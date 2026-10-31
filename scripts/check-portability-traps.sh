@@ -705,13 +705,25 @@ function conditioned(tool, code,   pr, c2, cal, arm, m1, m2, p_and, p_then, rest
 # `find … -exec` position. Counting is what distinguishes "the call is conditioned" from "a call on
 # this line is conditioned"; a boolean cannot, and the boolean is what shipped four times.
 function toolcalls(code, tool,   t, n) {
+  # ⛔ ONE CALL, ONE COUNT — AND THE TOOL MUST BE THE CALLED COMMAND (review cycle-14, measured).
+  # Three defects have lived in this counting, each caught by a different fixture:
+  #  · a substitution had its OWN pattern AND its opener `$(` is a SEPARATOR, so `x="$(timeout 5 …)"`
+  #    counted 2 and every substitution finding doubled its baseline row;
+  #  · the substitution span was `[^()]*`, so `$( … tmux-timeout … )`, `--timeout 2` (a git flag) and
+  #    `$(_rec free …)` counted as invocations — 8 invented findings in scripts/disk-reaper.sh alone;
+  #  · masking the opener with a non-separator let the ASSIGNMENT prefix swallow the argument, so
+  #    `free=$(_rec free | …)` matched again.
+  # A substitution is normalised to `( … ;` — the opener becomes a separator and the closer a right
+  # border — and then ONE command-position pattern counts every call, whether it is bare, inside a
+  # substitution, or after a redirection.
   t = code
+  gsub(/[$][(][ \t]*/, "(", t)
   n = gsub("(^|" SEP ")[ \t]*" pre pfx tool rb, "\003", t)
-  # a call reached through a substitution is a call — `n="$(nproc)"` is how every probe arm in this
-  # tree writes it, and a count that missed it read the canonical guarded form as UNGUARDED (measured:
-  # guarded/3-probe.sh went red the moment the count was introduced).
+  # a substitution that CLOSES right after the tool (`$(nproc)`) has `)` as its right border, and
+  # `rb` deliberately excludes `)` (`case` labels). Counted separately with no back-reference —
+  # mawk does not implement `\1` in a gsub replacement (measured: it printed `\1` literally).
   t = code
-  n += gsub("[$][(][^()]*" tool "([^A-Za-z0-9_]|$)", "\003", t)
+  n += gsub("[$][(][ \t]*([-./][^ \t]*/)?" tool ")", "\003", t)
   t = code
   n += gsub("[ \t]-(exec|execdir|ok|okdir)[ \t]+([^;&|(){}]*[ \t])?" pfx tool rb, "\003", t)
   return n
@@ -869,8 +881,25 @@ function cmdunits(code, segs,   t, n) {
   # gate bypass, not a cosmetic miss. `||` is a SEPARATOR to `cp()`/`cmd_opt` and is NOT split on
   # here, so the unit stays whole AND the command after the mask is still in command position.
   t = code
-  gsub(/&&/, "||", t)
-  gsub(/[<>]&/, "||", t)
+  # ⛔ `&&` IS NOT A FALLBACK (review cycle-14 P2): masking it to `||` made
+  # `mt=$(stat -c %Y f && stat -f %m f)` CLEAN — on macOS the GNU call fails, `&&` short-circuits,
+  # the BSD arm never runs and `mt` is EMPTY, the silent-empty failure this file warns about. `|&`
+  # is still a SEPARATOR to cp()/cmd_opt and cmdunits() does not split on it, so the unit stays
+  # whole AND gnu_only_unit() can tell a sequence from a fallback.
+  # ⛔ THE MASK MUST NOT CONTAIN `&` (measured): `|&` was split again by the bare-`&` separator and
+  # turned `2>&1` into `2|>`, cutting the unit in half. `|(` is a SEPARATOR to cp()/cmd_opt, is not
+  # split here, and is distinguishable from the `||` arm/fallback mask.
+  gsub(/&&/, "|(", t)
+  gsub(/[<>]&/, "|(", t)
+  # ⛔ A ONE-LINE `case` ARM IS THE SAME PLATFORM BRANCH AS `if/else` (review cycle-14 P2): `;;` was
+  # split as a unit separator, so `case "$(uname)" in Darwin) stat -f %m f ;; *) stat -c %Y f ;; esac`
+  # reded while the identical `if`/`else` form is blessed — and the tree writes exactly this shape
+  # (worktree-disk-probe.sh:168-176, baselined as "NOT yet repaired" while being portable). `;;`,
+  # `;&` and `;;&` are masked as fallbacks BEFORE the `;` split; the multi-line `case` form is
+  # declared in the header instead (arms on separate lines cannot be paired by a line-local rule).
+  gsub(/;;&/, "||", t)
+  gsub(/;&/, "||", t)
+  gsub(/;;/, "||", t)
   gsub(/;[ \t]*(then|else|elif|fi|do|done)([ \t]|$)/, "||", t)
   gsub(/;/, "\n", t)
   gsub(/&/, "\n", t)
@@ -879,20 +908,98 @@ function cmdunits(code, segs,   t, n) {
 
 # gnu_only_unit(code, tool, shortflag, longform, bsd1, bsd2) — 1 when SOME command unit calls `tool`
 # with the GNU spelling and carries NO BSD counterpart of its own.
-function gnu_only_unit(code, tool, shortf, longf, bsd1, bsd2,   segs, n, k, hasg) {
+function gnu_only_unit(code, tool, shortf, longf, bsd1, bsd2,   segs, n, k, c, parts, np, j, gi, good, bpos, gpos) {
   n = cmdunits(code, segs)
+  c = 0
   for (k = 1; k <= n; k++) {
     if (!cp(segs[k], tool)) continue
-    hasg = (shortf != "" && cmd_opt(segs[k], tool, shortf)) || (longf != "" && opt_long(segs[k], tool, longf))
-    if (!hasg) continue
-    if (cmd_opt(segs[k], tool, bsd1)) continue
-    if (bsd2 != "" && cmd_opt(segs[k], tool, bsd2)) continue
-    return 1
+    if (!((shortf != "" && cmd_opt(segs[k], tool, shortf)) || (longf != "" && opt_long(segs[k], tool, longf)))) continue
+    # the unit is split into FALLBACK parts on `||` only: a `&&` tail is a SEQUENCE, not a fallback
+    np = split(segs[k], parts, "[|][|]")
+    gi = 0
+    for (j = 1; j <= np; j++)
+      if ((shortf != "" && cmd_opt(parts[j], tool, shortf)) || (longf != "" && opt_long(parts[j], tool, longf))) { gi = j; break }
+    if (gi == 0) continue
+    good = 0
+    # the counterpart in ANOTHER fallback part: an earlier one is the platform arm
+    # (`if stat -f …; then …` / `case … Darwin) …`), a later one is the `||` chain
+    for (j = 1; j <= np; j++) {
+      if (j == gi) continue
+      if (cmd_opt(parts[j], tool, bsd1) || (bsd2 != "" && cmd_opt(parts[j], tool, bsd2))) { good = 1; break }
+    }
+    # …or in the SAME part, BEFORE the GNU call (`if stat -f … && …`, `stat -f … ; `)
+    if (!good && (cmd_opt(parts[gi], tool, bsd1) || (bsd2 != "" && cmd_opt(parts[gi], tool, bsd2)))) {
+      gpos = index(parts[gi], shortf != "" ? shortf : longf)
+      bpos = index(parts[gi], bsd1)
+      if (bsd2 != "" && (bpos == 0 || (index(parts[gi], bsd2) > 0 && index(parts[gi], bsd2) < bpos))) bpos = index(parts[gi], bsd2)
+      if (bpos > 0 && (gpos == 0 || bpos < gpos)) good = 1
+    }
+    if (!good) c++
   }
-  return 0
+  return c
 }
 
-function cmd_cluster(code, tool, letters,   t, k, segs, n, toolat, off, adv, t2, segk) {
+# ⛔ COUNTS, NOT FLAGS (review cycle-14 P1): the ratchet compares a COUNT, so a rule that can only
+# answer "is there one on this line" cannot see a second trap added beside an existing one. Each of
+# these returns how many instances it found; the boolean twins above are kept for the callers that
+# only need the predicate.
+# bare_calls(tool, code) — invocations of `tool` that are NOT guarded by a presence probe.
+# ⛔ THE COUNT IS OF COMMAND-POSITION CALLS ONLY (review cycle-14 P1, measured): `toolcalls()` counts
+# substitution and `-exec` positions too — that is what the CONDITIONING test needs — and using it
+# here made `timeout` rows rise from 3 to 6 on data the rule had already accepted, i.e. it changed
+# what a finding IS rather than how many are counted. `cmd_calls()` counts exactly the positions the
+# rule matches.
+function bare_calls(tool, code,   c2, pr) {
+  if (conditioned(tool, code) || probe_then(tool, code)) return 0
+  # the PROBE itself is not a call (`command -v timeout` matches the command-position pattern because
+  # `command` is a wrapper keyword — `cp()` strips it for the same reason, and skipping this stripped
+  # the guard off every probe-only line: measured, it invented 13 findings including one in
+  # scripts/lib/bounded.sh, the shim the remedy names).
+  c2 = code
+  pr = "(^|" SEP ")[ \t]*" asg pctl "(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
+  if (c2 ~ pr) {
+    sub(pr, "\001", c2)
+    if (c2 !~ ("(^|" SEP ")[ \t]*" pre pfx tool rb)) return 0
+  }
+  # the count is of what the rule MATCHES — command position, a `$( … )` substitution and `-exec`
+  # (`p="$(readlink -f ./x)"` and `x="$(free -m)"` are findings, and a command-position-only count
+  # made both vanish). The probe is already stripped above, so the count does not include it.
+  return toolcalls(c2, tool)
+}
+
+function cmd_calls(tool, code,   t) {
+  t = code
+  return gsub("(^|" SEP ")[ \t]*" pre pfx tool rb, "", t)
+}
+
+# seg_tool_count(code, tool, word) — segments where `tool` is called and `word` appears as a format
+# word in THAT segment (`ps … etimes` is a ps format, `grep -q etimes` is an argument).
+function seg_tool_count(code, tool, word,   t, k, segs, n, c) {
+  t = code
+  gsub(/[|&;(){}]/, "\n", t)
+  n = split(t, segs, "\n")
+  c = 0
+  for (k = 1; k <= n; k++)
+    if (cp(segs[k], tool) && segs[k] ~ ("(^|[ \t,=])" word "([ \t,=]|$)")) c++
+  return c
+}
+
+function cmd_cluster(code, tool, letters) {
+  return (cmd_cluster_n(code, tool, letters) > 0)
+}
+
+# cmd_long_re_n — the long-option rule, counted per segment.
+function cmd_long_re_n(code, tool, pat,   t, k, segs, n, c) {
+  t = code
+  gsub(/[|&;(){}]/, "\n", t)
+  n = split(t, segs, "\n")
+  c = 0
+  for (k = 1; k <= n; k++)
+    if (cp(segs[k], tool) && segs[k] ~ (pat "([=][^ \t]*)?([ \t]|$)")) c++
+  return c
+}
+
+function cmd_cluster_n(code, tool, letters,   t, k, segs, n, toolat, off, adv, t2, c) {
   t = code
   gsub(/[|&;(){}]/, "\n", t)
   n = split(t, segs, "\n")
@@ -910,13 +1017,13 @@ function cmd_cluster(code, tool, letters,   t, k, segs, n, toolat, off, adv, t2,
     if (match(segs[k], pfx tool rb) > 0) toolat = RSTART + RLENGTH
     off = 0; t2 = segs[k]
     while (match(t2, "(^|[ \t])-[A-Za-z]*" letters "[A-Za-z]*([ \t=]|$)")) {
-      if (off + RSTART >= toolat) return 1
+      if (off + RSTART >= toolat) { c++; break }
       adv = RSTART + 1
       off += adv
       t2 = substr(t2, adv)
     }
   }
-  return 0
+  return c
 }
 # cmd_opt(code, tool, opt) — 1 when ONE command on the line invokes `tool` with option `opt`.
 # Segments are split on the shell separators, so a flag belonging to a DIFFERENT command cannot
@@ -1023,11 +1130,14 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   }
 
   hit("cpu-count-single-mechanism", cpu_rule(code), "box_ncpu (scripts/lib/box.sh)")
-  hit("timeout-absent-on-macos",  timeout_rule(code), "sleep+kill -0 watchdog, or bounded.sh (#2046)")
-  if (cp(code, "setsid")) hit("setsid-absent-on-macos", 1, "( … ) &, or python3 os.setsid")
+  hit("timeout-absent-on-macos",  bare_calls("timeout", code), "sleep+kill -0 watchdog, or bounded.sh (#2046)")
+  hit("setsid-absent-on-macos",   bare_calls("setsid", code), "( … ) &, or python3 os.setsid")
   # `etimes` is a ps FORMAT word, so it is bordered by `,` or `=` in `-o pid=,etimes=` and not only by
   # whitespace. The looser border is what makes `ps -eo pid=,etimes= -p $$` detectable at all.
-  if (cp(code, "ps") && code ~ /(^|[ \t,=])etimes([ \t,=]|$)/) hit("ps-etimes-macos-absent", 1, "parse ps -o etime=")
+  # ⛔ THE FORMAT WORD MUST BELONG TO THE `ps` COMMAND (review cycle-14 P2): the test was on the whole
+  # LINE, so `ps -eo pid= -p 1 | grep -q etimes` reded on portable code — a word in a grep ARGUMENT is
+  # not a ps format. Counted per segment, so two `ps … etimes` on one line are two findings.
+  hit("ps-etimes-macos-absent", seg_tool_count(code, "ps", "etimes"), "parse ps -o etime=")
   sed_rule(code)
   # ⛔ THE OPTION MAY BE CLUSTERED (review finding 6): `readlink -nf` and `grep -qP` are the same trap
   # as `-f` / `-P` and the first version missed them — including a live `grep -qP` in this change own
@@ -1042,8 +1152,8 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # as "NOT yet repaired". probed() is the one lookback this file already trusts.
   # ⛔ THE LONG OPTION FAMILY, NOT JUST ONE MEMBER (review cycle-5 P2): `--canonicalize-missing` and
   # `--canonicalize-existing` are GNU-only too, and BSD/macOS readlink has neither.
-  hit("readlink-f-bsd-absent",    ((cmd_cluster(code, "readlink", "f") || cmd_long_re(code, "readlink", "--canonicalize(-[a-z]+)?")) && !conditioned("readlink", code) && !probe_then("readlink", code)), "cd … && pwd -P")
-  hit("grep-P-bsd-absent",        (cmd_cluster(code, "grep", "P") || cmd_long_re(code, "grep", "--perl-regexp")), "grep -E")
+  hit("readlink-f-bsd-absent",    (conditioned("readlink", code) || probe_then("readlink", code)) ? 0 : (cmd_cluster_n(code, "readlink", "f") + cmd_long_re_n(code, "readlink", "--canonicalize(-[a-z]+)?")), "cd … && pwd -P")
+  hit("grep-P-bsd-absent",        (cmd_cluster_n(code, "grep", "P") + cmd_long_re_n(code, "grep", "--perl-regexp")), "grep -E")
   # ⛔ A LINE THAT ALREADY NAMES THE BSD COUNTERPART IS THE GUARDED CHAIN (review cycle-1 P2):
   # `stat -c %Y f || stat -f %m f` and `date -d @$t || date -r $t` are portable as written — that is
   # the idiom the header promises is clean — and 35 of the baselined date/stat findings were exactly
@@ -1073,7 +1183,7 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # reported.
   hit("date-d-gnu",               gnu_only_unit(code, "date", "-d", "date", "-r", "-v"), "box_epoch_to_iso (scripts/lib/box.sh)")
   hit("stat-c-gnu",               gnu_only_unit(code, "stat", "-c", "format", "-f", ""), "box_mtime (scripts/lib/box.sh)")
-  hit("free-macos-absent",        cp(code, "free"), "`vm_stat` on macOS and `/proc/meminfo` on Linux (this tree does that per file today, e.g. `scripts/orchestrator-harness/orch-loop.sh`; no `box_*` memory shim exists yet)")
+  hit("free-macos-absent",        bare_calls("free", code), "`vm_stat` on macOS and `/proc/meminfo` on Linux (this tree does that per file today, e.g. `scripts/orchestrator-harness/orch-loop.sh`; no `box_*` memory shim exists yet)")
   # ⛔ `${x#/proc/}` IS A PARAMETER EXPANSION, NOT A READ (review cycle-1 P2): the `code` view keeps
   # `${…}` bodies (they are code), so the bare `/proc/` test flagged a string-strip expression. The
   # expansion is masked out before the unquoted test; a QUOTED path is still caught by quoted_procfs.
@@ -1094,6 +1204,10 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   # 3.2, and the rule demanded two. The `[,^]` position still excludes the operator forms
   # (`${x:-}`, `${x##}`, `${x%%}`), which put a different character there.
   if (code ~ /\$\{[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?[,\^]{1,2}/) hit("bash4-case-modify", 1, "tr")
+  # ⛔ NOT COUNTED (review cycle-14 P1, measured): an awk function cannot take a regex CONSTANT as a
+  # value — `/re/` in an argument position evaluates `$0 ~ /re/`, so `gcount(code, /&>>/)` counted
+  # LENGTH+1 (39, 56 … per file) instead of the occurrences, and the emitted baseline inflated to
+  # 70,665 findings. The per-occurrence counts below use STRING patterns; these four stay per line.
   if (code ~ /&>>/) hit("bash4-append-amp", 1, ">>f 2>&1")
   # ⛔ THE OPTION MUST BELONG TO `wait` (review cycle-1 P2): `word_has(code, "-n")` flagged
   # `[ -n "$1" ] && { kill "$1"; wait "$1"; }` — a `-n` TEST, not `wait -n`.
@@ -1161,7 +1275,7 @@ function cpu_rule(code,   n, mech) {
   # mechanism and cleared it — a repeat of the same mechanism is not a chain, which is exactly what
   # this guard exists to say. Only `nproc` repeats were caught, and the asymmetry was invisible.
   if (mech && cpu_other(cpu_mech(code))) return 0
-  return mech
+  return n
 }
 
 # cpu_mech(code) — a bitmask of the CPU mechanisms READ ON THIS LINE (1 nproc, 2 sysctl, 4 getconf).
@@ -1322,14 +1436,21 @@ END {
 }
 
 # hit(rule, is_hit, replacement) — one finding line, machine-parseable: path \t line \t rule \t replacement
-function hit(rule, is_hit, replacement,   f, l) {
+function hit(rule, is_hit, replacement,   f, l, i) {
+  # ⛔ A COUNT IS PART OF THE FINDING (review cycle-14 P1): every rule except `sed` reported at most
+  # ONE finding per LINE, so a second live trap appended to an already-counted line left the ratchet
+  # green — measured: a line carrying two `stat -c` calls reported `baseline=1 live=1` and passed,
+  # with two NEW macOS traps in it. `is_hit` may be a NUMBER; it is the number of instances to emit.
   if (!is_hit) return
   # `HIT_PATH`/`HIT_LINE` are set only by the END block, where FILENAME/FNR would name the LAST record
   # rather than the opener. Every other call runs mid-record and leaves them unset.
   f = (HIT_PATH == "") ? FILENAME : HIT_PATH
   l = (HIT_LINE == 0)  ? FNR      : HIT_LINE
-  printf "%s\t%d\t%s\t%s\n", f, l, rule, replacement
+  for (i = 0; i < is_hit; i++) printf "%s\t%d\t%s\t%s\n", f, l, rule, replacement
 }
+
+# (a per-occurrence helper was REMOVED here: awk cannot take a regex CONSTANT as a function value —
+# `/re/` in an argument position evaluates `$0 ~ /re/`. Counted rules pass STRING patterns instead.)
 '
 
 # `sed_rule` uses `hit` before its definition in the awk source order; awk resolves at CALL time, so

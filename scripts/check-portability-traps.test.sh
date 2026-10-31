@@ -921,6 +921,59 @@ n_ls="$(awk -v r="sed-in-place-gnu" '{ n = split($0, a, ": "); if (n >= 2) { spl
 [ "$n_ls" = 2 ] && ok "C16c: long-form then short-form sed on ONE line counts 2" \
   || bad "C16c: long-form then short-form counted $n_ls, not 2 — the first hit skipped the next segment"
 
+# ── C17. THE FOURTEENTH CYCLE — counts are part of the finding, and a counterpart is a FALLBACK ────
+# (a) every rule but `sed` reported at most ONE finding per line, so a second live trap appended to an
+#     already-counted line left the ratchet green; (b) `&&` was treated as a fallback, so a BSD arm
+#     that never runs on macOS blessed the GNU call before it; (c) a one-line `case` platform branch
+#     and a `grep -q etimes` argument reded on portable code.
+C7="$TMP/cyc12"; : >"$C7"
+C7C="$TMP/cyc12clean"; : >"$C7C"
+mkc7()  { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C7"; }
+mkc7c() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C7C"; }
+
+# `&&` is a SEQUENCE: on macOS the GNU call fails, so the BSD arm never runs and the value is empty
+mkc7 cyc12/1-and-is-not-fallback.sh '#!/usr/bin/env bash' 'mt=$(stat -c %Y f && stat -f %m f)'
+mkc7 cyc12/2-ps-etimes.sh '#!/usr/bin/env bash' 'ps -eo pid=,etimes= -p 1'
+# two instances on ONE line
+mkc7 cyc12/3-two-stat-one-line.sh '#!/usr/bin/env bash' 'mt="$(stat -c %Y f)"; mt2="$(stat -c %Y g)"'
+mkc7 cyc12/4-two-timeout-one-line.sh '#!/usr/bin/env bash' 'timeout 5 a; timeout 5 b'
+
+# the portable forms
+mkc7c cyc12clean/1-case-platform.sh '#!/usr/bin/env bash' 'case "$(uname)" in Darwin) stat -f %m f ;; *) stat -c %Y f ;; esac'
+mkc7c cyc12clean/2-probe-then-branch.sh '#!/usr/bin/env bash' 'mode_of() { if stat -c "%a" "$1" >/dev/null 2>&1; then stat -c "%a" "$1"; else stat -f "%Lp" "$1"; fi; }'
+mkc7c cyc12clean/3-etimes-as-argument.sh '#!/usr/bin/env bash' 'ps -eo pid= -p 1 | grep -q etimes'
+mkc7c cyc12clean/4-or-chain.sh '#!/usr/bin/env bash' 'stat -c %Y f || stat -f %m f'
+
+run_check "$C7" --no-baseline
+for pair in   "stat-c-gnu cyc12/1-and-is-not-fallback.sh"   "ps-etimes-macos-absent cyc12/2-ps-etimes.sh"   "stat-c-gnu cyc12/3-two-stat-one-line.sh"   "timeout-absent-on-macos cyc12/4-two-timeout-one-line.sh"
+do
+  set -- $pair
+  if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    ok "C17a: caught $1 in $(basename "$2")"
+  else
+    bad "C17a: MISSED $1 in $(basename "$2")"
+  fi
+done
+run_check "$C7C" --no-baseline
+for pair in   "stat-c-gnu cyc12clean/1-case-platform.sh"   "stat-c-gnu cyc12clean/2-probe-then-branch.sh"   "ps-etimes-macos-absent cyc12clean/3-etimes-as-argument.sh"   "stat-c-gnu cyc12clean/4-or-chain.sh"
+do
+  set -- $pair
+  if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    bad "C17b: FALSE POSITIVE — $1 reded on portable $(basename "$2")"
+  else
+    ok "C17b: portable platform branch NOT flagged ($(basename "$2"))"
+  fi
+done
+# the COUNT is what the ratchet compares: two instances must emit two findings, for a rule too
+printf '%s\n' cyc12/3-two-stat-one-line.sh cyc12/4-two-timeout-one-line.sh >"$TMP/cyc12.list"
+run_check "$TMP/cyc12.list" --no-baseline
+for pair in "stat-c-gnu cyc12/3-two-stat-one-line.sh" "timeout-absent-on-macos cyc12/4-two-timeout-one-line.sh"; do
+  set -- $pair
+  n_inst="$(awk -v f="$2" -v r="$1" '{ n = split($0, a, ": "); if (index($0, f ":") == 1 && n >= 2) { split(a[2], b, " "); if (b[1] == r) c++ } } END { print c + 0 }' "$OUT")"
+  [ "$n_inst" = 2 ] && ok "C17c: two $1 instances on one line are counted twice" \
+    || bad "C17c: two $1 instances on one line counted $n_inst, not 2 — the ratchet cannot see the second"
+done
+
 # ⛔ A SECOND LIVE TRAP ON THE SAME LINE IS COUNTED (review cycle-12 P2): the ratchet is keyed on the
 # COUNT, so a `return` after the first hit let `sed -i …; sed -i …` report 1 where two lines report 2
 # — a fresh trap appended beside an existing one stayed green forever.
@@ -940,7 +993,7 @@ gmutants() {
   printf '%s\n' \
     'if (mech && cpu_other(cpu_mech(code))) return 0|cyc7clean/1-chain.sh|cpu-count-single-mechanism' \
     'if (n >= 2) return 0|cyc7clean/3-chain-1line.sh|cpu-count-single-mechanism' \
-    'if (conditioned(tool, code)) return 0|cyc8clean/2-and-timeout.sh|timeout-absent-on-macos'
+    'if (conditioned(tool, code)|cyc8clean/2-and-timeout.sh|timeout-absent-on-macos'
 }
 GDIR="$TMP/gmutant.sh"
 # run_mutant_path <mutant> <list> — the same wrapper contract run_mutant (section D) uses, for the
