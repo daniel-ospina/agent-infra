@@ -334,7 +334,7 @@ function fail(msg) { print "❌ " msg > "/dev/stderr"; exit 2 }
 #   SN[d]  1 when the span opened at stack depth d had literal content (the `@@` marker above).
 #   PD[d]  the paren/brace depth of the substitution opened at stack depth d.
 function st_top() { return (length(ST) > 0) ? substr(ST, length(ST), 1) : "" }
-function st_push(ch,   d) { ST = ST ch; d = length(ST); SN[d] = 0; PD[d] = 0; AR[d] = 0 }
+function st_push(ch,   d) { ST = ST ch; d = length(ST); SN[d] = 0; PD[d] = 0; AR[d] = 0; CD[d] = 0 }
 function st_pop() { ST = substr(ST, 1, length(ST) - 1) }
 
 function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
@@ -437,6 +437,22 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
     # ── inside `$( … )`: code, with nested quotes and parens of its own
     if (top == "C") {
       if (c == "\\") { i++; continue }
+      # ⛔ A `case` ARM LABEL `)` DOES NOT CLOSE THE SUBSTITUTION, AND MISSING THAT MADE A REAL
+      # COMMENT LOOK GLUED (review cycle-3 P0). The `)` of `y)` popped the substitution and set
+      # LAST_POP, so the `#` after it was declared DATA by cmt_start — while bash starts a comment
+      # there. The consequence was not cosmetic: an apostrophe in that prose opened a phantom
+      # single-quote span, and two LIVE traps below it (`sed -i`, `stat -c`) went unreported with the
+      # run exiting 0 (“if the quotes balance, the scan is silently CLEAN”). The mirror of the CD state
+      # the suite pin already carries, so the two models cannot drift.
+      if (c ~ /[A-Za-z]/ && (i == 1 || substr(line, i - 1, 1) ~ /[^A-Za-z0-9_]/)) {
+        rest2 = substr(line, i)
+        # ⛔ `i += 3`, NOT 4: this loop advances `i` in its own `for (i = 1; i <= n; i++)`, so an
+        # extra `i++` consumes exactly one more byte (the same trap the heredoc branch documents).
+        # With 4, the character AFTER the keyword was skipped — measured: the scan desynchronised and
+        # invented 5 findings across ci_runner_pool.sh and cloud-cell-bringup.sh.
+        if (rest2 ~ /^case([ \t;)(|&]|$)/) { CD[length(ST)] = 1; out = out "case"; i += 3; continue }
+        if (rest2 ~ /^esac([ \t;)(|&]|$)/) { CD[length(ST)] = 0; out = out "esac"; i += 3; continue }
+      }
       if (c == "#" && cmt_start(line, i)) { CMT_AT = i; break }
       if (c == "\"") { st_push("D"); SN[length(ST)] = 0; out = out "\""; continue }
       if (c == SQ) { ansi = (i > 1 && substr(line, i - 1, 1) == "$"); st_push("S"); AC[length(ST)] = ansi; SN[length(ST)] = 0; out = out SQ; continue }
@@ -476,7 +492,11 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
       }
       d = length(ST)
       if (c == "(") PD[d]++
-      else if (c == ")") { PD[d]--; if (PD[d] <= 0) { LAST_POP = i; out = out ")"; st_pop(); continue } }
+      else if (c == ")") {
+        # an arm label: data, and it must not become LAST_POP (see the case note above)
+        if (CD[d] == 1) { out = out ")"; continue }
+        PD[d]--; if (PD[d] <= 0) { LAST_POP = i; out = out ")"; st_pop(); continue }
+      }
       out = out c; continue
     }
     # ── TOP LEVEL: code, comments, and the opener of each context
@@ -540,9 +560,11 @@ function no_comment(line,   i, n, c, out, q, prev) {
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
     if (q != "") { out = out c; if (c == q) q = ""; continue }
+    # ⛔ SAME DECISION HERE, NOT A SUPERSET (review cycle-3 P2): this site kept its own class test
+    # (`{`, `}`, `)` all sit inside it), so the `cmt_start` call above it was INERT — a `#` glued to a
+    # closed `$( … )` was still read as a comment here and a live `/proc` read to its right went
+    # unreported. Deleting the leftover test is what actually puts this site on the single decision.
     if (c == "#" && cmt_start(line, i)) { CMT_AT = i; break }
-    if (c == "#") { prev = (i == 1) ? " " : substr(line, i - 1, 1)
-                    if (prev ~ /[ \t;&|(){}]/) break }
     if (c == SQ || c == "\"") { q = c; out = out c; continue }
     if (c == "\\") { i++; out = out substr(line, i, 1); continue }
     out = out c

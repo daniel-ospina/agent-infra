@@ -273,6 +273,46 @@ printf '%s\n' '#!/usr/bin/env bash' 'y=`sed -i "s/a/b/" f # portability-ok: call
 printf 'glued2/3-inner-ok.sh\nglued2/4-inner-ok-backtick.sh\n' >"$TMP/inner-ok-targets"
 not_flags "sed-in-place-gnu" "$TMP/inner-ok-targets" && ok "C23: a reasoned '# portability-ok:' INSIDE a \$( ) and a backtick substitution still suppresses (it is a real comment there)" \
   || bad "C23: the per-line hatch stopped working inside \$( … ) — over-block on a documented escape"
+# ⛔ C24 — A REAL COMMENT AFTER A `case` ARM LABEL INSIDE A SUBSTITUTION (review cycle-3 P0). The
+# arm label `)` popped the substitution and was recorded as LAST_POP, so the `#` after it was called
+# DATA — while bash starts a comment there. An apostrophe in that prose then opened a phantom
+# single-quote span and the two LIVE traps below it went unreported, rc=0. The detector now models
+# `case`/`esac` per depth (the mirror of the suite pin), so the arm `)` is data and the `#` is a
+# comment. This arm asserts the traps BELOW the prose are still found — the direction that was lost.
+mkdir -p "$TMP/tree/casearm"
+# ⛔ THE APOSTROPHE IN THE PROSE IS THE WHOLE POINT: read as a comment it is prose; read as DATA it
+# opens a quote span that swallows the rest of the file. The first draft of this arm said "do not
+# reorder these" and stayed GREEN against a detector with the case model removed — a
+# non-discriminating arm (measured), so the fixture carries the apostrophe deliberately.
+# ⛔ `printf "%c" 39` PRINTS `3` — %c takes the FIRST CHARACTER of its argument, not a codepoint
+# (measured: the fixture read `don3t`, no apostrophe, and the arm then proved nothing). `\047` is octal.
+CASQ=$(printf '\047')
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(case y in' "  y)# don${CASQ}t change the order" '    echo ok;;' 'esac)' 'sed -i '"'"'s/a/b/'"'"' f' 'stat -c %Y g' '# it is documented above' >"$TMP/tree/casearm/1.sh"
+printf 'casearm/1.sh\n' >"$TMP/casearm-targets"
+flags "sed-in-place-gnu" "$TMP/casearm-targets" && flags "stat-c-gnu" "$TMP/casearm-targets" \
+  && ok "C24: a real comment after a case ARM LABEL inside \$( ) — the live traps below it are still reported (the arm ')' is data, the '#' is a comment)" \
+  || bad "C24: the arm-label ')' was treated as a glued word, so a real comment opened a phantom quote span and hid live traps"
+# ⛔ C25 — the same decision in `no_comment` (review cycle-3 P2): that site kept a SUPERSET class
+# test, which made its `cmt_start` call inert, so a `#` glued to a closed `$( … )` was still read as a
+# comment there and a live /proc read to its right went unreported.
+mkdir -p "$TMP/tree/gluedproc"
+printf '%s\n' '#!/usr/bin/env bash' 'v=$(tag)#note; head -1 /proc/loadavg' >"$TMP/tree/gluedproc/1.sh"
+printf 'gluedproc/1.sh\n' >"$TMP/gluedproc-targets"
+flags "procfs-macos-absent" "$TMP/gluedproc-targets" \
+  && ok "C25: a /proc read to the right of a GLUED '#' is still reported (no_comment asks the same decision, not a superset)" \
+  || bad "C25: the glued '#' truncated the /proc read — no_comment is still on its own class test"
+# ⛔ E15 — A REFUSAL MESSAGE MUST NOT EXECUTE ANYTHING (review cycle-3 P2). The malformed-table
+# message once carried backticks inside double quotes, so the shell command-substituted them: `id` ran
+# with `<TAB>` as a redirect target and the operator lost the column names.
+mkdir -p "$TMP/tbl15"
+awk -F'\t' 'BEGIN { OFS = "\t" } $1 == "cpu-count-single-mechanism" { $3 = "" } { print }' "$CHECK" >"$TMP/tbl15/bad-empty.sh"
+if bash "$TMP/tbl15/bad-empty.sh" --list-rules >"$TMP/e15.out" 2>"$TMP/e15.err"; then
+  bad "E15: a malformed rule table did not refuse"
+elif grep -q 'id, trap and replacement' "$TMP/e15.err" && ! grep -qE 'no such user|No such file' "$TMP/e15.err"; then
+  ok "E15: the malformed-table refusal names the columns and executes nothing (no backtick substitution in the message)"
+else
+  bad "E15: the refusal message ran a command or lost the column names — $(head -2 "$TMP/e15.err" | tr '\n' ' ')"
+fi
 
 # C6/C7 — the file-level declaration: a reasoned skip works; a bare one REFUSES.
 L="$TMP/linuxonly"; : >"$L"
