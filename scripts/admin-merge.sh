@@ -122,15 +122,20 @@
 #   base reports this program under the other lane's name.
 #
 # ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
-# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:444
-# `node --check`, :456 the lane-parity guard, :462 its mutation self-test, :476 the shard
-# list) and the other two are `actions/checkout` (:429) and `actions/setup-node` (:434) —
-# while a `bash-suites (<n>)` slice runs only the shard list. So a red under that name may
-# be the shard list's red — or ANY other step's, including the setup ones. The equivalence
-# therefore establishes that the base RUNS this program and carries A red under its name;
-# it can never establish that the base's red is this suite's. That is why the answer is
-# phrased as a candidate (`base-caused via`) and why the paragraph under it says so out
-# loud.
+# `script-validate` job has SEVEN steps: four validation steps (the `node --check` syntax
+# pass, the lane-parity guard, that guard's mutation self-test, and the shard list), the two
+# setup steps (`actions/checkout`, `actions/setup-node`), and the `Materialize origin/main`
+# fetch step added by #3131/#3139 — while a `bash-suites (<n>)` slice runs only the shard
+# list. So a red under that name may be the shard list's red — or ANY other step's,
+# including setup or the fetch. The equivalence therefore establishes that the base RUNS
+# this program and carries A red under its name; it can never establish that the base's red
+# is this suite's. That is why the answer is phrased as a candidate (`base-caused via`) and
+# why the paragraph under it says so out loud.
+#
+# The steps above are NAMED, not line-cited, on purpose: these coordinates had already
+# drifted ~17 lines on main before this PR added its step, and a citation that rots is worse
+# than no citation — the containment argument rests on the step LIST, not on where each one
+# sits. Re-locate by quoting a step's `name:`/`run:` to check this.
 #
 # WHAT IT DOES NOT BUY, stated here so it cannot be read as more than it is:
 #   * it is a NAME-level statement about two LANES, not an identity-level statement
