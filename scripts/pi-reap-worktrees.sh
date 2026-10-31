@@ -284,7 +284,9 @@
 #   (no mode flag)  dry-run: classify + report, remove NOTHING (default)
 #   --dry-run       explicit dry-run
 #   --apply         armed one-shot pass (or env REAP_WT_DRY_RUN=0)
-#   --repo PATH     repo whose worktrees are reaped (default $PWD)
+#   --repo PATH     repo whose worktrees are reaped (REQUIRED: --repo, or $REPO from the box —
+#                   there is NO $PWD default; under launchd $PWD is /, a real directory that is not
+#                   a repo, so the pass died later as "not a git repository: /")
 #   --aged-days N   age threshold (default 7; strict >)
 #   --main REF      main ref for the merged check (default: auto-detect)
 #   --list          print worktrees and exit (no gh / ps / lock / log)
@@ -574,7 +576,15 @@ IGNORED_REGENERABLE=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS
 
 MODE=unknown
 LIST_ONLY=0
-REPO=""
+# ⛔ INHERITED, NOT CLEARED. This read `REPO=""` and that single assignment made the box's REPO
+# UNREADABLE to the resolver below: the operator's value arrives in the ENVIRONMENT (the plist's
+# EnvironmentVariables on a Mac, keys.env on a cell), and an unconditional `REPO=""` at the top level
+# OVERWRITES it before `resolve_repo` ever looks — so a box that HAD set REPO was told "REPO is unset",
+# and the documented fallback existed only in the comment. Measured: `REPO=/tmp/nonexistent` in the
+# environment answered "REPO is unset — the harness has no default for it" instead of refusing by the
+# value it was given. `${REPO:-}` keeps an inherited value, stays `set -u`-safe, and leaves --repo
+# (parsed below) as the one thing that can override it.
+REPO="${REPO:-}"
 MAIN_REF_OVERRIDE="$REAP_WT_MAIN_REF"
 
 # run() state
@@ -654,7 +664,9 @@ Usage:
   (no mode flag)  dry-run: classify + report, remove NOTHING (default)
   --dry-run       explicit dry-run
   --apply         armed one-shot pass (or env REAP_WT_DRY_RUN=0)
-  --repo PATH     repo whose worktrees are reaped (default \$PWD)
+  --repo PATH     repo whose worktrees are reaped (REQUIRED: --repo, or \$REPO from the box;
+                  there is NO \$PWD default — under launchd \$PWD is /, which is a real
+                  directory that is not a repo, so the pass failed later as "not a git repository: /")
   --aged-days N   age threshold in days (default 7; HEAD must be strictly older)
   --main REF      main ref for the merged check (default: auto-detect)
   --list          print worktrees and exit
@@ -2893,7 +2905,43 @@ run() {
     # candidate probing on its own — slower, never less safe.
     REMOTE_DEAD_FILE="$(mktemp "${TMPDIR:-/tmp}/pi-reap-deadremotes.XXXXXX")" || REMOTE_DEAD_FILE=""
 
-    REPO="${REPO:-$PWD}"
+    # ⛔ REPO IS NAMED, NEVER ASSUMED — AND THERE IS NO `$PWD` DEFAULT (that default was the defect).
+    # `$PWD` is not even a fact about the repo: it is whatever directory the CALLER happened to stand
+    # in. Under launchd it is `/`, which IS a real directory — so `canonicalize` accepts it and the pass
+    # then fails several probes later as "not a git repository: /", nowhere near the cause. A launchd
+    # job must name its repo (`--repo`), and a manual run falls back to the box's `REPO` — set once, in
+    # the plist or in the cell's keys.env, never per script.
+    # The ONE resolver is `repo-slug.sh`'s `resolve_repo`, which refuses BY NAME when REPO is absent or
+    # is not a checkout. Candidates are tried BESIDE THIS SCRIPT FIRST (repo-target.sh's order: the tree
+    # the script came from is the trustworthy one), then the operator's `$AGENT_INFRA_PATH`; an entry is
+    # accepted only if it actually DEFINES `resolve_repo`, so a STALE copy cannot shadow a good one and
+    # leave this consolidation silently inert — measured: with `AGENT_INFRA_PATH` naming a checkout that
+    # predates `resolve_repo`, sourcing the first existing candidate left the resolver undefined and the
+    # reaper answered with the OLD refusal.
+    # The FARM copy (`~/.pi/agent/scripts/`, no orchestrator-harness subtree) legitimately finds none,
+    # and it always arrives with `--repo` from its launchd template — so an UNRESOLVED REPO is the only
+    # case that may not proceed, and an already-named one keeps the validation four lines below
+    # (`rev-parse --git-common-dir`, which proves strictly more than resolve_repo's toplevel probe).
+    _repo_lib_stale=""
+    for _cand in "${REAP_WT_REPO_SLUG_LIB:-}" \
+                 "$SELF_DIR/orchestrator-harness/repo-slug.sh" \
+                 "$SELF_DIR/repo-slug.sh" \
+                 "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/repo-slug.sh"; do
+        [ -n "$_cand" ] || continue
+        [ -f "$_cand" ] || continue
+        # shellcheck disable=SC1090
+        . "$_cand" 2>/dev/null || continue
+        command -v resolve_repo >/dev/null 2>&1 && break
+        # A file that sources cleanly but defines nothing is not the resolver — try the next one.
+        unset -f resolve_repo 2>/dev/null || true
+        _repo_lib_stale="$_repo_lib_stale $_cand"
+    done
+    if command -v resolve_repo >/dev/null 2>&1; then
+        REPO="$(resolve_repo)" || exit $?
+    elif [ -z "$REPO" ]; then
+        echo "FAIL-CLOSED abort: REPO is unset and no repo-slug.sh defining resolve_repo (the ONE resolver) was found — looked beside this script ($SELF_DIR/orchestrator-harness, $SELF_DIR), in \$AGENT_INFRA_PATH, and in \$REAP_WT_REPO_SLUG_LIB.${_repo_lib_stale:+ STALE copies with no resolve_repo:$_repo_lib_stale.} Pass --repo <path>, or set REPO to the checkout this pass should reap (exit 2)" >&2
+        exit 2
+    fi
     REPO_CANON="$(canonicalize "$REPO")"
     [ -n "$REPO_CANON" ] || { echo "not a directory: $REPO" >&2; exit 2; }
     local common
