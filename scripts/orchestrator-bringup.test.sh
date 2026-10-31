@@ -129,6 +129,12 @@ LC
 
 # A stub harness: the two scripts the entry point consults, and a marker each so a case can assert
 # that a verb did (or did NOT) call one.
+# ⛔ THE rc=1 ARM SPEAKS THE PRODUCER'S OWN FORMAT, and that is load-bearing, not cosmetic. A fixture
+# that prints `DRIFT: …` re-implements a format the shipped checker no longer emits, so it agrees with
+# the consumer while the consumer disagrees with reality — the arm passed green over a count that read
+# `0 finding(s)` on a real box. Three lines, one of each shape the checker can produce: two LABELLED
+# (the question each failed) and one unlabelled (the record/surface remainders), so a consumer that
+# counts only one shape is caught here instead of on the box.
 mk_harness() { # <dir> <drift-rc>
   mkdir -p "$1"
   cat > "$1/check-deployed-drift.sh" <<EOF
@@ -136,7 +142,10 @@ mk_harness() { # <dir> <drift-rc>
 rc=$2
 case "\$rc" in
   2) echo "UNKNOWN: no harness record at \$O/.agent-infra-stamp.json"; exit 2 ;;
-  1) echo "DRIFT: the deployed harness is recorded from deadbeef, which is BEHIND origin/main"; exit 1 ;;
+  1) echo "DRIFT(identity): the deployed harness is recorded from deadbeef, which is BEHIND origin/main"
+     echo "DRIFT(record): a.sh — UNCOMMITTED EDIT in \$O: the deployed copy differs from what the record says was deployed"
+     echo "DRIFT: MISSING b.sh — the record says the deploy wrote it, and it is not there now"
+     exit 1 ;;
   *) echo "MATCH: deployed harness at \$O == the repo"; exit 0 ;;
 esac
 EOF
@@ -1362,6 +1371,216 @@ printf '{ not json' > "$SA/O/.agent-infra-stamp.json"
 BRINGUP_ARGS=check bringup "$SA/home" "$SA/bin" "$SA/harness" REPO="$SA/repo" O="$SA/O" ENV_FILE="$SA/home/keys.env"
 [ "$RC" = 2 ] && ok "check: an UNREADABLE stamp is still rc=2 — cannot-verify is never a pass" \
               || bad "check: rc=$RC over a stamp nobody can parse, want 2 — $OUT"
+
+
+# ── §14 the drift report's COUNT must count every drift, labelled included ──────────────────────
+# ⛔ The checker labels each finding with the QUESTION it failed (`DRIFT(identity|record|checkout):`) and
+# leaves the record/surface remainders bare (`DRIFT:`). The bringup's warning counted with `^DRIFT:`,
+# which matched only the bare shape — so on the box this verb exists for (the deployed copy DIFFERS,
+# the labelled case) it printed `0 finding(s)` beside a drift report it had just received. This arm
+# grades the count against the producer's real vocabulary: 3 lines in, 3 findings reported.
+say_case "§14 the drift warning counts LABELLED findings too — a count that contradicts its own report is a lie"
+DD="$T/dd"; mk_bin "$DD/bin" mac; mk_harness "$DD/harness" 1; mk_clone "$DD/repo" "daniel-ospina/agent-infra"
+mkdir -p "$DD/home"
+BRINGUP_ARGS=check bringup "$DD/home" "$DD/bin" "$DD/harness" REPO="$DD/repo" O="$DD/O" ENV_FILE="$DD/home/keys.env"
+[ "$RC" = 0 ] && ok "§14 check: drift is REPORTED, not refused (start is the verb that redeploys \$O)" \
+              || bad "§14 check: rc=$RC over a drifted \$O, want 0 — drift must not block the repair — $OUT"
+case "$OUT" in
+  *"3 finding(s)"*) ok "§14 the warning counts all 3 DRIFT lines — the two labelled ones included" ;;
+  *"finding(s)"*)   bad "§14 the warning MISCOUNTS the drift report (want 3) — $OUT" ;;
+  *)                bad "§14 the warning reported no finding count at all — $OUT" ;;
+esac
+# The behavioural arm above needs the fixture; this one is the SOURCE-level guard that survives a
+# fixture regression. Reverting the pattern to `^DRIFT:` reddens it on any checkout, which is the arm
+# a future lane editing the warning needs: the count is a reader of the checker's vocabulary, so it may
+# not hard-code one shape of it.
+if grep -q "grep -c '\^DRIFT:'" "$BRINGUP"; then
+  bad "§14 the finding count is anchored on '^DRIFT:' — it cannot match DRIFT(<question>): lines"
+else
+  ok "§14 the finding count does not anchor on the colon (it matches the labelled shape too)"
+fi
+
+
+# ── §15 the deploy REFUSES to overwrite an uncommitted edit in $O — and RECORDS what it wrote ────
+# ⛔ MEASURED 2026-10-28: a hand-applied fix to `$O/merge-one.sh` was reverted TWICE by redeploys. The
+# two deploy paths learned to refuse (exit 78) and to record `$O/.harness-provenance`; `start` — the Mac
+# verb operators actually run — is a THIRD writer of `$O/*.sh` and kept copying over the patch after a
+# warning. A refusal present in two of three writers is a gate with a door beside it, and a box written
+# by the ungated one carried bytes no record described. Both halves are pinned here, in order: the
+# record (so an edit is even distinguishable), the refusal, and the deliberate override.
+say_case "§15 a deploy REFUSES to overwrite an uncommitted edit in \$O, and RECORDS what it wrote"
+GS="$T/gs"; mk_bin "$GS/bin" mac; mk_clone "$GS/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GS/home/Library/LaunchAgents" "$GS/O" "$GS/harness"; mk_render_harness "$GS/harness"
+# The source ships the real checker/writer, so the arm grades the shipped instrument, not a stub.
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GS/harness/"
+printf '#!/bin/bash\necho SHIPPED-A\n' > "$GS/harness/worker-a.sh"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GS/home/keys.env"
+mk_controller "$GS/O"
+GS_PID="$(start_controller "$GS/O")"; sleep 0.4; printf '%s\n' "$GS_PID" > "$GS/O/.orch.lock"
+mk_launchctl_pid "$GS/bin" "$GS_PID"
+GS_SHIPPED="$(ls "$GS/harness"/*.sh | wc -l | tr -d ' ')"
+BRINGUP_ARGS=start bringup "$GS/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$GS/home/keys.env"
+# ⛔ NOT `[ $RC = 0 ]`. `start` ends with the FLEET table, which on a host whose components cannot be
+# read returns 2 for reasons that have nothing to do with this deploy (the same pre-existing arm colour
+# as `deploy:`/`start (adopt)` above). What this arm is about is that the deploy RAN and was not
+# refused, and that is asserted directly: the deploy line, the record, and the manifest.
+[ "$RC" != 1 ] && grep -q 'deployed [0-9]* harness script' <<<"$OUT" \
+  && ok "§15 start (mac): a clean deploy RUNS and is not refused" \
+  || bad "§15 start (mac): the clean deploy did not run / was refused — rc=$RC $OUT"
+[ -f "$GS/O/.harness-provenance" ] \
+  && ok "§15 the deploy RECORDED \$O's provenance (the box is attributable, not inferred)" \
+  || bad "§15 the deploy wrote NO .harness-provenance — the next deploy is blind again, which is the incident"
+if [ -f "$GS/O/.harness-provenance" ]; then
+  grep -q "^files=$GS_SHIPPED\$" "$GS/O/.harness-provenance" \
+    && ok "§15 the record's files= count matches the $GS_SHIPPED file(s) the source shipped" \
+    || bad "§15 the record does not describe what was shipped — $(grep '^files=' "$GS/O/.harness-provenance" 2>/dev/null)"
+  grep -q " worker-a.sh\$" "$GS/O/.harness-provenance" \
+    && ok "§15 the record carries a sha256 for the shipped worker" \
+    || bad "§15 the record has no manifest line for worker-a.sh"
+fi
+# THE INCIDENT: a hand patch to a file the deploy ships.
+printf '#!/bin/bash\necho HAND-PATCHED\n' > "$GS/O/worker-a.sh"
+G2="$T/gs2"; mkdir -p "$G2/home" "$G2/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$G2/home/keys.env"
+BRINGUP_ARGS=start bringup "$G2/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$G2/home/keys.env"
+[ "$RC" = 1 ] && ok "§15 start: an uncommitted edit in \$O is a REFUSAL (rc=1), not a warning" \
+              || bad "§15 start: rc=$RC over a hand-patched \$O, want 1 — the patch is not protected — $OUT"
+case "$OUT" in
+  # ⛔ BOTH HALVES, because either alone is satisfiable without a refusal: the deploy's own plan line
+  # also names the file, and the `refuse` line is generic by contract. The DIAGNOSIS is the pair.
+  *"UNCOMMITTED-EDIT"*worker-a.sh*) case "$OUT" in
+      *"REFUSED"*) ok "§15 the refusal NAMES the file it would have overwritten, and refuses" ;;
+      *) bad "§15 the edit was diagnosed but nothing refused it — $OUT" ;;
+    esac ;;
+  *) bad "§15 the refusal named no file — an operator cannot act on that — $OUT" ;;
+esac
+grep -q 'HAND-PATCHED' "$GS/O/worker-a.sh" \
+  && ok "§15 the patched bytes are STILL THERE (a refusal copies nothing)" \
+  || bad "§15 the patch was OVERWRITTEN anyway — this is the 2026-10-28 incident, reproduced"
+# …and the override is opt-in BY NAME, on the command line.
+G3="$T/gs3"; mkdir -p "$G3/home" "$G3/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$G3/home/keys.env"
+BRINGUP_ARGS="start --accept-discard" bringup "$G3/home" "$GS/bin" "$GS/harness" REPO="$GS/repo" O="$GS/O" ENV_FILE="$G3/home/keys.env"
+[ "$RC" != 1 ] && ok "§15 start --accept-discard: proceeds — the refusal is never the last word" \
+  || bad "§15 start --accept-discard: STILL refused (rc=1) after a deliberate override — $OUT"
+case "$OUT" in
+  *"--accept-discard"*) ok "§15 the override is announced, so the discard is never silent" ;;
+  *) bad "§15 the override discarded an edit and said nothing — $OUT" ;;
+esac
+grep -q 'SHIPPED-A' "$GS/O/worker-a.sh" && ! grep -q 'HAND-PATCHED' "$GS/O/worker-a.sh" \
+  && ok "§15 --accept-discard did deploy the shipped bytes (the flag means discard, not abort)" \
+  || bad "§15 --accept-discard left the patch in place — the flag is a no-op"
+kill -9 "$GS_PID" 2>/dev/null
+
+
+# ── §15b the record describes the WRITE SET, on a source that also ships non-.sh files ────────────
+# ⛔ MEASURED 2026-10-30 (review of PR #3053), reproduced with the shipped tool before the fix: `write`
+# inventories `--src` RECURSIVELY and calls a source file missing from `$O` a FAILED deploy, while `start`
+# copies only depth-1 `*.sh`. A real harness directory also ships `README.md`, `ARCHITECTURE.md`, `*.py`,
+# `retired/`, `gh-rest/gh` — so on every real box `write` refused ("the source ships README.md but `$O`
+# has no such file"), NO record was written by the verb operators actually run, and §15's own refusal
+# then sat on `drc=2` CANNOT-TELL forever: a gate with no witness, on the population it was added for.
+# Every fixture was `.sh`-only, which is exactly why §15 was green. This arm gives the source the shape
+# the real harness has, and pins BOTH halves: the record is written (files= counts what was written), and
+# an edit to a file this deploy does NOT write neither refuses the run nor enters the manifest.
+say_case "§15b the record covers what the deploy WROTE, on a source that also ships non-.sh files"
+GW="$T/gw"; mk_bin "$GW/bin" mac; mk_clone "$GW/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GW/home/Library/LaunchAgents" "$GW/O" "$GW/harness"; mk_render_harness "$GW/harness"
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GW/harness/"
+printf '# the docs a real harness ships beside its scripts\n' > "$GW/harness/README.md"
+mkdir -p "$GW/harness/retired"; printf '#!/bin/bash\ntrue\n' > "$GW/harness/retired/old.sh"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GW/home/keys.env"
+mk_controller "$GW/O"
+GW_PID="$(start_controller "$GW/O")"; sleep 0.4; printf '%s\n' "$GW_PID" > "$GW/O/.orch.lock"
+mk_launchctl_pid "$GW/bin" "$GW_PID"
+# The box already carries a `README.md` whose bytes no deploy wrote — `install.sh` seeds the whole tree, so
+# this is the ordinary state of a real Mac, not a contrived one. `start` does not write it, so it must not
+# refuse over it (and must not then claim it in the manifest).
+printf 'locally edited docs — not a file start writes\n' > "$GW/O/README.md"
+GW_SHIPPED="$(ls "$GW/harness"/*.sh | wc -l | tr -d ' ')"
+BRINGUP_ARGS=start bringup "$GW/home" "$GW/bin" "$GW/harness" REPO="$GW/repo" O="$GW/O" ENV_FILE="$GW/home/keys.env"
+[ "$RC" != 1 ] && ok "§15b an edit to a file this deploy does NOT write is not a refusal" \
+  || bad "§15b a non-.sh edit in \$O refused the run — the check is told the source tree, not the write set — rc=$RC $OUT"
+[ -f "$GW/O/.harness-provenance" ] \
+  && ok "§15b a source that ships non-.sh files still RECORDS the box" \
+  || bad "§15b NO record over a source that ships README.md — every real harness box stays unrecorded, and the §15 refusal is inert there — $OUT"
+if [ -f "$GW/O/.harness-provenance" ]; then
+  grep -q "^files=$GW_SHIPPED\$" "$GW/O/.harness-provenance" \
+    && ok "§15b the record's files= counts the $GW_SHIPPED file(s) this run WROTE" \
+    || bad "§15b the record's files= is not the write set — $(grep '^files=' "$GW/O/.harness-provenance" 2>/dev/null) (want $GW_SHIPPED)"
+  grep -q '  README.md$' "$GW/O/.harness-provenance" \
+    && bad "§15b the record claims a file this deploy never wrote — a manifest of the SOURCE TREE is not a record of the run" \
+    || ok "§15b the record does not claim the non-.sh file it never wrote"
+  grep -q 'retired/old.sh$' "$GW/O/.harness-provenance" \
+    && bad "§15b the record claims a NESTED file this deploy never wrote" \
+    || ok "§15b the record does not claim the nested file it never wrote"
+fi
+# …and the half that must still bite: an edit to a file it DOES write is still a refusal, with the record
+# present (so this arm cannot pass by the record being absent — the state that made §15 blind).
+printf '#!/bin/bash\necho HAND-PATCHED\n' > "$GW/O/worker.sh"
+BRINGUP_ARGS=start bringup "$GW/home" "$GW/bin" "$GW/harness" REPO="$GW/repo" O="$GW/O" ENV_FILE="$GW/home/keys.env"
+[ "$RC" = 1 ] && ok "§15b an edit to a file it DOES write is STILL a refusal" \
+  || bad "§15b rc=$RC over a hand-patched \$O/worker.sh with a record present, want 1 — the gate is blind — $OUT"
+grep -q 'HAND-PATCHED' "$GW/O/worker.sh" \
+  && ok "§15b …and the refusal preserved the patch" \
+  || bad "§15b the patch was overwritten — the 2026-10-28 incident, reproduced through the .sh path"
+kill -9 "$GW_PID" 2>/dev/null
+
+
+# ── §15c the CANNOT-VERIFY arm prints the CHECKER's verdict, and claims no cause ──────────────────
+# ⛔ THE THIRD DEPLOY PATH'S CANNOT-VERIFY ARM WAS GRADED BY NOTHING (review of #3090).
+# `deploy-harness.sh` and `deploy-mac-orchestrator.sh` each got a mutation-proven arm in that PR; this
+# one — the arm `start`, the verb operators actually run, reaches — was reached by no assertion, so
+# reverting it to the old sentence reddened nothing. The old sentence was "(no readable provenance
+# record there)", and it was FALSE on most of the branch: `*)` takes every code that is neither 0 nor 1,
+# and the state measured here (a record that EXISTS and is perfectly readable, with `files=0`) is one of
+# them. The checker printed "EMPTY manifest"; the arm discarded it and substituted a guess, handing the
+# operator the remedy for an ABSENT record when what they had was a CORRUPT one — on the path that
+# overwrites `$O`. Both halves are pinned: the checker's line is printed, and no cause is asserted.
+say_case "§15c an unreadable-but-present record names the CHECKER's verdict, not a fabricated cause"
+GU="$T/gu"; mk_bin "$GU/bin" mac; mk_clone "$GU/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GU/home/Library/LaunchAgents" "$GU/O" "$GU/harness"; mk_render_harness "$GU/harness"
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GU/harness/"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GU/home/keys.env"
+mk_controller "$GU/O"
+GU_PID="$(start_controller "$GU/O")"; sleep 0.4; printf '%s\n' "$GU_PID" > "$GU/O/.orch.lock"
+mk_launchctl_pid "$GU/bin" "$GU_PID"
+# ⛔ THE FIXTURE MUST EARN THE STATE BY DEPLOYING FIRST. Hand-writing a `files=0` record would test the
+# arm over a file no deploy ever wrote, and the arm's own message says "this run records the box" — the
+# measured state is a record a real run WROTE, whose count was later damaged (`files=` no longer matching
+# the manifest). Only then is "present and readable, but cannot describe any bytes" the real situation.
+BRINGUP_ARGS=start bringup "$GU/home" "$GU/bin" "$GU/harness" REPO="$GU/repo" O="$GU/O" ENV_FILE="$GU/home/keys.env"
+[ -f "$GU/O/.harness-provenance" ] \
+  && ok "§15c fixture: the first start RECORDED the box (the state under test is a record that exists)" \
+  || bad "§15c fixture: no record was written, so the arm would pass for the wrong reason — $OUT"
+grep -q '^files=[1-9]' "$GU/O/.harness-provenance" 2>/dev/null \
+  && ok "§15c fixture: the record's files= is a real count before it is damaged" \
+  || bad "§15c fixture: the record already had files=0 — the arm would not be reached by a damaged record"
+# Damage the count, leaving the manifest entries in place: present, readable, unable to describe bytes.
+sed 's/^files=.*/files=0/' "$GU/O/.harness-provenance" > "$T/gu-rec" && mv "$T/gu-rec" "$GU/O/.harness-provenance"
+# ⛔ A SECOND HOME, for the reason §15 uses `$G2`/`$G3`: the controller registry is keyed on $HOME, so a
+# second `start` from the SAME home is refused as "already running" before the deploy is reached at all,
+# and the arm would be graded by a refusal that has nothing to do with it (measured: 3 spurious reds).
+GU2="$T/gu2"; mkdir -p "$GU2/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GU2/home/keys.env"
+BRINGUP_ARGS=start bringup "$GU2/home" "$GU/bin" "$GU/harness" REPO="$GU/repo" O="$GU/O" ENV_FILE="$GU2/home/keys.env"
+# The refusal cannot fire over an unanswerable record, and must not start firing here: the arm is about
+# what the operator is TOLD, not about turning a warning into a gate.
+[ "$RC" != 1 ] && ok "§15c an unanswerable record is a WARNING, not a refusal (the entry points are unchanged)" \
+  || bad "§15c the cannot-verify arm now refuses the run (rc=1) — this PR changes a message, not a gate — $OUT"
+case "$OUT" in
+  *"EMPTY manifest"*) ok "§15c the CHECKER'S verdict is printed, not discarded (“EMPTY manifest”)" ;;
+  *) bad "§15c the checker's own reason never reaches the operator — the arm guessed instead — $OUT" ;;
+esac
+case "$OUT" in
+  *"no readable provenance record"*) bad "§15c the arm still claims the record is UNREADABLE — it is present and readable, so that is a fabricated cause — $OUT" ;;
+  *) ok "§15c the arm does NOT claim the record is unreadable" ;;
+esac
+case "$OUT" in
+  *"could not be USED"*) ok "§15c it claims only what is known: the record could not be USED" ;;
+  *) bad "§15c the arm does not state the one fact every code in that branch shares — $OUT" ;;
+esac
+kill -9 "$GU_PID" 2>/dev/null
 
 
 echo

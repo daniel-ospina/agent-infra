@@ -21,6 +21,22 @@
 #         PHASE=A bash deploy-mac-orchestrator.sh    # A only
 #         WAIT=1  bash deploy-mac-orchestrator.sh    # ALSO wait for a zero-in-flight moment first
 #                                                    # (preference, never a safety requirement)
+#         DRY_RUN=1 bash deploy-mac-orchestrator.sh  # stage, report EVERY file this run would
+#                                                    # overwrite and what it would discard, then stop.
+#                                                    # Nothing under $O is written, no controller is
+#                                                    # touched. Also the safe way to test this script.
+#
+# ── WHAT IT RECORDS, AND WHAT IT REFUSES (2026-10-28) ───────────────────────────────────────────
+# At the end of a COMPLETE deploy (phase B) it writes `$O/.harness-provenance` — the source commit and
+# a sha256 per deployed file — so "which commit is this box running?" has an answer that does not need
+# a checkout, and so the NEXT deploy can recognise a hand patch instead of silently reverting it.
+# MEASURED, this box, 2026-10-28: a hand-applied fix to `$O/merge-one.sh` was reverted TWICE by
+# redeploys (mtime moved at 20:02 and again at 20:15, after the patch); the box then ran unpatched
+# code and a production fix looked like it had "stopped working". So a deploy that would overwrite a
+# file whose bytes no deploy wrote now REFUSES (exit 78) and names every such file, unless
+# `--accept-discard` / `ACCEPT_DISCARD=1` says to discard them deliberately.
+# PHASE=A deliberately leaves `orch-loop.sh` alone, so phase A writes NO record: a commit claim over a
+# half-deployed tree would be false. A box that only ever got phase A reads as UNKNOWN, never clean.
 set -uo pipefail
 
 AI_MAIN="${AI_MAIN:-$HOME/Documents/GitHub/agent-infra}"
@@ -30,6 +46,20 @@ PHASE="${PHASE:-AB}"
 WAIT="${WAIT:-0}"
 PATIENCE="${PATIENCE:-2400}"     # seconds to wait for a quiet moment before giving up on B
 STAGE="${STAGE:-/tmp/harness-main.$$}"
+# ⛔ THE DRY RUN IS AN ENV VAR TOO (like PHASE/WAIT/O), because this script's callers are scripts as
+# often as humans; `--dry-run` is accepted as well. It is what makes the refusal path testable WITHOUT
+# overwriting a live runtime — the incident this file is being fixed for.
+DRY_RUN="${DRY_RUN:-0}"
+ACCEPT_DISCARD="${ACCEPT_DISCARD:-0}"
+for _arg in "$@"; do
+  case "$_arg" in
+    --dry-run)        DRY_RUN=1 ;;
+    --accept-discard) ACCEPT_DISCARD=1 ;;
+    *) echo "deploy-mac-orchestrator: unknown argument: $_arg (known: --dry-run --accept-discard)" >&2; exit 78 ;;
+  esac
+done
+case "$DRY_RUN" in 1|true|yes) DRY_RUN=1 ;; *) DRY_RUN=0 ;; esac
+case "$ACCEPT_DISCARD" in 1|true|yes) ACCEPT_DISCARD=1 ;; *) ACCEPT_DISCARD=0 ;; esac
 # ⛔ REPO IS REQUIRED AND IS NOT DEFAULTED (agent-infra#1935) — but only when this run includes
 # phase B, which RELAUNCHES the controller. An unset REPO would leave a controller that exits 78 on
 # its own guard, and this script's verification would report `after: 0 scoped match(es)` over a
@@ -98,6 +128,154 @@ log "  claims.sh $(wc -c < "$H/claims.sh" | tr -d ' ') bytes, sha256 $(shasum -a
 # ---- 1. record what we are replacing, so the change is auditable -----------------------
 log "before: $(controller_pids | wc -l | tr -d ' ') controller pid(s), $(inflight) in-flight lane/merge session(s)"
 log "before: $O/claims.sh $([ -f "$O/claims.sh" ] && echo present || echo ABSENT)"
+
+# ---- 1a. WHAT THIS RUN WOULD WRITE — computed BEFORE the discard gate, because it is the evidence
+# the operator needs exactly when that gate refuses: "the plan, and the refusal", never one alone.
+# (Measured: --dry-run on a dirty $O used to exit 78 having printed the refusal and NO plan, which
+# threw away the one list that makes --accept-discard a decision rather than a leap.)
+PLAN=""
+for f in "$H"/*; do
+  b="$(basename "$f")"
+  [ "$b" = "orch-loop.sh" ] && continue
+  if [ ! -e "$O/$b" ]; then
+    PLAN="$PLAN
+  new          $b"
+  elif [ -d "$f" ]; then
+    PLAN="$PLAN
+  replace dir  $b"
+  elif cmp -s "$f" "$O/$b"; then
+    PLAN="$PLAN
+  unchanged    $b"
+  else
+    PLAN="$PLAN
+  overwrite    $b   (differs from $SRC_REF)"
+  fi
+done
+
+# ---- 1b. WHAT THIS RUN WOULD OVERWRITE — AND WHAT IT WOULD DISCARD (measured 2026-10-28) ------
+# A hand-applied fix to `$O/merge-one.sh` was reverted TWICE by redeploys on this box; the mtime moved
+# at 20:02 and again at 20:15, nothing printed what was about to be lost, and the box then ran
+# unpatched code while a production fix looked like it had "stopped working". `$O`'s own provenance
+# record says which bytes the LAST deploy wrote, so a file that differs from it is an edit NO deploy
+# made — and overwriting it destroys work that exists nowhere else.
+# ⛔ 78 = refused before ANYTHING was written (no copy, no controller touched, no record replaced).
+# ⛔ DISC_RC STARTS AT 3, NOT 0. It used to start at 0 and be reassigned only when the staged harness
+# ships the checker — so a ref that PREDATES harness-provenance.sh left it 0, the canary below never
+# fired, and the run reported a clean deploy over a box it never inspected. That is the same silence
+# the 2026-10-28 incident is made of, on the arm (`--ref main` on an older ref) most likely to hit it.
+# 3 is none of the checker's own codes (0 clean / 1 edits / 2 unknown / 78 bad invocation), so
+# "there is no checker to run" can never be read as a verdict.
+DISC_OUT=""; DISC_RC=3
+if [ -f "$H/harness-provenance.sh" ]; then
+  # ⛔ ASK ONLY ABOUT WHAT THIS RUN WRITES. `PHASE=A` deliberately leaves `$O/orch-loop.sh` alone (phase B
+  # owns it), so a gate over the whole staged tree refused a phase-A run over a file it never touches
+  # and offered `--accept-discard` for it. `--skip` is the writer's seam for exactly that: the caller
+  # states its own write set.
+  DISC_ARGS=()
+  [ "$PHASE" = "A" ] && DISC_ARGS=(--skip orch-loop.sh)
+  # An ARRAY, not a joined string: an unquoted flag string is the shape that broke the record write in
+  # deploy-harness.sh (a checkout path with a space), and `${arr[@]+"..."}` is the bash-3.2-safe
+  # expansion for an array that may be empty under `set -u` (this file sets `-uo pipefail`).
+  DISC_OUT="$(bash "$H/harness-provenance.sh" check --o "$O" --src "$H" ${DISC_ARGS[@]+"${DISC_ARGS[@]}"} 2>&1)"; DISC_RC=$?
+fi
+if [ "$ACCEPT_DISCARD" -eq 1 ]; then
+  log "ACCEPT_DISCARD=1 — an uncommitted edit in $O (if any) WILL be overwritten by this run"
+elif [ "$DISC_RC" -eq 1 ]; then
+  log "REFUSING: $O carries UNRECORDED EDITS this deploy would OVERWRITE — nothing was copied"
+  printf '%s\n' "$DISC_OUT" >&2
+  # ⛔ "NOWHERE ELSE" WAS A FABRICATED FACT (measured 2026-10-30, review of #3053): a phase-A landing at
+  # an INTERMEDIATE commit then a moved ref reproduces this refusal over bytes a real deploy wrote, which
+  # are in git. The refusal stays (fail-closed); the claim does not.
+  log "  no completed deploy records those bytes: copy them aside first. If they came from a partial"
+  log "  deploy (PHASE=A writes no record), they are the commit THAT run deployed — copy them aside too,"
+  log "  rather than land them in the repo as though they were new work."
+  log "  to discard them deliberately, re-run with --accept-discard. It would do this:"
+  printf '%s\n' "$PLAN"
+  rm -rf "$STAGE"
+  exit 78
+elif [ "$DISC_RC" -ne 0 ]; then
+  # CANNOT-VERIFY: the refusal cannot fire, but silence about it is how the next redeploy quietly
+  # reverts a patch. Said out loud, once, on the path that will overwrite — and the states are NAMED
+  # apart: "nothing is there yet" is the strongest fact; "this ref ships no checker" is a DIFFERENT
+  # problem (deploy from a ref that has one); and the third takes EVERY other code, so it names only
+  # that NO ANSWER was produced and prints the checker's own verdict. ⛔ This preamble used to say the
+  # third one meant "the box carries no record" (record it) — the same guess the arm itself carried,
+  # which was false on most of it (#3089). Handing an operator the wrong remedy sends them to one
+  # that cannot work, and a comment that re-states the guess reintroduces it for the next reader.
+  if [ ! -d "$O" ]; then
+    # ORDER MATTERS: "nothing is there" is the strongest fact, and it is true regardless of which
+    # checker the ref ships. Nested under either other branch it produced a false alarm about files
+    # being lost at a path that does not exist.
+    if [ "$DRY_RUN" -eq 1 ]; then
+      log "note: $O does not exist yet — a DRY RUN writes nothing. The real deploy creates it and (on a"
+      log "      full PHASE=AB run) records it, so the NEXT deploy can tell an edit from its own bytes."
+    elif [ "$PHASE" = "A" ]; then
+      log "note: $O does not exist yet — this run creates it. A PHASE=A run does NOT write the record"
+      log "      (phase B owns orch-loop.sh and the record is written only after both); the next full"
+      log "      deploy will record it."
+    else
+      log "note: $O does not exist yet — this run creates it and writes $O/.harness-provenance, so the"
+      log "      NEXT deploy can tell an edit from its own bytes."
+    fi
+  elif [ ! -f "$H/harness-provenance.sh" ]; then
+    log "WARN: the staged harness from $SRC_REF ships no harness-provenance.sh, so this deploy CANNOT"
+    log "      TELL whether $O carries uncommitted edits; every file it overwrites is UNRECOVERABLE."
+    log "      Deploy from a ref that ships the checker, or record the box by hand before deploying."
+  else
+    # ⛔ THE OLD REMEDY NAMED A PATH THIS SCRIPT DELETES. It pointed at `$H/harness-provenance.sh` — a
+    # file inside `$STAGE`, which every exit path `rm -rf`s — and told the operator to pass
+    # `--src '<the harness dir it currently is>'`, i.e. `$O` itself, which the writer REFUSES by design
+    # ("refusing to record ... from itself"). Three ways unusable. What actually works on this path is
+    # this run: it writes the record at the end.
+    # ⛔ "NO READABLE RECORD THERE" WAS A GUESS, AND A FALSE ONE ON MOST OF THIS ARM (measured
+    # 2026-10-30, review of #3053): this branch takes every code that is neither 0 nor 1 — `files=0`,
+    # a `files=` count that disagrees with the manifest, an unparseable manifest line, an unreadable
+    # file (all rc 2 with a record that is PRESENT and READABLE) and `die`'s 78. ⛔ NOT `commit=UNKNOWN`:
+    # `check` never reads the commit field (only `show` does) — measured, a `commit=UNKNOWN` record exits
+    # 0 clean and 1 after an edit, never 2 (review of #3090). The checker printed the reason; this branch
+    # used to discard it and assert a cause instead. Claim only what is known — no answer was produced —
+    # and print the checker's own verdict above it.
+    printf '%s\n' "$DISC_OUT" >&2
+    log "WARN: cannot tell whether $O carries uncommitted edits — the provenance record could not be USED"
+    log "      (the checker's own verdict is above). The files this run overwrites may include bytes no"
+    log "      deploy wrote — those are NOT recoverable, and nothing here can tell you which they are."
+    if [ "$PHASE" = "A" ]; then
+      log "      Proceed deliberately with --accept-discard. NOTE: a PHASE=A run does NOT write the record"
+      log "      (it exits before phase B); run the full deploy to record the box, and until then this"
+      log "      box has no answer for which commit it runs."
+    else
+      log "      Proceed deliberately with --accept-discard: this run then records the box, and every"
+      log "      later deploy can tell an edit from its own bytes."
+    fi
+  fi
+fi
+
+# ---- 1c. THE DRY RUN — prints the plan computed above and does nothing else ---------------
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "DRY RUN — $SRC_REF ($REV) would be deployed to $O. Nothing under \$O is written; no controller is touched."
+  printf '%s\n' "$PLAN"
+  # ⛔ PHASE-AWARE, BECAUSE THE RUN THIS DESCRIBES IS PHASE-AWARE. It used to promise "the record that
+  # would be written" and "phase B would swap orch-loop.sh" for a `PHASE=A` run — which writes no record
+  # and performs no phase B (its own cannot-verify note says so three paragraphs up). The dry run is the
+  # documented way to inspect this script, so a false line here is how an operator decides wrongly.
+  if [ "$PHASE" = "A" ]; then
+    log "  PHASE=A: phase A would copy $(ls "$H" | grep -vc '^orch-loop.sh$') entries; orch-loop.sh is left alone and NO record is written"
+  else
+    if [ -f "$H/harness-provenance.sh" ]; then
+      log "  the record that would be written: $O/.harness-provenance (commit $REV + a sha256 per deployed file)"
+    fi
+    log "  phase A would copy $(ls "$H" | grep -vc '^orch-loop.sh$') entries, phase B would swap orch-loop.sh"
+  fi
+  rm -rf "$STAGE"
+  exit 0
+fi
+
+# ---- 1d. THE TARGET MUST EXIST BEFORE ANYTHING IS WRITTEN INTO IT -------------------------------
+# ⛔ `install_file` copies to `$O/.<name>.new.$$` and renames; on a path that does not exist yet the `cp`
+# fails and the run dies at "FATAL: claims.sh did not land in $O". The cannot-verify branch above says
+# "this run creates it" — so it has to. (Only the parent of $O is the operator's; $O itself is ours.)
+[ -d "$O" ] || { mkdir -p "$O" || { log "FATAL: cannot create $O"; rm -rf "$STAGE"; exit 1; }; log "created $O"; }
+[ -d "$O" ] || { log "FATAL: $O does not exist and could not be created"; rm -rf "$STAGE"; exit 1; }
 
 # ---- 2. Phase A: copy everything but orch-loop.sh (atomically) -------------------------
 # Runtime state (candidates.txt, checked.txt, dispatched.txt, state/, logs/, wip/) is NOT in the
@@ -288,5 +466,35 @@ log "VERIFIED: controller pid=$P (new inode) holds $O/.orch.lock and runs $O/orc
 log "  registry wiring in the live loop: $(grep -c 'refs/claims' "$O/orch-loop.sh") ref(s)"
 log "  claims.sh present: $([ -f "$O/claims.sh" ] && echo yes || echo NO)"
 log "  snapshot path: $O/state/claims-snapshot"
+# ---- 5. RECORD WHAT THIS BOX IS NOW — commit + per-file manifest (provenance) ----------------
+# ⛔ ONLY HERE, at the end of a COMPLETE deploy: phase A alone leaves orch-loop.sh at its old bytes, so
+# a commit claim written there would describe a tree that is half of one commit and half of another.
+# This record is what `check-deployed-drift.sh` reads first, and what lets the NEXT deploy tell a hand
+# patch from its own last run instead of silently reverting it.
+REVFULL="$(git -C "$AI_MAIN" rev-parse --verify --quiet "$SRC_REF^{commit}" 2>/dev/null)"
+if [ -f "$H/harness-provenance.sh" ]; then
+  # ⛔ THE TWO FIELDS THIS PATH MUST STATE FOR ITSELF, because `$H` is a `git archive` extraction in
+  # `$STAGE` that this script deletes four lines below:
+  #   --source-dirty false  the payload IS a commit's tree — `git archive` cannot carry uncommitted
+  #                         bytes — so the truthful answer is `false`, not the `unknown` the writer
+  #                         derives from a staging dir that is not a checkout. Left underived, the
+  #                         record said `sourceDirty=unknown`, which `check-deployed-drift.sh` REFUSES,
+  #                         and since this record is PREFERRED over install.sh's stamp the box lost the
+  #                         attribution it already had — on the very box class (#3049) this feature is for.
+  #   --origin <checkout>   what gets recorded as `source=`. The PENDING arm of a plain `check --o $O`
+  #                         compares `$O` against `source=`, so recording the deleted `$STAGE` made that
+  #                         arm dead and reported a routine phase-A leftover as a hand edit to recover.
+  if bash "$H/harness-provenance.sh" write --o "$O" --src "$H" \
+       --commit "${REVFULL:-$REV}" --ref "$SRC_REF" --repo "$AI_MAIN" \
+       --source-dirty false --origin "$AI_MAIN/scripts/orchestrator-harness"; then
+    log "provenance: $O/.harness-provenance records commit ${REVFULL:-$REV} ($SRC_REF) + one sha256 per deployed file"
+  else
+    log "WARN: could NOT write $O/.harness-provenance — the bytes deployed above are unrecorded, so"
+    log "      'which commit is this box running?' has no answer for this box until the next deploy."
+  fi
+else
+  log "WARN: the staged harness carries no harness-provenance.sh — this deploy records no commit."
+fi
+
 rm -rf "$STAGE"
 log "DONE — Mac runtime is on $REV with the cross-box claim registry active"
