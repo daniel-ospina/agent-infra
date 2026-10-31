@@ -205,10 +205,24 @@ jobs:
         # expect_trace, pr_is_artifact_only, resolve_issue_ref, and the
         # has_scoping_marker family added by #991 — was decorative.
         #
-        # CI is also the ONLY venue for it: the #1484 main-worktree-guard
-        # blocks local execution of this script (it contains a read-only
-        # `git -C "$ROOT" remote get-url origin`), so neither the maintainer nor
-        # an agent can run the suite on their own machine (#883).
+        # CI is the AUTHORITATIVE venue for it: the required check runs the suite
+        # on every PR, so a regression cannot land unseen.
+        #
+        # ⛔ CORRECTION — the sentence that stood here claimed the #1484
+        # main-worktree-guard made CI the ONLY venue by blocking local execution.
+        # That is FALSE at this head and was already false when this line was
+        # written. `extensions/main-worktree-guard/index.ts` lists
+        # `scripts/check-pipeline-compliance.sh` by name in
+        # `SANCTIONED_SCRIPT_RELPATHS` — the sanctioned-script exemption exists
+        # exactly so hub-rooted sessions can run it (#1129, extended to framework
+        # checkouts by #2332) — and the suite's own recursive deletes target
+        # `mktemp -d` dirs it created itself, so the discard walk allows it too.
+        # Measured 2026-10-31 at this head: `PIPELINE_COMPLIANCE_SELF_TEST=1 …`
+        # exits 0 from BOTH the hub checkout and a linked worktree, while the
+        # guard was demonstrably live in the same session (it refused unrelated
+        # scripts). Corrected rather than deleted: a rationale that an agent
+        # cannot run the gate locally is the reason someone re-derives it from CI
+        # logs instead of just running it, and stale claims are how that starts.
         #
         # NOT a new gate. This executes a suite the script ALREADY ships and
         # which already asserts; it adds no requirement a PR must satisfy and
