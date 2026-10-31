@@ -121,15 +121,184 @@ _override_usable() {
   return 1
 }
 
+# _gh_named_state — the gh layer's NAMED budget state (`gh-core-exhausted resets_in=12m`), or empty
+# when the budget is fine or the record is stale.
+#
+# ⛔ WHY A LANE MUST SAY THIS INSTEAD OF “branch protection UNREADABLE”: on 2026-10-22 the account's
+# REST pool reached `5000 used / 0 remaining` while GraphQL still held 4769. Every lane read the
+# refused protection endpoint as “the merge contract is UNKNOWN”, and the human-facing diagnosis that
+# follows — wrong token, wrong repo, broken protection — was WRONG in all three parts. A budget the
+# fleet's own polling spent is indistinguishable, from inside a lane, from GitHub being down, so the
+# layer names it and this function repeats the name verbatim.
+#
+# ⛔ IT READS LOCAL STATE, DELIBERATELY: this runs at exactly the moment every gh call is refused, and
+# `gh-limit.py --health` is the surface that answers then (no request, no quota, no credentials). The
+# file is read directly rather than shelling out, because a resolver called once per candidate must
+# not add a process per call.
+# ⛔ AND IT IS AGE-BOUNDED, like `last-limit`: a record whose `reset` has passed is not a CURRENT
+# state, or one exhausted window would keep asserting itself for the rest of the day.
+#
+# ⛔ AN UNDATED RECORD IS STILL A STATE — the shape this function USED TO IGNORE ENTIRELY. A refusal
+# that carried no `X-RateLimit-Reset` is recorded with `reset=0` (the layer cannot invent a window),
+# and EVERY `GH_LIMIT_NO_WAIT` caller produces exactly that shape — eight heartbeat tools set it. So
+# requiring `reset > now` made this function print NOTHING in the most common case, and the lane went
+# back to “branch protection UNREADABLE” with no reason, which is the whole defect this exists to
+# remove (measured 2026-10-22: the same record printed nothing here while `gh-limit.py --health`
+# named it). The age bound is the layer's own `HEALTH_UNKNOWN_WINDOW` (900 s) for that shape, and the
+# token says `?` rather than a number nobody measured.
+_gh_named_state() {
+  local dir p line tok reset at now _win _alt _bp _brem _breset _bat _ttl
+  dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
+  # ⛔ AN EMPTY `HOME` IS NOT `/tmp`. A shell that computed `${HOME:-/tmp}/.cache` read a directory the
+  # layer never writes, so NO named state ever reached the rail on such a box (measured, round 10).
+  # Unquoted `~` with `HOME=` expands to the EMPTY string, so the path below becomes
+  # `/.cache/gh-limit` — which is exactly what CPython's `expanduser("~")` yields in the same state
+  # (`posixpath` returns `(userhome + rest) or root`), i.e. the same directory the layer resolves.
+  # Stated as the MEASURED mechanism: bash does NOT consult the passwd entry when `HOME` is set-but-empty.
+  if [ -z "${GH_LIMIT_DIR:-}" ] && [ -z "${XDG_CACHE_HOME:-}" ] && [ -z "${HOME:-}" ]; then
+    dir=~/.cache/gh-limit
+  fi
+  p="$dir/health"
+  # ⛔ THE LAYER HAS A DEGRADED STATE DIR AND THIS READER DID NOT KNOW ABOUT IT. When the primary dir is
+  # UNWRITABLE the layer moves lock/ETag/`last-limit`/`health` to `${TMPDIR}/gh-limit-<uid>` (see
+  # gh-limit.py `state_dir`), so a shell that only reads the primary finds NOTHING on exactly the box
+  # that is already degraded — and the lane loses the named state and falls back to the unexplained
+  # “required checks UNREADABLE”. Follow the same fallback, in the same order.
+  # ⛔ AND AN UNWRITABLE DIR WINS OVER ITS OWN STALE FILE: the layer has ALREADY moved, so a record left
+  # behind there is one nothing can clear (`record_core_ok` unlinks in the fallback), and naming it
+  # asserted an exhaustion the layer no longer held while `--health` said `gh-ok` (measured, round 8).
+  if [ ! -w "$dir" ] || { [ ! -f "$p" ] && [ ! -d "$dir" ]; }; then
+    _alt="${TMPDIR:-/tmp}/gh-limit-${UID:-0}"
+    if [ -d "$_alt" ] && [ -w "$_alt" ]; then
+      dir="$_alt" && p="$dir/health"
+    elif [ ! -w "$dir" ]; then
+      # ⛔ AN UNWRITABLE PRIMARY WITH NO FALLBACK YET IS NOT AN ANSWER — IT IS THE LAYER'S MOVE IN
+      # PROGRESS. Reading the abandoned primary asserted the stale record the layer had already left
+      # behind (`--health` said `gh-ok`), which is a confident diagnosis the layer refuses to make. Say
+      # nothing; the layer will create the fallback and the next read names it.
+      return 0
+    fi
+  fi
+  now="$(date +%s)"
+
+  # ⛔ THE READER MUST CONSULT THE SAME THREE SOURCES, IN THE SAME ORDER, AS `core_pressure()` —
+  # otherwise the rail and `--health` tell two lanes different things about one box (measured, review
+  # round 6: with a FRESH meter reading `core=0` and no refusal yet, `--health` named the state and this
+  # function printed nothing at all; with a fresh meter at 3000 beside an older dated-empty record it
+  # was the other way round). Order: a MEASUREMENT outranks a durable record.
+  #
+  # (1) the shared meter snapshot — `--budget`, free for later readers, TTL `GH_LIMIT_BUDGET_TTL` (30 s)
+  # ⛔ A HALF-WRITTEN FILE IS NOT A MEASUREMENT. `write_state` stages-and-renames, so a torn file means a
+  # hand edit / a version skew, and the layer's `json.load` rejects it — while this sed parse happily read
+  # `{"at": N, "core": {"remaining": 0, "reset": …` and announced an exhaustion the layer called
+  # `gh-ok` (measured, round 8).
+  # ⛔ AND THE FILE ENDS WITH A NEWLINE, so `[ "$(tail -c 1 "$f")" = "}" ]` was NEVER TRUE — command
+  # substitution strips it, the branch was dead, and the MEASUREMENT source that is supposed to outrank
+  # every record never ran in the rail at all (measured, round 9: `od -c` ends `} } \n`, `tail -c 1`
+  # yields the empty string). `grep '}$'` tests the last LINE, which is what the writer produces.
+  _bp="$dir/budget.json"
+  if [ -f "$_bp" ] && grep -q '}$' "$_bp" 2>/dev/null; then
+    _bat="$(sed -n 's/^{[[:space:]]*"at"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
+    _brem="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
+    _breset="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"reset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
+    _ttl="${GH_LIMIT_BUDGET_TTL:-30}"
+    # ⛔ CLAMPED LIKE `cfg_secs` (which honours a DECIMAL): a `case` over `[!0-9]` mapped `45.5` to the
+    # 30 s default while the layer honoured 45.5 — the same two-contracts-for-one-rule asymmetry the
+    # health window had.
+    case "$_ttl" in ''|*[!0-9.+-]*) _ttl=30 ;; esac
+    _ttl="$(awk -v v="$_ttl" 'BEGIN { n = v + 0; if (n < 5) n = 5; if (n > 600) n = 600; printf "%d", n }' 2>/dev/null)"
+    case "$_ttl" in ''|*[!0-9]*) _ttl=30 ;; esac
+    if [ -n "$_bat" ] && [ -n "$_brem" ] && [ -n "$_breset" ]; then
+      if [ "$(( now - _bat ))" -le "$_ttl" ] && [ "$(( _bat - now ))" -le 60 ]; then
+        if [ "$_brem" -eq 0 ] && [ "$_breset" -gt "$now" ]; then
+          printf 'gh-core-exhausted resets_in=%dm' "$(( (_breset - now + 59) / 60 ))"
+          return 0
+        fi
+        # a FRESH snapshot with headroom (or in the low-water band) outranks every older record
+        return 0
+      fi
+    fi
+  fi
+
+  # (2) the durable `core` refusal record — written by the FIRST refused core call on any lane
+  if [ -f "$dir/last-limit" ]; then
+    if grep -q 'bucket=core' "$dir/last-limit" 2>/dev/null && ! grep -q 'recovered=' "$dir/last-limit" 2>/dev/null; then
+      case "$(sed -n 's/.*[[:space:]]remaining=\([0-9][0-9]*\).*/\1/p' "$dir/last-limit" 2>/dev/null)" in
+        0)
+          reset="$(sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p' "$dir/last-limit" 2>/dev/null)"
+          if [ -n "$reset" ] && [ "$reset" -gt "$now" ]; then
+            printf 'gh-core-exhausted resets_in=%dm' "$(( (reset - now + 59) / 60 ))"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+  fi
+
+  # (3) the named health record (dated = a measurement, undated = bounded evidence)
+  [ -f "$p" ] || return 0
+  IFS= read -r line < "$p" 2>/dev/null || return 0
+  tok="${line%% *}"
+  case "$tok" in gh-*) ;; *) return 0 ;; esac
+  # ⛔ A RECORD ABOUT THE OTHER POOL IS NOT A REASON THE *CORE* PROTECTION READ FAILED, AND A RECORD THAT
+  # DOES NOT SAY WHICH POOL IT IS ABOUT IS NOT EVIDENCE AT ALL. This output is embedded in a sentence
+  # about the REST budget, so repeating `gh-graphql-unavailable` wrapped in “the REST budget is spent”
+  # named the wrong pool (round 9) — and the previous fix still ADMITTED a bucketless line whose token
+  # started `gh-core-`, so a torn record made the rail assert an exhaustion `--health` refuses to vouch
+  # for (round 10). `record_core_exhausted` always writes `bucket=core`, so requiring it costs nothing and
+  # is the only form this reader can prove.
+  case "$line" in *"bucket=core"*) ;; *) return 0 ;; esac
+  case "$tok" in gh-core-*) ;; *) return 0 ;; esac
+  reset="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p')"
+  if [ -n "$reset" ] && [ "$reset" -gt 0 ]; then
+    [ "$reset" -gt "$now" ] || return 0
+    printf '%s resets_in=%dm' "$tok" "$(( (reset - now + 59) / 60 ))"
+    return 0
+  fi
+  # undated: current only inside the layer's bounded window, and honest about the number
+  at="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]at=\([0-9][0-9]*\).*/\1/p')"
+  [ -n "$at" ] && [ "$at" -gt 0 ] || return 0
+  # ⛔ THE BOUND IS CLAMPED EXACTLY AS THE LAYER CLAMPS IT (cfg_secs(…, 60, 86400)). Taking the env
+  # verbatim made the two readers DISAGREE about the same record: at window=30 a 45 s-old record
+  # printed nothing here while `gh-limit.py --health` named it — the “two contracts for one rule”
+  # defect, in the pair of readers that must agree or the lane is told two different things. And the
+  # clamp must accept what `cfg_secs` accepts: a DECIMAL (`45.5` → 60) and a NEGATIVE (`-5` → 60)
+  # reach the floor, while a NON-NUMERIC falls back to the default — a digits-only `case`, which is
+  # what this was, sent both of the first two to the 900 s default instead.
+  _win="${GH_LIMIT_HEALTH_UNKNOWN_WINDOW:-900}"
+  case "$_win" in ''|*[!0-9.+-]*) _win=900 ;; esac
+  _win="$(awk -v v="$_win" 'BEGIN { n = v + 0; if (n < 60) n = 60; if (n > 86400) n = 86400; printf "%d", n }' 2>/dev/null)"
+  case "$_win" in ''|*[!0-9]*) _win=900 ;; esac
+  # ⛔ A STAMP IN THE FUTURE IS NOT “EXPIRED” — the layer accepts a negative age (`clock() - at` below
+  # the window, including below zero, which a stepped-back clock or a resumed VM produces) and this
+  # reader used to require `now >= at`, so the two readers disagreed about one record in exactly that
+  # case: the rail printed the old unexplained UNREADABLE while `--health` named the state.
+  [ "$(( now - at ))" -le "$_win" ] || return 0
+  printf '%s resets_in=?' "$tok"
+}
+
 # required_checks <owner/repo> [<gh-binary>]
 # Print the repo's required status-check contexts, space-separated, once each.
 #   rc 0 -> READ from branch protection (the printed set is NON-EMPTY)
 #   rc 1 -> could NOT be read (network / permission / shape); nothing is printed
 # A zero-name read is a FAILED read, never "this repo requires nothing".
 required_checks() {
-  local or="${1:-}" gh="${2:-gh}" raw joined
+  local or="${1:-}" gh="${2:-gh}" raw joined named
   [ -n "$or" ] || return 1
-  raw="$("$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || return 1
+  # ⛔ ESSENTIAL (#2342). A landing cannot proceed without the merge contract, and this endpoint has
+  # NO exact GraphQL equivalent — so it is the one read in the harness allowed to spend the RESERVE
+  # below the layer's floor. Without this line the floor would refuse it, `REQ_SOURCE=fallback` would
+  # follow, and the rail would tell every lane “the merge contract is UNKNOWN” for the last minutes of
+  # every window — the exact misdiagnosis the named state was added to remove.
+  raw="$(GH_LIMIT_ESSENTIAL=1 "$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || {
+    # The read failed. Say WHY when the layer knows: an exhausted budget is a “wait 12 minutes”, not
+    # a “fix your token”. Silence otherwise — the existing fail-closed path is unchanged.
+    named="$(_gh_named_state)"
+    if [ -n "$named" ]; then
+      printf 'repo-authority: %s: required checks UNREAD — %s (the REST budget is spent, not a broken repo, not an invalid token, not GitHub being down). The merge contract is UNKNOWN until the window clears (fail-closed).\n' "$or" "$named" >&2
+    fi
+    return 1
+  }
   # De-duplicate and join on one line: the classifier splits on whitespace, and a newline would
   # otherwise reach it as part of the value rather than as a separator.
   _unrepresentable "$or" "$raw" || return 1
