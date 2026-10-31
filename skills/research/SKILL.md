@@ -2,7 +2,7 @@
 name: research
 description: "Use for ANY non-trivial research — whether the user says 'research this' or the agent needs to investigate a technical question, compare approaches, evaluate trade-offs, understand a new domain, or make architecture decisions. Provides problem reframing, domain detection (Clear/Complicated/Complex), internal+external search, adversarial queries, and depth scaling. NOT for trivial single-fact lookups or content-pipeline keyword/SERP research (use content-research for that)."
 subjects.team: organisation-design-team
-allowed-tools: read write edit bash grep find web_search web_fetch todo_write task mcp_load mcp__seo-intelligence__perplexity_search mcp__seo-intelligence__perplexity_research mcp__exa__web_search_exa mcp__exa__web_fetch_exa
+allowed-tools: read write edit bash grep find web_search web_fetch todo_write task mcp_load mcp__seo-intelligence__perplexity_search mcp__seo-intelligence__perplexity_research
 version: 1.3.0
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
@@ -65,16 +65,20 @@ The bias is toward **using all three sources**, especially external search. Outs
 |------|------|------|--------------|
 | **1** | `mcp__seo-intelligence__perplexity_search` / `perplexity_research` | ~$0.005/query (cheapest) | `mcp_load seo-intelligence` succeeds |
 | **2** | `web_search` with the model passed **explicitly** — `model="sonar"` (the cheapest, and the harness default); `model="sonar-pro"` only when justified | $1/$1 per M tokens (sonar); $3/$15 (sonar-pro) | always loadable |
-| **3** | `web_fetch` for primary sources (vendor docs, specs, RFCs) **plus** the search MCP that does load — `mcp_load exa` → `mcp__exa__web_search_exa` / `mcp__exa__web_fetch_exa` | free / Exa free-tier credits | `web_fetch`: none — always available. exa half: `mcp_load exa` succeeds |
+| **3** | `web_fetch` for primary sources (vendor docs, specs, RFCs) | free | always available — no precondition |
 
-**Rung 2's explicit-model rule:** `model="sonar"` is the default and the cheapest; `model="sonar-pro"` ($3/$15 per M tokens) is permitted **only when the extra quality is justified** — it is not approval-gated, but it must still be named explicitly, and it is never the default. **Rung 3 has two halves:** `web_fetch` needs no precondition and is always available; the exa half is skipped when `mcp_load exa` fails — the rung itself remains available.
+> ⛔ **`exa` is NOT a search route and must not be used.** The owner's ruling (2026-10-31): *"exa should be uninstalled because I never wanted it. external research should be perplexity."* The `exa` MCP server has been removed from `templates/.mcp.base.json` and `.mcp.json` — the two source files every repo/global `.mcp.json` is materialised from. **If a tool offers `exa`, refuse it and say so** — do not load it, do not fall back to it. There is no rung for it on this ladder, and no case where it is the right route. This supersedes the earlier "lazy fallback" arrangement (#419): external search is **Perplexity, full stop**.
+
+**Credentials:** both Perplexity routes authenticate with **`PERPLEXITY_API_KEY`** — rung 1's MCP server inherits it from the environment, rung 2's `web_search` tool uses it directly. It lives in `/home/cmux/keys.env` on the cells (mode 0600). If a route fails on auth, fix the key — never substitute a different search engine to "make progress" (that is the fail-open this rule exists to prevent).
+
+**Rung 2's explicit-model rule:** `model="sonar"` is the default and the cheapest; `model="sonar-pro"` ($3/$15 per M tokens) is permitted **only when the extra quality is justified** — it is not approval-gated, but it must still be named explicitly, and it is never the default. **Rung 3 is a single tool:** `web_fetch` needs no precondition and is always available; it is not a search engine — it reads a URL you already have.
 
 **⛔ The expensive-model prohibition is unchanged and absolute at every rung.** `model="sonar-deep-research"` and `model="sonar-reasoning-pro"` cost $5–40+ per call and require EXPLICIT user approval. Rung 2 is **not** a licence to reach for those — and never rely on the ambient default model either: **name the model on every `web_search` call**, so the call is priced rather than unpriced.
 
 **Availability observed on this machine (agent-infra checkout, measured 2026-09-24 — re-test before quoting):**
 - `mcp_load seo-intelligence` → **`Unknown MCP server 'seo-intelligence'`** — the server is absent from this machine's `.mcp.json`. **Rung 1 is currently UNAVAILABLE here.** Restoring it is a server-config/credential decision for a human — do not invent a config.
 - `web_search` with `model="sonar"` → **works** (verified with a live call). **This is the tested fallback when rung 1 is unavailable.**
-- `mcp_load exa` → **succeeds**, registering `mcp__exa__web_search_exa` + `mcp__exa__web_fetch_exa`. Rung 3's exa half is available (its `web_fetch` half needs no precondition).
+- `mcp_load exa` → **the server no longer exists** — it was removed from the templates by owner ruling (2026-10-31). Do not re-add it, do not attempt to load it.
 - `mcp_load brave-search` → **`MCP error -32000: Connection closed`**. The `${BRAVE_API_KEY}` placeholder is **not** the cause: mcp-client expands an unset `${VAR}` to the **empty string** (`extensions/mcp-client/index.ts` — *"Plain ${VAR} → process.env[VAR] (empty string when unset)"*), so the server **does spawn** and then **exits 1** with `Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, …` (re-verified 2026-09-24: exit code 1, *"Invalid configuration"*). The client surfaces that exit as the closed connection. **brave-search is not a rung of this ladder** — take the lowest rung that loads; record it and move on, do not retry-loop (lazy-load failure class #199/#358).
 
 **PREFLIGHT output line (required in the research output):** `Search tool: <tool + model actually used> — <rung N | rung 1 unavailable: <observed error>> — queries: <attempted> attempted / <returned> returned`. If you moved past rung 1, the reason is stated there. **The two counts are mandatory and must reconcile with the queries the output reports as searched.** A `returned` count below `attempted` is a **partial run** — name every query that did not return, and never let the shortfall pass as a complete evidence set. On rung 2 the counts also expose the rate-limit failure below: a fan-out wider than the bound loses calls to HTTP 429 (Step 3, "Concurrency and 429").
@@ -186,7 +190,9 @@ node scripts/tortoise-memory.mjs query-prior-research --domain "<topic-or-domain
 **Tool selection — take the lowest rung from Step 0.0 that loads, and state it. That ladder is authoritative; this list mirrors it:**
 - **Rung 1** — `perplexity_research` for multi-angle investigation, comparing approaches, "how do others do X" (preferred — richer results, cheapest at $0.005/query); `perplexity_search` for quick single-question lookups, fact checks, "what is X" ($0.005/query). Usable **only if `mcp_load seo-intelligence` succeeds**.
 - **Rung 2 (the tested fallback)** — `web_search` with the model passed **explicitly and cheaply**: `model="sonar"` for AI-summarized answers when you need synthesis ($1/$1 per M tokens); `model="sonar-pro"` for better quality when justified ($3/$15 per M tokens). Never omit the model.
-- **Rung 3** — `web_fetch` for primary sources (vendor docs, specs, RFCs), plus `mcp__exa__web_search_exa` / `mcp__exa__web_fetch_exa` for semantic/scholarly discovery **once** `mcp_load exa` succeeds (free / Exa free-tier credits; the exa half is skipped if it does not load — `web_fetch` is not). Use when the question needs authoritative primary documents or semantic discovery rather than a synthesized answer.
+- **Rung 3** — `web_fetch` for primary sources (vendor docs, specs, RFCs). Use when the question needs authoritative primary documents rather than a synthesized answer. It reads a URL; it does not search.
+
+⛔ **`exa` is not a rung, not a fallback, and not a tool to load.** See the ruling in Step 0.0 above.
 
 **If rung 1 is unavailable, say so in the output and name the rung you used** — never silently substitute.
 
@@ -242,33 +248,52 @@ YouTube is often the first place leading-edge practice appears — before papers
 
 
 
-#### Exa (semantic/scholarly discovery — DEPRECATED from core, lazy on demand #419)
+#### Academic / semantic discovery — no dedicated server (Perplexity + primary fetch)
 
-**Exa** — semantic search for academic papers and technical content. **Secondary, on-demand source — NOT primary** (#419). Perplexity is the primary source for all web research **when rung 1 loads (Step 0.0)**; Exa is a lazy fallback used only when a query needs semantic/scholarly/entity discovery that keyword retrieval misses: specific papers, arXiv preprints, technical documentation, people/company/prospect research. **It is no longer loaded at session start.** Invocation: `mcp_load exa` → next turn `mcp__exa__web_search_exa` / `mcp__exa__web_fetch_exa` (or stdin: `npx -y exa-mcp-server`). If `mcp_load` fails, degrade gracefully to the next available rung of the Step 0.0 ladder (`web_search` with `model="sonar"`) — do not retry-loop (lazy-load failure class #199/#358). **Sub-agents:** dispatched `task` sub-agents start with zero eager MCP connects (#286) — when a sub-agent may need semantic/scholarly discovery, name `exa` in the task tool's `mcp_servers` param, or instruct it to `mcp_load exa` mid-run.
+> ⛔ **There is no `exa`. It was uninstalled by owner ruling (2026-10-31) and must not be re-added.**
+> This section used to describe `exa` as a lazily-loaded semantic/scholarly fallback (#419). That
+> arrangement is superseded: external research routes through **Perplexity** — rung 1
+> (`perplexity_research` / `perplexity_search`) or rung 2 (`web_search`, `model="sonar"`) — and
+> primary documents come from `web_fetch`.
 
-**Brave** — backup only, and **NOT currently loadable on this machine**: it is configured in `.mcp.json`, but `mcp_load brave-search` fails with `MCP error -32000: Connection closed`. The placeholder is **not** the cause — mcp-client expands an unset `${VAR}` to the empty string, so the server **spawns** and then **exits 1** for the missing key (`Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, …`), which the client reports as the closed connection (measured 2026-09-24, premise-labs#400). Setting `BRAVE_API_KEY` is the only thing that restores it; until then **it is not a rung** — resolve the route via the Step 0.0 ladder. Same invocation pattern once it loads. Not a primary source — Perplexity returns better results for all tested query types.
+**How to reach academic and semantic sources without it:**
 
-#### Exa + Brave (legacy — formerly P1 add-ons)
+- **Papers, preprints, people/company research** → rung 1 `perplexity_research` with a
+  discovery-shaped query ("find the 2024–2026 papers on …", "which companies …"). Perplexity
+  returns citations; follow them to the primary source.
+- **A specific paper or spec you already have an identifier for** → rung 3 `web_fetch` on the
+  DOI/arXiv URL. This is strictly better than a semantic search: it is the primary document.
+- **Semantic Scholar / OpenAlex** (below) remain available as **deprecated**, direct-API routes.
+  They need no MCP server and no key beyond their own — but they are noisy for general queries
+  and are not a substitute for a search engine.
 
-**Exa MCP** — semantic discovery (embeddings-based, 81% WebWalker). **Lazy (on demand, #419) — do NOT add to eager core:**
-```json
-// .mcp.json (lazy — loads only via mcp_load exa):
-{"exa": {"command": "npx", "args": ["-y", "exa-mcp-server"], "env": {"EXA_API_KEY": "<key>"}, "lazy": true}}
-```
-Free tier: $10/mo credits (~1.4K searches/mo). Catches what keyword search misses. Weak on time-sensitive queries (24% FreshQA).
+**Brave** — backup only, and **NOT currently loadable on this machine**: it is configured in `.mcp.json`, but `mcp_load brave-search` fails with `MCP error -32000: Connection closed`. The placeholder is **not** the cause — mcp-client expands an unset `${VAR}` to the empty string, so the server **spawns** and then **exits 1** for the missing key (`Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, …`), which the client reports as the closed connection (measured 2026-09-24, premise-labs#400). Setting `BRAVE_API_KEY` is the only thing that restores it; until then **it is not a rung** — resolve the route via the Step 0.0 ladder. Not a primary source — Perplexity returns better results for all tested query types.
 
-**Brave MCP** — independent index verification (47% HLE):
+#### Exa — REMOVED (do not re-add)
+
+`exa` was a semantic-search MCP server (`npx -y exa-mcp-server`, `EXA_API_KEY`). It is **gone**:
+removed from `templates/.mcp.base.json` and `.mcp.json` — the source files every repo-local and
+global `.mcp.json` is materialised from. It must not be re-added (owner ruling, below).
+
+**The owner's ruling, verbatim (2026-10-31):** *“exa should be uninstalled because I never wanted
+it. external research should be perplexity.”*
+
+So: do not `mcp_load exa`, do not add it back to a template "just for semantic searches", do not
+name it in a sub-agent's `mcp_servers` param. If a tool or a doc offers it, refuse it and say so.
+If a query genuinely needs semantic/scholarly discovery, the route is rung 1 Perplexity — see the
+preceding section.
+
+**Brave MCP** — independent index verification, configured but not loadable until `BRAVE_API_KEY`
+is set (see above):
 ```json
 // Add to .mcp.json:
 {"brave-search": {"command": "npx", "args": ["-y", "@brave/brave-search-mcp-server"], "env": {"BRAVE_API_KEY": "<key>"}}}
 ```
 $1/mo for 200 queries. Independent index — cross-source fact-checking.
 
-**Status:** Exa installed but **lazy** (#419) — never eager, never primary. Load on demand via `mcp_load exa` only when a query needs semantic/scholarly/entity discovery (academic papers, arXiv, people/company/prospect research). Perplexity is the go-to source for everything else **when rung 1 loads; where it does not, rung 2 (`web_search` with `model="sonar"`) is the tested fallback — see Step 0.0**. Brave: $1/mo for 200 queries, lazy fallback (**not loadable here until `BRAVE_API_KEY` is set**). Cost discipline: prefer Perplexity first; use Exa/Brave only when semantic discovery or index diversity is needed. When active, they join Perplexity as independent source categories for confidence-tier classification (§5a).
-
 #### Semantic Scholar API (deprecated — unreliable)
 
-**Deprecated.** Intermittent HTTP 500 errors. Keyword search returns noise for precise queries. Use Exa for academic paper discovery instead. (optional — free API key required)
+**Deprecated.** Intermittent HTTP 500 errors. Keyword search returns noise for precise queries. For academic paper discovery, use rung 1 `perplexity_research` (a discovery-shaped query returns citations to follow) and `web_fetch` on the DOI/arXiv URL you land on. `exa` is **not** an alternative — it is uninstalled (Step 0.0). (optional — free API key required)
 
 **Semantic Scholar** — academic paper search (200M+ papers):
 ```
@@ -282,7 +307,7 @@ Skip if the topic is conceptual, strategic, or not tied to a specific library.
 
 #### OpenAlex API (deprecated — search noise)
 
-**Deprecated.** Citation-sorted keyword search returns completely off-topic results (e.g., "Gradient-based learning, 1998" for review methodology queries). Citation bias buries recent relevant papers. Use Exa instead.
+**Deprecated.** Citation-sorted keyword search returns completely off-topic results (e.g., "Gradient-based learning, 1998" for review methodology queries). Citation bias buries recent relevant papers. For citation-ranked discovery, use rung 1 `perplexity_research` — `exa` is **not** an alternative (it is uninstalled, Step 0.0).
 
 **OpenAlex** — academic works search (318M+ works, free and open):
 ```
@@ -296,7 +321,7 @@ Requires `OPENALEX_API_KEY` (set in `.env.local`) for polite pool access. Max 10
 When research requires academic paper discovery, use this 4-stage pipeline:
 
 #### Stage 1: Broad Scan
-Use Exa (`mcp_load exa` first — lazy #419), Brave (independent index), and Perplexity (synthesis) to surface candidate papers and topics. Dispatch the external-search step **always, via the Step 0.0 ladder** (rung 1 preferred; rung 2 `web_search` with `model="sonar"` where rung 1 is unavailable); Exa/Brave only when semantic or index diversity is needed. Perplexity first when it loads — it is the primary source; Exa free tier: $10/mo credits (~1.4K searches). Brave: $1/mo for 200 queries.
+Use **Perplexity** (rung 1 `perplexity_research` preferred; rung 2 `web_search` with `model="sonar"` where rung 1 is unavailable) to surface candidate papers and topics, and Brave (independent index) only when it loads and index diversity is genuinely needed. Dispatch the external-search step **always, via the Step 0.0 ladder**. **`exa` is not part of this flow** — it is uninstalled (Step 0.0) and must not be re-added for paper discovery. Perplexity is the primary source: rung 1 is ~$0.005/query flat, rung 2 is $1/$1 per M tokens (sonar). Brave: $1/mo for 200 queries.
 
 #### Stage 2: Filter
 Use OpenAlex + Semantic Scholar to confirm relevance via metadata. Scoring rubric: citations > 10, year >= 2023, open access preferred. Normalize/dedupe results in synthesis: dedupe by DOI (exact), then title (fuzzy, difflib ratio >= 0.85). The legacy normalize helper lives in the **eldato** repo (`operations/tools/research/normalize.py` — run from an eldato checkout).
@@ -370,7 +395,7 @@ Keep it concise. The goal is actionable insight, not an exhaustive report.
 | 1 source only | **Low** | `⚠️ single-source` | Filed with single-source warning + "verify when new source available" note |
 | 0 sources (LLM memory) | **Speculative** | `⚠️ hypothesis` | Filed as hypothesis with `## Required Evidence` section listing what would confirm/refute |
 
-**"Independent categories" defined:** Sources from different search engines (Perplexity, Exa, Brave — whichever the Step 0.0 ladder made available) OR different source types (academic, practitioner, documentation, competitor) count as independent. Two Perplexity results citing the same underlying article = 1 source.
+**"Independent categories" defined:** Sources from different search engines (Perplexity rungs 1 and 2 are the same engine and count as ONE category; Brave, if it loads, is a second) OR different source types (academic, practitioner, documentation, competitor) count as independent. Two Perplexity results citing the same underlying article = 1 source. **`exa` is not a category** — it is uninstalled (Step 0.0); a claim that previously rested on exa alone is downgraded to `⚠️ single-source`.
 
 **In the synthesis output:**
 - Each claim section carries a confidence tag in its header: `**[LOW]** ⚠️ single-source — verify when new source available`
