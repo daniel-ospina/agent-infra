@@ -155,7 +155,14 @@ fail() { echo "lane-arm: $1" >&2; log "FAIL $1"; exit 4; }
 # ── lock: one arm at a time; break a stale one (a SIGKILLed run cannot clean up) ────────────────
 if [ -e "$LOCK" ]; then
   la="$(age_s "$LOCK")" || la=0
-  if [ "${la:-0}" -lt "$STALE_LOCK_S" ]; then
+  # ⛔ A NEGATIVE AGE IS NOT A FRESH LOCK. A backward clock step, a copied file or `touch -t` puts the
+  # mtime in the future, and a negative number satisfies `-lt STALE_LOCK_S` — so the pass would skip
+  # with exit 0 forever and the stale-break below would be unreachable until real time passed
+  # mtime+900. Under `Type=oneshot` that exit 0 reads as SUCCESS: a healthy timer with nothing
+  # produced, which is the no-op-gate class this whole arm exists to refuse. Treat an unreadable or
+  # future stamp as MAXIMALLY stale (break it), never as a fresh lock.
+  case "$la" in ''|-*) la=$STALE_LOCK_S ;; esac
+  if [ "$la" -lt "$STALE_LOCK_S" ]; then
     echo "lane-arm: another pass holds $LOCK (${la}s) -- skipping" >&2
     log "SKIP lock held ${la}s"
     exit 0
@@ -176,9 +183,19 @@ TMP="$SNAP.arm.$$"
 # measures the mtime of the file this script just wrote, so a cached read would print `snapshot_age=0s`
 # no matter how old the data was and `--max-snapshot-age` could never fire. The clock exists to produce
 # a CURRENT verdict; a cached one is the measurement-artifact-as-state failure it is meant to remove.
-if ! bounded "$BUDGET" "$PY" "$SC/lane-status.py" --json --no-cache >"$TMP" 2>"$STATE/lane-arm.status.err"; then
+# ⛔ A BOUND MUST REPORT AS A BOUND. `bounded()` returns the child's OWN exit status, so a classifier
+# that dies instantly with a real error and a classifier killed at the watchog bound both land here.
+# Reporting the second for both sends the reader to tune a budget instead of to the actual error —
+# which is exactly the misreport this script's header quotes from the cells ("failed after 0.0s of a
+# 60.0s budget", where nothing timed out at all).
+bounded "$BUDGET" "$PY" "$SC/lane-status.py" --json --no-cache >"$TMP" 2>"$STATE/lane-arm.status.err"
+rc=$?
+if [ "$rc" -ne 0 ]; then
   rm -f "$TMP"
-  fail "classifier did not finish within ${BUDGET}s (see $STATE/lane-arm.status.err); previous snapshot left standing"
+  case "$rc" in
+    137|143) fail "classifier KILLED at the ${BUDGET}s bound (see $STATE/lane-arm.status.err); previous snapshot left standing" ;;
+    *)     fail "classifier EXITED $rc — not a timeout (see $STATE/lane-arm.status.err); previous snapshot left standing" ;;
+  esac
 fi
 # A partial/half-written snapshot must never be published, and neither must an empty one.
 if ! "$PY" -c 'import json,sys
