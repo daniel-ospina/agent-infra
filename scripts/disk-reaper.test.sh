@@ -3185,9 +3185,13 @@ assert_contains "$(cat "$T/t62/units-ok/eldato-disk-reaper.service" 2>/dev/null)
 # (b) THE DISARM CASE: the same box after the checkout moved. A path that git does not answer for
 # must be refused — and must write NOTHING, because a written unit is what runs blind every hour.
 # Assert the GUARD'S OWN text, not a bare "REFUSING": any refusal added ahead of the repo check would
-# otherwise keep this green with the repo guard deleted. Two such refusals DO sit ahead of it in
-# `do_install` — DISK_REAPER_WT_AGED_DAYS (installer:596) and the root/SUDO_USER check (installer:1250)
-# — so a bare "REFUSING" match is not hypothetical.
+# otherwise keep this green with the repo guard deleted. Two such refusals DO sit ahead of it ON THE
+# INSTALL PATH — DISK_REAPER_WT_AGED_DAYS (installer:600, in `do_install`) and the root/SUDO_USER check
+# (installer:1254, in `do_install_systemd`, which `do_install` dispatches into before the repo check
+# itself at installer:1265) — so a bare "REFUSING" match is not hypothetical. ⚠️ All three line numbers
+# were RE-READ at this head after the rebase: this comment previously carried 596 / 1250, which were
+# stale by four lines and pointed at prose rather than at the statements they name (a prior review cycle
+# recorded them as "corrected" when they were not — the citation is re-derived here, not adjusted).
 OUT="$(inst62 "$T/t62/vanished-checkout" "$T/t62/units-blind")"; RC=$?
 assert_contains "$OUT" "no repo resolved on this box" \
     "T62 a repo that is not a git checkout is REFUSED (never a blind unit)"
