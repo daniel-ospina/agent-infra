@@ -1405,10 +1405,10 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     name: "IDLE_S",
     owners: ["scripts/orchestrator-harness/lane-bound.sh"],
     value: "IDLE_S=\"\"",
-    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 1200)"'],
+    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 2700)"'],
     axis: "kill",
     guardedBy: NONE,
-    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 1200 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
+    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 2700 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
   },
   {
     name: "MIN_SESSION_AGE_S",
