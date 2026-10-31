@@ -15,21 +15,6 @@
       "whenToLoad": "research/search tasks FIRST (prefer over web_search); also GSC, SERP, Places and HubSpot tasks. NOTE: requires a one-time `npm install` in mcp-servers/seo-intelligence per checkout, or the entry fails to spawn",
       "cost": "~$0.005/query flat; zero cost while sleeping (lazy)"
     },
-    "exa": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "exa-mcp-server"
-      ],
-      "env": {
-        "EXA_API_KEY": "${EXA_API_KEY}"
-      },
-      "lazy": true,
-      "idleTimeoutMs": 900000,
-      "purpose": "Semantic search (Exa) — scholarly/semantic/entity discovery",
-      "whenToLoad": "on demand — semantic/scholarly/prospect discovery only (#419)",
-      "cost": "one light process; Perplexity is the primary source"
-    },
     "brave-search": {
       "command": "npx",
       "args": [
