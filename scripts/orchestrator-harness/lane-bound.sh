@@ -182,21 +182,34 @@ if [ "$POLL_S" -eq 0 ]; then
   [ "$POLL_S" -lt 1 ] && POLL_S=1
 fi
 
+# ⛔ AN ARM-TIME WARNING MUST REACH THE LANE LOG, NOT ONLY STDOUT (agent-infra#2888 review, P2 —
+# verified). `run_agent` launches this helper as `sh lane-bound.sh watch … >/dev/null 2>&1`
+# (spawn-gate.sh), so every bare `printf` here was DISCARDED on the one path that matters: the shipped
+# claim "the pre-emption is warned about at arm time" was true of the tty and false of every real lane,
+# and an operator who never reads the source could not learn that a lane was being wall-killed. So the
+# arm-time warnings go to BOTH surfaces. NOT to `--verdict-file`: its reader takes the FIRST `verdict=`
+# line (`sed … | head -1`), and an arm-time warning there would push the verdict out of first place.
+warn_line() { # warn_line <line>
+  printf '%s\n' "$1"
+  [ -n "$LOGF" ] && printf '%s\n' "$1" >> "$LOGF" 2>/dev/null
+  return 0
+}
+
 # ⛔ A BOUND THAT IS OFF MUST SAY SO. `LANE_BOUND_IDLE_S=0 LANE_BOUND_WALL_S=0` is a supported
 # combination (an operator debugging a lane by hand) and it is also exactly what a fleet-wide typo
 # would look like, so the single line below is the only thing that separates the two.
 if [ "$WALL_S" -eq 0 ] && [ "$IDLE_S" -eq 0 ]; then
-  printf '[lane-bound] WARN tag=%s BOTH bounds are disabled (wall=0 idle=0) — this lane is UNBOUNDED by construction\n' "$TAG"
+  warn_line "$(printf '[lane-bound] WARN tag=%s BOTH bounds are disabled (wall=0 idle=0) — this lane is UNBOUNDED by construction' "$TAG")"
 fi
 # ⛔ THE BACKSTOP MUST SIT ABOVE THE PROGRESS ALLOWANCE, AND A VIOLATION IS LOUD (#2888). The shipped
 # pair was wall 2400 < allowance 2700, i.e. the backstop pre-empted the bound it is supposed to back
 # up — so the progress rule could never reach its verdict and a lane was killed by elapsed time before
 # anything could ask whether it was working. This is a WARN, never a refusal: a caller (and every test
 # here) may arm a deliberately short wall to exercise the ceiling itself, and killing timing is an
-# operator decision (#1070).
+# operator decision (#1070). ⚠️ IT GOES TO THE LANE LOG AS WELL (see `warn_line`) — an operator is told
+# this on every lane that is armed this way, not only on a tty.
 if [ "$WALL_S" -gt 0 ] && [ "$IDLE_S" -gt 0 ] && [ "$WALL_S" -le "$IDLE_S" ]; then
-  printf '[lane-bound] WARN tag=%s the BACKSTOP (wall=%ss) is NOT above the PROGRESS allowance (idle=%ss): the wall clock will pre-empt the progress bound, so a lane that is still working is killed by elapsed time (agent-infra#2888). Set --wall above --idle unless you are deliberately exercising the ceiling.\n' \
-    "$TAG" "$WALL_S" "$IDLE_S"
+  warn_line "$(printf '[lane-bound] WARN tag=%s the BACKSTOP (wall=%ss) is NOT above the PROGRESS allowance (idle=%ss): the wall clock will pre-empt the progress bound, so a lane that is still working is killed by elapsed time (agent-infra#2888). Set --wall above --idle unless you are deliberately exercising the ceiling.' "$TAG" "$WALL_S" "$IDLE_S")"
 fi
 
 # ── the two signals ───────────────────────────────────────────────────────────────────────────────
