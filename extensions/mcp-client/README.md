@@ -98,8 +98,7 @@ owner ruling (2026-10-31: *"exa should be uninstalled because I never wanted it.
 external research should be perplexity"*), which reverses #419's "demote to lazy"
 arrangement. External search is Perplexity: the `seo-intelligence` MCP server
 (`perplexity_research` / `perplexity_search`, rung 1) or the built-in `web_search`
-tool (rung 2). `tests/no-exa-mcp/run.sh` fails the build if any `.mcp.json`
-re-declares it. `tortoise` is launched
+tool (rung 2). `tortoise` is launched
 with `${TORTOISE_HOME}/.venv/bin/python3` (the venv has `fastmcp`; global
 python3 does not).
 

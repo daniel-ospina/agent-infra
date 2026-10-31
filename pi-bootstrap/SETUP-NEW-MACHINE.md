@@ -134,8 +134,7 @@ machine's pi instance.
   the base config for that repo. Base servers: brave-search,
   playwright-browser, gemini, tortoise (plus `seo-intelligence`, the Perplexity
   research server). **`exa` is not among them** — it was uninstalled by owner
-  ruling (2026-10-31); do not re-add it, and `tests/no-exa-mcp/run.sh` fails the
-  build if any `.mcp.json` re-declares it.
+  ruling (2026-10-31); do not re-add it.
 - **Tortoise MCP server:** the base config runs the local `tortoise.mcp_server`
   stdio server. It needs `TORTOISE_HOME` pointing at your tortoise checkout
   (setup.sh auto-wires it if the checkout is in a standard location, e.g.
