@@ -276,6 +276,19 @@
 #                 clean-low guard in main and the predicates below.
 set -euo pipefail
 
+# ⛔ THE RESERVE IS SPENT BY LANDINGS ONLY — AND "THE RESERVE" IS NOT THIS SCRIPT (#2342 review, P1).
+# `gh-limit.py` keeps a reserve below `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read
+# that could not be served from GraphQL. This file used to carry a file-scope
+# `export GH_LIMIT_ESSENTIAL=1` here, which made EVERY `gh` in this script — and in every child it
+# spawns — exempt from that floor. That is the opposite of the policy the layer states
+# (`gh-limit.py::essential()`: "A poll is never essential"; docs/ops/gh-rate-limits.md:454): the
+# floor's reason to exist is the spend measured on THIS rail's own poll loops, so exempting them left
+# the guard unable to fire on its target. ⛔ AND IT BOUGHT THE LANDING'S WRITE NOTHING: `essential()`
+# has exactly one call site, on the NON-mutating arm — a write is refused only by the dated-empty
+# guard, which never consults it. The one in-tree declaration is therefore per call, on the read a
+# landing genuinely cannot do without: `repo-authority.sh::required_checks`
+# (`GH_LIMIT_ESSENTIAL=1 "$gh" api …/protection/required_status_checks`).
+
 # ── closing_issue_refs <text> ─────────────────────────────────────────────
 # Print EVERY issue reference resolved by a closing keyword in <text>, one
 # "owner/repo#num" per line, deduplicated. Mirrors check-pipeline-compliance.sh
@@ -2912,11 +2925,18 @@ PYC4
 # status is invisible here. Stated rather than implied — on agent-infra's own head
 # `statuses == 0`, and a false claim of parity is worse than a named gap.
 RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE-ai-review-gate ai-review-gate-tests}"
-target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
+target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red, 2 = the surface was NOT READ
   local raw
-  raw="$(command gh api "repos/$REPO/commits/$1/check-runs?per_page=100&filter=all" \
+  # ⛔ THREE OUTCOMES, NOT TWO (#2342). This used to be `... 2>/dev/null || true` followed by
+  # `[ -n "$raw" ] || return 1`, which made a REFUSED read indistinguishable from an EMPTY surface —
+  # so a spent budget (or, after #2342, a floor refusal) let the clause-E veto be skipped and a SIGNED
+  # `clean` re-bound onto a head whose own checks were never seen. That is the fail-open the veto
+  # exists to close, reachable from a read that never happened. A failed READ is its own answer.
+  if ! raw="$(command gh api "repos/$REPO/commits/$1/check-runs?per_page=100&filter=all" \
            --paginate \
-           --jq '.check_runs[] | "\(.app.slug // "?")|\(.name)|\(.id)|\(.status)|\(.conclusion // "null")"' 2>/dev/null || true)"
+           --jq '.check_runs[] | "\(.app.slug // "?")|\(.name)|\(.id)|\(.status)|\(.conclusion // "null")"' 2>/dev/null)"; then
+    return 2                       # UNREADABLE — not red, and NOT “not red” either
+  fi
   [ -n "$raw" ] || return 1
   printf '%s\n' "$raw" | awk -F'|' -v excl="$RECORD_REVIEW_RED_EXCLUDE" '
     { # A literal pipe inside a check name (a matrix job named `shard 1 | slow`) shifts
@@ -3088,11 +3108,22 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     if [ -n "$CARRY_ARM" ]; then
       # (E) (#1575) — the veto. Refuse BEFORE printing either arm's success line and
       # before re-binding SHA, so a red target never produces a signed `clean`.
-      if target_head_red "$CURRENT_HEAD"; then
+      # ⛔ `set -e` IS ACTIVE HERE: a bare failing call ABORTS the script before the assignment, so the
+      # three-way verdict must be captured in a condition context. (Measured: without `||`, every
+      # carry arm exited 1 and 28 assertions reddened.)
+      E_RC=0
+      target_head_red "$CURRENT_HEAD" || E_RC=$?
+      if [ "$E_RC" -ne 1 ]; then
+        if [ "$E_RC" -eq 0 ]; then
         echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD IS MEASURABLY RED." >&2
         echo "   A base-only move is still a change to the tree the verdict describes, so re-binding '$VERDICT' to it would put a SIGNED 'clean' on a head whose own checks are failing — an attestation that records a red tree as reviewed-green, and one the merge gate cannot see once the record outlives the run (#4823, #5395, #5292)." >&2
         echo "   The LANE's artifact IS unchanged — that is what the carry proved. Only the head's health is unknown or bad. Re-review at ${CURRENT_HEAD:0:12}…, or re-run the failing checks and re-record." >&2
         exit 3
+        else
+        echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD'S CHECK SURFACE COULD NOT BE READ (UNREADABLE), so “not red” was never established." >&2
+        echo "   A carry re-binds a SIGNED verdict to a new head, so it needs the head's health READ and not merely un-refuted: a REFUSED read (a spent budget, a floor refusal, an auth error) and an EMPTY surface are the same bytes on stdout, and only the exit status tells them apart. Re-read the head's checks once the budget window resets, or re-review at ${CURRENT_HEAD:0:12}… and re-record." >&2
+        exit 3
+        fi
       fi
       if [ "$CARRY_ARM" = "diff" ]; then
         echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2

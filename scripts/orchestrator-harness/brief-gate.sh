@@ -61,9 +61,20 @@ BRIEF_GATE_REFUSED=80
 BRIEF_GATE_UNAVAILABLE=78
 
 # The closed vocabulary a `RUNG:` value must name. Rung 1 = the perplexity MCP; rung 2 = the
-# `web_search` tool (model stated explicitly, `sonar`); rung 3 = `web_fetch` / exa. A rung digit
+# `web_search` tool (model stated explicitly, `sonar`); rung 3 = `web_fetch`. A rung digit
 # alone is not a decision — the tool is what makes the plan executable, so both are required.
-BRIEF_GATE_TOOLS='perplexity, web_search, web_fetch, exa, context7'
+# ⛔ `exa` is deliberately ABSENT from this vocabulary: the server was uninstalled by owner
+# ruling (2026-10-31, "external research should be perplexity"). Named here so the absence
+# reads as a decision, not an omission.
+# ⚠️ WHAT THAT BUYS, PRECISELY (a review measured the wider claim and it was false): a brief
+# whose `RUNG:` line names ONLY `exa` is REFUSED, because no allowed tool is then present.
+# The gate checks PRESENCE and SHAPE, never content — a brief naming `exa` ALONGSIDE an
+# allowed tool still passes (`RUNG: 3 — web_fetch / exa` → exit 0), and that is correct: it
+# also lets a brief mention `exa` solely to prohibit it (`RUNG: 3 — web_fetch (exa is
+# uninstalled)`) pass, which a substring ban would wrongly refuse. So the vocabulary makes
+# `exa` an unusable ROUTE, not a forbidden WORD. See "WHAT THIS FILE DELIBERATELY DOES NOT
+# DO" above; the prohibition itself lives in the research skill and the owner's ruling.
+BRIEF_GATE_TOOLS='perplexity, web_search, web_fetch, context7'
 
 # brief_gate_missing <brief-file|-> — print ONE token per missing element, nothing when complete.
 # `-` reads stdin (pane orders are passed inline, not as files). An unreadable or empty brief prints
@@ -129,7 +140,7 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
     if (_lab == "external" && length(_rest) > 0) external = 1
     if (_lab == "rung" && length(_rest) > 0 &&
         _rest ~ /(^|[^0-9])[1-3]([^0-9]|$)/ &&
-        tolower(_rest) ~ /perplexity|web_search|web[ _-]?fetch|exa|context7/) rung = 1
+        tolower(_rest) ~ /perplexity|web_search|web[ _-]?fetch|context7/) rung = 1
   }
   if (_lab == "contradiction test" && length(_rest) > 0) ct = 1
 }
@@ -225,7 +236,7 @@ EXTERNAL: look OUTSIDE this repo for how comparable systems solve this — vendo
     took from it. Skipping the rung is not allowed; \`web_fetch\` on a primary source always exists.
 RUNG: 2 — web_search model="sonar"   ⛔ REPLACE with the rung you will actually use, naming the tool:
     1 = perplexity MCP (\`mcp__seo-intelligence__perplexity_search\`) · 2 = \`web_search\` with the model
-    passed explicitly (\`sonar\`) · 3 = \`web_fetch\` / exa (\`mcp_load exa\`). If the rung you wanted does
+    passed explicitly (\`sonar\`) · 3 = \`web_fetch\`. If the rung you wanted does
     not load, name the rung you took AND the error you saw — a silent fallback erases the config gap.
 CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling, a decision section in
     a plan doc, a decision comment on an issue, a Tortoise point carrying one? Quote it, and say

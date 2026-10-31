@@ -1380,6 +1380,19 @@ assert_contains "$RECORD_ERR" "TARGET HEAD IS MEASURABLY RED" "11.3a (E) names t
 [ ! -f "$(Q2 424510)" ] && ok "11.3a (E) no record written for a red head" || bad "11.3a (E) wrote a record onto a red head"
 if grep -qF "carry-forward" <<<"$RECORD_ERR"; then bad "11.3a (E) still printed the carry SUCCESS line"; else ok "11.3a (E) the carry success line is not printed"; fi
 
+# 11.3e2 (#2342): a REFUSED read of the target head's surface is NOT "not red". The read used to be
+# `... 2>/dev/null || true` plus `[ -n "$raw" ] || return 1`, so an empty stdout — which a spent
+# budget, a floor refusal and an auth error all produce — skipped the veto and bound a SIGNED `clean`
+# to a head nobody had looked at. A failed READ must be its own answer, and it fails CLOSED.
+rm -f "$(Q2 424516)"
+STUB_CHECKS_FAIL=1 run_record_diff 424516 "$STALE" "body
+
+$(prior_for 424516)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3e2 an UNREADABLE target surface refuses the carry (rc 3)" || bad "11.3e2 carried onto a head whose surface was never read! (rc=$RECORD_RC)"
+assert_contains "$RECORD_ERR" "COULD NOT BE READ" "11.3e2 names the unread surface (not 'not red')"
+[ ! -f "$(Q2 424516)" ] && ok "11.3e2 no record written for an unread surface" || bad "11.3e2 wrote a record onto an unread surface"
+if grep -qF "TARGET HEAD IS MEASURABLY RED" <<<"$RECORD_ERR"; then bad "11.3e2 claimed a RED head it never read"; else ok "11.3e2 does not claim a red head it never read"; fi
+
 # 11.3b: POLARITY CONTROL — a group whose OLDER attempt failed and whose NEWEST
 # passed is NOT red. This is what stops (E) being written as an ungrouped `any
 # failure`, which refuses a green head; this fleet produces re-runs routinely
