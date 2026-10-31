@@ -4682,6 +4682,35 @@ def test_the_cascade_wait_rung_counts_a_still_running_head(monkeypatch):
     assert "filelist=" not in casc[0], casc[0]
 
 
+def test_the_cascade_wait_rung_counts_an_unreadable_classification(monkeypatch):
+    """`wait=` must count the `skipped-unreadable` rows -- the OTHER half of the wait axis.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 10): `_r3_wait` sums `skipped-running` +
+    `skipped-unreadable`, and only the `running` half had an assertion behind it. Deleting
+    `skipped-unreadable` from that sum left the suite GREEN (mutation: `("skipped-running",)` ->
+    `12 passed` over `-k "cascade or rung2 or rung3 or wait or held"`, identical to the unmutated
+    baseline), so the population #1872 r2 exists for could be dropped in silence -- while the banner
+    above names "an unreadable classification" as one of rung 3's three populations.
+
+    The fixture MUST be a MIXED pass: an all-unreadable pass returns at the REFUSING arm
+    (`not classified and skipped.get("unreadable") == len(prs)`), which sits ABOVE the cascade line,
+    so it can never reach the term under test.
+    """
+    def _classify(p):
+        if p["number"] == 73:
+            return None          # a blind check-run read is a HOLD, never work
+        return ("fix-ci", "red", [])
+
+    _rc, joined, payload = _drive_pass(monkeypatch, [_pr(72), _pr(73)], _classify)
+    assert "1 PR(s) had UNREADABLE checks" in joined, joined
+    assert payload.get("unreadable") == 1, payload
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    # the wait axis counts it, beside the rung-2 row that did go out
+    assert "wait=1" in casc[0], casc[0]
+    assert "fix=1" in casc[0], casc[0]
+
+
 def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatch):
     """Rung 1 must name what is ELIGIBLE; only `_finish` may say what was dispatched.
 
@@ -5336,7 +5365,12 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "load_state", lambda: dict(state or {}))
     monkeypatch.setattr(pr, "save_state", lambda st: None)   # never touch the live state file
     monkeypatch.setattr(pr, "open_prs", lambda: prs)
-    monkeypatch.setattr(pr, "classify", lambda p: classified)
+    monkeypatch.setattr(pr, "classify",
+                        # ⛔ A CALLABLE LETS ONE PASS CARRY DIFFERENT CLASSIFICATIONS PER PR. A mixed
+                        # pass is the ONLY shape that reaches the cascade's `wait=` term with a
+                        # rung-2 row beside it, because an all-unreadable pass RETURNS at the
+                        # REFUSING arm (above the cascade line). A tuple stays the common case.
+                        classified if callable(classified) else (lambda p: classified))
     monkeypatch.setattr(pr, "worker_live", live if callable(live) else (lambda name: live))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",

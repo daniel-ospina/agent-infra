@@ -5359,15 +5359,18 @@ def run_pass(args, rubric_note: str = "") -> int:
     # decision, so it is not done here); `filelist=` instead DECOMPOSES the axis, so the
     # human-decision part of the wait is visible rather than renamed away.
     # ⛔ `skipped-surface` IS NOT FOLDED IN: it is an ASK-USER, not blindness, and is issued as its
-    # own `surface=` term — and ⛔ `held=` APPEARS EXACTLY ONCE PER LINE, as the TERMINAL ARM's
-    # TOTAL `_r3 + _held`, never as the ASK-USER count alone (review P2, round 6). An earlier
-    # revision of this comment said surface was "not carried under `held=`" and then said, one
-    # clause later, that the arm below folds it in: a self-refuting banner is worse than no banner,
-    # because a maintainer could obey either half. What is guaranteed: `surface=` names the
-    # SDK-surface ASK-USER split, `wait=` names rung 3 by the banner's definition (`_finish`'s
-    # `blind` PLUS `running`), `filelist=` the
-    # unusable-changed-file-list part of it (a human decides), and `held=` is the arm's total only
-    # in the arm that says so.
+    # own `surface=` term — and ⛔ `held=` APPEARS EXACTLY ONCE PER LINE, AND DENOTES THAT ARM'S OWN
+    # TOTAL (review P2, round 6; corrected round 10). THREE terminal arms print it, and the total is
+    # a different quantity in each: `_r3 + _held` when BOTH hold populations are non-empty, `_r3`
+    # alone on the rung-3-only arm, and `_held` ALONE on the ASK-USER-only arm — which says so in
+    # the same clause ("held for a HUMAN (ASK-USER), not on the rung-3 wait axis"), and
+    # `test_the_cascade_emits_one_held_quantity_under_one_label` drives exactly that fixture. An
+    # earlier revision of this comment claimed the ASK-USER count alone was NEVER printed, which
+    # that third arm refutes — the same self-refuting-banner class as its predecessor, one revision
+    # over. What is guaranteed: `surface=` names the SDK-surface ASK-USER split, `wait=` names rung 3
+    # by the banner's definition (`_finish`'s `blind` PLUS `running`), `filelist=` the
+    # unusable-changed-file-list part of it (a human decides), and `held=` never appears twice in one
+    # line, so no two quantities share the label.
     _r3_wait = sum(counts.get(k, 0) for k in ("skipped-running", "skipped-unreadable"))
     _r3_files = sum(counts.get(k, 0)
                     for k in ("skipped-surface_unreadable", "skipped-surface_partial",
