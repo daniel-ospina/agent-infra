@@ -471,11 +471,13 @@ jobs:
     # only that branch) reds; `CI on main` on `main` (fetch of `refs/remotes/origin/main`)
     # passes.
     #   So materialize the ref here too, under the SAME two conditions as the `extension-tests`
-    # preamble: not the main ref, and actually inside a git work tree. The `--git-dir` clause is
-    # load-bearing for the same reason as there — this repo executes committed `run:` bodies in
-    # non-repo temp dirs (e.g. `scripts/check-pi-pin-lockstep.mjs`), where an unguarded fetch exits
-    # 128 under `bash -e` and takes the step down. No `|| true`: a fetch that cannot produce the
-    # ref must fail loudly, because silently skipping reinstates the false red.
+    # preamble: not the main ref, and actually inside a git work tree. `--git-dir` is a cheap
+    # precondition here — unlike `extension-tests`, nothing in THIS job executes a committed
+    # `run:` body in a non-repo temp dir (that harness targets `test-command`), so the clause is a
+    # guard against a future caller rather than a present need; it costs one `git` call and it
+    # fails closed in the direction that matters (no repo ⇒ nothing to materialize). No `|| true`:
+    # a fetch that cannot produce the ref must fail loudly, because silently skipping reinstates
+    # the false red.
     # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the one
     # runner below, UNSHARDED (main runs once per merge, so the queue a hang would starve is
     # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation

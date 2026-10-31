@@ -1230,6 +1230,24 @@ jobs:
         with:
           node-version: '22'
         timeout-minutes: 10
+      - name: Materialize origin/main so checkout-keyed assertions are judgeable (#3131)
+        # The PR lane fetches `refs/remotes/pull/<N>/merge` and NOTHING else, so `origin/main` does
+        # not exist and any suite that needs it reds for a reason the PR cannot fix. Measured on
+        # three PR runs: `PASS=336 FAIL=1`, the one failure being
+        # `scripts/orchestrator-harness/merge-reminder.test.sh` §27b, which requires
+        # `box-status.sh` to print `ref: origin/main=<sha>` — a line it emits ONLY when
+        # `git rev-parse --verify origin/main` resolves, with no diagnostic when it does not
+        # (#3160). Materialize the ref rather than weaken the assertion.
+        #
+        # NOT `|| true`: a fetch that cannot produce the ref must fail loudly. The `--git-dir`
+        # clause is the only non-failure skip — no repository means no tracking ref to create
+        # (and this lane's `run:` bodies are executed in non-repo temp dirs by the pin suites that
+        # assert them). No `if:` on the step either: `scripts/check-ci-lane-parity.sh` refuses a
+        # conditional step around the shard call, so the condition lives in the shell.
+        run: |
+          if [ "${GITHUB_REF:-}" != "refs/heads/main" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+            git fetch --depth=1 --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          fi
       - name: Bash shards — the ONE list both lanes run (#1369)
         # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
         # hand-kept number, and never a list: the list is the runner's).
