@@ -1527,6 +1527,62 @@ grep -q 'HAND-PATCHED' "$GW/O/worker.sh" \
 kill -9 "$GW_PID" 2>/dev/null
 
 
+# ── §15c the CANNOT-VERIFY arm prints the CHECKER's verdict, and claims no cause ──────────────────
+# ⛔ THE THIRD DEPLOY PATH'S CANNOT-VERIFY ARM WAS GRADED BY NOTHING (review of #3090).
+# `deploy-harness.sh` and `deploy-mac-orchestrator.sh` each got a mutation-proven arm in that PR; this
+# one — the arm `start`, the verb operators actually run, reaches — was reached by no assertion, so
+# reverting it to the old sentence reddened nothing. The old sentence was "(no readable provenance
+# record there)", and it was FALSE on most of the branch: `*)` takes every code that is neither 0 nor 1,
+# and the state measured here (a record that EXISTS and is perfectly readable, with `files=0`) is one of
+# them. The checker printed "EMPTY manifest"; the arm discarded it and substituted a guess, handing the
+# operator the remedy for an ABSENT record when what they had was a CORRUPT one — on the path that
+# overwrites `$O`. Both halves are pinned: the checker's line is printed, and no cause is asserted.
+say_case "§15c an unreadable-but-present record names the CHECKER's verdict, not a fabricated cause"
+GU="$T/gu"; mk_bin "$GU/bin" mac; mk_clone "$GU/repo" "daniel-ospina/agent-infra"
+mkdir -p "$GU/home/Library/LaunchAgents" "$GU/O" "$GU/harness"; mk_render_harness "$GU/harness"
+cp "$HERE/orchestrator-harness/harness-provenance.sh" "$GU/harness/"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GU/home/keys.env"
+mk_controller "$GU/O"
+GU_PID="$(start_controller "$GU/O")"; sleep 0.4; printf '%s\n' "$GU_PID" > "$GU/O/.orch.lock"
+mk_launchctl_pid "$GU/bin" "$GU_PID"
+# ⛔ THE FIXTURE MUST EARN THE STATE BY DEPLOYING FIRST. Hand-writing a `files=0` record would test the
+# arm over a file no deploy ever wrote, and the arm's own message says "this run records the box" — the
+# measured state is a record a real run WROTE, whose count was later damaged (`files=` no longer matching
+# the manifest). Only then is "present and readable, but cannot describe any bytes" the real situation.
+BRINGUP_ARGS=start bringup "$GU/home" "$GU/bin" "$GU/harness" REPO="$GU/repo" O="$GU/O" ENV_FILE="$GU/home/keys.env"
+[ -f "$GU/O/.harness-provenance" ] \
+  && ok "§15c fixture: the first start RECORDED the box (the state under test is a record that exists)" \
+  || bad "§15c fixture: no record was written, so the arm would pass for the wrong reason — $OUT"
+grep -q '^files=[1-9]' "$GU/O/.harness-provenance" 2>/dev/null \
+  && ok "§15c fixture: the record's files= is a real count before it is damaged" \
+  || bad "§15c fixture: the record already had files=0 — the arm would not be reached by a damaged record"
+# Damage the count, leaving the manifest entries in place: present, readable, unable to describe bytes.
+sed 's/^files=.*/files=0/' "$GU/O/.harness-provenance" > "$T/gu-rec" && mv "$T/gu-rec" "$GU/O/.harness-provenance"
+# ⛔ A SECOND HOME, for the reason §15 uses `$G2`/`$G3`: the controller registry is keyed on $HOME, so a
+# second `start` from the SAME home is refused as "already running" before the deploy is reached at all,
+# and the arm would be graded by a refusal that has nothing to do with it (measured: 3 spurious reds).
+GU2="$T/gu2"; mkdir -p "$GU2/home/Library/LaunchAgents"
+printf 'DEEPSEEK_API_KEY=sk-test\n' > "$GU2/home/keys.env"
+BRINGUP_ARGS=start bringup "$GU2/home" "$GU/bin" "$GU/harness" REPO="$GU/repo" O="$GU/O" ENV_FILE="$GU2/home/keys.env"
+# The refusal cannot fire over an unanswerable record, and must not start firing here: the arm is about
+# what the operator is TOLD, not about turning a warning into a gate.
+[ "$RC" != 1 ] && ok "§15c an unanswerable record is a WARNING, not a refusal (the entry points are unchanged)" \
+  || bad "§15c the cannot-verify arm now refuses the run (rc=1) — this PR changes a message, not a gate — $OUT"
+case "$OUT" in
+  *"EMPTY manifest"*) ok "§15c the CHECKER'S verdict is printed, not discarded (“EMPTY manifest”)" ;;
+  *) bad "§15c the checker's own reason never reaches the operator — the arm guessed instead — $OUT" ;;
+esac
+case "$OUT" in
+  *"no readable provenance record"*) bad "§15c the arm still claims the record is UNREADABLE — it is present and readable, so that is a fabricated cause — $OUT" ;;
+  *) ok "§15c the arm does NOT claim the record is unreadable" ;;
+esac
+case "$OUT" in
+  *"could not be USED"*) ok "§15c it claims only what is known: the record could not be USED" ;;
+  *) bad "§15c the arm does not state the one fact every code in that branch shares — $OUT" ;;
+esac
+kill -9 "$GU_PID" 2>/dev/null
+
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

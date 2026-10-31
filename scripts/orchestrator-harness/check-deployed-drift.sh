@@ -810,6 +810,30 @@ if [ "$problems" -gt 0 ]; then
     # A THIRD STATE, NAMED. `payload-differs` would be false (the bytes that ARE there match the
     # record) and `uncommitted-edit` would be false (nothing was edited) — it is an INCOMPLETE tree.
     HTOKEN="incomplete:$(head -1 "$TMPD/missing-names" 2>/dev/null)"
+  elif [ "$DIRTY" = true ]; then
+    # ⛔ A DIRTY-SOURCE RECORD ON THE TIP IS NOT `payload-differs` (measured 2026-10-30, review of
+    # #3053/#3090). It fell through to the else below — but README §4.3 defines that token as "the
+    # bytes differ from the checkout but the record STILL DESCRIBES $O", which is precisely what a
+    # `sourceDirty=true` record does not do: it names a commit whose bytes are not on the box. A token
+    # that sends an operator to "redeploy to adopt" without saying the box was never identifiable is
+    # the same false reassurance the summary sentence below used to give.
+    # ⛔ AND IT IS PLACED BELOW `incomplete:` ON PURPOSE (review of #3090): a record can be dirty AND
+    # name a file `$O` no longer has, and the absent script — the runtime-breakage signal README gives
+    # its own row and its own remedy ("a redeploy CREATES it") — is the more actionable of the two.
+    # Measured: putting this arm first narrowed `incomplete:b.sh` to `source-dirty:<sha>` for a
+    # dirty-source record with a missing file. Precedence, stated rather than implied:
+    # uncommitted-edit > behind/diverged > incomplete > source-dirty > (surface | payload-differs).
+    # ⛔ THE `O_ABSENT` ARM PRECEDES ALL OF THESE (review of #3090): no question about `$O` was
+    # answered, so there is nothing to order it against — and it is NOT the `Q_BYTES=0` surface arm
+    # below, where that flag is a real answer rather than the initialisation at the top of the script.
+    # It is reachable only when the SURFACE pass raised `problems` (`SURF_HIT`), so the token still
+    # names a real drift — in another dir — and never a statement about `$O`.
+    # ⛔ THE LAST TWO ARE ALTERNATIVES, NOT A CHAIN (review of #3090, on this PR's own comment): the
+    # `surface` arm below requires `Q_BYTES=0`, so a surface hit that coincides with `$O`'s own bytes
+    # differing falls through to `payload-differs`. A stated chain ending `surface > payload-differs`
+    # described an order the `if` below does not implement — the exact class of claim this PR exists
+    # to remove. The other-directory fact is carried by the report body's surface-hit line.
+    HTOKEN="source-dirty:${HAS:0:12}"
   elif [ "$SURF_HIT" -eq 1 ] && [ "$Q_RECORD" -eq 0 ] && [ "$Q_IDENT" -eq 0 ] && [ "$Q_BYTES" -eq 0 ]; then
     # $O answered clean; the hit is in another harness dir this box carries. `payload-differs` would be
     # a false statement about $O and would prescribe a redeploy that cannot clear it.
@@ -830,7 +854,15 @@ if [ "$problems" -gt 0 ]; then
     bad "      bash '$HERE/harness-provenance.sh' show --o '$O'   &&   bash '$HERE/harness-provenance.sh' check --o '$O'"
   fi
   if [ "$Q_IDENT" -eq 1 ]; then
-    bad "  (a) identity: the box is recorded from ${HAS:0:12} — $RELATION $REF ($TIP_SHORT). A box deliberately BEHIND a known commit is a known state, not a defect; DIVERGED means it runs code main does not carry."
+    # ⛔ THE ROUTINE-STATE SENTENCE IS ONLY TRUE FOR A CLEAN-SOURCE RECORD (measured 2026-10-30, review
+    # of #3053). Printed under a `sourceDirty=true` record it read "the box is recorded from <sha> —
+    # current main … a known state, not a defect" DIRECTLY BENEATH the line saying that commit does
+    # not describe the deployed bytes. Two sentences, opposite conclusions, one report.
+    if [ "$DIRTY" = true ]; then
+      bad "  (a) identity: the record names ${HAS:0:12} ($RELATION $REF, $TIP_SHORT) but its SOURCE WAS DIRTY, so that commit does not describe the bytes on this box — it was never identifiable. Redeploy from a CLEAN checkout; only then does a commit name these bytes."
+    else
+      bad "  (a) identity: the box is recorded from ${HAS:0:12} — $RELATION $REF ($TIP_SHORT). A box deliberately BEHIND a known commit is a known state, not a defect; DIVERGED means it runs code main does not carry."
+    fi
   fi
   if [ "$Q_BYTES" -eq 1 ]; then
     bad "  (b) checkout: \$O's bytes differ from the checkout at $REF — redeploy to adopt it:"
