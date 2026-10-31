@@ -553,6 +553,79 @@ else
     fi
 fi
 
+# ── LF. THE FORCE-PUSH ARM: the leading `+` is LOAD-BEARING, and dropping it must REDDEN ──────────
+# ⛔ WHY SECTIONS L/LA COULD NOT SEE THIS (review P2, 2026-10-31). Both drive the shipped line on a
+# clone whose `refs/remotes/origin/$BR` does NOT yet exist. Creating a remote-tracking ref for the
+# first time is a fast-forward, so git accepts it WITHOUT the leading `+` — meaning a mutant that
+# drops the `+` from `fix-one.sh`, `adopt-fix.sh` or `merge-one.sh` stayed fully GREEN. Measured in a
+# copy of the tree: all three shipped lines rewritten to `refs/heads/$BR:refs/remotes/origin/$BR` gave
+# `22 passed, 0 failed`.
+#
+# ⛔ WHY THAT MATTERS, and it is the same silent class this whole file exists for. A PR branch is
+# routinely force-pushed, so the destination ref already EXISTS at an OLD commit when the fetch runs.
+# Without `+`, git REFUSES the non-fast-forward update (rc != 0) and **the stale ref survives**:
+#   * `fix-one.sh`'s fetch has no `|| true`, but the ref is still present, so its `git rev-parse
+#     --verify refs/remotes/origin/$BR` guard passes and the fixer materialises the STALE commit;
+#   * `adopt-fix.sh` and `merge-one.sh` swallow the rejection with `|| true`, so `merge-one.sh`'s
+#     `git show origin/$BR:<path>` reviews a tree it never fetched.
+# Both are "no verdict without an observation" one step removed: a caller reads a ref and believes it
+# fetched it. So the arm below REWRITES the remote branch to an UNRELATED root commit (a genuine
+# non-fast-forward) and requires the tracking ref to MOVE to the rewritten tip.
+_FP_N=0
+for _fsib in scripts/orchestrator-harness/fix-one.sh \
+             scripts/orchestrator-harness/adopt-fix.sh \
+             scripts/orchestrator-harness/merge-one.sh; do
+    _FP_N=$((_FP_N + 1))
+    _ffile="$HERE/../$_fsib"
+    if [ ! -f "$_ffile" ]; then
+        bad "$_fsib is missing — the force-push arm cannot be pinned"
+        continue
+    fi
+    _fline="$(live_line "$_ffile" 'git fetch origin' '$BR')"
+    if [ -z "$_fline" ]; then
+        bad "$_fsib has no live (non-comment) 'git fetch origin … \$BR' line — the force-push arm cannot be driven"
+        continue
+    fi
+    _fd="$WORK/fp-$_FP_N"
+    if ! git clone -q --single-branch --branch main "$WORK/origin.git" "$_fd" 2>/dev/null; then
+        bad "could not clone the force-push fixture for $_fsib"
+        continue
+    fi
+    # 1. the SHIPPED line, on a clone that holds the CURRENT remote tip
+    run_shipped "$_fd" fix/some-branch "$WORK/wtf-$_FP_N" "$_fline" || true
+    _fp_before="$(git -C "$_fd" rev-parse --verify --quiet refs/remotes/origin/fix/some-branch 2>/dev/null || true)"
+    if [ -z "$_fp_before" ]; then
+        bad "$_fsib's fetch line created no tracking ref before the rewrite — the force-push arm cannot be driven"
+        continue
+    fi
+    # 2. REWRITE the remote branch to an UNRELATED root commit: a genuine non-fast-forward
+    _fpseed="$WORK/fp-seed-$_FP_N"
+    if ! git -c init.defaultBranch=main init -q "$_fpseed" \
+        || ! git -C "$_fpseed" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "rewritten-$_FP_N"; then
+        bad "could not build the rewrite commit for $_fsib"
+        continue
+    fi
+    _fp_after="$(git -C "$_fpseed" rev-parse HEAD)"
+    if ! git -C "$_fpseed" push -q --force "$WORK/origin.git" 'HEAD:refs/heads/fix/some-branch' 2>/dev/null; then
+        bad "could not force-push the rewrite for $_fsib"
+        continue
+    fi
+    if [ "$_fp_after" = "$_fp_before" ]; then
+        bad "the rewrite did not change the tip for $_fsib — the fixture cannot exercise a force-push"
+        continue
+    fi
+    # 3. re-run the SHIPPED line: the tracking ref must MOVE to the rewritten tip
+    run_shipped "$_fd" fix/some-branch "$WORK/wtf-$_FP_N" "$_fline" || true
+    _fp_got="$(git -C "$_fd" rev-parse --verify --quiet refs/remotes/origin/fix/some-branch 2>/dev/null || true)"
+    if [ "$_fp_got" = "$_fp_after" ]; then
+        ok "$_fsib's fetch line UPDATES a force-pushed branch (the leading '+' is load-bearing, not decoration)"
+    elif [ "$_fp_got" = "$_fp_before" ]; then
+        bad "$_fsib's fetch line REFUSED the force-push and left the STALE ref — the leading '+' is missing, so a caller reads a ref it did not fetch"
+    else
+        bad "$_fsib's fetch line left the ref at neither the old nor the rewritten tip ('$_fp_got')"
+    fi
+done
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

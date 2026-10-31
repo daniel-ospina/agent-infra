@@ -2572,7 +2572,16 @@ def _git(args, timeout=120):
 # is. The leading `+` keeps the update valid when the branch was rewritten (a force-push), which a
 # PR branch routinely is.
 def _fetch_refspec(name: str) -> str:
-    """`<name>` -> a refspec that leaves `origin/<name>` resolvable after the fetch.
+    """`<name>` -> the refspec to fetch so the caller can read what it asked for.
+
+    ⛔ THE CONTRACT IS PER ARM (review P2, 2026-10-31). A single line here claimed ONE postcondition
+    for both arms, and it was FALSE for exactly the input the second arm exists for:
+
+      * a bare branch `<b>` -> `+refs/heads/<b>:refs/remotes/origin/<b>`, which DOES leave
+        `origin/<b>` resolvable after the fetch;
+      * a fully-qualified `refs/...` ref -> returned UNCHANGED. That refspec names no DESTINATION, so
+        the fetch lands in FETCH_HEAD only and NO remote-tracking ref is created -- `origin/<ref>'
+        does NOT resolve. A caller of this arm must read FETCH_HEAD, never `origin/<ref>`.
 
     ⛔ THE `refs/` PASSTHROUGH IS DEFENCE, NOT A LIVE CALL SITE (review P2). Both shipped callers
     either pass a bare branch name or short-circuit before reaching here (`fetch_ref or
