@@ -305,6 +305,16 @@ chmod +x "$TMP/bin76/pi"
 # red). The calm answer goes where the gate reads; nothing here disables the gate.
 printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin76/gh"
 chmod +x "$TMP/bin76/gh"
+# ⛔ THE CAPABILITY GATE IS SUPPLIED A READING, NOT SWITCHED OFF (agent-infra#2935). `run_agent` now
+# asks `cell-lane-preflight.sh` whether this box can complete ONE model call and RETURN, and refuses
+# with 71 BEFORE any spawn when it cannot — so on a runner with no provider credential this arm read
+# `rc=71 started=0` (measured in CI: 2 of 29 red, this pair) and never reached the 76 -> 75
+# translation it exists to test. This is the SAME box-dependence #3072 removed from
+# `wip-rescue-exit.test.sh` (#3088), left in this consumer. The seam is the gate's own documented
+# one (`CELL_PREFLIGHT_SH` — spawn-gate.sh keeps the default precisely so a suite can inject a
+# verdict), and the answer goes where the gate reads: nothing here disables the gate.
+printf '#!/usr/bin/env bash\necho "LANE_CAPABILITY=ok why=fixture"\n' > "$TMP/bin76/cell-lane-preflight.sh"
+chmod +x "$TMP/bin76/cell-lane-preflight.sh"
 # ⛔ AND THE REPO, NOT ONLY THE NUMBERS (review cycle 3, P2 — the SAME defect review cycle 2 found in
 # spawn-gate.test.sh, left in this file). `land_backlog_repo` derives owner/name from the CURRENT
 # worktree's origin, and this arm never `cd`s, so it only passed when the runner happened to start in a
@@ -320,7 +330,8 @@ git init -q "$FIXREPO" && git -C "$FIXREPO" remote add origin https://github.com
 # main before the gate existed. Rendered from the shipped validator so it cannot drift from its advice.
 "$ROOT/scripts/orchestrator-harness/brief-gate.sh" --section lane > "$TMP/brief.txt"
 [ -s "$TMP/brief.txt" ] || { echo "FATAL: could not render the brief fixture"; exit 2; }
-res="$(PATH="$TMP/bin76:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 bash -c '
+res="$(PATH="$TMP/bin76:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 \
+  CELL_PREFLIGHT_SH="$TMP/bin76/cell-lane-preflight.sh" bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "1"; }
