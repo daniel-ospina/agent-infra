@@ -651,7 +651,9 @@ except Exception:
 # RELAUNCH" for 95 minutes -- while its pane was live and running the Slack bridge. THE
 # PRESCRIBED REMEDY IS DESTRUCTIVE (respawn-pane REPLACES the pane command), so a
 # record-only read can kill a live lane. The pane settles it: a pi TUI always draws a
-# footer carrying the context budget (`/300k`) and the model (`-flash • high`), and it
+# footer carrying the context budget (`/800k` at the shipped 800K clamp — it was `/300k`
+# before the 2026-10-31 owner move, and historical transcripts still render that, so BOTH
+# are accepted below) and the model (`-flash • high`), and it
 # draws it even when other output interleaves -- the DMeer footer was present, glued to the
 # end of a bridge line. Confirm against the pane BEFORE condemning a lane.
 def _pane_has_pi(uuid):

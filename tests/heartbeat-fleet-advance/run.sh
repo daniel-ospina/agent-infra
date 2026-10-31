@@ -333,6 +333,20 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # (same one-line rewrite), and the shipped egress is untouched: the `send` token, the MSG reads
 # outside the appends, and both block depths are unmoved and pinned above.
 lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "25224790895720"
+# ⛔ AND THE FOOTER SIGNATURE MUST ACCEPT THE BUDGET pi ACTUALLY DRAWS (2026-10-31).
+# `_pane_has_pi` decides whether a pane is driven by pi from a footer marker, so a marker that
+# does not match the LIVE rendering reads a settled lane as unread/idle — the failure that cost a
+# lane 95 minutes (see the function's own note). The owner decision of 2026-10-31 moved the clamp
+# 300K → 800K and pi renders `formatTokens(800000)` = `/800k`; `/300k` must stay for historical
+# transcripts. Assert BOTH literals are present in the tuple, so deleting either one — or the
+# pair-projecting rewrite that would pin it to one era — fails here instead of at a dead lane.
+for _needle in '"/800k"' '"/300k"'; do
+  if grep -qF -- "$_needle" <<<"$(grep -F 'for _m in (' "$HB")"; then
+    pass "_pane_has_pi's footer signature accepts ${_needle}"
+  else
+    fail "_pane_has_pi's footer signature no longer accepts ${_needle} — a pane drawing that budget reads as NO PI (a settled lane reported idle)"
+  fi
+done
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
