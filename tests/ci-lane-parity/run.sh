@@ -1780,13 +1780,31 @@ else
   fi
   # EACH ARM ALONE: revert one at a time. Both must stay green, so neither can be dropped as
   # "redundant" without this arm going red — the belt-and-braces is pinned, not assumed.
+  #
+  # ⛔ AND THE FIXTURE'S OWN STDIN IS THE LIST, NOT THE CALLER'S (#3099 review). `runner-drain-nostdin`
+  # is the driver with `</dev/null` stripped, so its drainer inherits whatever fd 0 the TEST process
+  # holds — a TTY, a pipe, an `ssh host 'bash tests/…'`. With neither `timeout` nor `gtimeout`
+  # installed (the macOS default, so `$FIXTURE_BOUND` is EMPTY) that is an UNBOUNDED HANG, which
+  # falsifies the guarantee stated at `FIXTURE_BOUND`'s definition above; with the bound present it is
+  # a red naming the wrong cause (rc 124). And at EOF the arm cannot fail for the reason it names: a
+  # shard handed EOF drains nothing whether the list is in an array or on stdin, so it would report
+  # "the ARRAY alone is sufficient" for a runner whose array had also been removed. Handing it the
+  # LIST fixes both — the shard still gets a stream it COULD drain, so a future refactor that drops the
+  # ARRAY while `</dev/null` is absent shortens the run and reds this arm, and the caller's stdin stops
+  # mattering.
+  printf '%s\n' tests/ci-lane-parity/drain-a.sh tests/ci-lane-parity/drain-b.sh \
+                tests/ci-lane-parity/drain-c.sh >"$TMP/drain-stdin.txt"
   sed 's| bash "\$1" </dev/null| bash "$1"|' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-nostdin.sh"
-  $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-nostdin.sh" >"$TMP/runner-drain-nostdin.out" 2>&1
-  RC=$?
-  if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-nostdin.out"; then
-    pass "the ARRAY alone is sufficient (a shard without </dev/null still cannot shorten the list)"
+  if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-nostdin.sh"; then
+    fail "the </dev/null removal did not change the file — the shard call moved, and this arm now measures the UNMUTATED runner"
   else
-    fail "without </dev/null the run still shortened (rc $RC) — the array is not doing the work this arm claims: $(cat "$TMP/runner-drain-nostdin.out")"
+    $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-nostdin.sh" <"$TMP/drain-stdin.txt" >"$TMP/runner-drain-nostdin.out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-nostdin.out"; then
+      pass "the ARRAY alone is sufficient (a shard without </dev/null, handed a stream it could drain, still cannot shorten the list)"
+    else
+      fail "without </dev/null the run still shortened (rc $RC) — the array is not doing the work this arm claims: $(cat "$TMP/runner-drain-nostdin.out")"
+    fi
   fi
   awk '
     /^for shard in / { print "while IFS= read -r shard; do"
@@ -1797,12 +1815,16 @@ else
     inold { if ($0 == "done") { inold = 0 }; next }
     { print }
   ' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-stdinloop.sh"
-  $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-stdinloop.sh" >"$TMP/runner-drain-stdinloop.out" 2>&1
-  RC=$?
-  if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-stdinloop.out"; then
-    pass "the </dev/null arm alone is sufficient (a stdin-fed loop cannot be drained when the shard's stdin is closed)"
+  if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-stdinloop.sh"; then
+    fail "the loop revert did not change the file — the loop's shape moved, and this arm now measures the UNMUTATED runner"
   else
-    fail "with the stdin-fed loop and </dev/null the run still shortened (rc $RC): $(cat "$TMP/runner-drain-stdinloop.out")"
+    $FIXTURE_BOUND bash "$DRAIN_FIX/scripts/runner-drain-stdinloop.sh" >"$TMP/runner-drain-stdinloop.out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] && grep -q '✅ all 3 bash shards passed' "$TMP/runner-drain-stdinloop.out"; then
+      pass "the </dev/null arm alone is sufficient (a stdin-fed loop cannot be drained when the shard's stdin is closed)"
+    else
+      fail "with the stdin-fed loop and </dev/null the run still shortened (rc $RC): $(cat "$TMP/runner-drain-stdinloop.out")"
+    fi
   fi
 fi
 
