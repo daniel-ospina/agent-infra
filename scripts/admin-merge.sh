@@ -6288,15 +6288,21 @@ NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unre
 #     baseline measured (a sibling failure in the same file): the rail's own
 #     `attribute_residual` calls that MEASURED-ABSENT, "not present on main",
 #     which is evidence of novelty. Only the absence of ANY measurement of the
-#     file is the missing measurement this constructs. AND EVERY NON-NODEID
-#     CLASS IS NEVER A CANDIDATE, because a base run cannot speak to what it
-#     asserts: an UNATTRIBUTABLE id (a class red across runs under a MOVING id —
-#     "cannot be attributed to this PR", and therefore never a merge), a
-#     guard-step identity (no local runner), and the other non-nodeid families a
-#     local pytest cannot execute (`collect-error::<file>` #6798,
+#     file is the missing measurement this constructs. AND A NON-NODEID CLASS
+#     IS NEVER CLEARABLE, because a base run cannot speak to what it asserts: an
+#     UNATTRIBUTABLE id (a class red across runs under a MOVING id — "cannot be
+#     attributed to this PR", and therefore never a merge), a guard-step
+#     identity (no local runner), and the other non-nodeid families a local
+#     pytest cannot execute (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
 #     `bash-shard::<path>` #2643, `runner::<job>` — passed as argv they make
-#     pytest exit 4 having run NOTHING). `repro_scope` then
+#     pytest exit 4 having run NOTHING). CANDIDACY AND CLEARANCE ARE NOT THE SAME
+#     SET (#1185): `repro_scope` admits ONE guard-step identity into the
+#     candidate set when the base's baseline was read and holds no row for its
+#     step, so the rail can REPORT that the base cannot speak to it — and both
+#     filters above keep it out of the runner's argv and out of the base's
+#     capture, so a candidate of that class is still never cleared.
+#     `repro_scope` then
 #     `repro_candidates` are the one place that decision is made, and the cleared
 #     set is its intersection with the base's own failures (`intersect_sets`,
 #     below);
