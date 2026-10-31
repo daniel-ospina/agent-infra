@@ -1003,6 +1003,9 @@ printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *) cat
 ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s proto dhcp src 169.254.77.2 metric 100\n' "$_d" > "$TMP/iproute.out"
   : > "$TMP/ipaddr.out"
   for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done; }
+# ipfixr <route-line…> — replace just the ROUTE output (a multipath default is several lines; the address
+# fixture is whatever the previous `ipfix` wrote).
+ipfixr() { printf '%s\n' "$@" > "$TMP/iproute.out"; }
 boxidnet_mod() { _m="$1"; ( . "$_m"; PATH="$IPB:$PATH"; CAP_BOXID=""; cap_boxid_net ) 2>/dev/null; }
 boxidnet() { boxidnet_mod "$CAP"; }
 if [ -r /proc/net/route ]; then
@@ -1116,17 +1119,30 @@ MUT
     '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0'
   A10="$(boxidnet)"; RC=$?
   # (b) …and the tie-break among candidates that are equal in BOTH ifindex and secondary-ness is
-  #     NUMERIC. The two addresses are chosen so a STRING compare and an OCTET compare disagree:
-  #     "10.9.10.9" < "10.9.9.10" as strings, but 10.9.9.10 < 10.9.10.9 as octets. Round 2 measured
-  #     that a reverted string compare stayed 207/0 green against the previous fixture, i.e. this half
-  #     graded nothing; this fixture is the one that discriminates.
+  #     NUMERIC. The two addresses are chosen so a STRING compare and a MISSING compare disagree with the
+  #     octet answer, and the LOWER address is emitted FIRST so that "last candidate wins" is wrong too:
+  #     octets ⇒ 10.9.9.10; a string compare ⇒ 10.9.10.9; no numeric term at all ⇒ 10.9.10.9. (Round 5
+  #     measured that with the lower address LAST, a mutant that dropped the numeric term entirely was
+  #     211/0 green, because "last wins" happened to produce the expected value.)
   ipfix eth0 \
-    '3: eth0 inet 10.9.10.9/24 brd 10.9.10.255 scope global eth0' \
-    '3: eth0 inet 10.9.9.10/24 brd 10.9.9.255 scope global eth0'
+    '3: eth0 inet 10.9.9.10/24 brd 10.9.9.255 scope global eth0' \
+    '3: eth0 inet 10.9.10.9/24 brd 10.9.10.255 scope global eth0'
   A10B="$(boxidnet)"
   ck "(10) a secondary never displaces the primary ($A10), and the tie-break is NUMERIC — octets give .9.10, a string compare gives .10.9 ($A10B)" \
      "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.10 ] && echo 0 || echo 1)"
-  # (11) CLAUSE 3'S UNSPECIFIED AND RESERVED PREFIXES (review round 3, finding 2; round 4, finding 1):
+  # (13) THE ROUTE LINE IS NOT ALWAYS ONE LINE (review round 5, finding 3): a multipath default dumps a
+  # bare `default` record first and the devices only on the `nexthop` lines after it. A `NR==1` parse
+  # therefore refuses on such a box (fail-closed, but a silent eligibility loss the comment at
+  # capacity.sh:398-400 presents as handled) — round 5 measured it 211/0 green.
+  ipfix eth0 '3: eth0 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0'
+  ipfixr 'default proto static' '\tnexthop via 169.254.77.1 dev eth0 weight 1' '\tnexthop via 169.254.77.1 dev eth9 weight 1'
+  A13="$(boxidnet)"; RC=$?
+  # …and several main-table defaults at different metrics: the FIRST (lowest metric, iproute2's own order).
+  ipfix eth0 '3: eth0 inet 10.238.144.2/20 scope global eth0' '4: eth9 inet 10.9.9.9/24 scope global eth9'
+  ipfixr 'default via 169.254.77.1 dev eth0 proto dhcp src 169.254.77.2 metric 100' 'default via 169.254.77.1 dev eth9 metric 200'
+  A13B="$(boxidnet)"; RC2=$?
+  ck "(13) a MULTIPATH default (bare first line, devices on the nexthop lines) still yields the egress device's address ($A13), and several defaults use the lowest metric ($A13B)" \
+     "$([ "$RC" -eq 0 ] && [ "$A13" = 10.238.144.2 ] && [ "$RC2" -eq 0 ] && [ "$A13B" = 10.238.144.2 ] && echo 0 || echo 1)"
   # each is addable on this kernel and each appears in `ip -4 -o addr show scope global` (measured under
   # `unshare -rn`), so a clause that drops one publishes an address no peer can use as an identity.
   # ⛔ BOTH HALVES OF THE RESERVED RANGE ARE FED: `224.0.0.7` only exercises `22[4-9]\.` (224-229), so
@@ -1140,27 +1156,27 @@ MUT
   A11C="$(boxidnet)"; RC3=$?
   ck "(11) unspecified (0/8) and BOTH halves of the reserved range (224-229, 230-255) REFUSE rather than being published ([$A11] rc=$RC, [$A11B] rc=$RC2, [$A11C] rc=$RC3)" \
      "$([ "$RC" -eq 1 ] && [ -z "$A11" ] && [ "$RC2" -eq 1 ] && [ -z "$A11B" ] && [ "$RC3" -eq 1 ] && [ -z "$A11C" ] && echo 0 || echo 1)"
-  # (12) THE DARWIN ARM — the branch this change does NOT touch, driven here so its ONE prefix filter
-  # (the shared tail guard, `127.*|169.254.*`) is graded somewhere in the suite. It is reached the way a
-  # Mac reaches it: no `ip` on PATH. Round 4 measured that deleting that tail guard was 209/0 green.
-  DAB="$TMP/bin-darwin"; mkdir -p "$DAB"
-  printf '#!/bin/sh\necho "  interface: eth9"\n' > "$DAB/route"
-  printf '#!/bin/sh\necho cmux\n' > "$DAB/hostname"
-  printf '#!/bin/sh\necho Linux\n' > "$DAB/uname"
-  chmod +x "$DAB/route" "$DAB/hostname" "$DAB/uname"
-  [ -e "$DAB/awk" ] || ln -s "$(command -v awk)" "$DAB/awk" 2>/dev/null || true
-  # ⛔ the ifconfig stub BAKES its answer in: an exported variable would not survive the restricted PATH.
-  da_ifconfig() { printf '#!/bin/sh\nprintf "\\tinet %s netmask 0xffff0000\\n"\n' "$1" > "$DAB/ifconfig"; chmod +x "$DAB/ifconfig"; }
-  boxidnet_darwin() ( da_ifconfig "$1"; PATH="$DAB"; CAP_BOXID=""; . "$CAP"; cap_boxid_net ) 2>/dev/null
-  A12="$(boxidnet_darwin 10.238.144.2)"; RC=$?
-  A12B="$(boxidnet_darwin 169.254.7.7)"; RC2=$?
-  ck "(12) the Darwin arm (no \`ip\` on PATH) answers its interface address ($A12) and REFUSES a link-local one (rc=$RC2, boxid=[$A12B])" \
-     "$([ "$RC" -eq 0 ] && [ "$A12" = 10.238.144.2 ] && [ "$RC2" -eq 1 ] && [ -z "$A12B" ] && echo 0 || echo 1)"
 else
-  echo "  ⏭ §14 (1)-(5), (8)-(11) SKIPPED: this platform has no /proc/net/route, so the Linux arm of"
-  echo "    cap_boxid_net is unreachable here — including the arms that grade clauses 1 and 2 and the"
-  echo "    tie-breaks (8)-(11). Not a pass: CI runs ubuntu-latest, where every arm above is measured."
+  echo "  ⏭ §14 (1)-(5), (8)-(11), (13) SKIPPED: this platform has no /proc/net/route, so the LINUX arm of"
+  echo "    cap_boxid_net is unreachable here — including every arm that grades a clause (8)-(11), (13)."
+  echo "    Arm (12) — the DARWIN arm, the one this platform actually uses — runs below and is NOT skipped."
 fi
+# (12) THE DARWIN ARM (review round 5, finding 2: it used to sit INSIDE the Linux-only branch, so the
+# branch a Mac actually uses was ungraded ON the Mac). It needs no procfs: it is reached the way a Mac
+# reaches it, by there being no `ip` on PATH, so it runs on both platforms.
+DAB="$TMP/bin-darwin"; mkdir -p "$DAB"
+printf '#!/bin/sh\necho "  interface: eth9"\n' > "$DAB/route"
+printf '#!/bin/sh\necho cmux\n' > "$DAB/hostname"
+printf '#!/bin/sh\necho Linux\n' > "$DAB/uname"
+chmod +x "$DAB/route" "$DAB/hostname" "$DAB/uname"
+[ -e "$DAB/awk" ] || ln -s "$(command -v awk)" "$DAB/awk" 2>/dev/null || true
+# ⛔ the ifconfig stub BAKES its answer in: an exported variable would not survive the restricted PATH.
+da_ifconfig() { printf '#!/bin/sh\nprintf "\\tinet %s netmask 0xffff0000\\n"\n' "$1" > "$DAB/ifconfig"; chmod +x "$DAB/ifconfig"; }
+boxidnet_darwin() ( da_ifconfig "$1"; PATH="$DAB"; CAP_BOXID=""; . "$CAP"; cap_boxid_net ) 2>/dev/null
+A12="$(boxidnet_darwin 10.238.144.2)"; RC=$?
+A12B="$(boxidnet_darwin 169.254.7.7)"; RC2=$?
+ck "(12) the Darwin arm (no \`ip\` on PATH — runs on macOS too) answers its interface address ($A12) and REFUSES a link-local one (rc=$RC2, boxid=[$A12B])" \
+   "$([ "$RC" -eq 0 ] && [ "$A12" = 10.238.144.2 ] && [ "$RC2" -eq 1 ] && [ -z "$A12B" ] && echo 0 || echo 1)"
 # (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
 # controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
 # reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
