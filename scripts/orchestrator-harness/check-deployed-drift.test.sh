@@ -63,9 +63,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/deployed-drift.XXXXXX")"; trap 'rm -rf "$TMP"'
 REPO="$TMP/repo"; O="$TMP/O"
 G="git -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
 git init -q -b main "$REPO" >/dev/null 2>&1 || { echo "❌ git init failed"; exit 2; }
-mkdir -p "$REPO/scripts/orchestrator-harness"
+mkdir -p "$REPO/scripts/orchestrator-harness" "$REPO/scripts/lib"
 printf '#!/usr/bin/env bash\necho one\n' > "$REPO/scripts/orchestrator-harness/a.sh"
 printf '#!/usr/bin/env bash\necho two\n' > "$REPO/scripts/orchestrator-harness/b.sh"
+printf '#!/usr/bin/env bash\nlc_fixture() { :; }\n' > "$REPO/scripts/lib/lane-ceiling.sh"
 ( cd "$REPO" && $G add -A && $G commit -q -m fixture ) >/dev/null 2>&1
 HEAD1="$(git -C "$REPO" rev-parse HEAD)"
 ck "fixture repo has a commit" "$([ -n "$HEAD1" ] && echo 0 || echo 1)"
@@ -74,6 +75,10 @@ ck "fixture repo has a commit" "$([ -n "$HEAD1" ] && echo 0 || echo 1)"
 deploy() {
   rm -rf "$O"; mkdir -p "$O"
   cp "$REPO/scripts/orchestrator-harness/a.sh" "$REPO/scripts/orchestrator-harness/b.sh" "$O/" || return 1
+  # the flat deploy's second directory: `deploy-mac-orchestrator.sh` stages the library to `$O/lib/`,
+  # where install.sh sources it — so a TRUTHFUL fixture deployment carries it too.
+  mkdir -p "$O/lib" || return 1
+  cp "$REPO/scripts/lib/lane-ceiling.sh" "$O/lib/lane-ceiling.sh" || return 1
   local payload
   payload="$( ( cd "$O" && for f in *.sh; do $SHA_CMD "$f"; done ) | $SHA_CMD | awk '{print $1}' )"
   printf '{\n "commit": "%s",\n "payloadSha256": "%s",\n "agentInfraDirty": false\n}\n' \
@@ -109,6 +114,22 @@ deploy
 run
 ck "rc is 0 again" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 # ⛔ §1/§2/§3 are one fixture, one byte apart, with opposite verdicts — the non-vacuity control.
+echo
+echo "── §3b the SOURCED library at \$O/lib is compared too (a stale formula is DRIFT, not 'identical') ──"
+# ⛔ IT IS NOT AT DEPTH 1 (#3146 review P1): the repo side is the harness dir's `*.sh` and the deployed
+# side is `ls -1 *.sh` in `$O`, so `$O/lib/lane-ceiling.sh` — the file install.sh SOURCES for the whole
+# `capacity:` report and the whole drift verdict — was compared by NOTHING. Measured pre-fix: one
+# appended byte printed `OK: deployed` and exited 0, so a box could run last week's formula forever
+# while every instrument called the harness byte-identical.
+printf '\n# STALE FORMULA\n' >> "$O/lib/lane-ceiling.sh"
+run
+ck "a stale \$O/lib/lane-ceiling.sh is a byte difference (rc 1), not a pass" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "…and the report NAMES lib/lane-ceiling.sh" "$(qF 'lib/lane-ceiling.sh — the deployed copy DIFFERS' "$OUT" && echo 0 || echo 1)"
+ck "…and says why it matters (install.sh SOURCES it for the report AND the verdict)" \
+   "$(qF 'SOURCES it for the ceiling report' "$OUT" && echo 0 || echo 1)"
+deploy
+run
+ck "restoring the library returns the verdict to OK (0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 
 echo
 echo "── §5 THE PROVENANCE RECORD: the deploy writes it, and the check reads it as question (a) ──"
