@@ -1340,7 +1340,7 @@ reap_uv() {
 # An EMPTY repo list is a fail-closed condition for these classes, not a no-op: a venv/worktree pass
 # that scans nothing looks identical to a clean box.
 resolve_repos() {
-    local r list="" seen=" "
+    local r list="" seen=" " _g="" _rc=0
     REPOS=""
     list="$REPOS_ARG"
     [ -n "$list" ] || list="$(printf '%s\n' "${DISK_REAPER_REPOS:-}" | tr ':' '\n')"
@@ -1356,10 +1356,31 @@ resolve_repos() {
         # ⛔ BOUNDED, LIKE EVERY OTHER PROBE THIS FILE MAKES. A bare `git` on a repo whose `.git` sits on a
         # dead or hung mount blocks the pass WHILE IT HOLDS THE LOCK: the hour's reap never happens, the
         # lock ages out, a contender breaks it, and two passes credit each other's `df` deltas.
-        if ! tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" git -C "$r" rev-parse --git-dir >/dev/null 2>&1; then
+        # ⛔ AND QUOTE GIT'S OWN LINE, NEVER ASSERT A CAUSE — the SAME rule the installer applies in its
+        # resolve_repos (scripts/install-disk-reaper-timer.sh), because the two are one concept and used
+        # to differ (#2159 review: the installer was fixed, this hourly copy kept the old diagnostic).
+        # `rev-parse --git-dir` fails for MANY reasons: a vanished checkout, `chmod 000`, and the fleet's
+        # dominant shape, `fatal: detected dubious ownership in repository at …` (a checkout owned by a
+        # different uid). Stamping all of them "not a git checkout" sends the operator after the one
+        # cause that cannot explain the fault — and suppresses the datum that would. This is the line the
+        # 2026-10-30 incident's hourly log carried, so the fix belongs here too, not only in the installer.
+        # `2>&1 >/dev/null`: stderr duplicates onto the capture pipe BEFORE stdout is discarded, so git's
+        # ERROR is captured and its stdout (the `--git-dir` answer, which this function never reads) is not.
+        _rc=0
+        _g="$(tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" git -C "$r" rev-parse --git-dir 2>&1 >/dev/null)" || _rc=$?
+        if [ "$_rc" -ne 0 ]; then
             # An explicit --repo is the operator's assertion, so a rejected one must be named (the
             # same rule find_delegate applies to a set-but-missing delegate override).
-            log_line "disk-reaper: WARNING: ignoring '$r' — not a git checkout, so a class cannot scan it"
+            if [ "$_rc" = "124" ]; then
+                # 124 is the BOUND firing, not git's answer: a dead or hung mount times out with an
+                # EMPTY stderr, and rendering that as "git gave no message" would hide the one fact
+                # this pass does know about it. Named as itself, like every other bounded probe here.
+                log_line "disk-reaper: WARNING: ignoring '$r' — the git probe did not finish within ${GIT_TIMEOUT:-$DU_TIMEOUT}s (a dead or hung mount), so a class cannot scan it"
+            else
+                # `${_g:-…}` guards the empty-stderr shape (a silent git exits non-zero and says
+                # nothing): an empty "(...)" would name no datum at all, so say so explicitly.
+                log_line "disk-reaper: WARNING: ignoring '$r' — git cannot use it here ($(printf '%s' "${_g:-<git gave no message>}" | head -1)), so a class cannot scan it"
+            fi
             continue
         fi
         REPOS="${REPOS}${REPOS:+
