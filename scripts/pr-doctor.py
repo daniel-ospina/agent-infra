@@ -5289,8 +5289,17 @@ def run_pass(args, rubric_note: str = "") -> int:
     #   rung 2 FIX     the blocking cause, chosen by cause -- `resolve-conflict` (rebase, then record
     #                  + rail), `record-review` (fresh-context review, then record + rail), `fix-ci`
     #                  (repair the red, re-review, rail), `rerun-checks`, `blocked-by-rail`.
-    #   rung 3 WAIT    nothing to dispatch: `running` (the head is still executing) or an unreadable
-    #                  classification. Stated, never silent.
+    #   rung 3 WAIT    nothing to dispatch: `running` (the head is still executing), an unreadable
+    #                  classification, or an unusable changed-file list. ⛔ ONE DEFINITION, and every
+    #                  mention of the axis in this block means exactly this: rung 3 is every row the
+    #                  pass HELD WITHOUT A DISPATCH that a later pass retries on its own, and `wait=`
+    #                  IS that set (`_finish`'s `blind` PLUS `running` -- noting that `blind` alone has
+    #                  NO `running` term). ONE subset is named INSIDE it: `filelist=`, the part no
+    #                  re-read will clear, so a human must resolve it. OUTSIDE it sits `surface=` --
+    #                  the SDK-surface hold, an ESCALATION for a human rather than a wait -- which is
+    #                  why it is never counted in `wait=` (review P2, round 9: the banner, the
+    #                  `_r3` comment and the `surface=` comment each described a DIFFERENT set, so a
+    #                  reader could obey any one of three).
     # `no slot` is the refusal BOTH budget-gated rungs take (rung 1 as well — see below), and it
     # prints the reason with it -- the budget it could not take. A rung that is skipped for capacity
     # must SAY so; that silence is what the brief bans.
@@ -5330,9 +5339,9 @@ def run_pass(args, rubric_note: str = "") -> int:
             _c = ACTION_CLASS.get(_a, "fix")
             _r2_by_class[_c] = _r2_by_class.get(_c, 0) + _n
     _r2 = sum(_r2_by_class.values())
-    # ⛔ rung 3 IS EVERY ROW THE PASS HELD WITHOUT DISPATCHING, AND THAT IS NOT `_finish`'s `blind`
-    # (review P1, 2026-10-31). Two of the populations are obvious -- `running` (the head is still
-    # executing) and `unreadable` -- and `_finish` folds THREE MORE onto its blindness axis
+    # ⛔ rung 3 IS THE WAIT AXIS AS DEFINED IN THE BANNER ABOVE -- every held row a later pass
+    # retries, NOT every held row (review P1/P2, 2026-10-31; corrected round 9). `running` and
+    # `unreadable` are the obvious populations, and `_finish` folds THREE MORE onto its blindness
     # (`blind = unread + blind_surface + blind_partial + blind_abandoned`): an unusable changed-file
     # list is a held PR for a reason the operator must see. Leaving those three out let this line
     # print `wait=0 ... nothing to dispatch` while PRs sat held on precisely the classification it
@@ -5355,8 +5364,8 @@ def run_pass(args, rubric_note: str = "") -> int:
     # revision of this comment said surface was "not carried under `held=`" and then said, one
     # clause later, that the arm below folds it in: a self-refuting banner is worse than no banner,
     # because a maintainer could obey either half. What is guaranteed: `surface=` names the
-    # SDK-surface ASK-USER split, `wait=` names every hold without a dispatch (`_finish`'s `blind`
-    # PLUS `running`), `filelist=` the
+    # SDK-surface ASK-USER split, `wait=` names rung 3 by the banner's definition (`_finish`'s
+    # `blind` PLUS `running`), `filelist=` the
     # unusable-changed-file-list part of it (a human decides), and `held=` is the arm's total only
     # in the arm that says so.
     _r3_wait = sum(counts.get(k, 0) for k in ("skipped-running", "skipped-unreadable"))
@@ -5450,7 +5459,17 @@ def run_pass(args, rubric_note: str = "") -> int:
         _use = (budgets.get("used_by_class") or {}).get(_c)
         if _cap is None or _use is None:
             return "%s budget 0" % _c          # a caller that did not go through pass_budgets
+        # ⛔ A 0 CAP DOES NOT IMPLY NOTHING WAS SPENT (review P1, round 9). `out[_c] = max(0, cap -
+        # used[_c])` clamps at 0, so a class CONFIGURED 0 can still hold charged rows (`used > cap`),
+        # and the round-8 wording asserted "nothing was spent" from the cap alone while `_use` was
+        # read and never consulted -- reproduced at `MAX_FIX=0` with one fresh `fix-ci` row:
+        #     fix->NO SLOT (fix budget 0 (the cap is 0, so nothing was spent):
+        #                  no available slot: inflight=1 alive=0 unproven=1)
+        # one clause saying a slot is held and that nothing was spent. Both facts are now stated.
         if _cap <= 0:
+            if _use:
+                return ("%s budget 0 (the cap is 0, but %d slot(s) are still charged)"
+                        % (_c, _use))
             return "%s budget 0 (the cap is 0, so nothing was spent)" % _c
         return "%s budget 0 (%d of %d slots in use)" % (_c, _use, _cap)
 
@@ -5463,8 +5482,10 @@ def run_pass(args, rubric_note: str = "") -> int:
             return "the aggregate ceiling (--max) 0, %s budget %d" % (_c, _cls_b)
         if _tot <= 0:
             # NOT capped, so `total == 0` means both class budgets are 0 -- and `_cls_state` says
-            # WHY each one is, without ever claiming a spend it cannot see.
-            return "no class budget left -- %s; %s" % (_cls_state(_c), _cls_state(_other))
+            # WHY each one is, without ever claiming a spend it cannot see. ⛔ "AVAILABLE", not
+            # "left": a budget configured 0 is not budget that was CONSUMED, and "no class budget
+            # left" asserted a consumption the configured-zero case never had (review P1, round 9).
+            return "no class budget available -- %s; %s" % (_cls_state(_c), _cls_state(_other))
         return _cls_state(_c)
 
     if _r1:
@@ -5490,8 +5511,8 @@ def run_pass(args, rubric_note: str = "") -> int:
     # `wait=0 surface=1 ... nothing dispatchable -- held=1, the chain is on rung 3` -- naming a rung
     # its own definition (`running` or an unreadable classification) says it is NOT on, and
     # contradicting its own `wait=0` in the same clause. The two populations are named separately:
-    # rung 3 is the WAIT axis; an ASK-USER hold is a HUMAN decision, and saying so is the whole point
-    # of `surface=` existing.
+    # rung 3 is the WAIT axis; the SDK-surface ASK-USER hold (`surface=`) is a HUMAN decision outside
+    # that axis, and saying so is the whole point of `surface=` existing.
     # ⛔ AND A WAIT THAT ONLY A HUMAN CAN END MUST SAY SO (review P1, round 7). The three
     # unusable-changed-file-list holds are on the blindness axis (`_finish`, #2136 r2) AND are
     # announced per PR as `ASK-USER ... a human decides`; a bare "the chain is on rung 3" told the

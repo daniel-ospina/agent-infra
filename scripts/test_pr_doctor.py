@@ -4711,6 +4711,13 @@ def test_the_cascade_merge_arm_claims_eligibility_and_never_a_handoff(monkeypatc
     assert payload.get("dispatched") == 0, (joined, payload)
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
+    # ⛔ THE ASSERTION MUST BE ABLE TO RED (review P2, round 9). `"handed"` appears in NO emitted
+    # cascade string (only in this block's comments), so `assert "handed" not in ...` was satisfied
+    # by every arm that ever shipped and pinned nothing about THIS line. What the line must actually
+    # say is pinned instead: the candidate claim IS made, and NO dispatch word is (only `_finish`
+    # may say a dispatch happened).
+    assert "merge->candidate" in casc[0], casc[0]
+    assert "dispatched" not in casc[0], casc[0]
     assert "handed" not in casc[0], casc[0]
 
 
@@ -4871,11 +4878,27 @@ def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
     assert "review->NO SLOT" in casc[0], casc[0]
-    assert "no class budget left" in casc[0], casc[0]
+    assert "no class budget available" in casc[0], casc[0]
     assert "4 of 4 slots in use" in casc[0], casc[0]
     assert "3 of 3 slots in use" in casc[0], casc[0]
     assert "the cap is 0" not in casc[0], casc[0]
     assert "aggregate ceiling" not in casc[0], casc[0]
+
+    # (e) A CLASS CONFIGURED 0 THAT STILL HAS CHARGED ROWS (review P1, round 9). `out[c] = max(0,
+    #     cap - used[c])` clamps at 0, so "the cap is 0" does NOT imply "nothing was spent" -- and
+    #     the round-8 wording said exactly that while the same clause printed `inflight=1`.
+    monkeypatch.setenv("MAX_FIX", "0")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    _charged = {"950": {"action": "fix-ci", "head": "c" * 40,
+                        "at_epoch": pr.now(), "worker": "w-charged"}}
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(72)], ("fix-ci", "red", []), state=_charged)
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix->NO SLOT" in casc[0], casc[0]
+    assert "still charged" in casc[0], casc[0]
+    assert "nothing was spent" not in casc[0], casc[0]
+    assert "inflight=1" in casc[0], casc[0]
 
 
 def test_the_cascade_rung2_total_is_not_reported_as_a_class_count(monkeypatch):
