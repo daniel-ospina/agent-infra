@@ -708,10 +708,16 @@ cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/gate-po
 # the validator is the same class as its dependency on spawn-gate.sh.
 cp "$HERE/fix-one.sh" "$RIG/stale/"
 cp "$HERE/brief-gate.sh" "$RIG/stale/"
-# …and `reviewer-preflight.sh`, the third member of that same class (#2981): without it `fix-one.sh`
-# renders its delivery brief from the AMBIENT `$AGENT_INFRA_PATH` checkout, so this arm read 78 on a
-# box whose main checkout predates #2981 and called it the stale-helper behaviour. What is meant to be
-# stale here is `spawn-gate.sh`'s refusal CONSTANTS, nothing else.
+# ⛔ AND THE DELIVERY RENDERER, FOR THE SAME REASON AND WITH EVIDENCE (#2981). fix-one.sh now
+# HARD-REQUIRES `reviewer-preflight.sh --delivery-brief` and resolves it from `$SELF`, then
+# `$AGENT_INFRA_PATH`, then `~/.pi/agent` — so a rig that seeds `fix-one.sh` without it does not
+# exercise the refund at all: it falls through to an AMBIENT home. Measured on a clean clone of main
+# (709dfb06): the ambient checkout answered `--delivery-brief` with a usage line and the arm read
+# `rc=78, fixcount=2` — a "STALE helper" red that is really a half-seeded rig. On a CI runner, whose
+# HOME and `$AGENT_INFRA_PATH` hold no harness scripts, the same rig returns 78 for a second reason.
+# Neither is the behaviour under test, so the renderer travels with the fixture and the arm can no
+# longer pass or fail on what the box happens to have installed. What is meant to be stale here is
+# `spawn-gate.sh`'s refusal CONSTANTS, nothing else.
 cp "$HERE/reviewer-preflight.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
@@ -1042,13 +1048,14 @@ export -f pi
 # this comment once left to luck are copied explicitly; the fallbacks `brief_gate_lib` also consults
 # (`$AGENT_INFRA_PATH`, `~/.pi/agent/scripts`) are NOT relied on, so the arm cannot pass on a dev box
 # and fail on a runner whose HOME has no harness scripts (same class as round 3's HOME fix).
+# ⛔ AND THE DELIVERY RENDERER TOO (#2981): `fix-one.sh` refuses (78) without
+# `reviewer-preflight.sh --delivery-brief`, and it resolves that helper from `$SELF` first and then
+# from AMBIENT homes (`$AGENT_INFRA_PATH`, `~/.pi/agent`). A rig that omits it therefore measures the
+# box, not the wrapper: on a dev box the ambient checkout may answer with a usage line (measured, rc=78)
+# and on a runner no ambient home has it (rc=78 for the other reason) — both read as "the wrapper does
+# not propagate the fixer's status". Seeded here for the same reason brief-gate.sh is.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/brief-gate.sh" "$HERE/gate-policy.sh" \
    "$HERE/adopt-fix.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/reviewer-preflight.sh" "$RO/"
-# …`reviewer-preflight.sh` is the THIRD hard-required module (#2981), and until it was seeded here this
-# arm returned 78 — the same HALF-DEPLOYED shape the comment above describes: `fix-one.sh` rendered its
-# delivery brief from the ambient `$AGENT_INFRA_PATH` checkout, so a box whose main checkout predates
-# #2981 could never reach the claim refusal this arm asserts. Declared in the loop below for the same
-# reason as the rest: a dropped module must fail HERE, naming itself.
 # …and the arm must not be satisfiable by a rig that never reached the claim block: assert the
 # modules it needs are actually in $RO, so a future edit that drops one fails HERE, naming the
 # missing file, instead of resurfacing as a bogus 78 two assertions later.
@@ -1084,13 +1091,15 @@ cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-s
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
 cp "$HERE/brief-gate.sh" "$RO/"
-# …and `reviewer-preflight.sh`, for the SAME reason and by the same mechanism (#2981). `fix-one.sh`
-# renders its delivery brief from `reviewer-preflight.sh --delivery-brief prfix`, and it resolves that
-# file from `$SELF` FIRST — but `$SELF` here is `$RO`, which did not carry it, so EVERY fixer/adopt arm
-# fell through to the ambient `$AGENT_INFRA_PATH` checkout and came back 78 ("--delivery-brief failed")
-# on any box whose main checkout predates #2981. That is the class this file keeps calling out: a
-# verdict decided by the HOST's configuration rather than by the code the arm names — green in CI,
-# red on a cell with a stale checkout, and in neither case a test of the gate under test.
+# ⛔ THIS SEED IS REDUNDANT BY CONSTRUCTION, AND SAYING SO IS THE POINT (review of #3042, second
+# round). §9 and §10 share the SAME `$RO` (`RO="$RIG/O"`, created once, never re-created) and §9's
+# `cp` list already carries `reviewer-preflight.sh`, so by the time §10 runs the renderer IS in place —
+# this line restates it so the section stays self-describing if the two rigs are ever separated, and
+# it is NOT what makes the arms below pass. The guard on the seed that actually fires is §9's
+# `_rigmiss` loop, which names `reviewer-preflight.sh` on its own line; a rig-carry assertion HERE
+# could not discriminate (a dropped §10 copy leaves §9's in place), and one naming `chain-merge.sh`
+# would be worse than none: the propagation arms invoke `bash "$HERE/chain-merge.sh"`, never
+# `$RO/chain-merge.sh`, so its only reachable outcome is a RED that no arm's behaviour earned.
 cp "$HERE/reviewer-preflight.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
@@ -1317,6 +1326,15 @@ ck "a capability refusal leaves the caller's job control as it found it (got '${
 RES="$TMP/resolve"; mkdir -p "$RES/bin"
 cp "$HERE/spawn-gate.sh" "$RES/spawn-gate.sh"
 cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
+# ⛔ AND THE BRIEF VALIDATOR, OR THIS ARM MEASURES THE BOX (#3042 review, P2). `run_agent` refuses a
+# brief it cannot validate (CANNOT VERIFY) BEFORE it reads load, disk or the capability probe, and
+# `brief_gate_lib` resolves the validator from `$O`, then `$here`, then `$AGENT_INFRA_PATH`, then
+# `~/.pi/agent`. This rig seeded neither `$RES` nor `$TMP/O` with it, so on a box with an installed
+# harness the arm passed for the box's sake and on a bare runner it measured something else entirely:
+# `AGENT_INFRA_PATH` unset and an empty `HOME` gave `rc=78` with `[brief-gate] CANNOT VERIFY …`
+# instead of the 71 this arm asserts (measured: 247 passed / 1 failed, the failure being this arm).
+# The subject here is the CAPABILITY resolver, so the validator that gates it must travel with the rig.
+cp "$HERE/brief-gate.sh" "$RES/brief-gate.sh"
 cat > "$RES/bin/pi" <<'PIHANG'
 #!/bin/sh
 case "$1" in --version) echo 9.9.9-stub; exit 0 ;; esac
