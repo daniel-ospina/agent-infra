@@ -617,6 +617,25 @@ while IFS= read -r d; do
     drift_q checkout "$d — present in $O but NOT shipped by the repo at $REF (a hand-placed or retired script)"
   fi
 done < "$TMPD/deployed-sh"
+# ⛔ AND ONE SOURCED FILE IS NOT AT DEPTH 1 AT ALL (review P1, agent-infra#3146). The lane-ceiling
+# library ships at `scripts/lib/lane-ceiling.sh` and `deploy-mac-orchestrator.sh` stages it to
+# `$O/lib/`, where `install.sh` SOURCES it: the whole `capacity:` report and the whole drift verdict are
+# its bytes. Neither listing above can see it (the repo side is the harness dir's `*.sh`; the deployed
+# side is `ls -1 *.sh` in `$O`), so a box carrying last week's formula passed BYTES as identical — the
+# same false PASS this half exists against, one directory over. Compared only when BOTH sides have it:
+# a cell's `$O` legitimately carries no `lib/` (the cell path reads its own mirror), and absence here is
+# already loud (install.sh names the probed paths), so absence is not this arm's verdict to give.
+if git -C "$REPO" rev-parse --verify --quiet "$TIP:scripts/lib/lane-ceiling.sh" >/dev/null 2>&1 \
+   && [ -f "$O/lib/lane-ceiling.sh" ]; then
+  have="$(git hash-object -- "$O/lib/lane-ceiling.sh" 2>/dev/null || true)"
+  want="$(git -C "$REPO" rev-parse --verify --quiet "$TIP:scripts/lib/lane-ceiling.sh" 2>/dev/null || true)"
+  if [ -z "$have" ] || [ -z "$want" ]; then
+    unknown "cannot read the deployed or the ref's scripts/lib/lane-ceiling.sh — cannot verify it"
+  elif [ "$have" != "$want" ]; then
+    Q_BYTES=1
+    drift_q checkout "lib/lane-ceiling.sh — the deployed copy DIFFERS from the repo at $REF ($want); install.sh SOURCES it for the ceiling report AND for its drift verdict, so this box would report by whatever formula these bytes carry"
+  fi
+fi
 fi
 
 # ── 4. SURFACE (--surface): every harness dir this BOX carries, not just $O (#2231) ──────────────

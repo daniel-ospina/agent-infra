@@ -298,6 +298,22 @@ for f in "$HERE"/*.sh "$HERE"/*.py "$HERE"/gh-rest/gh "$HERE"/gh-limit/gh; do
   DEPLOY_SET+=("${f#"$HERE"/}")
 done
 [ "${#DEPLOY_SET[@]}" -gt 0 ] || unknown "no shipped files found in $HERE — nothing to compare a deployment against (not a pass)"
+# ⛔ AND ONE SHIPPED FILE IS NOT BESIDE THIS SCRIPT AT ALL (review P1, agent-infra#3146 — a FALSE PASS
+# about the number this change exists to make truthful). The lane-ceiling library lives at
+# `scripts/lib/lane-ceiling.sh` in the repo and `deploy-mac-orchestrator.sh` stages it to `$O/lib/` on
+# the flat deploy, where `install.sh` SOURCES it — every byte of the `capacity:` report AND of the
+# drift verdict comes from it. Both loops above are adjacency-based ("$HERE"/*.sh, two known
+# subpaths), so that directory was compared by NOTHING: measured at this head, a one-byte append to
+# `$O/lib/lane-ceiling.sh` printed `ok: one source of truth` and exited 0, so a box could run a stale
+# formula forever while every instrument reported the harness byte-identical. The entry is
+# `<canonical>|<deployed relpath>` because the two paths are not the same shape, and it is skipped —
+# never failed — when this checkout does not ship the library (a cell's `$O` legitimately carries no
+# `lib/`: the cell path reads its own mirror, and requiring presence here would red a healthy cell).
+SIBLING_SET=()
+for f in "$HERE"/../lib/lane-ceiling.sh; do
+  [ -f "$f" ] || continue
+  SIBLING_SET+=("$f|lib/$(basename "$f")")
+done
 if [ -n "$O_DIR" ]; then
   # ⛔ AND THE SAME SHAPES THE FORK ARM CLOSES: does-not-resolve (including a dangling ANCESTOR and a
   # trailing slash), non-directory, unsearchable (review P1/P2, cycles 8-10). The fork arm's comment
@@ -345,6 +361,14 @@ if [ -n "$O_DIR" ]; then
       a="$(hash_of "$HERE/$f")"; b="$(hash_of "$O_DIR/$f")"
       [ -n "$a" ] && [ -n "$b" ] || unknown "could not hash $f (canonical='$a' deployed='$b')"
       [ "$a" = "$b" ] || diverge "the deployed copy DIFFERS from canonical: $f (canonical ${a:0:12} vs deployed ${b:0:12}) — re-install or make \$O a versioned checkout of agent-infra"
+    done
+    # the sibling entry: SAME comparison, different path SHAPE on each side.
+    for ent in ${SIBLING_SET[@]+"${SIBLING_SET[@]}"}; do
+      can="${ent%%|*}"; rel="${ent#*|}"
+      [ -f "$O_DIR/$rel" ] || continue
+      a="$(hash_of "$can")"; b="$(hash_of "$O_DIR/$rel")"
+      [ -n "$a" ] && [ -n "$b" ] || unknown "could not hash $rel (canonical='$a' deployed='$b')"
+      [ "$a" = "$b" ] || diverge "the deployed copy DIFFERS from canonical: $rel (canonical ${a:0:12} vs deployed ${b:0:12}) — install.sh SOURCES this file for the ceiling report and the drift verdict, so a stale copy quietly reports by the OLD formula; re-run deploy-mac-orchestrator.sh (it stages scripts/lib/lane-ceiling.sh to \$O/lib/) or copy the canonical file there"
     done
   fi
 fi
