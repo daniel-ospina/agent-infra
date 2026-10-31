@@ -14489,7 +14489,14 @@ job_step "$SCEN/jobs-gen-9811-1.json" "bash-suites" in_progress 1 2 \
   "Bash shards — the ONE list both lanes run" "Bash shards — step 1 running" 5000
 lane_fail mainpr 9812 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9812"
-SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=1 SUITE_FIRST_CHECKS_STALL=2 \
+# ⛔ A 1s CEILING CANNOT OBSERVE ANYTHING. The promotion is read from a per-poll REPORT, and the
+# clock that expires the wait is a `$SECONDS` DELTA: on a fast, idle host the first poll advances it
+# by 0 and the report prints (green); on a loaded runner one poll costs ≥1s, the 1s ceiling expires
+# on the FIRST poll, the verdict returns before the report case, and this assertion fails while the
+# promotion never had a poll to appear in (measured: red on a loaded Linux box, green on an idle
+# one — the (h) fixture above had the identical shape). 5s of ceiling keeps the scenario short and
+# leaves room for the polls the assertion needs; the promotion itself is unchanged.
+SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=5 SUITE_FIRST_CHECKS_STALL=2 \
   SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 grep -q 'stall bound 10000s' "$SCEN/out" "$SCEN/err" \
   && pass "(f) …and a 5000s completed step PROMOTES the stall period to 10000s at runtime" \
