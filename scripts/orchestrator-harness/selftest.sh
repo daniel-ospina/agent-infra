@@ -5313,6 +5313,136 @@ if [ -s "$MERGE" ]; then
 fi
 
 echo
+# ── LANE CEILING: ONE DERIVATION, PORTABLE, AND A DRIFTING PIN IS LOUD (#3171) ──
+# The ruling is unchanged — MAX_LANES is DERIVED, floor(ncpu × 5/2) — but the DERIVATION was written
+# out four times and the cell path wrote it ZERO times: a cell's `keys.env` carried a hand-pushed
+# MAX_LANES and nothing compared it to the derivation (measured: cell-3, 4 cores → 10, keys.env said
+# 20, memory ceiling 3; it ran 10 lanes and was killed with ENOSPC). This arm proves four things,
+# each of which goes RED on a regression:
+#   (a) the portability arms are EXECUTED, not described — sysctl absent still answers (nproc), then
+#       getconf when both are gone, and when all three are gone the fallback SAYS SO instead of
+#       presenting a constant as a measurement;
+#   (b) the supervisor's PINNED MIRROR of the derivation (it is farmed out of the checkout and cannot
+#       source the library — see the note above its `_proc_start_epoch`) answers IDENTICALLY to the
+#       library under every probe scenario: the `pin_dirty` pattern, because a mirror that may drift
+#       is the #1178 defect. It is BEHAVIOURAL rather than byte-identity because the two bodies
+#       legitimately differ in naming; what must not differ is what they ANSWER;
+#   (c) a pin that disagrees is REPORTED and NOT overwritten — the operator's number stays in force;
+#   (d) the verbs that must report actually CALL the report (a correct function nobody invokes
+#       reports nothing).
+# ⛔ A probe is made ABSENT with an `exit 1` stub, never by leaving it off PATH: a shortened PATH
+# would also hide `date`/`awk` from the supervisor and, on a host that HAS the probe, would let the
+# real one answer through — so "absent" would silently mean "whatever this box has".
+LC_LIB="$HERE/../lib/lane-ceiling.sh"
+SUP_CELL="$HERE/../cloud-cell-supervisor.sh"
+if [ -f "$LC_LIB" ] && [ -f "$SUP_CELL" ]; then
+  # (a) the library's own arms. ⛔ THE OUTPUT IS READ, not just the exit code (review P2): a library
+  # whose selftest dispatch was deleted exits 0 having run NOTHING, and an rc-only arm calls that a
+  # PASS. `SELFTEST PASS` is the library's own clean verdict and the line below is what checks it.
+  bash "$LC_LIB" --selftest >"$TMP/lc.self.out" 2>&1
+  grep -q '^SELFTEST PASS$' "$TMP/lc.self.out" && _lc_rc=0 || _lc_rc=1
+  [ "$_lc_rc" -eq 0 ] || sed -n '1,40p' "$TMP/lc.self.out"
+  ck "lane ceiling: the library's portability arms pass, by its own clean verdict (sysctl → nproc → getconf → LOUD fallback)" $_lc_rc
+
+  _lc="$TMP/lc"; _lc_reset() { rm -rf "$_lc/bin"; mkdir -p "$_lc/bin"; }
+  _lc_reset
+  _LC_BASH="$(command -v bash || echo /bin/bash)"
+  printf 'export MEM_AVAIL_MB=9000\n' >"$_lc/keys.env"
+  _lc_path="$_lc/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  _lcstub() { # $1 = probe, $2 = value | FAIL (a probe that does not answer)
+    if [ "$2" = FAIL ]; then printf '#!/bin/sh\nexit 1\n' >"$_lc/bin/$1"
+    else printf '#!/bin/sh\nprintf "%s\\n"\n' "$2" >"$_lc/bin/$1"; fi
+    chmod +x "$_lc/bin/$1"
+  }
+  # The triple + the probe that answered, from each implementation, under the SAME stubbed PATH.
+  _lc_triple_lib() {
+    bash -c 'PATH="$2"; MEM_AVAIL_MB=9000; . "$1"; lc_report' lane-ceiling-lib "$LC_LIB" "$1" 2>/dev/null \
+      | sed -n 's/.*cpus=\([0-9]*\) MAX_LANES=\([0-9]*\) mem_ceiling=\([^ ]*\) cpu_probe=\([a-z]*\).*/\1 \2 \3 \4/p' | head -1
+  }
+  _lc_triple_sup() { # drives the SHIPPED supervisor, not a copy of its logic
+    env -i PATH="$1" HOME="$_lc" CELL_HOME="$_lc" ENV_FILE="$_lc/keys.env" \
+      "$_LC_BASH" "$SUP_CELL" capacity 2>/dev/null \
+      | sed -n 's/.*cpus=\([0-9]*\) MAX_LANES=\([0-9]*\) mem_ceiling=\([^ ]*\) cpu_probe=\([a-z]*\).*/\1 \2 \3 \4/p' | head -1
+  }
+  _lc_parity() { # $1 = arm name, $2 = expected triple
+    local l s rc=1
+    l="$(_lc_triple_lib "$_lc_path")"; s="$(_lc_triple_sup "$_lc_path")"
+    [ -n "$l" ] && [ "$l" = "$s" ] && [ "$l" = "$2" ] && rc=0
+    [ "$rc" -eq 0 ] || echo "      $1: lib='$l' supervisor='$s' want='$2'"
+    ck "lane ceiling mirror: $1 — library and supervisor agree ($2)" $rc
+  }
+  _lc_reset; _lcstub sysctl 8; _lcstub nproc 4; _lcstub getconf 2
+  _lc_parity "sysctl answers first (macOS shape)" "8 20 12 sysctl"
+  _lc_reset; _lcstub sysctl FAIL; _lcstub nproc 4; _lcstub getconf 2
+  _lc_parity "sysctl ABSENT falls through to nproc (Linux cell)" "4 10 12 nproc"
+  _lc_reset; _lcstub sysctl FAIL; _lcstub nproc FAIL; _lcstub getconf 6
+  _lc_parity "sysctl+nproc ABSENT falls through to getconf (POSIX)" "6 15 12 getconf"
+  _lc_reset; _lcstub sysctl FAIL; _lcstub nproc FAIL; _lcstub getconf FAIL
+  _lc_parity "ALL probes ABSENT: the documented fallback, named as a constant" "4 10 12 fallback"
+  # ⛔ THE FALLBACK MUST BE LOUD ON BOTH CARRIERS (review P2). The parity arm above compares the VALUE
+  # through `2>/dev/null`, so it cannot see a warning at all — deleting the mirror's WARN left the
+  # whole suite green, which is precisely the defect this change exists to end (a constant presented
+  # as a measurement). So stderr is captured here and the SENTENCE is asserted, not just the number.
+  _supwarn="$(env -i PATH="$_lc_path" HOME="$_lc" CELL_HOME="$_lc" ENV_FILE="$_lc/keys.env" \
+              "$_LC_BASH" "$SUP_CELL" capacity 2>&1)"
+  case "$_supwarn" in
+    *"could not be read"*"CONSTANT, not a measurement"*) ck "lane ceiling fallback: the supervisor SAYS its number is a constant, not a measurement" 0 ;;
+    *) ck "lane ceiling fallback: the supervisor SAYS its number is a constant, not a measurement" 1; echo "      got: $_supwarn" ;;
+  esac
+  # A 0-valued probe is a FAILED probe, not "no cores": a 0 reads as a full fleet downstream.
+  _lc_reset; _lcstub sysctl FAIL; _lcstub nproc 0; _lcstub getconf FAIL
+  _lc_parity "a 0-valued probe is a FAILED probe, not 'no cores'" "4 10 12 fallback"
+  _lc_reset; _lcstub sysctl 9223372036854775808; _lcstub nproc 4
+  _lc_parity "a 19-digit probe is REFUSED (it would wrap to 0, not error)" "4 10 12 nproc"
+
+  # (c) THE MEASURED DEFECT, as a control: a 4-core box whose keys.env pins 20.
+  _lc_reset; _lcstub nproc 4; _lcstub sysctl FAIL; _lcstub getconf FAIL
+  printf 'export MEM_AVAIL_MB=9000\nexport MAX_LANES=20\n' >"$_lc/pinned.env"
+  _supout="$(env -i PATH="$_lc_path" HOME="$_lc" CELL_HOME="$_lc" ENV_FILE="$_lc/pinned.env" \
+             "$_LC_BASH" "$SUP_CELL" capacity 2>&1)"
+  case "$_supout" in
+    *"cpus=4 MAX_LANES=10"*"pinned=20"*DRIFT*) ck "lane ceiling drift: a pin that disagrees with 2.5 × 4 cores is REPORTED" 0 ;;
+    *) ck "lane ceiling drift: a pin that disagrees with 2.5 × 4 cores is REPORTED" 1; echo "      got: $_supout" ;;
+  esac
+  # ⛔ The pin is NOT rewritten: a tool that silently corrects an operator's number turns a visible
+  # disagreement into an invisible one, and the next reader cannot tell a lane ceiling was changed.
+  grep -qx 'export MAX_LANES=20' "$_lc/pinned.env" \
+    && ck "lane ceiling drift: the operator's pin is NAMED, never overwritten" 0 \
+    || ck "lane ceiling drift: the operator's pin is NAMED, never overwritten" 1
+  # A PIN THAT IS NOT A MAGNITUDE WRAPS under `$((10#pin))` — it must be refused, not evaluated.
+  printf 'export MEM_AVAIL_MB=9000\nexport MAX_LANES=99999999999999999999\n' >"$_lc/wrap.env"
+  _supout="$(env -i PATH="$_lc_path" HOME="$_lc" CELL_HOME="$_lc" ENV_FILE="$_lc/wrap.env" \
+             "$_LC_BASH" "$SUP_CELL" capacity 2>&1)"
+  case "$_supout" in
+    *"not a magnitude"*) ck "lane ceiling drift: a 20-digit pin is REFUSED, not wrapped into the report" 0 ;;
+    *) ck "lane ceiling drift: a 20-digit pin is REFUSED, not wrapped into the report" 1; echo "      got: $_supout" ;;
+  esac
+  # NON-VACUITY: an agreeing pin must NOT be called drift, or the arms above prove nothing.
+  printf 'export MEM_AVAIL_MB=9000\nexport MAX_LANES=10\n' >"$_lc/agree.env"
+  _supout="$(env -i PATH="$_lc_path" HOME="$_lc" CELL_HOME="$_lc" ENV_FILE="$_lc/agree.env" \
+             "$_LC_BASH" "$SUP_CELL" capacity 2>&1)"
+  case "$_supout" in
+    *DRIFT*) ck "lane ceiling drift: a pin that AGREES is not called drift (non-vacuity)" 1 ;;
+    *"pinned=10 (agrees"*) ck "lane ceiling drift: a pin that AGREES is not called drift (non-vacuity)" 0 ;;
+    *) ck "lane ceiling drift: a pin that AGREES is not called drift (non-vacuity)" 1; echo "      got: $_supout" ;;
+  esac
+
+  # (d) CALL SITES. A correct function nobody invokes reports nothing, so the two verbs that must
+  # report are asserted by extracting their OWN bodies — not by trusting that they were edited.
+  for _lcverb in cmd_start cmd_status; do
+    # ⛔ A NON-COMMENT LINE, not a substring match: commenting the call out is exactly how a call
+    # site gets "removed" in practice, and a bare `grep -q lane_ceiling_report` finds the comment
+    # and calls that a PASS (measured while mutation-proving this arm).
+    sed -n "/^${_lcverb}() {/,/^}/p" "$SUP_CELL" | grep -qE '^[[:space:]]*lane_ceiling_report([[:space:];]|$)' \
+      && ck "lane ceiling: $_lcverb REPORTS it (the one line, at the box's start and status)" 0 \
+      || { ck "lane ceiling: $_lcverb REPORTS it (the one line, at the box's start and status)" 1; echo "      $_lcverb does not CALL lane_ceiling_report"; }
+  done
+else
+  ck "lane ceiling: scripts/lib/lane-ceiling.sh + cloud-cell-supervisor.sh present" 1
+fi
+
+echo
+
 # ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
 # A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class
 # `AGENTS.md` names. On macOS the gate must skip NOTHING (the install.sh checks are reachable there);
