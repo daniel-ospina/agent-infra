@@ -279,6 +279,31 @@ ck "the record says sourceDirty=true" "$(qF "sourceDirty=true" "$(cat "$O/.harne
 ck "rc is 1 (a commit name that does not describe these bytes is drift)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 ck "…and the report says the record's source was DIRTY" "$(qF "source was DIRTY" "$OUT" && echo 0 || echo 1)"
 ck "…and it does NOT read the identity as ok" "$(qF "identity: ok" "$OUT" && echo 1 || echo 0)"
+# ⛔ THE SUMMARY MUST NOT CONTRADICT THE LINE ABOVE IT (measured 2026-10-30, review of #3053). The record's
+# commit IS the ref tip here, so `Q_IDENT=1` with `RELATION=current` fell through to `payload-differs` —
+# a token README §4.3 defines as "the bytes differ from the checkout but the record STILL DESCRIBES $O",
+# the one thing a `sourceDirty=true` record does not do — and then printed "the box is recorded from
+# <sha> — current main … a known state, not a defect" directly beneath "does not describe the deployed
+# bytes". Both arms below redden if the fall-through or the routine-state sentence comes back.
+ck "…the token is harness=source-dirty:<sha12>" "$(qF "harness=source-dirty:" "$OUT" && echo 0 || echo 1)"
+ck "…and NOT payload-differs (which claims the record describes \$O)" \
+   "$(qF "harness=payload-differs" "$OUT" && echo 1 || echo 0)"
+ck "…and it does NOT print the routine-state sentence under a DIRTY record" \
+   "$(qF "known state, not a defect" "$OUT" && echo 1 || echo 0)"
+ck "…it says the box was never identifiable, and how to make it so" \
+   "$(qF "never identifiable" "$OUT" && echo 0 || echo 1)"
+# ⛔ A DIRTY RECORD **AND** A MISSING FILE ARE TWO FACTS, and the token must carry the actionable one
+# (review of #3090). The absent shipped script is what README gives its own row and remedy ("a redeploy
+# CREATES it"); `source-dirty` says the record cannot describe the box, which is true but is not what
+# breaks the runtime. Measured: with the DIRTY arm placed FIRST this state reported
+# `harness=source-dirty:<sha>` and the `incomplete:` signal disappeared from the token.
+rm -f "$O/b.sh"
+run
+ck "…a DIRTY record with a MISSING file still says harness=incomplete:b.sh" \
+   "$(qF "harness=incomplete:b.sh" "$OUT" && echo 0 || echo 1)"
+ck "…and NOT source-dirty (the absent script is the runtime signal)" \
+   "$(qF "harness=source-dirty" "$OUT" && echo 1 || echo 0)"
+ck "…while still naming the DIRTY source in the body" "$(qF "source was DIRTY" "$OUT" && echo 0 || echo 1)"
 cp "$TMP/a.sh.committed" "$SRCDIR/a.sh"                                        # leave the fixture clean again
 deploy
 bash "$PROVW" write --o "$O" --src "$SRCDIR" >/dev/null 2>&1
@@ -396,6 +421,48 @@ ck "rc is 2 — the record cannot be read, so nothing about it can be claimed" "
 ck "…and it does NOT fabricate a MISSING file named after the digest" "$(qF "MISSING $H_A2" "$OUT" && echo 1 || echo 0)"
 ck "…and it names the real reason (a manifest line with no path)" \
    "$(qF "manifest line with no path" "$OUT" && echo 0 || echo 1)"
+
+echo
+echo "── §9g a run with NO \$O compared answers harness=surface, and says nothing was identified ──"
+# ⛔ THIS GRADES A POPULATION NO ASSERTION COVERED BEFORE (review of #3090). When `$O` is absent (or a
+# `--surface` run finds no readable record for one) every question about `$O` abstains, and the token
+# block only runs at all because the SURFACE pass raised `problems` — so the token here names the OTHER
+# dir's drift and says nothing about `$O`. §5b grades the other `surface` shape (a clean `$O` plus a
+# hit in another dir) and §9e runs with the surface candidates CLEAN, so it reaches the OK summary and
+# prints no token at all. Nothing stated what THIS shape's token is, which is why the README could
+# describe `surface` as `Q_BYTES=0`-gated. (This comment previously said the arm "emits `surface`
+# because NOTHING was compared" — false, and contradicted by its own fixture needing `c.sh` below:
+# `$O`-absent alone emits no token, so the run must have a surface hit to print one at all.)
+# ⛔ WHAT IT DOES AND DOES NOT PROVE. It DOES redden (2 arms) if this population's token becomes
+# `payload-differs` — measured by mutating the `O_ABSENT` arm to emit it. It does NOT discriminate
+# removal of that arm on its own: every reachable `O_ABSENT` run exits non-zero via a surface HIT, and
+# the `SURF_HIT && Q_BYTES=0` arm below then answers `surface` identically, so the two are
+# observationally redundant here. Say so rather than let a later reader believe this pins the arm.
+absent_O="$TMP/definitely-not-here"; rm -rf "$absent_O"
+no_o_extra="$TMP/extra-absent"; rm -rf "$no_o_extra"; mkdir -p "$no_o_extra"
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$no_o_extra/"
+printf '#!/usr/bin/env bash\necho hand-placed\n' > "$no_o_extra/c.sh"
+OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$no_o_extra" HARNESS_PIN_DIR="" \
+        HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
+        bash "$DRIFT" --o "$absent_O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+ck "rc is 1 — the surface pass answered, and its hit is a drift" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "…the identity half reports SKIPPED for the absent \$O" "$(qF "identity: SKIPPED" "$OUT" && echo 0 || echo 1)"
+ck "…and the one-line answer is harness=surface" "$(qF "harness=surface" "$OUT" && echo 0 || echo 1)"
+ck "…and NOT payload-differs, which would name a question nothing asked" \
+   "$(qF "harness=payload-differs" "$OUT" && echo 1 || echo 0)"
+# ⛔ AND THE COUNTER-CASE THAT SETTLES WHAT THE TOKEN MEANS (review of #3090, cycle 3): `$O`-absent
+# ALONE emits NO token at all. Without this arm the paragraph in README §4.3 could say the missing
+# `$O` "emits harness=surface" and pass every assertion — which is exactly how that wording drifted
+# twice. The token is printed only under `problems > 0`, so with $O absent it can ONLY come from a
+# surface hit; a clean surface pass reaches the OK summary and stamps nothing.
+no_o_clean="$TMP/clean-absent"; rm -rf "$no_o_clean"; mkdir -p "$no_o_clean"
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$no_o_clean/"
+OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$no_o_clean" HARNESS_PIN_DIR="" \
+        HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
+        bash "$DRIFT" --o "$absent_O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+ck "…with \$O absent and a CLEAN surface pass: rc 0 (nothing differs)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and it stamps NO harness= token at all (the token names a drift; there is none)" \
+   "$(qF "harness=" "$OUT" && echo 1 || echo 0)"
 
 echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
