@@ -1031,8 +1031,13 @@ if command -v perl >/dev/null 2>&1; then
   ck "…and a credential that is ABSENT/UNREADABLE still exits 98 (the fail-closed direction, unchanged)" $rc
   # (c) THE REFUSAL TEXT CARRIES THE REMEDY, NOT JUST THE NUMBER. Asserted at the SOURCE because producing
   # a real `wt_spawn` refusal for each arm costs a tmux surface; the decoder is a pure `case` on $pre_rc.
-  grep -q 'the credential PROBE could not answer in time' "$LIB" \
-    && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
+  grep -qF 'the credential PROBE could not answer in time' "$LIB" \
+    && grep -qF 'the GH CREDENTIAL is absent or unreadable' "$LIB" \
+    && grep -qF 'an ENVIRONMENT FILE the launch line sources is unreadable' "$LIB" \
+    && grep -qF 'the MODEL credential is blank in the worker (rc=95' "$LIB" \
+    && grep -qF 'the credential read NEVER RAN or was KILLED' "$LIB" \
+    && grep -qF 'the launch-line PRE-CHECK could not finish' "$LIB" \
+    && grep -qF 'NO gh BINARY could be resolved' "$LIB" && rc=0 || rc=1
   ck "…and the refusal text distinguishes them with a remedy each (probe-timing vs the credential arms)" $rc
   # (d) THE OTHER ARMS GET THEIR OWN CODES TOO, so a `keys.env` that will not parse cannot be reported
   # as an absent gh credential — the opposite conflation, and the one review caught. ⛔ THE CODES ARE

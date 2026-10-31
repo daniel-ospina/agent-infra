@@ -2870,11 +2870,21 @@ def makes_no_request_strictly(argv):
         # set`/`delete` do a LOAD-MODIFY-WRITE of `~/.config/gh/config.yml` — the same file for both —
         # and the box lock was their ONLY serialiser (no pacing predicate covers them: `MUTATING_PAIRS`
         # has no config/alias pair). Exempting them wholesale would let two concurrent `gh config set`
-        # calls lose one setting, and a concurrent reader see a half-written file. The exemption claims
-        # to be about REQUESTS; these forms make none but they do WRITE, so only the read-only forms
-        # are exempt and every writer keeps the lock.
-        return len(argv) >= 2 and (argv[0], argv[1]) in (
-            ("alias", "list"), ("alias", ""),
+        # calls LOSE A SETTING (writer vs writer — closed by this allow-list). ⛔ THE READER RACE IS
+        # ACCEPTED, NOT CLOSED (review finding, 2026-10-30): an exempt `config get` can still observe a
+        # writer's truncate-then-write window, because it takes no lock. Accepted deliberately — no
+        # harness caller reads gh config (grepped), and a reader cannot CORRUPT the file, so the cost is
+        # a transient misread against a lock that every credential refresh pays for. Serialising readers
+        # with writers is the alternative, and it would put a LOCAL read back in the queue this change
+        # exists to empty. The exemption is about REQUESTS; the write forms make none but they DO write,
+        # so only the read-only forms are exempt.
+        # ⛔ and the BARE forms (`gh alias`, `gh config`) print help and are request-free — they are
+        # exempt too, which the `len(argv) == 1` half expresses (an `("alias", "")` tuple entry could
+        # never match: the tuple is only reached with two argv entries).
+        if len(argv) == 1:
+            return True
+        return (argv[0], argv[1]) in (
+            ("alias", "list"),
             ("config", "get"), ("config", "list"), ("config", "clear-cache"))
     if argv[0] in NO_REQUEST:
         return True                      # --version/version/help/--help/-h/completion
