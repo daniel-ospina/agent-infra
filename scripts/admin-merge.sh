@@ -4363,7 +4363,7 @@ wait_for_first_checks() {
   local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
   local now last_clock dt fp summary max_step digest jobs
   local max_step_run fp_run summary_run read_ok n_lines idx
-  local stall_bound ceiling_bound signal_ok poll_step remaining adv
+  local stall_bound ceiling_bound signal_ok poll_step remaining adv wait_word expired
   local rederive_left lane_filter_active head_checks
   local -a jobs_files=() pending_ids=()
   FIRST_CHECKS_WAITED=0; FIRST_CHECKS_QUIET=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""
@@ -4621,43 +4621,64 @@ wait_for_first_checks() {
       FIRST_CHECKS_OUTCOME="$FIRST_CHECKS_STATE"
       return 1
     fi
+    # ── THE VERDICT ───────────────────────────────────────────────────────
+    # ⛔ THE EXPIRING POLL STILL REPORTS (#2862 CI regression). The verdict used to
+    # `return 1` from inside this table, i.e. BEFORE the report below — so the ONE
+    # poll an operator most needs to read (the one that ended the wait) was the only
+    # one that printed nothing about what it had observed. That is not a cosmetic
+    # gap: `$SECONDS` is a whole-second clock, so any poll whose work straddles a
+    # second boundary charges 1s, and a wait whose window IS 1s therefore expired on
+    # its FIRST observation whenever that happened — ~1 poll in 5 on a loaded runner.
+    # Measured: run 41110313398, job 124250724527 reddened `tests/admin-merge/run.sh`
+    # with "✗ BLOCK — the FIRST-CHECKS wait expired after 1s (ceiling 1s)" and NO
+    # report line above it, on a total wall clock of 226ms. Every fixture that
+    # asserts on a report line was therefore a coin flip, and the shard reddened
+    # every PR. Setting `expired` and reporting before returning makes the observation
+    # deterministic WITHOUT loosening a bound: the same verdict, the same instant, one
+    # more line — and the wait still sleeps zero additional seconds.
+    expired=0
     case "$FIRST_CHECKS_STATE" in
       still-running)
         if [ "$quiet" -ge "$stall_bound" ]; then
           FIRST_CHECKS_OUTCOME="stalled"
-          return 1
-        fi
-        if [ "$waited" -ge "$ceiling_bound" ]; then
+          expired=1
+        elif [ "$waited" -ge "$ceiling_bound" ]; then
           FIRST_CHECKS_OUTCOME="ceiling"
-          return 1
+          expired=1
         fi ;;
       never-started|unreadable)
         if [ "$waited" -ge "$FIRST_CHECKS_WAIT" ]; then
           FIRST_CHECKS_OUTCOME="$FIRST_CHECKS_STATE"
-          return 1
+          expired=1
         fi ;;
       unobservable)
         if [ "$missing" -ge "$FIRST_CHECKS_WAIT" ] || [ "$waited" -ge "$ceiling_bound" ]; then
           FIRST_CHECKS_OUTCOME="unobservable"
-          return 1
+          expired=1
         fi ;;
     esac
 
     # ── THE REPORT (patience, not a hang: say WHAT was observed) ──────────
+    # ⛔ A REPORT PRINTED ON THE POLL THAT ENDS THE WAIT MAY NOT SAY IT IS STILL
+    # WAITING. The observation is the same either way; only the tense changes, and a
+    # line that says "waiting" one line above a refusal that says "the window is
+    # spent" is the kind of message this repo treats as a defect, not a nicety.
+    wait_word="— waiting."
+    [ "$expired" -eq 1 ] && wait_word="— the bound is now spent, so this is the CLOSING observation."
     case "$FIRST_CHECKS_STATE" in
       never-started)
-        info "admin-merge: … FIRST-CHECKS wait: no run has appeared for head $head yet (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — waiting." ;;
+        info "admin-merge: … FIRST-CHECKS wait: no run has appeared for head $head yet (${waited}s of the ${FIRST_CHECKS_WAIT}s window) $wait_word" ;;
       unreadable)
-        info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — still waiting; unreachable is not empty." ;;
+        info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) $wait_word unreachable is not empty." ;;
       unobservable)
-        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${missing_streak}s consecutively) — waiting, and NOT calling it a stall: an unread instrument is not a stalled run." ;;
+        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${missing_streak}s consecutively) $wait_word This wait does NOT call it a stall: an unread instrument is not a stalled run." ;;
       *)
         if [ "$FIRST_CHECKS_TRANSITIONS" -eq 0 ]; then
-          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, no change observed yet (${waited}s of the ${ceiling_bound}s ceiling; stall bound ${stall_bound}s) — waiting. first observation: $summary"
+          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, no change observed yet (${waited}s of the ${ceiling_bound}s ceiling; stall bound ${stall_bound}s) $wait_word first observation: $summary"
         elif [ "$quiet" -eq 0 ]; then
-          info "admin-merge: … FIRST-CHECKS wait: still RUNNING and PROGRESSING — change #${FIRST_CHECKS_TRANSITIONS} observed at ${waited}s (${pending} run(s) pending, stall bound ${stall_bound}s, ceiling ${ceiling_bound}s): $summary"
+          info "admin-merge: … FIRST-CHECKS wait: still RUNNING and PROGRESSING — change #${FIRST_CHECKS_TRANSITIONS} observed at ${waited}s (${pending} run(s) pending, stall bound ${stall_bound}s, ceiling ${ceiling_bound}s): $summary $wait_word"
         else
-          info "admin-merge: … FIRST-CHECKS wait: still RUNNING, no change for ${quiet}s of the ${stall_bound}s stall bound (${waited}s of the ${ceiling_bound}s ceiling, ${FIRST_CHECKS_TRANSITIONS} change(s) so far) — last: $FIRST_CHECKS_LAST_CHANGE"
+          info "admin-merge: … FIRST-CHECKS wait: still RUNNING, no change for ${quiet}s of the ${stall_bound}s stall bound (${waited}s of the ${ceiling_bound}s ceiling, ${FIRST_CHECKS_TRANSITIONS} change(s) so far) — last: $FIRST_CHECKS_LAST_CHANGE $wait_word"
         fi ;;
     esac
 
@@ -4665,6 +4686,10 @@ wait_for_first_checks() {
     # bound it reports (the #1395 lesson again). The room is whichever verdict is
     # next: the stall clock for an observed surface, the legacy window for an
     # unobserved one, and the ceiling always.
+    # ⛔ AN EXPIRED WAIT DOES NOT SLEEP: the report above was the last thing it owed.
+    if [ "$expired" -eq 1 ]; then
+      return 1
+    fi
     remaining=$((ceiling_bound - waited))
     case "$FIRST_CHECKS_STATE" in
       still-running) [ $((stall_bound - quiet)) -lt "$remaining" ] && remaining=$((stall_bound - quiet)) ;;
