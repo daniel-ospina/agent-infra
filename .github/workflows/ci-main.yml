@@ -70,9 +70,13 @@ jobs:
         #   The `--git-dir` clause is NOT cosmetic: `scripts/check-pi-pin-lockstep.mjs`
         # EXECUTES this committed `test-command` inside a `mktemp -d` directory that is
         # not a repository, under `bash -e`. Unguarded, the fetch exits 128 there and
-        # takes the whole step down (measured: 115 passed / 9 failed at this head vs
-        # 124 / 0 with `GITHUB_REF=refs/heads/main`, i.e. with the fetch skipped — the
-        # same head, so the fetch is the cause). Outside a repository there is no
+        # takes the whole step down. Measured on the UNGUARDED revision of this preamble
+        # (`0bac887d9`): 115 passed / 9 failed, and 124 / 0 on that SAME commit with the
+        # fetch skipped (`GITHUB_REF=refs/heads/main`) — same head, so the fetch is the
+        # cause. With this guard, `node scripts/check-pi-pin-lockstep.mjs` is 124 / 0 at
+        # EVERY value of `GITHUB_REF` (unset, main, refs/pull/N/merge, a feature branch),
+        # because the harness's temp dir has no repo to fetch into.
+        # Outside a repository there is no
         # tracking ref to create and nothing to judge; the guard's own assertion
         # answers `allow` there because `_recoveryCheckoutVerifiable` has no git dir to
         # consult. So: skip when there is no repo, and fail loudly when there is one and

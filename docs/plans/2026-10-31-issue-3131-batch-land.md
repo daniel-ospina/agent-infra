@@ -19,8 +19,10 @@ aboutObjects: agent-infra, issue-3131, mergify, ci-main, atomic-land
 > assembled as an `integration/batch-*` branch and landed through `atomic-land.sh`; that is what
 > `ci-main.yml` gains a trigger for. **The Mergify queue half is NOT in this PR** — no `.mergify.yml`,
 > no `tests/batch-queue/run.sh`, no `mergify/merge-queue/*` trigger, no hand-off. Tasks 1, 4 and 5, the
-> queue-branch trigger in Task 2, and `A5`/`A7`/`A8` below are **DEFERRED** to the queue follow-up on
-> #3131, where they are inert until an owner arms the app (A8).
+> queue-branch trigger in Task 2, and `A5`/`A6`/`A7`/`A8` below are **DEFERRED** to the queue follow-up on
+> #3131, where they are inert until an owner arms the app (A8). `A6` is listed with them on purpose:
+> `batch_size` sizes a QUEUE batch, so the measurement it prescribes needs the queue armed — the
+> agent-assembled integration branch this PR does ship has no `batch_size` and lands one tree at a time.
 >
 > What this means for the rest of the doc: any sentence that describes the batch branch as
 > `mergify/merge-queue/main`, or that would have a test assert that branch name, describes the DEFERRED
@@ -83,12 +85,15 @@ derivation, and it is withdrawn. The first wave of 10 measures that rate; the dr
 | `ci-main.yml` concurrency | contract | `check-workflow-concurrency.sh` passes on the file: no `cancel-in-progress: true` anywhere and no JOB-level block (a workflow-level block with the literal `false` is permitted, but this workflow ships WITHOUT one — a group here would cancel the very matrix the queue waits on) |
 | `auto-file-on-failure` condition | contract | exact expression `failure() && github.ref == 'refs/heads/main'` |
 | `admin-merge-detector.yml` | contract | the main-only filter is the TRIGGER's `on.workflow_run.branches: [main]` — a job-level `if:` would silently skip the documented `workflow_dispatch` path (see Task 3) |
-| Workflow lock | contract | `scripts/workflow-lock.json` hash matches both edited workflows |
+| Workflow lock | contract | `scripts/workflow-lock.json` matches the workflows it COVERS — the lock lists
+`ci.yml`, `node-ci.yml` and `ci-main.yml` only, so the detector is NOT lock-covered (its drift control is
+`sync-ci-workflows.sh`, which requires `templates/.github/workflows/admin-merge-detector.yml` to stay
+byte-identical to the live copy) |
 | Hand-off | integration (`tests/atomic-land/` existing suite) | `--queue` on an unarmed repo prints `QUEUE-NOT-ARMED` and still lands by the existing path |
 
 **Files:**
 - Create: `.mergify.yml`, `tests/batch-queue/run.sh`
-- Modify: `.github/workflows/ci-main.yml` (`on.push.branches`, `auto-file-on-failure` `if:` — and deliberately NO `concurrency:` block), `.github/workflows/admin-merge-detector.yml` (the trigger's `workflow_run.branches:` filter, never a job `if:`), `scripts/workflow-lock.json` (re-cut hashes), and the merge-duty call site (Task 4)
+- Modify: `.github/workflows/ci-main.yml` (`on.push.branches`, `auto-file-on-failure` `if:` — and deliberately NO `concurrency:` block), `.github/workflows/admin-merge-detector.yml` **and its SOURCE** `templates/.github/workflows/admin-merge-detector.yml` (the two are byte-identical, enforced by `sync-ci-workflows.sh`; the main-only filter is the trigger's `workflow_run.branches:`, never a job `if:`), `scripts/workflow-lock.json` (re-cut hashes), and the merge-duty call site (Task 4)
 
 ---
 
