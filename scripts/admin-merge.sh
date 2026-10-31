@@ -6308,7 +6308,9 @@ NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unre
 #   * guard-step identities are NOT reproduced (they have no local runner) and
 #     always remain in the residual — `repro_scope` admits one into the
 #     CANDIDATE set only when the base holds no record of its step (#1185), and
-#     even then nothing local can execute it, so it can never be cleared.
+#     even then nothing local can execute it: `reproduce_residual_on_base`
+#     filters it from its argv AND from the base's own capture before the
+#     intersection, so it can never be cleared.
 #
 # The worktree is a throwaway under $TMP and is always removed.
 #
@@ -6474,7 +6476,25 @@ reproduce_residual_on_base() {
   # implementation (never a second subtraction, never `comm -12`).
   if [ -n "$reproduced" ]; then
     printf '%s\n' "$reproduced" | sort -u > "$work/reproduced.all"
-    intersect_sets "$work/reproduced.all" "$residual" "$out" "$work/rep-outside.txt" || {
+    # ⛔ THE ARGV FILTER ABOVE DOES NOT BOUND WHAT MAY BE CLEARED (#1185 review,
+    # cycle 2). ⚠️ THIS FILTER IS UNFIXTURED: the cycle-2 author wrote a
+    # rail-level fixture for it and MEASURED that it did not discriminate (the
+    # same scenario cleared nothing with the filter removed), so the case was
+    # deleted rather than shipped as a vacuous green — the effect below is
+    # established by direct measurement of the parser instead
+    # (`python3 scripts/ci_exemption.py ids --log` on a capture carrying the
+    # `##[error]FAILED …` annotation prints the `guard-step::` id). `grep -Ev`
+    # bounds what the runner was ASKED to run; a CAPTURE can
+    # still volunteer an identity its argv never named — `ids --log` recovers
+    # them from anywhere in the log, and a capture carrying a `##[error]FAILED …`
+    # annotation emits a `guard-step::` identity. Since #1185 a guard-step id CAN
+    # be in `$residual` (the candidate set), so before this filter it could be
+    # subtracted from the rail's residual by the base's own output: a failure no
+    # local run can execute, CLEARED. One more filter on the BASE'S side, through
+    # the same one pattern, keeps "an id no local reproduction can execute can
+    # never be cleared" true whichever side reports it.
+    grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$work/reproduced.all" > "$work/reproduced.exec" 2>/dev/null || : > "$work/reproduced.exec"
+    intersect_sets "$work/reproduced.exec" "$residual" "$out" "$work/rep-outside.txt" || {
       : > "$out"; return 1
     }
   fi

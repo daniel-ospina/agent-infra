@@ -2366,19 +2366,27 @@ printf '%s\n' "$HEAD_G3" > "$SCEN/head"
 lane_fail "$HEAD_G3" 963 > "$SCEN/runs-$HEAD_G3"
 GUARD_UNKNOWN_STEP_LOG 'FAILED extensions/shared/heartbeat-progress-edges.test.ts' > "$SCEN/log-963"
 printf '1\n' > "$SCEN/jobs-count-963"
-lane_pass main8888 993        # main is GREEN over the window: no failing row at all
+# ⛔ THE REDIRECT IS LOAD-BEARING (#1185 review, cycle 2): without it main has NO
+# listing at all, the rail blocks at step 2b ("never TESTED main") BEFORE the repro
+# section ever runs, and this scenario pins nothing while its two `|| pass` arms
+# report GREEN. Every arm below is `pass`/`fail`-able for that reason, and the
+# old-exclusion arm is a hard FAIL so "reached the wrong branch" cannot read clean.
+lane_pass main8888 993 > "$SCEN/runs-main"   # main is GREEN over the window: no failing row
 repro_script_log "$SCEN/repro-log.sh" 'tests/test_never.py::test_never' "$SCEN/repro-request.txt"
 REPRO_CMD="bash $SCEN/repro-log.sh"
 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "#1185: an EMPTY base baseline still BLOCKS the guard-step red (exit $rc)" \
-                || pass "#1185: (informational) the rail took another arm on a green-main fixture (exit $rc)"
+                || fail "#1185: an empty base baseline let the guard-step red through"
 grep -q "holds no row for their units" "$SCEN/err" \
   && fail "#1185: an EMPTY base baseline was read as 'the base holds no record' — it cannot tell green from never-run" \
   || pass "#1185: an empty base baseline is NOT read as a no-base-record claim"
 grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
   && pass "#1185: …it keeps the pre-change exclusion (an empty baseline admits nothing)" \
-  || pass "#1185: (informational) the empty-baseline arm reported through another refusal"
+  || { fail "#1185: the empty-baseline fixture never reached the repro section — the arm is unpinned"; sed 's/^/      /' "$SCEN/err"; }
+[ -s "$SCEN/repro-request.txt" ] \
+  && fail "#1185: the empty-baseline fixture handed ids to a runner" \
+  || pass "#1185: …and nothing was handed to a runner"
 
 # HALF 11 — the base reproduction must NOT pre-empt the E5 rotation rule. A
 # clearance that empties the residual would otherwise SKIP the re-run, which is
