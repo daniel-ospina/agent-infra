@@ -1091,8 +1091,10 @@ wt_launcher_env() {
   # gating it on the FILE credit or a non-zero source status skipped exactly the arm where a `keys.env`
   # had just overwritten an inherited token, leaving a credential-less worker on a spawn that reported
   # provisioned. It costs a `gh auth token` only when no name carries a value — and `gh auth token`
-  # answers for the worker's own HOME + pinned config dir, so with no gh at all the fallthrough exits
-  # 98 (fail-closed).
+  # answers for the worker's own HOME + pinned config dir. ⛔ WITH NO gh AT ALL IT IS **NOT** 98
+  # (review finding): the guard is `false; exit 97` in that case, so nothing was ever asked for a
+  # token and 98 (`gh auth token` answered with nothing) is the wrong bucket. Fail-closed, but its own
+  # code — the 98 remedy sends an operator after a credential that is not the fault.
   # ⛔ AND THE gh CALL MUST NOT RE-READ THE VALUE THAT WAS JUST JUDGED BLANK (review finding, 2026-10-23,
   # measured): with `GH_TOKEN='   '` exported, `gh auth token` prints it and exits 0, so the guard would
   # bless the very token the `case` above rejected. The environment names are cleared for this one call
@@ -1851,6 +1853,10 @@ wt_runfile() { # <name> <cwd> <envfile> <command> -> prints the path
   {
     printf '#!/usr/bin/env bash\n# worker %s, launched %s by worker-terminal.sh — the exact command this worker runs\n' \
       "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    # ⛔ 92 IS THE `cd` FAULT, DELIBERATELY NOT 97 (review note): in this file's vocabulary 97 now means
+    # "NO gh RESOLVABLE at build time", so reusing it here would file a directory error under a missing
+    # binary. `wt_spawn`'s decoder has no `92)` arm, so it lands on the generic "the launch line exited
+    # rc=92" — coarse, but never the gh-credential bucket.
     printf 'cd %s || exit 92\n' "$(wt_q "$2")"
     printf 'set -a; . %s || exit 94; set +a\n' "$(wt_q "$3")"
     printf '%s\n' "$4"
@@ -1991,7 +1997,7 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
           93) pre_fault="the credential read NEVER RAN or was KILLED (rc=93): either gh resolved at build time but there is no `perl` timer to bound it, the resolved gh could not be EXECUTED when the pane ran it (perl's failed `exec` would otherwise return 0 and bless a credential-less worker), or the reader was signalled / could not be started (126/127/13x/14x/15x — SIGKILL is 137, SIGTERM 143). Remedy: install `perl` on the harness box (the bound is perl's alarm; `timeout` is absent on macOS), check the gh path this launch line carries, and read the pane line's own message" ;;
           96) pre_fault="the credential PROBE could not answer in time (rc=96: the LOCAL \`gh auth token\` read was still running when its 10 s bound expired) — a PROBE/TIMING fault, NOT an absent credential; the store may be perfectly good. Remedy: re-run this lane, and if it repeats, check that the local credential read is not being serialised behind API traffic (the gh-limit layer's no-request fast path, agent-infra#3138)" ;;
           97) pre_fault="NO gh BINARY could be resolved when this launch line was built (rc=97), so nothing was ever asked for a token. Remedy: put gh on the harness PATH" ;;
-          98) pre_fault="the GH CREDENTIAL is absent or unreadable (rc=98): the worker's environment carries no GH_TOKEN/GITHUB_TOKEN value AND \`gh auth token\` did not answer for that HOME. This is the gh credential and nothing else — the env-file arms are 94 and the model key is 95, so a 98 never means a bad keys.env. Remedy: provision the gh credential for that HOME (hosts.yml / keyring via \`gh auth login\`, or a GH_TOKEN line in keys.env)" ;;
+          98) pre_fault="the GH CREDENTIAL is absent or unreadable (rc=98): the worker's environment carries no GH_TOKEN/GITHUB_TOKEN value AND \`gh auth token\` did not answer for that HOME. NOT THE gh CREDENTIAL EXCLUSIVELY: the env-file arms are 94 and the model key is 95, but a \`keys.env\` whose top-level \`return\` fires BEFORE its token line also lands here (its source still succeeds, so it is not a 94), and so does a store this HOME's gh cannot reach. If a credential was expected, read that file too. Remedy: provision the gh credential for that HOME (hosts.yml / keyring via \`gh auth login\`, or a GH_TOKEN line in keys.env)" ;;
           94) pre_fault="an ENVIRONMENT FILE the launch line sources is unreadable, does not parse, or failed to source (rc=94) — keys.env / pi-keys.env, NOT the gh credential. Remedy: fix that file (\`bash -n <file>\` reproduces it); the credential was never tested" ;;
           95) pre_fault="the MODEL credential is blank in the worker (rc=95: the provider's env name pi needs is empty after every delivery arm), so the lane would die at its first model call. Remedy: deliver the model key (pi-keys.env / keys.env); the gh credential is unaffected" ;;
           # ⛔ THE PRE-CHECK'S OWN ALARM IS THE LAST UNNAMED FAULT (review finding, 2026-10-30): pre_rc

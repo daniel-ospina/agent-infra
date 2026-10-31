@@ -723,8 +723,11 @@ envout="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-plain" XDG_CONFIG_HOME="$TMP
 case "$envout" in *"XDG=[unset] GHCD=[unset]"*) rc=0 ;; *) rc=1; echo "      $envout";; esac
 ck "…and a DEFAULT-config probe UNSETS both, so an inherited config dir cannot repoint the worker's gh" $rc
 # ⛔ A `keys.env` THAT FAILS TO SOURCE IS FATAL (review finding): `wt_runfile` already dies (`|| exit
-# 98`), and the tmux arm must agree — otherwise a failed source silently drops the token assignment
-# and runs a credential-less lane on a spawn that returned 0 and wrote its record.
+# 94`), and the tmux arm must agree — otherwise a failed source silently drops the token assignment
+# and runs a credential-less lane on a spawn that returned 0 and wrote its record. ⛔ 94, NOT 98
+# (review finding): this comment said 98, which was the code BEFORE the env-file arms got their own
+# code — a `keys.env` fault was never a gh-credential fault, and the stale number is exactly the
+# conflation that renumbering removed.
 rm -rf "$TMP/home-badkeys" "$TMP/O4t"; gh_hosts_fixture "$TMP/home-badkeys"
 printf 'GH_TOKEN=ghp_ok\nBADLINE ( (\n' > "$TMP/home-badkeys/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t" "$TMP/home-badkeys" 2>&1)"
@@ -815,9 +818,14 @@ rm -rf "$TMP/home-return" "$TMP/O4t3"; mkdir -p "$TMP/home-return"
 printf 'FOO=1\nreturn 1\nGH_TOKEN=ghp_ok\n' > "$TMP/home-return/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t3" "$TMP/home-return" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
-[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
-ck "a keys.env that aborts BEFORE the token exits 98 (a parse check alone would have run it)" $rc
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"; rcs=$?
+# ⛔ THE CODE IS PINNED, NOT JUST THE REFUSAL (review finding, 2026-10-31): this arm used to assert only
+# that the prefix refused, so it stayed green whatever code was emitted — and the 98 message was free to
+# deny this very shape ("a 98 never means a bad keys.env") with nothing to contradict it. The sentinel
+# still sees a `return 1` source succeed, so this file is NOT a 94; the credential guard fires and
+# answers 98, which is the fact the refusal text must state rather than deny.
+[ "$reach" = "" ] && [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
+ck "a keys.env that aborts BEFORE the token exits 98 — an ENV-FILE fault in the gh bucket, so 98 must not claim gh-only" $rc
 # …and the same abort AFTER the token has been exported is NOT fatal — the environment holds the
 # credential the worker needs, which is the question the guard is asking.
 rm -rf "$TMP/home-return2" "$TMP/O4t4"; mkdir -p "$TMP/home-return2"
@@ -1082,6 +1090,17 @@ if command -v perl >/dev/null 2>&1; then
   # comment would otherwise reinstate it silently.
   grep -qF 'agent-infra#3138' "$LIB" && ! grep -qF '#3099' "$LIB" && rc=0 || rc=1
   ck "…and the 96 remedy cites the DEFECT (#3138), never the unrelated shard PR (#3099)" $rc
+  # ⛔ NO DECODED MESSAGE MAY DENY A FAULT IT CAN ACTUALLY REPORT (review finding, 2026-10-31): two
+  # claims contradicted the code they sit next to — the 98 text said "a 98 never means a bad keys.env"
+  # while the `home-return` arm above produces exactly that, and the guard's own contract still said "no
+  # gh at all → exits 98" twelve lines above the `_guard="false; exit 97"` that emits 97. A maintainer
+  # trusting either one would delete the 97 arm (and this suite's 97 arm) as dead code and restore the
+  # bucketing this change removes. Pinned in both directions, like the #3138 pin.
+  ! grep -qF 'a 98 never means a bad keys.env' "$LIB" \
+    && grep -qF 'fires BEFORE its token line also lands here' "$LIB" \
+    && ! grep -qF 'so with no gh at all the fallthrough exits' "$LIB" \
+    && grep -qF 'IT IS **NOT** 98' "$LIB" && rc=0 || rc=1
+  ck "…and no refusal text DENIES a fault it can report (98 is not gh-only; no gh at all is 97, not 98)" $rc
   # ⛔ AND 93 IS PROVEN BEHAVIOURALLY, which no grep can do: build the launch line with a resolvable
   # gh, then make that gh NON-EXECUTABLE before the pane runs it. perl's failed `exec` returns FALSE and
   # ends the one-liner with status 0 — so without the `; exit 93` tail this arm sees rc=0, i.e. a BLESSED

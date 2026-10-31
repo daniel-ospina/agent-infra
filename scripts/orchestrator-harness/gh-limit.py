@@ -2887,7 +2887,12 @@ def makes_no_request_strictly(argv):
         # a transient misread against a lock that every credential refresh pays for. Serialising readers
         # with writers is the alternative, and it would put a LOCAL read back in the queue this change
         # exists to empty. The exemption is about REQUESTS; the write forms make none but they DO write,
-        # so only the read-only forms are exempt.
+        # so the only READ-ONLY forms are exempt — with ONE stated exception, because that rule is about
+        # what a concurrent writer can LOSE: `config clear-cache` does write, but only the on-disk
+        # API-response cache (it deletes it) and never `config.yml`, so it is a CACHE-ONLY WRITER —
+        # request-free, and destroying a local cache is not a setting two callers can lose, which is what
+        # puts it here rather than with `config set` (review note: the sentence above read as a universal
+        # rule this tuple entry contradicted).
         # ⛔ and the BARE forms (`gh alias`, `gh config`) print help and are request-free — they are
         # exempt too, which the `len(argv) == 1` half expresses (an `("alias", "")` tuple entry could
         # never match: the tuple is only reached with two argv entries).
