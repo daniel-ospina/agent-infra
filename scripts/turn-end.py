@@ -47,6 +47,26 @@ WHY IT SKIPS A LANE HOLDING A QUESTION
     lane waits for the owner exactly as it does today, and the question is queued
     where the owner will see it. Flip SKIP_IF_QUESTION to change that.
 
+    ⛔ AND THE `question-bounced` LABEL COUNTS ONLY WHILE IT IS CURRENT
+    (agent-infra#2844). The rule above is "do not nudge a lane that HOLDS a
+    question"; keying it on the label's PRESENCE makes it fire on a lane that holds
+    NONE. `question-bounced` is a projection — it records that a bounce happened,
+    not that the question is still pending — and nothing re-validates it. Measured
+    2026-10-29: of the 26 open issues carrying it, 22 had thread activity NEWER than
+    the label's own `labeled` event. So each such issue's own timeline is consulted
+    through `_bounce_state.py` (the ONE definition, shared with `turn-classify.py`
+    and `undelivered-answers.py`), and a bounce the thread has overtaken does not
+    suppress this lane's nudge. This STRENGTHENS the owner's rule rather than
+    reversing it: the skip is for a lane holding a question, and a stale label is
+    evidence of no question at all. `owner-decision` is NOT checked — that is the
+    queue's live membership, which the thread moving on does not contradict (the
+    same split `turn-classify.py` records).
+
+    The cost is ONE timeline read per `question-bounced` issue, so it is bounded
+    twice (count AND wall clock, see MAX_BOUNCE_READS / BOUNCE_BUDGET_S) and
+    fails CLOSED: an issue past either bound, or a timeline that could not be read,
+    keeps the label's authority — the lane is not nudged, exactly as before.
+
 USAGE
     python3 turn-end.py [--dry-run] [--limit-seconds 30]
 
@@ -100,6 +120,20 @@ MIN_GAP_S = 900
 # See the module docstring: this implements the owner's literal rule.
 SKIP_IF_QUESTION = True
 
+# ⛔ THE BOUNCE STATE IS READ PER ISSUE, SO IT IS BOUNDED TWICE — BY COUNT AND BY WALL
+# CLOCK — AND BOTH BOUNDS FAIL CLOSED. `lanes_with_open_question()` asks whether each
+# `question-bounced` label is still current, which costs ONE timeline read per such issue.
+# Measured 2026-10-29: 26 open issues carry that label across the three repos, so the
+# unconditioned cost is ~26 reads. This script runs under the heartbeat's `run_bounded`
+# (90 s for the whole tick, see the #1988 note above) and the question scan is only ONE of
+# its calls, so a count cap alone would let a slow gh eat the pass and this fallback
+# nudger would never run at all. Past EITHER bound the remaining issues are treated as
+# CURRENT (their lane is not nudged) and the cap is LOGGED — never silently dropped, and
+# never read as "no question".
+MAX_BOUNCE_READS = 40
+BOUNCE_READ_TIMEOUT_S = 10
+BOUNCE_BUDGET_S = 25
+
 # ⛔ THE TRANSCRIPT GUARD WAS DEAD CODE - DO NOT RESURRECT IT.
 # `DECL_RE = ^\s*RESEARCH:\s*skill=` matched **0** times against a session tail that
 # contained the substring **26** times (measured on 2c Pack compile). In a .jsonl the
@@ -146,6 +180,17 @@ def _gh_layer():
 
 GH = _gh_layer() or "gh"
 
+# The SHARED definition of "is that bounce label still the truth?" lives with this file in
+# the repo (scripts/_bounce_state.py) and is farmed to `$SCRIPTS` before its consumers.
+# Resolved repo-first, deployed-second, so the copy under test and the running copy cannot
+# diverge — the same two-step `turn-classify.py` uses.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+if SCRIPTS not in sys.path:
+    sys.path.append(SCRIPTS)
+import _bounce_state as bs                                    # noqa: E402
+
 
 def log(msg: str) -> None:
     try:
@@ -161,6 +206,20 @@ def sh(argv: list[str], timeout: int = 120) -> tuple[int, str]:
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as exc:                                   # noqa: BLE001
         return 999, f"{type(exc).__name__}: {exc}"
+
+
+def sh_stdout(argv: list[str], timeout: int = 120) -> tuple[int, str]:
+    """`sh`, but STDOUT ONLY — for callers that PARSE the output.
+
+    `sh` merges stderr into the returned text, which is right for the diagnostics that
+    print it and wrong for a parser: a warning gh wrote to stderr would be handed to the
+    reduction as if it were a row. Same seam, same reason as `turn-classify.py`'s.
+    """
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "")
+    except Exception as exc:                                   # noqa: BLE001
+        return 999, ""
 
 
 def tail_text(path: str, nbytes: int = 400_000) -> str:
@@ -270,15 +329,58 @@ Reply with one line saying what you are doing next, then do it.
 """
 
 
-def lanes_with_open_question() -> set:
-    """Lane labels whose open issues carry `owner-decision` or `question-bounced`.
+def bounce_still_current(repo: str, n: int):
+    """True / False / None — is `question-bounced` on this issue still the newest word?
+
+    `None` means the timeline could not be read, and the caller MUST keep the label's
+    authority: an unread state is not evidence that a question is gone, and this is a
+    nudger, so the only safe direction on a failed read is the pre-fix behaviour (skip).
+    """
+    def run(argv):
+        # ⛔ #1988, and the reason `_bounce_state.bounce_view` takes `run` as an ARGUMENT.
+        # `bounce_view` emits `["gh", "api", …]` — a bare name that resolves through PATH,
+        # where `heartbeat-loop.sh`'s pinned PATH lets the real gh OUTRANK the seeded
+        # shims. Passing it straight to `sh` would make this the file's only unserialised
+        # gh call, per tick, against the account four boxes share. Both sibling readers
+        # rebind it the same way, and stdout-only because the output is PARSED.
+        rc, out = sh_stdout([GH] + list(argv[1:]), timeout=BOUNCE_READ_TIMEOUT_S)
+        return rc, out
+
+    try:
+        view = bs.bounce_view(repo, n, run)
+    except Exception as exc:                                     # noqa: BLE001
+        log(f"WARN bounce state raised for {repo}#{n}: {exc} — treating it as current")
+        return None
+    if not view.read:
+        return None                    # UNKNOWN — the caller must not claim either way
+    return not view.stale
+
+
+def lanes_with_open_question(known_lanes=None) -> set:
+    """Lane labels whose open issues carry a question. (labels)
 
     A question is ONE comment on an ISSUE, so the issue's labels are the fact and the
     lane's transcript is not. Attribution is by the issue's own `lane:*` label; an
     issue with no lane label is REPORTED (never guessed) — same rule as
     ask-owner.py's lane_workspace().
+
+    ⛔ `question-bounced` COUNTS ONLY WHILE IT IS CURRENT (agent-infra#2844). The label is
+    a projection — it records that a bounce happened, not that the question is still
+    pending — so each issue carrying it is checked against its own timeline through
+    `scripts/_bounce_state.py`, the ONE definition shared with `turn-classify.py` and
+    `undelivered-answers.py`. Before this, the label's PRESENCE returned the lane, and
+    `main()` skipped its `WIP-IDLE` nudge — so a bounce the thread had overtaken silenced
+    the fallback nudger for a lane that held no question at all (22 of 26 measured
+    label-carriers were stale). `owner-decision` is NOT checked: that is the queue's live
+    membership, which the thread moving on does not contradict, and checking it would only
+    add reads for no claim.
+
+    `known_lanes`, when given, BOUNDS the currency checks to lanes the caller can act on.
+    It never bounds the RETURNED set — a lane outside the bound keeps the label's answer,
+    because this set is also the log line that says a question is queued.
     """
     out = set()
+    bounce_issues = []                 # (repo, number, lane labels) — checked below
     for repo in REPOS:
         for label in ("owner-decision", "question-bounced"):
             rc, txt = sh([GH, "issue", "list", "--repo", repo, "--state", "open",
@@ -300,7 +402,38 @@ def lanes_with_open_question() -> set:
                     log(f"NOTE guard: {repo}#{r['number']} holds a question but has "
                         f"no lane:* label - cannot attribute, not guessing")
                     continue
-                out.update(mine)
+                if label == bs.BOUNCE:
+                    bounce_issues.append((repo, r["number"], mine))
+                else:
+                    out.update(mine)
+    # A read that failed — or an issue past the cap — keeps the label's authority, so the
+    # bound can only ever ADD a lane. It can never make this scan look empty.
+    # `reads` counts READS, not loop positions: the registry bound below `continue`s without
+    # spending one. Both bounds are stated in the log, once, with the number they affected.
+    reads = capped = 0
+    deadline = time.monotonic() + BOUNCE_BUDGET_S
+    for repo, number, mine in bounce_issues:
+        if known_lanes is not None and not (set(mine) & known_lanes):
+            out.update(mine)           # cannot act on this lane: keep the label's answer
+            continue
+        if reads >= MAX_BOUNCE_READS or time.monotonic() >= deadline:
+            capped += 1
+            out.update(mine)
+            continue
+        reads += 1
+        current = bounce_still_current(repo, number)
+        if current is None:
+            log(f"WARN bounce state unreadable for {repo}#{number} — counting it as "
+                f"current (no nudge on an unread state)")
+            out.update(mine)
+        elif current:
+            out.update(mine)
+        else:
+            log(f"bounce label SUPERSEDED on {repo}#{number} — NOT counted as a held "
+                f"question, so its lane is still nudged")
+    if capped:
+        log(f"CAP bounce-state reads ({MAX_BOUNCE_READS} reads OR {BOUNCE_BUDGET_S}s): "
+            f"{capped} issue(s) treated as CURRENT (never dropped)")
     return out
 
 
@@ -372,7 +505,7 @@ def main(argv: list[str]) -> int:
 
             f = session_path(sid)
             if SKIP_IF_QUESTION and issue_label in holds_question:
-                log(f"SKIP {lane} holds a question ({issue_label} carries "
+                log(f"SKIP {lane} holds a question ({issue_label} carries a CURRENT "
                     f"owner-decision/question-bounced)")
                 continue
 
