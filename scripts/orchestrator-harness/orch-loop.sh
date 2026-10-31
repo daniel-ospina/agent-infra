@@ -5641,7 +5641,12 @@ PY
       CAP_PUB="$(cap_publish "$REPO" "$CAP_REC" 2>&1)" || {
         CAP_PUB_WHY="$(printf '%s\n' "${CAP_PUB:-}" | awk -F'why=' '/^publish=(refused|failed)/{print $2; exit}')"
         CAP_PUB_BID="$(cap_kv "$CAP_REC" boxid)"
-        echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS ($(printf '%s' "$CAP_PUB" | tr '\n' ' '))— peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings) — why=${CAP_PUB_WHY:-unknown} boxid=${CAP_PUB_BID:-<none>} host=$(cap_host); a box that cannot name itself cannot publish, and the operator seam is CAP_BOXID" >> "$LOG"
+        # ⛔ THE REMEDY IS ONLY NAMED FOR THE REASON THAT HAS ONE (review round 3): `no-box-identity`
+        # means "this box cannot name itself"; `push-refused`/`no-head`/`invalid-record` do not, and
+        # pointing an operator at CAP_BOXID for those would send them to a boxid that is already right.
+        CAP_PUB_HINT=""
+        [ "${CAP_PUB_WHY:-}" = "no-box-identity" ] && CAP_PUB_HINT='; a box that cannot name itself cannot publish it — the operator seam is CAP_BOXID'
+        echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS ($(printf '%s' "$CAP_PUB" | tr '\n' ' '))— peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings) — why=${CAP_PUB_WHY:-unknown} boxid=${CAP_PUB_BID:-<none>} host=$(cap_host)$CAP_PUB_HINT" >> "$LOG"
       }
       CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
       [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"

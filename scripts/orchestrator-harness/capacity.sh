@@ -167,8 +167,11 @@
 # #2707 defect wearing a different key, so the order is now (hw uuid, routable IPv4) and then **no
 # identity at all** — `cap_publish` refuses by name (`why=no-box-identity`) and the box is INVISIBLE to
 # its peers, which is the fail-closed direction and is the same stance as `fork_unknown`. A box that
-# reaches the origin has a routable address by construction (private ranges are `scope global`), so the
-# refusal costs nothing in practice; a deploy that must name a box pins `CAP_BOXID`.
+# reaches the origin normally has a routable address, but that is NOT free any more: since #3167 the
+# derivation is anchored to the egress device and refuses a box whose default route is not in the main
+# table (`ip route show default`), so a policy-routing or gateway-less box IS refused where the old
+# `NR==1` body would have published something. Fail-closed on purpose — a deploy that must name such a
+# box pins `CAP_BOXID`.
 #
 # ⛔ THE PREFIX IS NOT THE KEY, AND THE PRUNE IS NOT HOST-SCOPED. `cap_host` still returns the HUMAN
 # name (`cmux`, `Daniels-MacBook-Air`) and a ref is keyed `refs/boxes/<host>/<boxid>/<reading>`. The
@@ -306,8 +309,10 @@ cap_boxid() {
 
 # cap_boxid_auto — first AVAILABLE source wins, in order of measured discriminating power:
 #   1. the hardware UUID (Darwin `kern.uuid`) — unique per machine, survives a re-image of the OS;
-#   2. the box's GLOBAL IPv4 — measured UNIQUE on the three cells (10.238.144.2/.3/.4). `scope
-#      global` also excludes `lo` and the 169.254/16 link-local address that IS shared (measured).
+#   2. the box's ROUTABLE IPv4 — measured UNIQUE on the three cells (10.238.144.2/.3/.4). ⛔ NOT
+#      because `scope global` excludes anything useful: on these cells the 169.254/16 link-local address
+#      is ITSELF reported `scope global` (measured, #3167), which is what broke this source. Read
+#      `cap_boxid_net`: it excludes link-local by PREFIX and anchors the answer to the egress device.
 # ⛔ AND THEN NOTHING — `machine-id` is gone from this list on purpose (see the header): measured
 # IDENTICAL on all three cells, so as a fallback it publishes a FALSE ATTRIBUTION instead of refusing.
 # An empty answer here is a real answer: `cap_probe_local` still reports the reading, and `cap_publish`
@@ -372,7 +377,10 @@ cap_hw_uuid() {
 # docker network, a VPN) can never preempt one that already existed.
 # ⛔ EVERY CLAUSE IS GRADED BY ITS OWN ARM in capacity-placement.test.sh §14: (8) a foreign device with a
 # NON-REJECTED name at a lower ifindex is never the identity (clause 1), (9) an egress device that is a
-# tunnel refuses rather than adopting its address (clause 2), (3)/(10) the choice is stable and total.
+# tunnel refuses rather than adopting its address (clause 2), (11) the reserved/unspecified prefixes
+# refuse (clause 3), (3)/(4) the choice is stable, total and ifindex-ordered, (10) the secondary and
+# octet tie-breaks. The dotted-quad `$4` guard is deliberately UNGRADED: `ip -4 -o addr` always puts the
+# address in `$4`, so it is defence only, not a mechanism.
 # ⛔ THIS IS ALSO THE SUITE'S IDENTITY SEAM: the arms in capacity-placement.test.sh §12 override THIS
 # FUNCTION to stand up two boxes with two identities on one hostname — the whole point of #2707 is
 # that `CAP_HOST` is NOT what distinguishes them.

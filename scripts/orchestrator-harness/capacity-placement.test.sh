@@ -992,11 +992,15 @@ printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *) cat
   "$TMP/iproute.out" "$TMP/ipaddr.out" > "$IPB/ip"; chmod +x "$IPB/ip"
 # ipfix <egress-dev> <addr-line…> — one fixture for one box. `CAP_BOXID` is cleared in every arm below:
 # the operator seam must not mask the derivation, which is the thing under test.
-# ⛔ EACH LINE IS EMITTED IN THE PRODUCTION SHAPE, tail included (`\       valid_lft forever
+# ⛔ EACH ADDR LINE IS EMITTED IN THE PRODUCTION SHAPE, tail included (`\       valid_lft forever
 # preferred_lft forever` — measured on a live cell: NF=13 and `$NF` is `forever`). A fixture without the
 # tail is NF=9 with `$NF=eth0`, so an implementation that reads the LAST field instead of `$4` would be
 # GREEN here and wrong on every real box — review round 1, finding 4.
-ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s\n' "$_d" > "$TMP/iproute.out"
+# ⛔ AND SO IS THE ROUTE LINE (review round 3, finding 1): a DHCP-configured box prints
+# `default via 10.9.9.1 dev wan0 proto dhcp src 10.9.9.9 metric 100` — the device is NOT the last field,
+# so a `$NF` implementation loses the identity on an ordinary box. The `proto/src/metric` tail is part of
+# the fixture for exactly that reason.
+ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s proto dhcp src 169.254.77.2 metric 100\n' "$_d" > "$TMP/iproute.out"
   : > "$TMP/ipaddr.out"
   for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done; }
 boxidnet_mod() { _m="$1"; ( . "$_m"; PATH="$IPB:$PATH"; CAP_BOXID=""; cap_boxid_net ) 2>/dev/null; }
@@ -1039,6 +1043,15 @@ if [ -r /proc/net/route ]; then
   A3C="$(boxidnet)"; RC=$?
   ck "  …and the SAME one when \`ip\` lists them in the other order ($A3C) — the answer is a function of the set, not of the output order" \
      "$([ "$RC" -eq 0 ] && [ "$A3C" = 10.1.0.5 ] && echo 0 || echo 1)"
+  # (3b) THE IFINDEX ORDER DECIDES, NOT THE ADDRESS ORDER (review round 3, finding 4). Here the lower
+  # ifindex holds the HIGHER address, so the documented rule (lowest ifindex) and an octet-only rule
+  # disagree. Without this arm, replacing the ifindex parse with `i = 0` stays green.
+  ipfix eth0 \
+    '3: eth0 inet 10.2.0.7/24 brd 10.2.0.255 scope global eth0' \
+    '5: eth0.7 inet 10.1.0.5/24 scope global eth0.7'
+  A3D="$(boxidnet)"; RC=$?
+  ck "  …and the LOWEST IFINDEX wins even when it holds the numerically HIGHER address ($A3D, not 10.1.0.5)" \
+     "$([ "$RC" -eq 0 ] && [ "$A3D" = 10.2.0.7 ] && echo 0 || echo 1)"
   # (4) no address at all => refuse.
   ipfix eth0 ''
   A4="$(boxidnet)"; RC=$?
@@ -1088,14 +1101,17 @@ MUT
   A9="$(boxidnet)"; RC=$?
   ck "(9) an egress device that is a TUNNEL refuses rather than adopting its address (rc=$RC, boxid=[$A9])" \
      "$([ "$RC" -eq 1 ] && [ -z "$A9" ] && echo 0 || echo 1)"
-  # (10) TWO addresses on ONE device (review round 1, finding 2; round 2, finding 1).
-  # (a) a `secondary` alias never displaces the address of record — written in the shape real iproute2
-  #     emits, where `$2` stays the DEVICE and the label is the TRAILING field (measured with real `ip
-  #     addr add … label eth1:1`: `5: eth1 inet 10.50.0.9/24 scope global eth1:1`). A fixture with
-  #     `$2 = eth0:1` is rejected by clause 1 instead and grades nothing.
+  # (10) TWO addresses on ONE device (review round 1, finding 2; round 2, finding 1; round 3, finding 3).
+  # (a) a `secondary` address never displaces the address of record. ⛔ THE SECONDARY LINE COMES FIRST
+  #     ON PURPOSE: with the primary first, the `s == bs` guard inside the numeric term already refuses
+  #     the displacement and the `s < bs` clause grades nothing (round 3 measured exactly that).
+  #     ⛔ AND NOTE THE PLATFORM: `ip addr add … secondary` is refused by iproute2 6.x (~"secondary option
+  #     is not mutable from userspace") and `ip -j addr show` reports `secondary:false` for a labelled
+  #     alias, so this flag is KERNEL-set — the fixture is the only way to reach the branch, and the
+  #     trailing label is in the shape real `ip` prints it.
   ipfix eth0 \
-    '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0' \
-    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global secondary eth0:1'
+    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global secondary eth0:1' \
+    '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0'
   A10="$(boxidnet)"; RC=$?
   # (b) …and the tie-break among candidates that are equal in BOTH ifindex and secondary-ness is
   #     NUMERIC. The two addresses are chosen so a STRING compare and an OCTET compare disagree:
@@ -1106,11 +1122,21 @@ MUT
     '3: eth0 inet 10.9.10.9/24 brd 10.9.10.255 scope global eth0' \
     '3: eth0 inet 10.9.9.10/24 brd 10.9.9.255 scope global eth0'
   A10B="$(boxidnet)"
-  ck "(10) a secondary alias never displaces the primary ($A10), and the tie-break is NUMERIC — octets give .9.10, a string compare gives .10.9 ($A10B)" \
+  ck "(10) a secondary never displaces the primary ($A10), and the tie-break is NUMERIC — octets give .9.10, a string compare gives .10.9 ($A10B)" \
      "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.10 ] && echo 0 || echo 1)"
+  # (11) CLAUSE 3'S RESERVED/UNSPECIFIED PREFIXES (review round 3, finding 2): both are addable on this
+  # kernel and both appear in `ip -4 -o addr show scope global` (measured under `unshare -rn`), so a
+  # clause that drops them publishes an address no peer can use as an identity.
+  ipfix eth0 '3: eth0 inet 0.9.9.9/24 scope global eth0'
+  A11="$(boxidnet)"; RC=$?
+  ipfix eth0 '3: eth0 inet 224.0.0.7/24 scope global eth0'
+  A11B="$(boxidnet)"; RC2=$?
+  ck "(11) an unspecified (0/8) or multicast/reserved (224/4) address REFUSES rather than being published ([$A11] rc=$RC, [$A11B] rc=$RC2)" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A11" ] && [ "$RC2" -eq 1 ] && [ -z "$A11B" ] && echo 0 || echo 1)"
 else
-  echo "  ⏭ §14 (1)-(5) SKIPPED: this platform has no /proc/net/route, so the Linux arm of cap_boxid_net is unreachable here."
-  echo "    Not a pass: CI runs ubuntu-latest, where every arm above is measured."
+  echo "  ⏭ §14 (1)-(5), (8)-(11) SKIPPED: this platform has no /proc/net/route, so the Linux arm of"
+  echo "    cap_boxid_net is unreachable here — including the arms that grade clauses 1 and 2 and the"
+  echo "    tie-breaks (8)-(11). Not a pass: CI runs ubuntu-latest, where every arm above is measured."
 fi
 # (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
 # controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
