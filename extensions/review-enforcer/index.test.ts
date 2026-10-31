@@ -66,6 +66,7 @@ import {
   mergeVerbInText,
   readsNonMergeGhCall,
   writesOnlyTrackerRecords,
+  withoutQuotedHeredocBodies,
   ghShimWillEnforce,
   isExecutableShim,
   hasLiteralAdminFlag,
@@ -10184,6 +10185,158 @@ pending.push(async () => {
   ] as Array<[string, string]>) {
     equal(isGitOp(command), true, `${label}: must keep the floor`);
   }
+});
+
+// ── PR #3161 P0: the classification mask may not blank a body the PROVEN masker REFUSES ────────
+//
+// THE FINDING (fresh-context review, re-verified by execution here). `withoutQuotedHeredocBodies`
+// exists to skip ONE of `maskHeredocData`'s clauses — the COMPOUND-PREFIX refusal — and its docstring
+// ARGUED that the other five did not matter ("with a QUOTED delimiter bash performs no expansion, and
+// the body is stdin to `cat`, which cannot run it"). That argument is true about the BODY and false
+// about the COMMAND. Measured through this module at the reviewed head, every shape below was BLANKED
+// while `bash` executes the body, so the `git` word inside it vanished from `isGitOp`'s view — and
+// `isGitOp` is the gate handler's ENTRY predicate, so the ≥1-dispatch floor, the admin-merge evidence
+// gate and the merge registry were all skipped for a real `git -C <wt> push` (the fleet's own
+// canonical push form).
+//
+// FIVE CLAUSES WERE MISSING, not one, and each has a row here. The rows are pins in TWO places:
+// `isGitOp(command) === true` below (the user-visible, fail-closed property) and the differential
+// block after it (the reason, computed against `maskHeredocData` rather than hand-asserted).
+const CLASSIFICATION_MASK_EVASIONS: Array<[string, string]> = [
+  // clause 2 — a WRITTEN TARGET a later line runs
+  ['body written to a file the SAME command then runs', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nbash /tmp/y.sh"],
+  ['body written to a file, run by sh with a continuation', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nsh \\\n/tmp/y.sh"],
+  // clause 5 — a SECOND COMMAND on the opener line, i.e. the same thing one line up
+  ['opener line runs the file it writes', "gh pr comment 1 --body-file /tmp/x.md && cat > /tmp/y.sh <<'EOF' && bash /tmp/y.sh\ngit -C /wt push origin HEAD:main\nEOF"],
+  // …and the same thing when the WRITER is not the line's first word (`tee`/`dd of=` write the body
+  // to a file the next line runs — both were measured masking in the first version of this fix).
+  ['compound prefix + tee writes the file a later line runs', "cd /tmp && tee /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nbash /tmp/y.sh"],
+  ['dd of= writes the file a later line runs', "cd /tmp && dd of=/tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nbash /tmp/y.sh"],
+  // clause 3 — a SHADOWED reader
+  ['shadowed reader: function definition', "cat() { bash; }\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['shadowed reader: alias', "alias cat=bash\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['shadowed reader: assignment', "cat=bash\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // clause 4 — the PREFIX can capture the body or re-resolve the reader
+  ['prefix substitution on the opener line', 'x=$(cat <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF\n)\neval "$x"'],
+  ['prefix substitution on an earlier line', 'x=$(\ncat <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF\n)\neval "$x"'],
+  ['PATH assignment in the opener-line prefix', "PATH=/tmp/evil:$PATH cat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['PATH exported on an earlier line', "PATH=/tmp/evil:$PATH; export PATH\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['continuation on a PREFIX line', "cd /wt && \\\ncat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // clause 1 — a FRAME whose stdout can still reach a program
+  ['compound frame piped into bash', "if true; then cat <<'EOF'\ngh -R o/r pr merge 9 --squash\nEOF\n: ; fi | bash"],
+  // …and the frame opened on an EARLIER line, which is the shape that actually reaches the consumer
+  // clause: on one line the reader word is `then`/`do` (already refused), on two it is `cat`.
+  ['opener inside a frame opened earlier', "if true; then\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nfi"],
+  ['loop frame opened earlier, done | bash', "for x in 1; do\ncat <<'EOF'\ngh -R o/r pr merge 9 --squash\nEOF\ndone | bash"],
+  // clause 5 (consumer) — a reader that is not proven data-only, and a frameless ELEVATION path
+  ['while read + eval as the consumer', 'while read l; do eval "$l"; done <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF'],
+  ['unquoted delimiter EXPANDS its body', 'cat <<EOF\n$(git -C /wt push origin HEAD:main)\nEOF'],
+];
+
+// One `test` per shape, so a single broken clause cannot mask the others in the report: the whole
+// point of this section is that the SET of executed-body shapes is enumerated, not sampled.
+//
+// TWO assertions per row, and the second is the one that cannot be satisfied by accident: the gate
+// must fire (`isGitOp`), AND the OPERATION inside the executed body must still be VISIBLE in the
+// classifier's masked read — a row can pass the first while the masker blanks the body, because an
+// unmasked-but-still-refused command exists (the frame rows did exactly that at the reviewed head).
+console.log("\n── the classification mask may not hide an executed body (PR #3161 P0)");
+for (const [label, command] of CLASSIFICATION_MASK_EVASIONS) {
+  test(`executed body is not masked as data: ${label}`, () => {
+    equal(isGitOp(command), true, "the gate must fire — the body reaches a shell");
+    equal(writesOnlyTrackerRecords(command), false, "not a tracker write");
+    equal(
+      /git -C \/wt push|pr merge/.test(withoutQuotedHeredocBodies(command)),
+      true,
+      "the operation inside an EXECUTED body must stay readable to the classifier",
+    );
+  });
+}
+
+// ── The classification masker is a SUBSET of the proven one (differential, PR #3161 P0) ────────
+//
+// The property, stated once: for any command, the set of BODY LINES `withoutQuotedHeredocBodies`
+// blanks must be a subset of the lines `maskHeredocData` blanks — i.e. the narrow masker may never
+// mask a body the proven masker refused to mask. It is checked by CALLING both functions over a
+// corpus that spans all six clauses, the reported prose shapes and the PR's own parked rows; nothing
+// here is a hand-written expectation of "masked"/"not masked" except the non-vacuity counts.
+//
+// TWO DECLARED RELAXATIONS are the ONLY permitted difference, and they are enumerated per row, not
+// assumed: (1) the PREFIX of the opener line may be COMPOUND, (2) a written target may be MENTIONED
+// by a tracker-write READER that cannot run it (`gh --body-file`). Both are what the PR exists for.
+// A third row is marked because it is a RESIDUAL the proven masker declares too (a written file
+// renamed by `cp` inside the command) — named here rather than left for a reviewer to find.
+// A declared row must still MASK (or the corpus is vacuous).
+const blankedLineIndexes = (original: string, masked: string): number[] => {
+  const a = original.split("\n");
+  const b = masked.split("\n");
+  // A masker that changes the line COUNT is broken in a way no subset test can rescue.
+  if (a.length !== b.length) return [-1];
+  const out: number[] = [];
+  // Only an ALL-SPACE line is a blanked body; the opener line this classifier REWRITES
+  // (`<<'EOF'` → `</dev/null`) and the terminator it keeps verbatim are not.
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i] && /^[ ]*$/.test(b[i])) out.push(i);
+  return out;
+};
+
+const MASK_CORPUS: Array<[label: string, command: string, declaredRelaxation: boolean]> = [
+  ['prose body under a lone writer', "cat > /tmp/f.md <<'MDEOF'\ngh pr merge 999 --admin\nMDEOF", false],
+  ['parked lane fi-10343 (compound prefix + gh body-file)', REPORT_ONLY_COMMENT, true],
+  ['parked lane rv-ai-3054 (compound prefix + gh body-file)', REPORT_ONLY_COMMENT_2, true],
+  ['compound prefix, no tracker mention', "cd /wt && cat > /tmp/f.md <<'MDEOF'\nprose `git push`\nMDEOF", true],
+  ['written target read by a tracker (gh) later', "cat > /tmp/b.md <<'MDEOF'\nprose `gh pr merge`\nMDEOF\ngh pr comment 1 --body-file /tmp/b.md", true],
+  ['written target piped into a program later', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\ncat /tmp/y.sh | bash", false],
+  // A SHARED RESIDUAL, enumerated rather than hidden: the written path reaches a runner through a
+  // `cp` inside the prefix, which no written-target rule here follows. `maskHeredocData` declares the
+  // same gap (a file a LATER tool call runs, and a file renamed inside the command); it only refuses
+  // this shape because the prefix is compound, which is relaxation (1).
+  ['written target COPIED to another name in the prefix', "cp /tmp/a.sh /tmp/y.sh && cat > /tmp/a.sh <<'EOF'\ngh pr merge 1 --admin\nEOF", true],
+  ['written target run by a later line', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\nbash /tmp/y.sh", false],
+  ['written target under a compound prefix, run later', "cd /tmp && tee /tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\nbash /tmp/y.sh", false],
+  ['written target via `dd of=`, run later', "cd /tmp && dd of=/tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\nbash /tmp/y.sh", false],
+  ['shadowed reader (function)', "cat() { bash; }\ncat <<'EOF'\ngit push\nEOF", false],
+  ['shadowed reader (alias)', "alias cat=bash\ncat <<'EOF'\ngit push\nEOF", false],
+  ['prefix substitution on the opener line', 'x=$(cat <<\'EOF\'\ngit push\nEOF\n)', false],
+  ['prefix substitution on an earlier line', 'x=$(\ncat <<\'EOF\'\ngit push\nEOF\n)', false],
+  ['continuation on a prefix line', "cd /wt && \\\ncat > /tmp/y.sh <<'EOF'\ngit push\nEOF", false],
+  ['continuation on the opener line', "cat <<'EOF' \\\n| sh\ngit push\nEOF", false],
+  ['frame: if ... fi | bash', "if true; then\ncat <<'EOF'\ngh pr merge 1 --admin\nEOF\nfi | bash", false],
+  ['frame: for ... done | bash', "for x in 1; do\ncat <<'EOF'\ngh pr merge 1 --admin\nEOF\ndone | bash", false],
+  ['pipe into sh', "cat <<'EOF' | sh\ngit push\nEOF", false],
+  ['sh as the consumer', "sh <<'EOF'\ngit push\nEOF", false],
+  ['process substitution in the remainder', "cat <<'EOF' > >(sh)\ngit push\nEOF", false],
+  ['process substitution in the prefix', "tee >(sh) <<'EOF'\ngit push\nEOF", false],
+  ['PATH assignment in the opener-line prefix', "PATH=/tmp/e:$PATH cat <<'EOF'\ngit push\nEOF", false],
+  ['consumer this classifier does not prove', "head -1 <<'EOF'\ngh pr merge 1 --admin\nEOF", false],
+  ['unquoted delimiter EXPANDS its body', 'cat <<EOF\ngh pr merge 1 --admin\nEOF', false],
+];
+
+console.log("\n── the classification masker is a SUBSET of the proven masker (differential)");
+test("no body is blanked that maskHeredocData keeps readable (except the 2 declared relaxations)", () => {
+  const violations: string[] = [];
+  let maskedRows = 0;
+  let relaxationRows = 0;
+  for (const [label, command, declaredRelaxation] of MASK_CORPUS) {
+    const narrow = blankedLineIndexes(command, withoutQuotedHeredocBodies(command));
+    const proven = new Set(blankedLineIndexes(command, maskHeredocData(command)));
+    if (narrow.length > 0) maskedRows++;
+    if (declaredRelaxation) {
+      relaxationRows++;
+      if (narrow.length === 0) violations.push(`${label}: a DECLARED relaxation must still mask — got no mask`);
+      continue;
+    }
+    const extra = narrow.filter((n) => !proven.has(n));
+    if (extra.length > 0) {
+      violations.push(
+        `${label}: blanked line(s) ${extra.join(", ")} that maskHeredocData keeps READABLE — the classifier may never be less conservative than the proven masker`,
+      );
+    }
+  }
+  // NON-VACUITY, asserted rather than assumed: a masker that blanks nothing satisfies every subset
+  // test above for free, and a corpus with no declared relaxation proves nothing about the PR.
+  if (maskedRows < 3) violations.push(`the corpus must contain masked rows (got ${maskedRows})`);
+  if (relaxationRows < 3) violations.push(`the corpus must contain declared-relaxation rows (got ${relaxationRows})`);
+  equal(violations.length, 0, violations.join("\n    ") || "no violation");
 });
 
 // ── Summary ───────────────────────────────────────────

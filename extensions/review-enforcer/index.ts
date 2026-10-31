@@ -767,7 +767,16 @@ const GIT_FILE_NAMING_SUBCOMMANDS = new Set([
  * `grep X`), which is rare; the ordinary `cat >> CHANGELOG.md` … `git add CHANGELOG.md` sequence
  * stays masked, which is the case that would otherwise bring the reported false positive back.
  */
-function heredocLineExecutes(line: string, target: string, scope = line): boolean {
+function heredocLineExecutes(
+  line: string,
+  target: string,
+  scope = line,
+  // ⛔ AN EXTRA NAMING VOCABULARY, for the ONE caller that asks a narrower question
+  // (`withoutQuotedHeredocBodies`, the tracker-write CLASSIFICATION mask). Undefined for every other
+  // caller, so `maskHeredocData`'s answer is unchanged to the byte — the proven over-refusal ("any
+  // mention may be execution") is the default and stays that way.
+  extraNaming?: ReadonlySet<string>,
+): boolean {
   // ⛔ A PROCESS SUBSTITUTION RUNS A PROGRAM WITH THE TARGET AS ITS STDIN (#1382 cycle 10 review, P0 —
   // measured: `cat /tmp/x.sh > >(bash)` executes the file and contains NO `|` at all, so the pipe arm
   // never fired). `<(…)`/`>(…)` is a handle to the named file exactly like a pipe is, so a line that
@@ -799,7 +808,7 @@ function heredocLineExecutes(line: string, target: string, scope = line): boolea
   for (const segment of line.split(/[;|&]+/)) {
     if (!heredocNamesTarget(segment, target) && !heredocGlobMentions(segment, target)) continue;
     if (pipedIntoProgram) return true;
-    if (!heredocSegmentIsNaming(segment, scope)) return true;
+    if (!heredocSegmentIsNaming(segment, scope, extraNaming)) return true;
   }
   return false;
 }
@@ -1038,7 +1047,11 @@ function globToRegExp(glob: string): RegExp | null {
  * (See the declared residual in the #1382 issue comment; the argv layer (#984) is the layer that
  * sees the real invocation.)
  */
-function heredocSegmentIsNaming(segment: string, scope = segment): boolean {
+function heredocSegmentIsNaming(
+  segment: string,
+  scope = segment,
+  extraNaming?: ReadonlySet<string>,
+): boolean {
   // ⛔ A NAMING WORD THAT WRAPS A COMMAND SUBSTITUTION PROVES NOTHING (#1382 cycle 11 review, P0 —
   // measured ALLOWED: `ls "$(bash x.sh)"` and `echo "$(bash x.sh)"` masked a body they then ran).
   // The substitution's OUTPUT is the argument, so the reader is not reading the file — something else
@@ -1058,14 +1071,14 @@ function heredocSegmentIsNaming(segment: string, scope = segment): boolean {
   // — `-exec`, `-exec bash {} +`, `-name … -exec`, `-execdir`, `-ok` — became masks the moment `find`
   // joined the naming set wholesale). Its other primaries only name a file, which is why the whole
   // command was tempting; the exec primaries are the exception, and they are the one that matters.
-  if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;
+  if (HEREDOC_FILE_NAMING_ONLY.has(commandWord) || extraNaming?.has(commandWord)) return true;
   if (commandWord !== "git") return false;
   // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).
   if (words.some((w) => /^(-c|--config-env|--exec-path|--upload-pack|--receive-pack)$/.test(w))) return false;
   const sub = words.slice(1).map((w) => w.replace(/["'\\]/g, "")).find((w) => !w.startsWith("-"));
   return GIT_FILE_NAMING_SUBCOMMANDS.has(sub ?? "");
 }
-function heredocWrittenTargets(line: string): string[] {
+function heredocWrittenTargets(line: string, readerOverride?: string): string[] {
   const out: string[] = [];
   const dequoteWord = (w: string) => w.replace(/["'\\]/g, "");
   // `>`/`>>` targets, quote-aware (a `>` inside a quoted delimiter or message is not a redirect).
@@ -1097,8 +1110,24 @@ function heredocWrittenTargets(line: string): string[] {
       continue;
     }
   }
-  const words = line.trim().split(/\s+/).map(dequoteWord);
-  const reader = heredocCommandWord(line);
+  // ⛔ THE READER MAY BE GIVEN, because the command word is not always the writer (#3161 P0). With a
+  // COMPOUND opener line the FIRST word is the prefix's command (`cd /wt && tee /tmp/y.sh <<'EOF'`),
+  // so the `tee`/`sort -o` arms below saw `cd` and returned NO target — and the caller that permits a
+  // compound prefix then had no target to check against a later `bash /tmp/y.sh` (measured fail-open).
+  // When the reader is given, the WORDS are its own SEGMENT too, so the prefix's words cannot enter
+  // its argument list as phantom targets. Default unchanged, so `maskHeredocData` reads exactly what
+  // it read before.
+  const reader = readerOverride ?? heredocCommandWord(line);
+  const words = (readerOverride
+    ? line
+        .split(/[;&|]+/)
+        .filter((s) => (s.trim().split(/\s+/)[0] ?? "").replace(/["'\\]/g, "") === readerOverride)
+        .pop() ?? line
+    : line
+  )
+    .trim()
+    .split(/\s+/)
+    .map(dequoteWord);
   if (reader === "tee") {
     for (const w of words.slice(1)) if (w && !w.startsWith("-") && w !== "-") out.push(w);
   }
@@ -3397,26 +3426,84 @@ const QUOTED_HEREDOC = /<<-?(?:'([^']*)'|"([^"]*)"|\\([A-Za-z_][\w-]*))/;
 /**
  * The consumers that treat a heredoc body as DATA. Deliberately tiny: every entry is measured, and a
  * word this list does not know keeps its body readable (fail-closed). `sed`/`awk` are NOT here — their
- * `-f -` / `-e` spellings read the body as a PROGRAM, and one entry cannot be both.
+ * `-f -` / `-e` spellings read the body as a PROGRAM, and one entry cannot be both. `dd` is NOT here
+ * either, and for the same reason: `dd of=/tmp/y.sh` WRITES the body to a file, and `dd`'s target is
+ * not in `heredocWrittenTargets`' reader (`>`, `tee`, `sort -o`) — so a consumer the written-target
+ * clause cannot follow is not one this masker may treat as a sink (#3161 P0, measured).
  */
-const DATA_ONLY_CONSUMERS = new Set(["cat", "tee", "dd", "wc"]);
+const DATA_ONLY_CONSUMERS = new Set(["cat", "tee", "wc"]);
+
+/**
+ * RELAXATION 2 of `withoutQuotedHeredocBodies`, stated once and in one place: a command that can only
+ * READ a file it is handed, so a line that names a heredoc's written target through it cannot be
+ * EXECUTING that target.
+ *
+ * It is LOCAL, not part of `HEREDOC_FILE_NAMING_ONLY`, on purpose: that set is `maskHeredocData`'s
+ * vocabulary, and widening it would move the mask every gate consumes (`gh` there would mask a body
+ * merely because a LATER line reads the file — a behaviour change to the proven function, which this
+ * change is not entitled to make). `gh` cannot source or exec a local path: `--body-file` reads it,
+ * and `gh extension exec` resolves a NAME under gh's own extensions directory, never an arbitrary
+ * written path. A line that PIPES the reader into a program, chains a second command, or hands the
+ * path to an interpreter is still an execution (the pipe arm and the segment split both fire).
+ */
+const TRACKER_FILE_READERS: ReadonlySet<string> = new Set(["gh"]);
 
 /**
  * Blank the BODY of every `<<'QUOTED'` heredoc, LENGTH-PRESERVING, for a CLASSIFICATION read only.
  *
- * ⛔ WHY THIS EXISTS AND WHY IT IS NOT `maskHeredocData` (#485 class, measured 2026-10-31 on
- * pi-cell-1). The measured parked command was
+ * ⛔ WHY THIS IS NOT `maskHeredocData` (#485 class, measured 2026-10-31 on pi-cell-1). The measured
+ * parked command was
  *     cd <wt> && cat > /tmp/f.md <<'MDEOF'  …prose with `backticks`…  MDEOF
  *     gh pr comment <n> --repo <o/r> --body-file /tmp/f.md 2>&1 | tail -2; rm -f /tmp/f.md
- * `maskHeredocData` declines to mask it because its opener line is COMPOUND (`cd … && cat …`) and
- * `heredocBodyIsData` refuses any `;&|()` there. But the compound prefix has nothing to do with
- * whether the BODY is data: with a QUOTED delimiter bash performs no expansion, and the body is
- * stdin to `cat`, which cannot run it. So the prose was scanned as operations, its backticks blinded
- * the positive non-merge read, and a TRACKER WRITE reached the ≥1-dispatch floor.
+ * `maskHeredocData` keeps that body readable for TWO independent reasons: (a) its opener line is
+ * COMPOUND (`cd … && cat …`) and `heredocBodyIsData` refuses any `;&|()` there; (b) it over-refuses
+ * ANY line that merely MENTIONS a written target, and `gh` is not in `HEREDOC_FILE_NAMING_ONLY`.
+ * The prose then reached `isGhPrMergeCommand`'s broad arm as if it were operations, and a TRACKER
+ * WRITE parked a lane for 45 minutes (`gate-events.jsonl`, 2026-10-30T19:41:53Z).
  *
- * POLARITY, unchanged: only a QUOTED delimiter is masked (an unquoted `<<EOF` expands, so it keeps
- * its text readable); an unterminated body is left readable; a `<<` sitting inside an open quote on
- * the same line is not an opener. Every one of those is the fail-CLOSED direction.
+ * ⛔ SO THE RELAXATIONS ARE EXACTLY TWO — that is the WHOLE delta between this function and the
+ * proven one, and a fresh-context review measured the first version's delta at FIVE because it had
+ * dropped the rest:
+ *   R1. the PREFIX of the opener line may be COMPOUND (a). Nothing follows from a prefix about
+ *       whether the BODY is data — provided the prefix cannot hand the body to anything, which is
+ *       clause C4 below;
+ *   R2. a written target may be MENTIONED by a tracker-write READER (b): `TRACKER_FILE_READERS`.
+ * EVERY OTHER CLAUSE IS RESTORED, USING THE SAME PRIMITIVES `maskHeredocData` USES, so the two
+ * cannot drift into different answers about the same question:
+ *   C1. FRAME — `heredocOpenerIsInsideFrame`: inside `if`/`for`/`case`/`(`/`{`, the body's stdout
+ *       may still reach a program (`fi | bash`), so nothing is masked;
+ *   C2. WRITTEN TARGET + LATER LINE — `heredocWrittenTargets` + `heredocLineExecutes`: a body written
+ *       to a file a later line can RUN keeps its text (`cat > /tmp/y.sh <<'EOF' … EOF` + `bash /tmp/y.sh`);
+ *   C3. SHADOWED READER — `heredocReaderIsShadowed`: `cat() { bash; }` / `alias cat=bash` make the
+ *       consumer clause a claim about a WORD, not a program;
+ *   C4. PREFIX — `heredocPrefixIsUnprovable` (plus this line's own prefix, which R1 above would
+ *       otherwise stop being checked) and `endsWithContinuation` on the prefix AND the opener line: a
+ *       `$(`/backtick/`PATH=`/written-path prefix, or a `\`-joined line, makes every line-local rule
+ *       here a reading of a FRAGMENT;
+ *   C5. CONSUMER + REMAINDER — a data-only consumer word, and a remainder that is not a pipe, a
+ *       substitution, a process substitution or a SECOND COMMAND (`&& bash /tmp/y.sh`).
+ *
+ * ⛔ WHY THE CLAUSES ARE NOT CEREMONY — the measured cost of dropping them (this file's own head,
+ * measured by execution, each one `isGitOp()` false where it must be true): a body the same command
+ * executes (`… <<'EOF' && bash /tmp/y.sh`), a shadowed reader, a `$(` on the opener line, a `\`
+ * continuation on the PREFIX line, a frame, and a written-then-run file. The first version of this
+ * function's docstring ARGUED them away ("with a QUOTED delimiter bash performs no expansion, and
+ * the body is stdin to `cat`, which cannot run it"). That argument is true about the BODY and false
+ * about the COMMAND — so `git -C /wt push` inside such a body was invisible, `isGitOp` returned
+ * false, and the whole gate handler (the ≥1-dispatch floor, the admin-merge evidence gate, the merge
+ * registry) was skipped. **Restore the clause, or delete the function — do not restate an argument
+ * for a clause that is missing.**
+ *
+ * ⛔ STATED RESIDUAL — the SAME one `maskHeredocData` declares, and it is not narrowed here: this
+ * follows the file the heredoc WRITES as far as a runner in the SAME command. It does not follow that
+ * file into a LATER tool call (the argv layer, #984, is the answer there), and it does not follow it
+ * through a `cp`/`mv` of the written path. Both were the proven masker's declared gap before this
+ * function existed; a row in the suite marks the `cp` shape so no lane reads it as covered.
+ *
+ * POLARITY, unchanged and stricter than `maskHeredocData` in two places: only a QUOTED delimiter is
+ * masked (an UNQUOTED `<<EOF` EXPANDS, so its text stays readable here even though the proven masker
+ * masks it); a delimiter this reader cannot resolve is not an opener; a `<<` inside an open quote or
+ * a `#` comment is text; an unterminated body stays readable. Every one of those is fail-CLOSED.
  */
 export function withoutQuotedHeredocBodies(command: string): string {
   const lines = command.split("\n");
@@ -3459,32 +3546,110 @@ export function withoutQuotedHeredocBodies(command: string): string {
     }
     const m = QUOTED_HEREDOC.exec(line.slice(at))!;
     const delim = m[1] ?? m[2] ?? m[3] ?? "";
-    // A body whose CONSUMER can run it is not data. Two halves, both measured by review:
-    //  (a) the REMAINDER of the opener line — `cat <<'EOF' | bash`, `$(cat ...)`, a backtick;
+    const remainder = line.slice(at + m[0].length);
+    const prefixOnLine = line.slice(0, at);
+    const consumer = (prefixOnLine.match(/(?:^|[;&|(]\s*)([A-Za-z_][\w.-]*)\s*[^;&|]*$/) ?? [])[1] ?? "";
+    const refuse = () => {
+      out.push(line);
+      i++;
+    };
+    // ── CLAUSE C5 (consumer + remainder) ──────────────────────────────────────────────────────────
+    // A body whose CONSUMER can run it is not data. Four halves, every one measured by review:
+    //  (a) the REMAINDER of the opener line — `cat <<'EOF' | bash`, `$(cat …)`, a backtick;
     //  (b) the CONSUMER WORD itself — `sh <<'EOF'` / `bash -s` / `python` take the body as a SCRIPT,
     //      so a merge written inside one is EXECUTED even though the delimiter is quoted (round-2
-    //      review, P0). Only a data-only consumer is masked; anything else keeps its body readable,
-    //      which is this function's stated polarity.
-    const remainder = line.slice(at + m[0].length);
-    const consumer = (line.slice(0, at).match(/(?:^|[;&|(]\s*)([A-Za-z_][\w.-]*)\s*[^;&|]*$/) ?? [])[1] ?? "";
-    // Three more shapes measured in round 3, each of which EXECUTES the body while the opener line
-    // still looks like plain `cat >` (the guard is line-local, so): a trailing `\\` makes bash
-    // join the next line and run `cat <<'EOF' | sh`; and a PROCESS SUBSTITUTION in either
-    // the remainder or the PREFIX (`cat <<'EOF' > >(sh)`, `tee >(sh) <<'EOF'`,
-    // `1> >(bash -s)`) hands the body to a shell.
+    //      review, P0). Only a data-only consumer is masked, which is this function's polarity;
+    //  (c) a SECOND COMMAND in the remainder — `cat > /tmp/y.sh <<'EOF' … EOF && bash /tmp/y.sh`
+    //      (measured, P1) writes the body to a file and RUNS it on the same line, exactly as the
+    //      later-line form does. `[;&]` is the whole class, so no spelling of a following command
+    //      slips through;
+    //  (d) a trailing `\` on the opener line (round 3): bash joins the next line, so the guard is
+    //      line-local — and a PROCESS SUBSTITUTION in the remainder or the PREFIX
+    //      (`cat <<'EOF' > >(sh)`, `tee >(sh) <<'EOF'`, `1> >(bash -s)`) hands the body to a shell.
     if (
       /\||\$\(|`/.test(remainder) ||
+      /[;&]/.test(remainder) ||
       /\\\s*$/.test(line) ||
       /[<>]\(/.test(line) ||
       !DATA_ONLY_CONSUMERS.has(consumer)
     ) {
-      out.push(line);
-      i++;
+      refuse();
       continue;
     }
     if (delim === "") {
-      out.push(line);
-      i++;
+      refuse();
+      continue;
+    }
+    // ── CLAUSE C1 (frame) ─────────────────────────────────────────────────────────────────────────
+    // A compound KEYWORD or bracket frame can hand the body's stdout to a program (`fi | bash`), so
+    // inside one nothing is masked — the proven masker's own measured fail-open (#1382).
+    if (heredocOpenerIsInsideFrame(lines, i)) {
+      refuse();
+      continue;
+    }
+    // ── CLAUSE C4a (continuation) ─────────────────────────────────────────────────────────────────
+    // The proof below is LINE-LOCAL and bash is not: a `\` at the end of this line, or of ANY line
+    // that feeds it, joins two physical lines into one command. Measured fail-open: a prefix
+    // continuation hid a `| sh` and a `> /tmp/y.sh`, and the body was masked while bash ran it.
+    if (endsWithContinuation(line) || lines.slice(0, i).some(endsWithContinuation)) {
+      refuse();
+      continue;
+    }
+    // ── CLAUSE C3 (shadowed reader) ───────────────────────────────────────────────────────────────
+    // Scope is the prefix THROUGH this line, for `maskHeredocData`'s reason: a definition must precede
+    // its use, and reading the whole command let a body that merely QUOTED `cat() { bash; }` disarm
+    // the mask. Measured fail-open: `cat() { bash; }` / `alias cat=bash` on an earlier line, then
+    // `cat <<'EOF' … git push … EOF` → masked and ungated.
+    if (heredocReaderIsShadowed(lines.slice(0, i + 1).join("\n"), consumer)) {
+      refuse();
+      continue;
+    }
+    // ── CLAUSE C2 (written target a later line can run) + CLAUSE C4b (prefix) ──────────────────────
+    // A body written to a FILE that this same command can EXECUTE by a later line is unprovable, so
+    // it keeps its text (measured P1: `cat > /tmp/y.sh <<'EOF' … EOF` + `bash /tmp/y.sh`). The ONE
+    // declared relaxation is `TRACKER_FILE_READERS`: a mention through a reader that cannot run the
+    // file is a READ, which is the parked shape this function exists for.
+    const scope = lines.join("\n");
+    // The WRITER is the LAST simple command before the opener, not the line's first word: a permitted
+    // compound prefix (`cd /wt && tee /tmp/y.sh <<'EOF'`) would otherwise hide `tee`'s target from this
+    // check, and a later `bash /tmp/y.sh` would run a body that was masked (measured, P0).
+    const targets = heredocWrittenTargets(line, consumer);
+    // A redirect target the shell will EXPAND is not a name we can compare (`$HOME`, a backtick).
+    if (targets.some((t) => /[$`]/.test(t))) {
+      refuse();
+      continue;
+    }
+    // Later lines read with continuations RESOLVED, so a runner spelled `bash \` / `/tmp/y.sh` is as
+    // visible as `bash /tmp/y.sh`, and a pipe continued onto the next line keeps its pipeline.
+    const otherLines = lines
+      .filter((_, n) => n !== i)
+      .join("\n")
+      .replace(/\\\r?\n/g, " ")
+      .replace(/\|[ \t]*\r?\n/g, "| ")
+      .split("\n");
+    if (
+      targets.some(
+        (t) =>
+          t !== "" &&
+          t !== "-" &&
+          otherLines.some((l) => heredocLineExecutes(l, t, scope, TRACKER_FILE_READERS)),
+      )
+    ) {
+      refuse();
+      continue;
+    }
+    // The prefix must not be able to change what the consumer resolves to, capture the body, or hold
+    // the written path in a variable. THIS LINE'S OWN PREFIX is included because R1 above stops
+    // `heredocBodyIsData` from looking at it — without that, `x=$(cat <<'EOF' …)` and
+    // `PATH=/tmp/e:$PATH cat <<'EOF' …` were masked (measured fail-open). Split in two, because a
+    // target THIS line writes is expected to appear in its own prefix: the earlier lines are checked
+    // WITH the targets (`source "$f"` on an earlier line), the opener line's prefix WITHOUT them
+    // (an assignment or a substitution there is the danger, not the redirect that writes the body).
+    if (
+      heredocPrefixIsUnprovable(lines.slice(0, i).join("\n"), targets) ||
+      heredocPrefixIsUnprovable(prefixOnLine, [])
+    ) {
+      refuse();
       continue;
     }
     // The OPENER is a redirection whose target is a literal delimiter: it blinds nothing, so it is
