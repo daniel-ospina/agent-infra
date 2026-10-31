@@ -71,10 +71,18 @@
 #     `# portability-ok: <reason>`. Same rule: no reason ⇒ still flagged.
 #   · Heredoc bodies are skipped (a data line is not a command). A heredoc whose marker is computed
 #     is not tracked — declared over-block, both polarities named in `--list-rules`.
-#   · A tool terminated by a PIPE with no space (`x="$(free|head -3)"`) is not matched: allowing `|`
-#     as a right border also matched `case` labels (`timeout) printf …`) and flagged correct code, so
-#     the substitution form is matched by its own exact shape instead. Write the space, or use the
-#     shim. Measured: 5 correct files reded before this limit was drawn.
+#   · A tool terminated by a PIPE or a `)` with no space (`x="$(free|head -3)"`, `(free)`) is not
+#     matched: allowing those as right borders also matched `case` labels (`timeout) printf …`) and
+#     flagged correct code, so the substitution form is matched by its own exact shape instead. `;`,
+#     `&` and `}` ARE admitted. Write the space, or use the shim. Measured: 5 correct files reded
+#     before this limit was drawn.
+#   · A wrapper keyword followed by a command that merely MENTIONS a tool name over-blocks:
+#     `if grep -q timeout f`, `while grep -q free "$f"`. The wrapper group is `[^;&|(){}]*` (any
+#     number of words), which is what makes `sudo -u root sed`, `nice -n 5 sed` and `env A=1 timeout`
+#     detectable; the cost is this shape. One reasoned `# portability-ok:` clears it.
+#   · A `# portability: off|linux-only` declaration takes effect FROM ITS OWN LINE ONWARD: the records
+#     above it were already scanned. Put the marker in the first 20 lines (the header contract) and it
+#     covers the file; put it mid-file and it covers only what follows.
 #
 # BASELINE — the ratchet
 # ----------------------
@@ -150,7 +158,7 @@ bash4-mapfile	`mapfile` / `readarray`	bash 3.2 has neither — `while IFS= read 
 bash4-case-modify	`${var,,}` / `${var^^}` (case modification)	bash 3.2 has none — `tr '[:upper:]' '[:lower:]'`
 bash4-append-amp	`&>>` (append both streams)	bash 3.2: `>>f 2>&1`
 bash4-wait-n	`wait -n` (wait for any one child)	bash 3.2 has none — poll with `kill -0`
-heredoc-unterminated	a heredoc opener this reader cannot close, so every following line is unreachable	close the heredoc, or declare the file `# portability: off <reason>` — an unreachable span is an unscanned span
+heredoc-unterminated	a heredoc opener this reader cannot close, so every following line is unreachable — INCLUDING the over-block polarity: a COMPUTED marker (`cat <<$M`, `cat <<"$M"`) is not tracked, so such a body is read as CODE (a trap inside it is flagged, and a valid quoted marker can report this rule)	close the heredoc, or declare the file `# portability: off <reason>` — an unreachable span is an unscanned span
 context-unbalanced	a quote or substitution this reader cannot close, so the tail of the file was read as DATA and nothing there can be flagged	close the quote, or declare the file `# portability: off <reason>` — a silent truncation is the false-CLEAN this file exists to prevent
 RULES
 )
@@ -410,6 +418,29 @@ function unexpanded(line,   v) {
   return v
 }
 
+# procfs_rule(code, raw) — 1 only when the line READS a procfs path.
+# A DETECTOR WITHOUT THIS GUARD IS THE OVER-BLOCK THAT GETS SWITCHED OFF (review cycle-5 P1): 23 of
+# the 65 baselined procfs rows were `[ -d /proc/self ]`-style AVAILABILITY PROBES and `/proc` strings
+# passed as VALUES (`TMPDIR=/proc/definitely-not-writable bash …`, `*_DIR="/proc/nope/gate"`), none of
+# which reads procfs. The header blesses exactly this idiom for the other rules ("the presence probe,
+# then the call"), so the probe line must not carry a finding whose remedy is the thing it probes for.
+function procfs_rule(code, raw) {
+  if (code ~ /\[[ \t]+-[A-Za-z]+[ \t]+"?\/proc\//) return 0          # [ -d /proc/self ]
+  if (code ~ /\[\[[ \t]+-[A-Za-z]+[ \t]+"?\/proc\//) return 0         # [[ -r /proc/x ]]
+  if (raw ~ /=[ \t]*["\047]?[^ \t"\047;&|()]*\/proc\//) return 0      # VAR=/proc/… or VAR="/proc/…"
+  if (proc_read(code)) return 1
+  return quoted_procfs(raw)
+}
+# proc_read(code) — a /proc/ path that is NOT the right-hand side of an assignment.
+function proc_read(code,   v, i, prev) {
+  v = unexpanded(code)
+  while ((i = index(v, "/proc/")) > 0) {
+    prev = (i > 1) ? substr(v, i - 1, 1) : ""
+    if (prev != "=") return 1
+    v = substr(v, i + 6)
+  }
+  return 0
+}
 function quoted_procfs(line) {
   # the quote must OPEN the word, and the closing quote must END it: a quoted word that IS a procfs
   # path. That is what separates `"/proc/$pid/cmdline"` (a read) from `"/proc/4242/cwd (readlink:
@@ -504,7 +535,10 @@ function cp(code, tool,   re) {
   # shapes the tree actually contains (worker-terminal.test.sh:2309/2312, harness-cohesion.test.sh:334,
   # harness-surface.test.sh:568). A command position is: line start; a separator; or a shell KEYWORD /
   # wrapper word that puts its next word in command position; and the tool may be spelled with a PATH.
-  kw = "(if|then|elif|else|do|while|until|exec|env|sudo|command|nohup|xargs|time|!|eval|busybox|stdbuf)"
+  # ⛔ THE CLASS MUST CONTAIN THE WRAPPERS THE COMMENT NAMES (review cycle-5 P1): the cycle-2 comment
+  # claimed `nice -n 5 sed -i` and `find … -exec sed -i` were fixed, but neither word was in this
+  # class, so BOTH were still silent — `nice -n 5 sed -i` is the #2571 class, the headline rule.
+  kw = "(if|then|elif|else|do|while|until|exec|env|sudo|command|nohup|xargs|time|!|eval|busybox|stdbuf|nice|ionice|flock|doas|chronic|-exec)"
   pfx = "([-./][^ \t]*/)?"
   # A LEADING `VAR=value` ASSIGNMENT DOES NOT END COMMAND POSITION (review cycle-3 P0): `FOO=1
   # timeout 5 cmd` and `LC_ALL=C sed -i ...` are ordinary shell, and every one of the 19 rules was
@@ -513,14 +547,30 @@ function cp(code, tool,   re) {
   # detector reported four — the baseline row was saturated at 4, so those three live macOS traps sat
   # there reported CLEAN, and a lane could add another one and stay green.
   asg = "([A-Za-z_][A-Za-z0-9_]*=[^ \t;&|(){}]*[ \t]+)*"
-  re = "(^|" SEP ")[ \t]*" asg kw "?[ \t]*" pfx tool "([ \t]|$)"
-  re2 = "(^|" SEP ")[ \t]*" asg pfx tool "([ \t]|$)"
+  # ⛔ A SEPARATOR RIGHT OF THE TOOL STILL MEANS THE COMMAND RAN (review cycle-5 P2): `if free; then`
+  # and `{ free; }` were invisible because the right border was whitespace only. `;`, `&` and `}` are
+  # admitted; `)` and `|` are NOT, because those collide with `case` labels (`timeout)  printf …`) and
+  # with pipes, which is the collision that made the cycle-4 widening flag five correct files.
+  # `}` IS NOT A RIGHT BORDER (measured): `${timeout}` and `${free}` are PARAMETER NAMES inside
+  # messages, and strip_code emits `${…}` bodies as code because an expansion IS code — admitting `}`
+  # flagged 6 correct lines in launchd-cycle.sh and in this suite.
+  rb = "([ \t;&]|$)"
+  re = "(^|" SEP ")[ \t]*" asg kw "?[ \t]*" pfx tool rb
+  re2 = "(^|" SEP ")[ \t]*" asg pfx tool rb
   # ⛔ A WRAPPER OFTEN CARRIES ITS OWN ARGUMENTS (review cycle-2 P2): `env FOO=1 timeout 5 …`,
   # `sudo -u root sed -i …`, `xargs -n1 timeout 5 …`, `nice -n 5 sed -i …` all put words between the
   # wrapper and the tool, and the tight form above required them adjacent — so every one of those
-  # shapes was CLEAN. Up to three words are allowed through; the cost is a rare false POSITIVE after
-  # a wrapper keyword (visible, one reasoned escape away), never a silent pass over a real trap.
-  re3 = "(^|" SEP ")[ \t]*" asg kw "([^;&|(){}]*[ \t])?" pfx tool "([ \t]|$)"
+  # shapes were CLEAN. The group after a wrapper keyword is `[^;&|(){}]*` — ANY number of words, not
+  # "up to three" (the earlier comment was wrong) — and the cost is a false POSITIVE on a line where
+  # a keyword is followed by some other command that merely MENTIONS a tool name
+  # (`if grep -q timeout f`): declared over-block, see DECLARED SCOPE.
+  # ⛔ THE JUNK GROUP BELONGS ONLY TO THE WRAPPERS THAT TAKE A BARE ARGUMENT (measured): with the
+  # group on the whole keyword class, `if have timeout; then` matched (kw `if`, junk `have `, tool
+  # `timeout`) — a call to a helper named `have` reded as a macOS trap. `sudo -u root sed`,
+  # `nice -n 5 sed`, `flock /tmp/l sed`, `xargs -n1 timeout`, `-exec sed` all need the group, so those
+  # keep it; `if`, `then`, `!`, `eval` do not get it.
+  kw1 = "(env|sudo|command|nohup|xargs|time|exec|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)"
+  re3 = "(^|" SEP ")[ \t]*" asg kw1 "([^;&|(){}]*[ \t])?" pfx tool rb
   # ⛔ AND A BARE COMMAND INSIDE A SUBSTITUTION IS MATCHED BY ITS OWN SHAPE (review cycle-4 P1):
   # `x="$(free)"` puts `)` directly after the tool, so the whitespace border missed it. The widening
   # that allowed `)`/`|` as a general right border ALSO matched CASE PATTERNS (`timeout)  printf …`)
@@ -529,6 +579,10 @@ function cp(code, tool,   re) {
   # immediately followed by the closing paren is a command, never a case label.
   # DECLARED LIMIT: `x="$(free|head -3)"` (a PIPE, no space, straight after the tool) is not matched.
   subst = "[$][(][ \t]*" asg pfx tool "[ \t]*[)]"
+  # `command -v <tool>` / `type <tool>` / `hash <tool>` / `which <tool>` is a PROBE for EVERY rule, not
+  # just timeout/setsid/cpu: `command -v free` is code ASKING whether free exists (review cycle-5 P2).
+  probe = "(^|" SEP ")[ \t]*(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
+  if (code ~ probe && !(code ~ re) && !(code ~ re2) && !(code ~ subst)) return 0
   return (code ~ re || code ~ re2 || code ~ re3 || code ~ subst)
 }
 
@@ -547,6 +601,17 @@ function opt_long(code, tool, name,   t, k, segs, n) {
   n = split(t, segs, "\n")
   for (k = 1; k <= n; k++) {
     if (cp(segs[k], tool) && segs[k] ~ ("--" name "([=][^ \t]*)?([ \t]|$)")) return 1
+  }
+  return 0
+}
+# cmd_long_re(code, tool, pat) — `tool` in ONE command with the long option matching `pat`
+# (`--canonicalize(-[a-z]+)?`). Same scoping as cmd_opt.
+function cmd_long_re(code, tool, pat,   t, k, segs, n) {
+  t = code
+  gsub(/[|&;(){}]/, "\n", t)
+  n = split(t, segs, "\n")
+  for (k = 1; k <= n; k++) {
+    if (cp(segs[k], tool) && segs[k] ~ (pat "([=][^ \t]*)?([ \t]|$)")) return 1
   }
   return 0
 }
@@ -667,7 +732,9 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # readlink -f -- "$d" >/dev/null 2>&1; then out="$(readlink -f -- "$d")"` is the guarded form — the
   # same `command -v` contract every other rule honours — and BOTH lines were flagged, then baselined
   # as "NOT yet repaired". probed() is the one lookback this file already trusts.
-  hit("readlink-f-bsd-absent",    ((cmd_cluster(code, "readlink", "f") || opt_long(code, "readlink", "canonicalize")) && !probed("readlink", code)), "cd … && pwd -P")
+  # ⛔ THE LONG OPTION FAMILY, NOT JUST ONE MEMBER (review cycle-5 P2): `--canonicalize-missing` and
+  # `--canonicalize-existing` are GNU-only too, and BSD/macOS readlink has neither.
+  hit("readlink-f-bsd-absent",    ((cmd_cluster(code, "readlink", "f") || cmd_long_re(code, "readlink", "--canonicalize(-[a-z]+)?")) && !probed("readlink", code)), "cd … && pwd -P")
   hit("grep-P-bsd-absent",        cmd_cluster(code, "grep", "P"), "grep -E")
   # ⛔ A LINE THAT ALREADY NAMES THE BSD COUNTERPART IS THE GUARDED CHAIN (review cycle-1 P2):
   # `stat -c %Y f || stat -f %m f` and `date -d @$t || date -r $t` are portable as written — that is
@@ -697,7 +764,7 @@ FNR <= 20 && heredoc == "" && /^# *portability:/ {
   # ("the fork/task headroom could not be measured (ulimit -u, /proc/sys/kernel/threads-max, …)")
   # is not a read, and the fully-quoted view carried it — 1 false finding on `scripts/harness-up`.
   # A path inside a quoted WORD is still caught, by quoted_procfs on the raw line.
-  if (unexpanded(code) ~ /\/proc\// || quoted_procfs(raw)) hit("procfs-macos-absent", 1, "ps/lsof, or declare the file linux-only")
+  if (procfs_rule(code, raw)) hit("procfs-macos-absent", 1, "ps/lsof, or declare the file linux-only")
   # `local -A` AND `typeset -A` ARE THE SAME TRAP AS `declare -A` (review cycle-3 P1): `local -A`
   # is the common spelling inside a function and a hard failure on /bin/bash 3.2.57, and the rule
   # tested `declare` only — so the spelling most functions actually use was invisible.
@@ -732,7 +799,12 @@ function inpos(code, tool) {
   # command position, or a `$( … )` / backtick substitution, which is how a CPU read is spelled.
   # `code` is passed explicitly — awk function parameters are local, so reading the global here would
   # work only by accident of the caller.
-  return (cp(code, tool) || code ~ ("[$][(][^)]*" tool) || code ~ ("`[^`]*" tool))
+  # THE TOOL MUST BE A WORD, AND `$(( … ))` IS ARITHMETIC, NOT A SUBSTITUTION (review cycle-5 P1):
+  # `cpu_cap=$(( nproc_ / 2 ))` was flagged as a mechanism read (live, baselined, in
+  # scripts/pr-repair-loop.sh:250) because the substitution test had no word boundary and did not
+  # exclude the arithmetic form — the same "a mechanism is a command, not a word" defect one level
+  # down. `[^()]` cannot cross the `((`, so `$(nproc)` still matches and `$(( nproc_ ))` does not.
+  return (cp(code, tool) || code ~ ("[$][(][^()]*" tool "([^A-Za-z0-9_]|$)") || code ~ ("`[^`]*" tool "([^A-Za-z0-9_]|$)"))
 }
 function cpu_rule(code,   n, mech) {
   n = 0; mech = 0
@@ -755,6 +827,12 @@ function cpu_rule(code,   n, mech) {
   if (code ~ /command -v (nproc|sysctl|getconf)/) return 0
   if (code ~ /(hash|type) (nproc|sysctl|getconf)/) return 0
   if (n >= 2) return 0
+  # ⛔ A CHAIN WRITTEN ONE ARM PER LINE IS STILL A CHAIN (review cycle-5 P2): the header blessed form
+  # `sysctl … || nproc … || getconf …` was recognised only on ONE line, so the same three arms split
+  # across three lines were three findings on correct code — live and baselined in
+  # scripts/orchestrator-harness/ai-drainer.sh:255-257. A DIFFERENT mechanism within the lookback
+  # window means the author is choosing, which is what the rule asks for.
+  if (mech && cpu_other(code)) return 0
   return mech
 }
 
@@ -777,6 +855,13 @@ function probed(tool, code,   i, p, pr) {
   for (i = 1; i <= 8; i++) {
     p = (FNR - i) % 8
     if (p in hist && hist[p] ~ pr) return 1
+  }
+  return 0
+}
+function cpu_other(code,   i, p) {
+  for (i = 1; i <= 8; i++) {
+    p = (FNR - i) % 8
+    if (p in hist && hist[p] ~ /(nproc|hw\.ncpu|_NPROCESSORS_ONLN)/) return 1
   }
   return 0
 }
@@ -980,7 +1065,10 @@ join_out="$(printf '%s\n' "$counts" | awk -F'\t' -v basefile="$BASELINE" '
         while ((getline line < basefile) > 0) {
           ln++
           sub(/\r$/, "", line)
-          if (line ~ /^[ \t]*$/ || substr(line, 1, 1) == "#") continue
+          # ⛔ AN INDENTED COMMENT IS A COMMENT (review cycle-5 P2): only column 0 was skipped, so a
+          # hand-added `  # note` in a TSV refused the whole gate as MALFORMED.
+          t = line; sub(/^[ \t]+/, "", t)
+          if (t ~ /^$/ || substr(t, 1, 1) == "#") continue
           # only a well-formed data row is an entry: `path<TAB>rule<TAB>count<TAB>justification`
           # ⛔ A ROW THAT DOES NOT PARSE IS NOT A "NEW TRAP" (review cycle-2 P2). It used to be
           # skipped in silence, so a lost 4th column or a space-mangled row reded as

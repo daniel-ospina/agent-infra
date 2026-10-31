@@ -357,6 +357,11 @@ mkz fixed/18-date-then-rm.sh    '#!/usr/bin/env bash' 'd="$(date -d @0 +%s)"; rm
 mkz fixed/19-wait-n-sep.sh      '#!/usr/bin/env bash' 'if wait -n; then echo ok; fi'
 mkz fixed/20-subst-bare.sh      '#!/usr/bin/env bash' 'x="$(free)"'
 mkz fixed/21-case-single.sh     '#!/usr/bin/env bash' 'v="x"; echo "${v,}"'
+mkz fixed/22-nice-sed.sh        '#!/usr/bin/env bash' "nice -n 5 sed -i 's/a/b/' f"
+mkz fixed/23-flock-sed.sh       '#!/usr/bin/env bash' 'flock /tmp/l sed -i s/a/b/ f'
+mkz fixed/24-exec-sed.sh        '#!/usr/bin/env bash' 'find . -name "*.sh" -exec sed -i "s/a/b/" {} +'
+mkz fixed/25-free-sep.sh        '#!/usr/bin/env bash' 'if free; then echo ok; fi'
+mkz fixed/26-readlink-missing.sh '#!/usr/bin/env bash' 'p=$(readlink --canonicalize-missing x)'
 run_check "$Z" --no-baseline
 for pair in \
   "timeout-absent-on-macos fixed/1-assign-timeout.sh" \
@@ -379,7 +384,12 @@ for pair in \
   "date-d-gnu fixed/18-date-then-rm.sh" \
   "bash4-wait-n fixed/19-wait-n-sep.sh" \
   "free-macos-absent fixed/20-subst-bare.sh" \
-  "bash4-case-modify fixed/21-case-single.sh"
+  "bash4-case-modify fixed/21-case-single.sh" \
+  "sed-in-place-gnu fixed/22-nice-sed.sh" \
+  "sed-in-place-gnu fixed/23-flock-sed.sh" \
+  "sed-in-place-gnu fixed/24-exec-sed.sh" \
+  "free-macos-absent fixed/25-free-sep.sh" \
+  "readlink-f-bsd-absent fixed/26-readlink-missing.sh"
 do
   set -- $pair
   if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -401,6 +411,10 @@ mkz2 fixed-clean/7-test-c-flag.sh '#!/usr/bin/env bash' 'if [ -c "$f" ]; then st
 mkz2 fixed-clean/8-local-d.sh    '#!/usr/bin/env bash' 'local d; ls -A "$d"'
 mkz2 fixed-clean/9-date-v-chain.sh '#!/usr/bin/env bash' 'YOUNG="$(date -u -d 4 minutes ago +%s 2>/dev/null || date -u -v-4M +%s)"'
 mkz2 fixed-clean/10-readlink-probe.sh '#!/usr/bin/env bash' 'if command -v readlink >/dev/null 2>&1 && readlink -f -- "$d" >/dev/null 2>&1; then out="$(readlink -f -- "$d")"; fi'
+mkz2 fixed-clean/11-arith-var.sh '#!/usr/bin/env bash' 'cpu_cap=$(( nproc_ / 2 ))'
+mkz2 fixed-clean/12-proc-test.sh '#!/usr/bin/env bash' '[ -d /proc/self ]' 'if [ -r /proc/loadavg ]; then echo y; fi'
+mkz2 fixed-clean/13-proc-value.sh '#!/usr/bin/env bash' 'OUT="$(TMPDIR=/proc/nope bash ./x)"' 'AGENT_GH_GATE_DIR="/proc/nope/gate" bash "$SHIM" api user'
+mkz2 fixed-clean/14-probe-and-arg.sh '#!/usr/bin/env bash' 'if grep -q timeout scripts/x.sh; then :; fi' 'command -v free >/dev/null 2>&1' 'if have timeout; then :; fi' 'lc_err "after ${timeout}s"'
 run_check "$Z2" --no-baseline
 if [ "$?" = 2 ]; then
   bad "C10b: the portable-code arm was REFUSED (rc=2) — an empty scan proves nothing"
@@ -415,7 +429,11 @@ else
     "stat-c-gnu fixed-clean/7-test-c-flag.sh" \
     "bash4-declare-A fixed-clean/8-local-d.sh" \
     "date-d-gnu fixed-clean/9-date-v-chain.sh" \
-    "readlink-f-bsd-absent fixed-clean/10-readlink-probe.sh"
+    "readlink-f-bsd-absent fixed-clean/10-readlink-probe.sh" \
+    "cpu-count-single-mechanism fixed-clean/11-arith-var.sh" \
+    "procfs-macos-absent fixed-clean/12-proc-test.sh" \
+    "procfs-macos-absent fixed-clean/13-proc-value.sh" \
+    "timeout-absent-on-macos fixed-clean/14-probe-and-arg.sh"
   do
     set -- $pair
     if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -544,15 +562,19 @@ invalid="$(grep -c '^MUTANT-INVALID' "$TMP/mutants.log")"
 # ── E. THE BASELINE RATCHET: it cannot swallow a regression, and it cannot pass without a reason ─
 E="$TMP/ratchet"; : >"$E"
 mkdir -p "$TMP/tree/ratchet"
-printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/tree/ratchet/x.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'timeout 5 true' >"$TMP/tree/ratchet/x.sh"
 printf 'ratchet/x.sh\n' >>"$E"
 eb="$TMP/base.tsv"
-printf '# fake baseline\nratchet/x.sh\tcpu-count-single-mechanism\t1\t#1702 grandfathered for this arm\n' >"$eb"
+printf '# fake baseline\nratchet/x.sh\ttimeout-absent-on-macos\t1\t#2046 grandfathered for this arm\n' >"$eb"
 run_check "$E" --baseline "$eb"
 [ "$?" = 0 ] && ok "E1: a baselined finding does not red (ratchet holds)" || bad "E1: a baselined finding reddened"
 
 printf 'ratchet/x.sh\nratchet/x.sh\n' >/dev/null   # (a count rise needs a second finding in the SAME file)
-printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' 'm="$(nproc)"' >"$TMP/tree/ratchet/x.sh"
+# ⛔ TWO `timeout` LINES, NOT TWO `nproc` LINES: the CPU rule has a cross-line CHAIN control (a
+# different mechanism within the lookback means the author is choosing), so two mechanisms on
+# adjacent lines are correctly CLEAN — a rise test built on them measured the chain control, not the
+# ratchet. `timeout` has no such control, so its count rises 1 → 2 as the arm intends.
+printf '%s\n' '#!/usr/bin/env bash' 'timeout 5 true' 'timeout 6 true' >"$TMP/tree/ratchet/x.sh"
 run_check "$E" --baseline "$eb"
 [ "$?" = 1 ] && grep -q 'NOT grandfathered' "$ERR" && ok "E2: a RISE over the baselined count REDS (the ratchet is not a blanket amnesty)" \
   || bad "E2: a rise over the baselined count did not red"
@@ -577,7 +599,7 @@ run_check "$E" --baseline "$TMP/base-nojust.tsv"
 # `grep -P` sat in it undetected. Scanning both makes the class self-policing.
 SELF="$TMP/self"; printf 'scripts/check-portability-traps.sh\nscripts/check-portability-traps.test.sh\n' >"$SELF"
 ( cd "$HERE/.." && bash "$CHECK" --root "$(cd "$HERE/.." && pwd)" --targets "$SELF" --no-baseline >"$OUT" 2>"$ERR" )
-if [ "$?" = 0 ]; then ok "F1: the detector is CLEAN under its own rules (bash-3.2-safe, no trap in its own source)"
+if [ "$?" = 0 ]; then ok "F1: the detector is CLEAN under its own 19 rules (no trap in its own source) — bash-3.2 PARSABILITY is not what this arm measures"
 else bad "F1: the detector flags ITSELF — $(head -3 "$OUT")"; fi
 
 [ -f "$BASELINE" ] && ok "F2: the shipped baseline exists ($(grep -vc '^#' "$BASELINE") entries)" \
@@ -755,13 +777,17 @@ printf '\n───────────────────────�
 # A pinned line range cut the header off mid-sentence and never printed USAGE or EXIT (review
 # cycle-3 P2), and `--baseline FILE` was implemented but undocumented. Both are checked as text, so
 # the help output cannot drift from the parser again without an arm going red.
-help_out="$(bash "$CHECK" --help 2>/dev/null)"
+det_run() { bash "$CHECK" "$@"; }
+help_out="$(det_run --help 2>/dev/null)"
 printf '%s\n' "$help_out" | grep -q 'USAGE' && printf '%s\n' "$help_out" | grep -q 'EXIT:' \
   && ok "F8a: --help prints the whole header (USAGE and EXIT are present, not truncated by a pinned range)" \
   || bad "F8a: --help output is truncated — it is missing USAGE and/or EXIT"
 # ⛔ THE FLAG LIST IS DERIVED FROM THE PARSER (review cycle-4 P2): asserting one hard-coded flag let
 # `--help` itself go undocumented. Every `--flag)` arm of the argument parser must appear in the text.
-flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done/p' "$CHECK" | grep -o -- '--[a-z-]*)' | tr -d ')' | sort -u)"
+# ⛔ DERIVE THE FLAG TOKENS, NOT THE `)`-TERMINATED ARMS (review cycle-5 P1): `--help|-h)` does not
+# end in `)` until the `|` is crossed, so the arm list silently omitted `--help` — the very flag the
+# previous cycle added to the docs, which is exactly the drift this arm exists to catch.
+flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done/p' "$CHECK" | grep -o -- '--[a-z][a-z-]*' | sort -u)"
 missing=""
 for fl in $flags; do
   printf '%s\n' "$help_out" | grep -q -- "$fl" || missing="$missing $fl"
