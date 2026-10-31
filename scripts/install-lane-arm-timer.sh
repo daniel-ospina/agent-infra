@@ -75,6 +75,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# Resolve the binary ONCE, before any verb. `|| echo systemctl` kept the variable NON-empty when
+# systemctl does not exist, so every call below silently failed under `|| true` and the uninstall still
+# printed "uninstalled" having removed nothing.
+if [ -z "$SYSTEMCTL" ] && [ "$OS" = linux ]; then
+  SYSTEMCTL="$(command -v systemctl || true)"
+fi
+
 say() { printf '%s\n' "$*"; }
 fail() { say "FAIL: $*" >&2; exit 1; }
 
@@ -91,10 +98,16 @@ OS="$(os_kind)"
 # values are XML — so a HOME / scripts dir / state dir containing a SPACE renders an artifact that
 # cannot work, while the install-time check (which only proves the TIMER is listed) still prints
 # "installed". That is the false PASS this installer is supposed to be the opposite of.
-case "$ARM" in *[[:space:]]*) fail "the arm path contains whitespace ($ARM) — systemd would split it";; esac
-case "$HOME$SCRIPTS_DIR$STATE_DIR" in *[[:space:]]*) fail "HOME/scripts/state dir contains whitespace — refusing to render a unit that cannot run";; esac
-case "$INTERVAL" in ''|*[!0-9]*) fail "LANE_ARM_TIMER_INTERVAL must be a positive integer (got '$INTERVAL')";; esac
-[ "$INTERVAL" -gt 0 ] 2>/dev/null || fail "LANE_ARM_TIMER_INTERVAL must be > 0 (got '$INTERVAL')"
+case "$ARM" in *[[:space:]]*) [ "$VERB" = install ] && fail "the arm path contains whitespace ($ARM) — systemd would split it";; esac
+case "$HOME$SCRIPTS_DIR$STATE_DIR" in *[[:space:]]*) [ "$VERB" = install ] && fail "HOME/scripts/state dir contains whitespace — refusing to render a unit that cannot run";; esac
+# ⛔ RENDER-TIME VALIDITY MUST NOT GATE CLEANUP. These three checks used to run for every verb, so with
+# LANE_ARM_TIMER_INTERVAL=abc (or a HOME containing a space) exported, `--uninstall` exited 1 and left
+# an installed timer LIVE. Validation is an INSTALL concern; `--status` and `--uninstall` must always be
+# able to run.
+if [ "$VERB" = install ]; then
+  case "$INTERVAL" in ''|*[!0-9]*) fail "LANE_ARM_TIMER_INTERVAL must be a positive integer (got '$INTERVAL')";; esac
+  [ "$INTERVAL" -gt 0 ] 2>/dev/null || fail "LANE_ARM_TIMER_INTERVAL must be > 0 (got '$INTERVAL')"
+fi
 
 # ── the artifact bodies ────────────────────────────────────────────────────────────────────────
 service_body() {
@@ -179,14 +192,13 @@ except OSError: raise SystemExit(1)' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || 
   fi
   case "$OS" in
     linux)
-      # ⛔ THE SCOPE MATTERS HERE TOO: `systemctl list-timers` (system) cannot see a USER timer, so a
-      # running user-scope job would be reported "not installed" by its own status verb.
-      if command -v systemctl >/dev/null 2>&1; then
-        systemctl list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
-          || systemctl --user list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
-          || say "timer    : not installed"
+      # use the RESOLVED binary and the same scope discipline as --install
+      if [ -z "$SYSTEMCTL" ]; then
+        say "timer    : no systemctl on this box"
       else
-        say "timer    : no systemctl"
+        $SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
+          || $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
+          || say "timer    : not installed"
       fi
       ;;
     macos)
@@ -201,14 +213,14 @@ except OSError: raise SystemExit(1)' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || 
 if [ "$VERB" = uninstall ]; then
   case "$OS" in
     linux)
-      [ -n "$SYSTEMCTL" ] || SYSTEMCTL="$(command -v systemctl || echo systemctl)"
+      [ -n "$SYSTEMCTL" ] || fail "no systemctl on this box -- refusing to claim an uninstall it cannot verify"
       D="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
       $SUDO $SYSTEMCTL disable --now "${LABEL}.timer" 2>/dev/null || true
       $SUDO rm -f "$D/${LABEL}.service" "$D/${LABEL}.timer" 2>/dev/null || true
       $SUDO $SYSTEMCTL daemon-reload 2>/dev/null || true
       # VERIFY, never the send: only claim removal when the timer is actually gone from BOTH scopes.
-      if systemctl list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL" \
-         || systemctl --user list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL"; then
+      if $SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL" \
+         || $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL"; then
         fail "removal reported but ${LABEL}.timer is STILL listed -- not uninstalled (check the other scope)"
       fi
       say "uninstalled ${LABEL}.timer"
