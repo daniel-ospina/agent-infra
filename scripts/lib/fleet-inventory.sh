@@ -220,6 +220,22 @@ _fleet_ps_awk() {
 AWK
 }
 
+# ── THE SNAPSHOT IS A SHELL VARIABLE, NEVER AN EXPORTED ONE ─────────────────────────────────────
+# ⛔ `FLEET_PS_CACHE` / `FLEET_LAUNCHD_CACHE` USED TO BE `export`ed, AND THAT WAS A PRODUCT DEFECT.
+# An exported variable rides in the ENVIRONMENT of every child this file spawns, and `execve` bounds
+# argv **and envp together** by ARG_MAX (1 MiB on macOS; on Linux a single string past 128 KiB fails
+# on its own). MEASURED 2026-10-30: a 1,167,325-byte `ps -eo pid=,ppid=,command=` output (a busy box
+# — ~1.5k lanes with prompts in their argv) made EVERY read die with `cat: Argument list too long`
+# (E2BIG), so the controller and landers rows printed `<ps unreadable> UNKNOWN` and `fleet_render_table`
+# could not even find its controller row. The health screen went blank at exactly the moment the box
+# was too busy to be healthy — the one moment it exists for. THE SIZE OF THE STATE MUST BE
+# IRRELEVANT: a shell variable reaches no `execve`, and the table reaches awk on STDIN (`<<<`), never
+# on the command line. So **do not re-add an `export` of either cache** (the size of this datum is
+# the load, so it is largest precisely when the read matters); if a caller ever needs the snapshot in
+# a real child, pass a PATH, not the data.
+# A subshell inherits every shell VARIABLE regardless of `export` — that is what makes the one-read
+# cache work for the rows below, each of which reads it inside a command substitution.
+
 # fleet_ps_snapshot — the raw table, read ONCE per run so two rows cannot see two different worlds.
 fleet_ps_snapshot() {
   if [ -n "${FLEET_PS_CACHE:-}" ]; then printf '%s\n' "$FLEET_PS_CACHE"; return 0; fi
@@ -387,6 +403,7 @@ fleet_launchctl_available() {
 }
 
 fleet_launchd_table() {
+  # Same rule as `fleet_ps_snapshot`: a shell variable, never exported (see the ARG_MAX note there).
   if [ -n "${FLEET_LAUNCHD_CACHE:-}" ]; then printf '%s\n' "$FLEET_LAUNCHD_CACHE"; return 0; fi
   fleet_launchctl_available || return 1
   local t
@@ -1247,6 +1264,30 @@ fleet_row_second_controller() {
   # ⛔ THREE OUTCOMES, and they must not collapse: a value, ABSENT, and COULD-NOT-READ (rc 2). The
   # plain assignment swallowed the third, so an unreadable definition silently fell back to the seam and
   # the row then judged a directory the job does not use — the false verdict this line prevents.
+  # ⛔ ABSENT IS THE FIRST OF THOSE THREE, NOT A FOURTH THAT LOOKS LIKE THE THIRD. `fleet_plist_value`
+  # answers rc 2 both for "this key cannot be determined" and for "there is no such FILE"
+  # (`[ -f "$f" ] || return 2`), so reading it BEFORE the existence test collapsed the normal case
+  # (a box with no second controller) into UNKNOWN — and printed a detail that ASSERTED "$plist
+  # exists" about a file that was not there. Every such box then failed the whole table with exit 2
+  # forever, which is the opposite of what this row documents (not installed → SKIPPED). The existence
+  # test is therefore the FIRST test; the unreadable verdict below still applies to a file that IS
+  # there and cannot be read, so no outcome was removed.
+  if [ ! -f "$plist" ]; then
+    local exp0="one orch-loop.sh for $o, with a fresh heartbeat and a loaded job"
+    # ⛔ EVIDENCE THE SECOND CONTROLLER CREATED, not a directory something else owns. `-d "$o"` was the
+    # wrong predicate: `$HOME/orchestrator-ai` is ALSO the ai-drainer's default state dir, which the
+    # drainer creates on its first tick — so activating only the DRAINER manufactured a red row
+    # instructing the operator to install a second controller (model spend, per box). The `--init`
+    # artefact is the one thing only the launcher writes.
+    if [ -s "$o/state/HARNESS-PIN" ]; then
+      fleet_row second-controller "$exp0" "no job definition" MISSING \
+        "$o/state/HARNESS-PIN exists — so a second controller's identity was created on this box — but no job installs it (looked for $plist): it is hand-run or gone, and a reboot ends it silently. Render it: AI_MULTI_REPO_SLUG=… AI_MULTI_REPO_REPO=… AI_MULTI_REPO_STATE=$o bash scripts/install-launchd.sh"
+      return 0
+    fi
+    fleet_row second-controller "$exp0" "not installed" SKIPPED \
+      "neither a job definition ($plist) nor a second controller's identity ($o/state/HARNESS-PIN) exists here — this box runs one repo's controller, which is the normal case (NOT a healthy second controller)"
+    return 0
+  fi
   if ! declared="$(fleet_plist_value "$label" EnvironmentVariables.O)"; then
     fleet_row second-controller "one orch-loop.sh for its declared state dir, with a fresh heartbeat" \
       "$label: job definition unreadable" UNKNOWN \
@@ -1254,21 +1295,6 @@ fleet_row_second_controller() {
   fi
   [ -n "$declared" ] && o="$declared"
   local exp="one orch-loop.sh for $o, with a fresh heartbeat and a loaded job"
-  if [ ! -f "$plist" ]; then
-    # ⛔ EVIDENCE THE SECOND CONTROLLER CREATED, not a directory something else owns. `-d "$o"` was the
-    # wrong predicate: `$HOME/orchestrator-ai` is ALSO the ai-drainer's default state dir, which the
-    # drainer creates on its first tick — so activating only the DRAINER manufactured a red row
-    # instructing the operator to install a second controller (model spend, per box). The `--init`
-    # artefact is the one thing only the launcher writes.
-    if [ -s "$o/state/HARNESS-PIN" ]; then
-      fleet_row second-controller "$exp" "no job definition" MISSING \
-        "$o/state/HARNESS-PIN exists — so a second controller's identity was created on this box — but no job installs it (looked for $plist): it is hand-run or gone, and a reboot ends it silently. Render it: AI_MULTI_REPO_SLUG=… AI_MULTI_REPO_REPO=… AI_MULTI_REPO_STATE=$o bash scripts/install-launchd.sh"
-      return 0
-    fi
-    fleet_row second-controller "$exp" "not installed" SKIPPED \
-      "neither a job definition ($plist) nor a second controller's identity ($o/state/HARNESS-PIN) exists here — this box runs one repo's controller, which is the normal case (NOT a healthy second controller)"
-    return 0
-  fi
   if [ ! -d "$o" ]; then
     fleet_row second-controller "$exp" "state dir absent" MISSING \
       "the job definition exists but ITS state dir $o does not — the launcher REFUSES to start without one (it will not conjure a controller's identity mid-launch), so this job can never dispatch. Create it once: O=$o … bash scripts/orchestrator-harness/multi-repo-controller.sh --init"
@@ -1317,16 +1343,17 @@ fleet_row_second_controller() {
 # other component exists to serve), then the things that keep it alive, then the maintenance jobs.
 fleet_rows() {
   local harness="${1:-}"
-  # ONE `ps` read and ONE `launchctl list` for the whole table: both are EXPORTED, so every row —
-  # each of which reads them inside a command substitution (a subshell) — sees the same snapshot.
-  # Without this, one `status` on a loaded box spawns ~20 `ps` processes and takes 5.4s (measured),
-  # and a health screen nobody waits for is a health screen nobody reads. One snapshot also means
-  # two rows cannot report two different worlds.
+  # ONE `ps` read and ONE `launchctl list` for the whole table, so every row — each of which reads
+  # them inside a command substitution (a subshell) — sees the same snapshot. Without this, one
+  # `status` on a loaded box spawns ~20 `ps` processes and takes 5.4s (measured), and a health screen
+  # nobody waits for is a health screen nobody reads. One snapshot also means two rows cannot report
+  # two different worlds.
+  # ⛔ A subshell inherits these two shell variables WITHOUT `export`, and exporting them is the
+  # ARG_MAX/E2BIG defect documented above `fleet_ps_snapshot` — the snapshot would ride in every
+  # child's environment, and it is largest when the box is busiest. NOT exported, deliberately.
   FLEET_PS_CACHE=""; FLEET_LAUNCHD_CACHE=""   # a NEW snapshot per table, never a stale one reused
   fleet_ps_snapshot >/dev/null 2>&1 || true
-  export FLEET_PS_CACHE
   fleet_launchd_table >/dev/null 2>&1 || true
-  export FLEET_LAUNCHD_CACHE
   fleet_row_controller "$harness"
   fleet_row_watchdog
   fleet_row_heartbeat_loop
