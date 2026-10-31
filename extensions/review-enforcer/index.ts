@@ -3387,6 +3387,173 @@ export function isAdminMergeCommand(command: string): boolean {
   return bareGh && /(^|[\s;&|(){!])gh\s+pr\s+merge/.test(probe);
 }
 
+/**
+ * A QUOTED heredoc delimiter: `<<'EOF'`, `<<"EOF"`, `<<\EOF`. Quoted means NO expansion, so the body
+ * is literal stdin DATA and can never become command lines of THIS command — the same proof
+ * `heredocBodyIsData` makes, minus its refusal to look at a COMPOUND opener line.
+ */
+const QUOTED_HEREDOC = /<<-?(?:'([^']*)'|"([^"]*)"|\\([A-Za-z_][\w-]*))/;
+
+/**
+ * The consumers that treat a heredoc body as DATA. Deliberately tiny: every entry is measured, and a
+ * word this list does not know keeps its body readable (fail-closed). `sed`/`awk` are NOT here — their
+ * `-f -` / `-e` spellings read the body as a PROGRAM, and one entry cannot be both.
+ */
+const DATA_ONLY_CONSUMERS = new Set(["cat", "tee", "dd", "wc"]);
+
+/**
+ * Blank the BODY of every `<<'QUOTED'` heredoc, LENGTH-PRESERVING, for a CLASSIFICATION read only.
+ *
+ * ⛔ WHY THIS EXISTS AND WHY IT IS NOT `maskHeredocData` (#485 class, measured 2026-10-31 on
+ * pi-cell-1). The measured parked command was
+ *     cd <wt> && cat > /tmp/f.md <<'MDEOF'  …prose with `backticks`…  MDEOF
+ *     gh pr comment <n> --repo <o/r> --body-file /tmp/f.md 2>&1 | tail -2; rm -f /tmp/f.md
+ * `maskHeredocData` declines to mask it because its opener line is COMPOUND (`cd … && cat …`) and
+ * `heredocBodyIsData` refuses any `;&|()` there. But the compound prefix has nothing to do with
+ * whether the BODY is data: with a QUOTED delimiter bash performs no expansion, and the body is
+ * stdin to `cat`, which cannot run it. So the prose was scanned as operations, its backticks blinded
+ * the positive non-merge read, and a TRACKER WRITE reached the ≥1-dispatch floor.
+ *
+ * POLARITY, unchanged: only a QUOTED delimiter is masked (an unquoted `<<EOF` expands, so it keeps
+ * its text readable); an unterminated body is left readable; a `<<` sitting inside an open quote on
+ * the same line is not an opener. Every one of those is the fail-CLOSED direction.
+ */
+export function withoutQuotedHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    let line = lines[i];
+    const at = line.search(QUOTED_HEREDOC);
+    if (at < 0) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    // Quote-blindness would let `echo "note <<'EOF'"` mask a real command after it: refuse to treat
+    // an opener that sits inside an OPEN quote as an opener.
+    let quote: string | null = null;
+    let inComment = false;
+    for (let c = 0; c < at; c++) {
+      const ch = line[c];
+      if (quote) {
+        if (ch === "\\" && quote === '"') c++;
+        else if (ch === quote) quote = null;
+      } else if (ch === "'" || ch === '"') quote = ch;
+      // A `#` COMMENT IS TEXT, NOT AN OPENER (fresh-context review, P1). Measured input:
+      //     gh pr comment 1 --body-file /tmp/f.md  # cat <<'EOF'
+      //     gh --repo o/r pr merge 9
+      //     EOF
+      // was read as an opener and BLANKED the executed merge two lines down — a fail-open. The rule
+      // is `heredocFrameTokens`'s: a `#` at start-of-line or after whitespace, outside quotes.
+      // Bash starts a comment at the beginning of a WORD, so a word-adjacent separator counts too:
+      // `;#`, `&&#`, `|#`, `(#` all begin a comment, and an opener hidden behind one is TEXT, not an
+      // opener. Narrow on purpose — the wider this predicate, the LESS masking, and less masking is
+      // the fail-CLOSED direction (round-2 review measured `;#` under-masking an executed merge).
+      else if (ch === "#" && (c === 0 || /[\s;&|()]/.test(line[c - 1]))) inComment = true;
+    }
+    if (quote !== null || inComment) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    const m = QUOTED_HEREDOC.exec(line.slice(at))!;
+    const delim = m[1] ?? m[2] ?? m[3] ?? "";
+    // A body whose CONSUMER can run it is not data. Two halves, both measured by review:
+    //  (a) the REMAINDER of the opener line — `cat <<'EOF' | bash`, `$(cat ...)`, a backtick;
+    //  (b) the CONSUMER WORD itself — `sh <<'EOF'` / `bash -s` / `python` take the body as a SCRIPT,
+    //      so a merge written inside one is EXECUTED even though the delimiter is quoted (round-2
+    //      review, P0). Only a data-only consumer is masked; anything else keeps its body readable,
+    //      which is this function's stated polarity.
+    const remainder = line.slice(at + m[0].length);
+    const consumer = (line.slice(0, at).match(/(?:^|[;&|(]\s*)([A-Za-z_][\w.-]*)\s*[^;&|]*$/) ?? [])[1] ?? "";
+    // Three more shapes measured in round 3, each of which EXECUTES the body while the opener line
+    // still looks like plain `cat >` (the guard is line-local, so): a trailing `\\` makes bash
+    // join the next line and run `cat <<'EOF' | sh`; and a PROCESS SUBSTITUTION in either
+    // the remainder or the PREFIX (`cat <<'EOF' > >(sh)`, `tee >(sh) <<'EOF'`,
+    // `1> >(bash -s)`) hands the body to a shell.
+    if (
+      /\||\$\(|`/.test(remainder) ||
+      /\\\s*$/.test(line) ||
+      /[<>]\(/.test(line) ||
+      !DATA_ONLY_CONSUMERS.has(consumer)
+    ) {
+      out.push(line);
+      i++;
+      continue;
+    }
+    if (delim === "") {
+      out.push(line);
+      i++;
+      continue;
+    }
+    // The OPENER is a redirection whose target is a literal delimiter: it blinds nothing, so it is
+    // rewritten to the plain redirection shape the tokenizer already exempts (`</dev/null`).
+    line = line.slice(0, at) + "</dev/null" + line.slice(at + m[0].length);
+    out.push(line);
+    i++;
+    const stripTabs = /^<<-/.test(m[0]);
+    let closed = false;
+    for (let j = i; j < lines.length; j++) {
+      const probe = stripTabs ? lines[j].replace(/^\t+/, "") : lines[j];
+      if (probe === delim) {
+        // The BODY is blanked; the terminator line itself is kept verbatim (it is not a command).
+        for (let k = i; k < j; k++) out.push(" ".repeat(lines[k].length));
+        closed = true;
+        i = j;
+        break;
+      }
+    }
+    // Unterminated: the body stays readable (nothing masked) — the safe direction.
+    if (!closed) continue;
+  }
+  return out.join("\n");
+}
+
+/**
+ * Does the text name the WORD `git` anywhere, outside a quoted-heredoc body? Used ONLY to veto the
+ * tracker-write stand-down below (never to widen a gate).
+ *
+ * A WORD TEST, NOT A VERB SPELLING. A fresh-context review measured six spellings that a
+ * `git\s+(commit|push)` anchor missed once this classifier existed, every one of them a REAL push or
+ * commit reaching zero dispatches: `git -C <path> push`, `git --no-pager push`, `git -c k=v push`,
+ * `git -C /wt commit -am x`, `$('git' push)`, `sh -c 'git -C /wt push'`. `-C` is this fleet's own
+ * canonical form, so the class is reachable. Enumerating spellings is the thing this file keeps
+ * re-learning not to do; the property that converges is the WORD, and the cost of the blunter test is
+ * a refusal (`--body "run git log"`) — the direction this file is allowed to be wrong in.
+ *
+ * The quoted-heredoc BODY is excluded because it is DATA to this command (see
+ * `withoutQuotedHeredocBodies`); a comment body that merely mentions git is the shape this classifier
+ * exists to allow.
+ */
+// The leading class is SEPARATORS, not quotes. Including `'`/`"` here gated `echo "git commit -m x"`,
+// which a pinned test requires stay outside (#1492: a quoted MENTION is not an operation), and a
+// command-position analysis is what distinguishes the two correctly. DECLARED RESIDUAL, unchanged
+// from HEAD: `$('git' push)` and `sh -c 'git -C /wt push'` are not caught here (nor at HEAD —
+// GIT_COMMIT_PATTERN has the same anchor assumption). Filed as a follow-up.
+const GIT_WORD_PATTERN = /(^|[\s;&|(){!])git\s/;
+
+function gitWordAnywhere(command: string): boolean {
+  return /(^|[^\w.-])git(\b|[^\w-])/.test(withoutQuotedHeredocBodies(command));
+}
+
+/**
+ * A TRACKER WRITE, read positively (defect measured 2026-10-30/31, pi-cell-1).
+ *
+ * `gh pr comment` / `gh pr edit` / `gh issue comment` publish a RECORD; they cannot mint the rail's
+ * attestation (record-review.sh — "a body edit cannot mint one"), cannot move code, and cannot merge.
+ * The ≥1-dispatch floor covers WRITES THAT LAND CODE, so a tracker write is a READ-SIDE
+ * classification at this floor, not a gated operation. What is NOT relaxed: any `git` verb anywhere
+ * (including inside a substitution), an admin-merge flag, and any gh invocation this layer cannot
+ * positively read as a non-merge — `gh issue comment 1 && gh pr merge 2`, a spliced verb, and an
+ * unquoted heredoc body all keep the floor.
+ */
+export function writesOnlyTrackerRecords(command: string): boolean {
+  if (gitWordAnywhere(command)) return false;
+  if (hasAdminMergeFlag(command)) return false;
+  return readsNonMergeGhCall(withoutQuotedHeredocBodies(command));
+}
+
 // Exported so the test suite can pin this predicate DIRECTLY. VGATE round 7
 // showed that an unexported `isGitOp` could have its conjunction dropped — the
 // exact round-4 regression — while the shipped suite stayed green, because the
@@ -3398,7 +3565,25 @@ export function isGitOp(command: string): boolean {
   // hits — a regression introduced by the `gh pr "merge"` fix and caught by
   // VGATE round 4.
   if (GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command)) return true;
-  if (isGhPrMergeCommand(command) && hasBareGhWord(command)) return true;
+  // ⛔ A `git` COMMAND WORD IS A SHIPPING OP IN EVERY SPELLING (round-2 review, P0). The literal arm
+  // above cannot cross a global option, so `git -C <path> push` — this fleet's own canonical form —
+  // and `git --no-pager push` / `git -c k=v commit` matched NO arm and reached zero dispatches. The
+  // fix is an ARM, not a veto: `gitWordAnywhere` below is a veto inside the tracker-write classifier,
+  // which only speaks once some other arm has already made the command a candidate — a raw
+  // `git -C /wt push` supplies no such candidate. Quoted-heredoc bodies are excluded because they are
+  // DATA to this command; anything else with `git` in a word-leading position is gated (a refusal).
+  if (GIT_WORD_PATTERN.test(withoutQuotedHeredocBodies(command))) return true;
+  // ⛔ THE BROAD `gh`+`pr` ARM ASKS ITS OWN DOCUMENTED QUESTION (#485 class, measured
+  // 2026-10-30/31 on pi-cell-1). `isGhPrMergeCommand`'s `hasGh && hasPr` arm exists to catch a
+  // merge whose VERB this layer cannot read (`` gh pr m`printf erge` 999 ``). When the text
+  // POSITIVELY reads every gh invocation as a NON-merge gh call, there is nothing left for the arm
+  // to catch — and the cost of not asking was measured in `gate-events.jsonl`: 3 comment writes
+  // (`gh pr comment <n> --body-file /tmp/x.md`, preceded by a `cat > … <<'EOF'` heredoc and a
+  // `2>&1 | tail -2`) reached the ≥1-dispatch floor and parked a lane for 45 minutes on a
+  // TRACKER WRITE. The predicate is `readsNonMergeGhCall`'s, not a second opinion: it fails CLOSED
+  // on any construct outside a value position, so a spliced `--admin` merge and
+  // `gh issue comment 1 && gh pr merge 2` both keep the gate (see index.test.ts).
+  if (isGhPrMergeCommand(command) && hasBareGhWord(command) && !writesOnlyTrackerRecords(command)) return true;
   return isAdminMergeCommand(command);
 }
 
