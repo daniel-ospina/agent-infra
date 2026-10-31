@@ -519,6 +519,238 @@ ck "shipped reaper: a genuinely EMPTY (readable) PR listing still reaps 4114" $r
 case "$kept" in *7777*) rc=0;; *) rc=1;; esac
 ck "shipped reaper: the empty-listing pass still keeps a non-open issue (7777)" $rc
 
+# ── 5a1) THE CAPPED WINDOW IS NOT AN ANSWER: an entry ABSENT from `.open_iss` is asked directly ──
+# `.open_iss` is `--limit 500` created-DESC against a repo with >500 OPEN issues, so it is PERMANENTLY
+# saturated and every issue older than the 500 newest is absent from it for ever. Read as "cannot prove
+# it is open ⇒ keep", that absence made the suppression permanent and invisible: never dropped from
+# `dispatched.txt` ⇒ never leaves `checked.txt` ⇒ skipped by every later pass ⇒ never back in
+# `candidates.txt`. Measured 2026-10-30 on the live box: `dispatched.txt` held 203 entries and the reap
+# released 0; 169 of them are outside the window, and the 12 asked in the first bounded pass were ALL
+# OPEN. These cases drive the SHIPPED heredoc WITH a repo slug, so the targeted `gh issue view` arm is
+# live (the fixtures above pass no slug, so it stays inert there).
+# ⛔ AND AN OPEN ENTRY IS **KEPT**, NOT RELEASED: `.pr_brs` is as saturated as `.open_iss` (4142 PRs
+# exist), so a window-blind "no PR" cannot be told apart from "a merged PR outside the window" — and an
+# OPEN issue whose PR merged reads CLEAN downstream (LANDED comes only from a CLOSED issue), so
+# releasing it would re-queue shipped work. Only a CLOSED issue's dispatch is settled. The OPEN class is
+# NAMED on the operator line instead of dropped, which is the half this fixture pins.
+RW="$TMP/reap-window"; mkdir -p "$RW"
+printf '4114\n2222\n3333\n' > "$RW/dispatched.txt"
+printf '4114\n2222\n3333\n' > "$RW/checked.txt"
+printf '4114\n' > "$RW/.open_iss"     # 2222 and 3333 are OUTSIDE the capped window
+: > "$RW/.pr_brs"
+# the gh stub answers OPEN for $GH_STUB_OPEN and CLOSED for everything else
+( PATH="$R:$PATH" GH_STUB_OPEN="2222" python3 "$R/reap.py" "$RW" "owner/repo" ) > "$TMP/reap-window.out" 2>&1
+kept="$(tr '\n' ' ' < "$RW/dispatched.txt")"
+case "$kept" in *2222*) rc=0;; *) rc=1; echo "      dispatched.txt: '$kept'";; esac
+ck "shipped reaper: a window-blind OPEN entry is KEPT (a merged PR naming an OPEN issue reads CLEAN downstream)" $rc
+grep -q 'OPEN, KEPT' "$TMP/reap-window.out" && rc=0 || rc=1
+ck "shipped reaper: the window-blind OPEN class is NAMED on the operator line, not dropped silently" $rc
+case "$kept" in *3333*) rc=1;; *) rc=0;; esac
+ck "shipped reaper: a window-blind CLOSED entry IS reclaimed (its dispatch is settled for ever)" $rc
+case "$(tr '\n' ' ' < "$RW/checked.txt")" in *3333*) rc=1;; *) rc=0;; esac
+ck "shipped reaper: the reclaimed window-blind entry also leaves checked.txt" $rc
+grep -qE 'dispatched re-check: asked 2 of 2' "$TMP/reap-window.out" && rc=0 || rc=1
+ck "shipped reaper: the window-blind re-check is REPORTED, with its asked/blind counts" $rc
+# ⛔ AND IT IS BOUNDED, because every ask is a GraphQL call on a bucket four boxes share. The bound
+# must DEFER, never decide: an entry the cursor did not reach this pass is kept, so "not asked yet"
+# can never read as a verdict.
+RW2="$TMP/reap-window-cap"; mkdir -p "$RW2"
+printf '2222\n3333\n' > "$RW2/dispatched.txt"
+printf '2222\n3333\n' > "$RW2/checked.txt"
+printf '1\n' > "$RW2/.open_iss"
+: > "$RW2/.pr_brs"
+( PATH="$R:$PATH" GH_STUB_OPEN="2222 3333" DISPATCHED_RECHECK_MAX=1 python3 "$R/reap.py" "$RW2" "owner/repo" ) > "$TMP/reap-window-cap.out" 2>&1
+kept2="$(tr '\n' ' ' < "$RW2/dispatched.txt")"
+grep -qE 'asked 1 of 2' "$TMP/reap-window-cap.out" && rc=0 || rc=1
+ck "shipped reaper: the bound asks ONE entry per pass (DISPATCHED_RECHECK_MAX)" $rc
+grep -qE '1 deferred to a later pass by the rotating cursor' "$TMP/reap-window-cap.out" && rc=0 || rc=1
+ck "shipped reaper: the deferral is named, so the bound cannot silently skip the tail" $rc
+case "$kept2" in *2222*3333*|*3333*2222*) rc=0;; *) rc=1; echo "      dispatched.txt: '$kept2'";; esac
+ck "shipped reaper: entries the bound did not decide are KEPT (deferred is not released)" $rc
+case "$(cat "$RW2/state/dispatched-recheck-cursor" 2>/dev/null)" in 2222) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the re-check cursor ADVANCES (the rotation cannot restart at the head for ever)" $rc
+# ⛔ AND THE ROTATION MUST BE OBSERVED ACROSS PASSES, which one pass cannot show. Verified by mutation:
+# `_start = 0` (the cursor written and never read) and `_last = max(...)` (the #2183 FREEZE — a running
+# maximum that stops rotating once it reaches the largest number) both kept the single-pass suite GREEN.
+# These entries are all OPEN, so none is released and the list is stable across passes.
+RW3="$TMP/reap-window-rotate"; mkdir -p "$RW3"
+printf '1111\n2222\n3333\n' > "$RW3/dispatched.txt"
+printf '1111\n2222\n3333\n' > "$RW3/checked.txt"
+printf '1\n' > "$RW3/.open_iss"
+: > "$RW3/.pr_brs"
+: > "$TMP/reap-rotate.cursors"
+for _i in 1 2 3; do
+  ( PATH="$R:$PATH" GH_STUB_OPEN="1111 2222 3333" DISPATCHED_RECHECK_MAX=1 python3 "$R/reap.py" "$RW3" "owner/repo" ) >> "$TMP/reap-rotate.out" 2>&1
+  printf '%s ' "$(cat "$RW3/state/dispatched-recheck-cursor" 2>/dev/null)" >> "$TMP/reap-rotate.cursors"
+done
+_cursors="$(cat "$TMP/reap-rotate.cursors")"
+case "$_cursors" in
+  "1111 2222 3333 ") rc=0;;
+  *) rc=1; echo "      cursor sequence: $_cursors";;
+esac
+ck "shipped reaper: three passes ask THREE DIFFERENT entries (the rotation actually rotates)" $rc
+_rotkept="$(tr '\n' ' ' < "$RW3/dispatched.txt")"
+case "$_rotkept" in
+  "1111 2222 3333 ") rc=0;;
+  *) rc=1; echo "      dispatched.txt: $_rotkept";;
+esac
+ck "shipped reaper: the three OPEN entries are all KEPT and the row order is stable across passes" $rc
+# ⛔ The WRAP branch (`len(_asked) < _rch_max` with a start point near the end) is the branch that
+# produced the `asked 8 of 4` double-ask in the first cut, and no other fixture enters it: 4 entries at
+# cap 3 with the cursor parked at the second one must ask 3 DISTINCT numbers.
+RW6="$TMP/reap-window-wrap"; mkdir -p "$RW6"
+printf '1111\n2222\n3333\n4444\n' > "$RW6/dispatched.txt"
+printf '1111\n2222\n3333\n4444\n' > "$RW6/checked.txt"
+printf '1\n' > "$RW6/.open_iss"
+: > "$RW6/.pr_brs"
+printf '2222\n' > "$RW6/state-dispatched-recheck-cursor"
+mkdir -p "$RW6/state" && cp "$RW6/state-dispatched-recheck-cursor" "$RW6/state/dispatched-recheck-cursor"
+( PATH="$R:$PATH" GH_STUB_OPEN="1111 2222 3333 4444" DISPATCHED_RECHECK_MAX=3 python3 "$R/reap.py" "$RW6" "owner/repo" ) > "$TMP/reap-wrap.out" 2>&1
+grep -qE 'asked 3 of 4' "$TMP/reap-wrap.out" && rc=0 || rc=1
+ck "shipped reaper: the wrap asks exactly the cap, not the whole list (no 'asked 8 of 4')" $rc
+_wrapopen="$(sed -n 's/.*re-queue shipped work: \(.*\); unreadable.*/\1/p' "$TMP/reap-wrap.out")"
+case "$_wrapopen" in
+  *1111*1111*) rc=1;;   # a double-ask of the same number is the defect
+  *) rc=0;;
+esac
+ck "shipped reaper: the wrap never asks the same number twice in one pass" $rc
+# ⛔ A 0/negative/unreadable cap must be COERCED AND NAMED, never a silent disable: a bound of 0 that
+# asks nothing is byte-identical on the operator line to a pass with nothing to ask, and the class stays
+# suppressed for ever — the exact defect this block removes, one knob away.
+RW4="$TMP/reap-window-cap0"; mkdir -p "$RW4"
+printf '2222\n' > "$RW4/dispatched.txt"
+printf '2222\n' > "$RW4/checked.txt"
+printf '1\n' > "$RW4/.open_iss"
+: > "$RW4/.pr_brs"
+( PATH="$R:$PATH" DISPATCHED_RECHECK_MAX=0 python3 "$R/reap.py" "$RW4" "owner/repo" ) > "$TMP/reap-cap0.out" 2>&1
+grep -q 'is not a usable bound' "$TMP/reap-cap0.out" && rc=0 || rc=1
+ck "shipped reaper: DISPATCHED_RECHECK_MAX=0 is named and coerced, not silently disabled" $rc
+grep -q 'dispatched re-check: asked 1 of 1' "$TMP/reap-cap0.out" && rc=0 || rc=1
+ck "shipped reaper: the coerced cap still asks (a 0 bound cannot freeze the class)" $rc
+# ⛔ `str.isdigit()` IS TRUE FOR CHARACTERS `int()` REJECTS. An unguarded conversion raised out of the
+# heredoc, aborted the reap and took EXIT_TRANSIENT on EVERY later pass — the permanent no-dispatch loop
+# this file records being fixed twice. Row AND knob are both exercised, and the row must be PRESERVED.
+RW5="$TMP/reap-window-nonnum"; mkdir -p "$RW5"
+{ printf '2222\n'; printf '\302\262\n'; } > "$RW5/dispatched.txt"
+cp "$RW5/dispatched.txt" "$RW5/checked.txt"
+printf '1\n' > "$RW5/.open_iss"
+: > "$RW5/.pr_brs"
+( PATH="$R:$PATH" DISPATCHED_RECHECK_MAX=$'\302\262' python3 "$R/reap.py" "$RW5" "owner/repo" ) > "$TMP/reap-nonnum.out" 2>&1
+rc=$?
+[ "$rc" = "0" ] && rc=0 || rc=1
+ck "shipped reaper: a digit-but-not-a-number ROW and KNOB do not abort the pass" $rc
+grep -q 'Traceback' "$TMP/reap-nonnum.out" && rc=1 || rc=0
+ck "shipped reaper: no traceback escapes on a non-numeric row or knob" $rc
+grep -q 'is a digit but not a number' "$TMP/reap-nonnum.out" && rc=0 || rc=1
+ck "shipped reaper: a digit-but-not-a-number cap is NAMED, not silently defaulted" $rc
+
+# ⛔ A CLOSED ENTRY IS ONLY RECLAIMED WHEN ITS `candidates.txt` ROW IS ALREADY GONE. `dispatched.txt` is
+# the ONLY thing between a persisted queue row and a spawned lane (the dispatcher skips what it finds
+# there, and `lane.sh` never re-reads the issue's state), while `candidates.txt` is pruned BY THAT SAME
+# FILE, with its rc discarded. Dropping the row for an issue still listed there un-protects it — a lane
+# for a closed issue is the #8560/#7174 class this arm exists to avoid. Two passes converge instead.
+RW7="$TMP/reap-window-queued"; mkdir -p "$RW7"
+printf '3333\n' > "$RW7/dispatched.txt"
+printf '3333\n' > "$RW7/checked.txt"
+printf '3333\n' > "$RW7/candidates.txt"
+printf '1\n' > "$RW7/.open_iss"
+: > "$RW7/.pr_brs"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$RW7" "owner/repo" ) > "$TMP/reap-queued.out" 2>&1
+case "$(tr '\n' ' ' < "$RW7/dispatched.txt")" in *3333*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: a CLOSED entry still listed in candidates.txt is KEPT (its queue row is unprotected otherwise)" $rc
+grep -q 'still listed in candidates.txt, KEPT' "$TMP/reap-queued.out" && rc=0 || rc=1
+ck "shipped reaper: the closed-but-still-queued case is NAMED, not silently kept" $rc
+# ...and once the queue row is gone (the prune ran), the next pass reclaims it.
+: > "$RW7/candidates.txt"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$RW7" "owner/repo" ) > "$TMP/reap-queued2.out" 2>&1
+case "$(tr '\n' ' ' < "$RW7/dispatched.txt")" in *3333*) rc=1;; *) rc=0;; esac
+ck "shipped reaper: the next pass reclaims it once the queue row is gone (convergence, not a stall)" $rc
+# ⛔ A ROW THAT IS NOT AN ISSUE NUMBER CAN NEVER BE ASKED, so calling it `deferred` would promise a
+# release that cannot happen — the rule this file states for the sibling checked-release rotation. It
+# must be counted and NAMED separately, and never listed as deferred.
+RW8="$TMP/reap-window-nonnum2"; mkdir -p "$RW8"
+{ printf '\302\262\n'; printf '2222\n'; } > "$RW8/dispatched.txt"
+cp "$RW8/dispatched.txt" "$RW8/checked.txt"
+printf '1\n' > "$RW8/.open_iss"
+: > "$RW8/.pr_brs"
+( PATH="$R:$PATH" GH_STUB_OPEN="2222" DISPATCHED_RECHECK_MAX=1 python3 "$R/reap.py" "$RW8" "owner/repo" ) > "$TMP/reap-nonnum2.out" 2>&1
+grep -q 'row(s) are not issue numbers and can never be asked' "$TMP/reap-nonnum2.out" && rc=0 || rc=1
+ck "shipped reaper: a non-issue-number row is NAMED as unaskable, never counted as deferred" $rc
+grep -qE 'deferred to a later pass by the rotating cursor' "$TMP/reap-nonnum2.out" && rc=1 || rc=0
+ck "shipped reaper: an unaskable row is NOT promised as a later release" $rc
+grep -qE 'OPEN, KEPT because a merged PR naming an OPEN issue reads CLEAN downstream[^:]*: 2222' "$TMP/reap-nonnum2.out" && rc=0 || rc=1
+ck "shipped reaper: the unaskable row does not consume the bound (the NUMERIC entry is the one asked)" $rc
+RW9="$TMP/reap-window-unaskable-only"; mkdir -p "$RW9"
+{ printf '\302\262\n'; printf '\302\263\n'; } > "$RW9/dispatched.txt"
+cp "$RW9/dispatched.txt" "$RW9/checked.txt"
+printf '1\n' > "$RW9/.open_iss"
+: > "$RW9/.pr_brs"
+( PATH="$R:$PATH" GH_STUB_FAIL=1 python3 "$R/reap.py" "$RW9" "owner/repo" ) > "$TMP/reap-unaskable.out" 2>&1
+_unask="$(tr '\n' ' ' < "$RW9/dispatched.txt")"
+[ "$(grep -c . "$RW9/dispatched.txt")" = "2" ] && rc=0 || rc=1
+ck "shipped reaper: a pass with ONLY unaskable rows drops nothing (they are never asked, so never decided)" $rc
+grep -q '0 askable row(s) outside the capped open-issue window' "$TMP/reap-unaskable.out" && rc=0 || rc=1
+ck "shipped reaper: a pass with only unaskable rows still SAYS so (not a silent no-op)" $rc
+# ⛔ AN UNREADABLE candidates.txt IS NOT AN EMPTY ONE (review round 4, item 1). `read_soft` returns None
+# for unreadable and [] for absent; collapsing them reaped a CLOSED entry whose queue row IS still there,
+# and `dispatched.txt` is the only thing filtering that row from a spawned lane. Unverifiable ⇒ KEEP.
+RWA="$TMP/reap-window-unreadable"; mkdir -p "$RWA"
+printf '3333\n' > "$RWA/dispatched.txt"
+printf '3333\n' > "$RWA/checked.txt"
+mkdir -p "$RWA/candidates.txt"          # a DIRECTORY: present, unreadable
+printf '1\n' > "$RWA/.open_iss"
+: > "$RWA/.pr_brs"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$RWA" "owner/repo" ) > "$TMP/reap-unreadable.out" 2>&1
+case "$(tr '\n' ' ' < "$RWA/dispatched.txt")" in *3333*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: an UNREADABLE candidates.txt keeps a CLOSED entry (the queue row cannot be proved gone)" $rc
+grep -q 'candidates.txt is UNREADABLE' "$TMP/reap-unreadable.out" && rc=0 || rc=1
+ck "shipped reaper: the unreadable-queue refusal is NAMED, not silent" $rc
+case "$(tr '\n' ' ' < "$RWA/checked.txt")" in *3333*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the unreadable-queue pass leaves checked.txt untouched too" $rc
+
+# ⛔ THE "NO ANSWER" ARM IS THE FAIL-CLOSED GUARD, AND IT NEEDED A FIXTURE (review round 5). Nothing
+# reached it: every asking fixture used a stub that exits 0 with valid JSON, and the one GH_STUB_FAIL=1
+# fixture had only unaskable rows, so no ask was made. Mutating the arm to `reaped.append(n)` — the
+# fail-OPEN direction, which on a GraphQL refusal would drop up to DISPATCHED_RECHECK_MAX entries from
+# both files on a read that never answered — left every suite green.
+RWB="$TMP/reap-window-ghfail"; mkdir -p "$RWB"
+printf '2222\n' > "$RWB/dispatched.txt"
+printf '2222\n' > "$RWB/checked.txt"
+printf '1\n' > "$RWB/.open_iss"
+: > "$RWB/.pr_brs"
+( PATH="$R:$PATH" GH_STUB_FAIL=1 python3 "$R/reap.py" "$RWB" "owner/repo" ) > "$TMP/reap-ghfail.out" 2>&1
+case "$(tr '\n' ' ' < "$RWB/dispatched.txt")" in *2222*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: a FAILED state read KEEPS the entry (an unanswerable read is not a CLOSED answer)" $rc
+case "$(tr '\n' ' ' < "$RWB/checked.txt")" in *2222*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: a FAILED state read leaves checked.txt untouched" $rc
+grep -qE 'unreadable, KEPT: 1 \(2222\)' "$TMP/reap-ghfail.out" && rc=0 || rc=1
+ck "shipped reaper: the unreadable entries are NAMED, not just counted" $rc
+# ⛔ AND THE CURSOR IS THE **LAST ASKED** NUMBER, NOT THE MAXIMUM (review round 5): on the WRAP branch
+# `max()` is the global maximum, so the next pass restarted at the head and re-asked what the wrap pass
+# had just asked. Assert the cursor the wrap pass WROTE — RW6 asks 3333 4444 1111 (wrap from 2), so the
+# last asked is 1111 and the next pass must resume at 2222, not jump back to 1111.
+RWC="$TMP/reap-window-wrapcursor"; mkdir -p "$RWC"
+printf '1111\n2222\n3333\n4444\n' > "$RWC/dispatched.txt"
+cp "$RWC/dispatched.txt" "$RWC/checked.txt"
+printf '1\n' > "$RWC/.open_iss"
+: > "$RWC/.pr_brs"
+mkdir -p "$RWC/state" && printf '2222\n' > "$RWC/state/dispatched-recheck-cursor"
+( PATH="$R:$PATH" GH_STUB_OPEN="1111 2222 3333 4444" DISPATCHED_RECHECK_MAX=3 python3 "$R/reap.py" "$RWC" "owner/repo" ) > "$TMP/reap-wrapcursor.out" 2>&1
+case "$(cat "$RWC/state/dispatched-recheck-cursor" 2>/dev/null)" in 1111) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the wrap cursor is the LAST ASKED number (max() would freeze the ring on the tail)" $rc
+( PATH="$R:$PATH" GH_STUB_OPEN="1111 2222 3333 4444" DISPATCHED_RECHECK_MAX=3 python3 "$R/reap.py" "$RWC" "owner/repo" ) > "$TMP/reap-wrapcursor2.out" 2>&1
+_next="$(sed -n 's/.*re-queue shipped work: \([0-9 ]*\); unreadable.*/\1/p' "$TMP/reap-wrapcursor2.out")"
+case "$_next" in
+  *1111*) rc=1;;   # re-asking what the wrap pass just asked is the defect
+  *) rc=0;;
+esac
+ck "shipped reaper: the pass AFTER a wrap does not re-ask the entry the wrap just asked" $rc
+case "$(tr '\n' ' ' < "$RW8/dispatched.txt")" in *2222*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the asked OPEN entry is kept" $rc
+# ⛔ AND AN UNASKABLE ROW MUST SURVIVE a CLOSED answer it must never have been asked for: with no
+# numeric row at all there is no ask, so nothing may be dropped (the first cut asked it, got CLOSED, and
+# DELETED the row on the same line that called it "can never be asked").
+
 # ── 5a2) THE CHECKED CLASSIFICATION: a suppression survives only while a re-checkable fact holds ──
 # `checked.txt` short-circuits the walk before ANY network call, so an entry in it is invisible to
 # every later pass — and before agent-infra#2183 nothing revalidated it: the only remover walked

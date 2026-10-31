@@ -2585,18 +2585,249 @@ if not _disp_ok:
     print("[reap] SKIPPED (dispatched.txt unreadable) — an unreadable blacklist is not an empty one; "
           "nothing is reaped and the file is left exactly as it was")
     _disp_rows = []
+# ── THE CAPPED WINDOW IS NOT AN ANSWER, SO THE ENTRIES IT CANNOT REACH ARE ASKED DIRECTLY ──────
+# ⛔ `.open_iss` IS `--limit 500` created-DESC against a repo with 1371 open issues (measured
+# 2026-10-30, daniel-ospina/tortoise), so it is PERMANENTLY saturated: every issue older than the 500
+# newest OPEN ones is absent from it for ever. The reap below reads that absence as "cannot prove it
+# is open" — the right polarity for the CLOSED question, and the WRONG one for the RELEASE question,
+# because it makes the suppression PERMANENT: an abandoned dispatch falls out of the window, is never
+# dropped from `dispatched.txt`, therefore never leaves `checked.txt`, therefore is SKIPPED by every
+# later pass and never re-enters `candidates.txt` (which the dispatch cycle prunes of dispatched ids).
+# The issue stays open, nobody works it, and the one line an operator reads counts it as `dispatched`.
+# MEASURED on the live box: the shipped reap released NOTHING (0 releasable of 384) while 169 of the
+# 203 entries in `dispatched.txt` were outside the window. Of the 12 asked in the first bounded pass,
+# ALL were OPEN — and `.pr_brs` is as saturated as `.open_iss` (4142 PRs exist, 500 visible), so "no PR"
+# is NOT a fact this pass can read: 7 of those 12 turned out to have head-ref-naming MERGED PRs outside
+# the window (verified: #1789 → PR 8041, #2107 → PR 8128, both MERGED, both issues still OPEN).
+# ⛔ SO ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN, window-blind entry is KEPT and NAMED. The reason is
+# in this file's own words: the LANDED verdict comes ONLY from the issue's own CLOSED state (`:4453`,
+# tortoise#8625), so an OPEN issue whose PR merged reads **CLEAN** in the pre-flight and is re-queued —
+# a lane re-implementing shipped work (#8560/#7174). The reap may end SILENCE; it may not cause a
+# requeue. What it therefore delivers is (a) every CLOSED entry reclaimed, (b) the OPEN class COUNTED and
+# NAMED on the operator line every pass, rotated so the whole class is named over time — a stated deficit
+# instead of an invisible permanent suppression. Closing that half needs the PR question answered
+# authoritatively per entry (a timeline/linked-PR read), which is a separate change.
+# So the entries the window cannot answer for get the AUTHORITATIVE, UNCAPPED question —
+# `gh issue view <N> --json state`, exactly the reading the landed prune below already takes for the same
+# reason. A CLOSED issue's dispatch is settled for ever ⇒ drop it. OPEN or unreadable ⇒ KEEP, fail-closed
+# per entry, unchanged.
+# ⛔ BOUNDED BY A ROTATING CURSOR, NOT A HEAD WINDOW. `DISPATCHED_RECHECK_MAX` (default 12, ceiling 96)
+# asks per pass against the numerically sorted ambiguous list, starting after
+# `state/dispatched-recheck-cursor` and wrapping to the start, so a head of permanently-unreadable
+# entries can never consume the budget for ever — the #1729 defect the checked-release rotation below
+# exists to avoid. A cap that is 0, negative or unreadable is COERCED **and NAMED**: a bound of 0 that
+# disables a mechanism silently is a silent disable wearing the shape of a measurement (the rule
+# `CHECKED_RELEASE_MAX` already follows). The cost is GraphQL `gh issue view`, only for entries with
+# no live lane, no PR ref and no window answer, and it is taken ABOVE the affordability gate for the
+# same reason the claim filter below is: on the starved box — the one where a stale suppression hurts
+# most — housekeeping would otherwise never run.
+DISPATCHED_RECHECK_CEILING = 96
+
+
+def _issue_num(x):
+    """Sort key for a `dispatched.txt` row. ⛔ `str.isdigit()` IS TRUE FOR CHARACTERS `int()` REJECTS
+    (superscript two is a digit and not a number), and an unguarded `int()` on one raised out of this
+    heredoc, aborted the reap and took `EXIT_TRANSIENT` on EVERY later pass — the permanent
+    no-dispatch loop this block's own comments record being fixed twice. Non-numeric rows sort first
+    and are PRESERVED, never dropped."""
+    s = (x or "").strip()
+    if s.isdigit() and len(s) <= 18:
+        try:
+            return int(s)
+        except ValueError:
+            return -1
+    return -1
+
+
+def issue_state_targeted(n):
+    """The issue's own state, straight from gh — UNCAPPED, and None on ANY failure (which every
+    caller reads as "keep the entry", never as "closed"). The timeout is load-bearing: this is a
+    network call taken ABOVE the affordability gate, so a hung `gh` must not stall the pass."""
+    if not OR:
+        return None
+    try:
+        r = subprocess.run(["gh", "issue", "view", n, "--repo", OR, "--json", "state"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return None
+        state = json.loads(r.stdout).get("state")
+    except Exception:
+        return None
+    if not isinstance(state, str):
+        return None
+    return state.strip().upper() or None
+
 if have_open and _disp_ok:
-    keep, reaped = [], []
+    keep, reaped, _window_blind = [], [], []
     for n in _disp_rows:
         if not n:
             continue
         if n in live:
             keep.append(n); continue
         has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
-        if n in open_iss and not has_pr:
+        if has_pr:
+            keep.append(n); continue
+        if n in open_iss:
             reaped.append(n)
         else:
-            keep.append(n)
+            _window_blind.append(n)
+    # The ambiguous class is the only one asked over the network, and only within a rotating bound.
+    if _window_blind:
+        # ⛔ A CAP OF 0 IS NOT A MEASUREMENT, IT IS A DISABLED MECHANISM — so it is coerced and SAID.
+        # Silently asking nothing while 169 entries stay suppressed for ever is the exact failure this
+        # block removes, one knob away.
+        _rch_raw = (os.environ.get("DISPATCHED_RECHECK_MAX", "") or "").strip()
+        if not _rch_raw:
+            _rch_max = 12
+        elif _rch_raw.isdigit() and len(_rch_raw) <= 6:
+            try:
+                _rch_max = int(_rch_raw)
+            except ValueError:
+                # ⛔ `str.isdigit()` IS TRUE FOR CHARACTERS `int()` REJECTS (a superscript two), and an
+                # unguarded conversion here aborted the reap and took EXIT_TRANSIENT on EVERY later pass
+                # — the permanent no-dispatch loop this block's neighbour `_issue_num` exists to prevent.
+                _rch_max = 12
+                print("[reap] WARN DISPATCHED_RECHECK_MAX=%r is a digit but not a number — coerced to 12"
+                      % _rch_raw)
+            if _rch_max <= 0:
+                _rch_max = 12
+                print("[reap] WARN DISPATCHED_RECHECK_MAX=%r is not a usable bound — coerced to 12, NOT "
+                      "read as 'ask nothing' (a bound of 0 would leave the window-blind class suppressed "
+                      "for ever, silently)" % _rch_raw)
+        else:
+            _rch_max = 12
+            print("[reap] WARN DISPATCHED_RECHECK_MAX=%r is not a number — coerced to 12" % _rch_raw)
+        if _rch_max > DISPATCHED_RECHECK_CEILING:
+            print("[reap] WARN DISPATCHED_RECHECK_MAX=%d exceeds the %d ceiling — clamped (this pass is "
+                  "taken ABOVE the affordability gate, so an unbounded cap would spend the shared "
+                  "GraphQL bucket on housekeeping)" % (_rch_max, DISPATCHED_RECHECK_CEILING))
+            _rch_max = DISPATCHED_RECHECK_CEILING
+        # ⛔ ASKABLE ROWS ONLY. A row that is not an issue number cannot be asked (the sibling rotation's
+        # own mechanism, `case ... *[!0-9]*) continue`), so it must never occupy a cap slot or be decided
+        # by a network answer — only the RULE had been carried over, which made the line report one row as
+        # both dropped and "can never be asked (KEPT)". They are KEPT and counted separately.
+        _unaskable = sorted({x for x in _window_blind if _issue_num(x) < 0})
+        _ordered = sorted({x for x in _window_blind if _issue_num(x) >= 0},
+                          key=lambda x: (_issue_num(x), x))
+        _cursor = 0
+        try:
+            with open(os.path.join(ST, "dispatched-recheck-cursor")) as _cfh:
+                _cursor = int((_cfh.read().strip() or "0"))
+        except (OSError, ValueError):
+            _cursor = 0
+        _start = 0
+        for _i, _x in enumerate(_ordered):
+            if _issue_num(_x) > _cursor:
+                _start = _i
+                break
+        # ⛔ ASK ALL WHEN THE LIST FITS THE BOUND — and never ask one entry twice. Concatenating the
+        # list to itself and slicing is the wrap, but on a list SHORTER than the cap it re-asks the
+        # same numbers (`asked 8 of 4`), which both spends the budget on repeats and makes the reap's
+        # own counters disagree with the list (caught by the rotation fixture, not by inspection).
+        if not _rch_max:
+            _asked = []
+        elif len(_ordered) <= _rch_max:            _asked = list(_ordered)
+        else:
+            _asked = _ordered[_start:_start + _rch_max]
+            if len(_asked) < _rch_max:
+                _asked = _asked + _ordered[:_rch_max - len(_asked)]
+        _askedset = set(_asked)
+        # ⛔ ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN one is KEPT and NAMED, however abandoned it
+        # looks, and the reason is measured in this file's own words: the LANDED verdict comes ONLY from
+        # the issue's own state being CLOSED (`:4453-4456`, tortoise#8625), so an OPEN issue whose PR was
+        # merged reads **CLEAN** in the pre-flight and is re-queued — a lane re-implementing shipped
+        # work, which is the #8560/#7174 class this whole reap exists to prevent. The window-blind "no PR"
+        # fact cannot tell the two apart, so the reap must not act on it: silence is what it may end, a
+        # requeue is what it may not cause. Named on the line instead of dropped, counted, and rotated.
+        # ⛔ A CLOSED ENTRY IS ONLY RECLAIMED WHEN ITS QUEUE ROW IS ALREADY GONE. `dispatched.txt` is the
+        # ONLY thing standing between a persisted `candidates.txt` row and a spawned lane: the dispatcher
+        # skips an id it finds there (`orch-loop.sh:6095`) and `lane.sh` never re-reads the issue's state,
+        # while `candidates.txt` is pruned BY THE SAME FILE (`orch-loop.sh:5531`, rc discarded). So dropping
+        # the row for an issue that is still listed there un-protects it — a lane for a closed issue is
+        # exactly the #8560/#7174 class this arm exists to avoid. Keep it this pass; the prune removes the
+        # queue row and the next pass reclaims the entry, which converges one cycle later with no window
+        # in which the queue row is unprotected.
+        # ⛔ AN UNREADABLE `candidates.txt` IS NOT AN EMPTY ONE — the same polarity `read_soft` documents
+        # and the `_REFUSED` arms above already take. `or []` collapsed UNREADABLE (None) into "nothing is
+        # queued", so a CLOSED entry whose queue row IS still there was dropped from `dispatched.txt` and
+        # `checked.txt` — and `dispatched.txt` is the only thing filtering that row from a spawned lane.
+        # One non-UTF-8 byte in the queue is enough (bash and `awk` read it fine, so the prune keeps the
+        # row). Unverifiable ⇒ KEEP every CLOSED entry this pass and SAY so.
+        _queue_rows = read_soft("candidates.txt")
+        _queue_unreadable = _queue_rows is None
+        _queued_now = set(l for l in (_queue_rows or []) if l)
+        _settled, _blind_open, _unreadable, _still_queued = [], [], [], []
+        for _n in _asked:
+            _st = issue_state_targeted(_n)
+            if _st == "CLOSED":
+                if _queue_unreadable or _n in _queued_now:
+                    keep.append(_n); _still_queued.append(_n)
+                else:
+                    reaped.append(_n); _settled.append(_n)
+            elif _st == "OPEN":
+                keep.append(_n); _blind_open.append(_n)
+            else:
+                keep.append(_n); _unreadable.append(_n)
+        # Everything the bound did not reach this pass is KEPT and named, never silently dropped: the
+        # cursor is what makes "not asked yet" a deferral rather than a verdict.
+        for _n in _ordered:
+            if _n not in _askedset:
+                keep.append(_n)
+        keep = list(dict.fromkeys(keep))
+        if not _ordered and _unaskable:
+            print("[reap] dispatched re-check: 0 askable row(s) outside the capped open-issue window; "
+                  "%d row(s) are not issue numbers and can never be asked (KEPT): %s"
+                  % (len(_unaskable), " ".join(_unaskable)))
+        if _asked:
+            # ⛔ A ROW THAT IS NOT AN ISSUE NUMBER IS NOT `deferred` — it can never be asked, so promising a
+            # release would be a promise that cannot happen (the rule `:3128` states for the sibling
+            # rotation). It is counted and NAMED separately, and `_issue_num`'s -1 sort places them at the
+            # head, where a wrap-ask can only ever reach the first of them.
+            _nonnumeric = _unaskable
+            _def = max(0, len(_ordered) - len(_asked))
+            print("[reap] dispatched re-check: asked %d of %d entr(ies) the capped open-issue window "
+                  "cannot answer for (cap %d) — CLOSED and settled, dropped from dispatched.txt: %s; "
+                  "CLOSED but still listed in candidates.txt, KEPT (its queue row is protected only by "
+                  "this file, so the prune goes first): %s; OPEN, KEPT because a merged PR naming an OPEN "
+                  "issue reads CLEAN downstream (LANDED comes only from a CLOSED issue), so releasing it "
+                  "would re-queue shipped work: %s; unreadable, KEPT: %d%s%s%s"
+                  % (len(_asked), len(_ordered), _rch_max,
+                     " ".join(_settled) if _settled else "none",
+                     " ".join(_still_queued) if _still_queued else "none",
+                     " ".join(_blind_open) if _blind_open else "none", len(_unreadable),
+                     (" (%s)" % " ".join(_unreadable)) if _unreadable else "",
+                     "" if _def <= 0
+                     else "; %d deferred to a later pass by the rotating cursor" % _def,
+                     "" if not _nonnumeric
+                     else "; %d row(s) are not issue numbers and can never be asked (KEPT): %s"
+                     % (len(_nonnumeric), " ".join(_nonnumeric))))
+            if _queue_unreadable:
+                print("[reap] WARN candidates.txt is UNREADABLE — a CLOSED entry is kept this pass "
+                      "because its queue row cannot be proved gone (an unreadable queue is not an "
+                      "empty one; dropping the dispatched.txt row is what would un-protect it)")
+            try:
+                # ⛔ THE LAST ASKED, NOT THE MAXIMUM (review round 5). `max()` over a WRAPPED window is
+                # the global maximum, so the next pass restarted at the head and re-asked exactly the
+                # entries the wrap pass had just asked (`5555 1111` → cursor 5555 → `1111 2222`) — up to
+                # `cap - 1` redundant asks per lap on a bucket four boxes share, and the review-proof that
+                # the fixture could not tell the two rules apart. `_asked[-1]` resumes after the last entry
+                # asked, wrapping only when the list really is exhausted.
+                _last = _issue_num(_asked[-1]) if _asked else _cursor
+                with open(os.path.join(ST, ".dispatched-recheck-cursor.%d" % os.getpid()), "w") as _wf:
+                    _wf.write("%d\n" % _last)
+                os.replace(os.path.join(ST, ".dispatched-recheck-cursor.%d" % os.getpid()),
+                           os.path.join(ST, "dispatched-recheck-cursor"))
+            except (OSError, ValueError):
+                print("[reap] WARN: could not persist the dispatched re-check cursor — the next pass "
+                      "restarts at the head of the ambiguous list (a rotation that never advances, "
+                      "so the tail defers for ever)")
+    # ⛔ THE FILE'S ORDER IS THE PREVIOUS FILE'S ORDER. Building `keep` by appending (live, then
+    # has-PR, then asked, then deferred) rotated the rows relative to each other on every pass, so
+    # `dispatched.txt` churned a diff for no reason and a reader comparing two passes saw movement that
+    # was not a decision. Filter the ORIGINAL rows instead — one source of order, and a dedupe for free.
+    _reaped_set = set(reaped)
+    keep = [n for n in _disp_rows if n and n not in _reaped_set]
+    reaped = list(dict.fromkeys(reaped))
     with open(os.path.join(O, "dispatched.txt"), "w") as fh:
         fh.write("\n".join(keep) + ("\n" if keep else ""))
     if reaped:
@@ -2615,7 +2846,8 @@ if have_open and _disp_ok:
         if kept_ck is not None and os.path.exists(ck):
             with open(ck, "w") as fh:
                 fh.write("\n".join(kept_ck) + ("\n" if kept_ck else ""))
-        print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+        print("[reap] un-blacklisted (open, no PR, no live lane; a CLOSED issue's dispatch is settled): %s"
+              % " ".join(sorted(reaped, key=_issue_num)))
 
 # ── THE CHECKED CLASSIFICATION: A SUPPRESSION SURVIVES ONLY WHILE A RE-CHECKABLE FACT HOLDS ─────
 # `checked.txt` short-circuits the walk before any network call, so an entry in it is invisible to
@@ -2727,22 +2959,9 @@ if _landed_rows is None:
     _landed_rows = []
 landed_entries = [l for l in _landed_rows if l]
 
-def landed_issue_state(n):
-    """The issue's own state, straight from gh — UNCAPPED, and None on ANY failure
-    (which the caller reads as "keep the entry", never "closed")."""
-    if not OR:
-        return None
-    try:
-        r = subprocess.run(["gh", "issue", "view", n, "--repo", OR,
-                            "--json", "state"], capture_output=True, text=True)
-        if r.returncode != 0:
-            return None
-        state = json.loads(r.stdout).get("state")
-    except Exception:
-        return None
-    if not isinstance(state, str):
-        return None
-    return state.strip().upper() or None
+# ⛔ ONE AUTHORITY for the targeted read: the dispatched reap above takes it too, so the two prunes
+# cannot drift into asking the same question two ways.
+landed_issue_state = issue_state_targeted
 
 if landed_entries:
     still_landed, released, settled, unreadable = [], [], [], []
