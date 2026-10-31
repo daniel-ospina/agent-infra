@@ -4,8 +4,12 @@
 #   ./check-farm-drift.sh [--dest <dir>] [--src <checkout>] [--pin-file <file>]
 #                         [--ref <git-ref>] [--quiet] [--no-pin-identity]
 #
-# Exit: 0 = match, 1 = DRIFT (a named file differs — the farm is not the shipped code),
-#       3 = UNSOURCED only (on the box, in no repo file — a deploy cannot fix it, a human must),
+# Exit: 0 = match, 1 = DRIFT THE FARM OWES (a farm-declared file differs, or a declared file never
+#           landed — the farm is not the shipped code, and re-running the farm is the remedy),
+#       3 = a deploy CANNOT fix it: an UNSOURCED file (on the box, in no repo file) or a STALE file
+#           that NO farm array delivers (differs from its source, and no farm leg puts it there).
+#           Loud, never a pass, and never the installer's fatal arm — otherwise setup.sh exits 1 on a
+#           file its own printed remedy cannot fix, and sync.sh (`set -euo pipefail`) dies every run.
 #       2 = UNKNOWN (cannot verify — NEVER a pass).
 #
 # ── WHY THIS EXISTS: tortoise#10114 ─────────────────────────────────────────────────────────────
@@ -212,13 +216,34 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
     say "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
 fi
 
+if [ "$PIN_IDENTITY" -eq 1 ] && [ -e "$PIN_FILE" ] && [ ! -f "$PIN_FILE" ]; then
+    # A pin record that EXISTS but is not a regular file (a directory, a dangling symlink) is
+    # "cannot read the pin", not "no pin" — the same `[ -f ]`-is-too-weak class the declaration arm
+    # below already refuses (it would silently demote cannot-verify to a pass).
+    say_err "$PROG: UNKNOWN — pin record $PIN_FILE exists but is not a readable regular file; the"
+    say_err "   commit this box should run cannot be read, so nothing was verified."
+    exit 2
+fi
+
 if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ]; then
-    # ⛔ "NO PIN YET" AND "PIN LOST" ARE INDISTINGUISHABLE AND BOTH SKIP THE TRAP ARM. A first install
-    # legitimately has no pin record; a box whose record was deleted or whose path was mistyped reads
-    # identically — and then the arm that exists for "a byte comparison against the tree it farms FROM
-    # is green regardless" is simply off, with no line saying so. Note it, on stderr, and stay 0 so a
-    # first-time install is unaffected.
-    say_err "$PROG: note — no pin record at $PIN_FILE: pin identity NOT verified (a first install has none; a box that LOST one reads the same)."
+    # ⛔ A LOST PIN IS NOT A FIRST INSTALL. `.harness-path` exists ONLY as the pin's SECOND record
+    # ("A pin is TWO records" — §1 above, and harness-apply-pass.sh's header), so a box carrying
+    # `.harness-path` and no HARNESS-PIN HAD a pin and lost it (or its path is mistyped). Staying 0
+    # there printed `OK` while the wrong-tree trap arm was off — the false PASS this whole file
+    # exists against (reproduced on main 2026-10-31: `.harness-path` present, HARNESS-PIN absent →
+    # `OK — 1/1 sourced file(s) match`, rc=0). A FIRST install has NEITHER record; that one stays 0,
+    # so a first-time install is unaffected (and 2 would not block it anyway — setup.sh:1069's `*)`
+    # arm warns and continues; it is 0 that would claim a verification that never happened).
+    _hp="${CELL_HOME:-$HOME}/.harness-path"
+    if [ -e "$_hp" ] || [ -L "$_hp" ]; then
+        say_err "$PROG: UNKNOWN — pin record $PIN_FILE is ABSENT, but $_hp EXISTS and that file is the"
+        say_err "   pin's SECOND record. A box with a pin TREE on record and no pin SHA has LOST its pin"
+        say_err "   (or the path is wrong), so the wrong-tree trap arm cannot run and nothing verified"
+        say_err "   WHICH commit this farm should be. That is 'cannot verify', never a pass."
+        say_err "   Next: restore $PIN_FILE, or re-cut the pin deliberately (scripts/harness-apply-pass.sh)."
+        exit 2
+    fi
+    say_err "$PROG: note — no pin record at $PIN_FILE and no $_hp: this is a FIRST INSTALL, so there is nothing to compare the source tree against. pin identity NOT verified."
 fi
 
 # ── the source lookup map ──────────────────────────────────────────────────────────────────────
@@ -324,6 +349,7 @@ EOF_LINKS
 [ "$broken_link" -eq 0 ] || exit 2
 
 stale=0
+stale_rows=""
 unsourced=0
 same=0
 matched=0
@@ -366,6 +392,7 @@ while IFS= read -r rel; do
         fi
         if [ "$src_exec" -eq 1 ] && [ ! -x "$DEST/$rel" ]; then
             stale=$((stale+1))
+            stale_rows+="$rel"$'\n'
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "NOT-EXECUTABLE" >&2
             continue
         fi
@@ -374,6 +401,7 @@ while IFS= read -r rel; do
             [ "$QUIET" -eq 1 ] || printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "ok"
         else
             stale=$((stale+1))
+            stale_rows+="$rel"$'\n'
             # BOTH shas, always: "N stale files" is not actionable; a pair is.
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "$(printf %s "$d_sha" | cut -c1-12)" "$(printf %s "$s_sha" | cut -c1-12)" "STALE" >&2
         fi
@@ -392,6 +420,8 @@ EOF_ROWS
 # relative to $DEST. Read it when it exists; say so when it does not.
 DECL="$(dirname "$DEST")/state/farm-declared.txt"
 missing=0
+decl_ok=0
+decl_rel_set=""
 if [ -f "$DECL" ]; then
     # ⛔ A PRESENT-BUT-EMPTY OR UNREADABLE DECLARATION IS `UNKNOWN`, NOT "NOTHING WAS DECLARED".
     # `$(cat "$DECL" 2>/dev/null)` discards the read's failure and an empty list declares nothing, so a
@@ -414,6 +444,7 @@ if [ -f "$DECL" ]; then
     while IFS= read -r dpath; do
         [ -n "$dpath" ] || continue
         case "$dpath" in scripts/*) rel="${dpath#scripts/}" ;; *) continue ;; esac
+        decl_rel_set+="$dpath"$'\n'
         is_declared_local "$rel" && continue
         if [ ! -e "$DEST/$rel" ]; then
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "DECLARED-BUT-ABSENT" >&2

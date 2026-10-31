@@ -219,12 +219,54 @@ RC=$?
 ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "worktree mode still refuses an unresolvable explicit --ref (rc=$RC)"
 
 # 20. An ABSENT pin record is NOTED (pin identity not verified), not silently skipped.
-F20="$TMP/f20"; mk_farm "$F20"
+# ⛔ CELL_HOME IS SET EXPLICITLY: the checker reads the pin's SECOND record from
+# `${CELL_HOME:-$HOME}/.harness-path`, so without it this case graded the AMBIENT box — on a box
+# that has a `.harness-path` (every cell does) the case asserted a first-install state it had not
+# built. Hermetic input, not the host's.
+F20="$TMP/f20"; mk_farm "$F20"; mkdir -p "$TMP/first-install"
 OUT="$TMP/out"; ERR="$TMP/err"
-( cd "$TMP" && bash "$CHECK" --dest "$F20" --src "$SRC" --ref HEAD --pin-file "$TMP/no-such-pin" ) >"$OUT" 2>"$ERR"
+( cd "$TMP" && CELL_HOME="$TMP/first-install" bash "$CHECK" --dest "$F20" --src "$SRC" --ref HEAD --pin-file "$TMP/no-such-pin" ) >"$OUT" 2>"$ERR"
 RC=$?
-ck $([ "$RC" -eq 0 ] && echo 0 || echo 1) "an absent pin record leaves the pass at 0 (first install) (rc=$RC)"
+ck $([ "$RC" -eq 0 ] && echo 0 || echo 1) "an absent pin record on a FIRST INSTALL leaves the pass at 0 (rc=$RC)"
 grep -qi 'pin identity NOT verified' "$ERR" && ck 0 "...but says pin identity was NOT verified" || ck 1 "...but says pin identity was NOT verified"
+
+# 21. ⛔ A LOST PIN IS NOT A FIRST INSTALL. `.harness-path` is the pin's SECOND record
+# (harness-apply-pass.sh's header): a pin is the sha in HARNESS-PIN *and* the tree in .harness-path.
+# So `.harness-path` present + HARNESS-PIN absent is a pin that was LOST — and the wrong-tree trap
+# arm is off. It must be UNKNOWN (2), never the 0 that reads as "OK".
+F21="$TMP/f21"; mk_farm "$F21"; mkdir -p "$TMP/pinlost"
+printf '%s\n' "$SRC" > "$TMP/pinlost/.harness-path"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$TMP/pinlost" bash "$CHECK" --dest "$F21" --src "$SRC" --ref HEAD --pin-file "$TMP/pinlost/state/HARNESS-PIN" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a LOST pin (.harness-path present, HARNESS-PIN absent) is UNKNOWN, not a pass (rc=$RC)"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict at all"
+
+# 22. ⛔ A STALE FILE NO FARM ARRAY DELIVERS IS NOT FATAL. `admin-merge.sh`, `heartbeat-loop.sh` and
+# the declared #1553 gap live on the box and are delivered by NO farm array (measured: grep count 0 in
+# pi-bootstrap/setup.sh), so setup.sh's rc=1 arm fired on a file its own printed remedy could never
+# fix — and sync.sh (set -euo pipefail) died every run. Same split the author already made for
+# UNSOURCED: a deploy cannot fix it, a human must → 3, loud and never a pass.
+# The declaration lists ONLY beta.sh, so alpha.py's drift is outside what the farm owes.
+C22="$TMP/c22"; mk_farm "$C22/scripts"; mkdir -p "$C22/state"
+printf 'scripts/beta.sh\n' > "$C22/state/farm-declared.txt"
+printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C22/scripts/alpha.py"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C22" bash "$CHECK" --dest "$C22/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 3 ] && echo 0 || echo 1) "a STALE file OUTSIDE the farm declaration is 3, not fatal (rc=$RC)"
+ck $(grep -q 'NOT farm-declared' "$ERR" && echo 0 || echo 1) "...and is labelled as outside the farm declaration"
+
+# 23. ⛔ BUT DRIFT THE FARM *DOES* OWE STAYS FATAL (tortoise#10114 unchanged). Same bytes as case 22,
+# same declaration — only the declaration now NAMES alpha.py, i.e. the farm delivers it and did not
+# converge it. That is the defect the check exists for and it must exit 1.
+C23="$TMP/c23"; mk_farm "$C23/scripts"; mkdir -p "$C23/state"
+printf 'scripts/alpha.py\nscripts/beta.sh\n' > "$C23/state/farm-declared.txt"
+printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C23/scripts/alpha.py"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C23" bash "$CHECK" --dest "$C23/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "a STALE file the farm DECLARES is still fatal #10114 drift (rc=$RC)"
 
 echo ""
 if [ "$fail" -eq 0 ]; then
