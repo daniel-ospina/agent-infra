@@ -1160,18 +1160,20 @@ MUT
   A14="$(boxidnet)"; RC=$?
   ck "(14) an address on a DOWN interface is never the identity ($A14 — the dead VLAN is at a LOWER ifindex)" \
      "$([ "$RC" -eq 0 ] && [ "$A14" = 10.238.144.2 ] && echo 0 || echo 1)"
-  # (15) AN EGRESS-CARRYING TUNNEL of a name the list knows (measured in round 6: `ppp0` slipped
-  # through): clause 1 accepts the egress device by definition, so the name list is the only filter that
-  # can refuse — and round 7 measured that FIVE of the six entries were individually ungraded, i.e. that
-  # deleting any one of them was silent. So EVERY entry is fed here, in the POINTOPOINT shape real `ip`
-  # prints for them (`inet 10.8.0.2 peer 10.8.0.1/32` — no `brd`, which cannot occur on a p2p device).
+  # (15) AN EGRESS-CARRYING PSEUDO/CONTAINER/TUNNEL DEVICE: clause 1 accepts the egress device by
+  # definition, so the name deny-list is the ONLY filter that can refuse — and each round of review found
+  # entries that were individually ungraded, i.e. that deleting one was silent (round 7: five of six new
+  # entries; round 8: `docker` and `br-`, whose measured consequence is that a docker host with
+  # `default via … dev docker0` publishes `172.17.0.1` as its identity). So EVERY entry in the list is fed
+  # here, in the POINTOPOINT shape real `ip` prints for the tunnels (`inet X peer Y/32` — no `brd`).
   A15BAD=""
-  for _tn in ppp0 gre1 ipip0 sit0 wwan0 rmnet0; do
+  for _tn in lo docker0 br-1a2b3c4d veth0 virbr0 podman0 vxlan0 cni0 flannel.1 cali1 kube-ipvs0 \
+             tun0 tap0 wg0 zt0 tailscale0 utun3 ppp0 gre1 ipip0 sit0 wwan0 rmnet0 dummy0 lxcbr0; do
     ipfix "$_tn" "2: $_tn inet 10.8.0.2/24 peer 10.8.0.1/32 scope global $_tn"
     _tv="$(boxidnet)"; _trc=$?
     { [ "$_trc" -eq 1 ] && [ -z "$_tv" ]; } || A15BAD="$A15BAD $_tn=[$_tv]"
   done
-  ck "(15) EVERY deny-listed egress name refuses rather than adopting its address — ppp/gre/ipip/sit/wwan/rmnet${A15BAD:+ — FAILED:}$A15BAD" \
+  ck "(15) EVERY entry in the deny list refuses as an EGRESS device rather than adopting its address (25 names: lo, docker0, br-, veth, virbr, podman, vxlan, cni, flannel, cali, kube, tun, tap, wg, zt, tailscale, utun, ppp, gre, ipip, sit, wwan, rmnet, dummy, lxc)${A15BAD:+ — FAILED:}$A15BAD" \
      "$([ -z "$A15BAD" ] && echo 0 || echo 1)"
   # each is addable on this kernel and each appears in `ip -4 -o addr show scope global` (measured under
   # `unshare -rn`), so a clause that drops one publishes an address no peer can use as an identity.
