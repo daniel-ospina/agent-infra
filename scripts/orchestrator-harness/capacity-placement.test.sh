@@ -1088,19 +1088,26 @@ MUT
   A9="$(boxidnet)"; RC=$?
   ck "(9) an egress device that is a TUNNEL refuses rather than adopting its address (rc=$RC, boxid=[$A9])" \
      "$([ "$RC" -eq 1 ] && [ -z "$A9" ] && echo 0 || echo 1)"
-  # (10) TWO addresses on ONE device (review round 1, finding 2): a `secondary` alias never displaces the
-  # address of record, and the documented tie-break is NUMERIC — a string compare reads `10.9.9.10` as
-  # smaller than `10.9.9.9` and would publish the wrong one of a pair the box owns.
+  # (10) TWO addresses on ONE device (review round 1, finding 2; round 2, finding 1).
+  # (a) a `secondary` alias never displaces the address of record — written in the shape real iproute2
+  #     emits, where `$2` stays the DEVICE and the label is the TRAILING field (measured with real `ip
+  #     addr add … label eth1:1`: `5: eth1 inet 10.50.0.9/24 scope global eth1:1`). A fixture with
+  #     `$2 = eth0:1` is rejected by clause 1 instead and grades nothing.
   ipfix eth0 \
     '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0' \
-    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global secondary eth0'
+    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global secondary eth0:1'
   A10="$(boxidnet)"; RC=$?
+  # (b) …and the tie-break among candidates that are equal in BOTH ifindex and secondary-ness is
+  #     NUMERIC. The two addresses are chosen so a STRING compare and an OCTET compare disagree:
+  #     "10.9.10.9" < "10.9.9.10" as strings, but 10.9.9.10 < 10.9.10.9 as octets. Round 2 measured
+  #     that a reverted string compare stayed 207/0 green against the previous fixture, i.e. this half
+  #     graded nothing; this fixture is the one that discriminates.
   ipfix eth0 \
-    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global eth0' \
-    '3: eth0:1 inet 10.9.9.10/24 brd 10.9.9.255 scope global secondary eth0:1'
+    '3: eth0 inet 10.9.10.9/24 brd 10.9.10.255 scope global eth0' \
+    '3: eth0 inet 10.9.9.10/24 brd 10.9.9.255 scope global eth0'
   A10B="$(boxidnet)"
-  ck "(10) a secondary alias never displaces the primary ($A10), and the tie-break is NUMERIC ($A10B — .9 not .10)" \
-     "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.9 ] && echo 0 || echo 1)"
+  ck "(10) a secondary alias never displaces the primary ($A10), and the tie-break is NUMERIC — octets give .9.10, a string compare gives .10.9 ($A10B)" \
+     "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.10 ] && echo 0 || echo 1)"
 else
   echo "  ⏭ §14 (1)-(5) SKIPPED: this platform has no /proc/net/route, so the Linux arm of cap_boxid_net is unreachable here."
   echo "    Not a pass: CI runs ubuntu-latest, where every arm above is measured."
