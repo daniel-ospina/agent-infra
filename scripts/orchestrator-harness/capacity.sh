@@ -359,14 +359,20 @@ cap_hw_uuid() {
 # ⛔ SO THE ACCEPT-PREDICATE IS AN ALLOW-LIST, and the answer is REFUSED — never guessed — unless a
 # candidate passes EVERY clause:
 #   1. the device CARRIES THE EGRESS TRAFFIC: it is the default route's device, or a VLAN child of it
-#      (`<dev>.<n>` — the cells' routable address lives there), AND that device is UP (`ip … show up`: a
-#      DOWN interface keeps its address in the listing, and a stale address on a dead VLAN is not "the
-#      ONE address a peer can reach it on" — measured, review round 6). This is the structural clause,
-#      and it is the same rule the Darwin arm encodes: the address a peer can reach me on is the
-#      address on the interface my traffic leaves by. For any device that does NOT carry egress it makes
-#      a container bridge or a VPN structurally unable to supply the value, whatever it is named and
-#      whatever order the kernel lists it in — docker0 is at a LOWER ifindex than the cells' VLAN child,
-#      so ordering alone would never save us.
+#      (`<dev>.<n>` — the cells' routable address lives there), AND that device is ADMINISTRATIVELY UP
+#      (`ip … show up`; a DOWN interface keeps its address in the listing, and a stale address on a dead
+#      VLAN is not "the ONE address a peer can reach it on" — measured, review round 6). This is the
+#      structural clause, and it is the same rule the Darwin arm encodes: the address a peer can reach me
+#      on is the address on the interface my traffic leaves by. For any device that does NOT carry egress
+#      it makes a container bridge or a VPN structurally unable to supply the value, whatever it is named
+#      and whatever order the kernel lists it in — docker0 is at a LOWER ifindex than the cells' VLAN
+#      child, so ordering alone would never save us.
+#      ⛔ KNOWN RESIDUAL, stated rather than implied: `up` is IFF_UP, NOT carrier/operstate. A device that
+#      is admin-up with NO CARRIER (a dead VLAN over a dead veth) still lists its address and can be
+#      chosen (measured, review round 7). Requiring `LOWER_UP` was considered and NOT taken: it adds a
+#      second query and a second failure mode on every box whose egress device reports no lower-layer
+#      flag, and the blast radius here is already bounded — the same egress carries the `git push` that
+#      publishes the record, so a dead egress normally surfaces as `why=push-refused` instead.
 #      ⛔ FOR THE EGRESS DEVICE ITSELF clause 1 accepts by definition, so a tunnel that carries the
 #      default route is caught by clause 2's NAME LIST and by nothing else — a deny-list, incomplete by
 #      nature (`ppp0` was measured slipping through in round 6 and is now listed). An operator whose

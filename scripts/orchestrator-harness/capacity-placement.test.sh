@@ -1106,7 +1106,7 @@ MUT
      "$([ "$RC" -eq 0 ] && [ "$A8" = 10.238.144.2 ] && echo 0 || echo 1)"
   # (9) AND CLAUSE 2 IS LOAD-BEARING (same finding). The EGRESS device itself is a tunnel (`wg0`): its
   # address satisfies the anchor and is routable-looking, so only the name clause refuses it.
-  ipfix wg0 '3: wg0 inet 10.8.0.2/24 brd 10.8.0.255 scope global wg0'
+  ipfix wg0 '3: wg0 inet 10.8.0.2/24 peer 10.8.0.1/32 scope global wg0'
   A9="$(boxidnet)"; RC=$?
   ck "(9) an egress device that is a TUNNEL refuses rather than adopting its address (rc=$RC, boxid=[$A9])" \
      "$([ "$RC" -eq 1 ] && [ -z "$A9" ] && echo 0 || echo 1)"
@@ -1160,12 +1160,19 @@ MUT
   A14="$(boxidnet)"; RC=$?
   ck "(14) an address on a DOWN interface is never the identity ($A14 — the dead VLAN is at a LOWER ifindex)" \
      "$([ "$RC" -eq 0 ] && [ "$A14" = 10.238.144.2 ] && echo 0 || echo 1)"
-  # (15) AN EGRESS-CARRYING TUNNEL of a name the list did not yet know (`ppp0`, measured in round 6):
-  # clause 1 accepts the egress device by definition, so the name list is the only filter that can refuse.
-  ipfix ppp0 '2: ppp0 inet 10.8.0.2/24 brd 10.8.0.255 scope global ppp0'
-  A15="$(boxidnet)"; RC=$?
-  ck "(15) an egress device that is a ppp TUNNEL refuses rather than adopting its address (rc=$RC, boxid=[$A15])" \
-     "$([ "$RC" -eq 1 ] && [ -z "$A15" ] && echo 0 || echo 1)"
+  # (15) AN EGRESS-CARRYING TUNNEL of a name the list knows (measured in round 6: `ppp0` slipped
+  # through): clause 1 accepts the egress device by definition, so the name list is the only filter that
+  # can refuse — and round 7 measured that FIVE of the six entries were individually ungraded, i.e. that
+  # deleting any one of them was silent. So EVERY entry is fed here, in the POINTOPOINT shape real `ip`
+  # prints for them (`inet 10.8.0.2 peer 10.8.0.1/32` — no `brd`, which cannot occur on a p2p device).
+  A15BAD=""
+  for _tn in ppp0 gre1 ipip0 sit0 wwan0 rmnet0; do
+    ipfix "$_tn" "2: $_tn inet 10.8.0.2/24 peer 10.8.0.1/32 scope global $_tn"
+    _tv="$(boxidnet)"; _trc=$?
+    { [ "$_trc" -eq 1 ] && [ -z "$_tv" ]; } || A15BAD="$A15BAD $_tn=[$_tv]"
+  done
+  ck "(15) EVERY deny-listed egress name refuses rather than adopting its address — ppp/gre/ipip/sit/wwan/rmnet${A15BAD:+ — FAILED:}$A15BAD" \
+     "$([ -z "$A15BAD" ] && echo 0 || echo 1)"
   # each is addable on this kernel and each appears in `ip -4 -o addr show scope global` (measured under
   # `unshare -rn`), so a clause that drops one publishes an address no peer can use as an identity.
   # ⛔ BOTH HALVES OF THE RESERVED RANGE ARE FED: `224.0.0.7` only exercises `22[4-9]\.` (224-229), so
