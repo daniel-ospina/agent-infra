@@ -479,6 +479,21 @@ ck "…that carries the caller's command verbatim" $rc
 ck "the env snapshot (the keys the terminal does NOT inherit) is written 0600" $rc
 grep -q '^export O=' "$TMP/O1/state/env-lane-7.sh" && rc=0 || rc=1
 ck "…and it carries O, which a durable terminal would otherwise lose" $rc
+# THE uv PIN IS IN THE SNAPSHOT (agent-infra#2159). A lane is the process that runs `uv sync`, so this
+# snapshot is the ONE delivery point that reaches every worker on every platform — the controller's
+# `export -p` alone leaves a box that never pinned its cache at the filesystem's mercy (measured: a
+# cold-cache cell MATERIALISED ~5.8 GB per worktree and went 17 GB free -> 257 MB in ~50 minutes).
+grep -q '^export UV_CACHE_DIR=' "$TMP/O1/state/env-lane-7.sh" && grep -q '^export UV_LINK_MODE=' "$TMP/O1/state/env-lane-7.sh" && rc=0 || rc=1
+ck "…and the uv cache + link-mode pin, so the lane's venv is hardlinked rather than a full copy (#2159)" $rc
+# …and the DEFAULT is what a box that never pinned it gets: with both variables unset in the caller's
+# environment the snapshot must still carry the repo's values. Without this case the line above passes
+# on any box whose shell profile happens to set them (this box's own does), proving nothing.
+rm -rf "$TMP/O4"
+# XDG_CACHE_HOME is unset TOO: on a host that sets it the snapshot would be $XDG_CACHE_HOME/uv and the
+# case would red for a reason that has nothing to do with the pin (hermetic-or-nothing).
+env -u UV_CACHE_DIR -u UV_LINK_MODE -u XDG_CACHE_HOME bash "$TMP/b1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O4" "$TMP/cmux4.log" >/dev/null 2>&1
+grep -q "^export UV_LINK_MODE='hardlink'$" "$TMP/O4/state/env-lane-7.sh" && grep -q "^export UV_CACHE_DIR='.*\.cache/uv'$" "$TMP/O4/state/env-lane-7.sh" && rc=0 || rc=1
+ck "…and with both UNSET in the caller it emits the repo DEFAULTS (the pin is not left to a profile)" $rc
 # A failed create must NOT look like a worker: no record, no run script, non-zero rc.
 rm -rf "$TMP/O2"; CMUX_LAYOUT_RC=1 bash "$TMP/b1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2" "$TMP/cmux2.log" >"$TMP/b2.out" 2>&1
 grep -q 'rc=1' "$TMP/b2.out" && [ ! -f "$TMP/O2/state/worker-lane-7" ] && rc=0 || { rc=1; cat "$TMP/b2.out"; }
