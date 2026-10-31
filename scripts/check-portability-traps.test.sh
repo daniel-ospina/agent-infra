@@ -219,6 +219,29 @@ run_check "$Q" --no-baseline
 [ "$?" = 2 ] && grep -q 'NO reason' "$ERR" && ok "C5: reasonless '# portability-ok:' is REFUSED (exit 2)" \
   || bad "C5: reasonless '# portability-ok:' was accepted (silent pass)"
 
+
+# ⛔ THE MARKER MUST BE A REAL COMMENT, NOT MERELY THE TEXT (review cycle-18 P2). The hatch matched
+# `raw`, so a `#` inside a QUOTED STRING silenced the line: program text could suppress the gate, and
+# the diff would show nothing but a string. Both fixtures below carry the identical sed, so the ONLY
+# difference is where the `#` sits — that is what makes this a discriminating pair.
+mkdir -p "$TMP/tree/qmark"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "note # portability-ok: caller pins GNU sed" > f; sed -i "s/a/b/" g.txt' >"$TMP/tree/qmark/1-quoted.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "note nothing special" > f; sed -i "s/a/b/" g.txt' >"$TMP/tree/qmark/2-plain.sh"
+# ⛔ ONE TARGET PER ARM, NOT BOTH (measured while mutation-testing this very arm): a list holding the
+# quoted fixture AND a plain one satisfied `flags` through the plain file, so the arm stayed green
+# against a detector with the raw-text hatch restored — a non-discriminating arm, which is exactly
+# what C20 is here to prevent it from being.
+printf 'qmark/1-quoted.sh\n' >"$TMP/qmark-quoted"
+printf 'qmark/2-plain.sh\n' >"$TMP/qmark-plain"
+flags "sed-in-place-gnu" "$TMP/qmark-quoted"
+[ "$?" = 0 ] && ok "C19: a '# portability-ok:' INSIDE A QUOTED STRING does not suppress the trap on that line (program text cannot silence the gate)" \
+  || bad "C19: a quoted '#' suppressed a real trap — the hatch is matching text, not comments"
+# the positive control: the SIBLING fixture differs only in the quoted text, and it must flag — else
+# nothing is proven about the quoted one above (a matcher that flags neither would pass C19 by silence).
+flags "sed-in-place-gnu" "$TMP/qmark-plain"
+[ "$?" = 0 ] && ok "C20: the sibling fixture, identical except for the quoted text, DOES flag (so C19 measures the hatch, not a broken fixture)" \
+  || bad "C20: the control fixture did not flag — C19 proves nothing"
+
 # C6/C7 — the file-level declaration: a reasoned skip works; a bare one REFUSES.
 L="$TMP/linuxonly"; : >"$L"
 mk4_lo() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$L"; }
@@ -1243,6 +1266,51 @@ run_check "$E" --baseline "$TMP/base-nojust.tsv"
 [ "$?" = 1 ] && grep -q 'NO justification' "$ERR" && ok "E4: a baseline entry with NO justification is a finding" \
   || bad "E4: a justification-less baseline entry was accepted"
 
+
+# ── E8..E10: `--emit-baseline` IS A DOCUMENTED REGENERATION PATH, SO IT IS A GATE SURFACE ────────
+# ⛔ THE DEFECT THESE PIN (review cycle-18 P1). The rule table reached awk as `-v rules="$RULES"` with
+# LITERAL NEWLINES in it; one-true-awk — macOS, the host this class exists for — refuses that, the
+# pipeline status was never checked, and `--emit-baseline` therefore printed 14 header lines, ZERO
+# rows and `exit 0`. The maintainer's regression path minted a SILENTLY EMPTY baseline, and no arm
+# touched the emit path at all (`grep -n emit-baseline` had no hits in this file). Three arms: the
+# happy path is complete, and BOTH failure modes of a choked awk refuse instead of printing nothing.
+mkdir -p "$TMP/tree/emit"
+printf '%s\n' '#!/usr/bin/env bash' 'n="$(nproc)"' >"$TMP/tree/emit/1-cpu.sh"
+printf 'emit/1-cpu.sh\n' >"$TMP/emit-targets"
+"$CHECK" --root "$TMP/tree" --targets "$TMP/emit-targets" --emit-baseline >"$TMP/emit.tsv" 2>"$TMP/emit.err"; erc=$?
+rows="$(grep -v '^#' "$TMP/emit.tsv" | grep -c . || true)"
+cols="$(grep -v '^#' "$TMP/emit.tsv" | awk -F'\t' 'NF>=3 && $4 ~ /[^ \t]/' | grep -c . || true)"
+if [ "$erc" = 0 ] && [ "$rows" = 1 ] && [ "$cols" = 1 ]; then
+  ok "E8: --emit-baseline emits one row per finding, with the REQUIRED justification column filled"
+else
+  bad "E8: --emit-baseline emitted rows=$rows justified=$cols rc=$erc (expected 1/1/0) — an empty or short emit is a false PASS"
+fi
+# one-true-awk model: an awk that REFUSES the `-v rules=` assignment (exit 2, the macOS message)
+mkdir -p "$TMP/awkrefuse"
+printf '#!/bin/sh\nfor a in "$@"; do case "$a" in rules=*) echo "awk: newline in string" >&2; exit 2;; esac; done\nexec %s "$@"\n' "$(command -v awk)" >"$TMP/awkrefuse/awk"
+chmod +x "$TMP/awkrefuse/awk"
+PATH="$TMP/awkrefuse:$PATH" "$CHECK" --root "$TMP/tree" --targets "$TMP/emit-targets" --emit-baseline >"$TMP/emit2.tsv" 2>"$TMP/emit2.err"; erc2=$?
+if [ "$erc2" = 2 ] && ! grep -q '^emit/' "$TMP/emit2.tsv"; then
+  ok "E9: a choked awk REFUSES the emit (rc=2, no rows) instead of printing an empty baseline that reads as 'nothing to grandfather'"
+else
+  bad "E9: a failing awk produced rc=$erc2 with $(grep -c '^emit/' "$TMP/emit2.tsv") row(s) — the macOS false-PASS shape"
+fi
+# and the quieter half: an awk that exits 0 having printed nothing must ALSO refuse, because the row
+# COUNT is reconciled against the live finding pairs. This is the barrier a status check alone misses.
+mkdir -p "$TMP/awkquiet"
+# ⛔ THE STUB DRAINS STDIN BEFORE EXITING (measured): exiting with the pipe still full makes `printf`
+# die of SIGPIPE, and `pipefail` then hands us a 141 — which the awk-status barrier catches, so the
+# arm would pass through the WRONG branch and only by timing. `cat >/dev/null` makes the reconciliation
+# the only barrier left standing, which is what this arm is for.
+printf '#!/bin/sh\nfor a in "$@"; do case "$a" in rules=*) cat >/dev/null; exit 0;; esac; done\nexec %s "$@"\n' "$(command -v awk)" >"$TMP/awkquiet/awk"
+chmod +x "$TMP/awkquiet/awk"
+PATH="$TMP/awkquiet:$PATH" "$CHECK" --root "$TMP/tree" --targets "$TMP/emit-targets" --emit-baseline >"$TMP/emit3.tsv" 2>"$TMP/emit3.err"; erc3=$?
+if [ "$erc3" = 2 ] && grep -q 'INCOMPLETE baseline' "$TMP/emit3.err"; then
+  ok "E10: an awk that exits 0 with NO rows is caught by the count reconciliation (rc=2) — a status check alone would have passed it"
+else
+  bad "E10: a silent zero-row emit was accepted (rc=$erc3) — the reconciliation is not doing its job"
+fi
+
 # ── F. SELF-CHECK: the detector obeys its own rules, and the shipped baseline is valid ──────────
 # ⛔ THE SUITE IS IN ITS OWN SELF-SCAN (review finding 14). The first version scanned only the detector,
 # so the SUITE — the file that is supposed to police BSD safety — was itself exempt, and a BSD-absent
@@ -1519,20 +1587,121 @@ fi
 #        host has no 3.x the arm prints `UNPROVEN-ON`, never a pass.
 # ⛔ THE SHAPE IS MATCHED WITHOUT MATCHING THIS FILE'S OWN PROSE: only non-comment lines of the
 # detector are read, so the comment block above (which names the shape) cannot red the arm.
+# ⛔ AND THE MATCH IS STATE-AWARE, NOT SAME-LINE (review cycle-18 P2). The first version anchored on
+# `$(... <<` WITHIN one line, so the equally fatal multi-line spelling
+#     X="$(
+#     cat <<\047EOF\047
+#     it\047s a quote
+#     EOF
+#     )"
+# scored 0 hits while `/bin/bash -n` on 3.2.57 refuses it (rc=2) — and because F9c32 is
+# `UNPROVEN-ON` wherever no bash 3.x exists (CI is ubuntu-only), this pin is the ONLY 3.2 coverage
+# there: the detector could go green in CI while every mode died at parse time on the host the trap
+# class exists for. The scanner therefore tracks SUBSTITUTION DEPTH across lines (`$( … )` and
+# backticks), skips heredoc BODIES at top level (a body is data, and its `$(` must not open a depth),
+# and reports any heredoc opener seen while depth > 0.
 subst_heredoc_pin() {
-  grep -nE '\$\([^)]*<<-?['"'"'"]?[A-Za-z_]|`[^`]*<<-?['"'"'"]?[A-Za-z_]' "$1" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#'
+  # A CHAR-LEVEL CONTEXT-STACK scan across lines, NOT a per-line grep. Two measurements forced it:
+  #   · a per-line quote model desynchronises on the detector own 1200-line SINGLE-QUOTED awk
+  #     program, so a phantom `$(` reads every later `<<` as "inside a substitution" (5 false hits);
+  #   · the same-line pattern missed the MULTI-LINE spelling entirely, which is an equal parse
+  #     failure on bash 3.2.57 and therefore an equal hole in the only 3.2 coverage bash-5 CI has.
+  # So this mirrors the model the detector itself uses: push on `$(`, `$((' (arithmetic), a double
+  # quote, a single/ANSI-C quote and a backtick; pop on the matching close. A heredoc opener seen
+  # while the stack sits on a COMMAND SUBSTITUTION is the defect. Two exclusions keep it honest:
+  # `$(( … ))` is ARITHMETIC (a `<<` there is a left shift, not a heredoc) and a top-level heredoc
+  # BODY is data, so a `$(` inside a body cannot open a depth.
+  awk '
+    BEGIN { SQ = sprintf("%c", 39); hd = ""; hdstrip = 0; ST = "" }
+    function s_top() { return (length(ST) > 0) ? substr(ST, length(ST), 1) : "" }
+    function s_push(ch) { ST = ST ch }
+    function s_pop() { ST = substr(ST, 1, length(ST) - 1) }
+    {
+      line = $0
+      if (hd != "") { t = line; if (hdstrip) sub(/^\t+/, "", t); if (t == hd) hd = ""; next }
+      n = length(line); i = 1; prev = " "
+      while (i <= n) {
+        c = substr(line, i, 1); nx = substr(line, i + 1, 1); t = s_top()
+        if (t == "S") { if (c == SQ) s_pop(); prev = c; i++; continue }
+        if (t == "A") { if (c == "\\") { i += 2; continue } if (c == SQ) s_pop(); prev = c; i++; continue }
+        if (t == "D") {
+          if (c == "\\") { i += 2; continue }
+          if (c == "\"") { s_pop(); prev = c; i++; continue }
+          if (c == "$" && nx == "(") { s_push("C"); i += 2; continue }
+          if (c == "`") { s_push("K"); prev = c; i++; continue }
+          prev = c; i++; continue
+        }
+        if (t == "K") { if (c == "\\") { i += 2; continue } if (c == "`") s_pop(); prev = c; i++; continue }
+        if (t == "C") {
+          if (c == "\\") { i += 2; continue }
+          if (c == ")" && AR[length(ST)] == 0) { s_pop(); prev = c; i++; continue }
+          if (c == ")" && AR[length(ST)] == 1) { s_pop(); if (nd > 0) nd--; prev = c; i++; continue }
+          if (c == SQ) {
+            if (prev == "$") s_push("A"); else s_push("S")
+            prev = c; i++; continue
+          }
+          if (c == "\"") { s_push("D"); prev = c; i++; continue }
+          if (c == "`") { s_push("K"); prev = c; i++; continue }
+          if (c == "$" && nx == "(") {
+            if (substr(line, i + 2, 1) == "(") { s_push("C"); AR[length(ST)] = 1; nd++; i += 3; continue }
+            s_push("C"); i += 2; continue
+          }
+          if (c == "<" && nx == "<" && substr(line, i + 2, 1) != "=" && AR[length(ST)] == 0) { print FNR; i += 2; prev = c; continue }
+          prev = c; i++; continue
+        }
+        # top level
+        if (c == "\\") { i += 2; prev = c; continue }
+        if (c == "#" && (i == 1 || prev ~ /[ \t;&|(){}]/)) break
+        if (c == SQ) { if (prev == "$") s_push("A"); else s_push("S"); prev = c; i++; continue }
+        if (c == "\"") { s_push("D"); prev = c; i++; continue }
+        if (c == "$" && nx == "(") { s_push("C"); AR[length(ST)] = (substr(line, i + 2, 1) == "(") ? 1 : 0; i += 2; continue }
+        if (c == "`") { s_push("K"); prev = c; i++; continue }
+        if (c == "<" && nx == "<" && substr(line, i + 2, 1) != "=") {
+          rest = substr(line, i + 2)
+          if (substr(rest, 1, 1) == "-") { rest = substr(rest, 2); hdstrip = 1 } else hdstrip = 0
+          sub(/^[ \t]*/, "", rest)
+          q2 = substr(rest, 1, 1)
+          if (q2 == SQ || q2 == "\"") { rest = substr(rest, 2); j = index(rest, q2); if (j > 0) hd = substr(rest, 1, j - 1) }
+          else { hd = rest; sub(/[^A-Za-z0-9_].*$/, "", hd) }
+          if (hd != "") { i = n + 1; continue }
+          i += 2; prev = c; continue
+        }
+        prev = c; i++
+      }
+    }' "$1" 2>/dev/null
 }
-if subst_heredoc_pin "$CHECK" >"$TMP/f9.hits" 2>/dev/null; then
+subst_heredoc_pin "$CHECK" >"$TMP/f9.hits" 2>/dev/null
+# ⛔ THE VERDICT IS "ANY HIT", NOT THE TOOL RC (review cycle-18 P2): the matcher is now awk, which
+# exits 0 whether or not it printed anything — an `if subst_heredoc_pin …` test would have been
+# ALWAYS TRUE, i.e. an arm that reds on the detector no matter what it contains (and, with the
+# message's `head -1` empty, no evidence at all). `-s` is the only test that matches the question.
+if [ -s "$TMP/f9.hits" ]; then
   bad "F9a: the detector carries a heredoc INSIDE a command substitution — bash 3.2 parses that body as CODE, so every mode dies at parse time ($(head -1 "$TMP/f9.hits"))"
 else
   ok "F9a: no heredoc inside a \$( … ) in the detector (the shape that made every mode rc=2 on bash 3.2.57)"
 fi
-# the negative control: a fixture carrying the OLD shape MUST be reported, or F9a proves nothing
+# the negative controls: a fixture carrying EITHER spelling MUST be reported, or F9a proves nothing.
+# F9b is the single-line form (the one that actually shipped and broke the gate); F9d is the
+# multi-line form, which the same-line matcher missed entirely.
 printf 'RULES=$(cat <<%sRULES%s\na body with an apostrophe: it is fine\nRULES\n)\n' "'" "'" >"$TMP/f9-neg.sh"
 if [ -n "$(subst_heredoc_pin "$TMP/f9-neg.sh")" ]; then
-  ok "F9b-negative: the shape matcher REPORTS the heredoc-in-\$( … ) form on a fixture that carries it (so F9a can fail)"
+  ok "F9b-negative: the shape matcher REPORTS the single-line heredoc-in-\$( … ) form on a fixture that carries it (so F9a can fail)"
 else
   bad "F9b: the shape matcher cannot fail — it reported nothing on a fixture that carries the exact old shape"
+fi
+{ printf 'X="$('; printf '\n'; printf 'cat <<%sEOF%s' "'" "'"; printf '\n'; printf 'it%ss a quote' "'"; printf '\n'; printf 'EOF'; printf '\n'; printf ')"'; printf '\n'; } >"$TMP/f9-multiline.sh"
+if [ -n "$(subst_heredoc_pin "$TMP/f9-multiline.sh")" ]; then
+  ok "F9d-negative: the shape matcher REPORTS the MULTI-LINE heredoc-in-\$( … ) form (an equal parse failure on 3.2.57, and the one the same-line matcher missed)"
+else
+  bad "F9d: the shape matcher missed the multi-line spelling — the pin would let a 3.2-fatal detector read as green on bash-5 CI"
+fi
+# F9e — the matcher must not fire on a heredoc at TOP LEVEL, nor on a `$(` inside a heredoc BODY:
+# a matcher that reds on correct code is the over-block that gets the gate switched off.
+printf 'cat <<%sEOF%s\nX="$(date)"\nEOF\n' "'" "'" >"$TMP/f9-toplevel.sh"
+if [ -z "$(subst_heredoc_pin "$TMP/f9-toplevel.sh")" ]; then
+  ok "F9e: a top-level heredoc whose BODY contains a substitution is NOT reported (bodies are data, not code)"
+else
+  bad "F9e: the shape matcher reported a legit top-level heredoc body — over-block on correct code"
 fi
 # F9c — the real parse, under this host's bash and under a real bash 3.x if the host has one
 if bash -n "$CHECK" 2>"$TMP/f9.err"; then

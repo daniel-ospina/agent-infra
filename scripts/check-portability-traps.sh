@@ -71,6 +71,10 @@
 #     reason REFUSES the run (exit 2) — an unexplained exclusion is an omission, not a decision.
 #   · A single correct line inside an otherwise-portable file gets a trailing
 #     `# portability-ok: <reason>`. Same rule: no reason ⇒ still flagged.
+#     ⛔ AND IT MUST BE A REAL COMMENT (review cycle-18 P2): the marker is honoured only where the
+#     shell would start a comment — a `#` INSIDE A QUOTED STRING is program text, and matching it let
+#     `echo "note # portability-ok: x" > f; sed -i …` silence a live trap (the one direction this
+#     header forbids). The suite pins both directions (C19 must flag, C20 is its control).
 #   · Heredoc bodies are skipped (a data line is not a command). A heredoc whose marker is computed
 #     is not tracked — declared over-block, both polarities named in `--list-rules`.
 #   · A tool terminated by a PIPE or a `)` with no space (`x="$(free|head -3)"`, `(free)`) is not
@@ -105,6 +109,13 @@
 #   freely; it may not rise. `--emit-baseline` PRINTS a baseline for the current tree (it does not
 #   write the file: the rewrite is a reviewable diff, not a side effect), and every row REQUIRES a
 #   justification (column 4), the same contract `scripts/false-pass-baseline.tsv` states.
+#   ⛔ THE EMIT PATH IS A GATE SURFACE, NOT CONVENIENCE (review cycle-18 P1): it is the DOCUMENTED way
+#   to regenerate the file, so an emit that prints a header and no rows is a false PASS that the next
+#   reviewer inherits as "nothing to grandfather". Two independent barriers guard it, and the suite
+#   pins both (E8/E9/E10): the rule table is FLATTENED to `\034` before it reaches awk as a `-v`
+#   assignment (one-true-awk, i.e. macOS, refuses a literal newline there — "awk: newline in string",
+#   and the pipeline status used to be discarded), and the emitted row COUNT is reconciled against the
+#   live (path, rule) pairs, so a silently empty or short emit refuses instead of succeeding.
 #   ⛔ A FALL IS NOT AUTOMATICALLY A FIX, AND IT IS NOT PERMANENT (review cycle-2 P2): a count that
 #   drops is reported as SHRUNK and the gate stays green, but the row keeps its OLD, higher count
 #   until it is re-emitted — so headroom for that many new instances of the same trap in the same file
@@ -127,7 +138,10 @@
 # inside a `$( … )` — a FEATURE list is not a PARSE list, and the parse half is the one that has
 # already cost this repo an install (#2828, #2930, #2248). This script is subject to its own rules:
 # the suite's F1 arm runs it over its own source, and F9 PARSES it with a real bash 3.x.
-# AWK: POSIX subset, so both `mawk` (Linux) and the BSD `awk` on macOS accept it. The apostrophe is
+# AWK: POSIX subset, so both `mawk` (Linux) and the BSD `awk` on macOS accept it — INCLUDING the
+# `-v` assignment rule that cycle-18 found the hard way: a literal newline in a `-v` VALUE is refused
+# by one-true-awk and accepted by mawk, so any multi-line value is flattened to `\034` for transport
+# (the Linux-only run could never have shown it). The apostrophe is
 # spelled with `sprintf("%c", 39)`/octal `\047` rather than `\x27`, which is a gawk extension
 # (review cycle-2 P2). THE DIALECT IS NOW OBSERVED ON BOTH (review cycle-17): the same tree under macOS
 # BSD `awk` (version 20200816) prints the same `126 grandfathered across 75 file/rule pairs` as Linux
@@ -203,7 +217,11 @@ case "$MODE" in
     sed -n '2,/^set -uo pipefail/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
     exit 0 ;;
   list-rules)
-    printf '%s\n' "$RULES" | awk -F'\t' '{ printf "%-28s\n  trap:        %s\n  replacement: %s\n", $1, $2, $3 }'
+    # ⛔ THE TABLE'S STATUS IS CHECKED, NOT DISCARDED (review cycle-18 P1): `exit 0` after a pipe hides
+    # an awk that printed nothing, and "no rules" reads exactly like "no rules applies". See the
+    # transport note at --emit-baseline for the one-true-awk failure that made this load-bearing.
+    printf '%s\n' "$RULES" | awk -F'\t' '{ printf "%-28s\n  trap:        %s\n  replacement: %s\n", $1, $2, $3 }' \
+      || { echo "❌ --list-rules: awk failed to print the rule table — refusing to report an empty table as success" >&2; exit 2; }
     exit 0 ;;
 esac
 
@@ -290,6 +308,15 @@ function st_pop() { ST = substr(ST, 1, length(ST) - 1) }
 
 function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
   n = length(line); out = ""
+  # ⛔ CMT_AT — THE OFFSET WHERE THE TOP-LEVEL COMMENT ON THIS LINE STARTS, 0 WHEN THERE IS NONE (review
+  # cycle-18 P2). It exists because the `# portability-ok:` hatch below used to be matched against
+  # `raw`, which cannot tell a comment from a `#` inside a QUOTED string: a line carrying real
+  # program text (`echo "note # portability-ok: x" > f; sed -i …`) silenced its own trap — a false
+  # PASS reached from program content, the one direction the header of this detector forbids. The offset
+  # is set by the SAME walk that already knows the quote/context stack, so the hatch and the comment
+  # model cannot disagree; a `#` inside a multi-line string is not top level here either, and such a
+  # line is scanned instead of blessed (over-block, which is the safe direction).
+  CMT_AT = 0
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
     top = st_top()
@@ -431,7 +458,7 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
     if (c == "\\") { i++; continue }
     if (c == "#") { prev = (i == 1) ? " " : substr(line, i - 1, 1)
                     if (prev == "{") { out = out c; continue }
-                    if (prev ~ /[ \t;&|(){}]/) break }
+                    if (prev ~ /[ \t;&|(){}]/) { CMT_AT = i; break } }
     if (c == SQ) { ansi = (i > 1 && substr(line, i - 1, 1) == "$"); st_push("S"); AC[length(ST)] = ansi; SN[length(ST)] = 0; out = out SQ; continue }
     if (c == "\"") { st_push("D"); SN[length(ST)] = 0; out = out "\""; continue }
     if (c == "$" && substr(line, i + 1, 1) == "(") {
@@ -1155,11 +1182,12 @@ heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   if (mode != "") next            # declared out of scope for the whole file
 
   # per-line escape hatch: `# portability-ok: <reason>`, reason required.
-  # ⛔ IT MUST BE A COMMENT AT WORD START (review cycle-8 P1): matching the bare text anywhere let
-  # `grep -n 'portability-ok:' f; sed -i …` and `flag="portability-ok:1"; sed -i …` suppress a real
-  # finding — a suppression no reviewer could see in the diff, and not what the header documents.
-  if (raw ~ /(^|[ \t;&|(){}])# *portability-ok:/) {
-    tail = raw; sub(/.*# *portability-ok:[ \t]*/, "", tail)
+  # ⛔ IT MUST BE A REAL COMMENT AT WORD START (review cycle-8 P1), AND NOW IT MUST ALSO BE A COMMENT
+  # AT ALL (review cycle-18 P2): matching `raw` let a `#` inside a QUOTED STRING suppress the line,
+  # so program text could silence the gate. `CMT_AT` comes from the quote-aware walk that built
+  # `code`, so the marker is honoured only where the shell itself would start a comment.
+  if (CMT_AT > 0 && substr(raw, CMT_AT) ~ /^# *portability-ok:/) {
+    tail = substr(raw, CMT_AT); sub(/^# *portability-ok:[ \t]*/, "", tail)
     if (tail ~ /[^ \t]/) next
     fail(FILENAME ":" FNR ": `# portability-ok:` with NO reason — a suppression without a reason is a silent pass")
   }
@@ -1523,7 +1551,16 @@ findings="$(scan)" || exit 2
 # emitting zero rows over a tree with 89 findings. Counted here, keyed on the tab, sorted for
 # determinism; no field rebuild can corrupt the key.
 counts="$(printf '%s\n' "$findings" | awk -F'\t' 'NF>=3 { c[$1 "\t" $3]++ } END { for (k in c) print k "\t" c[k] }' \
-          | LC_ALL=C sort -t"$(printf '\t')" -k1,1 -k2,2)"
+          | LC_ALL=C sort -t"$(printf '\t')" -k1,1 -k2,2)" \
+  || { echo "❌ the (path, rule) count pass FAILED — refusing a verdict from counts that could not be built" >&2; exit 2; }
+# ⛔ FINDINGS WITHOUT COUNTS IS THE SAME FALSE PASS ONE STEP LATER (review cycle-18 P1): the ratchet
+# compares COUNTS, so an empty count map over a non-empty finding list reads as "nothing found" and
+# the gate goes green over real traps. The scan's own status is checked above; this checks the pass
+# that was silently assumed.
+if [ -n "$findings" ] && [ -z "$counts" ]; then
+  echo "❌ the scan reported findings but the count map is EMPTY — refusing a CLEAN verdict from a half-built comparison" >&2
+  exit 2
+fi
 
 if [ "$MODE" = "emit" ]; then
   printf '# scripts/portability-baseline.tsv — grandfathered cross-platform findings\n'
@@ -1542,13 +1579,32 @@ if [ "$MODE" = "emit" ]; then
   printf '# A count may FALL freely; it may not RISE (a rise is a new trap, and it reds).\n'
   # The justification is DERIVED from the rule table, so it cannot go stale the way hand-written
   # prose does: it names the trap and the portable replacement this repo already ships.
-  printf '%s\n' "$counts" | awk -F'\t' -v rules="$RULES" 'NF>=3 {
-      split(rules, R, "\n")
+  #
+  # ⛔ THE TABLE IS FLATTENED FOR TRANSPORT, AND AWK'S STATUS IS CHECKED (review cycle-18 P1). The
+  # table used to reach awk as `-v rules="$RULES"` with LITERAL NEWLINES in it. One-true-awk — the
+  # BSD/macOS `awk` on the host this whole trap class exists for — refuses that (`awk: newline in
+  # string cpu-count-single-mec…`), and the pipeline's status was never tested (`set -uo pipefail`,
+  # no `-e`, no `||`), so `--emit-baseline` printed its 14 header lines, ZERO data rows, and
+  # `exit 0`. That is the DOCUMENTED regeneration path, so the maintainer on macOS got a silently
+  # EMPTY baseline, while every Linux run stayed byte-identical — a false PASS reachable only from
+  # the platform the gate protects. Two independent barriers now: the newline becomes `\034` (which
+  # no awk refuses) and the row COUNT is reconciled against the live finding pairs, so a choked awk
+  # can never read as "nothing to emit".
+  rules_flat="${RULES//$'\n'/$'\034'}"
+  emit_rows="$(printf '%s\n' "$counts" | awk -F'\t' -v rules="$rules_flat" 'NF>=3 {
+      split(rules, R, "\034")
       repl = ""
       for (i in R) { split(R[i], f, "\t"); if (f[1] == $2) repl = f[3] }
       if (repl == "") repl = "(rule not in the table — investigate)"
       printf "%s\t%s\t%s\tportability-baseline: pre-existing, NOT yet repaired — portable replacement is %s\n", $1, $2, $3, repl
-    }'
+    }')" || { echo "❌ --emit-baseline: awk failed to emit the baseline rows — a header with no rows is NOT an empty baseline" >&2; exit 2; }
+  pairs="$(printf '%s\n' "$counts" | awk -F'\t' 'NF>=3' | wc -l | tr -d ' ')"
+  emitted="$(printf '%s\n' "$emit_rows" | awk 'NF>0' | wc -l | tr -d ' ')"
+  if [ "$pairs" != "$emitted" ]; then
+    echo "❌ --emit-baseline: $pairs file/rule pair(s) found but $emitted row(s) emitted — refusing to print an INCOMPLETE baseline (the emit path is a false-PASS surface: an empty or short file reads as 'nothing to grandfather')" >&2
+    exit 2
+  fi
+  printf '%s\n' "$emit_rows"
   exit 0
 fi
 
@@ -1557,7 +1613,11 @@ fi
 printf '%s' "$findings" | awk -F'\t' 'NF>=4 { printf "%s:%s: %s — use %s\n", $1, $2, $3, $4 }'
 
 if [ "$USE_BASELINE" = "0" ] || [ ! -f "$BASELINE" ]; then
-  total="$(printf '%s' "$findings" | awk -F'\t' 'NF>=3' | wc -l | tr -d ' ')"
+  # ⛔ COUNTED WITHOUT AWK (review cycle-18 P1): `... | awk ... | wc -l` reads 0 when awk dies, so a
+  # chokable child produced the verdict "✅ no cross-platform traps" over a non-empty finding list.
+  # A count of non-empty lines cannot fail the same way.
+  total="$(printf '%s\n' "$findings" | grep -c '[^[:space:]]' || true)"
+  [ -n "$total" ] || total=0
   if [ "$total" != "0" ]; then
     echo "❌ $total cross-platform trap(s) found (baseline not consulted)" >&2
     exit 1
