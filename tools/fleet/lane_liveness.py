@@ -587,8 +587,12 @@ def render_report(
 # REPORTED here too — enumerated from durable transcripts by
 # `tools/fleet/fleet_snapshot.py` (never a second copy of the enumeration, and
 # never a second verdict: every row is `liveness.evaluate`'s). It is
-# REPORT-ONLY on purpose: its `dead` is unreachable by design (no durable fenced
-# incarnation), so it must never reach the escalation policy above.
+# REPORT-ONLY on purpose: its `dead` is unreachable by construction (a borrowed
+# incarnation that reads `absent` is the same abstention as an unbound row — an
+# arm in `evaluate`, not an absence of cases), so it must never reach the
+# escalation policy above. It is also measured BEFORE the cmux gate in `main`:
+# a cmux-population failure must not withhold a population whose source is a
+# different directory.
 def dispatch_rows(**kw):
     """``(rows, declaration)`` for the dispatch population, or ``([], why)``.
 
@@ -715,6 +719,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def log(text: str) -> None:
         append_log(ns.log, text)
 
+    # ── the dispatch population is measured FIRST, and on EVERY path ──────
+    # It is enumerated from a DIFFERENT durable source (the session transcripts),
+    # so the cmux half's environment state is not a reason to withhold it. Before
+    # this ordering a cell — which has no `~/.cmuxterm/pi-hook-sessions.json` by
+    # construction — raised EnvError at the store gate below and exited 2 with
+    # NO dispatch section, i.e. the population that exists to cover "lanes the
+    # cmux report cannot see" was absent exactly where it is the only population
+    # and where this PR names it as the point.
+    lib = os.environ.get("PI_PID_IDENTITY_LIB") or liveness.lib_path()
+    disp, disp_decl = dispatch_rows(sessions_dir=ns.sessions_dir, store_path=ns.store,
+                                   task_sessions=ns.task_sessions, now_ms=now_ms, lib=lib)
+    dispatch_section = render_dispatch_section(disp, disp_decl)
     try:
         store_ok, sessions = liveness.load_store(ns.store)
         if not store_ok:
@@ -736,7 +752,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "no lane records in %s: the store may be shape-drifted or all %d "
                 "record(s) are task children" % (ns.store, len(sessions))
             )
-        lib = os.environ.get("PI_PID_IDENTITY_LIB") or liveness.lib_path()
         pairs: List[Tuple[Lane, "liveness.Verdict", "liveness.Evidence"]] = []
         for lane in lanes:
             v, ev = verdict_for(
@@ -744,16 +759,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             pairs.append((lane, v, ev))
     except EnvError as exc:
-        line = "%s ERROR: %s — no verdict, no issue" % (ts, exc)
+        line = "%s ERROR: %s — no cmux verdict, no issue" % (ts, exc)
         print(line, file=sys.stderr)
         log(line)
+        # The dispatch population IS reported on this path: its source is a
+        # different directory, and the box this matters on most (a cell) is
+        # exactly the one that lands here. Exit 2 still means "no cmux verdict",
+        # which is what the launchd log reader needs.
+        print(dispatch_section)
+        log(dispatch_section)
+        if ns.json:
+            print(json.dumps({"lanes": [], "counts": None,
+                              "cmux_unmeasured": str(exc),
+                              "dispatch_lanes": disp,
+                              "dispatch_declaration": disp_decl,
+                              "coverage_gaps": list(COVERAGE_GAPS)}, sort_keys=True))
         return 2
 
     body = render_report(ts, pairs, host=host, escalate_states=ESCALATE_STATES,
                          population_source=population_source)
-    disp, disp_decl = dispatch_rows(sessions_dir=ns.sessions_dir, store_path=ns.store,
-                                   task_sessions=ns.task_sessions, now_ms=now_ms, lib=lib)
-    body += "\n" + render_dispatch_section(disp, disp_decl)
+    body += "\n" + dispatch_section
     dead = [(lane, v, ev) for lane, v, ev in pairs if escalatable(v, ev)]
     counts = {}
     for _lane, v, _ev in pairs:
