@@ -415,7 +415,7 @@ say_case "11. the helper owns the verdict, so a caller cannot announce success o
 # (it sits after the copy-fail and verify-fail gates, which both `exit 1`).
 n_success_lines="$(grep -c 'harness deploy VERIFIED' "$DEPLOY")"
 [ "$n_success_lines" = "1" ] && ok "one success-notification site" || bad "$n_success_lines success-notification sites (expected 1)"
-n_verified_print="$(grep -c 'say "\$PROG: VERIFIED' "$DEPLOY")"
+n_verified_print="$(grep -c 'log_line "\$PROG: VERIFIED' "$DEPLOY")"
 [ "$n_verified_print" = "1" ] && ok "one VERIFIED print site" || bad "$n_verified_print VERIFIED print sites (expected 1)"
 # The helper's non-comment lines are CAPTURED once and tested in the shell: a non-quiet grep piped
 # into `grep -q` is the #841/#864 SIGPIPE false-negative (the quiet grep exits early, the producer
@@ -1187,7 +1187,7 @@ fi
 # at head `orch-loop.sh` carried 21 mentions and `refresh-candidates.sh` 5, while the floors said 20
 # and 4 — reverting a single remedy left both green, which is the defect this arm exists to catch.
 # The rule: each number is `grep -c 'deploy-harness\.sh' <file>` as measured NOW.
-REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1"
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:3 lane-merge.sh:2 spawn-gate.sh:3"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
