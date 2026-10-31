@@ -823,10 +823,11 @@ if [ "$problems" -gt 0 ]; then
     # Measured: putting this arm first narrowed `incomplete:b.sh` to `source-dirty:<sha>` for a
     # dirty-source record with a missing file. Precedence, stated rather than implied:
     # uncommitted-edit > behind/diverged > incomplete > source-dirty > (surface | payload-differs).
-    # ⛔ THE `O_ABSENT` ARM ABOVE PRECEDES ALL OF THESE (review of #3090): with no `$O` compared no
-    # question was asked, so there is nothing to order it against — and it is NOT the `Q_BYTES=0`
-    # surface arm below, where the flag is a real answer rather than the initialisation at the top
-    # of this script.
+    # ⛔ THE `O_ABSENT` ARM PRECEDES ALL OF THESE (review of #3090): no question about `$O` was
+    # answered, so there is nothing to order it against — and it is NOT the `Q_BYTES=0` surface arm
+    # below, where that flag is a real answer rather than the initialisation at the top of the script.
+    # It is reachable only when the SURFACE pass raised `problems` (`SURF_HIT`), so the token still
+    # names a real drift — in another dir — and never a statement about `$O`.
     # ⛔ THE LAST TWO ARE ALTERNATIVES, NOT A CHAIN (review of #3090, on this PR's own comment): the
     # `surface` arm below requires `Q_BYTES=0`, so a surface hit that coincides with `$O`'s own bytes
     # differing falls through to `payload-differs`. A stated chain ending `surface > payload-differs`

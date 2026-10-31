@@ -424,12 +424,15 @@ ck "…and it names the real reason (a manifest line with no path)" \
 
 echo
 echo "── §9g a run with NO \$O compared answers harness=surface, and says nothing was identified ──"
-# ⛔ THIS GRADES A POPULATION NO ASSERTION COVERED BEFORE (review of #3090). A box with no `$O` at
-# all, or a `--surface` run that found no readable record for one, emits `surface` because NOTHING was
-# compared — so `Q_BYTES=0` is the initialisation at the top of the script, NOT an answer about `$O`.
-# §5b grades the OTHER `surface` population (a clean `$O` plus a hit in another dir) and §9e runs with
-# the surface candidates CLEAN, so it reaches the OK summary and prints no token at all. Nothing stated
-# what THIS population's token is, which is why the README could describe it as `Q_BYTES=0`-gated.
+# ⛔ THIS GRADES A POPULATION NO ASSERTION COVERED BEFORE (review of #3090). When `$O` is absent (or a
+# `--surface` run finds no readable record for one) every question about `$O` abstains, and the token
+# block only runs at all because the SURFACE pass raised `problems` — so the token here names the OTHER
+# dir's drift and says nothing about `$O`. §5b grades the other `surface` shape (a clean `$O` plus a
+# hit in another dir) and §9e runs with the surface candidates CLEAN, so it reaches the OK summary and
+# prints no token at all. Nothing stated what THIS shape's token is, which is why the README could
+# describe `surface` as `Q_BYTES=0`-gated. (This comment previously said the arm "emits `surface`
+# because NOTHING was compared" — false, and contradicted by its own fixture needing `c.sh` below:
+# `$O`-absent alone emits no token, so the run must have a surface hit to print one at all.)
 # ⛔ WHAT IT DOES AND DOES NOT PROVE. It DOES redden (2 arms) if this population's token becomes
 # `payload-differs` — measured by mutating the `O_ABSENT` arm to emit it. It does NOT discriminate
 # removal of that arm on its own: every reachable `O_ABSENT` run exits non-zero via a surface HIT, and
@@ -447,6 +450,19 @@ ck "…the identity half reports SKIPPED for the absent \$O" "$(qF "identity: SK
 ck "…and the one-line answer is harness=surface" "$(qF "harness=surface" "$OUT" && echo 0 || echo 1)"
 ck "…and NOT payload-differs, which would name a question nothing asked" \
    "$(qF "harness=payload-differs" "$OUT" && echo 1 || echo 0)"
+# ⛔ AND THE COUNTER-CASE THAT SETTLES WHAT THE TOKEN MEANS (review of #3090, cycle 3): `$O`-absent
+# ALONE emits NO token at all. Without this arm the paragraph in README §4.3 could say the missing
+# `$O` "emits harness=surface" and pass every assertion — which is exactly how that wording drifted
+# twice. The token is printed only under `problems > 0`, so with $O absent it can ONLY come from a
+# surface hit; a clean surface pass reaches the OK summary and stamps nothing.
+no_o_clean="$TMP/clean-absent"; rm -rf "$no_o_clean"; mkdir -p "$no_o_clean"
+cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$no_o_clean/"
+OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$no_o_clean" HARNESS_PIN_DIR="" \
+        HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
+        bash "$DRIFT" --o "$absent_O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+ck "…with \$O absent and a CLEAN surface pass: rc 0 (nothing differs)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and it stamps NO harness= token at all (the token names a drift; there is none)" \
+   "$(qF "harness=" "$OUT" && echo 1 || echo 0)"
 
 echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
