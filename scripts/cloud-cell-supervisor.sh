@@ -18,8 +18,13 @@
 # because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
-#   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
+#   bash cloud-cell-supervisor.sh check|start|stop|status|capacity|logs|apply|prune
 #                                  |doctor|merge|reap|hygiene
+#
+#   capacity   print the box's ONE lane-ceiling line — `cpus=N MAX_LANES=M mem_ceiling=K`,
+#           `pinned=`/`drift=` when a pin exists — and exit. This is the only way to see whether
+#           a cell's `keys.env` disagrees with the derivation WITHOUT starting anything, so it is
+#           named here and not only in the dispatch's usage string (agent-infra#3146).
 #
 #   apply   fetch agent-infra main and PIN this cell's harness to it (agent-infra#1745). This is the
 #           whole of "apply the proper harness"; `start` runs it before every launch, so it is
@@ -285,7 +290,7 @@ WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
-# LANE CEILING — DERIVED on this delivery path too, and a PIN THAT DISAGREES IS LOUD (#3171)
+# LANE CEILING — DERIVED on this delivery path too, and a PIN THAT DISAGREES IS LOUD (#3146)
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # THE RULING IS NOT CHANGED HERE. `MAX_LANES` is DERIVED, not configured: floor(ncpu × 5/2), the
 # fleet's 2026-10-17 lane ruling (docs/ops/ai-drainer.md:49, docs/ops/fleet-harness-baseline.md:137
@@ -310,7 +315,10 @@ log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 # and reddens on any divergence — name it exactly: a comment that points at a suite which does not
 # contain the arm leaves the next editor pinning nothing. (It is behavioural rather than the
 # byte-identity `pin_dirty` uses because the two bodies legitimately differ in naming; what must not
-# differ is what they ANSWER, which is what the five probe scenarios assert.)
+# differ is what they ANSWER, which is what the parity scenarios assert — the CPU-probe ladder AND
+# the memory formula, the latter at a NON-DEFAULT MEM_BUDGET_PCT/LANE_MEM_MB. At the default 75%/512MB
+# a missing clamp is INVISIBLE: this mirror shipped without the drainer's clamps and every probe arm
+# stayed green while it printed 5x the ceiling ai-drainer.sh enforces.
 _lane_is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 _lane_is_limit() { _lane_is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 # Sets LANE_CPU_N / LANE_CPU_MECH in this shell. Order is install.sh:46's, unchanged: sysctl (macOS)
@@ -365,14 +373,31 @@ _lane_mem_avail_mb() {
   case "$mb" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s\n' "$mb"
 }
-_lane_mem_ceiling() { # $1 = mem_avail_mb → "?" when unreadable
+_lane_mem_ceiling() { # $1 = mem_avail_mb → "?" when unreadable; $1 unused + $2=formula → the formula it used
   local avail="${1:-}" floor_mb budget lane_mb usable
-  _lane_is_num "${avail:-}" || { printf '?\n'; return 1; }
   floor_mb="${MIN_MEM_FREE_MB:-512}"; budget="${MEM_BUDGET_PCT:-75}"; lane_mb="${LANE_MEM_MB:-512}"
   _lane_is_num "$floor_mb" || floor_mb=512
   _lane_is_num "$budget"   || budget=75
   _lane_is_num "$lane_mb"  || lane_mb=512
-  [ "$lane_mb" -ge 1 ] || lane_mb=512
+  # ⛔ THE DRAINER'S OWN CLAMPS, not just non-numeric coercion (review P1). `ai-drainer.sh:228-231`
+  # clamps LANE_MEM_MB to >= 1 and MEM_BUDGET_PCT into [1,100] BEFORE its `_capacity_target`, so those
+  # are the numbers it ACTS on. This mirror had only the coercion, so a cell `keys.env` carrying
+  # MEM_BUDGET_PCT=500 reported (9000-512) x 500/100 / 512 = 82 lanes where the drainer holds 16 — and
+  # because the thrash WARN below compares the pin against THIS number, a box pinned at 20 on a real
+  # ceiling of 16 read as "inside its ceiling" and the warning the change exists to add went SILENT.
+  # The library (scripts/lib/lane-ceiling.sh) got these clamps; a mirror without them is exactly the
+  # #1178 "two contracts for one safety rule" the drift arm below exists to prevent — and it could
+  # not see it: every arm ran at the default 75, where neither copy clamps.
+  [ "$budget" -ge 1 ]   || budget=1
+  [ "$budget" -le 100 ] || budget=100
+  [ "$lane_mb" -ge 1 ]  || lane_mb=1
+  # The formula AS PRINTED, from the same clamped values — a WARN that quotes the raw environment
+  # (`MEM_BUDGET_PCT=500%`) beside a ceiling computed from 100% names a formula nobody used.
+  if [ "${2:-}" = formula ]; then
+    printf '(MemAvailable - %sMB) x %s%% / %sMB\n' "$((10#$floor_mb))" "$((10#$budget))" "$((10#$lane_mb))"
+    return 0
+  fi
+  _lane_is_num "${avail:-}" || { printf '?\n'; return 1; }
   usable=$(( (10#$avail - 10#$floor_mb) * 10#$budget / 100 ))
   [ "$usable" -ge 0 ] || usable=0
   printf '%s\n' "$(( usable / 10#$lane_mb ))"
@@ -409,7 +434,7 @@ lane_ceiling_report() {
     log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin DRIFT — the pin disagrees with 2.5 x $ncpu cores (=$derived) and stays in force; the ruling is that MAX_LANES is DERIVED, not configured, so remove the MAX_LANES line from ${ENV_FILE:-keys.env} unless this box is deliberately carved out (docs/ops/fleet-harness-baseline.md:137). Reported, never overwritten."
   fi
   if [ "$memceil" != "?" ] && [ "$memceil" -lt "$((10#$pin))" ]; then
-    log_line "WARN: the pinned MAX_LANES=$pin EXCEEDS this box's memory ceiling ($memceil lanes — (MemAvailable - ${MIN_MEM_FREE_MB:-512}MB) x ${MEM_BUDGET_PCT:-75}% / ${LANE_MEM_MB:-512}MB): the drainer holds the real target at $memceil, so the extra $((10#$pin - memceil)) lane slot(s) are a thrash risk, not capacity (measured: cell-3 ran 10 lanes against a ceiling of 3 and was killed with ENOSPC, agent-infra#3171)"
+    log_line "WARN: the pinned MAX_LANES=$pin EXCEEDS this box's memory ceiling ($memceil lanes — $(_lane_mem_ceiling '' formula)): the drainer holds the real target at $memceil, so the extra $((10#$pin - memceil)) lane slot(s) are a thrash risk, not capacity (measured: cell-3 ran 10 lanes against a ceiling of 3 and was killed with ENOSPC, agent-infra#3146)"
   fi
   return 0
 }
@@ -2675,7 +2700,7 @@ end_loop_pid() { # [<pid> <ident>]
 
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
-  # ⛔ THE BOX'S LANE CEILING, IN ONE LINE, BEFORE ANYTHING STARTS (#3171). `$ENV_FILE` is already
+  # ⛔ THE BOX'S LANE CEILING, IN ONE LINE, BEFORE ANYTHING STARTS (#3146). `$ENV_FILE` is already
   # sourced into this shell by this point, so a `keys.env` MAX_LANES pin is visible here — and this
   # is the ONLY place a cell's ceiling is ever compared to the derivation. A warning at start is the
   # whole point: cell-3's 20-against-a-derivation-of-10 was invisible until it thrashed.
@@ -3542,9 +3567,14 @@ cmd_stop() {
 }
 cmd_status() {
   local cpids own foreign
-  # The ceiling goes in the STATUS report too: `status` is what an operator (and the doctor) reads
-  # when a box is misbehaving, and the answer to "is it over its memory ceiling" belongs there.
-  lane_ceiling_report
+  # ⛔ NOT HERE — the ceiling line goes LAST in this verb (review P2). Two callers read the HEAD of
+  # `status`: `report.sh:114` keeps `head -4` (its first four lines were `controller:` → `supervision:`
+  # → `state dir:` → `queue:`) and `bin/harness:428` keeps `head -1` and matches `controller: RUNNING`.
+  # Leading with `capacity:` pushed the `queue:` line — the #1901 signal that answers "is this cell
+  # pointed at the repo it grades?" — out of report.sh's window, and made bin/harness's `head -1` a
+  # line no arm of its `case` recognises, so a HEALTHY cell was reported as "cannot determine" (a
+  # false UNKNOWN, which that reader treats as not-a-pass). The ceiling is CONTEXT, not the verdict;
+  # `cmd_start` still reports it FIRST, where "before anything starts" is the whole point.
   cpids="$(seen_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to report a controller state from an unreadable read"
   own="$(owned_controller_pids)" \
@@ -3803,6 +3833,9 @@ cmd_status() {
     log_line "  roles: UNKNOWN — cloud-cell-doctor.sh not found (run: $0 apply)"
     [ -f "$ROLES_DIR/.desired" ] && rrc=1
   fi
+  # The ceiling, as the LAST line of `status` — after the verdict, never ahead of the head-1/head-4
+  # readers (see the note at the top of this function).
+  lane_ceiling_report
   return "$rrc"
 }
 

@@ -2,7 +2,7 @@
 # scripts/lib/lane-ceiling.sh — the fleet's ONE lane-ceiling derivation, portable across macOS,
 # Linux and therefore a cmux cloud cell.
 #
-# THE RULING IS NOT BEING CHANGED HERE (contradiction test, agent-infra#3171). `MAX_LANES` is
+# THE RULING IS NOT BEING CHANGED HERE (contradiction test, agent-infra#3146). `MAX_LANES` is
 # **DERIVED, not configured**: `floor(ncpu × 5/2)`, the fleet's 2026-10-17 lane ruling
 # (`docs/ops/ai-drainer.md` §"the target is a measurement", `docs/ops/fleet-harness-baseline.md`
 # §2's "MAX_LANES is derived, not configured — do not 'fix' a per-box MAX_LANES").
@@ -16,7 +16,7 @@
 # (`install.sh:46,87`, `orch-loop.sh:197,243`, `ai-drainer.sh:256`, `spawn-gate.sh:91`) and the
 # cell path derived it ZERO times — a cell's `keys.env` carried a hand-pushed `MAX_LANES` and
 # nothing compared it to the derivation, so cell-3 pinned 20 against a derived 10 with a memory
-# ceiling of 3 and thrashed (#3171). Portability is the part that has to be shared.
+# ceiling of 3 and thrashed (#3146). Portability is the part that has to be shared.
 #
 # Usage:
 #   . scripts/lib/lane-ceiling.sh          # then call lc_* functions
@@ -94,7 +94,7 @@ lc_derive_max_lanes() { # $1 = ncpu
 # formula (`ai-drainer.sh:44`), with the same defaults and the same env names, so a pin on one box
 # is honoured by both. It is REPORTED here precisely because the drainer owns APPLICATION: this
 # file must never quietly narrow a lane count from memory, or the ruling above is reversed by a
-# side effect. #3171's cell-3 is why it must still be visible: 10 lanes running against a memory
+# side effect. #3146's cell-3 is why it must still be visible: 10 lanes running against a memory
 # ceiling of 3 is a thrash, and it should be one printed line, not an inference from the wreckage.
 lc_mem_avail_mb() {
   local p="${LC_PROC_MEMINFO:-/proc/meminfo}" mb
@@ -127,14 +127,18 @@ lc_mem_ceiling() { # $1 = mem_avail_mb → prints the lane ceiling memory would 
   lc_is_num "$floor_mb" || floor_mb=512
   lc_is_num "$budget"   || budget=75
   lc_is_num "$lane_mb"  || lane_mb=512
-  # ⛔ THE DRAINER'S OWN CLAMPS, not just non-numeric coercion (review P2): `ai-drainer.sh:229-231`
+  # ⛔ THE DRAINER'S OWN CLAMPS, not just non-numeric coercion (review P2): `ai-drainer.sh:228-231`
   # clamps MEM_BUDGET_PCT into [1,100] and LANE_MEM_MB to >= 1 BEFORE its `_capacity_target`. Without
   # the same clamps a `keys.env` carrying MEM_BUDGET_PCT=500 would make this report print 5x the
   # ceiling the drainer actually enforces — a second contract for the one number the change exists to
   # unify. This file REPORTS that number; it must report the drainer's, not an unclamped reading.
+  # ⛔ THE LANE FLOOR IS **1**, WHICH IS THE DRAINER'S (`WARN: LANE_MEM_MB=0 — using 1`), not this
+  # file's own 512 default (review P2): 512 is the value used when the seam is UNSET, and using it for
+  # an explicit 0 printed a ceiling 512x smaller than the drainer acts on — a FALSE thrash WARN about a
+  # box that has no binding memory ceiling at all. Same number, same reason, as the supervisor's mirror.
   [ "$budget" -ge 1 ]   || budget=1
   [ "$budget" -le 100 ] || budget=100
-  [ "$lane_mb" -ge 1 ]  || lane_mb=512
+  [ "$lane_mb" -ge 1 ]  || lane_mb=1
   usable=$(( (10#$avail - 10#$floor_mb) * 10#$budget / 100 ))
   [ "$usable" -ge 0 ] || usable=0
   printf '%s\n' "$(( usable / 10#$lane_mb ))"
@@ -142,7 +146,7 @@ lc_mem_ceiling() { # $1 = mem_avail_mb → prints the lane ceiling memory would 
 
 # ── the ONE report line ───────────────────────────────────────────────────────────────────────
 # `cpus=N MAX_LANES=M mem_ceiling=K` on every box start, so a box whose lane count exceeds its
-# memory ceiling is visible in one line rather than inferred from a thrash (item 4, #3171).
+# memory ceiling is visible in one line rather than inferred from a thrash (item 4, #3146).
 # `pinned=` appears only when a pin exists; `drift=1` means the pin disagrees with the derivation.
 lc_report() { # $1 = optional pinned MAX_LANES (env / keys.env)
   local pin="${1:-}" ncpu derived avail memceiling

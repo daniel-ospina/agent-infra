@@ -5233,7 +5233,7 @@ if [ -s "$MERGE" ]; then
 fi
 
 echo
-# ── LANE CEILING: ONE DERIVATION, PORTABLE, AND A DRIFTING PIN IS LOUD (#3171) ──
+# ── LANE CEILING: ONE DERIVATION, PORTABLE, AND A DRIFTING PIN IS LOUD (#3146) ──
 # The ruling is unchanged — MAX_LANES is DERIVED, floor(ncpu × 5/2) — but the DERIVATION was written
 # out four times and the cell path wrote it ZERO times: a cell's `keys.env` carried a hand-pushed
 # MAX_LANES and nothing compared it to the derivation (measured: cell-3, 4 cores → 10, keys.env said
@@ -5275,8 +5275,14 @@ if [ -f "$LC_LIB" ] && [ -f "$SUP_CELL" ]; then
     chmod +x "$_lc/bin/$1"
   }
   # The triple + the probe that answered, from each implementation, under the SAME stubbed PATH.
+  # ⛔ ANY EXTRA `NAME=VALUE` PAIR AFTER THE PATH REACHES BOTH CARRIERS (review P1): with only the PATH
+  # parameterised, every arm ran at the DEFAULT MEM_BUDGET_PCT/LANE_MEM_MB, so the memory formula was
+  # never compared — the mirror shipped without the drainer's clamps and all 14 arms stayed green while
+  # it printed 5x the ceiling ai-drainer.sh enforces.
   _lc_triple_lib() {
-    bash -c 'PATH="$2"; MEM_AVAIL_MB=9000; . "$1"; lc_report' lane-ceiling-lib "$LC_LIB" "$1" 2>/dev/null \
+    local p="$1"; shift
+    env -i PATH="$p" HOME="$_lc" MEM_AVAIL_MB=9000 "$@" \
+      bash -c '. "$1"; lc_report' lane-ceiling-lib "$LC_LIB" 2>/dev/null \
       | sed -n 's/.*cpus=\([0-9]*\) MAX_LANES=\([0-9]*\) mem_ceiling=\([^ ]*\) cpu_probe=\([a-z]*\).*/\1 \2 \3 \4/p' | head -1
   }
   _lc_triple_sup() { # drives the SHIPPED supervisor, not a copy of its logic
@@ -5284,12 +5290,16 @@ if [ -f "$LC_LIB" ] && [ -f "$SUP_CELL" ]; then
       "$_LC_BASH" "$SUP_CELL" capacity 2>/dev/null \
       | sed -n 's/.*cpus=\([0-9]*\) MAX_LANES=\([0-9]*\) mem_ceiling=\([^ ]*\) cpu_probe=\([a-z]*\).*/\1 \2 \3 \4/p' | head -1
   }
-  _lc_parity() { # $1 = arm name, $2 = expected triple
-    local l s rc=1
-    l="$(_lc_triple_lib "$_lc_path")"; s="$(_lc_triple_sup "$_lc_path")"
-    [ -n "$l" ] && [ "$l" = "$s" ] && [ "$l" = "$2" ] && rc=0
-    [ "$rc" -eq 0 ] || echo "      $1: lib='$l' supervisor='$s' want='$2'"
-    ck "lane ceiling mirror: $1 — library and supervisor agree ($2)" $rc
+  _lc_parity() { # $1 = arm name, $2 = expected triple, rest = NAME=VALUE for both carriers
+    local name="$1" want="$2" l s rc=1 _kv
+    shift 2
+    # ONE fixture, both readers: the supervisor sources keys.env, the library gets the same pairs in
+    # its environment, so an arm cannot pass by giving the two carriers different inputs.
+    { printf 'export MEM_AVAIL_MB=9000\n'; for _kv in "$@"; do printf 'export %s\n' "$_kv"; done; } >"$_lc/keys.env"
+    l="$(_lc_triple_lib "$_lc_path" "$@")"; s="$(_lc_triple_sup "$_lc_path")"
+    [ -n "$l" ] && [ "$l" = "$s" ] && [ "$l" = "$want" ] && rc=0
+    [ "$rc" -eq 0 ] || echo "      $name: lib='$l' supervisor='$s' want='$want'"
+    ck "lane ceiling mirror: $name — library and supervisor agree ($want)" $rc
   }
   _lc_reset; _lcstub sysctl 8; _lcstub nproc 4; _lcstub getconf 2
   _lc_parity "sysctl answers first (macOS shape)" "8 20 12 sysctl"
@@ -5312,6 +5322,29 @@ if [ -f "$LC_LIB" ] && [ -f "$SUP_CELL" ]; then
   # A 0-valued probe is a FAILED probe, not "no cores": a 0 reads as a full fleet downstream.
   _lc_reset; _lcstub sysctl FAIL; _lcstub nproc 0; _lcstub getconf FAIL
   _lc_parity "a 0-valued probe is a FAILED probe, not 'no cores'" "4 10 12 fallback"
+  # ⛔ THE MEMORY FORMULA, NOT JUST THE CPU PROBE (review P1). These three arms are the ones that would
+  # have made the mirror's missing clamps RED. `ai-drainer.sh:228-231` clamps LANE_MEM_MB to >= 1 and
+  # MEM_BUDGET_PCT into [1,100]; at the default 75%/512MB neither copy clamps, so the divergence was
+  # invisible in CI while a cell's keys.env (the file an operator actually writes) printed 5x the
+  # ceiling the drainer enforces — and the new "pin EXCEEDS the memory ceiling" WARN went silent on
+  # exactly the box it exists to describe. Expected values are the drainer's own arithmetic:
+  #   (9000-512) x 100/100 / 512 = 16   (MEM_BUDGET_PCT=500 clamped to 100)
+  #   (9000-512) x   1/100 / 512 =  0   (MEM_BUDGET_PCT=0 clamped up to 1)
+  #   (9000-512) x  75/100 /   1 = 6366 (LANE_MEM_MB=0 clamped to the drainer's 1)
+  _lc_reset; _lcstub sysctl 8; _lcstub nproc 4; _lcstub getconf 2
+  _lc_parity "MEM_BUDGET_PCT=500 is CLAMPED to 100 (the drainer's clamp), not multiplied by 5" "8 20 16 sysctl" MEM_BUDGET_PCT=500
+  _lc_parity "MEM_BUDGET_PCT=0 is CLAMPED up to 1 (the drainer's clamp, not 'zero lanes')" "8 20 0 sysctl" MEM_BUDGET_PCT=0
+  _lc_parity "LANE_MEM_MB=0 falls back to the DRAINER's 1, not this file's 512 default" "8 20 6366 sysctl" LANE_MEM_MB=0
+  # The WARN's own formula must print the CLAMPED numbers it used, or it explains a ceiling nobody
+  # computed ("… x 500% …" beside a number derived from 100%).
+  printf 'export MEM_AVAIL_MB=9000\nexport MEM_BUDGET_PCT=500\nexport MAX_LANES=20\n' >"$_lc/clamp.env"
+  _supout="$(env -i PATH="$_lc_path" HOME="$_lc" CELL_HOME="$_lc" ENV_FILE="$_lc/clamp.env" \
+             "$_LC_BASH" "$SUP_CELL" capacity 2>&1)"
+  case "$_supout" in
+    *"EXCEEDS this box's memory ceiling (16 lanes — "*"x 100% / 512MB"*)
+      ck "lane ceiling memory: the thrash WARN FIRES at a clamped budget and quotes the clamped formula" 0 ;;
+    *) ck "lane ceiling memory: the thrash WARN FIRES at a clamped budget and quotes the clamped formula" 1; echo "      got: $_supout" ;;
+  esac
   _lc_reset; _lcstub sysctl 9223372036854775808; _lcstub nproc 4
   _lc_parity "a 19-digit probe is REFUSED (it would wrap to 0, not error)" "4 10 12 nproc"
 
@@ -5357,6 +5390,103 @@ if [ -f "$LC_LIB" ] && [ -f "$SUP_CELL" ]; then
       && ck "lane ceiling: $_lcverb REPORTS it (the one line, at the box's start and status)" 0 \
       || { ck "lane ceiling: $_lcverb REPORTS it (the one line, at the box's start and status)" 1; echo "      $_lcverb does not CALL lane_ceiling_report"; }
   done
+  # ⛔ AND IN `status` IT MUST NOT COME FIRST (review P2). Two callers read the HEAD of `status`:
+  # `report.sh:114` keeps `head -4` for its four-line summary (whose fourth line is the `queue:` signal
+  # that answers "is this cell pointed at the repo it grades?") and `bin/harness:428` keeps `head -1`
+  # and matches `controller: RUNNING|STOPPED|NOT this state dir`. Leading `status` with the capacity
+  # line pushed `queue:` out of one window and left the other matching NO arm — a healthy cell reported
+  # as "cannot determine". Asserted on the body ORDER, so moving the call back to the top reddens.
+  _lc_first="$(sed -n '/^cmd_status() {/,/^}/p' "$SUP_CELL" | grep -vE '^[[:space:]]*(#|local |$)' | sed -n '2p')"
+  case "$_lc_first" in
+    *lane_ceiling_report*) ck "lane ceiling: cmd_status does NOT lead with the capacity line (report.sh head -4 / bin/harness head -1)" 1 ;;
+    "") ck "lane ceiling: cmd_status does NOT lead with the capacity line (report.sh head -4 / bin/harness head -1)" 1; echo "      empty extraction — the check could not see cmd_status" ;;
+    *) ck "lane ceiling: cmd_status does NOT lead with the capacity line (report.sh head -4 / bin/harness head -1)" 0 ;;
+  esac
+
+  # (f) THE MAC DELIVERY PATH (review P1/P1). Zero arms touched install.sh's block, so the P0 this PR's
+  # own body records — a failing `cd` inside `$( )` under `set -euo pipefail` = a silent `exit 1` BEFORE
+  # the plist renders — could be re-armed by deleting one `||` with every shard green, and the report
+  # could be DEAD on the deployed flat layout (`$O/../lib` is `$HOME/lib`) with nothing red.
+  # The block is EXTRACTED from the shipped installer and driven under install.sh's own
+  # `set -euo pipefail`; the two carriers cannot be stubbed differently because the block IS the code.
+  _lcinst_block="$TMP/lcinst_block.sh"
+  awk '/MAC DELIVERY PATH REPORTS AND CHECKS/{f=1} f{print} f&&/^fi$/{exit}' "$INST" >"$_lcinst_block"
+  if grep -q '_LANECAP_LIB=' "$_lcinst_block" && grep -q 'MAX_LANES is DERIVED' "$_lcinst_block"; then
+    ck "lane ceiling install: the block is extracted from the shipped install.sh" 0
+  else
+    ck "lane ceiling install: the block is extracted from the shipped install.sh" 1
+    echo "      extraction found nothing — the installer's lane-ceiling block moved or was deleted"
+  fi
+  cat >"$TMP/lcinst_drive.sh" <<'LCINSTEOF'
+set -euo pipefail
+_NCPU="${LC_NCPU:-4}"; MAX_LANES="${LC_MAX_LANES:-20}"; _MAX_LANES_PIN="${LC_PIN-20}"
+ok()  { printf 'OK %s\n' "$*"; }
+warn(){ printf 'WARN %s\n' "$*" >&2; }
+. "$1"
+printf 'DRIVER-COMPLETED\n'
+LCINSTEOF
+  # $1 = layout dir (holds the copied install.sh), rest = NAME=VALUE for the run. Only the blocks this
+  # extraction needs are supplied by the driver (`_NCPU`/`MAX_LANES`/`_MAX_LANES_PIN`/`ok`/`warn`); the
+  # code under test is the shipped one.
+  _lcinst_run() {
+    local d="$1"; shift
+    env -i PATH="$_lc_path" HOME="$TMP/lcinst" MEM_AVAIL_MB=9000 "$@" \
+      "$_LC_BASH" "$TMP/lcinst_drive.sh" "$d/install.sh" 2>&1
+  }
+  # Layout A: the FLAT deploy as `deploy-mac-orchestrator.sh` now stages it — install.sh beside lib/.
+  rm -rf "$TMP/lcinst"; mkdir -p "$TMP/lcinst/flat/lib" "$TMP/lcinst/bare"
+  # ⛔ THE LAYOUT FILE IS THE EXTRACTED BLOCK, named `install.sh` — NOT the whole installer: sourcing all
+  # 1,800 lines would run past the block into the plist render (and refuse: a fixture layout has no
+  # launchd-cycle.sh), so the arm would grade the wrong lines. The extraction arm above is what proves
+  # the block came from the shipped file; `BASH_SOURCE[0]` then names the LAYOUT dir, which is the only
+  # thing the resolution under test reads.
+  cp "$_lcinst_block" "$TMP/lcinst/flat/install.sh"; cp "$_lcinst_block" "$TMP/lcinst/bare/install.sh"
+  cp "$LC_LIB" "$TMP/lcinst/flat/lib/lane-ceiling.sh"
+  _out="$(_lcinst_run "$TMP/lcinst/flat" LC_NCPU=4 LC_MAX_LANES=20 LC_PIN=20)"
+  case "$_out" in
+    *"capacity: cpus=4 MAX_LANES=20 mem_ceiling=12"*DRIFT*DRIVER-COMPLETED*)
+      ck "lane ceiling install: the FLAT deploy (library at \$O/lib) REPORTS the ceiling and the DRIFT" 0 ;;
+    *) ck "lane ceiling install: the FLAT deploy (library at \$O/lib) REPORTS the ceiling and the DRIFT" 1; echo "      got: $_out" ;;
+  esac
+  # …and the ceiling it prints there is the CLAMPED one, the same number the cell path and the drainer
+  # act on (review P1: the two carriers of "one number" must not disagree at a non-default budget).
+  _out="$(_lcinst_run "$TMP/lcinst/flat" LC_NCPU=4 LC_MAX_LANES=10 LC_PIN=10 MEM_BUDGET_PCT=500)"
+  case "$_out" in
+    *"mem_ceiling=16"*"pinned=10"*) [ "${_out#*DRIFT}" = "$_out" ] \
+      && ck "lane ceiling install: mem_ceiling is the CLAMPED number (MEM_BUDGET_PCT=500 → 16), and an agreeing pin is not drift" 0 \
+      || { ck "lane ceiling install: mem_ceiling is the CLAMPED number (MEM_BUDGET_PCT=500 → 16), and an agreeing pin is not drift" 1; echo "      got: $_out"; } ;;
+    *) ck "lane ceiling install: mem_ceiling is the CLAMPED number (MEM_BUDGET_PCT=500 → 16), and an agreeing pin is not drift" 1; echo "      got: $_out" ;;
+  esac
+  # Layout B: library absent, and a PIN supplied — the P0 case. rc 0 (the guard holds under `set -e`),
+  # the warning NAMES the paths it probed, and it does NOT claim the pinned number was derived.
+  _out="$(_lcinst_run "$TMP/lcinst/bare" LC_NCPU=4 LC_MAX_LANES=30 LC_PIN=30)"; _irc=$?
+  _okrc=1; [ "$_irc" -eq 0 ] && _okrc=0
+  case "$_out" in
+    *"report unavailable"*"bare/../lib (absent)"*"bare/lib (absent)"*"the OPERATOR PIN (not re-derived)"*DRIVER-COMPLETED*)
+      _okrc=$(( _okrc )) ;;
+    *) _okrc=1 ;;
+  esac
+  case "$_out" in
+    *"is still the derived value"*) _okrc=1 ;;
+  esac
+  [ "$_okrc" -eq 0 ] \
+    && ck "lane ceiling install: a MISSING library is a NAMED warning (path + pin wording), never a silent exit" 0 \
+    || { ck "lane ceiling install: a MISSING library is a NAMED warning (path + pin wording), never a silent exit" 1; echo "      rc=$_irc got: $_out"; }
+  # ⛔ NON-VACUITY OF THE GUARD (the P0, re-armed in a SCRATCH COPY, never on the branch): strip
+  # `|| _lc_dir=""` and the same flat-without-library run ABORTS before the plist could render. Without
+  # this arm the suites cannot tell a guarded assignment from an unguarded one, which is the whole P0.
+  mkdir -p "$TMP/lcinst/mut"
+  sed 's/ || _lc_dir=""//' "$_lcinst_block" >"$TMP/lcinst/mut/block.sh"
+  if cmp -s "$_lcinst_block" "$TMP/lcinst/mut/block.sh"; then
+    ck "lane ceiling install: the guard is load-bearing (mutation: an unguarded cd assignment ABORTS under set -e)" 1
+    echo "      the mutation changed nothing — the guard expression moved, so this arm proves nothing"
+  else
+    _mout="$(env -i PATH="$_lc_path" HOME="$TMP/lcinst" MEM_AVAIL_MB=9000 LC_NCPU=4 LC_MAX_LANES=30 LC_PIN=30 \
+               bash -c 'set -euo pipefail; _NCPU="$LC_NCPU"; MAX_LANES="$LC_MAX_LANES"; _MAX_LANES_PIN="$LC_PIN"; ok(){ printf "OK %s\n" "$*"; }; warn(){ printf "WARN %s\n" "$*" >&2; }; . "$1"; printf "DRIVER-COMPLETED\n"' _ "$TMP/lcinst/mut/block.sh" 2>&1)"; _mrc=$?
+    [ "$_mrc" -ne 0 ] && [ "${_mout#*DRIVER-COMPLETED}" = "$_mout" ] \
+      && ck "lane ceiling install: the guard is load-bearing (mutation: an unguarded cd assignment ABORTS under set -e)" 0 \
+      || { ck "lane ceiling install: the guard is load-bearing (mutation: an unguarded cd assignment ABORTS under set -e)" 1; echo "      rc=$_mrc got: $_mout"; }
+  fi
 else
   ck "lane ceiling: scripts/lib/lane-ceiling.sh + cloud-cell-supervisor.sh present" 1
 fi

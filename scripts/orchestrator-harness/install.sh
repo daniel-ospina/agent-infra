@@ -85,7 +85,7 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # cloud-cell-supervisor.sh:1198 records why it has to: the tmux SERVER supplies a new session's
 # environment, so an exported ceiling is silently dropped and would revert to its default.
 # The incoming value, before the default is filled in: a PIN and a DERIVATION are different facts
-# and the report below names which one this run has (#3171).
+# and the report below names which one this run has (#3146).
 _MAX_LANES_PIN="${MAX_LANES:-}"
 MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 # ⛔ BOUND THE DERIVATION, NOT A PINNED VALUE — and only the derivation CAN be out of range here:
@@ -178,7 +178,7 @@ die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
 
-# ── THE MAC DELIVERY PATH REPORTS AND CHECKS THE SAME DERIVATION THE CELL PATH DOES (#3171) ──────
+# ── THE MAC DELIVERY PATH REPORTS AND CHECKS THE SAME DERIVATION THE CELL PATH DOES (#3146) ──────
 # Two delivery paths decide a box's lane ceiling — this renderer writes it into the plist, and a
 # cell's is a hand-pushed `keys.env` constant — and only this one derived it, so the cell could
 # drift with nothing going red (measured: cell-3, 4 cores, derived 10, keys.env carried 20 against a
@@ -187,12 +187,33 @@ warn(){ echo "  ⚠️  $*"; }
 # derivation is REPORTED and a pin that disagrees with it is LOUD, on both paths.
 # `scripts/lib/lane-ceiling.sh` is the ONE implementation of the parts around the number: the probe's
 # mechanism, the memory ceiling, the one-line report, and the drift comparison.
-# ⛔ `|| true` IS LOAD-BEARING (review P0). This file runs under `set -euo pipefail` (line 22), and
-# the deployed mac layout is FLAT — `deploy-mac-orchestrator.sh` stages `scripts/orchestrator-harness`
-# only, so `../lib` does not exist there and the failing `cd` inside `$( )` would make the assignment
-# return 1, which `set -e` turns into a silent `exit 1` BEFORE the plist is rendered. The library is
-# an OBSERVABILITY aid; it must never be able to stop an install.
-_LANECAP_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" 2>/dev/null && pwd)/lane-ceiling.sh" || _LANECAP_LIB=""
+# ⛔ TWO LAYOUTS, BOTH RESOLVED (review P1). This file runs from a CHECKOUT — `<repo>/scripts/
+# orchestrator-harness/install.sh`, library at `../lib` — and from the deployed mac tree, where
+# `deploy-mac-orchestrator.sh` stages `scripts/orchestrator-harness` FLAT into `$O` and the operator
+# runs the documented `bash ~/orchestrator/install.sh --restart`. Probing ONLY `../lib` made the
+# report and the drift check DEAD on that second path: `$O/../lib` is `$HOME/lib`, which no deploy
+# writes, so the box's documented restart took the "unavailable" branch on every run and the drift
+# check never ran exactly where a pin actually drifts. So both are probed — `../lib` (checkout) and
+# `./lib` (the flat deploy, which stages `$O/lib/lane-ceiling.sh`) — and `./lib` is the only path a
+# deploy can put it at, because `$O` IS the harness dir (`$O/../lib` is `$HOME/lib`, still nothing).
+# ⛔ THE `cd` GUARD IS LOAD-BEARING (review P0) — and it is NOT `|| true`: an earlier draft said
+# `|| true`, and a comment that names code which is not here is how the next editor deletes the real
+# guard, so this one quotes the shipped expression. This file runs under `set -euo pipefail` (line 22),
+# and the probe below `cd`s into a candidate directory that OFTEN DOES NOT EXIST (`$HOME/lib` on the
+# deployed tree): an unguarded `X="$(cd … && pwd)"` returns 1 there, which `set -e` turns into a
+# silent `exit 1` BEFORE the plist is rendered. The library is an OBSERVABILITY aid; it must never be
+# able to stop an install. selftest.sh proves BOTH halves: the shipped block completes with no library
+# at all, and a scratch copy with the guard deleted ABORTS under the same `set -euo pipefail`.
+_LANECAP_HERE="$(dirname "${BASH_SOURCE[0]}")"
+_LANECAP_LIB=""; _LANECAP_PROBED=""
+for _lc_rel in ../lib lib; do
+  # `../lib` = a CHECKOUT; `lib` = the FLAT deploy (`$O` IS the harness dir, so `$O/lib` is the only
+  # path a deploy can place the library at).
+  _lc_dir="$(cd "$_LANECAP_HERE/$_lc_rel" 2>/dev/null && pwd)" || _lc_dir=""
+  [ -n "$_lc_dir" ] || { _LANECAP_PROBED="$_LANECAP_PROBED${_LANECAP_PROBED:+, }$_LANECAP_HERE/$_lc_rel (absent)"; continue; }
+  _LANECAP_PROBED="$_LANECAP_PROBED${_LANECAP_PROBED:+, }$_lc_dir/lane-ceiling.sh"
+  if [ -z "$_LANECAP_LIB" ] && [ -f "$_lc_dir/lane-ceiling.sh" ]; then _LANECAP_LIB="$_lc_dir/lane-ceiling.sh"; fi
+done
 if [ -f "$_LANECAP_LIB" ]; then
   # shellcheck source=../lib/lane-ceiling.sh
   . "$_LANECAP_LIB"
@@ -205,13 +226,30 @@ if [ -f "$_LANECAP_LIB" ]; then
   _LC_MEM="$(lc_mem_ceiling "$(lc_mem_avail_mb 2>/dev/null)" 2>/dev/null)" || _LC_MEM="?"
   ok "capacity: cpus=$_NCPU MAX_LANES=$MAX_LANES mem_ceiling=${_LC_MEM:-?}$([ -n "$_MAX_LANES_PIN" ] && printf ' pinned=%s' "$_MAX_LANES_PIN")"
   ok "          MAX_LANES is DERIVED (floor(ncpu x 5/2)); mem_ceiling is the drainer's second ceiling — REPORTED here, applied only by ai-drainer.sh"
-  if [ -n "$_MAX_LANES_PIN" ] && ! lc_drift "$_MAX_LANES_PIN" "$_NCPU" >/dev/null 2>&1; then
-    warn "DRIFT: MAX_LANES='$_MAX_LANES_PIN' is pinned, but the derivation for $_NCPU cores is $(lc_derive_max_lanes "$_NCPU"). The pin stays in force — it is yours, and a renderer that rewrote it would turn a visible disagreement into a silent one — but MAX_LANES is DERIVED, not configured (docs/ops/fleet-harness-baseline.md:137): remove the pin unless this box is deliberately carved out."
+  if [ -n "$_MAX_LANES_PIN" ]; then
+    # ⛔ rc 2 IS NOT rc 1 (review P3): `lc_drift` returns 2 when the pin is not a usable magnitude, and
+    # folding that into DRIFT prints "MAX_LANES='abc' is pinned, but the derivation for 8 cores is 20"
+    # — a comparison that was never made, because there is no value to compare. Both are defects and
+    # both are reported; the message says WHICH (the supervisor's report draws the same distinction).
+    if lc_drift "$_MAX_LANES_PIN" "$_NCPU" >/dev/null 2>&1; then :
+    else
+      _lc_rc=$?
+      _lc_derived="$(lc_derive_max_lanes "$_NCPU")" || _lc_derived="?"
+      if [ "$_lc_rc" -eq 2 ]; then
+        warn "UNUSABLE PIN: MAX_LANES='$_MAX_LANES_PIN' is pinned, but it is not a whole-number magnitude (at most nine digits), so it cannot be the lane ceiling it names and NO comparison with the derivation was made. The derivation for $_NCPU cores is $_lc_derived. The pin stays in force — it is yours, and a renderer that rewrote it would turn a visible disagreement into a silent one — but MAX_LANES is DERIVED, not configured (docs/ops/fleet-harness-baseline.md:137): fix or remove the pin unless this box is deliberately carved out."
+      else
+        warn "DRIFT: MAX_LANES='$_MAX_LANES_PIN' is pinned, but the derivation for $_NCPU cores is $_lc_derived. The pin stays in force — it is yours, and a renderer that rewrote it would turn a visible disagreement into a silent one — but MAX_LANES is DERIVED, not configured (docs/ops/fleet-harness-baseline.md:137): remove the pin unless this box is deliberately carved out."
+      fi
+    fi
   fi
 else
-  # ⛔ A MISSING LIBRARY IS SAID OUT LOUD, never silently skipped: a box that cannot report its own
-  # ceiling is the state this change exists to end, so it is named with the path that was missing.
-  warn "lane-ceiling report unavailable — $_LANECAP_LIB is missing (harness dir materialised without scripts/lib). MAX_LANES=$MAX_LANES is still the derived value; the one-line report and the drift check did not run."
+  # ⛔ A MISSING LIBRARY IS SAID OUT LOUD, never silently skipped — and it NAMES the paths it probed
+  # (review P3: clearing `_LANECAP_LIB` to "" on failure printed "—  is missing", so the observability
+  # half of this feature named nothing), and it does NOT claim a pinned number was derived (review P2:
+  # `MAX_LANES=30 is still the derived value` on an 8-core box whose derivation is 20 — false whenever
+  # the pin supplied the number).
+  _lc_what="$([ -n "$_MAX_LANES_PIN" ] && printf 'the OPERATOR PIN (not re-derived)' || printf 'still the derived value')"
+  warn "lane-ceiling report unavailable — none of these exists: ${_LANECAP_PROBED:-<harness dir unresolved>} (the harness dir was materialised without scripts/lib). MAX_LANES=$MAX_LANES is $_lc_what; the one-line report and the drift check did not run."
 fi
 
 # ── the LABEL guard: a non-default label is a sandbox seam, never a real install ─────────────
