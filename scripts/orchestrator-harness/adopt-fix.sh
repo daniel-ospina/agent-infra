@@ -21,7 +21,12 @@ if [ "$ADOPT_ASSERT_RC" -ne 0 ]; then
   echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the checkout $REPO_ABS is not $OR; nothing fetched, no worktree built, no attempt consumed" >> "$O/logs/adopt-$PR.log"
   exit "$ADOPT_ASSERT_RC"
 fi
-git fetch origin "$BR" --quiet 2>/dev/null || true
+# ⛔ NAME THE DESTINATION (#3009): a bare `fetch origin "$BR"` leaves FETCH_HEAD and creates
+# `refs/remotes/origin/$BR` only when the clone's configured refspec maps that source — true on a
+# full clone, FALSE on a cell's single-branch clone, where `git worktree add "$WT" "$BR"` then has
+# no remote-tracking branch to DWIM from and the adoption dies before the fixer starts.
+# The leading `+` tolerates the force-push a PR branch routinely gets.
+git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet 2>/dev/null || true
 WT=".worktrees/adopt-$PR"
 # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
 # `pipefail` would re-run `worktree add` over an existing worktree and abort (#864).

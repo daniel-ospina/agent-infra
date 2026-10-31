@@ -361,6 +361,32 @@ else
     bad "MUTANT: bare fetch failed outright — the fixture cannot model the original bug"
 fi
 
+# ── L. THE SAME DEFECT ON THE SIBLING INGRESSES: #3009 IS A CHAIN, NOT ONE FILE ─────────────
+# The actuator fixed above is the DISPATCH path. The other three scripts in the same chain fetch a PR
+# branch themselves before they can materialise or read it, and all three carried the identical bare
+# `fetch origin "$BR"`. On a cell's single-branch clone that fetch returns 0, creates nothing, and the
+# next line asks for the ref it just declined to create — for `fix-one.sh` with a FABRICATED diagnosis
+# (`branch is not in <OR> — a BRANCH/REPO mismatch`), which accuses the wrong repo.
+#
+# STATED LIMIT: these three are pinned STRUCTURALLY (fixed-string grep), not driven — each needs live
+# gates, a lane table, or a claim taken before it will run, so a fixture that drove them would be a
+# second implementation of the chain. The BEHAVIOUR of the exact refspec form is measured above, on a
+# real single-branch clone, and this section pins that the same form is what these scripts carry and
+# that the bare form is GONE from them (a fix in one file only is how this bug class survives).
+for _sib in scripts/orchestrator-harness/fix-one.sh \
+            scripts/orchestrator-harness/adopt-fix.sh \
+            scripts/orchestrator-harness/merge-one.sh; do
+    if [ -f "$HERE/../$_sib" ]; then
+        _txt="$(cat "$HERE/../$_sib")"
+        assert_contains "$_txt" 'fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"' \
+            "$_sib fetches with the explicit destination refspec (#3009, chain-wide)"
+        assert_not_contains "$_txt" 'git fetch origin "$BR" --quiet' \
+            "$_sib carries no bare 'fetch origin \$BR' (the shape that creates no tracking ref)"
+    else
+        bad "$_sib is missing — the chain cannot be pinned without it"
+    fi
+done
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

@@ -4748,6 +4748,66 @@ def test_the_cascade_fix_arm_names_the_class_it_is_reporting(monkeypatch):
     assert "fix->" not in casc[0], casc[0]
 
 
+def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
+    """A NO SLOT arm must name the term that is actually 0, not a hardcoded class.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 4): both arms printed `"<class> budget 0"`, but the
+    gate is `_eff(c) = min(budgets[c], budgets["total"])`. With the documented `--max 0` override
+    `budgets` is `{'fix': 3, 'review': 3, 'total': 0}`, so the line said
+
+        slots=0 merge->NO SLOT (review budget 0: inflight=0 alive=0 unproven=0)
+
+    — `MAX_REVIEW` was 3 and the appended numbers say nothing holds a slot, so the sentence named a
+    cause its own evidence refuted and sent the operator at the wrong knob. The arm must name the
+    AGGREGATE ceiling when that is the binding term, and the CLASS when the class is 0. Both
+    directions are pinned here so neither can be satisfied by a string that fits one of them.
+    """
+    # (a) the aggregate ceiling binds while the class budget is healthy -> name the ceiling.
+    monkeypatch.setenv("MAX_FIX", "3")
+    monkeypatch.setenv("MAX_REVIEW", "3")
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(62)], ("record-review", "why", []),
+        argv=("pr-doctor.py", "--max", "0"))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->NO SLOT" in casc[0], casc[0]
+    assert "aggregate ceiling" in casc[0], casc[0]
+    assert "review budget 0:" not in casc[0], casc[0]
+
+    # (b) the CLASS budget binds (and the ceiling is healthy) -> still name the class, honestly.
+    monkeypatch.setenv("MAX_REVIEW", "0")
+    _rc, joined, _payload = _drive_pass(
+        monkeypatch, [_pr(63)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "review->NO SLOT (review budget 0:" in casc[0], casc[0]
+    assert "aggregate ceiling" not in casc[0], casc[0]
+
+
+def test_the_cascade_rung2_total_is_not_reported_as_a_class_count(monkeypatch):
+    """`fix=` is the RUNG-2 total, and it must not read as a fix-CLASS count.
+
+    ⛔ THE MEASURED DEFECT (review P2, round 4): `_r2 = sum(_r2_by_class.values())` spans both budget
+    classes, while the arms below name a class (`fix->` / `review->`). A pass whose only rung-2 row
+    was `record-review` therefore printed
+
+        cascade: order=merge>fix>wait merge=0 fix=1 wait=0 slots=6 review->candidate (1), review slots=3
+
+    — `fix=1` on a pass with NO fix-class row at all: one label, two quantities. The split is now
+    printed beside the total whenever a review-class row exists, so the line cannot be misread.
+    """
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(64)], ("record-review", "why", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix=1(fix 0/review 1)" in casc[0], casc[0]
+    # and the fix-only case keeps the plain token, because there the total IS the class count.
+    _rc, joined, _payload = _drive_pass(monkeypatch, [_pr(65)], ("fix-ci", "red", []))
+    casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
+    assert len(casc) == 1, joined
+    assert "fix=1 " in casc[0] + " ", casc[0]
+    assert "(fix " not in casc[0], casc[0]
+
+
 def test_two_failed_file_reads_stop_the_per_pr_requests_but_still_refuse(monkeypatch):
     """The per-PR read is BOUNDED: after two failures the pass stops asking, and still refuses.
 

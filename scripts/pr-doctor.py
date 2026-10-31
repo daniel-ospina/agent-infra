@@ -5172,9 +5172,20 @@ def run_pass(args, rubric_note: str = "") -> int:
               for k in ("skipped-running", "skipped-unreadable", "skipped-surface_unreadable",
                         "skipped-surface_partial", "skipped-surface_abandoned"))
     _held = counts.get("skipped-surface", 0)   # ASK-USER: held for a HUMAN, not for a re-read
+    # ⛔ RUNG 2 SPANS TWO CLASSES, SO ITS TOTAL IS NOT A CLASS COUNT (review P2, round 4). `fix=%d`
+    # printed `_r2` -- the sum over BOTH budget classes -- while the arms below name a CLASS
+    # (`fix->` / `review->`). So a pass whose only rung-2 row was `record-review` read
+    # `fix=1 ... review->candidate (1)`: one label, two quantities, the same defect this block
+    # fixed for `held=`. The rung total stays (it is the ladder count, `order=merge>fix>wait`); the
+    # class split is printed beside it whenever a REVIEW-class row exists, so `fix=` can never be
+    # read as a fix-class count it does not hold.
+    _r2_split = ""
+    if _r2_by_class.get("review"):
+        _r2_split = "(fix %d/review %d)" % (_r2_by_class.get("fix", 0),
+                                            _r2_by_class.get("review", 0))
     _casc = ["order=merge>fix>wait",
              "merge=%d" % _r1,
-             "fix=%d" % _r2,
+             "fix=%d%s" % (_r2, _r2_split),
              "wait=%d" % _r3]
     # ⛔ ONE LABEL, ONE QUANTITY (review P2, 2026-10-31). This term is the ASK-USER count ALONE; the
     # "nothing dispatchable" arm below prints `_r3 + _held`. Naming both `held=` emitted
@@ -5212,10 +5223,25 @@ def run_pass(args, rubric_note: str = "") -> int:
     # THE EFFECTIVE SLOTS ARE THE BINDING ONE: the loop breaks on the aggregate AND refuses per class.
     def _eff(_c):
         return min(budgets[_c], budgets["total"])
+
+    # ⛔ THE NO-SLOT ARM MUST NAME THE CONSTRAINT THAT ACTUALLY BOUND (review P2, round 4). Both arms
+    # hardcoded `"<class> budget 0"`, but `_eff` is `min(budgets[cls], budgets["total"])` -- so with
+    # the documented `--max 0` override (`{'fix': 3, 'review': 3, 'total': 0}`) the arm told the
+    # operator `review budget 0` while `MAX_REVIEW` was 3, sending them at the wrong knob. The
+    # appended `_noslot` numbers contradicted it in the same clause (`inflight=0 alive=0 unproven=0`
+    # says nothing holds a slot). Name the BINDING term: the class, the aggregate, or both.
+    def _why(_c):
+        _cls_b, _tot = budgets[_c], budgets["total"]
+        if _cls_b <= 0 and _tot <= 0:
+            return "%s budget 0 and the aggregate ceiling (--max) 0" % _c
+        if _tot <= 0:
+            return "the aggregate ceiling (--max) 0, %s budget %d" % (_c, _cls_b)
+        return "%s budget 0" % _c
+
     if _r1:
         _e = _eff("review")
         _casc.append("merge->candidate (%d), the rail decides; review slots=%d" % (_r1, _e)
-                     if _e > 0 else "merge->NO SLOT (review budget 0: %s)" % _noslot)
+                     if _e > 0 else "merge->NO SLOT (%s: %s)" % (_why("review"), _noslot))
     for _cls in ("fix", "review"):
         _n = _r2_by_class.get(_cls, 0)
         if not _n:
@@ -5223,7 +5249,7 @@ def run_pass(args, rubric_note: str = "") -> int:
         _e = _eff(_cls)
         _casc.append("%s->candidate (%d), %s slots=%d" % (_cls, _n, _cls, _e)
                      if _e > 0
-                     else "%s->NO SLOT (%s budget 0: %s)" % (_cls, _cls, _noslot))
+                     else "%s->NO SLOT (%s: %s)" % (_cls, _why(_cls), _noslot))
     # ⛔ "NOTHING TO DISPATCH" IS A CLAIM ABOUT THE WHOLE QUEUE, NOT ABOUT TWO RUNGS (found by the
     # new pin, 2026-10-31). The arm fired on `not _r1 and not _r2` alone, so once `wait=` was made
     # honest the line read `wait=1 slots=7 nothing to dispatch (no mergeable, no repairable)` -- a
