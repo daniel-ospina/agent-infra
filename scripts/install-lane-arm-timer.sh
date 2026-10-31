@@ -78,10 +78,6 @@ done
 # Resolve the binary ONCE, before any verb. `|| echo systemctl` kept the variable NON-empty when
 # systemctl does not exist, so every call below silently failed under `|| true` and the uninstall still
 # printed "uninstalled" having removed nothing.
-if [ -z "$SYSTEMCTL" ] && [ "$OS" = linux ]; then
-  SYSTEMCTL="$(command -v systemctl || true)"
-fi
-
 say() { printf '%s\n' "$*"; }
 fail() { say "FAIL: $*" >&2; exit 1; }
 
@@ -93,6 +89,13 @@ os_kind() {
   esac
 }
 OS="$(os_kind)"
+
+# ⛔ AFTER `OS` IS SET. This block sat above `OS="$(os_kind)"` for one revision and, under `set -u`,
+# every verb died with "OS: unbound variable" before doing anything -- a load-time crash that the
+# install path never reached because it is only exercised after the verb switch.
+if [ -z "$SYSTEMCTL" ] && [ "$OS" = linux ]; then
+  SYSTEMCTL="$(command -v systemctl || true)"
+fi
 
 # ⛔ VALIDATE BEFORE RENDERING. systemd splits an unquoted value on whitespace, and launchd/plist
 # values are XML — so a HOME / scripts dir / state dir containing a SPACE renders an artifact that
@@ -121,7 +124,16 @@ Type=oneshot
 Environment=HOME=$HOME
 Environment=LANE_ARM_SCRIPTS=$SCRIPTS_DIR
 Environment=LANE_ARM_STATE=$STATE_DIR
-ExecStart="/bin/bash $ARM"
+# ⛔ UNQUOTED, DELIBERATELY. systemd splits an ExecStart into words HONOURING quotes, and the FIRST
+# word is the executable — so the QUOTED whole-line form is ONE token and the service cannot exec at
+# any fire, while 'enable --now' and 'list-timers' still print "installed". That is the false PASS this
+# installer exists to prevent, reproduced at the level of the unit file. Every other template in this
+# repo renders the house form unquoted (eldato-disk-reaper.service, eldato-harness-apply.service), and
+# the spaced-path case is REFUSED above rather than quoted — so quoting is both unnecessary and harmful.
+# (Named in prose, not in backticks: see the heredoc rule immediately below — this comment lives INSIDE
+# the expansion heredoc, so a backticked span here would run as a command substitution and corrupt the
+# unit. That is the recorded regression this file already carries a rule about.)
+ExecStart=/bin/bash $ARM
 # NOT 'Restart=' and NOT 'SuccessExitStatus=4': exit 4 means "could not measure", and a timer that
 # swallows it is the no-op gate this repo keeps removing. The failure stays visible in
 # 'systemctl --failed' and in the journal.
