@@ -1596,8 +1596,18 @@ ck "NO_WAIT: every bounded caller sets it for the layer AND still imports [${_po
 # ⛔ L10. THE MUTATION STAMP MUST BE WRITTEN UNDER THE ATTEMPT LOCK, at the moment the request leaves.
 # Measured, three concurrent processes: 1.014 s / 1.002 s gaps. Stamping outside the lock (or before
 # it) is what let a lock-holding competitor compress two mutations below the gap.
-_disp="$(sed -n '/^def dispatch(/,/^def run_attempt/p' "$HELPER")"
-_lock_at="$(printf '%s\n' "$_disp" | grep -n 'lock = acquire_lock()' | head -1 | cut -d: -f1)"
+# ⛔ THE RANGE IS `_dispatch`, NOT `dispatch` (rebased head, measured). `dispatch()` is the meter probe;
+# it takes its own `acquire_lock(strict=True)` and `mark_mutation` lives in `_dispatch` — so the old
+# `def dispatch(` range spanned BOTH functions and this pin passed only because the METER's lock happened
+# to be spelled `lock = acquire_lock()`. Main now spells it `strict=True`, the anchor vanished, and the
+# arm reported the invariant BROKEN while it held. It is anchored on the function the comment names.
+_disp="$(sed -n '/^def _dispatch(/,/^def run_attempt/p' "$HELPER")"
+# ⛔ AND ON THE NON-STRICT CALL, not on the assignment's spelling: #3099 made the attempt lock
+# CONDITIONAL (`lock = None if makes_no_request_strictly(gh_argv) else acquire_lock()`), and an anchor of
+# `lock = acquire_lock()` would have survived the LESS correct spelling only. The three
+# `acquire_lock(strict=True)` meter probes are outside this range AND carry an argument; a `_dispatch`
+# that takes no attempt lock at all still fails here (empty `_lock_at`).
+_lock_at="$(printf '%s\n' "$_disp" | grep -n 'acquire_lock()' | head -1 | cut -d: -f1)"
 _mark_at="$(printf '%s\n' "$_disp" | grep -n 'mark_mutation()' | head -1 | cut -d: -f1)"
 ck "mutative: the send stamp is written AFTER the attempt lock, inside it (not at reservation time)" \
    "$([ -n "$_lock_at" ] && [ -n "$_mark_at" ] && [ "$_lock_at" -lt "$_mark_at" ] && echo 0 || echo 1)"

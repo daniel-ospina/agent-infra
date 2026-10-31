@@ -2862,7 +2862,17 @@ def makes_no_request_strictly(argv):
     So this predicate is an exact allow-list of forms whose argv is PROVABLY local, and everything
     else — including every form `makes_request()` merely cannot attribute — keeps the lock. The cost
     of a MISS here is one serialised local read (a queue, i.e. today's behaviour); the cost of a
-    false POSITIVE is an unserialised API call."""
+    false POSITIVE is an unserialised API call.
+
+    ⛔ `reaches_api()` IS NOT IT EITHER, AND FOR THE SAME REASON IN THE OTHER DIRECTION. It answers the
+    BUDGET question (#2342), whose safe default is the opposite — "an argv I cannot attribute is
+    assumed to spend the pool" — so it answers False for `gh api rate_limit` (an exempt call that IS a
+    real request), for anything in `NO_REQUEST` (which includes the `alias`/`config` WRITE forms), and
+    for any argv carrying a help-looking token via `NO_REQUEST_ANY` (`gh issue create -t help` is a
+    real mutation with a title). Keyed on it the lock would be skipped for a live meter call, for two
+    concurrent `gh config set`s that then lose a setting, and for a mutation whose title is `help`.
+    Three predicates, three questions, three safe defaults: this file deliberately derives none of
+    them from another."""
     if not argv:
         return True                      # bare `gh` prints help
     if argv[0] in ("alias", "config"):
