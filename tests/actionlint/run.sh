@@ -90,7 +90,7 @@ echo "== Case 4: ci-main.yml — every post-merge job is wired into the failure 
 # `sigpipe-grep-guard` job was missing from that list while every sibling guard
 # was present.
 if python3 -c 'import yaml' >/dev/null 2>&1; then
-  case4_out="$(python3 - "$CI_MAIN" <<'PY' 2>&1
+  _case4_py() { python3 - "$CI_MAIN" <<'PY' 2>&1
 import sys, yaml
 jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
 filer = "auto-file-on-failure"
@@ -104,10 +104,11 @@ if missing:
     print("missing from auto-file-on-failure.needs: " + ", ".join(missing))
     sys.exit(1)
 PY
-)" && case4_rc=0 || case4_rc=1
+  }
+  case4_out="$(_case4_py)" && case4_rc=0 || case4_rc=1
 elif ruby -ryaml -e '' >/dev/null 2>&1; then
   # The CI runner's python3 has NO PyYAML by default (2f34ed3); ruby does.
-  case4_out="$(ruby -ryaml - "$CI_MAIN" <<'RB' 2>&1
+  _case4_rb() { ruby -ryaml - "$CI_MAIN" <<'RB' 2>&1
 jobs = YAML.load_file(ARGV[0])["jobs"]
 filer = "auto-file-on-failure"
 abort("no auto-file-on-failure job — the post-merge failure filer is gone") unless jobs.key?(filer)
@@ -115,7 +116,8 @@ needs = Array(jobs[filer]["needs"])
 missing = jobs.keys.reject { |j| j == filer || needs.include?(j) }.sort
 abort("missing from auto-file-on-failure.needs: " + missing.join(", ")) unless missing.empty?
 RB
-)" && case4_rc=0 || case4_rc=1
+  }
+  case4_out="$(_case4_rb)" && case4_rc=0 || case4_rc=1
 else
   case4_rc=2
 fi
@@ -163,7 +165,7 @@ if ! command -v node >/dev/null 2>&1; then
 else
   case5_rc=2
   if python3 -c 'import yaml' >/dev/null 2>&1; then
-    case5_out="$(python3 - "$ROOT" "$CASE5_JSON" <<'PY' 2>&1
+    _case5_py() { python3 - "$ROOT" "$CASE5_JSON" <<'PY' 2>&1
 import glob, json, os, sys, yaml
 root, out = sys.argv[1], sys.argv[2]
 pats = (".github/workflows/*.yml", ".github/workflows/*.yaml",
@@ -201,10 +203,11 @@ for pat in pats:
                     skipped.append(f"{rel} job={jn} step={i} (github-script with no string script:)")
 json.dump({"bodies": found, "skipped": skipped}, open(out, "w"))
 PY
-)" && case5_rc=0 || case5_rc=1
+    }
+    case5_out="$(_case5_py)" && case5_rc=0 || case5_rc=1
   elif ruby -ryaml -e '' >/dev/null 2>&1; then
     # The CI runner's python3 has NO PyYAML by default (2f34ed3); ruby does.
-    case5_out="$(ruby -ryaml -rjson - "$ROOT" "$CASE5_JSON" <<'RB' 2>&1
+    _case5_rb() { ruby -ryaml -rjson - "$ROOT" "$CASE5_JSON" <<'RB' 2>&1
 require 'yaml'
 require 'json'
 root, out = ARGV
@@ -245,7 +248,8 @@ pats.each do |pat|
 end
 File.write(out, JSON.generate({ "bodies" => found, "skipped" => skipped }))
 RB
-)" && case5_rc=0 || case5_rc=1
+    }
+    case5_out="$(_case5_rb)" && case5_rc=0 || case5_rc=1
   else
     case5_rc=2
   fi
@@ -256,7 +260,7 @@ RB
       fail "github-script body extraction failed: $case5_out"
     fi
   else
-    case5_node="$(node - "$CASE5_JSON" <<'JS' 2>&1
+    _case5_js() { node - "$CASE5_JSON" <<'JS' 2>&1
 const fs = require('fs');
 const OPEN = '$' + '{{';
 const data = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -399,7 +403,8 @@ problems.forEach((pr) => console.log('      ' + pr));
 if (problems.length) process.exit(1);
 console.log(String(bodies.length));
 JS
-)"
+    }
+    case5_node="$(_case5_js)"
     case5_nrc=$?
     case "$case5_nrc" in
       0) pass "all $case5_node github-script body/bodies compile and embed no expression" ;;
