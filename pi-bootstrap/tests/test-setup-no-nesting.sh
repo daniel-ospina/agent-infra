@@ -1557,6 +1557,27 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed claim_lanes.py differs from (or is missing vs) tools/fleet/claim_lanes.py"
   fi
+  # #1178 `one-instrument-two-populations` — the BOX reading the scheduled driver now
+  # imports for its `### Dispatch lanes` section. Farming the driver without this
+  # module makes that import fail on EVERY box, so the section renders
+  # `UNMEASURED(fleet_snapshot.py not farmed beside this driver)` forever — the
+  # "older farm" transition the driver's ImportError arm describes never ages by
+  # itself. Importing it here (not just diffing it) also proves the sibling
+  # classifier sits beside it, which is the seam that actually breaks first.
+  if diff -q "$ROOT/tools/fleet/fleet_snapshot.py" "$DEST/scripts/fleet/fleet_snapshot.py" >/dev/null 2>&1; then
+    echo "ok: $label farmed fleet_snapshot.py == repo copy (#1178)"
+  else
+    fail "$label: fleet_snapshot.py is missing from (or stale in) scripts/fleet/ — the scheduled report's dispatch section would render UNMEASURED on every box"
+  fi
+  local snap_out snap_rc
+  snap_out="$(cd "$TMP" && env HOME="$HOME_DIR" \
+         PI_PID_IDENTITY_LIB="$DEST/scripts/lib/pid-identity.sh" \
+         python3 -c 'import sys; sys.path.insert(0, "'"$DEST"'/scripts/fleet"); import fleet_snapshot' 2>&1)" && snap_rc=0 || snap_rc=$?
+  if [ "$snap_rc" -eq 0 ]; then
+    echo "ok: $label farmed fleet_snapshot.py imports its classifier from the farmed layout"
+  else
+    fail "$label: farmed fleet_snapshot.py failed to import (rc=$snap_rc): $(head -1 <<<"$snap_out")"
+  fi
   # The farmed driver must actually start from the farmed layout: it imports its
   # sibling classifier and forks the shared identity library. `--help` is the
   # read-only mode (no cmux call, no store read, no issue); the pinned
