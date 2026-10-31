@@ -1107,7 +1107,7 @@ wt_launcher_env() {
   # with no gh anywhere cannot run a lane at all, and refusing loudly — before the session starts, via
   # `wt_spawn`'s caller-side pre-flight — is the documented fail-closed policy for that shape, not a
   # file credit the worker's own gh could never spend.
-  # ⛔ THE GUARD NAMES WHICH FAULT IT HIT (#3099). `exit 98` used to mean EVERYTHING — an absent
+  # ⛔ THE GUARD NAMES WHICH FAULT IT HIT (#3138). `exit 98` used to mean EVERYTHING — an absent
   # credential, an unreadable store, AND "the local read had not finished when its 10 s bound expired" —
   # so the operator's only signal was one opaque number, and the log read `the credential contract this
   # launch line carries FAILS (rc=98)` for a credential that was PRESENT and a probe that was QUEUED.
@@ -1959,13 +1959,13 @@ wt_spawn() { # wt_spawn <name> <cwd> <command...>  -> 0 spawned, 1 not spawned (
             *) pre_where=" (this caller's environment; the tmux server did NOT answer within ${WT_PROBE_TIMEOUT:-15}s, so what it carries is UNKNOWN — not established as absent)" ;;
           esac
         fi
-        # ⛔ AND IT NAMES WHICH FAULT IT HIT, NOT JUST THE NUMBER (#3099). "the credential is absent" and
+        # ⛔ AND IT NAMES WHICH FAULT IT HIT, NOT JUST THE NUMBER (#3138). "the credential is absent" and
         # "the probe could not answer in time" produce the SAME refusal and DIFFERENT remedies, and the
         # 9-hour merge stall this change comes from was a probe TIMEOUT reported as a failed credential
         # contract. The codes are set by the launch line's own guard (see `wt_launcher_env`).
         case "$pre_rc" in
           93) pre_fault="the credential read NEVER RAN or was KILLED (rc=93): either gh resolved at build time but there is no `perl` timer to bound it, the resolved gh could not be EXECUTED when the pane ran it (perl's failed `exec` would otherwise return 0 and bless a credential-less worker), or the reader was signalled / could not be started (126/127/13x/14x/15x — SIGKILL is 137, SIGTERM 143). Remedy: install `perl` on the harness box (the bound is perl's alarm; `timeout` is absent on macOS), check the gh path this launch line carries, and read the pane line's own message" ;;
-          96) pre_fault="the credential PROBE could not answer in time (rc=96: the LOCAL \`gh auth token\` read was still running when its 10 s bound expired) — a PROBE/TIMING fault, NOT an absent credential; the store may be perfectly good. Remedy: re-run this lane, and if it repeats, check that the local credential read is not being serialised behind API traffic (the gh-limit layer's no-request fast path, agent-infra#3099)" ;;
+          96) pre_fault="the credential PROBE could not answer in time (rc=96: the LOCAL \`gh auth token\` read was still running when its 10 s bound expired) — a PROBE/TIMING fault, NOT an absent credential; the store may be perfectly good. Remedy: re-run this lane, and if it repeats, check that the local credential read is not being serialised behind API traffic (the gh-limit layer's no-request fast path, agent-infra#3138)" ;;
           97) pre_fault="NO gh BINARY could be resolved when this launch line was built (rc=97), so nothing was ever asked for a token. Remedy: put gh on the harness PATH" ;;
           98) pre_fault="the GH CREDENTIAL is absent or unreadable (rc=98): the worker's environment carries no GH_TOKEN/GITHUB_TOKEN value AND \`gh auth token\` did not answer for that HOME. This is the gh credential and nothing else — the env-file arms are 94 and the model key is 95, so a 98 never means a bad keys.env. Remedy: provision the gh credential for that HOME (hosts.yml / keyring via \`gh auth login\`, or a GH_TOKEN line in keys.env)" ;;
           94) pre_fault="an ENVIRONMENT FILE the launch line sources is unreadable, does not parse, or failed to source (rc=94) — keys.env / pi-keys.env, NOT the gh credential. Remedy: fix that file (\`bash -n <file>\` reproduces it); the credential was never tested" ;;

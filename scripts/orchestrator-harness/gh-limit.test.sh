@@ -572,7 +572,7 @@ ck "single flight: the /rate_limit PROBE is serialised too (it runs outside the 
 ck "single flight: … and that measurement really saw the probe (the leader's 4 attempts + 3 probes)" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -gt 4 ] && echo 0 || echo 1)"
 
-# ── G1b. A NO-REQUEST CALL NEVER TAKES THE BOX LOCK (#3099) ────────────────────────────────────
+# ── G1b. A NO-REQUEST CALL NEVER TAKES THE BOX LOCK (#3138) ────────────────────────────────────
 # ⛔ WHAT THIS PINS. The single-flight lock's invariant is "one gh REQUEST in flight per box". A call
 # that makes NO request cannot overlap anyone, so it must not QUEUE for the lock either — and taking it
 # anyway is what starved the review actuator: `worker-terminal.sh` runs `gh auth token` (offline
@@ -1602,7 +1602,7 @@ ck "NO_WAIT: every bounded caller sets it for the layer AND still imports [${_po
 # to be spelled `lock = acquire_lock()`. Main now spells it `strict=True`, the anchor vanished, and the
 # arm reported the invariant BROKEN while it held. It is anchored on the function the comment names.
 _disp="$(sed -n '/^def _dispatch(/,/^def run_attempt/p' "$HELPER")"
-# ⛔ AND ON THE NON-STRICT CALL, not on the assignment's spelling: #3099 made the attempt lock
+# ⛔ AND ON THE NON-STRICT CALL, not on the assignment's spelling: #3138 made the attempt lock
 # CONDITIONAL (`lock = None if makes_no_request_strictly(gh_argv) else acquire_lock()`), and an anchor of
 # `lock = acquire_lock()` would have survived the LESS correct spelling only. The three
 # `acquire_lock(strict=True)` meter probes are outside this range AND carry an argument; a `_dispatch`

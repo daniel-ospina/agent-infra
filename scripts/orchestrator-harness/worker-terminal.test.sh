@@ -990,7 +990,7 @@ pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 case "$pfx" in *"*) false; exit 97"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *) rc=1 ;; esac
 ck "…the guard never credits a file the worker's own gh could not spend (no gh => REFUSED, not blessed)" $rc
 if command -v perl >/dev/null 2>&1; then
-  # ⛔ THE `; exit 93` IS PART OF THE PIN (#3099 review): perl's failed `exec` returns FALSE and the
+  # ⛔ THE `; exit 93` IS PART OF THE PIN (#3138 review): perl's failed `exec` returns FALSE and the
   # one-liner ends with status 0, so without it the guard BLESSES a worker whose gh could not be run —
   # the fail-open direction. The bound and the absolute path are pinned here; the fail-closed tail is
   # pinned by the same string.
@@ -999,7 +999,7 @@ if command -v perl >/dev/null 2>&1; then
   case "$pfx" in *"|| gh auth token"*|*"|gh auth token"*) rc=1 ;; *) rc=0 ;; esac
   ck "…and no bare gh lookup survives in the guard (it is the build-time absolute path)" $rc
 fi
-# ── THE GUARD NAMES WHICH FAULT IT HIT (#3099) ──────────────────────────────────
+# ── THE GUARD NAMES WHICH FAULT IT HIT (#3138) ──────────────────────────────────
 # ⛔ WHAT THIS PINS, AND WHY THE POLARITY MATTERS. `exit 98` used to mean BOTH "no credential" and "the
 # local read had not finished when the alarm fired". The second is not a credential fault at all — it is
 # a probe that could not answer — and on 2026-10-30 the conflation is what read as `the credential
@@ -1059,6 +1059,14 @@ if command -v perl >/dev/null 2>&1; then
     && grep -qF 'this lane could not authenticate a single model call" >&2; exit 95 ;; esac' "$LIB" \
     && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
   ck "…and BOTH env-file arms emit 94 (count: $_94n) and the 93/95/98 EMISSIONS are pinned literally" $rc
+  # ⛔ THE FAULT MUST NAME THE **DEFECT**, NOT AN UNRELATED PR (review finding, 2026-10-31): the 96 remedy
+  # cited `agent-infra#3099`, which is a MERGED PR about the shard list — so an operator who hit this
+  # timing fault was sent to an issue that cannot explain it, which is the dead-end diagnosis this very
+  # change exists to remove, one level up. #3138 is the defect. Pinned in BOTH directions: the right
+  # number must be present AND the wrong one must be gone, because a later edit that copies an old
+  # comment would otherwise reinstate it silently.
+  grep -qF 'agent-infra#3138' "$LIB" && ! grep -qF '#3099' "$LIB" && rc=0 || rc=1
+  ck "…and the 96 remedy cites the DEFECT (#3138), never the unrelated shard PR (#3099)" $rc
   # ⛔ AND 93 IS PROVEN BEHAVIOURALLY, which no grep can do: build the launch line with a resolvable
   # gh, then make that gh NON-EXECUTABLE before the pane runs it. perl's failed `exec` returns FALSE and
   # ends the one-liner with status 0 — so without the `; exit 93` tail this arm sees rc=0, i.e. a BLESSED
@@ -1095,7 +1103,7 @@ fi
 # module, so it cannot call the helper. Anything with NEITHER is an unbounded probe, which is the
 # defect. The helper is then separately pinned: a name without the alarm would be a gate that reads
 # correct and enforces nothing.
-# ⛔ A MESSAGE IS NOT A CALL SITE (#3099). The refusal text now names `gh auth token` when it explains
+# ⛔ A MESSAGE IS NOT A CALL SITE (#3138). The refusal text now names `gh auth token` when it explains
 # which fault it hit, and that string must not be read as an unbounded probe — the predicate is about
 # INVOCATIONS. So the operator-facing message lines (`pre_fault=` / `wt_warn`) are excluded; every line
 # that can actually EXECUTE the read must still arrive through `wt_bounded` or the pane's own `alarm`.

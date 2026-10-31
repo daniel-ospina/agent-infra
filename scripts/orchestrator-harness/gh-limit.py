@@ -4535,7 +4535,7 @@ def _dispatch(real_gh, gh_argv):
                         log_event("account budget: %s still at its share after waiting %ds — proceeding "
                                   "OVER the partition (recorded, not silent)" % (bucket, int(w0)))
         attempt += 1
-        # ⛔ THE SINGLE-FLIGHT LOCK IS FOR REQUESTS, NOT FOR CALLS (#3099). Its invariant is "one gh
+        # ⛔ THE SINGLE-FLIGHT LOCK IS FOR REQUESTS, NOT FOR CALLS (#3138). Its invariant is "one gh
         # REQUEST in flight per box" — and a call that makes NO request cannot overlap anyone. Taking
         # the lock anyway made a purely LOCAL read queue behind every API call on the box, and the
         # measured consequence was not slow: it was a REFUSED WORKER. `wt_gh_token` / the launch-line
