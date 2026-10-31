@@ -870,6 +870,12 @@ assert_eq "$rc" "0" "a timed-out probe does not fail the pass"
 # An INVALID bound arms no watchdog at all in run_bounded, so it must be refused loudly, not silently.
 out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=2 REAP_VENV_VENV_COST_TIMEOUT=abc --gc --repo "$RH")"; rc=$?
 assert_contains "$out" "is not a positive integer" "an invalid timeout is named, not silently unbounded"
+# ⛔ AN ALL-DIGIT VALUE ABOVE intmax IS THE FAIL-OPEN CASE (review round 3): `is_pos_int` accepts it and
+# `[ <huge> -eq 0 ]` ERRORS rather than returning false, so a "digits and not zero" check let it through
+# and armed no watchdog at all. A string-compare + length cap is what makes this reachable-and-refused.
+out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_VENV_COST_SLEEP=2 REAP_VENV_VENV_COST_TIMEOUT=99999999999999999999999 --gc --repo "$RH")" 2>&1; rc=$?
+assert_contains "$out" "is not a positive integer" "an over-range all-digit timeout is refused too, not accepted as a bound"
+assert_not_contains "$out" "integer expression expected" "the validation does not itself emit an arithmetic error"
 
 echo " H5d an unmeasurable probe reads UNKNOWN, never 0 (#2159)"
 # A `0` here would read as "a lane env is free", which is the exact over-admission this line exists to

@@ -1046,7 +1046,19 @@ parse_args() {
     # timeout silently makes the probe UNBOUNDED — the exact failure the call site claims to
     # prevent (measured: `0` and `abc` both ran a 30 s probe to completion). Validated here, where
     # the other seams are, with a loud fallback rather than a silent one.
-    if ! is_pos_int "${REAP_VENV_VENV_COST_TIMEOUT:-}" || [ "$REAP_VENV_VENV_COST_TIMEOUT" -eq 0 ]; then
+    # ⛔ A RANGE CHECK, NOT "DIGITS AND NOT ZERO" (review round 3): `is_pos_int` accepts any digit
+    # string, and `[ <huge> -eq 0 ]` ERRORS rather than returning false — so an all-digit value above
+    # intmax skipped the fallback entirely and left the probe UNBOUNDED, the exact fail-open this
+    # validation was added to prevent (the same class #2158 fixed for the age floor). String compare
+    # for the zero test, and a length cap before any numeric comparison, so the check cannot itself
+    # emit an arithmetic error.
+    _vct="${REAP_VENV_VENV_COST_TIMEOUT:-}"
+    _vct_ok=0
+    case "$_vct" in
+        ''|*[!0-9]*) _vct_ok=0 ;;
+        *) [ "${#_vct}" -le 5 ] && [ "$_vct" != "0" ] && _vct_ok=1 ;;
+    esac
+    if [ "$_vct_ok" = "0" ]; then
         echo "warn: REAP_VENV_VENV_COST_TIMEOUT='${REAP_VENV_VENV_COST_TIMEOUT:-}' is not a positive integer — using 60s; an invalid bound in run_bounded arms no watchdog at all" >&2
         log "warn: REAP_VENV_VENV_COST_TIMEOUT invalid ('${REAP_VENV_VENV_COST_TIMEOUT:-}') — fell back to 60s"
         REAP_VENV_VENV_COST_TIMEOUT=60

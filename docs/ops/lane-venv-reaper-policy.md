@@ -160,7 +160,7 @@ capacity: lanes_live=K lane_venv_max=M MB lane_venv_real=R MB venv_dedupe=ok|deg
 |---|---|---|
 | `lanes_live` | MEASURED | lane **envs** this pass KEPT because a live holder was found — a count of retained envs, **not** of worktrees: a live worktree with no `.venv` yet produces no row and is not counted |
 | `lane_venv_max` | MEASURED | the LARGEST lane env this pass saw — the worst case, never the mean. Its representativeness is only as good as the sample: a PARTIALLY-synced env is small and inflates `lanes_headroom`. The divisor is printed so a reader can reject the quotient |
-| `lane_venv_real` | MEASURED | the LARGEST **private-block** count (files with `nlink == 1`) this pass saw — the bytes that actually vanish when such an env is reaped. `?` when the probe could not run. ⛔ **It is REPORTED, never the divisor** — see the next row |
+| `lane_venv_real` | MEASURED | the LARGEST **private-block** count this pass saw — blocks whose every link lies inside that env (`nlink == 1`, or all of its links seen in the walk; an inode hardlinked twice *within* one tree is private too) — the bytes that actually vanish when such an env is reaped. `?` when the probe could not run. ⛔ **It is REPORTED, never the divisor** — see the next row |
 | `venv_dedupe` | MEASURED | `ok` / `degraded` / `unknown`: whether this box's hardlink-sharing regime is in force for the envs **seen in this pass** (pre-removal — a dead env this pass reaps is still counted). `degraded` means an env is paying its full `du` size, i.e. `UV_CACHE_DIR` is likely on another filesystem or `UV_LINK_MODE` is unset |
 | `venv_degraded` | MEASURED | how many envs in this pass were `degraded` — the count, not a ratio, so one legacy env cannot be averaged away |
 | `free_after` | MEASURED | filesystem free space after the pass |
@@ -287,8 +287,9 @@ assumption to be made.
 
 ### What the reaper now reports
 
-The capacity line carries three new keys, all MEASURED per env, `?`/`unknown` when unmeasurable
-(never `0`, which would read as "free"):
+The capacity line carries three new keys, all MEASURED per env. `?`/`unknown` when unmeasurable
+(never `0`, which would read as "free") — but a MEASURED zero prints `0MB`, because a perfectly
+shared env has no private bytes and that is the ideal reading, not a broken probe:
 
 - `lane_venv_real=<MB>` — the largest **private-block** count seen: the bytes that vanish when that
   env is reaped.

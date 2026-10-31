@@ -129,7 +129,10 @@ def measure(root: str) -> dict:
             nlink = getattr(s, "st_nlink", 1)
             if nlink > 1:
                 shared_files += 1
-            key = (getattr(s, "st_dev", 0), getattr(s, "st_ino", 0))
+            # No getattr default: st_dev/st_ino exist on every CPython platform, so a default can
+            # only ever mask a real failure — and a (0, 0) fallback would collapse every file into
+            # ONE inode, under-reporting total_kb (#2159 review, round 3).
+            key = (s.st_dev, s.st_ino)
             slot = inodes.get(key)
             if slot is None:
                 inodes[key] = [blocks // denom, nlink, 1]
@@ -145,6 +148,9 @@ def measure(root: str) -> dict:
         # see (nlink > seen) can be keeping the blocks alive afterwards.
         if seen >= nlink:
             private_kb += blocks_kb
+            # This tree owns every link, so its share is the whole inode. Reporting 0 here would
+            # tell a reader the private 5.9 GB env "touches nothing" (#2159 review, round 3).
+            fair_kb += blocks_kb
         else:
             fair_kb += (blocks_kb * seen) // nlink
 

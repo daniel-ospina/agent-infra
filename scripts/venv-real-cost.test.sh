@@ -62,6 +62,14 @@ case "$json" in
     *) bad "file count wrong (directories counted?): $json" ;;
 esac
 
+echo "── 1b. fair_kb still reports the share for PRIVATE files (not 0) ───────────────────────"
+# `fair_kb` is "this tree's share of everything it touches"; a private tree touches 100% of its own
+# bytes. Reporting 0 for exactly the class this tool exists to name was a real regression.
+out="$("$PY" "$TOOL" --tsv "$T/priv")"
+fair="$(printf '%s' "$out" | cut -f2)"
+[ "$fair" -ge 2000 ] && ok "a private tree's fair share is its own bytes (${fair} KB)" \
+    || bad "fair_kb collapsed to $fair for a private tree"
+
 echo "── 2. a HARDLINKED pair is counted ONCE, not twice ──────────────────────────────────────"
 mkdir -p "$T/s1" "$T/s2"
 dd if=/dev/zero of="$T/s1/blob.bin" bs=1024 count=1024 status=none
