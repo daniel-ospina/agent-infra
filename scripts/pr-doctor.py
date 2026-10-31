@@ -2580,8 +2580,11 @@ def _fetch_refspec(name: str) -> str:
       * a bare branch `<b>` -> `+refs/heads/<b>:refs/remotes/origin/<b>`, which DOES leave
         `origin/<b>` resolvable after the fetch;
       * a fully-qualified `refs/...` ref -> returned UNCHANGED. That refspec names no DESTINATION, so
-        the fetch lands in FETCH_HEAD only and NO remote-tracking ref is created -- `origin/<ref>'
-        does NOT resolve. A caller of this arm must read FETCH_HEAD, never `origin/<ref>`.
+        it lands in FETCH_HEAD, and a remote-tracking ref is created ONLY IF one of the remote's
+        CONFIGURED `remote.<name>.fetch` refspecs maps that source -- which is the mechanism stated
+        in the module comment above, not the colon. No standard config maps `refs/pull/**`, so for
+        the fork ref this arm exists for, NO tracking ref appears and `origin/<ref>` does NOT
+        resolve. A caller of this arm must read FETCH_HEAD, never `origin/<ref>`.
 
     ⛔ THE `refs/` PASSTHROUGH IS DEFENCE, NOT A LIVE CALL SITE (review P2). Both shipped callers
     either pass a bare branch name or short-circuit before reaching here (`fetch_ref or
