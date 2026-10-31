@@ -407,6 +407,43 @@ grep -q 'NO pi IN THIS PANE' "$TMP/notice.out"; ck $? "…and the no-pi guard is
 bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 2 ]; ck $? "an UNKNOWN mode is a usage error (2), never a silent exemption (rc=$rc)"
 
+# ── safe-send.sh's PANE PROBE must accept the context budget pi actually draws (2026-10-31).
+# The owner decision moved the clamp 300K → 800K, so a settled TUI renders `formatTokens(800000)`
+# = `%/800k`; until this arm the probe's only literals were `/300k` and the model bullet, and the
+# pre-existing `/300k` literal was equally untested. A probe that does not match the live footer
+# reads a LIVE, settled lane as a bare login shell and REFUSES the send (rc 3) — the failure that
+# motivated the literal. Driven, not grepped: the stub's LAST line carries the budget and NOTHING
+# else the probe matches (no `• high` bullet, no model-bullet arm), so these arms flip only on the
+# budget literals. `%/500k` is the negative control: a budget pi never draws is refused.
+# ⛔ `%/1.0M` IS NOT A NICETY — it is the window this fleet PRESCRIBES for its own rollback
+# (`models.json` contextWindow 800000 → 1000000, docs/ops/cost-config-policy.md §7.1 and
+# watch-truncation.sh's printed procedure) and the shipped `kimi-k3` window (1,048,576). pi draws
+# it as `1.0M`, NOT `1M` (`formatTokens`: `count < 1e6 → round(count/1000)+"k"`, else
+# `(count/1e6).toFixed(1)+"M"`), so a tuple written from the `/1M` guess matches no footer at all:
+# after the owner executes the rollback procedure every lane would read "NO pi IN THIS PANE" and
+# every send would exit 3. `%/262k` is the other shipped non-deepseek window (`qwen3.8-max`,
+# 262144 → pi renders `262k`); unlike the heartbeat's probe, safe-send's has NO `(auto)` or
+# model-bullet rescue arm, so an unlisted window is an outright refusal. Pin every shipped window
+# here, not just the current clamp.
+for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
+  printf '#!/bin/sh\necho "CMUX_RAN $*" >> "$CMUX_LOG"\ncase "$1 $2" in "read-screen --workspace") echo "~/Documents/GitHub/agent-infra"; echo "  deepseek-flash %s";; esac\nexit 0\n' "$_budget" > "$TMP/bin/cmux"
+  chmod +x "$TMP/bin/cmux"
+  : > "$CMUX_LOG"
+  PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" SAFE_SEND_DISPATCH=/bin/true \
+    bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 pane-probe "$ALERT" --notice >"$TMP/probe.out" 2>&1; rc=$?
+  if [ "$_budget" = '%/500k' ]; then
+    grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; ck $? "negative control: a budget pi never draws (%/500k) is still REFUSED as 'no pi' (rc=$rc)"
+    grep -q 'pane UNREADABLE' "$TMP/probe.out"; [ $? -ne 0 ]; ck $? "…and it never reaches the later busy/idle gate (the refusal is the pane probe's)"
+  else
+    # The observable is WHICH gate refused, not the exit code: the pane probe's refusal is the
+    # "NO pi IN THIS PANE" message (exit 3), while the busy/idle gate that follows refuses with
+    # "pane UNREADABLE" and ALSO exits 3 — so an rc-only assertion cannot tell them apart, and a
+    # probe that rejected the live footer would print the message this arm forbids.
+    grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; [ $? -ne 0 ]; ck $? "the pane probe ACCEPTS the live footer budget ${_budget} (it does not report 'NO pi IN THIS PANE')"
+    grep -q 'pane UNREADABLE' "$TMP/probe.out"; ck $? "…and the refusal it DOES hit is the later busy/idle gate, so the probe admitted ${_budget}"
+  fi
+done
+
 # ── pr-doctor.py: the fleet's own generated worker brief must carry the contract, or every worker the
 # beat spawns is refused. Driven through the module, not grepped from the source.
 # ⛔ THE PROBE IS ISOLATED, AND ITS ISOLATION IS ASSERTED BELOW (agent-infra#2708, review). Before
