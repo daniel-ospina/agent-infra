@@ -451,13 +451,19 @@ PY
 # that does not inherit it. `sigpipe-grep-guard` is repo-wide regardless, so the expansion stands on its
 # own merits and not on a `pipefail` claim this file cannot make.)
 [ "${out##*$'\n'}" = "ok" ]; ck $? "pr-doctor.py's generated brief carries the research contract (driven through brief())"
-# ⛔ AND THE PROVENANCE LINE LANDS IN THE FIXTURE, NOT THE LIVE LOG -- asserted by EFFECT, not by the
-# presence of `HOME=` above. `log()` `makedirs`es `$STATE_DIR` and appends there, so the proof that the
-# operator log was never touched is that the line is INSIDE the private home. Pre-fix this greps
-# nothing (the line went to the real `~/.pi/agent/state/pr-doctor.log`) and reds; it also keeps the arm
-# honest about the capability's NEW observable, which is the whole point of #2708.
-grep -q 'brief: research contract rendered by ' "$TMP/fakehome/.pi/agent/state/pr-doctor.log"; ck $? \
-  "…and its provenance line lands in the FIXTURE's state dir, never the live operator log"
+# ⛔ AND THE PROVENANCE LINE LANDS IN THE FIXTURE, NAMING THE TREE'S OWN COPY -- asserted by EFFECT,
+# not by the presence of `HOME=`/`O=` above, and not by a prefix match either. Both halves of the
+# defect are graded here because both are visible in the one line: WHERE it went (inside the private
+# home, so the live operator log was never touched) and WHICH COPY it names (`_brief_gate_paths`,
+# `pr-doctor.py:3470-3482`, resolves `$ROOT/scripts/orchestrator-harness/brief-gate.sh` and nothing
+# else once `O` is an empty dir, `HOME` is private and `$AGENT_INFRA_PATH` is unset). Measured: a
+# PREFIX-ONLY grep is green on a half-revert that keeps `HOME=` and drops `O=`/`env -u`, because the
+# line still lands in the fixture -- it just names the BOX's copy and its validator count (the
+# box-dependence half of the defect, unasserted). Pinning the whole line reds that half-revert, so the
+# `O=` and `env -u` in the invocation above cannot rot silently. `-F`: `$ROOT` is a path, not a regex.
+grep -qF "brief: research contract rendered by $ROOT/scripts/orchestrator-harness/brief-gate.sh and admitted by 1 validator(s)" \
+  "$TMP/fakehome/.pi/agent/state/pr-doctor.log"; ck $? \
+  "…and its provenance line names the TREE's own copy (1 validator) and lands in the FIXTURE, never the live log"
 bash "$GATE" --check "$ROOT/.pd-brief.txt" worker >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "…and that generated brief PASSES the validator (worker role) (rc=$rc)"
 rm -f "$ROOT/.pd-brief.txt"
