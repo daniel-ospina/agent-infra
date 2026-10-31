@@ -1217,6 +1217,20 @@ if [ "${CC_OWED:-0}" = "1" ]; then
   echo "[merge $PR] NO REVIEW ORDERED — a clean record already covers head=$HEAD; continuing to the merge path with the recorded verdict (the signed marker is verified below)" >> "$L.log"
 else
 REV_STARTED=1
+# ⛔ THIS BOUND IS STILL BELOW THE PROGRESS ALLOWANCE, AND THAT IS A KNOWN, NAMED RESIDUAL RATHER
+# THAN AN OVERSIGHT (agent-infra#2888). The wall stopped being a lane's primary bound: it must sit ABOVE
+# the 2700 s progress allowance or it pre-empts the rule that decides wedged-vs-slow, and `run_agent`
+# now warns at arm time when it does not. This reviewer run is the one shipped call site where the wall
+# is still SHORTER than the allowance (1800 < 2700), so a reviewer killed here is censored the same way
+# a lane was — `lane-bound.sh` says so on every review.
+#
+# It is not fixed here because the bound is not free to raise: `CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))`
+# below, and `claims.sh` CLAMPS any lease above `CLAIM_TTL_MAX - 1200` = 6000 s. Raising REVIEW_TIMEOUT
+# to the 7200 s backstop would therefore produce a 7200 s reviewer holding a claim that expires at 6000
+# — a second lane free to take the claim mid-review, which is the exact silent-park `claims.sh` guards
+# against. The two numbers are one decision: raise `CLAIM_TTL_MAX` with the reviewer bound, in one
+# change, with `claim-orphan.test.sh` re-derived. Tracked on agent-infra#2888 (comment), not as a peer
+# issue: same root cause, different call site.
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
 AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
