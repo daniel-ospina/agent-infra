@@ -334,6 +334,9 @@ function strip_code(line,   i, n, c, out, prev, d, top, ansi) {
     # ── inside a LITERAL span opened by a single quote INSIDE `${…}`: delimiters there are literal (a
     # `}` does not close the brace), but `$( … )`, `${ … }` and backticks STILL RUN — see the B branch.
     if (top == "L") {
+      # ⛔ A BACKSLASH ESCAPES INSIDE THIS SPAN TOO (review cycle-8 P2): the escaped substitution
+      # does NOT run — measured — so reading it as live code flagged code bash never executes.
+      if (c == "\\") { i++; continue }
       if (c == SQ) { out = out SQ; st_pop(); continue }
       if (c == "$" && substr(line, i + 1, 1) == "(") {
         if (substr(line, i + 2, 1) == "(") { st_push("C"); AR[length(ST)] = 1; PD[length(ST)] = 2; out = out "$(("; i += 2; continue }
@@ -503,7 +506,7 @@ function quoted_procfs(line) {
 # `check-portability-traps.test.sh:171` report `heredoc-unterminated` and blinded lines 172-458 of the
 # file that is supposed to police this class.
 # Sets HD_STRIP=1 for the `<<-` form (the leading TABS of the body are stripped before the compare).
-function heredoc_open(line,   i, n, c, q, j, marker, arith, test) {
+function heredoc_open(line,   i, n, c, q, j, marker, arith, test, hdm) {
   n = length(line); q = ""; HD_STRIP = 0; arith = 0; test = 0
   for (i = 1; i <= n; i++) {
     c = substr(line, i, 1)
@@ -536,7 +539,15 @@ function heredoc_open(line,   i, n, c, q, j, marker, arith, test) {
       # `<`, where `<< "operand"` looks like an ordinary quoted opener (the sibling records the same
       # defect — `read -r e <<< "x"` became a heredoc whose delimiter was `x`).
       if (substr(line, i + 2, 1) == "<") { i += 2; continue }
-      return hd_name(line, i + 2)
+      # ⛔ AN UNRESOLVABLE MARKER IS STILL AN OPENER (review cycle-8 P1): `cat <<$M` yields no
+      # marker, so nothing was tracked and the body was read as code — but a `# portability: off`
+      # line INSIDE that body was then honoured as a declaration and switched the rest of the file
+      # off (the whole-file false PASS this header promises cannot happen). The extent is unknown, so
+      # declarations are refused from here on (HDU) — the same declared over-block the quoted-marker
+      # form already takes.
+      hdm = hd_name(line, i + 2)
+      if (hdm == "") HDU = 1
+      return hdm
     }
   }
   return ""
@@ -566,6 +577,71 @@ function hd_name(line,   j, n, c, q, marker) {
 
 # cp(code, tool) — is `tool` in COMMAND POSITION: line start, or after a separator, or after `(`
 # (which covers `$(tool …)`), allowing leading whitespace. This is what keeps prose and arguments out.
+# atoms() — the regex atoms every command-position test shares. They depend only on constants, so
+# they are built ONCE at BEGIN: cp(), conditioned() and probe_then() all read the same ones, and the
+# conditioning helper cannot drift from the matcher it is supposed to guard.
+function atoms() {
+  asg = "([A-Za-z_][A-Za-z0-9_]*=[^ \t;&|(){}]*[ \t]+)*"
+  rb = "([ \t;&]|$)"
+  ctl = "(if|then|elif|else|do|while|until)"
+  wrap = "((env|sudo|command|nohup|xargs|time|exec|eval|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)([^;&|(){}]*[ \t])?)"
+  pre = "(" asg "(" ctl "[ \t]+|![ \t]+|" wrap ")*)"
+  kw1 = "(env|sudo|command|nohup|xargs|time|exec|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)"
+  # the CONTROL keywords a presence probe may sit behind (`if command -v …`, `while ! command -v …`)
+  pctl = "((if|elif|while|until|then|do|else|!)[ \t]+)*"
+}
+
+# conditioned(tool, code) — 1 when EVERY read of `tool` on this line is CONDITIONED on a presence
+# probe: joined to it by `&&`, or in the `then` arm of a same-line `if <probe> …; then`.
+# ⛔ THE PROBE DOES NOT GUARD THE LINE, ONLY THE CONDITIONED CALL (review cycle-8 P0). Cycle 7 fixed
+# this for the rules that go through cp() and left `probed()` blessing the WHOLE line for timeout,
+# setsid, readlink and cpu — the headline rule among them. Measured then:
+#   `command -v timeout >/dev/null 2>&1 || timeout 5 sleep 1`   CLEAN  (runs when timeout is ABSENT)
+#   `command -v setsid >/dev/null 2>&1; setsid sleep 1`         CLEAN  (runs unconditionally)
+#   `if command -v timeout …; then :; else timeout 5 sleep 1; fi` CLEAN (the else arm IS the trap)
+# A NEGATED probe (`if ! command -v …; then …`) guards nothing, so it is never a guard.
+function conditioned(tool, code,   pr, c2) {
+  # ⛔ A PROBE IS OFTEN INSIDE A KEYWORD (review cycle-8): the first version anchored at `(^|SEP)`,
+  # so `if command -v timeout …` matched NOTHING — every guarded form in this tree is written that
+  # way, and the conditioning test then reported clean code as a trap (bounded.sh, box.sh,
+  # install-controller-service.sh). The control keywords and a leading assignment are admitted here;
+  # a wrapper-with-args is NOT, so `grep -q command -v` still cannot pose as a probe.
+  pr = "(^|" SEP ")[ \t]*" asg pctl "(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
+  if (code !~ pr) return 0
+  if (code ~ /if[ \t]+!/) return 0
+  c2 = code
+  sub(pr, "\001", c2)
+
+  # the guarded call, in either spelling: BARE (`then timeout …`) or inside a substitution
+  # (`then n="$(sysctl -n hw.ncpu …)"` — the idiom every probe arm in this tree uses, review
+  # cycle-8). The tool must be the FIRST command of the arm, so `then :; else <call>` — the shape a
+  # negated/`else` branch hides a live trap in — is NOT matched: `:` is not in ctl/wrap, and a
+  # substitution is only reachable through the assignment form below.
+  # a value assignment has no spaces inside `$( … )`, so it needs its own form:
+  # `NCPU="$(nproc …)"` — the assignment atom above cannot span the parentheses.
+  cal = "(" pre pfx tool rb "|[A-Za-z_][A-Za-z0-9_]*=[\"\047]?[$][(][ \t]*" asg pfx tool ")"
+  if (c2 ~ ("\001[^;|]*&&[^|]*" cal)) return 1
+  if (c2 ~ ("\001[^|]*[ \t]then[ \t]+" cal)) return 1
+  return 0
+}
+
+# probe_then(tool, code) — the LOOKBACK half: a previous line that OPENS a conditional ON the probe
+# (`if command -v <tool> …; then`) guards the block that follows. The opener must END with `then`
+# (so `…; then :; fi`, which guards nothing, is not a guard) and must not be negated.
+# ⛔ DECLARED OVER-BLOCK: the window is 8 code lines and it is not block-aware, so a call that sits
+# AFTER the matching `fi` but within 8 lines is treated as guarded too. Narrowing that needs `if`/`fi`
+# depth tracking; the shape it buys is rare, and the cost of the wrong direction (a false PASS over a
+# live macOS trap) is the one this file never takes.
+function probe_then(tool, code,   i, p, pr) {
+  pr = "(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool "[^|(){}]*[ \t]then[ \t]*$"
+  if (code ~ /if[ \t]+!/) return 0
+  for (i = 1; i <= 8; i++) {
+    p = (FNR - i) % 8
+    if (p in hist && hist[p] ~ pr && hist[p] !~ /if[ \t]+!/) return 1
+  }
+  return 0
+}
+
 function cp(code, tool,   re, c2) {
   # ⛔ THE SEPARATOR CLASS INCLUDES THE QUOTE CHARACTERS (they are literal inside a bracket
   # expression), so a command that FOLLOWS a quoted argument is still in command position:
@@ -580,18 +656,12 @@ function cp(code, tool,   re, c2) {
   # shapes the tree actually contains (worker-terminal.test.sh:2309/2312, harness-cohesion.test.sh:334,
   # harness-surface.test.sh:568). A command position is: line start; a separator; or a shell KEYWORD /
   # wrapper word that puts its next word in command position; and the tool may be spelled with a PATH.
-  # ⛔ THE CLASS MUST CONTAIN THE WRAPPERS THE COMMENT NAMES (review cycle-5 P1): the cycle-2 comment
-  # claimed `nice -n 5 sed -i` and `find … -exec sed -i` were fixed, but neither word was in this
-  # class, so BOTH were still silent — `nice -n 5 sed -i` is the #2571 class, the headline rule.
-  kw = "(if|then|elif|else|do|while|until|exec|env|sudo|command|nohup|xargs|time|!|eval|busybox|stdbuf|nice|ionice|flock|doas|chronic|-exec)"
-  pfx = "([-./][^ \t]*/)?"
   # A LEADING `VAR=value` ASSIGNMENT DOES NOT END COMMAND POSITION (review cycle-3 P0): `FOO=1
   # timeout 5 cmd` and `LC_ALL=C sed -i ...` are ordinary shell, and every one of the 19 rules was
   # blind to them. Measured on this tree: `scripts/orchestrator-harness/gh-limit.test.sh` has SEVEN
   # executable `timeout` calls, three of them assignment-prefixed (1093, 1233, 1593), and the
   # detector reported four — the baseline row was saturated at 4, so those three live macOS traps sat
   # there reported CLEAN, and a lane could add another one and stay green.
-  asg = "([A-Za-z_][A-Za-z0-9_]*=[^ \t;&|(){}]*[ \t]+)*"
   # ⛔ A SEPARATOR RIGHT OF THE TOOL STILL MEANS THE COMMAND RAN (review cycle-5 P2): `if free; then`
   # and `{ free; }` were invisible because the right border was whitespace only. `;`, `&` and `}` are
   # admitted; `)` and `|` are NOT, because those collide with `case` labels (`timeout)  printf …`) and
@@ -599,7 +669,6 @@ function cp(code, tool,   re, c2) {
   # `}` IS NOT A RIGHT BORDER (measured): `${timeout}` and `${free}` are PARAMETER NAMES inside
   # messages, and strip_code emits `${…}` bodies as code because an expansion IS code — admitting `}`
   # flagged 6 correct lines in launchd-cycle.sh and in this suite.
-  rb = "([ \t;&]|$)"
   # ⛔ THE PREFIX IS A CHAIN, NOT ONE TOKEN (review cycle-6 P0): `kw "?" tool` allowed at most ONE
   # keyword, so `if ! timeout 5 x`, `if sudo timeout 5 x`, `if nice -n 5 sed -i`, `then env FOO=1
   # timeout 5 x` were ALL invisible — including a live
@@ -608,12 +677,9 @@ function cp(code, tool,   re, c2) {
   # any sequence of {control-flow keyword, `!`, wrapper-with-its-arguments}, after the assignments.
   # `grep` is NOT in either class, so `if grep -q timeout f` stays clean (that was the collision the
   # kw1 narrowing below exists for).
-  ctl = "(if|then|elif|else|do|while|until)"
   # ⛔ `eval` TAKES THE REST OF ITS LINE AS THE COMMAND (review cycle-7 P1): dropping it from the
   # class made `eval sed -i …` and `eval timeout 5 …` CLEAN — a shape that was flagged before this
   # cycle. It belongs in the junk-taking group for the same reason `sudo -u root` does.
-  wrap = "((env|sudo|command|nohup|xargs|time|exec|eval|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)([^;&|(){}]*[ \t])?)"
-  pre = "(" asg "(" ctl "[ \t]+|![ \t]+|" wrap ")*)"
   re = "(^|" SEP ")[ \t]*" pre pfx tool rb
   re2 = "(^|" SEP ")[ \t]*" asg pfx tool rb
   # ⛔ A WRAPPER OFTEN CARRIES ITS OWN ARGUMENTS (review cycle-2 P2): `env FOO=1 timeout 5 …`,
@@ -628,7 +694,6 @@ function cp(code, tool,   re, c2) {
   # `timeout`) — a call to a helper named `have` reded as a macOS trap. `sudo -u root sed`,
   # `nice -n 5 sed`, `flock /tmp/l sed`, `xargs -n1 timeout`, `-exec sed` all need the group, so those
   # keep it; `if`, `then`, `!`, `eval` do not get it.
-  kw1 = "(env|sudo|command|nohup|xargs|time|exec|nice|ionice|flock|doas|chronic|-exec|stdbuf|busybox)"
   re3 = "(^|" SEP ")[ \t]*" asg kw1 "([^;&|(){}]*[ \t])?" pfx tool rb
   # ⛔ AND A BARE COMMAND INSIDE A SUBSTITUTION IS MATCHED BY ITS OWN SHAPE (review cycle-4 P1):
   # `x="$(free)"` puts `)` directly after the tool, so the whitespace border missed it. The widening
@@ -642,23 +707,25 @@ function cp(code, tool,   re, c2) {
   # position (`(^|SEP)`), so the plain spelling `find . -exec sed -i {} +` stayed CLEAN — the suite
   # fixture only fired because a quoted argument left a `"` (a SEPARATOR char) before it. `-exec`
   # takes a command, so it is its own infix form.
-  iexec = "[ \t]-exec[ \t]+([^;&|(){}]*[ \t])?" pfx tool rb
+  # ⛔ `-execdir`/`-ok`/`-okdir` TOO (review cycle-8 P1): matching only the literal `-exec` left the
+  # sibling predicates — which take a command just the same — as a silent miss for every rule.
+  iexec = "[ \t]-(exec|execdir|ok|okdir)[ \t]+([^;&|(){}]*[ \t])?" pfx tool rb
   # `command -v <tool>` / `type <tool>` / `hash <tool>` / `which <tool>` is a PROBE for EVERY rule, not
   # just timeout/setsid/cpu: `command -v free` is code ASKING whether free exists (review cycle-5 P2).
-  probe = "(^|" SEP ")[ \t]*(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
-  # ⛔ A PROBE GUARDS THE CALL CONDITIONED ON IT — NOT THE WHOLE LINE (review cycle-7 P1). Two
-  # separate defects met here. (a) The cycle-6 wholesale return was introduced because `command` is
-  # itself a wrapper keyword, so `re` matched the PROBE and the old `probe && !re` exception never
-  # fired for the `command -v` spelling; the fix for that is to strip the probe span, not to bless
-  # the line. (b) Blessing the line hid real traps: `command -v sed >/dev/null; sed -i …` runs the
-  # call UNCONDITIONALLY, and `command -v free || free -m` runs it exactly when the tool is ABSENT —
-  # the host the rule exists for. So after the probe is marked, only a `&&`-joined call is guarded.
+  probe = "(^|" SEP ")[ \t]*" asg pctl "(command[ \t]+(-v|-V)|type|hash|which)[ \t]+(--[ \t]+)?" pfx tool rb
+  # ⛔ A PROBE GUARDS THE CALL CONDITIONED ON IT — NOT THE WHOLE LINE (review cycle-7 P1). The
+  # wholesale return was introduced because `command` is itself a wrapper keyword, so `re` matched the
+  # PROBE and the old `probe && !re` exception never fired for the `command -v` spelling; the fix is
+  # to strip the probe span, not to bless the line — `command -v sed >/dev/null; sed -i …` runs the
+  # call UNCONDITIONALLY and `command -v free || free -m` runs it exactly when the tool is ABSENT.
+  # The conditioning test itself lives in conditioned()/probe_then() so every rule shares it.
   if (code ~ probe) {
+    if (conditioned(tool, code)) return 0
     c2 = code
     sub(probe, "\001", c2)
-    if (c2 ~ ("\001[^;|]*&&[^;|]*" pre pfx tool rb)) return 0
     return (c2 ~ re || c2 ~ re2 || c2 ~ re3 || c2 ~ subst || c2 ~ iexec)
   }
+  if (probe_then(tool, code)) return 0
   return (code ~ re || code ~ re2 || code ~ re3 || code ~ subst || code ~ iexec)
 }
 
@@ -726,6 +793,7 @@ function word_has(code, word,   re) {
 BEGIN {
   # declared file scope, read from the header
   mode = ""; mode_reason = ""; mode_line = 0; heredoc = ""; hd_strip = 0; hd_line = 0
+  HDU = 0      # an opener whose marker could not be resolved — see heredoc_open
   HIT_PATH = ""; HIT_LINE = 0
   # carried quote state — see the note in strip_code for why this is not per-line
   ST = ""; split("", SN); split("", PD); split("", AR); split("", AC)
@@ -735,10 +803,14 @@ BEGIN {
   QCH = sprintf("%c%c", 34, 39)
   SQ = sprintf("%c", 39)
   SEP = "[|&;(){}" sprintf("%c", 96) QCH "]"
+  # the shared command-position atoms — see atoms()
+  atoms()
+  pfx = "([-./][^ \t]*/)?"
 }
 
 FNR == 1 {
   mode = ""; mode_reason = ""; mode_line = 0; heredoc = ""; hd_strip = 0; hd_line = 0
+  HDU = 0      # an opener whose marker could not be resolved — see heredoc_open
   HIT_PATH = ""; HIT_LINE = 0
   ST = ""; split("", SN); split("", PD); split("", AR); split("", AC)
 }
@@ -752,7 +824,7 @@ FNR == 1 {
 # the file off from inside a string, and — worse — a marker below an UNBALANCED quote silently
 # covered the tail that was already being read as data, which is the false-CLEAN the EOF rules exist
 # to report. A declaration is only read at top level.
-heredoc == "" && ST == "" && /^# *portability:/ {
+heredoc == "" && HDU == 0 && ST == "" && /^# *portability:/ {
   line = $0
   sub(/^# *portability: */, "", line)
   tag = line; sub(/[ \t].*$/, "", tag)
@@ -791,16 +863,19 @@ heredoc == "" && ST == "" && /^# *portability:/ {
   if (code ~ /^[ \t]*$/) next
   if (mode != "") next            # declared out of scope for the whole file
 
-  # per-line escape hatch: `# portability-ok: <reason>` in the RAW line, reason required
-  if (raw ~ /portability-ok:/) {
-    tail = raw; sub(/.*portability-ok:[ \t]*/, "", tail)
+  # per-line escape hatch: `# portability-ok: <reason>`, reason required.
+  # ⛔ IT MUST BE A COMMENT AT WORD START (review cycle-8 P1): matching the bare text anywhere let
+  # `grep -n 'portability-ok:' f; sed -i …` and `flag="portability-ok:1"; sed -i …` suppress a real
+  # finding — a suppression no reviewer could see in the diff, and not what the header documents.
+  if (raw ~ /(^|[ \t;&|(){}])# *portability-ok:/) {
+    tail = raw; sub(/.*# *portability-ok:[ \t]*/, "", tail)
     if (tail ~ /[^ \t]/) next
     fail(FILENAME ":" FNR ": `# portability-ok:` with NO reason — a suppression without a reason is a silent pass")
   }
 
   hit("cpu-count-single-mechanism", cpu_rule(code), "box_ncpu (scripts/lib/box.sh)")
   hit("timeout-absent-on-macos",  timeout_rule(code), "sleep+kill -0 watchdog, or bounded.sh (#2046)")
-  if (cp(code, "setsid") && !probed("setsid", code)) hit("setsid-absent-on-macos", 1, "( … ) &, or python3 os.setsid")
+  if (cp(code, "setsid")) hit("setsid-absent-on-macos", 1, "( … ) &, or python3 os.setsid")
   # `etimes` is a ps FORMAT word, so it is bordered by `,` or `=` in `-o pid=,etimes=` and not only by
   # whitespace. The looser border is what makes `ps -eo pid=,etimes= -p $$` detectable at all.
   if (cp(code, "ps") && code ~ /(^|[ \t,=])etimes([ \t,=]|$)/) hit("ps-etimes-macos-absent", 1, "parse ps -o etime=")
@@ -818,7 +893,7 @@ heredoc == "" && ST == "" && /^# *portability:/ {
   # as "NOT yet repaired". probed() is the one lookback this file already trusts.
   # ⛔ THE LONG OPTION FAMILY, NOT JUST ONE MEMBER (review cycle-5 P2): `--canonicalize-missing` and
   # `--canonicalize-existing` are GNU-only too, and BSD/macOS readlink has neither.
-  hit("readlink-f-bsd-absent",    ((cmd_cluster(code, "readlink", "f") || cmd_long_re(code, "readlink", "--canonicalize(-[a-z]+)?")) && !probed("readlink", code)), "cd … && pwd -P")
+  hit("readlink-f-bsd-absent",    ((cmd_cluster(code, "readlink", "f") || cmd_long_re(code, "readlink", "--canonicalize(-[a-z]+)?")) && !conditioned("readlink", code) && !probe_then("readlink", code)), "cd … && pwd -P")
   hit("grep-P-bsd-absent",        cmd_cluster(code, "grep", "P"), "grep -E")
   # ⛔ A LINE THAT ALREADY NAMES THE BSD COUNTERPART IS THE GUARDED CHAIN (review cycle-1 P2):
   # `stat -c %Y f || stat -f %m f` and `date -d @$t || date -r $t` are portable as written — that is
@@ -904,12 +979,14 @@ function cpu_rule(code,   n, mech) {
   # `command -v sysctl` and a `command -v nproc` arm, so it IS the multi-mechanism shape the rule
   # asks for — while `getconf` itself needs no presence probe (it is in the base system on both).
   # Measured on `scripts/harness-up`: the chain was flagged on its third arm alone.
-  if (inpos(code, "nproc") && !cpu_probed(code)) { n++; mech = 1 }
-  if (code ~ /hw\.ncpu/ && inpos(code, "sysctl") && !cpu_probed(code)) { n++; mech = 1 }
-  if (code ~ /_NPROCESSORS_ONLN/ && inpos(code, "getconf") && !cpu_probed(code)) { n++; mech = 1 }
+  if (inpos(code, "nproc") && !cpu_guarded("nproc", code)) { n++; mech = 1 }
+  if (code ~ /hw\.ncpu/ && inpos(code, "sysctl") && !cpu_guarded("sysctl", code)) { n++; mech = 1 }
+  if (code ~ /_NPROCESSORS_ONLN/ && inpos(code, "getconf") && !cpu_guarded("getconf", code)) { n++; mech = 1 }
   if (code ~ /box_ncpu/) return 0
-  if (code ~ /command -v (nproc|sysctl|getconf)/) return 0
-  if (code ~ /(hash|type) (nproc|sysctl|getconf)/) return 0
+  # ⛔ A PROBE ON THIS LINE IS ALREADY ACCOUNTED FOR PER TOOL (review cycle-8 P0): these two
+  # line-wide returns blessed every mechanism on a probe line, so `command -v nproc >/dev/null 2>&1 ||
+  # n="$(nproc)"` — a read that runs exactly on the host where nproc is missing — was CLEAN.
+  # cpu_guarded() decides per tool, and only for a call conditioned on the probe.
   if (n >= 2) return 0
   # ⛔ A CHAIN WRITTEN ONE ARM PER LINE IS STILL A CHAIN (review cycle-5 P2): the header blessed form
   # `sysctl … || nproc … || getconf …` was recognised only on ONE line, so the same three arms split
@@ -924,28 +1001,6 @@ function cpu_rule(code,   n, mech) {
   return mech
 }
 
-# ── timeout / setsid: FLAGGED unless a presence probe was read recently ──────────────────────────
-function probed(tool, code,   i, p, pr) {
-  # the CURRENT line first: `command -v timeout >/dev/null 2>&1 && timeout 5 true` is one of the
-  # guarded forms the header promises is clean (review finding 9 — starting the lookback at i=1 made
-  # the one-liner flag while the two-line `if … then` form was clean).
-  # ⛔ `command -v -- timeout` IS A PRESENCE PROBE (review cycle-2 P2): the WIDENED wrapper form
-  # below accepts arguments after a wrapper keyword, so `command -v -- timeout` started reading as an
-  # UNGUARDED call and reded `scripts/lib/bounded.sh:67` — the one file that owns this shim. The
-  # optional `--` is part of the probe, not an argument to the tool.
-  # THE PROBE MUST NAME THE TOOL, IN BOTH ALTERNATIVES (review cycle-3 P0). The cycle-2 widening
-  # dropped `tool` from the FIRST alternative, so `command -v jq` on the line (or within the 8-line
-  # lookback) disarmed the timeout, setsid AND cpu rules — `timeout 300 env …` in
-  # scripts/reap-lane-venvs.test.sh:1066 was reported CLEAN on a live tree, and two of the four
-  # executable `timeout` calls in worker-terminal.test.sh were shielded by `command -v tmux`.
-  pr = "(command (-v|-V) (--[ \t]+)?|(hash|type) )" tool
-  if (code ~ pr) return 1
-  for (i = 1; i <= 8; i++) {
-    p = (FNR - i) % 8
-    if (p in hist && hist[p] ~ pr) return 1
-  }
-  return 0
-}
 # cpu_mech(code) — a bitmask of the CPU mechanisms READ ON THIS LINE (1 nproc, 2 sysctl, 4 getconf).
 # Each bit is set only in COMMAND POSITION, which is the same property the same-line rule tests.
 function cpu_mech(code,   m) {
@@ -971,12 +1026,16 @@ function cpu_other(cur,   i, p, m) {
   }
   return 0
 }
-function cpu_probed(code) {
-  return (probed("nproc", code) || probed("sysctl", code) || probed("getconf", code))
+# ⛔ PER TOOL, AND CONDITIONED (review cycle-8 P0/P1): `cpu_probed` asked "was ANY of the three
+# probed", on this line or in an 8-line window, and blessed the whole line — so
+# `command -v nproc >/dev/null 2>&1 || n="$(nproc)"` was CLEAN even though that read runs exactly on
+# the host where nproc is missing, and `if ! command -v nproc …; then …` shielded later reads too.
+# A probe arms the read it NAMES, and only when the read is conditioned on it.
+function cpu_guarded(tool, code) {
+  return (conditioned(tool, code) || probe_then(tool, code))
 }
 function timeout_rule(code) {
-  if (!cp(code, "timeout")) return 0
-  return probed("timeout", code) ? 0 : 1
+  return cp(code, "timeout")
 }
 
 # ── sed -i: the SUFFIX decides the platform. Attached (`.bak`) is portable to both; a bare `-i` is
@@ -992,7 +1051,7 @@ function timeout_rule(code) {
 #      `readlink -nf` / `grep -qP`.
 #   3. the ATTACHED empty-quote spelling `sed -i""` / `-i''` was reported under the GNU rule (wrong
 #      key, wrong failure mode): it is the BSD spelling whichever side of the separator it sits on.
-function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2) {
+function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat) {
   if (!cp(code, "sed")) return 0
   if (code ~ /box_sed_i/) return 0
   t = code
@@ -1004,9 +1063,19 @@ function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2) {
     # the LONG form is GNU-only on every suffix (BSD sed has no `--in-place` at all)
     if (seg ~ /--in-place([=][^ \t]*)?([ \t]|$)/) { hit("sed-in-place-gnu", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); return 0 }
     n2 = length(seg)
+    # ⛔ ONLY OPTIONS THAT BELONG TO THE TOOL, NOT TO AN EARLIER COMMAND (review cycle-8 P1): the walk
+    # examined every `-word` in the segment, so `find . -execdir sed -i …` read `-execdir` as a sed
+    # OPTION CLUSTER containing an `i`, hit the "the flag is not the last letter" branch and RETURNED
+    # 0 — the whole rule aborted before it reached the real `-i`. `-iname`/`-ipath` misfire the same
+    # way. The same class of bug one layer out: the token must be right of the tool.
+    # (`sed` spelled out, not a `tool` variable: sed_rule is sed-specific, and a stale global here
+    # measured the WRONG position and re-opened the same early return)
+    if (match(seg, pfx "sed" rb) > 0) toolat = RSTART + RLENGTH
+    else toolat = 0
     # walk every option TOKEN and examine the one that carries an `i`
     for (i = 1; i <= n2; i++) {
       if (substr(seg, i, 1) != "-" || (i > 1 && substr(seg, i - 1, 1) !~ /[ \t]/)) continue
+      if (i < toolat) continue
       if (substr(seg, i + 1, 1) == "-") continue
       # the option CLUSTER: `-Ei`, `-ni`, `-i`, `-i.bak`, `-i@@`
       j = i + 1; cl = ""

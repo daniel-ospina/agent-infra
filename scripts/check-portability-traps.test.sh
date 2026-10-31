@@ -591,6 +591,106 @@ else
   done
 fi
 
+# ── C13. THE EIGHTH CYCLE'S SHAPES — the probe does not bless a LINE, it guards a CALL ───────────
+# Cycle 7 fixed the conditioning for the rules that go through cp() and left `probed()` blessing the
+# whole line for timeout, setsid, readlink and cpu. Each shape below is a live macOS trap that was
+# reported CLEAN at the previous head; the clean half is the guarded form the header promises.
+C3="$TMP/cyc8"; : >"$C3"
+C3C="$TMP/cyc8clean"; : >"$C3C"
+mkc3()  { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C3"; }
+mkc3c() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C3C"; }
+
+# the `||` arm runs EXACTLY when the tool is absent — the host the rule exists for
+mkc3 cyc8/1-probe-or-timeout.sh '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 || timeout 5 sleep 1'
+# a `;` arm runs unconditionally
+mkc3 cyc8/2-probe-semi-setsid.sh '#!/usr/bin/env bash' 'command -v setsid >/dev/null 2>&1; setsid sleep 1'
+# the `else` arm is the trap, and it is the arm a negated probe takes
+mkc3 cyc8/3-probe-else-timeout.sh '#!/usr/bin/env bash' 'if command -v timeout >/dev/null 2>&1; then :; else timeout 5 sleep 1; fi'
+# per TOOL, not per line: a nproc read is not conditioned on its own probe when it is in the `||` arm
+mkc3 cyc8/4-probe-or-nproc.sh '#!/usr/bin/env bash' 'command -v nproc >/dev/null 2>&1 || n="$(nproc)"'
+# a NEGATED probe guards nothing, and its `fi` is not a guard for the call after it
+mkc3 cyc8/5-neg-probe.sh '#!/usr/bin/env bash' 'if ! command -v timeout >/dev/null 2>&1; then echo no-timeout; fi' 'timeout 5 sleep 1'
+# find's sibling predicates take a command too
+mkc3 cyc8/6-execdir-sed.sh '#!/usr/bin/env bash' 'find . -execdir sed -i s/a/b/ {} +'
+# a declaration inside a COMPUTED-marker heredoc body is data (the extent is unknown)
+mkc3 cyc8/7-computed-heredoc-decl.sh '#!/usr/bin/env bash' 'M=EOF' 'cat <<$M' '# portability: off the body of a heredoc is DATA, not a declaration' '$M' "sed -i 's/a/b/' f"
+# the escape hatch must be a real comment, not text that merely appears
+mkc3 cyc8/8-ok-in-pattern.sh '#!/usr/bin/env bash' "grep -n 'portability-ok:' f; sed -i 's/a/b/' f"
+mkc3 cyc8/9-ok-in-string.sh  '#!/usr/bin/env bash' 'flag="portability-ok:1"; sed -i "s/a/b/" "$flag"'
+
+# the guarded forms, which must stay clean
+mkc3c cyc8clean/1-then-timeout.sh  '#!/usr/bin/env bash' 'if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi'
+mkc3c cyc8clean/2-and-timeout.sh   '#!/usr/bin/env bash' 'command -v timeout >/dev/null 2>&1 && timeout 5 true'
+mkc3c cyc8clean/3-then-sysctl.sh   '#!/usr/bin/env bash' 'if command -v sysctl >/dev/null 2>&1; then' '  n="$(sysctl -n hw.ncpu 2>/dev/null || true)"' 'fi'
+mkc3c cyc8clean/4-then-nproc.sh    '#!/usr/bin/env bash' 'if command -v nproc >/dev/null 2>&1; then NCPU="$(nproc 2>/dev/null)"' 'elif command -v sysctl >/dev/null 2>&1; then NCPU="$(sysctl -n hw.ncpu 2>/dev/null)"; fi'
+mkc3c cyc8clean/5-real-ok-marker.sh '#!/usr/bin/env bash' "sed -i 's/a/b/' f  # portability-ok: this file deliberately rewrites the fixture in place"
+# a `\` inside the literal span means the substitution does NOT run — measured
+mkdir -p "$TMP/tree/cyc8clean"
+cat >"$TMP/tree/cyc8clean/6-literal-escape.sh" <<'C13ESC'
+#!/usr/bin/env bash
+unset x
+v="${x:-'a\$(nproc)b'}"
+echo "$v"
+C13ESC
+printf '%s\n' cyc8clean/6-literal-escape.sh >>"$C3C"
+
+run_check "$C3" --no-baseline
+if [ "$?" = 2 ]; then
+  bad "C13: the cycle-8 fixture tree was REFUSED (rc=2) — an empty scan proves nothing"
+else
+  for pair in \
+    "timeout-absent-on-macos cyc8/1-probe-or-timeout.sh" \
+    "setsid-absent-on-macos cyc8/2-probe-semi-setsid.sh" \
+    "timeout-absent-on-macos cyc8/3-probe-else-timeout.sh" \
+    "cpu-count-single-mechanism cyc8/4-probe-or-nproc.sh" \
+    "timeout-absent-on-macos cyc8/5-neg-probe.sh" \
+    "sed-in-place-gnu cyc8/6-execdir-sed.sh" \
+    "sed-in-place-gnu cyc8/7-computed-heredoc-decl.sh" \
+    "sed-in-place-gnu cyc8/8-ok-in-pattern.sh" \
+    "sed-in-place-gnu cyc8/9-ok-in-string.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      ok "C13a: caught $1 in $(basename "$2")"
+    else
+      bad "C13a: MISSED $1 in $(basename "$2") — a probe is blessing a line again"
+    fi
+  done
+  run_check "$C3C" --no-baseline
+  for pair in \
+    "timeout-absent-on-macos cyc8clean/1-then-timeout.sh" \
+    "timeout-absent-on-macos cyc8clean/2-and-timeout.sh" \
+    "cpu-count-single-mechanism cyc8clean/3-then-sysctl.sh" \
+    "cpu-count-single-mechanism cyc8clean/4-then-nproc.sh" \
+    "sed-in-place-gnu cyc8clean/5-real-ok-marker.sh" \
+    "cpu-count-single-mechanism cyc8clean/6-literal-escape.sh"
+  do
+    set -- $pair
+    if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+      bad "C13b: FALSE POSITIVE — $1 reded on guarded $(basename "$2")"
+    else
+      ok "C13b: guarded code NOT flagged ($(basename "$2"))"
+    fi
+  done
+fi
+
+# ⛔ THE REPEAT ARMS ASSERT BY LINE, NOT BY FILE (review cycle-8 P2): with a file-level assertion a
+# repeat fixture stays green under the very regression it was written for — the second occurrence is
+# the one that matters, and a cleared second occurrence still leaves the first reported. Measured on
+# the mask bug: both repeat fixtures passed while the repeat was being cleared.
+printf 'cyc7/1-repeat-sysctl.sh\ncyc7/2-repeat-getconf.sh\n' >"$TMP/rep.list"
+run_check "$TMP/rep.list" --no-baseline
+for spec in "cyc7/1-repeat-sysctl.sh 2" "cyc7/1-repeat-sysctl.sh 4" \
+            "cyc7/2-repeat-getconf.sh 2" "cyc7/2-repeat-getconf.sh 4"; do
+  set -- $spec
+  if awk -v f="$1" -v ln="$2" -v r="cpu-count-single-mechanism" \
+       '{ if (index($0, f ":" ln ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    ok "C13c: a REPEATED mechanism is flagged on $(basename "$1") line $2"
+  else
+    bad "C13c: the repeat on $(basename "$1") line $2 was CLEARED — a repeat is not a chain"
+  fi
+done
+
 # ⛔ D2. GUARD MUTANTS — the arms the `hit(…)` mutants cannot reach ──────────────────────────────
 # Section D deletes a rule's DISPATCH, which makes a finding disappear. A CROSS-LINE GUARD works the
 # other way round: it SUPPRESSES a finding, so deleting it makes the output larger and the D-style
@@ -599,7 +699,8 @@ fi
 gmutants() {
   printf '%s\n' \
     'if (mech && cpu_other(cpu_mech(code))) return 0|cyc7clean/1-chain.sh|cpu-count-single-mechanism' \
-    'if (n >= 2) return 0|cyc7clean/3-chain-1line.sh|cpu-count-single-mechanism'
+    'if (n >= 2) return 0|cyc7clean/3-chain-1line.sh|cpu-count-single-mechanism' \
+    'if (conditioned(tool, code)) return 0|cyc8clean/2-and-timeout.sh|timeout-absent-on-macos'
 }
 GDIR="$TMP/gmutant.sh"
 # run_mutant_path <mutant> <list> — the same wrapper contract run_mutant (section D) uses, for the
@@ -618,7 +719,11 @@ gmutants | while IFS='|' read -r gl fixt rule; do
   printf '%s\n' "$fixt" >"$TMP/gmut.list"
   run_mutant_path "$GDIR" "$TMP/gmut.list"; grc=$?
   if [ "$grc" != 1 ]; then
+    # ⛔ AN INVALID MUTANT MUST SAY WHY (review cycle-8 P2): "exited 2, not 1" is a symptom with no
+    # diagnosis, and every cause (a fixture that moved, a refusal, an awk fatal) needs a different
+    # fix. The mutant's own stderr is the only thing that distinguishes them.
     echo "GMUTANT-INVALID $gl (mutant exited $grc, not 1)"
+    sed 's/^/  stderr: /' "$ERR" | head -5
     continue
   fi
   if awk -v r="$rule" '{ n = split($0, a, ": "); if (n >= 2) { split(a[2], b, " "); if (b[1] == r) found = 1 } } END { exit(found ? 0 : 1) }' "$OUT"; then
@@ -969,6 +1074,21 @@ if [ -f "$SHARDS" ]; then
 else
   unproven "run-bash-shards.sh absent — the CI-wiring arm cannot run here"
 fi
+
+# ⛔ THE REFUSAL PATHS OF THE RATCHET ARE PART OF THE RATCHET (review cycle-8 P2): a MALFORMED row
+# or a DUPLICATE key must refuse with exit 2 — last-wins would silently compare against ONE of two
+# counts, which is the failure the code comment says was measured. Neither path had an arm.
+printf 'x.sh\ttimeout-absent-on-macos\t1\tjust1\nx.sh\ttimeout-absent-on-macos\t2\tjust2\n' >"$TMP/dup.tsv"
+printf 'x.sh\ttimeout-absent-on-macos\t1\n' >"$TMP/mal.tsv"
+mkdir -p "$TMP/tree/rt"
+printf '#!/usr/bin/env bash\ntimeout 5 true\n' >"$TMP/tree/rt/x.sh"
+printf 'rt/x.sh\n' >"$TMP/rt.list"
+run_check "$TMP/rt.list" --baseline "$TMP/dup.tsv"; rc=$?
+[ "$rc" = 2 ] && ok "E5: a DUPLICATE baseline key REFUSES (exit 2) — no last-wins comparison" \
+  || bad "E5: a duplicate baseline key did not refuse (rc=$rc) — the ratchet compared against one of two counts"
+run_check "$TMP/rt.list" --baseline "$TMP/mal.tsv"; rc=$?
+[ "$rc" = 2 ] && ok "E6: a MALFORMED baseline row REFUSES (exit 2) — a 3-column row is not a verdict" \
+  || bad "E6: a malformed baseline row did not refuse (rc=$rc)"
 
 # ── REPORT ──────────────────────────────────────────────────────────────────────────────────────
 printf '\n────────────────────────────────────────\n'
