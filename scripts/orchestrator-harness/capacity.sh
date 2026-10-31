@@ -331,8 +331,12 @@ cap_hw_uuid() {
 # cap_boxid_net — the box's routable IPv4: the ONE address a peer can reach it on, and the only
 # identifier measured to differ across the three cells. Darwin reads the address on the interface the
 # default route uses; Linux reads the same thing off `ip`, and REFUSES rather than guessing when it
-# cannot see it. A box with no routable address (an isolated runner) returns 1 and the next source
-# answers.
+# cannot see it. Two shapes return 1 and the next source answers: a box with no routable address at all
+# (an isolated runner), and — narrowing from review round 1 — a box with **no default route in the MAIN
+# table** (a policy-routing or gateway-less box: `ip route show default` prints the main table only, so
+# such a box is now REFUSED where the old `NR==1` body would have published *some* address). That is the
+# fail-closed direction on purpose, and `CAP_BOXID` is the seam for an operator whose box is shaped that
+# way — the derivation is a convenience for boxes networked the way the fleet's are, not an oracle.
 #
 # ⛔ `scope global` IS NOT A ROUTABILITY TEST — MEASURED 2026-10-31 ON EVERY CELL (#3167). Every cell
 # reports the identical arrangement, and `169.254.77.2/30` — an RFC 3927 LINK-LOCAL address — comes
@@ -358,15 +362,17 @@ cap_hw_uuid() {
 #   2. the device is not a pseudo/container/tunnel device by name (defence in depth for clause 1);
 #   3. the address is a dotted quad that is not loopback (127/8), link-local (169.254/16), unspecified
 #      (0/8), multicast or reserved (224/4 and up).
-# THE CHOICE AMONG SEVERAL SURVIVORS IS DOCUMENTED AND TOTAL: the LOWEST interface index wins, ties
-# broken by the numerically lower address. The choice is therefore a function of the candidate SET
-# alone, never of the order `ip` emitted its lines in — and this matters more than it looks: an
-# identity that FLAPS between runs publishes FALSE ATTRIBUTION (two peers, two keys, one box) which is
-# strictly worse than an empty one, because an empty boxid is refused by name while a flapping one is
-# believed. Linux allocates ifindex monotonically, so a device created LATER (a docker network, a VPN)
-# can never preempt one that already existed.
-# ⛔ AN OPERATOR WITH A BOX THAT DOES NOT FIT THIS SHAPE SETS `CAP_BOXID` (see `cap_boxid`): the
-# derivation is a convenience for boxes that are networked the way the fleet's are, not an oracle.
+# THE CHOICE AMONG SEVERAL SURVIVORS IS DOCUMENTED AND TOTAL: the LOWEST interface index wins, then a
+# PRIMARY address before a `secondary` alias, then the NUMERICALLY lower address (compared as octets, not
+# as a string — `10.9.9.9` < `10.9.9.10`, which a string compare gets backwards). The choice is therefore
+# a function of the candidate SET alone, never of the order `ip` emitted its lines in — and this matters
+# more than it looks: an identity that FLAPS between runs publishes FALSE ATTRIBUTION (two peers, two
+# keys, one box) which is strictly worse than an empty one, because an empty boxid is refused by name
+# while a flapping one is believed. Linux allocates ifindex monotonically, so a device created LATER (a
+# docker network, a VPN) can never preempt one that already existed.
+# ⛔ EVERY CLAUSE IS GRADED BY ITS OWN ARM in capacity-placement.test.sh §14: (8) a foreign device with a
+# NON-REJECTED name at a lower ifindex is never the identity (clause 1), (9) an egress device that is a
+# tunnel refuses rather than adopting its address (clause 2), (3)/(10) the choice is stable and total.
 # ⛔ THIS IS ALSO THE SUITE'S IDENTITY SEAM: the arms in capacity-placement.test.sh §12 override THIS
 # FUNCTION to stand up two boxes with two identities on one hostname — the whole point of #2707 is
 # that `CAP_HOST` is NOT what distinguishes them.
@@ -392,8 +398,15 @@ cap_boxid_net() {
         # clause 1 — the device carries egress, or is a VLAN child of the device that does.
         if ($2 != ENVIRON["CAP_EGRESS_DEV"] && index($2, ENVIRON["CAP_EGRESS_DEV"] ".") != 1) next
         i = $1; sub(/:$/, "", i); i = i + 0
-        # the documented choice: lowest ifindex, then the numerically lower address.
-        if (best == "" || i < bi || (i == bi && a < best)) { best = a; bif = $2; bi = i }
+        # `secondary` is how a SECOND address on one device announces itself; it never displaces the
+        # address of record on that device.
+        s = ($0 ~ /[[:space:]]secondary([[:space:]]|$)/) ? 1 : 0
+        # the address as a NUMBER (octets), because the documented tie-break is numeric and a string
+        # compare reads `10.9.9.10` as smaller than `10.9.9.9`.
+        n = 0; k = split(a, o, "."); for (j = 1; j <= k; j++) n = n * 256 + (o[j] + 0)
+        if (best == "" || i < bi || (i == bi && s < bs) || (i == bi && s == bs && n < bn)) {
+          best = a; bif = $2; bi = i; bs = s; bn = n
+        }
       }
       END { if (best != "") print bif " " best }
     ')"

@@ -992,7 +992,13 @@ printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *) cat
   "$TMP/iproute.out" "$TMP/ipaddr.out" > "$IPB/ip"; chmod +x "$IPB/ip"
 # ipfix <egress-dev> <addr-line…> — one fixture for one box. `CAP_BOXID` is cleared in every arm below:
 # the operator seam must not mask the derivation, which is the thing under test.
-ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s\n' "$_d" > "$TMP/iproute.out"; printf '%s\n' "$@" > "$TMP/ipaddr.out"; }
+# ⛔ EACH LINE IS EMITTED IN THE PRODUCTION SHAPE, tail included (`\       valid_lft forever
+# preferred_lft forever` — measured on a live cell: NF=13 and `$NF` is `forever`). A fixture without the
+# tail is NF=9 with `$NF=eth0`, so an implementation that reads the LAST field instead of `$4` would be
+# GREEN here and wrong on every real box — review round 1, finding 4.
+ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s\n' "$_d" > "$TMP/iproute.out"
+  : > "$TMP/ipaddr.out"
+  for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done; }
 boxidnet_mod() { _m="$1"; ( . "$_m"; PATH="$IPB:$PATH"; CAP_BOXID=""; cap_boxid_net ) 2>/dev/null; }
 boxidnet() { boxidnet_mod "$CAP"; }
 if [ -r /proc/net/route ]; then
@@ -1066,6 +1072,35 @@ MUT
   M5="$(boxidnet_mod "$TMP/cap-nr1.sh")"; RC=$?
   ck "(5) m5: the PRE-#3167 body yields NO identity on the very fixture (1) answers ($M5, rc=$RC) — arm (1) is RED before this fix" \
      "$([ "$RC" -eq 1 ] && [ -z "$M5" ] && echo 0 || echo 1)"
+  # (8) CLAUSE 1 IS LOAD-BEARING (review round 1, finding 1). A foreign device with a name the reject
+  # list does NOT name (`br0` — a bridge, or a VPN's `bond0`) is at a LOWER ifindex than the egress
+  # device, and carries the container-network address. Only the egress anchor rejects it; delete clause 1
+  # and this arm returns 172.17.0.1 — the false attribution this whole change exists to prevent.
+  ipfix eth0 \
+    '2: br0 inet 172.17.0.1/16 brd 172.17.255.255 scope global br0' \
+    '3: eth0 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0'
+  A8="$(boxidnet)"; RC=$?
+  ck "(8) a NON-REJECTED-NAME foreign device at a LOWER ifindex is never the identity (got $A8) — the egress anchor is what rejects it" \
+     "$([ "$RC" -eq 0 ] && [ "$A8" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (9) AND CLAUSE 2 IS LOAD-BEARING (same finding). The EGRESS device itself is a tunnel (`wg0`): its
+  # address satisfies the anchor and is routable-looking, so only the name clause refuses it.
+  ipfix wg0 '3: wg0 inet 10.8.0.2/24 brd 10.8.0.255 scope global wg0'
+  A9="$(boxidnet)"; RC=$?
+  ck "(9) an egress device that is a TUNNEL refuses rather than adopting its address (rc=$RC, boxid=[$A9])" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A9" ] && echo 0 || echo 1)"
+  # (10) TWO addresses on ONE device (review round 1, finding 2): a `secondary` alias never displaces the
+  # address of record, and the documented tie-break is NUMERIC — a string compare reads `10.9.9.10` as
+  # smaller than `10.9.9.9` and would publish the wrong one of a pair the box owns.
+  ipfix eth0 \
+    '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0' \
+    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global secondary eth0'
+  A10="$(boxidnet)"; RC=$?
+  ipfix eth0 \
+    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global eth0' \
+    '3: eth0:1 inet 10.9.9.10/24 brd 10.9.9.255 scope global secondary eth0:1'
+  A10B="$(boxidnet)"
+  ck "(10) a secondary alias never displaces the primary ($A10), and the tie-break is NUMERIC ($A10B — .9 not .10)" \
+     "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.9 ] && echo 0 || echo 1)"
 else
   echo "  ⏭ §14 (1)-(5) SKIPPED: this platform has no /proc/net/route, so the Linux arm of cap_boxid_net is unreachable here."
   echo "    Not a pass: CI runs ubuntu-latest, where every arm above is measured."
