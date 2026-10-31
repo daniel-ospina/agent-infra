@@ -65,12 +65,22 @@
 # platforms already need for the classifier itself.
 #
 # EXIT: 0 published a fresh verdict (lists + queue)
-#       4 could not measure, or the snapshot is stale, or the lists failed -- NOTHING is published
-#         as current, and the previous artifacts are left standing (nothing is lost).
+#       4 could not measure, the sample was too old, the lists failed, or the queue could not be
+#         rendered/published -- NOTHING from this pass is published as current, and the previous
+#         snapshot AND queue are left standing (nothing is lost, and no half-published pair).
+#       2 a usage error (a non-numeric/zero --budget or --max-snapshot-age, or a bad flag).
+#
+# ⛔ WHAT THIS ARM NEEDS FROM ITS CONTEXT, BECAUSE IT CANNOT SUPPLY IT. The classifier enumerates the
+# fleet with `cmux list-workspaces`, and cmux authorises only processes STARTED INSIDE CMUX. A
+# systemd/launchd timer is never one, so on a host that authorises by ancestry a scheduled pass
+# cannot measure: it exits 4 naming the ancestry refusal (see the degraded check below) and is a
+# CANARY, not a producer. The producing context is a cmux descendant -- the controller loop or an
+# orchestrator workspace. `lane_liveness.py` can run under launchd only because it never calls the
+# cmux CLI; this arm deliberately uses the real classifier instead.
 #
 # USAGE:
-#   lane-arm.sh                     # sample + publish (the scheduled form)
-#   lane-arm.sh --max-snapshot-age 3600   # refuse a snapshot older than this (default: 900 s)
+#   lane-arm.sh                     # sample + publish (from a cmux descendant)
+#   lane-arm.sh --max-snapshot-age 3600   # refuse a SAMPLE that took longer than this (default: 900 s)
 #   lane-arm.sh --print             # also print the first 40 lines of the recap
 #   lane-arm.sh --budget 240        # hard bound for the sampler (default: 240 s)
 
@@ -95,11 +105,21 @@ BUDGET=240
 MAX_AGE=900
 SHOW=0
 
+# ⛔ A NON-NUMERIC BOUND SILENTLY REMOVES THE BOUND (2026-10-31, review). `bounded()` sleeps for
+# "$secs" and the watchdog `exit 0`s when `sleep` rejects the value -- so `--budget abc` left the child
+# waited for with NO bound at all (measured: a 20 s sampler under `--budget abc` ran to completion in
+# 21 s and the pass PUBLISHED and exited 0). The same parse hole on `--max-snapshot-age abc` made
+# `[ abc -gt 900 ]` error out, so the `if` was false and a refusal was silently disabled -- the
+# no-op-gate shape this file exists to remove. Both are positive integers or they are usage errors.
+_is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --budget)            [ $# -ge 2 ] || { echo "lane-arm: --budget needs a value" >&2; exit 2; }
+                         _is_pos_int "$2" || { echo "lane-arm: --budget must be a positive integer of seconds, not '$2'" >&2; exit 2; }
                          BUDGET="$2"; shift 2 ;;
     --max-snapshot-age)  [ $# -ge 2 ] || { echo "lane-arm: --max-snapshot-age needs a value" >&2; exit 2; }
+                         _is_pos_int "$2" || { echo "lane-arm: --max-snapshot-age must be a positive integer of seconds, not '$2'" >&2; exit 2; }
                          MAX_AGE="$2"; shift 2 ;;
     --print)             SHOW=1; shift ;;
     -h|--help)           sed -n '2,80p' "$0"; exit 0 ;;
@@ -120,6 +140,11 @@ log() { printf '%s LANE-ARM %s\n' "$(date '+%m-%d %H:%M:%S')" "$1" >>"$LOG" 2>/d
 # pid, kill it, and re-prove the child's identity before signalling it.
 bounded() {
   local secs="$1"; shift
+  # ⛔ THIS FUNCTION'S CONTRACT IS "BOUNDED". A value `sleep(1)` cannot express is NOT a licence to
+  # wait forever -- that is precisely how `--budget abc` became an unbounded wait. Refuse instead;
+  # the argument parsing above already rejects it, and this is the second gate for a programmatic
+  # caller that does not go through it.
+  _is_pos_int "$secs" || { echo "lane-arm: bounded() got a non-numeric bound '$secs' -- refusing to run unbounded" >&2; return 2; }
   "$@" & local pid=$!
   local me=$$
   # ⛔ THE OWNERSHIP PREDICATE IS `ppid == me`, NOT AN IMAGE COMPARISON. An image/`lstart` comparison
@@ -142,6 +167,8 @@ bounded() {
   kill "$wd" 2>/dev/null; wait "$wd" 2>/dev/null
   return $rc
 }
+
+now_s() { "$PY" -c 'import time; print(int(time.time()))'; }
 
 age_s() {  # <file> -> seconds since mtime, or empty when absent
   [ -e "$1" ] || return 1
@@ -174,7 +201,7 @@ if [ -e "$LOCK" ]; then
   rm -f "$LOCK" 2>/dev/null || true
 fi
 ( set -C; : >"$LOCK" ) 2>/dev/null || { echo "lane-arm: cannot create $LOCK in $STATE (read-only or full?)" >&2; log "FAIL cannot create lock"; exit 4; }
-trap 'rm -f "$LOCK" 2>/dev/null || true' EXIT INT TERM
+trap 'rm -f "$LOCK" "$SNAP.prev.$$" 2>/dev/null || true' EXIT INT TERM
 
 # ── 1. THE MEASUREMENT (never mtime, never ps -o pcpu -- that is lane-status.py's own rule) ─────
 [ -f "$SC/lane-status.py" ] || fail "classifier ABSENT at $SC/lane-status.py -- install it before scheduling this arm (on the cells it was missing entirely on 2026-10-31, which made lane-actions.py fail on every pass)"
@@ -183,15 +210,14 @@ TMP="$SNAP.arm.$$"
 # ⛔ `--no-cache` IS NOT AN OPTIMISATION, IT IS THE POINT. `lane-status.py --json` serves a cached
 # snapshot (state/lane-status.cache, keyed on --only, 420 s TTL) unless asked not to, and the cache key
 # is the same `[null]` for this arm as for the heartbeat tick — so without this flag the arm happily
-# REPUBLISHES the tick's snapshot and calls it a fresh measurement. Worse, the freshness guard below
-# measures the mtime of the file this script just wrote, so a cached read would print `snapshot_age=0s`
-# no matter how old the data was and `--max-snapshot-age` could never fire. The clock exists to produce
+# REPUBLISHES the tick's snapshot and calls it a fresh measurement. The clock exists to produce
 # a CURRENT verdict; a cached one is the measurement-artifact-as-state failure it is meant to remove.
 # ⛔ A BOUND MUST REPORT AS A BOUND. `bounded()` returns the child's OWN exit status, so a classifier
 # that dies instantly with a real error and a classifier killed at the watchog bound both land here.
 # Reporting the second for both sends the reader to tune a budget instead of to the actual error —
 # which is exactly the misreport this script's header quotes from the cells ("failed after 0.0s of a
 # 60.0s budget", where nothing timed out at all).
+SAMPLE_T0="$(now_s)"
 bounded "$BUDGET" "$PY" "$SC/lane-status.py" --json --no-cache >"$TMP" 2>"$STATE/lane-arm.status.err"
 rc=$?
 if [ "$rc" -ne 0 ]; then
@@ -210,14 +236,43 @@ if lanes is None or not isinstance(lanes,list): raise SystemExit(1)' "$TMP" 2>/d
   fail "classifier output did not parse as a snapshot; not publishing it"
 fi
 
-# ── 2. FRESHNESS IS PART OF THE VERDICT (a measurement artifact is not a state) ─────────────────
-# Measured on the TEMP file -- the bytes this pass actually produced. Measuring $SNAP here would be a
-# tautology (its mtime is microseconds old whatever the data age), which is how an earlier revision
-# came to advertise a refusal it could never perform.
-sa="$(age_s "$TMP")" || fail "the temp snapshot vanished before the freshness check"
-if [ "${sa:-999999}" -gt "$MAX_AGE" ]; then
+# ⛔ A DEGRADED READ IS NOT A MEASUREMENT, AND THE REASON MUST BE NAMED HERE (2026-10-31, review).
+# `lane-status.py` enumerates the fleet with `cmux list-workspaces --json`; when that read is refused
+# it falls back to the hand-written TSV and stamps EVERY row `degraded` (lane-status.py:698-703,
+# :2430), and `lane-actions.py` then REFUSES the whole snapshot
+# (`_refuse_if_degraded`, lane-actions.py:265-266). Without this check the pass died at the renderer
+# and reported "lane-actions.py failed", sending the operator to the wrong program.
+# ⛔ THE CAUSE IS ANCESTRY, NOT CONFIGURATION: cmux authorises only processes started inside cmux
+# ("Access denied - only processes started inside cmux can connect"), and a systemd/launchd timer is
+# never one -- `live-workspaces-publisher.py:11-13` ("launchd is the ONE context that can never be
+# authorized"), docs/ops/fleet-liveness.md:561, docs/ops/outcome-canary.md:136, lane-status.py:2241.
+# So on such a host THIS ARM CAN ONLY EVER BE A CANARY, and it says so instead of blaming the renderer.
+if ! "$PY" - "$TMP" <<'PYCHK'
+import json, sys
+d = json.load(open(sys.argv[1]))
+lanes = d.get("lanes") if isinstance(d, dict) else d
+raise SystemExit(1 if any(isinstance(r, dict) and r.get("degraded") for r in lanes) else 0)
+PYCHK
+then
   rm -f "$TMP"
-  fail "snapshot is ${sa}s old (> ${MAX_AGE}s) -- refusing to present it as current"
+  fail "the classifier's cmux roster read was REFUSED, so every row came back degraded and lane-actions.py would refuse it -- this is an ANCESTRY refusal, not a renderer fault: cmux authorises only processes started inside cmux, and a systemd/launchd timer is never one. Run this arm from a cmux descendant (the controller loop / an orchestrator workspace), and keep the timer as a canary that reports this condition loudly (see $STATE/lane-arm.status.err)"
+fi
+
+# ── 2. FRESHNESS IS PART OF THE VERDICT (a measurement artifact is not a state) ─────────────────
+# ⛔ THE OLD FORM COULD NEVER FIRE (2026-10-31, review). It read `age_s "$TMP"` -- the mtime of the
+# file this pass had just finished writing -- so it was always ~0s, `--max-snapshot-age 0` still
+# PUBLISHED and exited 0, and the queue header stamped `snapshot_age=0s` on every row as a constant.
+# A `0s` that is arithmetic rather than measurement is the exact artifact-as-state failure this
+# marker exists to prevent, so the stamp was worse than none.
+# The age this arm can HONESTLY measure is the age of its own reading: the wall time from the moment
+# it asked for a sample to the moment the sample is in hand. That is a real bound on how stale the
+# data is (nothing between T0 and now can have aged it), it is non-zero, and it CAN exceed MAX_AGE --
+# e.g. `--budget 1200` against the 900 s default -- which is what makes the refusal a live gate
+# rather than an advertisement. `--no-cache` above is what makes the sample fresh in the first place.
+sa=$(( $(now_s) - SAMPLE_T0 ))
+if [ "$sa" -gt "$MAX_AGE" ]; then
+  rm -f "$TMP"
+  fail "the sample took ${sa}s (> ${MAX_AGE}s) -- a reading that old is not presented as current"
 fi
 
 # ── 3. THE LISTS (cache-aware: --stdin never re-samples, so this cannot double the cost) ───────
@@ -226,16 +281,22 @@ if ! bounded "$BUDGET" "$PY" "$SC/lane-actions.py" --stdin "$TMP" >"$STATE/lane-
   rm -f "$TMP"
   fail "lane-actions.py failed (see $STATE/lane-arm.actions.err); previous snapshot AND recap left standing"
 fi
-# ⛔ THE LISTS ARE RENDERED *BEFORE* THE SNAPSHOT IS PUBLISHED, so this file's own promise -- "a pass
-# that cannot measure publishes nothing and the previous artifacts are left standing" -- is TRUE. The
-# other order destroys the last good fleet view in a pass that then abstains: a degraded read is still
+# ⛔ EVERYTHING IS RENDERED *BEFORE* THE SNAPSHOT IS PUBLISHED, so this file's own promise -- "a pass
+# that cannot measure publishes nothing and the previous artifacts are left standing" -- is TRUE for
+# the queue as well as the lists. ⛔ THE QUEUE USED TO RENDER *AFTER* THE PUBLISH (2026-10-31,
+# review): measured, a pass that abstained at the queue step exited 4 having ALREADY replaced
+# lane-status.last.json, leaving a NEW snapshot beside a STALE LANE-QUEUE.tsv and a stale `wedged=`
+# story -- the partial publish the contract above denies. The temp file is therefore still in place
+# when the renderer runs; it is renamed to $SNAP only once every consumer of these bytes has
+# succeeded (see the publish block at the end of the handoff section).
+# The other order destroys the last good fleet view in a pass that then abstains: a degraded read is still
 # valid JSON with a list, so it would replace the good snapshot and only then be refused by
 # lane-actions.py. `--stdin <path>` does not re-sample, and lane-actions derives its age from that
 # file's mtime, so rendering against the temp file changes nothing it reports.
-# ⛔ AND THIS IS THE ONLY `mv` TO $SNAP IN THIS FILE. An earlier revision left the old publish in
-# place as well, so the temp file was already gone when the renderer ran: every pass exited 4 AND the
-# snapshot had been replaced -- the exact failure this ordering exists to prevent, twice over.
-mv "$TMP" "$SNAP" || { rm -f "$TMP"; fail "cannot publish $SNAP"; }
+# ⛔ AND THIS IS THE ONLY `mv` TO $SNAP IN THIS FILE, and it happens at the END. An earlier revision
+# left the old publish in place here as well, so the temp file was already gone when the renderer
+# ran: every pass exited 4 AND the snapshot had been replaced. Three revisions of this ordering have
+# now shipped; the invariant is "one publish, last, restored if it fails part-way".
 
 # ── 4. THE HANDOFF: one machine-readable line per WEDGED lane ─────────────────────────────────
 # The .md is prose for a human; a consumer should not have to parse it. This is the contract.
@@ -246,11 +307,11 @@ mv "$TMP" "$SNAP" || { rm -f "$TMP"; fail "cannot publish $SNAP"; }
 # row -- the CPU delta, the child, the tool and its own declared bound, how long it has been quiet --
 # is on the line, so the reader never has to go and re-measure to decide whether it is a wedge.
 QTMP="$QUEUE.arm.$$"
-# The pass marker the queue header carries (see the comment at the header). With --no-cache above this
-# age is a REAL measurement age; exporting it rather than letting the renderer guess keeps the stamp
-# honest.
+# The pass marker the queue header carries (see the comment at the header). `sa` is the SAMPLE age
+# measured above -- the wall time this pass spent obtaining its reading -- so it is a real datum and
+# not the file's own mtime. Exporting it rather than letting the renderer guess keeps the stamp honest.
 export LANE_ARM_SNAPSHOT_AGE="${sa:-?}"
-if ! "$PY" - "$SNAP" >"$QTMP" <<'PYEOF'
+if ! "$PY" - "$TMP" >"$QTMP" <<'PYEOF'
 import json, os, sys, time
 try:
     d = json.load(open(sys.argv[1]))
@@ -314,9 +375,34 @@ sys.stderr.write("wedged=%d\n" % n)
 PYEOF
 then
   rm -f "$QTMP"
-  fail "could not render the wedged queue from the snapshot"
+  fail "could not render the wedged queue from the snapshot — nothing published; previous snapshot AND queue left standing"
 fi
-mv "$QTMP" "$QUEUE" || { rm -f "$QTMP"; fail "cannot publish $QUEUE"; }
+
+# ── 5. ONE PUBLISH, LAST, AND RESTORED IF IT FAILS PART-WAY ──────────────────────────────────
+# The snapshot is the PRIMARY artifact and the queue is derived from it, so both temp files are fully
+# written before either is current. The previous snapshot is copied aside first: if the final `mv`
+# fails (a full or read-only state dir between the two renames), the queue would otherwise be new
+# beside a snapshot this pass replaced — the same partial publish, one step later. Restoring makes
+# the abstention total, which is what the EXIT contract promises.
+SNAP_PREV="$SNAP.prev.$$"
+SNAP_HAD_PREV=0
+if [ -e "$SNAP" ] && cp -p "$SNAP" "$SNAP_PREV" 2>/dev/null; then SNAP_HAD_PREV=1; fi
+mv "$TMP" "$SNAP" || { rm -f "$TMP" "$SNAP_PREV"; fail "cannot publish $SNAP — nothing published"; }
+if ! mv "$QTMP" "$QUEUE"; then
+  rm -f "$QTMP"
+  # ⛔ SAY WHAT ACTUALLY HAPPENED, per branch. Claiming "restored" when there was no backup to
+  # restore would be the same false-PASS the rest of this file refuses: the first-ever pass has no
+  # previous snapshot, and a failed `cp` leaves SNAP_HAD_PREV=0.
+  if [ "$SNAP_HAD_PREV" = 1 ] && mv -f "$SNAP_PREV" "$SNAP" 2>/dev/null; then
+    fail "cannot publish $QUEUE — previous snapshot RESTORED, so NOTHING from this pass is current"
+  fi
+  rm -f "$SNAP_PREV"
+  if [ "$SNAP_HAD_PREV" = 1 ]; then
+    fail "cannot publish $QUEUE — and the previous snapshot could NOT be restored; $SNAP now holds THIS pass's reading with a STALE queue. Re-run to re-publish the pair"
+  fi
+  fail "cannot publish $QUEUE — there was no previous snapshot to restore; $SNAP holds THIS pass's reading with no queue. Re-run to re-publish the pair"
+fi
+rm -f "$SNAP_PREV"
 
 WEDGED="$(grep -c '^WEDGED' "$QUEUE" 2>/dev/null || true)"
 WEDGED="${WEDGED:-0}"
