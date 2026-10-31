@@ -6207,8 +6207,12 @@ build_evidence() {
 # found`) and the whole base run clears nothing. TWO readers ask this question —
 # `reproduce_residual_on_base`, which must not hand them to the runner, and the
 # #3715 block, which reports that the surviving candidate set names nothing a
-# local run could execute. A second copy of the list is exactly the drift the
-# rail's one-derivation rule forbids, so the list lives here and nowhere else.
+# local run could execute. A second copy of the REGEX is exactly the drift the
+# rail's one-derivation rule forbids, so the regex lives here and nowhere else.
+# (This is ONE pattern with TWO readers, not one enumeration of the families:
+# `repro_scope`'s `case` arms answer a DIFFERENT question — admission into the
+# candidate set, which is #1185's narrowing — so a family added here must be
+# considered there too, and vice versa.)
 NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^bash-shard::|^runner::|^pipeline-compliance::'
 
 # ══ reproduce_residual_on_base — THE MISSING MEASUREMENT (#3715) ═══════════
@@ -8282,7 +8286,7 @@ main() {
       # carries a main-side measurement, or every id's FILE is measured on main
       # (MEASURED-ABSENT). Naming the wrong one would be a false report.
       if [ ! -s "$TMP/repro-scope.txt" ]; then
-        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job). A guard-step whose step main's baseline holds NO record of is NOT in this class (#1185): it reaches the candidate set and is reported there. The refusal stands"
+        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job). A guard-step is NOT in this class only when main's baseline was READ, is non-empty, and holds no row for its step (#1185) — then it reaches the candidate set and is reported there; an EMPTY or unreadable baseline keeps it in THIS class, because a failure-only baseline cannot tell 'main is green' from 'main has no run' (#7734). The refusal stands"
       elif [ ! -s "$TMP/repro-idlevel.txt" ]; then
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to carries a main-side measurement, so there is no missing measurement to construct — the refusal stands"
       else
