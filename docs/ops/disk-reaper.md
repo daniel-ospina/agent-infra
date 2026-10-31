@@ -862,7 +862,7 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
 (it did once, on this box, before the scoping was added).
-`scripts/disk-reaper.test.sh` — 659 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 713 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -922,6 +922,8 @@ own fixture: without that, a `--apply` assertion anywhere in it would sweep the 
 | T58 | the INSTALLED ARTIFACT is read back before `enable --now`: a clean install says it read `ExecStart` + `HOME` out of the artifact; a `50-mask.conf` drop-in that REPLACES `ExecStart` makes the install refuse (naming the drop-in files that exist) and nothing is armed; removing it restores a clean install; an ADDED `ExecStart` (a pre-flight) is accepted and still verified; a drop-in that moves `Environment=HOME` is refused and names both HOMEs; and a `gh` that does not resolve is reported. It also pins the **wrapper preference** (`disk-reaper-run.sh` beside the reaper) on a deliberately UNPINNED install — nothing else measures it, and a timer-started raw reaper inherits no HOME/keys/`gh`, fails the open-PR gate closed and reclaims nothing (#2354) |
 | T58b | the plist **textual** fallback (no usable parser) still refuses a stale arming decision: a good artifact passes and the message names `EnvironmentVariables.HOME` as NOT verified; a stale one (no `--apply`) is refused, naming the missing flag |
 | T55 | **a full disk does not stop the pass** (#2443): an uncreatable state dir falls back to a tmpfs candidate — the classes RUN, the record is written with `state_dir=`/`state_dir_primary=` and says why, and the pass discloses it; the fallback lock is a REAL lock (a live holder still defers, 6); nothing writable anywhere is still a refusal naming every candidate; a writable configured dir produces the unchanged record; and the record returns to the configured path on the next pass once it can be written |
+| T62 | the **installer** refuses to render a unit that scans nothing: an all-empty resolved list is refused (rc=1, no unit written) and an entry dropped from a PARTIALLY resolvable list is NAMED on **stderr** — quoting git's own first line, measured on its own stream — while the entries it CAN use still install. It also pins the absolute-path arm hoisted above the git probe (a relative / `git@host:owner/repo.git` candidate is dropped for the reason that applies, not blamed on a missing checkout) and the `<git gave no message>` fallback (#2159/#2878) |
+| T63 | the **hourly pass** applies the same rule in its own `resolve_repos`: git's own error line reaches the operator (`git cannot use it here (fatal: cannot change to …)`) instead of the blanket `not a git checkout`, a silent non-zero git renders `<git gave no message>`, and a probe killed by the BOUND (rc=124, a dead or hung mount) is named as a timeout rather than as a git that said nothing (#2159) |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
 flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1
