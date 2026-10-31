@@ -51,15 +51,15 @@ Four reviewers killed the original "new `batch-land.py` + `git push` to main" pl
 | `.mergify.yml` (schema + condition lists) | contract | parses; every required context named in exactly one list; every `merge_conditions` check is one `ci-main` actually reports |
 | Live required contexts vs config | contract | `gh api …/branches/main/protection` contexts ⊆ `queue_conditions ∪ merge_conditions` |
 | `ci-main.yml` trigger on the queue branch | contract (YAML assertion + actionlint) | `mergify/merge-queue/main ∈ on.push.branches` |
-| `ci-main.yml` concurrency | contract | group present; `cancel-in-progress` excludes `refs/heads/main` |
+| `ci-main.yml` concurrency | contract | `check-workflow-concurrency.sh` passes on the file: no `cancel-in-progress: true` anywhere and no JOB-level block (a workflow-level block with the literal `false` is permitted, but this workflow ships WITHOUT one — a group here would cancel the very matrix the queue waits on) |
 | `auto-file-on-failure` condition | contract | exact expression `failure() && github.ref == 'refs/heads/main'` |
-| `admin-merge-detector.yml` | contract | `workflow_run.head_branch == 'main'` filter present |
+| `admin-merge-detector.yml` | contract | the main-only filter is the TRIGGER's `on.workflow_run.branches: [main]` — a job-level `if:` would silently skip the documented `workflow_dispatch` path (see Task 3) |
 | Workflow lock | contract | `scripts/workflow-lock.json` hash matches both edited workflows |
 | Hand-off | integration (`tests/atomic-land/` existing suite) | `--queue` on an unarmed repo prints `QUEUE-NOT-ARMED` and still lands by the existing path |
 
 **Files:**
 - Create: `.mergify.yml`, `tests/batch-queue/run.sh`
-- Modify: `.github/workflows/ci-main.yml` (`on.push.branches`, `concurrency:`, `auto-file-on-failure` `if:`), `.github/workflows/admin-merge-detector.yml` (job `if:`), `scripts/workflow-lock.json` (re-cut hashes), and the merge-duty call site (Task 4)
+- Modify: `.github/workflows/ci-main.yml` (`on.push.branches`, `auto-file-on-failure` `if:` — and deliberately NO `concurrency:` block), `.github/workflows/admin-merge-detector.yml` (the trigger's `workflow_run.branches:` filter, never a job `if:`), `scripts/workflow-lock.json` (re-cut hashes), and the merge-duty call site (Task 4)
 
 ---
 
@@ -67,13 +67,13 @@ Four reviewers killed the original "new `batch-land.py` + `git push` to main" pl
 
 **Step 1: Write the failing test** — `tests/batch-queue/run.sh` case `mergify_contract`: parse `.mergify.yml`; assert `queue_rules[0].name == main`, `batch_size` present, `branch_protection_injection_mode == merge`, `merge_protections_settings.auto_merge_conditions == true`, and that the union of `queue_conditions`/`merge_conditions` check names contains every live required context.
 **Step 2: Run — expect FAIL** (no such file).
-**Step 3: Implement** the file, modelled on tortoise's contract: `queue_conditions` = `base=main`, `-draft`, `check-success=pipeline-compliance`, `check-success=ci` (the per-PR node suite); `merge_conditions` = the `ci-main` gate jobs that report on the queue branch; `merge_method: squash`; `batch_size: 3`; `batch_max_wait_time: 5 min`. Every line carries a comment naming #3131 and, where a hazard exists, the deadlock it avoids.
+**Step 3: Implement** the file, modelled on tortoise's contract: `queue_conditions` = `base=main`, `-draft`, `check-success=pipeline-compliance`, `check-success=ci` (the per-PR node suite); `merge_conditions` = the `ci-main` gate jobs that report on the queue branch; `merge_method: squash`; `batch_size: 10` (A6 — the first-wave number; the per-run cost is what bounds it, not caution); `batch_max_wait_time: 5 min`. Every line carries a comment naming #3131 and, where a hazard exists, the deadlock it avoids.
 **Step 4: Re-run — expect PASS.**
-**Step 5: Commit** `ci(mergify): arm the merge queue for main with a 3-PR batch (#3131)`
+**Step 5: Commit** `ci(mergify): arm the merge queue for main with a 10-PR batch (#3131)`
 
 ### Task 2: `ci-main.yml` — the batch gate and the `main`-only signal
 
-**Step 1: Write the failing test** — cases `cimain_queue_trigger`, `cimain_concurrency`, `cimain_autofile_exact`: assert the trigger contains the queue branch; assert a `concurrency:` block whose `cancel-in-progress` is false for `refs/heads/main`; assert the literal expression `failure() && github.ref == 'refs/heads/main'`.
+**Step 1: Write the failing test** — cases `cimain_queue_trigger`, `cimain_concurrency`, `cimain_autofile_exact`: assert the trigger contains the queue branch; assert `check-workflow-concurrency.sh` PASSES on the file as shipped, which is the accurate statement of the repo's rule — R2 refuses `cancel-in-progress: true` and any non-literal value, and R0 refuses a JOB-level block, while a workflow-level block with the literal `false` is permitted; this workflow simply ships without one, because a `concurrency:` group on ci-main would cancel the very matrix the queue is waiting on. Do NOT assert that a `concurrency:` block is refused — it is not, and such a test would go red the moment a literal-`false` block is added legitimately; assert the literal expression `failure() && github.ref == 'refs/heads/main'` for the auto-file job.
 **Step 2: Run — expect FAIL.**
 **Step 3: Implement** the three edits, re-cut `scripts/workflow-lock.json`, and keep the existing per-PR semantics untouched.
 **Step 4: Re-run — expect PASS**, and `bash tests/actionlint/run.sh` green.
@@ -81,7 +81,7 @@ Four reviewers killed the original "new `batch-land.py` + `git push` to main" pl
 
 ### Task 3: `admin-merge-detector.yml` — never read a batch as a merge
 
-**Step 1: Write the failing test** — assert the detect job carries `github.event.workflow_run.head_branch == 'main'`.
+**Step 1: Write the failing test** — assert the workflow's TRIGGER carries `on.workflow_run.branches: [main]`. The main-only filter belongs on the trigger, NOT on a job `if:`: a job-level `if:` also gates the documented `workflow_dispatch` path (which carries no `workflow_run` payload) and would silently skip it, so the shipped file states that reason in its own comment.
 **Step 2: Run — expect FAIL.** **Step 3: Implement.** **Step 4: PASS.** **Step 5: Commit**
 
 ### Task 4: Hand-off — the merge duty asks the queue
@@ -103,6 +103,6 @@ Four reviewers killed the original "new `batch-land.py` + `git push` to main" pl
 |------|-----------|
 | A check named in `merge_conditions` never reports on the queue branch → queue wedges | Task 5 Step 2 verifies it on a real queue run before the hand-off is switched; `--queue` degrades to the existing path only on `QUEUE-NOT-ARMED`, so an armed-but-wedged queue is visible as a stall, not as a silent fallback |
 | Config drift from the live required set | Task 1's test reads branch protection live; porting tortoise's `mergify_config_guard.py` is a named follow-up, not silently assumed |
-| `batch_size: 3` on a repo whose composition breaks often | bisection cost is unmetered; raise only after measured green batches (A6) |
+| `batch_size: 10` on a repo whose composition breaks often | bisection cost is unmetered; the first wave of 10 MEASURES the per-PR breakage rate, and the size is raised only on that measurement (A6) |
 | Queue lands a batch whose matrix was weakened | T4: the queue branch's `ci-main.yml` must match `main`'s; test asserts the divergence refusal |
 | Owner-arming is the critical path | everything except Task 5 lands first and is inert until arming |

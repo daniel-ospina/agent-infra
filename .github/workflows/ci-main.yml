@@ -49,17 +49,15 @@ jobs:
         # nothing to do with the branch's content — measured on run 41190178021:
         # this assertion green on `main`, red on `integration/batch-20261031-16`,
         # with `classify-git.mjs` byte-identical to main.
-        #   ⚠ The `unit-test` JOB is red on `main` too, for an UNRELATED reason
-        # (`test-sanctioned-identity.mjs`: stale `sanctioned-scripts.pin.json`
-        # digests for `record-review.sh`/`admin-merge.sh`, 14 passed / 6 failed on
-        # runs 41185164653 and 41189976808). That is exactly why this fix is worth
-        # making: with the integration-only red removed, the failures on
-        # `integration/**` become COMPARABLE with `main`'s like for like — one cause
-        # each, so a real regression in either area stays attributable. (The set
-        # equality itself is a code-reading expectation until a post-fix
-        # `integration/**` run measures it.) Leaving it in makes an
-        # `integration/**` red uncomparable — two causes in one job, one of them
-        # invisible to any baseline comparison.
+        #   ⚠ The `unit-test` JOB was ALSO red on `main` while this was written, for
+        # an UNRELATED reason (`test-sanctioned-identity.mjs`: stale
+        # `sanctioned-scripts.pin.json` digests for `record-review.sh` /
+        # `admin-merge.sh`, 14 passed / 6 failed on run 41185164653). `main` carries
+        # the fix for that red — `#3140` re-cut the pin at `6423b5bc3` — and the
+        # reason this fix matters is the GENERAL case, not that instance: two
+        # independent causes reddening one job make an `integration/**` failure
+        # unattributable, because one of the two is invisible to any baseline
+        # comparison.
         #   Materialize the DWIM source rather than weaken the assertion: the test
         # then measures the guard, not the checkout depth, and every future
         # `integration/**` run stays judgeable. NOT `|| true` — a fetch that cannot
