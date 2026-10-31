@@ -1075,7 +1075,7 @@ the same overclaim this file exists to remove. The others, named with the gap ea
 | Path | What it still does |
 |---|---|
 | `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:539`) and `$O/gh-limit.py` (`install.sh:556`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:822`, `:1003`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
-| `deploy-mac-orchestrator.sh` phase A (`:274-278`, with `install_file` at `:106-110`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
+| `deploy-mac-orchestrator.sh` phase A (`:292-296`, with `install_file` at `:106-110`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
 | `deploy-crossbox.sh` step 3 (`:57-92`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
 | `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:1281`; called at `:1872`, `:2523`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
 | `cloud-cell-quiesce.sh` step 4 (`scripts/cloud-cell-quiesce.sh:74-79`) | the cell-recovery redeploy: `cp "$HARNESS"/*.sh "$O"/ 2>/dev/null || true` — depth-1, **rc discarded**, then `seeded $O with $(ls "$O"/*.sh | wc -l)` read from the **target**, and a controller started on it (`:89-92`). That is all three mechanisms #2041 names, verbatim; it is listed here rather than quietly omitted |
@@ -1323,9 +1323,35 @@ dispatch row is a claim that something is wrong:
 | `harness=behind:<sha12>` | (a) | the box is recorded from `<sha12>`, an **ancestor** of the ref: a known, deliberate state | redeploy when you mean to adopt the new tip |
 | `harness=diverged:<sha12>` | (a) | `<sha12>` is **not an ancestor** of the ref — the box runs code main does not carry | find out why before redeploying |
 | `harness=uncommitted-edit:<file>` | (a) | `$O` holds bytes **no deploy wrote** (`<file>` differs from the record) — a hand patch | **recover the patch first**: a redeploy destroys it (§4.1 refusal) |
+| `harness=source-dirty:<sha12>` | (a) | the record names `<sha12>` — **this** commit — but its own `sourceDirty=true` (or, for a legacy *stamp* record, `agentInfraDirty=true`) says the deploy was staged from a checkout with uncommitted changes, so `<sha12>` does **not** describe the bytes on the box | redeploy from a **clean** checkout: that is what makes the box identifiable at all |
 | `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
 | `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
-| `harness=surface` | neither — another dir | `$O` itself is clean; a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) differs from `$REF` | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it |
+| `harness=surface` | neither — not a statement about `$O`'s bytes | a surface hit on a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) is the only failing comparison. It appears in **two shapes**: `$O` was never compared at all — absent, or a `--surface` run that found no readable record for it (the body prints `identity: SKIPPED`) — **or** `$O` was compared and answered clean on all three questions | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it. On the first shape `$O` also has no usable deploy record, so redeploying is what would make the box identifiable |
+
+### Precedence when more than one state is true
+
+`uncommitted-edit:<file>` › `behind:`/`diverged:` › `incomplete:<file>` › `source-dirty:<sha12>` ›
+(`surface` | `payload-differs`). The token is ONE line, so the order is the answer to "which fact does
+an operator act on first": unrecoverable bytes, then where the box sits, then code that is missing,
+then a record that cannot describe the box at all, then the last two.
+
+**`surface` is never a statement about `$O`'s own bytes, and it has TWO shapes.** A token is printed
+only when the run found a problem (`problems > 0` in the script), and with no `$O` every question
+about `$O` abstains — so the `O_ABSENT` arm can only be reached when the **surface pass** is what
+differed. On that shape `$O` was **never compared at all** (absent, or a `--surface` run with no
+readable record for it — the body prints `identity: SKIPPED`); on the other shape `$O` **was**
+compared and answered clean on all three questions, which is the `Q_BYTES=0` precondition — a
+condition on *that* arm alone, not on `surface` as a token. `$O`-absent alone emits **no** token at
+all (a clean surface pass is an `OK` summary): the token names a drift, and the drift is always the
+other dir.
+
+**The last two are therefore ALTERNATIVES, not a chain:** a surface hit that coincides with `$O`'s
+own bytes differing reports `payload-differs` — and the other-directory fact is then carried by the
+report body's "for a surface hit, reseed the copy the RUNNING component uses" line, not by the
+token. It is stated here rather than left to the `if` order in the code; `check-deployed-drift.test.sh`
+§9b grades the `incomplete` over `source-dirty` case, `dirty + behind/diverged` is the other combined
+state the chain produces (it reports `behind:`/`diverged:`), and §9g grades the `O_ABSENT` shape —
+the one that emits `surface` with no question about `$O` answered.
 
 The refusal has **two directions**, and both matter: a file whose bytes differ from the record, and a
 file `$O` carries that the record never saw — *when the incoming source ships that name*, because that is
@@ -2277,6 +2303,10 @@ refresh log)` when the count could not be recorded: the `checked.txt` rewrite fa
 `state/checked-release` publish did not land, or the record predates the pass — the entries are then in
 fact still suppressed),
 `— UNPROVEN suppression: K checked entr(ies) with no proven fact`,
+`— K of the N blacklisted are the DISPATCH BACKLOG (CLEAN-judged, awaiting the issue path), not suppressed`
+(the `queued` keep-fact means "still in `candidates.txt`", i.e. waiting for the ISSUE PATH — `checked.txt`
+stops a re-pre-flight, never a dispatch — so these are work the box has already judged CLEAN, not
+suppression, and the two need different repairs; #3110),
 `— K checked entr(ies) deferred by the release cap` (a STANDING residue means `CHECKED_RELEASE_MAX` is too
 small for this cell — it accepts up to **96** asks per pass, four times the default; above that the value is
 coerced to 96 with a WARN, because each ask is an un-timeouted `git` call), `— checked classification REFUSED this pass (<slug>): nothing could be released`
@@ -4562,8 +4592,11 @@ Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired i
 `run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work
 (fail-closed, because the alternative makes a `gh` outage indistinguishable from an empty queue),
 and every deferral emits ONE line naming the depth, the runners, the ceiling and WHAT was deferred —
-silence is what makes a deferral look like a bug. A deferral writes the same bail marker the
-cross-box refusal writes, so it consumes no attempt and is re-decided from a fresh read next cycle.
+silence is what makes a deferral look like a bug. A deferral consumes no attempt: the ISSUE-batch
+arm releases its claims and drops its rows, and the CI-rerun arm withholds the rerun and records why
+(`state/rerun-<PR>-<RID>` is not written). The `fixbail-*` marker is NOT written by either — it
+belongs to `fix-one.sh`'s own three pre-agent deferrals (the cross-box refusal, the PR-OWNER lock, and a
+PR-owner takeover that could not complete), which is where it is written.
 
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
