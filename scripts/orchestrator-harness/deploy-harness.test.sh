@@ -1215,11 +1215,28 @@ fi
 # better one and the floor stays at the measured count: those two refusals previously refused a fixer
 # WITHOUT naming any way to fix the box, so the count was met by adding the remedy an operator needed
 # rather than by dropping the assertion that noticed it. `-ge` is used below, so a floor one BELOW
-# today's count tolerates exactly one reverted remedy — which is why the number is the measured
-# count and never `0` or `1`. Adding the three files that gained remedies above (`lane.sh:3`,
-# `lane-merge.sh:2`, `spawn-gate.sh:3`) is that same doctrine applied to them: a file that gains a
-# remedy gets a floor, or arm (1) is silent on it and arm (2) is silent on a remedy replaced by prose.
-REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:21 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:3 lane-merge.sh:2 spawn-gate.sh:3"
+# today's count tolerates exactly one reverted remedy — which is why each number is the measured
+# count of REMEDY mentions, never `0` or `1`. Two entries were measurably below that and are
+# recorded here rather than silently tolerated (found by review of PR #3097):
+#   ⛔ `orch-loop.sh` read 21 while the file carried 23 — drift from `191078ad4` (#2958) and
+#   `4b21a05ad` (#3113), which each added a remedy and re-cut no floor, so TWO reverted remedies
+#   there were invisible. That is exactly the defect the paragraph above names. Re-cut to 23,
+#   measured: all 23 mentions are remedy sites (every one reads "re-seed/fix: bash …
+#   deploy-harness.sh --repo . --o $O").
+#   ⛔ `check-deployed-drift.sh` reads 3 and KEEPS a floor of 1 DELIBERATELY — this is the one entry
+#   that must NOT be re-cut to its raw count. Of its three mentions, two are PROSE naming the
+#   producer (`:65` a comment; `:294` an "unknown: no harness record … written by the deploy path:"
+#   message) and only `:869` hands out a redeploy. Pinning 3 would pin two sentences, so a comment
+#   reword would red this arm over correct code — precisely the `say`→`log_line` brittleness this
+#   change exists to retire, moved one target to the left. Its residual is STATED, not hidden:
+#   replacing the remedy at `:869` with a bare `cp` IS caught by arm (2) below, but DELETING that
+#   line is caught by neither arm. A remedy-shaped count (rather than a mention count) would fix it;
+#   that is a change to the ARM, not to this number, so it is a follow-up rather than a floor
+#   smuggled in here.
+# Adding the three files that gained remedies above (`lane.sh:3`, `lane-merge.sh:2`,
+# `spawn-gate.sh:3`) is the same doctrine applied to them: a file that gains a remedy gets a floor, or
+# arm (1) is silent on it and arm (2) is silent on a remedy replaced by prose.
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:23 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:3 lane-merge.sh:2 spawn-gate.sh:3"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
