@@ -1776,6 +1776,45 @@ brief_gate_role() {
   esac
 }
 
+# lane_wall_bound <caller_seconds> — THE WALL `run_agent` MAY ARM, given `LANE_BOUND_WALL_S`.
+# Prints "<seconds> <state>", state ∈ unchanged|applied|refused. A PURE function (no log, no side
+# effects) so the clamp below can be tested without driving a lane — which is the only shape the
+# checkpoint-hygiene guard leaves available to an agent session (it refuses this suite's fixtures).
+#
+# ⛔ THE OVERRIDE MAY SHORTEN A RUN, NEVER LENGTHEN IT (agent-infra#2888 review, P1). `$1` is the
+# bound the CALLER declared, and every cross-box lease in the tree is derived from that bound
+# (`fix-one.sh` leases `bound + 1200`, `merge-one.sh` `REVIEW_TIMEOUT + gate-wait + 300`), because the
+# lease exists to cover the run it was taken for. Letting an env knob raise the run above it puts a live
+# run outside the fence that stops a PEER taking the same head: the peer reads the claim as expired and
+# starts a second fixer/reviewer on one branch — the duplicate-paid-work class #2888's own P1 finding
+# closed on the fix-one path, re-opened from outside the file. So the override is a CEILING REDUCER:
+# `min($t, LANE_BOUND_WALL_S)` for every POSITIVE value. A request to raise is REFUSED, not clamped
+# silently — the caller stays on the bound it declared, which its own lease covers — and the refusal is
+# written to the lane log.
+# ⛔ RAISING IS NOT LOST, IT MOVES TO THE SEAM THAT OWNS THE LEASE. Every shipped caller resolves its
+# bound from one (`lane.sh`/`nonblocking-dispatch.sh` `LANE_TIMEOUT`+`LANE_BACKSTOP_S`, `fix-one.sh`
+# `FIX_TIMEOUT`), and raising THAT moves the lease with the bound in the same expression. `0` — the
+# documented "wall axis OFF" value — is a raise in this sense (unbounded), so it is refused here too on
+# a caller that declared a finite bound; the OFF switch remains available where it is unambiguous (on
+# `lane-bound.sh`'s own flag/env, and through the caller's own seam, `LANE_TIMEOUT=0`).
+lane_wall_bound() { # lane_wall_bound <caller_seconds>
+  local t="${1:-}" w
+  case "${LANE_BOUND_WALL_S:-}" in
+    ''|*[!0-9]*) printf '%s unchanged' "$t"; return 0 ;;
+    *) w="$LANE_BOUND_WALL_S" ;;
+  esac
+  # A caller's own bound that is not a number is passed through UNTOUCHED — never defaulted to 0, which
+  # would silently read as "the wall axis is off" (the same typo-becomes-unbounded failure lane-bound's
+  # own `num_or` refuses).
+  case "$t" in ''|*[!0-9]*) printf '%s unchanged' "$t"; return 0 ;; esac
+  # ⛔ `0` IS THE DOCUMENTED "WALL AXIS OFF" VALUE, AND OFF IS THE LONGEST RUN THERE IS. A numeric `-le`
+  # would read it as the largest possible SHORTENING and grant exactly what this rule forbids, so it is
+  # refused on a caller that declared a finite bound.
+  if [ "$w" -eq 0 ] && [ "$t" -gt 0 ]; then printf '%s refused' "$t"; return 0; fi
+  if [ "$w" -le "$t" ]; then printf '%s applied' "$w"; else printf '%s refused' "$t"; fi
+  return 0
+}
+
 # brief_gate_run <brief-file> <role> — 0 admitted · 80 REFUSED · 78 CANNOT-VERIFY. The refusal text
 # goes where the CALLER sends it (run_agent appends it to the agent log, which is what an operator
 # greps); nothing here writes to stdout, because lane.sh's stdout is the lane's own report surface.
@@ -1789,7 +1828,7 @@ brief_gate_run() { # brief_gate_run <brief-file> <role>
   bash "$lib" --check "$f" "$role"
 }
 run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
-  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl _lb_sh _lb_wall
+  local t="$1" log="$2" prompt="$3" label="${4:-agent}" pid w rc l start elapsed was_m jobctl _lb_sh _lb_wall _lb_res _lb_why
   AGENT_STARTED=0
   # The cap signal is per-invocation state, like AGENT_STARTED: a caller that reads it after a
   # refusal or a clean run must see 0, never a previous lane's answer.
@@ -2185,16 +2224,23 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ⛔ `LANE_BOUND_WALL_S` IS CONSULTED HERE, BECAUSE OTHERWISE IT IS AN INERT KNOB (agent-infra#2888).
   # lane-bound resolves flag → env → default, so `--wall "$t"` always being passed made its own
   # documented env seam unreachable on every path that goes through `run_agent` — an operator setting
-  # it would have changed nothing, which is the "knob that does nothing" shape. When it is set it WINS
-  # (an operator escape outranks a caller's default) and the override is named in the log, so the
-  # bound that ran and the bound that was reported cannot silently disagree.
+  # it would have changed nothing, which is the "knob that does nothing" shape. It is also named in the
+  # log, so the bound that ran and the bound that was reported cannot silently disagree.
+  # ⛔ AND IT CAN ONLY SHORTEN THIS RUN — `lane_wall_bound` above is the rule and the reason (a run may
+  # not outlive the cross-box claim lease derived from the caller's own bound). A request to raise is
+  # REFUSED and SAID so here: this knob is documented in `load-policy.md` §3 / the README as the
+  # operator's lane-bound seam, so an operator must never be able to set the documented value and get a
+  # silent no-op — or, worse, a reviewer running past its lease.
   AGENT_BOUND_VERDICT=""
   rm -f "$log.lanebound" 2>/dev/null || true
-  _lb_wall="$t"
-  case "${LANE_BOUND_WALL_S:-}" in
-    ''|*[!0-9]*) : ;;
-    *) _lb_wall="$LANE_BOUND_WALL_S"
-       echo "[lane-bound] NOTE $label: backstop OVERRIDDEN by LANE_BOUND_WALL_S=$_lb_wall (caller asked for ${t}s) — the PROGRESS allowance is unchanged (agent-infra#2888)" >> "$log" ;;
+  _lb_res="$(lane_wall_bound "$t")"
+  _lb_wall="${_lb_res% *}"
+  case "${_lb_res##* }" in
+    applied) echo "[lane-bound] NOTE $label: backstop OVERRIDDEN by LANE_BOUND_WALL_S=$_lb_wall (caller asked for ${t}s) — the PROGRESS allowance is unchanged (agent-infra#2888)" >> "$log" ;;
+    refused)
+      _lb_why="it is ABOVE the bound this caller declared (${t}s)"
+      [ "$LANE_BOUND_WALL_S" -eq 0 ] && _lb_why="0 means the wall axis is OFF — an UNBOUNDED run — and that is above the bound this caller declared (${t}s)"
+      echo "[lane-bound] WARN $label: LANE_BOUND_WALL_S=$LANE_BOUND_WALL_S REFUSED — $_lb_why, and a run must not outlive the cross-box claim lease derived from that bound (a peer would read the claim as expired mid-run and start a SECOND worker on the same head). The wall stays ${t}s. To raise it, raise the CALLER's own seam — LANE_BACKSTOP_S / LANE_TIMEOUT / FIX_TIMEOUT — which moves the lease WITH the bound (agent-infra#2888 review, P1)" >> "$log" ;;
   esac
   _lb_sh="$(lane_bound_path)"
   if [ -n "$_lb_sh" ]; then

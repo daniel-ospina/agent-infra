@@ -2497,6 +2497,15 @@ ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT,
 `getCpuStallMs`. Tuning is per dispatch: a lane class that legitimately sits silent for longer (a long
 model call with no tool activity) raises `LANE_BOUND_IDLE_S` rather than removing the limit.
 
+⛔ **THROUGH `run_agent`, `LANE_BOUND_WALL_S` CAN ONLY SHORTEN A RUN** (agent-infra#2888 review, P1).
+A caller that passes a wall also derives its cross-box claim lease from it (`fix-one.sh`: bound + 1200;
+`merge-one.sh`: `REVIEW_TIMEOUT` + gate wait + 300), because the lease exists to cover the run it was
+taken for — so an env value ABOVE the caller's own bound (including `0`, which means OFF = unbounded)
+is REFUSED, the wall stays at the caller's bound, and the refusal is written into the lane log. To give
+a lane a longer wall, raise the seam the CALLER owns — `LANE_BACKSTOP_S`, `LANE_TIMEOUT`,
+`FIX_TIMEOUT` — which moves the lease with the bound in the same expression. `lane-bound.sh` invoked
+directly (its own flag/env, `mac-lane.sh`) still honours the value as given: no lease is derived there.
+
 ⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
 no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
 (`TASK_STREAM_STALL_MS` = 20 min) and the same window a human used by hand (5–15 min) — but it IS a

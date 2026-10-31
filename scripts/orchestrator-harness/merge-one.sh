@@ -1227,7 +1227,15 @@ REV_STARTED=1
 # the 2700 s progress allowance or it pre-empts the rule that decides wedged-vs-slow, and `run_agent`
 # now warns at arm time when it does not. This reviewer run is the one shipped call site where the wall
 # is still SHORTER than the allowance (1800 < 2700), so a reviewer killed here is censored the same way
-# a lane was — `lane-bound.sh` says so on every review.
+# a lane was.
+# ⛔ CORRECTION (agent-infra#2888 review, P2 — VERIFIED): this block used to claim "`lane-bound.sh` says
+# so on every review". It does not, and it cannot: THIS file's `run_agent` is its own plain `sleep`
+# watchdog that never invokes `lane-bound.sh`, so no pre-emption warning is produced here at all. The
+# same fact is why `LANE_BOUND_WALL_S` cannot reach this reviewer (it is read only by spawn-gate.sh's
+# `run_agent`, whose callers are lane.sh / fix-one.sh / nonblocking-dispatch.sh) — so the reviewer
+# cannot be pushed past the `CLAIM_LEASE` below by that knob, and this file needs no clamp of its own.
+# Nothing warns when a reviewer is censored at 1800 s; that is a KNOWN gap recorded here rather than a
+# claim about a warning nobody emits.
 #
 # It is not fixed here because the bound is not free to raise: `CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))`
 # below, and `claims.sh` CLAMPS any lease above `CLAIM_TTL_MAX - 1200` = 6000 s. Raising REVIEW_TIMEOUT
