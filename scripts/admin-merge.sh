@@ -6359,8 +6359,10 @@ reproduce_residual_on_base() {
   # directory not found`), so a residual that mixes a collection error with real
   # nodeids aborted the whole base run and cleared nothing — the false block this
   # repair exists to remove, with no diagnostic naming the cause. (`repro_scope`
-  # already filters them from the candidate set; this is the function's own
-  # guard, so the contract holds for any caller.)
+  # filters them from the candidate set — EXCEPT the guard-step ids #1185 admits,
+  # the ones the base holds no record of, admitted so the rail can REPORT that
+  # fact; this is the function's own guard, so the contract holds for every
+  # caller, and it is also what keeps a base CAPTURE from volunteering one.)
   local nodeids
   nodeids="$(grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
@@ -6677,7 +6679,10 @@ intersect_sets() {
 }
 
 # repro_scope <residual> <unattributable> <out> <scratch> [<mainfails>] — the ids
-# a base run could even SPEAK TO: the residual minus UNATTRIBUTABLE identities,
+# a base run could even SPEAK TO, PLUS (since #1185) the guard-step ids the base
+# holds NO record of: those are admitted so the rail can REPORT that fact, never
+# because a run could speak to them (nothing local can execute one — see the
+# caller's own branch). The set is the residual minus UNATTRIBUTABLE identities,
 # minus guard-step identities THE BASE HAS A RECORD OF, and minus the other
 # NON-NODEID families. Every arm is excluded on DOCTRINE — and the guard-step arm
 # alone is additionally decided on EVIDENCE from the base's OWN baseline
