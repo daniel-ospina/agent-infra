@@ -13099,7 +13099,7 @@ grep -q 'the FIRST-CHECKS wait expired' "$TMP/err" \
 # and its re-derive budget is unspent, so `--any-workflow` never reaches it) — which is a different
 # fact about the head from "proven empty", pinned by (a5) below so it stays measured. Re-pointing
 # the pin at the arm the fixture actually reaches is not a weakening: the state assertion, its evidence, and the
-# three negatives that follow are all still demanded.
+# FOUR negatives that follow (RE-RUN wait, MERGE-REF wait, no merge made, no evidence posted) are all still demanded.
 grep -q 'NOTHING has attached to this head at all' "$TMP/err" \
   && pass "(a) …naming checks-never-started (a PROVEN-EMPTY surface, not 'still running', not a CI verdict)" \
   || fail "(a) the never-started state is not distinguished"
@@ -14494,7 +14494,7 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9812"
 # by 0 and the report prints (green); on a loaded runner one poll costs ≥1s, the 1s ceiling expires
 # on the FIRST poll, the verdict returns before the report case, and this assertion fails while the
 # promotion never had a poll to appear in (measured: red on a loaded Linux box, green on an idle
-# one — the (h) fixture above had the identical shape). 5s of ceiling keeps the scenario short and
+# one — the (h) fixture BELOW has the identical shape). 5s of ceiling keeps the scenario short and
 # leaves room for the polls the assertion needs; the promotion itself is unchanged.
 SUITE_FIRST_CHECKS_WAIT=1 SUITE_FIRST_CHECKS_CEILING=5 SUITE_FIRST_CHECKS_STALL=2 \
   SUITE_FIRST_CHECKS_POLL=1 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
@@ -14598,9 +14598,10 @@ rc=$?
 # only when a poll finishes BEFORE the window expires, and the clock is a `$SECONDS` delta: on a
 # fast, idle host the first poll advances it by 0 (the line prints, this scenario was green); on a
 # loaded runner one poll costs ≥1s, the window (1s) expires on the FIRST poll, the verdict returns
-# before the report case is reached, and every assertion here about `$SCEN/out` fails while the
-# rail behaved correctly (measured: red on a loaded Linux box and on GitHub's runner, green on an
-# idle one — the same fixture, two verdicts). The refusal that closes the wait
+# before the report case is reached, and the POSITIVE witness assertion on `$SCEN/out` fails — while
+# the rail behaved correctly, and the negatives around it still pass in that shape, which is why the
+# failure read as a silent loss of the witness rather than as a visibly wrong verdict (measured: red
+# on a loaded Linux box and on GitHub's runner, green on an idle one — the same fixture, two verdicts). The refusal that closes the wait
 # (`block_on_first_checks`) is emitted on EVERY non-terminal close, and this fixture's state closes
 # as `unobservable` (the short-digest arm sets `signal_ok=0`), which routes to the `*)` arm — the
 # arm that carries the "their per-job/per-step PROGRESS could not be read" spelling. So the witness
