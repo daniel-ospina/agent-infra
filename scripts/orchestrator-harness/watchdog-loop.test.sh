@@ -402,6 +402,65 @@ env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/
 assert_contains "$(grep -m1 RESTART-SUPPRESSED "$C/state/l")" "RESTART-SUPPRESSED" "WATCHDOG_NO_RESTART reaches the platform verb and is taken"
 assert_eq "$([ -f "$C/launchctl.calls" ] && echo 1 || echo 0)" "0" "…and a launchctl shim on PATH records ZERO calls (the live verb was never reached, even though this run had no stub)"
 
+# ═══ 8b. REMOVED vs LOADED — WHICH launchd verb, decided by a MEASURED state (#1986) ═══════════
+echo "── 8b. a REMOVED controller job is BOOTSTRAPPED; a loaded one is KICKSTARTED"
+# ⛔ WHAT THIS ARM EXISTS FOR. KeepAlive cannot restart a service that is no longer in the domain
+# (`launchctl unload -w` / a `bootout` whose `bootstrap` failed: measured five times on 2026-10-17),
+# and `kickstart -k` exits non-zero for ever on such a label — so before this arm the ONE restart the
+# watchdog issues could never restore a REMOVED controller, and nothing said so. The recovery belongs
+# HERE, in the tracked agent: `templates/launchd/RETIRED` retired the second launchd watchdog because
+# two loaded watchdogs are two MUTATING actors on one controller, and `fleet-liveness` names this file
+# as the replacement.
+# ⛔ IT IS DRIVEN WITH NO `WATCHDOG_RESTART_CMD`: the stub seam returns BEFORE the platform arm, so a
+# case that kept it would assert nothing about the verb — the vacuity case 8 records. `uname` is shimmed
+# (this suite runs on Linux) and `launchctl` records every argv, so the assertions are about the verb
+# that was actually issued.
+mk_darwin_bin() { # <print-rc> <print-output> → $C/bin/{uname,launchctl}
+  mkdir -p "$C/bin"
+  printf '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; exit 0; fi\nexec /usr/bin/uname "$@"\n' > "$C/bin/uname"
+  {
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$C/launchctl.calls"
+    printf 'if [ "$1" = print ]; then printf "%%s\\n" "%s"; exit %s; fi\nexit 0\n' "$2" "$1"
+  } > "$C/bin/launchctl"
+  chmod +x "$C/bin/uname" "$C/bin/launchctl"
+}
+removed_pass() { # <pass-output-file>
+  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+      WATCHDOG_PLIST="$C/stack.plist" SETTLE=0 PATH="$C/bin:$PATH" bash "$WD" >"$1" 2>&1
+}
+# (a) ABSENT from both domains → enable + bootstrap from the plist, and NEVER a kickstart.
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 113 'Could not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "bootstrap gui/$(id -u) $C/stack.plist" "a REMOVED job is BOOTSTRAPPED from its rendered plist"
+assert_contains "$CALLS_OUT" "enable gui/$(id -u)/com.eldato.orchestrator-stack" "…after ENABLE, because a -w unload leaves a persistent Disabled override that makes bootstrap a silent no-op"
+assert_absent "$CALLS_OUT" "kickstart" "…and NO kickstart was issued for a job launchd does not hold (it could only fail)"
+assert_contains "$(grep -m1 -E 'verdict=(DOWN|WEDGED)' "$C/state/l")" "restart=1" "…the pass still reports the restart it attempted"
+# (b) LOADED → the wedge-curing kickstart, and NO bootstrap (a second bootstrap is a no-op at best
+#     and an error at worst; the state was MEASURED as present).
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 0 'com.eldato.orchestrator-stack = {\n\tactive count = 0\n\tlast exit code = 0\n}'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "kickstart -k gui/$(id -u)/com.eldato.orchestrator-stack" "a LOADED job still takes kickstart -k"
+assert_absent "$CALLS_OUT" "bootstrap" "…and is never re-bootstrapped underneath a live controller"
+# (c) A REMOVED job with NO plist is REPORTED, not guessed at: there is nothing to bootstrap, and a
+#     silent success here would claim a recovery that cannot happen.
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+mk_darwin_bin 113 'Could not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/pass.out")" "RESTART-UNAVAILABLE" "a REMOVED job with no plist on disk reports RESTART-UNAVAILABLE"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and issues no bootstrap with nothing to load"
+# (d) AN UNREADABLE READ IS NOT "ABSENT". A bare `Bad request.` is launchd rejecting the request; the
+#     polarity must be kickstart (which cannot double-load), never bootstrap over a job that may exist.
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 1 'Bad request.'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "kickstart -k" "an UNREADABLE state takes kickstart, not bootstrap"
+assert_absent "$CALLS_OUT" "bootstrap" "…never a bootstrap decided from an error message"
+
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
 MUT="$WORK/mutant.sh"
