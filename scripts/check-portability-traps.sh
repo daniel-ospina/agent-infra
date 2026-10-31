@@ -860,10 +860,18 @@ function cmd_long_re(code, tool, pat,   t, k, segs, n) {
 # ONE construction. `;` and a BARE `&` do. Masking is length-preserving and only used for the split,
 # so a caller can still test the original text.
 function cmdunits(code, segs,   t, n) {
+  # ⛔ THE MASK MUST BE A SEPARATOR (review cycle-13 P0). Masking with `\002` kept the unit whole —
+  # which was the point — but `\002` is NOT in SEP, so `cp()` could not see a command immediately
+  # after it and EVERY trap joined by `&&` or sitting in an `if/then`/`loop` arm became CLEAN:
+  #     true && stat -c %Y f            ← reported clean, was flagged at the previous head
+  #     if [ -d x ]; then date -d @0 +%s; fi
+  # A live trap appended to a file whose row was already 1 left the ratchet green, i.e. this was a
+  # gate bypass, not a cosmetic miss. `||` is a SEPARATOR to `cp()`/`cmd_opt` and is NOT split on
+  # here, so the unit stays whole AND the command after the mask is still in command position.
   t = code
-  gsub(/&&/, "\002\002", t)
-  gsub(/[<>]&/, "\002\002", t)
-  gsub(/;[ \t]*(then|else|elif|fi|do|done)([ \t]|$)/, "\002\002\002\002", t)
+  gsub(/&&/, "||", t)
+  gsub(/[<>]&/, "||", t)
+  gsub(/;[ \t]*(then|else|elif|fi|do|done)([ \t]|$)/, "||", t)
   gsub(/;/, "\n", t)
   gsub(/&/, "\n", t)
   return split(t, segs, "\n")
@@ -884,7 +892,7 @@ function gnu_only_unit(code, tool, shortf, longf, bsd1, bsd2,   segs, n, k, hasg
   return 0
 }
 
-function cmd_cluster(code, tool, letters,   t, k, segs, n) {
+function cmd_cluster(code, tool, letters,   t, k, segs, n, toolat, off, adv, t2, segk) {
   t = code
   gsub(/[|&;(){}]/, "\n", t)
   n = split(t, segs, "\n")
@@ -894,7 +902,19 @@ function cmd_cluster(code, tool, letters,   t, k, segs, n) {
     # `readlink -nf` flagged — the flag POSITION is not a property of the trap. The trailing
     # `[A-Za-z]*` admits the rest of the cluster; `.bak`-style suffixes are not `[A-Za-z]*`, so the
     # portable `sed -i.bak` spelling is untouched (sed has its own rule anyway).
-    if (cp(segs[k], tool) && segs[k] ~ ("(^|[ \t])-[A-Za-z]*" letters "[A-Za-z]*([ \t=]|$)")) return 1
+    # ⛔ …BUT ONLY A FLAG RIGHT OF THE TOOL IS THE TOOLS FLAG (review cycle-13 P2): the regex scanned
+    # the whole SEGMENT, so `xargs -P 4 grep foo` — `-P` is xargs parallelism, present on both hosts —
+    # red as `grep-P-bsd-absent`, and the comment above claimed command scoping the code did not do.
+    if (!cp(segs[k], tool)) continue
+    toolat = 0
+    if (match(segs[k], pfx tool rb) > 0) toolat = RSTART + RLENGTH
+    off = 0; t2 = segs[k]
+    while (match(t2, "(^|[ \t])-[A-Za-z]*" letters "[A-Za-z]*([ \t=]|$)")) {
+      if (off + RSTART >= toolat) return 1
+      adv = RSTART + 1
+      off += adv
+      t2 = substr(t2, adv)
+    }
   }
   return 0
 }
@@ -1216,7 +1236,13 @@ function sed_rule(code,   t, segs, n, k, seg, i, j, n2, cl, rest, q1, q2, toolat
     # same two calls on two lines counted 2 — and the ratchet is keyed on the COUNT, so appending a
     # fresh `; sed -i …` to a line that already carried a finding stayed green. `break` leaves the
     # option walk for THIS segment and lets the segment loop reach the next one.
-    if (seg ~ /--in-place([=][^ \t]*)?([ \t]|$)/) { hit("sed-in-place-gnu", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); break }
+    # ⛔ THIS `break` IS IN THE SEGMENT LOOP, SO IT SKIPPED THE REMAINING SEGMENTS (review cycle-13
+    # P1): the comment below describes the OPTION walk, and the fix for the first-hit defect was
+    # applied to the wrong loop on this one arm — `sed --in-place s/a/b/ f; sed -i s/c/d/ g` reported
+    # ONE finding while the short-form twin reported two, which is the ratchet gap this cycle exists
+    # to close. `continue` reaches the next segment; the option walk below is not entered for this
+    # one, which is what the long form needs anyway.
+    if (seg ~ /--in-place([=][^ \t]*)?([ \t]|$)/) { hit("sed-in-place-gnu", 1, "sed -i.bak … && rm -f f.bak, or box_sed_i"); continue }
     n2 = length(seg)
     # ⛔ ONLY OPTIONS THAT BELONG TO THE TOOL, NOT TO AN EARLIER COMMAND (review cycle-8 P1): the walk
     # examined every `-word` in the segment, so `find . -execdir sed -i …` read `-execdir` as a sed

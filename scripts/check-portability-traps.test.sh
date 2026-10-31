@@ -872,6 +872,55 @@ else
   done
 fi
 
+# ── C16. THE THIRTEENTH CYCLE — the unit mask must stay a SEPARATOR, and a flag must be the TOOL flag ─
+# Cycle 12 masked `&&`/arm-opening `;` with a control character so the unit stayed whole, but that
+# character is NOT in SEP, so `cp()` could not see a command after it: every trap joined by `&&` or
+# sitting in an `if/then`/loop arm went CLEAN, and a live trap appended to an already-counted row left
+# the ratchet green. `||` keeps both properties: a separator to `cp()`, not split by cmdunits().
+C6="$TMP/cyc11"; : >"$C6"
+C6C="$TMP/cyc11clean"; : >"$C6C"
+mkc6()  { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C6"; }
+mkc6c() { local f="$1"; shift; mkdir -p "$TMP/tree/$(dirname "$f")"; printf '%s\n' "$@" >"$TMP/tree/$f"; printf '%s\n' "$f" >>"$C6C"; }
+
+mkc6 cyc11/1-and-joined-stat.sh '#!/usr/bin/env bash' 'true && stat -c %Y f'
+mkc6 cyc11/2-then-arm-date.sh '#!/usr/bin/env bash' 'if [ -d x ]; then date -d @0 +%s; fi'
+mkc6 cyc11/3-else-arm-stat.sh '#!/usr/bin/env bash' 'if [ -d x ]; then :; else stat -c %Y f; fi'
+mkc6 cyc11/4-do-arm-stat.sh '#!/usr/bin/env bash' 'while [ -d x ]; do stat -c %Y f; done'
+mkc6c cyc11clean/1-or-chain.sh '#!/usr/bin/env bash' 'stat -c %Y f || stat -f %m f'
+mkc6c cyc11clean/2-ifelse-uname.sh '#!/usr/bin/env bash' 'if [ "$(uname)" = Darwin ]; then stat -f %m f; else stat -c %Y f; fi'
+mkc6c cyc11clean/3-probe-then-chain.sh '#!/usr/bin/env bash' 'if stat -f %m f >/dev/null 2>&1; then stat -f %m f; else stat -c %Y f; fi'
+# `-P` here is xargs parallelism, present on both hosts — not a grep flag
+mkc6c cyc11clean/4-xargs-parallel.sh '#!/usr/bin/env bash' 'xargs -P 4 grep foo'
+
+run_check "$C6" --no-baseline
+for pair in   "stat-c-gnu cyc11/1-and-joined-stat.sh"   "date-d-gnu cyc11/2-then-arm-date.sh"   "stat-c-gnu cyc11/3-else-arm-stat.sh"   "stat-c-gnu cyc11/4-do-arm-stat.sh"
+do
+  set -- $pair
+  if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    ok "C16a: caught $1 in $(basename "$2")"
+  else
+    bad "C16a: MISSED $1 in $(basename "$2") — the unit mask swallowed command position"
+  fi
+done
+run_check "$C6C" --no-baseline
+for pair in   "stat-c-gnu cyc11clean/1-or-chain.sh"   "stat-c-gnu cyc11clean/2-ifelse-uname.sh"   "stat-c-gnu cyc11clean/3-probe-then-chain.sh"   "grep-P-bsd-absent cyc11clean/4-xargs-parallel.sh"
+do
+  set -- $pair
+  if awk -v f="$2" -v r="$1" '{ if (index($0, f ":") == 1 && index($0, r " ") > 0) found = 1 } END { exit(found ? 0 : 1) }' "$OUT"; then
+    bad "C16b: FALSE POSITIVE — $1 reded on correct $(basename "$2")"
+  else
+    ok "C16b: guarded/wrapped code NOT flagged ($(basename "$2"))"
+  fi
+done
+
+# the `--in-place` long form must not stop the SEGMENT loop: two traps on one line, one of each spelling
+printf '%s\n' 'sed --in-place s/a/b/ f; sed -i s/c/d/ g' >"$TMP/tree/cyc11/5-long-then-short.sh"
+printf '%s\n' cyc11/5-long-then-short.sh >"$TMP/ls.list"
+run_check "$TMP/ls.list" --no-baseline
+n_ls="$(awk -v r="sed-in-place-gnu" '{ n = split($0, a, ": "); if (n >= 2) { split(a[2], b, " "); if (b[1] == r) c++ } } END { print c + 0 }' "$OUT")"
+[ "$n_ls" = 2 ] && ok "C16c: long-form then short-form sed on ONE line counts 2" \
+  || bad "C16c: long-form then short-form counted $n_ls, not 2 — the first hit skipped the next segment"
+
 # ⛔ A SECOND LIVE TRAP ON THE SAME LINE IS COUNTED (review cycle-12 P2): the ratchet is keyed on the
 # COUNT, so a `return` after the first hit let `sed -i …; sed -i …` report 1 where two lines report 2
 # — a fresh trap appended beside an existing one stayed green forever.
