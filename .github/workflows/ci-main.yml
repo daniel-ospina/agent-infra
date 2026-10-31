@@ -6,12 +6,19 @@ name: CI on main
 # deterministic and green today. skill-lint is the post-merge re-check; the
 # per-PR hard gate runs in ci.yml → node-ci.yml (issue #237).
 #
-# On failure, a GitHub issue is auto-filed (no human gate — the AI review gate
-# already guards merges; this is the post-merge backstop).
+# On failure, a GitHub issue is auto-filed. That filing is MAIN-ONLY: an
+# `integration/**` push below runs this same matrix as a PRE-merge gate, and a
+# red integration tree must NOT be reported as "main broken by merge" — it never
+# reached main (agent-infra#3131).
 
 on:
   push:
-    branches: [main]
+    # `integration/**` is the batch/integration train (agent-infra#3131): K PRs are
+    # merged into one branch and THIS matrix runs ONCE on the composed tree, so
+    # main only ever receives a tree that already passed. No `concurrency:` block
+    # is added — a push-triggered workflow must not cancel (check-workflow-
+    # concurrency.sh R2), and the train is single-writer by design.
+    branches: [main, 'integration/**']
 
 permissions:
   contents: read
@@ -584,7 +591,14 @@ jobs:
   auto-file-on-failure:
     runs-on: ubuntu-latest
     needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
-    if: failure()
+    if: failure() && github.ref == 'refs/heads/main'
+    # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131). `failure()` must stay: replacing it
+    # with a ref condition alone makes this job run on every push and file nothing
+    # (the steps read `needs`, which only carries failure on a failed run), so a red
+    # main would file NOTHING while the job still existed. And the ref clause is what
+    # keeps an `integration/**` matrix failure from being filed as "main broken by
+    # merge": that tree never reached main, and a false issue there is precisely the
+    # noise that hides the real ones.
     # RESIDUAL (round-2 review): paginate -> find -> create is check-then-act, so two
     # concurrent post-merge runs can both create (runs 34534428397 / 34534452089 failed 17s
     # apart on 2026-09-10 and filed #710 / #711). A job-level `concurrency:` group was added
