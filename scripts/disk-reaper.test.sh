@@ -61,7 +61,11 @@
 #       gives the ALARM class precedence (`mixed-benign` vs `mixed`) (#3041/#3058).
 #   T62 a reaper pointed at a checkout that is NOT THERE can never be installed BLIND: an all-empty
 #       resolved list is REFUSED (rc=1, no unit written), and an entry dropped from a PARTIALLY
-#       resolvable list is NAMED on stderr instead of vanishing silently (#2159/#2878).
+#       resolvable list is NAMED on stderr instead of vanishing silently (#2159/#2878). It also pins
+#       the two ACCOMPANYING behaviours: the absolute-path arm hoisted ABOVE the git probe (so a
+#       relative / `git@host:owner/repo.git` candidate is dropped for the reason that applies rather
+#       than blamed on a missing checkout), and the `<git gave no message>` fallback for a git that
+#       exits non-zero without a word.
 #       ⚠️ T62 is the number this block took on rebase: it was written as T61 against a base where
 #       T61 was free, and #3041 landed a DIFFERENT T61 first. Two sections cannot share an ID (nor
 #       `ENVNAME`/`$T/t61`), so this one was renumbered rather than merged under a duplicate label.
@@ -3157,11 +3161,16 @@ assert_eq "$(t61_run_pair reclaimed unlisted-new-verdict)" "unlisted-new-verdict
 # and exited 3 — for 34 worktrees and ~60 GB it had never once looked at. The box sat at 100% used
 # with the reaper "on the clock": an inert enforcer that LOOKS installed.
 # This case pins BOTH guards that make that visible, because they cover different shapes:
-#   (a)(b)(c) an ALL-EMPTY resolved list is REFUSED (rc=1) and writes no unit.
-#   (d)       a PARTIALLY resolvable list — the incident's own shape, since the bring-up passes the
-#             operator's colon-joined list verbatim — installs, but the entry git cannot answer for
-#             must be NAMED on stderr. It was dropped in SILENCE before this change, which is
-#             indistinguishable from success while a configured tree is not scanned.
+#   (b)(c) an ALL-EMPTY resolved list is REFUSED (rc=1) and writes no unit.
+#   (d)    a PARTIALLY resolvable list — the incident's own shape, since the bring-up passes the
+#          operator's colon-joined list verbatim — installs, but the entry git cannot answer for
+#          must be NAMED on stderr. It was dropped in SILENCE before this change, which is
+#          indistinguishable from success while a configured tree is not scanned.
+#   (e)(f) the two ACCOMPANYING behaviours this change adds, which nothing else pins: the hoisted
+#          absolute-path arm (a relative / `git@host:owner/repo.git` candidate must be dropped for
+#          the reason that ACTUALLY applies, not blamed on a missing checkout), and the
+#          `${_g:-<git gave no message>}` fallback for a git that exits non-zero and says nothing.
+#          (a) is the positive control that the same command path still installs.
 ENVNAME=t62
 REPO_T62="$(mk_repo t62-repo)"
 inst62() { # inst62 <repos-value> <unit-dir>
@@ -3248,6 +3257,50 @@ assert_contains "$(cat "$T/t62/units-partial/eldato-disk-reaper.service" 2>/dev/
     "DISK_REAPER_REPOS=$REPO_T62" "T62 case (d): the unit keeps the entry that DOES resolve"
 assert_absent "$(cat "$T/t62/units-partial/eldato-disk-reaper.service" 2>/dev/null)" \
     "vanished-checkout" "T62 case (d): ... and never renders a path that cannot be scanned"
+
+# (e) THE HOISTED ABSOLUTE-PATH ARM. This arm was moved ABOVE the git probe because with the probe
+# first, a relative candidate or `git@host:owner/repo.git` was reported as "not a git checkout" —
+# pointing the operator at a missing checkout — and the `git@…` form was SPLIT ON ':' into two bogus
+# entries by the list loop. Neither shape is pinned anywhere else, so a regression that moved the arm
+# back below the probe, or dropped the split guard, would keep the whole suite green.
+OUT="$(inst62 "$REPO_T62:relative/dir" "$T/t62/units-rel") "; RC=$?
+assert_eq "$RC" "0" "T62 case (e): a relative entry does not block the rest of the list"
+assert_contains "$OUT" "not an absolute path" \
+    "T62 case (e): ... and it is dropped for the reason that ACTUALLY applies (the absolute-path arm)"
+assert_contains "$OUT" "relative/dir" "T62 case (e): ... naming the candidate that was dropped"
+assert_absent "$OUT" "not a git checkout" \
+    "T62 case (e): ... and NOT blamed on a missing checkout (the arm is hoisted above the probe)"
+assert_contains "$(cat "$T/t62/units-rel/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 case (e): ... while the entry that IS absolute still installs"
+assert_absent "$(cat "$T/t62/units-rel/eldato-disk-reaper.service" 2>/dev/null)" \
+    "relative/dir" "T62 case (e): ... and the relative path is never rendered into a unit"
+# The `git@host:owner/repo.git` shape is the one the ':' list-split fragments into two candidates.
+# ⚠️ It is STILL fragmented — that is the list's separator, not a defect this change removes. What the
+# hoist changes is the REASON each fragment is dropped: "not an absolute path" (true, actionable)
+# rather than "not a git checkout" (a cause the code never established). Measured, not assumed: the
+# split yields `git@github.com` and `owner/repo.git`, both reported as not absolute, install rc=0.
+OUT="$(inst62 "$REPO_T62:git@github.com:owner/repo.git" "$T/t62/units-scp") "; RC=$?
+assert_eq "$RC" "0" "T62 case (e): an scp-style remote does not block the rest of the list"
+assert_contains "$OUT" "ignoring repo 'owner/repo.git' — not an absolute path" \
+    "T62 case (e): ... its fragments are dropped for the ABSOLUTE-PATH reason, not a missing checkout"
+assert_absent "$OUT" "not a git checkout" \
+    "T62 case (e): ... and nothing is blamed on a git checkout the code never probed"
+assert_contains "$(cat "$T/t62/units-scp/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 case (e): ... the absolute entry still installs"
+
+# (f) A GIT THAT EXITS NON-ZERO AND SAYS NOTHING. `${_g:-<git gave no message>}` exists for exactly
+# this shape: without it the warning rendered an empty "()" and named no datum at all. A shim is
+# needed because the real git always says something; it delegates everything except the probe.
+mkdir -p "$T/t62/bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do [ "$a" = rev-parse ] && exit 1; done' \
+    'exec "$_REAL_GIT" "$@"' >"$T/t62/bin/git"
+chmod +x "$T/t62/bin/git"
+OUT="$(PATH="$T/t62/bin:$PATH" _REAL_GIT="$(command -v git)" \
+    inst62 "$REPO_T62" "$T/t62/units-silent") "; RC=$?
+assert_eq "$RC" "1" "T62 case (f): a silent non-zero git leaves nothing resolved, so the install REFUSES"
+assert_contains "$OUT" "<git gave no message>" \
+    "T62 case (f): ... and the warning says git gave no message rather than rendering an empty '()'"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"
