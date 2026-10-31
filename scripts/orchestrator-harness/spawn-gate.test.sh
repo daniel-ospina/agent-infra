@@ -1162,6 +1162,26 @@ printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO
 ck "adopt-fix.sh propagates the DISK refusal 77 (got $arc2) — not normalised to a load refusal" $rc
 grep -q 'DISK gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
+# ⛔ THE HARNESS-SKEW ARM (follow-up review of #2991, P1/P2, measured). `fix-one.sh` propagates the
+# gate's OWN code, so the new 81 arrived at this wrapper with NO arm: it matched no `elif`, fell to
+# `exit "$rc"`, and wrote NO LINE into `adopt-$PR.log` — the one log a manual operator reads (#1720).
+# That is the identical defect the 71 arm above documents, one code later, and the coverage guard
+# cannot see it (its union is per CODE, satisfied by lane.sh/fix-one.sh naming it, not per READER).
+# `$O/fix-one.sh` is stubbed to exit 81 exactly as the real one does on `exit "$ar"`, so this arm
+# pins the WRAPPER's dispatch table and nothing else. On the pre-fix file rc is still 81 and the log
+# stays EMPTY apart from the worktree line — the grep below is what fails, which is the point.
+O81="$TMP/O81"; mkdir -p "$O81/logs"
+printf '#!/bin/bash\nexit 81\n' > "$O81/fix-one.sh"; chmod +x "$O81/fix-one.sh"
+( cd "$RREPO" && O="$O81" PATH="$RIG/bin:$PATH" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc81=$?
+[ "$arc81" -eq 81 ]; rc=$?
+ck "adopt-fix.sh propagates the HARNESS-SKEW refusal 81 (got $arc81) — not swallowed, not normalised" $rc
+grep -q 'fixer NOT started (HARNESS/MISMATCH gate)' "$O81/logs/adopt-7.log"; rc=$?
+ck "...and NAMES it in the log the manual operator reads (the 71 arm's defect, one code later)" $rc
+grep -q 'dispatching the PR to another box would refuse identically' "$O81/logs/adopt-7.log"; rc=$?
+ck "...and says the remedy is NOT to hand the PR to another box (both boxes run the same pair)" $rc
+grep -q 'cp scripts/orchestrator-harness/\*.sh' "$O81/logs/adopt-7.log"; rc=$?
+ck "...and names the SYNC remedy (cp the helper pair), not 'repair the box'" $rc
 
 : > "$MERGE_LOG"
 
@@ -1398,6 +1418,34 @@ ck "the resolver finds the helper through the FILESYSTEM with CELL_PREFLIGHT_SH 
 { ! grep -q 'cell-lane-preflight.sh not found' "$LOG"; }; rc=$?
 ck "...and does not log the false 'not found' WARN that the unbound-variable abort produced" $rc
 
+# (j) THE LANE'S OWN READER OF 81 — and its stand-down line must PRINT the remedy, not RUN it
+# (follow-up review of #2991, P1, measured in this suite). `lane.sh`'s `gate=skew` arm carries the sync
+# remedy, and the first cut wrote it inside BACKTICKS in a double-quoted `echo`: a command substitution,
+# not text. Measured on that exact line: the log read "The remedy is  wherever lanes run" (the
+# substitution's empty stdout replaced the remedy) AND the substitution really ran `cp`, copying the
+# helper pair into `$O` — a log statement mutating the deployed harness while deleting the one
+# instruction it exists to deliver. Both halves are asserted: the LITERAL remedy text must reach the
+# log, and no `.sh` may be copied into `$O` by the act of logging. Driven through the real `lane.sh`
+# with the real capability gate: a probe that RAN and exited 2 with no verdict is 81 (arm (g4) above).
+: > "$PI_LOG"; : > "$RO/logs/lane-9998.log"; rm -f "$RO/state/capacity-refused-9998"
+mkfake '' 2
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh" \
+    bash "$HERE/lane.sh" 9998 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
+{ [ "$lrc3" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "lane.sh on a HARNESS-SKEW refusal exits 81 and spawns NO agent (rc=$lrc3)" $rc
+grep -q 'stand-down recorded: gate=skew' "$RO/logs/lane-9998.log"; rc=$?
+ck "...and records the stand-down as gate=skew (not as a load capacity transfer)" $rc
+{ read -r _se _su _sg < "$RO/state/capacity-refused-9998" 2>/dev/null; [ "${_sg:-}" = "skew" ]; }; rc=$?
+ck "...and the durable record carries gate='skew' (got '${_sg:-<none>}') for the three readers" $rc
+grep -qF 'The remedy is cp scripts/orchestrator-harness/*.sh $O/ wherever lanes run' "$RO/logs/lane-9998.log"; rc=$?
+ck "...and PRINTS the sync remedy verbatim — a backticked line substituted it away (measured: 'The remedy is  wherever')" $rc
+# The other half of the same defect: a substitution's stdout is spliced into the sentence, so a
+# DOUBLED SPACE where the remedy should be is the signature the old shape left. Asserted so a future
+# backticked remedy cannot pass the check above by luck of a cp that happened to print that text.
+{ ! grep -q 'The remedy is  wherever' "$RO/logs/lane-9998.log"; }; rc=$?
+ck "...and the line is not the substituted shape (no 'The remedy is  wherever' hole in the sentence)" $rc
+
 # ── EVERY REFUSAL CODE MUST HAVE A READER (review of #2991, P1; HARDENED by the follow-up, P1) ──
 # A refusal code that no caller CLASSIFIES is worse than no gate: the box is refused correctly and the
 # operator is handed another gate's remedy. Measured on the first cut of #2935 — `AGENT_CAPABILITY_REFUSED`
@@ -1493,7 +1541,12 @@ chain_probe() { # <gate-word> -> sets CHAIN_RC and CHAIN_REMEDY (the gate the ch
     >/dev/null 2>&1 || r=$?
   rm -f "$_gatetable/O/state/capacity-refused-7"
   CHAIN_RC="$r"
-  CHAIN_REMEDY="$(grep -m1 -o 'refused at the [a-z-]* gate\|land-backlog' "$_gatetable/O/logs/chain-7.log" 2>/dev/null)"
+  # ⛔ `grep -E`, NOT A `\|` BRE ALTERNATION (follow-up review, P2): POSIX leaves alternation in a BRE
+  # undefined, and this repo's own note records that BSD tools do not support it (`orch-loop.sh:1283`,
+  # "BRE has no alternation; BSD sed (macOS…)"). Under a grep that follows its sed, the pattern
+  # matches NOTHING, `CHAIN_REMEDY` is empty, and the two assertions below red on the box that
+  # dispatches — the same construct the guard's own comment says had to be rewritten above.
+  CHAIN_REMEDY="$(grep -m1 -oE 'refused at the [a-z-]* gate|land-backlog' "$_gatetable/O/logs/chain-7.log" 2>/dev/null)"
 }
 # `<gate-word>:<CONSTANT-NAME>` — the value is read from the helper, so a RENUMBER here is followed
 # rather than pinned twice, and an absent constant shows up as an empty `want` (red), not as a pass.
