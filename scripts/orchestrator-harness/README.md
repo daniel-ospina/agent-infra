@@ -2396,9 +2396,11 @@ plus its tmux server (agent-infra#2159).
 lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|terminals|unknown>
 ```
 
-* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (45 min,
-  deliberately ABOVE `lane.sh`'s 2400 s wall limit: a live lane inside one long silent tool call must
-  not read as dead and license extra dispatch). A lane whose log was **deleted** (a `/tmp` prune can
+* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (125 min,
+  deliberately ABOVE the lane's wall BACKSTOP `LANE_BACKSTOP_S` = 7200 s: a live lane inside one long
+  silent tool call must not read as dead and license extra dispatch. It followed the wall limit while
+  the wall was the primary bound; since agent-infra#2888 the wall is only the backstop, so the window
+  follows the backstop). A lane whose log was **deleted** (a `/tmp` prune can
   do that to a working lane) also counts as live: it may still be working, and for a capacity gate
   "possibly live" must never be counted `0`. This is the number `MAX_LANES` gates.
 * **total** — every resident lane tree THE CENSUS CAN ATTRIBUTE: a `pi` tree whose root or a direct

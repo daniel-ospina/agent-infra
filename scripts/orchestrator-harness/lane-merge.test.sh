@@ -339,6 +339,23 @@ ck "a live merge lock is adopted: the record carries the LIVE pid and the RECORD
       && [ "$(awk '{print $2}' "$OT/state/lanemerge-41.chain")" = oldhead ] && echo 0 || echo 1)
 
 # ── 11c-septies. the WAITING_API refund is CAPPED, so the spin has a terminal state ────────────
+# ⛔ THE FIXTURES IN THIS BLOCK SEED A `.watch` COUNTER "AT THE BUDGET", AND THE BUDGET IS DERIVED
+# (agent-infra#2888 review, P3 — verified). They hardcoded the old 15-chunk default; once the lane's clock
+# moved to the 7200 s backstop the derived budget became 40, so every case seeded a counter nowhere near
+# the cap and measured the MIDDLE of a run instead of its terminal state — 11 arms went red for a change
+# that was correct, which is the "stale fixture" failure a hardcoded budget always buys. Read it from the
+# SHIPPED expression (§18 does the same), so a future re-derivation cannot silently retarget these arms.
+_mw_poll="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
+_mw_wait="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
+_mw_res="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
+_mw_wall="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+MAXW=""
+if [ -n "$_mw_poll" ] && [ -n "$_mw_wait" ] && [ -n "$_mw_res" ] && [ -n "$_mw_wall" ] \
+   && [ "$_mw_poll" -ge 1 ] && [ "$(( _mw_wall - _mw_wait - _mw_res ))" -gt 0 ]; then
+  MAXW=$(( ( _mw_wall - _mw_wait - _mw_res ) / _mw_poll ))
+fi
+ck "FIXTURE: the shipped supervision budget is readable (MAXW=${MAXW:-unreadable}) — a stale seed would measure the wrong end of every case here" \
+   $([ -n "$MAXW" ] && [ "$MAXW" -ge 1 ] && echo 0 || echo 1)
 new_o "$T/junk-q4.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open4.tsv"
 printf '%s deadbeef %s\n' 999994 "$OT/logs/lane-merge-51.log" > "$OT/state/lanemerge-51.chain"
@@ -362,7 +379,10 @@ printf 'open||newhead1|clean\n' > "$T/pr-open5.tsv"
 printf '%s deadbeef %s\n' 999993 "$OT/logs/lane-merge-52.log" > "$OT/state/lanemerge-52.chain"
 printf '[merge 52] MERGED via the rail (attempt 1)\n' > "$OT/logs/merge-52.log"
 printf '%s\n' "3" > "$OT/state/lanemerge-52.watch"
-printf '%s\n' "15" > "$OT/state/lanemerge-52.apiretry"
+# ⛔ THE REFUND ALLOWANCE IS `MAX_WATCH` PER CYCLE, so "exhausted" must be seeded as the SAME derived
+# number — a hardcoded 15 stopped being "spent" the moment the budget became 40, and this arm then
+# measured a refund instead of the charge it exists to prove (agent-infra#2888 review, P3).
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-52.apiretry"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 52 --watch --repo o/r --pr-tsv "$T/pr-open5.tsv" 2>&1)"; RC=$?
 ck "past the refund allowance the chunk is CHARGED (watch 3 → 4, not refunded) and the run says so" \
@@ -392,7 +412,7 @@ REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT"
   bash "$SCRIPT" 53 --watch --repo o/r --pr-tsv "$T/pr-open6.tsv" >/dev/null 2>&1
 ck "a LOAD chunk OVERWRITES an older WAITING_API disposition (the hand-off may only describe the last chunk)" \
    $([ "$(cat "$OT/state/lanemerge-53.lastdisp" 2>/dev/null)" = "WAITING_LOAD" ] && echo 0 || echo 1)
-printf '%s\n' "15" > "$OT/state/lanemerge-53.watch"
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-53.watch"
 # ⛔ A CASE-LOCAL gh LOG: `$T/gh.log` ACCUMULATES every earlier case's comments, so a negative
 # assertion on it ("must not say the read failed") is polluted by a PREVIOUS case's legitimate
 # unreadable-read hand-off — measured here as a false FAIL.
@@ -489,7 +509,7 @@ printf 'open||newhead1|clean\n' > "$T/pr-open9.tsv"
 sleep 60 & CH_PID56=$!
 printf '%s newhead1 %s\n' "$CH_PID56" "$OT/logs/lm-56.log" > "$OT/state/lanemerge-56.chain"
 echo "still working" > "$OT/logs/lm-56.log"
-printf '%s\n' "15" > "$OT/state/lanemerge-56.watch"
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-56.watch"
 printf '%s\n' "WAITING_HEAD_MOVED" > "$OT/state/lanemerge-56.lastdisp"
 HEADMOVED_LOG="$T/gh-tredecies.log"; : > "$HEADMOVED_LOG"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$HEADMOVED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
@@ -536,7 +556,7 @@ new_o "$T/junk-q15.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open15.tsv"
 printf '%s deadbeef %s\n' 999999 "$OT/logs/lm-62.log" > "$OT/state/lanemerge-62.chain"
 : > "$OT/logs/merge-62.log"
-printf '%s\n' "15" > "$OT/state/lanemerge-62.watch"
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-62.watch"
 printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-62.lastdisp"
 ARM_LOG="$T/gh-sedecies.log"; : > "$ARM_LOG"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
@@ -579,7 +599,7 @@ new_o "$T/junk-q19.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open19.tsv"
 printf '%s deadbeef %s\n' 999988 "$OT/logs/lm-67.log" > "$OT/state/lanemerge-67.chain"
 : > "$OT/logs/merge-67.log"
-printf '%s\n' "15" > "$OT/state/lanemerge-67.watch"
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-67.watch"
 printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-67.lastdisp"
 BODY_LOG="$T/gh-body.log"; : > "$BODY_LOG"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$BODY_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
@@ -591,7 +611,7 @@ new_o "$T/junk-q20.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open20.tsv"
 printf '%s deadbeef %s\n' 999987 "$OT/logs/lm-68.log" > "$OT/state/lanemerge-68.chain"
 : > "$OT/logs/merge-68.log"
-printf '%s\n' "15" > "$OT/state/lanemerge-68.watch"
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-68.watch"
 printf '%s\n' "WAITING_API" > "$OT/state/lanemerge-68.lastdisp"
 printf "lint\nunit\n" > "$OT/state/lanemerge-68.last"
 printf 'newhead1\n' > "$OT/state/lanemerge-68.lasthead"   # the head those names belong to
@@ -607,7 +627,7 @@ new_o "$T/junk-q21.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open21.tsv"
 printf '%s deadbeef %s\n' 999986 "$OT/logs/lm-69.log" > "$OT/state/lanemerge-69.chain"
 : > "$OT/logs/merge-69.log"
-printf '%s\n' "15" > "$OT/state/lanemerge-69.watch"
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-69.watch"
 printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-69.lastdisp"
 printf "lint\nunit\n" > "$OT/state/lanemerge-69.last"
 printf 'anOLDERhead\n' > "$OT/state/lanemerge-69.lasthead"
@@ -640,7 +660,7 @@ new_o "$T/junk-q23.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open23.tsv"
 printf '%s deadbeef %s\n' 999985 "$OT/logs/lm-71.log" > "$OT/state/lanemerge-71.chain"
 : > "$OT/logs/merge-71.log"
-printf '%s\n' "15" > "$OT/state/lanemerge-71.watch"
+printf '%s\n' "$MAXW" > "$OT/state/lanemerge-71.watch"
 printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-71.lastdisp"
 EXEC_BODY="$T/gh-exec.log"; : > "$EXEC_BODY"
 OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$EXEC_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
@@ -665,7 +685,7 @@ for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS WAITING_CHAIN_RUNNING; do
   printf 'open||newhead1|clean\n' > "$T/pr-open17.tsv"
   printf '%s deadbeef %s\n' 999990 "$OT/logs/lm-65.log" > "$OT/state/lanemerge-65.chain"
   : > "$OT/logs/merge-65.log"
-  printf '%s\n' "15" > "$OT/state/lanemerge-65.watch"
+  printf '%s\n' "$MAXW" > "$OT/state/lanemerge-65.watch"
   printf '%s\n' "$_arm" > "$OT/state/lanemerge-65.lastdisp"
   ARM_LOG="$T/gh-arm-$_arm.log"; : > "$ARM_LOG"
   OUT="$(REPO_PATH="${REPO_PATH:-$RUN_REPO}" PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
@@ -1017,13 +1037,25 @@ ck "the supervision budget is DERIVED from the lane's wall clock and RESERVES im
 # by the lane that owns it — and it must leave a NON-ZERO reserve, or the merge phase is again paid for
 # out of the lane's implementation time.
 _ps="$(sed -n 's/.*LANE_MERGE_POLL:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
-# lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-3300}" …`, so read the default out of THAT call.
-_lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
+# lane.sh invokes it as `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" …` (agent-infra#2888: the wall
+# became a BACKSTOP, so the lane's default is now the harness seam).
+# ⛔ READ BOTH SIDES FROM THE FILES THAT COMPUTE THEM (review finding, P3 — verified). The previous
+# version resolved `_lt` from lane.sh (7200, via the seam) and asserted the arithmetic against it while
+# the arithmetic that actually RAN was still clamped by lane-merge.sh's own `${LANE_TIMEOUT:-3300}`
+# literal — so the check passed on a wider margin and would ALSO have passed if that default drifted,
+# which is exactly the property it exists to protect. Now `_lt` is lane-merge.sh's OWN resolved
+# default, and a second assertion requires the two files to name the SAME bound.
+_lt="$(sed -n 's/.*LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$SCRIPT" | head -1)"
+[ -n "$_lt" ] || _lt="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
+_LANE_SIDE="$(grep -o 'LANE_TIMEOUT:-[0-9]*' "$HERE/lane.sh" | head -1 | tr -dc '0-9')"
+[ -n "$_LANE_SIDE" ] || _LANE_SIDE="$(grep -o 'LANE_BACKSTOP_S:-[0-9]*' "$HERE/spawn-gate.sh" | head -1 | tr -dc '0-9')"
+ck "lane-merge.sh's OWN supervision clock (${_lt:-?}s) is the SAME bound lane.sh hands the lane (${_LANE_SIDE:-?}s) — two files, one number" \
+   $([ -n "$_lt" ] && [ "$_lt" = "$_LANE_SIDE" ] && echo 0 || echo 1)
 _ws="$(sed -n 's/.*LANE_MERGE_WAIT:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_ws" ] || _ws="$(grep -o 'LANE_MERGE_WAIT:-[0-9]*' "$SCRIPT" | head -1 | tr -dc '0-9')"
 _ir="$(sed -n 's/.*LANE_MERGE_IMPL_RESERVE:-*\([0-9]*\)}.*/\1/p' "$SCRIPT" | head -1)"
 [ -n "$_ps" ] && [ -n "$_lt" ] && [ -n "$_ws" ] && [ -n "$_ir" ] && _mw=$(( (_lt - _ws - _ir) / _ps )) || _mw=0
-ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) ≤ lane.sh LANE_TIMEOUT ($_lt) — by ARITHMETIC across the two files, with a NON-ZERO implementation reserve" \
+ck "WAIT_S ($_ws) + MAX_WATCH x POLL ($_mw x $_ps) + IMPL_RESERVE ($_ir) = $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) ≤ lane-merge.sh's OWN LANE_WALL_S ($_lt) — by ARITHMETIC across the two files, with a NON-ZERO implementation reserve" \
    $([ -n "$_mw" ] && [ "${_ir:-0}" -gt 0 ] && [ "${_mw:-0}" -ge 1 ] && [ $(( ${_ws:-0} + ${_mw:-0} * ${_ps:-0} + ${_ir:-0} )) -le "$_lt" ] && echo 0 || echo 1)
 # ⛔ AND THE ARITHMETIC IS NOT THE RUNTIME (this suite's own lesson: a source-shape assertion passes on a
 # script whose runtime lost the property). Drive the DERIVED cap through --watch with a SHRUNK
