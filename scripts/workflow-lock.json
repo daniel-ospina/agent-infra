@@ -3,6 +3,6 @@
   "files": {
     ".github/workflows/ci.yml": "10a9dcf80cdf8de6899555de83224d14ca0a9a6bd3e25bd6047e8924565e7650",
     ".github/workflows/node-ci.yml": "cb73d7c7b08516740a667c75771d5d7674f3b42a2c84313ae8c2988fa96a668e",
-    ".github/workflows/ci-main.yml": "66136c80b9117707e7a3b4f0b492b5e49aa95b12f3c3bf581a963f2dd87a8600"
+    ".github/workflows/ci-main.yml": "41efb3723af7a48e204352b22fcf0c529c79971d104931e7c222a4ee97c4c404"
   }
 }

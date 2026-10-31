@@ -46,9 +46,11 @@ jobs:
         # remote whose fetch refspec maps onto an EXISTING tracking ref). A
         # single-ref checkout of a non-main branch leaves NEITHER, so the guard
         # correctly answers `block` and the assertion fails for a reason that has
-        # nothing to do with the branch's content — measured on run 41190178021:
-        # this assertion green on `main`, red on `integration/batch-20261031-16`,
-        # with `classify-git.mjs` byte-identical to main.
+        # nothing to do with the branch's content — measured on two runs: this
+        # assertion GREEN in `main`'s unit-test log (run 41185164653), RED in
+        # `integration/batch-20261031-16`'s (run 41190178021, job
+        # `extension-tests / unit-test`), with `classify-git.mjs` byte-identical to
+        # main.
         #   ⚠ The `unit-test` JOB was ALSO red on `main` while this was written, for
         # an UNRELATED reason (`test-sanctioned-identity.mjs`: stale
         # `sanctioned-scripts.pin.json` digests for `record-review.sh` /
@@ -65,7 +67,17 @@ jobs:
         # it would restore the false red it exists to remove. `--no-tags` mirrors
         # actions/checkout (which fetches without tags by default), so the non-main
         # run does not pull tags into a checkout that would otherwise have none.
-        if [ "${GITHUB_REF:-}" != "refs/heads/main" ]; then
+        #   The `--git-dir` clause is NOT cosmetic: `scripts/check-pi-pin-lockstep.mjs`
+        # EXECUTES this committed `test-command` inside a `mktemp -d` directory that is
+        # not a repository, under `bash -e`. Unguarded, the fetch exits 128 there and
+        # takes the whole step down (measured: 115 passed / 9 failed at this head vs
+        # 124 / 0 with `GITHUB_REF=refs/heads/main`, i.e. with the fetch skipped — the
+        # same head, so the fetch is the cause). Outside a repository there is no
+        # tracking ref to create and nothing to judge; the guard's own assertion
+        # answers `allow` there because `_recoveryCheckoutVerifiable` has no git dir to
+        # consult. So: skip when there is no repo, and fail loudly when there is one and
+        # the fetch cannot produce `origin/main`.
+        if [ "${GITHUB_REF:-}" != "refs/heads/main" ] && git rev-parse --git-dir >/dev/null 2>&1; then
           git fetch --depth=1 --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
         fi
         failures=0
@@ -623,13 +635,15 @@ jobs:
     runs-on: ubuntu-latest
     needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, python-ci]
     if: failure() && github.ref == 'refs/heads/main'
-    # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131). `failure()` must stay: replacing it
-    # with a ref condition alone makes this job run on every push and file nothing
-    # (the steps read `needs`, which only carries failure on a failed run), so a red
-    # main would file NOTHING while the job still existed. And the ref clause is what
-    # keeps an `integration/**` matrix failure from being filed as "main broken by
-    # merge": that tree never reached main, and a false issue there is precisely the
-    # noise that hides the real ones.
+    # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131), in DIFFERENT directions.
+    #   `failure()` must stay: the steps derive the failing set from `needs`, and the
+    #   filer files EVEN WHEN THAT SET IS EMPTY (bare title `main broken by merge`,
+    #   `Failing jobs: unknown`) — there is no `failed.length === 0` early return. So a
+    #   ref condition ALONE would run this job on every push to `main` and file a FALSE
+    #   "main broken by merge" issue on every GREEN one.
+    #   The ref clause is what keeps an `integration/**` matrix failure from being filed
+    #   as "main broken by merge": that tree never reached main, and a false issue there
+    #   is precisely the noise that hides the real ones.
     # RESIDUAL (round-2 review): paginate -> find -> create is check-then-act, so two
     # concurrent post-merge runs can both create (runs 34534428397 / 34534452089 failed 17s
     # apart on 2026-09-10 and filed #710 / #711). A job-level `concurrency:` group was added
