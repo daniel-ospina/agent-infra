@@ -32,6 +32,23 @@
 #     `claim_live`, the doctor) for exactly this reason. The residue — a recycled pid reads live until
 #     it exits — is #1985, already filed, and it is the SAFE direction: one PR waits, versus a second
 #     worker pushing to a branch a live worker already holds.
+#     ⚠️ AMENDED by #3096 (review P1-1). This is a DEPARTURE FROM THE LITERAL WORD of the rule above
+#     while KEEPING its rule: "empty ⇒ dead owner" stays FORBIDDEN, because the create→write window is
+#     real — but an empty record that has OUTLIVED any possible create window is a MEASUREMENT, not an
+#     inference, and is reclaimed through a detach-and-verify CAS (`pl_reap_no_owner`) exactly as
+#     `fix-one.sh`'s `prlock_no_owner_abandoned` reclaims the SAME file. What must never happen is the
+#     content-only inference, and it still cannot: outside the grace, and for every non-empty
+#     unparseable body, the verdict is unchanged — LIVE, never reaped. Why it had to be amended:
+#     measured 2026-10-30, this verdict answered `OWNED … never reaped` for 0-byte records 1278-2314
+#     MINUTES old, and `pr_owner_live` short-circuits on that rc (`orch-loop.sh:3150`) ahead of all five
+#     fixer/rail spawn arms — so the fixer arm that reclaims those records was unreachable on every box
+#     where this module is deployed. The evidence for the amendment is on #3096.
+#     ⛔ **OVERRIDES:** the 2026-10-25 review rule "an EMPTY or unparseable record is not stale … so it is
+#     treated as LIVE", read as an ABSOLUTE bar — an EMPTY record is reclaimed by AGE
+#     (`PRLOCK_NO_OWNER_GRACE_MIN`, default 2 m) through detach-and-verify, because that rule's REASON is
+#     the create→write window, which age measures and emptiness alone does not; the content-only
+#     inference it forbids is still forbidden. Marked here (and in `README.md`/`ARCHITECTURE.md`) so the
+#     departure reads as intentional at the point of adoption rather than as comment drift.
 #  2. A DETECTOR THAT CANNOT ACT IS A LOG LINE. `[dispatch] DRAIN STALLED` detected zero merges for
 #     360m, un-owned PRs, and a closed issue path — and then did nothing, cycle after cycle. The stall
 #     now feeds a bounded counter of passes in which the PR path STARTED NOTHING, and at the bound the
@@ -72,6 +89,75 @@ pl_lock_pid() { # <state> <pr> -> the recorded pid, or nothing
   tr -dc '0-9' < "$f" 2>/dev/null
 }
 
+# ── WHEN "NO OWNER" IS MEASURED RATHER THAN INFERRED (#3096) ────────────────────────────────────
+# ⛔ THE HOLE THESE THREE FUNCTIONS CLOSE. `pl_lock_pid` strips every non-digit, so a record that
+# names NOBODY — 0 bytes, whitespace, or a `noclobber` create caught before its `echo $$` — yields the
+# empty pid and lands in the "claim mid-creation" arm below, which is correct for the WINDOW and wrong
+# for ever. Measured 2026-10-30 on three Linux cells: `state/mergeclaim-<PR>.lock` records were 0-byte,
+# unheld and **1278-2314 MINUTES** old, so THIS verdict told the controller `OWNED … never reaped`, the
+# fixer arms spawned nothing, while `pr_owned` (which needs a pid > 0) counted the same PRs UN-owned and
+# held the whole issue path shut. One state, two opposite verdicts, zero lanes — and a second arm in
+# `fix-one.sh` that reclaims exactly these records could never run, because this gate refuses to spawn
+# the fixer in the first place (review of #3096, P1-1).
+#
+# THE ANSWER IS THE MEASUREMENT THE RULE ALREADY ASKED FOR, NOT A LOOSER READING. The rule above forbids
+# the INFERENCE "empty ⇒ dead owner", because the create→write window is real; it does not claim the
+# window is unbounded. So the question is not "is the record empty" but "has it outlived any possible
+# create window" — `mmin` on the record, the same third measurement `fix-one.sh`'s
+# `prlock_no_owner_abandoned` takes on the same file, and the convergent practice for a pid-less lock
+# (Prefect #21388 reclaims a lock whose content is empty after an mtime threshold; `flufl.lock` expires
+# by timestamp; `filelock` recommends read → RENAME → re-verify → unlink). The grace is bounded far
+# above the window (microseconds) and far below the observed ages (hours).
+# OUTSIDE the grace, and for any NON-empty unparseable body, nothing changes: still LIVE, still kept.
+# Reaping is a DETACH-AND-VERIFY, never `rm`, so a peer that claimed in between is put back.
+PL_NO_OWNER_GRACE_MIN="${PRLOCK_NO_OWNER_GRACE_MIN:-2}"
+pl_record_no_owner() { # <record path> -> prints its content and rc 0 ONLY when it names NO owner
+  local f="${1:-}" p
+  [ -f "$f" ] || return 1
+  [ -L "$f" ] && return 1
+  # `cat`'s exit status, not a `|| echo 0` fallback: an UNREADABLE record is not evidence of anything,
+  # and turning it into "0" would admit it to an arm that then reaps what it could not read.
+  p="$(cat "$f" 2>/dev/null)" || return 1
+  # ⛔ ONLY `''` IS ADMITTED HERE, NOT `0` (review of #3096, P3-1). `pl_lock_pid` strips every non-digit,
+  # so a `0` body yields the NON-empty pid `0` and never reaches this function at all — the pre-existing
+  # dead-pid arm answers for it. Admitting `0` here was dead code that also made the verdict's own
+  # sentence false (it claimed no liveness test could resolve a shape another arm was already resolving).
+  case "${p//[[:space:]]/}" in '') printf '%s\n' "$p"; return 0 ;; esac
+  return 1
+}
+pl_record_outlived_create_window() { # <record path> -> 0 when the RECORD itself is older than the grace
+  local f="${1:-}"
+  [ -f "$f" ] || return 1
+  # `find -mmin` is the ONE age primitive that means the same thing on this box's GNU userland and the
+  # macOS harness hosts (GNU `stat -c` and BSD `stat -f` disagree), so this is portable by construction.
+  [ -n "$(find "$f" -maxdepth 0 -mmin +"${PL_NO_OWNER_GRACE_MIN:-2}" 2>/dev/null)" ]
+}
+pl_reap_no_owner() { # <state> <pr> -> 0 reaped · 1 nothing touched · 3 a peer's claim was detached and RESTORED · 4 …and could NOT be
+  local st="${1:-}" pr="${2:-}" f side
+  f="$(pl_lock_path "$st" "$pr")"
+  side="$f.reclaim.$$"
+  pl_record_no_owner "$f" >/dev/null || return 1
+  # DETACH by `mv`, never `rm`: what was moved can be inspected, and only one racer can move a given
+  # record, which is the compare-and-swap. This is `fix-one.sh`'s `prlock_takeover` shape, applied to
+  # the one state it cannot see from a pid.
+  mv -f "$f" "$side" 2>/dev/null || return 1
+  if ! pl_record_no_owner "$side" >/dev/null; then
+    # What we detached is NOT the abandoned record we measured: a peer claimed it in the instant between
+    # the read and the `mv`. Put it back with `ln` (create-if-absent), so a claim displaced for an
+    # instant is not lost — and say so loudly if a third party re-claimed the path first.
+    # ⛔ `ln` INTO A DIRECTORY EXITS 0 and links INSIDE it, so success is not proof the claim is reachable
+    # again — `fix-one.sh`'s `prlock_take` documents the same trap with a measured incident. The restore is
+    # verified AT THE PATH, and a stray inner link removed, before rc 3 is ever returned (review P2-2).
+    if ln "$side" "$f" 2>/dev/null && [ ! -d "$f" ] && [ "$(cat "$f" 2>/dev/null)" = "$(cat "$side" 2>/dev/null)" ]; then
+      rm -f "$side"; return 3
+    fi
+    rm -f "$f/${side##*/}" "$side" 2>/dev/null
+    return 4
+  fi
+  rm -f "$side"
+  return 0
+}
+
 # ── THE VERDICT ───────────────────────────────────────────────────────────────────────────────
 # pl_verdict <state-dir> <pr> <other-proof-rc> <sess-proof-rc>
 #   other-proof-rc  0 when an EXTERNAL live fact proves ownership (the cwd scan / cross-box lease —
@@ -92,7 +178,7 @@ pl_lock_pid() { # <state> <pr> -> the recorded pid, or nothing
 # The residue is #1985's (a recycled pid reads live until it exits) — stated, already filed, and the
 # mirror image of the one that MUST NOT happen here (deleting a live worker's lock).
 pl_verdict() {
-  local st="${1:-}" pr="${2:-}" other="${3:-1}" sess="${4:-1}" f p why
+  local st="${1:-}" pr="${2:-}" other="${3:-1}" sess="${4:-1}" f p why _rr
   pl_num "$pr" || { printf 'RELEASED\tnon-numeric PR ref (%s) is not a PR\n' "${pr:-<empty>}"; return 1; }
   f="$(pl_lock_path "$st" "$pr")"
   # 1. THE LIVE FACT (cwd scan / cross-box lease) — a process that is working the PR right now.
@@ -105,7 +191,49 @@ pl_verdict() {
   if [ -f "$f" ]; then
     if [ -z "${p:-}" ]; then
       # ⛔ THE CREATION WINDOW IS NOT A DEAD OWNER (fix-one.sh documents this exact hole): the record
-      # exists before its pid does, so an unreadable/empty lock is a claim IN PROGRESS.
+      # exists before its pid does, so an unreadable/empty lock is a claim IN PROGRESS — for as long as
+      # a create window can last. Past it, "no owner" is a MEASUREMENT rather than an inference, and
+      # the verdict is the one `fix-one.sh`'s `prlock_no_owner_abandoned` already acts on: reconciled
+      # here (#3096 review P1-1) so ONE state cannot read OWNED to the spawn gate and ABANDONED to the
+      # fixer. Outside the grace — and for every non-empty unparseable body — nothing below fires.
+      if pl_record_no_owner "$f" >/dev/null && pl_record_outlived_create_window "$f"; then
+        # ⛔ THE WORKER RECORD IS ASKED FIRST, AND THIS ARM DELETES FILES (review of #3096, P2-1). Lock
+        # evidence is the WEAKEST proof this file accepts; a live `fix-<PR>`/`merge-<PR>` record is the
+        # strongest short of a live pid. The dead-pid arm below deliberately DECLINES to answer and
+        # falls through to step 3 for exactly that reason — so an arm that DELETES the lock must not run
+        # ahead of it. Deleting a live worker's lock is the one outcome this module exists to prevent (a
+        # second worker then pushes to a branch the first still holds).
+        if [ "$sess" = "0" ]; then
+          printf 'OWNED\t%s\n' "a live worker record (fix-$pr/merge-$pr) holds it — the lock names no owner, but a measured worker record outranks a lock this pass would otherwise reap"
+          return 0
+        fi
+        pl_reap_no_owner "$st" "$pr"; _rr=$?
+        if [ "$_rr" -eq 0 ]; then
+          printf 'RELEASED\t%s\n' "lock mergeclaim-$pr.lock named NO owner (empty or whitespace-only content, so no pid-based liveness test could resolve it) and was older than ${PL_NO_OWNER_GRACE_MIN}m — no create window explains it, so the ABANDONED record was REMOVED and the PR is un-owned and releasable"
+          return 1
+        fi
+        if [ "$_rr" -eq 4 ]; then
+          printf 'OWNED\t%s\n' "lock mergeclaim-$pr.lock named NO owner and outlived the create window, but the path was re-claimed in the instant before the reclaim and the claim this pass detached could NOT be put back — that claim is LOST and a peer may be working blind; REPAIR only if this repeats with no live worker (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh')"
+          return 0
+        fi
+        if [ "$_rr" -eq 3 ]; then
+          printf 'OWNED\t%s\n' "lock mergeclaim-$pr.lock named NO owner but a PEER claimed it in the instant before the reclaim — that claim was put back at the path and the peer holds it"
+          return 0
+        fi
+        # The detach did not happen. Do not report a peer that was never observed, and do not name a CAUSE
+        # that was not measured (an earlier draft asserted "state/ is unwritable" for every `mv` and
+        # pre-check failure alike — review P3-2). Re-read the path and say what is actually there.
+        if pl_record_no_owner "$f" >/dev/null; then
+          printf 'OWNED\t%s\n' "lock mergeclaim-$pr.lock names NO owner and outlived the create window, but it could NOT be detached for reclaim (measured: the record is still there, unchanged) — it will be re-examined next pass"
+          return 0
+        fi
+        if [ ! -e "$f" ]; then
+          printf 'OWNED\t%s\n' "lock mergeclaim-$pr.lock names NO owner, but the record VANISHED between the measurement and the reclaim — this pass deleted nothing, and a peer may now hold the PR"
+          return 0
+        fi
+        printf 'OWNED\t%s\n' "lock mergeclaim-$pr.lock names NO owner but a PEER re-claimed it in the instant before the reclaim — it now carries a readable owner and the peer holds it"
+        return 0
+      fi
       printf 'OWNED\t%s\n' "lock exists but carries no readable pid (a claim mid-creation, or an unreadable record) — treated LIVE, never reaped"
       return 0
     fi
