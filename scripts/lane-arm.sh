@@ -31,7 +31,9 @@
 # WHAT THIS SCRIPT IS: the bound, the honesty, and the handoff -- nothing else.
 #   * it TAKES THE MEASUREMENT (bounded `lane-status.py --json`) and PUBLISHES it atomically;
 #   * it RENDERS THE LISTS (`lane-actions.py --stdin <snapshot>`, cache-aware, so it never re-samples);
-#   * it writes state/LANE-QUEUE.tsv -- ONE machine-readable line per WEDGED lane, the handoff a
+#   * it writes state/LANE-QUEUE.tsv -- ONE machine-readable line per lane the classifier puts in the
+#     wedge family, the verdict column carrying the classifier's OWN word (WEDGED / CHILD_STUCK /
+#     CHILD_STUCK_PARKED ...) so a consumer never has to re-derive which action applies. The handoff a
 #     consumer drains (the .md is for a human; a program should not parse prose);
 #   * it REFUSES A STALE SNAPSHOT: a frozen input is not a current verdict, so it says so and exits
 #     non-zero. A pass that cannot measure is NEVER exit 0 -- that is the no-op-gate class
@@ -90,7 +92,8 @@
 #
 # USAGE:
 #   lane-arm.sh                     # sample + publish (from a cmux descendant)
-#   lane-arm.sh --max-snapshot-age 3600   # refuse a SAMPLE that took longer than this (default: 900 s)
+#   lane-arm.sh --max-snapshot-age 3600   # refuse a reading older than this AT PUBLISH
+#                                         # (default: 2 x --budget, i.e. the pass's own worst case)
 #   lane-arm.sh --print             # also print the first 40 lines of the recap
 #   lane-arm.sh --budget 240        # hard bound for the sampler (default: 240 s)
 
@@ -110,16 +113,7 @@ RECAP="$STATE/NEEDS-ACTION.md"
 QUEUE="$STATE/LANE-QUEUE.tsv"
 LOG="$STATE/lane-arm.log"
 LOCK="$STATE/lane-arm.lock"
-STALE_LOCK_S=900
 BUDGET=240
-# ⛔ NOT `MAX_AGE` (2026-10-31, verify). That name is a REGISTERED term owned by
-# `scripts/monitor-worker.sh` (a worker-log freshness bound, `${2:-60}`), and re-declaring it here
-# made ONE name out of TWO unrelated numbers -- the exact divergence the stall-term registry exists
-# to surface. The registry refuses a registered term declared in an unregistered file, and co-owner
-# registration is impossible by construction here (the forward check requires the SAME value in every
-# owner, and these differ: 60 s vs 900 s). So the name is distinct and self-describing, and it is
-# registered in `extensions/shared/heartbeat-progress-edges.ts` on its own row.
-LANE_ARM_SNAPSHOT_MAX_AGE=900
 SHOW=0
 # The pid of whatever `bounded()` currently has in flight, so the signal handler can stop it instead
 # of orphaning it (see the trap block). Emptied by `bounded()` on the normal path.
@@ -129,7 +123,7 @@ CUR_PID=""
 # "$secs" and the watchdog `exit 0`s when `sleep` rejects the value -- so `--budget abc` left the child
 # waited for with NO bound at all (measured: a 20 s sampler under `--budget abc` ran to completion in
 # 21 s and the pass PUBLISHED and exited 0). The same parse hole on `--max-snapshot-age abc` made
-# `[ abc -gt 900 ]` error out, so the `if` was false and a refusal was silently disabled -- the
+# `[ abc -gt <ceiling> ]` error out, so the `if` was false and a refusal was silently disabled -- the
 # no-op-gate shape this file exists to remove. Both are positive integers or they are usage errors.
 _is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -gt 0 ]; }
 
@@ -140,12 +134,32 @@ while [ $# -gt 0 ]; do
                          BUDGET="$2"; shift 2 ;;
     --max-snapshot-age)  [ $# -ge 2 ] || { echo "lane-arm: --max-snapshot-age needs a value" >&2; exit 2; }
                          _is_pos_int "$2" || { echo "lane-arm: --max-snapshot-age must be a positive integer of seconds, not '$2'" >&2; exit 2; }
-                         LANE_ARM_SNAPSHOT_MAX_AGE="$2"; shift 2 ;;
+                         LANE_ARM_SNAPSHOT_MAX_AGE_OPT="$2"; shift 2 ;;
     --print)             SHOW=1; shift ;;
     -h|--help)           sed -n '2,80p' "$0"; exit 0 ;;
     *) echo "lane-arm: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
+
+# ── THE TWO BOUNDS THIS PASS DECLARES ARE DERIVED FROM ITS OWN BUDGET, AFTER PARSING ──────────────
+# ⛔ THE STALENESS CEILING IS THE PASS'S STRUCTURAL WORST CASE, NOT A MAGIC 900 (2026-10-31, review).
+# The sampler AND the renderer are each bounded by $BUDGET, so a legitimate pass cannot exceed
+# 2 x BUDGET unless one of those bounds has already failed; a literal 900 over a 240 s budget was a
+# bound the code could not reach — an inert enforcer, which is worse than no bound because the header
+# advertised it. Derived, the ceiling is REACHABLE (the publish-time check below) and it does not
+# silently loosen when an operator raises --budget. `--max-snapshot-age` pins it explicitly.
+# ⛔ AND NOT `MAX_AGE`: that symbol is a REGISTERED term owned by `scripts/monitor-worker.sh` (a
+# worker-log freshness bound at `${2:-60}`), and one name over two unrelated numbers is the divergence
+# the stall-term registry exists to surface. The registry refused the collision, and co-owner
+# registration is impossible by construction (the forward check requires the SAME value in every
+# owner, and 60 s is not this bound). Both bounds below are registered on their own rows.
+LANE_ARM_SNAPSHOT_MAX_AGE="${LANE_ARM_SNAPSHOT_MAX_AGE_OPT:-$(( BUDGET * 2 ))}"
+# ⛔ A LOCK REAP BOUND MUST EXCEED THE LONGEST LEGITIMATE PASS, or a second pass reaps a LIVE lock and
+# the two interleave their artefacts (one pass's snapshot beside the other's queue). The longest
+# legitimate pass is 2 x BUDGET; deriving the bound makes that inequality structural instead of a
+# constant an operator can outgrow by passing --budget 1200 (measured: a 900 s constant against a
+# 1200 s budget let an overlapping pass break a live lock and both publish).
+LANE_ARM_LOCK_REAP_S=$(( BUDGET * 2 + 60 ))
 
 mkdir -p "$STATE" 2>/dev/null || { echo "lane-arm: cannot create $STATE" >&2; exit 4; }
 
@@ -226,26 +240,56 @@ fail() { echo "lane-arm: $1" >&2; log "FAIL $1"; exit 4; }
 
 # ── lock: one arm at a time; break a stale one (a SIGKILLed run cannot clean up) ────────────────
 if [ -e "$LOCK" ]; then
-  # ⛔ DROP THE `|| la=0`. With it, an UNREADABLE stamp became 0, which is `-lt STALE_LOCK_S`, so the
+  # ⛔ DROP THE `|| la=0`. With it, an UNREADABLE stamp became 0, which is `-lt LANE_ARM_LOCK_REAP_S`, so the
   # pass skipped with exit 0 and the `''` arm of the case below was UNREACHABLE — the "unreadable is
   # maximally stale" half of this rule was described but not implemented. Leaving `la` empty lets the
   # case see it.
   la="$(age_s "$LOCK")"
   # ⛔ A NEGATIVE AGE IS NOT A FRESH LOCK. A backward clock step, a copied file or `touch -t` puts the
-  # mtime in the future, and a negative number satisfies `-lt STALE_LOCK_S` — so the pass would skip
+  # mtime in the future, and a negative number satisfies `-lt LANE_ARM_LOCK_REAP_S` — so the pass would skip
   # with exit 0 forever and the stale-break below would be unreachable until real time passed
-  # mtime+900. Under `Type=oneshot` that exit 0 reads as SUCCESS: a healthy timer with nothing
+  # mtime+the reap window. Under `Type=oneshot` that exit 0 reads as SUCCESS: a healthy timer with nothing
   # produced, which is the no-op-gate class this whole arm exists to refuse. An UNREADABLE or FUTURE
   # stamp is MAXIMALLY stale (break it), never a fresh lock.
-  case "$la" in ''|-*) la=$STALE_LOCK_S ;; esac
-  if [ "$la" -lt "$STALE_LOCK_S" ]; then
-    echo "lane-arm: another pass holds $LOCK (${la}s) -- skipping" >&2
-    log "SKIP lock held ${la}s"
+  case "$la" in ''|-*) la=$LANE_ARM_LOCK_REAP_S ;; esac
+  # ⛔ OWNERSHIP IS A PID, NOT AN MTIME (2026-10-31, review). An mtime-only lock cannot tell a pass
+  # that is WORKING from one that was SIGKILLed, so a dead holder's lock made EVERY fire for the whole
+  # reap window print "skipping" and exit 0 -- under Type=oneshot that is SUCCESS with nothing
+  # produced: the no-op-gate shape this file exists to remove, and the reason the window had to be
+  # guesswork in the first place. The holder records its pid, and a pid that no longer exists is stale
+  # IMMEDIATELY, not after the window.
+  # ⛔ `ps -o pid=`, NOT `kill -0`: this lock lives in a state dir shared between the timer's identity
+  # and a cmux descendant's, and `kill -0` against another user's LIVE pid fails with EPERM -- which
+  # would read as "dead" and break a live lock. `ps` answers the only question asked (does this pid
+  # exist?) for any owner.
+  # ⛔ AND THE PID MUST STILL BE RUNNING THE ARM: a recycled pid belongs to some unrelated process, and
+  # accepting that as a live holder is the stale-measurement class. The args are RE-PROVED here, never
+  # assumed from the pid existing.
+  lp="$(head -1 "$LOCK" 2>/dev/null | tr -cd '0-9')"
+  if [ -n "$lp" ] && [ "$lp" != "$$" ] \
+     && ps -o pid= -p "$lp" >/dev/null 2>&1 \
+     && ps -o args= -p "$lp" 2>/dev/null | grep -q 'lane-arm\.sh'; then
+    # A LIVE holder is the ONE case where exit 0 is honest: that pass owns the publish, so this pass
+    # has nothing to do and nothing was lost. It is also what a second timer fire looks like.
+    echo "lane-arm: another pass holds $LOCK (pid $lp, ${la}s old) -- skipping" >&2
+    log "SKIP lock held by live pid $lp (${la}s)"
     exit 0
   fi
+  if [ -z "$lp" ] && [ "$la" -lt "$LANE_ARM_LOCK_REAP_S" ]; then
+    # No pid recorded (an older pass's lock, or a file someone created by hand): age is the only
+    # evidence there is. Refusing to break a lock this pass cannot identify is the conservative
+    # direction, and it is BOUNDED by the reap window rather than open-ended.
+    echo "lane-arm: $LOCK carries no holder pid and is ${la}s old (< ${LANE_ARM_LOCK_REAP_S}s) -- treating it as held; this pass will not break a lock it cannot identify" >&2
+    log "SKIP unidentified lock ${la}s"
+    exit 0
+  fi
+  # Everything left is stale: the recorded holder is GONE (its pid no longer exists, or is now some
+  # other program), or there is no pid and the window has expired, or the stamp is unreadable/future.
+  echo "lane-arm: breaking a stale $LOCK (pid ${lp:-unknown}, ${la}s old)" >&2
+  log "REAP stale lock pid=${lp:-unknown} age=${la}s"
   rm -f "$LOCK" 2>/dev/null || true
 fi
-( set -C; : >"$LOCK" ) 2>/dev/null || { echo "lane-arm: cannot create $LOCK in $STATE -- the state dir is read-only or full, OR another pass won the race for it, OR a file another user owns is in the way (this dir is shared by the timer's identity and the cmux descendant's, whose owners must match -- see install-lane-arm-timer.sh)" >&2; log "FAIL cannot create lock"; exit 4; }
+( set -C; printf '%s\n' "$$" >"$LOCK" ) 2>/dev/null || { echo "lane-arm: cannot create $LOCK in $STATE -- the state dir is read-only or full, OR another pass won the race for it, OR a file another user owns is in the way (this dir is shared by the timer's identity and the cmux descendant's, whose owners must match -- see install-lane-arm-timer.sh)" >&2; log "FAIL cannot create lock"; exit 4; }
 # ⛔ AN EXTERNAL SIGNAL IS NOT THE BOUND (2026-10-31, review). With ONE cleanup trap on
 # EXIT/INT/TERM, a TERM to the arm interrupted `wait` inside `bounded()`, and the interrupted wait's
 # status then landed in the `137|143` arm below -- so a pass an operator killed was reported as
@@ -356,18 +400,28 @@ fi
 # marker exists to prevent, so the stamp was worse than none.
 # The age this arm can HONESTLY measure is the age of its own reading: the wall time from the moment
 # it asked for a sample to the moment the sample is in hand. That is a real bound on how stale the
-# data is (nothing between T0 and now can have aged it), it is non-zero, and it CAN exceed the bound --
-# e.g. `--budget 1200` against the 900 s default -- which is what makes the refusal a live gate
-# rather than an advertisement. `--no-cache` above is what makes the sample fresh in the first place.
+# data is (nothing between T0 and now can have aged it) and it is non-zero.
+# ⛔ BUT A SAMPLE-DURATION BOUND ALONE IS INERT, AND THAT IS WHAT SHIPPED (2026-10-31, review). The
+# sampler is hard-bounded by $BUDGET, so a sample that reaches the budget is KILLED and refused above
+# with `KILLED at the ... bound` -- `sa` is therefore always < BUDGET and a ceiling above BUDGET can
+# never fire. Measured: with `--budget 240` against the old literal 900 the refusal was unreachable,
+# while the header advertised it. So the ceiling now bounds the PASS (2 x BUDGET by construction, see
+# the derivation above) and the binding arm is the PUBLISH-time check in 4b, which also covers the
+# renderer. This early check is kept because it refuses a stale sample BEFORE paying for a render.
 sa=$(( $(now_s) - SAMPLE_T0 ))
 if [ "$sa" -gt "$LANE_ARM_SNAPSHOT_MAX_AGE" ]; then
   rm -f "$TMP"
   fail "the sample took ${sa}s (> ${LANE_ARM_SNAPSHOT_MAX_AGE}s) -- a reading that old is not presented as current"
 fi
 
-# ── 3. THE HANDOFF: one machine-readable line per WEDGED lane ─────────────────────────────────
+# ── 3. THE HANDOFF: one machine-readable line per lane the classifier calls WEDGE-FAMILY ──────
 # The .md is prose for a human; a consumer should not have to parse it. This is the contract.
 # Columns: verdict <TAB> lane <TAB> workspace <TAB> session <TAB> why
+# ⛔ THE FIRST COLUMN IS THE CLASSIFIER'S OWN VERDICT WORD, not a constant (2026-10-31, review). It
+# used to be `WEDGED` for every row, which threw away the CHILD_STUCK / CHILD_STUCK_PARKED distinction
+# that the only documented action depends on: a consumer draining `^WEDGED` cannot tell a parked child
+# (safe `unblock-lane`) from a quiet one, and is pushed back to scraping the prose this header forbids
+# consuming.
 # The WHY is BUILT FROM THE SNAPSHOT FIELDS, never parsed out of the prose recap: the recap is for a
 # human, and a consumer that regex-scrapes it is one wording edit away from silently matching nothing
 # (the "a gate that cannot answer its own question" class). Every number a human needs to judge the
@@ -379,7 +433,9 @@ fi
 QTMP="$QUEUE.arm.$$"
 # The pass marker the queue header carries (see the comment at the header). `sa` is the SAMPLE age
 # measured above -- the wall time this pass spent obtaining its reading -- so it is a real datum and
-# not the file's own mtime. Exporting it rather than letting the renderer guess keeps the stamp honest.
+# not the file's own mtime. It is rewritten to the PUBLISH-time age in 4b, because the renderer runs
+# after this line and its own duration would otherwise be invisible in the stamp. Exporting it
+# rather than letting the renderer guess keeps the stamp honest.
 export LANE_ARM_SNAPSHOT_AGE="${sa:-?}"
 if ! "$PY" - "$TMP" >"$QTMP" <<'PYEOF'
 import json, os, sys, time
@@ -442,9 +498,17 @@ for ev in lanes:
             declared = " | ".join(str(x) for x in declared)
         parts.insert(0, str(declared))
     why = "; ".join(parts)
-    print("WEDGED\t%s\t%s\t%s\t%s" % (lane, ws, sid, why.replace("\t", " ").replace("\n", " ")))
+    # ⛔ THE VERDICT COLUMN CARRIES THE CLASSIFIER'S OWN WORD (2026-10-31, review). This emitted a
+    # hard-coded `WEDGED` for every accepted row, so a CHILD_STUCK or CHILD_STUCK_PARKED lane was
+    # published AS `WEDGED` -- while the header above tells the consumer to drain a PARKED-CHILD row
+    # with `unblock-lane.sh`, i.e. the ONE distinction the only documented action depends on was thrown
+    # away at the moment of writing. Measured with a two-row snapshot (one WEDGED, one CHILD-STUCK):
+    # the queue contained `WEDGED` twice. `st` is already the normalized uppercase voter, so emit it.
+    print("%s\t%s\t%s\t%s\t%s" % (st, lane, ws, sid, why.replace("\t", " ").replace("\n", " ")))
     n += 1
-sys.stderr.write("wedged=%d\n" % n)
+# ⛔ NO stderr COUNT HERE (2026-10-31, review): this printed `wedged=N` to stderr on a pass that could
+# still abort and publish NOTHING, so an operator or a log scraper saw a count from a discarded pass.
+# The count is derived from the PUBLISHED queue after the publish instead (the success path at the end).
 PYEOF
 then
   rm -f "$QTMP"
@@ -453,9 +517,19 @@ fi
 
 # ── 4. THE LISTS (cache-aware: --stdin never re-samples, so this cannot double the cost) ───────
 [ -f "$SC/lane-actions.py" ] || fail "lane-actions.py ABSENT at $SC/lane-actions.py"
-if ! bounded "$BUDGET" "$PY" "$SC/lane-actions.py" --stdin "$TMP" >"$ACTIONS_OUT_TMP" 2>"$ACTIONS_ERR_TMP"; then
-  rm -f "$TMP" "$ACTIONS_OUT_TMP" "$ACTIONS_ERR_TMP"
-  fail "lane-actions.py failed (see $ACTIONS_ERR); previous snapshot AND recap left standing"
+bounded "$BUDGET" "$PY" "$SC/lane-actions.py" --stdin "$TMP" >"$ACTIONS_OUT_TMP" 2>"$ACTIONS_ERR_TMP"
+arc=$?
+if [ "$arc" -ne 0 ]; then
+  rm -f "$TMP" "$ACTIONS_OUT_TMP"
+  # ⛔ A BOUND-KILL IS NOT A RENDERER FAULT, AND THE EVIDENCE IS PUBLISHED WHEN THERE IS ANY
+  # (2026-10-31, review). The old form discarded the status, so rc 137/143 reported "lane-actions.py
+  # failed (see ...actions.err)" while that capture was 0 bytes -- sending the reader to a program that
+  # never erred and could not explain itself. Same misreport the classifier arm above was fixed for.
+  case "$arc" in
+    137|143) rm -f "$ACTIONS_ERR_TMP"; fail "lane-actions.py KILLED at the ${BUDGET}s bound -- this is THE BOUND, not a renderer fault (a process killed mid-write may have logged nothing); previous snapshot AND recap left standing" ;;
+    *)     mv -f "$ACTIONS_ERR_TMP" "$ACTIONS_ERR" 2>/dev/null || rm -f "$ACTIONS_ERR_TMP"
+           fail "lane-actions.py EXITED $arc -- not a timeout (capture: $ACTIONS_ERR); previous snapshot AND recap left standing" ;;
+  esac
 fi
 if [ ! -e "$ACTIONS_ERR_TMP" ]; then
   rm -f "$TMP"
@@ -492,15 +566,28 @@ mv -f "$ACTIONS_ERR_TMP" "$ACTIONS_ERR" 2>/dev/null || true
 # lane-status.last.json, leaving a NEW snapshot beside a STALE LANE-QUEUE.tsv and a stale `wedged=`
 # story -- the partial publish the contract above denies. The temp file is therefore still in place
 # when the renderer runs; it is renamed to $SNAP only once every consumer of these bytes has
-# succeeded (see the publish block at the end of the handoff section).
-# The other order destroys the last good fleet view in a pass that then abstains: a degraded read is still
-# valid JSON with a list, so it would replace the good snapshot and only then be refused by
-# lane-actions.py. `--stdin <path>` does not re-sample, and lane-actions derives its age from that
-# file's mtime, so rendering against the temp file changes nothing it reports.
-# ⛔ AND THIS IS THE ONLY `mv` TO $SNAP IN THIS FILE, and it happens at the END. An earlier revision
-# left the old publish in place here as well, so the temp file was already gone when the renderer
-# ran: every pass exited 4 AND the snapshot had been replaced. Three revisions of this ordering have
-# now shipped; the invariant is "one publish, last, restored if it fails part-way".
+# succeeded (see the publish block below).
+
+# ── 4b. THE CEILING IS MEASURED AT PUBLISH, AND THE STAMP IS CORRECTED TO MATCH ────────────────
+# ⛔ `sa` IS MEASURED BEFORE THE RENDERER RUNS, SO ON ITS OWN IT UNDER-READS (2026-10-31, review). The
+# queue's `snapshot_age` is stamped inside the renderer heredoc, i.e. with the age of the SAMPLE, while
+# the reading does not become current until the renderer (separately bounded by $BUDGET) has finished
+# and the two renames land. Measured gap: a 240 s sample plus a 240 s render publishes a ~480 s-old
+# reading stamped `snapshot_age=240s`. So the ceiling is applied HERE, to the age at publish, and the
+# stamp is rewritten to the same number -- the rewrite happens on the TEMP file before the rename, so
+# the publish is still ONE atomic mv.
+pub_age=$(( $(now_s) - SAMPLE_T0 ))
+if [ "$pub_age" -gt "$LANE_ARM_SNAPSHOT_MAX_AGE" ]; then
+  rm -f "$TMP" "$QTMP"
+  fail "the reading is ${pub_age}s old at publish (> the ${LANE_ARM_SNAPSHOT_MAX_AGE}s ceiling) -- a reading that old is not presented as current; nothing published"
+fi
+# Same-directory temp, then a rename: never a truncating in-place rewrite of a file another pass could
+# be about to publish (the state dir is shared between two identities -- see the lock block).
+if awk -v age="$pub_age" 'BEGIN{FS="\t";OFS="\t"} /^# generated\t/{sub(/snapshot_age=[^[:space:]]*/, "snapshot_age=" age "s")} {print}' "$QTMP" >"$QTMP.stamp" 2>/dev/null && mv -f "$QTMP.stamp" "$QTMP"; then :; else
+  rm -f "$TMP" "$QTMP" "$QTMP.stamp"
+  fail "cannot correct the queue's snapshot_age stamp before publishing -- publishing a stamp this pass knows is wrong is worse than publishing nothing"
+fi
+snapshot_age=$pub_age
 
 # ── 5. ONE PUBLISH, LAST, AND RESTORED IF IT FAILS PART-WAY ──────────────────────────────────
 # The snapshot is the PRIMARY artifact and the queue is derived from it, so both temp files are fully
@@ -528,24 +615,35 @@ if ! mv "$QTMP" "$QUEUE"; then
 fi
 rm -f "$SNAP_PREV"
 
-WEDGED="$(grep -c '^WEDGED' "$QUEUE" 2>/dev/null || true)"
-WEDGED="${WEDGED:-0}"
+# ⛔ COUNT WHAT WAS ACTUALLY PUBLISHED, AND NAME EACH ROW'S OWN VERDICT (2026-10-31, review). This
+# counted `^WEDGED` and printed `WEDGED` for every row, which was only self-consistent while the
+# writer hard-coded that word. Now that the first column carries the classifier's own verdict, a
+# `grep '^WEDGED'` would silently under-count a CHILD-STUCK row that is in the queue -- the partial
+# recap class this file refuses elsewhere. So: every non-comment row is a row, and the recap prints
+# the state it read.
+ROWS="$(grep -vc '^#' "$QUEUE" 2>/dev/null || true)"
+ROWS="${ROWS:-0}"
 LANES="$("$PY" -c 'import json,sys
 d=json.load(open(sys.argv[1])); l=d.get("lanes") if isinstance(d,dict) else d
 print(len(l) if isinstance(l,list) else 0)' "$SNAP" 2>/dev/null || echo '?')"
 
-echo "lane-arm: lanes=$LANES wedged=$WEDGED snapshot_age=${sa}s recap=$RECAP queue=$QUEUE"
-log "OK lanes=$LANES wedged=$WEDGED age=${sa}s"
+echo "lane-arm: lanes=$LANES wedged=$ROWS snapshot_age=${snapshot_age}s recap=$RECAP queue=$QUEUE"
+log "OK lanes=$LANES wedged=$ROWS age=${snapshot_age}s"
 if [ "$SHOW" = "1" ]; then
   echo "---- LIST 1 / LIST 2 (first 40 lines) ----"
   head -40 "$RECAP" 2>/dev/null
 fi
-if [ "$WEDGED" -gt 0 ]; then
-  echo "lane-arm: WEDGED lanes needing a HUMAN-ACTIONABLE look:"
-  grep '^WEDGED' "$QUEUE" | while IFS="$(printf '\t')" read -r _v lane ws sid why; do
-    echo "  WEDGED  $lane  [$ws]"
+if [ "$ROWS" -gt 0 ]; then
+  echo "lane-arm: $ROWS lane(s) in the wedge family, each with the classifier's OWN verdict:"
+  grep -v '^#' "$QUEUE" | while IFS="$(printf '\t')" read -r verdict lane ws sid why; do
+    echo "  $verdict  $lane  [$ws]"
     echo "     why: $why"
-    echo "     act: scripts/unblock-lane.sh <child> <sid>  (only if why names a PARKED child; otherwise report)"
+    # The only documented action is conditional on the row's own verdict -- which is why the column
+    # exists. Saying it unconditionally is what the discarded-verdict bug made unavoidable.
+    case "$verdict" in
+      CHILD_STUCK_PARKED) echo "     act: scripts/unblock-lane.sh <child> <sid>  (this row names a PARKED child)" ;;
+      *)                  echo "     act: REPORT ONLY -- this row is not a parked child; re-measure before acting" ;;
+    esac
   done
 fi
 exit 0

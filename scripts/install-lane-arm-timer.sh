@@ -265,16 +265,36 @@ if [ "$VERB" = uninstall ]; then
   case "$OS" in
     linux)
       [ -n "$SYSTEMCTL" ] || fail "no systemctl on this box -- refusing to claim an uninstall it cannot verify"
-      D="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+      # ⛔ REMOVE EVERY SCOPE `--install` CAN USE (2026-10-31, review). Install falls back to a USER unit
+      # (`$HOME/.config/systemd/user`, `systemctl --user`) when `/etc/systemd/system` is not reachable,
+      # but uninstall only ever touched the SYSTEM dir with a bare `systemctl`. Measured consequence: on
+      # a box without passwordless sudo, `--install` said "installed (user)" and `--uninstall` disabled
+      # and removed nothing, then failed with "check the other scope" -- a 30-minute job that keeps
+      # firing with no non-manual way to stop it, the exact false claim the macOS branch below was
+      # hardened against. Each scope is disabled with ITS OWN manager and ITS OWN directory, and the
+      # verification below still refuses to claim a removal it cannot see.
+      _sysdir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+      _userdir="$HOME/.config/systemd/user"
       $SUDO $SYSTEMCTL disable --now "${LABEL}.timer" 2>/dev/null || true
-      $SUDO rm -f "$D/${LABEL}.service" "$D/${LABEL}.timer" 2>/dev/null || true
+      $SUDO rm -f "$_sysdir/${LABEL}.service" "$_sysdir/${LABEL}.timer" 2>/dev/null || true
       $SUDO $SYSTEMCTL daemon-reload 2>/dev/null || true
+      # The user scope is ours to touch only when a user manager exists; a box without one must not
+      # have this branch fail, but it MUST not be skipped silently either (see the verification).
+      if $SYSTEMCTL --user show-environment >/dev/null 2>&1; then
+        $SYSTEMCTL --user disable --now "${LABEL}.timer" 2>/dev/null || true
+        $SYSTEMCTL --user daemon-reload 2>/dev/null || true
+      fi
+      rm -f "$_userdir/${LABEL}.service" "$_userdir/${LABEL}.timer" 2>/dev/null || true
       # VERIFY, never the send: only claim removal when the timer is actually gone from BOTH scopes.
       if $SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL" \
          || $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL"; then
-        fail "removal reported but ${LABEL}.timer is STILL listed -- not uninstalled (check the other scope)"
+        fail "removal reported but ${LABEL}.timer is STILL listed -- not uninstalled. system=$($SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | tr '\n' ' ') user=$($SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | tr '\n' ' ')"
       fi
-      say "uninstalled ${LABEL}.timer"
+      for _d in "$_sysdir" "$_userdir"; do
+        [ -e "$_d/${LABEL}.timer" ] || [ -e "$_d/${LABEL}.service" ] || continue
+        fail "removal reported but unit files remain in $_d -- not uninstalled (a manager may hold them open, or another identity owns them)"
+      done
+      say "uninstalled ${LABEL}.timer (verified absent from both the system and user managers)"
       ;;
     macos)
       # ⛔ VERIFY, NEVER THE SEND -- the same rule the Linux branch above spells out. `bootout` is

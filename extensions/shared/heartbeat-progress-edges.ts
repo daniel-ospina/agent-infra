@@ -873,11 +873,18 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   {
     name: "LANE_ARM_SNAPSHOT_MAX_AGE",
     owners: ["scripts/lane-arm.sh"],
-    value: "=900",
+    value: "\"${LANE_ARM_SNAPSHOT_MAX_AGE_OPT:-$(( BUDGET * 2 ))}\"",
     axis: "hygiene",
     guardedBy: NONE,
-    overrides: ['LANE_ARM_SNAPSHOT_MAX_AGE="$2"'],
-    note: "how old a lane-arm pass's own SAMPLE may be before the reading is refused rather than presented as current (900 s), reachable as `--max-snapshot-age`. The age it bounds is honestly measured — the wall time from asking for the sample to having it in hand — so it is non-zero and CAN be exceeded (`--budget 1200` against this 900 s default makes the refusal live rather than an advertisement); a bound that could never fire was the defect the 2026-10-31 review found, when the test read the mtime of the file the pass had just written and every row stamped `snapshot_age=0s` as a constant. Deliberately NOT named `MAX_AGE`: that symbol is a REGISTERED term owned by `scripts/monitor-worker.sh` (a worker-log freshness bound at `${2:-60}`), and the reverse scan refused the collision — one name over two unrelated numbers is the divergence this registry exists to surface. Registered as a co-owner instead would be a lie: the forward check requires the SAME value in every owner, and 60 s is not 900 s. The value is asserted by THIS registry's forward check; the shipped arm has no dedicated suite, which is why guardedBy is NONE rather than naming one that does not drive it.",
+    note: "how old the reading a lane-arm pass publishes may be WHEN IT BECOMES CURRENT (default 2 x --budget = 480 s), reachable as `--max-snapshot-age`. Applied twice: before the renderer (cheap refusal) and again at PUBLISH, which is the binding arm because it also covers the renderer's own bounded run — the stamp in the queue header is rewritten to that same number so the field and the gate cannot disagree. ⛔ DERIVED, NOT A LITERAL, AND THAT WAS THE FIX (2026-10-31 review): over a 240 s sampler budget a literal 900 was a bound the code could not reach — the sample is hard-killed at its budget, so `sa` is always < BUDGET — i.e. an inert enforcer advertising protection it never gave. The derivation makes the ceiling the pass's own structural worst case (sample bound + renderer bound), so it binds exactly when a pass overruns what its own bounds permit, and it does not silently loosen when an operator raises --budget. Deliberately NOT named `MAX_AGE`: that symbol is a REGISTERED term owned by `scripts/monitor-worker.sh` (a worker-log freshness bound at `${2:-60}`), and the reverse scan refused the collision — one name over two unrelated numbers is the divergence this registry exists to surface. Co-owner registration instead would be a lie: the forward check requires the SAME value in every owner. The `_OPT` suffix on the CLI variable keeps this the ONE declaration of the term, so the override fragment is the default assignment rather than a second declaration.",
+  },
+  {
+    name: "LANE_ARM_LOCK_REAP_S",
+    owners: ["scripts/lane-arm.sh"],
+    value: "$(( BUDGET * 2 + 60 ))",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "how old a lane-arm pass's LOCK file may be before the next pass reaps it, default 2 x --budget + 60 s. ⛔ THE INEQUALITY IS THE POINT (2026-10-31 review): this bound must EXCEED the longest legitimate pass (2 x BUDGET, sample plus renderer), or a second fire reaps a LIVE lock and the two passes interleave their artefacts — one pass's snapshot published beside the other's queue. A fixed 900 against a `--budget 1200` pass (2400 s worst case) did exactly that, measured; deriving it from the budget makes the inequality structural instead of a constant an operator can outgrow. ⛔ LOCK OWNERSHIP IS A PID, NOT THIS AGE: the lock records its holder and a pid that no longer exists is stale IMMEDIATELY, so a SIGKILLed pass no longer makes every fire for the whole window print 'skipping' and exit 0 (under Type=oneshot, SUCCESS with nothing produced — the no-op-gate shape). This bound is only the last resort for a lock whose holder this pass cannot identify at all.",
   },
   // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
   //
