@@ -13,8 +13,21 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# ⛔ NO `-x` PROBE AND NO `$HERE/scripts/` FALLBACK. `HERE` is already the directory holding this
+# suite, so the old fallback resolved to `…/scripts/scripts/check-farm-drift.sh` — a path that never
+# exists. It was invisible only because both files are 755 in-tree; the day the checker stopped being
+# executable EVERY case reported rc=127 without naming the cause (found in review, P3-6 of #3133).
+# `--check <path>` exists for the mutation runs, which must point the suite at a REVERTED copy.
 CHECK="$HERE/check-farm-drift.sh"
-[ -x "$CHECK" ] || CHECK="$HERE/scripts/check-farm-drift.sh"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) [ $# -ge 2 ] || { echo "--check needs a path" >&2; exit 1; }; CHECK="$2"; shift 2 ;;
+        *) echo "unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
+# P3-6 of #3133's review: dropping the dead `-x` probe must not leave the "every case reports rc=127
+# and nothing names the cause" failure reachable through the new flag instead.
+[ -f "$CHECK" ] || { echo "no checker at $CHECK" >&2; exit 1; }
 fail=0
 ck() { # ck <rc> <message>
     if [ "$1" -eq 0 ]; then printf '  ok   %s\n' "$2"; else printf '  FAIL %s\n' "$2"; fail=$((fail+1)); fi
@@ -278,6 +291,96 @@ OUT="$TMP/out"; ERR="$TMP/err"
 ( cd "$TMP" && CELL_HOME="$C23" bash "$CHECK" --dest "$C23/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
 RC=$?
 ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "a STALE file the farm DECLARES is still fatal #10114 drift (rc=$RC)"
+
+# 24. ⛔ THE PIN'S TWO RECORDS ARE READ FROM ONE ROOT (P2-1 of #3133). The lost-pin arm used to read
+# the sibling record from `${CELL_HOME:-$HOME}` while the SHA record arrived via `--pin-file`, so when
+# those named DIFFERENT homes the arm looked in the wrong one, found nothing, and reported a FIRST
+# INSTALL: `OK`, rc=0 — the false PASS it exists against, one variable over. `setup.sh:1056` passes
+# `--pin-file "$DEST/state/HARNESS-PIN"` with `DEST="$HOME/.pi/agent"`, so an exported `CELL_HOME`
+# (a staging/cell home) is the reachable shape. The pin record's OWN root must win.
+C24="$TMP/c24"; mk_farm "$C24/scripts"; mkdir -p "$C24/.pi/agent/state" "$TMP/c24-other-home"
+printf '%s\n' "$SRC" > "$C24/.harness-path"     # the pin's SECOND record, at the RECORD's root
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$TMP/c24-other-home" bash "$CHECK" --dest "$C24/scripts" --src "$SRC" --ref HEAD \
+    --pin-file "$C24/.pi/agent/state/HARNESS-PIN" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a LOST pin is UNKNOWN even when CELL_HOME names a different home (rc=$RC)"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict (the CELL_HOME root mismatch was a false PASS)"
+ck $(grep -q "$C24/.harness-path" "$ERR" && echo 0 || echo 1) "...and names the record it actually read ($C24/.harness-path)"
+# ...and the OTHER root the repo's writers use. `harness-apply-pass.sh:183-184` co-roots BOTH records
+# at $CELL_HOME while `orchestrator-harness/install.sh:741` roots the DIR record at $HOME, so a pin at
+# $HOME with the tree at $CELL_HOME (which is what `pi-bootstrap/setup.sh` produces when CELL_HOME is
+# set) must ALSO be seen as a pin on record, not as a first install. Testing only the derived root
+# would just MOVE the false PASS — the review measured exactly that (rc=2 on base, rc=0 on a one-root
+# fix), so the first-install arm requires NEITHER record to exist.
+C24B="$TMP/c24b"; mk_farm "$C24B/scripts"; mkdir -p "$C24B/.pi/agent/state" "$TMP/c24b-cellhome"
+printf '%s\n' "$SRC" > "$TMP/c24b-cellhome/.harness-path"   # the OTHER root, not the record's
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$TMP/c24b-cellhome" bash "$CHECK" --dest "$C24B/scripts" --src "$SRC" --ref HEAD \
+    --pin-file "$C24B/.pi/agent/state/HARNESS-PIN" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a .harness-path at CELL_HOME also refuses a FIRST INSTALL, so the pass cannot move (rc=$RC)"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict"
+# ...but a GENUINE first install — NEITHER record at either root — still exits 0, so the arm above
+# cannot be "refuse everything" and does not turn a fresh box into UNKNOWN.
+C24C="$TMP/c24c"; mk_farm "$C24C/scripts"; mkdir -p "$C24C/.pi/agent/state" "$TMP/c24c-cellhome"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$TMP/c24c-cellhome" bash "$CHECK" --dest "$C24C/scripts" --src "$SRC" --ref HEAD \
+    --pin-file "$C24C/.pi/agent/state/HARNESS-PIN" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 0 ] && echo 0 || echo 1) "a GENUINE first install (neither record at either root) is still 0 (rc=$RC)"
+ck $(grep -qi 'pin identity NOT verified' "$ERR" && echo 0 || echo 1) "...and still says pin identity was not verified"
+# ...and a RELATIVE --pin-file is the same false PASS from a different spelling: the suffix match used
+# to derive `.pi/agent/.harness-path` (one level too deep), miss the real record and report FIRST
+# INSTALL. `--pin-file` is documented with no absoluteness requirement.
+C24D="$TMP/c24d"; mk_farm "$C24D/scripts"; mkdir -p "$C24D/.pi/agent/state"
+printf '%s\n' "$SRC" > "$C24D/.harness-path"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$C24D" && CELL_HOME="$TMP/c24d-cellhome" bash "$CHECK" --dest "$C24D/scripts" --src "$SRC" --ref HEAD \
+    --pin-file ".pi/agent/state/HARNESS-PIN" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a RELATIVE --pin-file still finds the pin TREE record (rc=$RC)"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict"
+# ...and an explicit --harness-path-file that does not exist is an ASSERTION THAT FAILED (rc=2), not
+# "no record" — the same convention `--src` and an explicit `--ref` already follow.
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$TMP/c24c-cellhome" bash "$CHECK" --dest "$C24C/scripts" --src "$SRC" --ref HEAD \
+    --pin-file "$C24C/.pi/agent/state/HARNESS-PIN" --harness-path-file "$TMP/c24c/harness-path-TYPO" ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a --harness-path-file that does not exist is UNKNOWN, not a first install (rc=$RC)"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict"
+
+# 25. ⛔ A DECLARATION THE CHECK CANNOT GRADE IS `UNKNOWN`, NOT "THE FARM OWES NOTHING" (P2-2 of
+# #3133). Lines that are not `scripts/<rel>` are dropped (rightly — farm-retire.sh:58-64 refuses
+# them), but dropping ALL of them still left `decl_ok=1` with an empty declared set, and every stale
+# file then counted as "outside the farm": the #10114 fatal arm switched off by a declaration it could
+# not read. Same doctrine as the present-but-EMPTY declaration above — `UNKNOWN`, never a pass.
+C25="$TMP/c25"; mk_farm "$C25/scripts"; mkdir -p "$C25/state"
+printf 'lib/whatever.sh\n' > "$C25/state/farm-declared.txt"     # NOTHING this check can grade
+printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C25/scripts/alpha.py"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C25" bash "$CHECK" --dest "$C25/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "an all-off-shape declaration is UNKNOWN, not 'nothing was declared' (rc=$RC)"
+ck $(grep -q 'NOT farm-declared' "$ERR" && echo 1 || echo 0) "...and does NOT rule the stale file 'outside the farm' (which would disable the fatal arm)"
+
+# 26. ⛔ THE SUMMARY MUST NOT ASSERT WHAT THE RUN DID NOT MEASURE, AND THE CLOSING REMEDY MUST NOT BE
+# THE ONE THE RUN JUST CALLED USELESS (P3-3 of #3133). No declaration at all ⇒ the split is UNKNOWN,
+# not "N farm-declared — a re-run must fix these".
+C26="$TMP/c26"; mk_farm "$C26/scripts"
+printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C26/scripts/alpha.py"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C26" bash "$CHECK" --dest "$C26/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "no declaration + stale drift is still fatal drift (rc=$RC)"
+ck $(grep -q 'split is UNKNOWN' "$ERR" && echo 0 || echo 1) "...the summary says the farm-declared split is UNKNOWN"
+ck $(grep -q 'farm-declared — a re-run must fix these' "$ERR" && echo 1 || echo 0) "...and does NOT claim a farm-declared count it never read"
+# ...and on the exit-3 path the LAST line must not be the remedy the per-file lines just ruled out.
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C22" bash "$CHECK" --dest "$C22/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $(grep -q 'Next: re-run the farm' "$ERR" && echo 1 || echo 0) "exit-3 drift outside the farm does not close with 're-run the farm' (rc=$RC)"
+ck $(grep -q 'declare each file above in a farm array' "$ERR" && echo 0 || echo 1) "...it closes with the declare / delete / retire remedy instead"
 
 echo ""
 if [ "$fail" -eq 0 ]; then
