@@ -359,12 +359,20 @@ cap_hw_uuid() {
 # ⛔ SO THE ACCEPT-PREDICATE IS AN ALLOW-LIST, and the answer is REFUSED — never guessed — unless a
 # candidate passes EVERY clause:
 #   1. the device CARRIES THE EGRESS TRAFFIC: it is the default route's device, or a VLAN child of it
-#      (`<dev>.<n>` — the cells' routable address lives there). This is the structural clause, and it
-#      is the same rule the Darwin arm encodes: the address a peer can reach me on is the address on
-#      the interface my traffic leaves by. It is what makes a container bridge or a VPN structurally
-#      unable to supply the value, whatever it is named and whatever order the kernel lists it in —
-#      docker0 is at a LOWER ifindex than the cells' VLAN child, so ordering alone would never save us;
-#   2. the device is not a pseudo/container/tunnel device by name (defence in depth for clause 1);
+#      (`<dev>.<n>` — the cells' routable address lives there), AND that device is UP (`ip … show up`: a
+#      DOWN interface keeps its address in the listing, and a stale address on a dead VLAN is not "the
+#      ONE address a peer can reach it on" — measured, review round 6). This is the structural clause,
+#      and it is the same rule the Darwin arm encodes: the address a peer can reach me on is the
+#      address on the interface my traffic leaves by. For any device that does NOT carry egress it makes
+#      a container bridge or a VPN structurally unable to supply the value, whatever it is named and
+#      whatever order the kernel lists it in — docker0 is at a LOWER ifindex than the cells' VLAN child,
+#      so ordering alone would never save us.
+#      ⛔ FOR THE EGRESS DEVICE ITSELF clause 1 accepts by definition, so a tunnel that carries the
+#      default route is caught by clause 2's NAME LIST and by nothing else — a deny-list, incomplete by
+#      nature (`ppp0` was measured slipping through in round 6 and is now listed). An operator whose
+#      egress device is an unusual tunnel sets `CAP_BOXID`; guessing from an address is the false
+#      attribution this function exists to avoid;
+#   2. the device is not a pseudo/container/tunnel device by name;
 #   3. the address is a dotted quad that is not loopback (127/8), link-local (169.254/16), unspecified
 #      (0/8), multicast or reserved (224/4 and up). The 0/8 and 224/4 branches are graded by §14 (11) and
 #      the link-local branch by (1)/(2); the 127/8 branch is DEFENCE ONLY on Linux (`ip addr add 127.0.0.5`
@@ -381,8 +389,10 @@ cap_hw_uuid() {
 # ⛔ EVERY CLAUSE IS GRADED BY ITS OWN ARM in capacity-placement.test.sh §14: (8) a foreign device with a
 # NON-REJECTED name at a lower ifindex is never the identity (clause 1), (9) an egress device that is a
 # tunnel refuses rather than adopting its address (clause 2), (11) the unspecified/reserved prefixes
-# refuse (clause 3), (12) the Darwin arm refuses a link-local address, (3)/(3b) the choice is stable,
-# total and ifindex-ordered, (10) the secondary and octet tie-breaks. The dotted-quad `$4` guard is
+# refuse (clause 3), (12) the Darwin arm refuses a link-local address, (14) an address on a DOWN
+# interface is never the identity, (15) an egress device that is a `ppp` tunnel refuses, (3)/(3b) the
+# choice is stable, total and ifindex-ordered, (10) the secondary and octet tie-breaks. The dotted-quad
+# `$4` guard is
 # deliberately UNGRADED: `ip -4 -o addr` always puts the address in `$4`, so it is defence only, not a
 # mechanism. Arm (4) is the no-address refusal — kept as a guard, NOT as proof: the old body refused that
 # fixture too, so it does not discriminate.
@@ -392,7 +402,7 @@ cap_hw_uuid() {
 cap_boxid_net() {
   local out ifc ip cand dev
   if command -v ip >/dev/null 2>&1 && [ -r /proc/net/route ]; then
-    out="$(ip -4 -o addr show scope global 2>/dev/null)" || return 1
+    out="$(ip -4 -o addr show scope global up 2>/dev/null)" || return 1
     [ -n "$out" ] || return 1
     # The egress device — clause 1's anchor. `ip route show default` prints the MAIN table only (a route
     # in a custom table does not appear here), and it prints SEVERAL lines when the main table holds a
@@ -402,7 +412,7 @@ cap_boxid_net() {
     [ -n "$dev" ] || return 1
     cand="$(printf '%s\n' "$out" | CAP_EGRESS_DEV="$dev" awk '
       # clause 2 — a pseudo/container/tunnel device never names a box, even when it carries egress.
-      $2 ~ /^(lo|docker|br-|veth|virbr|podman|vxlan|cni|flannel|cali|kube|tun|tap|wg|zt|tailscale|utun|dummy|lxc)/ { next }
+      $2 ~ /^(lo|docker|br-|veth|virbr|podman|vxlan|cni|flannel|cali|kube|tun|tap|wg|zt|tailscale|utun|ppp|gre|ipip|sit|wwan|rmnet|dummy|lxc)/ { next }
       # the address field must be a dotted quad with an optional prefix length, or this is not a line
       # we understand and we must not read it.
       $4 !~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*(\/[0-9][0-9]*)?$/ { next }

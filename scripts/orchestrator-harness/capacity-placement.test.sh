@@ -988,8 +988,11 @@ echo "── §14 box identity: the routable address, or an honest refusal — n
 # was the fleet's only eligible box. These arms drive the SHIPPED `cap_boxid_net` through a stubbed
 # `ip`, so the PREDICATE is graded rather than a re-implementation of it.
 IPB="$TMP/bin-ip"; mkdir -p "$IPB"
-printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *) cat "%s" ;;\nesac\n' \
-  "$TMP/iproute.out" "$TMP/ipaddr.out" > "$IPB/ip"; chmod +x "$IPB/ip"
+# ⛔ THE STUB HONOURS `ip`'s OWN `up` FILTER (review round 6, finding 2): a DOWN interface keeps its
+# address in the listing, so the function asks for `show up` and this stub serves a DIFFERENT listing when
+# `up` is absent — exactly what real `ip` does. Without that, deleting `up` from the query is ungraded.
+printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *" up"*) cat "%s" ;;\n  *) cat "%s" ;;\nesac\n' \
+  "$TMP/iproute.out" "$TMP/ipaddr.up.out" "$TMP/ipaddr.out" > "$IPB/ip"; chmod +x "$IPB/ip"
 # ipfix <egress-dev> <addr-line…> — one fixture for one box. `CAP_BOXID` is cleared in every arm below:
 # the operator seam must not mask the derivation, which is the thing under test.
 # ⛔ EACH ADDR LINE IS EMITTED IN THE PRODUCTION SHAPE, tail included (`\       valid_lft forever
@@ -1002,7 +1005,10 @@ printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *) cat
 # the fixture for exactly that reason.
 ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s proto dhcp src 169.254.77.2 metric 100\n' "$_d" > "$TMP/iproute.out"
   : > "$TMP/ipaddr.out"
-  for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done; }
+  for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done
+  cp "$TMP/ipaddr.out" "$TMP/ipaddr.up.out"; }
+# ipfixdown <addr-line…> — append addresses that `ip … show up` would NOT list (a DOWN interface).
+ipfixdown() { for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done; }
 # ipfixr <route-line…> — replace just the ROUTE output (a multipath default is several lines; the address
 # fixture is whatever the previous `ipfix` wrote).
 ipfixr() { printf '%s\n' "$@" > "$TMP/iproute.out"; }
@@ -1119,14 +1125,18 @@ MUT
     '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0'
   A10="$(boxidnet)"; RC=$?
   # (b) …and the tie-break among candidates that are equal in BOTH ifindex and secondary-ness is
-  #     NUMERIC. The two addresses are chosen so a STRING compare and a MISSING compare disagree with the
-  #     octet answer, and the LOWER address is emitted FIRST so that "last candidate wins" is wrong too:
-  #     octets ⇒ 10.9.9.10; a string compare ⇒ 10.9.10.9; no numeric term at all ⇒ 10.9.10.9. (Round 5
-  #     measured that with the lower address LAST, a mutant that dropped the numeric term entirely was
-  #     211/0 green, because "last wins" happened to produce the expected value.)
+  #     NUMERIC. THREE addresses, chosen so that every wrong rule gives a DIFFERENT answer from the octet
+  #     rule (review round 6, finding 1 measured that two addresses could not: with the lowest one first,
+  #     "first wins" — the numeric term deleted — agrees with the octet answer, so the term's EXISTENCE
+  #     was ungraded; with the lowest one last, "last wins" agreed instead):
+  #        octets    ⇒ 10.9.9.10   (the numeric minimum)
+  #        string    ⇒ 10.9.10.9   ("10.9.10.9" < "10.9.9.10")
+  #        first-wins (no numeric term) ⇒ 10.9.10.9
+  #        last-wins                    ⇒ 10.9.9.11
   ipfix eth0 \
+    '3: eth0 inet 10.9.10.9/24 brd 10.9.10.255 scope global eth0' \
     '3: eth0 inet 10.9.9.10/24 brd 10.9.9.255 scope global eth0' \
-    '3: eth0 inet 10.9.10.9/24 brd 10.9.10.255 scope global eth0'
+    '3: eth0 inet 10.9.9.11/24 brd 10.9.9.255 scope global eth0'
   A10B="$(boxidnet)"
   ck "(10) a secondary never displaces the primary ($A10), and the tie-break is NUMERIC — octets give .9.10, a string compare gives .10.9 ($A10B)" \
      "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.10 ] && echo 0 || echo 1)"
@@ -1143,6 +1153,19 @@ MUT
   A13B="$(boxidnet)"; RC2=$?
   ck "(13) a MULTIPATH default (bare first line, devices on the nexthop lines) still yields the egress device's address ($A13), and several defaults use the lowest metric ($A13B)" \
      "$([ "$RC" -eq 0 ] && [ "$A13" = 10.238.144.2 ] && [ "$RC2" -eq 0 ] && [ "$A13B" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (14) A DOWN INTERFACE IS NOT A PEER-REACHABLE ADDRESS (review round 6, finding 2). The dead VLAN holds
+  # its stale address at a LOWER ifindex and passes every other clause, so only the `up` filter rejects it.
+  ipfix eth0 '5: eth0.1911 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  ipfixdown '4: eth0.100 inet 192.168.99.7/24 brd 192.168.99.255 scope global eth0.100'
+  A14="$(boxidnet)"; RC=$?
+  ck "(14) an address on a DOWN interface is never the identity ($A14 — the dead VLAN is at a LOWER ifindex)" \
+     "$([ "$RC" -eq 0 ] && [ "$A14" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (15) AN EGRESS-CARRYING TUNNEL of a name the list did not yet know (`ppp0`, measured in round 6):
+  # clause 1 accepts the egress device by definition, so the name list is the only filter that can refuse.
+  ipfix ppp0 '2: ppp0 inet 10.8.0.2/24 brd 10.8.0.255 scope global ppp0'
+  A15="$(boxidnet)"; RC=$?
+  ck "(15) an egress device that is a ppp TUNNEL refuses rather than adopting its address (rc=$RC, boxid=[$A15])" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A15" ] && echo 0 || echo 1)"
   # each is addable on this kernel and each appears in `ip -4 -o addr show scope global` (measured under
   # `unshare -rn`), so a clause that drops one publishes an address no peer can use as an identity.
   # ⛔ BOTH HALVES OF THE RESERVED RANGE ARE FED: `224.0.0.7` only exercises `22[4-9]\.` (224-229), so
