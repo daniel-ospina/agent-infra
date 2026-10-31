@@ -570,9 +570,13 @@ echo "── hermetic suites ─────────────────
 # hermetic contract is stated rather than inherited.
 shard_array=()
 while IFS= read -r shard; do
-  # Drop a line with no non-blank text: it is not a path, so it is neither counted nor queued. Not
-  # literally identical to `listed`'s `awk 'NF'` (bash's `[[:space:]]` also covers CR/VT/FF) — the
-  # assertion below says why that difference cannot start a run either way.
+  # A line with no non-blank text is not a path, so it is not queued. `listed`'s `awk 'NF'` agrees on
+  # every line that can REACH here: a blank line is skipped by both (awk `NF=0`), and anything else
+  # that gets this far is a real file path — glob-matched, `[ -f ]`-checked, and re-verified by the
+  # containment loop above — which both of them count exactly once. The two are NOT identical as
+  # predicates: a CR/VT/FF-only line is counted by awk's default FS and stripped by bash's
+  # `[[:space:]]`. Such a line is not a file, so it exits 1 up there (`[ ! -f "$t" ]`) and never
+  # arrives; the assertion below says what a divergence would mean if the contract changed.
   [ -n "${shard//[[:space:]]/}" ] || continue
   shard_array+=("$shard")
 done <<<"$shard_paths"
