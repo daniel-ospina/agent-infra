@@ -2,7 +2,7 @@
   "_why": "sha256 of the audited bytes of every SANCTIONED_SCRIPT_RELPATHS entry (index.ts). The exemption is granted on IDENTITY, not on a path string: a script is the sanctioned one when it sits at a sanctioned relpath inside a framework checkout AND its bytes hash to the value below. Re-cut with `node extensions/main-worktree-guard/test-sanctioned-identity.mjs --cut` in the SAME commit that changes any listed script; test-sanctioned-identity.mjs reds when this file is stale, so a stale pin cannot reach main silently. Why a pin and not a path: a path is purchasable (`git init` + two fingerprint files), and `committed` is purchasable (the #1485 A5 rejection) — but the AUDITED BYTES are not, so the pin is the only reference an agent cannot forge with allowed operations.",
   "version": 2,
   "sha256": {
-    "scripts/check-pipeline-compliance.sh": "a3a4344dd4e5d6be38dd3a03035d5bd66016112536482d14a907033b42a651ae",
+    "scripts/check-pipeline-compliance.sh": "288389f6b8f5d93ccce96648f8679ce1fa5358183de6bac5e007910918f5ae86",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/record-review.sh": "66fb36403f1e4d23f0c81a704cf45bf8874952b88041ee06f2b66bddbb6ea1f1",
@@ -11,7 +11,7 @@
   },
   "delegates": {
     "scripts/admin-merge.sh": "7a5c4a20cc561c460fece80e611a76af901af620803d598290fa67dfbec49e32",
-    "scripts/check-pipeline-compliance.sh": "a3a4344dd4e5d6be38dd3a03035d5bd66016112536482d14a907033b42a651ae",
+    "scripts/check-pipeline-compliance.sh": "288389f6b8f5d93ccce96648f8679ce1fa5358183de6bac5e007910918f5ae86",
     "scripts/checkout-hygiene/hub-worktree-refresh-advance.sh": "88bde611c5f53bc75c94d56f97b8d6048d21029b1396cb0db162b082ebb9a643",
     "scripts/checkout-hygiene/hub-worktree-salvage-commit.sh": "f747ad00b5babe4474a625b3564f27d3e6523f05147bef79126ff5e4a5a5c29e",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",

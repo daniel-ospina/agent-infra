@@ -174,7 +174,17 @@ probe_outcome() {
 main() {
   local repo="${GH_REPO:-}" issue="${ISSUE_NUMBER:-}" body="${COMMENT_BODY:-}"
   local assoc="${COMMENT_AUTHOR_ASSOCIATION:-}"
-  GATE_SCRIPT="${GATE_SCRIPT:-$(dirname "$SELF")/check-pipeline-compliance.sh}"
+  # Default the delegated parser to a LITERAL relative path, not
+  # `$(dirname "$SELF")/…`: an assignment whose value contains a command
+  # substitution is not statically resolvable, so a checkout guard that reads the
+  # script before allowing it to run fails CLOSED on the whole invocation —
+  # measured: `REVALIDATE_SELF_TEST=1 bash scripts/<this>.sh` was refused with
+  # "Form: script-indirection … the script path contains a shell-expansion form",
+  # from a linked worktree AND from a /tmp copy at any cwd, while a literal path
+  # was allowed. A self-test nobody can run locally is a fixture only CI runs,
+  # which is the class #1129 exists for. The env override is kept for testing
+  # against a pre-change gate; run from the repo root, as the workflow does.
+  GATE_SCRIPT="${GATE_SCRIPT:-scripts/check-pipeline-compliance.sh}"
 
   [[ -n "$repo" && -n "$issue" ]] || {
     say_err "usage: GH_REPO=owner/repo ISSUE_NUMBER=<n> COMMENT_BODY=<text> \\"

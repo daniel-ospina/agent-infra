@@ -341,9 +341,12 @@ if [[ -z "$GH_REPO" ]]; then
   esac
 fi
 # The probe answers a question about TEXT and needs no repo at all, so it must
-# never fail on an unresolvable remote (the auto-detect above also runs a
-# read-only `git -C`, which the #1484 guard blocks on a local checkout — a
-# probe that only works in CI would be a probe nobody runs).
+# never fail on an unresolvable remote: probe mode is deliberately repo-FREE and
+# never depends on the remote auto-detect above (the gate itself is sanctioned by
+# name under #1129/#2332, so a local checkout is not blocked from running it).
+# An earlier revision of this comment blamed the #1484 guard for a block it does
+# not impose — measured 2026-10-31: probe mode answers 0/1 with `GH_REPO` unset,
+# from both the hub and a linked worktree.
 if [[ -z "$GH_REPO" && "${PROBE_MODE:-0}" != "1" ]]; then
   echo "❌ Could not determine GH_REPO. Set GH_REPO=owner/repo or run from a repo with a github.com origin." >&2
   exit 2
