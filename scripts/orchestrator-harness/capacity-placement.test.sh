@@ -974,6 +974,119 @@ _n_fix4="$(git -C "$W8" ls-remote --refs origin 'refs/boxes/*' | grep -c .)"
 ck "m4: the MUTANT collapses a shared-key peer to 1 ref ($_n_m4), the fix keeps 2 ($_n_fix4)" \
    "$([ "$_n_m4" -eq 1 ] && [ "$_n_fix4" -eq 2 ] && echo 0 || echo 1)"
 
+# ── §14 THE BOX'S OWN IDENTITY (#3167): `scope global` is NOT a routability test ───────────────
+echo
+echo "── §14 box identity: the routable address, or an honest refusal — never `NR==1` ──"
+# MEASURED 2026-10-31 on every cloud cell — the SAME arrangement on each (`ip -4 -o addr show scope
+# global`), with `ip route show default` naming `eth0`:
+#   3: eth0      inet 169.254.77.2/30  scope global  <-- RFC 3927 link-local, reported `scope global`
+#   4: docker0   inet 172.17.0.1/16    scope global  <-- a bridge, at a LOWER ifindex than the real one
+#   5: eth0.1911 inet 10.238.144.N/20  scope global  <-- THE identity
+# The pre-#3167 body took `NR==1`, committed to line 3, rejected it in the tail guard, and returned 1
+# with line 5 never read — so every cell published NO identity, `cap_publish` refused it by name, and
+# every cell was permanently INELIGIBLE while the Mac (which resolves identity from Darwin `kern.uuid`)
+# was the fleet's only eligible box. These arms drive the SHIPPED `cap_boxid_net` through a stubbed
+# `ip`, so the PREDICATE is graded rather than a re-implementation of it.
+IPB="$TMP/bin-ip"; mkdir -p "$IPB"
+printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *) cat "%s" ;;\nesac\n' \
+  "$TMP/iproute.out" "$TMP/ipaddr.out" > "$IPB/ip"; chmod +x "$IPB/ip"
+# ipfix <egress-dev> <addr-line…> — one fixture for one box. `CAP_BOXID` is cleared in every arm below:
+# the operator seam must not mask the derivation, which is the thing under test.
+ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s\n' "$_d" > "$TMP/iproute.out"; printf '%s\n' "$@" > "$TMP/ipaddr.out"; }
+boxidnet_mod() { _m="$1"; ( . "$_m"; PATH="$IPB:$PATH"; CAP_BOXID=""; cap_boxid_net ) 2>/dev/null; }
+boxidnet() { boxidnet_mod "$CAP"; }
+if [ -r /proc/net/route ]; then
+  # (1) the CELL's measured fixture: link-local FIRST, the docker bridge SECOND, the routable VLAN
+  # child LAST — the exact arrangement `NR==1` died on.
+  ipfix eth0 \
+    '3: eth0    inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0' \
+    '4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0' \
+    '5: eth0.1911    inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  A1="$(boxidnet)"; RC=$?
+  ck "(1) a cell whose FIRST global line is link-local and whose bridge is second resolves to the ROUTABLE one (boxid=$A1)" \
+     "$([ "$RC" -eq 0 ] && [ "$A1" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (2) nothing but link-local => REFUSE, never guess.
+  ipfix eth0 '3: eth0 inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0'
+  A2="$(boxidnet)"; RC=$?
+  ck "(2) a box whose ONLY 'global' address is link-local REFUSES (rc=$RC, boxid=[$A2]) — never a guess" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A2" ] && echo 0 || echo 1)"
+  # (2b) …and a container bridge never names the box, even when it is the only plausible-looking
+  # address on it: a bridge address is the FALSE-ATTRIBUTION direction, which is worse than refusing.
+  ipfix eth0 \
+    '3: eth0 inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0' \
+    '4: docker0 inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0'
+  A2B="$(boxidnet)"; RC=$?
+  ck "(2b) a link-local NIC plus a 172.17.0.1 docker bridge REFUSES rather than adopting the bridge (rc=$RC, boxid=[$A2B])" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A2B" ] && echo 0 || echo 1)"
+  # (3) SEVERAL real addresses => a stable, documented choice, and the SAME one on every run ($C1/$C2)
+  # and whatever order `ip` emitted the lines in ($C3) — a boxid that FLAPS publishes false attribution.
+  ipfix eth0 \
+    '3: eth0 inet 10.1.0.5/24 brd 10.1.0.255 scope global eth0' \
+    '5: eth0.7 inet 10.2.0.7/24 brd 10.2.0.255 scope global eth0.7'
+  A3="$(boxidnet)"; RC=$?
+  A3B="$(boxidnet)"
+  ck "(3) a box with SEVERAL real addresses picks the documented one (lowest ifindex => $A3) and again on the next run ($A3B)" \
+     "$([ "$RC" -eq 0 ] && [ "$A3" = 10.1.0.5 ] && [ "$A3B" = 10.1.0.5 ] && echo 0 || echo 1)"
+  ipfix eth0 \
+    '5: eth0.7 inet 10.2.0.7/24 scope global eth0.7' \
+    '3: eth0 inet 10.1.0.5/24 brd 10.1.0.255 scope global eth0'
+  A3C="$(boxidnet)"; RC=$?
+  ck "  …and the SAME one when \`ip\` lists them in the other order ($A3C) — the answer is a function of the set, not of the output order" \
+     "$([ "$RC" -eq 0 ] && [ "$A3C" = 10.1.0.5 ] && echo 0 || echo 1)"
+  # (4) no address at all => refuse.
+  ipfix eth0 ''
+  A4="$(boxidnet)"; RC=$?
+  ck "(4) a box with NO address at all REFUSES (rc=$RC, boxid=[$A4])" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A4" ] && echo 0 || echo 1)"
+  # (5) MUTATION CONTROL — the PRE-#3167 body, cited verbatim from the commit this fixes, run on
+  # fixture (1). If this arm ever answers an identity, the arms above stopped discriminating.
+  { cat "$CAP"; cat <<'MUT'
+# MUTANT (m5): the PRE-#3167 Linux arm, verbatim: `NR==1` of `ip -o addr show scope global`.
+cap_boxid_net() {
+  local out ifc ip
+  if command -v ip >/dev/null 2>&1 && [ -r /proc/net/route ]; then
+    out="$(ip -4 -o addr show scope global 2>/dev/null)" || return 1
+    [ -n "$out" ] || return 1
+    ifc="$(printf '%s\n' "$out" | awk 'NR==1{print $2}')"
+    ip="$(printf '%s\n' "$out" | awk 'NR==1{print $4}')"
+    ip="${ip%%/*}"
+  else
+    return 1
+  fi
+  case "$ip" in ''|*[!0-9.]*) return 1 ;; esac
+  case "$ip" in 127.*|169.254.*) return 1 ;; esac
+  printf '%s' "$ip"
+}
+MUT
+  } > "$TMP/cap-nr1.sh"
+  ipfix eth0 \
+    '3: eth0    inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0' \
+    '4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0' \
+    '5: eth0.1911    inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  M5="$(boxidnet_mod "$TMP/cap-nr1.sh")"; RC=$?
+  ck "(5) m5: the PRE-#3167 body yields NO identity on the very fixture (1) answers ($M5, rc=$RC) — arm (1) is RED before this fix" \
+     "$([ "$RC" -eq 1 ] && [ -z "$M5" ] && echo 0 || echo 1)"
+else
+  echo "  ⏭ §14 (1)-(5) SKIPPED: this platform has no /proc/net/route, so the Linux arm of cap_boxid_net is unreachable here."
+  echo "    Not a pass: CI runs ubuntu-latest, where every arm above is measured."
+fi
+# (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
+# controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
+# reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
+ck "(6) the controller CAPTURES the publish output and logs why=… (no more silent refusal)" \
+   "$(grep -qF -- 'cap_publish "$REPO" "$CAP_REC" 2>&1' "$LOOP" && grep -qF -- 'why=${CAP_PUB_WHY:-unknown}' "$LOOP" && echo 0 || echo 1)"
+# (7) THE MAC CANNOT BE AFFECTED. A Darwin box resolves its identity from `kern.uuid` FIRST
+# (`cap_boxid_auto` source 1), so it never reaches the Linux arm this fix changes. That precedence is
+# the property, not a comment: asserted here so a future edit that reorders the sources — or that makes
+# the net arm authoritative — goes red on the box the fleet depends on today.
+macbid() ( . "$CAP"; cap_hw_uuid() { printf '8e93de39-C0FFEE-11EE-9E93-8E93DE39AAAA'; }
+  cap_boxid_net() { printf '10.238.144.2'; }
+  CAP_BOXID=""; cap_boxid_auto )
+MACBID="$(macbid 2>/dev/null)"; RC=$?
+ck "(7) a box with a hardware uuid keeps THAT identity and never consults the net derivation (mac unchanged: $MACBID)" \
+   "$([ "$RC" -eq 0 ] && [ "$MACBID" = '8e93de39-C0FFEE-11EE-9E93-8E93DE39AAAA' ] && echo 0 || echo 1)"
+
+
 echo
 echo "───────────────────────────────────────────────────────────────────────────────"
 echo "  passed: $PASS   failed: $FAIL"

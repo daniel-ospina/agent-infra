@@ -329,21 +329,76 @@ cap_hw_uuid() {
 }
 
 # cap_boxid_net — the box's routable IPv4: the ONE address a peer can reach it on, and the only
-# identifier measured to differ across the three cells. Linux reads it through `ip` with `scope
-# global` (link-local and loopback are excluded by scope, not by a pattern); Darwin reads the
-# interface the default route uses. A box with no routable address (an isolated runner) returns 1 and
-# the next source answers.
+# identifier measured to differ across the three cells. Darwin reads the address on the interface the
+# default route uses; Linux reads the same thing off `ip`, and REFUSES rather than guessing when it
+# cannot see it. A box with no routable address (an isolated runner) returns 1 and the next source
+# answers.
+#
+# ⛔ `scope global` IS NOT A ROUTABILITY TEST — MEASURED 2026-10-31 ON EVERY CELL (#3167). Every cell
+# reports the identical arrangement, and `169.254.77.2/30` — an RFC 3927 LINK-LOCAL address — comes
+# out of `ip -4 -o addr show scope global` as `scope global`, FIRST, ahead of the docker bridge and of
+# the routable address on the VLAN child:
+#
+#   3: eth0      inet 169.254.77.2/30   scope global eth0        <-- link-local, still `scope global`
+#   4: docker0   inet 172.17.0.1/16     scope global docker0     <-- a bridge, never peer-reachable
+#   5: eth0.1911 inet 10.238.144.N/20   scope global eth0.1911   <-- THE identity
+#
+# The old body took `NR==1`, committed the identity to line 3, rejected it in the guard below, and
+# returned 1 with line 5 never read. Every cell therefore published NO identity, `cap_publish` refused
+# it by name, and every cell was permanently INELIGIBLE to its peers (#3167).
+#
+# ⛔ SO THE ACCEPT-PREDICATE IS AN ALLOW-LIST, and the answer is REFUSED — never guessed — unless a
+# candidate passes EVERY clause:
+#   1. the device CARRIES THE EGRESS TRAFFIC: it is the default route's device, or a VLAN child of it
+#      (`<dev>.<n>` — the cells' routable address lives there). This is the structural clause, and it
+#      is the same rule the Darwin arm encodes: the address a peer can reach me on is the address on
+#      the interface my traffic leaves by. It is what makes a container bridge or a VPN structurally
+#      unable to supply the value, whatever it is named and whatever order the kernel lists it in —
+#      docker0 is at a LOWER ifindex than the cells' VLAN child, so ordering alone would never save us;
+#   2. the device is not a pseudo/container/tunnel device by name (defence in depth for clause 1);
+#   3. the address is a dotted quad that is not loopback (127/8), link-local (169.254/16), unspecified
+#      (0/8), multicast or reserved (224/4 and up).
+# THE CHOICE AMONG SEVERAL SURVIVORS IS DOCUMENTED AND TOTAL: the LOWEST interface index wins, ties
+# broken by the numerically lower address. The choice is therefore a function of the candidate SET
+# alone, never of the order `ip` emitted its lines in — and this matters more than it looks: an
+# identity that FLAPS between runs publishes FALSE ATTRIBUTION (two peers, two keys, one box) which is
+# strictly worse than an empty one, because an empty boxid is refused by name while a flapping one is
+# believed. Linux allocates ifindex monotonically, so a device created LATER (a docker network, a VPN)
+# can never preempt one that already existed.
+# ⛔ AN OPERATOR WITH A BOX THAT DOES NOT FIT THIS SHAPE SETS `CAP_BOXID` (see `cap_boxid`): the
+# derivation is a convenience for boxes that are networked the way the fleet's are, not an oracle.
 # ⛔ THIS IS ALSO THE SUITE'S IDENTITY SEAM: the arms in capacity-placement.test.sh §12 override THIS
 # FUNCTION to stand up two boxes with two identities on one hostname — the whole point of #2707 is
 # that `CAP_HOST` is NOT what distinguishes them.
 cap_boxid_net() {
-  local out ifc ip
+  local out ifc ip cand dev
   if command -v ip >/dev/null 2>&1 && [ -r /proc/net/route ]; then
     out="$(ip -4 -o addr show scope global 2>/dev/null)" || return 1
     [ -n "$out" ] || return 1
-    ifc="$(printf '%s\n' "$out" | awk 'NR==1{print $2}')"
-    ip="$(printf '%s\n' "$out" | awk 'NR==1{print $4}')"
-    ip="${ip%%/*}"
+    # The egress device — clause 1's anchor. `ip route show default` can print several lines (multipath,
+    # and one per table); the first one naming a device is the route this box actually leaves by.
+    dev="$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')" || dev=""
+    [ -n "$dev" ] || return 1
+    cand="$(printf '%s\n' "$out" | CAP_EGRESS_DEV="$dev" awk '
+      # clause 2 — a pseudo/container/tunnel device never names a box, even when it carries egress.
+      $2 ~ /^(lo|docker|br-|veth|virbr|podman|vxlan|cni|flannel|cali|kube|tun|tap|wg|zt|tailscale|utun|dummy|lxc)/ { next }
+      # the address field must be a dotted quad with an optional prefix length, or this is not a line
+      # we understand and we must not read it.
+      $4 !~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*(\/[0-9][0-9]*)?$/ { next }
+      {
+        a = $4; sub(/\/.*/, "", a)
+        # clause 3 — peer-reachable prefixes only.
+        if (a ~ /^0\./ || a ~ /^127\./ || a ~ /^169\.254\./ || a ~ /^22[4-9]\./ || a ~ /^2[3-5][0-9]\./) next
+        # clause 1 — the device carries egress, or is a VLAN child of the device that does.
+        if ($2 != ENVIRON["CAP_EGRESS_DEV"] && index($2, ENVIRON["CAP_EGRESS_DEV"] ".") != 1) next
+        i = $1; sub(/:$/, "", i); i = i + 0
+        # the documented choice: lowest ifindex, then the numerically lower address.
+        if (best == "" || i < bi || (i == bi && a < best)) { best = a; bif = $2; bi = i }
+      }
+      END { if (best != "") print bif " " best }
+    ')"
+    [ -n "$cand" ] || return 1
+    ifc="${cand%% *}"; ip="${cand#* }"
   else
     ifc="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')" || return 1
     [ -n "$ifc" ] || return 1
