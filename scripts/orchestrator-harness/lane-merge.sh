@@ -685,8 +685,9 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
     # ⛔ THE BRANCH MUST BE RESOLVED, NOT A PLACEHOLDER (reviewer finding, P1, R11, measured): the brief's
     # own `--watch` call never passes `--branch`, so `${BR:-<branch>}` rendered the literal `<branch>` on
-    # the documented supervision path — and merge-one feeds that argument into `git fetch origin "$BR"`,
-    # so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
+    # the documented supervision path — and merge-one feeds that argument into
+    # `git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"` (the shipped form since #3009 named
+    # the DESTINATION), so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
     # ⛔ A DETACHED HEAD IS NOT A BRANCH (reviewer finding, P2, R12, measured): `git rev-parse
     # --abbrev-ref HEAD` answers "HEAD" outside a branch, and `origin/HEAD` resolves to main — so the
     # printed command would hand the reviewer MAIN's content under the PR's name, and a `CLEAN` verdict
