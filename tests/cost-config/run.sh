@@ -1616,14 +1616,14 @@ echo "37. instrument drift / unreadable floor → exit 2 (the derived relation i
 TMP37="$(mktemp -d /tmp/cost-config-regime-drift.XXXXXX)"
 mkroot "$TMP37"
 # (a) the two instruments disagree with each other.
-sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-290000/' "$TMP37/scripts/fleet-cost-report.sh"
+sed -i.bak 's/FLEET_REGIME_TB:-783616/FLEET_REGIME_TB:-290000/' "$TMP37/scripts/fleet-cost-report.sh"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "fleet-cost-report floor moved alone → exit 2"; else fail "expected exit 2 on instrument disagreement, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "regime floor disagrees between the instruments" "$OUT"; then pass "the disagreement names both instruments' values"; else fail "expected the instrument-disagreement message"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
 # (b) the watcher's floor moved alone — the other direction.
-sed -i.bak 's/REGIME_TB_FLOOR=283616/REGIME_TB_FLOOR=290000/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/REGIME_TB_FLOOR=783616/REGIME_TB_FLOOR=290000/' "$TMP37/scripts/watch-truncation.sh"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "watch-truncation floor moved alone → exit 2"; else fail "expected exit 2 on instrument disagreement, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1642,8 +1642,8 @@ if [ "$code" -eq 0 ]; then pass "the pristine fixture root still reads green (th
 # (e) BOTH instruments moved TOGETHER to a new self-consistent floor → the instrument-agreement
 # leg passes, so the guard reaches the settings check and the DERIVED geometry leg must fire on
 # its own (proving it is not dead code behind the instrument check).
-sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-290000/' "$TMP37/scripts/fleet-cost-report.sh"
-sed -i.bak 's/REGIME_TB_FLOOR=283616/REGIME_TB_FLOOR=290000/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/FLEET_REGIME_TB:-783616/FLEET_REGIME_TB:-290000/' "$TMP37/scripts/fleet-cost-report.sh"
+sed -i.bak 's/REGIME_TB_FLOOR=783616/REGIME_TB_FLOOR=290000/' "$TMP37/scripts/watch-truncation.sh"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "both instruments moved together → the derived geometry leg fires alone (exit 1)"; else fail "expected exit 1 from the derived geometry leg, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1655,8 +1655,8 @@ mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
 # refuses to print a floor it cannot band on, so the guard's execution read fails closed rather
 # than certifying a floor no record can reach. (#1342: this check moved from a guard-side text
 # parse into the instrument that owns the band.)
-sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-983616/' "$TMP37/scripts/fleet-cost-report.sh"
-sed -i.bak 's/REGIME_TB_FLOOR=283616/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/FLEET_REGIME_TB:-783616/FLEET_REGIME_TB:-983616/' "$TMP37/scripts/fleet-cost-report.sh"
+sed -i.bak 's/REGIME_TB_FLOOR=783616/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "an empty/inverted watcher band -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on an inverted band, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1674,7 +1674,7 @@ mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
 # silently disarming the inverted-band refusal above, which is the exact hazard the pre-#1342 guard
 # bounded its capture against. Post-fix the watcher refuses and prints no floor; pre-fix it prints
 # the literal and exits 0 (the arm is red pre-fix).
-sed -i.bak 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=99999999999999999999999999/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/^REGIME_TB_FLOOR=783616$/REGIME_TB_FLOOR=99999999999999999999999999/' "$TMP37/scripts/watch-truncation.sh"
 if grep -q '^REGIME_TB_FLOOR=99999999999999999999999999$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (h): the out-of-range floor mutation took effect"; else fail "37 fixture (h): the out-of-range floor mutation did not take effect"; fi
 if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed an out-of-range floor (the inverted-band refusal was silently disarmed)"; else pass "watch-truncation --print-regime-floor refuses an out-of-range floor"; fi
 if grep -q "outside the representable integer range" "$OUT"; then pass "the out-of-range refusal is explicit"; else fail "expected an explicit out-of-range refusal"; sed -n '1,30p' "$OUT"; fi
@@ -1727,7 +1727,7 @@ cp "$TMP37/scripts/watch-truncation.sh" "$TMP37/scripts/watch-truncation.sh.orig
 # `-i.bak` works on both; the `.bak` is discarded because the `.orig` snapshot is what is restored
 # below. Gate on the mutation having taken effect so a no-op substitution is a loud FAIL rather
 # than an earned-looking pass.
-sed -i.bak 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/^REGIME_TB_FLOOR=783616$/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
 sed -i.bak 's/^REGIME_TB_ERA_CEIL=650000$/REGIME_TB_ERA_CEIL=1000000/' "$TMP37/scripts/watch-truncation.sh"
 if grep -q '^REGIME_TB_FLOOR=983616$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k) 1M-revert control: the floor mutation took effect"; else fail "37 fixture (k) 1M-revert control: the floor mutation did not take effect"; fi
 if grep -q '^REGIME_TB_ERA_CEIL=1000000$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k) 1M-revert control: the ceiling mutation took effect"; else fail "37 fixture (k) 1M-revert control: the ceiling mutation did not take effect"; fi
@@ -1845,12 +1845,12 @@ src = open(g).read()
 assert "CLAMP=300000" in src, "guard constant shape changed — update this test"
 open(g, "w").write(src.replace("CLAMP=300000", "CLAMP=1000000"))
 r = open(rep).read()
-assert "FLEET_REGIME_TB:-283616" in r, "report default shape changed"
-open(rep, "w").write(r.replace("FLEET_REGIME_TB:-283616", "FLEET_REGIME_TB:-983616"))
+assert "FLEET_REGIME_TB:-783616" in r, "report default shape changed"
+open(rep, "w").write(r.replace("FLEET_REGIME_TB:-783616", "FLEET_REGIME_TB:-983616"))
 w = open(wat).read()
-assert "REGIME_TB_FLOOR=283616" in w, "watcher band shape changed"
+assert "REGIME_TB_FLOOR=783616" in w, "watcher band shape changed"
 assert "REGIME_TB_ERA_CEIL=650000" in w, "watcher band shape changed"
-open(wat, "w").write(w.replace("REGIME_TB_FLOOR=283616", "REGIME_TB_FLOOR=983616")
+open(wat, "w").write(w.replace("REGIME_TB_FLOOR=783616", "REGIME_TB_FLOOR=983616")
                       .replace("REGIME_TB_ERA_CEIL=650000", "REGIME_TB_ERA_CEIL=1000000"))
 # The documented 1M revert moves the WINDOW too (policy §7: "updates, in one commit: contextWindow
 # in models.json, the guard's CLAMP, and the floor literal in both instruments"). Without this the
@@ -1993,12 +1993,12 @@ src = open(g).read()
 assert "CLAMP=300000" in src
 open(g, "w").write(src.replace("CLAMP=300000", "CLAMP=1000000"))
 r = open(rep).read()
-assert "FLEET_REGIME_TB:-283616" in r
-open(rep, "w").write(r.replace("FLEET_REGIME_TB:-283616", "FLEET_REGIME_TB:-983616"))
+assert "FLEET_REGIME_TB:-783616" in r
+open(rep, "w").write(r.replace("FLEET_REGIME_TB:-783616", "FLEET_REGIME_TB:-983616"))
 w = open(wat).read()
-assert "REGIME_TB_FLOOR=283616" in w
+assert "REGIME_TB_FLOOR=783616" in w
 assert "REGIME_TB_ERA_CEIL=650000" in w
-open(wat, "w").write(w.replace("REGIME_TB_FLOOR=283616", "REGIME_TB_FLOOR=983616")
+open(wat, "w").write(w.replace("REGIME_TB_FLOOR=783616", "REGIME_TB_FLOOR=983616")
                       .replace("REGIME_TB_ERA_CEIL=650000", "REGIME_TB_ERA_CEIL=1000000"))
 PYEOF
 then
