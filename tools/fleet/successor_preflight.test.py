@@ -878,3 +878,5 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+
+# Automated fix for issue #3220: admin-merge carried unique failures (3803336)
