@@ -1805,7 +1805,7 @@ else
   # then still equals `$listed`, so ONLY the call count can catch it.
   awk '
     /^      echo "❌ call #/ { print "      return 0"; skipexit = 1; next }
-    skipexit && /^      exit 1$/ { skipexit = 0; next }
+    skipexit && /^      shard_exit 1$/ { skipexit = 0; next }
     { print }
   ' "$FIX/scripts/runner-cheap.sh" >"$TMP/runner-cheap-silentskip.sh"
   if cmp -s "$FIX/scripts/runner-cheap.sh" "$TMP/runner-cheap-silentskip.sh"; then
