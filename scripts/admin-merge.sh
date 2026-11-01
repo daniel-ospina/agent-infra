@@ -880,6 +880,36 @@ FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-$FAILSAFE_RERUN_TIMEOUT}"
 FIRST_CHECKS_STALL="${ADMIN_MERGE_FIRST_CHECKS_STALL:-8760}"
 FIRST_CHECKS_CEILING="${ADMIN_MERGE_FIRST_CHECKS_CEILING:-18064}"
 FIRST_CHECKS_POLL="${ADMIN_MERGE_FIRST_CHECKS_POLL:-60}"
+# CHECK_UNRESOLVED_BOUND — the bound on ONE thing the FIRST-CHECKS wait never
+# bounded: a check whose NEWEST attempt has no conclusion (`status=queued`/
+# `in_progress`, `conclusion=null`) because the job behind it never got a runner.
+#
+# ⛔ THE MEASURED DEFECT THIS BOUNDS (tortoise#10399). Two lanes railed two
+# FULLY GREEN PRs (#10474, #10475) and both HUNG with no decision: `pending=1`
+# on a head whose `python-ci-gate` — tortoise's REQUIRED aggregator, "branch
+# protection AND the merge queue's only merge_condition" — had no completed
+# attempt, because the aggregator cannot start until every `needs:` job has.
+# One of those (`ci-introduced-failure`) sat `queued` on run 41279786666 from
+# 06:11:08Z to 09:06:39Z — nearly three hours — while its SIBLING jobs kept
+# finishing, so the progress fingerprint kept CHANGING and the stall clock could
+# never fire. The wait's own ceilings (stall 8760s, ceiling 18064s) are LANE
+# OCCUPANCY bounds, not budget bounds: a lane that hits them has spent 2.4-5h
+# inside one command and returns, from outside, exactly the artefact of a
+# lander that was never running.
+#
+# So this is a SEPARATE, budget-sized bound on UNRESOLVEDNESS, and it REFUSES BY
+# NAME (`check-unresolved:<name>:<status>/<conclusion>`) instead of waiting. It
+# is NOT a longer timeout and NOT a shorter stall clock — a run that is queued
+# because the whole pool is saturated never stops moving, so no progress-based
+# clock can ever reach it. 3600s is the default because it is longer than the
+# slowest honest single attempt measured on this fleet and far shorter than the
+# occupancy bound it substitutes for; an operator who wants the old behaviour
+# sets it to the ceiling.
+# ⛔ IT NEVER CONCLUDES GREEN. Expiry is a REFUSAL (exit 1 via
+# block_on_first_checks), and a `conclusion` of null/empty is never read as
+# `success`/`neutral`/`skipped` — the fleet polarity rule: an unrecognised or
+# null conclusion is RED-or-REFUSED, never green.
+CHECK_UNRESOLVED_BOUND="${ADMIN_MERGE_CHECK_UNRESOLVED_BOUND:-3600}"
 
 # ── THE CONFIGURED LANE THAT DOES NOT EXIST IN THIS REPO (#2862) ──
 # `WORKFLOW` defaults to `python-ci.yml`, a TORTOISE layout. On a repo whose CI
@@ -1893,6 +1923,24 @@ validate_timing_knobs() {
     say_err "admin-merge: note — ADMIN_MERGE_FIRST_CHECKS_CEILING (${FIRST_CHECKS_CEILING}s) is below"
     say_err "   ADMIN_MERGE_FIRST_CHECKS_STALL (${FIRST_CHECKS_STALL}s), so the CEILING decides every wait and no"
     say_err "   STALL verdict can be reached. Legal, and what the rail's own suite uses."
+  fi
+  # CHECK_UNRESOLVED_BOUND — the same three checks as every other timing knob. A
+  # value the shell cannot compare must REFUSE at startup: `-ge` on '1h' makes `[`
+  # return 2, the arm is SKIPPED, and a typo silently restores the very hang this
+  # bound exists to end.
+  if counter_has_leading_zero "$CHECK_UNRESOLVED_BOUND"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_CHECK_UNRESOLVED_BOUND='${CHECK_UNRESOLVED_BOUND}' — a"
+    say_err "   LEADING ZERO is ambiguous: bash ARITHMETIC reads it as OCTAL while the comparison that"
+    say_err "   triggers the refusal reads it as DECIMAL. Write it without the leading zero."
+  elif ! counter_is_positive "$CHECK_UNRESOLVED_BOUND"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_CHECK_UNRESOLVED_BOUND='${CHECK_UNRESOLVED_BOUND}' — the"
+    say_err "   unresolved-check bound must be a POSITIVE integer number of seconds."
+  elif counter_exceeds_max "$CHECK_UNRESOLVED_BOUND" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_CHECK_UNRESOLVED_BOUND='${CHECK_UNRESOLVED_BOUND}' — beyond"
+    say_err "   the usable range (max ${TIMING_KNOB_MAX}s)."
   fi
   if counter_has_leading_zero "$FIRST_CHECKS_POLL"; then
     bad=1
@@ -4347,6 +4395,88 @@ first_checks_head_check_count() {
   printf '%s\n' "$n"
 }
 
+# check_unresolved_scan <check-runs-json> → one `check-unresolved:<name>:
+# <status>/<conclusion>` line per check whose NEWEST attempt (highest id per
+# (app slug, name)) is NOT `completed`. rc 0 when at least one is unresolved,
+# rc 1 when every newest attempt concluded.
+#
+# ⛔ WHY A SEPARATE SCAN AND NOT THE AGGREGATE. A check-run ROLLUP is not a
+# verdict: GitHub keeps every ATTEMPT, so one head carries BOTH a `failure` and a
+# `success` for the same job name, and the newest is the only one that describes
+# the tree. Measured on tortoise #10475 (head 3b4a8096): `python-ci-gate` holds
+# id 124783536754 `completed/failure` (07:32:42Z) AND id 124788856867
+# `completed/success` (07:58:49Z) — same name, same head, opposite verdicts. A
+# scan that took the first, or the worst, would refuse a green head; one that
+# took a rollup state would read the aggregate, not the check.
+#
+# ⛔ AND `conclusion` IS PRINTED, NEVER INTERPRETED. `null` becomes `-` (the same
+# sentinel the rest of this file uses), and `-` is NOT in any non-red set: the
+# caller's refusal carries it verbatim so the next reader sees WHICH empty shape
+# it was. The four shapes have four different fixes, and collapsing them into
+# "pending" is how the empty state became invisible in the first place.
+CHECK_UNRESOLVED_Q=''
+check_unresolved_scan() {
+  local body="$1"
+  "$PYTHON_BIN" - "$body" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+try:
+    with open(path, "rb") as fh:
+        raw = fh.read().decode("utf-8", "replace")
+except OSError:
+    sys.exit(2)
+
+runs = []
+docs = []
+idx = 0
+while idx < len(raw):
+    while idx < len(raw) and raw[idx] in " \t\r\n":
+        idx += 1
+    if idx >= len(raw):
+        break
+    try:
+        obj, end = json.JSONDecoder().raw_decode(raw, idx)
+    except ValueError:
+        sys.exit(2)
+    idx = end
+    docs.append(obj)
+for d in docs:
+    if isinstance(d, dict) and isinstance(d.get("check_runs"), list):
+        runs.extend(x for x in d["check_runs"] if isinstance(x, dict))
+if not runs:
+    # An EMPTY surface is not an absence of unresolved checks - it is an absence
+    # of a MEASUREMENT, and the caller must not read it as "nothing pending".
+    sys.exit(2)
+
+best = {}
+for pos, r in enumerate(runs):
+    name = str(r.get("name") or "")
+    if not name:
+        name = "(unnamed check)"
+    app = str(((r.get("app") or {}).get("slug")) or "")
+    # Newest attempt per (app, name) ordered by ID - never by started_at, which is
+    # nullable for a queued attempt and would sort an unresolved one first.
+    rid = r.get("id")
+    rid = rid if isinstance(rid, int) else -pos
+    key = (app, name)
+    if key not in best or rid > best[key][0]:
+        best[key] = (rid, r)
+
+unresolved = 0
+for (app, name) in sorted(best):
+    r = best[(app, name)][1]
+    status = str(r.get("status") or "")
+    concl = r.get("conclusion")
+    concl = "-" if concl in (None, "") else str(concl)
+    if status == "completed":
+        continue
+    unresolved += 1
+    print("check-unresolved:%s:%s/%s" % (name, status or "-", concl))
+sys.exit(0 if unresolved else 1)
+PY
+}
+
 # wait_for_first_checks <head> → 0 the lane is terminal at this head (there is
 # something to compare), 1 it is not (and FIRST_CHECKS_* say which way).
 #
@@ -4361,7 +4491,7 @@ first_checks_head_check_count() {
 # #1395 lesson: a rail that outlived its own reported bound).
 wait_for_first_checks() {
   local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
-  local now last_clock dt fp summary max_step digest jobs
+  local now last_clock dt fp summary max_step digest jobs cr_slug scan_rc scan_out
   local max_step_run fp_run summary_run read_ok n_lines idx
   local stall_bound ceiling_bound signal_ok poll_step remaining adv wait_word expired
   local rederive_left lane_filter_active head_checks
@@ -4370,6 +4500,7 @@ wait_for_first_checks() {
   FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
   FIRST_CHECKS_FINGERPRINT=""; FIRST_CHECKS_MISSING=0; FIRST_CHECKS_MISSING_STREAK=0
+  FIRST_CHECKS_UNRESOLVED=""; FIRST_CHECKS_UNRESOLVED_UNREADABLE=0
   stall_bound="$FIRST_CHECKS_STALL"
   ceiling_bound="$FIRST_CHECKS_CEILING"
   FIRST_CHECKS_STALL_BOUND="$stall_bound"; FIRST_CHECKS_CEILING_BOUND="$ceiling_bound"
@@ -4657,6 +4788,53 @@ wait_for_first_checks() {
           expired=1
         fi ;;
     esac
+    # ── THE UNRESOLVED-CHECK BOUND (tortoise#10399) ───────────────────────
+    # Checked AFTER the table above and OVERRIDING it, on purpose: the states the
+    # table bounds are all "a run is moving" or "nothing is observable", and the
+    # defect is the third case — a REQUIRED check whose job never got a runner so
+    # its newest attempt has NO conclusion, on a run that keeps producing job
+    # transitions and therefore never trips a progress clock. A wait that is
+    # still holding a head with an unresolved check after this bound REFUSES BY
+    # NAME rather than occupying the lane any longer.
+    # ⛔ The bound is not applied to `never-started`/`unreadable` (their own window
+    # already governs, and neither has a check NAME to report) nor when the lane
+    # is terminal (that returns above).
+    case "$FIRST_CHECKS_STATE" in
+      still-running)
+        if [ "$expired" -ne 1 ] && [ "$waited" -ge "$CHECK_UNRESOLVED_BOUND" ]; then
+          # ONE read, and only at the bound, so the ordinary merge path pays
+          # nothing. An unreadable scan does NOT clear the refusal: it keeps the
+          # outcome and says the names could not be read — failing to look is
+          # never a green.
+          if [ -n "${REPO:-}" ]; then cr_slug="repos/$REPO"; else cr_slug="repos/{owner}/{repo}"; fi
+          FIRST_CHECKS_UNRESOLVED=""
+          if $GH api "$cr_slug/commits/$head/check-runs?per_page=100&filter=all" --paginate \
+               > "$TMP/fc-unresolved.json" 2>/dev/null; then
+            # ⛔ THE SCAN'S EXIT STATUS IS THE DECISION — never "did it print
+            # anything". rc 2 means the surface was EMPTY or UNREADABLE, which
+            # prints nothing; reading that as "nothing unresolved" would leave
+            # `expired` at 0 and send the wait straight back into the hang this
+            # branch exists to end (and pay one extra read per poll forever).
+            scan_rc=0
+            scan_out="$(check_unresolved_scan "$TMP/fc-unresolved.json" 2>/dev/null)" || scan_rc=$?
+            case "$scan_rc" in
+              0) FIRST_CHECKS_UNRESOLVED="$scan_out"
+                 FIRST_CHECKS_OUTCOME="check-unresolved"
+                 expired=1 ;;
+              1) : ;;   # every newest attempt concluded — the wait keeps its bounds
+              *) FIRST_CHECKS_OUTCOME="check-unresolved"
+                 FIRST_CHECKS_UNRESOLVED=""
+                 FIRST_CHECKS_UNRESOLVED_UNREADABLE=1
+                 expired=1 ;;
+            esac
+          else
+            FIRST_CHECKS_OUTCOME="check-unresolved"
+            FIRST_CHECKS_UNRESOLVED=""
+            FIRST_CHECKS_UNRESOLVED_UNREADABLE=1
+            expired=1
+          fi
+        fi ;;
+    esac
 
     # ── THE REPORT (patience, not a hang: say WHAT was observed) ──────────
     # ⛔ A REPORT PRINTED ON THE POLL THAT ENDS THE WAIT MAY NOT SAY IT IS STILL
@@ -4716,8 +4894,37 @@ wait_for_first_checks() {
 # single "expired" would throw that distinction away — which is the whole point of
 # the progress signal.
 block_on_first_checks() {
-  local head="$1"
+  local head="$1" one_line
   case "${FIRST_CHECKS_OUTCOME:-}" in
+    check-unresolved)
+      # ⛔ THE NAMED REFUSAL (tortoise#10399). Reached when a check's NEWEST attempt
+      # has no conclusion after CHECK_UNRESOLVED_BOUND seconds: the lane gets its
+      # budget back WITH the reason recorded, instead of a silent multi-hour wait.
+      # It can never be green — `conclusion: null` prints as `-` and `-` is not in
+      # any non-red set.
+      say_err "admin-merge: ✗ BLOCK — REFUSED(check-unresolved) after ${FIRST_CHECKS_WAITED}s"
+      say_err "   (bound ADMIN_MERGE_CHECK_UNRESOLVED_BOUND=${CHECK_UNRESOLVED_BOUND}s) — a check on"
+      say_err "   head $head still has NO CONCLUSION, and an unresolved check is not a pass."
+      if [ "${FIRST_CHECKS_UNRESOLVED:-}" != "" ]; then
+        while IFS= read -r one_line; do
+          [ -n "$one_line" ] || continue
+          say_err "   REFUSED(${one_line})"
+        done <<< "$FIRST_CHECKS_UNRESOLVED"
+      elif [ "${FIRST_CHECKS_UNRESOLVED_UNREADABLE:-0}" -eq 1 ]; then
+        say_err "   REFUSED(check-unresolved:<names-unreadable>): the head's check-runs could not be"
+        say_err "   READ, so the unresolved check cannot be named — an unread surface is never a green."
+      else
+        say_err "   REFUSED(check-unresolved:<names-unavailable>): the lane reports pending runs but the"
+        say_err "   head's check surface names no unresolved attempt — the two disagree. The refusal"
+        say_err "   stands: the rail will not merge on a surface it cannot show is RESOLVED."
+      fi
+      say_err "   last observed: ${FIRST_CHECKS_OBSERVED:-nothing readable}"
+      say_err "   what was missing: this is NOT a stall and NOT a slow run. A stall means nothing moved;"
+      say_err "   here the run KEEPS moving (job transitions advance the fingerprint, so no progress clock"
+      say_err "   can ever fire) while ONE check never produces a conclusion — typically a required"
+      say_err "   aggregator whose own jobs are queued behind a saturated runner pool and so cannot start."
+      say_err "   Next: read the run named above; if a job is queued with no runner, free capacity or"
+      say_err "   re-run it. Nothing was compared, no evidence was posted and nothing was merged." ;;
     stalled)
       say_err "admin-merge: ✗ BLOCK — the FIRST-CHECKS wait STALLED: NO observable change for ${FIRST_CHECKS_QUIET}s"
       say_err "   (stall ${FIRST_CHECKS_STALL_BOUND}s, derived from the measured longest green step; waited ${FIRST_CHECKS_WAITED}s"
@@ -5388,6 +5595,11 @@ check_surface_probe() {
   MAIN_HEALTH_RED=0
   MAIN_HEALTH_RED_OTHER=0
   MAIN_HEALTH_PENDING=0
+  # The NAMES behind the pending count. The count alone cannot tell the rail's own
+  # [3/4] body-edit generation from real CI, and a refusal that says "N checks have
+  # no conclusion" without saying WHICH asks the operator to guess. Filled from the
+  # `PENDING` rows the classifier below already emits (#10399 review P1).
+  MAIN_HEALTH_PENDINGS=""
   if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
   # The head SHA is for the RECORD: main moves, and the evidence must say which
   # commit was measured. Unresolvable is not fatal — a branch ref addresses
@@ -5666,6 +5878,13 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
     case "$line" in
       COUNTS$'\t'*)
         IFS=$'\t' read -r tag MAIN_HEALTH_TOTAL _ MAIN_HEALTH_PENDING ok_rest <<< "$line"
+        ;;
+      PENDING$'\t'*)
+        # ⛔ THE ROW WAS ALREADY BEING EMITTED AND WAS BEING DROPPED. Without this
+        # branch only the COUNT survived, so the #10399 refusal could name no
+        # offender while every other refusal in this file insists on naming one.
+        IFS=$'\t' read -r tag pend_name pend_app <<< "$line"
+        MAIN_HEALTH_PENDINGS="${MAIN_HEALTH_PENDINGS}${MAIN_HEALTH_PENDINGS:+$'\n'}  ${pend_name} (${pend_app:-unknown app}) — no conclusion"
         ;;
       SURFACE$'\t'*)
         # The surface's own production time; consumed by the PR-tree probe in
@@ -8650,18 +8869,47 @@ main() {
   # PROCEEDS on UNMEASURED (a surface with no checks certifies nothing, but is
   # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
   # look is never a green).
-  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
+  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_PENDINGS TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
   check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0
   TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_PENDINGS="$MAIN_HEALTH_PENDINGS"
   TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
-  TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
+  TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
   # The PR surface's own production time — the anchor step 4.6 compares a base
   # red against. Empty means the surface has produced no completed check at all.
   TREE_MAX_COMPLETED="$MAIN_HEALTH_MAX_COMPLETED"
   TREE_MAX_COMPLETED_EPOCH="$MAIN_HEALTH_MAX_COMPLETED_EPOCH"
   case "$TREE_STATUS" in
     green)
+      # ⛔ A SURFACE WITH UNRESOLVED CHECKS IS NOT A GREEN SURFACE (tortoise#10399).
+      # `green` used to be reached whenever no check FAILED, so N checks with
+      # `status=queued|in_progress, conclusion=null` certified the very tree this
+      # merge lands — an empty conclusion read as a pass, which is exactly the
+      # polarity rule's forbidden outcome.
+      # ⛔ THE TEST IS `counter_is_zero`, NOT `-gt 0 2>/dev/null`. The latter is the
+      # precise fail-OPEN shape this file documents at the timing knobs: an
+      # unreadable counter makes `[` return 2, the `if` body is SKIPPED, and the
+      # guard about to certify a merge certifies it. Refusing unless the count is
+      # PROVEN zero blocks on `n/a`, on overflow, and on a positive count alike.
+      if ! counter_is_zero "${TREE_PENDING:-}"; then
+        say_err "admin-merge: ✗ BLOCK — REFUSED(check-unresolved): the PR's evaluated tree has ${TREE_PENDING} check(s) with NO CONCLUSION, so it is not certifiable."
+        say_err "   $TREE_SUMMARY"
+        if [ -n "${TREE_PENDINGS:-}" ]; then
+          say_err "   Unresolved checks (newest attempt, every workflow and app on this head):"
+          printf '%s\n' "$TREE_PENDINGS" >&2
+        fi
+        say_err "   A check whose newest attempt is queued/in_progress has concluded NOTHING — it is not a"
+        say_err "   pass, and calling this surface green would land a tree nobody measured."
+        say_err "   ⚠️ DECLARED RESIDUAL: this counts EVERY workflow and app on the head, so a pending check"
+        say_err "   outside the watched lane — including the rail's own [3/4] body-edit generation"
+        say_err "   (pipeline-compliance, workflow-lock) — refuses here too. That is deliberate: an"
+        say_err "   unresolved check is not a measurement whichever workflow produced it, and the refusal"
+        say_err "   names them so the next reader can tell the rail's own generation from real CI."
+        say_err "   Next: wait for those checks to conclude and re-run the rail. No evidence was posted and"
+        say_err "   no merge attempted."
+        exit 1
+      fi
       info "admin-merge: ✅ evaluated tree ${TREE_SUMMARY}" ;;
     unmeasured)
       info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
