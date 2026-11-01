@@ -282,6 +282,41 @@ fi
 # Default: no slice (run the whole list) — the behaviour every existing caller keeps.
 slice_index=-1
 slice_count=0
+# ── THE WALL BUDGET, AND WHY IT IS A NAMED VERDICT (agent-infra#3174) ──────────────────────────
+# The step's `timeout-minutes` is the PLATFORM's kill: it is `failure`, and its log says only
+# "exceeded the maximum execution time of N minutes". A shard that FAILED also produces `failure`.
+# So before this, the two reds this step can produce — a suite failed, or the DERIVED LIST outran
+# the bound — were one red with no distinguishing line. Measured 2026-10-31 (main, run
+# 41240886978): 147 listed suites summing 6468 s of shard work against a 6600 s (110 min) step
+# bound — a 132 s margin, 98 % of the bound — so the overrun arm was one suite away.
+#
+# `BASH_SHARDS_BUDGET_SECS` (set by the CALLING STEP, never guessed here) is the runner's OWN
+# deadline, deliberately BELOW that step bound, so the runner reaches this verdict and prints
+# WHICH defect it is before the platform kills the step opaquely:
+#   ❌ SHARD BUDGET EXCEEDED …  → capacity: the list outran the bound (NOT a suite failure)
+#   ❌ failing shard(s): …      → a real suite failure, named, with its `::error::` annotation
+# Both still exit 1. ⛔ The budget verdict deliberately emits NO `::error::` annotation: an
+# annotation becomes a guard-step identity the merge rail can COMPARE against main and EXEMPT
+# (scripts/ci_exemption.py, `guard_step_failures`), and a systemic overrun exists on main too — so
+# annotating it would turn "the bound is under-derived" into a PR-exempt failure. Prose keeps it
+# unattributable, and unattributable is fail-CLOSED, the correct direction here.
+# 0 / unset = no budget (the behaviour every pre-existing caller keeps).
+shard_budget=0
+if [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ]; then
+  case "$BASH_SHARDS_BUDGET_SECS" in
+    *[!0-9]*) echo "❌ BASH_SHARDS_BUDGET_SECS='$BASH_SHARDS_BUDGET_SECS' is not a whole number of seconds"; exit 2 ;;
+  esac
+  shard_budget=$((10#$BASH_SHARDS_BUDGET_SECS))
+  # ⛔ A BUDGET AND A SLICE DO NOT COMPOSE (review finding, #3174). `shard_time` accumulates only the
+  # shards THIS process ran, so a sliced caller would compare a ~1/N share against a WHOLE-LIST
+  # budget — a deadline ~N times too lenient, with no error, i.e. fail-open for any future caller that
+  # sets both. Refuse the pair rather than silently weakening the deadline; a slice's share would have
+  # to be derived from a measured whole-list figure, and no caller needs that today.
+  if [ -n "${BASH_SHARD_SLICE:-}" ]; then
+    echo "❌ BASH_SHARDS_BUDGET_SECS=$shard_budget cannot be combined with BASH_SHARD_SLICE — this process only accumulates the shards its own slice ran, so a whole-list budget would be ~N times too lenient. Set one or the other."
+    exit 2
+  fi
+fi
 if [ -n "${BASH_SHARD_SLICE:-}" ]; then
   case "$BASH_SHARD_SLICE" in
     *[!0-9/]*) echo "❌ BASH_SHARD_SLICE='$BASH_SHARD_SLICE' is not <index>/<count>"; exit 2 ;;
@@ -430,6 +465,43 @@ slice_skips() {
 # file the rail cannot name is the class this whole file exists to refuse.
 shard_named_failure() { shard_failed_list="${shard_failed_list}${shard_failed_list:+, }$1"; printf '❌ FAILED SHARD: %s\n' "$1"; }
 shard_record_failure() { [ "$shard_is_listed" = 1 ] || return 0; shard_named_failure "$1"; }
+
+# shard_budget_trip <what-is-being-started> — the NAMED overrun verdict, checked BEFORE each shard
+# so it fires while there is budget left to say why.
+# ⛔ THE QUANTITY IS `shard_time`, NOT `$SECONDS`, and the distinction is the whole measurement: the
+# 6468 s figure this bound was sized from is the SUM OF THE PER-SUITE ROWS (`▸ <secs> <path>`), i.e.
+# shard work, not step wall (the same run's shard STEP took 6469 s; the whole JOB took 6493 s, the
+# difference being checkout/setup and the three steps ahead of it). Comparing the budget against the
+# same quantity it was measured on keeps the arithmetic honest — and it is why the residue between
+# 6468 and 6469 is ~1 s, not the 25 s a first draft of this comment claimed.
+# It also draws the line between the two defects a step bound has to survive: a single HUNG suite
+# moves `$SECONDS` but barely moves `shard_time` (it has not returned yet), so a hang is still caught
+# by the platform's `timeout-minutes` — opaque but red — while the LIST outgrowing its bound is what
+# this verdict names. Exits 1: an overrun is RED, and no shard is skipped to fit the budget.
+shard_budget_trip() {
+  [ "$shard_budget" -gt 0 ] || return 0
+  [ "$shard_time" -ge "$shard_budget" ] || return 0
+  echo "❌ SHARD BUDGET EXCEEDED — the DERIVED LIST outran the step's bound, and this is NOT a suite failure: ${shard_time}s of shard work against BASH_SHARDS_BUDGET_SECS=${shard_budget}s, before starting '$1'. Ran $shard_ran of $listed listed shard(s) (slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}). Fix it with CAPACITY — add matrix slices (ci.yml's bash-suites), split the slowest suite — never by widening this number to whatever the run happened to take."
+  # ⛔ GATED ON THE COUNT, AND THE NAME IS OPTIONAL (review finding, #3174). `shard_failed_list` is
+  # the NAMES and `shard_errors` is the COUNT — two different quantities, which is why the recap
+  # below can report a failure that was counted and NOT named. Gating this line on the name list
+  # would let a broken naming arm print "NOT a suite failure" over a run that did fail one, i.e. this
+  # verdict would absorb the very failure it disclaims. The count decides; the name is reported when
+  # there is one and declared MISSING when there is not.
+  if [ "$shard_errors" -gt 0 ]; then
+    echo "❌ …and $shard_errors shard(s) failed INDEPENDENTLY of the overrun: ${shard_failed_list:-(counted, NONE named — the naming arm did not run for them, which is a defect in this runner)}"
+  fi
+  # ⛔ A SHORT COUNT IS NOT A SHORT LIST (#3079 applied to THIS exit). The trip stops the run, so the
+  # `executed + skipped == listed` accounting below never executes — and on the run this feature
+  # targets that is precisely the information a reader needs. Name the shards that will not run
+  # rather than leaving them as the difference between two numbers.
+  if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
+    _left="$(shard_unaccounted)"
+    echo "❌ NOT RUN — $shard_count_lines "$_left" of $listed listed shard(s) will not be attempted because the budget was already spent:"
+    while IFS= read -r _u; do [ -n "$_u" ] && printf '   ⏭  NOT RUN: %s\n' "$_u"; done <<<"$_left"
+  fi
+  exit 1
+}
 
 # shard_note <path> <seconds> — the per-shard timing row, and the running total/slowest. Separate
 # from run_shard so the execution line stays one readable statement-chain (the mutation pins replace
@@ -611,6 +683,7 @@ if [ "${#shard_array[@]}" -ne "$listed" ]; then
   exit 1
 fi
 for shard in ${shard_array[@]+"${shard_array[@]}"}; do
+  shard_budget_trip "$shard"
   run_shard "$shard"
 done
 echo "───────────────────────────────────────────────────────────────────"
@@ -738,6 +811,11 @@ shard_errors=$before_err
 shard_ran=$before_ran
 shard_skipped=$before_skip
 shard_listed=$before_listed
+
+# The budget is ALSO checked after the last shard (the pre-shard trip cannot see a list whose LAST
+# suite is the one that ran long), and BEFORE the failure recap, so a run that both overran and
+# failed prints both reasons in one place.
+shard_budget_trip "(end of list)"
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"

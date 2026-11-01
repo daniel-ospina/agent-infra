@@ -995,7 +995,7 @@ awk -v g="tests/ci-lane-parity/stand-in-*.sh" '
   skip { next }
   { print }
 ' "$RUNNER" >"$NAMED_FIX/scripts/runner-named.sh"
-env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-onefail.out" 2>&1
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-onefail.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-onefail.out")"
 if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT"; then
@@ -1040,6 +1040,81 @@ if [ "$RC" -eq 1 ] && grep -q 'resolves outside this checkout' <<<"$OUT"; then
   pass "a symlinked PARENT directory is refused (the leaf check alone would pass it)"
 else
   fail "a symlinked parent dir returned rc $RC (want 1): $(printf '%s' "$OUT" | tail -1)"
+fi
+
+echo ""
+echo "8aQ. THE OVERRUN IS A DIFFERENT NAMED RED FROM A SUITE FAILURE (agent-infra#3174)"
+# The step bound (`timeout-minutes`) is the PLATFORM's kill, and a FAILED shard is also `failure`:
+# before #3174 those two reds had nothing distinguishing them, so "a suite failed" and "the derived
+# list outran its bound" read identically in the check and only a hand diff of two logs told them
+# apart. `BASH_SHARDS_BUDGET_SECS` is the runner's own deadline, and this arm proves the two reds
+# are now distinguishable AND that neither absorbs the other:
+#   * no budget declared      -> the suite failure is named, and NO overrun verdict appears (a
+#                                verdict appearing unconditionally would be a permanent false block)
+#   * budget exhausted        -> the OVERRUN is named, disclaimed as "NOT a suite failure", and any
+#                                real failure is reported SEPARATELY rather than blamed on the bound
+#   * a live, unspent budget  -> the suite failure still fails the step (a budget must never absorb a
+#                                failure: that is the fail-open this arm exists to catch)
+# The slow stand-in is written into the fixture TREE (`$NAMED_FIX`), never committed: it only has to
+# make `shard_time` cross a 1 s budget deterministically, and a committed 2 s sleep would be paid by
+# every run of this suite forever.
+printf '#!/bin/bash\nsleep 2\n' >"$NAMED_FIX/tests/ci-lane-parity/stand-in-zzzslow.sh"
+# (1) NO budget: exactly §8am's verdict, and no overrun line.
+if grep -qF 'SHARD BUDGET EXCEEDED' "$TMP/runner-onefail.out"; then
+  fail "an overrun verdict appeared on a run that declared NO budget — a verdict that fires unconditionally is a permanent false block"
+else
+  pass "no overrun verdict when no budget is declared (0 = no deadline)"
+fi
+# (2) Budget exhausted (1 s, crossed by the 2 s stand-in): the overrun is NAMED and separated.
+env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=1 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-overrun.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-overrun.out")"
+if [ "$RC" -eq 1 ] && grep -qF '❌ SHARD BUDGET EXCEEDED' <<<"$OUT" && grep -qF 'this is NOT a suite failure' <<<"$OUT"; then
+  pass "an exhausted budget fails the step (rc 1) with its OWN NAMED verdict, disclaimed as not a suite failure"
+else
+  fail "the overrun verdict did not fire or did not disclaim a suite failure (rc $RC): $(grep -F 'BUDGET' <<<"$OUT" | head -2)"
+fi
+if grep -qF 'BASH_SHARDS_BUDGET_SECS=1' <<<"$OUT" && grep -qE 'failed INDEPENDENTLY of the overrun: .*stand-in-fail\.sh' <<<"$OUT"; then
+  pass "…it prints the budget it compared against AND names the one real failure SEPARATELY (neither red is laundered into the other)"
+else
+  fail "the overrun verdict did not separate the budget from the failure: $(grep -F 'INDEPENDENTLY' <<<"$OUT" | head -2)"
+fi
+# (3) A live budget that is NOT spent must not absorb the failure.
+env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=99999 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetok.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-budgetok.out")"
+if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT" && ! grep -qF 'SHARD BUDGET EXCEEDED' <<<"$OUT"; then
+  pass "an unspent budget changes nothing: the suite failure still fails the step, named, with no overrun line"
+else
+  fail "a live budget altered the suite-failure verdict (rc $RC): $(grep -E 'BUDGET|FAILED SHARD' <<<"$OUT" | head -2)"
+fi
+# (3b) The documented `0` spelling means NO deadline, and it must not be a silent no-op either: a
+# SET-but-zero budget that behaved like a tiny deadline would false-block every run.
+env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=0 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetzero.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-budgetzero.out")"
+if [ "$RC" -eq 1 ] && grep -qF "❌ FAILED SHARD: $NAMED_FAIL" <<<"$OUT" && ! grep -qF 'SHARD BUDGET EXCEEDED' <<<"$OUT"; then
+  pass "BASH_SHARDS_BUDGET_SECS=0 is the documented 'no deadline' spelling: the failure is named, no overrun line"
+else
+  fail "a zero budget changed the verdict (rc $RC): $(grep -E 'BUDGET|FAILED SHARD' <<<"$OUT" | head -2)"
+fi
+# (3c) A budget and a slice are REFUSED together: `shard_time` only accumulates this process's own
+# slice, so a whole-list budget over a 1/N share is ~N times too lenient — a silent weakening, so it
+# fails closed instead of never binding.
+env BASH_SHARD_SLICE=1/2 BASH_SHARDS_BUDGET_SECS=10 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetsliced.out" 2>&1
+RC=$?
+if [ "$RC" -eq 2 ] && grep -qF 'cannot be combined with BASH_SHARD_SLICE' "$TMP/runner-budgetsliced.out"; then
+  pass "a budget combined with a slice is refused (rc 2) instead of silently never binding"
+else
+  fail "budget+slice returned rc $RC (want 2)"
+fi
+# (4) A budget that is not a number is REFUSED, never silently ignored.
+env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=12x $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetbad.out" 2>&1
+RC=$?
+if [ "$RC" -eq 2 ] && grep -qF 'is not a whole number of seconds' "$TMP/runner-budgetbad.out"; then
+  pass "a non-numeric BASH_SHARDS_BUDGET_SECS is refused (rc 2), not silently run with no deadline"
+else
+  fail "a non-numeric budget returned rc $RC (want 2)"
 fi
 
 echo ""
