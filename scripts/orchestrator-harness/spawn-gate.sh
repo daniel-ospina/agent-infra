@@ -1695,30 +1695,46 @@ _cap_mod_missing() { # prints the missing functions, one per line; rc 1 if any i
 }
 spawn_gate_load_capacity() {
   [ "${CAP_GATE_MOD_LOADED:-0}" = "1" ] && return 0
-  _cap_mod_missing >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
-  local _sgc_d cand="" _sgc_here
+  # ⛔ A MODULE THE CALLING SHELL ALREADY SOURCED IS ACCEPTED, BUT NOT SILENTLY (cycle-3 review, P2):
+  # `SPAWN_GATE_CAP_TRIED` names it as PRELOADED, because this is the one place a mixed pair — this
+  # gate consuming a `capacity.sh` someone else loaded — can be seen at all.
+  _cap_mod_missing >/dev/null 2>&1 && {
+    CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_TRIED='(preloaded in the calling shell)'; SPAWN_GATE_CAP_FAULT=""
+    return 0
+  }
+  local _sgc_d _sgc_here _sgc_bad=""
   _sgc_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   SPAWN_GATE_CAP_TRIED=""
   # `${X:+…}` so an UNSET HOME/O/AGENT_INFRA_PATH contributes NO candidate — a bare `"$HOME/orchestrator"`
   # with HOME unset would search `/orchestrator` and claim it had tried something real.
+  # ⛔ A BROKEN CANDIDATE IS SKIPPED, NOT FATAL (cycle-3 review, P2). Breaking on the first candidate
+  # that merely EXISTS turned ONE stale file — and `deploy-harness.sh` seeds `$O` per file, so a stale
+  # `$O/capacity.sh` is a documented state — into a refusal for every spawn on a box that has a
+  # complete copy one candidate further along. That is the box-wide stall this change exists to
+  # remove, re-introduced by the fix for it.
   for _sgc_d in "${O:-}" "$_sgc_here" \
                 "${AGENT_INFRA_PATH:+$AGENT_INFRA_PATH/scripts/orchestrator-harness}" \
                 "${HOME:+$HOME/orchestrator}" "${HOME:+$HOME/.pi/agent/scripts}"; do
     [ -n "$_sgc_d" ] || continue
     SPAWN_GATE_CAP_TRIED="${SPAWN_GATE_CAP_TRIED}${SPAWN_GATE_CAP_TRIED:+ }$_sgc_d"
-    [ -f "$_sgc_d/capacity.sh" ] && { cand="$_sgc_d/capacity.sh"; break; }
+    [ -f "$_sgc_d/capacity.sh" ] || continue
+    # shellcheck source=/dev/null
+    if ! . "$_sgc_d/capacity.sh" 2>/dev/null; then
+      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh could NOT be sourced (corrupt or truncated copy)"
+    elif _cap_mod_missing >/dev/null 2>&1; then
+      CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_FAULT=""; return 0
+    else
+      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh is INCOMPLETE — missing: $(_cap_mod_missing 2>/dev/null | tr '\n' ' ')"
+    fi
+    # A partial load leaves functions DEFINED in this shell, which would make the NEXT call's
+    # "already defined" check pass on a broken module. Unset them so a retry starts clean.
+    unset -f cap_procs_pair_vars cap_h_for_vars cap_fork_probe 2>/dev/null || true
   done
-  [ -n "$cand" ] || {
+  if [ -n "$_sgc_bad" ]; then
+    SPAWN_GATE_CAP_FAULT="not COMPLETE anywhere it was searched (${_sgc_bad#; }; searched: ${SPAWN_GATE_CAP_TRIED:-nothing})"
+  else
     SPAWN_GATE_CAP_FAULT="not reachable from this spawn gate (searched: ${SPAWN_GATE_CAP_TRIED:-nothing})"
-    return 1
-  }
-  # shellcheck source=/dev/null
-  . "$cand" 2>/dev/null || {
-    SPAWN_GATE_CAP_FAULT="found at $cand but could NOT be sourced (corrupt or truncated copy)"
-    return 1
-  }
-  if _cap_mod_missing >/dev/null 2>&1; then CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_FAULT=""; return 0; fi
-  SPAWN_GATE_CAP_FAULT="found at $cand but INCOMPLETE — missing: $(_cap_mod_missing 2>/dev/null | tr '\n' ' ')"
+  fi
   return 1
 }
 
@@ -1750,7 +1766,24 @@ spawn_fork_state() {
   fi
   cap_h_for_vars "$_sf_p" "$_sf_m" _sf_h || _sf_h='?'
   printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} headroom=${_sf_h} src=${_sf_src:-?}"
-  if [ "$_sf_h" != '?' ] && [ "$_sf_h" != 'unbounded' ] && [ "$_sf_h" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
+  # ⛔ A NON-NUMERIC READING IS NOT "NO PRESSURE" (cycle-3 review, P1 — the same false-PASS class this
+  # change exists to close). Measured: a `capacity.sh` whose `cap_h_for_vars` was present but wrote
+  # nothing to `$3` left `_sf_h` EMPTY, and a non-numeric `CAP_MIN_FORK_HEADROOM` made `[ -lt ]` error
+  # with `[: abc: integer expression expected` — both skipped the headroom test, fell through to the
+  # two-fork probe, and the gate answered `ok` on a box with ONE pid of headroom, launching pi. A
+  # non-numeric value on either side now REFUSES under `nodeploy`, because that is a broken instrument
+  # or a broken knob, not an unmeasurable box.
+  if [ "$_sf_h" != 'unbounded' ] && ! is_num "$_sf_h"; then
+    printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} but cap_h_for_vars produced NO NUMBER (headroom='${_sf_h}'), so the fork floor cannot be decided"
+    printf -v "$_sf_sv" '%s' 'nodeploy'
+    return 0
+  fi
+  if ! is_num "${CAP_MIN_FORK_HEADROOM:-200}"; then
+    printf -v "$_sf_dv" '%s' "CAP_MIN_FORK_HEADROOM='${CAP_MIN_FORK_HEADROOM:-}' is not a number, so the fork floor cannot be decided (procs=${_sf_p}/${_sf_m}, headroom=${_sf_h})"
+    printf -v "$_sf_sv" '%s' 'nodeploy'
+    return 0
+  fi
+  if [ "$_sf_h" != 'unbounded' ] && [ "$_sf_h" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
     printf -v "$_sf_dv" '%s' "headroom=${_sf_h} < min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200} (procs=${_sf_p}/${_sf_m}, src=${_sf_src:-?})"
     printf -v "$_sf_sv" '%s' 'refused'
     return 0
@@ -1881,7 +1914,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       # is the remedy — the same sentence the capability gate publishes for 81, and the same reason
       # it is not folded into 73 (this box can fork perfectly well).
       AGENT_STARTED=0
-      echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the pair: cp scripts/orchestrator-harness/*.sh \$O/ (or redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)." >> "$log"
+      echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC (or a fork-floor CONFIG) fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the pair: cp scripts/orchestrator-harness/*.sh \$O/ (or redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)." >> "$log"
       return "$AGENT_HARNESS_SKEW_REFUSED" ;;
     unknown)
       echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. The instrument RAN and could not measure, which is a reading about the box rather than a deploy fault, so this spawn proceeds (an unmeasurable box is not a refusal). If lanes here stall, start from this line." >> "$log" ;;
@@ -2638,7 +2671,7 @@ pi_shim_main() {
     # cannot be established" as "capacity is available", which is the one inference an admission
     # gate may never make. The operator rescue is the real pi by absolute path.
     printf '[pi-gate] REFUSED fork headroom UNREADABLE: %s. NO pi was started and nothing was consumed.\n' "$_fdetail" >&2
-    printf '[pi-gate]   this is a DEPLOY/SYNC fault, not a reading about this box: sync the pair into one of the searched dirs (cp scripts/orchestrator-harness/*.sh <dir>) or redeploy the harness (deploy-harness.sh --repo . --o <O>). Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
+    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box: sync the pair into one of the searched dirs (cp scripts/orchestrator-harness/*.sh <dir>), fix the fork-floor knob named above, or redeploy the harness (deploy-harness.sh --repo . --o <O>). Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
     pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
     exit "$AGENT_HARNESS_SKEW_REFUSED"
   fi

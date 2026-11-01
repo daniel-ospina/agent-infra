@@ -1839,13 +1839,37 @@ mkdir -p "$ND/partial"
 cat > "$ND/partial/capacity.sh" <<'PIPARTIAL'
 cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 15641; printf -v "$3" '%s' stub; }
 PIPARTIAL
-nd3="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
-       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
 # The copy's own directory holds no capacity.sh, so point the resolver at the partial one via O.
 nd3="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/partial" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
        bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
 case "$nd3" in *'state=nodeploy'*'missing: cap_h_for_vars'*) rc=0 ;; *) rc=1 ;; esac
 ck "an INCOMPLETE capacity.sh is nodeploy naming the missing function, never a false PASS [$nd3]" $rc
+# ⛔ A NON-NUMERIC HEADROOM IS NOT "NO PRESSURE" (cycle-3 review, P1): a module whose
+# `cap_h_for_vars` is PRESENT but writes nothing left the headroom empty, the numeric test was
+# skipped, and the gate answered `ok` on a box with ONE pid of headroom — then launched pi.
+cat > "$ND/nonum/capacity.sh" 2>/dev/null || mkdir -p "$ND/nonum"
+cat > "$ND/nonum/capacity.sh" <<'PINONUM'
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 401; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { :; }
+cap_fork_probe() { :; }
+PINONUM
+nd4="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/nonum" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd4" in *'state=nodeploy'*'NO NUMBER'*) rc=0 ;; *) rc=1 ;; esac
+ck "a NON-NUMERIC headroom REFUSES (nodeploy) instead of skipping the test and answering ok [$nd4]" $rc
+nd5="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$(dirname "$cap_abspath")" CAP_MIN_FORK_HEADROOM=abc HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd5" in *'state=nodeploy'*'CAP_MIN_FORK_HEADROOM'*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a NON-NUMERIC CAP_MIN_FORK_HEADROOM REFUSES too, naming the knob (no silent \`[: integer expression expected\`) [$nd5]" $rc
+# ⛔ A BROKEN CANDIDATE IS SKIPPED, NOT FATAL (cycle-3 review, P2): one stale `$O/capacity.sh` must not
+# refuse every spawn on a box that holds a complete copy in the next candidate.
+mkdir -p "$ND/mixedO" "$ND/home3/orchestrator"
+cp "$ND/partial/capacity.sh" "$ND/mixedO/capacity.sh"
+cp "$cap_abspath" "$ND/home3/orchestrator/capacity.sh"
+nd6="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/mixedO" HOME="$ND/home3" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; if spawn_gate_load_capacity; then echo COMPLETE; else echo REFUSED; fi' _ "$ND/gate/pi" 2>&1)"
+case "$nd6" in *COMPLETE*) rc=0 ;; *) rc=1 ;; esac
+ck "a STALE \$O copy is SKIPPED and the complete copy further along is used — not a box-wide stall ($nd6)" $rc
 # the RESOLVER fix: `O` unset, but the DOCUMENTED default for it ($HOME/orchestrator) holds the
 # instrument — present rather than merely reported, which is the preferred half of the remedy.
 mkdir -p "$ND/home2/orchestrator"; cp "$cap_abspath" "$ND/home2/orchestrator/capacity.sh"
