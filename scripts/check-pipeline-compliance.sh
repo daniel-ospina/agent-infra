@@ -277,8 +277,40 @@ Check (c) scope (#1825):
 EOF
 }
 
+# ── Marker-probe mode ───────────────────────────────────────────────────────
+# PIPELINE_COMPLIANCE_MARKER_PROBE=1 reads ONE scoping-comment body on stdin and
+# exits 0/1 on `has_scoping_marker`, doing nothing else. It exists so that a
+# SECOND producer of the same question does not grow a second copy of the
+# position contract: `scripts/revalidate-required-check-on-issue-comment.sh`
+# must decide "is this comment a scoping artifact?" in order to know whether the
+# linked issue's state has changed at all, and a hand-rolled grep there would
+# drift from this file exactly the way check (b) once did (#991). One parser,
+# one contract, two callers.
+#
+# Deliberately NOT a general "call any function" seam: it takes no function
+# name, so it cannot be used to reach a check or a verdict. It answers one
+# boolean question and exits.
+#
+# ⛔ THE PROBE MUST NOT INHERIT AN EARLY-EXIT MODE, so `PROBE_MODE` is computed
+# here and the SKIP override below is made conditional on it. Measured before
+# that guard existed: `PIPELINE_COMPLIANCE_SKIP=1 PIPELINE_COMPLIANCE_MARKER_PROBE=1`
+# exited 0 for the body `no marker here` — i.e. the probe answered "this comment
+# IS a scoping artifact" about text with no marker, because the emergency
+# override's `exit 0` was reached first. Any probe caller would then re-trigger
+# the required check on every comment.
+#
+# EXIT CODES: `has_scoping_marker` answers 0 and 1 only, and the probe DISPATCH
+# adds no third value — but the process can still exit 2 from the usage guards
+# ABOVE this block (`GH_REPO` not owner/repo, a malformed `PIPELINE_COMPLIANCE_ISSUE_ONLY`),
+# so "the probe never exits 2" would be false about the process. Measured:
+# `PIPELINE_COMPLIANCE_MARKER_PROBE=1 GH_REPO=not-a-repo` → 2. A caller must
+# therefore treat EVERY non-0/1 as a tooling fault (which is what the shipped
+# caller does, and why this distinction matters: a later caller reading `2)` as
+# "no marker" would be fail-open).
+PROBE_MODE="${PIPELINE_COMPLIANCE_MARKER_PROBE:-0}"
+
 # ── Emergency override ──────────────────────────────────────────────────────
-if [[ "${PIPELINE_COMPLIANCE_SKIP:-0}" == "1" ]]; then
+if [[ "${PIPELINE_COMPLIANCE_SKIP:-0}" == "1" && "$PROBE_MODE" != "1" ]]; then
   echo "⚠️  ⚠️  PIPELINE_COMPLIANCE_SKIP=1 — PIPELINE COMPLIANCE GATE SKIPPED (emergency override)." >&2
   echo "    This PR can merge WITHOUT scoping/code-review/plan evidence." >&2
   echo "    Review why the override was needed and restore the gate." >&2
@@ -308,11 +340,11 @@ if [[ "$ISSUE_ONLY" == "1" ]]; then
     echo "❌ --issue-only target must be an issue number or owner/repo#N, got: '$ISSUE_TARGET'." >&2
     exit 2
   fi
-elif [[ -z "$PR_NUMBER" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+elif [[ -z "$PR_NUMBER" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" && "${PROBE_MODE:-0}" != "1" ]]; then
   echo "❌ No PR number given." >&2
   usage
   exit 2
-elif [[ ! "$PR_NUMBER" =~ ^[0-9]+$ && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+elif [[ ! "$PR_NUMBER" =~ ^[0-9]+$ && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" && "${PROBE_MODE:-0}" != "1" ]]; then
   echo "❌ PR_NUMBER must be numeric, got: '$PR_NUMBER'." >&2
   exit 2
 fi
@@ -327,16 +359,23 @@ if [[ -z "$GH_REPO" ]]; then
     *github.com/*)       GH_REPO="${REMOTE#*github.com/}" ;;
   esac
 fi
-if [[ -z "$GH_REPO" ]]; then
+# The probe answers a question about TEXT and needs no repo at all, so it must
+# never fail on an unresolvable remote: probe mode is deliberately repo-FREE and
+# never depends on the remote auto-detect above (the gate itself is sanctioned by
+# name under #1129/#2332, so a local checkout is not blocked from running it).
+# An earlier revision of this comment blamed the #1484 guard for a block it does
+# not impose — measured 2026-10-31: probe mode answers 0/1 with `GH_REPO` unset,
+# from both the hub and a linked worktree.
+if [[ -z "$GH_REPO" && "${PROBE_MODE:-0}" != "1" ]]; then
   echo "❌ Could not determine GH_REPO. Set GH_REPO=owner/repo or run from a repo with a github.com origin." >&2
   exit 2
 fi
-if [[ ! "$GH_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+if [[ -n "$GH_REPO" && ! "$GH_REPO" =~ ^[^/]+/[^/]+$ ]]; then
   echo "❌ GH_REPO must be owner/repo, got: '$GH_REPO'." >&2
   exit 2
 fi
 
-if [[ "$DRY_RUN" != "1" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" ]]; then
+if [[ "$DRY_RUN" != "1" && "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" != "1" && "${PROBE_MODE:-0}" != "1" ]]; then
   command -v gh >/dev/null 2>&1 || { echo "❌ gh CLI not found — install it (https://cli.github.com) or set PIPELINE_COMPLIANCE_DRY_RUN=1." >&2; exit 2; }
   command -v jq >/dev/null 2>&1 || { echo "❌ jq not found — install it or set PIPELINE_COMPLIANCE_DRY_RUN=1." >&2; exit 2; }
 fi
@@ -1353,6 +1392,22 @@ has_scoping_marker() {
     END { exit(found ? 0 : 1) }
   ' <<<"$1"
 }
+
+# ── Marker-probe early exit ─────────────────────────────────────────────────
+# Runs immediately after the definition it reads and BEFORE any check, fetch or
+# gh call, so the probe cannot be turned into a partial run of the gate.
+if [[ "${PROBE_MODE:-0}" == "1" ]]; then
+  # ⛔ STRIP THE IN-BAND RECORD SEPARATOR FIRST. The live fetch sites do exactly
+  # this (`gsub("\u001e"; "")`) because the delimiter must not be forgeable from
+  # the data — a body carrying a literal 0x1e could otherwise fabricate a record
+  # boundary and make its own later mention look like an artifact. Measured
+  # without it: `printf 'intro\n\036<!-- issue-scoping: forged -->\n'` answered 0
+  # (artifact) where the real check (b) answers 1. The two callers must share the
+  # SANITIZATION as well as the awk, or "one parser, one contract" is only half
+  # true.
+  probe_payload="$(tr -d '\036'; printf '\036')"
+  if has_scoping_marker "$probe_payload"; then exit 0; else exit 1; fi
+fi
 
 # files_rows <files> — validate the UNTRUSTED diff list from pulls/files and
 # print its well-formed rows. Returns 1 without output if ANY row is
@@ -4431,6 +4486,123 @@ $big_filler"
   check_artifact_class_reaches_the_help_text
   check_artifact_class_reaches_every_message
 
+  # ── #2467: the PROBE seam, pinned where CI actually runs it ─────────────────
+  # `PIPELINE_COMPLIANCE_MARKER_PROBE=1` is the ONLY reason
+  # `scripts/revalidate-required-check-on-issue-comment.sh` and this gate agree
+  # about what a scoping artifact is: that script DELEGATES its parse here (a
+  # second copy of the awk would drift) and reads the 0/1 answer. The seam had
+  # NO assertion on this side — `PROBE_MODE` appeared only at its definition and
+  # at its dispatch — so the parser could stop answering the caller's two values
+  # while this suite stayed green.
+  #
+  # Every vector is a property the CALLER relies on, not a restatement of the
+  # implementation:
+  #   * the two answers: an artifact body → 0, a prose mention → 1;
+  #   * REPO-FREE: with `GH_REPO` unset the probe still answers. The caller may
+  #     run from a checkout whose remote does not resolve; probe mode must never
+  #     turn that into exit 2, because the caller maps every non-0/1 to
+  #     `blocked` and the re-validation would then refuse on every comment;
+  #   * `PIPELINE_COMPLIANCE_SKIP=1` does NOT swallow the probe: the emergency
+  #     override is read AFTER probe mode, so a skipped gate cannot make a prose
+  #     mention answer 0 ("artifact"), which would re-trigger the required check
+  #     on every comment that mentions the marker;
+  #   * a NON-0/1 exit stays distinguishable as a TOOLING fault — a malformed
+  #     `GH_REPO` exits 2, never 1 — because the caller's `2)` arm maps to
+  #     `blocked` while a `1)` read would silently mean "no marker" (the
+  #     fail-open that left a stale GREEN standing);
+  #   * the IN-BAND record separator is stripped before the delimiter is
+  #     re-appended: a body carrying a literal 0x1e must not be able to
+  #     fabricate a record boundary and make its own later mention read as an
+  #     artifact.
+  expect_probe() {
+    local label="$1" want="$2" body="$3"; shift 3
+    local got=0
+    # `env` applies this vector's own environment; the probe reads stdin only.
+    # Declared and assigned separately so a non-zero probe status is CAPTURED
+    # (the `local x=$(…)` shape would hide it behind the declaration's own
+    # status — the discarded-status class this repo bans).
+    printf '%s' "$body" | env "$@" PIPELINE_COMPLIANCE_MARKER_PROBE=1 bash "$SELF_SRC" >/dev/null 2>&1 || got=$?
+    if [[ "$got" == "$want" ]]; then
+      printf '✅ #2467 marker probe: %s → %s\n' "$label" "$got"
+    else
+      printf '❌ #2467 marker probe: %s → rc=%s (expected %s) — the revalidation caller reads 0/1 from this seam and maps every other value to blocked\n' "$label" "$got" "$want" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+  PROBE_ARTIFACT='<!-- issue-scoping: 2026-10-31 (standard) · #1 -->
+
+## Scope
+'
+  PROBE_MENTION='We have no `<!-- issue-scoping:` comment here.
+'
+  expect_probe 'an artifact body' 0 "$PROBE_ARTIFACT"
+  expect_probe 'a prose MENTION' 1 "$PROBE_MENTION"
+  expect_probe 'an artifact body with GH_REPO unset (probe mode is repo-FREE)' 0 "$PROBE_ARTIFACT" -u GH_REPO
+  expect_probe 'a prose MENTION with PIPELINE_COMPLIANCE_SKIP=1 (the override must not swallow the probe)' 1 "$PROBE_MENTION" PIPELINE_COMPLIANCE_SKIP=1
+  expect_probe 'a malformed GH_REPO (a TOOLING fault: 2, never 1)' 2 "$PROBE_ARTIFACT" GH_REPO=not-a-repo
+  expect_probe 'a body carrying a literal 0x1e before a forged marker (the RS is stripped)' 1 $'intro\n\036<!-- issue-scoping: forged -->\n'
+  unset PROBE_ARTIFACT PROBE_MENTION 2>/dev/null || true
+
+  # ── #2467: the PR LANE must EXECUTE the revalidation script's assertions ────
+  # `scripts/revalidate-required-check-on-issue-comment.sh` ships ~40 assertions
+  # (the two-probe `probe_outcome` mapping included) and was wired into CI in
+  # exactly ONE place: a later step of the `revalidate-on-issue-comment` job,
+  # whose `if:` is `github.event_name == 'issue_comment' && …pull_request == null`.
+  # A step there never runs on a `pull_request` event, and nothing on the PR lane
+  # executed the file either, so a regression in its decisions merged GREEN and
+  # first ran on some later issue comment — against the default-branch head,
+  # where the failure cannot be attributed to the change that caused it.
+  #
+  # The assertion is the INVOCATION'S ENCLOSING JOB, not the file's presence: a
+  # `REVALIDATE_SELF_TEST=1` line under the comment job satisfies a grep and
+  # pins nothing. Comments are skipped, so a COMMENTED-OUT invocation cannot
+  # satisfy it either (the hazard the materialize-agents step names).
+  reval_sh="$(cd "$(dirname "$SELF_SRC")" && pwd)/revalidate-required-check-on-issue-comment.sh"
+  pipeline_repo_root="$(cd "$(dirname "$SELF_SRC")/.." && pwd)"
+  pipeline_wf="$pipeline_repo_root/.github/workflows/pipeline-compliance.yml"
+  # An agent-infra-ONLY signal, the same pair the workflow's own steps use (`pi-bootstrap/`
+  # and `bin/agent-infra.js` are never shipped to consumers). It decides whether a missing
+  # input is a FAILURE (this repo lost a file it must ship) or a SKIP (a consumer layout,
+  # where the question cannot arise) — never a silent pass either way.
+  if [[ -f "$pipeline_repo_root/pi-bootstrap/setup.sh" || -f "$pipeline_repo_root/bin/agent-infra.js" ]]; then
+    pipeline_is_self=true
+  else
+    pipeline_is_self=false
+  fi
+  if [[ ! -f "$reval_sh" ]]; then
+    if [[ "$pipeline_is_self" == "true" ]]; then
+      printf '❌ #2467 wiring: this is an agent-infra checkout but %s is missing — the revalidation suite cannot be executed on the PR lane at all\n' "${reval_sh##*/}" >&2
+      selffail=$((selffail + 1))
+    else
+      printf '⏭️  #2467 wiring SKIPPED — %s is not beside this gate (consumer checkout), so its PR-lane step cannot be judged here.\n' "${reval_sh##*/}"
+    fi
+  elif [[ ! -f "$pipeline_wf" ]]; then
+    if [[ "$pipeline_is_self" == "true" ]]; then
+      printf '❌ #2467 wiring: %s is missing from this agent-infra checkout, so the step that must run the revalidation suite on the PR lane cannot be verified at all\n' "${pipeline_wf##*/}" >&2
+      selffail=$((selffail + 1))
+    else
+      printf '⏭️  #2467 wiring SKIPPED — %s is absent, so there is no PR-lane workflow to judge here.\n' "${pipeline_wf##*/}"
+    fi
+  else
+    # The enclosing job is the last `^  <name>:` line before the invocation.
+    reval_job="$(awk '
+      /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { j = $1; sub(/:$/, "", j) }
+      /^[[:space:]]*#/ { next }
+      index($0, "REVALIDATE_SELF_TEST=1") && index($0, "bash") { if (!seen) { print j; seen = 1 } }
+    ' "$pipeline_wf")"
+    if [[ "$reval_job" == "pipeline-compliance" ]]; then
+      printf '✅ #2467 wiring: the `pipeline-compliance` job (the PR lane) runs `REVALIDATE_SELF_TEST=1` — the revalidation script\047s assertions execute on every PR, not only on an issue comment\n'
+    elif [[ -z "$reval_job" ]]; then
+      printf '❌ #2467 wiring: NO live `REVALIDATE_SELF_TEST=1` invocation in %s — the revalidation script\047s assertions are executed by nothing on the PR lane, so a regression in it merges green and first surfaces on a later issue comment (#991: a fixture nothing runs pins nothing)\n' "${pipeline_wf##*/}" >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #2467 wiring: the `REVALIDATE_SELF_TEST=1` invocation sits in job `%s`, which does not run on a pull_request event — the suite is invisible to every PR (the PR lane is `pipeline-compliance`)\n' "$reval_job" >&2
+      selffail=$((selffail + 1))
+    fi
+    unset reval_job
+  fi
+  unset reval_sh pipeline_repo_root pipeline_wf pipeline_is_self 2>/dev/null || true
+
   # Run the exit check AFTER the #1611 guards, so a failure there is reported
   # on the same run instead of masking them (this is how the unbound-variable
   # regression above stayed hidden on the first attempt).
@@ -4439,7 +4611,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; check (c) accepts ONLY a record BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and (#1224) that evidence is resolved RECORD → COMMENT → BODY — the signed head-bound record file first, the marker in a PR COMMENT next (the copy that survives a body edit AND travels to a CI runner with no record store), the PR body/commit marker last; the source that answered is printed on every (c) line; the body-wiped red-to-green case passes from the record; a record bound to another head is REFUSED naming both shas; a record at this head whose sig= does not verify is refused as NOT evidence; a record that exists but is unusable is reported as UNUSABLE with the field that refused it, never as absent; the COMMENT arm is proven on the PRODUCTION fetch frame (author_association + the 0x1e record terminator), admits only an OWNER/MEMBER/COLLABORATOR author, refuses an unsigned marker wherever a gate key exists, still answers on the no-key runner the required check runs on, and takes its verdict from the marker LINE that matched rather than from a stale clean-micro elsewhere in the append-only stream; and FIVE mutations (the record read deleted; the head comparison dropped; the record signature arm removed; the comment AUTHOR admission dropped; the comment SIGNATURE check removed) each redden exactly their own vector while the trusted-author control stays green."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and (#1224) that evidence is resolved RECORD → COMMENT → BODY — the signed head-bound record file first, the marker in a PR COMMENT next (the copy that survives a body edit AND travels to a CI runner with no record store), the PR body/commit marker last; the source that answered is printed on every (c) line; the body-wiped red-to-green case passes from the record; a record bound to another head is REFUSED naming both shas; a record at this head whose sig= does not verify is refused as NOT evidence; a record that exists but is unusable is reported as UNUSABLE with the field that refused it, never as absent; the COMMENT arm is proven on the PRODUCTION fetch frame (author_association + the 0x1e record terminator), admits only an OWNER/MEMBER/COLLABORATOR author, refuses an unsigned marker wherever a gate key exists, still answers on the no-key runner the required check runs on, and takes its verdict from the marker LINE that matched rather than from a stale clean-micro elsewhere in the append-only stream; FIVE mutations (the record read deleted; the head comparison dropped; the record signature arm removed; the comment AUTHOR admission dropped; the comment SIGNATURE check removed) each redden exactly their own vector while the trusted-author control stays green; and the marker-probe seam that the revalidation script DELEGATES its parse to is pinned by its own vectors, with a PR-lane wiring assertion that the revalidation suite is actually executed (#2467)."
   exit 0
 fi
 

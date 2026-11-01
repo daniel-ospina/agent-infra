@@ -178,7 +178,8 @@
 #           green-with-no-verdict on the newest tree, and on `workflow-lock` would satisfy the
 #           guard-generation wait while contributing no verdict. So the required check is one of the
 #           two that DOES stack, and a repair push costs a run there every time.
-#           NOT in the set, and why: `ci-main.yml` (`push: [main]`) and `enforce-skills.yml`
+#           NOT in the set, and why: `ci-main.yml` (`push` to `main`, plus `integration/**` since
+#           #3131 — never a PR push) and `enforce-skills.yml`
 #           (`schedule` + `push: [main]`) never fire on a PR push, and `admin-merge-detector.yml`
 #           fires on `workflow_run` of main's CI. The four reusable `workflow_call` files
 #           (`docs-ci`, `drift-check`, `node-ci`, `python-ci`) run as JOBS inside a caller's RUN,
