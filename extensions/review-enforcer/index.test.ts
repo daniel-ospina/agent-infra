@@ -63,6 +63,7 @@ import {
   isAdminMergeCommand,
   mergeInvocationInText,
   hasGhCommandWord,
+  hasBareGhWord,
   mergeVerbInText,
   readsNonMergeGhCall,
   ghShimWillEnforce,
@@ -5191,9 +5192,14 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
 section("#3953 — a READ-ONLY command that mentions merging is not a merge");
 
 test("mergeInvocationInText: read-only commands that NAME a merge are not candidates", () => {
-  // Each of these was REFUSED at 04bc1dde with "no resolvable PR number" (measured; see
-  // the module docstring on `mergeInvocationInText`), and each must stay admitted BY
-  // CONSTRUCTION — a property of the command SHAPE, not of the reader's mood.
+  // ⛔ HOW MANY OF THESE WERE ACTUALLY REFUSED AT 04bc1dde IS MEASURED, NOT ASSUMED (VGATE round
+  // on review cycle 6): FOUR of the nine rows below (the branch-protection projection, the
+  // `gh pr create` title, the `gh pr revert` title, and the `gh run view | grep` read). The other
+  // FIVE — the canonical check-runs read, its `$S`-substituted form, the `--search` row,
+  // `git merge-base`, and the `merge_commit_sha` projection — were ALREADY admitted at the base
+  // (`isAdminMergeCommand`, `isGitOp` and `hasAdminMergeFlag` all false), so for those this table
+  // is a REGRESSION FENCE around shapes the issue class contains, not a guard against 04bc1dde.
+  // Every row must be admitted BY CONSTRUCTION either way — a property of the command SHAPE.
   const admitted: Array<[string, string]> = [
     [
       "the mandated check-runs read (the #3953 repro)",
@@ -5330,6 +5336,21 @@ test("mergeInvocationInText: a construct on BOTH sides is not an invocation (rev
     `$JQ "$F" --arg admin x`,
     `$CARGO $ARGS --features admin`,
     `"$PYTHON" "$SCRIPT" $'--dry-run'`,
+    // ⛔ AND WITH A NUMERIC OPERAND (review cycle 6). The cycle-6 PR-NUMBER bound means a
+    // constructed VERB is only read when a bare number FOLLOWS it, and a dequoted flag can only
+    // reach the verb slot behind a construct command word and a construct group — so the row
+    // above no longer exercises the DEQUOTED-DASH bound at all. This row is what keeps it
+    // observable (measured: dropping the dequoted-dash test reddens ONLY this row). A quoted flag
+    // with a numeric value is everyday: `"$PYTHON" "$SCRIPT" $'--max-errors' 25`.
+    `"${"$"}PYTHON" "${"$"}SCRIPT" ${"$"}'--max-errors' 25`,
+    // ⛔ AND THE SAME WITH THE FLAG THE NEW ARGV BOUND LOOKS FOR (review cycle 7). Cycle 6's row
+    // above stopped faulting the dequoted-dash bound once that bound became "a selector AND then an
+    // admin flag" (mutant M12 — drop `!w.startsWith("-")` — SURVIVED the whole suite, measured):
+    // the row has no flag after the number, so it is admitted either way. THIS row supplies one, and
+    // without the dash test the dequoted `--max-errors` reads as a verb word, `25` as the selector
+    // and `--admin` as the flag — a refusal of a read-only invocation. Admitted at `78d897fa1` AND
+    // at `04bc1dde` (measured), so unlike its neighbours it is a plain GUARD.
+    `"${"$"}PYTHON" "${"$"}SCRIPT" ${"$"}'--max-errors' 25 --admin`,
   ];
   for (const cmd of overBlocks) {
     ok(!mergeInvocationInText(cmd), `a read-only construct-construct command is not a merge: ${cmd}`);
@@ -5392,31 +5413,213 @@ test("mergeInvocationInText: TEXT is not an invocation, and an all-assembled com
     // ⛔ AND WITH A REDIRECTION APPENDED (review cycle 5, P1). `CONSTRUCT` lists `<`/`>`, so
     // `2>/dev/null` / `> /tmp/out` / `2>&1` read as construct words — and an adjacent construct
     // at the verb stage returned true, so ONE redirect turned a read-only command into a refused
-    // "admin merge". These ARE guards: `origin/main` admits all four and the cycle-4 head
-    // (1d63117e4) refused all four — measured — so the redirection bound is what decides them.
+    // "admin merge". These ARE guards: the pre-#3953 base `04bc1dde` admits all four and the
+    // cycle-4 head (1d63117e4) refused all four — measured — so the redirection bound decides them.
     `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR" 2>/dev/null`,
     `bash ${"$"}AIR/scripts/verify-admin-merge-evidence.sh "${"$"}PR" 2>&1`,
     `jq --arg admin "${"$"}X" "${"$"}F" > /tmp/out`,
     `jq --arg admin "${"$"}X" "${"$"}F" 2>&1 | tail -5`,
+    // ⛔ THREE CONSECUTIVE VARIABLE WORDS ARE NOT `gh`→`pr`→`merge` (review cycle 6, P1
+    // over-block). The walk accepts a construct in the command, group AND verb slots, so on its
+    // own it read `node $A $B $C admin` as a merge and — with the `admin` word present — refused
+    // it. `04bc1dde` admits every row here and the merged head `78d897fa1` refuses every one (both
+    // measured), so these are GUARDS against an over-block that is LIVE on main. A constructed verb
+    // now needs a merge's ARGV after it — a PR SELECTOR and then the admin flag — which is what the
+    // assembled merges this arm is for all carry (`GH=gh; ${GH} ${P} $M 999 --admin`).
+    `bash "${"$"}AIR/scripts/verify-admin-merge-evidence.sh" "${"$"}PR" "${"$"}HEAD"`,
+    `node ${"$"}A ${"$"}B ${"$"}C admin`,
+    `git log ${"$"}A ${"$"}B ${"$"}C --author=admin`,
+    `echo ${"$"}A ${"$"}B ${"$"}C admin`,
+    `rg admin ${"$"}A ${"$"}B ${"$"}C`,
+    // ⛔ TWO ISOLATION ROWS: each faults ONE conjunct of the new bound, and neither is a fleet
+    // command — they exist because a conjunction can have a conjunct no command-shaped case reaches
+    // (the same reason the `hasGhCommandWord` bounds above are asserted directly).
+    //   (1) the SELECTOR slot must actually BE a selector: with `isMergeSelectorToken` weakened to
+    //       `return true`, the bare word `admin` reads as the positional and the trailing `--admin`
+    //       completes the argv — mutant M1 survived the whole suite until this row existed.
+    `echo ${"$"}A ${"$"}B ${"$"}C admin --admin`,
+    //   (2) no reading crosses a COMMAND SEPARATOR: without that stop the flag slot borrows the
+    //       `--admin` of the NEXT command — mutant M3 survived until this row existed.
+    `echo ${"$"}A ${"$"}B ${"$"}C; --admin`,
+    // ⛔ AND NOT BECAUSE A NUMBER APPEARS FURTHER ALONG (review cycle 7, P2). The same blind bound
+    // was an unbounded FORWARD SCAN, so it borrowed a number from a different word — a flag's value
+    // or the NEXT command — and refused all four of these. `78d897fa1` refuses them and `04bc1dde`
+    // admits them (both measured): GUARDS. The scan now stops at a command separator and only skips
+    // a GLOBAL value flag's value, so `-n 5`, `-A 3`, `; sleep 5` and `&& sleep 10` are not the merge's.
+    `git log ${"$"}A ${"$"}B ${"$"}C --author=admin -n 5`,
+    `rg admin ${"$"}A ${"$"}B ${"$"}C -A 3`,
+    `echo ${"$"}A ${"$"}B ${"$"}C admin; sleep 5`,
+    `node ${"$"}A ${"$"}B ${"$"}C admin && sleep 10`,
+    // ⛔ AND A BARE `pr` MENTION IS NOT A MERGE (review cycle 6, P1 over-block). The
+    // `mergeVerbInText` arm is quote-blind for a construct after a `pr` WORD, so it named
+    // `echo pr $PR admin` a merge although the command contains no `gh` at all — refused at the
+    // merged head `78d897fa1`, admitted at the pre-#3953 base `04bc1dde` (both measured), so also a GUARD.
+    `echo pr ${"$"}PR admin`,
+    `echo "pr ${"$"}PR admin"`,
   ];
   for (const cmd of notInvocations) {
     ok(!mergeInvocationInText(cmd), `prose/heredoc is not a merge invocation: ${cmd.slice(0, 70)}`);
     ok(!isAdminMergeCommand(cmd), `…and the admin-merge gate is never asked about it: ${cmd.slice(0, 70)}`);
   }
+  // ⛔ `COMMAND_SEPARATOR`'s NEWLINE, pinned on its own (review cycle 8, P2 — mutant M17), on this
+  // side of the bound because both rows are GUARDS: REFUSED at `78d897fa1` (the over-block class
+  // this PR exists to fix) and ADMITTED at `04bc1dde` and at this head (measured).
+  // The mechanism is worth stating, because "the tokenizer already splits on whitespace" makes the
+  // clause look dead: a newline never SURVIVES as a token, but it does sit in `scan.gaps` (the gap
+  // is the original text sliced between two tokens), and the gap is the only place the separator
+  // test can look. Drop `\n` from the class and the scan crosses the line break — the flag slot
+  // picks the NEXT command's `--admin`, and the selector slot picks the next line's `999`.
+  for (const cmd of [
+    `${"$"}{GH} ${"$"}{P} ${"$"}{M} 999\n--admin`, // the flag is another command's
+    `${"$"}{GH} ${"$"}{P} ${"$"}{M}\n999 --admin`, // …and so is the selector
+  ]) {
+    ok(!mergeInvocationInText(cmd), `a newline ends the invocation — the next line is not its argv: ${cmd}`);
+    ok(!isAdminMergeCommand(cmd), `…so the admin-merge gate is never asked about it: ${cmd}`);
+  }
   // The other side of the same bound: an invocation whose EVERY word is assembled is still a
-  // merge. Measured against `origin/main` — every one of these is a real `gh pr merge <n>
-  // --admin` and the base refuses it, so a bound that dropped them would be a fail-open.
+  // merge. Every row here is a real admin merge, and each is REFUSED at `78d897fa1` (the merged
+  // #2907 head) and at this head — measured — so a bound that dropped them would be a fail-open.
+  // ⚠️ NOT all of them are refused at `04bc1dde`: the rows noted below are spellings that the
+  // pre-#3953 base simply did not READ (admitted there, refused by every later base). Stating the
+  // two bases separately is the point of naming SHAs instead of `origin/main`, which moved.
   const assembled = [
     `GH=gh; ${"$"}{GH} ${"$"}{P} $M 999 --admin`,
     `GH=gh; g$'h' $P $M 999 --admin`,
     `timeout 5 g$'h' $'pr' "merge" 999 --admin`,
     `GH=gh; g$'h' $P "merge" 999 --admin`,
+    // ⛔ `isAdminFlagSlot`'s LITERAL arm, pinned on its own (review cycle 8, P2 — mutant M14).
+    // Without it a literal `--admin` in the flag slot is not a flag at all (`isVerbSlotConstruct`
+    // rejects a `-`-leading word), so this real `gh pr merge 999 --admin` becomes ADMITTED. Every
+    // other row in this block is silent about that arm because the GROUP-slot ask reads the first
+    // two constructs as selector+flag and never reaches the literal one — `GH=gh; … $M 999 --admin`
+    // stays refused with the arm deleted (measured), which is exactly why the block needed a row
+    // with NO assignment prefix. Base relation: REFUSED at `78d897fa1`, admitted at `04bc1dde`
+    // (the older base simply did not read this spelling — not an over-block this change adds).
+    `${"$"}{GH} ${"$"}{P} ${"$"}{M} 999 --admin`,
+    // ⛔ AND `isMergeSelectorToken`'s `PR_URL_RE` arm, pinned the same way (mutant M15). A URL
+    // selector is otherwise ALWAYS shielded: `GH=gh; ${GH} ${P} ${M} <url> --admin` is still
+    // refused with the arm deleted, because the GROUP-slot ask reads `${GH}`/`${P}` first. Only a
+    // shape whose URL is the SOLE readable selector faults it. A corpus cannot pin this arm at all —
+    // over every string literal in the three review-enforcer sources it is never the deciding one —
+    // so it is pinned by a ROW or by nothing. This row is
+    // `timeout 5 gh pr merge <url> --admin` and is REFUSED at `78d897fa1` and here.
+    `timeout 5 ${"$"}{GH} ${"$"}{P} ${"$"}{M} https://github.com/o/r/pull/9 --admin`,
+    // ⛔ AND THE COMMAND-FIRST ORDERING of `mergeVerbSequenceInTokens`, pinned on its own (review
+    // cycle 8, P2 — mutant M20). `mergeVerbWalk` is OR-ed in both orderings because a construct at
+    // the group stage is ambiguous, and until this row existed ONE OF THE TWO OR-ED ARMS could be
+    // deleted with the suite at 338/0. Dropping the command-first arm admits this row — a real
+    // `gh pr merge 999 --admin` (the quoted `"pr"` is data to the model while the construct `g$'h'`
+    // is the command word) — and it is REFUSED at BOTH bases (`78d897fa1`, `04bc1dde`) as well as
+    // here, so it is a guard in the strict sense. The row the block already carried
+    // (`g$'h' $P "merge"`) is silent about the ordering: it is read by the GROUP-first arm.
+    `GH=gh; g$'h' "pr" merge 999 --admin`,
   ];
   for (const cmd of assembled) {
     ok(mergeInvocationInText(cmd), `an all-assembled invocation is still a merge: ${cmd}`);
     ok(isAdminMergeCommand(cmd), `…and the admin-merge gate still decides it: ${cmd}`);
   }
+  // ⛔ AND THE SELECTOR IS A SELECTOR, NOT A BARE DECIMAL (review cycle 7, P0). The cycle-6 bound
+  // asked for `/^\d+$/` on a later word, so an assembled merge whose PR was a VARIABLE or a URL
+  // stopped reaching this arm — `mergeInvocationInText` answered false, `isGitOp` was false, and
+  // the handler returned before the evidence gate (`index.ts`, `if (!isGitOp(command))`). Every row
+  // here is a real admin merge; each is ADMITTED at the cycle-6 head `7703dde60` and REFUSED at
+  // both `78d897fa1` (merged #2907 head) and `04bc1dde` (pre-#3953 base) — measured. They are
+  // GUARDS against the P0, and they are what a `bareNumberAfter`-shaped bound cannot pass.
+  const assembledSelector = [
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M $PR --admin`,
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M "$PR" --admin`,
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M ${"$"}{PR} --admin`,
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M "$PR" --admin --squash`,
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M https://github.com/o/r/pull/9 --admin`,
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M $PR_URL --admin`,
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M --repo o/r $PR --admin`,
+    // …and two for a global flag that is NOT stripped before the walk (`--hostname github.com`), so
+    // the reading has to survive a flag/value pair sitting between the verb and the positional. The
+    // second row (the `${GH}` slot dropped) is the one that faults the value-flag skip ON ITS OWN
+    // — mutant M4 survived the suite until it existed (measured); the first is covered by the
+    // GROUP-slot reading as well, which is why it is not sufficient.
+    `GH=gh; ${"$"}{GH} ${"$"}{P} $M --hostname github.com $PR --admin`,
+    `GH=gh; ${"$"}{P} $M --hostname github.com $PR --admin`,
+    `X=gh; ${"$"}{X} ${"$"}{P} $M $N --admin`,
+    `sh -c 'GH=gh; ${"$"}{GH} ${"$"}{P} $M $PR --admin'`,
+    `X='GH=gh; ${"$"}{GH} ${"$"}{P} $M $PR --admin'; sh -c "$X"`,
+    // ⛔ AND `shellWordAt`'s `${X}` PAIR READ, pinned on its own (review cycle 8, P2 — mutant M16).
+    // `${PR}` arrives as the tokens `$` + `PR}`, and the selector is only readable when those two
+    // are joined. With the pair read disabled this row is ADMITTED, and note WHY it needs its own
+    // row: every other `${PR}` row in this block is shielded by the GROUP-slot ask, so the block
+    // was green over a clause it never exercised. The braces on the VERB (`${M}`, not `$M`) are
+    // what make the difference — with `$M` the group-slot ask still reads a selector. REFUSED at
+    // BOTH bases (`78d897fa1`, `04bc1dde`), so it is a guard in the strict sense.
+    `GH=gh; ${"$"}{GH} ${"$"}{P} ${"$"}{M} ${"$"}{PR} --admin`,
+  ];
+  for (const cmd of assembledSelector) {
+    ok(mergeInvocationInText(cmd), `an assembled merge with a NON-DECIMAL selector is a merge: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and the admin-merge gate decides it (a P0 when this is false): ${cmd}`);
+  }
+  // …and the flag side of the same argv: an assembled FLAG is only read where the command SPELLS
+  // `--admin`. Without the anchor, `$V` in the flag slot made a construct RUN (`node $A $B $C $D
+  // admin`) a merge; without the assembled spelling at all, this real admin merge would be admitted.
+  ok(mergeInvocationInText(`V=--admin; GH=gh; ${"$"}{GH} ${"$"}{P} $M $PR $V`),
+     "a $VAR-supplied admin flag is still an assembled admin merge (the command spells --admin)");
+  ok(!mergeInvocationInText(`node ${"$"}A ${"$"}B ${"$"}C ${"$"}D admin`),
+     "…while a four-construct RUN with a bare `admin` word is still not one");
+
+  // ⛔ AND THE SELECTOR MAY BE ABSENT ENTIRELY — `gh pr merge --admin`, the spelling that merges the
+  // CURRENT BRANCH (review cycle 9, P0). `extractMergePrNumber` returns null for it and this file's
+  // own contract says a null answer must FAIL CLOSED, yet at `90859f471` EVERY reading of it dropped
+  // out: `assembledMergeArgvAfter` wants a SELECTOR (the word after the verb here is `--admin`, which
+  // `isMergeSelectorToken` rejects), `isGitOp`'s `GH_PR_PATTERN` needs a literal `gh pr merge` (the
+  // verb is a construct), and the text arm's conjunct (`hasBareGhWord ∨ MERGE_WORD`) is false because
+  // the `gh` WORD is a construct too. So `isGitOp` answered false and the handler returned at
+  // `if (!isGitOp(command)) return undefined;` BEFORE the evidence gate and the registry gate.
+  // Each row is REFUSED at BOTH bases (`78d897fa1`, `04bc1dde`) and ADMITTED at `90859f471`
+  // (measured), which is this PR's own fail-open criterion. Keep ONE word literal and the same
+  // command was already refused — which is why no existing row could see it:
+  // `X=gh; ${X} pr merge --admin` and `X=gh; ${X} pr $M 999 --admin` are both refused here.
+  const assembledNoSelector = [
+    `X=gh; ${"$"}{X} pr $M --admin`,
+    `X=gh; ${"$"}{X} "pr" $M --admin`,
+    `X=gh; ${"$"}{X} pr $M --admin --squash`,
+    // …and the `${M}` spelling, which is what forces the arm to read the WORD at the slot rather than
+    // the single token: `${M}` arrives as the pair `$` + `M}`, and that first token alone is not the
+    // verb (only `shellWordAt`'s pair branch makes it one).
+    `X=gh; ${"$"}{X} pr ${"$"}{M} --admin`,
+  ];
+  for (const cmd of assembledNoSelector) {
+    ok(mergeInvocationInText(cmd), `an assembled merge with NO selector (current branch) is a merge: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and the admin-merge gate decides it: ${cmd}`);
+    // ⛔ `isGitOp` IS THE ASSERTION THAT MATTERS (a P0 when it is false): the handler returns at
+    // `if (!isGitOp(command)) return undefined;`, so this is the difference between a gated merge and
+    // a gate that never runs. The bound is `assembledBareAdminAfter`, guarded by the LITERAL `pr`
+    // group word so the construct RUNS above cannot reach it (a run has no `pr` in its group slot).
+    ok(isGitOp(cmd), `…and the handler's own isGitOp gate is reached (a P0 when this is false): ${cmd}`);
+  }
+  // ⛔ THE RESIDUAL THAT GUARD LEAVES, RECORDED SO THE ASYMMETRY IS VISIBLE (not celebrated). The
+  // guard is "a LITERAL `pr` in the group slot", and the walk cannot tell a construct that IS `gh`
+  // from one that is not — so a read-only `<command> $A pr $B --admin` reads as a merge too. Its
+  // relation: GATED at `78d897fa1` (that head's unconditional verb-slot arm read it) and at this
+  // head, ADMITTED at `04bc1dde` (measured) — i.e. it stays inside the #2907 over-block class this
+  // PR does not own, and closing it would cost the four rows above. Pinned so a future narrowing is
+  // a deliberate act rather than an accident.
+  ok(mergeInvocationInText(`node ${"$"}A pr ${"$"}B --admin`),
+     "…while a NON-gh command with a literal `pr`, a construct verb and --admin is still read as one (declared residual)");
 });
+
+/**
+ * The SCOPE of the two invariants below: a command that reads as a merge INVOCATION rather than a
+ * mere MENTION — a BARE `gh` word, or the verb WORD (mirroring `MERGE_WORD` in the implementation).
+ *
+ * ONE definition, TWO readers, for the same reason the implementation has one: an invariant with a
+ * scope written twice drifts, and the second copy is where the disagreement hides. It is
+ * load-bearing rather than decorative — `echo pr $PR admin` is a merge by the TEXT read and NOT an
+ * invocation (it is deliberately admitted; see the `notInvocations` block), so the corpus carries
+ * that row and reverting either filter to `if (!mergeVerbInText(command)) continue;` turns this
+ * test RED (mutation M5). Before the row existed the narrowing could be reverted with the suite
+ * green at 338/338 — an edit no assertion could see (review cycle 7, P2).
+ */
+function isMergeInvocationScoped(command: string): boolean {
+  return hasBareGhWord(command) || /(^|[^\w-])merge([^\w-]|$)/.test(command);
+}
 
 test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText — no two disagreeing merge-reads", () => {
   // ⛔ THE INVARIANT, not a case list. `mergeVerbInText` is the read the CALLER's own
@@ -5426,7 +5629,17 @@ test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText
   // word is DATA to the counting walk; the construct in the verb slot is the merge).
   //
   // SCOPED EXACTLY, because the unscoped form is FALSE and was caught in review cycle 2:
-  //   pinned here      — `mergeVerbInText(c)` ⇒ `mergeInvocationInText(c)`   (the argv read)
+  //   pinned here      — `(hasBareGhWord(c) ∨ the word `merge`) ∧ mergeVerbInText(c)`
+  //                      ⇒ `mergeInvocationInText(c)`                          (the argv read)
+  // ⛔ AND NARROWED AGAIN IN REVIEW CYCLE 6, on evidence rather than convenience: the
+  // unconditional form is false because `mergeVerbInText` names a bare `pr` MENTION with no `gh`
+  // in the command (`echo pr $PR admin` — measured true there, and refused at the cycle-5 head
+  // while `origin/main` admitted it: a P1 over-block). The consequence that MATTERS is that the
+  // two reads may not disagree about a merge INVOCATION, which is what the conjunct states.
+  ok(mergeVerbInText(`echo pr ${"$"}PR admin`), "the caller's own read names this bare mention");
+  ok(!mergeInvocationInText(`echo pr ${"$"}PR admin`),
+     "…and it is not an invocation: no gh word; `04bc1dde` admits it and the merged head `78d897fa1` refuses it (measured, cycle-6 counterexample)");
+  ok(!hasBareGhWord(`echo pr ${"$"}PR admin`), "…the conjunct is what excludes it, and it is false here");
   //   NOT an invariant — `mergeVerbInText(c)` ⇒ `isAdminMergeCommand(c)`, since that
   //                      predicate ALSO requires `hasAdminMergeFlag`. `gh pr merge 999` (no
   //                      flag) is a merge both reads see and the ADMIN-merge gate does not;
@@ -5467,9 +5680,21 @@ test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText
     `git merge-base --is-ancestor abc origin/main`,
     `echo 'gh pr merge 9 --admin'`,
     `bash $AGENT_INFRA_PATH/scripts/admin-merge.sh 123 --admin`,
+    // ⛔ THE FILTER BELOW IS LOAD-BEARING, AND THESE TWO ROWS ARE WHAT MAKE IT SO (review cycle 7,
+    // P2). Both satisfy `mergeVerbInText` and NOT the conjunct (no bare `gh` word, no `merge` word),
+    // so the SCOPED implication says nothing about them — and they are deliberately admitted (see
+    // the `notInvocations` block). Reverting the filter to `if (!mergeVerbInText(command)) continue;`
+    // asserts the implication on them and turns this test RED (mutation M5); before these rows the
+    // narrowing could be reverted with the suite still green at 338/338, i.e. an edit no assertion
+    // could see.
+    `echo pr ${"$"}PR admin`,
+    `echo "pr ${"$"}PR admin"`,
   ];
+  ok(mergeVerbInText(`echo pr ${"$"}PR admin`), "the corpus row that makes the filter matter is a merge by the TEXT read");
+  ok(!isMergeInvocationScoped(`echo pr ${"$"}PR admin`),
+     "…and it fails the conjunct, which is exactly why it is out of the SCOPED implication's scope");
   for (const command of corpus) {
-    if (!mergeVerbInText(command)) continue;
+    if (!(mergeVerbInText(command) && isMergeInvocationScoped(command))) continue;
     ok(
       mergeInvocationInText(command),
       `mergeVerbInText reads a merge, so the argv-position read must too: ${command}`,
@@ -5503,7 +5728,7 @@ test("mergeInvocationInText: the candidate rule is a SUPERSET of mergeVerbInText
      "…and it is still a candidate, which is what review cycle 2 was about");
   // …and the CALLER's predicate agrees wherever its own flag conjunct holds:
   for (const command of corpus) {
-    if (!(mergeVerbInText(command) && hasAdminMergeFlag(command))) continue;
+    if (!(mergeVerbInText(command) && hasAdminMergeFlag(command) && isMergeInvocationScoped(command))) continue;
     ok(isAdminMergeCommand(command), `…and the admin-merge gate decides it: ${command}`);
   }
   ok(!(mergeVerbInText("gh pr merge 999") && hasAdminMergeFlag("gh pr merge 999")),
@@ -7378,6 +7603,27 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "gh pr view 1; \"X=1\" $(true)",
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
+  }
+  // ⛔ THE THREE CONSTRUCT-VERB ROWS ABOVE ARE REFUSED BY A DIFFERENT ARM THAN THE ONE THIS TEST
+  // WAS WRITTEN FOR, and for a whole review cycle nothing asserted it (review cycle 8, P1). They
+  // are in the `readsNonMergeGhCall` list above, whose predicate is the DEFERRAL's polarity — so
+  // deleting the stage-2 `assembledMergeArgvAfter` call in `mergeVerbWalk` left the suite at
+  // **338 passed, 0 failed** while flipping all three to ADMITTED. Measured here (mutant M13), with
+  // `isGitOp` false as well, which is the whole failure: the handler returns at
+  // `if (!isGitOp(command))` BEFORE the evidence gate and the merge registry gate, so an assembled
+  // `gh pr merge 999 --admin` whose verb sits in `then`/`env`/`if` executes ungated. Each row is
+  // refused at BOTH bases (`78d897fa1`, `04bc1dde`), so the arm is the reason and not a shape the
+  // base refused for a different cause.
+  for (const cmd of [
+    "V=--admin; if true; then $C $P $M 999 $V; fi; gh issue comment 5", // the verb behind `then`
+    "V=--admin; env $C $P $M 999 $V; gh issue comment 5", // …behind `env`
+    "V=--admin; if $C $P $M 999 $V; then :; fi; gh issue comment 5", // …and behind `if`
+  ]) {
+    ok(mergeInvocationInText(cmd), `a construct verb behind a reserved word is still a merge: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and the admin-merge gate decides it (a FAIL-OPEN when false): ${cmd}`);
+    // The handler's OWN entry predicate, pinned because the two above can be true while this one
+    // is false — and `if (!isGitOp(command)) return undefined;` is the line that skips both gates.
+    ok(isGitOp(cmd), `…and the handler does not return before the evidence gate: ${cmd}`);
   }
   // `mergeVerbInText` — the candidate rule's shared read (`isAdminMergeCommand` calls it
   // on its spliced-verb branch), which is why it is pinned here rather than only through
