@@ -69,10 +69,16 @@
 #   bash scripts/run-bash-shards.sh --list-sweeps   # print the syntax-sweep globs, run nothing
 #
 #   BASH_SHARD_SLICE=<i>/<n> bash scripts/run-bash-shards.sh   # run ONE slice of the list
+#   SHARD_BOUND=<seconds> bash scripts/run-bash-shards.sh       # that per-shard bound (see below)
 #   BASH_SHARDS_BUDGET_SECS=<secs> bash scripts/run-bash-shards.sh  # name an overrun of the bound
 #
 # ENVIRONMENT CONTRACT (complete — a caller that sets anything else changes nothing here):
 #   BASH_SHARD_SLICE      <i>/<n> — run only slice i of n. Slicing is a MATRIX concern (below).
+#   SHARD_BOUND           whole seconds; the PER-SHARD bound (#3187). Unset or EMPTY takes the
+#                         default 1800 s; `0`/'off' DISABLES it; any other non-integer — or one wide
+#                         enough to wrap negative — is REFUSED (rc 2) rather than silently running
+#                         unbounded. A shard that crosses it is killed by PROCESS GROUP, named
+#                         `TIMEOUT after <n>s` in the recap, and the list CONTINUES (see below).
 #   BASH_SHARDS_BUDGET_SECS  whole seconds; the runner's OWN deadline for the shard WORK it measures
 #                         (`shard_time`, the sum of the per-suite `▸` rows — NOT step wall clock).
 #                         Unset = no deadline; `0` = no deadline; set-but-EMPTY is REFUSED (rc 2),
@@ -81,6 +87,37 @@
 #                         NOT be combined with BASH_SHARD_SLICE (rc 2) — the two do not compose.
 #                         On crossing it the runner prints a NAMED overrun verdict and EXITS 1, so an
 #                         overrun can never be read as a suite failure (see shard_budget_trip).
+#
+# ⛔ THE TWO BOUNDS ARE DIFFERENT DEFECTS, and they do not overlap. SHARD_BOUND bounds ONE shard, so
+# a HANG costs one shard instead of the rest of the list; BASH_SHARDS_BUDGET_SECS bounds the LIST,
+# so an overrun of the whole list is NAMED as capacity rather than arriving as an opaque platform
+# kill. They compose: a hung shard trips the first (bounded, named, list continues), a list whose
+# shards are each within bound but whose SUM is not trips the second.
+#
+# THE PER-SHARD BOUND — why a hung shard must cost ONE shard (#3187)
+# ------------------------------------------------------------------
+#   Measured on main's `script-validate` (PR #3153 run, job 124687782089): shard #103 of 148,
+#   `scripts/orchestrator-harness/selftest.sh`, STOPPED inside a child with 0.00 s CPU and sat
+#   there for 82 minutes. The only bounds were the STEP's (110 min) and the JOB's, so the hang
+#   consumed the whole list's budget and shards #104–#148 never ran at all. That is why the
+#   reported failing set kept SHRINKING (13 → 11 → 10) while nothing was fixed: fewer shards
+#   executed before the kill, not more bugs repaired. #3174 makes such a truncation VISIBLE
+#   (a partial recap refuses to be used as a baseline); this bound makes it NOT HAPPEN.
+#
+#   `SHARD_BOUND`, default 1800 s — 1.65× the slowest shard measured (1092 s), so a legitimately
+#   slow suite cannot false-trip. A shard that exceeds it is KILLED BY PROCESS GROUP (its own
+#   children included — a wrapper-only kill leaves the hang's children running), NAMED with a
+#   `TIMEOUT after <n>s` marker through the SAME `shard_failed_list` every other failure uses,
+#   and the loop CONTINUES to the next shard. A hang therefore costs one shard, not forty-five.
+#   `SHARD_BOUND=0` (or `off`) disables it for a lane that legitimately wants no bound; any other
+#   non-integer refuses the run rather than silently degrading to unbounded.
+#
+#   PORTABILITY: `timeout` does not exist on macOS and the repo runs bash 3.2 as well as 5. The
+#   bound is therefore built from `set -m` (job control ⇒ each background job LEADS its own process
+#   group) plus ONE `sleep`-based watchdog — no external dependency, no poll loop (a 1 s poll costs
+#   ~1.16 s of dead time per shard, measured; the watchdog costs two forks). `kill -<signal> -<pgid>`
+#   reaches the whole group; TERM is followed by KILL so a shard that traps/ignores TERM cannot
+#   outlive it.
 #
 # SLICING — why it is an ENV VAR and not an argument (#2055 follow-up; the `bash-suites`
 # duration defect). Slicing exists because the JOB's DURATION, not runner capacity, was the
@@ -381,15 +418,67 @@ fi
 # the first slice's set, N=78 is caught only because 78 % 8 ≠ 0 — at N=80 all eight slices execute a
 # correct COUNT (10 each) and print ✅ while 10 of the 80 shards never run at all. The list grows, so
 # that decay is scheduled rather than hypothetical. The set is compared at the end.
+# ── THE PER-SHARD BOUND (#3187) — parsed and VALIDATED before any work ────────────────────────
+# `shard_bound` is the number of seconds, or 0 for "no bound"; `shard_bound_desc` is what the
+# header and the recap REPORT, so a truncated run says which bound it hit rather than leaving the
+# reader to guess whether the step, the job, or this script killed it.
+shard_bound_raw="${SHARD_BOUND:-1800}"
+shard_bound=0
+case "$shard_bound_raw" in
+  off|OFF|Off|disabled|DISABLED|none|NONE) shard_bound=0 ;;
+  *[!0-9]*)
+    echo "❌ SHARD_BOUND='$shard_bound_raw' is not a bound — want a whole number of seconds, or 0/off to disable. Refusing rather than running UNBOUNDED (a typo must not silently remove the bound that #3187 added)." >&2
+    exit 2 ;;
+  ??????????*)
+    # ⛔ WIDTH IS CHECKED BEFORE THE ARITHMETIC, because `$((10#$x))` WRAPS: a 19-digit value becomes
+    # NEGATIVE (which the `-lt 1` test below would read as "disabled" — the exact fail-open this
+    # block exists to refuse) or a huge positive `sleep` rejects outright (rc 1, so the watchdog fires
+    # instantly and kills EVERY shard at t≈0). Ten digits is ~317 years, far past any real bound, and
+    # it is the same 9-digit-scale guard the repo's reapers apply to a numeric seam (`docs/ops/disk-reaper.md`).
+    echo "❌ SHARD_BOUND='$shard_bound_raw' is TOO LARGE — at most 9 digits (a longer value wraps in shell arithmetic, and a wrapped bound is either NEGATIVE or rejected by sleep). Refusing." >&2
+    exit 2 ;;
+  *) shard_bound=$((10#$shard_bound_raw)) ;;
+esac
+if [ "$shard_bound" -lt 1 ]; then
+  shard_bound=0
+  shard_bound_desc="DISABLED (SHARD_BOUND=$shard_bound_raw) — a hung shard will consume the whole step"
+else
+  shard_bound_desc="${shard_bound}s per shard (SHARD_BOUND; 0 or 'off' disables)"
+fi
+
 shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
 # ⛔ THE SKIPPED PATHS ARE RECORDED TOO, WITH THEIR REASON (agent-infra#3079). `shard_skipped` was a
 # bare counter, so a slice could SAY it had skipped 31 shards and name none of them — and the
 # `ran + skipped == listed` check had no way to tell "this slice skipped 31 by design" from "31
 # shards vanished and the counter drifted to the same number". One line per skip, `<path>\t<reason>`.
 shard_skip_log="${shard_ran_log}.skipped"
+# The bound's mark (#3187): the watchdog WRITES here when it decides the shard overran, so the
+# parent can tell "the bound killed it" from "the shard died on its own at about the bound" without
+# comparing clock readings. Emptied before every shard; one file, never one per shard.
+shard_timeout_marker="${shard_ran_log}.timeout"
 : > "$shard_ran_log" 2>/dev/null || true
 : > "$shard_skip_log" 2>/dev/null || true
-trap 'rm -f "$shard_ran_log" "$shard_skip_log"' EXIT
+: > "$shard_timeout_marker" 2>/dev/null || true
+trap 'rm -f "$shard_ran_log" "$shard_skip_log" "$shard_timeout_marker"' EXIT
+
+# ── A SHARD MUST DIE WITH ITS DRIVER (#3187 review, P2) ────────────────────────────────────────────
+# `set -m` (see `shard_run_bounded`) gives the RUNNING shard its own process group, so a GROUP kill of
+# this driver — a cancelled CI step, a harness group kill, Ctrl-C — no longer reaches it. Before this
+# change the shard inherited the driver's process group and died with it, so this is a regression the
+# bound itself introduces and must close: without these traps a cancelled step leaves a shard writing
+# into a workspace the runner already considers finished, for up to `SHARD_BOUND` (UNBOUNDED when the
+# bound is disabled). The live shard's group and the live watchdog take the TERM; then the driver
+# exits as the signal says, and its EXIT trap still runs.
+shard_bg_pid=""
+shard_wd_pid=""
+shard_driver_signal() {
+  [ -n "${shard_bg_pid:-}" ] && { kill -TERM -"$shard_bg_pid" 2>/dev/null || kill -TERM "$shard_bg_pid" 2>/dev/null; }
+  [ -n "${shard_wd_pid:-}" ] && { kill -TERM -"$shard_wd_pid" 2>/dev/null || kill -TERM "$shard_wd_pid" 2>/dev/null; }
+  exit "$1"
+}
+trap 'shard_driver_signal 129' HUP
+trap 'shard_driver_signal 130' INT
+trap 'shard_driver_signal 143' TERM
 
 # shard_unaccounted — the listed shards this run neither EXECUTED nor SKIPPED, one path per line.
 # ⛔ DERIVED FROM THE LIST, never from the counters (agent-infra#3079). `executed + skipped == listed`
@@ -442,6 +531,155 @@ shard_count_lines() { awk 'NF { n++ } END { print n + 0 }' <<<"$1"; }
 # gutted for the name to disappear, which is exactly the vacuous arm the tests refuse.
 shard_failed_list=""
 shard_fail() { shard_record_failure "$1"; }
+
+# ── THE HUNG SHARD (#3187): bounded, NAMED, and the run CONTINUES ────────────────────────────────
+# `shard_timeout_list` is the names of the shards this run KILLED at the per-shard bound. It is a
+# SEPARATE accumulator on purpose: `shard_failed_list` feeds the recap line
+# `❌ failing shard(s): <a>, <b>`, which `scripts/ci_exemption.py` splits on `, ` into
+# `bash-shard::<path>` identities (`_BASH_SHARD_RECAP_RE`) — so a marker appended to a name THERE
+# would manufacture a phantom identity that matches nothing on main and false-BLOCKs every lane. The
+# casualty is therefore named through the SAME `shard_fail` chain as any other failure (one name,
+# one chain — unchanged) and this list carries the `TIMEOUT after <n>s` marker as its own recap line.
+shard_timeout_list=""
+
+# shard_timed_out <path> <seconds> — the distinguishable mark a bound hit leaves. Printed at the
+# point of failure (so a truncated log still explains itself) and replayed in the recap by name.
+# Gated on `shard_is_listed` by its caller, exactly like `shard_record_failure`: the runtime sentinel
+# deliberately fails a mktemp stub and must never be reported as a timed-out SHARD.
+shard_timed_out() { shard_timeout_list="${shard_timeout_list}${shard_timeout_list:+, }$1"; printf '⏱ SHARD TIMEOUT after %ss: %s\n' "$2" "$1"; }
+
+# shard_watchdog — the BOUND itself, run as one background job beside the shard. Reads (never
+# writes) the driver's globals: `shard_bg_pid` is the shard's pid, which — under `set -m` — is also
+# its process GROUP id. A single `sleep`, not a poll loop (see `shard_run_bounded`).
+#
+# ⛔ THE TIMER IS A CHILD SO TERM CAN TAKE IT WITH US (#3187 review, and measured the hard way). A
+# bare `sleep` in the watchdog's own body is a process the watchdog cannot kill on its way out: if
+# only the watchdog's pid is signalled (the fallback path, or any caller that misses the group), the
+# `sleep` is orphaned. An orphaned timer is not harmless — it INHERITS STDOUT, so when the driver runs
+# inside a `$( … )`/pipeline (which tests/ci-lane-parity does, and so do real callers) the leaked
+# `sleep 1800` keeps the pipe open after the driver exits and the caller blocks until the bound —
+# measured: a 10-minute `sleep 1800` holding the parity suite's pipe, with the driver long gone.
+# Holding the timer as `$shard_timer_pid` and killing it in the TERM trap makes the watchdog exit
+# clean no matter which of its processes the signal reaches.
+shard_watchdog() {
+  # ⛔ JOB CONTROL OFF INSIDE THE TIMER (#3187 review, measured 4/15 in isolation). `set -m` is a
+  # shell OPTION, so this subshell inherits it — and with job control on, `sleep … &` gets its OWN
+  # process group, which the parent's `kill -TERM -<watchdog pgid>` DOES NOT REACH. The timer then
+  # survives every teardown that signals the watchdog's group, and only the trap below could kill it —
+  # with a real race, because the trap can fire in the window between the fork and
+  # `shard_timer_pid=$!` (observed: 4 of 15 iterations orphaned a fresh `sleep 777`). With `set +m`
+  # the timer stays in THIS subshell's group, so the parent's group TERM always reaches it; the trap
+  # is then a second, non-load-bearing path. It records nothing, so disabling job control here cannot
+  # disturb the driver.
+  set +m
+  trap 'kill "${shard_timer_pid:-}" 2>/dev/null; kill -TERM -- -"${BASHPID:-$$}" 2>/dev/null; exit 0' TERM INT
+  sleep "$shard_bound" &
+  shard_timer_pid=$!
+  wait "$shard_timer_pid" 2>/dev/null || exit 0
+  # Gone already ⇒ this is NOT a timeout: say nothing and leave no mark. ⛔ `kill -0` alone is NOT
+  # enough: it SUCCEEDS for a zombie (a child that exited but has not been reaped yet), so a shard
+  # that finished at the last instant could be reported as killed. `ps -o stat=` reads `Z` for that
+  # state on macOS and Linux alike, and it costs one fork only on the timeout path (review finding,
+  # P2 — the window is sub-millisecond, which is exactly why rc alone is the wrong discriminator:
+  # consulting rc would turn a TERM-trapping shard's clean exit into a false PASS).
+  kill -0 "$shard_bg_pid" 2>/dev/null || exit 0
+  case "$(ps -o stat= -p "$shard_bg_pid" 2>/dev/null)" in
+    Z*|'') exit 0 ;;
+  esac
+  printf 'x' >"$shard_timeout_marker" 2>/dev/null
+  # The GROUP (`-$pid`), never the bare pid: a wrapper-only kill is the orphan factory this exists
+  # to close (#103's hang was inside a CHILD). The bare-pid form is the fallback for a shell whose
+  # job control did not give the shard its own group — reaching less beats a shard outliving every
+  # bound. TERM, then KILL after a second, so a suite that traps TERM cannot outlive the bound.
+  kill -TERM -"$shard_bg_pid" 2>/dev/null || kill -TERM "$shard_bg_pid" 2>/dev/null
+  sleep 1
+  kill -KILL -"$shard_bg_pid" 2>/dev/null || kill -KILL "$shard_bg_pid" 2>/dev/null
+}
+
+# shard_run_bounded <path> — run ONE shard under `SHARD_BOUND`, portable and bash-3.2 clean.
+#
+# ⛔ WHY NOT `timeout`: it is GNU and absent on macOS (`gtimeout` needs coreutils, and is absent too
+# on a bare runner). ⛔ WHY A PROCESS GROUP: `set -m` makes bash place each background job in its
+# OWN process group, whose PGID is the job's pid, so `kill -TERM -<pid>` reaches the wrapper AND its
+# descendants (see `shard_watchdog`).
+#
+# ⛔ A WATCHDOG, NOT A POLL LOOP. `while kill -0; do sleep 1; done` costs up to a second of dead time
+# per shard — measured on a 5-instant-shard fixture: 6.75 s bounded vs 0.94 s unbounded, i.e. ~1.16 s
+# per shard, ~2.9 min added to a 148-shard job whose DURATION is the reason slicing exists. Here the
+# parent blocks in `wait` and one `sleep <bound>` does the counting: two forks per shard, no
+# wall-clock. The watchdog gets its own process group too, and the parent kills that GROUP off after
+# a NORMAL completion — otherwise every fast shard would leave a `sleep 1800` behind.
+#
+# ⛔ WHY NOT `scripts/lib/bounded.sh` (`tb_timeout`) — the repo's other portable bound? Because the
+# two properties #3187 depends on are both absent there, and importing it would make the regression
+# invisible: (1) its INTERNAL watchdog (the macOS path, i.e. every laptop and every macOS runner)
+# kills the child PID only, so a suite that hung inside a CHILD — precisely what shard #103 did, with
+# 0.00 s CPU — leaves that child alive; (2) it is GNU-`timeout`-FIRST when a binary exists, and GNU
+# `timeout` signals the child's process GROUP, so the same bound would reach different processes on
+# Linux and on macOS: one runner, two contracts. Its contract also forbids setting shell options,
+# which `set -m` is. Folding group semantics into a helper the whole reaper family depends on is its
+# own change (filed as a follow-up); until then this file owns its bound, stated rather than hidden.
+#
+# Returns the shard's own rc when it finishes in time; 124 (the `timeout` convention) when the bound
+# was hit, decided from the MARKER the watchdog writes (never from a clock comparison, and never from
+# rc 124, which a suite is free to exit with itself). `shard_bound` 0 short-circuits to the plain
+# invocation, so disabling the bound is not a second code path — it is the ABSENCE of the watchdog,
+# which is what `SHARD_BOUND=0` promises.
+shard_run_bounded() {
+  if [ "$shard_bound" -lt 1 ]; then bash "$1" </dev/null; return $?; fi
+  : >"$shard_timeout_marker" 2>/dev/null || true
+  set -m                                  # job control ⇒ each background job LEADS its own group
+  bash "$1" </dev/null &
+  shard_bg_pid=$!
+  # ⛔ THE WATCHDOG'S OUTPUT GOES TO /dev/null, and that is load-bearing rather than tidy: the timer
+  # must never be able to hold the driver's stdout open. A caller that runs this driver inside
+  # `$( … )` or a pipeline waits for EOF on that pipe, so ANY surviving watchdog process would block
+  # it until the bound — measured: a leaked `sleep 1800` kept `tests/ci-lane-parity`'s substitution
+  # open with the driver long gone (see `shard_watchdog`). The watchdog has nothing to say (it only
+  # writes the marker FILE), so nothing is lost.
+  shard_watchdog >/dev/null 2>&1 &
+  shard_wd_pid=$!
+  set +m                                  # …and the driver is not left in job-control mode
+  # `wait` is what yields the rc AND reaps the child; whether the wait was CUT SHORT is the
+  # watchdog's verdict, and it travels in the marker file, not in a return code.
+  wait "$shard_bg_pid"
+  shard_bg_rc=$?
+  # ⛔ KEEP THE GROUP ID (#3187 review): the shard is reaped here, so `$shard_bg_pid` must not be
+  # reused after it is cleared — the timeout branch below still has to signal the shard's PROCESS
+  # GROUP when a child outlived the wrapper.
+  shard_bg_group="$shard_bg_pid"
+  # Tear the watchdog down by GROUP, so its `sleep <bound>` cannot outlive a shard that finished.
+  kill -TERM -"$shard_wd_pid" 2>/dev/null || kill -TERM "$shard_wd_pid" 2>/dev/null
+  wait "$shard_wd_pid" 2>/dev/null
+  # ⛔ AND A SECOND PASS ON THE GROUP, AFTER THE REAP (measured: 3 of 30 runs leaked a timer without
+  # it). The watchdog forks its timer as its first act, so a TERM that lands DURING that fork is
+  # delivered to the group just before the new child joins it — the child then never receives the
+  # signal, while its parent (which did) dies and leaves it orphaned. `kill -TERM -$pgid` returned 0
+  # in every one of those runs, so a status check cannot see this: only a pass that happens AFTER the
+  # fork can. The group stays addressable by the watchdog's pgid while ANY member lives, so this
+  # KILL collects the straggler deterministically and costs one syscall in the normal case.
+  kill -KILL -"$shard_wd_pid" 2>/dev/null
+  shard_bg_pid=""
+  shard_wd_pid=""
+  if [ -s "$shard_timeout_marker" ]; then
+    # ⛔ THE ESCALATION IS THE PARENT'S JOB TOO (review finding, P1). The group TERM above kills a
+    # default-disposition wrapper AT ONCE, so `wait` returns BEFORE the watchdog reaches its KILL —
+    # and tearing the watchdog down (above) would cut that KILL off, leaving a child that TRAPS TERM
+    # alive with no bound left to reach it. Measured by a reviewer on a fixture whose child ignored
+    # TERM: the child survived the bound permanently. So the group gets the same one-second grace
+    # here and is then KILLed by the parent, which makes the escalation independent of which process
+    # outlived the TERM. The watchdog keeps its own KILL for the other ordering — a WRAPPER that
+    # traps TERM, where `wait` has not returned yet (pinned by the suite's arm 2b; this branch is
+    # pinned by arm 2c).
+    sleep 1
+    if [ -n "$shard_bg_group" ]; then
+      kill -KILL -"$shard_bg_group" 2>/dev/null || kill -KILL "$shard_bg_group" 2>/dev/null
+    fi
+    [ "$shard_is_listed" = 1 ] && shard_timed_out "$1" "$shard_bound"
+    return 124
+  fi
+  return $shard_bg_rc
+}
 
 slice_skips() {
   slice_pos=$shard_listed
@@ -561,7 +799,7 @@ shard_note() {
 # parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
 # of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
 # a PR-unique failure and still blocks.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" </dev/null || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; shard_run_bounded "$1" || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -693,6 +931,10 @@ for pattern in "${SWEEP_GLOBS[@]}"; do
 done
 
 echo "── hermetic suites ────────────────────────────────────────────────"
+# ⛔ THE BOUND IS ANNOUNCED BEFORE THE FIRST SHARD RUNS (#3187), so a run that is later truncated is
+# self-describing: the reader can tell WHICH bound the run was operating under — the step's, the
+# job's, or this one — and that a hung shard costs one shard instead of the rest of the list.
+echo "   ⏱  per-shard bound: ${shard_bound_desc}"
 # Every suite the list below runs is hermetic (temp repos / temp HOME / stubbed tools, no network).
 #
 # ⛔ THERE IS NO PER-SUITE ROW IN THIS SECTION, AND THAT IS THE COMMITMENT (#2838). `1d56cc10`
@@ -928,6 +1170,19 @@ if [ "$shard_errors" -gt 0 ]; then
   # `could NOT be named` rather than blame a subsystem it never looked at.
   if [ -n "$shard_failed_list" ]; then
     echo "❌ failing shard(s): $shard_failed_list"
+    # ⛔ THE CASUALTY NAMES ITSELF WITH THE MARKER (#3187). A bound hit is a FAILURE (it reds the
+    # run and enters `shard_failed_list` above like any other), but "this shard failed" and "this
+    # shard was STILL RUNNING at the bound" are different diagnoses with different fixes: one is a
+    # bug in the suite, the other is a HANG. This line carries the marker and the bound that
+    # applied, so the recap answers "which shard, and was it killed or did it fail?" — and it is
+    # deliberately NOT part of the identity list above, which `scripts/ci_exemption.py` splits into
+    # `bash-shard::<path>` keys (a marker inside a name would be a phantom identity).
+    if [ -n "$shard_timeout_list" ]; then
+      echo "⏱  TIMEOUT after ${shard_bound}s (SHARD_BOUND): $shard_timeout_list — killed (whole process group), counted as failed, and the run CONTINUED to the remaining shards"
+    fi
+    # ⛔ EVERY recap REPORTS THE BOUND THAT APPLIED (a red without a bound is a red whose truncation
+    # the reader has to guess at), not only the recaps where it fired.
+    echo "   ⏱  per-shard bound applied: ${shard_bound_desc}"
     # ⛔ A PARTIAL RECAP IS A FALSE PASS (review cycle 2, P2). The list can name SOME of the counted
     # failures, and "2 failed" beside one name reads as a COMPLETE recap to the rail, which then
     # compares a 1-identity certificate and admits the un-named half — the incomplete-set direction
@@ -960,10 +1215,10 @@ if [ "$shard_errors" -gt 0 ]; then
 fi
 if [ "$slice_count" -gt 0 ]; then
   echo "✅ all $shard_ran bash shards passed (slice $((slice_index + 1))/$slice_count of $listed; $swept file(s) syntax-checked)"
-  echo "   ⏱  this slice: ${shard_time}s of shard work over $shard_ran shard(s); slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}"
+  echo "   ⏱  this slice: ${shard_time}s of shard work over $shard_ran shard(s); slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 else
   echo "✅ all $shard_ran bash shards passed ($swept file(s) syntax-checked)"
-  echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}"
+  echo "   ⏱  ${shard_time}s of shard work; slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}; per-shard bound ${shard_bound_desc}"
 fi
 
 
