@@ -125,8 +125,12 @@ is_harness_unit() {
 #   path=/abs/script ; argv[]=/abs/script [args]                (direct script -> the path= value)
 # A direct BINARY ExecStart (argv[]=/usr/bin/foo --flag) has no pinned script and is not judged.
 execstart_path() {
-  local v="$("$SYSTEMCTL_BIN" show "$1" -p ExecStart --value 2>/dev/null)"
-  local p=""
+  # ⛔ SPLIT DECLARATION, DELIBERATELY: `local v="$(…)"` DISCARDS the substitution's exit status, so a
+  # FAILED `systemctl show` and an EMPTY ExecStart are indistinguishable — and every caller reads an
+  # empty result as "no pinned script, not judgeable", i.e. a failed read silently EXONERATES every
+  # unit on the box while the report still reads clean. Capture, check, then decide.
+  local v p=""
+  v="$("$SYSTEMCTL_BIN" show "$1" -p ExecStart --value 2>/dev/null)" || return 2
   # Bash-wrapped: the token following `argv[]=/bin/bash` (or /bin/sh) is the script.
   p="$(printf '%s' "$v" | awk '
     { for (i=1; i<=NF; i++) {
@@ -150,7 +154,12 @@ report_units() {
     name="$(printf '%s' "$line" | awk '{print $1}')"
     [ -n "$name" ] || continue
     is_harness_unit "$name" || continue
-    path="$(execstart_path "$name")"
+    if ! path="$(execstart_path "$name")"; then
+      # rc 2 = the read FAILED. Reporting it as "not judgeable" would turn a broken instrument into a
+      # clean report; it is named instead, and the unit is still not called an orphan (we did not read it).
+      printf 'unreadable:kind=unit name=%s reason=execstart-unreadable\n' "$name"
+      continue
+    fi
     [ -n "$path" ] || continue   # no pinned script path: not judgeable, not an orphan here
     if [ ! -e "$path" ]; then
       printf 'orphan:kind=unit name=%s path=%s prs=- reason=missing\n' "$name" "$path"
