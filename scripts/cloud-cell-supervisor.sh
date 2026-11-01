@@ -747,9 +747,20 @@ _scan_controller_paths() { # stdin "<pid> <command>"; stdout "<pid> <script-path
 _proc_root() { printf '%s' "${PROC_ROOT:-/proc}"; }
 
 _controller_env_state_dir() { # <pid>; the O= the process was EXEC'd with; rc 1 when unreadable
-  local pr; pr="$(_proc_root)"
+  local pr out; pr="$(_proc_root)"
   [ -r "$pr/$1/environ" ] || return 1
-  tr '\0' '\n' < "$pr/$1/environ" 2>/dev/null | sed -n 's/^O=//p' | head -1
+  # ⛔ NO `| head -1` HERE (review MEDIUM, #2315). `head` exits early BY DESIGN, so on an `environ`
+  # large enough to outlive a 64 KiB pipe buffer the producer takes SIGPIPE and — under
+  # `set -o pipefail` (:132) — this function returns NON-ZERO having printed the right value. Every
+  # caller reads non-zero as "not this state dir's" (`_pid_is_foreign_root_leak` returns 1 = not a
+  # leak), so a REAL leak would be classified not-a-leak and never reaped. That is the idiom this
+  # file condemns at :1796/:3184/:4329, one layer in, and it fails OPEN in the direction of the 12 h
+  # dead cell #2315 exists to end. Read the (bounded) stream whole and take the first line HERE,
+  # where no producer can be left writing into a closed pipe.
+  out="$(tr '\0' '\n' < "$pr/$1/environ" 2>/dev/null | sed -n 's/^O=//p')" || return 1
+  out="${out%%$'\n'*}"
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out"
 }
 
 _pid_is_foreign_root_leak() { # <pid> <script-path> <state-dir> <harness-or-empty>
@@ -930,8 +941,13 @@ _session_pane_state_dir() { # <session>
   local cmd o
   cmd="$(tmux list-panes -t "=${1:-}" -F '#{pane_start_command}' 2>/dev/null)" || return 1
   [ -n "$cmd" ] || return 1
+  # ⛔ SAME `| head -1` REMOVAL AS `_controller_env_state_dir` — one idiom, one rule (#2315 review
+  # MEDIUM). This producer is a short rendered command line, so the SIGPIPE it invites is not
+  # reachable here, but a reader who copies the shape elsewhere inherits the fail-OPEN: non-zero from
+  # this function means "cannot prove this state dir's", which is how a leftover is left un-cleared.
   o="$(printf '%s\n' "$cmd" \
-        | sed -n "s/.*[[:space:]\"']O='\([^']*\)'.*/\1/p;s/^O='\([^']*\)'.*/\1/p" | head -1)"
+        | sed -n "s/.*[[:space:]\"']O='\([^']*\)'.*/\1/p;s/^O='\([^']*\)'.*/\1/p")" || return 1
+  o="${o%%$'\n'*}"
   [ -n "$o" ] || return 1
   case "$o" in /*) ;; *) return 1 ;; esac
   printf '%s\n' "$o"
@@ -2950,11 +2966,18 @@ cmd_start() {
   # ⛔ ALSO AFTER #2235'S GH_REPO REFUSAL, the same rule one refusal later: a start that refuses must
   # not have cleared the OFF switch on its way to refusing.
   # ⛔ REAP HERE, NOT ONLY IN SERVICE MODE (review P1-4, #2315). `foreground_handover` runs only when
-  # ORCH_FOREGROUND=1, so an operator's own `start` on a wedged cell missed it entirely and went on to
-  # report `already running (tmux session 'orch', …)` and return 0 — the measured 12-hour false green.
-  # Placed beside `scheduler_ensure`, BEFORE the `has-session` early return, so every verb that can act
-  # as the recovery path inherits it. Scoped to OUR state dir (env O=) plus the sanctioned-root
+  # ORCH_FOREGROUND=1, so an operator's own `start` on a wedged cell missed the reap entirely. Placed
+  # beside `scheduler_ensure`, BEFORE the `has-session` early return, so every verb that can act as
+  # the recovery path inherits it. Scoped to OUR state dir (env O=) plus the sanctioned-root
   # exclusion, so a peer lane's controller is still never a candidate (#1761).
+  # ⛔ AND IT IS ONLY HALF THE RECOVERY — do not read this line as "start heals the wedge". The reap
+  # removes a leaked CONTROLLER; it cannot clear a leftover SESSION (the issue's leftover #2), because
+  # a leaked controller runs neither $O/orch-loop.sh nor the harness path and so was never in `seen0`
+  # to begin with. The session half is `stop`'s (the pane-shape proof below in cmd_stop) and the
+  # service-mode handover's. `start` REFUSES loudly over such a session rather than reporting
+  # "already running" — see the `[ -z "$seen0" ]` branch, which is where the measured 12 h false
+  # green came from (review P1, #2315: the comment that used to sit here claimed a fix the code did
+  # not deliver).
   reap_own_foreign_root_leaks "$O" || true
 
   scheduler_ensure
@@ -3002,14 +3025,32 @@ cmd_start() {
       return 0
       fi
     fi
-    # Nothing of ours holds it. Either this repo's loop has not written its lock yet (the seconds
-    # `start` spends in check/seed — report it, do not refuse), or the session belongs to ANOTHER
-    # repo sharing this cell's harness path (then it is not evidence about $OR at all).
+    # Nothing of ours holds it. Three cases, and they are NOT the same answer (#2315 review P1):
+    #   * the session's own pane command names ANOTHER state dir, or cannot be read      -> report it
+    #     (a shared session name is not evidence about $OR, and refusing here would block a start on
+    #     a box where a peer repo's session merely exists);
+    #   * the pane command names $O and nothing of ours runs  -> THIS state dir's LEFTOVER, refused
+    #     loudly below (it is not "already running");
+    #   * service mode -> the handover replaces the answer entirely.
     if [ -z "$seen0" ]; then
       # Same rule as above: in service mode the handover replaces the answer, because a session with no
       # controller of ours is an ORPHAN the handover waits out (short bound) and then falls through to.
       if [ "${ORCH_FOREGROUND:-0}" = 1 ]; then
         foreground_handover || return 1
+      elif session_names_own_state_dir "$SESSION"; then
+        # ⛔ THE FALSE GREEN THIS BRANCH USED TO BE (review P1, #2315). A session whose OWN pane
+        # command names $O, holding neither a lock owner nor a controller pid, is THIS STATE DIR'S
+        # LEFTOVER — it was `start`'s answer to print `already running (…, no controller pid observed
+        # yet)` and exit 0, over a cell that dispatches nothing: the measured 12 h where `is-active`
+        # said active and heartbeat was 733m stale. rc 0 is the whole defect: nothing downstream can
+        # tell that answer from a healthy cell.
+        # ⛔ AND IT MUST NOT KILL THE SESSION HERE. A concurrent `start` is indistinguishable from this
+        # leftover for the seconds between `new-session` and the controller's `acq()` (the same window
+        # the old comment called "the seconds `start` spends in check/seed"), and shooting that is the
+        # in-flight-landing-work death the handover's ownership guard exists to prevent. `stop` is the
+        # verb that may act — it clears the leftover on exactly this proof, and it is reachable in one
+        # command — so `start` refuses, names the leftover, and names that remedy.
+        die "session '$SESSION' holds no controller, but its own pane command names this state dir ($O) — this is THIS STATE DIR'S LEFTOVER (#2315), NOT a running cell, so 'already running' would be the 12 h false green; recover with: $0 stop (it clears the leftover and releases the lock), then start again"
       else
       log_line "already running (tmux session '$SESSION', no controller pid observed yet) — use: status | logs | stop"
       start_doctor_loop; local drc=$?
@@ -3469,11 +3510,15 @@ unit_stop_effect_verdict() { # <unit>
   return 1
 }
 cmd_stop() {
-  local rc=0 lpid lident rpid rident i
+  local rc=0 lpid lident rpid rident i reap_rc=0
   # ⛔ #2315 NAMES `stop` EXPLICITLY ("neither start nor stop can clear"). A leaked controller from
   # another harness root is invisible to the ownership reads below (foreign path, no lock), so `stop`
   # walked past it and the refusal further down blamed the session. Reap first, same peer-safe scope.
-  reap_own_foreign_root_leaks "$O" || true
+  # ⛔ THE RC IS KEPT, NOT DISCARDED (review P1, #2315). `|| true` here made a reap that could NOT
+  # prove the cell clear indistinguishable from one that could — and the leftover path below turns
+  # that unproven state into a released lock. 1 = a candidate SURVIVED TERM and KILL; 2 = cannot
+  # determine (`/proc` absent — macOS — or the table unreadable). Both are read at the lock release.
+  reap_own_foreign_root_leaks "$O" || reap_rc=$?
   # FIRST: drop the desired-state marker, THEN bump the generation. Both orders matter:
   #  * `.desired` gone before anything else means a pass that starts in the window below sees a
   #    "not started" cell (the doctor supervises nothing and launches no restart), and a pass already
@@ -3663,6 +3708,24 @@ cmd_stop() {
       tmux kill-session -t "=$SESSION" || die "tmux kill-session failed for '$SESSION' — the leftover session may still be running"
       tmux has-session -t "=$SESSION" 2>/dev/null && die "session '$SESSION' still exists after kill-session — refusing to report a cleared leftover"
       log_line "cleared this state dir's leftover session '$SESSION'"
+      # ⛔ THE CLEAR IS PROVABLE; THE SWEEP MAY NOT BE — AND THE LOCK RELEASE RESTS ON THE SWEEP
+      # (review P1, #2315). This path reaches `rm -f "$LOCK"` below with `own` EMPTY, which no
+      # pre-change path could do: the only thing that is supposed to establish "no controller of this
+      # state dir is left" is the reap at the top, and it is invisible to both ownership reads by
+      # construction (the #2095 leak runs a foreign path and holds no lock). So the reap's verdict is
+      # the evidence for the release: rc 1 (a candidate SURVIVED TERM/KILL — e.g. another uid) or rc 2
+      # (cannot determine) means a controller this state dir cannot see may STILL be serving its
+      # queue. Clearing the session is proven by its own pane command, so it happens; releasing $LOCK
+      # is NOT proven, so it must not — a `start` that then `acq()`s the free lock puts a SECOND
+      # dispatcher on the same queue, which is the #1761 duplicate this verb exists to prevent.
+      # ⛔ rc 2 IS NOT A CORNER CASE: macOS has no /proc, so it is the EVERY-VISIT answer there.
+      # The lock is left naming a DEAD pid, which `acq()` clears itself (:3612-3620), so `stop; start`
+      # still recovers the cell — what the operator loses is a false "provably clear" report, and
+      # that is the trade this verb is named for.
+      if [ "$reap_rc" -ne 0 ]; then
+        log_line "leaked controller(s) for $O could NOT be proven gone (reap rc $reap_rc) — the leftover session is cleared, but $LOCK is NOT released and this is NOT reported as a clean stop: a controller this state dir cannot see may still be serving its queue"
+        return 1
+      fi
       # ⛔ AND THEN THE SHARED TAIL, NOT AN EARLY RETURN. The tail is what re-reads ownership, proves
       # nothing of ours is alive, verifies the unit's effect and RELEASES $LOCK — a killed controller
       # leaves a lock on disk naming a dead pid, and skipping that release would leave the next `start`

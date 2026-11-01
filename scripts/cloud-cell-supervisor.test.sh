@@ -4798,11 +4798,19 @@ render_leftover_pane() { # <state-dir>; the DEPLOYED order, O= first
   printf '%s\n' "set -a; [ ! -f '$C2/home/keys.env' ] || . '$C2/home/keys.env'; set +a; unset GH_REPO; PATH='$1/gh-limit':\"\$PATH\" HOME='$C2/home' CELL_HOME='$C2/home' REPO='daniel-ospina/agent-infra' O='$1' OR='daniel-ospina/agent-infra' SCOPE='auto' HARNESS_REPO='premise-labs/agent-infra' HARNESS_REF='main' bash '$1/orch-loop.sh' 2>&1 | tee -a '$1/logs/controller.log'" > "$C2/pane.txt"
 }
 run_stop() { # <state-dir>; runs the SHIPPED stop, returns its rc in S_RC, output in S_OUT
-  S_RC=0; S_OUT="$(PATH="$C2/bin:$PATH" CELL_HOME="$C2/home" ENV_FILE="$C2/home/keys.env" \
+  # ⛔ `S_PROC` LETS A LEG SAY WHAT THE REAP CAN SEE (#2315 review P1). Without it the reap's verdict
+  # depended on the HOST — `/proc` exists on a Linux cell and is absent on a Mac — so the same leg
+  # asserted "lock released" on one platform and, after the reap's rc was made load-bearing, would
+  # assert the opposite on the other. A leg that grades a platform is not a pin.
+  S_RC=0; S_OUT="$(PATH="$C2/bin:$PATH" PROC_ROOT="${S_PROC:-}" CELL_HOME="$C2/home" ENV_FILE="$C2/home/keys.env" \
     SESSION=orch O="$1" REPO="$C2/home" OR=daniel-ospina/agent-infra SCOPE=own \
     HARNESS="$C2/harness" bash "$SUP" stop 2>&1)" || S_RC=$?
 }
 : > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/o"
+# A proc root the reap CAN read, holding no candidate: this is a cell whose sweep is provable, so the
+# leftover path is allowed to release the lock (the assertion this leg has always made).
+mkdir -p "$C2/proc-clean"
+S_PROC="$C2/proc-clean"
 # The killed controller left a lock naming a DEAD pid (a kill/OOM/reboot does). The leftover path must
 # reach `stop`'s shared tail, which is what releases it — an early return there would leave the next
 # `start` to `acq()` a lock whose recycled pid makes it exit 0 silently, dispatching nothing.
@@ -4871,6 +4879,85 @@ case "$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE)" in
   SESSION-GONE) ok "…and the leftover session is actually GONE after the handover" ;;
   *) bad "the handover reported a clear but the session is still there" ;;
 esac
+
+# (11b) ⛔ THE CLEAR IS PROVABLE, THE SWEEP MAY NOT BE — AND THE LOCK RELEASE RESTS ON THE SWEEP
+#       (#2315 review P1). `reap_own_foreign_root_leaks` returns 1 (a candidate SURVIVED TERM/KILL) or
+#       2 (cannot determine: `/proc` absent — which is EVERY macOS visit — or the table unreadable), and
+#       the only thing that is supposed to prove "no controller of this state dir is left" is that reap,
+#       because the leak this change is about is invisible to both ownership reads by construction. A
+#       lock released on an unproven sweep lets the next `start` `acq()` it and put a SECOND dispatcher
+#       on the same queue (#1761), so the verb must fail and leave the lock. The lock is left naming a
+#       DEAD pid, which `acq()` clears itself, so `stop; start` still recovers the cell.
+: > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/o"
+printf '999999\n' > "$C2/o/.orch.lock"
+S_PROC="$C2/proc-absent"   # does not exist -> the reap cannot determine, on Linux AND on macOS
+run_stop "$C2/o"
+case "$S_RC:$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE)" in
+  0:*) bad "stop reported a CLEAN stop (rc=0) after a reap that could not prove the cell clear — the lock was released over a controller it cannot see (#2315 review P1)" ;;
+  *:SESSION-LEFT) bad "the leftover session survived a stop whose sweep was unprovable — the clear is independently provable and must still happen" ;;
+  *) ok "stop FAILS (rc=$S_RC) when the reap cannot prove the cell clear, while still clearing the provable leftover session" ;;
+esac
+case "$([ -f "$C2/o/.orch.lock" ] && echo LOCK-LEFT || echo LOCK-GONE)" in
+  LOCK-LEFT) ok "…and it does NOT release .orch.lock on an unproven sweep — a lock removed while a controller may still serve this queue is #1761's duplicate" ;;
+  *) bad "the lock was RELEASED after a reap that could not prove the cell clear — the next start would acq() it beside a live leftover (#2315 review P1)" ;;
+esac
+case "$S_OUT" in
+  *"could NOT be proven gone"*) ok "…and it SAYS which proof it lacked, instead of reporting a clean sweep it never reached" ;;
+  *) bad "the refusal does not name the unproven sweep: [$S_OUT]" ;;
+esac
+
+# (14b) ⛔ AND THE OPERATOR PATH MUST NOT CALL A LEFTOVER "ALREADY RUNNING" (#2315 review P1). This is
+#       the measured 12 h false green: the cell dispatched nothing, `start` printed
+#       "already running (tmux session 'orch', no controller pid observed yet)" and exited 0. The reap
+#       above cannot reach it (a leaked controller runs neither $O/orch-loop.sh nor the harness path,
+#       so it was never in `seen0`). `start` must refuse — loudly, naming the leftover and the one
+#       verb that clears it — and it must NOT kill the session: a concurrent `start` is
+#       indistinguishable for the seconds before its controller `acq()`s, and shooting that is the
+#       in-flight-landing-work death the handover's ownership guard exists to prevent.
+: > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/o"
+rm -f "$C2/o/.orch.lock"
+N_OUT="$(PATH="$C2/bin:$PATH" PROC_ROOT="$C2/proc-clean" CELL_HOME="$C2/home" ENV_FILE="$C2/home/keys.env" \
+  SESSION=orch O="$C2/o" REPO="$C2/home" OR=daniel-ospina/agent-infra SCOPE=own \
+  HARNESS="$C2/harness" CONTROLLER_ORPHAN_TIMEOUT=5 \
+  run_bounded 60 bash "$SUP" start 2>&1)"; N_RC=$?
+[ "$N_RC" -ne 0 ] \
+  && ok "start is NON-ZERO (rc=$N_RC) over this state dir's own leftover session — no more rc 0 over a cell that dispatches nothing" \
+  || bad "start returned 0 over a provable leftover session — the 12 h false green is back (#2315 review P1)"
+case "$N_OUT" in
+  *"LEFTOVER"*"stop"*) ok "…and it NAMES the leftover and the verb that clears it, rather than reporting 'already running'" ;;
+  *"already running"*) bad "start still answers 'already running' over a leftover it can prove is not one" ;;
+  *) bad "the refusal neither names the leftover nor the remedy: [$(printf '%s' "$N_OUT" | tr '\n' ' ' | cut -c1-400)]" ;;
+esac
+case "$([ -f "$C2/session" ] && echo SESSION-LEFT || echo SESSION-GONE):$(cat "$C2/killed" 2>/dev/null)" in
+  SESSION-LEFT:) ok "…and start did NOT kill the session — a concurrent start's session must never be shot (#2315 review P1)" ;;
+  SESSION-GONE:*) bad "start killed the session ($(cat "$C2/killed" 2>/dev/null | tr '\n' ' ')) — a racing start is indistinguishable here and its landing work would die" ;;
+  *) bad "start signalled something while refusing the leftover: [$(cat "$C2/killed" 2>/dev/null | tr '\n' ' ')]" ;;
+esac
+
+# (15) ⛔ THE ENVIRON READ MUST NOT FAIL OPEN ON A LARGE environ (#2315 review MEDIUM). `head -1` exits
+#      early by design, so on an `environ` big enough to outlive a 64 KiB pipe buffer the producer takes
+#      SIGPIPE and — under `set -o pipefail` — `_controller_env_state_dir` returns NON-ZERO having
+#      printed the right value. `_pid_is_foreign_root_leak` reads non-zero as "not this state dir's",
+#      so a REAL leak would be classified not-a-leak and never reaped — a fail-OPEN in the direction of
+#      the 12 h dead cell. `/proc/<pid>/environ` is exactly a file that can carry a large environment,
+#      and the O= term is the one that makes the reap scope-safe, so this is the load-bearing half.
+BIG="$C/proc-big"; mkdir -p "$BIG/4242" "$C/bin3"
+{ printf 'O=%s\0' "$O"; printf 'PAD=%s\0' "$(printf '%*s' 200000 '')"; } > "$BIG/4242/environ"
+cat > "$C/bin3/ps" <<SH
+#!/bin/bash
+case "\$*" in
+  *"-eo pid=,command="*) echo "4242 bash /tmp/harness-refresh.zz/s2/pinroot/abc/orch-loop.sh"; exit 0 ;;
+  *"-p 4242"*) echo "4242 bash /tmp/harness-refresh.zz/s2/pinroot/abc/orch-loop.sh"; exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$C/bin3/ps"
+out="$(PATH="$C/bin3:$PATH" PROC_ROOT="$BIG" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; cell_own_foreign_root_pids "$O" "$HARNESS"')"
+case "$out" in
+  4242) ok "a >64 KiB environ still yields the O= this state dir owns — the foreign-root leak is SELECTED, so the read cannot fail open on a big environment (review MEDIUM)" ;;
+  *) bad "the O= read failed on a large environ (got [$out]) — a real leaked controller would be classified not-a-leak and never reaped: the SIGPIPE/pipefail fail-open (#2315 review MEDIUM)" ;;
+esac
+
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
