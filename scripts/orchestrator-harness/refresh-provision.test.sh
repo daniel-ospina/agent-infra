@@ -711,9 +711,9 @@ ck "(h2) …and that control DOES print the refusal (h2) must not see" "$r"
 OR="$AMBIENT_OR_SAVE"
 
 # ── (h3) THE RECORDED CAUSE NAMES THE ORIGIN SHAPE IT READ, NOT A PREDICTED ONE ──────────────────────
-# `resolve_repo` refuses a REPO-set pair for THREE different measured reasons (an unreadable origin, a URL
-# naming ANOTHER repo, a local path that cannot prove a DECLARED target). The carried cause asserted the
-# local-path wording for all three — a refusal that predicts a mechanism it never measured, the #2229
+# `resolve_repo` refuses a REPO-set pair for FOUR different measured reasons (an unreadable origin, a
+# `file://` mirror that names no repo identity, a URL naming ANOTHER repo, a local path that cannot prove
+# a DECLARED target). The carried cause asserted the local-path wording for all four — a refusal that predicts a mechanism it never measured, the #2229
 # class this exit is being fixed to remove (review cycle 2, P2). These arms pin each arm's own words.
 # ⛔ THE FAILURE THEY PREVENT IS NOT COSMETIC: `refresh_cause_brief` quotes `why=` into the controller's
 # `[dispatch] BLOCKED` line, so a wrong mechanism sends the operator to a remedy that cannot work.

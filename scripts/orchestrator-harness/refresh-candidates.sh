@@ -1861,9 +1861,9 @@ if ! resolve_repo; then
   # ⛔ THE CAUSE NAMES ONLY WHAT WAS MEASURED (review cycles 1-2, P2). It rendered an unset `$REPO` as
   # `$REPO ('')` beside "a local-path origin cannot prove a DECLARED target" — three claims about an
   # origin that was never read, in the one string `refresh_cause_brief` quotes. `resolve_repo` has
-  # THREE distinct REPO-set refusals (unreadable origin, a URL naming another repo, a local path that
-  # cannot prove a DECLARED target) plus the unset-`$REPO` search, so this names the shape it actually
-  # read instead of guessing one. Pointing at "the lines above" is NOT an option here: that is the
+  # FOUR distinct REPO-set refusals (unreadable origin, a `file://` mirror that names no repo identity,
+  # a URL naming another repo, a local path that cannot prove a DECLARED target) plus the unset-`$REPO`
+  # search, so this names the shape it actually read instead of guessing one. Pointing at "the lines above" is NOT an option here: that is the
   # `the failing step recorded no cause` sentence this exit is being fixed to stop writing.
   if [ -n "$REPO" ]; then
     _origin="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
