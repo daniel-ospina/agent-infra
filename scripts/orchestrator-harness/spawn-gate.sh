@@ -2253,11 +2253,27 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     # operator asked for, on the one path where no helper exists to honour the contract (#2888 review,
     # P2). A disabled axis arms no kill: the watchdog below only has to exist so the group reap after
     # `wait` has something to end.
+    # ⛔ AND THE DEGRADED FALLBACK KEEPS #2033's FIX, BECAUSE THE ORPHAN IS WHAT BREAKS THE REAP RATHER
+    # THAN THE WATCHDOG (measured 2026-10-18). A plain `( sleep "$_lb_wall"; kill … ) &` does NOT take
+    # its `sleep` down when the subshell is killed, so every lane leaves an ORPHANED `sleep` reparented
+    # to launchd with its CWD still the lane's worktree. `wt-lifecycle.sh`'s cwd witness then answers
+    # "yes, a live process holds this checkout" every single time and the empty-worktree reap can never
+    # fire — the inert-enforcer shape #2033 exists to remove. So both sleeps are backgrounded and kept
+    # in `s` (the TERM trap takes them down) and `wait` makes the teardown observable rather than racy.
+    # Keep this in step with lane-bound.sh's own teardown. The bound it sleeps is `_lb_wall` — the
+    # resolved one that runs and is reported — never the caller's raw `$t` (#2888).
     if [ "$_lb_wall" -ge 1 ]; then
-      ( sleep "$_lb_wall"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+      ( trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
+        sleep "$_lb_wall" & s=$!; wait "$s" 2>/dev/null
+        kill -TERM "$pid" 2>/dev/null
+        sleep 15 & s=$!; wait "$s" 2>/dev/null
+        kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
     else
       echo "[lane-bound] WARN $label: the backstop resolved to 0 (the wall axis is OFF) AND lane-bound.sh is missing — this lane is UNBOUNDED: nothing here will end it (#2888)" >> "$log"
-      ( while :; do sleep 3600; done ) >/dev/null 2>&1 &
+      # The keepalive is orphan-safe on the same rule as the arm above: the long `sleep` is backgrounded
+      # and TERM-trapped, so a reaped lane cannot leave a `sleep 3600` holding the worktree open (#2033).
+      ( trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
+        while :; do sleep 3600 & s=$!; wait "$s" 2>/dev/null; done ) >/dev/null 2>&1 &
     fi
   fi
   w=$!
