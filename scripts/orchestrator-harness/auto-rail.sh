@@ -11,6 +11,14 @@
 #   * one lock: two copies of this script would double-rail
 set -u
 MAX=${MAX:-2}
+case "${MAX}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: MAX='${MAX}' is not a positive integer — this actuator would not know its own bound" >> /tmp/auto-rail.log; exit 3;; esac
+# The repos this actuator drives. `rails_for_repo` takes the FULL slug for the repo being asked about
+# plus this same list for the population, and derives every short name itself — one call shape, so the
+# two cannot drift apart (the bug that made `unattributed` read 1 for a rail that WAS attributed).
+REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
+_n_repos=0
+for _r in $REPOS; do _n_repos=$(( _n_repos + 1 )); done
 # ── ⛔ THE MERGE-SLOT ACCOUNTING IS PER REPO (2026-11-01). IT WAS GLOBAL, AND THAT STARVED A QUEUE. ──
 # `rails_live` used to be ONE count across every repo this actuator drives, and it gated EVERY repo's
 # candidates. So rails working on repo A consumed repo B's merge capacity. Measured on this box: a
@@ -42,6 +50,9 @@ MAX=${MAX:-2}
 # rails. That population is reachable (the log holds rails_live=15 and =16 today), so max_total is a
 # bound on how much THIS actuator will pile into the shared REST budget, not a promise that the symptom
 # can never recur at a larger population. It is printed on every pass for exactly that reason.
+MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
+case "${MAX_TOTAL}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
 MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
 # The repos this actuator drives. `rails_for_repo` takes the FULL slug for the repo being asked about
 # plus this same list for the population, and derives every short name itself — one call shape, so the
@@ -139,7 +150,10 @@ import sys
 me = sys.argv[1].split("/")[-1]
 known = [r.split("/")[-1] for r in sys.argv[2:]]
 own = total = unk = 0
-for line in sys.stdin:
+for raw in sys.stdin.buffer:
+    # a single non-UTF-8 byte in any argv would otherwise kill this whole read (UnicodeDecodeError),
+    # the function would print nothing, and the caller would see an unreadable population.
+    line = raw.decode("utf-8", "replace")
     if "admin-merge.sh " not in line or "[a]dmin-merge.sh" in line:
         continue
     total += 1
@@ -165,6 +179,12 @@ print(own, total, unk)
 rails_should_defer() {  # $1 = this repo (owner/name), $2.. = every repo driven
   local own total unk
   read -r own total unk <<< "$(rails_for_repo "$@")"
+  # ⛔ AN UNPARSEABLE COUNTER IS NOT A FREE SLOT. `read` succeeds on empty output, and then `[ "" -ge n ]`
+  # errors — and an errored `[` reads as FALSE, i.e. LAUNCH. So say it and defer: a population I cannot
+  # read is load I cannot rule out, which is the same fail-closed rule as the unknown bucket.
+  case "${own}${total}${unk}" in
+    ''|*[!0-9]*) say "COUNTER-FAILED: rails_for_repo produced no counts — deferring $1 (fail-closed)"; return 0;;
+  esac
   [ $(( own + unk )) -ge "$MAX" ] || [ "$total" -ge "$MAX_TOTAL" ]
 }
 # ⛔ A NON-NUMERIC BOUND MUST NOT DISARM THE CEILING. `${VAR:-default}` substitutes only on empty or
