@@ -55,6 +55,76 @@
 #                    surface. The cap only ever LOWERS — a value above the floor in
 #                    force has no effect (so 14 does not mean "keep longer"), and a
 #                    merged/patch-equivalent scratch row keeps the merged floor.
+#
+# LANE RESIDUE (agent-infra#2033) — THE CLASS THIS REAPER USED TO KEEP FOR EVER
+# ---------------------------------------------------------------------------
+# A failed or aborted LANE leaves a worktree and/or a branch behind, and the
+# collision pre-flight infers "in flight" from exactly those two surfaces — so
+# the residue makes a FREE issue permanently undispatchable, on every box:
+#
+#   #8090 -> VERDICT: COLLISION
+#     [local branches]  refs/heads/feat/8090-tm — matched issue-number (8090) — 0 commit(s) ahead
+#     [local worktrees] …/.worktrees/tm-8090 [refs/heads/feat/8090-tm] (age=2.4h)
+#
+# ZERO commits ahead — the branch holds no work at all. Three shapes were
+# MEASURED on 2026-10-18, and before this change EVERY one of them was PRESERVEd
+# for ever by the gates above (which were right about the datum and wrong about
+# the meaning — that is why they are not weakened, they are joined by evidence):
+#
+#   ghost            clean, 0 commits ahead, branch `feat/<N>-tm`. Reclaimable
+#                    already under the merged floor — but the reaper "never
+#                    deletes branch refs", so it removed the checkout and LEFT
+#                    THE BRANCH, which is the surface the pre-flight reads. The
+#                    block survived the reap. That is the defect (#2033).
+#   interrupted-add  `git worktree add` killed mid-checkout: the record is
+#                    LOCKED with the reason `initializing` (git removes that
+#                    lock when the checkout completes), the directory is a
+#                    PARTIAL materialisation, and every not-yet-written file
+#                    reads as `D` in `git status`. So it classified `dirty`
+#                    (or `worktree-locked` once the lock was noticed) and was
+#                    preserved for ever — while `dispatch-merge.sh`'s old
+#                    directory probe saw a registered record and spawned the
+#                    lane INTO it. The lock's `initializing` reason is positive
+#                    evidence that no work can exist there: the add never
+#                    returned.
+#   abandoned-wip    0 commits ahead and a DIRTY tree — the lane never
+#                    committed. 24 of these were measured in one repo. Reaping
+#                    one means destroying the only copy of uncommitted work, so
+#                    it is NOT part of the ordinary pass: it needs the verified
+#                    backup below AND an explicit `--reap-abandoned-wip`.
+#
+# The lane-residue classes are recognised by the branch name the harness itself
+# creates (`REAP_WT_LANE_BRANCH_RE`, default `^refs/heads/feat/[0-9]+-tm$`).
+# That narrowness is deliberate: a general "0 commits ahead" rule would collide
+# with `cleanup-stale-branches.sh --scope local`, which owns branch-only
+# cleanup and classifies it from GitHub PR state — a signal this script does
+# not have. A record whose branch does not match is handled exactly as before.
+#
+# LIVE CLAIMS (the veto that makes the branch delete safe). Every record whose
+# branch names an issue number (the digits in `feat/8090-tm`, or any digits
+# after the last `/`) is checked against the fleet's cross-box claim registry,
+# `refs/claims/issue-<N>` on origin — `claims.sh` is the reference
+# implementation of the lease, and the polarity here is ITS polarity (an
+# absent, zero, non-numeric or 19+-digit lease is LIVE, never free). A LIVE
+# claim PRESERVEs the record: the issue is in flight, and a worktree created
+# seconds ago by a dispatch is clean, 0 commits ahead and merged — exactly this
+# class. The registry is unverifiable (no network)? Then the lane-residue
+# classes are PRESERVED (`claim-unverified`), never removed on a guess.
+#
+# BRANCH DELETION — AND THE DEPARTURE IT IS. The policy above says this script
+# "never runs `git branch -D`", and that stays true: the branch half of a
+# lane-residue record is removed with `git update-ref -d <ref> <expected-oid>`
+# (the atomic compare-and-delete `branch_reaper.py` uses), and ONLY when the
+# ref is PROVEN to be 0 commits ahead of the main ref — i.e. it holds no commit
+# that main does not have, so the delete cannot lose work, and a ref that MOVED
+# is refused. What the old rule protected was the commits; a 0-ahead branch
+# holds none. LEFT ALONE: everything that is not lane residue — a merged
+# feature branch, a closed PR's tip, a branch held by an open PR — keeps its
+# ref, which is why this is not a general branch reaper.
+# OVERRIDES: "a worktree reaper never deletes a branch ref" — the retained
+# branch IS the residue the pre-flight counts (#2033), so the 0-ahead
+# lane-owned ref is deleted with the checkout, by CAS, only after the commits
+# are proven to survive on the main ref.
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
 #
@@ -292,21 +362,54 @@
 #
 # Gate order (first failure decides) — keep in sync with classify_one():
 #   unparseable-path (poisoned record) > bare > main-checkout > self-checkout >
-#   worktree-locked > unreadable-path | prunable > live-process > live-cwd >
-#   dirty | ignored-artifact | status-timeout | status-error >
-#   detached-unreachable > open-pr > too-recent > too-young >
+#   worktree-locked (an `initializing` lock older than REAP_WT_STALE_INIT_SECONDS is DETECTED here
+#   and the interrupted-add class stays pending) > unreadable-path | prunable > live-process >
+#   live-cwd > live-claim > claim-unverified > interrupted-add[-unreachable] >
+#   dirty | ignored-artifact | status-timeout | status-error > abandoned-wip >
+#   detached-unreachable > open-pr > too-recent | ghost-zero-ahead > too-young >
 #   stranded-stash-unverifiable | stranded-stash > unpushed-unverifiable > reclaimable
 #
-# ⛔ EVERY TOKEN ABOVE IS ONE THE CODE CAN EMIT (agent-infra#2541 review), and the
-# order is the order `abstain_gate` actually runs: the STASH arm first, then the
-# unpushed arm. There is deliberately NO `unpushed-commits` reason: a readable
-# `rev-list --count HEAD --not --remotes` above zero KEEPS nothing — it is carried
-# on the removal row as `unpushed=N` (gate P-a). Advertising it here as a preserve
-# reason told a reader the gate vetoed a shape it in fact reclaims.
+# ⛔ THIS LIST IS THE MERGE OF TWO INDEPENDENT ORDERS, so it names every token EITHER side can emit
+# and says which side contributed it — a reader must be able to tell a lane-residue class from a
+# pre-existing safety gate without archaeology (#2033 met #2541/#3041 here):
+#   #2033 (this branch, lane residue)  live-claim · claim-unverified · interrupted-add ·
+#                                     interrupted-add-unreachable · abandoned-wip ·
+#                                     ghost-zero-ahead · unreadable-worktree-age
+#   #2541/#3041 (origin/main)         too-young · stranded-stash · stranded-stash-unverifiable ·
+#                                     unpushed-unverifiable · main-proof-vanished ·
+#                                     remote-holds:<remote>/<branch>
+#   pre-existing (both sides)         bare · main-checkout · self-checkout · worktree-locked ·
+#                                     unreadable-path · prunable · live-process · live-cwd · dirty ·
+#                                     ignored-artifact · status-timeout · status-error ·
+#                                     detached-unreachable · remote-only-ref · revocable-ref ·
+#                                     open-pr · too-recent · no-pr · pr-closed-unmerged ·
+#                                     unreadable-head · unparseable-path · reclaimable
+#   pass state, not a classify reason  deferred (the budget ran out — UNCLASSIFIED)
+#
+# ⛔ EVERY TOKEN ABOVE IS ONE THE CODE CAN EMIT (agent-infra#2541 review), and the order is the order
+# `abstain_gate` actually runs: the STASH arm first, then the unpushed arm. There is deliberately NO
+# `unpushed-commits` reason: a readable `rev-list --count HEAD --not --remotes` above zero KEEPS
+# nothing — it is carried on the removal row as `unpushed=N` (gate P-a). Advertising it here as a
+# preserve reason told a reader the gate vetoed a shape it in fact reclaims.
+#
+# ⛔ THE INTERRUPTED-ADD **REMOVAL** IS EMITTED AFTER THE LIVENESS GATES, NOT WITH THE LOCK TEST
+# (agent-infra#2102 review §P2-2). Only the lock DETECTION sits up here — it has to run before the
+# `prunable` branch, because git refuses to prune a locked record. The decision that DESTROYS the
+# checkout is emitted after live-process, live-cwd and the live-claim veto, and that is the correct
+# order: the previous wording of this line claimed an interrupted add outranks a live process/cwd
+# holder, so anyone "restoring" the documented order would have run a forced removal and its backup
+# against a checkout a process still holds — the exact class live-cwd exists to prevent.
+# ⛔ AND #2541's ABSTENTION PAIR IS THE LAST GATE BEFORE **EVERY** REMOVAL ROW, the lane-residue
+# classes included: `abstain_gate` is called immediately before `reclaimable`, `ghost-zero-ahead`,
+# `abandoned-wip` and `interrupted-add` are emitted, never after. That is the merge's one new
+# ordering rule, and it is the direction both sides already stated (a lane-residue class may never
+# remove a checkout that a safety gate would preserve; a stash the register names is parked work).
 #
 # PRESERVE reasons and why each one is not a bug:
 #   main-checkout          the shared checkout
 #   self-checkout          contains the reaper's own cwd
+#   bare                   the record is the BARE repository itself — `git worktree list`
+#                          says so, and there is no checkout to reclaim
 #   unreadable-path        cannot be resolved (perm/unmount) — NOT prunable;
 #                          deregistering it would drop a LIVE record. A failed
 #                          LEAF stat is not proof of absence: an unresolvable
@@ -371,6 +474,62 @@
 #   too-recent             HEAD commit not strictly older than --aged-days AND
 #                          the branch is NOT merged (a merged head is exempt)
 #   unreadable-head        HEAD could not be dated
+#   too-young              nothing younger than REAP_WT_MIN_AGE_MINUTES (45) is
+#                          removable by ANY removal class — rule 7's floor, and it
+#                          is applied to the lane-residue classes too (origin/main,
+#                          #2721/#2541; the age is the YOUNGER of HEAD's commit date
+#                          and the checkout's own ctime)
+#   no-pr                  clean + NO PR matches this head at all, inside the age
+#                          floor in force — rule 6's KEEP, printed as itself so the
+#                          window between "not merged" and "abandoned" is legible
+#                          (origin/main)
+#   pr-closed-unmerged     clean + PR `CLOSED` without a merge and head not an
+#                          ancestor — rule 5's KEEP; nobody can tell whether that
+#                          work should land, so it is NAMED for a human (origin/main)
+#   ghost-zero-ahead       a LANE-owned branch (feat/<N>-tm) with 0 commits
+#                          ahead, clean, no live claim — the residue class
+#                          above; its own floor is REAP_WT_GHOST_AGE_HOURS (2),
+#                          NOT the 7-day one (a ghost is provably dead as soon
+#                          as nothing holds it). ⛔ BOTH hour floors are
+#                          measured on the CHECKOUT RECORD's age
+#                          (`wt_created_ts`: the admin record's birth/ctime),
+#                          NEVER on the HEAD commit's date: these classes
+#                          require refs=merged, so the tip IS the base commit
+#                          and a commit-date floor is main's tip age — it could
+#                          never fire on this repo (#2102 review §4)
+#   interrupted-add        a record locked with reason `initializing` — an add
+#                          that never returned, so it cannot hold work; removed
+#                          only after REAP_WT_STALE_INIT_SECONDS (1800) and only
+#                          when no process holds the path
+#   interrupted-add-unreachable
+#                          a record locked `initializing` whose HEAD is NOT provably
+#                          on main (`merged` / `branch-retained:*`) — the class is
+#                          DETECTED, but the commits would not survive the removal,
+#                          so it is kept (this branch, #2033)
+#   unreadable-worktree-age
+#                          the checkout RECORD's age could not be read, so a lane-
+#                          residue hour floor cannot be applied — abstain rather than
+#                          reap on the base commit's date (this branch, #2033)
+#   abandoned-wip          0 commits ahead, DIRTY, lane-owned, aged past
+#                          REAP_WT_WIP_AGE_HOURS (24) — reaped ONLY under
+#                          --reap-abandoned-wip, and only after a VERIFIED backup
+#                          (`format-patch` + working-tree diff + a tarball of the
+#                          untracked AND ignored-but-non-regenerable files — the
+#                          latter matters because `worktree remove --force` deletes
+#                          them, and `clean_gate` DISCARDS its ignored list once the
+#                          tree is dirty; #2102 review §2) lands under
+#                          REAP_WT_BACKUP_DIR
+#   live-claim             an issue named by the branch is claimed live on
+#                          origin (refs/claims/issue-<N>) — the issue is in
+#                          flight; see the LANE RESIDUE section above
+#   claim-unverified       the claim registry could not be read; the lane-residue
+#                          classes abstain (a claim that cannot be read is LIVE)
+#   backup-unverified      the dirty-tree backup did not verify — NOTHING was
+#                          removed (fail-closed, counted as a failure). ⛔ emitted as
+#                          the `BACKUP-UNVERIFIED-KEEP` log line + the out-loud
+#                          `PRESERVED — the backup did NOT verify` line, NOT as a
+#                          `reason=` field: the row keeps the reason it classified as,
+#                          because the backup failed AFTER classification decided it
 #   deferred               the pass budget ran out; the record is UNCLASSIFIED,
 #                          so it also blocks the end-of-pass prune (an
 #                          unclassified record may be prunable)
@@ -427,6 +586,8 @@
 #   REAP_WT_GIT_TIMEOUT REAP_WT_DF_TIMEOUT
 #   REAP_WT_BUDGET_SECONDS REAP_WT_ROTATE REAP_WT_STATE_DIR REAP_WT_LOCK_STALE_SECONDS
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
+#   REAP_WT_LANE_BRANCH_RE REAP_WT_GHOST_AGE_HOURS REAP_WT_STALE_INIT_SECONDS
+#   REAP_WT_WIP REAP_WT_WIP_AGE_HOURS REAP_WT_BACKUP_DIR REAP_WT_CLAIM_NS REAP_WT_CLAIM_TMP_NS
 #   REAP_WT_MAIN_PROOF (auto|local) REAP_WT_MAIN_PUSH_URL
 #   REAP_WT_DISK_FLOOR_MB REAP_WT_INEFFECTIVE_MIN_EXAMINED REAP_WT_FREE_MB (test seam: an
 #   already-measured free-space witness, like REAP_WT_TREE_TS)
@@ -453,6 +614,8 @@ LSOF_BIN="${LSOF_BIN:-lsof}"
 # Only the ephemeral pre-delete in remove_one uses this; the script's own
 # scratch/log cleanup keeps the real `rm` (it must not be defeated by a seam).
 RM_BIN="${RM_BIN:-rm}"
+TAR_BIN="${TAR_BIN:-tar}"
+DATE_BIN="${DATE_BIN:-/bin/date}"
 STATE_DIR="${REAP_WT_STATE_DIR:-${HOME:-}/.pi/agent/state}"
 REAP_WT_LOG="${REAP_WT_LOG:-$STATE_DIR/pi-reap-worktrees.log}"
 LOCK_DIR="$STATE_DIR/pi-reap-worktrees.lock"
@@ -535,6 +698,29 @@ REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}"
 REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT:-5000}"
 REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF:-}"
 REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}"
+# ── lane residue (#2033; see the LANE RESIDUE section of the header) ─────────────────────────────
+# The branch names the harness creates for a lane. Only records matching this pattern are eligible
+# for the lane-residue classes (and therefore for the branch delete); everything else is classified
+# exactly as before. Overridable so a fork that names its lanes differently is a config change.
+REAP_WT_LANE_BRANCH_RE="${REAP_WT_LANE_BRANCH_RE:-^refs/heads/feat/[0-9]+-tm$}"
+# A ghost is provably dead as soon as nothing holds it — but "nothing holds it" cannot see a human
+# who is about to start work in a checkout created by hand, so the class keeps a short floor of its
+# own rather than the merged floor's 0. HOURS, not days: the whole point is that the block stops
+# recurring, and 7 days of an undispatchable issue is the defect.
+REAP_WT_GHOST_AGE_HOURS="${REAP_WT_GHOST_AGE_HOURS:-2}"
+# A lock that says `initializing` is an add in progress until it is old enough to be an add that
+# died. git holds it for the duration of `worktree add` (seconds; minutes on a huge repo).
+REAP_WT_STALE_INIT_SECONDS="${REAP_WT_STALE_INIT_SECONDS:-1800}"
+# The abandoned-WIP class is OFF unless an operator asks for it AND the backup verifies. Age is in
+# hours and much longer than the ghost floor: a dirty tree 1h old may be a lane someone is debugging.
+REAP_WT_WIP="${REAP_WT_WIP:-0}"
+REAP_WT_WIP_AGE_HOURS="${REAP_WT_WIP_AGE_HOURS:-24}"
+REAP_WT_BACKUP_DIR="${REAP_WT_BACKUP_DIR:-${O:-${HOME:-/tmp}/orchestrator}/state/reaped-patches}"
+# The claim registry. `refs/claims/issue-<N>` on origin; `claims.sh` owns the lease format.
+REAP_WT_CLAIM_NS="${REAP_WT_CLAIM_NS:-refs/claims}"
+# The private namespace this pass fetches claims into — never `refs/claims*` itself (a fetch into
+# the registry's own namespace would look like an acquisition to every reader on every box).
+REAP_WT_CLAIM_TMP_NS="${REAP_WT_CLAIM_TMP_NS:-refs/pireap-claims}"
 # auto = prove "merged into main" against the main the REMOTE reports (ls-remote on the push url);
 # local = the local ref chain only. The suite pins this to `local` for every fixture so no test ever
 # opens a network connection or changes verdict with the host's state.
@@ -595,6 +781,8 @@ LATE_PRESERVE=0
 # remove_one; read by run() so the operator sees WHY, not just "changed").
 REMOVE_SKIP_VERDICT=""
 DEFERRED=0
+BRANCH_DELETED=0
+BRANCH_KEPT=0
 # ⛔ A DEFERRED REMOVAL IS NOT A DEFERRED CLASSIFICATION. An armed overrun defers a record whose
 # verdict was ALREADY `remove`, so it was classified and selected; folding it into DEFERRED deflates
 # `preserved = PRESERVE_C - DEFERRED` and makes the SUMMARY line contradict itself. Own counter.
@@ -649,7 +837,7 @@ $SCRIPT_NAME — reap provably-reclaimable git worktree checkouts ($ISSUE_REF)
 
 Usage:
   $SCRIPT_NAME [--dry-run] [--apply] [--repo PATH] [--aged-days N]
-               [--main REF] [--list] [--help]
+               [--main REF] [--reap-abandoned-wip] [--list] [--help]
 
   (no mode flag)  dry-run: classify + report, remove NOTHING (default)
   --dry-run       explicit dry-run
@@ -657,6 +845,11 @@ Usage:
   --repo PATH     repo whose worktrees are reaped (default \$PWD)
   --aged-days N   age threshold in days (default 7; HEAD must be strictly older)
   --main REF      main ref for the merged check (default: auto-detect)
+  --reap-abandoned-wip
+                  ALSO reap the lane-residue class whose tree is DIRTY and whose branch is 0 commits
+                  ahead (a lane that never committed; #2033). OFF by default, and even when given
+                  the removal happens only after a VERIFIED backup under REAP_WT_BACKUP_DIR
+                  (default \$O/state/reaped-patches/<date>). Age floor: REAP_WT_WIP_AGE_HOURS (24).
   --list          print worktrees and exit
   --help          this text
 
@@ -706,6 +899,44 @@ log() { printf '%s\n' "$*" >>"$REAP_WT_LOG" 2>/dev/null || true; }
 now_epoch() {
     if [ -n "${REAP_WT_NOW_EPOCH:-}" ]; then printf '%s\n' "$REAP_WT_NOW_EPOCH"; return 0; fi
     /bin/date +%s 2>/dev/null || date +%s
+}
+
+# wt_created_ts <path> -> epoch seconds of when this CHECKOUT was materialised, or "" when it cannot
+# be read. ⛔ THE CHECKOUT, NOT THE COMMIT (agent-infra#2102 review §4).
+# `head_ts` is `git log -1 --format=%ct "$sha"` on the WORKTREE HEAD — and BOTH new age floors
+# (REAP_WT_GHOST_AGE_HOURS, REAP_WT_WIP_AGE_HOURS) require refs=merged, i.e. the tip is an ancestor of
+# main. For exactly the records those floors govern, HEAD *is* the base commit, so the commit date is
+# `main`'s tip age: a worktree and branch created ten seconds ago by a dispatch inherited it, and on
+# any repo whose main tip is older than 2 h (ghost) or 24 h (wip) the floor could NEVER fire — which is
+# the normal state of this repo. The floor was decorative, and a `too-recent` row printed `ghost age
+# 73h` for a checkout minutes old, which is a misleading line for the operator.
+# The datum both floors were WRITTEN to bound is the record's own age, so it is read from the admin
+# record (`<common>/.git/worktrees/<name>`, created by `worktree add` and by nothing else), never
+# from the commit. Birth time where the filesystem reports it, else ctime; both ladders validate
+# numerically (GNU `-c` first, BSD `-f` second, and never the reverse — GNU reads `-f` as
+# "filesystem status" and exits 0). A garbled, zero or FUTURE value is "cannot judge" (""), which the
+# callers treat as a fail-closed PRESERVE.
+wt_created_ts() {
+    local path="$1" gd ts="" now
+    gd="$("$GIT_BIN" -C "$path" rev-parse --absolute-git-dir 2>/dev/null)" || gd=""
+    [ -n "$gd" ] && [ -e "$gd" ] || return 0
+    # ⛔ EVERY rung requires a STRICTLY POSITIVE value: `stat -c %W` documents 0 as "birth time
+    # unknown" (filesystems without it, and some overlay/tmpfs mounts), and a 0 accepted as an epoch
+    # makes the age `now - 0` — ~56 years — so the 2 h ghost floor and the 24 h WIP floor would be
+    # satisfied by a checkout created SECONDS ago and the record would be REAPED. That is fail-OPEN
+    # on the one path this whole section exists to keep closed, so 0 is "cannot judge" here, exactly
+    # like a garbled value.
+    ts="$(stat -c %W "$gd" 2>/dev/null)"                       # GNU birth (%W=0 when unknown)
+    case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac
+    if [ -z "$ts" ]; then ts="$(stat -c %Z "$gd" 2>/dev/null)"; case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac; fi
+    if [ -z "$ts" ]; then ts="$(stat -f %B "$gd" 2>/dev/null)"; case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac; fi
+    if [ -z "$ts" ]; then ts="$(stat -f %c "$gd" 2>/dev/null)"; case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac; fi
+    [ -n "$ts" ] || return 0
+    now="$(now_epoch)"
+    # A future timestamp (clock skew, a copied record) cannot bound an age: abstain rather than print a
+    # negative "age" or preserve/reap on nonsense.
+    is_pos_int "$now" && [ "$ts" -gt "$now" ] && return 0
+    printf '%s\n' "$ts"
 }
 
 is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
@@ -1783,6 +2014,352 @@ commits_survive() {
     return 0
 }
 
+# ── lane residue: the claim registry, and the helpers the classes rest on (#2033) ──
+# Why the claim registry is consulted at all: a worktree created by a dispatch SECONDS ago is
+# clean, 0 commits ahead of main and its branch is lane-owned — i.e. it is indistinguishable from
+# a ghost by every datum this script had. What distinguishes it is that the issue is CLAIMED.
+# Without this veto the new ghost class would reap a live dispatch's worktree out from under it
+# (and, with the branch half, delete the branch the lane is about to push). The registry is the
+# fleet's existing cross-box truth (`claims.sh`), read here — never written.
+CLAIMS_STATE=unknown   # ok | na | unavailable (na = origin cannot carry claims)
+CLAIM_MAP=""           # "<issue>\t<live|expired>" lines, built once per pass
+
+# lane_issue_of <branch-ref> -> the issue number the branch names, or ""
+# The harness names a lane branch `feat/<issue>-tm`; other fleet branches carry the issue after a
+# `/` too (`fix/1234-…`). Digits only, and "" when there are none — a branch with no issue number
+# is not a lane branch and is never claim-gated.
+lane_issue_of() {
+    local ref="$1" tail
+    case "$ref" in refs/heads/*) : ;; *) return 0 ;; esac
+    tail="${ref##*/}"
+    case "$tail" in
+        [0-9]*) printf '%s\n' "$tail" | sed -n 's/^\([0-9][0-9]*\).*/\1/p' ;;
+        *) printf '' ;;
+    esac
+}
+
+is_lane_branch() { # <branch-ref> -> 0 when the harness itself created this branch name
+    case "$1" in refs/heads/*) : ;; *) return 1 ;; esac
+    grep -Eq -- "$REAP_WT_LANE_BRANCH_RE" <<<"$1"
+}
+
+# claims_load — ONE bounded fetch of the registry into this pass's own namespace.
+# The destination is `refs/pireap-claims/*`, never `refs/claims/*`: a fetch INTO the registry's
+# namespace would look like an acquisition to every reader on every box. `--prune` is scoped to
+# that destination pattern, so the only refs it can drop are ones this pass created.
+claims_load() {
+    local out rc ref issue lease now
+    CLAIM_MAP="$(mktemp "${TMPDIR:-/tmp}/pi-reap-claims.XXXXXX")" || { CLAIMS_STATE="unavailable"; return 1; }
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-claims-out.XXXXXX")" || { CLAIMS_STATE="unavailable"; return 1; }
+    # NO ORIGIN IS *NOT* AN UNREADABLE REGISTRY. `git remote get-url origin` exits 2 when the remote
+    # does not exist, and that is a decidable answer: claims live in the TARGET repo's origin, so a
+    # repo without one cannot have a registry — every issue is genuinely unclaimed (`na`). Anything
+    # else (a probe failure, a timeout) means the gate cannot be evaluated, which is `unavailable`
+    # and makes the lane-residue classes abstain — the same fail-closed split the open-PR gate uses,
+    # and for the same reason: reading an empty answer as "nobody holds it" is how a live dispatch
+    # loses its worktree.
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" remote get-url origin
+    case "$?" in
+        0) : ;;
+        2) CLAIMS_STATE="na"; log "CLAIMS n/a (no origin remote) — no issue can be claimed here"; rm -f "$out"; return 0 ;;
+        *) CLAIMS_STATE="unavailable"; log "CLAIMS unavailable (origin probe failed)"; rm -f "$out"; return 1 ;;
+    esac
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" \
+        "$GIT_BIN" -C "$REPO_CANON" fetch -q --no-tags --no-write-fetch-head --prune origin \
+        "+${REAP_WT_CLAIM_NS}/issue-*:${REAP_WT_CLAIM_TMP_NS}/issue-*"
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        CLAIMS_STATE="unavailable"
+        log "CLAIMS unavailable (fetch rc=$rc) — lane-residue reaping abstains this pass"
+        rm -f "$out"
+        return 1
+    fi
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" \
+        "$GIT_BIN" -C "$REPO_CANON" for-each-ref --format='%(refname)' "$REAP_WT_CLAIM_TMP_NS"
+    if [ $? != 0 ]; then
+        CLAIMS_STATE="unavailable"; log "CLAIMS unavailable (for-each-ref failed)"; rm -f "$out"; return 1
+    fi
+    now="$(now_epoch)"
+    # ⛔ THE LIST IS READ INTO MEMORY BEFORE THE LOOP, and that is a correctness requirement, not
+    # tidiness: the lease read below runs `run_bounded`, which TRUNCATES its output file — and `$out`
+    # is the very file this loop would otherwise be reading. Measured on a two-claim fixture: the
+    # loop ended after the first ref, the second claim was invisible, and a lane-owned branch with a
+    # LIVE claim would have been classified `claim=absent`. Bounded at 500 refs (a registry larger
+    # than that is a defect of its own; the extras are simply not consulted, which preserves).
+    CLAIM_LIST="$(head -500 "$out" 2>/dev/null)"
+    while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        issue="${ref##*issue-}"
+        case "$issue" in ''|*[!0-9]*) continue ;; esac
+        if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" \
+            "$GIT_BIN" -C "$REPO_CANON" log -1 --format=%B "$ref"; then
+            # A claim whose lease cannot be READ is LIVE (claims.sh's own polarity, below).
+            printf '%s\tlive\n' "$issue" >>"$CLAIM_MAP"
+            continue
+        fi
+        lease="$(sed -n 's/.*lease_until=\([0-9]*\).*/\1/p' "$out" | head -1)"
+        # POLARITY — claims.sh's `_lease_is_live`, copied deliberately rather than re-derived: an
+        # absent, zero, non-numeric or 19+-digit lease is LIVE (never free). A second derivation of
+        # this is how a live claim gets stolen; see that function's comment for the 2**63 incident.
+        case "${lease:-}" in
+            ''|0|*[!0-9]*) printf '%s\tlive\n' "$issue" >>"$CLAIM_MAP"; continue ;;
+        esac
+        if [ "${#lease}" -gt 18 ]; then printf '%s\tlive\n' "$issue" >>"$CLAIM_MAP"; continue; fi
+        if [ "$now" -le "$lease" ]; then
+            printf '%s\tlive\n' "$issue" >>"$CLAIM_MAP"
+        else
+            printf '%s\texpired\n' "$issue" >>"$CLAIM_MAP"
+        fi
+    done <<EOF
+$CLAIM_LIST
+EOF
+    rm -f "$out"
+    CLAIMS_STATE="ok"
+    return 0
+}
+
+claim_verdict() { # <issue> -> live | expired | absent | unknown
+    local issue="$1" v
+    case "${issue:-}" in ''|*[!0-9]*) printf 'absent\n'; return 0 ;; esac
+    case "$CLAIMS_STATE" in
+        ok) ;;
+        na) printf 'absent\n'; return 0 ;;
+        *) printf 'unknown\n'; return 0 ;;
+    esac
+    v="$(awk -F'\t' -v i="$issue" '$1 == i { print $2; exit }' "$CLAIM_MAP" 2>/dev/null)"
+    printf '%s\n' "${v:-absent}"
+}
+
+# init_lock_age <path> -> the age in seconds of a lock whose reason is `initializing`, else ""
+# git writes `<admin>/worktrees/<name>/locked` = `initializing` for the DURATION of `worktree add`
+# and removes it when the checkout completes. A surviving one is therefore positive evidence the
+# add never returned — the only datum that separates a partial materialisation (which cannot hold
+# work) from a checkout an operator locked on purpose. Measured on the residue: three interrupted
+# adds, all `locked` + `initializing`, all with a partial tree.
+init_lock_age() {
+    local path="$1" gd f reason mtime
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$path" rev-parse --path-format=absolute --git-dir || return 0
+    gd="$(head -1 "$GIT_OUT" 2>/dev/null)"
+    [ -n "$gd" ] || return 0
+    f="$gd/locked"
+    [ -f "$f" ] || return 0
+    reason="$(cat "$f" 2>/dev/null)" || return 0
+    [ "$reason" = "initializing" ] || return 0
+    # ⛔ GNU `stat -c %Y` FIRST, THEN BSD `stat -f %m` — NEVER the reverse (agent-infra#2102 review §1;
+    # the same ladder wt-lifecycle.sh and orch-loop.sh carry). GNU coreutils reads `-f` as
+    # "filesystem status" and `%m` as a second FILENAME: it prints a whole filesystem block to stdout
+    # AND exits 1, so the `||` branch runs but its output is APPENDED to the same command
+    # substitution — `$mtime` became "<filesystem block>\n<epoch>" and the numeric guard below then
+    # rejected it on EVERY input. Consequence on GNU/Linux (ubuntu CI, the cloud cells): this function
+    # returned "" always, so classify_one's locked arm always fell through to `preserve
+    # worktree-locked` and the `interrupted-add` class — its knob and its registry row — was DEAD
+    # CODE. Measured on GNU coreutils 9.4: `stat -f %m f` prints the block, rc=1, and the combined
+    # substitution yields a non-numeric blob. Fail-closed (nothing destroyed), but inert.
+    mtime="$(stat -c %Y "$f" 2>/dev/null || true)"
+    case "$mtime" in ''|*[!0-9]*) mtime="" ;; esac
+    if [ -z "$mtime" ]; then
+        mtime="$(/usr/bin/stat -f %m "$f" 2>/dev/null || true)"
+        case "$mtime" in ''|*[!0-9]*) mtime="" ;; esac
+    fi
+    [ -n "$mtime" ] || return 0
+    local now; now="$(now_epoch)"
+    [ "$now" -gt "$mtime" ] || return 0
+    printf '%s\n' "$((now - mtime))"
+}
+
+# backup_before_removal <path> <branch> <reason> — the ONLY way uncommitted work is ever destroyed.
+# Writes into $REAP_WT_BACKUP_DIR/<UTC date>/:
+#   <slug>.patch          `git diff <MAIN_REF>` — the working tree (staged AND unstaged) vs main, so
+#                         a lane that never committed is fully captured. `format-patch` is also
+#                         written when commits are ahead, but for the 0-ahead residue class it is
+#                         EMPTY BY CONSTRUCTION — that is why the diff is the substantive half and
+#                         why "the patch is non-empty" is asserted against the diff, not the format.
+#   <slug>.untracked.tar.gz  every untracked, non-ignored file (a patch carries none of them).
+#   <slug>.manifest       what was captured, from which sha, why — the operator's index.
+# Returns 0 only when the capture VERIFIES; anything else is 1 and the caller must not remove.
+backup_before_removal() { # <path> <branch> <sha> <reason>
+    local path="$1" br="$2" sha="$3" why="$4" slug day dir out patch tarf listf ahead nt nu n_ent rc
+    slug="$(printf '%s' "${br#refs/heads/}" | tr '/' '_')"
+    day="$("$DATE_BIN" -u +%Y-%m-%d 2>/dev/null)" || day="undated"
+    dir="$REAP_WT_BACKUP_DIR/$day"
+    mkdir -p "$dir" || { log "BACKUP-FAIL $path cannot create $dir"; return 1; }
+    patch="$dir/$slug.patch"
+    tarf="$dir/$slug.untracked.tar.gz"
+    listf="$(mktemp "${TMPDIR:-/tmp}/pi-reap-bk-list.XXXXXX")" || return 1
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-bk.XXXXXX")" || { rm -f "$listf"; return 1; }
+    rm -f "$patch" "$tarf"
+
+    # How many commits does the branch hold that main does not? (For the residue class: none.)
+    ahead=""
+    if [ -n "$MAIN_REF" ]; then
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" \
+            rev-list --count "$MAIN_REF..$br" && ahead="$(head -1 "$out")"
+    fi
+    case "${ahead:-}" in ''|*[!0-9]*) ahead="?" ;; esac
+    if [ "$ahead" != 0 ] && [ "$ahead" != "?" ]; then
+        run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
+            format-patch "$MAIN_REF" --stdout
+        if [ $? = 0 ]; then cp "$out" "$dir/$slug.commits.patch" 2>/dev/null || true; fi
+    fi
+
+    # The working tree, tracked changes only.
+    # `git diff` (no `--stdout` — that is a `format-patch` option; passing it here makes git exit 129
+    # and, measured, turned every backup into BACKUP-FAIL, i.e. nothing was ever reaped).
+    run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$path" diff "$MAIN_REF"
+    rc=$?
+    if [ "$rc" != 0 ]; then log "BACKUP-FAIL $path git diff rc=$rc"; rm -f "$out" "$listf"; return 1; fi
+    cp "$out" "$patch" || { rm -f "$out" "$listf"; return 1; }
+
+    # Untracked files — the half a patch cannot carry. Declared-ephemeral ROOT entries are excluded
+    # (they are reproducible from the manifests, and tarring a `.venv` is how a backup becomes 2 GB of
+    # noise).
+    #
+    # ⛔ AND IGNORED, NON-REGENERABLE DATA IS TAKEN TOO (agent-infra#2102 review §2). `--exclude-standard`
+    # MEANS "apply the ignore rules", so the previous call captured untracked-AND-NOT-IGNORED files
+    # only, and `git diff` above cannot carry an untracked file at all — the comment that stood here
+    # ("everything else is taken, including ignored-but-not-ephemeral data") claimed the exact opposite
+    # of what the command does. The reachable cost was not cosmetic: `clean_gate` returns `dirty` as
+    # soon as ANY tracked/untracked entry exists and DISCARDS its ignored list in that case, so a lane
+    # worktree holding one modified tracked file plus a gitignored `.env` classified `dirty` →
+    # `remove abandoned-wip backup=required` → the backup verified on the diff → `worktree remove
+    # --force` (remove_one_forced) deleted the `.env`. The pass logged `BACKUP ok` over a destroyed
+    # file, on the one path whose stated purpose is "the ONLY way uncommitted work is ever destroyed".
+    # `--directory` keeps the enumeration BOUNDED and is what makes the filter correct: an ignored
+    # `.venv/` or `node_modules/` collapses to ONE entry, which `is_regenerable_ignored` then drops,
+    # instead of listing every file inside it (whose basename would not be recognised as regenerable).
+    run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
+        ls-files --others --exclude-standard
+    rc=$?
+    if [ "$rc" != 0 ]; then log "BACKUP-FAIL $path ls-files rc=$rc"; rm -f "$out" "$listf"; return 1; fi
+    : >"$listf"
+    nu=0
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        case "${entry%/}" in
+            */*) : ;;                    # nested: always taken
+            *) is_ephemeral_name "${entry%/}" && continue ;;
+        esac
+        printf '%s\n' "$entry" >>"$listf"
+        nu=$((nu + 1))
+    done <"$out"
+    # The ignored half. An entry whose basename is a declared-regenerable artifact is skipped; anything
+    # else (a `.env`, an ignored `data/`, a `*.pem`) is operator data and MUST be captured, because the
+    # forced removal that follows this verified backup deletes the whole checkout.
+    run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
+        ls-files --others --ignored --exclude-standard --directory
+    rc=$?
+    if [ "$rc" != 0 ]; then log "BACKUP-FAIL $path ls-files --ignored rc=$rc"; rm -f "$out" "$listf"; return 1; fi
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        is_regenerable_ignored "$entry" && continue
+        printf '%s\n' "$entry" >>"$listf"
+        nu=$((nu + 1))
+    done <"$out"
+    if [ "$nu" -gt 0 ]; then
+        if ! command -v "${TAR_BIN:-tar}" >/dev/null 2>&1; then
+            log "BACKUP-FAIL $path ${nu} untracked/ignored file(s) and no tar to capture them"
+            rm -f "$out" "$listf"; return 1
+        fi
+        run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "${TAR_BIN:-tar}" -czf "$tarf" -C "$path" -T "$listf"
+        rc=$?
+        if [ "$rc" != 0 ]; then log "BACKUP-FAIL $path tar rc=$rc"; rm -f "$out" "$listf"; return 1; fi
+    fi
+
+    # ── VERIFICATION. Nothing is removed unless every component that SHOULD have content has it. ──
+    # A dirty TRACKED tree always produces a non-empty diff (a deletion is a hunk too), so an empty
+    # patch alongside tracked changes means the capture is broken.
+    nt=0
+    run_bounded "$REAP_WT_STATUS_TIMEOUT" "$out" "$GIT_BIN" -C "$path" status --porcelain --untracked-files=no
+    if [ $? = 0 ]; then
+        nt="$(grep -c . "$out" 2>/dev/null || true)"
+        case "${nt:-}" in ''|*[!0-9]*) nt=0 ;; esac
+    fi
+    if [ "$nt" -gt 0 ] && [ ! -s "$patch" ]; then
+        log "BACKUP-UNVERIFIED $path $nt tracked change(s) but the patch is EMPTY"
+        rm -f "$out" "$listf"; return 1
+    fi
+    if [ "$nu" -gt 0 ]; then
+        if [ ! -s "$tarf" ]; then
+            log "BACKUP-UNVERIFIED $path $nu untracked/ignored entry(ies) but the tarball is empty"
+            rm -f "$out" "$listf"; return 1
+        fi
+        if ! run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "${TAR_BIN:-tar}" -tzf "$tarf"; then
+            log "BACKUP-UNVERIFIED $path the tarball does not list"
+            rm -f "$out" "$listf"; return 1
+        fi
+        n_ent="$(grep -c . "$out" 2>/dev/null || true)"
+        case "${n_ent:-}" in ''|*[!0-9]*) n_ent=0 ;; esac
+        if [ "$n_ent" -lt "$nu" ]; then
+            log "BACKUP-UNVERIFIED $path tarball lists $n_ent entries for $nu untracked/ignored entry(ies)"
+            rm -f "$out" "$listf"; return 1
+        fi
+    fi
+    if [ "$nt" -eq 0 ] && [ "$nu" -eq 0 ]; then
+        # The classification said DIRTY; the backup finds nothing. Two probes disagree => abstain.
+        log "BACKUP-UNVERIFIED $path classified dirty but no tracked/untracked evidence was captured"
+        rm -f "$out" "$listf"; return 1
+    fi
+    {
+        printf 'branch=%s\nsha=%s\nreason=%s\ncommits_ahead=%s\ntracked_changes=%s\nuntracked_entries=%s\npatch=%s\ntarball=%s\n' \
+            "$br" "$sha" "$why" "$ahead" "$nt" "$nu" "$patch" "$([ "$nu" -gt 0 ] && printf '%s' "$tarf" || printf 'none')"
+        printf 'created=%s\n' "$("$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    } >"$dir/$slug.manifest" 2>/dev/null || true
+    log "BACKUP ok $path -> $dir (tracked=$nt untracked=$nu ahead=$ahead)"
+    printf '%s\n' "$dir"
+    rm -f "$out" "$listf"
+    return 0
+}
+
+# delete_lane_branch <branch-ref> <expected-oid> — remove the BRANCH half of a lane-residue record.
+# Prints the outcome; 0 = deleted, 1 = kept (with the reason on stdout, so the caller reports it).
+# This is NOT a general branch reaper: only a ref matching REAP_WT_LANE_BRANCH_RE, only while its tip
+# is still an ancestor of the main ref (0 commits ahead => no commit can be lost), and only via the
+# atomic compare-and-delete. `git branch -D` is never called and `--force` is never passed.
+delete_lane_branch() {
+    local ref="$1" oid="$2" br
+    is_lane_branch "$ref" || { printf 'not-a-lane-branch\n'; return 1; }
+    br="${ref#refs/heads/}"
+    [ -n "$oid" ] || { printf 'no-oid\n'; return 1; }
+    [ -n "$MAIN_REF" ] || { printf 'no-main-ref\n'; return 1; }
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$oid" "$MAIN_REF"
+    if [ $? != 0 ]; then
+        # Re-proven AT THE MOMENT OF DELETION (TOCTOU, the same discipline as remove_one): a commit
+        # that appeared since classification makes this a branch WITH work, and work is kept.
+        printf 'moved-or-not-ancestor-of-main\n'
+        return 1
+    fi
+    if run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" update-ref -d "$ref" "$oid"; then
+        # `update-ref -d` leaves `branch.<name>.*` config behind (git branch -D does not). Remove it
+        # best-effort so a re-created branch does not inherit a stale upstream.
+        "$GIT_BIN" -C "$REPO_CANON" config --remove-section "branch.$br" >/dev/null 2>&1 || true
+        printf 'deleted\n'
+        return 0
+    fi
+    # ⛔ DISTINGUISH "THE REF MOVED" FROM "GIT REFUSED" (measured while merging origin/main, #2033).
+    # `update-ref -d <ref> <old-oid>` is itself a compare-and-delete, so it fails when the ref no
+    # longer points at the oid we classified. That is the SAME race the re-proof above exists for, one
+    # step later: the old oid stays an ancestor of main after a peer commits ON TOP of it, so the
+    # ancestry re-proof legitimately passes and only the CAS can see the move. It is a BENIGN KEEP —
+    # the branch grew work — and reporting it as a failed pass (exit 4, BRANCH_KEPT) turns every such
+    # race into a false alarm. Only a refusal with the ref UNCHANGED is a real failure.
+    local now_oid
+    if run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" rev-parse --verify -q "$ref"; then
+        now_oid="$(head -1 "$GIT_OUT" 2>/dev/null)"
+    else
+        now_oid=""
+    fi
+    if [ "$now_oid" != "$oid" ]; then
+        printf 'moved-or-not-ancestor-of-main\n'
+        return 1
+    fi
+    printf 'update-ref-refused\n'
+    return 1
+}
+
 # patch_equivalent <sha> — the SQUASH-MERGE evidence (#2354), and ONLY an age-floor signal.
 #
 # ⛔ THIS IS NOT A SURVIVAL PROOF, and must never be returned by commits_survive (review of
@@ -2079,6 +2656,7 @@ classify_one() {
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf proof_txt=""
     local head_ts tree_ts witness wname age_s young age_floor aged_note
     local pr pr_state pr_num pr_oid pr_key pr_other subj prnum_note pr_floor no_pr_proof
+    local issue="" claim="absent" init_age="" wt_ts="" wt_ok=0
     local unp stash_hit
     UNPUSHED_NOTE=""
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trule=P proof=worktree-list --porcelain record had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
@@ -2096,7 +2674,23 @@ classify_one() {
     # itself refuses to prune a locked record, so a locked worktree whose
     # checkout has vanished is still a PRESERVE — classifying it `prunable`
     # would claim (and count) a removal git will not perform.
-    case ",$flags," in *,locked,*) printf 'preserve\tworktree-locked\t\trule=P proof=worktree-list:locked git worktree lock is set\n'; return 0 ;; esac
+    #
+    # EXCEPT a lock that reads `initializing` (#2033): that is git's own marker for an add that has
+    # not returned yet, and a surviving one older than the floor proves the add never did — so the
+    # record cannot hold work. 24 of the measured residue records were interrupted adds, and the
+    # old rule preserved every one of them for ever (a partial checkout also reads `dirty`, so it was
+    # preserved twice over). The lock age only DETECTS the class here: the removal decision is
+    # emitted further down, AFTER the live-process / live-cwd / claim gates, because those are the
+    # gates that know whether something is still using the checkout.
+    case ",$flags," in
+        *,locked,*)
+            if [ "$exists" = 1 ]; then init_age="$(init_lock_age "$path")"; fi
+            if is_pos_int "$init_age" && [ "$init_age" -ge "$REAP_WT_STALE_INIT_SECONDS" ]; then
+                :   # fall through: an interrupted add, not a deliberate lock
+            else
+                printf 'preserve\tworktree-locked\t\trule=P proof=worktree-list:locked git worktree lock is set\n'; return 0
+            fi ;;
+    esac
     if [ -z "$canon" ]; then
         # `canonicalize` failing means "cannot resolve", NOT "directory gone":
         # an existing-but-inaccessible checkout must never be treated as prunable
@@ -2152,18 +2746,52 @@ classify_one() {
     fi
     [ -n "$HL_STALE" ] && stale_txt="stale-shell:$HL_STALE"
 
-    crumb="$(clean_gate "$path")"
-    cverdict="${crumb%%$'\t'*}"
-    cpay="${crumb#*$'\t'}"
-    case "$cverdict" in
-        clean) eph="$cpay" ;;
-        dirty)            printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s\n' "$cpay"; return 0 ;;
-        ignored-artifact) printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
-        status-timeout)   printf 'preserve\tstatus-timeout\t\trule=2 proof=git-status:timeout %s\n' "$cpay"; return 0 ;;
-        *)                printf 'preserve\tstatus-error\t\trule=2 proof=git-status:error %s\n' "$cpay"; return 0 ;;
-    esac
+    # ── the issue this record belongs to, and whether the fleet says it is IN FLIGHT (#2033) ──
+    # A record created seconds ago by a dispatch is clean, 0 commits ahead and lane-owned: without
+    # this veto it is a ghost by every datum below. LIVE is the only answer that needs to be read as
+    # a preserve for EVERY class; `unknown` is applied only where a class would otherwise REMOVE a
+    # lane-owned record (below), so an unreadable registry cannot change any pre-existing verdict.
+    issue="$(lane_issue_of "$branch")"
+    if [ -n "$issue" ]; then
+        claim="$(claim_verdict "$issue")"
+        if [ "$claim" = "live" ]; then
+            printf 'preserve\tlive-claim\t\tissue #%s is claimed live on origin (%s/issue-%s) — in flight, not residue\n' \
+                "$issue" "$REAP_WT_CLAIM_NS" "$issue"
+            return 0
+        fi
+    fi
+    if is_pos_int "$init_age" && [ "$init_age" -ge "$REAP_WT_STALE_INIT_SECONDS" ]; then
+        # An interrupted add. It cannot hold work (the add never returned), so the clean gate is not
+        # consulted at all — a partial checkout reads `dirty` for every file git had not written yet.
+        refs="$(commits_survive "$sha" "$branch")"
+        # ⛔ `case`, NOT `[ "$refs" != branch-retained:* ]` (#2102 review P3): `test`'s `!=` is a
+        # LITERAL compare, so that form let every real `branch-retained:<name>` fall into the preserve
+        # arm and the allowance never applied — an interrupted add whose branch still retained commits
+        # was preserved for ever, on the one path that names it.
+        case "$refs" in
+            merged|branch-retained:*) : ;;
+            *) printf 'preserve\tinterrupted-add-unreachable\t\tlock=initializing age=%ss but the HEAD commit is not provably on main (refs=%s) — kept\n' "$init_age" "${refs:-none}"
+               return 0 ;;
+        esac
+        if [ "$claim" = "unknown" ]; then
+            printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+            return 0
+        fi
+        # ⛔ #2541's ABSTENTION PAIR RUNS ON THIS CLASS TOO (the merge's rule: a lane-residue class may
+        # never remove a checkout that a safety gate would preserve). `landing-proved=0` is the HONEST
+        # value: the surviving refs above only promise the commits are RETAINED on a branch, which is
+        # not the same claim as "landed on main" — so the unpushed arm is allowed to fail closed here.
+        # A stash the register names for this branch is parked lane work, and it outranks the class.
+        abstain_gate "$path" "$branch" "$refs" 0 && return 0
+        printf 'remove\tinterrupted-add\t%s\trule=L lock=initializing age=%ss refs=%s claim=%s — an add that never returned; nothing was materialised into it\n' \
+            "" "$init_age" "$refs" "$claim"
+        return 0
+    fi
 
     # ── RULE 7's witnesses, computed BEFORE any removal rule can act ─────
+    # ⛔ MOVED AHEAD OF `clean_gate` (#2033): the dirty arm below needs the checkout's AGE to decide
+    # `abandoned-wip`, and main's comment already requires these witnesses before any removal rule
+    # fires. Two independent watchdosed reads, so moving them earlier changes no verdict.
     # A hung commit-graph read must not wedge the pass: the budget is only
     # checked between records, so this probe is watchdosed and a failure is
     # `unreadable-head` (PRESERVE).
@@ -2183,6 +2811,11 @@ classify_one() {
     # of the pass clock cannot witness age (it would make every checkout
     # infinitely young, and the reaper would then reclaim nothing at all), so it
     # is ignored rather than trusted.
+    # ⛔ THIS IS ALSO THE DATUM THE TWO NEW HOUR-FLOORS READ (#2102 review §4). Both lane-residue
+    # floors used to read the HEAD COMMIT's date, which for a `refs=merged` record IS the base
+    # commit's date — so a checkout created seconds ago from an old main inherited main's age and the
+    # floor could never fire. `age_s` is the younger of the commit date and the checkout's own ctime,
+    # which is what "how long has this checkout existed" actually needs.
     witness="$head_ts"; wname="head-commit"
     tree_ts="$(path_ctime "$path")"
     case "$tree_ts" in
@@ -2194,6 +2827,71 @@ classify_one() {
     age_s="$((now - witness))"
     young=0
     [ "$age_s" -lt "$((REAP_WT_MIN_AGE_MINUTES * 60))" ] && young=1
+
+    # ⛔ AND THE RECORD'S OWN AGE, for the two LANE-RESIDUE floors only (agent-infra#2102 review §4).
+    # `age_s` above is main's rule-7 witness (the younger of the HEAD COMMIT date and the checkout's
+    # ctime). Both new classes require `refs=merged`, i.e. the tip IS the base commit, so the COMMIT
+    # half of that witness is `main`'s tip age — a checkout created ten seconds ago inherits it, and on
+    # any repo whose main tip is older than 2 h (ghost) or 24 h (wip) the floor could NEVER fire. The
+    # datum those floors were written to bound is the RECORD's own age, and `wt_created_ts` reads the
+    # admin record `<common>/.git/worktrees/<name>` — created by `worktree add` and by nothing else, so
+    # it does not move when the checkout root is chmod-ed the way a directory ctime does. An unreadable
+    # or FUTURE record age is `wt_ok=0`, and both arms then PRESERVE rather than reap on the wrong datum.
+    wt_ts="$(wt_created_ts "$path")" || wt_ts=""
+    if is_pos_int "$wt_ts"; then wt_ok=1; fi
+
+    crumb="$(clean_gate "$path")"
+    cverdict="${crumb%%$'\t'*}"
+    cpay="${crumb#*$'\t'}"
+    case "$cverdict" in
+        clean) eph="$cpay" ;;
+        dirty)
+            # ── abandoned WIP, OPT-IN (#2033): 0 commits ahead, dirty, lane-owned ──────────────
+            # 24 of these were measured in one repo: a lane that never made its first commit, so the
+            # ONLY copy of its work is this working tree. A normal pass PRESERVES it (`dirty` is rule
+            # 2 above), and it is only ever removed when an operator armed `--reap-abandoned-wip` —
+            # and even then the removal is gated on a VERIFIED backup (`backup_before_removal`, which
+            # the run loop runs BEFORE `remove_one_forced`). Nothing here is default behaviour.
+            if [ "$REAP_WT_WIP" = 1 ] && is_lane_branch "$branch"; then
+                if [ "$claim" = "unknown" ]; then
+                    printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+                    return 0
+                fi
+                refs="$(commits_survive "$sha" "$branch")"
+                case "$refs" in
+                    merged) : ;;
+                    *)
+                        # Commits exist that main does not have: the tree is dirty AND the branch
+                        # holds work. That is not residue, it is a lane mid-flight. Preserve, as before.
+                        printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s (and refs=%s: the branch holds commits)\n' "$cpay" "$refs"
+                        return 0 ;;
+                esac
+                if [ "$wt_ok" != 1 ]; then
+                    # The floor exists to protect a checkout someone may still be working in. If the
+                    # CHECKOUT's age cannot be read, that floor cannot be applied — abstain rather than
+                    # reap on the base commit's date, which is what made the floor decorative.
+                    printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_WIP_AGE_HOURS cannot be applied)\n' "$path"
+                    return 0
+                fi
+                if [ "$((now - wt_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
+                    printf 'preserve\ttoo-recent\t\trule=P WIP age %sh ≤ %sh (REAP_WT_WIP_AGE_HOURS) witness=worktree-record\n' \
+                        "$(((now - wt_ts) / 3600))" "$REAP_WT_WIP_AGE_HOURS"
+                    return 0
+                fi
+                # ⛔ #2541's ABSTENTION PAIR RUNS HERE (merge of #2033 × #2541): the class is "dirty,
+                # 0 ahead, lane-owned, old", and a stash naming this branch is exactly the parked work
+                # the dirty tree cannot show. `landing-proved=1` — the `refs=merged` case above is an
+                # ancestry proof for THIS head, the same exemption rule 3 takes on the same datum.
+                abstain_gate "$path" "$branch" "$refs" 1 && return 0
+                printf 'remove\tabandoned-wip\t%s\trule=L refs=merged dirty=%s age=%sh claim=%s witness=worktree-record backup=required\n' \
+                    "$cpay" "$(((now - wt_ts) / 3600))" "$claim"
+                return 0
+            fi
+            printf 'preserve\tdirty\t\trule=2 proof=git-status --porcelain %s\n' "$cpay"; return 0 ;;
+        ignored-artifact) printf 'preserve\tignored-artifact\t\trule=2 proof=git-status --ignored %s\n' "$cpay"; return 0 ;;
+        status-timeout)   printf 'preserve\tstatus-timeout\t\trule=2 proof=git-status:timeout %s\n' "$cpay"; return 0 ;;
+        *)                printf 'preserve\tstatus-error\t\trule=2 proof=git-status:error %s\n' "$cpay"; return 0 ;;
+    esac
 
     # ── RULES 4/5/6: PR state, from the pass's ONE batched read ──────────
     # The branch name is the natural key; a DETACHED head has none, so its
@@ -2293,6 +2991,46 @@ classify_one() {
             # named in words so the row still says which decision it aborted.
             printf 'preserve\tmain-proof-vanished\t\trule=P would-remove=3 the ancestry proof that put this row in the removal path does NOT reproduce now (tried %s then %s) — a proof that cannot be retaken removes nothing\n' \
                 "${RESOLVED_MAIN:-<no-resolved-main>}" "${MAIN_REF:-<no-main-ref>}"
+            return 0
+        fi
+        # ── LANE GHOST (#2033): a clean, 0-commits-ahead LANE branch — residue by construction ──
+        # `refs=merged` IS the 0-ahead test (the tip is an ancestor of the main ref), so no extra probe
+        # is needed. This record is what the collision pre-flight reads, and removing the checkout while
+        # RETAINING the branch — the old behaviour — left the issue undispatchable for ever. It keeps a
+        # short floor of its OWN (hours, not the days that made the block permanent), because the whole
+        # point is that the block stops recurring, and it is only a ghost when nothing outside this
+        # script says the issue is in flight (the claim veto above, which abstains when unreadable).
+        # The generic merged floor below is deliberately BYPASSED for this class and only this class:
+        # a non-lane branch keeps the operator's full cooldown, so this widens nothing else.
+        if is_lane_branch "$branch"; then
+            if [ "$claim" = "unknown" ]; then
+                printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
+                return 0
+            fi
+            if [ "$wt_ok" != 1 ]; then
+                # Same fail-closed rule as abandoned-wip: the ghost floor is the ONLY thing separating a
+                # dispatch that started seconds ago from residue, so it must be applied on the
+                # checkout's own age or not at all.
+                printf 'preserve\tunreadable-worktree-age\t\trule=P cannot date the checkout at %s (REAP_WT_GHOST_AGE_HOURS cannot be applied)\n' "$path"
+                return 0
+            fi
+            if [ "$((now - wt_ts))" -le "$((REAP_WT_GHOST_AGE_HOURS * 3600))" ]; then
+                printf 'preserve\ttoo-recent\t\trule=P ghost age %sh ≤ %sh (REAP_WT_GHOST_AGE_HOURS) witness=worktree-record proof=%s\n' \
+                    "$(((now - wt_ts) / 3600))" "$REAP_WT_GHOST_AGE_HOURS" "$proof_txt"
+                return 0
+            fi
+            if [ "$young" = 1 ]; then
+                printf 'preserve\ttoo-young\t\trule=7 age=%sm < %sm (witness=%s) proof=%s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$proof_txt"
+                return 0
+            fi
+            # ⛔ #2541's ABSTENTION PAIR RUNS BEFORE THIS REMOVAL (merge of #2033 × #2541), and the
+            # order matters: the ghost class deletes the CHECKOUT **and** its 0-ahead branch ref, so a
+            # stash the register names for that branch must be able to stop it. `landing-proved=1` is
+            # exactly rule 3's exemption — `refs=merged` above is an ancestry proof for this head.
+            abstain_gate "$path" "$branch" "$refs" 1 && return 0
+            log "CLASSIFY ghost $path issue=${issue:-?} claim=$claim age=$(((now - wt_ts) / 3600))h ghost_floor=${REAP_WT_GHOST_AGE_HOURS}h"
+            printf 'remove\tghost-zero-ahead\t%s\trule=L refs=merged proof=%s ghost=lane-branch:%s claim=%s age=%sh witness=worktree-record clean=disposable-only unref=%s,no-open-pr delete_lane_branch=yes\n' \
+                "$eph" "$proof_txt" "${issue:-?}" "$claim" "$(((now - wt_ts) / 3600))" "${stale_txt:-no-proc}"
             return 0
         fi
         # `age_floor` already carries the merged floor (computed above).
@@ -2607,6 +3345,33 @@ remove_one() {
     return 1
 }
 
+# remove_one_forced <path> — the ONLY path in this script that passes `--force`, and it exists for
+# records whose tree is genuinely dirty after a VERIFIED backup (#2033: `abandoned-wip` and
+# `interrupted-add`). `git worktree remove --force` — not `rm -rf` followed by a prune — because it
+# deregisters the record and deletes the tree in one step: a mid-way failure leaves a REGISTERED
+# worktree (which the next pass re-classifies) rather than a directory that no record points at and
+# that nothing will ever reap. A clean record never comes here; remove_one (no --force) owns those.
+# A locked record is unlocked first: `worktree remove --force` alone refuses a locked worktree (git
+# asks for --force twice), and a lock whose reason is `initializing` is exactly the interrupted-add
+# case. `worktree unlock` is bounded like every other probe.
+remove_one_forced() {
+    local path="$1" out rc
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rmf.XXXXXX")" || return 1
+    run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" \
+        "$GIT_BIN" -C "$REPO_CANON" worktree unlock "$path" || true
+    run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" \
+        "$GIT_BIN" -C "$REPO_CANON" worktree remove --force "$path"
+    rc=$?
+    if [ "$rc" = 0 ]; then log "REMOVED-FORCED $path"; rm -f "$out"; return 0; fi
+    if [ "$rc" = 124 ]; then
+        log "REMOVE-FAIL $path forced removal timed out after ${REAP_WT_REMOVE_TIMEOUT}s (admin record left intact)"
+    else
+        log "REMOVE-FAIL $path forced rc=$rc $(head -1 "$out" 2>/dev/null)"
+    fi
+    rm -f "$out"
+    return 1
+}
+
 # ── report ─────────────────────────────────────────────────────────────
 report_row() { # <verdict> <path> <reason> <detail>
     if [ -n "${4:-}" ]; then
@@ -2617,7 +3382,7 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE VERDICT=${PASS_VERDICT:-?} FREE_MB=${FREE_MB:-?}"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED DEFERRED_REMOVE=$DEFERRED_REMOVE CLASSIFIED=$CLASSIFIED_C BRANCH_DELETED=$BRANCH_DELETED BRANCH_KEPT=$BRANCH_KEPT CLAIMS=$CLAIMS_STATE GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED MAIN_PROOF=$MAIN_PROOF PR_MERGED=$PR_MERGED_STATE VERDICT=${PASS_VERDICT:-?} FREE_MB=${FREE_MB:-?}"
 }
 
 # ── THE PASS VERDICT (#3041) ───────────────────────────────────────────────────────────────────
@@ -2815,6 +3580,8 @@ parse_args() {
             --main)
                 [ $# -ge 2 ] || { echo "bad --main: missing value" >&2; exit 2; }
                 MAIN_REF_OVERRIDE="$2"; shift 2 ;;
+            --reap-abandoned-wip) REAP_WT_WIP=1; shift ;;
+            --no-reap-abandoned-wip) REAP_WT_WIP=0; shift ;;
             --help|-h) usage; exit 0 ;;
             *) usage >&2; exit 2 ;;
         esac
@@ -2827,7 +3594,13 @@ run() {
     # it owns the probe scratch dir, the watchdog timers, the probe output files
     # and the lock. Installing it later (as it was) leaked the scratch dir on
     # every early fail-closed exit.
-    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT" "$STASH_OUT" "$REMOTE_DEAD_FILE"; lock_release' EXIT
+    # The trap owns EVERY scratch file a pass can mint, from BOTH sides of this merge:
+    #   · `$STASH_OUT` / `$REMOTE_DEAD_FILE` — the #2541/#3041 probes (origin/main);
+    #   · `$CLAIM_MAP` — the registry scratch this pass builds (claims_load), which used to be the ONE
+    #     scratch file the trap did not own, so every launchd-scheduled pass left one behind
+    #     (agent-infra#2102 review, minor). Guarded because the pass may exit before the registry was
+    #     ever loaded.
+    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT" "$STASH_OUT" "$REMOTE_DEAD_FILE"; if [ -n "${CLAIM_MAP:-}" ]; then rm -f "$CLAIM_MAP"; fi; lock_release' EXIT
     if [ "$MODE" = unknown ]; then
         if [ "$REAP_WT_DRY_RUN" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi
@@ -3091,11 +3864,40 @@ run() {
     stash_index_load
     remote_state_load
 
+    # ── the claim registry (#2033), read ONCE per pass ───────────────────────────────────────────
+    # Only needed when some record's branch names an issue number (i.e. a lane-owned record could be
+    # in play). A failure here is NOT an abort: it makes the lane-residue classes abstain, which is
+    # the fail-closed direction, while every other class keeps the verdicts it had before.
+    local need_claims=0
+    while IFS=$'\t' read -r p h b f; do
+        [ -n "$b" ] || continue
+        case "$b" in refs/heads/*) ;; *) continue ;; esac
+        [ -n "$(lane_issue_of "$b")" ] && { need_claims=1; break; }
+    done <<<"$WT_LIST"
+    if [ "$need_claims" = 1 ]; then
+        claims_load || log "CLAIMS abstain this pass: lane-residue classes will PRESERVE with reason=claim-unverified"
+    else
+        CLAIMS_STATE="na"
+    fi
+
+    # ⛔ THIS BLOCK IS `log_line`, NOT `say` (merge of #2033 × origin/main). The branch wrote these
+    # notes with a `say` command that DOES NOT EXIST in this file — the base had no `say` at all,
+    # `log_line` is the function (measured: `pi-reap-worktrees.sh: line 3883: say: command not
+    # found`, on every pass, on every Linux cell; on macOS it is worse, because `say` is the
+    # text-to-speech binary, so the operator notes were SPOKEN and never printed). origin/main had
+    # independently renamed the same notes to `log_line`, so the auto-merge left both copies and the
+    # broken one first. The surviving copy below is origin/main's block with the branch's text —
+    # including the one sentence that CONTRADICTS main's old wording ("branch refs are never deleted
+    # by this tool"), which #2033 overrides for the 0-ahead lane ref only, as the header records.
     log_line "rules: 1 live-holder KEEP · 2 dirty KEEP · 3 ancestor-of-main REMOVE · 4 PR-MERGED REMOVE ·"
     log_line "       5 PR-CLOSED KEEP(named) · 6 no-PR KEEP(named) · 7 younger-than-${REAP_WT_MIN_AGE_MINUTES}m KEEP ·"
+    log_line "       L lane residue (ghost-zero-ahead / abandoned-wip / interrupted-add) ·"
     log_line "       P pre-existing gates (main/self/locked/open-PR/revocable-ref). Every row prints rule= and proof=."
     log_line ""
-    log_line "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
+    log_line "note: \`git worktree remove\` deletes the CHECKOUT. A LANE-owned ref (feat/<N>-tm) that is 0 commits"
+    log_line "      ahead of main is ALSO deleted, by atomic compare-and-delete, because that ref is the residue the"
+    log_line "      collision pre-flight reads (#2033). Every other branch ref survives — \`git branch -D\` is never run,"
+    log_line "      and a --force removal only ever follows a VERIFIED backup (--reap-abandoned-wip / interrupted-add)."
     log_line "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
     log_line "      cache on SOME machines (APFS clonefile, or a hardlink) and is REAL on others"
     log_line "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
@@ -3107,7 +3909,7 @@ run() {
     log_line "      bash ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh --help   (#1851)"
     log_line ""
 
-    local elapsed=0 crumb verdict reason detail rc REMOTE_HOLDS_ROW=0
+    local elapsed=0 crumb verdict reason detail rc _bk _need_bk _bd _bdrc REMOTE_HOLDS_ROW=0
     # The budget clock starts HERE, not at `now`: see the BOUNDEDNESS note in
     # the header. `now` stays the single ageing reference for the whole pass.
     START_EPOCH="$(now_epoch)"
@@ -3170,12 +3972,69 @@ run() {
                     log_line "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
                     log "PRUNE-PENDING $p"
                 else
-                    remove_one "$p" "$h"; rc=$?
+                    # ── a DIRTY removal is BACKUP-FIRST, or it does not happen (#2033) ─────────
+                    # `abandoned-wip` and `interrupted-add` are the two classes whose tree is not
+                    # clean. The backup is not advisory: `backup_before_removal` VERIFIES every
+                    # component it wrote, and a verification failure preserves the record and counts
+                    # as a failure (exit 4) — nothing was removed, and the operator is told why.
+                    _bk=""; _need_bk=0
+                    case "$reason" in abandoned-wip|interrupted-add) _need_bk=1 ;; esac
+                    if [ "$_need_bk" = 1 ]; then
+                        if ! _bk="$(backup_before_removal "$p" "$b" "$h" "$reason")"; then
+                            log_line "         PRESERVED — the backup did NOT verify, so nothing was removed (reason=$reason; see $REAP_WT_LOG)"
+                            log "BACKUP-UNVERIFIED-KEEP $p reason=$reason"
+                            FAILED=$((FAILED + 1))
+                            continue
+                        fi
+                        log_line "         BACKUP verified -> $_bk"
+                        # ⛔ #2541's HOLDER RULE IS RE-ASSERTED ON THE FORCED PATH TOO, and that is the
+                        # merge's decision: `remove_one_forced` bypasses `remove_one` BY CONSTRUCTION
+                        # (no clean gate, no ephemeral pre-delete, `--force`), so without this call the
+                        # two lane-residue classes would have been the ONLY removal path in the file
+                        # with no re-check between classification and the fork — the exact window
+                        # holder_recheck exists to close (a demoted shell that got a child). It is
+                        # called AFTER the verified backup so a preserve here leaves the backup on
+                        # disk rather than deleting work, and rc=2 is the file's existing "the
+                        # checkout changed, it is PRESERVED" arm — never exit 4.
+                        if holder_recheck "$p" "$h"; then
+                            remove_one_forced "$p"; rc=$?
+                        else
+                            rc=2
+                        fi
+                    else
+                        remove_one "$p" "$h"; rc=$?
+                    fi
                     case "$rc" in
                         0)
-                            log_line "         REMOVED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p')"
+                            log_line "         REMOVED — checkout gone (refs=$(printf '%s' "$detail" | sed -n 's/.*refs=\([^ ]*\).*/\1/p'): the commits it held are on a surviving ref; a LANE-owned 0-ahead ref is CAS-deleted on its own line below)"
                             REMOVED=$((REMOVED + 1))
-                            log "REMOVED $p" ;;
+                            log "REMOVED $p"
+                            # ── the BRANCH half, which is what actually unblocks the issue ─────
+                            # Removing the checkout alone was this reaper's behaviour and it is the
+                            # defect (#2033): the retained 0-ahead branch is the surface the collision
+                            # pre-flight reads, so the issue stayed undispatchable for ever. The
+                            # delete re-proves, at this instant, that the ref is still lane-owned,
+                            # still 0 commits ahead, and still the ref we classified — and it is a
+                            # CAS (`update-ref -d <ref> <oid>`), never `branch -D`, never `--force`.
+                            _bd="$(delete_lane_branch "$b" "$h")"; _bdrc=$?
+                            case "$_bdrc" in
+                                0)
+                                    log_line "         BRANCH $b deleted (0 commits ahead; commits survive on $MAIN_REF)"
+                                    BRANCH_DELETED=$((BRANCH_DELETED + 1))
+                                    log "BRANCH-DELETED $b (checkout $p)" ;;
+                                *)
+                                    case "$_bd" in
+                                        not-a-lane-branch|moved-or-not-ancestor-of-main|no-oid|no-main-ref)
+                                            # A benign keep: not residue of ours, or it grew work.
+                                            log_line "         branch $b KEPT ($_bd)"
+                                            log "BRANCH-KEPT $b reason=$_bd" ;;
+                                        *)
+                                            log_line "         BRANCH KEPT — $b: $_bd (the issue it names stays blocked; see $REAP_WT_LOG)"
+                                            BRANCH_KEPT=$((BRANCH_KEPT + 1))
+                                            log "BRANCH-KEPT-FAILED $b reason=$_bd" ;;
+                                    esac ;;
+                            esac
+                            ;;
                         2)
                             # The removal-time re-check was not clean (F4): the
                             # checkout is PRESERVED. Nothing failed and nothing
@@ -3365,7 +4224,7 @@ run() {
     if [ "$MODE" = dry-run ]; then
         log_line "DRY-RUN — nothing removed. Re-run with --apply to remove the 'remove' rows."
     else
-        log_line "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED"
+        log_line "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED BRANCH_DELETED=$BRANCH_DELETED BRANCH_KEPT=$BRANCH_KEPT"
     fi
     summary_line
     print_footer "$(now_epoch)"
@@ -3374,6 +4233,11 @@ run() {
     # as a clean run (the "false PASS" failure mode). Deferrals stay 0: they are
     # the budget working, and the next pass re-classifies them.
     [ "$FAILED" -gt 0 ] && exit 4
+    # A kept BRANCH is a residue this pass was supposed to clear and did not: it leaves the issue
+    # named by the branch blocked on every box, so it is reported as a failure of the PASS (exit 4),
+    # not as a quiet footnote — the same "a removal that did not happen is not a pass" rule the
+    # FAILED counter exists for.
+    [ "$BRANCH_KEPT" -gt 0 ] && exit 4
     exit 0
 }
 
