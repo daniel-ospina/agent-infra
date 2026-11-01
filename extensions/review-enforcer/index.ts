@@ -3860,10 +3860,44 @@ export type RecordFileState =
    *  the one that was tried — distinct from "corrupt", which names a REAL file. */
   | { kind: "ambiguous"; files: string[] };
 
+/**
+ * #3175/#2374 — WHAT THE SHARED CROSS-BOX STORE HOLDS for this PR, as far as this
+ * box can see it.
+ *
+ * The registry is a LOCAL directory (`~/.pi/agent/reviews`), so every refusal was
+ * necessarily about THIS box — but the text said "no record" as if it were a fact
+ * about the PR. #2349 fixed the words; nothing yet said whether the record EXISTS
+ * elsewhere. It often does: `scripts/registry-sync.sh` (#2374) replicates records
+ * through `refs/reviews/<owner>-<repo>-<pr>` on the shared agent-infra remote, so a
+ * lane whose refusal says `crossbox=present` fetches one ref instead of paying for
+ * a second review — which is the whole measured cost (2026-11-01: ten-plus lanes
+ * dispatched at a queue of fully-attested PRs and produced zero merges, because
+ * "no record HERE" read as "never reviewed").
+ *
+ * ⛔ DIAGNOSTIC ONLY. No branch of any decision reads this. An absent record still
+ * refuses whatever the cross-box store holds — the gate's attestation is a LOCAL
+ * record bound to THIS head (#1224), and a fetched record is only usable once it is
+ * written into the local registry and head-bound there.
+ */
+export type CrossBoxRecordState =
+  | { kind: "present"; ref: string; store: string; scanned: number }
+  | { kind: "absent"; store: string; scanned: number }
+  /** Not "absent": the store could not be read, or this box holds no checkout that
+   *  can reach it. A failed READ is never reported as a negative fact (#2349). */
+  | { kind: "unmeasurable"; why: string };
+
 export interface ReviewRecordObservation {
   pr: number;
   repo: string | null;
   registryDir: string;
+  /** The BOX this gate read on (#3175). A registry is per-machine, so a refusal that
+   *  names no machine cannot be acted on: a lane must know whether to re-review here
+   *  or dispatch to the box that minted the record. Diagnostics only. */
+  host: string;
+  /** What the shared store holds for this PR (#2374). Defaults to `unmeasurable` —
+   *  the probe is OPT-IN and run only on the no-record path of a real refusal, so no
+   *  test and no healthy merge ever performs network I/O (see `observeReviewRecord`). */
+  crossBox: CrossBoxRecordState;
   /** For a repo-less read: the path GENERATOR, since no single file is tried. */
   qualifiedPath: string;
   legacyPath: string;
@@ -3917,13 +3951,29 @@ function observeRecordFile(path: string): { state: RecordFileState; rec: ReviewR
  *   • several repo-keyed candidates         → ambiguous, trusted by neither
  *   • a usable record                       → then the HEAD/DIFF question is live
  */
-export function observeReviewRecord(pr: number, repo?: string): ReviewRecordObservation {
+export function observeReviewRecord(
+  pr: number,
+  repo?: string,
+  /** `"probe"` asks for the cross-box store read (#2374). ONLY the tool_call hook
+   *  passes it, and only on the no-record path: `evaluateMergeGate` is a pure
+   *  function that performs no I/O, and the probe must never run inside it. Every
+   *  other caller (including every test) gets the default `unmeasurable` and stays
+   *  hermetic and offline. */
+  opts: { crossBox?: "probe" | CrossBoxRecordState } = {}
+): ReviewRecordObservation {
   const registryDir = reviewsDir();
   const legacyPath = reviewRecordFile(undefined, pr);
+  // `"probe"` is honoured at the END (`finishObservation`), once we know whether a
+  // local record was found — a present record needs no read of the shared store.
+  probeRequested = opts.crossBox === "probe";
   const obs: ReviewRecordObservation = {
     pr,
     repo: repo ?? null,
     registryDir,
+    host: boxName(),
+    crossBox: typeof opts.crossBox === "object" && opts.crossBox !== null
+      ? opts.crossBox
+      : { kind: "unmeasurable", why: "not probed on this call" },
     qualifiedPath: repo ? reviewRecordFile(repo, pr) : `${registryDir}/<owner>-<repo>-${pr}.json`,
     legacyPath,
     qualified: { kind: "absent" },
@@ -4009,8 +4059,163 @@ function finishObservation(obs: ReviewRecordObservation): ReviewRecordObservatio
     if (typeof obs.record.mint === "string") obs.mint = obs.record.mint;
     if (typeof obs.record.carried_from === "string") obs.carriedFrom = obs.record.carried_from;
   }
+  // #3175/#2374 — HONOUR THE `"probe"` OPT, on the no-record case only. This is the
+  // ONE place the cross-box store is read from a production path, and it is
+  // deliberately here rather than in `evaluateMergeGate`: the gate stays a pure
+  // function that performs no I/O, and a record that IS present never pays for a
+  // network read (there is nothing the text would add).
+  if (probeRequested && !obs.record) {
+    obs.crossBox = crossBoxRecordState(obs.repo ?? undefined, obs.pr);
+  }
   return obs;
 }
+
+/** The box name a refusal names (#3175). `os.hostname()` is the fleet's own
+ *  dispatch identity, so it is the value a lane can act on; a failure yields
+ *  `unknown` rather than an exception in a refusal path. */
+export function boxName(): string {
+  try {
+    return os.hostname() || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/** `~/.pi/agent/scripts/registry-sync.sh` (farmed) and the checkout copy (#2374). */
+export const REGISTRY_SYNC_SH = "~/.pi/agent/scripts/registry-sync.sh";
+
+export function registrySyncCommand(): string {
+  const parts = [`${REGISTRY_SYNC_SH} pull`];
+  const checkoutCopy = extensionRelativeScript("registry-sync.sh");
+  if (checkoutCopy) parts.push(`${checkoutCopy} pull`);
+  return parts.join("   |   ");
+}
+
+/** A sibling `scripts/<name>` of this extension's checkout, or null. Mirrors
+ *  `resolveDiffHashHelper`'s idiom: report a missing tool, never invent a path. */
+function extensionRelativeScript(name: string): string | null {
+  if (!EXTENSION_DIR) return null;
+  try {
+    const p = resolvePath(EXTENSION_DIR, "..", "..", "scripts", name);
+    return fs.existsSync(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The checkouts whose `refs/reviews/*` namespace the fleet may share (#2374):
+ *  `$AGENT_INFRA_PATH` and this extension's own checkout (where the farmed/sync
+ *  scripts point), PLUS the checkout the merge runs in — because `registry-sync.sh`'s
+ *  refs live on ONE repo's remote per key, and a tortoise PR's record is on the
+ *  tortoise remote, not agent-infra's (measured: agent-infra's store holds 3,668
+ *  refs and none of them for a `daniel-ospina-tortoise-*` key). Probing one store
+ *  would print a confident `absent` for a record that exists — the #2349 defect. */
+function registryStoreDirs(): string[] {
+  const candidates: string[] = [];
+  if (process.env.AGENT_INFRA_PATH) candidates.push(process.env.AGENT_INFRA_PATH);
+  if (EXTENSION_DIR) candidates.push(resolvePath(EXTENSION_DIR, "..", ".."));
+  candidates.push(process.cwd());
+  const stores: string[] = [];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(resolvePath(c, ".git")) && !stores.includes(c)) stores.push(c);
+    } catch {
+      /* unreadable candidate — try the next */
+    }
+  }
+  return stores;
+}
+
+/** One `ls-remote` result per store, reused for every refusal in this process.
+ *  Bounded and MEMOIZED: a few thousand refs is one cheap call, and a lane that
+ *  fetches the record then re-runs the merge must not keep reading a stale
+ *  "absent" (>60 s). */
+const CROSSBOX_MEMO_TTL_MS = 60_000;
+const crossBoxMemo = new Map<string, { at: number; refs: Set<string> | null; why: string | null }>();
+
+/**
+ * Read the shared store's `refs/reviews/*` listing — the ONE read that turns "no
+ * record on this box" into an actionable statement. Never throws, never long:
+ *
+ *   - bounded (6 s) and `try/catch` → `unmeasurable` with the reason, never `absent`;
+ *   - an EMPTY listing is also `unmeasurable`: it may be a remote that is not the
+ *     store at all, and claiming "no such record exists" from it would be a cause
+ *     this gate did not read;
+ *   - EVERY candidate store is probed, and a hit in ANY is `present`;
+ *   - no decision reads the result (see `CrossBoxRecordState`).
+ */
+export function crossBoxRecordState(repo: string | undefined, pr: number): CrossBoxRecordState {
+  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    return { kind: "unmeasurable", why: "repo context unresolved, so the store's key cannot be formed" };
+  }
+  const stores = registryStoreDirs();
+  if (stores.length === 0) {
+    return {
+      kind: "unmeasurable",
+      why: "no agent-infra checkout to read the shared store from (set AGENT_INFRA_PATH)",
+    };
+  }
+  const key = `${repo.replace("/", "-")}-${pr}`;
+  const ref = `refs/reviews/${key}`;
+  const now = Date.now();
+  const whys: string[] = [];
+  let scannedTotal = 0;
+  let scannedAny = false;
+  for (const store of stores) {
+    let entry = crossBoxMemo.get(store);
+    if (!entry || now - entry.at > CROSSBOX_MEMO_TTL_MS) {
+      let refs: Set<string> | null = null;
+      let why: string | null = null;
+      try {
+        // execFileSync with an argv array: no value here can be re-parsed as shell syntax.
+        const out = execFileSync("git", ["-C", store, "ls-remote", "--refs", "origin", "refs/reviews/*"], {
+          timeout: 6000,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        refs = new Set(
+          out
+            .split("\n")
+            .map((l) => l.split("\t")[1])
+            .filter((r): r is string => typeof r === "string" && r.startsWith("refs/reviews/"))
+        );
+        if (refs.size === 0) {
+          refs = null;
+          why = `${store}: \`origin\` lists no refs/reviews/* (#2374)`;
+        }
+      } catch (e) {
+        why = `${store}: ${String((e as Error)?.message ?? e).slice(0, 60)}`;
+      }
+      entry = { at: now, refs, why };
+      crossBoxMemo.set(store, entry);
+    }
+    if (!entry.refs) {
+      whys.push(entry.why ?? `${store}: unreadable`);
+      continue;
+    }
+    scannedAny = true;
+    scannedTotal += entry.refs.size;
+    if (entry.refs.has(ref)) return { kind: "present", ref, store, scanned: scannedTotal };
+  }
+  if (!scannedAny) {
+    return { kind: "unmeasurable", why: whys.join("; ").slice(0, 160) || "no store could be read" };
+  }
+  return { kind: "absent", store: stores.join(", "), scanned: scannedTotal };
+}
+
+/** The one-line, machine-readable state a lane can branch on (#3175): it carries the
+ *  box, the registry path, the per-machine fact, and the cross-box verdict. */
+export function recordAbsentToken(obs: ReviewRecordObservation): string {
+  const cb =
+    obs.crossBox.kind === "present" ? "present" : obs.crossBox.kind === "absent" ? "absent" : "unmeasurable";
+  return `RECORD-ABSENT(host=${obs.host}; registry=${obs.registryDir}; per-machine; crossbox=${cb})`;
+}
+
+/** Set by `observeReviewRecord` for the duration of one observation, so
+ *  `finishObservation` (every return path) can honour `crossBox: "probe"` without
+ *  threading an argument through four call sites. Module-level because the observer
+ *  is synchronous: one observation is in flight at a time, by construction. */
+let probeRequested = false;
 
 /**
  * Which of the four "no usable record" states the observation is in.
@@ -4064,6 +4269,24 @@ export function describeRecordMiss(
     lines.push("       NO file exists at either path ON THIS BOX. The registry is PER-MACHINE, so this is");
     lines.push("       \"not visible here\" — NOT necessarily \"no review happened\": a record minted on another box");
     lines.push("       (or under another HOME) is invisible to this gate, and this box sees only its own.");
+    // #3175/#2374 — SAY WHICH BOX, AND WHETHER THE SHARED STORE HAS IT. The prose
+    // above is only actionable once a lane can tell the two situations APART, and
+    // the measured cost of not telling them apart is a re-review per lane per PR.
+    lines.push(`     box        : ${observation.host} (registry ${observation.registryDir} — per-machine)`);
+    lines.push(`     cross-box  : ${crossBoxLine(observation.crossBox)}`);
+    lines.push(`     ${recordAbsentToken(observation)}`);
+    if (observation.crossBox.kind === "present") {
+      lines.push("     → NEXT ACTION: fetch it from the shared store and RE-RUN the merge. This is a one-command");
+      lines.push(`       fix — ${registrySyncCommand()}`);
+      lines.push("       A review dispatched here would be paid for twice for the same head.");
+    } else if (observation.crossBox.kind === "absent") {
+      lines.push("     → NEXT ACTION: the shared store has no record for this PR either, so a review HERE is");
+      lines.push("       genuinely needed — dispatch it and record it at the head you are merging.");
+    } else {
+      lines.push("     → NEXT ACTION: whether another box holds it could not be read (see cross-box above), so");
+      lines.push(`       try the store first — ${registrySyncCommand()}`);
+      lines.push("       — and only then pay for a review here.");
+    }
     lines.push("     → remedy (a): if the review ran elsewhere, copy its <owner>-<repo>-<pr>.json into the repo-keyed");
     lines.push("       path above. → remedy (b): re-record here at the head you are merging:");
     lines.push(`       ${recordCmd}`);
@@ -4098,6 +4321,18 @@ export function recordSourcePath(obs: ReviewRecordObservation): string {
   return obs.record ? obs.legacyPath : obs.qualifiedPath;
 }
 
+/** One line describing what the SHARED store holds (#2374/#3175). */
+export function crossBoxLine(cb: CrossBoxRecordState): string {
+  switch (cb.kind) {
+    case "present":
+      return `PRESENT at ${cb.ref} — the review ran on another box; fetch it, do not re-review`;
+    case "absent":
+      return `ABSENT — the shared store (${cb.scanned} refs) holds no ref for this PR`;
+    default:
+      return `UNMEASURABLE (${cb.why}) — nothing is claimed about other boxes`;
+  }
+}
+
 /** One line per filesystem state — the "what I read" block of a refusal. */
 export function describeRecordObservation(obs: ReviewRecordObservation, indent = "     "): string[] {
   const fileState = (s: RecordFileState): string =>
@@ -4111,7 +4346,9 @@ export function describeRecordObservation(obs: ReviewRecordObservation, indent =
             ? `AMBIGUOUS — ${s.files.length} repo-keyed files match (${s.files.join(", ")}), so no single file is the one tried`
             : `PRESENT but UNREADABLE (${s.reason}) — treated as absent (fail-closed)`;
   const lines = [
+    `${indent}host         : ${obs.host} — this registry is a LOCAL store on THIS box`,
     `${indent}registry dir : ${obs.registryDir}`,
+    `${indent}cross-box    : ${crossBoxLine(obs.crossBox)}`,
     `${indent}repo-keyed   : ${obs.qualifiedPath} — ${fileState(obs.qualified)}`,
     `${indent}legacy       : ${obs.legacyPath} — ${fileState(obs.legacy)}`,
   ];
@@ -7476,7 +7713,14 @@ export default function (pi: ExtensionAPI) {
         // #2349: the registry observation, taken ONCE and passed to the gate as a
         // MESSAGE INPUT. `record` above is still what `readReviewRecord` returned —
         // the observation is never consulted for a decision.
-        const recordObservation = observeReviewRecord(prNumber, envRepo ?? undefined);
+        const recordObservation = observeReviewRecord(
+          prNumber,
+          envRepo ?? undefined,
+          // #3175/#2374: the cross-box store is read HERE — the I/O site — never inside
+          // the pure `evaluateMergeGate`, and only when there is no local record, which
+          // is the only case whose text needs it. Bounded (6 s), memoized, never throws.
+          record ? {} : { crossBox: "probe" }
+        );
         // #285 Fix C: the no-record block message is shape-aware (task
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(

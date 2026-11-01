@@ -106,6 +106,11 @@ import {
   observeReviewRecord,
   describeRecordObservation,
   describeRecordMiss,
+  // #3175/#2374 — the box identity and the cross-box store line the absent-record
+  // refusal now carries. Same rule as the #2349 imports above: message inputs only.
+  boxName,
+  recordAbsentToken,
+  crossBoxRecordState,
   classifyRecordMissState,
   describeCarryConjuncts,
   describeDispatchFloorRead,
@@ -10103,6 +10108,82 @@ testAsync("a report write is allowed at 0 dispatches while every shipping write 
       }
     });
   });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// #3175 / #2374 — an absent record must say WHERE it looked, ON WHICH BOX, and
+// whether the SHARED store holds the record. These assert on the DECISION PATH
+// (`evaluateMergeGate`, the function the tool_call hook calls and branches on),
+// for the reason #2349 wrote down: a message-only assertion cannot tell a gate
+// from a greeting.
+// ══════════════════════════════════════════════════════════════════════════
+const CROSSBOX_REF_2349 = `refs/reviews/owner-repo-${PR_2349}`;
+
+// ── DIRECTION (a): a MISSING record still REFUSES, and the refusal is actionable ──
+test("#3175 a — no record + the store HAS it: still BLOCKS, and says box, registry, per-machine, crossbox=present, and the fetch command", () => {
+  withTempHomeSync(() => {
+    const obs = observeReviewRecord(PR_2349, "owner/repo", {
+      crossBox: { kind: "present", ref: CROSSBOX_REF_2349, store: "/tmp/agent-infra", scanned: 12 },
+    });
+    const r = evaluateMergeGate(
+      PR_2349, null, HEAD_2349, { source: "flag", repo: "owner/repo" }, false, null, null, obs
+    );
+    // ⛔ THE DECISION IS UNCHANGED: a cross-box hit is NOT a licence to merge. The
+    // attestation this gate trusts is a LOCAL record bound to THIS head (#1224).
+    equal(r.status, "block", "crossbox=present must NOT make an absent local record mergeable");
+    const reason = (r as any).reason as string;
+    ok(reason.includes(boxName()), `names the BOX it read on (${boxName()})`);
+    ok(reason.includes(obs.registryDir), "names the registry directory it read");
+    ok(reason.includes("per-machine"), "states that the registry is per-machine");
+    ok(
+      reason.includes(`RECORD-ABSENT(host=${boxName()}; registry=${obs.registryDir}; per-machine; crossbox=present)`),
+      `carries the machine-readable state a lane can branch on:\n${recordAbsentToken(obs)}`
+    );
+    ok(reason.includes(CROSSBOX_REF_2349), "names the exact ref the record lives at");
+    ok(reason.includes("registry-sync.sh pull"), "gives a RUNNABLE fetch command, not prose");
+    ok(reason.includes("do not re-review"), "says which of the two next actions is correct");
+  });
+});
+
+// ── DIRECTION (b): a PRESENT record at the live head still LANDS ──
+test("#3175 b — a record at the LIVE head still ALLOWS, and the cross-box state cannot change that", () => {
+  // ⛔ The guard must not become "refuse everything": the same gate that refuses an
+  // absent record must still land a head-bound one. Asserted with the cross-box state
+  // on its WORST setting (unmeasurable) so a probe failure cannot add a block.
+  const r = evaluateMergeGate(
+    138, cleanRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, null, null,
+    observeReviewRecord(138, "owner/repo", { crossBox: { kind: "unmeasurable", why: "probe failed" } })
+  );
+  equal(r.status, "allow", "a present record at the live head still lands");
+});
+
+// ── DIRECTION (c): the probe cannot invent a fact, and cannot gate anything ──
+test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed store is 'unmeasurable', never 'absent'", () => {
+  const r = evaluateMergeGate(
+    138, cleanRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, null, null,
+    observeReviewRecord(138, "owner/repo", { crossBox: { kind: "absent", store: "/tmp/agent-infra", scanned: 3 } })
+  );
+  equal(r.status, "allow", "crossbox=absent must not block a head-bound local record");
+  // A key that cannot be formed is NOT a negative answer about other boxes: the #2349
+  // rule ("never print a cause the gate did not read") applies to the store too.
+  const noRepo = crossBoxRecordState(undefined, PR_2349);
+  equal(noRepo.kind, "unmeasurable", "an unresolved repo yields 'unmeasurable', not 'absent'");
+  // ⛔ THE WIRING, not the formatter (fresh review, P0): `{crossBox: "probe"}` must
+  // REACH `crossBoxRecordState`. Asserted with an unresolvable repo, which returns
+  // before any network read — so this proves the opt is honoured and stays hermetic.
+  const probed = observeReviewRecord(PR_2349, undefined, { crossBox: "probe" });
+  equal(probed.record, null, "no record in the empty temp home");
+  equal(probed.crossBox.kind, "unmeasurable", "the probe ran and reported");
+  ok(
+    probed.crossBox.kind === "unmeasurable" && probed.crossBox.why.includes("repo context unresolved"),
+    `the \`probe\` opt is HONOURED — the reason names the real read, not 'not probed': ${JSON.stringify(probed.crossBox)}`
+  );
+  const messaging = observeReviewRecord(PR_2349, "owner/repo");
+  equal(messaging.crossBox.kind, "unmeasurable", "the default observation never probes (hermetic, no network)");
+  ok(
+    describeRecordMiss(messaging, PR_2349, "owner/repo").join("\n").includes("crossbox=unmeasurable"),
+    "an unprobed observation says so rather than claiming absence"
+  );
 });
 
 // ── Summary ───────────────────────────────────────────
