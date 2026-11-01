@@ -51,7 +51,8 @@
 #   (s7) `--check` does NOT fail a clean shallow scout — `cloud-cell-bringup.sh` DIES on a non-zero
 #        `--check`, so that second copy of the comparison was a cell that could not START;
 #   (s8) NON-VACUITY for (s7): the old `--check` arm still FAILS the same tree.
-#   (h) HERMETICITY: an ambient exported `$OR`/`OR_OPERATOR_DECLARED` does not reach the pass, and the
+#   (h) HERMETICITY: ambient `$OR` AND `OR_OPERATOR_DECLARED` (both exported into the suite, so a drift
+#       in either clear entry reddens it) do not reach the pass, and the
 #       record carries no resolve-repo refusal — with a positive control that a DECLARED `$OR` handed to
 #       the invocation IS still refused (rc=3);
 #   (h2) the `--check` twin of (h), with the same two-way control;
@@ -206,7 +207,8 @@ mk_shallow_case() {
 # (`git init -q --bare "$D/origin.git"`), and the shipped `resolve_repo` tolerates a local-path origin
 # only while the queue target is UNDECLARED (`OR_DECLARED=0`) — a DECLARED $OR cannot be proven by a
 # path, so it refuses with rc=3 BEFORE the provision stage runs. This suite cleared every other
-# ambient knob but NOT `$OR`, so on a box whose shell exports one (a cell's keys.env does; measured
+# ambient knob but NOT `$OR` (nor `OR_OPERATOR_DECLARED`, which forces the same refusal on its own), so
+# on a box whose shell exports one (a cell's keys.env does; measured
 # on this box: `OR=daniel-ospina/tortoise`) most of this suite went red for a reason that has
 # nothing to do with provisioning:
 #
@@ -222,10 +224,11 @@ mk_shallow_case() {
 # The `(h)` arms below are the regression test for the clear list itself.
 OUT=""; RC=0
 # ⛔ THE CLEAR LIST IS WRITTEN ONCE, HERE (review cycle 1, P2). It was two verbatim copies — the shape
-# that already cost this file 38 arms when one copy drifted from `refresh-scout.test.sh`'s. A new
-# ambient knob goes in this array and nowhere else. `SCOUT_LOCK_STALE_SECS`/`OR_OPERATOR_DECLARED` are
-# cleared here and set per arm (`rp "$D" "" SCOUT_LOCK_STALE_SECS=5m`) because GNU `env` applies a
-# KEY=VAL after `-u KEY`, so the arm's own value is the one the pass sees.
+# that already cost this file most of its reds when one copy drifted from `refresh-scout.test.sh`'s. A new
+# ambient knob goes in this array and nowhere else. `SCOUT_LOCK_STALE_SECS` is set per arm
+# (`rp "$D" "" SCOUT_LOCK_STALE_SECS=5m`) because GNU `env` applies a KEY=VAL after `-u KEY`, so the
+# arm's own value is the one the pass sees; `OR_OPERATOR_DECLARED` is exported by `(h)` into the
+# suite's own environment precisely so its clear entry is load-bearing.
 RP_CLEAR=(-u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS
           -u SCOUT_LOCK_STALE_SECS -u OR -u OR_OPERATOR_DECLARED)
 rp() {
@@ -651,8 +654,9 @@ fi
 # shipped script at all: `rp`/`rpc` cleared every ambient provisioning knob EXCEPT `$OR`, and every
 # fixtures that existed when it was measured all prove their target with a bare LOCAL origin — which
 # `resolve_repo` refuses the moment `$OR` is DECLARED, before the provision stage runs. (The
-# `(h3)`/`(h4*)` fixtures below came later and spell their origin differently; `insteadOf` keeps every
-# one of them off the network.) Measured on a cell whose shell exports `OR`:
+# `(h3)`/`(h4*)` fixtures below came later and spell their origin as a URL; the `(h4*)`/`(h4d)` rows
+# redirect that transport with `insteadOf`, while the `(h3)` rows never reach a fetch at all — the
+# resolver refuses above it.) Measured on a cell whose shell exports `OR`:
 # most of the suite red, each recording the EXIT TRAP's `the failing step recorded no cause` because the
 # refusal happened above `scout_sync` — which is why the cluster read as a cause-record defect.
 # The arm EXPORTS the ambient value into the suite's own environment (not into the pass), so it fails
@@ -662,8 +666,12 @@ fi
 # still REFUSE (rc 3) — the deliberate `resolve_repo` behaviour that made the ambient leak fatal.
 mk_case hermetic
 AMBIENT_OR_SAVE="${OR:-}"; AMBIENT_DECL_SAVE="${OR_OPERATOR_DECLARED:-}"
-export OR="daniel-ospina/tortoise"
-unset OR_OPERATOR_DECLARED 2>/dev/null || true
+# ⛔ BOTH KNOBS, NOT ONE (review cycle 12, P2): the marker `OR_OPERATOR_DECLARED` alone forces the same
+# refusal — `refresh-candidates.sh:27-31` reads it as "the operator named the target", and the local-path
+# fixture then cannot prove it — but this arm used to UNSET the marker, so dropping
+# `-u OR_OPERATOR_DECLARED` from `RP_CLEAR` left every `(h)` row green. Exported now, so a drift in
+# either entry reddens the arm.
+export OR="daniel-ospina/tortoise" OR_OPERATOR_DECLARED=1
 rp "$D"
 ck "(h) an AMBIENT exported \$OR does not reach the pass (rc=$RC — it must proceed)" "$([ "$RC" -eq 0 ]; echo $?)"
 # ⛔ THE RECORD ASSERTION READS THE MARKER THE RECORD ACTUALLY CARRIES (review cycle 1, P1-ish). It used
