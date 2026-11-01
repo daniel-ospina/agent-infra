@@ -124,8 +124,16 @@ is_harness_unit() {
 #   path=/bin/bash ; argv[]=/bin/bash /abs/script [args]        (bash-wrapped -> the 2nd argv)
 #   path=/abs/script ; argv[]=/abs/script [args]                (direct script -> the path= value)
 # A direct BINARY ExecStart (argv[]=/usr/bin/foo --flag) has no pinned script and is not judged.
+#
+# ⛔ THE READ IS SEPARATED FROM ITS DECLARATION (#2096, `discarded-status`). `local v="$(…)"` leaves `$?`
+# holding the DECLARATION builtin's status, so a `systemctl` that could not run and a unit that genuinely
+# has no ExecStart both produced a `v` of "" — every unit then read as "not judgeable" and the surface
+# was reported CLEAN over a read that never happened. Assigning on its own line makes the failure
+# reachable, and an unreadable read is propagated (rc 2) instead of being folded into "nothing pinned".
 execstart_path() {
-  local v="$("$SYSTEMCTL_BIN" show "$1" -p ExecStart --value 2>/dev/null)"
+  local v rc
+  v="$("$SYSTEMCTL_BIN" show "$1" -p ExecStart --value 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 2   # the unit's ExecStart could not be READ — not the same as "none"
   local p=""
   # Bash-wrapped: the token following `argv[]=/bin/bash` (or /bin/sh) is the script.
   p="$(printf '%s' "$v" | awk '
@@ -150,7 +158,10 @@ report_units() {
     name="$(printf '%s' "$line" | awk '{print $1}')"
     [ -n "$name" ] || continue
     is_harness_unit "$name" || continue
-    path="$(execstart_path "$name")"
+    # ⛔ AN UNREADABLE ExecStart DEGRADES THE SURFACE, it does not skip the unit: `|| return 1` is what
+    # the caller already turns into UNIT_READ=0 (and `no verdict` when tmux is unreadable too), so a
+    # systemctl that stops answering mid-loop can no longer be reported as "no orphans".
+    path="$(execstart_path "$name")" || return 1
     [ -n "$path" ] || continue   # no pinned script path: not judgeable, not an orphan here
     if [ ! -e "$path" ]; then
       printf 'orphan:kind=unit name=%s path=%s prs=- reason=missing\n' "$name" "$path"

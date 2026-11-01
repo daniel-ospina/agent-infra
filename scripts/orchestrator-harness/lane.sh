@@ -96,7 +96,17 @@ command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_a
 # defects that produced from wrapping it). Fail LOUD if it is missing — an unsourced snippet would silently
 # restore the 7-second death this exists to remove.
 [ -r "$SELF/lane-env.sh" ] || { echo "[lane $N] FATAL: $SELF/lane-env.sh missing — refusing to start a lane whose credentials nothing sourced (#3060)" >&2; exit 78; }
+# ⛔ THE TARGET IS AN ARGUMENT, AND SOURCING AN ENV FILE MUST NOT BE ABLE TO REPLACE IT (measured
+# 2026-11-01). `keys.env` on a cell carries `export OR=<owner/name>` (it is the CONTROLLER's default,
+# written for loops that mean it). Sourced here as a top-level snippet, that line silently overwrote the
+# target this lane was DISPATCHED for — so `repo_target_assert` compared the worktree against the
+# ENV FILE's repo, and a correct dispatch was refused with `reason=slug-mismatch` naming a repo nobody
+# asked for. The gate exists because the worktree must be the repo that was ASKED FOR; an ambient `OR`
+# is exactly the "default two programs invented" #1974 removed. Save the parsed target across the
+# sourcing and restore it, so the argument keeps the last word.
+LANE_TARGET_ARG="$OR"
 LANE_ENV_LOG="$O/logs/lane-$N.log" LANE_ENV_LABEL="lane $N" . "$SELF/lane-env.sh"
+OR="$LANE_TARGET_ARG"
 
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
