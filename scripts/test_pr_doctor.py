@@ -1870,12 +1870,18 @@ def test_fix_and_review_budgets_are_separate(monkeypatch):
 # distinguish the defect: a worker that exits at once closes its own end of the pipe, so even a
 # captured pre-fix call returned promptly for that shape.
 _WORKERS = {
+    # ⛔ THE WORKER MUST OUTLIVE THE DISPATCHER'S START WINDOW BY A WIDE MARGIN (agent-infra#3161).
+    # `nonblocking-dispatch.sh` now sleeps a bounded settle window before it certifies a launch, so a
+    # worker that dies INSIDE the window is (correctly) reported `NOT STARTED` and `dispatch()` never
+    # reaches the promptness question at all. 12 s against the 2 s window pinned in `_wire_dispatch`
+    # keeps "the call ended with the dispatcher" the thing under test, and keeps the bound below far
+    # from the worker's own lifetime.
     # silent for its whole life
-    "sleeps past the window and writes nothing": "run_agent() { sleep 6; return 0; }\n",
+    "sleeps past the window and writes nothing": "run_agent() { sleep 12; return 0; }\n",
     # writes IMMEDIATELY (the shape where a caller with a pipe receives output first) and runs on
-    "writes at once, then sleeps": 'run_agent() { echo starting; sleep 6; return 0; }\n',
+    "writes at once, then sleeps": 'run_agent() { echo starting; sleep 12; return 0; }\n',
     # writes to BOTH streams at the end
-    "sleeps, then writes to stdout and stderr": 'run_agent() { sleep 6; echo OUT; echo ERR >&2; }\n',
+    "sleeps, then writes to stdout and stderr": 'run_agent() { sleep 12; echo OUT; echo ERR >&2; }\n',
 }
 
 
@@ -1920,6 +1926,13 @@ def _wire_dispatch(monkeypatch, tmp_path, d, wt):
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setenv("O", str(d))
+    # ⛔ THE START WINDOW IS PINNED TO ITS FLOOR FOR THE SUITE (agent-infra#3161). The dispatcher now
+    # spends `NB_START_SETTLE` (default 5 s) PROVING a lane became a process before it reports a
+    # launch; at the default every dispatch test in this file would carry 5 s of wall clock the test is
+    # not about, and the promptness arm could no longer tell "waited for the window" from "waited for
+    # the worker". 2 is the documented floor, so this exercises the real assertion at its cheapest --
+    # the DEFAULT is covered by `nonblocking-dispatch.test.sh`, which is the launcher's own suite.
+    monkeypatch.setenv("NB_START_SETTLE", "2")
 
 
 def _stub_the_spawn(monkeypatch, rc_ok=False):
@@ -1951,8 +1964,14 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
 
     PRE-FIX (`sh_err(spawn_argv(...), timeout=120)` with `capture_output=True`): `subprocess.run`
     blocks on EOF of the capture pipe, and the worker subshell inherits it -- so this call lasted
-    the worker's whole life. For the sleeping worker that is 6 s here and TimeoutExpired at
+    the worker's whole life. For the sleeping worker that is 12 s here and TimeoutExpired at
     timeout=120 in production, which returned rc=-1, logged `FAIL`, and wrote NO state row.
+
+    ⛔ AND THE CALL MUST NOT RETURN *BEFORE* THE DISPATCHER'S OWN START ASSERTION (agent-infra#3161).
+    "Prompt" means it stopped waiting for the WORKER, never that it may skip proving a lane started:
+    a dispatch that returns before `NB_START_SETTLE` has elapsed is the false `launched` this pair of
+    bounds exists to keep out. Both bounds are load-bearing and they are the same pair
+    `test_nonblocking_dispatch_routes_through_run_agent` uses.
     """
     d, wt = _orch(tmp_path, _WORKERS[label])
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
@@ -1960,7 +1979,11 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
     ok, detail, record = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
     elapsed = time.monotonic() - t0
     assert ok is True and record is True, (ok, detail)
-    assert elapsed < 3.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
+    # Lower bound: the start assertion is NOT optional -- the window (2 s) elapses before `launched`.
+    assert elapsed >= 2.0, ("dispatch returned in %.2fs, before the dispatcher's own start window -- "
+                           "the launch was reported without a positive start assertion" % elapsed)
+    # Upper bound: the worker (12 s) must NOT be waited on.
+    assert elapsed < 6.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
 
 
 def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, tmp_path):

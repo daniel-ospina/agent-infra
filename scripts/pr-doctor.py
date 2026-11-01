@@ -4254,6 +4254,24 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     _, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=SPAWN_CALL_TIMEOUT_S,
                            cwd=HOME, env=_orch_env(), capture=False)
     if rc != 0:
+        # ⛔ A GATE REFUSAL NOW ARRIVES ON THE FOREGROUND EXIT CODE, AND IT MUST KEEP ITS CLASS
+        # (agent-infra#3161, measured 2026-11-01). `nonblocking-dispatch.sh` used to exit 0 for every
+        # launch -- including one whose worker the gate refused -- so the refusal existed only in
+        # `$O/bg/<name>.rc` and `_confirm()` read it. Its start assertion now exits 75 ITSELF when no
+        # lane becomes a process (`FAILED EARLY` carries the worker's own 75; `NOT STARTED` proves
+        # nothing ran at all), which makes `rc != 0` true for a refusal that consumed NOTHING.
+        # Collapsing that into the chain-failure branch below is not a cosmetic mislabel: measured, a
+        # load refusal (which clears by itself) was reported as
+        # `EXIT rc=3 -- VERDICT=UNDELIVERED next=repair-chain` -- the one verdict that says a human
+        # must repair the dispatch chain -- and, being `record=False` on both paths, it also lost the
+        # distinction the assertion was added to create. So ask the SAME durable artifact `_confirm()`
+        # asks, with the SAME predicate (`gate_refused`: a GATE_REFUSAL code AND the gate's own marker
+        # in the worker log AND no `[timeout] agent pid=` line) -- never a second definition here.
+        code = read_rc(bg_path(name, "rc"))
+        if code is not None and gate_refused(name, code):
+            detail = "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
+            log("spawn %s: %s -- no agent started, nothing consumed" % (name, detail))
+            return False, detail, False
         # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh or a missing
         # brief-gate.sh), rc=80 (THE BRIEF WAS REFUSED by the research-first gate -- see
         # agent-infra#2258: the fix is in `brief()`/`brief-gate.sh`, not in the box), rc=2 (no
@@ -4261,7 +4279,10 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # the message is the only thing that names which one it is. 80 is deliberately NOT in
         # GATE_REFUSALS: that tuple is the 75/77 LOAD/DISK class written by run_agent into a
         # backgrounded worker's `.rc`, whereas 80 comes back on the FOREGROUND call and no worker
-        # ever exists to have an `.rc`.
+        # ever exists to have an `.rc`. A dispatcher 75 that the DURABLE EVIDENCE above does not
+        # certify as a gate refusal is the third class below -- the assertion PROVED no lane is
+        # running (`NOT STARTED:`), which is a real chain defect and is reported loudly, not waited
+        # out; it is still `record=False` because it consumed nothing.
         detail = "rc=%s: %s" % (rc, (errout or "").strip()
                                 or "the dispatcher exited non-zero with no stderr")
         log("spawn %s -> %s: FAIL %s" % (name, wt, detail[:200]))
