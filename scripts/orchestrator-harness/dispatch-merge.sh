@@ -142,6 +142,23 @@ done
 for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_launcher_why wt_count; do
   command -v "$_wt_v" >/dev/null 2>&1 || { echo "dispatch-merge: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_close/wt_launcher/wt_launcher_why/wt_count) — refusing to dispatch lanes that cannot be started or stopped; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"; exit 78; }
 done
+# ── the worktree/branch lifecycle (#2033) ─────────────────────────────────────────────────────
+# ⛔ SOURCED, NOT RE-IMPLEMENTED. Every lane worktree is created through `wt_provision`, which either
+# leaves a USABLE checkout or NOTHING; the old inline `git worktree add … || skip` left a branch (and
+# a half-materialised directory) behind on failure, and the collision pre-flight counts exactly those
+# two surfaces as in-flight work — so one failed add made a FREE issue permanently undispatchable.
+# The helper lives beside this script so it is seeded into $O by the same copy that seeds this file.
+# A missing helper is FATAL (78): continuing would create worktrees whose rollback does not exist,
+# which is the very leak this change removes.
+WTL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wt-lifecycle.sh"
+# shellcheck source=/dev/null
+. "$WTL" || { echo "dispatch-merge: FATAL: $WTL is missing — refusing to create lane worktrees without their rollback (a failed add would leave a branch behind, #2033). Fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >&2; exit 78; }
+
+# ⛔ TWO MODULES, ONE `wt_` NAMESPACE, AND NO SHARED NAME — for now. `worker-terminal.sh` and
+# `wt-lifecycle.sh` both prefix their verbs `wt_`, so a future addition to either can silently SHADOW
+# the other (the second `wt_foo` wins, with no error). The verb lists are pinned against each other
+# by `wt-lifecycle.test.sh`'s L9 arm, which reds when the two verb sets intersect — run it before
+# adding a verb to either module.
 cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every claim in this batch (no lane and no chain can start here)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done
   drop_dispatched_rows "$@"
@@ -261,20 +278,33 @@ for N in "$@"; do
   # Issue numbers come from the GitHub API via candidates.txt; never let one reach a shell string.
   case "${N:-}" in ''|*[!0-9]*) echo "#$N: SKIPPED (non-numeric issue id)"; continue ;; esac
   WT="tm-$N"; BR="feat/$N-tm"
-  # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative
-  # under `pipefail` would send this lane down the `worktree add` path, fail on the
-  # existing worktree, and silently SKIP the issue (#864).
-  wt_registered=0
-  case "$(git worktree list 2>/dev/null || true)" in *"/$WT "*) wt_registered=1 ;; esac
-  if [ "$wt_registered" -eq 0 ]; then
-    git worktree add ".worktrees/$WT" -b "$BR" origin/main >/dev/null 2>&1 \
-      || { echo "#$N: worktree add failed (branch exists?) — skipping"; release_issue_claim_unspawned "$N"; continue; }
-  fi
+  # ── create the lane's worktree, or leave NOTHING behind (#2033) ──────────────────────────────
+  # This used to be: probe `worktree list` for the directory name, then `git worktree add -b …`.
+  # Three failure modes of that shape, all measured:
+  #   1. an add killed mid-checkout leaves the branch (0 commits ahead) + a registered, LOCKED,
+  #      half-materialised directory — the `worktree list` probe then said "already there", so the
+  #      lane was spawned INTO the partial checkout, and the reaper preserved it for ever (a partial
+  #      tree reads as `dirty` — deleted files — and its record reads as `locked`);
+  #   2. a leftover branch with 0 commits (the pre-flight residue) made `add -b` fail with "branch
+  #      exists", and the issue was skipped on every box, for ever;
+  #   3. the directory-name probe tested the NAME, not the branch, so a worktree of another branch
+  #      at the same path read as "already provisioned".
+  # `wt_provision` answers all three: it repairs an interrupted add, deletes a 0-ahead ghost branch
+  # by CAS, ATTACHES an existing branch that holds commits (resume, never delete), and rolls back to
+  # a verified empty state if the add fails.
+  wt_provision "$REPO" ".worktrees/$WT" "$BR" origin/main
+  _wt_rc=$?
+  case "$_wt_rc" in
+    0) echo "#$N: worktree ok — $WT_RESULT" ;;
+    *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; continue ;;
+  esac
   WT_ABS="$REPO_ABS/.worktrees/$WT"
   # ── THE POST-BUILD ASSERTION (agent-infra#2724/#2694) ───────────────────────────────────────
   # The worktree EXISTS. Read its own origin and checkout identity; if they are not the target, the
   # lane would do its whole run in the wrong repository and every downstream gate (review, rail,
   # attestation) would certify it perfectly. Refuse, release the claim, and record the line.
+  # ⛔ `wt_provision` PROVING the checkout is usable is NOT the same proof: it checks the branch
+  # identity, not the REPOSITORY the checkout belongs to. Both arms are required.
   LANE_REPO_LINE="$(repo_target_assert "lane #$N" "$WT_ABS" "$OR" "$REPO_ABS")"; LANE_REPO_RC=$?
   LANE_BRANCH_LINE="$(repo_target_branch_assert "lane #$N" "$WT_ABS" "$BR" "$OR")"; LANE_BRANCH_RC=$?
   printf '%s\n%s\n' "$LANE_REPO_LINE" "$LANE_BRANCH_LINE" | tee -a "$O/logs/lane-$N.log"
@@ -353,6 +383,19 @@ for N in "$@"; do
     else
       echo "#$N: lane-$N stopped — releasing the issue claim"
       release_issue_claim_unspawned "$N"
+      # ── and take its EMPTY worktree back (#2033) ─────────────────────────────────────────────
+      # The lane is confirmed gone and no chain will ever look at this checkout, so an empty one is
+      # residue by definition — and residue is what makes the issue undispatchable everywhere.
+      # `wt_reap_if_empty` is the SAME function the lane's own EXIT trap runs, and it refuses on
+      # anything that could be work: commits ahead, a pushed branch, a dirty tree, a live holder.
+      # A lane that pushed and opened a PR within seconds keeps its worktree (the branch is ahead).
+      wt_reap_if_empty "$REPO" ".worktrees/$WT" "$BR" "dispatch #$N"
+      _rp=$?
+      case "$_rp" in
+        0) echo "#$N: $WT_RESULT" ;;
+        1) echo "#$N: worktree kept — $WT_RESULT" ;;
+        *) echo "#$N: ⚠️ worktree NOT reaped — $WT_RESULT (bash scripts/pi-reap-worktrees.sh --repo '$REPO' reports it)" ;;
+      esac
     fi
   fi
   sleep 30   # stagger uv sync
