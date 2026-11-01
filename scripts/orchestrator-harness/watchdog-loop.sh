@@ -53,11 +53,20 @@
 # different datum and at a different cadence, and its whole safety comes from being bounded: one
 # restart per observation, a re-check afterwards, and a stop after N consecutive wedges.
 #
-# PLATFORM. macOS: the controller job is launchd's. WHICH launchd verb is MEASURED, not assumed:
-#   loaded  → `launchctl kickstart -k gui/<uid>/<label>` (cures a wedge)
-#   REMOVED → `launchctl enable` + `launchctl bootstrap gui/<uid> <plist>` (agent-infra#1986: KeepAlive
+# PLATFORM. macOS: the controller job is launchd's. WHICH launchd verb, and in WHICH DOMAIN, is
+# MEASURED and not assumed — a job loaded from an SSH session lives in `user/`, so a `gui/`-only verb
+# could never reach it:
+#   loaded  → `launchctl kickstart -k <domain>/<label>`, in the domain the read FOUND it (cures a wedge)
+#   REMOVED → `launchctl enable` + `launchctl bootstrap <domain> <plist>` (agent-infra#1986: KeepAlive
 #             cannot reach a job that is no longer in the domain, and `kickstart` fails for ever on it,
 #             so a controller launchd REMOVED is put back from the plist `install.sh` rendered)
+#             ⛔ AND ONLY ON EVIDENCE THE CONTROLLER IS **GONE**, NEVER MERELY WEDGED (review P1,
+#             #1986). `WEDGED` is a state of a LIVE controller — `pid_is_controller` proved it alive —
+#             so a `bootstrap` there starts a SECOND controller beside the first (the #1715 shape:
+#             `orch-loop.sh:1546-1551` defers the newcomer only until the first exits, so the repair
+#             silently leaves two processes on one PR queue), and on a box whose operator deliberately
+#             stopped the job it resurrects what they stopped. The REMOVED arm therefore RE-PROBES the
+#             controller at the moment of the mutation and REFUSES if anything is alive.
 #   unreadable → `kickstart` (never a bootstrap: that action cannot double-load an existing job)
 # Linux cell: there is no launchd and no KeepAlive — a cell's controller is launched by
 # `cloud-cell-supervisor.sh start`, which is exactly the verb its own doctor role uses, so that is the
@@ -87,6 +96,10 @@
 # episode file unwritable, a second crash is deduped (recorded once, not twice).
 #   WATCHDOG_RESTART_CMD  replace the platform restart with this command (TESTS ONLY)
 #   WATCHDOG_NO_RESTART   never invoke the platform restart verb (TESTS ONLY)
+#   WATCHDOG_LAUNCHCTL_PIN  the ONLY `launchctl` this file may execute, by resolved path. If the one on
+#                         PATH is a different binary, NO launchctl verb is issued and the pass says
+#                         RESTART-REFUSED. A test enters the Darwin arm behind a PATH shim and pins it,
+#                         so a shim that failed to be written refuses instead of reaching the real verb.
 #   WATCHDOG_SLEEP_BIN    `sleep` seam (TESTS ONLY)
 set -uo pipefail
 
@@ -122,6 +135,11 @@ STATE_DIR="${WATCHDOG_STATE_DIR:-$HOME/.pi/agent/state}"
 # resolved from the passwd database, is the only place launchd reads from), so the watchdog never
 # invents a second install location: an absent plist is REPORTED (RESTART-UNAVAILABLE), not guessed at.
 PLIST_PATH="${WATCHDOG_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+# ⛔ A DELIBERATE REFUSAL IS NOT A FAILED VERB. Both are non-zero (a refusal must never be read as a
+# recovery), but only this one means *nothing was executed* — so `main` reports RESTART-REFUSED for it
+# instead of RESTART-FAILED, and never lets it fall through to the post-settle `STILL_NOT_CYCLING` arm as
+# though an attempt had been made and simply did not work.
+RC_REFUSED=75
 LOG="${WATCHDOG_LOG:-$STATE_DIR/controller-watchdog.log}"
 STREAK_FILE="$STATE_DIR/controller-watchdog.streak"
 CRASH_FILE="$STATE_DIR/controller-watchdog.crash"
@@ -295,8 +313,9 @@ controller_pid() {
 }
 
 # ── the restart, per platform. ONE verb, the box's own owner ─────────────────────────────────────
-# launchd_job_state — is the controller's launchd job IN the domain? 0 = loaded, 1 = absent from every
-# domain, 2 = UNKNOWN (the read established nothing).
+# launchd_job_state — prints `"<state> <domain>"`. state 0 = loaded (domain = the one it was FOUND in),
+# 1 = absent from every domain (domain = the first domain that EXISTS, i.e. where a bootstrap belongs),
+# 2 = UNKNOWN (domain `-`: the read established nothing).
 # ⛔ WHY THIS EXISTS AT ALL (agent-infra#1986): a REMOVED job is not a crashed one, and `kickstart`
 # cannot put one back. Measured five times on 2026-10-17 — a persistent-disable verb, or a `bootout`
 # whose `bootstrap` then failed, leaves `Setting service … to disabled` → `removing service`: the job
@@ -311,29 +330,47 @@ controller_pid() {
 # block (`pid =` / `last exit code =`), while two shipped files disagree about what `list <label>`
 # prints on current macOS.
 # ⛔ BOTH DOMAINS, because a job loaded from an SSH session lives in `user/`, so a `gui/`-only read
-# would call a RUNNING controller "not loaded" and issue a bootstrap over it.
+# would call a RUNNING controller "not loaded" and issue a bootstrap over it — and the DOMAIN IS
+# RETURNED WITH THE STATE, because a `gui/`-only VERB has the same defect from the other side: a job
+# found in `user/` could be read as loaded and then never kickstarted (measured review P2, #1986).
 # ⛔ A DOMAIN-LEVEL REJECTION (`Could not find domain …`) means that domain cannot hold the job — not
-# that the read failed — so it continues to the next domain. A bare `Bad request.` is launchd
-# rejecting the REQUEST, which is UNKNOWN (2) and NEVER "absent": deciding a mutation from an error
-# message is how a healthy job gets re-bootstrapped underneath a live controller.
+# that the read failed — so it continues to the next domain, and does NOT count as a place to load into.
+# ⛔ NOT-FOUND IS THE RETURN CODE; the text only backstops it. ⚠ CORRECTED 2026-11-01 against the live
+# box: the previous version of this comment (and the README row it came from) said a bare `Bad request.`
+# was the UNREADABLE marker. It is not — a NOT-FOUND read is `rc 113` and its FIRST line is `Bad
+# request.`, followed by `Could not find service "<label>" in domain for user …` (verified for both
+# `gui/<uid>` and `user/<uid>`; the selftest's own fixture had learned half of this). The measured
+# UNREADABLE read is `rc 64` + `Unrecognized target specifier.` for a malformed target, or any other
+# non-zero whose text is neither of the two below. Matching `rc 113` is what keeps this polarity
+# correct if launchd's wording changes; UNKNOWN stays UNKNOWN and NEVER becomes "absent", because
+# deciding a mutation from an error message is how a healthy job gets re-bootstrapped underneath a live
+# controller.
 launchd_job_state() {
-  local d out rc unknown=""
+  local d out rc unknown="" target=""
   for d in "gui/$(id -u)" "user/$(id -u)"; do
     out="$(launchctl print "$d/$LABEL" 2>&1)"; rc=$?
-    [ "$rc" -eq 0 ] && { printf '0\n'; return 0; }
+    [ "$rc" -eq 0 ] && { printf '0 %s\n' "$d"; return 0; }
+    case "$out" in *"Could not find domain"*) continue ;; esac
+    # this domain EXISTS (it did not reject the domain itself), so it is where a bootstrap belongs
+    [ -n "$target" ] || target="$d"
+    if [ "$rc" -eq 113 ]; then continue; fi
     case "$out" in
       *"Could not find service"*|*"not find service"*|*"service not found"*) continue ;;
-      *"Could not find domain"*) continue ;;
       *) unknown=1 ;;
     esac
   done
-  if [ -n "$unknown" ]; then printf '2\n'; return 0; fi
-  printf '1\n'
+  if [ -n "$unknown" ]; then printf '2 -\n'; return 0; fi
+  printf '1 %s\n' "${target:-gui/$(id -u)}"
 }
+# RESTART_VERB — the one platform verb this pass issued, for the caller's failure line. A bare
+# `RESTART-FAILED rc=1` cannot be acted on: `enable`, `bootstrap`, `kickstart` and the cell supervisor
+# fail for completely different reasons, and the reader had to guess which one this was.
+RESTART_VERB=""
 restart_stack() {
   local rc=0
   if [ -n "${WATCHDOG_RESTART_CMD:-}" ]; then
     # TESTS ONLY: an exact stand-in for the platform verb, so every case is driven hermetically.
+    RESTART_VERB="$WATCHDOG_RESTART_CMD"
     if [ -x "$WATCHDOG_RESTART_CMD" ]; then "$WATCHDOG_RESTART_CMD" >>"$LOG" 2>&1 || rc=$?
     else sh -c "$WATCHDOG_RESTART_CMD" >>"$LOG" 2>&1 || rc=$?; fi
     return "$rc"
@@ -351,22 +388,64 @@ restart_stack() {
     Darwin)
       if ! command -v launchctl >/dev/null 2>&1; then rc=127
       else
+        # ⛔ A PINNED BINARY THAT IS NOT THE ONE ON PATH REFUSES EVERY VERB — INCLUDING THE READS.
+        # The Darwin arm is the one place this file executes another program that can MUTATE the box, and
+        # a test enters it behind a PATH shim. Under `set -uo pipefail` with no `-e`, a shim write that
+        # failed used to leave the case running against the LIVE `/bin/launchctl` — measured shape: a real
+        # `kickstart -k gui/501/…` issued from a unit test. `WATCHDOG_NO_RESTART` could not prevent it
+        # (the arm that must be exercised has to unset it, which is the whole point of the case), so the
+        # protection is a comparison of the RESOLVED PATH against a pin: whatever answers, it is named by
+        # the caller, and if it is not, nothing runs.
+        if [ -n "${WATCHDOG_LAUNCHCTL_PIN:-}" ]; then
+          local lc; lc="$(command -v launchctl 2>/dev/null)"
+          if [ "$lc" != "$WATCHDOG_LAUNCHCTL_PIN" ]; then
+            log_line "verdict=RESTART-REFUSED"$'\t'"note=WATCHDOG_LAUNCHCTL_PIN=${WATCHDOG_LAUNCHCTL_PIN} but launchctl resolves to ${lc:-nothing} — NO launchctl verb was issued (not even the state read); whatever would have answered is not the binary this caller pinned"
+            return "$RC_REFUSED"
+          fi
+        fi
         # ONE restart, but WHICH verb depends on a MEASURED state — see launchd_job_state above. A
-        # loaded job takes the wedge-curing `kickstart -k`; a job launchd has REMOVED is re-enabled
-        # (a `-w` unload leaves a persistent Disabled override, and `bootstrap` of a disabled label is
-        # a no-op that can still exit 0) and then `bootstrap`ed from its plist. An UNKNOWN read takes
-        # the kickstart: it is the action that cannot double-load a job that exists, and refusing to
-        # act on an unreadable state is exactly how the measured hour was spent.
-        case "$(launchd_job_state)" in
+        # loaded job takes the wedge-curing `kickstart -k` IN THE DOMAIN IT WAS FOUND IN; a job launchd
+        # has REMOVED is re-enabled (a `-w` unload leaves a persistent Disabled override, and `bootstrap`
+        # of a disabled label is a no-op that can still exit 0) and then `bootstrap`ed from its plist. An
+        # UNKNOWN read takes the kickstart: it is the action that cannot double-load a job that exists,
+        # and refusing to act on an unreadable state is exactly how the measured hour was spent.
+        local st state dom
+        st="$(launchd_job_state)"; state="${st%% *}"; dom="${st##* }"
+        case "$state" in
           1)
-            if [ -f "$PLIST_PATH" ]; then
-              launchctl enable "gui/$(id -u)/$LABEL" >>"$LOG" 2>&1 || true
-              launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" >>"$LOG" 2>&1 || rc=$?
-            else
+            # ⛔ THE TRIGGER IS "THE CONTROLLER IS GONE", NOT "THE CONTROLLER IS WEDGED" (review P1,
+            # #1986). Re-probed HERE, at the moment of the mutation, and not inherited from the pass's
+            # first reading: the whole point is that no `bootstrap` may land beside a process that is
+            # still running. `WEDGED` is exactly such a state, and `main` cannot tell them apart at this
+            # call site — so this arm asks.
+            local live; live="$(controller_pid)"
+            if [ -n "$live" ]; then
+              log_line "verdict=RESTART-REFUSED"$'\t'"pid=$live"$'\t'"note=$LABEL is NOT in any launchd domain, but a controller (pid $live) is ALIVE — NOT bootstrapping: a bootstrap beside a live controller is a SECOND controller on one PR queue, and over a job an operator deliberately stopped it is that stop, reversed. Nothing was issued; if the box needs this controller replaced, stop it first (the handoff ritual) and the next REMOVED pass will restore it"
+              return "$RC_REFUSED"
+            elif [ ! -f "$PLIST_PATH" ]; then
               rc=127
               log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=$LABEL is NOT loaded and no $PLIST_PATH exists — there is nothing to bootstrap; run scripts/orchestrator-harness/install.sh"
+            else
+              # ⛔ AN `enable` THAT FAILS STOPS THE ARM — it is not swallowed. It used to be
+              # `enable … || true`, so a REFUSED verb fell through to a `bootstrap` of a label that may
+              # still be disabled (a documented silent no-op that can exit 0) and the pass then reported
+              # STILL_NOT_CYCLING — i.e. a refusal was presented as "the restart did not work" (review
+              # P2, #1986). The rc propagates, so the caller says RESTART-FAILED and names the verb.
+              RESTART_VERB="launchctl enable $dom/$LABEL"
+              launchctl enable "$dom/$LABEL" >>"$LOG" 2>&1 || rc=$?
+              if [ "$rc" -eq 0 ]; then
+                RESTART_VERB="launchctl bootstrap $dom $PLIST_PATH"
+                launchctl bootstrap "$dom" "$PLIST_PATH" >>"$LOG" 2>&1 || rc=$?
+              fi
             fi ;;
-          *) launchctl kickstart -k "gui/$(id -u)/$LABEL" >>"$LOG" 2>&1 || rc=$? ;;
+          0)
+            RESTART_VERB="launchctl kickstart -k $dom/$LABEL"
+            launchctl kickstart -k "$dom/$LABEL" >>"$LOG" 2>&1 || rc=$? ;;
+          *)
+            # UNKNOWN: the read established nothing. `kickstart` cannot double-load a job that exists, so
+            # it is the only safe polarity — and it is the one that was measured to cure the wedge.
+            RESTART_VERB="launchctl kickstart -k gui/$(id -u)/$LABEL"
+            launchctl kickstart -k "gui/$(id -u)/$LABEL" >>"$LOG" 2>&1 || rc=$? ;;
         esac
       fi ;;
     *)
@@ -384,6 +463,7 @@ restart_stack() {
         # shell). Inherited, `start` takes the FOREGROUND branch: it parks inside the handover wait for up to
         # CONTROLLER_HANDOVER_TIMEOUT instead of delegating to the unit — the same inheritance the doctor pins
         # against, at a call site the doctor's pin cannot reach.
+        RESTART_VERB="$sup start"
         ORCH_FOREGROUND=0 bash "$sup" start >>"$LOG" 2>&1 || rc=$?
       else
         rc=127
@@ -582,8 +662,14 @@ main() {
   # ── 4. ONE restart, then PROVE it after a settle window. Never a second restart in this pass: a
   #       loop that restarts until something looks healthy is the behaviour this file replaces.
   restart_stack || rc=$?
+  # ⛔ A REFUSAL IS ITS OWN VERDICT, already stated WITH ITS REASON by the arm that refused. It must not
+  # become RESTART-FAILED (nothing was executed, so nothing failed) and must not reach the settle re-read
+  # (there is nothing to settle into), which is how a refusal used to surface as STILL_NOT_CYCLING.
+  if [ "$rc" -eq "$RC_REFUSED" ]; then
+    return 0
+  fi
   if [ "$rc" -ne 0 ]; then
-    log_line "verdict=RESTART-FAILED"$'\t'"pid=${pid:-none}"$'\t'"rc=$rc"$'\t'"note=the platform restart verb failed; nothing else was attempted"
+    log_line "verdict=RESTART-FAILED"$'\t'"pid=${pid:-none}"$'\t'"rc=$rc"$'\t'"verb=${RESTART_VERB:-unknown}"$'\t'"note=the platform restart verb failed; nothing else was attempted"
     return 0
   fi
   [ "$SETTLE" -gt 0 ] && "$SLEEP_BIN" "$SETTLE" 2>/dev/null
