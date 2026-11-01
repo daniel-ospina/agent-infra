@@ -15273,10 +15273,6 @@ grep -q "check 'bash-suites (5)'" "$SCEN_EQ/mut-err" 2>/dev/null \
   && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
   || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
 
-if [ "$failures" -gt 0 ]; then
-  echo "❌ $failures of $checks admin-merge test(s) failed"
-  exit 1
-fi
 
 # ── #10399: the unresolved-check refusal, in both directions ────────────────
 # Run as its OWN process so its assertions are independent of this file's fixture
@@ -15291,6 +15287,11 @@ if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ] || [ -f "$(dirnam
   else
     checks=$((checks + 1)); fail "(n) check-unresolved.sh FAILED — see its output above"
   fi
+fi
+
+if [ "$failures" -gt 0 ]; then
+  echo "❌ $failures of $checks admin-merge test(s) failed"
+  exit 1
 fi
 
 echo "✅ all $checks admin-merge tests passed"

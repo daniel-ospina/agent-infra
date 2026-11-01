@@ -8882,35 +8882,36 @@ main() {
   TREE_MAX_COMPLETED_EPOCH="$MAIN_HEALTH_MAX_COMPLETED_EPOCH"
   case "$TREE_STATUS" in
     green)
-      # ⛔ A SURFACE WITH UNRESOLVED CHECKS IS NOT A GREEN SURFACE (tortoise#10399).
-      # `green` used to be reached whenever no check FAILED, so N checks with
-      # `status=queued|in_progress, conclusion=null` certified the very tree this
-      # merge lands — an empty conclusion read as a pass, which is exactly the
-      # polarity rule's forbidden outcome.
-      # ⛔ THE TEST IS `counter_is_zero`, NOT `-gt 0 2>/dev/null`. The latter is the
-      # precise fail-OPEN shape this file documents at the timing knobs: an
-      # unreadable counter makes `[` return 2, the `if` body is SKIPPED, and the
-      # guard about to certify a merge certifies it. Refusing unless the count is
-      # PROVEN zero blocks on `n/a`, on overflow, and on a positive count alike.
-      if ! counter_is_zero "${TREE_PENDING:-}"; then
-        say_err "admin-merge: ✗ BLOCK — REFUSED(check-unresolved): the PR's evaluated tree has ${TREE_PENDING} check(s) with NO CONCLUSION, so it is not certifiable."
-        say_err "   $TREE_SUMMARY"
-        if [ -n "${TREE_PENDINGS:-}" ]; then
-          say_err "   Unresolved checks (newest attempt, every workflow and app on this head):"
-          printf '%s\n' "$TREE_PENDINGS" >&2
-        fi
-        say_err "   A check whose newest attempt is queued/in_progress has concluded NOTHING — it is not a"
-        say_err "   pass, and calling this surface green would land a tree nobody measured."
-        say_err "   ⚠️ DECLARED RESIDUAL: this counts EVERY workflow and app on the head, so a pending check"
-        say_err "   outside the watched lane — including the rail's own [3/4] body-edit generation"
-        say_err "   (pipeline-compliance, workflow-lock) — refuses here too. That is deliberate: an"
-        say_err "   unresolved check is not a measurement whichever workflow produced it, and the refusal"
-        say_err "   names them so the next reader can tell the rail's own generation from real CI."
-        say_err "   Next: wait for those checks to conclude and re-run the rail. No evidence was posted and"
-        say_err "   no merge attempted."
-        exit 1
-      fi
-      info "admin-merge: ✅ evaluated tree ${TREE_SUMMARY}" ;;
+      # ⛔ AN IN-FLIGHT CHECK ON THE PR'S TREE IS **NOT** A RED, AND THIS ARM DOES
+      # NOT REDDEN ONE — RESTORED DELIBERATELY (PR #3205 review, blocking).
+      #
+      # A first cut of #10399 also refused here whenever `TREE_PENDING > 0`, on the
+      # argument that an unresolved check certifies nothing. That argument is sound
+      # IN THE ABSTRACT and it REVERSES A RECORDED DECISION: this repo already
+      # settled the question, and the settlement is TESTED in four arms of
+      # tests/admin-merge/run.sh — "A CHECK STILL RUNNING IS NOT A RED — on the PR's
+      # tree either. Main always has something in flight; a busy PR tree does too."
+      # Measured: that cut reddened `bash-suites (1)` with 14 of 1841 assertions
+      # failing, four of them the arms that pin exactly this behaviour.
+      #
+      # The reversal also had a practical cost the abstract argument missed: on a
+      # saturated runner pool, "some check on head just started" is the NORMAL case,
+      # so a head-wide pending refusal makes the rail unlandable until every advisory
+      # workflow on the head concludes — a false block on a healthy tree.
+      #
+      # ⛔ SO WHERE IS THE #10399 DEFECT ACTUALLY CLOSED? In the FIRST-CHECKS wait,
+      # which is where the hang was measured (900s and 330s, no decision): there the
+      # rail is waiting ON those unresolved checks, `check-unresolved` bounds that
+      # wait at CHECK_UNRESOLVED_BOUND and REFUSES BY NAME. A surface nobody is
+      # waiting on is not waiting to be certified either — the merge gate is the
+      # lane/§1b pending precondition, which has no green path.
+      # The pending NAMES are still accumulated and still reported in the summary, so
+      # "which check has no conclusion" is legible without reddening a busy tree.
+      info "admin-merge: ✅ evaluated tree ${TREE_SUMMARY}"
+      if [ -n "${TREE_PENDINGS:-}" ]; then
+        info "admin-merge:    in flight on this tree (reported, NOT blocking — a check still running is not a red):"
+        printf '%s\n' "$TREE_PENDINGS"
+      fi ;;
     unmeasured)
       info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
     red)

@@ -159,26 +159,23 @@ else
 fi
 
 # ── THE GREEN TREE ARM MUST REFUSE ON PENDING ──────────────────────────────
-# ⛔ ORDER, NOT PRESENCE. A presence grep is satisfied by a guard that can never
-# fire (measured: `-gt 0` rewritten to `-gt 999999` still passed it). The refusal
-# must sit BEFORE the PASS line in the same `green)` arm, and the count must be
-# tested with `counter_is_zero` — the file's own documented fail-closed helper —
-# because `[ … -gt 0 2>/dev/null ]` SKIPS the refusal when the count is unreadable.
-green_arm="$(awk '/^  case "\$TREE_STATUS" in/{f=1} f&&/^    green\)/{g=1} g{print} g&&/✅/{exit}' "$SCRIPT")"
-refusal_ln="$(printf '%s\n' "$green_arm" | grep -n 'REFUSED(check-unresolved)' | head -1 | cut -d: -f1)"
-pass_ln="$(printf '%s\n' "$green_arm" | grep -n '✅ evaluated tree' | head -1 | cut -d: -f1)"
-exit_ln="$(printf '%s\n' "$green_arm" | grep -n 'exit 1' | head -1 | cut -d: -f1)"
-if [ -n "$refusal_ln" ] && [ -n "$pass_ln" ] && [ -n "$exit_ln" ] \
-   && [ "$refusal_ln" -lt "$pass_ln" ] && [ "$refusal_ln" -le "$exit_ln" ] \
-   && [ "$exit_ln" -lt "$pass_ln" ]; then
-  ok "the evaluated-tree 'green' PASS path is textually AFTER the unresolved refusal and its exit 1 (order pinned, not presence)"
+# ── THE TREE ARM MUST **NOT** REDDEN AN IN-FLIGHT CHECK ────────────────────
+# ⛔ THIS IS A PIN AGAINST RE-INTRODUCING A REVERSAL. A first cut of this fix also
+# refused in the evaluated-tree `green)` arm whenever TREE_PENDING > 0. That reads
+# well in the abstract and it REVERSES A RECORDED, TESTED DECISION — four arms of
+# tests/admin-merge/run.sh pin "A CHECK STILL RUNNING IS NOT A RED — on the PR's
+# tree either", and the cut reddened `bash-suites (1)` with 14 of 1841 assertions
+# failing. On a saturated runner pool "some check on head just started" is the
+# NORMAL case, so that rule makes the rail unlandable.
+# The #10399 defect is closed where it was MEASURED — in the FIRST-CHECKS wait,
+# which is the only place the rail is actually waiting on those checks.
+green_arm="$(awk '/^  case "\$TREE_STATUS" in/{f=1} f&&/^    green\)/{g=1} g{print} g&&/evaluated tree/{c++} c&&/^      info "admin-merge: ✅/{exit}' "$SCRIPT")"
+if [ -z "$green_arm" ]; then
+  bad "could not delimit the evaluated-tree 'green' arm"
+elif printf '%s\n' "$green_arm" | grep -q 'REFUSED(check-unresolved)'; then
+  bad "the evaluated-tree 'green' arm refuses on an in-flight check — that reverses a tested decision (see tests/admin-merge/run.sh, 'A CHECK STILL RUNNING IS NOT A RED') and makes a busy tree unlandable"
 else
-  bad "the 'green' arm does not refuse BEFORE the ✅ PASS line (refusal@${refusal_ln:-none} exit@${exit_ln:-none} pass@${pass_ln:-none})"
-fi
-if printf '%s\n' "$green_arm" | grep -q 'counter_is_zero'; then
-  ok "the pending count is tested with counter_is_zero (an UNREADABLE count refuses, it does not skip the guard)"
-else
-  bad "the pending count is not proven-zero tested — an unreadable count would SKIP the refusal (fail-open)"
+  ok "the evaluated-tree 'green' arm does NOT redden an in-flight check (the recorded decision stands; #10399 is closed in the FIRST-CHECKS wait)"
 fi
 
 printf '\n%s\n' "----------------------------------------------------------------"
