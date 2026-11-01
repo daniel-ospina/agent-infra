@@ -177,10 +177,18 @@ scan() {
     if [ "$rc" -ne 0 ]; then
       rm -f "$T"; echo "__NOK__ find-failed(rc=$rc)"; exit 0
     fi
-    echo __OK__
     # Ask for one MORE row than the cap so "exactly ROW_CAP matches" is not mistaken for truncation.
-    head -n '"$((ROW_CAP + 1))"' "$T"
-    rm -f "$T"
+    # ⛔ THE CAPPED READ IS BUFFERED AND ITS STATUS CHECKED BEFORE THE SENTINEL IS EMITTED. Emitting
+    # `__OK__` and then letting `head` fail produced `__OK__` + zero rows + exit 0, which the caller reads
+    # as "searched, matched nothing" -> ABSENT-EVERYWHERE. `find` was converted to `__NOK__`; the reader
+    # was not, and that asymmetry is exactly what this file forbids. The list is already capped, so
+    # buffering costs nothing.
+    if ! head -n '"$((ROW_CAP + 1))"' "$T" > "$T.rows" 2>/dev/null; then
+      rm -f "$T" "$T.rows"; echo "__NOK__ read-failed"; exit 0
+    fi
+    echo __OK__
+    cat "$T.rows"
+    rm -f "$T" "$T.rows"
   ' lane-artifacts "$pat" "$since_min" "$ATIF_ROOT" "$exact" </dev/null 2>/dev/null
 }
 
@@ -199,34 +207,41 @@ pull() {
   # (The previous version of this file CLAIMED this fix in a comment while the code still emitted the
   # marker last — found by review. The code is the claim.)
   raw="$("$CM" vm exec --timeout 120 "$vm" -- sh -c \
-          'b=$(base64 < "$1" 2>/dev/null); rc=$?; printf "RC=%s SIZE=%s\n%s\n" "$rc" "$(wc -c < "$1" 2>/dev/null)" "$b"' \
+          'b=$(base64 < "$1" 2>/dev/null | tr -d "\n"); rc=$?; printf "RC=%s LEN=%s\n%s\n" "$rc" "${#b}" "$b"' \
           lane-artifacts "$path" </dev/null 2>/dev/null)"
-  rc="$(printf '%s\n' "$raw" | sed -n '1s/^RC=\([0-9]*\) SIZE=.*/\1/p' | tr -d '[:space:]')"
-  # ⛔ THE SIZE IS MEASURED IN THE SAME EXEC AS THE TRANSFER. The previous version compared the decoded
-  # bytes against the size from the EARLIER scan row — a file that a LIVE lane is still appending to
-  # (the primary use case: `logs` exists for a running lane) grew in between, so the artifact arrived
-  # byte-perfect, was discarded as "TRUNCATED", and the operator was told it "did NOT arrive" and left
-  # with nothing. In-band cannot be stale, and still survives truncation because the size prefixes the
-  # payload.
-  want_in="$(printf '%s\n' "$raw" | sed -n '1s/^RC=[0-9]* SIZE=//p' | tr -d '[:space:]')"
-  [ -n "${want_in:-}" ] && want="$want_in"
+  rc="$(printf '%s\n' "$raw" | sed -n '1s/^RC=\([0-9]*\) LEN=.*/\1/p' | tr -d '[:space:]')"
+  # ⛔ THE LENGTH IS TAKEN FROM THE VERY STRING THAT WAS SENT, NOT FROM A SECOND READ OF THE FILE.
+  # Two earlier versions got this wrong in opposite directions: the first compared against the size from
+  # the EARLIER SCAN row (stale — a live lane had grown); the second emitted `wc -c` from a SECOND read in
+  # the same exec, which still leaves a window between `base64 < file` and `wc -c < file`. Measured by
+  # review: a fixture appended every 3 ms failed 2 of 3 runs — a BYTE-PERFECT artifact discarded as
+  # "TRUNCATED" at exit 5, on exactly the case `logs` exists for. `${#b}` is computed from the payload
+  # itself, so there is no window at all, and a cut of even one character is still caught.
+  want_len="$(printf '%s\n' "$raw" | sed -n '1s/^RC=[0-9]* LEN=//p' | tr -d '[:space:]')"
   b64="$(printf '%s\n' "$raw" | tail -n +2 | tr -d '[:space:]')"
   if [ "${rc:-1}" != "0" ]; then
     printf '  ✗ pull failed (remote exit %s — unreadable or UNMEASURED): %s\n' "${rc:-?}" "$path" >&2
     rm -f "$dest"          # a stale copy from an earlier run must not survive as this run's result
     return 1
   fi
+  if [ -z "${want_len:-}" ]; then
+    # A missing in-band length is UNMEASURED — do NOT fall back to the scan row's size, which is the
+    # stale comparison this check exists to avoid.
+    printf '  ✗ pull failed (no in-band length — UNMEASURED): %s\n' "$path" >&2
+    rm -f "$dest"; return 1
+  fi
+  if [ "${#b64}" != "$want_len" ]; then
+    printf '  ✗ TRUNCATED: %s arrived with %s base64 chars, the box sent %s — discarded\n' \
+      "$path" "${#b64}" "$want_len" >&2
+    rm -f "$dest"; return 1
+  fi
   if ! printf '%s' "$b64" | base64 -D > "$dest" 2>/dev/null && \
      ! printf '%s' "$b64" | base64 -d > "$dest" 2>/dev/null; then
     printf '  ✗ decode failed: %s\n' "$path" >&2; rm -f "$dest"; return 1
   fi
   got="$(wc -c < "$dest" | tr -d '[:space:]')"
-  if [ -n "${want:-}" ] && [ "${want:-x}" != "?" ] && [ "$got" != "$want" ]; then
-    printf '  ✗ SIZE MISMATCH: %s decoded %s bytes, the box reported %s — TRUNCATED, discarded\n' \
-      "$path" "$got" "$want" >&2
-    rm -f "$dest"; return 1
-  fi
   printf '  ✓ wrote %s (%s bytes)\n' "$dest" "$got"
+  PULL_BYTES="$got"        # the size actually written, so the index does not record the stale scan size
 }
 
 MAP_RAW="$(resolve_boxes "$only_box")"
@@ -302,7 +317,7 @@ emit_box() {
       dest="$outdir/${label}-$(basename "$p")"
       if pull "$vm" "$p" "$sz" "$dest"; then
         R_PULLED=$((R_PULLED + 1))
-        printf '%s\t%s\t%s\n' "$label" "$p" "${sz:-?}" >> "$outdir/.lane-artifacts-index"
+        printf '%s\t%s\t%s\n' "$label" "$p" "${PULL_BYTES:-${sz:-?}}" >> "$outdir/.lane-artifacts-index"
       else
         R_PULLFAIL=$((R_PULLFAIL + 1))
       fi
@@ -375,10 +390,18 @@ case "$verb" in
         "$ATIF_ROOT" "${since:+-mmin -$since }" "$pat" "${since:+ in the last $since minutes}" "$REACHED" "$REACHED_LABELS"
       exit 3
     fi
-    [ "$R_TRUNC" -gt 0 ] && echo "⚠ TRUNCATED at the $ROW_CAP-row cap on $R_TRUNC box(es) — narrow the pattern; this list is NOT complete"
+    [ "$R_TRUNC" -gt 0 ] && echo "⚠ TRUNCATED at the $ROW_CAP-row cap on $R_TRUNC box(es)"
+    # ⛔ A ROW-CAPPED LIST IS A PARTIAL LIST. `collect '*'` with more matches than the cap printed "this list
+    # is NOT complete" and still exited 0, so a caller keying on the status read a short list as whole —
+    # the same doctrine this file applies to `ls`. Abstain, with a distinct verdict so the operator can
+    # tell "incomplete" from "nothing found".
     # ⛔ AN UNPARSEABLE ROW IS AN UNMEASURED BOX, so the whole verdict abstains even when other boxes yielded
     # hits: a corrupt listing means the universe was not fully read, and reporting "found N files" at exit 0
     # would let a caller treat a short list as complete.
+    if [ "${R_TRUNC:-0}" -gt 0 ]; then
+      echo "FOUND-TRUNCATED($R_HITS file(s) shown, capped at $ROW_CAP per box on $R_TRUNC box(es) — the list is NOT complete; narrow the pattern)"
+      exit 4
+    fi
     if [ "${R_UNPARSE:-0}" -gt 0 ]; then
       echo "UNMEASURED($R_UNPARSE box(es) returned an unparseable scan row — the list above is NOT complete, so no 'found/absent' verdict is claimed)"
       exit 4
@@ -396,7 +419,7 @@ case "$verb" in
     exit 0
     ;;
   ls)
-    T="$(printf '\t')"; reached=0; ls_hole=0; any_scanned=0
+    T="$(printf '\t')"; ls_hole=0; any_scanned=0
     show() {  # show <label> <vm> <fragment> <cap> <what> — checked in BOTH scans, not just the first
       local label="$1" vm="$2" frag="$3" cap="$4" what="$5" raw first rows
       raw="$(scan "$vm" "$frag" "$since" 0)"; local _src=$?
@@ -426,7 +449,7 @@ case "$verb" in
       # ⛔ BOTH scans must be guarded: a partial inventory (one scan failed, the other returned rows)
       # used to exit 0, so a caller keying on the status could not tell a complete inventory from a
       # partial one. Any failed scan is a COVERAGE hole and the verb abstains.
-      if [ "$ok_md" -eq 1 ] && [ "$ok_log" -eq 1 ]; then reached=$((reached + 1)); else ls_hole=$((ls_hole + 1)); fi
+      if [ "$ok_md" -ne 1 ] || [ "$ok_log" -ne 1 ]; then ls_hole=$((ls_hole + 1)); fi
       if [ "$ok_md" -eq 1 ] || [ "$ok_log" -eq 1 ]; then any_scanned=$((any_scanned + 1)); fi
     done <<< "$MAP"
     # so a label missing from `cmux vm list` produced no header, no UNMEASURED line and exit 0 — silence
@@ -444,8 +467,8 @@ case "$verb" in
     # while `.log` succeeded counted as "reached" and the verb exited 0 — a caller keying on the status
     # could not tell a complete inventory from a partial one, in the verb used to discover what exists.
     # A failed scan is a coverage hole, so the verb abstains rather than reporting a short list as whole.
-    if [ "$ls_hole" -gt 0 ]; then
-      echo "UNMEASURED($ls_hole box(es) returned a partial inventory — a scan failed; the list above is NOT complete)"
+    if [ "$ls_hole" -gt 0 ] || [ "${NUNRESOLVED:-0}" -gt 0 ]; then
+      echo "UNMEASURED($((ls_hole + NUNRESOLVED)) requested box(es) could not be fully inventoried — a scan failed or a label never resolved; the list above is NOT complete)"
       exit 4
     fi
     exit 0

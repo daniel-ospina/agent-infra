@@ -112,6 +112,18 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   if [ -n "${STUB_BAD_SIZE:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
     printf '__OK__\n%s/has\ttab.md\t2026-01-01T00:00:00\n' "$root"; exit 0
   fi
+  # STUB_GROW: append to a file EVERY time a pull exec runs, simulating a LANE STILL WRITING. A pull that
+  # takes its expected length from a second read of the file disagrees with itself; one that derives it
+  # from the payload it actually sent cannot.
+  if [ -n "${STUB_GROW:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
+    printf 'line-appended-by-the-live-lane\n' >> "$STUB_GROW" 2>/dev/null
+  fi
+  # STUB_BULK: a directory with more matches than ROW_CAP, so the truncation notice is exercised.
+  if [ -n "${STUB_BULK:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
+    echo __OK__
+    i=0; while [ $i -lt 240 ]; do printf '%s/bulk-%s.md\t1\t2026-01-01T00:00:00\n' "$STUB_BULK" "$i"; i=$((i+1)); done
+    exit 0
+  fi
   exec "${args[@]}" 2>/dev/null
 fi
 echo "stub: unsupported: $*" >&2
@@ -306,7 +318,7 @@ rc=$?; unset STUB_BAD_SIZE
 eq "T17 exit 4 (abstain)" "$rc" "4"
 grep -q 'unparseable scan row' "$Q/t17.txt" && ok "T17 names the unparseable row" || bad "T17 names it" "$(head -6 "$Q/t17.txt")"
 
-echo "T18 — the transfer status is a PREFIX: a tail-cut still reports SIZE MISMATCH"
+echo "T18 — the transfer status is a PREFIX: a tail-cut still yields a specific verdict"
 # This is the discrimination the round-2 fix never had: with the marker as a SUFFIX, cutting the tail
 # destroys it and the tool says "remote exit ?" instead of the size mismatch it actually detected.
 out="$Q/out18"; mkdir -p "$out"
@@ -314,8 +326,8 @@ STUB_CUT_TAIL=1; export STUB_CUT_TAIL
 run collect epic-ledger --out "$out" > "$Q/t18.txt" 2>&1
 rc=$?; unset STUB_CUT_TAIL
 [ "$rc" -ne 0 ] && ok "T18 fails closed (exit $rc)" || bad "T18 must not report success" "$(cat "$Q/t18.txt")"
-grep -qi 'SIZE MISMATCH' "$Q/t18.txt" && ok "T18 names the size mismatch (prefix marker survived)" \
-  || bad "T18 should name SIZE MISMATCH, not a lost status" "$(cat "$Q/t18.txt" | tail -4)"
+grep -qiE 'SIZE MISMATCH|TRUNCATED' "$Q/t18.txt" && ok "T18 names a specific verdict (prefix marker survived)" \
+  || bad "T18 should name TRUNCATED, not a lost status" "$(cat "$Q/t18.txt" | tail -4)"
 
 echo "T19 — a scan that ANSWERS but reports failure is UNMEASURED, never ABSENT"
 STUB_SCAN_ERROR=1; export STUB_SCAN_ERROR
@@ -332,6 +344,42 @@ run ls > "$Q/t20.txt" 2>&1
 rc=$?; unset STUB_DEAD_LOG
 eq "T20 exit 4 (partial inventory)" "$rc" "4"
 grep -q 'NOT complete' "$Q/t20.txt" && ok "T20 says the list is not complete" || bad "T20 wording" "$(tail -3 "$Q/t20.txt")"
+
+echo "T21 — a LIVE lane's growing log is NOT falsely rejected (the primary use case)"
+# The pull reads the file ONCE and takes the length from that same payload, so a file appended between
+# the scan and the transfer cannot disagree with itself. Two earlier versions compared against a second
+# read and failed 2 of 3 runs on a fixture appended every few ms — a byte-perfect artifact discarded as
+# "TRUNCATED" at exit 5, on exactly the case `logs` exists for.
+mkdir -p "$Q/box-c"
+printf 'line1\n' > "$Q/box-c/growing.log"
+STUB_GROW="$Q/box-c/growing.log"; export STUB_GROW
+out="$Q/out21"; mkdir -p "$out"
+run logs growing --out "$out" > "$Q/t21.txt" 2>&1
+rc=$?; unset STUB_GROW
+eq "T21 exit 0 (a growing file is not a truncation)" "$rc" "0"
+[ -s "$out/pi-cell-4-growing.log" ] && ok "T21 the artifact was written" || bad "T21 written" "$(cat "$Q/t21.txt")"
+
+# T23 — a file large enough that `base64` WRAPS. The length check must count base64 CHARACTERS, not
+# newlines: `${#b}` on wrapped output includes them. All the other fixtures are under the 76-char wrap
+# width, so the suite was blind to this and only a LIVE pull caught it (11788 arrived vs 11943 "sent").
+echo "T23 — a >76-byte artifact (base64 wraps) is pulled, not falsely rejected"
+mkdir -p "$Q/box-c"
+python3 -c "open('$Q/box-c/big-artifact.md','w').write('x'*500 + '\n')"
+out="$Q/out23"; mkdir -p "$out"
+run collect big-artifact --out "$out" > "$Q/t23.txt" 2>&1
+rc=$?
+eq "T23 exit 0" "$rc" "0"
+eq "T23 byte-exact size" "$(wc -c < "$out/pi-cell-4-big-artifact.md" 2>/dev/null | tr -d ' ')" "501"
+
+# T22 — a row-capped list is a PARTIAL list: it must not be reported as success.
+echo "T22 — a truncated (row-capped) result abstains instead of exiting 0"
+mkdir -p "$Q/box-bulkmany"
+for i in $(seq 1 240); do printf 'x' > "$Q/box-bulkmany/bulk-$i.md"; done
+export STUB_BULK="$Q/box-bulkmany"
+run collect bulk- --box pi-cell-1 > "$Q/t22.txt" 2>&1
+rc=$?; unset STUB_BULK
+eq "T22 exit 4 (list is NOT complete)" "$rc" "4"
+grep -q 'NOT complete' "$Q/t22.txt" && ok "T22 says the list is not complete" || bad "T22 wording" "$(tail -3 "$Q/t22.txt")"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"
