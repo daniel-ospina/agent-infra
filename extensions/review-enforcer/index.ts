@@ -1071,7 +1071,15 @@ function heredocSegmentIsNaming(
   // — `-exec`, `-exec bash {} +`, `-name … -exec`, `-execdir`, `-ok` — became masks the moment `find`
   // joined the naming set wholesale). Its other primaries only name a file, which is why the whole
   // command was tempting; the exec primaries are the exception, and they are the one that matters.
-  if (HEREDOC_FILE_NAMING_ONLY.has(commandWord) || extraNaming?.has(commandWord)) return true;
+  // ⛔ `gh` IS NOT A READER — IT CAN EXECUTE A LOCAL PATH (#3161 fresh-context review, P0, measured:
+  // `gh alias set qq '!bash /tmp/f.sh'` then `gh qq` runs the file). The relaxation is granted to a
+  // reader word only for a spelling that cannot run anything; an executor spelling keeps the body
+  // READABLE, which is the fail-closed direction.
+  if (extraNaming?.has(commandWord)) {
+    if (commandWord === "gh" && GH_EXECUTOR_SHAPE.test(segment)) return false;
+    return true;
+  }
+  if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;
   if (commandWord !== "git") return false;
   // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).
   if (words.some((w) => /^(-c|--config-env|--exec-path|--upload-pack|--receive-pack)$/.test(w))) return false;
@@ -3441,12 +3449,28 @@ const DATA_ONLY_CONSUMERS = new Set(["cat", "tee", "wc"]);
  * It is LOCAL, not part of `HEREDOC_FILE_NAMING_ONLY`, on purpose: that set is `maskHeredocData`'s
  * vocabulary, and widening it would move the mask every gate consumes (`gh` there would mask a body
  * merely because a LATER line reads the file — a behaviour change to the proven function, which this
- * change is not entitled to make). `gh` cannot source or exec a local path: `--body-file` reads it,
- * and `gh extension exec` resolves a NAME under gh's own extensions directory, never an arbitrary
- * written path. A line that PIPES the reader into a program, chains a second command, or hands the
- * path to an interpreter is still an execution (the pipe arm and the segment split both fire).
+ * change is not entitled to make).
+ *
+ * ⛔ THE ORIGINAL JUSTIFICATION FOR THIS WAS FALSE (#3161 fresh-context review, P0 — measured). It
+ * read "`gh` cannot source or exec a local path: `--body-file` reads it, and `gh extension exec`
+ * resolves a NAME under gh's own extensions directory, never an arbitrary written path." A gh SHELL
+ * ALIAS evaluates its expansion through `sh`: `gh alias set qq '!bash /tmp/f.sh'` followed by
+ * `gh qq` RUNS the written file — measured on this box, the file executed. `--shell` is that same
+ * expansion without the `!`, and `gh extension exec` runs a program. So `gh` is a READER only for a
+ * spelling that cannot run anything; `GH_EXECUTOR_SHAPE` below withholds the relaxation from the
+ * rest (a body written for one of those keeps its text — the fail-closed direction). A line that
+ * PIPES the reader into a program, chains a second command, or hands the path to an interpreter is
+ * still an execution (the pipe arm and the segment split both fire).
  */
 const TRACKER_FILE_READERS: ReadonlySet<string> = new Set(["gh"]);
+
+/**
+ * A `gh` invocation that can EXECUTE a local path, so the reader claim above is VOID for it.
+ * `alias` (a `!`-prefixed expansion is evaluated through `sh`; `--shell` is the same without the
+ * `!`) and `extension exec` (runs a program) are the executors. When this matches, the segment is
+ * NOT naming-only, so the written-target clause sees an execution and keeps the body readable.
+ */
+const GH_EXECUTOR_SHAPE = /(^|\s)alias(\s|=|$)|(^|\s)extension\s+exec(\s|$)|--shell(\s|=|$)/;
 
 /**
  * Blank the BODY of every `<<'QUOTED'` heredoc, LENGTH-PRESERVING, for a CLASSIFICATION read only.
@@ -3527,6 +3551,20 @@ export function withoutQuotedHeredocBodies(command: string): string {
       out.push(line);
       i++;
       continue;
+    }
+    // ⛔ A BACKSLASH-ESCAPED `<<` IS NOT A HEREDOC (#3161 fresh-context review, P1 — measured).
+    // `cat \<<'EOF'` gives bash a LITERAL `<` and a plain input redirect: no heredoc, so the next
+    // line is a COMMAND. Measured — `cat \<<'EOF'` / `touch /tmp/EXEC3` / `EOF` RUNS the touch, and
+    // the same shape with `git -C /wt push` reached zero dispatches, while this function blanked it.
+    // An ODD run of backslashes immediately before the match escapes its first `<`.
+    {
+      let backslashes = 0;
+      for (let c = at - 1; c >= 0 && line[c] === "\\"; c--) backslashes++;
+      if (backslashes % 2 === 1) {
+        out.push(line);
+        i++;
+        continue;
+      }
     }
     // Quote-blindness would let `echo "note <<'EOF'"` mask a real command after it: refuse to treat
     // an opener that sits inside an OPEN quote as an opener.
@@ -3749,8 +3787,15 @@ export function withoutQuotedHeredocBodies(command: string): string {
 // spellings reach zero dispatches ALONE on both trees. The argv layer (#984) is the answer for the
 // rest. (`git update-index` was listed here while the pattern armed it — the two disagreed; it is
 // now genuinely unarmed, because it ships nothing.)
+// ⛔ THE OPTION VALUE MAY BE A QUOTED WORD (#3161 fresh-context review, P1 — measured). The value
+// alternative used to be `[^\s;&|]+`, which stops at the first space, so `git -C "/tmp/my wt" push`
+// matched NO arm at all and reached zero dispatches with no decoy — a plain, un-obfuscated push.
+// Quoted paths with spaces are ordinary in this org (`domains (S1)/<domain>`), so this is the exact
+// class the arm exists for ("a git WRITE VERB is a shipping op in EVERY SPELLING"). Widening the
+// option VALUE can only make more commands match `push`/`commit`, i.e. it is the fail-closed
+// direction.
 const GIT_WRITE_VERB_PATTERN =
-  /(^|[\s;&|(){!])git\s+(?:-{1,2}[^\s;&|]+(?:\s+[^\s;&|]+)?\s+)*(?:commit|push)(?=\s|$)/;
+  /(^|[\s;&|(){!])git\s+(?:-{1,2}[^\s;&|]+(?:\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+))?\s+)*(?:commit|push)(?=\s|$)/;
 
 function gitWordAnywhere(command: string): boolean {
   return GIT_WRITE_VERB_PATTERN.test(withoutQuotedHeredocBodies(command));

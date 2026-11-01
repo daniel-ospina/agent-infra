@@ -10305,6 +10305,17 @@ const CLASSIFICATION_MASK_EVASIONS: Array<[string, string]> = [
   // clause 5 (consumer) — a reader that is not proven data-only, and a frameless ELEVATION path
   ['while read + eval as the consumer', 'while read l; do eval "$l"; done <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF'],
   ['unquoted delimiter EXPANDS its body', 'cat <<EOF\n$(git -C /wt push origin HEAD:main)\nEOF'],
+  // ⛔ TWO SHAPES A FRESH-CONTEXT REVIEW ADDED AT THIS HEAD, both measured fail-open:
+  // (a) `gh alias set` is an EXECUTOR, not a tracker reader — its expansion is evaluated through
+  //     `sh`, so the written body RUNS. `gh` was in `TRACKER_FILE_READERS` justified by the false
+  //     premise "`gh` cannot source or exec a local path".
+  [
+    'gh shell alias RUNS the written body (gh is not a reader)',
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh alias set qq '!bash /tmp/f.sh' && gh qq",
+  ],
+  // (b) `\<<` is a LITERAL `<` plus an input redirect, so bash never sees a heredoc and the next
+  //     line is a COMMAND — while the opener scan honoured it and blanked the executed line.
+  ['backslash-escaped `<<` is NOT an opener', "cat \\<<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
 ];
 
 // One `test` per shape, so a single broken clause cannot mask the others in the report: the whole
@@ -10324,6 +10335,27 @@ for (const [label, command] of CLASSIFICATION_MASK_EVASIONS) {
       true,
       "the operation inside an EXECUTED body must stay readable to the classifier",
     );
+  });
+}
+
+// ── `GIT_WRITE_VERB_PATTERN`: quoted option values are still a WRITE VERB (PR #3161 P1) ────────
+// The option-value alternative was `[^\s;&|]+`, which stops at the first space, so a push whose
+// `-C`/`--git-dir` value is a QUOTED path containing a space matched no arm at all. Measured
+// through this module at the reviewed head: every row below was `isGitOp === false` — a real push
+// reaching zero dispatches with no decoy, and quoted paths with spaces are ordinary here
+// (`docs/teams/<team>/domains (S1)/<domain>`).
+const GIT_WRITE_VERB_SPELLINGS: Array<[string, string]> = [
+  ['plain -C push (control)', 'git -C /wt push'],
+  ['QUOTED -C value with a space', 'git -C "/tmp/my wt" push origin HEAD:main'],
+  ['single-quoted -C value with a space', "git -C '/tmp/my wt' push"],
+  ['QUOTED --git-dir value with a space', 'git --git-dir "/a b/.git" push'],
+  ['QUOTED -C value, commit', 'git -C "/tmp/my wt" commit -am x'],
+  ['quoted value then a second flag', 'git -C "/tmp/my wt" --no-pager push'],
+];
+console.log("\n── a git WRITE VERB in every spelling, quoted option values included (PR #3161 P1)");
+for (const [label, command] of GIT_WRITE_VERB_SPELLINGS) {
+  test(`a git write verb is gated: ${label}`, () => {
+    equal(isGitOp(command), true, "a real push/commit must reach the floor in EVERY spelling");
   });
 }
 
