@@ -1014,7 +1014,7 @@ sed 's/\[ "$shard_errors" -ne "$shard_err0" \] && shard_fail "$1"; //' "$NAMED_F
 if cmp -s "$NAMED_FIX/scripts/runner-named.sh" "$NAMED_FIX/scripts/runner-noname.sh"; then
   fail "the no-name mutation did not change the fixture (the naming call moved — update this arm's sed)"
 else
-  env -u BASH_SHARD_SLICE $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
+  env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-onefail-noname.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-onefail-noname.out")"
   if [ "$RC" -eq 1 ] && ! grep -qF 'FAILED SHARD' <<<"$OUT"; then
@@ -1056,9 +1056,18 @@ echo "8aQ. THE OVERRUN IS A DIFFERENT NAMED RED FROM A SUITE FAILURE (agent-infr
 #   * a live, unspent budget  -> the suite failure still fails the step (a budget must never absorb a
 #                                failure: that is the fail-open this arm exists to catch)
 # The slow stand-ins are written into the fixture TREE (`$NAMED_FIX`), never committed: they only have
-# to make `shard_time` cross a 3 s budget deterministically (a 1 s budget would trip BEFORE
-# `stand-in-aab-failslow.sh`, so the "failed INDEPENDENTLY" assertion below would never match), and
-# a committed 2 s sleep would be paid by every run of this suite forever.
+# to make `shard_time` cross the budget at a point this arm CHOOSES, and a committed 2 s sleep would
+# be paid by every run of this suite forever.
+# ⛔ THE PROPERTY IS AN INEQUALITY UNDER INTEGER TRUNCATION, NOT "2 + 2 > 3" (review, #3174).
+# `shard_note` measures each shard as `$((SECONDS - shard_t0))` — bash's INTEGER `SECONDS` — so a
+# `sleep 2` stand-in records **2 or 3** depending on where it straddles a 1 s boundary (measured on
+# this repo's own fixture: 54×`2`, 6×`3` in 60 runs). At `BASH_SHARDS_BUDGET_SECS=3` the trip's
+# `-ge` therefore fired BEFORE `stand-in-aab-failslow.sh` ran whenever the first stand-in measured 3 —
+# `shard_errors` was still 0, no "failed INDEPENDENTLY" line was printed, and the assertion below
+# failed on a CORRECT tree (measured: 3 of 40 runs). The budget is 4 so the invariant is
+#     first < budget <= first + second
+# which holds for EVERY truncation: first ∈ {2,3} < 4, and first + second ∈ {4,5,6} >= 4. The trip still
+# lands MID-LOOP (before the third stand-in), which is what the arm exists to exercise.
 # ⛔ TWO slow stand-ins, named so they sort FIRST (`aaa`) and SECOND (`aab`), because the arm must
 # exercise the MID-LOOP trip: a `zzz`-sorted slow suite only ever reaches the end-of-list trip, where
 # `ran + skipped == listed` — so the "NOT RUN" listing (the branch that was fatal in review cycle 2)
@@ -1067,7 +1076,9 @@ echo "8aQ. THE OVERRUN IS A DIFFERENT NAMED RED FROM A SUITE FAILURE (agent-infr
 # `unbound variable` on 100 % of mid-loop trips.
 printf '#!/bin/bash\nsleep 2\n' >"$NAMED_FIX/tests/ci-lane-parity/stand-in-aaa-slow.sh"
 # A FAILING stand-in that is slow enough to have contributed `shard_time`, so the trip fires AFTER a
-# recorded failure: that is what makes the "failed INDEPENDENTLY of the overrun" line reachable.
+# recorded failure: that is what makes the "failed INDEPENDENTLY of the overrun" line reachable. Both
+# sleeps stay at 2 and the BUDGET carries the margin (see the invariant above) — lowering this one
+# or raising the other only moves which truncation can break the arm.
 printf '#!/bin/bash\nsleep 2\nexit 1\n' >"$NAMED_FIX/tests/ci-lane-parity/stand-in-aab-failslow.sh"
 # (1) NO budget: exactly §8am's verdict, and no overrun line.
 if grep -qF 'SHARD BUDGET EXCEEDED' "$TMP/runner-onefail.out"; then
@@ -1075,9 +1086,10 @@ if grep -qF 'SHARD BUDGET EXCEEDED' "$TMP/runner-onefail.out"; then
 else
   pass "no overrun verdict when no budget is declared (0 = no deadline)"
 fi
-# (2) Budget exhausted (3 s, crossed by the two 2 s stand-ins): the TRIP HAPPENS MID-LOOP, after a
-# recorded failure and with suites still un-run — the production shape, and the one cycle 2 proved fatal.
-env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=3 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-overrun.out" 2>&1
+# (2) Budget exhausted (4 s: after ONE stand-in at 2-3 s, at/below it after TWO at 4-6 s): the TRIP
+# HAPPENS MID-LOOP, after a recorded failure and with suites still un-run — the production shape, and
+# the one cycle 2 proved fatal. 4, not 3: see the truncation invariant above.
+env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=4 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-overrun.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-overrun.out")"
 if [ "$RC" -eq 1 ] && grep -qF '❌ SHARD BUDGET EXCEEDED' <<<"$OUT" && grep -qF 'this is NOT a suite failure' <<<"$OUT"; then
@@ -1085,7 +1097,7 @@ if [ "$RC" -eq 1 ] && grep -qF '❌ SHARD BUDGET EXCEEDED' <<<"$OUT" && grep -qF
 else
   fail "the overrun verdict did not fire or did not disclaim a suite failure (rc $RC): $(grep -F 'BUDGET' <<<"$OUT" | head -2)"
 fi
-if grep -qF 'BASH_SHARDS_BUDGET_SECS=3' <<<"$OUT" && grep -qE 'failed INDEPENDENTLY of the overrun: .*stand-in-' <<<"$OUT"; then
+if grep -qF 'BASH_SHARDS_BUDGET_SECS=4' <<<"$OUT" && grep -qE 'failed INDEPENDENTLY of the overrun: .*stand-in-' <<<"$OUT"; then
   pass "…it prints the budget it compared against AND names the real failure SEPARATELY (neither red is laundered into the other)"
 else
   fail "the overrun verdict did not separate the budget from the failure: $(grep -F 'INDEPENDENTLY' <<<"$OUT" | head -2)"
@@ -1143,6 +1155,18 @@ if [ "$RC" -eq 2 ] && grep -qF 'cannot be combined with BASH_SHARD_SLICE' "$TMP/
 else
   fail "budget+slice returned rc $RC (want 2)"
 fi
+# (3d) …but `0` is the documented "no deadline" spelling, and it is NOT a budget at all. Refusing it
+# alongside a slice is a false block on a documented no-op spelling (review finding, #3174): the
+# caller has declared NO deadline, so there is no whole-list/1-N-share mismatch to refuse. Pre-fix
+# this returned rc 2 and the run never happened.
+env BASH_SHARD_SLICE=1/2 BASH_SHARDS_BUDGET_SECS=0 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetzerosliced.out" 2>&1
+RC=$?
+OUT="$(cat "$TMP/runner-budgetzerosliced.out")"
+if [ "$RC" -eq 1 ] && ! grep -qF 'cannot be combined with BASH_SHARD_SLICE' <<<"$OUT" && ! grep -qF 'SHARD BUDGET EXCEEDED' <<<"$OUT"; then
+  pass "BASH_SHARDS_BUDGET_SECS=0 is NOT refused alongside a slice — '0 = no deadline' is not a budget to compose"
+else
+  fail "a zero budget combined with a slice was refused or changed the verdict (rc $RC): $(grep -E 'BUDGET' <<<"$OUT" | head -2)"
+fi
 # (4) A budget that is not a number is REFUSED, never silently ignored.
 env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=12x $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetbad.out" 2>&1
 RC=$?
@@ -1151,6 +1175,12 @@ if [ "$RC" -eq 2 ] && grep -qF 'is not a whole number of seconds' "$TMP/runner-b
 else
   fail "a non-numeric budget returned rc $RC (want 2)"
 fi
+# ⛔ THE TWO SLOW STAND-INS ARE REMOVED HERE, so the arms BELOW see the tree their own comments
+# document (review finding, #3174). Leaving them in `$NAMED_FIX` silently re-shaped the attribution
+# arm into "four stand-ins, two failing, ~+8 s of sleeps" for every later run of this file — the arm
+# still passed, so what drifted was WHAT IT MEASURED. The two COMMITTED stand-ins stay: they are the
+# fixture those arms are written against.
+rm -f "$NAMED_FIX/tests/ci-lane-parity/stand-in-aaa-slow.sh" "$NAMED_FIX/tests/ci-lane-parity/stand-in-aab-failslow.sh"
 
 echo ""
 echo "8ab. FALSE-BLOCK CONTROLS — legitimate spellings must still be read as calls"
@@ -1623,7 +1653,12 @@ elif ! grep -qF 'stand-in-*.sh' "$NAMED_FIX/scripts/runner-named.sh" 2>/dev/null
 else
   # ⛔ RUN IT WHERE IT LIVES. A copy moved to `$TMP` anchors discovery to `$TMP` and refuses (rc 2,
   # EMPTY list); the fixture is only a fixture inside its own tree.
-  $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-named.out" 2>&1
+  # ⛔ AND WITH NO INHERITED BUDGET (review finding, #3174): the main lane's shards step exports
+  # `BASH_SHARDS_BUDGET_SECS` to EVERY child, so without these `-u` flags this arm's expected verdict
+  # would depend on an env value supplied by the workflow — and a budget that fires would SUPPRESS the
+  # very verdict shape the arm asserts on. The exemption is now stated here instead of resting on
+  # "this suite is `# shard: off` so it never runs as a shard".
+  env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-named.out" 2>&1
   RC=$?
   OUT="$(cat "$TMP/runner-named.out")"
   # The verdict block is everything from the `N bash shard(s) failed` line on: the per-shard line is
@@ -1650,7 +1685,7 @@ else
   if cmp -s "$TMP/runner-named.sh" "$TMP/runner-noname.sh"; then
     fail "the no-name mutation did not change the fixture"
   else
-    $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
+    env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-noname.sh" >"$TMP/runner-noname.out" 2>&1
     RC=$?
     NONAME_VERDICT="$(sed -n '/bash shard(s) failed/,$p' "$TMP/runner-noname.out")"
     if [ "$RC" -eq 1 ] && ! grep -qF "$FAIL_SHARD" <<<"$NONAME_VERDICT"; then

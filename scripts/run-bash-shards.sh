@@ -69,6 +69,18 @@
 #   bash scripts/run-bash-shards.sh --list-sweeps   # print the syntax-sweep globs, run nothing
 #
 #   BASH_SHARD_SLICE=<i>/<n> bash scripts/run-bash-shards.sh   # run ONE slice of the list
+#   BASH_SHARDS_BUDGET_SECS=<secs> bash scripts/run-bash-shards.sh  # name an overrun of the bound
+#
+# ENVIRONMENT CONTRACT (complete — a caller that sets anything else changes nothing here):
+#   BASH_SHARD_SLICE      <i>/<n> — run only slice i of n. Slicing is a MATRIX concern (below).
+#   BASH_SHARDS_BUDGET_SECS  whole seconds; the runner's OWN deadline for the shard WORK it measures
+#                         (`shard_time`, the sum of the per-suite `▸` rows — NOT step wall clock).
+#                         Unset = no deadline; `0` = no deadline; set-but-EMPTY is REFUSED (rc 2),
+#                         since an unset CI variable expands to empty and silently running with no
+#                         deadline is the fail-open; non-numeric refused (rc 2). A POSITIVE value may
+#                         NOT be combined with BASH_SHARD_SLICE (rc 2) — the two do not compose.
+#                         On crossing it the runner prints a NAMED overrun verdict and EXITS 1, so an
+#                         overrun can never be read as a suite failure (see shard_budget_trip).
 #
 # SLICING — why it is an ENV VAR and not an argument (#2055 follow-up; the `bash-suites`
 # duration defect). Slicing exists because the JOB's DURATION, not runner capacity, was the
@@ -326,7 +338,10 @@ if [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ]; then
   # budget — a deadline ~N times too lenient, with no error, i.e. fail-open for any future caller that
   # sets both. Refuse the pair rather than silently weakening the deadline; a slice's share would have
   # to be derived from a measured whole-list figure, and no caller needs that today.
-  if [ -n "${BASH_SHARD_SLICE:-}" ]; then
+  # ⛔ …BUT `0` IS NOT A BUDGET (review finding, #3174). `0` is the documented "no deadline" spelling,
+  # so there is no share to compare and nothing to weaken — refusing it refused a documented no-op
+  # spelling, i.e. a false block (category B). Only a POSITIVE budget composes badly with a slice.
+  if [ "$shard_budget" -gt 0 ] && [ -n "${BASH_SHARD_SLICE:-}" ]; then
     echo "❌ BASH_SHARDS_BUDGET_SECS=$shard_budget cannot be combined with BASH_SHARD_SLICE — this process only accumulates the shards its own slice ran, so a whole-list budget would be ~N times too lenient. Set one or the other."
     exit 2
   fi
