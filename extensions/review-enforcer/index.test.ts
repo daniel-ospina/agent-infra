@@ -5079,6 +5079,54 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
 });
 
+test("#3161: a git WRITE VERB is gate-relevant in every spelling — and a git READ is not", () => {
+  // ⛔ THE ARM WAS A WORD TEST, AND A WORD TEST REFUSES THE FLEET'S MOST COMMON COMMAND. Measured on
+  // this branch against `origin/main` (`isGitOp` on the same 8 spellings, both trees): `main` allowed
+  // every read below, the word arm blocked every read below, at ZERO dispatches — so `git status` was
+  // refused until a lane dispatched a reviewer FOR THE `git status`. The arm's own docstring priced
+  // the blunt test as "a refusal (`--body \"run git log\"`)", a quoted MENTION; refusing the read
+  // itself was never priced, and 358 green assertions contained no bare-read row, which is exactly
+  // why the suite missed it. Both halves are pinned here, because either one alone is a defect: the
+  // read rows keep the over-block from coming back, the write rows keep `-C`/`--no-pager`/`-c` from
+  // slipping the floor (the fail-open round 2 measured).
+  for (const c of [
+    "git status",
+    "git log --oneline -3",
+    "git diff --stat",
+    "git fetch origin main",
+    "git rev-parse HEAD",
+    "git branch --show-current",
+    "git show HEAD:README.md",
+    "git status --porcelain",
+    "git -c core.pager=less log --oneline -3",
+    "git --no-pager log",
+  ]) {
+    ok(!isGitOp(c), `a git READ ships nothing and must not be gated: ${JSON.stringify(c)}`);
+  }
+  for (const c of [
+    "git commit -m x",
+    "git push",
+    "git -C /wt push",
+    "git --no-pager push",
+    "git -c k=v commit -m x",
+    "git -C /a -C /b commit -m x",
+    "git -c user.name=bot -c user.email=b@x commit -m x",
+    "git status && git push",
+    "git status; git -C /wt push",
+    "cd /wt && git push",
+  ]) {
+    ok(isGitOp(c), `a git WRITE VERB is a shipping op in this spelling: ${JSON.stringify(c)}`);
+  }
+  // The masking still holds for the WRITE test — at the LAYER the gate actually uses. `isGitOp` is
+  // handed `maskHeredocData(rawCommand)` by its only caller (`index.ts`, `tool_call`), so the body is
+  // already blanked by the time either arm reads it; asserting on the RAW text would pin a claim no
+  // arm makes (and would fail on `origin/main` too, because `GIT_COMMIT_PATTERN` is unmasked). The
+  // property under test: a `git push` that is DATA to this command must not make the tracker write
+  // that writes it a shipping op (#485's parked-lane class).
+  ok(!isGitOp(maskHeredocData("cat > /tmp/f.md <<'EOF'\nremember to git push\nEOF\n")),
+     "a git write inside a QUOTED heredoc body is data, not an operation");
+});
+
 test("#1492: a block is a NO-OP — the refused command is recorded, and the message says nothing ran", () => {
   // The field #1492 asks for: a `gate_block` entry carried reason + tier, never WHICH
   // command was refused.

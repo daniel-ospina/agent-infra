@@ -3693,13 +3693,36 @@ export function withoutQuotedHeredocBodies(command: string): string {
  */
 // The leading class is SEPARATORS, not quotes. Including `'`/`"` here gated `echo "git commit -m x"`,
 // which a pinned test requires stay outside (#1492: a quoted MENTION is not an operation), and a
-// command-position analysis is what distinguishes the two correctly. DECLARED RESIDUAL, unchanged
-// from HEAD: `$('git' push)` and `sh -c 'git -C /wt push'` are not caught here (nor at HEAD —
-// GIT_COMMIT_PATTERN has the same anchor assumption). Filed as a follow-up.
-const GIT_WORD_PATTERN = /(^|[\s;&|(){!])git\s/;
+// command-position analysis is what distinguishes the two correctly.
+//
+// ⛔ A WRITE **VERB**, NOT THE WORD `git` (agent-infra#3161 — a P0 the first form shipped). The first
+// form of this arm was `/(^|[\s;&|(){!])git\s/`: ANY command containing `git ` became a "git op",
+// INCLUDING every read-only inspection an agent runs before it has dispatched a reviewer. Measured
+// on this branch against `origin/main` (`isGitOp` on 14 spellings, both trees): `origin/main`
+// ALLOWED `git status`, `git log --oneline -3`, `git diff --stat`, `git fetch origin main`,
+// `git rev-parse HEAD`, `git branch --show-current`, `git show HEAD:README.md` and
+// `git status --porcelain`; the word arm BLOCKED all eight at zero dispatches. So a bare `git status`
+// was refused until the lane dispatched a reviewer FOR THE `git status` — the fleet's most common
+// command. The docstring below priced the blunt test as "a refusal (`--body "run git log"`)", i.e. a
+// quoted mention; a refusal of the READ ITSELF was never priced, so this was not a disclosed residual,
+// and no suite row covered a bare git read (which is why 358 green assertions missed it). The lane
+// that shipped it could not see it: its own session ran with dispatch enforcement BYPASSED.
+//
+// The arm still CROSSES the global options that made a word test tempting — `git -C <path> push` (this
+// fleet's canonical spelling), `git --no-pager push`, `git -c k=v commit`, `git -C /a -C /b commit` —
+// because `-C`/`-c` take a VALUE, so a naive `git\s+(commit|push)` anchor saw `-C`. The option group
+// is backtracking-safe: for `git --no-pager push` the optional value is declined and the verb matches.
+//
+// DECLARED RESIDUALS, unchanged from HEAD in kind and now stated rather than implied: an alias push
+// (`git -c alias.p=push p origin …`), `git update-index`, and `$('git' push)` / `sh -c 'git -C /wt push'`
+// keep no arm HERE (nor did `GIT_COMMIT_PATTERN` at HEAD). They are caught where the floor actually
+// needs them — `mentionsGitWord` refuses ANY git word before a tracker write may stand down — and the
+// argv layer (#984) is the answer for the rest.
+const GIT_WRITE_VERB_PATTERN =
+  /(^|[\s;&|(){!])git\s+(?:-{1,2}[^\s;&|]+(?:\s+[^\s;&|]+)?\s+)*(?:commit|push|merge|reset|rebase|cherry-pick|revert|am|apply|checkout|switch|restore|clean|pull|add|rm|mv|init|clone|update-index|update-ref|filter-branch)(?=\s|$)/;
 
 function gitWordAnywhere(command: string): boolean {
-  return /(^|[^\w.-])git(\b|[^\w-])/.test(withoutQuotedHeredocBodies(command));
+  return GIT_WRITE_VERB_PATTERN.test(withoutQuotedHeredocBodies(command));
 }
 
 /**
@@ -3714,7 +3737,14 @@ function gitWordAnywhere(command: string): boolean {
  * unquoted heredoc body all keep the floor.
  */
 export function writesOnlyTrackerRecords(command: string): boolean {
-  if (gitWordAnywhere(command)) return false;
+  // ⛔ ONE DEFINITION OF "THIS TEXT MENTIONS git" (agent-infra#3161 review). The first form carried a
+  // private regex beside the module's own `mentionsGitWord`, and the private one was WEAKER: it
+  // matched the literal characters `git`, so the quote/backslash SPLICES that `mentionsGitWord` was
+  // written to normalize (`''git push`, `\git push`, `g"i"t push`, `$'git' push`) read as "no git
+  // word" here — a fail-open inside the very veto that keeps a splice from standing the floor down.
+  // `mentionsGitWord` is the pre-existing decision for this question (see its "third design" note),
+  // so the duplicate goes and the veto inherits the splice-proofing.
+  if (mentionsGitWord(withoutQuotedHeredocBodies(command))) return false;
   if (hasAdminMergeFlag(command)) return false;
   return readsNonMergeGhCall(withoutQuotedHeredocBodies(command));
 }
@@ -3730,14 +3760,16 @@ export function isGitOp(command: string): boolean {
   // hits — a regression introduced by the `gh pr "merge"` fix and caught by
   // VGATE round 4.
   if (GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command)) return true;
-  // ⛔ A `git` COMMAND WORD IS A SHIPPING OP IN EVERY SPELLING (round-2 review, P0). The literal arm
+  // ⛔ A `git` WRITE VERB IS A SHIPPING OP IN EVERY SPELLING (round-2 review, P0). The literal arm
   // above cannot cross a global option, so `git -C <path> push` — this fleet's own canonical form —
   // and `git --no-pager push` / `git -c k=v commit` matched NO arm and reached zero dispatches. The
   // fix is an ARM, not a veto: `gitWordAnywhere` below is a veto inside the tracker-write classifier,
   // which only speaks once some other arm has already made the command a candidate — a raw
   // `git -C /wt push` supplies no such candidate. Quoted-heredoc bodies are excluded because they are
-  // DATA to this command; anything else with `git` in a word-leading position is gated (a refusal).
-  if (GIT_WORD_PATTERN.test(withoutQuotedHeredocBodies(command))) return true;
+  // DATA to this command; anything else with a git WRITE VERB is gated (a refusal). A git READ VERB
+  // (`status`, `log`, `diff`, `show`, `rev-parse`, `branch`, `fetch`, …) is deliberately NOT here:
+  // see `GIT_WRITE_VERB_PATTERN`'s note — it is a read, and refusing it never shipped anything.
+  if (gitWordAnywhere(command)) return true;
   // ⛔ THE BROAD `gh`+`pr` ARM ASKS ITS OWN DOCUMENTED QUESTION (#485 class, measured
   // 2026-10-30/31 on pi-cell-1). `isGhPrMergeCommand`'s `hasGh && hasPr` arm exists to catch a
   // merge whose VERB this layer cannot read (`` gh pr m`printf erge` 999 ``). When the text
