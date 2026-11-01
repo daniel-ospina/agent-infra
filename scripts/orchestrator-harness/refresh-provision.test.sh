@@ -51,6 +51,17 @@
 #   (s7) `--check` does NOT fail a clean shallow scout — `cloud-cell-bringup.sh` DIES on a non-zero
 #        `--check`, so that second copy of the comparison was a cell that could not START;
 #   (s8) NON-VACUITY for (s7): the old `--check` arm still FAILS the same tree.
+#   (h) HERMETICITY: ambient `$OR` AND `OR_OPERATOR_DECLARED` (both exported into the suite, so a drift
+#       in either clear entry reddens it) do not reach the pass, and the
+#       record carries no resolve-repo refusal — with a positive control that a DECLARED `$OR` handed to
+#       the invocation IS still refused (rc=3);
+#   (h2) the `--check` twin of (h), with the same two-way control;
+#   (h3) the RECORDED cause names what the resolver actually read, instead of predicting one mechanism
+#       for all of them: the no-`$REPO` candidate SEARCH (no origin is recorded there at all), an
+#       unreadable origin, a `file://` local mirror, a URL naming another repo, and a local path that
+#       cannot prove a DECLARED target — the five shapes `_pair` can name;
+#   (h4) an origin that NAMES the queue target with a trailing slash is the same repo: it PROCEEDS, so
+#       the cause can never report a "DIFFERENT repo" mismatch it did not measure.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
@@ -122,6 +133,18 @@ PY
   git -C "$D/repo" add -A; git -C "$D/repo" commit -qm two
   git -C "$D/repo" push -q origin main
   mk_gh_stub "$D"
+  mk_claims_stub "$D"
+}
+
+# mk_claims_stub <case-dir> — seed the cross-box claim registry the shipped pass reads at `$O/claims.sh`.
+# ⛔ A REAL `$O` HAS ONE (install.sh/deploy-harness.sh put it there), and the shipped `--check` refuses
+# a cell whose registry is absent — deliberately, because the pre-flight would refuse every issue as
+# INCOMPLETE and the cell could only merge (#2466). Without the seed, `(s7)`'s `--check` exited 3 on
+# the MISSING REGISTRY rather than on anything about the shallow scout it exists to measure, so the
+# arm could never turn green however correct the scout logic was. It copies the SHIPPED file (as
+# refresh-scout.test.sh's `mk_case` does), so the sandbox cannot drift from the real claim format.
+mk_claims_stub() {
+  cp "$HERE/claims.sh" "$1/o/claims.sh"
 }
 
 # mk_gh_stub <case-dir> — the `gh` every arm's box-level preconditions are answered by.
@@ -171,18 +194,60 @@ mk_shallow_case() {
   for i in 6 7 8 9 10; do echo "$i" > "$D/repo/f$i.txt"; git -C "$D/repo" add -A; git -C "$D/repo" commit -qm "c$i"; done
   git -C "$D/repo" push -q origin main
   mk_gh_stub "$D"
+  mk_claims_stub "$D"
   git -C "$D/repo" fetch -q --depth 2 origin "+refs/heads/main:refs/remotes/origin/main"
 }
 
-# rp <case-dir> — run the SHIPPED script; $OUT/$RC. Provisioning knobs are cleared so an operator's
-# exported TORTOISE_REPO/SCOUT_* cannot leak in and make a case pass for the wrong reason.
+# rp <case-dir> [<script>] [KEY=VAL ...] — run the SHIPPED script; $OUT/$RC. Provisioning knobs are
+# cleared so an operator's exported TORTOISE_REPO/SCOUT_* cannot leak in and make a case pass for the
+# wrong reason. A case that WANTS one sets it on its own invocation (e.g. `rp "$D" "" SCOUT_LOCK_STALE_SECS=5m`),
+# so the clear list costs nothing and every arm's values are its own.
+#
+# ⛔ $OR IS CLEARED TOO, AND THAT IS THE WHOLE DIFFERENCE BETWEEN THIS SUITE AND ITS SIBLING
+# (agent-infra#3174 lane, measured 2026-11-01). Every fixture here builds a bare LOCAL origin
+# (`git init -q --bare "$D/origin.git"`), and the shipped `resolve_repo` tolerates a local-path origin
+# only while the queue target is UNDECLARED (`OR_DECLARED=0`) — a DECLARED $OR cannot be proven by a
+# path, so it refuses with rc=3 BEFORE the provision stage runs. This suite cleared every other
+# ambient knob but NOT `$OR` (nor `OR_OPERATOR_DECLARED`, which forces the same refusal on its own), so
+# on a box whose shell exports one (a cell's keys.env does; measured
+# on this box: `OR=daniel-ospina/tortoise`) most of this suite went red for a reason that has
+# nothing to do with provisioning:
+#
+#     [refresh] NOT PROVISIONABLE: $REPO is …/repo, whose 'origin' is the local path …/origin.git —
+#       it cannot prove it is a checkout of $OR (daniel-ospina/tortoise), and $OR was DECLARED
+#     [refresh] FAILED stage=provision rc=3 … — the failing step recorded no cause; the lines above
+#       are this pass's last evidence (#2229)
+#
+# …and the arm then read that EXIT-TRAP sentence off `state/refresh-last` as though the scout had
+# refused, which is why the cluster read as a cause-record defect. It is not: the record is RIGHT —
+# no cause was recorded, because nothing below `resolve_repo` ever ran. `refresh-scout.test.sh` paid
+# for this exact lesson in #1935 and its `rf` clears `-u OR`; this file's `rp` did not.
+# The `(h)` arms below are the regression test for the clear list itself.
 OUT=""; RC=0
+# ⛔ THE CLEAR LIST IS WRITTEN ONCE, HERE (review cycle 1, P2). It was two verbatim copies — the shape
+# that already cost this file most of its reds when one copy drifted from `refresh-scout.test.sh`'s. A new
+# ambient knob goes in this array and nowhere else. `SCOUT_LOCK_STALE_SECS` is set per arm
+# (`rp "$D" "" SCOUT_LOCK_STALE_SECS=5m`) because GNU `env` applies a KEY=VAL after `-u KEY`, so the
+# arm's own value is the one the pass sees; `OR_OPERATOR_DECLARED` is exported by `(h)` into the
+# suite's own environment precisely so its clear entry is load-bearing.
+RP_CLEAR=(-u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS
+          -u SCOUT_LOCK_STALE_SECS -u OR -u OR_OPERATOR_DECLARED)
 rp() {
   local dir="$1" script="${2:-$REFRESH}"
-  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
-          -u SCOUT_LOCK_STALE_SECS \
-          HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" \
+  if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
+  OUT="$(env "${RP_CLEAR[@]}" \
+          HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$script" 6 2>&1)"
+  RC=$?
+}
+# rpc <case-dir> [<script>] [KEY=VAL ...] — the `--check` twin of `rp`: SAME clear list (literally the
+# same array, not a second copy), same argument handling, so the two cannot drift.
+rpc() {
+  local dir="$1" script="${2:-$REFRESH}"
+  if [ "$#" -ge 2 ]; then shift 2; else shift 1; fi
+  OUT="$(env "${RP_CLEAR[@]}" \
+          HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" "$@" \
+          bash "$script" --check 2>&1)"
   RC=$?
 }
 rec() { sed -n "s/^$1=//p" "${2:-$D/o/state/refresh-last}" 2>/dev/null | head -1; }
@@ -275,11 +340,11 @@ for bad in 5m abc 0 '300 ' 00 000 9223372036854775808; do
   mk_case "bound-$BOUNDN"
   LOCK="$D/repo/.git/worktrees/dispatch-scout/index.lock"
   : > "$LOCK"
-  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
-          SCOUT_LOCK_STALE_SECS="$bad" \
-          HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" \
-          bash "$REFRESH" 6 2>&1)"
-  RC=$?
+  # ⛔ THROUGH `rp`, NOT A FIFTH COPY OF THE CLEAR LIST. This arm built its own `env -u …` line and so
+  # inherited the ambient `$OR` the clear list exists to drop: measured on this box, all seven `(a3)`
+  # arms refused at `resolve_repo` (rc=3) and recorded the EXIT TRAP's `the failing step recorded no
+  # cause`, so the assertion read red for a reason the arm does not test (#3174).
+  rp "$D" "" SCOUT_LOCK_STALE_SECS="$bad"
   ck "(a3) SCOUT_LOCK_STALE_SECS='$bad' refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
   ck "(a3) SCOUT_LOCK_STALE_SECS='$bad' did NOT delete a FRESH lock" "$([ -e "$LOCK" ]; echo $?)"
   case "$OUT" in *"REPAIR: removed"*) r=1 ;; *) r=0 ;; esac
@@ -382,11 +447,7 @@ open(sys.argv[2], "w").write(out)
 PY2
 ck "(c3) the no-guards control was actually produced" "$([ -s "$MUT" ]; echo $?)"
 if [ -s "$MUT" ]; then
-OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
-        SCOUT_LOCK_STALE_SECS=9223372036854775808 \
-        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" \
-        bash "$MUT" 6 2>&1)"
-RC=$?
+rp "$D" "$MUT" SCOUT_LOCK_STALE_SECS=9223372036854775808
 ck "(c3) with the two form guards deleted the STATUS arm still refuses (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
 ck "(c3) the lock SURVIVED — the comparison error was not read as 'stale'" "$([ -e "$LOCK" ]; echo $?)"
 case "$(rec why)" in *"could not be compared"*) r=0 ;; *) r=1 ;; esac
@@ -554,9 +615,7 @@ ck "(s6) …and does not refuse it (rc=$RC — the residual is that it proceeds)
 # `cloud-cell-bringup.sh` DIES on a non-zero `--check`, so a false FAIL here refuses to START a cell.
 # That mode is offline by design and cannot connect a severed history, so it must WARN, not FAIL.
 mk_shallow_case check-shallow
-OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
-        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$REFRESH" --check 2>&1)"
-RC=$?
+rpc "$D"
 ck "(s7) --check does NOT fail a CLEAN shallow scout (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
 case "$OUT" in *"check: WARN the scout"*"SHALLOW"*) r=0 ;; *) r=1 ;; esac
 ck "(s7) it WARNS and names the shallow history as the reason it cannot judge" "$r"
@@ -585,13 +644,277 @@ open(sys.argv[2], "w").write(out)
 PY4
 ck "(s8) the pre-fix --check control was actually produced" "$([ -s "$MUT2" ]; echo $?)"
 if [ -s "$MUT2" ]; then
-OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
-        HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUT2" --check 2>&1)"
-RC=$?
+rpc "$D" "$MUT2"
 ck "(s8) WITHOUT the fix --check FAILS the clean shallow scout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
 case "$OUT" in *"check: FAIL the scout"*) r=0 ;; *) r=1 ;; esac
 ck "(s8) …and it is that FAIL line, so a cell would refuse to START" "$r"
 fi
+
+# ── (h) HERMETICITY: AN AMBIENT DECLARED `$OR` MUST NOT REACH THE PASS ───────────────────────────────
+# ⛔ THE REGRESSION TEST FOR THE CLEAR LIST ITSELF (agent-infra#3174). The defect this pins is not in the
+# shipped script at all: `rp`/`rpc` cleared every ambient provisioning knob EXCEPT `$OR`, and every
+# fixtures that existed when it was measured all prove their target with a bare LOCAL origin — which
+# `resolve_repo` refuses the moment `$OR` is DECLARED, before the provision stage runs. (The
+# `(h3)`/`(h4*)` fixtures below came later and each keeps its OWN shape (bare local path / removed
+# origin / URL naming another repo / file:// mirror / synthetic candidate); the `(h4*)`/`(h4d)` rows
+# spell the origin as a URL and redirect that transport with `insteadOf`, and no `(h3)` row ever reaches
+# a fetch — the resolver refuses above it.) Measured on a cell whose shell exports `OR`:
+# most of the suite red, each recording the EXIT TRAP's `the failing step recorded no cause` because the
+# refusal happened above `scout_sync` — which is why the cluster read as a cause-record defect.
+# The arm EXPORTS the ambient value into the suite's own environment (not into the pass), so it fails
+# on a tree where the clear list has drifted and passes only while `rp`/`rpc` keep `-u OR`.
+# ⛔ IT ASSERTS BOTH DIRECTIONS so it cannot be satisfied by a pass that ignores `$OR` outright: the
+# ambient-exported run must PROCEED (rc 0), and a DECLARED target handed to the pass EXPLICITLY must
+# still REFUSE (rc 3) — the deliberate `resolve_repo` behaviour that made the ambient leak fatal.
+mk_case hermetic
+AMBIENT_OR_SAVE="${OR:-}"; AMBIENT_DECL_SAVE="${OR_OPERATOR_DECLARED:-}"
+# ⛔ BOTH KNOBS, NOT ONE (review cycle 12, P2): the marker `OR_OPERATOR_DECLARED` alone forces the same
+# refusal — `refresh-candidates.sh:27-31` reads it as "the operator named the target", and the local-path
+# fixture then cannot prove it — but this arm used to UNSET the marker, so dropping
+# `-u OR_OPERATOR_DECLARED` from `RP_CLEAR` left every `(h)` row green. Exported now, so a drift in
+# either entry reddens the arm.
+export OR="daniel-ospina/tortoise" OR_OPERATOR_DECLARED=1
+rp "$D"
+ck "(h) an AMBIENT exported \$OR does not reach the pass (rc=$RC — it must proceed)" "$([ "$RC" -eq 0 ]; echo $?)"
+# ⛔ THE RECORD ASSERTION READS THE MARKER THE RECORD ACTUALLY CARRIES (review cycle 1, P1-ish). It used
+# to look for `was DECLARED`, a string that exists ONLY on `resolve_repo`'s stdout (its local-path `$OR_DECLARED` arm — cited by ARM, not by line, because
+# this diff has already moved that number twice) and never in
+# `why=`, so it was green by construction: measured with `-u OR` removed from `RP_CLEAR`, the pass went
+# rc=3 and this arm still printed ✅ while `why=` plainly held a `sub-step=resolve-repo` refusal.
+case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
+ck "(h) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-90))" "$r"
+# the positive control: the SAME value, handed over deliberately, IS refused — so (h) is not a fixture
+# that has simply stopped testing the resolver.
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h) a DECLARED \$OR on the invocation is still REFUSED (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$(rec why)" in *"sub-step=resolve-repo"*"local-path"*) r=0 ;; *) r=1 ;; esac
+ck "(h) …and the record NAMES the local-path origin it could not prove ($(rec why | cut -c1-90))" "$r"
+OR="$AMBIENT_OR_SAVE"
+if [ -n "$AMBIENT_DECL_SAVE" ]; then export OR_OPERATOR_DECLARED="$AMBIENT_DECL_SAVE"; else unset OR_OPERATOR_DECLARED 2>/dev/null || true; fi
+
+# ── (h2) THE `--check` TWIN MUST BE INSURED THE SAME WAY ────────────────────────────────────────────
+# `rpc` shares `RP_CLEAR` with `rp` now, so the drift this arm pins against is a future one: it EXPORTS
+# the ambient value into the suite and requires `--check` to still answer for the same fixture.
+mk_shallow_case hermetic-check
+AMBIENT_OR_SAVE="${OR:-}"
+export OR="daniel-ospina/tortoise"
+rpc "$D"
+ck "(h2) an AMBIENT exported \$OR does not reach \`--check\` (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+case "$OUT" in *"was DECLARED"*) r=1 ;; *) r=0 ;; esac
+ck "(h2) …and --check prints no 'declared \$OR' refusal" "$r"
+# the positive control for the TWIN: the same value, handed over deliberately, is refused here too.
+rpc "$D" "" OR="daniel-ospina/tortoise"
+ck "(h2) a DECLARED \$OR on a --check invocation is still REFUSED (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+# ⛔ NON-VACUITY FOR THE NEGATIVE ASSERTION ABOVE (review cycle 3, P2): a "this string is absent"
+# check stays green if the string stops existing at all, so the control must PRINT it.
+case "$OUT" in *"was DECLARED"*) r=0 ;; *) r=1 ;; esac
+ck "(h2) …and that control DOES print the refusal (h2) must not see" "$r"
+OR="$AMBIENT_OR_SAVE"
+
+# ── (h3) THE RECORDED CAUSE NAMES THE ORIGIN SHAPE IT READ, NOT A PREDICTED ONE ──────────────────────
+# `resolve_repo` refuses a REPO-set pair for FOUR different measured reasons (an unreadable origin, a
+# `file://` mirror that names no repo identity, a URL naming ANOTHER repo, a local path that cannot prove
+# a DECLARED target). The carried cause asserted the local-path wording for all four — a refusal that predicts a mechanism it never measured, the #2229
+# class this exit is being fixed to remove (review cycle 2, P2). These arms pin each arm's own words.
+# ⛔ THE FAILURE THEY PREVENT IS NOT COSMETIC: `refresh_cause_brief` quotes `why=` into the controller's
+# `[dispatch] BLOCKED` line, so a wrong mechanism sends the operator to a remedy that cannot work.
+mk_case cause-url-mismatch
+git -C "$D/repo" remote set-url origin https://github.com/someone/other.git
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h3) a URL origin naming another repo still REFUSES (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$(rec why)" in *"NOT the queue target"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) …and the recorded cause says it is a DIFFERENT repo ($(rec why | cut -c1-90))" "$r"
+case "$(rec why)" in *"local-path"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and does NOT borrow the local-path sentence" "$r"
+# …the local-path arm still names ITS shape, so (h3) cannot be satisfied by one generic sentence…
+mk_case cause-local-path
+rp "$D" "" OR="daniel-ospina/tortoise"
+case "$(rec why)" in *"local-path"*"cannot prove a DECLARED"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) the local-path arm names the local path ($(rec why | cut -c1-90))" "$r"
+# ── (h4) A TRAILING-SLASH ORIGIN THAT NAMES THE TARGET IS THE SAME REPO ─────────────────────────────
+# ⛔ A FALSE BLOCK, NOT A WORDING NIT (review cycle 4, P2). `resolve_repo`'s accept list enumerated
+# `"$OR"`, `"$OR.git"`, `*":$OR"`, `*":$OR.git"`, `*"/$OR"`, `*"/$OR.git"` — so a remote with a
+# TRAILING SLASH (`https://github.com/<owner>/<repo>/`, which `git remote add` accepts and humans type)
+# was refused as "NOT the queue target", and the cause this diff adds would have written "a DIFFERENT
+# repo, and no retry can mend a mismatch" about the RIGHT repo. Both the accept list and the cause
+# predicates now carry the trailing-slash spellings, and this arm pins that the pass PROCEEDS.
+mk_case cause-trailing-slash
+git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise/"
+# ⛔ THE TRANSPORT IS REDIRECTED, THE SPELLING IS NOT (review cycle 5, P1-shaped P2): without this line
+# `scout_sync` FETCHES github.com for real — it broke this file's own "no network is touched" invariant
+# (stated at the top of this file — cited by name, not by line: this PR has moved line numbers twice) and made the arm's outcome depend on egress. `insteadOf` rewrites the transport while
+# `git config --get remote.origin.url` still answers the trailing-slash URL that `resolve_repo` reads,
+# so the arm measures the accept list and nothing else.
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "https://github.com/daniel-ospina/tortoise/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+# ⛔ A POSITIVE ASSERTION, NOT TWO ABSENCES (review cycle 5, P2). "no 'NOT the queue target'" and "no
+# resolve-repo in the record" are both green when the pass dies BEFORE the resolver — measured by
+# injecting an unrelated early `provision_fail`, which left both lines ✅ while `resolve_repo` never ran.
+# With the transport redirected the pass completes, so rc=0 pins the accept list directly.
+ck "(h4) a trailing-slash origin naming the target is ACCEPTED and the pass proceeds (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+case "$OUT" in *"NOT the queue target"*) r=1 ;; *) r=0 ;; esac
+ck "(h4) …and it is not refused as a different repo" "$r"
+case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
+ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-70))" "$r"
+# NON-VACUITY: with the trailing-slash spellings removed from `resolve_repo`'s REPO-SET accept list this
+# fixture prints `NOT the queue target` and the `(h4)` rows above go red. ⛔ NO INTEGER IS QUOTED HERE:
+# the suite's arm count has moved three times while this block was written, and a stale `N passed`
+# in a comment is re-derived by the next lane and found false. The stable, re-verifiable claim is the
+# mechanism: strip an arm, the row that names that spelling reddens.
+# ⛔ ALL FOUR TRAILING-SLASH SPELLINGS ARE PINNED, ONE ROW EACH (review cycles 6-8, P2). With only
+# `*"/$OR/"` covered, removing any of the other three from ALL THREE lists still printed
+# the whole suite green — i.e. what the change claims to fix rested on inspection. One row per spelling
+# now, and the claim each row makes is the mechanism, not a count: strip that spelling from the accept
+# lists and THAT row reddens. Every fixture redirects the transport with `insteadOf` (so the spelling
+# stays realistic while nothing reaches the network) and asserts rc=0.
+# ⛔ WHICH COPY EACH ROW PINS (review cycles 8-9, P2): the four spelling rows above run with `REPO=` set,
+# so they pin `resolve_repo`'s REPO-SET list only. The same four arms are also carried by the
+# CANDIDATE-LOOP predicate (the auto-derive path a cell without `REPO` uses) and by the `_pair` cause.
+# `(h4d)` below runs the SAME four spellings through the candidate loop; stripping the arms from that
+# copy reddens `(h4d)` and leaves every other row green. The `_pair` copy is DEFENSIVE and is pinned by
+# nothing:
+# `resolve_repo` returns 0 whenever that predicate matches, so its "names `$OR` yet the resolver refused
+# it" arm is reachable only by a config race. Stated, not implied.
+mk_case cause-trailing-slash-git
+git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise.git/"
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "https://github.com/daniel-ospina/tortoise.git/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h4b) an https '…/tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+mk_case cause-trailing-slash-scp
+git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise.git/"
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise.git/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h4b) an scp-form '…:tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+# …and the FOURTH arm, the scp form WITHOUT `.git` (review cycle 7, P2): stripping `*":$OR/"` from all
+# three lists left the suite green — the comment above claimed every row was its own fixture while
+# that one was covered by nothing. Each of the four is a row now, so every TRAILING-SLASH spelling is
+# pinned. ⛔ THE SIX PRE-EXISTING ARMS ARE STILL PINNED BY NOTHING: deleting `"$OR"`, `"$OR.git"`,
+# `*":$OR"`, `*":$OR.git"`, `*"/$OR"` and `*"/$OR.git"` from all three lists leaves the suite GREEN (no
+# integer — the note above explains why: a count here was re-derived as false one round later). Stated
+# rather than implied, so a future lane can pin them the same way.
+mk_case cause-trailing-slash-scp-nogit
+git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise/"
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h4c) an scp-form '…:tortoise/' (no .git) origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+# ── (h4d) THE CANDIDATE LOOP'S COPY OF THE SAME PREDICATE, ONE ROW PER SPELLING ─────────────────────
+# ⛔ THE AUTO-DERIVE PATH IS WHAT A CELL WITHOUT `REPO=` USES (review cycles 8-9, P2), and it carries its
+# own copy of the accept list — the same duplication this file's `RP_CLEAR` exists to stop. Stripping the
+# arms from THAT copy alone left the suite green for three of the four, so the path a cell actually takes
+# on a box with no exported checkout could lose them silently. The candidate list is derived from `$OR`'s
+# last path segment (`$HOME/<name>`, `/tmp/<name>`), so a SYNTHETIC `$OR` names a candidate that cannot
+# exist anywhere except where this arm puts it — that is what makes the arm hermetic (see `(h3)`).
+# ONE ROW PER SPELLING: a single row covered only `*"/$OR/"`, and the other three stayed silent.
+H4D_OR="no-such-org/tortoise-derived-3174"
+H4D_N=0
+for h4d_spelling in \
+  "https://github.com/no-such-org/tortoise-derived-3174/" \
+  "https://github.com/no-such-org/tortoise-derived-3174.git/" \
+  "git@github.com:no-such-org/tortoise-derived-3174/" \
+  "git@github.com:no-such-org/tortoise-derived-3174.git/"
+do
+  H4D_N=$((H4D_N+1))
+  mk_case "cause-derived-$H4D_N"
+  git clone -q "$D/origin.git" "$D/home/tortoise-derived-3174"
+  git -C "$D/home/tortoise-derived-3174" config user.email t@t
+  git -C "$D/home/tortoise-derived-3174" config user.name t
+  git -C "$D/home/tortoise-derived-3174" remote set-url origin "$h4d_spelling"
+  git -C "$D/home/tortoise-derived-3174" config "url.$D/origin.git.insteadOf" "$h4d_spelling"
+  rp "$D" "" REPO= OR="$H4D_OR"
+  ck "(h4d) a DERIVED candidate with the origin '$h4d_spelling' is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+  case "$OUT" in *"REPO was not set — using"*) r=0 ;; *) r=1 ;; esac
+  ck "(h4d) …and it was that candidate the pass chose ('$h4d_spelling')" "$r"
+done
+# ⛔ THE UNSET-`$REPO` ARM IS HERMETIC BECAUSE THE CANDIDATE LIST IS DERIVED FROM `$OR` (review cycle 3,
+# P2 — this arm was briefly retired on a FALSE premise). `repo_candidates` builds `/tmp/${OR##*/}` and
+# `$HOME/${OR##*/}`, so a SYNTHETIC `$OR` names candidates that cannot exist on any box, while every
+# other candidate (`/tmp/cell`, `${TORTOISE_REPO}`, `${TORTOISE}`) is rejected by the origin check. The
+# earlier version exported the real `OR` and this box's real `/tmp/tortoise` checkout made it proceed
+# (rc=0), which pinned the box — that is a fixture problem, not a reason to leave `_pair`'s `else`
+# branch with zero coverage.
+mk_case cause-no-repo
+rp "$D" "" REPO= OR="no-such-org/no-such-repo-3174"
+ck "(h3) with no \$REPO set at all the pass still REFUSES (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$(rec why)" in *"no \$REPO was set"*"no candidate checkout"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) …and the cause says no checkout was FOUND, naming no origin ($(rec why | cut -c1-90))" "$r"
+# …and the UNREADABLE-origin shape — the FIRST arm of `_pair`'s case (`''`), not the third. Without it, a
+# URL naming `$OR` and an origin that cannot be read are indistinguishable in the record.
+mk_case cause-no-origin
+git -C "$D/repo" remote remove origin
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h3) a checkout with NO origin remote still REFUSES (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$(rec why)" in *"NO READABLE 'origin'"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) …and the cause says the origin is UNREADABLE ($(rec why | cut -c1-90))" "$r"
+case "$(rec why)" in *"local-path"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and does not claim a local-path origin it never read" "$r"
+# …and the FILE:// MIRROR, which is not evidence of a different repo (review cycle 13, P2): it matched
+# the `*://*` classifier and was reported as "a DIFFERENT repo, and no retry can mend a mismatch" — an
+# identity claim never measured, about the shape this repo calls a legitimate local mirror.
+mk_case cause-file-url
+git -C "$D/repo" remote set-url origin "file://$D/origin.git"
+rp "$D"
+ck "(h3) a file:// mirror origin REFUSES (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$(rec why)" in *"local-mirror"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) …and the cause calls it a LOCAL MIRROR, not a different repo ($(rec why | cut -c1-80))" "$r"
+case "$(rec why)" in *"DIFFERENT repo"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and it makes no identity claim it did not measure" "$r"
+# ⛔ THE LOG AND THE RECORD MUST AGREE (review cycle 14, P2): the record said "local mirror" while the
+# log line one above it still said "NOT the queue target … another repo's tree is #1901". Both say the
+# same thing now; these rows pin the LOG half.
+case "$OUT" in *"local mirror"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) …and the LOG calls it a local mirror too" "$r"
+case "$OUT" in *"another repo's tree"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and the log makes no #1901 identity claim about it" "$r"
+# …and the remedy it offers is one that CAN work (review cycle 15, P2): the sibling local-path arm may
+# say "or unset OR to use the harness default" because IT is gated on `OR_DECLARED`; this refusal is
+# unconditional, and this fixture runs with the harness default already in force. Re-adding the clause
+# to the `file://` arm reddens this row, and the sibling arm keeps printing the string elsewhere — so
+# the row is not vacuous.
+case "$OUT" in *"unset OR"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
+
+# ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
+# ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here
+# (the REPO-set arm, the candidate loop, and `_pair`'s cause classifier) and a fourth in
+# `scripts/cloud-cell-supervisor.sh`'s OWN `resolve_repo`, which is the auto-derive path a cell with no
+# exported `$REPO` takes. The trailing-slash spellings were added to these three and NOT to that one,
+# so the two entry points disagreed on a URL-shaped origin — `refresh --check` derived the checkout,
+# `cloud-cell-supervisor.sh check` died "REPO is not set and no single checkout could be derived" —
+# which also made this file's DECLARED RESIDUAL paragraph ("the two verbs agree wherever the origin is
+# URL-shaped") false as written. That paragraph is the thing a future lane trusts when deciding the
+# entry points agree, and a per-copy behavioural arm in the supervisor's own suite (its `(7d)`) pins
+# the BEHAVIOUR; this row pins the LOCKSTEP, so the next spelling added to one copy and not the others
+# reddens here instead of shipping a second divergence.
+# ⛔ STATED RESIDUAL: if a future change SINGLE-SOURCES the predicate (both files calling one helper),
+# the supervisor's copy disappears and this row reds. That is a deliberate over-block — re-pin the row
+# consciously, because the cheap alternative (an absence-tolerant comparison) is green in exactly the
+# case this arm exists to catch.
+RP_ROOT="$(cd "$HERE/../.." && pwd -P)"
+RP_SUP="$RP_ROOT/scripts/cloud-cell-supervisor.sh"
+# The arm list itself, whitespace-normalised and with a trailing ` ;;` dropped: the three `case` copies
+# end in `;;`, `_pair`'s copied list does not, and that difference is a syntax detail — not the
+# predicate. Anything else (a missing or extra spelling here) is the drift.
+h5_lines() { grep -n '"\$OR"|"\$OR\.git"' "$1" 2>/dev/null | sed 's/^[0-9]*://' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]*;;$//'; }
+H5_REF="$(h5_lines "$REFRESH" | head -1)"
+H5_SUP="$(h5_lines "$RP_SUP")"
+ck "(h5) the supervisor carries its own copy of resolve_repo's accept list (found in $RP_SUP)" "$([ -n "$H5_SUP" ]; echo $?)"
+ck "(h5) …and the SHIPPED refresh-candidates.sh carries at least one (found here)" "$([ -n "$H5_REF" ]; echo $?)"
+H5_EXPECT="$([ -n "$H5_REF" ] && echo "$H5_REF" || echo "$H5_SUP")"
+H5_DISTINCT="$( { h5_lines "$REFRESH"; h5_lines "$RP_SUP"; } | sort -u | grep -c . )"
+ck "(h5) every copy lists the SAME spellings (distinct arm lists: $H5_DISTINCT — 1 means no drift)" "$([ "$H5_DISTINCT" -eq 1 ]; echo $?)"
+H5_TS=0
+for h5_spelling in '*"/$OR/"' '*"/$OR.git/"' '*":$OR/"' '*":$OR.git/"'; do
+  case "$H5_EXPECT" in *"$h5_spelling"*) H5_TS=$((H5_TS+1)) ;; esac
+done
+ck "(h5) …and the shared list carries all four trailing-slash spellings ($H5_TS of 4)" "$([ "$H5_TS" -eq 4 ]; echo $?)"
+# ⛔ NAMING THE DRIFT, not just counting it: when a copy diverges, this row prints the outlier so the
+# operator sees WHICH file to edit instead of being sent to re-derive four case arms by hand.
+H5_OUTLIERS="$( { h5_lines "$REFRESH"; h5_lines "$RP_SUP"; } | sort | uniq -u | head -3 )"
+case "$H5_OUTLIERS" in
+  "") r=0 ;;
+  *) printf '  (h5) divergent arm list(s):\n%s\n' "$(printf '%s\n' "$H5_OUTLIERS" | sed 's/^/         /')"; r=1 ;;
+esac
+ck "(h5) …and no copy's list is an outlier" "$r"
 
 echo
 echo "==> $PASS passed, $FAIL failed"
