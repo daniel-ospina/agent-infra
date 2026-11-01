@@ -1,17 +1,27 @@
 name: CI on main
 # Post-merge safety net (issue #86): catches "PR A + PR B together break main"
-# that per-PR review cannot see. Runs after every push to main.
+# that per-PR review cannot see. Runs after every push to `main` — and, since #3131, on
+# `integration/**` batch branches too, so the tree a batch would land from is gated by the SAME
+# matrix before it reaches main. The auto-file signal stays main-only (see `auto-file-on-failure`'s
+# `if:`): an integration-branch failure is not a main breakage and must not be filed as one.
 #
 # Hard gates (fail on error): extension tests + script validation + skill lint —
 # deterministic and green today. skill-lint is the post-merge re-check; the
 # per-PR hard gate runs in ci.yml → node-ci.yml (issue #237).
 #
-# On failure, a GitHub issue is auto-filed (no human gate — the AI review gate
-# already guards merges; this is the post-merge backstop).
+# On failure, a GitHub issue is auto-filed. That filing is MAIN-ONLY: an
+# `integration/**` push below runs this same matrix as a PRE-merge gate, and a
+# red integration tree must NOT be reported as "main broken by merge" — it never
+# reached main (agent-infra#3131).
 
 on:
   push:
-    branches: [main]
+    # `integration/**` is the batch/integration train (agent-infra#3131): K PRs are
+    # merged into one branch and THIS matrix runs ONCE on the composed tree, so
+    # main only ever receives a tree that already passed. No `concurrency:` block
+    # is added — a push-triggered workflow must not cancel (check-workflow-
+    # concurrency.sh R2), and the train is single-writer by design.
+    branches: [main, 'integration/**']
 
 permissions:
   contents: read
@@ -30,6 +40,53 @@ jobs:
       script-validate: false
       skill-lint: false
       test-command: |
+        # #3131 — this matrix now also runs on `integration/**` (#3139), and ONE
+        # guard assertion is keyed to the checkout rather than to the change:
+        # `extensions/main-worktree-guard/test.mjs` expects the sanctioned-recovery
+        # script `git checkout main && git pull --ff-only` to be ALLOWED, which the
+        # classifier can only grant when `main` is a verifiable checkout target
+        # (`_recoveryCheckoutVerifiable` → a local `refs/heads/main`, or exactly one
+        # remote whose fetch refspec maps onto an EXISTING tracking ref). A
+        # single-ref checkout of a non-main branch leaves NEITHER, so the guard
+        # correctly answers `block` and the assertion fails for a reason that has
+        # nothing to do with the branch's content — measured on two runs: this
+        # assertion GREEN in `main`'s unit-test log (run 41185164653), RED in
+        # `integration/batch-20261031-16`'s (run 41190178021, job
+        # `extension-tests / unit-test`), with `classify-git.mjs` byte-identical to
+        # main.
+        #   ⚠ The `unit-test` JOB was ALSO red on `main` while this was written, for
+        # an UNRELATED reason (`test-sanctioned-identity.mjs`: stale
+        # `sanctioned-scripts.pin.json` digests for `record-review.sh` /
+        # `admin-merge.sh`, 14 passed / 6 failed on run 41185164653). `main` carries
+        # the fix for that red — `#3140` re-cut the pin at `6423b5bc3` — and the
+        # reason this fix matters is the GENERAL case, not that instance: two
+        # independent causes reddening one job make an `integration/**` failure
+        # unattributable, because one of the two is invisible to any baseline
+        # comparison.
+        #   Materialize the DWIM source rather than weaken the assertion: the test
+        # then measures the guard, not the checkout depth, and every future
+        # `integration/**` run stays judgeable. NOT `|| true` — a fetch that cannot
+        # produce `origin/main` must fail the job loudly, because silently skipping
+        # it would restore the false red it exists to remove. `--no-tags` mirrors
+        # actions/checkout (which fetches without tags by default), so the non-main
+        # run does not pull tags into a checkout that would otherwise have none.
+        #   The `--git-dir` clause is NOT cosmetic: `scripts/check-pi-pin-lockstep.mjs`
+        # EXECUTES this committed `test-command` inside a `mktemp -d` directory that is
+        # not a repository, under `bash -e`. Unguarded, the fetch exits 128 there and
+        # takes the whole step down. Measured on the UNGUARDED revision of this preamble
+        # (`0bac887d9`): 115 passed / 9 failed, and 124 / 0 on that SAME commit with the
+        # fetch skipped (`GITHUB_REF=refs/heads/main`) — same head, so the fetch is the
+        # cause. With this guard, `node scripts/check-pi-pin-lockstep.mjs` is 124 / 0 at
+        # EVERY value of `GITHUB_REF` (unset, main, refs/pull/N/merge, a feature branch),
+        # because the harness's temp dir has no repo to fetch into.
+        # Outside a repository there is no
+        # tracking ref to create and nothing to judge; the guard's own assertion
+        # answers `allow` there because `_recoveryCheckoutVerifiable` has no git dir to
+        # consult. So: skip when there is no repo, and fail loudly when there is one and
+        # the fetch cannot produce `origin/main`.
+        if [ "${GITHUB_REF:-}" != "refs/heads/main" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+          git fetch --depth=1 --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+        fi
         failures=0
         # #2188 — a suite that CRASHES (an uncaught assertion) prints no aggregate
         # line at all, so `scripts/ci_exemption.py ids` yielded ZERO identities for
@@ -92,9 +149,9 @@ jobs:
         # Glob-collected: every extensions/*/test*.mjs suite, including #744's
         # main-worktree-guard/test-module-load.mjs (the index.ts module-LOAD
         # regression pin) — no explicit line for it, that would double-run it.
-        # ⚠️ This leg is POST-MERGE only (on: push → main); the per-PR run of
-        # the #744 suite is wired in ci.yml — the per-PR workflow that runs the
-        # test suites. (This comment used to add "pipeline-compliance.yml is also
+        # ⚠️ This leg runs on the PUSH lane only — `main`, and `integration/**` since #3131 —
+        # never on a pull request (this workflow has no `pull_request` trigger). The per-PR run of
+        # the #744 suite is wired in ci.yml, the workflow that runs the test suites on PRs. (This comment used to add "pipeline-compliance.yml is also
         # PR-triggered, but runs no test suite" — stale since #991, which wired
         # the pipeline-compliance fixture suite in, and since #1027, which added
         # tests/materialize-agents/run.sh to the same required job.)
@@ -276,8 +333,10 @@ jobs:
         # #5550/#1491 — the push-scope PROOF (D1–D3 + F1–F14). It was wired into
         # NO lane while its three siblings ran, so a previously-unrun suite could
         # rot unobserved; this step closes that gap and runs beside its siblings.
-        # NOTE this lane is trigger `push: [main]` (post-merge, like the unit/e2e
-        # suites above): a regression is reported on main AFTER merge, not before.
+        # NOTE this lane runs on the PUSH lane only — `main` (post-merge, where a regression is
+        # reported AFTER merge) and, since #3131, `integration/**` (a PRE-merge batch gate, where the
+        # same red blocks the batch instead) — like the unit/e2e suites above. This workflow has no
+        # `pull_request` trigger, so nothing here gates a PR.
         # A PR-gating leg is the follow-up (the suite value-imports ./index.js,
         # which imports the pi SDK, so it needs a scoped `npm ci` that ci.yml's
         # verify job deliberately avoids — the same constraint as its siblings).
@@ -402,6 +461,22 @@ jobs:
 
   script-validate:
     runs-on: ubuntu-latest
+    # ⛔ #3131 — `merge-reminder.test.sh` §27b is the SECOND ambient-ref reader on this matrix. It
+    # requires `box-status.sh` to print `ref: origin/main=<sha>`, a line emitted ONLY when
+    # `git -C "$REPO" rev-parse --verify origin/main` resolves; an unresolvable ref produces no
+    # `ref:` line at all (and no diagnostic — `REF_WHY` is set only on a refusal), so the grep
+    # simply misses. A push to a non-main branch checks out ONE ref, so `origin/main` does not exist
+    # and the job reds for a reason unrelated to the tree. MEASURED on the batch matrix: the shard
+    # failed on `integration/batch-*` while the same file passes on `main`, and it was the ONLY new
+    # shard against main's own run (§27b was the sole failing assertion; a controlled experiment with
+    # content held constant flipped exactly that assertion by deleting only `refs/remotes/origin/main`).
+    #   So the ref is materialized here too, under the same two conditions as the `extension-tests`
+    # preamble, with the same no-`|| true` rule.
+    #   ⚠ THIS IS A WORKAROUND, AND IT MUST NOT BE SILENTLY REMOVED: the real fix is #3160 — §27b is
+    # about the SUBDIRECTORY rule and should point its candidate at the suite's own fixture repo (which
+    # carries its own `origin/main`) instead of the ambient checkout. That fixture change is in flight
+    # on the batch branch, NOT in this PR, so this step stays until #3160 lands; removing it earlier
+    # would reinstate the false red on every `integration/**` run.
     # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the one
     # runner below, UNSHARDED (main runs once per merge, so the queue a hang would starve is
     # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation
@@ -482,6 +557,17 @@ jobs:
         # old 70 min was sized from a measurement taken before #2529 and could not fail fast.
         timeout-minutes: 15
         run: bash tests/ci-lane-parity/run.sh
+      - name: Materialize origin/main so checkout-keyed assertions are judgeable (#3131)
+        # ⛔ NO `if:` on this step: `scripts/check-ci-lane-parity.sh` refuses a conditional step around the
+        # shard call ("a step that may not run, whose failure cannot fail the run"), so the condition
+        # lives inside the shell — exactly as the `extension-tests` preamble does it.
+        run: |
+          # See the job comment. NOT `|| true`: a fetch that cannot produce the ref must fail loudly,
+          # because silently skipping it reinstates the false red this step removes. The `--git-dir`
+          # clause is the one non-failure skip — no repository means no tracking ref to create.
+          if [ "${GITHUB_REF:-}" != "refs/heads/main" ] && git rev-parse --git-dir >/dev/null 2>&1; then
+            git fetch --depth=1 --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          fi
       - name: Bash shards — the ONE list both lanes run (#1369)
         # #1369 — the ONE list of bash shards is scripts/run-bash-shards.sh, and BOTH lanes
         # call it: a shard added there is in both lanes by construction, so a lane split
@@ -642,7 +728,16 @@ jobs:
   auto-file-on-failure:
     runs-on: ubuntu-latest
     needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
-    if: failure()
+    if: failure() && github.ref == 'refs/heads/main'
+    # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131), in DIFFERENT directions.
+    #   `failure()` must stay: the steps derive the failing set from `needs`, and the
+    #   filer files EVEN WHEN THAT SET IS EMPTY (bare title `main broken by merge`,
+    #   `Failing jobs: unknown`) — there is no `failed.length === 0` early return. So a
+    #   ref condition ALONE would run this job on every push to `main` and file a FALSE
+    #   "main broken by merge" issue on every GREEN one.
+    #   The ref clause is what keeps an `integration/**` matrix failure from being filed
+    #   as "main broken by merge": that tree never reached main, and a false issue there
+    #   is precisely the noise that hides the real ones.
     # RESIDUAL (round-2 review): paginate -> find -> create is check-then-act, so two
     # concurrent post-merge runs can both create (runs 34534428397 / 34534452089 failed 17s
     # apart on 2026-09-10 and filed #710 / #711). A job-level `concurrency:` group was added
