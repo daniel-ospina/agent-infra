@@ -14880,7 +14880,7 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
 # unqualified absence answer, and (n2) is the mutation — with the equivalence
 # deleted the mapped answer must disappear, so these assertions rest on that arm alone.
 # ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: main has no gate
-# JOB, so its two programs run as STEPS inside `script-validate` (ci-main.yml:456/:462) and
+# JOB, so its two programs run as STEPS inside `script-validate` (named, not line-cited) and
 # that red also has a base counterpart under the other name. (n1) pins the SCOPING decision
 # (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own note says
 # so rather than claiming the programs differ.
@@ -15272,6 +15272,22 @@ grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/mut-err" 2>/dev/null \
 grep -q "check 'bash-suites (5)'" "$SCEN_EQ/mut-err" 2>/dev/null \
   && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
   || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
+
+
+# ── #10399: the unresolved-check refusal, in both directions ────────────────
+# Run as its OWN process so its assertions are independent of this file's fixture
+# state, and so a failure names the file that failed. ⛔ Without this line the new
+# test is gated by NOTHING: shard discovery is `tests/*/run.sh` only, so a file
+# added beside this one is never executed by CI (nor by check-bash32-parse.sh,
+# which only does `bash -n`) — an inert enforcer is the class this repo treats as
+# category A, not as coverage.
+if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ] || [ -f "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ]; then
+  if bash "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh"; then
+    checks=$((checks + 1)); pass "(n) check-unresolved.sh — the unresolved-check refusal, both directions"
+  else
+    checks=$((checks + 1)); fail "(n) check-unresolved.sh FAILED — see its output above"
+  fi
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
