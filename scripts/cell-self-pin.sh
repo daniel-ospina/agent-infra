@@ -567,6 +567,7 @@ declares() {
 
 verify_unit() { # <rendered service> — the properties the ISSUE names, asserted on the ARTIFACT
   local f="$1" body exec_path n_exec execs envs ok_vals v w seen0=0 _interp _x _c
+  local n_home home_val _env _kv
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
   # next reader to delete the only explanation of why the line is banned. Strip comments first.
@@ -629,11 +630,41 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   # home, so a unit that carried only `HOME=` left the pass defaulting CELL_HOME from an unrelated value
   # while its ExecStart sat under the real one — measured: the pass then read `$HOME/.harness-path` while
   # the controller read `$CELL_HOME/.harness-path`, i.e. it pinned a tree the controller never runs.
+  # ⛔ EXACTLY ONE `CELL_HOME=` ASSIGNMENT — A COUNT AND VALUE RULE, NOT A PRESENCE TEST. `Environment=` is
+  # LAST-WINS in systemd: a SECOND assignment of the same variable OVERRIDES the first. A presence test
+  # therefore installs GREEN a unit whose EFFECTIVE base is a different path, while `ExecStart` — and so
+  # the `$CELL_HOME` prefix rule above — still sits under the real one, so no other rule catches it and
+  # the pass reads a pin record the controller never reads. MEASURED before this rule existed: appending
+  # `Environment=CELL_HOME=/tmp/other-home` to the template installed rc=0 and wrote BOTH lines.
+  # This is the same defect shape as the `ExecStart=` count rule above, and it is fixed the same way —
+  # including the spellings systemd accepts (`Environment="CELL_HOME=/x"` — the quotes are stripped —
+  # several assignments on one line, and an indented `Environment=`).
   envs="$(directive "$body" Environment)"
-  case $'\n'"$envs"$'\n' in
-    *$'\n'"CELL_HOME=${CELL_HOME}"$'\n'*) ;;
-    *) bad "the rendered unit does not carry 'Environment=CELL_HOME=${CELL_HOME}' — without it the pass derives its base from the service manager's HOME and can read a DIFFERENT pin record than the controller"; return 1 ;;
-  esac
+  n_home=0
+  home_val=""
+  while IFS= read -r _env; do
+    for _kv in $_env; do
+      _kv="${_kv%\"}"; _kv="${_kv#\"}"
+      case $_kv in
+        CELL_HOME=*) n_home=$((n_home + 1)); home_val="${_kv#CELL_HOME=}" ;;
+      esac
+    done
+  done <<<"$envs"
+  if [ "$n_home" -ne 1 ]; then
+    bad "the rendered unit declares ${n_home} 'Environment=CELL_HOME=' assignment(s) — exactly one is installable (systemd is LAST-WINS, so a second one silently re-bases the pass onto a DIFFERENT pin record than the controller)"; return 1
+  fi
+  if [ "$home_val" != "$CELL_HOME" ]; then
+    bad "the rendered unit's Environment=CELL_HOME='${home_val}' is not the cell home '${CELL_HOME}' — the pass would derive its base from a value the controller never read, so it pins a different record"; return 1
+  fi
+  # ⛔ `EnvironmentFile=` IS REFUSED BY NAME, AND IT IS THE SAME THREAT SURFACE, NOT AN ADJACENT NICETY.
+  # systemd READS the named file and its assignments OVERRIDE the unit's `Environment=`, so an
+  # `EnvironmentFile=` can set `CELL_HOME` to a base no rule in this file reads — while the count rule
+  # above still sees exactly one `Environment=CELL_HOME=` and passes. Refused rather than modelled: the
+  # rendered pin unit needs no environment file (`print_unit` emits every value it needs), so there is
+  # nothing to preserve by supporting one.
+  if declares "$body" EnvironmentFile; then
+    bad "the rendered unit declares EnvironmentFile= — systemd reads that file and its values OVERRIDE Environment=, so it can re-base the pass onto a pin record this verification never reads; the pin unit needs no environment file"; return 1
+  fi
   # ⛔ AND IT MUST NOT DECLARE A WORKING DIRECTORY AT ALL. Any absolute path here is a bootstrap-time
   # value outliving its directory; the pass `cd`s itself after resolving the layer. `declares` (not a
   # value read) so `WorkingDirectory=` with an empty or continued value cannot slip past.
@@ -686,7 +717,7 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
 # executable directive, a working directory, a condition (a green skip), or a wider success vocabulary —
 # because every one of those is a directive this file does not verify and systemd RUNS anyway.
 verify_dropins() { # <unit-dir> <unit-name>
-  local dir="$1/$2.d" f body _c
+  local dir="$1/$2.d" f body _c _kv
   [ -d "$dir" ] || return 0
   for f in "$dir"/*.conf; do
     [ -f "$f" ] || continue
@@ -704,6 +735,26 @@ verify_dropins() { # <unit-dir> <unit-name>
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
         SuccessExitStatus)
           bad "the installed drop-in ${f} declares SuccessExitStatus= — it would widen the unit's green vocabulary past 0/11, which is a false PASS; remove ${f}"; return 1 ;;
+        EnvironmentFile)
+          bad "the installed drop-in ${f} declares EnvironmentFile= — systemd reads that file and its values OVERRIDE the unit's Environment=, so it can re-base the pass onto a pin record no rule here reads; remove ${f}"; return 1 ;;
+        Environment)
+          # ⛔ A DROP-IN MAY ADJUST IDENTITY, AND THAT ALLOWANCE IS EXACTLY ONE VARIABLE WIDE. The
+          # comment above this function names the remedy as `User=` and `Environment=HOME=` — so allow
+          # `HOME=` and refuse EVERY other `Environment=` assignment, rather than blocklisting the names
+          # this file happens to know (`CELL_HOME`, `HARNESS_PIN_FILE`, `HARNESS`, `HARNESS_PIN_DIR`, …).
+          # A blocklist here is the "family closed by one name" defect this file already fixed twice:
+          # every one of those variables is READ by this pass, so a drop-in that sets any of them
+          # silently re-points the pass at a different record while `--install` reports success. Allowed
+          # names are the closed set; a variable systemd or a future revision adds is refused without
+          # another review.
+          for _kv in $(directive "$body" Environment); do
+            _kv="${_kv%\"}"; _kv="${_kv#\"}"
+            case $_kv in
+              HOME=*) ;;
+              *)
+                bad "the installed drop-in ${f} sets 'Environment=${_kv%%=*}=' — a drop-in OVERRIDES the rendered unit, so an environment value other than HOME= can re-point the pass at a different pin record than the controller; a drop-in may adjust IDENTITY (User=, Environment=HOME=), never the base or the record it reads; remove ${f}"; return 1 ;;
+            esac
+          done ;;
       esac
     done
   done
