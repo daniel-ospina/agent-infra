@@ -4485,11 +4485,19 @@ SH
 # question, and `_pid_is_foreign_root_leak`'s DECISION is what every leg grades. It is NOT inert:
 # with $FAKE_OWNER = the candidate's pid the leg must report SAFE, and with the ownership term deleted
 # from the shipped script that same leg reports LEAK and fails — so the call itself is pinned.
-for _zzlib in "$C/lib.sh" "$C/lib2.sh"; do
-  cat >> "$_zzlib" <<'SH'
+# ⛔ NOT A `for … in "$C/lib.sh" "$C/lib2.sh"` LOOP (#2315). The fixture-parity guard below
+# ("the fixture's worker seed must not drift") flags ANY non-comment `for … in` line naming two or more
+# `*.sh` literals, because that is the signature of a hand-written WORKER seed list — which is exactly
+# how a new worker went missing in 52 unrelated failures. A loop over two lib PATHS trips it, and the
+# guard is right to be blunt: the allow-list form was already proven dodgeable. So the stub is written
+# twice, explicitly, through a helper whose `cat` is the same one the single-lib seam above uses.
+_zz_ownership_stub() { # <lib>
+  cat >> "$1" <<'SH'
 lock_controller_pid() { printf '%s\n' "${FAKE_OWNER:-}"; }
 SH
-done
+}
+_zz_ownership_stub "$C/lib.sh"
+_zz_ownership_stub "$C/lib2.sh"
 
 # (0) PRECONDITION — every function this section drives must EXIST in $SUP. Legs (2)/(2b)/(4) assert
 #     "SAFE", which is exactly what a MISSING function prints, so without this arm the whole negative
@@ -4749,8 +4757,12 @@ esac
 #       closes the hazard per candidate; this pin closes it per CALL, so the ordering itself is asserted
 #       rather than left to the reader. A reap hoisted back above the `_own` read restores the exact
 #       defect — 3600 s of handover replaced by a 10 s kill — and every other leg above stays green.
+#       ⛔ THE EXTRACTION MUST TOLERATE THE NESTING: `foreground_handover` is a function defined INSIDE
+#       `cmd_start`, so it is INDENTED ("  foreground_handover() {") and it closes with an indented `}`.
+#       The first version matched `^foreground_handover()` and found NOTHING, then reported three `bad`s
+#       against an empty string — a false pin that a reader would have taken for three code defects.
 say_case 'the handover reads OWNERSHIP before it reaps (#2315 review P0)'
-_zz_fh="$(sed -n '/^foreground_handover()/,/^}/p' "$SUP")"
+_zz_fh="$(sed -n '/^[[:space:]]*foreground_handover()/,/^[[:space:]]*}$/p' "$SUP")"
 [ -n "$_zz_fh" ] && ok 'foreground_handover was found in the supervisor' \
                  || bad 'could not locate foreground_handover in the supervisor — this case would otherwise pass vacuously'
 _zz_own_ln="$(printf '%s\n' "$_zz_fh" | grep -n '^    _own="\$(owned_controller_pids' | head -1 | cut -d: -f1)"
@@ -4916,6 +4928,15 @@ esac
 #       in-flight-landing-work death the handover's ownership guard exists to prevent.
 : > "$C2/session"; : > "$C2/killed"; render_leftover_pane "$C2/o"
 rm -f "$C2/o/.orch.lock"
+# ⛔ THE OPERATOR PATH REACHES `assert_queue_target` FIRST (service mode does not), so the fixture's
+# REPO must be a checkout whose `origin` names the queue this cell declares — otherwise `start` dies on
+# the QUEUE check and never reaches the branch under test. The first draft of this leg reported
+# "neither names the leftover nor the remedy" against a FATAL about `remote get-url origin`: the leg
+# was asserting on the wrong refusal, which is a leg that grades nothing. `git` stays REAL (the suite's
+# standing rule) — this is a real, empty repo with a real remote.
+git -C "$C2/home" init -q 2>/dev/null || true
+git -C "$C2/home" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null \
+  || git -C "$C2/home" remote set-url origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
 N_OUT="$(PATH="$C2/bin:$PATH" PROC_ROOT="$C2/proc-clean" CELL_HOME="$C2/home" ENV_FILE="$C2/home/keys.env" \
   SESSION=orch O="$C2/o" REPO="$C2/home" OR=daniel-ospina/agent-infra SCOPE=own \
   HARNESS="$C2/harness" CONTROLLER_ORPHAN_TIMEOUT=5 \
