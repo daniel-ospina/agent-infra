@@ -743,10 +743,22 @@ case "$OUT" in *"NOT the queue target"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and it is not refused as a different repo" "$r"
 case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-70))" "$r"
+# ⛔ THE OTHER THREE TRAILING-SLASH SPELLINGS ARE PINNED HERE (review cycle 6, P2): with only the
+# `*"/$OR/"` row covered, removing `*":$OR/"`, `*":$OR.git/"` or `*"/$OR.git/"` from ALL THREE lists
+# still printed `118 passed, 0 failed` — i.e. three quarters of what this commit claims to fix rested on
+# inspection. Each row is its own fixture, transport redirected the same way, asserting rc=0.
+mk_case cause-trailing-slash-git
+git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise.git/"
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "https://github.com/daniel-ospina/tortoise.git/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h4b) an https '…/tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+mk_case cause-trailing-slash-scp
+git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise.git/"
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise.git/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h4b) an scp-form '…:tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
 # NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s accept list the
 # pass prints `NOT the queue target` for this origin and all three assertions above go red.
-# NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s accept list,
-# the pass prints `NOT the queue target` for this exact origin and both assertions above go red.
 # ⛔ THE UNSET-`$REPO` ARM IS HERMETIC BECAUSE THE CANDIDATE LIST IS DERIVED FROM `$OR` (review cycle 3,
 # P2 — this arm was briefly retired on a FALSE premise). `repo_candidates` builds `/tmp/${OR##*/}` and
 # `$HOME/${OR##*/}`, so a SYNTHETIC `$OR` names candidates that cannot exist on any box, while every
