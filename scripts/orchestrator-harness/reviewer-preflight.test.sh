@@ -519,6 +519,12 @@ cp "$HERE/brief-gate.sh" "$STRIP/brief-gate.sh"
 # so a rig without it composed NOTHING and the two control arms below were green/failing on an empty
 # artifact, the exact vacuity this section exists to forbid (measured in CI: 133 passed, 2 failed).
 cp "$HERE/gate-policy.sh" "$STRIP/gate-policy.sh"
+# ⛔ AND THE WORKTREE LIFECYCLE MODULE (#2033), WHICH IS THE SAME CLASS OF HARD REQUIREMENT ONE STEP
+# SHARPER. `lane.sh` sources it for the empty-worktree reap and exits 78 without it, and that source
+# runs BEFORE the brief is composed — so a rig without it refused with `wt-lifecycle.sh missing` and the
+# two arms below reported ✅/❌ on an empty artifact, which is the vacuity this section exists to forbid
+# (measured: 183 passed, 5 failed, every one of them this).
+cp "$HERE/wt-lifecycle.sh" "$STRIP/wt-lifecycle.sh"
 sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
 [ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
 # The cwd is the §C fixture — a checkout of `acme/widget` that this suite already proves works in CI —
@@ -559,6 +565,7 @@ cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
 cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP2/repo-slug.sh"
 cp "$HERE/brief-gate.sh" "$STRIP2/brief-gate.sh"
 cp "$HERE/gate-policy.sh" "$STRIP2/gate-policy.sh"   # same hard requirement as the first rig (review, P1)
+cp "$HERE/wt-lifecycle.sh" "$STRIP2/wt-lifecycle.sh"   # …and so is the lifecycle module (#2033)
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
 [ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
 mkdir -p "$TMP/o4/logs"
@@ -699,6 +706,7 @@ STRIPG="$TMP/stripg"; mkdir -p "$STRIPG"
 cp "$HERE/spawn-gate.sh" "$STRIPG/spawn-gate.sh"; cp "$LANE" "$STRIPG/lane.sh"
 cp "$HERE/repo-target.sh" "$STRIPG/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIPG/repo-slug.sh"
 cp "$HERE/brief-gate.sh" "$STRIPG/brief-gate.sh"; cp "$HERE/gate-policy.sh" "$STRIPG/gate-policy.sh"
+cp "$HERE/wt-lifecycle.sh" "$STRIPG/wt-lifecycle.sh"   # #2033: refusing on a MISSING module is this rig's own bug, not the guard's verdict
 sed "s#^DELIVERY_BRIEF_HEADING=.*#DELIVERY_BRIEF_HEADING=''#" "$HELPER" > "$STRIPG/reviewer-preflight.sh"
 grep -q "^DELIVERY_BRIEF_HEADING=''$" "$STRIPG/reviewer-preflight.sh"; ck $? "the heading-stripped helper copy was produced"
 for _rigbr in fix/stripg; do git -C "$TMP" update-ref "refs/heads/$_rigbr" HEAD 2>/dev/null || true; done
