@@ -405,7 +405,10 @@ cap_hw_uuid() {
 # choice is stable, total and ifindex-ordered, (10) the secondary and octet tie-breaks. The dotted-quad
 # `$4` guard is
 # deliberately UNGRADED: `ip -4 -o addr` always puts the address in `$4`, so it is defence only, not a
-# mechanism. Arm (4) is the no-address refusal — kept as a guard, NOT as proof: the old body refused that
+# mechanism — and so is the WORD ANCHOR on the `secondary` detector (`\<secondary\>`): replacing it with a
+# bare substring match is green because its only reachable difference is a device/label containing that
+# literal word, which can only break a tie between two addresses on the SAME device — so the answer stays
+# a peer-reachable address on that device, deterministic run to run. Arm (4) is the no-address refusal — kept as a guard, NOT as proof: the old body refused that
 # fixture too, so it does not discriminate.
 # ⛔ THIS IS ALSO THE SUITE'S IDENTITY SEAM: the arms in capacity-placement.test.sh §12 override THIS
 # FUNCTION to stand up two boxes with two identities on one hostname — the whole point of #2707 is

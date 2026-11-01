@@ -1232,9 +1232,17 @@ MUT
   ck "(11) unspecified (0/8) and BOTH halves of the reserved range (224-229, 230-255) REFUSE rather than being published ([$A11] rc=$RC, [$A11B] rc=$RC2, [$A11C] rc=$RC3)" \
      "$([ "$RC" -eq 1 ] && [ -z "$A11" ] && [ "$RC2" -eq 1 ] && [ -z "$A11B" ] && [ "$RC3" -eq 1 ] && [ -z "$A11C" ] && echo 0 || echo 1)"
 else
-  echo "  ⏭ §14 (1)-(5), (8)-(11), (13) SKIPPED: this platform has no /proc/net/route, so the LINUX arm of"
-  echo "    cap_boxid_net is unreachable here — including every arm that grades a clause (8)-(11), (13)."
-  echo "    Arm (12) — the DARWIN arm, the one this platform actually uses — runs below and is NOT skipped."
+  # ⛔ THE LIST IS DERIVED, NOT TYPED (review round 14): it went stale twice as arms were added inside the
+  # Linux-only branch, so a reader was told (14), (15) and (20) ran on macOS when they had not.
+  SKIPLIST="$(awk '
+    /^if \[ -r \/proc\/net\/route \]; then/ { f=1; next }
+    f && /^else$/ { exit }
+    f && /ck "/ {
+      if (match($0, /\([0-9]+[a-z]?\)/)) { t = substr($0, RSTART, RLENGTH); if (!(t in seen)) { seen[t]=1; printf "%s ", t } }
+    }' "$0" 2>/dev/null)"
+  [ -n "$SKIPLIST" ] || SKIPLIST="(1)-(5) (8)-(11) (13)-(15) (20)"
+  echo "  ⏭ §14 ${SKIPLIST}SKIPPED: this platform has no /proc/net/route, so the LINUX arm of cap_boxid_net"
+  echo "    is unreachable here. Arm (12) — the DARWIN arm, the one this platform actually uses — runs below."
 fi
 # (12) THE DARWIN ARM (review round 5, finding 2: it used to sit INSIDE the Linux-only branch, so the
 # branch a Mac actually uses was ungraded ON the Mac). It needs no procfs: it is reached the way a Mac
@@ -1259,8 +1267,13 @@ ck "(12) the Darwin arm (no \`ip\` on PATH — runs on macOS too) answers its in
 # `inet addr:10.1.2.3`, so `awk '{print $2}'` yields `addr:10.1.2.3` — a NON-ADDRESS string. The tail
 # guard's `*[!0-9.]*` arm is the only thing refusing it, so it is graded here.
 A21="$(boxidnet_darwin 'addr:10.1.2.3')"; RC=$?
-ck "(21) a NON-ADDRESS interface token (addr:10.1.2.3) REFUSES rather than becoming the boxid (rc=$RC, boxid=[$A21])" \
-   "$([ "$RC" -eq 1 ] && [ -z "$A21" ] && echo 0 || echo 1)"
+# ⛔ AND AN ADDRESS THAT IS ENTIRELY ABSENT (review round 14): an IPv6-only interface prints no `inet` line,
+# so `awk` yields the EMPTY string and only the tail case's `''` branch refuses it. Measured: with that
+# branch dropped the function returns 0 with an empty boxid — a successful "publish" of nothing.
+da_noinet() { printf '#!/bin/sh\nprintf "\\tinet6 fe80::1%%en0 prefixlen 64\\n"\n' > "$DAB/ifconfig"; chmod +x "$DAB/ifconfig"; }
+A21B="$( da_noinet; PATH="$DAB"; CAP_BOXID=""; . "$CAP"; cap_boxid_net 2>/dev/null )"; RC4=$?
+ck "(21) a NON-ADDRESS token (addr:10.1.2.3) REFUSES (rc=$RC, boxid=[$A21]) and so does an ABSENT one (IPv6-only interface: rc=$RC4, boxid=[$A21B])" \
+   "$([ "$RC" -eq 1 ] && [ -z "$A21" ] && [ "$RC4" -eq 1 ] && [ -z "$A21B" ] && echo 0 || echo 1)"
 # (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
 # controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
 # reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
@@ -1312,7 +1325,7 @@ L22="$( CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log6" bash -c '
   cap_publish() { return 1; }
   cap_publish_logged "$2" "$3" "$4" refs/boxes; echo "rc=$?"' _ "$CAP" "$W16" "$VALID boxid=10.238.144.2" "$LOGL" 2>&1 )"
 ck "(22) a refusal that prints NO parsable line still logs why=unknown ($(grep -o 'why=[^ ]*' "$LOGL" | head -1)) — never a blank reason" \
-   "$( { printf '%s' "$L22" | grep -q 'rc=1' && grep -q 'why=unknown' "$LOGL" && ! grep -q 'why= ' "$LOGL"; } && echo 0 || echo 1)"
+   "$( { grep -q 'rc=1' <<<"$L22" && grep -q 'why=unknown' "$LOGL" && ! grep -q 'why= ' "$LOGL"; } && echo 0 || echo 1)"
 # (7) THE MAC CANNOT BE AFFECTED. A Darwin box resolves its identity from `kern.uuid` FIRST
 # (`cap_boxid_auto` source 1), so it never reaches the Linux arm this fix changes. That precedence is
 # the property, not a comment: asserted here so a future edit that reorders the sources — or that makes
