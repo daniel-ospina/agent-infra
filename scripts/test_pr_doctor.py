@@ -2457,6 +2457,41 @@ def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
     assert pr.gate_refused("prd-9", 74) is False
 
 
+def test_a_capability_refusal_is_the_gates_own_class_and_never_waits(tmp_path, monkeypatch):
+    """Exit 71 is the FIFTH gate refusal, and it was the one missing (#3161 round-6 review, P2).
+
+    `run_agent` returns `AGENT_CAPABILITY_REFUSED=71` and writes `[capability-gate] REFUSED … no agent
+    was started, so nothing was consumed` BEFORE any agent runs — the same class as 73/74/75/77, and
+    the same accounting consequence when it is left out: `_confirm()`/`dispatch()` read the `.rc` as a
+    failure, the pass reaches `undeliverable += 1`, and it exits 3 with `next=repair-chain` — "a human
+    must repair the dispatch chain" — for a box whose own capability probe proved it cannot complete a
+    call and return. Measured on the pre-fix tree: `gate_refused("prd-5", 71) is False` and the detail
+    read `rc=75: FAILED EARLY: prd-5 started and exited rc=71`.
+
+    ⛔ AND THE REMEDY MUST NOT BE "wait" (#2291's own lesson, restated per axis). `GATE_NEXT_TOKEN` is
+    read with `.get(ax, "wait")` at the verdict line, so an axis with no token would default to the
+    one remedy that is provably useless here. Both halves are asserted: the code must be recognised,
+    the marker must be the gate's own line, and the token must be neither `wait` nor `repair-chain`.
+    """
+    assert 71 in pr.GATE_REFUSALS
+    assert pr.GATE_REFUSAL_BOUND[71] == "capability"
+    assert pr.GATE_NEXT_TOKEN["capability"] != "wait"
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-5.rc").write_text("71\n")
+    (d / "bg" / "prd-5.log").write_text(
+        "[capability-gate] REFUSED prd-5: LANE_CAPABILITY (exit 3) — no agent was started, so "
+        "nothing was consumed and no 3300s slot is spent on a box that cannot complete one call "
+        "and return.\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-5", 71) is True
+    assert pr.refusal_axis(71) == "capability"
+    # The cooldown-VOIDING direction: an agent that exits 71 itself is not a gate refusal.
+    (d / "bg" / "prd-5.log").write_text(
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=71\n")
+    assert pr.gate_refused("prd-5", 71) is False
+
+
 def test_the_refusal_markers_are_the_gates_own_lines():
     """Anti-drift on the ONE piece of prose this file reads: reword it in spawn-gate.sh and the
     refusal detection silently stops working (every refusal would read as a real dispatch)."""
@@ -3423,7 +3458,14 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     gate = (_HARNESS / "spawn-gate.sh").read_text()
     exported = dict(re.findall(r"^(AGENT_[A-Z_]+)=(\d+)$", gate, re.M))
     for const, code in (("AGENT_FORK_REFUSED", 73), ("AGENT_LAND_BACKLOG", 74),
-                        ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77)):
+                        ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77),
+                        # ⛔ AND THE CAPABILITY GATE (#3161 round-6 review, P2): `run_agent`
+                        # returns this code and writes "[capability-gate] REFUSED … no agent was
+                        # started", so it is the SAME class as the four above and was the one
+                        # missing -- measured, it fell through to `EXIT 3 / UNDELIVERED /
+                        # next=repair-chain` for a box its own probe had proved cannot complete a
+                        # call. Pinned here so neither side can renumber or drop it again.
+                        ("AGENT_CAPABILITY_REFUSED", 71)):
         assert exported.get(const) == str(code), (
             "spawn-gate.sh no longer exports %s=%d -- GATE_REFUSAL_BOUND is stale" % (const, code))
         assert pr.GATE_REFUSAL_BOUND[code], "the gate declares %d and this file does not" % code
@@ -3437,7 +3479,8 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     # tell them to restart a healthy box. Derived from the gate's own CONSTANT NAMES, so a
     # renumbering or a rename on either side reddens here.
     want = {"AGENT_FORK_REFUSED": "fork", "AGENT_LAND_BACKLOG": "land-backlog",
-            "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk"}
+            "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk",
+            "AGENT_CAPABILITY_REFUSED": "capability"}
     for const, axis in want.items():
         code = int(exported[const])
         assert pr.GATE_REFUSAL_BOUND[code] == axis, (

@@ -1076,6 +1076,12 @@ function heredocSegmentIsNaming(
   // reader word only for a spelling that cannot run anything; an executor spelling keeps the body
   // READABLE, which is the fail-closed direction.
   if (extraNaming?.has(commandWord)) {
+    // ⛔ ASK THE QUESTION POSITIVELY, AND ASK IT FIRST (#3161 round-6 review, P1 — measured).
+    // `GH_EXECUTOR_SHAPE` below can only name the spelling that DEFINES a gh executor; the spelling
+    // that INVOKES one (`gh qq <written-file>`, definition on an earlier line) carries no keyword,
+    // so a negative test granted `gh` the reader relaxation on a command bash RAN. The relaxation is
+    // therefore scoped to the tracker writes it was created for — see `ghTrackerWriteReadsOnly`.
+    if (commandWord === "gh" && !ghTrackerWriteReadsOnly(segment)) return false;
     // ⛔ THE SHAPE TEST MUST SEE THE SAME TEXT THE SHELL DOES (#3161 cycle-5 review, P1, measured).
     // `commandWord` above is DEQUOTED (`:1061`) — the module's own convention — but this test read the
     // RAW segment, so a quote/backslash SPLICE of the gh SUBCOMMAND matched no alternative in
@@ -3489,21 +3495,96 @@ const DATA_ONLY_CONSUMERS = new Set(["cat", "tee", "wc"]);
  * resolves a NAME under gh's own extensions directory, never an arbitrary written path." A gh SHELL
  * ALIAS evaluates its expansion through `sh`: `gh alias set qq '!bash /tmp/f.sh'` followed by
  * `gh qq` RUNS the written file — measured on this box, the file executed. `--shell` is that same
- * expansion without the `!`, and `gh extension exec` runs a program. So `gh` is a READER only for a
- * spelling that cannot run anything; `GH_EXECUTOR_SHAPE` below withholds the relaxation from the
- * rest (a body written for one of those keeps its text — the fail-closed direction). A line that
- * PIPES the reader into a program, chains a second command, or hands the path to an interpreter is
- * still an execution (the pipe arm and the segment split both fire).
+ * expansion without the `!`, and `gh extension exec` runs a program. A line that PIPES the reader
+ * into a program, chains a second command, or hands the path to an interpreter is still an execution
+ * (the pipe arm and the segment split both fire).
+ *
+ * ⛔ AND A NEGATIVE TEST COULD NOT BE MADE EXHAUSTIVE, WHICH IS WHY THIS IS A POSITIVE ONE (#3161
+ * round-6 fresh-context review, P1 — measured, and it is the same class as the round-5 splice).
+ * `GH_EXECUTOR_SHAPE` names the spelling that DEFINES an alias (`gh alias set …`). The spelling that
+ * INVOKES one carries no keyword at all: with the definition on an EARLIER line, the invocation
+ * `gh qq /tmp/y.sh` matched nothing, so `gh` was granted the reader relaxation, the classification
+ * masker blanked a body that bash RAN, and the push inside it reached zero dispatches:
+ *     gh alias set qq '!bash "$1"'            <- earlier line, never adjacent to the target
+ *     cat > /tmp/y.sh <<'EOF'
+ *     git -C /wt push origin main
+ *     EOF
+ *     gh qq /tmp/y.sh                         <- names the target, executes it, no keyword
+ * measured through this module: `isGitOp(raw)` was `false` and `writesOnlyTrackerRecords` `true`.
+ * The alias NAME is arbitrary, so no negative keyword list can cover the invocation — the question
+ * must be asked POSITIVELY, and it is `ghTrackerWriteReadsOnly` below.
  */
 const TRACKER_FILE_READERS: ReadonlySet<string> = new Set(["gh"]);
+
+/**
+ * The `gh` commands that can WRITE A TRACKER RECORD — the only ones the reader relaxation is for.
+ *
+ * ⛔ WHY AN ALLOW-LIST OF BUILT-INS IS SOUND AND A LIST OF EXECUTOR KEYWORDS IS NOT: `gh alias set`
+ * REFUSES a name that shadows an existing gh command ("could not create alias: pr is a command"),
+ * so `gh pr …` / `gh issue …` / `gh release …` can never be a shell alias — the invocation that
+ * defeated the keyword test (`gh qq /tmp/y.sh`) is not spellable on any command in this set. None of
+ * the listed subcommands has a flag that runs a local file as a program: `--body-file` and
+ * `--notes-file` READ it. Anything not listed keeps its body READABLE, which is the fail-closed
+ * direction (the cost is a refusal on a `gh` spelling nobody has measured parking a lane).
+ */
+const GH_TRACKER_WRITE_COMMANDS = new Set(["pr", "issue", "release"]);
+/** The record-writing verbs on those commands. `merge` is deliberately ABSENT — it is the op the
+ *  floor exists for, and it is not a tracker write. */
+const GH_TRACKER_WRITE_SUBCOMMANDS = new Set(["comment", "edit", "create", "review", "close", "reopen"]);
+/** gh's GLOBAL flags that take a VALUE. Closed set by definition (`-R/--repo` is the only one these
+ *  shapes use); an UNKNOWN leading flag makes the pair unresolvable, i.e. not a reader. */
+const GH_GLOBAL_VALUE_FLAGS = new Set(["-R", "--repo"]);
 
 /**
  * A `gh` invocation that can EXECUTE a local path, so the reader claim above is VOID for it.
  * `alias` (a `!`-prefixed expansion is evaluated through `sh`; `--shell` is the same without the
  * `!`) and `extension exec` (runs a program) are the executors. When this matches, the segment is
  * NOT naming-only, so the written-target clause sees an execution and keeps the body readable.
+ *
+ * It is kept as a SECOND, independent veto behind the positive test — belt and braces, not the
+ * authority: a future tracker subcommand that grew an exec-bearing flag would still be caught here.
  */
 const GH_EXECUTOR_SHAPE = /(^|\s)alias(\s|=|$)|(^|\s)extension\s+exec(\s|$)|--shell(\s|=|$)/;
+
+/** The `gh` invocation's own `[command, subcommand]` pair, or null when the segment is not a `gh`
+ *  invocation whose pair this masker can resolve. Null is the fail-closed answer.
+ *
+ *  Words are DEQUOTED first, because the shell delivers argv regardless of how it was spelled:
+ *  `gh 'pr' comment` and `gh \\pr comment` are the same invocation (the round-5 splice, above). */
+function ghSubcommandPair(segment: string): [string, string] | null {
+  const words = segment.replace(/["'\\]/g, "").trim().split(/\s+/);
+  if (words[0] !== "gh") return null;
+  let i = 1;
+  while (i < words.length) {
+    const w = words[i];
+    if (!w.startsWith("-")) break;
+    if (GH_GLOBAL_VALUE_FLAGS.has(w)) {
+      i += 2;
+      continue;
+    }
+    if (w.includes("=")) {
+      i += 1;
+      continue;
+    }
+    // An unknown flag: nothing proves it takes no value, so the pair cannot be resolved.
+    return null;
+  }
+  const cmd = words[i];
+  const sub = words[i + 1];
+  if (!cmd || !sub) return null;
+  return [cmd, sub];
+}
+
+/** Is this segment a `gh` TRACKER WRITE — positively, by its own command pair?
+ *
+ *  This is what grants `TRACKER_FILE_READERS` to `gh`. Everything else (`gh qq <file>`,
+ *  `gh extension exec`, `gh alias set`, `gh pr merge`, an unknown global flag) answers NO and keeps
+ *  the written body readable. */
+function ghTrackerWriteReadsOnly(segment: string): boolean {
+  const pair = ghSubcommandPair(segment);
+  if (!pair) return false;
+  return GH_TRACKER_WRITE_COMMANDS.has(pair[0]) && GH_TRACKER_WRITE_SUBCOMMANDS.has(pair[1]);
+}
 
 /**
  * Blank the BODY of every `<<'QUOTED'` heredoc, LENGTH-PRESERVING, for a CLASSIFICATION read only.
@@ -3870,6 +3951,18 @@ function gitWordAnywhere(command: string): boolean {
  * (including inside a substitution), an admin-merge flag, and any gh invocation this layer cannot
  * positively read as a non-merge — `gh issue comment 1 && gh pr merge 2`, a spliced verb, and an
  * unquoted heredoc body all keep the floor.
+ *
+ * ⛔ DECLARED RESIDUAL, AND IT IS THE FAIL-CLOSED DIRECTION (#3161 round-6 review, P2 — measured):
+ * the classification is TEXTUAL, so a report body that QUOTES the merge form is not readable as a
+ * tracker write and keeps the floor. `gh pr comment 5 --body "see gh pr merge 7"`, and a heredoc
+ * body with `gh pr merge` in prose, both read `isGitOp === true` — `maskHeredocData` refuses to mask
+ * a body that names a `gh pr` candidate, and `readsNonMergeGhCall` then cannot positively read the
+ * text. That is a REFUSAL (a parked lane), never a bypass, and it is IDENTICAL on `origin/main`, so
+ * it is not a regression this change introduces. It is stated here rather than implied away because
+ * "a tracker write is read-side" is exactly the kind of sentence a reader generalises: the accurate
+ * form is "a tracker write whose TEXT contains no merge form and no git verb is read-side".
+ * Widening it is refused on purpose — the only shapes that would admit a merge-quoting body are the
+ * ones that also admit a real merge, and #1492 pins that a quoted MENTION stays outside.
  */
 export function writesOnlyTrackerRecords(command: string): boolean {
   // ⛔ ONE DEFINITION OF "THIS TEXT MENTIONS git" (agent-infra#3161 review). The first form carried a

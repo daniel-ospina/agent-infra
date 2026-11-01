@@ -10223,6 +10223,15 @@ pending.push(async () => {
     ["bare gh pr comment", "gh pr comment 1234 --body-file /tmp/x.md"],
     ["bare gh issue comment", "gh issue comment 1224 --body-file /tmp/x.md"],
     ["gh pr edit (already outside — signed-marker reason)", "gh pr edit 3099 --body-file /tmp/body.md"],
+    // ⛔ THE POSITIVE TEST MUST CROSS A GLOBAL FLAG, not just the bare spelling (#3161 round-6
+    // review). The relaxation is keyed on the `gh` COMMAND PAIR, and a global flag stands between
+    // `gh` and the pair — `-R` takes a value, `--repo=` carries one. Both are ordinary in this
+    // fleet (`gh -R o/r pr comment`), so a positive test that only matched the bare form would
+    // re-park exactly the lanes this classification exists to release.
+    ["gh -R <repo> pr comment (global flag before the pair)",
+     "gh -R acme/widget pr comment 5 --body-file /tmp/x.md"],
+    ["gh --repo=<repo> pr comment (global flag with `=`)",
+     "gh --repo=acme/widget pr comment 5 --body-file /tmp/x.md"],
   ] as Array<[string, string]>) {
     equal(isGitOp(command), false, `${label}: a tracker write must not be a shipping op`);
     equal(writesOnlyTrackerRecords(command), true, `${label}: the classification must be the reason`);
@@ -10250,6 +10259,22 @@ pending.push(async () => {
     ['bare git --no-pager push', 'git --no-pager push origin main'],
     ['git -c k=v commit', 'git -c user.x=1 commit -am x'],
     ['comment AND git -C push', 'gh pr comment 1 --body-file /tmp/x.md && git -C /wt push origin main'],
+    // ⛔ THE SPELLING THAT DEFINES A GH EXECUTOR IS NOT THE ONE THAT INVOKES IT (#3161 round-6
+    // fresh-context review, P1 — measured). `GH_EXECUTOR_SHAPE` matches `gh alias set …`; the
+    // INVOCATION `gh qq <file>` carries no keyword at all, and gh alias names are arbitrary, so no
+    // negative keyword list can cover it. With the definition on an EARLIER line the relaxation was
+    // granted, the body was blanked and the push inside it reached zero dispatches — measured
+    // through this module at the reviewed head: `isGitOp(raw) === false`,
+    // `writesOnlyTrackerRecords(raw) === true`. The two rows below are the fix's own pin: the
+    // classifier now asks POSITIVELY whether the segment is a tracker WRITE
+    // (`ghTrackerWriteReadsOnly`), and `gh qq …` can never answer yes.
+    // ⛔ MUTATION: restore the negative-only test (`GH_EXECUTOR_SHAPE` alone) and BOTH rows go
+    // isGitOp=false — the first because the definition line is separate, the second because
+    // `--body-file` is just an argv element to the alias.
+    ['gh alias INVOKED by name, definition on an EARLIER line',
+     "gh alias set qq '!bash \"$1\"'\ncat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin main\nEOF\ngh qq /tmp/y.sh"],
+    ['gh alias INVOKED by name with a `--body-file` decoy',
+     "gh alias set pp '!bash \"$1\"'\ncat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin main\nEOF\ngh pp --body-file /tmp/y.sh"],
     // Round 3: the mask's proof that a body is DATA is line-local, so these four shapes EXECUTE
     // the body while the opener line still looks like `cat >`. Each measured, each now pinned.
     ['continuation hides a pipe into sh', 'cat <<\'EOF\' \\\n| sh\ngit -C /wt push origin HEAD:main\nEOF'],
