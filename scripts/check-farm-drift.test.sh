@@ -382,33 +382,72 @@ RC=$?
 ck $(grep -q 'Next: re-run the farm' "$ERR" && echo 1 || echo 0) "exit-3 drift outside the farm does not close with 're-run the farm' (rc=$RC)"
 ck $(grep -q 'declare each file above in a farm array' "$ERR" && echo 0 || echo 1) "...it closes with the declare / delete / retire remedy instead"
 
-# 27. ⛔ AN OFF-SHAPE DECLARATION ENTRY MAY NOT SWITCH THE FATAL ARM OFF (P2 of #3133's review). The
-# guard above drops lines that are not `scripts/<rel>`, but an entry that IS `scripts/…` and carries no
-# plain relative path (`scripts/`, `scripts//x.sh`, `scripts/./x.sh`) recorded bytes the DEPLOYED side
-# can never match, so a file the farm DOES owe classified as "outside the farm" — exit 3 instead of the
-# fatal exit 1, with the UNKNOWN arm silent because the line started with `scripts/`. Measured at
-# bbf93274: `scripts/` ⇒ rc=3 `check-farm-drift.sh is STALE and NOT farm-declared`; canonical ⇒ rc=1.
-for _decl in 'scripts/' 'scripts/./alpha.py' 'scripts//alpha.py'; do
+# 27. ⛔ A DECLARATION ENTRY IS NORMALISED, NOT TRUSTED, AND NEVER SILENTLY DROPPED (#3133 review: P2
+# round 1, then P1 + P1 round 2 — this one shape produced THREE fail-opens, so all three directions are
+# pinned here). `main` matched the declaration's raw bytes, so `scripts//x.sh` and `scripts/./x.sh`
+# classified a file the farm DOES owe as "outside the farm" — exit 3 instead of the fatal exit 1, the
+# #10114 arm switched off by a declaration nothing could read. Rejecting those entries instead (round
+# 1's fix) was the OPPOSITE fail-open: `main`'s raw probe let the FILESYSTEM collapse `//` and `/./`, so
+# an owed-and-never-landed file was DECLARED-BUT-ABSENT (rc=1); dropping the entry before the probe
+# printed `OK — everything matches`, rc=0. Both directions are asserted.
+for _decl in 'scripts/./alpha.py' 'scripts//alpha.py' 'scripts/alpha.py/'; do
     C27="$TMP/c27"; if [ -e "$C27" ]; then find "$C27" -mindepth 1 -delete; fi
     mk_farm "$C27/scripts"; mkdir -p "$C27/state"
-    printf '%s\n' "$_decl" > "$C27/state/farm-declared.txt"     # names the stale file, ungradeably
-    printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C27/scripts/alpha.py"
+    printf '%s\n' "$_decl" > "$C27/state/farm-declared.txt"     # names alpha.py, un-normalised
+    printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C27/scripts/alpha.py"   # STALE
     OUT="$TMP/out"; ERR="$TMP/err"
     ( cd "$TMP" && CELL_HOME="$C27" bash "$CHECK" --dest "$C27/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
     RC=$?
-    ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "an ungradeable scripts/ entry ('$_decl') is UNKNOWN, not a non-fatal outside-farm verdict (rc=$RC)"
-    ck $(grep -q 'NOT farm-declared' "$ERR" && echo 1 || echo 0) "...and does not rule the file 'outside the farm' ('$_decl')"
+    ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "an un-normalised entry ('$_decl') still DECLARES the file, so drift stays fatal (rc=$RC)"
+    ck $(grep -q 'NOT farm-declared' "$ERR" && echo 1 || echo 0) "...and is not ruled 'outside the farm' ('$_decl')"
 done
-# ...and a PARTLY unreadable declaration: the canonical entry must still make a genuinely undeclared
-# file exit 3 (the arm is not simply disabled), while the off-shape line alone may not authorise it.
+# 27A. A declaration with NOTHING gradeable is UNKNOWN, not "the farm owes nothing".
+C27A="$TMP/c27a"; mk_farm "$C27A/scripts"; mkdir -p "$C27A/state"
+printf 'scripts/\n' > "$C27A/state/farm-declared.txt"
+printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C27A/scripts/alpha.py"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27A" bash "$CHECK" --dest "$C27A/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a declaration naming no gradeable path is UNKNOWN, not a non-fatal outside-farm verdict (rc=$RC)"
+ck $(grep -q 'NOT farm-declared' "$ERR" && echo 1 || echo 0) "...and does not rule the stale file 'outside the farm'"
+# 27B. A path that ESCAPES the deployed root is never graded — and may not authorise a bare OK either.
 C27B="$TMP/c27b"; mk_farm "$C27B/scripts"; mkdir -p "$C27B/state"
-printf 'scripts/alpha.py\nscripts//other.sh\n' > "$C27B/state/farm-declared.txt"
-printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C27B/scripts/alpha.py"
+printf 'scripts/alpha.py\nscripts/../scripts/alpha.py\n' > "$C27B/state/farm-declared.txt"
 OUT="$TMP/out"; ERR="$TMP/err"
 ( cd "$TMP" && CELL_HOME="$C27B" bash "$CHECK" --dest "$C27B/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
 RC=$?
-ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "a canonical declaration still makes declared drift FATAL beside an off-shape line (rc=$RC)"
-ck $(grep -q 'farm-declared — a re-run must fix these' "$ERR" && echo 0 || echo 1) "...and the summary still counts it as farm-declared"
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a matching farm + an ungradeable '..' line is UNKNOWN, not OK (rc=$RC)"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK verdict"
+# 27C. ⛔ THE ABSENCE NET. A normalised entry naming a file the farm owes and never landed must stay
+# DECLARED-BUT-ABSENT (rc=1) — not vanish into a clean farm.
+C27C="$TMP/c27c"; mk_farm "$C27C/scripts"; mkdir -p "$C27C/state"
+printf 'scripts/beta.sh\nscripts//owed-and-absent.sh\n' > "$C27C/state/farm-declared.txt"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27C" bash "$CHECK" --dest "$C27C/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "an un-normalised entry for an owed-and-absent file is still fatal (rc=$RC)"
+ck $(grep -q 'DECLARED-BUT-ABSENT' "$ERR" && echo 0 || echo 1) "...and the report still names DECLARED-BUT-ABSENT"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and does not print OK"
+# 27D. ⛔ THE FATAL ARM OUTRANKS THE PARTIAL-READ ARM. A declared stale + an undeclared stale + an
+# ungradeable line must stay rc=1: the first cut of the partial-read arm exited 2 before the fatal
+# determination, turning tortoise#10114's verdict into a warn-and-continue code (rc=2).
+C27D="$TMP/c27d"; mk_farm "$C27D/scripts"; mkdir -p "$C27D/state"
+printf 'scripts/alpha.py\nscripts/../nope\n' > "$C27D/state/farm-declared.txt"
+printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C27D/scripts/alpha.py"          # STALE, declared
+printf 'print("gamMA")\n' > "$C27D/scripts/fleet/gamma.py"                          # STALE, undeclared
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27D" bash "$CHECK" --dest "$C27D/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "declared stale + undeclared stale + an ungradeable line is STILL rc=1 (rc=$RC)"
+ck $(grep -q '1 farm-declared' "$ERR" && echo 0 || echo 1) "...and the summary still counts the declared one"
+# 30. ⛔ THE DROPPED-ENTRIES MESSAGE MUST SURVIVE ITSELF (#3176 class: backticks inside a double-quoted
+# string are EXECUTED by the shell). The text an operator needs in order to fix the declaration was
+# deleted by a command substitution, and the failure looked like a broken gate. Re-runs the
+# all-ungradeable declaration, because that is the only path that prints it.
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27A" bash "$CHECK" --dest "$C27A/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+ck $(grep -q 'scripts/<rel>' "$ERR" && echo 0 || echo 1) "the ungradeable-line message still tells the operator the shape it wants"
+ck $(grep -qE 'command substitution|syntax error' "$ERR" && echo 1 || echo 0) "...and emits no shell error while doing it"
 
 # 28. ⛔ THE CLOSING REMEDY IS PER CLASS (P3 of #3133's review). The condition used to be
 # `stale_declared == 0 && missing == 0`, which is ALSO true on the UNSOURCED-only path (stale=0), so the

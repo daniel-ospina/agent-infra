@@ -375,28 +375,35 @@ resolve_source() {  # $1 = dest-relative path → prints the repo-relative sourc
 }
 
 # DECLARED local-only: a name that is deliberately on the box and in no repo file.
-# A DECLARATION ENTRY MUST BE A PLAIN RELATIVE PATH — no empty, `.` or `..` component, no leading or
-# trailing slash. ⛔ WHY THIS IS A CORRECTNESS ARM AND NOT TIDINESS: the membership test below is
-# fixed-string containment over the entry's own bytes, so an entry the DEPLOYED side cannot match
-# (`scripts/`, `scripts//x.sh`, `scripts/./x.sh` — all real hand-edit/`echo`/CR shapes) silently
-# classified a file the farm DOES owe as "outside the farm", which is exit 3 instead of the fatal
-# exit 1: the #10114 arm switched off by a declaration this check could not read, while the UNKNOWN
-# arm below did NOT fire because the entry started with `scripts/`. Measured 2026-10-31 on
-# bbf93274 + a declaration of `scripts/` (and of `scripts/./check-farm-drift.sh`, and of
-# `scripts//check-farm-drift.sh`): `rc=3`, `check-farm-drift.sh is STALE and NOT farm-declared`,
-# over drift the farm owes — versus `rc=1` for the same bytes declared as `scripts/check-farm-drift.sh`.
-# Off-shape entries are COUNTED as well as dropped, so a declaration made entirely of them reaches the
-# "no path this check can grade" arm (UNKNOWN) rather than an empty set that reads as "the farm owes
-# nothing". bash 3.2-safe: no arrays, no `mapfile`, no `${v,,}`; component split by `#`/`%%` only.
-decl_rel_ok() {
-    [ -n "$1" ] || return 1
-    case "$1" in /*|*/) return 1 ;; esac
-    _dro_rest="$1"
-    while [ -n "$_dro_rest" ]; do
-        _dro_comp="${_dro_rest%%/*}"
-        case "$_dro_comp" in ''|.|..) return 1 ;; esac
-        case "$_dro_rest" in */*) _dro_rest="${_dro_rest#*/}" ;; *) _dro_rest="" ;; esac
+# ── A DECLARATION ENTRY IS NORMALISED, NOT TRUSTED, AND NEVER SILENTLY DROPPED ────────────────
+# ⛔ WHY NORMALISATION AND NOT REJECTION. The membership test below is fixed-string containment, so an
+# entry the DEPLOYED side cannot match byte-for-byte classified a file the farm DOES owe as "outside
+# the farm" — exit 3 instead of the fatal exit 1, i.e. the #10114 arm switched off by a declaration
+# nothing could read (measured 2026-10-31 at bbf93274: `scripts/` and `scripts//x.sh` and
+# `scripts/./x.sh` ⇒ rc=3 "NOT farm-declared", canonical ⇒ rc=1).
+# ⛔ BUT REJECTING THEM OUTRIGHT IS THE OPPOSITE FAIL-OPEN, AND IT IS WHERE THE FIRST CUT OF THIS FIX
+# WENT WRONG (review P1). `main` probed `[ ! -e "$DEST/$rel" ]` on the RAW rel, and the FILESYSTEM
+# collapses `//` and `/./` for free — so `scripts//owed.sh` over a file the farm owes and never landed
+# printed DECLARED-BUT-ABSENT, rc=1. Dropping the entry BEFORE the probe removed that net and printed
+# `OK — everything matches`, rc=0, over an owed-and-absent file: the #1924 "green tick over a no-op"
+# shape, and the worst outcome this file exists to prevent.
+# So: collapse the path (`//`, `.` components, leading/trailing `/`) and grade the CANONICAL form. What
+# stays ungradeable is a path that ESCAPES the deployed root (`..`) or names nothing at all — those are
+# counted as off-shape, never silently dropped, and a declaration containing one can never print a bare
+# OK (see the "cannot be ruled out" arm below). bash 3.2-safe: no arrays, no `mapfile`, no `${v,,}`.
+decl_rel_norm() {
+    _n_up="$1"
+    case "$_n_up" in *..*) return 1 ;; esac   # a path that escapes the root is never graded
+    _n_out=""
+    while [ -n "$_n_up" ]; do
+        case "$_n_up" in /*) _n_up="${_n_up#/}"; continue ;; esac   # leading / and // collapse
+        _n_comp="${_n_up%%/*}"
+        case "$_n_up" in */*) _n_up="${_n_up#*/}" ;; *) _n_up="" ;; esac
+        case "$_n_comp" in ''|.) continue ;; esac                  # `.`/empty components collapse
+        if [ -z "$_n_out" ]; then _n_out="$_n_comp"; else _n_out="$_n_out/$_n_comp"; fi
     done
+    [ -n "$_n_out" ] || return 1
+    printf '%s\n' "$_n_out"
     return 0
 }
 
@@ -572,10 +579,9 @@ if [ -f "$DECL" ]; then
     while IFS= read -r dpath; do
         [ -n "$dpath" ] || continue
         case "$dpath" in scripts/*) rel="${dpath#scripts/}" ;; *) decl_offshape=$((decl_offshape+1)); continue ;; esac
-        # ⛔ AND `scripts/` IS NOT ENOUGH — see `decl_rel_ok` above: an entry that starts with `scripts/`
-        # but carries no matchable relative path is OFF-SHAPE too, or it disarms the #10114 fatal arm.
-        if ! decl_rel_ok "$rel"; then decl_offshape=$((decl_offshape+1)); continue; fi
-        # The set stores the CANONICAL form, so membership compares like with like (`scripts/<rel>`).
+        # ⛔ NORMALISE, THEN GRADE — never reject before the absence probe (see `decl_rel_norm` above:
+        # rejecting first LOST `main`'s DECLARED-BUT-ABSENT verdict and printed rc=0 OK over an owed file).
+        rel="$(decl_rel_norm "$rel")" || { decl_offshape=$((decl_offshape+1)); continue; }
         decl_rel_set+="scripts/$rel"$'\n'
         is_declared_local "$rel" && continue
         if [ ! -e "$DEST/$rel" ]; then
@@ -597,7 +603,7 @@ EOF_DECL
     # over drift the farm DOES owe, while the same bytes with alpha.py declared ⇒ rc=1.
     if [ -z "$decl_rel_set" ]; then
         say_err "$PROG: UNKNOWN — the farm declaration $DECL carries no path this check can grade"
-        say_err "   ($decl_offshape line(s) dropped: not `scripts/<rel>`, or no plain relative path). What the farm OWES is"
+        say_err "   ($decl_offshape line(s) dropped: not scripts/<rel>, or a path that escapes the deployed root). What the farm OWES is"
         say_err "   therefore unknown, and grading stale drift against it would report every file as"
         say_err "   'outside the farm' — switching the #10114 fatal arm off. This is not a pass."
         exit 2
@@ -639,21 +645,22 @@ if [ "$decl_ok" -eq 1 ] && [ -n "$stale_rows" ]; then
 $stale_rows
 EOF_STALE
 fi
-# ⛔ A DECLARATION THAT WAS PARTLY UNREADABLE MAY NOT CERTIFY "OUTSIDE THE FARM". `stale_outside` is a
-# claim about a DECLARATION, so it is only sound when every entry in that declaration was read. An
-# OFF-SHAPE entry naming the very file that is stale (`scripts//x.sh`, `scripts/./x.sh`) is dropped from
-# the set above, so the file reads as "not farm-declared" — the #10114 fatal arm written off as
-# non-fatal by a malformed line, the same fail-open the dropped-entry counting exists to prevent, one
-# entry to the side. Measured 2026-10-31: a declaration of `scripts//check-farm-drift.sh` alone ⇒ rc=3
-# "NOT farm-declared" over drift the farm owes, while `scripts/check-farm-drift.sh` ⇒ rc=1. So a partial
-# read withholds ONLY the outside-farm verdict — UNKNOWN (2), never a pass — while anything the farm
-# OWES still reaches the fatal arm (1).
-if [ "$decl_offshape" -gt 0 ] && [ "$stale_outside" -gt 0 ]; then
+# ⛔ A DECLARATION THAT WAS PARTLY UNREADABLE MAY NOT CERTIFY "OUTSIDE THE FARM", AND MUST NOT
+# OUTRANK THE FATAL ARM EITHER. Two separate fail-opens, one condition each:
+#   * `stale_outside` is a claim ABOUT A DECLARATION, so it is sound only when every entry was graded;
+#   * but withholding it must never demote drift the farm OWES. The first cut of this arm exited 2
+#     whenever `decl_offshape > 0 && stale_outside > 0`, which fired BEFORE the fatal determination at
+#     the bottom of this file — so "declared stale + one undeclared stale + one ungradeable line"
+#     turned the #10114 fatal verdict into UNKNOWN (rc=2), which `pi-bootstrap/setup.sh:1076` warns
+#     and continues on. That is the arm reversing the decision it exists to protect (review P1,
+#     measured: rc=1 on main and at bbf93274, rc=2 on the fixed head). Hence `stale_declared -eq 0 &&
+#     missing -eq 0`: withhold ONLY the outside-farm classification, and let the fatal arm fire.
+if [ "$decl_offshape" -gt 0 ] && [ "$stale_outside" -gt 0 ] && [ "$stale_declared" -eq 0 ] && [ "$missing" -eq 0 ]; then
     say_err "$PROG: UNKNOWN — $decl_offshape line(s) of the farm declaration $DECL could not be graded,"
     say_err "   and $stale_outside stale file(s) fall outside what the graded lines declare. A partly"
     say_err "   unreadable declaration cannot certify 'the farm does not owe this', so the fatal arm is"
     say_err "   not being switched off on it. This is not a pass."
-    say_err "   Next: fix the declaration entries named above (each must be a plain scripts/<path>), then re-run this."
+    say_err "   Next: fix the declaration entries (each must name a path under scripts/, with no '..'), then re-run this."
     exit 2
 fi
 # ⛔ THE SPLIT IS ONLY A MEASUREMENT WHEN THE DECLARATION WAS READ. `stale_declared=$stale` is
@@ -673,6 +680,18 @@ total=$((same+stale+unsourced))
 say ""
 if [ "$matched" -eq 0 ]; then
     say_err "$PROG: UNKNOWN — no SOURCED file was graded; an all-declared-local farm is not a matching farm."
+    exit 2
+fi
+# ⛔ A LINE THIS RUN COULD NOT GRADE MEANS A DECLARED FILE MIGHT BE OWED AND ABSENT — so a farm that
+# otherwise matches may not print OK while one exists. The shapes still ungradeable after
+# `decl_rel_norm` are narrow (a path that escapes the root; an empty `scripts/`), and the whole-set
+# case already exits 2 above — this is the MIXED case, where a gradeable sibling made the set non-empty
+# and the ungradeable line simply vanished. A false PASS is the one outcome this file must never have;
+# refusing OK is the fail-closed direction (rc=2 warns, it never blocks an install).
+if [ "$decl_offshape" -gt 0 ] && [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
+    say_err "$PROG: UNKNOWN — $decl_offshape line(s) of the farm declaration $DECL could not be graded, so a"
+    say_err "   file the farm owes and never landed cannot be ruled out. This is not a pass."
+    say_err "   Next: fix the declaration entries (each must name a path under scripts/, with no '..'), then re-run this."
     exit 2
 fi
 if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
