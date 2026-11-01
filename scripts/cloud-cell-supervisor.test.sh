@@ -2094,6 +2094,84 @@ qsup start "$Q/tortoise-repo" "$Q/st-http"
                   || bad "start rejected an http:// origin — $Q_OUT"
 git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
 
+# (7d) A TRAILING SLASH IS THE SAME REPO HERE TOO — and this copy of the accept list had drifted
+# (review of #3188, P2). `refresh-candidates.sh` had already learned that `git remote add` accepts
+# `https://github.com/<owner>/<repo>/` and that humans type it, so its three copies of the predicate
+# carry the four trailing-slash spellings. THIS copy (in `resolve_repo`, the auto-derive path a cell
+# with no exported `$REPO` takes) did not, so the two entry points disagreed on a URL-shaped origin:
+# `refresh --check` derived the checkout and proceeded, `start`/`check` died "REPO is not set and no
+# single checkout could be derived" — the #1745/#1856 two-authorities class, in the fail-closed
+# direction. Every arm below is a POSITIVE derivation (not a pair of absences) and each spelling is
+# its own fixture, so deleting one spelling from THIS copy reddens exactly its own row. The control at
+# the end keeps them honest: a trailing-slash origin naming ANOTHER repo is still refused.
+# ⛔ THE PER-ROW $O IS SEEDED AND THE ROW ASSERTS rc=0 (review of #3188, P2). The first version of this
+# block left $O unseeded, so `check` died one gate PAST the resolver (cmd_check's worker-scripts
+# precondition) in every fixture: the rows could only report "the resolver PRINTED its derivation
+# line" while the verb this fix exists for still exited non-zero — the block's own framing ("check
+# died") was never demonstrated, and a green row proved less than a reader would read into it. Seeding
+# the shipped set ($SEED_WORKERS, derived from the supervisor at the top of this file) lets `check` run
+# to its verdict, so each spelling now pins the END STATE — rc=0 AND the CELL CAN RUN banner — rather
+# than a log line that a later regression could print while still refusing. Same lesson as (h4)'s "A
+# POSITIVE ASSERTION, NOT TWO ABSENCES" in refresh-provision.test.sh.
+T7D="$T/trailslash"; mkdir -p "$T7D"
+T7D_N=0
+for t7d_spelling in \
+  "https://github.com/acme/trailslash/" \
+  "https://github.com/acme/trailslash.git/" \
+  "git@github.com:acme/trailslash/" \
+  "git@github.com:acme/trailslash.git/"
+do
+  T7D_N=$((T7D_N + 1))
+  t7d_repo="$T7D/repo-$T7D_N"
+  ai_init_repo "$t7d_repo"
+  git -C "$t7d_repo" remote set-url origin "$t7d_spelling"
+  t7d_real="$(cd "$t7d_repo" && pwd -P)"
+  mkdir -p "$T7D/o-$T7D_N"
+  seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$T7D/o-$T7D_N/$f"; done
+  T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-$T7D_N" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+             ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-$T7D_N-$$" O="$T7D/o-$T7D_N" \
+             WORKDIR="$t7d_repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+             HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+  case "$T7D_OUT" in
+    *"REPO was not set — using $t7d_real"*)
+      ok "(7d) the auto-derive adopts a checkout whose origin is '$t7d_spelling' (trailing slash = same repo)" ;;
+    *)
+      bad "(7d) FALSE-BLOCKED a trailing-slash origin '$t7d_spelling' (rc=$T7D_RC) — the other verbs derive it: $T7D_OUT" ;;
+  esac
+  case "$T7D_OUT" in
+    *"no single checkout could be derived"*)
+      bad "(7d) '$t7d_spelling' reached the underivable refusal" ;;
+    *)
+      ok "(7d) …and '$t7d_spelling' never reaches the underivable refusal" ;;
+  esac
+  [ "$T7D_RC" -eq 0 ] \
+    && ok "(7d) …so check PROCEEDS on '$t7d_spelling' (rc=0 — the verb the false block killed, not just the resolver)" \
+    || bad "(7d) check still exited $T7D_RC for '$t7d_spelling' AFTER the resolver adopted it: the false block moved, it did not close — $T7D_OUT"
+  case "$T7D_OUT" in
+    *"CELL CAN RUN A CONTROLLER"*)
+      ok "(7d) …and reaches its verdict (the CELL CAN RUN banner), so the derivation is not the end of the pass" ;;
+    *)
+      bad "(7d) '$t7d_spelling' was adopted but check never reached its verdict — an early exit past the resolver still reads as a pass otherwise: $T7D_OUT" ;;
+  esac
+done
+# The CONTROL: the same trailing-slash SHAPE naming another repo is still not adopted, so the four rows
+# above pin the accept list rather than "a trailing slash is always accepted". (Unique slugs on both
+# sides keep this hermetic: no box has a checkout whose origin is acme/trailslash*.) Its $O is
+# deliberately left UNSEEDED: this arm's whole claim is that the refusal IS the derivation — which the
+# block's own third row pins by name — so seeding could only blur which gate answered.
+mkdir -p "$T7D/other" "$T7D/st-other"; ai_init_repo "$T7D/other"
+git -C "$T7D/other" remote set-url origin "https://github.com/acme/something-else/"
+T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-other" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+           ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-other-$$" O="$T7D/o-other" \
+           WORKDIR="$T7D/other" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+           HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+[ "$T7D_RC" -ne 0 ] && ok "(7d) the trailing-slash shape naming ANOTHER repo is still REFUSED" \
+                   || bad "(7d) adopted a trailing-slash origin that names another repo — $T7D_OUT"
+case "$T7D_OUT" in
+  *"no single checkout could be derived"*) ok "(7d) …and the refusal is the derivation (not an unrelated precondition)" ;;
+  *) bad "(7d) the control refused for an UNRELATED reason, so the four rows above prove nothing: $T7D_OUT" ;;
+esac
+
 # (8) `check` refuses the same pair `start` refuses — a preflight that says YES where `start` dies is
 # a FALSE PASS on exactly the question its verdict answers.
 qsup check "$Q/agent-repo" "$Q/st-check" OR=daniel-ospina/tortoise
