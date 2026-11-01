@@ -65,6 +65,32 @@ TMP="$(mktemp -d)"
 # running a cell controller. An explicit EMPTY value (no colon) is the helper's advertised seam for
 # "no roots" — the same line tests/ci-lane-parity/run.sh uses.
 FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
+# ⛔ AND THE FIXTURE MUST NOT INHERIT THE CALLER'S **RUNNER** ENV EITHER (agent-infra#3220, measured).
+# `scripts/run-bash-shards.sh` hands every shard its own environment unmodified (`shard_run_bounded`
+# runs `bash "$1" </dev/null`), and BOTH of this repo's bash lanes export a runner setting that this
+# suite's fixtures then re-use as if it were their own:
+#
+#   * `ci-main.yml`'s `script-validate` exports `BASH_SHARDS_BUDGET_SECS: '7800'` job-wide. The runner
+#     deliberately REFUSES (rc 2) a POSITIVE budget combined with `BASH_SHARD_SLICE` — a sliced
+#     process only accumulates its own share, so a whole-list deadline would be ~N times too lenient.
+#     Arms 2d/2e pass `BASH_SHARD_SLICE=1/1`, so the inherited budget turned arm 2d into
+#     `❌ a 3-shard SLICED run failed (rc 2)` on EVERY main run — measured 4/4 across 9cdad0511,
+#     3803336, f8f366b, 7094d4183 — while passing on a laptop where the variable is unset. This is the
+#     `bash-shard::tests/run-bash-shards-bound/run.sh` identity #3220 reported.
+#   * `ci.yml`'s `bash-suites` matrix exports `BASH_SHARD_SLICE: <i>/<n>` for the whole step. Every
+#     fixture call here that does NOT set its own slice then inherits one and runs 1/n of its staged
+#     3 shards, so the bound arms collapse. Measured: **25 of 52** assertions under
+#     `BASH_SHARD_SLICE=1/3`, and **33 of 52** in CI's own `bash-suites (8)` (run 41345204825,
+#     `❌ run-bash-shards-bound suite: 33 of 52 assertion(s) failed`) — so the same suite is red in
+#     BOTH lanes, from these two different variables, which is why one fix has to clear both.
+#
+# Both are the same defect — a suite that declares itself hermetic ("no host state") reading the host's
+# runner config — and this suite tests the BOUND, never the budget or the slicing. `tests/ci-lane-parity`
+# already strips exactly these two variables at every one of its fixture invocations for this reason, so
+# unsetting them in ONE place here is the established idiom, not a weakening. Both are written as
+# `unset` rather than `=0`/`=1/1`: the runner's other documented "none" spellings, but unsetting is the
+# form the sibling suite uses and what `ci-main.yml` documents as "no deadline".
+unset BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
 trap 'rm -rf "$TMP"' EXIT
 
 # stage_fixture <root> <hang-seconds> — a miniature checkout the REAL runner runs.
