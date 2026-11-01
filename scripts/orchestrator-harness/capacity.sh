@@ -167,8 +167,11 @@
 # #2707 defect wearing a different key, so the order is now (hw uuid, routable IPv4) and then **no
 # identity at all** — `cap_publish` refuses by name (`why=no-box-identity`) and the box is INVISIBLE to
 # its peers, which is the fail-closed direction and is the same stance as `fork_unknown`. A box that
-# reaches the origin has a routable address by construction (private ranges are `scope global`), so the
-# refusal costs nothing in practice; a deploy that must name a box pins `CAP_BOXID`.
+# reaches the origin normally has a routable address, but that is NOT free any more: since #3167 the
+# derivation is anchored to the egress device and refuses a box whose default route is not in the main
+# table (`ip route show default`), so a policy-routing or gateway-less box IS refused where the old
+# `NR==1` body would have published something. Fail-closed on purpose — a deploy that must name such a
+# box pins `CAP_BOXID`.
 #
 # ⛔ THE PREFIX IS NOT THE KEY, AND THE PRUNE IS NOT HOST-SCOPED. `cap_host` still returns the HUMAN
 # name (`cmux`, `Daniels-MacBook-Air`) and a ref is keyed `refs/boxes/<host>/<boxid>/<reading>`. The
@@ -306,8 +309,10 @@ cap_boxid() {
 
 # cap_boxid_auto — first AVAILABLE source wins, in order of measured discriminating power:
 #   1. the hardware UUID (Darwin `kern.uuid`) — unique per machine, survives a re-image of the OS;
-#   2. the box's GLOBAL IPv4 — measured UNIQUE on the three cells (10.238.144.2/.3/.4). `scope
-#      global` also excludes `lo` and the 169.254/16 link-local address that IS shared (measured).
+#   2. the box's ROUTABLE IPv4 — measured UNIQUE on the three cells (10.238.144.2/.3/.4). ⛔ NOT
+#      because `scope global` excludes anything useful: on these cells the 169.254/16 link-local address
+#      is ITSELF reported `scope global` (measured, #3167), which is what broke this source. Read
+#      `cap_boxid_net`: it excludes link-local by PREFIX and anchors the answer to the egress device.
 # ⛔ AND THEN NOTHING — `machine-id` is gone from this list on purpose (see the header): measured
 # IDENTICAL on all three cells, so as a fallback it publishes a FALSE ATTRIBUTION instead of refusing.
 # An empty answer here is a real answer: `cap_probe_local` still reports the reading, and `cap_publish`
@@ -329,21 +334,123 @@ cap_hw_uuid() {
 }
 
 # cap_boxid_net — the box's routable IPv4: the ONE address a peer can reach it on, and the only
-# identifier measured to differ across the three cells. Linux reads it through `ip` with `scope
-# global` (link-local and loopback are excluded by scope, not by a pattern); Darwin reads the
-# interface the default route uses. A box with no routable address (an isolated runner) returns 1 and
-# the next source answers.
+# identifier measured to differ across the three cells. Darwin reads the address on the interface the
+# default route uses; Linux reads the same thing off `ip`, and REFUSES rather than guessing when it
+# cannot see it. Two shapes return 1 and the next source answers: a box with no routable address at all
+# (an isolated runner), and — narrowing from review round 1 — a box with **no default route in the MAIN
+# table** (a policy-routing or gateway-less box: `ip route show default` prints the main table only, so
+# such a box is now REFUSED where the old `NR==1` body would have published *some* address). That is the
+# fail-closed direction on purpose, and `CAP_BOXID` is the seam for an operator whose box is shaped that
+# way — the derivation is a convenience for boxes networked the way the fleet's are, not an oracle.
+#
+# ⛔ `scope global` IS NOT A ROUTABILITY TEST — MEASURED 2026-10-31 ON EVERY CELL (#3167). Every cell
+# reports the identical arrangement, and `169.254.77.2/30` — an RFC 3927 LINK-LOCAL address — comes
+# out of `ip -4 -o addr show scope global` as `scope global`, FIRST, ahead of the docker bridge and of
+# the routable address on the VLAN child:
+#
+#   3: eth0      inet 169.254.77.2/30   scope global eth0        <-- link-local, still `scope global`
+#   4: docker0   inet 172.17.0.1/16     scope global docker0     <-- a bridge, never peer-reachable
+#   5: eth0.1911 inet 10.238.144.N/20   scope global eth0.1911   <-- THE identity
+#
+# The old body took `NR==1`, committed the identity to line 3, rejected it in the guard below, and
+# returned 1 with line 5 never read. Every cell therefore published NO identity, `cap_publish` refused
+# it by name, and every cell was permanently INELIGIBLE to its peers (#3167).
+#
+# ⛔ SO THE ACCEPT-PREDICATE IS AN ALLOW-LIST, and the answer is REFUSED — never guessed — unless a
+# candidate passes EVERY clause:
+#   1. the device CARRIES THE EGRESS TRAFFIC: it is the default route's device, or a VLAN child of it
+#      (`<dev>.<n>` — the cells' routable address lives there), AND that device is ADMINISTRATIVELY UP
+#      (`ip … show up`; a DOWN interface keeps its address in the listing, and a stale address on a dead
+#      VLAN is not "the ONE address a peer can reach it on" — measured, review round 6). This is the
+#      structural clause, and it is the same rule the Darwin arm encodes: the address a peer can reach me
+#      on is the address on the interface my traffic leaves by. For any device that does NOT carry egress
+#      it makes a container bridge or a VPN unable to supply the value by ACCIDENT of ordering or naming —
+#      docker0 is at a LOWER ifindex than the cells' VLAN child, so ordering alone would never save us.
+#      ⛔ CLAUSE 1'S CHILD HALF IS A NAME TEST, AND SAYS SO: a device is accepted as a "VLAN child" when
+#      it is NAMED `<egress>.<n>`, so a bridge/VPN device deliberately named that way IS trusted (measured,
+#      review round 9: a dummy named `eth0.9` at a lower ifindex was published). Closing that needs a
+#      TYPE check (`ip -d link show`), which was considered and not taken: it adds a query and a failure
+#      mode for every candidate, and the only way to reach the hole is to name a device after the egress
+#      device on purpose. The alternative is to say this plainly, which is what this paragraph does.
+#      ⛔ KNOWN RESIDUAL, stated rather than implied: `up` is IFF_UP, NOT carrier/operstate. A device that
+#      is admin-up with NO CARRIER (a dead VLAN over a dead veth) still lists its address and can be
+#      chosen (measured, review round 7). Requiring `LOWER_UP` was considered and NOT taken: it adds a
+#      second query and a second failure mode on every box whose egress device reports no lower-layer
+#      flag, and the blast radius here is already bounded — the same egress carries the `git push` that
+#      publishes the record, so a dead egress normally surfaces as `why=push-refused` instead.
+#      ⛔ FOR THE EGRESS DEVICE ITSELF clause 1 accepts by definition, so a tunnel that carries the
+#      default route is caught by clause 2's NAME LIST and by nothing else — a deny-list, incomplete by
+#      nature (`ppp0` was measured slipping through in round 6 and is now listed). An operator whose
+#      egress device is an unusual tunnel sets `CAP_BOXID`; guessing from an address is the false
+#      attribution this function exists to avoid;
+#   2. the device is not a pseudo/container/tunnel device by name;
+#   3. the address is a dotted quad that is not loopback (127/8), link-local (169.254/16), unspecified
+#      (0/8), multicast or reserved (224/4 and up). The 0/8 and 224/4 branches are graded by §14 (11) and
+#      the link-local branch by (1)/(2); the 127/8 branch is DEFENCE ONLY on Linux (`ip addr add 127.0.0.5`
+#      reports `scope host`, so `scope global` already drops it) — the tail guard below is its only
+#      backstop, and (12) grades that guard through the Darwin arm, which this change does not touch.
+# THE CHOICE AMONG SEVERAL SURVIVORS IS DOCUMENTED AND TOTAL: the LOWEST interface index wins, then a
+# PRIMARY address before a `secondary` alias, then the NUMERICALLY lower address (compared as octets, not
+# as a string — `10.9.9.9` < `10.9.9.10`, which a string compare gets backwards). The choice is therefore
+# a function of the candidate SET alone, never of the order `ip` emitted its lines in — and this matters
+# more than it looks: an identity that FLAPS between runs publishes FALSE ATTRIBUTION (two peers, two
+# keys, one box) which is strictly worse than an empty one, because an empty boxid is refused by name
+# while a flapping one is believed. Linux allocates ifindex monotonically, so a device created LATER (a
+# docker network, a VPN) can never preempt one that already existed.
+# ⛔ EVERY CLAUSE IS GRADED BY ITS OWN ARM in capacity-placement.test.sh §14: (8) a foreign device with a
+# NON-REJECTED name at a lower ifindex is never the identity (clause 1), (9) an egress device that is a
+# tunnel refuses rather than adopting its address (clause 2), (11) the unspecified/reserved prefixes
+# refuse (clause 3), (12) the Darwin arm refuses a link-local address, (14) an address on a DOWN
+# interface is never the identity, (15) an egress device that is a `ppp` tunnel refuses, (3)/(3b) the
+# choice is stable, total and ifindex-ordered, (10) the secondary and octet tie-breaks. The dotted-quad
+# `$4` guard is
+# deliberately UNGRADED: `ip -4 -o addr` always puts the address in `$4`, so it is defence only, not a
+# mechanism — and so is the WORD ANCHOR on the `secondary` detector (`\<secondary\>`): replacing it with a
+# bare substring match is green because its only reachable difference is a device/label containing that
+# literal word, which can only break a tie between two addresses on the SAME device — so the answer stays
+# a peer-reachable address on that device, deterministic run to run. Arm (4) is the no-address refusal — kept as a guard, NOT as proof: the old body refused that
+# fixture too, so it does not discriminate.
 # ⛔ THIS IS ALSO THE SUITE'S IDENTITY SEAM: the arms in capacity-placement.test.sh §12 override THIS
 # FUNCTION to stand up two boxes with two identities on one hostname — the whole point of #2707 is
 # that `CAP_HOST` is NOT what distinguishes them.
 cap_boxid_net() {
-  local out ifc ip
+  local out ifc ip cand dev
   if command -v ip >/dev/null 2>&1 && [ -r /proc/net/route ]; then
-    out="$(ip -4 -o addr show scope global 2>/dev/null)" || return 1
+    out="$(ip -4 -o addr show scope global up 2>/dev/null)" || return 1
     [ -n "$out" ] || return 1
-    ifc="$(printf '%s\n' "$out" | awk 'NR==1{print $2}')"
-    ip="$(printf '%s\n' "$out" | awk 'NR==1{print $4}')"
-    ip="${ip%%/*}"
+    # The egress device — clause 1's anchor. `ip route show default` prints the MAIN table only (a route
+    # in a custom table does not appear here), and it prints SEVERAL lines when the main table holds a
+    # multipath default or several defaults at different metrics; the first one naming a device wins,
+    # which is iproute2's own metric-ascending order.
+    dev="$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')" || dev=""
+    [ -n "$dev" ] || return 1
+    cand="$(printf '%s\n' "$out" | CAP_EGRESS_DEV="$dev" awk '
+      # clause 2 — a pseudo/container/tunnel device never names a box, even when it carries egress.
+      $2 ~ /^(lo|docker|br-|veth|virbr|podman|vxlan|cni|flannel|cali|kube|tun|tap|wg|zt|tailscale|utun|ppp|gre|ipip|sit|wwan|rmnet|dummy|lxc)/ { next }
+      # the address field must be a dotted quad with an optional prefix length, or this is not a line
+      # we understand and we must not read it.
+      $4 !~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*(\/[0-9][0-9]*)?$/ { next }
+      {
+        a = $4; sub(/\/.*/, "", a)
+        # clause 3 — peer-reachable prefixes only.
+        if (a ~ /^0\./ || a ~ /^127\./ || a ~ /^169\.254\./ || a ~ /^22[4-9]\./ || a ~ /^2[3-5][0-9]\./) next
+        # clause 1 — the device carries egress, or is a VLAN child of the device that does.
+        if ($2 != ENVIRON["CAP_EGRESS_DEV"] && index($2, ENVIRON["CAP_EGRESS_DEV"] ".") != 1) next
+        i = $1; sub(/:$/, "", i); i = i + 0
+        # `secondary` is how a SECOND address on one device announces itself; it never displaces the
+        # address of record on that device.
+        s = ($0 ~ /[[:space:]]secondary([[:space:]]|$)/) ? 1 : 0
+        # the address as a NUMBER (octets), because the documented tie-break is numeric and a string
+        # compare reads `10.9.9.10` as smaller than `10.9.9.9`.
+        n = 0; k = split(a, o, "."); for (j = 1; j <= k; j++) n = n * 256 + (o[j] + 0)
+        if (best == "" || i < bi || (i == bi && s < bs) || (i == bi && s == bs && n < bn)) {
+          best = a; bif = $2; bi = i; bs = s; bn = n
+        }
+      }
+      END { if (best != "") print bif " " best }
+    ')"
+    [ -n "$cand" ] || return 1
+    ifc="${cand%% *}"; ip="${cand#* }"
   else
     ifc="$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')" || return 1
     [ -n "$ifc" ] || return 1
@@ -1129,6 +1236,37 @@ cap_ref_deletable() {
 # Anything else fresh under our hostname is another box's reading: KEPT (it is the evidence) and counted
 # in `foreign=`. The first draft of this fix instead inferred authorship from (key, boot) equality, which
 # a mis-keyed peer satisfies — see `cap_ref_deletable`.
+# cap_pub_why <publish-output> -> the reason `cap_publish` refused/failed, or nothing.
+# ⛔ IT IS FIELD-ANCHORED **AND TOKEN-BOUNDED** (`-F'why='` then the first whitespace-delimited token):
+# a push failure carries MORE on the line (`publish=failed why=push-refused ref=refs/boxes/...`), so both
+# `$NF` (the ref) and the whole remainder (`push-refused ref=…`) report a "reason" that names nothing
+# usable — which is how a why-field silently stops being one (review round 9).
+cap_pub_why() {
+  printf '%s\n' "${1:-}" | awk -F'why=' '/^publish=(refused|failed)/{split($2, t, " "); print t[1]; exit}'
+}
+
+# cap_publish_logged <repo> <record> <logfile> <namespace> — PUBLISH, and on failure write the reason to
+# <logfile>. Returns `cap_publish`'s status. THIS EXISTS BECAUSE A SILENT REFUSAL IS THE DEFECT (#3167):
+# the controller called `cap_publish … >/dev/null 2>&1`, so a box that could not name itself went
+# INELIGIBLE with nothing in the log saying why. Keeping the logic HERE (not inline in orch-loop.sh) is
+# what lets the suite grade it as BEHAVIOUR — the polarity, the reason and the remedy gate — instead of
+# grepping the controller's text for fragments (review round 9).
+# ⛔ THE REMEDY IS NAMED ONLY FOR THE REASON THAT HAS ONE: `no-box-identity` means "this box cannot name
+# itself"; `push-refused`/`no-head`/`invalid-record` do not, and pointing an operator at CAP_BOXID for
+# those would send them to a boxid that is already right.
+cap_publish_logged() {
+  local repo rec log ns out why bid hint
+  repo="${1:-}"; rec="${2:-}"; log="${3:-}"; ns="${4:-$CAP_NS}"
+  out="$(cap_publish "$repo" "$rec" 2>&1)" && return 0
+  why="$(cap_pub_why "$out")"
+  bid="$(cap_kv "$rec" boxid)"
+  hint=""
+  [ "${why:-}" = "no-box-identity" ] && hint='; a box that cannot name itself cannot publish it — the operator seam is CAP_BOXID'
+  printf '[capacity] this box'"'"'s reading could not be PUBLISHED to %s (%s) — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings) — why=%s boxid=%s host=%s%s\n' \
+    "$ns" "$(printf '%s' "$out" | tr '\n' ' ')" "${why:-unknown}" "${bid:-<none>}" "$(cap_host)" "$hint" >> "$log"
+  return 1
+}
+
 cap_publish() {
   local repo="${1:-.}" rec="${2:-}" ref sha old orec h bid now foreign ledger
   # ⛔ NO NAME, NO RECORD — and this is checked BEFORE the record's other fields, because "I could not
