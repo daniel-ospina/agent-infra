@@ -107,6 +107,103 @@ OUT="$(pl_verdict "$D" 6161 1 1)"; RC=$?
 check "(a3) an EMPTY lock (claim mid-creation) reads OWNED" "[ $RC -eq 0 ] && case \"\$OUT\" in *'mid-creation'*) true ;; *) false ;; esac"
 check "(a3) …and the mid-create lock is NOT removed"       "[ -e '$(pl_lock_path "$D" 6161)' ]"
 
+# ⛔ (a4) AN ORPHANED RECORD — one that names NO owner and has OUTLIVED any possible create window — is
+# ABANDONED, not mid-creation (agent-infra#3096, review P1-1). `merge-one.sh` creates the record and
+# writes its pid in two steps, so an EMPTY record is a claim IN PROGRESS for as long as that window can
+# last, which is microseconds. Past it the state is a MEASUREMENT, and it must not read OWNED for ever:
+# the controller asks this verdict BEFORE each of its five fixer/rail spawn arms (`pr_owner_live`,
+# `orch-loop.sh:3150`), so answering OWNED for a 21-hour-old 0-byte record spawns NOTHING — while
+# `pr_owned`, which needs a pid > 0, counts the same PR UN-owned and holds the issue path shut. One
+# state, two opposite verdicts, zero lanes: measured on three cells, records 1278-2314 minutes old, and
+# the fixer arm that reclaims them could never be reached (review of #3096, P1-1).
+# The alternative that must never happen is reclaiming on EMPTINESS ALONE, which deletes a live
+# lander's claim. (a3) and (a4) use the SAME BYTES and the SAME CALL and differ only in the record's
+# age, so the pair pins that AGE is what is measured — and that the content alone never decides.
+O="$TMP/orphan"; mkdir -p "$O"
+OLK="$(pl_lock_path "$O" 7171)"
+: > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+[ -n "$(find "$OLK" -maxdepth 0 -mmin +2 2>/dev/null)" ]; rc=$?
+check "(a4) the fixture really is an OLD record (mtime aged past the grace, or the arm below is vacuous)" "[ $rc -eq 0 ]"
+OUT="$(pl_verdict "$O" 7171 1 1)"; RC=$?
+check "(a4) an empty record PAST the create window is ABANDONED — RELEASED, not 'never reaped'" \
+  "[ $RC -eq 1 ] && case \"\$OUT\" in RELEASED*'named NO owner'*ABANDONED*) true ;; *) false ;; esac"
+check "(a4) …and the abandoned record is REMOVED, so the PR is genuinely spawnable" "[ ! -e '$OLK' ]"
+# The deliberate NARROWING, and the arm that would otherwise be a fail-open: a body that is NOT empty is a
+# claim with real content in it, and "nothing was ever written here" is not provable from it. It stays LIVE.
+: > "$OLK"; printf 'not-a-pid\n' > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$(pl_verdict "$O" 7171 1 1)"; RC=$?
+check "(a4b) a NON-empty unparseable record stays LIVE (content alone never proves abandonment)" \
+  "[ $RC -eq 0 ] && case \"\$OUT\" in OWNED*) true ;; *) false ;; esac"
+check "(a4b) …and it is KEPT" "[ -e '$OLK' ]"
+# A peer's LIVE claim is never displaced, however the age reads: the pid arm runs first and returns OWNED.
+printf '%s\n' "$$" > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$(pl_verdict "$O" 7171 1 1)"; RC=$?
+check "(a4c) an OLD record naming a LIVE pid is OWNED and kept (age never overrides a measured owner)" \
+  "[ $RC -eq 0 ] && [ -e '$OLK' ]"
+rm -f "$OLK"
+# ⛔ (a4d) THE WORKER RECORD OUTRANKS THE LOCK, AND THIS ARM DELETES FILES (review of #3096, P2-1). A lock
+# is the WEAKEST proof this module accepts; the dead-pid arm deliberately declines to answer and falls
+# through to the worker-record step for exactly that reason. An arm that REMOVES the record must not run
+# ahead of it, or it deletes the lock a live worker's census row still proves is held.
+: > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$(pl_verdict "$O" 7171 1 0)"; RC=$?
+check "(a4d) a LIVE worker record keeps an aged empty lock OWNED (the reap never outranks a measured worker)" \
+  "[ $RC -eq 0 ] && case \"\$OUT\" in *'live worker record'*) true ;; *) false ;; esac"
+check "(a4d) …and the lock is KEPT — deleting a live worker's lock is the one outcome this module bans" \
+  "[ -e '$OLK' ]"
+rm -f "$OLK"
+# ⛔ (a4e/a4f) THE RACE OUTCOMES HAVE THEIR OWN SENTENCES, AND EACH MUST BE REACHABLE (review P2-4: 18
+# lines that no shard could see go red). `pl_reap_no_owner` calls `mv` and `ln` UNQUALIFIED on purpose, so
+# a function of that name drives the exact instant: `mv` still detaches (the race is real, not simulated)
+# and the detached record then carries a PEER's pid.
+: > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$( mv() { command mv "$@"; printf '%s\n' "$$" > "$OLK.reclaim.$$"; }; pl_verdict "$O" 7171 1 1 )"; RC=$?
+check "(a4e) a peer that claims during the reclaim is PUT BACK and reported as OWNED (rc=$RC)" \
+  "[ $RC -eq 0 ] && case \"\$OUT\" in *'PEER claimed it in the instant'*) true ;; *) false ;; esac"
+check "(a4e) …and the restored claim is readable AT THE PATH again, not merely ln-succeeded" \
+  "[ -f '$OLK' ] && [ -n \"\$(cat '$OLK' 2>/dev/null)\" ]"
+: > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$( mv() { command mv "$@"; printf '%s\n' "$$" > "$OLK.reclaim.$$"; }; ln() { return 1; }; pl_verdict "$O" 7171 1 1 )"; RC=$?
+check "(a4f) a claim that could NOT be put back is reported as LOST, not as 'nothing was deleted' (rc=$RC)" \
+  "[ $RC -eq 0 ] && case \"\$OUT\" in *'could NOT be put back'*) true ;; *) false ;; esac"
+check "(a4f) …and it does NOT claim the peer still holds it" \
+  "case \"\$OUT\" in *'peer holds it'*) false ;; *) true ;; esac"
+# The detach itself failing must NOT invent a peer: a `mv` that fails leaves the record on disk, unchanged.
+: > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$( mv() { return 1; }; pl_verdict "$O" 7171 1 1 )"; RC=$?
+check "(a4g) a reclaim that could not detach says so, and does NOT assert a cause it never measured (rc=$RC)" \
+  "[ $RC -eq 0 ] && case \"\$OUT\" in *'could NOT be detached'*) true ;; *) false ;; esac && case \"\$OUT\" in *'unwritable'*) false ;; *) true ;; esac"
+check "(a4g) …and the abandoned record is still on disk, unchanged" "[ -e '$OLK' ]"
+rm -f "$OLK"
+# ⛔ THE GUARDS THAT MAKE A `rm`-BEARING ARM SAFE (review of #3096, P3-4). Each of these was measured as
+# UNDISCRIMINATED: deleting the guard left both suites green. They fail closed, so the risk is not worse
+# behaviour, it is a silent regression in the arm that deletes files.
+# 1. A SYMLINK is not a record: `[ -f ]` follows it, so a `rm` would delete the TARGET.
+: > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OLLINK="$TMP/orphan-link.lock"; rm -f "$OLLINK"; ln -s "$OLK" "$OLLINK" 2>/dev/null
+check "(a4h) a symlinked record is NOT admitted (content alone is not the record's own — `rm` would hit the target)" \
+  "! pl_record_no_owner '$OLLINK' >/dev/null"
+OUT="$( pl_reap_no_owner "$TMP" orphan-link >/dev/null 2>&1; printf '%s' ok )"
+check "(a4h) …and the reap refuses it, leaving the target intact" "[ -e '$OLK' ]"
+rm -f "$OLLINK" "$OLK"
+# 2. a WHITESPACE-ONLY body is no owner, and is admitted (the module side of the fix-one '   \n' fixture).
+: > "$OLK"; printf '   \n' > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null
+OUT="$(pl_verdict "$O" 7171 1 1)"; RC=$?
+check "(a4i) an AGED whitespace-only record is RELEASED (the module half of the shape fix-one reclaims)" \
+  "[ $RC -eq 1 ] && case \"\$OUT\" in RELEASED*) true ;; *) false ;; esac"
+check "(a4i) …and it is REMOVED" "[ ! -e '$OLK' ]"
+# 3. an UNREADABLE record is not evidence of anything — no `|| echo 0` shortcut, and never reaped.
+: > "$OLK"; printf '\n' > "$OLK"; touch -t 202001010000 "$OLK" 2>/dev/null; chmod 000 "$OLK" 2>/dev/null
+if [ ! -r "$OLK" ]; then
+  OUT="$(pl_verdict "$O" 7171 1 1)"; RC=$?
+  check "(a4j) an UNREADABLE aged record is not reclaimed — what cannot be read is not evidence (rc=$RC)" \
+    "[ $RC -eq 0 ] && [ -e '$OLK' ]"
+  chmod 600 "$OLK" 2>/dev/null
+else
+  printf '  (skipped) cannot make a file unreadable here — chmod 000 had no effect (root?)\n'
+fi
+rm -f "$OLK"
+
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 echo "(c) a PR whose worker is ALIVE is still respected"
 OUT="$(pl_verdict "$B" 4242 1 1)"; RC=$?
