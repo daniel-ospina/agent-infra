@@ -2465,9 +2465,16 @@ run_recover() { # <pr> <repo> [script] -> RB_OUT / RB_RC
 # (a) THE RECOVERY: a record file is absent, the body carries a valid signed
 #     marker → the record is rebuilt, with the marker's own head/diff/verdict.
 rb_clear
-export STUB_BODY="Some PR description.
+# status CHECKED, then exported. This site is the class the scanner's rule CANNOT see (a declaration
+# builtin whose value spans lines is not "a substitution on the same line"), and it is still the shape:
+# a marker that failed to BUILD leaves the prose prefix non-empty, so the arm goes red for the wrong
+# reason instead of refusing to judge. The marker is therefore built and checked BEFORE it is embedded.
+RB_M_A="$(rb_marker 424911 "review recorded: reviews/424911.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — the 11.14a arm would otherwise fail on a MISSING marker"
+STUB_BODY="Some PR description.
 
-$(rb_marker 424911 "review recorded: reviews/424911.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+$RB_M_A"
+export STUB_BODY
 run_recover 424911 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14a a verified marker rebuilds the missing record (exit 0)"
 assert_eq "$RB_OUT" "recovered${RB_TAB}${RB_HEAD}${RB_TAB}${RB_DIFF}" "11.14a …and prints the restored head + digest, so the claim is checkable"
@@ -2688,11 +2695,16 @@ unset STUB_BODY RB_OUT RB_RC RB_LEG RB_FOREIGN_BEFORE
 rb_clear
 RB_OLD_HEAD="$(printf '7%.0s' $(seq 1 40))"
 RB_OLD_DIFF="$(printf '8%.0s' $(seq 1 64))"
-# status CHECKED, then exported: `export X="$(…)"` discards the substitution's status, so a fixture
-# that failed to BUILD (empty STUB_BODY) would make both arms refuse for the WRONG reason and still pass.
-STUB_BODY="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean @ $RB_OLD_HEAD diff=$RB_OLD_DIFF ($RB_REPO)")
-$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean-micro @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
-  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+# status CHECKED PER MARKER, then exported. ⛔ A single trailing guard on a TWO-substitution value
+# checks only the LAST one (`X="…$(a)…$(b)"` returns b's status), so a failing FIRST marker would still
+# be discarded — and the arm asserts the LAST marker wins by name, so it would stay green while proving
+# nothing about supersession. Each marker is built and checked on its own, so either failure is loud.
+RB_M_FIRST="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean @ $RB_OLD_HEAD diff=$RB_OLD_DIFF ($RB_REPO)")" \
+  || bad "fixture: the SUPERSEDED marker could not be BUILT — 11.14o would otherwise prove nothing about supersession"
+RB_M_LAST="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean-micro @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: the LAST marker could not be BUILT — an empty last marker would make recovery refuse for the WRONG reason"
+STUB_BODY="$RB_M_FIRST
+$RB_M_LAST"
 export STUB_BODY
 run_recover 424926 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14o two markers for one PR: recovery succeeds (exit 0)"
