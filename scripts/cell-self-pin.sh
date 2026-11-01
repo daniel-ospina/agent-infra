@@ -26,9 +26,12 @@
 # and it REFUSES LOUDLY (exit 2, a named reason) when the record cannot answer.
 #
 # ── WHAT `--install` RESOLVES, AND WHERE EACH VALUE COMES FROM ─────────────────────────────────
-#   base       ${CELL_HOME:-$HOME}                — the SAME expression cloud-cell-supervisor.sh:134 and
-#                                                   cloud-cell-bringup.sh:71 default to. One base, so
-#                                                   the pin actor and the controller cannot disagree.
+#   base       ${CELL_HOME:-$HOME}                — the expression this file, the unit's rendered
+#                                                   `Environment=CELL_HOME=` and every sibling installer
+#                                                   agree on. ⛔ Note the SUPERVISOR's own fallback is
+#                                                   `/tmp/cell-home` (cloud-cell-supervisor.sh:134), NOT
+#                                                   `$HOME`; that is why the unit renders CELL_HOME
+#                                                   EXPLICITLY rather than trusting the manager's HOME.
 #   record     ${HARNESS_PIN_FILE}                — default $CELL_HOME/.harness-path: the file
 #              (= $CELL_HOME/.harness-path)          cloud-cell-supervisor.sh's `start` READS to choose
 #                                                   the tree it execs (`cmd_start` → `$HARNESS`).
@@ -196,12 +199,21 @@ do_pass() {
     fi
     exit 1
   fi
-  # ⛔ THE PASS IS NOT GREEN UNTIL THE RECORD MOVED. A verb that exited 0 and moved nothing is the exact
-  # shape #3194 is about (a green record over a stale layer), so it is verified, not assumed: re-read the
-  # record the controller will act on and require it to name the ref tip.
+  # ⛔ THE PASS IS NOT GREEN UNTIL THE RECORD MOVED **AND** CONTAINS THE TIP. Equality with a `target` read
+  # BEFORE the apply is too strict: `apply` re-fetches, so it can legitimately pin a commit that landed in
+  # between — and a periodic false RED on `systemctl --failed` trains operators to ignore the colour this
+  # whole change depends on. An UNMOVED record stays RED (that is #3194's own shape).
   now="$(pinned_head)"
-  if [ "$now" != "$target" ]; then
-    err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} names '${now:-<unreadable>}', not '${target}' -- an exit code is not a convergence"
+  if [ -z "$now" ]; then
+    err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} names nothing readable -- an exit code is not a convergence"
+    exit 1
+  fi
+  if [ "$now" = "$applied" ] && [ "$now" != "$target" ]; then
+    err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} still names '${now}' while ${HARNESS_REF} is '${target}' -- an exit code is not a convergence"
+    exit 1
+  fi
+  if ! git -C "$repo" merge-base --is-ancestor "$target" "$now" 2>/dev/null; then
+    err "STALE-RECORD: the record names '${now}', which does not contain the ref tip '${target}' -- a pin that is not on the ref's line is not a pin"
     exit 1
   fi
   log "applied -> ${now} (record verified; ctrl=$(systemctl is-active eldato-orchestrator 2>/dev/null); note: a RUNNING controller keeps the layer it started on until it is restarted)"
@@ -232,26 +244,25 @@ bad() { printf 'REFUSING: %s\n' "$*" >&2; }
 
 # pin_script_for_unit — the absolute path the unit's ExecStart names.
 # pin_script_for_unit [place] — the absolute path the unit's ExecStart names.
-# ⛔ IT MUST LIVE UNDER $CELL_HOME, AND `place` IS HOW THAT IS GUARANTEED. Naming the running copy is a
-# path outliving nothing: measured in review, rendering from a lane worktree produced
-# `ExecStart=/bin/bash /home/cmux/agent-infra/.worktrees/ai-3194/scripts/cell-self-pin.sh`, and the lane
-# worktree is PRUNED when the lane merges — after which the unit is 203/EXEC on every tick. That is the
-# identical failure class to the `WorkingDirectory=` this change removes, so `--install` COPIES the pass
-# into `$CELL_HOME/.pi/agent/scripts/` (the directory the controller's own unit names its supervisor in)
-# and the rendered unit names THAT.
-pin_script_for_unit() { # [place]
+# ⛔ IT MUST LIVE UNDER $CELL_HOME, AND IT IS ALWAYS (RE)PLACED THERE. Two bugs live in the first version
+# of this function, both measured in review:
+#   (a) Naming the running copy is a path outliving nothing — rendering from a lane worktree produced
+#       `ExecStart=/bin/bash /home/…/.worktrees/ai-3194/scripts/cell-self-pin.sh`, and the worktree is
+#       PRUNED when the lane merges, leaving 203/EXEC every tick.
+#   (b) An `[ -f "$dest" ] && return` early-exit means a FIXED pass never reaches the box — install once,
+#       then re-install from a newer checkout, and the unit keeps the old bytes. That is verbatim #3194
+#       ("deployed code that was never deployed") reproduced inside its own fix, silently.
+# So the copy is UNCONDITIONAL, which also makes the install idempotent in the useful direction.
+pin_script_for_unit() {
   local dest="$CELL_HOME/.pi/agent/scripts/cell-self-pin.sh" src
-  if [ -f "$dest" ]; then printf '%s\n' "$dest"; return 0; fi
   src="${SELF_DIR:-}/$(basename "${BASH_SOURCE[0]}")"
-  if [ ! -f "$src" ]; then
-    if [ -f "${SELF_DIR:-}/cell-self-pin.sh" ]; then src="${SELF_DIR}/cell-self-pin.sh"; else return 1; fi
+  if [ ! -f "$src" ] && [ -f "${SELF_DIR:-}/cell-self-pin.sh" ]; then src="${SELF_DIR}/cell-self-pin.sh"; fi
+  [ -f "$src" ] || { err "cannot find the pass to install beside itself (looked in ${SELF_DIR:-<unknown>})"; return 1; }
+  if [ "$src" != "$dest" ]; then
+    mkdir -p "$(dirname "$dest")" || { err "cannot create $(dirname "$dest")"; return 1; }
+    install -m 0755 "$src" "$dest" || { err "cannot place the pass at $dest"; return 1; }
   fi
-  if [ "${1:-}" = place ]; then
-    mkdir -p "$(dirname "$dest")" || return 1
-    install -m 0755 "$src" "$dest" || return 1
-    printf '%s\n' "$dest"; return 0
-  fi
-  printf '%s\n' "$src"
+  printf '%s\n' "$dest"
 }
 
 print_unit() { # [dest-dir] — render both units into a directory, or stdout when no dir is given
@@ -263,11 +274,12 @@ print_unit() { # [dest-dir] — render both units into a directory, or stdout wh
   done
   [ -n "${TEMPLATES_DIR:-}" ] && [ -f "$TEMPLATES_DIR/cell-self-pin.service" ] \
     || { bad "cannot find cell-self-pin.service in any template dir (tried TEMPLATES_DIR, ${SELF_DIR%/scripts}/templates/systemd, $CELL_HOME/.pi/agent/templates/systemd)"; return 1; }
-  script="$(pin_script_for_unit ${dest:+place})" || { bad "cannot locate an installed cell-self-pin.sh to exec"; return 1; }
+  script="$(pin_script_for_unit)" || { bad "cannot locate an installed cell-self-pin.sh to exec"; return 1; }
   user="$(id -un)"; home="$HOME"
   for tpl in cell-self-pin.service cell-self-pin.timer; do
     if [ -n "$dest" ]; then
       sed -e "s|{{USER}}|$(sed_esc "$user")|g" -e "s|{{HOME}}|$(sed_esc "$home")|g" \
+          -e "s|{{CELL_HOME}}|$(sed_esc "$CELL_HOME")|g" \
           -e "s|{{PIN_SCRIPT}}|$(sed_esc "$script")|g" -e "s|{{INTERVAL_MIN}}|$INTERVAL_MIN|g" \
           "$TEMPLATES_DIR/$tpl" >"$dest/$tpl" || return 1
       if grep -q '{{' "$dest/$tpl"; then
@@ -275,6 +287,7 @@ print_unit() { # [dest-dir] — render both units into a directory, or stdout wh
       fi
     else
       sed -e "s|{{USER}}|$(sed_esc "$user")|g" -e "s|{{HOME}}|$(sed_esc "$home")|g" \
+          -e "s|{{CELL_HOME}}|$(sed_esc "$CELL_HOME")|g" \
           -e "s|{{PIN_SCRIPT}}|$(sed_esc "$script")|g" -e "s|{{INTERVAL_MIN}}|$INTERVAL_MIN|g" \
           "$TEMPLATES_DIR/$tpl"
     fi
@@ -300,7 +313,15 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   fi
   # ⛔ AND THE EXECSTART MUST LIVE UNDER $CELL_HOME. Any other absolute path can be pruned out from under
   # the unit (a lane worktree, a bootstrap clone); $CELL_HOME is the one root a running cell keeps.
-  exec_path="$(printf '%s\n' "$body" | sed -n 's|^ExecStart=/bin/bash \(.*\)$|\1|p' | head -1)"
+  # ⛔ EVERY ExecStart, AND EXACTLY ONE. `Type=oneshot` permits REPEATED `ExecStart=` and systemd runs all
+  # of them, so checking only the first line let an injected second one install green — a fail-open in
+  # the one rule this change exists to enforce (measured in review: legit line first, appended
+  # `ExecStart=/bin/bash /srv/nowhere/…` → `--install` returned 0 and both lines landed).
+  local n_exec; n_exec="$(printf '%s\n' "$body" | grep -c '^ExecStart=')"
+  if [ "$n_exec" -ne 1 ]; then
+    bad "the rendered unit declares ${n_exec} ExecStart= lines — exactly one is installable (systemd runs them ALL, so a second one is an unverified executable directive)"; return 1
+  fi
+  exec_path="$(printf '%s\n' "$body" | sed -n 's|^ExecStart=/bin/bash \(.*\)$|\1|p')"
   if [ -z "$exec_path" ]; then
     bad "the rendered unit's ExecStart is not '/bin/bash <absolute script>'"; return 1
   fi
@@ -310,6 +331,13 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   esac
   if [ ! -f "$exec_path" ]; then
     bad "ExecStart names '${exec_path}', which does not exist — the unit would fail 203/EXEC before any payload runs"; return 1
+  fi
+  # ⛔ AND THE UNIT MUST CARRY THE SAME BASE THE EXECSTART USES. The service manager's HOME is not the cell
+  # home, so a unit that carried only `HOME=` left the pass defaulting CELL_HOME from an unrelated value
+  # while its ExecStart sat under the real one — measured: the pass then read `$HOME/.harness-path` while
+  # the controller read `$CELL_HOME/.harness-path`, i.e. it pinned a tree the controller never runs.
+  if ! printf '%s\n' "$body" | grep -qxF "Environment=CELL_HOME=${CELL_HOME}"; then
+    bad "the rendered unit does not carry 'Environment=CELL_HOME=${CELL_HOME}' — without it the pass derives its base from the service manager's HOME and can read a DIFFERENT pin record than the controller"; return 1
   fi
   # ⛔ AND IT MUST NOT DECLARE A WORKING DIRECTORY AT ALL. Any absolute path here is a bootstrap-time
   # value outliving its directory; the pass `cd`s itself after resolving the layer.
@@ -359,6 +387,6 @@ case "${1:---pass}" in
   --status)       do_status ;;
   --print-unit)   print_unit ;;
   --install)      do_install ;;
-  --help|-h)      sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  --help|-h)      sed -n '2,68p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
   *)              err "unknown argument '$1' (try --help)"; exit 64 ;;
 esac

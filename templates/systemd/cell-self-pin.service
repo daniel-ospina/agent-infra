@@ -35,8 +35,8 @@
 #             `cloud-cell-supervisor.sh`'s `start` READS to decide which tree to exec. Reading the same
 #             file is what makes "the tree that gets pinned" and "the tree that gets executed" one fact
 #             instead of two that happen to look alike.
-#   ref       `$HARNESS_REF` (default `origin/main`), resolved in `$HARNESS_REPO`, itself derived from
-#             the pin record's own git — never a bootstrap clone.
+#   ref       `$HARNESS_REF` (default `origin/main`), resolved in the RESOLVED LAYER's own git — so the
+#             pin, the verb that performs it and the ref they act on all come from one tree.
 # ⛔ AND IT IS NOT A HARD-CODED PATH IN A DROP-IN. A drop-in `WorkingDirectory=` is rendered once, at
 # provisioning time, and then silently outlives the directory it names; deriving the value on every
 # tick is the only form that cannot go stale.
@@ -57,6 +57,13 @@ Wants=network-online.target
 Type=oneshot
 User={{USER}}
 Environment=HOME={{HOME}}
+# ⛔ THE BASE IS CARRIED EXPLICITLY, AND IT IS THE SAME VALUE THE ExecStart PATH IS BUILT FROM. The
+# service manager's HOME is not the cell home; a unit that carried only `HOME=` leaves the pass deriving
+# its base from an unrelated value while its own ExecStart sits under the real one — measured: the pass
+# then read `$HOME/.harness-path` while the controller read `$CELL_HOME/.harness-path`, so it pinned a tree
+# the controller never runs. Its siblings (`eldato-orchestrator.service`, `eldato-pr-repair.service`) carry
+# it for the same reason.
+Environment=CELL_HOME={{CELL_HOME}}
 # ⛔ THE PASS IS PINNED BY ABSOLUTE PATH because a oneshot has no shell to resolve one; it is the SAME
 # `$CELL_HOME/.pi/agent/scripts/` base the controller's unit names its supervisor in, so the two units
 # share one resolved base rather than two spellings of it. `--install` REFUSES if it does not exist.

@@ -150,7 +150,16 @@ esac
 # ── 4. the guard itself, RULE BY RULE, on doctored artifacts ─────────────────────────────────────
 # ⛔ ONE DOCTOR PER RULE. The first version doctored `WorkingDirectory=/tmp/cell-ai`, which the
 # `/tmp/cell-ai` rule rejects FIRST — so the `WorkingDirectory=` rule was never reached and could have
-# been deleted with this leg still green (review finding). Each probe below trips exactly one rule.
+# been deleted with this leg still green.
+# ⛔ AND EVERY LEG BELOW HAD TO BE REBUILT: the first version ran `--install` with the REAL `systemctl`, so
+# `daemon-reload` was denied for a non-root user, `rc=1`, and ALL FIVE `REFUSES …` legs went green with
+# `verify_unit` deleted entirely (measured in review: neutering the guard left 28 ok / 1 failed). A refusal
+# that comes from the environment is not a refusal, and a gate with no discriminating power in exactly the
+# "false PASS" class this issue is about is worse than no gate. Hence: a fake `systemctl`, and an
+# assertion on the REASON each leg prints.
+mkdir -p "$T/fakebin"
+printf '#!/bin/bash\nexit 0\n' >"$T/fakebin/systemctl"
+chmod +x "$T/fakebin/systemctl"
 doctor() { # <name> <appended lines>  -> prints the doctored template dir
   local d="$T/doctored-$1"
   mkdir -p "$d" && cp "$TPL/cell-self-pin.timer" "$d/" && cp "$TPL/cell-self-pin.service" "$d/"
@@ -159,31 +168,36 @@ doctor() { # <name> <appended lines>  -> prints the doctored template dir
 }
 install_doctored() { # <dir> <unit-dir>
   runat "$T/home" TEMPLATES_DIR="$1" SYSTEMD_UNIT_DIR="$2" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
-    bash "$PIN" --install 2>&1
+    PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1
 }
-d1="$(doctor bootpath 'WorkingDirectory=/tmp/cell-ai')"
-out="$(install_doctored "$d1" "$T/u1")"; rc=$?
-[ "$rc" -ne 0 ] && ok "REFUSES WorkingDirectory=/tmp/cell-ai (the shipped defect)" || bad "ACCEPTED the shipped defect: $out"
-[ -f "$T/u1/cell-self-pin.service" ] && bad "a refused install still wrote the unit" || ok "a refused install wrote nothing"
-d2="$(doctor workdir 'WorkingDirectory=/srv/harness-current')"
-out="$(install_doctored "$d2" "$T/u2")"; rc=$?
-[ "$rc" -ne 0 ] && ok "REFUSES WorkingDirectory= even when the path is not the clone (rule 2 is reachable)" || bad "ACCEPTED an absolute WorkingDirectory=: $out"
-d3="$(doctor cond 'ConditionPathExists=/srv/harness-current')"
-out="$(install_doctored "$d3" "$T/u3")"; rc=$?
-[ "$rc" -ne 0 ] && ok "REFUSES ConditionPathExists= (a skipped condition is a green no-op, rule 3 is reachable)" || bad "ACCEPTED ConditionPathExists=: $out"
-# ⛔ THE EXECSTART FORM: a token after `/bin/bash `, not after `=` — the reachable bypass.
-d4="$(doctor execboot "ExecStart=/bin/bash /tmp/cell-ai/scripts/cell-self-pin.sh")"
-out="$(install_doctored "$d4" "$T/u4")"; rc=$?
-[ "$rc" -ne 0 ] && ok "REFUSES an ExecStart whose script lives in the bootstrap clone (token, not '='-prefixed)" || bad "ACCEPTED ExecStart=/bin/bash /tmp/cell-ai/…: $out"
-# ⛔ AND AN EXECSTART OUTSIDE CELL_HOME — a lane worktree, which is PRUNED when the lane merges (203/EXEC).
-d5="$(doctor execwt "ExecStart=/bin/bash $T/nowhere/cell-self-pin.sh")"
-out="$(install_doctored "$d5" "$T/u5")"; rc=$?
-[ "$rc" -ne 0 ] && ok "REFUSES an ExecStart outside CELL_HOME (a path that can be pruned out from under the unit)" || bad "ACCEPTED an ExecStart outside CELL_HOME: $out"
+# refuses <name> <doctored-dir> <unit-dir> <must-appear-in-the-reason>
+refuses() {
+  local name="$1" d="$2" u="$3" why="$4" out rc
+  out="$(install_doctored "$d" "$u")"; rc=$?
+  if [ "$rc" -eq 0 ]; then bad "ACCEPTED $name — the gate does not exist: $out"; return; fi
+  if printf '%s\n' "$out" | grep -qF -- "$why"; then ok "REFUSES $name, and says why (\"$why\")";
+  else bad "refused $name for the WRONG reason (wanted \"$why\") — an environment failure is not a refusal: $out"; fi
+  [ -f "$u/cell-self-pin.service" ] && bad "a refused install ($name) still wrote the unit" \
+    || ok "a refused install ($name) wrote nothing"
+}
+refuses 'WorkingDirectory=/tmp/cell-ai' "$(doctor bootpath 'WorkingDirectory=/tmp/cell-ai')" "$T/u1" 'provisioning clone'
+refuses 'WorkingDirectory= outside the clone' "$(doctor workdir 'WorkingDirectory=/srv/harness-current')" "$T/u2" 'WorkingDirectory='
+refuses 'ConditionPathExists=' "$(doctor cond 'ConditionPathExists=/srv/harness-current')" "$T/u3" 'ConditionPathExists='
+refuses 'an ExecStart in the bootstrap clone' "$(doctor execboot 'ExecStart=/bin/bash /tmp/cell-ai/scripts/cell-self-pin.sh')" "$T/u4" 'provisioning clone'
+# ⛔ THIS ONE MUST *REPLACE* THE ExecStart, NOT APPEND ONE. Appending makes it a two-`ExecStart=` unit, and
+# the count rule then fires first — the leg would be green while testing a different rule (measured: the
+# first version of this leg refused for the wrong reason).
+d_execwt="$T/doctored-execwt"
+mkdir -p "$d_execwt" && cp "$TPL/cell-self-pin.timer" "$d_execwt/"
+sed "s|^ExecStart=/bin/bash .*$|ExecStart=/bin/bash $T/nowhere/cell-self-pin.sh|" \
+  "$TPL/cell-self-pin.service" >"$d_execwt/cell-self-pin.service"
+refuses 'an ExecStart outside CELL_HOME' "$d_execwt" "$T/u5" 'NOT under CELL_HOME'
+# ⛔ A SECOND ExecStart= — `Type=oneshot` permits repeats and systemd runs ALL of them, so a gate that
+# inspects only the first line installs an executable directive it never saw (measured: rc=0, both lines
+# written). This doctor keeps the LEGITIMATE line first, so only the count rule can catch it.
+refuses 'a SECOND ExecStart=' "$(doctor exec2 "ExecStart=/bin/bash $T/nowhere/cell-self-pin.sh")" "$T/u6" 'ExecStart= lines'
 
 # ── 5. the shipped template installs, and the written unit carries no bootstrap path ──────────────
-mkdir -p "$T/fakebin"
-printf '#!/bin/bash\nexit 0\n' >"$T/fakebin/systemctl"
-chmod +x "$T/fakebin/systemctl"
 runat "$T/home" TEMPLATES_DIR="$TPL" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 SYSTEMD_UNIT_DIR="$T/units2" \
   PATH="$T/fakebin:$PATH" bash "$PIN" --install >"$T/install.log" 2>&1
 if [ -f "$T/units2/cell-self-pin.service" ]; then
@@ -201,6 +215,26 @@ if [ -f "$T/units2/cell-self-pin.service" ]; then
   [ -f "$T/home/.pi/agent/scripts/cell-self-pin.sh" ] \
     && ok "the pass is materialised at the path the unit names" || bad "the unit names a pass that was never placed"
   [ -f "$T/units2/cell-self-pin.timer" ] && ok "the timer installs beside the service" || bad "the timer was not installed"
+  # ⛔ AND A FIXED PASS REACHES THE BOX. `pin_script_for_unit` once returned early when the copy merely
+  # existed, so install-once-then-reinstall-from-a-newer-checkout kept the OLD bytes — verbatim #3194
+  # reproduced inside its own fix.
+  printf '\n# freshness probe\n' >>"$T/home/.pi/agent/scripts/cell-self-pin.sh"
+  runat "$T/home" TEMPLATES_DIR="$TPL" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 SYSTEMD_UNIT_DIR="$T/units2" \
+    PATH="$T/fakebin:$PATH" bash "$PIN" --install >/dev/null 2>&1
+  cmp -s "$PIN" "$T/home/.pi/agent/scripts/cell-self-pin.sh" \
+    && ok "a re-install REFRESHES the placed copy (a fixed pass reaches the box)" \
+    || bad "a re-install kept the stale placed copy — deployed code that was never deployed"
+  # ⛔ THE BASE THE UNIT CARRIES IS THE BASE THE PASS USES. The service manager's HOME is not the cell home,
+  # so a unit carrying only HOME= left the pass reading a DIFFERENT pin record than the controller.
+  printf '%s\n' "$T/home/.harness-path" >"$T/home/.harness-path"
+  printf '%s\n' "$T/home/harness/pintree" >"$T/home/.harness-path"
+  mkdir -p "$T/otherhome"
+  printf '%s\n' "$T/seed" >"$T/otherhome/.harness-path"
+  out="$(runat "$T/home" HOME="$T/otherhome" bash "$PIN" --dry-run 2>&1)"
+  case "$out" in
+    *"layer=$T/home/harness/pintree"*) ok "with HOME != CELL_HOME the pass reads the CELL_HOME record (no #2215 skew)" ;;
+    *) bad "with HOME != CELL_HOME the pass read the wrong record: $out" ;;
+  esac
 else bad "the shipped template did not install: $(cat "$T/install.log")"; fi
 
 # ── 6. a FALSE PASS is impossible: apply exiting 0 without moving the record is RED ───────────────
