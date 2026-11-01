@@ -623,6 +623,28 @@ shard_watchdog() {
   kill -KILL -"$shard_bg_pid" 2>/dev/null || kill -KILL "$shard_bg_pid" 2>/dev/null
 }
 
+# shard_kill_group <pgid> — TERM then KILL one shard's PROCESS GROUP, and NEVER a bare pid.
+# ⛔ THE BARE-PID FALLBACK IS GONE ON PURPOSE (review cycle 3, P2, measured). By the time the timeout
+# branch escalates, `wait` has already reaped the leader, so its pid is FREE — and a bare `kill -KILL
+# <pid>` aimed at a freed pid takes an uncatchable SIGKILL to whatever the kernel has since handed that
+# number to (another lane, the runner agent itself). The fallback existed for "a shell whose job
+# control gave the shard no group of its own"; there the GROUP form fails and the pid form is the only
+# thing left, so it is kept ONLY when that pid is still alive (`kill -0`, which fails for a reaped pid
+# and succeeds for a zombie — where a KILL is a harmless no-op).
+# A group that no longer exists fails the TERM and nothing else happens: one syscall in the common case.
+shard_kill_group() {
+  [ -n "${1:-}" ] || return 0
+  if kill -TERM -"$1" 2>/dev/null; then
+    # The leader is gone (the shard finished or was killed), so every remaining member is a leftover:
+    # give it the same one-second grace the bound gives a suite, then make it certain.
+    sleep 1
+    kill -KILL -"$1" 2>/dev/null
+    return 0
+  fi
+  kill -0 "$1" 2>/dev/null && kill -KILL "$1" 2>/dev/null
+  return 0
+}
+
 # shard_run_bounded <path> — run ONE shard under `SHARD_BOUND`, portable and bash-3.2 clean.
 #
 # ⛔ WHY NOT `timeout`: it is GNU and absent on macOS (`gtimeout` needs coreutils, and is absent too
@@ -698,13 +720,24 @@ shard_run_bounded() {
     # outlived the TERM. The watchdog keeps its own KILL for the other ordering — a WRAPPER that
     # traps TERM, where `wait` has not returned yet (pinned by the suite's arm 2b; this branch is
     # pinned by arm 2c).
-    sleep 1
-    if [ -n "$shard_bg_group" ]; then
-      kill -KILL -"$shard_bg_group" 2>/dev/null || kill -KILL "$shard_bg_group" 2>/dev/null
-    fi
+    # TERM is already in flight from the watchdog; `shard_kill_group` re-sends it (a no-op for those
+    # who got it), gives the group its one-second grace and KILLs whatever is left. It also never aims
+    # a bare pid at a reaped leader.
+    shard_kill_group "$shard_bg_group"
     [ "$shard_is_listed" = 1 ] && shard_timed_out "$1" "$shard_bound"
     return 124
   fi
+  # ⛔ THE GROUP OF A SHARD THAT FINISHED IS TORN DOWN TOO (review cycle 3, P1, measured). `set -m`
+  # puts the shard in its OWN group, so a child it backgrounded and never waited for is no longer in
+  # the driver's group: nothing ever reached it (not the driver, not a cancelled step's group kill —
+  # the regression the HUP/INT/TERM traps exist to close), it outlives the driver with the shard's
+  # stdout still open (a caller reading through a pipe/FIFO never gets EOF — arm 7's exact hazard,
+  # through the shard instead of the timer), and the run reports the shard PASSED. Measured: with a
+  # shard ending in `leftover.sh &; exit 0`, rc 0 was printed while the leftover lived on (ppid 1,
+  # the shard's pgid) and the FIFO reader got no EOF until the LEFTOVER exited. A group that no longer
+  # exists fails the kill silently (ESRCH), so this costs one syscall in the ordinary case — and it
+  # takes the sweep of TERM→KILL only when something IS left, which is exactly the leak.
+  shard_kill_group "$shard_bg_group"
   return $shard_bg_rc
 }
 

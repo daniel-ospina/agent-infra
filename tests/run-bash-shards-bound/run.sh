@@ -136,6 +136,20 @@ if grep -qE '^❌ failing shard\(s\): .*tests/mmm-hang/run\.sh$' <<<"$OUT"; then
 else
   fail "the hung shard is absent from '❌ failing shard(s): …': $(grep -E 'failing shard' <<<"$OUT" | tr '\n' '|')"
 fi
+# ⛔ THE POINT-OF-FAILURE LINE **AND** THE RECAP'S BOUND LINE, each pinned by its own exact shape (review
+# cycle 3, P2 — a mutation that stripped the bound from BOTH recaps left the suite green, so "the bound
+# is reported in every recap" was an unproven claim; and the early-exit paths have no recap at all, so
+# the per-failure line is the only place that case is ever explained).
+if grep -qE '^⏱ SHARD TIMEOUT after 2s: tests/mmm-hang/run\.sh$' <<<"$OUT"; then
+  pass "the point-of-failure line names the casualty even if the run never reaches a recap"
+else
+  fail "no '⏱ SHARD TIMEOUT after 2s: <path>' line at the point of failure"
+fi
+if grep -qE '^   ⏱  per-shard bound applied: 2s per shard' <<<"$OUT"; then
+  pass "the FAILING recap reports the bound that applied"
+else
+  fail "the failing recap does not report the bound ($(grep -c 'per-shard bound applied' <<<"$OUT") occurrence(s))"
+fi
 if grep -q 'BEFORE-RAN' <<<"$OUT"; then
   pass "the shard BEFORE the hang ran"
 else
@@ -195,12 +209,19 @@ fi
 # passing because nothing ever spawned one.
 MUTFIX="$TMP/mutf"
 stage_fixture "$MUTFIX" 30
-# ⛔ BOTH group-kill forms are stripped: the WATCHDOG's (`-"$shard_bg_pid"`) and the parent's
-# escalation (`-"$shard_bg_group"`). Mutating only the first would leave the fixture "fixed" by the
-# second and the control would prove nothing (measured: that is exactly what happened when the
-# parent-side escalation was added).
-sed -e 's/-"\$shard_bg_pid"/"$shard_bg_pid"/g' -e 's/-"\$shard_bg_group"/"$shard_bg_group"/g' \
-  "$MUTFIX/scripts/runner.sh" >"$TMP/runner-wrapper-only.sh"
+# ⛔ EVERY group-kill form is neutralised, or the fixture is "fixed" by whichever one is left and the
+# control proves nothing (measured twice: first when the parent-side escalation was added, then when it
+# moved into `shard_kill_group`): the WATCHDOG's (`-"$shard_bg_pid"`), and the shared helper itself
+# (gutted wholesale, body and all). What remains is a wrapper-only kill — the implementation #3187
+# exists to replace.
+awk '
+  /^  kill -TERM -"\$shard_bg_pid"/ { print "  kill -TERM \"$shard_bg_pid\" 2>/dev/null"; next }
+  /^  kill -KILL -"\$shard_bg_pid"/ { print "  kill -KILL \"$shard_bg_pid\" 2>/dev/null"; next }
+  /^shard_kill_group\(\) \{$/ { print "shard_kill_group() { :; }"; skip = 1; next }
+  skip && /^}$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$MUTFIX/scripts/runner.sh" >"$TMP/runner-wrapper-only.sh"
 if cmp -s "$MUTFIX/scripts/runner.sh" "$TMP/runner-wrapper-only.sh"; then
   fail "the wrapper-only mutation did not change the runner — the orphan assertion has no control"
 else
@@ -321,6 +342,13 @@ if [ "$RC" -eq 0 ] && grep -q 'per-shard bound: 1800s per shard' <<<"$DOUT"; the
   pass "with SHARD_BOUND unset the run uses and reports the 1800s default (rc 0 on instant shards)"
 else
   fail "the default bound is not 1800s (rc $RC): $(grep -i 'bound' <<<"$DOUT" | tr '\n' '|')"
+fi
+# …and the SUCCESS recap carries it too, in the RECAP's own shape (not the header's): a truncated run
+# must be self-describing whichever recap it reaches (review cycle 3, P2).
+if grep -qE 'shard work; slowest [0-9]+s.*; per-shard bound 1800s per shard' <<<"$DOUT"; then
+  pass "the SUCCESS recap reports the bound that applied as well"
+else
+  fail "the success recap omits the bound: $(grep -i 'shard work' <<<"$DOUT" | tr '\n' '|')"
 fi
 
 echo ""
@@ -586,6 +614,71 @@ else
   fi
 fi
 
+
+echo "8. A SHARD THAT EXITS LEAVING A CHILD BEHIND: the child must NOT survive, and must NOT hold the pipe"
+# ⛔ `set -m` puts the shard in its OWN group, so a child it backgrounded and never waited for is no
+# longer in the driver's group (review cycle 3, P1, measured): nothing reached it — not the driver, not
+# a cancelled step's group kill — it outlived the driver with the shard's stdout still open (a caller
+# reading through a pipe/FIFO never got EOF: measured, the reader got no EOF until the LEFTOVER exited),
+# and the run reported the shard PASSED. The driver now tears down the group of a FINISHED shard too.
+LEAKFIX="$TMP/leakfix"
+stage_fixture "$LEAKFIX" 0
+mkdir -p "$TMP/pids-leak"
+{
+  printf '#!/bin/bash\n'
+  printf 'sleep 45 &\n'
+  printf 'printf "%%s\\n" "$!" > "%s"\n' "$TMP/pids-leak/child.pid"
+  printf 'printf "LEAVING-A-CHILD\\n"\n'
+  printf 'exit 0\n'
+} >"$LEAKFIX/tests/mmm-hang/run.sh"
+SHARD_BOUND=60 bash "$LEAKFIX/scripts/runner.sh" >"$TMP/leakfix.out" 2>&1
+LEAK_RC=$?
+LEAK_PID="$(cat "$TMP/pids-leak/child.pid" 2>/dev/null)"
+LEAK_ALIVE=0
+if [ -n "$LEAK_PID" ]; then
+  _n=0
+  while kill -0 "$LEAK_PID" 2>/dev/null && [ "$_n" -lt 6 ]; do sleep 0.5; _n=$((_n + 1)); done
+  kill -0 "$LEAK_PID" 2>/dev/null && LEAK_ALIVE=1
+fi
+if [ -z "$LEAK_PID" ]; then
+  fail "the leftover-child fixture recorded no pid — this arm proves nothing"
+elif [ "$LEAK_ALIVE" -ne 0 ]; then
+  fail "a child left behind by a FINISHED shard survived the driver (pid $LEAK_PID) — it is in the shard's own group now, so nothing else will reach it"
+  kill -KILL "$LEAK_PID" 2>/dev/null
+elif [ "$LEAK_RC" -ne 0 ]; then
+  fail "the leftover-child run itself failed (rc $LEAK_RC, want 0 — the shard exits successfully)"
+else
+  pass "a child left behind by a finished shard is torn down with its group (run still rc 0)"
+fi
+# CONTROL: with the shared group-kill helper gutted, that same child MUST survive — otherwise this arm
+# is proving only that the fixture never started a child.
+MUTLEAK="$TMP/leakfix-mutant"
+stage_fixture "$MUTLEAK" 0
+{
+  printf '#!/bin/bash\n'
+  printf 'sleep 45 &\n'
+  printf 'printf "%%s\\n" "$!" > "%s"\n' "$TMP/pids-leak/child2.pid"
+  printf 'exit 0\n'
+} >"$MUTLEAK/tests/mmm-hang/run.sh"
+awk '
+  /^shard_kill_group\(\) \{$/ { print "shard_kill_group() { :; }"; skip = 1; next }
+  skip && /^}$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$MUTLEAK/scripts/runner.sh" >"$TMP/runner-nokill.sh"
+if cmp -s "$MUTLEAK/scripts/runner.sh" "$TMP/runner-nokill.sh"; then
+  fail "the no-kill mutation did not change the runner — the leftover-child arm has no control"
+else
+  cp "$TMP/runner-nokill.sh" "$MUTLEAK/scripts/runner.sh"
+  SHARD_BOUND=60 bash "$MUTLEAK/scripts/runner.sh" >"$TMP/leakfix-mutant.out" 2>&1
+  MUT_PID="$(cat "$TMP/pids-leak/child2.pid" 2>/dev/null)"
+  if [ -n "$MUT_PID" ] && kill -0 "$MUT_PID" 2>/dev/null; then
+    pass "control: with the group teardown gutted the leftover child DOES survive (pid $MUT_PID) — the arm can see a leak"
+  else
+    fail "control: a gutted group teardown left no surviving child, so the assertion above cannot distinguish the fixed code"
+  fi
+  [ -n "$MUT_PID" ] && kill -KILL "$MUT_PID" 2>/dev/null
+fi
 
 echo ""
 if [ "$failures" -eq 0 ]; then
