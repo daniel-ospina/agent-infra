@@ -357,11 +357,54 @@ python_target() { # python_target <path>
 # silently turn the gate into "0 + 0 + 0" (admit always) — the inert-gate class the floor guards at
 # source time. An explicit `0` IS honoured: the test seam neutralises all three in one place, and an
 # operator zeroing the reserve is making a stated choice.
+# ── THE SHARING READING THE `self` TERM RESTS ON (agent-infra#2159) ─────────────────────────────
+# `self` is the FULL-materialise worst case. It is the RIGHT default and it stays the default: every
+# unreadable, missing, stale or malformed state keeps it (see `uv_env_sharing_token`, which is
+# fail-closed by construction). What it must NOT be is UNCONDITIONAL, because it is ~19x the measured
+# marginal cost of the same lane on a box whose worktree venvs hardlink into a warm uv cache — and a
+# box can prove that (`nlink>1` on 28,730 site-packages files, measured). On such a box 6144+2048
+# demands 8GiB free per python lane; the measured marginal is 316MB. That gap is the whole of
+# "how many lanes fit on 121GB", and it is a DELIVERY question (is the pin live?) that the gate was
+# answering with a constant instead of a reading.
+# ⛔ ONLY `SHARED` LICENSES `tree`. Anything else — including a box that has never run a bring-up — is
+# `self`. So this change can only ever ADMIT a lane it admitted before, and only on positive evidence;
+# the pessimistic arm is bit-identical to the shipped behaviour.
+SPAWN_GATE_UV_ENV_SH=""
+spawn_gate_uv_env_path() {
+  [ -n "$SPAWN_GATE_UV_ENV_SH" ] && { printf '%s\n' "$SPAWN_GATE_UV_ENV_SH"; return 0; }
+  local c
+  for c in "$here/uv-env.sh" "${O:-}/uv-env.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/uv-env.sh" \
+           "${HOME:-}/.pi/agent/scripts/orchestrator-harness/uv-env.sh" \
+           "${HOME:-}/.pi/agent/scripts/uv-env.sh"; do
+    [ -n "$c" ] && [ -r "$c" ] && { SPAWN_GATE_UV_ENV_SH="$c"; printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# disk_lane_sharing <path> -> "SHARED" | "FULL". A harness target never consults it (it installs
+# nothing, so `self` is 64MB and the question does not arise).
+disk_lane_sharing() { # disk_lane_sharing <path>
+  local py=0 f
+  python_target "${1:-.}" && py=1
+  [ "$py" = 1 ] || { printf 'FULL\n'; return 0; }
+  f="$(spawn_gate_uv_env_path)" || { printf 'FULL\n'; return 0; }
+  # Subshell: sourcing a helper must not leak its functions/vars into this gate's namespace.
+  ( . "$f" >/dev/null 2>&1 && uv_env_sharing_token "${O:-}" ) 2>/dev/null || printf 'FULL\n'
+}
+
 disk_lane_costs() { # disk_lane_costs <path>
   local p="${1:-.}" tree self reserve py=0
   python_target "$p" && py=1
   if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$py" = 1 ]; then tree=350; else tree=64; fi
-  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; elif [ "$py" = 1 ]; then self=6144; else self=64; fi
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"
+  elif [ "$py" = 1 ]; then
+    self=6144
+    # (agent-infra#2159) An operator override always wins (above). Absent one, the worst case applies
+    # UNLESS the box has positive evidence its venvs share the cache — then the marginal cost IS the
+    # lane's cost and `tree` is the honest bound.
+    [ "$(disk_lane_sharing "$p")" = "SHARED" ] && self="$tree"
+  else self=64; fi
   # 4x the DISPATCH floor — the same number the warn band defaults to, derived INDEPENDENTLY: the
   # reserve is enforcement, the band is reporting, and an operator lowering the band to quiet logs must
   # not be lowering admission with it (review round 3, P2).
