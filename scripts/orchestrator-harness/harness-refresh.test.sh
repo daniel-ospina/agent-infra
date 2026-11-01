@@ -797,20 +797,67 @@ case "$_row43" in *harness=*) bad "a current box's row carries a token anyway: '
                    *) ok "…and a current box's row stays clean" ;; esac
 
 _CASE=$((_CASE+1)); echo "=== C2: the issue-lane spawn line carries it too (dispatch-merge.sh, driven with stubs) ==="
-D="$T/c2"; mkdir -p "$D/bin" "$D/O" "$D/repo/.git" "$D/repo/.worktrees/tm-7" "$D/repo/.worktrees/tm-8" "$D/repo/.worktrees/tm-9"
-# ⛔ THE STUB MUST ANSWER THE REPO-IDENTITY READS (#2762 review, 4th cycle, P1). `dispatch-merge.sh`
-# now asserts the checkout's origin before ANY lane work, so a stub that answers nothing makes the
-# batch refuse 72 and every spawn/chain assertion below goes empty — a registered shard red for a
-# reason it does not test. The origin read is the module's `config --local --get remote.origin.url`;
-# `--git-common-dir` answers "./.git" and `$D/repo/.git` exists, so the post-build dir half matches.
+D="$T/c2"; mkdir -p "$D/bin" "$D/O" "$D/repo/.git" "$D/repo/.worktrees"
+# ⛔ THE STUB MUST DO **BOTH** JOBS: MATERIALISE A USABLE WORKTREE *AND* ANSWER THE REPO-IDENTITY
+# READS. Two separate reds, both measured, met in the same stub:
+#
+#  (a) #2033 — it used to be a blind `exit 0`, which was indistinguishable from production only while
+#      nothing verified the add. `dispatch-merge.sh` now provisions through `wt_provision`, whose step 4
+#      asks the checkout itself (`symbolic-ref --short HEAD` == the branch, `rev-parse --verify HEAD`
+#      resolves) — so a blind stub reported "add succeeded" over a checkout that DOES NOT EXIST, the
+#      rollback ran, and every issue was skipped. All three C2 assertions then failed on an empty
+#      `grep 'lane-7'`, for a reason they do not test.
+#  (b) #2762 review (4th cycle, P1) — `dispatch-merge.sh` also asserts the checkout's ORIGIN before ANY
+#      lane work (`config --local --get remote.origin.url` + `rev-parse --git-common-dir`), so a stub
+#      that answers nothing makes the batch refuse 72 and every spawn/chain assertion below goes empty.
+#
+# So the stub emulates the PRODUCTION PRECONDITION — an add that creates the ref and materialises the
+# directory, and a checkout that can name its own repo — which is what makes both post-checks pass
+# FOR THE RIGHT REASON, instead of turning either verification off (a verification an env var can open
+# is not a verification; same rule as the CIQ_GH seam below).
 cat > "$D/bin/git" <<GITS
 #!/bin/bash
+# A git that behaves like a REAL successful \`worktree add\`: the directory exists afterwards, the
+# record is LISTED by \`worktree list\`, the checkout answers the branch/HEAD queries \`wt_provision\`
+# verifies — including on a SECOND dispatch of the same issue, where a real git reports the existing
+# worktree and the lifecycle REUSES it — and it can name its own repository, which is what
+# \`repo_target_assert\` reads. Everything else exits 0 quietly (this rig drives the DISCLOSURE on the
+# spawn line, not git).
+d="\$PWD"
+if [ "\${1:-}" = "-C" ]; then d="\${2:-}"; shift 2 || true; fi
+# ── THE REPO-IDENTITY READS (#2762/#2694) ──────────────────────────────────────────────────────
 case "\$*" in
-  *"config --local --get remote.origin.url"*) echo "https://github.com/owner/repo.git" ;;
+  *"config --local --get remote.origin.url"*) echo "https://github.com/owner/repo.git"; exit 0 ;;
   # ABSOLUTE, so the post-build dir half compares equal for the worktree and its checkout.
-  *"rev-parse --git-dir"*|*"rev-parse --git-common-dir"*) echo "$D/repo/.git" ;;
+  *"rev-parse --git-common-dir"*|*"rev-parse --git-dir"*|*"rev-parse --absolute-git-dir"*) echo "$D/repo/.git"; exit 0 ;;
 esac
-exit 0
+case "\${1:-}" in
+  worktree)
+    case "\${2:-}" in
+      add)
+        shift 2
+        br=""
+        if [ "\${1:-}" = "-b" ]; then br="\${2:-}"; shift 2 || true; fi
+        p="\${1:-}"
+        if [ -n "\$p" ]; then
+          mkdir -p "\$p" && printf '%s\\n' "\$br" > "\$p/.emulated-branch"
+          printf '%s %s\\n' "\$p" "\$br" >> "\$d/.emulated-worktrees"
+        fi
+        ;;
+      list)
+        [ -f "\$d/.emulated-worktrees" ] || exit 0
+        while read -r p br; do
+          [ -n "\$p" ] || continue
+          printf 'worktree %s\\nHEAD 0000000000000000000000000000000000000000\\nbranch refs/heads/%s\\n\\n' "\$p" "\$br"
+        done < "\$d/.emulated-worktrees"
+        ;;
+    esac
+    exit 0 ;;
+  symbolic-ref)
+    [ -f "\$d/.emulated-branch" ] || exit 1
+    cat "\$d/.emulated-branch" ;;
+  *) exit 0 ;;
+esac
 GITS
 chmod +x "$D/bin/git"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/tmux";   chmod +x "$D/bin/tmux"
