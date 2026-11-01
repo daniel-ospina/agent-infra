@@ -17,11 +17,13 @@
 #     `continue`, or wrapped in `if false`) — that class is not pinned by anything here, and saying so
 #     is the point of this paragraph. What the loop DECIDES is pinned by behaviour: `rail_already_running`
 #     (three answers), `rail_says_skip` (rc -> action) and the MAX/MAX_TOTAL validation are all driven.
-#   * NOT PINNED AT ALL, declared rather than left to be discovered: the loop's HEAD-READ guard (a `gh pr
-#     view` failure must skip the candidate, not write a cooldown key with an empty head) and the startup
-#     refusal when the cooldown ledger cannot be created. Both are loop/startup lines, `TRIED` is not an
-#     env-overridable seam, and driving either means stub-driving the actuator. They are guarded in the
-#     SUT and unpinned here — verified by reading, not by this suite.
+#   * NOT PINNED AT ALL, declared rather than left to be discovered: the loop's HEAD-READ guard and the
+#     `echo … >> "$TRIED"` cooldown write (a `gh pr view` failure must skip the candidate, not write a
+#     cooldown key with an empty head), and the startup precondition refusals (cooldown ledger, rail-verdict
+#     directory). All are loop/startup lines, `TRIED`/`$RAIL_DIR` are not env-overridable seams, and driving
+#     either means stub-driving the actuator. They are guarded in the SUT and unpinned here — verified by
+#     reading, not by this suite. The two LOOP GUARD lines that CAN be pinned cheaply are pinned as text
+#     (below with `candidate_deferred`): deleting the guard, or faking its input, is what cycle 4 measured.
 #
 # The fixture is `ps -eo args=` output from this box on 2026-11-01 at ~17:11Z, captured immediately
 # BEFORE the actuator restart at 17:12:02Z cleared the population (the restart is the collateral
@@ -105,6 +107,17 @@ loop_call=$(sed -n 's/^[[:space:]]*if candidate_deferred \(.*\); then$/\1/p' "$S
 [ "$loop_call" = '"$repo" $REPOS' ] \
   || { echo "FAIL: the loop must invoke candidate_deferred as \"\$repo\" \$REPOS (got '$loop_call') — dropping \$REPOS turns every other repo's rails into UNKNOWN load and re-creates the starvation with the predicate untouched"; fail=1; }
 
+# ⛔ THE DUPLICATE-RAIL GUARD AT ITS ONLY CALL SITE — also text, also declared. Cycle 4 measured two ways
+# to undo it with the suite green: fake the guard's input (`_rail_rc=1`) and delete the skip block. The
+# functions are DRIVEN above; what is pinned here is that the loop still ASKS them and still acts on the
+# answer. Both compares are whole-line literals, so an edit inside either line reddens.
+guard_call=$(sed -n 's/^[[:space:]]*rail_already_running "\(.*\)"; _rail_rc=\$?$/\1/p' "$SUT")
+[ "$guard_call" = '$pr' ] \
+  || { echo "FAIL: the loop must ASK rail_already_running about the candidate (got 'rail_already_running \"$guard_call\"') — a guard the loop never calls cannot stop a duplicate rail"; fail=1; }
+skip_call=$(sed -n 's/^[[:space:]]*if rail_says_skip "\(.*\)"; then$/\1/p' "$SUT")
+[ "$skip_call" = '$_rail_rc' ] \
+  || { echo "FAIL: the loop must ACT on the guard's answer via rail_says_skip (got '$skip_call') — deleting this turns 'cannot tell' back into a launch"; fail=1; }
+
 # …and the bound still BITES, in both clauses.
 TABLE="$(for i in 1 2 3 4 5 6 7 8; do echo "bash /r/scripts/admin-merge.sh $i --repo daniel-ospina/tortoise"; done)"
 MAX_TOTAL=16 MAX=8
@@ -168,14 +181,48 @@ rail_says_skip 1   && { echo "FAIL: rc 1 (no rail) must PROCEED — refusing her
 # only the MAX guard can refuse it.
 _sutlog=$(mktemp); _sut0=$(mktemp)
 sed "s#/tmp/auto-rail.log#$_sutlog#g" "$SUT" > "$_sut0"
-for _env in "MAX=0|REFUSED: MAX=" "MAX=0 MAX_TOTAL=16|REFUSED: MAX=" \
-            "MAX_TOTAL=0|REFUSED: MAX_TOTAL=" "MAX=8 MAX_TOTAL=0|REFUSED: MAX_TOTAL="; do
-  _e=${_env%%|*}; _want=${_env#*|}
+# _check_refusal <env> <line prefix> <reason fragment> — three assertions, because each alone can pass for
+# the wrong reason: rc=3 is also a missing rail, the prefix does not prove the reason survived, and the
+# reason without the prefix could come from the other bound's guard.
+_check_refusal() {
+  local rc
   : > "$_sutlog"
-  env $_e bash "$_sut0" >/dev/null 2>&1; _rc=$?
-  [ "$_rc" -eq 3 ] || { echo "FAIL: $_e must be REFUSED (exit 3), got rc=$_rc — a zero bound defers every candidate for ever"; fail=1; }
-  grep -q "$_want" "$_sutlog" || { echo "FAIL: $_e must log '$_want' — a bare rc=3 is also what a missing rail produces, so the line is what proves the GUARD fired"; fail=1; }
-done
+  env $1 bash "$_sut0" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 3 ] || { echo "FAIL: $1 must be REFUSED (exit 3), got rc=$rc — a zero bound defers every candidate for ever"; fail=1; }
+  # -F, not -q: the reason fragment contains a BRACKETED expression, which BRE reads as a character class
+  # (`[ total -ge 0 ]` would match any of t,o,a,l,space,... and quietly match the wrong text).
+  grep -qF "$2" "$_sutlog" || { echo "FAIL: $1 must log '$2' — a bare rc=3 is also what a missing rail produces, so the line is what proves the GUARD fired"; fail=1; }
+  grep -qF "$3" "$_sutlog" || { echo "FAIL: $1 must log the REASON ('$3') — a message truncated by command substitution explains nothing"; fail=1; }
+}
+# `MAX=0 MAX_TOTAL=16` is the DISCRIMINATING pair: with the aggregate positive, only the MAX guard can
+# refuse it — otherwise the MAX_TOTAL zero-check masks a deleted MAX check (measured: this passed for the
+# wrong reason before the discriminating case and the reason-fragment assertion were added).
+# The REASON fragments deliberately SPAN the bracketed expression: a fragment that survives its deletion
+# ("true for every population") does not detect the command-substitution defect — measured, this assertion
+# stayed green with backticks restored until the fragment included the clause itself.
+_check_refusal "MAX=0"               "REFUSED: MAX="       "0 would defer every candidate for ever"
+_check_refusal "MAX=0 MAX_TOTAL=16"  "REFUSED: MAX="       "0 would defer every candidate for ever"
+_check_refusal "MAX_TOTAL=0"         "REFUSED: MAX_TOTAL=" "aggregate clause '[ total -ge 0 ]' true"
+_check_refusal "MAX=8 MAX_TOTAL=0"   "REFUSED: MAX_TOTAL=" "aggregate clause '[ total -ge 0 ]' true"
+
+# ⛔ THE RAIL-VERDICT DIRECTORY IS A PRECONDITION TOO — and its absence used to be invisible: a launch whose
+# redirect cannot be opened returns 0 to the caller, so the log said `launching rail` for a rail that never
+# started, and the cooldown then reported "already railed … only a NEW HEAD can change" over it (measured
+# cycle 4). Driven from a copy whose RAIL_DIR cannot be created, so the refusal is the SHIPPED one.
+_sutdir=$(mktemp); _thumb=$(mktemp -d)
+# A throwaway rail hub: the gh-shim check runs BEFORE the RAIL_DIR check, so the refusal under test can only
+# be reached with a hub whose shim and rail script exist. `RAIL_SCRIPT=/bin/true` would fail the shim check
+# first and this assertion would pass for the wrong reason (measured — it did, on the first attempt).
+mkdir -p "$_thumb/hub/scripts/gh-shim"
+: > "$_thumb/hub/scripts/gh-shim/gh"; chmod +x "$_thumb/hub/scripts/gh-shim/gh"
+: > "$_thumb/hub/scripts/admin-merge.sh"
+sed -e "s#/tmp/auto-rail.log#$_sutlog#g" -e 's#^RAIL_DIR=.*#RAIL_DIR=/proc/no/such/rail-dir#' "$SUT" > "$_sutdir"
+: > "$_sutlog"
+env MAX=8 RAIL_SCRIPT="$_thumb/hub/scripts/admin-merge.sh" bash "$_sutdir" >/dev/null 2>&1; _drc=$?
+[ "$_drc" -eq 3 ] || { echo "FAIL: an uncreatable rail-verdict directory must be REFUSED (exit 3), got rc=$_drc — otherwise every launch fails silently and is recorded as railed"; fail=1; }
+grep -q "REFUSED: cannot create a writable rail-verdict directory" "$_sutlog" \
+  || { echo "FAIL: the rail-verdict refusal must name itself in the log — a silent per-launch failure is the defect (log: $(cat "$_sutlog"))"; fail=1; }
+rm -rf "$_sutdir" "$_thumb"
 rm -f "$_sutlog" "$_sut0"
 
 # ⛔ THE AGGREGATE'S DERIVATION IS PINNED BY EVALUATING THE SHIPPED LINE, not by a literal in this file.
@@ -207,7 +254,10 @@ else echo "FAIL: a ps that could not run read as an EMPTY population and LAUNCHE
 # ⛔ AN UNREADABLE COUNTER MUST DEFER (fail-closed) — and this case PINS it: without it the guard can be
 # deleted and the whole test still prints PASS. The stub overrides `rails_for_repo` (not `ps`) because an
 # EMPTY PROCESS TABLE legitimately yields `0 0 0`; what must fail closed is a counter that prints nothing
-# usable. Two shapes: no output at all, and a SHORT parse ("0 0") whose fields concatenate to "00".
+# usable. Two shapes: no output at all, and a SHORT parse ("0 0") that leaves the THIRD field EMPTY —
+# `read` gives `own=0 total=0 unk=''`, so the string is `:0:0::` and the `*::` alternative catches it.
+# Nothing concatenates anything (an earlier version of this comment claimed the fields "concatenate to
+# 00", which is not the mechanism and invites a "simplification" of a guard that does work).
 rails_for_repo() { printf '%s' "$RAILS_OUT"; }
 MAX_TOTAL=16 MAX=8
 RAILS_OUT=""

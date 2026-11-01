@@ -67,7 +67,12 @@ max_total_for() {  # $1 = MAX; $2.. = the repos this actuator drives
 MAX_TOTAL=${MAX_TOTAL:-$(max_total_for "$MAX" $REPOS)}
 case "${MAX_TOTAL}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
-[ "$MAX_TOTAL" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a POSITIVE integer — 0 makes the aggregate clause `[ total -ge 0 ]` true for every population, i.e. every candidate deferred for ever" >> /tmp/auto-rail.log; exit 3; }
+# ⛔ NO BACKTICKS INSIDE A DOUBLE-QUOTED MESSAGE: `` `[ total -ge 0 ]` `` in this string was COMMAND
+# SUBSTITUTION (measured cycle 4) — bash ran `[ total -ge 0 ]`, printed `[: total: integer expression
+# expected` to stderr, and deleted the entire explanatory clause from the log line, i.e. it truncated
+# the message at the exact point that explains why the value is refused. The suite now matches the
+# explanation FRAGMENT, not just `REFUSED: MAX_TOTAL=`, so this cannot come back silently.
+[ "$MAX_TOTAL" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a POSITIVE integer — 0 makes the aggregate clause '[ total -ge 0 ]' true for every population, i.e. every candidate deferred for ever" >> /tmp/auto-rail.log; exit 3; }
 INTERVAL=${INTERVAL:-180}
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
@@ -110,7 +115,17 @@ COOLDOWN_S=${COOLDOWN_S:-21600}
 # attestation being re-recorded and for main going green. So: a verdict that can only be changed by a
 # NEW HEAD (CONFLICTED, DRAFT) keeps the long cooldown; every other verdict gets the short one.
 COOLDOWN_TRANSIENT_S=${COOLDOWN_TRANSIENT_S:-900}
-mkdir -p "$RAIL_DIR" 2>/dev/null
+# ⛔ THE RAIL DIRECTORIES ARE PRECONDITIONS, NOT DECORATION. Every launch writes its verdict into
+# `$RAIL_DIR`, and the cooldown logic READS it; a `mkdir` whose status nobody checks, and a redirect that
+# cannot be opened, both leave the ledger recording "railed" for a rail that never ran — measured cycle 4
+# on this file: `nohup … > <unopenable> 2>&1 &` returns 0 to the caller, the log says `launching rail`,
+# and every later pass reports "this head was already railed … only a NEW HEAD can change" for six hours
+# over a rail that never started. Refuse at start instead of failing silently per launch, exactly as the
+# `$TRIED` and `$RAIL_SCRIPT` checks below do.
+if ! mkdir -p "$RAIL_DIR" 2>/dev/null || [ ! -d "$RAIL_DIR" ] || [ ! -w "$RAIL_DIR" ]; then
+  echo "$(date -u +%FT%TZ) REFUSED: cannot create a writable rail-verdict directory at $RAIL_DIR — a launch that cannot write its verdict is a failed launch this log would record as a launch" >> /tmp/auto-rail.log
+  exit 3
+fi
 # ⛔ THE COOLDOWN LEDGER IS THE ONLY THING STOPPING AN UNLIMITED RE-RAIL LOOP, so its absence is a
 # refusal, not a shrug: unreadable/unwritable, every candidate reads as "never tried" and is launched
 # again every INTERVAL, each launch consuming a MAX slot. Refuse once, diagnosably, at start.
@@ -118,7 +133,6 @@ if ! touch "$TRIED" 2>/dev/null || [ ! -w "$TRIED" ]; then
   echo "$(date -u +%FT%TZ) REFUSED: cannot create the cooldown ledger at $TRIED — without it every candidate would be re-railed every pass" >> /tmp/auto-rail.log
   exit 3
 fi
-mkdir -p "$RAIL_DIR" 2>/dev/null
 if [ ! -f "$RAIL_SCRIPT" ]; then
   echo "$(date -u +%FT%TZ) REFUSED: rail not found at $RAIL_SCRIPT — this actuator cannot land anything" >> /tmp/auto-rail.log
   exit 3
@@ -262,7 +276,7 @@ say "auto-rail started max=$MAX interval=${INTERVAL}s rail=$RAIL_SCRIPT"
 
 while :; do
   for repo in $REPOS; do
-    python3 - "$repo" "${RED_CAP:-2}" <<'PY' > /tmp/auto-rail-cand.$$
+    python3 - "$repo" "${RED_CAP:-2}" <<'PY' 2>> "$LOG" > /tmp/auto-rail-cand.$$
 import json,subprocess,sys
 repo=sys.argv[1]
 try:
@@ -377,6 +391,12 @@ PY
           continue
         fi
       fi
+      # ⛔ THE LEDGER RECORDS AN ATTEMPT, NOT A SUCCESS, AND THAT IS DELIBERATE. Recording after a verified
+      # start was proposed in review and rejected: `nohup … &` forks and the rail may refuse in seconds, so
+      # "the process is gone" is exactly the case the cooldown exists for — moving the write after it would
+      # re-rail every fast refusal every pass. What must not happen is a launch that never STARTED, and that
+      # is prevented by the precondition checks at startup (rail script present, `$RAIL_DIR` writable,
+      # `$TRIED` writable), not by this ordering.
       echo "$pr	$head	$now" >> "$TRIED"
       say "$repo #$pr GREEN+terminal -> launching rail (head $head)"
       # ⛔ agent-infra SPLITS ITS LANES BY TRIGGER (agent-infra #1257): `ci.yml` is pull_request-only and
