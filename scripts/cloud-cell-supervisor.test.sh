@@ -2104,6 +2104,15 @@ git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina
 # direction. Every arm below is a POSITIVE derivation (not a pair of absences) and each spelling is
 # its own fixture, so deleting one spelling from THIS copy reddens exactly its own row. The control at
 # the end keeps them honest: a trailing-slash origin naming ANOTHER repo is still refused.
+# ⛔ THE PER-ROW $O IS SEEDED AND THE ROW ASSERTS rc=0 (review of #3188, P2). The first version of this
+# block left $O unseeded, so `check` died one gate PAST the resolver (cmd_check's worker-scripts
+# precondition) in every fixture: the rows could only report "the resolver PRINTED its derivation
+# line" while the verb this fix exists for still exited non-zero — the block's own framing ("check
+# died") was never demonstrated, and a green row proved less than a reader would read into it. Seeding
+# the shipped set ($SEED_WORKERS, derived from the supervisor at the top of this file) lets `check` run
+# to its verdict, so each spelling now pins the END STATE — rc=0 AND the CELL CAN RUN banner — rather
+# than a log line that a later regression could print while still refusing. Same lesson as (h4)'s "A
+# POSITIVE ASSERTION, NOT TWO ABSENCES" in refresh-provision.test.sh.
 T7D="$T/trailslash"; mkdir -p "$T7D"
 T7D_N=0
 for t7d_spelling in \
@@ -2117,6 +2126,8 @@ do
   ai_init_repo "$t7d_repo"
   git -C "$t7d_repo" remote set-url origin "$t7d_spelling"
   t7d_real="$(cd "$t7d_repo" && pwd -P)"
+  mkdir -p "$T7D/o-$T7D_N"
+  seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$T7D/o-$T7D_N/$f"; done
   T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-$T7D_N" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
              ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-$T7D_N-$$" O="$T7D/o-$T7D_N" \
              WORKDIR="$t7d_repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
@@ -2133,10 +2144,21 @@ do
     *)
       ok "(7d) …and '$t7d_spelling' never reaches the underivable refusal" ;;
   esac
+  [ "$T7D_RC" -eq 0 ] \
+    && ok "(7d) …so check PROCEEDS on '$t7d_spelling' (rc=0 — the verb the false block killed, not just the resolver)" \
+    || bad "(7d) check still exited $T7D_RC for '$t7d_spelling' AFTER the resolver adopted it: the false block moved, it did not close — $T7D_OUT"
+  case "$T7D_OUT" in
+    *"CELL CAN RUN A CONTROLLER"*)
+      ok "(7d) …and reaches its verdict (the CELL CAN RUN banner), so the derivation is not the end of the pass" ;;
+    *)
+      bad "(7d) '$t7d_spelling' was adopted but check never reached its verdict — an early exit past the resolver still reads as a pass otherwise: $T7D_OUT" ;;
+  esac
 done
 # The CONTROL: the same trailing-slash SHAPE naming another repo is still not adopted, so the four rows
 # above pin the accept list rather than "a trailing slash is always accepted". (Unique slugs on both
-# sides keep this hermetic: no box has a checkout whose origin is acme/trailslash*.)
+# sides keep this hermetic: no box has a checkout whose origin is acme/trailslash*.) Its $O is
+# deliberately left UNSEEDED: this arm's whole claim is that the refusal IS the derivation — which the
+# block's own third row pins by name — so seeding could only blur which gate answered.
 mkdir -p "$T7D/other" "$T7D/st-other"; ai_init_repo "$T7D/other"
 git -C "$T7D/other" remote set-url origin "https://github.com/acme/something-else/"
 T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-other" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
