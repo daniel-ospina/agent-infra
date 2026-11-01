@@ -1823,7 +1823,35 @@ fi
 # stands in must not pre-flight anything (the scout worktree is created INSIDE $REPO below).
 if ! resolve_repo; then
   [ -n "$REPO" ] || repo_unresolved
-  exit "$EXIT_NOT_PROVISIONABLE"
+  # ⛔ THIS WAS THE LAST BARE `exit` IN THE PROVISION STAGE — AND IT RECORDED NO CAUSE (agent-infra#3174,
+  # measured 2026-11-01). `resolve_repo` prints its own refusal to the LOG and then this line exited with
+  # rc=3, so `refresh_on_exit` wrote `why=… the failing step recorded no cause` into
+  # `state/refresh-last` — the exact #2229 symptom the other exits in this stage were converted to
+  # `provision_fail` to remove. The controller's `[dispatch] BLOCKED` line quotes THAT FILE, not the
+  # log, so the one sentence an operator reads named nothing while the real reason sat one line above it.
+  # ⛔ THE CAUSE NAMES ONLY WHAT WAS MEASURED (review cycles 1-2, P2). It rendered an unset `$REPO` as
+  # `$REPO ('')` beside "a local-path origin cannot prove a DECLARED target" — three claims about an
+  # origin that was never read, in the one string `refresh_cause_brief` quotes. `resolve_repo` has
+  # THREE distinct REPO-set refusals (unreadable origin, a URL naming another repo, a local path that
+  # cannot prove a DECLARED target) plus the unset-`$REPO` search, so this names the shape it actually
+  # read instead of guessing one. Pointing at "the lines above" is NOT an option here: that is the
+  # `the failing step recorded no cause` sentence this exit is being fixed to stop writing.
+  if [ -n "$REPO" ]; then
+    _origin="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
+    case "$_origin" in
+      '') _pair="\$REPO ('${REPO}') has NO READABLE 'origin' remote, so it cannot prove it is a checkout of \$OR ('${OR:-}')" ;;
+      *://*|*@*:*)
+         case "$_origin" in
+           "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git")
+             _pair="\$REPO ('${REPO}') carries an 'origin' that names \$OR ('${OR:-}') yet the resolver refused it — see the refusal above (OR_DECLARED='${OR_DECLARED:-?}')" ;;
+           *) _pair="\$REPO ('${REPO}') has 'origin'=${_origin}, which is NOT the queue target \$OR ('${OR:-}') — a DIFFERENT repo, and no retry can mend a mismatch" ;;
+         esac ;;
+      *) _pair="\$REPO ('${REPO}') has the local-path 'origin' ${_origin}, which cannot prove a DECLARED \$OR ('${OR:-}'; OR_DECLARED='${OR_DECLARED:-?}')" ;;
+    esac
+  else
+    _pair="no \$REPO was set and no candidate checkout of \$OR ('${OR:-}') was found where this harness puts one (OR_DECLARED='${OR_DECLARED:-?}')"
+  fi
+  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=resolve-repo: $_pair"
 fi
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
