@@ -1068,12 +1068,14 @@ if [ -r /proc/net/route ]; then
      "$([ "$RC" -eq 0 ] && [ "$A3C" = 10.1.0.5 ] && echo 0 || echo 1)"
   # (3b) THE IFINDEX ORDER DECIDES, NOT THE ADDRESS ORDER (review round 3, finding 4). Here the lower
   # ifindex holds the HIGHER address, so the documented rule (lowest ifindex) and an octet-only rule
-  # disagree. Without this arm, replacing the ifindex parse with `i = 0` stays green.
+  # disagree. ⛔ THE IFINDEXES STRADDLE A DIGIT BOUNDARY (9 vs 12) ON PURPOSE (review round 11): the parse
+  # coerces to a number (`i = i + 0`), and without it awk compares "12" < "9" as STRINGS and the rule
+  # inverts — which every single-digit fixture in this section cannot see.
   ipfix eth0 \
-    '3: eth0 inet 10.2.0.7/24 brd 10.2.0.255 scope global eth0' \
-    '5: eth0.7 inet 10.1.0.5/24 scope global eth0.7'
+    '9: eth0 inet 10.2.0.7/24 brd 10.2.0.255 scope global eth0' \
+    '12: eth0.1911 inet 10.1.0.5/24 scope global eth0.1911'
   A3D="$(boxidnet)"; RC=$?
-  ck "  …and the LOWEST IFINDEX wins even when it holds the numerically HIGHER address ($A3D, not 10.1.0.5)" \
+  ck "  …and the LOWEST IFINDEX wins even when it holds the numerically HIGHER address ($A3D, not 10.1.0.5) — and across a digit boundary (9 vs 12)" \
      "$([ "$RC" -eq 0 ] && [ "$A3D" = 10.2.0.7 ] && echo 0 || echo 1)"
   # (4) no address at all => refuse.
   ipfix eth0 ''
@@ -1230,8 +1232,11 @@ da_ifconfig() { printf '#!/bin/sh\nprintf "\\tinet %s netmask 0xffff0000\\n"\n' 
 boxidnet_darwin() ( da_ifconfig "$1"; PATH="$DAB"; CAP_BOXID=""; . "$CAP"; cap_boxid_net ) 2>/dev/null
 A12="$(boxidnet_darwin 10.238.144.2)"; RC=$?
 A12B="$(boxidnet_darwin 169.254.7.7)"; RC2=$?
-ck "(12) the Darwin arm (no \`ip\` on PATH — runs on macOS too) answers its interface address ($A12) and REFUSES a link-local one (rc=$RC2, boxid=[$A12B])" \
-   "$([ "$RC" -eq 0 ] && [ "$A12" = 10.238.144.2 ] && [ "$RC2" -eq 1 ] && [ -z "$A12B" ] && echo 0 || echo 1)"
+# ⛔ AND THE LOOPBACK BRANCH OF THE SAME GUARD (review round 11): the Darwin path has no `scope global`
+# filter at all, so `127/8` rejection there rests ENTIRELY on that `case` — ungraded until now.
+A12C="$(boxidnet_darwin 127.0.0.1)"; RC3=$?
+ck "(12) the Darwin arm (no \`ip\` on PATH — runs on macOS too) answers its interface address ($A12), REFUSES a link-local one (rc=$RC2, boxid=[$A12B]) and REFUSES a loopback one (rc=$RC3, boxid=[$A12C])" \
+   "$([ "$RC" -eq 0 ] && [ "$A12" = 10.238.144.2 ] && [ "$RC2" -eq 1 ] && [ -z "$A12B" ] && [ "$RC3" -eq 1 ] && [ -z "$A12C" ] && echo 0 || echo 1)"
 # (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
 # controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
 # reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
