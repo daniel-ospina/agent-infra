@@ -1348,11 +1348,16 @@ if [ -s "$TMP/dh.sh" ]; then
   # stall-repair worker on every HEALTHY pass; the second cut initialised the flag INSIDE the stall
   # arm, which reset it immediately and dispatched on NO pass at all. Neither state is visible to any
   # existing leg, so both are driven here: a stalled pass MUST invoke the fixer, a landed pass MUST NOT.
-  stallfix_dispatch() {   # <land-age-minutes> -> "called" | "not-called"
+  # ⛔ THE STUB RECORDS ITS ARGUMENTS (review P3, #2929). It used to be `echo called`, so the leg proved
+  # only THAT a worker was started, never WHAT it was told: mutating `orch-loop.sh` to pass a constant
+  # `"0"` instead of `"${_dpass:-0}"` made `stall-fix.sh` refuse every call in production (`SEEN=0` is
+  # not a stalled pass — the escalation dispatches NOBODY, the exact inertness this PR removes) while
+  # the whole suite stayed green. Asserting the counter is what makes the leg discriminating.
+  stallfix_dispatch() {   # <land-age-minutes> -> the pass counter the fixer was called with | "not-called"
     rm -f "$TMP/called.txt"; mkdir -p "$TMP/D3/state"; : > "$TMP/D3/state/merged-1.done"
     cat > "$TMP/D3/stall-fix.sh" <<'STUBFIX'
 #!/bin/bash
-echo called >> "$STUBMARK"
+printf '%s' "$1" >> "$STUBMARK"
 STUBFIX
     chmod +x "$TMP/D3/stall-fix.sh"
     (
@@ -1366,11 +1371,11 @@ STUBFIX
       is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0?*) return 1 ;; *) return 0 ;; esac; }
       . "$TMP/dh.sh"
     ) >/dev/null 2>&1
-    [ -s "$TMP/called.txt" ] && echo called || echo not-called
+    [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
   }
   _o="$(stallfix_dispatch 400)"
-  [ "$_o" = "called" ] && ok "a STALLED pass invokes the stall fixer (the escalation dispatches)" \
-    || bad "a stalled pass did not invoke the stall fixer — the escalation is inert again: got '$_o'"
+  [ "$_o" = "1" ] && ok "a STALLED pass invokes the stall fixer WITH the pass counter it measured (1) — the escalation dispatches" \
+    || bad "a stalled pass did not hand the stall fixer pass counter 1 — the escalation is inert, or hands it a counter stall-fix.sh refuses: got '$_o'"
   # ⛔ AND THE SAME EMPTY ANSWER MUST DISPATCH (verifier, cycle 3 + #2929): an empty `mp_recent_land`
   # is NOTHING landed inside the window — the ≥6h class this box actually reaches, and the state #2929
   # measured at 178 markers / 0 inside 360m. It printed a line and set no flag, so the escalation was
@@ -1380,7 +1385,7 @@ STUBFIX
     rm -f "$TMP/called.txt"; mkdir -p "$TMP/D4/state"; : > "$TMP/D4/state/merged-1.done"
     cat > "$TMP/D4/stall-fix.sh" <<'STUBFIX'
 #!/bin/bash
-echo called >> "$STUBMARK"
+printf '%s' "$1" >> "$STUBMARK"
 STUBFIX
     chmod +x "$TMP/D4/stall-fix.sh"
     (
@@ -1390,11 +1395,11 @@ STUBFIX
       is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0?*) return 1 ;; *) return 0 ;; esac; }
       . "$TMP/dh.sh"
     ) >/dev/null 2>&1
-    [ -s "$TMP/called.txt" ] && echo called || echo not-called
+    [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
   }
   _o="$(stallfix_dispatch_noland)"
-  [ "$_o" = "called" ] && ok "…and the EMPTY answer (nothing landed inside the window — the >=6h stall) dispatches too" \
-    || bad "the empty-answer path printed the line but never invoked the fixer — inert where the stall is worst: got '$_o'"
+  [ "$_o" = "1" ] && ok "…and the EMPTY answer (nothing landed inside the window — the >=6h stall) dispatches too, with the measured counter" \
+    || bad "the empty-answer path printed the line but never invoked the fixer correctly — inert where the stall is worst: got '$_o'"
   _o="$(stallfix_dispatch 5)"
   [ "$_o" = "not-called" ] && ok "…and a LANDED pass does not (no worker on a healthy box)" \
     || bad "a healthy pass invoked the stall fixer — the gate reads the counter, not the stall: got '$_o'"

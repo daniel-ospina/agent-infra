@@ -2722,9 +2722,15 @@ drain_stall_token() {
   spawns="$(sed -n 's/^spawns=//p' "$f" 2>/dev/null | head -1)"
   unowned="$(sed -n 's/^unowned=//p' "$f" 2>/dev/null | head -1)"
   lage="$(sed -n 's/^age=//p' "$f" 2>/dev/null | head -1)"
+  # ⛔ A SYNTHESISED AGE IS A BOUND, NOT A MEASUREMENT (review P3, #2929), and this is the line every
+  # reader parses — so it must say so. `>=` on the `no_land=` field is the distinction; a MEASURED age
+  # keeps the exact format every existing reader and `test-gates.sh` pin (`no_land=240m`). A record
+  # written before `agesrc` existed has no field, reads as measured, and is rendered exactly as before.
+  agesrc="$(sed -n 's/^agesrc=//p' "$f" 2>/dev/null | head -1)"
+  _agepfx=""; [ "${agesrc:-}" = "synth" ] && _agepfx=">="
   lbl="$(drain_stall_label "$f")"
-  printf ' drain=%s(passes=%s,unowned=%s,no_land=%sm,spawns=%s)' \
-    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${lage:--}" "${spawns:-?}"
+  printf ' drain=%s(passes=%s,unowned=%s,no_land=%s%sm,spawns=%s)' \
+    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${_agepfx}" "${lage:--}" "${spawns:-?}"
 }
 # ── THE ESCALATION'S LABEL, DERIVED FROM ITS OWN MEASUREMENT (review c-1, 2026-10-23) ─────────────
 # ⛔ THE MARKER IS WRITTEN BY BOTH STALL ARMS, SO ITS *EXISTENCE* CANNOT MEAN "DEADLOCK". A STALLED
@@ -5919,8 +5925,9 @@ PY
     # state loss their absence is unmeasurable in BOTH directions — and #2929 names silence as the
     # wrong side of that ambiguity: a box that cannot show it has landed is a box to escalate, not one
     # to leave quiet. What keeps that honest is the WINDOW, not the carve-out: the synthesised age is
-    # the smallest the gate can justify (`_stallmin + 1`), so a stall is UNDERSTATED and never
-    # invented, the printed line says the answer was empty, and a fresh numeric stamp still reads
+    # `mp_recent_land`'s OWN bound (`2 x MERGE_PRIORITY_MAX_AGE_MIN`), the largest floor the empty
+    # answer proves, so a stall is UNDERSTATED and never invented, the printed line says the answer was
+    # empty, and a fresh numeric stamp still reads
     # "drain alive" — the polarity of #2929 ask 3 is unchanged.
     # ⛔ NORMALISE THE TUNABLE (review P3): `[ "200m" -ge … ]` ERRORS (rc 2), an errored test is
     # FALSE, and the else arm would print "drain alive" — a false all-clear on the very condition this
@@ -5934,6 +5941,19 @@ PY
     _stallraw="${MERGE_STALL_MIN:-180}"
     _stallmin=180
     case "$_stallraw" in ''|*[!0-9]*) : ;; *) _stallmin=$(( 10#$_stallraw )) ;; esac
+    # ⛔ THE EMPTY ANSWER'S ONLY JUSTIFIED AGE IS THE WINDOW'S OWN BOUND (review P3, #2929). An empty
+    # `mp_recent_land` PROVES exactly one thing: no `merged-*.done` is inside `2 x
+    # MERGE_PRIORITY_MAX_AGE_MIN` (that is the `-mmin -bound` in the function). So the largest floor the
+    # answer supports is that bound — and it must be read from the SAME knob the function reads, not
+    # from `MERGE_STALL_MIN`, which is a DISPLAY threshold. Measured with the threshold-derived value:
+    # `MERGE_STALL_MIN=2000` + an empty answer printed `no PR merged in 2001m … the age is the window's
+    # lower bound`, i.e. 1641m of staleness the box never measured — the opposite of the `OVERRIDES:`
+    # claim that a stall is UNDERSTATED rather than invented. Normalised like `_stallmin` above: a
+    # non-numeric knob must not make this arithmetic error.
+    _wraw="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+    _wmin=180
+    case "$_wraw" in ''|*[!0-9]*) : ;; *) _wmin=$(( 10#$_wraw )) ;; esac
+    _wbound=$(( _wmin * 2 ))
     # ⛔ THE DISPATCH BELOW MUST SEE "DID THIS PASS STALL", NOT "WHAT IS THE COUNTER".
     # `_dpass` is set only inside the stall arm; read on the drain-alive path it defaults to 0,
     # and `0 % 3 == 0` dispatched a stall-repair worker on every HEALTHY pass (verifier,
@@ -5946,10 +5966,11 @@ PY
       _lage=$(( ( $(date +%s) - (10#${_lm}) ) / 60 ))
     else
       # ⛔ NO LAND MARKER INSIDE THE WINDOW IS THE STALL ITSELF (#2929 ask 1). Synthesise the stamp so
-      # the gate EVALUATES instead of skipping: `_stallmin + 1` is the smallest age the empty answer can
-      # justify, so the escalation fires and the printed age never claims more staleness than was run.
+      # the gate EVALUATES instead of skipping, and use the MEASUREMENT'S OWN FLOOR (`_wbound`, the
+      # window `mp_recent_land` searched) — never a threshold — so the printed age is a bound the empty
+      # answer actually proves. Understating stays the safe direction; inventing does not.
       _lmsyn=1
-      _lage=$(( _stallmin + 1 ))
+      _lage=$_wbound
     fi
       # ⛔ A FUTURE STAMP IS NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N` passes a file
       # stamped in the future (a negative age is "less than N minutes ago"), so clamping it to 0 would
@@ -5982,8 +6003,13 @@ PY
         _dpass=$(( _dpass + 1 ))
         # ⛔ THE RECORD IS WRITE-CHECKED, like every other record this loop trusts: an escalation the
         # box cannot persist is an escalation that dies with the pass it was printed in.
-        if printf 'at=%s\npasses=%s\nage=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
-             "$(date +%s)" "$_dpass" "$_lage" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
+        # ⛔ THE RECORD CARRIES THE AGE'S PROVENANCE (review P3, #2929). Only the LOG line was labelled,
+        # so `drain_stall_token` printed the synthesised bound through the same `no_land=<age>m` field a
+        # MEASURED age uses — on the one line every reader parses. `agesrc` is additive (no reader is
+        # broken by a field it does not know) and is what lets the token say `>=` for a bound.
+        if [ "${_lmsyn:-0}" = "1" ]; then _agesrc=synth; else _agesrc=measured; fi
+        if printf 'at=%s\npasses=%s\nage=%s\nagesrc=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
+             "$(date +%s)" "$_dpass" "$_lage" "$_agesrc" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
              > "$O/state/drain-stall" 2>/dev/null; then
           # ⛔ THE LABEL IS DERIVED, NOT HARD-CODED (review 3-P2). A STALLED pass records `spawns=4`
           # and `drain_stall_label` then prints STALLED, so promising "drain=DEADLOCK" here told the
@@ -6043,7 +6069,7 @@ PY
         # says which it is, in the same place the age is printed (#2929's own reading: an empty answer
         # means no recent land, "which is exactly the gate's own question").
         _lmtail=""
-        [ "${_lmsyn:-0}" = "1" ] && _lmtail=" (no land marker inside the window at all — the empty answer to 'has this box landed' IS the stall, so the age is the window's lower bound and the real stall may be older)"
+        [ "${_lmsyn:-0}" = "1" ] && _lmtail=" (no land marker inside the ${_wbound}m window at all — the empty answer to 'has this box landed' IS the stall, so the age is AT LEAST that window's own bound and the real stall may be older)"
         if [ "${_spk:-}" = "0" ]; then
           echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m${_lmtail}, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
         else
