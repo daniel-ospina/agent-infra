@@ -35,8 +35,59 @@ name: Harness single source
 # moment it was inserted (its own 7 added lines moved both targets), which is the same defect the
 # fold fixed in ci.yml's "shard 192" pointer. A name survives an edit; a line number does not.
 
+# ⛔ A `paths:` FILTER, BECAUSE A DIFF THAT CANNOT CHANGE THIS READ SHOULD NOT BUY A RUN (#3196).
+# This job ran on EVERY PR at a 6.7 min median wall clock for a few seconds of work (measured
+# 2026-11-01), and `pipeline-compliance` — the repo's only required context — queues behind it.
+# The filter is scoped to what the steps below can READ, and it errs WIDE on purpose: the measured
+# history of this file is that an arm which is right about `bin/harness` was wrong about the
+# MACHINE it landed on (#3001), so the rule is "everything the read depends on", never "the file
+# under test".
+#
+#   bin/harness                                — the CLI the `doctor` step executes and asserts.
+#   scripts/orchestrator-harness/**            — doctor's CANONICAL tree: it reads this directory's
+#                                                git HEAD and dirty state (`canonical.commit` is
+#                                                asserted to BE this run's head), runs
+#                                                check-single-source.sh from it, and every
+#                                                NON-VACUITY step compares files in it (the
+#                                                `--require-target` copy, the planted fork's
+#                                                `lane.sh`, the byte-divergent `spawn-gate.sh`).
+#                                                The supervisor probe also sources
+#                                                `orchestrator-harness/worker-terminal.sh` and
+#                                                `orchestrator-harness/uv-env.sh` from here.
+#   scripts/cloud-cell-supervisor.sh           — the Linux supervisor installer doctor resolves
+#                                                (`$_sup_sh`) and EXECUTES `status` on, so its
+#                                                behaviour is part of the read.
+#   .github/workflows/harness-single-source.yml — this file: an assertion or step change must be
+#                                                able to run on its own PR.
+#
+# DELIBERATELY EXCLUDED, each with the reason it cannot change the read (do not "tidy" one in
+# without one):
+#   * `scripts/lib/**` — the doctor path sources only `orchestrator-harness/uv-env.sh` and
+#     `orchestrator-harness/worker-terminal.sh`; `scripts/lib/pid-identity.sh` and
+#     `scripts/lib/box.sh` are PINNED MIRRORS whose predicates the supervisor carries its own copy
+#     of, so editing them changes neither doctor's output nor a step's input.
+#   * `docs/**`, `templates/**`, `extensions/**`, `bin/agent-infra.js` — no step here executes or
+#     reads any of them.
+#   * every OTHER workflow — this job reads no workflow file but its own.
+#
+# ⛔ NOT ON THE REQUIRED CONTEXT, AND THAT IS WHY THIS IS SAFE HERE AND WOULD NOT BE THERE. GitHub
+# documents that "if a workflow is skipped due to path filtering … then checks associated with that
+# workflow will remain in a 'Pending' state", so a filtered REQUIRED context would block merges.
+# `pipeline-compliance` is this repo's only required context (measured) and its triggers are
+# untouched on purpose. For an advisory check the missing run is simply absent, and
+# `scripts/admin-merge.sh` already models a `paths:`-filtered PR workflow on the base-side
+# comparison (#1542 at :5202) rather than treating the absence as a gap.
+#
+# The set is pinned by `tests/ci-trigger-scope`, whose admission arms go through
+# `scripts/ci-workflow-pr-evaluable.sh` — the SAME predicate the merge rail uses — so a filter that
+# stops admitting one of the paths above is RED rather than a quiet coverage loss.
 on:
   pull_request:
+    paths:
+      - 'bin/harness'
+      - 'scripts/orchestrator-harness/**'
+      - 'scripts/cloud-cell-supervisor.sh'
+      - '.github/workflows/harness-single-source.yml'
 
 concurrency:
   # Supersede a run when the branch moves; a superseded run is not a failure (the rail treats
