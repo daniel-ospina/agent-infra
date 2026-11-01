@@ -59,6 +59,11 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   [ "${1:-}" = "--" ] && shift
   label="${vm#vm-}"
   case " $dead " in *" $label "*) echo "Error: The Cloud VM request failed." >&2; exit 1 ;; esac
+  # STUB_DEAD_LOG: let ONLY the `.log` scan fail, so the `ls` verb's second scan can be tested — the
+  # reviewer found its failure was silently an empty list at exit 0 because only the `.md` scan was guarded.
+  if [ -n "${STUB_DEAD_LOG:-}" ] && [ "${5:-}" != "${5%%.log*}" ]; then
+    echo "Error: The Cloud VM request failed." >&2; exit 1
+  fi
   # ⛔ MODEL THE CHANNEL: the real `cmux vm exec` READS THE CALLER'S STDIN. Swallow one line here so an
   # exec with no `</dev/null` inside a `while read … <<< "$MAP"` loop visibly eats the loop's rows and
   # T3 goes red. A stub that ignores stdin cannot test the guard at all.
@@ -215,8 +220,7 @@ grep -q 'exact log' "$out/pi-cell-4-t-lane.log" 2>/dev/null && ok "T12 log body 
   || bad "T12 log body" "$(cat "$out/pi-cell-4-t-lane.log" 2>/dev/null)"
 ls "$out" | grep -q 'log.bak' && bad "T12 must not collect the decoy" "$(ls "$out")" || ok "T12 decoy not collected"
 
-echo "T13 — a truncated invocation errors instead of spinning forever"
-# `timeout` is GNU coreutils and absent on macOS; guard with a background pid + a bounded wait instead,
+echo "T13 — a truncated invocation errors instead of spinning forever"# `timeout` is GNU coreutils and absent on macOS; guard with a background pid + a bounded wait instead,
 # so this case tests the tool and not the host's coreutils.
 bash "$TOOL" collect ci-cause --out > "$Q/t13.txt" 2>&1 &
 t13pid=$!
@@ -226,6 +230,41 @@ wait "$t13pid" 2>/dev/null; rc=$?
 kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
 eq "T13 exit 64 on a missing option value" "$rc" "64"
 grep -q 'missing value for --out' "$Q/t13.txt" && ok "T13 names the missing value" || bad "T13 wording" "$(cat "$Q/t13.txt")"
+
+echo "T5c — a requested label that does not resolve ⇒ exit 4, NOT 3 (it was never attempted)"
+OLD="$STUB_BOXES"
+STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-4=$Q/box-c"
+STUB_BOXES="$STUB_BOXES" run collect no-such-artifact > "$Q/t5c.txt" 2>&1
+rc=$?
+STUB_BOXES="$OLD"
+eq "T5c exit 4" "$rc" "4"
+grep -q '^ABSENT-EVERYWHERE' "$Q/t5c.txt" && bad "T5c must not claim absent" "$(cat "$Q/t5c.txt")" \
+  || ok "T5c does not claim absent for a label it never resolved"
+
+echo "T8b — ls: the .log scan failing is UNMEASURED, not an empty list at exit 0"
+STUB_DEAD_LOG=1; export STUB_DEAD_LOG
+run ls > "$Q/t8b.txt" 2>&1
+unset STUB_DEAD_LOG
+# The .md scan succeeded, so the box is REACHED and the verb exits 0; the point is that the failed
+# .log scan is NAMED rather than silently rendering as "this box has no lane logs".
+grep -q 'UNMEASURED(log' "$Q/t8b.txt" && ok "T8b names the failed log scan" || bad "T8b names it" "$(head -10 "$Q/t8b.txt")"
+
+echo "T14 — --since 30m is a USAGE error (exit 64), never a false ABSENT"
+run collect ci-cause --since 30m > "$Q/t14.txt" 2>&1
+rc=$?
+eq "T14 exit 64" "$rc" "64"
+grep -q '^ABSENT-EVERYWHERE' "$Q/t14.txt" && bad "T14 must not claim absent" "$(cat "$Q/t14.txt")" \
+  || ok "T14 does not claim absent on a bad duration"
+
+echo "T15 — a reused --out does not leave the previous run's artifacts beside this run's index"
+out="$Q/out15"; mkdir -p "$out"
+run collect epic-ledger --out "$out" >/dev/null 2>&1
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T15 run 1 wrote its file" || bad "T15 run 1" "$(ls "$out")"
+STUB_DEAD="pi-cell-1 pi-cell-3 pi-cell-4"; run collect epic-ledger --out "$out" >/dev/null 2>&1
+STUB_DEAD=""
+ls "$out" | grep -q 'pi-cell-4-epic-ledger.md' && bad "T15 stale artifact survived run 2" "$(ls "$out")" \
+  || ok "T15 stale artifact from run 1 removed"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"

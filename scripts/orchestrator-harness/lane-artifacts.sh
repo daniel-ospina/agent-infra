@@ -29,10 +29,13 @@
 #   been wrong even on the night it was recorded. Discovery is SELF-VALIDATING (the file is there or
 #   it is not) at the cost of one cheap `cmux vm exec` per box.
 #
-# ⛔ THE HONESTY INVARIANT, and it is the whole reason the exit codes are this specific:
-#      a failed exec is UNMEASURED, NEVER "absent" — an unreachable box says nothing about its files.
-#      0 = found · 3 = every resolved box was reached and matched nothing
-#      4 = some/every box UNMEASURED (so "absent" is NOT claimed) · 5 = a requested pull failed
+# ⛔ THE HONESTY INVARIANT — this is the whole reason the exit codes are this specific, and every
+#    branch below exists to keep it true. A claim of ABSENCE must rest on having actually searched
+#    EVERY box the caller asked for:
+#      0 = found · 3 = ABSENT-EVERYWHERE (every requested box resolved AND was searched AND matched
+#          nothing) · 4 = UNMEASURED, so "absent" is NOT claimed (a box failed, errored, or never
+#          resolved) · 5 = PULL-FAILED · 64 = usage error
+#    "Resolved" is not "searched", and a `find` that ERRORED is not a `find` that found nothing.
 # ⛔ Never make the lane responsible for its own collection: the failure is a lane that died before it
 #    could do anything after the kill.
 set -uo pipefail
@@ -42,6 +45,7 @@ BOXES_DEFAULT="${LANE_ARTIFACT_BOXES:-pi-cell-1 pi-cell-3 pi-cell-4}"
 # The directory scanned on each box. `/tmp` in production; overridable ONLY so the test can build a
 # fixture tree instead of asserting against whatever happens to be on a live box.
 ATIF_ROOT="${LANE_ARTIFACT_ROOT:-/tmp}"
+ROW_CAP=200
 
 usage() {
   cat >&2 <<'EOF'
@@ -49,14 +53,14 @@ usage: lane-artifacts.sh <verb> [args]
 
   collect <pattern> [--out DIR] [--lines N] [--box LABEL] [--since MINUTES]
         Find every /tmp/*<pattern>* on the cells, print it (first --lines, default 40),
-        and with --out write each FULL file to DIR/<cell>-<basename> and record it in
-        DIR/.lane-artifacts-index (truncated per run).
+        and with --out write each FULL file to DIR/<cell>-<basename>, recorded in
+        DIR/.lane-artifacts-index (rewritten per run).
         <pattern> is a glob fragment, so `collect ci-cause` finds /tmp/ci-cause.md.
         `collect '*'` sweeps all of /tmp.
 
   logs <name> [--out DIR] [--lines N] [--box LABEL]
-        The deterministic per-lane stdout: EXACTLY /tmp/<name>.log (no glob), written by the
-        dispatcher's launcher (`nohup pi -p < brief > /tmp/<name>.log`). This IS a cell lane's stdout.
+        The deterministic per-lane stdout: /tmp/<name>.log, written by the dispatcher's launcher
+        (`nohup pi -p < brief > /tmp/<name>.log`). This IS a cell lane's stdout.
 
   ls [--box LABEL] [--since MINUTES]
         Inventory of /tmp/*.md and /tmp/*.log per box.
@@ -70,22 +74,28 @@ verb="${1:-}"; [ -n "$verb" ] || usage; shift || true
 
 pattern=""; outdir=""; lines=40; only_box=""; since=""
 need_val() { [ "$2" -ge 2 ] || { echo "lane-artifacts: missing value for $1" >&2; usage; }; }
+need_num() { printf '%s' "$2" | grep -Eq '^[0-9]+$' || { echo "lane-artifacts: $1 must be a whole number, got '$2'" >&2; usage; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
     # ⛔ `shift 2` with one arg left does NOT shift, so the loop would spin forever on a truncated
     # invocation (`collect ci-cause --out`) — a wedge, not an error. Check the count first.
     --out)     need_val --out "$#";   outdir="$2"; shift 2 ;;
-    --lines)   need_val --lines "$#"; lines="$2";  shift 2 ;;
+    --lines)   need_val --lines "$#"; need_num --lines "$2"; lines="$2"; shift 2 ;;
     --box)     need_val --box "$#";   only_box="$2"; shift 2 ;;
-    --since)   need_val --since "$#"; since="$2";  shift 2 ;;
+    # A unit suffix (`--since 30m`) used to reach the remote `find` as `-mmin -30m`, whose error was
+    # discarded — so the scan returned no rows and the tool claimed ABSENT about a file that exists.
+    # Validate here, where a usage error is a usage error.
+    --since)   need_val --since "$#"; need_num --since "$2"; since="$2"; shift 2 ;;
     -h|--help) usage ;;
     *)         if [ -z "$pattern" ]; then pattern="$1"; shift; else echo "unexpected arg: $1" >&2; usage; fi ;;
   esac
 done
+[ -n "$pattern" ] || [ "$verb" = "ls" ] || usage   # `ls` takes no pattern
 
-# `cmux vm exec` addresses a box by its VM NAME, not its label — passing the label fails with an
-# opaque `Reference: <hash>`. Resolve label -> name from `cmux vm list` and NAME the labels that could
-# not be resolved, rather than silently collecting from fewer boxes than the operator believes.
+# `cmux vm exec` addresses a box by its VM NAME, not by its label — passing the label fails with an
+# opaque `Reference: <hash>`. Resolve label -> name from `cmux vm list`, and report how many requested
+# labels did NOT resolve: a label that silently vanishes shrinks the universe, which would let exit 3
+# ("absent everywhere") be claimed without ever attempting that box.
 resolve_boxes() {
   local want="$1" list label name labels
   list="$("$CM" vm list </dev/null 2>/dev/null)" || { echo "UNMEASURED cmux-vm-list-failed" >&2; return 1; }
@@ -93,42 +103,46 @@ resolve_boxes() {
   for label in $labels; do
     name="$(printf '%s\n' "$list" | awk -v L="$label" '$2==L {print $1; exit}')"
     if [ -n "$name" ]; then printf '%s %s\n' "$label" "$name"
-    else printf 'UNMEASURED no-VM-labelled-%s\n' "$label" >&2; fi
+    else printf 'UNRESOLVED %s\n' "$label"; fi
   done
 }
 
-# scan <vm> <pattern> <since_minutes> <exact:0|1>
-#   -> `__OK__` sentinel, then `path<TAB>size<TAB>mtime` rows.
+# scan <vm> <pattern> <since_minutes|""> <exact:0|1>
+#   -> `__OK__` then `path<TAB>size<TAB>mtime` rows, or `__NOK__ <reason>` and nothing else.
+#
 # `find <root> -maxdepth 1` is an EXPLICIT, BOUNDED start point (never a root walk).
+#
+# TWO failures must be distinguishable, and neither is "no files":
+#   __NOK__ unreadable-root — the root is not a readable directory
+#   __NOK__ find-failed     — the match step ERRORED (bad flag, broken find, missing binary)
+# Both are UNMEASURED. The first version emitted `__OK__` BEFORE `find` ran and discarded its exit
+# status, so a `find` error produced `__OK__` + no rows = "searched, matched nothing" = ABSENT claimed
+# about a box that was never searched. `find` and `head` are therefore run to a temp file and their
+# status is checked before the sentinel.
 #
 # ⛔ `</dev/null` IS LOAD-BEARING ON EVERY EXEC THAT RUNS INSIDE A `while read … <<< "$MAP"` LOOP —
 #    this one included. An exec that inherits that here-string EATS the unread rows, so whole boxes are
-#    skipped and the tool answers "ABSENT-EVERYWHERE" about a file that is present. Found in `pull`
-#    first (the last matched file vanished from every run); the same shape was then still present here,
-#    which is why this comment names the loop rather than the call — grep for `</dev/null` and every
-#    exec inside a read loop must have one.
+#    skipped. Found in `pull` first (the last matched file vanished from every run), then still present
+#    here; the reviewer proved the `head`-preview exec had it too. Grep for `</dev/null`: every exec
+#    inside a read loop must have one.
 #
-# ONE syscall pass per box: `-printf` replaces a per-file `wc -c`+`stat` subshell (the first version did
-# that per file, took ~14 s/box, and silently LOST a row on a slow box — the truncation this tool exists
-# to stop producing).
+# ONE pass per box: `-printf` replaces a per-file `wc -c`+`stat` subshell (the first version did that per
+# file, took ~14 s/box, and silently LOST a row on a slow box — the truncation this tool exists to stop).
 #
-# The sentinel is echoed BY THE REMOTE SHELL, so its absence means the exec failed (UNMEASURED) rather
-# than "no files". Do not build it with `sed '1s/^/…\n/'` — BSD sed does not expand `\n`, so on a mac
-# the sentinel became the literal `__OK__n` and every box read as UNMEASURED while the files sat there.
-# `__NOK__` is emitted when `sh` did start but the root is not a readable directory: also UNMEASURED.
+# The sentinel is echoed BY THE REMOTE SHELL. Do not build it with `sed '1s/^/…\n/'` — BSD sed does not
+# expand `\n`, so on a mac the sentinel became the literal `__OK__n` and every box read as UNMEASURED
+# while the files sat there.
 scan() {
   local vm="$1" pat="$2" since_min="$3" exact="$4"
   "$CM" vm exec --timeout 60 "$vm" -- sh -c '
     R="$3"
-    [ -d "$R" ] && [ -r "$R" ] || { echo __NOK__; exit 0; }
-    echo __OK__
-    case "$4" in
-      1) NAME=$(printf "%s" "$1") ;;
-      *) NAME="*$1*" ;;
-    esac
+    [ -d "$R" ] && [ -r "$R" ] || { echo "__NOK__ unreadable-root"; exit 0; }
+    case "$4" in 1) NAME="$(printf "%s" "$1" | sed "s/\\\\([][*?]\\\\)/[\\\\1]/g")" ;; *) NAME="*$1*" ;; esac
+    T=$(mktemp 2>/dev/null) || T="/tmp/.lane-artifacts.$$"
     if find "$R" -maxdepth 1 -type f -printf "" 2>/dev/null; then
       find "$R" -maxdepth 1 -type f -name "$NAME" ${2:+-mmin -$2} \
-        -printf "%p\t%s\t%TY-%Tm-%TdT%TH:%TM:%TS\n" 2>/dev/null | head -200
+        -printf "%p\t%s\t%TY-%Tm-%TdT%TH:%TM:%TS\n" > "$T" 2>/dev/null
+      rc=$?
     else
       # No -printf => BSD/busybox find (a mac, or a stripped image). Same rows, per-file stat: slower,
       # and only ever the fallback. WITHOUT IT the mac-side test could not exercise the real scan at
@@ -137,34 +151,48 @@ scan() {
       # `stat -c` is tried FIRST because Linux is the production platform; GNU `stat -f` means
       # --file-system and would SUCCEED while printing filesystem status, so the BSD arm would never
       # fall through and the mtime column would be garbage for every row.
-      find "$R" -maxdepth 1 -type f -name "$NAME" ${2:+-mmin -$2} 2>/dev/null | head -200 |
-        while IFS= read -r f; do
-          printf "%s\t%s\t%s\n" "$f" "$(wc -c < "$f" | tr -d " ")" \
-            "$(stat -c "%y" "$f" 2>/dev/null || stat -f "%Sm" -t "%FT%T" "$f" 2>/dev/null || echo -)"
-        done
+      L=$(mktemp 2>/dev/null) || L="/tmp/.lane-artifacts.l.$$"
+      find "$R" -maxdepth 1 -type f -name "$NAME" ${2:+-mmin -$2} > "$L" 2>/dev/null
+      rc=$?
+      : > "$T"
+      while IFS= read -r f; do
+        printf "%s\t%s\t%s\n" "$f" "$(wc -c < "$f" | tr -d " ")" \
+          "$(stat -c "%y" "$f" 2>/dev/null || stat -f "%Sm" -t "%FT%T" "$f" 2>/dev/null || echo -)" >> "$T"
+      done < "$L"
+      rm -f "$L"
     fi
+    if [ "$rc" -ne 0 ]; then
+      rm -f "$T"; echo "__NOK__ find-failed(rc=$rc)"; exit 0
+    fi
+    echo __OK__
+    # Ask for one MORE row than the cap so "exactly ROW_CAP matches" is not mistaken for truncation.
+    head -n '"$((ROW_CAP + 1))"' "$T"
+    rm -f "$T"
   ' lane-artifacts "$pat" "$since_min" "$ATIF_ROOT" "$exact" </dev/null 2>/dev/null
 }
 
 # pull <vm> <remote path> <remote size> <dest>
-#   Byte-exact or it FAILS: a `cmux vm exec` cut mid-stream at a 4-char-aligned base64 boundary decodes
-#   cleanly to a TRUNCATED file, so the decoded size is compared against the size `scan` already read.
-#   The path travels as argv ($1), never interpolated into the command text — a filename containing an
-#   apostrophe broke the interpolated form (and its `2>&1` rendered "cannot open" as the artifact body).
-#   A 0-byte artifact is a legitimate result (a lane killed between creating and writing) and is NOT a
-#   failed pull: the remote exit status decides, not the emptiness of the payload.
+#   Byte-exact or it FAILS: a transfer cut mid-stream at a 4-char-aligned base64 boundary decodes
+#   cleanly to a TRUNCATED file, so the decoded size is compared with the size `scan` already read.
+#   The path travels as argv ($1), never interpolated — a filename with an apostrophe broke that.
+#   A 0-byte artifact is a legitimate result (a lane killed between creating and writing): the remote
+#   exit status decides, not the emptiness of the payload.
 pull() {
   local vm="$1" path="$2" want="$3" dest="$4" raw b64 rc got
-  # ⛔ THE STATUS GOES FIRST, ON ITS OWN LINE. It used to be a trailing `RC=` marker, and a transfer
-  # truncated mid-flight cuts the END off — so the marker itself was destroyed and the tool reported a
-  # nonsense "remote exit bGVkZ2VyIG9uIG…" instead of the size mismatch it had actually detected. A
-  # prefix marker survives truncation from the end; a suffix marker cannot. (Caught by T10.)
-  raw="$("$CM" vm exec --timeout 120 "$vm" -- sh -c 'base64 < "$1" 2>/dev/null; printf "\nRC=%s\n" "$?"' \
+  # ⛔ THE STATUS LINE COMES FIRST. It used to be a trailing `RC=` marker, and a transfer truncated
+  # mid-flight cuts the END off — destroying the marker, so the size check below was UNREACHABLE for
+  # the one failure it was written for and the operator was told "unreadable or UNMEASURED" about a
+  # transient truncation. A prefix marker survives truncation from the end; a suffix marker cannot.
+  # (The previous version of this file CLAIMED this fix in a comment while the code still emitted the
+  # marker last — found by review. The code is the claim.)
+  raw="$("$CM" vm exec --timeout 120 "$vm" -- sh -c \
+          'b=$(base64 < "$1" 2>/dev/null); rc=$?; printf "RC=%s\n%s\n" "$rc" "$b"' \
           lane-artifacts "$path" </dev/null 2>/dev/null)"
-  rc="$(printf '%s\n' "$raw" | sed -n 's/^RC=//p' | tail -1 | tr -d '[:space:]')"
-  b64="$(printf '%s\n' "$raw" | sed '/^RC=/d' | tr -d '[:space:]')"
+  rc="$(printf '%s\n' "$raw" | sed -n '1s/^RC=//p' | tr -d '[:space:]')"
+  b64="$(printf '%s\n' "$raw" | tail -n +2 | tr -d '[:space:]')"
   if [ "${rc:-1}" != "0" ]; then
     printf '  ✗ pull failed (remote exit %s — unreadable or UNMEASURED): %s\n' "${rc:-?}" "$path" >&2
+    rm -f "$dest"          # a stale copy from an earlier run must not survive as this run's result
     return 1
   fi
   if ! printf '%s' "$b64" | base64 -D > "$dest" 2>/dev/null && \
@@ -181,35 +209,44 @@ pull() {
 }
 
 MAP="$(resolve_boxes "$only_box")"
-NBOX="$(printf '%s\n' "$MAP" | awk 'NF{ n++ } END{ print n+0 }')"
-if [ "$NBOX" -eq 0 ]; then echo "UNMEASURED(no box resolved from cmux vm list)"; exit 4; fi
+RBOX="$(printf '%s\n' "$MAP" | awk '$1=="UNRESOLVED"{ n++; next } NF{ m++ } END{ print (m+0), (n+0) }')"
+NBOX="${RBOX% *}"; NUNRESOLVED="${RBOX#* }"
+if [ "${NBOX:-0}" -eq 0 ]; then
+  echo "UNMEASURED(no box resolved from cmux vm list — $(printf '%s' "$MAP" | awk '$1=="UNRESOLVED"{printf "%s ",$2}'))"
+  exit 4
+fi
+MAP="$(printf '%s\n' "$MAP" | awk '$1!="UNRESOLVED"')"
+UNRESOLVED_LABELS="$(printf '%s\n' "$(resolve_boxes "$only_box")" | awk '$1=="UNRESOLVED"{printf "%s ",$2}')"
 
-# Emit `collect`-shaped output for one box. Sets R_REACHED=1 when the box answered.
+# emit_box <label> <vm> … — `collect`-shaped output for one box. Sets R_REACHED=1 when it answered.
 emit_box() {
   local label="$1" vm="$2" pat="$3" exact="$4" outdir="$5" lines="$6" since="$7"
   local raw first res rows p sz mt dest
   raw="$(scan "$vm" "$pat" "$since" "$exact")"
   first="$(printf '%s\n' "$raw" | head -1)"
+  if [ "${first:0:7}" = "__NOK__" ]; then
+    echo "── $label  UNMEASURED(${first#__NOK__ })"
+    return 1
+  fi
   if [ "$first" != "__OK__" ]; then
-    if [ "$first" = "__NOK__" ]; then
-      echo "── $label  UNMEASURED(scan root '${ATIF_ROOT}' is not a readable directory on $label)"
-    else
-      echo "── $label  UNMEASURED(exec did not answer — says nothing about whether the file exists)"
-    fi
+    echo "── $label  UNMEASURED(exec did not answer — says nothing about whether the file exists)"
     return 1
   fi
   R_REACHED=1
   res="$(printf '%s\n' "$raw" | tail -n +2 | grep -v '^$')"
   [ -n "$res" ] || return 0
   rows="$(printf '%s\n' "$res" | wc -l | tr -d ' ')"
-  [ "$rows" -ge 200 ] && R_TRUNC=$((R_TRUNC + 1))
+  if [ "$rows" -gt "$ROW_CAP" ]; then
+    R_TRUNC=$((R_TRUNC + 1))
+    res="$(printf '%s\n' "$res" | head -n "$ROW_CAP")"
+  fi
   while IFS="$(printf '\t')" read -r p sz mt; do
     [ -n "${p:-}" ] || continue
     R_HITS=$((R_HITS + 1))
     echo
     echo "── $label  $p  (${sz:-?} bytes, ${mt:-?})"
-    # `head -n`/`--` with the count and path as argv, and stderr kept OUT of the body: a remote "cannot
-    # open" must never be rendered as though it were the artifact's first lines.
+    # The count and path go as argv, and stderr is kept OUT of the body: a remote "cannot open" — or a
+    # `--lines` that `head` rejected — must never be rendered as though it were the artifact's content.
     "$CM" vm exec --timeout 60 "$vm" -- sh -c 'head -n "$1" -- "$2" 2>/dev/null' \
       lane-artifacts "$lines" "$p" </dev/null 2>/dev/null | sed 's/^/   /'
     if [ -n "$outdir" ]; then
@@ -229,9 +266,9 @@ case "$verb" in
   collect|logs)
     pat="$pattern"; exact=0
     if [ "$verb" = "logs" ]; then
-      # EXACT name: `<name>` is documented as the deterministic /tmp/<name>.log, so a glob here would
-      # also pull /tmp/<name>.log.bak — "the exact path" and "any path starting with it" are different
-      # promises, and the usage text makes the first one.
+      # EXACT name: `<name>` is documented as the deterministic /tmp/<name>.log. `logs` with no name is
+      # a usage error, not an absence verdict about a name the operator never gave.
+      [ -n "$pattern" ] || usage
       pat="${pattern%.log}.log"; exact=1
     elif [ "$pat" = "*" ] || [ "$pat" = "." ]; then
       pat=""                          # a full sweep is /tmp/*, not /tmp/**
@@ -242,9 +279,15 @@ case "$verb" in
       if [ ! -d "$outdir" ] || [ ! -w "$outdir" ]; then
         echo "lane-artifacts: --out '$outdir' is not a writable directory" >&2; exit 64
       fi
-      : > "$outdir/.lane-artifacts-index"   # per-run, not accumulated: an index that cannot say what
-    fi                                      # THIS run collected is a stale record, not an index
-    echo "== lane-artifacts $verb '$pat' over $NBOX box(es)"
+      # Per-run, and the previous run's artifacts go too: a directory holding run 1's files next to
+      # run 2's empty index is read by any globbing consumer as run 2's result.
+      rm -f "$outdir/.lane-artifacts-index"
+      for f in "$outdir"/pi-cell-*; do [ -e "$f" ] && rm -f "$f"; done
+      : > "$outdir/.lane-artifacts-index"
+    fi
+    UNRES_NOTE=""
+    [ "${NUNRESOLVED:-0}" -gt 0 ] && UNRES_NOTE=" (+$NUNRESOLVED unresolved label(s):$UNRESOLVED_LABELS)"
+    echo "== lane-artifacts $verb '$pat' over $NBOX box(es)$UNRES_NOTE"
     while read -r label vm; do
       [ -n "${label:-}" ] || continue
       R_REACHED=0
@@ -255,54 +298,64 @@ case "$verb" in
     done <<< "$MAP"
 
     echo
+    # UNRESOLVED labels count as "not measured": they were requested and never attempted, so exit 3
+    # must not be claimed on their behalf.
+    MISSING=$(( (NBOX - REACHED) + NUNRESOLVED ))
     if [ "$REACHED" -eq 0 ]; then
       echo "UNMEASURED(no box answered — this says nothing about whether the file exists)"
       exit 4
     fi
     if [ "$R_HITS" -eq 0 ]; then
-      if [ "$REACHED" -lt "$NBOX" ]; then
-        # ⛔ DO NOT CLAIM ABSENT WHILE A BOX WAS UNMEASURED. `$MAP` is every RESOLVED box; `$REACHED_LABELS`
-        # is every box actually searched — naming $MAP here asserted a search of a box that never
-        # answered, which is how "not found" gets read as "does not exist".
-        printf 'UNMEASURED(nothing matched on the %s box(es) actually searched:%s — %s box(es) did NOT answer, so ABSENT is not claimed)\n' \
-          "$REACHED" "$REACHED_LABELS" "$((NBOX - REACHED))"
+      if [ "$MISSING" -gt 0 ]; then
+        printf 'UNMEASURED(nothing matched on the %s box(es) actually searched:%s — %s requested box(es) did NOT answer (%s), so ABSENT is NOT claimed)\n' \
+          "$REACHED" "$REACHED_LABELS" "$MISSING" "${UNRESOLVED_LABELS:-exec failed}"
         exit 4
       fi
       printf 'ABSENT-EVERYWHERE(find %s -maxdepth 1 -name "%s" matched nothing on all %s box(es):%s)\n' \
         "$ATIF_ROOT" "$pat" "$REACHED" "$REACHED_LABELS"
       exit 3
     fi
-    [ "$R_TRUNC" -gt 0 ] && echo "⚠ TRUNCATED at the 200-row cap on $R_TRUNC box(es) — narrow the pattern; this list is NOT complete"
-    echo "== $R_HITS file(s) collected from $REACHED box(es)${outdir:+; $R_PULLED pulled into $outdir}"
+    [ "$R_TRUNC" -gt 0 ] && echo "⚠ TRUNCATED at the $ROW_CAP-row cap on $R_TRUNC box(es) — narrow the pattern; this list is NOT complete"
+    # Partial coverage is disclosed on the SUCCESS path too: exit 0 with 1 of 3 boxes silent reads as
+    # a complete result to any caller keying on the exit status.
+    echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es)${outdir:+; $R_PULLED pulled into $outdir}"
+    if [ "$MISSING" -gt 0 ]; then
+      echo "⚠ COVERAGE INCOMPLETE: $MISSING requested box(es) did NOT answer (${UNRESOLVED_LABELS:-exec failed}) — files may exist there"
+    fi
     if [ "$R_PULLFAIL" -gt 0 ]; then
-      echo "PULL-FAILED($R_PULLFAIL of $R_PULLED + $R_PULLFAIL requested file(s) did NOT arrive — see the ✗ lines)"
+      echo "PULL-FAILED($R_PULLFAIL file(s) did NOT arrive — see the ✗ lines)"
       exit 5
     fi
     exit 0
     ;;
   ls)
-    T="$(printf '\t')"; any=0; reached=0
+    T="$(printf '\t')"; reached=0
+    show() {  # show <label> <vm> <fragment> <cap> <what> — checked in BOTH scans, not just the first
+      local label="$1" vm="$2" frag="$3" cap="$4" what="$5" raw first rows
+      raw="$(scan "$vm" "$frag" "$since" 0)"
+      first="$(printf '%s\n' "$raw" | head -1)"
+      if [ "${first:0:7}" = "__NOK__" ]; then
+        echo "   UNMEASURED($what: ${first#__NOK__ })"; return 1
+      fi
+      if [ "$first" != "__OK__" ]; then
+        # ⛔ The inventory verb must not turn a dead box into an empty, healthy-looking list (exit 0) —
+        # indistinguishable from "nothing in /tmp" — in the verb used to DISCOVER what exists.
+        echo "   UNMEASURED($what: exec did not answer)"; return 1
+      fi
+      rows="$(printf '%s\n' "$raw" | tail -n +2 | grep -v '^$')"
+      [ -n "$rows" ] || return 0
+      n="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
+      printf '%s\n' "$rows" | head -n "$cap" | awk -F"$T" '{printf "  %10s  %s  %s\n", $2, $1, $3}'
+      [ "$n" -gt "$cap" ] && echo "   ⚠ shown $cap of $n — pass a narrower pattern with \`collect\` for the rest"
+      return 0
+    }
     while read -r label vm; do
       [ -n "${label:-}" ] || continue
       echo "== $label"
-      R_REACHED=0; R_TRUNC=0
-      raw="$(scan "$vm" ".md" "$since" 0)"
-      first="$(printf '%s\n' "$raw" | head -1)"
-      if [ "$first" != "__OK__" ]; then
-        # ⛔ The inventory verb must not turn a dead fleet into an empty, healthy-looking list (exit 0):
-        # that is indistinguishable from "three boxes with nothing in /tmp", in the verb an operator uses
-        # to DISCOVER what exists.
-        if [ "$first" = "__NOK__" ]; then echo "   UNMEASURED(scan root '${ATIF_ROOT}' unreadable)"
-        else echo "   UNMEASURED(exec did not answer)"; fi
-        continue
-      fi
-      reached=$((reached + 1))
-      printf '%s\n' "$raw" | tail -n +2 | grep -v '^$' | head -25 |
-        awk -F"$T" '{printf "  %10s  %s  %s\n", $2, $1, $3}'
-      raw="$(scan "$vm" ".log" "$since" 0)"
-      printf '%s\n' "$raw" | tail -n +2 | grep -v '^$' | head -10 |
-        awk -F"$T" '{printf "  %10s  %s  %s\n", $2, $1, $3}'
-      any=1
+      ok_md=0; ok_log=0
+      show "$label" "$vm" ".md" 25 "md" && ok_md=1
+      show "$label" "$vm" ".log" 10 "log" && ok_log=1
+      if [ "$ok_md" -eq 1 ] || [ "$ok_log" -eq 1 ]; then reached=$((reached + 1)); fi
     done <<< "$MAP"
     if [ "$reached" -eq 0 ]; then echo "UNMEASURED(no box answered — says nothing about what is on them)"; exit 4; fi
     exit 0
