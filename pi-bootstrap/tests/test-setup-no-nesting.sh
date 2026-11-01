@@ -2346,7 +2346,7 @@ if [ "$_grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
   echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 with the LOAD code 76 (the real pi never ran)"
 elif [ ! -e "$TMP/gate-ran" ]; then
   # ⛔ A REFUSAL FOR ANOTHER CAUSE IS NOT THIS ARM'S SUBJECT (review, P2). Without the code check a
-  # memory (72) or fork (73) refusal satisfied a LOAD assertion, and the positive control below then
+  # memory (82) or fork (73) refusal satisfied a LOAD assertion, and the positive control below then
   # failed — the suite reporting its own subject as broken on a box where nothing was wrong with it.
   fail "the installed gate refused at MAX_LOAD=0 for some OTHER cause (rc=$_grc, expected 76) — the load arm cannot be asserted over it"
 else
