@@ -354,8 +354,20 @@ ck "orch-loop.sh sources capacity.sh from \$O, falling back to its own directory
    "$(grep -q 'capacity.sh' "$LOOP" && grep -q '_cap_mod' "$LOOP" && echo 0 || echo 1)"
 ck "…and gates on the INTERFACE (declare -f), not on the file, so a stale copy cannot read as wired" \
    "$(grep -q 'declare -f cap_probe_local cap_place cap_read_fleet cap_publish' "$LOOP" && echo 0 || echo 1)"
-ck "the cycle PROBES this box and PUBLISHES the reading" \
-   "$(grep -q 'cap_probe_local "\$REPO"' "$LOOP" && grep -q 'cap_publish "\$REPO"' "$LOOP" && echo 0 || echo 1)"
+# ⛔ AND THE GATE MUST NAME EVERY FUNCTION THE CYCLE CALLS (#3167, review round 10). The gate listed only
+# the four pre-change names, so a stale `$O/capacity.sh` passed as WIRED and the cycle's
+# `cap_publish_logged … || true` swallowed `command not found` — the box published NOTHING, silently. This
+# arm derives the requirement from the two files: every `cap_*` that the module DEFINES and the
+# controller CALLS must appear in the gate's own list.
+GATELIST="$(sed -n 's/.*declare -f \(cap_[a-z_ ]*\) >\/dev\/null 2>&1; then CAPACITY=1.*/\1/p' "$LOOP" | head -1)"
+MISSING=""
+for _fn in $(grep -o 'cap_[a-z_]*' "$LOOP" | sort -u); do
+  case " $GATELIST " in *" $_fn "*) : ;; *) grep -q "^$_fn() {" "$CAP" && MISSING="$MISSING $_fn" ;; esac
+done
+ck "…and the gate NAMES every module function the cycle calls — a stale capacity.sh cannot read as wired (missing:${MISSING:- none})" \
+   "$([ -n "$GATELIST" ] && [ -z "$MISSING" ] && echo 0 || echo 1)"
+ck "the cycle PROBES this box and PUBLISHES the reading (through the logged publish, #3167)" \
+   "$(grep -q 'cap_probe_local "\$REPO"' "$LOOP" && grep -q 'cap_publish_logged "\$REPO"' "$LOOP" && echo 0 || echo 1)"
 ck "…READS the fleet and ASKS cap_place for the target box" \
    "$(grep -q 'cap_read_fleet "\$REPO"' "$LOOP" && grep -q 'cap_place "\$(cap_host)"' "$LOOP" && echo 0 || echo 1)"
 ck "the placement verdict is in the [capacity] log line (the decision is visible every cycle)" \
@@ -973,6 +985,358 @@ m4pubx "$CAP" "$TMP/state-m4d" 8 "$(( NOW + 60 ))"
 _n_fix4="$(git -C "$W8" ls-remote --refs origin 'refs/boxes/*' | grep -c .)"
 ck "m4: the MUTANT collapses a shared-key peer to 1 ref ($_n_m4), the fix keeps 2 ($_n_fix4)" \
    "$([ "$_n_m4" -eq 1 ] && [ "$_n_fix4" -eq 2 ] && echo 0 || echo 1)"
+
+# ── §14 THE BOX'S OWN IDENTITY (#3167): `scope global` is NOT a routability test ───────────────
+echo
+echo "── §14 box identity: the routable address, or an honest refusal — never `NR==1` ──"
+# MEASURED 2026-10-31 on every cloud cell — the SAME arrangement on each (`ip -4 -o addr show scope
+# global`), with `ip route show default` naming `eth0`:
+#   3: eth0      inet 169.254.77.2/30  scope global  <-- RFC 3927 link-local, reported `scope global`
+#   4: docker0   inet 172.17.0.1/16    scope global  <-- a bridge, at a LOWER ifindex than the real one
+#   5: eth0.1911 inet 10.238.144.N/20  scope global  <-- THE identity
+# The pre-#3167 body took `NR==1`, committed to line 3, rejected it in the tail guard, and returned 1
+# with line 5 never read — so every cell published NO identity, `cap_publish` refused it by name, and
+# every cell was permanently INELIGIBLE while the Mac (which resolves identity from Darwin `kern.uuid`)
+# was the fleet's only eligible box. These arms drive the SHIPPED `cap_boxid_net` through a stubbed
+# `ip`, so the PREDICATE is graded rather than a re-implementation of it.
+IPB="$TMP/bin-ip"; mkdir -p "$IPB"
+# ⛔ THE STUB HONOURS BOTH OF `ip`'s FILTERS the way real `ip` does (review rounds 6 and 10): a DOWN
+# interface keeps its address in the listing (so `show up` must serve a SMALLER file), and `scope global`
+# must filter too — a query WITHOUT it is served a host-scope listing, so deleting the scope filter from
+# the shipped query cannot look correct here.
+printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *"scope global"*" up"*|*" up"*"scope global"*) cat "%s" ;;\n  *"scope global"*) cat "%s" ;;\n  *) cat "%s" ;;\nesac\n' \
+  "$TMP/iproute.out" "$TMP/ipaddr.up.out" "$TMP/ipaddr.out" "$TMP/ipaddr.host.out" > "$IPB/ip"; chmod +x "$IPB/ip"
+printf '1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n' > "$TMP/ipaddr.host.out"
+# ipfix <egress-dev> <addr-line…> — one fixture for one box. `CAP_BOXID` is cleared in every arm below:
+# the operator seam must not mask the derivation, which is the thing under test.
+# ⛔ EACH ADDR LINE IS EMITTED IN THE PRODUCTION SHAPE, tail included (`\       valid_lft forever
+# preferred_lft forever` — measured on a live cell: NF=13 and `$NF` is `forever`). A fixture without the
+# tail is NF=9 with `$NF=eth0`, so an implementation that reads the LAST field instead of `$4` would be
+# GREEN here and wrong on every real box — review round 1, finding 4.
+# ⛔ AND SO IS THE ROUTE LINE (review round 3, finding 1): a DHCP-configured box prints
+# `default via 10.9.9.1 dev wan0 proto dhcp src 10.9.9.9 metric 100` — the device is NOT the last field,
+# so a `$NF` implementation loses the identity on an ordinary box. The `proto/src/metric` tail is part of
+# the fixture for exactly that reason.
+ipfix() { _d="$1"; shift; printf 'default via 169.254.77.1 dev %s proto dhcp src 169.254.77.2 metric 100\n' "$_d" > "$TMP/iproute.out"
+  : > "$TMP/ipaddr.out"
+  for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done
+  cp "$TMP/ipaddr.out" "$TMP/ipaddr.up.out"; }
+# ipfixdown <addr-line…> — append addresses that `ip … show up` would NOT list (a DOWN interface).
+ipfixdown() { for _l in "$@"; do printf '%s\\       valid_lft forever preferred_lft forever\n' "$_l" >> "$TMP/ipaddr.out"; done; }
+# ipfixr <route-line…> — replace just the ROUTE output (a multipath default is several lines; the address
+# fixture is whatever the previous `ipfix` wrote).
+ipfixr() { printf '%s\n' "$@" > "$TMP/iproute.out"; }
+boxidnet_mod() { _m="$1"; ( . "$_m"; PATH="$IPB:$PATH"; CAP_BOXID=""; cap_boxid_net ) 2>/dev/null; }
+boxidnet() { boxidnet_mod "$CAP"; }
+if [ -r /proc/net/route ]; then
+  # (1) the CELL's measured fixture: link-local FIRST, the docker bridge SECOND, the routable VLAN
+  # child LAST — the exact arrangement `NR==1` died on.
+  ipfix eth0 \
+    '3: eth0    inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0' \
+    '4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0' \
+    '5: eth0.1911    inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  A1="$(boxidnet)"; RC=$?
+  ck "(1) a cell whose FIRST global line is link-local and whose bridge is second resolves to the ROUTABLE one (boxid=$A1)" \
+     "$([ "$RC" -eq 0 ] && [ "$A1" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (2) nothing but link-local => REFUSE, never guess.
+  ipfix eth0 '3: eth0 inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0'
+  A2="$(boxidnet)"; RC=$?
+  ck "(2) a box whose ONLY 'global' address is link-local REFUSES (rc=$RC, boxid=[$A2]) — never a guess" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A2" ] && echo 0 || echo 1)"
+  # (2b) …and a container bridge never names the box, even when it is the only plausible-looking
+  # address on it: a bridge address is the FALSE-ATTRIBUTION direction, which is worse than refusing.
+  ipfix eth0 \
+    '3: eth0 inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0' \
+    '4: docker0 inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0'
+  A2B="$(boxidnet)"; RC=$?
+  ck "(2b) a link-local NIC plus a 172.17.0.1 docker bridge REFUSES rather than adopting the bridge (rc=$RC, boxid=[$A2B])" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A2B" ] && echo 0 || echo 1)"
+  # (3) SEVERAL real addresses => a stable, documented choice, and the SAME one on every run ($C1/$C2)
+  # and whatever order `ip` emitted the lines in ($C3) — a boxid that FLAPS publishes false attribution.
+  ipfix eth0 \
+    '3: eth0 inet 10.1.0.5/24 brd 10.1.0.255 scope global eth0' \
+    '5: eth0.7 inet 10.2.0.7/24 brd 10.2.0.255 scope global eth0.7'
+  A3="$(boxidnet)"; RC=$?
+  A3B="$(boxidnet)"
+  ck "(3) a box with SEVERAL real addresses picks the documented one (lowest ifindex => $A3) and again on the next run ($A3B)" \
+     "$([ "$RC" -eq 0 ] && [ "$A3" = 10.1.0.5 ] && [ "$A3B" = 10.1.0.5 ] && echo 0 || echo 1)"
+  ipfix eth0 \
+    '5: eth0.7 inet 10.2.0.7/24 scope global eth0.7' \
+    '3: eth0 inet 10.1.0.5/24 brd 10.1.0.255 scope global eth0'
+  A3C="$(boxidnet)"; RC=$?
+  ck "  …and the SAME one when \`ip\` lists them in the other order ($A3C) — the answer is a function of the set, not of the output order" \
+     "$([ "$RC" -eq 0 ] && [ "$A3C" = 10.1.0.5 ] && echo 0 || echo 1)"
+  # (3b) THE IFINDEX ORDER DECIDES, NOT THE ADDRESS ORDER (review round 3, finding 4). Here the lower
+  # ifindex holds the HIGHER address, so the documented rule (lowest ifindex) and an octet-only rule
+  # disagree. ⛔ THE IFINDEXES STRADDLE A DIGIT BOUNDARY (9 vs 12) ON PURPOSE (review round 11): the parse
+  # coerces to a number (`i = i + 0`), and without it awk compares "12" < "9" as STRINGS and the rule
+  # inverts — which every single-digit fixture in this section cannot see.
+  ipfix eth0 \
+    '9: eth0 inet 10.2.0.7/24 brd 10.2.0.255 scope global eth0' \
+    '12: eth0.1911 inet 10.1.0.5/24 scope global eth0.1911'
+  A3D="$(boxidnet)"; RC=$?
+  ck "  …and the LOWEST IFINDEX wins even when it holds the numerically HIGHER address ($A3D, not 10.1.0.5) — and across a digit boundary (9 vs 12)" \
+     "$([ "$RC" -eq 0 ] && [ "$A3D" = 10.2.0.7 ] && echo 0 || echo 1)"
+  # (4) no address at all => refuse.
+  ipfix eth0 ''
+  A4="$(boxidnet)"; RC=$?
+  ck "(4) a box with NO address at all REFUSES (rc=$RC, boxid=[$A4])" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A4" ] && echo 0 || echo 1)"
+  # (5) MUTATION CONTROL — the PRE-#3167 body, cited verbatim from the commit this fixes, run on
+  # fixture (1). If this arm ever answers an identity, the arms above stopped discriminating.
+  { cat "$CAP"; cat <<'MUT'
+# MUTANT (m5): the PRE-#3167 Linux arm, verbatim: `NR==1` of `ip -o addr show scope global`.
+cap_boxid_net() {
+  local out ifc ip
+  if command -v ip >/dev/null 2>&1 && [ -r /proc/net/route ]; then
+    out="$(ip -4 -o addr show scope global 2>/dev/null)" || return 1
+    [ -n "$out" ] || return 1
+    ifc="$(printf '%s\n' "$out" | awk 'NR==1{print $2}')"
+    ip="$(printf '%s\n' "$out" | awk 'NR==1{print $4}')"
+    ip="${ip%%/*}"
+  else
+    return 1
+  fi
+  case "$ip" in ''|*[!0-9.]*) return 1 ;; esac
+  case "$ip" in 127.*|169.254.*) return 1 ;; esac
+  printf '%s' "$ip"
+}
+MUT
+  } > "$TMP/cap-nr1.sh"
+  ipfix eth0 \
+    '3: eth0    inet 169.254.77.2/30 brd 169.254.77.3 scope global eth0' \
+    '4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0' \
+    '5: eth0.1911    inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  M5="$(boxidnet_mod "$TMP/cap-nr1.sh")"; RC=$?
+  ck "(5) m5: the PRE-#3167 body yields NO identity on the very fixture (1) answers ($M5, rc=$RC) — arm (1) is RED before this fix" \
+     "$([ "$RC" -eq 1 ] && [ -z "$M5" ] && echo 0 || echo 1)"
+  # (8) CLAUSE 1 IS LOAD-BEARING (review round 1, finding 1). A foreign device with a name the reject
+  # list does NOT name (`br0` — a bridge, or a VPN's `bond0`) is at a LOWER ifindex than the egress
+  # device, and carries the container-network address. Only the egress anchor rejects it; delete clause 1
+  # and this arm returns 172.17.0.1 — the false attribution this whole change exists to prevent.
+  ipfix eth0 \
+    '2: br0 inet 172.17.0.1/16 brd 172.17.255.255 scope global br0' \
+    '3: eth0 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0'
+  A8="$(boxidnet)"; RC=$?
+  ck "(8) a NON-REJECTED-NAME foreign device at a LOWER ifindex is never the identity (got $A8) — the egress anchor is what rejects it" \
+     "$([ "$RC" -eq 0 ] && [ "$A8" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (8b) …and the child test is ANCHORED TO THE PREFIX (review round 10, finding 2): a device whose name
+  # merely CONTAINS the egress name (`fooeth0.9`) is a foreign device, not a VLAN child. Loosening
+  # `index($2, dev ".") != 1` to a substring test published `192.0.2.79` here with the suite green.
+  ipfix eth0 \
+    '3: fooeth0.9 inet 192.0.2.79/24 brd 192.0.2.255 scope global fooeth0.9' \
+    '4: eth0.1911 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  A8B="$(boxidnet)"; RC=$?
+  ck "(8b) a device whose name only CONTAINS the egress name is not a VLAN child ($A8B, not 192.0.2.79)" \
+     "$([ "$RC" -eq 0 ] && [ "$A8B" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (8c) …and the '.' in that anchor is LOAD-BEARING (review round 12): a device named `eth01` STARTS WITH
+  # the egress name, so dropping the dot from the anchor let it pass at a lower ifindex and published its
+  # address — a false attribution — with the suite green. (8b) cannot see this: `fooeth0.9` fails both forms.
+  ipfix eth0 \
+    '3: eth01 inet 192.0.2.79/24 brd 192.0.2.255 scope global eth01' \
+    '5: eth0.1911 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  A8C="$(boxidnet)"; RC=$?
+  ck "(8c) a device that merely STARTS WITH the egress name (\`eth01\`) is not its VLAN child ($A8C, not 192.0.2.79) — the dot is load-bearing" \
+     "$([ "$RC" -eq 0 ] && [ "$A8C" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (20) A BOX WHOSE DEFAULT ROUTE NAMES NO DEVICE IS REFUSED (review round 13). The `[ -n "$dev" ]` guard
+  # is NOT a no-op: with an empty `dev`, clause 1 degenerates to `index($2, ".") != 1`, which a device named
+  # `.foo` PASSES (the kernel accepts such a name) — so without the guard that box publishes a non-egress
+  # address. Measured shape: device `.foo` at a low ifindex, default route present but device-less.
+  ipfix eth0 '3: .foo inet 10.77.0.9/24 brd 10.77.0.255 scope global .foo'
+  ipfixr 'blackhole default'
+  A20="$(boxidnet)"; RC=$?
+  ck "(20) a box whose default route names NO device REFUSES (rc=$RC, boxid=[$A20]) — the empty-egress guard is load-bearing, not a no-op" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A20" ] && echo 0 || echo 1)"
+  # (9) AND CLAUSE 2 IS LOAD-BEARING (same finding). The EGRESS device itself is a tunnel (`wg0`): its
+  # address satisfies the anchor and is routable-looking, so only the name clause refuses it.
+  ipfix wg0 '3: wg0 inet 10.8.0.2/24 peer 10.8.0.1/32 scope global wg0'
+  A9="$(boxidnet)"; RC=$?
+  ck "(9) an egress device that is a TUNNEL refuses rather than adopting its address (rc=$RC, boxid=[$A9])" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A9" ] && echo 0 || echo 1)"
+  # (10) TWO addresses on ONE device (review round 1, finding 2; round 2, finding 1; round 3, finding 3).
+  # (a) a `secondary` address never displaces the address of record. ⛔ THE SECONDARY LINE COMES FIRST
+  #     ON PURPOSE: with the primary first, the `s == bs` guard inside the numeric term already refuses
+  #     the displacement and the `s < bs` clause grades nothing (round 3 measured exactly that).
+  #     ⛔ WHAT THE KERNEL DOES (round 4 corrected three wrong claims that stood here): a plain second
+  #     `ip addr add 10.1.0.9/24 dev eth0` — no keyword, no label — is printed as `scope global
+  #     secondary`; `ip addr add … secondary` is ACCEPTED by iproute2 6.x with a warning and lands the
+  #     same way; and a labelled alias reports `secondary: true, label: 'eth0:1'` in `ip -j addr show`.
+  #     So the flag is a real shape, and this fixture is in that shape (the label trails, `$2` is the
+  #     device).
+  ipfix eth0 \
+    '3: eth0 inet 10.9.9.9/24 brd 10.9.9.255 scope global secondary eth0:1' \
+    '3: eth0 inet 192.168.7.5/24 brd 192.168.7.255 scope global eth0'
+  A10="$(boxidnet)"; RC=$?
+  # (b) …and the tie-break among candidates that are equal in BOTH ifindex and secondary-ness is
+  #     NUMERIC. THREE addresses, chosen so that every wrong rule gives a DIFFERENT answer from the octet
+  #     rule (review round 6, finding 1 measured that two addresses could not: with the lowest one first,
+  #     "first wins" — the numeric term deleted — agrees with the octet answer, so the term's EXISTENCE
+  #     was ungraded; with the lowest one last, "last wins" agreed instead):
+  #        octets    ⇒ 10.9.9.10   (the numeric minimum)
+  #        string    ⇒ 10.9.10.9   ("10.9.10.9" < "10.9.9.10")
+  #        first-wins (no numeric term) ⇒ 10.9.10.9
+  #        last-wins                    ⇒ 10.9.9.11
+  ipfix eth0 \
+    '3: eth0 inet 10.9.10.9/24 brd 10.9.10.255 scope global eth0' \
+    '3: eth0 inet 10.9.9.10/24 brd 10.9.9.255 scope global eth0' \
+    '3: eth0 inet 10.9.9.11/24 brd 10.9.9.255 scope global eth0'
+  A10B="$(boxidnet)"
+  ck "(10) a secondary never displaces the primary ($A10), and the tie-break is NUMERIC — octets give .9.10, a string compare gives .10.9 ($A10B)" \
+     "$([ "$RC" -eq 0 ] && [ "$A10" = 192.168.7.5 ] && [ "$A10B" = 10.9.9.10 ] && echo 0 || echo 1)"
+  # (13) THE ROUTE LINE IS NOT ALWAYS ONE LINE (review round 5, finding 3): a multipath default dumps a
+  # bare `default` record first and the devices only on the `nexthop` lines after it. A `NR==1` parse
+  # therefore refuses on such a box (fail-closed, but a silent eligibility loss the comment at
+  # capacity.sh:398-400 presents as handled) — round 5 measured it 211/0 green.
+  ipfix eth0 '3: eth0 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0'
+  ipfixr 'default proto static' '\tnexthop via 169.254.77.1 dev eth0 weight 1' '\tnexthop via 169.254.77.1 dev eth9 weight 1'
+  A13="$(boxidnet)"; RC=$?
+  # …and several main-table defaults at different metrics: the FIRST (lowest metric, iproute2's own order).
+  ipfix eth0 '3: eth0 inet 10.238.144.2/20 scope global eth0' '4: eth9 inet 10.9.9.9/24 scope global eth9'
+  ipfixr 'default via 169.254.77.1 dev eth0 proto dhcp src 169.254.77.2 metric 100' 'default via 169.254.77.1 dev eth9 metric 200'
+  A13B="$(boxidnet)"; RC2=$?
+  ck "(13) a MULTIPATH default (bare first line, devices on the nexthop lines) still yields the egress device's address ($A13), and several defaults use the lowest metric ($A13B)" \
+     "$([ "$RC" -eq 0 ] && [ "$A13" = 10.238.144.2 ] && [ "$RC2" -eq 0 ] && [ "$A13B" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (14) A DOWN INTERFACE IS NOT A PEER-REACHABLE ADDRESS (review round 6, finding 2). The dead VLAN holds
+  # its stale address at a LOWER ifindex and passes every other clause, so only the `up` filter rejects it.
+  ipfix eth0 '5: eth0.1911 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  ipfixdown '4: eth0.100 inet 192.168.99.7/24 brd 192.168.99.255 scope global eth0.100'
+  A14="$(boxidnet)"; RC=$?
+  ck "(14) an address on a DOWN interface is never the identity ($A14 — the dead VLAN is at a LOWER ifindex)" \
+     "$([ "$RC" -eq 0 ] && [ "$A14" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (15) AN EGRESS-CARRYING PSEUDO/CONTAINER/TUNNEL DEVICE: clause 1 accepts the egress device by
+  # definition, so the name deny-list is the ONLY filter that can refuse — and each round of review found
+  # entries that were individually ungraded, i.e. that deleting one was silent (round 7: five of six new
+  # entries; round 8: `docker` and `br-`, whose measured consequence is that a docker host with
+  # `default via … dev docker0` publishes `172.17.0.1` as its identity). So EVERY entry in the list is fed
+  # here, in the POINTOPOINT shape real `ip` prints for the tunnels (`inet X peer Y/32` — no `brd`).
+  A15BAD=""
+  for _tn in lo docker0 br-1a2b3c4d veth0 virbr0 podman0 vxlan0 cni0 flannel.1 cali1 kube-ipvs0 \
+             tun0 tap0 wg0 zt0 tailscale0 utun3 ppp0 gre1 ipip0 sit0 wwan0 rmnet0 dummy0 lxcbr0; do
+    ipfix "$_tn" "2: $_tn inet 10.8.0.2/24 peer 10.8.0.1/32 scope global $_tn"
+    _tv="$(boxidnet)"; _trc=$?
+    { [ "$_trc" -eq 1 ] && [ -z "$_tv" ]; } || A15BAD="$A15BAD $_tn=[$_tv]"
+  done
+  ck "(15) EVERY entry in the deny list refuses as an EGRESS device rather than adopting its address (25 names: lo, docker0, br-, veth, virbr, podman, vxlan, cni, flannel, cali, kube, tun, tap, wg, zt, tailscale, utun, ppp, gre, ipip, sit, wwan, rmnet, dummy, lxc)${A15BAD:+ — FAILED:}$A15BAD" \
+     "$([ -z "$A15BAD" ] && echo 0 || echo 1)"
+  # each is addable on this kernel and each appears in `ip -4 -o addr show scope global` (measured under
+  # `unshare -rn`), so a clause that drops one publishes an address no peer can use as an identity.
+  # ⛔ BOTH HALVES OF THE RESERVED RANGE ARE FED: `224.0.0.7` only exercises `22[4-9]\.` (224-229), so
+  # round 4 measured that dropping `2[3-5][0-9]\.` (230-255) stayed green while the mutant published
+  # `239.0.0.1`. `239.0.0.1` is in 224/4 (multicast) and is that alternative's own slice.
+  ipfix eth0 '3: eth0 inet 0.9.9.9/24 scope global eth0'
+  A11="$(boxidnet)"; RC=$?
+  ipfix eth0 '3: eth0 inet 224.0.0.7/24 scope global eth0'
+  A11B="$(boxidnet)"; RC2=$?
+  ipfix eth0 '3: eth0 inet 239.0.0.1/24 scope global eth0'
+  A11C="$(boxidnet)"; RC3=$?
+  ck "(11) unspecified (0/8) and BOTH halves of the reserved range (224-229, 230-255) REFUSE rather than being published ([$A11] rc=$RC, [$A11B] rc=$RC2, [$A11C] rc=$RC3)" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A11" ] && [ "$RC2" -eq 1 ] && [ -z "$A11B" ] && [ "$RC3" -eq 1 ] && [ -z "$A11C" ] && echo 0 || echo 1)"
+else
+  # ⛔ THE LIST IS DERIVED, NOT TYPED (review round 14): it went stale twice as arms were added inside the
+  # Linux-only branch, so a reader was told (14), (15) and (20) ran on macOS when they had not.
+  SKIPLIST="$(awk '
+    /^if \[ -r \/proc\/net\/route \]; then/ { f=1; next }
+    f && /^else$/ { exit }
+    f && /ck "/ {
+      if (match($0, /\([0-9]+[a-z]?\)/)) { t = substr($0, RSTART, RLENGTH); if (!(t in seen)) { seen[t]=1; printf "%s ", t } }
+    }' "$0" 2>/dev/null)"
+  [ -n "$SKIPLIST" ] || SKIPLIST="(1)-(5) (8)-(11) (13)-(15) (20)"
+  echo "  ⏭ §14 ${SKIPLIST}SKIPPED: this platform has no /proc/net/route, so the LINUX arm of cap_boxid_net"
+  echo "    is unreachable here. Arm (12) — the DARWIN arm, the one this platform actually uses — runs below."
+fi
+# (12) THE DARWIN ARM (review round 5, finding 2: it used to sit INSIDE the Linux-only branch, so the
+# branch a Mac actually uses was ungraded ON the Mac). It needs no procfs: it is reached the way a Mac
+# reaches it, by there being no `ip` on PATH, so it runs on both platforms.
+DAB="$TMP/bin-darwin"; mkdir -p "$DAB"
+printf '#!/bin/sh\necho "  interface: eth9"\n' > "$DAB/route"
+printf '#!/bin/sh\necho cmux\n' > "$DAB/hostname"
+printf '#!/bin/sh\necho Linux\n' > "$DAB/uname"
+chmod +x "$DAB/route" "$DAB/hostname" "$DAB/uname"
+[ -e "$DAB/awk" ] || ln -s "$(command -v awk)" "$DAB/awk" 2>/dev/null || true
+# ⛔ the ifconfig stub BAKES its answer in: an exported variable would not survive the restricted PATH.
+da_ifconfig() { printf '#!/bin/sh\nprintf "\\tinet %s netmask 0xffff0000\\n"\n' "$1" > "$DAB/ifconfig"; chmod +x "$DAB/ifconfig"; }
+boxidnet_darwin() ( da_ifconfig "$1"; PATH="$DAB"; CAP_BOXID=""; . "$CAP"; cap_boxid_net ) 2>/dev/null
+A12="$(boxidnet_darwin 10.238.144.2)"; RC=$?
+A12B="$(boxidnet_darwin 169.254.7.7)"; RC2=$?
+# ⛔ AND THE LOOPBACK BRANCH OF THE SAME GUARD (review round 11): the Darwin path has no `scope global`
+# filter at all, so `127/8` rejection there rests ENTIRELY on that `case` — ungraded until now.
+A12C="$(boxidnet_darwin 127.0.0.1)"; RC3=$?
+ck "(12) the Darwin arm (no \`ip\` on PATH — runs on macOS too) answers its interface address ($A12), REFUSES a link-local one (rc=$RC2, boxid=[$A12B]) and REFUSES a loopback one (rc=$RC3, boxid=[$A12C])" \
+   "$([ "$RC" -eq 0 ] && [ "$A12" = 10.238.144.2 ] && [ "$RC2" -eq 1 ] && [ -z "$A12B" ] && [ "$RC3" -eq 1 ] && [ -z "$A12C" ] && echo 0 || echo 1)"
+# (21) A MALFORMED `ifconfig` SHAPE IS REFUSED, not adopted (review round 13): net-tools/BusyBox print
+# `inet addr:10.1.2.3`, so `awk '{print $2}'` yields `addr:10.1.2.3` — a NON-ADDRESS string. The tail
+# guard's `*[!0-9.]*` arm is the only thing refusing it, so it is graded here.
+A21="$(boxidnet_darwin 'addr:10.1.2.3')"; RC=$?
+# ⛔ AND AN ADDRESS THAT IS ENTIRELY ABSENT (review round 14): an IPv6-only interface prints no `inet` line,
+# so `awk` yields the EMPTY string and only the tail case's `''` branch refuses it. Measured: with that
+# branch dropped the function returns 0 with an empty boxid — a successful "publish" of nothing.
+da_noinet() { printf '#!/bin/sh\nprintf "\\tinet6 fe80::1%%en0 prefixlen 64\\n"\n' > "$DAB/ifconfig"; chmod +x "$DAB/ifconfig"; }
+A21B="$( da_noinet; PATH="$DAB"; CAP_BOXID=""; . "$CAP"; cap_boxid_net 2>/dev/null )"; RC4=$?
+ck "(21) a NON-ADDRESS token (addr:10.1.2.3) REFUSES (rc=$RC, boxid=[$A21]) and so does an ABSENT one (IPv6-only interface: rc=$RC4, boxid=[$A21B])" \
+   "$([ "$RC" -eq 1 ] && [ -z "$A21" ] && [ "$RC4" -eq 1 ] && [ -z "$A21B" ] && echo 0 || echo 1)"
+# (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
+# controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
+# reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
+ck "(6) the controller REALLY CALLS the logging publish (not a local re-implementation, and not the silent form)" \
+   "$(grep -qF -- 'cap_publish_logged "$REPO" "$CAP_REC" "$LOG" "$CAP_NS"' "$LOOP" && echo 0 || echo 1)"
+# (16)-(18) THE DIAGNOSTIC IS GRADED AS BEHAVIOUR (review round 9, finding 1). Text greps for fragments
+# were the defect: the reason PARSING could be neutered (`why=unknown` for a real `no-box-identity`), the
+# field could be read as `$NF` (a push refusal then reports the ref as the reason), and the block's
+# POLARITY could be flipped (`&&`), all with the suite green. So the shipped `cap_publish_logged` is driven
+# against a local bare origin instead.
+O16="$TMP/origin-log.git"; W16="$TMP/work-log"
+( git init -q --bare "$O16" && git init -q "$W16" && cd "$W16" && git config user.email t@t \
+  && git config user.name t && git commit -q --allow-empty -m init && git remote add origin "$O16" \
+  && git push -q origin HEAD:main ) >/dev/null 2>&1
+LOGL="$TMP/cap-log.txt"
+VALID="host=cmux ncpu=4 load1=56 lpc=14 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=$NOW procs=400 procs_max=15641 fork=1 boot=$A_BOOT"
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log1" cap_publish_logged "$W16" "$VALID" "$LOGL" refs/boxes || RC=$?
+L16="$(cat "$LOGL" 2>/dev/null)"
+ck "(16) a refused publish (no boxid) returns 1 and its log line NAMES the reason — why=no-box-identity, plus the CAP_BOXID seam (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && qF 'why=no-box-identity' "$L16" && qF 'the operator seam is CAP_BOXID' "$L16" && echo 0 || echo 1)"
+# an invalid record (a valid boxid, but `fork=` is not a number) — a DIFFERENT reason, so the remedy must
+# NOT be offered (pointing the operator at a boxid that is already right is a misdiagnosis).
+L16REC="host=cmux ncpu=4 load1=56 lpc=14 lanes=0 disk_free_mb=120000 mem_free_mb=14000 at=$NOW procs=400 procs_max=15641 fork=x boot=$A_BOOT boxid=10.238.144.2"
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log3" cap_publish_logged "$W16" "$L16REC" "$LOGL" refs/boxes || RC=$?
+L17="$(cat "$LOGL" 2>/dev/null)"
+ck "(17) a DIFFERENT refusal reason is named (why=invalid-record) and the CAP_BOXID remedy is NOT offered (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && qF 'why=invalid-record' "$L17" && ! qF 'the operator seam is CAP_BOXID' "$L17" && echo 0 || echo 1)"
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log4" cap_publish_logged "$W16" "$VALID boxid=10.238.144.2" "$LOGL" refs/boxes || RC=$?
+ck "(18) a SUCCESSFUL publish returns 0 and writes NO refusal line (rc=$RC, log bytes=$(wc -c < "$LOGL" | tr -d ' ')) — the polarity cannot be inverted silently" \
+   "$([ "$RC" -eq 0 ] && [ ! -s "$LOGL" ] && echo 0 || echo 1)"
+# (19) A PUSH FAILURE carries MORE on the line (`publish=failed why=push-refused ref=refs/boxes/...`), so
+# the reason must be read FIELD-ANCHORED: `$NF` would report the ref as the reason (review round 9).
+W17="$TMP/work-log-bad"; git init -q "$W17"; ( cd "$W17" && git config user.email t@t && git config user.name t \
+  && git commit -q --allow-empty -m init && git remote add origin "$TMP/does-not-exist.git" ) >/dev/null 2>&1
+: > "$LOGL"
+RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log5" cap_publish_logged "$W17" "$VALID boxid=10.238.144.2" "$LOGL" refs/boxes || RC=$?
+L19="$(cat "$LOGL" 2>/dev/null)"
+ck "(19) a PUSH failure is reported as why=push-refused — the ref on the line does NOT become the reason (rc=$RC)" \
+   "$([ "$RC" -eq 1 ] && qF '— why=push-refused boxid=' "$L19" && ! qF '— why=push-refused ref=' "$L19" && echo 0 || echo 1)"
+# (22) AN UNPARSEABLE refusal still names a reason (review round 13): `cap_publish` failing WITHOUT
+# printing a `publish=refused|failed` line must log `why=unknown`, never an empty token — the whole point
+# of this PR is that a refusal must never be silent-or-blank.
+: > "$LOGL"
+L22="$( CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log6" bash -c '
+  . "$1"
+  cap_publish() { return 1; }
+  cap_publish_logged "$2" "$3" "$4" refs/boxes; echo "rc=$?"' _ "$CAP" "$W16" "$VALID boxid=10.238.144.2" "$LOGL" 2>&1 )"
+ck "(22) a refusal that prints NO parsable line still logs why=unknown ($(grep -o 'why=[^ ]*' "$LOGL" | head -1)) — never a blank reason" \
+   "$( { grep -q 'rc=1' <<<"$L22" && grep -q 'why=unknown' "$LOGL" && ! grep -q 'why= ' "$LOGL"; } && echo 0 || echo 1)"
+# (7) THE MAC CANNOT BE AFFECTED. A Darwin box resolves its identity from `kern.uuid` FIRST
+# (`cap_boxid_auto` source 1), so it never reaches the Linux arm this fix changes. That precedence is
+# the property, not a comment: asserted here so a future edit that reorders the sources — or that makes
+# the net arm authoritative — goes red on the box the fleet depends on today.
+macbid() ( . "$CAP"; cap_hw_uuid() { printf '8e93de39-C0FFEE-11EE-9E93-8E93DE39AAAA'; }
+  cap_boxid_net() { printf '10.238.144.2'; }
+  CAP_BOXID=""; cap_boxid_auto )
+MACBID="$(macbid 2>/dev/null)"; RC=$?
+ck "(7) a box with a hardware uuid keeps THAT identity and never consults the net derivation (mac unchanged: $MACBID)" \
+   "$([ "$RC" -eq 0 ] && [ "$MACBID" = '8e93de39-C0FFEE-11EE-9E93-8E93DE39AAAA' ] && echo 0 || echo 1)"
+
 
 echo
 echo "───────────────────────────────────────────────────────────────────────────────"
