@@ -97,9 +97,10 @@
 # possibly help and which diagnosis is true:
 #   - `state != open` AND no merge commit — nothing to validate. Checked before
 #     `mergeable`, and AFTER the sha check, because a MERGED PR is state=closed and DOES
-#     carry a merge commit that gets validated. (`edited` is in this workflow's trigger
-#     set, so editing a CLOSED PR's body runs the leg; for such a PR `mergeable` stays
-#     null forever and a retry is pointless.)
+#     carry a merge commit that gets validated. Nothing in the CURRENT trigger set fires for
+#     a closed PR (`edited` used to, and was removed — see the trigger block below), so this
+#     branch is now a guard rather than a live path: it is kept because the sha check runs
+#     first and a merged PR's commit must still be validated rather than reported as absent.
 #   - `mergeable == false` — GitHub FINISHED and concluded the trees cannot merge.
 #     Retrying cannot change that, so it is reported at once as a real CONFLICT.
 #   - otherwise — no merge commit, and no confirmed conflict. Reported as UNRESOLVED,
@@ -133,9 +134,50 @@
 
 name: Workflow lock (base-branch checker)
 
+# WHY `edited` IS NOT IN `types` (agent-infra#3196). It was, and it cost a full run per
+# recorded review: `scripts/record-review.sh` writes the reviewer attestation INTO THE PR BODY,
+# so every `[3/4] record` step that APPENDS the marker is a body edit — a run for a diff that did not change.
+# Measured 2026-11-01: this workflow's median wall clock was 16.1 min (max 24.5) for ~9 s of
+# work, and a 9 s job that waits 16 min IS a 16 min job; `pipeline-compliance`, the repo's only
+# required context, queues behind it.
+#
+# WHAT THE REMAINING THREE TYPES COVER. `opened`, `synchronize` and `reopened` are every activity
+# that can change the HEAD, and they are also GitHub's own defaults for this event — so this list is
+# the default in explicit form rather than a narrowing: a value that stops running for a head it
+# should have measured is not something to write implicitly. GitHub's definition of the activity
+# `edited` is a DISJUNCTION — "the title or body of a pull request was edited, OR the base branch of a
+# pull request was changed". The first disjunct cannot change the merge result this job validates and
+# is the cost #3196 removes; the second one CAN change the DIFF, and it is the declared residual in
+# the next paragraph rather than something this sentence claims to cover. Quoting only the second
+# disjunct would have made `edited` read as pure diff coverage, which is the opposite of the case.
+#
+# ⛔ THE DECISION ON THE BASE-BRANCH CASE, AND WHY IT IS NOT A `schedule:` SWEEP. `edited` also
+# fires when a PR's BASE is retargeted, and a base move changes the merge result this job
+# validates. Weighed, and not keepable: (a) the residual is ALREADY declared above — "NOT A
+# GUARANTEE ABOUT WHAT EVENTUALLY LANDS … the validated commit is no longer the one a merge
+# would produce, and nothing re-runs this leg until the next pull_request_target event" — a base
+# ADVANCE already has exactly this property today, so dropping `edited` extends an accepted
+# residual to one more rare event (a manual retarget) rather than introducing a new one; (b) a
+# `schedule:` leg CANNOT restore it. A scheduled workflow's OWN run belongs to the default branch
+# (GitHub docs, "Events that trigger workflows": GITHUB_SHA is "Last commit on default branch",
+# GITHUB_REF "Default branch"), so the check THAT TRIGGER produces attaches to `main`, never to a PR
+# head. Re-establishing a per-PR verdict from a schedule would therefore not be this leg at all: it
+# would have to compute every open PR's merge result itself and POST a check run per head
+# (`checks: write`, a new permission on a privileged workflow) — a NEW INSTRUMENT, not a trigger
+# swap — and it would still fire up to 24 h late on a retarget while a failure in it reddened main
+# and blocked every PR through the rail's base-vs-PR comparison. That is a step-2-sized change with
+# a fleet-wide blast radius, not a way to keep one trigger type.
+#
+# ⛔ AND THE OTHER HALF OF THE COST — `scripts/admin-merge.sh`'s #1417 wait — STILL HOLDS. The
+# rail's `[3/4] record` body PATCH still creates `pipeline-compliance`'s `edited` run (that file
+# is untouched by design: it is the required context), and `settle_self_edit_generation` requires
+# every guard workflow observed at the head. This workflow's leg is observed from the run its
+# push created, which is terminal by then and satisfies completeness (a terminal leg is an
+# observed leg). Dropping `edited` here removes runs from that surface; it never adds one, and
+# the "nothing unfinished is ours" path falls through to §1b's unchanged decision.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
 
 # NO `concurrency:` BLOCK, DELIBERATELY (#2474). A per-PR group here cannot tell a
 # head from its successor: the key is the PR, not the sha, so a `gh run rerun` of a
@@ -199,10 +241,11 @@ jobs:
           # they decide BOTH whether retrying can help and which diagnosis is true:
           #   state != open      -> nothing to validate, UNLESS a merge commit is present
           #                         (a MERGED PR is state=closed and does carry one, so the
-          #                         sha check above runs first and it IS validated). Checked
-          #                         before `mergeable` because `edited` is in the trigger
-          #                         set, so editing a CLOSED PR's body runs this leg, and
-          #                         for it mergeable stays null forever.
+          #                         sha check above runs first and it IS validated). No declared
+          #                         activity type fires for a closed PR since `edited` was
+          #                         removed (see the trigger block above), so this is a guard
+          #                         now, not a live path — kept so a merged PR's commit is
+          #                         validated rather than reported as absent.
           #   mergeable == false -> GitHub has FINISHED and concluded the trees cannot
           #                         merge. Retrying cannot change that, so it is reported
           #                         at once as a real conflict.

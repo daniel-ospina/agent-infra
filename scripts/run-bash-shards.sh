@@ -54,6 +54,9 @@
 #   - Exits 1 if any shard failed, 0 otherwise — and NAMES each failing shard (a bare
 #     "N bash shard(s) failed" was unattributable: a syntax error in one suite read as a
 #     whole-list failure with no name).
+#   - An INTERRUPTED run (TERM/INT) still prints that recap from what it accumulated, prefixed
+#     `⚠️ RECAP INCOMPLETE (k/n shards ran)`, and exits 1: a truncated run is UNPROVEN, never
+#     green, and never a baseline (agent-infra#3174 — see shard_partial_recap).
 #   - Hermetic: every suite builds its own temp repos/HOME/shims and touches no real state.
 #   - `--list` prints the DERIVED shard list (DERIVATION above), `--list-sweeps` the syntax-sweep
 #     globs. Both print the lists this script EXECUTES, from one source each (SUITE_GLOBS + each
@@ -66,6 +69,18 @@
 #   bash scripts/run-bash-shards.sh --list-sweeps   # print the syntax-sweep globs, run nothing
 #
 #   BASH_SHARD_SLICE=<i>/<n> bash scripts/run-bash-shards.sh   # run ONE slice of the list
+#   BASH_SHARDS_BUDGET_SECS=<secs> bash scripts/run-bash-shards.sh  # name an overrun of the bound
+#
+# ENVIRONMENT CONTRACT (complete — a caller that sets anything else changes nothing here):
+#   BASH_SHARD_SLICE      <i>/<n> — run only slice i of n. Slicing is a MATRIX concern (below).
+#   BASH_SHARDS_BUDGET_SECS  whole seconds; the runner's OWN deadline for the shard WORK it measures
+#                         (`shard_time`, the sum of the per-suite `▸` rows — NOT step wall clock).
+#                         Unset = no deadline; `0` = no deadline; set-but-EMPTY is REFUSED (rc 2),
+#                         since an unset CI variable expands to empty and silently running with no
+#                         deadline is the fail-open; non-numeric refused (rc 2). A POSITIVE value may
+#                         NOT be combined with BASH_SHARD_SLICE (rc 2) — the two do not compose.
+#                         On crossing it the runner prints a NAMED overrun verdict and EXITS 1, so an
+#                         overrun can never be read as a suite failure (see shard_budget_trip).
 #
 # SLICING — why it is an ENV VAR and not an argument (#2055 follow-up; the `bash-suites`
 # duration defect). Slicing exists because the JOB's DURATION, not runner capacity, was the
@@ -282,6 +297,55 @@ fi
 # Default: no slice (run the whole list) — the behaviour every existing caller keeps.
 slice_index=-1
 slice_count=0
+# ── THE WALL BUDGET, AND WHY IT IS A NAMED VERDICT (agent-infra#3174) ──────────────────────────
+# The step's `timeout-minutes` is the PLATFORM's kill: it is `failure`, and its log says only
+# "exceeded the maximum execution time of N minutes". A shard that FAILED also produces `failure`.
+# So before this, the two reds this step can produce — a suite failed, or the DERIVED LIST outran
+# the bound — were one red with no distinguishing line. Measured 2026-10-31 (main, run
+# 41240886978 — an `integration/batch-20261031-10` pre-merge gate, whose list is 147 = main's
+# today): 147 listed suites summing 6468 s of shard work against a 6600 s (110 min) step
+# bound — a 132 s margin, 98 % of the bound — so the overrun arm was one suite away.
+#
+# `BASH_SHARDS_BUDGET_SECS` (set by the CALLING STEP, never guessed here) is the runner's OWN
+# deadline, deliberately BELOW that step bound, so the runner reaches this verdict and prints
+# WHICH defect it is before the platform kills the step opaquely:
+#   ❌ SHARD BUDGET EXCEEDED …  → capacity: the list outran the bound (NOT a suite failure)
+#   ❌ failing shard(s): …      → a real suite failure, named, with its `::error::` annotation
+# Both still exit 1. ⛔ The budget verdict deliberately emits NO `::error::` annotation: an
+# annotation becomes a guard-step identity the merge rail can COMPARE against main and EXEMPT
+# (scripts/ci_exemption.py, `guard_step_failures`), and a systemic overrun exists on main too — so
+# annotating it would turn "the bound is under-derived" into a PR-exempt failure. Prose keeps it
+# unattributable, and unattributable is fail-CLOSED, the correct direction here.
+# 0 / unset = no budget (the behaviour every pre-existing caller keeps).
+shard_budget=0
+# ⛔ `set` AND empty is REFUSED (review cycle 2, #3174): an unset CI variable expands to the empty
+# string, and treating that as "0 = no deadline" would be a fail-open dressed as the documented
+# default — the step would run with no deadline while its comment claims a non-numeric value is
+# refused. `+set` distinguishes "absent" from "present and empty"; only ABSENT means no deadline.
+case "${BASH_SHARDS_BUDGET_SECS+set}" in
+  "") : ;;
+  *)  [ -n "${BASH_SHARDS_BUDGET_SECS}" ] || {
+        echo "❌ BASH_SHARDS_BUDGET_SECS is SET but EMPTY — that is a missing value, not 'no deadline'. Unset it, or give it whole seconds (0 = no deadline).";
+        exit 2; } ;;
+esac
+if [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ]; then
+  case "$BASH_SHARDS_BUDGET_SECS" in
+    *[!0-9]*) echo "❌ BASH_SHARDS_BUDGET_SECS='$BASH_SHARDS_BUDGET_SECS' is not a whole number of seconds"; exit 2 ;;
+  esac
+  shard_budget=$((10#$BASH_SHARDS_BUDGET_SECS))
+  # ⛔ A BUDGET AND A SLICE DO NOT COMPOSE (review finding, #3174). `shard_time` accumulates only the
+  # shards THIS process ran, so a sliced caller would compare a ~1/N share against a WHOLE-LIST
+  # budget — a deadline ~N times too lenient, with no error, i.e. fail-open for any future caller that
+  # sets both. Refuse the pair rather than silently weakening the deadline; a slice's share would have
+  # to be derived from a measured whole-list figure, and no caller needs that today.
+  # ⛔ …BUT `0` IS NOT A BUDGET (review finding, #3174). `0` is the documented "no deadline" spelling,
+  # so there is no share to compare and nothing to weaken — refusing it refused a documented no-op
+  # spelling, i.e. a false block (category B). Only a POSITIVE budget composes badly with a slice.
+  if [ "$shard_budget" -gt 0 ] && [ -n "${BASH_SHARD_SLICE:-}" ]; then
+    echo "❌ BASH_SHARDS_BUDGET_SECS=$shard_budget cannot be combined with BASH_SHARD_SLICE — this process only accumulates the shards its own slice ran, so a whole-list budget would be ~N times too lenient. Set one or the other."
+    exit 2
+  fi
+fi
 if [ -n "${BASH_SHARD_SLICE:-}" ]; then
   case "$BASH_SHARD_SLICE" in
     *[!0-9/]*) echo "❌ BASH_SHARD_SLICE='$BASH_SHARD_SLICE' is not <index>/<count>"; exit 2 ;;
@@ -431,6 +495,44 @@ slice_skips() {
 shard_named_failure() { shard_failed_list="${shard_failed_list}${shard_failed_list:+, }$1"; printf '❌ FAILED SHARD: %s\n' "$1"; }
 shard_record_failure() { [ "$shard_is_listed" = 1 ] || return 0; shard_named_failure "$1"; }
 
+# shard_budget_trip <what-is-being-started> — the NAMED overrun verdict, checked BEFORE each shard
+# so it fires while there is budget left to say why.
+# ⛔ THE QUANTITY IS `shard_time`, NOT `$SECONDS`, and the distinction is the whole measurement: the
+# 6468 s figure this bound was sized from is the SUM OF THE PER-SUITE ROWS (`▸ <secs> <path>`), i.e.
+# shard work, not step wall (the same run's shard STEP took 6469 s; the whole JOB took 6493 s, the
+# difference being checkout/setup and the three steps ahead of it). Comparing the budget against the
+# same quantity it was measured on keeps the arithmetic honest — and it is why the residue between
+# 6468 and 6469 is ~1 s, not the 25 s a first draft of this comment claimed.
+# It also draws the line between the two defects a step bound has to survive: a single HUNG suite
+# moves `$SECONDS` but barely moves `shard_time` (it has not returned yet), so a hang is still caught
+# by the platform's `timeout-minutes` — opaque but red — while the LIST outgrowing its bound is what
+# this verdict names. Exits 1: an overrun is RED, and the shards the run does NOT reach are NAMED
+# below, so the shortfall can never be mistaken for a suite failure.
+shard_budget_trip() {
+  [ "$shard_budget" -gt 0 ] || return 0
+  [ "$shard_time" -ge "$shard_budget" ] || return 0
+  echo "❌ SHARD BUDGET EXCEEDED — the DERIVED LIST outran the step's bound, and this is NOT a suite failure: ${shard_time}s of shard work against BASH_SHARDS_BUDGET_SECS=${shard_budget}s, before starting '$1'. Ran $shard_ran of $listed listed shard(s) (slowest ${shard_slowest_secs}s${shard_slowest:+ ($shard_slowest)}). Fix it with CAPACITY — add matrix slices (ci.yml's bash-suites), split the slowest suite — never by widening this number to whatever the run happened to take."
+  # ⛔ GATED ON THE COUNT, AND THE NAME IS OPTIONAL (review finding, #3174). `shard_failed_list` is
+  # the NAMES and `shard_errors` is the COUNT — two different quantities, which is why the recap
+  # below can report a failure that was counted and NOT named. Gating this line on the name list
+  # would let a broken naming arm print "NOT a suite failure" over a run that did fail one, i.e. this
+  # verdict would absorb the very failure it disclaims. The count decides; the name is reported when
+  # there is one and declared MISSING when there is not.
+  if [ "$shard_errors" -gt 0 ]; then
+    echo "❌ …and $shard_errors shard(s) failed INDEPENDENTLY of the overrun: ${shard_failed_list:-(counted, NONE named — the naming arm did not run for them, which is a defect in this runner)}"
+  fi
+  # ⛔ A SHORT COUNT IS NOT A SHORT LIST (#3079 applied to THIS exit). The trip stops the run, so the
+  # `executed + skipped == listed` accounting below never executes — and on the run this feature
+  # targets that is precisely the information a reader needs. Name the shards that will not run
+  # rather than leaving them as the difference between two numbers.
+  if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
+    _left="$(shard_unaccounted)"
+    echo "❌ NOT RUN — $(shard_count_lines "$_left") of $listed listed shard(s) will not be attempted because the budget was already spent:"
+    while IFS= read -r _u; do [ -n "$_u" ] && printf '   ⏭  NOT RUN: %s\n' "$_u"; done <<<"$_left"
+  fi
+  exit 1
+}
+
 # shard_note <path> <seconds> — the per-shard timing row, and the running total/slowest. Separate
 # from run_shard so the execution line stays one readable statement-chain (the mutation pins replace
 # that whole line; everything they must disable has to live on it).
@@ -483,6 +585,76 @@ swept=0
 sweep_errors=0
 sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && { sweep_errors=$((sweep_errors + 1)); [ "${sweep_name:-1}" = 1 ] && shard_named_failure "$1"; }; }
 
+# ── THE PARTIAL RECAP — an INTERRUPTED run still names what it saw, and says it is INCOMPLETE ──
+# (agent-infra#3174)
+#
+# THE DEFECT. On 2026-10-31 main's `script-validate` job was killed mid-run (run `41217287437`:
+# the shard step was terminated after 111 minutes) and a KILLED step printed NO recap at all. So the
+# only thing the fleet's merge decisions read — the set of shards red on `main`, which every batch
+# verdict subtracts — was produced by a job whose answer silently SHRANK as the job got slower.
+# Measured across three consecutive main runs: 13 / 11 / 10 failing shards named, with nothing
+# fixed in between. Under-reporting the reference set is not cosmetic: a shard genuinely red on
+# `main` drops out of the baseline, then reappears as "a new failure caused by the batch" and gets a
+# constituent dropped or reverted on a FALSE signal — and, read as an improvement, it also HIDES the
+# failures that were real.
+#
+# THREE PARTS, and the second is the point:
+#   1. A TERM/INT trap emits the same `❌ failing shard(s): …` recap the normal exit emits, from
+#      everything accumulated so far, so an interrupted run still NAMES its failures.
+#   2. The interrupted recap is VISIBLY INCOMPLETE — `⚠️ RECAP INCOMPLETE (k/n shards ran)` — because
+#      a partial recap that LOOKS full is worse than no recap: it is exactly the false-PASS shape
+#      this file exists to refuse. The marker is the machine-readable half (scripts/ci_exemption.py
+#      detects it, and scripts/ci-failure-set.sh refuses to fold such a run into the baseline).
+#   3. The exit code stays 1. An interrupted run proves nothing about the shards it never reached, so
+#      it must never read GREEN — a killed step that exits 0 would certify a hole.
+#
+# ⛔ `shard_errors` is NOT "the whole failure set": it counts what had failed BEFORE the signal. The
+# handler therefore never prints a bare "0 failed" as if it were a clean result — with nothing
+# failed yet it says NOTHING IS PROVEN, out loud, because the dangerous reading of a truncated run is
+# "fewer failures = an improvement".
+#
+# ⛔ BASH DEFERS THE TRAP while a foreground child runs, which is why the signal must reach the CHILD
+# too — GitHub terminates the whole process group, so that is what happens in the incident this fixes
+# and what `scripts/run-bash-shards.recap.test.sh` reproduces.
+#
+# ⚠️ STATED RESIDUAL — WHAT THIS HANDLER CANNOT COVER, PRECISELY (review of this change, P1). A run
+# that is SIGKILLed, OOM-killed, or dies with its runner BEFORE the trap executes prints NO recap and
+# NO marker — and on that capture the marker's ABSENCE does not mean "not truncated": it is
+# indistinguishable from a complete run. Such a run still carries the per-shard
+# `❌ FAILED SHARD: <path>` lines printed at the point of failure, so `scripts/ci_exemption.py` still
+# yields ids for it with rc 0 and `scripts/ci-failure-set.sh` still folds it in — the PRE-#3174
+# behaviour survives on that path, and NO rule in the consumers currently owns it. Do not read this
+# trap as covering it. The repair is the consumer treating "shard identities but no recap line at
+# all" as a truncated capture (fail closed); that is a behaviour change to the SHARED parser — several
+# fixtures legitimately carry a per-shard line and no recap — so it is filed as its own issue (#3182)
+# rather than bundled here.
+shard_partial_recap() {
+  shard_signal="${1:-TERM}"
+  shard_done=$((shard_ran + shard_skipped))
+  shard_notrun=$((listed - shard_done))
+  [ "$shard_notrun" -ge 0 ] || shard_notrun=0
+  printf '\n⚠️ RECAP INCOMPLETE (%s/%s shards ran) — scripts/run-bash-shards.sh was TERMINATED (%s) after %s of %s listed shard(s) (%s ran, %s skipped, %s never reached), so this is a TRUNCATED run: the lines below name what had ALREADY failed and say NOTHING about the shard(s) that had not run. A PARTIAL RECAP IS NOT A BASELINE — report UNPROVEN, never a failure set (agent-infra#3174)\n' \
+    "$shard_ran" "$listed" "$shard_signal" "$shard_done" "$listed" "$shard_ran" "$shard_skipped" "$shard_notrun"
+  if [ -n "$shard_failed_list" ]; then
+    printf '❌ %s bash shard(s) had failed when this run was killed\n' "$shard_errors"
+    printf '❌ failing shard(s): %s\n' "$shard_failed_list"
+    if [ "${sweep_errors:-0}" -gt 0 ]; then
+      printf '❌ …and %s of them are SYNTAX-SWEEP failures, not shards — each named at its own bash -n line\n' "$sweep_errors"
+    fi
+    recap_named_partial=$(printf '%s' "$shard_failed_list" | awk -F', ' '{print NF}')
+    if [ "$recap_named_partial" -lt "$shard_errors" ]; then
+      printf '❌ …and %s of the counted failure(s) could NOT be named — the naming arm did not run for them (a defect in scripts/run-bash-shards.sh, not in the failing file)\n' "$((shard_errors - recap_named_partial))"
+    fi
+  else
+    printf '❌ NOTHING IS PROVEN: no shard had failed yet at %s/%s, and %s shard(s) had not run — this is NOT a green baseline, it is a run that was killed before it finished\n' \
+      "$shard_done" "$listed" "$shard_notrun"
+  fi
+  printf '   ⚠️ RECAP INCOMPLETE — do not compute a set difference from this run: it is UNPROVEN (agent-infra#3174)\n'
+  exit 1
+}
+trap 'shard_partial_recap TERM' TERM
+trap 'shard_partial_recap INT' INT
+
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
 # run none of the suites — the counter arm alone cannot tell the difference.
@@ -533,6 +705,16 @@ echo "── hermetic suites ─────────────────
 # carried (what a suite pins, which incident added it) live in git history on this commit and in
 # each suite's own header — and see the note at the end of this file for why they are likewise not
 # reproduced here as prose.
+# ⛔ THE SAME RULE APPLIES TO A DUPLICATE, which is the shape #1989 + #2597 produced: the SAME suite
+# was listed TWICE (the second copy appended instead of editing the first), so the tree ran it twice
+# and `test_bash_shard_identity_is_injective_over_the_listed_shards` (tests/test_ci_exemption.py)
+# went red on main — a fleet-wide merge block caused by a list, not by code. Under DERIVATION that
+# failure mode is structurally gone (a file is matched once, and `shard_list` de-duplicates a path
+# two globs both match), which is why a suite that gains a claim amends THIS note and never adds a
+# row.
+# ⛔ AND `tests/pr-doctor-trigger/run.sh` (#2700 C5) NEEDS NO ROW EITHER: `tests/*/run.sh` matches
+# it, so the suite is wired by the FILE existing — an enumerated row would be the second execution
+# of the same suite, i.e. the defect #2838 records.
 #
 # ⛔ #2439 FOLDED THE DUPLICATE RUN SITES — this paragraph used to say the opposite, deliberately.
 # It read: "That duplication is deliberate here … the PR lane runs those twice … Dropping them
@@ -611,6 +793,7 @@ if [ "${#shard_array[@]}" -ne "$listed" ]; then
   exit 1
 fi
 for shard in ${shard_array[@]+"${shard_array[@]}"}; do
+  shard_budget_trip "$shard"
   run_shard "$shard"
 done
 echo "───────────────────────────────────────────────────────────────────"
@@ -738,6 +921,11 @@ shard_errors=$before_err
 shard_ran=$before_ran
 shard_skipped=$before_skip
 shard_listed=$before_listed
+
+# The budget is ALSO checked after the last shard (the pre-shard trip cannot see a list whose LAST
+# suite is the one that ran long), and BEFORE the failure recap, so a run that both overran and
+# failed prints both reasons in one place.
+shard_budget_trip "(end of list)"
 
 if [ "$shard_errors" -gt 0 ]; then
   echo "❌ $shard_errors bash shard(s) failed"
