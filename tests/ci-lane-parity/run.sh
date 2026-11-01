@@ -1055,9 +1055,10 @@ echo "8aQ. THE OVERRUN IS A DIFFERENT NAMED RED FROM A SUITE FAILURE (agent-infr
 #                                real failure is reported SEPARATELY rather than blamed on the bound
 #   * a live, unspent budget  -> the suite failure still fails the step (a budget must never absorb a
 #                                failure: that is the fail-open this arm exists to catch)
-# The slow stand-in is written into the fixture TREE (`$NAMED_FIX`), never committed: it only has to
-# make `shard_time` cross a 1 s budget deterministically, and a committed 2 s sleep would be paid by
-# every run of this suite forever.
+# The slow stand-ins are written into the fixture TREE (`$NAMED_FIX`), never committed: they only have
+# to make `shard_time` cross a 3 s budget deterministically (a 1 s budget would trip BEFORE
+# `stand-in-aab-failslow.sh`, so the "failed INDEPENDENTLY" assertion below would never match), and
+# a committed 2 s sleep would be paid by every run of this suite forever.
 # ⛔ TWO slow stand-ins, named so they sort FIRST (`aaa`) and SECOND (`aab`), because the arm must
 # exercise the MID-LOOP trip: a `zzz`-sorted slow suite only ever reaches the end-of-list trip, where
 # `ran + skipped == listed` — so the "NOT RUN" listing (the branch that was fatal in review cycle 2)

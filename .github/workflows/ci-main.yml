@@ -412,8 +412,13 @@ jobs:
     # measurement is PR #2412's (job 120365087427, 2026-10-23T10:25Z) and predates #2529
     # (`00814821`, 16:09Z same day), which stopped the self-test's fixture re-running the real
     # shard list. MEASURED AFTER #2529 (2026-10-24, this job, 8 successful main runs pulled from the
-    # Actions API): step 6, the self-test, **6-9 s**; step 7, the shards, **46m38s-54m32s**. The PR
-    # lane's equivalent step, 17 runs sampled: 6-12 s with one 17 s outlier. What remains expensive
+    # Actions API): step 6, the self-test, **6-9 s**. The PR lane's equivalent step, 17 runs sampled:
+    # 6-12 s with one 17 s outlier.
+    #
+    # ⛔ STEP 7 (THE SHARDS) IS **6468 s = 107.8 min**, NOT the 46m38s-54m32s this header used to
+    # quote (#3174): that range described the ~80-shard list BEFORE #2609 made the list a DERIVATION
+    # and #3114 added an 891 s suite by it. Quoting it here contradicted the step's own comment
+    # below and made 150 min read as 2.75x over-provisioned instead of 1.39x. What remains expensive
     # here is the SHARDS step — that is what the 150 min bound below is sized for, and what sharding
     # main (the separate change named below) would cut.
     #
