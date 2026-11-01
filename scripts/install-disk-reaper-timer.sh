@@ -168,7 +168,9 @@ fi
 # is kept only when git answers for it — a unit scanning a path that is not a repo fails closed every
 # hour, which is how an alarm becomes wallpaper.
 resolve_repos() {
-    local r seen=" " out=""
+    # `_g` is LOCAL: it holds the captured git error, and without `local` this function writes a GLOBAL
+    # from inside a $( ) call site — a latent clobber for any future direct caller (review cycle 3).
+    local r seen=" " out="" _g=""
     local list="${DISK_REAPER_REPOS:-}"
     if [ -z "$list" ]; then
         list="$(printf '%s\n' "${REPO:-}" "${TORTOISE_REPO:-}" "${WORKDIR:-}" "${AGENT_INFRA_PATH:-}")"
@@ -177,15 +179,46 @@ resolve_repos() {
         [ -n "$r" ] || continue
         case "$seen" in *" $r "*) continue ;; esac
         seen="$seen$r "
-        git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
-        # ⛔ ABSOLUTE ONLY. systemd resolves a relative Environment value against the SERVICE's working
-        # directory, not this shell's, so a relative candidate (or a bare `owner/repo` slug, which the
-        # ambient REPO sometimes carries) would render a unit whose two repo classes fail closed every
-        # tick. Dropped here, where the rendered list is decided, and said out loud.
+        # ⛔ ABSOLUTE ONLY, AND CHECKED FIRST. systemd resolves a relative Environment value against
+        # the SERVICE's working directory, not this shell's, so a relative candidate (or a bare
+        # `owner/repo` slug, which the ambient REPO sometimes carries) would render a unit whose two
+        # repo classes fail closed every tick. This arm is HOISTED above the git probe deliberately
+        # (review cycle 2): with the probe first, a relative candidate git cannot answer for was
+        # reported as "not a git checkout" — pointing the operator at a missing checkout instead of at
+        # the slug — and `git@github.com:owner/repo.git` was split on ':' by the line below into two
+        # entries, each warned about with the wrong reason. Each candidate is now dropped with the
+        # reason that ACTUALLY applies to it.
         case "$r" in
             /*) ;;
             *) err "WARNING: ignoring repo '$r' — not an absolute path, so a unit cannot use it"; continue ;;
         esac
+        # ⛔ A CANDIDATE GIT DOES NOT ANSWER FOR IS DROPPED **OUT LOUD** — never silently (2026-10-30).
+        # MEASURED on pi-cell-1: the installed unit carried
+        #     Environment=DISK_REAPER_REPOS=/tmp/cell-t3:/tmp/cell-ai
+        # (the cell layout, #2878 — and `cloud-cell-bringup.sh` passes the operator's list verbatim,
+        # colon-joined, so MULTI-ENTRY lists are the normal shape). Once that box's checkout moved to
+        # /home/cmux/tortoise, this loop dropped the vanished entry with NO output, the install returned
+        # 0, and the rendered unit named only what survived. The result is indistinguishable from
+        # success while a configured scan target is silently not scanned — the same inert shape as a
+        # unit that scans nothing, which the empty-list refusal below already catches. A single
+        # surviving entry is exactly what hid the incident for days.
+        # ⛔ QUOTE GIT'S OWN LINE, never assert a cause (review cycle 2). `rev-parse --git-dir` fails for
+        # MANY reasons — a missing checkout, `chmod 000`, and the fleet's own dominant shape,
+        # `fatal: detected dubious ownership in repository at …` (a checkout owned by a different uid).
+        # Stamping all of them "not a git checkout" sends the operator after the one cause that cannot
+        # explain the fault, and the refusal's advice ("set DISK_REAPER_REPOS to a checkout path") is
+        # useless for a permission/ownership one. The wording choice changes no outcome: the entry is
+        # dropped either way, and the CALLER'S result is the same whichever message is used — a single
+        # dead entry in a longer list still installs (T62 (d) asserts rc=0 deliberately), and the
+        # all-dead case still refuses. This costs no safety; it recovers the one actionable signal the
+        # fix exists to give. (Review cycle 3 corrected an earlier sentence here that claimed a refusal
+        # the PARTIAL-list path never performs.)
+        if ! _g="$(git -C "$r" rev-parse --git-dir 2>&1 >/dev/null)"; then
+            # `${_g:-…}` guards the empty-stderr shape (a silent git shim exits non-zero and says
+            # nothing): an empty "(...)" would name no datum at all, so say so explicitly.
+            err "WARNING: ignoring repo '$r' — git cannot use it here ($(printf '%s' "${_g:-<git gave no message>}" | head -1)), so the venv/worktree classes cannot scan it (the rendered unit will NOT cover it)"
+            continue
+        fi
         out="${out}${out:+:}$r"
     done <<<"$(printf '%s\n' "$list" | tr ':' '\n')"
     printf '%s' "$out"

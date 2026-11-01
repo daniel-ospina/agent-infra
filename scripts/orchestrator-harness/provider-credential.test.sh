@@ -197,8 +197,11 @@ pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 grep -q 'pi-keys.env' <<<"$pfx" && rc=1 || rc=0
 ck "…and no pi-keys.env source is emitted for a box that has no such file" $rc
 rcs="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-caller" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; echo $?)"
-[ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      the prefix let a worker start with NO model credential (rc=$rcs)"; }
-ck "…and that prefix REFUSES (98) when the pane does NOT hold the value — the blank-key lane cannot start" $rc
+# ⛔ 95, NOT 98 (#3138): the MODEL arm has its own code now, so a blank model key can never be
+# reported as an absent gh credential. This suite executes the SAME emitted prefix as
+# worker-terminal.test.sh and was left on the old code when that change landed.
+[ "$rcs" = "95" ] && rc=0 || { rc=1; echo "      the prefix let a worker start with NO model credential (rc=$rcs)"; }
+ck "…and that prefix REFUSES (95) when the pane does NOT hold the value — the blank-key lane cannot start" $rc
 envout="$(env -i PATH="$TMP/bin:/usr/bin:/bin" O="$TMP/O-caller" DEEPSEEK_API_KEY=sk_caller_value "$BASH" -c "$pfx; printf 'V=[%s]' \"\${DEEPSEEK_API_KEY:-}\"" 2>&1)"
 case "$envout" in *"V=[sk_caller_value]") rc=0 ;; *) rc=1; echo "      $envout" ;; esac
 ck "…and WITH the value in the pane it proceeds and keeps it (the delivery LANDS, nothing clobbers it)" $rc
