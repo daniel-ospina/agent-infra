@@ -7,7 +7,7 @@
 #   * grouped by (name), newest attempt per group — a superseded failure must not outvote
 #     a green re-run (the rail's §2C rule, applied here so we queue the right PRs)
 #   * in-flight => not a candidate (a queued check is a WAIT, never a green)
-#   * at most MAX rails at once; a PR that already has a rail is skipped
+#   * at most MAX rails per repo, and MAX_TOTAL overall; a PR that already has a rail is skipped
 #   * one lock: two copies of this script would double-rail
 set -u
 MAX=${MAX:-2}
@@ -30,15 +30,25 @@ MAX=${MAX:-2}
 # "everything else the box happens to be running".
 #
 # ⛔ PER-REPO MUST NOT SILENTLY MULTIPLY THE LOAD BOUND. MAX=8 was justified against this machine's CPU
-# ceiling (see the launchd plist), so making it per-repo would turn an 8-rail bound into 8×2 with nothing
+# ceiling (see the launchd plist), so making it per-repo would turn an 8-rail bound into 8×N with nothing
 # saying so. MAX_TOTAL is that aggregate, NAMED AND TUNABLE instead of an arithmetic accident: MAX × the
-# repos this actuator drives. It is a ceiling on what THIS ACTUATOR LAUNCHES, never a bound on the box —
-# measured 2026-11-01 the box carried 15 rails against max=8, because pr-doctor and the repair lanes
-# start rails without consulting this counter at all. The real governor is measured load at dispatch time.
-MAX_TOTAL=${MAX_TOTAL:-$(( MAX * 2 ))}
-# The repos this actuator drives. `rails_*` below take the SHORT name (`tortoise`), which is what a
-# rail's `--repo daniel-ospina/tortoise` and its script path both reduce to; deriving the short names
-# from this one list is what keeps the two in step.
+# number of repos this actuator drives, DERIVED from REPOS so that adding a third repo cannot leave the
+# aggregate below the sum of the per-repo budgets. It is a ceiling on what THIS ACTUATOR LAUNCHES, never a
+# bound on the box — measured 2026-11-01 the box carried 15 rails against max=8, because pr-doctor and the
+# repair lanes start rails without consulting this counter at all. The real governor is measured load at
+# dispatch time.
+# ⛔ AND THE AGGREGATE IS A REAL CEILING, NOT A DECORATION — say so rather than claiming the class is
+# dead: at `total >= max_total` an otherwise-idle repo's candidate IS still deferred by other repos'
+# rails. That population is reachable (the log holds rails_live=15 and =16 today), so max_total is a
+# bound on how much THIS actuator will pile into the shared REST budget, not a promise that the symptom
+# can never recur at a larger population. It is printed on every pass for exactly that reason.
+MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
+# The repos this actuator drives. `rails_for_repo` takes the FULL slug for the repo being asked about
+# plus this same list for the population, and derives every short name itself — one call shape, so the
+# two cannot drift apart (the bug that made `unattributed` read 1 for a rail that WAS attributed).
+REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
+_n_repos=0
+for _r in $REPOS; do _n_repos=$(( _n_repos + 1 )); done
 REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
 INTERVAL=${INTERVAL:-180}
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
@@ -113,17 +123,57 @@ if ! mkdir "$LOCK.d" 2>/dev/null; then
 fi
 echo $$ > "$LOCK.d/pid"; trap 'rm -rf "$LOCK.d"' EXIT INT TERM
 say() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
-# ── merge-slot accounting, PER REPO ──────────────────────────────────────────────────────────────
-# A rail is attributed to a repo by an explicit `--repo <owner/name>` from its launcher, or else by the
-# repo named in the rail SCRIPT's own path (a clone/worktree of one repo — measured, the only
-# non-`--repo` rail on this box was `.worktrees/rail-exit-after-verdict/scripts/admin-merge.sh`).
-# ⛔ A RAIL ATTRIBUTABLE TO NEITHER COUNTS FOR EVERY REPO. Fail-closed: unknown load must never be read
-# as free load, or one repo's rails can starve another's queue again by becoming invisible to both.
-rails_live_total() { ps -eo args= | grep -c "[a]dmin-merge.sh "; }
-rails_on()         { ps -eo args= | grep "[a]dmin-merge.sh " | grep -c -e "--repo [^ ]*/$1\( \|$\)" -e "/$1/"; }
-rails_unknown()    { ps -eo args= | grep "[a]dmin-merge.sh " | grep -c -v -e "--repo " -e "/$1/" -e "/$2/"; }
-# `rails_unknown` must be given the same SHORT names its sibling takes: a full `daniel-ospina/…` slug
-# matches no script path, and the unknown bucket then reads 1 for a rail that IS attributed.
+# ── merge-slot accounting, PER REPO ─────────────────────────────────
+# Attribution has PRECEDENCE, and it is ONE pass over the process table rather than three greps over it —
+# three greps is how a rail can be counted twice by one and never by another.
+#   1. an explicit `--repo <owner/name>` from the launcher decides;
+#   2. else the repo named in the rail SCRIPT's own path (a clone/worktree of one repo);
+#   3. else UNKNOWN.
+# A rail attributable to NEITHER is UNKNOWN, and so is one whose `--repo` names a repo this actuator does
+# not drive. Unknown load must never read as free load (fail-closed), so it counts against EVERY repo and
+# is printed: that is the difference between "no rails here" and "rails I cannot see".
+# Prints `<own> <total> <unknown>`; $1 is the repo being asked about, $2.. every repo driven.
+rails_for_repo() {
+  ps -eo args= | python3 -c '
+import sys
+me = sys.argv[1].split("/")[-1]
+known = [r.split("/")[-1] for r in sys.argv[2:]]
+own = total = unk = 0
+for line in sys.stdin:
+    if "admin-merge.sh " not in line or "[a]dmin-merge.sh" in line:
+        continue
+    total += 1
+    toks = line.split()
+    slug = None
+    for i, t in enumerate(toks):
+        if t == "--repo" and i + 1 < len(toks):
+            slug = toks[i + 1].split("/")[-1]
+            break
+    if slug is None:
+        for k in known:
+            if "/%s/" % k in line:
+                slug = k
+                break
+    if slug is None or slug not in known:
+        unk += 1
+    elif slug == me:
+        own += 1
+print(own, total, unk)
+' "$@"
+}
+# The defer decision, in ONE place, so a test can pin the SHIPPED predicate instead of a copy of it.
+rails_should_defer() {  # $1 = this repo (owner/name), $2.. = every repo driven
+  local own total unk
+  read -r own total unk <<< "$(rails_for_repo "$@")"
+  [ $(( own + unk )) -ge "$MAX" ] || [ "$total" -ge "$MAX_TOTAL" ]
+}
+# ⛔ A NON-NUMERIC BOUND MUST NOT DISARM THE CEILING. `${VAR:-default}` substitutes only on empty or
+# unset, so a typo (`MAX_TOTAL=sixteen`) reaches `-ge`, the test errors, and an errored `[` reads as FALSE
+# — i.e. the aggregate clause silently stops biting and every candidate launches. Refuse loudly instead.
+case "${MAX}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: MAX='${MAX}' is not a positive integer — this actuator would not know its own bound" >> /tmp/auto-rail.log; exit 3;; esac
+case "${MAX_TOTAL}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
 # Keep the TCC-free rail clone current BEFORE using it. A failed refresh is LOUD but not fatal: the
 # previous HEAD then runs, which is strictly better than not merging, and the log says which happened.
 if [ -d "$RAIL_HUB/.git" ]; then
@@ -205,19 +255,19 @@ PY
     # bad day. One line per repo per pass makes the answer readable.
     # The counts are PER REPO (that is the fix) and `unattributed` is printed rather than dropped: a
     # rail nobody can attribute is unknown load, and a report that omits it reads as "none".
-    say "$repo pass: candidates=$(wc -l < /tmp/auto-rail-cand.$$) cand_bytes=$(wc -c < /tmp/auto-rail-cand.$$ 2>/dev/null || echo MISSING) rails_on_repo=$(rails_on "${repo##*/}") rails_live=$(rails_live_total) unattributed=$(rails_unknown ${REPOS//daniel-ospina\//}) max=$MAX max_total=$MAX_TOTAL"
+    read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
+    say "$repo pass: candidates=$(wc -l < /tmp/auto-rail-cand.$$) cand_bytes=$(wc -c < /tmp/auto-rail-cand.$$ 2>/dev/null || echo MISSING) rails_on_repo=$_own rails_live=$_total unattributed=$_unk max=$MAX max_total=$MAX_TOTAL"
     while read -r pr; do
       [ -z "${pr:-}" ] && continue
       case "$DENY" in *" $pr "*) say "$repo #$pr DENIED — duplicate-pair member or contradictory PR pending a decision"; continue;; esac
       live=$(ps -eo args= | grep -c "[a]dmin-merge.sh $pr ")
       if [ "$live" -gt 0 ]; then say "$repo #$pr skipped (rail already running)"; continue; fi
-      # ⛔ THIS REPO'S BUDGET, NOT THE BOX'S. `total` is the aggregate ceiling and is deliberately the
-      # second clause: it bounds what this actuator launches in total, and it never lets ANOTHER repo's
-      # rails decide this repo's candidates while this repo is idle.
-      running=$(rails_on "${repo##*/}")
-      total=$(rails_live_total)
-      if [ "$running" -ge "$MAX" ] || [ "$total" -ge "$MAX_TOTAL" ]; then
-        say "$repo #$pr deferred ($running rails on this repo, $total live in total, max=$MAX max_total=$MAX_TOTAL)"; continue
+      # ⛔ THIS REPO'S BUDGET, NOT THE BOX'S. `rails_should_defer` adds the unattributable population to
+      # this repo's own count (fail-closed) and keeps the aggregate as a second, independent clause:
+      # another repo's rails can only decide this repo's candidates once the AGGREGATE is reached.
+      if rails_should_defer "$repo" $REPOS; then
+        read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
+        say "$repo #$pr deferred ($_own rails on this repo + $_unk unattributed, $_total live in total, max=$MAX max_total=$MAX_TOTAL)"; continue
       fi
       head=$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid 2>/dev/null)
       now=$(date +%s)

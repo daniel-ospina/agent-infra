@@ -1,18 +1,24 @@
 #!/bin/bash
-# Decide the deferral the way the DEPLOYED auto-rail.sh decides it, over a REAL captured process
-# table. The table below is verbatim `ps -eo args=` output captured on this box at 2026-11-01T17:12Z
-# (8 rows: 6 rails on agent-infra, one of them a duplicate launch; 1 on tortoise; 1 launched by another
-# lane out of a worktree, which passed no --repo and is attributed by its script path).
+# Pin the merge-slot accounting of auto-rail.sh. The functions under test are EXTRACTED FROM THE SCRIPT
+# ITSELF — including the defer predicate, so reverting the fix fails this test instead of passing it.
+#
+# The fixture is `ps -eo args=` output from this box on 2026-11-01 at ~17:11Z, captured immediately
+# BEFORE the actuator restart at 17:12:02Z cleared the population (the restart is the collateral
+# recorded in agent-infra#3224; `rails_live` reads 0 at 17:12:08Z and that is the same table, emptied).
+# It is 8 rows: 7 on agent-infra — six carrying `--repo daniel-ospina/agent-infra`, one of them the
+# duplicate launch of #3136, PLUS another lane's worktree dry-run attributed by its script path — and 1
+# on tortoise.
 set -u
 HERE=$(dirname "$0")   # the SCRIPT under test: the tracked copy beside this file
-DEPLOYED=${AUTO_RAIL_SCRIPT:-$HERE/auto-rail.sh}
-MAX=8
-MAX_TOTAL=16
+SUT=${AUTO_RAIL_SCRIPT:-$HERE/auto-rail.sh}
+MAX=${MAX:-8}
 
-# ── the three accounting functions, EXTRACTED FROM THE DEPLOYED SCRIPT (so this tests the shipped code) ──
-eval "$(grep -E '^rails_(live_total|on|unknown)\(\) ' "$DEPLOYED")"
+# ── the shipped functions, extracted (the multi-line one runs to the first column-0 `}`) ──────────────
+eval "$(sed -n '/^rails_for_repo() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^rails_should_defer() {/,/^}$/p' "$SUT")"
+command -v rails_should_defer >/dev/null || { echo "FATAL: rails_should_defer not found in $SUT"; exit 2; }
 
-ps() { printf '%s\n' "$TABLE"; }
+REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
 TABLE="$(cat <<'ROWS'
 bash /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/rail-exit-after-verdict/scripts/admin-merge.sh 42 --main-runs 10 --dry-run
 bash /Users/danielospina/rail-hub/scripts/admin-merge.sh 3054 --repo daniel-ospina/agent-infra --any-workflow
@@ -24,42 +30,49 @@ bash /Users/danielospina/rail-hub/scripts/admin-merge.sh 3212 --repo daniel-ospi
 bash /Users/danielospina/rail-hub/scripts/admin-merge.sh 10500 --repo daniel-ospina/tortoise
 ROWS
 )"
-
-total=$(rails_live_total)
-tortoise=$(rails_on tortoise)
-ai=$(rails_on agent-infra)
-unattributed=$(rails_unknown tortoise agent-infra)
-
-printf 'captured table: total=%s tortoise_on_repo=%s agent-infra_on_repo=%s unattributed=%s\n' \
-  "$total" "$tortoise" "$ai" "$unattributed"
+ps() { printf '%s\n' "$TABLE"; }
 
 fail=0
-# The attribution itself: every rail lands on exactly one repo (or the unknown bucket), and the
-# unknown bucket is EMPTY for this table because each row names its repo in --repo or in its path.
-[ "$total" -eq 8 ]        || { echo "FAIL: total rails $total != 8"; fail=1; }
-[ "$ai" -eq 7 ]           || { echo "FAIL: agent-infra attribution $ai != 7 (the #3136 duplicate + the worktree dry-run both belong to it)"; fail=1; }
-[ "$tortoise" -eq 1 ]     || { echo "FAIL: tortoise attribution $tortoise != 1"; fail=1; }
-[ "$unattributed" -eq 0 ] || { echo "FAIL: unattributed $unattributed != 0"; fail=1; }
+read -r t_own t_total t_unk <<< "$(rails_for_repo daniel-ospina/tortoise $REPOS)"
+read -r a_own a_total a_unk <<< "$(rails_for_repo daniel-ospina/agent-infra $REPOS)"
+printf 'captured table: tortoise=%s/%s/%s agent-infra=%s/%s/%s (own/total/unknown)\n' \
+  "$t_own" "$t_total" "$t_unk" "$a_own" "$a_total" "$a_unk"
 
-# ⛔ THE DEFECT, AS A DECISION. On this exact table:
-#   OLD (global):   running_declared = $total = 8 >= MAX 8  -> tortoise DEFERRED
-#   NEW (per repo): tortoise own = 1 < MAX 8, total 8 < MAX_TOTAL 16 -> everything below the bar
-# The old verdict is what /tmp/auto-rail.log recorded at 16:48Z ("deferred (11 rails already live,
-# max=8)") while tortoise contributed one of those rails.
-old_defer=0; [ "$total" -ge "$MAX" ] && old_defer=1
-new_defer=0; { [ "$tortoise" -ge "$MAX" ] || [ "$total" -ge "$MAX_TOTAL" ]; } && new_defer=1
-printf 'OLD decision for a tortoise candidate: %s\n' "$([ "$old_defer" = 1 ] && echo DEFER || echo LAUNCH)"
-printf 'NEW decision for a tortoise candidate: %s\n' "$([ "$new_defer" = 1 ] && echo DEFER || echo LAUNCH)"
-[ "$old_defer" = 1 ] || { echo "FAIL: the old rule should DEFER on this table (that is the defect being fixed)"; fail=1; }
-[ "$new_defer" = 0 ] || { echo "FAIL: the new rule must LAUNCH on this table"; fail=1; }
+# The partition: every rail lands on exactly one repo or the unknown bucket.
+[ "$t_total" -eq 8 ] || { echo "FAIL: total $t_total != 8"; fail=1; }
+[ "$t_unk" -eq 0 ]   || { echo "FAIL: unknown $t_unk != 0 (each row names its repo in --repo or in its path)"; fail=1; }
+[ "$t_own" -eq 1 ]   || { echo "FAIL: tortoise own $t_own != 1"; fail=1; }
+[ "$a_own" -eq 7 ]   || { echo "FAIL: agent-infra own $a_own != 7 (6 via --repo incl. the #3136 duplicate, + the worktree dry-run by path)"; fail=1; }
+[ $(( t_own + a_own + t_unk )) -eq "$t_total" ] || { echo "FAIL: the three buckets do not partition the table"; fail=1; }
 
-# The bound still BITES when it should: 8 rails on THIS repo defers a 9th candidate here.
-TABLE="$(for i in $(seq 1 8); do echo "bash /r/scripts/admin-merge.sh $i --repo daniel-ospina/tortoise"; done)"
-[ "$(rails_on tortoise)" -ge "$MAX" ] || { echo "FAIL: 8 rails on one repo must still hit the per-repo bound"; fail=1; }
-# Fail-closed: a rail nobody can attribute counts for EVERY repo, never for none.
-TABLE="bash /somewhere/else/admin-merge.sh 7"
-[ "$(rails_unknown tortoise agent-infra)" -eq 1 ] \
-  || { echo "FAIL: an unattributable rail must be counted as unknown"; fail=1; }
+# ⛔ THE DEFECT AS A DECISION, through the SHIPPED predicate. On this table main's rule
+# (`total >= MAX`) defers tortoise; the shipped rule must not.
+MAX_TOTAL=16 MAX=8
+if [ "$t_total" -ge 8 ]; then echo "old rule (total>=MAX) for a tortoise candidate: DEFER"; else echo "FAIL: fixture no longer reproduces the defect"; fail=1; fi
+if rails_should_defer daniel-ospina/tortoise $REPOS; then echo "FAIL: new rule DEFERS tortoise on this table"; fail=1
+else echo "new rule (per repo) for a tortoise candidate: LAUNCH"; fi
 
-[ "$fail" = 0 ] && echo "PASS: per-repo accounting launches a starved repo's candidate and still bounds one repo"
+# …and the bound still BITES, in both clauses.
+TABLE="$(for i in 1 2 3 4 5 6 7 8; do echo "bash /r/scripts/admin-merge.sh $i --repo daniel-ospina/tortoise"; done)"
+MAX_TOTAL=16 MAX=8
+rails_should_defer daniel-ospina/tortoise $REPOS || { echo "FAIL: 8 rails on ONE repo must defer a 9th candidate there"; fail=1; }
+TABLE="$(for i in $(seq 1 16); do echo "bash /r/scripts/admin-merge.sh $i --repo daniel-ospina/agent-infra"; done)"
+MAX_TOTAL=16 MAX=8
+rails_should_defer daniel-ospina/tortoise $REPOS || { echo "FAIL: the MAX_TOTAL clause must bite at 16 live"; fail=1; }
+
+# Fail-closed: unknown load counts for EVERY repo, never for none.
+TABLE="$(for i in $(seq 1 8); do echo "bash /opt/other/scripts/admin-merge.sh $i --repo some-org/third-repo"; done)"
+MAX_TOTAL=16 MAX=8
+read -r u_own u_total u_unk <<< "$(rails_for_repo daniel-ospina/tortoise $REPOS)"
+[ "$u_own" -eq 0 ] && [ "$u_unk" -eq 8 ] || { echo "FAIL: a --repo naming an undriven repo must be unknown (own=$u_own unk=$u_unk)"; fail=1; }
+rails_should_defer daniel-ospina/tortoise $REPOS || { echo "FAIL: 8 unattributable rails must count against every repo's MAX"; fail=1; }
+
+# Precedence: `--repo` decides, so one rail is never counted on two repos.
+TABLE="bash /Users/x/agent-infra/.worktrees/y/scripts/admin-merge.sh 42 --repo daniel-ospina/tortoise"
+read -r p_t_own p_t_total _p <<< "$(rails_for_repo daniel-ospina/tortoise $REPOS)"
+read -r p_a_own _p2 _p3 <<< "$(rails_for_repo daniel-ospina/agent-infra $REPOS)"
+[ "$p_t_own" -eq 1 ] && [ "$p_a_own" -eq 0 ] \
+  || { echo "FAIL: --repo must take precedence over the script path (tortoise=$p_t_own agent-infra=$p_a_own)"; fail=1; }
+
+[ "$fail" = 0 ] && echo "PASS: per-repo accounting launches a starved repo's candidate, still bounds one repo, and counts unknown load against everyone"
 exit "$fail"
