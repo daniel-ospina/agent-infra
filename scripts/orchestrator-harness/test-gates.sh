@@ -2993,10 +2993,22 @@ ISSUES 2')"
   else
     _arms_ok=0
   fi
+  # ⛔ THE PRODUCER IS CAPTURED, THEN TESTED — never `grep -v … | grep -qF …` (#841/#864). The quiet
+  # grep exits at its first match while the producer is still writing, so the producer takes SIGPIPE,
+  # and under the `pipefail` this gate family runs open the PIPELINE status goes non-zero on a payload
+  # whose match was there all along — a MATCH reads as a FAILURE (#3030). The here-string form keeps
+  # `-v`'s line selection and `-qF`'s per-line substring semantics exactly, because the pattern holds
+  # no newline and can therefore never span a line boundary; an empty capture matches nothing, as the
+  # empty pipeline matched nothing.
+  # ⛔ MEASURED ON THIS PR (#3181, head 16c071e4): the same line reddened BOTH `sigpipe-grep` and
+  # `bash-suites (4)` — the guard named it (`test-gates.sh:2998 — 1 occurrence(s), undeclared`) and
+  # the suite failed only this assertion, so the arm read as un-wired on a tree that wires it exactly
+  # as #2132 requires. Open PR #3222 fixes the identical line for its own lane; this hunk is kept
+  # BYTE-IDENTICAL to that one so whichever lands second is a no-op instead of a conflict.
   if [ "$_arms_ok" -ne 1 ]; then
     echo "  ❌ merge-one.sh's no-verdict arm could not be extracted (CLEAN arm at ${_clean_ln:-none}, no-verdict arm at ${_star_ln:-none}) — the wiring is UNPROVEN, never green"; FAIL=$((FAIL+1))
-  elif grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh" \
-       | grep -qF 'review_state_record "$(verdict_class "$LAST")"' \
+  elif _star_body="$(grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh")" \
+    && grep -qF 'review_state_record "$(verdict_class "$LAST")"' <<<"$_star_body" \
      && ! grep -q 'state/needsfix-' "$TMP/merge_star_arm.sh"; then
     echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
   else
