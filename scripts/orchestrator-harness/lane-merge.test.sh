@@ -634,7 +634,8 @@ ck "a CLOSED+unmerged PR's hand-off says reopen/re-PR and does NOT tell the next
 # ⛔ THREE WAYS IT WAS NOT (reviewer findings P1/P2, R11, all measured): (1) `--watch` on a budget
 # hand-off charges chunk N+1 before any work and re-hands-off (RC=13, same token, 0.455s, zero
 # supervision); (2) `${BR:-<branch>}` rendered a literal placeholder on the documented `--watch` path,
-# and merge-one feeds it to `git fetch origin "$BR"`; (3) the printed command omitted `--repo`, which
+# and merge-one feeds it to `git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"` (the shipped
+# form since #3009 named the destination); (3) the printed command omitted `--repo`, which
 # this box cannot recover because the fallback used GNU-only `sed -E`.
 new_o "$T/junk-q23.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open23.tsv"
@@ -695,7 +696,8 @@ ck "a head-bound handoff with NO signed review → exit 12 BLOCKED_ATTESTATION, 
       && grep -q 'lane-merge-handoff: abc123' "$T/gh.log" && grep -q 'at head `abc123`' "$T/gh.log" \
       && ! grep -q 'handoff: unknown' "$T/gh.log" && echo 0 || echo 1)
 # ⛔ ITS merge-one COMMAND MUST BE RUNNABLE (reviewer finding, P1, R11): the documented `--watch` call
-# passes no `--branch`, and a literal placeholder there aims merge-one's `git fetch origin "$BR"` at a
+# passes no `--branch`, and a literal placeholder there aims merge-one's
+# `git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"` at a
 # ref that does not exist — the next holder pays for a reviewer that cannot start.
 # ⛔ PINNED BY ITS INPUTS, NOT BY A GREP OF A GREEN CHECKOUT (reviewer finding, P2, R13, measured: the
 # previous assertion was 76/76 GREEN with the whole resolution reverted, because the suite's own checkout
