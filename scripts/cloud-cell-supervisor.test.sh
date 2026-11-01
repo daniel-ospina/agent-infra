@@ -4477,6 +4477,19 @@ cp "$C/lib.sh" "$C/lib2.sh"
 cat >> "$C/lib.sh" <<'SH'
 _controller_env_state_dir() { printf '%s\n' "${FAKE_O:-}"; }
 SH
+# ⛔ THE OWNERSHIP TERM'S SEAM (#2315 review P0) — appended to BOTH libs, because the term lives in
+# `_pid_is_foreign_root_leak`, which legs (2)-(5) drive through `lib.sh` AND legs (8)-(13) drive through
+# `lib2.sh`. The real `lock_controller_pid` reads `$LOCK`, `kill -0`, `ps -o command=` and `ps -o etime=`
+# — i.e. the HOST's process table — so a fixture pid cannot mean what it says through it. This seam is
+# the same shape as the `_controller_env_state_dir` override above: the stub answers the ownership
+# question, and `_pid_is_foreign_root_leak`'s DECISION is what every leg grades. It is NOT inert:
+# with $FAKE_OWNER = the candidate's pid the leg must report SAFE, and with the ownership term deleted
+# from the shipped script that same leg reports LEAK and fails — so the call itself is pinned.
+for _zzlib in "$C/lib.sh" "$C/lib2.sh"; do
+  cat >> "$_zzlib" <<'SH'
+lock_controller_pid() { printf '%s\n' "${FAKE_OWNER:-}"; }
+SH
+done
 
 # (0) PRECONDITION — every function this section drives must EXIST in $SUP. Legs (2)/(2b)/(4) assert
 #     "SAFE", which is exactly what a MISSING function prints, so without this arm the whole negative
@@ -4615,6 +4628,23 @@ esac
 exit 0
 SH
 chmod +x "$C/bin2/ps"
+# ⛔ `kill` IS A BASH BUILTIN, SO STUBBING `ps` ALONE DID NOT CONTAIN THE SIGNAL (review P1). The reap
+# runs `kill -TERM 202` / `kill -KILL 202`, and only `ps` was in `$C/bin2` — so a suite that is explicitly
+# designed to run on a macOS laptop (legs 0/8/10 exist for exactly that) sent a REAL signal to PID 202 of
+# whichever machine ran it, and to 202 again with -KILL if it survived. Two defects in one: a test that can
+# shoot an unrelated process, and a leg that could not discriminate — it asserted the AUDIT LINE, which the
+# reap prints BEFORE it signals, so deleting the entire kill loop left the leg green. The stub below records
+# every signal to $KILL_LOG and makes the pid report dead once signalled (so the grace loop terminates
+# deterministically instead of sleeping out the bound); leg (9) then asserts the EXACT signal set.
+cat >> "$C/lib2.sh" <<'SH'
+kill() {
+  local l="${KILL_LOG:-$C/kills-unset}"
+  case "${1:-}" in
+    -0) [ ! -f "$l.dead.${2:-}" ] ;;
+    *) printf '%s %s\n' "${1:-}" "${2:-}" >> "$l"; : > "$l.dead.${2:-}" ;;
+  esac
+}
+SH
 out="$(PATH="$C/bin2:$PATH" PROC_ROOT="$PR" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; cell_own_foreign_root_pids "$O" "$HARNESS"')"
 case "$out" in
   202) ok "the COLLECTION path selects exactly the real leak — not the sanctioned controller (101), not the peer (303), not a command STRING (404)" ;;
@@ -4622,7 +4652,8 @@ case "$out" in
 esac
 
 # (9) and the reap actually signals it, with the audit line naming only that pid
-reaped="$(PATH="$C/bin2:$PATH" PROC_ROOT="$PR" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; reap_own_foreign_root_leaks "$O" 1; echo "RC=$?"')"
+rm -f "$C/kills9" "$C/kills9.dead."*
+reaped="$(KILL_LOG="$C/kills9" PATH="$C/bin2:$PATH" PROC_ROOT="$PR" O="$O" HARNESS="$H" bash -c '. "$C/lib2.sh"; reap_own_foreign_root_leaks "$O" 1; echo "RC=$?"')"
 case "$reaped" in
   *"pid 202"*) ok "the reap names the leak it is about to signal (auditable: which pid, which state dir)" ;;
   *) bad "the reap did not name the pid it acted on — got [$(printf '%s' "$reaped" | tr '\n' ' ')]" ;;
@@ -4630,6 +4661,18 @@ esac
 case "$reaped" in
   *"RC=2"*) bad "the reap reported CANNOT-DETERMINE on a readable table (rc 2)" ;;
   *) : ;;
+esac
+# ⛔ THE SIGNAL IS THE ASSERTION, NOT THE ANNOUNCEMENT (review P1). The reap prints its audit line BEFORE
+# the loop, so an arm that reads only that line passes with the loop deleted — measured by mutating the
+# `kill -TERM` out of the shipped script. What is pinned here is the EXACT signal set: TERM to the one
+# real leak, and to nothing else in a table that also holds the sanctioned controller (101), a peer (303)
+# and a command STRING (404). RED on revert: the loop deleted -> empty log; a scope widened to the
+# sanctioned controller or the peer -> an extra line.
+_zz_signals="$(printf '%s' "$(cat "$C/kills9" 2>/dev/null)" | tr '\n' ';' | sed 's/;$//')"
+case "$_zz_signals" in
+  '-TERM 202') ok "the reap SIGNALS exactly the one real leak — TERM 202, and no signal to the sanctioned controller (101), the peer (303) or a command string (404)" ;;
+  '') bad "the reap issued NO signal at all — the audit line is not the reap (the kill loop is missing or unreachable)" ;;
+  *) bad "the reap signalled the wrong set — expected [-TERM 202], got [$_zz_signals]" ;;
 esac
 
 # (9b) ⛔ CANNOT-MEASURE IS FAIL-CLOSED (#2315). A `ps` that fails returns the SAME empty answer a
@@ -4665,6 +4708,62 @@ case "$out" in
   *"reaped:"*) bad "without /proc the reap claimed a clean sweep it never performed" ;;
   *) : ;;
 esac
+
+# (10b) ⛔ THE OWNERSHIP TERM (#2315 review P0). A controller that holds THIS state dir's lock is this
+#       cell's controller WHATEVER TREE IT EXECUTES — and a live one routinely executes an OLDER pin tree:
+#       `harness-refresh` reports `restart-pending` precisely because "the running controller still
+#       executes an older tree", and `HARNESS_PIN_DIR/<sha12>` pins are per-commit with the previous
+#       one surviving until `prune`. That process satisfies SHAPE + ROOT (it is outside the CURRENT
+#       `$HARNESS`) + CELL (`O=` ours), so before this term it was selected for `kill -TERM` -> `kill
+#       -KILL` — and `foreground_handover`'s pre-loop reap did it to the very controller its wait loop
+#       exists to wait for, which is `CONTROLLER_HANDOVER_TIMEOUT` (3600 s) of handover replaced by 10 s
+#       of killing in-flight landing work. The path below is the DEPLOYED nesting under an OLD pin, not
+#       a shallow fixture, because the previous fixture shape is what hid the ROOT defect.
+OLDPIN="/tmp/oldpin.zz/a1b2c3d4e5f6/scripts/orchestrator-harness/orch-loop.sh"
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/o" FAKE_OWNER=202 bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 202 '"$OLDPIN"' "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  SAFE) ok "the LOCK OWNER running an OLDER pin tree is NOT a leak — the controller a handover waits for is never reaped (review P0)" ;;
+  *) bad "a controller holding this state dir's lock was classified as a LEAK — a service-mode upgrade would SIGTERM/SIGKILL the controller it is waiting for: [$out]" ;;
+esac
+# ⛔ AND THE TERM IS OWNERSHIP, NOT "ANY PIN-SHAPED PATH". The pin root is deliberately NOT a term: the
+# #2095 leak this whole change exists for lives at exactly `<pinroot>/<sha>/…` (see the 202 fixture), so
+# excluding pin-shaped trees would exclude the leak and restore the 12 h dead cell. The SAME old-pin
+# process, when nothing owns it, stays a candidate — that is the arm that keeps the ownership exclusion
+# from silently becoming a pin-directory exclusion.
+out="$(O="$O" HARNESS="$H" FAKE_O="$C/o" FAKE_OWNER= bash -c '. "$C/lib.sh"; _pid_is_foreign_root_leak 202 '"$OLDPIN"' "$O" "$HARNESS" && echo LEAK || echo SAFE')"
+case "$out" in
+  LEAK) ok "…and the SAME old-pin controller is a candidate when nothing owns it — the exclusion is OWNERSHIP, not a pin-directory guess (the #2095 leak is pin-shaped)" ;;
+  *) bad "the ownership term widened into a pin-root exclusion — an UNOWNED leaked controller under a pin root would never be reaped, which is the 12 h dead cell #2315 exists to end: [$out]" ;;
+esac
+# (10c) …and the REAP cannot reach it either. The term is graded above, but the hazard is the verb, so it
+#       is driven end to end: the same table that selects 202 for the unowned case must select NOTHING,
+#       and issue NO signal, when 202 holds the lock.
+rm -f "$C/kills-owned" "$C/kills-owned.dead."*
+out="$(KILL_LOG="$C/kills-owned" PATH="$C/bin2:$PATH" PROC_ROOT="$PR" O="$O" HARNESS="$H" FAKE_OWNER=202 bash -c '. "$C/lib2.sh"; cell_own_foreign_root_pids "$O" "$HARNESS"; reap_own_foreign_root_leaks "$O" 1; echo "RC=$?"')"
+_zz_own_kills="$(cat "$C/kills-owned" 2>/dev/null)"
+case "$out:$_zz_own_kills" in
+  *"RC=0"*:) ok "the REAP of an owned controller is a no-op with NO signal — the handover's controller is never TERMed or KILLed (review P0)" ;;
+  *) bad "the reap reached the lock owner — output [$out], signals [$_zz_own_kills]" ;;
+esac
+# (10d) ⛔ `foreground_handover` MUST READ OWNERSHIP BEFORE IT REAPS (#2315 review P0). The ownership term
+#       closes the hazard per candidate; this pin closes it per CALL, so the ordering itself is asserted
+#       rather than left to the reader. A reap hoisted back above the `_own` read restores the exact
+#       defect — 3600 s of handover replaced by a 10 s kill — and every other leg above stays green.
+say_case 'the handover reads OWNERSHIP before it reaps (#2315 review P0)'
+_zz_fh="$(sed -n '/^foreground_handover()/,/^}/p' "$SUP")"
+[ -n "$_zz_fh" ] && ok 'foreground_handover was found in the supervisor' \
+                 || bad 'could not locate foreground_handover in the supervisor — this case would otherwise pass vacuously'
+_zz_own_ln="$(printf '%s\n' "$_zz_fh" | grep -n '^    _own="\$(owned_controller_pids' | head -1 | cut -d: -f1)"
+_zz_reap_ln="$(printf '%s\n' "$_zz_fh" | grep -n 'reap_own_foreign_root_leaks "\$O"' | head -1 | cut -d: -f1)"
+[ -n "$_zz_own_ln" ] && ok 'the handover reads the owned set explicitly before its pre-loop reap' \
+                     || bad 'the pre-loop `_own` read is gone from foreground_handover — re-derive this pin'
+[ -n "$_zz_reap_ln" ] && ok 'the pre-loop reap is still present (the case #2315 fixes is not dropped)' \
+                      || bad 'the pre-loop reap is gone from foreground_handover — a dead cell would no longer be recoverable by start'
+if [ -n "$_zz_own_ln" ] && [ -n "$_zz_reap_ln" ]; then
+  [ "$_zz_own_ln" -lt "$_zz_reap_ln" ] \
+    && ok 'the pre-loop reap runs AFTER the ownership read — a live owned controller is never reaped by the handover' \
+    || bad "the pre-loop reap runs BEFORE the ownership read (line $_zz_reap_ln vs $_zz_own_ln) — a service-mode upgrade would kill the controller CONTROLLER_HANDOVER_TIMEOUT exists to wait for"
+fi
 
 # (11) THE ISSUE'S TITLE, END TO END: a killed controller's leftover SESSION is cleared by `stop`
 #      when — and only when — its own pane command names THIS state dir. This is ask (a) as written:
