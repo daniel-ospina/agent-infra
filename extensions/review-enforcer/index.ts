@@ -3955,17 +3955,23 @@ export function observeReviewRecord(
   pr: number,
   repo?: string,
   /** `"probe"` asks for the cross-box store read (#2374). ONLY the tool_call hook
-   *  passes it, and only on the no-record path: `evaluateMergeGate` is a pure
-   *  function that performs no I/O, and the probe must never run inside it. Every
-   *  other caller (including every test) gets the default `unmeasurable` and stays
-   *  hermetic and offline. */
-  opts: { crossBox?: "probe" | CrossBoxRecordState } = {}
+   *  passes it, and only on the no-record path: no decision branch of
+   *  `evaluateMergeGate` reads the result, and the probe must never run inside it.
+   *  Every other caller (including every test) gets the default `unmeasurable` and
+   *  stays hermetic and offline.
+   *
+   *  `stores` PINS the probed checkouts for a test (a caller-supplied argument, not
+   *  an ambient env var — round-1 review P2). Production omits it and the probe
+   *  resolves `registryStoreDirs()` itself; a test that pins it performs no read it
+   *  did not build. */
+  opts: { crossBox?: "probe" | CrossBoxRecordState; stores?: string[] } = {}
 ): ReviewRecordObservation {
   const registryDir = reviewsDir();
   const legacyPath = reviewRecordFile(undefined, pr);
   // `"probe"` is honoured at the END (`finishObservation`), once we know whether a
   // local record was found — a present record needs no read of the shared store.
   const wantProbe = opts.crossBox === "probe";
+  const stores = opts.stores;
   const obs: ReviewRecordObservation = {
     pr,
     repo: repo ?? null,
@@ -4043,29 +4049,37 @@ export function observeReviewRecord(
       // reads `<pr>.json`, so an ambiguous PR is UNTRUSTED — restoring a legacy record
       // here would print "AMBIGUOUS … none is trusted" AND "record: clean at head …"
       // in one block (fresh review, cycle 3, P1).
-      return finishObservation(obs, wantProbe);
+      return finishObservation(obs, wantProbe, stores);
     }
     if (!obs.record && legacy.rec) {
       if (legacy.rec.repo !== undefined) obs.legacy = { kind: "foreign-repo", repo: legacy.rec.repo };
       else obs.record = legacy.rec;
     }
   }
-  return finishObservation(obs, wantProbe);
+  return finishObservation(obs, wantProbe, stores);
 }
 
 /** Attach the record's mint provenance (diagnostic only) and return the observation. */
-function finishObservation(obs: ReviewRecordObservation, wantProbe: boolean): ReviewRecordObservation {
+function finishObservation(
+  obs: ReviewRecordObservation,
+  wantProbe: boolean,
+  /** Test seam for the probed stores; production passes nothing (`registryStoreDirs()`). */
+  stores?: string[]
+): ReviewRecordObservation {
   if (obs.record) {
     if (typeof obs.record.mint === "string") obs.mint = obs.record.mint;
     if (typeof obs.record.carried_from === "string") obs.carriedFrom = obs.record.carried_from;
   }
   // #3175/#2374 — HONOUR THE `"probe"` OPT, on the no-record case only. This is the
   // ONE place the cross-box store is read from a production path, and it is
-  // deliberately here rather than in `evaluateMergeGate`: the gate stays a pure
-  // function that performs no I/O, and a record that IS present never pays for a
-  // network read (there is nothing the text would add).
+  // deliberately here rather than in `evaluateMergeGate`: NO DECISION BRANCH OF THE
+  // GATE READS THE RESULT, its `record`/head/digest arms are unchanged, and a record
+  // that IS present never pays for a network read (there is nothing the text would
+  // add). ⛔ NOT "the gate performs no I/O" (fresh review, P2): the gate's MESSAGE
+  // arm calls `describeRecordMiss` → `registrySyncOptions` → one local `existsSync`,
+  // so the guarantee is "no NETWORK read on the decision path", not "no I/O here".
   if (wantProbe && !obs.record) {
-    obs.crossBox = crossBoxRecordState(obs.repo ?? undefined, obs.pr);
+    obs.crossBox = crossBoxRecordState(obs.repo ?? undefined, obs.pr, { stores });
   }
   return obs;
 }
@@ -4084,21 +4098,88 @@ export function boxName(): string {
 /** `~/.pi/agent/scripts/registry-sync.sh` (farmed) and the checkout copy (#2374). */
 export const REGISTRY_SYNC_SH = "~/.pi/agent/scripts/registry-sync.sh";
 
+/** One candidate `pull` invocation and whether this box actually has it. */
+export interface RegistrySyncOption {
+  /** What the agent pastes — ONE command, never a pipeline. */
+  command: string;
+  /** The file the command runs, `~` already expanded (so duplicates can be seen). */
+  path: string;
+  present: boolean;
+}
+
+/** `~` → home. The farmed path is written with `~` for readability, and it cannot be
+ *  existence-checked (or deduped against the checkout copy) until it is expanded. */
+function expandHome(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) return resolvePath(os.homedir(), p.slice(2));
+  return p;
+}
+
 /** ⛔ THE STORE MUST BE NAMED. `registry-sync.sh` resolves its store as
  *  `--repo` → `$AGENT_INFRA_PATH` → its own parent dir, so a bare `pull` reads
  *  whichever store those point at — and for a cross-REPO record (the case the
  *  multi-store probe exists for) that is a different store, which "succeeds" having
  *  fetched nothing. A remedy that cannot reach the record it names is worse than no
- *  remedy: the lane runs it, sees exit 0, and re-reviews anyway (fresh review P1). */
-export function registrySyncCommand(store?: string): string {
+ *  remedy: the lane runs it, sees exit 0, and re-reviews anyway (fresh review P1).
+ *
+ *  ⛔ AND NEVER JOINED INTO ONE STRING (fresh review, P2). The two candidates are
+ *  ALTERNATIVES, and joining them with a shell metacharacter (`   |   `) made the
+ *  "one-command fix" a PIPELINE: it runs BOTH halves through a pipe — and in the
+ *  farmed layout (`EXTENSION_DIR = ~/.pi/agent/extensions/review-enforcer`) both
+ *  halves resolve to `~/.pi/agent/scripts/registry-sync.sh`, i.e. the script piped
+ *  into itself. Deduped by EXPANDED path for the same reason, and `present` lets a
+ *  caller declare a copy this box does not have instead of printing it as the
+ *  remedy.
+ */
+export function registrySyncOptions(store?: string): RegistrySyncOption[] {
   // ⛔ SINGLE-QUOTED, NOT JSON-QUOTED (fresh review, P2): this text is a command an
   // agent PASTES. JSON quoting leaves `$(…)` and backticks live inside double quotes,
   // and `store` is an operator-supplied path ($AGENT_INFRA_PATH / cwd). `'…'` is inert.
   const repoFlag = store ? ` --repo '${store.replace(/'/g, `'\\''`)}'` : "";
-  const parts = [`${REGISTRY_SYNC_SH} pull${repoFlag}`];
+  const candidates: Array<{ asWritten: string; path: string }> = [
+    { asWritten: REGISTRY_SYNC_SH, path: expandHome(REGISTRY_SYNC_SH) },
+  ];
   const checkoutCopy = extensionRelativeScript("registry-sync.sh");
-  if (checkoutCopy) parts.push(`${checkoutCopy} pull${repoFlag}`);
-  return parts.join("   |   ");
+  if (checkoutCopy) candidates.push({ asWritten: checkoutCopy, path: expandHome(checkoutCopy) });
+  const seen = new Set<string>();
+  const options: RegistrySyncOption[] = [];
+  for (const c of candidates) {
+    if (seen.has(c.path)) continue; // farmed box: both candidates are the SAME file
+    seen.add(c.path);
+    let present = false;
+    try {
+      present = fs.existsSync(c.path);
+    } catch {
+      present = false;
+    }
+    options.push({ command: `${c.asWritten} pull${repoFlag}`, path: c.path, present });
+  }
+  return options;
+}
+
+/** The ONE command a single-line consumer can print: the first candidate that exists
+ *  on this box, else the farmed path (which the caller renders as a declared gap). */
+export function registrySyncCommand(store?: string): string {
+  const options = registrySyncOptions(store);
+  return (options.find((o) => o.present) ?? options[0])?.command ?? `${REGISTRY_SYNC_SH} pull`;
+}
+
+/** Render the candidates as ONE PER LINE, prefixed `try:` / `or:` — an ALTERNATIVE is
+ *  not a pipeline, and a copy this box lacks is DECLARED rather than offered as the
+ *  remedy (fresh review, P2: the farmed script is not installed on cmux). */
+function registrySyncRemedyLines(store: string | undefined, indent = "       "): string[] {
+  const options = registrySyncOptions(store);
+  const live = options.filter((o) => o.present);
+  if (live.length > 0) {
+    return live.map((o, i) => `${indent}${i === 0 ? "try:" : " or:"} ${o.command}`);
+  }
+  // Nothing is installed here: print the invocation AND say so, so an agent does not
+  // read "No such file or directory" as "the remedy is broken — re-review instead".
+  return [
+    `${indent}${options[0]?.command ?? `${REGISTRY_SYNC_SH} pull`}`,
+    `${indent}⚠ no copy of registry-sync.sh exists on this box (${options.map((o) => o.path).join(", ")}) —`,
+    `${indent}  install the farmed copy before running it`,
+  ];
 }
 
 /** A sibling `scripts/<name>` of this extension's checkout, or null. Mirrors
@@ -4150,18 +4231,25 @@ const crossBoxMemo = new Map<string, { at: number; refs: Set<string> | null; why
  * Read the shared store's `refs/reviews/*` listing — the ONE read that turns "no
  * record on this box" into an actionable statement. Never throws, never long:
  *
- *   - bounded (6 s) and `try/catch` → `unmeasurable` with the reason, never `absent`;
+ *   - bounded (8 s) and `try/catch` → `unmeasurable` with the reason, never `absent`;
  *   - an EMPTY listing is also `unmeasurable`: it may be a remote that is not the
  *     store at all, and claiming "no such record exists" from it would be a cause
  *     this gate did not read;
  *   - EVERY candidate store is probed, and a hit in ANY is `present`;
  *   - no decision reads the result (see `CrossBoxRecordState`).
  */
-export function crossBoxRecordState(repo: string | undefined, pr: number): CrossBoxRecordState {
+export function crossBoxRecordState(
+  repo: string | undefined,
+  pr: number,
+  /** Test seam ONLY: pin the checkouts to probe. Production omits it and the probe
+   *  resolves `registryStoreDirs()` itself, so a hermetic test never reads a store
+   *  (or a remote) it did not construct. */
+  opts: { stores?: string[] } = {}
+): CrossBoxRecordState {
   if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
     return { kind: "unmeasurable", why: "repo context unresolved, so the store's key cannot be formed" };
   }
-  const stores = registryStoreDirs();
+  const stores = opts.stores ?? registryStoreDirs();
   if (stores.length === 0) {
     return {
       kind: "unmeasurable",
@@ -4174,8 +4262,9 @@ export function crossBoxRecordState(repo: string | undefined, pr: number): Cross
   const whys: string[] = [];
   let scannedTotal = 0;
   let scannedAny = false;
-  // ONE budget for the whole probe (8 s), not per store: three candidates × a 6 s
-  // bound would put an 18 s synchronous block inside a tool call (fresh review, P2).
+  // ONE budget for the whole probe (8 s), not per store: a per-store bound (6 s) ×
+  // three candidates would put an 18 s synchronous block inside a tool call (fresh
+  // review, P2).
   const deadline = now + 8000;
   for (const store of stores) {
     const remaining = Math.max(1000, deadline - Date.now());
@@ -4297,16 +4386,26 @@ export function describeRecordMiss(
     lines.push(`     cross-box  : ${crossBoxLine(observation.crossBox)}`);
     lines.push(`     ${recordAbsentToken(observation)}`);
     if (observation.crossBox.kind === "present") {
-      lines.push("     → NEXT ACTION: fetch it from the shared store and RE-RUN the merge. This is a one-command");
-      lines.push(`       fix — ${registrySyncCommand(observation.crossBox.store)}`);
-      lines.push("       A review dispatched here would be paid for twice for the same head.");
+      // ⛔ THIS ARM MAY NOT ASSERT A HEAD IT NEVER READ (fresh review, P2). The probe
+      // reads ref NAMES (`git ls-remote --refs`); the record's `head_sha` lives in the
+      // record BODY, which it never fetches. "A review dispatched here would be paid for
+      // twice for the same head" therefore stated a cause this gate did not measure —
+      // and the normal case where it is FALSE is an ordinary PR lifecycle (reviewed on
+      // box A at head X, pushed to Y, merged from a fresh box). So the claim is made
+      // CONDITIONAL in the same sentence that gives the remedy, and the head check that
+      // can actually measure it (`head_advanced` in `evaluateMergeGate`) decides.
+      lines.push("     → NEXT ACTION: a record for THIS PR exists in the shared store, but WHICH HEAD it");
+      lines.push("       binds is not visible until you fetch it. Fetch it, then RE-RUN the merge:");
+      lines.push(...registrySyncRemedyLines(observation.crossBox.store));
+      lines.push("       ⛔ If the re-run then reports the HEAD ADVANCED, the stored record is at an OLDER");
+      lines.push("       head — the fetch was still the right first step, and a review HERE is what to pay for.");
     } else if (observation.crossBox.kind === "absent") {
       lines.push("     → NEXT ACTION: the shared store has no record for this PR either, so a review HERE is");
       lines.push("       genuinely needed — dispatch it and record it at the head you are merging.");
     } else {
       lines.push("     → NEXT ACTION: whether another box holds it could not be read (see cross-box above), so");
       lines.push("       try the store first, naming the checkout whose origin holds refs/reviews/* — add --repo <store> to:");
-      lines.push(`       ${registrySyncCommand()}`);
+      lines.push(...registrySyncRemedyLines(undefined));
       lines.push("       — and only then pay for a review here.");
     }
     lines.push("     → remedy (a): if the review ran elsewhere, copy its <owner>-<repo>-<pr>.json into the repo-keyed");
@@ -4347,7 +4446,12 @@ export function recordSourcePath(obs: ReviewRecordObservation): string {
 export function crossBoxLine(cb: CrossBoxRecordState): string {
   switch (cb.kind) {
     case "present":
-      return `PRESENT at ${cb.ref} in ${cb.store} — the review ran on another box; fetch it, do not re-review`;
+      // ⛔ NO HEAD CLAIM (fresh review, P2). "the review ran on another box; fetch it, do
+      // not re-review" asserted the stored record is at the head being merged, which
+      // `ls-remote` cannot see (the head is in the record BODY). `present` means "a
+      // record exists for this PR", full stop — the head question is the gate's, and
+      // it answers it AFTER the fetch, as `head_advanced`.
+      return `PRESENT at ${cb.ref} in ${cb.store} — a record for THIS PR exists there; its HEAD is not visible until fetched`;
     case "absent":
       // ⛔ NAME THE STORES THE NEGATIVE COVERS (fresh review, P2). A bare "the shared
       // store" made a three-store read look like one, so a record sitting in a checkout
@@ -7743,7 +7847,8 @@ export default function (pi: ExtensionAPI) {
           envRepo ?? undefined,
           // #3175/#2374: the cross-box store is read HERE — the I/O site — never inside
           // the pure `evaluateMergeGate`, and only when there is no local record, which
-          // is the only case whose text needs it. Bounded (6 s), memoized, never throws.
+          // is the only case whose text needs it. Bounded (ONE 8 s deadline for the
+          // whole probe, not per store), memoized, never throws.
           record ? {} : { crossBox: "probe" }
         );
         // #285 Fix C: the no-record block message is shape-aware (task

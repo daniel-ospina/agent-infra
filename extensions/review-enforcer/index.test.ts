@@ -112,6 +112,7 @@ import {
   recordAbsentToken,
   crossBoxRecordState,
   registrySyncCommand,
+  registrySyncOptions,
   classifyRecordMissState,
   describeCarryConjuncts,
   describeDispatchFloorRead,
@@ -10142,7 +10143,22 @@ test("#3175 a — no record + the store HAS it: still BLOCKS, and says box, regi
     );
     ok(reason.includes(CROSSBOX_REF_2349), "names the exact ref the record lives at");
     ok(reason.includes("registry-sync.sh pull"), "gives a RUNNABLE fetch command, not prose");
-    ok(reason.includes("do not re-review"), "says which of the two next actions is correct");
+    // ⛔ THE CLAIM IS CONDITIONAL ON A HEAD THIS PROBE NEVER READ (fresh review, P2).
+    // `ls-remote --refs` returns NAMES; the record's `head_sha` is in the record BODY,
+    // which is never fetched. So the refusal may say "fetch it and re-run the merge",
+    // and must NOT assert that the stored record is at the head being merged — the
+    // ordinary reviewed-at-X/pushed-to-Y PR would be told not to re-review the one head
+    // that needs it. The head question is answered AFTER the fetch, by `head_advanced`.
+    ok(
+      !reason.includes("do not re-review"),
+      `does NOT assert a head the probe never read (\`present\` is a ref NAME, not a head):\n${reason}`
+    );
+    ok(!reason.includes("for the same head"), "does not claim 'the same head' either");
+    ok(reason.includes("RE-RUN the merge"), "names the step that resolves the head question");
+    ok(
+      reason.includes("HEAD ADVANCED"),
+      "renders the head claim as the CONDITION the re-run measures, in the sentence that gives the remedy"
+    );
   });
 });
 
@@ -10224,16 +10240,18 @@ test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed stor
   // ── MIXED STORE RESULT (round-2 review P1, untested until now): ONE unreadable
   // candidate must make the verdict `unmeasurable`, never `absent`. A store whose
   // origin does not exist is a read failure, and a failure is never a negative fact.
+  // ⛔ STORES PINNED (fresh review, P2): with only `AGENT_INFRA_PATH` set, the probe
+  // continues to this extension's own checkout and to `process.cwd()`, so the case ran
+  // a REAL `git ls-remote origin` against this repo's remote. Pinned, it reads nothing
+  // but the store it built.
   const brokenTmp = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-broken-"));
-  const prevInfra2 = process.env.AGENT_INFRA_PATH;
   try {
     const broken = resolvePath(brokenTmp, "store");
     execSync(`git init -q ${JSON.stringify(broken)}`, { stdio: "ignore" });
     execSync(`git -C ${JSON.stringify(broken)} remote add origin ${JSON.stringify(resolvePath(brokenTmp, "nope.git"))}`, {
       stdio: "ignore",
     });
-    process.env.AGENT_INFRA_PATH = broken;
-    const mixed = crossBoxRecordState("owner/repo", PR_2349 + 7777);
+    const mixed = crossBoxRecordState("owner/repo", PR_2349 + 7777, { stores: [broken] });
     equal(
       mixed.kind,
       "unmeasurable",
@@ -10244,8 +10262,6 @@ test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed stor
       "and it names how many stores it did read"
     );
   } finally {
-    if (prevInfra2 === undefined) delete process.env.AGENT_INFRA_PATH;
-    else process.env.AGENT_INFRA_PATH = prevInfra2;
     fs.rmSync(brokenTmp, { recursive: true, force: true });
   }
 
@@ -10255,6 +10271,150 @@ test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed stor
     describeRecordMiss(messaging, PR_2349, "owner/repo").join("\n").includes("crossbox=unmeasurable"),
     "an unprobed observation says so rather than claiming absence"
   );
+});
+
+/** Build a REAL store: a checkout whose `origin` (a bare repo in the same temp dir)
+ *  holds `refs`. Fully local — `git init` + `update-ref` + `push`, no network. */
+function makeCrossBoxStore(root: string, name: string, refs: string[]): string {
+  const bare = resolvePath(root, `${name}-origin.git`);
+  const store = resolvePath(root, name);
+  execSync(`git init -q --bare ${JSON.stringify(bare)}`, { stdio: "ignore" });
+  execSync(`git init -q ${JSON.stringify(store)}`, { stdio: "ignore" });
+  execSync(`git -C ${JSON.stringify(store)} remote add origin ${JSON.stringify(bare)}`, { stdio: "ignore" });
+  execSync(`git -C ${JSON.stringify(store)} -c user.email=t@t -c user.name=t commit -q --allow-empty -m s`, {
+    stdio: "ignore",
+  });
+  for (const r of refs) execSync(`git -C ${JSON.stringify(store)} update-ref ${r} HEAD`, { stdio: "ignore" });
+  if (refs.length > 0) execSync(`git -C ${JSON.stringify(store)} push -q origin ${refs.join(" ")}`, { stdio: "ignore" });
+  return store;
+}
+
+// ── DIRECTION (d): `absent` is REACHABLE, and it is the one state whose prose tells a
+// lane to pay for a review. Round-3 review P2: no test ever PRODUCED it — the branch
+// text was only ever fed a hand-built `{kind:"absent"}` — so a regression that made it
+// unreachable (or that mis-summed `scanned`) failed nothing.
+test("#3175 d — two readable stores, refs for OTHER PRs only: `absent`, scanned = the SUM, and the refusal says a review HERE is needed", () => {
+  withTempHomeSync(() => {
+    const tmp = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-absent-"));
+    try {
+      const a = makeCrossBoxStore(tmp, "store-a", ["refs/reviews/other-repo-11", "refs/reviews/other-repo-12"]);
+      const b = makeCrossBoxStore(tmp, "store-b", ["refs/reviews/other-repo-13"]);
+      // Through the PRODUCTION path (`{crossBox:"probe"}` → `finishObservation`), with
+      // the stores pinned so the read is exactly these two and in this order.
+      const obs = observeReviewRecord(PR_2349, "owner/repo", { crossBox: "probe", stores: [a, b] });
+      equal(obs.record, null, "no local record in the empty temp home");
+      equal(
+        obs.crossBox.kind,
+        "absent",
+        `every candidate was READ and none has this PR's ref → absent: ${JSON.stringify(obs.crossBox)}`
+      );
+      ok(
+        obs.crossBox.kind === "absent" && obs.crossBox.scanned === 3,
+        `scanned is the SUM over every readable store (2+1): ${JSON.stringify(obs.crossBox)}`
+      );
+      ok(
+        obs.crossBox.kind === "absent" && obs.crossBox.store.includes(a) && obs.crossBox.store.includes(b),
+        "the negative NAMES every store it covers"
+      );
+      const reason = (evaluateMergeGate(
+        PR_2349, null, HEAD_2349, { source: "flag", repo: "owner/repo" }, false, null, null, obs
+      ) as any).reason as string;
+      equal(
+        (evaluateMergeGate(
+          PR_2349, null, HEAD_2349, { source: "flag", repo: "owner/repo" }, false, null, null, obs
+        ) as any).status,
+        "block",
+        "crossbox=absent is still a REFUSAL — the probe never decides"
+      );
+      ok(reason.includes("crossbox=absent"), "the decision path carries the measured state");
+      ok(
+        reason.includes("ABSENT — 3 refs read from every candidate store") && reason.includes(a) && reason.includes(b),
+        `the cross-box line states the measured scope:\n${reason}`
+      );
+      ok(
+        reason.includes("a review HERE is") && reason.includes("genuinely needed"),
+        "and the one state that MEANS 'pay for a review' gives that next action"
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── DIRECTION (e): `present` WINS over a failed sibling — the precedence the aggregator
+// deliberately implements (`:4215` returns before the `whys` check). Round-3 review P2:
+// the only `present` case was a FIRST-candidate hit, so flipping that precedence — the
+// other way to hide an existing record — failed no test.
+test("#3175 e — a HIT beats a FAILED sibling: `present` is reported after an unreadable earlier store", () => {
+  withTempHomeSync(() => {
+    const tmp = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-precedence-"));
+    try {
+      const broken = resolvePath(tmp, "broken");
+      execSync(`git init -q ${JSON.stringify(broken)}`, { stdio: "ignore" });
+      execSync(
+        `git -C ${JSON.stringify(broken)} remote add origin ${JSON.stringify(resolvePath(tmp, "nope.git"))}`,
+        { stdio: "ignore" }
+      );
+      const good = makeCrossBoxStore(tmp, "store-good", [CROSSBOX_REF_2349]);
+      // Order PINNED: the failure comes FIRST, so this can only pass if a hit on a later
+      // candidate wins instead of the `whys` check short-circuiting to `unmeasurable`.
+      const brokenFirst = crossBoxRecordState("owner/repo", PR_2349, { stores: [broken, good] });
+      equal(
+        brokenFirst.kind,
+        "present",
+        `a hit must beat a failed sibling: ${JSON.stringify(brokenFirst)}`
+      );
+      ok(
+        brokenFirst.kind === "present" && brokenFirst.store === good,
+        "and it names the store that ACTUALLY holds the ref"
+      );
+      const goodFirst = crossBoxRecordState("owner/repo", PR_2349, { stores: [good, broken] });
+      equal(goodFirst.kind, "present", "and the same holds with the order reversed");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── DIRECTION (f): the remedy is a COMMAND, never a pipeline (round-3 review P2).
+// `parts.join("   |   ")` pasted into a shell is a PIPE: both halves run, and in the
+// farmed layout both halves are the SAME script — plus the unmeasurable arm asked the
+// lane to "add --repo" to a two-command string it could not choose between.
+test("#3175 f — the fetch remedy is ONE command per line (`try:`/`or:`), never a pipe, and never the same script twice", () => {
+  withTempHomeSync(() => {
+    // (i) a single command, and it survives the hostile store path it must carry
+    const cmd = registrySyncCommand("/tmp/agent infra/it's $(rm -rf /)");
+    ok(!cmd.includes("|"), `a single RUNNABLE command, not a pipeline: ${cmd}`);
+    ok(
+      !cmd.includes("$(rm -rf /)") || cmd.includes(`'\\''`),
+      `the store is single-quoted with the quote escaped, so the paste is inert: ${cmd}`
+    );
+    // (ii) no duplicate candidate: on a farmed box the two paths resolve to ONE file
+    const options = registrySyncOptions("/tmp/agent-infra");
+    equal(
+      new Set(options.map((o) => o.path)).size,
+      options.length,
+      `each candidate is a DISTINCT file: ${JSON.stringify(options)}`
+    );
+    // (iii) the refusal renders them as alternatives, on their own lines
+    const obs = observeReviewRecord(PR_2349, "owner/repo", {
+      crossBox: { kind: "present", ref: CROSSBOX_REF_2349, store: "/tmp/agent-infra", scanned: 12 },
+    });
+    const reason = (evaluateMergeGate(
+      PR_2349, null, HEAD_2349, { source: "flag", repo: "owner/repo" }, false, null, null, obs
+    ) as any).reason as string;
+    ok(!/registry-sync\.sh pull[^\n]*\|/.test(reason), `no line pipes the fetch into anything:\n${reason}`);
+    const cmdLines = reason.split("\n").filter((l: string) => l.includes("registry-sync.sh pull"));
+    ok(cmdLines.length >= 1, `the remedy is present:\n${reason}`);
+    ok(
+      cmdLines.every((l: string) => /^\s+(try|or):/.test(l)),
+      `every candidate is labelled as an ALTERNATIVE (try:/or:), so one is run and the next is a fallback:\n${cmdLines.join("\n")}`
+    );
+    ok(
+      cmdLines.length === Math.max(1, options.filter((o) => o.present).length),
+      `one line per copy that EXISTS on this box (${options.filter((o) => o.present).length} here), never a dead path offered as the remedy`
+    );
+  });
 });
 
 // ── Summary ───────────────────────────────────────────
