@@ -905,17 +905,27 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     asserts the call ARRIVES at the gate -- which is where the load gate lives -- by recording it.
     If the routing is ever "simplified" back to a direct `pi` spawn, this goes RED.
 
-    ⛔ AND IT PINS THE OTHER HALF OF THE P0: the stub worker SLEEPS 3 s, so a CAPTURED call can only
-    return promptly if the worker subshell closed the parent's stdout/stderr (`exec >/dev/null
-    2>&1`). Without that line this test takes the worker's lifetime; measured pre-fix, 5.02 s for a
-    5 s worker. Removing the `exec` from the harness reddens THIS test and nothing else, which is
-    the point: pr-doctor no longer captures, so no shipped pr-doctor caller would notice.
+    ⛔ AND IT PINS THE OTHER HALF OF THE P0: the stub worker OUTLIVES the dispatcher's start window,
+    so a CAPTURED call can only return promptly if the worker subshell closed the parent's
+    stdout/stderr (`exec >/dev/null 2>&1`). Without that line this test takes the worker's lifetime;
+    measured for the shape below, ~12 s for a 12 s worker. Removing the `exec` from the harness
+    reddens THIS test and nothing else, which is the point: pr-doctor no longer captures, so no
+    shipped pr-doctor caller would notice.
+
+    ⛔ THE STUB MUST SATISFY THE DISPATCHER'S OWN START CONTRACT (agent-infra, measured 2026-10-31).
+    `nonblocking-dispatch.sh` no longer reports `launched` for a pid it captured — it asserts a
+    POSITIVE start after a settle window, and a worker that returns rc=0 having written NOT ONE LOG
+    BYTE is deliberately NOT a dispatch (exit 75). The stub therefore (a) writes a line to its own
+    log (`$2` of `run_agent`) as the evidence a lane ran, and (b) stays alive past the window, so the
+    verdict under test is `launched` rather than a race between `finished early` and `NOT STARTED`.
+    The window is pinned to the floor (2 s) via `NB_START_SETTLE` so this test stays fast.
     """
     d = tmp_path / "orch"
     d.mkdir()
     marker = tmp_path / "marker.txt"
     (d / "spawn-gate.sh").write_text(
-        'run_agent() { echo "GATED $*" > "$MARK"; sleep 3; echo ran; return 0; }\n')
+        'run_agent() { echo "GATED $*" > "$MARK"; echo "[worker] started" >> "$2"; '
+        'sleep 12; echo ran; return 0; }\n')
     # …and the REAL brief validator, because `nonblocking-dispatch.sh` refuses an unvalidated brief
     # in the FOREGROUND, before `run_agent` — which is the call this test asserts arrives (#2258).
     shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
@@ -928,14 +938,19 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     # dispatcher backgrounds anything, so the routing this test proves would never be exercised.
     prompt.write_text(subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--section", "worker"],
                                      capture_output=True, text=True, check=True).stdout)
-    env = dict(os.environ, O=str(d), MARK=str(marker))
+    env = dict(os.environ, O=str(d), MARK=str(marker), NB_START_SETTLE="2")
     nb = _HARNESS / "nonblocking-dispatch.sh"
     t0 = time.monotonic()
     r = subprocess.run(["bash", str(nb), "prd-1", str(wt), str(prompt), "5"],
                        capture_output=True, text=True, env=env, timeout=30)
     elapsed = time.monotonic() - t0
     assert r.returncode == 0, r.stderr
-    assert elapsed < 2.0, ("the captured call waited %.2fs for a 3 s worker -- the worker "
+    # Lower bound: the start assertion is NOT optional — the window (2 s) elapses before `launched`.
+    assert elapsed >= 2.0, ("the dispatcher returned in %.2fs, before its own start window -- "
+                            "the launch was reported without a positive start assertion" % elapsed)
+    # Upper bound: the worker (12 s) must NOT be waited on. If `exec >/dev/null 2>&1` is removed from
+    # the worker subshell, the captured call holds the caller's pipe for the worker's whole life.
+    assert elapsed < 6.0, ("the captured call waited %.2fs for a 12 s worker -- the worker "
                            "subshell is holding the caller's pipe" % elapsed)
     for _ in range(100):
         if marker.exists():
