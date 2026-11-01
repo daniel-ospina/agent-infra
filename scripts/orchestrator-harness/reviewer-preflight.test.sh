@@ -555,11 +555,17 @@ cp "$HERE/brief-gate.sh" "$STRIP/brief-gate.sh"
 # artifact, the exact vacuity this section exists to forbid (measured in CI: 133 passed, 2 failed).
 cp "$HERE/gate-policy.sh" "$STRIP/gate-policy.sh"
 # ⛔ AND `lane-env.sh`, WHICH BECAME THE SAME CLASS OF HARD REQUIREMENT (#3060, measured red in CI).
-# `lane.sh` refuses with 78 when the snippet is not beside it — a FAIL-CLOSED guard that is correct,
-# but it made this rig compose NOTHING (rc=78 `lane-env.sh missing`), so the control arms below were
-# vacuous in CI while passing on a box whose harness tree happened to hold the real copy. Same rule as
-# every other module here: copy it in, so the rig carries everything the lane hard-requires.
+# `lane.sh` refuses with 78 when the snippet is not beside it (L98) — a FAIL-CLOSED guard that is
+# correct, but it made this rig compose NOTHING (rc=78 `lane-env.sh missing`), so the control arms
+# below were vacuous in CI while passing on a box whose harness tree happened to hold the real copy.
 cp "$HERE/lane-env.sh" "$STRIP/lane-env.sh"
+# ⛔ AND THE WORKTREE LIFECYCLE MODULE (#2033), WHICH IS THE SAME CLASS OF HARD REQUIREMENT ONE STEP
+# SHARPER. `lane.sh` sources it for the empty-worktree reap and exits 78 without it (L164), so a rig
+# without it refused with `wt-lifecycle.sh missing` and the two arms below reported ✅/❌ on an empty
+# artifact, which is the vacuity this section exists to forbid (measured: 183 passed, 5 failed, every
+# one of them this). BOTH modules are copied: lane.sh hard-requires lane-env.sh at L98 AND
+# wt-lifecycle.sh at L164, so the rig needs the union or it composes nothing.
+cp "$HERE/wt-lifecycle.sh" "$STRIP/wt-lifecycle.sh"
 sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
 [ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
 # The cwd is the §C fixture — a checkout of `acme/widget` that this suite already proves works in CI —
@@ -601,6 +607,7 @@ cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$ST
 cp "$HERE/brief-gate.sh" "$STRIP2/brief-gate.sh"
 cp "$HERE/gate-policy.sh" "$STRIP2/gate-policy.sh"   # same hard requirement as the first rig (review, P1)
 cp "$HERE/lane-env.sh" "$STRIP2/lane-env.sh"         # …and so is lane-env.sh (#3060, measured rc=78 in CI)
+cp "$HERE/wt-lifecycle.sh" "$STRIP2/wt-lifecycle.sh"   # …and so is the lifecycle module (#2033)
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
 [ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
 mkdir -p "$TMP/o4/logs"
@@ -742,6 +749,7 @@ cp "$HERE/spawn-gate.sh" "$STRIPG/spawn-gate.sh"; cp "$LANE" "$STRIPG/lane.sh"
 cp "$HERE/repo-target.sh" "$STRIPG/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIPG/repo-slug.sh"
 cp "$HERE/brief-gate.sh" "$STRIPG/brief-gate.sh"; cp "$HERE/gate-policy.sh" "$STRIPG/gate-policy.sh"
 cp "$HERE/lane-env.sh" "$STRIPG/lane-env.sh"   # the third hard requirement (#3060) — see the first rig's note
+cp "$HERE/wt-lifecycle.sh" "$STRIPG/wt-lifecycle.sh"   # #2033: refusing on a MISSING module is this rig's own bug, not the guard's verdict
 sed "s#^DELIVERY_BRIEF_HEADING=.*#DELIVERY_BRIEF_HEADING=''#" "$HELPER" > "$STRIPG/reviewer-preflight.sh"
 grep -q "^DELIVERY_BRIEF_HEADING=''$" "$STRIPG/reviewer-preflight.sh"; ck $? "the heading-stripped helper copy was produced"
 for _rigbr in fix/stripg; do git -C "$TMP" update-ref "refs/heads/$_rigbr" HEAD 2>/dev/null || true; done
