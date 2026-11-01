@@ -2452,7 +2452,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # arm: the two shim codes say two different things, and collapsing them would report a load
   # refusal for a box whose load is fine — sending the operator to watch a number that will never
   # move while lanes keep dying. The message does NOT assert why the shim refused (it cannot know
-  # that a `pi` exiting 72 for its own reason did not do so); it points at the [pi-gate] line, which
+  # that a `pi` exiting 82 for its own reason did not do so); it points at the [pi-gate] line, which
   # carries the reading and the arithmetic, and it names the remedy the code selects.
   if [ "$rc" = "$PI_GATE_MEM_REFUSED" ]; then
     AGENT_STARTED=0
