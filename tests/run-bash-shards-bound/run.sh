@@ -90,6 +90,12 @@ stage_fixture() {
   {
     printf '#!/bin/bash\n'
     printf '# the hung shard: it blocks INSIDE A CHILD, like shard #103 of 148 did\n'
+    # ⛔ REFUSE TO RUN WHEN THE PID DIRECTORY IS UNSET (review cycle 7, P3). `$HANG_PID_DIR/self.pid`
+    # with the variable unset expands to `/self.pid`: a suppressed permission-denied on a normal host,
+    # and a file OUTSIDE $TMP under a root CI container — which this suite's HERMETIC promise forbids,
+    # and which no assertion could see because the shard still "passed". Measured: arm 6c was launched
+    # without the variable. This makes ANY future omission a RED instead of a silent write attempt.
+    printf 'if [ -z "${HANG_PID_DIR:-}" ] || [ "${HANG_PID_DIR}" = "/" ]; then printf "%%s\\n" "FIXTURE-BUG: HANG_PID_DIR is unset or / — the fixture would write outside its tree"; exit 97; fi\n'
     printf 'mkdir -p "$HANG_PID_DIR" 2>/dev/null\n'
     printf 'printf "%%s\\n" "$$" >>"$HANG_PID_DIR/self.pid"\n'
     printf 'sleep %s &\n' "$hang"
@@ -521,18 +527,59 @@ stage_fixture "$LEADER" 0
 # subshell would be the leader and the runner its child — the shape the finding is about (a foreground
 # job of an interactive shell) would not be reproduced, measured: the arm passed with the bug restored.
 # The runner anchors its discovery on the tree it lives in, so no `cd` is needed here.
+# ⛔ HANG_PID_DIR IS SET HERE TOO (review cycle 7, P3): the fixture's hang shard writes
+# `$HANG_PID_DIR/self.pid`, and with the variable UNSET that path is `/self.pid` — a suppressed
+# permission-denied on a normal host, and a file created OUTSIDE $TMP under a root CI container, which
+# this suite's HERMETIC promise forbids. Every other fixture run in this file sets it.
 set -m
-SHARD_BOUND=60 bash "$LEADER/scripts/runner.sh" >"$TMP/leader.out" 2>&1 &
+HANG_PID_DIR="$TMP/pids-leader" SHARD_BOUND=60 bash "$LEADER/scripts/runner.sh" >"$TMP/leader.out" 2>&1 &
 LEADER_JOB=$!
 set +m
 wait "$LEADER_JOB" 2>/dev/null
 LEADER_RC=$?
 LOUT="$(cat "$TMP/leader.out")"
-if [ "$LEADER_RC" -eq 0 ] && grep -q 'BEFORE-RAN' <<<"$LOUT" && grep -q 'AFTER-RAN' <<<"$LOUT" \
-   && grep -q 'all 3 bash shards passed' <<<"$LOUT"; then
+# one predicate, so the arm and its control are judged by EXACTLY the same rule
+leader_whole_list() {  # <rc> <out file>
+  [ "$1" -eq 0 ] && grep -q 'BEFORE-RAN' "$2" && grep -q 'AFTER-RAN' "$2" \
+    && grep -q 'all 3 bash shards passed' "$2"
+}
+if leader_whole_list "$LEADER_RC" "$TMP/leader.out"; then
   pass "a GROUP-LEADER driver runs the WHOLE list (rc 0, all 3 shards, recap) — no self-signal on bash 3.2"
 else
   fail "a group-leader driver exited rc $LEADER_RC with $(grep -c '  ▸' <<<"$LOUT") shard row(s) — the run was cut short ($(printf '%s' "$LOUT" | tail -1))"
+fi
+# ⛔ THE CONTROL, AND WHY IT IS SPELLED `$$` AND NOT `${BASHPID:-$$}` (review cycle 7, P3). The bug this
+# arm pins was `kill -TERM -- -"${BASHPID:-$$}"` in the watchdog's TERM trap: on bash 3.2 `BASHPID`
+# does not exist, so it evaluates to `$$` — the DRIVER's pid — and the per-shard teardown signals the
+# driver's own group. Restoring THAT spelling cannot discriminate on bash 5 (there `BASHPID` is the
+# watchdog's own pid, i.e. harmless), and CI runs bash 5, so this arm would be green EITHER WAY on the
+# platform it is judged on. The control therefore restores the same BEHAVIOUR in the one spelling that
+# means it on EVERY bash — a bare `$$` — and requires this arm's own predicate to go red.
+LEADER_CTRL="$TMP/leader-ctrl"
+stage_fixture "$LEADER_CTRL" 0
+awk '
+  /^  trap .*TERM INT HUP$/ {
+    print "  trap \047kill \"${shard_timer_pid:-}\" 2>/dev/null; kill -TERM -- -$$ 2>/dev/null; exit 0\047 TERM INT HUP"
+    next
+  }
+  { print }
+' "$LEADER_CTRL/scripts/runner.sh" >"$LEADER_CTRL/scripts/runner.mut.sh"
+if [ ! -s "$LEADER_CTRL/scripts/runner.mut.sh" ] \
+   || cmp -s "$LEADER_CTRL/scripts/runner.sh" "$LEADER_CTRL/scripts/runner.mut.sh"; then
+  fail "the self-signal mutation did not change the fixture runner — arm 6c has no control on this bash"
+else
+  cp "$LEADER_CTRL/scripts/runner.mut.sh" "$LEADER_CTRL/scripts/runner.sh"
+  set -m
+  HANG_PID_DIR="$TMP/pids-leader-ctrl" SHARD_BOUND=60 bash "$LEADER_CTRL/scripts/runner.sh" >"$TMP/leader-ctrl.out" 2>&1 &
+  CTRL_JOB=$!
+  set +m
+  wait "$CTRL_JOB" 2>/dev/null
+  CTRL_RC=$?
+  if leader_whole_list "$CTRL_RC" "$TMP/leader-ctrl.out"; then
+    fail "control: the pre-fix self-signal (\`kill -TERM -- -\$\$\` from the watchdog) still ran the WHOLE list (rc $CTRL_RC) — arm 6c cannot see the bug it claims to pin on this bash"
+  else
+    pass "control: the pre-fix self-signal cuts the run short (rc $CTRL_RC, $(grep -c '  ▸' "$TMP/leader-ctrl.out") shard row(s)) — arm 6c discriminates on bash 5 as well as 3.2"
+  fi
 fi
 
 # 6d. AN UNREADABLE `ps` MUST NOT DISARM THE BOUND (review cycle 2, P1, measured). The zombie guard
@@ -605,7 +652,21 @@ else
 fi
 SIGFIX_HUP="$TMP/sig-hup"
 stage_fixture "$SIGFIX_HUP" 60
-HANG_PID_DIR="$TMP/pids-sig-hup" SHARD_BOUND=1800 bash "$SIGFIX_HUP/scripts/runner.sh" >"$TMP/sig-hup.out" 2>&1 &
+# ⛔ THE HUP RUN GETS A `mktemp` SHIM, SO ITS TEMP FILES ARE FINDABLE (review cycle 7, P3). The HUP
+# branch of the handler used to `exit "$1"` directly instead of going through `shard_exit`, so the
+# driver's ran/skip/timeout files survived in the temp dir on EVERY terminal hangup — while the file's
+# stated residual bounds that leak to `kill -9`/OOM only. The paths are decided by `mktemp` at runtime
+# (and BSD `mktemp` ignores TMPDIR), so the only hermetic way to see them is to shim it and read back
+# what it created.
+mkdir -p "$TMP/mktemp-shim" "$TMP/hup-tmp"
+cat >"$TMP/mktemp-shim/mktemp" <<MKTEMP
+#!/bin/bash
+p="\$(/usr/bin/mktemp "$TMP/hup-tmp/tmp.XXXXXXXX")" || exit 1
+printf '%s\\n' "\$p" >>"$TMP/hup-tmp/made"
+printf '%s\\n' "\$p"
+MKTEMP
+chmod +x "$TMP/mktemp-shim/mktemp"
+PATH="$TMP/mktemp-shim:$PATH" HANG_PID_DIR="$TMP/pids-sig-hup" SHARD_BOUND=1800 bash "$SIGFIX_HUP/scripts/runner.sh" >"$TMP/sig-hup.out" 2>&1 &
 SIGHUP_DRV=$!
 _n=0
 while [ "$_n" -lt 100 ]; do
@@ -631,6 +692,29 @@ elif [ -n "$SIGHUP_SURVIVORS" ]; then
   fail "a HUP to the driver left the shard alive:$SIGHUP_SURVIVORS"
 else
   pass "a HUP to the driver takes the shard and its child with it"
+fi
+# ⛔ AND THE HUP MUST CARRY THE DRIVER'S BOOKKEEPING AWAY WITH IT (review cycle 7, P3). Read back what
+# the `mktemp` shim above created: every path it handed out must be GONE, because the handler now ends
+# in `shard_exit` (cleanup) rather than a bare `exit`.
+if [ ! -s "$TMP/hup-tmp/made" ]; then
+  fail "the mktemp shim was never used — the HUP cleanup assertion below would be vacuous"
+else
+  # ONE `mktemp`, THREE artifacts: the runner derives `.skipped` and `.timeout` from the single path it
+  # got back, so all three are checked and all three must be gone.
+  HUP_MADE=0
+  HUP_LEFT=0
+  while IFS= read -r _p; do
+    [ -n "$_p" ] || continue
+    HUP_MADE=$((HUP_MADE + 1))
+    for _s in "" .skipped .timeout; do [ -e "$_p$_s" ] && HUP_LEFT=$((HUP_LEFT + 1)); done
+  done <"$TMP/hup-tmp/made"
+  if [ "$HUP_MADE" -lt 1 ]; then
+    fail "the HUP run recorded no temp path at all — this arm proves nothing"
+  elif [ "$HUP_LEFT" -ne 0 ]; then
+    fail "a HUP left $HUP_LEFT of $((HUP_MADE * 3)) temp artifact(s) behind — the handler exited WITHOUT shard_cleanup"
+  else
+    pass "a HUP carries the driver's bookkeeping away with it (all $((HUP_MADE * 3)) temp artifacts removed)"
+  fi
 fi
 # 6f. AND THE DOCUMENTED RESIDUAL: SIGKILL cannot be trapped. What saves the run is the WATCHDOG, which
 # is orphaned but still holding the bound — so this arm pins BOTH halves of the truth the PR body states:
@@ -675,8 +759,20 @@ HANG_PID_DIR="$TMP/pids-sliceclean" SHARD_BOUND=1800 BASH_SHARD_SLICE=1/1 bash "
 # 3 shards ran, so the log the coverage check compares must hold all 3
 SLICE_ROWS="$(grep -c '  ▸' "$TMP/sliceclean.out")"
 SLICEMUT="$TMP/sliceclean-mutant.sh"
+# ⛔ THE CONTROL INJECTS THE WIPE ITSELF, NOT THE `EXIT` TRAP THAT USED TO CARRY IT (review cycle 7,
+# U1, measured on this host). The control used to re-install `trap 'rm -f …' EXIT` and require the same
+# sliced run to go red in ≥1 of 6 attempts — which depends on bash running an INHERITED `EXIT` trap
+# inside the forked child of a background FUNCTION. Probed on this host: /bin/bash 3.2.57 and bash 5.3
+# both run that trap ONCE, in the DRIVER, at script exit (`BASH_SUBSHELL=0`) — so the control red-not in
+# 0 of 6 on BOTH, and this arm was a false red wherever the child does not inherit the trap. The
+# regression being pinned is not "an EXIT trap" — it is "the driver's bookkeeping gets wiped after a
+# shard", so the control now does exactly that, deterministically, on every bash.
 awk '
-  /^shard_cleanup\(\) \{ rm -f/ { print "trap \047rm -f \"$shard_ran_log\" \"$shard_skip_log\" \"$shard_timeout_marker\"\047 EXIT"; print; next }
+  /^shard_watchdog\(\) \{$/ {
+    print
+    print "  rm -f \"$shard_ran_log\" \"$shard_skip_log\" \"$shard_timeout_marker\""
+    next
+  }
   { print }
 ' "$SLICEFIX/scripts/runner.sh" >"$SLICEMUT"
 if [ "$SLICE_RC" -ne 0 ]; then
@@ -684,20 +780,17 @@ if [ "$SLICE_RC" -ne 0 ]; then
 elif [ "$SLICE_ROWS" -ne 3 ]; then
   fail "a 3-shard sliced run printed $SLICE_ROWS timing row(s), not 3 — this arm proves nothing"
 elif cmp -s "$SLICEFIX/scripts/runner.sh" "$SLICEMUT"; then
-  fail "the EXIT-trap mutation did not change the runner — the 'no wipe' assertion has no control"
+  fail "the teardown-wipe mutation did not change the runner — the 'no wipe' assertion has no control"
 else
-  # the control: re-install the destructive EXIT trap. It must make the same sliced run red.
+  # the control: make the watchdog wipe the driver's logs. It must make the same sliced run red, and
+  # the FIRST attempt is enough — the wipe is a certainty, not a schedule.
   cp "$SLICEMUT" "$SLICEFIX/scripts/runner.sh"
   MUT_RC=0
-  MUT_BAD=0
-  for _i in 1 2 3 4 5 6; do
-    HANG_PID_DIR="$TMP/pids-slicemut" SHARD_BOUND=1800 BASH_SHARD_SLICE=1/1 bash "$SLICEFIX/scripts/runner.sh" >/dev/null 2>&1 || MUT_BAD=$((MUT_BAD + 1))
-  done
-  MUT_RC=$MUT_BAD
+  HANG_PID_DIR="$TMP/pids-slicemut" SHARD_BOUND=1800 BASH_SHARD_SLICE=1/1 bash "$SLICEFIX/scripts/runner.sh" >"$TMP/sliceclean-mut.out" 2>&1 || MUT_RC=$?
   if [ "$MUT_RC" -ge 1 ]; then
-    pass "a shard teardown does NOT wipe the driver's ran/skip/timeout logs, and re-arming the EXIT trap reds the same sliced run ($MUT_RC of 6)"
+    pass "a shard teardown does NOT wipe the driver's ran/skip/timeout logs, and re-arming the wipe reds the same sliced run (rc $MUT_RC)"
   else
-    fail "the EXIT-trap control did not red the sliced run in 6 attempts — the assertion above cannot see the wipe it guards"
+    fail "the teardown-wipe control did not red the sliced run (rc 0) — the assertion above cannot see the wipe it guards"
   fi
 fi
 
@@ -768,6 +861,139 @@ else
   kill -KILL "$OWN_FOREIGN" 2>/dev/null
 fi
 
+# ── 11. THE WATCHDOG'S OWN TEARDOWN NAMES A BARE PID ONLY WHILE IT IS STILL OURS (cycle 7, P2) ────
+# `kill -TERM -"$shard_wd_pid" || kill -TERM "$shard_wd_pid"` takes the `||` branch EXACTLY when the
+# group is empty — i.e. when the watchdog (which EXITS BY ITSELF after firing the bound) and its timer
+# are both gone. Its number is then free, or already handed to another process, so the unguarded
+# fallback was a signal aimed at whatever now owns it; the post-reap `kill -KILL -"$shard_wd_pid"` had
+# the same problem one `wait` later. Both now go through `shard_wd_term`/`shard_wd_kill`, which is what
+# `shard_driver_signal` and the per-shard teardown call.
+# ⛔ LIFTED AND EXERCISED, NOT GREPPED: staging a real pid-reuse race is not hermetic, so the units are
+# read out of the shipped runner and run against a LOGGING `kill`, which records the signal it was
+# asked to send. Each case states the decision that matters, and the control proves case (b) is not
+# vacuous (gut the ownership comparison and the foreign pid gets signalled).
+WDEARM="$TMP/wdteardown"
+mkdir -p "$WDEARM"
+sed -n '/^shard_pid_is_mine() {$/,/^}$/p' "$RUNNER" >"$WDEARM/pid_is_mine.sh"
+sed -n '/^shard_wd_term() {$/,/^}$/p' "$RUNNER" >"$WDEARM/wd_term.sh"
+sed -n '/^shard_wd_kill() {$/,/^}$/p' "$RUNNER" >"$WDEARM/wd_kill.sh"
+if [ ! -s "$WDEARM/pid_is_mine.sh" ] || [ ! -s "$WDEARM/wd_term.sh" ] || [ ! -s "$WDEARM/wd_kill.sh" ]; then
+  fail "cannot lift shard_pid_is_mine/shard_wd_term/shard_wd_kill out of the runner — the gated teardown does not exist"
+else
+  cat >"$WDEARM/harness.sh" <<'WDHARNESS'
+#!/bin/bash
+# usage: harness.sh <fn-dir> <siglog> <case> — one teardown decision, with `kill` logged instead of hidden
+set -uo pipefail
+FNDIR="$1"; SIGLOG="$2"; CASE="$3"
+: >"$SIGLOG"
+. "$FNDIR/pid_is_mine.sh" || exit 3
+. "$FNDIR/wd_term.sh" || exit 3
+. "$FNDIR/wd_kill.sh" || exit 3
+kill() { printf '%s\n' "$*" >>"$SIGLOG"; builtin kill "$@" 2>/dev/null; }
+case "$CASE" in
+  ours)
+    # a direct child of THIS shell, in THIS shell's group (no job control): the group TERM fails ESRCH,
+    # so the bare-pid fallback is the only thing that can reach it — and it must be allowed
+    sleep 20 & p=$!
+    shard_wd_term "$p"
+    builtin kill -KILL "$p" 2>/dev/null
+    ;;
+  foreign)
+    # a live pid whose parent has exited: "the number now names someone else"
+    p="$(bash -c 'sleep 20 >/dev/null 2>&1 & printf "%s\n" "$!"')"
+    sleep 0.5
+    shard_wd_term "$p"
+    builtin kill -KILL "$p" 2>/dev/null
+    ;;
+  gone)
+    # a pid that is already REAPED (free), the ordering the bound creates when the watchdog exits first
+    sleep 20 & p=$!
+    builtin kill -KILL "$p" 2>/dev/null
+    wait "$p" 2>/dev/null
+    shard_wd_term "$p"
+    shard_wd_kill "$p"
+    ;;
+  held)
+    # a group that IS still there: the group TERM succeeds, so the post-reap group KILL must follow
+    set -m
+    sleep 20 & p=$!
+    set +m
+    shard_wd_term "$p"
+    shard_wd_kill "$p"
+    builtin kill -KILL "$p" 2>/dev/null
+    ;;
+  *) exit 4 ;;
+esac
+printf '%s\n' "$p" >"$SIGLOG.pid"
+exit 0
+WDHARNESS
+  wd_run() {  # <fn dir> <tag> <case>
+    bash "$WDEARM/harness.sh" "$1" "$WDEARM/sig-$2.log" "$3" 2>/dev/null
+    printf '%s\n' "$?" >"$WDEARM/rc-$2"
+  }
+  wd_pid() { cat "$WDEARM/sig-$1.log.pid" 2>/dev/null; }
+  wd_sig() { grep -qxF -- "$2" "$WDEARM/sig-$1.log" 2>/dev/null; }
+
+  wd_run "$WDEARM" ours ours
+  WD_P="$(wd_pid ours)"
+  if [ ! -s "$WDEARM/rc-ours" ] || [ "$(cat "$WDEARM/rc-ours")" -ne 0 ] || [ -z "$WD_P" ]; then
+    fail "the teardown harness did not run case (a) — this arm proves nothing"
+  elif wd_sig ours "-TERM -$WD_P" && wd_sig ours "-TERM $WD_P"; then
+    pass "a real child (no group of its own) still gets the bare-pid TERM after the group TERM fails"
+  else
+    fail "case (a): the group TERM $(wd_sig ours "-TERM -$WD_P" && echo ran || echo missing) and the bare TERM $(wd_sig ours "-TERM $WD_P" && echo ran || echo missing) — a live shard-watchdog would never be signalled"
+  fi
+
+  wd_run "$WDEARM" foreign foreign
+  WD_F="$(wd_pid foreign)"
+  if [ ! -s "$WDEARM/rc-foreign" ] || [ "$(cat "$WDEARM/rc-foreign")" -ne 0 ] || [ -z "$WD_F" ]; then
+    fail "the teardown harness did not run case (b) — this arm proves nothing"
+  elif wd_sig foreign "-TERM $WD_F"; then
+    fail "the teardown sent a bare TERM to pid $WD_F, which is not this driver's child — a freed pid that got recycled would be signalled"
+  else
+    pass "a pid that no longer belongs to this driver is NOT signalled (only the group form was attempted)"
+  fi
+
+  wd_run "$WDEARM" gone gone
+  WD_G="$(wd_pid gone)"
+  if [ ! -s "$WDEARM/rc-gone" ] || [ "$(cat "$WDEARM/rc-gone")" -ne 0 ] || [ -z "$WD_G" ]; then
+    fail "the teardown harness did not run case (c) — this arm proves nothing"
+  elif wd_sig gone "-KILL -$WD_G" || wd_sig gone "-TERM $WD_G"; then
+    fail "an ALREADY-FREED pid ($WD_G) was signalled anyway — that is the SIGKILL-at-a-freed-number the file bans"
+  else
+    pass "an already-freed watchdog pid is left alone: no bare signal, and no group KILL for a group that was gone"
+  fi
+
+  wd_run "$WDEARM" held held
+  WD_H="$(wd_pid held)"
+  if [ ! -s "$WDEARM/rc-held" ] || [ "$(cat "$WDEARM/rc-held")" -ne 0 ] || [ -z "$WD_H" ]; then
+    fail "the teardown harness did not run case (d) — this arm proves nothing"
+  elif wd_sig held "-KILL -$WD_H"; then
+    pass "a group that WAS still there gets the post-reap group KILL — the leak fix is not disarmed by the new gate"
+  else
+    fail "case (d): the post-reap group KILL did not fire for a group that was observed alive — a leaked timer would now survive"
+  fi
+
+  # ⛔ CONTROL for case (b): with the parent comparison gutted, a FOREIGN pid must be signalled. Otherwise
+  # (b) may be passing because the fixture was already dead rather than because of the ownership gate.
+  sed 's|\[ "\$_w" = "\$\$" \]|[ -n "$_w" ]|' "$WDEARM/pid_is_mine.sh" >"$WDEARM/pid_is_mine-gutted.sh"
+  if cmp -s "$WDEARM/pid_is_mine.sh" "$WDEARM/pid_is_mine-gutted.sh"; then
+    fail "the ownership-gate mutation did not change the lifted function — case (b) has no control"
+  else
+    mkdir -p "$WDEARM/gutted"
+    cp "$WDEARM/pid_is_mine-gutted.sh" "$WDEARM/gutted/pid_is_mine.sh"
+    cp "$WDEARM/wd_term.sh" "$WDEARM/gutted/wd_term.sh"
+    cp "$WDEARM/wd_kill.sh" "$WDEARM/gutted/wd_kill.sh"
+    wd_run "$WDEARM/gutted" foreign-gut foreign
+    WD_FG="$(wd_pid foreign-gut)"
+    if [ -n "$WD_FG" ] && wd_sig foreign-gut "-TERM $WD_FG"; then
+      pass "control: with the parent comparison removed the foreign pid IS signalled — case (b) is not vacuous"
+    else
+      fail "control: the gutted ownership gate still refused the foreign pid — case (b) passes for the wrong reason"
+    fi
+  fi
+fi
+
 echo ""
 echo "7. NO TIMER MAY HOLD THE CALLER'S PIPE (the regression that hung tests/ci-lane-parity)"
 # ⛔ A watchdog's `sleep <bound>` INHERITS STDOUT. A caller that runs this driver inside `$( … )` or a
@@ -818,8 +1044,13 @@ awk '
   /^  set \+m$/ { print "  :   # job-control reset removed by the control"; next }
   /^  trap .kill .*shard_timer_pid/ { print "  :   # trap removed by the control"; next }
   /^  shard_watchdog >\/dev\/null 2>&1 &$/ { print "  shard_watchdog &"; next }
-  /^  kill -TERM -"\$shard_wd_pid" 2>\/dev\/null \|\| kill -TERM "\$shard_wd_pid"/ { print "  kill -TERM \"$shard_wd_pid\" 2>/dev/null"; next }
-  /^  kill -KILL -"\$shard_wd_pid" 2>\/dev\/null$/ { print "  :   # post-reap group KILL removed by the control"; next }
+  # ⛔ THE TEARDOWN IS NOW TWO CALLS (`shard_wd_term`/`shard_wd_kill`), so the control rewrites the CALLS:
+  # a bare TERM to the watchdog (nothing reaches its timer group) and no post-reap pass at all. The old
+  # literal here matched the inlined `kill … || kill …` line, which no longer exists — MEASURED: with the
+  # stale pattern the mutation still applied (other arms fired) but left no timer, so this control red-ed
+  # for the wrong reason and arm 7a had no discriminating partner.
+  /^  shard_wd_term "\$shard_wd_pid"$/ { print "  kill -TERM \"$shard_wd_pid\" 2>/dev/null"; next }
+  /^  shard_wd_kill "\$shard_wd_pid"$/ { print "  :   # post-reap group KILL removed by the control"; next }
   { print }
 ' "$MUTPIPE/scripts/runner.sh" >"$TMP/runner-leaky.sh"
 if cmp -s "$MUTPIPE/scripts/runner.sh" "$TMP/runner-leaky.sh"; then

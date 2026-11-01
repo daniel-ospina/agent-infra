@@ -483,20 +483,6 @@ shard_timeout_marker="${shard_ran_log}.timeout"
 : > "$shard_ran_log" 2>/dev/null || true
 : > "$shard_skip_log" 2>/dev/null || true
 : > "$shard_timeout_marker" 2>/dev/null || true
-# ⛔ THE CLEANUP RUNS IN THE DRIVER ONLY, AND THE TEST IS `BASH_SUBSHELL` — a VARIABLE FLAG CANNOT DO
-# IT. `shard_watchdog` is a forked subshell, and bash runs this EXIT trap INSIDE forked children of the
-# driver (measured: the trapping shell reports `BASH_SUBSHELL=1`, and `FUNCNAME=[shard_run_bounded
-# run_shard main]` — it forks around the `shard_watchdog … &` job and never enters that function). So
-# every per-shard teardown DELETED the driver's ran/skip/timeout logs mid-run. The symptom was not a
-# crash but a LIE: the slice-coverage self-check then read a log holding only the LAST shard and
-# reported `slice N/M executed a DIFFERENT SET of shards than its index derives` — measured **11 of 20**
-# sliced runs, i.e. a flaky FALSE RED on exactly the sliced callers CI uses (`ci.yml`'s bash-suites
-# matrix) — and a deleted timeout marker would make a real bound-hit unattributable too.
-# Both wrong fixes were tried and MEASURED: `trap - EXIT` at the top of the watchdog does not suppress
-# it, and a `shard_logs_owned` flag cleared in the child does not either — the trapping shell is forked
-# BEFORE the function body runs, so it never executes the clear. `BASH_SUBSHELL` (bash 3.0+, so it is
-# present on the 3.2 the repo supports — unlike `BASHPID`) is the property that actually distinguishes
-# them: 0 in the driver, ≥1 in every forked child. Pinned by arm 2d of `tests/run-bash-shards-bound`.
 # ── CLEANUP IS EXPLICIT, NOT AN EXIT TRAP — AND THAT IS A MEASURED DECISION, NOT A STYLE CHOICE ────
 # `shard_watchdog` runs in a FORKED subshell, and bash executes an inherited EXIT trap inside forked
 # children of the driver. Measured: the trapping shell is the watchdog itself (`BASHPID` == the
@@ -516,6 +502,9 @@ shard_timeout_marker="${shard_ran_log}.timeout"
 # ⚠️ STATED RESIDUAL: a shell that forked BEFORE those calls (a crash, `kill -9` of the driver) leaves
 # the three temp files in $TMPDIR. They are three small empty files; a killed run has nothing to
 # report anyway, and the alternative was corrupting the bookkeeping of runs that DID finish.
+# ⛔ A HUP IS NOT THAT RESIDUAL: it is an ordinary exit path, so `shard_driver_signal` routes it through
+# `shard_exit` too. Pinned — like the no-wipe property itself — by `tests/run-bash-shards-bound`
+# (arm 2d, and the HUP cleanup assertion that reads back what a `mktemp` shim handed out).
 # (`shard_cleanup`/`shard_exit` are defined near the top — the driver's early refusals
 # below use them, so they must exist before any of it runs.)
 
@@ -550,18 +539,24 @@ shard_driver_signal() {
   # `shard_kill_group` gives the group the same TERM→grace→KILL the bound gives (needed here: a
   # TERM-deaf shard must not outlive a cancelled step).
   [ -n "${shard_bg_pid:-}" ] && shard_kill_group "$shard_bg_pid"
-  # The WATCHDOG is still alive when this trap runs (it is counting down), so a bare-pid fallback IS
-  # meaningful for it — that is the one place in this file where it is.
-  [ -n "${shard_wd_pid:-}" ] && { kill -TERM -"$shard_wd_pid" 2>/dev/null || kill -TERM "$shard_wd_pid" 2>/dev/null; }
+  # The WATCHDOG is usually still counting down when this trap runs, so the GROUP TERM reaches it — but
+  # "usually alive" is a claim about the common case, not an invariant: it can have exited on its own
+  # (after firing the bound) and been reaped, which FREES its number. So even here the bare-pid fallback
+  # is gated on ownership, by the same helper the per-shard teardown uses (`shard_wd_term`).
+  [ -n "${shard_wd_pid:-}" ] && shard_wd_term "$shard_wd_pid"
   # ⛔ THEN THE #3174 CONTRACT: a TERM/INT'd run is TRUNCATED, so it must NAME itself INCOMPLETE and
   # exit 1 rather than certifying a hole. `shard_partial_recap` prints from what accumulated and
   # exits 1 (never 0), which is what `scripts/ci-failure-set.sh` refuses to fold into a baseline.
   # HUP keeps the pre-#3174 exit code (129): it is a terminal hangup, not a cancellation, and it is
   # non-zero either way, so nothing about it can read GREEN. The recap is the ONLY wording here —
   # the signal number is what the caller reads to tell the two apart.
+  # ⛔ HUP EXITS THROUGH `shard_exit` TOO, not a bare `exit` (#3187 review, P3): "cleanup is called by
+  # `shard_exit`, which every driver exit goes through" is a claim about ALL exits, and a terminal
+  # hangup is an ordinary exit path, not the `kill -9` the stated residual covers. A bare `exit` here
+  # left `$shard_ran_log`, `.skipped` and `.timeout` behind in $TMPDIR on every HUP.
   case "${2:-}" in
     TERM|INT) shard_partial_recap "$2" ;;
-    *)        exit "$1" ;;
+    *)        shard_exit "${1:-129}" ;;
   esac
 }
 trap 'shard_driver_signal 129 HUP' HUP
@@ -725,10 +720,11 @@ shard_watchdog() {
   fi
 }
 
-# shard_pid_is_mine <pid> — does <pid> STILL name the shard this watchdog is guarding?
-# Used ONLY by the no-group fallback above, immediately before a bare-pid `SIGKILL`: at that instant
-# the pid may already be FREE (the driver reaped its child during the grace second), so "it exists"
-# and even "it is alive" are NOT answers. Two things are checked, and both are required:
+# shard_pid_is_mine <pid> — does <pid> STILL name a live child of THIS driver?
+# Used at every bare-pid signal site: the shard's no-group fallback above (immediately before a bare-pid
+# `SIGKILL`) and `shard_wd_term`'s watchdog fallback (immediately before a bare `TERM`). At both instants
+# the pid may already be FREE (the driver reaped its child), so "it exists" and even "it is alive" are
+# NOT answers. Two things are checked, and both are required:
 #   • not a ZOMBIE — the shard is a child of the DRIVER, so nobody reaps it but the driver's `wait`;
 #     `ps -o stat=` reads `Z` on BSD and GNU for a child that exited and has not been reaped yet.
 #   • the pid's PARENT IS THE DRIVER — the pid can only name our shard if the driver is still its
@@ -751,6 +747,41 @@ shard_pid_is_mine() {
   return 1
 }
 
+# shard_wd_term <watchdog pid> — TERM the watchdog's PROCESS GROUP, and fall back to its bare pid ONLY
+# while that pid still demonstrably belongs to this driver (#3187 review, P2).
+# ⛔ WHY THE FALLBACK NEEDS A GATE AT ALL. `kill -TERM -<pgid>` fails with ESRCH exactly when NO member
+# of that group is alive any more — and the watchdog can get there first, because it EXITS BY ITSELF
+# once it has fired the bound. Its number is then free (or already handed to another process), so the
+# unguarded `|| kill -TERM "$shard_wd_pid"` this replaces was a signal aimed at whatever now owns it.
+# `shard_pid_is_mine` answers "is this still OUR live child", which is the only question a bare-pid
+# signal may act on — the same rule the shard's own no-group fallback already follows.
+# ⛔ AND IT RECORDS WHAT THE GROUP READ SAID, because the second pass (`shard_wd_kill`) runs AFTER
+# `wait` has reaped the leader: an empty group here means there is nothing left to collect, and the
+# pgid may be recycled, so that pass must not run at all.
+shard_wd_term() {
+  [ -n "${1:-}" ] || return 0
+  shard_wd_group_held=0
+  kill -TERM -"$1" 2>/dev/null && shard_wd_group_held=1
+  if [ "$shard_wd_group_held" = 0 ] && shard_pid_is_mine "$1"; then
+    kill -TERM "$1" 2>/dev/null
+  fi
+  return 0
+}
+
+# shard_wd_kill <watchdog pgid> — the second, post-reap pass on the group, taken only when
+# `shard_wd_term` OBSERVED a member there (that read, not the wording, is what makes the pgid ours).
+# ⚠️ STATED RESIDUAL: if the last member died between that read and this line, the number is free once
+# more and could in principle be recycled inside that window — a microsecond window, and there is no
+# portable way to close it (the identity we would need is the leader's, and reaping it is exactly what
+# frees the number). What this DOES remove is the unconditional form's guarantee: that the signal is
+# aimed at a number THIS RUN has already been told is empty.
+shard_wd_kill() {
+  [ -n "${1:-}" ] || return 0
+  [ "${shard_wd_group_held:-0}" = 1 ] || return 0
+  kill -KILL -"$1" 2>/dev/null
+  return 0
+}
+
 # shard_kill_group <pgid> — TERM then KILL one shard's PROCESS GROUP. NEVER a bare pid.
 # ⛔ NO BARE-PID FALLBACK IN THIS FUNCTION (review cycle 3 found the unguarded one; cycle 4 found the
 # GUARD inverted). BOTH call sites run AFTER `wait` has reaped the leader, so its pid is already FREE —
@@ -759,10 +790,16 @@ shard_pid_is_mine() {
 # it cannot tell `pid still names my shard` from `pid now names someone else`, so at these call sites a
 # passing `kill -0` PROVES reuse. The "no group of its own" case the fallback was written for is not
 # reachable from here either (that shard is equally reaped).
-# ⛔ The WATCHDOG's `shard_watchdog` is a DIFFERENT call site and does have a bare-pid fallback — but a
-# GUARDED one: it runs while the shard is alive, and it re-verifies ownership with `shard_pid_is_mine`
-# immediately before the KILL (cycle 6, P2). "No bare pid anywhere" was never true while that fallback
-# was unguarded; it is true now because the guard, not the wording, is what makes it safe.
+# ⛔ WHERE A BARE PID IS NAMED AT ALL, EXHAUSTIVELY — TWO functions, three sites, all ownership-gated:
+#   · `shard_watchdog` — the SHARD's no-group fallback, gated by `shard_pid_is_mine` before its bare
+#     TERM and again before its bare KILL (cycle 6, P2);
+#   · `shard_wd_term` — the WATCHDOG's fallback, gated by the same check (cycle 7, P2), which is why
+#     `shard_driver_signal` and the per-shard teardown both go through it instead of each spelling
+#     `kill … || kill …` inline.
+# "No bare pid anywhere" was NEVER true while those fallbacks were unguarded, and this comment used to
+# claim the watchdog was exempt because it "runs while the shard is alive" — between its bare TERM and
+# its bare KILL sits a `sleep 1`, and what decides liveness across that second is the DRIVER's `wait`.
+# What makes these sites safe is the guard, not a wording that denied they existed.
 # A group that no longer exists fails the TERM and nothing else happens: one syscall in the common case.
 shard_kill_group() {
   [ -n "${1:-}" ] || return 0
@@ -827,7 +864,8 @@ shard_run_bounded() {
   # GROUP when a child outlived the wrapper.
   shard_bg_group="$shard_bg_pid"
   # Tear the watchdog down by GROUP, so its `sleep <bound>` cannot outlive a shard that finished.
-  kill -TERM -"$shard_wd_pid" 2>/dev/null || kill -TERM "$shard_wd_pid" 2>/dev/null
+  # ⛔ OWNERSHIP-GATED, AND IT RECORDS WHAT THE GROUP READ SAW (#3187 review, P2): see `shard_wd_term`.
+  shard_wd_term "$shard_wd_pid"
   wait "$shard_wd_pid" 2>/dev/null
   # ⛔ AND A SECOND PASS ON THE GROUP, AFTER THE REAP (measured: 3 of 30 runs leaked a timer without
   # it). The watchdog forks its timer as its first act, so a TERM that lands DURING that fork is
@@ -836,7 +874,11 @@ shard_run_bounded() {
   # in every one of those runs, so a status check cannot see this: only a pass that happens AFTER the
   # fork can. The group stays addressable by the watchdog's pgid while ANY member lives, so this
   # KILL collects the straggler deterministically and costs one syscall in the normal case.
-  kill -KILL -"$shard_wd_pid" 2>/dev/null
+  # ⛔ …BUT ONLY WHEN THE GROUP WAS STILL THERE WHEN IT WAS TERMED (#3187 review, P2). `wait` above has
+  # REAPED the leader, so if `shard_wd_term` already got ESRCH, the last member is gone, there is no
+  # straggler to collect, and a group `SIGKILL` at that freed pgid is aimed at whatever the kernel has
+  # since handed the number to. `shard_wd_kill` is that gate; its stated residual is written on it.
+  shard_wd_kill "$shard_wd_pid"
   shard_bg_pid=""
   shard_wd_pid=""
   if [ -s "$shard_timeout_marker" ]; then
