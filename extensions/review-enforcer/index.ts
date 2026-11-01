@@ -3881,7 +3881,9 @@ export type RecordFileState =
  */
 export type CrossBoxRecordState =
   | { kind: "present"; ref: string; store: string; scanned: number }
-  | { kind: "absent"; store: string; scanned: number }
+  /** `covered` names the store(s) whose OWN `origin` IS `repo` — the read that makes
+   *  this a MEASURED absence rather than a miss in somebody else's namespace. */
+  | { kind: "absent"; store: string; scanned: number; covered?: string }
   /** Not "absent": the store could not be read, or this box holds no checkout that
    *  can reach it. A failed READ is never reported as a negative fact (#2349). */
   | { kind: "unmeasurable"; why: string };
@@ -4000,7 +4002,13 @@ export function observeReviewRecord(
         // "another repo's record, inert here" AND "record: clean at head …" in the
         // same block — the self-contradicting diagnostic this change exists to
         // remove (fresh review of #2349, P1).
-        return finishObservation(obs, wantProbe);
+        //
+        // ⛔ AND THE PINNED `stores` SEAM IS HONOURED HERE TOO (fresh review, P2): this
+        // return used to call `finishObservation` WITHOUT `stores`, so a caller passing
+        // `{ crossBox: "probe", stores: [...] }` fell through to `registryStoreDirs()` and
+        // performed a REAL `git ls-remote origin` — the exact read the seam exists to
+        // prevent, disabled on one of the three paths that reach it.
+        return finishObservation(obs, wantProbe, stores);
       }
       obs.qualified = qualified.state;
       obs.record = qualified.rec;
@@ -4115,6 +4123,22 @@ function expandHome(p: string): string {
   return p;
 }
 
+/** ⛔ EVERY PATH IN THE PASTED REMEDY IS A SHELL *WORD*, NOT RAW TEXT (fresh review, P2).
+ *  `store` was quoted and the script path was not, so the two halves of one command
+ *  disagreed — and this text is a command an agent PASTES. A checkout under
+ *  `/Users/home/agent infra/…` produced `/Users/home/agent infra/scripts/registry-sync.sh
+ *  pull …` (`No such file or directory`, which an agent reads as "the remedy is broken"
+ *  and re-reviews — the cost this change exists to remove), and a path carrying `;`,
+ *  `$( )` or a backtick would EXECUTE.
+ *
+ *  Single quotes are the inert form: inside them `$( )`, backticks and `;` are literal,
+ *  and an embedded `'` becomes `'\''`. A `~`-prefixed path stays UNQUOTED — quoting it
+ *  would suppress the tilde expansion the farmed copy depends on. */
+export function shellQuotePath(p: string): string {
+  if (p.startsWith("~")) return p;
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
 /** ⛔ THE STORE MUST BE NAMED. `registry-sync.sh` resolves its store as
  *  `--repo` → `$AGENT_INFRA_PATH` → its own parent dir, so a bare `pull` reads
  *  whichever store those point at — and for a cross-REPO record (the case the
@@ -4130,12 +4154,16 @@ function expandHome(p: string): string {
  *  into itself. Deduped by EXPANDED path for the same reason, and `present` lets a
  *  caller declare a copy this box does not have instead of printing it as the
  *  remedy.
+ *  ⛔ AND EVERY PATH IN IT IS QUOTED (fresh review, P2): `store` was single-quoted and the
+ *  script path was interpolated RAW, so a checkout path with a space produced a command
+ *  that cannot run, and one with `$( )`/backticks would execute on paste. Both halves go
+ *  through `shellQuotePath`.
  */
 export function registrySyncOptions(store?: string): RegistrySyncOption[] {
   // ⛔ SINGLE-QUOTED, NOT JSON-QUOTED (fresh review, P2): this text is a command an
   // agent PASTES. JSON quoting leaves `$(…)` and backticks live inside double quotes,
   // and `store` is an operator-supplied path ($AGENT_INFRA_PATH / cwd). `'…'` is inert.
-  const repoFlag = store ? ` --repo '${store.replace(/'/g, `'\\''`)}'` : "";
+  const repoFlag = store ? ` --repo ${shellQuotePath(store)}` : "";
   const candidates: Array<{ asWritten: string; path: string }> = [
     { asWritten: REGISTRY_SYNC_SH, path: expandHome(REGISTRY_SYNC_SH) },
   ];
@@ -4152,7 +4180,7 @@ export function registrySyncOptions(store?: string): RegistrySyncOption[] {
     } catch {
       present = false;
     }
-    options.push({ command: `${c.asWritten} pull${repoFlag}`, path: c.path, present });
+    options.push({ command: `${shellQuotePath(c.asWritten)} pull${repoFlag}`, path: c.path, present });
   }
   return options;
 }
@@ -4225,7 +4253,30 @@ function registryStoreDirs(): string[] {
  *  fetches the record then re-runs the merge must not keep reading a stale
  *  "absent" (>60 s). */
 const CROSSBOX_MEMO_TTL_MS = 60_000;
-const crossBoxMemo = new Map<string, { at: number; refs: Set<string> | null; why: string | null }>();
+const crossBoxMemo = new Map<
+  string,
+  { at: number; refs: Set<string> | null; why: string | null; origin: string | null }
+>();
+
+/** The repo a STORE's own `origin` is bound to — the evidence that its `refs/reviews/*`
+ *  namespace can answer for a given key (fresh review, P1).
+ *
+ *  ⛔ A LOCAL `git config` READ, NOT A NETWORK ONE, and `execFileSync` with an argv array
+ *  for the same reason the listing uses it: `store` is an operator-supplied path, and a
+ *  shell re-parse of it is the class this file already refuses. Shares `repoFromOriginUrl`
+ *  with `repoFromGitRemote` so the two readers can never disagree about a slug. */
+function storeOriginRepo(store: string): string | null {
+  try {
+    const url = execFileSync("git", ["-C", store, "config", "--get", "remote.origin.url"], {
+      timeout: 2000,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return repoFromOriginUrl(url);
+  } catch {
+    return null; // no origin / not GitHub / not a git dir → this store covers nothing
+  }
+}
 
 /**
  * Read the shared store's `refs/reviews/*` listing — the ONE read that turns "no
@@ -4235,7 +4286,18 @@ const crossBoxMemo = new Map<string, { at: number; refs: Set<string> | null; why
  *   - an EMPTY listing is also `unmeasurable`: it may be a remote that is not the
  *     store at all, and claiming "no such record exists" from it would be a cause
  *     this gate did not read;
- *   - EVERY candidate store is probed, and a hit in ANY is `present`;
+ *   - ⛔ AND SO IS A MISS IN A STORE THAT DOES NOT ANSWER FOR `repo` (fresh review, P1).
+ *     `registryStoreDirs()` builds its candidates from `$AGENT_INFRA_PATH`, this
+ *     extension's checkout and `cwd` — NONE of them keyed on `repo` — so a cross-REPO
+ *     merge (`gh pr merge <N> --repo other/repo` from an agent-infra checkout) read three
+ *     agent-infra origins, found no ref `other-repo-<pr>`, and called it `absent`: the
+ *     refusal then told the lane to pay for a duplicate review of a record that exists on
+ *     `other/repo`'s own remote. A non-empty listing from the WRONG remote is still a
+ *     listing from the wrong remote — the empty-listing rule above was the same defect,
+ *     applied only to the case that happened to be noticed. So `absent` additionally
+ *     requires that at least one probed store's own `origin` IS `repo`;
+ *   - EVERY candidate store is probed, and a hit in ANY is `present` (a ref NAME carries
+ *     `<owner>-<repo>-<pr>`, so a hit is a fact about the key whatever the store's origin);
  *   - no decision reads the result (see `CrossBoxRecordState`).
  */
 export function crossBoxRecordState(
@@ -4262,6 +4324,8 @@ export function crossBoxRecordState(
   const whys: string[] = [];
   let scannedTotal = 0;
   let scannedAny = false;
+  /** Stores whose own `origin` IS `repo` — the only candidates a MISS may speak for. */
+  const covered: string[] = [];
   // ONE budget for the whole probe (8 s), not per store: a per-store bound (6 s) ×
   // three candidates would put an 18 s synchronous block inside a tool call (fresh
   // review, P2).
@@ -4272,6 +4336,7 @@ export function crossBoxRecordState(
     if (!entry || now - entry.at > CROSSBOX_MEMO_TTL_MS) {
       let refs: Set<string> | null = null;
       let why: string | null = null;
+      const origin = storeOriginRepo(store);
       try {
         // execFileSync with an argv array: no value here can be re-parsed as shell syntax.
         const out = execFileSync("git", ["-C", store, "ls-remote", "--refs", "origin", "refs/reviews/*"], {
@@ -4292,7 +4357,7 @@ export function crossBoxRecordState(
       } catch (e) {
         why = `${store}: ${String((e as Error)?.message ?? e).slice(0, 60)}`;
       }
-      entry = { at: now, refs, why };
+      entry = { at: now, refs, why, origin };
       crossBoxMemo.set(store, entry);
     }
     if (!entry.refs) {
@@ -4301,7 +4366,11 @@ export function crossBoxRecordState(
     }
     scannedAny = true;
     scannedTotal += entry.refs.size;
+    // A HIT NEEDS NO COVERAGE CHECK: the ref name carries `<owner>-<repo>-<pr>`, so
+    // finding it IS the fact this probe wanted. Coverage only decides whether a MISS may
+    // be reported as a negative fact (fresh review, P1).
     if (entry.refs.has(ref)) return { kind: "present", ref, store, scanned: scannedTotal };
+    if (entry.origin === repo) covered.push(store);
   }
   // ⛔ `absent` ONLY IF EVERY CANDIDATE STORE WAS READ. One readable store plus one
   // unreadable store NAMED `absent` means "no record exists" for a ref the gate never
@@ -4316,7 +4385,19 @@ export function crossBoxRecordState(
   if (!scannedAny) {
     return { kind: "unmeasurable", why: "no store could be read" };
   }
-  return { kind: "absent", store: stores.join(", "), scanned: scannedTotal };
+  // ⛔ COVERAGE (fresh review, P1): every candidate was READ, but if none of them answers
+  // for `repo`, the miss says nothing about this PR — it is the #2349 defect in a new arm.
+  // `unmeasurable` is the honest state, and its prose sends the lane to check the store
+  // before paying for a review rather than after.
+  if (covered.length === 0) {
+    return {
+      kind: "unmeasurable",
+      why:
+        `no store whose origin is ${repo} was among the ${stores.length} read ` +
+        `[${stores.join(", ")}], so this is not a measured absence`,
+    };
+  }
+  return { kind: "absent", store: stores.join(", "), covered: covered.join(", "), scanned: scannedTotal };
 }
 
 /** The one-line, machine-readable state a lane can branch on (#3175): it carries the
@@ -4456,7 +4537,12 @@ export function crossBoxLine(cb: CrossBoxRecordState): string {
       // ⛔ NAME THE STORES THE NEGATIVE COVERS (fresh review, P2). A bare "the shared
       // store" made a three-store read look like one, so a record sitting in a checkout
       // this probe never considered read as a confident "a review HERE is genuinely needed".
-      return `ABSENT — ${cb.scanned} refs read from every candidate store [${cb.store}], none for this PR`;
+      // …and NAME THE STORE THAT MAKES IT CREDIBLE (fresh review, P1): `absent` is only
+      // emitted when a store whose own origin IS this PR's repo was read, so the negative
+      // never speaks for a namespace the probe could not reach.
+      return `ABSENT — ${cb.scanned} refs read from every candidate store [${cb.store}], none for this PR${
+        cb.covered ? `; a checkout of THIS PR's repo was among them [${cb.covered}]` : ""
+      }`;
     default:
       return `UNMEASURABLE (${cb.why}) — nothing is claimed about other boxes`;
   }
@@ -4517,11 +4603,20 @@ export function repoFromGitRemote(dir: string): string | null {
       stdio: ["ignore", "pipe", "ignore"],
       encoding: "utf8",
     }).trim();
-    const m = url.match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
-    return m ? m[1] : null;
+    return repoFromOriginUrl(url);
   } catch {
     return null; // not a git dir / no origin / not GitHub → caller falls back
   }
+}
+
+/** `owner/name` from a GitHub remote URL, or null.
+ *  ⛔ ONE PARSER, TWO READERS (fresh review, P1): `repoFromGitRemote` answers "which repo
+ *  is this CHECKOUT bound to", and the cross-box coverage check answers "which repo does
+ *  this STORE's namespace answer for". Two copies of this regex could disagree, and then a
+ *  store would be simultaneously credible and not. */
+export function repoFromOriginUrl(url: string): string | null {
+  const m = url.trim().match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
+  return m ? m[1] : null;
 }
 
 export interface RepoContext {

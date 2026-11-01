@@ -114,6 +114,8 @@ import {
   crossBoxRecordState,
   registrySyncCommand,
   registrySyncOptions,
+  shellQuotePath,
+  REGISTRY_SYNC_SH,
   classifyRecordMissState,
   describeCarryConjuncts,
   describeDispatchFloorRead,
@@ -10388,7 +10390,10 @@ test("#3175 a — no record + the store HAS it: still BLOCKS, and says box, regi
       `carries the machine-readable state a lane can branch on:\n${recordAbsentToken(obs)}`
     );
     ok(reason.includes(CROSSBOX_REF_2349), "names the exact ref the record lives at");
-    ok(reason.includes("registry-sync.sh pull"), "gives a RUNNABLE fetch command, not prose");
+    // ⛔ THE SCRIPT PATH IS QUOTED (fresh review, P2): the pasted remedy is a shell WORD,
+    // so the checkout copy renders as `'<abs path>' pull …` — a `registry-sync.sh pull`
+    // substring match would be an assertion about unquoted text, not about a runnable command.
+    ok(/registry-sync\.sh'? pull/.test(reason), `gives a RUNNABLE fetch command, not prose:\n${reason}`);
     // ⛔ THE CLAIM IS CONDITIONAL ON A HEAD THIS PROBE NEVER READ (fresh review, P2).
     // `ls-remote --refs` returns NAMES; the record's `head_sha` is in the record BODY,
     // which is never fetched. So the refusal may say "fetch it and re-run the merge",
@@ -10421,7 +10426,12 @@ test("#3175 b — a record at the LIVE head still ALLOWS, and the cross-box stat
 });
 
 // ── DIRECTION (c): the probe cannot invent a fact, and cannot gate anything ──
-test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed store is 'unmeasurable', never 'absent'", () => {
+test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed store is 'unmeasurable', never 'absent'", () => withTempHomeSync(() => {
+  // ⛔ HOME IS ISOLATED (fresh review, P2): without this, the `equal(probed.record, null,
+  // "no record in the empty temp home")` below read the OPERATOR's `~/.pi/agent/reviews`,
+  // where a legacy `2349.json` legitimately exists on any box that minted agent-infra PR
+  // 2349 — red for a reason unrelated to this change, with a message pointing at a bug
+  // that is not there.
   const r = evaluateMergeGate(
     138, cleanRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, null, null,
     observeReviewRecord(138, "owner/repo", { crossBox: { kind: "absent", store: "/tmp/agent-infra", scanned: 3 } })
@@ -10460,7 +10470,12 @@ test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed stor
     execSync(`git -C ${JSON.stringify(store)} update-ref ${CROSSBOX_REF_2349} HEAD`, { stdio: "ignore" });
     execSync(`git -C ${JSON.stringify(store)} push -q origin ${CROSSBOX_REF_2349}`, { stdio: "ignore" });
     process.env.AGENT_INFRA_PATH = store;
-    const live = observeReviewRecord(PR_2349, "owner/repo", { crossBox: "probe" });
+    // ⛔ AND PINNED (fresh review, P2): `AGENT_INFRA_PATH` alone is not enough — the probe
+    // continues to this extension's own checkout and to `process.cwd()`, so this case
+    // performed a REAL `git ls-remote origin` against this repo's remote. `stores: [store]`
+    // is the production shape (the env var is what production resolves) read EXACTLY as
+    // this test built it, so the suite's "fully local" claim holds.
+    const live = observeReviewRecord(PR_2349, "owner/repo", { crossBox: "probe", stores: [store] });
     equal(live.crossBox.kind, "present", `a REAL store ref must read as present: ${JSON.stringify(live.crossBox)}`);
     ok(
       live.crossBox.kind === "present" && live.crossBox.ref === CROSSBOX_REF_2349,
@@ -10517,12 +10532,18 @@ test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed stor
     describeRecordMiss(messaging, PR_2349, "owner/repo").join("\n").includes("crossbox=unmeasurable"),
     "an unprobed observation says so rather than claiming absence"
   );
-});
+}));
 
 /** Build a REAL store: a checkout whose `origin` (a bare repo in the same temp dir)
  *  holds `refs`. Fully local — `git init` + `update-ref` + `push`, no network. */
-function makeCrossBoxStore(root: string, name: string, refs: string[]): string {
-  const bare = resolvePath(root, `${name}-origin.git`);
+function makeCrossBoxStore(root: string, name: string, refs: string[], slug?: string): string {
+  // ⛔ `slug` PUTS THE BARE REPO UNDER A GITHUB-SHAPED PATH (`…/github.com/<owner>/<repo>.git`),
+  // so its URL parses like a real remote while `ls-remote` stays local. That is what makes a
+  // store CREDIBLE for `repo`: `absent` now requires a store whose own `origin` IS the repo
+  // (fresh review, P1), and a store bound to an unrelated bare path in /var/folders is not.
+  const bare = slug
+    ? resolvePath(root, `${name}-origin`, "github.com", `${slug}.git`)
+    : resolvePath(root, `${name}-origin.git`);
   const store = resolvePath(root, name);
   execSync(`git init -q --bare ${JSON.stringify(bare)}`, { stdio: "ignore" });
   execSync(`git init -q ${JSON.stringify(store)}`, { stdio: "ignore" });
@@ -10543,8 +10564,10 @@ test("#3175 d — two readable stores, refs for OTHER PRs only: `absent`, scanne
   withTempHomeSync(() => {
     const tmp = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-absent-"));
     try {
-      const a = makeCrossBoxStore(tmp, "store-a", ["refs/reviews/other-repo-11", "refs/reviews/other-repo-12"]);
-      const b = makeCrossBoxStore(tmp, "store-b", ["refs/reviews/other-repo-13"]);
+      const a = makeCrossBoxStore(
+        tmp, "store-a", ["refs/reviews/other-repo-11", "refs/reviews/other-repo-12"], "owner/repo"
+      );
+      const b = makeCrossBoxStore(tmp, "store-b", ["refs/reviews/other-repo-13"], "owner/repo");
       // Through the PRODUCTION path (`{crossBox:"probe"}` → `finishObservation`), with
       // the stores pinned so the read is exactly these two and in this order.
       const obs = observeReviewRecord(PR_2349, "owner/repo", { crossBox: "probe", stores: [a, b] });
@@ -10561,6 +10584,13 @@ test("#3175 d — two readable stores, refs for OTHER PRs only: `absent`, scanne
       ok(
         obs.crossBox.kind === "absent" && obs.crossBox.store.includes(a) && obs.crossBox.store.includes(b),
         "the negative NAMES every store it covers"
+      );
+      ok(
+        obs.crossBox.kind === "absent" &&
+          (obs.crossBox.covered ?? "").includes(a) &&
+          (obs.crossBox.covered ?? "").includes(b),
+        `and names the stores whose OWN origin IS this PR's repo (the coverage that makes it a ` +
+          `measured absence): ${JSON.stringify(obs.crossBox)}`
       );
       const reason = (evaluateMergeGate(
         PR_2349, null, HEAD_2349, { source: "flag", repo: "owner/repo" }, false, null, null, obs
@@ -10650,7 +10680,7 @@ test("#3175 f — the fetch remedy is ONE command per line (`try:`/`or:`), never
       PR_2349, null, HEAD_2349, { source: "flag", repo: "owner/repo" }, false, null, null, obs
     ) as any).reason as string;
     ok(!/registry-sync\.sh pull[^\n]*\|/.test(reason), `no line pipes the fetch into anything:\n${reason}`);
-    const cmdLines = reason.split("\n").filter((l: string) => l.includes("registry-sync.sh pull"));
+    const cmdLines = reason.split("\n").filter((l: string) => /registry-sync\.sh'? pull/.test(l));
     ok(cmdLines.length >= 1, `the remedy is present:\n${reason}`);
     ok(
       cmdLines.every((l: string) => /^\s+(try|or):/.test(l)),
@@ -10660,6 +10690,133 @@ test("#3175 f — the fetch remedy is ONE command per line (`try:`/`or:`), never
       cmdLines.length === Math.max(1, options.filter((o) => o.present).length),
       `one line per copy that EXISTS on this box (${options.filter((o) => o.present).length} here), never a dead path offered as the remedy`
     );
+  });
+});
+
+// ── DIRECTION (g): a MISS IN A STORE THAT DOES NOT ANSWER FOR `repo` IS NOT `absent`
+// (fresh review, P1). `registryStoreDirs()` builds its candidates from `$AGENT_INFRA_PATH`,
+// this extension's checkout and `cwd` — NONE of them keyed on `repo` — so a cross-REPO merge
+// (`gh pr merge <N> --repo daniel-ospina/tortoise` from an agent-infra checkout) read three
+// agent-infra origins, found no `tortoise-<pr>` ref, and said `absent`: the refusal then told
+// the lane to pay for a duplicate review of a record sitting on the tortoise remote. That is
+// the #2349 defect class in a new arm — a cause the probe never read — and the change's own
+// "a failed read is never a negative fact" rule, applied to the case that matters most.
+test("#3175 g — a readable store bound to a DIFFERENT repo cannot turn a miss into `absent`", () => {
+  withTempHomeSync(() => {
+    const tmp = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-coverage-"));
+    try {
+      const foreign = makeCrossBoxStore(tmp, "ai-store", ["refs/reviews/other-repo-11"], "daniel-ospina/agent-infra");
+      const foreign2 = makeCrossBoxStore(tmp, "ai-store-2", ["refs/reviews/other-repo-12"], "daniel-ospina/agent-infra");
+      const miss = crossBoxRecordState("daniel-ospina/tortoise", 10483, { stores: [foreign, foreign2] });
+      equal(
+        miss.kind,
+        "unmeasurable",
+        `a miss in agent-infra's namespace says NOTHING about a tortoise PR: ${JSON.stringify(miss)}`
+      );
+      ok(
+        miss.kind === "unmeasurable" && miss.why.includes("no store whose origin is daniel-ospina/tortoise"),
+        `the reason names the repo whose store was never read: ${JSON.stringify(miss)}`
+      );
+      ok(
+        miss.kind === "unmeasurable" && miss.why.includes(foreign) && miss.why.includes(foreign2),
+        "and the stores it DID read, so the gap is visible instead of asserted"
+      );
+      // ⛔ THE PROSE THAT PAYS FOR A REVIEW IS GATED ON THIS STATE: `absent` is the one
+      // verdict whose NEXT ACTION says "a review HERE is genuinely needed".
+      const obs = observeReviewRecord(PR_2349, "daniel-ospina/tortoise", {
+        crossBox: "probe",
+        stores: [foreign, foreign2],
+      });
+      equal(obs.record, null, "no local record in the empty temp home");
+      equal(obs.crossBox.kind, "unmeasurable", "the PINNED probe reports the coverage gap");
+      const reason = (evaluateMergeGate(
+        PR_2349, null, HEAD_2349, { source: "flag", repo: "daniel-ospina/tortoise" }, false, null, null, obs
+      ) as any).reason as string;
+      ok(reason.includes("crossbox=unmeasurable"), "the decision path carries the measured state");
+      ok(
+        !reason.includes("genuinely needed"),
+        `must NOT claim a review here is needed from a namespace it never read:\n${reason}`
+      );
+      ok(reason.includes("--repo"), "sends the lane to read the RIGHT store first, not to re-review");
+      // …and a store whose OWN origin IS the repo turns the same miss into a measured absence.
+      const own = makeCrossBoxStore(
+        tmp, "tortoise-store", ["refs/reviews/other-repo-99"], "daniel-ospina/tortoise"
+      );
+      const absent = crossBoxRecordState("daniel-ospina/tortoise", 10483, { stores: [foreign, own] });
+      equal(absent.kind, "absent", `a readable store of the repo itself, read, no ref → absent: ${JSON.stringify(absent)}`);
+      ok(absent.kind === "absent" && absent.scanned === 2, "scanned counts every readable store (1+1)");
+      ok(
+        absent.kind === "absent" && (absent.covered ?? "") === own,
+        `\`covered\` names the ONE store that answers for this key: ${JSON.stringify(absent)}`
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── DIRECTION (h): the FOREIGN-REPO return honours the pinned `stores` seam (fresh review,
+// P2). It called `finishObservation(obs, wantProbe)` WITHOUT `stores`, so a caller who pinned
+// the probe's checkouts silently fell back to `registryStoreDirs()` and performed a real
+// `git ls-remote origin` against this box's remotes — the exact read the seam exists to stop,
+// disabled on one of the three paths that reach it.
+test("#3175 h — the foreign-repo return uses the PINNED stores instead of the real ones", () => {
+  withTempHomeSync(() => {
+    const pr = PR_2349 + 41;
+    writeReviewFile(reviewRecordFile("owner/repo", pr), {
+      pr, head_sha: "a".repeat(40), verdict: "clean", repo: "other/repo",
+    });
+    // `stores: []` is the sharpest seam probe: honoured, it reads NOTHING and says so;
+    // dropped, it falls through to this box's real checkouts and their real remotes.
+    const obs = observeReviewRecord(pr, "owner/repo", { crossBox: "probe", stores: [] });
+    equal(obs.qualified.kind, "foreign-repo", "the repo-keyed file names another repo");
+    equal(obs.record, null, "…so the READER sees no record here (fail-closed)");
+    equal(obs.crossBox.kind, "unmeasurable", "and the probe reports instead of deciding");
+    ok(
+      obs.crossBox.kind === "unmeasurable" && obs.crossBox.why.includes("no agent-infra checkout"),
+      `the PINNED empty store list was used — falling through to registryStoreDirs() would have ` +
+        `read this box's real remotes: ${JSON.stringify(obs.crossBox)}`
+    );
+  });
+});
+
+// ── DIRECTION (i): EVERY path in the pasted remedy is a quoted shell WORD (fresh review,
+// P2). `store` was single-quoted and the SCRIPT path was interpolated raw, so a checkout
+// under `/Users/home/agent infra/…` produced a command that cannot run (an agent reads
+// "No such file or directory" as "the remedy is broken" and re-reviews), and a path
+// carrying `;`/`$( )`/a backtick would EXECUTE on paste. The code's own rationale — "this
+// text is a command an agent PASTES" — applies to both halves.
+test("#3175 i — every path in the fetch remedy is quoted, the script included", () => {
+  withTempHomeSync(() => {
+    // (i) the helper: `~/…` must stay BARE (the shell expands it), everything else is inert.
+    equal(
+      shellQuotePath("~/.pi/agent/scripts/registry-sync.sh"),
+      "~/.pi/agent/scripts/registry-sync.sh",
+      "a ~ path stays unquoted so the shell expands it"
+    );
+    equal(
+      shellQuotePath("/Users/home/agent infra/scripts/registry-sync.sh"),
+      "'/Users/home/agent infra/scripts/registry-sync.sh'",
+      "a space in the checkout path must not split the command"
+    );
+    equal(
+      shellQuotePath("/tmp/it's $(id) `id`; rm -rf /"),
+      "'/tmp/it'\\''s $(id) `id`; rm -rf /'",
+      "an embedded quote is escaped, and $( )/backticks/; stay INERT inside single quotes"
+    );
+    // (ii) EVERY rendered candidate — including the checkout copy `extensionRelativeScript`
+    // resolves, the one that used to be interpolated raw.
+    const options = registrySyncOptions("/tmp/agent infra");
+    ok(options.length >= 1, `at least one candidate is offered: ${JSON.stringify(options)}`);
+    for (const o of options) {
+      const scriptWord = o.command.split(" pull")[0];
+      ok(
+        scriptWord === REGISTRY_SYNC_SH || scriptWord === `'${o.path}'`,
+        `the script is a quoted shell word (or the ~ form the shell must expand), never a raw ` +
+          `absolute path: ${o.command}`
+      );
+      ok(o.command.includes("--repo '/tmp/agent infra'"), `and so is the store: ${o.command}`);
+    }
   });
 });
 
