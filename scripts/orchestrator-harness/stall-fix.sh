@@ -27,7 +27,12 @@ TIMEOUT="${DRAIN_STALL_FIX_TIMEOUT:-1800}"
 UNOWNED="${UPN_WORK:-?}"
 AGEMIN="${2:-?}"                    # minutes since the last land (or the threshold)
 
-say() { printf '[dispatch] %s\n' "$*"; }
+# ⛔ NOT `say` (agent-infra#2910). On macOS `say` is /usr/bin/say — text-to-speech — so a shipped
+# script that defines a helper by that name SPEAKS through the owner's speakers whenever a fragment
+# runner executes its body in a shell where the definition did not survive. The repo-wide rename
+# chose `log_line`; `tests/no-tts/run.sh` re-reads the tree on every run and reddens this file if the
+# old name ever comes back.
+log_line() { printf '[dispatch] %s\n' "$*"; }
 
 # ⛔ THE TIGHT FORM, NOT A LENIENT FIFTH (selftest.sh "ONE PREDICATE, EVERY SHIPPED COPY"): the
 # `''|*[!0-9]*` form ACCEPTS `08`, and `$(( SEEN % EVERY ))` below then reads it as invalid OCTAL and
@@ -43,29 +48,29 @@ is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
 # arm, so 0 means the caller is on a healthy pass (or passed it through a default). Refusing
 # here as well makes the bound hold even if a future call site forgets the gate.
 if [ "${SEEN:-0}" = "0" ]; then
-  say "DRAIN STALL -> stall fix skipped (pass counter 0 — not a stalled pass)"
+  log_line "DRAIN STALL -> stall fix skipped (pass counter 0 — not a stalled pass)"
   exit 0
 fi
 if ! is_num "${SEEN:-}"; then
-  say "DRAIN STALL -> STALL FIX SKIPPED (no pass counter; not a number: '${SEEN}')"
+  log_line "DRAIN STALL -> STALL FIX SKIPPED (no pass counter; not a number: '${SEEN}')"
   exit 0
 fi
 
 # Bounded: fire on the EVERY-th stalled pass only, so one stall == one worker.
 if [ "$(( SEEN % EVERY ))" -ne 0 ]; then
-  say "DRAIN STALL -> stall fix deferred (pass ${SEEN}, one dispatch per ${EVERY})"
+  log_line "DRAIN STALL -> stall fix deferred (pass ${SEEN}, one dispatch per ${EVERY})"
   exit 0
 fi
 
 DISP="$O/nonblocking-dispatch.sh"
 if [ ! -x "$DISP" ]; then
-  say "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no executable $DISP) — the stall line is the only trace"
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no executable $DISP) — the stall line is the only trace"
   exit 0
 fi
 
 BRIEF_DIR="$O/state/briefs"
 mkdir -p "$BRIEF_DIR" 2>/dev/null || {
-  say "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (state/briefs is unwritable)"; exit 0; }
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (state/briefs is unwritable)"; exit 0; }
 BRIEF="$BRIEF_DIR/stall-fix-$(date -u '+%Y%m%dT%H%M%SZ').md"
 
 # The brief names only MEASURED facts it is handed, plus where to look. It must not
@@ -162,14 +167,14 @@ _brief="${_brief//__O__/$O}"
 _brief="${_brief//__SPAWNS__/$SPAWNS_TXT}"
 printf '%s\n' "$_brief" > "$BRIEF" 2>/dev/null || true
 if [ ! -s "$BRIEF" ]; then
-  say "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief could not be written)"
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief could not be written)"
   exit 0
 fi
 # ⛔ AND THE SUBSTITUTION IS CHECKED, NOT ASSUMED: a failed write leaves the ORIGINAL file in place,
 # which is NON-EMPTY and passes the size test above — so an unstubbed brief would be dispatched with
 # `__SEEN__` still in it. A surviving placeholder is a brief that cannot be read correctly: refuse.
 if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\)__' "$BRIEF" 2>/dev/null; then
-  say "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief still carries unresolved placeholders — not dispatching a worker on it)"
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief still carries unresolved placeholders — not dispatching a worker on it)"
   exit 0
 fi
 
@@ -185,11 +190,11 @@ if [ ! -e "$WT/.git" ] && [ -e "$HREPO/.git" ]; then
   git -C "$HREPO" worktree add -f --detach "$WT" origin/main >/dev/null 2>&1 || true
 fi
 if [ ! -e "$WT/.git" ]; then
-  say "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no usable worktree: $WT — set HARNESS_REPO)"
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no usable worktree: $WT — set HARNESS_REPO)"
   exit 0
 fi
 if KIND=prfix "$DISP" "stallfix-$(date -u '+%H%M%S')" "$WT" "$BRIEF" "$TIMEOUT" prfix >>"$O/logs/stall-fix.log" 2>&1; then
-  say "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; brief ${BRIEF#$O/}; report $O/state/REPORT-stall-fix.md)"
+  log_line "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; brief ${BRIEF#$O/}; report $O/state/REPORT-stall-fix.md)"
   printf '%s\tstall-fix dispatched\tpass=%s\tunowned=%s\tage_min=%s\n' \
     "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SEEN" "$UNOWNED" "$AGEMIN" >> "$O/state/drain-stall-dispatch.log" 2>/dev/null
   exit 0
@@ -197,6 +202,6 @@ fi
 
 # ⛔ A FAILED DISPATCH IS LOUD TOO: a stall escalation that cannot start a worker must
 # not read as one that did.
-say "DRAIN STALL -> STALL FIX DISPATCH FAILED (nonblocking-dispatch.sh refused; see $O/logs/stall-fix.log) — the box is still stalled"
+log_line "DRAIN STALL -> STALL FIX DISPATCH FAILED (nonblocking-dispatch.sh refused; see $O/logs/stall-fix.log) — the box is still stalled"
 printf '%s\tstall-fix DISPATCH FAILED\tpass=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SEEN" >> "$O/state/drain-stall-dispatch.log" 2>/dev/null
 exit 0
