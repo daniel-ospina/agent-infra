@@ -54,13 +54,6 @@ MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
 case "${MAX_TOTAL}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
 MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
-# The repos this actuator drives. `rails_for_repo` takes the FULL slug for the repo being asked about
-# plus this same list for the population, and derives every short name itself — one call shape, so the
-# two cannot drift apart (the bug that made `unattributed` read 1 for a rail that WAS attributed).
-REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
-_n_repos=0
-for _r in $REPOS; do _n_repos=$(( _n_repos + 1 )); done
-REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
 INTERVAL=${INTERVAL:-180}
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
@@ -182,18 +175,11 @@ rails_should_defer() {  # $1 = this repo (owner/name), $2.. = every repo driven
   # ⛔ AN UNPARSEABLE COUNTER IS NOT A FREE SLOT. `read` succeeds on empty output, and then `[ "" -ge n ]`
   # errors — and an errored `[` reads as FALSE, i.e. LAUNCH. So say it and defer: a population I cannot
   # read is load I cannot rule out, which is the same fail-closed rule as the unknown bucket.
-  case "${own}${total}${unk}" in
-    ''|*[!0-9]*) say "COUNTER-FAILED: rails_for_repo produced no counts — deferring $1 (fail-closed)"; return 0;;
+  case ":${own}:${total}:${unk}:" in
+    *[!0-9:]*|::*|*::|*:::*) say "COUNTER-FAILED: rails_for_repo produced no usable counts — deferring $1 (fail-closed)"; return 0;;
   esac
   [ $(( own + unk )) -ge "$MAX" ] || [ "$total" -ge "$MAX_TOTAL" ]
 }
-# ⛔ A NON-NUMERIC BOUND MUST NOT DISARM THE CEILING. `${VAR:-default}` substitutes only on empty or
-# unset, so a typo (`MAX_TOTAL=sixteen`) reaches `-ge`, the test errors, and an errored `[` reads as FALSE
-# — i.e. the aggregate clause silently stops biting and every candidate launches. Refuse loudly instead.
-case "${MAX}" in ''|*[!0-9]*)
-  echo "$(date -u +%FT%TZ) REFUSED: MAX='${MAX}' is not a positive integer — this actuator would not know its own bound" >> /tmp/auto-rail.log; exit 3;; esac
-case "${MAX_TOTAL}" in ''|*[!0-9]*)
-  echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
 # Keep the TCC-free rail clone current BEFORE using it. A failed refresh is LOUD but not fatal: the
 # previous HEAD then runs, which is strictly better than not merging, and the log says which happened.
 if [ -d "$RAIL_HUB/.git" ]; then

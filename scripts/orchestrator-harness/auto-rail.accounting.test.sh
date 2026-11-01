@@ -74,5 +74,21 @@ read -r p_a_own _p2 _p3 <<< "$(rails_for_repo daniel-ospina/agent-infra $REPOS)"
 [ "$p_t_own" -eq 1 ] && [ "$p_a_own" -eq 0 ] \
   || { echo "FAIL: --repo must take precedence over the script path (tortoise=$p_t_own agent-infra=$p_a_own)"; fail=1; }
 
+# ⛔ AN UNREADABLE COUNTER MUST DEFER (fail-closed) — and this case PINS it: without it the guard can be
+# deleted and the whole test still prints PASS. The stub overrides `rails_for_repo` (not `ps`) because an
+# EMPTY PROCESS TABLE legitimately yields `0 0 0`; what must fail closed is a counter that prints nothing
+# usable. Two shapes: no output at all, and a SHORT parse ("0 0") whose fields concatenate to "00".
+rails_for_repo() { printf '%s' "$RAILS_OUT"; }
+MAX_TOTAL=16 MAX=8
+RAILS_OUT=""
+if rails_should_defer daniel-ospina/tortoise $REPOS; then echo "fail-closed on an empty counter: DEFER (correct)"
+else echo "FAIL: an empty counter must DEFER, not launch"; fail=1; fi
+RAILS_OUT="0 0"
+if rails_should_defer daniel-ospina/tortoise $REPOS; then echo "fail-closed on a short parse: DEFER (correct)"
+else echo "FAIL: a short parse ('0 0') must DEFER, not read as free load"; fail=1; fi
+RAILS_OUT="0 0 0"
+if rails_should_defer daniel-ospina/tortoise $REPOS; then echo "FAIL: a genuinely empty population must not defer"; fail=1
+else echo "a genuinely empty population: LAUNCH (correct)"; fi
+
 [ "$fail" = 0 ] && echo "PASS: per-repo accounting launches a starved repo's candidate, still bounds one repo, and counts unknown load against everyone"
 exit "$fail"
