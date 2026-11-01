@@ -3494,7 +3494,10 @@ testAsync("#2204: the refusal names the tier, names what to run instead, and del
         equal(recoveries[0].options?.triggerTurn, true, "…and it triggers that turn instead of letting the run stop");
         // #3175: the delivered recovery is the refusal PLUS the ANCHOR that names the refused call —
         // it is a queued followUp, so it can land while the lane is looking at a LATER call.
-        ok(String(recoveries[0].message?.content).endsWith(String(blocked.reason)), "…carrying the same instruction as the tool result");
+        // ⛔ #3175 (fresh review, P1): the recovery STARTS WITH the tool result — the same refusal text,
+        // same anchor — and appends ONE line naming the command, which a queued message cannot get from
+        // any attached tool call. The tool result is the record of the call; the recovery only repeats it.
+        ok(String(recoveries[0].message?.content).startsWith(String(blocked.reason)), "…carrying the same refusal text as the tool result, plus the command the queued message cannot otherwise name");
         ok(String(recoveries[0].message?.content).includes("ANCHOR (#3175)"), "…prefixed with the call it is about (#3175)");        // ONCE per session is the bound that keeps this from becoming a retry loop: a lane that
         // keeps issuing refused commands buys ONE extra turn, not one per refusal.
         const second = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
@@ -3596,7 +3599,7 @@ testAsync("#2204: a harness lane's recovery carries the HARNESS advice, not a di
         equal(recoveries.length, 1, "…and still gets the recovery");
         // The tool result AND the model-visible message are the same text, and both are the HARNESS
         // text: one path, one audience, no chance of the two drifting apart.
-        ok(String(recoveries[0].message?.content).endsWith(String(blocked.reason)), "the recovery carries the same text as the tool result");
+        ok(String(recoveries[0].message?.content).startsWith(String(blocked.reason)), "the recovery carries the same refusal text as the tool result");
         ok(String(recoveries[0].message?.content).includes("ANCHOR (#3175)"), "…behind the #3175 anchor");
         ok(/do NOT dispatch/i.test(blocked.reason), "a lane is told it does not dispatch (#2148)");
         ok(/FINAL head/.test(blocked.reason), "…and what it DOES own (push its final head)");
@@ -4819,7 +4822,7 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
     // appends the tier line. The token moved with the shape; the ARM it pins (micro → micro
     // remediation, never the generic one) is asserted behaviorally by T1, and the micro-vs-generic
     // selection is re-pinned below so a message swap cannot hide behind the rename.
-    'return { block: true, reason: dispatchFloorMessage("micro", reviewerRole, floor.read)',
+    'reason: dispatchFloorRefusal("micro", reviewerRole, floor.read, firedCallId)',
     "export const TIER_RULE",
     'micro: "block"',
     'standard: "block"',
@@ -4851,13 +4854,13 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // the micro arm's own copy and empty the region vacuously — the full-file lastIndexOf keeps the
   // slice meaningful.
   ok(microCheck !== -1, "micro arm must exist");
-  const genericReturn = src.lastIndexOf("return { block: true, reason: dispatchFloorMessage(tier, reviewerRole, floor.read)");
+  const genericReturn = src.lastIndexOf("reason: dispatchFloorRefusal(tier, reviewerRole, floor.read, firedCallId)");
   ok(genericReturn !== -1 && genericReturn > microCheck, "generic block return must follow the micro arm");
   // #2204: the tier line lives in ONE builder, and the micro arm must not bypass it (a hand-rolled
   // return of MICRO_BLOCK_MESSAGE would silently drop the tier naming the issue asks for).
   ok(
     src.includes("export function dispatchFloorMessage(") &&
-      (src.match(/dispatchFloorMessage\("micro", reviewerRole, floor\.read\)/g) ?? []).length === 1 &&
+      (src.match(/dispatchFloorRefusal\("micro", reviewerRole, floor\.read, firedCallId\)/g) ?? []).length === 1 &&
       // #3175: the builder must still take `role` (the role-aware remediation is #2148's whole point)
       // AND must take the READ — a builder that drops `read` re-breaks the count the issue is about.
       /export function dispatchFloorMessage\(\s*tier: string,\s*role: ReviewerRole = "self",\s*read: DispatchFloorRead = \{\},?\s*\)/.test(src),
@@ -5154,7 +5157,11 @@ test("#3175: the refusal prints the count it READ, and UNKNOWN when it read noth
   const read3 = dispatchFloorMessage("standard", "self", { dispatches: 3 });
   ok(
     /DISPATCHES = 3 \(counted in THIS pi process\)/.test(read3),
-    "the refusal prints the count it was handed — the pre-#3175 text printed a literal `(still 0)` here",
+    // ⛔ THE HONEST CLAIM (fresh review of #3175, P1). The pre-#3175 text ASSERTED a literal nobody
+    // read — but at a fired refusal that literal was `0` and the counter was `0`, so "it printed a
+    // wrong number" was never the measurement. What was wrong is that no state could say "not
+    // measured"; that is what this pins.
+    "the refusal renders the count it was handed, and the pre-#3175 text could only ever assert a literal",
   );
   // The failure mode of a call site that forgets to thread the read through: UNKNOWN, not 0.
   const unread = dispatchFloorMessage("standard", "self");
@@ -5167,6 +5174,68 @@ test("#3175: the refusal prints the count it READ, and UNKNOWN when it read noth
   const listed = dispatchFloorReadLines({ dispatches: 0, registry: { total: 4, forRepo: 2, dir: "/d" } }).join("\n");
   ok(/4 record\(s\) at \/d, 2 for this repo/.test(listed), "a readable registry reports its own numbers");
   ok(/never \\"no review exists\\"/.test(listed) || /never "no review exists"/.test(listed), "and `0` is defined as a counter reading, not a fact about the review");
+  // ⛔ `null` AND `undefined` ARE DIFFERENT READS (fresh review of #3175, P2). `null` = the listing
+  // was ATTEMPTED and failed; `undefined` = no listing was taken at all. The old renderer collapsed
+  // both onto "the registry directory could not be listed" — a CAUSE asserted for a read that never
+  // happened.
+  const noListing = dispatchFloorReadLines({ dispatches: 0 }).join("\n");
+  ok(/REGISTRY: UNKNOWN/.test(noListing), "a registry with no listing TAKEN is UNKNOWN, not a cause");
+  ok(
+    !/could not be listed/.test(noListing),
+    `…and never claims a listing FAILED when none was attempted: ${noListing.split("\n")[2]}`,
+  );
+  ok(/could not be listed/.test(unlistable), "…while an attempted-and-failed listing says exactly that");
+  // ⛔ THE RECORD HALF IS ITS OWN TRI-STATE (fresh review of #3175, P2). A caller that supplies the
+  // registry but never states the record read used to get a confident "NONE VISIBLE HERE" for a read
+  // it never stated.
+  const recordUnstated = dispatchFloorReadLines({ dispatches: 0, registry: { total: 4, forRepo: 2, dir: "/d" } }).join("\n");
+  ok(/found: UNKNOWN/.test(recordUnstated), "an unstated record read is UNKNOWN");
+  ok(!/NONE VISIBLE HERE/.test(recordUnstated), "…and is never turned into a confident negative");
+  const recordNone = dispatchFloorReadLines({ dispatches: 0, registry: { total: 0, forRepo: 0, dir: "/d", absent: true }, record: "none" }).join("\n");
+  ok(/NONE VISIBLE HERE/.test(recordNone), "a record read that DID establish the negative still says so");
+});
+
+test("#3175: the operator block and the model text render the SAME read — absent, unlistable, listed", () => {
+  // ⛔ ONE DERIVATION, TWO RENDERINGS (fresh review of #3175, P2). The operator `lines` were left
+  // binary while the model text became tri-state: on a box with no registry the log said
+  // "found NONE visible here" and the model was told "not established" — the same observation
+  // described two contradictory ways, which is the defect this PR exists to remove.
+  withTempHomeSync(() => {
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.rmSync(reviews, { recursive: true, force: true });
+
+    // (1) ABSENT — `ENOENT` is a READ that established zero, not a failure.
+    const absent = describeDispatchFloorRead("git commit -m x", "standard", 0);
+    ok(absent.read.registry !== null && absent.read.registry.absent === true,
+      "an absent registry is recorded as an ABSENT listing, not as an unreadable one");
+    equal(absent.read.registry?.total, 0, "…with the zero it actually read");
+    equal(absent.read.record, "none", "…which is a real negative, so the record half is `none`");
+    const absentModel = dispatchFloorReadLines(absent.read).join("\n");
+    ok(/does not exist/.test(absent.lines.join("\n")), "the operator log says the dir does not exist");
+    ok(/does not exist/.test(absentModel), "…and the model is told the same thing, not 'not established'");
+    ok(/found: NONE VISIBLE HERE/.test(absentModel), "…and the record half agrees with the operator line");
+    ok(!/registry=-1/.test(absent.recordState), "the audit row never carries the -1 sentinel");
+
+    // (2) UNLISTABLE — a non-ENOENT errno is UNKNOWN on BOTH channels. A directory that is a FILE
+    // reproduces `ENOTDIR` deterministically, with no permission games.
+    fs.mkdirSync(resolvePath(reviews, ".."), { recursive: true });
+    fs.writeFileSync(reviews, "not a directory");
+    const unlistable = describeDispatchFloorRead("git commit -m x", "standard", 0);
+    equal(unlistable.read.registry, null, "a listing that FAILED is null (its own state, not `undefined`)");
+    equal(unlistable.read.record, "unknown", "…so the record half is UNKNOWN, never `none`");
+    const unlistableLog = unlistable.lines.join("\n");
+    ok(!/NONE visible here|NONE VISIBLE HERE/.test(unlistableLog),
+      `the operator log must not report a confident negative for a read that failed: ${unlistableLog.split("\n")[1]}`);
+    ok(/could not be listed/.test(unlistableLog), "…it says the listing failed");
+    ok(!/does not exist/.test(unlistableLog),
+      "…and does not claim ENOENT — the case the old `catch { total = -1 }` collapsed into it");
+    const unlistableModel = dispatchFloorReadLines(unlistable.read).join("\n");
+    ok(/found: UNKNOWN/.test(unlistableModel), "the model is told UNKNOWN, matching the operator log");
+    ok(/registry=UNKNOWN/.test(unlistable.recordState),
+      `the audit row carries UNKNOWN, not a negative count: ${unlistable.recordState}`);
+    ok(!/registry=-?\d*-1/.test(unlistable.recordState), "…never the -1 sentinel");
+    fs.rmSync(reviews, { force: true });
+  });
 });
 
 testAsync("#3175: a blocked call leaves NO effect, and the refusal is ANCHORED to that call", async () => {
@@ -5176,32 +5245,129 @@ testAsync("#3175: a blocked call leaves NO effect, and the refusal is ANCHORED t
       process.env.PI_MODE = "print";
       const { pi, fire, sent } = mockPi();
       (reviewEnforcerFactory as any)(pi);
-      const marker = resolvePath(os.tmpdir(), `re-3175-effect-${process.pid}`);
       try {
-        fs.rmSync(marker, { force: true });
         await fire("session_start"); // no skip env → the floor is live
-        // THE EFFECT, not the message: this is what the command would have done, and it runs ONLY
-        // if the gate allowed the call. `refs/heads/x` is the observable an effect-level test needs.
-        const effect = () => fs.writeFileSync(marker, "committed");
+        // ⛔ THE EFFECT CLAIM IS CHECKED WHERE IT IS RECORDED, NOT BY A FIXTURE THE TEST WRITES.
+        // The first version of this test wrote a marker in the `!block` branch and then asserted the
+        // marker was absent — which is `block === true` restated, so it could not fail unless the
+        // assertion above it already had (fresh review of #3175, P2). The durable effect record is
+        // the audit row, and it is what the fleet reads back.
         const res = await fire("tool_call", {
           toolName: "bash",
           toolCallId: "call_3175_anchor",
           input: { command: "git commit -m x" },
         });
         ok(res && res.block === true, "the git op at 0 dispatches is still refused (the protection is unchanged)");
-        if (!(res && res.block)) effect(); // only an ALLOWING gate would have run the command
-        ok(!fs.existsSync(marker), "a blocked command must not have run — asserted by its EFFECT, not by any banner");
-        // …and the claim is anchored, so a lane cannot read it as a verdict on a DIFFERENT call.
+        // …and the claim is anchored IN THE TOOL RESULT, so a lane cannot read it as a verdict on a
+        // DIFFERENT call — the recovery is delivered once per session, so a pointer that resolved
+        // only there was unsatisfiable from the second refusal on.
+        ok(/tool_call_id=call_3175_anchor/.test(String(res && (res as any).reason)),
+          "the TOOL RESULT names the call it is about (#3175, P1)");
+        ok(/see the ANCHOR line below/.test(String(res && (res as any).reason)) &&
+           /ANCHOR \(#3175\)/.test(String(res && (res as any).reason)),
+          "…and the '(see the ANCHOR line)' pointer resolves inside the same text");
         const recovery = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
         equal(recovery.length, 1, "the recovery is delivered once");
         const body = String(recovery[0].message.content);
-        ok(/tool_call_id=call_3175_anchor/.test(body), "the refusal names the call it is about (#3175)");
-        ok(/git commit -m x/.test(body), "…and the command it refused");
+        ok(/tool_call_id=call_3175_anchor/.test(body), "the recovery names the call it is about too");
+        ok(/the refused command: git commit -m x/.test(body), "…and adds the command, which a queued message cannot get from an attached call");
         ok(/delivery order is not cause/.test(body), "…and says a queued recovery is not evidence about a later call");
         ok(!/NOTHING IN THE BLOCKED COMMAND RAN/.test(body), "the unbounded claim is gone from the delivered text too");
+        // THE EFFECT, as the durable record: what the refusal claimed, and about which call.
+        const audit = readAuditLines(auditLogPath()).filter(
+          (l) => l.event === "reviewer_preflight" && l.phase === "block_recovery"
+        );
+        equal(audit.length, 1, "the refusal is audited once");
+        equal(audit[0].effect, "not_applied", "the audit row records the effect claim");
+        equal(audit[0].effect_scope, "this_call_only", "…scoped to this call, never a claim about a sibling");
+        equal(audit[0].tool_call_id, "call_3175_anchor", "…bound to the call it observed");
+        equal(audit[0].dispatch_count, 0, "…with the count it actually read");
       } finally {
-        fs.rmSync(marker, { force: true });
         process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+test("#3175: the floor's blocking read is NOT taken above the capacity arms (spawn-fault path)", () => {
+  // ⛔ THE READ IS NOT HOISTED (fresh review of #3175, P2). `describeDispatchFloorRead` runs `execSync`
+  // git plus a `readdirSync`; hoisting it above the capacity arms put that blocking work on the
+  // spawn-fault path — the one a loaded box is already failing on — for two arms that consume only
+  // `dispatches`. The capacity arms therefore pass the count alone, and the read is taken per arm.
+  if (!isSourceCheckout()) {
+    console.log("  ↪ skip (deployed copy — not an agent-infra source checkout)");
+    return;
+  }
+  const src = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  const microArm = src.indexOf('if (tier === "micro")');
+  const microFloorRead = src.indexOf('const floor = describeDispatchFloorRead(command, "micro", dispatchCount);');
+  const genericFloorRead = src.indexOf("const floor = describeDispatchFloorRead(command, tier, dispatchCount);");
+  ok(microArm !== -1, "the micro arm exists");
+  ok(microFloorRead !== -1 && genericFloorRead !== -1, "each floor arm takes its own read");
+  ok(
+    microFloorRead > microArm,
+    "the micro read is taken INSIDE the arm, below the capacity check (not hoisted above `if (tier === \"micro\")`)",
+  );
+  ok(
+    src.lastIndexOf("const floor = describeDispatchFloorRead(", microArm) === -1,
+    "nothing reads the registry above the micro arm — the capacity arms run first",
+  );
+  ok(
+    (src.match(/\{ dispatches: dispatchCount \}/g) ?? []).length >= 2,
+    "both capacity arms pass the COUNT alone, so the blocking read is not on the spawn-fault path",
+  );
+});
+
+testAsync("#3175: EVERY refusal arm carries the per-call anchor and the read — not just the first", async () => {
+  // ⛔ THE THREADING IS PINNED BEHAVIOURALLY, ON EVERY ARM (fresh review of #3175, P2). The source
+  // tokens pin the shape; a source token cannot show that the value reaches the model. Drive the two
+  // FLOOR arms through the real handler and require the reason itself to carry the anchor.
+  // The synthetic verdict-less spawn, shaped like builtin-tools' own producer (the same shape the
+  // #spawngate section below documents). Written here rather than imported: that constant is
+  // declared later in this file, and a test that runs before its declaration would hit its TDZ.
+  const SPAWN_FAILED_LOCAL = { model: "m", provider: "p", status: "failed", retryable: false };
+  const drive = async (micro: boolean, capacity: boolean): Promise<string> => {
+    if (micro) fs.writeFileSync("/tmp/agent-issue-complexity", "micro\n");
+    else fs.rmSync("/tmp/agent-issue-complexity", { force: true });
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const arm = `${micro ? "micro" : "standard"}-${capacity ? "capacity" : "floor"}`;
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      if (capacity) await fire("tool_result", { toolName: "task", details: SPAWN_FAILED_LOCAL });
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        toolCallId: `call_3175_${arm}`,
+        input: { command: "git commit -m x" },
+      });
+      ok(res && res.block === true, `the ${arm} arm still refuses`);
+      return String((res as any).reason);
+    } finally {
+      process.env.PI_MODE = prevMode;
+      if (micro) fs.rmSync("/tmp/agent-issue-complexity", { force: true });
+    }
+  };
+  await withMarkerIsolated(async () => {
+    await withTempHome(async () => {
+      for (const micro of [false, true]) {
+        for (const capacity of [false, true]) {
+          const arm = `${micro ? "micro" : "standard"}-${capacity ? "capacity" : "floor"}`;
+          const reason = await drive(micro, capacity);
+          ok(new RegExp(`tool_call_id=call_3175_${arm}`).test(reason),
+            `the ${arm} arm's TOOL RESULT names its own call (#3175)`);
+          // The CAPACITY arms render their own diagnosis instead of the read block, so the count is
+          // asserted where they do carry it: the audit row is `dispatch_count`. Here the floor arms
+          // must show the count they READ; the capacity arms must at least not fabricate one.
+          if (!capacity) {
+            ok(/DISPATCHES = 0 \(counted in THIS pi process\)/.test(reason),
+              `the ${arm} arm renders the count it read, not UNKNOWN and not a literal`);
+            ok(!/DISPATCHES = UNKNOWN/.test(reason), `…and the ${arm} arm actually took the read`);
+          }
+          ok(!/see the ANCHOR line below/.test(reason) || /ANCHOR \(#3175\)/.test(reason),
+            `the ${arm} arm's anchor pointer resolves inside its own text`);
+        }
       }
     });
   });
@@ -9251,11 +9417,19 @@ test("#2349 evidence gate — its four block states print four DISTINCT lines (t
 // CONTRADICTING its own spawn-path paragraph (fresh review round 5, P1; invisible to every test,
 // because the old pin asserted the stale sentence). The pin is now the TRUE disclosure.
 test("#2349 dispatch floor — the refusal says it read a head-bound record AND a dispatch count", () => {
-  // #3175: the READ line is GENERATED (a hardcoded count was the defect), so this asserts the text
-  // the model actually RECEIVES — the composed refusal, not the static template plus the generator's
-  // own output (a fixture built from the function under test would pass on a broken composer).
+  // #3175: the READ line is GENERATED (a hardcoded count was the defect). This fixture IS the
+  // function under test — `dispatchFloorMessage` — so it cannot show that a caller threads the read
+  // in; it shows only that the composer renders what it is handed. What pins the THREADING is
+  // behavioural, and it lives in "#3175: EVERY refusal arm carries the per-call anchor and the read":
+  // this test drives the composer, that one drives the four refusal arms through the real handler.
+  // ⛔ (The first version of this comment claimed the opposite — that a fixture built from the
+  // function under test would pass on a broken composer — while building exactly that fixture.
+  // Corrected in the fresh review of #3175; the coverage was never in question, the rationale was.)
+  // NOTE the tier: standard only. The templates are per-tier, so this pins the GENERIC dispatch-floor
+  // message (`BLOCK_MESSAGE`), not micro's (`MICRO_BLOCK_MESSAGE`) — micro's own text is pinned by
+  // #2204/#485 T1 above.
   const staticText = dispatchFloorMessage("standard", "self", { dispatches: 0, registry: null });
-  ok(staticText.includes("WHAT THIS GATE READ"), "both dispatch-floor messages disclose what they read");
+  ok(staticText.includes("WHAT THIS GATE READ"), "the standard dispatch-floor message discloses what it read");
   ok(staticText.includes("head-bound review record"), "…and that the record path IS consulted (post-#2287 truth)");
   ok(staticText.includes("PER-MACHINE"), "…and that the registry is per-machine");
   ok(staticText.replace(/\s+/g, " ").includes("IN THIS SESSION"), "…and what the lane's next action is");
@@ -9604,7 +9778,7 @@ testAsync("#2206 review P2: the CAPACITY refusal is non-terminal in the text the
         const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
         equal(recoveries.length, 1, "the capacity refusal delivers its one recovery message");
         equal(recoveries[0].options?.triggerTurn, true, "…triggering the turn that keeps the run alive");
-        ok(String(recoveries[0].message?.content).endsWith(String(reason)), "…carrying THIS arm's diagnosis, not the compliance text");
+        ok(String(recoveries[0].message?.content).startsWith(String(reason)), "…carrying THIS arm's diagnosis, not the compliance text");
         ok(
           !/No reviewers were dispatched in this session/.test(recoveries[0].message?.content ?? ""),
           "…and does NOT tell the lane it skipped a review it never had the chance to dispatch"
