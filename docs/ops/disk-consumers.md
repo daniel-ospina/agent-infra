@@ -234,7 +234,7 @@ The class cannot run there, for three independent reasons:
 * the delegates are **absent from the cell's harness**: `/tmp/cell-home/.pi/agent/scripts/` has
   `disk-reaper.sh`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `pi-reap-worktrees.sh` — but **no
   `reap-duplicate-installs.sh` and no `reap-abandoned-worktrees.sh`** (both are in the repo at
-  `scripts/`, and both are in the farm list at `pi-bootstrap/setup.sh:522`);
+  `scripts/`, and both are in the farm list at `pi-bootstrap/setup.sh:574`);
 * the installed unit has **no `DUP_INSTALL_REAPER` / `ABANDONED_WT_REAPER`** env pins (the template does,
   `templates/systemd/eldato-disk-reaper.service:50-51`);
 * the pass record confirms it: `classes=uv,venv,worktree`.
@@ -243,7 +243,7 @@ The harness pins on the cells (`c46fe9ae…` / `e90973eb…`) predate `b13f1f4e0
 `eldato-harness-apply` reports *"the pin already names origin/main — no-op"* while the delegate is
 still missing: **the pin advances, the deploy does not carry the file.** (Re-running
 `scripts/install-disk-reaper-timer.sh` on the cells re-renders the unit and its delegate check warns when
-a pinned delegate is missing — `install-disk-reaper-timer.sh:303`.)
+a pinned delegate is missing — `install-disk-reaper-timer.sh:337`.)
 
 ### G5 — nothing sweeps `/tmp` on a useful timescale
 `/usr/lib/tmpfiles.d/tmp.conf` ships `D /tmp 1777 root root 30d`. Lane scratch is 10–11 days old at its
@@ -271,7 +271,7 @@ Measured on c1 the next day (see *The runner `_work` sink* above): **19 G** in s
 reporting healthy. `scripts/disk-reaper-run.sh` had zero coverage of `gh-runner`/`_work`, so the sink
 was unmeasurable by construction. Shipped as `class=runner-work` + `scripts/reap-runner-work.sh`
 (owner), with the mtime gate and the `_tool`/`_actions` carve-out; its suite fails against the
-pre-change tree (4 passed / 13 failed) and kills all nine of its mutants
+pre-change tree (6 passed / 13 failed) and kills all ten of its mutants
 (`scripts/disk-reaper-runner-work.test.sh`).
 
 ### G9 — the stale `/tmp` sink (filed as **#3043**, deliberately NOT fixed with G8)
@@ -411,7 +411,7 @@ diagnosis only. What a follow-up PR would touch, per finding:
 | **G1** `/home/cmux/tortoise` outside `DISK_REAPER_REPOS` | nothing in code — an installer argument. `install-disk-reaper-timer.sh --repo` on each cell, then verify `classes=` and the worktree census in the next pass. |
 | **G2** lane-scratch population unbounded | a decision, not a patch: replacing `systemd-tmpfiles`' 30 d with an aged class needs an owner ruling on what scratch counts as evidence. Out of scope by design (see the two rules in `docs/ops/disk-reaper.md`). |
 | **G3** uv bound unclaimable on a busy cell | `scripts/pi-cache-reap.sh` — a deferral that recurs on N consecutive passes cannot stay a silent `deferral`; it needs a named escalation (raise the bound deliberately, or report `bound-unclaimed-for=…` in the status record) plus a test. Two-arm change, not one line. |
-| **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:556`) already names both delegates, so the list is not the defect. Needs its own test. |
+| **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:574`) already names both delegates, so the list is not the defect. Needs its own test. |
 | **G8** the runner `_work` sink had no class | **shipped** (2026-10-28): `scripts/reap-runner-work.sh` + `class=runner-work` in `scripts/disk-reaper.sh`, pinned in both scheduled artifacts and in the farm list. A class an operator has to remember to enable is the hole it closes, so it is in the DEFAULT `--only` list — and its globs are in `DISK_REAPER_RUNNER_GLOBS`, so an explicit-but-unmatched layout is a refusal rather than a measured zero. |
 | **G9** stale `/tmp` has no class | filed as **#3043** — a liveness witness (`scripts/lib/live-paths.sh`) per candidate, an owner ruling on what scratch counts as evidence, and an exclusion set that is not a name list. |
 | **G5** `/tmp` swept only at 30 d | policy (`/etc/tmpfiles.d/`), one owner decision; no repo change. |

@@ -949,10 +949,25 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh`, also mutation-checked —
-run against the PRE-CHANGE tree (the base commit's `disk-reaper.sh` beside this owner) it reports
-**4 passed, 13 failed**, and against this tree **17 passed, 0 failed**: the discrimination is measured
-both ways, not asserted:
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **9 cases and 10 mutants,
+19 assertions** — also mutation-checked. Run against the PRE-CHANGE tree (the base commit's
+`disk-reaper.sh` beside this owner) it reports **6 passed, 13 failed**, and against this tree
+**19 passed, 0 failed**: the discrimination is measured both ways, not asserted. (The 13 red on the
+pre-change tree are cases (a)–(h) plus the five entry-point mutants that cannot even be applied there,
+because the arms they edit do not exist in that `disk-reaper.sh`; (i) and the owner-side mutants stay
+green, which is the correct answer for a case whose subject is the owner.)
+
+The measured transcript, `bash scripts/disk-reaper-runner-work.test.sh`:
+
+```
+  19 passed, 0 failed
+```
+
+and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
+
+```
+  6 passed, 13 failed
+```
 
 | case | proves | mutant that must turn it red |
 |---|---|---|
@@ -964,6 +979,7 @@ both ways, not asserted:
 | (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) | the `census=no-roots` arm is deleted |
 | (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
 | (h) | a SET-but-EMPTY glob list is a refusal at **both** layers (the entry point's seam and the owner's), never "scan nothing for ever" — `${X:-default}` would substitute the *widest* sweep for an emptied value, and this class's output is deletions | the entry point's empty-glob arm never matches; and, separately, the owner's |
+| (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
