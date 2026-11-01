@@ -52,6 +52,23 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
+# ── the worktree lifecycle helper (#2033) ──────────────────────────────────────────────────────
+# Sourced after spawn-gate for the same $SELF (a `$O` seed copies the whole directory).
+# ⛔ PROBED HERE, SOURCED ONLY WHERE IT IS NEEDED — AND THAT IS A CORRECTNESS REQUIREMENT (measured).
+# An eager `. … || exit 78` at THIS point runs before the load/disk refusal accounting further down,
+# which is where the controller's fixcount attempt is REFUNDED. `$O` is seeded file by file, so a new
+# caller against an older `$O` (missing this helper) is a documented, TOLERATED skew — the same skew
+# the AGENT_DISK_REFUSED tolerant reference below exists for. Exit 78 there would burn an attempt
+# without running a fixer, and three of those PARK a PR "needs a human", which is precisely the
+# agent-infra#1720 failure the refund exists to prevent. Measured: the shipped spawn-gate.test.sh
+# fixture went red with the eager source — "a STALE helper still REFUNDS a load refusal: rc=75,
+# fixcount 2->1 (rc=78, fixcount=2)". Only the materialise path below needs the helper, so the FATAL
+# moves there: the refusal is still hard, it just no longer preempts accounting that must always run.
+WT_LIFECYCLE_READY=0
+if [ -f "$SELF/wt-lifecycle.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$SELF/wt-lifecycle.sh" && WT_LIFECYCLE_READY=1
+fi
 # ── the RESEARCH contract is part of the fixer's brief too (#2258) ──────────────────────────────────
 # A fixer acts on a reviewer's findings, and the measured duplicate-PR incident (#2247 vs #2250) was
 # two lanes fixing the same three things from two briefs that never forced either to look first. The
@@ -171,9 +188,25 @@ fi
 
 [ -z "$WT" ] && {
   # Foreign (other-machine) branch: materialise a local worktree so the fixer has somewhere to work.
-  if git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
-    git worktree add ".worktrees/fix-$PR" "$BR" >> "$L.log" 2>&1
-  else
+  # ⛔ THROUGH THE SHARED HELPER (#2033), not `git worktree add … || exit 1`. That shape left the
+  # branch behind when the add failed mid-checkout — and for this path the branch is one this box may
+  # have JUST created from `origin/$BR`, i.e. residue with no owner, which then blocks the PR's issue
+  # pre-flight on every box. `wt_provision` rolls back to a verified empty state, and ATTACHES an
+  # existing branch that holds commits instead of failing on "branch exists".
+  # The helper MUST be present on exactly this path (see the probe above): without its rollback, a
+  # failed add leaves the branch behind, which is the residue #2033 is about.
+  if [ "$WT_LIFECYCLE_READY" != 1 ]; then
+    echo "[fix $PR] FATAL: $SELF/wt-lifecycle.sh missing — refusing to materialise a worktree without its rollback (#2033)" >> "$L.log"
+    echo "[fix $PR] FATAL: $SELF/wt-lifecycle.sh missing — refusing to materialise a worktree without its rollback (#2033)" >&2
+    exit 78
+  fi
+  # ⛔ NAME THE REPO, NOT A MATERIALISATION FAILURE (#2694). The measured message a human read first
+  # was `cannot materialise <branch>`, which says nothing about the repo the branch is missing FROM.
+  # If the branch is in neither this repo nor its origin after a fetch, say so — with the branch and
+  # the slug — and stop before `wt_provision` can only report the generic add failure. A fetch that
+  # failed for network reasons is covered too: the branch is unproven here, and the refusal names
+  # both possibilities rather than blaming worktree creation.
+  if ! git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
     # ⛔ NAME THE DESTINATION, NOT JUST THE SOURCE (#3009, the SAME defect pr-doctor had).
     # `git fetch origin "$BR"` does NOT create `refs/remotes/origin/$BR`: with no colon the fetched
     # ref lands in FETCH_HEAD, and a remote-tracking ref is only ALSO updated when a CONFIGURED
@@ -185,12 +218,7 @@ fi
     # of the wrong repo, which is worse than a silent failure because it sends the operator at the
     # remote instead of at the clone. The leading `+` keeps the update valid after the force-push a
     # PR branch routinely gets.
-    git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet >> "$L.log" 2>&1
-    # ⛔ NAME THE REPO, NOT A MATERIALISATION FAILURE (#2694). The measured message a human read
-    # first was `cannot materialise <branch>`, which says nothing about the repo the branch is
-    # missing FROM. If the branch is not in THIS repo, say so — with the branch and the slug — and
-    # stop. A fetch that failed for network reasons is covered too: the branch is unproven here, and
-    # the refusal names both possibilities rather than blaming worktree creation.
+git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$L.log" 2>&1
     if ! git rev-parse --verify -q "refs/remotes/origin/$BR" >/dev/null 2>&1; then
       # Reached only when the fetch genuinely could not read the branch (network, auth, a real
       # BRANCH/REPO mismatch) — the refspec above no longer produces a FALSE hit here.
@@ -199,7 +227,11 @@ fi
       refund_gate_attempt
       exit "$REPO_TARGET_REFUSED"
     fi
-    git worktree add ".worktrees/fix-$PR" -b "$BR" "origin/$BR" >> "$L.log" 2>&1
+  fi
+  wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
+  if [ "$?" != 0 ]; then
+    echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
+    exit 1
   fi
   WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
   [ -z "$WT" ] && { echo "[fix $PR] ABORT: could not materialise a worktree for $BR" >> "$L.log"; exit 1; }
