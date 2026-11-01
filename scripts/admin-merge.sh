@@ -1521,7 +1521,13 @@ named_unattributable_runs() {
   else
     say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
   fi
-  say_err "   log yielded no failure identity, so it entered NEITHER side of the comparison:"
+  # ⛔ TWO REASONS, ONE LIST (agent-infra#3174). Since #3174 a run whose shard runner was KILLED
+  # mid-list is named here too: its ids exist but were REFUSED (the set is a truncated sample), so
+  # the list is no longer exclusively "yielded no identity". Naming only the old reason would send
+  # the operator to hunt a parser bug for a window whose remedy is a wider read.
+  say_err "   log yielded no failure identity, OR its shard recap was INCOMPLETE (the shard step was"
+  say_err "   killed mid-list, #3174 — those ids exist and were refused as a truncated SAMPLE) — so it"
+  say_err "   entered NEITHER side of the comparison:"
   while IFS= read -r line; do
     [ -n "${line//[[:space:]]/}" ] || continue
     runref="${line##*$'\t'}"
@@ -8023,6 +8029,21 @@ main() {
         say_err "   yielded NO failure identity (its log could not be fetched, or the id parser"
         say_err "   could not read it — a missing/updated parser, or a moved log format)."
         say_err "   Re-running fixes the first; the second needs the parser updated." ;;
+      truncated:*)
+        # ── #3174: A THIRD STATE, AND ITS OWN REMEDY ───────────────────────────────
+        # The window WAS listed and read; its failing runs were KILLED MID-LIST, so the shard
+        # runner's recap is INCOMPLETE and the failure set it names is a SAMPLE. This is
+        # neither "main is green" nor "the listing could not be read", which is why it has
+        # its own arm: the remedy is a WIDER/OLDER window (or waiting for a completed run),
+        # NOT a re-run of the parser — the parser read the capture fine and refused it on
+        # purpose (scripts/ci-failure-set.sh `collect_union_truncated`).
+        say_err "   This is an UNPROVEN baseline, not an empty one and not a failed read: the window"
+        say_err "   WAS listed (main: completed=${main_completed_bad:-0} run(s), of which"
+        say_err "   tested=${main_tested_bad:-0}) but run ${main_unreadable#truncated:} was killed before"
+        say_err "   its shard list finished, so the failures it names are a TRUNCATED SAMPLE."
+        say_err "   Folding a partial set into the reference would report a real main failure as new."
+        say_err "   Remedy: re-read a window that contains a run whose shard step FINISHED (raise"
+        say_err "   --main-runs) — do NOT re-run the parser, which produced this verdict deliberately." ;;
       *)
         say_err "   This is an UNREADABLE window, not an empty baseline: main's run LISTING"
         say_err "   could not be read (or the capture refused before publishing any counters),"
@@ -8058,6 +8079,13 @@ main() {
         say_err "   A FAILED READ over a window that WAS listed: main's rate table measured"
         say_err "   $(report_value "$TMP/main-report.txt" tested) tested run(s), and run ${main_sig_unreadable#parse:}"
         say_err "   yielded no failure identity for the signature pass (fetch or parser)." ;;
+      truncated:*)
+        # #3174: same third state as the rate pass above — the signature table cannot be built
+        # from a run whose recap is truncated (scripts/ci_exemption.py refuses both doors).
+        say_err "   UNPROVEN, not unreadable: the window WAS listed and its failing run"
+        say_err "   ${main_sig_unreadable#truncated:} was KILLED before its shard list finished, so its"
+        say_err "   shard recap is incomplete and no signature table can be signed from it (#3174)."
+        say_err "   Remedy: re-read a window containing a run whose shard step FINISHED (raise --main-runs)." ;;
       *)
         say_err "   No signature pass ran over a read window: main's run LISTING could not be"
         say_err "   read (or the capture refused before it), so nothing was measured here." ;;
