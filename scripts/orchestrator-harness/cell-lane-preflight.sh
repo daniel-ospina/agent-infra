@@ -88,6 +88,12 @@
 #   why=no-answer    ⇔ the process RETURNED without answering. A transient blip is the only thing that
 #                      produces it (a deterministic defect hangs, errors, or cannot be measured at
 #                      all), so it is the ONLY reason a caller may WARN on and proceed.
+#   why=usage        ⇔ THIS FILE COULD NOT RUN AS ASKED — an unknown argument, a non-numeric `--bound`.
+#                      Emitted by `die_usage` at exit 2 (the CANNOT MEASURE code). Without it the
+#                      usage path printed NO verdict, so the caller WARNed and dispatched anyway;
+#                      measured `LANE_PREFLIGHT_BOUND=45s` → `run_agent rc=0, agent launched` (review
+#                      of #2991, P2). Its usual cause in production is consumer/helper VERSION SKEW
+#                      (a caller passing a flag this copy predates), and the remedy says so.
 #   every other refused reason ⇔ deterministic: `exit-hang` / `no-return` (still alive at the bound,
 #                      with or without the answer), `call-failed` (answered, then errored),
 #                      `keys-unreadable`, `pi-missing`, `misconfigured`. A caller must REFUSE on these.
@@ -109,8 +115,31 @@ PROVIDER="${PI_LANE_PROVIDER:-deepseek}"
 ATTEMPTS=2
 QUIET=0
 TOKEN="PF_OK_4f2c"
+# Set BEFORE the parse loop: a usage refusal carries the host it happened on, and that is the one field
+# an operator needs to act on it. `hostname` is a single cheap fork; `PI_VER` is deliberately left late,
+# because it runs `pi` and a usage error must not depend on the binary it is about to blame.
+HOST="$(hostname 2>/dev/null || echo '?')"
 
-die_usage() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+# emit <verdict> <rest of the line>  — one line, on stdout, in both directions.
+# ⛔ DEFINED ABOVE `die_usage`, AND TOLERANT OF UNBOUND FIELDS, BECAUSE `die_usage` CALLS IT (review of
+# #2991, P2, measured). The usage path fires during argument parsing — BEFORE `HOST`/`PI_VER` are set —
+# so an `emit` that read them bare would abort under `set -u` and print nothing, which is the very
+# defect this is fixing (an emit defined only BELOW the parse loop would also be an unbound FUNCTION
+# at that point: `die_usage: emit: command not found`, and still no verdict).
+emit() {
+  local verdict="$1"; shift
+  printf '[%s] LANE_CAPABILITY=%s host=%s model=%s/%s pi=%s %s\n' \
+    "$PROG" "$verdict" "${HOST:-<unknown>}" "${PROVIDER:-}" "${MODEL:-}" "${PI_VER:-<unknown>}" "$*"
+}
+
+# ⛔ A USAGE ERROR IS A REFUSAL, NOT AN ABSENCE OF A VERDICT (follow-up to #2991, P2, measured).
+# This used to exit 2 with a stderr line and NOTHING on stdout. Every caller decides refuse-vs-warn
+# from the verdict line, so the line it prints here is the whole difference between a gate and an
+# inert gate: `LANE_PREFLIGHT_BOUND=45s` measured `probe rc=2, stdout=<>` and then, through
+# `run_agent`, `rc=0, agent launched` — a lane dispatched by a probe that never measured anything,
+# against this file's own EXIT table ("2 CANNOT MEASURE — EVERY caller must refuse too"). The exit
+# code stays 2 (it IS cannot-measure); what changes is that it can now be READ.
+die_usage() { printf '%s: %s\n' "$PROG" "$*" >&2; emit "refused why=usage" "usage-error=$*"; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --keys) [ $# -ge 2 ] || die_usage "--keys needs a path"; KEYS="$2"; shift 2 ;;
@@ -131,15 +160,9 @@ case "$ATTEMPTS" in ''|*[!0-9]*) die_usage "--attempts must be a positive intege
 [ "$BOUND" -gt 0 ] || die_usage "--bound must be > 0 (read '$BOUND')"
 [ "$ATTEMPTS" -gt 0 ] || die_usage "--attempts must be > 0 (read '$ATTEMPTS')"
 
-HOST="$(hostname 2>/dev/null || echo '?')"
+HOST="${HOST:-$(hostname 2>/dev/null || echo '?')}"
 PI_VER="$(pi --version 2>/dev/null | tail -1)"
 
-# emit <verdict> <rest of the line>  — one line, on stdout, in both directions.
-emit() {
-  local verdict="$1"; shift
-  printf '[%s] LANE_CAPABILITY=%s host=%s model=%s/%s pi=%s %s\n' \
-    "$PROG" "$verdict" "$HOST" "$PROVIDER" "$MODEL" "${PI_VER:-<unknown>}" "$*"
-}
 # refuse <why> <reading> <exit-code> — a refusal ALWAYS carries the reading it used, and every one of
 # them is a verdict an operator can grep, never a bare "hung".
 
