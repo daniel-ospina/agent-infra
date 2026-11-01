@@ -290,6 +290,18 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
           echo "[refresh]   fix: git -C $REPO remote set-url origin https://github.com/$OR.git  (or unset REPO and let this script derive one)"
           return 1 ;;
       *) case "$url" in
+           # ⛔ A `file://` URL NAMES NO REPO IDENTITY (review cycle 14, P2). It is URL-SHAPED, so the
+           # arm below reported it as "NOT the queue target … pre-flighting one repo's issues against
+           # another repo's tree is #1901" — an identity claim this pass never measured, about the
+           # shape `repo-slug.sh:52` refuses for exactly that reason, and about the one this file's own
+           # header (:21-23) calls a legitimate local mirror. The refusal is right; the identity claim
+           # is not. Same words as the recorded cause (`_pair`'s `file://*)` arm), so log and record
+           # cannot disagree.
+           file://*)
+             echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is the local mirror $url — a file:// URL names no repo identity, so it cannot prove it is a checkout of \$OR ($OR)"
+             echo "[refresh]   refusing is deliberate: a path cannot certify a queue target. Retrying cannot fix it, and the checkout is not evidence of a DIFFERENT repo either"
+             echo "[refresh]   fix: give the checkout a real remote (git -C $REPO remote set-url origin https://github.com/$OR.git), or unset OR to use the harness default"
+             return 1 ;;
            # A URL-shaped origin names a repo that can be COMPARED, so a difference is a refusal.
            *://*|*@*:*)
              echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is $url — NOT the queue target $OR"

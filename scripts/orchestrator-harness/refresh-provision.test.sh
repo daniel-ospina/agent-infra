@@ -786,9 +786,10 @@ ck "(h4b) an scp-form '…:tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC
 # …and the FOURTH arm, the scp form WITHOUT `.git` (review cycle 7, P2): stripping `*":$OR/"` from all
 # three lists left the suite green — the comment above claimed every row was its own fixture while
 # that one was covered by nothing. Each of the four is a row now, so every TRAILING-SLASH spelling is
-# pinned. ⛔ THE SIX PRE-EXISTING ARMS ARE STILL PINNED BY NOTHING (measured: deleting `"$OR"`,
-# `"$OR.git"`, `*":$OR"`, `*":$OR.git"`, `*"/*$OR"`-family from all three lists leaves the suite at
-# 129 passed, 0 failed). Stated rather than implied — a future lane can pin them the same way.
+# pinned. ⛔ THE SIX PRE-EXISTING ARMS ARE STILL PINNED BY NOTHING: deleting `"$OR"`, `"$OR.git"`,
+# `*":$OR"`, `*":$OR.git"`, `*"/$OR"` and `*"/$OR.git"` from all three lists leaves the suite GREEN (no
+# integer — the note above explains why: a count here was re-derived as false one round later). Stated
+# rather than implied, so a future lane can pin them the same way.
 mk_case cause-trailing-slash-scp-nogit
 git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise/"
 git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise/"
@@ -856,6 +857,13 @@ case "$(rec why)" in *"local-mirror"*) r=0 ;; *) r=1 ;; esac
 ck "(h3) …and the cause calls it a LOCAL MIRROR, not a different repo ($(rec why | cut -c1-80))" "$r"
 case "$(rec why)" in *"DIFFERENT repo"*) r=1 ;; *) r=0 ;; esac
 ck "(h3) …and it makes no identity claim it did not measure" "$r"
+# ⛔ THE LOG AND THE RECORD MUST AGREE (review cycle 14, P2): the record said "local mirror" while the
+# log line one above it still said "NOT the queue target … another repo's tree is #1901". Both say the
+# same thing now; these rows pin the LOG half.
+case "$OUT" in *"local mirror"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) …and the LOG calls it a local mirror too" "$r"
+case "$OUT" in *"another repo's tree"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and the log makes no #1901 identity claim about it" "$r"
 
 echo
 echo "==> $PASS passed, $FAIL failed"
