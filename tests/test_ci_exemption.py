@@ -3900,3 +3900,123 @@ def test_shard_annotation_family_is_reported_identically_by_both_doors():
     assert ids_door.bash_shard == sig_door.bash_shard == [
         "bash-shard::scripts/a/b.test.sh"
     ]
+
+
+# ==========================================================================
+# #3174 — THE PARTIAL RECAP MARKS A CAPTURE UNPROVEN, NOT A SHORTER SET
+# ==========================================================================
+#
+# THE DEFECT. Main's `script-validate` was killed mid-run and a killed shard step printed NO recap,
+# so the set of shards red on `main` — the REFERENCE SET every batch verdict subtracts — silently
+# SHRANK as the job got slower. Measured over three consecutive main runs: 13 / 11 / 10 failing
+# shards named, with nothing fixed in between (run `41217287437` was killed at 111 min). A shard
+# genuinely red on main then drops out of the baseline, reappears as "a new failure caused by the
+# batch", and gets a constituent dropped or reverted on a false signal.
+#
+# THE CONTRACT PINNED HERE. The runner prints the partial recap from a TERM/INT trap, prefixed
+# `⚠️ RECAP INCOMPLETE (k/n shards ran)`. The parser must treat that marker as "this capture holds a
+# TRUNCATED SAMPLE, not a set": NO ids on stdout, exit code 4 (which `scripts/ci-failure-set.sh` maps
+# onto its `truncated:` state and reports as UNPROVEN), and the word UNPROVEN on stderr. Emitting the
+# truncated list instead is exactly the fold the fix exists to stop.
+#
+# MUTATION THAT MUST GO RED: delete the `bash_shard_recap_incomplete` refusal from `_cmd_ids` → the
+# truncated capture yields `bash-shard::scripts/a.test.sh` and rc 0 → the tests below fail.
+
+_INCOMPLETE_MARKER = "⚠️ RECAP INCOMPLETE (2/3 shards ran)"
+
+
+def test_recap_incomplete_marker_is_recognised_with_or_without_the_emoji():
+    """The marker is the SIGNAL, so a rendering that lost the glyph must still be recognised.
+
+    A capture is not the runner's stdout: ANSI stripping and log rendering can drop the variation
+    selector, and an unrecognised marker is a SILENT return to #3174's failure mode. The parser
+    matches on the phrase, in a log-prefixed line, with or without the emoji.
+    """
+    prefix = f"{_SHARD_JOB}\t{_SHARD_STEP}\t2026-10-31T17:57:11.1234567Z "
+    for line in (
+        f"{prefix}{_INCOMPLETE_MARKER} — terminated",
+        f"{prefix}\u26a0 RECAP INCOMPLETE (2/3 shards ran)",  # no variation selector
+        f"{prefix}  RECAP INCOMPLETE (2/3 shards ran)",
+    ):
+        assert ci_exemption.bash_shard_recap_incomplete(line) is not None, line
+    # …and a COMPLETE capture — recap plus per-shard lines, no marker — is not truncated. Without
+    # this half the predicate could be "always True" and every baseline would be UNPROVEN.
+    complete = _shard_capture(
+        "❌ FAILED SHARD: scripts/a.test.sh",
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s): scripts/a.test.sh",
+    )
+    assert ci_exemption.bash_shard_recap_incomplete(complete) is None
+
+
+def test_ids_door_refuses_a_truncated_capture_and_names_it_unproven(tmp_path):
+    """`ids --log` on a capture carrying the marker: rc 4, NO ids, `UNPROVEN` on stderr.
+
+    Run through the CLI (subprocess), because the EXIT CODE is the wire contract the shell rail
+    reads — `scripts/ci-failure-set.sh` maps 4 onto `truncated:` (an excluded, UNPROVEN run) and
+    everything else onto a parser failure. A call on the function alone would not pin that.
+    """
+    log = tmp_path / "truncated.log"
+    log.write_text(
+        _shard_capture(
+            "❌ FAILED SHARD: scripts/a.test.sh",
+            _INCOMPLETE_MARKER + " — scripts/run-bash-shards.sh was TERMINATED (TERM)",
+            "❌ 1 bash shard(s) had failed when this run was killed",
+            "❌ failing shard(s): scripts/a.test.sh",
+        )
+    )
+    proc = subprocess.run(
+        [sys.executable, str(_CANONICAL_PATH), "ids", "--log", str(log)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 4, (
+        f"a truncated capture must answer with the truncated state (4), got {proc.returncode}: "
+        f"{proc.stderr[-1500:]}"
+    )
+    assert proc.stdout.strip() == "", (
+        "a truncated capture must emit NO ids (a consumer ignoring the code would subtract a "
+        f"partial set as if it were the baseline): {proc.stdout!r}"
+    )
+    assert "UNPROVEN" in proc.stderr, proc.stderr[-1500:]
+    assert "RECAP INCOMPLETE" in proc.stderr, proc.stderr[-1500:]
+
+
+def test_signatures_door_refuses_a_truncated_capture_too(tmp_path):
+    """Both doors, one rule — a truncated capture has no signature TABLE either.
+
+    Refusing only the `ids` door would leave `signatures` as the surviving way to publish a set read
+    off a run that never finished (and `scripts/ci-failure-set.sh` calls it per run).
+    """
+    log = tmp_path / "truncated-sig.log"
+    log.write_text(_shard_capture("❌ FAILED SHARD: scripts/a.test.sh", _INCOMPLETE_MARKER))
+    proc = subprocess.run(
+        [sys.executable, str(_CANONICAL_PATH), "signatures", "--log", str(log)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 4, f"{proc.returncode}: {proc.stderr[-1500:]}"
+    assert proc.stdout.strip() == "", proc.stdout
+
+
+def test_complete_capture_still_yields_its_ids(tmp_path):
+    """THE CONTROL ARM: a complete recap is NOT truncated, so the refusal cannot be vacuous.
+
+    Without this, a predicate that answered "truncated" for every capture would pass the three tests
+    above and disable the whole baseline — a false UNPROVEN is its own outage.
+    """
+    log = tmp_path / "complete.log"
+    log.write_text(
+        _shard_capture(
+            "❌ FAILED SHARD: scripts/a.test.sh",
+            "❌ 1 bash shard(s) failed",
+            "❌ failing shard(s): scripts/a.test.sh",
+        )
+    )
+    proc = subprocess.run(
+        [sys.executable, str(_CANONICAL_PATH), "ids", "--log", str(log)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    assert proc.stdout.strip().splitlines() == ["bash-shard::scripts/a.test.sh"]
