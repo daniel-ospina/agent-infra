@@ -334,6 +334,94 @@ uv_env_distinct_bytes() { # <dir>...
     "$(uv_env_mb "$sum_kb")" "$(uv_env_mb "$all")" "$(uv_env_mb "$shared_kb")" "$sum_kb" "$all" "$shared_kb"
 }
 
+# ── THE ONE BIT THE ADMISSION GATE NEEDS (agent-infra#2159, extending #2850/#2721) ──────────────
+# `spawn-gate.sh` admits a python lane on `max(tree, self) + reserve`, where `self` is the FULL-
+# materialise worst case (6144MB) for a box whose venv cannot be linked into the cache. That number is
+# RIGHT for such a box and it is ~19x the measured marginal cost of the same lane (316MB) on a box
+# that shares — so on a 121GB cell with 16GB free it admits ONE python lane where the measurement
+# admits tens. The gate cannot measure this itself: `uv_env_report` walks the cache, and a spawn would
+# pay for that walk on every lane.
+#
+# So the question is reduced to ONE BIT, answered from a RECORD refreshed at most once per day:
+#   SHARED — this box links worktree venvs into its cache, so a lane costs `tree`, not `self`.
+#   FULL   — anything else. Sharing is not guaranteed, so admit on the worst case.
+# ⛔ FAIL-CLOSED IS THE ENTIRE SAFETY ARGUMENT. Every absent, unreadable, stale, malformed or
+# unrecognised state returns FULL, which is exactly today's admission. A box becomes cheaper to admit
+# onto ONLY by producing positive evidence (link_mode=hardlink AND a cache measured at or above the
+# cold floor). Loosening admission is a capacity change; it may never happen by accident, a typo, or a
+# missing file — that is the inert-gate class, and here the inert direction *adds* lanes.
+# Record: one tab-separated line, `token<TAB>epoch<TAB>link_mode<TAB>cache_mb<TAB>cache_dir`, so a
+# reader that finds the admission loosened can SEE what it rested on instead of trusting a word.
+UV_ENV_SHARING_RECORD="${UV_ENV_SHARING_RECORD:-uv-env-sharing}"
+UV_ENV_SHARING_MAX_AGE_S="${UV_ENV_SHARING_MAX_AGE_S:-86400}"
+
+uv_env_sharing_record_path() { printf '%s/%s\n' "${1:-}" "$UV_ENV_SHARING_RECORD"; }
+
+# The token, from raw evidence. Total for any input; every unknown is FULL.
+uv_env_sharing_token_from() { # <link_mode> <measure-kind> <cache-mb>
+  local mode="${1:-}" kind="${2:-}" mb="${3:-0}" cold
+  [ "$mode" = "hardlink" ] || { printf 'FULL\n'; return 0; }
+  [ "$kind" = "measured" ] || { printf 'FULL\n'; return 0; }
+  case "$mb" in ''|*[!0-9]*) printf 'FULL\n'; return 0 ;; esac
+  cold="$(uv_env_cold_floor)"
+  [ "$mb" -ge "$cold" ] || { printf 'FULL\n'; return 0; }
+  printf 'SHARED\n'
+}
+
+# Refresh the record from a live measurement. The ONLY place the cache is walked for this bit.
+uv_env_sharing_record_write() { # <state-dir>
+  local dir="${1:-}" mode state kind kb mb token
+  [ -n "$dir" ] || return 1
+  mode="$(uv_env_link_mode)"
+  state="$(uv_env_measure_dir "$(uv_env_cache_dir)")"
+  kind="${state%% *}"; kb="${state#* }"
+  case "$kind" in measured) mb="$(uv_env_mb "$kb")" ;; *) mb=0 ;; esac
+  token="$(uv_env_sharing_token_from "$mode" "$kind" "$mb")"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$token" "$(date +%s)" "$mode" \
+    "$(case "$kind" in measured) printf '%s' "$mb" ;; *) printf '%s' "$kind" ;; esac)" \
+    "$(uv_env_cache_dir)" > "$(uv_env_sharing_record_path "$dir")" 2>/dev/null || return 1
+  return 0
+}
+
+# THE READER. Prints SHARED or FULL, always, and never fails.
+# A stale record is REFRESHED here (once per UV_ENV_SHARING_MAX_AGE_S) rather than merely distrusted:
+# a record that is only ever written by a bring-up goes stale on a box that never gets re-provisioned,
+# and then the gate silently returns to the pessimistic constant for ever — an admitted lane's cost
+# would depend on how long ago the box was built. One bounded `du` per day is the cheaper contract.
+# ⛔ A REFRESH THAT CANNOT MEASURE WRITES NOTHING and returns FULL: an unreadable cache must not be
+# allowed to overwrite a good SHARED record with a pessimistic one either, because that would make a
+# transient mount hiccup permanently halve a cell's capacity until the next bring-up.
+uv_env_sharing_token() { # <state-dir>
+  local dir="${1:-}" f tok ts now max age
+  if [ -z "$dir" ]; then printf 'FULL\n'; return 0; fi
+  f="$(uv_env_sharing_record_path "$dir")"
+  max="$UV_ENV_SHARING_MAX_AGE_S"
+  case "$max" in ''|*[!0-9]*) max=86400 ;; esac
+  now="$(date +%s)"
+  if [ -r "$f" ]; then
+    tok="$(cut -f1 "$f" 2>/dev/null)"
+    ts="$(cut -f2 "$f" 2>/dev/null)"
+    case "$ts" in
+      ''|*[!0-9]*) : ;;
+      *) age=$(( now - ts ))
+         # A record dated in the FUTURE is not fresh, it is wrong (the one-sided age test this repo
+         # has already been bitten by): treat it as stale so it is re-measured rather than trusted.
+         if [ "$age" -ge 0 ] && [ "$age" -le "$max" ]; then
+           case "$tok" in SHARED) printf 'SHARED\n' ;; *) printf 'FULL\n' ;; esac
+           return 0
+         fi ;;
+    esac
+  fi
+  # Missing or stale: try to refresh. A failure leaves the old record (if any) untouched.
+  if uv_env_sharing_record_write "$dir"; then
+    tok="$(cut -f1 "$f" 2>/dev/null)"
+    case "$tok" in SHARED) printf 'SHARED\n'; return 0 ;; esac
+  fi
+  printf 'FULL\n'
+  return 0
+}
+
 uv_env_usage() {
   sed -n '3,6p' "$0" >/dev/null 2>&1 || true
   cat <<'USAGE'
@@ -355,6 +443,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     report)     shift; uv_env_report "$@" ;;
     distinct)   shift; [ $# -gt 0 ] || { echo "distinct needs at least one directory" >&2; exit 2; }; uv_env_distinct_bytes "$@" ;;
     cache-dir)  uv_env_cache_dir ;;
+    sharing-token) shift; uv_env_sharing_token "${1:-}" ;;
     ''|-h|--help|help) uv_env_usage ;;
     *) echo "$UV_ENV_NAME: unknown argument: $1 (try --help)" >&2; exit 2 ;;
   esac
