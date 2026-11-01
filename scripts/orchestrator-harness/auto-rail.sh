@@ -200,9 +200,26 @@ rails_should_defer() {  # $1 = this repo (owner/name), $2.. = every repo driven
 # alongside the repo being asked about. Drop that argument — or put the old global `total >= MAX`
 # back at the call site — and every other repo's rails read as unknown load: the fix is fully undone
 # while the predicate itself is untouched, and a suite that drives the predicate alone cannot see it.
-# So the call site is a function the suite DRIVES, not a string it greps.
+# So the call site's shape is a function the suite DRIVES — and the loop's own invocation of it is
+# pinned SEPARATELY, by a declared text assertion in the suite, because the loop cannot be executed
+# without stub-driving the whole supervisor. Neither pin alone is enough: driving this wrapper cannot
+# see `"$repo"` losing its `$REPOS` at the loop, and a grep at the loop cannot see this wrapper
+# mangling its arguments. The suite states which is which (see its "call site" section).
 candidate_deferred() {  # $1 = this repo, $2.. = every repo driven  (rc 0 = defer this candidate)
   rails_should_defer "$@"
+}
+# ── THE DUPLICATE-RAIL GUARD, as a function ────────────────────────────────────────────────────
+# rc 0 = a rail for THIS PR is live (skip it), 1 = no rail for it, 2 = CANNOT TELL — and 2 is not 1.
+# The guard used to read `ps … | grep -c`, which has no `pipefail` here: a failing `ps` left `grep -c`
+# reading EOF, printing `0`, so "I cannot see the process table" became "no rail is running" and the
+# actuator launched a SECOND rail for a PR that already had one — burning the shared REST budget,
+# doubling the merge attempt, and inflating this repo's own count so other candidates of the repo this
+# change exists to unstarve get deferred. A FUNCTION so the suite drives all three answers.
+rail_already_running() {  # $1 = PR number
+  local tbl live
+  tbl=$(ps -eo args= 2>/dev/null) || { say "COUNTER-FAILED: ps rc=$? — cannot rule out an existing rail for #$1 (fail-closed)"; return 2; }
+  live=$(printf '%s\n' "$tbl" | grep -c "[a]dmin-merge.sh $1 ")
+  [ "$live" -gt 0 ]
 }
 # Keep the TCC-free rail clone current BEFORE using it. A failed refresh is LOUD but not fatal: the
 # previous HEAD then runs, which is strictly better than not merging, and the log says which happened.
@@ -290,8 +307,15 @@ PY
     while read -r pr; do
       [ -z "${pr:-}" ] && continue
       case "$DENY" in *" $pr "*) say "$repo #$pr DENIED — duplicate-pair member or contradictory PR pending a decision"; continue;; esac
-      live=$(ps -eo args= | grep -c "[a]dmin-merge.sh $pr ")
-      if [ "$live" -gt 0 ]; then say "$repo #$pr skipped (rail already running)"; continue; fi
+      # ⛔ THE SAME FAIL-OPEN THIS FILE FORBIDS AT THE COUNTER, one line below it. No `pipefail` here,
+      # so a `ps` that cannot run left `grep -c` reading EOF and printing `0`: "I cannot see the process
+      # table" became "no rail is running for #pr", and the actuator would launch a SECOND rail for a PR
+      # that already has one — burning the shared REST budget, doubling the merge attempt, and inflating
+      # this repo's own count so other candidates of the repo this change exists to unstarve are deferred.
+      # Unreadable is not zero: skip the candidate loudly (a pass that cannot rule a rail out must not add one).
+      rail_already_running "$pr"; _rail_rc=$?
+      if [ "$_rail_rc" -eq 0 ]; then say "$repo #$pr skipped (rail already running)"; continue; fi
+      if [ "$_rail_rc" -ne 1 ]; then say "$repo #$pr skipped — cannot rule out an existing rail (fail-closed)"; continue; fi
       # ⛔ THIS REPO'S BUDGET, NOT THE BOX'S. `rails_should_defer` adds the unattributable population to
       # this repo's own count (fail-closed) and keeps the aggregate as a second, independent clause:
       # another repo's rails can only decide this repo's candidates once the AGGREGATE is reached.
