@@ -93,44 +93,38 @@
 # region and moved the job from :896 to :945, which left an earlier version of this very
 # block citing an unrelated `http-pool-hygiene` step — the declaration then looked
 # unsubstantiated, i.e. the false absence came back through the citation instead of the
-# logic. A later merge onto main moved it AGAIN, :945 -> :970, and the rebase of this
-# branch re-created the same rot: the numbers below were re-located by their quotes and
-# corrected — which is the rule working, not an exception to it). A THIRD move re-created
-# it once more: merging main into this branch pushed the job :970 -> :993 and
-# `script-validate` ci-main.yml:376 -> :386, and every coordinate below was re-located by
-# its quote again, in the same commit that moved it — because a citation that rots in the
-# very commit that moves the lines reads to the next lane as proof the claim is false.
-# Re-locate by the quote, and fix the number when you move it. A FOURTH move (the merge that
-# resolved this branch's conflicts) pushed every ci.yml coordinate again — +64 for the four job
-# coordinates and +11 for the :395 citation — and each was re-located by its quote in that same
-# commit; ci-main.yml's coordinates did not move.
-#   * ci.yml:1057 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
-#     `shard: [1, 2, …]` at :1147, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
-#     one check per slice, and each slice's step is `bash scripts/run-bash-shards.sh`
-#     (ci.yml:1185, `run: bash scripts/run-bash-shards.sh`);
-#   * ci-main.yml:388 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
-#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:476 is that
-#     call: `bash scripts/run-bash-shards.sh`; main publishes ONE check named
-#     `script-validate` (ci-main.yml:386);
-#   * ci.yml:1159 — "ci-main.yml's `script-validate`: one runtime for the list, in
-#     both lanes" (also ci.yml:406, "today — ci-main.yml's script-validate job runs bash
-#     shards only"). ⛔ NOT ci.yml:1060: that line is the HISTORY of the pre-#1369 split
-#     ("while main's `script-validate` ran the bash sweeps + the hermetic suites") and
-#     describes a body WIDER than the list, so citing it here would argue AGAINST the
-#     containment this pair rests on (review cycle 3).
+# logic. That preamble is the rule working, not an exception to it: a citation that rots in the
+# very commit that moves the lines reads to the next lane as proof the claim is false, so every
+# reference below is a QUOTE first and a line number never. Re-locate by the quote.
+#   * ci.yml — the PR lane's job is `bash-suites`, matrix `shard: [1, 2, …]`, so it PUBLISHES
+#     `bash-suites (1)` … `bash-suites (N)`, one check per slice, and each slice's step is
+#     `run: bash scripts/run-bash-shards.sh`;
+#   * ci-main.yml — "the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job
+#     calls the one runner below, UNSHARDED", and that call is the step
+#     `bash scripts/run-bash-shards.sh`; main publishes ONE check named `script-validate`;
+#   * ci.yml — "ci-main.yml's `script-validate`: one runtime for the list, in both lanes",
+#     and "today — ci-main.yml's script-validate job runs bash shards only". ⛔ NOT the block
+#     that is the HISTORY of the pre-#1369 split ("while main's `script-validate` ran the bash
+#     sweeps + the hermetic suites"): it describes a body WIDER than the list, so citing it
+#     here would argue AGAINST the containment this pair rests on (review cycle 3).
 #   So main's ONE check RUNS the same list the PR slices, one shard at a time: the
 #   base reports this program under the other lane's name.
 #
 # ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
-# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:444
-# `node --check`, :456 the lane-parity guard, :462 its mutation self-test, :476 the shard
-# list) and the other two are `actions/checkout` (:429) and `actions/setup-node` (:434) —
-# while a `bash-suites (<n>)` slice runs only the shard list. So a red under that name may
-# be the shard list's red — or ANY other step's, including the setup ones. The equivalence
-# therefore establishes that the base RUNS this program and carries A red under its name;
-# it can never establish that the base's red is this suite's. That is why the answer is
-# phrased as a candidate (`base-caused via`) and why the paragraph under it says so out
-# loud.
+# `script-validate` job has SEVEN steps: four validation steps (the `node --check` syntax
+# pass, the lane-parity guard, that guard's mutation self-test, and the shard list), the two
+# setup steps (`actions/checkout`, `actions/setup-node`), and the `Materialize origin/main`
+# fetch step added by #3131/#3139 — while a `bash-suites (<n>)` slice runs only the shard
+# list. So a red under that name may be the shard list's red — or ANY other step's,
+# including setup or the fetch. The equivalence therefore establishes that the base RUNS
+# this program and carries A red under its name; it can never establish that the base's red
+# is this suite's. That is why the answer is phrased as a candidate (`base-caused via`) and
+# why the paragraph under it says so out loud.
+#
+# The steps above are NAMED, not line-cited, on purpose: these coordinates had already
+# drifted ~17 lines on main before this PR added its step, and a citation that rots is worse
+# than no citation — the containment argument rests on the step LIST, not on where each one
+# sits. Re-locate by quoting a step's `name:`/`run:` to check this.
 #
 # WHAT IT DOES NOT BUY, stated here so it cannot be read as more than it is:
 #   * it is a NAME-level statement about two LANES, not an identity-level statement
@@ -1394,7 +1388,8 @@ fetch_run_failed_job_names() {
 # ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
 # `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
 # programs that PR job runs — the lane-parity guard and its mutation self-test — are
-# STEPS inside `script-validate` (ci-main.yml:456, :462). So a `bash-suites-gate` red
+# STEPS inside `script-validate` (named, not line-cited: see the note there). So a
+# `bash-suites-gate` red
 # ALSO has a base counterpart under that name, and this ONE pair does not map it: that
 # refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
 # scoping decision recorded on #2610), NOT a claim that the programs differ. Mapping
@@ -1521,7 +1516,13 @@ named_unattributable_runs() {
   else
     say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
   fi
-  say_err "   log yielded no failure identity, so it entered NEITHER side of the comparison:"
+  # ⛔ TWO REASONS, ONE LIST (agent-infra#3174). Since #3174 a run whose shard runner was KILLED
+  # mid-list is named here too: its ids exist but were REFUSED (the set is a truncated sample), so
+  # the list is no longer exclusively "yielded no identity". Naming only the old reason would send
+  # the operator to hunt a parser bug for a window whose remedy is a wider read.
+  say_err "   log yielded no failure identity, OR its shard recap was INCOMPLETE (the shard step was"
+  say_err "   killed mid-list, #3174 — those ids exist and were refused as a truncated SAMPLE) — so it"
+  say_err "   entered NEITHER side of the comparison:"
   while IFS= read -r line; do
     [ -n "${line//[[:space:]]/}" ] || continue
     runref="${line##*$'\t'}"
@@ -1595,11 +1596,11 @@ named_unattributable_runs() {
               say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
               say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
               say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
-              say_err "       (.github/workflows/ci-main.yml:476), and '${name}' is one shard of that same"
-              say_err "       list on a PR (.github/workflows/ci.yml:1057/1185), one runtime in both lanes"
-              say_err "       (ci.yml:1159). The base therefore carries a red under a name that RUNS this"
-              say_err "       list — but that job has FIVE other steps (node --check :444, the lane-parity"
-              say_err "       guard :456, its self-test :462, plus checkout :429 and setup-node :434), so the"
+              say_err "       (.github/workflows/ci-main.yml, step 'Bash shards'), and '${name}' is one"
+              say_err "       shard of that same list on a PR (.github/workflows/ci.yml, one runtime in both"
+              say_err "       lanes). The base therefore carries a red under a name that RUNS this list — but"
+              say_err "       that job has SIX other steps (checkout, setup-node, node --check, the lane-parity"
+              say_err "       guard, its self-test, and the origin/main materialization that #3131 added), so the"
               say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
               say_err "       an established identity: no identity was produced, so nothing here is"
               say_err "       comparable yet"
@@ -8023,6 +8024,21 @@ main() {
         say_err "   yielded NO failure identity (its log could not be fetched, or the id parser"
         say_err "   could not read it — a missing/updated parser, or a moved log format)."
         say_err "   Re-running fixes the first; the second needs the parser updated." ;;
+      truncated:*)
+        # ── #3174: A THIRD STATE, AND ITS OWN REMEDY ───────────────────────────────
+        # The window WAS listed and read; its failing runs were KILLED MID-LIST, so the shard
+        # runner's recap is INCOMPLETE and the failure set it names is a SAMPLE. This is
+        # neither "main is green" nor "the listing could not be read", which is why it has
+        # its own arm: the remedy is a WIDER/OLDER window (or waiting for a completed run),
+        # NOT a re-run of the parser — the parser read the capture fine and refused it on
+        # purpose (scripts/ci-failure-set.sh `collect_union_truncated`).
+        say_err "   This is an UNPROVEN baseline, not an empty one and not a failed read: the window"
+        say_err "   WAS listed (main: completed=${main_completed_bad:-0} run(s), of which"
+        say_err "   tested=${main_tested_bad:-0}) but run ${main_unreadable#truncated:} was killed before"
+        say_err "   its shard list finished, so the failures it names are a TRUNCATED SAMPLE."
+        say_err "   Folding a partial set into the reference would report a real main failure as new."
+        say_err "   Remedy: re-read a window that contains a run whose shard step FINISHED (raise"
+        say_err "   --main-runs) — do NOT re-run the parser, which produced this verdict deliberately." ;;
       *)
         say_err "   This is an UNREADABLE window, not an empty baseline: main's run LISTING"
         say_err "   could not be read (or the capture refused before publishing any counters),"
@@ -8058,6 +8074,13 @@ main() {
         say_err "   A FAILED READ over a window that WAS listed: main's rate table measured"
         say_err "   $(report_value "$TMP/main-report.txt" tested) tested run(s), and run ${main_sig_unreadable#parse:}"
         say_err "   yielded no failure identity for the signature pass (fetch or parser)." ;;
+      truncated:*)
+        # #3174: same third state as the rate pass above — the signature table cannot be built
+        # from a run whose recap is truncated (scripts/ci_exemption.py refuses both doors).
+        say_err "   UNPROVEN, not unreadable: the window WAS listed and its failing run"
+        say_err "   ${main_sig_unreadable#truncated:} was KILLED before its shard list finished, so its"
+        say_err "   shard recap is incomplete and no signature table can be signed from it (#3174)."
+        say_err "   Remedy: re-read a window containing a run whose shard step FINISHED (raise --main-runs)." ;;
       *)
         say_err "   No signature pass ran over a read window: main's run LISTING could not be"
         say_err "   read (or the capture refused before it), so nothing was measured here." ;;

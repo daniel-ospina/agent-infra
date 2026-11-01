@@ -319,6 +319,40 @@ ruling that there is no lane ceiling tied to cpu count.
   the measured `/tmp/actions-runner`, `RUNNER_TEMPLATE` holds one pristine unpacked release, and each
   `add` **copies** it — a shared install with per-name dirs would register runners whose `.runner`
   never appears where the tool looks.
+- **Every instance gets its OWN private temp root, and the listener is started with it**
+  (agent-infra#7815). `$instance/_tmp` (mode 0700, created by the user that execs `run.sh`) is exported
+  as `TMPDIR`/`TMP`/`TEMP` **before** `exec`, so a job's `mktemp`, `tempfile.gettempdir()` and every other
+  temp consumer land inside that instance — not in the machine-wide `/tmp` shared with every other runner
+  install on the box, every peer lane, and anything else running there. That sharing is not cosmetic: a CI
+  shard died in `tests/_tmpdir_hygiene.py` with `SharedTmpdirScanError: os.scandir('/tmp')`, because that
+  suite's hygiene guard scans the HOST temp dir and refuses entries it does not own (one unrelated fixture
+  had written 337 GB into `/private/tmp`, agent-infra#3003) — on a shared temp dir the guard is unpassable
+  for reasons no PR controls. ⛔ **`RUNNER_TEMP` (`_work/_temp`) is NOT touched**: the runner owns it and
+  empties it per job, and it does not exist before the first job — where an ABSENT `$TMPDIR` makes
+  `tempfile.gettempdir()` fall back to the SHARED temp dir with no error (measured), i.e. the isolation
+  would vanish silently. `_tmp` is therefore STABLE, and is therefore **swept**: every START removes entries
+  older than `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h). A LIVE-repair pass (`restart`, `reconcile`)
+  creates and verifies the root and sweeps **NOTHING** — mtime age is not a holder witness, so it says so
+  (`tmpdir-sweep skipped … reason=live-listener`) instead of risking a long-running job's scratch. ⛔ The
+  safety of that sweep is **conditional, and the condition is the START path**: a start can follow a
+  listener that DIED MID-JOB, so the sweep can meet scratch whose job is not over — and GitHub allows a
+  **self-hosted job up to 5 days** (`/en/actions/reference/limits`), so a bound below your longest job
+  deletes a dead listener's still-running job's scratch. The tool therefore **refuses any value under
+  360 min** (the GitHub-hosted 6 h job ceiling) with
+  `cannot-measure why=tmp-max-age-too-small`, refusing nothing at or above it; on a long-job box you RAISE
+  the bound above your longest job, and `0`/`1` cannot reach `find -mmin`. A `.env` that names a TMPDIR
+  still wins — it is sourced after the export. `status` reports a missing root as `defect tmpdir-missing`
+  (rc 3) and the printed `restart` recreates it.
+  ⛔ A listener that is ALREADY RUNNING keeps the env it was exec'd with, and **a bare unit restart does
+  not confer the private root**: the export lives only in `start_listener`, so a unit restart carries
+  only what the unit's own environment (or an `export TMPDIR=…` line in `.env`) provides — and a BARE
+  `TMPDIR=…` line in `.env` reaches the listener *only* because `start_listener` exported it first, so a
+  unit restart drops it entirely (measured: sourcing a bare assignment sets it in the sourcing shell,
+  not in the child). For an instance with no `.env` the unit restart hands the listener no TMPDIR at
+  all — jobs silently fall back to the box's shared temp dir while `status` grades the layout and reads
+  clean. The remedies that work: start the listener through this tool (stop it, then `restart --name <n>`
+  on the now-dead listener — `add` is **not** one: an already-registered name is refused `rc 4 use
+  restart`), or give the unit `Environment=TMPDIR=$instance/_tmp` (plus `TMP`/`TEMP`).
 - **The pool is every LIVE runner ON THE BOX, not every directory under one root.** `RUNNER_ROOT` must be
 the directory that **CONTAINS** the instance dirs (one level above them) — its default
 `/tmp/actions-runner` is where this tool puts what it creates, and on a hand-provisioned box the
@@ -412,8 +446,9 @@ registration for that name under `RUNNER_ROOT`, or something that is not a usabl
 the state and the action that clears it: "clear it, or pick another name" — and, for the "no
 registration" arm, that the reading is the **process table**, so an instance dir outside `RUNNER_ROOT`
 whose listener is DEAD is invisible there) · 3 `status`: the
-report contains a DEAD listener, an ORPHANED registration, or a `defect tmpdir-missing` row · 4 name
-not available (that name is taken; try another) · 5 this
+report contains a DEAD listener, an ORPHANED registration, or a `defect tmpdir-missing` row (the
+effective temp root — the `.env`-named path, else `$instance/_tmp` — does not exist, so a runner started
+from now on inherits a TMPDIR nobody created) · 4 name not available (that name is taken; try another) · 5 this
 name could not be REGISTERED (config.sh failed, or left no `.runner` — a PER-NAME failure, so the pass
 tries the next name instead of ending: `/tmp` is where `RUNNER_ROOT` lives, so a reboot erases every
 local `.runner` while GitHub keeps every registration, and the first name minted after a reboot is
@@ -435,7 +470,12 @@ empty pool.
 Tests:
 `scripts/ci_runner_pool.test.sh` (in both bash lanes), whose install stubs model GitHub's own cwd
 contract and listener argv, and which includes a mutant with the floor comparison defused that must
-stop refusing.
+stop refusing — plus the per-instance private temp root (#7815): two instances get two DIFFERENT 0700
+roots inside their own dirs (asserted from inside the listener, so the export and not the directory's
+existence is what is pinned), a re-installed instance gets its root back through `add` with no hand
+action, the age bound sweeps a stale entry and keeps a fresh one (and the operand decides the
+threshold), a missing root is a `defect tmpdir-missing` whose printed remedy restores it, and a mutant
+with the export removed must leave the listener running under whatever temp dir the box gave it.
 
 
 ## 9. The required-check reservation — so the ONE required status never queues behind advisory work

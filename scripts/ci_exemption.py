@@ -1817,6 +1817,45 @@ _BASH_SHARD_ANNOTATION_RE = re.compile(
     r"^(?i:bash shard failed):\s*(?P<label>\S.*?)\s*$"
 )
 
+#: ⛔ THE RUNNER'S **PARTIAL** RECAP — ``⚠️ RECAP INCOMPLETE (k/n shards ran)`` — is NOT a failure
+#: set, and this module must say so (agent-infra#3174).
+#:
+#: THE DEFECT. Until #3174 a KILLED shard step printed no recap at all, so a job that was terminated
+#: mid-list published a failure set that silently SHRANK as the job got slower — measured over three
+#: consecutive main runs: 13, then 11 (run `41217287437`, killed at 111 min), then 10 failing shards
+#: named, with nothing fixed in between. Every batch verdict in this fleet is
+#: ``batch_failures − main_failures``, so a shard genuinely red on main DROPS OUT of the reference
+#: set, reappears as "a new failure caused by the batch", and gets a constituent dropped or
+#: reverted on a false signal. Read as an improvement, it also HIDES the failures that were real.
+#:
+#: THE RUNNER NOW PRINTS THE PARTIAL RECAP (a TERM/INT trap) and prefixes it with this marker, so an
+#: interrupted run still NAMES what it saw while stating — in the same line — that it is incomplete.
+#: A partial recap that LOOKS FULL is worse than no recap, so the marker is load-bearing: this
+#: pattern is what turns "a shorter list" into "UNPROVEN", and the two readers below refuse rather
+#: than hand a truncated set to `decide()`.
+#:
+#: ⛔ WHY A REFUSAL AND NOT A FILTER. Dropping the missing shards is not available — they are missing,
+#: not absent-from-the-run — and keeping the ones that DID fail is exactly the "a partial set looks
+#: like a set" fold this exists to stop: the truncated capture would then be subtracted as if it
+#: were the whole baseline. So the capture yields NO ids at all and the caller fails closed, naming
+#: this cause (exit code :data:`_EXIT_TRUNCATED_CAPTURE`, the shell's `truncated:` state).
+#:
+#: The emoji is optional in the pattern because a capture's rendering is not the runner's: the
+#: variation selector (`\ufe0f`) can be dropped by whatever re-renders the log — a paste, a
+#: re-encoding, a terminal capture — and a capture that lost the glyph must still be recognised, since
+#: an unrecognised marker is a silent return to the #3174 failure mode. (⛔ NOT by this module's own
+#: ANSI stripping: `_ANSI_RE` removes ANSI CSI sequences — the final byte class `[A-Za-z]` covers
+#: `ESC[2K`/`ESC[1A` as well as SGR — and CANNOT consume U+FE0F, which is not `ESC` and not in that
+#: class. The tolerance is for renderings that happen OUTSIDE this parser, and being glyph-independent
+#: costs nothing.)
+_BASH_SHARD_INCOMPLETE_RE = re.compile(r"^[\u26a0\ufe0f\s]*(?i:RECAP INCOMPLETE)\b")
+
+#: The exit code meaning "this capture was READ and it says its own recap is INCOMPLETE". Distinct
+#: from 1 ("the input could not be read") on purpose: `scripts/ci-failure-set.sh` maps it onto the
+#: `truncated:` state, because the operator's remedy is not "fix the parser" — it is "this RUN is
+#: unproven, do not build a baseline from it" (#3174).
+_EXIT_TRUNCATED_CAPTURE = 4
+
 #: ⛔ THIS PASS MAY ONLY EVER ADD AN IDENTITY — never drop one (#2700 review, cycle 3, P1).
 #: A filter over the SHARED label list was tried and reverted: `$`, a backtick and `<`/`>` ARE
 #: legal in POSIX filenames, so dropping them also dropped the per-shard arm's REAL identity
@@ -1928,6 +1967,25 @@ def bash_shard_annotation_key(message: str) -> str | None:
     if not token:
         return None
     return f"{_BASH_SHARD_KEY_PREFIX}{token}"
+
+
+def bash_shard_recap_incomplete(text: str) -> str | None:
+    """The runner's INCOMPLETE-RECAP marker line, or ``None`` when the capture recapped fully.
+
+    ONE reader for the marker (``_BASH_SHARD_INCOMPLETE_RE``), so both CLI doors — and any future
+    consumer — agree about whether a capture's failure set is a SET or a TRUNCATED sample
+    (agent-infra#3174).
+
+    Returns the marker LINE rather than a bool: the refusal has to quote what it saw, and a
+    truncation message that names neither the shard counts nor the signal is a claim the operator
+    cannot check. ``None`` means "no marker", which is the only state that may be folded into a set
+    difference — never "the marker was not found, therefore the run was fine": a killed run that
+    printed nothing at all is #3174's original shape, and it is not this function's to certify.
+    """
+    for line in _log_lines(text):
+        if _BASH_SHARD_INCOMPLETE_RE.match(line):
+            return line
+    return None
 
 
 def bash_shard_failures(
@@ -2695,8 +2753,38 @@ def _cmd_ids(args: argparse.Namespace) -> int:
     answer (the caller's `examined > extracted` gate owns "a failing run that
     yielded nothing"). A non-zero exit therefore means exactly one thing: the
     input could not be read. Reading that as "no failures" is the vacuous pass.
+
+    ⛔ ONE EXCEPTION, AND IT IS NOT AN EMPTY SET (agent-infra#3174): a capture whose shard recap is
+    INCOMPLETE (`⚠️ RECAP INCOMPLETE (k/n shards ran)` — `run-bash-shards.sh` was killed mid-list)
+    is READ but does not hold a failure SET, so it exits `_EXIT_TRUNCATED_CAPTURE` (4) and prints
+    NO ids. Emitting the truncated list would be the fold this fix exists to stop: the caller would
+    subtract a partial set as though it were the baseline, which is exactly how a shard red on main
+    drops out of the reference set and comes back as "a new failure caused by the batch". The
+    caller's own `truncated:` state names the remedy (this RUN is unproven — do not re-run the
+    parser); see `scripts/ci-failure-set.sh`.
     """
-    parsed = parse_failed_ids(_read(args.log), raw_log=True)
+    text = _read(args.log)
+    truncated = bash_shard_recap_incomplete(text)
+    parsed = parse_failed_ids(text, raw_log=True)
+    if truncated is not None:
+        # ⛔ NOTHING ON STDOUT. A consumer that ignores the exit code must not be handed a set that
+        # looks whole — the ids that WERE named go to stderr, as evidence, not as an answer.
+        print(
+            "ci-exemption: ⚠️ UNPROVEN: this capture's shard recap is INCOMPLETE — "
+            "scripts/run-bash-shards.sh was TERMINATED before the list finished, so the failure "
+            "set it names is a TRUNCATED SAMPLE, not a set. Refusing to emit ids for it: a set "
+            "difference computed from a partial recap reports real failures as new and hides the "
+            "ones the killed run never reached (agent-infra#3174). The marker it printed was: "
+            f"{truncated}",
+            file=sys.stderr,
+        )
+        for nodeid in parsed.ids:
+            print(
+                "ci-exemption: (TRUNCATED capture — named, NOT in the failure set) "
+                f"{nodeid}",
+                file=sys.stderr,
+            )
+        return _EXIT_TRUNCATED_CAPTURE
     for nodeid in parsed.ids:
         print(nodeid)
     for token in parsed.rejected:
@@ -2765,7 +2853,21 @@ def _cmd_ids(args: argparse.Namespace) -> int:
 
 
 def _cmd_signatures(args: argparse.Namespace) -> int:
-    parsed = parse_pr_failure_text(_read(args.log))
+    text = _read(args.log)
+    # ⛔ THE SAME REFUSAL AS THE `ids` DOOR (agent-infra#3174). A truncated capture has no stable
+    # signature TABLE either — a signature read off the shards that happened to run would certify a
+    # set the run never finished. Both doors are refused so neither can be used to bypass the other.
+    truncated = bash_shard_recap_incomplete(text)
+    if truncated is not None:
+        print(
+            "ci-exemption: ⚠️ UNPROVEN: this capture's shard recap is INCOMPLETE "
+            "(scripts/run-bash-shards.sh was TERMINATED before the list finished) — refusing to "
+            "publish a signature table for a TRUNCATED failure set (agent-infra#3174). The "
+            f"marker it printed was: {truncated}",
+            file=sys.stderr,
+        )
+        return _EXIT_TRUNCATED_CAPTURE
+    parsed = parse_pr_failure_text(text)
     sys.stdout.write(render_signature_table(parsed.signatures))
     for line in parsed.rejected:
         print(f"ci-exemption: rejected FAILED line: {line}", file=sys.stderr)
