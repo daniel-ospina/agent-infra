@@ -2777,6 +2777,7 @@ resolve_merge_ref() {
   step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
   if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
   while :; do
+  rail_guard_poll
     # ONE call: mergeability and the merge ref sha together. `--jq` is real gh's
     # projection; the harness stub answers with the already-projected line.
     line="$($GH api "$slug/pulls/$pr" --jq '"\(.mergeable)" + "\t" + (.merge_commit_sha // "")' 2>/dev/null || true)"
@@ -4542,6 +4543,7 @@ wait_for_first_checks() {
   case "$rederive_left" in ''|*[!0-9]*) rederive_left=1 ;; esac
   last_clock="$SECONDS"
   while :; do
+  rail_guard_poll
     # shellcheck disable=SC2086
     out="$($GH run list --commit "$head" --limit 100 ${args[@]+"${args[@]}"} \
         --json databaseId,status,conclusion,createdAt --jq "$FIRST_CHECKS_JQ" 2>/dev/null)"; rc=$?
@@ -5140,6 +5142,7 @@ settle_self_edit_generation() {
   local waited=0 step saw=0 status conclusion id key gk self_n foreign_n missing
   local seen_keys=" "
   while :; do
+  rail_guard_poll
     self_n=0; foreign_n=0
     # shellcheck disable=SC2086
     while IFS=$'\t' read -r status conclusion id key; do
@@ -6118,6 +6121,7 @@ wait_for_run() {
   # to 0 — a 0-step loop can never reach its own bound and spins forever.
   step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
   while [ "$waited" -lt "$RERUN_TIMEOUT" ]; do
+  rail_guard_poll
     # ONE gh call: the run's completion state and its run attempt. `updatedAt` is
     # deliberately NOT read — it advances on JOB/STEP TRANSITIONS, so it is frozen
     # for the entire duration of a single long step, and treating its freeze as
@@ -7343,6 +7347,194 @@ resolve_rail_repo() {
   return 0
 }
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE RAIL'S OWN DEADLINE, ITS PER-PR LEASE, AND ITS TERMINAL-STATE EXIT (#3194)
+#
+# WHY THIS EXISTS — MEASURED, not theorised (2026-11-01, this mac). Eight rails were
+# alive; #10483's had run 6h47m while its PR had MERGED 1h57m earlier. Its stdout
+# (fd 1 -> $STATE/rails/auto-daniel-ospina-tortoise-10483.out) was BYTE-FROZEN for
+# 6h42m while its only child cycled `gh run view … --json status,attempt` plus
+# `sleep 10` — i.e. it sat inside `wait_for_run`, the RE-RUN wait. Two rails ran on
+# #3055 and two on #10500 at the same time. `auto-rail.sh` counts PROCESSES
+# (`rails_live`), so every rail that never exits holds a merge slot forever; at 8 the
+# auto-rail deferred every candidate on every pass.
+#
+# The per-wait bound was NOT the defect and is NOT removed here: `wait_for_run`
+# already bounds itself and already names STALLED / UNOBSERVABLE / CEILING (#3205).
+# The defect is that a bound on EACH wait is not a bound on the ATTEMPT:
+#   (a) nothing re-read the PR's own state once a wait had begun, so a PR that merged
+#       (or was closed) mid-wait left the rail polling a finished job;
+#   (b) a rail enters several waits in sequence, and a wait whose run never becomes
+#       readable spins its SILENT branch (unreadable => `continue`, no line printed), so
+#       the process outlives every stated bound while producing no output;
+#   (c) no exclusion existed per PR at all (`grep ALREADY-RAILING` found nothing).
+#
+# CONVERGENT PRACTICE (§0 research). GitHub's merge queue bounds the WHOLE merge group
+# and, when the bound is spent, FAILS the group and REMOVES the PR from the queue
+# (a configurable status-check timeout). Mergify does the same for a batch: a
+# check-timeout splits/removes the offending PR and requeues the rest. Both bound the
+# ATTEMPT and ALWAYS emit a terminal verdict; neither waits sub-condition by
+# sub-condition indefinitely. That is the shape implemented here.
+#
+# ⛔ THIS CHANGES NO VERDICT. Nothing here widens, skips, mutes or soft-fails a gate,
+# and nothing here touches the review-attestation requirement. A rail that would have
+# MERGED still merges; one that would have been BLOCKED is still blocked. The only new
+# outcomes are "this rail is out of time" and "another rail already owns this PR" —
+# both refusals to ACT, never permissions to.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# The lease is one directory per (repo, PR). `mkdir` is the atomic primitive: two
+# concurrent rails cannot both create it, so the loser is decided by the kernel and
+# not by a check-then-act race.
+RAIL_LOCK_ROOT="${ADMIN_MERGE_LOCK_ROOT:-${HOME}/.pi/agent/state/rail-locks}"
+RAIL_LOCK_HELD=0
+RAIL_LOCK_PATH=""
+RAIL_LOCK_PR=""
+RAIL_STARTED_AT="$(date +%s)"
+RAIL_POLL_TICKS=0
+# ONE ABSOLUTE BOUND FOR THE WHOLE ATTEMPT.
+# ⛔ IT MUST EXCEED EVERY WAIT THE RAIL IS *ALLOWED* TO TAKE, or it becomes a second,
+# tighter gate that false-blocks healthy PRs (review finding 7). A rail legitimately
+# inside `wait_for_first_checks` may spend the FIRST-CHECKS CEILING (18064s by default)
+# and then still owe a RE-RUN wait (derived per shard, >= the fail-safe 3900s) and a
+# re-collection. So the attempt bound is the ceiling plus BOTH fail-safe per-wait
+# bounds, and an expired deadline can only fire on an attempt that has genuinely
+# outlived every window the rail itself declared.
+RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$((FIRST_CHECKS_CEILING + FAILSAFE_RERUN_TIMEOUT * 2))}"
+RAIL_LAST_TERMINAL_CHECK=0
+
+rail_lock_release() {
+  [ "${RAIL_LOCK_HELD:-0}" -eq 1 ] || return 0
+  [ -n "${RAIL_LOCK_PATH:-}" ] && rm -rf "$RAIL_LOCK_PATH" 2>/dev/null
+  RAIL_LOCK_HELD=0
+  return 0
+}
+
+# rail_lock_acquire <key> — <key> is `<owner>-<repo>-<pr>`, filesystem-safe.
+# A held lease whose holder is STILL ALIVE => ALREADY-RAILING and EXIT 0. A lease whose
+# holder is GONE is RECLAIMED: a stale flag that records a past state and is never
+# revalidated is the class this file treats as its own defect, so the LIVEness of the
+# holder — not the existence of the directory — is what decides. (A recycled pid could
+# make a dead holder look alive; that errs toward a duplicate NO-OP exit, never toward a
+# double merge, so it is the safe direction and is stated rather than discovered.)
+rail_lock_acquire() {
+  local key="$1" dir holder started acquired=0
+  RAIL_LOCK_PR="${key##*-}"
+  # ⛔ A PR-LESS INVOCATION TAKES NO LEASE (review finding 6). `--print-bounds` must work
+  # on a bare invocation, and a key with an empty PR half would make EVERY PR-less run in
+  # every repo collide on one lease.
+  case "$RAIL_LOCK_PR" in ''|*[!0-9]*) return 0 ;; esac
+  mkdir -p "$RAIL_LOCK_ROOT" 2>/dev/null || return 0
+  dir="$RAIL_LOCK_ROOT/$key"
+  # `mkdir` on the lease directory is the atomic primitive: two concurrent rails cannot
+  # both create it, so the loser is decided by the kernel, not by a check-then-act race.
+  mkdir "$dir" 2>/dev/null && acquired=1
+  if [ "$acquired" -eq 0 ]; then
+    holder="$(cat "$dir/pid" 2>/dev/null || true)"
+    started="$(cat "$dir/started" 2>/dev/null || true)"
+    if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null; then
+      # Holder is GONE (or unreadable): RECLAIM. A stale flag that records a past state and
+      # is never revalidated is this file's own defect class, so LIVENESS decides here, not
+      # the existence of the directory.
+      say_err "admin-merge: ↻ rail lease ${dir} was held by pid ${holder:-<unreadable>} (${started:-<unreadable>}) which is NO LONGER ALIVE — reclaiming the stale lease."
+      rm -rf "$dir" 2>/dev/null
+      mkdir "$dir" 2>/dev/null && acquired=1
+    fi
+  fi
+  # ⛔ FAIL CLOSED (review finding 5). `acquired` — NOT a second reading of the
+  # directory — decides, so a just-reclaimed lease (whose pid file does not exist yet)
+  # is not mistaken for a live holder, and a rail that LOST the reclaim race is not
+  # mistaken for its owner. Exclusion that cannot be proven is a refusal, never a
+  # silent degrade to no exclusion at all.
+  if [ "$acquired" -eq 0 ]; then
+    say_err "admin-merge: ✗ ALREADY-RAILING(${RAIL_LOCK_PR}) — the rail lease ${dir} is held by pid ${holder:-<unreadable>} (since ${started:-<unreadable>}) and this execution could not acquire it. A second execution would double-hold the merge slot (two rails on #3055 and two on #10500 were measured racing on 2026-11-01) and could double-merge. EXIT 75: a RETRYABLE refusal for the duplicate, NOT a merge and NOT a verdict about the PR."
+    # ⛔ EXIT 75, NEVER 0 (review finding 1). `merge-one.sh:694-696` treats rail exit 0 as
+    # a merge: it logs `MERGED via the rail`, writes `state/merged-<PR>.done` and clears the
+    # refusal record. Exiting 0 here would mark a PR MERGED that nothing merged, and the
+    # sweep would then never retry it.
+    exit 75
+  fi
+  printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
+  date -u +%FT%TZ > "$dir/started" 2>/dev/null || true
+  RAIL_LOCK_PATH="$dir"
+  RAIL_LOCK_HELD=1
+  # ⛔ EXIT ONLY — NEVER INT/TERM (review finding 4). A handler on TERM replaces the
+  # default action, so the shell would SURVIVE the signal and keep looping (restoring the
+  # un-killable rail this change exists to remove) while ALSO dropping the lease, letting a
+  # second rail acquire the same PR mid-merge. `main` installs its own EXIT trap later and
+  # CHAINS to rail_lock_release rather than replacing it (review finding 3); this one is the
+  # belt for an exit that happens before that.
+  trap 'rail_lock_release' EXIT
+  return 0
+}
+
+# rail_stop_if_pr_terminal — (a) EXIT AFTER SUCCESS.
+# The rail's whole purpose is to reach MERGED. Once the PR IS merged — whoever did it,
+# including a duplicate or a human — there is no work left, so continuing to poll a run
+# is pure slot-holding. The measured 6h47m life belonged to exactly that. CLOSED is
+# treated the same way: nothing can be merged into a closed PR.
+rail_stop_if_pr_terminal() {
+  [ -n "${RAIL_LOCK_PR:-}" ] || return 0
+  local state st at
+  # GH_REPO is exported by resolve_rail_repo, so a bare number resolves to THIS rail's
+  # repo — never to whatever checkout the caller happened to be standing in.
+  # shellcheck disable=SC2086
+  state="$($GH pr view "$RAIL_LOCK_PR" --json state,mergedAt \
+    --jq '( .state // "" ) + "\t" + ( .mergedAt // "" )' 2>/dev/null || true)"
+  [ -n "$state" ] || return 0
+  st="${state%%$'\t'*}"
+  at="${state#*$'\t'}"
+  case "$st" in
+    MERGED)
+      info "admin-merge: ✅ PR #$RAIL_LOCK_PR is MERGED (mergedAt=${at:-<unreadable>}) — the rail's work here is DONE; exiting 0 instead of polling a finished job."
+      rail_lock_release
+      exit 0 ;;
+    CLOSED)
+      # ⛔ NOT exit 0, and NOT a ✅ (review finding 2). A closed-unmerged PR is NOT merged;
+      # exit 0 is written into `state/merged-<PR>.done` by merge-one.sh, producing a ✅ over
+      # an unmerged PR — the #2235 shape. Exit 3 names it as its own outcome: there is
+      # nothing to merge, and nothing to retry.
+      info "admin-merge: PR #$RAIL_LOCK_PR is CLOSED and NOT MERGED — nothing can be merged into a closed PR; exiting 3 (no merge, no retry)."
+      rail_lock_release
+      exit 3 ;;
+  esac
+  return 0
+}
+
+# rail_guard_poll — (b) THE BOUNDED WAIT. Called at the head of the 5 POLL loops that wait
+# on a REMOTE RUN or on the merge artifact to appear: MERGE-REF, FIRST-CHECKS, the #1417
+# self-edit wait, the RE-RUN wait, and main's #1417 re-read pass.
+# It is NOT on the two ATTEMPT-bounded retry loops (the head read at :2193 and
+# `poll_merge_artifact`'s attempt loop): those stop after a fixed number of attempts and a
+# deadline check there would add nothing. That distinction is the accurate claim (review
+# finding 9). It decides no verdict:
+#   1. the whole-attempt deadline (REFUSED(rail-deadline:…) then EXIT);
+#   2. the terminal-state re-read, throttled to every 6th poll (~60s at the default
+#      ADMIN_MERGE_POLL_INTERVAL=10), so a merged PR is noticed within a minute without
+#      spending a gh call on every poll.
+rail_guard_poll() {
+  RAIL_POLL_TICKS=$((RAIL_POLL_TICKS + 1))
+  local now elapsed
+  now="$(date +%s)"
+  elapsed=$((now - RAIL_STARTED_AT))
+  # The terminal re-read is throttled on ELAPSED TIME, not tick count (review finding 8):
+  # a spinning silent branch polls every ~1s while a FIRST-CHECKS poll is every 60s, so a
+  # tick-based throttle is ~6s in one loop and ~6min in the other — wrong in both
+  # directions. 60s is the value the comment claims.
+  RAIL_TERMINAL_CHECK_EVERY="${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}"
+  if [ "${RAIL_DEADLINE:-0}" -gt 0 ] 2>/dev/null && [ "$elapsed" -ge "$RAIL_DEADLINE" ]; then
+    say_err "admin-merge: ✗ REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s) — the rail has spent its whole-attempt bound (ADMIN_MERGE_RAIL_DEADLINE, default FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + 2 x the fail-safe per-wait bound ${FAILSAFE_RERUN_TIMEOUT}s - i.e. every window the rail itself declares). Every individual wait in this rail DOES bound itself; the ATTEMPT is what was unbounded, and it is bounded now. This is a refusal to keep holding the merge slot, NOT a verdict about the PR: no check was made green, widened, skipped or muted, and the head-bound review evidence is untouched. Re-run the rail when the runs are readable — it re-evaluates from scratch."
+    rail_lock_release
+    exit 1
+  fi
+  if [ -n "${RAIL_LOCK_PR:-}" ] \
+     && [ $((now - RAIL_LAST_TERMINAL_CHECK)) -ge "$RAIL_TERMINAL_CHECK_EVERY" ]; then
+    RAIL_LAST_TERMINAL_CHECK=$now
+    rail_stop_if_pr_terminal
+  fi
+  return 0
+}
 main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
   local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
@@ -7590,6 +7782,14 @@ main() {
   # every `--print-bounds <run-id>` arm in the suite passes `--repo`).
   resolve_rail_repo "$REPO" || exit 2
   REPO="$RAIL_REPO"
+  # ⛔ (c) PER-PR EXCLUSION — before ANY CI work, comment or merge (#3194).
+  # The key carries the repo because one PR NUMBER exists in BOTH repos, and a bare
+  # number is exactly how #2235 printed a ✅ over an unmerged PR. Acquiring here means
+  # a duplicate exits before it can spend a slot, post a comment or reach a merge.
+  # The PR is validated numeric a few lines below; `rail_lock_acquire` itself refuses to
+  # take a lease on a non-numeric/empty PR, so `--print-bounds` and the usage errors keep
+  # working and can never render `ALREADY-RAILING()` with an empty number (finding 6).
+  rail_lock_acquire "${RAIL_REPO//\//-}-$PR"
 
   # The derivation report is an inspection: print and exit BEFORE any PR is
   # required, so `--print-bounds <run-id>` works on a bare invocation.
@@ -7643,7 +7843,10 @@ main() {
   # nothing can trap that — so this narrows the window rather than closing it to zero. The path
   # is `mktemp`-generated and read from the file-scope `READ_ERRTMP` at TRAP TIME, so it follows
   # the file the reads actually created instead of naming a predictable path (#1750 review).
-  trap 'rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
+  # CHAINED, not replaced: an EXIT trap here OVERWRITES any earlier one, so without the
+  # second call the per-PR lease would survive every normal exit and the exclusion would
+  # rest entirely on the dead-pid reclaim path (review finding 3).
+  trap 'rail_lock_release; rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
 
   # ── 0a. ALREADY MERGED ⇒ BENIGN NO-OP (#1709 rec 7) ──────────────────────
   # The rail runs at-least-once: a crash, a pause that resumes, or a second box
@@ -7874,6 +8077,7 @@ main() {
   # `pr-drops.err` FILE is left intact — the attribution half reads it later.
   local pr_drops_emitted=""
   while :; do
+  rail_guard_poll
     pr_status=0
     # THE PARSER'S DIAGNOSTICS ARE CAPTURED, NOT INHERITED (#1353): the dropped
     # FAILED tokens it names are the ONLY source of the attribution half, and they
