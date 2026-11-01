@@ -743,12 +743,19 @@ case "$OUT" in *"NOT the queue target"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and it is not refused as a different repo" "$r"
 case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-70))" "$r"
-# ⛔ ALL FOUR TRAILING-SLASH SPELLINGS ARE PINNED, ONE ROW EACH (review cycles 6-7, P2). With only
+# ⛔ ALL FOUR TRAILING-SLASH SPELLINGS ARE PINNED, ONE ROW EACH (review cycles 6-8, P2). With only
 # `*"/$OR/"` covered, removing any of the other three from ALL THREE lists still printed
 # `118 passed, 0 failed` — i.e. what the commit claims to fix rested on inspection. Measured now: strip
 # `*"/$OR/"` → 3 rows red; strip `*"/$OR.git/"` → 1 row; strip `*":$OR.git/"` → 1 row; strip `*":$OR/"`
 # → 1 row. Every fixture redirects the transport with `insteadOf` (so the spelling stays realistic while
 # nothing reaches the network) and asserts rc=0.
+# ⛔ WHICH COPY EACH ROW PINS (review cycle 8, P2): the four spelling rows above all run with `REPO=`
+# set, so they pin `resolve_repo`'s REPO-SET list only. The same four arms are also carried by the
+# CANDIDATE-LOOP predicate (the auto-derive path a cell without `REPO` uses) and by the `_pair` cause;
+# stripping them from the candidate loop alone left `121 passed, 0 failed`. `(h4d)` below pins the
+# candidate loop; the `_pair` copy is DEFENSIVE — `resolve_repo` returns 0 whenever that predicate
+# matches, so its "names `$OR` yet the resolver refused it" arm is reachable only by a config race and
+# is pinned by nothing. Stated, not implied.
 mk_case cause-trailing-slash-git
 git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise.git/"
 git -C "$D/repo" config "url.$D/origin.git.insteadOf" "https://github.com/daniel-ospina/tortoise.git/"
@@ -767,6 +774,23 @@ git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise/"
 git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise/"
 rp "$D" "" OR="daniel-ospina/tortoise"
 ck "(h4c) an scp-form '…:tortoise/' (no .git) origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+# ── (h4d) THE CANDIDATE LOOP'S COPY OF THE SAME PREDICATE ────────────────────────────────────────────
+# ⛔ THE AUTO-DERIVE PATH IS WHAT A CELL WITHOUT `REPO=` USES (review cycle 8, P2), and it carries its
+# own copy of the accept list — the same duplication this file's `RP_CLEAR` exists to stop. Stripping
+# the four arms from THAT copy alone left `121 passed, 0 failed`, so the path a cell actually takes on
+# a box with no exported checkout could lose them silently. The candidate list is derived from `$OR`'s
+# last path segment (`/tmp/<name>`, `$HOME/<name>`), so a SYNTHETIC `$OR` names a candidate that cannot
+# exist anywhere except where this arm puts it — that is what makes the arm hermetic (see `(h3)`).
+mk_case cause-trailing-slash-derived
+git clone -q "$D/origin.git" "$D/home/tortoise-derived-3174"
+git -C "$D/home/tortoise-derived-3174" config user.email t@t
+git -C "$D/home/tortoise-derived-3174" config user.name t
+git -C "$D/home/tortoise-derived-3174" remote set-url origin "https://github.com/no-such-org/tortoise-derived-3174/"
+git -C "$D/home/tortoise-derived-3174" config "url.$D/origin.git.insteadOf" "https://github.com/no-such-org/tortoise-derived-3174/"
+rp "$D" "" REPO= OR="no-such-org/tortoise-derived-3174"
+ck "(h4d) a DERIVED candidate with a trailing-slash origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+case "$OUT" in *"REPO was not set — using"*) r=0 ;; *) r=1 ;; esac
+ck "(h4d) …and it was that candidate the pass chose" "$r"
 # NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s accept list the
 # pass prints `NOT the queue target` for this origin and all three assertions above go red.
 # ⛔ THE UNSET-`$REPO` ARM IS HERMETIC BECAUSE THE CANDIDATE LIST IS DERIVED FROM `$OR` (review cycle 3,
