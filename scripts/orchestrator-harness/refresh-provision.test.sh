@@ -743,10 +743,12 @@ case "$OUT" in *"NOT the queue target"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and it is not refused as a different repo" "$r"
 case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-70))" "$r"
-# ⛔ THE OTHER THREE TRAILING-SLASH SPELLINGS ARE PINNED HERE (review cycle 6, P2): with only the
-# `*"/$OR/"` row covered, removing `*":$OR/"`, `*":$OR.git/"` or `*"/$OR.git/"` from ALL THREE lists
-# still printed `118 passed, 0 failed` — i.e. three quarters of what this commit claims to fix rested on
-# inspection. Each row is its own fixture, transport redirected the same way, asserting rc=0.
+# ⛔ ALL FOUR TRAILING-SLASH SPELLINGS ARE PINNED, ONE ROW EACH (review cycles 6-7, P2). With only
+# `*"/$OR/"` covered, removing any of the other three from ALL THREE lists still printed
+# `118 passed, 0 failed` — i.e. what the commit claims to fix rested on inspection. Measured now: strip
+# `*"/$OR/"` → 3 rows red; strip `*"/$OR.git/"` → 1 row; strip `*":$OR.git/"` → 1 row; strip `*":$OR/"`
+# → 1 row. Every fixture redirects the transport with `insteadOf` (so the spelling stays realistic while
+# nothing reaches the network) and asserts rc=0.
 mk_case cause-trailing-slash-git
 git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise.git/"
 git -C "$D/repo" config "url.$D/origin.git.insteadOf" "https://github.com/daniel-ospina/tortoise.git/"
@@ -757,6 +759,14 @@ git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise.gi
 git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise.git/"
 rp "$D" "" OR="daniel-ospina/tortoise"
 ck "(h4b) an scp-form '…:tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
+# …and the FOURTH arm, the scp form WITHOUT `.git` (review cycle 7, P2): stripping `*":$OR/"` from all
+# three lists left `120 passed, 0 failed` — the comment above claimed every row was its own fixture while
+# that one was covered by nothing. Each of the four is now a row, so every arm in the list is pinned.
+mk_case cause-trailing-slash-scp-nogit
+git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise/"
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+ck "(h4c) an scp-form '…:tortoise/' (no .git) origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
 # NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s accept list the
 # pass prints `NOT the queue target` for this origin and all three assertions above go red.
 # ⛔ THE UNSET-`$REPO` ARM IS HERMETIC BECAUSE THE CANDIDATE LIST IS DERIVED FROM `$OR` (review cycle 3,
