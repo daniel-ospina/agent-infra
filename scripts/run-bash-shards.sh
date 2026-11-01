@@ -1222,6 +1222,16 @@ echo "   ⏱  per-shard bound: ${shard_bound_desc}"
 # carried (what a suite pins, which incident added it) live in git history on this commit and in
 # each suite's own header — and see the note at the end of this file for why they are likewise not
 # reproduced here as prose.
+# ⛔ THE SAME RULE APPLIES TO A DUPLICATE, which is the shape #1989 + #2597 produced: the SAME suite
+# was listed TWICE (the second copy appended instead of editing the first), so the tree ran it twice
+# and `test_bash_shard_identity_is_injective_over_the_listed_shards` (tests/test_ci_exemption.py)
+# went red on main — a fleet-wide merge block caused by a list, not by code. Under DERIVATION that
+# failure mode is structurally gone (a file is matched once, and `shard_list` de-duplicates a path
+# two globs both match), which is why a suite that gains a claim amends THIS note and never adds a
+# row.
+# ⛔ AND `tests/pr-doctor-trigger/run.sh` (#2700 C5) NEEDS NO ROW EITHER: `tests/*/run.sh` matches
+# it, so the suite is wired by the FILE existing — an enumerated row would be the second execution
+# of the same suite, i.e. the defect #2838 records.
 #
 # ⛔ #2439 FOLDED THE DUPLICATE RUN SITES — this paragraph used to say the opposite, deliberately.
 # It read: "That duplication is deliberate here … the PR lane runs those twice … Dropping them
