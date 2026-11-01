@@ -13,9 +13,10 @@
 #                and was MENDED to the tree `apply` created; 1 = apply failed, the record did not
 #                converge, or a RE-ARMED second actuator could not be retired; 2 = the layer could NOT
 #                be resolved (loud, named).
-# Exit (status): 0 = current, 1 = DRIFT, 2 = the layer could NOT be resolved — the repo's own
-#                `0 match / 1 drift / 2 unknown` vocabulary (scripts/check-deployed-drift.sh), reused
-#                rather than invented a third time (#1178).
+# Exit (status): 0 = current, 1 = DRIFT, 2 = UNKNOWN — the layer could not be resolved, OR the ref could
+#                not be REFRESHED (an unrefreshed ref cannot tell current from DRIFT, so it decides
+#                nothing) — the repo's own `0 match / 1 drift / 2 unknown` vocabulary
+#                (scripts/check-deployed-drift.sh), reused rather than invented a third time (#1178).
 #
 # ── WHY THIS FILE EXISTS (#3194) ────────────────────────────────────────────────────────────────
 # `cell-self-pin.service` had exactly this job and could never do it. Its unit drop-in shipped
@@ -44,9 +45,14 @@
 #                                                   the tree it execs (`cmd_start` → `$HARNESS`).
 #   pin root   ${HARNESS_PIN_DIR}                 — default $CELL_HOME/harness (one worktree per commit).
 #   ref        ${HARNESS_REF}                     — default origin/main.
-#   ExecStart  ${CELL_HOME}/.pi/agent/scripts/cell-self-pin.sh when it exists (where the controller's own
-#              unit names its supervisor), else THIS file's resolved absolute path. Both exist for the
-#              life of the cell; neither is created by the provisioning recipe.
+#   ExecStart  ${CELL_HOME}/.pi/agent/scripts/cell-self-pin.sh ALWAYS — the one path `--install` places
+#              this file's own bytes at, under the one root a running cell keeps. ⛔ THERE IS NO
+#              FALLBACK TO "this file's own resolved path": that was a bug the older header documented
+#              as a feature. Rendering from a checkout (a lane worktree, a /tmp copy) produced
+#              `ExecStart=/bin/bash /home/…/.worktrees/ai-3194/scripts/cell-self-pin.sh`, and the worktree
+#              is PRUNED when the lane merges, leaving 203/EXEC every tick. `pin_script_path` therefore
+#              always prints the $CELL_HOME copy and REFUSES when it cannot find its own source bytes to
+#              place there — a refusal, never a path that outlives nothing.
 #   WorkingDirectory                          — **none**. See below.
 #
 # ⛔ `WorkingDirectory=` IS DELIBERATELY ABSENT FROM THE RENDERED UNIT, and that is the whole fix.
@@ -95,6 +101,14 @@
 # HEAD out of the RECORD the controller acts on rather than out of the stamp.
 set -u
 
+# ⛔ REMEMBERED BEFORE IT IS DEFAULTED, because the DEFAULT IS THE DEFECT. `cloud-cell-supervisor.sh`'s own
+# fallback is `/tmp/cell-home` (measured: cloud-cell-supervisor.sh:134), NOT `$HOME` — so an install run
+# with CELL_HOME unset would render `Environment=CELL_HOME=$HOME` into a unit whose reader is looking
+# somewhere else, i.e. the pin pass reads `$HOME/.harness-path` while the controller reads
+# `$CELL_HOME/.harness-path`: the #2215 skew this whole change exists to remove, installed permanently
+# into /etc/systemd/system. Rendering refuses when this is empty (see `print_unit`); a bare PASS keeps
+# the tolerant default, because a manual run must not be refused over an environment variable.
+CELL_HOME_GIVEN="${CELL_HOME:-}"
 CELL_HOME="${CELL_HOME:-$HOME}"
 HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
@@ -327,7 +341,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup
+  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -354,9 +368,20 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
       *) if git -C "$layer" fetch -q origin main 2>/dev/null; then
            printf '  (%s fetched just now)\n' "$HARNESS_REF"
          else
-           printf '  (git fetch FAILED in %s — the reading below may be STALE; this is not a green)\n' "$layer"
+           printf '  (git fetch FAILED in %s — the reading below is against an UNREFRESHED local ref; this is not a green)\n' "$layer"
+           fetch_failed=1
          fi ;;
     esac
+    # ⛔ A FAILED FETCH IS `2 = unknown`, NOT `0 = current`. The line above prints "this is not a green"
+    # and the comparison below used to hand back `verdict current` + exit 0 anyway: the artifact
+    # contradicted itself in one screen, and the only monitorable signal — the exit code — said green for
+    # exactly the reading the header calls unverified. An unrefreshed local ref cannot distinguish current
+    # from DRIFT, so it decides NOTHING; the vocabulary this file reuses already has the word for it.
+    if [ "${fetch_failed:-0}" -ne 0 ]; then
+      printf '  %s %s (NOT refreshed — the value above may be stale)\n' "$HARNESS_REF" "$(git -C "$layer" rev-parse "$HARNESS_REF" 2>/dev/null || echo '<unreadable>')"
+      printf '  verdict        UNKNOWN (2) — the fetch failed, so this reading can NOT be called current\n'
+      return 2
+    fi
     target="$(git -C "$layer" rev-parse "$HARNESS_REF" 2>/dev/null)"; printf '  %s %s\n' "$HARNESS_REF" "${target:-<unreadable>}"
     # ⛔ 1 FOR DRIFT, NOT 0. `scripts/check-deployed-drift.sh` already speaks `0 match / 1 drift /
     # 2 unknown`; a status verb that reports DRIFT and exits 0 cannot be gated on by anything, which is
@@ -370,7 +395,10 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
 
 # ── --install ────────────────────────────────────────────────────────────────────────────────────
 sed_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
-say() { printf '%s\n' "$*"; }
+# ⛔ NOT `say`. `tests/no-tts/run.sh` refuses a line-start `say()` definition in any tracked shipped
+# script, because on macOS `say` is /usr/bin/say (#2910) — and this file was the third offender keeping
+# that shard red. `note` is the same one-line writer with a name that cannot shadow a binary.
+note() { printf '%s\n' "$*"; }
 bad() { printf 'REFUSING: %s\n' "$*" >&2; }
 
 # pin_script_path — the absolute path the unit's ExecStart names, **COMPUTED AND NEVER WRITTEN**.
@@ -409,6 +437,15 @@ place_pass() {
 
 print_unit() { # [dest-dir] — render both units into a directory, or stdout when no dir is given
   local dest="${1:-}" tpl script user home
+  # ⛔ A RENDER OF A BASE NOBODY GAVE IS A LIE THE UNIT CANNOT TAKE BACK. `CELL_HOME` unset defaults to
+  # $HOME here, but the READER of the record this file derives from defaults to /tmp/cell-home — so the
+  # rendered `Environment=CELL_HOME=` would permanently disagree with the controller, and the only guard on
+  # it (`verify_unit`'s CELL_HOME assertion) compares the artifact against that SAME already-wrong value.
+  # Refusing is the only fail-closed answer at the one moment the value becomes permanent.
+  if [ -z "$CELL_HOME_GIVEN" ]; then
+    bad "CELL_HOME is not set in this environment — this file would default it to \$HOME (${HOME}), while cloud-cell-supervisor.sh's own default is /tmp/cell-home, so the rendered unit would pin a DIFFERENT record than the controller reads (the #2215 skew). Set CELL_HOME to the cell home and re-run."
+    return 1
+  fi
   # The template dir is resolved from THIS file's repo (templates/systemd is its sibling), then the
   # cell's materialized copy. A missing template is a refusal, never an empty unit.
   for d in "${TEMPLATES_DIR:-}" "${SELF_DIR%/scripts}/templates/systemd" "$CELL_HOME/.pi/agent/templates/systemd"; do
@@ -467,7 +504,7 @@ declares() {
 }
 
 verify_unit() { # <rendered service> — the properties the ISSUE names, asserted on the ARTIFACT
-  local f="$1" body exec_path n_exec execs envs ok_vals v w seen0=0
+  local f="$1" body exec_path n_exec execs envs ok_vals v w seen0=0 _interp _x
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
   # next reader to delete the only explanation of why the line is banned. Strip comments first.
@@ -476,7 +513,13 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   # TOKEN — not merely after `=` or at line start. `ExecStart=/bin/bash /tmp/cell-ai/scripts/…` puts a
   # SPACE before the path, and that is the reachable form: the placed copy's fallback is whatever
   # checkout the installer ran from, which on a provisioning box is exactly the bootstrap clone.
-  if [[ $body =~ (^|[[:space:]=])/(var/)?tmp/cell-ai(/|[[:space:]]|$) ]]; then
+  # ⛔ AND `/private/tmp` IS THE SAME DIRECTORY, SPELLED THE WAY macOS RESOLVES IT. The token list used to
+  # require the literal `/tmp/`, so `Environment=HARNESS_PIN_FILE=/private/tmp/cell-ai/.harness-path`
+  # installed GREEN — and the `Environment=` line is the one place nothing else looks (the `declares` and
+  # `$CELL_HOME` rules only read `WorkingDirectory=`/`ExecStart=`), so that spelling reached the box and
+  # pointed the pass at a different pin record than the controller reads. This suite already compensates
+  # for the same resolution for its own git paths (`pwd -P`); the guard has to as well.
+  if [[ $body =~ (^|[[:space:]=])/(private/)?(var/)?tmp/cell-ai(/|[[:space:]]|$) ]]; then
     bad "a rendered directive names the provisioning clone (/tmp/cell-ai) — that path is absent on a running cell and systemd fails the unit at CHDIR before any payload runs (#3194)"; return 1
   fi
   # ⛔ EVERY ExecStart, AND EXACTLY ONE — counted and read in EVERY spelling systemd accepts
@@ -490,10 +533,29 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   if [ "$n_exec" -ne 1 ]; then
     bad "the rendered unit declares ${n_exec} ExecStart= lines — exactly one is installable (systemd runs them ALL, so a second one is an unverified executable directive)"; return 1
   fi
-  exec_path="$execs"
+  # ⛔ THE EXECUTABLE-DIRECTIVE FAMILY IS CLOSED, NOT JUST `ExecStart=`. `Type=oneshot` runs
+  # `ExecStartPre=`, `ExecCondition=` and `ExecStopPost=` too, and every one of them is an executable
+  # directive this file does not read, prefix-check or token-check (measured: `ExecStartPre=/bin/bash
+  # /srv/nowhere/bootstrap.sh` appended to the template installed with rc=0 and every leg green). The pass
+  # needs exactly ONE executable directive; any other member of the family is refused BY NAME, because an
+  # executable nobody verified is the false PASS class #3194 is about, one directive name over.
+  for _x in ExecStartPre ExecStartPost ExecCondition ExecStop ExecStopPost ExecReload; do
+    if declares "$body" "$_x"; then
+      bad "the rendered unit declares ${_x}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1
+    fi
+  done
+  # ⛔ TWO RULES, TWO DIRECTORS, EACH INDIVIDUALLY GATING. `ExecStart=` is INTERPRETER plus PAYLOAD, and
+  # the two properties are asserted separately here (interpreter is /bin/bash; payload is an absolute path
+  # under $CELL_HOME). Anchoring both on one prefix match made the interpreter rule unreachable on its
+  # own: with `[ "/bin/bash "* ]` as the split, a `/bin/sh <path>` doctor fell through to the $CELL_HOME
+  # rule and was refused by the WRONG one, so deleting the interpreter rule left the suite green.
+  _interp="${execs%% *}"
+  exec_path="${execs#"$_interp" }"
+  [ "$_interp" = "/bin/bash" ] \
+    || { bad "the rendered unit's ExecStart interpreter is '${_interp}', not '/bin/bash' — a oneshot has no shell to resolve one"; return 1; }
   case "$exec_path" in
-    "/bin/bash "*) exec_path="${exec_path#/bin/bash }" ;;
-    *) bad "the rendered unit's ExecStart is not '/bin/bash <absolute script>' (it is '${exec_path}') — a oneshot has no shell to resolve one"; return 1 ;;
+    /*) ;;
+    *) bad "the rendered unit's ExecStart payload '${exec_path}' is not an ABSOLUTE path — a oneshot has no shell to resolve one"; return 1 ;;
   esac
   # ⛔ AND IT MUST LIVE UNDER $CELL_HOME. Any other absolute path can be pruned out from under the unit
   # (a lane worktree, a bootstrap clone); $CELL_HOME is the one root a running cell keeps.
@@ -586,7 +648,7 @@ retire_actuator() {
   if actuator_enabled_in "$scope"; then
     bad "eldato-harness-apply.timer still reads ENABLED in the ${scope} manager after 'disable --now' — REFUSING: two mutating actors on one pin is a race, not redundancy"; return 1
   fi
-  say "  RETIRED eldato-harness-apply.timer (${scope} manager)"
+  note "  RETIRED eldato-harness-apply.timer (${scope} manager)"
   return 0
 }
 # restore_actuator <scope> — put the shipped actuator BACK, and say whether the read-back agrees. Used
@@ -673,12 +735,12 @@ do_install() { # [--takeover]
     rm -rf "$tmp"; return 1
   fi
   if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
-    say "installing into $unit_dir (retiring the duplicate actuator in the ${who} manager(s) LAST, after the units are placed)"
+    note "installing into $unit_dir (retiring the duplicate actuator in the ${who} manager(s) LAST, after the units are placed)"
   elif [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ] && [ -n "$scopes" ]; then
-    say "  WARNING: eldato-harness-apply.timer is ENABLED (${who# }) and CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR is set — two actuators on one pin, deliberately"
+    note "  WARNING: eldato-harness-apply.timer is ENABLED (${who# }) and CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR is set — two actuators on one pin, deliberately"
   else
-    [ "$takeover" = --takeover ] && say "  (--takeover given, and no eldato-harness-apply.timer is enabled — nothing to retire)"
-    [ "$takeover" = --takeover ] || say "installing into $unit_dir"
+    [ "$takeover" = --takeover ] && note "  (--takeover given, and no eldato-harness-apply.timer is enabled — nothing to retire)"
+    [ "$takeover" = --takeover ] || note "installing into $unit_dir"
   fi
   # ⛔ THE UNITS GO IN FIRST, THE RETIREMENT LAST, AND THAT ORDER IS THE FIX. `retire_actuator` used to run
   # before `mkdir`, the writes, `daemon-reload` and `enable --now` — so ANY failure in that second half
@@ -688,9 +750,9 @@ do_install() { # [--takeover]
   # migration. A migration may not destroy the thing it is replacing before the replacement exists.
   mkdir -p "$unit_dir" 2>/dev/null || { bad "cannot create $unit_dir — nothing was retired, so the box keeps the actuator it had"; rm -rf "$tmp"; return 1; }
   for u in cell-self-pin.service cell-self-pin.timer; do
-    if [ -f "$unit_dir/$u" ] && cmp -s "$tmp/$u" "$unit_dir/$u"; then say "  $u unchanged"; continue; fi
+    if [ -f "$unit_dir/$u" ] && cmp -s "$tmp/$u" "$unit_dir/$u"; then note "  $u unchanged"; continue; fi
     install -m 0644 "$tmp/$u" "$unit_dir/$u" || { bad "cannot write $unit_dir/$u — nothing was retired, so the box keeps the actuator it had"; rm -rf "$tmp"; return 1; }
-    say "  $u written"
+    note "  $u written"
   done
   systemctl daemon-reload || { bad "'systemctl daemon-reload' failed — the units are on disk but not loaded, and nothing was retired, so the box keeps the actuator it had"; rm -rf "$tmp"; return 1; }
   # ⛔ NOW, AND ONLY NOW, THE RETIREMENT — immediately before the replacement is enabled. Every scope, and
@@ -699,7 +761,7 @@ do_install() { # [--takeover]
     for s in $scopes; do
       if ! retire_actuator "$s"; then
         for u in $retired; do
-          restore_actuator "$u" && say "  ROLLED BACK: eldato-harness-apply.timer re-enabled in the ${u} manager (that retirement was not part of a completed migration)" \
+          restore_actuator "$u" && note "  ROLLED BACK: eldato-harness-apply.timer re-enabled in the ${u} manager (that retirement was not part of a completed migration)" \
             || bad "ROLLBACK FAILED in the ${u} manager: eldato-harness-apply.timer is DISABLED there, this unit is NOT enabled, and that box now has NO pin actuator. Re-enable it by hand:'systemctl enable --now eldato-harness-apply.timer'."
         done
         rm -rf "$tmp"; return 1
@@ -712,7 +774,7 @@ do_install() { # [--takeover]
     # ⛔ A MIGRATION THAT CANNOT COMPLETE PUTS ITSELF BACK. Zero actuators is WORSE than two: two race on
     # one target, none leaves the box unpinned with a green-looking nothing.
     for s in $retired; do
-      restore_actuator "$s" && say "  ROLLED BACK: eldato-harness-apply.timer re-enabled in the ${s} manager, so this box keeps the ONE actuator it had before this attempt" \
+      restore_actuator "$s" && note "  ROLLED BACK: eldato-harness-apply.timer re-enabled in the ${s} manager, so this box keeps the ONE actuator it had before this attempt" \
         || bad "ROLLBACK FAILED in the ${s} manager: eldato-harness-apply.timer is DISABLED there, cell-self-pin.timer is NOT enabled, and this box now has NO pin actuator. Re-enable it by hand: 'systemctl enable --now eldato-harness-apply.timer'."
     done
     rm -rf "$tmp"
@@ -724,7 +786,7 @@ do_install() { # [--takeover]
   # shipped timer is the same false PASS this function refuses to create. A DELIBERATE duplicate
   # (CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR) is the one case where the invariant is not the claim.
   if [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
-    say "installed (TWO actuators on this pin, as CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR declares). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
+    note "installed (TWO actuators on this pin, as CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR declares). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
     return 0
   fi
   if scopes="$(actuator_scopes)"; then
@@ -733,7 +795,7 @@ do_install() { # [--takeover]
     bad "eldato-harness-apply.timer still reads ENABLED in the ${who} manager(s) after the migration — two mutating actors on one pin. Fix it with 'systemctl disable --now eldato-harness-apply.timer' in that manager."
     return 1
   fi
-  say "installed — ONE actuator on this pin (read back in both managers). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
+  note "installed — ONE actuator on this pin (read back in both managers). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
   return 0
 }
 

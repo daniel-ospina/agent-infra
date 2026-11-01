@@ -261,10 +261,29 @@ esac
 mkdir -p "$T/fakebin"
 printf '#!/bin/bash\nexit 0\n' >"$T/fakebin/systemctl"
 chmod +x "$T/fakebin/systemctl"
+# ⛔ A COPY OF THE PASS IS ALREADY PLACED, BEFORE ANY REFUSAL IS EXERCISED. Leg 1 asserted that
+# `--print-unit` writes nothing (no copy here yet), so this is the first placement — and it is what makes
+# «a REFUSED install must not replace the placed copy» assertable at all. Its bytes are a sentinel, not
+# this file: a mutant that moves `place_pass` above `verify_unit` overwrites it and `cmp` catches it.
+PLACED="$T/home/.pi/agent/scripts/cell-self-pin.sh"
+mkdir -p "$(dirname "$PLACED")"
+printf '#!/bin/bash\n# a copy placed by an EARLIER install — a refused install must not replace these bytes\n' >"$PLACED"
+cp "$PLACED" "$T/placed.before"
 doctor() { # <name> <appended lines>  -> prints the doctored template dir
   local d="$T/doctored-$1"
   mkdir -p "$d" && cp "$TPL/cell-self-pin.timer" "$d/" && cp "$TPL/cell-self-pin.service" "$d/"
   printf '\n[Service]\n%s\n' "$2" >>"$d/cell-self-pin.service"
+  printf '%s\n' "$d"
+}
+# doctor_rw <name> <sed-expr> — a doctor that must REWRITE an existing line rather than append one: the
+# rules on `Environment=CELL_HOME=`, `SuccessExitStatus=` and the ExecStart INTERPRETER are all about a
+# line the shipped template already carries, so an appended duplicate tests nothing (systemd merges the
+# section, and a second `ExecStart=` would trip the count rule first — the leg would pass on a rule it
+# did not name, which is exactly the vacuity the doctors exist to remove).
+doctor_rw() { # <name> <sed-expr applied to the service template>
+  local d="$T/doctored-$1"
+  mkdir -p "$d" && cp "$TPL/cell-self-pin.timer" "$d/"
+  sed "$2" "$TPL/cell-self-pin.service" >"$d/cell-self-pin.service"
   printf '%s\n' "$d"
 }
 install_doctored() { # <dir> <unit-dir>
@@ -280,6 +299,14 @@ refuses() {
   else bad "refused $name for the WRONG reason (wanted \"$why\") — an environment failure is not a refusal: $out"; fi
   [ -f "$u/cell-self-pin.service" ] && bad "a refused install ($name) still wrote the unit" \
     || ok "a refused install ($name) wrote nothing"
+  # ⛔ AND IT MUST NOT HAVE REPLACED THE PASS EITHER. «Deployed code that was never verified» is this
+  # change's own headline defect, and the refusal path is where it came back: `place_pass` used to run
+  # inside the renderer, so a REFUSED `--install` had already overwritten the copy at
+  # `$CELL_HOME/.pi/agent/scripts/cell-self-pin.sh` before `verify_unit` could refuse. Nothing asserted it:
+  # the old legs ran before ANY copy existed, so moving `place_pass` above `verify_unit` changed no result.
+  # `$PLACED` is seeded once, before the doctors, and every refusal re-checks those exact bytes.
+  if cmp -s "$T/placed.before" "$PLACED"; then ok "a refused install ($name) did NOT replace the already-placed pass"
+  else bad "a refused install ($name) REPLACED the placed pass before verification — deployed code that was never verified"; cp "$T/placed.before" "$PLACED"; fi
 }
 refuses 'WorkingDirectory=/tmp/cell-ai' "$(doctor bootpath 'WorkingDirectory=/tmp/cell-ai')" "$T/u1" 'provisioning clone'
 refuses 'WorkingDirectory= outside the clone' "$(doctor workdir 'WorkingDirectory=/srv/harness-current')" "$T/u2" 'WorkingDirectory='
@@ -308,6 +335,29 @@ refuses 'a SPACED WorkingDirectory=' "$(doctor workdir-spaced 'WorkingDirectory 
 refuses 'a SPACED ConditionPathExists=' "$(doctor cond-spaced 'ConditionPathExists = /srv/nope')" "$T/u8" 'ConditionPathExists='
 refuses 'an INDENTED second ExecStart=' "$(doctor exec2-indented " ExecStart=/bin/bash $T/nowhere/cell-self-pin.sh")" "$T/u9" 'ExecStart= lines'
 refuses 'a SPACED second ExecStart=' "$(doctor exec2-spaced "ExecStart = /bin/bash $T/nowhere/cell-self-pin.sh")" "$T/u10" 'ExecStart= lines'
+# ⛔ THE REST OF THE EXECUTABLE-DIRECTIVE FAMILY, refused BY NAME. Measured in review:
+# `ExecStartPre=/bin/bash /srv/nowhere/bootstrap.sh` appended to the template installed with rc=0 and every
+# leg green — `Type=oneshot` RUNS it, and `directive $body ExecStart` never saw it. A guard that covers one
+# name in a family is a guard the next template edit walks around.
+refuses 'an ExecStartPre=' "$(doctor execpre "ExecStartPre=/bin/bash $T/nowhere/bootstrap.sh")" "$T/u11" 'ExecStartPre='
+refuses 'a SPACED ExecStopPost=' "$(doctor stoppost "ExecStopPost = /bin/bash $T/nowhere/cleanup.sh")" "$T/u12" 'ExecStopPost='
+# ⛔ FOUR RULES THAT HAD NO DOCTOR AT ALL — deleting any one of them left this suite green, which the body's
+# «one doctor per rule» claim does not survive. Each doctor below trips ITS rule and nothing else:
+#   · the INTERPRETER rule is individually gating only because ExecStart is parsed as interpreter+payload;
+#     `/bin/sh <a path under CELL_HOME>` passes every other rule, so nothing else can answer for it.
+#   · the CELL_HOME environment rule is the only check on `Environment=`;
+#   · the two SuccessExitStatus rules (present; and only 0/11 with 0 included) are the difference between a
+#     RED and a green on every failure this unit exists to surface.
+refuses 'an ExecStart that is not /bin/bash' "$(doctor_rw interp "s|^ExecStart=/bin/bash .*$|ExecStart=/bin/sh $T/home/.pi/agent/scripts/cell-self-pin.sh|")" "$T/u13" "not '/bin/bash'"
+refuses 'a MISSING Environment=CELL_HOME=' "$(doctor_rw nocellhome '/^Environment=CELL_HOME=/d')" "$T/u14" 'Environment=CELL_HOME='
+refuses 'a MISSING SuccessExitStatus=' "$(doctor_rw noexit '/^SuccessExitStatus=/d')" "$T/u15" 'must declare SuccessExitStatus'
+refuses 'a WIDENED SuccessExitStatus=' "$(doctor_rw wideexit 's|^SuccessExitStatus=.*$|SuccessExitStatus=0 11 1|')" "$T/u16" 'neither 0'
+# ⛔ AND THE macOS SPELLING OF THE CLONE. `/tmp` IS `/private/tmp` there, and the token rule required the
+# literal `/tmp/` — so this installed GREEN. It is reachable as an `Environment=` value, which NOTHING else
+# inspects (the `declares`/`$CELL_HOME` rules read only `WorkingDirectory=` and `ExecStart=`), and the pass
+# that read it would derive a different pin record than the controller. This suite already resolves `/tmp`
+# for its own git paths (`pwd -P`); the guard has to see the same spelling.
+refuses 'an Environment= naming /private/tmp/cell-ai' "$(doctor privtmp 'Environment=HARNESS_PIN_FILE=/private/tmp/cell-ai/.harness-path')" "$T/u17" 'provisioning clone'
 
 # ── 4b. ONE ACTUATOR PER PIN — the guard asks BOTH systemd managers, and retires BOTH ────────────
 # ⛔ BARE `systemctl` IS THE SYSTEM MANAGER ONLY, and the shipped sibling installer this guard names as
@@ -634,6 +684,47 @@ RECORDED="$(head -1 "$T/home/.harness-path" 2>/dev/null)"
 [ "$RECORDED" = "$T/home/harness/$SHA12/scripts/orchestrator-harness" ] \
   && ok "…and the record names the HARNESS DIR the controller execs (not a bare toplevel)" \
   || bad "…but the mended record is '${RECORDED}', not '<tree>/scripts/orchestrator-harness'"
+
+# ── 9. two ways a reading that is NOT a green used to come back GREEN ──────────────────────────
+# ⛔ (a) A FAILED FETCH IS `2 = unknown`, NOT `0 = current`, AND MUST NOT PRINT «current». The status verb
+# prints "this is not a green" and then fell through to the SAME equality test against the LOCAL ref it
+# never refreshed, returning `verdict current` + exit 0 — the artifact contradicting itself in one screen,
+# with the only monitorable signal saying green for exactly the reading the header calls unverified. The
+# fixture is a clone whose `origin` URL answers nothing, sitting AT its own local `origin/main`, so a
+# fetch-agnostic comparison reports `current` while a fetch-aware one must refuse to decide.
+BADHOME="$T/home-badfetch"
+mkdir -p "$BADHOME/harness" "$BADHOME/orchestrator"
+git clone -q "$T/origin.git" "$BADHOME/harness/tree" 2>/dev/null
+git -C "$BADHOME/harness/tree" remote set-url origin "$T/no-such-origin.git"
+printf '%s\n' "$BADHOME/harness/tree" >"$BADHOME/.harness-path"
+# NON-VACUITY: the same tree IS `current` on the unfetched reading, so the leg below is discriminating
+# rather than passing because the tree happens to be behind.
+out="$(pinrun "$BADHOME" --status-nofetch 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "(control) the same tree reads 'current' on the UNFETCHED comparison, so the leg below discriminates" \
+  || bad "(control) the unfetched reading is $rc, not 0 — the fetch-failure leg would pass for the wrong reason: $out"
+out="$(pinrun "$BADHOME" --status 2>&1)"; rc=$?
+[ "$rc" -eq 2 ] && ok "a FAILED fetch exits 2 (unknown) — an unrefreshed ref cannot tell current from DRIFT" \
+  || bad "a failed fetch exited $rc, expected 2 (unknown): $out"
+case "$out" in
+  *'verdict        current'*) bad "a FAILED fetch still printed 'verdict current' — a reading the pass itself called unverified, reported GREEN" ;;
+  *'UNKNOWN'*) ok "…and the verdict line says UNKNOWN, so the self-contradiction is gone" ;;
+  *) bad "…but the verdict line does not name UNKNOWN: $out" ;;
+esac
+# ⛔ (b) A RENDER REFUSES WHEN `CELL_HOME` IS UNSET. The installer's default is `$HOME`; the READER of the
+# record it derives from defaults to `/tmp/cell-home` (cloud-cell-supervisor.sh:134). Rendering bakes
+# `Environment=CELL_HOME=` into /etc/systemd/system for ever, and `verify_unit`'s CELL_HOME assertion is
+# self-referential (it compares the artifact with the same already-wrong value), so nothing else can catch
+# it. Refusing at the one moment the value becomes permanent is the only fail-closed answer.
+out="$(env -u CELL_HOME -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
+     -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
+     -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC \
+     PATH="$T/fakebin-none:$PATH" HOME="$T/home" bash "$PIN" --print-unit 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "--print-unit REFUSES to render when CELL_HOME is unset (the base would be \$HOME, not the supervisor's)" \
+  || bad "a render with CELL_HOME unset succeeded (rc=$rc) — it bakes a WRONG base into the unit: $out"
+case "$out" in
+  *'CELL_HOME'*'/tmp/cell-home'*) ok "…and the refusal names the divergence (CELL_HOME vs the supervisor's /tmp/cell-home)" ;;
+  *) bad "…but the refusal does not name the divergence it refused for: $out" ;;
+esac
 
 printf '\n%d ok, %d failed\n' "$ok_n" "$bad_n"
 [ "$bad_n" -eq 0 ] || { printf 'scratch left at %s\n' "$T"; trap - EXIT; exit 1; }
