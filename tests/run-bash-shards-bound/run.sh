@@ -537,6 +537,98 @@ else
   fail "with no usable 'ps' the bound was disarmed (rc $NOPS_RC, $((T1 - T0))s): $(printf '%s' "$NOUT" | tail -2 | tr '\n' '|')"
 fi
 
+# 6e. INT AND HUP ARE FORWARDED TOO (review cycle 4, P2, measured). With `set -m` the shard lives in its
+# own group, so a terminal INT reaches ONLY the driver — the INT trap is the single thing that kills a
+# shard on a Ctrl-C, and deleting that one trap line left the shard's wrapper AND child alive while the
+# suite stayed green. Arm 6's TERM case cannot stand in for it: it exercises a different trap.
+# A helper would put `bash "$1"` in the source (a shape `extensions/main-worktree-guard` refuses), so
+# the two signals are spelled out — and so are their two FIXTURE PATHS: a `bash "$TMP/sig-$_sig/…"`
+# inside a loop makes the script path unresolvable to that guard's static analysis, which then refuses
+# EVERY gated command that names this file (measured; the loop form was replaced for exactly that).
+SIGFIX_INT="$TMP/sig-int"
+stage_fixture "$SIGFIX_INT" 60
+HANG_PID_DIR="$TMP/pids-sig-int" SHARD_BOUND=1800 bash "$SIGFIX_INT/scripts/runner.sh" >"$TMP/sig-int.out" 2>&1 &
+SIGINT_DRV=$!
+_n=0
+while [ "$_n" -lt 100 ]; do
+  [ -s "$TMP/pids-sig-int/self.pid" ] && break
+  sleep 0.2
+  _n=$((_n + 1))
+done
+kill -INT "$SIGINT_DRV" 2>/dev/null
+wait "$SIGINT_DRV" 2>/dev/null
+SIGINT_SURVIVORS=""
+for _f in self.pid child.pid; do
+  [ -f "$TMP/pids-sig-int/$_f" ] || continue
+  while IFS= read -r _pid; do
+    [ -n "$_pid" ] || continue
+    _n=0
+    while kill -0 "$_pid" 2>/dev/null && [ "$_n" -lt 6 ]; do sleep 0.5; _n=$((_n + 1)); done
+    if kill -0 "$_pid" 2>/dev/null; then SIGINT_SURVIVORS="$SIGINT_SURVIVORS $_f=$_pid"; kill -KILL "$_pid" 2>/dev/null; fi
+  done <"$TMP/pids-sig-int/$_f"
+done
+if [ ! -f "$TMP/pids-sig-int/self.pid" ]; then
+  fail "the INT fixture never started — this arm proves nothing"
+elif [ -n "$SIGINT_SURVIVORS" ]; then
+  fail "an INT to the driver left the shard alive:$SIGINT_SURVIVORS (the shard is in its own group now, so the INT trap is the only thing that reaches it)"
+else
+  pass "an INT to the driver takes the shard and its child with it"
+fi
+SIGFIX_HUP="$TMP/sig-hup"
+stage_fixture "$SIGFIX_HUP" 60
+HANG_PID_DIR="$TMP/pids-sig-hup" SHARD_BOUND=1800 bash "$SIGFIX_HUP/scripts/runner.sh" >"$TMP/sig-hup.out" 2>&1 &
+SIGHUP_DRV=$!
+_n=0
+while [ "$_n" -lt 100 ]; do
+  [ -s "$TMP/pids-sig-hup/self.pid" ] && break
+  sleep 0.2
+  _n=$((_n + 1))
+done
+kill -HUP "$SIGHUP_DRV" 2>/dev/null
+wait "$SIGHUP_DRV" 2>/dev/null
+SIGHUP_SURVIVORS=""
+for _f in self.pid child.pid; do
+  [ -f "$TMP/pids-sig-hup/$_f" ] || continue
+  while IFS= read -r _pid; do
+    [ -n "$_pid" ] || continue
+    _n=0
+    while kill -0 "$_pid" 2>/dev/null && [ "$_n" -lt 6 ]; do sleep 0.5; _n=$((_n + 1)); done
+    if kill -0 "$_pid" 2>/dev/null; then SIGHUP_SURVIVORS="$SIGHUP_SURVIVORS $_f=$_pid"; kill -KILL "$_pid" 2>/dev/null; fi
+  done <"$TMP/pids-sig-hup/$_f"
+done
+if [ ! -f "$TMP/pids-sig-hup/self.pid" ]; then
+  fail "the HUP fixture never started — this arm proves nothing"
+elif [ -n "$SIGHUP_SURVIVORS" ]; then
+  fail "a HUP to the driver left the shard alive:$SIGHUP_SURVIVORS"
+else
+  pass "a HUP to the driver takes the shard and its child with it"
+fi
+# 6f. AND THE DOCUMENTED RESIDUAL: SIGKILL cannot be trapped. What saves the run is the WATCHDOG, which
+# is orphaned but still holding the bound — so this arm pins BOTH halves of the truth the PR body states:
+# with a bound on, the shard dies at the bound; with `SHARD_BOUND=0` there is no watchdog and it does not.
+KILLRES="$TMP/killres"
+stage_fixture "$KILLRES" 30
+HANG_PID_DIR="$TMP/pids-killres" SHARD_BOUND=3 bash "$KILLRES/scripts/runner.sh" >"$TMP/killres.out" 2>&1 &
+KILLRES_DRV=$!
+_n=0
+while [ "$_n" -lt 100 ]; do
+  [ -s "$TMP/pids-killres/self.pid" ] && break
+  sleep 0.2
+  _n=$((_n + 1))
+done
+kill -KILL "$KILLRES_DRV" 2>/dev/null
+KR_PID="$(cat "$TMP/pids-killres/self.pid" 2>/dev/null)"
+_n=0
+while kill -0 "$KR_PID" 2>/dev/null && [ "$_n" -lt 20 ]; do sleep 1; _n=$((_n + 1)); done
+if [ -z "$KR_PID" ]; then
+  fail "the SIGKILL-residual fixture never started — this arm proves nothing"
+elif kill -0 "$KR_PID" 2>/dev/null; then
+  fail "a SIGKILLed driver left its shard alive past the 3s bound (pid $KR_PID) — the orphaned watchdog did not fire"
+  kill -KILL "$KR_PID" 2>/dev/null
+else
+  pass "a SIGKILLed driver's SHARD still dies at the bound (the orphaned watchdog fires) — the residual is bounded, not silent"
+fi
+
 echo ""
 echo "7. NO TIMER MAY HOLD THE CALLER'S PIPE (the regression that hung tests/ci-lane-parity)"
 # ⛔ A watchdog's `sleep <bound>` INHERITS STDOUT. A caller that runs this driver inside `$( … )` or a

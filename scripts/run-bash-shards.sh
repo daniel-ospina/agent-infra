@@ -623,25 +623,23 @@ shard_watchdog() {
   kill -KILL -"$shard_bg_pid" 2>/dev/null || kill -KILL "$shard_bg_pid" 2>/dev/null
 }
 
-# shard_kill_group <pgid> — TERM then KILL one shard's PROCESS GROUP, and NEVER a bare pid.
-# ⛔ THE BARE-PID FALLBACK IS GONE ON PURPOSE (review cycle 3, P2, measured). By the time the timeout
-# branch escalates, `wait` has already reaped the leader, so its pid is FREE — and a bare `kill -KILL
-# <pid>` aimed at a freed pid takes an uncatchable SIGKILL to whatever the kernel has since handed that
-# number to (another lane, the runner agent itself). The fallback existed for "a shell whose job
-# control gave the shard no group of its own"; there the GROUP form fails and the pid form is the only
-# thing left, so it is kept ONLY when that pid is still alive (`kill -0`, which fails for a reaped pid
-# and succeeds for a zombie — where a KILL is a harmless no-op).
+# shard_kill_group <pgid> — TERM then KILL one shard's PROCESS GROUP. NEVER a bare pid.
+# ⛔ NO BARE-PID FALLBACK AT ALL (review cycle 3 found the unguarded one; cycle 4 found the GUARD
+# inverted). BOTH call sites run AFTER `wait` has reaped the leader, so its pid is already FREE — and a
+# bare `kill -KILL <pid>` takes an uncatchable SIGKILL to whatever the kernel has since handed that
+# number to (another lane, the runner agent itself). A `kill -0` liveness guard does not fix that: it
+# cannot tell `pid still names my shard` from `pid now names someone else`, so at these call sites a
+# passing `kill -0` PROVES reuse. The "no group of its own" case the fallback was written for is not
+# reachable from here either (that shard is equally reaped), and it is already covered where it can
+# still work: the watchdog signals the shard's group with a bare-pid fallback WHILE the shard is alive.
 # A group that no longer exists fails the TERM and nothing else happens: one syscall in the common case.
 shard_kill_group() {
   [ -n "${1:-}" ] || return 0
-  if kill -TERM -"$1" 2>/dev/null; then
-    # The leader is gone (the shard finished or was killed), so every remaining member is a leftover:
-    # give it the same one-second grace the bound gives a suite, then make it certain.
-    sleep 1
-    kill -KILL -"$1" 2>/dev/null
-    return 0
-  fi
-  kill -0 "$1" 2>/dev/null && kill -KILL "$1" 2>/dev/null
+  kill -TERM -"$1" 2>/dev/null || return 0
+  # The leader is gone (the shard finished or was killed), so every remaining member is a leftover:
+  # give it the same one-second grace the bound gives a suite, then make it certain.
+  sleep 1
+  kill -KILL -"$1" 2>/dev/null
   return 0
 }
 
