@@ -726,9 +726,15 @@ for _dir in "$O" "$(dirname "$0")"; do
   [ -f "$_cr_mod" ]  || [ ! -f "$_dir/cycle-record.sh" ] || _cr_mod="$_dir/cycle-record.sh"
 done
 [ -n "$_cap_mod" ] && . "$_cap_mod"
-if declare -f cap_probe_local cap_place cap_read_fleet cap_publish >/dev/null 2>&1; then CAPACITY=1; else
+# ⛔ THE INTERFACE GATE MUST COVER EVERY MODULE FUNCTION THE CYCLE CALLS, INCLUDING THE ONES THIS
+# CHANGE ADDED (#3167, review round 10). It listed only the four pre-change names, so a `$O` whose
+# `capacity.sh` had not been re-copied — `deploy-harness.sh` seeds `$O` per file and `continue`s on a
+# failed copy — passed the gate as WIRED, then `cap_publish_logged … || true` swallowed `command not
+# found` (rc 127) and the box published NOTHING, silently: the exact defect this change fixes. The list
+# is what makes a stale module read as unwired, and the message names what is missing.
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars >/dev/null 2>&1; then CAPACITY=1; else
   CAPACITY=0
-  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box\n' >> "$LOG" 2>/dev/null || true
+  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, and this box publishes NOTHING to peers\n' >> "$LOG" 2>/dev/null || true
 fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
@@ -3175,10 +3181,21 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
     # it and returned 1 unconditionally — so when the probe said OWNED (a lock that appeared between the
     # `pr_owned` call and this one, or a claim caught mid-creation) the arms SPAWNED A SECOND WORKER on
     # a live claim and logged it as a release. Only rc=1 is a release.
-    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then return 0; fi
+    # ⛔ AND AN OWNED VERDICT THAT REPORTS A DESTRUCTION IS NOT DISCARDED (review of #3096, P2-3). rc 0 is
+    # "owned", so the old one-liner threw `_v` away — but three of `pl_verdict`'s OWNED sentences exist ONLY
+    # to be read: a claim this pass detached and could not put back (`peer may be working blind`), and a
+    # record that vanished mid-reclaim. Leaving no artifact for those is the "process claim with no
+    # evidence" class this file bans, and `fix-one.sh`'s equivalent outcome writes a WARNING line.
+    _tab="$(printf '\t')"
+    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then
+      case "$_v" in
+        *'could NOT be put back'*|*VANISHED*|*'could NOT be detached'*)
+          echo "[lock] #$pr — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true ;;
+      esac
+      return 0
+    fi
     # Strip the verdict label with a REAL TAB: `${_v#RELEASED\t}` never matched (bash reads `\t` in a
     # pattern as an escaped `t`), so every reap line printed a duplicated label and a raw tab — review P2.
-    _tab="$(printf '\t')"
     echo "[reap] #$pr released — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true
     return 1
   fi
@@ -5634,8 +5651,13 @@ PY
       # THE LOCAL FORK BOUND, from the SAME record placement reads — one implementation, two consumers.
       CAP_FORK_BOUND_SELF="$(cap_fork_bound "$CAP_REC" 2>/dev/null)" || CAP_FORK_BOUND_SELF=""
       CAP_LPC_SELF="$(cap_kv "$CAP_REC" lpc)"
-      cap_publish "$REPO" "$CAP_REC" > /dev/null 2>&1 \
-        || echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings)" >> "$LOG"
+      # ⛔ THE REFUSAL'S REASON IS PART OF THE DIAGNOSIS (#3167). `cap_publish` is fail-closed by design —
+      # it prints `publish=refused why=<reason>` and returns 1 — but this call used to discard that output
+      # (`>/dev/null 2>&1`), so a box that could not name itself went INELIGIBLE for a whole lane's worth of
+      # cycles with no gate red and nothing in the log saying why. `cap_publish_logged` surfaces it on one
+      # line AND is driven by the suite (§14 (16)-(18)), so its polarity, its reason parsing and its
+      # CAP_BOXID gate are graded behaviour rather than a grep of this file's text.
+      cap_publish_logged "$REPO" "$CAP_REC" "$LOG" "$CAP_NS" || true
       CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
       [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"
       # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.

@@ -128,13 +128,50 @@ printf '%s\n' "$RESEARCH_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
 # The reaper still re-probes for a live holder before deleting, so a worktree another lane is using,
 # or a `pi`/pytest child still running after the agent returned, keeps its env. Best-effort and loud:
 # `reap_lane_venv` never changes the lane's exit status, and logs every outcome to the lane log.
-trap 'reap_lane_venv "$PWD" "lane $N"' EXIT
+#
+# ── and the WORKTREE + BRANCH go with it when the lane produced nothing (agent-infra#2033) ────────
+# This is the other half of the same trap, and it is the half that keeps the ISSUE dispatchable. A
+# lane that exits with no commit, no push and a clean tree leaves a branch that is 0 commits ahead of
+# origin/main — and the collision pre-flight infers "in flight" from exactly that branch, so a free
+# issue becomes permanently undispatchable on every box (measured: #8090, `feat/8090-tm`, 0 ahead).
+# `wt_reap_if_empty` refuses on anything that could be work (commits ahead, a pushed branch, a dirty
+# tree, a live holder, an unevaluable probe), and a dirty tree is deliberately NOT reaped here: the
+# backup-then-remove policy (`reaped-patches`) belongs to the reaper, not to the dying lane.
+# `SELF` is the ONE from above (the harness/$O directory that also holds spawn-gate.sh) — a second
+# declaration here would be harmless today and a trap the day one of them changes.
+# shellcheck source=/dev/null
+. "$SELF/wt-lifecycle.sh" || { echo "[lane $N] FATAL: $SELF/wt-lifecycle.sh missing — refusing to run a lane whose empty worktree could never be reclaimed (#2033)" >&2; exit 78; }
+LANE_WT="$PWD"
+lane_exit_cleanup() {
+  [ -n "${LANE_WT:-}" ] || return 0
+  reap_lane_venv "$LANE_WT" "lane $N"
+  local repo
+  repo="$(cd "$LANE_WT" 2>/dev/null && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || repo=""
+  case "$repo" in */.git) repo="${repo%/.git}" ;; esac
+  [ -n "$repo" ] || return 0
+  wt_reap_if_empty "$repo" "$LANE_WT" "$BR" "lane $N" || true
+  echo "[lane $N] worktree: $WT_RESULT" >> "$O/logs/lane-$N.log" 2>/dev/null || true
+  return 0
+}
+# ⛔ THE SIGNAL TRAPS ARE LOAD-BEARING, NOT TIDINESS (measured on /bin/bash 3.2.57, 2026-10-18): a
+# shell killed by SIGHUP with only an EXIT trap installed does NOT run that trap. `tmux kill-session`
+# — which `dispatch-merge.sh` uses on its no-chain path, and which an operator uses by hand — delivers
+# SIGHUP, so the cleanup has to be reached by an explicit handler that `exit`s. Each handler clears
+# the traps on entry so the `exit` cannot re-enter it (one cleanup, one exit, status matched to the
+# signal).
+trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 143' TERM
+trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 130' INT
+trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 129' HUP
+trap 'lane_exit_cleanup' EXIT
 # ⛔ ...but NOT on a DRY RUN (agent-infra#2148's `LANE_DRY_RUN` seam, below). No agent ran, so the
 # worktree's `.venv` has no dead holder to reap — and a preview that DELETES a build artifact is
 # exactly the destructive-side-effect class a dry run exists to avoid. The trap is installed
 # conditionally because it is installed before the dry-run branch is reached.
+# ⛔ AND IT CLEARS *ALL FOUR* TRAPS, not just EXIT: `lane_exit_cleanup` is now also reached by the
+# signal handlers, so leaving THOSE armed would let a Ctrl-C in a dry run run the very cleanup the
+# guard is disabling.
 if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
-  trap - EXIT
+  trap - EXIT INT TERM HUP
 fi
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319)
 # This line used to export `AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` UNCONDITIONALLY — a permanent
