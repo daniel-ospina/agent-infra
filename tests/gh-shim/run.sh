@@ -757,7 +757,7 @@ bash "$SHIM" ship-it 123 >/dev/null 2>"$TMP/err"; rc=$?
 #   13(c) `retry-after` is honoured (and the retry is never immediate),
 #   13(d) with no `retry-after`, the wait is the documented >=60 s,
 #   13(e) a burst of N lanes produces ONE refusal-and-wait, not N failures (the AC),
-#   13(f) the gate never asks `rate_limit` how healthy the account is,
+#   13(f) the exempt `rate_limit` read can only LIFT a shared window, never admit under one,
 #   13(g) a non-rate-limit 403 is NOT retried (a mutating command must not run twice).
 echo "== 13. the fleet courtesy gate: bounded concurrency, spacing, 403/429 handling (#1910) =="
 
@@ -965,15 +965,93 @@ esac
   && pass "  …and all 5 lanes finished rc=0 (one refusal-and-wait, no lane failed)" \
   || fail "  …but some lanes failed: rc list '$burst_rcs'"
 
-# (f) THE GATE's HEALTH SIGNAL IS ITS OWN IN-FLIGHT COUNT. `GET /rate_limit` reports only
-#     the primary budget, so asking it would be exactly the #1762 mistake. Pin that no
-#     executed line of the shim references the ENDPOINT (header prose may; the code may
-#     not). The pattern excludes the gate's own `rate_limited` helper, which is this file's
-#     own function name and says nothing about the API.
-rl_refs=$(grep -v '^[[:space:]]*#' "$SHIM" | grep -cE 'rate_limit([^a-z_]|$)' || true)
-[ "${rl_refs:-1}" -eq 0 ] \
-  && pass "no executed line consults \`rate_limit\` — the gate's own slot count is the signal" \
-  || fail "the shim's CODE now reads rate_limit ($rl_refs reference(s)) — it cannot see the secondary limit"
+# (f) THE GATE's HEALTH SIGNAL IS ITS OWN IN-FLIGHT COUNT — AND THE EXEMPT `/rate_limit` READ MAY
+#     ONLY EVER *LIFT* A WINDOW, NEVER ADMIT UNDER ONE. `GET /rate_limit` reports only the primary
+#     budget, so a refusal it cannot see (secondary/abuse) must never be discharged by it (#1762).
+#
+#     ⛔ THIS ARM USED TO BE A STATIC GREP — "no executed line references the endpoint" — AND THAT
+#     PIN WAS SATISFIED BY A FIX THAT DISCHARGED NOTHING AT ALL. A three-line `python3 -c` body with
+#     a leading space on line 2 raises IndentationError, the parser reported "unreadable body", the
+#     window was honoured, and the grep was green over a revalidation that could never fire
+#     (measured: a 110 s window slept out in full, 112.9 s, while the account had core 3,502/5,000).
+#     The invariant is BEHAVIOURAL, so it is pinned behaviourally: the read lifts a window when the
+#     account is healthy, and it CANNOT lift one a secondary refusal wrote or one it cannot verify.
+#     `AGENT_GH_GATE_WAIT_BUDGET=1` keeps a non-discharge at ~1 s (rc=75) instead of a 60 s sleep.
+GDIR="$(gate_dir revalidate)"
+GREAL="$TMP/gate-real-revalidate"
+# A fake gh that answers the exempt read with a HEALTHY body and everything else with silence.
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976},"search":{"limit":30,"remaining":30}}}'
+    exit 0 ;;
+esac
+exit 0
+GHEOF
+chmod +x "$GREAL"
+# A fake gh whose exempt read FAILS — absence of evidence must never discharge a window.
+GREAL_BAD="$TMP/gate-real-revalidate-bad"
+cat > "$GREAL_BAD" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*) echo 'HTTP 403: API rate limit exceeded for user ID 81560491' >&2; exit 1 ;;
+esac
+exit 0
+GHEOF
+chmod +x "$GREAL_BAD"
+
+# (f)(i) a HEALTHY account LIFTS a far-future window: the call proceeds now, not in 60 s.
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/events.log"
+_ns=$(date +%s)
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+_ne=$(date +%s)
+[ "$_rc" -eq 0 ] && [ $(( _ne - _ns )) -le 5 ] \
+  && pass "a healthy exempt read lifts a 60 s window (rc=0 in $(( _ne - _ns ))s, not 60s)" \
+  || fail "the window was NOT re-derived: rc=$_rc after $(( _ne - _ns ))s — the revalidation is a no-op"
+grep -q 'DISCHARGED' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and it is recorded as DISCHARGED, with the core number it read" \
+  || fail "  …and nothing said DISCHARGED — the window vanished silently or not at all"
+ls "$GDIR"/cooldown.* >/dev/null 2>&1 \
+  && fail "  …but the cooldown files are still there, so the next lane still sleeps" \
+  || pass "  …and the stale cooldown files are gone (the whole box is released, not just this call)"
+
+# (f)(ii) A SECONDARY/abuse window is INVISIBLE to `/rate_limit`, so a healthy primary read must
+#         NOT discharge it. This is the #1762 mistake, pinned: same healthy body, honoured anyway.
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/secondary.window"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "a SECONDARY window is honoured even when core reads healthy (rc=75 contended)" \
+  || fail "a secondary window was discharged by a primary read (rc=$_rc) — this is the #1762 mistake"
+grep -q 'DISCHARGED' "$GDIR/events.log" 2>/dev/null \
+  && fail "  …and it was recorded as DISCHARGED — the secondary flag did not gate the read" \
+  || pass "  …and nothing was discharged"
+
+# (f)(iii) A revalidation that CANNOT COMPLETE leaves the window exactly as it was — absence of
+#          evidence is never a discharge (a transient 502 must not delete a real window).
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+rm -f "$GDIR/secondary.window"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_BAD" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "a FAILED exempt read honours the window (rc=75) — no evidence, no discharge" \
+  || fail "a failed exempt read discharged the window (rc=$_rc) — absence was read as health"
+grep -q 'could not re-derive' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and says so, rather than passing silently" \
+  || fail "  …and the failure was silent"
+rm -f "$GDIR"/cooldown.* "$GDIR/secondary.window" 2>/dev/null
 
 # (g) A NON-rate-limit 403 IS NOT RETRIED. A permissions failure is not a burst, and
 #     retrying a mutating command would run it twice.
