@@ -654,9 +654,10 @@ fi
 # shipped script at all: `rp`/`rpc` cleared every ambient provisioning knob EXCEPT `$OR`, and every
 # fixtures that existed when it was measured all prove their target with a bare LOCAL origin — which
 # `resolve_repo` refuses the moment `$OR` is DECLARED, before the provision stage runs. (The
-# `(h3)`/`(h4*)` fixtures below came later and spell their origin as a URL; the `(h4*)`/`(h4d)` rows
-# redirect that transport with `insteadOf`, while the `(h3)` rows never reach a fetch at all — the
-# resolver refuses above it.) Measured on a cell whose shell exports `OR`:
+# `(h3)`/`(h4*)` fixtures below came later and each keeps its OWN shape (bare local path / removed
+# origin / URL naming another repo / file:// mirror / synthetic candidate); the `(h4*)`/`(h4d)` rows
+# spell the origin as a URL and redirect that transport with `insteadOf`, and no `(h3)` row ever reaches
+# a fetch — the resolver refuses above it.) Measured on a cell whose shell exports `OR`:
 # most of the suite red, each recording the EXIT TRAP's `the failing step recorded no cause` because the
 # refusal happened above `scout_sync` — which is why the cluster read as a cause-record defect.
 # The arm EXPORTS the ambient value into the suite's own environment (not into the pass), so it fails
@@ -784,7 +785,10 @@ rp "$D" "" OR="daniel-ospina/tortoise"
 ck "(h4b) an scp-form '…:tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
 # …and the FOURTH arm, the scp form WITHOUT `.git` (review cycle 7, P2): stripping `*":$OR/"` from all
 # three lists left the suite green — the comment above claimed every row was its own fixture while
-# that one was covered by nothing. Each of the four is now a row, so every arm in the list is pinned.
+# that one was covered by nothing. Each of the four is a row now, so every TRAILING-SLASH spelling is
+# pinned. ⛔ THE SIX PRE-EXISTING ARMS ARE STILL PINNED BY NOTHING (measured: deleting `"$OR"`,
+# `"$OR.git"`, `*":$OR"`, `*":$OR.git"`, `*"/*$OR"`-family from all three lists leaves the suite at
+# 129 passed, 0 failed). Stated rather than implied — a future lane can pin them the same way.
 mk_case cause-trailing-slash-scp-nogit
 git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise/"
 git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-ospina/tortoise/"
@@ -841,6 +845,17 @@ case "$(rec why)" in *"NO READABLE 'origin'"*) r=0 ;; *) r=1 ;; esac
 ck "(h3) …and the cause says the origin is UNREADABLE ($(rec why | cut -c1-90))" "$r"
 case "$(rec why)" in *"local-path"*) r=1 ;; *) r=0 ;; esac
 ck "(h3) …and does not claim a local-path origin it never read" "$r"
+# …and the FILE:// MIRROR, which is not evidence of a different repo (review cycle 13, P2): it matched
+# the `*://*` classifier and was reported as "a DIFFERENT repo, and no retry can mend a mismatch" — an
+# identity claim never measured, about the shape this repo calls a legitimate local mirror.
+mk_case cause-file-url
+git -C "$D/repo" remote set-url origin "file://$D/origin.git"
+rp "$D"
+ck "(h3) a file:// mirror origin REFUSES (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
+case "$(rec why)" in *"local-mirror"*) r=0 ;; *) r=1 ;; esac
+ck "(h3) …and the cause calls it a LOCAL MIRROR, not a different repo ($(rec why | cut -c1-80))" "$r"
+case "$(rec why)" in *"DIFFERENT repo"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and it makes no identity claim it did not measure" "$r"
 
 echo
 echo "==> $PASS passed, $FAIL failed"

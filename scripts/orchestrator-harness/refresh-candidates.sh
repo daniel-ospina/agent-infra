@@ -1848,6 +1848,12 @@ if ! resolve_repo; then
     _origin="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
     case "$_origin" in
       '') _pair="\$REPO ('${REPO}') has NO READABLE 'origin' remote, so it cannot prove it is a checkout of \$OR ('${OR:-}')" ;;
+      # ⛔ A `file://` URL NAMES NO REPO IDENTITY (review cycle 13, P2). It matched `*://*` and was
+      # therefore reported as "NOT the queue target … a DIFFERENT repo, and no retry can mend a
+      # mismatch" — an identity claim this pass never measured, about a shape `repo-slug.sh:52`
+      # refuses for exactly that reason (and which the header of this file calls a legitimate local
+      # mirror at :21-23). Its own arm, before the URL case.
+      file://*) _pair="\$REPO ('${REPO}') has the local-mirror 'origin' ${_origin} — a file:// URL names no repo identity, so it cannot prove it is a checkout of \$OR ('${OR:-}'; OR_DECLARED='${OR_DECLARED:-?}'); refusing is deliberate, since a path cannot certify a queue target" ;;
       *://*|*@*:*)
          case "$_origin" in
            "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/")
