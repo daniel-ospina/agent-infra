@@ -1372,7 +1372,7 @@ ck "a probe that produced NO verdict at all with rc=1 WARNS and dispatches (rc=$
 # CALLER refuses on it, so the two halves cannot drift apart in either direction.
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 LANE_PREFLIGHT_BOUND=45s CELL_PREFLIGHT_SH="$HERE/cell-lane-preflight.sh"
-{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+{ [ "$CRC" -eq 83 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "an UNREADABLE usage path (bad \$LANE_PREFLIGHT_BOUND) is REFUSED, not dispatched (rc=$CRC)" $rc
 grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and the remedy names what a usage error actually is — helper/consumer skew, not the extension set" $rc
@@ -1404,13 +1404,13 @@ ck "a GENUINE why=no-answer still WARNS and dispatches (rc=$CRC) even with a hos
 # 3300 s slot this gate exists to protect. Reachable in the version-skew direction the probe's own
 # header names as the production cause (a NEW caller against an OLD deployed helper: a rejected
 # `--bound` exits 2 printing nothing) and from a truncated/corrupt copy (`bash <file>` on broken syntax
-# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 81 (not 71: 71 sends the
+# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 83 (not 71: 71 sends the
 # operator to repair the BOX and then to dispatch the item to a peer that runs the same pair).
 mkfake '' 2
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
-{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
-ck "a probe that RAN and exited 2 with NO verdict is REFUSED 81 and starts NO agent (rc=$CRC)" $rc
+{ [ "$CRC" -eq 83 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that RAN and exited 2 with NO verdict is REFUSED 83 and starts NO agent (rc=$CRC)" $rc
 grep -q 'rc=2 with NO verdict' "$LOG"; rc=$?
 ck "...and the log names the rc=2 reading, so the operator is not left with an unexplained refusal" $rc
 grep -q 'VERSION SKEW' "$LOG"; rc=$?
@@ -1602,6 +1602,119 @@ for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GA
 done
 [ -z "$_unread" ]; rc=$?
 ck "every AGENT_*_REFUSED code is ACCOUNTED FOR — named in a caller's CODE or reached by the table (unread:${_unread:- none})" $rc
+
+# ══ THE CLASS: TWO GATES MUST NOT CLAIM ONE CODE, AND EVERY ARM MUST BE REACHED ══════════════════
+# ⛔ WHY THIS SECTION EXISTS (measured 2026-11-01 on the merged tree of PR #2591, parents 317cf6286 +
+# 951e4c821). `AGENT_HARNESS_SKEW_REFUSED` was added at 81 by #3035 (2026-11-01) — nine days AFTER
+# `AGENT_MEM_REFUSED` (#2387, 2026-10-23) had claimed 81 on a branch that had not merged. Nothing
+# detected it, and the reason is that BOTH things that could have were SPOT LISTS, not derivations:
+#   • `_gate_expected` above is a hand-written list of the gates that existed when it was authored, so
+#     a NEW constant needs a row nobody was required to add — #2591's memory gate never got one, and
+#     the chain was therefore never asked to prove its arm reachable;
+#   • the distinctness assertions elsewhere are spot checks too (`capacity-placement.test.sh`: "fork 73,
+#     distinct from land 74, disk 77 and load 75") — a list, so it cannot see a code added after it.
+# The consequence was not cosmetic: callers classify a refusal BY CODE and in ARM ORDER, so with skew
+# at 81 and the skew arm FIRST in `fix-one.sh` (:795 on that tree, the memory arm at :818), every
+# MEMORY refusal exited 81 under the "HARNESS/MISMATCH gate" label and the memory arm was UNREACHABLE.
+# One red out of 113 checks, and only because #2591 happened to write an arm that drove the memory
+# refusal through the fixer.
+# So the two properties below are DERIVED FROM THE HELPER and from the caller's own references, never
+# from a list a future author has to remember to extend:
+#   (1) two gates may not claim one code (the only sanctioned share is 78's cannot-verify pair);
+#   (2) every gate the fixer CLASSIFIES is DRIVEN, and must NAME ITSELF. A new constant that fix-one.sh
+#       reads but this table does not declare is a RED ("undeclared"), so the table cannot fall behind
+#       the helper silently — the blind spot that let 81 be claimed twice.
+
+# (1) THE CODES ARE UNIQUE. Derived from every `*_REFUSED=<n>` constant in the shipped helper, with
+# the ONE declared share: `PI_FORK_REFUSED` and `BRIEF_GATE_UNAVAILABLE` are both 78 by an inherited
+# decision (#2258's note in spawn-gate.sh: both mean "this run could not be verified"), so a guard
+# that demanded strict uniqueness here would fail on a known-intentional pair and be relaxed rather
+# than fixed. The share is named exactly, so a THIRD claimant of 78 — or any other duplicate — is red.
+_allref="$(sed -n -e 's/^\([A-Z][A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1 \2/p' \
+                  -e 's/^\(AGENT_LAND_BACKLOG\)=\([0-9][0-9]*\).*/\1 \2/p' \
+                  -e 's/^\(BRIEF_GATE_UNAVAILABLE\)=\([0-9][0-9]*\).*/\1 \2/p' "$GATE")"
+_dupgroups=""
+for _cv in $(printf '%s\n' "$_allref" | awk 'NF{print $2}' | sort -u); do
+  _cn="$(printf '%s\n' "$_allref" | awk -v c="$_cv" '$2==c{print $1}' | sort | tr '\n' ',')"
+  _cn="${_cn%,}"
+  case "$_cn" in *,*) _dupgroups="$_dupgroups $_cv=$_cn" ;; esac
+done
+_dupgroups="${_dupgroups# }"
+# GREEN when nothing is shared, or when the ONLY shared code is the declared 78 pair. Both directions
+# are red on anything else — a THIRD claimant of 78, or any other duplicate.
+case "$_dupgroups" in
+  ""|"78=BRIEF_GATE_UNAVAILABLE,PI_FORK_REFUSED") rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "no two refusal gates claim the SAME code — the only sanctioned share is 78's cannot-verify pair (duplicate codes:${_dupgroups:- none})" $rc
+
+# (2) THE ARM TABLE. `<CONSTANT>:<wording the fixer's own log must carry>`. A row may PRECEDE its
+# gate (#2387's memory gate is declared here before main defines it): the moment that constant lands,
+# this row drives it, so the collision cannot be merged into main a second time without a red.
+_fixer_arms="AGENT_BRIEF_REFUSED:BRIEF gate
+AGENT_CAPABILITY_REFUSED:CAPABILITY gate
+AGENT_FORK_REFUSED:fork gate
+AGENT_LOAD_REFUSED:load gate
+AGENT_DISK_REFUSED:disk gate
+AGENT_HARNESS_SKEW_REFUSED:HARNESS/MISMATCH gate
+AGENT_MEM_REFUSED:memory gate"
+_armdecl=" $(printf '%s\n' "$_fixer_arms" | cut -d: -f1 | tr '\n' ' ')"
+# Completeness, in the direction that matters: every gate the FIXER reads must have a row. Derived
+# from fix-one.sh itself, so adding a `${AGENT_X_REFUSED:-…}` arm there without declaring it here is a
+# red rather than an unchecked arm.
+_armmissing=""
+for _ac in $(grep -o 'AGENT_[A-Z_]*_REFUSED' "$HERE/fix-one.sh" | sort -u); do
+  case "$_armdecl" in *" $_ac "*) : ;; *) _armmissing="$_armmissing $_ac" ;; esac
+done
+[ -z "${_armmissing// /}" ]; rc=$?
+ck "every gate fix-one.sh CLASSIFIES has an arm-table row (undeclared:${_armmissing:- none}) — a new arm cannot be added without proving it is reachable" $rc
+
+# The fixture: the shipped fix-one.sh beside the SHIPPED helper with ONE function APPENDED and
+# overridden — `run_agent`, whose RETURN VALUE is the classifier's whole input. Deriving the fixture
+# from the helper (rather than re-implementing a helper that returns a code) is what keeps this from
+# proving only that a `case` statement exists: every constant, every guard and every other function in
+# the fixture is the shipped code, and the prefix identity is asserted below so an edit to the
+# derivation cannot quietly diverge.
+_armdir="$RIG/armtable"; mkdir -p "$_armdir"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" \
+   "$HERE/gate-policy.sh" "$HERE/brief-gate.sh" "$HERE/reviewer-preflight.sh" "$_armdir/"
+cat >> "$_armdir/spawn-gate.sh" <<'ARMTABLE_OVERRIDE'
+
+# ── FIXTURE OVERRIDE (spawn-gate.test.sh's arm table) ───────────────────────────────────────────
+# The fixer's classifier keys on run_agent's RETURN VALUE, so the return value is what is forced here;
+# nothing else in this helper is touched. Appended LAST so this definition wins at source time.
+run_agent() { AGENT_STARTED=0; return "${FIXTURE_GATE_RC:-75}"; }
+ARMTABLE_OVERRIDE
+head -n "$(wc -l < "$GATE" | tr -d ' ')" "$_armdir/spawn-gate.sh" | diff -q - "$GATE" >/dev/null; rc=$?
+ck "the arm-table fixture differs from the shipped helper ONLY by the appended run_agent override" $rc
+grep -q '^run_agent() { AGENT_STARTED=0; return "\${FIXTURE_GATE_RC:-75}"; }$' "$_armdir/spawn-gate.sh"; rc=$?
+ck "...and the override really is there (a derived fixture that silently dropped it would drive the real gate)" $rc
+
+_armseen=""
+# ⛔ `fix_argv` IS RE-BUILT BEFORE EVERY ROW, NOT ONCE: `fix-one.sh --argv` CONSUMES the file
+# (`rm -f "$ARGV"` at its own :10), so a single build would drive row 1 and leave rows 2..n asserting
+# on "missing argv file" — measured on the first cut of this section, where only the first gate passed.
+for _row in $_fixer_arms; do
+  _ac="${_row%%:*}"; _aw="${_row#*:}"
+  _av="$(sed -n "s/^${_ac}=//p" "$GATE" | head -1)"
+  # A forward-declared row (the gate is not on this tree yet) is inert, not vacuous: it fires the day
+  # the constant lands, which is the whole point of declaring it early.
+  [ -n "$_av" ] || { _armseen="$_armseen $_aw(skipped:${_ac} undefined)"; continue; }
+  fix_argv
+  : > "$RO/logs/fix-7.log"; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
+  ( cd "$RREPO" && O="$RO" FIXTURE_GATE_RC="$_av" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 \
+      DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" \
+      PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+      bash "$_armdir/fix-one.sh" --argv "$RIG/argv7" ) >"$_armdir/arm-$_ac.out" 2>&1; _arc=$?
+  if grep -q "fixer NOT started ($_aw" "$RO/logs/fix-7.log" 2>/dev/null && [ "$_arc" = "$_av" ]; then rc=0; else rc=1; fi
+  _armgot="$(grep -o 'fixer NOT started ([^:)]*' "$RO/logs/fix-7.log" 2>/dev/null | head -1 | sed 's/.*(//')"
+  # On a red, the fixture's OWN output is quoted: a label that says only "no refusal line" hides
+  # whether the arm missed the classifier, the derivation, or the fixture.
+  _armwhy=""
+  [ "$rc" -eq 0 ] || _armwhy=" | fixer said: $(tail -2 "$_armdir/arm-$_ac.out" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
+  ck "fix-one.sh NAMES '$_aw' when the gate returns $_ac ($_av) and REPUBLISHES that code (read: '${_armgot:-<no refusal line>}', rc=$_arc)$_armwhy" $rc
+  _armseen="$_armseen $_aw"
+done
 
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,

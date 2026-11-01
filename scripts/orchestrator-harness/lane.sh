@@ -476,7 +476,7 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
   echo "[lane $N] ⚠️ NO merge-phase verdict (state/lanemerge-issue-$N.verdict absent) — the lane ended without either reaching merged or naming a blocker; merge-rate.sh will count it as PR_OPENED (or UNKNOWN if the log carries no status token), never as MERGED." >> "$O/logs/lane-$N.log"
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
-# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71)
+# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (83)
 # or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
@@ -527,7 +527,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
-    elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then _cap_gate=skew
+    elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then _cap_gate=skew
     elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
     else _cap_gate=load; fi
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
@@ -590,7 +590,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # already idle; the reading they need is the repo's open-PR count against its landing rate, which
     # is on the `[land-backlog] REFUSED` line in the same log.
     echo "[lane $N] NOT started: LAND-BACKLOG — the repo holds more open PRs than its own measured landing rate can absorb (#2409), so new creation is held. This is NOT a capacity refusal: the box is fine and waiting will not clear it. The work is the PR queue — review, rebase or land an open PR; a P0-blocker or a base-red repair is exempt by evidence. Issue returns to the pool." >> "$O/logs/lane-$N.log"
-  elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+  elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
     # ⛔ NAMED, AND NAMED AS NOT-A-BOX-FAULT (follow-up review of #2991, P2, measured). The refusal is a
     # VERSION SKEW between this caller and the deployed `cell-lane-preflight.sh`, or a corrupt copy of
     # it — the harness's own files, identical on every box. The capability arm below would send the

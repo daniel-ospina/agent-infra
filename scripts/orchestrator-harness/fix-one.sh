@@ -792,7 +792,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # no attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
   if [ "$ar" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
     why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
-  elif [ "$ar" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+  elif [ "$ar" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
     # ⛔ A HARNESS DEFECT, LIKE THE BRIEF ARM ABOVE, AND FOR THE SAME REASON (follow-up review of
     # #2991, P2): the fixer's caller and the deployed `cell-lane-preflight.sh` disagree (a usage/version
     # skew) or the copy is corrupt, so the probe measured nothing. The capability arm below would have
