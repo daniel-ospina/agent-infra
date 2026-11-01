@@ -4091,7 +4091,10 @@ export const REGISTRY_SYNC_SH = "~/.pi/agent/scripts/registry-sync.sh";
  *  fetched nothing. A remedy that cannot reach the record it names is worse than no
  *  remedy: the lane runs it, sees exit 0, and re-reviews anyway (fresh review P1). */
 export function registrySyncCommand(store?: string): string {
-  const repoFlag = store ? ` --repo ${JSON.stringify(store)}` : "";
+  // ⛔ SINGLE-QUOTED, NOT JSON-QUOTED (fresh review, P2): this text is a command an
+  // agent PASTES. JSON quoting leaves `$(…)` and backticks live inside double quotes,
+  // and `store` is an operator-supplied path ($AGENT_INFRA_PATH / cwd). `'…'` is inert.
+  const repoFlag = store ? ` --repo '${store.replace(/'/g, `'\\''`)}'` : "";
   const parts = [`${REGISTRY_SYNC_SH} pull${repoFlag}`];
   const checkoutCopy = extensionRelativeScript("registry-sync.sh");
   if (checkoutCopy) parts.push(`${checkoutCopy} pull${repoFlag}`);
@@ -4115,8 +4118,11 @@ function extensionRelativeScript(name: string): string | null {
  *  scripts point), PLUS the checkout the merge runs in — because `registry-sync.sh`'s
  *  refs live on ONE repo's remote per key, and a tortoise PR's record is on the
  *  tortoise remote, not agent-infra's (measured: agent-infra's store holds 3,668
- *  refs and none of them for a `daniel-ospina-tortoise-*` key). Probing one store
- *  would print a confident `absent` for a record that exists — the #2349 defect. */
+ *  refs, and tortoise-keyed records are pushed to the TORTOISE remote — measured
+ *  2026-11-01: 2,570 `refs/reviews/daniel-ospina-tortoise-*` on that remote, and
+ *  `daniel-ospina-tortoise-10483` in none of them, i.e. an unsynced record reads
+ *  `absent` here and must say so as a MEASURED absence). Probing one store would
+ *  print a confident `absent` for a record that exists — the #2349 defect class. */
 function registryStoreDirs(): string[] {
   const candidates: string[] = [];
   if (process.env.AGENT_INFRA_PATH) candidates.push(process.env.AGENT_INFRA_PATH);
@@ -4168,8 +4174,8 @@ export function crossBoxRecordState(repo: string | undefined, pr: number): Cross
   const whys: string[] = [];
   let scannedTotal = 0;
   let scannedAny = false;
-  // ONE budget for the whole probe, not per store: three candidates × a 6 s bound
-  // would put an 18 s synchronous block inside a tool call (fresh review, P2).
+  // ONE budget for the whole probe (8 s), not per store: three candidates × a 6 s
+  // bound would put an 18 s synchronous block inside a tool call (fresh review, P2).
   const deadline = now + 8000;
   for (const store of stores) {
     const remaining = Math.max(1000, deadline - Date.now());
@@ -4299,7 +4305,8 @@ export function describeRecordMiss(
       lines.push("       genuinely needed — dispatch it and record it at the head you are merging.");
     } else {
       lines.push("     → NEXT ACTION: whether another box holds it could not be read (see cross-box above), so");
-      lines.push(`       try the store first — ${registrySyncCommand()}`);
+      lines.push("       try the store first, naming the checkout whose origin holds refs/reviews/* — add --repo <store> to:");
+      lines.push(`       ${registrySyncCommand()}`);
       lines.push("       — and only then pay for a review here.");
     }
     lines.push("     → remedy (a): if the review ran elsewhere, copy its <owner>-<repo>-<pr>.json into the repo-keyed");
@@ -4342,7 +4349,10 @@ export function crossBoxLine(cb: CrossBoxRecordState): string {
     case "present":
       return `PRESENT at ${cb.ref} in ${cb.store} — the review ran on another box; fetch it, do not re-review`;
     case "absent":
-      return `ABSENT — the shared store (${cb.scanned} refs) holds no ref for this PR`;
+      // ⛔ NAME THE STORES THE NEGATIVE COVERS (fresh review, P2). A bare "the shared
+      // store" made a three-store read look like one, so a record sitting in a checkout
+      // this probe never considered read as a confident "a review HERE is genuinely needed".
+      return `ABSENT — ${cb.scanned} refs read from every candidate store [${cb.store}], none for this PR`;
     default:
       return `UNMEASURABLE (${cb.why}) — nothing is claimed about other boxes`;
   }

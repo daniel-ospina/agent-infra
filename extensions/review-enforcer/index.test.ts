@@ -10221,6 +10221,34 @@ test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed stor
     fs.rmSync(storeTmp, { recursive: true, force: true });
   }
 
+  // ── MIXED STORE RESULT (round-2 review P1, untested until now): ONE unreadable
+  // candidate must make the verdict `unmeasurable`, never `absent`. A store whose
+  // origin does not exist is a read failure, and a failure is never a negative fact.
+  const brokenTmp = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-broken-"));
+  const prevInfra2 = process.env.AGENT_INFRA_PATH;
+  try {
+    const broken = resolvePath(brokenTmp, "store");
+    execSync(`git init -q ${JSON.stringify(broken)}`, { stdio: "ignore" });
+    execSync(`git -C ${JSON.stringify(broken)} remote add origin ${JSON.stringify(resolvePath(brokenTmp, "nope.git"))}`, {
+      stdio: "ignore",
+    });
+    process.env.AGENT_INFRA_PATH = broken;
+    const mixed = crossBoxRecordState("owner/repo", PR_2349 + 7777);
+    equal(
+      mixed.kind,
+      "unmeasurable",
+      `a partially-read store set is UNMEASURABLE, not absent: ${JSON.stringify(mixed)}`
+    );
+    ok(
+      mixed.kind === "unmeasurable" && mixed.why.includes("store(s)"),
+      "and it names how many stores it did read"
+    );
+  } finally {
+    if (prevInfra2 === undefined) delete process.env.AGENT_INFRA_PATH;
+    else process.env.AGENT_INFRA_PATH = prevInfra2;
+    fs.rmSync(brokenTmp, { recursive: true, force: true });
+  }
+
   const messaging = observeReviewRecord(PR_2349, "owner/repo");
   equal(messaging.crossBox.kind, "unmeasurable", "the default observation never probes (hermetic, no network)");
   ok(
