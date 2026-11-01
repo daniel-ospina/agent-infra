@@ -6,11 +6,17 @@
 # in place (content-merge), so repo updates flow to the live install and local
 # extras survive. Never deletes anything outside ~/.pi/agent.
 #
-# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly two things: a legacy $DEST/tools/fleet/
-# (#1277, a pi boot-blocker) and the farm artifacts DECLARED in
+# ⚠️ It DOES delete, INSIDE ~/.pi/agent, exactly three things: a legacy $DEST/tools/fleet/
+# (#1277, a pi boot-blocker), the farm artifacts DECLARED in
 # pi-bootstrap/farm-retired.txt (#1924 — a retired script must stop existing on the
-# machines, not just stop being delivered). Nothing else is ever removed; a local extra
-# that is not declared retired is kept.
+# machines, not just stop being delivered), and the `exa` server entry in
+# $DEST/.mcp.json (owner ruling 2026-10-31, reversing #419: the merge is
+# `{**dst, **src}`, so dropping `exa` from the template alone would leave every
+# already-provisioned machine loading it). Nothing else is ever removed; a local extra
+# that is not declared retired is kept — `exa` is removed because it was a BASE server
+# being retired, not a local extra. NOTE the pop keys on the NAME only: a machine whose
+# `.mcp.json` carries a hand-rolled server the operator happened to name `exa` will be
+# de-configured too, which is why it is listed here rather than happening quietly.
 # ============================================================
 set -euo pipefail
 
@@ -88,6 +94,18 @@ src = json.load(open(sys.argv[1]))
 dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
 src_servers = src.get("mcpServers", {})
 dst_servers = dst.get("mcpServers", {})
+# ⛔ THE ONE DELIBERATE EXCEPTION TO "local extras preserved" (#419 reversed by the
+# owner, 2026-10-31: "exa should be uninstalled because I never wanted it. external
+# research should be perplexity"). `exa` is NOT a local extra to carry forward — it
+# was a BASE server, and the merge below is `{**dst_servers, **src_servers}`, which
+# preserves any key that already exists in dst. So dropping it from the TEMPLATE
+# alone would leave every ALREADY-PROVISIONED machine still loading it: the new
+# template wins on the keys it still has, and exa is not one of them, so dst's copy
+# is what survives. That is the opposite of what the operator expects from a
+# bring-up, and it is invisible (the merge prints "local extras preserved" either
+# way). This pop IS the migration.
+if dst_servers.pop("exa", None) is not None:
+    print("    exa removed from .mcp.json (owner ruling 2026-10-31 — uninstalled, not configured)")
 merged = {**dst, **src, "mcpServers": {**dst_servers, **src_servers}}
 json.dump(merged, open(sys.argv[2], "w"), indent=2)
 print("    .mcp.json merged (base servers win; local extras preserved)")
@@ -553,7 +571,7 @@ fi
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -1031,14 +1049,21 @@ fi
 #
 # So the deploy ends by GRADING ITS OWN RESULT: `check-farm-drift.sh` compares every deployed file
 # against the source at the ref and prints `file | deployed sha | source sha | verdict`.
-#   rc=1 (a named file differs)        → FATAL. The farm did not converge, and a stale script would
-#                                        be executed. A failed install is louder than a silent
-#                                        no-op fleet.
+#   rc=1 (a farm-DECLARED file differs, or a declared file never landed) → FATAL. The farm owes these
+#                                        and did not converge them, and a stale script would be
+#                                        executed. A failed install is louder than a silent no-op
+#                                        fleet.
 #   rc=2 (cannot compare / not the pin) → LOUD WARNING naming both shas, and the install continues:
 #                                        a fresh box legitimately has no pin record yet, and aborting
 #                                        there would fail every first-time install for a reason that
 #                                        is not a defect. The line prints on every run until it is
 #                                        resolved, which is what makes it observable.
+#   rc=3 (drift NO FARM ARRAY DELIVERS — an UNSOURCED file, or a STALE file outside the declaration)
+#                                      → LOUD WARNING and the install continues. This arm exists
+#                                        because rc=1 was fatal for them too and a deploy cannot fix
+#                                        either: measured 2026-10-31, ONE such file → rc=1 → exit 1,
+#                                        and a second full run left it stale, so the printed remedy
+#                                        could never clear it. Fatal only over what the farm owes.
 if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
   echo ""
   echo "==> Farm drift (deployed vs shipped)"
@@ -1064,7 +1089,7 @@ if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
        printf '%s\n' "$_farm_msg" | sed 's/^/      /'
        echo "    Refusing to report a successful install over a farm that launchd would execute as stale code."
        exit 1 ;;
-    3) echo "    ⚠️  farm: UNSOURCED file(s) — on the box, in no repo file (this is NOT drift, and NOT a pass):"
+    3) echo "    ⚠️  farm: files a DEPLOY CANNOT FIX (exit 3) — this is NOT a pass:"
        printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
     *) echo "    ⚠️  farm: COULD NOT VERIFY (exit $_farm_rc) — this is NOT a pass:"
        printf '%s\n' "$_farm_msg" | sed 's/^/      /' ;;
