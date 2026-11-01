@@ -36,6 +36,10 @@ MAX=${MAX:-2}
 # measured 2026-11-01 the box carried 15 rails against max=8, because pr-doctor and the repair lanes
 # start rails without consulting this counter at all. The real governor is measured load at dispatch time.
 MAX_TOTAL=${MAX_TOTAL:-$(( MAX * 2 ))}
+# The repos this actuator drives. `rails_*` below take the SHORT name (`tortoise`), which is what a
+# rail's `--repo daniel-ospina/tortoise` and its script path both reduce to; deriving the short names
+# from this one list is what keeps the two in step.
+REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
 INTERVAL=${INTERVAL:-180}
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
@@ -118,6 +122,8 @@ say() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 rails_live_total() { ps -eo args= | grep -c "[a]dmin-merge.sh "; }
 rails_on()         { ps -eo args= | grep "[a]dmin-merge.sh " | grep -c -e "--repo [^ ]*/$1\( \|$\)" -e "/$1/"; }
 rails_unknown()    { ps -eo args= | grep "[a]dmin-merge.sh " | grep -c -v -e "--repo " -e "/$1/" -e "/$2/"; }
+# `rails_unknown` must be given the same SHORT names its sibling takes: a full `daniel-ospina/…` slug
+# matches no script path, and the unknown bucket then reads 1 for a rail that IS attributed.
 # Keep the TCC-free rail clone current BEFORE using it. A failed refresh is LOUD but not fatal: the
 # previous HEAD then runs, which is strictly better than not merging, and the log says which happened.
 if [ -d "$RAIL_HUB/.git" ]; then
@@ -134,7 +140,7 @@ fi
 say "auto-rail started max=$MAX interval=${INTERVAL}s rail=$RAIL_SCRIPT"
 
 while :; do
-  for repo in daniel-ospina/tortoise daniel-ospina/agent-infra; do
+  for repo in $REPOS; do
     python3 - "$repo" "${RED_CAP:-2}" <<'PY' > /tmp/auto-rail-cand.$$
 import json,subprocess,sys
 repo=sys.argv[1]
@@ -199,7 +205,7 @@ PY
     # bad day. One line per repo per pass makes the answer readable.
     # The counts are PER REPO (that is the fix) and `unattributed` is printed rather than dropped: a
     # rail nobody can attribute is unknown load, and a report that omits it reads as "none".
-    say "$repo pass: candidates=$(wc -l < /tmp/auto-rail-cand.$$) cand_bytes=$(wc -c < /tmp/auto-rail-cand.$$ 2>/dev/null || echo MISSING) rails_on_repo=$(rails_on "${repo##*/}") rails_live=$(rails_live_total) unattributed=$(rails_unknown daniel-ospina/tortoise daniel-ospina/agent-infra) max=$MAX max_total=$MAX_TOTAL"
+    say "$repo pass: candidates=$(wc -l < /tmp/auto-rail-cand.$$) cand_bytes=$(wc -c < /tmp/auto-rail-cand.$$ 2>/dev/null || echo MISSING) rails_on_repo=$(rails_on "${repo##*/}") rails_live=$(rails_live_total) unattributed=$(rails_unknown ${REPOS//daniel-ospina\//}) max=$MAX max_total=$MAX_TOTAL"
     while read -r pr; do
       [ -z "${pr:-}" ] && continue
       case "$DENY" in *" $pr "*) say "$repo #$pr DENIED — duplicate-pair member or contradictory PR pending a decision"; continue;; esac
