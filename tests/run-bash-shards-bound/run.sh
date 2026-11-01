@@ -210,13 +210,19 @@ fi
 MUTFIX="$TMP/mutf"
 stage_fixture "$MUTFIX" 30
 # ⛔ EVERY group-kill form is neutralised, or the fixture is "fixed" by whichever one is left and the
-# control proves nothing (measured twice: first when the parent-side escalation was added, then when it
-# moved into `shard_kill_group`): the WATCHDOG's (`-"$shard_bg_pid"`), and the shared helper itself
-# (gutted wholesale, body and all). What remains is a wrapper-only kill — the implementation #3187
+# control proves nothing (measured three times: when the parent-side escalation was added, when it
+# moved into `shard_kill_group`, and when the watchdog's kill was restructured into an `if` — that last
+# one silently stopped matching its `^  kill -…` pattern, leaving the watchdog's group kill intact, so
+# the control went red and said so). What remains is a wrapper-only kill — the implementation #3187
 # exists to replace.
+# ⛔ AND THE MUTANT MUST NOT ITSELF BE DANGEROUS: it is a bare TERM *only*, with the KILL line deleted.
+# Rendering the group KILL as a BARE `kill -KILL` would reproduce, in the control, the exact construct
+# this change removes — an uncatchable signal sent 1 s after the wrapper answered TERM and the driver
+# reaped it, i.e. at a FREED pid that the kernel may already have handed to another process on this
+# host. A control may be wrong; it must not be able to kill a stranger.
 awk '
-  /^  kill -TERM -"\$shard_bg_pid"/ { print "  kill -TERM \"$shard_bg_pid\" 2>/dev/null"; next }
-  /^  kill -KILL -"\$shard_bg_pid"/ { print "  kill -KILL \"$shard_bg_pid\" 2>/dev/null"; next }
+  /^[[:space:]]*if kill -TERM -"\$shard_bg_pid"/ { print "  if kill -TERM \"$shard_bg_pid\" 2>/dev/null; then"; next }
+  /^[[:space:]]*kill -KILL -"\$shard_bg_pid"/ { print "    :   # wrapper-only mutation: the group KILL is removed"; next }
   /^shard_kill_group\(\) \{$/ { print "shard_kill_group() { :; }"; skip = 1; next }
   skip && /^}$/ { skip = 0; next }
   skip { next }
@@ -444,10 +450,20 @@ if [ -n "$KILL_MISSING" ]; then
   fail "the shard never started (no pid for:$KILL_MISSING) — this arm proves nothing"
 elif [ -n "$KILL_ORPHANS" ]; then
   fail "the shard SURVIVED its driver being killed:$KILL_ORPHANS (it is in its own process group now, so the driver must forward the signal)"
-elif [ "$DRV_RC" -eq 143 ]; then
-  pass "killing the driver TERMs the shard's group and the shard dies with it (driver rc 143)"
 else
-  fail "the driver exited rc $DRV_RC (want 143 — its TERM trap) and left no shard behind"
+  # ⛔ BOTH CONTRACTS IN ONE ASSERTION (#3187 teardown + #3174 recap). The driver's exit code here is
+  # 1, NOT 143: `shard_driver_signal` composes main's #3174 partial recap, which exits 1 so a
+  # TRUNCATED run can never read GREEN or be used as a baseline. Pinning 143 alone would have
+  # celebrated a head where the recap had silently replaced the teardown.
+  if [ "$DRV_RC" -eq 143 ]; then
+    fail "the driver exited 143 — its #3187 teardown ran but the #3174 INCOMPLETE recap did not (a truncated run must exit 1 and name itself)"
+  elif [ "$DRV_RC" -ne 1 ]; then
+    fail "the driver exited rc $DRV_RC (want 1 = TERM'd run is UNPROVEN, #3174) and left no shard behind"
+  elif ! grep -q '⚠️ RECAP INCOMPLETE' "$TMP/killdriver.out"; then
+    fail "the driver died from TERM without printing '⚠️ RECAP INCOMPLETE' — a truncated run would read as a complete one"
+  else
+    pass "killing the driver TERMs the shard's group AND prints the INCOMPLETE recap (rc 1, #3187 + #3174)"
+  fi
 fi
 
 # 6b. AND A SHARD THAT IGNORES TERM MUST STILL DIE (review cycle 2, P2, measured). A TERM-only
@@ -486,9 +502,11 @@ if [ ! -f "$TMP/pids-deafkill/deaf.pid" ]; then
 elif [ "$DEAF_SURVIVED" -ne 0 ]; then
   fail "a TERM-DEAF shard outlived a cancelled driver — the forward must escalate to KILL, not stop at TERM"
 elif [ "$DEAF_RC" -eq 143 ]; then
-  pass "a TERM-deaf shard is KILLed after a cancelled driver (driver rc 143)"
+  fail "the driver exited 143 — its teardown ran but the #3174 INCOMPLETE recap was replaced/absent"
+elif [ "$DEAF_RC" -ne 1 ]; then
+  fail "the driver exited rc $DEAF_RC (want 1, #3174) and left no term-deaf shard behind"
 else
-  fail "the driver exited rc $DEAF_RC (want 143) and left no term-deaf shard behind"
+  pass "a TERM-deaf shard is KILLed after a cancelled driver (rc 1 + INCOMPLETE recap)"
 fi
 
 # 6c. THE DRIVER AS A PROCESS-GROUP LEADER (review cycle 2, P1, measured). `BASHPID` is bash 4+; a
@@ -537,18 +555,26 @@ else
   fail "with no usable 'ps' the bound was disarmed (rc $NOPS_RC, $((T1 - T0))s): $(printf '%s' "$NOUT" | tail -2 | tr '\n' '|')"
 fi
 
-# 6e. INT AND HUP ARE FORWARDED TOO (review cycle 4, P2, measured). With `set -m` the shard lives in its
+# 6e. INT AND HUP ARE FORWARDED TOO (review cycle 4, P2). With `set -m` the shard lives in its
 # own group, so a terminal INT reaches ONLY the driver — the INT trap is the single thing that kills a
-# shard on a Ctrl-C, and deleting that one trap line left the shard's wrapper AND child alive while the
-# suite stayed green. Arm 6's TERM case cannot stand in for it: it exercises a different trap.
+# shard on a Ctrl-C.
+# ⛔ JOB CONTROL IS LOAD-BEARING FOR THE *TEST*, NOT JUST THE RUNNER (review cycle 6, P2, measured).
+# A non-interactive shell starts its background jobs with SIGINT (and SIGQUIT) IGNORED at the OS
+# level, and POSIX forbids trapping a signal inherited as ignored — so `… &` from a plain script
+# produces a driver whose INT trap CAN NEVER RUN. Written that way this arm passed while testing
+# nothing: it measured rc 0 after the FULL 60 s hang with no recap at all, the shard being gone only
+# because the run had COMPLETED. `set -m` around the launch restores job control, which un-ignores
+# INT, and the trap then really fires (verified: rc 130 and the trap's own output on a 0 s fixture).
 # A helper would put `bash "$1"` in the source (a shape `extensions/main-worktree-guard` refuses), so
 # the two signals are spelled out — and so are their two FIXTURE PATHS: a `bash "$TMP/sig-$_sig/…"`
 # inside a loop makes the script path unresolvable to that guard's static analysis, which then refuses
 # EVERY gated command that names this file (measured; the loop form was replaced for exactly that).
 SIGFIX_INT="$TMP/sig-int"
 stage_fixture "$SIGFIX_INT" 60
+set -m
 HANG_PID_DIR="$TMP/pids-sig-int" SHARD_BOUND=1800 bash "$SIGFIX_INT/scripts/runner.sh" >"$TMP/sig-int.out" 2>&1 &
 SIGINT_DRV=$!
+set +m
 _n=0
 while [ "$_n" -lt 100 ]; do
   [ -s "$TMP/pids-sig-int/self.pid" ] && break
@@ -557,6 +583,7 @@ while [ "$_n" -lt 100 ]; do
 done
 kill -INT "$SIGINT_DRV" 2>/dev/null
 wait "$SIGINT_DRV" 2>/dev/null
+SIGINT_RC=$?
 SIGINT_SURVIVORS=""
 for _f in self.pid child.pid; do
   [ -f "$TMP/pids-sig-int/$_f" ] || continue
@@ -571,8 +598,10 @@ if [ ! -f "$TMP/pids-sig-int/self.pid" ]; then
   fail "the INT fixture never started — this arm proves nothing"
 elif [ -n "$SIGINT_SURVIVORS" ]; then
   fail "an INT to the driver left the shard alive:$SIGINT_SURVIVORS (the shard is in its own group now, so the INT trap is the only thing that reaches it)"
+elif [ "$SIGINT_RC" -ne 1 ] || ! grep -q '⚠️ RECAP INCOMPLETE' "$TMP/sig-int.out"; then
+  fail "the INT trap did not run: rc $SIGINT_RC (want 1, #3174) and $(grep -c '⚠️ RECAP INCOMPLETE' "$TMP/sig-int.out") INCOMPLETE line(s) — an INT that reaches nothing is the Ctrl-C leak this arm exists for"
 else
-  pass "an INT to the driver takes the shard and its child with it"
+  pass "an INT to the driver takes the shard and its child with it (rc 1 + INCOMPLETE recap)"
 fi
 SIGFIX_HUP="$TMP/sig-hup"
 stage_fixture "$SIGFIX_HUP" 60
@@ -627,6 +656,83 @@ elif kill -0 "$KR_PID" 2>/dev/null; then
   kill -KILL "$KR_PID" 2>/dev/null
 else
   pass "a SIGKILLed driver's SHARD still dies at the bound (the orphaned watchdog fires) — the residual is bounded, not silent"
+fi
+
+# 6g. THE WATCHDOG'S BARE-PID FALLBACK IS OWNERSHIP-GUARDED (review cycle 6, P2).
+# The no-group fallback is the one place in this file that names a BARE pid, and it does so a full
+# second after the driver may have reaped the shard — an uncatchable `SIGKILL` aimed at a freed pid,
+# i.e. possibly at another lane or the runner agent itself. It is only safe because it re-verifies
+# ownership first, and NOTHING PINNED THAT: the arm that neutralised the kill neutralised both forms
+# together, so ungUarding it would have gone unnoticed. This is a SOURCE INVARIANT arm (the shape of
+# the file, not a runtime behaviour) — the no-group case cannot be staged hermetically on a host whose
+# `set -m` works — and it carries a mutation control so it cannot pass vacuously.
+# ⛔ IT ALSO PINS `$$`, NOT `$PPID`: the guard runs inside the watchdog's forked subshell, where bash
+# leaves `$$` as the DRIVER's pid but `$PPID` as the driver's PARENT, so a `$PPID` comparison would be
+# false on every host and the guard would silently never fire.
+guard_invariant() {
+  local _bad
+  # every bare-pid KILL of the shard must sit on the guarded line
+  _bad="$(grep -n 'kill -KILL "\$shard_bg_pid"' "$1" | grep -v 'shard_pid_is_mine')" || true
+  [ -z "$_bad" ] || return 1
+  # …and that guard must exist, compare against the driver's pid, and query the parent
+  grep -q 'shard_pid_is_mine "\$shard_bg_pid" && kill -KILL "\$shard_bg_pid"' "$1" || return 1
+  grep -q '\[ "\$_w" = "\$\$" \]' "$1" || return 1
+  grep -q 'ps -o ppid= -p' "$1" || return 1
+  return 0
+}
+GUARDMUT="$TMP/guardmut-runner.sh"
+sed 's|shard_pid_is_mine "\$shard_bg_pid" && ||' "$RUNNER" >"$GUARDMUT" 2>/dev/null
+if ! guard_invariant "$RUNNER"; then
+  fail "the watchdog's bare-pid SIGKILL is NOT ownership-guarded (or guards against \$PPID instead of \$\$) — it can kill a recycled pid"
+elif cmp -s "$RUNNER" "$GUARDMUT"; then
+  fail "the guard mutation did not change the runner — the invariant check has no control"
+elif guard_invariant "$GUARDMUT"; then
+  fail "the guard-invariant check did not notice an UNGUARDED bare-pid KILL — the assertion above has no control"
+else
+  pass "the one bare-pid SIGKILL is ownership-guarded (ppid == \$\$, non-zombie), and the check reds when unguarded"
+fi
+
+# 2d. A SHARD'S TEARDOWN MUST NOT WIPE THE DRIVER'S OWN BOOKKEEPING (review cycle 6, P1, measured).
+# `shard_watchdog` runs in a forked subshell, and bash runs an inherited EXIT trap inside forked
+# children of the driver — measured, the trapping shell IS the watchdog — so an EXIT-trap `rm` of the
+# ran/skip/timeout logs DELETED them after every shard. The failure is not a crash but a LIE: the
+# slice-coverage self-check then reads a log holding only the LAST shard and reports
+# `slice N/M executed a DIFFERENT SET of shards than its index derives`. Measured **11 of 20** sliced
+# runs — a flaky FALSE RED on exactly the sliced callers CI uses (`ci.yml`'s bash-suites matrix) — and
+# a deleted timeout marker would make a real bound-hit unattributable. This arm is the regression pin:
+# 3 shards, a slice that must see all 3, and a control that re-installs the destructive trap.
+SLICEFIX="$TMP/sliceclean"
+stage_fixture "$SLICEFIX" 0
+for _s in before hang after; do :; done
+SLICE_RC=0
+HANG_PID_DIR="$TMP/pids-sliceclean" SHARD_BOUND=1800 BASH_SHARD_SLICE=1/1 bash "$SLICEFIX/scripts/runner.sh" >"$TMP/sliceclean.out" 2>&1 || SLICE_RC=$?
+# 3 shards ran, so the log the coverage check compares must hold all 3
+SLICE_ROWS="$(grep -c '  ▸' "$TMP/sliceclean.out")"
+SLICEMUT="$TMP/sliceclean-mutant.sh"
+awk '
+  /^shard_cleanup\(\) \{ rm -f/ { print "trap \047rm -f \"$shard_ran_log\" \"$shard_skip_log\" \"$shard_timeout_marker\"\047 EXIT"; print; next }
+  { print }
+' "$SLICEFIX/scripts/runner.sh" >"$SLICEMUT"
+if [ "$SLICE_RC" -ne 0 ]; then
+  fail "a 3-shard SLICED run failed (rc $SLICE_RC) — the driver's own bookkeeping did not survive its shard teardowns: $(grep -E 'DIFFERENT SET|sort: cannot read' "$TMP/sliceclean.out" | head -2 | tr '\n' ' ')"
+elif [ "$SLICE_ROWS" -ne 3 ]; then
+  fail "a 3-shard sliced run printed $SLICE_ROWS timing row(s), not 3 — this arm proves nothing"
+elif cmp -s "$SLICEFIX/scripts/runner.sh" "$SLICEMUT"; then
+  fail "the EXIT-trap mutation did not change the runner — the 'no wipe' assertion has no control"
+else
+  # the control: re-install the destructive EXIT trap. It must make the same sliced run red.
+  cp "$SLICEMUT" "$SLICEFIX/scripts/runner.sh"
+  MUT_RC=0
+  MUT_BAD=0
+  for _i in 1 2 3 4 5 6; do
+    HANG_PID_DIR="$TMP/pids-slicemut" SHARD_BOUND=1800 BASH_SHARD_SLICE=1/1 bash "$SLICEFIX/scripts/runner.sh" >/dev/null 2>&1 || MUT_BAD=$((MUT_BAD + 1))
+  done
+  MUT_RC=$MUT_BAD
+  if [ "$MUT_RC" -ge 1 ]; then
+    pass "a shard teardown does NOT wipe the driver's ran/skip/timeout logs, and re-arming the EXIT trap reds the same sliced run ($MUT_RC of 6)"
+  else
+    fail "the EXIT-trap control did not red the sliced run in 6 attempts — the assertion above cannot see the wipe it guards"
+  fi
 fi
 
 echo ""

@@ -143,6 +143,28 @@
 
 set -uo pipefail
 
+# ── CLEANUP IS EXPLICIT, NOT AN EXIT TRAP — A MEASURED DECISION, NOT A STYLE CHOICE ───────────────
+# `shard_watchdog` runs in a FORKED subshell, and bash executes an inherited EXIT trap inside forked
+# children of the driver. Measured: the trapping shell IS the watchdog (`BASHPID` == the
+# `shard_wd_pid` the parent stored), so every per-shard teardown DELETED the driver's ran/skip/timeout
+# logs mid-run. The symptom was not a crash but a LIE: the slice-coverage self-check then read a log
+# holding only the LAST shard and reported `slice N/M executed a DIFFERENT SET of shards than its
+# index derives` — measured **11 of 20** sliced runs, i.e. a flaky FALSE RED on exactly the sliced
+# callers CI uses (`ci.yml`'s bash-suites matrix) — and a deleted timeout marker would make a real
+# bound-hit unattributable too.
+# THREE fixes were tried and all were MEASURED wrong: `trap - EXIT` as the watchdog's first line (the
+# trap still fired), a `shard_logs_owned` flag cleared in the child (the trap fires in a shell that
+# never runs that line), and `BASH_SUBSHELL`-gated cleanup (the trap also fires with BASH_SUBSHELL=0
+# in that shell). Wrapping the launch in `{ … } &`, in `( … ) &`, and replacing the watchdog's
+# `exit 0` with `return 0` were each tried too. What IS proven: with the trap's `rm` disabled, 20 of
+# 20 sliced runs pass; with any guard in place, 7-14 of 20 fail. So cleanup does not live in a trap.
+# Every driver exit goes through `shard_exit`, and `shard_driver_signal` calls `shard_cleanup` itself.
+# ⚠️ STATED RESIDUAL: a driver killed without running an exit path (`kill -9`, OOM) leaves the three
+# temp files in $TMPDIR. They are three small empty files and such a run has no recap to corrupt;
+# the alternative was corrupting the bookkeeping of runs that DID finish.
+shard_cleanup() { rm -f "${shard_ran_log:-}" "${shard_skip_log:-}" "${shard_timeout_marker:-}"; }
+shard_exit() { shard_cleanup; exit "${1:-0}"; }
+
 # ── the checkout this script BELONGS to ───────────────────────────────────────────────────────
 # Discovery reads the TREE, so the globs must resolve from the checkout the script lives in, not
 # from the caller's cwd. Two reasons, both measured in review (agent-infra#2609): the pre-change
@@ -153,7 +175,7 @@ set -uo pipefail
 # (`pwd -P` below) anchored to the same root.
 SHARD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || {
   echo "❌ cannot resolve the directory this script lives in — refusing to derive a list from an unknown tree" >&2
-  exit 2
+  shard_exit 2
 }
 # In the repo the driver lives at <root>/scripts/…, so the root is one level up. A fixture that
 # copies it to <root>/… is the root itself — both layouts are stated here rather than guessed, so a
@@ -163,7 +185,7 @@ if [ "$(basename "$SHARD_ROOT")" = "scripts" ]; then
 fi
 cd "$SHARD_ROOT" || {
   echo "❌ cannot enter $SHARD_ROOT — refusing to derive a list from a tree it cannot read" >&2
-  exit 2
+  shard_exit 2
 }
 
 # The syntax-sweep targets. A DATA list, not two literal `for f in …` lines: `--list-sweeps` prints
@@ -240,10 +262,10 @@ if [ "${1:-}" = "--list" ]; then
   shard_list_out="$(shard_list)" || exit 2
   if [ -z "$shard_list_out" ]; then
     echo "❌ the derived shard list is EMPTY — refusing to print an empty list as if it were the list (cwd $(pwd -P)): do the discovery globs match this tree?" >&2
-    exit 2
+    shard_exit 2
   fi
   printf '%s\n' "$shard_list_out"
-  exit 0
+  shard_exit 0
 fi
 
 if [ "${1:-}" = "--list-sweeps" ]; then
@@ -252,7 +274,7 @@ if [ "${1:-}" = "--list-sweeps" ]; then
   # `check-ci-lane-parity`’s §6 fixture reported "the lane’s own sweep list is unreadable" instead of
   # the no-sweeps floor it was measuring. The same idiom guards SUITE_GLOBS above.
   printf '%s\n' ${SWEEP_GLOBS[@]+"${SWEEP_GLOBS[@]}"}
-  exit 0
+  shard_exit 0
 fi
 
 # ⛔ THE PLACEMENT GUARD (agent-infra#3011) RUNS BEFORE ANY WORK, not merely before the shard loop.
@@ -272,7 +294,7 @@ fi
 # refuses rather than running the whole population unguarded.
 command -v fixture_guard_placement >/dev/null 2>&1 || {
   echo "❌ cannot load scripts/orchestrator-harness/fixture-hermetic.sh — refusing to run shards with the #3011 placement guard inert" >&2
-  exit 2
+  shard_exit 2
 }
 fixture_guard_placement "run-bash-shards.sh"
 
@@ -323,13 +345,13 @@ shard_slowest=""
 # begin.
 shard_paths="$(shard_list)" || {
   echo "❌ the shard list could not be derived — refusing to run a partial list (see the error above)"
-  exit 2
+  shard_exit 2
 }
 listed=0
 [ -z "$shard_paths" ] || listed="$(awk 'NF { n++ } END { print n + 0 }' <<<"$shard_paths")"
 if [ "$listed" -lt 1 ]; then
   echo "❌ the derived shard list is EMPTY — refusing to report success over a run that executes no suite"
-  exit 2
+  shard_exit 2
 fi
 
 # ── slice selection — see SLICING in the header ────────────────────────────────────────────────
@@ -382,7 +404,7 @@ if [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ]; then
   # spelling, i.e. a false block (category B). Only a POSITIVE budget composes badly with a slice.
   if [ "$shard_budget" -gt 0 ] && [ -n "${BASH_SHARD_SLICE:-}" ]; then
     echo "❌ BASH_SHARDS_BUDGET_SECS=$shard_budget cannot be combined with BASH_SHARD_SLICE — this process only accumulates the shards its own slice ran, so a whole-list budget would be ~N times too lenient. Set one or the other."
-    exit 2
+    shard_exit 2
   fi
 fi
 if [ -n "${BASH_SHARD_SLICE:-}" ]; then
@@ -461,24 +483,65 @@ shard_timeout_marker="${shard_ran_log}.timeout"
 : > "$shard_ran_log" 2>/dev/null || true
 : > "$shard_skip_log" 2>/dev/null || true
 : > "$shard_timeout_marker" 2>/dev/null || true
-trap 'rm -f "$shard_ran_log" "$shard_skip_log" "$shard_timeout_marker"' EXIT
+# ⛔ THE CLEANUP RUNS IN THE DRIVER ONLY, AND THE TEST IS `BASH_SUBSHELL` — a VARIABLE FLAG CANNOT DO
+# IT. `shard_watchdog` is a forked subshell, and bash runs this EXIT trap INSIDE forked children of the
+# driver (measured: the trapping shell reports `BASH_SUBSHELL=1`, and `FUNCNAME=[shard_run_bounded
+# run_shard main]` — it forks around the `shard_watchdog … &` job and never enters that function). So
+# every per-shard teardown DELETED the driver's ran/skip/timeout logs mid-run. The symptom was not a
+# crash but a LIE: the slice-coverage self-check then read a log holding only the LAST shard and
+# reported `slice N/M executed a DIFFERENT SET of shards than its index derives` — measured **11 of 20**
+# sliced runs, i.e. a flaky FALSE RED on exactly the sliced callers CI uses (`ci.yml`'s bash-suites
+# matrix) — and a deleted timeout marker would make a real bound-hit unattributable too.
+# Both wrong fixes were tried and MEASURED: `trap - EXIT` at the top of the watchdog does not suppress
+# it, and a `shard_logs_owned` flag cleared in the child does not either — the trapping shell is forked
+# BEFORE the function body runs, so it never executes the clear. `BASH_SUBSHELL` (bash 3.0+, so it is
+# present on the 3.2 the repo supports — unlike `BASHPID`) is the property that actually distinguishes
+# them: 0 in the driver, ≥1 in every forked child. Pinned by arm 2d of `tests/run-bash-shards-bound`.
+# ── CLEANUP IS EXPLICIT, NOT AN EXIT TRAP — AND THAT IS A MEASURED DECISION, NOT A STYLE CHOICE ────
+# `shard_watchdog` runs in a FORKED subshell, and bash executes an inherited EXIT trap inside forked
+# children of the driver. Measured: the trapping shell is the watchdog itself (`BASHPID` == the
+# `shard_wd_pid` the parent stored), so EVERY per-shard teardown DELETED the driver's ran/skip/timeout
+# logs mid-run. The symptom was not a crash but a LIE: the slice-coverage self-check then read a log
+# holding only the LAST shard and reported `slice N/M executed a DIFFERENT SET of shards than its
+# index derives` — measured **11 of 20** sliced runs, i.e. a flaky FALSE RED on exactly the sliced
+# callers CI uses (`ci.yml`'s bash-suites matrix) — and a deleted timeout marker would make a real
+# bound-hit unattributable too.
+# THREE fixes were tried and all three were MEASURED wrong: `trap - EXIT` at the top of the watchdog
+# (trap still fired), a `shard_logs_owned` flag cleared in the child (the trap fires in a shell that
+# never runs that line), and `BASH_SUBSHELL`-gated cleanup (the trap ALSO fires with BASH_SUBSHELL=0
+# in that shell). Wrapping the launch, `{ … } &`, and replacing the watchdog's `exit 0` with `return 0`
+# were each tried too. What IS proven: with the trap's `rm` disabled, 20 of 20 sliced runs pass; with
+# any of the guards, 7-14 of 20 fail. So cleanup does not live in a trap. `shard_cleanup` is called by
+# `shard_exit`, which every driver exit below goes through, and by `shard_driver_signal`.
+# ⚠️ STATED RESIDUAL: a shell that forked BEFORE those calls (a crash, `kill -9` of the driver) leaves
+# the three temp files in $TMPDIR. They are three small empty files; a killed run has nothing to
+# report anyway, and the alternative was corrupting the bookkeeping of runs that DID finish.
+# (`shard_cleanup`/`shard_exit` are defined near the top — the driver's early refusals
+# below use them, so they must exist before any of it runs.)
 
-# ── A SHARD MUST DIE WITH ITS DRIVER (#3187 review, P2) ────────────────────────────────────────────
+# ── ONE HANDLER FOR EVERY CANCEL: kill the shard, then say what the run could not prove ───────────
 # `set -m` (see `shard_run_bounded`) gives the RUNNING shard its own process group, so a GROUP kill of
-# this driver — a cancelled CI step, a harness group kill, Ctrl-C — no longer reaches it. Before this
-# change the shard inherited the driver's process group and died with it, so this is a regression the
-# bound itself introduces and must close: without these traps a cancelled step leaves a shard writing
-# into a workspace the runner already considers finished, for up to `SHARD_BOUND` (UNBOUNDED when the
-# bound is disabled). The live shard's group and the live watchdog take the TERM; then the driver
-# exits as the signal says, and its EXIT trap still runs.
+# this driver — a cancelled CI step, a harness group kill, Ctrl-C — no longer reaches it. Before #3187
+# the shard inherited the driver's process group and died with it, so this is a regression the bound
+# itself introduces and must close: without these traps a cancelled step leaves a shard writing into a
+# workspace the runner already considers finished, for up to `SHARD_BOUND` (UNBOUNDED when the bound
+# is disabled). The live shard's group and the live watchdog take the TERM; then the EXIT trap runs.
+#
+# ⛔ THERE IS EXACTLY ONE TRAP PER SIGNAL IN THIS FILE, AND THIS IS IT. A second `trap … TERM` further
+# down would SILENTLY REPLACE this one (bash keeps the last assignment), and that is not hypothetical:
+# #3174's partial recap installs its own TERM/INT traps, and a mechanical rebase onto it left BOTH
+# sets in place — the recap won, so a cancelled step printed a fine INCOMPLETE recap and left the
+# shard running, because nothing killed its group any more. Measured: 2 of this suite's 35 assertions
+# red (arms 6 and 6b) with the shard and its child alive after the driver was TERMed. So the two
+# contracts are COMPOSED here instead of stacked: teardown first (#3187), then the recap (#3174).
 shard_bg_pid=""
 shard_wd_pid=""
-# The traps FORWARD the signal and then leave; the shard's group gets the same TERM→KILL escalation
-# the bound uses (review cycle 2, P2, measured). TERM alone left a `trap '' TERM` shard running for
-# EVER after a cancelled step — reparented to init, in its own group (which `set -m` created), with the
-# watchdog TERMed too, so nothing remained to bound or kill it. That is a regression against main,
-# where the shard inherited the driver's group and died with it, and `tests/run-bash-shards-bound`'s
-# arm 6 could not see it because its shard answers TERM.
+# The handler FORWARDS the signal and then leaves; the shard's group gets the same TERM→KILL
+# escalation the bound uses (review cycle 2, P2, measured). TERM alone left a `trap '' TERM` shard
+# running for EVER after a cancelled step — reparented to init, in its own group (which `set -m`
+# created), with the watchdog TERMed too, so nothing remained to bound or kill it. That is a
+# regression against main, where the shard inherited the driver's group and died with it, and
+# `tests/run-bash-shards-bound`'s arm 6 could not see it because its shard answers TERM.
 shard_driver_signal() {
   # ⛔ SHARED WITH EVERY OTHER TEARDOWN: group-only, never a bare pid (review cycle 5, P2). This trap
   # can fire DURING the teardown window too — after `wait` reaped the shard, before `shard_bg_pid` is
@@ -490,11 +553,20 @@ shard_driver_signal() {
   # The WATCHDOG is still alive when this trap runs (it is counting down), so a bare-pid fallback IS
   # meaningful for it — that is the one place in this file where it is.
   [ -n "${shard_wd_pid:-}" ] && { kill -TERM -"$shard_wd_pid" 2>/dev/null || kill -TERM "$shard_wd_pid" 2>/dev/null; }
-  exit "$1"
+  # ⛔ THEN THE #3174 CONTRACT: a TERM/INT'd run is TRUNCATED, so it must NAME itself INCOMPLETE and
+  # exit 1 rather than certifying a hole. `shard_partial_recap` prints from what accumulated and
+  # exits 1 (never 0), which is what `scripts/ci-failure-set.sh` refuses to fold into a baseline.
+  # HUP keeps the pre-#3174 exit code (129): it is a terminal hangup, not a cancellation, and it is
+  # non-zero either way, so nothing about it can read GREEN. The recap is the ONLY wording here —
+  # the signal number is what the caller reads to tell the two apart.
+  case "${2:-}" in
+    TERM|INT) shard_partial_recap "$2" ;;
+    *)        exit "$1" ;;
+  esac
 }
-trap 'shard_driver_signal 129' HUP
-trap 'shard_driver_signal 130' INT
-trap 'shard_driver_signal 143' TERM
+trap 'shard_driver_signal 129 HUP' HUP
+trap 'shard_driver_signal 130 INT' INT
+trap 'shard_driver_signal 143 TERM' TERM
 
 # shard_unaccounted — the listed shards this run neither EXECUTED nor SKIPPED, one path per line.
 # ⛔ DERIVED FROM THE LIST, never from the counters (agent-infra#3079). `executed + skipped == listed`
@@ -619,23 +691,70 @@ shard_watchdog() {
   esac
   printf 'x' >"$shard_timeout_marker" 2>/dev/null
   # The GROUP (`-$pid`), never the bare pid: a wrapper-only kill is the orphan factory this exists
-  # to close (#103's hang was inside a CHILD). The bare-pid form is the fallback for a shell whose
-  # job control did not give the shard its own group — reaching less beats a shard outliving every
-  # bound. TERM, then KILL after a second, so a suite that traps TERM cannot outlive the bound.
-  kill -TERM -"$shard_bg_pid" 2>/dev/null || kill -TERM "$shard_bg_pid" 2>/dev/null
-  sleep 1
-  kill -KILL -"$shard_bg_pid" 2>/dev/null || kill -KILL "$shard_bg_pid" 2>/dev/null
+  # to close (#103's hang was inside a CHILD). TERM, then KILL after a second, so a suite that traps
+  # TERM cannot outlive the bound.
+  if kill -TERM -"$shard_bg_pid" 2>/dev/null; then
+    sleep 1
+    kill -KILL -"$shard_bg_pid" 2>/dev/null
+  else
+    # ── THE NO-GROUP FALLBACK, AND WHY IT IS GUARDED (review cycle 6, P2) ─────────────────────────
+    # This branch is reached only when the GROUP TERM failed, i.e. a shell whose job control did not
+    # give the shard its own group — so the group KILL would fail too and the bare pid is all that is
+    # left. ⛔ The unguarded form it replaces was the worst construct in this file: the bare TERM makes
+    # the shard answer, the driver's `wait` reaps it and the pid becomes FREE, and 1 000 000 µs later
+    # (the `sleep 1`) an UNCATCHABLE `kill -KILL` was aimed at that number — at whatever the kernel had
+    # since handed it to, another lane or the runner agent itself. That is the exact hazard
+    # `shard_kill_group` deleted its own fallback for; keeping it here, unguarded, made the file's
+    # "no bare-pid fallback" claim false in three places (all three corrected with this fix).
+    # So the KILL is sent only after RE-VERIFYING that the pid still names OUR shard. `ps` is already
+    # this block's dependency (the zombie check above), and `-o ppid=` is in the same family — but an
+    # UNREADABLE `ps` must not disarm anything, so it returns false and the KILL is SKIPPED: the
+    # deliberately accepted residual is a TERM-deaf shard on a host that gave it no group, which is a
+    # leak of ONE shard bounded to this run, versus an unguardable SIGKILL to an unrelated process.
+    kill -TERM "$shard_bg_pid" 2>/dev/null
+    sleep 1
+    shard_pid_is_mine "$shard_bg_pid" && kill -KILL "$shard_bg_pid" 2>/dev/null
+  fi
+}
+
+# shard_pid_is_mine <pid> — does <pid> STILL name the shard this watchdog is guarding?
+# Used ONLY by the no-group fallback above, immediately before a bare-pid `SIGKILL`: at that instant
+# the pid may already be FREE (the driver reaped its child during the grace second), so "it exists"
+# and even "it is alive" are NOT answers. Two things are checked, and both are required:
+#   • not a ZOMBIE — the shard is a child of the DRIVER, so nobody reaps it but the driver's `wait`;
+#     `ps -o stat=` reads `Z` on BSD and GNU for a child that exited and has not been reaped yet.
+#   • the pid's PARENT IS THE DRIVER — the pid can only name our shard if the driver is still its
+#     parent, which is what makes a recycled pid detectable here at all.
+# ⛔ THE DRIVER'S PID IS `$$`, NOT `$PPID` (measured, bash 5.2 — and 3.2 behaves the same way): this
+# function runs inside `shard_watchdog`'s forked subshell, and bash leaves `$$` as the ORIGINAL
+# shell's pid while `$PPID` keeps the value that shell started with — i.e. the DRIVER'S PARENT. Using
+# `$PPID` here would compare against the wrong process on every host and quietly always be false.
+# That is the same class of landmine as the `BASHPID` bug this branch already documents; hence the
+# explicit note rather than a bare comparison.
+shard_pid_is_mine() {
+  local _st _pp _w
+  _st="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+  case "$_st" in ''|Z*) return 1 ;; esac
+  _pp="$(ps -o ppid= -p "$1" 2>/dev/null)" || return 1
+  # BSD `ps` prints ' 12345' and GNU '12345'; an unquoted split is the portable trim and forks nothing.
+  for _w in $_pp; do
+    [ "$_w" = "$$" ] && return 0
+  done
+  return 1
 }
 
 # shard_kill_group <pgid> — TERM then KILL one shard's PROCESS GROUP. NEVER a bare pid.
-# ⛔ NO BARE-PID FALLBACK AT ALL (review cycle 3 found the unguarded one; cycle 4 found the GUARD
-# inverted). BOTH call sites run AFTER `wait` has reaped the leader, so its pid is already FREE — and a
-# bare `kill -KILL <pid>` takes an uncatchable SIGKILL to whatever the kernel has since handed that
-# number to (another lane, the runner agent itself). A `kill -0` liveness guard does not fix that: it
-# cannot tell `pid still names my shard` from `pid now names someone else`, so at these call sites a
+# ⛔ NO BARE-PID FALLBACK IN THIS FUNCTION (review cycle 3 found the unguarded one; cycle 4 found the
+# GUARD inverted). BOTH call sites run AFTER `wait` has reaped the leader, so its pid is already FREE —
+# and a bare `kill -KILL <pid>` takes an uncatchable SIGKILL to whatever the kernel has since handed
+# that number to (another lane, the runner agent itself). A `kill -0` liveness guard does not fix that:
+# it cannot tell `pid still names my shard` from `pid now names someone else`, so at these call sites a
 # passing `kill -0` PROVES reuse. The "no group of its own" case the fallback was written for is not
-# reachable from here either (that shard is equally reaped), and it is already covered where it can
-# still work: the watchdog signals the shard's group with a bare-pid fallback WHILE the shard is alive.
+# reachable from here either (that shard is equally reaped).
+# ⛔ The WATCHDOG's `shard_watchdog` is a DIFFERENT call site and does have a bare-pid fallback — but a
+# GUARDED one: it runs while the shard is alive, and it re-verifies ownership with `shard_pid_is_mine`
+# immediately before the KILL (cycle 6, P2). "No bare pid anywhere" was never true while that fallback
+# was unguarded; it is true now because the guard, not the wording, is what makes it safe.
 # A group that no longer exists fails the TERM and nothing else happens: one syscall in the common case.
 shard_kill_group() {
   [ -n "${1:-}" ] || return 0
@@ -757,12 +876,12 @@ slice_skips() {
   if [ "$slice_pos" -ge "$listed" ]; then
     if [ "$shard_past_list" -ne 1 ]; then
       echo "❌ call #$((slice_pos + 1)) to run_shard is PAST the derived list ($listed listed shard(s)) and did not DECLARE itself — the list and the execution disagree, so 'executed + skipped == listed' cannot hold. The likely cause is a second, enumerated list of suites in this file (#2838). Refusing: extra work is not a repair for two lists that disagree. Already ran $shard_ran and skipped $shard_skipped of $listed."
-      exit 1
+      shard_exit 1
     fi
     past_list_calls=$((past_list_calls + 1))
     if [ "$past_list_calls" -gt "$past_list_budget" ]; then
       echo "❌ $past_list_calls call(s) past the derived list ($listed listed shard(s)); the declared budget is $past_list_budget — the runtime failure-recording sentinel alone. Refusing (#2838)."
-      exit 1
+      shard_exit 1
     fi
   fi
   [ "$slice_count" -gt 0 ] || return 1
@@ -830,7 +949,7 @@ shard_budget_trip() {
     echo "❌ NOT RUN — $(shard_count_lines "$_left") of $listed listed shard(s) will not be attempted because the budget was already spent:"
     while IFS= read -r _u; do [ -n "$_u" ] && printf '   ⏭  NOT RUN: %s\n' "$_u"; done <<<"$_left"
   fi
-  exit 1
+  shard_exit 1
 }
 
 # shard_note <path> <seconds> — the per-shard timing row, and the running total/slowest. Separate
@@ -950,10 +1069,13 @@ shard_partial_recap() {
       "$shard_done" "$listed" "$shard_notrun"
   fi
   printf '   ⚠️ RECAP INCOMPLETE — do not compute a set difference from this run: it is UNPROVEN (agent-infra#3174)\n'
-  exit 1
+  shard_exit 1
 }
-trap 'shard_partial_recap TERM' TERM
-trap 'shard_partial_recap INT' INT
+# ⛔ NO `trap` HERE — DELIBERATELY. #3174 installs its TERM/INT traps next to this function, but this
+# branch's single handler owns every signal (see `shard_driver_signal`), and a second `trap … TERM`
+# would silently replace it: the recap would print and the shard would be left RUNNING, which defeats
+# #3187 entirely. The handler calls `shard_partial_recap` itself, so the contract below is unchanged —
+# `scripts/run-bash-shards.recap.test.sh` still pins rc 1 + `⚠️ RECAP INCOMPLETE` for a TERM'd run.
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
@@ -965,7 +1087,7 @@ while IFS= read -r t; do
   esac
   if [ -L "$t" ]; then
     echo "❌ shard target '$t' is a symlink — it may resolve outside the checkout"
-    exit 1
+    shard_exit 1
   fi
   # The leaf check above is not enough: a symlinked PARENT directory (scripts/ -> elsewhere)
   # resolves the same target out of the checkout while the leaf itself is a regular file.
@@ -976,7 +1098,7 @@ while IFS= read -r t; do
   esac
   if [ ! -f "$t" ]; then
     echo "❌ shard target '$t' does not exist — the list and the checkout disagree"
-    exit 1
+    shard_exit 1
   fi
 done <<<"$shard_paths"
 
@@ -1084,7 +1206,7 @@ done <<<"$shard_paths"
 # to be deleted.
 if [ "${#shard_array[@]}" -ne "$listed" ]; then
   echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run. Refusing to start (this is a DERIVATION or READ change, not a missing shard: the end-of-run set difference names those)."
-  exit 1
+  shard_exit 1
 fi
 for shard in ${shard_array[@]+"${shard_array[@]}"}; do
   shard_budget_trip "$shard"
@@ -1118,7 +1240,7 @@ if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
     echo "   ⏭  $shard_skipped shard(s) were DELIBERATELY skipped, with the reason recorded:"
     while IFS="$(printf '\t')" read -r _p _why; do [ -n "$_p" ] && printf '   ⏭  SKIPPED: %s (%s)\n' "$_p" "$_why"; done < "$shard_skip_log"
   fi
-  exit 1
+  shard_exit 1
 fi
 # ⛔ THE CALL COUNT IS CHECKED TOO, NOT ONLY THE TALLY (#2838). `ran + skipped` uses the same
 # counters the loop increments, so it cannot see how many times the loop was ENTERED (a second list
@@ -1127,7 +1249,7 @@ fi
 # downgraded to a skip.
 if [ $((slice_calls - past_list_calls)) -ne "$listed" ]; then
   echo "❌ the shard loop entered run_shard $((slice_calls - past_list_calls)) time(s) for a list of $listed shard(s) — the list and the execution disagree (a second list, or a re-read of the same one)"
-  exit 1
+  shard_exit 1
 fi
 
 # Runtime self-check 1b: slice COVERAGE. Each slice must execute exactly its derived share, so the
@@ -1145,17 +1267,17 @@ if [ "$slice_count" -gt 0 ]; then
   if ! cmp -s "$exp_log" "$exp_log.ran"; then
     echo "❌ slice $((slice_index + 1))/$slice_count executed a DIFFERENT SET of shards than its index derives (expected $(wc -l <"$exp_log" | tr -d ' '), ran $(wc -l <"$exp_log.ran" | tr -d ' ')); first difference: $(diff "$exp_log" "$exp_log.ran" | head -4 | tr '\n' ' ')"
     rm -f "$exp_log" "$exp_log.ran"
-    exit 1
+    shard_exit 1
   fi
   rm -f "$exp_log" "$exp_log.ran"
   expected=$(( (listed - 1 - slice_index) / slice_count + 1 ))
   if [ "$shard_ran" -ne "$expected" ]; then
     echo "❌ slice $((slice_index + 1))/$slice_count executed $shard_ran shard(s), expected $expected — the slice does not cover its share of the list"
-    exit 1
+    shard_exit 1
   fi
 elif [ "$shard_skipped" -ne 0 ]; then
   echo "❌ $shard_skipped shard(s) skipped without a slice (BASH_SHARD_SLICE unset) — an unsharded run must execute every listed shard"
-  exit 1
+  shard_exit 1
 fi
 
 # Runtime self-check 2: the SWEEP must have executed. A `for` loop kept intact while its body
@@ -1163,7 +1285,7 @@ fi
 # counter proves the sweep did something.
 if [ "$swept" -lt 1 ]; then
   echo "❌ the syntax sweep executed no file — the sweep loops are present but the body is not"
-  exit 1
+  shard_exit 1
 fi
 
 # Runtime self-check 2b: the SWEEP ARM must still be wired. The `swept` counter above proves the
@@ -1181,7 +1303,7 @@ sweep_name=1
 rm -f "$sentinel_sweep"
 if [ "$shard_errors" -ne $((before_sweep_err + 1)) ]; then
   echo "❌ the sweep arm is broken — a file with a syntax error would not fail this run"
-  exit 1
+  shard_exit 1
 fi
 # Both counters are restored to their PRE-sentinel values (not decremented): a decrement silently
 # assumes the sentinel incremented, and this file's whole discipline is that an assumption about a
@@ -1209,7 +1331,7 @@ shard_past_list=0
 rm -f "$sentinel"
 if [ "$shard_errors" -ne $((before_err + 1)) ]; then
   echo "❌ the failure-recording arm is broken — a failing shard would not fail this run"
-  exit 1
+  shard_exit 1
 fi
 shard_errors=$before_err
 shard_ran=$before_ran
@@ -1273,7 +1395,7 @@ if [ "$shard_errors" -gt 0 ]; then
     # syntax-sweep failure", which sent triage to fix the sweep and lose the unnamed shard with it.)
     echo "❌ $((shard_errors - sweep_errors)) of these failure(s) could NOT be named — a counting path with no path of its own raised them (this is the backstop: the shard loop AND the syntax sweep both name themselves, so a defect in scripts/run-bash-shards.sh is the likely cause)"
   fi
-  exit 1
+  shard_exit 1
 fi
 if [ "$slice_count" -gt 0 ]; then
   echo "✅ all $shard_ran bash shards passed (slice $((slice_index + 1))/$slice_count of $listed; $swept file(s) syntax-checked)"
