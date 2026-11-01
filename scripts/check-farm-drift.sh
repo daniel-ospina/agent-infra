@@ -52,8 +52,11 @@
 #    a check that answers "identical to the wrong tree" is the false PASS this class produces.
 #
 # ── WHAT IS *NOT* "DRIFT" ───────────────────────────────────────────────────────────────────────
-# A file on the box with NO source in the checkout is `UNSOURCED`, and a file that DIFFERS from its
-# source but that NO farm array delivers is `STALE (NOT farm-declared)`. Both are exit 3 with
+# A file on the box with NO source in the checkout is `UNSOURCED` (its row says so), and a file that
+# DIFFERS from its source but that NO farm array delivers keeps the table row `STALE` — the table is
+# printed BEFORE the declaration is read, so it cannot carry the class — and the line under it names it
+# `… is STALE and NOT farm-declared` (`:600`). Read the two lines together; do NOT describe this class
+# as a verdict string, because no row ever prints one. Both are exit 3 with
 # UNSOURCED — loud, never a pass, and never the installer's fatal arm, because a deploy cannot fix
 # either (that arm deadlocked setup.sh: measured 2026-10-31, ONE such file → exit 1, and a second
 # full run left it stale). `UNSOURCED` is the class that lost real fixes (#2231 — three fixes
@@ -92,8 +95,9 @@ check-farm-drift.sh — is the FARMED copy of the harness the code the repo ship
 Exit: 0 = match, 1 = DRIFT THE FARM OWES (a farm-declared file differs, or a declared file never
           landed — the farm is not the shipped code, and re-running the farm IS the remedy),
       3 = a deploy CANNOT fix it: an UNSOURCED file (on the box, in no repo file) or a STALE file
-          that NO farm array delivers. Loud, never a pass, and never the installer's fatal arm —
-          the remedy is declare / delete / retire, not "re-run the farm",
+          that NO farm array delivers (row `STALE`, named `NOT farm-declared` on the line under it).
+          Loud, never a pass, and never the installer's fatal arm — the remedy is declare / delete /
+          retire, not "re-run the farm",
       2 = UNKNOWN (cannot verify — NEVER a pass).
 
 See the header comment of this file for why it exists (tortoise#10114).
@@ -162,7 +166,7 @@ CELL_HOME="${CELL_HOME:-$HOME}"
 #   • `scripts/orchestrator-harness/install.sh:741` roots the DIR record at `$HOME`.
 # So the sibling of a sha record named by `--pin-file` is at the pin record's OWN root, and it may
 # ALSO be at `$CELL_HOME` — and the old code read only `${CELL_HOME:-$HOME}`: when the caller named a
-# `$HOME`-rooted pin (which `pi-bootstrap/setup.sh:1061` does — `DEST="$HOME/.pi/agent"`,
+# `$HOME`-rooted pin (which `pi-bootstrap/setup.sh:1063` does — `DEST="$HOME/.pi/agent"`, `:20`,
 # `--pin-file "$DEST/state/HARNESS-PIN"`) on a box whose records are CELL_HOME-rooted, the LOST-PIN
 # arm looked in the wrong home, found nothing and reported a FIRST INSTALL — `OK`, rc=0, pin identity
 # unverified. That is the false PASS the arm exists against, one variable over (measured at
@@ -313,7 +317,7 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ ! -f "$PIN_FILE" ]; then
     # there printed `OK` while the wrong-tree trap arm was off — the false PASS this whole file
     # exists against (reproduced on main 2026-10-31: `.harness-path` present, HARNESS-PIN absent →
     # `OK — 1/1 sourced file(s) match`, rc=0). A FIRST install has NEITHER record; that one stays 0,
-    # so a first-time install is unaffected (and 2 would not block it anyway — setup.sh:1069's `*)`
+    # so a first-time install is unaffected (and 2 would not block it anyway — setup.sh:1076's `*)`
     # arm warns and continues; it is 0 that would claim a verification that never happened).
     # ⛔ THE SIBLING RECORD IS READ FROM THE PIN RECORD'S OWN ROOT ($HP_FILE, resolved above) — NOT
     # from `${CELL_HOME:-$HOME}`. Reading a different home here is the false PASS itself: the arm
@@ -371,6 +375,31 @@ resolve_source() {  # $1 = dest-relative path → prints the repo-relative sourc
 }
 
 # DECLARED local-only: a name that is deliberately on the box and in no repo file.
+# A DECLARATION ENTRY MUST BE A PLAIN RELATIVE PATH — no empty, `.` or `..` component, no leading or
+# trailing slash. ⛔ WHY THIS IS A CORRECTNESS ARM AND NOT TIDINESS: the membership test below is
+# fixed-string containment over the entry's own bytes, so an entry the DEPLOYED side cannot match
+# (`scripts/`, `scripts//x.sh`, `scripts/./x.sh` — all real hand-edit/`echo`/CR shapes) silently
+# classified a file the farm DOES owe as "outside the farm", which is exit 3 instead of the fatal
+# exit 1: the #10114 arm switched off by a declaration this check could not read, while the UNKNOWN
+# arm below did NOT fire because the entry started with `scripts/`. Measured 2026-10-31 on
+# bbf93274 + a declaration of `scripts/` (and of `scripts/./check-farm-drift.sh`, and of
+# `scripts//check-farm-drift.sh`): `rc=3`, `check-farm-drift.sh is STALE and NOT farm-declared`,
+# over drift the farm owes — versus `rc=1` for the same bytes declared as `scripts/check-farm-drift.sh`.
+# Off-shape entries are COUNTED as well as dropped, so a declaration made entirely of them reaches the
+# "no path this check can grade" arm (UNKNOWN) rather than an empty set that reads as "the farm owes
+# nothing". bash 3.2-safe: no arrays, no `mapfile`, no `${v,,}`; component split by `#`/`%%` only.
+decl_rel_ok() {
+    [ -n "$1" ] || return 1
+    case "$1" in /*|*/) return 1 ;; esac
+    _dro_rest="$1"
+    while [ -n "$_dro_rest" ]; do
+        _dro_comp="${_dro_rest%%/*}"
+        case "$_dro_comp" in ''|.|..) return 1 ;; esac
+        case "$_dro_rest" in */*) _dro_rest="${_dro_rest#*/}" ;; *) _dro_rest="" ;; esac
+    done
+    return 0
+}
+
 is_declared_local() {
     case "$1" in
         *.bak-*)        return 0 ;;   # a repair path's own backup beside the live script it replaced
@@ -543,7 +572,11 @@ if [ -f "$DECL" ]; then
     while IFS= read -r dpath; do
         [ -n "$dpath" ] || continue
         case "$dpath" in scripts/*) rel="${dpath#scripts/}" ;; *) decl_offshape=$((decl_offshape+1)); continue ;; esac
-        decl_rel_set+="$dpath"$'\n'
+        # ⛔ AND `scripts/` IS NOT ENOUGH — see `decl_rel_ok` above: an entry that starts with `scripts/`
+        # but carries no matchable relative path is OFF-SHAPE too, or it disarms the #10114 fatal arm.
+        if ! decl_rel_ok "$rel"; then decl_offshape=$((decl_offshape+1)); continue; fi
+        # The set stores the CANONICAL form, so membership compares like with like (`scripts/<rel>`).
+        decl_rel_set+="scripts/$rel"$'\n'
         is_declared_local "$rel" && continue
         if [ ! -e "$DEST/$rel" ]; then
             printf '%-46s | %-12s | %-12s | %s\n' "$rel" "-" "-" "DECLARED-BUT-ABSENT" >&2
@@ -564,7 +597,7 @@ EOF_DECL
     # over drift the farm DOES owe, while the same bytes with alpha.py declared ⇒ rc=1.
     if [ -z "$decl_rel_set" ]; then
         say_err "$PROG: UNKNOWN — the farm declaration $DECL carries no path this check can grade"
-        say_err "   ($decl_offshape line(s) dropped for not being scripts/<rel>). What the farm OWES is"
+        say_err "   ($decl_offshape line(s) dropped: not `scripts/<rel>`, or no plain relative path). What the farm OWES is"
         say_err "   therefore unknown, and grading stale drift against it would report every file as"
         say_err "   'outside the farm' — switching the #10114 fatal arm off. This is not a pass."
         exit 2
@@ -606,6 +639,23 @@ if [ "$decl_ok" -eq 1 ] && [ -n "$stale_rows" ]; then
 $stale_rows
 EOF_STALE
 fi
+# ⛔ A DECLARATION THAT WAS PARTLY UNREADABLE MAY NOT CERTIFY "OUTSIDE THE FARM". `stale_outside` is a
+# claim about a DECLARATION, so it is only sound when every entry in that declaration was read. An
+# OFF-SHAPE entry naming the very file that is stale (`scripts//x.sh`, `scripts/./x.sh`) is dropped from
+# the set above, so the file reads as "not farm-declared" — the #10114 fatal arm written off as
+# non-fatal by a malformed line, the same fail-open the dropped-entry counting exists to prevent, one
+# entry to the side. Measured 2026-10-31: a declaration of `scripts//check-farm-drift.sh` alone ⇒ rc=3
+# "NOT farm-declared" over drift the farm owes, while `scripts/check-farm-drift.sh` ⇒ rc=1. So a partial
+# read withholds ONLY the outside-farm verdict — UNKNOWN (2), never a pass — while anything the farm
+# OWES still reaches the fatal arm (1).
+if [ "$decl_offshape" -gt 0 ] && [ "$stale_outside" -gt 0 ]; then
+    say_err "$PROG: UNKNOWN — $decl_offshape line(s) of the farm declaration $DECL could not be graded,"
+    say_err "   and $stale_outside stale file(s) fall outside what the graded lines declare. A partly"
+    say_err "   unreadable declaration cannot certify 'the farm does not owe this', so the fatal arm is"
+    say_err "   not being switched off on it. This is not a pass."
+    say_err "   Next: fix the declaration entries named above (each must be a plain scripts/<path>), then re-run this."
+    exit 2
+fi
 # ⛔ THE SPLIT IS ONLY A MEASUREMENT WHEN THE DECLARATION WAS READ. `stale_declared=$stale` is
 # initialised BEFORE the `decl_ok` test, so the summary used to print "N farm-declared — a re-run must
 # fix these" on exactly the path where the note above says what the farm DECLARES could not be graded:
@@ -639,11 +689,22 @@ say_err "   An UNSOURCED file is on the box and in no repo file — declare it l
 # per-file lines above it explicitly say cannot work (`re-running the farm is not expected to converge
 # it`). Exit 3 means the deploy is not the remedy — and when nothing is farm-declared and nothing is
 # declared-but-absent, there is nothing a re-run COULD fix, so the re-run advice is dropped entirely.
-if [ "$stale_declared" -eq 0 ] && [ "$missing" -eq 0 ]; then
+# ⛔ AND THE ADVICE IS PER CLASS, NOT PER `stale_declared == 0`. The condition below used to be
+# `stale_declared -eq 0 && missing -eq 0`, which is also true on the UNSOURCED-only path (stale=0) —
+# so the LAST line an operator read on the most common exit-3 state was "declare each file above in a
+# farm array", which is impossible for a file with no repo source (measured 2026-10-31: a matching
+# farm + one `handmade-thing.py` ⇒ that advice). Three classes, three remedies:
+#   * something the farm OWES is wrong  → re-run the farm (the only class a deploy can fix)
+#   * a STALE file outside the farm     → declare / delete / retire
+#   * UNSOURCED only (stale=0)          → declare it LOCAL, delete, or retire — never "re-run the farm"
+if [ "$stale_declared" -gt 0 ] || [ "$missing" -gt 0 ]; then
+    say_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent checkout, then re-run this."
+elif [ "$stale_outside" -gt 0 ]; then
     say_err "   Next: this is NOT re-runnable into a pass — declare each file above in a farm array"
     say_err "   (pi-bootstrap/setup.sh), delete it, or retire it in pi-bootstrap/farm-retired.txt; then re-run this."
 else
-    say_err "   Next: re-run the farm (pi-bootstrap/setup.sh) from a pin-consistent checkout, then re-run this."
+    say_err "   Next: a deploy cannot fix this — declare each UNSOURCED name above as LOCAL (the *.bak-*"
+    say_err "   form this script accepts), delete it, or retire it in pi-bootstrap/farm-retired.txt; then re-run this."
 fi
 # ⛔ THREE VERDICTS, NOT TWO. STALE (1) is the #10114 defect and a deploy must never report success
 # over it. UNSOURCED-only (3) is a DIFFERENT fact — a name on the box that no repo file explains — and

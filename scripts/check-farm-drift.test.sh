@@ -295,7 +295,7 @@ ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "a STALE file the farm DECLARES is sti
 # 24. ⛔ THE PIN'S TWO RECORDS ARE READ FROM ONE ROOT (P2-1 of #3133). The lost-pin arm used to read
 # the sibling record from `${CELL_HOME:-$HOME}` while the SHA record arrived via `--pin-file`, so when
 # those named DIFFERENT homes the arm looked in the wrong one, found nothing, and reported a FIRST
-# INSTALL: `OK`, rc=0 — the false PASS it exists against, one variable over. `setup.sh:1056` passes
+# INSTALL: `OK`, rc=0 — the false PASS it exists against, one variable over. `setup.sh:1063` passes
 # `--pin-file "$DEST/state/HARNESS-PIN"` with `DEST="$HOME/.pi/agent"`, so an exported `CELL_HOME`
 # (a staging/cell home) is the reachable shape. The pin record's OWN root must win.
 C24="$TMP/c24"; mk_farm "$C24/scripts"; mkdir -p "$C24/.pi/agent/state" "$TMP/c24-other-home"
@@ -381,6 +381,62 @@ OUT="$TMP/out"; ERR="$TMP/err"
 RC=$?
 ck $(grep -q 'Next: re-run the farm' "$ERR" && echo 1 || echo 0) "exit-3 drift outside the farm does not close with 're-run the farm' (rc=$RC)"
 ck $(grep -q 'declare each file above in a farm array' "$ERR" && echo 0 || echo 1) "...it closes with the declare / delete / retire remedy instead"
+
+# 27. ⛔ AN OFF-SHAPE DECLARATION ENTRY MAY NOT SWITCH THE FATAL ARM OFF (P2 of #3133's review). The
+# guard above drops lines that are not `scripts/<rel>`, but an entry that IS `scripts/…` and carries no
+# plain relative path (`scripts/`, `scripts//x.sh`, `scripts/./x.sh`) recorded bytes the DEPLOYED side
+# can never match, so a file the farm DOES owe classified as "outside the farm" — exit 3 instead of the
+# fatal exit 1, with the UNKNOWN arm silent because the line started with `scripts/`. Measured at
+# bbf93274: `scripts/` ⇒ rc=3 `check-farm-drift.sh is STALE and NOT farm-declared`; canonical ⇒ rc=1.
+for _decl in 'scripts/' 'scripts/./alpha.py' 'scripts//alpha.py'; do
+    C27="$TMP/c27"; if [ -e "$C27" ]; then find "$C27" -mindepth 1 -delete; fi
+    mk_farm "$C27/scripts"; mkdir -p "$C27/state"
+    printf '%s\n' "$_decl" > "$C27/state/farm-declared.txt"     # names the stale file, ungradeably
+    printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C27/scripts/alpha.py"
+    OUT="$TMP/out"; ERR="$TMP/err"
+    ( cd "$TMP" && CELL_HOME="$C27" bash "$CHECK" --dest "$C27/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+    RC=$?
+    ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "an ungradeable scripts/ entry ('$_decl') is UNKNOWN, not a non-fatal outside-farm verdict (rc=$RC)"
+    ck $(grep -q 'NOT farm-declared' "$ERR" && echo 1 || echo 0) "...and does not rule the file 'outside the farm' ('$_decl')"
+done
+# ...and a PARTLY unreadable declaration: the canonical entry must still make a genuinely undeclared
+# file exit 3 (the arm is not simply disabled), while the off-shape line alone may not authorise it.
+C27B="$TMP/c27b"; mk_farm "$C27B/scripts"; mkdir -p "$C27B/state"
+printf 'scripts/alpha.py\nscripts//other.sh\n' > "$C27B/state/farm-declared.txt"
+printf '#!/usr/bin/env python3\nprint("hellO")\n' > "$C27B/scripts/alpha.py"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27B" bash "$CHECK" --dest "$C27B/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "a canonical declaration still makes declared drift FATAL beside an off-shape line (rc=$RC)"
+ck $(grep -q 'farm-declared — a re-run must fix these' "$ERR" && echo 0 || echo 1) "...and the summary still counts it as farm-declared"
+
+# 28. ⛔ THE CLOSING REMEDY IS PER CLASS (P3 of #3133's review). The condition used to be
+# `stale_declared == 0 && missing == 0`, which is ALSO true on the UNSOURCED-only path (stale=0), so the
+# last line an operator read on the commonest exit-3 state told them to declare a file with no repo
+# source in a farm array — impossible, and the same "remedy the run just contradicted" defect.
+C28="$TMP/c28"; mk_farm "$C28/scripts"; mkdir -p "$C28/state"
+printf 'scripts/alpha.py\n' > "$C28/state/farm-declared.txt"   # mk_farm already deployed alpha.py in step with $SRC
+printf 'print("handmade")\n' > "$C28/scripts/handmade-thing.py"                # UNSOURCED only
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C28" bash "$CHECK" --dest "$C28/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 3 ] && echo 0 || echo 1) "unsourced-only is exit 3 (rc=$RC)"
+ck $(grep -q 'declare each file above in a farm array' "$ERR" && echo 1 || echo 0) "...and does NOT advise declaring an unsourced file in a farm array"
+ck $(grep -q 'declare each UNSOURCED name above as LOCAL' "$ERR" && echo 0 || echo 1) "...it names the LOCAL/delete/retire remedy instead"
+
+# 29. ⛔ A ROTTED CITATION READS AS EVIDENCE (#3172). The pin-root derivation quotes `setup.sh` line
+# numbers, and the pre-patch numbering survived one root fix. This suite is hermetic and may run from a
+# temp copy, so it cannot resolve the repo's own `pi-bootstrap/setup.sh`: those numbers were re-verified
+# by hand against the checkout when they were corrected (`DEST=` at :20, `--pin-file` at :1063, the `*)`
+# arm at :1076), and what is pinned HERE is that the stale numbering does not come back through a
+# copy-paste of the old comment.
+# ⛔ THE NEEDLE IS SPLIT so this file's own prose cannot satisfy it — a guard whose literal appears in
+# its own source is a tautology (the class falsified in check-pipeline-compliance.sh's own history).
+_old_cite="setup.sh:10"; _old_cite="${_old_cite}56"
+_old_cite2="setup.sh:10"; _old_cite2="${_old_cite2}61"
+ck $(grep -qF "$_old_cite" "$HERE/check-farm-drift.test.sh" && echo 1 || echo 0) "no citation still points at the pre-patch setup.sh line-56 numbering"
+ck $(grep -qF "$_old_cite2" "$HERE/check-farm-drift.sh" && echo 1 || echo 0) "no citation points at the pre-patch setup.sh line-61 numbering (the --pin-file call moved)"
+
 
 echo ""
 if [ "$fail" -eq 0 ]; then
