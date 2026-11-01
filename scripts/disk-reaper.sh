@@ -2239,9 +2239,10 @@ reap_dup() {
 # the floor (`DISK_REAPER_RUNNER_MIN_AGE`, default 3600 s). The IN-ENTRY witness is the checkout's own
 # writes; `_work/_temp` (step scripts, command logs) is a SIBLING of `_work/<repo>` and protects nothing
 # here, so the mtime is the proof for the entry being deleted and there is no local busy-check on a
-# owner's header forbids inventing a `pgrep`-shaped one (it would keep every dead entry while ANY
-# runner is idle — always, on a 12-runner box — i.e. an inert class that reports healthy). The owner
-# re-probes the same question immediately before each removal, so a job that starts mid-pass survives.
+# runner to consult, and the owner's header forbids inventing a `pgrep`-shaped one (it would keep every
+# dead entry while ANY runner is idle — always, on a 12-runner box — i.e. an inert class that reports
+# healthy). The owner re-probes the same question immediately before each removal, so a job that starts
+# mid-pass survives.
 #
 # ⛔ `_work/_tool` AND `_work/_actions` ARE DELIBERATELY RETAINED: they are the runner's cross-job caches,
 # so removing them buys a re-download on the NEXT job rather than disk. The owner excludes them BEFORE

@@ -82,7 +82,17 @@
 #   REAP_RW_STATE_DIR   lock + log dir (default $HOME/.pi/agent/state)
 #   REAP_RW_LOG         pass log (default $REAP_RW_STATE_DIR/reap-runner-work.log)
 #   REAP_RW_LOCK_STALE_SECONDS  stale lock reclaim bound (default 1800)
-#   REAP_RW_BUDGET_SECONDS      wall-clock budget for the sweep (default 300)
+#   REAP_RW_BUDGET_SECONDS      wall-clock budget for the `--apply` sweep (default 300). ⛔ IT DOES NOT
+#                       BOUND `--dry-run`, and that asymmetry is deliberate: in `--apply` a spent budget has
+#                       a defined, safe meaning — every entry still unprocessed is KEPT and PRESERVED
+#                       (`reason=budget`) — whereas truncating a dry pass would emit a SUMMARY
+#                       `candidates=N` for a population LARGER than N, i.e. a partial count presented as a
+#                       total, which is the false-measurement shape this class's own `census=` refusal
+#                       exists to prevent. A dry pass therefore measures the WHOLE population it matched.
+#                       It is still bounded, one call at a time, by the watchdogs below; its aggregate cost
+#                       is candidates x those bounds, not this knob. A malformed value IS refused in both
+#                       modes (`num` at startup), so the seam is validated everywhere and only its
+#                       bounding effect is apply-only.
 #   REAP_RW_DU_TIMEOUT / REAP_RW_FIND_TIMEOUT  per-call watchdogs, secs (default 120 each)
 #   REAP_RW_EXPLICIT    1 when the caller's glob list came from an EXPLICIT operator seam rather than
 #                       the defaults. It changes ONE outcome: a sweep that matches no root at all is then
@@ -353,6 +363,16 @@ prune_entry() { # <entry> <root>
                 # twice — once here and once in `disk-reaper.sh` — doubles the only cost that matters.
                 # `?` when du cannot answer: a CANDIDATE whose bytes are unknown is still a candidate, and
                 # a caller that dropped the row would report `candidates=0` on a pass with real work.
+                #
+                # ⛔ AND THE DEADLINE CHECK DELIBERATELY SITS BELOW THIS `return`, NOT ABOVE IT. Moving it
+                # up looks like a fix for "the budget is unreachable in dry-run" and is the opposite: the
+                # SUMMARY would then print a `candidates=` count TRUNCATED by the budget while reading
+                # exactly like a complete measurement — a partial population reported as a total. `--apply`
+                # has a safe early-stop (unprocessed entries are PRESERVED, named `reason=budget`); a
+                # measurement does not. The trade is documented at `REAP_RW_BUDGET_SECONDS` in the header,
+                # and the per-call watchdogs (`REAP_RW_DU_TIMEOUT`/`REAP_RW_FIND_TIMEOUT`) bound each dry
+                # step. A reader who wants a bounded dry pass should bound the CANDIDATE COUNT, not move
+                # this check.
                 log_line "REAP no-write-for-${MIN_AGE}s $(du_mb "$entry")MB $entry"
                 return 0
             fi
