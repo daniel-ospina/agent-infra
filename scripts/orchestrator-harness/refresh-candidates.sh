@@ -281,7 +281,11 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
   if [ -n "$REPO" ]; then
     url="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
     case "$url" in
-      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      # ⛔ THE TRAILING-SLASH SPELLINGS ARE PART OF THE TARGET (review of #3188, P2). `git remote add` accepts
+      # `https://github.com/<owner>/<repo>/` and humans type it; without these arms such a checkout was
+      # refused as "NOT the queue target" and the recorded cause called the RIGHT repo a DIFFERENT one.
+      # `resolve_repo`'s two callers rely on this ONE predicate; the cause predicates carry the same list.
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/") ;;
       "") echo "[refresh] NOT PROVISIONABLE: \$REPO ($REPO) has no readable 'origin' remote, so this pass cannot prove it is a checkout of $OR — an unproven checkout is how the wrong repo's issues get queued (#1901)"
           echo "[refresh]   fix: git -C $REPO remote set-url origin https://github.com/$OR.git  (or unset REPO and let this script derive one)"
           return 1 ;;
@@ -324,7 +328,11 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
     git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
     url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
     case "$url" in
-      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      # ⛔ THE TRAILING-SLASH SPELLINGS ARE PART OF THE TARGET (review of #3188, P2). `git remote add` accepts
+      # `https://github.com/<owner>/<repo>/` and humans type it; without these arms such a checkout was
+      # refused as "NOT the queue target" and the recorded cause called the RIGHT repo a DIFFERENT one.
+      # `resolve_repo`'s two callers rely on this ONE predicate; the cause predicates carry the same list.
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/") ;;
       *) continue ;;
     esac
     REPO="$(cd "$cand" && pwd -P)" || continue
@@ -1842,7 +1850,7 @@ if ! resolve_repo; then
       '') _pair="\$REPO ('${REPO}') has NO READABLE 'origin' remote, so it cannot prove it is a checkout of \$OR ('${OR:-}')" ;;
       *://*|*@*:*)
          case "$_origin" in
-           "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git")
+           "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/")
              _pair="\$REPO ('${REPO}') carries an 'origin' that names \$OR ('${OR:-}') yet the resolver refused it — see the refusal above (OR_DECLARED='${OR_DECLARED:-?}')" ;;
            *) _pair="\$REPO ('${REPO}') has 'origin'=${_origin}, which is NOT the queue target \$OR ('${OR:-}') — a DIFFERENT repo, and no retry can mend a mismatch" ;;
          esac ;;

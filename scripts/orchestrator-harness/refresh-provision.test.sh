@@ -51,6 +51,15 @@
 #   (s7) `--check` does NOT fail a clean shallow scout — `cloud-cell-bringup.sh` DIES on a non-zero
 #        `--check`, so that second copy of the comparison was a cell that could not START;
 #   (s8) NON-VACUITY for (s7): the old `--check` arm still FAILS the same tree.
+#   (h) HERMETICITY: an ambient exported `$OR`/`OR_OPERATOR_DECLARED` does not reach the pass, and the
+#       record carries no resolve-repo refusal — with a positive control that a DECLARED `$OR` handed to
+#       the invocation IS still refused (rc=3);
+#   (h2) the `--check` twin of (h), with the same two-way control;
+#   (h3) the RECORDED cause names the origin SHAPE the resolver actually read (no `$REPO` set, an
+#       unreadable origin, a URL naming another repo, a local path that cannot prove a DECLARED target)
+#       instead of predicting one mechanism for all of them;
+#   (h4) an origin that NAMES the queue target with a trailing slash is the same repo: it PROCEEDS, so
+#       the cause can never report a "DIFFERENT repo" mismatch it did not measure.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
@@ -709,6 +718,25 @@ mk_case cause-local-path
 rp "$D" "" OR="daniel-ospina/tortoise"
 case "$(rec why)" in *"local-path"*"cannot prove a DECLARED"*) r=0 ;; *) r=1 ;; esac
 ck "(h3) the local-path arm names the local path ($(rec why | cut -c1-90))" "$r"
+# ── (h4) A TRAILING-SLASH ORIGIN THAT NAMES THE TARGET IS THE SAME REPO ─────────────────────────────
+# ⛔ A FALSE BLOCK, NOT A WORDING NIT (review cycle 4, P2). `resolve_repo`'s accept list enumerated
+# `"$OR"`, `"$OR.git"`, `*":$OR"`, `*":$OR.git"`, `*"/$OR"`, `*"/$OR.git"` — so a remote with a
+# TRAILING SLASH (`https://github.com/<owner>/<repo>/`, which `git remote add` accepts and humans type)
+# was refused as "NOT the queue target", and the cause this diff adds would have written "a DIFFERENT
+# repo, and no retry can mend a mismatch" about the RIGHT repo. Both the accept list and the cause
+# predicates now carry the trailing-slash spellings, and this arm pins that the pass PROCEEDS.
+mk_case cause-trailing-slash
+git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise/"
+rp "$D" "" OR="daniel-ospina/tortoise"
+# ⛔ THE ASSERTION IS "THE PAIR WAS ACCEPTED", NOT `rc=0`: this fixture's remote is a URL that does not
+# resolve from the sandbox, so the pass moves PAST the resolver and then fails at `scout_sync`'s fetch
+# (TRANSIENT). Pinning rc=0 would pin that unrelated network behaviour instead of the accept list.
+case "$OUT" in *"NOT the queue target"*) r=1 ;; *) r=0 ;; esac
+ck "(h4) a trailing-slash origin naming the target is NOT refused as a different repo" "$r"
+case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
+ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-70))" "$r"
+# NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s accept list,
+# the pass prints `NOT the queue target` for this exact origin and both assertions above go red.
 # ⛔ THE UNSET-`$REPO` ARM IS HERMETIC BECAUSE THE CANDIDATE LIST IS DERIVED FROM `$OR` (review cycle 3,
 # P2 — this arm was briefly retired on a FALSE premise). `repo_candidates` builds `/tmp/${OR##*/}` and
 # `$HOME/${OR##*/}`, so a SYNTHETIC `$OR` names candidates that cannot exist on any box, while every
