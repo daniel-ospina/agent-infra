@@ -2224,7 +2224,7 @@ function isGhWordAt(scan: ScanTokens, i: number): boolean {
   return isCommandPositionAt(scan, i);
 }
 
-function hasBareGhWord(command: string): boolean {
+export function hasBareGhWord(command: string): boolean {
   const scan = scanTokens(command);
   return scan.tokens.some((_, i) => isGhWordAt(scan, i));
 }
@@ -3860,10 +3860,46 @@ export type RecordFileState =
    *  the one that was tried — distinct from "corrupt", which names a REAL file. */
   | { kind: "ambiguous"; files: string[] };
 
+/**
+ * #3175/#2374 — WHAT THE SHARED CROSS-BOX STORE HOLDS for this PR, as far as this
+ * box can see it.
+ *
+ * The registry is a LOCAL directory (`~/.pi/agent/reviews`), so every refusal was
+ * necessarily about THIS box — but the text said "no record" as if it were a fact
+ * about the PR. #2349 fixed the words; nothing yet said whether the record EXISTS
+ * elsewhere. It often does: `scripts/registry-sync.sh` (#2374) replicates records
+ * through `refs/reviews/<owner>-<repo>-<pr>` on the shared agent-infra remote, so a
+ * lane whose refusal says `crossbox=present` fetches one ref instead of paying for
+ * a second review — which is the whole measured cost (2026-11-01: ten-plus lanes
+ * dispatched at a queue of fully-attested PRs and produced zero merges, because
+ * "no record HERE" read as "never reviewed").
+ *
+ * ⛔ DIAGNOSTIC ONLY. No branch of any decision reads this. An absent record still
+ * refuses whatever the cross-box store holds — the gate's attestation is a LOCAL
+ * record bound to THIS head (#1224), and a fetched record is only usable once it is
+ * written into the local registry and head-bound there.
+ */
+export type CrossBoxRecordState =
+  | { kind: "present"; ref: string; store: string; scanned: number }
+  /** `covered` names the store(s) whose OWN `origin` IS `repo` — the read that makes
+   *  this a MEASURED absence rather than a miss in somebody else's namespace. */
+  | { kind: "absent"; store: string; scanned: number; covered?: string }
+  /** Not "absent": the store could not be read, or this box holds no checkout that
+   *  can reach it. A failed READ is never reported as a negative fact (#2349). */
+  | { kind: "unmeasurable"; why: string };
+
 export interface ReviewRecordObservation {
   pr: number;
   repo: string | null;
   registryDir: string;
+  /** The BOX this gate read on (#3175). A registry is per-machine, so a refusal that
+   *  names no machine cannot be acted on: a lane must know whether to re-review here
+   *  or dispatch to the box that minted the record. Diagnostics only. */
+  host: string;
+  /** What the shared store holds for this PR (#2374). Defaults to `unmeasurable` —
+   *  the probe is OPT-IN and run only on the no-record path of a real refusal, so no
+   *  test and no healthy merge ever performs network I/O (see `observeReviewRecord`). */
+  crossBox: CrossBoxRecordState;
   /** For a repo-less read: the path GENERATOR, since no single file is tried. */
   qualifiedPath: string;
   legacyPath: string;
@@ -3917,13 +3953,35 @@ function observeRecordFile(path: string): { state: RecordFileState; rec: ReviewR
  *   • several repo-keyed candidates         → ambiguous, trusted by neither
  *   • a usable record                       → then the HEAD/DIFF question is live
  */
-export function observeReviewRecord(pr: number, repo?: string): ReviewRecordObservation {
+export function observeReviewRecord(
+  pr: number,
+  repo?: string,
+  /** `"probe"` asks for the cross-box store read (#2374). ONLY the tool_call hook
+   *  passes it, and only on the no-record path: no decision branch of
+   *  `evaluateMergeGate` reads the result, and the probe must never run inside it.
+   *  Every other caller (including every test) gets the default `unmeasurable` and
+   *  stays hermetic and offline.
+   *
+   *  `stores` PINS the probed checkouts for a test (a caller-supplied argument, not
+   *  an ambient env var — round-1 review P2). Production omits it and the probe
+   *  resolves `registryStoreDirs()` itself; a test that pins it performs no read it
+   *  did not build. */
+  opts: { crossBox?: "probe" | CrossBoxRecordState; stores?: string[] } = {}
+): ReviewRecordObservation {
   const registryDir = reviewsDir();
   const legacyPath = reviewRecordFile(undefined, pr);
+  // `"probe"` is honoured at the END (`finishObservation`), once we know whether a
+  // local record was found — a present record needs no read of the shared store.
+  const wantProbe = opts.crossBox === "probe";
+  const stores = opts.stores;
   const obs: ReviewRecordObservation = {
     pr,
     repo: repo ?? null,
     registryDir,
+    host: boxName(),
+    crossBox: typeof opts.crossBox === "object" && opts.crossBox !== null
+      ? opts.crossBox
+      : { kind: "unmeasurable", why: "not probed on this call" },
     qualifiedPath: repo ? reviewRecordFile(repo, pr) : `${registryDir}/<owner>-<repo>-${pr}.json`,
     legacyPath,
     qualified: { kind: "absent" },
@@ -3944,7 +4002,13 @@ export function observeReviewRecord(pr: number, repo?: string): ReviewRecordObse
         // "another repo's record, inert here" AND "record: clean at head …" in the
         // same block — the self-contradicting diagnostic this change exists to
         // remove (fresh review of #2349, P1).
-        return finishObservation(obs);
+        //
+        // ⛔ AND THE PINNED `stores` SEAM IS HONOURED HERE TOO (fresh review, P2): this
+        // return used to call `finishObservation` WITHOUT `stores`, so a caller passing
+        // `{ crossBox: "probe", stores: [...] }` fell through to `registryStoreDirs()` and
+        // performed a REAL `git ls-remote origin` — the exact read the seam exists to
+        // prevent, disabled on one of the three paths that reach it.
+        return finishObservation(obs, wantProbe, stores);
       }
       obs.qualified = qualified.state;
       obs.record = qualified.rec;
@@ -3993,23 +4057,355 @@ export function observeReviewRecord(pr: number, repo?: string): ReviewRecordObse
       // reads `<pr>.json`, so an ambiguous PR is UNTRUSTED — restoring a legacy record
       // here would print "AMBIGUOUS … none is trusted" AND "record: clean at head …"
       // in one block (fresh review, cycle 3, P1).
-      return finishObservation(obs);
+      return finishObservation(obs, wantProbe, stores);
     }
     if (!obs.record && legacy.rec) {
       if (legacy.rec.repo !== undefined) obs.legacy = { kind: "foreign-repo", repo: legacy.rec.repo };
       else obs.record = legacy.rec;
     }
   }
-  return finishObservation(obs);
+  return finishObservation(obs, wantProbe, stores);
 }
 
 /** Attach the record's mint provenance (diagnostic only) and return the observation. */
-function finishObservation(obs: ReviewRecordObservation): ReviewRecordObservation {
+function finishObservation(
+  obs: ReviewRecordObservation,
+  wantProbe: boolean,
+  /** Test seam for the probed stores; production passes nothing (`registryStoreDirs()`). */
+  stores?: string[]
+): ReviewRecordObservation {
   if (obs.record) {
     if (typeof obs.record.mint === "string") obs.mint = obs.record.mint;
     if (typeof obs.record.carried_from === "string") obs.carriedFrom = obs.record.carried_from;
   }
+  // #3175/#2374 — HONOUR THE `"probe"` OPT, on the no-record case only. This is the
+  // ONE place the cross-box store is read from a production path, and it is
+  // deliberately here rather than in `evaluateMergeGate`: NO DECISION BRANCH OF THE
+  // GATE READS THE RESULT, its `record`/head/digest arms are unchanged, and a record
+  // that IS present never pays for a network read (there is nothing the text would
+  // add). ⛔ NOT "the gate performs no I/O" (fresh review, P2): the gate's MESSAGE
+  // arm calls `describeRecordMiss` → `registrySyncOptions` → one local `existsSync`,
+  // so the guarantee is "no NETWORK read on the decision path", not "no I/O here".
+  if (wantProbe && !obs.record) {
+    obs.crossBox = crossBoxRecordState(obs.repo ?? undefined, obs.pr, { stores });
+  }
   return obs;
+}
+
+/** The box name a refusal names (#3175). `os.hostname()` is the fleet's own
+ *  dispatch identity, so it is the value a lane can act on; a failure yields
+ *  `unknown` rather than an exception in a refusal path. */
+export function boxName(): string {
+  try {
+    return os.hostname() || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/** `~/.pi/agent/scripts/registry-sync.sh` (farmed) and the checkout copy (#2374). */
+export const REGISTRY_SYNC_SH = "~/.pi/agent/scripts/registry-sync.sh";
+
+/** One candidate `pull` invocation and whether this box actually has it. */
+export interface RegistrySyncOption {
+  /** What the agent pastes — ONE command, never a pipeline. */
+  command: string;
+  /** The file the command runs, `~` already expanded (so duplicates can be seen). */
+  path: string;
+  present: boolean;
+}
+
+/** `~` → home. The farmed path is written with `~` for readability, and it cannot be
+ *  existence-checked (or deduped against the checkout copy) until it is expanded. */
+function expandHome(p: string): string {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/") || p.startsWith("~\\")) return resolvePath(os.homedir(), p.slice(2));
+  return p;
+}
+
+/** ⛔ EVERY PATH IN THE PASTED REMEDY IS A SHELL *WORD*, NOT RAW TEXT (fresh review, P2).
+ *  `store` was quoted and the script path was not, so the two halves of one command
+ *  disagreed — and this text is a command an agent PASTES. A checkout under
+ *  `/Users/home/agent infra/…` produced `/Users/home/agent infra/scripts/registry-sync.sh
+ *  pull …` (`No such file or directory`, which an agent reads as "the remedy is broken"
+ *  and re-reviews — the cost this change exists to remove), and a path carrying `;`,
+ *  `$( )` or a backtick would EXECUTE.
+ *
+ *  Single quotes are the inert form: inside them `$( )`, backticks and `;` are literal,
+ *  and an embedded `'` becomes `'\''`. A `~`-prefixed path stays UNQUOTED — quoting it
+ *  would suppress the tilde expansion the farmed copy depends on. */
+export function shellQuotePath(p: string): string {
+  if (p.startsWith("~")) return p;
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/** ⛔ THE STORE MUST BE NAMED. `registry-sync.sh` resolves its store as
+ *  `--repo` → `$AGENT_INFRA_PATH` → its own parent dir, so a bare `pull` reads
+ *  whichever store those point at — and for a cross-REPO record (the case the
+ *  multi-store probe exists for) that is a different store, which "succeeds" having
+ *  fetched nothing. A remedy that cannot reach the record it names is worse than no
+ *  remedy: the lane runs it, sees exit 0, and re-reviews anyway (fresh review P1).
+ *
+ *  ⛔ AND NEVER JOINED INTO ONE STRING (fresh review, P2). The two candidates are
+ *  ALTERNATIVES, and joining them with a shell metacharacter (`   |   `) made the
+ *  "one-command fix" a PIPELINE: it runs BOTH halves through a pipe — and in the
+ *  farmed layout (`EXTENSION_DIR = ~/.pi/agent/extensions/review-enforcer`) both
+ *  halves resolve to `~/.pi/agent/scripts/registry-sync.sh`, i.e. the script piped
+ *  into itself. Deduped by EXPANDED path for the same reason, and `present` lets a
+ *  caller declare a copy this box does not have instead of printing it as the
+ *  remedy.
+ *  ⛔ AND EVERY PATH IN IT IS QUOTED (fresh review, P2): `store` was single-quoted and the
+ *  script path was interpolated RAW, so a checkout path with a space produced a command
+ *  that cannot run, and one with `$( )`/backticks would execute on paste. Both halves go
+ *  through `shellQuotePath`.
+ */
+export function registrySyncOptions(store?: string): RegistrySyncOption[] {
+  // ⛔ SINGLE-QUOTED, NOT JSON-QUOTED (fresh review, P2): this text is a command an
+  // agent PASTES. JSON quoting leaves `$(…)` and backticks live inside double quotes,
+  // and `store` is an operator-supplied path ($AGENT_INFRA_PATH / cwd). `'…'` is inert.
+  const repoFlag = store ? ` --repo ${shellQuotePath(store)}` : "";
+  const candidates: Array<{ asWritten: string; path: string }> = [
+    { asWritten: REGISTRY_SYNC_SH, path: expandHome(REGISTRY_SYNC_SH) },
+  ];
+  const checkoutCopy = extensionRelativeScript("registry-sync.sh");
+  if (checkoutCopy) candidates.push({ asWritten: checkoutCopy, path: expandHome(checkoutCopy) });
+  const seen = new Set<string>();
+  const options: RegistrySyncOption[] = [];
+  for (const c of candidates) {
+    if (seen.has(c.path)) continue; // farmed box: both candidates are the SAME file
+    seen.add(c.path);
+    let present = false;
+    try {
+      present = fs.existsSync(c.path);
+    } catch {
+      present = false;
+    }
+    options.push({ command: `${shellQuotePath(c.asWritten)} pull${repoFlag}`, path: c.path, present });
+  }
+  return options;
+}
+
+/** The ONE command a single-line consumer can print: the first candidate that exists
+ *  on this box, else the farmed path (which the caller renders as a declared gap). */
+export function registrySyncCommand(store?: string): string {
+  const options = registrySyncOptions(store);
+  return (options.find((o) => o.present) ?? options[0])?.command ?? `${REGISTRY_SYNC_SH} pull`;
+}
+
+/** Render the candidates as ONE PER LINE, prefixed `try:` / `or:` — an ALTERNATIVE is
+ *  not a pipeline, and a copy this box lacks is DECLARED rather than offered as the
+ *  remedy (fresh review, P2: the farmed script is not installed on cmux). */
+function registrySyncRemedyLines(store: string | undefined, indent = "       "): string[] {
+  const options = registrySyncOptions(store);
+  const live = options.filter((o) => o.present);
+  if (live.length > 0) {
+    return live.map((o, i) => `${indent}${i === 0 ? "try:" : " or:"} ${o.command}`);
+  }
+  // Nothing is installed here: print the invocation AND say so, so an agent does not
+  // read "No such file or directory" as "the remedy is broken — re-review instead".
+  return [
+    `${indent}${options[0]?.command ?? `${REGISTRY_SYNC_SH} pull`}`,
+    `${indent}⚠ no copy of registry-sync.sh exists on this box (${options.map((o) => o.path).join(", ")}) —`,
+    `${indent}  install the farmed copy before running it`,
+  ];
+}
+
+/** A sibling `scripts/<name>` of this extension's checkout, or null. Mirrors
+ *  `resolveDiffHashHelper`'s idiom: report a missing tool, never invent a path. */
+function extensionRelativeScript(name: string): string | null {
+  if (!EXTENSION_DIR) return null;
+  try {
+    const p = resolvePath(EXTENSION_DIR, "..", "..", "scripts", name);
+    return fs.existsSync(p) ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The checkouts whose `refs/reviews/*` namespace the fleet may share (#2374):
+ *  `$AGENT_INFRA_PATH` and this extension's own checkout (where the farmed/sync
+ *  scripts point), PLUS the checkout the merge runs in — because `registry-sync.sh`'s
+ *  refs live on ONE repo's remote per key, and a tortoise PR's record is on the
+ *  tortoise remote, not agent-infra's (measured: agent-infra's store holds 3,668
+ *  refs, and tortoise-keyed records are pushed to the TORTOISE remote — measured
+ *  2026-11-01: 2,570 `refs/reviews/daniel-ospina-tortoise-*` on that remote, and
+ *  `daniel-ospina-tortoise-10483` in none of them, i.e. an unsynced record reads
+ *  `absent` here and must say so as a MEASURED absence). Probing one store would
+ *  print a confident `absent` for a record that exists — the #2349 defect class. */
+function registryStoreDirs(): string[] {
+  const candidates: string[] = [];
+  if (process.env.AGENT_INFRA_PATH) candidates.push(process.env.AGENT_INFRA_PATH);
+  if (EXTENSION_DIR) candidates.push(resolvePath(EXTENSION_DIR, "..", ".."));
+  candidates.push(process.cwd());
+  const stores: string[] = [];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(resolvePath(c, ".git")) && !stores.includes(c)) stores.push(c);
+    } catch {
+      /* unreadable candidate — try the next */
+    }
+  }
+  return stores;
+}
+
+/** One `ls-remote` result per store, reused for every refusal in this process.
+ *  Bounded and MEMOIZED: a few thousand refs is one cheap call, and a lane that
+ *  fetches the record then re-runs the merge must not keep reading a stale
+ *  "absent" (>60 s). */
+const CROSSBOX_MEMO_TTL_MS = 60_000;
+const crossBoxMemo = new Map<
+  string,
+  { at: number; refs: Set<string> | null; why: string | null; origin: string | null }
+>();
+
+/** The repo a STORE's own `origin` is bound to — the evidence that its `refs/reviews/*`
+ *  namespace can answer for a given key (fresh review, P1).
+ *
+ *  ⛔ A LOCAL `git config` READ, NOT A NETWORK ONE, and `execFileSync` with an argv array
+ *  for the same reason the listing uses it: `store` is an operator-supplied path, and a
+ *  shell re-parse of it is the class this file already refuses. Shares `repoFromOriginUrl`
+ *  with `repoFromGitRemote` so the two readers can never disagree about a slug. */
+function storeOriginRepo(store: string): string | null {
+  try {
+    const url = execFileSync("git", ["-C", store, "config", "--get", "remote.origin.url"], {
+      timeout: 2000,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return repoFromOriginUrl(url);
+  } catch {
+    return null; // no origin / not GitHub / not a git dir → this store covers nothing
+  }
+}
+
+/**
+ * Read the shared store's `refs/reviews/*` listing — the ONE read that turns "no
+ * record on this box" into an actionable statement. Never throws, never long:
+ *
+ *   - bounded (8 s) and `try/catch` → `unmeasurable` with the reason, never `absent`;
+ *   - an EMPTY listing is also `unmeasurable`: it may be a remote that is not the
+ *     store at all, and claiming "no such record exists" from it would be a cause
+ *     this gate did not read;
+ *   - ⛔ AND SO IS A MISS IN A STORE THAT DOES NOT ANSWER FOR `repo` (fresh review, P1).
+ *     `registryStoreDirs()` builds its candidates from `$AGENT_INFRA_PATH`, this
+ *     extension's checkout and `cwd` — NONE of them keyed on `repo` — so a cross-REPO
+ *     merge (`gh pr merge <N> --repo other/repo` from an agent-infra checkout) read three
+ *     agent-infra origins, found no ref `other-repo-<pr>`, and called it `absent`: the
+ *     refusal then told the lane to pay for a duplicate review of a record that exists on
+ *     `other/repo`'s own remote. A non-empty listing from the WRONG remote is still a
+ *     listing from the wrong remote — the empty-listing rule above was the same defect,
+ *     applied only to the case that happened to be noticed. So `absent` additionally
+ *     requires that at least one probed store's own `origin` IS `repo`;
+ *   - EVERY candidate store is probed, and a hit in ANY is `present` (a ref NAME carries
+ *     `<owner>-<repo>-<pr>`, so a hit is a fact about the key whatever the store's origin);
+ *   - no decision reads the result (see `CrossBoxRecordState`).
+ */
+export function crossBoxRecordState(
+  repo: string | undefined,
+  pr: number,
+  /** Test seam ONLY: pin the checkouts to probe. Production omits it and the probe
+   *  resolves `registryStoreDirs()` itself, so a hermetic test never reads a store
+   *  (or a remote) it did not construct. */
+  opts: { stores?: string[] } = {}
+): CrossBoxRecordState {
+  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    return { kind: "unmeasurable", why: "repo context unresolved, so the store's key cannot be formed" };
+  }
+  const stores = opts.stores ?? registryStoreDirs();
+  if (stores.length === 0) {
+    return {
+      kind: "unmeasurable",
+      why: "no agent-infra checkout to read the shared store from (set AGENT_INFRA_PATH)",
+    };
+  }
+  const key = `${repo.replace("/", "-")}-${pr}`;
+  const ref = `refs/reviews/${key}`;
+  const now = Date.now();
+  const whys: string[] = [];
+  let scannedTotal = 0;
+  let scannedAny = false;
+  /** Stores whose own `origin` IS `repo` — the only candidates a MISS may speak for. */
+  const covered: string[] = [];
+  // ONE budget for the whole probe (8 s), not per store: a per-store bound (6 s) ×
+  // three candidates would put an 18 s synchronous block inside a tool call (fresh
+  // review, P2).
+  const deadline = now + 8000;
+  for (const store of stores) {
+    const remaining = Math.max(1000, deadline - Date.now());
+    let entry = crossBoxMemo.get(store);
+    if (!entry || now - entry.at > CROSSBOX_MEMO_TTL_MS) {
+      let refs: Set<string> | null = null;
+      let why: string | null = null;
+      const origin = storeOriginRepo(store);
+      try {
+        // execFileSync with an argv array: no value here can be re-parsed as shell syntax.
+        const out = execFileSync("git", ["-C", store, "ls-remote", "--refs", "origin", "refs/reviews/*"], {
+          timeout: remaining,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        refs = new Set(
+          out
+            .split("\n")
+            .map((l) => l.split("\t")[1])
+            .filter((r): r is string => typeof r === "string" && r.startsWith("refs/reviews/"))
+        );
+        if (refs.size === 0) {
+          refs = null;
+          why = `${store}: \`origin\` lists no refs/reviews/* (#2374)`;
+        }
+      } catch (e) {
+        why = `${store}: ${String((e as Error)?.message ?? e).slice(0, 60)}`;
+      }
+      entry = { at: now, refs, why, origin };
+      crossBoxMemo.set(store, entry);
+    }
+    if (!entry.refs) {
+      whys.push(entry.why ?? `${store}: unreadable`);
+      continue;
+    }
+    scannedAny = true;
+    scannedTotal += entry.refs.size;
+    // A HIT NEEDS NO COVERAGE CHECK: the ref name carries `<owner>-<repo>-<pr>`, so
+    // finding it IS the fact this probe wanted. Coverage only decides whether a MISS may
+    // be reported as a negative fact (fresh review, P1).
+    if (entry.refs.has(ref)) return { kind: "present", ref, store, scanned: scannedTotal };
+    if (entry.origin === repo) covered.push(store);
+  }
+  // ⛔ `absent` ONLY IF EVERY CANDIDATE STORE WAS READ. One readable store plus one
+  // unreadable store NAMED `absent` means "no record exists" for a ref the gate never
+  // looked at — and that is exactly the duplicate review this change exists to stop
+  // (fresh review, P1). A partial read is `unmeasurable`, with the stores that failed.
+  if (whys.length > 0) {
+    return {
+      kind: "unmeasurable",
+      why: `read ${stores.length - whys.length}/${stores.length} store(s); ${whys.join("; ")}`.slice(0, 200),
+    };
+  }
+  if (!scannedAny) {
+    return { kind: "unmeasurable", why: "no store could be read" };
+  }
+  // ⛔ COVERAGE (fresh review, P1): every candidate was READ, but if none of them answers
+  // for `repo`, the miss says nothing about this PR — it is the #2349 defect in a new arm.
+  // `unmeasurable` is the honest state, and its prose sends the lane to check the store
+  // before paying for a review rather than after.
+  if (covered.length === 0) {
+    return {
+      kind: "unmeasurable",
+      why:
+        `no store whose origin is ${repo} was among the ${stores.length} read ` +
+        `[${stores.join(", ")}], so this is not a measured absence`,
+    };
+  }
+  return { kind: "absent", store: stores.join(", "), covered: covered.join(", "), scanned: scannedTotal };
+}
+
+/** The one-line, machine-readable state a lane can branch on (#3175): it carries the
+ *  box, the registry path, the per-machine fact, and the cross-box verdict. */
+export function recordAbsentToken(obs: ReviewRecordObservation): string {
+  const cb =
+    obs.crossBox.kind === "present" ? "present" : obs.crossBox.kind === "absent" ? "absent" : "unmeasurable";
+  return `RECORD-ABSENT(host=${obs.host}; registry=${obs.registryDir}; per-machine; crossbox=${cb})`;
 }
 
 /**
@@ -4064,6 +4460,35 @@ export function describeRecordMiss(
     lines.push("       NO file exists at either path ON THIS BOX. The registry is PER-MACHINE, so this is");
     lines.push("       \"not visible here\" — NOT necessarily \"no review happened\": a record minted on another box");
     lines.push("       (or under another HOME) is invisible to this gate, and this box sees only its own.");
+    // #3175/#2374 — SAY WHICH BOX, AND WHETHER THE SHARED STORE HAS IT. The prose
+    // above is only actionable once a lane can tell the two situations APART, and
+    // the measured cost of not telling them apart is a re-review per lane per PR.
+    lines.push(`     box        : ${observation.host} (registry ${observation.registryDir} — per-machine)`);
+    lines.push(`     cross-box  : ${crossBoxLine(observation.crossBox)}`);
+    lines.push(`     ${recordAbsentToken(observation)}`);
+    if (observation.crossBox.kind === "present") {
+      // ⛔ THIS ARM MAY NOT ASSERT A HEAD IT NEVER READ (fresh review, P2). The probe
+      // reads ref NAMES (`git ls-remote --refs`); the record's `head_sha` lives in the
+      // record BODY, which it never fetches. "A review dispatched here would be paid for
+      // twice for the same head" therefore stated a cause this gate did not measure —
+      // and the normal case where it is FALSE is an ordinary PR lifecycle (reviewed on
+      // box A at head X, pushed to Y, merged from a fresh box). So the claim is made
+      // CONDITIONAL in the same sentence that gives the remedy, and the head check that
+      // can actually measure it (`head_advanced` in `evaluateMergeGate`) decides.
+      lines.push("     → NEXT ACTION: a record for THIS PR exists in the shared store, but WHICH HEAD it");
+      lines.push("       binds is not visible until you fetch it. Fetch it, then RE-RUN the merge:");
+      lines.push(...registrySyncRemedyLines(observation.crossBox.store));
+      lines.push("       ⛔ If the re-run then reports the HEAD ADVANCED, the stored record is at an OLDER");
+      lines.push("       head — the fetch was still the right first step, and a review HERE is what to pay for.");
+    } else if (observation.crossBox.kind === "absent") {
+      lines.push("     → NEXT ACTION: the shared store has no record for this PR either, so a review HERE is");
+      lines.push("       genuinely needed — dispatch it and record it at the head you are merging.");
+    } else {
+      lines.push("     → NEXT ACTION: whether another box holds it could not be read (see cross-box above), so");
+      lines.push("       try the store first, naming the checkout whose origin holds refs/reviews/* — add --repo <store> to:");
+      lines.push(...registrySyncRemedyLines(undefined));
+      lines.push("       — and only then pay for a review here.");
+    }
     lines.push("     → remedy (a): if the review ran elsewhere, copy its <owner>-<repo>-<pr>.json into the repo-keyed");
     lines.push("       path above. → remedy (b): re-record here at the head you are merging:");
     lines.push(`       ${recordCmd}`);
@@ -4098,6 +4523,31 @@ export function recordSourcePath(obs: ReviewRecordObservation): string {
   return obs.record ? obs.legacyPath : obs.qualifiedPath;
 }
 
+/** One line describing what the SHARED store holds (#2374/#3175). */
+export function crossBoxLine(cb: CrossBoxRecordState): string {
+  switch (cb.kind) {
+    case "present":
+      // ⛔ NO HEAD CLAIM (fresh review, P2). "the review ran on another box; fetch it, do
+      // not re-review" asserted the stored record is at the head being merged, which
+      // `ls-remote` cannot see (the head is in the record BODY). `present` means "a
+      // record exists for this PR", full stop — the head question is the gate's, and
+      // it answers it AFTER the fetch, as `head_advanced`.
+      return `PRESENT at ${cb.ref} in ${cb.store} — a record for THIS PR exists there; its HEAD is not visible until fetched`;
+    case "absent":
+      // ⛔ NAME THE STORES THE NEGATIVE COVERS (fresh review, P2). A bare "the shared
+      // store" made a three-store read look like one, so a record sitting in a checkout
+      // this probe never considered read as a confident "a review HERE is genuinely needed".
+      // …and NAME THE STORE THAT MAKES IT CREDIBLE (fresh review, P1): `absent` is only
+      // emitted when a store whose own origin IS this PR's repo was read, so the negative
+      // never speaks for a namespace the probe could not reach.
+      return `ABSENT — ${cb.scanned} refs read from every candidate store [${cb.store}], none for this PR${
+        cb.covered ? `; a checkout of THIS PR's repo was among them [${cb.covered}]` : ""
+      }`;
+    default:
+      return `UNMEASURABLE (${cb.why}) — nothing is claimed about other boxes`;
+  }
+}
+
 /** One line per filesystem state — the "what I read" block of a refusal. */
 export function describeRecordObservation(obs: ReviewRecordObservation, indent = "     "): string[] {
   const fileState = (s: RecordFileState): string =>
@@ -4111,7 +4561,9 @@ export function describeRecordObservation(obs: ReviewRecordObservation, indent =
             ? `AMBIGUOUS — ${s.files.length} repo-keyed files match (${s.files.join(", ")}), so no single file is the one tried`
             : `PRESENT but UNREADABLE (${s.reason}) — treated as absent (fail-closed)`;
   const lines = [
+    `${indent}host         : ${obs.host} — this registry is a LOCAL store on THIS box`,
     `${indent}registry dir : ${obs.registryDir}`,
+    `${indent}cross-box    : ${crossBoxLine(obs.crossBox)}`,
     `${indent}repo-keyed   : ${obs.qualifiedPath} — ${fileState(obs.qualified)}`,
     `${indent}legacy       : ${obs.legacyPath} — ${fileState(obs.legacy)}`,
   ];
@@ -4151,11 +4603,20 @@ export function repoFromGitRemote(dir: string): string | null {
       stdio: ["ignore", "pipe", "ignore"],
       encoding: "utf8",
     }).trim();
-    const m = url.match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
-    return m ? m[1] : null;
+    return repoFromOriginUrl(url);
   } catch {
     return null; // not a git dir / no origin / not GitHub → caller falls back
   }
+}
+
+/** `owner/name` from a GitHub remote URL, or null.
+ *  ⛔ ONE PARSER, TWO READERS (fresh review, P1): `repoFromGitRemote` answers "which repo
+ *  is this CHECKOUT bound to", and the cross-box coverage check answers "which repo does
+ *  this STORE's namespace answer for". Two copies of this regex could disagree, and then a
+ *  store would be simultaneously credible and not. */
+export function repoFromOriginUrl(url: string): string | null {
+  const m = url.trim().match(/github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/);
+  return m ? m[1] : null;
 }
 
 export interface RepoContext {
@@ -5662,13 +6123,24 @@ function withoutAssignmentPrefix(word: string): string {
  * `${head}`, the `-->` that closes an HTML marker. Reading those as the `gh` command word made a
  * heredoc that WRITES this gate's own evidence marker (`cat > f <<'EOF' … <!-- admin-merge-
  * safety: ${head} --> … EOF`) a REFUSED read-only command — measured in review cycle 4;
- * `origin/main` admits it. So a construct is accepted only when it CARRIES ITS INTRODUCER
+ * `04bc1dde` (the pre-#3953 base) admits it. So a construct is accepted only when it CARRIES ITS INTRODUCER
  * (`$…`, a backtick, `{…}`), and the one residue that IS a word — the tail of a split `${X}`,
  * i.e. the tokens `$` + `X}` — is accepted only where the `${` itself begins a simple command.
  *
  * ⛔ NOT POSITION-GATED otherwise, deliberately: a wrapper's arguments put the command word out
- * of the position model's reach, and requiring command position lost 168 real admin merges
- * (`timeout 5 g$'h' $'pr' "merge" 999 --admin`) that `origin/main` refuses.
+ * of the position model's reach, and requiring command position then stops reading the merge at
+ * all. The payload row is `timeout 5 g$'h' $'pr' "merge" 999 --admin` — a real admin merge that
+ * `78d897fa1` refuses — and it is pinned in `index.test.ts`'s `assembled` block, so this bound
+ * cannot be tightened without a red. ⚠️ NO MAGNITUDE IS QUOTED HERE: earlier revisions of this
+ * comment said position-gating "lost 168 real admin merges", and no artifact in the repo produced
+ * that 168 (the generated corpus it came from was never landed), so the number could not be
+ * reproduced by any later lane — the same defect this file deletes for the `hasGhCommandWord`
+ * conjunct further down. The pinned ROW survives; the unreproducible count does not.
+ *
+ * NAMING THE BASES: `78d897fa1` is the merged #2907 head (it WAS `origin/main` when these were
+ * measured) and `04bc1dde` is the pre-#3953 base. This file names the two SHAs rather than the ref
+ * so a measurement cannot silently change meaning when main moves (review cycle 7, P2: one
+ * function's docs named both).
  */
 function isGhCommandWordAt(scan: ScanTokens, i: number): boolean {
   const raw = scan.tokens[i];
@@ -5680,14 +6152,15 @@ function isGhCommandWordAt(scan: ScanTokens, i: number): boolean {
   if (w === "gh") return true;
   // A construct that CARRIES ITS INTRODUCER: `$GH`, `$'gh'`, `g$'h'`, `x${X}`, or a backtick.
   // Position does not matter — a wrapper's arguments put the command word out of the position
-  // model's reach (`timeout 5 g$'h' $'pr' "merge" 999 --admin`, measured: position-gating this
-  // lost 168 real admin merges that `origin/main` refuses).
+  // model's reach (`timeout 5 g$'h' $'pr' "merge" 999 --admin`, refused at `78d897fa1` and pinned
+  // in the `assembled` block; the magnitude this comment used to quote was unreproducible and is
+  // deleted — see the note on the function's own doc comment).
   if (/[$`]/.test(raw)) return true;
   // A BRACE-EXPANSION word (`{pr,merge}`) is a construct too.
   if (/^\w*\{/.test(raw)) return true;
   // The ONE residue that IS a word: the TAIL of a split `${X}` (tokens `$` + `X}`), and only when
   // the `${` ITSELF begins a simple command — `GH=gh; ${GH} ${P} merge 999 --admin` is a real
-  // merge `origin/main` refuses. Command position read at the TAIL is not usable: it is true for
+  // merge `78d897fa1` refuses. Command position read at the TAIL is not usable: it is true for
   // a same-shaped `${head}` mid-line in a heredoc body, because the `{` of `${` reads as a group
   // separator to the gap test. The `${` token is where the word starts, so that is the token the
   // position is read at.
@@ -5702,8 +6175,10 @@ function isGhCommandWordAt(scan: ScanTokens, i: number): boolean {
  * NOT position-gated: this question is only ever asked TOGETHER with something else that is
  * already narrow (a merge-verb window, or a top-level `ghGroupIsUnreadable` that does its own
  * position test), and a wrapper's arguments put the command word out of the position model's
- * reach — position-gating it lost 168 real admin merges (`timeout 5 g$'h' $'pr' "merge" 999
- * --admin`) that `origin/main` refuses.
+ * reach. The payload row is `timeout 5 g$'h' $'pr' "merge" 999 --admin` — a real admin merge
+ * `78d897fa1` refuses — and it is pinned in `index.test.ts`'s `assembled` block. ⚠️ NO MAGNITUDE:
+ * the "168 real admin merges" this comment used to quote came from a generated corpus that was
+ * never landed, so no later lane could reproduce it; the pinned ROW is the evidence now.
  */
 export function hasGhCommandWord(command: string): boolean {
   const scan = scanTokens(command);
@@ -5741,7 +6216,7 @@ function ghGroupIsUnreadable(command: string): boolean {
       // The one thing that makes a construct-construct command a REAL merge is the verb: bash
       // hands gh `<group> merge <n> <flag>`, so require the merged word after the group slot.
       // Measured payload: `GH=gh; g$'h' $P "merge" 999 --admin`, `GH=gh; $GH $P 'merge' 999
-      // --admin` (the `GH=gh` assignment is what makes origin/main read them, and a narrowing
+      // --admin` (the `GH=gh` assignment is what makes 78d897fa1 read them, and a narrowing
       // that dropped them would be a fail-open against the base).
       if (w === "gh") return true;
       const verb = j + 1 < scan.tokens.length ? shellWord(scan.tokens[j + 1]) : "";
@@ -5765,31 +6240,254 @@ function ghGroupIsUnreadable(command: string): boolean {
  * Two orderings are OR-ed, and the reason is measured. At the group stage a CONSTRUCT is
  * ambiguous: it can be the GROUP slot of an all-assembled invocation (`GH=gh; ${GH} ${P} $M 999
  * --admin`) or a fresh COMMAND word (`GH=gh; g$'h' "pr" merge 999 --admin`, where the `GH=gh`
- * assignment already opened the group stage). A single ordering loses one of the two — measured:
- * group-first lost 88 real admin merges that `origin/main` refuses, command-first lost 128. Both
- * orderings only ADD candidates, so OR-ing cannot widen the rule in a direction the other does
- * not already reach.
+ * assignment already opened the group stage). A single ordering loses one of the two, and each
+ * losing row is PINNED, so neither arm can be dropped silently (mutants M19 and M20 in review
+ * cycle 8): the group-first row is `GH=gh; ${GH} ${P} $M 999 --admin` and the command-first row is
+ * `GH=gh; g$'h' "pr" merge 999 --admin`, both in the `assembled` block and both refused at
+ * `78d897fa1` AND `04bc1dde`. Both orderings only ADD candidates, so OR-ing cannot widen the rule
+ * in a direction the other does not already reach.
+ * ⚠️ THE COUNTS THIS COMMENT USED TO CARRY ("group-first lost 88 … command-first lost 128") ARE
+ * DELETED: they came from a generated corpus that was never landed, so no later lane could
+ * reproduce them — and an unpinned count is exactly the failure this test now prevents.
  */
 function mergeVerbSequenceInTokens(command: string): boolean {
   return mergeVerbWalk(command, true) || mergeVerbWalk(command, false);
 }
 
+/** A command SEPARATOR, visible only in `scan.gaps`: no reading crosses one. */
+const COMMAND_SEPARATOR = /[;&|(){!\n\r]/;
+
 /**
- * The walk. `groupFirst` decides which reading wins for a construct at the group stage.
+ * A word the walk accepts where a `gh`/`pr`/`merge` word belongs: a construct that CARRIES ONE.
  *
  * ⛔ THE WORD TESTS ARE WHAT BOUND IT, NOT DISTANCE. A construct only counts as a word if it is
  * not a REDIRECTION (`2>/dev/null`, `> file`, `2>&1`, `<<<`), not a `-`-leading flag (read from the
  * DEQUOTED word, so `$'--dry-run'` is a flag), and not shell punctuation. A heredoc writing
  * `<!-- admin-merge-safety: ${head} -->` therefore has no reachable `gh`→group→verb triple: its
  * `<`, `<<'EOF'` and `-->` tokens are all excluded, and what remains (`head}`) cannot complete a
- * sequence — `origin/main` admits that heredoc, and the arms that refused it are the ones this PR
- * narrows (measured, review cycles 4 and 5). An intermediate ADJACENCY bound was removed once
- * these tests were in place: measured redundant on the whole corpus.
+ * sequence — `04bc1dde` (measured there) admits that heredoc, and the arms that refused it are the
+ * ones this PR narrows (measured, review cycles 4 and 5). ONE definition, FOUR slots — the walk's
+ * command, group and verb slots, plus the FLAG slot reached through `isAdminFlagSlot` from the
+ * assembled-argv test: two notions of "a construct in a word slot" is how this file's reads start
+ * disagreeing about the same token.
+ */
+function isVerbSlotConstruct(raw: string, w: string): boolean {
+  return (
+    CONSTRUCT.test(raw) &&
+    w !== "" &&
+    !w.startsWith("-") &&
+    !raw.startsWith("-") &&
+    !/^\d*[<>]/.test(raw) &&
+    !/^&>>?/.test(raw) &&
+    !/^[|&;()]+$/.test(raw)
+  );
+}
+
+/**
+ * Is `tok` the PR SELECTOR of a merge — the positional `gh pr merge` takes?
+ *
+ * The shapes are the ones `extractMergeSelector` resolves (a literal number, or the ONE PR URL
+ * `PR_URL_RE` accepts) PLUS the ASSEMBLED spelling this arm exists for: a word bash substitutes
+ * before gh sees argv (`$PR`, `"$PR"`, `${PR}`, `$N`, `$PR_URL`). Reusing `PR_URL_RE` here is
+ * deliberate — a second notion of "a PR" in this file is how the gate and the shim came to
+ * disagree about which PR a URL names (#1007).
+ *
+ * ⛔ EVERY ARM HERE IS PINNED BY A ROW THAT ACTUALLY FAILS WITHOUT IT (review cycle 8, P2), and
+ * the row for each is named in `index.test.ts`'s #3953 test so the next lane can see which assertion
+ * holds which arm up:
+ *   - the `/^\d+$/` arm — the `assembled` block (`… $M 999 --admin`).
+ *   - the `PR_URL_RE` arm — `timeout 5 ${GH} ${P} ${M} https://…/pull/9 --admin` in
+ *     `assembledSelector`. ⚠️ It was UNPINNED for a whole cycle, and the reason is worth keeping:
+ *     the other URL rows in that block are read by the GROUP-slot ask before this arm is ever
+ *     consulted (`GH=gh; ${GH} ${P} ${M} <url> --admin` is still refused with this arm deleted), so
+ *     only a shape where the URL is the sole readable selector faults it. A corpus cannot pin it at
+ *     all — over every string literal in the three review-enforcer sources the arm is NEVER the
+ *     deciding one; only a row can.
+ *   - the `/[$`]/` (construct) arm — `${PR}` and `$PR_URL` in `assembledSelector`.
+ * ⛔ AND THE `\w*\}` ARM IS GONE: it answered for a bare `X}` tail, which reaches this function
+ * only when `shellWordAt`'s `${X}` pair branch did NOT fire. To see why it went, run the procedure
+ * rather than trusting a number — extract every string literal from the three review-enforcer
+ * sources, run `isAdminMergeCommand` over them with and without the arm, and diff: the arm decides
+ * once, and that input is a TypeScript object-literal fragment, not a command, i.e. it could only
+ * ever widen the read on text that is not a shell command. (No magnitude is quoted here: an earlier
+ * revision of this very comment quoted corpus counts that no later lane could reproduce, which is
+ * the defect this PR deletes elsewhere. The procedure above is the reproducible artifact.)
+ */
+function isMergeSelectorToken(tok: string): boolean {
+  const w = shellWord(tok);
+  if (/^\d+$/.test(w)) return true;
+  if (PR_URL_RE.test(w)) return true;
+  return /[$`]/.test(tok);
+}
+
+/**
+ * The command SPELLS the admin flag somewhere — `--admin`, `--admin=true`, `$'--admin'`, `V=--admin`.
+ *
+ * NOT `hasAdminMergeFlag` (which is deliberately a fail-closed guess) and not `literalAdminFlagIn`
+ * (which reads a normalized probe over the whole text): this answers one narrow question, "may an
+ * ASSEMBLED word in the flag slot be read as the admin flag?", and it anchors on the flag WORD so
+ * `--author=admin` and a bare `admin` do not answer it.
+ */
+function commandSpellsAdminFlag(command: string): boolean {
+  return /--admin(?![\w-])/.test(command);
+}
+
+/** Is the word in the FLAG slot the admin flag — literal, or an assembled one the command spells? */
+function isAdminFlagSlot(word: string, command: string): boolean {
+  const w = shellWord(word);
+  if (/^--admin(=.*)?$/.test(w)) return true;
+  // ⛔ AN ASSEMBLED FLAG COUNTS ONLY WHEN THE COMMAND SPELLS `--admin` SOMEWHERE. `$V` alone is a
+  // guess, and the guess is what made a construct RUN (`node $A $B $C $D admin`) a merge. With the
+  // anchor, `V=--admin; GH=gh; ${GH} ${P} $M $PR $V` is still refused (the flag IS an assembled
+  // `--admin` — a measured fail-open of a literal-only rule) while the run is not.
+  return isVerbSlotConstruct(word, w) && commandSpellsAdminFlag(command);
+}
+
+/**
+ * One SHELL WORD starting at token `k`, and the index of its LAST token.
+ *
+ * `${X}` arrives as the PAIR `$` + `X}` (the tokenizer splits on `{`, which is a separator, while
+ * `}` is not), so a word can span two tokens. Reading half a word as a slot is what put the verb of
+ * `GH=gh; ${GH} ${P} $M ${PR} --admin` one token late and left its selector unread (measured).
+ */
+function shellWordAt(scan: ScanTokens, k: number): { word: string; end: number } {
+  if (
+    shellWord(scan.tokens[k]) === "" &&
+    k + 1 < scan.tokens.length &&
+    /^\w*\}$/.test(scan.tokens[k + 1]) &&
+    // The `{` of `${` IS what the split put in this gap (it is a separator character): it is the
+    // OPENING BRACE of the expansion, not a separator between two words — `{ cmd; }` would put a
+    // real separator here and the tail would not be `\w*}`.
+    /^\s*\{\s*$/.test(scan.gaps[k + 1])
+  ) {
+    return { word: scan.tokens[k] + scan.tokens[k + 1], end: k + 1 };
+  }
+  return { word: scan.tokens[k], end: k };
+}
+
+/**
+ * The index of the next INDEPENDENT argv word at or after `k`, or -1 when the invocation ends first.
+ *
+ * Two bounds, both measured. (a) It STOPS at a command separator: an unbounded forward scan borrowed
+ * a token from another command, so `git log $A $B $C --author=admin -n 5`,
+ * `rg admin $A $B $C -A 3`, `echo $A $B $C admin; sleep 5` and `node $A $B $C admin && sleep 10`
+ * were refused for a `5`/`3`/`10` belonging to `sleep`/`rg` (review cycle 6, P2). (b) It skips a
+ * GLOBAL VALUE FLAG and its value, because `--hostname github.com` may sit between the verb and the
+ * positional: `GH=gh; ${P} $M --hostname github.com $PR --admin` is a real assembled admin merge,
+ * refused at both bases, and dropping this skip ADMITS it (measured — review cycle 7, mutant M4; the
+ * `--repo` half of the set is already removed by `stripRepoArgs` before the walk, so the row that
+ * faults this bound spells `--hostname`).
+ */
+function nextWordStart(scan: ScanTokens, k: number): number {
+  let j = k;
+  while (j < scan.tokens.length) {
+    if (COMMAND_SEPARATOR.test(scan.gaps[j])) return -1;
+    const { word, end } = shellWordAt(scan, j);
+    if (GLOBAL_VALUE_FLAGS.has(shellWord(word))) {
+      j = end + 2; // the flag and its value are not the positional
+      continue;
+    }
+    return j;
+  }
+  return -1;
+}
+
+/**
+ * Does a word standing in the VERB slot carry a real merge's ARGV after it — a PR SELECTOR, and then
+ * the ADMIN FLAG this gate is about?
+ *
+ * ⛔ A PR SELECTOR ALONE DOES NOT SEPARATE THE TWO CLASSES, and that is measured, not argued. The
+ * read-only commands this bound exists to keep admitted are themselves construct RUNS —
+ * `node $A $B $C admin`, `git log $A $B $C --author=admin`, `bash "$AIR/…verify-admin-merge-
+ * evidence.sh" "$PR" "$HEAD"` — so every construct after the verb slot reads as a selector under a
+ * selector-only bound and it answers true for all of them (the walk's `$A` is a `gh` word, `$B` a
+ * group and `$C` a verb under exactly the over-approximation the assembled merges use). What a REAL
+ * assembled admin merge has and those do not is the argv shape `merge <selector> <admin flag>`, and
+ * requiring the argv the operation actually takes is this file's own rule — bound the arm by the
+ * OPERATION, not by vocabulary.
+ *
+ * ⛔ IT IS ASKED AT THE GROUP SLOT TOO, and only measurement explains that. `GH=gh;` is an
+ * ASSIGNMENT PREFIX, not a word of the invocation, so the walk — which reads `GH=gh` as the command
+ * word — places the real words one slot early: the group lands where the verb belongs. Asking at
+ * both slots loses nothing (the stage-1 construct is already being accepted as a word, so this only
+ * ADDS the argv reading) and without it a URL selector is unread (`… $M https://…/pull/9 --admin`
+ * walked as verb=`${P}`), which was the second of the two cycle-7 P0 rows.
+ *
+ * Refused by this bound and refused at both `78d897fa1` and `04bc1dde` (measured, review cycle 7):
+ *   `GH=gh; ${GH} ${P} $M $PR --admin`            (also `"$PR"`, `${PR}`, `"$PR" … --squash`)
+ *   `GH=gh; ${GH} ${P} $M https://github.com/o/r/pull/9 --admin`
+ *   `GH=gh; ${GH} ${P} $M $PR_URL --admin`       (also `X=gh; ${X} ${P} $M $N --admin`)
+ *   `GH=gh; ${GH} ${P} $M --repo o/r $PR --admin`  (the repo pair is stripped before the walk)
+ *   `GH=gh; ${GH} ${P} $M --hostname github.com $PR --admin` (a global flag that is NOT stripped:
+ *     this pair of rows is what faults the value-flag skip, measured — mutant M4)
+ *   `V=--admin; GH=gh; ${GH} ${P} $M $PR $V` — an ASSEMBLED flag: refused at both bases, so a
+ *     literal-only flag rule would be a fail-open, and `commandSpellsAdminFlag` is what keeps it
+ *   `sh -c 'GH=gh; ${GH} ${P} $M $PR --admin'` and the `X='…'; sh -c "$X"` spelling
+ * ⛔ The cycle-6 comment claimed those were a "declared residual" because "when it is a VARIABLE the
+ * base did not read the command either". That was FALSE and the reviewer measured it: the base
+ * refuses all seven spellings. They are a regression this bound closes, not a residual it inherits.
+ */
+function assembledMergeArgvAfter(scan: ScanTokens, i: number, command: string): boolean {
+  const sel = nextWordStart(scan, i + 1);
+  if (sel < 0) return false;
+  const selector = shellWordAt(scan, sel);
+  if (!isMergeSelectorToken(selector.word)) return false;
+  const flag = nextWordStart(scan, selector.end + 1);
+  return flag >= 0 && isAdminFlagSlot(shellWordAt(scan, flag).word, command);
+}
+
+/**
+ * Does a construct standing in the VERB slot take the ADMIN FLAG **immediately after it, with NO
+ * PR selector at all** — the argv of `gh pr merge --admin`, which merges the CURRENT BRANCH?
+ *
+ * ⛔ WITHOUT THIS ARM THAT SPELLING WAS A FAIL-OPEN, and it was measured at the cycle-8 head
+ * `90859f471` (review cycle 9, P0): `gh pr merge --admin` is a REAL admin merge (`extractMergePrNumber`
+ * returns null for it,
+ * and this file's own contract says a null answer must FAIL CLOSED), but every reading of it dropped
+ * out: `assembledMergeArgvAfter` requires a SELECTOR and this shape has none (the first word after
+ * the verb is `--admin`, which `isMergeSelectorToken` rejects), `isGitOp`'s `GH_PR_PATTERN` needs a
+ * literal `gh pr merge` (the verb here is a construct), and the text arm's conjunct
+ * (`hasBareGhWord ∨ MERGE_WORD`) is false because the `gh` word is itself a construct. So
+ * `isGitOp` answered false and the handler returned at `if (!isGitOp(command)) return undefined;`
+ * BEFORE the evidence gate and the registry gate — the gate never ran on a real admin merge.
+ * Measured at `X=gh; ${X} pr $M --admin` (and `"pr"`, `--squash`, `${M}` spellings):
+ * REFUSED at BOTH bases (`78d897fa1`, `04bc1dde`), ADMITTED at the cycle-8 head. A spelling that
+ * both bases refused and this one admits is a regression by this PR's own criterion.
+ *
+ * ⛔ AND IT IS GUARDED BY THE LITERAL `pr` WORD, which is what keeps it from widening the
+ * over-block this PR is about. The SELECTOR requirement is what separates an assembled merge from
+ * the construct RUNS (`node $A $B $C admin`, `git log $A $B $C --author=admin`, the evidence
+ * verifier's `"$PR" "$HEAD"`), and dropping it unguarded would re-open exactly that class: three
+ * consecutive constructs read as `gh`→`pr`→`merge` under the walk's over-approximation. A run has
+ * no literal `pr` in its GROUP slot, so requiring one keeps every one of those rows admitted while
+ * the group word here is the actual `gh pr` group. Measured: the suite stays green, i.e. no row in
+ * `notInvocations` or `overBlocks` became a merge when this arm was added.
+ */
+function assembledBareAdminAfter(scan: ScanTokens, i: number, command: string): boolean {
+  const verb = shellWordAt(scan, i);
+  if (!isVerbSlotConstruct(scan.tokens[i], verb.word)) return false;
+  const flag = nextWordStart(scan, verb.end + 1);
+  return flag >= 0 && isAdminFlagSlot(shellWordAt(scan, flag).word, command);
+}
+
+/**
+ * The walk. `groupFirst` decides which reading wins for a construct at the group stage.
+ *
+ * ⛔ THE WORD TESTS ARE WHAT BOUND IT, NOT DISTANCE (see `isVerbSlotConstruct`, the ONE definition
+ * the slots share). A heredoc writing `<!-- admin-merge-safety: ${head} -->` has no reachable
+ * `gh`→group→verb triple: its `<`, `<<'EOF'` and `-->` tokens are all excluded, and what remains
+ * (`head}`) cannot complete a sequence — `04bc1dde` (measured there) admits that heredoc, and the
+ * arms that refused it are the ones this PR narrows (measured, review cycles 4 and 5). An
+ * intermediate ADJACENCY bound was removed once these tests were in place: measured redundant on
+ * the whole corpus.
  */
 function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
   const scan = scanTokens(command);
   // 0: looking for the command word, 1: for `pr`, 2: for `merge`.
   let stage = 0;
+  // Did the LITERAL word `pr` take us out of stage 1? Only then may the selector-less arm above
+  // read a construct in the verb slot as a merge (see `assembledBareAdminAfter`).
+  let groupWasLiteralPr = false;
   for (let i = 0; i < scan.tokens.length; i++) {
     const raw = scan.tokens[i];
     const w = shellWord(raw);
@@ -5806,28 +6504,31 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
     // resolve, and requiring command position there re-opened the same hole one wrapper deeper
     // (measured). A bare `$` is excluded, so `${RAIL}` (which tokenizes to `$` + `RAIL}`) cannot
     // be read as a command word.
-    // A LEADING DASH MEANS A FLAG, NOT A WORD -- and it has to be read from the DEQUOTED word:
-    // `$'--dry-run'` does not start with `-` as a RAW token, but bash hands gh a flag, so reading
-    // the raw text only made `$PYTHON $SCRIPT $'--dry-run'` a three-construct "merge" (measured).
-    // ⛔ A REDIRECTION IS NOT A VERB EITHER (review cycle 5, P1). `CONSTRUCT` lists `<`/`>` among
-    // the shell metacharacters, so `2>/dev/null`, `>/tmp/out`, `2>&1` and `<<<` all qualified as
-    // construct words -- and an adjacent construct at the verb stage returned true, so appending
-    // ONE redirect to a read-only command made it a candidate:
-    // `bash $AIR/scripts/verify-admin-merge-evidence.sh "$PR" 2>/dev/null` and
-    // `jq --arg admin "$X" "$F" > /tmp/out` are refused at the cycle-4 head and admitted at
-    // origin/main (measured) -- the cycle-3 over-block, re-opened one token over.
-    const isConstructWord =
-      CONSTRUCT.test(raw) &&
-      w !== "" &&
-      !w.startsWith("-") &&
-      !raw.startsWith("-") &&
-      !/^\d*[<>]/.test(raw) &&
-      !/^&>>?/.test(raw) &&
-      !/^[|&;()]+$/.test(raw);
+    // NOTE a bare `$` is excluded by the helper, so `${RAIL}` (which tokenizes to `$` + `RAIL}`)
+    // cannot be read as a command word. The flag and redirection bounds live in the helper too
+    // (leading `-` from the DEQUOTED word; `2>/dev/null`/`>/tmp/out`/`2>&1`), because they are the
+    // same question in every slot — see `isVerbSlotConstruct`.
+    const isConstructWord = isVerbSlotConstruct(raw, w);
     const isCommandWord = /\bgh\b/.test(w) || isConstructWord;
     if (stage === 2) {
       if (verbWord === "merge") return true;
-      if (isConstructWord) return true;
+      // ⛔ A CONSTRUCT IN THE VERB SLOT NEEDS A MERGE'S ARGV AFTER IT (review cycles 6 and 7).
+      // Without a bound, three CONSECUTIVE variable words read as `gh`→`pr`→`merge`, so
+      // `node $A $B $C admin`, `git log $A $B $C --author=admin`, `echo $A $B $C admin` and
+      // `bash "$AIR/…/verify-admin-merge-evidence.sh" "$PR" "$HEAD"` were refused at the merged
+      // #2907 head `78d897fa1` — the base before it, `04bc1dde`, admits every one (both measured).
+      // The first bound asked for a bare NUMBER and left a P0 open: a selector that was a VARIABLE
+      // (`GH=gh; ${GH} ${P} $M $PR --admin`) or a URL no longer reached this arm at all, so
+      // `isGitOp` was false and the evidence gate never ran (measured at this head and refused at
+      // BOTH bases). `assembledMergeArgvAfter` states the argv a merge actually takes — a PR
+      // SELECTOR and then the ADMIN flag — which is what separates the assembled merges from the
+      // construct RUNS above; see its comment for why a selector alone does not.
+      if (isConstructWord && assembledMergeArgvAfter(scan, i, command)) return true;
+      // ⛔ AND A CONSTRUCT VERB WITH NO SELECTOR AT ALL, when the GROUP was the literal `pr`: the
+      // `gh pr merge --admin` spelling (current branch), which had no arm at all — see
+      // `assembledBareAdminAfter`. Guarded by the literal `pr` so a three-construct RUN cannot
+      // reach it (`node $A $B $C admin` has no `pr` in the group slot).
+      if (groupWasLiteralPr && assembledBareAdminAfter(scan, i, command)) return true;
       // A pure-whitespace assignment (`CMD+=' '`) is a SEPARATOR being assembled, not a verb
       // slot: skipping it is what lets `CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge` read as
       // one invocation (measured as a real bypass).
@@ -5835,15 +6536,26 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
       // A word in the verb slot that is not the verb restarts the walk (a command word here can
       // begin a fresh sequence; anything else drops back to looking for one).
       stage = isCommandWord ? 1 : 0;
+      groupWasLiteralPr = false;
       continue;
     }
     if (stage === 1) {
       if (verbWord === "pr" || (groupFirst && isConstructWord)) {
+        // ⛔ ASKED HERE TOO: `GH=gh;` is an ASSIGNMENT PREFIX, not a word of the invocation, so the
+        // walk places the real words one slot early and the GROUP lands in the verb slot. That
+        // reading is what left `… ${P} $M https://…/pull/9 --admin` unread (verb=`${P}`, selector
+        // `$M`, flag = the URL). Nothing is widened: a stage-1 construct is already accepted as a
+        // word here, and this only adds the argv reading to it.
+        if (isConstructWord && assembledMergeArgvAfter(scan, i, command)) return true;
+        groupWasLiteralPr = verbWord === "pr";
         stage = 2;
         continue;
       }
     }
-    if (isCommandWord) stage = 1;
+    if (isCommandWord) {
+      stage = 1;
+      groupWasLiteralPr = false;
+    }
   }
   return false;
 }
@@ -5938,17 +6650,17 @@ export function mergeInvocationInText(command: string): boolean {
   // the SEQUENCE WALK (arm 3) reads the words anyway, so this function answers true. That is
   // the fail-closed direction and it is accepted, not overlooked — a quoted MENTION of a merge
   // costs, at most, a resolvable PR number, while a missed INVOCATION costs the bypass. It is
-  // NOT simply "a candidate at origin/main": with no CONSTRUCT in the text the caller takes its
+  // NOT simply "a candidate at 78d897fa1": with no CONSTRUCT in the text the caller takes its
   // readable-text branch, which requires a BARE `gh` word (`hasBareGhWord`) and a quoted mention
   // supplies none — so the end-to-end predicate stays false for a quote-only spelling (measured:
   // `echo 'gh pr merge 9 --admin'` has `hasAdminMergeFlag` true and is still false at
-  // origin/main AND false here, while this function is true).
+  // 78d897fa1 AND false here, while this function is true).
   // What must never vary is the ARM you are reading: the count is data-aware, the sequence
   // walk is quote-blind.
   // The shared count, tied to two other reads. On its own it is too blunt to be the candidate
   // rule: it walks constructs ANYWHERE, so a heredoc that WRITES this gate's own evidence marker
   // (`cat > f <<'EOF'` ... `<!-- admin-merge-safety: ${head} -->` ... `EOF`) counts as one merge
-  // there (`countMergeVerbs` is 1, unchanged by this PR) while `origin/main` admits it. So the
+  // there (`countMergeVerbs` is 1, unchanged by this PR) while the pre-#3953 base `04bc1dde` admits it (measured). So the
   // window only counts when the command ALSO carries a `gh` command word (`hasGhCommandWord`,
   // NOT position-gated: a wrapper's arguments hide the position) AND the word `merge`
   // (`MERGE_WORD`, so a hyphenated identifier does not count). Measured with this gate removed:
@@ -5974,11 +6686,32 @@ export function mergeInvocationInText(command: string): boolean {
   // never closes — while `mergeVerbInText` DOES name a merge for all of them. Two predicates
   // for "is this a merge" disagreeing is the failure this file keeps re-learning, so the
   // candidate rule is made a SUPERSET of that read rather than a second opinion beside it.
-  // SCOPED PRECISELY: the pinned invariant is `mergeVerbInText(c) ⇒ mergeInvocationInText(c)`.
+  // SCOPED PRECISELY: the pinned invariant is `(hasBareGhWord ∨ MERGE_WORD) ∧ mergeVerbInText(c)
+  // ⇒ mergeInvocationInText(c)` — the two merges-reads may not disagree ABOUT A MERGE INVOCATION.
+  // ⛔ `hasBareGhWord`, NOT `hasGhCommandWord`: a CONSTRUCT counts as a gh command word
+  // (`$PR` — see `hasGhCommandWord`), so the wider conjunct would re-state as an invariant the
+  // very over-block this arm's bound exists to remove (`echo pr $PR admin`: `hasGhCommandWord`
+  // true, candidate false). ⛔ NO MAGNITUDE IS QUOTED HERE (review cycle 7, P2): an earlier version
+  // claimed "202 violations … over a 580-input corpus" and no such corpus exists in the repo, so
+  // the number could not be reproduced. What IS pinned is the row, in
+  // `mergeInvocationInText: the candidate rule is a SUPERSET …` — that test asserts this exact
+  // command's two reads and the scope the conjunct states, and it is the artifact to measure
+  // against rather than a count stated in prose.
+  // The unconditional form is FALSE and was measured so (review cycle 6): `mergeVerbInText` also
+  // names a bare `pr` mention with no `gh` in the command, which is not an invocation.
   // `isAdminMergeCommand` is a DIFFERENT (narrower) question — it also requires
   // `hasAdminMergeFlag`, so `gh pr merge 999` (no flag anywhere) is a merge this rule sees and
   // the ADMIN-merge gate does not, which is correct and is how the registry gate gets it.
-  if (mergeVerbInText(bare)) return true;
+  // ⛔ BUT NOT ON A BARE `pr` MENTION (review cycle 6, P1 over-block). That read is quote-blind
+  // for a construct after a bare `pr` WORD, so on its own it refused `echo pr $PR admin` and
+  // `echo "pr $PR admin"` — commands the pre-#3953 base `04bc1dde` ADMITS and the merged head
+  // `78d897fa1` refuses (both measured), containing no `gh` at all. The bound is
+  // that the command must still look like a merge INVOCATION: a BARE `gh` word somewhere
+  // (`hasBareGhWord` — a CONSTRUCT such as `$PR` is not enough, or every `$`-bearing command with
+  // the word `pr` in it would qualify) or the WORD `merge` (`MERGE_WORD`). Measured: every cycle-1
+  // shape this arm exists for has the literal `gh` word, and the `pr merge <n> --admin` fragment
+  // has the verb word — both survive; the `echo pr $PR` class does not.
+  if ((hasBareGhWord(bare) || MERGE_WORD.test(bare)) && mergeVerbInText(bare)) return true;
   // The separators are not recoverable from the text, so the token arms above are not a
   // read of this command: refuse on the WORDS read, which is what the pre-#3953 rule did.
   if (ansiCEncodesSeparator(bare)) {
@@ -7476,7 +8209,15 @@ export default function (pi: ExtensionAPI) {
         // #2349: the registry observation, taken ONCE and passed to the gate as a
         // MESSAGE INPUT. `record` above is still what `readReviewRecord` returned —
         // the observation is never consulted for a decision.
-        const recordObservation = observeReviewRecord(prNumber, envRepo ?? undefined);
+        const recordObservation = observeReviewRecord(
+          prNumber,
+          envRepo ?? undefined,
+          // #3175/#2374: the cross-box store is read HERE — the I/O site — never inside
+          // the pure `evaluateMergeGate`, and only when there is no local record, which
+          // is the only case whose text needs it. Bounded (ONE 8 s deadline for the
+          // whole probe, not per store), memoized, never throws.
+          record ? {} : { crossBox: "probe" }
+        );
         // #285 Fix C: the no-record block message is shape-aware (task
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(
