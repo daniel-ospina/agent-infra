@@ -676,7 +676,8 @@ export OR="daniel-ospina/tortoise" OR_OPERATOR_DECLARED=1
 rp "$D"
 ck "(h) an AMBIENT exported \$OR does not reach the pass (rc=$RC — it must proceed)" "$([ "$RC" -eq 0 ]; echo $?)"
 # ⛔ THE RECORD ASSERTION READS THE MARKER THE RECORD ACTUALLY CARRIES (review cycle 1, P1-ish). It used
-# to look for `was DECLARED`, a string that exists ONLY on `resolve_repo`'s stdout (`refresh-candidates.sh:311`) and never in
+# to look for `was DECLARED`, a string that exists ONLY on `resolve_repo`'s stdout (its local-path `$OR_DECLARED` arm — cited by ARM, not by line, because
+# this diff has already moved that number twice) and never in
 # `why=`, so it was green by construction: measured with `-u OR` removed from `RP_CLEAR`, the pass went
 # rc=3 and this arm still printed ✅ while `why=` plainly held a `sub-step=resolve-repo` refusal.
 case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
@@ -864,6 +865,13 @@ case "$OUT" in *"local mirror"*) r=0 ;; *) r=1 ;; esac
 ck "(h3) …and the LOG calls it a local mirror too" "$r"
 case "$OUT" in *"another repo's tree"*) r=1 ;; *) r=0 ;; esac
 ck "(h3) …and the log makes no #1901 identity claim about it" "$r"
+# …and the remedy it offers is one that CAN work (review cycle 15, P2): the sibling local-path arm may
+# say "or unset OR to use the harness default" because IT is gated on `OR_DECLARED`; this refusal is
+# unconditional, and this fixture runs with the harness default already in force. Re-adding the clause
+# to the `file://` arm reddens this row, and the sibling arm keeps printing the string elsewhere — so
+# the row is not vacuous.
+case "$OUT" in *"unset OR"*) r=1 ;; *) r=0 ;; esac
+ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 
 echo
 echo "==> $PASS passed, $FAIL failed"

@@ -300,7 +300,12 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
            file://*)
              echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is the local mirror $url — a file:// URL names no repo identity, so it cannot prove it is a checkout of \$OR ($OR)"
              echo "[refresh]   refusing is deliberate: a path cannot certify a queue target. Retrying cannot fix it, and the checkout is not evidence of a DIFFERENT repo either"
-             echo "[refresh]   fix: give the checkout a real remote (git -C $REPO remote set-url origin https://github.com/$OR.git), or unset OR to use the harness default"
+             # ⛔ AND THE REMEDY MUST BE ONE THAT CAN WORK (review cycle 15, P2): the local-path arm's
+             # "or unset OR to use the harness default" was copied here, where it is FALSE — that arm is
+             # gated on OR_DECLARED, while this one refuses unconditionally, so an operator who unsets OR
+             # changes nothing (the diff's own `(h3)` fixture runs with the harness default in force and
+             # still refuses). `(h3)` pins the absence of that clause.
+             echo "[refresh]   fix: give the checkout a real remote (git -C $REPO remote set-url origin https://github.com/$OR.git) — a file:// origin is refused whether or not \$OR was declared, so unsetting OR cannot help"
              return 1 ;;
            # A URL-shaped origin names a repo that can be COMPARED, so a difference is a refusal.
            *://*|*@*:*)
