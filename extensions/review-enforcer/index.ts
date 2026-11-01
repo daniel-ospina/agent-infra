@@ -1551,8 +1551,30 @@ export function maskHeredocData(command: string): string {
       let closed = false;
       for (i++; i < lines.length; i++) {
         const probe = opener.stripTabs ? lines[i].replace(/^\t+/, "") : lines[i];
-        out.push(blank(lines[i]));
-        if (probe === opener.delim) {
+        // ⛔ THE TERMINATOR IS KEPT VERBATIM, AND THAT IS A FAIL-OPEN FIX (fresh-context review,
+        // P0 — measured). The BODY is blanked; the terminator LINE is not. Blanking it too made this
+        // function's output UNPARSEABLE BY ITS OWN GRAMMAR: a later masker looking for the terminator
+        // of the SAME opener could not find it (it was now spaces), so it searched PAST it and blanked
+        // real commands until it hit some LATER surviving `EOF`. Measured at this head, the gate's own
+        // call shape — `isGitOp(maskHeredocData(raw))`, `index.ts` `tool_call` — turned a REAL push
+        // into zero dispatches:
+        //
+        //   cat > /tmp/f.md <<'EOF'      ← this body IS masked
+        //   prose
+        //   EOF                          ← …so its terminator was blanked
+        //   git -C /wt push origin main  ← bash RUNS this
+        //   cd /tmp && cat > /tmp/g.md <<'EOF'   ← this one is REFUSED (unprovable prefix), so Its
+        //   prose2                             ←   terminator SURVIVES
+        //   EOF
+        //
+        // `isGitOp(raw)` was true and `isGitOp(maskHeredocData(raw))` was FALSE — the second masker
+        // re-found the first opener, could not find its blanked terminator, and ran to the surviving
+        // `EOF`, swallowing the push. The terminator is a bare delimiter word — it can never match a
+        // `git`/`gh` arm — so keeping it removes nothing from the classifier and makes re-masking a
+        // no-op, which is what both callers (`gitWordAnywhere`, `writesOnlyTrackerRecords`) require.
+        const isTerminator = probe === opener.delim;
+        out.push(isTerminator ? lines[i] : blank(lines[i]));
+        if (isTerminator) {
           closed = true;
           break;
         }
@@ -3585,15 +3607,26 @@ export function withoutQuotedHeredocBodies(command: string): string {
     // So the PROVEN reader decides, and its delimiter is the one this masks — the same "one opener
     // reader" rule `stripHeredocBodies` and `maskHeredocData` already follow. `QUOTED_HEREDOC` is now
     // kept ONLY to locate the quoted word, for the rewrite span.
-    const stripTabsOpen = /^<<-/.test(line.slice(at));
-    const resolved = heredocDelimiterWord(line, at + 2 + (stripTabsOpen ? 1 : 0));
-    if (resolved === null || !proven.some((o) => o.delim === resolved.word)) {
+    const stripTabsAtDecoy = /^<<-/.test(line.slice(at));
+    const resolved = heredocDelimiterWord(line, at + 2 + (stripTabsAtDecoy ? 1 : 0));
+    const provenMatch = resolved === null ? undefined : proven.find((o) => o.delim === resolved.word);
+    if (resolved === null || provenMatch === undefined) {
       // Not an opener the SHELL would see, or a delimiter no static read can resolve: the body stays
       // READABLE, which is the fail-closed direction.
       out.push(line);
       i++;
       continue;
     }
+    // ⛔ `<<-` IS A PROPERTY OF THE PROVEN OPENER, NOT OF THE CANDIDATE (fresh-context review, P1 —
+    // measured). `QUOTED_HEREDOC` locates a DECOY position, and one line can hold both: for
+    // `cat <<<'EOF' <<-'EOF'` the candidate is the here-string (no `-`) while the opener the SHELL
+    // sees is `<<-'EOF'`, whose terminator may be `\tEOF`. Reading `<<-` off the candidate searched
+    // for `EOF` where bash terminates at `\tEOF`, so the search ran PAST bash's terminator and
+    // blanked a `git -C /wt` push the next lines EXECUTE (measured: bash created the side-effect
+    // file; `isGitOp` was false). The rewrite span still comes from the CANDIDATE (`resolved.end`),
+    // which is harmless: it only rewrites the opener line's own `<<…` to the exempt `</dev/null`
+    // shape, and the proven opener left in place cannot match a `git`/`gh` arm.
+    const stripTabs = provenMatch.stripTabs;
     const delim = resolved.word;
     const remainder = line.slice(resolved.end);
     const prefixOnLine = line.slice(0, at);
@@ -3706,7 +3739,6 @@ export function withoutQuotedHeredocBodies(command: string): string {
     line = line.slice(0, at) + "</dev/null" + line.slice(resolved.end);
     out.push(line);
     i++;
-    const stripTabs = stripTabsOpen;
     let closed = false;
     for (let j = i; j < lines.length; j++) {
       const probe = stripTabs ? lines[j].replace(/^\t+/, "") : lines[j];
@@ -3782,7 +3814,15 @@ export function withoutQuotedHeredocBodies(command: string): string {
 // DECLARED RESIDUALS, unchanged from HEAD in kind and now stated rather than implied: an alias push
 // (`git -c alias.p=push p origin …`), and `$('git' push)` / `sh -c 'git -C /wt push'` keep no arm
 // HERE (nor did `GIT_COMMIT_PATTERN` at HEAD) — the quote sits where a command word's boundary would
-// be, so the pattern cannot see through it. `writesOnlyTrackerRecords`' `mentionsGitWord` veto does
+// be, so the pattern cannot see through it. ⛔ THE SAME APPLIES TO A QUOTED VERB (fresh-context
+// review, P2 — measured): `git "push" origin main`, `git 'push' …`, `git pu"sh" …` and `\git push …`
+// are all REAL pushes and all reach zero dispatches here AND on `origin/main`, so this is a
+// pre-existing gap, not a regression. The word `git` is visible to `mentionsGitWord` in the backslash
+// form only as a veto inside the tracker-write classifier, which speaks only after a `gh`+`pr`
+// candidate exists, so these reach zero dispatches ALONE. They are NOT fixed by widening the verb to
+// a quoted alternative, because that arm would also fire on the prose `echo 'git "push"'`, i.e. it
+// would re-break #1492's "a quoted MENTION is not an operation". Stated, not silently absorbed.
+// `writesOnlyTrackerRecords`' `mentionsGitWord` veto does
 // NOT cover them either: that function is reachable only once a `gh`+`pr` candidate exists, so these
 // spellings reach zero dispatches ALONE on both trees. The argv layer (#984) is the answer for the
 // rest. (`git update-index` was listed here while the pattern armed it — the two disagreed; it is
@@ -3844,7 +3884,10 @@ export function isGitOp(command: string): boolean {
   // hits — a regression introduced by the `gh pr "merge"` fix and caught by
   // VGATE round 4.
   if (GIT_COMMIT_PATTERN.test(command) || GH_PR_PATTERN.test(command)) return true;
-  // ⛔ A `git` WRITE VERB IS A SHIPPING OP IN EVERY SPELLING (round-2 review, P0). The literal arm
+  // ⛔ A `git` WRITE VERB IS A SHIPPING OP IN EVERY GLOBAL-OPTION SPELLING (round-2 review, P0). "EVERY
+  // SPELLING" ALONE WAS AN OVERCLAIM — a QUOTED verb (`git "push"`, `\git push`) still reaches no
+  // arm; those are in `GIT_WRITE_VERB_PATTERN`'s DECLARED RESIDUALS, with the reason breaking them is
+  // not a widening. The literal arm
   // above cannot cross a global option, so `git -C <path> push` — this fleet's own canonical form —
   // and `git --no-pager push` / `git -c k=v commit` matched NO arm and reached zero dispatches. The
   // fix is an ARM, not a veto: `gitWordAnywhere` below is a veto inside the tracker-write classifier,

@@ -10343,10 +10343,36 @@ const CLASSIFICATION_MASK_EVASIONS: Array<[string, string]> = [
 // must fire (`isGitOp`), AND the OPERATION inside the executed body must still be VISIBLE in the
 // classifier's masked read — a row can pass the first while the masker blanks the body, because an
 // unmasked-but-still-refused command exists (the frame rows did exactly that at the reviewed head).
+// ⛔ ONE KNOWN, PRE-EXISTING SHARED GAP — named here rather than hidden, and deliberately NOT pinned
+// as correct. An UNQUOTED delimiter makes bash EXPAND the body before the consumer reads it, so a
+// substitution inside it EXECUTES (measured: `cat <<EOF` / `$(touch /tmp/EXPANDED)` / `EOF`, the
+// side-effect file CREATED). `maskHeredocData` blanks that body anyway — measured at this head, on a
+// shape this PR does not touch and with identical behaviour on `origin/main`: `isGitOp(raw) === true`
+// and `isGitOp(maskHeredocData(raw)) === false`, i.e. the GATE path is blind.
+// `withoutQuotedHeredocBodies` gets it RIGHT (it masks only a QUOTED delimiter), which is why that row
+// still passes on the raw text. FILED as #3210 (agent-infra): the fix is to make the PROVEN masker refuse an
+// unquoted delimiter, which changes `maskHeredocData`'s own proof and does not belong inside a
+// dispatch/classifier PR. The row is left OUT of the masked assertion on purpose — pinning the bug
+// would turn RED when somebody fixes it, which is how a test becomes an argument against a fix.
+const GATE_MASKED_RESIDUALS = new Set<string>([
+  'unquoted delimiter EXPANDS its body',
+]);
+
 console.log("\n── the classification mask may not hide an executed body (PR #3161 P0)");
 for (const [label, command] of CLASSIFICATION_MASK_EVASIONS) {
   test(`executed body is not masked as data: ${label}`, () => {
     equal(isGitOp(command), true, "the gate must fire — the body reaches a shell");
+    // ⛔ THE GATE'S INPUT IS THE MASKED TEXT, NOT THE RAW COMMAND (fresh-context review, P2 —
+    // measured). `tool_call` does `const command = maskHeredocData(rawCommand); if (!isGitOp(command))`,
+    // so a pin on the RAW text asks a question no arm is ever asked. It was not academic: a shape
+    // measured `isGitOp(raw) === true` while `isGitOp(maskHeredocData(raw)) === false`, so this whole
+    // section was green over a live fail-open. Both are asserted — raw for the classifier's own
+    // contract, masked for the one production caller's — except for `GATE_MASKED_RESIDUALS`, whose
+    // reason is stated once above `CLASSIFICATION_MASK_EVASIONS`'s loop.
+    if (!GATE_MASKED_RESIDUALS.has(label)) {
+      equal(isGitOp(maskHeredocData(command)), true, "…and it must fire on the text the GATE actually reads");
+      equal(writesOnlyTrackerRecords(maskHeredocData(command)), false, "not a tracker write (masked)");
+    }
     equal(writesOnlyTrackerRecords(command), false, "not a tracker write");
     equal(
       /git -C \/wt push|pr merge/.test(withoutQuotedHeredocBodies(command)),
@@ -10380,6 +10406,31 @@ const GIT_WRITE_VERB_SPELLINGS: Array<[string, string]> = [
   // verb, so it reached zero dispatches.
   ['line continuation between flag and verb', 'git -C /wt \\\n  push'],
   ['line continuation between git and flag', 'git \\\n  -C /wt push'],
+  // ⛔ A SECOND MASK MUST NOT HIDE WHAT THE FIRST ONE KEPT (fresh-context review, P0 — measured).
+  // The gate hands `isGitOp` text that `maskHeredocData` has ALREADY masked, and both
+  // `gitWordAnywhere` and `writesOnlyTrackerRecords` mask AGAIN. When the proven masker blanked a
+  // heredoc's TERMINATOR line too, the second masker could not find that terminator, so it searched
+  // PAST it and blanked real commands until it reached a LATER surviving `EOF` — the one belonging to
+  // a heredoc the proven masker REFUSED. Measured at the reviewed head: `isGitOp(raw) === true` and
+  // `isGitOp(maskHeredocData(raw)) === false`, i.e. the gate read none of it. Two rows, because the
+  // refusing second heredoc can be refused for two different reasons (an unprovable PREFIX, or a
+  // FRAME).
+  [
+    'a second mask must not swallow a line the first one kept (unprovable prefix)',
+    "cat > /tmp/f.md <<'EOF'\nprose\nEOF\ngit -C /wt push origin HEAD:main\ncd /tmp && cat > /tmp/g.md <<'EOF'\nprose2\nEOF",
+  ],
+  [
+    'a second mask must not swallow a line the first one kept (frame)',
+    "cat > /tmp/f.md <<'EOF'\nprose\nEOF\ngit -C /wt push origin HEAD:main\nfor x in 1; do cat <<'EOF'\nprose2\nEOF\ndone",
+  ],
+  // ⛔ `<<-` IS A PROPERTY OF THE OPENER THE SHELL SEES, NOT OF THE CANDIDATE POSITION (P1 —
+  // measured). One line can hold a decoy and the real opener; reading `<<-` off the decoy searched
+  // for `EOF` where bash terminates at `\tEOF`, so the mask ran past bash's terminator and blanked
+  // the push below (measured: bash created the side-effect file, `isGitOp` was false).
+  [
+    'a `<<-` decoy must not pick the terminator for a plain opener',
+    "cat <<<'EOF' <<-'EOF'\nbody line\n\tEOF\ngit -C /wt push origin HEAD:main\nEOF",
+  ],
 ];
 
 // ── …and the OTHER direction: a heredoc the SHELL really opens stays DATA (PR #3161 P0) ─────────
@@ -10401,12 +10452,20 @@ for (const [label, command] of [
       false,
       'the body is stdin to a data-only consumer — it must be blanked, not left readable',
     );
+    equal(
+      /git -C \/wt push|pr merge/.test(withoutQuotedHeredocBodies(maskHeredocData(command))),
+      false,
+      'and still blanked after the gate has already masked it — a second mask must not UN-mask',
+    );
   });
 }
 console.log("\n── a git WRITE VERB in every spelling, quoted option values included (PR #3161 P1)");
 for (const [label, command] of GIT_WRITE_VERB_SPELLINGS) {
   test(`a git write verb is gated: ${label}`, () => {
     equal(isGitOp(command), true, "a real push/commit must reach the floor in EVERY spelling");
+    // The gate reads the MASKED text (see the note on the block above): a row that only passes on the
+    // raw text pins a claim no arm is ever asked.
+    equal(isGitOp(maskHeredocData(command)), true, "…and on the text the GATE actually reads");
   });
 }
 

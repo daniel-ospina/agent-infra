@@ -4273,9 +4273,15 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # and a gate marker in the log, can both be LEFTOVER from an earlier dispatch of this same
         # name. Reading them under an 80 would report a PERMANENT, fleet-wide brief refusal as
         # `gate REFUSED rc=75 (load)` -- "wait, it clears by itself" -- which is the one direction this
-        # file may never be wrong in. 75 is emitted by the start assertion alone
-        # (`NOT STARTED` / `FAILED EARLY` / `finished early`), and that assertion runs after the two
+        # file may never be wrong in. 75 is emitted by the start assertion alone -- its TWO
+        # `NOT STARTED` arms (rc=0 with no log byte; pid gone before a `.rc` appeared) and its
+        # `FAILED EARLY` arm (rc!=0 inside the window) -- and that assertion runs after the two
         # truncations, so 75 is exactly the code whose durable evidence is guaranteed fresh.
+        # ⛔ `finished early` IS NOT ONE OF THEM: banner it prints is followed by the dispatch row and
+        # `launched`, and the script ends on `echo`, so a worker that started, wrote a log line and
+        # exited 0 inside the window leaves rc=0 -- never 75. Listing it here made this file's
+        # "75 comes from" set name a state the dispatcher cannot produce (fresh-context review, P2;
+        # measured: `grep -n 'exit 7[0-9]' nonblocking-dispatch.sh` -> 425, 433, 443 only).
         code = read_rc(bg_path(name, "rc")) if rc == 75 else None
         if code is not None and gate_refused(name, code):
             detail = "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
@@ -4292,12 +4298,13 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # certify as a gate refusal is the third class below -- a real chain defect, reported loudly,
         # not waited out.
         # ⛔ AND IT IS THREE ARMS, NOT ONE, SO DO NOT READ THIS AS "NOTHING RAN" (round-4 review, P2).
-        # The start assertion exits 75 from `NOT STARTED` (no log byte / pid gone), from
-        # `FAILED EARLY: … started and exited rc=N`, and from `finished early` (rc=0 WITH a log line).
-        # Only the `NOT STARTED` arms consumed nothing; `FAILED EARLY` and `finished early` are a
-        # worker that RAN. All three are `record=False` below, which is right for the two `NOT
-        # STARTED` arms and is the RESIDUAL for the other two: such a worker gets no state row and no
-        # `spent[class]`, so it is re-spawned every pass and `REFUSAL_ESCALATE_AT` never engages.
+        # The start assertion exits 75 from its TWO `NOT STARTED` arms (no log byte / pid vanished
+        # before a `.rc`) and from `FAILED EARLY: … started and exited rc=N`. Only the `NOT STARTED`
+        # arms consumed nothing; `FAILED EARLY` is a worker that RAN. All three are `record=False`
+        # below, which is right for the two `NOT STARTED` arms and is the RESIDUAL for `FAILED EARLY`:
+        # such a worker gets no state row and no `spent[class]`, so it is re-spawned every pass and
+        # `REFUSAL_ESCALATE_AT` never engages. (`finished early` is NOT among them -- it exits 0; see
+        # the note above, which named it wrongly.)
         # Safe, not tight: nothing here claims a lane is alive (the next pass re-checks liveness), and
         # a worker that starts and dies inside the settle window is rare by construction (the window
         # is seconds). Declared rather than silently absorbed -- giving those two arms a cooldown row
