@@ -1819,14 +1819,33 @@ ck "POSITIVE CONTROL: the SAME box with 15k spare pids is ALLOWED (the arm is no
 ND="$TMP/nodeploy"; mkdir -p "$ND/gate" "$ND/home"
 cp "$GATE" "$ND/gate/pi"
 : > "$PI_LOG"
-nd_out="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+# ⛔ `PI_LOG` IS PASSED IN, AND THE ASSERTION IS "the stub wrote NOTHING" (cycle-2 review, P2). The
+# previous version grepped for a `PI_RAN` string the live stub never prints and did not hand the
+# child a `PI_LOG` at all, so it could not fail: an inert assertion dressed as a coverage claim. The
+# stub at `$TMP/bin/pi` appends one line per invocation, so an EMPTY file is proof it never ran.
+nd_out="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home" PI_LOG="$PI_LOG" PATH="$TMP/bin:/usr/bin:/bin" \
           bash "$ND/gate/pi" -p noop 2>&1)"; nd_rc=$?
 [ "$nd_rc" -eq 81 ]; rc=$?
 ck "the spawn point REFUSES (81) when capacity.sh is unresolvable — it does not WARN and launch (rc=$nd_rc)" $rc
-grep -q 'PI_RAN' "$PI_LOG" 2>/dev/null; [ $? -ne 0 ]; rc=$?
-ck "...and the stub pi was NOT invoked — 'the fork floor is off' is no longer a launch" $rc
-case "$nd_out" in *'fork headroom UNREADABLE'*'(searched: '*|*'searched: '*) rc=0 ;; *) rc=1 ;; esac
+[ ! -s "$PI_LOG" ]; rc=$?
+ck "...and the stub pi was NOT invoked (its log is empty) — 'the fork floor is off' is no longer a launch" $rc
+case "$nd_out" in *'fork headroom UNREADABLE'*'searched: '*) rc=0 ;; *) rc=1 ;; esac
 ck "...and the refusal NAMES the directories it searched (an operator is not told to guess) [$nd_out]" $rc
+# ⛔ THE PARTIAL-DEPLOY ARM (cycle-1 P1, cycle-2 P2 — the mechanism had no test): a `capacity.sh`
+# truncated at a function boundary used to satisfy `cap_procs_pair_vars` while `cap_h_for_vars` was
+# MISSING, so the headroom arithmetic was skipped, the two-fork probe passed and the gate answered
+# `ok` — a FALSE PASS. Required now: the whole function set, reported by name.
+mkdir -p "$ND/partial"
+cat > "$ND/partial/capacity.sh" <<'PIPARTIAL'
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 15641; printf -v "$3" '%s' stub; }
+PIPARTIAL
+nd3="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+# The copy's own directory holds no capacity.sh, so point the resolver at the partial one via O.
+nd3="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/partial" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd3" in *'state=nodeploy'*'missing: cap_h_for_vars'*) rc=0 ;; *) rc=1 ;; esac
+ck "an INCOMPLETE capacity.sh is nodeploy naming the missing function, never a false PASS [$nd3]" $rc
 # the RESOLVER fix: `O` unset, but the DOCUMENTED default for it ($HOME/orchestrator) holds the
 # instrument — present rather than merely reported, which is the preferred half of the remedy.
 mkdir -p "$ND/home2/orchestrator"; cp "$cap_abspath" "$ND/home2/orchestrator/capacity.sh"
@@ -1834,6 +1853,18 @@ nd2="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home2" PATH="$TMP/bin:
        bash -c '. "$1"; if spawn_gate_load_capacity; then echo RESOLVED; else echo UNREACHABLE; fi' _ "$ND/gate/pi" 2>&1)"
 case "$nd2" in *RESOLVED*) rc=0 ;; *) rc=1 ;; esac
 ck "with O UNSET the instrument is still FOUND in \$HOME/orchestrator — the floor enforces itself where it is installed as pi ($nd2)" $rc
+# ⛔ STRUCTURAL, AND SAID SO: the two 81 arms added for cycle-1 P1/P2 are ordered before the code that
+# would swallow them. This is a grep, not a drive — a behavioural fixture for `merge-one.sh`/`review-pr.sh`
+# needs a whole reviewer/repo rig, and claiming one here would be worse than naming the limit.
+m81="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-81' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
+m80="$(grep -n 'AGENT_BRIEF_REFUSED:-80' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
+mex="$(grep -n 'THE EXTRACTOR MUST ADMIT' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
+[ -n "$m81" ] && [ -n "$m80" ] && [ -n "$mex" ] && [ "$m81" -gt "$m80" ] && [ "$m81" -lt "$mex" ]; rc=$?
+ck "STRUCTURAL: merge-one.sh's 81 arm sits AFTER 80 and BEFORE the verdict extractor ($m80 < $m81 < $mex)" $rc
+r81="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-81' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
+rnn="$(grep -n 'THE EXIT STATUS IS THE SIGNAL' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
+[ -n "$r81" ] && [ -n "$rnn" ] && [ "$r81" -lt "$rnn" ]; rc=$?
+ck "STRUCTURAL: review-pr.sh's 81 arm sits BEFORE its non-zero-exit fallthrough ($r81 < $rnn)" $rc
 
 # END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
 # code (74, not 77/75), and the log says why.
