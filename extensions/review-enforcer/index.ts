@@ -1076,7 +1076,18 @@ function heredocSegmentIsNaming(
   // reader word only for a spelling that cannot run anything; an executor spelling keeps the body
   // READABLE, which is the fail-closed direction.
   if (extraNaming?.has(commandWord)) {
-    if (commandWord === "gh" && GH_EXECUTOR_SHAPE.test(segment)) return false;
+    // ⛔ THE SHAPE TEST MUST SEE THE SAME TEXT THE SHELL DOES (#3161 cycle-5 review, P1, measured).
+    // `commandWord` above is DEQUOTED (`:1061`) — the module's own convention — but this test read the
+    // RAW segment, so a quote/backslash SPLICE of the gh SUBCOMMAND matched no alternative in
+    // `GH_EXECUTOR_SHAPE`: `gh 'alias' set`, `gh a"lias" set` and `gh \alias set` all deliver argv
+    // `[alias] [set] …` to the program (bash equivalence measured), yet none of them matched
+    // `/(^|\s)alias(\s|=|$)/`. The `gh` relaxation was therefore granted to an EXECUTOR line, the
+    // classification masker blanked a body the proven masker keeps readable, and `gitWordAnywhere`
+    // then read doubly-masked text — `isGitOp(maskHeredocData(raw))` false on a push bash EXECUTED:
+    // the fail-open direction, on the very spelling this PR exists to arm. Dequote before the shape
+    // test, exactly as `:1061` and `heredocReaderIsShadowed` already do (the same one-line splice also
+    // defeated the `--shell`/`extension exec` arms; fixing the TEXT fixes all three, widening no regex).
+    if (commandWord === "gh" && GH_EXECUTOR_SHAPE.test(segment.replace(/["'\\]/g, ""))) return false;
     return true;
   }
   if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;

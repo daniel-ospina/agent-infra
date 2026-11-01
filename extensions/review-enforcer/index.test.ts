@@ -10313,6 +10313,28 @@ const CLASSIFICATION_MASK_EVASIONS: Array<[string, string]> = [
     'gh shell alias RUNS the written body (gh is not a reader)',
     "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh alias set qq '!bash /tmp/f.sh' && gh qq",
   ],
+  // ⛔ THE SAME EXECUTOR LINE, WITH THE SUBCOMMAND SPLICED (PR #3161 cycle-5 review, P1 — measured).
+  // `heredocSegmentIsNaming` DEQUOTES the command word (`index.ts:1061`) but `GH_EXECUTOR_SHAPE`
+  // was tested against the RAW segment, so `gh 'alias' set`, `gh a"lias" set` and `gh \alias set`
+  // matched NO alternative in `/(^|\s)alias(\s|=|$)/` — the `gh` relaxation was granted to an
+  // EXECUTOR line, `withoutQuotedHeredocBodies` blanked a body the proven masker keeps readable, and
+  // the arm that sees a push (`gitWordAnywhere`) read doubly-masked text: `isGitOp(maskHeredocData(
+  // raw)) === false` on a push bash EXECUTED — zero dispatches. Shell equivalence is not a gh
+  // claim: all three deliver argv `[alias] [set] …` to the program (measured with an argv-dumping
+  // stub), i.e. they are ONE invocation spelled three ways. The un-spliced control above stayed
+  // green throughout, which is exactly why the splice went unseen.
+  [
+    "gh 'alias' set — QUOTED subcommand is the same executor",
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh 'alias' set qq '!bash /tmp/f.sh' && gh qq",
+  ],
+  [
+    'gh a"lias" set — SPLICED subcommand is the same executor',
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh a\"lias\" set qq '!bash /tmp/f.sh' && gh qq",
+  ],
+  [
+    'gh \\alias set — BACKSLASH-escaped subcommand is the same executor',
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh \\alias set qq '!bash /tmp/f.sh' && gh qq",
+  ],
   // (b) `\<<` is a LITERAL `<` plus an input redirect, so bash never sees a heredoc and the next
   //     line is a COMMAND — while the opener scan honoured it and blanked the executed line.
   ['backslash-escaped `<<` is NOT an opener', "cat \\<<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
