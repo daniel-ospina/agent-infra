@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# Tests for lane-artifacts.sh — the pull verb that makes a CELL lane's artifact reachable from the
+# machine the orchestrator runs on.
+#
+# The stub CMUX_BIN answers `vm list` from a fixture and runs `vm exec … sh -c '<script>' ARG0 ARG1…`
+# LOCALLY, retargeting the root argument to that label's own fixture directory, and — critically —
+# MODELLING THE CHANNEL'S STDIN BEHAVIOUR (see T3). So every case here is hermetic: no cloud VM, no
+# network, no dependency on whatever happens to sit in a live box's /tmp.
+#
+# The cases are chosen from the failures that ACTUALLY HAPPENED while building this:
+#   T1  a real artifact found on ONE box is collected, byte-exact (compared by sha, not by `cat`)
+#   T2  a file held by a DIFFERENT box is collected from that box
+#   T3  ⛔ the stdin-eat regression: an inner exec inside the `while read … <<< "$MAP"` loop must not
+#       consume the loop's remaining rows. The stub CONSUMES ONE LINE OF STDIN on every exec, exactly
+#       as the real channel does — without that, the guard cannot be tested and this case passes with
+#       the bug present (that is how the bug survived the first round).
+#   T4  nothing anywhere, every box reached ⇒ exit 3 ABSENT-EVERYWHERE
+#   T5  every box UNMEASURED ⇒ exit 4, never "absent", never 0
+#   T5b ⛔ a box UNMEASURED + nothing found ⇒ exit 4, NOT exit 3 — "absent" is not claimed
+#   T6  one dead box does not lose the file a live box holds
+#   T7  a KILLED writer's artifact is collectable (the case that matters most)
+#   T8  `ls` on a dead fleet says UNMEASURED, not an empty healthy inventory
+#   T9  a 0-byte artifact (lane killed between create and write) is a SUCCESSFUL pull, not a failure
+#   T10 a truncation is caught: decoded size != the size the box reported ⇒ discarded, exit 5
+#   T11 an apostrophe in a filename does not break the pull
+#   T12 `logs` takes the EXACT path — a `.log.bak` decoy is not collected
+#   T13 a truncated invocation (`--out` with no value) ERRORS, it does not spin forever
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+TOOL="$HERE/lane-artifacts.sh"
+Q="$(mktemp -d "${TMPDIR:-/tmp}/lane-artifacts-test.XXXXXX")"
+trap 'rm -rf "$Q"' EXIT
+
+pass=0; fail=0
+ok()  { pass=$((pass+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
+bad() { fail=$((fail+1)); printf '  \033[31m✗ %s\033[0m\n     %s\n' "$1" "${2:-}"; }
+eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "want [$3] got [$2]"; fi; }
+
+# ── the stub ─────────────────────────────────────────────────────────────────────────────────────
+mkdir -p "$Q/bin"
+cat > "$Q/bin/stub-cmux" <<'STUB'
+#!/usr/bin/env bash
+# STUB_BOXES: "label=path" pairs, one per line. STUB_DEAD: labels whose exec always fails.
+# STUB_SUFFIX_TAG: appended to a pulled file's base64 so a truncation can be simulated.
+boxes="${STUB_BOXES:-}"
+dead="${STUB_DEAD:-}"
+if [ "${1:-}" = "vm" ] && [ "${2:-}" = "list" ]; then
+  echo "NAME                                 LABEL      STATE"
+  while IFS='=' read -r label path; do
+    [ -n "$label" ] && echo "vm-$label  $label  running"
+  done <<< "$boxes"
+  exit 0
+fi
+if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
+  shift 2
+  [ "${1:-}" = "--timeout" ] && shift 2
+  vm="${1:-}"; shift
+  [ "${1:-}" = "--" ] && shift
+  label="${vm#vm-}"
+  case " $dead " in *" $label "*) echo "Error: The Cloud VM request failed." >&2; exit 1 ;; esac
+  # ⛔ MODEL THE CHANNEL: the real `cmux vm exec` READS THE CALLER'S STDIN. Swallow one line here so an
+  # exec with no `</dev/null` inside a `while read … <<< "$MAP"` loop visibly eats the loop's rows and
+  # T3 goes red. A stub that ignores stdin cannot test the guard at all.
+  IFS= read -r _dropped || true
+  root=""
+  while IFS='=' read -r l p; do [ "$l" = "$label" ] && root="$p"; done <<< "$boxes"
+  args=("$@")
+  # Retarget the root ARGUMENT to this label's OWN fixture root. The tool passes the root as an
+  # argument (never interpolated into the script text) precisely so a stub can retarget it per box —
+  # which is also why a multi-box run stays honest about which box a file came from. Match by VALUE,
+  # not by index: an index-based version silently stopped matching when an argument was added.
+  for i in "${!args[@]}"; do
+    [ "${args[$i]}" = "${LANE_ARTIFACT_ROOT:-}" ] && args[$i]="$root"
+  done
+  # simulate a truncated transfer: drop the last 8 base64 chars of the PAYLOAD but keep the status
+  # line, which is exactly the real failure this guards (a cut mid-stream decodes cleanly to a short
+  # file). Truncating the whole output instead would also delete the status line and test the wrong arm.
+  if [ -n "${STUB_TRUNCATE:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
+    out="$("${args[@]}" 2>/dev/null)"
+    payload="${out%%$"\n"*}"
+    rest="${out#*$'\n'}"
+    [ "$rest" = "$out" ] && rest=""
+    if [ -n "$rest" ]; then printf '%s\n%s' "${payload%????????}" "$rest"
+    else printf '%s' "${payload%????????}"; fi
+    exit 0
+  fi
+  exec "${args[@]}" 2>/dev/null
+fi
+echo "stub: unsupported: $*" >&2
+exit 99
+STUB
+chmod +x "$Q/bin/stub-cmux"
+export CMUX_BIN="$Q/bin/stub-cmux"
+
+mk() { mkdir -p "$Q/$1"; printf '%s' "$2" > "$Q/$1/$3"; }
+mk box-a 'artifact-a-body
+second line
+' ci-cause.md
+mk box-a 'older' other.md
+mk box-b 'histogram on b' blocked-histogram.md
+mk box-c 'ledger on c' epic-ledger.md
+mk box-c 'p1 on c' p1-10515.md
+mk box-c 'killproof: written then the writer was SIGKILLed' killproof-lane.md
+mk box-c '' empty-artifact.md
+mk box-c 'apostrophe body' "don't-panic.md"
+mk box-c 'exact log' t-lane.log
+mk box-c 'decoy' t-lane.log.bak
+
+export LANE_ARTIFACT_BOXES="pi-cell-1 pi-cell-3 pi-cell-4"
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+export STUB_DEAD=""
+export LANE_ARTIFACT_ROOT="$Q/never-used"   # the stub retargets it per box
+
+run() { bash "$TOOL" "$@" 2>&1; }
+
+echo "T1 — a real artifact found on one box is collected, byte-exact"
+out="$Q/out1"; mkdir -p "$out"
+run collect ci-cause --out "$out" --lines 1 > "$Q/t1.txt" 2>&1
+grep -q 'artifact-a-body' "$Q/t1.txt" && ok "T1 body printed" || bad "T1 body printed" "$(head -5 "$Q/t1.txt")"
+[ -f "$out/pi-cell-1-ci-cause.md" ] && ok "T1 wrote pi-cell-1-ci-cause.md" || bad "T1 wrote the file" "$(ls "$out")"
+# sha, not `cat`: command substitution strips trailing newlines, so a `cat` comparison would pass even
+# if the final newline were lost.
+eq "T1 byte-exact (sha256)" "$(shasum -a 256 < "$out/pi-cell-1-ci-cause.md" | cut -d' ' -f1)" \
+   "$(shasum -a 256 < "$Q/box-a/ci-cause.md" | cut -d' ' -f1)"
+
+echo "T2 — a name held by a DIFFERENT box is collected from that box"
+run collect blocked-histogram > "$Q/t2.txt" 2>&1
+grep -q 'histogram on b' "$Q/t2.txt" && ok "T2 found the file on pi-cell-3" || bad "T2 found it" "$(head -8 "$Q/t2.txt")"
+grep -q 'pi-cell-3' "$Q/t2.txt" && ok "T2 names the box it came from" || bad "T2 names the box" ""
+
+echo "T3 — REGRESSION: no exec may eat the loop's rows (stub consumes stdin like the real channel)"
+out="$Q/out3"; mkdir -p "$out"
+run collect .md --out "$out" --lines 1 > "$Q/t3.txt" 2>&1
+n="$(ls "$Q/out3" | grep -c '^pi-cell-4-.*\.md$')"
+[ -n "$(ls "$Q/out3" | grep '^pi-cell-1-' || true)" ] && ok "T3 the FIRST box was scanned" || bad "T3 first box scanned" "$(head -6 "$Q/t3.txt")"
+[ -n "$(ls "$Q/out3" | grep '^pi-cell-4-' || true)" ] && ok "T3 the LAST box was scanned (not eaten)" || bad "T3 last box scanned" "$(head -8 "$Q/t3.txt")"
+[ "$n" -ge 4 ] && ok "T3 all 4 box-c .md files pulled ($n)" || bad "T3 all box-c files pulled" "got $n from: $(ls "$Q/out3")"
+
+echo "T4 — nothing anywhere, every box reached ⇒ exit 3 ABSENT-EVERYWHERE"
+run collect no-such-artifact-anywhere > "$Q/t4.txt" 2>&1
+rc=$?
+eq "T4 exit 3" "$rc" "3"
+grep -q 'ABSENT-EVERYWHERE' "$Q/t4.txt" && ok "T4 says ABSENT-EVERYWHERE" || bad "T4 wording" "$(cat "$Q/t4.txt")"
+
+echo "T5 — every box UNMEASURED ⇒ exit 4 and the word UNMEASURED (never absent, never 0)"
+STUB_DEAD="pi-cell-1 pi-cell-3 pi-cell-4"; run collect ci-cause > "$Q/t5.txt" 2>&1
+rc=$?; STUB_DEAD=""
+eq "T5 exit 4" "$rc" "4"
+grep -q 'UNMEASURED' "$Q/t5.txt" && ok "T5 says UNMEASURED" || bad "T5 wording" "$(cat "$Q/t5.txt")"
+grep -q 'ABSENT-EVERYWHERE' "$Q/t5.txt" && bad "T5 must NOT claim absent" "$(cat "$Q/t5.txt")" \
+  || ok "T5 does not claim absent"
+
+echo "T5b — a box UNMEASURED + nothing found ⇒ exit 4, and ABSENT is NOT claimed"
+STUB_DEAD="pi-cell-3"; run collect no-such-artifact > "$Q/t5b.txt" 2>&1
+rc=$?; STUB_DEAD=""
+eq "T5b exit 4 (not 3)" "$rc" "4"
+grep -q 'ABSENT-EVERYWHERE' "$Q/t5b.txt" && bad "T5b must not claim absent" "$(cat "$Q/t5b.txt")" \
+  || ok "T5b does not claim absent while a box is unmeasured"
+
+echo "T6 — one dead box does not lose the file a live box holds"
+STUB_DEAD="pi-cell-1 pi-cell-3"; run collect epic-ledger > "$Q/t6.txt" 2>&1
+rc=$?; STUB_DEAD=""
+eq "T6 exit 0" "$rc" "0"
+grep -q 'ledger on c' "$Q/t6.txt" && ok "T6 collected from the live box" || bad "T6 collected" "$(head -6 "$Q/t6.txt")"
+grep -q 'pi-cell-1.*UNMEASURED' "$Q/t6.txt" && ok "T6 names the dead box as UNMEASURED" || bad "T6 names the dead box" "$(head -6 "$Q/t6.txt")"
+
+echo "T7 — a KILLED writer's artifact is collectable (the case that matters most)"
+# Asserted STRUCTURALLY: the fixture file is written and then nothing ever touches it again, and
+# collection is a PULL from the orchestrator side — so it cannot depend on the writer surviving,
+# cooperating, or running any code after the write. The live proof (a process SIGKILLed, then its file
+# collected over a real `cmux vm exec`) needs a real box and is quoted in the PR body, not asserted here.
+out="$Q/out7"; mkdir -p "$out"
+run collect killproof --out "$out" --lines 2 > "$Q/t7.txt" 2>&1
+grep -q 'SIGKILLed' "$out/pi-cell-4-killproof-lane.md" 2>/dev/null && ok "T7 killed writer's file collected" \
+  || bad "T7 collected" "$(head -6 "$Q/t7.txt")"
+
+echo "T8 — \`ls\` on a dead fleet says UNMEASURED, not an empty healthy inventory"
+STUB_DEAD="pi-cell-1 pi-cell-3 pi-cell-4"; run ls > "$Q/t8.txt" 2>&1
+rc=$?; STUB_DEAD=""
+eq "T8 exit 4" "$rc" "4"
+grep -q 'UNMEASURED' "$Q/t8.txt" && ok "T8 says UNMEASURED" || bad "T8 wording" "$(head -8 "$Q/t8.txt")"
+
+echo "T9 — a 0-byte artifact is a SUCCESSFUL pull (lane killed between create and write)"
+out="$Q/out9"; mkdir -p "$out"
+run collect empty-artifact --out "$out" > "$Q/t9.txt" 2>&1
+rc=$?
+eq "T9 exit 0" "$rc" "0"
+[ -f "$out/pi-cell-4-empty-artifact.md" ] && ok "T9 wrote the 0-byte file" || bad "T9 wrote it" "$(cat "$Q/t9.txt")"
+eq "T9 size" "$(wc -c < "$out/pi-cell-4-empty-artifact.md" | tr -d ' ')" "0"
+
+echo "T10 — a truncated transfer is caught by the size check and discarded, exit 5"
+out="$Q/out10"; mkdir -p "$out"
+STUB_TRUNCATE=1 bash "$TOOL" collect epic-ledger --out "$out" > "$Q/t10.txt" 2>&1
+rc=$?
+eq "T10 exit 5" "$rc" "5"
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && bad "T10 truncated file must be discarded" "$(ls "$out")" \
+  || ok "T10 truncated file discarded"
+grep -qi 'SIZE MISMATCH\|TRUNCATED' "$Q/t10.txt" && ok "T10 says why" || bad "T10 says why" "$(cat "$Q/t10.txt")"
+
+echo "T11 — an apostrophe in a filename does not break the pull"
+out="$Q/out11"; mkdir -p "$out"
+run collect "don't-panic" --out "$out" > "$Q/t11.txt" 2>&1
+expect="$out/pi-cell-4-don't-panic.md"
+grep -q 'apostrophe body' "$expect" 2>/dev/null && ok "T11 pulled and printed it" \
+  || bad "T11 pulled it" "$(head -8 "$Q/t11.txt"); files: $(ls "$out" 2>/dev/null)"
+
+echo "T12 — \`logs\` takes the EXACT path; a .log.bak decoy is not collected"
+out="$Q/out12"; mkdir -p "$out"
+run logs t-lane --out "$out" > "$Q/t12.txt" 2>&1
+[ -f "$out/pi-cell-4-t-lane.log" ] && ok "T12 took the exact log" || bad "T12 exact log" "$(cat "$Q/t12.txt")"
+grep -q 'exact log' "$out/pi-cell-4-t-lane.log" 2>/dev/null && ok "T12 log body is the exact file's" \
+  || bad "T12 log body" "$(cat "$out/pi-cell-4-t-lane.log" 2>/dev/null)"
+ls "$out" | grep -q 'log.bak' && bad "T12 must not collect the decoy" "$(ls "$out")" || ok "T12 decoy not collected"
+
+echo "T13 — a truncated invocation errors instead of spinning forever"
+# `timeout` is GNU coreutils and absent on macOS; guard with a background pid + a bounded wait instead,
+# so this case tests the tool and not the host's coreutils.
+bash "$TOOL" collect ci-cause --out > "$Q/t13.txt" 2>&1 &
+t13pid=$!
+( sleep 5; kill -9 "$t13pid" 2>/dev/null ) &
+watchdog=$!
+wait "$t13pid" 2>/dev/null; rc=$?
+kill "$watchdog" 2>/dev/null; wait "$watchdog" 2>/dev/null
+eq "T13 exit 64 on a missing option value" "$rc" "64"
+grep -q 'missing value for --out' "$Q/t13.txt" && ok "T13 names the missing value" || bad "T13 wording" "$(cat "$Q/t13.txt")"
+
+echo
+printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ] || exit 1
+exit 0
