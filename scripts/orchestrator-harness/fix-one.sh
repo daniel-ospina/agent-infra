@@ -810,6 +810,13 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # no attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
   if [ "$ar" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
     why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
+  elif [ "$ar" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+    # ⛔ A HARNESS DEFECT, LIKE THE BRIEF ARM ABOVE, AND FOR THE SAME REASON (follow-up review of
+    # #2991, P2): the fixer's caller and the deployed `cell-lane-preflight.sh` disagree (a usage/version
+    # skew) or the copy is corrupt, so the probe measured nothing. The capability arm below would have
+    # this operator repair the box or dispatch the PR elsewhere — the extension set is fine and every
+    # other box runs the same pair, so both remedies send them to an event that cannot arrive.
+    why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991) — this is a harness defect, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair (cp scripts/orchestrator-harness/*.sh \$O/) and re-run. Nothing was consumed"
   elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
     # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting
