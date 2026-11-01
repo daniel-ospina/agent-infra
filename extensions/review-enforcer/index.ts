@@ -571,7 +571,7 @@ export function heredocOpenersIn(line: string, state?: HeredocScanState): Heredo
       // shell's true terminator became invisible — a fail-OPEN the reviewer measured (`cat <<'EOF'x`
       // … `EOFx` … two admin merges → ALLOWED, where the pre-change text BLOCKED).
       const word = heredocDelimiterWord(line, c + 2 + (stripTabs ? 1 : 0));
-      if (word !== null) hits.push({ delim: word, stripTabs });
+      if (word !== null) hits.push({ delim: word.word, stripTabs });
     }
     atWordStart = /\s/.test(ch);
   }
@@ -595,7 +595,7 @@ export function heredocOpenersIn(line: string, state?: HeredocScanState): Heredo
  * guessed one, because a guessed delimiter that is a PREFIX of the real one masks to end of command
  * and hides real commands — the fail-OPEN this reader exists to prevent.
  */
-function heredocDelimiterWord(line: string, from: number): string | null {
+function heredocDelimiterWord(line: string, from: number): { word: string; end: number } | null {
   let i = from;
   while (i < line.length && (line[i] === " " || line[i] === "\t")) i++;
   let word = "";
@@ -635,7 +635,7 @@ function heredocDelimiterWord(line: string, from: number): string | null {
     word += ch;
     i++;
   }
-  return word === "" ? null : word;
+  return word === "" ? null : { word, end: i };
 }
 
 /** Carried scan state for a caller reading a WHOLE command line by line. */
@@ -3543,6 +3543,8 @@ const GH_EXECUTOR_SHAPE = /(^|\s)alias(\s|=|$)|(^|\s)extension\s+exec(\s|$)|--sh
 export function withoutQuotedHeredocBodies(command: string): string {
   const lines = command.split("\n");
   const out: string[] = [];
+  // Carried across lines: a quoted string may span them, and so may an arithmetic `$(( … ))`.
+  const scanState: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
   let i = 0;
   while (i < lines.length) {
     let line = lines[i];
@@ -3552,50 +3554,33 @@ export function withoutQuotedHeredocBodies(command: string): string {
       i++;
       continue;
     }
-    // ⛔ A BACKSLASH-ESCAPED `<<` IS NOT A HEREDOC (#3161 fresh-context review, P1 — measured).
-    // `cat \<<'EOF'` gives bash a LITERAL `<` and a plain input redirect: no heredoc, so the next
-    // line is a COMMAND. Measured — `cat \<<'EOF'` / `touch /tmp/EXEC3` / `EOF` RUNS the touch, and
-    // the same shape with `git -C /wt push` reached zero dispatches, while this function blanked it.
-    // An ODD run of backslashes immediately before the match escapes its first `<`.
-    {
-      let backslashes = 0;
-      for (let c = at - 1; c >= 0 && line[c] === "\\"; c--) backslashes++;
-      if (backslashes % 2 === 1) {
-        out.push(line);
-        i++;
-        continue;
-      }
-    }
-    // Quote-blindness would let `echo "note <<'EOF'"` mask a real command after it: refuse to treat
-    // an opener that sits inside an OPEN quote as an opener.
-    let quote: string | null = null;
-    let inComment = false;
-    for (let c = 0; c < at; c++) {
-      const ch = line[c];
-      if (quote) {
-        if (ch === "\\" && quote === '"') c++;
-        else if (ch === quote) quote = null;
-      } else if (ch === "'" || ch === '"') quote = ch;
-      // A `#` COMMENT IS TEXT, NOT AN OPENER (fresh-context review, P1). Measured input:
-      //     gh pr comment 1 --body-file /tmp/f.md  # cat <<'EOF'
-      //     gh --repo o/r pr merge 9
-      //     EOF
-      // was read as an opener and BLANKED the executed merge two lines down — a fail-open. The rule
-      // is `heredocFrameTokens`'s: a `#` at start-of-line or after whitespace, outside quotes.
-      // Bash starts a comment at the beginning of a WORD, so a word-adjacent separator counts too:
-      // `;#`, `&&#`, `|#`, `(#` all begin a comment, and an opener hidden behind one is TEXT, not an
-      // opener. Narrow on purpose — the wider this predicate, the LESS masking, and less masking is
-      // the fail-CLOSED direction (round-2 review measured `;#` under-masking an executed merge).
-      else if (ch === "#" && (c === 0 || /[\s;&|()]/.test(line[c - 1]))) inComment = true;
-    }
-    if (quote !== null || inComment) {
+    // ⛔ ONE OPENER READER FOR THE WHOLE FILE (cycle-2 fresh-context review, P0 — measured). This
+    // function used to RE-DERIVE the opener: a per-line quote state, its own comment rule, and
+    // `QUOTED_HEREDOC`'s first quoted span as the delimiter. Each disagreed with bash, and every
+    // disagreement BLANKED a line bash EXECUTES — each measured, with a real `git push` reaching zero
+    // dispatches against a local bare repo (`refs/heads/probe4`, `probe6`):
+    //   • `cat <<<'EOF'` is a HERE-STRING, which has NO body — the bespoke scan read the 2nd/3rd `<`
+    //     as an opener and blanked the command lines after it;
+    //   • `cat <<'E'O'F'` builds ONE word (`EOF`) by CONCATENATION — taking `E` as the delimiter
+    //     masked past bash's terminator;
+    //   • a quoted STRING opened on an EARLIER line (`echo "start` … `cat <<'EOF'` …) is text — the
+    //     per-line state read the middle line as an opener;
+    //   • `cat \<<'EOF'` is a LITERAL `<` plus an input redirect (measured: the next line RUNS).
+    // So the PROVEN reader decides, and its delimiter is the one this masks — the same "one opener
+    // reader" rule `stripHeredocBodies` and `maskHeredocData` already follow. `QUOTED_HEREDOC` is now
+    // kept ONLY to locate the quoted word, for the rewrite span.
+    const proven = heredocOpenersIn(line, scanState);
+    const stripTabsOpen = /^<<-/.test(line.slice(at));
+    const resolved = heredocDelimiterWord(line, at + 2 + (stripTabsOpen ? 1 : 0));
+    if (resolved === null || !proven.some((o) => o.delim === resolved.word)) {
+      // Not an opener the SHELL would see, or a delimiter no static read can resolve: the body stays
+      // READABLE, which is the fail-closed direction.
       out.push(line);
       i++;
       continue;
     }
-    const m = QUOTED_HEREDOC.exec(line.slice(at))!;
-    const delim = m[1] ?? m[2] ?? m[3] ?? "";
-    const remainder = line.slice(at + m[0].length);
+    const delim = resolved.word;
+    const remainder = line.slice(resolved.end);
     const prefixOnLine = line.slice(0, at);
     const consumer = (prefixOnLine.match(/(?:^|[;&|(]\s*)([A-Za-z_][\w.-]*)\s*[^;&|]*$/) ?? [])[1] ?? "";
     const refuse = () => {
@@ -3703,10 +3688,10 @@ export function withoutQuotedHeredocBodies(command: string): string {
     }
     // The OPENER is a redirection whose target is a literal delimiter: it blinds nothing, so it is
     // rewritten to the plain redirection shape the tokenizer already exempts (`</dev/null`).
-    line = line.slice(0, at) + "</dev/null" + line.slice(at + m[0].length);
+    line = line.slice(0, at) + "</dev/null" + line.slice(resolved.end);
     out.push(line);
     i++;
-    const stripTabs = /^<<-/.test(m[0]);
+    const stripTabs = stripTabsOpen;
     let closed = false;
     for (let j = i; j < lines.length; j++) {
       const probe = stripTabs ? lines[j].replace(/^\t+/, "") : lines[j];
@@ -3794,11 +3779,19 @@ export function withoutQuotedHeredocBodies(command: string): string {
 // class the arm exists for ("a git WRITE VERB is a shipping op in EVERY SPELLING"). Widening the
 // option VALUE can only make more commands match `push`/`commit`, i.e. it is the fail-closed
 // direction.
+// ⛔ THE FLAG TOKEN MAY BE QUOTED TOO (cycle-2 fresh-context review, P2 — measured). Widening the
+// option VALUE to a quoted word left the FLAG literal, so `git "-C" /wt push` (bash strips the quotes
+// — a real push, measured against a bare repo) matched no arm. A quoted flag must still carry a
+// leading `-`, so this cannot admit an arbitrary word.
 const GIT_WRITE_VERB_PATTERN =
-  /(^|[\s;&|(){!])git\s+(?:-{1,2}[^\s;&|]+(?:\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+))?\s+)*(?:commit|push)(?=\s|$)/;
+  /(^|[\s;&|(){!])git\s+(?:(?:"-[^"]*"|'-[^']*'|-{1,2}[^\s;&|]+)(?:\s+(?:"[^"]*"|'[^']*'|[^\s;&|]+))?\s+)*(?:commit|push)(?=\s|$)/;
 
 function gitWordAnywhere(command: string): boolean {
-  return GIT_WRITE_VERB_PATTERN.test(withoutQuotedHeredocBodies(command));
+  // ⛔ A LINE CONTINUATION IS A SPACE TO BASH (cycle-2 fresh-context review, P1 — measured):
+  // `git -C /wt \` NEWLINE `  push` RUNS a real push, but the pattern saw `git -C /wt \` and no verb,
+  // so it reached zero dispatches. Resolved before the match, exactly as the later-line scan in
+  // `withoutQuotedHeredocBodies` already does.
+  return GIT_WRITE_VERB_PATTERN.test(withoutQuotedHeredocBodies(command).replace(/\\\r?\n/g, " "));
 }
 
 /**
