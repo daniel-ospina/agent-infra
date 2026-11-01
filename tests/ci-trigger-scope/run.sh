@@ -8,7 +8,7 @@
 # volume, not coverage:
 #
 #   * `workflow-lock.yml` declared `edited` in its `types:`. `scripts/record-review.sh` writes the
-#     reviewer attestation INTO THE PR BODY, so EVERY recorded review was an `edited` activity and
+#     reviewer attestation INTO THE PR BODY, so every record that APPENDS the marker was an `edited` activity and
 #     bought a full run for a diff that had not changed (median 16.1 min wall clock).
 #   * `harness-single-source.yml` had no `paths:` filter, so it ran on every PR (median 6.7 min)
 #     for a read that depends on a handful of trees.
@@ -19,22 +19,26 @@
 #   1. LIVE — the real tree is as decided (both files, plus the required context untouched).
 #   2. MUTANT: `edited` restored to workflow-lock's `types:`          → must FAIL.
 #   3. MUTANT: `synchronize` dropped from it                          → must FAIL.
+#  3b. MUTANT: a `paths:` filter added to the base-branch checker     → must FAIL (a filter there is
+#      a NARROWING on a gate that validates every workflow file in the merge result).
 #   4. MUTANT: the `types:` key deleted (GitHub's default is the same three, so the VALUES still
 #      match — the arm exists because an implicit default is not an artifact) → must FAIL.
 #   5. MUTANT: `harness-single-source.yml`'s `paths:` block deleted   → must FAIL.
 #   6. MUTANT: `paths:` reduced to `'**'` (a no-op that reads like a filter) → must FAIL.
-#   6c. MUTANT: `types:`/`branches-ignore:` added to the single-source guard → must FAIL (a second
-#      filter key narrows coverage the path arm cannot see).
-#   6d. MUTANT: a sibling key's block sequence read as `types:`        → must FAIL. The reader used to
-#      attribute a FOLLOWING key's list to the preceding one.
-#   6e. MUTANT: a SECOND `on:` trigger beside `pull_request_target:` / `pull_request:` → must FAIL.
-#      Pinning one trigger's filters is not enough: a second trigger re-opens all of it.
-#   6f. MUTANT: a `push:` trigger added to `pipeline-compliance.yml`  → must FAIL (the same `on:`
-#      key-set pin on the required context, which has no other arm).
 #   7. MUTANT: `edited` dropped from `pipeline-compliance.yml`        → must FAIL. The asymmetry is
 #      the whole design: the required context KEEPS `edited`, because its #513 verdict binding
 #      re-reads the body marker written after the last push. "Finishing the job" there would let a
 #      forged `verdict=clean-micro` marker ride a stale green check to merge.
+#  7b. MUTANT: a `paths:` filter added to the REQUIRED context         → must FAIL (a path-filtered
+#      workflow's checks stay "Pending", so the required context becomes unsatisfiable).
+#  7c. MUTANT: `types:`/`branches-ignore:` added to the single-source guard → must FAIL (a second
+#      filter key narrows coverage the path arm cannot see).
+#  7d. MUTANT: a sibling key's block sequence read as `types:`        → must FAIL. The reader used to
+#      attribute a FOLLOWING key's list to the preceding one.
+#  7e. MUTANT: a SECOND `on:` trigger beside `pull_request_target:` / `pull_request:` → must FAIL.
+#      Pinning one trigger's filters is not enough: a second trigger re-opens all of it.
+#  7f. MUTANT: a `push:` trigger added to `pipeline-compliance.yml`  → must FAIL (the same `on:`
+#      key-set pin on the required context).
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
