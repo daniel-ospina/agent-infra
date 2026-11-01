@@ -17,8 +17,16 @@ case "${MAX}" in ''|*[!0-9]*)
 # plus this same list for the population, and derives every short name itself — one call shape, so the
 # two cannot drift apart (the bug that made `unattributed` read 1 for a rail that WAS attributed).
 REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
-_n_repos=0
-for _r in $REPOS; do _n_repos=$(( _n_repos + 1 )); done
+# The aggregate's derivation is a FUNCTION, for the same reason `rails_should_defer` is: a test must be
+# able to pin the SHIPPED arithmetic instead of a copy of it. Every review round on this branch rewrote
+# the MAX_TOTAL line (three of five rounds), which is exactly the line that cannot be left unpinned — a
+# literal `MAX * 2` in the test would keep passing after the derivation was broken or disarmed.
+max_total_for() {  # $1 = MAX; $2.. = the repos this actuator drives
+  local max=$1 n=0 _r
+  shift
+  for _r in "$@"; do n=$(( n + 1 )); done
+  printf '%s\n' "$(( max * n ))"
+}
 # ── ⛔ THE MERGE-SLOT ACCOUNTING IS PER REPO (2026-11-01). IT WAS GLOBAL, AND THAT STARVED A QUEUE. ──
 # `rails_live` used to be ONE count across every repo this actuator drives, and it gated EVERY repo's
 # candidates. So rails working on repo A consumed repo B's merge capacity. Measured on this box: a
@@ -50,7 +58,7 @@ for _r in $REPOS; do _n_repos=$(( _n_repos + 1 )); done
 # rails. That population is reachable (the log holds rails_live=15 and =16 today), so max_total is a
 # bound on how much THIS actuator will pile into the shared REST budget, not a promise that the symptom
 # can never recur at a larger population. It is printed on every pass for exactly that reason.
-MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
+MAX_TOTAL=${MAX_TOTAL:-$(max_total_for "$MAX" $REPOS)}
 case "${MAX_TOTAL}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
 INTERVAL=${INTERVAL:-180}
@@ -137,7 +145,15 @@ say() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 # is printed: that is the difference between "no rails here" and "rails I cannot see".
 # Prints `<own> <total> <unknown>`; $1 is the repo being asked about, $2.. every repo driven.
 rails_for_repo() {
-  ps -eo args= | python3 -c '
+  local tbl
+  # ⛔ A FAILED DATA SOURCE IS NOT AN EMPTY QUEUE — the rule the candidate search below states at
+  # SEARCH-FAILED, and the counter path did not have. This script has no `pipefail`, so a `ps` that
+  # cannot run (rc≠0, no process table) left python reading EOF and printing a perfectly parseable
+  # `0 0 0`: the guard in `rails_should_defer` never fired, BOTH bounds disarmed, and the log read
+  # byte-identically to a healthy idle box. Capture the table and its STATUS first, and print NOTHING
+  # on failure — empty output is exactly what makes that guard defer (fail-closed).
+  tbl="$(ps -eo args= 2>/dev/null)" || { say "COUNTER-FAILED: ps rc=$? — cannot read the process table, deferring $1 (fail-closed)"; return 1; }
+  printf '%s\n' "$tbl" | python3 -c '
 import sys
 me = sys.argv[1].split("/")[-1]
 known = [r.split("/")[-1] for r in sys.argv[2:]]
@@ -178,6 +194,15 @@ rails_should_defer() {  # $1 = this repo (owner/name), $2.. = every repo driven
     *[!0-9:]*|::*|*::|*:::*) say "COUNTER-FAILED: rails_for_repo produced no usable counts — deferring $1 (fail-closed)"; return 0;;
   esac
   [ $(( own + unk )) -ge "$MAX" ] || [ "$total" -ge "$MAX_TOTAL" ]
+}
+# ── THE CALL SITE'S SHAPE, as a function ───────────────────────────────────────────────────────
+# `rails_should_defer` is only PER-REPO because its caller passes the whole population ($REPOS)
+# alongside the repo being asked about. Drop that argument — or put the old global `total >= MAX`
+# back at the call site — and every other repo's rails read as unknown load: the fix is fully undone
+# while the predicate itself is untouched, and a suite that drives the predicate alone cannot see it.
+# So the call site is a function the suite DRIVES, not a string it greps.
+candidate_deferred() {  # $1 = this repo, $2.. = every repo driven  (rc 0 = defer this candidate)
+  rails_should_defer "$@"
 }
 # Keep the TCC-free rail clone current BEFORE using it. A failed refresh is LOUD but not fatal: the
 # previous HEAD then runs, which is strictly better than not merging, and the log says which happened.
@@ -270,7 +295,7 @@ PY
       # ⛔ THIS REPO'S BUDGET, NOT THE BOX'S. `rails_should_defer` adds the unattributable population to
       # this repo's own count (fail-closed) and keeps the aggregate as a second, independent clause:
       # another repo's rails can only decide this repo's candidates once the AGGREGATE is reached.
-      if rails_should_defer "$repo" $REPOS; then
+      if candidate_deferred "$repo" $REPOS; then
         read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
         say "$repo #$pr deferred ($_own rails on this repo + $_unk unattributed, $_total live in total, max=$MAX max_total=$MAX_TOTAL)"; continue
       fi
