@@ -151,11 +151,15 @@ jobs:
         # #991 — the parser/fixture suite was executed by NOTHING. The env var is
         # set nowhere outside the script itself (grep: only the script's own
         # help text and its own guard), and this job ran the gate only —
-        # `ci-main.yml:55-56` said so outright ("pipeline-compliance.yml is also
-        # PR-triggered, but runs no test suite"). That line is now stale, and
-        # this step is what makes it so; it is not corrected here because
+        # ci-main.yml's extension leg said so outright ("pipeline-compliance.yml
+        # is also PR-triggered, but runs no test suite"). That line is now stale,
+        # and this step is what makes it so; it is not corrected here because
         # ci-main.yml is pinned in scripts/workflow-lock.json and a comment
-        # tweak would force a lock re-derivation. A fixture nothing runs pins
+        # tweak would force a lock re-derivation. (Cited by its TEXT, not by a
+        # line number: the coordinate had already rotted from :98 to :55-56 to
+        # :155 as its neighbours moved, and a number that rots argues for the
+        # wrong thing - #3131's own preamble states the rule.) A fixture nothing
+        # runs pins
         # nothing, so every assertion the suite carries — expect_ref,
         # expect_trace, pr_is_artifact_only, resolve_issue_ref, and the
         # has_scoping_marker family added by #991 — was decorative.
