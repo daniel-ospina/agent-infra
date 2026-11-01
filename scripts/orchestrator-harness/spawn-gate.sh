@@ -1714,7 +1714,7 @@ cell_preflight_path() {
 #
 # Gated: a refusal does not start the agent at all, and run_agent returns THAT gate's code —
 # AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting),
-# AGENT_MEM_REFUSED (73, evaluated SECOND: a box at its memory floor loses lanes to the OOM killer,
+# AGENT_MEM_REFUSED (81, evaluated SECOND: a box at its memory floor loses lanes to the OOM killer,
 # and unlike a load refusal the consequence is not slowness but a dead batch — agent-infra#2387),
 # AGENT_LOAD_REFUSED (75, which clears when the box quietens), or AGENT_LAND_BACKLOG (74, the creation
 # back-pressure gate: the repo's open-PR count is over its own measured landing ceiling, which clears
@@ -2645,7 +2645,7 @@ reap_lane_venv() {
 #     own and is not gated on the FLOOR — that disarms the LOW arm only: `mem_gate_verdict` returns
 #     UNREADABLE and refuses BEFORE any comparison, so an unreadable probe stays refused whatever the
 #     floor says. The harness's own suites use it as a NEUTRALISER (`export MEM_MIN_AVAIL_MB=1`) so a
-#     memory-tight box does not answer a load arm with 73; the four values an operator sets
+#     memory-tight box does not answer a load arm with 82; the four values an operator sets
 #     deliberately are stated in README §7 and rendered by install.sh into the plist, so no caller can
 #     claim it did not know.
 #   * INTERACTIVE sessions are gated too, deliberately. "The gate at the spawn point" is not a claim
