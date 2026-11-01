@@ -48,6 +48,7 @@ ATIF_ROOT="${LANE_ARTIFACT_ROOT:-/tmp}"
 ROW_CAP=200
 
 usage() {
+  local rc="${1:-64}"
   cat >&2 <<'EOF'
 usage: lane-artifacts.sh <verb> [args]
 
@@ -67,10 +68,15 @@ usage: lane-artifacts.sh <verb> [args]
 
 Exit: 0 found · 3 ABSENT-EVERYWHERE · 4 UNMEASURED (absent NOT claimed) · 5 PULL-FAILED.
 EOF
-  exit 64
+  exit "$rc"
 }
 
-verb="${1:-}"; [ -n "$verb" ] || usage; shift || true
+verb="${1:-}"; [ -n "$verb" ] || usage
+# `--help` is asked for as a VERB (`lane-artifacts.sh --help`), so it must be recognised before the shift
+# that consumes it — otherwise it fell through to the "no pattern" guard and returned the usage-ERROR
+# code 64 for a help request, which a doc/CI wrapper reads as failure.
+case "$verb" in -h|--help) usage 0 ;; esac
+shift || true
 
 pattern=""; outdir=""; lines=40; only_box=""; since=""
 need_val() { [ "$2" -ge 2 ] || { echo "lane-artifacts: missing value for $1" >&2; usage; }; }
@@ -86,7 +92,7 @@ while [ $# -gt 0 ]; do
     # discarded — so the scan returned no rows and the tool claimed ABSENT about a file that exists.
     # Validate here, where a usage error is a usage error.
     --since)   need_val --since "$#"; need_num --since "$2"; since="$2"; shift 2 ;;
-    -h|--help) usage ;;
+    -h|--help) usage 0 ;;
     *)         if [ -z "$pattern" ]; then pattern="$1"; shift; else echo "unexpected arg: $1" >&2; usage; fi ;;
   esac
 done
@@ -208,7 +214,8 @@ pull() {
   printf '  ✓ wrote %s (%s bytes)\n' "$dest" "$got"
 }
 
-MAP="$(resolve_boxes "$only_box")"
+MAP_RAW="$(resolve_boxes "$only_box")"
+MAP="$MAP_RAW"
 RBOX="$(printf '%s\n' "$MAP" | awk '$1=="UNRESOLVED"{ n++; next } NF{ m++ } END{ print (m+0), (n+0) }')"
 NBOX="${RBOX% *}"; NUNRESOLVED="${RBOX#* }"
 if [ "${NBOX:-0}" -eq 0 ]; then
@@ -216,7 +223,10 @@ if [ "${NBOX:-0}" -eq 0 ]; then
   exit 4
 fi
 MAP="$(printf '%s\n' "$MAP" | awk '$1!="UNRESOLVED"')"
-UNRESOLVED_LABELS="$(printf '%s\n' "$(resolve_boxes "$only_box")" | awk '$1=="UNRESOLVED"{printf "%s ",$2}')"
+# Derived from the SINGLE listing already in hand, not from a second `cmux vm list` round trip: a moving
+# universe could make the count (call 1) and the names (call 2) disagree, and the message would then
+# fall back to a vague `exec failed` about a label it had just resolved.
+UNRESOLVED_LABELS="$(MAP_RAW=$MAP_RAW awk 'BEGIN{ n=split(ENVIRON["MAP_RAW"],a,"\n"); for(i=1;i<=n;i++){ split(a[i],f," "); if(f[1]=="UNRESOLVED") printf "%s ", f[2] } }')"
 
 # emit_box <label> <vm> … — `collect`-shaped output for one box. Sets R_REACHED=1 when it answered.
 emit_box() {
@@ -247,8 +257,16 @@ emit_box() {
     echo "── $label  $p  (${sz:-?} bytes, ${mt:-?})"
     # The count and path go as argv, and stderr is kept OUT of the body: a remote "cannot open" — or a
     # `--lines` that `head` rejected — must never be rendered as though it were the artifact's content.
-    "$CM" vm exec --timeout 60 "$vm" -- sh -c 'head -n "$1" -- "$2" 2>/dev/null' \
-      lane-artifacts "$lines" "$p" </dev/null 2>/dev/null | sed 's/^/   /'
+    "$CM" vm exec --timeout 60 "$vm" -- sh -c 'head -n "$1" -- "$2" 2>/dev/null; exit $?' \
+      lane-artifacts "$lines" "$p" </dev/null 2>/dev/null > /tmp/.la-prev.$$ 2>/dev/null
+    if [ $? -ne 0 ]; then
+      # A failed preview used to render as an EMPTY artifact at exit 0 — content-absence silently
+      # standing in for a failed read, the one thing this tool refuses to do everywhere else.
+      echo "   ⚠ preview failed (exec did not answer) — the file is ${sz:-?} bytes on the box; content not shown"
+    else
+      sed 's/^/   /' /tmp/.la-prev.$$
+    fi
+    rm -f /tmp/.la-prev.$$
     if [ -n "$outdir" ]; then
       dest="$outdir/${label}-$(basename "$p")"
       if pull "$vm" "$p" "$sz" "$dest"; then
@@ -264,7 +282,14 @@ emit_box() {
 
 case "$verb" in
   collect|logs)
-    pat="$pattern"; exact=0
+  # ⛔ `find -name` NEVER matches a `/`, and the briefs this tool serves mandate `/tmp/<topic>.md` — so a
+  # pasted path is the likely first invocation, and it used to return a confident ABSENT-EVERYWHERE
+  # (every box searched, matched nothing: the letter of the contract, the wrong verdict — the same class
+  # as `--since 30m`). A path is a usage error, not a pattern.
+  case "$pattern" in
+    */*) echo "lane-artifacts: pattern is a filename fragment, not a path — give 'ci-cause', not '/tmp/ci-cause.md'" >&2; usage ;;
+  esac
+  pat="$pattern"; exact=0
     if [ "$verb" = "logs" ]; then
       # EXACT name: `<name>` is documented as the deterministic /tmp/<name>.log. `logs` with no name is
       # a usage error, not an absence verdict about a name the operator never gave.
@@ -279,10 +304,14 @@ case "$verb" in
       if [ ! -d "$outdir" ] || [ ! -w "$outdir" ]; then
         echo "lane-artifacts: --out '$outdir' is not a writable directory" >&2; exit 64
       fi
-      # Per-run, and the previous run's artifacts go too: a directory holding run 1's files next to
-      # run 2's empty index is read by any globbing consumer as run 2's result.
-      rm -f "$outdir/.lane-artifacts-index"
-      for f in "$outdir"/pi-cell-*; do [ -e "$f" ] && rm -f "$f"; done
+      # Delete exactly what the PREVIOUS index recorded — label-independent. A `pi-cell-*` glob missed
+      # any caller-supplied label (`--box edge-7`), leaving run 1's file beside run 2's empty index for
+      # any consumer that globs the directory instead of reading the index.
+      if [ -f "$outdir/.lane-artifacts-index" ]; then
+        while IFS="$(printf '\t')" read -r _l p _s; do
+          [ -n "${p:-}" ] && rm -f "$outdir/${_l}-$(basename "$p")"
+        done < "$outdir/.lane-artifacts-index"
+      fi
       : > "$outdir/.lane-artifacts-index"
     fi
     UNRES_NOTE=""
@@ -357,7 +386,16 @@ case "$verb" in
       show "$label" "$vm" ".log" 10 "log" && ok_log=1
       if [ "$ok_md" -eq 1 ] || [ "$ok_log" -eq 1 ]; then reached=$((reached + 1)); fi
     done <<< "$MAP"
+    # ⛔ A REQUESTED BOX THAT NEVER RESOLVED MUST BE NAMED. `collect` was fixed for this and `ls` was not,
+    # so a label missing from `cmux vm list` produced no header, no UNMEASURED line and exit 0 — silence
+    # read as "nothing there", in the verb an operator uses to ask what IS there.
+    if [ "${NUNRESOLVED:-0}" -gt 0 ]; then
+      for l in $UNRESOLVED_LABELS; do echo "== $l  UNRESOLVED(not in cmux vm list — NOT searched)"; done
+    fi
     if [ "$reached" -eq 0 ]; then echo "UNMEASURED(no box answered — says nothing about what is on them)"; exit 4; fi
+    if [ "${NUNRESOLVED:-0}" -gt 0 ]; then
+      echo "⚠ COVERAGE INCOMPLETE: $NUNRESOLVED requested box(es) were never resolved ($UNRESOLVED_LABELS)"
+    fi
     exit 0
     ;;
   *) usage ;;

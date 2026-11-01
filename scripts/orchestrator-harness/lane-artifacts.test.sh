@@ -220,7 +220,8 @@ grep -q 'exact log' "$out/pi-cell-4-t-lane.log" 2>/dev/null && ok "T12 log body 
   || bad "T12 log body" "$(cat "$out/pi-cell-4-t-lane.log" 2>/dev/null)"
 ls "$out" | grep -q 'log.bak' && bad "T12 must not collect the decoy" "$(ls "$out")" || ok "T12 decoy not collected"
 
-echo "T13 — a truncated invocation errors instead of spinning forever"# `timeout` is GNU coreutils and absent on macOS; guard with a background pid + a bounded wait instead,
+echo "T13 — a truncated invocation errors instead of spinning forever"
+# `timeout` is GNU coreutils and absent on macOS; guard with a background pid + a bounded wait instead,
 # so this case tests the tool and not the host's coreutils.
 bash "$TOOL" collect ci-cause --out > "$Q/t13.txt" 2>&1 &
 t13pid=$!
