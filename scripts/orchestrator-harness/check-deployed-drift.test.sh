@@ -465,6 +465,99 @@ ck "…and it stamps NO harness= token at all (the token names a drift; there is
    "$(qF "harness=" "$OUT" && echo 1 || echo 0)"
 
 echo
+echo "── §10 THE EXECUTING TREE: read from the PROCESS, never from a record about it (#10114) ──"
+# ⛔ THIS IS THE ARM'S REFUSAL TEST, AND IT IS THE WHOLE POINT OF THE CHANGE. Every section above
+# compares a directory AT REST. Measured on a live cell: the controller ran a harness directory that
+# had already been DELETED while `HARNESS-PIN` named a different commit, and the run printed
+# `OK: every harness dir on this box matches origin/main` and exited 0 — because the running dir was
+# pushed into the candidate list from inside a pipeline (a subshell, where `drift` cannot count) and a
+# candidate whose dir is ABSENT was then dropped by a bare `continue`. The word "every" excluded the
+# only directory that was executing.
+#
+# Its own fixture repo, because the graded shape needs a dir that can MATCH the ref — and a matching
+# dir must carry `orch-loop.sh`, which the fixture above deliberately does not ship.
+# ⛔ RESOLVED SPELLING, because the script prints `pwd -P`-normalised candidates (review finding 2).
+# Asserting the UNRESOLVED `$TMP` spelling reds on any host whose temp dir is reached through a symlink
+# (macOS `/var` -> `/private/var`, a symlinked `$TMPDIR`) while the checker is behaving correctly — the
+# class `harness-refresh.test.sh` already measured ("A36 redded there while CI went green").
+TMPR="$( cd "$TMP" && pwd -P )"
+R2="$TMPR/repo2"; D2="$TMPR/run2"
+git init -q -b main "$R2" >/dev/null 2>&1 || { echo "❌ git init failed for fixture2"; exit 2; }
+mkdir -p "$R2/scripts/orchestrator-harness" "$D2"
+printf '#!/usr/bin/env bash\necho loop\n' > "$R2/scripts/orchestrator-harness/orch-loop.sh"
+printf '#!/usr/bin/env bash\necho a\n' > "$R2/scripts/orchestrator-harness/a.sh"
+( cd "$R2" && $G add -A && $G commit -q -m fixture2 ) >/dev/null 2>&1 || { echo "❌ fixture2 commit failed"; exit 2; }
+cp "$R2/scripts/orchestrator-harness/orch-loop.sh" "$R2/scripts/orchestrator-harness/a.sh" "$D2/"
+PSH="$TMP/ps-cat"; printf '#!/bin/sh\ncat "$PS_TABLE" 2>/dev/null\nexit 0\n' > "$PSH"; chmod +x "$PSH"
+EMPTYHOME6="$TMP/emptyhome6"; mkdir -p "$EMPTYHOME6"
+surf() { # <ps-table> [extra HARNESS dir] — an isolated --surface run against fixture2
+  OUT="$( cd "$TMP" && HOME="$EMPTYHOME6" CELL_HOME="" HARNESS="${2:-}" HARNESS_PIN_DIR="" HARNESS_PIN_FILE="" \
+          DRIFT_PS="$PSH" PS_TABLE="$1" \
+          bash "$DRIFT" --o "$TMP/no-such-deployed" --repo "$R2" --ref main \
+               --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
+}
+
+# (10a) A LIVE CONTROLLER EXECUTING A DIRECTORY THAT NO LONGER EXISTS IS DRIFT — not a skip.
+GONE="$TMPR/run-gone/scripts/orchestrator-harness"
+printf '4242 bash %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-gone"
+surf "$TMP/ps-gone"
+ck "10a: executing a harness dir that is GONE is DRIFT (rc=$RC), and it used to print OK" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "10a: the report says the directory DOES NOT EXIST" "$(qF "DOES NOT EXIST" "$OUT" && echo 0 || echo 1)"
+ck "10a: the report NAMES THE PID that is executing it, so an operator can act" "$(qF "pid 4242 is EXECUTING" "$OUT" && echo 0 || echo 1)"
+ck "10a: the one-line token is harness=executes:<dir>, not a token about a copy at rest" \
+   "$(qF "harness=executes:$GONE" "$OUT" && echo 0 || echo 1)"
+ck "10a: …and it is NOT harness=surface (that token's remedy, reseeding a dir, cannot clear a gone tree)" \
+   "$(qF "harness=surface" "$OUT" && echo 1 || echo 0)"
+ck "10a: the verdict says a redeploy of \$O does not clear it" "$(qF "does not clear it" "$OUT" && echo 0 || echo 1)"
+
+# (10b) THE NON-VACUITY PAIR: the same invocation, the controller executing a dir that IS the ref.
+printf '4243 bash %s/orch-loop.sh\n' "$D2" > "$TMP/ps-healthy"
+surf "$TMP/ps-healthy"
+ck "10b: the same box with the controller on a matching tree is rc 0 (10a is not a permanently-red check)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "10b: …and the executing dir is COMPARED and labelled RUNNING, not merely seen" \
+   "$(qF "$D2  (RUNNING)" "$OUT" && echo 0 || echo 1)"
+ck "10b: …and the run SAYS which pid it read, so the green is attributable" \
+   "$(qF "exec: pid 4243 executes $D2" "$OUT" && echo 0 || echo 1)"
+
+# (10c) THE EXECUTING DIR EXISTS BUT IS NOT $REF — the same standard applied to the tree that runs.
+D3="$TMPR/run3"
+mkdir -p "$D3"
+cp "$R2/scripts/orchestrator-harness/orch-loop.sh" "$R2/scripts/orchestrator-harness/a.sh" "$D3/"
+printf '#!/usr/bin/env bash\necho stale-loop\n' > "$D3/orch-loop.sh"
+printf '4244 bash %s/orch-loop.sh\n' "$D3" > "$TMP/ps-differs"
+surf "$TMP/ps-differs"
+ck "10c: a RUNNING tree that differs from the ref is DRIFT (rc=$RC)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "10c: …and the differing file is NAMED against the dir the controller executes" \
+   "$(qF "orch-loop.sh — DIFFERS in $D3" "$OUT" && echo 0 || echo 1)"
+
+# (10d) FAIL-CLOSED: a path that cannot be EXAMINED is BROKEN (2), never "nothing to report".
+ln -s "$TMP/definitely-not-a-target" "$TMP/dangling-run" 2>/dev/null || true
+printf '4245 bash %s/dangling-run/orch-loop.sh\n' "$TMP" > "$TMP/ps-dangling"
+# ⛔ A CLEAN CANDIDATE IS SUPPLIED ON PURPOSE (review finding 4). Without one, the PRE-CHANGE script
+# also exits 2 here (the unexaminable dir is dropped, the candidate set is empty, and the pre-existing
+# empty-candidate refusal fires) — the assertion would pass for a reason unrelated to what it names.
+# With $D2 clean and only the executing path unexaminable, the pre-change run reaches `OK`/rc 0 and
+# this arm is the only thing that can red it.
+surf "$TMP/ps-dangling" "$D2"
+ck "10d: an UNEXAMINABLE executing path is exit 2 (rc=$RC) over an otherwise CLEAN box (pre-change: rc 0)" \
+   "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "10d: …and the report says it cannot be EXAMINED" "$(qF "cannot be EXAMINED" "$OUT" && echo 0 || echo 1)"
+
+# (10e) AN EXECUTING DIR THAT STILL EXISTS BUT CARRIES NO *.sh IS NOT DROPPED (review finding 1).
+# The deterministic sibling of 10a: the process outlives the scripts (a deleted script is held open by
+# the running interpreter), so the dir exists and the generic "is this a harness dir?" filter skipped it
+# with a bare `continue` — after already printing that it was "compared against $REF below".
+D4="$TMPR/run4"; mkdir -p "$D4"
+printf '4246 bash %s/orch-loop.sh\n' "$D4" > "$TMP/ps-empty-dir"
+surf "$TMP/ps-empty-dir" "$D2"
+ck "10e: an executing dir with NO readable *.sh is DRIFT (rc=$RC), not silently filtered out" \
+   "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
+ck "10e: …and the token names the executing dir" "$(qF "harness=executes:$D4" "$OUT" && echo 0 || echo 1)"
+ck "10e: …and it says the script the live process started from is GONE" \
+   "$(qF "NO readable *.sh at all" "$OUT" && echo 0 || echo 1)"
+
+echo
 echo "── §4 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"
 # ⛔ MEMBERSHIP IS READ FROM WHAT THE RUNNER EXECUTES, NOT FROM ITS TEXT (#2838). This check used to
 # grep the runner's SOURCE for its own `run_shard` row — the text of a list that no longer exists:
