@@ -65,6 +65,42 @@ TMP="$(mktemp -d)"
 # running a cell controller. An explicit EMPTY value (no colon) is the helper's advertised seam for
 # "no roots" — the same line tests/ci-lane-parity/run.sh uses.
 FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
+# ⛔ AND THE FIXTURE MUST NOT INHERIT THE CALLER'S **RUNNER** ENV EITHER (agent-infra#3220, measured).
+# `scripts/run-bash-shards.sh` hands every shard its own environment unmodified (`shard_run_bounded`
+# runs `bash "$1" </dev/null`), and BOTH of this repo's bash lanes export a runner setting that this
+# suite's fixtures then re-use as if it were their own:
+#
+#   * `ci-main.yml`'s `script-validate` exports `BASH_SHARDS_BUDGET_SECS: '7800'` job-wide. The runner
+#     deliberately REFUSES (rc 2) a POSITIVE budget combined with `BASH_SHARD_SLICE` — a sliced
+#     process only accumulates its own share, so a whole-list deadline would be ~N times too lenient.
+#     Arms 2d/2e pass `BASH_SHARD_SLICE=1/1`, so the inherited budget turned arm 2d into
+#     `❌ a 3-shard SLICED run failed (rc 2)` on EVERY main run, while passing on a laptop where the
+#     variable is unset. This IS the `bash-shard::tests/run-bash-shards-bound/run.sh` identity #3220
+#     reported, and it is still red on main: run 41338741722 (`ci-main.yml`, job 124944015052) printed
+#     exactly that line, then `❌ SHARD FAILED (rc 1): tests/run-bash-shards-bound/run.sh` — 1 of 52
+#     assertions — and listed the shard in `❌ failing shard(s): …`.
+#   * `ci.yml`'s `bash-suites` matrix exports `BASH_SHARD_SLICE: <i>/<n>` for the whole step. Every
+#     fixture call here that does NOT set its own slice then inherits one and runs 1/n of its staged
+#     3 shards, so the bound arms collapse. Measured at this head: **33 of 52** assertions fail under
+#     `BASH_SHARD_SLICE=1/8` (CI's `bash-suites (8)`) and **26 of 52** under `1/3`. ⛔ The count MOVES
+#     with the slice AND with run-to-run timing (a re-measure at `1/8` gave 34) — read it as "most of
+#     the suite", never as a fixed number. So the same suite is red in BOTH lanes, from these two
+#     different variables, which is why one fix has to clear both.
+#
+# Both are the same defect — a suite that declares itself hermetic ("no host state") reading the host's
+# runner config — and this suite tests the BOUND, never the budget or the slicing. `tests/ci-lane-parity`
+# already strips exactly these two variables at every one of its fixture invocations for this reason, so
+# unsetting them in ONE place here is the established idiom, not a weakening. Both are written as
+# `unset` rather than `=0`/`=1/1`: the runner's other documented "none" spellings, but unsetting is the
+# form the sibling suite uses and what `ci-main.yml` documents as "no deadline".
+#
+# ⛔ THE INHERITED BUDGET IS ALSO WHY THIS ARM WAS ONCE ROOT-CAUSED WRONG, so arm 2d below now SEPARATES
+# the two failures it used to report as one. `rc 2` is the runner REFUSING to start — a config/env
+# fault that is NOT this suite's subject — and `rc 1` is a shard failure. The arm's single old message
+# blamed "the driver's own bookkeeping did not survive its shard teardowns" for BOTH, which reads as a
+# runner-bug report and sends the next reader to the wrong file (it did exactly that). The refusal is
+# now named as a refusal, with the offending variable quoted from the runner's own output.
+unset BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
 trap 'rm -rf "$TMP"' EXIT
 
 # stage_fixture <root> <hang-seconds> — a miniature checkout the REAL runner runs.
@@ -782,7 +818,12 @@ awk '
   }
   { print }
 ' "$SLICEFIX/scripts/runner.sh" >"$SLICEMUT"
-if [ "$SLICE_RC" -ne 0 ]; then
+if [ "$SLICE_RC" -eq 2 ]; then
+  # A REFUSAL, not a suite failure (see the header above): the runner exits 2 when the environment
+  # hands it a configuration it will not run under, so the run never reached the bookkeeping this arm
+  # is about. Naming that as a failure of the driver is how #3220 got diagnosed against the wrong file.
+  fail "a 3-shard SLICED run was REFUSED by the runner (rc 2), so this arm never exercised the teardown at all — a runner setting this suite does not set itself is in the environment: $(grep -E 'BASH_SHARDS_BUDGET_SECS|BASH_SHARD_SLICE' "$TMP/sliceclean.out" | head -2 | tr '\n' ' ')"
+elif [ "$SLICE_RC" -ne 0 ]; then
   fail "a 3-shard SLICED run failed (rc $SLICE_RC) — the driver's own bookkeeping did not survive its shard teardowns: $(grep -E 'DIFFERENT SET|sort: cannot read' "$TMP/sliceclean.out" | head -2 | tr '\n' ' ')"
 elif [ "$SLICE_ROWS" -ne 3 ]; then
   fail "a 3-shard sliced run printed $SLICE_ROWS timing row(s), not 3 — this arm proves nothing"
