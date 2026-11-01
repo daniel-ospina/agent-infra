@@ -677,7 +677,7 @@ extract_failed_tests() {
     3) rm -f "$log_file"; run_failed_job_ids "$run_id"; return $? ;;
     *) rm -f "$log_file"; return 1 ;;
   esac
-  failed_ids_from_log "$log_file"
+  failed_ids_from_log "$log_file" "$run_id"
   rc=$?
   rm -f "$log_file"
   return $rc
@@ -901,7 +901,7 @@ fetch_failed_log() {
   return 1
 }
 
-# failed_ids_from_log <log-file> → the ids, via THE canonical parser.
+# failed_ids_from_log <log-file> [<run-id>] → the ids, via THE canonical parser.
 #
 # #3756 DEFECT 1: this used to be a second `awk` regex that printed whatever
 # token followed a bare `FAILED` field — including `may` from log prose. `may` is
@@ -913,12 +913,33 @@ fetch_failed_log() {
 # UNATTRIBUTABLE on stderr (fail-closed, #3705) — never carried, never read as
 # "no failures".
 failed_ids_from_log() {
-  local log_file="$1" out
+  local log_file="$1" out rc run_label="${2:-}"
   require_exemption_module || return 1
-  if ! out="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$log_file")"; then
-    say_err "ci-failure-set: ✗ FAILED-id extraction FAILED for $log_file — refusing to read it as an empty failure set"
-    return 1
-  fi
+  out="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$log_file")"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    # ── #3174 — A TRUNCATED RUN IS NOT A FAILURE SET ─────────────────────────────────────────
+    # `run-bash-shards.sh` prints `⚠️ RECAP INCOMPLETE (k/n shards ran)` when it is killed mid-list
+    # (its TERM/INT trap), and `ci_exemption.py ids` answers that capture with this exit code and
+    # NO ids. The answer is neither "no failures" nor a shorter set: it is UNPROVEN, and folding it
+    # into the baseline is the defect this fixes. Measured on main 2026-10-31: three consecutive
+    # runs named 13 / 11 / 10 failing shards, so the reference set every batch verdict subtracts was
+    # SHRINKING as the job got slower — a shard red on main drops out, reappears as "a new failure
+    # caused by the batch", and gets a constituent dropped or reverted on a false signal.
+    #
+    # ⛔ NOT A HARD FAILURE OF THE WHOLE CAPTURE. One killed run must not make the reference
+    # uncomputable (#3131's baseline would become permanently UNPROVEN on a fleet where the shard
+    # step is the slowest thing main runs) — so the collectors EXCLUDE this run from BOTH the
+    # numerator and the denominator of the rate table and say so out loud, and only refuse the
+    # capture when NO failing run in the window could be measured. See `collect_union_rates`.
+    4)
+      say_err "ci-failure-set: ⚠️ UNPROVEN: run-bash-shards.sh's recap in this capture${run_label:+ (run $run_label)} is INCOMPLETE — the step was TERMINATED before its list finished, so the failures it names are a TRUNCATED SAMPLE, not a set. This run is EXCLUDED from the baseline rather than folded into it (#3174): its missing shards are missing from the rate table, so treating it as a set would report a real failure on main as new."
+      return 4 ;;
+    *)
+      say_err "ci-failure-set: ✗ FAILED-id extraction FAILED for $log_file — refusing to read it as an empty failure set"
+      return 1 ;;
+  esac
   [ -n "$out" ] && printf '%s\n' "$out"
   return 0
 }
@@ -1018,7 +1039,7 @@ write_runs_report() {
 # provenance/counts when requested. Returns 1 on extraction failure.
 collect_union() {
   local lane_file="$1" provenance="$2" report="$3"
-  local tmp_set="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
+  local tmp_set="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line truncated=0 truncated_id=""
   tmp_set="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_set"
   # The provenance file must exist even when NOTHING failed — callers build the
@@ -1076,6 +1097,13 @@ collect_union() {
       # that actually exercised the revision" and is the main-side gate's signal,
       # so the credit is taken back rather than left to dilute the rate table.
       2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
+      # #3174: a TRUNCATED capture (the shard runner was killed mid-list) is not a
+      # failure set — it is excluded from BOTH sides of every comparison, and the
+      # credit is taken back for the same reason as the zero-job arm: the run did
+      # not FINISH exercising the revision, so counting it as measured would make
+      # the set it did not produce look like an empty one. `collect_union_truncated`
+      # publishes the exclusion so it is loud, never a silent shrink.
+      4) [ "$credited" = "1" ] && tested=$((tested - 1)); truncated=$((truncated + 1)); truncated_id="$run_id"; continue ;;
       # #2569: the counters reached so far are PUBLISHED before failing closed, so
       # the refusal can name a measured window instead of reading like an empty one.
       # `parse:` — `extract_failed_tests` is COMPOSITE (fetch, then ids, then a
@@ -1089,8 +1117,49 @@ collect_union() {
     fi
   done < "$lane_file"
   write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
+  collect_union_truncated "$truncated" "$examined" "$extracted" "$report" "$completed" "$tested" "$pending" "$truncated_id" || { rm -f "$tmp_set"; return 1; }
   sort -u "$tmp_set"
   rm -f "$tmp_set"
+}
+
+# collect_union_truncated <truncated> <examined> <extracted> <report> <completed> <tested>
+#                        <pending> <last-truncated-run-id>
+#
+# The ONE report for a baseline that had to EXCLUDE truncated runs (#3174), shared by every collector
+# so the message, the runs-report label and the refusal rule cannot drift between the union, the rate
+# table, the signature table and the row door.
+#
+# TWO OUTCOMES, both loud:
+#   * SOME failing run was measured → say how many were excluded and that the table covers the rest.
+#     Continuing is deliberate: a killed main run must not make the reference UNCOMPUTABLE on a fleet
+#     where the shard step is the slowest thing main runs — that is the same class of harm as the
+#     fail-open in the other direction, one permanent UNPROVEN instead of one silent shrink.
+#   * NO failing run in the window could be measured → REFUSE (rc 1) and RE-WRITE the runs-report
+#     with `unreadable=truncated:<run-id>`. An empty table is not "main is green": `decide()` would
+#     carry no base rows and every PR failure would block against an unmeasured reference — and the
+#     label is what lets `admin-merge.sh` name THIS cause instead of falling through to its
+#     "main's run LISTING could not be read" message, which is the opposite of what happened (the
+#     window WAS listed; its failing runs were killed mid-list).
+#
+# ⛔ EVERY ARM THAT REFUSES MUST PUBLISH A LABEL. The refusal is `rc 1`; without a label the rail's
+# `case "$main_unreadable"` falls into its `*)` arm and names a remedy that cannot work — the #2569
+# "two opposite states, one message" defect, one state further out.
+collect_union_truncated() {
+  local truncated="$1" examined="$2" extracted="$3" report="${4:-}" completed="${5:-0}"
+  local tested="${6:-0}" pending="${7:-0}" last_id="${8:-unknown}"
+  [ "$truncated" -gt 0 ] || return 0
+  say_err "ci-failure-set: ⚠️ UNPROVEN: $truncated of $examined examined failing run(s) were EXCLUDED from this baseline because scripts/run-bash-shards.sh's recap in them is INCOMPLETE (the step was killed mid-list, #3174). A truncated run's failure set is a SAMPLE, not a set — it contributed to NEITHER side of the comparison, because a shard missing from the reference comes back as a new failure caused by whatever is being compared."
+  if [ "$examined" -gt 0 ] && [ "$extracted" -eq 0 ]; then
+    # ⛔ THE CLAIM IS BUILT FROM THE COUNTERS, never from the guard (review of this change, P2).
+    # `extracted == 0` also holds for a run whose log was READ and yielded no ids, so a message
+    # saying "every examined run was truncated" would assert a cause its own predicate does not
+    # establish.
+    say_err "ci-failure-set: ✗ UNPROVEN: NO failing run in this window could be MEASURED — of $examined examined failing run(s), $truncated were excluded as TRUNCATED (recap INCOMPLETE) and $((examined - truncated)) yielded no failure identity. Refusing to publish a baseline (an empty table would read as 'nothing fails on main'). Remedy: read a window that contains a run whose shard step FINISHED — raise the requested width (e.g. --main-union-rates <N> / --main-runs <N>): the widening heuristic credits a completed/failure run as MEASURED without fetching its log, so a window made of killed runs satisfies it while proving nothing. This is a measurement failure, not a parser failure, so re-running the parser is not the fix."
+    write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "truncated:$last_id"
+    return 1
+  fi
+  say_err "ci-failure-set: · UNPROVEN-EXCLUDED: the table below covers the measured run(s) only; the excluded run(s) named above are NOT evidence that their unfinished shards were green."
+  return 0
 }
 
 # #3756 — per-id failure COUNTS across a lane's runs, not a union.
@@ -1105,7 +1174,7 @@ collect_union() {
 # baseline must never read as "no failures".
 collect_union_rates() {
   local lane_file="$1" provenance="$2" report="$3"
-  local tmp_all="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
+  local tmp_all="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line truncated=0 truncated_id=""
   tmp_all="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_all"
   [ -n "$provenance" ] && : > "$provenance"
@@ -1143,6 +1212,11 @@ collect_union_rates() {
     case "$rc" in
       0) ;;
       2) [ "$credited" = "1" ] && tested=$((tested - 1)); continue ;;
+      # #3174 — a TRUNCATED capture is excluded from BOTH sides of the rate table (see
+      # `collect_union_truncated`): the numerator would otherwise be a sample of the run while the
+      # denominator still counted it as a full measurement, which is exactly the "main 1/8 vs PR 8/8"
+      # shape the rate comparison was built to see through.
+      4) [ "$credited" = "1" ] && tested=$((tested - 1)); truncated=$((truncated + 1)); truncated_id="$run_id"; continue ;;
       # #2569: publish the partial counters before failing closed — see
       # `write_runs_report` for why this is not a shrunken baseline. `parse:`
       # because `extract_failed_tests` is composite (fetch, ids, pruned fallback).
@@ -1154,6 +1228,7 @@ collect_union_rates() {
     fi
   done < "$lane_file"
   write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
+  collect_union_truncated "$truncated" "$examined" "$extracted" "$report" "$completed" "$tested" "$pending" "$truncated_id" || { rm -f "$tmp_all"; return 1; }
   # No tested runs -> emit NOTHING. An empty rate table must never be read as
   # "main never fails anything", which would exempt every PR failure.
   if [ "$tested" -gt 0 ]; then
@@ -1169,7 +1244,7 @@ collect_union_rates() {
 # failure returns 1, and nothing is emitted when no run exercised the suite.
 collect_union_signatures() {
   local lane_file="$1" provenance="$2" report="$3"
-  local tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
+  local tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line truncated=0 truncated_id=""
   tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_sigs"
   [ -n "$provenance" ] && : > "$provenance"
@@ -1226,12 +1301,21 @@ collect_union_signatures() {
     # yields no ids, which is correct for a capture that PROVES nothing but wrong
     # for a run we already know carried no parseable failure (the
     # `extracted < examined` gate in admin-merge.sh owns that case).
-    local ids="" one=""
-    ids="$(failed_ids_from_log "$log_file")" || {
+    local ids="" one="" irc=0
+    ids="$(failed_ids_from_log "$log_file" "$run_id")"; irc=$?
+    if [ "$irc" -eq 4 ]; then
+      # #3174 — TRUNCATED capture: excluded from the signature table for the same reason as every
+      # other collector (see `collect_union_truncated`). The run is not credited as measured.
+      [ "$credited" = "1" ] && tested=$((tested - 1))
+      truncated=$((truncated + 1)); truncated_id="$run_id"
+      rm -f "$log_file"
+      continue
+    fi
+    if [ "$irc" -ne 0 ]; then
       rm -f "$log_file" "$tmp_sigs"
       write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
       return 1
-    }
+    fi
     if [ -n "$ids" ]; then
       extracted=$((extracted + 1))
       one="$(extract_failed_signatures "$log_file")" || {
@@ -1244,6 +1328,7 @@ collect_union_signatures() {
     rm -f "$log_file"
   done < "$lane_file"
   write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
+  collect_union_truncated "$truncated" "$examined" "$extracted" "$report" "$completed" "$tested" "$pending" "$truncated_id" || { rm -f "$tmp_sigs"; return 1; }
   # No tested run -> emit NOTHING. An empty signature table is not evidence; the
   # caller BLOCKS on it rather than exempting from it.
   if [ "$tested" -gt 0 ]; then
@@ -1273,7 +1358,7 @@ collect_union_signatures() {
 # in the capture with its own test; it is deliberately NOT bundled here.
 collect_union_rows() {
   local lane_file="$1" provenance="$2" report="$3" per_run="$4" unattr="${5:-}"
-  local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line
+  local tmp_ids="" tmp_sigs="" examined=0 extracted=0 completed=0 tested=0 pending=0 credited=0 run_id line truncated=0 truncated_id=""
   tmp_ids="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   tmp_sigs="$(mktemp "${TMPDIR:-/tmp}/ci-failure-set.XXXXXX")"
   : > "$tmp_ids"; : > "$tmp_sigs"
@@ -1348,11 +1433,30 @@ collect_union_rows() {
       write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "log:$run_id"
       return 1
     fi
-    ids="$(failed_ids_from_log "$log_file")" || {
+    ids="$(failed_ids_from_log "$log_file" "$run_id")"; local irc=$?
+    if [ "$irc" -eq 4 ]; then
+      # #3174 — TRUNCATED capture: excluded from the row door (see `collect_union_truncated`), so a
+      # partial failure set never reaches `decide()` as if it were the PR's (or main's) set.
+      [ "$credited" = "1" ] && tested=$((tested - 1))
+      truncated=$((truncated + 1)); truncated_id="$run_id"
+      # ⛔ THE `--unattributed` WRITE IS NOT OPTIONAL HERE (review of this change, P2). Every other
+      # arm that advances `examined` without `extracted` records the runref — the zero-job arm above
+      # and the empty-ids arm below — and `admin-merge.sh` §1c CROSS-CHECKS it: the `examined >
+      # extracted` refusal counts the runs it expects to be named, then requires the collector to
+      # have published that many. Omitting this write made the two files disagree ("the collector
+      # published 0 unattributable run(s) where the refusal counted 1 — this list is INCOMPLETE"),
+      # blaming a collector whose exclusion was deliberate. The reason is NOT "yielded no identity"
+      # — the ids exist and were refused — so the run is named in the UNPROVEN line by
+      # `failed_ids_from_log` and listed here as the un-extracted run it is.
+      [ -n "$unattr" ] && printf '%s\n' "$runref" >> "$unattr"
+      rm -f "$log_file"
+      continue
+    fi
+    if [ "$irc" -ne 0 ]; then
       rm -f "$log_file" "$tmp_ids" "$tmp_sigs"
       write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending" "parse:$run_id"
       return 1
-    }
+    fi
     if [ -n "$ids" ]; then
       extracted=$((extracted + 1))
       printf '%s\n' "$ids" >> "$tmp_ids"
@@ -1382,6 +1486,7 @@ collect_union_rows() {
     rm -f "$log_file"
   done < "$lane_file"
   write_runs_report "$report" "$examined" "$extracted" "$completed" "$tested" "$pending"
+  collect_union_truncated "$truncated" "$examined" "$extracted" "$report" "$completed" "$tested" "$pending" "$truncated_id" || { rm -f "$tmp_ids" "$tmp_sigs"; return 1; }
   if [ "$tested" -gt 0 ]; then
     # Join per-id failure counts (and the id universe, so an UNSIGNED id still
     # gets a row) with the signature rows. awk only; no second signature parser.
