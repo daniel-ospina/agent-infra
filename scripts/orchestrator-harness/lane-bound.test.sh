@@ -594,7 +594,14 @@ grep -q 'AGENT_BOUND_VERDICT' "$GATE"; ck "(g) …and exposes its verdict to cal
 # fallback exists is the other half of "a version skew must never halt every lane": the failure this
 # guards is a future edit that deletes the subshell while keeping the WARN, which would advertise a
 # bound the box does not have.
-grep -qF 'sleep "$_lb_wall"; kill -TERM "$pid"' "$GATE"; ck "(g) …and a \$O without lane-bound.sh still gets the WALL CLOCK (loudly), never an unbounded lane" $?
+# ⛔ THE PIN IS THE ARM, NOT A SPELLING OF IT. It was `sleep "$_lb_wall"; kill -TERM "$pid"` before
+# #2033 orphan-proofed the fallback (2026-10-18): the wall `sleep` is now BACKGROUNDED and kept in `s`
+# so the TERM trap takes it down, because a plain subshell `sleep` survives its parent's kill, holds
+# the worktree's cwd, and makes the empty-worktree reap unable to fire — the inert-enforcer shape
+# #2033 exists to remove. The degraded path must still (1) sleep the bound THAT RUNS and (2) TERM the
+# pid, so both are asserted; a future edit that deletes the subshell while keeping the WARN still
+# reddens here.
+grep -qF 'sleep "$_lb_wall" & s=$!' "$GATE" && grep -qF 'kill -TERM "$pid"' "$GATE"; ck "(g) …and a \$O without lane-bound.sh still gets the WALL CLOCK (loudly), never an unbounded lane" $?
 # ⛔ THE VERDICT FILE IS REMOVED BEFORE EACH RUN. A leftover from a previous invocation of the same log
 # would be read as THIS run's outcome — the stale-flag class the harness names in its own instructions.
 awk '/rm -f "\$log.lanebound"/{f=1} /sh "\$_lb_sh" watch/{w=1} END{exit !(f && w && NR>0)}' "$GATE" \
