@@ -74,6 +74,14 @@ cat > "$BRIEF" <<'BRIEFEOF'
 FIRST ACTION: write `__O__/state/REPORT-stall-fix.md` with a stub. **You are dispatched by a
 stall escalation, not by a PR or an issue.** 30 minutes, then report even if unfinished.
 
+⛔ **YOU OWN NO PR — AND THE "COMMIT AS YOU GO" SECTION APPENDED BELOW DOES NOT APPLY TO YOU.** This
+brief is dispatched with the `prfix` kind for ONE reason: the creation back-pressure gate exempts a
+stall repair as `prfix`. That kind's delivery section contributes the sentence *"Your PR is ALREADY
+OPEN — commit and push onto it, and do NOT open a second PR"*, which describes a FIXER working on an
+existing PR. It does not describe you. **You are READ-ONLY: do not commit, do not push, do not open,
+re-open or touch any PR.** Your only output is `__O__/state/REPORT-stall-fix.md`. If the two
+instructions conflict, this one governs.
+
 ## Why you exist
 
 The controller reported a DRAIN STALL: **no PR merged in __AGEMIN__ minutes** while
