@@ -5087,7 +5087,11 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
 });
 
-test("#1492: a block is a NO-OP — the refused command is recorded, and the message says nothing ran", () => {
+// ⛔ THE TITLE PINS WHAT THE BODY NOW ASSERTS (fresh review of #3175 round 2, P2). It used to read
+// "…and the message says NOTHING RAN", while the assertions below require the message to say no such
+// thing — a label asserting the behaviour the diff REMOVED, which is the same defect class this PR
+// fixes in the gate text. The invariant that holds is the SCOPED one.
+test("#1492/#3175: a block is a NO-OP for its OWN call — the refused command is recorded, and the message states only the effect it established", () => {
   // The field #1492 asks for: a `gate_block` entry carried reason + tier, never WHICH
   // command was refused.
   const short = 'gh pr list --json number | sort';
@@ -5238,7 +5242,7 @@ test("#3175: the operator block and the model text render the SAME read — abse
   });
 });
 
-testAsync("#3175: a blocked call leaves NO effect, and the refusal is ANCHORED to that call", async () => {
+testAsync("#3175: the refusal is ANCHORED to its own call, scoped to it, and records that claim", async () => {
   await withTempHome(async () => {
     await withMarkerIsolated(async () => {
       const prevMode = process.env.PI_MODE;
@@ -5252,6 +5256,15 @@ testAsync("#3175: a blocked call leaves NO effect, and the refusal is ANCHORED t
         // marker was absent — which is `block === true` restated, so it could not fail unless the
         // assertion above it already had (fresh review of #3175, P2). The durable effect record is
         // the audit row, and it is what the fleet reads back.
+        //
+        // ⛔ AND THE HOST-LEVEL NO-OP IS A *CITED* CONTRACT, NOT SOMETHING MEASURED HERE (fresh review
+        // of #3175, round 2, P2 — the title used to read "a blocked call leaves NO effect" while
+        // nothing in the body observed an effect, and a marker written by the test itself can only
+        // ever restate `block === true`). "The refused command did not execute" rests on
+        // `pi-agent-core`'s agent loop (`beforeResult.block` → an immediate error result, the tool
+        // never runs); this double is not that loop, so the test must not dress a citation up as an
+        // observation. What IS observed is the SCOPE, below: the refusal is bound to ONE call and a
+        // sibling call in the same session is not refused.
         const res = await fire("tool_call", {
           toolName: "bash",
           toolCallId: "call_3175_anchor",
@@ -5282,6 +5295,19 @@ testAsync("#3175: a blocked call leaves NO effect, and the refusal is ANCHORED t
         equal(audit[0].effect_scope, "this_call_only", "…scoped to this call, never a claim about a sibling");
         equal(audit[0].tool_call_id, "call_3175_anchor", "…bound to the call it observed");
         equal(audit[0].dispatch_count, 0, "…with the count it actually read");
+        // THE SCOPE, MEASURED (fresh review of #3175 round 2, P2). `effect_scope: this_call_only` is a
+        // claim about behaviour, so observe the behaviour: a SIBLING call in the SAME session, on a
+        // command this gate has no business refusing, is not refused, and the refusal that preceded
+        // it does not terminate the batch around it. A gate that refused the session's later calls —
+        // or returned `terminate: true` — goes red here, which is what the deleted marker assertion
+        // could not do.
+        const sibling = await fire("tool_call", {
+          toolName: "bash",
+          toolCallId: "call_3175_sibling",
+          input: { command: "ls .worktrees" },
+        });
+        ok(!(sibling && sibling.block), "a SIBLING non-git call in the same session is NOT refused (the scope claim, observed)");
+        ok((res as any).terminate !== true, "…and the refusal is not TERMINATING: `true` would end the batch around it");
       } finally {
         process.env.PI_MODE = prevMode;
       }
@@ -5357,6 +5383,36 @@ testAsync("#3175: EVERY refusal arm carries the per-call anchor and the read —
           const reason = await drive(micro, capacity);
           ok(new RegExp(`tool_call_id=call_3175_${arm}`).test(reason),
             `the ${arm} arm's TOOL RESULT names its own call (#3175)`);
+          // The ANCHOR itself, on EVERY arm — pre-#3175 the tool result carried no anchor at all, so
+          // this is the assertion the pointer below depends on.
+          ok(/ANCHOR \(#3175\)/.test(reason), `the ${arm} arm's tool result carries the per-call ANCHOR`);
+          // ⛔ THE POINTER ASSERTION WAS A FALSE-PASS INSTRUMENT (fresh review of #3175 round 2, P2).
+          // It read `ok(!pointer || /ANCHOR \(#3175\)/.test(reason))`, whose second disjunct is
+          // INVARIANT-TRUE by construction: every arm returns `dispatchFloorRefusal(...)`, and that
+          // composes `message + dispatchFloorAnchor(...)`, whose first line is literally `⛔ ANCHOR
+          // (#3175)`. `X || true` is `true`, so the cell could never fail — and on the PRE-#3175 code
+          // it passed for the opposite reason (neither string was present, so `!X` was true).
+          // The disjunction meant is a CONDITIONAL one, and it is written as one: where the arm's
+          // text points at the anchor, the anchor must be in the same text.
+          if (capacity) {
+            // ⛔ AND THE ARM IS PINNED TO ITS OWN TEXT (same finding): these cells asserted only
+            // `block === true` + an anchor, so a mis-shaped `tool_result` fixture that silently fell
+            // through to the FLOOR arm answered and the cell passed anyway. The capacity arm renders
+            // the spawn-fault diagnosis and NEVER the compliance text, so assert the channel-specific
+            // content and, crucially, its absence from the floor arms below.
+            ok(/REVIEW-GATE-UNSPAWNABLE/.test(reason),
+              `the ${arm} arm renders the spawn-fault diagnosis, not the compliance text`);
+            ok(!/No reviewers were dispatched in this session/.test(reason),
+              `…the compliance headline is NOT what the ${arm} arm printed`);
+            ok(!/see the ANCHOR line below/.test(reason),
+              `…and it carries no ANCHOR pointer it would then have to satisfy`);
+          } else {
+            ok(/see the ANCHOR line below/.test(reason), `the ${arm} arm points at the ANCHOR it carries`);
+            ok(/ANCHOR \(#3175\)/.test(reason),
+              `…and that pointer RESOLVES inside its own text, not only in the once-per-session recovery`);
+            ok(!/REVIEW-GATE-UNSPAWNABLE/.test(reason),
+              `…and the ${arm} arm is the COMPLIANCE refusal, not a spawn-fault one`);
+          }
           // The CAPACITY arms render their own diagnosis instead of the read block, so the count is
           // asserted where they do carry it: the audit row is `dispatch_count`. Here the floor arms
           // must show the count they READ; the capacity arms must at least not fabricate one.
@@ -5365,8 +5421,6 @@ testAsync("#3175: EVERY refusal arm carries the per-call anchor and the read —
               `the ${arm} arm renders the count it read, not UNKNOWN and not a literal`);
             ok(!/DISPATCHES = UNKNOWN/.test(reason), `…and the ${arm} arm actually took the read`);
           }
-          ok(!/see the ANCHOR line below/.test(reason) || /ANCHOR \(#3175\)/.test(reason),
-            `the ${arm} arm's anchor pointer resolves inside its own text`);
         }
       }
     });
