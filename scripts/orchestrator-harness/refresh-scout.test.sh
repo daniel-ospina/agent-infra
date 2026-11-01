@@ -2555,6 +2555,15 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
   run_branch() {
     ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
       LANE_ALIVE="$1"; KILLABLE="$2"; released=0
+      # ⛔ THE SLICE IS THE LOOP BODY, SO THE LOOP'S LOCALS MUST BE SUPPLIED. `refresh-scout.test.sh`
+      # runs under `set -u`, and the #2033 merge added `wt_reap_if_empty "$REPO" ".worktrees/$WT" …`
+      # to this branch: `WT` is set two lines above the slice in the real script (`WT="tm-$N"`), but
+      # an extracted slice does not carry it, so the subshell DIED on the unbound variable before it
+      # could print its count and the assertion read '' — a failure of the harness, not of the code.
+      # `wt_reap_if_empty` is stubbed for the same reason `release_issue_claim_unspawned` is: this
+      # check counts RELEASES, and the reap is proven by wt-lifecycle.test.sh's own arms.
+      WT="tm-$N"
+      wt_reap_if_empty() { WT_RESULT="stub: reap not exercised by the release-count check"; return 0; }
       chain_gen=""   # the spawner sets this; the extracted branch only USES it
       wt_spawn() { return 1; }                                       # the chain cannot start
       wt_alive() { [ "$LANE_ALIVE" = 1 ]; }
