@@ -440,6 +440,42 @@ OUT="$TMP/out"; ERR="$TMP/err"
 RC=$?
 ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "declared stale + undeclared stale + an ungradeable line is STILL rc=1 (rc=$RC)"
 ck $(grep -q '1 farm-declared' "$ERR" && echo 0 || echo 1) "...and the summary still counts the declared one"
+# 27E. ⛔ TWO DOTS INSIDE A FILENAME ARE NOT A PATH ESCAPE (#3133 review round 3, P1). The escape
+# test was a SUBSTRING match, so a canonical declaration of a real file named `x..sh` was counted
+# ungradeable: its stale copy became rc=2 (warn-and-continue) where main said rc=1, and an accurate
+# declaration of an owed-but-absent `x..sh` was demoted the same way — the fatal arm written off by a
+# filename. The test must be on the `..` COMPONENT.
+# The name needs a SOURCE for the STALE direction (a file in no repo file is UNSOURCED, exit 3 by
+# design — that is T2's arm, not this one), so it is seeded here rather than at the top so the cases
+# above it keep their exact fixture.
+printf '#!/bin/bash\necho dots\n' > "$SRC/scripts/x..sh"
+git -C "$SRC" -c user.email=t@t -c user.name=t add -A 2>/dev/null
+git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm dots 2>/dev/null
+C27E="$TMP/c27e"; mk_farm "$C27E/scripts"; mkdir -p "$C27E/state"
+printf 'scripts/x..sh\n' > "$C27E/state/farm-declared.txt"
+printf '#!/bin/bash\necho DOTZ\n' > "$C27E/scripts/x..sh"      # STALE: differs from the seeded source
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27E" bash "$CHECK" --dest "$C27E/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "a declared file whose NAME contains '..' is graded, so its drift is fatal (rc=$RC)"
+ck $(grep -q 'NOT farm-declared' "$ERR" && echo 1 || echo 0) "...and is not ruled 'outside the farm'"
+# ...and the same name, owed but never landed, is DECLARED-BUT-ABSENT — not 'cannot be graded'.
+C27F="$TMP/c27f"; mk_farm "$C27F/scripts"; mkdir -p "$C27F/state"
+printf 'scripts/beta.sh\nscripts/x..sh\n' > "$C27F/state/farm-declared.txt"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27F" bash "$CHECK" --dest "$C27F/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 1 ] && echo 0 || echo 1) "an owed-and-absent name containing '..' is still fatal (rc=$RC)"
+ck $(grep -q 'DECLARED-BUT-ABSENT' "$ERR" && echo 0 || echo 1) "...and the report names DECLARED-BUT-ABSENT"
+ck $(grep -q 'OK — ' "$OUT" && echo 1 || echo 0) "...and prints no OK"
+# ...while a path that really does ESCAPE the root stays ungradeable (rc=2, never a pass).
+C27G="$TMP/c27g"; mk_farm "$C27G/scripts"; mkdir -p "$C27G/state"
+printf 'scripts/../outside.sh\n' > "$C27G/state/farm-declared.txt"
+OUT="$TMP/out"; ERR="$TMP/err"
+( cd "$TMP" && CELL_HOME="$C27G" bash "$CHECK" --dest "$C27G/scripts" --src "$SRC" --ref HEAD --no-pin-identity ) >"$OUT" 2>"$ERR"
+RC=$?
+ck $([ "$RC" -eq 2 ] && echo 0 || echo 1) "a '..' COMPONENT is still ungradeable, rc=2 (rc=$RC)"
+
 # 30. ⛔ THE DROPPED-ENTRIES MESSAGE MUST SURVIVE ITSELF (#3176 class: backticks inside a double-quoted
 # string are EXECUTED by the shell). The text an operator needs in order to fix the declaration was
 # deleted by a command substitution, and the failure looked like a broken gate. Re-runs the

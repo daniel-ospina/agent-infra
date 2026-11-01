@@ -393,12 +393,19 @@ resolve_source() {  # $1 = dest-relative path → prints the repo-relative sourc
 # OK (see the "cannot be ruled out" arm below). bash 3.2-safe: no arrays, no `mapfile`, no `${v,,}`.
 decl_rel_norm() {
     _n_up="$1"
-    case "$_n_up" in *..*) return 1 ;; esac   # a path that escapes the root is never graded
     _n_out=""
     while [ -n "$_n_up" ]; do
         case "$_n_up" in /*) _n_up="${_n_up#/}"; continue ;; esac   # leading / and // collapse
         _n_comp="${_n_up%%/*}"
         case "$_n_up" in */*) _n_up="${_n_up#*/}" ;; *) _n_up="" ;; esac
+        # ⛔ THE ESCAPE TEST IS ON A COMPONENT, NEVER ON A SUBSTRING. `case "$_n_up" in *..*)`, this
+        # function's first cut, rejected a perfectly canonical declaration of a real file whose NAME
+        # contains two dots (`scripts/x..sh`), so the entry was never graded: a stale copy became
+        # "carries no path this check can grade" (rc=2, warn-and-continue through `setup.sh:1076`) where
+        # main returned rc=1, and an accurate declaration of an owed-but-absent `x..sh` was demoted the
+        # same way (measured 2026-10-31, review round 3 P1). `..` as a WHOLE COMPONENT is what escapes
+        # the root; two dots inside a name are just bytes.
+        case "$_n_comp" in ..) return 1 ;; esac
         case "$_n_comp" in ''|.) continue ;; esac                  # `.`/empty components collapse
         if [ -z "$_n_out" ]; then _n_out="$_n_comp"; else _n_out="$_n_out/$_n_comp"; fi
     done
@@ -660,7 +667,7 @@ if [ "$decl_offshape" -gt 0 ] && [ "$stale_outside" -gt 0 ] && [ "$stale_declare
     say_err "   and $stale_outside stale file(s) fall outside what the graded lines declare. A partly"
     say_err "   unreadable declaration cannot certify 'the farm does not owe this', so the fatal arm is"
     say_err "   not being switched off on it. This is not a pass."
-    say_err "   Next: fix the declaration entries (each must name a path under scripts/, with no '..'), then re-run this."
+    say_err "   Next: fix the declaration entries (each must name a path under scripts/, with no '..' COMPONENT), then re-run this."
     exit 2
 fi
 # ⛔ THE SPLIT IS ONLY A MEASUREMENT WHEN THE DECLARATION WAS READ. `stale_declared=$stale` is
@@ -691,7 +698,7 @@ fi
 if [ "$decl_offshape" -gt 0 ] && [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
     say_err "$PROG: UNKNOWN — $decl_offshape line(s) of the farm declaration $DECL could not be graded, so a"
     say_err "   file the farm owes and never landed cannot be ruled out. This is not a pass."
-    say_err "   Next: fix the declaration entries (each must name a path under scripts/, with no '..'), then re-run this."
+    say_err "   Next: fix the declaration entries (each must name a path under scripts/, with no '..' COMPONENT), then re-run this."
     exit 2
 fi
 if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
