@@ -436,7 +436,7 @@ jobs:
     # = `failure` = red.
     #
     # ⛔ AND THE JOB BOUND SITS ABOVE THE SUM OF THE STEP BOUNDS, so it can never pre-empt a step:
-    # 10 (checkout) + 10 (node) + 10 (node --check) + 5 (parity) + 15 (self-test) + 110 (shards) =
+    # 10 (checkout) + 10 (node) + 10 (node --check) + 5 (parity) + 15 (self-test) + 150 (shards) =
     # 200 < 230. Below the sum, the non-red job-level `cancelled` could win instead of the red
     # step-level `failure` — the whole defect this block exists to close, re-entering through the
     # backstop. 230 also stays ~1.53x the 150 min shard step it backstops, so it cannot
@@ -492,7 +492,7 @@ jobs:
         # job 124654357365): 147 listed suites summing 6468 s = 107.8 min of shard work, with the job
         # itself ending at 108.2 min wall. Against the 110 min step bound that was a 132 s MARGIN —
         # 98.0 % of the bound — so the list had already outrun its bound in every sense that matters
-        # and ~20 of the measured suites are each larger than it — the 891 s suite added the same day
+        # and 13 of the measured suites are each larger than it — the 891 s suite added the same day
         # by 4bc7f759 / #3114 is ONE OF THEM and is INSIDE the 6468 s, so it is not extra (a first
         # draft of this comment charged it twice). No ambiguity about which end was the
         # defect: the SUITES ARE LEGITIMATE GATES (wired by DERIVATION — a file matching SUITE_GLOBS
@@ -500,11 +500,11 @@ jobs:
         #
         #   147 suites · 6468 s measured · 110 min bound · +132 s margin (98.0 % of bound)
         #
-        # 150 min = 9000 s = 1.39x the measured 6468 s. The headroom is not a guess: it is the size of
-        # the LARGEST measured suite (`tests/atomic-land/run.sh`, 899 s = 15.0 min) plus runner
-        # variance, so the bound survives ANY ONE MORE suite of tonight's largest class without a
-        # workflow edit (6468 + 899 = 7367 s < 7800 s budget < 9000 s step bound) — while still
-        # failing fast against the ~2h46m hang that #2055 recorded.
+        # 150 min = 9000 s = 1.39x the measured 6468 s: 2532 s (42.2 min) of headroom, which is 2.8x
+        # the largest measured suite (`tests/atomic-land/run.sh`, 899 s = 15.0 min) and 1.5x it even
+        # measured against the runner's 7800 s budget. So the bound survives ANY one more suite of
+        # tonight's largest class without a workflow edit (6468 + 899 = 7367 s < 7800 s budget < 9000 s
+        # step bound) — while still failing fast against the ~2h46m hang that #2055 recorded.
         #
         # ⛔ AND THE OVERRUN IS NOW A NAMED RED, NOT AN OPAQUE ONE. `BASH_SHARDS_BUDGET_SECS` below is
         # the runner's OWN deadline at 7800 s (130 min = 1.20x measured), 20 min INSIDE this platform
@@ -514,8 +514,10 @@ jobs:
         # annotation). Before this, both were the same `failure` with nothing distinguishing them.
         # 150 also keeps the job bound a pure backstop: 10 + 10 + 10 + 5 + 15 + 150 = 200 < 230.
         env:
-          # seconds; must stay BELOW `timeout-minutes` here so the named verdict wins. The runner
-          # refuses a non-numeric value rather than silently running with no deadline.
+          # Whole seconds; must stay BELOW `timeout-minutes` here so the named verdict wins. The
+          # runner refuses a non-numeric value, and refuses SET-but-EMPTY (an unset CI variable
+          # expands to empty, and treating that as "no deadline" would be a fail-open). Unsetting the
+          # var is the documented "no deadline" spelling, as is 0.
           BASH_SHARDS_BUDGET_SECS: '7800'
         timeout-minutes: 150
         run: bash scripts/run-bash-shards.sh

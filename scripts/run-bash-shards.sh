@@ -287,7 +287,8 @@ slice_count=0
 # "exceeded the maximum execution time of N minutes". A shard that FAILED also produces `failure`.
 # So before this, the two reds this step can produce — a suite failed, or the DERIVED LIST outran
 # the bound — were one red with no distinguishing line. Measured 2026-10-31 (main, run
-# 41240886978): 147 listed suites summing 6468 s of shard work against a 6600 s (110 min) step
+# 41240886978 — an `integration/batch-20261031-10` pre-merge gate, whose list is 147 = main's
+# today): 147 listed suites summing 6468 s of shard work against a 6600 s (110 min) step
 # bound — a 132 s margin, 98 % of the bound — so the overrun arm was one suite away.
 #
 # `BASH_SHARDS_BUDGET_SECS` (set by the CALLING STEP, never guessed here) is the runner's OWN
@@ -302,6 +303,16 @@ slice_count=0
 # unattributable, and unattributable is fail-CLOSED, the correct direction here.
 # 0 / unset = no budget (the behaviour every pre-existing caller keeps).
 shard_budget=0
+# ⛔ `set` AND empty is REFUSED (review cycle 2, #3174): an unset CI variable expands to the empty
+# string, and treating that as "0 = no deadline" would be a fail-open dressed as the documented
+# default — the step would run with no deadline while its comment claims a non-numeric value is
+# refused. `+set` distinguishes "absent" from "present and empty"; only ABSENT means no deadline.
+case "${BASH_SHARDS_BUDGET_SECS+set}" in
+  "") : ;;
+  *)  [ -n "${BASH_SHARDS_BUDGET_SECS}" ] || {
+        echo "❌ BASH_SHARDS_BUDGET_SECS is SET but EMPTY — that is a missing value, not 'no deadline'. Unset it, or give it whole seconds (0 = no deadline).";
+        exit 2; } ;;
+esac
 if [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ]; then
   case "$BASH_SHARDS_BUDGET_SECS" in
     *[!0-9]*) echo "❌ BASH_SHARDS_BUDGET_SECS='$BASH_SHARDS_BUDGET_SECS' is not a whole number of seconds"; exit 2 ;;
@@ -477,7 +488,8 @@ shard_record_failure() { [ "$shard_is_listed" = 1 ] || return 0; shard_named_fai
 # It also draws the line between the two defects a step bound has to survive: a single HUNG suite
 # moves `$SECONDS` but barely moves `shard_time` (it has not returned yet), so a hang is still caught
 # by the platform's `timeout-minutes` — opaque but red — while the LIST outgrowing its bound is what
-# this verdict names. Exits 1: an overrun is RED, and no shard is skipped to fit the budget.
+# this verdict names. Exits 1: an overrun is RED, and the shards the run does NOT reach are NAMED
+# below, so the shortfall can never be mistaken for a suite failure.
 shard_budget_trip() {
   [ "$shard_budget" -gt 0 ] || return 0
   [ "$shard_time" -ge "$shard_budget" ] || return 0
@@ -497,7 +509,7 @@ shard_budget_trip() {
   # rather than leaving them as the difference between two numbers.
   if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
     _left="$(shard_unaccounted)"
-    echo "❌ NOT RUN — $shard_count_lines "$_left" of $listed listed shard(s) will not be attempted because the budget was already spent:"
+    echo "❌ NOT RUN — $(shard_count_lines "$_left") of $listed listed shard(s) will not be attempted because the budget was already spent:"
     while IFS= read -r _u; do [ -n "$_u" ] && printf '   ⏭  NOT RUN: %s\n' "$_u"; done <<<"$_left"
   fi
   exit 1

@@ -1058,15 +1058,25 @@ echo "8aQ. THE OVERRUN IS A DIFFERENT NAMED RED FROM A SUITE FAILURE (agent-infr
 # The slow stand-in is written into the fixture TREE (`$NAMED_FIX`), never committed: it only has to
 # make `shard_time` cross a 1 s budget deterministically, and a committed 2 s sleep would be paid by
 # every run of this suite forever.
-printf '#!/bin/bash\nsleep 2\n' >"$NAMED_FIX/tests/ci-lane-parity/stand-in-zzzslow.sh"
+# ⛔ TWO slow stand-ins, named so they sort FIRST (`aaa`) and SECOND (`aab`), because the arm must
+# exercise the MID-LOOP trip: a `zzz`-sorted slow suite only ever reaches the end-of-list trip, where
+# `ran + skipped == listed` — so the "NOT RUN" listing (the branch that was fatal in review cycle 2)
+# is never entered, and a suite that crashes on every mid-loop trip would stay green here. Measured
+# consequence of getting this wrong: 8aQ passed 7 assertions over a line that lost the log to
+# `unbound variable` on 100 % of mid-loop trips.
+printf '#!/bin/bash\nsleep 2\n' >"$NAMED_FIX/tests/ci-lane-parity/stand-in-aaa-slow.sh"
+# A FAILING stand-in that is slow enough to have contributed `shard_time`, so the trip fires AFTER a
+# recorded failure: that is what makes the "failed INDEPENDENTLY of the overrun" line reachable.
+printf '#!/bin/bash\nsleep 2\nexit 1\n' >"$NAMED_FIX/tests/ci-lane-parity/stand-in-aab-failslow.sh"
 # (1) NO budget: exactly §8am's verdict, and no overrun line.
 if grep -qF 'SHARD BUDGET EXCEEDED' "$TMP/runner-onefail.out"; then
   fail "an overrun verdict appeared on a run that declared NO budget — a verdict that fires unconditionally is a permanent false block"
 else
   pass "no overrun verdict when no budget is declared (0 = no deadline)"
 fi
-# (2) Budget exhausted (1 s, crossed by the 2 s stand-in): the overrun is NAMED and separated.
-env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=1 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-overrun.out" 2>&1
+# (2) Budget exhausted (3 s, crossed by the two 2 s stand-ins): the TRIP HAPPENS MID-LOOP, after a
+# recorded failure and with suites still un-run — the production shape, and the one cycle 2 proved fatal.
+env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=3 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-overrun.out" 2>&1
 RC=$?
 OUT="$(cat "$TMP/runner-overrun.out")"
 if [ "$RC" -eq 1 ] && grep -qF '❌ SHARD BUDGET EXCEEDED' <<<"$OUT" && grep -qF 'this is NOT a suite failure' <<<"$OUT"; then
@@ -1074,10 +1084,34 @@ if [ "$RC" -eq 1 ] && grep -qF '❌ SHARD BUDGET EXCEEDED' <<<"$OUT" && grep -qF
 else
   fail "the overrun verdict did not fire or did not disclaim a suite failure (rc $RC): $(grep -F 'BUDGET' <<<"$OUT" | head -2)"
 fi
-if grep -qF 'BASH_SHARDS_BUDGET_SECS=1' <<<"$OUT" && grep -qE 'failed INDEPENDENTLY of the overrun: .*stand-in-fail\.sh' <<<"$OUT"; then
-  pass "…it prints the budget it compared against AND names the one real failure SEPARATELY (neither red is laundered into the other)"
+if grep -qF 'BASH_SHARDS_BUDGET_SECS=3' <<<"$OUT" && grep -qE 'failed INDEPENDENTLY of the overrun: .*stand-in-' <<<"$OUT"; then
+  pass "…it prints the budget it compared against AND names the real failure SEPARATELY (neither red is laundered into the other)"
 else
   fail "the overrun verdict did not separate the budget from the failure: $(grep -F 'INDEPENDENTLY' <<<"$OUT" | head -2)"
+fi
+# ⛔ THE MID-LOOP TRIP MUST NAME WHAT IT DID NOT RUN (review cycle 2, #3174 — this branch was FATAL:
+# `$shard_count_lines` is a function, so `set -u` killed the log with `unbound variable` on 100 % of
+# mid-loop trips, i.e. on the production case). Both the count line and at least one per-path line
+# must appear, and NO shell error may.
+if grep -qF 'NOT RUN —' <<<"$OUT" && grep -qE '⏭  NOT RUN: tests/ci-lane-parity/stand-in-' <<<"$OUT"; then
+  pass "a mid-loop trip NAMES the shards it will not attempt (count line + per-path lines) — a short count is a short LIST"
+else
+  fail "the overrun did not name the shards it never ran: $(grep -F 'NOT RUN' <<<"$OUT" | head -3)"
+fi
+if grep -qE 'unbound variable|command not found|syntax error' <<<"$OUT"; then
+  fail "the overrun verdict ended on a SHELL ERROR, not a message: $(grep -E 'unbound variable|command not found|syntax error' <<<"$OUT" | head -2)"
+else
+  pass 'the overrun verdict prints no shell error (the fatal shard_count_lines-as-a-variable bug is pinned)'
+fi
+
+# set-but-EMPTY is a MISSING VALUE, not the documented "no deadline" — it must be refused, because an
+# unset CI variable expands to empty and silently running with no deadline is the fail-open.
+env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS= $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetempty.out" 2>&1
+RC=$?
+if [ "$RC" -eq 2 ] && grep -qF 'is SET but EMPTY' "$TMP/runner-budgetempty.out"; then
+  pass "a SET-but-EMPTY budget is refused (rc 2) instead of meaning 'no deadline'"
+else
+  fail "a set-but-empty budget returned rc $RC (want 2)"
 fi
 # (3) A live budget that is NOT spent must not absorb the failure.
 env -u BASH_SHARD_SLICE BASH_SHARDS_BUDGET_SECS=99999 $FIXTURE_BOUND bash "$NAMED_FIX/scripts/runner-named.sh" >"$TMP/runner-budgetok.out" 2>&1
