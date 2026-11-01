@@ -94,7 +94,8 @@ grep -q STOLEN "$TMPROOT/ttl.out" && ok "an EXPIRED lease is stolen (no permanen
 # (b) passed VACUOUSLY when zero rails acquired, because `grep -c` on a missing file is 0 and
 # the arm only rejected `n -eq 2`. It now asserts n == 1 exactly, over 8 rails (review cycle 3
 # finding 3).
-harness "$TMPROOT/race.sh" 'rail_lock_acquire "acme-widget-80" && echo ACQUIRED'
+harness "$TMPROOT/race.sh" \
+  'rail_lock_acquire "acme-widget-80" && { echo ACQUIRED; sleep 3; }'
 trials=40; wrong=0; zero=0
 i=0
 while [ "$i" -lt "$trials" ]; do
@@ -140,7 +141,18 @@ printf '#!/bin/bash\nprintf "CLOSED\\t"\n' > "$TMPROOT/gh-closed"
 printf '#!/bin/bash\nprintf "MERGED\\t2026-11-01T14:53:07Z\\n"\n' > "$TMPROOT/gh-merged"
 chmod +x "$TMPROOT"/gh-multiline "$TMPROOT"/gh-closed "$TMPROOT"/gh-merged
 
-harness "$TMPROOT/term.sh" 'RAIL_LOCK_PR="10483"' 'rail_stop_if_pr_terminal' 'echo SURVIVED'
+# ⛔ THIS ASSERTION USED TO BE VACUOUS (review cycle 4 finding 3). The harness never set
+# RAIL_REPO / RAIL_CHECKOUT_REPO, so the identity proofs failed, the MERGED arm never fired,
+# and the observed rc 0 came from the trailing `echo SURVIVED` — deleting the entire
+# false-checkmark gate this PR exists to add would have left the test GREEN. So the repos are
+# set, `rail_pr_url_names` is stubbed to succeed, and the merged case must NOT print SURVIVED.
+harness "$TMPROOT/term.sh" \
+  'RAIL_LOCK_PR="10483"' \
+  'RAIL_REPO="acme/widget"' \
+  'RAIL_CHECKOUT_REPO="acme/widget"' \
+  'rail_pr_url_names() { return 0; }' \
+  'rail_stop_if_pr_terminal' \
+  'echo SURVIVED'
 for case in multiline closed merged; do
   ADMIN_MERGE_GH="$TMPROOT/gh-$case" bash "$TMPROOT/term.sh" > "$TMPROOT/t-$case.out" 2>&1
   echo "$case:$?" >> "$TMPROOT/t.rc"
@@ -152,7 +164,12 @@ rc_merged=$(grep '^merged:' "$TMPROOT/t.rc" | cut -d: -f2)
   && ok "a MULTI-LINE read does NOT exit 0" || bad "a multi-line read was taken as MERGED"
 [ "$rc_closed" -eq 3 ] && ok "CLOSED exits 3, never 0 (no checkmark over an unmerged PR)" \
   || bad "CLOSED exited $rc_closed, expected 3"
-[ "$rc_merged" -eq 0 ] && ok "a real MERGED exits 0" || bad "a real MERGED exited $rc_merged, expected 0"
+if [ "$rc_merged" -eq 0 ] && ! grep -q SURVIVED "$TMPROOT/t-merged.out" \
+   && grep -q 'MERGED' "$TMPROOT/t-merged.out"; then
+  ok "a real MERGED exits 0 (and the arm actually FIRED — not vacuously via a trailing echo)"
+else
+  bad "the MERGED arm did not fire: rc=$rc_merged survived=$(grep -c SURVIVED "$TMPROOT/t-merged.out") — the test would pass with the gate deleted"
+fi
 
 # ── 8. THE DEADLINE TRIPS AND NAMES ITSELF ────────────────────────────────────
 harness "$TMPROOT/dl.sh" 'RAIL_STARTED_AT=$(( $(date +%s) - 999999 )); RAIL_DEADLINE=10' \
@@ -185,6 +202,38 @@ for badval in "RAIL:7h" "RAIL:0" "TTL:forever" "TERM:60s"; do
 done
 bash "$TMPROOT/bounds.sh" > "$TMPROOT/b-ok.out" 2>&1
 grep -q BOUNDS-OK "$TMPROOT/b-ok.out" && ok "valid knobs pass validation" || bad "valid knobs were refused"
+
+# ── 10. A LEASE MID-PUBLICATION IS NOT STALE (cycle-4 finding 1) ──────────────
+# The incumbent is exactly in this state between `mkdir` and writing its pid. Treating "no
+# pid" as "dead" handed the lease to a second rail while the first still held it (measured
+# deterministically: both ended at acquired=1).
+rm -rf "$LOCKROOT/acme-widget-90"; mkdir -p "$LOCKROOT/acme-widget-90"   # no pid file
+harness "$TMPROOT/midpub.sh" 'rail_lock_acquire "acme-widget-90"; echo "ACQUIRED-MIDPUB"'
+ADMIN_MERGE_LOCK_ROOT="$LOCKROOT" bash "$TMPROOT/midpub.sh" > "$TMPROOT/midpub.out" 2>&1
+rc=$?
+if [ "$rc" -eq 75 ] && ! grep -q ACQUIRED-MIDPUB "$TMPROOT/midpub.out"; then
+  ok "a lease with NO readable holder is treated as MID-PUBLICATION, not stale (exit 75)"
+else
+  bad "a pid-less lease was STOLEN (rc=$rc) — two rails can both hold it"
+fi
+
+# ── 11. A ZERO-PADDED PR IS THE SAME LEASE AS ITS CANONICAL FORM (cycle-4 finding 2) ──
+# `admin-merge.sh 01631` and `admin-merge.sh 1631` used to take SEPARATE leases and BOTH hold
+# them, so two rails ran on one PR.
+rm -rf "$LOCKROOT"; mkdir -p "$LOCKROOT"
+harness "$TMPROOT/pad.sh" 'rail_lock_acquire "$1"; echo "HELD=${RAIL_LOCK_HELD} PR=$RAIL_LOCK_PR"; sleep 6'
+harness "$TMPROOT/pad2.sh" 'rail_lock_acquire "$1"; echo "HELD=${RAIL_LOCK_HELD} PR=$RAIL_LOCK_PR"'
+ADMIN_MERGE_LOCK_ROOT="$LOCKROOT" bash "$TMPROOT/pad.sh" "acme-widget-1631" > "$TMPROOT/p1.out" 2>&1 &
+PADHOLDER=$!
+sleep 2
+ADMIN_MERGE_LOCK_ROOT="$LOCKROOT" bash "$TMPROOT/pad2.sh" "acme-widget-01631" > "$TMPROOT/p2.out" 2>&1
+rc=$?
+kill "$PADHOLDER" 2>/dev/null; wait "$PADHOLDER" 2>/dev/null
+if [ "$rc" -eq 75 ] && grep -q 'HELD=1' "$TMPROOT/p1.out" && ! grep -q 'HELD=1' "$TMPROOT/p2.out"; then
+  ok "01631 and 1631 are ONE lease (zero-padding cannot defeat the exclusion)"
+else
+  bad "zero-padded PR took its own lease (rc=$rc) — two rails can run on one PR"
+fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

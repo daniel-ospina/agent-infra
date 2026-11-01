@@ -7435,12 +7435,18 @@ rail_lock_release() {
 # make a dead holder look alive; that errs toward a duplicate NO-OP exit, never toward a
 # double merge, so it is the safe direction and is stated rather than discovered.)
 rail_lock_acquire() {
-  local key="$1" dir holder started now age acquired=0 stale stolen
+  local key="$1" prefix dir holder started now age acquired=0 stale stolen expired=0
   RAIL_LOCK_PR="${key##*-}"
   # ⛔ A PR-LESS INVOCATION TAKES NO LEASE (finding 6, cycle 1). `--print-bounds` must work
   # on a bare invocation, and a key with an empty PR half would make EVERY PR-less run in
   # every repo collide on one lease.
   case "$RAIL_LOCK_PR" in ''|*[!0-9]*) return 0 ;; esac
+  # ⛔ CANONICALISE THE NUMBER BEFORE IT BECOMES A LEASE NAME (review cycle 4 finding 2,
+  # MEASURED: `admin-merge.sh 01631` and `admin-merge.sh 1631` each took their OWN lease and
+  # BOTH held it, so two rails could run on one PR). The rail explicitly accepts a
+  # zero-padded number, so the exclusion key must be the canonical decimal, not the spelling.
+  RAIL_LOCK_PR=$((10#$RAIL_LOCK_PR))
+  prefix="${key%-*}"
   # ⛔ FAIL CLOSED, LOUDLY (finding 5, cycle 2). An unusable lease ROOT means exclusion cannot
   # be proven at all. Returning 0 here would leave every rail running with no lease and no
   # line in the log — the duplicate-rail race unchanged and invisible, while the function's
@@ -7449,7 +7455,7 @@ rail_lock_acquire() {
     say_err "admin-merge: ✗ cannot create the rail lease root $RAIL_LOCK_ROOT — per-PR exclusion CANNOT be proven, and a rail that cannot prove it does not run (two rails on the same PR could double-merge). EXIT 76."
     exit 76
   fi
-  dir="$RAIL_LOCK_ROOT/$key"
+  dir="$RAIL_LOCK_ROOT/${prefix}-${RAIL_LOCK_PR}"
   # `mkdir` on the lease directory is the atomic primitive: two concurrent rails cannot both
   # create it, so the loser is decided by the kernel, not by a check-then-act race.
   mkdir "$dir" 2>/dev/null && acquired=1
@@ -7458,7 +7464,14 @@ rail_lock_acquire() {
     started="$(cat "$dir/started" 2>/dev/null || true)"
     now="$(date +%s)"
     age=0
-    case "${started:-}" in ''|*[!0-9]*) age=0 ;; *) age=$((now - started)) ;; esac
+    # AGE comes from `started` when it is readable, and from the DIRECTORY's mtime when it is
+    # not — a lease that is being published has no `started` file yet, and an age of 0 there
+    # would make an in-flight lease look both fresh and (via a dead-pid read) stale at once.
+    case "${started:-}" in
+      ''|*[!0-9]*) age=$(( now - $(stat -f %m "$dir" 2>/dev/null || echo "$now") )) ;;
+      *) age=$((now - started)) ;;
+    esac
+    [ "$age" -lt 0 ] && age=0
     # ⛔ A LEASE WITH NO EXPIRY CAN BLOCK A PR FOREVER (finding 6, cycle 2). A SIGKILLed rail
     # leaves the lease behind (no trap runs on SIGKILL), and `kill -0` cannot tell that pid
     # from a LATER process that reused it — the fleet keeps many long-lived pids. Without a
@@ -7466,8 +7479,16 @@ rail_lock_acquire() {
     # and merge-one.sh burns its attempts and PARKS the head. That is the "stale flag that
     # records a past state and is never revalidated" class this file calls its own defect, so
     # the lease carries an AGE bound as well as a liveness test.
-    if [ -z "$holder" ] || ! kill -0 "$holder" 2>/dev/null \
+    # ⛔ AN UNREADABLE HOLDER IS NOT A STALE HOLDER (review cycle 4 finding 1, MEASURED
+    # deterministically: a lease directory with no pid file let BOTH rails end at
+    # `acquired=1`). An incumbent is exactly in that state between `mkdir` and writing its
+    # pid, so treating "no pid" as "dead" hands the lease to a second rail while the first
+    # still holds it. A lease whose identity cannot be read is only taken when it has also
+    # EXPIRED — and expiry is judged from the directory's own mtime in that state.
+    if { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } \
        || { [ "$RAIL_LOCK_TTL" -gt 0 ] && [ "$age" -ge "$RAIL_LOCK_TTL" ]; }; then
+      expired=0
+      { [ "$RAIL_LOCK_TTL" -gt 0 ] && [ "$age" -ge "$RAIL_LOCK_TTL" ]; } && expired=1
       if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
         say_err "admin-merge: ↻ rail lease ${dir} is held by pid ${holder} but is ${age}s old (TTL ${RAIL_LOCK_TTL}s) — EXPIRED, stealing it. A lease older than the whole-attempt bound cannot belong to an attempt still running."
       else
@@ -7487,7 +7508,14 @@ rail_lock_acquire() {
       stale="$dir.stale.$$"
       if mv "$dir" "$stale" 2>/dev/null; then
         stolen="$(cat "$stale/pid" 2>/dev/null || true)"
-        if [ -n "$stolen" ] && [ "$stolen" != "$holder" ] && kill -0 "$stolen" 2>/dev/null; then
+        # EXPIRY IS THE ONLY AUTHORITY over a lease whose identity cannot be proven.
+        if [ "$expired" -eq 1 ]; then
+          rm -rf "$stale" 2>/dev/null
+          mkdir "$dir" 2>/dev/null && acquired=1
+        elif [ -z "$stolen" ]; then
+          say_err "admin-merge: ↻ rail lease ${dir} has NO readable holder and has NOT expired (${age}s of ${RAIL_LOCK_TTL}s) — that is a lease MID-PUBLICATION, not a dead one. RESTORING it rather than stealing a rail that is between mkdir and writing its pid."
+          mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
+        elif [ "$stolen" != "$holder" ] && kill -0 "$stolen" 2>/dev/null; then
           say_err "admin-merge: ↻ rail lease ${dir}: this rail moved a lease owned by LIVE pid ${stolen} that it had NOT decided to steal (it decided on ${holder:-<unreadable>}) — RESTORING it rather than stealing a running rail's lease."
           mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
         else
@@ -7584,9 +7612,9 @@ rail_stop_if_pr_terminal() {
 # deadline check there would add nothing. That distinction is the accurate claim (review
 # finding 9). It decides no verdict:
 #   1. the whole-attempt deadline (REFUSED(rail-deadline:…) then EXIT);
-#   2. the terminal-state re-read, throttled to every 6th poll (~60s at the default
-#      ADMIN_MERGE_POLL_INTERVAL=10), so a merged PR is noticed within a minute without
-#      spending a gh call on every poll.
+#   2. the terminal-state re-read, throttled on ELAPSED TIME (ADMIN_MERGE_TERMINAL_CHECK_EVERY,
+#      default 60s) — NOT on a tick count, which would be ~6s in a wait that polls every
+#      second and ~6min in one that polls every 60s.
 rail_guard_poll() {
   RAIL_POLL_TICKS=$((RAIL_POLL_TICKS + 1))
   local now elapsed
@@ -7598,7 +7626,7 @@ rail_guard_poll() {
   # directions. 60s is the value the comment claims.
   RAIL_TERMINAL_CHECK_EVERY="${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}"
   if [ "${RAIL_DEADLINE:-0}" -gt 0 ] 2>/dev/null && [ "$elapsed" -ge "$RAIL_DEADLINE" ]; then
-    say_err "admin-merge: ✗ REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s) — the rail has spent its whole-attempt bound (ADMIN_MERGE_RAIL_DEADLINE, default FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + 2 x the fail-safe per-wait bound ${FAILSAFE_RERUN_TIMEOUT}s - i.e. every window the rail itself declares). Every individual wait in this rail DOES bound itself; the ATTEMPT is what was unbounded, and it is bounded now. This is a refusal to keep holding the merge slot, NOT a verdict about the PR: no check was made green, widened, skipped or muted, and the head-bound review evidence is untouched. Re-run the rail when the runs are readable — it re-evaluates from scratch."
+    say_err "admin-merge: ✗ REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s) — the rail has spent its whole-attempt bound (ADMIN_MERGE_RAIL_DEADLINE, default FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + 4 x the fail-safe per-wait bound ${FAILSAFE_RERUN_TIMEOUT}s, i.e. ${RAIL_DEADLINE}s - i.e. every window the rail itself declares). Every individual wait in this rail DOES bound itself; the ATTEMPT is what was unbounded, and it is bounded now. This is a refusal to keep holding the merge slot, NOT a verdict about the PR: no check was made green, widened, skipped or muted, and the head-bound review evidence is untouched. Re-run the rail when the runs are readable — it re-evaluates from scratch."
     rail_lock_release
     exit 1
   fi
