@@ -30,7 +30,11 @@ export default function (pi: ExtensionAPI) {
       // at runtime (s7) — without them a hop-leg dispatch would fail to
       // resolve the model. Cost/maxTokens sourced from the equivalent
       // openrouter.models[] rows in models-store.json (catalog authority, s7);
-      // contextWindow honors the global clamp (300K). (Exception: the V4.1 row
+      // contextWindow honors the global clamp (800K — owner decision 2026-10-31,
+      // docs/ops/cost-config-policy.md §7.1; it was 300K before that). The
+      // `openrouter.modelOverrides` block in models.json also names these ids at
+      // the same window, and overrides are applied LAST, so the two layers agree
+      // rather than one masking the other — move BOTH or neither. (Exception: the V4.1 row
       // below has NO entry in the shipped store — see its own comment for the
       // provenance of its rates.)
       //
@@ -65,7 +69,7 @@ export default function (pi: ExtensionAPI) {
         thinkingLevelMap: { off: "none", minimal: null, low: null, medium: null, high: "high", max: "max" },
         input: ["text", "image"],
         cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
-        contextWindow: 300000,
+        contextWindow: 800000,
         maxTokens: 384000
       },
       // Legacy-generation leg (upstream "DeepSeek V4 Flash 0423"), kept in the
@@ -83,7 +87,7 @@ export default function (pi: ExtensionAPI) {
         reasoning: false,
         input: ["text"],
         cost: { input: 0.0882, output: 0.1764, cacheRead: 0.01764, cacheWrite: 0 },
-        contextWindow: 300000,
+        contextWindow: 800000,
         maxTokens: 131072
       },
       {
@@ -92,7 +96,7 @@ export default function (pi: ExtensionAPI) {
         reasoning: false,
         input: ["text"],
         cost: { input: 0.435, output: 0.87, cacheRead: 0.003625, cacheWrite: 0 },
-        contextWindow: 300000,
+        contextWindow: 800000,
         maxTokens: 384000
       }
     ]
