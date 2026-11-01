@@ -19,8 +19,9 @@
 # with status 200/CHDIR every ten minutes for as long as the box existed. It never failed on its work;
 # IT COULD NEVER BEGIN.
 #
-#   `WorkingDirectory=` is the ONE directive that makes systemd REFUSE TO START a unit at all, before
-#   any line of the payload runs, so it is the worst possible place to name a directory that is not a
+#   `WorkingDirectory=` refuses to start a unit at all — before any line of the payload runs, unless it is
+#   given the non-fatal `-` prefix (`systemd.exec(5)`) — so it is the worst possible place to name a
+#   directory that is not a
 #   live-cell invariant. This unit therefore declares NONE: systemd starts it in `/`, and the payload
 #   `cd`s itself to the layer it actually pins, after resolving that layer from the cell's own record.
 #   A resolver that cannot answer is a loud non-zero exit, not a unit that never started.
@@ -39,7 +40,9 @@
 #             from it.
 #   fallbacks ⛔ STATED BECAUSE THE CODE HAS THEM: when the record is unusable the pass tries the NEWEST
 #             tree (by mtime) under `$HARNESS_PIN_DIR`, then an operator's `$HARNESS`. Neither is proven
-#             to be the layer the controller runs, so the pass says so on stderr when it lands there; a
+#             to be the layer the controller runs, so the pass says so on stderr when it lands there (it
+#             must — this is the one path where the pinned tree need not be the EXECUTED tree, so a silent
+#             fallback would be the drift this unit exists to prevent, inside the unit itself); a
 #             cell with none of the three has no layer and gets a NAMED exit 2 rather than a guess.
 #   ref       `$HARNESS_REF` (default `origin/main`), resolved in the RESOLVED LAYER's own git — so the
 #             pin, the verb that performs it and the ref they act on all come from one tree.

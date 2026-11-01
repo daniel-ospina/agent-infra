@@ -341,6 +341,81 @@ refuses 'a SPACED second ExecStart=' "$(doctor exec2-spaced "ExecStart = /bin/ba
 # name in a family is a guard the next template edit walks around.
 refuses 'an ExecStartPre=' "$(doctor execpre "ExecStartPre=/bin/bash $T/nowhere/bootstrap.sh")" "$T/u11" 'ExecStartPre='
 refuses 'a SPACED ExecStopPost=' "$(doctor stoppost "ExecStopPost = /bin/bash $T/nowhere/cleanup.sh")" "$T/u12" 'ExecStopPost='
+# ⛔ AND THE CONDITION FAMILY IS CLOSED BY PREFIX, NOT BY ONE NAME. Refusing only `ConditionPathExists=`
+# left the other members of `systemd.unit(5)`'s condition set reachable — `ConditionFileNotEmpty=`,
+# `ConditionPathIsDirectory=`, `ConditionEnvironment=`, `ConditionUser=`, … — and EVERY member has the same
+# behaviour on a false condition: the unit is SKIPPED and left GREEN, which is strictly worse than the
+# 200/CHDIR it replaced. These two legs name members the artifact rules above never mention, so a guard
+# that reverted to the single-name check fails them.
+refuses 'a ConditionFileNotEmpty= (the family, not the one name)' "$(doctor condfam 'ConditionFileNotEmpty=/srv/nope')" "$T/u17" 'ConditionFileNotEmpty='
+refuses 'a ConditionUser= (the family, a third name)' "$(doctor conduser 'ConditionUser=cmux')" "$T/u18" 'ConditionUser='
+# ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
+# ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
+# `<unit>.service.d/*.conf` OVER it, in both managers, whether the drop-in was written before the unit or
+# after. So an installed legacy drop-in can carry the exact defect this change removes while `--install`
+# prints "installed — ONE actuator on this pin" and exits 0. This is a REACHABLE state, not a hypothetical:
+# the defect in the issue was itself carried in a DROP-IN (`WorkingDirectory=/tmp/cell-ai`), and a box in
+# this fleet still carries `cell-self-pin.service.d/user.conf` today. Every leg below is the drop-in half
+# of a rule the artifact legs above already pin, so a guard that reads only the rendered file fails them.
+dropin_doctor() { # <name> <conf body> -> prints a unit dir carrying a drop-in with that body
+  local u="$T/dropin-$1"
+  mkdir -p "$u/cell-self-pin.service.d"
+  printf '[Service]\n%s\n' "$2" >"$u/cell-self-pin.service.d/legacy.conf"
+  printf '%s\n' "$u"
+}
+refuses_dropin() { # <name> <unit-dir> <must-appear-in-the-reason>
+  local name="$1" u="$2" why="$3" out rc
+  # The UNDOCTORED template, so the ONLY reason to refuse is the drop-in: an artifact rule that also fired
+  # here would make the leg pass on a reason it did not name.
+  out="$(install_doctored "$TPL" "$u")"; rc=$?
+  if [ "$rc" -eq 0 ]; then bad "ACCEPTED a drop-in that $name — the effective-unit gate does not exist: $out"; return; fi
+  if [[ $out == *"$why"* ]]; then ok "REFUSES a drop-in that $name, and names the file (\"$why\")"
+  else bad "refused a drop-in that $name for the WRONG reason (wanted \"$why\"): $out"; fi
+  [ -f "$u/cell-self-pin.service" ] && bad "a refused install (drop-in: $name) still wrote the unit" \
+    || ok "a refused install (drop-in: $name) wrote nothing"
+}
+refuses_dropin 'carries the provisioning clone' "$(dropin_doctor bootpath 'WorkingDirectory=/tmp/cell-ai')" 'provisioning clone'
+refuses_dropin 'declares WorkingDirectory=' "$(dropin_doctor workdir 'WorkingDirectory=/srv/harness-current')" 'WorkingDirectory='
+refuses_dropin 'declares a Condition (a green skip)' "$(dropin_doctor cond 'ConditionPathExists=/srv/nope')" 'ConditionPathExists='
+refuses_dropin 'declares an executable directive' "$(dropin_doctor execpre 'ExecStartPre=/bin/bash /srv/nowhere/x.sh')" 'ExecStartPre='
+refuses_dropin 'widens the success vocabulary' "$(dropin_doctor okvals 'SuccessExitStatus=0 11 1')" 'SuccessExitStatus='
+# ⛔ THE NON-VACUITY CONTROL, and it is load-bearing: a drop-in that only sets IDENTITY is the operator's
+# DOCUMENTED remedy for the `User=root` render. Without this leg the gate above could "pass" by refusing
+# every drop-in, which would block the one migration this file recommends.
+u_bene="$T/dropin-benign"
+mkdir -p "$u_bene/cell-self-pin.service.d"
+printf '[Service]\nUser=%s\nEnvironment=HOME=%s\n' "$(id -un)" "$HOME" >"$u_bene/cell-self-pin.service.d/user.conf"
+out_bene="$(install_doctored "$TPL" "$u_bene")"; rc_bene=$?
+if [ "$rc_bene" -eq 0 ]; then ok "ACCEPTS a drop-in that only sets IDENTITY (User=/HOME=) — the gate discriminates; it does not refuse every drop-in"
+else bad "REFUSED a benign identity-only drop-in — that is the operator's documented remedy for the User=root render: $out_bene"; fi
+# ⛔ RE-SEED THE PLACED-PASS SENTINEL. The benign leg above is the only SUCCESSFUL install in this region,
+# and a successful install legitimately (re)places the pass at $PLACED — which is precisely the artifact the
+# `refuses` legs assert a REFUSED install leaves untouched. Without this line the next refusal is reported
+# as "REPLACED the placed pass" for a replacement that was correct, i.e. the sentinel would be measuring the
+# wrong install.
+cp "$T/placed.before" "$PLACED"
+# ── 4c. THE RENDER'S IDENTITY IS THE TREE'S OWNER, NOT THE INVOKER'S ────────────────────
+# ⛔ `--install` writes a SYSTEM unit under /etc/systemd/system and needs `systemctl enable`, so the
+# documented install path is `sudo … --install` — and rendering `{{USER}}` from `id -un` therefore baked
+# `User=root` into a unit that must run as the owner of the tree it pins. This fleet's own drop-in records
+# the consequence verbatim: root's git refuses the operator-owned checkout on ownership grounds, so the
+# pass finds no layer and exits `UNRESOLVED(no-layer)` every tick — #3194 reached by following this
+# change's own migration. THE DISCRIMINATOR IS A CELL_HOME WHOSE OWNER IS NOT THE INVOKING USER: `/` is
+# root-owned on every box this suite runs on, so an `id -un` render yields the invoking user and fails.
+owner_of() { ls -ld "$1" 2>/dev/null | awk '{print $3}'; }
+out_id="$(runat "$T/home" CELL_HOME=/ TEMPLATES_DIR="$TPL" bash "$PIN" --print-unit 2>&1)"
+got_user="$(printf '%s\n' "$out_id" | sed -n 's/^User=//p' | head -1)"
+want_user="$(owner_of /)"
+if [ "$want_user" = "$(id -un)" ]; then
+  ok "SKIPS the owner-derivation discriminator honestly: / is owned by the INVOKING user here, so `User=` cannot tell the two renders apart on this box"
+elif [ "$got_user" = "$want_user" ]; then
+  ok "the rendered User= is the OWNER of CELL_HOME ('$want_user'), not the invoking user ('$(id -un)') — an `id -un` render would have baked User=$(id -un)"
+else bad "the rendered User= is '$got_user', not the owner of CELL_HOME ('$want_user') — the render followed the INVOKING identity, which is how User=root reached a box that can only pin as its owner"; fi
+got_home="$(printf '%s\n' "$out_id" | sed -n 's/^Environment=HOME=//p' | head -1)"
+if [ "$want_user" != "$(id -un)" ]; then
+  if [ "$got_home" = "$(eval "printf '%s' ~$want_user" 2>/dev/null)" ]; then ok "and its HOME= is that owner's home ('$got_home'), not the installer's"
+  else bad "the rendered HOME= is '$got_home', not the owner's home — the pass would derive its base from the installer's home"; fi
+fi
 # ⛔ FOUR RULES THAT HAD NO DOCTOR AT ALL — deleting any one of them left this suite green, which the body's
 # «one doctor per rule» claim does not survive. Each doctor below trips ITS rule and nothing else:
 #   · the INTERPRETER rule is individually gating only because ExecStart is parsed as interpreter+payload;

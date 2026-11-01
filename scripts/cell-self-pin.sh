@@ -56,9 +56,12 @@
 #   WorkingDirectory                          — **none**. See below.
 #
 # ⛔ `WorkingDirectory=` IS DELIBERATELY ABSENT FROM THE RENDERED UNIT, and that is the whole fix.
-# `WorkingDirectory=` is the ONE directive that makes systemd refuse to start a unit BEFORE any line of
-# the payload runs (`EXIT_CHDIR` = 200, systemd.exec(5)) — the worst possible place to name a directory
-# that is not a live-cell invariant. With no `WorkingDirectory=`, systemd starts the oneshot in `/` and
+# `WorkingDirectory=` refuses to start a unit BEFORE any line of the payload runs (`EXIT_CHDIR` = 200,
+# `systemd.exec(5)`) unless it is given the `-` prefix (which makes the failure non-fatal). It is
+# therefore the worst possible place to name a directory that is not a live-cell invariant — and it is
+# not the ONLY directive with that shape (`EnvironmentFile=`, `RootDirectory=` and `User=` resolve before
+# exec too). The rule this file holds is narrower than a superlative: refuse the directives whose
+# ABSENCE-from-a-running-cell turns a pin into a unit that never began. With no `WorkingDirectory=`, systemd starts the oneshot in `/` and
 # THIS pass `cd`s itself to the layer it just resolved, so "the directory is missing" becomes a named
 # non-zero exit with a remedy, instead of a unit that never began.
 #
@@ -183,9 +186,15 @@ resolve_layer() {
       layer_ok "$c" || continue
       best="${c%/}"; break
     done < <(ls -1dt "$HARNESS_PIN_DIR"/*/ 2>/dev/null)
-    if [ -n "$best" ]; then printf '%s\n' "$(git -C "$best" rev-parse --show-toplevel 2>/dev/null)"; return 0; fi
+    if [ -n "$best" ]; then
+      err "the record ${HARNESS_PIN_FILE} is unusable and the pin root ${HARNESS_PIN_DIR} names no layer it can use — falling back to the NEWEST tree there ('${best}'), which is NOT proven to be the layer the controller EXECUTES"
+      printf '%s\n' "$(git -C "$best" rev-parse --show-toplevel 2>/dev/null)"; return 0
+    fi
   fi
-  if layer_ok "$HARNESS"; then printf '%s\n' "$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null)"; return 0; fi
+  if layer_ok "$HARNESS"; then
+    err "no usable pin record and no layer under ${HARNESS_PIN_DIR} — falling back to HARNESS='${HARNESS}', which is NOT proven to be the layer the controller EXECUTES"
+    printf '%s\n' "$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null)"; return 0
+  fi
   return 1
 }
 
@@ -222,7 +231,7 @@ pinned_head() {
 
 # mend_record <target> — repoint a MISSING/EMPTY record at the tree `apply` just created for <target>.
 # ⛔ WHY THIS EXISTS, precisely: `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch
-# (cloud-cell-supervisor.sh:1926 sets `HARNESS_APPLIED=unchanged` for a pin already at the tip; :1949 is
+# (cloud-cell-supervisor.sh:2137 sets `HARNESS_APPLIED=unchanged` for a pin already at the tip; :2160 is
 # the only write). So `apply --force --pin-only` on a box whose record was lost exits 0, writes NOTHING
 # and reports `unchanged` — leaving this pass reading an empty record on every tick, for ever. That is
 # #3133 (merged) one layer up: an unhealable RED is as useless as a false GREEN, and the recorded answer
@@ -398,8 +407,49 @@ sed_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 # ⛔ NOT `say`. `tests/no-tts/run.sh` refuses a line-start `say()` definition in any tracked shipped
 # script, because on macOS `say` is /usr/bin/say (#2910) — and this file was the third offender keeping
 # that shard red. `note` is the same one-line writer with a name that cannot shadow a binary.
-note() { printf '%s\n' "$*"; }
+note() { printf '%s\n' "$*" ; }
 bad() { printf 'REFUSING: %s\n' "$*" >&2; }
+
+# ── WHO the unit runs as: a property of the TREE IT PINS, not of whoever rendered it ───────────────
+# ⛔ `{{USER}}`/`{{HOME}}` USED TO COME FROM THE INVOKING IDENTITY (`id -un`/`$HOME`), and the documented
+# install path is `sudo … --install` — `--install` writes a SYSTEM unit under /etc/systemd/system and
+# needs `systemctl daemon-reload`/`enable --now`, which only root can do. So the render produced
+# `User=root`, `Environment=HOME=/root`. The consequences are recorded verbatim in THIS FLEET's own
+# drop-in, `cell-self-pin.service.d/user.conf`:
+#   "The repo and the stamp are owned by cmux; running as root makes git refuse the fetch (dubious
+#    ownership) so the unit could never pin anything."
+# That is #3194 reached by following this change's own migration: `resolve_layer` finds no layer and every
+# tick exits `UNRESOLVED(no-layer)`. Worse, the `systemctl --user` probes in `actuator_scopes` become
+# ROOT's user manager, so the one-actor guard silently misses the operator's timer — the exact false PASS
+# that guard was added to close. Derive BOTH from the owner of `$CELL_HOME`: the one identity whose git
+# can answer for the tree the pass pins.
+# ⛔ `ls -ld`, NOT `stat -c`: `stat -c` is GNU-only and this repo's portability gate refuses it on macOS
+# (where the spelling is `stat -f`) — the same trap class that gate exists to catch.
+cell_home_owner() {
+  local o
+  o="$(ls -ld "$CELL_HOME" 2>/dev/null | awk '{print $3}')"
+  [ -n "$o" ] || return 1
+  printf '%s\n' "$o"
+}
+
+# home_of_user <user> — that user's home directory, portably. There is no `getent` on macOS and no `dscl`
+# on Linux, so try the one, then fall back to the shell's own `~user` expansion (bash is the interpreter
+# this unit declares). The name is validated first, so the expansion is never fed an arbitrary string.
+home_of_user() {
+  local u="$1" h=""
+  case "$u" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  if command -v getent >/dev/null 2>&1; then
+    h="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"
+  fi
+  if [ -z "$h" ]; then
+    h="$(eval "printf '%s' ~$u" 2>/dev/null)"
+    case "$h" in '~'*) h="" ;; esac
+  fi
+  [ -n "$h" ] && [ -d "$h" ] || return 1
+  printf '%s\n' "$h"
+}
 
 # pin_script_path — the absolute path the unit's ExecStart names, **COMPUTED AND NEVER WRITTEN**.
 # ⛔ IT MUST LIVE UNDER $CELL_HOME, and that is a bug fix of its own: naming the RUNNING copy is a path
@@ -458,7 +508,13 @@ print_unit() { # [dest-dir] — render both units into a directory, or stdout wh
   # render that silently printed a unit naming a file it did not create would be the same class of
   # half-truth as the unit this file replaces. stderr, so stdout stays the artifact.
   [ -n "$dest" ] || [ -f "$script" ] || err "note: ${script} is not placed yet — this is a RENDER; '--install' places it and the units"
-  user="$(id -un)"; home="$HOME"
+  # ⛔ THE RENDER'S IDENTITY IS THE TREE'S, NOT THE INVOKER'S — see `cell_home_owner`. A render that
+  # cannot answer who owns $CELL_HOME REFUSES rather than silently baking the invoking user in, because
+  # "the installer happened to be root" is how `User=root` reached a box that can only pin as its owner.
+  user="$(cell_home_owner)" \
+    || { bad "cannot determine the owner of CELL_HOME ('${CELL_HOME}') — the unit must run as the user whose git can answer for the tree it pins, and rendering the INVOKING user instead is what produced User=root (see cell_home_owner)"; return 1; }
+  home="$(home_of_user "$user")" \
+    || { bad "cannot resolve a home directory for '${user}' (the owner of CELL_HOME '${CELL_HOME}') — the unit's HOME= would otherwise point at the installer's home, and the pass derives its base from it"; return 1; }
   for tpl in cell-self-pin.service cell-self-pin.timer; do
     if [ -n "$dest" ]; then
       sed -e "s|{{USER}}|$(sed_esc "$user")|g" -e "s|{{HOME}}|$(sed_esc "$home")|g" \
@@ -497,6 +553,12 @@ print_unit() { # [dest-dir] — render both units into a directory, or stdout wh
 directive() {
   printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p"
 }
+# directive_names <body> — every directive NAME present (the left side of `=`), one per line, sorted.
+# For FAMILY rules. A prefix test needs the names, because asserting one `<Name>=` spelling at a time is
+# how a family of thirty-plus directives comes to be "closed" for exactly one of them.
+directive_names() {
+  printf '%s\n' "$1" | sed -n 's/^[[:space:]]*\([A-Za-z][A-Za-z0-9]*\)[[:space:]]*=.*/\1/p' | sort -u
+}
 declares() {
   local hit
   hit="$(printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*.*/x/p")"
@@ -504,7 +566,7 @@ declares() {
 }
 
 verify_unit() { # <rendered service> — the properties the ISSUE names, asserted on the ARTIFACT
-  local f="$1" body exec_path n_exec execs envs ok_vals v w seen0=0 _interp _x
+  local f="$1" body exec_path n_exec execs envs ok_vals v w seen0=0 _interp _x _c
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
   # next reader to delete the only explanation of why the line is banned. Strip comments first.
@@ -578,10 +640,19 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   if declares "$body" WorkingDirectory; then
     bad "the rendered unit declares WorkingDirectory= — one directive that refuses to start the unit when the directory is gone (EXIT_CHDIR 200); drop it and let the pass resolve its own cwd"; return 1
   fi
-  # A skipped CONDITION is a green no-op — see the header. Refuse it on the artifact.
-  if declares "$body" ConditionPathExists; then
-    bad "the rendered unit declares ConditionPathExists= — a failed condition SKIPS the unit and leaves it green; the missing-layer case must be a RED payload exit, not a skip"; return 1
-  fi
+  # ⛔ A SKIPPED CONDITION IS A GREEN NO-OP, AND THE FAMILY IS THIRTY-PLUS NAMES, NOT ONE.
+  # `systemd.unit(5)` lists `ConditionPathExists=`, `ConditionFileNotEmpty=`, `ConditionPathIsDirectory=`,
+  # `ConditionEnvironment=`, `ConditionUser=`, `ConditionNeedsUpdate=`, … and EVERY member behaves the same
+  # way on a false condition: the unit is SKIPPED and left GREEN — strictly worse than the 200/CHDIR this
+  # change replaces. Refusing only `ConditionPathExists=` left the other twenty-nine reachable, which is
+  # the same "family closed by one name" defect this file already fixed for the `Exec*` family. The
+  # PREFIX is the rule, so a condition name systemd adds later is closed without another review.
+  for _c in $(directive_names "$body"); do
+    case "$_c" in
+      Condition*)
+        bad "the rendered unit declares ${_c}= — a failed condition SKIPS the unit and leaves it green; the missing-layer case must be a RED payload exit, not a skip"; return 1 ;;
+    esac
+  done
   # ⛔ ONLY THE PASS'S OWN SUCCESS CODES ARE GREEN. 0 = current/applied and 11 = mended are the whole
   # success vocabulary (`harness-apply-pass.sh`'s recorded codes, adopted rather than re-invented); any
   # other value would green a failure, which is the false PASS #3194 is about.
@@ -597,6 +668,45 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
     done
   done <<<"$ok_vals"
   [ "$seen0" -eq 1 ] || { bad "SuccessExitStatus must include 0 — 'current' and 'applied' are only green as 0"; return 1; }
+  return 0
+}
+
+# ── the EFFECTIVE unit: the fragment systemd loads, which is NOT the file this run wrote ───────────
+# ⛔ `verify_unit` READS THE ARTIFACT THIS RUN RENDERED. systemd does not read that file alone: it MERGES
+# every `<unit>.service.d/*.conf` drop-in over it, in both managers, whether the drop-in was written
+# before the main unit or after it. So an installed legacy drop-in can reinstate the exact defect this
+# change exists to remove while `--install` prints "installed — ONE actuator" and exits 0 — a false PASS
+# in the one function whose job is to make the migration safe.
+# AND THIS IS THE MEASURED HISTORY, NOT A HYPOTHESIS. The defect in the issue lived in a DROP-IN
+# (`WorkingDirectory=/tmp/cell-ai`), and a box in this fleet still carries
+# `cell-self-pin.service.d/user.conf` today — so the drop-in directory is the half of the effective unit
+# that no check in this file looked at.
+# THE RULE. A drop-in MAY adjust IDENTITY (`User=`, `Environment=HOME=`): that is how an operator corrects
+# the render without a second copy of the unit. It MAY NOT re-open a class `verify_unit` closed — an
+# executable directive, a working directory, a condition (a green skip), or a wider success vocabulary —
+# because every one of those is a directive this file does not verify and systemd RUNS anyway.
+verify_dropins() { # <unit-dir> <unit-name>
+  local dir="$1/$2.d" f body _c
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/*.conf; do
+    [ -f "$f" ] || continue
+    body="$(grep -vE '^[[:space:]]*#' "$f")"
+    if [[ $body =~ (^|[[:space:]=])/(private/)?(var/)?tmp/cell-ai(/|[[:space:]]|$) ]]; then
+      bad "the installed drop-in ${f} names the provisioning clone (/tmp/cell-ai) — a drop-in OVERRIDES the rendered unit, so rewriting only the unit cannot remove that path; remove ${f} and re-run (a pin unit needs no drop-in)"; return 1
+    fi
+    for _c in $(directive_names "$body"); do
+      case "$_c" in
+        WorkingDirectory)
+          bad "the installed drop-in ${f} declares WorkingDirectory= — it refuses to start the unit when the directory is gone (EXIT_CHDIR 200), which is the defect this change replaces; remove ${f}"; return 1 ;;
+        Condition*)
+          bad "the installed drop-in ${f} declares ${_c}= — a failed condition SKIPS the unit and leaves it green; remove ${f}"; return 1 ;;
+        Exec*)
+          bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
+        SuccessExitStatus)
+          bad "the installed drop-in ${f} declares SuccessExitStatus= — it would widen the unit's green vocabulary past 0/11, which is a false PASS; remove ${f}"; return 1 ;;
+      esac
+    done
+  done
   return 0
 }
 
@@ -717,6 +827,13 @@ do_install() { # [--takeover]
     return 1
   fi
   tmp="$(mktemp -d)" || { bad "mktemp failed"; return 1; }
+  # ⛔ BEFORE ANY WRITE, VERIFY THE UNIT SYSTEMD WILL ACTUALLY LOAD — not only the file this run writes.
+  # A legacy drop-in (`<unit>.service.d/*.conf`) is merged OVER the rendered unit, so it can carry the very
+  # `WorkingDirectory=/tmp/cell-ai` this change removes while every rule below inspects a file nothing else
+  # will read. Checking first also means a refusal mutates NOTHING, so a box that carries one keeps the
+  # actuator it had instead of being told "installed" while still running the defect.
+  verify_dropins "$unit_dir" cell-self-pin.service \
+    || { err "refusing: an installed drop-in re-opens a class the rendered unit closed (reason above) — nothing was written and nothing was retired"; rm -rf "$tmp"; return 1; }
   # ⛔ RENDER → VERIFY → PLACE → INSTALL, in that order, and the order is the fix. Placement used to
   # happen inside the renderer, so a REFUSED install had already replaced the placed pass, and
   # `--print-unit` wrote a file. Verification now runs against the artifact BEFORE anything is written.
