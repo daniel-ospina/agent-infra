@@ -6619,9 +6619,28 @@ function _adminMergeOverride(): boolean {
 const BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation.",
-  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
-  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
-  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
+  // ⛔ #3175: THE REFUSAL STATES WHAT IT ESTABLISHED, AND ONLY ABOUT THIS CALL. It used to claim
+  // "NOTHING IN THE BLOCKED COMMAND RAN … if it bundled a sub-agent launch alongside the git op, the
+  // launch DID NOT HAPPEN (#1492)" — two EFFECT claims this extension cannot observe. What is true:
+  // pi blocks the refused tool call itself (`pi-agent-core` agent-loop: `beforeResult.block` → an
+  // immediate error result, the tool never executes), so THAT command did not run. What is NOT
+  // implied: a SIBLING tool call in the same assistant message (a `task`/`subagent` launch), a
+  // command that already ran, or one run on another box — this handler returns before it sees any
+  // of them (`if (!isToolCallEventType("bash", event)) return undefined`).
+  // MEASURED COST of the over-claim: a lane read "nothing ran" about a merge commit that HAD landed,
+  // re-ran the commit, and left a zero-diff second merge commit plus stale MERGE_HEAD (#3175).
+  "   → REFUSED (effect: NOT APPLIED to THIS call). pi blocks the refused tool call before the shell",
+  "     runs it, so the command THIS REFUSAL IS ABOUT did not execute (see the ANCHOR line below).",
+  // ⛔ #3175 (fresh review, P2): this sentence read "this gate never sees a `task`/`subagent` launch"
+  // — FALSE, and load-bearing: the `tool_result` handler COUNTS exactly those (that is how a lane
+  // clears this floor), and the remediation five lines up tells the lane to dispatch one. What is
+  // true is the SIBLING call in the same batch (this handler returns before it sees it) and a
+  // `background: true` launch, which is not counted until its verdict is reaped (#1662).
+  "     SCOPE — that call only: this gate sees no SIBLING `task`/`subagent` launch in the same batch,",
+  "     no parallel tool call, no script an earlier command assembled, and nothing run on another box",
+  "     — and it does not claim THEY did nothing (a `background: true` dispatch counts only once its",
+  "     verdict is reaped, #1662). Verify the artifact (git log/reflog, file mtime), never a banner",
+  "     (#3175). The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
   // #2287/#2148: a lane whose review came from a SPAWNED reviewer process (review-pr.sh,
@@ -6649,18 +6668,18 @@ const BLOCK_MESSAGE = [
   // an attestation — the second refusal needs a command, and this is the moment to hand it over.
   "   → A dispatch alone does not land the PR: the rail also needs the attestation at the FINAL head —",
   `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
-  // #2349: say WHAT THIS FLOOR READ. Before #2287 it read only a dispatch count and the text said
-  // so. #2287 gave it a head-bound-record path, which made that sentence FALSE — and left the
-  // message CONTRADICTING its own spawn-path paragraph four lines above (fresh review round 5, P1).
-  // The block below is only reached when no usable record was found, so "none" is a true statement
-  // at the moment it prints. The registry-is-per-machine disclosure survives from #2349 because it
-  // is still the reason a record can be invisible to THIS box.
-  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
-  "     head for this repo on this box, or the command's shape closed that path — see above) — and the",
-  "     reviewer DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE",
-  "     (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json), so a record minted on another box, or by a",
-  "     parent session, is invisible here: for a lane whose reviewer ran elsewhere, a dispatch is the",
-  "     only thing this floor can see. The datum it still needs is a dispatch IN THIS SESSION.",
+  // #2349: say WHAT THIS FLOOR READ — and ⛔ #3175: the COUNT is no longer hardcoded text here.
+  // This block used to read "reviewer DISPATCHES counted in THIS pi process (still 0)" as a LITERAL.
+  // ⛔ THE HONEST RATIONALE (fresh review of #3175, P1 — the first version of this comment claimed a
+  // MEASUREMENT that never happened: "the same refusal told two audiences two different facts"). It
+  // could not: the floor is only reachable at `dispatchCount === 0` (the `> 0` early return above),
+  // so the literal was ACCURATE at every fired refusal and the operator block printed 0 as well.
+  // What is actually wrong with a literal is structural, and unchanged by that: the refusal asserts
+  // a value NOBODY READ, so the next edit to the counter (or a future arm reaching this template)
+  // silently makes the text wrong, and there is no state in which it can say "not measured". The
+  // line is now GENERATED from the value actually read (`dispatchFloorReadLines`), so the value is
+  // derived rather than asserted and a caller that cannot supply one gets `UNKNOWN`, never a 0 it
+  // did not take.
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
@@ -6709,14 +6728,8 @@ export function describeDispatchFloorRead(
   command: string,
   tier: string,
   dispatchCount: number
-): { lines: string[]; recordState: string } {
+): { lines: string[]; recordState: string; read: DispatchFloorRead } {
   const stateText = tier === "" ? "unlabeled" : tier;
-  const lines = [
-    `   → READ: reviewer dispatches counted in THIS pi process = ${dispatchCount}; tier=${stateText}.`,
-    "     This floor ALSO tried a head-bound review record for this op and found NONE visible here,",
-    "     so \"no record at this head\" and \"a record exists on another box\" read the same at this",
-    "     point (the registry is PER-MACHINE).",
-  ];
   // A command that reaches this floor names no PR BY CONSTRUCTION: every `gh pr merge`
   // and every `gh pr <verb> <n>` came back from the merge-registry branch above, which
   // always returns. So the honest extra datum is the REGISTRY ITSELF — how much of it is
@@ -6725,28 +6738,52 @@ export function describeDispatchFloorRead(
   const ctx = resolveRepoContext(command, null);
   const repo = ctx.repo ?? (ctx.cwd ? repoFromGitRemote(ctx.cwd) : null) ?? repoFromGitRemote(process.cwd());
   const dir = reviewsDir();
-  let total = 0;
-  let forRepo = 0;
+  // ⛔ THE LISTING IS ITSELF A TRI-STATE (fresh review of #3175, P2). The old `catch { total = -1 }`
+  // collapsed two different observations and then rendered BOTH as "does not exist (0 records can be
+  // visible here)" — a confident zero about a read that may simply have been refused (`EACCES`,
+  // `EIO`). `ENOENT` is the one errno where zero IS the answer (a directory that does not exist
+  // holds no records); every other errno is UNKNOWN, and both channels now say so.
+  let registry: DispatchFloorRead["registry"];
   try {
     const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-    total = files.length;
-    if (repo) {
-      const prefix = `${repo.replace("/", "-")}-`;
-      forRepo = files.filter((f) => f.startsWith(prefix)).length;
-    }
-  } catch {
-    total = -1; // registry dir absent — say so rather than reporting a confident 0
+    const forRepo = repo ? files.filter((f) => f.startsWith(`${repo.replace("/", "-")}-`)).length : 0;
+    registry = { total: files.length, forRepo: repo ? forRepo : null, dir };
+  } catch (err) {
+    registry =
+      (err as NodeJS.ErrnoException)?.code === "ENOENT"
+        ? { total: 0, forRepo: repo ? 0 : null, dir, absent: true }
+        : null; // attempted and FAILED — UNKNOWN, never "0 records"
   }
-  lines.push(
-    total < 0
-      ? `     REGISTRY on this box: ${dir} does not exist (0 records can be visible here).`
-      : `     REGISTRY on this box: ${total} record(s) at ${dir}${repo ? `, ${forRepo} for ${repo}` : " (repo unresolved)"}.`
-  );
-  lines.push(
+  // #3175: the SAME observation, as a value BOTH audiences render — so the model-facing text and
+  // this operator-facing block cannot disagree about what was read. There is ONE derivation and two
+  // renderings; that is what makes the invariant true by construction instead of by intention (the
+  // first version of this fix left `lines` binary and the model text tri-state, and they disagreed
+  // on the most common fresh box there is).
+  const read: DispatchFloorRead = {
+    dispatches: dispatchCount,
+    registry,
+    // The evidence check swallows its own read failure, so the LISTING is the only evidence about
+    // the record half: an unlistable dir → `unknown`, never `none`. An ABSENT dir is a read that
+    // established zero, so `none` is correct there.
+    record: registry === null ? "unknown" : "none",
+  };
+  const lines = [
+    `   → READ: reviewer dispatches counted in THIS pi process = ${dispatchCount}; tier=${stateText}.`,
+    `     This floor ALSO tried a head-bound review record for this op — found: ${recordReadText(read.record)}.`,
+    `     REGISTRY on this box: ${registryReadText(read.registry)}.`,
     "     This command names no PR, and its SHAPE decides whether a record could have been used at all" +
-      " — the datum this gate needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent)."
-  );
-  return { lines, recordState: `no-pr-named (registry=${total}${repo ? `, repo=${forRepo}` : ""})` };
+      " — the datum this gate needs is a reviewer dispatch in THIS session (or the parent's, for a sub-agent).",
+  ];
+  return {
+    lines,
+    // #2349 counts these rows. ⛔ #3175: an UNREADABLE registry is written as UNKNOWN — the old
+    // `registry=-1` sentinel put a NEGATIVE COUNT into gate-events.jsonl, where a reader counting
+    // "no record on this box" ingests it as a number.
+    recordState: `no-pr-named (registry=${registry === null ? "UNKNOWN" : registry.total}${
+      repo ? `, repo=${registry === null ? "UNKNOWN" : registry.forRepo}` : ""
+    })`,
+    read,
+  };
 }
 
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static
@@ -6759,21 +6796,22 @@ export function describeDispatchFloorRead(
 export const MICRO_BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation (micro tier).",
-  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
-  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
-  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
+  // #3175: same correction as BLOCK_MESSAGE's — state the effect established (THIS call), scope it,
+  // and never assert an effect about a tool call this gate never saw.
+  "   → REFUSED (effect: NOT APPLIED to THIS call). pi blocks the refused tool call before the shell",
+  "     runs it, so the command THIS REFUSAL IS ABOUT did not execute (see the ANCHOR line below).",
+  "     SCOPE — that call only: a sibling `task`/`subagent` launch, a parallel tool call, or anything",
+  "     that already ran is NOT covered. Verify the artifact, never a banner (#3175). The refused",
+  "     command is recorded in gate-events.jsonl.",
   "   → Micro skips the multi-agent code-review GATE (commit-workflow 03-code-review.md) — the review-enforcer ≥1-dispatch rule still applies (#485).",
   "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
   // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
   `   → Then record the attestation at the FINAL head (micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
-  // #2349: same disclosure as the generic message, corrected post-#2287: the floor DOES consult a
-  // head-bound record before it refuses, so "reads NO review record" was no longer true.
-  "   → WHAT THIS GATE READ: a head-bound review record for THIS op — found: NONE (no record at this",
-  "     head for this repo on this box, or the command carried shell syntax or a flag) — and the reviewer",
-  "     DISPATCHES counted in THIS pi process (still 0). The registry is PER-MACHINE, so a record on",
-  "     another box is invisible here. What unlocks this floor is a dispatch NOW.",
+  // #2349/#3175: the WHAT-THIS-GATE-READ line is GENERATED from the values actually read
+  // (`dispatchFloorReadLines`) — the old literal "(still 0)" is gone for the same reason as in
+  // BLOCK_MESSAGE.
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
@@ -6823,7 +6861,156 @@ export function tierSourceFor(tier: string): "read" | "undetermined" {
  * lane is now being told to do something it cannot do. The roles that do not dispatch get the
  * direct instruction they can act on (push/report), plus the same "your brief overrides this" hedge.
  */
-export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"): string {
+/**
+ * #3175 — WHAT THE FLOOR READ, as a VALUE the refusal renders, not prose it asserts.
+ *
+ * The refusal is the model's only evidence about two things: the reviewer dispatch count, and
+ * whether a head-bound review record exists at this op's head. Both have THREE answers, and the
+ * collapse of the third into the first is this fleet's most repeated defect:
+ *
+ *   dispatches: a number                       | UNKNOWN (the caller never supplied a read)
+ *   registry:   read (n records on this box)    | UNKNOWN (the dir could not be listed)
+ *   record:     none visible here              | UNKNOWN (the registry could not be READ)
+ *
+ * So every field is `undefined`-able and `undefined` renders `UNKNOWN`, never `0`: a caller that
+ * forgets to thread the read through cannot cause the gate to state a count it did not take.
+ */
+export interface DispatchFloorRead {
+  /** Reviewer dispatches counted in THIS pi process; `undefined` = never read. */
+  dispatches?: number;
+  /**
+   * The registry listing — a THREE-state read, and the three states are DIFFERENT FACTS:
+   *
+   *   a listing    — a read that returned these numbers (`absent: true` = `ENOENT`, i.e. the
+   *                  directory does not exist, so zero records CAN be visible here);
+   *   `null`       — the listing was ATTEMPTED and FAILED (`EACCES`, `EIO`, …): UNKNOWN, never `0`;
+   *   `undefined`  — no listing was taken at all for this refusal: UNKNOWN, and *not* the same
+   *                  claim as `null` (fresh review of #3175, P2: `undefined` used to render as
+   *                  "the registry directory could not be listed" — a cause asserted for a read that
+   *                  was never attempted).
+   */
+  registry?: { total: number; forRepo: number | null; dir: string; absent?: boolean } | null;
+  /**
+   * The RECORD half, which is NOT the same read as the registry listing: `headBoundReviewEvidence`
+   * swallows every failure of its own listing (`catch { return null }`), so the evidence check
+   * cannot tell "no record at this head" from "the registry could not be read". `none` is therefore
+   * only correct when the listing SUCCEEDED; when it did not, this is `unknown` — and `undefined` is
+   * its own state ("no read was taken"), never a confident `none` for a caller that supplied a
+   * registry but no record (fresh review of #3175, P2).
+   */
+  record?: "none" | "unknown";
+}
+
+/**
+ * The REGISTRY half, rendered FROM the value — one source for the model-facing text and the
+ * operator-facing block, so the two audiences cannot disagree about what was read (fresh review of
+ * #3175, P2: the operator block was left binary while the model text became tri-state, so the same
+ * observation printed "found NONE visible here" to the log and "not established" to the model).
+ */
+export function registryReadText(registry: DispatchFloorRead["registry"]): string {
+  if (registry === undefined)
+    return "UNKNOWN — no registry listing was taken for this refusal, so \"no record here\" was NOT established";
+  if (registry === null)
+    return "UNKNOWN — the registry directory could not be listed, so \"no record here\" was NOT established";
+  if (registry.absent)
+    return `0 record(s) — ${registry.dir} does not exist, so no record can be visible here`;
+  return (
+    `${registry.total} record(s) at ${registry.dir}` +
+    (registry.forRepo === null ? " (repo unresolved)" : `, ${registry.forRepo} for this repo`)
+  );
+}
+
+/** The RECORD half, rendered from the value (its own tri-state — see `DispatchFloorRead.record`). */
+export function recordReadText(record: DispatchFloorRead["record"]): string {
+  if (record === "none")
+    return (
+      "NONE VISIBLE HERE (either there is none at this head for this repo on this box, or the " +
+      "refused command's shape closed that path — see above)"
+    );
+  if (record === "unknown")
+    return "UNKNOWN — the evidence listing failed, so this gate did NOT establish that none exists";
+  return "UNKNOWN — this refusal was built without reading the record half, so \"none\" was NOT established";
+}
+
+/**
+ * The one generated READ line, shared by every refusal path (#2349/#3175).
+ *
+ * ⛔ The `0`-vs-`UNKNOWN` distinction is structural: `undefined` is the DEFAULT for both inputs, so
+ * the failure mode of a future call site is a refusal that says UNKNOWN — never one that asserts a
+ * count it did not take. The count's own MEANING is stated too, because "0 dispatches" is true and
+ * useless while "no reviewer exists" is false: a background `task` dispatch counts only when its
+ * verdict is reaped (#1662), and a reviewer that ran in a parent session or on another box is
+ * invisible to this counter by construction.
+ */
+export function dispatchFloorReadLines(read: DispatchFloorRead = {}): string[] {
+  const dispatches =
+    typeof read.dispatches === "number"
+      ? `${read.dispatches} (counted in THIS pi process)`
+      : "UNKNOWN — this refusal was built without reading the counter, so treat it as unmeasured";
+  return [
+    `   → WHAT THIS GATE READ: reviewer DISPATCHES = ${dispatches};`,
+    `     a head-bound review record for THIS op — found: ${recordReadText(read.record)}.`,
+    `     REGISTRY: ${registryReadText(read.registry)}.`,
+    "     The registry is PER-MACHINE (~/.pi/agent/reviews/<owner>-<repo>-<pr>.json), so a record minted",
+    "     on another box, or by a parent session, is invisible here. `0` means \"no dispatch THIS counter",
+    "     could see\" — never \"no review exists\". The datum this floor still needs is a dispatch IN THIS",
+    "     SESSION (or a head-bound record at this head).",
+  ];
+}
+
+/**
+ * #3175 — THE ANCHOR: the per-call binding, in the text the model reads.
+ *
+ * Why it must be in the TOOL RESULT and not only in the queued recovery (fresh review of #3175,
+ * P1): the recovery is delivered at most once per session (`blockRecoverySent`), so on the second
+ * and later refusals the only ANCHOR in the model's context names an EARLIER, different call — the
+ * refusal said "see the ANCHOR line" about evidence of the wrong call, which is the exact
+ * mis-anchoring this issue is about. The tool result is per-call by construction, so the anchor
+ * belongs there, and `dispatchFloorRefusal` puts the identical string in both channels.
+ */
+export function dispatchFloorAnchor(toolCallId: string, rawCommand?: string): string {
+  const id = toolCallId ? `tool_call_id=${toolCallId}` : "tool_call_id=(the host supplied none)";
+  const lines = [
+    `⛔ ANCHOR (#3175): this refusal is about ${id} —`,
+    "   A refusal is bound to its OWN call: it arrives as THAT call's tool result, so it is evidence",
+    "   about that call and nothing else — a refusal delivered after a LATER call is still about the",
+    "   call named above, never a verdict on what ran before it (#3175: delivery order is not cause).",
+  ];
+  // ⛔ THE COMMAND IS NAMED IN THE QUEUED RECOVERY, NOT IN THE TOOL RESULT (fresh review of #3175).
+  // The tool result is already bound to its call and its input is in the model's context, so echoing
+  // the command there is redundant — and it is not free: every existing reader of `reason` that
+  // matches WORDS (e.g. #1776's "which gate refused this", where the command's own title happened to
+  // read `fix(admin-merge): x`) would start matching the command instead of the refusal.
+  if (rawCommand !== undefined)
+    lines.push(`   — and the refused command: ${auditCommand(rawCommand, 300).replace(/\n/g, " ⏎ ")}`);
+  return lines.join("\n");
+}
+
+/**
+ * The complete refusal text: the message (`dispatchFloorMessage`, or the capacity arm's own) plus the
+ * ANCHOR, composed ONCE so every channel carries the same string.
+ *
+ * ⛔ THE TOOL RESULT AND THE QUEUED RECOVERY ARE THE SAME TEXT (#3175, P1). The templates point at
+ * "the ANCHOR line", so an anchor that existed only in the once-per-session recovery left that
+ * pointer unsatisfiable on every later refusal; composing both channels here makes the pointer true
+ * by construction, and costs nothing (the id and the command are per-call data the handler holds).
+ */
+export function dispatchFloorRefusal(
+  tier: string,
+  role: ReviewerRole,
+  read: DispatchFloorRead,
+  toolCallId: string,
+  message?: string,
+  rawCommand?: string,
+): string {
+  return `${message ?? dispatchFloorMessage(tier, role, read)}\n${dispatchFloorAnchor(toolCallId, rawCommand)}`;
+}
+
+export function dispatchFloorMessage(
+  tier: string,
+  role: ReviewerRole = "self",
+  read: DispatchFloorRead = {},
+): string {
   const base = tier === "micro" ? MICRO_BLOCK_MESSAGE : BLOCK_MESSAGE;
   const label = tierLabel(tier);
   const provenance =
@@ -6841,25 +7028,28 @@ export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"):
   const recovery =
     role === "reviewer"
       ? [
-          "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran. You are the REVIEWER: you do not dispatch,",
-          "     push, record or merge — report the refused command to merge-one.sh and continue reporting.",
+          "   → THIS REFUSAL IS NOT TERMINAL: do not dispatch, do not push, do not record and do not",
+          "     merge. That ONE call did not run. You are the REVIEWER — report the refused command to",
+          "     merge-one.sh and continue reporting.",
         ]
       : role === "harness"
         ? [
-            "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran and the session is still alive: push your",
+            "   → THIS REFUSAL IS NOT TERMINAL. That one call did not run and the session is still alive: push your",
             "     FINAL head and finish the report — the HARNESS reviewer (merge-one.sh) mints the",
             "     attestation for this PR, so do NOT dispatch and do NOT merge (#825).",
             "   → If your brief says you DO have a `task` tool and own the review, dispatch a reviewer and",
             "     re-run the SAME command instead.",
           ]
         : [
-            "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran and the session is still alive: dispatch a reviewer",
-            "     (the `task` or `subagent` tool), then re-run the SAME command. Do not end the run on a block.",
+            "   → THIS REFUSAL IS NOT TERMINAL. That one call did not run and the session is still alive:",
+            "     dispatch a reviewer (the `task` or `subagent` tool), then re-run the SAME command. Do not",
+            "     end the run on a block.",
             "   → If your brief says you have no `task` tool, that overrides this: do NOT dispatch and do NOT",
             "     merge — the parent's reviewer mints the attestation.",
           ];
   return [
     base,
+    ...dispatchFloorReadLines(read),
     `   → Tier: ${label} — ${provenance}`,
     ...recovery,
     "   → If the command only READS (gh pr view / gh api / gh issue view), it should not have needed a",
@@ -7137,9 +7327,22 @@ export default function (pi: ExtensionAPI) {
     // wrong action #2665's own note above says printing BLOCK_MESSAGE on that arm produces. It
     // arrives as a `followUp` that TRIGGERS A TURN, so it is the instruction the model acts on.
     // The floor arm keeps the default; the capacity arm passes its own `unspawnableMessage`.
-    const deliverBlockRecovery = (tier: string, rawCommand: string, message?: string): void => {
+    const deliverBlockRecovery = (
+      tier: string,
+      rawCommand: string,
+      read: DispatchFloorRead = {},
+      toolCallId = "",
+      message?: string,
+    ): void => {
       if (blockRecoverySent) return;
-      const body = message ?? dispatchFloorMessage(tier, reviewerRole);
+      // ⛔ #3175 — ONE COMPOSER FOR BOTH CHANNELS (fresh review, P1). The recovery is a QUEUED
+      // followUp that TRIGGERS A TURN, so it lands with no toolCallId attached and reads as the
+      // verdict on whatever the lane just did (measured: session 2026-10-30T20-38-34, "Which
+      // command is this?"). The anchor names the refused call by id and command and says outright
+      // that delivery order is not cause — and because `dispatchFloorRefusal` also builds the tool
+      // result, the "(see the ANCHOR line)" pointer in the templates resolves on EVERY refusal, not
+      // only on the first one the session happens to deliver.
+      const body = dispatchFloorRefusal(tier, reviewerRole, read, toolCallId, message, rawCommand);
       let sendQueued = false;
       if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
         try {
@@ -7156,6 +7359,14 @@ export default function (pi: ExtensionAPI) {
         tier: tier === "" ? "unlabeled" : tier,
         tier_source: tierSourceFor(tier),
         send_queued: sendQueued,
+        // #3175: the anchored refusal record — what the refusal CLAIMED about the effect, and the
+        // call it claimed it about. `effect: not_applied` is the host contract for a blocked call
+        // (pi-agent-core: `beforeResult.block` → immediate error result, the tool never runs) and
+        // `effect_scope` bounds it: this gate observes no other call, so it asserts nothing about one.
+        effect: "not_applied",
+        effect_scope: "this_call_only",
+        tool_call_id: toolCallId || null,
+        dispatch_count: typeof read.dispatches === "number" ? read.dispatches : null, // null = UNKNOWN
         // #1382: the audit row records the command the CALLER wrote. This helper receives the
         // masked READING for none of its own logic — `rawCommand` is the only thing it audits —
         // so it must be handed the caller's text, not the heredoc-masked rewrite.
@@ -7169,6 +7380,10 @@ export default function (pi: ExtensionAPI) {
       // `rawCommand` is read BEFORE the `extensionEnabled` gate: the #2148 early notice below must
       // also reach a BYPASSED lane (that is the one which reaches the rail unstopped).
       const rawCommand = String(event.input.command ?? "");
+      // #3175: the id of the call THIS refusal is about. A refused call and a queued recovery message
+      // are delivered separately and out of causal order, so the refusal must name its own call or a
+      // lane cannot tell which of several calls it is evidence about.
+      const firedCallId = String((event as { toolCallId?: string }).toolCallId ?? "");
 
       // #984: the ARGV-LEVEL layer runs FIRST and for EVERY bash call, not only
       // for git ops — the shim has to be on PATH before the command runs, and a
@@ -7600,6 +7815,10 @@ export default function (pi: ExtensionAPI) {
       // of the JSONL can now see that no tier was determined — and the operator-facing message
       // says the same thing in words.
       const tierClassification = tierSourceFor(tier);
+      // #3175: the floor's observation is taken ONCE per ARM, not once per call. It is NOT hoisted
+      // above the capacity arms (fresh review, P2): those arms consume only `dispatches`, while
+      // `describeDispatchFloorRead` runs `execSync` git and a `readdirSync` — blocking work on the
+      // spawn-fault path, which is the path a loaded box is already failing on.
       if (tier === "micro") {
         // #2665: CAPACITY first — the fault is upstream of the tier, so the micro remediation
         // (which is about WHICH reviewer to dispatch) would misdirect here.
@@ -7628,10 +7847,17 @@ export default function (pi: ExtensionAPI) {
           // ⛔ AND THE MODEL-VISIBLE HALF, ON BOTH CAPACITY EMITTERS (#2206 re-review, P2): the
           // first fix added this call to the non-micro branch only, so a `pi -p` micro lane still
           // got a tool result and nothing that re-opens the turn — the exact #2204 (2) failure.
-          deliverBlockRecovery("micro", rawCommand, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
+          const microCapacity = dispatchFloorRefusal(
+            "micro",
+            reviewerRole,
+            { dispatches: dispatchCount },
+            firedCallId,
+            unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+          );
+          deliverBlockRecovery("micro", rawCommand, { dispatches: dispatchCount }, firedCallId, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
           return {
             block: true,
-            reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+            reason: microCapacity,
             terminate: false,
           };
         }
@@ -7649,8 +7875,12 @@ export default function (pi: ExtensionAPI) {
           // heredoc-masked READING used by the gates; masking is never a rewrite of the record.
           command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
         }); // #516: durable audit
-        deliverBlockRecovery(tier, rawCommand);
-        return { block: true, reason: dispatchFloorMessage("micro", reviewerRole), terminate: false };
+        deliverBlockRecovery(tier, rawCommand, floor.read, firedCallId);
+        return {
+          block: true,
+          reason: dispatchFloorRefusal("micro", reviewerRole, floor.read, firedCallId),
+          terminate: false,
+        };
       }
 
       // #2665: the lane that TRIED and could not get a verdict is a different state from the
@@ -7675,10 +7905,17 @@ export default function (pi: ExtensionAPI) {
         // model reads, so a lane on the one arm #2204 calls "the refusal the model reads as the end
         // of the run" still read it that way). The message is THIS arm's, not the compliance text
         // (#2206 re-review, P1).
-        deliverBlockRecovery(tier, rawCommand, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
+        const genericCapacity = dispatchFloorRefusal(
+          tier,
+          reviewerRole,
+          { dispatches: dispatchCount },
+          firedCallId,
+          unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+        );
+        deliverBlockRecovery(tier, rawCommand, { dispatches: dispatchCount }, firedCallId, unspawnableMessage(spawnAttempts, spawnAttemptsTotal));
         return {
           block: true,
-          reason: unspawnableMessage(spawnAttempts, spawnAttemptsTotal),
+          reason: genericCapacity,
           terminate: false,
         };
       }
@@ -7694,13 +7931,13 @@ export default function (pi: ExtensionAPI) {
         // #1382: audit the caller's command, not the masked reading (see the micro arm above).
         command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
       }); // #516: durable audit
-      deliverBlockRecovery(tier, rawCommand);
+      deliverBlockRecovery(tier, rawCommand, floor.read, firedCallId);
       // `terminate: false` is EXPLICIT (#2204 (2)). The SDK contract is "the agent stops early only
       // when every finalized result in the batch is terminating", so a refusal that leaves this
       // unset is already non-terminating — stating it is what stops a future edit from reaching for
       // `terminate: true` to "make the refusal stick". The measured failure was the MODEL treating
       // the block as terminal; `deliverBlockRecovery` is the model-visible half of that fix.
-      return { block: true, reason: dispatchFloorMessage(tier, reviewerRole), terminate: false };
+      return { block: true, reason: dispatchFloorRefusal(tier, reviewerRole, floor.read, firedCallId), terminate: false };
     });
 
     // ── tool_result: count sub-agent dispatches ────
