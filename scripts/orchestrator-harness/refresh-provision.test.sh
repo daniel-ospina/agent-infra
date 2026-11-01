@@ -727,14 +727,24 @@ ck "(h3) the local-path arm names the local path ($(rec why | cut -c1-90))" "$r"
 # predicates now carry the trailing-slash spellings, and this arm pins that the pass PROCEEDS.
 mk_case cause-trailing-slash
 git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise/"
+# ⛔ THE TRANSPORT IS REDIRECTED, THE SPELLING IS NOT (review cycle 5, P1-shaped P2): without this line
+# `scout_sync` FETCHES github.com for real — it broke this file's own "no network is touched" invariant
+# (:66) and made the arm's outcome depend on egress. `insteadOf` rewrites the transport while
+# `git config --get remote.origin.url` still answers the trailing-slash URL that `resolve_repo` reads,
+# so the arm measures the accept list and nothing else.
+git -C "$D/repo" config "url.$D/origin.git.insteadOf" "https://github.com/daniel-ospina/tortoise/"
 rp "$D" "" OR="daniel-ospina/tortoise"
-# ⛔ THE ASSERTION IS "THE PAIR WAS ACCEPTED", NOT `rc=0`: this fixture's remote is a URL that does not
-# resolve from the sandbox, so the pass moves PAST the resolver and then fails at `scout_sync`'s fetch
-# (TRANSIENT). Pinning rc=0 would pin that unrelated network behaviour instead of the accept list.
+# ⛔ A POSITIVE ASSERTION, NOT TWO ABSENCES (review cycle 5, P2). "no 'NOT the queue target'" and "no
+# resolve-repo in the record" are both green when the pass dies BEFORE the resolver — measured by
+# injecting an unrelated early `provision_fail`, which left both lines ✅ while `resolve_repo` never ran.
+# With the transport redirected the pass completes, so rc=0 pins the accept list directly.
+ck "(h4) a trailing-slash origin naming the target is ACCEPTED and the pass proceeds (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
 case "$OUT" in *"NOT the queue target"*) r=1 ;; *) r=0 ;; esac
-ck "(h4) a trailing-slash origin naming the target is NOT refused as a different repo" "$r"
+ck "(h4) …and it is not refused as a different repo" "$r"
 case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-70))" "$r"
+# NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s accept list the
+# pass prints `NOT the queue target` for this origin and all three assertions above go red.
 # NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s accept list,
 # the pass prints `NOT the queue target` for this exact origin and both assertions above go red.
 # ⛔ THE UNSET-`$REPO` ARM IS HERMETIC BECAUSE THE CANDIDATE LIST IS DERIVED FROM `$OR` (review cycle 3,
