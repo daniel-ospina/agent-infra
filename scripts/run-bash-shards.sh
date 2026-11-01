@@ -54,6 +54,9 @@
 #   - Exits 1 if any shard failed, 0 otherwise — and NAMES each failing shard (a bare
 #     "N bash shard(s) failed" was unattributable: a syntax error in one suite read as a
 #     whole-list failure with no name).
+#   - An INTERRUPTED run (TERM/INT) still prints that recap from what it accumulated, prefixed
+#     `⚠️ RECAP INCOMPLETE (k/n shards ran)`, and exits 1: a truncated run is UNPROVEN, never
+#     green, and never a baseline (agent-infra#3174 — see shard_partial_recap).
 #   - Hermetic: every suite builds its own temp repos/HOME/shims and touches no real state.
 #   - `--list` prints the DERIVED shard list (DERIVATION above), `--list-sweeps` the syntax-sweep
 #     globs. Both print the lists this script EXECUTES, from one source each (SUITE_GLOBS + each
@@ -566,6 +569,76 @@ swept=0
 # not a shard) and the bare `|| shard_errors=$((shard_errors + 1))` literal stays intact for §8h.
 sweep_errors=0
 sweep_file() { swept=$((swept + 1)); shard_err0=$shard_errors; bash -n "$1" || shard_errors=$((shard_errors + 1)); [ "$shard_errors" -ne "$shard_err0" ] && { sweep_errors=$((sweep_errors + 1)); [ "${sweep_name:-1}" = 1 ] && shard_named_failure "$1"; }; }
+
+# ── THE PARTIAL RECAP — an INTERRUPTED run still names what it saw, and says it is INCOMPLETE ──
+# (agent-infra#3174)
+#
+# THE DEFECT. On 2026-10-31 main's `script-validate` job was killed mid-run (run `41217287437`:
+# the shard step was terminated after 111 minutes) and a KILLED step printed NO recap at all. So the
+# only thing the fleet's merge decisions read — the set of shards red on `main`, which every batch
+# verdict subtracts — was produced by a job whose answer silently SHRANK as the job got slower.
+# Measured across three consecutive main runs: 13 / 11 / 10 failing shards named, with nothing
+# fixed in between. Under-reporting the reference set is not cosmetic: a shard genuinely red on
+# `main` drops out of the baseline, then reappears as "a new failure caused by the batch" and gets a
+# constituent dropped or reverted on a FALSE signal — and, read as an improvement, it also HIDES the
+# failures that were real.
+#
+# THREE PARTS, and the second is the point:
+#   1. A TERM/INT trap emits the same `❌ failing shard(s): …` recap the normal exit emits, from
+#      everything accumulated so far, so an interrupted run still NAMES its failures.
+#   2. The interrupted recap is VISIBLY INCOMPLETE — `⚠️ RECAP INCOMPLETE (k/n shards ran)` — because
+#      a partial recap that LOOKS full is worse than no recap: it is exactly the false-PASS shape
+#      this file exists to refuse. The marker is the machine-readable half (scripts/ci_exemption.py
+#      detects it, and scripts/ci-failure-set.sh refuses to fold such a run into the baseline).
+#   3. The exit code stays 1. An interrupted run proves nothing about the shards it never reached, so
+#      it must never read GREEN — a killed step that exits 0 would certify a hole.
+#
+# ⛔ `shard_errors` is NOT "the whole failure set": it counts what had failed BEFORE the signal. The
+# handler therefore never prints a bare "0 failed" as if it were a clean result — with nothing
+# failed yet it says NOTHING IS PROVEN, out loud, because the dangerous reading of a truncated run is
+# "fewer failures = an improvement".
+#
+# ⛔ BASH DEFERS THE TRAP while a foreground child runs, which is why the signal must reach the CHILD
+# too — GitHub terminates the whole process group, so that is what happens in the incident this fixes
+# and what `scripts/run-bash-shards.recap.test.sh` reproduces.
+#
+# ⚠️ STATED RESIDUAL — WHAT THIS HANDLER CANNOT COVER, PRECISELY (review of this change, P1). A run
+# that is SIGKILLed, OOM-killed, or dies with its runner BEFORE the trap executes prints NO recap and
+# NO marker — and on that capture the marker's ABSENCE does not mean "not truncated": it is
+# indistinguishable from a complete run. Such a run still carries the per-shard
+# `❌ FAILED SHARD: <path>` lines printed at the point of failure, so `scripts/ci_exemption.py` still
+# yields ids for it with rc 0 and `scripts/ci-failure-set.sh` still folds it in — the PRE-#3174
+# behaviour survives on that path, and NO rule in the consumers currently owns it. Do not read this
+# trap as covering it. The repair is the consumer treating "shard identities but no recap line at
+# all" as a truncated capture (fail closed); that is a behaviour change to the SHARED parser — several
+# fixtures legitimately carry a per-shard line and no recap — so it is filed as its own issue (#3182)
+# rather than bundled here.
+shard_partial_recap() {
+  shard_signal="${1:-TERM}"
+  shard_done=$((shard_ran + shard_skipped))
+  shard_notrun=$((listed - shard_done))
+  [ "$shard_notrun" -ge 0 ] || shard_notrun=0
+  printf '\n⚠️ RECAP INCOMPLETE (%s/%s shards ran) — scripts/run-bash-shards.sh was TERMINATED (%s) after %s of %s listed shard(s) (%s ran, %s skipped, %s never reached), so this is a TRUNCATED run: the lines below name what had ALREADY failed and say NOTHING about the shard(s) that had not run. A PARTIAL RECAP IS NOT A BASELINE — report UNPROVEN, never a failure set (agent-infra#3174)\n' \
+    "$shard_ran" "$listed" "$shard_signal" "$shard_done" "$listed" "$shard_ran" "$shard_skipped" "$shard_notrun"
+  if [ -n "$shard_failed_list" ]; then
+    printf '❌ %s bash shard(s) had failed when this run was killed\n' "$shard_errors"
+    printf '❌ failing shard(s): %s\n' "$shard_failed_list"
+    if [ "${sweep_errors:-0}" -gt 0 ]; then
+      printf '❌ …and %s of them are SYNTAX-SWEEP failures, not shards — each named at its own bash -n line\n' "$sweep_errors"
+    fi
+    recap_named_partial=$(printf '%s' "$shard_failed_list" | awk -F', ' '{print NF}')
+    if [ "$recap_named_partial" -lt "$shard_errors" ]; then
+      printf '❌ …and %s of the counted failure(s) could NOT be named — the naming arm did not run for them (a defect in scripts/run-bash-shards.sh, not in the failing file)\n' "$((shard_errors - recap_named_partial))"
+    fi
+  else
+    printf '❌ NOTHING IS PROVEN: no shard had failed yet at %s/%s, and %s shard(s) had not run — this is NOT a green baseline, it is a run that was killed before it finished\n' \
+      "$shard_done" "$listed" "$shard_notrun"
+  fi
+  printf '   ⚠️ RECAP INCOMPLETE — do not compute a set difference from this run: it is UNPROVEN (agent-infra#3174)\n'
+  exit 1
+}
+trap 'shard_partial_recap TERM' TERM
+trap 'shard_partial_recap INT' INT
 
 # Every listed target must be a real file INSIDE this checkout. Without this, a substitution that
 # keeps the line count but points the list at a /tmp stub would report every shard as passed having
