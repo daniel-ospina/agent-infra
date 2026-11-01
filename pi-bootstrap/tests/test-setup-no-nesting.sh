@@ -1537,6 +1537,24 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed liveness.py differs from tools/fleet/liveness.py (stale copy!)"
   fi
+  # #1178 — the DISPATCH population. `lane_liveness.py` imports this module for its
+  # `### Dispatch lanes` section, and a missing sibling is a declared
+  # `UNMEASURED(fleet_snapshot.py not farmed beside this driver: ...)` — on EVERY
+  # box, on every pass, forever. So presence is not the assertion and neither is
+  # byte-equality on its own: the farmed DRIVER must actually import the farmed
+  # module in the farmed layout, which is the thing the runtime does.
+  local snapshot="$DEST/scripts/fleet/fleet_snapshot.py"
+  if diff -q "$ROOT/tools/fleet/fleet_snapshot.py" "$snapshot" >/dev/null 2>&1; then
+    echo "ok: $label farmed fleet_snapshot.py == repo copy (#1178 dispatch population)"
+  else
+    fail "$label: farmed fleet_snapshot.py differs from (or is missing vs) tools/fleet/fleet_snapshot.py"
+  fi
+  local imp_out
+  if imp_out="$(cd "$DEST/scripts/fleet" && python3 -c 'import fleet_snapshot, lane_liveness; fleet_snapshot.dispatch_lanes' 2>&1)"; then
+    echo "ok: $label the farmed driver imports its farmed fleet_snapshot (#1178)"
+  else
+    fail "$label: the farmed driver cannot import the farmed fleet_snapshot: $(head -1 <<<"$imp_out")"
+  fi
   # #1178 unit 4 — the two tools that lived ONLY as untracked files in
   # ~/.pi/agent/state/: the recovery primitive and the dead-lane reader.
   if diff -q "$ROOT/tools/fleet/fleet-health.py" "$DEST/scripts/fleet/fleet-health.py" >/dev/null 2>&1; then
@@ -2051,7 +2069,7 @@ check_tools_dir_clean "run1-final"
 # the farm FAIL LOUD rather than recreate one.
 echo "== run 1b: legacy tools/fleet migration + tools/ regression guard (#1277)"
 mkdir -p "$DEST/tools/fleet"
-for f in lane_liveness.py liveness.py claim_lanes.py fleet-health.py map-sessions.py; do
+for f in lane_liveness.py liveness.py fleet_snapshot.py claim_lanes.py fleet-health.py map-sessions.py; do
   echo "# legacy farm replica (the pi boot-blocker)" > "$DEST/tools/fleet/$f"
 done
 if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
@@ -2127,6 +2145,9 @@ if [ -f "$DEST/scripts/fleet/lane_liveness.py" ]; then
 fi
 if [ -f "$DEST/scripts/fleet/liveness.py" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/fleet/liveness.py"        # #1178 unit 3 farm refresh
+fi
+if [ -f "$DEST/scripts/fleet/fleet_snapshot.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/fleet/fleet_snapshot.py"  # #1178 dispatch population farm refresh
 fi
 if [ -f "$DEST/scripts/fleet/fleet-health.py" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/fleet/fleet-health.py"     # #1178 unit 4 farm refresh
