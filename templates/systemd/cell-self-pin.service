@@ -74,9 +74,11 @@ IOSchedulingClass=idle
 # It is one `git fetch` and, at most, one `apply --force`. Ten minutes is ample; the bound exists so a
 # wedged `git` cannot leave the oneshot "activating" for ever with the next tick queued behind it.
 TimeoutStartSec=600
-# ⛔ ONLY 0 IS GREEN, AND THAT IS THE WHOLE POINT. The pass's own vocabulary reserves nothing else:
-# 10/11-style "advanced/mended" meanings belong to harness-apply-pass.sh, which this unit does NOT
-# call. A non-zero here means the layer could not be resolved, the ref could not be read, or `apply`
-# failed — every one of which is a HUMAN-resolvable state, and greening any of them is the false PASS
-# #3194 is about.
-SuccessExitStatus=0
+# ⛔ ONLY THE PASS'S OWN SUCCESS CODES ARE GREEN: 0 AND 11. 0 = current/applied; 11 = `mended` — the
+# pin RECORD was missing/empty and was repaired to the tree `apply` created. 11 is `harness-apply-pass.sh`'s
+# own code for exactly that event (harness-refresh.sh's vocabulary before it), adopted rather than
+# re-invented: excluding it would make a LOST record an unhealable RED on a box that is in fact correct,
+# which is #3133 one layer up. Everything else stays RED — a non-zero here means the layer could not be
+# resolved, the ref could not be read, or `apply` failed, and every one of those is a HUMAN-resolvable
+# state. Greening any of them is the false PASS #3194 is about.
+SuccessExitStatus=0 11

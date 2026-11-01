@@ -2,13 +2,19 @@
 # cell-self-pin.sh — keep the layer this cell EXECUTES on origin/main, on a clock (agent-infra #3194).
 #
 #   ./cell-self-pin.sh                 # one pass: resolve the layer, no-op if current, else apply --force
-#   ./cell-self-pin.sh --status        # read-only: what it resolved, where it came from, last outcome
-#   ./cell-self-pin.sh --dry-run       # resolve + decide + print, change NOTHING
-#   ./cell-self-pin.sh --install       # render templates/systemd/cell-self-pin.{service,timer} and install
-#   ./cell-self-pin.sh --print-unit    # render to stdout only (the test asserts on this artifact)
+#   ./cell-self-pin.sh --status        # what it resolved, where it came from, the LAST OUTCOME (it FETCHES)
+#   ./cell-self-pin.sh --status-nofetch # the same reading against the LOCAL ref, saying it may be stale
+#   ./cell-self-pin.sh --dry-run       # resolve + decide + print: change NOTHING, fetch NOTHING
+#   ./cell-self-pin.sh --install [--takeover]   # render + verify + PLACE the pass + install the units
+#   ./cell-self-pin.sh --print-unit    # render the units to stdout ONLY — writes no file, places no pass
 #   ./cell-self-pin.sh --help
 #
-# Exit: 0 = current or applied, 1 = apply failed, 2 = the layer could NOT be resolved (loud, named).
+# Exit (pass):   0 = current or applied; 11 = the pin RECORD was missing and was MENDED to the tree
+#                `apply` created; 1 = apply failed, or the record did not converge; 2 = the layer
+#                could NOT be resolved (loud, named).
+# Exit (status): 0 = current, 1 = DRIFT, 2 = the layer could NOT be resolved — the repo's own
+#                `0 match / 1 drift / 2 unknown` vocabulary (scripts/check-deployed-drift.sh), reused
+#                rather than invented a third time (#1178).
 #
 # ── WHY THIS FILE EXISTS (#3194) ────────────────────────────────────────────────────────────────
 # `cell-self-pin.service` had exactly this job and could never do it. Its unit drop-in shipped
@@ -54,6 +60,23 @@
 # SILENT, GREEN no-op: strictly worse than the 200/CHDIR it replaced, because the old one at least
 # coloured the unit red. The correct outcome here is a RED that is TRUE, produced by the payload.
 #
+# ── ONE ACTUATOR PER PIN, AND WHAT `--install` DOES ABOUT IT ────────────────────────────────────
+# ⛔ THIS FILE IS A SECOND SCHEDULED ACTUATOR FOR A JOB `harness-apply-pass.sh` ALREADY DOES, and that
+# is a fact to be handled, not papered over. `eldato-harness-apply.timer` runs every ten minutes, calls
+# the same `apply --force --pin-only`, already owns the `mended` state and writes an instrumented status
+# file, and `cloud-cell-bringup.sh` installs it on EVERY cell (it dies if it cannot). Two mutating
+# actors on one pin is a RACE, not redundancy — so this file never silently becomes the second one:
+#   · `--install` REFUSES while `eldato-harness-apply.timer` is enabled in EITHER systemd manager —
+#     the SYSTEM one and the `--user` one the sibling installer negotiates — and NAMES the scope it saw;
+#   · `--install --takeover` is the ONE-ACTOR MIGRATION: disable+stop that timer, VERIFY the disable,
+#     and only then install this unit. `--takeover` is an operator's explicit decision to retire the
+#     shipped actuator on this box; a retirement that does not take is a REFUSAL, never two actors.
+# ⛔ AND NOTHING INSTALLS THIS UNIT AUTOMATICALLY. `cloud-cell-bringup.sh` carries no reference to it,
+# deliberately: retiring a shipped, tested actuator on every cell is an operator decision, not a side
+# effect of a merge. Until that decision is taken, this file is the INSTRUMENT plus its migration and
+# `harness-apply-pass.sh` stays the shipped default. A merge of this file is not "the fleet changed":
+# adoption is `--install --takeover`, on the box, by a human or a bring-up step that says so.
+#
 # ── WHAT IT ACTUALLY DOES (it re-implements no activation) ─────────────────────────────────────
 # `cloud-cell-supervisor.sh apply` already fetches agent-infra main and pins a detached per-commit
 # worktree (#1745); the pin deadlock (#2700 C5) is that `apply` refuses while a controller runs, and a
@@ -78,11 +101,22 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || SELF_
 log() { printf '%s self-pin: %s\n' "$(date -u +%FT%TZ)" "$*"; }
 err() { printf '%s self-pin: %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
+# record_outcome — ONE line, read back by `--status`'s "last outcome". A verb that advertises a last
+# outcome and prints none is a claim this file does not keep; journald is not an answer to "what did
+# this timer do last tick" for an operator reading one screen. Best-effort by design: a record that
+# cannot be written must never turn a correct pass into a RED.
+record_outcome() {
+  mkdir -p "$O" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >"$O/self-pin.last" 2>/dev/null || true
+  return 0
+}
+
 # loud() — the shape of EVERY unresolvable state. stderr (so journald carries it), a NAMED reason, the
 # readings it decided from, and exit 2. Never a silent `exit 1`: #3194's cost was a unit whose failure
 # said nothing an operator could act on.
 loud() { # <code> <reason> [detail…]
   local code="$1" reason="$2"; shift 2
+  record_outcome "unresolved($reason) $*"
   err "UNRESOLVED($reason): $*"
   err "  base=${CELL_HOME} pin_file=${HARNESS_PIN_FILE} pin_dir=${HARNESS_PIN_DIR} ref=${HARNESS_REF}"
   err "  This is a RED, not a retry: the cell's executing layer could not be identified, so nothing was"
@@ -118,11 +152,15 @@ resolve_layer() {
     # ⛔ NEWEST BY mtime, not lexicographic: a pin root holds one directory per commit and a sha12 is
     # random, so glob order picks an ARBITRARY commit — and it is that commit's supervisor which then
     # executes. A record nobody can read is already an error above; this fallback is the last resort.
-    for c in $(ls -1dt "$HARNESS_PIN_DIR"/*/ 2>/dev/null); do
+    # ⛔ READ THE LISTING LINE BY LINE. `for c in $(ls -1dt …)` WORD-SPLITS on whitespace, so one pin
+    # directory whose path contains a space splits into two candidates — and the first fragment can
+    # still pass `layer_ok` as a parent and be pinned from. A process substitution keeps both the
+    # listing and the assignment in THIS shell (no subshell), so `best` survives the loop.
+    while IFS= read -r c; do
       [ -d "$c" ] || continue
       layer_ok "$c" || continue
       best="${c%/}"; break
-    done
+    done < <(ls -1dt "$HARNESS_PIN_DIR"/*/ 2>/dev/null)
     if [ -n "$best" ]; then printf '%s\n' "$(git -C "$best" rev-parse --show-toplevel 2>/dev/null)"; return 0; fi
   fi
   if layer_ok "$HARNESS"; then printf '%s\n' "$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null)"; return 0; fi
@@ -140,9 +178,11 @@ supervisor_in() {
   if [ -f "$t/orchestrator-harness/cloud-cell-supervisor.sh" ]; then
     printf '%s\n' "$t/orchestrator-harness/cloud-cell-supervisor.sh"; return 0
   fi
-  if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/cloud-cell-supervisor.sh" ]; then
-    printf '%s\n' "$SELF_DIR/cloud-cell-supervisor.sh"; return 0
-  fi
+  # ⛔ NO `$SELF_DIR` ARM. There was one, and it was a FALSE GREEN: it let a supervisor from THIS
+  # file's own directory (a /tmp copy, a lane worktree, any tree at all) stand in for the resolved
+  # layer, so the suite's "the pass follows .harness-path" leg passed through a supervisor belonging
+  # to a DIFFERENT tree than the one being pinned — exactly the property the leg claimed to test.
+  # A layer with no supervisor is a named RED (`loud 2 no-supervisor`), not a borrowed verb.
   return 1
 }
 
@@ -156,6 +196,33 @@ pinned_head() {
   local pin; pin="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
   [ -n "$pin" ] || return 1
   git -C "$pin" rev-parse HEAD 2>/dev/null
+}
+
+# mend_record <target> — repoint a MISSING/EMPTY record at the tree `apply` just created for <target>.
+# ⛔ WHY THIS EXISTS, precisely: `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch
+# (cloud-cell-supervisor.sh:1926 sets `HARNESS_APPLIED=unchanged` for a pin already at the tip; :1949 is
+# the only write). So `apply --force --pin-only` on a box whose record was lost exits 0, writes NOTHING
+# and reports `unchanged` — leaving this pass reading an empty record on every tick, for ever. That is
+# #3133 (merged) one layer up: an unhealable RED is as useless as a false GREEN, and the recorded answer
+# is the one `harness-apply-pass.sh` already uses — MEND the record to what the box actually runs, and
+# report it with the code that vocabulary already owns (11, `mended`).
+# ⛔ AND IT MENDS ONLY FROM THE PIN ROOT. The tree it records is the per-commit worktree `apply` itself
+# created for <target> (`$HARNESS_PIN_DIR/<sha12>`), exactly as `harness_apply` would have named it —
+# never an operator's ad-hoc checkout, and never a tree that is not AT the target.
+mend_record() {
+  local target="$1" cand top
+  [ -n "$target" ] || return 1
+  cand="$HARNESS_PIN_DIR/$(printf '%s' "$target" | cut -c1-12)"
+  layer_ok "$cand" || return 1
+  [ "$(git -C "$cand" rev-parse HEAD 2>/dev/null)" = "$target" ] || return 1
+  top="$(git -C "$cand" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ -n "$top" ] && [ -d "$top/scripts/orchestrator-harness" ] || return 1
+  mkdir -p "$(dirname "$HARNESS_PIN_FILE")" 2>/dev/null || true
+  # The record names the HARNESS DIR, not the tree: that is the value `harness_apply` writes and the one
+  # `start` execs ($HARNESS/orch-loop.sh). Writing the toplevel instead would "heal" the record into a
+  # shape the controller cannot use.
+  printf '%s\n' "$top/scripts/orchestrator-harness" >"$HARNESS_PIN_FILE" 2>/dev/null || return 1
+  return 0
 }
 
 do_pass() {
@@ -181,6 +248,7 @@ do_pass() {
   if [ -z "$applied" ]; then
     log "no readable pin record at ${HARNESS_PIN_FILE} -- applying (a pin nobody can read is not a pin)"
   elif [ "$target" = "$applied" ]; then
+    record_outcome "current ${target} (no-op)"
     log "current ${target} (no-op)"; return 0
   else
     log "DRIFT pinned=${applied} target=${target} -- applying --force --pin-only"
@@ -192,6 +260,7 @@ do_pass() {
   # version-skew generator. This pass only advances the pin; the next `start` seeds from it.
   bash "$sup" apply --force --pin-only >"$O/self-pin-apply.log" 2>&1; rc=$?
   if [ "$rc" -ne 0 ]; then
+    record_outcome "apply-failed rc=${rc} via ${sup}"
     err "APPLY-FAILED rc=${rc} via ${sup}"
     if [ -f "$O/self-pin-apply.log" ]; then
       err "  see ${O}/self-pin-apply.log"
@@ -205,36 +274,69 @@ do_pass() {
   # whole change depends on. An UNMOVED record stays RED (that is #3194's own shape).
   now="$(pinned_head)"
   if [ -z "$now" ]; then
-    err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} names nothing readable -- an exit code is not a convergence"
+    # ⛔ A LOST RECORD MUST NOT BE A PERMANENT, UNHEALABLE RED. `cloud-cell-supervisor.sh`'s
+    # `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch (`:1926`/`:1949`), so a
+    # pin that is ALREADY at the tip takes `HARNESS_APPLIED=unchanged` and the record is never written.
+    # A cell whose record was lost therefore reads an empty record every tick and REDs for ever on a
+    # box that is in fact correct — the #3133 defect (merged), reproduced one layer up. The recorded
+    # answer for exactly this state already exists in `harness-apply-pass.sh`: MEND the record to what
+    # the box actually runs, and say so with its own exit code, 11 (`mended`).
+    if mend_record "$target"; then
+      now="$(pinned_head)"
+      log "mended: the pin RECORD was missing/empty and now names ${now} (the tree apply created for ${target})"
+      record_outcome "mended ${now} (record was missing; now names the tree apply created)"
+      exit 11
+    fi
+    record_outcome "stale-record (apply exited 0, ${HARNESS_PIN_FILE} names nothing readable, and no tree under ${HARNESS_PIN_DIR} could be recorded)"
+    err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} names nothing readable, and no tree under ${HARNESS_PIN_DIR} is at ${target} to mend it to -- an exit code is not a convergence"
     exit 1
   fi
   if [ "$now" = "$applied" ] && [ "$now" != "$target" ]; then
+    record_outcome "stale-record (${now} unmoved; ${HARNESS_REF} is ${target})"
     err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} still names '${now}' while ${HARNESS_REF} is '${target}' -- an exit code is not a convergence"
     exit 1
   fi
   if ! git -C "$repo" merge-base --is-ancestor "$target" "$now" 2>/dev/null; then
+    record_outcome "stale-record (${now} does not contain ${target})"
     err "STALE-RECORD: the record names '${now}', which does not contain the ref tip '${target}' -- a pin that is not on the ref's line is not a pin"
     exit 1
   fi
+  record_outcome "applied -> ${now}"
   log "applied -> ${now} (record verified; ctrl=$(systemctl is-active eldato-orchestrator 2>/dev/null); note: a RUNNING controller keeps the layer it started on until it is restarted)"
   return 0
 }
 
-do_status() {
-  local layer sup target
-  printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n' \
+do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
+  local layer sup target mode="${1:-fetch}" last="<none recorded>"
+  [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
+  printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
-    "$HARNESS_PIN_DIR" "$(pinned_head || echo '<unreadable>')" "$STAMP" "$(read_stamp || true)"
+    "$HARNESS_PIN_DIR" "$(pinned_head || echo '<unreadable>')" "$STAMP" "$(read_stamp || true)" "${last:-<empty record>}"
   if layer="$(resolve_layer)"; then
     printf '  resolved layer %s\n' "$layer"
     sup="$(supervisor_in "$layer" && true)"; printf '  supervisor     %s\n' "${sup:-<none>}"
+    # ⛔ A STATUS THAT DOES NOT FETCH IS BLIND IN THE EXACT STATE THIS FILE EXISTS TO CATCH. #3194 was
+    # a pin RECORD that disagreed with the layer the cell executed for ~a day: "current" against a
+    # stale local `origin/main` is that same lie with a green verdict, so the ref is FETCHED here and
+    # the reading SAYS which of the two it is. `--dry-run` stays the verb that touches nothing; a failed
+    # fetch is reported as possibly stale, never as current-but-unverified silence.
+    case "$mode" in
+      nofetch) printf '  (%s NOT fetched — the reading below may be STALE)\n' "$HARNESS_REF" ;;
+      *) if git -C "$layer" fetch -q origin main 2>/dev/null; then
+           printf '  (%s fetched just now)\n' "$HARNESS_REF"
+         else
+           printf '  (git fetch FAILED in %s — the reading below may be STALE; this is not a green)\n' "$layer"
+         fi ;;
+    esac
     target="$(git -C "$layer" rev-parse "$HARNESS_REF" 2>/dev/null)"; printf '  %s %s\n' "$HARNESS_REF" "${target:-<unreadable>}"
-    if [ -n "${target:-}" ] && [ "${target:-}" = "$(pinned_head)" ]; then printf '  verdict        current\n'
-    else printf '  verdict        DRIFT (a RUNNING controller keeps the layer it started on until restarted)\n'; fi
+    # ⛔ 1 FOR DRIFT, NOT 0. `scripts/check-deployed-drift.sh` already speaks `0 match / 1 drift /
+    # 2 unknown`; a status verb that reports DRIFT and exits 0 cannot be gated on by anything, which is
+    # how a third drift dialect (#1178) is born. Nothing here re-decides the vocabulary.
+    if [ -n "${target:-}" ] && [ "${target:-}" = "$(pinned_head)" ]; then printf '  verdict        current\n'; return 0; fi
+    printf '  verdict        DRIFT (a RUNNING controller keeps the layer it started on until restarted)\n'; return 1
   else
     printf '  resolved layer <UNRESOLVED — this is a RED, see --status output above>\n'; return 2
   fi
-  return 0
 }
 
 # ── --install ────────────────────────────────────────────────────────────────────────────────────
@@ -242,27 +344,38 @@ sed_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 say() { printf '%s\n' "$*"; }
 bad() { printf 'REFUSING: %s\n' "$*" >&2; }
 
-# pin_script_for_unit — the absolute path the unit's ExecStart names.
-# pin_script_for_unit [place] — the absolute path the unit's ExecStart names.
-# ⛔ IT MUST LIVE UNDER $CELL_HOME, AND IT IS ALWAYS (RE)PLACED THERE. Two bugs live in the first version
-# of this function, both measured in review:
-#   (a) Naming the running copy is a path outliving nothing — rendering from a lane worktree produced
-#       `ExecStart=/bin/bash /home/…/.worktrees/ai-3194/scripts/cell-self-pin.sh`, and the worktree is
-#       PRUNED when the lane merges, leaving 203/EXEC every tick.
-#   (b) An `[ -f "$dest" ] && return` early-exit means a FIXED pass never reaches the box — install once,
-#       then re-install from a newer checkout, and the unit keeps the old bytes. That is verbatim #3194
-#       ("deployed code that was never deployed") reproduced inside its own fix, silently.
-# So the copy is UNCONDITIONAL, which also makes the install idempotent in the useful direction.
-pin_script_for_unit() {
+# pin_script_path — the absolute path the unit's ExecStart names, **COMPUTED AND NEVER WRITTEN**.
+# ⛔ IT MUST LIVE UNDER $CELL_HOME, and that is a bug fix of its own: naming the RUNNING copy is a path
+# that outlives nothing — rendering from a lane worktree produced
+# `ExecStart=/bin/bash /home/…/.worktrees/ai-3194/scripts/cell-self-pin.sh`, and the worktree is PRUNED
+# when the lane merges, leaving 203/EXEC every tick. `$CELL_HOME` is the one root a running cell keeps.
+# ⛔ AND IT IS SPLIT FROM PLACEMENT, because a RENDER must write nothing. `--print-unit` is documented
+# as a render-only verb and it wrote a file (and failed outright on a read-only $CELL_HOME), and a
+# REFUSED `--install` had already replaced the placed copy before `verify_unit` could refuse. Both
+# verbs now render the SAME path; only `--install` places it, and only after verification.
+pin_script_path() {
   local dest="$CELL_HOME/.pi/agent/scripts/cell-self-pin.sh" src
   src="${SELF_DIR:-}/$(basename "${BASH_SOURCE[0]}")"
-  if [ ! -f "$src" ] && [ -f "${SELF_DIR:-}/cell-self-pin.sh" ]; then src="${SELF_DIR}/cell-self-pin.sh"; fi
-  [ -f "$src" ] || { err "cannot find the pass to install beside itself (looked in ${SELF_DIR:-<unknown>})"; return 1; }
-  if [ "$src" != "$dest" ]; then
-    mkdir -p "$(dirname "$dest")" || { err "cannot create $(dirname "$dest")"; return 1; }
-    install -m 0755 "$src" "$dest" || { err "cannot place the pass at $dest"; return 1; }
-  fi
+  [ -f "$src" ] || src="${SELF_DIR:-}/cell-self-pin.sh"
+  [ -n "${SELF_DIR:-}" ] && [ -f "$src" ] \
+    || { err "cannot find the pass to install beside itself (looked in ${SELF_DIR:-<unknown>})"; return 1; }
   printf '%s\n' "$dest"
+}
+
+# place_pass <dest> — put THIS file's bytes at <dest>, UNCONDITIONALLY.
+# ⛔ UNCONDITIONAL, and that is a measured fix: an `[ -f "$dest" ] && return` early-exit meant
+# install-once-then-reinstall-from-a-newer-checkout kept the OLD bytes — verbatim #3194 ("deployed code
+# that was never deployed") reproduced inside its own fix, silently. Called by `--install` AFTER
+# verification, NEVER by the renderer.
+place_pass() {
+  local dest="$1" src
+  src="${SELF_DIR:-}/$(basename "${BASH_SOURCE[0]}")"
+  [ -f "$src" ] || src="${SELF_DIR:-}/cell-self-pin.sh"
+  [ -f "$src" ] || { err "cannot find the pass to place (looked in ${SELF_DIR:-<unknown>})"; return 1; }
+  [ "$src" = "$dest" ] && return 0
+  mkdir -p "$(dirname "$dest")" || { err "cannot create $(dirname "$dest")"; return 1; }
+  install -m 0755 "$src" "$dest" || { err "cannot place the pass at $dest"; return 1; }
+  return 0
 }
 
 print_unit() { # [dest-dir] — render both units into a directory, or stdout when no dir is given
@@ -274,7 +387,11 @@ print_unit() { # [dest-dir] — render both units into a directory, or stdout wh
   done
   [ -n "${TEMPLATES_DIR:-}" ] && [ -f "$TEMPLATES_DIR/cell-self-pin.service" ] \
     || { bad "cannot find cell-self-pin.service in any template dir (tried TEMPLATES_DIR, ${SELF_DIR%/scripts}/templates/systemd, $CELL_HOME/.pi/agent/templates/systemd)"; return 1; }
-  script="$(pin_script_for_unit)" || { bad "cannot locate an installed cell-self-pin.sh to exec"; return 1; }
+  script="$(pin_script_path)" || { bad "cannot locate the pass this unit would exec"; return 1; }
+  # ⛔ A RENDER SAYS WHAT IT DID NOT DO. The rendered unit names a path that `--install` places; a
+  # render that silently printed a unit naming a file it did not create would be the same class of
+  # half-truth as the unit this file replaces. stderr, so stdout stays the artifact.
+  [ -n "$dest" ] || [ -f "$script" ] || err "note: ${script} is not placed yet — this is a RENDER; '--install' places it and the units"
   user="$(id -un)"; home="$HOME"
   for tpl in cell-self-pin.service cell-self-pin.timer; do
     if [ -n "$dest" ]; then
@@ -298,75 +415,182 @@ print_unit() { # [dest-dir] — render both units into a directory, or stdout wh
   return 0
 }
 
+# ── a unit reader that speaks systemd's own syntax ──────────────────────────────────────────────────
+# directive <body> <Name> — every value of <Name>= in the unit body, one per line, in file order.
+# declares   <body> <Name> — true when the directive is present AT ALL (even with an empty value).
+# ⛔ WHITESPACE-TOLERANT IN BOTH POSITIONS, AND THAT IS A FAIL-OPEN FIX, NOT TIDINESS. systemd's parser
+# strips whitespace before a directive NAME and around the `=`, so `Name=value`, ` Name=value` and
+# `Name = value` are the SAME directive to the manager. A matcher anchored on column 0 with a literal
+# `Name=` is therefore blind to two spellings systemd honours. MEASURED in review, both live:
+#   · `WorkingDirectory = /srv/harness-current` / `ExecStart = /bin/bash /srv/nowhere/evil.sh` /
+#     `ConditionPathExists = /srv/nope` → `--install` returned 0 and wrote all three;
+#   · an INDENTED second `ExecStart=` → not counted, so the count rule, the $CELL_HOME prefix check and
+#     the `/tmp/cell-ai` token check all inspected only the first, legitimate line.
+# The repo's own unit reader already parses this way (`scripts/orchestrator-harness/harness-roles.sh`:
+# `sed -n 's/^[[:space:]]*ExecStart=//p'`), so this is one spelling of one rule, not a third dialect.
+directive() {
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p"
+}
+declares() {
+  local hit
+  hit="$(printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*.*/x/p")"
+  [ -n "$hit" ]
+}
+
 verify_unit() { # <rendered service> — the properties the ISSUE names, asserted on the ARTIFACT
-  local f="$1" body exec_path
+  local f="$1" body exec_path n_exec execs envs ok_vals v w seen0=0
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
   # next reader to delete the only explanation of why the line is banned. Strip comments first.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
   # ⛔ THE DEFECT ITSELF, AS AN INVARIANT: a rendered pin unit must carry NO bootstrap-only path, AS A
   # TOKEN — not merely after `=` or at line start. `ExecStart=/bin/bash /tmp/cell-ai/scripts/…` puts a
-  # SPACE before the path, and that is the reachable form: `pin_script_for_unit`'s fallback is whatever
+  # SPACE before the path, and that is the reachable form: the placed copy's fallback is whatever
   # checkout the installer ran from, which on a provisioning box is exactly the bootstrap clone.
-  if printf '%s\n' "$body" | grep -qE '(^|[[:space:]=])/(var/)?tmp/cell-ai(/|[[:space:]]|$)'; then
+  if [[ $body =~ (^|[[:space:]=])/(var/)?tmp/cell-ai(/|[[:space:]]|$) ]]; then
     bad "a rendered directive names the provisioning clone (/tmp/cell-ai) — that path is absent on a running cell and systemd fails the unit at CHDIR before any payload runs (#3194)"; return 1
   fi
-  # ⛔ AND THE EXECSTART MUST LIVE UNDER $CELL_HOME. Any other absolute path can be pruned out from under
-  # the unit (a lane worktree, a bootstrap clone); $CELL_HOME is the one root a running cell keeps.
-  # ⛔ EVERY ExecStart, AND EXACTLY ONE. `Type=oneshot` permits REPEATED `ExecStart=` and systemd runs all
-  # of them, so checking only the first line let an injected second one install green — a fail-open in
-  # the one rule this change exists to enforce (measured in review: legit line first, appended
-  # `ExecStart=/bin/bash /srv/nowhere/…` → `--install` returned 0 and both lines landed).
-  local n_exec; n_exec="$(printf '%s\n' "$body" | grep -c '^ExecStart=')"
+  # ⛔ EVERY ExecStart, AND EXACTLY ONE — counted and read in EVERY spelling systemd accepts
+  # (`ExecStart=`, ` ExecStart=`, `ExecStart = `). `Type=oneshot` permits REPEATED `ExecStart=` and
+  # systemd runs all of them, so a guard that inspects only the first line installs an executable
+  # directive it never saw. Measured in review: a legitimate line first plus an appended
+  # `ExecStart=/bin/bash /srv/nowhere/…` installed green (rc=0, both lines written).
+  execs="$(directive "$body" ExecStart)"
+  n_exec=0
+  [ -z "$execs" ] || n_exec="$(printf '%s\n' "$execs" | wc -l | tr -d ' ')"
   if [ "$n_exec" -ne 1 ]; then
     bad "the rendered unit declares ${n_exec} ExecStart= lines — exactly one is installable (systemd runs them ALL, so a second one is an unverified executable directive)"; return 1
   fi
-  exec_path="$(printf '%s\n' "$body" | sed -n 's|^ExecStart=/bin/bash \(.*\)$|\1|p')"
-  if [ -z "$exec_path" ]; then
-    bad "the rendered unit's ExecStart is not '/bin/bash <absolute script>'"; return 1
-  fi
+  exec_path="$execs"
+  case "$exec_path" in
+    "/bin/bash "*) exec_path="${exec_path#/bin/bash }" ;;
+    *) bad "the rendered unit's ExecStart is not '/bin/bash <absolute script>' (it is '${exec_path}') — a oneshot has no shell to resolve one"; return 1 ;;
+  esac
+  # ⛔ AND IT MUST LIVE UNDER $CELL_HOME. Any other absolute path can be pruned out from under the unit
+  # (a lane worktree, a bootstrap clone); $CELL_HOME is the one root a running cell keeps.
   case "$exec_path" in
     "$CELL_HOME"/*) ;;
     *) bad "ExecStart names '${exec_path}', which is NOT under CELL_HOME ('${CELL_HOME}') — a path outside the one home can be pruned out from under the unit, which is the failure this change exists to remove (203/EXEC every tick)"; return 1 ;;
   esac
-  if [ ! -f "$exec_path" ]; then
-    bad "ExecStart names '${exec_path}', which does not exist — the unit would fail 203/EXEC before any payload runs"; return 1
-  fi
   # ⛔ AND THE UNIT MUST CARRY THE SAME BASE THE EXECSTART USES. The service manager's HOME is not the cell
   # home, so a unit that carried only `HOME=` left the pass defaulting CELL_HOME from an unrelated value
   # while its ExecStart sat under the real one — measured: the pass then read `$HOME/.harness-path` while
   # the controller read `$CELL_HOME/.harness-path`, i.e. it pinned a tree the controller never runs.
-  if ! printf '%s\n' "$body" | grep -qxF "Environment=CELL_HOME=${CELL_HOME}"; then
-    bad "the rendered unit does not carry 'Environment=CELL_HOME=${CELL_HOME}' — without it the pass derives its base from the service manager's HOME and can read a DIFFERENT pin record than the controller"; return 1
-  fi
+  envs="$(directive "$body" Environment)"
+  case $'\n'"$envs"$'\n' in
+    *$'\n'"CELL_HOME=${CELL_HOME}"$'\n'*) ;;
+    *) bad "the rendered unit does not carry 'Environment=CELL_HOME=${CELL_HOME}' — without it the pass derives its base from the service manager's HOME and can read a DIFFERENT pin record than the controller"; return 1 ;;
+  esac
   # ⛔ AND IT MUST NOT DECLARE A WORKING DIRECTORY AT ALL. Any absolute path here is a bootstrap-time
-  # value outliving its directory; the pass `cd`s itself after resolving the layer.
-  if printf '%s\n' "$body" | grep -qE '^[[:space:]]*WorkingDirectory='; then
+  # value outliving its directory; the pass `cd`s itself after resolving the layer. `declares` (not a
+  # value read) so `WorkingDirectory=` with an empty or continued value cannot slip past.
+  if declares "$body" WorkingDirectory; then
     bad "the rendered unit declares WorkingDirectory= — one directive that refuses to start the unit when the directory is gone (EXIT_CHDIR 200); drop it and let the pass resolve its own cwd"; return 1
   fi
   # A skipped CONDITION is a green no-op — see the header. Refuse it on the artifact.
-  if printf '%s\n' "$body" | grep -qE '^[[:space:]]*ConditionPathExists='; then
+  if declares "$body" ConditionPathExists; then
     bad "the rendered unit declares ConditionPathExists= — a failed condition SKIPS the unit and leaves it green; the missing-layer case must be a RED payload exit, not a skip"; return 1
   fi
-  printf '%s\n' "$body" | grep -qxF 'SuccessExitStatus=0' || { bad "the rendered unit must declare SuccessExitStatus=0 (only 0 is green)"; return 1; }
+  # ⛔ ONLY THE PASS'S OWN SUCCESS CODES ARE GREEN. 0 = current/applied and 11 = mended are the whole
+  # success vocabulary (`harness-apply-pass.sh`'s recorded codes, adopted rather than re-invented); any
+  # other value would green a failure, which is the false PASS #3194 is about.
+  ok_vals="$(directive "$body" SuccessExitStatus)"
+  [ -n "$ok_vals" ] || { bad "the rendered unit must declare SuccessExitStatus=… — a non-zero exit is how this pass goes RED"; return 1; }
+  while IFS= read -r v; do
+    for w in $v; do
+      case "$w" in
+        0)  seen0=1 ;;
+        11) ;;
+        *)  bad "SuccessExitStatus lists '${w}', which is neither 0 (current/applied) nor 11 (mended) — a wider list greens a failure"; return 1 ;;
+      esac
+    done
+  done <<<"$ok_vals"
+  [ "$seen0" -eq 1 ] || { bad "SuccessExitStatus must include 0 — 'current' and 'applied' are only green as 0"; return 1; }
   return 0
 }
 
-do_install() {
-  local unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u
+# ── one actuator per pin, in BOTH systemd managers ──────────────────────────────────────────────────
+# ⛔ BARE `systemctl` IS THE SYSTEM MANAGER ONLY, and the sibling installer this file names as the one
+# to keep NEGOTIATES THE SCOPE: `install-harness-apply-timer.sh` falls back to `systemctl --user` /
+# `$HOME/.config/systemd/user` when passwordless sudo does not answer, and `install-cell-timers.sh`
+# does the same. On such a box `systemctl is-enabled eldato-harness-apply.timer` answers "no", the guard
+# stays silent, and `--install` puts TWO mutating actors on one pin — precisely the race the guard's own
+# comment says it exists to prevent. So ask BOTH, and NAME the scope that answered.
+actuator_scope() { # prints "system" | "user" when eldato-harness-apply.timer is ENABLED
+  systemctl is-enabled eldato-harness-apply.timer >/dev/null 2>&1 && { printf 'system\n'; return 0; }
+  systemctl --user is-enabled eldato-harness-apply.timer >/dev/null 2>&1 && { printf 'user\n'; return 0; }
+  return 1
+}
+actuator_enabled_in() { # <scope>
+  case "$1" in
+    system) systemctl is-enabled eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    user)   systemctl --user is-enabled eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
+}
+# retire_actuator <scope> — RETIRE the shipped timer, explicitly. This is the one-actor decision, taken.
+# ⛔ VERIFIED, NOT ASSUMED: a `disable` that did not take leaves exactly the state this whole guard exists
+# to prevent, so the refusal is on the READ-BACK, not on the exit code.
+retire_actuator() {
+  local scope="$1"
+  case "$scope" in
+    user)   systemctl --user disable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    system) systemctl disable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac || { bad "could not disable eldato-harness-apply.timer in the ${scope} manager — REFUSING to install a second actuator beside one I cannot retire (that is the race, not redundancy)"; return 1; }
+  if actuator_enabled_in "$scope"; then
+    bad "eldato-harness-apply.timer still reads ENABLED in the ${scope} manager after 'disable --now' — REFUSING: two mutating actors on one pin is a race, not redundancy"; return 1
+  fi
+  say "  RETIRED eldato-harness-apply.timer (${scope} manager) — ONE actuator on this pin, as --takeover declares"
+  return 0
+}
+
+do_install() { # [--takeover]
+  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u scope script
+  case "$takeover" in
+    ""|--takeover) ;;
+    *) bad "unknown argument '${takeover}' to --install (only --takeover is accepted)"; return 64 ;;
+  esac
+  # ⛔ A SCOPE THIS FILE DOES NOT RENDER IS A COMPLETE REFUSAL, never a half-install. It writes SYSTEM
+  # units only; on a box with no system manager (or where the manager cannot be reached) it says so and
+  # writes nothing, instead of leaving units that nothing will ever load — which is how "installed"
+  # becomes a claim with no mechanism behind it.
+  if [ -z "${SYSTEMD_UNIT_DIR:-}" ] && ! systemctl show-environment >/dev/null 2>&1; then
+    bad "no systemd SYSTEM manager on this box ('systemctl show-environment' did not answer) — this unit is rendered for the system scope only, so REFUSING rather than writing units nothing will load. Target a manager you mean to install into with SYSTEMD_UNIT_DIR."
+    return 1
+  fi
   tmp="$(mktemp -d)" || { bad "mktemp failed"; return 1; }
+  # ⛔ RENDER → VERIFY → PLACE → INSTALL, in that order, and the order is the fix. Placement used to
+  # happen inside the renderer, so a REFUSED install had already replaced the placed pass, and
+  # `--print-unit` wrote a file. Verification now runs against the artifact BEFORE anything is written.
   print_unit "$tmp" || { err "refusing: the units could not be rendered (reason above)"; rm -rf "$tmp"; return 1; }
   verify_unit "$tmp/cell-self-pin.service" || { err "refusing: the rendered cell-self-pin.service failed verification (reason above)"; rm -rf "$tmp"; return 1; }
+  script="$(pin_script_path)" || { err "refusing: cannot locate the pass this unit would exec"; rm -rf "$tmp"; return 1; }
+  place_pass "$script" || { err "refusing: the pass could not be placed at $script"; rm -rf "$tmp"; return 1; }
+  [ -f "$script" ] || { bad "the unit names '${script}' and it does not exist after placement — the unit would fail 203/EXEC before any payload runs"; rm -rf "$tmp"; return 1; }
   # ⛔ ONE ACTUATOR PER PIN. `eldato-harness-apply.timer` already advances this box's harness on the same
-  # 10-minute clock (#2416), and two mutating actors on one pin is a race, not redundancy. Refuse — and
-  # name which one to keep — instead of silently installing a second one.
-  if [ -z "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ] \
-     && systemctl is-enabled eldato-harness-apply.timer >/dev/null 2>&1; then
-    bad "eldato-harness-apply.timer is ENABLED on this box and already advances the harness on a ten-minute clock — two pin actuators race on one pin. Keep ONE: 'scripts/install-harness-apply-timer.sh --install' (the shipped, tested one) supersedes this unit; disable it first, or set CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 to override deliberately."
-    rm -rf "$tmp"; return 1
+  # 10-minute clock (#2416), and two mutating actors on one pin is a race, not redundancy. The guard asks
+  # BOTH managers, NAMES the scope it saw, and `--takeover` is the one-actor migration that retires it.
+  if scope="$(actuator_scope)"; then
+    case "$takeover" in
+      --takeover)
+        say "installing into $unit_dir (retiring the duplicate actuator in the ${scope} manager first)"
+        retire_actuator "$scope" || { rm -rf "$tmp"; return 1; }
+        ;;
+      *)
+        if [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
+          say "  WARNING: eldato-harness-apply.timer is ENABLED (${scope} manager) and CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR is set — two actuators on one pin, deliberately"
+        else
+          bad "eldato-harness-apply.timer is ENABLED in the ${scope} manager and already advances this harness on a ten-minute clock — two pin actuators race on one pin. Keep ONE: run '$0 --install --takeover' to RETIRE it and install this unit, or keep 'scripts/install-harness-apply-timer.sh --install' (the shipped, tested one) and do not install this one, or set CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 to override deliberately."
+          rm -rf "$tmp"; return 1
+        fi
+        ;;
+    esac
+  else
+    [ "$takeover" = --takeover ] && say "  (--takeover given, and no eldato-harness-apply.timer is enabled — nothing to retire)"
   fi
+  [ "$takeover" = --takeover ] || say "installing into $unit_dir"
   mkdir -p "$unit_dir" 2>/dev/null || { bad "cannot create $unit_dir"; rm -rf "$tmp"; return 1; }
-  say "installing into $unit_dir"
   for u in cell-self-pin.service cell-self-pin.timer; do
     if [ -f "$unit_dir/$u" ] && cmp -s "$tmp/$u" "$unit_dir/$u"; then say "  $u unchanged"; continue; fi
     install -m 0644 "$tmp/$u" "$unit_dir/$u" || { bad "cannot write $unit_dir/$u"; rc=1; continue; }
@@ -384,9 +608,14 @@ do_install() {
 case "${1:---pass}" in
   --pass|"")      do_pass ;;
   --dry-run)      do_pass dry ;;
-  --status)       do_status ;;
+  --status)       do_status fetch ;;
+  --status-nofetch) do_status nofetch ;;
   --print-unit)   print_unit ;;
-  --install)      do_install ;;
-  --help|-h)      sed -n '2,68p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  --install)      shift; do_install "${1:-}" ;;
+  --takeover)     err "--takeover is an argument to --install: '$0 --install --takeover'"; exit 64 ;;
+  # ⛔ THE RANGE IS DERIVED, NOT TYPED. `sed -n '2,68p'` cut mid-sentence and printed `set -u` plus the
+  # assignments once the header grew — a help screen that is a lie about the file. Print the leading
+  # comment block only, whatever its length is today.
+  --help|-h)      awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${BASH_SOURCE[0]}" ;;
   *)              err "unknown argument '$1' (try --help)"; exit 64 ;;
 esac
