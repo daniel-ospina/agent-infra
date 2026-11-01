@@ -212,6 +212,16 @@ CFS="$ROOT/scripts/ci-failure-set.sh"
 ADM="${ADMIN_MERGE_SUITE_ADM:-$ROOT/scripts/admin-merge.sh}"
 DETECTOR="$ROOT/.github/workflows/admin-merge-detector.yml"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
+# ⛔ THE SUITE MUST NOT TOUCH THE MACHINE-GLOBAL LEASE ROOT (#3194, review cycle 3 finding 5).
+# The rail now takes a per-PR lease; without this, every one of this suite's ~1843 rail
+# invocations would lease the REAL `$HOME/.pi/agent/state/rail-locks/agent-infra-42`, so two
+# concurrent suite runs on this box (routine: several lanes and reviewers per repo), or a live
+# rail on that key, would hit ALREADY-RAILING (exit 75) and cascade misleading failures — and
+# the suite would delete leases out of the directory a live rail depends on. Each suite run
+# gets its own root.
+ADMIN_MERGE_LOCK_ROOT="$TMP/rail-locks"
+export ADMIN_MERGE_LOCK_ROOT
+mkdir -p "$ADMIN_MERGE_LOCK_ROOT"
 checks=0
 failures=0
 # The two new windows default to "one observation, no waiting" for the WHOLE
@@ -15287,6 +15297,25 @@ if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ] || [ -f "$(dirnam
   else
     checks=$((checks + 1)); fail "(n) check-unresolved.sh FAILED — see its output above"
   fi
+fi
+
+# #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
+# file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is
+# executed by NOTHING (not even check-bash32-parse.sh, which only does a syntax check)
+# — the inert-enforcer class. That is exactly how the lease's remaining reclaim race
+# shipped green through five review cycles: the test existed and never ran.
+RAIL_EXIT_TEST="$(dirname "${BASH_SOURCE[0]}")/rail-exit.test.sh"
+# ⛔ A MISSING TEST FILE IS A FAILURE, NOT A SKIP (review cycle 6 finding 3). The previous
+# guard made a renamed, deleted or sparse-checkout-missing suite a NO-OP — no check
+# counted, no failure, green summary — which is the inert-enforcer class this very block's
+# comment invokes. And pass/fail ALREADY increment `checks`, so the previous explicit
+# increment counted this block TWICE in the denominator (finding 4).
+if [ ! -f "$RAIL_EXIT_TEST" ]; then
+  fail "(o) rail-exit.test.sh is MISSING at $RAIL_EXIT_TEST — the terminal-exit/lease/deadline regression guard did not run"
+elif bash "$RAIL_EXIT_TEST"; then
+  pass "(o) rail-exit.test.sh — terminal exit, whole-attempt deadline, per-PR lease"
+else
+  fail "(o) rail-exit.test.sh FAILED — see its output above"
 fi
 
 if [ "$failures" -gt 0 ]; then
