@@ -432,6 +432,19 @@ ck "(E) a syntax-broken script in the EXECUTED tree turns the row BROKEN" \
    "$(row selftest | grep -q 'BROKEN (failed: zz-broken.sh' && echo 0 || echo 1)"
 ck "(E) …and the verdict is BROKEN, not a remembered pass (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
 rm -f "$HARNESS/zz-broken.sh"
+# ⛔ #2930 — A TEST SUITE IS NOT RUNTIME, AND BLOCKING ON IT MADE A HEALTHY BOX UNSTARTABLE. `up`
+# refuses to start on a failed self-test, so a `*.test.sh` that cannot parse on THIS host (macOS is
+# bash 3.2.57; CI is 5.x) used to refuse the controller — the catch-22 #2930 reports, one level up
+# from `install.sh`. The control below is the point: the SAME defect in a runtime script is RED
+# (above) and in a test suite is NOT, so the split is measured rather than asserted in a comment.
+printf 'if [ -z "$x" ; then\n' > "$HARNESS/zz-broken.test.sh"
+run status
+tb_row="$(row selftest)"
+ck "(E) …while the SAME syntax error in a *.test.sh does NOT turn the row BROKEN (#2930) [$tb_row]" \
+   "$(lacks "$tb_row" 'BROKEN' && echo 0 || echo 1)"
+ck "(E) …and that suite is still NAMED in the row, so the failure is reported rather than swallowed" \
+   "$(has "$tb_row" 'zz-broken.test.sh' && echo 0 || echo 1)"
+rm -f "$HARNESS/zz-broken.test.sh"
 
 # ══ (F) SELF-HEAL: THE TWO SAFE REPAIRS, AND THE REFUSALS ═══════════════════════════════════════
 # (F1) A controller that is NOT running is STARTED — and it is the only authority called.
