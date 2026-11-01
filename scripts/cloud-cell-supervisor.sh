@@ -706,7 +706,20 @@ LOCK_START_SLACK_SECONDS=5
 #                 exclusion while the code implemented none — the defect, not a comment typo.
 #   3. CELL     — `/proc/<pid>/environ` carries `O=<our state dir>` (trailing slash normalised). This is
 #                 what keeps us inside #1761: a peer lane carries a DIFFERENT O and is never a candidate.
-#   4. IDENTITY — terms 1-3 are re-read immediately before EACH signal, so a recycled pid is neither
+#   4. OWNERSHIP — the process is NOT this state dir's lock owner. A controller that holds `$O/.orch.lock`
+#                 is THIS cell's controller whatever tree it executes, and a live one routinely executes an
+#                 OLDER pin tree: `harness-refresh` reports `restart-pending` precisely because "the running
+#                 controller still executes an older tree", and the previous pin "survives until `prune`
+#                 reclaims it". Such a process satisfies terms 1-3 — argv `<shell> <oldpin>/scripts/
+#                 orchestrator-harness/orch-loop.sh`, outside `$O/` AND outside the CURRENT `$HARNESS`,
+#                 with `O=` ours — so without this term `foreground_handover` would TERM/KILL the very
+#                 controller its wait loop exists to wait for, and in-flight landing work dies (review P0).
+#                 Ownership is the DISCRIMINATOR, not a pin-directory guess: #2095's leak is documented in
+#                 this file as "invisible to the ownership reads (foreign path, no lock)", so excluding the
+#                 lock owner cannot exclude a leak — while excluding every `<pinroot>/<sha>/…` tree WOULD
+#                 (the proof-run's leaked controller lives at exactly that shape), which is why the pin root
+#                 is deliberately NOT a term here.
+#   5. IDENTITY — terms 1-4 are re-read immediately before EACH signal, so a recycled pid is neither
 #                 TERMed nor KILLed.
 #
 # ⛔ THE SPLIT IS DELIBERATE. `_scan_controller_paths` is the portable half (a ps table in, `pid path`
@@ -740,7 +753,7 @@ _controller_env_state_dir() { # <pid>; the O= the process was EXEC'd with; rc 1 
 }
 
 _pid_is_foreign_root_leak() { # <pid> <script-path> <state-dir> <harness-or-empty>
-  local p="$1" path="$2" d="${3%/}" h="${4:-}" o
+  local p="$1" path="$2" d="${3%/}" h="${4:-}" o own rc
   h="${h%/}"
   # ⛔ THE ROOT TEST IS A PREFIX, NOT `$root/orch-loop.sh` (found LIVE on pi-cell-4, 2026-10-28). The
   # deployed controller is `<harness>/scripts/orchestrator-harness/orch-loop.sh`, so an equality test
@@ -752,6 +765,12 @@ _pid_is_foreign_root_leak() { # <pid> <script-path> <state-dir> <harness-or-empt
   if [ -n "$h" ]; then case "$path" in "$h"|"$h"/*) return 1 ;; esac; fi
   o="$(_controller_env_state_dir "$p")" || return 1
   [ "${o%/}" = "$d" ] || return 1
+  # ⛔ TERM 4: OWNERSHIP. Read AFTER the structural terms so the cheap tests short-circuit, and treat
+  # BOTH "rc 2 = age unreadable" and any other non-zero as NOT-A-LEAK — an ownership we cannot prove
+  # must never become a kill (the same fail-closed rule `lock_controller_pid` propagates elsewhere).
+  own="$(lock_controller_pid 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ "$own" != "$p" ] || return 1
   return 0
 }
 
@@ -2826,11 +2845,19 @@ cmd_start() {
   #     looking supervised forever.
   foreground_handover() {
     local _own _seen _saidd=0 _waited=0 _bound="${CONTROLLER_HANDOVER_TIMEOUT:-3600}" _session_cleared=0
-    # ⛔ REAP BEFORE THE LOOP: the loop's first act is to BREAK when nothing owns and no session
-    # exists — the state a cell is left in when its controller died — so an in-loop reap is
-    # unreachable in the case that matters. Scoped to OUR state dir (env O=), so a peer's controller
-    # is still refused, never killed (#2315 / #2095 / #1761).
-    reap_own_foreign_root_leaks "$O" || true
+    # ⛔ REAP BEFORE THE LOOP — BUT ONLY WHEN NOTHING OWNS THIS STATE DIR (review P0, #2315). The loop's
+    # first act is to BREAK when nothing owns and no session exists — the state a cell is left in when
+    # its controller died — so an in-loop reap is unreachable in the case that matters. What the reap
+    # must NEVER do is run while this cell's own controller is LIVE: that is exactly the `_own` the loop
+    # below waits on for up to `CONTROLLER_HANDOVER_TIMEOUT`, so a reap-first handover can shoot the
+    # controller it exists to wait for and in-flight landing work dies. TWO INDEPENDENT GUARDS close that
+    # hazard and both are needed: `_pid_is_foreign_root_leak`'s ownership term closes it for every
+    # candidate, and this gate closes it for the whole CALL — including any candidate the term cannot
+    # classify. Scoped to OUR state dir (env O=), so a peer's controller is still refused, never killed
+    # (#2315 / #2095 / #1761).
+    _own="$(owned_controller_pids 2>/dev/null)" \
+      || die "cannot read the process table (ps) — refusing to start on an unreadable read"
+    [ -n "$_own" ] || reap_own_foreign_root_leaks "$O" || true
 
     local _orphan_bound="${CONTROLLER_ORPHAN_TIMEOUT:-60}"
     while :; do
