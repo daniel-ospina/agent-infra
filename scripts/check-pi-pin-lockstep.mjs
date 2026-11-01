@@ -2625,12 +2625,15 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
   const onTarget = isMap(doc.on?.pull_request_target) ? doc.on.pull_request_target : {};
   // ⛔ `edited` WAS IN THIS SET AND IS NOT ANY MORE (agent-infra#3196). It was pinned
   // with no rationale, and the cost it carried was the whole reason #3196 exists:
-  // `scripts/record-review.sh` writes the reviewer attestation INTO THE PR BODY, so every
-  // recorded review was an `edited` activity that bought a full run of this leg — median
-  // 16.1 min of wall clock, for a diff that had not changed — and `pipeline-compliance`, the
-  // repo's ONLY required context, queues behind it. `opened` / `synchronize` / `reopened`
-  // are every event whose HEAD OR DIFF can change, and they are GitHub's own defaults for
-  // this event, so this list is now the default written out explicitly.
+  // `scripts/record-review.sh` writes the reviewer attestation INTO THE PR BODY, so every record
+  // that APPENDS the marker (`:3518-3532` PATCHes only while the marker is absent) was an `edited`
+  // activity that bought a full run of this leg — median 16.1 min of wall clock measured
+  // 2026-11-01, for a diff that had not changed — and `pipeline-compliance`, the repo's ONLY
+  // required context, queues behind it. `opened` / `synchronize` / `reopened` are every event that
+  // can change the HEAD, and they are GitHub's own defaults for this event, so this list is now the
+  // default written out explicitly. The fourth activity `edited` also covers — a BASE retarget,
+  // which does change the diff and the merge result — is owned by THE DECLARED RESIDUAL below, not
+  // by this sentence.
   //
   // WHAT THE REMOVAL DOES *NOT* BREAK, checked rather than assumed: `scripts/admin-merge.sh`'s
   // #1417 guard-generation wait (`GUARD_WORKFLOW_KEYS`, `settle_self_edit_generation`) still
@@ -2660,6 +2663,20 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
       `${rel}: an \`on.pull_request_target\` \`${k}\` filter can stop this leg from triggering`
     );
   }
+  // ⛔ AND THE SET OF TRIGGERS IS PINNED TOO. Pinning one trigger's filters is not enough: a SECOND
+  // trigger beside it re-opens everything the first one closes. Measured: adding
+  // `on.pull_request: types: [edited]` next to the pinned block left this suite (124/124), the
+  // `ci-trigger-scope` shard (33/33) AND the content lock green — `workflow-lock.yml` is not one of
+  // the three paths in `scripts/workflow-lock.json` — so `edited` came back one line away from the
+  // assertion that says it is gone. Every other object in this test is pinned by exact key set
+  // (`permissions` above, `jobs`, `step.env`); `on:` was the one that was not.
+  assert.deepEqual(
+    Object.keys(doc.on ?? {}).sort(),
+    ["pull_request_target"],
+    `${rel}: \`on:\` must declare EXACTLY \`pull_request_target\` — a second trigger re-opens the ` +
+      "coverage this pin closes (a `pull_request:` arm also collapses the trust split the header " +
+      "requires: the definition must come from the base branch)"
+  );
 });
 
 /** Timeout for each behavioural spawn of the workflow-lock step. */

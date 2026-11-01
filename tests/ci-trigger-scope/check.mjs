@@ -89,6 +89,23 @@ function onRegion(text, file) {
 
 const KEY_RE = /^([ \t]*)(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))[ \t]*:(.*)$/;
 
+// onKeys(region, childIndent) — the trigger NAMES declared under `on:`.
+//
+// ⛔ WHY THE `on:` KEY SET IS PINNED TOO (review of the last delta, P2). Pinning a trigger's own
+// filter keys is not enough: a SECOND trigger added beside it re-opens everything the first one
+// closes. Measured before this: adding `on.pull_request: types: [edited]` next to a correctly
+// pinned `pull_request_target:` left every suite green (the pin suite 124/124, this shard 33/33,
+// and the content lock untouched — `workflow-lock.yml` is not one of the three locked paths), so
+// `edited` was silently re-addable one line away from the assertion that says it is gone. A
+// `pull_request:` trigger on `workflow-lock.yml` would ALSO collapse its trust split.
+function onKeys(region, childIndent) {
+  return region
+    .filter((l) => l.indent === childIndent)
+    .map((l) => keyOf(l))
+    .filter((k) => k !== null)
+    .map((k) => k.key);
+}
+
 function keyOf(line) {
   const m = KEY_RE.exec(line.raw);
   if (!m) return null;
@@ -184,12 +201,25 @@ function extraFilters(keys, allowed) {
   return keys.map((k) => k.key).filter((k) => !allowed.includes(k));
 }
 
+// extraSet(names, allowed) — the same difference for a plain list of trigger NAMES.
+function extraSet(names, allowed) {
+  return names.filter((n) => !allowed.includes(n));
+}
+
 // ── the two facts this file owns ─────────────────────────────────────────────────────────────
 
 function checkWorkflowLock() {
   const text = read(WL_FILE);
   const { region, childIndent } = onRegion(text, WL_FILE);
   const t = trigger(region, childIndent, "pull_request_target", WL_FILE);
+
+  const onSet = onKeys(region, childIndent);
+  const extraOn = extraSet(onSet, ["pull_request_target"]);
+  if (extraOn.length) {
+    findings.push(
+      `workflow-lock.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`pull_request_target:\`. A SECOND trigger re-opens everything the first one closes — \`on.pull_request: types: [edited]\` would fire this leg on every body edit again, one line away from the assertion that says \`edited\` is gone, and it would also collapse this file's trust split (the definition must come from the base branch). The only trigger is \`pull_request_target:\`.`
+    );
+  }
 
   // ⛔ THIS TRIGGER CARRIES `types` AND NOTHING ELSE (review cycle 1, P2). `types` is a
   // `--head-ref`-style coverage knob; a `paths:`/`branches:` filter next to it is a NARROWING, and
@@ -227,7 +257,7 @@ function checkWorkflowLock() {
   }
   if (extra.length) {
     const why = extra.includes("edited")
-      ? "`edited` is the one this reduction exists to remove (#3196): `scripts/record-review.sh` writes the attestation into the PR BODY, so every recorded review buys a full run for a diff that did not change — a run that queues `pipeline-compliance`, the repo's only required context, behind it. The base-retarget coverage it also provided is a declared residual (see the workflow's trigger block); re-adding a per-edit trigger to recover it is the trade this decision rejected."
+      ? "`edited` is the one this reduction exists to remove (#3196): `scripts/record-review.sh` writes the attestation into the PR BODY, so every record that APPENDS the marker buys a full run for a diff that did not change — a run that queues `pipeline-compliance`, the repo's only required context, behind it. The base-retarget coverage it also provided is a declared residual (see the workflow's trigger block); re-adding a per-edit trigger to recover it is the trade this decision rejected."
       : "an unexpected activity type widens the trigger set, and a widened set cannot be told from the decided one.";
     findings.push(
       `workflow-lock.yml's \`types:\` carries UNEXPECTED [${extra.join(", ")}]. ${why}`
@@ -239,6 +269,14 @@ function checkHarnessSingleSource() {
   const text = read(HSS_FILE);
   const { region, childIndent } = onRegion(text, HSS_FILE);
   const t = trigger(region, childIndent, "pull_request", HSS_FILE);
+
+  const onSet = onKeys(region, childIndent);
+  const extraOn = extraSet(onSet, ["pull_request"]);
+  if (extraOn.length) {
+    findings.push(
+      `harness-single-source.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`pull_request:\`. A second trigger runs this job on a surface the path filter does not scope — \`pull_request_target:\` would run it privileged, and \`push:\` would run it on main for a diff no PR measured. The only trigger is \`pull_request:\`.`
+    );
+  }
 
   // ⛔ THIS TRIGGER CARRIES `paths` AND NOTHING ELSE (review cycle 2, P1 — the mirror of the
   // `workflow-lock` arm cycle 1 added). `types:` narrows coverage exactly as a path filter does, and
@@ -292,6 +330,15 @@ function checkPipelineComplianceUnchanged() {
   const text = read(PC_FILE);
   const { region, childIndent } = onRegion(text, PC_FILE);
   const t = trigger(region, childIndent, "pull_request", PC_FILE);
+
+  // `workflow_call` is legitimate here (consumers reuse this file); anything else is a new run site
+  // on the repo's only required context, and a `push:` arm would attach its verdict to main.
+  const extraOn = extraSet(onKeys(region, childIndent), ["workflow_call", "pull_request"]);
+  if (extraOn.length) {
+    findings.push(
+      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\` and \`pull_request:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
+    );
+  }
 
   // ⛔ AND NO PATH FILTER UNDER IT (review cycle 1, P1). This is the change the current sweep most
   // invites — "finish the job, filter the required check too" — and it is the one that hurts most:

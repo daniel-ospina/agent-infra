@@ -141,10 +141,13 @@ name: Workflow lock (base-branch checker)
 # work, and a 9 s job that waits 16 min IS a 16 min job; `pipeline-compliance`, the repo's only
 # required context, queues behind it.
 #
-# WHAT THE REMAINING THREE TYPES COVER. `opened`, `synchronize` and `reopened` are every event
-# whose HEAD OR DIFF can change — and they are also GitHub's own defaults for this event, so
-# this list is now the default in explicit form rather than a narrowing: a value that stops
-# running for a head it should have measured is not something to write implicitly.
+# WHAT THE REMAINING THREE TYPES COVER. `opened`, `synchronize` and `reopened` are every activity
+# that can change the HEAD, and they are also GitHub's own defaults for this event — so this list is
+# the default in explicit form rather than a narrowing: a value that stops running for a head it
+# should have measured is not something to write implicitly. The fourth thing `edited` covers — "the
+# base branch of a pull request was changed" (GitHub's own definition of the activity) — does change
+# the DIFF, and is the declared residual in the next paragraph rather than something this sentence
+# claims to cover.
 #
 # ⛔ THE DECISION ON THE BASE-BRANCH CASE, AND WHY IT IS NOT A `schedule:` SWEEP. `edited` also
 # fires when a PR's BASE is retargeted, and a base move changes the merge result this job

@@ -326,6 +326,41 @@ if apply_mutation "$PC" "$PC_SIBLING" \
   esac
 fi
 
+echo "== 7e. MUTANT: a SECOND \`on:\` trigger re-opening the same coverage =="
+# Review of the last delta, P2 — pinning a trigger's own filter keys is not enough. Measured before
+# this arm: \`on.pull_request: types: [edited]\` added beside the pinned \`pull_request_target:\` left
+# the pin suite (124/124), this shard (33/33) and the content lock all GREEN, so \`edited\` was
+# silently re-addable one line away from the assertion that says it is gone.
+WL_SECOND="$TMP/wl-second-trigger.yml"
+if apply_mutation "$WL" "$WL_SECOND" \
+  "  pull_request_target:
+    types: [opened, synchronize, reopened]" \
+  "  pull_request_target:
+    types: [opened, synchronize, reopened]
+  pull_request:
+    types: [edited]" \
+  "a second trigger must be constructible"; then
+  run_check 1 "a second \`on:\` trigger beside \`pull_request_target:\` is REFUSED" WL_FILE="$WL_SECOND"
+  case "$FINDINGS" in
+    *"declares [pull_request]"*) pass "the refusal NAMES the added trigger" ;;
+    *) fail "the refusal did not name the added trigger in its FINDING line" ;;
+  esac
+fi
+
+HSS_SECOND="$TMP/hss-second-trigger.yml"
+if apply_mutation "$HSS" "$HSS_SECOND" \
+  "      - '.github/workflows/harness-single-source.yml'" \
+  "      - '.github/workflows/harness-single-source.yml'
+  push:
+    branches: [main]" \
+  "a second trigger must be constructible"; then
+  run_check 1 "a \`push:\` trigger added to the single-source guard is REFUSED" HSS_FILE="$HSS_SECOND"
+  case "$FINDINGS" in
+    *"declares [push]"*) pass "the refusal NAMES the added trigger" ;;
+    *) fail "the refusal did not name the added trigger in its FINDING line" ;;
+  esac
+fi
+
 echo "== 8. ADMISSION: every path the doctor step can read is admitted =="
 # Each entry names the reader it belongs to. This list is the assertion: a filter that stops
 # admitting one of them is a coverage loss, and the mandate for this change is to err WIDE (#3001 —
