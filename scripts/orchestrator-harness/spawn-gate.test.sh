@@ -1365,12 +1365,65 @@ mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=some-future-verdict ho
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "an UNRECOGNISED refusal reason refuses (polarity, not an allow-list) (rc=$CRC)" $rc
-# (g) A VERDICT THAT NEVER CAME warns: a probe that could not run is not a verdict about the box.
+# (g) A VERDICT THAT NEVER CAME warns: a probe that could not RUN is not a verdict about the box.
+# ⛔ `rc=1` IS THE NO-PROBE CASE — the file could not be started at all. `rc=2` is a different
+# reading and is arm (g4) below.
 mkfake '' 1
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
 { [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
-ck "a probe that produced NO verdict at all WARNS and dispatches (rc=$CRC, agent ran)" $rc
+ck "a probe that produced NO verdict at all with rc=1 WARNS and dispatches (rc=$CRC, agent ran)" $rc
+# (g2) THE USAGE PATH MUST FAIL CLOSED (follow-up to #2991, P2, measured). This is the REAL probe, not
+# a fixture: `LANE_PREFLIGHT_BOUND=45s` made `die_usage` exit 2 with a stderr line and no stdout
+# verdict, the "no verdict" arm above took it, and the measured result was `rc=0, agent launched` —
+# a lane dispatched by a probe that never measured anything, one line under this file's own claim that
+# "rc=2 CANNOT MEASURE now refuses". The probe is fixed to emit `why=usage`; this arm pins that the
+# CALLER refuses on it, so the two halves cannot drift apart in either direction.
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 LANE_PREFLIGHT_BOUND=45s CELL_PREFLIGHT_SH="$HERE/cell-lane-preflight.sh"
+{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "an UNREADABLE usage path (bad \$LANE_PREFLIGHT_BOUND) is REFUSED, not dispatched (rc=$CRC)" $rc
+grep -q 'VERSION SKEW' "$LOG"; rc=$?
+ck "...and the remedy names what a usage error actually is — helper/consumer skew, not the extension set" $rc
+grep -q 'do NOT dispatch the item elsewhere' "$LOG"; rc=$?
+ck "...and says the refusal is NOT a box property, so a peer must not be handed the item" $rc
+# (g3) A REFUSAL'S READING IS NOT ITS VERDICT (follow-up to #2991, P3, measured). `why=no-return` and
+# `why=call-failed` end in `tail=<last 240 bytes of pi's own output>`, and the arms above were chosen
+# by a substring test over the WHOLE line — so a deterministic refusal whose tail happened to embed
+# the transient word was classified as one. Measured: `why=call-failed … tail=pi: provider said
+# why=no-answer~` → `rc=0, agent launched`. A fail-open driven by REMOTE TEXT is the worst kind: the
+# reading that refutes the box is swallowed by the box's own output. The reason is now parsed from its
+# structural position, so nothing after it can move the classification.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=call-failed host=x answered_ms=800 rc=1 attempts=1 bound=45s tail=pi: provider said why=no-answer~' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 71 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a refusal whose READING embeds why=no-answer still REFUSES (rc=$CRC) — the tail cannot vote" $rc
+# ...and the inverse, so the arm above cannot be satisfied by refusing everything: a GENUINE transient
+# (the reason token itself is no-answer) still warns and dispatches.
+mkfake '[cell-lane-preflight] LANE_CAPABILITY=refused why=no-answer host=x returned_ms=1042 rc=1 attempts=2 bound=45s tail=provider said why=call-failed~' 3
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -ne 71 ] && [ -s "$PI_LOG" ]; }; rc=$?
+ck "a GENUINE why=no-answer still WARNS and dispatches (rc=$CRC) even with a hostile tail" $rc
+# (g4) A PROBE THAT RAN AND SAID "CANNOT MEASURE" MUST REFUSE (follow-up review of #2991, P1, measured).
+# `_pf_rc` was captured and NEVER CONSULTED, so this shape took the `*)` WARN arm and dispatched: the
+# probe exited 2 with empty stdout — which its own EXIT table defines as "CANNOT MEASURE, every caller
+# must refuse too" — and an agent was launched by a probe that had measured nothing, burning the exact
+# 3300 s slot this gate exists to protect. Reachable in the version-skew direction the probe's own
+# header names as the production cause (a NEW caller against an OLD deployed helper: a rejected
+# `--bound` exits 2 printing nothing) and from a truncated/corrupt copy (`bash <file>` on broken syntax
+# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 81 (not 71: 71 sends the
+# operator to repair the BOX and then to dispatch the item to a peer that runs the same pair).
+mkfake '' 2
+: > "$LOG"
+cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
+{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that RAN and exited 2 with NO verdict is REFUSED 81 and starts NO agent (rc=$CRC)" $rc
+grep -q 'rc=2 with NO verdict' "$LOG"; rc=$?
+ck "...and the log names the rc=2 reading, so the operator is not left with an unexplained refusal" $rc
+grep -q 'VERSION SKEW' "$LOG"; rc=$?
+ck "...and names the pair as the cause (skew/corrupt copy), not the box's pi or credential" $rc
 # (h) A REFUSAL RESTORES THE CALLER'S JOB CONTROL. `set -m` is turned on above the gate and restored
 # after the launch, so the early return was the one path that left the caller with job control ON —
 # and with it on, an async command in the caller no longer gets its stdin from /dev/null (#2163).
@@ -1431,23 +1484,142 @@ ck "the resolver finds the helper through the FILESYSTEM with CELL_PREFLIGHT_SH 
 { ! grep -q 'cell-lane-preflight.sh not found' "$LOG"; }; rc=$?
 ck "...and does not log the false 'not found' WARN that the unbound-variable abort produced" $rc
 
-# ── EVERY REFUSAL CODE MUST HAVE A READER (review of #2991, P1) ──────────────────────────────
+# ── EVERY REFUSAL CODE MUST HAVE A READER (review of #2991, P1; HARDENED by the follow-up, P1) ──
 # A refusal code that no caller CLASSIFIES is worse than no gate: the box is refused correctly and the
 # operator is handed another gate's remedy. Measured on the first cut of #2935 — `AGENT_CAPABILITY_REFUSED`
 # (71) was defined here, returned here, and named by NOTHING else, so `lane.sh` fell through to
 # `_cap_gate=load` and published "load gate refused — issue returns to the queue" one line under this
 # file's own "This does NOT clear by waiting". `fix-one.sh` published "re-dispatched when 1-min load
 # falls", `chain-merge.sh` mapped it to 75 and `adopt-fix.sh` wrote no line at all.
-# This asserts the GENERAL property rather than the one instance: for every `AGENT_*_REFUSED=<code>`
-# this helper defines, some caller must name it. A sixth code added tomorrow without a reader is red
-# here, which is the only version of this guard worth having.
+#
+# ⛔ THE FIRST VERSION OF THIS GUARD WAS ITSELF A DEFECT, AND IT IS THE ONE THAT LET THE MERGE ABOVE
+# LAND (follow-up review, P1). It was `grep -q "$_code" <callers>` — a TEXT match, and a comment is
+# text. Measured by replacing every caller's code reference with a bare literal and leaving
+# `chain-merge.sh`'s comment (`# 71 is spawn-gate.sh's AGENT_CAPABILITY_REFUSED …`) in place: the
+# guard still reported `unread: none`, i.e. GREEN over a tree in which NO caller's code named the
+# constant. It is the vacuous-guard class the repo names elsewhere, so it is fixed in two halves:
+#
+#   1. the text match is COMMENT-STRIPPED, so a full-line or trailing `# …` mention cannot satisfy it;
+#   2. the property that actually matters is asserted BEHAVIOURALLY below — `chain-merge.sh` is the
+#      one reader that turns a record into an EXIT CODE, so it is driven through the real record
+#      format for every gate it can be handed and the code it exits with is pinned. That is the arm
+#      the text version could not have: on the merged tree `chain-merge.sh` NAMED the constant while
+#      `cap_refusal_gate`'s normaliser folded `capability` into `load`, so a capability refusal exited
+#      75 with the LOAD remedy — text-green and behaviour-red in the same file.
+#
+# ⛔ AND NEITHER HALF ALONE IS THE PROPERTY, WHICH IS WHY THE VERDICT IS A UNION: a caller may
+# legitimately read a code by its DEFAULT arm rather than by name — that is exactly how `load` is
+# read (`else _cap_gate=load`), and on the real tree `AGENT_LOAD_REFUSED` appears ONLY in comments in
+# every caller (measured). A pure text check therefore calls a correct caller unread, and a pure
+# behavioural check says nothing about a code the table does not drive. So `_unread` is
+# `defined − (named in CODE ∪ exercised by the table)`: a code is accounted for if some caller NAMES
+# it in code **or** the table proves a caller reaches it. A sixth code added tomorrow with neither is
+# red, which is the general property this guard exists for.
+#
+# Tested in BOTH directions, and the mutations say which half each one kills:
+#   M1  drop `capability` from `cap_refusal_gate`'s normaliser  → 3 red (equality, distinctness, remedy)
+#   M2a delete the `capability) _cap_rc=71` ARM, keep the comment → **2 red** (equality, distinctness),
+#                                                                    measured: `capability` falls to the
+#                                                                    `*` arm and exits 75 (equality
+#                                                                    red), `load` also exits 75 so the
+#                                                                    two codes collide (distinctness
+#                                                                    red) — and the REMEDY assertion
+#                                                                    still passes, because the log line
+#                                                                    it reads (`refused at the
+#                                                                    capability gate`) comes from the
+#                                                                    NORMALISER's value, not from the
+#                                                                    arm. The USE is what is tested; the
+#                                                                    comment proves nothing. (This line
+#                                                                    said "same 3 red" before the follow-up
+#                                                                    review measured it — a mutation
+#                                                                    count that no run had produced is
+#                                                                    the claim-without-an-artifact class
+#                                                                    the review gate exists to delete.)
+#   M2b delete the COMMENT only, keep the arm                      → 0 red (the guard is not
+#                                                                    comment-dependent — the exact
+#                                                                    inverse of the old one)
+#   M2c replace every caller's code mention by a literal, comments left in place → **RED**, `unread:
+#                                                                    AGENT_BRIEF_REFUSED`. Measured by
+#                                                                    re-running this guard's own
+#                                                                    `strip_comments` union over a copy of
+#                                                                    the five callers with each mention
+#                                                                    literalled: `_named` becomes EMPTY,
+#                                                                    and the table only ever exercises
+#                                                                    capability/fork/load/land/disk/skew —
+#                                                                    `BRIEF` is the one code the table
+#                                                                    cannot reach, so removing the names
+#                                                                    uncovers it. (This line said the
+#                                                                    opposite — "stays GREEN" — which is
+#                                                                    the more dangerous direction of the
+#                                                                    same defect: it told the next reader
+#                                                                    the union tolerates losing half of
+#                                                                    itself.)
+#
+# ⛔ TWO `s///` EXPRESSIONS, NOT ONE `\|` ALTERNATION: BSD sed (macOS — the box that dispatches to
+# the cells, where this suite is run by hand) has no `\|`, so the compact form
+# `s/\(^\|[[:space:]]\)#.*$//` strips NOTHING and the guard silently goes back to counting comments.
+# Measured on the first cut of this fix: with every caller's code reference replaced by a literal and
+# only chain-merge.sh's comment left, the compact form still reported `unread: none`. GNU sed would
+# have hidden that; this box is BSD, so the mutation that was supposed to prove the guard works is
+# what caught it.
+strip_comments() { sed -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]#.*$//' "$1"; }
+
+# ── the BEHAVIOURAL half FIRST, because its result feeds the coverage verdict below ────────────
+# A record with `gate=<word>` in field 3 is the whole input (see `lane.sh`, its one writer). One
+# chain invocation per gate: the record is admitted on the first poll, so this costs a fork, not a
+# wait — `CHAIN_POLLS=1` would only matter for a record the reader REFUSED, which would prove the
+# opposite of what these arms assert.
+_gatetable="$TMP/gatetable"; mkdir -p "$_gatetable/O/logs" "$_gatetable/O/state" "$_gatetable/repo"
+chain_probe() { # <gate-word> -> sets CHAIN_RC and CHAIN_REMEDY (the gate the chain's log names)
+  local g="$1" now r=0
+  now="$(date +%s)"
+  printf '%s\t%s\t%s\n' "$now" "$(( now + 900 ))" "$g" > "$_gatetable/O/state/capacity-refused-7"
+  O="$_gatetable/O" CHAIN_POLLS=1 CHAIN_POLL_SECS=1 \
+    bash "$HERE/chain-merge.sh" "$_gatetable/repo" daniel-ospina/agent-infra 7 fix/gate-table \
+    >/dev/null 2>&1 || r=$?
+  rm -f "$_gatetable/O/state/capacity-refused-7"
+  CHAIN_RC="$r"
+  CHAIN_REMEDY="$(grep -m1 -o 'refused at the [a-z-]* gate\|land-backlog' "$_gatetable/O/logs/chain-7.log" 2>/dev/null)"
+}
+# `<gate-word>:<CONSTANT-NAME>` — the value is read from the helper, so a RENUMBER here is followed
+# rather than pinned twice, and an absent constant shows up as an empty `want` (red), not as a pass.
+_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED"
+_seen=""; _exercised=""
+for _pair in $_gate_expected; do
+  _g="${_pair%%:*}"; _c="${_pair##*:}"
+  _want="$(sed -n "s/^${_c}=//p" "$GATE" | head -1)"
+  chain_probe "$_g"
+  [ -n "$_want" ] && [ "$CHAIN_RC" = "$_want" ]; rc=$?
+  ck "chain-merge reports a '$_g' refusal as its own code (want=$_want got=$CHAIN_RC)" $rc
+  _seen="$_seen $CHAIN_RC"; _exercised="$_exercised $_c"
+done
+_dups="$(printf '%s\n' $_seen | sort | uniq -d | tr '\n' ' ')"
+[ -z "${_dups// /}" ]; rc=$?
+ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_dups:- none})" $rc
+# The operator-facing half: the load REMEDY must not be printed for a capability refusal.
+chain_probe capability
+[ "$CHAIN_REMEDY" = "refused at the capability gate" ]; rc=$?
+ck "...and the capability refusal NAMES its own gate in the log (read: '${CHAIN_REMEDY:-<nothing>}')" $rc
+chain_probe load
+[ "$CHAIN_REMEDY" = "refused at the load gate" ]; rc=$?
+ck "...while a load refusal still names the load gate (read: '${CHAIN_REMEDY:-<nothing>}')" $rc
+
+# ── the COVERAGE verdict: defined − (named in CODE ∪ exercised above) must be empty ─────────────
+_named=""
+for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GATE" | sort -u); do
+  for _f in lane.sh fix-one.sh chain-merge.sh adopt-fix.sh nonblocking-dispatch.sh; do
+    strip_comments "$HERE/$_f" | grep -q "$_code" && _named="$_named $_code"
+  done
+done
 _unread=""
-for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$HERE/spawn-gate.sh" | sort -u); do
-  grep -q "$_code" "$HERE/lane.sh" "$HERE/fix-one.sh" "$HERE/chain-merge.sh" \
-      "$HERE/adopt-fix.sh" "$HERE/nonblocking-dispatch.sh" 2>/dev/null || _unread="$_unread $_code"
+for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GATE" | sort -u); do
+  case " $_named $_exercised " in
+    *" $_code "*) : ;;
+    *) _unread="$_unread $_code" ;;
+  esac
 done
 [ -z "$_unread" ]; rc=$?
-ck "every AGENT_*_REFUSED code has a READER in its callers (unread:${_unread:- none})" $rc
+ck "every AGENT_*_REFUSED code is ACCOUNTED FOR — named in a caller's CODE or reached by the table (unread:${_unread:- none})" $rc
 
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,
