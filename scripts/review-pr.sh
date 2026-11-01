@@ -852,6 +852,15 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
   err "  This is a capacity event, not a code verdict. Re-run when the box is quieter (the gate's own ceiling is MAX_LOAD)."
   exit 75
 fi
+# ⛔ THE SPAWN POINT'S SYNC REFUSAL (81) IS READ THE SAME WAY, FOR THE SAME REASON. Since the fork
+# resolver can answer `nodeploy`, the spawn point exits 81 when it cannot find `capacity.sh` at all.
+# Unread, that refusal reached the no-verdict branch below, which reports "a crashed/killed/failed
+# reviewer" and tells the operator to RE-RUN — straight back into a sync fault no re-run can clear.
+if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+  err "$PROG: the reviewer was NOT STARTED — the spawn point could not resolve its fork instrument (rc=$AGENT_RC, AGENT_HARNESS_SKEW_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
+  err "  This is a HELPER/SYNC fault, not a code verdict and not a box capacity event: sync the pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever reviewers run, then re-run. Do NOT dispatch the PR elsewhere — every box with these files refuses identically."
+  exit 81
+fi
 # ⛔ THE EXIT STATUS IS THE SIGNAL, NOT A STRING IN THE TRANSCRIPT (P3, fresh review of #2288). This
 # arm used to ALSO match `^\[pi-gate\] REFUSED` anywhere in the log, so a reviewer that QUOTED the
 # gate's own refusal line while reviewing the gate — completing and exiting 0 — was reported as "the

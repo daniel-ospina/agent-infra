@@ -1810,6 +1810,31 @@ ok_out="$(fake_edge 400 15641)"
 case "$ok_out" in *"COLLIDE:state=ok"*) rc=0 ;; *) rc=1 ;; esac
 ck "POSITIVE CONTROL: the SAME box with 15k spare pids is ALLOWED (the arm is not a blanket refusal) [$ok_out]" $rc
 
+# ⛔ THE `nodeploy` ARM — the defect this change exists for (measured 2026-11-01). The resolver searched
+# `$O` and "beside me" ONLY, so as the installed `pi` shim at `$HOME/.pi/agent/bin` — a directory that
+# holds no harness — it found nothing whenever the launcher had not exported `O`, and every such lane
+# ran with the fork floor OFF behind a per-launch WARN. Driven at the SHIM (the mode the evidence came
+# from), with a COPY of the gate in an empty directory so the arm is reachable for real: the shipped
+# file's own directory always holds capacity.sh, which is exactly why this arm was never exercised.
+ND="$TMP/nodeploy"; mkdir -p "$ND/gate" "$ND/home"
+cp "$GATE" "$ND/gate/pi"
+: > "$PI_LOG"
+nd_out="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+          bash "$ND/gate/pi" -p noop 2>&1)"; nd_rc=$?
+[ "$nd_rc" -eq 81 ]; rc=$?
+ck "the spawn point REFUSES (81) when capacity.sh is unresolvable — it does not WARN and launch (rc=$nd_rc)" $rc
+grep -q 'PI_RAN' "$PI_LOG" 2>/dev/null; [ $? -ne 0 ]; rc=$?
+ck "...and the stub pi was NOT invoked — 'the fork floor is off' is no longer a launch" $rc
+case "$nd_out" in *'fork headroom UNREADABLE'*'(searched: '*|*'searched: '*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the refusal NAMES the directories it searched (an operator is not told to guess) [$nd_out]" $rc
+# the RESOLVER fix: `O` unset, but the DOCUMENTED default for it ($HOME/orchestrator) holds the
+# instrument — present rather than merely reported, which is the preferred half of the remedy.
+mkdir -p "$ND/home2/orchestrator"; cp "$cap_abspath" "$ND/home2/orchestrator/capacity.sh"
+nd2="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home2" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; if spawn_gate_load_capacity; then echo RESOLVED; else echo UNREACHABLE; fi' _ "$ND/gate/pi" 2>&1)"
+case "$nd2" in *RESOLVED*) rc=0 ;; *) rc=1 ;; esac
+ck "with O UNSET the instrument is still FOUND in \$HOME/orchestrator — the floor enforces itself where it is installed as pi ($nd2)" $rc
+
 # END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
 # code (74, not 77/75), and the log says why.
 : > "$LOG"; : > "$PI_LOG"
