@@ -672,7 +672,15 @@ shard_watchdog() {
   # the parent's job (`shard_run_bounded` sends TERM to the group and, after reaping, KILL to it again
   # — that second pass exists precisely because a timer forked around the TERM joins the group too
   # late to receive it), so nothing here is load-bearing for the group case.
-  trap 'kill "${shard_timer_pid:-}" 2>/dev/null; exit 0' TERM INT
+  # ⛔ TERM, INT **AND HUP** — the watchdog INHERITS the driver's traps, and the driver's handler is
+  # `shard_driver_signal`, which (a) kills the LIVE SHARD's group and (b) `shard_exit`s, cleaning up the
+  # driver's temp files. A group-wide HUP (a cancelled step, a killed terminal) reaches the watchdog
+  # too, so without an HUP trap of its own the WATCHDOG would run the DRIVER's handler — tearing down a
+  # shard the driver is still waiting on and deleting logs the driver is still writing. The inheritance
+  # itself is measured (`BASH_SUBSHELL`/`FUNCNAME` in the trap: a forked child of the driver does run
+  # the driver's traps); trapping HUP here keeps the watchdog's exit path its own — kill the timer,
+  # leave — which is also what stops an orphaned timer holding the caller's pipe (arm 7's hazard).
+  trap 'kill "${shard_timer_pid:-}" 2>/dev/null; exit 0' TERM INT HUP
   sleep "$shard_bound" &
   shard_timer_pid=$!
   wait "$shard_timer_pid" 2>/dev/null || exit 0

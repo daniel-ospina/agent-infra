@@ -658,40 +658,6 @@ else
   pass "a SIGKILLed driver's SHARD still dies at the bound (the orphaned watchdog fires) — the residual is bounded, not silent"
 fi
 
-# 6g. THE WATCHDOG'S BARE-PID FALLBACK IS OWNERSHIP-GUARDED (review cycle 6, P2).
-# The no-group fallback is the one place in this file that names a BARE pid, and it does so a full
-# second after the driver may have reaped the shard — an uncatchable `SIGKILL` aimed at a freed pid,
-# i.e. possibly at another lane or the runner agent itself. It is only safe because it re-verifies
-# ownership first, and NOTHING PINNED THAT: the arm that neutralised the kill neutralised both forms
-# together, so ungUarding it would have gone unnoticed. This is a SOURCE INVARIANT arm (the shape of
-# the file, not a runtime behaviour) — the no-group case cannot be staged hermetically on a host whose
-# `set -m` works — and it carries a mutation control so it cannot pass vacuously.
-# ⛔ IT ALSO PINS `$$`, NOT `$PPID`: the guard runs inside the watchdog's forked subshell, where bash
-# leaves `$$` as the DRIVER's pid but `$PPID` as the driver's PARENT, so a `$PPID` comparison would be
-# false on every host and the guard would silently never fire.
-guard_invariant() {
-  local _bad
-  # every bare-pid KILL of the shard must sit on the guarded line
-  _bad="$(grep -n 'kill -KILL "\$shard_bg_pid"' "$1" | grep -v 'shard_pid_is_mine')" || true
-  [ -z "$_bad" ] || return 1
-  # …and that guard must exist, compare against the driver's pid, and query the parent
-  grep -q 'shard_pid_is_mine "\$shard_bg_pid" && kill -KILL "\$shard_bg_pid"' "$1" || return 1
-  grep -q '\[ "\$_w" = "\$\$" \]' "$1" || return 1
-  grep -q 'ps -o ppid= -p' "$1" || return 1
-  return 0
-}
-GUARDMUT="$TMP/guardmut-runner.sh"
-sed 's|shard_pid_is_mine "\$shard_bg_pid" && ||' "$RUNNER" >"$GUARDMUT" 2>/dev/null
-if ! guard_invariant "$RUNNER"; then
-  fail "the watchdog's bare-pid SIGKILL is NOT ownership-guarded (or guards against \$PPID instead of \$\$) — it can kill a recycled pid"
-elif cmp -s "$RUNNER" "$GUARDMUT"; then
-  fail "the guard mutation did not change the runner — the invariant check has no control"
-elif guard_invariant "$GUARDMUT"; then
-  fail "the guard-invariant check did not notice an UNGUARDED bare-pid KILL — the assertion above has no control"
-else
-  pass "the one bare-pid SIGKILL is ownership-guarded (ppid == \$\$, non-zombie), and the check reds when unguarded"
-fi
-
 # 2d. A SHARD'S TEARDOWN MUST NOT WIPE THE DRIVER'S OWN BOOKKEEPING (review cycle 6, P1, measured).
 # `shard_watchdog` runs in a forked subshell, and bash runs an inherited EXIT trap inside forked
 # children of the driver — measured, the trapping shell IS the watchdog — so an EXIT-trap `rm` of the
@@ -733,6 +699,73 @@ else
   else
     fail "the EXIT-trap control did not red the sliced run in 6 attempts — the assertion above cannot see the wipe it guards"
   fi
+fi
+
+# ── 10. THE ESCALATION'S BARE-PID KILL IS OWNERSHIP-CHECKED (review cycle 6, P2) ─────────────────
+# The no-group fallback is the one place in the file that names a BARE pid, and it fires a full second
+# after the driver may have reaped the shard — an uncatchable `SIGKILL` aimed at a freed pid, i.e.
+# possibly at another lane or the runner agent itself. It is only safe because `shard_pid_is_mine`
+# re-verifies ownership first, and NOTHING pinned that: the arm that neutralises the kill neutralises
+# both forms together, so unguarding it would have gone unnoticed.
+# ⛔ BEHAVIOURAL, NOT A GREP: the function is lifted out of the real runner and EXERCISED on a real
+# parent/child pair, so the assertion is about what it decides, not how it is spelled. The no-group
+# scenario itself cannot be staged hermetically on a host whose `set -m` works, which is why the
+# function is the unit under test.
+# ⛔ IT ALSO PINS `$$`, NOT `$PPID`: inside the watchdog's forked subshell bash leaves `$$` as the
+# DRIVER's pid but `$PPID` as the driver's PARENT, so a `$PPID` comparison would be false on every host
+# and the guard would silently never fire.
+OWNARM="$TMP/ownercheck"
+mkdir -p "$OWNARM"
+# lift `shard_pid_is_mine` (body and all) out of the shipped runner and load it here
+sed -n '/^shard_pid_is_mine() {$/,/^}$/p' "$RUNNER" >"$OWNARM/fn.sh"
+if [ ! -s "$OWNARM/fn.sh" ]; then
+  fail "cannot lift 'shard_pid_is_mine' out of the runner — the ownership guard does not exist"
+else
+  . "$OWNARM/fn.sh"
+  # (a) REAL OWNER: a direct child of THIS shell — the ppid test must succeed
+  sleep 20 &
+  OWN_CHILD=$!
+  if shard_pid_is_mine "$OWN_CHILD"; then
+    pass "the ownership check ACCEPTS a pid whose parent is the caller (real owner ⇒ signal is allowed)"
+  else
+    fail "the ownership check REJECTED a direct child of this shell — the guard is inverted or compares against \$PPID, and a real bound-hit would never escalate"
+  fi
+  # (b) FOREIGN OWNER: a process whose parent is a shell that has already exited (reparented), i.e.
+  #     exactly "the number now names someone else" — must be refused
+  # ⛔ the inner sleep's stdout MUST be redirected: in a command substitution a background child
+  # that still holds the pipe keeps the substitution open until it exits (measured: the fixture
+  # "never started" because the capture was blocked on it).
+  OWN_FOREIGN="$(bash -c 'sleep 20 >/dev/null 2>&1 & printf "%s\n" "$!"')"
+  sleep 0.5
+  if [ -n "$OWN_FOREIGN" ] && kill -0 "$OWN_FOREIGN" 2>/dev/null; then
+    if shard_pid_is_mine "$OWN_FOREIGN"; then
+      fail "the ownership check ACCEPTED pid $OWN_FOREIGN whose parent is not this shell — the bare-pid KILL could hit a recycled pid"
+    else
+      pass "the ownership check REFUSES a live pid owned by someone else (recycled pid ⇒ no signal)"
+    fi
+    # ⛔ the fixture is killed AFTER the control below, not here: the control re-checks the SAME pid, and a
+    # dead pid is refused by the `ps` lookup rather than by the ownership gate — which is how the
+    # control first "passed" for the wrong reason (measured rc 8).
+  else
+    fail "the foreign-owner fixture never started — this arm proves nothing"
+  fi
+  # (c) CONTROL: with the parent comparison gutted, case (b) must flip — otherwise (b) may pass for the
+  #     wrong reason (e.g. because the fixture was already dead).
+  sed 's|\[ "\$_w" = "\$\$" \]|[ -n "$_w" ]|' "$OWNARM/fn.sh" >"$OWNARM/fn-gutted.sh"
+  if cmp -s "$OWNARM/fn.sh" "$OWNARM/fn-gutted.sh"; then
+    fail "the ownership-gate mutation did not change the lifted function — case (b) has no control"
+  else
+    ( . "$OWNARM/fn-gutted.sh"
+      if shard_pid_is_mine "$OWN_FOREIGN"; then exit 7; else exit 8; fi ) 2>/dev/null
+    GUT_RC=$?
+    if [ "$GUT_RC" -eq 7 ]; then
+      pass "control: with the parent comparison removed the check accepts a foreign pid — case (b) is not vacuous"
+    else
+      fail "control: the gutted ownership gate still refused (rc $GUT_RC) — case (b) passes for the wrong reason"
+    fi
+  fi
+  kill -KILL "$OWN_CHILD" 2>/dev/null
+  kill -KILL "$OWN_FOREIGN" 2>/dev/null
 fi
 
 echo ""
