@@ -83,12 +83,21 @@ trap cleanup EXIT
 
 # ── the ONE reader, driven twice: live, and against a mutant copy ─────────────────────────────
 LAST_OUT=""
+# ⛔ "THE REFUSAL NAMES X" MUST READ THE FINDINGS, NOT THE WHOLE BUFFER (review cycle 2, P2).
+# `LAST_OUT` is the combined output of all THREE file reads, and the live reads always print the
+# `harness-single-source … paths:` line and the `pipeline-compliance … edited` line. So a
+# `case "$LAST_OUT" in *paths*)` / `*edited*` / `*synchronize*` matched a static report line and could
+# never fail — four arms that pinned nothing while claiming to. `FINDINGS` holds only `FINDING:` lines.
+FINDINGS=""
+findings_only() { FINDINGS="$(grep '^FINDING:' <<<"$LAST_OUT" || true)"; }
+
 run_check() { # <want-rc> <label> [VAR=value ...]
   local want="$1" label="$2"
   shift 2
   local rc
   LAST_OUT="$(env "$@" node "$CHECK" 2>&1)"
   rc=$?
+  findings_only
   if [ "$rc" -eq "$want" ]; then
     pass "$label (rc=$rc)"
   else
@@ -153,9 +162,9 @@ if apply_mutation "$WL" "$WL_EDITED" \
   "    types: [opened, synchronize, reopened, edited]" \
   "the per-edit trigger must be restored"; then
   run_check 1 "a restored \`edited\` is REFUSED" WL_FILE="$WL_EDITED"
-  case "$LAST_OUT" in
+  case "$FINDINGS" in
     *edited*) pass "the refusal NAMES \`edited\` and why it is the one being removed" ;;
-    *) fail "the refusal did not name \`edited\`" ;;
+    *) fail "the refusal did not name \`edited\` in its FINDING line" ;;
   esac
 fi
 
@@ -166,9 +175,9 @@ if apply_mutation "$WL" "$WL_NOSYNC" \
   "    types: [opened, reopened]" \
   "a head-moving event must be droppable"; then
   run_check 1 "a \`types:\` set that lost \`synchronize\` is REFUSED" WL_FILE="$WL_NOSYNC"
-  case "$LAST_OUT" in
+  case "$FINDINGS" in
     *synchronize*) pass "the refusal NAMES the lost event" ;;
-    *) fail "the refusal did not name the lost event" ;;
+    *) fail "the refusal did not name the lost event in its FINDING line" ;;
   esac
 fi
 
@@ -184,9 +193,9 @@ if apply_mutation "$WL" "$WL_PATHS" \
       - '.github/workflows/**'" \
   "a narrowing filter must be constructible"; then
   run_check 1 "a \`paths:\` on \`pull_request_target:\` is REFUSED" WL_FILE="$WL_PATHS"
-  case "$LAST_OUT" in
+  case "$FINDINGS" in
     *paths*) pass "the refusal NAMES the narrowing filter" ;;
-    *) fail "the refusal did not name the narrowing filter" ;;
+    *) fail "the refusal did not name the narrowing filter in its FINDING line" ;;
   esac
 fi
 
@@ -259,9 +268,61 @@ if apply_mutation "$PC" "$PC_PATHS" \
   "a filter on the required context must be constructible"; then
   run_check 1 "a \`paths:\` filter on pipeline-compliance is REFUSED (it would leave the required context Pending)" \
     PC_FILE="$PC_PATHS"
-  case "$LAST_OUT" in
+  case "$FINDINGS" in
     *paths*) pass "the refusal NAMES the filter and the consequence" ;;
-    *) fail "the refusal did not name the filter" ;;
+    *) fail "the refusal did not name the filter in its FINDING line" ;;
+  esac
+fi
+
+echo "== 7c. MUTANT: harness-single-source narrowed by a SECOND filter key =="
+# Review cycle 2, P1 — the mirror of 3b. `types: [opened]` drops every synchronize (no later head is
+# ever measured) and `branches-ignore: [main]` stops the job firing on any PR at all; the whole suite
+# was green over both, because the arms only ever asked about `paths`. APPENDED after the paths block
+# on purpose: inserting between `pull_request:` and `paths:` would red only because arms 5/6/9's
+# mutation anchor stops matching, which reports the wrong diagnosis.
+HSS_TYPES="$TMP/hss-types.yml"
+if apply_mutation "$HSS" "$HSS_TYPES" \
+  "      - '.github/workflows/harness-single-source.yml'" \
+  "      - '.github/workflows/harness-single-source.yml'
+    types: [opened]" \
+  "a second filter key must be constructible"; then
+  run_check 1 "a \`types:\` narrowing the guard's coverage is REFUSED" HSS_FILE="$HSS_TYPES"
+  case "$FINDINGS" in
+    *types*) pass "the refusal NAMES the narrowing key" ;;
+    *) fail "the refusal did not name the narrowing key in its FINDING line" ;;
+  esac
+fi
+
+HSS_BRANCHES="$TMP/hss-branches.yml"
+if apply_mutation "$HSS" "$HSS_BRANCHES" \
+  "      - '.github/workflows/harness-single-source.yml'" \
+  "      - '.github/workflows/harness-single-source.yml'
+    branches-ignore: [main]" \
+  "a branch filter must be constructible"; then
+  run_check 1 "a \`branches-ignore: [main]\` that disables the guard on every PR is REFUSED" \
+    HSS_FILE="$HSS_BRANCHES"
+fi
+
+echo "== 7d. MUTANT: a sibling key's list must not be read as \`types:\` =="
+# Review cycle 2, P2 — the reader used to collect a key's items with a FILTER over every deeper line,
+# so a following sibling's block sequence was attributed to the preceding key. Measured fail-open: an
+# emptied `types:` followed by `branches: [- edited]` printed `types: … edited` and exited 0.
+PC_SIBLING="$TMP/pc-sibling.yml"
+if apply_mutation "$PC" "$PC_SIBLING" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:
+    branches:
+      - edited" \
+  "the cross-key misread must be constructible"; then
+  run_check 1 "a 'types:' emptied and a sibling list carrying 'edited' does not read GREEN" \
+    PC_FILE="$PC_SIBLING"
+  case "$FINDINGS" in
+    *types*) pass "the refusal names \`types:\`, not the sibling's value" ;;
+    *) fail "the refusal did not name \`types:\`" ;;
   esac
 fi
 

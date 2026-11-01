@@ -68,16 +68,6 @@ const unquote = (s) => {
   return t;
 };
 
-// content(raw) — a line's {raw, indent, no} when it is a real content line, else null.
-function contentLines(text) {
-  const out = [];
-  text.split("\n").forEach((raw, i) => {
-    if (blank(raw) || comment(raw)) return;
-    out.push({ raw, indent: indentOf(raw), no: i + 1 });
-  });
-  return out;
-}
-
 // onRegion(line, file) — the content lines strictly inside the top-level `on:` block.
 // A top-level key at column 0 ends the region. The `on:` key itself may be quoted
 // (YAML 1.1 parses a bare `on` as the boolean true, and some formatters quote it).
@@ -126,6 +116,24 @@ function filterKeys(lines) {
     if (!k) refuse(`unparseable line ${l.no}: ${JSON.stringify(l.raw)}`);
     out.push({ ...k, line: l, idx: i, childIndent });
   });
+  return out;
+}
+
+// valueLinesFor(entry, lines) — the lines that belong to ONE key's value.
+//
+// ⛔ TAKE-WHILE, NOT FILTER (review cycle 2, P2). The predecessor was
+// `lines.slice(entry.idx + 1).filter(l => l.indent > entry.line.indent)`, and a SIBLING key's block
+// sequence also sits deeper than the preceding key's line — so a `paths:` list appended after `types:`
+// was attributed to `types:`, and the printed list was FABRICATED. It was a fail-open in the other
+// direction too: a `types:` with no items followed by `branches: [- edited]` reported
+// `types: … edited` and exited 0, i.e. the required context read GREEN while its `types:` declared
+// nothing. A block sequence ENDS at the first line that is not deeper than its key.
+function valueLinesFor(entry, lines) {
+  const out = [];
+  for (const l of lines.slice(entry.idx + 1)) {
+    if (l.indent <= entry.line.indent) break;
+    out.push(l);
+  }
   return out;
 }
 
@@ -206,7 +214,7 @@ function checkWorkflowLock() {
     return;
   }
   const entry = t.keys[typesIdx];
-  const valueLines = t.lines.slice(entry.idx + 1).filter((l) => l.indent > entry.line.indent);
+  const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`workflow-lock pull_request_target types: ${items.join(", ") || "<none>"}\n`);
 
@@ -232,6 +240,17 @@ function checkHarnessSingleSource() {
   const { region, childIndent } = onRegion(text, HSS_FILE);
   const t = trigger(region, childIndent, "pull_request", HSS_FILE);
 
+  // ⛔ THIS TRIGGER CARRIES `paths` AND NOTHING ELSE (review cycle 2, P1 — the mirror of the
+  // `workflow-lock` arm cycle 1 added). `types:` narrows coverage exactly as a path filter does, and
+  // `branches-ignore: [main]` disables the job for every PR in this repo — BOTH measured green over
+  // the whole 28-arm suite before this refusal existed, because the arms only ever asked about
+  // `paths`. An allow-list, so any future narrowing has to be a visible edit to this test.
+  const extraHss = extraFilters(t.keys, ["paths"]);
+  if (extraHss.length) {
+    findings.push(
+      `harness-single-source.yml's \`pull_request:\` declares [${extraHss.join(", ")}] besides \`paths:\`. Each of those is a COVERAGE NARROWING on a guard whose whole job is to red a reappearing fork or a drifting deployed copy: \`types: [opened]\` drops every \`synchronize\` (so no later head is ever measured), and \`branches-ignore: [main]\` stops the job firing on any PR in this repo at all — while the path arm stays true. The trigger's only filter is \`paths:\`.`
+    );
+  }
   const pathsIdx = t.keys.findIndex((k) => k.key === "paths");
   const ignoreIdx = t.keys.findIndex((k) => k.key === "paths-ignore");
   if (ignoreIdx >= 0) {
@@ -246,7 +265,7 @@ function checkHarnessSingleSource() {
     return;
   }
   const entry = t.keys[pathsIdx];
-  const valueLines = t.lines.slice(entry.idx + 1).filter((l) => l.indent > entry.line.indent);
+  const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`harness-single-source pull_request paths: ${items.join(" | ") || "<none>"}\n`);
 
@@ -294,7 +313,7 @@ function checkPipelineComplianceUnchanged() {
     return;
   }
   const entry = t.keys[idx];
-  const valueLines = t.lines.slice(entry.idx + 1).filter((l) => l.indent > entry.line.indent);
+  const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`pipeline-compliance pull_request types: ${items.join(", ") || "<none>"}\n`);
   if (!items.includes("edited")) {

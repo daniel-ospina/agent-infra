@@ -153,14 +153,15 @@ name: Workflow lock (base-branch checker)
 # would produce, and nothing re-runs this leg until the next pull_request_target event" — a base
 # ADVANCE already has exactly this property today, so dropping `edited` extends an accepted
 # residual to one more rare event (a manual retarget) rather than introducing a new one; (b) a
-# `schedule:` leg CANNOT restore it, and this is the decisive point: a scheduled workflow runs on
-# the DEFAULT BRANCH's latest commit (GitHub docs, "Events that trigger workflows": GITHUB_SHA
-# is "Last commit on default branch", GITHUB_REF "Default branch"), so its check runs attach to
-# `main`, never to a PR head — it could not re-establish a per-PR verdict at all. What it COULD
-# do is redden main's `workflow-lock` check and so block every PR in the rail's base-vs-PR
-# comparison, i.e. trade a rare stale green on one PR for a fleet-wide red. So: the next
-# `synchronize` or `reopened` re-validates a retargeted PR, and `tests/ci-trigger-scope` pins the
-# trigger set so this cannot silently decay back into a per-edit run.
+# `schedule:` leg CANNOT restore it. A scheduled workflow's OWN run belongs to the default branch
+# (GitHub docs, "Events that trigger workflows": GITHUB_SHA is "Last commit on default branch",
+# GITHUB_REF "Default branch"), so the check THAT TRIGGER produces attaches to `main`, never to a PR
+# head. Re-establishing a per-PR verdict from a schedule would therefore not be this leg at all: it
+# would have to compute every open PR's merge result itself and POST a check run per head
+# (`checks: write`, a new permission on a privileged workflow) — a NEW INSTRUMENT, not a trigger
+# swap — and it would still fire up to 24 h late on a retarget while a failure in it reddened main
+# and blocked every PR through the rail's base-vs-PR comparison. That is a step-2-sized change with
+# a fleet-wide blast radius, not a way to keep one trigger type.
 #
 # ⛔ AND THE OTHER HALF OF THE COST — `scripts/admin-merge.sh`'s #1417 wait — STILL HOLDS. The
 # rail's `[3/4] record` body PATCH still creates `pipeline-compliance`'s `edited` run (that file
