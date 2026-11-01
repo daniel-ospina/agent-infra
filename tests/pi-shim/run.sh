@@ -123,7 +123,7 @@ chmod +x "$LSHIMDIR/sysctl"
 # FAKE_LOAD / MAX_LOAD / TAG / PI_FAKE_RC come from the caller's environment.
 # ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER, for the same reason $LSHIMDIR stubs the LOAD
 # probe: every arm below is about the LOAD ceiling, and since agent-infra#2387 the shim consults
-# available memory BEFORE load. Without this a memory-tight box answers 72 to a load arm and the arm
+# available memory BEFORE load. Without this a memory-tight box answers 82 to a load arm and the arm
 # reports a #1884 regression that is not one. Section 12 drives the memory arm on purpose, at a floor
 # this box cannot meet; the SHIPPED default floor is asserted in spawn-gate.test.sh (env -u), which owns
 # the arithmetic.
@@ -480,9 +480,9 @@ else
   err="$(PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" TAG=mem-unreadable MAX_LOAD=999999999 \
     PATH="$TMP/unreadshim:$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
     bash -c 'pi -p x' 2>&1 >/dev/null)"; rc=$?
-  [ "$rc" -eq 72 ] \
+  [ "$rc" -eq 82 ] \
     && pass "an UNREADABLE probe REFUSES (rc=$rc) — fail-closed, not fail-open like the disk gate" \
-    || fail "an unreadable memory probe returned $rc instead of refusing with 72 (fail-OPEN)"
+    || fail "an unreadable memory probe returned $rc instead of refusing with 82 (fail-OPEN)"
   [ ! -s "$TMP/probe" ] \
     && pass "…and the real pi did NOT start on it" \
     || fail "an unreadable probe still started pi: $(tr '\n' ' ' < "$TMP/probe")"
