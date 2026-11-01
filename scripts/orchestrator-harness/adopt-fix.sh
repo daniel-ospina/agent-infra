@@ -21,14 +21,33 @@ if [ "$ADOPT_ASSERT_RC" -ne 0 ]; then
   echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the checkout $REPO_ABS is not $OR; nothing fetched, no worktree built, no attempt consumed" >> "$O/logs/adopt-$PR.log"
   exit "$ADOPT_ASSERT_RC"
 fi
-git fetch origin "$BR" --quiet 2>/dev/null || true
+# ⛔ NAME THE DESTINATION (#3009): a bare `fetch origin "$BR"` leaves FETCH_HEAD and creates
+# `refs/remotes/origin/$BR` only when the clone's configured refspec maps that source — true on a
+# full clone, FALSE on a cell's single-branch clone (`remote.origin.fetch` = `+refs/heads/main:…`).
+# The leading `+` tolerates the force-push a PR branch routinely gets. This fetch is what the
+# NEXT block needs (`origin/$BR` must resolve), and what the peer lanes read.
+git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet 2>/dev/null || true
 WT=".worktrees/adopt-$PR"
 # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
 # `pipefail` would re-run `worktree add` over an existing worktree and abort (#864).
 wt_registered=0
 case "$(git worktree list 2>/dev/null || true)" in *"/$WT "*) wt_registered=1 ;; esac
 if [ "$wt_registered" -eq 0 ]; then
-  git worktree add "$WT" "$BR" >/dev/null 2>&1 || { echo "[adopt-fix $PR] worktree add failed for $BR" | tee -a "$O/logs/adopt-$PR.log"; exit 1; }
+  # ⛔ NAME THE REF, DO NOT LET GIT GUESS IT (review P1, 2026-10-31 — MEASURED, this line was the
+  # inert half of the #3009 fix). `git worktree add "$WT" "$BR"` is DWIM, and DWIM does NOT consult
+  # the tracking ref: it resolves a bare name through `remote.<name>.fetch` CONFIGURED refspecs. So
+  # creating `refs/remotes/origin/$BR` above does not enable it — on a cell's single-branch clone the
+  # adoption STILL died with `fatal: invalid reference: $BR`, one line after a now-green fetch, and
+  # the fixer never started. Measured on a `--single-branch` clone holding the tracking ref:
+  # `worktree add <wt> <branch>` rc=128 `invalid reference`; changing ONLY the config (no fetch at
+  # all, the ref held constant) → rc=0. The sibling `fix-one.sh:202` already uses the explicit form
+  # below, which is why it was correct while this file was not. Two arms, in that order:
+  # a LOCAL branch needs no DWIM, an adopted (not-yet-local) one must name `origin/$BR`.
+  if git rev-parse --verify -q "refs/heads/$BR" >/dev/null 2>&1; then
+    git worktree add "$WT" "$BR" >/dev/null 2>&1
+  else
+    git worktree add "$WT" -b "$BR" "origin/$BR" >/dev/null 2>&1
+  fi || { echo "[adopt-fix $PR] worktree add failed for $BR" | tee -a "$O/logs/adopt-$PR.log"; exit 1; }
 fi
 echo "[adopt-fix $PR] worktree=$WT branch=$BR $(date)" >> "$O/logs/adopt-$PR.log"
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
