@@ -412,9 +412,14 @@ jobs:
     # measurement is PR #2412's (job 120365087427, 2026-10-23T10:25Z) and predates #2529
     # (`00814821`, 16:09Z same day), which stopped the self-test's fixture re-running the real
     # shard list. MEASURED AFTER #2529 (2026-10-24, this job, 8 successful main runs pulled from the
-    # Actions API): step 6, the self-test, **6-9 s**; step 7, the shards, **46m38s-54m32s**. The PR
-    # lane's equivalent step, 17 runs sampled: 6-12 s with one 17 s outlier. What remains expensive
-    # here is the SHARDS step — that is what the 110 min bound below is sized for, and what sharding
+    # Actions API): step 6, the self-test, **6-9 s**. The PR lane's equivalent step, 17 runs sampled:
+    # 6-12 s with one 17 s outlier.
+    #
+    # ⛔ STEP 7 (THE SHARDS) IS **6468 s = 107.8 min**, NOT the 46m38s-54m32s this header used to
+    # quote (#3174): that range described the ~80-shard list BEFORE #2609 made the list a DERIVATION
+    # and #3114 added an 891 s suite by it. Quoting it here contradicted the step's own comment
+    # below and made 150 min read as 2.75x over-provisioned instead of 1.39x. What remains expensive
+    # here is the SHARDS step — that is what the 150 min bound below is sized for, and what sharding
     # main (the separate change named below) would cut.
     #
     # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
@@ -436,10 +441,10 @@ jobs:
     # = `failure` = red.
     #
     # ⛔ AND THE JOB BOUND SITS ABOVE THE SUM OF THE STEP BOUNDS, so it can never pre-empt a step:
-    # 10 (checkout) + 10 (node) + 10 (node --check) + 5 (parity) + 15 (self-test) + 110 (shards) =
-    # 160 < 230. Below the sum, the non-red job-level `cancelled` could win instead of the red
+    # 10 (checkout) + 10 (node) + 10 (node --check) + 5 (parity) + 15 (self-test) + 150 (shards) =
+    # 200 < 230. Below the sum, the non-red job-level `cancelled` could win instead of the red
     # step-level `failure` — the whole defect this block exists to close, re-entering through the
-    # backstop. 230 also stays ~2.1x the 110 min shard step it backstops, so it cannot
+    # backstop. 230 also stays ~1.53x the 150 min shard step it backstops, so it cannot
     # false-block.
     timeout-minutes: 230
     steps:
@@ -483,13 +488,43 @@ jobs:
         # cannot recur by drift. The runner's runtime self-checks (executed == listed, a sweep
         # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
         # Bare call, one step: a shard failure must fail the RUN, not just a counter.
-        # 46m38s-54m32s measured on this job (8 successful main runs, 2026-10-24) for the whole
-        # unsharded list; 110 min is ~2.0x the top of that range. (The 73m37s figure this comment
-        # used to carry is PR #2412's,
-        # before the shard work that followed.) STEP-level for the reason in this job's header: a
-        # job-level trip is `cancelled` and non-red to the rail, a step-level trip is `failure`
-        # and red.
-        timeout-minutes: 110
+        #
+        # ⛔ THE BOUND IS SIZED FROM A MEASURED LIST, NOT FROM A GUESS, AND NOT FROM A MEASUREMENT OF A
+        # DIFFERENT LIST (agent-infra#3174). The figure this comment used to carry (46m38s-54m32s,
+        # 8 main runs on 2026-10-24) described about 80 shards; the derived list is 147 today, so
+        # "110 min is ~2.0x the top of that range" was arithmetic about a list that no longer existed.
+        # MEASURED 2026-10-31 from the job's OWN per-suite rows (`▸ <secs> <path>`, run 41240886978,
+        # job 124654357365): 147 listed suites summing 6468 s = 107.8 min of shard work, with the job
+        # itself ending at 108.2 min wall. Against the 110 min step bound that was a 132 s MARGIN —
+        # 98.0 % of the bound — so the list had already outrun its bound in every sense that matters
+        # and 13 of the measured suites are each larger than it — the 891 s suite added the same day
+        # by 4bc7f759 / #3114 is ONE OF THEM and is INSIDE the 6468 s, so it is not extra (a first
+        # draft of this comment charged it twice). No ambiguity about which end was the
+        # defect: the SUITES ARE LEGITIMATE GATES (wired by DERIVATION — a file matching SUITE_GLOBS
+        # joins the list with no workflow edit), and the CONSTANT was sized from an older list.
+        #
+        #   147 suites · 6468 s measured · 110 min bound · +132 s margin (98.0 % of bound)
+        #
+        # 150 min = 9000 s = 1.39x the measured 6468 s: 2532 s (42.2 min) of headroom, which is 2.8x
+        # the largest measured suite (`tests/atomic-land/run.sh`, 899 s = 15.0 min) and 1.5x it even
+        # measured against the runner's 7800 s budget. So the bound survives ANY one more suite of
+        # tonight's largest class without a workflow edit (6468 + 899 = 7367 s < 7800 s budget < 9000 s
+        # step bound) — while still failing fast against the ~2h46m hang that #2055 recorded.
+        #
+        # ⛔ AND THE OVERRUN IS NOW A NAMED RED, NOT AN OPAQUE ONE. `BASH_SHARDS_BUDGET_SECS` below is
+        # the runner's OWN deadline at 7800 s (130 min = 1.20x measured), 20 min INSIDE this platform
+        # bound, so the runner reaches its verdict first and says which defect it is:
+        # `❌ SHARD BUDGET EXCEEDED` (the LIST outran the bound — capacity) versus
+        # `❌ failing shard(s): <paths>` (a suite failed — attributed by name and `::error::`
+        # annotation). Before this, both were the same `failure` with nothing distinguishing them.
+        # 150 also keeps the job bound a pure backstop: 10 + 10 + 10 + 5 + 15 + 150 = 200 < 230.
+        env:
+          # Whole seconds; must stay BELOW `timeout-minutes` here so the named verdict wins. The
+          # runner refuses a non-numeric value, and refuses SET-but-EMPTY (an unset CI variable
+          # expands to empty, and treating that as "no deadline" would be a fail-open). Unsetting the
+          # var is the documented "no deadline" spelling, as is 0.
+          BASH_SHARDS_BUDGET_SECS: '7800'
+        timeout-minutes: 150
         run: bash scripts/run-bash-shards.sh
 
   skill-lint:
