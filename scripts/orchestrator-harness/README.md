@@ -1325,16 +1325,16 @@ dispatch row is a claim that something is wrong:
 | `harness=source-dirty:<sha12>` | (a) | the record names `<sha12>` — **this** commit — but its own `sourceDirty=true` (or, for a legacy *stamp* record, `agentInfraDirty=true`) says the deploy was staged from a checkout with uncommitted changes, so `<sha12>` does **not** describe the bytes on the box | redeploy from a **clean** checkout: that is what makes the box identifiable at all |
 | `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
 | `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
-| `harness=executes:<dir>` | **neither — it is a statement about the PROCESS** | a live controller is **executing** `<dir>/orch-loop.sh` and that directory **does not exist** (`--surface` reads it from `ps -eo pid=,command=`, so it is what the box runs rather than what a record says). The pin record, the deploy record and the unit can all be correct — they describe copies at rest — while the tree that is running is gone (#10114, #3194) | **restart the controller from the pinned tree** (`scripts/harness-up`); redeploying `$O` cannot clear it |
+| `harness=executes:<dir>` | **neither — it is a statement about the PROCESS** | a live controller is **executing** `<dir>/orch-loop.sh` and that directory **cannot be matched to this repo**: it **does not exist**, *or* it exists with **no readable `*.sh`** (the interpreter holds a deleted script open, so the process outlives the file) — the `DRIFT(exec)` line above the token says which of the two (`--surface` reads it from the process's own argv, `ps -eo pid=,command=` with `/proc/<pid>/cmdline` where the kernel keeps it, so it is what the box runs rather than what a record says). The pin record, the deploy record and the unit can all be correct — they describe copies at rest — while the tree that is running is one of those two states (#10114, #3194) | **restart the controller from the pinned tree** (`scripts/harness-up`); redeploying `$O` cannot clear it |
 | `harness=surface` | neither — not a statement about `$O`'s bytes | a surface hit on a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) is the only failing comparison. It appears in **two shapes**: `$O` was never compared at all — absent, or a `--surface` run that found no readable record for it (the body prints `identity: SKIPPED`) — **or** `$O` was compared and answered clean on all three questions | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it. On the first shape `$O` also has no usable deploy record, so redeploying is what would make the box identifiable |
 
 ### Precedence when more than one state is true
 
 `executes:<dir>` › `uncommitted-edit:<file>` › `behind:`/`diverged:` › `incomplete:<file>` ›
 `source-dirty:<sha12>` › (`surface` | `payload-differs`). The token is ONE line, so the order is the
-answer to "which fact does an operator act on first": the code that is RUNNING is not on the box at
-all (and no redeploy of `$O` reaches it), then unrecoverable bytes, then where the box sits, then code
-that is missing, then a record that cannot describe the box at all, then the last two.
+answer to "which fact does an operator act on first": the code that is RUNNING cannot be matched to this
+repo at all (and no redeploy of `$O` reaches it), then unrecoverable bytes, then where the box sits, then
+code that is missing, then a record that cannot describe the box at all, then the last two.
 
 **`surface` is never a statement about `$O`'s own bytes, and it has TWO shapes.** A token is printed
 only when the run found a problem (`problems > 0` in the script), and with no `$O` every question
