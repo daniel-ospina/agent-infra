@@ -3530,6 +3530,44 @@ def test_the_two_rc3_causes_are_reproduced_END_TO_END_through_the_REAL_gate(monk
         "the two facts share a code again -- this is the defect #2291 was filed for")
 
 
+def test_a_STALE_rc_cannot_relabel_a_permanent_refusal_as_a_gate_refusal(monkeypatch, tmp_path):
+    """⛔ THE EVIDENCE UNDER A 75 IS FRESH; UNDER ANY OTHER CODE IT IS NOT (agent-infra#3161).
+
+    `nonblocking-dispatch.sh`'s FOREGROUND refusals (78: no spawn-gate / no brief-gate /
+    reviewer-preflight; 80: the brief gate refused) exit BEFORE its `rm -f "$RC"` / `: > "$LOG"`, so
+    a `.rc` and a gate marker in the log can both be LEFTOVER from an earlier dispatch of the same
+    name. Reading them under those codes would report a PERMANENT, fleet-wide code fault as
+    `gate REFUSED rc=75 (load)` — i.e. "wait, it clears by itself" — which is the one direction this
+    file may never be wrong in. So the recovery is bound to 75, the only code the START ASSERTION
+    emits (it runs after both truncations).
+
+    The leftovers here are REAL, which is the only version of this arm that proves anything: the
+    stale pair is exactly what a previous load refusal leaves behind.
+    """
+    d, wt = _orch(tmp_path, "run_agent() { :; }\n")
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    name = pr.worker_name(5)
+    bg = pathlib.Path(d) / "bg"
+    bg.mkdir(parents=True, exist_ok=True)
+    (bg / (name + ".rc")).write_text("75\n")                     # stale: an EARLIER load refusal
+    (bg / (name + ".log")).write_text(
+        '[load-gate] REFUSED x: load=99 >= max_load=40 — no agent started\n')   # stale too
+    real = pr.sh_err
+
+    def fake(argv, timeout=180, cwd=None, env=None, capture=True):
+        if "--status" in argv:
+            return real(argv, timeout=timeout, cwd=cwd, env=env, capture=capture)
+        return ("", "nonblocking-dispatch.sh: REFUSED — brief-gate=/o/brief-gate.sh judged the "
+                     "brief at /o/p and refused it (agent-infra#2258)", 80)
+
+    monkeypatch.setattr(pr, "sh_err", fake)
+    ok, detail, record = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert "gate REFUSED" not in detail, (
+        "a permanent brief refusal was relabelled from LEFTOVER gate evidence: %r" % detail)
+    assert detail.startswith("rc=80:"), detail
+
+
 def _through_the_real_transport(monkeypatch, tmp_path, run_agent_body, dispatcher=None):
     """One real pass: real `nonblocking-dispatch.sh`, stub gate, everything else stubbed.
 

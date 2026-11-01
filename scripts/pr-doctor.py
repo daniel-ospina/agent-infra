@@ -4267,7 +4267,16 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # distinction the assertion was added to create. So ask the SAME durable artifact `_confirm()`
         # asks, with the SAME predicate (`gate_refused`: a GATE_REFUSAL code AND the gate's own marker
         # in the worker log AND no `[timeout] agent pid=` line) -- never a second definition here.
-        code = read_rc(bg_path(name, "rc"))
+        # ⛔ ONLY 75, AND THAT IS THE WHOLE GUARD AGAINST STALE EVIDENCE. Every FOREGROUND refusal in
+        # the dispatcher exits 78 (no spawn-gate / no brief-gate / reviewer-preflight) or 80 (the brief
+        # gate refused) and those paths run BEFORE its `rm -f "$RC"` / `: > "$LOG"` -- so a `.rc`,
+        # and a gate marker in the log, can both be LEFTOVER from an earlier dispatch of this same
+        # name. Reading them under an 80 would report a PERMANENT, fleet-wide brief refusal as
+        # `gate REFUSED rc=75 (load)` -- "wait, it clears by itself" -- which is the one direction this
+        # file may never be wrong in. 75 is emitted by the start assertion alone
+        # (`NOT STARTED` / `FAILED EARLY` / `finished early`), and that assertion runs after the two
+        # truncations, so 75 is exactly the code whose durable evidence is guaranteed fresh.
+        code = read_rc(bg_path(name, "rc")) if rc == 75 else None
         if code is not None and gate_refused(name, code):
             detail = "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
             log("spawn %s: %s -- no agent started, nothing consumed" % (name, detail))
