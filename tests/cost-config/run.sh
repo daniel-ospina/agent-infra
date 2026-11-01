@@ -3,8 +3,8 @@
 # #341 — cost-config drift-guard tests.
 #
 # Exercises scripts/check-cost-config.sh semantics:
-#   1. clean fixture (deepseek ids @300K clamp)    → PASS (exit 0)
-#   2. models.json drift (deepseek id > 300K)      → BLOCK (exit 1)
+#   1. clean fixture (deepseek ids @800K clamp)    → PASS (exit 0)
+#   2. models.json drift (deepseek id > 800K)      → BLOCK (exit 1)
 #      (positive controls: the v4-pro family, the legacy v4-flash alias, the
 #      canonical deepseek-flash id + its future bare `deepseek-pro`
 #      counterpart, dotted deepseek-v4.1 ids, hyphenated deepseek-v4-1 ids
@@ -49,7 +49,7 @@
 #   7. --shipped-only                              → exit 0, no live-dir access
 #   8. MINIFIED models.json (1M backdoor)           → BLOCK (exit 1) —
 #      format-independent detection (P1 regression pin)
-#   9. MINIFIED clean models.json (300K clamp)     → PASS (exit 0)
+#   9. MINIFIED clean models.json (800K clamp)     → PASS (exit 0)
 #  10. missing SHIPPED models.json                  → BLOCK (exit 1, authority
 #      deleted = clamp gone)
 #  11. missing LIVE models.json (first-install)     → WARN (exit 0)
@@ -159,7 +159,7 @@ done
 [ "$ok" = 1 ] && pass "all fixture JSON files parse"
 
 echo ""
-echo "1. Clean fixture (300K clamp) → PASS"
+echo "1. Clean fixture (800K clamp) → PASS"
 run_guard 0 "clean fixture" --live-dir "$FIX/clean"
 if grep -q "✅ cost-config guard: PASS" "$OUT"; then pass "summary PASS"; else fail "expected PASS summary"; tail -20 "$OUT"; fi
 
@@ -226,7 +226,7 @@ if grep -q "deepseek-proxy" "$OUT"; then fail "minified negative control deepsee
 if grep -q "deepseek-flashlight" "$OUT"; then fail "minified negative control deepseek-flashlight was flagged"; else pass "minified deepseek-flashlight (non-family) not flagged"; fi
 
 echo ""
-echo "9. MINIFIED clean models.json (300K clamp) → PASS, exit 0"
+echo "9. MINIFIED clean models.json (800K clamp) → PASS, exit 0"
 run_guard 0 "clean-minified" --live-dir "$FIX/clean-minified"
 if grep -q "✅ cost-config guard: PASS" "$OUT"; then pass "summary PASS"; else fail "expected PASS summary"; tail -20 "$OUT"; fi
 
@@ -1757,7 +1757,7 @@ open(g, "w").write(src.replace("CLAMP=800000", "CLAMP=1000000"))
 d = json.load(open(sp))
 d["compaction"]["reserveTokens"] = 216384     # 1000000 - 783616: the geometry still matches
 json.dump(d, open(sp, "w"), indent=2)
-# The GEOMETRY ANCHOR must hold too: a 1000000 CLAMP with 300000 windows is exactly the window the
+# The GEOMETRY ANCHOR must hold too: a 1000000 CLAMP with 800000 windows is exactly the window the
 # derived leg would be wrong about. Move the deepseek-served windows with the CLAMP so this fixture
 # isolates the INDEPENDENT pin rather than tripping the anchor first (test 43 exercises the anchor).
 DS = re.compile(r'^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)')
@@ -1782,7 +1782,7 @@ then
   grep -q '^CLAMP=1000000$' "$TMP38/scripts/check-cost-config.sh" || fail "38 fixture: the CLAMP mutation did not take effect"
   python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["compaction"]["reserveTokens"] == 216384 else 1)' "$TMP38/pi-bootstrap/pi-config/settings.json" || fail "38 fixture: the reserve mutation did not take effect"
   # The third mutation — the models.json window walk — must also be asserted (as test 40 does for
-  # its own). Unguarded, a no-op walk leaves the windows at 300000, the ANCHOR fires instead of the
+  # its own). Unguarded, a no-op walk leaves the windows at 800000, the ANCHOR fires instead of the
   # independent pin, the guard still exits 1, and the two arms below still pass: the test would
   # report that it isolated the pin when it did not.
   python3 -c 'import json,re,sys
@@ -2004,7 +2004,7 @@ PYEOF
 then
   bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
   code=$?
-  if [ "$code" -eq 1 ]; then pass "1M floors moved but the windows left at 300000 → exit 1"; else fail "expected exit 1 for the half-revert (windows left behind), got $code"; sed -n '1,30p' "$OUT"; fi
+  if [ "$code" -eq 1 ]; then pass "1M floors moved but the windows left at 800000 → exit 1"; else fail "expected exit 1 for the half-revert (windows left behind), got $code"; sed -n '1,30p' "$OUT"; fi
   if grep -q "geometry anchor is 1000000" "$OUT"; then pass "the block names the anchor and the window it found"; else fail "expected the geometry-anchor message"; sed -n '1,30p' "$OUT"; fi
 else
   fail "43 fixture (a) mutation FAILED — the test cannot observe the condition, so it must not report the arms"
