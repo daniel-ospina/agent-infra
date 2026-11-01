@@ -259,6 +259,57 @@ jobs:
           fi
           PIPELINE_COMPLIANCE_SELF_TEST=1 bash scripts/check-pipeline-compliance.sh
 
+      - name: Run the revalidation script's fixture suite (#2467 — PR lane)
+        # #2467 — `scripts/revalidate-required-check-on-issue-comment.sh` ships ~40
+        # assertions and was wired into CI in exactly ONE place: a later step of the
+        # `revalidate-on-issue-comment` job below, whose `if:` admits only an
+        # `issue_comment` on a plain ISSUE. It therefore never executed on any
+        # `pull_request` event, and `scripts/run-bash-shards.sh` does not discover the
+        # file either (its SUITE_GLOBS are `scripts/*.test.sh`, `scripts/*/*.test.sh`,
+        # `scripts/orchestrator-harness/test-*.sh`, `scripts/orchestrator-harness/selftest.sh`,
+        # `tests/*/run.sh`, `pi-bootstrap/tests/*.sh`; SWEEP_GLOBS `scripts/*.sh` gives it
+        # a `bash -n` and nothing more). So a regression in its decisions merged GREEN and
+        # first ran on some later comment, against the default-branch head.
+        #
+        # That matters because the assertions pin exactly the classes this file has
+        # already shipped broken once: a silent INVERSION (`$?` read inside the `then`
+        # block of `if ! cmd`, so every comment exited 2 — measured), and the two-probe
+        # `probe_outcome` symmetry whose one-sided version was a fail-open (a retraction
+        # probed 1 → `skip` → a stale GREEN left standing).
+        #
+        # Placed in THIS job and not as a new shard deliberately: `pipeline-compliance`
+        # is the repo's only required check (#646) and runs on every PR, so this is the
+        # one place the suite blocks a merge — and the shard lane is already at its
+        # runtime bound (`script-validate`'s "Bash shards" step was cancelled at 110 min
+        # on 2026-11-01), so adding a shard would buy the same coverage at the cost of a
+        # lane that is already timing out.
+        #
+        # Also: the comment job's OWN copy was moved to run before its live step
+        # (see that job), because a self-test that is a LATER step of a job is skipped
+        # whenever the live step exits non-zero — i.e. exactly when the code is
+        # misbehaving.
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/revalidate-required-check-on-issue-comment.sh ]; then
+            # Two signals make this an agent-infra-ONLY script, so a consumer reusing
+            # this workflow via `workflow_call` must not be reddened by its absence —
+            # while an agent-infra checkout that lost the file fails closed rather than
+            # silently dropping the suite (#991).
+            if [ -f pi-bootstrap/setup.sh ] || [ -f bin/agent-infra.js ]; then
+              echo "::error::agent-infra checkout detected but scripts/revalidate-required-check-on-issue-comment.sh is missing — its assertions would silently stop running (#2467)."
+              exit 1
+            fi
+            echo "::notice::consumer checkout — revalidate-required-check fixture suite skipped"
+            exit 0
+          fi
+          # Fail closed on the seam, exactly as the step above does: a renamed or
+          # removed `REVALIDATE_SELF_TEST` seam must fail loudly, never `exit 0`.
+          if ! grep -q 'REVALIDATE_SELF_TEST' scripts/revalidate-required-check-on-issue-comment.sh; then
+            echo "::error::scripts/revalidate-required-check-on-issue-comment.sh carries no REVALIDATE_SELF_TEST seam, so its fixture cannot run — and a fixture nothing runs pins nothing (#991)."
+            exit 1
+          fi
+          REVALIDATE_SELF_TEST=1 bash scripts/revalidate-required-check-on-issue-comment.sh
+
       - name: AGENTS.md materialize gate suite (#1027 — base-owned region pin)
         # #1027 — `scripts/materialize-agents.sh --check` validated the base rule
         # headings by PRESENCE only: a base-owned paragraph could be deleted, or a
@@ -349,6 +400,22 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v4
+      # ⛔ THE SELF-TEST RUNS FIRST, NOT LAST (#2467 review, secondary). A self-test
+      # placed AFTER the live step is skipped whenever the live step exits non-zero —
+      # i.e. exactly when the code is misbehaving and the assertions matter most. It
+      # is pure shell with no `gh` calls and no token, so ordering it first costs
+      # nothing and cannot flake. (The PR lane runs it too, from
+      # `pipeline-compliance`'s step `Run the revalidation script's fixture suite`,
+      # so it does not depend on this job's narrow `if:` to be executed at all.)
+      - name: Revalidation self-test (the pure decisions)
+        run: |
+          set -euo pipefail
+          if ! grep -q 'REVALIDATE_SELF_TEST' scripts/revalidate-required-check-on-issue-comment.sh; then
+            echo "::error::scripts/revalidate-required-check-on-issue-comment.sh carries no REVALIDATE_SELF_TEST seam — its decisions would be unpinned" >&2
+            exit 1
+          fi
+          REVALIDATE_SELF_TEST=1 bash scripts/revalidate-required-check-on-issue-comment.sh
+
       - name: Revalidate the required check against the current issue state
         # The comment body goes through the ENVIRONMENT, never inline: a comment
         # body is attacker-influenced text and `${{ }}` interpolation would run
@@ -373,15 +440,6 @@ jobs:
             exit 1
           fi
           bash scripts/revalidate-required-check-on-issue-comment.sh
-
-      - name: Revalidation self-test (the pure decisions)
-        run: |
-          set -euo pipefail
-          if ! grep -q 'REVALIDATE_SELF_TEST' scripts/revalidate-required-check-on-issue-comment.sh; then
-            echo "::error::scripts/revalidate-required-check-on-issue-comment.sh carries no REVALIDATE_SELF_TEST seam — its decisions would be unpinned" >&2
-            exit 1
-          fi
-          REVALIDATE_SELF_TEST=1 bash scripts/revalidate-required-check-on-issue-comment.sh
 
   workflow-drift:
     # The same guard the required job carries: a comment cannot change a reusable
