@@ -11,13 +11,17 @@
 # the issue path MAY open (the #2832 escape), but the stall must ALSO put a worker
 # on the land problem — so the box cannot report a deadlock into a void.
 #
-# The worker it dispatches is a `prfix` (KIND), which the creation back-pressure
-# gate lets through — because this work IS the drain, not new work.
+# The worker it dispatches declares KIND=`prfix`, because this work IS the drain, not new work.
+# ⛔ THAT KIND IS MEASURED, NOT EXEMPTED (review P2, 2026-11-01): only a worktree that provably IS an
+# open PR at its HEAD earns the `prfix` exemption, and this one is detached at `origin/main` — so the
+# ordinary landing-ratio gate decides, and a drain stall is precisely when that ratio is over the
+# ceiling. The dispatch can therefore be HELD, and this script says which happened instead of
+# assuming it (see "WHY ITS EXIT STATUS IS NOT THE VERDICT" at the dispatch).
 #
 # Bounded: one dispatch per DRAIN_STALL_FIX_EVERY stalled passes (default 3), so a
 # stall that nobody fixes does not spawn a worker per cycle forever.
 #
-# Exit: 0 dispatched or deliberately skipped (with a reason), 2 usage error.
+# Exit: 0 whatever happened to the dispatch (it is reported, never raised), 2 usage error.
 set -uo pipefail
 
 O="${O:-$HOME/orchestrator}"
@@ -80,12 +84,15 @@ FIRST ACTION: write `__O__/state/REPORT-stall-fix.md` with a stub. **You are dis
 stall escalation, not by a PR or an issue.** 30 minutes, then report even if unfinished.
 
 ⛔ **YOU OWN NO PR — AND THE "COMMIT AS YOU GO" SECTION APPENDED BELOW DOES NOT APPLY TO YOU.** This
-brief is dispatched with the `prfix` kind for ONE reason: the creation back-pressure gate exempts a
-stall repair as `prfix`. That kind's delivery section contributes the sentence *"Your PR is ALREADY
-OPEN — commit and push onto it, and do NOT open a second PR"*, which describes a FIXER working on an
-existing PR. It does not describe you. **You are READ-ONLY: do not commit, do not push, do not open,
-re-open or touch any PR.** Your only output is `__O__/state/REPORT-stall-fix.md`. If the two
-instructions conflict, this one governs.
+brief is dispatched with the `prfix` kind because a stall repair is drain work, not new work. ⛔ That
+kind is MEASURED, not exempted (see the `KIND=prfix` note in the dispatcher): the creation
+back-pressure gate reads the landing ratio and can HOLD this dispatch on exactly the box that is
+stalled. That decision is not yours and not the brief's — it happened before you were started, so if
+you are reading this you were admitted. The kind's delivery section contributes the sentence *"Your PR
+is ALREADY OPEN — commit and push onto it, and do NOT open a second PR"*, which describes a FIXER
+working on an existing PR. It does not describe you. **You are READ-ONLY: do not commit, do not push,
+do not open, re-open or touch any PR.** Your only output is `__O__/state/REPORT-stall-fix.md`. If the
+two instructions conflict, this one governs.
 
 ## Why you exist
 
@@ -178,8 +185,19 @@ if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\)__' "$BRIEF" 2>/dev/null; then
   exit 0
 fi
 
-# KIND=prfix: the creation gate exempts it because the product of this worker IS the
-# drain (spawn-gate.sh §"prfix EXISTS BECAUSE KIND IS NOT A CREATION/REPAIR DISCRIMINATOR").
+# KIND=prfix — A MEASUREMENT, NOT AN EXEMPTION (review P2, 2026-11-01: this comment used to say the
+# creation gate "exempts" a stall repair, which spawn-gate.sh denies). `prfix` is exempt ONLY on proof
+# that this worktree IS an open PR at this HEAD (`spawn-gate.sh:1989-1993`, via
+# `land_backlog_open_pr_evidence`), and a DETACHED worktree at `origin/main` can never produce that
+# proof (`:1970-1978`: the branch rule is skipped because `rev-parse --abbrev-ref HEAD` is `HEAD`, and
+# no open PR's head is main's tip). So this KIND falls through to the ordinary landing-ratio
+# measurement (`:1994-2005`) — and a drain stall IS the state where that ratio is over the ceiling.
+# ⇒ The creation back-pressure gate CAN legitimately HOLD this dispatch, and it is most likely to fire
+# on exactly the box this escalation exists for. That is stated rather than denied, and it is not
+# hidden from the operator: the hold writes `[land-backlog] REFUSED …` to the worker's own log, which
+# the verdict reader below prints as `STALL FIX NOT DISPATCHED` WITH the gate's own line quoted.
+# An exempt `stallfix` KIND would make the escalation unconditional, but that is a change to the #2409
+# gate's own deny-list — not something this file may grant itself, and not something this fix assumes.
 # ⛔ A WORKER NEEDS A REAL GIT WORKTREE, NOT $O. Measured 2026-10-27: passing the
 # runtime dir got `[land-backlog] REFUSED … UNREADABLE repo — this worktree's origin
 # is not a GitHub owner/name slug`, and the worker died in 1s with rc=74. So the
@@ -193,15 +211,114 @@ if [ ! -e "$WT/.git" ]; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no usable worktree: $WT — set HARNESS_REPO)"
   exit 0
 fi
-if KIND=prfix "$DISP" "stallfix-$(date -u '+%H%M%S')" "$WT" "$BRIEF" "$TIMEOUT" prfix >>"$O/logs/stall-fix.log" 2>&1; then
-  log_line "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; brief ${BRIEF#$O/}; report $O/state/REPORT-stall-fix.md)"
-  printf '%s\tstall-fix dispatched\tpass=%s\tunowned=%s\tage_min=%s\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SEEN" "$UNOWNED" "$AGEMIN" >> "$O/state/drain-stall-dispatch.log" 2>/dev/null
-  exit 0
-fi
+# ── THE DISPATCH — AND WHY ITS EXIT STATUS IS NOT THE VERDICT ─────────────────────────────────────
+# ⛔ A REFUSED SPAWN MUST NOT READ AS A DISPATCHED ONE (review P1, 2026-11-01).
+# `nonblocking-dispatch.sh` runs `run_agent` — and with it EVERY spawn gate — inside a backgrounded
+# subshell with `exec >/dev/null 2>&1` (`nonblocking-dispatch.sh:328-331`), and its own header says
+# what that means verbatim: a refusal raised in there "would leave no trace in this caller's output
+# and the dispatcher would report a launch that never happened" (`:124-128`). The script then ends on
+# plain `echo`s (`:375-381`) with no `exit`, so it RETURNS 0 once it reaches the launch — whether an
+# agent started or the load / disk / fork / land-backlog / capability gate refused it. Reading that 0
+# as "a worker started" is the exact false-success this file's own contract forbids, and it is not
+# hypothetical: the `[land-backlog]` gate is the one MOST likely to fire here, because a drain stall
+# is the state it measures (see the KIND=prfix note above).
+#
+# So the verdict is READ FROM EVIDENCE the dispatcher already publishes, never inferred from its rc:
+#   * `$O/bg/<name>.log`      — `run_agent` writes `[<gate>] REFUSED …` there for every gate refusal;
+#   * `$O/bg/<name>.rc`       — written by the worker subshell when `run_agent` RETURNS: an agent ran;
+#   * `$O/bg/<name>.pid`      — the launch pid, live while the worker runs;
+#   * `~/.pi/agent/state/spawn-gate.tsv` — the spawn point's own append-only ledger, one row per `pi`
+#     invocation carrying `verdict` (`allowed`|`refused`), `KIND` and `TAG` (= this worker's name).
+#     An `allowed` row for THIS TAG is the one POSITIVE PROOF an agent started, so it is preferred
+#     where the pi shim is installed; a box without the shim falls back to the record above.
+# The read is BOUNDED (`STALL_FIX_VERIFY_SECS`): the gates run a beat AFTER the launch returns, so the
+# record APPEARS rather than being there at the instant of return.
+NAME="stallfix-$(date -u '+%H%M%S')"
+BGD="$O/bg"; BLOG="$BGD/$NAME.log"; BRC="$BGD/$NAME.rc"; BPID="$BGD/$NAME.pid"
+LG="${HOME:-}/.pi/agent/state/spawn-gate.tsv"
+# The ledger is APPEND-ONLY and shared by every spawn on the box, so the byte offset taken BEFORE the
+# launch is what stops a row from an earlier worker (or an earlier run of the same name) answering for
+# THIS one. `tr -cd 0-9` because `wc -c` pads its number on some platforms, and an unreadable offset
+# must degrade to 0 (whole file) rather than to an arithmetic error under `set -u`.
+_lgoff=0
+[ -f "$LG" ] && _lgoff="$(wc -c < "$LG" 2>/dev/null | tr -cd '0-9')"
+is_num "${_lgoff:-}" || _lgoff=0
 
-# ⛔ A FAILED DISPATCH IS LOUD TOO: a stall escalation that cannot start a worker must
-# not read as one that did.
-log_line "DRAIN STALL -> STALL FIX DISPATCH FAILED (nonblocking-dispatch.sh refused; see $O/logs/stall-fix.log) — the box is still stalled"
-printf '%s\tstall-fix DISPATCH FAILED\tpass=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SEEN" >> "$O/state/drain-stall-dispatch.log" 2>/dev/null
-exit 0
+# spawn_row <allowed|refused> — did THIS launch write such a row? The awk reads to EOF (no early
+# `exit` in the rule) so a slow writer cannot SIGPIPE the reader.
+spawn_row() {
+  [ -f "$LG" ] || return 1
+  tail -c "+$(( _lgoff + 1 ))" "$LG" 2>/dev/null \
+    | awk -F'\t' -v want="$1" -v tag="$NAME" '$2 == want && $8 == tag { found = 1 } END { exit(found ? 0 : 1) }'
+}
+# gate_refusal — the FIRST gate refusal `run_agent` wrote for this worker, verbatim (empty if none).
+gate_refusal() {
+  [ -f "$BLOG" ] || return 0
+  awk '/REFUSED/ { print; exit }' "$BLOG" 2>/dev/null
+}
+
+_launch=0
+KIND=prfix "$DISP" "$NAME" "$WT" "$BRIEF" "$TIMEOUT" prfix >>"$O/logs/stall-fix.log" 2>&1 || _launch=$?
+
+_verdict="unproven"; _vmax="${STALL_FIX_VERIFY_SECS:-10}"; _vwaited=0; _bpid=""
+if [ "$_launch" -ne 0 ]; then
+  # A NON-ZERO EXIT IS A FOREGROUND REFUSAL (usage 2, brief-gate 80, missing helper/gate-policy 78, a
+  # `cd` failure): the dispatcher refused BEFORE it forked, so nothing was launched and no worker
+  # record exists. Its remedy text is on this script's own stderr, not the worker log.
+  _verdict="failed"
+else
+  is_num "${_vmax:-}" && [ "$_vmax" -ge 1 ] || _vmax=10
+  [ "$_vmax" -gt 120 ] && _vmax=120
+  while :; do
+    if spawn_row refused; then _verdict=refused; break; fi
+    if spawn_row allowed; then _verdict=started; break; fi
+    if [ -n "$(gate_refusal)" ]; then _verdict=refused; break; fi
+    if [ -s "$BRC" ]; then _verdict=ended; break; fi
+    if [ "$_vwaited" -ge "$_vmax" ]; then
+      _bpid="$(cat "$BPID" 2>/dev/null || true)"
+      is_num "${_bpid:-}" && kill -0 "$_bpid" 2>/dev/null && _verdict=running
+      break
+    fi
+    sleep 1; _vwaited=$(( _vwaited + 1 ))
+  done
+fi
+# One writer for the durable row, so no verdict can be recorded without the sentence that produced it.
+_record() {
+  printf '%s\t%s\tpass=%s\tunowned=%s\tage_min=%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" >> "$O/state/drain-stall-dispatch.log" 2>/dev/null
+}
+
+case "$_verdict" in
+  started)
+    log_line "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; spawn-gate ledger: allowed TAG=$NAME; brief ${BRIEF#$O/}; report $O/state/REPORT-stall-fix.md)"
+    _record "stall-fix dispatched"
+    exit 0 ;;
+  running)
+    # The pid is alive and nothing refused, but this box published no spawn-gate row either (the pi
+    # shim is a per-box install). Say exactly that: a live process is not proof an AGENT started, and
+    # claiming one would be the same fail-open in a narrower window.
+    log_line "DRAIN STALL -> STALL FIX LAUNCH ACCEPTED, AGENT START UNPROVEN (pass ${SEEN}; worker pid ${_bpid:-?} is alive but no spawn-gate ledger row for TAG=$NAME and no refusal within ${_vmax}s — the pi spawn-point ledger may not be installed on this box; brief ${BRIEF#$O/}; worker log $BLOG)"
+    _record "stall-fix launch-accepted (agent start unproven)"
+    exit 0 ;;
+  refused)
+    _g="$(gate_refusal)"
+    log_line "DRAIN STALL -> STALL FIX NOT DISPATCHED (a spawn gate REFUSED this worker, so the box is STILL STALLED): ${_g:-<refusal recorded in the spawn-gate ledger for TAG=$NAME; run: bash $DISP --status $NAME>} — worker log $BLOG"
+    _record "stall-fix NOT DISPATCHED (spawn refused)"
+    exit 0 ;;
+  ended)
+    _rc="$(cat "$BRC" 2>/dev/null || true)"
+    log_line "DRAIN STALL -> STALL FIX RAN AND ALREADY ENDED (pass ${SEEN}; rc=${_rc:-?}) — it DID start, so its report may exist: $O/state/REPORT-stall-fix.md; worker log $BLOG"
+    _record "stall-fix ran-and-ended rc=${_rc:-?}"
+    exit 0 ;;
+  failed)
+    # `nonblocking-dispatch.sh`'s own refusal text went to this script's stderr (`$O/logs/stall-fix.log`
+    # when the controller runs it), and any worker-side refusal to `$BLOG`. Name BOTH: the old message
+    # pointed only at the first, which is where a gate refusal is NOT written.
+    log_line "DRAIN STALL -> STALL FIX DISPATCH FAILED (nonblocking-dispatch.sh refused before launching, exit ${_launch}; see $O/logs/stall-fix.log and $BLOG) — the box is still stalled"
+    _record "stall-fix DISPATCH FAILED (exit ${_launch})"
+    exit 0 ;;
+  *)
+    log_line "DRAIN STALL -> STALL FIX DISPATCH UNPROVEN (pass ${SEEN}; no pid, no exit status, no refusal and no spawn-gate ledger row appeared within ${_vmax}s, so nothing here proves a worker started; brief ${BRIEF#$O/}; worker log $BLOG) — the box is still stalled"
+    _record "stall-fix dispatch unproven"
+    exit 0 ;;
+esac
