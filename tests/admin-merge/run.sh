@@ -15273,6 +15273,22 @@ grep -q "check 'bash-suites (5)'" "$SCEN_EQ/mut-err" 2>/dev/null \
   && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
   || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
 
+
+# ── #10399: the unresolved-check refusal, in both directions ────────────────
+# Run as its OWN process so its assertions are independent of this file's fixture
+# state, and so a failure names the file that failed. ⛔ Without this line the new
+# test is gated by NOTHING: shard discovery is `tests/*/run.sh` only, so a file
+# added beside this one is never executed by CI (nor by check-bash32-parse.sh,
+# which only does `bash -n`) — an inert enforcer is the class this repo treats as
+# category A, not as coverage.
+if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ] || [ -f "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ]; then
+  if bash "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh"; then
+    checks=$((checks + 1)); pass "(n) check-unresolved.sh — the unresolved-check refusal, both directions"
+  else
+    checks=$((checks + 1)); fail "(n) check-unresolved.sh FAILED — see its output above"
+  fi
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
