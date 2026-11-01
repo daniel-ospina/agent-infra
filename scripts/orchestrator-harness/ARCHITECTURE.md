@@ -82,7 +82,7 @@ issue (open, labelled P0/P1/P2, unassigned)
   ├─ chain-merge.sh (chain-<N>)
   │                           polls up to 90 min for a PR on the branch, then runs merge-one.sh
   │                           IN THIS SESSION and exits with merge-one.sh's status. ⛔ It exits AT
-  │                           ONCE — with the gate's code (75 load / 73 memory / 77 disk / 74 land), releasing the
+  │                           ONCE — with the gate's code (75 load / 81 memory / 77 disk / 74 land), releasing the
   │                           cross-box issue claim through its EXIT trap — when `lane.sh` recorded
   │                           a capacity refusal for THIS dispatch, because no PR can ever appear:
   │                           waiting would hold `refs/claims/issue-<N>` and make the issue
