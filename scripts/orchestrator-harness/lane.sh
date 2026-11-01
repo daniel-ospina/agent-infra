@@ -128,13 +128,50 @@ printf '%s\n' "$RESEARCH_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
 # The reaper still re-probes for a live holder before deleting, so a worktree another lane is using,
 # or a `pi`/pytest child still running after the agent returned, keeps its env. Best-effort and loud:
 # `reap_lane_venv` never changes the lane's exit status, and logs every outcome to the lane log.
-trap 'reap_lane_venv "$PWD" "lane $N"' EXIT
+#
+# ── and the WORKTREE + BRANCH go with it when the lane produced nothing (agent-infra#2033) ────────
+# This is the other half of the same trap, and it is the half that keeps the ISSUE dispatchable. A
+# lane that exits with no commit, no push and a clean tree leaves a branch that is 0 commits ahead of
+# origin/main — and the collision pre-flight infers "in flight" from exactly that branch, so a free
+# issue becomes permanently undispatchable on every box (measured: #8090, `feat/8090-tm`, 0 ahead).
+# `wt_reap_if_empty` refuses on anything that could be work (commits ahead, a pushed branch, a dirty
+# tree, a live holder, an unevaluable probe), and a dirty tree is deliberately NOT reaped here: the
+# backup-then-remove policy (`reaped-patches`) belongs to the reaper, not to the dying lane.
+# `SELF` is the ONE from above (the harness/$O directory that also holds spawn-gate.sh) — a second
+# declaration here would be harmless today and a trap the day one of them changes.
+# shellcheck source=/dev/null
+. "$SELF/wt-lifecycle.sh" || { echo "[lane $N] FATAL: $SELF/wt-lifecycle.sh missing — refusing to run a lane whose empty worktree could never be reclaimed (#2033)" >&2; exit 78; }
+LANE_WT="$PWD"
+lane_exit_cleanup() {
+  [ -n "${LANE_WT:-}" ] || return 0
+  reap_lane_venv "$LANE_WT" "lane $N"
+  local repo
+  repo="$(cd "$LANE_WT" 2>/dev/null && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || repo=""
+  case "$repo" in */.git) repo="${repo%/.git}" ;; esac
+  [ -n "$repo" ] || return 0
+  wt_reap_if_empty "$repo" "$LANE_WT" "$BR" "lane $N" || true
+  echo "[lane $N] worktree: $WT_RESULT" >> "$O/logs/lane-$N.log" 2>/dev/null || true
+  return 0
+}
+# ⛔ THE SIGNAL TRAPS ARE LOAD-BEARING, NOT TIDINESS (measured on /bin/bash 3.2.57, 2026-10-18): a
+# shell killed by SIGHUP with only an EXIT trap installed does NOT run that trap. `tmux kill-session`
+# — which `dispatch-merge.sh` uses on its no-chain path, and which an operator uses by hand — delivers
+# SIGHUP, so the cleanup has to be reached by an explicit handler that `exit`s. Each handler clears
+# the traps on entry so the `exit` cannot re-enter it (one cleanup, one exit, status matched to the
+# signal).
+trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 143' TERM
+trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 130' INT
+trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 129' HUP
+trap 'lane_exit_cleanup' EXIT
 # ⛔ ...but NOT on a DRY RUN (agent-infra#2148's `LANE_DRY_RUN` seam, below). No agent ran, so the
 # worktree's `.venv` has no dead holder to reap — and a preview that DELETES a build artifact is
 # exactly the destructive-side-effect class a dry run exists to avoid. The trap is installed
 # conditionally because it is installed before the dry-run branch is reached.
+# ⛔ AND IT CLEARS *ALL FOUR* TRAPS, not just EXIT: `lane_exit_cleanup` is now also reached by the
+# signal handlers, so leaving THOSE armed would let a Ctrl-C in a dry run run the very cleanup the
+# guard is disabling.
 if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
-  trap - EXIT
+  trap - EXIT INT TERM HUP
 fi
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319)
 # This line used to export `AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` UNCONDITIONALLY — a permanent
@@ -450,8 +487,8 @@ if [ "$AGENT_STARTED" = "0" ]; then
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
   # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk`,
-  # `capability` and `land` are the five values the gate can refuse on, and each is chosen by the code
-  # its own caller already distinguishes, so the record can never disagree with the exit status.
+  # `capability`, `skew` and `land` are the six values the gate can refuse on, and each is chosen by the
+  # code its own caller already distinguishes, so the record can never disagree with the exit status.
   # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
   # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
   # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
@@ -490,6 +527,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
+    elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then _cap_gate=skew
     elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
     else _cap_gate=load; fi
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
@@ -512,6 +550,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
       # only the description of what the stand-down buys changes.
       if [ "$_cap_gate" = "land" ]; then
         echo "[lane $N] stand-down recorded: gate=land, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the ratio is re-read; it does NOT free the item for a peer to clear, because the backlog is repo-wide. chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min; the drain is landing the open queue, not waiting." >> "$O/logs/lane-$N.log"
+      elif [ "$_cap_gate" = "skew" ]; then
+        # ⛔ A SIXTH VALUE, AND THE SECOND WHOSE RECORD IS NOT A CAPACITY CLAIM (follow-up review of
+        # #2991, P2). The refusal is a helper/consumer VERSION SKEW or a corrupt helper: it is a property
+        # of the PAIR, not of this box, so "yielded to peers" is false — a peer running the same pair
+        # refuses identically, and the operator's remedy is a `cp` of the helper pair on EVERY box. The
+        # record is still written (chain-merge.sh must stop waiting for a PR that cannot appear), and
+        # the words say exactly what it buys, the same way `land` does.
+        echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is `cp scripts/orchestrator-harness/*.sh \$O/` wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
       else
         echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
       fi
@@ -544,6 +590,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # already idle; the reading they need is the repo's open-PR count against its landing rate, which
     # is on the `[land-backlog] REFUSED` line in the same log.
     echo "[lane $N] NOT started: LAND-BACKLOG — the repo holds more open PRs than its own measured landing rate can absorb (#2409), so new creation is held. This is NOT a capacity refusal: the box is fine and waiting will not clear it. The work is the PR queue — review, rebase or land an open PR; a P0-blocker or a base-red repair is exempt by evidence. Issue returns to the pool." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+    # ⛔ NAMED, AND NAMED AS NOT-A-BOX-FAULT (follow-up review of #2991, P2, measured). The refusal is a
+    # VERSION SKEW between this caller and the deployed `cell-lane-preflight.sh`, or a corrupt copy of
+    # it — the harness's own files, identical on every box. The capability arm below would send the
+    # operator to "repair this box (installed pi/extension set, provider credential) or dispatch the
+    # issue to another box", and both are wrong here: the extension set is fine and the peer refuses
+    # identically. The fix is one `cp` on every box that runs lanes.
+    echo "[lane $N] NOT started: HARNESS/MISMATCH gate refused — this box's caller and its deployed cell-lane-preflight.sh do not agree (a usage/argument skew, or a corrupt copy), so the probe could not measure anything (agent-infra#2991). This is NOT a property of this box and load has nothing to do with it: every box running the same pair refuses identically, so do NOT dispatch the issue to another box. Sync the helper pair — cp scripts/orchestrator-harness/*.sh \$O/ — then re-dispatch. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ NAMED, BECAUSE THE REMEDY IS THE ONE THING WAITING CANNOT BUY (review of #2991, P1). Without
     # this arm a capability refusal fell into the `else` below and the operator read "load gate refused

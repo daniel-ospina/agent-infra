@@ -44,7 +44,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # class this whole list exists for, and the one that ran unobserved for hours on the cells.
 # `worker-terminal.sh` is in it because it is the ONE launcher/census/kill surface (#1702/#2210): a box
 # whose copy is missing or older spawns lanes on a transient terminal or counts 0 workers.
-SHARED="orch-loop.sh harness-refresh.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh install.sh selftest.sh"
+SHARED="orch-loop.sh harness-refresh.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh install.sh selftest.sh"
 # ⛔ THE FORK ARM'S SCOPE IS THIS LIST, AND THE EXCLUSIONS ARE NAMED — NOT SILENT (review P1). The arm
 # can only detect a fork of a file it lists, so a file left out is a fork this check cannot see. That
 # was invisible: the output said "retired location holds no harness scripts" while MOST of the harness
@@ -66,10 +66,13 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # about files no daemon executes, and told the operator "this box cannot run it" about a test suite.
 # Byte COMPARISON still covers every *.sh that IS present, which is what keeps the F5 gain (a stale
 # repo-slug.sh / report.sh / dispatch-merge.sh is still caught).
-# UNION of both sides of this merge — neither list is a superset. This branch adds lane-merge.sh and
-# merge-rate.sh (#2029); origin/main adds brief-gate.sh (#2258) and repo-target.sh (#2724/#2694). A file
-# executed from the installed $O that is absent from this list is a divergence nothing byte-compares.
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh"
+# UNION of both sides of this merge — neither list is a superset. This branch adds `wt-lifecycle.sh`
+# (#2033 — the ONE place a lane worktree/branch is created and reclaimed; `lane.sh`, `fix-one.sh`,
+# `adopt-fix.sh` and `dispatch-merge.sh` all `. "$SELF/wt-lifecycle.sh" || exit 78`, so a `$O` without
+# it stops every dispatch); origin/main adds brief-gate.sh (#2258), repo-target.sh (#2724/#2694) and
+# harness-provenance.sh. A file executed from the installed $O that is absent from this list is a
+# divergence nothing byte-compares.
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh"
 # …`harness-provenance.sh` joins the OPERATOR-SURFACE half of this list on the same test as
 # `check-deployed-drift.sh`: nothing on the daemon runs it, and the operator is told to run it from the
 # DEPLOYED tree — `bash ~/orchestrator/harness-provenance.sh show --o ~/orchestrator` is README §4.3's
@@ -87,6 +90,9 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-ga
 # `brief-gate.sh` (origin/main, #2258) is presence-required for the same class: it is the RESEARCH
 # validator lane.sh/fix-one.sh/merge-one.sh execute, and a $O predating it makes each of them refuse.
 # `repo-target.sh` (origin/main, #2724/#2694) is presence-required for the same class one layer down.
+# `wt-lifecycle.sh` (this branch, #2033) is presence-required on the sharpest version of the test: four
+# callers `. "$SELF/wt-lifecycle.sh" || exit 78` before they materialise anything, so a `$O` that
+# predates it refuses EVERY dispatch instead of falling back to the residue-leaving shape.
 # …and `rail-refusal.sh` is here for the same reason `live-ownership.sh` is: the daemon SOURCES it
 # (orch-loop.sh reads the record, merge-one.sh and the cell doctor write it). A `$O` without it makes
 # every rail refusal invisible to the red-fixer role — a quiet loss of the whole role, not a crash.

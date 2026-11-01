@@ -3181,10 +3181,21 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
     # it and returned 1 unconditionally — so when the probe said OWNED (a lock that appeared between the
     # `pr_owned` call and this one, or a claim caught mid-creation) the arms SPAWNED A SECOND WORKER on
     # a live claim and logged it as a release. Only rc=1 is a release.
-    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then return 0; fi
+    # ⛔ AND AN OWNED VERDICT THAT REPORTS A DESTRUCTION IS NOT DISCARDED (review of #3096, P2-3). rc 0 is
+    # "owned", so the old one-liner threw `_v` away — but three of `pl_verdict`'s OWNED sentences exist ONLY
+    # to be read: a claim this pass detached and could not put back (`peer may be working blind`), and a
+    # record that vanished mid-reclaim. Leaving no artifact for those is the "process claim with no
+    # evidence" class this file bans, and `fix-one.sh`'s equivalent outcome writes a WARNING line.
+    _tab="$(printf '\t')"
+    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then
+      case "$_v" in
+        *'could NOT be put back'*|*VANISHED*|*'could NOT be detached'*)
+          echo "[lock] #$pr — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true ;;
+      esac
+      return 0
+    fi
     # Strip the verdict label with a REAL TAB: `${_v#RELEASED\t}` never matched (bash reads `\t` in a
     # pattern as an escaped `t`), so every reap line printed a duplicated label and a raw tab — review P2.
-    _tab="$(printf '\t')"
     echo "[reap] #$pr released — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true
     return 1
   fi
