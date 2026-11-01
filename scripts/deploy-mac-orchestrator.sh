@@ -195,10 +195,13 @@ elif [ "$DISC_RC" -eq 1 ]; then
   exit 78
 elif [ "$DISC_RC" -ne 0 ]; then
   # CANNOT-VERIFY: the refusal cannot fire, but silence about it is how the next redeploy quietly
-  # reverts a patch. Said out loud, once, on the path that will overwrite — and the two reasons are
-  # NAMED apart: "this ref ships no checker" is a DIFFERENT problem (deploy from a ref that has one)
-  # from "the box carries no record" (record it). Handing an operator the wrong one sends them to a
-  # remedy that cannot work.
+  # reverts a patch. Said out loud, once, on the path that will overwrite — and the states are NAMED
+  # apart: "nothing is there yet" is the strongest fact; "this ref ships no checker" is a DIFFERENT
+  # problem (deploy from a ref that has one); and the third takes EVERY other code, so it names only
+  # that NO ANSWER was produced and prints the checker's own verdict. ⛔ This preamble used to say the
+  # third one meant "the box carries no record" (record it) — the same guess the arm itself carried,
+  # which was false on most of it (#3089). Handing an operator the wrong remedy sends them to one
+  # that cannot work, and a comment that re-states the guess reintroduces it for the next reader.
   if [ ! -d "$O" ]; then
     # ORDER MATTERS: "nothing is there" is the strongest fact, and it is true regardless of which
     # checker the ref ships. Nested under either other branch it produced a false alarm about files
@@ -224,8 +227,18 @@ elif [ "$DISC_RC" -ne 0 ]; then
     # `--src '<the harness dir it currently is>'`, i.e. `$O` itself, which the writer REFUSES by design
     # ("refusing to record ... from itself"). Three ways unusable. What actually works on this path is
     # this run: it writes the record at the end.
-    log "WARN: cannot tell whether $O carries uncommitted edits — no readable provenance record there."
-    log "      every file this run overwrites is UNRECOVERABLE, and nothing can tell you which they are."
+    # ⛔ "NO READABLE RECORD THERE" WAS A GUESS, AND A FALSE ONE ON MOST OF THIS ARM (measured
+    # 2026-10-30, review of #3053): this branch takes every code that is neither 0 nor 1 — `files=0`,
+    # a `files=` count that disagrees with the manifest, an unparseable manifest line, an unreadable
+    # file (all rc 2 with a record that is PRESENT and READABLE) and `die`'s 78. ⛔ NOT `commit=UNKNOWN`:
+    # `check` never reads the commit field (only `show` does) — measured, a `commit=UNKNOWN` record exits
+    # 0 clean and 1 after an edit, never 2 (review of #3090). The checker printed the reason; this branch
+    # used to discard it and assert a cause instead. Claim only what is known — no answer was produced —
+    # and print the checker's own verdict above it.
+    printf '%s\n' "$DISC_OUT" >&2
+    log "WARN: cannot tell whether $O carries uncommitted edits — the provenance record could not be USED"
+    log "      (the checker's own verdict is above). The files this run overwrites may include bytes no"
+    log "      deploy wrote — those are NOT recoverable, and nothing here can tell you which they are."
     if [ "$PHASE" = "A" ]; then
       log "      Proceed deliberately with --accept-discard. NOTE: a PHASE=A run does NOT write the record"
       log "      (it exits before phase B); run the full deploy to record the box, and until then this"
