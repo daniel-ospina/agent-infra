@@ -144,6 +144,56 @@ printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on'
 printf '%s\n' '/dev/fixture 100000000 1 20480000 1% /'
 SH
 chmod +x "$TMP/df"; chmod +x "$TMP/tmux"
+# ⛔ THE `roles` BLOCK IS A SECOND BOX READOUT, AND ITS TWO INPUTS ARE FIXTURES TOO — the same
+# discipline as `df`, the load file, `HU_PS` and `tmux` above, for the same reason. `harness-up
+# status` folds the role table's rc into the ONE verdict line (`_hu_take "$_role_rc"`, harness-up
+# 2490-2493), so an unfixtured role row grades the HOST and drags every arm that asserts `VERDICT:
+# HEALTHY` with it. MEASURED at origin/main 6da181ef: the (a) GREEN control's screen was OK in every
+# row it is actually about — exec, loop, capacity, lanes, selftest, next, refresh, claims,
+# supervisor, drift — and `VERDICT: DEGRADED` (rc=1) on the role table ALONE, so the arm could not
+# pass as written (2 of 167 red, both in this control).
+# Two inputs, and NEITHER is this suite's subject:
+#   - ${SYSTEMCTL:-systemctl} (harness-roles.sh:403) is the REAL systemd of whatever host runs the
+#     suite - it answered for THIS box, whose watchdog/reminder timers are genuinely not installed.
+#     harness-roles.test.sh owns the systemd reader itself (it fixtures SYSTEMCTL and covers
+#     RUNNING/FAILED/NEVER-INSTALLED/SKIPPED/DANGLING plus a mutation of the never-installed branch).
+#   - $O/state/roles (hr_state_doctor, harness-roles.sh:525-532, `[ -d "$rd" ] || NEVER-INSTALLED`)
+#     lives under $CELL_HOME/orchestrator - a directory this suite INVENTS in mktemp and never wrote,
+#     so `doctor` reported NEVER-INSTALLED on EVERY host, including a pristine one. That half is
+#     box-INDEPENDENT, which is what makes this a defect in the fixture and not an ENV-correct answer
+#     about a degraded box: proved by running this arm with only the systemd half fixtured (every
+#     unit installed and active, exactly what a pristine box answers) - the verdict still read
+#     DEGRADED, so `doctor` alone forced it, and no host could ever have satisfied the assertion.
+#     THIS READER IS OWNED BY NO SUITE: measured, `grep -rn hr_state_doctor --include='*.test.sh'`
+#     matched only the comment you are reading. Its NEVER-INSTALLED / NEVER-STARTED / DEAD / FAILED /
+#     stale branches have no negative test anywhere, so the fixture below covers the HEALTHY
+#     direction only. That gap is PRE-EXISTING and is recorded as a follow-up on #3174 - said here
+#     rather than claiming a coverage arrangement that does not exist (the #3174 reviewer falsified
+#     an earlier wording of this paragraph).
+# NOTHING IN THE HEALTH CHECK IS WEAKENED BY THIS: the surface still reads each role's own
+# artefact, still prints NEVER-INSTALLED/NEVER-STARTED when it is true, and still folds rc=1 into
+# DEGRADED. Only the two HOST-side inputs of the arm are fixed, exactly as `df` is.
+mkdir -p "$TMP/units"
+for u in eldato-orchestrator.service eldato-harness-apply.timer \
+         eldato-controller-watchdog.timer eldato-objective-reminder.timer; do
+  printf 'ExecStart=/bin/sh\n' > "$TMP/units/$u"   # a live ExecStart, so the DANGLING check passes
+done
+# Unquoted delimiter so $TMP expands; `\$` keeps the script's own vars for run time.
+cat > "$TMP/systemctl" <<SH
+#!/bin/sh
+unit=""
+for a in "\$@"; do case "\$a" in *.service|*.timer) unit="\$a" ;; esac; done
+case "\$*" in
+  *FragmentPath*) printf 'FragmentPath=$TMP/units/%s\nActiveState=active\nResult=success\nExecMainStatus=0\n' "\$unit" ;;
+esac
+exit 0
+SH
+chmod +x "$TMP/systemctl"
+# The doctor's own evidence: the role-record dir it reads, with one completed, clean pass. The tmux
+# stub above already answers `has-session =cell-doctor`, so the session-liveness leg is live.
+mkdir -p "$CELL/orchestrator/state/roles"
+printf 'last_pass_epoch=%s\nlast_rc=0\nlast_result=ok\n' "$(date +%s)" \
+  > "$CELL/orchestrator/state/roles/reap"
 # A load fixture: `HU_LOADAVG_FILE` is the seam (a suite cannot change the box's load).
 printf '4.00 1.00 0.50 1/100 4242\n' > "$TMP/load"
 
