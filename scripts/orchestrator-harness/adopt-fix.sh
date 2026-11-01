@@ -21,16 +21,27 @@ if [ "$ADOPT_ASSERT_RC" -ne 0 ]; then
   echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the checkout $REPO_ABS is not $OR; nothing fetched, no worktree built, no attempt consumed" >> "$O/logs/adopt-$PR.log"
   exit "$ADOPT_ASSERT_RC"
 fi
-git fetch origin "$BR" --quiet 2>/dev/null || true
+# The worktree lifecycle helper (#2033): a failed `worktree add` here used to leave the branch — and
+# for a foreign branch that is the ONE ref the adopt path just fetched, so the residue was durable.
+# shellcheck source=/dev/null
+. "$SELF/wt-lifecycle.sh" || { echo "[adopt-fix $PR] FATAL: $SELF/wt-lifecycle.sh missing — refusing to adopt without its rollback (#2033)" | tee -a "$O/logs/adopt-$PR.log"; exit 78; }
+# ⛔ NAME THE DESTINATION (#3009): a bare `fetch origin "$BR"` leaves FETCH_HEAD and creates
+# `refs/remotes/origin/$BR` only when the clone's configured refspec maps that source — true on a
+# full clone, FALSE on a cell's single-branch clone (`remote.origin.fetch` = `+refs/heads/main:…`).
+# The leading `+` tolerates the force-push a PR branch routinely gets. This fetch is what the
+# NEXT block needs (`origin/$BR` must resolve), and what the peer lanes read.
+git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet 2>/dev/null || true
 WT=".worktrees/adopt-$PR"
-# Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
-# `pipefail` would re-run `worktree add` over an existing worktree and abort (#864).
-wt_registered=0
-case "$(git worktree list 2>/dev/null || true)" in *"/$WT "*) wt_registered=1 ;; esac
-if [ "$wt_registered" -eq 0 ]; then
-  git worktree add "$WT" "$BR" >/dev/null 2>&1 || { echo "[adopt-fix $PR] worktree add failed for $BR" | tee -a "$O/logs/adopt-$PR.log"; exit 1; }
+# `wt_provision` creates the worktree OR leaves nothing behind, ATTACHES the existing branch when it
+# holds commits (the normal adopt case), and repairs a half-materialised/interrupted record instead of
+# trusting it. It replaces the directory-name probe, which tested a NAME rather than a branch (#2033).
+wt_provision "$REPO" "$WT" "$BR" "origin/$BR"
+_wt_rc=$?
+if [ "$_wt_rc" != 0 ]; then
+  echo "[adopt-fix $PR] $WT_RESULT — cannot adopt $BR" | tee -a "$O/logs/adopt-$PR.log"
+  exit 1
 fi
-echo "[adopt-fix $PR] worktree=$WT branch=$BR $(date)" >> "$O/logs/adopt-$PR.log"
+echo "[adopt-fix $PR] worktree=$WT branch=$BR ($WT_RESULT) $(date)" >> "$O/logs/adopt-$PR.log"
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
 # 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate

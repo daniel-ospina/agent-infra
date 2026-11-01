@@ -767,7 +767,8 @@ jobs:
         # required check (#646), so the BLOCKING backstop is the post-merge
         # ci-main.yml `extensions/shared/*.test.ts` glob. The `builtin-tools`
         # half of the parity assertion (the real child factory + the real
-        # parser) needs `npm ci` and therefore runs post-merge only.
+        # parser) needs `npm ci` and therefore runs on the push lane only (`main` post-merge,
+        # plus `integration/**` since #3131).
         run: npx tsx extensions/shared/declared-surface.test.ts
       - name: Heartbeat progress-edge declaration drift gate (#1068, zero-dep)
         # The SECOND suite of the #1068 pair, as its own step on purpose: `&&`
@@ -856,8 +857,10 @@ jobs:
         # load try/catch, leaving the fail-safe defaults for the bindings at or
         # after the abort point bound). No gate could see it: the
         # sibling extensions/main-worktree-guard/test.mjs imports
-        # classify-git.mjs DIRECTLY, and the extensions/*/test*.mjs glob is
-        # post-merge only (ci-main.yml). Its own step here, not a second
+        # classify-git.mjs DIRECTLY, and the extensions/*/test*.mjs glob runs on the
+        # push lane only (ci-main.yml: `main`, plus `integration/**` since #3131 — never
+        # on a PR), so this per-PR step is the only thing that runs #744 before a merge.
+        # Its own step here, not a second
         # `test-command` line above — that value is pinned by
         # check-pi-pin-lockstep.mjs (guard (j)) to exactly this one accumulator
         # invocation.
@@ -903,8 +906,9 @@ jobs:
         # and drives the tool_call handler against a hermetic hub.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s. Its own step
         # (like #709/#744 above) because the `extensions/*/test*.mjs` glob in
-        # ci-main.yml is POST-MERGE only, and a fail-open regression in a guard
-        # must not reach main before anything reads it.
+        # ci-main.yml runs on the push lane only (`main`, plus `integration/**` since
+        # #3131 -- never on a PR), and a fail-open regression in a guard must not reach
+        # main before anything reads it.
         run: node extensions/main-worktree-guard/test-script-backdoor.mjs
       - name: main-worktree-guard sanctioned-script IDENTITY + pin (#2332)
         # The exemption for `SANCTIONED_SCRIPT_RELPATHS` was a realpath STRING
@@ -943,7 +947,8 @@ jobs:
         # re-cut ⇒ pass.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step
         # for the same reason as the suite above: the `extensions/*/test*.mjs`
-        # glob in ci-main.yml is POST-MERGE only.
+        # glob in ci-main.yml runs on the push lane only (`main`, plus
+        # `integration/**` since #3131), never on a PR.
         run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"
       - name: main-worktree-guard pin freshness is a property of ONE commit (#2818)
         # The non-vacuity rig for the line above. Hermetic git repos build the
@@ -996,7 +1001,8 @@ jobs:
         # and every bootstrapped consumer repo symlinks `scripts/` (#387), so
         # this is the normal case, not an edge case.
         # Its own step (like #744/#709 above) because the
-        # `extensions/*/test*.mjs` glob in ci-main.yml is POST-MERGE only.
+        # `extensions/*/test*.mjs` glob in ci-main.yml runs on the push lane only
+        # (`main` post-merge, plus `integration/**` since #3131) — never on a PR.
         # Positive control: spawns the REAL gates through symlinked paths.
         # Zero-dep (`node:*` only), no `npm ci`, ~3s.
         run: node extensions/shared/test-is-main.mjs
@@ -1006,8 +1012,9 @@ jobs:
         # in-checkout enumeration into a filesystem-wide walk that could report
         # green over a tree that is not the checkout's. Its own step (like
         # #708/#744/#709 above) because the `extensions/*/test*.mjs` glob in
-        # ci-main.yml is POST-MERGE only, and a fail-open regression in a
-        # verifier should not reach main before anything reads it.
+        # ci-main.yml runs on the push lane only (`main`, plus `integration/**` since
+        # #3131 -- never on a PR), and a fail-open regression in a verifier should not
+        # reach main before anything reads it.
         # Hermetic (temp fixtures, a tiny sentinel tree — never `/`), zero-dep
         # (`node:*` + bash), no `npm ci`, ~2s. The suite is bidirectional: the
         # vulnerable form (`find <dir>/`, `find -H`, `find -L`) is executed and
