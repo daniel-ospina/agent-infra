@@ -232,6 +232,41 @@ grep -q 'never search the filesystem for an interpreter' "$BRIEF_FILE" 2>/dev/nu
 grep -q '`uv sync --extra embeddings --extra parity`' "$BRIEF_FILE" 2>/dev/null
 ck $? "no backtick span in the grown heredoc was executed at prompt-build time (#1835 class)"
 [ ! -s "$TMP/stderr" ] || [ -z "$(grep -v '^$' "$TMP/stderr")" ]; ck $? "the dry run writes nothing to stderr"
+
+# ⛔ SOURCING THE ENV FILE MUST NOT REPLACE THE DISPATCH (agent-infra#3174) — and this is the ONLY arm
+# that can tell the pre-fix code from the post-fix code. Everything above passes either way on any box
+# without a `~/keys.env`: `lane-env.sh` then finds no file and `OR` keeps the argument, so deleting the
+# save/restore in `lane.sh` leaves every other arm green (measured, review of #3174, P1). The fixture
+# SUPPLIES the file (`ENV_FILE`, a seam `lane-env.sh` already honours) instead of depending on the box's
+# home, so the arm is red-then-green on a CI runner as well as on a cell.
+# ⛔ AND IT PINS THE CREDENTIAL HALF (#3060): the restore must not become "do not source the file", so
+# the file's canary must still ARRIVE through the very snippet `lane.sh` dots in.
+mkdir -p "$TMP/home"
+{
+  printf 'export OR=someone/else\n'
+  printf 'export N=999\n'
+  printf 'export BR=other/branch\n'
+  printf 'export O=%s\n' "$TMP/clobbered"
+  printf 'export LANE_REPO_DIR=%s\n' "$TMP/not-a-checkout"
+  printf 'export LANE_ENV_CANARY=arrived-3174\n'
+} > "$TMP/keys.env"
+(
+  cd "$TMP" || exit 1
+  HOME="$TMP/home" ENV_FILE="$TMP/keys.env" O="$TMP/o5" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+    bash "$LANE" 2148 fix/2148-reviewer-preflight acme/widget
+) > "$TMP/stdout5" 2>"$TMP/stderr5"
+rc=$?
+ck $rc "a keys.env carrying 'export OR=…' does NOT refuse the dispatch the lane was given (#3174)"
+grep -q 'target=acme/widget' "$TMP/stdout5" 2>/dev/null; ck $? "…the [repo-target] line names the DISPATCHED repo, not the env file's"
+if grep -qF 'someone/else' "$TMP/stdout5" 2>/dev/null; then rc=1; else rc=0; fi
+ck $rc "…and the env file's repo appears NOWHERE in the lane's own output"
+[ -f "$TMP/o5/logs/lane-2148.log" ]; ck $? "…\$O and \$N still come from the DISPATCH (the lane records where it was told)"
+[ ! -e "$TMP/clobbered" ] && [ ! -e "$TMP/not-a-checkout" ]; ck $? "…the env file's \$O/\$LANE_REPO_DIR did not move the lane's record dir or target dir"
+grep -q 'fix/2148-reviewer-preflight' "$TMP/o5/logs/prompt-2148.txt" 2>/dev/null; ck $? "…and \$BR still names the dispatched branch in the generated brief"
+# The canary goes through the SAME snippet `lane.sh` dots in: a "fix" that filters or rewrites the file
+# (the sed/rewrite class lane-env.sh's header exists to forbid) would drop it, and this fails.
+CANARY="$(cd "$TMP" && ENV_FILE="$TMP/keys.env" bash -c ". '$HERE/lane-env.sh' >/dev/null 2>&1; printf '%s' \"\${LANE_ENV_CANARY:-}\"" 2>/dev/null)"
+[ "$CANARY" = "arrived-3174" ]; ck $? "…while the file's CANARY credential still ARRIVES (credentials keep the last word)"
 # Fail-closed: a missing helper must STOP the lane, not silently ship a brief with no reviewer step.
 # ⛔ The restore is a TRAP, not the next line: an interrupted run that left the shipped helper renamed
 # is a broken checkout (selftest.sh renders the brief through it). And the exit code is pinned to 78
@@ -519,6 +554,12 @@ cp "$HERE/brief-gate.sh" "$STRIP/brief-gate.sh"
 # so a rig without it composed NOTHING and the two control arms below were green/failing on an empty
 # artifact, the exact vacuity this section exists to forbid (measured in CI: 133 passed, 2 failed).
 cp "$HERE/gate-policy.sh" "$STRIP/gate-policy.sh"
+# ⛔ AND `lane-env.sh`, WHICH BECAME THE SAME CLASS OF HARD REQUIREMENT (#3060, measured red in CI).
+# `lane.sh` refuses with 78 when the snippet is not beside it — a FAIL-CLOSED guard that is correct,
+# but it made this rig compose NOTHING (rc=78 `lane-env.sh missing`), so the control arms below were
+# vacuous in CI while passing on a box whose harness tree happened to hold the real copy. Same rule as
+# every other module here: copy it in, so the rig carries everything the lane hard-requires.
+cp "$HERE/lane-env.sh" "$STRIP/lane-env.sh"
 sed '/^- \*\*\[d\] plan evidence\*\*/,+2d' "$HELPER" > "$STRIP/reviewer-preflight.sh"
 [ -s "$STRIP/reviewer-preflight.sh" ]; ck $? "the stripped helper copy was produced"
 # The cwd is the §C fixture — a checkout of `acme/widget` that this suite already proves works in CI —
@@ -559,6 +600,7 @@ cp "$HERE/spawn-gate.sh" "$STRIP2/spawn-gate.sh"; cp "$LANE" "$STRIP2/lane.sh"
 cp "$HERE/repo-target.sh" "$STRIP2/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIP2/repo-slug.sh"
 cp "$HERE/brief-gate.sh" "$STRIP2/brief-gate.sh"
 cp "$HERE/gate-policy.sh" "$STRIP2/gate-policy.sh"   # same hard requirement as the first rig (review, P1)
+cp "$HERE/lane-env.sh" "$STRIP2/lane-env.sh"         # …and so is lane-env.sh (#3060, measured rc=78 in CI)
 sed "s#$LANDING_HEAD_BINDING##" "$HELPER" > "$STRIP2/reviewer-preflight.sh"
 [ -s "$STRIP2/reviewer-preflight.sh" ]; ck $? "the head-binding-stripped helper copy was produced"
 mkdir -p "$TMP/o4/logs"
@@ -699,6 +741,7 @@ STRIPG="$TMP/stripg"; mkdir -p "$STRIPG"
 cp "$HERE/spawn-gate.sh" "$STRIPG/spawn-gate.sh"; cp "$LANE" "$STRIPG/lane.sh"
 cp "$HERE/repo-target.sh" "$STRIPG/repo-target.sh"; cp "$HERE/repo-slug.sh" "$STRIPG/repo-slug.sh"
 cp "$HERE/brief-gate.sh" "$STRIPG/brief-gate.sh"; cp "$HERE/gate-policy.sh" "$STRIPG/gate-policy.sh"
+cp "$HERE/lane-env.sh" "$STRIPG/lane-env.sh"   # the third hard requirement (#3060) — see the first rig's note
 sed "s#^DELIVERY_BRIEF_HEADING=.*#DELIVERY_BRIEF_HEADING=''#" "$HELPER" > "$STRIPG/reviewer-preflight.sh"
 grep -q "^DELIVERY_BRIEF_HEADING=''$" "$STRIPG/reviewer-preflight.sh"; ck $? "the heading-stripped helper copy was produced"
 for _rigbr in fix/stripg; do git -C "$TMP" update-ref "refs/heads/$_rigbr" HEAD 2>/dev/null || true; done
