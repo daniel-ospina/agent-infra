@@ -2935,12 +2935,51 @@ ISSUES 2')"
   else
     echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewdisp-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
   fi
-  # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
-  # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
-  awk '/^  \*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_star_arm.sh"
-  awk '/^  CLEAN\*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_clean_arm.sh"
-  if grep -qF 'review_state_record "$(verdict_class "$LAST")"' "$TMP/merge_star_arm.sh" \
-     && ! grep -qF 'touch "$O/state/needsfix-$PR-$HEAD"' "$TMP/merge_star_arm.sh"; then
+  # ⛔ THE TWO PREDICATES ARE SPELLING-INDEPENDENT ON PURPOSE (found by the #3174 reviewer). They
+  # used to be `grep -qF 'review_state_record "$(verdict_class "$LAST")'` and
+  # `! grep -qF 'touch "$O/state/needsfix-$PR-$HEAD"'`, which grade the VERB instead of the EFFECT:
+  # measured, a `*)` arm that keeps the classifier call and adds `: > "$O/state/needsfix-$PR-$HEAD"`
+  # still printed this assertion's ✅ line (476 passed, 0 failed) — the pre-#2132 defect intact and
+  # the suite green. `: >` is not exotic: merge-one.sh uses it in its own marker writes and this
+  # suite uses it to mint markers. The MARKER PATH is the invariant, so the absence test names the
+  # path; and the classifier call must be a LIVE line, so comments are stripped first (a commented-
+  # out call satisfied the old substring test).
+  #   shipped  → 0 refs to state/needsfix-, 1 live classifier call          → ✅
+  #   mut1     → touch …/needsfix-…, no classifier call                     → ❌ wiring
+  #   mut4     → classifier call KEPT + `: > …/needsfix-…`                  → ❌ wiring
+  # ⛔ AND BOTH ARMS MUST COME FROM THE ONE `case` THAT DISPATCHES ON THE REVIEWER'S VERDICT
+  # (agent-infra#3174). merge-one.sh holds MORE THAN ONE arm that opens `  *)` at column 4 — the
+  # check-carry `case "$CC_RC"` does (`  *)` at 1165), and its body closes on `    fi ;;`, NOT on
+  # `    ;;`. An unanchored /^  \*\)$/ therefore started at THAT arm, its terminator never matched,
+  # and the capture ran on past that `esac` to the next `    ;;` — 1061 lines that CONTAIN the CLEAN
+  # arm's own `review_state_clear` (so the arm-membership test below read it as "in the no-verdict
+  # arm") and EXCLUDE the `*)` arm's classifier call (so the wiring test below read the classifier as
+  # absent). Both assertions inverted on a CORRECT tree: measured 2 red of 474 at origin/main
+  # 6da181ef, while every neighbouring assertion about the same two arms passed. This suite's
+  # contract is an assertion that fails on the BROKEN tree, so an extractor that fails on a correct
+  # one is a defect in the extractor, not in merge-one.sh — which routes through the classifier at
+  # line 2234 exactly as #2132 requires and carries no unconditional fixer marker.
+  # Anchor: the no-verdict arm is the first `  *)` that FOLLOWS the `CLEAN*)` arm, and each arm ends
+  # at the first `    ;;` after its OWN opening line.
+  _clean_ln="$(awk '/^  CLEAN\*\)$/{print NR; exit}' "$MERGE")"
+  _star_ln="$(awk -v c="${_clean_ln:-0}" '/^  \*\)$/ && NR>c {print NR; exit}' "$MERGE")"
+  : > "$TMP/merge_clean_arm.sh"; : > "$TMP/merge_star_arm.sh"
+  _arms_ok=1
+  if [ -n "${_clean_ln:-}" ] && [ -n "${_star_ln:-}" ]; then
+    awk -v s="$_clean_ln" 'NR>=s{print} NR>s && /^    ;;$/{exit}' "$MERGE" > "$TMP/merge_clean_arm.sh"
+    awk -v s="$_star_ln"  'NR>=s{print} NR>s && /^    ;;$/{exit}' "$MERGE" > "$TMP/merge_star_arm.sh"
+    # An arm carries at least its opening AND its terminating line. A 1-line capture means the
+    # terminator was never found, and every grep below would then answer about a fragment.
+    [ "$(awk 'END{print NR+0}' "$TMP/merge_clean_arm.sh")" -ge 2 ] \
+      && [ "$(awk 'END{print NR+0}' "$TMP/merge_star_arm.sh")" -ge 2 ] || _arms_ok=0
+  else
+    _arms_ok=0
+  fi
+  if [ "$_arms_ok" -ne 1 ]; then
+    echo "  ❌ merge-one.sh's no-verdict arm could not be extracted (CLEAN arm at ${_clean_ln:-none}, no-verdict arm at ${_star_ln:-none}) — the wiring is UNPROVEN, never green"; FAIL=$((FAIL+1))
+  elif grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh" \
+       | grep -qF 'review_state_record "$(verdict_class "$LAST")"' \
+     && ! grep -q 'state/needsfix-' "$TMP/merge_star_arm.sh"; then
     echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
   else
     echo "  ❌ merge-one.sh's verdict arm does not route through the classifier, or still writes the fixer marker unconditionally"; FAIL=$((FAIL+1))
@@ -3000,6 +3039,8 @@ ISSUES 2')"
     echo "  ❌ could not locate the marker_ok guard and the review_state_clear call site in merge-one.sh"; FAIL=$((FAIL+1))
   elif [ "${_clear_ln}" -le "${_guard_ln}" ]; then
     echo "  ❌ the clear is invoked at line $_clear_ln, not after the marker_ok guard at line $_guard_ln — an unverified record would read as a clean head"; FAIL=$((FAIL+1))
+  elif [ "$_arms_ok" -ne 1 ]; then
+    echo "  ❌ the CLEAN and no-verdict arms could not be extracted from merge-one.sh — arm membership is UNPROVEN, not green"; FAIL=$((FAIL+1))
   elif ! grep -q '^    review_state_clear$' "$TMP/merge_clean_arm.sh"; then
     echo "  ❌ review_state_clear is NOT in the CLEAN arm — a verified review would clear nothing"; FAIL=$((FAIL+1))
   elif grep -q '^    review_state_clear$' "$TMP/merge_star_arm.sh"; then
