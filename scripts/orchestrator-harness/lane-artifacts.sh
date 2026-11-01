@@ -248,7 +248,7 @@ emit_box() {
   local label="$1" vm="$2" pat="$3" exact="$4" outdir="$5" lines="$6" since="$7"
   local raw first res rows p sz mt dest
   raw="$(scan "$vm" "$pat" "$since" "$exact")"; local _src=$?
-  # ⛔ THE EXECu0027S OWN STATUS IS CHECKED, not just the sentinel. `__OK__` is printed by the remote shell
+  # ⛔ THE EXEC'S OWN STATUS IS CHECKED, not just the sentinel. `__OK__` is printed by the remote shell
   # BEFORE it streams the rows, so a channel that dies mid-scan (the 60 s timeout firing, a dropped
   # connection) hands back the sentinel plus a PARTIAL row list — which read as "searched, matched
   # nothing" and produced a confident ABSENT-EVERYWHERE while the file sat on that box. A short row
@@ -273,6 +273,16 @@ emit_box() {
   fi
   while IFS="$(printf '\t')" read -r p sz mt; do
     [ -n "${p:-}" ] || continue
+    # ⛔ A NON-NUMERIC SIZE COLUMN MEANS THE ROW IS CORRUPT — a TAB or newline in a filename splits the
+    # TAB-delimited fields, so `sz` lands on the tail of the filename and `${want}` is garbage. The old
+    # code carried that through to a pull and produced a WRONG VERDICT (a bogus path, then PULL-FAILED)
+    # rather than an abstention. Abstain instead: the doctrine is that a failure must never look like a
+    # result, and an unparseable row is a failure of the listing, not evidence about the file.
+    case "${sz:-}" in
+      ''|""|*[!0-9]*)
+        echo "── $label  UNMEASURED(unparseable scan row — TAB/newline in a filename? raw: $p)"
+        R_REACHED=0; R_UNPARSE=$((R_UNPARSE + 1)); return 1 ;;
+    esac
     R_HITS=$((R_HITS + 1))
     echo
     echo "── $label  $p  (${sz:-?} bytes, ${mt:-?})"
@@ -319,7 +329,7 @@ case "$verb" in
     elif [ "$pat" = "*" ] || [ "$pat" = "." ]; then
       pat=""                          # a full sweep is /tmp/*, not /tmp/**
     fi
-    R_HITS=0; R_PULLED=0; R_PULLFAIL=0; R_TRUNC=0; REACHED=0; REACHED_LABELS=""
+    R_HITS=0; R_PULLED=0; R_PULLFAIL=0; R_TRUNC=0; R_UNPARSE=0; REACHED=0; REACHED_LABELS=""
     if [ -n "$outdir" ]; then
       mkdir -p "$outdir" 2>/dev/null
       if [ ! -d "$outdir" ] || [ ! -w "$outdir" ]; then
@@ -361,11 +371,18 @@ case "$verb" in
           "$REACHED" "$REACHED_LABELS" "$MISSING" "${UNRESOLVED_LABELS:-exec failed}"
         exit 4
       fi
-      printf 'ABSENT-EVERYWHERE(find %s -maxdepth 1 -name "%s" matched nothing on all %s box(es):%s)\n' \
-        "$ATIF_ROOT" "$pat" "$REACHED" "$REACHED_LABELS"
+      printf 'ABSENT-EVERYWHERE(find %s -maxdepth 1 %s-name "%s" matched nothing%s on all %s box(es):%s)\n' \
+        "$ATIF_ROOT" "${since:+-mmin -$since }" "$pat" "${since:+ in the last $since minutes}" "$REACHED" "$REACHED_LABELS"
       exit 3
     fi
     [ "$R_TRUNC" -gt 0 ] && echo "⚠ TRUNCATED at the $ROW_CAP-row cap on $R_TRUNC box(es) — narrow the pattern; this list is NOT complete"
+    # ⛔ AN UNPARSEABLE ROW IS AN UNMEASURED BOX, so the whole verdict abstains even when other boxes yielded
+    # hits: a corrupt listing means the universe was not fully read, and reporting "found N files" at exit 0
+    # would let a caller treat a short list as complete.
+    if [ "${R_UNPARSE:-0}" -gt 0 ]; then
+      echo "UNMEASURED($R_UNPARSE box(es) returned an unparseable scan row — the list above is NOT complete, so no 'found/absent' verdict is claimed)"
+      exit 4
+    fi
     # Partial coverage is disclosed on the SUCCESS path too: exit 0 with 1 of 3 boxes silent reads as
     # a complete result to any caller keying on the exit status.
     echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es)${outdir:+; $R_PULLED pulled into $outdir}"
@@ -379,7 +396,7 @@ case "$verb" in
     exit 0
     ;;
   ls)
-    T="$(printf '\t')"; reached=0
+    T="$(printf '\t')"; reached=0; ls_hole=0; any_scanned=0
     show() {  # show <label> <vm> <fragment> <cap> <what> — checked in BOTH scans, not just the first
       local label="$1" vm="$2" frag="$3" cap="$4" what="$5" raw first rows
       raw="$(scan "$vm" "$frag" "$since" 0)"; local _src=$?
@@ -406,17 +423,30 @@ case "$verb" in
       ok_md=0; ok_log=0
       show "$label" "$vm" ".md" 25 "md" && ok_md=1
       show "$label" "$vm" ".log" 10 "log" && ok_log=1
-      if [ "$ok_md" -eq 1 ] || [ "$ok_log" -eq 1 ]; then reached=$((reached + 1)); fi
+      # ⛔ BOTH scans must be guarded: a partial inventory (one scan failed, the other returned rows)
+      # used to exit 0, so a caller keying on the status could not tell a complete inventory from a
+      # partial one. Any failed scan is a COVERAGE hole and the verb abstains.
+      if [ "$ok_md" -eq 1 ] && [ "$ok_log" -eq 1 ]; then reached=$((reached + 1)); else ls_hole=$((ls_hole + 1)); fi
+      if [ "$ok_md" -eq 1 ] || [ "$ok_log" -eq 1 ]; then any_scanned=$((any_scanned + 1)); fi
     done <<< "$MAP"
-    # ⛔ A REQUESTED BOX THAT NEVER RESOLVED MUST BE NAMED. `collect` was fixed for this and `ls` was not,
     # so a label missing from `cmux vm list` produced no header, no UNMEASURED line and exit 0 — silence
     # read as "nothing there", in the verb an operator uses to ask what IS there.
     if [ "${NUNRESOLVED:-0}" -gt 0 ]; then
       for l in $UNRESOLVED_LABELS; do echo "== $l  UNRESOLVED(not in cmux vm list — NOT searched)"; done
     fi
-    if [ "$reached" -eq 0 ]; then echo "UNMEASURED(no box answered — says nothing about what is on them)"; exit 4; fi
+    # "no box answered" is decided on ANY scan answering, not on a complete one — otherwise a fleet where
+    # every `.log` scan failed reported "no box answered" while `.md` inventories had printed fine.
+    if [ "$any_scanned" -eq 0 ]; then echo "UNMEASURED(no box answered — says nothing about what is on them)"; exit 4; fi
     if [ "${NUNRESOLVED:-0}" -gt 0 ]; then
       echo "⚠ COVERAGE INCOMPLETE: $NUNRESOLVED requested box(es) were never resolved ($UNRESOLVED_LABELS)"
+    fi
+    # ⛔ A PARTIAL INVENTORY IS NOT AN INVENTORY. Both scans were ORed, so a box whose `.md` scan failed
+    # while `.log` succeeded counted as "reached" and the verb exited 0 — a caller keying on the status
+    # could not tell a complete inventory from a partial one, in the verb used to discover what exists.
+    # A failed scan is a coverage hole, so the verb abstains rather than reporting a short list as whole.
+    if [ "$ls_hole" -gt 0 ]; then
+      echo "UNMEASURED($ls_hole box(es) returned a partial inventory — a scan failed; the list above is NOT complete)"
+      exit 4
     fi
     exit 0
     ;;

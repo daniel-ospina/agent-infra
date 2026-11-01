@@ -78,17 +78,39 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   for i in "${!args[@]}"; do
     [ "${args[$i]}" = "${LANE_ARTIFACT_ROOT:-}" ] && args[$i]="$root"
   done
-  # simulate a truncated transfer: drop the last 8 base64 chars of the PAYLOAD but keep the status
-  # line, which is exactly the real failure this guards (a cut mid-stream decodes cleanly to a short
-  # file). Truncating the whole output instead would also delete the status line and test the wrong arm.
+  # Simulate a TRUNCATED transfer: drop the last 8 base64 chars of the PAYLOAD, keeping the status line.
+  # ⛔ The previous version used `$"\n"` (locale quoting) instead of `$'\n'`, so the pattern never
+  # matched, `payload` became the WHOLE output, and the case appended a duplicate copy rather than
+  # truncating — it passed for a reason its comment did not describe. Measured by review: "decoded 17
+  # bytes, the box reported 11" — doubled, not truncated.
   if [ -n "${STUB_TRUNCATE:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
     out="$("${args[@]}" 2>/dev/null)"
-    payload="${out%%$"\n"*}"
+    # Line 1 is the status (`RC=n SIZE=m`); everything after it is the payload. A real cut loses payload
+    # bytes, NOT the status line — so truncate `rest`, keep `payload` whole. (The first fix truncated the
+    # wrong one and the case went green by falling back to the scan size.)
+    payload="${out%%$'\n'*}"
     rest="${out#*$'\n'}"
     [ "$rest" = "$out" ] && rest=""
-    if [ -n "$rest" ]; then printf '%s\n%s' "${payload%????????}" "$rest"
-    else printf '%s' "${payload%????????}"; fi
+    printf '%s\n%s\n' "$payload" "${rest%????????}"
     exit 0
+  fi
+  # Simulate a transfer whose TAIL is lost entirely (status line included). Only a PREFIX marker survives
+  # this, so T18 can discriminate the round-2 "status line first" fix: a suffix marker yields
+  # `remote exit ?` instead of the SIZE MISMATCH the check is supposed to report.
+  if [ -n "${STUB_CUT_TAIL:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
+    out="$("${args[@]}" 2>/dev/null)"
+    printf '%s' "${out%????????????}"
+    exit 0
+  fi
+  # STUB_SCAN_ERROR: the remote scan ANSWERS but reports a failure (`__NOK__ find-failed`). Without this
+  # arm the find-errored guard has no test that would go red on regression — the stub could only simulate
+  # a DEAD exec, which is a different branch.
+  if [ -n "${STUB_SCAN_ERROR:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
+    printf '__NOK__ find-failed(rc=1)\n'; exit 0
+  fi
+  # STUB_BAD_SIZE: a row whose size column is not numeric — what a TAB/newline in a filename produces.
+  if [ -n "${STUB_BAD_SIZE:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
+    printf '__OK__\n%s/has\ttab.md\t2026-01-01T00:00:00\n' "$root"; exit 0
   fi
   exec "${args[@]}" 2>/dev/null
 fi
@@ -266,6 +288,50 @@ STUB_DEAD="pi-cell-1 pi-cell-3 pi-cell-4"; run collect epic-ledger --out "$out" 
 STUB_DEAD=""
 ls "$out" | grep -q 'pi-cell-4-epic-ledger.md' && bad "T15 stale artifact survived run 2" "$(ls "$out")" \
   || ok "T15 stale artifact from run 1 removed"
+
+echo "T16 — the ABSENT message echoes the --since it actually applied"
+run collect no-such-file --since 60 > "$Q/t16.txt" 2>&1
+rc=$?
+eq "T16 exit 3" "$rc" "3"
+grep -q -- '-mmin -60' "$Q/t16.txt" && ok "T16 echoes the mmin filter" || bad "T16 echoes --since" "$(cat "$Q/t16.txt")"
+grep -q 'in the last 60 minutes' "$Q/t16.txt" && ok "T16 says the window in words" || bad "T16 window wording" "$(cat "$Q/t16.txt")"
+
+echo "T17 — an unparseable scan row ABSTAINS instead of producing a wrong verdict"
+# A TAB/newline in a filename splits the TAB-delimited fields, so the size column lands on the tail of
+# the name. The old code carried that into a pull: a bogus path, then PULL-FAILED — a wrong verdict.
+out="$Q/out17"; mkdir -p "$out"
+STUB_BAD_SIZE=1; export STUB_BAD_SIZE
+run collect .md --out "$out" > "$Q/t17.txt" 2>&1
+rc=$?; unset STUB_BAD_SIZE
+eq "T17 exit 4 (abstain)" "$rc" "4"
+grep -q 'unparseable scan row' "$Q/t17.txt" && ok "T17 names the unparseable row" || bad "T17 names it" "$(head -6 "$Q/t17.txt")"
+
+echo "T18 — the transfer status is a PREFIX: a tail-cut still reports SIZE MISMATCH"
+# This is the discrimination the round-2 fix never had: with the marker as a SUFFIX, cutting the tail
+# destroys it and the tool says "remote exit ?" instead of the size mismatch it actually detected.
+out="$Q/out18"; mkdir -p "$out"
+STUB_CUT_TAIL=1; export STUB_CUT_TAIL
+run collect epic-ledger --out "$out" > "$Q/t18.txt" 2>&1
+rc=$?; unset STUB_CUT_TAIL
+[ "$rc" -ne 0 ] && ok "T18 fails closed (exit $rc)" || bad "T18 must not report success" "$(cat "$Q/t18.txt")"
+grep -qi 'SIZE MISMATCH' "$Q/t18.txt" && ok "T18 names the size mismatch (prefix marker survived)" \
+  || bad "T18 should name SIZE MISMATCH, not a lost status" "$(cat "$Q/t18.txt" | tail -4)"
+
+echo "T19 — a scan that ANSWERS but reports failure is UNMEASURED, never ABSENT"
+STUB_SCAN_ERROR=1; export STUB_SCAN_ERROR
+run collect no-such-file > "$Q/t19.txt" 2>&1
+rc=$?; unset STUB_SCAN_ERROR
+eq "T19 exit 4" "$rc" "4"
+grep -q 'find-failed' "$Q/t19.txt" && ok "T19 propagates the find failure" || bad "T19 find-failed" "$(head -6 "$Q/t19.txt")"
+grep -q '^ABSENT-EVERYWHERE' "$Q/t19.txt" && bad "T19 must not claim absent" "$(cat "$Q/t19.txt")" \
+  || ok "T19 does not claim absent on a failed scan"
+
+echo "T20 — ls on a PARTIAL inventory abstains instead of exiting 0"
+STUB_DEAD_LOG=1; export STUB_DEAD_LOG
+run ls > "$Q/t20.txt" 2>&1
+rc=$?; unset STUB_DEAD_LOG
+eq "T20 exit 4 (partial inventory)" "$rc" "4"
+grep -q 'NOT complete' "$Q/t20.txt" && ok "T20 says the list is not complete" || bad "T20 wording" "$(tail -3 "$Q/t20.txt")"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"
