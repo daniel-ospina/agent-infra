@@ -27,6 +27,32 @@
 # the class that lost those fixes. A component whose own dir does not match $REF REFUSES the pass:
 # the box is running code main does not carry, and calling that OK is the false green this whole
 # script exists against.
+#
+# ── THE EXECUTING TREE, READ FROM THE PROCESS ITSELF (agent-infra#10114) ─────────────────────────
+# Every arm above answers a question about a DIRECTORY. None of them answered the one a fleet
+# operator actually asks: **is the code that is EXECUTING equal to $REF?** — and the difference is
+# not academic. Measured on a live cell: the controller ran `/…/harness/709dfb06eac2/…`, a directory
+# that NO LONGER EXISTED, while `HARNESS-PIN` named `6da181efd551` and every record agreed with
+# itself; this script printed `OK: every harness dir on this box matches origin/main` and exited 0.
+# The one directory that WAS executing was the one directory never compared, because the running
+# dir was pushed into the candidate list from inside a PIPELINE (a subshell, where `drift` cannot
+# reach the counters) and a candidate whose dir is ABSENT was then dropped by a bare `continue`.
+#
+# So `--surface` now reads the process's OWN argv — `ps -eo pid=,command=`, with `/proc/<pid>/cmdline`
+# where the kernel keeps the argv (so a path containing a space survives, and a RELATIVE one resolves
+# against the CONTROLLER's cwd, never ours) — matching EVERY element rather than a fixed position, so
+# `bash <dir>/orch-loop.sh`, `env bash <dir>/orch-loop.sh` and `bash -c <dir>/orch-loop.sh` are the same
+# fact; keeping the PID; and answers three ways — only one of which may pass:
+#   dir           → compared against $REF by the candidate pass below, labelled RUNNING;
+#   absent        → DRIFT: a live controller executes a directory this box does not have, so nothing
+#                   it runs can be $REF's code. That is an ANSWER (compared, cannot match), not a
+#                   cannot-verify — and it is the #3194/#10114 shape, where the pin record, the unit
+#                   and the control plane all read green over a tree that was already gone;
+#   unexaminable  → BROKEN (exit 2): an unresolvable link or an unsearchable ancestor means we have
+#                   no answer about the only tree that is actually running.
+# The standard this implements is the one every deployment system converges on: reconcile the LIVE
+# artefact against the built one (a digest over the executing tree), never the manifest that claims
+# what was deployed. A pin record is a record ABOUT the box; `ps` is the box.
 # ⛔ FAIL-CLOSED: an UNREADABLE candidate dir or file is exit 2 (BROKEN), never "nothing to report".
 # Empty is not clean either: with no candidate dir at all the pass cannot answer, which is 2.
 #
@@ -628,6 +654,10 @@ fi
 # and without it a surface-only hit on a CURRENT box was labelled `harness=payload-differs`, whose
 # documented remedy (redeploy this $O) cannot clear it.
 SURF_BASE="$problems"
+# How many live controller processes execute a tree this box no longer has (#10114). Kept apart from
+# the surface counters because "a copy at rest differs" and "the tree that is RUNNING is gone" are
+# different facts with different remedies, and only the second one cannot be cleared by redeploying.
+EXEC_N=0; EXEC_FIRST=""
 if [ "$SURFACE" -eq 1 ]; then
   : > "$TMPD/cand-raw"; : > "$TMPD/running-raw"
   # The RUNNING controller's own directory, from the process table: `<interp> <path>/orch-loop.sh`.
@@ -639,18 +669,136 @@ if [ "$SURFACE" -eq 1 ]; then
   # ⛔ THE EXIT STATUS DECIDES, NOT THE OUTPUT. An EMPTY table is a legitimate answer (a box running no
   # controller right now); a FAILED read is no answer at all. Conflating the two either blesses an
   # unverified box (the warning this replaces) or reds every idle box (emptiness read as failure).
+  _ps_failed=0
   if ! _ps="$(${DRIFT_PS:-ps} -eo pid=,command= 2>/dev/null)"; then
       # ⛔ NOT A WARNING. A warning leaves `problems`/`broken` untouched, so the run would print OK and
       # exit 0 having never compared THE ONE DIRECTORY THAT IS ACTUALLY EXECUTING — a false green over
       # the exact population `--surface` exists to check. Cannot-verify is BROKEN (exit 2).
       brk "the process table could not be read, so the directory the RUNNING controller executes is not in this pass"
-      _ps=""
+      _ps=""; _ps_failed=1
   fi
-  case "$_ps" in '') note "running: no controller was found in the process table (nothing is executing a harness on this box right now)" ;;
-    *) printf '%s\n' "$_ps" | awk '{ p=$1; c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/,"",c)
-           n=split(c,t," "); if (n>=2 && t[2] ~ /\/orch-loop\.sh$/ && t[1] ~ /(bash|sh|dash|zsh|ksh)$/) print t[2] }' \
-         | while IFS= read -r _h; do _hd="${_h%/orch-loop.sh}"; printf '%s\n' "$_hd" >> "$TMPD/cand-raw"; printf '%s\n' "$_hd" >> "$TMPD/running-raw"; done ;;
-  esac
+  # ⛔ ONE PROCESS IS WRITTEN PER LINE AS `<pid><TAB><path>`, TO A FILE, and consumed in the PARENT
+  # shell below. The `| while read` form this replaces ran in a SUBSHELL, so a `drift`/`brk` raised
+  # inside it incremented a copy of the counters and vanished on return (#10114).
+  : > "$TMPD/ps-harness"
+  : > "$TMPD/running-real"
+  # ⛔ "no controller was found" IS AN ANSWER ONLY WHEN THE TABLE WAS READ (`_ps_failed`). Printed over a
+  # FAILED read it contradicted the BROKEN line directly above it, in one report (review of #3202).
+  [ "$_ps_failed" -eq 1 ] || [ -n "$_ps" ] || note "running: no controller was found in the process table (nothing is executing a harness on this box right now)"
+  # ── WHICH PROCESS IS EXECUTING A HARNESS (#10114): read from its OWN argv ──────────────────────
+  # ⛔ ONE PREDICATE PER FACT (#1178): this is `box-status.sh`'s argv reader (:236-277), ported rather than
+  # re-derived — with the one difference this script needs, that what box-status calls `UNREADABLE` is
+  # BROKEN here (exit 2), because this run's whole product is a verdict.
+  #   • ⛔ EVERY ELEMENT IS SCANNED, NOT A FIXED POSITION. The positional read this replaces took `t[1]` as
+  #     the interpreter and `t[2]` as the script, so `env bash <dir>/orch-loop.sh` (the `/usr/bin/env`
+  #     spelling launchd and wrapper scripts write), `bash -c <dir>/orch-loop.sh`, `sh -x …` and any path
+  #     containing a space were dropped with NO drift, NO note and NO counter — measured on this head: a
+  #     live controller on a GONE tree printed `OK: every harness dir on this box matches …`, rc 0. That is
+  #     the same false green this file exists against, narrowed to one argv spelling.
+  #   • ⛔ NUL-SEPARATED FIELDS WHERE THE KERNEL KEEPS THEM. `$PROC/<pid>/cmdline` is NUL-delimited so an
+  #     argument MAY contain a space; a whitespace split cut `~/Library/Application Support/…` into
+  #     fragments whose tail does not exist. `tr '\0' '\n'` keeps each element whole (and, unlike
+  #     `mapfile`, needs no bash 4). macOS has no `/proc`: there the flattened `ps` line is the fallback,
+  #     and a path with a space cannot be resolved — which is BROKEN below, never a guess.
+  #   • ⛔ A RELATIVE SCRIPT PATH RESOLVES AGAINST THE **CONTROLLER's** CWD, NOT OURS. Resolving it against
+  #     the CHECKER's cwd made the verdict a function of where the checker stood: the same process table
+  #     answered rc 0 from one cwd (comparing OUR tree) and a false `DOES NOT EXIST` from another.
+  #     `$PROC/<pid>/cwd` is the process's own directory; unreadable ⇒ BROKEN, never our cwd.
+  # STATED RESIDUAL, not hidden: a script path reached only through shell TEXT — `bash -c 'exec /x/orch-loop.sh'`
+  # or `bash -c 'cd /y && /x/orch-loop.sh'`, where the path is not the FIRST word of the `-c` string — is
+  # reported as a mention (`note`), not as a controller. No launcher this repo ships produces that shape
+  # (they pass the script as an argv element), and the alternative — treating any absolute-looking path in
+  # a `-c` string as the executing tree — reds the box for `bash -c 'grep -n foo /x/orch-loop.sh'`.
+  PROC="${DRIFT_PROC:-/proc}"
+  : > "$TMPD/ps-unres"
+  if [ -n "$_ps" ]; then
+    while IFS= read -r _line; do
+      [ -n "${_line//[[:space:]]/}" ] || continue
+      # `ps -eo pid=,command=` RIGHT-PADS the pid column: strip leading blanks before taking $1 (#2603).
+      _t="${_line#"${_line%%[![:space:]]*}"}"
+      _pid="${_t%%[[:space:]]*}"; _pid="${_pid//[[:space:]]/}"
+      _flat="${_t#"${_t%%[[:space:]]*}"}"; _flat="${_flat#"${_flat%%[![:space:]]*}"}"
+      [ -n "$_pid" ] || continue
+      case "$_flat" in *orch-loop.sh*) ;; *) continue ;; esac   # no mention ⇒ no question to answer here
+      _argv=()
+      if [ -r "$PROC/$_pid/cmdline" ]; then
+        while IFS= read -r _w; do [ -n "$_w" ] && _argv[${#_argv[@]}]="$_w"; done \
+          < <(tr '\0' '\n' < "$PROC/$_pid/cmdline" 2>/dev/null)
+      fi
+      if [ "${#_argv[@]}" -eq 0 ]; then read -r -a _argv <<< "$_flat"; fi   # flattened fallback (space path lost)
+      _script=""; _interp=0; _text=0; _i=0; _n=${#_argv[@]}
+      while [ "$_i" -lt "$_n" ]; do
+        _w="${_argv[$_i]}"
+        case "${_w##*/}" in bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) _interp=1 ;; esac
+        case "$_w" in
+          */orch-loop.sh|orch-loop.sh|./orch-loop.sh) _script="$_w" ;;
+          -c)
+            # ⛔ `bash -c <abs>/orch-loop.sh` IS the invocation; `bash -c 'echo-bash-<dir>/orch-loop.sh'` is a
+            # shell running TEXT — the self-match class the fleet inventory documents, and the arm that keeps
+            # a lane's echo from becoming a candidate dir. The FIRST word decides, and only an ABSOLUTE one
+            # counts, so a text mention can never be read as the executing tree.
+            _i=$((_i + 1)); _c="${_argv[$_i]:-}"; _c1="${_c%%[[:space:]]*}"
+            case "$_c1" in
+              /*/orch-loop.sh) _script="$_c1" ;;
+              *orch-loop.sh*) _text=1 ;;
+            esac ;;
+        esac
+        _i=$((_i + 1))
+      done
+      if [ -n "$_script" ]; then
+        case "$_script" in
+          /*) : ;;
+          *)  _pcwd="$(readlink "$PROC/$_pid/cwd" 2>/dev/null)"
+              case "$_pcwd" in
+                '') printf '%s\t%s\n' "$_pid" "$_flat" >> "$TMPD/ps-unres" ; continue ;;
+                *)  _script="$_pcwd/${_script#./}" ;;
+              esac ;;
+        esac
+        printf '%s\t%s\n' "$_pid" "$_script" >> "$TMPD/ps-harness"
+      elif [ "$_interp" -eq 1 ] && [ "$_text" -eq 0 ]; then
+        # An interpreter whose command line names orch-loop.sh and yields NO script path: the fact is held
+        # and cannot be read. BROKEN — never "no controller was found" over a process that is running one.
+        printf '%s\t%s\n' "$_pid" "$_flat" >> "$TMPD/ps-unres"
+      else
+        note "running: pid $_pid MENTIONS an orch-loop.sh but is not an invocation of one ($_flat) — not counted as a controller"
+      fi
+    done <<< "$_ps"
+  fi
+  while IFS="$(printf '\t')" read -r _pid _why; do
+    [ -n "${_pid:-}" ] || continue
+    brk "pid $_pid runs an orch-loop.sh whose script path could not be resolved ($_why) — the tree that is EXECUTING cannot be identified (a relative path resolves against the controller's own cwd, which this box will not read), and an unidentified executing tree is never a pass"
+  done < "$TMPD/ps-unres"
+  # ── THE EXECUTING TREE (#10114): the three answers, only one of which may pass ────────────────
+  # `HARNESS_PIN_FILE` is read ONLY to put the pin's name in the message. It never decides anything:
+  # the verdict is the process's own path, because a record that agrees with itself is exactly what
+  # the measured false green had.
+  _pin_dir=""
+  if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+    _pin_dir="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+  fi
+  while IFS="$(printf '\t')" read -r _pid _sp; do
+    [ -n "${_sp:-}" ] || continue
+    _sd="${_sp%/orch-loop.sh}"
+    case "$(hu_dir_state "$_sd")" in
+      dir)
+        printf '%s\n' "$_sd" >> "$TMPD/cand-raw"
+        printf '%s\n' "$_sd" >> "$TMPD/running-raw"
+        # The RESOLVED spelling, so the candidate filter below can tell an executing dir from any other
+        # one even when the box names it through a symlink or a trailing slash.
+        _sdr="$( ( cd "$_sd" 2>/dev/null && pwd -P ) )" || _sdr=""
+        [ -n "$_sdr" ] && printf '%s\n' "$_sdr" >> "$TMPD/running-real"
+        note "exec: pid ${_pid:-?} executes $_sd — compared against $REF below" ;;
+      absent)
+        # ⛔ NOT `continue`, AND NOT A NOTE. This is the whole defect: a live process whose tree is
+        # gone is the box running code nobody can identify, and skipping it is how "every harness dir
+        # on this box matches" was printed over exactly that state.
+        EXEC_N=$((EXEC_N + 1))
+        [ -n "$EXEC_FIRST" ] || EXEC_FIRST="$_sd"
+        drift_q exec "pid ${_pid:-?} is EXECUTING $_sp — and that directory DOES NOT EXIST. The box runs a harness tree it no longer has${_pin_dir:+ (the pin names $_pin_dir)}, so NOTHING it executes is this repo's code. This is the measured #3194/#10114 state: the pin record, the unit's active state and the control plane all read green over it" ;;
+      *)
+        brk "pid ${_pid:-?} is executing $_sp, and that path cannot be EXAMINED (a symlink whose target cannot be resolved, or an unsearchable ancestor) — cannot verify the one directory that is actually running (never a pass)" ;;
+    esac
+  done < "$TMPD/ps-harness"
   # ⛔ `-d "$O"`, NOT `O_ABSENT`: `O_ABSENT` also becomes 1 when the RECORD is missing or the path is
   # unexaminable (see the state split above), and the deployed directory still has to be compared when it
   # EXISTS — it is the population a record-less box has. Only a $O that is provably absent is skipped.
@@ -727,7 +875,19 @@ if [ "$SURFACE" -eq 1 ]; then
       brk "candidate harness dir $_r exists but cannot be LISTED (unreadable directory) — cannot verify it, and a dir this box carries is never 'nothing to report'"
       continue
     fi
-    ls "$_r"/*.sh >/dev/null 2>&1 || { [ -f "$_r/orch-loop.sh" ] || continue; }
+    ls "$_r"/*.sh >/dev/null 2>&1 || { [ -f "$_r/orch-loop.sh" ] || {
+      # ⛔ A RUNNING DIR IS NEVER DROPPED BY THE GENERIC "is this a harness dir?" FILTER (#10114, review
+      # finding 1). The measured sibling of the vanished-dir case: the process still executes
+      # `<dir>/orch-loop.sh` while the directory remains and its scripts are GONE (a deleted script is
+      # held open by the running interpreter, so the process outlives the file). This `continue` — the
+      # one below — then printed `OK: every harness dir on this box matches …` after line above already
+      # said it was "compared against $REF below". An executing dir with nothing to compare is DRIFT.
+      if grep -qxF "$_r" "$TMPD/running-real" 2>/dev/null; then
+        EXEC_N=$((EXEC_N + 1))
+        [ -n "$EXEC_FIRST" ] || EXEC_FIRST="$_r"
+        drift_q exec "the controller executes $_r, and it carries NO readable *.sh at all — the script the live process was started from is GONE. Nothing in the tree that is executing can be compared with $REF"
+      fi
+      continue; }; }
     grep -qxF "$_r" "$TMPD/cand" 2>/dev/null || printf '%s\n' "$_r" >> "$TMPD/cand"
   done < "$TMPD/cand-raw"
   # Running dirs, normalised the same way so the report's RUNNING prefix cannot miss on a spelling
@@ -741,7 +901,26 @@ if [ "$SURFACE" -eq 1 ]; then
   done < "$TMPD/running-raw"
 
   if [ ! -s "$TMPD/cand" ]; then
-    unknown "no harness directory was found on this box (looked at the running controller's own dir, $O, the pin records and the home dirs) — the surface question cannot be answered, and an unanswered check is never a pass"
+    # ⛔ THE REFUSAL STANDS — an unanswered surface question is never a pass — BUT IT IS NOT THE ONLY
+    # POSSIBLE ANSWER (#10114). When the EXECUTING-TREE arm already returned a DRIFT (a live
+    # controller runs a directory that is gone), the run HAS an answer and it is RED; exiting 2 here
+    # would replace that measured fact with "cannot verify" and drop the token that names it. So with
+    # EXEC_N>0 and nothing else broken the run carries on to the summary and exits 1 — never 0.
+    # ⛔ AND IT IS NOT AN ANSWER WHEN SOMETHING ELSE IS BROKEN (review of #3202, measured): a `brk`
+    # raised elsewhere (an unreadable pin record, an unexaminable pin-root child, an unlistable
+    # candidate) leaves `cand` empty too, and this note used to fire on it — printing "this run is RED,
+    # not unverified" one line above `BROKEN … the box's harness state is UNVERIFIED`, two opposite
+    # conclusions in one report, and the exit code is 2. Gate the sentence on the run that can honour
+    # it: `EXEC_N>0` AND nothing broken (`broken -eq 0`, the same counter the summary's exit-2 arm reads).
+    if [ "$EXEC_N" -eq 0 ]; then
+      unknown "no harness directory was found on this box (looked at the running controller's own dir, $O, the pin records and the home dirs) — the surface question cannot be answered, and an unanswered check is never a pass"
+    fi
+    if [ "$EXEC_N" -gt 0 ] && [ "$broken" -eq 0 ]; then
+      note "surface: no harness directory was compared (nothing on this box carries one), but the executing-tree arm DID answer — see the DRIFT(exec) line above; this run is RED, not unverified"
+    fi
+    # When something else IS broken the run is UNVERIFIED, so no claim about RED is made here — the
+    # DRIFT(exec) line still stands as a measured fact, and the summary below says the pass is
+    # unverified (exit 2). Silence is the honest report; the broken line already names what failed.
   fi
 
   while IFS= read -r _dir; do
@@ -782,8 +961,14 @@ if [ "$SURFACE" -eq 1 ]; then
 fi
 
 # Did the SURFACE arm (and only it) add problems? Read after the arm, before the summary.
+# ⛔ AN EXEC-ONLY DRIFT IS NOT A SURFACE HIT (review of #3202). `drift_q exec` increments `problems` from
+# inside the surface block, so `problems > SURF_BASE` was true for a gone EXECUTING tree alone — and the
+# summary then printed `for a surface hit, reseed the copy the RUNNING component uses` directly ABOVE
+# `(c) … redeploying $O does not clear it`: a remedy for a copy at rest, offered for a tree that is not on
+# the box. Both `drift_q exec` call sites increment `EXEC_N` in the same iteration, so the surface delta is
+# what this arm added MINUS the exec ones.
 SURF_HIT=0
-if [ "$problems" -gt "${SURF_BASE:-0}" ]; then SURF_HIT=1; fi
+if [ "$((problems - ${SURF_BASE:-0} - EXEC_N))" -gt 0 ]; then SURF_HIT=1; fi
 
 if [ "$problems" -gt 0 ]; then
   bad ""
@@ -796,7 +981,12 @@ if [ "$problems" -gt 0 ]; then
   # (`[harness=behind:<sha12>]` in orch-loop.sh / dispatch-merge.sh), so a reader can join the two.
   # `uncommitted-edit:*` is NOT `behind`: it means $O carries bytes no deploy wrote.
   HTOKEN=""
-  if [ "$O_ABSENT" -eq 1 ]; then
+  if [ "$EXEC_N" -gt 0 ]; then
+    # ⛔ FIRST IN THE CHAIN, AND BEFORE `O_ABSENT`. Every token below describes a copy AT REST; this
+    # one says the code that is RUNNING is not on the box at all. A redeploy of `$O` cannot clear it,
+    # so listing it under any of the others would print a remedy that does not fix the box.
+    HTOKEN="executes:$EXEC_FIRST"
+  elif [ "$O_ABSENT" -eq 1 ]; then
     # A --surface-only run: no $O was compared, so neither question was answered about one. Saying
     # "payload-differs" here would name a question nothing asked.
     HTOKEN="surface"
@@ -821,8 +1011,9 @@ if [ "$problems" -gt 0 ]; then
     # name a file `$O` no longer has, and the absent script — the runtime-breakage signal README gives
     # its own row and its own remedy ("a redeploy CREATES it") — is the more actionable of the two.
     # Measured: putting this arm first narrowed `incomplete:b.sh` to `source-dirty:<sha>` for a
-    # dirty-source record with a missing file. Precedence, stated rather than implied:
-    # uncommitted-edit > behind/diverged > incomplete > source-dirty > (surface | payload-differs).
+    # dirty-source record with a missing file. Precedence, stated rather than implied (and it must stay
+    # in step with the `if` chain BELOW, which is the one that decides):
+    # executes: > uncommitted-edit > behind/diverged > incomplete > source-dirty > (surface | payload-differs).
     # ⛔ THE `O_ABSENT` ARM PRECEDES ALL OF THESE (review of #3090): no question about `$O` was
     # answered, so there is nothing to order it against — and it is NOT the `Q_BYTES=0` surface arm
     # below, where that flag is a real answer rather than the initialisation at the top of the script.
@@ -876,6 +1067,14 @@ if [ "$problems" -gt 0 ]; then
   fi
   if [ "$SURF_HIT" -eq 1 ]; then
     bad "  for a surface hit, reseed the copy the RUNNING component uses (or move the box onto the pin: scripts/harness-up)"
+  fi
+  if [ "$EXEC_N" -gt 0 ]; then
+    # ⛔ SHAPE-NEUTRAL (review of #3202): this arm fires for BOTH executing shapes — the directory is GONE
+    # (`absent`), and the directory still EXISTS carrying no readable `*.sh` (`dir` whose scripts the live
+    # interpreter holds open after deletion). Saying "NOT THERE" for both made the summary state a falsehood
+    # about the box for the second, and the `executes:` row is the doc a lane reads to decide whether the
+    # token applies. The DRIFT line above names which of the two it is.
+    bad "  (c) executing tree: $EXEC_N live controller process(es) execute a harness directory that cannot be matched to this repo — it is GONE, or it still exists with NO readable *.sh (named above, and the DRIFT line says which). The pin record and the deploy record can both be correct while this is true — they describe copies at rest, and the box is running a tree that is one of those two states. Restart the controller from the pinned tree (scripts/harness-up); redeploying \$O does not clear it"
   fi
   exit 1
 fi
