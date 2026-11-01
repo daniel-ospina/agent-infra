@@ -1,5 +1,5 @@
 #!/bin/bash
-# shard: off pinned by its own step in BOTH lanes (ci.yml `bash-suites-gate`, ci-main `script-validate`) and it drives THIS runner's fast copy - as a shard it would re-enter itself
+# shard: off pinned by its own step in BOTH lanes (ci.yml `bash-suites-gate`, ci-main `script-validate-gate` since #3174 moved it out of `script-validate`) and it drives THIS runner's fast copy - as a shard it would re-enter itself
 # tests/ci-lane-parity/run.sh — #1369 regression suite for scripts/check-ci-lane-parity.sh
 # and the one-runner design it asserts.
 #
@@ -1431,13 +1431,115 @@ if [ "$RC" -eq 2 ]; then
 else
   fail "a flow-mapping __proto__ key returned rc $RC (want 2 — a false PASS): $OUT"
 fi
-printf 'name: x\non: pull_request\njobs: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}\n' \
+printf 'name: x\non: pull_request\njobs: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}, {run: "bash scripts/check-ci-lane-parity.sh"}]}}\n' \
   >"$TMP/ci-pr-flowok.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-flowok.yml"
 if [ "$RC" -eq 0 ]; then
   pass "control: an ordinary flow-mapping job IS read (the pin above is not 'flow style is refused')"
 else
   fail "an ordinary flow-mapping job returned rc $RC (want 0): $OUT"
+fi
+
+echo ''
+echo '8ac9. STEP-vs-JOB BOUNDS AND THE MATRIX AXIS — the two ways a SLICED lane reads GREEN over a hole (#3174)'
+# ⛔ A JOB-level `timeout-minutes` trip is reported `cancelled`, which scripts/admin-merge.sh reads
+# NON-RED (`NON_RED_CONC`); a STEP-level trip is `failure`. So a job bound must sit ABOVE the sum of
+# its own step bounds, or the non-red conclusion can pre-empt the red step that actually hung. NOT
+# hypothetical: measured at #3174's review, BOTH bash-3.2 gates (ci-main.yml's `bash32-parse-guard`,
+# ci.yml's `bash32-parse`) carried a 10 min JOB bound over 10 + 5 + 5 = 20 min of steps, and nothing
+# reddened it — while `auto-file-on-failure` is `if: failure()` and does not fire for a `cancelled`
+# need, so that lane's 3.2 red signal could have gone quiet with no red AND no filed issue.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n        timeout-minutes: 10\n      - run: bash scripts/check-ci-lane-parity.sh\n        timeout-minutes: 3\n' \
+  >"$TMP/ci-pr-bound.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-bound.yml"
+if [ "$RC" -eq 2 ] && grep -q 'timeout-minutes 10' <<<"$OUT"; then
+  pass "a job bound at/below the sum of its step bounds exits 2 (a non-red 'cancelled' could pre-empt the red step)"
+else
+  fail "a job bound at its steps' sum returned rc $RC (want 2, naming the bound): $OUT"
+fi
+# …CONTROL: the same document with the job bound ABOVE the sum is accepted, so the arm above cannot
+# pass merely because every job is refused.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n        timeout-minutes: 10\n      - run: bash scripts/check-ci-lane-parity.sh\n        timeout-minutes: 3\n' \
+  >"$TMP/ci-pr-bound-ok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-bound-ok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "control: the same job with a bound ABOVE its steps' sum is accepted"
+else
+  fail "a correct job bound returned rc $RC (want 0): $OUT"
+fi
+
+# ⛔ AND DELETING ONE STEP BOUND MUST BE CAUGHT, because it is the cheapest way to re-open the whole
+# class: the hang then trips the JOB bound (`cancelled`, NON-RED) and `auto-file-on-failure` is
+# `if: failure()`, so nothing is even filed. Measured (review cycle 2, mutation A) — deleting the
+# shard step's own bound from the live job left the guard GREEN.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n        timeout-minutes: 3\n' \
+  >"$TMP/ci-pr-nostepbound.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-nostepbound.yml"
+if [ "$RC" -eq 2 ] && grep -q 'carry NO finite step bound' <<<"$OUT"; then
+  pass "a step with NO bound inside a bounded job exits 2 (it would silently fall back to the non-red job trip)"
+else
+  fail "an unbounded step in a bounded job returned rc $RC (want 2): $OUT"
+fi
+
+# ⛔ AND THE RULE IS REPO-WIDE, NOT LANE-SCOPED — the conviction that made the ci.yml scope-add
+# necessary (`bash32-parse`, a NON-lane job with a 10 min job bound over 20 min of steps) would
+# silently return if someone narrowed checkBounds to the audited lane jobs.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n  lintish:\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    steps:\n      - run: echo hi\n        timeout-minutes: 10\n' \
+  >"$TMP/ci-pr-nonlane.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-nonlane.yml"
+if [ "$RC" -eq 2 ] && grep -q "lintish" <<<"$OUT"; then
+  pass "a NON-lane job with a job bound below its steps' sum exits 2 (the rule is repo-wide)"
+else
+  fail "a non-lane job bound violation returned rc $RC (want 2, naming it): $OUT"
+fi
+
+# ⛔ AND THE SLICE EXPRESSION ITSELF. The axis can be perfect while the DENOMINATOR is a stale
+# literal: the runner trusts `count` (it only refuses count > listed), so `/12` over an 8-wide matrix
+# leaves 4/12 of the list run by nobody while every arm still passes its own reconciliation.
+sed 's|${{ strategy.job-total }}|12|' "$MAIN" >"$TMP/ci-main-slice12.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-slice12.yml"; then
+  fail "the stale-denominator mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-slice12.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q 'strategy.job-total' <<<"$OUT"; then
+    pass "a hard-coded slice denominator exits 2 (a stale /N leaves slices no arm runs)"
+  else
+    fail "a hard-coded slice denominator returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ AND THE MATRIX AXIS IS A COVERAGE CLAIM NOTHING ELSE CHECKS. `BASH_SHARD_SLICE`'s denominator is
+# `strategy.job-total`, so an axis of `[1,1,2]` leaves slice 3 run by NOBODY while every arm still
+# passes its own set assertion (each process only knows its own index). Measured: accepted before.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        shard: [1, 1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
+  >"$TMP/ci-pr-axis-dup.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-axis-dup.yml"
+if [ "$RC" -eq 2 ] && grep -q 'shard: \[1, 1, 2\]' <<<"$OUT"; then
+  pass "a matrix axis with a DUPLICATE entry exits 2 (a slice no arm runs is a green hole)"
+else
+  fail "a duplicated matrix axis returned rc $RC (want 2): $OUT"
+fi
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
+  >"$TMP/ci-pr-axis-ok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-axis-ok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "control: a contiguous, distinct 1..N axis is accepted"
+else
+  fail "a correct matrix axis returned rc $RC (want 0): $OUT"
+fi
+
+# ⛔ AND THE GUARD ITSELF MUST STILL BE THERE. The guard's `guardMentioning` walk is NAME-FREE so a
+# synthetic fixture is not refused for lacking a job NAME — which also meant a document that carries
+# the shard call and NO guard step was GREEN: a copy of ci-main.yml with the whole
+# `script-validate-gate` job deleted exited 0 (measured), i.e. the job running the gate could be
+# removed while every assertion in the guard still passed.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n' \
+  >"$TMP/ci-pr-noguard.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-noguard.yml"
+if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  pass "a lane that calls the runner but runs NO guard step exits 2 (the gate cannot be silently deleted)"
+else
+  fail "a lane with the runner and no guard returned rc $RC (want 2): $OUT"
 fi
 
 # ROOT-CAUSE PIN. The guard refusing the polluted document does not prove the PARSER is fixed —
@@ -1540,7 +1642,8 @@ fi
 echo ""
 echo "8ai. TWO CONSECUTIVE FOLDED STEPS → the first is not dropped (a pending fold must flush)"
 awk '
-  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; pend = 1; next }
+  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; print "        timeout-minutes: 5"; print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "        timeout-minutes: 5"; pend = 1; next }
+  pend && /^        timeout-minutes: / { next }
   pend && /^        run: bash scripts\/run-bash-shards\.sh$/ { pend = 0; next }
   { print }
 ' "$PR" >"$TMP/ci-pr-twofold.yml"
@@ -1560,7 +1663,8 @@ fi
 # rc 1 while this asserted rc 0. (An earlier version put the call in the SECOND fold too, so it
 # passed even when the first was dropped — a vacuous assertion, found by the bug-scan reviewer.)
 awk '
-  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "      - run: >"; print "          echo done"; pend = 1; next }
+  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "        timeout-minutes: 5"; print "      - run: >"; print "          echo done"; print "        timeout-minutes: 5"; pend = 1; next }
+  pend && /^        timeout-minutes: / { next }
   pend && /^        run: bash scripts\/run-bash-shards\.sh$/ { pend = 0; next }
   { print }
 ' "$PR" >"$TMP/ci-pr-twofoldok.yml"
