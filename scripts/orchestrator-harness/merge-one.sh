@@ -180,7 +180,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
   return "$rc"
 }
-git fetch origin "$BR" --quiet 2>/dev/null || true   # external (other-machine) branches may not be fetched locally
+# ⛔ NAME THE DESTINATION (#3009): the reviewer brief below reads the PR head with
+# `git show origin/$BR:<path>`, which needs a REMOTE-TRACKING ref. A bare `fetch origin "$BR"` only
+# creates one when the clone's configured refspec maps that source — true on a full clone, FALSE on a
+# cell's single-branch clone (`+refs/heads/main:refs/remotes/origin/main`), where every `git show` in
+# the brief fails and the reviewer reviews a branch it cannot read. The `+` tolerates force-pushes.
+git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet 2>/dev/null || true   # external (other-machine) branches may not be fetched locally
 
 # HEAD is resolved BEFORE the claim: the cross-box claim key is <PR>-<head-sha12> (claim_key()
 # truncates the sha to 12), not <PR>

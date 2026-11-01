@@ -1560,8 +1560,21 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
     out["alive"] = alive
     out["unknown"] = unknown
     out["total"] = out["fix"] + out["review"]
+    # ⛔ `capped` AND THE PER-CLASS PROVENANCE RECORD WHAT THE ARM MAY **NOT** INFER (review P1,
+    # 2026-10-31). Without them the NO SLOT arm had to guess the cause of a 0 AGGREGATE from the
+    # number alone, and a 0 class budget has THREE causes: the cap is configured 0, every slot is in
+    # use, or (for `total`) the `--max` override clamped it. The arm named `--max` for all of them,
+    # so a saturated pass sent the operator to a flag they never passed -- and after the first fix it
+    # named "both class budgets are SPENT" for a pass where NOTHING was spent, with `inflight=0
+    # alive=0 unproven=0` appended to the same clause saying so. The provenance is known HERE, so it
+    # is recorded here instead of guessed at the call site.
+    out["capped"] = False
+    out["cap"] = {"fix": cap["max_fix"], "review": cap["max_review"]}
+    out["used_by_class"] = dict(used)
     if total_override is not None:
-        out["total"] = min(out["total"], max(0, total_override))
+        _cap = max(0, total_override)
+        out["capped"] = _cap < out["total"]
+        out["total"] = min(out["total"], _cap)
     return out
 
 
@@ -2526,7 +2539,7 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
         else:
             if dry:
                 return path, ""   # a real run would fetch origin/<branch> and create the branch
-            _, ferr, frc = _git(["fetch", "origin", branch, "--quiet"], timeout=300)
+            _, ferr, frc = _git(["fetch", "origin", _fetch_refspec(branch), "--quiet"], timeout=300)
             if frc != 0:
                 return "", "cannot materialise %s: origin/%s could not be fetched (%s)" % (
                     branch, branch, (ferr or "").strip()[:160])
@@ -2546,6 +2559,67 @@ def materialise_worktree(pr: dict, dry: bool = False) -> tuple[str, str]:
 
 def _git(args, timeout=120):
     return sh_err(["git", "-C", REPO_DIR] + list(args), timeout=timeout)
+
+
+# ⛔ THE REFSPEC THAT MAKES `origin/<branch>` EXIST -- agent-infra#2716 follow-up (measured 2026-10-30).
+#
+# `git fetch origin <branch>` DOES NOT CREATE `refs/remotes/origin/<branch>`. With no colon in the
+# refspec the ref lands in FETCH_HEAD, and git only ALSO updates a remote-tracking ref when one of
+# the remote's CONFIGURED `remote.<name>.fetch` refspecs maps that source ref. On a NORMAL clone the
+# configured refspec is `+refs/heads/*:refs/remotes/origin/*`, which matches -- so the bug is
+# invisible there. On a SINGLE-BRANCH clone the configured refspec is
+# `+refs/heads/main:refs/remotes/origin/main`, and ONLY `main` matches. Every other branch is
+# fetched into FETCH_HEAD and nowhere else.
+#
+# WHAT THAT COST. The cell checkout `/tmp/cell-t3` is a single-branch clone. So this file fetched
+# the branch (rc=0 -- the fetch SUCCEEDS), then asked for `git worktree add <path> -b <b> origin/<b>`,
+# which failed with `fatal: invalid reference: origin/<b>`. That refusal was reported as
+# `N order(s) no worker accepted`, which reads as a TRANSPORT failure, and it repeated on every pass
+# for weeks -- measured `27 order(s) no worker accepted -> VERDICT=UNDELIVERED next=repair-chain`
+# (agent-infra#3009). No worker was ever at fault: the order never reached one, because the ref it
+# would have checked out was never created. The proof is one line:
+#
+#   $ git -C /tmp/cell-t3 config --get-all remote.origin.fetch
+#   +refs/heads/main:refs/remotes/origin/main          <- single-branch
+#   $ git -C /tmp/cell-t3 rev-parse --verify refs/remotes/origin/fix/ci-runner-label-contract
+#   (rc=1, ABSENT)                                          <- measured 2026-10-30T17:39Z, BEFORE the fix
+#   $ git -C /tmp/cell-t3 ls-remote --heads origin fix/ci-runner-label-contract
+#   5f7c29a8d93b22f54b630195f37babed15894a8c  refs/heads/fix/ci-runner-label-contract   <- present on origin
+#
+# ⛔ THAT rc=1 IS A DATED MEASUREMENT, NOT A RUNNABLE PROOF, AND IT MUST SAY SO (review P2). Once a
+# fixed pass runs it CREATES the ref, so re-running the line returns rc=0 and a reader would conclude
+# the premise was stale. The refspec-vs-clone mechanism is pinned instead by
+# `scripts/pr-doctor-fetch-refspec.test.sh`, whose MUTANT section reproduces the exact
+# `fatal: invalid reference` on a fresh fixture at any time.
+#
+# The fix is to name the DESTINATION, so the ref is created whatever the clone's configured refspec
+# is. The leading `+` keeps the update valid when the branch was rewritten (a force-push), which a
+# PR branch routinely is.
+def _fetch_refspec(name: str) -> str:
+    """`<name>` -> the refspec to fetch so the caller can read what it asked for.
+
+    ⛔ THE CONTRACT IS PER ARM (review P2, 2026-10-31). A single line here claimed ONE postcondition
+    for both arms, and it was FALSE for exactly the input the second arm exists for:
+
+      * a bare branch `<b>` -> `+refs/heads/<b>:refs/remotes/origin/<b>`, which DOES leave
+        `origin/<b>` resolvable after the fetch;
+      * a fully-qualified `refs/...` ref -> returned UNCHANGED. That refspec names no DESTINATION, so
+        it lands in FETCH_HEAD, and a remote-tracking ref is created ONLY IF one of the remote's
+        CONFIGURED `remote.<name>.fetch` refspecs maps that source -- which is the mechanism stated
+        in the module comment above, not the colon. No standard config maps `refs/pull/**`, so for
+        the fork ref this arm exists for, NO tracking ref appears and `origin/<ref>` does NOT
+        resolve. A caller of this arm must read FETCH_HEAD, never `origin/<ref>`.
+
+    ⛔ THE `refs/` PASSTHROUGH IS DEFENCE, NOT A LIVE CALL SITE (review P2). Both shipped callers
+    either pass a bare branch name or short-circuit before reaching here (`fetch_ref or
+    _fetch_refspec(branch)`, where `fetch_ref` is `""` or `refs/pull/<n>/head`), so no current call
+    passes a qualified ref. It is kept so a future caller that does pass one is not silently given
+    `refs/remotes/origin/refs/pull/...` -- an invented ref nothing reads -- and it is NOT credited
+    with protecting the fork arm, which the `or` already does.
+    """
+    if name.startswith("refs/"):
+        return name
+    return "+refs/heads/%s:refs/remotes/origin/%s" % (name, name)
 
 
 def _live_worktree(path: str):
@@ -2739,7 +2813,8 @@ def _ensure_head(path: str, branch: str, head: str, fetch_ref: str = "", dry: bo
         # A fork PR's head lives at refs/pull/<n>/head, NOT origin/<branch> (which does not exist
         # for a fork). Fetching the WRONG ref leaves the object absent and every later probe fails
         # with a misleading error, so fetch the right one and name a persistent absence clearly.
-        sh_err(["git", "-C", path, "fetch", "origin", fetch_ref or branch, "--quiet"], timeout=300)
+        sh_err(["git", "-C", path, "fetch", "origin", fetch_ref or _fetch_refspec(branch),
+                "--quiet"], timeout=300)
         _, _, have = sh_err(["git", "-C", path, "cat-file", "-e", "%s^{commit}" % head], timeout=30)
         if have != 0:
             return ("PR head %s is not present locally and could not be fetched -- refusing to "
@@ -5241,6 +5316,290 @@ def run_pass(args, rubric_note: str = "") -> int:
         (len(prs), " ".join("%s=%d" % kv for kv in sorted(counts.items())),
          cap["max_fix"], cap["max_review"], budgets["inflight"], budgets["alive"],
          budgets["unknown"], budgets["fix"], budgets["review"], budgets["total"]))
+
+    # ── THE CASCADE, AND ITS ORDER, ON ONE LINE PER PASS ──────────────────────────────────────────
+    # The repair chain is THREE rungs, and each pass walks them in this order (the owner's canonical
+    # logic). Making the order VISIBLE here is not decoration: before this line, a pass printed the
+    # per-class counts and every individual refusal, so an operator could not tell from a single line
+    # WHICH rung the chain was on -- and a pass that did nothing was indistinguishable from a pass
+    # whose queue was empty, which is the silence that hid four dead actuators for weeks.
+    #
+    #   rung 1 MERGE   `call-rail` -- every gated check green, a clean attestation at this head, and
+    #                  the rail itself would take it. This rung is NOT re-implemented here and no
+    #                  gate is loosened: the ORDER hands it to `admin-merge.sh`, which decides.
+    #   rung 2 FIX     the blocking cause, chosen by cause -- `resolve-conflict` (rebase, then record
+    #                  + rail), `record-review` (fresh-context review, then record + rail), `fix-ci`
+    #                  (repair the red, re-review, rail), `rerun-checks`, `blocked-by-rail`.
+    #   rung 3 WAIT    nothing to dispatch: `running` (the head is still executing), an unreadable
+    #                  classification, or an unusable changed-file list. ⛔ ONE DEFINITION, and every
+    #                  mention of the axis in this block means exactly this: rung 3 is EXACTLY the
+    #                  rows `counts` records as `skipped-running` + `skipped-unreadable` +
+    #                  `skipped-surface_unreadable` / `skipped-surface_partial` /
+    #                  `skipped-surface_abandoned` (`_finish`'s `blind` PLUS `running` -- noting that
+    #                  `blind` alone has NO `running` term), and `wait=` IS that set. ⛔ "HELD WITHOUT
+    #                  A DISPATCH" IS NOT THE DEFINITION ON ITS OWN (review P1, rounds 11-12): a
+    #                  `skipped-surface` row is ALSO held without a dispatch, and it is an
+    #                  ESCALATION rather than a wait -- printed as `surface=` and counted only in
+    #                  `held=`, never in `wait=`. ⛔ AND "A LATER PASS RETRIES IT" IS TRUE OF ONLY
+    #                  PART OF rung 3: the `running` and `unreadable` rows are retried on their own,
+    #                  while ONE subset -- `filelist=`, the three unusable-changed-file-list
+    #                  buckets -- will NOT clear by re-reading, so a human must resolve it. That
+    #                  subset STAYS on the axis (#2136 r2; reclassifying it would REVERSE that
+    #                  recorded decision), which is why the arm below still says the chain is on
+    #                  rung 3 for it and DECOMPOSES the human part (round 7), rather than denying
+    #                  the axis it is on.
+    #                  (Review P2, round 9: the banner, the `_r3` comment and the `surface=`
+    #                  comment each described a DIFFERENT set, so a reader could obey any one of
+    #                  three. This paragraph is the ONE set, stated by KEY.)
+    # `no slot` is the refusal BOTH budget-gated rungs take (rung 1 as well — see below), and it
+    # prints the reason with it -- the budget it could not take. A rung that is skipped for capacity
+    # must SAY so; that silence is what the brief bans.
+    #
+    # ⛔ EVERY COUNT BELOW READS THE KEY `counts` ACTUALLY HOLDS (review P1, 2026-10-30). `running` and
+    # `unreadable` are diverted into `skipped[...]` BEFORE `classified` is built (the classification
+    # loop above writes `skipped["unreadable"]` and `skipped["running"]`), and `counts` is built from
+    # `classified` plus `skipped` under a `skipped-` prefix (`counts["skipped-" + a]`) -- so the bare
+    # keys can never exist and `counts.get("running", 0)` was STRUCTURALLY 0. That was a false
+    # statement of exactly the kind this line exists to prevent: a pass would print
+    # `pass: 22 open PRs :: skipped-running=6 ...` immediately above
+    # `cascade: ... wait=0 ... nothing to dispatch`, i.e. rung 3 denied while six PRs waited on it.
+    # rung 1 is BUDGET-GATED TOO (`ACTION_CLASS["call-rail"] == "review"`, `:1222`, and the dispatch
+    # loop breaks on `dispatched >= budgets["total"]`), so claiming a handoff is only true when a
+    # slot exists -- otherwise it takes the same NO SLOT arm as rung 2, for the same reason.
+    _r1 = counts.get("call-rail", 0)
+    # ⛔ rung 2 SPANS TWO BUDGET CLASSES, SO IT IS COUNTED PER CLASS (review P1, 2026-10-31).
+    # Summing the five actions into one number and then asking `budgets["fix"] > 0 or
+    # budgets["review"] > 0` re-created the rung-1 false claim one rung down: `resolve-conflict`,
+    # `fix-ci`, `rerun-checks` and `blocked-by-rail` are FIX class while `record-review` is REVIEW
+    # class (`ACTION_CLASS`, `:1222`), so a pass whose only rung-2 rows were fix-class printed
+    # `fix->eligible (1); fix slots=0 review slots=3` and refuted itself in the same clause -- with
+    # `budgets["fix"] == 0` reachable at the shipped `MAX_FIX=3` whenever three fix workers hold
+    # their slots, i.e. the normal busy-fleet state. The CLASS of each action still comes from
+    # `ACTION_CLASS` (the one mapping), and the SET of rung-2 actions is derived from `ranked` —
+    # ⛔ NOT from a second hand-kept list (review P2, round 6). This block used to iterate a literal
+    # of the five names while its own comment claimed it did not, and nothing pinned that literal to
+    # `ranked`: a new dispatchable action added to `ranked` would have been counted by neither rung,
+    # so the pass would print `merge=0 fix=0 wait=0 ... nothing to dispatch` with a dispatchable row
+    # in hand — the exact false statement this block exists to prevent, with no assertion behind it.
+    _r2_by_class: dict[str, int] = {}
+    for _a in ranked:
+        if _a == "call-rail":      # rung 1, counted separately as `_r1` above
+            continue
+        _n = counts.get(_a, 0)
+        if _n:
+            _c = ACTION_CLASS.get(_a, "fix")
+            _r2_by_class[_c] = _r2_by_class.get(_c, 0) + _n
+    _r2 = sum(_r2_by_class.values())
+    # ⛔ rung 3 IS THE WAIT AXIS AS DEFINED IN THE BANNER ABOVE -- every held row a later pass
+    # retries, NOT every held row (review P1/P2, 2026-10-31; corrected round 9). `running` and
+    # `unreadable` are the obvious populations, and `_finish` folds THREE MORE onto its blindness
+    # (`blind = unread + blind_surface + blind_partial + blind_abandoned`): an unusable changed-file
+    # list is a held PR for a reason the operator must see. Leaving those three out let this line
+    # print `wait=0 ... nothing to dispatch` while PRs sat held on precisely the classification it
+    # defines as rung 3: the same silence the block exists to remove, one population over.
+    # ⛔ SO `wait=` IS `blind` PLUS `running`, NOT `blind` ITSELF -- `_finish`'s equation has NO
+    # `running` term (`skipped["running"]` is written in the classification loop and read only
+    # here), and an earlier revision of this comment claimed the identity `blind == wait`, which the
+    # quoted equation eight lines above refutes.
+    # ⛔ AND THE THREE ARE NAMED SEPARATELY, BECAUSE THE PER-PR LINE CALLS THEM ASK-USER (review P1,
+    # 2026-10-31). The same pass logs `ASK-USER #<n> (...) -- a human decides` for each of them (the
+    # `surface_partial` / `surface_unreadable` / `surface_abandoned` arms above), and a 100+-file
+    # page never clears by waiting at all -- yet a bare `wait=` folded them into "the chain is on
+    # rung 3", which is the frame that says nothing needs doing. They STAY on the blindness axis
+    # (`_finish`'s `blind`, agent-infra#2136 r2 -- reclassifying them would REVERSE that recorded
+    # decision, so it is not done here); `filelist=` instead DECOMPOSES the axis, so the
+    # human-decision part of the wait is visible rather than renamed away.
+    # ⛔ `skipped-surface` IS NOT FOLDED IN: it is an ASK-USER, not blindness, and is issued as its
+    # own `surface=` term — and ⛔ `held=` APPEARS EXACTLY ONCE PER LINE, AND DENOTES THAT ARM'S OWN
+    # TOTAL (review P2, round 6; corrected round 10). THREE terminal arms print it, and the total is
+    # a different quantity in each: `_r3 + _held` when BOTH hold populations are non-empty, `_r3`
+    # alone on the rung-3-only arm, and `_held` ALONE on the ASK-USER-only arm — which says so in
+    # the same clause ("held for a HUMAN (ASK-USER), not on the rung-3 wait axis"), and
+    # `test_the_cascade_emits_one_held_quantity_under_one_label` drives exactly that fixture. An
+    # earlier revision of this comment claimed the ASK-USER count alone was NEVER printed, which
+    # that third arm refutes — the same self-refuting-banner class as its predecessor, one revision
+    # over. What is guaranteed: `surface=` names the SDK-surface ASK-USER split, `wait=` names rung 3
+    # by the banner's definition (`_finish`'s `blind` PLUS `running`), `filelist=` the
+    # unusable-changed-file-list part of it (a human decides), and `held=` never appears twice in one
+    # line, so no two quantities share the label.
+    _r3_wait = sum(counts.get(k, 0) for k in ("skipped-running", "skipped-unreadable"))
+    _r3_files = sum(counts.get(k, 0)
+                    for k in ("skipped-surface_unreadable", "skipped-surface_partial",
+                              "skipped-surface_abandoned"))
+    _r3 = _r3_wait + _r3_files      # `_finish`'s `blind` PLUS `running` (a hold, but not a blind read)
+    _held = counts.get("skipped-surface", 0)   # ASK-USER: held for a HUMAN, not for a re-read
+    # ⛔ RUNG 2 SPANS TWO CLASSES, SO ITS TOTAL IS NOT A CLASS COUNT (review P2, round 4). `fix=%d`
+    # printed `_r2` -- the sum over BOTH budget classes -- while the arms below name a CLASS
+    # (`fix->` / `review->`). So a pass whose only rung-2 row was `record-review` read
+    # `fix=1 ... review->candidate (1)`: one label, two quantities, the same defect this block
+    # fixed for `held=`. The rung total stays (it is the ladder count, `order=merge>fix>wait`); the
+    # class split is printed beside it whenever a REVIEW-class row exists, so `fix=` can never be
+    # read as a fix-class count it does not hold.
+    # ⛔ AND THE SPLIT MUST NOT RE-USE THE LABEL IT EXISTS TO DISAMBIGUATE (review P2, round 7). It
+    # read `fix=1(fix 0/review 1)` -- the word `fix` against two different numbers inside ONE token,
+    # which is exactly the ambiguity the paragraph above claims to have removed. The split is now
+    # qualified (`fix=1 (rung2: fix 0/review 1)`): the outer `fix=` is the LADDER rung and the inner
+    # one is plainly the CLASS breakdown.
+    _r2_split = ""
+    if _r2_by_class.get("review"):
+        _r2_split = " (rung2: fix %d/review %d)" % (_r2_by_class.get("fix", 0),
+                                                    _r2_by_class.get("review", 0))
+    _casc = ["order=merge>fix>wait",
+             "merge=%d" % _r1,
+             "fix=%d%s" % (_r2, _r2_split),
+             "wait=%d" % _r3]
+    # `filelist=` is a DECOMPOSITION of `wait=`, never a peer of it (review P1, round 7): it names
+    # the part of the wait that cannot clear by re-reading, so `wait=2 filelist=1` says "two held,
+    # one of them a human's to answer" instead of implying both are just in flight.
+    if _r3_files:
+        _casc.append("filelist=%d" % _r3_files)
+    # ⛔ ONE LABEL, ONE QUANTITY (review P2, 2026-10-31). This term is the ASK-USER count ALONE; the
+    # "nothing dispatchable" arm below prints `_r3 + _held`. Naming both `held=` emitted
+    # `wait=1 held=1 ... nothing dispatchable -- held=2` in ONE line -- no double-count (the keys are
+    # disjoint) but an ambiguous report, which is the same defect class this block exists to remove.
+    if _held:
+        _casc.append("surface=%d" % _held)
+    _casc.append("slots=%d (aggregate)" % budgets["total"])
+    # ⛔ NO ARM ASSERTS A DISPATCH IT HAS NOT MADE (review P2). `budgets["total"]` is an AGGREGATE
+    # (`fix + review`) while the loop spends PER CLASS, and a PR can still be refused for a live
+    # worker or an unreadable liveness after the slot check -- so "dispatched" is a claim only
+    # `_finish` can make from the real counters.
+    # ⛔ AND THE AGGREGATE ALONE IS NOT EVEN "A SLOT IS AVAILABLE" (review P1, 2026-10-31). TWO
+    # further facts decide a row AFTER this line prints, and both made the old arms LIE:
+    #   * the COOLDOWN/`covered` arm -- `if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S
+    #     and prev.get("head") == p["headRefOid"]:` removes a row dispatched on the previous pass at the
+    #     same head, while `counts` -- built from `classified` ABOVE that arm -- still counts it. In
+    #     steady state nearly every pass claimed a handoff with `dispatched 0` on the line below.
+    #   * the PER-CLASS gate -- `if spent[cls] >= budgets[cls]:` -- refuses a row the aggregate total
+    #     still admits: rung 1 IS `ACTION_CLASS["call-rail"] == "review"` (`:1222`), so a zero REVIEW
+    #     budget with fix slots free refuses it while `budgets["total"]` still reads > 0.
+    # ⛔ AND NEITHER AGGREGATE NOR CLASS ALONE IS "A SLOT EXISTS" (review P1, round 3). The loop ALSO
+    # breaks on `dispatched >= budgets["total"]`, and `pass_budgets` clamps `out["total"]` to the
+    # `--max` override through `_cap` (`out["total"] = min(out["total"], _cap)`) while leaving
+    # `out["fix"]`/`out["review"]` at their own values -- so `--max 0` (the documented operator flag,
+    # `--max`) yields `{'fix': 3, 'review': 4, 'total': 0}` at the shipped defaults and the arms
+    # printed `slots=0 merge->candidate (2), the rail decides; review slots=3` while dispatching
+    # nothing.
+    # The binding number is `min(budgets[cls], budgets["total"])`, and that is what the PER-CLASS
+    # arms print (`fix slots=` / `review slots=`). ⛔ THE STANDALONE `slots=` IS A DIFFERENT
+    # QUANTITY -- the AGGREGATE -- and it now SAYS SO in the line (review P2, round 11): printed bare
+    # it sat beside `fix slots=1` as `slots=4`, two numbers under one word, which is the ambiguous
+    # report this block exists to remove.
+    # So no arm says "handed"/"dispatched"/"eligible": every one names a CANDIDATE count and the
+    # EFFECTIVE slots that could serve it. "Candidate" is the only claim this line can keep, because
+    # cooldown and liveness are decided below it. `dispatched`/`_finish` remain the only source of
+    # what actually went out.
+    _noslot = ("no available slot: inflight=%d alive=%d unproven=%d"
+               % (budgets["inflight"], budgets["alive"], budgets["unknown"]))
+    # THE EFFECTIVE SLOTS ARE THE BINDING ONE: the loop breaks on the aggregate AND refuses per class.
+    def _eff(_c):
+        return min(budgets[_c], budgets["total"])
+
+    # ⛔ THE NO-SLOT ARM MUST NAME THE CONSTRAINT THAT ACTUALLY BOUND (review P2, round 4). Both arms
+    # hardcoded `"<class> budget 0"`, but `_eff` is `min(budgets[cls], budgets["total"])` -- so with
+    # the documented `--max 0` override (`{'fix': 3, 'review': 4, 'total': 0}` at the shipped caps)
+    # the arm told the operator `review budget 0` while the REVIEW cap was 4, sending them at the
+    # wrong knob. The appended `_noslot` numbers contradicted it in the same clause (`inflight=0
+    # alive=0 unproven=0` says nothing holds a slot). Name the BINDING term: the class, the aggregate,
+    # or both.
+    # ⛔ AND A 0 CLASS BUDGET HAS THREE CAUSES, SO NONE OF THEM MAY BE INFERRED FROM THE ZERO (review
+    # P1, round 7; P1 again round 8). `total == 0` is BOTH "`--max` clamped it" AND "both class
+    # budgets are 0" (`total = fix + review`, `total_override is None`), and a 0 class budget is
+    # BOTH "every slot is in use" AND "the cap is CONFIGURED 0" (`capacity()` accepts `"0"`).
+    # Round 7 fixed the first and then asserted the second: with `MAX_FIX=0 MAX_REVIEW=0` and NO
+    # in-flight rows it printed "both class budgets are spent", while the `_noslot` figures appended
+    # to the same clause read `inflight=0 alive=0 unproven=0` -- nothing had been spent. Both
+    # provenances are now recorded by `pass_budgets` (`capped`, `cap`, `used_by_class`), so every
+    # clause below is STATED from the fact.
+    def _cls_state(_c):
+        """Why THIS class budget is 0 -- configured that way, or consumed."""
+        _cap = (budgets.get("cap") or {}).get(_c)
+        _use = (budgets.get("used_by_class") or {}).get(_c)
+        if _cap is None or _use is None:
+            return "%s budget 0" % _c          # a caller that did not go through pass_budgets
+        # ⛔ A 0 CAP DOES NOT IMPLY NOTHING WAS SPENT (review P1, round 9). `out[_c] = max(0, cap -
+        # used[_c])` clamps at 0, so a class CONFIGURED 0 can still hold charged rows (`used > cap`),
+        # and the round-8 wording asserted "nothing was spent" from the cap alone while `_use` was
+        # read and never consulted -- reproduced at `MAX_FIX=0` with one fresh `fix-ci` row:
+        #     fix->NO SLOT (fix budget 0 (the cap is 0, so nothing was spent):
+        #                  no available slot: inflight=1 alive=0 unproven=1)
+        # one clause saying a slot is held and that nothing was spent. Both facts are now stated.
+        if _cap <= 0:
+            if _use:
+                return ("%s budget 0 (the cap is 0, but %d slot(s) are still charged)"
+                        % (_c, _use))
+            return "%s budget 0 (the cap is 0, so nothing was spent)" % _c
+        return "%s budget 0 (%d of %d slots in use)" % (_c, _use, _cap)
+
+    def _why(_c):
+        _cls_b, _tot = budgets[_c], budgets["total"]
+        _other = "review" if _c == "fix" else "fix"
+        if _tot <= 0 and budgets.get("capped"):
+            if _cls_b <= 0:
+                return "%s budget 0 and the aggregate ceiling (--max) 0" % _c
+            return "the aggregate ceiling (--max) 0, %s budget %d" % (_c, _cls_b)
+        if _tot <= 0:
+            # NOT capped, so `total == 0` means both class budgets are 0 -- and `_cls_state` says
+            # WHY each one is, without ever claiming a spend it cannot see. ⛔ "AVAILABLE", not
+            # "left": a budget configured 0 is not budget that was CONSUMED, and "no class budget
+            # left" asserted a consumption the configured-zero case never had (review P1, round 9).
+            return "no class budget available -- %s; %s" % (_cls_state(_c), _cls_state(_other))
+        return _cls_state(_c)
+
+    if _r1:
+        _e = _eff("review")
+        _casc.append("merge->candidate (%d), the rail decides; review slots=%d" % (_r1, _e)
+                     if _e > 0 else "merge->NO SLOT (%s: %s)" % (_why("review"), _noslot))
+    for _cls in ("fix", "review"):
+        _n = _r2_by_class.get(_cls, 0)
+        if not _n:
+            continue
+        _e = _eff(_cls)
+        _casc.append("%s->candidate (%d), %s slots=%d" % (_cls, _n, _cls, _e)
+                     if _e > 0
+                     else "%s->NO SLOT (%s: %s)" % (_cls, _why(_cls), _noslot))
+    # ⛔ "NOTHING TO DISPATCH" IS A CLAIM ABOUT THE WHOLE QUEUE, NOT ABOUT TWO RUNGS (found by the
+    # new pin, 2026-10-31). The arm fired on `not _r1 and not _r2` alone, so once `wait=` was made
+    # honest the line read `wait=1 slots=7 nothing to dispatch (no mergeable, no repairable)` -- a
+    # SELF-CONTRADICTING sentence, which is the same defect one clause over. A pass that HELD work
+    # did not have nothing to dispatch; it had nothing it was willing to dispatch.
+    # ⛔ AND "ON RUNG 3" IS A CLAIM ABOUT THE WAIT AXIS, NOT ABOUT HOLDS IN GENERAL (review P2,
+    # round 5). The arm fired on `(_r3 or _held)` and always appended "the chain is on rung 3", so a
+    # pass whose ONLY hold was an ASK-USER surface row printed
+    # `wait=0 surface=1 ... nothing dispatchable -- held=1, the chain is on rung 3` -- naming a rung
+    # its own definition (`running` or an unreadable classification) says it is NOT on, and
+    # contradicting its own `wait=0` in the same clause. The two populations are named separately:
+    # rung 3 is the WAIT axis; the SDK-surface ASK-USER hold (`surface=`) is a HUMAN decision outside
+    # that axis, and saying so is the whole point of `surface=` existing.
+    # ⛔ AND A WAIT THAT ONLY A HUMAN CAN END MUST SAY SO (review P1, round 7). The three
+    # unusable-changed-file-list holds are on the blindness axis (`_finish`, #2136 r2) AND are
+    # announced per PR as `ASK-USER ... a human decides`; a bare "the chain is on rung 3" told the
+    # operator to wait for something a re-read will never clear. The decomposition is appended to
+    # this arm so the sentence keeps rung 3 as the axis and still names the human decision inside it.
+    _files_note = ("%d of them on an unusable changed-file list, which a human must resolve"
+                   % _r3_files) if _r3_files else ""
+    _files_clause = (" -- " + _files_note) if _files_note else ""
+    if not _r1 and not _r2:
+        if _r3 and _held:
+            _casc.append("nothing dispatchable -- held=%d (%d waiting on rung 3%s, "
+                         "%d held for a HUMAN/ASK-USER)"
+                         % (_r3 + _held, _r3, _files_clause, _held))
+        elif _r3:
+            # ⛔ "THE CHAIN IS ON RUNG 3" IS KEPT HERE, AND IT IS TRUE UNDER THE BANNER'S DEFINITION
+            # (review P1, round 11 -- resolved by CORRECTING THE DEFINITION, not the arm).
+            # `test_the_cascade_names_the_WAIT_axis_separately_from_an_ASK_USER_hold` pins this
+            # arm's claim for a `surface_unreadable`-only hold, and #2136 r2 keeps those rows ON
+            # the axis: so the wait IS rung 3, and what a reader must additionally be told is that
+            # THIS wait needs a human. The round-7 decomposition below is that clause; the banner
+            # above no longer claims the whole axis clears by re-reading, which was the falsehood.
+            _casc.append("nothing dispatchable -- held=%d, the chain is on rung 3%s"
+                         % (_r3, _files_clause))
+        elif _held:
+            _casc.append("nothing dispatchable -- held=%d, held for a HUMAN (ASK-USER), "
+                         "not on the rung-3 wait axis" % _held)
+        else:
+            _casc.append("nothing to dispatch (no mergeable, no repairable)")
+    log("cascade: " + " ".join(_casc))
 
     # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
     # lane; with the fleet busy it printed "no idle lanes -- nothing dispatched this pass" and
