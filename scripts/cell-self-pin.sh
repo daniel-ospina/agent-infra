@@ -9,9 +9,10 @@
 #   ./cell-self-pin.sh --print-unit    # render the units to stdout ONLY — writes no file, places no pass
 #   ./cell-self-pin.sh --help
 #
-# Exit (pass):   0 = current or applied; 11 = the pin RECORD was missing and was MENDED to the tree
-#                `apply` created; 1 = apply failed, or the record did not converge; 2 = the layer
-#                could NOT be resolved (loud, named).
+# Exit (pass):   0 = current or applied (and ONE actuator on the pin); 11 = the pin RECORD was missing
+#                and was MENDED to the tree `apply` created; 1 = apply failed, the record did not
+#                converge, or a RE-ARMED second actuator could not be retired; 2 = the layer could NOT
+#                be resolved (loud, named).
 # Exit (status): 0 = current, 1 = DRIFT, 2 = the layer could NOT be resolved — the repo's own
 #                `0 match / 1 drift / 2 unknown` vocabulary (scripts/check-deployed-drift.sh), reused
 #                rather than invented a third time (#1178).
@@ -68,9 +69,16 @@
 # actors on one pin is a RACE, not redundancy — so this file never silently becomes the second one:
 #   · `--install` REFUSES while `eldato-harness-apply.timer` is enabled in EITHER systemd manager —
 #     the SYSTEM one and the `--user` one the sibling installer negotiates — and NAMES the scope it saw;
-#   · `--install --takeover` is the ONE-ACTOR MIGRATION: disable+stop that timer, VERIFY the disable,
-#     and only then install this unit. `--takeover` is an operator's explicit decision to retire the
-#     shipped actuator on this box; a retirement that does not take is a REFUSAL, never two actors.
+#   · `--install --takeover` is the ONE-ACTOR MIGRATION: place and verify the units FIRST, then
+#     disable+stop that timer in EVERY manager that carries it, VERIFY each disable, and only then
+#     `enable --now` this unit. `--takeover` is an operator's explicit decision to retire the shipped
+#     actuator on this box; a retirement that does not take is a REFUSAL, never two actors — and an
+#     install that fails after a retirement ROLLS IT BACK, so the migration never ends at zero actors;
+#   · ⛔ AND INSTALL TIME IS NOT ENOUGH: the invariant is RE-CHECKED ON EVERY TICK. `bringup`'s
+#     `check_harness_apply` re-runs the sibling installer, whose whole job is to re-arm a timer
+#     somebody disabled by hand — so a second actor comes BACK after a successful `--takeover`, with
+#     no signal. `do_pass` reads both managers every tick and re-takes the pin (retire, read back,
+#     say so), because an invariant nothing re-checks is not an invariant.
 # ⛔ AND NOTHING INSTALLS THIS UNIT AUTOMATICALLY. `cloud-cell-bringup.sh` carries no reference to it,
 # deliberately: retiring a shipped, tested actuator on every cell is an operator decision, not a side
 # effect of a merge. Until that decision is taken, this file is the INSTRUMENT plus its migration and
@@ -227,6 +235,9 @@ mend_record() {
 
 do_pass() {
   local dry="${1:-}" layer repo sup target applied now rc
+  # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED HERE, ON EVERY TICK, BEFORE ANYTHING ELSE — see
+  # `one_actor_check` for why install time cannot be the only reading.
+  one_actor_check "$([ "$dry" = dry ] && printf dry || printf apply)"
   layer="$(resolve_layer)" || loud 2 no-layer "no usable layer: ${HARNESS_PIN_FILE} names nothing readable and ${HARNESS_PIN_DIR} holds no tree git can answer from"
   sup="$(supervisor_in "$layer")" || loud 2 no-supervisor "resolved layer ${layer} carries no cloud-cell-supervisor.sh, so there is no verb to pin with"
   repo="$layer"
@@ -291,14 +302,23 @@ do_pass() {
     err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} names nothing readable, and no tree under ${HARNESS_PIN_DIR} is at ${target} to mend it to -- an exit code is not a convergence"
     exit 1
   fi
-  if [ "$now" = "$applied" ] && [ "$now" != "$target" ]; then
-    record_outcome "stale-record (${now} unmoved; ${HARNESS_REF} is ${target})"
-    err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} still names '${now}' while ${HARNESS_REF} is '${target}' -- an exit code is not a convergence"
-    exit 1
-  fi
+  # ⛔ ONE CONVERGENCE RULE, NOT TWO THAT OVERLAP. There were two guards here — "the record must have
+  # MOVED" and "the record must CONTAIN the tip" — and on every state where the first fires the second
+  # fires too (a record that was behind and did not move is still behind), so NEITHER was individually
+  # gated: a mutant disabling either one ALONE left the suite green (measured in review: `:294 → if
+  # false` and `:299 → if false` each survived at 66 ok / 0 failed). Containment IS the convergence
+  # rule, it fails on #3194's own shape (the unmoved record was 17 commits behind, so it does not
+  # contain the tip), and it does NOT produce the false RED the other one would have produced on a
+  # record that legitimately sits AHEAD of the ref. The diagnosis still says which shape it saw, because
+  # an operator acts differently on "apply did nothing" than on "apply pinned something off the line".
   if ! git -C "$repo" merge-base --is-ancestor "$target" "$now" 2>/dev/null; then
-    record_outcome "stale-record (${now} does not contain ${target})"
-    err "STALE-RECORD: the record names '${now}', which does not contain the ref tip '${target}' -- a pin that is not on the ref's line is not a pin"
+    if [ "$now" = "$applied" ]; then
+      record_outcome "stale-record (${now} unmoved; ${HARNESS_REF} is ${target})"
+      err "STALE-RECORD: apply exited 0 but ${HARNESS_PIN_FILE} still names '${now}', which does not contain ${HARNESS_REF} '${target}' -- the record did not move, and an exit code is not a convergence"
+    else
+      record_outcome "stale-record (record moved to ${now}, which does not contain ${target})"
+      err "STALE-RECORD: the record moved to '${now}', which does not contain the ref tip '${target}' -- a pin that is not on the ref's line is not a pin"
+    fi
     exit 1
   fi
   record_outcome "applied -> ${now}"
@@ -307,7 +327,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>"
+  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -315,6 +335,15 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
   if layer="$(resolve_layer)"; then
     printf '  resolved layer %s\n' "$layer"
     sup="$(supervisor_in "$layer" && true)"; printf '  supervisor     %s\n' "${sup:-<none>}"
+    # ⛔ AND THE ONE-ACTOR FACT IS ON THE OPERATOR'S LINE TOO. `do_pass` re-reads it every tick (bringup
+    # re-arms the shipped timer by design); the tick's own reading belongs where an operator looks FIRST,
+    # otherwise "is a second actor back?" is answerable only by reading a journal. Advisory by design —
+    # it does NOT change the 0/1/2 verdict, which is the drift vocabulary and nothing else.
+    if dup="$(actuator_scopes)"; then
+      printf '  second actuator %s manager(s) — eldato-harness-apply.timer is ENABLED beside this unit (a tick retires it again; an operator can end it with --install --takeover)\n' "$(printf '%s' "$dup" | tr '\n' ' ')"
+    else
+      printf '  second actuator <none>\n'
+    fi
     # ⛔ A STATUS THAT DOES NOT FETCH IS BLIND IN THE EXACT STATE THIS FILE EXISTS TO CATCH. #3194 was
     # a pin RECORD that disagreed with the layer the cell executed for ~a day: "current" against a
     # stale local `origin/main` is that same lie with a green verdict, so the ref is FETCHED here and
@@ -515,16 +544,32 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
 # `$HOME/.config/systemd/user` when passwordless sudo does not answer, and `install-cell-timers.sh`
 # does the same. On such a box `systemctl is-enabled eldato-harness-apply.timer` answers "no", the guard
 # stays silent, and `--install` puts TWO mutating actors on one pin — precisely the race the guard's own
-# comment says it exists to prevent. So ask BOTH, and NAME the scope that answered.
-actuator_scope() { # prints "system" | "user" when eldato-harness-apply.timer is ENABLED
-  systemctl is-enabled eldato-harness-apply.timer >/dev/null 2>&1 && { printf 'system\n'; return 0; }
-  systemctl --user is-enabled eldato-harness-apply.timer >/dev/null 2>&1 && { printf 'user\n'; return 0; }
-  return 1
-}
-actuator_enabled_in() { # <scope>
+# comment says it exists to prevent. So ask BOTH, and NAME EVERY scope that answered — the answer is a
+# LIST, not "the" scope (see `actuator_scopes`).
+actuator_enabled_in() { # <scope> — is the SHIPPED timer enabled in that manager?
   case "$1" in
     system) systemctl is-enabled eldato-harness-apply.timer >/dev/null 2>&1 ;;
     user)   systemctl --user is-enabled eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
+}
+actuator_scopes() { # EVERY scope in which eldato-harness-apply.timer is ENABLED, one per line, system first
+  local s n=0
+  for s in system user; do
+    if actuator_enabled_in "$s"; then printf '%s\n' "$s"; n=$((n + 1)); fi
+  done
+  [ "$n" -gt 0 ]
+}
+# ⛔ `actuator_scope` RETURNED ONLY THE FIRST ENABLED SCOPE, and that was a false PASS of its own: on a
+# box that carries the timer in BOTH managers (the system install plus the no-sudo user fallback — the two
+# shapes this file's own comment says it must handle) `--takeover` retired ONE of them, read THAT one
+# back, and printed "ONE actuator on this pin" while the other stayed enabled. Two mutating actors, exit
+# 0, and a claim of single ownership. There is no "the" scope: there is a LIST, and every member of it
+# has to be retired and read back.
+own_enabled_in() { # <scope> — is THIS unit installed in that manager?
+  case "$1" in
+    system) systemctl is-enabled cell-self-pin.timer >/dev/null 2>&1 ;;
+    user)   systemctl --user is-enabled cell-self-pin.timer >/dev/null 2>&1 ;;
     *)      return 1 ;;
   esac
 }
@@ -541,12 +586,62 @@ retire_actuator() {
   if actuator_enabled_in "$scope"; then
     bad "eldato-harness-apply.timer still reads ENABLED in the ${scope} manager after 'disable --now' — REFUSING: two mutating actors on one pin is a race, not redundancy"; return 1
   fi
-  say "  RETIRED eldato-harness-apply.timer (${scope} manager) — ONE actuator on this pin, as --takeover declares"
+  say "  RETIRED eldato-harness-apply.timer (${scope} manager)"
+  return 0
+}
+# restore_actuator <scope> — put the shipped actuator BACK, and say whether the read-back agrees. Used
+# ONLY to undo a retirement whose migration then failed, so the box never ends at zero pin actuators.
+restore_actuator() {
+  local scope="$1"
+  case "$scope" in
+    user)   systemctl --user enable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    system) systemctl enable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac || return 1
+  actuator_enabled_in "$scope"
+}
+
+# one_actor_check <dry|apply> — the ONE-ACTOR invariant, re-read on EVERY tick rather than only at
+# install time. ⛔ THE RE-ARM IS MEASURED, NOT HYPOTHETICAL: `cloud-cell-bringup.sh`'s
+# `check_harness_apply` runs `install-harness-apply-timer.sh --install` on EVERY bring-up (`die` on a
+# non-zero rc), and that installer's last act is `systemctl enable --now eldato-harness-apply.timer` —
+# deliberately, because "they are what re-arms a timer somebody disabled by hand". So a box that has been
+# through `--takeover` gets the second actor BACK at its next bring-up, and before this check nothing
+# read it: the invariant the file refuses to break at install time was re-broken minutes later, silently,
+# with the box's colour staying green.
+#   · this unit is NOT enabled in either manager ⇒ this run is not a second scheduled actor. Say so and
+#     touch NOTHING: a manual `bash cell-self-pin.sh` must never retire somebody's actuator.
+#   · this unit IS enabled and the shipped timer came back ⇒ RE-TAKE the pin: retire it again in every
+#     scope it reappeared in, read each one back, and say so.
+#   · a re-take that does not take is a RED (`DUPLICATE-ACTUATOR`, exit 1), never a warning — two
+#     mutating `apply --force --pin-only` actors on one pin IS the #2416 race this file exists to avoid.
+one_actor_check() {
+  local mode="$1" s dups ours="" who=""
+  dups="$(actuator_scopes)" || return 0
+  for s in system user; do own_enabled_in "$s" && ours="$ours $s"; done
+  for s in $dups; do who="$who ${s}"; done
+  if [ -z "$ours" ]; then
+    log "note: eldato-harness-apply.timer is ENABLED (${who# }) and cell-self-pin.timer is not enabled in either manager -- this run is not a second scheduled actor, so nothing is retired"
+    return 0
+  fi
+  if [ "$mode" = dry ]; then
+    log "dry-run: eldato-harness-apply.timer is ENABLED (${who# }) beside this unit (it was RE-ARMED after --takeover) -- a real pass would retire it again in those manager(s). NOTHING was touched"
+    return 0
+  fi
+  for s in $dups; do
+    if ! retire_actuator "$s"; then
+      record_outcome "duplicate-actuator (re-armed in the ${s} manager and could not be retired)"
+      err "DUPLICATE-ACTUATOR: eldato-harness-apply.timer is ENABLED in the ${s} manager beside this unit (bringup re-arms it) and could NOT be retired -- two mutating actors on one pin is the #2416 race, so this tick is a RED. Remedy: disable it by hand in that manager ('systemctl disable --now eldato-harness-apply.timer', plus '--user' for the user manager), then re-run '$0 --install --takeover'."
+      exit 1
+    fi
+  done
+  log "re-took the pin: eldato-harness-apply.timer was RE-ARMED (${who# }) after --takeover and has been retired again -- ONE actuator on this pin, re-verified rather than assumed"
+  record_outcome "re-took the pin (retired a re-armed eldato-harness-apply.timer in ${who# })"
   return 0
 }
 
 do_install() { # [--takeover]
-  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u scope script
+  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s
   case "$takeover" in
     ""|--takeover) ;;
     *) bad "unknown argument '${takeover}' to --install (only --takeover is accepted)"; return 64 ;;
@@ -570,38 +665,75 @@ do_install() { # [--takeover]
   [ -f "$script" ] || { bad "the unit names '${script}' and it does not exist after placement — the unit would fail 203/EXEC before any payload runs"; rm -rf "$tmp"; return 1; }
   # ⛔ ONE ACTUATOR PER PIN. `eldato-harness-apply.timer` already advances this box's harness on the same
   # 10-minute clock (#2416), and two mutating actors on one pin is a race, not redundancy. The guard asks
-  # BOTH managers, NAMES the scope it saw, and `--takeover` is the one-actor migration that retires it.
-  if scope="$(actuator_scope)"; then
-    case "$takeover" in
-      --takeover)
-        say "installing into $unit_dir (retiring the duplicate actuator in the ${scope} manager first)"
-        retire_actuator "$scope" || { rm -rf "$tmp"; return 1; }
-        ;;
-      *)
-        if [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
-          say "  WARNING: eldato-harness-apply.timer is ENABLED (${scope} manager) and CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR is set — two actuators on one pin, deliberately"
-        else
-          bad "eldato-harness-apply.timer is ENABLED in the ${scope} manager and already advances this harness on a ten-minute clock — two pin actuators race on one pin. Keep ONE: run '$0 --install --takeover' to RETIRE it and install this unit, or keep 'scripts/install-harness-apply-timer.sh --install' (the shipped, tested one) and do not install this one, or set CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 to override deliberately."
-          rm -rf "$tmp"; return 1
-        fi
-        ;;
-    esac
+  # BOTH managers, NAMES every scope it saw, and `--takeover` is the one-actor migration that retires it.
+  scopes="$(actuator_scopes)" || scopes=""
+  for s in $scopes; do who="$who ${s}"; done
+  if [ -n "$scopes" ] && [ "$takeover" != --takeover ] && [ -z "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
+    bad "eldato-harness-apply.timer is ENABLED in the ${who} manager(s) and already advances this harness on a ten-minute clock — two pin actuators race on one pin. Keep ONE: run '$0 --install --takeover' to RETIRE it and install this unit, or keep 'scripts/install-harness-apply-timer.sh --install' (the shipped, tested one) and do not install this one, or set CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 to override deliberately."
+    rm -rf "$tmp"; return 1
+  fi
+  if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
+    say "installing into $unit_dir (retiring the duplicate actuator in the ${who} manager(s) LAST, after the units are placed)"
+  elif [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ] && [ -n "$scopes" ]; then
+    say "  WARNING: eldato-harness-apply.timer is ENABLED (${who# }) and CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR is set — two actuators on one pin, deliberately"
   else
     [ "$takeover" = --takeover ] && say "  (--takeover given, and no eldato-harness-apply.timer is enabled — nothing to retire)"
+    [ "$takeover" = --takeover ] || say "installing into $unit_dir"
   fi
-  [ "$takeover" = --takeover ] || say "installing into $unit_dir"
-  mkdir -p "$unit_dir" 2>/dev/null || { bad "cannot create $unit_dir"; rm -rf "$tmp"; return 1; }
+  # ⛔ THE UNITS GO IN FIRST, THE RETIREMENT LAST, AND THAT ORDER IS THE FIX. `retire_actuator` used to run
+  # before `mkdir`, the writes, `daemon-reload` and `enable --now` — so ANY failure in that second half
+  # returned non-zero with the shipped timer already disabled AND stopped, and nothing re-enabled it:
+  # measured, `--takeover` against an unwritable unit dir left the box with ZERO pin actuators, i.e. the
+  # "nothing advances the layer" state #3194 is about, reached by following this change's own documented
+  # migration. A migration may not destroy the thing it is replacing before the replacement exists.
+  mkdir -p "$unit_dir" 2>/dev/null || { bad "cannot create $unit_dir — nothing was retired, so the box keeps the actuator it had"; rm -rf "$tmp"; return 1; }
   for u in cell-self-pin.service cell-self-pin.timer; do
     if [ -f "$unit_dir/$u" ] && cmp -s "$tmp/$u" "$unit_dir/$u"; then say "  $u unchanged"; continue; fi
-    install -m 0644 "$tmp/$u" "$unit_dir/$u" || { bad "cannot write $unit_dir/$u"; rc=1; continue; }
+    install -m 0644 "$tmp/$u" "$unit_dir/$u" || { bad "cannot write $unit_dir/$u — nothing was retired, so the box keeps the actuator it had"; rm -rf "$tmp"; return 1; }
     say "  $u written"
   done
-  [ "$rc" -eq 0 ] || { rm -rf "$tmp"; return 1; }
-  systemctl daemon-reload || rc=1
-  systemctl enable --now cell-self-pin.timer || rc=1
+  systemctl daemon-reload || { bad "'systemctl daemon-reload' failed — the units are on disk but not loaded, and nothing was retired, so the box keeps the actuator it had"; rm -rf "$tmp"; return 1; }
+  # ⛔ NOW, AND ONLY NOW, THE RETIREMENT — immediately before the replacement is enabled. Every scope, and
+  # a failure halfway through UNDOES the ones that did take.
+  if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
+    for s in $scopes; do
+      if ! retire_actuator "$s"; then
+        for u in $retired; do
+          restore_actuator "$u" && say "  ROLLED BACK: eldato-harness-apply.timer re-enabled in the ${u} manager (that retirement was not part of a completed migration)" \
+            || bad "ROLLBACK FAILED in the ${u} manager: eldato-harness-apply.timer is DISABLED there, this unit is NOT enabled, and that box now has NO pin actuator. Re-enable it by hand:'systemctl enable --now eldato-harness-apply.timer'."
+        done
+        rm -rf "$tmp"; return 1
+      fi
+      retired="$retired $s"
+    done
+  fi
+  if ! systemctl enable --now cell-self-pin.timer; then rc=1; fi
+  if [ "$rc" -ne 0 ]; then
+    # ⛔ A MIGRATION THAT CANNOT COMPLETE PUTS ITSELF BACK. Zero actuators is WORSE than two: two race on
+    # one target, none leaves the box unpinned with a green-looking nothing.
+    for s in $retired; do
+      restore_actuator "$s" && say "  ROLLED BACK: eldato-harness-apply.timer re-enabled in the ${s} manager, so this box keeps the ONE actuator it had before this attempt" \
+        || bad "ROLLBACK FAILED in the ${s} manager: eldato-harness-apply.timer is DISABLED there, cell-self-pin.timer is NOT enabled, and this box now has NO pin actuator. Re-enable it by hand: 'systemctl enable --now eldato-harness-apply.timer'."
+    done
+    rm -rf "$tmp"
+    bad "systemd did not enable cell-self-pin.timer — run: systemctl status cell-self-pin.service"
+    return 1
+  fi
   rm -rf "$tmp"
-  [ "$rc" -eq 0 ] || { bad "systemd did not accept the units — run: systemctl status cell-self-pin.service"; return 1; }
-  say "installed. Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
+  # ⛔ AND THE CLAIM IS READ BACK, NOT ASSERTED. Printing "ONE actuator" while a scope still carries the
+  # shipped timer is the same false PASS this function refuses to create. A DELIBERATE duplicate
+  # (CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR) is the one case where the invariant is not the claim.
+  if [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
+    say "installed (TWO actuators on this pin, as CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR declares). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
+    return 0
+  fi
+  if scopes="$(actuator_scopes)"; then
+    who=""
+    for s in $scopes; do who="$who ${s}"; done
+    bad "eldato-harness-apply.timer still reads ENABLED in the ${who} manager(s) after the migration — two mutating actors on one pin. Fix it with 'systemctl disable --now eldato-harness-apply.timer' in that manager."
+    return 1
+  fi
+  say "installed — ONE actuator on this pin (read back in both managers). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
   return 0
 }
 

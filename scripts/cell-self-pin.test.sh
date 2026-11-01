@@ -58,9 +58,15 @@ trap cleanup EXIT
 # the suite went red on exactly the box it exists to guard).
 runat() {
   local h="$1"; shift
+  # ⛔ AND PATHS: no leg may reach the HOST's real `systemctl`. `do_pass` now re-reads the one-actor
+  # invariant every tick, so a pass running with the real manager on a cell that carries both timers
+  # would RETIRE the cell's actuator from a test run — a suite that mutates the box it is guarding.
+  # `fakebin-none` answers "not enabled" to everything; the legs that exercise systemd state prepend
+  # their own fake, which wins (a later `env` assignment overrides an earlier one).
   env -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
       -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC \
+      PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
 # runat_keep_pinfile — the same, but the ambient `HARNESS_PIN_FILE` REACHES the child. `runat` scrubs it
@@ -72,9 +78,35 @@ runat_keep_pinfile() {
   env -u HARNESS -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
       -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC \
+      PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
 pinrun() { local h="$1"; shift; runat "$h" bash "$PIN" "$@"; }
+
+# mk_sup <path> [argv-log] — a supervisor fixture. WITHOUT a log it exits 0 and writes nothing (the
+# "apply said 0 and did nothing" shape); WITH one it RECORDS THE ARGV it was called with, because the
+# flag pair `--force --pin-only` is the one contract the header calls load-bearing and, until this was
+# added, NOTHING in this suite read it (measured in review: mutating the call to a bare `apply` left the
+# suite at 66 ok / 0 failed — a mutant that survives the whole suite is an ungated behaviour).
+mk_sup() {
+  local p="$1" log="${2:-}"
+  mkdir -p "$(dirname "$p")"
+  if [ -n "$log" ]; then
+    printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s"\nexit 0\n' "$log" >"$p"
+  else
+    printf '#!/bin/bash\nexit 0\n' >"$p"
+  fi
+  chmod +x "$p"
+}
+# mk_sup_pin <path> <record-file-contents> — a supervisor that MOVES the pin record, so a leg can pin the
+# containment rule (it must refuse a record that moved onto a tree off the ref's line) independently of
+# the unmoved-record rule.
+mk_sup_pin() {
+  local p="$1" rec="$2"
+  mkdir -p "$(dirname "$p")"
+  printf '#!/bin/bash\nprintf "%%s\\n" "%s" >"${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"\nexit 0\n' "$rec" >"$p"
+  chmod +x "$p"
+}
 
 # ── a hermetic cell: bare origin + a clone that IS the pin tree. NOTHING here is /tmp/cell-ai. ─────
 git init -q --bare "$T/origin.git" >/dev/null 2>&1 || { echo "FAIL git init"; exit 1; }
@@ -86,12 +118,18 @@ git -C "$T/seed" remote add origin "$T/origin.git"
 git -C "$T/seed" push -q origin main 2>/dev/null
 git clone -q "$T/origin.git" "$T/home/harness/pintree" 2>/dev/null   # the pin tree, under CELL_HOME
 mkdir -p "$T/home/harness/pintree/scripts"
-printf '#!/bin/bash\nexit 0\n' >"$T/home/harness/pintree/scripts/cloud-cell-supervisor.sh"
+# ⛔ THE PIN TREE'S SUPERVISOR RECORDS ITS ARGV — see `mk_sup`. Every apply leg goes through it.
+mk_sup "$T/home/harness/pintree/scripts/cloud-cell-supervisor.sh" "$T/argv.log"
+# ⛔ A MANAGER WITH NO UNITS, on PATH for every `runat`. See the note there: no leg may reach the host's
+# real systemd, because `do_pass` now re-reads (and can re-retire) the one-actor invariant every tick.
+mkdir -p "$T/fakebin-none"
+printf '#!/bin/bash\ncase "$*" in *is-enabled*) exit 1 ;; esac\nexit 0\n' >"$T/fakebin-none/systemctl"
+chmod +x "$T/fakebin-none/systemctl"
 mkdir -p "$T/home/orchestrator" "$T/empty"
 # The seed doubles as the target of the EXPLICIT-record leg below, so it carries a supervisor too — a
 # record may point at any resolved layer, and a layer with no supervisor is its own RED (asserted later).
 mkdir -p "$T/seed/scripts"
-printf '#!/bin/bash\nexit 0\n' >"$T/seed/scripts/cloud-cell-supervisor.sh"
+mk_sup "$T/seed/scripts/cloud-cell-supervisor.sh"
 
 # The record the CONTROLLER reads — `.harness-path` — names the pin tree. One fact, two readers.
 printf '%s\n' "$T/home/harness/pintree/scripts/orchestrator-harness" >"$T/home/.harness-path"
@@ -168,8 +206,8 @@ git clone -q "$T/origin.git" "$T/home/harness/other" 2>/dev/null
 # ⛔ THE SECOND CLONE CARRIES ITS OWN SUPERVISOR. Without one, this leg only passed where a supervisor
 # happened to sit beside THIS script (`supervisor_in`'s removed `$SELF_DIR` arm) — a supervisor from a
 # different tree than the resolved layer, which is precisely what the leg claims is impossible.
-mkdir -p "$T/home/harness/other/scripts" "$T/home/harness/other/scripts/orchestrator-harness"
-printf '#!/bin/bash\nexit 0\n' >"$T/home/harness/other/scripts/cloud-cell-supervisor.sh"
+mkdir -p "$T/home/harness/other/scripts/orchestrator-harness"
+mk_sup "$T/home/harness/other/scripts/cloud-cell-supervisor.sh"
 printf '%s\n' "$T/home/harness/other" >"$T/home/.harness-path"
 out="$(pinrun "$T/home" --dry-run 2>&1)"
 case "$out" in
@@ -271,12 +309,41 @@ refuses 'a SPACED ConditionPathExists=' "$(doctor cond-spaced 'ConditionPathExis
 refuses 'an INDENTED second ExecStart=' "$(doctor exec2-indented " ExecStart=/bin/bash $T/nowhere/cell-self-pin.sh")" "$T/u9" 'ExecStart= lines'
 refuses 'a SPACED second ExecStart=' "$(doctor exec2-spaced "ExecStart = /bin/bash $T/nowhere/cell-self-pin.sh")" "$T/u10" 'ExecStart= lines'
 
-# ── 4b. ONE ACTUATOR PER PIN — the guard asks BOTH systemd managers ─────────────────────────────────
+# ── 4b. ONE ACTUATOR PER PIN — the guard asks BOTH systemd managers, and retires BOTH ────────────
 # ⛔ BARE `systemctl` IS THE SYSTEM MANAGER ONLY, and the shipped sibling installer this guard names as
 # the one to keep NEGOTIATES the scope: `install-harness-apply-timer.sh` falls back to `systemctl --user`
 # / `$HOME/.config/systemd/user` when passwordless sudo does not answer. On such a box the system probe
 # answered "not enabled", the guard stayed silent, and `--install` put TWO mutating actors on one pin.
-out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-dup" PATH="$T/fakebin:$PATH" \
+# ⛔ ONE FAKE MANAGER, PER-SCOPE AND PER-UNIT STATE. The old fixture faked ONE scope at a time and
+# every `refuses …` leg below fails inside `verify_unit`, which runs BEFORE any retirement — so no leg
+# could pin what `--takeover` does once it starts retiring. This fake keys its state by
+# `<scope>-<unit>`, so both managers can carry the shipped timer, ours can be enabled or not, and a
+# retirement can be made to lie (a `disable` that exits 0 and changes nothing) or to be refused.
+mk_scoped_systemctl() { # <dir> <state-dir>
+  local d="$1" s="$2"
+  mkdir -p "$d" "$s"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    "S='$s'" \
+    'scope=system' \
+    'if [ "${1:-}" = "--user" ]; then scope=user; shift; fi' \
+    'verb="${1:-}"; shift 2>/dev/null || true' \
+    '[ "${1:-}" = "--now" ] && shift' \
+    'unit="${1:-}"' \
+    'st="$S/$scope-$unit"' \
+    'case "$verb" in' \
+    '  is-enabled) [ -f "$st" ] && exit 0 || exit 1 ;;' \
+    '  disable) [ -f "$S/$scope-stubborn" ] && exit 0; rm -f "$st"; exit 0 ;;' \
+    '  enable) if [ "$unit" = cell-self-pin.timer ] && [ -f "$S/fail-enable-self" ]; then exit 1; fi; : >"$st"; exit 0 ;;' \
+    'esac' \
+    'exit 0' >"$d/systemctl"
+  chmod +x "$d/systemctl"
+  return 0
+}
+SHIPPED=eldato-harness-apply.timer
+# ── (a) a SYSTEM-manager-only box refuses, and names that scope ────────────────────────────────
+mk_scoped_systemctl "$T/fake-1sys" "$T/state-1sys"; : >"$T/state-1sys/system-$SHIPPED"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-sys" PATH="$T/fake-1sys:$PATH" \
        bash "$PIN" --install 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && ok "an enabled eldato-harness-apply.timer (SYSTEM manager) refuses the install" \
   || bad "installed beside an enabled eldato-harness-apply.timer in the system manager (rc=$rc): $out"
@@ -284,26 +351,9 @@ case "$out" in
   *'system manager'*) ok "…and NAMES the system manager it saw" ;;
   *) bad "…but does not name the scope it saw: $out" ;;
 esac
-# The user-manager-only box: `systemctl is-enabled …` says no, `systemctl --user is-enabled …` says yes.
-mk_fake_user_systemctl() { # <dir> <state-dir> [stubborn]
-  local d="$1" s="$2" stubborn="${3:-}"
-  mkdir -p "$d" "$s"
-  printf '%s\n' \
-    '#!/bin/bash' \
-    "S='$s'" \
-    'case "$*" in' \
-    '  "--user is-enabled eldato-harness-apply.timer") [ -f "$S/enabled" ] && exit 0 || exit 1 ;;' \
-    '  "--user disable --now eldato-harness-apply.timer") [ -f "$S/stubborn" ] && exit 0; rm -f "$S/enabled"; exit 0 ;;' \
-    '  "is-enabled eldato-harness-apply.timer") exit 1 ;;' \
-    'esac' \
-    'exit 0' >"$d/systemctl"
-  chmod +x "$d/systemctl"
-  : >"$s/enabled"
-  [ -n "$stubborn" ] && : >"$s/stubborn"
-  return 0
-}
-mk_fake_user_systemctl "$T/fakebin-user" "$T/fake-state"
-out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-user" PATH="$T/fakebin-user:$PATH" \
+# ── (b) the documented no-sudo fallback: only the USER manager carries it ─────────────────────────
+mk_scoped_systemctl "$T/fake-1user" "$T/state-1user"; : >"$T/state-1user/user-$SHIPPED"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-usr" PATH="$T/fake-1user:$PATH" \
        bash "$PIN" --install 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && ok "…and refuses when only the USER manager carries it (the documented no-sudo fallback)" \
   || bad "installed beside a USER-manager eldato-harness-apply.timer (rc=$rc): $out"
@@ -311,34 +361,130 @@ case "$out" in
   *'user manager'*) ok "…naming the user manager, so the operator knows which one to retire" ;;
   *) bad "…but does not name the user manager: $out" ;;
 esac
-# ⛔ `--takeover` IS THE ONE-ACTOR MIGRATION: it RETIRES the shipped timer rather than racing it. This is
-# the decision the review said the change did not make — it is now explicit, and it is the operator's.
-out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-user" PATH="$T/fakebin-user:$PATH" \
+# ── (c) BOTH managers carry it: `--takeover` must retire BOTH, not the first one it finds ────────
+# ⛔ MEASURED FALSE PASS, NOT A HYPOTHETICAL: `actuator_scope` returned ONLY the first enabled scope, so
+# on a box with the system install AND the no-sudo user fallback `--takeover` retired the system one,
+# read THAT one back, printed "ONE actuator on this pin" and exited 0 — while the user-scope timer was
+# never touched, never re-read, and kept running. Two mutating `apply --force --pin-only` actors, a
+# success exit, and a claim of single ownership.
+mk_scoped_systemctl "$T/fake-both" "$T/state-both"
+: >"$T/state-both/system-$SHIPPED"; : >"$T/state-both/user-$SHIPPED"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-both" PATH="$T/fake-both:$PATH" \
        bash "$PIN" --install --takeover 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ]; then bad "--install --takeover failed (rc=$rc), so there is no one-actor path: $out"
+if [ "$rc" -ne 0 ]; then bad "--install --takeover refused on a box where BOTH managers carry the shipped timer (rc=$rc): $out"
 else
-  ok "--install --takeover installs (the ONE actuator)"
+  ok "--install --takeover installs on a box carrying the shipped timer in BOTH managers"
   case "$out" in
-    *'RETIRED eldato-harness-apply.timer'*) ok "…and it RETIRED the shipped actuator, saying so" ;;
-    *) bad "…but it did not report the retirement: $out" ;;
+    *'RETIRED eldato-harness-apply.timer (system manager)'*'RETIRED eldato-harness-apply.timer (user manager)'*|*'RETIRED eldato-harness-apply.timer (user manager)'*'RETIRED eldato-harness-apply.timer (system manager)'*)
+      ok "…retiring it in BOTH managers, each read back" ;;
+    *) bad "…but it did not report retiring every scope it found: $out" ;;
   esac
-  [ -f "$T/fake-state/enabled" ] && bad "--takeover left eldato-harness-apply.timer ENABLED — two actors on one pin" \
-    || ok "…and the timer really is disabled (read back, not assumed)"
+  if [ -f "$T/state-both/system-$SHIPPED" ] || [ -f "$T/state-both/user-$SHIPPED" ]; then
+    bad "--takeover left eldato-harness-apply.timer ENABLED in $( [ -f "$T/state-both/system-$SHIPPED" ] && printf 'the system ' ; [ -f "$T/state-both/user-$SHIPPED" ] && printf 'the user ' )manager — two actors on one pin"
+  else ok "…and the timer really is disabled in BOTH managers (read back, not assumed)" ; fi
+  [ -f "$T/state-both/system-cell-self-pin.timer" ] && ok "…and this unit is enabled, so the pin has an actuator" \
+    || bad "--takeover retired the shipped actuator and did NOT enable this one — zero actors"
 fi
-# ⛔ AND A RETIREMENT THAT DOES NOT TAKE IS A REFUSAL. A `disable` that returns 0 while the unit stays
-# enabled leaves exactly the two-actor state the guard exists to prevent, so the gate reads it back.
-mk_fake_user_systemctl "$T/fakebin-stub" "$T/fake-state2" stubborn
-out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-stub" PATH="$T/fakebin-stub:$PATH" \
+# ── (d) a retirement that does not TAKE is a refusal, and the ones that DID take are put back ────
+# A `disable` that returns 0 while the unit stays enabled leaves exactly the two-actor state the guard
+# exists to prevent, so the gate reads it back. And because the system scope is retired FIRST, a lying
+# user scope must not leave the box with the system actuator gone and nothing else in place.
+mk_scoped_systemctl "$T/fake-stub" "$T/state-stub"
+: >"$T/state-stub/system-$SHIPPED"; : >"$T/state-stub/user-$SHIPPED"; : >"$T/state-stub/user-stubborn"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-stub" PATH="$T/fake-stub:$PATH" \
        bash "$PIN" --install --takeover 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && ok "a retirement that does not TAKE is a refusal (not two actors)" || bad "installed after a failed retirement (rc=$rc): $out"
 case "$out" in
   *'still reads ENABLED'*) ok "…and the refusal names the read-back that failed" ;;
   *) bad "…but the refusal does not name the failed read-back: $out" ;;
 esac
+[ -f "$T/state-stub/system-$SHIPPED" ] \
+  && ok "…and the retirement that DID take was ROLLED BACK (the box keeps an actuator, not zero)" \
+  || bad "a failed migration left the system-scope actuator DISABLED and this unit not enabled — zero pin actuators"
+# ── (e) an install that fails AFTER the retirement rolls it back ──────────────────────────────────
+# ⛔ THE FIRST VERSION RETIRED FIRST AND INSTALLED SECOND, with no rollback: any failure in mkdir, the
+# writes, `daemon-reload` or `enable` returned non-zero with the shipped timer already disabled AND
+# stopped, and nothing re-enabled it — measured, `--takeover` against an unwritable unit dir left ZERO
+# pin actuators, i.e. the "nothing advances the layer" state #3194 is about, reached by following this
+# change's own documented migration.
+mk_scoped_systemctl "$T/fake-enfail" "$T/state-enfail"
+: >"$T/state-enfail/system-$SHIPPED"; : >"$T/state-enfail/fail-enable-self"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-enfail" PATH="$T/fake-enfail:$PATH" \
+       bash "$PIN" --install --takeover 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "an install that fails after the retirement returns non-zero" || bad "a failed enable reported success (rc=$rc): $out"
+case "$out" in
+  *'ROLLED BACK'*) ok "…and it ROLLS BACK, saying so, instead of leaving the box unpinned" ;;
+  *) bad "…but nothing rolled the retired actuator back: $out" ;;
+esac
+[ -f "$T/state-enfail/system-$SHIPPED" ] \
+  && ok "…the shipped timer is enabled again (one actuator preserved through a failed migration)" \
+  || bad "a failed migration left ZERO pin actuators where the box started with one"
+
+# ── 4c. THE ONE-ACTOR INVARIANT IS RE-READ ON EVERY TICK, NOT ONLY AT INSTALL TIME ────────────────
+# ⛔ THE RE-ARM IS BY DESIGN, IN THE SHIPPED CODE: `cloud-cell-bringup.sh`'s `check_harness_apply` runs
+# `install-harness-apply-timer.sh --install` on EVERY bring-up (`die` on a non-zero rc), and that
+# installer ends in `systemctl enable --now eldato-harness-apply.timer` precisely because it is what
+# re-arms a timer somebody disabled by hand. So a box that went through `--takeover` gets the SECOND
+# actor back at its next bring-up. Nothing read that: the invariant the installer refuses to break was
+# re-broken minutes later, silently, with the box's colour staying green. A hermetic, CURRENT home: the
+# pass's only job in these legs is the re-check, and "current" keeps the pin out of the assertions.
+TICK="$T/tick"
+mkdir -p "$TICK/harness" "$TICK/orchestrator"
+git clone -q "$T/origin.git" "$TICK/harness/tree" 2>/dev/null
+mkdir -p "$TICK/harness/tree/scripts"
+mk_sup "$TICK/harness/tree/scripts/cloud-cell-supervisor.sh"
+printf '%s\n' "$TICK/harness/tree" >"$TICK/.harness-path"
+mk_scoped_systemctl "$T/fake-rearm" "$T/state-rearm"
+: >"$T/state-rearm/system-cell-self-pin.timer"      # this unit IS the installed actuator
+: >"$T/state-rearm/system-$SHIPPED"                 # …and bringup has just re-armed the shipped one
+out="$(runat "$TICK" PATH="$T/fake-rearm:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "a pass on a current box still EXITS 0 when it finds a re-armed second actuator (it heals, it does not RED)" \
+  || bad "the pass failed (rc=$rc) on a box whose current state was fine and whose duplicate it could retire: $out"
+[ -f "$T/state-rearm/system-$SHIPPED" ] \
+  && bad "a RE-ARMED eldato-harness-apply.timer survived the tick — two mutating actors on one pin, unobserved" \
+  || ok "…and the re-armed eldato-harness-apply.timer is retired again (the invariant is durable, not an install-time ritual)"
+case "$out" in
+  *'RE-ARMED'*) ok "…and the pass SAYS the second actor came back, rather than healing in silence" ;;
+  *) bad "…but nothing in the output says the actuator had been re-armed: $out" ;;
+esac
+# ⛔ AND THE OPERATOR'S READ SHOWS IT TOO. `--status` is the verb an operator runs first; “is a second
+# actor back?” must be answerable there, not only in journald. Advisory: the 0/1/2 verdict stays the
+# drift vocabulary.
+: >"$T/state-rearm/system-$SHIPPED"
+out="$(runat "$TICK" PATH="$T/fake-rearm:$PATH" bash "$PIN" --status-nofetch 2>&1)"
+case "$out" in
+  *'second actuator system '*|*'second actuator user '*|*'second actuator system user '*) ok "--status also reports the re-armed second actuator (the operator's read, not just journald)" ;;
+  *) bad "--status does not report the re-armed second actuator: $out" ;;
+esac
+# And a re-arm that cannot be retired is a RED, never a warning: on a current box the pin needs no work,
+# so the duplicate is the ONLY thing that can make the tick fail — the leg cannot pass on another guard.
+mk_scoped_systemctl "$T/fake-rearm-stub" "$T/state-rearm-stub"
+: >"$T/state-rearm-stub/system-cell-self-pin.timer"
+: >"$T/state-rearm-stub/system-$SHIPPED"; : >"$T/state-rearm-stub/system-stubborn"
+out="$(runat "$TICK" PATH="$T/fake-rearm-stub:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "a re-armed actuator that cannot be retired is a RED, not a silent second actor" \
+  || bad "a tick that could NOT retire the re-armed actuator still exited 0 (rc=$rc): $out"
+case "$out" in
+  *'DUPLICATE-ACTUATOR'*) ok "…and it names the state (DUPLICATE-ACTUATOR) and the manager it saw" ;;
+  *) bad "…but the failure is not named: $out" ;;
+esac
+# ⛔ AND A MANUAL RUN MUST NOT RETIRE SOMEONE ELSE'S ACTUATOR. If this unit is not installed in either
+# manager, the pass is not a second scheduled actor: it reports and touches nothing.
+mk_scoped_systemctl "$T/fake-manual" "$T/state-manual"
+: >"$T/state-manual/system-$SHIPPED"
+out="$(runat "$TICK" PATH="$T/fake-manual:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "a MANUAL run beside the shipped actuator exits 0 (it is not a second scheduled actor)" \
+  || bad "a manual run failed (rc=$rc) instead of reporting that it is not a scheduled actor: $out"
+[ -f "$T/state-manual/system-$SHIPPED" ] \
+  && ok "…and it did NOT retire an actuator it does not replace (a rehearsal never disables the shipped timer)" \
+  || bad "a manual run RETIRED the shipped actuator — a test or a rehearsal must never disable the box's pin"
 
 # ── 5. the shipped template installs, and the written unit carries no bootstrap path ──────────────
+# ⛔ THE EXIT CODE IS ASSERTED, not merely "the files exist": a leg that only looks for the artifacts
+# passes when `--install` returns 1 AFTER writing them, which is exactly the shape a half-migration has.
 runat "$T/home" TEMPLATES_DIR="$TPL" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 SYSTEMD_UNIT_DIR="$T/units2" \
-  PATH="$T/fakebin:$PATH" bash "$PIN" --install >"$T/install.log" 2>&1
+  PATH="$T/fakebin:$PATH" bash "$PIN" --install >"$T/install.log" 2>&1; install_rc=$?
+[ "$install_rc" -eq 0 ] && ok "the shipped template installs (rc=0)" || bad "the shipped template install exited ${install_rc}: $(cat "$T/install.log")"
 if [ -f "$T/units2/cell-self-pin.service" ]; then
   ok "the shipped template renders and installs"
   body="$(grep -vE '^[[:space:]]*#' "$T/units2/cell-self-pin.service")"
@@ -399,19 +545,71 @@ if git -C "$T/seed" push -q origin main 2>/dev/null; then
   [ "$rc" -eq 1 ] && ok "…and DRIFT exits 1 (the repo's own 0 match / 1 drift / 2 unknown)" || bad "DRIFT exited $rc, expected 1"
 else bad "could not push a second commit — legs 6-8 not exercised"; fi
 
-# ── 7. a FALSE PASS is impossible: apply exiting 0 without moving the record is RED ───────────────
-# The fixture's supervisor exits 0 and writes nothing — the measured shape (`applied -> <no stamp
-# written>`, exit 0, repeating every tick). The record must be the verdict, not the exit code.
+# ── 7. a FALSE PASS is impossible: `apply` exiting 0 is not a convergence ─────────────────────────
+# ⛔ THE TWO RULES THAT USED TO LIVE HERE OVERLAPPED, SO NEITHER WAS GATED. There was "the record must
+# have MOVED" and "the record must CONTAIN the tip"; on every state where the first fired the second
+# fired too, so a mutant disabling EITHER ONE ALONE survived the whole suite (measured in review:
+# `:294 → if false` and `:299 → if false` each at 66 ok / 0 failed, both at 65 ok / 1 failed).
+# Containment IS the convergence rule — it fails on #3194's own shape (an unmoved record that was 17
+# commits behind does not contain the tip) — and the legs below pin it in BOTH directions: an unmoved
+# record that does NOT contain the tip is RED, a record that MOVED off the ref's line is RED, and a
+# record that legitimately sits AHEAD (it contains the tip) is GREEN rather than the false RED the
+# deleted equality rule would have produced.
 if [ -n "$(git -C "$T/home/harness/pintree" rev-parse HEAD 2>/dev/null)" ]; then
+  : >"$T/argv.log"
   out="$(pinrun "$T/home" 2>&1)"; rc=$?
   [ "$rc" -ne 0 ] && ok "apply exits 0 but the record did not move => non-zero (an exit code is not a convergence)" \
     || bad "the pass reported success with the record unmoved — that is #3194's own shape: $out"
   case "$out" in
-    *STALE-RECORD*) ok "…and it names the reading (STALE-RECORD: the record did not reach the ref tip)" ;;
-    *DRIFT*) ok "…and it reports the drift it acted on" ;;
+    *STALE-RECORD*'did not move'*) ok "…and it names the reading AND the shape (STALE-RECORD: the record did not move, so it does not contain the ref tip)" ;;
     *) bad "the pass did not diagnose the unmoved record: $out" ;;
   esac
+  # ⛔ AND THE SUPERVISOR'S ARGV IS THE CONTRACT. `apply --force --pin-only` is the ONE invocation the
+  # header calls load-bearing — `--pin-only` because a bare `apply` dies on a live controller, `--force`
+  # WITHOUT it because that re-seeds the state dir the controller is executing from (the #2215 skew).
+  # NOTHING read the argv, so mutating the call to a bare `apply` left the suite green (measured). The
+  # fixture records what it was called with; this asserts the exact string, both flags, nothing else.
+  ARGV="$(tail -1 "$T/argv.log" 2>/dev/null)"
+  [ "$ARGV" = "apply --force --pin-only" ] \
+    && ok "the pass invokes 'apply --force --pin-only' — BOTH flags, in that order (#2215)" \
+    || bad "the pass invoked the supervisor as '${ARGV:-<never called>}', not 'apply --force --pin-only' (a bare '--force' re-seeds a live controller's state dir; a bare 'apply' dies on it)"
 fi
+# ⛔ A RECORD THAT *MOVED* ONTO A TREE OFF THE REF'S LINE IS STILL RED, and only the containment rule can
+# say so: the old unmoved-equality rule cannot see it (the value changed). Fixture: one clone at the ref
+# tip's PARENT (the record), an orphan-side commit on the same object database (where the supervisor will
+# repoint the record), so `now != applied` and `now` still does not contain the ref tip — and every rev
+# resolves in the repo the check runs in, so the verdict is "not an ancestor", not "unknown object".
+OFFREPO="$T/home-off/harness/repo"
+mkdir -p "$T/home-off/harness" "$T/home-off/orchestrator"
+git clone -q "$T/origin.git" "$OFFREPO" 2>/dev/null
+git -C "$OFFREPO" checkout -q --orphan side >/dev/null 2>&1
+git -C "$OFFREPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "a line of history origin never had"
+SIDE="$(git -C "$OFFREPO" rev-parse HEAD 2>/dev/null)"
+FIRST="$(git -C "$OFFREPO" rev-list --max-parents=0 main 2>/dev/null | tail -1)"
+git -C "$OFFREPO" worktree add -f -q "$T/offapplied" "$FIRST" >/dev/null 2>&1
+git -C "$OFFREPO" worktree add -f -q "$T/offmoved" "$SIDE" >/dev/null 2>&1
+mk_sup_pin "$T/offapplied/scripts/cloud-cell-supervisor.sh" "$T/offmoved"
+printf '%s\n' "$T/offapplied" >"$T/home-off/.harness-path"
+out="$(pinrun "$T/home-off" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "a record that MOVED onto a tree off the ref's line is still RED" \
+  || bad "the pass reported success for a record that moved to a tree which does not contain the ref tip (rc=$rc): $out"
+case "$out" in
+  *'does not contain the ref tip'*) ok "…and the diagnosis names CONTAINMENT (moved, but off the ref's line)" ;;
+  *'did not move'*) bad "…but it reported the WRONG shape (unmoved) for a record that moved: $out" ;;
+  *) bad "the pass did not diagnose the off-line record: $out" ;;
+esac
+# ⛔ AND A RECORD ALREADY AHEAD OF THE TIP IS GREEN. The deleted rule compared the record to the ref for
+# EQUALITY, so a box whose record sat on a commit containing the tip — apply legitimately no-opes — RED'd
+# every tick: a periodic false RED on `systemctl --failed`, which is how operators learn to ignore the
+# colour this whole change depends on. Containment, not equality.
+mkdir -p "$T/home-ahead/harness" "$T/home-ahead/orchestrator"
+git clone -q "$T/origin.git" "$T/home-ahead/harness/tree" 2>/dev/null
+git -C "$T/home-ahead/harness/tree" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "a commit ON TOP of the tip"
+mk_sup "$T/home-ahead/harness/tree/scripts/cloud-cell-supervisor.sh"
+printf '%s\n' "$T/home-ahead/harness/tree" >"$T/home-ahead/.harness-path"
+out="$(pinrun "$T/home-ahead" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "a record that ALREADY CONTAINS the ref tip is green — containment, not equality (no false RED)" \
+  || bad "a record ahead of the ref tip was reported as ${rc} — that is the periodic false RED this rule exists to avoid: $out"
 
 # ── 8. a LOST record is MENDED (exit 11), not a permanent unhealable RED ─────────────────────────
 # ⛔ `harness_apply` writes $HARNESS_PIN_FILE only in its CHANGED branch, so a pin already at the tip
