@@ -1129,6 +1129,15 @@ MUT
   A8B="$(boxidnet)"; RC=$?
   ck "(8b) a device whose name only CONTAINS the egress name is not a VLAN child ($A8B, not 192.0.2.79)" \
      "$([ "$RC" -eq 0 ] && [ "$A8B" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (8c) …and the '.' in that anchor is LOAD-BEARING (review round 12): a device named `eth01` STARTS WITH
+  # the egress name, so dropping the dot from the anchor let it pass at a lower ifindex and published its
+  # address — a false attribution — with the suite green. (8b) cannot see this: `fooeth0.9` fails both forms.
+  ipfix eth0 \
+    '3: eth01 inet 192.0.2.79/24 brd 192.0.2.255 scope global eth01' \
+    '5: eth0.1911 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  A8C="$(boxidnet)"; RC=$?
+  ck "(8c) a device that merely STARTS WITH the egress name (\`eth01\`) is not its VLAN child ($A8C, not 192.0.2.79) — the dot is load-bearing" \
+     "$([ "$RC" -eq 0 ] && [ "$A8C" = 10.238.144.2 ] && echo 0 || echo 1)"
   # (9) AND CLAUSE 2 IS LOAD-BEARING (same finding). The EGRESS device itself is a tunnel (`wg0`): its
   # address satisfies the anchor and is routable-looking, so only the name clause refuses it.
   ipfix wg0 '3: wg0 inet 10.8.0.2/24 peer 10.8.0.1/32 scope global wg0'
