@@ -1138,6 +1138,15 @@ MUT
   A8C="$(boxidnet)"; RC=$?
   ck "(8c) a device that merely STARTS WITH the egress name (\`eth01\`) is not its VLAN child ($A8C, not 192.0.2.79) — the dot is load-bearing" \
      "$([ "$RC" -eq 0 ] && [ "$A8C" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (20) A BOX WHOSE DEFAULT ROUTE NAMES NO DEVICE IS REFUSED (review round 13). The `[ -n "$dev" ]` guard
+  # is NOT a no-op: with an empty `dev`, clause 1 degenerates to `index($2, ".") != 1`, which a device named
+  # `.foo` PASSES (the kernel accepts such a name) — so without the guard that box publishes a non-egress
+  # address. Measured shape: device `.foo` at a low ifindex, default route present but device-less.
+  ipfix eth0 '3: .foo inet 10.77.0.9/24 brd 10.77.0.255 scope global .foo'
+  ipfixr 'blackhole default'
+  A20="$(boxidnet)"; RC=$?
+  ck "(20) a box whose default route names NO device REFUSES (rc=$RC, boxid=[$A20]) — the empty-egress guard is load-bearing, not a no-op" \
+     "$([ "$RC" -eq 1 ] && [ -z "$A20" ] && echo 0 || echo 1)"
   # (9) AND CLAUSE 2 IS LOAD-BEARING (same finding). The EGRESS device itself is a tunnel (`wg0`): its
   # address satisfies the anchor and is routable-looking, so only the name clause refuses it.
   ipfix wg0 '3: wg0 inet 10.8.0.2/24 peer 10.8.0.1/32 scope global wg0'
@@ -1246,6 +1255,12 @@ A12B="$(boxidnet_darwin 169.254.7.7)"; RC2=$?
 A12C="$(boxidnet_darwin 127.0.0.1)"; RC3=$?
 ck "(12) the Darwin arm (no \`ip\` on PATH — runs on macOS too) answers its interface address ($A12), REFUSES a link-local one (rc=$RC2, boxid=[$A12B]) and REFUSES a loopback one (rc=$RC3, boxid=[$A12C])" \
    "$([ "$RC" -eq 0 ] && [ "$A12" = 10.238.144.2 ] && [ "$RC2" -eq 1 ] && [ -z "$A12B" ] && [ "$RC3" -eq 1 ] && [ -z "$A12C" ] && echo 0 || echo 1)"
+# (21) A MALFORMED `ifconfig` SHAPE IS REFUSED, not adopted (review round 13): net-tools/BusyBox print
+# `inet addr:10.1.2.3`, so `awk '{print $2}'` yields `addr:10.1.2.3` — a NON-ADDRESS string. The tail
+# guard's `*[!0-9.]*` arm is the only thing refusing it, so it is graded here.
+A21="$(boxidnet_darwin 'addr:10.1.2.3')"; RC=$?
+ck "(21) a NON-ADDRESS interface token (addr:10.1.2.3) REFUSES rather than becoming the boxid (rc=$RC, boxid=[$A21])" \
+   "$([ "$RC" -eq 1 ] && [ -z "$A21" ] && echo 0 || echo 1)"
 # (6) THE REFUSAL IS READABLE. `cap_publish` is fail-closed by design and prints `why=<reason>`; the
 # controller discarded it, which is why this took a whole lane to find. Text guard: the reason must
 # reach the log line (a discarded refusal is the defect class, not a cosmetic detail).
@@ -1288,6 +1303,16 @@ RC=0; CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log5" cap_publish_logge
 L19="$(cat "$LOGL" 2>/dev/null)"
 ck "(19) a PUSH failure is reported as why=push-refused — the ref on the line does NOT become the reason (rc=$RC)" \
    "$([ "$RC" -eq 1 ] && qF '— why=push-refused boxid=' "$L19" && ! qF '— why=push-refused ref=' "$L19" && echo 0 || echo 1)"
+# (22) AN UNPARSEABLE refusal still names a reason (review round 13): `cap_publish` failing WITHOUT
+# printing a `publish=refused|failed` line must log `why=unknown`, never an empty token — the whole point
+# of this PR is that a refusal must never be silent-or-blank.
+: > "$LOGL"
+L22="$( CAP_HOST="" CAP_BOXID="" CAP_STATE_DIR="$TMP/state-log6" bash -c '
+  . "$1"
+  cap_publish() { return 1; }
+  cap_publish_logged "$2" "$3" "$4" refs/boxes; echo "rc=$?"' _ "$CAP" "$W16" "$VALID boxid=10.238.144.2" "$LOGL" 2>&1 )"
+ck "(22) a refusal that prints NO parsable line still logs why=unknown ($(grep -o 'why=[^ ]*' "$LOGL" | head -1)) — never a blank reason" \
+   "$( { printf '%s' "$L22" | grep -q 'rc=1' && grep -q 'why=unknown' "$LOGL" && ! grep -q 'why= ' "$LOGL"; } && echo 0 || echo 1)"
 # (7) THE MAC CANNOT BE AFFECTED. A Darwin box resolves its identity from `kern.uuid` FIRST
 # (`cap_boxid_auto` source 1), so it never reaches the Linux arm this fix changes. That precedence is
 # the property, not a comment: asserted here so a future edit that reorders the sources — or that makes
