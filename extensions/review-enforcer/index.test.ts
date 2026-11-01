@@ -5103,6 +5103,32 @@ test("#3161: a git WRITE VERB is gate-relevant in every spelling — and a git R
   ]) {
     ok(!isGitOp(c), `a git READ ships nothing and must not be gated: ${JSON.stringify(c)}`);
   }
+  // ⛔ WORKING-TREE / INDEX VERBS ARE NOT SHIPPING OPS EITHER, AND THIS ARM WAS MEASURED REFUSING
+  // THEM (agent-infra#3161 review round 4, P1). The arm's first form listed 20 verbs, so at ZERO
+  // dispatches it refused `git add CHANGELOG.md` — the exact sequence `heredocLineExecutes`'s own
+  // note says must stay allowed — plus `git checkout -b`, `git switch -c`, `git clone`, `git init`,
+  // `git pull`, `git update-index`. `origin/main` allows every one. The floor's stated scope is
+  // "writes that LAND code"; a local verb lands nothing, and the `commit`/`push` that would ship its
+  // effect is gated by the write rows below. Pinned as a set because a future widening re-creates
+  // the over-block one verb at a time, and each one alone reads as harmless strictness.
+  for (const c of [
+    "git add CHANGELOG.md",
+    "git add -A",
+    "git -C /wt add -A",
+    "git checkout -b feat/x",
+    "git switch -c feat/x",
+    "git clone https://github.com/o/r /tmp/r2",
+    "git init -q",
+    "git pull --ff-only",
+    "git merge side",
+    "git rebase main",
+    "git reset --hard side",
+    "git restore f.txt",
+    "git clean -fd",
+    "git update-index --refresh",
+  ]) {
+    ok(!isGitOp(c), `a WORKING-TREE verb ships nothing and must not be gated: ${JSON.stringify(c)}`);
+  }
   for (const c of [
     "git commit -m x",
     "git push",

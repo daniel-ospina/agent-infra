@@ -4289,9 +4289,19 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # GATE_REFUSALS: that tuple is the 75/77 LOAD/DISK class written by run_agent into a
         # backgrounded worker's `.rc`, whereas 80 comes back on the FOREGROUND call and no worker
         # ever exists to have an `.rc`. A dispatcher 75 that the DURABLE EVIDENCE above does not
-        # certify as a gate refusal is the third class below -- the assertion PROVED no lane is
-        # running (`NOT STARTED:`), which is a real chain defect and is reported loudly, not waited
-        # out; it is still `record=False` because it consumed nothing.
+        # certify as a gate refusal is the third class below -- a real chain defect, reported loudly,
+        # not waited out.
+        # ⛔ AND IT IS THREE ARMS, NOT ONE, SO DO NOT READ THIS AS "NOTHING RAN" (round-4 review, P2).
+        # The start assertion exits 75 from `NOT STARTED` (no log byte / pid gone), from
+        # `FAILED EARLY: … started and exited rc=N`, and from `finished early` (rc=0 WITH a log line).
+        # Only the `NOT STARTED` arms consumed nothing; `FAILED EARLY` and `finished early` are a
+        # worker that RAN. All three are `record=False` below, which is right for the two `NOT
+        # STARTED` arms and is the RESIDUAL for the other two: such a worker gets no state row and no
+        # `spent[class]`, so it is re-spawned every pass and `REFUSAL_ESCALATE_AT` never engages.
+        # Safe, not tight: nothing here claims a lane is alive (the next pass re-checks liveness), and
+        # a worker that starts and dies inside the settle window is rare by construction (the window
+        # is seconds). Declared rather than silently absorbed -- giving those two arms a cooldown row
+        # is a separate change with its own test, not a comment fix.
         detail = "rc=%s: %s" % (rc, (errout or "").strip()
                                 or "the dispatcher exited non-zero with no stderr")
         log("spawn %s -> %s: FAIL %s" % (name, wt, detail[:200]))

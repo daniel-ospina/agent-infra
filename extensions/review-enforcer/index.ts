@@ -3500,6 +3500,17 @@ const TRACKER_FILE_READERS: ReadonlySet<string> = new Set(["gh"]);
  * through a `cp`/`mv` of the written path. Both were the proven masker's declared gap before this
  * function existed; a row in the suite marks the `cp` shape so no lane reads it as covered.
  *
+ * ⛔ AND A THIRD ONE, MEASURED BY REVIEW (agent-infra#3161 round 4, P2) — `heredocNamesTarget` matches
+ * a LITERAL path (and `~` / `$HOME`), never one ASSEMBLED FROM A VARIABLE, so a runner naming the
+ * target only through an assignment escapes C2 and the body is blanked:
+ *     cat > /tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\nd=/tmp; bash $d/y.sh
+ * executes the push and reads `isGitOp` false. This is NOT a regression — the proven masker blanks it
+ * too, so the pre-#3161 gate is equally blind — but C2's own wording ("a body written to a FILE a
+ * later line can RUN keeps its text") reads as if it covered it, and an earlier revision of this
+ * paragraph listed only the later-call and `cp`/`mv` gaps. Path-assembly is untracked on purpose: a
+ * `$d` can be anything, and guessing a value is the fail-OPEN direction. The argv layer (#984) is
+ * the answer, as it is for the other two.
+ *
  * POLARITY, unchanged and stricter than `maskHeredocData` in two places: only a QUOTED delimiter is
  * masked (an UNQUOTED `<<EOF` EXPANDS, so its text stays readable here even though the proven masker
  * masks it); a delimiter this reader cannot resolve is not an opener; a `<<` inside an open quote or
@@ -3713,13 +3724,33 @@ export function withoutQuotedHeredocBodies(command: string): string {
 // because `-C`/`-c` take a VALUE, so a naive `git\s+(commit|push)` anchor saw `-C`. The option group
 // is backtracking-safe: for `git --no-pager push` the optional value is declined and the verb matches.
 //
+// ⛔ THE VERB SET IS `GIT_COMMIT_PATTERN`'S, AND NOT ONE VERB WIDER. The arm exists for ONE measured
+// fail-open — the fleet's canonical `git -C <path> push` could not cross a global option, so it
+// matched no arm and reached ZERO dispatches — and the floor's own scope is stated two paragraphs
+// up: "WRITES THAT LAND CODE". A working-tree or index verb lands nothing, so adding it here is the
+// SAME over-block this file's previous commit had to fix for a bare `git status` (a word test
+// refused the fleet's most common command). MEASURED, `isGitOp` on both trees, at zero dispatches:
+// an earlier form of this pattern listed 20 verbs and turned `git add CHANGELOG.md`, `git add -A`,
+// `git -C /wt add -A`, `git checkout -b feat/x`, `git switch -c feat/x`, `git clone <url> <dir>`,
+// `git init -q`, `git pull --ff-only` and `git update-index --refresh` into REFUSALS that
+// `origin/main` allows. `git add CHANGELOG.md` is the sharpest: it is the exact sequence
+// `heredocLineExecutes`'s own note (above) says must stay allowed, so that form re-created the
+// reported false positive one clause away from the paragraph forbidding it.
+// A refusal is the fail-CLOSED direction, which is why an over-block can pass a review — but 20
+// verbs is not a strictness choice, it is the floor claiming jurisdiction over the working tree. The
+// remaining local verbs gain nothing: a `commit` or `push` that would SHIP their effect is already
+// gated here, and `resolveShippedHeads` refuses a ref-moving prefix (`git reset --hard side && git
+// push`) as evidence on its own.
 // DECLARED RESIDUALS, unchanged from HEAD in kind and now stated rather than implied: an alias push
-// (`git -c alias.p=push p origin …`), `git update-index`, and `$('git' push)` / `sh -c 'git -C /wt push'`
-// keep no arm HERE (nor did `GIT_COMMIT_PATTERN` at HEAD). They are caught where the floor actually
-// needs them — `mentionsGitWord` refuses ANY git word before a tracker write may stand down — and the
-// argv layer (#984) is the answer for the rest.
+// (`git -c alias.p=push p origin …`), and `$('git' push)` / `sh -c 'git -C /wt push'` keep no arm
+// HERE (nor did `GIT_COMMIT_PATTERN` at HEAD) — the quote sits where a command word's boundary would
+// be, so the pattern cannot see through it. `writesOnlyTrackerRecords`' `mentionsGitWord` veto does
+// NOT cover them either: that function is reachable only once a `gh`+`pr` candidate exists, so these
+// spellings reach zero dispatches ALONE on both trees. The argv layer (#984) is the answer for the
+// rest. (`git update-index` was listed here while the pattern armed it — the two disagreed; it is
+// now genuinely unarmed, because it ships nothing.)
 const GIT_WRITE_VERB_PATTERN =
-  /(^|[\s;&|(){!])git\s+(?:-{1,2}[^\s;&|]+(?:\s+[^\s;&|]+)?\s+)*(?:commit|push|merge|reset|rebase|cherry-pick|revert|am|apply|checkout|switch|restore|clean|pull|add|rm|mv|init|clone|update-index|update-ref|filter-branch)(?=\s|$)/;
+  /(^|[\s;&|(){!])git\s+(?:-{1,2}[^\s;&|]+(?:\s+[^\s;&|]+)?\s+)*(?:commit|push)(?=\s|$)/;
 
 function gitWordAnywhere(command: string): boolean {
   return GIT_WRITE_VERB_PATTERN.test(withoutQuotedHeredocBodies(command));
