@@ -665,7 +665,7 @@ unset OR_OPERATOR_DECLARED 2>/dev/null || true
 rp "$D"
 ck "(h) an AMBIENT exported \$OR does not reach the pass (rc=$RC — it must proceed)" "$([ "$RC" -eq 0 ]; echo $?)"
 # ⛔ THE RECORD ASSERTION READS THE MARKER THE RECORD ACTUALLY CARRIES (review cycle 1, P1-ish). It used
-# to look for `was DECLARED`, a string that exists ONLY on `resolve_repo`'s stdout (`:307`) and never in
+# to look for `was DECLARED`, a string that exists ONLY on `resolve_repo`'s stdout (`refresh-candidates.sh:311`) and never in
 # `why=`, so it was green by construction: measured with `-u OR` removed from `RP_CLEAR`, the pass went
 # rc=3 and this arm still printed ✅ while `why=` plainly held a `sub-step=resolve-repo` refusal.
 case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
@@ -743,20 +743,23 @@ case "$OUT" in *"NOT the queue target"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and it is not refused as a different repo" "$r"
 case "$(rec why)" in *"sub-step=resolve-repo"*) r=1 ;; *) r=0 ;; esac
 ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-70))" "$r"
-# NON-VACUITY, measured: with the trailing-slash spellings REMOVED from `resolve_repo`'s REPO-SET accept
-# list, this fixture prints `NOT the queue target` and the three `(h4)` assertions above go red
-# (`120 passed, 3 failed`). The `(h4b)`/`(h4c)` rows are pinned one arm each (1 row red per strip).
+# NON-VACUITY: with the trailing-slash spellings removed from `resolve_repo`'s REPO-SET accept list this
+# fixture prints `NOT the queue target` and the `(h4)` rows above go red. ⛔ NO INTEGER IS QUOTED HERE:
+# the suite's arm count has moved three times while this block was written, and a stale `N passed`
+# in a comment is re-derived by the next lane and found false. The stable, re-verifiable claim is the
+# mechanism: strip an arm, the row that names that spelling reddens.
 # ⛔ ALL FOUR TRAILING-SLASH SPELLINGS ARE PINNED, ONE ROW EACH (review cycles 6-8, P2). With only
 # `*"/$OR/"` covered, removing any of the other three from ALL THREE lists still printed
-# `118 passed, 0 failed` — i.e. what the commit claims to fix rested on inspection. Measured now: strip
-# `*"/$OR/"` → 3 rows red; strip `*"/$OR.git/"` → 1 row; strip `*":$OR.git/"` → 1 row; strip `*":$OR/"`
-# → 1 row. Every fixture redirects the transport with `insteadOf` (so the spelling stays realistic while
-# nothing reaches the network) and asserts rc=0.
+# `118 passed, 0 failed` — i.e. what the commit claims to fix rested on inspection. One row per spelling
+# now, and the claim each row makes is the mechanism, not a count: strip that spelling from the accept
+# lists and THAT row reddens. Every fixture redirects the transport with `insteadOf` (so the spelling
+# stays realistic while nothing reaches the network) and asserts rc=0.
 # ⛔ WHICH COPY EACH ROW PINS (review cycles 8-9, P2): the four spelling rows above run with `REPO=` set,
 # so they pin `resolve_repo`'s REPO-SET list only. The same four arms are also carried by the
 # CANDIDATE-LOOP predicate (the auto-derive path a cell without `REPO` uses) and by the `_pair` cause.
-# `(h4d)` below runs the SAME four spellings through the candidate loop — measured: stripping the arms
-# from that copy turns all four of its rows red. The `_pair` copy is DEFENSIVE and is pinned by nothing:
+# `(h4d)` below runs the SAME four spellings through the candidate loop; stripping the arms from that
+# copy reddens `(h4d)` and leaves every other row green. The `_pair` copy is DEFENSIVE and is pinned by
+# nothing:
 # `resolve_repo` returns 0 whenever that predicate matches, so its "names `$OR` yet the resolver refused
 # it" arm is reachable only by a config race. Stated, not implied.
 mk_case cause-trailing-slash-git
