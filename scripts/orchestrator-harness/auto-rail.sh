@@ -13,6 +13,12 @@ set -u
 MAX=${MAX:-2}
 case "${MAX}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: MAX='${MAX}' is not a positive integer — this actuator would not know its own bound" >> /tmp/auto-rail.log; exit 3;; esac
+# ⛔ ZERO IS NOT A BOUND, IT IS A STALL — and the message above always said "positive integer".
+# `case` above accepts `0` (it is a digit), and `MAX=0` derives `MAX_TOTAL=0`, whose clause
+# `[ total -ge 0 ]` is true for EVERY population: the actuator would defer every candidate for ever
+# while logging a normal-looking `deferred (…)`. Fail-closed, but a silent total stall is exactly the
+# state this guard exists to make diagnosable, so refuse it here rather than discover it in the log.
+[ "$MAX" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: MAX='${MAX}' is not a POSITIVE integer — 0 would defer every candidate for ever" >> /tmp/auto-rail.log; exit 3; }
 # The repos this actuator drives. `rails_for_repo` takes the FULL slug for the repo being asked about
 # plus this same list for the population, and derives every short name itself — one call shape, so the
 # two cannot drift apart (the bug that made `unattributed` read 1 for a rail that WAS attributed).
@@ -61,6 +67,7 @@ max_total_for() {  # $1 = MAX; $2.. = the repos this actuator drives
 MAX_TOTAL=${MAX_TOTAL:-$(max_total_for "$MAX" $REPOS)}
 case "${MAX_TOTAL}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
+[ "$MAX_TOTAL" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a POSITIVE integer — 0 makes the aggregate clause `[ total -ge 0 ]` true for every population, i.e. every candidate deferred for ever" >> /tmp/auto-rail.log; exit 3; }
 INTERVAL=${INTERVAL:-180}
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
@@ -104,7 +111,13 @@ COOLDOWN_S=${COOLDOWN_S:-21600}
 # NEW HEAD (CONFLICTED, DRAFT) keeps the long cooldown; every other verdict gets the short one.
 COOLDOWN_TRANSIENT_S=${COOLDOWN_TRANSIENT_S:-900}
 mkdir -p "$RAIL_DIR" 2>/dev/null
-touch "$TRIED" 2>/dev/null
+# ⛔ THE COOLDOWN LEDGER IS THE ONLY THING STOPPING AN UNLIMITED RE-RAIL LOOP, so its absence is a
+# refusal, not a shrug: unreadable/unwritable, every candidate reads as "never tried" and is launched
+# again every INTERVAL, each launch consuming a MAX slot. Refuse once, diagnosably, at start.
+if ! touch "$TRIED" 2>/dev/null || [ ! -w "$TRIED" ]; then
+  echo "$(date -u +%FT%TZ) REFUSED: cannot create the cooldown ledger at $TRIED — without it every candidate would be re-railed every pass" >> /tmp/auto-rail.log
+  exit 3
+fi
 mkdir -p "$RAIL_DIR" 2>/dev/null
 if [ ! -f "$RAIL_SCRIPT" ]; then
   echo "$(date -u +%FT%TZ) REFUSED: rail not found at $RAIL_SCRIPT — this actuator cannot land anything" >> /tmp/auto-rail.log
@@ -218,8 +231,19 @@ candidate_deferred() {  # $1 = this repo, $2.. = every repo driven  (rc 0 = defe
 rail_already_running() {  # $1 = PR number
   local tbl live
   tbl=$(ps -eo args= 2>/dev/null) || { say "COUNTER-FAILED: ps rc=$? — cannot rule out an existing rail for #$1 (fail-closed)"; return 2; }
-  live=$(printf '%s\n' "$tbl" | grep -c "[a]dmin-merge.sh $1 ")
+  live=$(printf '%s\n' "$tbl" | grep -cE "[a]dmin-merge[.]sh([[:space:]]+[^[:space:]]+)*[[:space:]]+$1([[:space:]]|$)")
   [ "$live" -gt 0 ]
+}
+# ── THE DUPLICATE-RAIL ANSWER, MAPPED TO AN ACTION ──────────────────────────────────────────────
+# `rail_already_running` has three answers and the pass has two actions; collapsing the third into
+# "no rail" is the fail-open. That mapping lives here, as a DRIVEN function, because a bare
+# `if [ "$rc" -ne 1 ]` at the loop is one line a reviewer found could be deleted with the suite green.
+rail_says_skip() {  # $1 = rc from rail_already_running  (rc 0 = skip this candidate)
+  case "$1" in
+    0) return 0;;   # a rail for this PR is live
+    1) return 1;;   # no rail: proceed
+    *) return 0;;   # CANNOT TELL -> skip (fail-closed) — never a launch
+  esac
 }
 # Keep the TCC-free rail clone current BEFORE using it. A failed refresh is LOUD but not fatal: the
 # previous HEAD then runs, which is strictly better than not merging, and the log says which happened.
@@ -314,8 +338,11 @@ PY
       # this repo's own count so other candidates of the repo this change exists to unstarve are deferred.
       # Unreadable is not zero: skip the candidate loudly (a pass that cannot rule a rail out must not add one).
       rail_already_running "$pr"; _rail_rc=$?
-      if [ "$_rail_rc" -eq 0 ]; then say "$repo #$pr skipped (rail already running)"; continue; fi
-      if [ "$_rail_rc" -ne 1 ]; then say "$repo #$pr skipped — cannot rule out an existing rail (fail-closed)"; continue; fi
+      if rail_says_skip "$_rail_rc"; then
+        if [ "$_rail_rc" -eq 0 ]; then say "$repo #$pr skipped (rail already running)"
+        else say "$repo #$pr skipped — cannot rule out an existing rail (fail-closed)"; fi
+        continue
+      fi
       # ⛔ THIS REPO'S BUDGET, NOT THE BOX'S. `rails_should_defer` adds the unattributable population to
       # this repo's own count (fail-closed) and keeps the aggregate as a second, independent clause:
       # another repo's rails can only decide this repo's candidates once the AGGREGATE is reached.
@@ -323,7 +350,13 @@ PY
         read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
         say "$repo #$pr deferred ($_own rails on this repo + $_unk unattributed, $_total live in total, max=$MAX max_total=$MAX_TOTAL)"; continue
       fi
-      head=$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid 2>/dev/null)
+      # ⛔ A FAILED HEAD READ IS NOT AN EMPTY HEAD. `gh` failing here used to write the cooldown key
+      # with an EMPTY head, which no later pass's real head can ever match — so the same PR was railed
+      # again every interval, each launch taking a MAX slot from the candidates this actuator exists to
+      # serve. Skip the candidate instead, and say so.
+      head=$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid 2>/dev/null) \
+        || { say "$repo #$pr HEAD-READ-FAILED: gh rc=$? — skipping this candidate (a cooldown keyed to an empty head would re-rail it every pass)"; continue; }
+      [ -n "$head" ] || { say "$repo #$pr HEAD-READ-FAILED: gh returned an empty head — skipping this candidate"; continue; }
       now=$(date +%s)
       if grep -q "^$pr[[:space:]]$head[[:space:]]" "$TRIED" 2>/dev/null; then
         ts=$(grep "^$pr[[:space:]]$head[[:space:]]" "$TRIED" | tail -1 | awk '{print $3}')

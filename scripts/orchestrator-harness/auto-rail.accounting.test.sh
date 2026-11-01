@@ -11,8 +11,17 @@
 #     commit that added them.
 #   * GREPPED (text, and declared as text): the pass LOOP's invocation of `candidate_deferred`. The loop
 #     runs `while :` around a live `gh`/`ps`/supervisor pass, so driving it here would mean stub-driving
-#     the whole actuator; the loop line is therefore pinned by the assertion at “the loop's own call”
-#     below. It catches `"$repo"` losing its `$REPOS`; it cannot catch a reordering inside the line.
+#     the whole actuator; the loop line is therefore pinned by the assertion at "the loop's own call"
+#     below. It compares the WHOLE captured argument string against the exact literal, so a reordering
+#     inside the line is caught too; what it cannot see is the line becoming UNREACHABLE (moved below a
+#     `continue`, or wrapped in `if false`) — that class is not pinned by anything here, and saying so
+#     is the point of this paragraph. What the loop DECIDES is pinned by behaviour: `rail_already_running`
+#     (three answers), `rail_says_skip` (rc -> action) and the MAX/MAX_TOTAL validation are all driven.
+#   * NOT PINNED AT ALL, declared rather than left to be discovered: the loop's HEAD-READ guard (a `gh pr
+#     view` failure must skip the candidate, not write a cooldown key with an empty head) and the startup
+#     refusal when the cooldown ledger cannot be created. Both are loop/startup lines, `TRIED` is not an
+#     env-overridable seam, and driving either means stub-driving the actuator. They are guarded in the
+#     SUT and unpinned here — verified by reading, not by this suite.
 #
 # The fixture is `ps -eo args=` output from this box on 2026-11-01 at ~17:11Z, captured immediately
 # BEFORE the actuator restart at 17:12:02Z cleared the population (the restart is the collateral
@@ -30,8 +39,9 @@ eval "$(sed -n '/^rails_for_repo() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^rails_should_defer() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^candidate_deferred() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^rail_already_running() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^rail_says_skip() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^max_total_for() {/,/^}$/p' "$SUT")"
-for _fn in rails_for_repo rails_should_defer candidate_deferred rail_already_running max_total_for; do
+for _fn in rails_for_repo rails_should_defer candidate_deferred rail_already_running rail_says_skip max_total_for; do
   command -v "$_fn" >/dev/null || { echo "FATAL: $_fn not found in $SUT"; exit 2; }
 done
 # ⛔ `rails_should_defer` calls `say`, which the SCRIPT defines and this file does not — so without a stub
@@ -124,6 +134,49 @@ TABLE="bash /r/scripts/admin-merge.sh 3136 --repo daniel-ospina/agent-infra
 bash /r/scripts/admin-merge.sh 3136 --repo daniel-ospina/agent-infra"
 rail_already_running 3136; [ $? -eq 0 ] || { echo "FAIL: a live rail for #3136 must be DETECTED (rc 0)"; fail=1; }
 rail_already_running 9999; [ $? -eq 1 ] || { echo "FAIL: with no rail for #9999 the guard must answer rc 1 (not running), not a refusal"; fail=1; }
+
+# ⛔ THE PR NUMBER IS NOT ALWAYS FOLLOWED BY AN ARGUMENT. `admin-merge.sh <PR>` — the form this repo's
+# own merge path tells operators to use — puts it LAST, and the old `grep "admin-merge.sh $1 "` needed a
+# trailing space, so it answered rc 1 ("no rail") for a rail that was live, and the actuator launched a
+# second one. `merge-reminder.py` reads the same table and matches the PR as ANY argv token for exactly
+# this reason ("a hand-started rail is still a rail").
+for _shape in "bash /r/hub/scripts/admin-merge.sh 3136" \
+              "bash /r/hub/scripts/admin-merge.sh 3136 --any-workflow" \
+              "bash /r/hub/scripts/admin-merge.sh --repo daniel-ospina/agent-infra 3136"; do
+  TABLE="$_shape"
+  rail_already_running 3136 || { echo "FAIL: this is a live rail for #3136 and the guard must DETECT it: $_shape"; fail=1; }
+done
+for _shape in "bash /r/hub/scripts/admin-merge.sh 13136" \
+              "bash /r/hub/scripts/admin-merge.sh 31360 --repo daniel-ospina/agent-infra" \
+              "bash /r/hub/scripts/admin-merge.sh 9999 --repo daniel-ospina/agent-infra"; do
+  TABLE="$_shape"
+  rail_already_running 3136 && { echo "FAIL: the PR token must be boundary-matched — #3136 is NOT running here: $_shape"; fail=1; }
+done
+
+# ⛔ THE PASS'S ACTION, DRIVEN FROM THE GUARD'S CONTRACT. 0 = a rail is live, 1 = none, 2 = CANNOT TELL.
+# Collapsing "cannot tell" into "none" is the fail-open cycle 2 fixed, and the mapping is one line at
+# the loop — so it is pinned by BEHAVIOUR here, not by a grep at the call site.
+rail_says_skip 0   || { echo "FAIL: rc 0 (a rail is live) must SKIP the candidate"; fail=1; }
+rail_says_skip 2   || { echo "FAIL: rc 2 (CANNOT TELL) must SKIP the candidate, never launch"; fail=1; }
+rail_says_skip 255 || { echo "FAIL: an unexpected rc must SKIP the candidate, never launch"; fail=1; }
+rail_says_skip 1   && { echo "FAIL: rc 1 (no rail) must PROCEED — refusing here would stall the queue"; fail=1; }
+
+# ⛔ NON-POSITIVE BOUNDS ARE REFUSED — driven from a copy whose LOG PATH IS PRIVATE, so the assertion can
+# read the guard's own `REFUSED: …` line. `rc=3` alone is NOT discriminating: the script exits 3 for a
+# missing rail too, so a deleted guard would still "pass" (measured — this assertion was a false pass
+# until the log was matched). `MAX=0 MAX_TOTAL=16` is the discriminating env: with the aggregate positive,
+# only the MAX guard can refuse it.
+_sutlog=$(mktemp); _sut0=$(mktemp)
+sed "s#/tmp/auto-rail.log#$_sutlog#g" "$SUT" > "$_sut0"
+for _env in "MAX=0|REFUSED: MAX=" "MAX=0 MAX_TOTAL=16|REFUSED: MAX=" \
+            "MAX_TOTAL=0|REFUSED: MAX_TOTAL=" "MAX=8 MAX_TOTAL=0|REFUSED: MAX_TOTAL="; do
+  _e=${_env%%|*}; _want=${_env#*|}
+  : > "$_sutlog"
+  env $_e bash "$_sut0" >/dev/null 2>&1; _rc=$?
+  [ "$_rc" -eq 3 ] || { echo "FAIL: $_e must be REFUSED (exit 3), got rc=$_rc — a zero bound defers every candidate for ever"; fail=1; }
+  grep -q "$_want" "$_sutlog" || { echo "FAIL: $_e must log '$_want' — a bare rc=3 is also what a missing rail produces, so the line is what proves the GUARD fired"; fail=1; }
+done
+rm -f "$_sutlog" "$_sut0"
 
 # ⛔ THE AGGREGATE'S DERIVATION IS PINNED BY EVALUATING THE SHIPPED LINE, not by a literal in this file.
 # `MAX_TOTAL=16` used to appear here as a constant, so `MAX_TOTAL=${MAX_TOTAL:-$(max_total_for …)}` could
