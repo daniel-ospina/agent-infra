@@ -105,7 +105,9 @@
 #   (a partial recap refuses to be used as a baseline); this bound makes it NOT HAPPEN.
 #
 #   `SHARD_BOUND`, default 1800 s — 1.65× the slowest shard measured (1092 s), so a legitimately
-#   slow suite cannot false-trip. A shard that exceeds it is KILLED BY PROCESS GROUP (its own
+#   slow suite cannot false-trip. `SHARD_BOUND=` (empty, like unset) takes the default; only a value
+#   the parser can read as "off" disables the bound. A shard that exceeds it is KILLED BY PROCESS GROUP
+#   (its own
 #   children included — a wrapper-only kill leaves the hang's children running), NAMED with a
 #   `TIMEOUT after <n>s` marker through the SAME `shard_failed_list` every other failure uses,
 #   and the loop CONTINUES to the next shard. A hang therefore costs one shard, not forty-five.
@@ -471,8 +473,18 @@ trap 'rm -f "$shard_ran_log" "$shard_skip_log" "$shard_timeout_marker"' EXIT
 # exits as the signal says, and its EXIT trap still runs.
 shard_bg_pid=""
 shard_wd_pid=""
+# The traps FORWARD the signal and then leave; the shard's group gets the same TERM→KILL escalation
+# the bound uses (review cycle 2, P2, measured). TERM alone left a `trap '' TERM` shard running for
+# EVER after a cancelled step — reparented to init, in its own group (which `set -m` created), with the
+# watchdog TERMed too, so nothing remained to bound or kill it. That is a regression against main,
+# where the shard inherited the driver's group and died with it, and `tests/run-bash-shards-bound`'s
+# arm 6 could not see it because its shard answers TERM.
 shard_driver_signal() {
-  [ -n "${shard_bg_pid:-}" ] && { kill -TERM -"$shard_bg_pid" 2>/dev/null || kill -TERM "$shard_bg_pid" 2>/dev/null; }
+  if [ -n "${shard_bg_pid:-}" ]; then
+    kill -TERM -"$shard_bg_pid" 2>/dev/null || kill -TERM "$shard_bg_pid" 2>/dev/null
+    sleep 1
+    kill -KILL -"$shard_bg_pid" 2>/dev/null || kill -KILL "$shard_bg_pid" 2>/dev/null
+  fi
   [ -n "${shard_wd_pid:-}" ] && { kill -TERM -"$shard_wd_pid" 2>/dev/null || kill -TERM "$shard_wd_pid" 2>/dev/null; }
   exit "$1"
 }
@@ -572,19 +584,34 @@ shard_watchdog() {
   # is then a second, non-load-bearing path. It records nothing, so disabling job control here cannot
   # disturb the driver.
   set +m
-  trap 'kill "${shard_timer_pid:-}" 2>/dev/null; kill -TERM -- -"${BASHPID:-$$}" 2>/dev/null; exit 0' TERM INT
+  # ⛔ NO `BASHPID` HERE — IT IS A BASH 3.2 LANDMINE (review cycle 2, P1, MEASURED). `BASHPID` arrived
+  # in bash 4.0, so this file would run on 3.2 (macOS) with `"${BASHPID:-$$}"` = `$$` = the DRIVER's
+  # pid: `kill -TERM -- -<driver pid>` then signals the DRIVER'S OWN group whenever the driver is a
+  # process-group leader (any foreground job of a job-control/interactive shell — a human typing
+  # `bash scripts/run-bash-shards.sh`, a `setsid` launcher, a monitor-mode one). The parent's NORMAL
+  # per-shard teardown would then TERM the driver itself: the run exited 143 after the FIRST shard,
+  # the remaining 147 never ran, and the log carried no recap — #3187 recreated by its own fix
+  # (measured: `set -m` launcher → rc 143, first shard ran, second did not; bash 5 unaffected because
+  # BASHPID exists there). The trap needs only the timer, which it now holds by pid; the GROUP kill is
+  # the parent's job (`shard_run_bounded` sends TERM to the group and, after reaping, KILL to it again
+  # — that second pass exists precisely because a timer forked around the TERM joins the group too
+  # late to receive it), so nothing here is load-bearing for the group case.
+  trap 'kill "${shard_timer_pid:-}" 2>/dev/null; exit 0' TERM INT
   sleep "$shard_bound" &
   shard_timer_pid=$!
   wait "$shard_timer_pid" 2>/dev/null || exit 0
-  # Gone already ⇒ this is NOT a timeout: say nothing and leave no mark. ⛔ `kill -0` alone is NOT
-  # enough: it SUCCEEDS for a zombie (a child that exited but has not been reaped yet), so a shard
-  # that finished at the last instant could be reported as killed. `ps -o stat=` reads `Z` for that
-  # state on macOS and Linux alike, and it costs one fork only on the timeout path (review finding,
-  # P2 — the window is sub-millisecond, which is exactly why rc alone is the wrong discriminator:
-  # consulting rc would turn a TERM-trapping shard's clean exit into a false PASS).
+  # ⛔ `kill -0` ALONE IS NOT ENOUGH — but `ps` MUST NOT BE ABLE TO DISARM THE BOUND (review cycle 2,
+  # P1, measured). `kill -0` SUCCEEDS for a zombie (a child that exited but has not been reaped), so a
+  # shard that finished at the last instant could be reported as killed; `ps -o stat=` reads `Z` for
+  # that state on macOS and Linux. The EMPTY case, though, means "`ps` could not answer" (a slim
+  # container has no `ps`; busybox' `ps` rejects `-o stat= -p`), NOT "the shard finished" — and
+  # reading it as "not a timeout" made the bound INERT while the run still printed
+  # `✅ all N bash shards passed` (measured with a `ps` shim: rc 0, no TIMEOUT, the hung shard ran to
+  # completion). `kill -0` has already established that the pid exists, so an unreadable state falls
+  # through to the KILL: fail-closed, exactly as the bound behaved before the zombie check existed.
   kill -0 "$shard_bg_pid" 2>/dev/null || exit 0
   case "$(ps -o stat= -p "$shard_bg_pid" 2>/dev/null)" in
-    Z*|'') exit 0 ;;
+    Z*) exit 0 ;;
   esac
   printf 'x' >"$shard_timeout_marker" 2>/dev/null
   # The GROUP (`-$pid`), never the bare pid: a wrapper-only kill is the orphan factory this exists

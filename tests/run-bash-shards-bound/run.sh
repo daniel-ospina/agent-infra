@@ -422,13 +422,100 @@ else
   fail "the driver exited rc $DRV_RC (want 143 — its TERM trap) and left no shard behind"
 fi
 
+# 6b. AND A SHARD THAT IGNORES TERM MUST STILL DIE (review cycle 2, P2, measured). A TERM-only
+# forward left a `trap '' TERM` shard running for EVER after a cancelled step — reparented to init, in
+# its own group, with the watchdog TERMed too, so nothing was left to bound or kill it. Arm 6's shard
+# answers TERM, so it could not see this.
+TERMDEAF="$TMP/killdeaf"
+stage_fixture "$TERMDEAF" 60
+{
+  printf '#!/bin/bash\n'
+  printf 'trap "" TERM\n'
+  printf 'mkdir -p "$HANG_PID_DIR" 2>/dev/null\n'
+  printf 'printf "%%s\\n" "$$" >"$HANG_PID_DIR/deaf.pid"\n'
+  printf 'while :; do sleep 1; done\n'
+} >"$TERMDEAF/tests/mmm-hang/run.sh"
+HANG_PID_DIR="$TMP/pids-deafkill" SHARD_BOUND=1800 bash "$TERMDEAF/scripts/runner.sh" >"$TMP/killdeaf.out" 2>&1 &
+DEAF_DRV=$!
+_n=0
+while [ "$_n" -lt 100 ]; do
+  [ -s "$TMP/pids-deafkill/deaf.pid" ] && break
+  sleep 0.2
+  _n=$((_n + 1))
+done
+kill -TERM "$DEAF_DRV" 2>/dev/null
+wait "$DEAF_DRV" 2>/dev/null
+DEAF_RC=$?
+DEAF_SURVIVED=0
+if [ -f "$TMP/pids-deafkill/deaf.pid" ]; then
+  DEAF_PID="$(cat "$TMP/pids-deafkill/deaf.pid")"
+  _n=0
+  while kill -0 "$DEAF_PID" 2>/dev/null && [ "$_n" -lt 8 ]; do sleep 1; _n=$((_n + 1)); done
+  if kill -0 "$DEAF_PID" 2>/dev/null; then DEAF_SURVIVED=1; kill -KILL "$DEAF_PID" 2>/dev/null; fi
+fi
+if [ ! -f "$TMP/pids-deafkill/deaf.pid" ]; then
+  fail "the TERM-deaf shard never started — this arm proves nothing"
+elif [ "$DEAF_SURVIVED" -ne 0 ]; then
+  fail "a TERM-DEAF shard outlived a cancelled driver — the forward must escalate to KILL, not stop at TERM"
+elif [ "$DEAF_RC" -eq 143 ]; then
+  pass "a TERM-deaf shard is KILLed after a cancelled driver (driver rc 143)"
+else
+  fail "the driver exited rc $DEAF_RC (want 143) and left no term-deaf shard behind"
+fi
+
+# 6c. THE DRIVER AS A PROCESS-GROUP LEADER (review cycle 2, P1, measured). `BASHPID` is bash 4+; a
+# `"${BASHPID:-$$}"` fallback in the watchdog became `$$` — the DRIVER's pid — on bash 3.2, so the
+# parent's normal per-shard teardown TERMed the driver's own group: the run exited 143 after the FIRST
+# shard and the remaining shards never ran, which is #3187 recreated by its own fix. Any foreground
+# job of a job-control/interactive shell is this shape, i.e. every human running this script.
+LEADER="$TMP/leader"
+stage_fixture "$LEADER" 0
+# ⛔ THE DRIVER ITSELF MUST BE THE GROUP LEADER, so it is started as a BACKGROUND JOB OF A
+# JOB-CONTROL SHELL (`set -m` above): with `set -m`, `bash … &` gets pgid == its own pid. A `( … ) &`
+# subshell would be the leader and the runner its child — the shape the finding is about (a foreground
+# job of an interactive shell) would not be reproduced, measured: the arm passed with the bug restored.
+# The runner anchors its discovery on the tree it lives in, so no `cd` is needed here.
+set -m
+SHARD_BOUND=60 bash "$LEADER/scripts/runner.sh" >"$TMP/leader.out" 2>&1 &
+LEADER_JOB=$!
+set +m
+wait "$LEADER_JOB" 2>/dev/null
+LEADER_RC=$?
+LOUT="$(cat "$TMP/leader.out")"
+if [ "$LEADER_RC" -eq 0 ] && grep -q 'BEFORE-RAN' <<<"$LOUT" && grep -q 'AFTER-RAN' <<<"$LOUT" \
+   && grep -q 'all 3 bash shards passed' <<<"$LOUT"; then
+  pass "a GROUP-LEADER driver runs the WHOLE list (rc 0, all 3 shards, recap) — no self-signal on bash 3.2"
+else
+  fail "a group-leader driver exited rc $LEADER_RC with $(grep -c '  ▸' <<<"$LOUT") shard row(s) — the run was cut short ($(printf '%s' "$LOUT" | tail -1))"
+fi
+
+# 6d. AN UNREADABLE `ps` MUST NOT DISARM THE BOUND (review cycle 2, P1, measured). The zombie guard
+# reads `ps -o stat=`; treating EMPTY output as "finished" made the bound INERT on any host without a
+# POSIX `ps` (slim images have none; busybox' rejects `-o stat= -p`) while the run still printed
+# `✅ all N bash shards passed`. Measured with a `ps` shim: rc 0, no TIMEOUT, the hung shard ran on.
+NOPS="$TMP/nops"
+stage_fixture "$NOPS" 30
+mkdir -p "$TMP/ps-shim"
+printf '#!/bin/bash\nexit 1\n' >"$TMP/ps-shim/ps"
+chmod +x "$TMP/ps-shim/ps"
+T0="$(date +%s)"
+HANG_PID_DIR="$TMP/pids-nops" PATH="$TMP/ps-shim:$PATH" SHARD_BOUND=2 bash "$NOPS/scripts/runner.sh" >"$TMP/nops.out" 2>&1
+NOPS_RC=$?
+T1="$(date +%s)"
+NOUT="$(cat "$TMP/nops.out")"
+if [ "$NOPS_RC" -eq 1 ] && [ $((T1 - T0)) -lt 25 ] && grep -q 'TIMEOUT after 2s' <<<"$NOUT"; then
+  pass "with no usable 'ps' the bound still FIRES and NAMES the shard (rc 1, $((T1 - T0))s, fail-closed)"
+else
+  fail "with no usable 'ps' the bound was disarmed (rc $NOPS_RC, $((T1 - T0))s): $(printf '%s' "$NOUT" | tail -2 | tr '\n' '|')"
+fi
+
 echo ""
 echo "7. NO TIMER MAY HOLD THE CALLER'S PIPE (the regression that hung tests/ci-lane-parity)"
 # ⛔ A watchdog's `sleep <bound>` INHERITS STDOUT. A caller that runs this driver inside `$( … )` or a
 # pipeline waits for EOF on that pipe, so a timer that outlives the driver blocks the CALLER until the
 # bound — measured on this suite's own driver: a leaked `sleep 1800` kept `tests/ci-lane-parity`'s
 # command substitution open for 10+ minutes with the driver long gone (the suite then sat at one line
-# of output forever, holding the whole lane). The bound here is 777, so a leaked timer can be found BY
+# of output forever, holding the whole lane). The bound here is 3117, so a leaked timer can be found BY
 # NAME instead of guessed at.
 #
 # 7a. A NORMAL run, whose stdout is a PIPE the caller reads, reaches EOF and leaves no timer
@@ -437,6 +524,8 @@ echo "7. NO TIMER MAY HOLD THE CALLER'S PIPE (the regression that hung tests/ci-
 # that runs that script — a false block on this whole lane, measured while writing this change
 # (tests/ci-lane-parity/run.sh records the same trap for command substitutions). A FIFO is the same
 # hazard with a statically readable command: the reader gets EOF only when every writer closes.
+# ⛔ THE BOUND IS 3117 SO THE TIMER CAN BE FOUND BY NAME, and a name that odd is what keeps the check
+# from seeing (or the cleanup from killing) some unrelated `sleep` on the host.
 PIPEFIX="$TMP/pipefix"
 stage_fixture "$PIPEFIX" 0
 PIPE_FIFO="$TMP/pipe.fifo"
@@ -445,7 +534,7 @@ mkfifo "$PIPE_FIFO" 2>/dev/null
 cat "$PIPE_FIFO" >"$TMP/pipe.out" &
 PIPE_READER=$!
 T0="$(date +%s)"
-HANG_PID_DIR="$TMP/pids-pipe" SHARD_BOUND=777 bash "$PIPEFIX/scripts/runner.sh" >"$PIPE_FIFO" 2>&1 &
+HANG_PID_DIR="$TMP/pids-pipe" SHARD_BOUND=3117 bash "$PIPEFIX/scripts/runner.sh" >"$PIPE_FIFO" 2>&1 &
 PIPE_WRITER=$!
 _n=0
 while kill -0 "$PIPE_READER" 2>/dev/null && [ "$_n" -lt 40 ]; do sleep 0.5; _n=$((_n + 1)); done
@@ -454,16 +543,16 @@ wait "$PIPE_WRITER" 2>/dev/null
 PIPE_RC=$?
 READER_OPEN=0
 kill -0 "$PIPE_READER" 2>/dev/null && READER_OPEN=1
-LEAKED="$(ps -A -o args= -ww | grep -cx 'sleep 777')"
+LEAKED="$(ps -A -o args= -ww | grep -cx 'sleep 3117')"
 if [ "$READER_OPEN" -eq 0 ] && [ "$PIPE_RC" -eq 0 ] && [ $((T1 - T0)) -lt 20 ] && [ "$LEAKED" -eq 0 ]; then
-  pass "a piped run reaches EOF in $((T1 - T0))s and leaves NO 'sleep 777' timer behind"
+  pass "a piped run reaches EOF in $((T1 - T0))s and leaves NO 'sleep 3117' timer behind"
 else
   fail "piped run: reader still open=$READER_OPEN, rc $PIPE_RC, $((T1 - T0))s, $LEAKED leaked timer(s) — a leaked timer holds the caller's pipe until the bound"
   kill -KILL "$PIPE_READER" "$PIPE_WRITER" 2>/dev/null
 fi
 # 7b. CONTROL — the same run with the THREE defences removed (no TERM trap in the watchdog, its output
 # NOT /dev/null, and the teardown signalling the bare pid instead of the group) MUST leave a
-# `sleep 777`. Without this, "no leak" could be passing because no timer ever existed.
+# `sleep 3117`. Without this, "no leak" could be passing because no timer ever existed.
 MUTPIPE="$TMP/pipefix-mutant"
 stage_fixture "$MUTPIPE" 0
 awk '
@@ -478,22 +567,22 @@ if cmp -s "$MUTPIPE/scripts/runner.sh" "$TMP/runner-leaky.sh"; then
   fail "the leaky-timer mutation did not change the runner — the 'no timer' assertion has no control"
 else
   cp "$TMP/runner-leaky.sh" "$MUTPIPE/scripts/runner.sh"
-  HANG_PID_DIR="$TMP/pids-pipe" SHARD_BOUND=777 bash "$MUTPIPE/scripts/runner.sh" >"$TMP/leaky.out" 2>&1
-  LEAKED_CTRL="$(ps -A -o args= -ww | grep -cx 'sleep 777')"
+  HANG_PID_DIR="$TMP/pids-pipe" SHARD_BOUND=3117 bash "$MUTPIPE/scripts/runner.sh" >"$TMP/leaky.out" 2>&1
+  LEAKED_CTRL="$(ps -A -o args= -ww | grep -cx 'sleep 3117')"
   if [ "$LEAKED_CTRL" -gt 0 ]; then
-    pass "control: with the defences removed a 'sleep 777' timer DOES survive the driver ($LEAKED_CTRL) — this arm can see a leak"
+    pass "control: with the defences removed a 'sleep 3117' timer DOES survive the driver ($LEAKED_CTRL) — this arm can see a leak"
   else
     fail "control: the mutant left no timer behind, so 'no leaked timer' above cannot distinguish the fixed code from the broken one"
   fi
   # Clean up the control's OWN timers, and prove they are gone (this suite must not leak either).
-  for _p in $(ps -A -o pid=,args= -ww | awk '$1 ~ /^[0-9]+$/ && $NF == "777" && $(NF-1) == "sleep" { print $1 }'); do
+  for _p in $(ps -A -o pid=,args= -ww | awk '$1 ~ /^[0-9]+$/ && $NF == "3117" && $(NF-1) == "sleep" { print $1 }'); do
     kill -KILL "$_p" 2>/dev/null
   done
   sleep 0.3
-  if [ "$(ps -A -o args= -ww | grep -cx 'sleep 777')" -eq 0 ]; then
+  if [ "$(ps -A -o args= -ww | grep -cx 'sleep 3117')" -eq 0 ]; then
     pass "the control's leaked timer(s) were cleaned up (this suite leaves no residue)"
   else
-    fail "this suite left 'sleep 777' timer(s) running — its own control leaked"
+    fail "this suite left 'sleep 3117' timer(s) running — its own control leaked"
   fi
 fi
 
