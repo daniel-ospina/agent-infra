@@ -349,6 +349,22 @@ refuses 'a SPACED ExecStopPost=' "$(doctor stoppost "ExecStopPost = /bin/bash $T
 # that reverted to the single-name check fails them.
 refuses 'a ConditionFileNotEmpty= (the family, not the one name)' "$(doctor condfam 'ConditionFileNotEmpty=/srv/nope')" "$T/u17" 'ConditionFileNotEmpty='
 refuses 'a ConditionUser= (the family, a third name)' "$(doctor conduser 'ConditionUser=cmux')" "$T/u18" 'ConditionUser='
+# ⛔ `Environment=` IS LAST-WINS, SO THE BASE RULE ABOVE IS A COUNT RULE, NOT A PRESENCE TEST. The rule used
+# to accept "a line matching `CELL_HOME=${CELL_HOME}` exists" — and a SECOND assignment OVERRIDES it, so the
+# unit's EFFECTIVE base was another path while `ExecStart` (and so the $CELL_HOME prefix rule) still sat
+# under the real one, and nothing else caught it. MEASURED before the rule existed: this doctor installed
+# rc=0 and wrote both lines. These legs FAIL on the presence-test version and pass on the count version,
+# which is what makes the rule load-bearing rather than decorative.
+refuses 'an OVERRIDING Environment=CELL_HOME=' "$(doctor overridehome 'Environment=CELL_HOME=/tmp/other-home')" "$T/u19" 'LAST-WINS'
+# ⛔ AND THE COUNT IS NOT ENOUGH ON ITS OWN — the ONE assignment must NAME the cell home. A unit that carries
+# exactly one `CELL_HOME=` pointing somewhere else is the same skew one spelling over, so this doctor
+# REWRITES the existing line instead of appending (a second line would trip the count rule first and the leg
+# would pass on a rule it never named — the same wrong-reason trap the ExecStart leg hit).
+refuses 'ONE Environment=CELL_HOME= naming a different base' "$(doctor_rw cmhome-wrong "s|^Environment=CELL_HOME=.*\$|Environment=CELL_HOME=/tmp/other-home|")" "$T/u20" 'is not the cell home'
+# ⛔ `EnvironmentFile=` IS THE SAME HOLE ONE DIRECTIVE OVER: systemd READS the named file and its values
+# OVERRIDE `Environment=`, so it can re-base `CELL_HOME` while the count rule above still sees exactly one
+# assignment and passes. Refused by name, because the rendered pass needs no environment file at all.
+refuses 'an EnvironmentFile= (overrides Environment=)' "$(doctor envfile 'EnvironmentFile=/srv/cell-pin.env')" "$T/u21" 'EnvironmentFile='
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
 # `<unit>.service.d/*.conf` OVER it, in both managers, whether the drop-in was written before the unit or
@@ -379,6 +395,15 @@ refuses_dropin 'declares WorkingDirectory=' "$(dropin_doctor workdir 'WorkingDir
 refuses_dropin 'declares a Condition (a green skip)' "$(dropin_doctor cond 'ConditionPathExists=/srv/nope')" 'ConditionPathExists='
 refuses_dropin 'declares an executable directive' "$(dropin_doctor execpre 'ExecStartPre=/bin/bash /srv/nowhere/x.sh')" 'ExecStartPre='
 refuses_dropin 'widens the success vocabulary' "$(dropin_doctor okvals 'SuccessExitStatus=0 11 1')" 'SuccessExitStatus='
+# ⛔ THE IDENTITY ALLOWANCE IS EXACTLY ONE VARIABLE WIDE (`Environment=HOME=`), and these legs are why. A
+# drop-in OVERRIDES the rendered unit, so a drop-in carrying `Environment=CELL_HOME=` (or any other variable
+# this pass READS) re-points the pass at a different pin record while the rendered unit still carries the
+# correct one and `--install` reports success — the effective-unit false PASS this whole section exists for,
+# one directive over from `WorkingDirectory=`. Refused as a CLASS (`HOME=` is the closed allow-list), not by
+# naming `CELL_HOME=`, so a variable a future revision adds is closed without another review.
+refuses_dropin 'sets Environment=CELL_HOME= (re-basing the pass)' "$(dropin_doctor envhome 'Environment=CELL_HOME=/tmp/other-home')" 'never the base'
+refuses_dropin 'sets Environment=HARNESS_PIN_FILE= (re-pointing the record)' "$(dropin_doctor envpin 'Environment=HARNESS_PIN_FILE=/tmp/other-path')" 'never the base'
+refuses_dropin 'declares an EnvironmentFile= (overrides Environment=)' "$(dropin_doctor envfile 'EnvironmentFile=/srv/cell-pin.env')" 'EnvironmentFile='
 # ⛔ THE NON-VACUITY CONTROL, and it is load-bearing: a drop-in that only sets IDENTITY is the operator's
 # DOCUMENTED remedy for the `User=root` render. Without this leg the gate above could "pass" by refusing
 # every drop-in, which would block the one migration this file recommends.
