@@ -480,11 +480,15 @@ shard_wd_pid=""
 # where the shard inherited the driver's group and died with it, and `tests/run-bash-shards-bound`'s
 # arm 6 could not see it because its shard answers TERM.
 shard_driver_signal() {
-  if [ -n "${shard_bg_pid:-}" ]; then
-    kill -TERM -"$shard_bg_pid" 2>/dev/null || kill -TERM "$shard_bg_pid" 2>/dev/null
-    sleep 1
-    kill -KILL -"$shard_bg_pid" 2>/dev/null || kill -KILL "$shard_bg_pid" 2>/dev/null
-  fi
+  # ⛔ SHARED WITH EVERY OTHER TEARDOWN: group-only, never a bare pid (review cycle 5, P2). This trap
+  # can fire DURING the teardown window too — after `wait` reaped the shard, before `shard_bg_pid` is
+  # cleared — and there the pid is already FREE, so the old `|| kill -TERM "$shard_bg_pid"` fallback
+  # could name a recycled process, which is the construct commit 4 deleted from `shard_kill_group`.
+  # `shard_kill_group` gives the group the same TERM→grace→KILL the bound gives (needed here: a
+  # TERM-deaf shard must not outlive a cancelled step).
+  [ -n "${shard_bg_pid:-}" ] && shard_kill_group "$shard_bg_pid"
+  # The WATCHDOG is still alive when this trap runs (it is counting down), so a bare-pid fallback IS
+  # meaningful for it — that is the one place in this file where it is.
   [ -n "${shard_wd_pid:-}" ] && { kill -TERM -"$shard_wd_pid" 2>/dev/null || kill -TERM "$shard_wd_pid" 2>/dev/null; }
   exit "$1"
 }

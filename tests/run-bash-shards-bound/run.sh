@@ -772,6 +772,47 @@ else
   [ -n "$MUT_PID" ] && kill -KILL "$MUT_PID" 2>/dev/null
 fi
 
+echo "9. A HEALTHY SLOW SHARD UNDER AN ENABLED BOUND MUST PASS — the one production risk of this design"
+# ⛔ THE OTHER DIRECTION, UNTESTED UNTIL NOW (review cycle 5, P2): every other arm is instant-or-hang, so
+# a watchdog that fired EARLIER than configured (or ignored `SHARD_BOUND` and used a constant) tripped
+# nothing — the `TIMEOUT after <n>s` text is printed from `$shard_bound`, so it cannot tell when the
+# timer actually fired. Measured: a mutant whose timer slept `bound/2` passed 32 of 33 assertions.
+# A shard that legitimately takes most of the bound must be GREEN, and halving the timer must make it RED.
+SLOWOK="$TMP/slowok"
+stage_fixture "$SLOWOK" 4
+T0="$(date +%s)"
+HANG_PID_DIR="$TMP/pids-slowok" SHARD_BOUND=6 bash "$SLOWOK/scripts/runner.sh" >"$TMP/slowok.out" 2>&1
+SLOW_RC=$?
+T1="$(date +%s)"
+SOUT="$(cat "$TMP/slowok.out")"
+if [ "$SLOW_RC" -eq 0 ] && ! grep -q 'TIMEOUT' <<<"$SOUT" && grep -q 'all 3 bash shards passed' <<<"$SOUT" \
+   && [ $((T1 - T0)) -ge 4 ]; then
+  pass "a 4s shard under a 6s bound PASSES ($((T1 - T0))s, rc 0, no TIMEOUT) — the bound does not false-trip a slow-but-healthy suite"
+else
+  fail "a 4s shard under a 6s bound did not pass cleanly (rc $SLOW_RC, $((T1 - T0))s): $(printf '%s' "$SOUT" | tail -2 | tr '\n' '|')"
+fi
+# CONTROL: the SAME fixture with a timer that fires at HALF the configured bound must go RED. Without
+# this, the arm above cannot distinguish "the bound is respected" from "the bound is ignored".
+HALFFIX="$TMP/slowok-half"
+stage_fixture "$HALFFIX" 4
+awk '
+  /^  sleep "\$shard_bound" &$/ { print "  sleep \"$((shard_bound / 2))\" &"; next }
+  { print }
+' "$HALFFIX/scripts/runner.sh" >"$TMP/runner-halfbound.sh"
+if cmp -s "$HALFFIX/scripts/runner.sh" "$TMP/runner-halfbound.sh"; then
+  fail "the half-bound mutation did not change the runner — the 'slow shard passes' arm has no control"
+else
+  cp "$TMP/runner-halfbound.sh" "$HALFFIX/scripts/runner.sh"
+  HANG_PID_DIR="$TMP/pids-slowok" SHARD_BOUND=6 bash "$HALFFIX/scripts/runner.sh" >"$TMP/slowok-half.out" 2>&1
+  HALF_RC=$?
+  HOUT="$(cat "$TMP/slowok-half.out")"
+  if [ "$HALF_RC" -eq 1 ] && grep -q 'TIMEOUT after 6s' <<<"$HOUT"; then
+    pass "control: a timer firing at HALF the configured bound reds that same shard — the arm can see a mistimed bound"
+  else
+    fail "control: a half-length timer did not red the 4s shard (rc $HALF_RC): $(printf '%s' "$HOUT" | tail -2 | tr '\n' '|')"
+  fi
+fi
+
 echo ""
 if [ "$failures" -eq 0 ]; then
   echo "✅ run-bash-shards-bound suite passed (${checks} assertions)"
