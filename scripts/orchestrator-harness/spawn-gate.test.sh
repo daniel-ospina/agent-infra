@@ -1870,6 +1870,23 @@ nd6="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/mixedO" HOME="$ND/home3" PATH=
        bash -c '. "$1"; if spawn_gate_load_capacity; then echo COMPLETE; else echo REFUSED; fi' _ "$ND/gate/pi" 2>&1)"
 case "$nd6" in *COMPLETE*) rc=0 ;; *) rc=1 ;; esac
 ck "a STALE \$O copy is SKIPPED and the complete copy further along is used — not a box-wide stall ($nd6)" $rc
+# ⛔ A SKIPPED CANDIDATE'S CONFIG BLOCK MUST NOT RIDE ALONG (cycle-4 review, P1 — measured). Every
+# `CAP_*` knob is assigned BEFORE any function is defined, so sourcing a broken candidate in the
+# gate's OWN shell left ITS floor in force while the gate used another file's arithmetic: a broken
+# `$O` copy setting `CAP_MIN_FORK_HEADROOM=1` plus a complete copy reporting 5 pids of headroom
+# produced `state=ok` and LAUNCHED pi. Candidates are validated in a subshell now, and only the
+# winner is sourced — so this arm is refused by the GOOD file's floor.
+mkdir -p "$ND/poison" "$ND/home4/orchestrator"
+printf 'CAP_MIN_FORK_HEADROOM=1\n' > "$ND/poison/capacity.sh"
+cat > "$ND/home4/orchestrator/capacity.sh" <<'PIGOOD'
+cap_procs_pair_vars() { printf -v "$1" '%s' 995; printf -v "$2" '%s' 1000; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { printf -v "$3" '%s' "$(( $2 - $1 ))"; return 0; }
+cap_fork_probe() { :; }
+PIGOOD
+nd7="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/poison" HOME="$ND/home4" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s|mod=%s" "$s" "$d" "${SPAWN_GATE_CAP_MOD:-}"' _ "$ND/gate/pi" 2>&1)"
+case "$nd7" in *'state=refused'*'min_fork_headroom=200'*"mod=$ND/home4/orchestrator/capacity.sh"*) rc=0 ;; *) rc=1 ;; esac
+ck "a skipped candidate's CAP_MIN_FORK_HEADROOM does NOT survive into the winner — the floor is the GOOD file's, and the module is NAMED by PATH [$nd7]" $rc
 # the RESOLVER fix: `O` unset, but the DOCUMENTED default for it ($HOME/orchestrator) holds the
 # instrument — present rather than merely reported, which is the preferred half of the remedy.
 mkdir -p "$ND/home2/orchestrator"; cp "$cap_abspath" "$ND/home2/orchestrator/capacity.sh"

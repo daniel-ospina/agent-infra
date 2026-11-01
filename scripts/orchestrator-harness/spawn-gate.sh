@@ -1681,6 +1681,10 @@ SPAWN_GATE_CAP_TRIED=""
 # not a sentence: telling an operator a file is missing when it is present and truncated sends them to
 # look for the wrong defect (fresh review, P2).
 SPAWN_GATE_CAP_FAULT=""
+# WHICH module answered — the path that won the walk, or `preloaded`. A gate that consumes a module it
+# cannot name is a gate an operator cannot audit, and cycle 4 measured exactly that: a skipped
+# candidate's config block could ride along with another file's arithmetic and nothing said so.
+SPAWN_GATE_CAP_MOD=""
 # The functions a COMPLETE `capacity.sh` provides to this gate. A copy truncated at a function boundary
 # can satisfy the FIRST one and lack the rest — and then `cap_h_for_vars` fails, the headroom arithmetic
 # is skipped, the two-fork probe passes and the gate answers `ok` with its arithmetic arm silently
@@ -1699,12 +1703,12 @@ spawn_gate_load_capacity() {
   # `SPAWN_GATE_CAP_TRIED` names it as PRELOADED, because this is the one place a mixed pair — this
   # gate consuming a `capacity.sh` someone else loaded — can be seen at all.
   _cap_mod_missing >/dev/null 2>&1 && {
-    CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_TRIED='(preloaded in the calling shell)'; SPAWN_GATE_CAP_FAULT=""
+    CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_TRIED='(preloaded in the calling shell)'; SPAWN_GATE_CAP_MOD='preloaded'; SPAWN_GATE_CAP_FAULT=""
     return 0
   }
-  local _sgc_d _sgc_here _sgc_bad=""
+  local _sgc_d _sgc_here _sgc_bad="" _sgc_probe=""
   _sgc_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-  SPAWN_GATE_CAP_TRIED=""
+  SPAWN_GATE_CAP_TRIED=""; SPAWN_GATE_CAP_MOD=""
   # `${X:+…}` so an UNSET HOME/O/AGENT_INFRA_PATH contributes NO candidate — a bare `"$HOME/orchestrator"`
   # with HOME unset would search `/orchestrator` and claim it had tried something real.
   # ⛔ A BROKEN CANDIDATE IS SKIPPED, NOT FATAL (cycle-3 review, P2). Breaking on the first candidate
@@ -1712,23 +1716,34 @@ spawn_gate_load_capacity() {
   # `$O/capacity.sh` is a documented state — into a refusal for every spawn on a box that has a
   # complete copy one candidate further along. That is the box-wide stall this change exists to
   # remove, re-introduced by the fix for it.
+  # ⛔ AND EVERY CANDIDATE IS VALIDATED IN A SUBSHELL BEFORE ANY OF IT IS SOURCED HERE (cycle-4 review,
+  # P1 — measured). `capacity.sh` assigns its whole `CAP_*` knob namespace BEFORE it defines any
+  # function, so sourcing a broken candidate in THIS shell left its knobs in force and the gate then
+  # enforced the BROKEN file's floor while using the good file's arithmetic: a broken `$O` copy setting
+  # `CAP_MIN_FORK_HEADROOM=1`, followed by a complete copy reporting `procs=995/1000 headroom=5`,
+  # produced `state=ok` and launched pi — the exact false PASS this change exists to close, with
+  # nothing logged. A subshell cannot poison this shell, so the winner is the only file ever sourced.
   for _sgc_d in "${O:-}" "$_sgc_here" \
                 "${AGENT_INFRA_PATH:+$AGENT_INFRA_PATH/scripts/orchestrator-harness}" \
                 "${HOME:+$HOME/orchestrator}" "${HOME:+$HOME/.pi/agent/scripts}"; do
     [ -n "$_sgc_d" ] || continue
     SPAWN_GATE_CAP_TRIED="${SPAWN_GATE_CAP_TRIED}${SPAWN_GATE_CAP_TRIED:+ }$_sgc_d"
     [ -f "$_sgc_d/capacity.sh" ] || continue
-    # shellcheck source=/dev/null
-    if ! . "$_sgc_d/capacity.sh" 2>/dev/null; then
+    _sgc_probe="$( ( # shellcheck source=/dev/null
+                     . "$_sgc_d/capacity.sh" 2>/dev/null || { printf 'SOURCEFAIL'; exit 0; }
+                     _cap_mod_missing 2>/dev/null | tr '\n' ' ' ) )"
+    if [ -z "$_sgc_probe" ]; then
+      # shellcheck source=/dev/null
+      if . "$_sgc_d/capacity.sh" 2>/dev/null && _cap_mod_missing >/dev/null 2>&1; then
+        CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_MOD="$_sgc_d/capacity.sh"; SPAWN_GATE_CAP_FAULT=""
+        return 0
+      fi
+      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh validated in a subshell but could not be loaded here"
+    elif [ "$_sgc_probe" = 'SOURCEFAIL' ]; then
       _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh could NOT be sourced (corrupt or truncated copy)"
-    elif _cap_mod_missing >/dev/null 2>&1; then
-      CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_FAULT=""; return 0
     else
-      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh is INCOMPLETE — missing: $(_cap_mod_missing 2>/dev/null | tr '\n' ' ')"
+      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh is INCOMPLETE — missing: $_sgc_probe"
     fi
-    # A partial load leaves functions DEFINED in this shell, which would make the NEXT call's
-    # "already defined" check pass on a broken module. Unset them so a retry starts clean.
-    unset -f cap_procs_pair_vars cap_h_for_vars cap_fork_probe 2>/dev/null || true
   done
   if [ -n "$_sgc_bad" ]; then
     SPAWN_GATE_CAP_FAULT="not COMPLETE anywhere it was searched (${_sgc_bad#; }; searched: ${SPAWN_GATE_CAP_TRIED:-nothing})"
@@ -1761,11 +1776,11 @@ spawn_fork_state() {
     return 0
   fi
   if ! cap_procs_pair_vars _sf_p _sf_m _sf_src; then
-    printf -v "$_sf_dv" '%s' 'neither a process count nor a ceiling could be read'
+    printf -v "$_sf_dv" '%s' "neither a process count nor a ceiling could be read from mod=${SPAWN_GATE_CAP_MOD:-?}"
     return 0
   fi
   cap_h_for_vars "$_sf_p" "$_sf_m" _sf_h || _sf_h='?'
-  printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} headroom=${_sf_h} src=${_sf_src:-?}"
+  printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} headroom=${_sf_h} src=${_sf_src:-?} mod=${SPAWN_GATE_CAP_MOD:-?}"
   # ⛔ A NON-NUMERIC READING IS NOT "NO PRESSURE" (cycle-3 review, P1 — the same false-PASS class this
   # change exists to close). Measured: a `capacity.sh` whose `cap_h_for_vars` was present but wrote
   # nothing to `$3` left `_sf_h` EMPTY, and a non-numeric `CAP_MIN_FORK_HEADROOM` made `[ -lt ]` error
@@ -1774,17 +1789,17 @@ spawn_fork_state() {
   # non-numeric value on either side now REFUSES under `nodeploy`, because that is a broken instrument
   # or a broken knob, not an unmeasurable box.
   if [ "$_sf_h" != 'unbounded' ] && ! is_num "$_sf_h"; then
-    printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} but cap_h_for_vars produced NO NUMBER (headroom='${_sf_h}'), so the fork floor cannot be decided"
+    printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} but cap_h_for_vars produced NO NUMBER (headroom='${_sf_h}') from mod=${SPAWN_GATE_CAP_MOD:-?}, so the fork floor cannot be decided"
     printf -v "$_sf_sv" '%s' 'nodeploy'
     return 0
   fi
   if ! is_num "${CAP_MIN_FORK_HEADROOM:-200}"; then
-    printf -v "$_sf_dv" '%s' "CAP_MIN_FORK_HEADROOM='${CAP_MIN_FORK_HEADROOM:-}' is not a number, so the fork floor cannot be decided (procs=${_sf_p}/${_sf_m}, headroom=${_sf_h})"
+    printf -v "$_sf_dv" '%s' "CAP_MIN_FORK_HEADROOM='${CAP_MIN_FORK_HEADROOM:-}' is not a number (it came from mod=${SPAWN_GATE_CAP_MOD:-?}), so the fork floor cannot be decided (procs=${_sf_p}/${_sf_m}, headroom=${_sf_h})"
     printf -v "$_sf_sv" '%s' 'nodeploy'
     return 0
   fi
   if [ "$_sf_h" != 'unbounded' ] && [ "$_sf_h" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
-    printf -v "$_sf_dv" '%s' "headroom=${_sf_h} < min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200} (procs=${_sf_p}/${_sf_m}, src=${_sf_src:-?})"
+    printf -v "$_sf_dv" '%s' "headroom=${_sf_h} < min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200} (procs=${_sf_p}/${_sf_m}, src=${_sf_src:-?}, mod=${SPAWN_GATE_CAP_MOD:-?})"
     printf -v "$_sf_sv" '%s' 'refused'
     return 0
   fi
@@ -1792,11 +1807,11 @@ spawn_fork_state() {
   # rc 254), so the probe must not share fate with the caller it is protecting.
   ( cap_fork_probe ) >/dev/null 2>&1 || _sf_prc=$?
   if [ "$_sf_prc" -eq 254 ]; then
-    printf -v "$_sf_dv" '%s' "the two-fork probe could not fork (rc=254 EAGAIN) with procs=${_sf_p}/${_sf_m}"
+    printf -v "$_sf_dv" '%s' "the two-fork probe could not fork (rc=254 EAGAIN) with procs=${_sf_p}/${_sf_m} (mod=${SPAWN_GATE_CAP_MOD:-?})"
     printf -v "$_sf_sv" '%s' 'refused'
     return 0
   fi
-  [ "$_sf_prc" -eq 0 ] || { printf -v "$_sf_dv" '%s' "the two-fork probe could not be read (rc=$_sf_prc)"; return 0; }
+  [ "$_sf_prc" -eq 0 ] || { printf -v "$_sf_dv" '%s' "the two-fork probe could not be read (rc=$_sf_prc) (mod=${SPAWN_GATE_CAP_MOD:-?})"; return 0; }
   printf -v "$_sf_sv" '%s' 'ok'
   return 0
 }
