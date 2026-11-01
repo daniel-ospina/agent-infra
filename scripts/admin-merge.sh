@@ -97,24 +97,28 @@
 # branch re-created the same rot: the numbers below were re-located by their quotes and
 # corrected — which is the rule working, not an exception to it). A THIRD move re-created
 # it once more: merging main into this branch pushed the job :970 -> :993 and
-# `script-validate` ci-main.yml:376 -> :386, and every coordinate below was re-located by
+# `script-validate` ci-main.yml:376 -> :403, and every coordinate below was re-located by
 # its quote again, in the same commit that moved it — because a citation that rots in the
 # very commit that moves the lines reads to the next lane as proof the claim is false.
 # Re-locate by the quote, and fix the number when you move it. A FOURTH move (the merge that
 # resolved this branch's conflicts) pushed every ci.yml coordinate again — +64 for the four job
 # coordinates and +11 for the :395 citation — and each was re-located by its quote in that same
-# commit; ci-main.yml's coordinates did not move.
-#   * ci.yml:1057 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
-#     `shard: [1, 2, …]` at :1147, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
+# commit; ci-main.yml's coordinates did not move. A FIFTH pass: `ci-main.yml` moved on main AND
+# this branch's #3174 `env:` block + comments moved it further (+22 for the five step coordinates,
+# +52 for the shard call), while `ci.yml` moved on main independently and left its four citations
+# stale — so every number in this block was re-located by its QUOTE, one at a time, and each now
+# names the line it claims. Re-locate by the quote; never by arithmetic on the old number.
+#   * ci.yml:1160 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
+#     `shard: [1, 2, …]` at :1250, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
 #     one check per slice, and each slice's step is `bash scripts/run-bash-shards.sh`
-#     (ci.yml:1185, `run: bash scripts/run-bash-shards.sh`);
-#   * ci-main.yml:388 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
-#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:476 is that
+#     (ci.yml:1288, `run: bash scripts/run-bash-shards.sh`);
+#   * ci-main.yml:405 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
+#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:528 is that
 #     call: `bash scripts/run-bash-shards.sh`; main publishes ONE check named
-#     `script-validate` (ci-main.yml:386);
-#   * ci.yml:1159 — "ci-main.yml's `script-validate`: one runtime for the list, in
-#     both lanes" (also ci.yml:406, "today — ci-main.yml's script-validate job runs bash
-#     shards only"). ⛔ NOT ci.yml:1060: that line is the HISTORY of the pre-#1369 split
+#     `script-validate` (ci-main.yml:403);
+#   * ci.yml:1262 — "ci-main.yml's `script-validate`: one runtime for the list, in
+#     both lanes" (also ci.yml:464, "today — ci-main.yml's script-validate job runs bash
+#     shards only"). ⛔ NOT ci.yml:1163: that line is the HISTORY of the pre-#1369 split
 #     ("while main's `script-validate` ran the bash sweeps + the hermetic suites") and
 #     describes a body WIDER than the list, so citing it here would argue AGAINST the
 #     containment this pair rests on (review cycle 3).
@@ -122,9 +126,9 @@
 #   base reports this program under the other lane's name.
 #
 # ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
-# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:444
-# `node --check`, :456 the lane-parity guard, :462 its mutation self-test, :476 the shard
-# list) and the other two are `actions/checkout` (:429) and `actions/setup-node` (:434) —
+# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:466
+# `node --check`, :478 the lane-parity guard, :484 its mutation self-test, :528 the shard
+# list) and the other two are `actions/checkout` (:451) and `actions/setup-node` (:456) —
 # while a `bash-suites (<n>)` slice runs only the shard list. So a red under that name may
 # be the shard list's red — or ANY other step's, including the setup ones. The equivalence
 # therefore establishes that the base RUNS this program and carries A red under its name;
@@ -1394,7 +1398,7 @@ fetch_run_failed_job_names() {
 # ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
 # `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
 # programs that PR job runs — the lane-parity guard and its mutation self-test — are
-# STEPS inside `script-validate` (ci-main.yml:456, :462). So a `bash-suites-gate` red
+# STEPS inside `script-validate` (ci-main.yml:478, :484). So a `bash-suites-gate` red
 # ALSO has a base counterpart under that name, and this ONE pair does not map it: that
 # refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
 # scoping decision recorded on #2610), NOT a claim that the programs differ. Mapping
@@ -1601,11 +1605,11 @@ named_unattributable_runs() {
               say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
               say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
               say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
-              say_err "       (.github/workflows/ci-main.yml:476), and '${name}' is one shard of that same"
-              say_err "       list on a PR (.github/workflows/ci.yml:1057/1185), one runtime in both lanes"
-              say_err "       (ci.yml:1159). The base therefore carries a red under a name that RUNS this"
-              say_err "       list — but that job has FIVE other steps (node --check :444, the lane-parity"
-              say_err "       guard :456, its self-test :462, plus checkout :429 and setup-node :434), so the"
+              say_err "       (.github/workflows/ci-main.yml:528), and '${name}' is one shard of that same"
+              say_err "       list on a PR (.github/workflows/ci.yml:1160/1288), one runtime in both lanes"
+              say_err "       (ci.yml:1262). The base therefore carries a red under a name that RUNS this"
+              say_err "       list — but that job has FIVE other steps (node --check :466, the lane-parity"
+              say_err "       guard :478, its self-test :484, plus checkout :451 and setup-node :456), so the"
               say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
               say_err "       an established identity: no identity was produced, so nothing here is"
               say_err "       comparable yet"
