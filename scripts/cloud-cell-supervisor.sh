@@ -307,7 +307,17 @@ resolve_repo() {
     if [ -n "${OR:-}" ]; then
       url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
       case "$url" in
-        "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+        # ⛔ THIS LIST IS A COPY AND MUST NOT DRIFT (review of #3188, P2). It is the SAME predicate as
+        # `refresh-candidates.sh`'s three copies (its REPO-set arm, its candidate loop, and `_pair`'s
+        # cause classifier), and the two entry points are documented as agreeing wherever the origin is
+        # URL-shaped (`refresh-candidates.sh`, the DECLARED RESIDUAL note in `resolve_repo`). Adding the
+        # trailing-slash spellings over there and not here made that sentence FALSE for a shape the
+        # other verbs accept: a checkout whose origin is `https://github.com/<owner>/<repo>/` derived a
+        # repo in `refresh --check` and then died here "REPO is not set and no single checkout could be
+        # derived" — a fail-closed false block (#1745/#1856: two authorities disagreeing).
+        # `(8)` in this file's suite pins the four spellings through THIS copy, and `(h5)` in
+        # `refresh-provision.test.sh` fails if any copy's arm list differs from the others.
+        "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/") ;;
         *) continue ;;
       esac
     fi

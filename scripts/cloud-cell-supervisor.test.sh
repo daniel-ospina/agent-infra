@@ -2094,6 +2094,62 @@ qsup start "$Q/tortoise-repo" "$Q/st-http"
                   || bad "start rejected an http:// origin — $Q_OUT"
 git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
 
+# (7d) A TRAILING SLASH IS THE SAME REPO HERE TOO — and this copy of the accept list had drifted
+# (review of #3188, P2). `refresh-candidates.sh` had already learned that `git remote add` accepts
+# `https://github.com/<owner>/<repo>/` and that humans type it, so its three copies of the predicate
+# carry the four trailing-slash spellings. THIS copy (in `resolve_repo`, the auto-derive path a cell
+# with no exported `$REPO` takes) did not, so the two entry points disagreed on a URL-shaped origin:
+# `refresh --check` derived the checkout and proceeded, `start`/`check` died "REPO is not set and no
+# single checkout could be derived" — the #1745/#1856 two-authorities class, in the fail-closed
+# direction. Every arm below is a POSITIVE derivation (not a pair of absences) and each spelling is
+# its own fixture, so deleting one spelling from THIS copy reddens exactly its own row. The control at
+# the end keeps them honest: a trailing-slash origin naming ANOTHER repo is still refused.
+T7D="$T/trailslash"; mkdir -p "$T7D"
+T7D_N=0
+for t7d_spelling in \
+  "https://github.com/acme/trailslash/" \
+  "https://github.com/acme/trailslash.git/" \
+  "git@github.com:acme/trailslash/" \
+  "git@github.com:acme/trailslash.git/"
+do
+  T7D_N=$((T7D_N + 1))
+  t7d_repo="$T7D/repo-$T7D_N"
+  ai_init_repo "$t7d_repo"
+  git -C "$t7d_repo" remote set-url origin "$t7d_spelling"
+  t7d_real="$(cd "$t7d_repo" && pwd -P)"
+  T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-$T7D_N" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+             ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-$T7D_N-$$" O="$T7D/o-$T7D_N" \
+             WORKDIR="$t7d_repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+             HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+  case "$T7D_OUT" in
+    *"REPO was not set — using $t7d_real"*)
+      ok "(7d) the auto-derive adopts a checkout whose origin is '$t7d_spelling' (trailing slash = same repo)" ;;
+    *)
+      bad "(7d) FALSE-BLOCKED a trailing-slash origin '$t7d_spelling' (rc=$T7D_RC) — the other verbs derive it: $T7D_OUT" ;;
+  esac
+  case "$T7D_OUT" in
+    *"no single checkout could be derived"*)
+      bad "(7d) '$t7d_spelling' reached the underivable refusal" ;;
+    *)
+      ok "(7d) …and '$t7d_spelling' never reaches the underivable refusal" ;;
+  esac
+done
+# The CONTROL: the same trailing-slash SHAPE naming another repo is still not adopted, so the four rows
+# above pin the accept list rather than "a trailing slash is always accepted". (Unique slugs on both
+# sides keep this hermetic: no box has a checkout whose origin is acme/trailslash*.)
+mkdir -p "$T7D/other" "$T7D/st-other"; ai_init_repo "$T7D/other"
+git -C "$T7D/other" remote set-url origin "https://github.com/acme/something-else/"
+T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-other" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+           ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-other-$$" O="$T7D/o-other" \
+           WORKDIR="$T7D/other" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+           HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+[ "$T7D_RC" -ne 0 ] && ok "(7d) the trailing-slash shape naming ANOTHER repo is still REFUSED" \
+                   || bad "(7d) adopted a trailing-slash origin that names another repo — $T7D_OUT"
+case "$T7D_OUT" in
+  *"no single checkout could be derived"*) ok "(7d) …and the refusal is the derivation (not an unrelated precondition)" ;;
+  *) bad "(7d) the control refused for an UNRELATED reason, so the four rows above prove nothing: $T7D_OUT" ;;
+esac
+
 # (8) `check` refuses the same pair `start` refuses — a preflight that says YES where `start` dies is
 # a FALSE PASS on exactly the question its verdict answers.
 qsup check "$Q/agent-repo" "$Q/st-check" OR=daniel-ospina/tortoise

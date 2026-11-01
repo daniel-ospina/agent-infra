@@ -873,6 +873,49 @@ ck "(h3) …and the log makes no #1901 identity claim about it" "$r"
 case "$OUT" in *"unset OR"*) r=1 ;; *) r=0 ;; esac
 ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 
+# ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
+# ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here
+# (the REPO-set arm, the candidate loop, and `_pair`'s cause classifier) and a fourth in
+# `scripts/cloud-cell-supervisor.sh`'s OWN `resolve_repo`, which is the auto-derive path a cell with no
+# exported `$REPO` takes. The trailing-slash spellings were added to these three and NOT to that one,
+# so the two entry points disagreed on a URL-shaped origin — `refresh --check` derived the checkout,
+# `cloud-cell-supervisor.sh check` died "REPO is not set and no single checkout could be derived" —
+# which also made this file's DECLARED RESIDUAL paragraph ("the two verbs agree wherever the origin is
+# URL-shaped") false as written. That paragraph is the thing a future lane trusts when deciding the
+# entry points agree, and a per-copy behavioural arm in the supervisor's own suite (its `(7d)`) pins
+# the BEHAVIOUR; this row pins the LOCKSTEP, so the next spelling added to one copy and not the others
+# reddens here instead of shipping a second divergence.
+# ⛔ STATED RESIDUAL: if a future change SINGLE-SOURCES the predicate (both files calling one helper),
+# the supervisor's copy disappears and this row reds. That is a deliberate over-block — re-pin the row
+# consciously, because the cheap alternative (an absence-tolerant comparison) is green in exactly the
+# case this arm exists to catch.
+RP_ROOT="$(cd "$HERE/../.." && pwd -P)"
+RP_SUP="$RP_ROOT/scripts/cloud-cell-supervisor.sh"
+# The arm list itself, whitespace-normalised and with a trailing ` ;;` dropped: the three `case` copies
+# end in `;;`, `_pair`'s copied list does not, and that difference is a syntax detail — not the
+# predicate. Anything else (a missing or extra spelling here) is the drift.
+h5_lines() { grep -n '"\$OR"|"\$OR\.git"' "$1" 2>/dev/null | sed 's/^[0-9]*://' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]*;;$//'; }
+H5_REF="$(h5_lines "$REFRESH" | head -1)"
+H5_SUP="$(h5_lines "$RP_SUP")"
+ck "(h5) the supervisor carries its own copy of resolve_repo's accept list (found in $RP_SUP)" "$([ -n "$H5_SUP" ]; echo $?)"
+ck "(h5) …and the SHIPPED refresh-candidates.sh carries at least one (found here)" "$([ -n "$H5_REF" ]; echo $?)"
+H5_EXPECT="$([ -n "$H5_REF" ] && echo "$H5_REF" || echo "$H5_SUP")"
+H5_DISTINCT="$( { h5_lines "$REFRESH"; h5_lines "$RP_SUP"; } | sort -u | grep -c . )"
+ck "(h5) every copy lists the SAME spellings (distinct arm lists: $H5_DISTINCT — 1 means no drift)" "$([ "$H5_DISTINCT" -eq 1 ]; echo $?)"
+H5_TS=0
+for h5_spelling in '*"/$OR/"' '*"/$OR.git/"' '*":$OR/"' '*":$OR.git/"'; do
+  case "$H5_EXPECT" in *"$h5_spelling"*) H5_TS=$((H5_TS+1)) ;; esac
+done
+ck "(h5) …and the shared list carries all four trailing-slash spellings ($H5_TS of 4)" "$([ "$H5_TS" -eq 4 ]; echo $?)"
+# ⛔ NAMING THE DRIFT, not just counting it: when a copy diverges, this row prints the outlier so the
+# operator sees WHICH file to edit instead of being sent to re-derive four case arms by hand.
+H5_OUTLIERS="$( { h5_lines "$REFRESH"; h5_lines "$RP_SUP"; } | sort | uniq -u | head -3 )"
+case "$H5_OUTLIERS" in
+  "") r=0 ;;
+  *) printf '  (h5) divergent arm list(s):\n%s\n' "$(printf '%s\n' "$H5_OUTLIERS" | sed 's/^/         /')"; r=1 ;;
+esac
+ck "(h5) …and no copy's list is an outlier" "$r"
+
 echo
 echo "==> $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
