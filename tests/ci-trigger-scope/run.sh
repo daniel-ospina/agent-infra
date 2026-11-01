@@ -56,6 +56,10 @@ WL="$ROOT/.github/workflows/workflow-lock.yml"
 HSS="$ROOT/.github/workflows/harness-single-source.yml"
 PC="$ROOT/.github/workflows/pipeline-compliance.yml"
 
+# ⛔ SKIP is a COUNTER, not a measurement this suite currently makes: every arm is mandatory, so no
+# arm below can be skipped and the final line's SKIP is structurally 0. It exists so that a future arm
+# has an honest place to record a host that genuinely cannot run it, rather than being silently
+# dropped — a silent skip is the no-op-gate class this repo names. If you add a skip, say why.
 PASS=0; FAIL=0; SKIP=0
 pass() { PASS=$((PASS + 1)); printf '   ✅ %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf '   ❌ %s\n' "$*"; }
@@ -168,6 +172,24 @@ if apply_mutation "$WL" "$WL_NOSYNC" \
   esac
 fi
 
+echo "== 3b. MUTANT: a \`paths:\` filter added to the base-branch checker =="
+# Review cycle 1, P2 — the positive assertion that this trigger carries `types` and NOTHING else. A
+# filter here narrows a gate that validates every workflow file in the merge result, and every
+# assertion about the trigger would still read true.
+WL_PATHS="$TMP/wl-paths.yml"
+if apply_mutation "$WL" "$WL_PATHS" \
+  "    types: [opened, synchronize, reopened]" \
+  "    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/**'" \
+  "a narrowing filter must be constructible"; then
+  run_check 1 "a \`paths:\` on \`pull_request_target:\` is REFUSED" WL_FILE="$WL_PATHS"
+  case "$LAST_OUT" in
+    *paths*) pass "the refusal NAMES the narrowing filter" ;;
+    *) fail "the refusal did not name the narrowing filter" ;;
+  esac
+fi
+
 echo "== 4. MUTANT: the \`types:\` key deleted (GitHub's default matches the values) =="
 WL_NOTYPES="$TMP/wl-notypes.yml"
 if apply_mutation "$WL" "$WL_NOTYPES" \
@@ -214,6 +236,33 @@ if apply_mutation "$PC" "$PC_NOEDIT" \
       - reopened" \
   "the asymmetry arm must be constructible"; then
   run_check 1 "pipeline-compliance losing \`edited\` is REFUSED (its #513 binding needs it)" PC_FILE="$PC_NOEDIT"
+fi
+
+echo "== 7b. MUTANT: a \`paths:\` filter added to the REQUIRED context =="
+# Review cycle 1, P1 — the second half of the asymmetry. Dropping `edited` there lets a forged body
+# marker ride a stale green; ADDING a path filter there makes the required context unsatisfiable
+# (GitHub keeps a filtered workflow's checks "Pending"), which blocks every merge.
+PC_PATHS="$TMP/pc-paths.yml"
+if apply_mutation "$PC" "$PC_PATHS" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+    paths:
+      - 'scripts/**'" \
+  "a filter on the required context must be constructible"; then
+  run_check 1 "a \`paths:\` filter on pipeline-compliance is REFUSED (it would leave the required context Pending)" \
+    PC_FILE="$PC_PATHS"
+  case "$LAST_OUT" in
+    *paths*) pass "the refusal NAMES the filter and the consequence" ;;
+    *) fail "the refusal did not name the filter" ;;
+  esac
 fi
 
 echo "== 8. ADMISSION: every path the doctor step can read is admitted =="

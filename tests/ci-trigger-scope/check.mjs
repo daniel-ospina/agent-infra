@@ -167,12 +167,33 @@ function trigger(region, childIndent, name, file) {
   return { lines, keys: keys || [] };
 }
 
+// extraFilters(keys, parent) — the filter keys a trigger declares that the caller does not allow.
+// A `paths:`/`paths-ignore:` on a gate WIDENS nothing: it NARROWS what the gate observes, silently,
+// while every assertion about the trigger still reads true (#1542's over-block class). On a required
+// context it is worse than silent — GitHub keeps a path-filtered workflow's checks "Pending", so the
+// context never reports and never merges.
+function extraFilters(keys, allowed) {
+  return keys.map((k) => k.key).filter((k) => !allowed.includes(k));
+}
+
 // ── the two facts this file owns ─────────────────────────────────────────────────────────────
 
 function checkWorkflowLock() {
   const text = read(WL_FILE);
   const { region, childIndent } = onRegion(text, WL_FILE);
   const t = trigger(region, childIndent, "pull_request_target", WL_FILE);
+
+  // ⛔ THIS TRIGGER CARRIES `types` AND NOTHING ELSE (review cycle 1, P2). `types` is a
+  // `--head-ref`-style coverage knob; a `paths:`/`branches:` filter next to it is a NARROWING, and
+  // this job validates EVERY workflow file in the merge result, so any diff it stops observing is a
+  // structural guard that silently stopped guarding. The positive assertion is deliberate: adding a
+  // filter here must be a visible edit to this test, not an invisible one to the workflow.
+  const extraWl = extraFilters(t.keys, ["types"]);
+  if (extraWl.length) {
+    findings.push(
+      `workflow-lock.yml's \`pull_request_target:\` declares [${extraWl.join(", ")}] besides \`types:\`. Any filter there NARROWS what this base-branch checker observes — it validates the merge result's workflow files for every PR, so a diff it stops seeing is a structural guard that silently stopped guarding, with every assertion about the trigger still green. The trigger's only filter is \`types:\`.`
+    );
+  }
 
   // The trigger must stay a pull_request_target: it is the reason the job runs from a copy the PR
   // cannot rewrite (see the workflow's own header). Losing it is not a narrowing, it is the gate
@@ -252,6 +273,19 @@ function checkPipelineComplianceUnchanged() {
   const text = read(PC_FILE);
   const { region, childIndent } = onRegion(text, PC_FILE);
   const t = trigger(region, childIndent, "pull_request", PC_FILE);
+
+  // ⛔ AND NO PATH FILTER UNDER IT (review cycle 1, P1). This is the change the current sweep most
+  // invites — "finish the job, filter the required check too" — and it is the one that hurts most:
+  // GitHub documents that "if a workflow is skipped due to path filtering … then checks associated
+  // with that workflow will remain in a 'Pending' state. A pull request that requires those checks
+  // to be successful will be blocked from merging." So `pipeline-compliance` is the ONE workflow in
+  // this repo that must never carry `paths:`/`paths-ignore:`, and this arm is where that is said.
+  const extraPc = extraFilters(t.keys, ["branches", "types"]);
+  if (extraPc.length) {
+    findings.push(
+      `pipeline-compliance.yml's \`pull_request:\` declares [${extraPc.join(", ")}]. It is the repo's ONLY required status context, so a path filter here does not narrow a check — it makes the required context UNSATISFIABLE on every head whose diff does not match: GitHub keeps a path-filtered workflow's checks "Pending", and a PR that requires them cannot merge. Allowed filter keys on this trigger are \`branches\` and \`types\` only.`
+    );
+  }
   const idx = t.keys.findIndex((k) => k.key === "types");
   if (idx < 0) {
     findings.push(
