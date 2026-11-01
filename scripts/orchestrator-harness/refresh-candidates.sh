@@ -281,11 +281,36 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
   if [ -n "$REPO" ]; then
     url="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
     case "$url" in
-      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      # ⛔ THE TRAILING-SLASH SPELLINGS ARE PART OF THE TARGET (review of #3188, P2). `git remote add` accepts
+      # `https://github.com/<owner>/<repo>/` and humans type it; without these arms such a checkout was
+      # refused as "NOT the queue target" and the recorded cause called the RIGHT repo a DIFFERENT one.
+      # `resolve_repo`'s two callers rely on this ONE predicate; the cause predicates carry the same list.
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/") ;;
       "") echo "[refresh] NOT PROVISIONABLE: \$REPO ($REPO) has no readable 'origin' remote, so this pass cannot prove it is a checkout of $OR — an unproven checkout is how the wrong repo's issues get queued (#1901)"
           echo "[refresh]   fix: git -C $REPO remote set-url origin https://github.com/$OR.git  (or unset REPO and let this script derive one)"
           return 1 ;;
       *) case "$url" in
+           # ⛔ A `file://` URL NAMES NO REPO IDENTITY (review cycle 14, P2). It is URL-SHAPED, so the
+           # arm below reported it as "NOT the queue target … pre-flighting one repo's issues against
+           # another repo's tree is #1901" — an identity claim this pass never measured, about the
+           # shape `repo-slug.sh:52` refuses for exactly that reason, and about the one this file's own
+           # header (:21-23) calls a legitimate local mirror. The refusal is right; the identity claim
+           # is not. Same words as the recorded cause (`_pair`'s `file://*)` arm), so log and record
+           # cannot disagree.
+           file://*)
+             echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is the local mirror $url — a file:// URL names no repo identity, so it cannot prove it is a checkout of \$OR ($OR)"
+             echo "[refresh]   refusing is deliberate: a path cannot certify a queue target. Retrying cannot fix it, and the checkout is not evidence of a DIFFERENT repo either"
+             # ⛔ AND THE REMEDY MUST BE ONE THAT CAN WORK (review cycles 15-16, P2). The local-path
+             # arm's "or unset OR to use the harness default" was copied here, where it does not hold the
+             # way it does there: that arm is GATED on OR_DECLARED, while this one is not. ⛔ AND NO
+             # UNIVERSAL MAY BE SUBSTITUTED FOR IT (measured, cycle 16): "a file:// origin is refused
+             # whether or not $OR was declared" is FALSE — the accept list above matches the path's
+             # TRAILING segment, so a mirror whose tail spells `<owner>/<repo>` is ACCEPTED, and in that
+             # shape unsetting OR changes which slug the tail is matched against. So the line states the
+             # operant remedy and claims nothing about the gate. `(h3)` pins that the copied clause is
+             # absent.
+             echo "[refresh]   fix: give the checkout a real remote (git -C $REPO remote set-url origin https://github.com/$OR.git)"
+             return 1 ;;
            # A URL-shaped origin names a repo that can be COMPARED, so a difference is a refusal.
            *://*|*@*:*)
              echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is $url — NOT the queue target $OR"
@@ -324,7 +349,11 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
     git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
     url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
     case "$url" in
-      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      # ⛔ THE TRAILING-SLASH SPELLINGS ARE PART OF THE TARGET (review of #3188, P2). `git remote add` accepts
+      # `https://github.com/<owner>/<repo>/` and humans type it; without these arms such a checkout was
+      # refused as "NOT the queue target" and the recorded cause called the RIGHT repo a DIFFERENT one.
+      # `resolve_repo`'s two callers rely on this ONE predicate; the cause predicates carry the same list.
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/") ;;
       *) continue ;;
     esac
     REPO="$(cd "$cand" && pwd -P)" || continue
@@ -1823,7 +1852,41 @@ fi
 # stands in must not pre-flight anything (the scout worktree is created INSIDE $REPO below).
 if ! resolve_repo; then
   [ -n "$REPO" ] || repo_unresolved
-  exit "$EXIT_NOT_PROVISIONABLE"
+  # ⛔ THIS WAS THE LAST BARE `exit` IN THE PROVISION STAGE — AND IT RECORDED NO CAUSE (agent-infra#3174,
+  # measured 2026-11-01). `resolve_repo` prints its own refusal to the LOG and then this line exited with
+  # rc=3, so `refresh_on_exit` wrote `why=… the failing step recorded no cause` into
+  # `state/refresh-last` — the exact #2229 symptom the other exits in this stage were converted to
+  # `provision_fail` to remove. The controller's `[dispatch] BLOCKED` line quotes THAT FILE, not the
+  # log, so the one sentence an operator reads named nothing while the real reason sat one line above it.
+  # ⛔ THE CAUSE NAMES ONLY WHAT WAS MEASURED (review cycles 1-2, P2). It rendered an unset `$REPO` as
+  # `$REPO ('')` beside "a local-path origin cannot prove a DECLARED target" — three claims about an
+  # origin that was never read, in the one string `refresh_cause_brief` quotes. `resolve_repo` has
+  # FOUR distinct REPO-set refusals (unreadable origin, a `file://` mirror that names no repo identity,
+  # a URL naming another repo, a local path that cannot prove a DECLARED target) plus the unset-`$REPO`
+  # search, so this names the shape it actually read instead of guessing one. Pointing at "the lines above" is NOT an option here: that is the
+  # `the failing step recorded no cause` sentence this exit is being fixed to stop writing.
+  if [ -n "$REPO" ]; then
+    _origin="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
+    case "$_origin" in
+      '') _pair="\$REPO ('${REPO}') has NO READABLE 'origin' remote, so it cannot prove it is a checkout of \$OR ('${OR:-}')" ;;
+      # ⛔ A `file://` URL NAMES NO REPO IDENTITY (review cycle 13, P2). It matched `*://*` and was
+      # therefore reported as "NOT the queue target … a DIFFERENT repo, and no retry can mend a
+      # mismatch" — an identity claim this pass never measured, about a shape `repo-slug.sh:52`
+      # refuses for exactly that reason (and which the header of this file calls a legitimate local
+      # mirror at :21-23). Its own arm, before the URL case.
+      file://*) _pair="\$REPO ('${REPO}') has the local-mirror 'origin' ${_origin} — a file:// URL names no repo identity, so it cannot prove it is a checkout of \$OR ('${OR:-}'; OR_DECLARED='${OR_DECLARED:-?}'); refusing is deliberate, since a path cannot certify a queue target" ;;
+      *://*|*@*:*)
+         case "$_origin" in
+           "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/")
+             _pair="\$REPO ('${REPO}') carries an 'origin' that names \$OR ('${OR:-}') yet the resolver refused it — see the refusal above (OR_DECLARED='${OR_DECLARED:-?}')" ;;
+           *) _pair="\$REPO ('${REPO}') has 'origin'=${_origin}, which is NOT the queue target \$OR ('${OR:-}') — a DIFFERENT repo, and no retry can mend a mismatch" ;;
+         esac ;;
+      *) _pair="\$REPO ('${REPO}') has the local-path 'origin' ${_origin}, which cannot prove a DECLARED \$OR ('${OR:-}'; OR_DECLARED='${OR_DECLARED:-?}')" ;;
+    esac
+  else
+    _pair="no \$REPO was set and no candidate checkout of \$OR ('${OR:-}') was found where this harness puts one (OR_DECLARED='${OR_DECLARED:-?}')"
+  fi
+  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=resolve-repo: $_pair"
 fi
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
