@@ -7430,7 +7430,7 @@ RAIL_LAST_TERMINAL_CHECK=0
 # age silently stays 0, meaning a lease can never expire. That is not hypothetical: this rail
 # is executed on Linux cells by `scripts/orchestrator-harness/cloud-cell-doctor.sh`. `date -r`
 # is portable across BSD and GNU and needs no capability probe (the repo already uses it in
-# `scripts/reap-lane-venvs.sh` for this exact reason, per the #1702 note in selftest.sh).
+# `scripts/orchestrator-harness/selftest.sh:3928` for this exact reason, per #1702).
 path_mtime() {
   local p="$1" m
   m="$(date -r "$p" +%s 2>/dev/null || true)"
@@ -7454,9 +7454,45 @@ rail_lock_release() {
 # holder — not the existence of the directory — is what decides. (A recycled pid could
 # make a dead holder look alive; that errs toward a duplicate NO-OP exit, never toward a
 # double merge, so it is the safe direction and is stated rather than discovered.)
+# rail_lock_restore <dir> <stale> — put a lease back, PROVING it landed.
+# ⛔ `mv a b` SUCCEEDS WHEN b EXISTS — it NESTS (`b/a`), exit 0 (review cycle 6 finding 1,
+# reproduced with two real rails). A naive "restore" therefore leaves the moved lease to
+# live INSIDE another rail's lease directory, and the rail that owns `b` later runs
+# `rm -rf "$dir"` on release — silently deleting the nested, still-live lease of a rail
+# that is mid-merge, after which a third rail can acquire. The old `|| rm -rf "$stale"`
+# fallback was the same hazard from the other side: it DELETED a lease the code had just
+# declared "someone else's". So: if the destination is taken, this execution does NOT
+# merge, does NOT delete anything, and says so.
+rail_lock_restore() {
+  local dir="$1" stale="$2"
+  if [ -e "$dir" ]; then
+    say_err "admin-merge: ✗ rail lease ${dir} was taken by ANOTHER rail while this one was stealing it, so the lease it moved ($stale) CANNOT be put back without nesting inside a live lease. This execution DELETES NOTHING and MERGES NOTHING. EXIT 75 (retryable): re-run the rail, which will re-read the lease from scratch."
+    exit 75
+  fi
+  if ! mv "$stale" "$dir" 2>/dev/null; then
+    say_err "admin-merge: ✗ could not restore the rail lease ${dir} from ${stale} — deleting NOTHING and merging NOTHING. EXIT 75 (retryable)."
+    exit 75
+  fi
+  return 0
+}
+
 rail_lock_acquire() {
   local key="$1" prefix dir holder started now age acquired=0 stale stolen expired=0 _m sage _t
   RAIL_LOCK_PR="${key##*-}"
+  # ⛔⛔ OFF BY DEFAULT — NOT SHIPPED AS A GATE (review cycle 6, MEASURED).
+  # The per-PR lease is NOT CERTIFIED and must not hold a merge back until it is. Six
+  # adversarial review cycles went at this, and the reclaim path — the path a SIGKILLed
+  # rail puts every later rail onto — still let TWO rails reach `acquired=1` in 2 of 40
+  # trials, reproducibly, after both the identity compare-and-swap and the bounded
+  # publish-wait. `mkdir` makes a lease visible an instant before its identity is written,
+  # and every scheme tried here either guesses across that gap or nests a restore inside a
+  # live lease. A double-held lease is a double merge, which is worse than the slot leak it
+  # was meant to fix, so the honest state is: the mechanism exists, it is measured, it is
+  # NOT trusted, and it is opt-in for whoever finishes it. Filed with the measurements.
+  #
+  # The two fixes that ARE certified and carry this PR — the terminal-state exit and the
+  # whole-attempt deadline — do not need this function and are always on.
+  [ "${ADMIN_MERGE_PER_PR_LEASE:-0}" -eq 1 ] || return 0
   # ⛔ A PR-LESS INVOCATION TAKES NO LEASE (finding 6, cycle 1). `--print-bounds` must work
   # on a bare invocation, and a key with an empty PR half would make EVERY PR-less run in
   # every repo collide on one lease.
@@ -7567,11 +7603,11 @@ rail_lock_acquire() {
             mkdir "$dir" 2>/dev/null && acquired=1
           else
             say_err "admin-merge: ↻ rail lease ${dir} has NO readable holder and has NOT expired (${sage}s of ${RAIL_LOCK_TTL}s) — that is a lease MID-PUBLICATION, not a dead one. RESTORING it rather than stealing a rail that is between mkdir and writing its pid."
-            mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
+            rail_lock_restore "$dir" "$stale"
           fi
         else
           say_err "admin-merge: ↻ rail lease ${dir}: this rail moved a lease owned by pid ${stolen} but had decided to steal ${holder:-<unreadable>} — the lease CHANGED between the read and the steal, so it is someone else's now. RESTORING it rather than stealing a running rail's lease."
-          mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
+          rail_lock_restore "$dir" "$stale"
         fi
       fi
     fi
@@ -7718,6 +7754,10 @@ validate_rail_bounds() {
   case "${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}" in
     ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_TERMINAL_CHECK_EVERY='${ADMIN_MERGE_TERMINAL_CHECK_EVERY}' — it must be a positive integer NUMBER OF SECONDS, or the terminal-state exit never fires."; exit 2 ;;
   esac
+  # ⛔ 0 IS NOT "CHECK EVERY POLL" (review cycle 6 finding 6): `[ $((now - last)) -ge 0 ]` is
+  # always true, so every guard poll issues a `gh pr view` — ~3600 calls/hour per rail in the
+  # silent spin branch, against exactly the rate limit this rail is careful about elsewhere.
+  [ "${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_TERMINAL_CHECK_EVERY='${ADMIN_MERGE_TERMINAL_CHECK_EVERY}' — 0 would issue a PR read on EVERY poll and burn the API budget. Set a positive number of seconds (default 60)."; exit 2; }
   return 0
 }
 

@@ -15305,12 +15305,17 @@ fi
 # — the inert-enforcer class. That is exactly how the lease's remaining reclaim race
 # shipped green through five review cycles: the test existed and never ran.
 RAIL_EXIT_TEST="$(dirname "${BASH_SOURCE[0]}")/rail-exit.test.sh"
-if [ -f "$RAIL_EXIT_TEST" ]; then
-  if bash "$RAIL_EXIT_TEST"; then
-    checks=$((checks + 1)); pass "(o) rail-exit.test.sh — terminal exit, whole-attempt deadline, per-PR lease"
-  else
-    checks=$((checks + 1)); fail "(o) rail-exit.test.sh FAILED — see its output above"
-  fi
+# ⛔ A MISSING TEST FILE IS A FAILURE, NOT A SKIP (review cycle 6 finding 3). The previous
+# guard made a renamed, deleted or sparse-checkout-missing suite a NO-OP — no check
+# counted, no failure, green summary — which is the inert-enforcer class this very block's
+# comment invokes. And pass/fail ALREADY increment `checks`, so the previous explicit
+# increment counted this block TWICE in the denominator (finding 4).
+if [ ! -f "$RAIL_EXIT_TEST" ]; then
+  fail "(o) rail-exit.test.sh is MISSING at $RAIL_EXIT_TEST — the terminal-exit/lease/deadline regression guard did not run"
+elif bash "$RAIL_EXIT_TEST"; then
+  pass "(o) rail-exit.test.sh — terminal exit, whole-attempt deadline, per-PR lease"
+else
+  fail "(o) rail-exit.test.sh FAILED — see its output above"
 fi
 
 if [ "$failures" -gt 0 ]; then
