@@ -514,6 +514,24 @@ ck "…and the record was written (the flags survived the space)" "$([ -s "$O4/.
 ck "…and it names a resolved commit, not UNKNOWN" \
    "$(qF "commit=UNKNOWN" "$(cat "$O4/.harness-provenance" 2>/dev/null)" && echo 1 || echo 0)"
 
+# ⛔ THE CANNOT-VERIFY ARM MUST PRINT THE CHECKER'S OWN REASON, NOT A GUESSED CAUSE (measured 2026-10-30,
+# review of #3053). `*)` takes every code that is neither 0 nor 1. A HAND-DAMAGED BUT PERFECTLY READABLE
+# record (`files=0`) is one of them, and the arm used to say "no readable provenance record there" — false
+# about a record it had just read — while discarding the checker's own "EMPTY manifest" line. The operator
+# then gets a remedy for a missing record when what they have is a corrupt one.
+O5="$TMP/o5"; mkdir -p "$O5"
+PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$SRC" --o "$O5" --no-notify >/dev/null 2>&1
+ck "a recorded \$O for the cannot-verify arm exists" "$([ -s "$O5/.harness-provenance" ] && echo 0 || echo 1)"
+sed 's/^files=.*/files=0/' "$O5/.harness-provenance" > "$TMP/r5" && mv "$TMP/r5" "$O5/.harness-provenance"
+OUT="$(PATH="/tmp/no-tts:$PATH" bash "$DEPLOY" --src "$SRC" --o "$O5" --no-notify 2>&1)"; RC=$?
+ck "…a record that cannot describe itself does NOT block the deploy (it cannot prove an edit: rc 0)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and the CHECKER'S verdict is printed, not discarded (“EMPTY manifest”)" \
+   "$(qF "EMPTY manifest" "$OUT" && echo 0 || echo 1)"
+ck "…and the arm does NOT claim the record is unreadable" "$(qF "no readable provenance record" "$OUT" && echo 1 || echo 0)"
+ck "…and the durable ledger's row says “could not be used”, not “no readable record”" \
+   "$(qF "the record could not be used" "$(cat "$O5/.deploy-ledger.tsv" 2>/dev/null)" && echo 0 || echo 1)"
+
 echo
 echo "── §4 the macOS deploy path: DRY RUN writes NOTHING, and it REFUSES a dirty \$O (never run live) ──"
 # ⛔ THE REAL SCRIPT IS NEVER RUN FOR REAL HERE: it would overwrite THIS box's live $O, which is the
@@ -545,6 +563,24 @@ ck "…and pointing at the deliberate override" "$(qF "--accept-discard" "$OUT" 
 ck "…and the patched bytes survive the refusal" "$(qF "hand-patched" "$(cat "$MO/claims.sh")" && echo 0 || echo 1)"
 ck "…and the PLAN is printed WITH the refusal (it is what --accept-discard would destroy)" \
    "$(qF "overwrite    claims.sh" "$OUT" && echo 0 || echo 1)"
+# ⛔ THE CANNOT-VERIFY ARM ON THE macOS PATH WAS GRADED BY NOTHING (review of #3090). `deploy-harness.sh`
+# and `check-deployed-drift.sh` each carry a mutation-proven arm; this one was reached by no assertion at
+# all, so reverting it to "no readable provenance record there" reddened nothing. The state under test is
+# a record that is PRESENT and READABLE but cannot describe itself (`files=0`) — one of the many codes
+# `*)` swallows, and precisely the one the old sentence was FALSE about.
+M4="$TMP/mac4"; cp -R "$MO"/. "$M4"/                                    # a COPY: later rigs in §4 reuse $MO
+cp "$SRC/claims.sh" "$M4/claims.sh"                                    # drop the hand patch — the record,
+sed 's/^files=.*/files=0/' "$M4/.harness-provenance" > "$TMP/r6"          # not an edit to $O, is what this
+mv "$TMP/r6" "$M4/.harness-provenance"                                   # arm is about
+OUT="$(AI_MAIN="$R" SRC_REF=main O="$M4" PHASE=A STAGE="$TMP/stage3b" bash "$MACDEP" --dry-run 2>&1)"; RC=$?
+ck "a record that cannot describe itself does NOT block the mac dry run (rc 0)" \
+   "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and the CHECKER'S verdict is printed, not discarded (“EMPTY manifest”)" \
+   "$(qF "EMPTY manifest" "$OUT" && echo 0 || echo 1)"
+ck "…and the arm does NOT claim the record is unreadable" \
+   "$(qF "no readable provenance record" "$OUT" && echo 1 || echo 0)"
+ck "…and it claims only what is known: the record could not be USED" \
+   "$(qF "could not be USED" "$OUT" && echo 0 || echo 1)"
 # ⛔ A REF THAT PREDATES THE CHECKER. `DISC_RC` starts at 0 in the old code and is only reassigned when
 # the staged harness ships the checker, so this arm read as a CLEAN deploy over a box nobody inspected —
 # the 2026-10-28 silence, on the ref most likely to produce it.

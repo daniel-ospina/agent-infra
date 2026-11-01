@@ -404,13 +404,13 @@ if [ ! -f "$chain" ]; then
   else
     say_err "lane-merge: $O/merge-one.sh is missing and the copy beside this script ($_d) is not the"
     say_err "  harness $O — refusing to select the merge authority from a checkout that may be a lane's"
-    say_err "  own branch. Sync it: cp scripts/orchestrator-harness/*.sh $O/"
+    say_err "  own branch. Redeploy it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
     exit 2
   fi
 fi
   if [ ! -f "$chain" ]; then
     say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
-    say_err "            hand-roll a merge; sync the harness (cp scripts/orchestrator-harness/*.sh \$O/)"
+    say_err "            hand-roll a merge; redeploy the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
     return 1
   fi
   # ⛔ THE CHECKOUT THE CHAIN RUNS FROM IS RESOLVED, NEVER INHERITED (landing-review F1). Resolved here,
@@ -685,8 +685,9 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
     # ⛔ THE BRANCH MUST BE RESOLVED, NOT A PLACEHOLDER (reviewer finding, P1, R11, measured): the brief's
     # own `--watch` call never passes `--branch`, so `${BR:-<branch>}` rendered the literal `<branch>` on
-    # the documented supervision path — and merge-one feeds that argument into `git fetch origin "$BR"`,
-    # so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
+    # the documented supervision path — and merge-one feeds that argument into
+    # `git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"` (the shipped form since #3009 named
+    # the DESTINATION), so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
     # ⛔ A DETACHED HEAD IS NOT A BRANCH (reviewer finding, P2, R12, measured): `git rev-parse
     # --abbrev-ref HEAD` answers "HEAD" outside a branch, and `origin/HEAD` resolves to main — so the
     # printed command would hand the reviewer MAIN's content under the PR's name, and a `CLEAN` verdict
