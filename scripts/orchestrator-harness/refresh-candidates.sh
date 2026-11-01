@@ -2625,13 +2625,17 @@ DISPATCHED_RECHECK_CEILING = 96
 
 
 def _issue_num(x):
-    """Sort key for a `dispatched.txt` row. ⛔ `str.isdigit()` IS TRUE FOR CHARACTERS `int()` REJECTS
-    (superscript two is a digit and not a number), and an unguarded `int()` on one raised out of this
-    heredoc, aborted the reap and took `EXIT_TRANSIENT` on EVERY later pass — the permanent
-    no-dispatch loop this block's own comments record being fixed twice. Non-numeric rows sort first
-    and are PRESERVED, never dropped."""
+    """Sort key for a `dispatched.txt` row, and the ASKABILITY test: a row is askable iff this
+    returns >= 0. ⛔ `str.isdigit()` IS TRUE FOR CHARACTERS `int()` REJECTS (superscript two is a digit
+    and not a number), and an unguarded `int()` on one raised out of this heredoc, aborted the reap and
+    took `EXIT_TRANSIENT` on EVERY later pass — the permanent no-dispatch loop this block's own
+    comments record being fixed twice. Non-numeric rows sort first and are PRESERVED, never dropped.
+    ⛔ AND THE BOUND IS THE SIBLING ROTATION'S SIX DIGITS, NOT `int()`'s eighteen (`:3219`
+    `length($1) <= 6`): a row longer than that is `unknown` there — it can never be asked — so reading
+    it as askable here would spend one GraphQL call per lap, for ever, on a number no issue has, and
+    report the result as `deferred` while the sibling calls the same row unaskable."""
     s = (x or "").strip()
-    if s.isdigit() and len(s) <= 18:
+    if s.isdigit() and len(s) <= 6:
         try:
             return int(s)
         except ValueError:
@@ -2659,6 +2663,9 @@ def issue_state_targeted(n):
 
 if have_open and _disp_ok:
     keep, reaped, _window_blind = [], [], []
+    # Defined HERE, not inside the re-check arm: the operator line below reports the two release classes
+    # separately, and a name that only exists on one branch is a NameError on the other.
+    _settled = []
     for n in _disp_rows:
         if not n:
             continue
@@ -2690,7 +2697,11 @@ if have_open and _disp_ok:
         _rch_raw = (os.environ.get("DISPATCHED_RECHECK_MAX", "") or "").strip()
         if not _rch_raw:
             _rch_max = 12
-        elif _rch_raw.isdigit() and len(_rch_raw) <= 6:
+        elif _rch_raw.isdigit():
+            # ⛔ NO LENGTH CLAUSE HERE. `int()` is guarded by the try/except below (the superscript-two
+            # case), so a LONG value is a NUMBER and must be clamped by the ceiling arm, not discarded as
+            # "not a number": `DISPATCHED_RECHECK_MAX=1000000` reported "is not a number — coerced to 12"
+            # and asked 12, when what the operator asked for was the most the pass may ask (96).
             try:
                 _rch_max = int(_rch_raw)
             except ValueError:
@@ -2754,8 +2765,11 @@ if have_open and _disp_ok:
         # requeue is what it may not cause. Named on the line instead of dropped, counted, and rotated.
         # ⛔ A CLOSED ENTRY IS ONLY RECLAIMED WHEN ITS QUEUE ROW IS ALREADY GONE. `dispatched.txt` is the
         # ONLY thing standing between a persisted `candidates.txt` row and a spawned lane: the dispatcher
-        # skips an id it finds there (`orch-loop.sh:6095`) and `lane.sh` never re-reads the issue's state,
-        # while `candidates.txt` is pruned BY THE SAME FILE (`orch-loop.sh:5531`, rc discarded). So dropping
+        # skips an id it finds there (`orch-loop.sh:6146`, `grep -qx "$ISS" "$O/dispatched.txt" &&
+        # continue`) and `lane.sh` never re-reads the issue's state, while `candidates.txt` is pruned BY
+        # THE SAME FILE (`orch-loop.sh:5583`, the `python3 - "$O/candidates.txt" "$O/dispatched.txt"`
+        # heredoc, rc discarded). ⛔ The pins are the anchor TEXT as well as the line: they were `:6095`
+        # and `:5531`, which land on unrelated comments, and they are this arm's whole evidence. So dropping
         # the row for an issue that is still listed there un-protects it — a lane for a closed issue is
         # exactly the #8560/#7174 class this arm exists to avoid. Keep it this pass; the prune removes the
         # queue row and the next pass reclaims the entry, which converges one cycle later with no window
@@ -2769,11 +2783,17 @@ if have_open and _disp_ok:
         _queue_rows = read_soft("candidates.txt")
         _queue_unreadable = _queue_rows is None
         _queued_now = set(l for l in (_queue_rows or []) if l)
-        _settled, _blind_open, _unreadable, _still_queued = [], [], [], []
+        _blind_open, _unreadable, _still_queued, _queue_unverified = [], [], [], []
         for _n in _asked:
             _st = issue_state_targeted(_n)
             if _st == "CLOSED":
-                if _queue_unreadable or _n in _queued_now:
+                # ⛔ AN UNREAD QUEUE IS NOT A QUEUE THAT STILL LISTS IT. Membership was never tested when
+                # `candidates.txt` could not be read, so an entry kept for that reason is reported under
+                # its own bucket — printing it as "still listed in candidates.txt" asserted a measurement
+                # the pass never took, and the WARN one line below contradicted it in the same breath.
+                if _queue_unreadable:
+                    keep.append(_n); _queue_unverified.append(_n)
+                elif _n in _queued_now:
                     keep.append(_n); _still_queued.append(_n)
                 else:
                     reaped.append(_n); _settled.append(_n)
@@ -2789,7 +2809,7 @@ if have_open and _disp_ok:
         keep = list(dict.fromkeys(keep))
         if not _ordered and _unaskable:
             print("[reap] dispatched re-check: 0 askable row(s) outside the capped open-issue window; "
-                  "%d row(s) are not issue numbers and can never be asked (KEPT): %s"
+                  "%d row(s) are not askable issue numbers and can never be asked (KEPT): %s"
                   % (len(_unaskable), " ".join(_unaskable)))
         if _asked:
             # ⛔ A ROW THAT IS NOT AN ISSUE NUMBER IS NOT `deferred` — it can never be asked, so promising a
@@ -2803,7 +2823,7 @@ if have_open and _disp_ok:
                   "CLOSED but still listed in candidates.txt, KEPT (its queue row is protected only by "
                   "this file, so the prune goes first): %s; OPEN, KEPT because a merged PR naming an OPEN "
                   "issue reads CLEAN downstream (LANDED comes only from a CLOSED issue), so releasing it "
-                  "would re-queue shipped work: %s; unreadable, KEPT: %d%s%s%s"
+                  "would re-queue shipped work: %s; unreadable, KEPT: %d%s%s%s%s"
                   % (len(_asked), len(_ordered), _rch_max,
                      " ".join(_settled) if _settled else "none",
                      " ".join(_still_queued) if _still_queued else "none",
@@ -2812,8 +2832,11 @@ if have_open and _disp_ok:
                      "" if _def <= 0
                      else "; %d deferred to a later pass by the rotating cursor" % _def,
                      "" if not _nonnumeric
-                     else "; %d row(s) are not issue numbers and can never be asked (KEPT): %s"
-                     % (len(_nonnumeric), " ".join(_nonnumeric))))
+                     else "; %d row(s) are not askable issue numbers and can never be asked (KEPT): %s"
+                     % (len(_nonnumeric), " ".join(_nonnumeric)),
+                     "" if not _queue_unverified
+                     else "; queue row UNVERIFIABLE (candidates.txt unreadable), KEPT: %s"
+                     % " ".join(_queue_unverified)))
             if _queue_unreadable:
                 print("[reap] WARN candidates.txt is UNREADABLE — a CLOSED entry is kept this pass "
                       "because its queue row cannot be proved gone (an unreadable queue is not an "
@@ -2872,8 +2895,15 @@ if have_open and _disp_ok:
         if kept_ck is not None and os.path.exists(ck):
             with open(ck, "w") as fh:
                 fh.write("\n".join(kept_ck) + ("\n" if kept_ck else ""))
-        print("[reap] un-blacklisted (open, no PR, no live lane; a CLOSED issue's dispatch is settled): %s"
-              % " ".join(sorted(reaped, key=_issue_num)))
+        # ⛔ TWO OPPOSITE VERDICTS SHARE THIS LINE, SO IT NAMES THEM SEPARATELY. `reaped` mixes the
+        # window-VISIBLE release (OPEN, no PR, no live lane) with the window-BLIND settlement (the issue
+        # is CLOSED), and a single leading label called a CLOSED issue "open" on the one line an operator
+        # reads — the same fabricated-fact class the re-check's own buckets exist to prevent.
+        _settledset = set(_settled)
+        print("[reap] un-blacklisted — open, no PR, no live lane: %s | issue CLOSED outside the capped "
+              "open-issue window (its dispatch is settled): %s"
+              % (" ".join(sorted([n for n in reaped if n not in _settledset], key=_issue_num)) or "none",
+                 " ".join(sorted(_settled, key=_issue_num)) or "none"))
 
 # ── THE CHECKED CLASSIFICATION: A SUPPRESSION SURVIVES ONLY WHILE A RE-CHECKABLE FACT HOLDS ─────
 # `checked.txt` short-circuits the walk before any network call, so an entry in it is invisible to
