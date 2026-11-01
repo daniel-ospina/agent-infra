@@ -104,9 +104,20 @@ command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_a
 # asked for. The gate exists because the worktree must be the repo that was ASKED FOR; an ambient `OR`
 # is exactly the "default two programs invented" #1974 removed. Save the parsed target across the
 # sourcing and restore it, so the argument keeps the last word.
-LANE_TARGET_ARG="$OR"
+#
+# ⛔ THE WHOLE DISPATCH-OWNED SET, NOT JUST THE TARGET (review of #3174, P2). `OR` was the variable the
+# refusal happened to name, but the same file can carry `export N=…`, `export BR=…`, `export O=…` or
+# `export LANE_REPO_DIR=…`, and each moves something the DISPATCH decided: which issue's brief is built,
+# which branch is asserted, where the lane records, and which checkout is compared. This is the class
+# `scripts/pr-repair-loop.sh` already settled — "`keys.env` remains authoritative for CREDENTIALS … it
+# may not move WHAT this box repairs or WHERE it records that." So the file keeps the last word on
+# CREDENTIALS (PATH, tokens, DSNs — see lane-env.test.sh A6) and the dispatch keeps it on these five.
+LANE_TARGET_ARG="$OR"; LANE_ISSUE_ARG="$N"; LANE_BRANCH_ARG="$BR"
+LANE_REPO_DIR_ARG="$LANE_REPO_DIR"; LANE_OUT_ARG="$O"
 LANE_ENV_LOG="$O/logs/lane-$N.log" LANE_ENV_LABEL="lane $N" . "$SELF/lane-env.sh"
-OR="$LANE_TARGET_ARG"
+OR="$LANE_TARGET_ARG"; N="$LANE_ISSUE_ARG"; BR="$LANE_BRANCH_ARG"
+LANE_REPO_DIR="$LANE_REPO_DIR_ARG"; O="$LANE_OUT_ARG"
+unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_ARG
 
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
