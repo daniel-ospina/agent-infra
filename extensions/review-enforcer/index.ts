@@ -3965,7 +3965,7 @@ export function observeReviewRecord(
   const legacyPath = reviewRecordFile(undefined, pr);
   // `"probe"` is honoured at the END (`finishObservation`), once we know whether a
   // local record was found — a present record needs no read of the shared store.
-  probeRequested = opts.crossBox === "probe";
+  const wantProbe = opts.crossBox === "probe";
   const obs: ReviewRecordObservation = {
     pr,
     repo: repo ?? null,
@@ -3994,7 +3994,7 @@ export function observeReviewRecord(
         // "another repo's record, inert here" AND "record: clean at head …" in the
         // same block — the self-contradicting diagnostic this change exists to
         // remove (fresh review of #2349, P1).
-        return finishObservation(obs);
+        return finishObservation(obs, wantProbe);
       }
       obs.qualified = qualified.state;
       obs.record = qualified.rec;
@@ -4043,18 +4043,18 @@ export function observeReviewRecord(
       // reads `<pr>.json`, so an ambiguous PR is UNTRUSTED — restoring a legacy record
       // here would print "AMBIGUOUS … none is trusted" AND "record: clean at head …"
       // in one block (fresh review, cycle 3, P1).
-      return finishObservation(obs);
+      return finishObservation(obs, wantProbe);
     }
     if (!obs.record && legacy.rec) {
       if (legacy.rec.repo !== undefined) obs.legacy = { kind: "foreign-repo", repo: legacy.rec.repo };
       else obs.record = legacy.rec;
     }
   }
-  return finishObservation(obs);
+  return finishObservation(obs, wantProbe);
 }
 
 /** Attach the record's mint provenance (diagnostic only) and return the observation. */
-function finishObservation(obs: ReviewRecordObservation): ReviewRecordObservation {
+function finishObservation(obs: ReviewRecordObservation, wantProbe: boolean): ReviewRecordObservation {
   if (obs.record) {
     if (typeof obs.record.mint === "string") obs.mint = obs.record.mint;
     if (typeof obs.record.carried_from === "string") obs.carriedFrom = obs.record.carried_from;
@@ -4064,7 +4064,7 @@ function finishObservation(obs: ReviewRecordObservation): ReviewRecordObservatio
   // deliberately here rather than in `evaluateMergeGate`: the gate stays a pure
   // function that performs no I/O, and a record that IS present never pays for a
   // network read (there is nothing the text would add).
-  if (probeRequested && !obs.record) {
+  if (wantProbe && !obs.record) {
     obs.crossBox = crossBoxRecordState(obs.repo ?? undefined, obs.pr);
   }
   return obs;
@@ -4084,10 +4084,17 @@ export function boxName(): string {
 /** `~/.pi/agent/scripts/registry-sync.sh` (farmed) and the checkout copy (#2374). */
 export const REGISTRY_SYNC_SH = "~/.pi/agent/scripts/registry-sync.sh";
 
-export function registrySyncCommand(): string {
-  const parts = [`${REGISTRY_SYNC_SH} pull`];
+/** ⛔ THE STORE MUST BE NAMED. `registry-sync.sh` resolves its store as
+ *  `--repo` → `$AGENT_INFRA_PATH` → its own parent dir, so a bare `pull` reads
+ *  whichever store those point at — and for a cross-REPO record (the case the
+ *  multi-store probe exists for) that is a different store, which "succeeds" having
+ *  fetched nothing. A remedy that cannot reach the record it names is worse than no
+ *  remedy: the lane runs it, sees exit 0, and re-reviews anyway (fresh review P1). */
+export function registrySyncCommand(store?: string): string {
+  const repoFlag = store ? ` --repo ${JSON.stringify(store)}` : "";
+  const parts = [`${REGISTRY_SYNC_SH} pull${repoFlag}`];
   const checkoutCopy = extensionRelativeScript("registry-sync.sh");
-  if (checkoutCopy) parts.push(`${checkoutCopy} pull`);
+  if (checkoutCopy) parts.push(`${checkoutCopy} pull${repoFlag}`);
   return parts.join("   |   ");
 }
 
@@ -4161,7 +4168,11 @@ export function crossBoxRecordState(repo: string | undefined, pr: number): Cross
   const whys: string[] = [];
   let scannedTotal = 0;
   let scannedAny = false;
+  // ONE budget for the whole probe, not per store: three candidates × a 6 s bound
+  // would put an 18 s synchronous block inside a tool call (fresh review, P2).
+  const deadline = now + 8000;
   for (const store of stores) {
+    const remaining = Math.max(1000, deadline - Date.now());
     let entry = crossBoxMemo.get(store);
     if (!entry || now - entry.at > CROSSBOX_MEMO_TTL_MS) {
       let refs: Set<string> | null = null;
@@ -4169,7 +4180,7 @@ export function crossBoxRecordState(repo: string | undefined, pr: number): Cross
       try {
         // execFileSync with an argv array: no value here can be re-parsed as shell syntax.
         const out = execFileSync("git", ["-C", store, "ls-remote", "--refs", "origin", "refs/reviews/*"], {
-          timeout: 6000,
+          timeout: remaining,
           encoding: "utf8",
           stdio: ["ignore", "pipe", "ignore"],
         });
@@ -4197,8 +4208,18 @@ export function crossBoxRecordState(repo: string | undefined, pr: number): Cross
     scannedTotal += entry.refs.size;
     if (entry.refs.has(ref)) return { kind: "present", ref, store, scanned: scannedTotal };
   }
+  // ⛔ `absent` ONLY IF EVERY CANDIDATE STORE WAS READ. One readable store plus one
+  // unreadable store NAMED `absent` means "no record exists" for a ref the gate never
+  // looked at — and that is exactly the duplicate review this change exists to stop
+  // (fresh review, P1). A partial read is `unmeasurable`, with the stores that failed.
+  if (whys.length > 0) {
+    return {
+      kind: "unmeasurable",
+      why: `read ${stores.length - whys.length}/${stores.length} store(s); ${whys.join("; ")}`.slice(0, 200),
+    };
+  }
   if (!scannedAny) {
-    return { kind: "unmeasurable", why: whys.join("; ").slice(0, 160) || "no store could be read" };
+    return { kind: "unmeasurable", why: "no store could be read" };
   }
   return { kind: "absent", store: stores.join(", "), scanned: scannedTotal };
 }
@@ -4210,12 +4231,6 @@ export function recordAbsentToken(obs: ReviewRecordObservation): string {
     obs.crossBox.kind === "present" ? "present" : obs.crossBox.kind === "absent" ? "absent" : "unmeasurable";
   return `RECORD-ABSENT(host=${obs.host}; registry=${obs.registryDir}; per-machine; crossbox=${cb})`;
 }
-
-/** Set by `observeReviewRecord` for the duration of one observation, so
- *  `finishObservation` (every return path) can honour `crossBox: "probe"` without
- *  threading an argument through four call sites. Module-level because the observer
- *  is synchronous: one observation is in flight at a time, by construction. */
-let probeRequested = false;
 
 /**
  * Which of the four "no usable record" states the observation is in.
@@ -4277,7 +4292,7 @@ export function describeRecordMiss(
     lines.push(`     ${recordAbsentToken(observation)}`);
     if (observation.crossBox.kind === "present") {
       lines.push("     → NEXT ACTION: fetch it from the shared store and RE-RUN the merge. This is a one-command");
-      lines.push(`       fix — ${registrySyncCommand()}`);
+      lines.push(`       fix — ${registrySyncCommand(observation.crossBox.store)}`);
       lines.push("       A review dispatched here would be paid for twice for the same head.");
     } else if (observation.crossBox.kind === "absent") {
       lines.push("     → NEXT ACTION: the shared store has no record for this PR either, so a review HERE is");
@@ -4325,7 +4340,7 @@ export function recordSourcePath(obs: ReviewRecordObservation): string {
 export function crossBoxLine(cb: CrossBoxRecordState): string {
   switch (cb.kind) {
     case "present":
-      return `PRESENT at ${cb.ref} — the review ran on another box; fetch it, do not re-review`;
+      return `PRESENT at ${cb.ref} in ${cb.store} — the review ran on another box; fetch it, do not re-review`;
     case "absent":
       return `ABSENT — the shared store (${cb.scanned} refs) holds no ref for this PR`;
     default:

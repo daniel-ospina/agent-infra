@@ -111,6 +111,7 @@ import {
   boxName,
   recordAbsentToken,
   crossBoxRecordState,
+  registrySyncCommand,
   classifyRecordMissState,
   describeCarryConjuncts,
   describeDispatchFloorRead,
@@ -10178,6 +10179,48 @@ test("#3175 c — crossbox=absent adds NO block, and an unreadable/unprobed stor
     probed.crossBox.kind === "unmeasurable" && probed.crossBox.why.includes("repo context unresolved"),
     `the \`probe\` opt is HONOURED — the reason names the real read, not 'not probed': ${JSON.stringify(probed.crossBox)}`
   );
+  // ── THE WIRING, END TO END, AGAINST A REAL STORE (fresh review, P1/P2): a probe
+  // that always returned `absent` or threw would pass everything above, so build a
+  // genuine store — a checkout whose `origin` holds `refs/reviews/*` — point
+  // $AGENT_INFRA_PATH at it, and drive `present` through the SAME path production
+  // uses. Fully local: git init + update-ref + push into a bare repo in a temp dir.
+  const storeTmp = fs.mkdtempSync(resolvePath(os.tmpdir(), "rev-store-"));
+  const prevInfra = process.env.AGENT_INFRA_PATH;
+  try {
+    const bare = resolvePath(storeTmp, "origin.git");
+    const store = resolvePath(storeTmp, "store");
+    execSync(`git init -q --bare ${JSON.stringify(bare)}`, { stdio: "ignore" });
+    execSync(`git init -q ${JSON.stringify(store)}`, { stdio: "ignore" });
+    execSync(`git -C ${JSON.stringify(store)} remote add origin ${JSON.stringify(bare)}`, { stdio: "ignore" });
+    execSync(`git -C ${JSON.stringify(store)} -c user.email=t@t -c user.name=t commit -q --allow-empty -m s`, {
+      stdio: "ignore",
+    });
+    execSync(`git -C ${JSON.stringify(store)} update-ref ${CROSSBOX_REF_2349} HEAD`, { stdio: "ignore" });
+    execSync(`git -C ${JSON.stringify(store)} push -q origin ${CROSSBOX_REF_2349}`, { stdio: "ignore" });
+    process.env.AGENT_INFRA_PATH = store;
+    const live = observeReviewRecord(PR_2349, "owner/repo", { crossBox: "probe" });
+    equal(live.crossBox.kind, "present", `a REAL store ref must read as present: ${JSON.stringify(live.crossBox)}`);
+    ok(
+      live.crossBox.kind === "present" && live.crossBox.ref === CROSSBOX_REF_2349,
+      "and it names the exact ref"
+    );
+    ok(
+      registrySyncCommand(live.crossBox.kind === "present" ? live.crossBox.store : undefined).includes(
+        "--repo"
+      ),
+      "the fetch command NAMES the store, so `pull` cannot read a different one and fetch nothing"
+    );
+    const reasonLive = (evaluateMergeGate(
+      PR_2349, null, HEAD_2349, { source: "flag", repo: "owner/repo" }, false, null, null, live
+    ) as any).reason as string;
+    ok(reasonLive.includes("crossbox=present"), "the decision path carries the measured state");
+    ok(reasonLive.includes("--repo"), "…and a remedy that can actually reach the record");
+  } finally {
+    if (prevInfra === undefined) delete process.env.AGENT_INFRA_PATH;
+    else process.env.AGENT_INFRA_PATH = prevInfra;
+    fs.rmSync(storeTmp, { recursive: true, force: true });
+  }
+
   const messaging = observeReviewRecord(PR_2349, "owner/repo");
   equal(messaging.crossBox.kind, "unmeasurable", "the default observation never probes (hermetic, no network)");
   ok(
