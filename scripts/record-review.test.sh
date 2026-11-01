@@ -2491,7 +2491,12 @@ assert_contains "$(cat "$T/rb-err")" "does not certify" "11.14a …and says it r
 #     the old carry-forward arm accepted; it must not survive the HMAC check.
 rb_clear
 RB_TEXT_B="review recorded: reviews/424912.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)"
-export STUB_BODY="$RB_TEXT_B sig=$(printf '0%.0s' $(seq 1 64))"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$RB_TEXT_B sig=$(printf '0%.0s' $(seq 1 64))" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424912 "$RB_REPO"
 assert_eq "$RB_RC" "3" "11.14b a forged sig=<64 zeros> is REFUSED (exit 3)"
 if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424912.json" ]; then bad "11.14b a forged marker minted a record"; else ok "11.14b …and nothing is written"; fi
@@ -2519,7 +2524,12 @@ assert_contains "$(cat "$T/rb-err")" "body EDIT" "11.14d …and says why an unve
 # (e) FOREIGN REPO: PR numbers collide across repos, which is why the record is
 #     repo-qualified. A signed marker naming another repo must not be adopted.
 rb_clear
-export STUB_BODY="$(rb_marker 424915 "review recorded: reviews/424915.json verdict=clean @ $RB_HEAD diff=$RB_DIFF (daniel-ospina/tortoise)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424915 "review recorded: reviews/424915.json verdict=clean @ $RB_HEAD diff=$RB_DIFF (daniel-ospina/tortoise)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424915 "$RB_REPO"
 assert_eq "$RB_RC" "3" "11.14e a marker signed for ANOTHER repo is refused (exit 3)"
 assert_contains "$(cat "$T/rb-err")" "DIFFERENT repo" "11.14e …and names the collision, not a signature failure"
@@ -2552,7 +2562,12 @@ rb_clear
 RB_EXIST="$RB_RDIR/daniel-ospina-agent-infra-424918.json"
 printf '%s\n' '{"pr":424918,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_EXIST"
 RB_BEFORE="$(cat "$RB_EXIST")"
-export STUB_BODY="$(rb_marker 424918 "review recorded: reviews/424918.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424918 "review recorded: reviews/424918.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424918 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14h an existing record is not replaced (exit 5)"
 assert_eq "$(cat "$RB_EXIST")" "$RB_BEFORE" "11.14h …byte-identical afterwards"
@@ -2560,7 +2575,12 @@ assert_eq "$(cat "$RB_EXIST")" "$RB_BEFORE" "11.14h …byte-identical afterwards
 # (i) AN HONEST reviewed_at IS NOT NEGOTIABLE. If the head commit's date cannot
 #     be read, refuse — stamping `now` as a mint time is the tortoise#7391 defect.
 rb_clear
-export STUB_BODY="$(rb_marker 424919 "review recorded: reviews/424919.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424919 "review recorded: reviews/424919.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 export STUB_COMMIT_FAIL=1
 run_recover 424919 "$RB_REPO"
 unset STUB_COMMIT_FAIL
@@ -2585,7 +2605,12 @@ sed 's@if \[ -z "$_expect" \] || \[ "$_expect" != "$_sig" \]; then@if false; the
 if grep -q 'if false; then' "$RB_MUT"; then
     rb_clear
     RB_TEXT_M="review recorded: reviews/424921.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)"
-    export STUB_BODY="$RB_TEXT_M sig=$(printf '0%.0s' $(seq 1 64))"
+    # status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+    # status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+    # below refuse for the WRONG reason and still pass.
+    STUB_BODY="$RB_TEXT_M sig=$(printf '0%.0s' $(seq 1 64))" \
+      || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+    export STUB_BODY
     run_recover 424921 "$RB_REPO" "$RB_MUT"
     assert_eq "$RB_RC" "0" "11.14k WITHOUT the HMAC check the forged marker mints (the pin has teeth)"
 else
@@ -2597,7 +2622,12 @@ unset STUB_BODY STUB_BODY_FAIL STUB_COMMIT_FAIL RB_OUT RB_RC RB_REC RB_EXIST RB_
 #     across repos), so an unresolvable repo is a USAGE error, not a guess.
 rb_clear
 export STUB_REPO_NAME=""
-export STUB_BODY="$(rb_marker 424922 "review recorded: reviews/424922.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424922 "review recorded: reviews/424922.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
     bash "$RECORD" --recover-body 424922 2>"$T/rb-err")" || RB_RC=$?
@@ -2609,7 +2639,12 @@ assert_contains "$(cat "$T/rb-err")" "no repo resolved" "11.14l …and names the
 #     body edit by definition. Minting on trust would make the whole check
 #     decorative, so this is a REFUSAL even when a valid-looking marker exists.
 rb_clear
-export STUB_BODY="$(rb_marker 424923 "review recorded: reviews/424923.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424923 "review recorded: reviews/424923.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" AI_REVIEW_GATE_KEY="" \
     bash "$RECORD" --recover-body 424923 "$RB_REPO" 2>"$T/rb-err")" || RB_RC=$?
@@ -2624,14 +2659,24 @@ if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424923.json" ]; then bad "11.14m a r
 rb_clear
 RB_LEG="$RB_RDIR/424924.json"
 printf '%s\n' '{"pr":424924,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_LEG"
-export STUB_BODY="$(rb_marker 424924 "review recorded: reviews/424924.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424924 "review recorded: reviews/424924.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424924 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14n a legacy record naming THIS repo is not replaced (exit 5)"
 if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424924.json" ]; then bad "11.14n a qualified record was minted beside an existing legacy one"; else ok "11.14n …and no qualified record is minted beside it"; fi
 rb_clear
 printf '%s\n' '{"pr":424925,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/424925.json"
 RB_FOREIGN_BEFORE="$(cat "$RB_RDIR/424925.json")"
-export STUB_BODY="$(rb_marker 424925 "review recorded: reviews/424925.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424925 "review recorded: reviews/424925.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424925 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14n a FOREIGN legacy record does not block this repo's recovery (exit 0)"
 assert_eq "$(cat "$RB_RDIR/424925.json")" "$RB_FOREIGN_BEFORE" "11.14n …and the other repo's record is left byte-identical, never deleted"
@@ -2643,8 +2688,12 @@ unset STUB_BODY RB_OUT RB_RC RB_LEG RB_FOREIGN_BEFORE
 rb_clear
 RB_OLD_HEAD="$(printf '7%.0s' $(seq 1 40))"
 RB_OLD_DIFF="$(printf '8%.0s' $(seq 1 64))"
-export STUB_BODY="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean @ $RB_OLD_HEAD diff=$RB_OLD_DIFF ($RB_REPO)")
-$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean-micro @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's status, so a fixture
+# that failed to BUILD (empty STUB_BODY) would make both arms refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean @ $RB_OLD_HEAD diff=$RB_OLD_DIFF ($RB_REPO)")
+$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean-micro @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424926 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14o two markers for one PR: recovery succeeds (exit 0)"
 assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424926.json" 2>/dev/null)" "\"head_sha\":\"$RB_HEAD\"" "11.14o …restoring the LAST marker's head, not the first"
@@ -2655,7 +2704,12 @@ assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424926.json" 2>/dev/n
 #     and `--check-carry` answers `nodigest` (5), not `fresh` (1): "no digest to
 #     compare" and "the diff changed" are different facts with different remedies.
 rb_clear
-export STUB_BODY="$(rb_marker 424927 "review recorded: reviews/424927.json verdict=clean @ $RB_HEAD ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424927 "review recorded: reviews/424927.json verdict=clean @ $RB_HEAD ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424927 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14p a diff-less (pre-#2982) marker still recovers (exit 0)"
 assert_eq "$RB_OUT" "recovered${RB_TAB}${RB_HEAD}${RB_TAB}-" "11.14p …and prints '-' for the digest it does not have"
@@ -2679,7 +2733,12 @@ assert_eq "${RB_CC_OUT%%"$RB_TAB"*}" "nodigest" "11.14p …and the verdict WORD 
 #     would make the rail skip its base guard while the gate blocks the same
 #     record as `base_unverifiable` — one record, two verdicts.
 rb_clear
-export STUB_BODY="$(rb_marker 424928 "review recorded: reviews/424928.json verdict=clean-low @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424928 "review recorded: reviews/424928.json verdict=clean-low @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424928 "$RB_REPO"
 assert_eq "$RB_RC" "3" "11.14q a clean-low marker is refused (exit 3)"
 assert_contains "$(cat "$T/rb-err")" "FRESH mint (not a carry" "11.14q …and names the remedy that IS available, correctly labelled (a fresh mint, not a carry)"
@@ -2690,7 +2749,12 @@ if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424928.json" ]; then bad "11.14q a c
 #     read-only answer and exit 0 having written NOTHING — a successful-looking
 #     recovery that did not happen.
 rb_clear
-export STUB_BODY="$(rb_marker 424929 "review recorded: reviews/424929.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424929 "review recorded: reviews/424929.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
     bash "$RECORD" --recover-body 424929 "$RB_REPO" --check-carry 2>"$T/rb-err")" || RB_RC=$?
@@ -2705,7 +2769,12 @@ if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424929.json" ]; then bad "11.14r the
 rb_clear
 printf '%s\n' '{"pr":424930,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/daniel-ospina-agent-infra-424930.json"
 RB_OTHER_BEFORE="$(cat "$RB_RDIR/daniel-ospina-agent-infra-424930.json")"
-export STUB_BODY="$(rb_marker 424930 "review recorded: reviews/424930.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424930 "review recorded: reviews/424930.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424930 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14s a qualified file embedding ANOTHER repo is not overwritten (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "daniel-ospina/tortoise" "11.14s …and the refusal names the repo whose verdict is at stake"
@@ -2719,7 +2788,12 @@ unset STUB_BODY RB_OUT RB_RC RB_OLD_HEAD RB_OLD_DIFF RB_OTHER_BEFORE
 #     it — the "walk the gate backwards" failure the whole rule exists to prevent.
 #     The stub performs the concurrent mint as a side effect of the LAST read.
 rb_clear
-export STUB_BODY="$(rb_marker 424931 "review recorded: reviews/424931.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424931 "review recorded: reviews/424931.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RACE="$RB_RDIR/daniel-ospina-agent-infra-424931.json"
 RB_RACE_JSON='{"pr":424931,"head_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","diff_sha256":"1111111111111111111111111111111111111111111111111111111111111111","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-12-01T00:00:00Z"}'
 export STUB_RACE_PATH="$RB_RACE" STUB_RACE_RECORD="$RB_RACE_JSON"
@@ -2734,7 +2808,12 @@ assert_contains "$(cat "$T/rb-err")" "appeared WHILE" "11.14t …and the refusal
 #     first and answer for a PR whose recovery never ran).
 for _combo in --print-diff-hash --print-tier; do
     rb_clear
-    export STUB_BODY="$(rb_marker 424932 "review recorded: reviews/424932.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+    # status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+    # status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+    # below refuse for the WRONG reason and still pass.
+    STUB_BODY="$(rb_marker 424932 "review recorded: reviews/424932.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+      || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+    export STUB_BODY
     RB_RC=0
     RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
         bash "$RECORD" --recover-body 424932 "$RB_REPO" "$_combo" 2>"$T/rb-err")" || RB_RC=$?
@@ -2749,11 +2828,21 @@ unset STUB_BODY RB_OUT RB_RC RB_RACE RB_RACE_JSON _combo
 #     the same class as 11.14t, which is why it is checked at the write too.
 rb_clear
 RB_FOREIGN_JSON='{"pr":424933,"head_sha":"dddddddddddddddddddddddddddddddddddddddd","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-12-01T00:00:00Z"}'
-export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 export STUB_RACE_PATH="$RB_RDIR/daniel-ospina-agent-infra-424933.json" STUB_RACE_RECORD="$RB_FOREIGN_JSON"
 run_recover 424933 "$RB_REPO"
 unset STUB_RACE_PATH STUB_RACE_RECORD
-export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 assert_eq "$RB_RC" "5" "11.14v a FOREIGN record appearing mid-recovery is not destroyed (exit 5)"
 assert_eq "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424933.json" 2>/dev/null)" "$RB_FOREIGN_JSON" "11.14v …the other repo's verdict survives byte-identical"
 
@@ -2762,7 +2851,12 @@ assert_eq "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424933.json" 2>/dev/null)" 
 #     would assert there is nothing to fix about a file the GATE calls corrupt.
 rb_clear
 printf '%s' '{"pr":424934,"head_sha":"abc' > "$RB_RDIR/daniel-ospina-agent-infra-424934.json"
-export STUB_BODY="$(rb_marker 424934 "review recorded: reviews/424934.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424934 "review recorded: reviews/424934.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424934 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14w a corrupt record is refused (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14w …and it is named as unusable, not as 'nothing to repair'"
@@ -2772,7 +2866,12 @@ assert_contains "$(cat "$T/rb-err")" "move it aside" "11.14w …with a way out"
 #     take $2 as the repo and DISCARD the verdict and head, minting the marker's
 #     verdict with exit 0 while the caller believed it had chosen one.
 rb_clear
-export STUB_BODY="$(rb_marker 424935 "review recorded: reviews/424935.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424935 "review recorded: reviews/424935.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
     bash "$RECORD" --recover-body 424935 "$RB_REPO" clean-low "$RB_HEAD" 2>"$T/rb-err")" || RB_RC=$?
@@ -2786,7 +2885,12 @@ unset STUB_BODY RB_OUT RB_RC RB_FOREIGN_JSON
 #     would walk the gate BACKWARDS. It must be treated as an existing record.
 rb_clear
 printf '%s\n' '{' '  "pr": 424936,' '  "head_sha": "ffffffffffffffffffffffffffffffffffffffff",' '  "verdict": "clean",' '  "repo": "daniel-ospina/agent-infra",' '  "reviewed_at": "2026-02-02T00:00:00Z"' '}' > "$RB_RDIR/daniel-ospina-agent-infra-424936.json"
-export STUB_BODY="$(rb_marker 424936 "review recorded: reviews/424936.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424936 "review recorded: reviews/424936.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424936 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14y a pretty-printed (jq round-trip) record counts as existing (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "already exists" "11.14y …and is NOT called unusable, because the gate reads it fine"
@@ -2797,7 +2901,12 @@ assert_contains "$(cat "$T/rb-err")" "already exists" "11.14y …and is NOT call
 #      about — the round-2 loop, narrowed to a present-but-untyped key.
 rb_clear
 printf '%s\n' '{"pr":424938,"head_sha":null,"verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/daniel-ospina-agent-infra-424938.json"
-export STUB_BODY="$(rb_marker 424938 "review recorded: reviews/424938.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424938 "review recorded: reviews/424938.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424938 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14y2 a record with an untyped head_sha is refused (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14y2 …as an unusable record, matching what the gate sees (absent)"
