@@ -56,9 +56,10 @@
 #       record carries no resolve-repo refusal — with a positive control that a DECLARED `$OR` handed to
 #       the invocation IS still refused (rc=3);
 #   (h2) the `--check` twin of (h), with the same two-way control;
-#   (h3) the RECORDED cause names the origin SHAPE the resolver actually read (no `$REPO` set, an
-#       unreadable origin, a URL naming another repo, a local path that cannot prove a DECLARED target)
-#       instead of predicting one mechanism for all of them;
+#   (h3) the RECORDED cause names what the resolver actually read, instead of predicting one mechanism
+#       for all of them: the no-`$REPO` candidate SEARCH (no origin is recorded there at all), an
+#       unreadable origin, a `file://` local mirror, a URL naming another repo, and a local path that
+#       cannot prove a DECLARED target — the five shapes `_pair` can name;
 #   (h4) an origin that NAMES the queue target with a trailing slash is the same repo: it PROCEEDS, so
 #       the cause can never report a "DIFFERENT repo" mismatch it did not measure.
 #
@@ -836,9 +837,8 @@ rp "$D" "" REPO= OR="no-such-org/no-such-repo-3174"
 ck "(h3) with no \$REPO set at all the pass still REFUSES (rc=$RC)" "$([ "$RC" -eq 3 ]; echo $?)"
 case "$(rec why)" in *"no \$REPO was set"*"no candidate checkout"*) r=0 ;; *) r=1 ;; esac
 ck "(h3) …and the cause says no checkout was FOUND, naming no origin ($(rec why | cut -c1-90))" "$r"
-# …and the UNSET-origin shape, which is the THIRD refusal `_pair` names and which `(h3)`'s header claims
-# is pinned. Without it, a URL naming `$OR` and an origin that cannot be read are indistinguishable in
-# the record.
+# …and the UNREADABLE-origin shape — the FIRST arm of `_pair`'s case (`''`), not the third. Without it, a
+# URL naming `$OR` and an origin that cannot be read are indistinguishable in the record.
 mk_case cause-no-origin
 git -C "$D/repo" remote remove origin
 rp "$D" "" OR="daniel-ospina/tortoise"
