@@ -143,7 +143,14 @@ scan() {
   "$CM" vm exec --timeout 60 "$vm" -- sh -c '
     R="$3"
     [ -d "$R" ] && [ -r "$R" ] || { echo "__NOK__ unreadable-root"; exit 0; }
-    case "$4" in 1) NAME="$(printf "%s" "$1" | sed "s/\\\\([][*?]\\\\)/[\\\\1]/g")" ;; *) NAME="*$1*" ;; esac
+    # `logs` promises EXACTLY /tmp/<name>.log, so backslash-ESCAPE glob metacharacters. The previous
+    # bracket-escape form was a silent NO-OP (one escaping layer too many: BRE saw a literal `\(`),
+    # so `logs 'x[1]'` glob-matched, found nothing and returned a confident ABSENT-EVERYWHERE
+    # about a file that EXISTED. The comment claimed a protection the code lacked.
+    case "$4" in
+      1) NAME="$(printf "%s" "$1" | sed "s/[][*?\\\\]/\\\\&/g")" ;;
+      *) NAME="*$1*" ;;
+    esac
     T=$(mktemp 2>/dev/null) || T="/tmp/.lane-artifacts.$$"
     if find "$R" -maxdepth 1 -type f -printf "" 2>/dev/null; then
       find "$R" -maxdepth 1 -type f -name "$NAME" ${2:+-mmin -$2} \
@@ -192,9 +199,17 @@ pull() {
   # (The previous version of this file CLAIMED this fix in a comment while the code still emitted the
   # marker last — found by review. The code is the claim.)
   raw="$("$CM" vm exec --timeout 120 "$vm" -- sh -c \
-          'b=$(base64 < "$1" 2>/dev/null); rc=$?; printf "RC=%s\n%s\n" "$rc" "$b"' \
+          'b=$(base64 < "$1" 2>/dev/null); rc=$?; printf "RC=%s SIZE=%s\n%s\n" "$rc" "$(wc -c < "$1" 2>/dev/null)" "$b"' \
           lane-artifacts "$path" </dev/null 2>/dev/null)"
-  rc="$(printf '%s\n' "$raw" | sed -n '1s/^RC=//p' | tr -d '[:space:]')"
+  rc="$(printf '%s\n' "$raw" | sed -n '1s/^RC=\([0-9]*\) SIZE=.*/\1/p' | tr -d '[:space:]')"
+  # ⛔ THE SIZE IS MEASURED IN THE SAME EXEC AS THE TRANSFER. The previous version compared the decoded
+  # bytes against the size from the EARLIER scan row — a file that a LIVE lane is still appending to
+  # (the primary use case: `logs` exists for a running lane) grew in between, so the artifact arrived
+  # byte-perfect, was discarded as "TRUNCATED", and the operator was told it "did NOT arrive" and left
+  # with nothing. In-band cannot be stale, and still survives truncation because the size prefixes the
+  # payload.
+  want_in="$(printf '%s\n' "$raw" | sed -n '1s/^RC=[0-9]* SIZE=//p' | tr -d '[:space:]')"
+  [ -n "${want_in:-}" ] && want="$want_in"
   b64="$(printf '%s\n' "$raw" | tail -n +2 | tr -d '[:space:]')"
   if [ "${rc:-1}" != "0" ]; then
     printf '  ✗ pull failed (remote exit %s — unreadable or UNMEASURED): %s\n' "${rc:-?}" "$path" >&2
@@ -232,7 +247,13 @@ UNRESOLVED_LABELS="$(MAP_RAW=$MAP_RAW awk 'BEGIN{ n=split(ENVIRON["MAP_RAW"],a,"
 emit_box() {
   local label="$1" vm="$2" pat="$3" exact="$4" outdir="$5" lines="$6" since="$7"
   local raw first res rows p sz mt dest
-  raw="$(scan "$vm" "$pat" "$since" "$exact")"
+  raw="$(scan "$vm" "$pat" "$since" "$exact")"; local _src=$?
+  # ⛔ THE EXECu0027S OWN STATUS IS CHECKED, not just the sentinel. `__OK__` is printed by the remote shell
+  # BEFORE it streams the rows, so a channel that dies mid-scan (the 60 s timeout firing, a dropped
+  # connection) hands back the sentinel plus a PARTIAL row list — which read as "searched, matched
+  # nothing" and produced a confident ABSENT-EVERYWHERE while the file sat on that box. A short row
+  # list is a silent truncation of the universe, so the partial rows are DISCARDED, not used.
+  if [ "$_src" -ne 0 ]; then echo "── $label  UNMEASURED(exec failed rc=$_src — the row list may be partial)"; return 1; fi
   first="$(printf '%s\n' "$raw" | head -1)"
   if [ "${first:0:7}" = "__NOK__" ]; then
     echo "── $label  UNMEASURED(${first#__NOK__ })"
@@ -361,7 +382,8 @@ case "$verb" in
     T="$(printf '\t')"; reached=0
     show() {  # show <label> <vm> <fragment> <cap> <what> — checked in BOTH scans, not just the first
       local label="$1" vm="$2" frag="$3" cap="$4" what="$5" raw first rows
-      raw="$(scan "$vm" "$frag" "$since" 0)"
+      raw="$(scan "$vm" "$frag" "$since" 0)"; local _src=$?
+      if [ "$_src" -ne 0 ]; then echo "   UNMEASURED($what: exec failed rc=$_src — row list may be partial)"; return 1; fi
       first="$(printf '%s\n' "$raw" | head -1)"
       if [ "${first:0:7}" = "__NOK__" ]; then
         echo "   UNMEASURED($what: ${first#__NOK__ })"; return 1
