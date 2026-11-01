@@ -17,6 +17,10 @@ MAX=${MAX:-8}
 eval "$(sed -n '/^rails_for_repo() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^rails_should_defer() {/,/^}$/p' "$SUT")"
 command -v rails_should_defer >/dev/null || { echo "FATAL: rails_should_defer not found in $SUT"; exit 2; }
+# ⛔ `rails_should_defer` calls `say`, which the SCRIPT defines and this file does not — so without a stub
+# the fail-closed diagnostic resolves to /usr/bin/say (macOS text-to-speech) and is SPOKEN instead of
+# printed, a silent dependency on an unrelated system binary (measured, round 5).
+say() { printf '%s\n' "$*" >&2; }
 
 REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
 TABLE="$(cat <<'ROWS'
