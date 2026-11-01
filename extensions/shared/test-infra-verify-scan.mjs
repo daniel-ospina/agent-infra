@@ -34,7 +34,7 @@
 //
 // Runs per-PR via the explicit step in .github/workflows/ci.yml's `verify` job,
 // and again post-merge via the `extensions/*/test*.mjs` glob in ci-main.yml
-// (that glob alone is post-merge only — the same #708/#744/#709 pattern).
+// (that glob alone runs on the push lane, never on a PR — the same #708/#744/#709 pattern).
 // Plain node, zero deps.
 //
 // Scope: a ONE-OFF regression pin for #1051's start-point guard. It is not the

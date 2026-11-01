@@ -93,44 +93,38 @@
 # region and moved the job from :896 to :945, which left an earlier version of this very
 # block citing an unrelated `http-pool-hygiene` step — the declaration then looked
 # unsubstantiated, i.e. the false absence came back through the citation instead of the
-# logic. A later merge onto main moved it AGAIN, :945 -> :970, and the rebase of this
-# branch re-created the same rot: the numbers below were re-located by their quotes and
-# corrected — which is the rule working, not an exception to it). A THIRD move re-created
-# it once more: merging main into this branch pushed the job :970 -> :993 and
-# `script-validate` ci-main.yml:376 -> :386, and every coordinate below was re-located by
-# its quote again, in the same commit that moved it — because a citation that rots in the
-# very commit that moves the lines reads to the next lane as proof the claim is false.
-# Re-locate by the quote, and fix the number when you move it. A FOURTH move (the merge that
-# resolved this branch's conflicts) pushed every ci.yml coordinate again — +64 for the four job
-# coordinates and +11 for the :395 citation — and each was re-located by its quote in that same
-# commit; ci-main.yml's coordinates did not move.
-#   * ci.yml:1057 — the PR lane's job is `bash-suites` (`bash-suites:`), matrix
-#     `shard: [1, 2, …]` at :1147, so it PUBLISHES `bash-suites (1)` … `bash-suites (N)`,
-#     one check per slice, and each slice's step is `bash scripts/run-bash-shards.sh`
-#     (ci.yml:1185, `run: bash scripts/run-bash-shards.sh`);
-#   * ci-main.yml:388 — "the main lane runs the SAME sweep as ci.yml's `bash-suites`
-#     — this job calls the one runner below, UNSHARDED", and ci-main.yml:476 is that
-#     call: `bash scripts/run-bash-shards.sh`; main publishes ONE check named
-#     `script-validate` (ci-main.yml:386);
-#   * ci.yml:1159 — "ci-main.yml's `script-validate`: one runtime for the list, in
-#     both lanes" (also ci.yml:406, "today — ci-main.yml's script-validate job runs bash
-#     shards only"). ⛔ NOT ci.yml:1060: that line is the HISTORY of the pre-#1369 split
-#     ("while main's `script-validate` ran the bash sweeps + the hermetic suites") and
-#     describes a body WIDER than the list, so citing it here would argue AGAINST the
-#     containment this pair rests on (review cycle 3).
+# logic. That preamble is the rule working, not an exception to it: a citation that rots in the
+# very commit that moves the lines reads to the next lane as proof the claim is false, so every
+# reference below is a QUOTE first and a line number never. Re-locate by the quote.
+#   * ci.yml — the PR lane's job is `bash-suites`, matrix `shard: [1, 2, …]`, so it PUBLISHES
+#     `bash-suites (1)` … `bash-suites (N)`, one check per slice, and each slice's step is
+#     `run: bash scripts/run-bash-shards.sh`;
+#   * ci-main.yml — "the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job
+#     calls the one runner below, UNSHARDED", and that call is the step
+#     `bash scripts/run-bash-shards.sh`; main publishes ONE check named `script-validate`;
+#   * ci.yml — "ci-main.yml's `script-validate`: one runtime for the list, in both lanes",
+#     and "today — ci-main.yml's script-validate job runs bash shards only". ⛔ NOT the block
+#     that is the HISTORY of the pre-#1369 split ("while main's `script-validate` ran the bash
+#     sweeps + the hermetic suites"): it describes a body WIDER than the list, so citing it
+#     here would argue AGAINST the containment this pair rests on (review cycle 3).
 #   So main's ONE check RUNS the same list the PR slices, one shard at a time: the
 #   base reports this program under the other lane's name.
 #
 # ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
-# `script-validate` job has SIX steps, of which FOUR are validation steps (ci-main.yml:444
-# `node --check`, :456 the lane-parity guard, :462 its mutation self-test, :476 the shard
-# list) and the other two are `actions/checkout` (:429) and `actions/setup-node` (:434) —
-# while a `bash-suites (<n>)` slice runs only the shard list. So a red under that name may
-# be the shard list's red — or ANY other step's, including the setup ones. The equivalence
-# therefore establishes that the base RUNS this program and carries A red under its name;
-# it can never establish that the base's red is this suite's. That is why the answer is
-# phrased as a candidate (`base-caused via`) and why the paragraph under it says so out
-# loud.
+# `script-validate` job has SEVEN steps: four validation steps (the `node --check` syntax
+# pass, the lane-parity guard, that guard's mutation self-test, and the shard list), the two
+# setup steps (`actions/checkout`, `actions/setup-node`), and the `Materialize origin/main`
+# fetch step added by #3131/#3139 — while a `bash-suites (<n>)` slice runs only the shard
+# list. So a red under that name may be the shard list's red — or ANY other step's,
+# including setup or the fetch. The equivalence therefore establishes that the base RUNS
+# this program and carries A red under its name; it can never establish that the base's red
+# is this suite's. That is why the answer is phrased as a candidate (`base-caused via`) and
+# why the paragraph under it says so out loud.
+#
+# The steps above are NAMED, not line-cited, on purpose: these coordinates had already
+# drifted ~17 lines on main before this PR added its step, and a citation that rots is worse
+# than no citation — the containment argument rests on the step LIST, not on where each one
+# sits. Re-locate by quoting a step's `name:`/`run:` to check this.
 #
 # WHAT IT DOES NOT BUY, stated here so it cannot be read as more than it is:
 #   * it is a NAME-level statement about two LANES, not an identity-level statement
@@ -703,6 +697,19 @@
 #                                         silently ignored.
 
 set -uo pipefail
+
+# ⛔ THE RESERVE IS SPENT BY LANDINGS ONLY — AND "THE RESERVE" IS NOT THIS SCRIPT (#2342 review, P1).
+# `gh-limit.py` keeps a reserve below `GH_LIMIT_CORE_FLOOR` (default 800) and refuses a core-only read
+# that could not be served from GraphQL. This file used to carry a file-scope
+# `export GH_LIMIT_ESSENTIAL=1` here, which made EVERY `gh` in this script — and in every child it
+# spawns — exempt from that floor. That is the opposite of the policy the layer states
+# (`gh-limit.py::essential()`: "A poll is never essential"; docs/ops/gh-rate-limits.md:454): the
+# floor's reason to exist is the spend measured on THIS rail's own poll loops, so exempting them left
+# the guard unable to fire on its target. ⛔ AND IT BOUGHT THE LANDING'S WRITE NOTHING: `essential()`
+# has exactly one call site, on the NON-mutating arm — a write is refused only by the dated-empty
+# guard, which never consults it. The one in-tree declaration is therefore per call, on the read a
+# landing genuinely cannot do without: `repo-authority.sh::required_checks`
+# (`GH_LIMIT_ESSENTIAL=1 "$gh" api …/protection/required_status_checks`).
 
 # File-scope so the EXIT trap can read it after `main` returns (P1-2).
 TMP=""
@@ -1381,7 +1388,8 @@ fetch_run_failed_job_names() {
 # ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
 # `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
 # programs that PR job runs — the lane-parity guard and its mutation self-test — are
-# STEPS inside `script-validate` (ci-main.yml:456, :462). So a `bash-suites-gate` red
+# STEPS inside `script-validate` (named, not line-cited: see the note there). So a
+# `bash-suites-gate` red
 # ALSO has a base counterpart under that name, and this ONE pair does not map it: that
 # refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
 # scoping decision recorded on #2610), NOT a claim that the programs differ. Mapping
@@ -1508,7 +1516,13 @@ named_unattributable_runs() {
   else
     say_err "   The failing run(s), NAMED (${named_count}) — each check below is one whose failed-step"
   fi
-  say_err "   log yielded no failure identity, so it entered NEITHER side of the comparison:"
+  # ⛔ TWO REASONS, ONE LIST (agent-infra#3174). Since #3174 a run whose shard runner was KILLED
+  # mid-list is named here too: its ids exist but were REFUSED (the set is a truncated sample), so
+  # the list is no longer exclusively "yielded no identity". Naming only the old reason would send
+  # the operator to hunt a parser bug for a window whose remedy is a wider read.
+  say_err "   log yielded no failure identity, OR its shard recap was INCOMPLETE (the shard step was"
+  say_err "   killed mid-list, #3174 — those ids exist and were refused as a truncated SAMPLE) — so it"
+  say_err "   entered NEITHER side of the comparison:"
   while IFS= read -r line; do
     [ -n "${line//[[:space:]]/}" ] || continue
     runref="${line##*$'\t'}"
@@ -1582,11 +1596,11 @@ named_unattributable_runs() {
               say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
               say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
               say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
-              say_err "       (.github/workflows/ci-main.yml:476), and '${name}' is one shard of that same"
-              say_err "       list on a PR (.github/workflows/ci.yml:1057/1185), one runtime in both lanes"
-              say_err "       (ci.yml:1159). The base therefore carries a red under a name that RUNS this"
-              say_err "       list — but that job has FIVE other steps (node --check :444, the lane-parity"
-              say_err "       guard :456, its self-test :462, plus checkout :429 and setup-node :434), so the"
+              say_err "       (.github/workflows/ci-main.yml, step 'Bash shards'), and '${name}' is one"
+              say_err "       shard of that same list on a PR (.github/workflows/ci.yml, one runtime in both"
+              say_err "       lanes). The base therefore carries a red under a name that RUNS this list — but"
+              say_err "       that job has SIX other steps (checkout, setup-node, node --check, the lane-parity"
+              say_err "       guard, its self-test, and the origin/main materialization that #3131 added), so the"
               say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
               say_err "       an established identity: no identity was produced, so nothing here is"
               say_err "       comparable yet"
@@ -4350,7 +4364,7 @@ wait_for_first_checks() {
   local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
   local now last_clock dt fp summary max_step digest jobs
   local max_step_run fp_run summary_run read_ok n_lines idx
-  local stall_bound ceiling_bound signal_ok poll_step remaining adv
+  local stall_bound ceiling_bound signal_ok poll_step remaining adv wait_word expired
   local rederive_left lane_filter_active head_checks
   local -a jobs_files=() pending_ids=()
   FIRST_CHECKS_WAITED=0; FIRST_CHECKS_QUIET=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""
@@ -4608,43 +4622,64 @@ wait_for_first_checks() {
       FIRST_CHECKS_OUTCOME="$FIRST_CHECKS_STATE"
       return 1
     fi
+    # ── THE VERDICT ───────────────────────────────────────────────────────
+    # ⛔ THE EXPIRING POLL STILL REPORTS (#2862 CI regression). The verdict used to
+    # `return 1` from inside this table, i.e. BEFORE the report below — so the ONE
+    # poll an operator most needs to read (the one that ended the wait) was the only
+    # one that printed nothing about what it had observed. That is not a cosmetic
+    # gap: `$SECONDS` is a whole-second clock, so any poll whose work straddles a
+    # second boundary charges 1s, and a wait whose window IS 1s therefore expired on
+    # its FIRST observation whenever that happened — ~1 poll in 5 on a loaded runner.
+    # Measured: run 41110313398, job 124250724527 reddened `tests/admin-merge/run.sh`
+    # with "✗ BLOCK — the FIRST-CHECKS wait expired after 1s (ceiling 1s)" and NO
+    # report line above it, on a total wall clock of 226ms. Every fixture that
+    # asserts on a report line was therefore a coin flip, and the shard reddened
+    # every PR. Setting `expired` and reporting before returning makes the observation
+    # deterministic WITHOUT loosening a bound: the same verdict, the same instant, one
+    # more line — and the wait still sleeps zero additional seconds.
+    expired=0
     case "$FIRST_CHECKS_STATE" in
       still-running)
         if [ "$quiet" -ge "$stall_bound" ]; then
           FIRST_CHECKS_OUTCOME="stalled"
-          return 1
-        fi
-        if [ "$waited" -ge "$ceiling_bound" ]; then
+          expired=1
+        elif [ "$waited" -ge "$ceiling_bound" ]; then
           FIRST_CHECKS_OUTCOME="ceiling"
-          return 1
+          expired=1
         fi ;;
       never-started|unreadable)
         if [ "$waited" -ge "$FIRST_CHECKS_WAIT" ]; then
           FIRST_CHECKS_OUTCOME="$FIRST_CHECKS_STATE"
-          return 1
+          expired=1
         fi ;;
       unobservable)
         if [ "$missing" -ge "$FIRST_CHECKS_WAIT" ] || [ "$waited" -ge "$ceiling_bound" ]; then
           FIRST_CHECKS_OUTCOME="unobservable"
-          return 1
+          expired=1
         fi ;;
     esac
 
     # ── THE REPORT (patience, not a hang: say WHAT was observed) ──────────
+    # ⛔ A REPORT PRINTED ON THE POLL THAT ENDS THE WAIT MAY NOT SAY IT IS STILL
+    # WAITING. The observation is the same either way; only the tense changes, and a
+    # line that says "waiting" one line above a refusal that says "the window is
+    # spent" is the kind of message this repo treats as a defect, not a nicety.
+    wait_word="— waiting."
+    [ "$expired" -eq 1 ] && wait_word="— the bound is now spent, so this is the CLOSING observation."
     case "$FIRST_CHECKS_STATE" in
       never-started)
-        info "admin-merge: … FIRST-CHECKS wait: no run has appeared for head $head yet (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — waiting." ;;
+        info "admin-merge: … FIRST-CHECKS wait: no run has appeared for head $head yet (${waited}s of the ${FIRST_CHECKS_WAIT}s window) $wait_word" ;;
       unreadable)
-        info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — still waiting; unreachable is not empty." ;;
+        info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) $wait_word unreachable is not empty." ;;
       unobservable)
-        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${missing_streak}s consecutively) — waiting, and NOT calling it a stall: an unread instrument is not a stalled run." ;;
+        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, and the PROGRESS SIGNAL is unavailable (Jobs API unreadable for ${missing}s of the ${FIRST_CHECKS_WAIT}s fallback window in total, ${missing_streak}s consecutively) $wait_word This wait does NOT call it a stall: an unread instrument is not a stalled run." ;;
       *)
         if [ "$FIRST_CHECKS_TRANSITIONS" -eq 0 ]; then
-          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, no change observed yet (${waited}s of the ${ceiling_bound}s ceiling; stall bound ${stall_bound}s) — waiting. first observation: $summary"
+          info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress, no change observed yet (${waited}s of the ${ceiling_bound}s ceiling; stall bound ${stall_bound}s) $wait_word first observation: $summary"
         elif [ "$quiet" -eq 0 ]; then
-          info "admin-merge: … FIRST-CHECKS wait: still RUNNING and PROGRESSING — change #${FIRST_CHECKS_TRANSITIONS} observed at ${waited}s (${pending} run(s) pending, stall bound ${stall_bound}s, ceiling ${ceiling_bound}s): $summary"
+          info "admin-merge: … FIRST-CHECKS wait: still RUNNING and PROGRESSING — change #${FIRST_CHECKS_TRANSITIONS} observed at ${waited}s (${pending} run(s) pending, stall bound ${stall_bound}s, ceiling ${ceiling_bound}s): $summary $wait_word"
         else
-          info "admin-merge: … FIRST-CHECKS wait: still RUNNING, no change for ${quiet}s of the ${stall_bound}s stall bound (${waited}s of the ${ceiling_bound}s ceiling, ${FIRST_CHECKS_TRANSITIONS} change(s) so far) — last: $FIRST_CHECKS_LAST_CHANGE"
+          info "admin-merge: … FIRST-CHECKS wait: still RUNNING, no change for ${quiet}s of the ${stall_bound}s stall bound (${waited}s of the ${ceiling_bound}s ceiling, ${FIRST_CHECKS_TRANSITIONS} change(s) so far) — last: $FIRST_CHECKS_LAST_CHANGE $wait_word"
         fi ;;
     esac
 
@@ -4652,6 +4687,10 @@ wait_for_first_checks() {
     # bound it reports (the #1395 lesson again). The room is whichever verdict is
     # next: the stall clock for an observed surface, the legacy window for an
     # unobserved one, and the ceiling always.
+    # ⛔ AN EXPIRED WAIT DOES NOT SLEEP: the report above was the last thing it owed.
+    if [ "$expired" -eq 1 ]; then
+      return 1
+    fi
     remaining=$((ceiling_bound - waited))
     case "$FIRST_CHECKS_STATE" in
       still-running) [ $((stall_bound - quiet)) -lt "$remaining" ] && remaining=$((stall_bound - quiet)) ;;
@@ -6201,6 +6240,20 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
+# ⛔ ONE PATTERN FOR "an id NO LOCAL REPRODUCTION can execute" (#3715, #1185).
+# These families name no pytest nodeid, so handed to the runner as ARGV ONE of
+# them makes pytest EXIT 4 having run NOTHING (`ERROR: file or directory not
+# found`) and the whole base run clears nothing. TWO readers ask this question —
+# `reproduce_residual_on_base`, which must not hand them to the runner, and the
+# #3715 block, which reports that the surviving candidate set names nothing a
+# local run could execute. A second copy of the REGEX is exactly the drift the
+# rail's one-derivation rule forbids, so the regex lives here and nowhere else.
+# (This is ONE pattern with TWO readers, not one enumeration of the families:
+# `repro_scope`'s `case` arms answer a DIFFERENT question — admission into the
+# candidate set, which is #1185's narrowing — so a family added here must be
+# considered there too, and vice versa.)
+NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^bash-shard::|^runner::|^pipeline-compliance::'
+
 # ══ reproduce_residual_on_base — THE MISSING MEASUREMENT (#3715) ═══════════
 #
 # THE DEFECT. `main-rates.txt` is a FAILURE-ONLY projection over the last N runs
@@ -6274,15 +6327,22 @@ build_evidence() {
 #     baseline measured (a sibling failure in the same file): the rail's own
 #     `attribute_residual` calls that MEASURED-ABSENT, "not present on main",
 #     which is evidence of novelty. Only the absence of ANY measurement of the
-#     file is the missing measurement this constructs. AND EVERY NON-NODEID
-#     CLASS IS NEVER A CANDIDATE, because a base run cannot speak to what it
-#     asserts: an UNATTRIBUTABLE id (a class red across runs under a MOVING id —
-#     "cannot be attributed to this PR", and therefore never a merge), a
-#     guard-step identity (no local runner), and the other non-nodeid families a
-#     local pytest cannot execute (`collect-error::<file>` #6798,
+#     file is the missing measurement this constructs. AND A NON-NODEID CLASS
+#     IS NEVER CLEARABLE, because a base run cannot speak to what it asserts: an
+#     UNATTRIBUTABLE id (a class red across runs under a MOVING id — "cannot be
+#     attributed to this PR", and therefore never a merge), a guard-step
+#     identity (no local runner), and the other non-nodeid families a local
+#     pytest cannot execute (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
 #     `bash-shard::<path>` #2643, `runner::<job>` — passed as argv they make
-#     pytest exit 4 having run NOTHING). `repro_scope` then
+#     pytest exit 4 having run NOTHING). CANDIDACY AND CLEARANCE ARE NOT THE SAME
+#     SET (#1185): `repro_scope` admits ONE guard-step identity into the
+#     candidate set when the base's baseline was read and holds no row for its
+#     step, so the rail can REPORT that the base cannot speak to it — while the
+#     two filters in `reproduce_residual_on_base` keep it out of the runner's
+#     argv AND out of the base's own capture before `intersect_sets`, so a
+#     candidate of that class is still never cleared.
+#     `repro_scope` then
 #     `repro_candidates` are the one place that decision is made, and the cleared
 #     set is its intersection with the base's own failures (`intersect_sets`,
 #     below);
@@ -6296,7 +6356,11 @@ build_evidence() {
 #     invalid bound clears NOTHING and the rail blocks exactly as before — an
 #     unrun reproduction is never read as "pre-existing";
 #   * guard-step identities are NOT reproduced (they have no local runner) and
-#     always remain in the residual.
+#     always remain in the residual — `repro_scope` admits one into the
+#     CANDIDATE set only when the base holds no record of its step (#1185), and
+#     even then nothing local can execute it: `reproduce_residual_on_base`
+#     filters it from its argv AND from the base's own capture before the
+#     intersection, so it can never be cleared.
 #
 # The worktree is a throwaway under $TMP and is always removed.
 #
@@ -6334,10 +6398,12 @@ reproduce_residual_on_base() {
   # directory not found`), so a residual that mixes a collection error with real
   # nodeids aborted the whole base run and cleared nothing — the false block this
   # repair exists to remove, with no diagnostic naming the cause. (`repro_scope`
-  # already filters them from the candidate set; this is the function's own
-  # guard, so the contract holds for any caller.)
+  # filters them from the candidate set — EXCEPT the guard-step ids #1185 admits,
+  # the ones the base holds no record of, admitted so the rail can REPORT that
+  # fact; this is the function's own guard, so the contract holds for every
+  # caller, and it is also what keeps a base CAPTURE from volunteering one.)
   local nodeids
-  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' -e '^bash-shard::' -e '^runner::' -e '^pipeline-compliance::' "$residual" 2>/dev/null || true)"
+  nodeids="$(grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -6462,7 +6528,25 @@ reproduce_residual_on_base() {
   # implementation (never a second subtraction, never `comm -12`).
   if [ -n "$reproduced" ]; then
     printf '%s\n' "$reproduced" | sort -u > "$work/reproduced.all"
-    intersect_sets "$work/reproduced.all" "$residual" "$out" "$work/rep-outside.txt" || {
+    # ⛔ THE ARGV FILTER ABOVE DOES NOT BOUND WHAT MAY BE CLEARED (#1185 review,
+    # cycle 2). ⚠️ THIS FILTER IS UNFIXTURED: the cycle-2 author wrote a
+    # rail-level fixture for it and MEASURED that it did not discriminate (the
+    # same scenario cleared nothing with the filter removed), so the case was
+    # deleted rather than shipped as a vacuous green — the effect below is
+    # established by direct measurement of the parser instead
+    # (`python3 scripts/ci_exemption.py ids --log` on a capture carrying the
+    # `##[error]FAILED …` annotation prints the `guard-step::` id). `grep -Ev`
+    # bounds what the runner was ASKED to run; a CAPTURE can
+    # still volunteer an identity its argv never named — `ids --log` recovers
+    # them from anywhere in the log, and a capture carrying a `##[error]FAILED …`
+    # annotation emits a `guard-step::` identity. Since #1185 a guard-step id CAN
+    # be in `$residual` (the candidate set), so before this filter it could be
+    # subtracted from the rail's residual by the base's own output: a failure no
+    # local run can execute, CLEARED. One more filter on the BASE'S side, through
+    # the same one pattern, keeps "an id no local reproduction can execute can
+    # never be cleared" true whichever side reports it.
+    grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$work/reproduced.all" > "$work/reproduced.exec" 2>/dev/null || : > "$work/reproduced.exec"
+    intersect_sets "$work/reproduced.exec" "$residual" "$out" "$work/rep-outside.txt" || {
       : > "$out"; return 1
     }
   fi
@@ -6633,16 +6717,43 @@ intersect_sets() {
   return 0
 }
 
-# repro_scope <residual> <unattributable> <out> <scratch> — the ids a base run
-# could even SPEAK TO: the residual minus UNATTRIBUTABLE identities, minus
-# guard-step identities, and minus the other NON-NODEID families. All are
-# excluded on doctrine, not on evidence:
+# repro_scope <residual> <unattributable> <out> <scratch> [<mainfails>] — the ids
+# a base run could even SPEAK TO, PLUS (since #1185) the guard-step ids the base
+# holds NO record of: those are admitted so the rail can REPORT that fact, never
+# because a run could speak to them (nothing local can execute one — see the
+# caller's own branch). The set is the residual minus UNATTRIBUTABLE identities,
+# minus guard-step identities THE BASE HAS A RECORD OF, and minus the other
+# NON-NODEID families. Every arm is excluded on DOCTRINE — and the guard-step arm
+# alone is additionally decided on EVIDENCE from the base's OWN baseline
+# (`main_measured_files`), which is #1185's narrowing:
 #   * UNATTRIBUTABLE is "a class red across runs under a MOVING id — the identity
 #     provably will not be the same next run, so it cannot be attributed to this
 #     PR". Reproducing ONE of the moving ids on the base says nothing about the
 #     class, and the class is never a merge (`detect_rotating_identity`, E5).
-#   * a guard-step identity has no local pytest runner, so it cannot be
-#     reproduced and must always remain in the residual.
+#   * a guard-step identity has no local pytest runner, so a local run cannot
+#     reproduce it — but that is a statement about the RUNNER, and it is only
+#     half of the question. The other half is whether the BASE holds any record
+#     of the id's UNIT at all (#1185): main's baseline is a union over main's own
+#     runs, and a `pull_request`-only workflow NEVER RUNS ON MAIN, so its
+#     `guard-step::<step>::<shape>` ids can never appear there however red main
+#     is. Excluding that id as "a reproduction can never clear it" conflated two
+#     different facts and named neither: the failure is real and on this head,
+#     but the base has NO RECORD of the step, so `main-fails.txt`'s silence is a
+#     structural absence, not evidence of novelty (#7734's own distinction). So
+#     a guard-step id is admitted into the candidate set ONLY when
+#     `main_measured_files` holds no row for its UNIT — the SAME derivation
+#     `repro_candidates` applies at its FILE level, so the scope and the
+#     clearance cannot disagree.
+#     ⛔ WHAT THE CONDITION FORBIDS: it never admits a guard-step id whose step
+#     main's baseline DID measure. There main HAS evaluated the unit, its
+#     absence from the failure set is a measurement (MEASURED-ABSENT), and
+#     reading it as "the base holds no record" would let a REAL failure be filed
+#     as unmeasurable — the widening direction that turns a block into a
+#     misdiagnosis. An EMPTY or unreadable baseline admits nothing either, and
+#     that is a deliberate refusal, not an oversight: a failure-only baseline
+#     that is empty cannot tell "main is GREEN" from "main has no run at all"
+#     (#7734), so this function cannot assert the base holds no record on it.
+#     The id then keeps the pre-change exclusion — fail closed.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
 #     `bash-shard::<path>` #2643, `runner::<job>`,
@@ -6652,17 +6763,36 @@ intersect_sets() {
 #     NAME, never measurements a local run can clear (#3715 review, P2).
 # Return contract: 0 = computed (out may be empty) · 1 = could not compute.
 repro_scope() {
-  local residual="$1" unattrib="$2" out="$3" scratch="$4" nid
+  local residual="$1" unattrib="$2" out="$3" scratch="$4" mainfails="${5:-}" nid ukey main_units=""
   if [ -s "$unattrib" ]; then
     run_failure_set --diff "$residual" "$unattrib" > "$scratch" 2>/dev/null || return 1
   else
     cp "$residual" "$scratch" || return 1
   fi
+  # THE BASE-SIDE RECORD, through the ONE derivation `repro_candidates` uses. An
+  # absent or EMPTY baseline leaves this empty, which ADMITS NOTHING below: a
+  # failure-only baseline that is empty cannot tell "main is green" from "main
+  # has no run", so "the base holds no record of this unit" is not a claim this
+  # function can make from it (fail closed — the pre-change exclusion stands).
+  if [ -n "$mainfails" ] && [ -s "$mainfails" ]; then
+    main_units="$(main_measured_files "$mainfails")"
+  fi
   : > "$out"
   while IFS= read -r nid; do
     [ -n "$nid" ] || continue
     case "$nid" in
-      guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
+      guard-step::*)
+        # #1185: admissible ONLY when the base's record is POSITIVELY readable and
+        # holds no row for the id's UNIT. An empty record admits nothing.
+        ukey="$(failure_file_key "$nid")"
+        if [ -z "$main_units" ]; then
+          continue
+        fi
+        if grep -qxF -- "$ukey" <<<"$main_units" 2>/dev/null; then
+          continue
+        fi
+        ;;
+      collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
       bash-shard::*|runner::*|pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
@@ -7894,6 +8024,21 @@ main() {
         say_err "   yielded NO failure identity (its log could not be fetched, or the id parser"
         say_err "   could not read it — a missing/updated parser, or a moved log format)."
         say_err "   Re-running fixes the first; the second needs the parser updated." ;;
+      truncated:*)
+        # ── #3174: A THIRD STATE, AND ITS OWN REMEDY ───────────────────────────────
+        # The window WAS listed and read; its failing runs were KILLED MID-LIST, so the shard
+        # runner's recap is INCOMPLETE and the failure set it names is a SAMPLE. This is
+        # neither "main is green" nor "the listing could not be read", which is why it has
+        # its own arm: the remedy is a WIDER/OLDER window (or waiting for a completed run),
+        # NOT a re-run of the parser — the parser read the capture fine and refused it on
+        # purpose (scripts/ci-failure-set.sh `collect_union_truncated`).
+        say_err "   This is an UNPROVEN baseline, not an empty one and not a failed read: the window"
+        say_err "   WAS listed (main: completed=${main_completed_bad:-0} run(s), of which"
+        say_err "   tested=${main_tested_bad:-0}) but run ${main_unreadable#truncated:} was killed before"
+        say_err "   its shard list finished, so the failures it names are a TRUNCATED SAMPLE."
+        say_err "   Folding a partial set into the reference would report a real main failure as new."
+        say_err "   Remedy: re-read a window that contains a run whose shard step FINISHED (raise"
+        say_err "   --main-runs) — do NOT re-run the parser, which produced this verdict deliberately." ;;
       *)
         say_err "   This is an UNREADABLE window, not an empty baseline: main's run LISTING"
         say_err "   could not be read (or the capture refused before publishing any counters),"
@@ -7929,6 +8074,13 @@ main() {
         say_err "   A FAILED READ over a window that WAS listed: main's rate table measured"
         say_err "   $(report_value "$TMP/main-report.txt" tested) tested run(s), and run ${main_sig_unreadable#parse:}"
         say_err "   yielded no failure identity for the signature pass (fetch or parser)." ;;
+      truncated:*)
+        # #3174: same third state as the rate pass above — the signature table cannot be built
+        # from a run whose recap is truncated (scripts/ci_exemption.py refuses both doors).
+        say_err "   UNPROVEN, not unreadable: the window WAS listed and its failing run"
+        say_err "   ${main_sig_unreadable#truncated:} was KILLED before its shard list finished, so its"
+        say_err "   shard recap is incomplete and no signature table can be signed from it (#3174)."
+        say_err "   Remedy: re-read a window containing a run whose shard step FINISHED (raise --main-runs)." ;;
       *)
         say_err "   No signature pass ran over a read window: main's run LISTING could not be"
         say_err "   read (or the capture refused before it), so nothing was measured here." ;;
@@ -8199,7 +8351,7 @@ main() {
     # (step 2). An id WITH a row stays refused no matter what the base does.
     local cand="$TMP/repro-candidates.txt"
     if ! repro_scope "$TMP/unique.txt" "$TMP/unique.unattributable" \
-         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" \
+         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" "$TMP/main-fails.txt" \
        || ! repro_candidates "$TMP/repro-scope.txt" "$TMP/main-fails.txt" "$cand" \
          "$TMP/repro-idlevel.txt" "$TMP/main-files.txt"; then
       repro_line="Reproduction on base: attempted on base $repro_base; the candidate set could not be computed through the shared parser — the refusal stands (fail closed)"
@@ -8209,12 +8361,25 @@ main() {
       # carries a main-side measurement, or every id's FILE is measured on main
       # (MEASURED-ABSENT). Naming the wrong one would be a false report.
       if [ ! -s "$TMP/repro-scope.txt" ]; then
-        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job) — the refusal stands"
+        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job). A guard-step is NOT in this class only when it is not UNATTRIBUTABLE (that arm wins first) AND main's baseline was READ, is non-empty, and holds no row for its step (#1185) — then it reaches the candidate set and is reported there; an EMPTY or unreadable baseline keeps it in THIS class, because a failure-only baseline cannot tell 'main is green' from 'main has no run' (#7734). The refusal stands"
       elif [ ! -s "$TMP/repro-idlevel.txt" ]; then
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to carries a main-side measurement, so there is no missing measurement to construct — the refusal stands"
       else
         repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to sits in a FILE main's baseline measured (MEASURED-ABSENT), which is evidence of novelty — the refusal stands"
       fi
+    elif ! grep -Eqv "$NON_LOCAL_REPRO_ID_RE" "$cand" 2>/dev/null; then
+      # #1185: THE CANDIDATE SET NAMES NO ID A LOCAL RUN COULD EXECUTE. The scope
+      # admitted such an id because `main_measured_files` carries no row for its
+      # unit, and no local runner can execute it — so NOTHING WAS ATTEMPTED, and
+      # the honest report is the fact that made it unmeasurable rather than "the
+      # reproduction could not RUN" (it never ran because it was never runnable).
+      # The message names NO family on purpose: the admission is `repro_scope`'s
+      # case arms, the report's classifier is `NON_LOCAL_REPRO_ID_RE`, and a
+      # family added to one and not the other must not produce a message that
+      # asserts WHICH family the operator is looking at.
+      # NOTHING IS CLEARED: the failure is on this head, and the refusal stands
+      # exactly as before.
+      repro_line="Reproduction on base: NOT attempted on base $repro_base — no candidate names an id a LOCAL run could execute, and the base's failure baseline holds no row for their units, so neither a local reproduction nor main's rate table can speak to them. The refusal stands"
     elif ! is_full_sha "$repro_base"; then
       # A REF NAME is not a pinned base. `check_surface_probe` falls back to the
       # REF when the commits API cannot resolve a SHA, and `git worktree add main`

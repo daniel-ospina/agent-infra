@@ -281,11 +281,36 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
   if [ -n "$REPO" ]; then
     url="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
     case "$url" in
-      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      # ⛔ THE TRAILING-SLASH SPELLINGS ARE PART OF THE TARGET (review of #3188, P2). `git remote add` accepts
+      # `https://github.com/<owner>/<repo>/` and humans type it; without these arms such a checkout was
+      # refused as "NOT the queue target" and the recorded cause called the RIGHT repo a DIFFERENT one.
+      # `resolve_repo`'s two callers rely on this ONE predicate; the cause predicates carry the same list.
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/") ;;
       "") echo "[refresh] NOT PROVISIONABLE: \$REPO ($REPO) has no readable 'origin' remote, so this pass cannot prove it is a checkout of $OR — an unproven checkout is how the wrong repo's issues get queued (#1901)"
           echo "[refresh]   fix: git -C $REPO remote set-url origin https://github.com/$OR.git  (or unset REPO and let this script derive one)"
           return 1 ;;
       *) case "$url" in
+           # ⛔ A `file://` URL NAMES NO REPO IDENTITY (review cycle 14, P2). It is URL-SHAPED, so the
+           # arm below reported it as "NOT the queue target … pre-flighting one repo's issues against
+           # another repo's tree is #1901" — an identity claim this pass never measured, about the
+           # shape `repo-slug.sh:52` refuses for exactly that reason, and about the one this file's own
+           # header (:21-23) calls a legitimate local mirror. The refusal is right; the identity claim
+           # is not. Same words as the recorded cause (`_pair`'s `file://*)` arm), so log and record
+           # cannot disagree.
+           file://*)
+             echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is the local mirror $url — a file:// URL names no repo identity, so it cannot prove it is a checkout of \$OR ($OR)"
+             echo "[refresh]   refusing is deliberate: a path cannot certify a queue target. Retrying cannot fix it, and the checkout is not evidence of a DIFFERENT repo either"
+             # ⛔ AND THE REMEDY MUST BE ONE THAT CAN WORK (review cycles 15-16, P2). The local-path
+             # arm's "or unset OR to use the harness default" was copied here, where it does not hold the
+             # way it does there: that arm is GATED on OR_DECLARED, while this one is not. ⛔ AND NO
+             # UNIVERSAL MAY BE SUBSTITUTED FOR IT (measured, cycle 16): "a file:// origin is refused
+             # whether or not $OR was declared" is FALSE — the accept list above matches the path's
+             # TRAILING segment, so a mirror whose tail spells `<owner>/<repo>` is ACCEPTED, and in that
+             # shape unsetting OR changes which slug the tail is matched against. So the line states the
+             # operant remedy and claims nothing about the gate. `(h3)` pins that the copied clause is
+             # absent.
+             echo "[refresh]   fix: give the checkout a real remote (git -C $REPO remote set-url origin https://github.com/$OR.git)"
+             return 1 ;;
            # A URL-shaped origin names a repo that can be COMPARED, so a difference is a refusal.
            *://*|*@*:*)
              echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is $url — NOT the queue target $OR"
@@ -324,7 +349,11 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
     git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
     url="$(git -C "$cand" config --get remote.origin.url 2>/dev/null || true)"
     case "$url" in
-      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git") ;;
+      # ⛔ THE TRAILING-SLASH SPELLINGS ARE PART OF THE TARGET (review of #3188, P2). `git remote add` accepts
+      # `https://github.com/<owner>/<repo>/` and humans type it; without these arms such a checkout was
+      # refused as "NOT the queue target" and the recorded cause called the RIGHT repo a DIFFERENT one.
+      # `resolve_repo`'s two callers rely on this ONE predicate; the cause predicates carry the same list.
+      "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/") ;;
       *) continue ;;
     esac
     REPO="$(cd "$cand" && pwd -P)" || continue
@@ -973,17 +1002,15 @@ gh_env_verdict() {
 # being wrong differs: refusing costs one PR's merge, certifying a free issue costs duplicated work
 # on two boxes.
 #
-# ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
-# through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
-# seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
-# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT the bare `cp` this comment used
-# to prescribe: depth-1 `*.sh` leaves `gh-limit/gh`, `gh-limit.py` and `retired/*` behind, which is the
-# #2041 shape. `install.sh` is not the answer either — it REPORTS drift rather than installing, and the
-# remedy it prints is now this same helper), so a deployed cell has it; a
-# box without it cannot take the claim either, and refusing to queue on a missing FILE would make
-# every such box merge-only — a bigger, less reversible failure than the state being removed.
-# Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a
-# provisioning failure (rc=3 below), because that one is local, permanent, and fixable in seconds.
+# MISSING IS REFUSED TOO — agent-infra#2466 REVERSED THE OLD "loud fallthrough" (2026-10-23). The old
+# rule let a box with NO registry file keep dispatching, unclaimed, on the argument that making a
+# missing file refuse would turn such a box merge-only. Two things changed that: (a) the PR path now
+# abstains on an unreadable registry as well, so the cell is not "merge-only" — it is silent, and this
+# change makes the silence announced with the one-line remedy; and (b) the fallthrough was not loud in
+# the place that matters: `issue_claim_verdict` ALREADY returned INCOMPLETE for a missing file, and the
+# call site simply did not ask it. So missing, unreadable and PRESENT-BUT-STALE are one polarity
+# (refuse), and `--check` refuses them up front. The migration cost is one command, named in the log
+# line and in `--check`'s output; the cost of the old behaviour was two lanes on one issue.
 # ⛔ THE REGISTRY PATH IS NOT READ FROM THE ENVIRONMENT (2026-10-16 review). `CLAIMS_SH` was a
 # regression-test seam, but three production callers had begun to honour it, which let an ambient
 # value resolve a DIFFERENT registry in each of them — a gate half-disabled by the environment, the
@@ -1221,9 +1248,15 @@ cmd_check() {
     fi
     echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
   else
-    # NOT a failure: the documented loud fallthrough (issue_claim_verdict's STATED LIMIT). The box
-    # dispatches, without the cross-box gate, and says so — the same verdict the refresh reaches.
-    echo "[refresh] check: claim registry=$O/claims.sh absent — the refresh will WARN per issue and dispatch without a cross-box claim"
+    # ⛔ A MISSING REGISTRY IS NOT A PASS (agent-infra#2466). This arm used to certify the cell and say
+    # the refresh would "WARN per issue and dispatch without a cross-box claim" — a check blessing the
+    # exact state the run now refuses, i.e. a false PASS. The run path (`issue_claim_verdict`) answers
+    # INCOMPLETE for a missing file, and `--check` must refuse what the run refuses, so both name the
+    # same one-line remedy.
+    echo "[refresh] check: FAIL $O/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
+    echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE (claim-unreadable), so a cell on this repo would dispatch NOTHING"
+    echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
+    return "$EXIT_NOT_PROVISIONABLE"
   fi
   # ⛔ JUDGE THE INTERPRETER THE REFRESH WILL ACTUALLY USE. `--check` must not create the scout
   # worktree, but the venv it reads must be the one the run will find there. Reading
@@ -1819,7 +1852,41 @@ fi
 # stands in must not pre-flight anything (the scout worktree is created INSIDE $REPO below).
 if ! resolve_repo; then
   [ -n "$REPO" ] || repo_unresolved
-  exit "$EXIT_NOT_PROVISIONABLE"
+  # ⛔ THIS WAS THE LAST BARE `exit` IN THE PROVISION STAGE — AND IT RECORDED NO CAUSE (agent-infra#3174,
+  # measured 2026-11-01). `resolve_repo` prints its own refusal to the LOG and then this line exited with
+  # rc=3, so `refresh_on_exit` wrote `why=… the failing step recorded no cause` into
+  # `state/refresh-last` — the exact #2229 symptom the other exits in this stage were converted to
+  # `provision_fail` to remove. The controller's `[dispatch] BLOCKED` line quotes THAT FILE, not the
+  # log, so the one sentence an operator reads named nothing while the real reason sat one line above it.
+  # ⛔ THE CAUSE NAMES ONLY WHAT WAS MEASURED (review cycles 1-2, P2). It rendered an unset `$REPO` as
+  # `$REPO ('')` beside "a local-path origin cannot prove a DECLARED target" — three claims about an
+  # origin that was never read, in the one string `refresh_cause_brief` quotes. `resolve_repo` has
+  # FOUR distinct REPO-set refusals (unreadable origin, a `file://` mirror that names no repo identity,
+  # a URL naming another repo, a local path that cannot prove a DECLARED target) plus the unset-`$REPO`
+  # search, so this names the shape it actually read instead of guessing one. Pointing at "the lines above" is NOT an option here: that is the
+  # `the failing step recorded no cause` sentence this exit is being fixed to stop writing.
+  if [ -n "$REPO" ]; then
+    _origin="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
+    case "$_origin" in
+      '') _pair="\$REPO ('${REPO}') has NO READABLE 'origin' remote, so it cannot prove it is a checkout of \$OR ('${OR:-}')" ;;
+      # ⛔ A `file://` URL NAMES NO REPO IDENTITY (review cycle 13, P2). It matched `*://*` and was
+      # therefore reported as "NOT the queue target … a DIFFERENT repo, and no retry can mend a
+      # mismatch" — an identity claim this pass never measured, about a shape `repo-slug.sh:52`
+      # refuses for exactly that reason (and which the header of this file calls a legitimate local
+      # mirror at :21-23). Its own arm, before the URL case.
+      file://*) _pair="\$REPO ('${REPO}') has the local-mirror 'origin' ${_origin} — a file:// URL names no repo identity, so it cannot prove it is a checkout of \$OR ('${OR:-}'; OR_DECLARED='${OR_DECLARED:-?}'); refusing is deliberate, since a path cannot certify a queue target" ;;
+      *://*|*@*:*)
+         case "$_origin" in
+           "$OR"|"$OR.git"|*":$OR"|*":$OR.git"|*"/$OR"|*"/$OR.git"|*"/$OR/"|*"/$OR.git/"|*":$OR/"|*":$OR.git/")
+             _pair="\$REPO ('${REPO}') carries an 'origin' that names \$OR ('${OR:-}') yet the resolver refused it — see the refusal above (OR_DECLARED='${OR_DECLARED:-?}')" ;;
+           *) _pair="\$REPO ('${REPO}') has 'origin'=${_origin}, which is NOT the queue target \$OR ('${OR:-}') — a DIFFERENT repo, and no retry can mend a mismatch" ;;
+         esac ;;
+      *) _pair="\$REPO ('${REPO}') has the local-path 'origin' ${_origin}, which cannot prove a DECLARED \$OR ('${OR:-}'; OR_DECLARED='${OR_DECLARED:-?}')" ;;
+    esac
+  else
+    _pair="no \$REPO was set and no candidate checkout of \$OR ('${OR:-}') was found where this harness puts one (OR_DECLARED='${OR_DECLARED:-?}')"
+  fi
+  provision_fail "$EXIT_NOT_PROVISIONABLE" "sub-step=resolve-repo: $_pair"
 fi
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
@@ -2581,18 +2648,275 @@ if not _disp_ok:
     print("[reap] SKIPPED (dispatched.txt unreadable) — an unreadable blacklist is not an empty one; "
           "nothing is reaped and the file is left exactly as it was")
     _disp_rows = []
+# ── THE CAPPED WINDOW IS NOT AN ANSWER, SO THE ENTRIES IT CANNOT REACH ARE ASKED DIRECTLY ──────
+# ⛔ `.open_iss` IS `--limit 500` created-DESC against a repo with 1371 open issues (measured
+# 2026-10-30, daniel-ospina/tortoise), so it is PERMANENTLY saturated: every issue older than the 500
+# newest OPEN ones is absent from it for ever. The reap below reads that absence as "cannot prove it
+# is open" — the right polarity for the CLOSED question, and the WRONG one for the RELEASE question,
+# because it makes the suppression PERMANENT: an abandoned dispatch falls out of the window, is never
+# dropped from `dispatched.txt`, therefore never leaves `checked.txt`, therefore is SKIPPED by every
+# later pass and never re-enters `candidates.txt` (which the dispatch cycle prunes of dispatched ids).
+# The issue stays open, nobody works it, and the one line an operator reads counts it as `dispatched`.
+# MEASURED on the live box: the shipped reap released NOTHING (0 releasable of 384) while 169 of the
+# 203 entries in `dispatched.txt` were outside the window. Of the 12 asked in the first bounded pass,
+# ALL were OPEN — and `.pr_brs` is as saturated as `.open_iss` (4142 PRs exist, 500 visible), so "no PR"
+# is NOT a fact this pass can read: 7 of those 12 turned out to have head-ref-naming MERGED PRs outside
+# the window (verified: #1789 → PR 8041, #2107 → PR 8128, both MERGED, both issues still OPEN).
+# ⛔ SO ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN, window-blind entry is KEPT and NAMED. The reason is
+# in this file's own words: the LANDED verdict comes ONLY from the issue's own CLOSED state (`:4552-4559`,
+# tortoise#8625), so an OPEN issue whose PR merged reads **CLEAN** in the pre-flight and is re-queued —
+# a lane re-implementing shipped work (#8560/#7174). The reap may end SILENCE; it may not cause a
+# requeue. What it therefore delivers is (a) every CLOSED entry reclaimed, (b) the OPEN class COUNTED and
+# NAMED on the operator line every pass, rotated so the whole class is named over time — a stated deficit
+# instead of an invisible permanent suppression. Closing that half needs the PR question answered
+# authoritatively per entry (a timeline/linked-PR read), which is a separate change.
+# So the entries the window cannot answer for get the AUTHORITATIVE, UNCAPPED question —
+# `gh issue view <N> --json state`, exactly the reading the landed prune below already takes for the same
+# reason. A CLOSED issue's dispatch is settled for ever ⇒ drop it. OPEN or unreadable ⇒ KEEP, fail-closed
+# per entry, unchanged.
+# ⛔ BOUNDED BY A ROTATING CURSOR, NOT A HEAD WINDOW. `DISPATCHED_RECHECK_MAX` (default 12, ceiling 96)
+# asks per pass against the numerically sorted ambiguous list, starting after
+# `state/dispatched-recheck-cursor` and wrapping to the start, so a head of permanently-unreadable
+# entries can never consume the budget for ever — the #1729 defect the checked-release rotation below
+# exists to avoid. A cap that is 0, negative or unreadable is COERCED **and NAMED**: a bound of 0 that
+# disables a mechanism silently is a silent disable wearing the shape of a measurement (the rule
+# `CHECKED_RELEASE_MAX` already follows). The cost is GraphQL `gh issue view`, only for entries with
+# no live lane, no PR ref and no window answer, and it is taken ABOVE the affordability gate for the
+# same reason the claim filter below is: on the starved box — the one where a stale suppression hurts
+# most — housekeeping would otherwise never run.
+DISPATCHED_RECHECK_CEILING = 96
+
+
+def _issue_num(x):
+    """Sort key for a `dispatched.txt` row. ⛔ `str.isdigit()` IS TRUE FOR CHARACTERS `int()` REJECTS
+    (superscript two is a digit and not a number), and an unguarded `int()` on one raised out of this
+    heredoc, aborted the reap and took `EXIT_TRANSIENT` on EVERY later pass — the permanent
+    no-dispatch loop this block's own comments record being fixed twice. Non-numeric rows sort first
+    and are PRESERVED, never dropped."""
+    s = (x or "").strip()
+    if s.isdigit() and len(s) <= 18:
+        try:
+            return int(s)
+        except ValueError:
+            return -1
+    return -1
+
+
+def issue_state_targeted(n):
+    """The issue's own state, straight from gh — UNCAPPED, and None on ANY failure (which every
+    caller reads as "keep the entry", never as "closed"). The timeout is load-bearing: this is a
+    network call taken ABOVE the affordability gate, so a hung `gh` must not stall the pass."""
+    if not OR:
+        return None
+    try:
+        r = subprocess.run(["gh", "issue", "view", n, "--repo", OR, "--json", "state"],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return None
+        state = json.loads(r.stdout).get("state")
+    except Exception:
+        return None
+    if not isinstance(state, str):
+        return None
+    return state.strip().upper() or None
+
 if have_open and _disp_ok:
-    keep, reaped = [], []
+    keep, reaped, _window_blind = [], [], []
     for n in _disp_rows:
         if not n:
             continue
         if n in live:
             keep.append(n); continue
         has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
-        if n in open_iss and not has_pr:
+        if has_pr:
+            keep.append(n); continue
+        if n in open_iss:
             reaped.append(n)
         else:
-            keep.append(n)
+            _window_blind.append(n)
+    # The ambiguous class is the only one asked over the network, and only within a rotating bound.
+    if _window_blind and not OR:
+        # ⛔ NO SLUG, NO ASK. `issue_state_targeted` returns None before any subprocess runs, so without
+        # this the line reported "asked N of M … unreadable, KEPT: N" — naming a read that was NEVER
+        # ATTEMPTED — and advanced the rotation past entries nothing had looked at. Both are claims about
+        # an action the pass did not take, and the operator's remedy is the missing slug, not the bucket.
+        print("[reap] dispatched re-check SKIPPED — no repo slug for this checkout, so the %d "
+              "window-blind entr(ies) cannot be asked; they are all KEPT (an unaskable entry is not a "
+              "released one) and they are: %s. Fix: the checkout's `origin` remote"
+              % (len(_window_blind), " ".join(sorted(_window_blind, key=_issue_num))))
+        keep.extend(_window_blind)
+        keep = list(dict.fromkeys(keep))
+    elif _window_blind:
+        # ⛔ A CAP OF 0 IS NOT A MEASUREMENT, IT IS A DISABLED MECHANISM — so it is coerced and SAID.
+        # Silently asking nothing while 169 entries stay suppressed for ever is the exact failure this
+        # block removes, one knob away.
+        _rch_raw = (os.environ.get("DISPATCHED_RECHECK_MAX", "") or "").strip()
+        if not _rch_raw:
+            _rch_max = 12
+        elif _rch_raw.isdigit() and len(_rch_raw) <= 6:
+            try:
+                _rch_max = int(_rch_raw)
+            except ValueError:
+                # ⛔ `str.isdigit()` IS TRUE FOR CHARACTERS `int()` REJECTS (a superscript two), and an
+                # unguarded conversion here aborted the reap and took EXIT_TRANSIENT on EVERY later pass
+                # — the permanent no-dispatch loop this block's neighbour `_issue_num` exists to prevent.
+                _rch_max = 12
+                print("[reap] WARN DISPATCHED_RECHECK_MAX=%r is a digit but not a number — coerced to 12"
+                      % _rch_raw)
+            if _rch_max <= 0:
+                _rch_max = 12
+                print("[reap] WARN DISPATCHED_RECHECK_MAX=%r is not a usable bound — coerced to 12, NOT "
+                      "read as 'ask nothing' (a bound of 0 would leave the window-blind class suppressed "
+                      "for ever, silently)" % _rch_raw)
+        else:
+            _rch_max = 12
+            print("[reap] WARN DISPATCHED_RECHECK_MAX=%r is not a number — coerced to 12" % _rch_raw)
+        if _rch_max > DISPATCHED_RECHECK_CEILING:
+            print("[reap] WARN DISPATCHED_RECHECK_MAX=%d exceeds the %d ceiling — clamped (this pass is "
+                  "taken ABOVE the affordability gate, so an unbounded cap would spend the shared "
+                  "GraphQL bucket on housekeeping)" % (_rch_max, DISPATCHED_RECHECK_CEILING))
+            _rch_max = DISPATCHED_RECHECK_CEILING
+        # ⛔ ASKABLE ROWS ONLY. A row that is not an issue number cannot be asked (the sibling rotation's
+        # own mechanism, `case ... *[!0-9]*) continue`), so it must never occupy a cap slot or be decided
+        # by a network answer — only the RULE had been carried over, which made the line report one row as
+        # both dropped and "can never be asked (KEPT)". They are KEPT and counted separately.
+        _unaskable = sorted({x for x in _window_blind if _issue_num(x) < 0})
+        _ordered = sorted({x for x in _window_blind if _issue_num(x) >= 0},
+                          key=lambda x: (_issue_num(x), x))
+        _cursor = 0
+        try:
+            with open(os.path.join(ST, "dispatched-recheck-cursor")) as _cfh:
+                _cursor = int((_cfh.read().strip() or "0"))
+        except (OSError, ValueError):
+            _cursor = 0
+        _start = 0
+        for _i, _x in enumerate(_ordered):
+            if _issue_num(_x) > _cursor:
+                _start = _i
+                break
+        # ⛔ ASK ALL WHEN THE LIST FITS THE BOUND — and never ask one entry twice. Concatenating the
+        # list to itself and slicing is the wrap, but on a list SHORTER than the cap it re-asks the
+        # same numbers (`asked 8 of 4`), which both spends the budget on repeats and makes the reap's
+        # own counters disagree with the list (caught by the rotation fixture, not by inspection).
+        # ⛔ THERE IS NO ZERO-CAP ARM, ON PURPOSE: every path above coerces `_rch_max` into [1, 96], so a
+        # `not _rch_max` branch here would be unreachable — and an unreachable safety net is worse than
+        # none, because a later edit that made zero reachable again would believe it was covered. The
+        # coercion (`<= 0` → 12, named) is the ONE place a zero is refused.
+        if len(_ordered) <= _rch_max:            _asked = list(_ordered)
+        else:
+            _asked = _ordered[_start:_start + _rch_max]
+            if len(_asked) < _rch_max:
+                _asked = _asked + _ordered[:_rch_max - len(_asked)]
+        _askedset = set(_asked)
+        # ⛔ ONLY A **CLOSED** ISSUE IS RELEASED. An OPEN one is KEPT and NAMED, however abandoned it
+        # looks, and the reason is measured in this file's own words: the LANDED verdict comes ONLY from
+        # the issue's own state being CLOSED (`:4552-4559`, tortoise#8625), so an OPEN issue whose PR was
+        # merged reads **CLEAN** in the pre-flight and is re-queued — a lane re-implementing shipped
+        # work, which is the #8560/#7174 class this whole reap exists to prevent. The window-blind "no PR"
+        # fact cannot tell the two apart, so the reap must not act on it: silence is what it may end, a
+        # requeue is what it may not cause. Named on the line instead of dropped, counted, and rotated.
+        # ⛔ A CLOSED ENTRY IS ONLY RECLAIMED WHEN ITS QUEUE ROW IS ALREADY GONE. `dispatched.txt` is the
+        # ONLY thing standing between a persisted `candidates.txt` row and a spawned lane: the dispatcher
+        # skips an id it finds there (`orch-loop.sh:6095`) and `lane.sh` never re-reads the issue's state,
+        # while `candidates.txt` is pruned BY THE SAME FILE (`orch-loop.sh:5531`, rc discarded). So dropping
+        # the row for an issue that is still listed there un-protects it — a lane for a closed issue is
+        # exactly the #8560/#7174 class this arm exists to avoid. Keep it this pass; the prune removes the
+        # queue row and the next pass reclaims the entry, which converges one cycle later with no window
+        # in which the queue row is unprotected.
+        # ⛔ AN UNREADABLE `candidates.txt` IS NOT AN EMPTY ONE — the same polarity `read_soft` documents
+        # and the `_REFUSED` arms above already take. `or []` collapsed UNREADABLE (None) into "nothing is
+        # queued", so a CLOSED entry whose queue row IS still there was dropped from `dispatched.txt` and
+        # `checked.txt` — and `dispatched.txt` is the only thing filtering that row from a spawned lane.
+        # One non-UTF-8 byte in the queue is enough (bash and `awk` read it fine, so the prune keeps the
+        # row). Unverifiable ⇒ KEEP every CLOSED entry this pass and SAY so.
+        _queue_rows = read_soft("candidates.txt")
+        _queue_unreadable = _queue_rows is None
+        _queued_now = set(l for l in (_queue_rows or []) if l)
+        _settled, _blind_open, _unreadable, _still_queued = [], [], [], []
+        for _n in _asked:
+            _st = issue_state_targeted(_n)
+            if _st == "CLOSED":
+                if _queue_unreadable or _n in _queued_now:
+                    keep.append(_n); _still_queued.append(_n)
+                else:
+                    reaped.append(_n); _settled.append(_n)
+            elif _st == "OPEN":
+                keep.append(_n); _blind_open.append(_n)
+            else:
+                keep.append(_n); _unreadable.append(_n)
+        # Everything the bound did not reach this pass is KEPT and named, never silently dropped: the
+        # cursor is what makes "not asked yet" a deferral rather than a verdict.
+        for _n in _ordered:
+            if _n not in _askedset:
+                keep.append(_n)
+        keep = list(dict.fromkeys(keep))
+        if not _ordered and _unaskable:
+            print("[reap] dispatched re-check: 0 askable row(s) outside the capped open-issue window; "
+                  "%d row(s) are not issue numbers and can never be asked (KEPT): %s"
+                  % (len(_unaskable), " ".join(_unaskable)))
+        if _asked:
+            # ⛔ A ROW THAT IS NOT AN ISSUE NUMBER IS NOT `deferred` — it can never be asked, so promising a
+            # release would be a promise that cannot happen (the rule `:3128` states for the sibling
+            # rotation). `_ordered` is FILTERED to `_issue_num(x) >= 0`, so an unaskable row is never in
+            # the ring at all and can never consume a cap slot; it is counted and NAMED from its own list.
+            _nonnumeric = _unaskable
+            _def = max(0, len(_ordered) - len(_asked))
+            print("[reap] dispatched re-check: asked %d of %d entr(ies) the capped open-issue window "
+                  "cannot answer for (cap %d) — CLOSED and settled, dropped from dispatched.txt: %s; "
+                  "CLOSED but still listed in candidates.txt, KEPT (its queue row is protected only by "
+                  "this file, so the prune goes first): %s; OPEN, KEPT because a merged PR naming an OPEN "
+                  "issue reads CLEAN downstream (LANDED comes only from a CLOSED issue), so releasing it "
+                  "would re-queue shipped work: %s; unreadable, KEPT: %d%s%s%s"
+                  % (len(_asked), len(_ordered), _rch_max,
+                     " ".join(_settled) if _settled else "none",
+                     " ".join(_still_queued) if _still_queued else "none",
+                     " ".join(_blind_open) if _blind_open else "none", len(_unreadable),
+                     (" (%s)" % " ".join(_unreadable)) if _unreadable else "",
+                     "" if _def <= 0
+                     else "; %d deferred to a later pass by the rotating cursor" % _def,
+                     "" if not _nonnumeric
+                     else "; %d row(s) are not issue numbers and can never be asked (KEPT): %s"
+                     % (len(_nonnumeric), " ".join(_nonnumeric))))
+            if _queue_unreadable:
+                print("[reap] WARN candidates.txt is UNREADABLE — a CLOSED entry is kept this pass "
+                      "because its queue row cannot be proved gone (an unreadable queue is not an "
+                      "empty one; dropping the dispatched.txt row is what would un-protect it)")
+            try:
+                # ⛔ THE LAST ASKED, NOT THE MAXIMUM (review round 5). `max()` over a WRAPPED window is
+                # the global maximum, so the next pass restarted at the head and re-asked exactly the
+                # entries the wrap pass had just asked (`5555 1111` → cursor 5555 → `1111 2222`) — up to
+                # `cap - 1` redundant asks per lap on a bucket four boxes share, and the review-proof that
+                # the fixture could not tell the two rules apart. `_asked[-1]` resumes after the last entry
+                # asked, wrapping only when the list really is exhausted.
+                _last = _issue_num(_asked[-1])   # inside `if _asked:`, so there is no empty half
+                with open(os.path.join(ST, ".dispatched-recheck-cursor.%d" % os.getpid()), "w") as _wf:
+                    _wf.write("%d\n" % _last)
+                os.replace(os.path.join(ST, ".dispatched-recheck-cursor.%d" % os.getpid()),
+                           os.path.join(ST, "dispatched-recheck-cursor"))
+            except (OSError, ValueError):
+                # ⛔ UNLINK THE TEMP, the way `publish()` above does. Without this a failed `os.replace`
+                # (ENOSPC, EACCES, or a DIRECTORY where the cursor should be) leaves
+                # `.dispatched-recheck-cursor.<pid>` behind on EVERY pass, in the very directory this
+                # reap writes, with nothing to prune it — measured: three passes, three orphans.
+                try:
+                    os.unlink(os.path.join(ST, ".dispatched-recheck-cursor.%d" % os.getpid()))
+                except OSError:
+                    pass
+                print("[reap] WARN: could not persist the dispatched re-check cursor — the next pass "
+                      "restarts at the head of the ambiguous list (a rotation that never advances, "
+                      "so the tail defers for ever)")
+    # ⛔ THE FILE'S ORDER IS THE PREVIOUS FILE'S ORDER, AND `reaped` IS THE ONLY VERDICT. Building `keep`
+    # by appending (live, then has-PR, then asked, then deferred) rotated the rows relative to each other
+    # on every pass, so `dispatched.txt` churned a diff for no reason and a reader comparing two passes saw
+    # movement that was not a decision. This rebuild reads the ORIGINAL rows minus `reaped`, so:
+    #   * the order is preserved, and duplicates in the file are preserved with it (NOT deduped — the
+    #     earlier comment claiming "a dedupe for free" was wrong);
+    #   * ⛔ EVERY `keep.append(...)` INSIDE THE BLOCK ABOVE IS THEREFORE INERT. A new keep-arm must add
+    #     the row to `reaped`'s complement implicitly by simply NOT appending it to `reaped` — appending
+    #     to `keep` there does nothing at all, and this line is the only place that decides the file.
+    _reaped_set = set(reaped)
+    keep = [n for n in _disp_rows if n and n not in _reaped_set]
+    reaped = list(dict.fromkeys(reaped))
     with open(os.path.join(O, "dispatched.txt"), "w") as fh:
         fh.write("\n".join(keep) + ("\n" if keep else ""))
     if reaped:
@@ -2611,7 +2935,8 @@ if have_open and _disp_ok:
         if kept_ck is not None and os.path.exists(ck):
             with open(ck, "w") as fh:
                 fh.write("\n".join(kept_ck) + ("\n" if kept_ck else ""))
-        print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+        print("[reap] un-blacklisted (open, no PR, no live lane; a CLOSED issue's dispatch is settled): %s"
+              % " ".join(sorted(reaped, key=_issue_num)))
 
 # ── THE CHECKED CLASSIFICATION: A SUPPRESSION SURVIVES ONLY WHILE A RE-CHECKABLE FACT HOLDS ─────
 # `checked.txt` short-circuits the walk before any network call, so an entry in it is invisible to
@@ -2723,22 +3048,9 @@ if _landed_rows is None:
     _landed_rows = []
 landed_entries = [l for l in _landed_rows if l]
 
-def landed_issue_state(n):
-    """The issue's own state, straight from gh — UNCAPPED, and None on ANY failure
-    (which the caller reads as "keep the entry", never "closed")."""
-    if not OR:
-        return None
-    try:
-        r = subprocess.run(["gh", "issue", "view", n, "--repo", OR,
-                            "--json", "state"], capture_output=True, text=True)
-        if r.returncode != 0:
-            return None
-        state = json.loads(r.stdout).get("state")
-    except Exception:
-        return None
-    if not isinstance(state, str):
-        return None
-    return state.strip().upper() or None
+# ⛔ ONE AUTHORITY for the targeted read: the dispatched reap above takes it too, so the two prunes
+# cannot drift into asking the same question two ways.
+landed_issue_state = issue_state_targeted
 
 if landed_entries:
     still_landed, released, settled, unreadable = [], [], [], []
@@ -2756,14 +3068,14 @@ if landed_entries:
             fh.write("\n".join(still_landed) + ("\n" if still_landed else ""))
     if settled:
         print("[reap] landed list: decision made (issue CLOSED), dropped: %s"
-              % " ".join(sorted(settled, key=int)))
+              % " ".join(sorted(settled, key=_issue_num)))
     if released:
         print("[reap] landed list: issue is OPEN — RELEASED (a pre-#8625 entry came from the timeline "
               "title arm on an OPEN issue, which would otherwise suppress a now-authorized issue "
-              "forever): %s" % " ".join(sorted(released, key=int)))
+              "forever): %s" % " ".join(sorted(released, key=_issue_num)))
     if unreadable:
         print("[reap] landed list: %d entr(ies) could not be re-read — KEPT, not assumed closed: %s"
-              % (len(unreadable), " ".join(sorted(unreadable, key=int))))
+              % (len(unreadable), " ".join(sorted(unreadable, key=_issue_num))))
 PY
 reap_rc=$?
 if [ "$reap_rc" -ne 0 ]; then
@@ -2841,20 +3153,22 @@ _ck_tmp="$O/.checked-decided.$$"
 : > "$_ck_tmp" || { echo "[refresh] ABORT: cannot write $_ck_tmp — the checked classification could not be persisted (#2183)"; exit "$EXIT_TRANSIENT"; }
   if [ ! -s "$O/state/checked-release-candidates" ]; then
     : # the classification ran and found EVERY entry justified: nothing to ask, nothing to release
-  elif [ ! -f "$O/claims.sh" ]; then
-    # ⛔ A BOX WITHOUT THE REGISTRY IS THE DOCUMENTED LOUD FALLTHROUGH (issue_claim_verdict's STATED
-    # LIMIT): it cannot take a claim either, so refusing to release would leave a suppression no
-    # reader on that box could ever justify. No network read happens here, so the cap does not apply.
-    echo "[reap] the claim registry ($O/claims.sh) is NOT INSTALLED — releasing on local facts only (documented fallback)"
-    # ⛔ AND THE LINE SAYS SO (review E, cycle 5): the claim read is the one fact this pass cannot
-    # answer locally, and a release made without it is indistinguishable on the operator line from a
-    # fully claim-checked one. `none` means "nothing was refused"; this uses its own value.
-    CHECKED_REFUSED="claim-registry-absent"
-    while IFS= read -r _n; do
-      case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
-      printf '%s\treleased\n' "$_n" >> "$_ck_tmp"
-    done < "$O/state/checked-release-candidates"
   else
+    # ⛔ A MISSING REGISTRY IS NOT A LICENCE TO RELEASE (agent-infra#2466, review P2). This branch used
+    # to hold an `elif [ ! -f "$O/claims.sh" ]` arm that released every candidate "on local facts
+    # only" and called it the documented loud fallthrough — citing `issue_claim_verdict`'s STATED
+    # LIMIT, a section the same change DELETED and replaced with "MISSING IS REFUSED TOO". So the arm
+    # acted on a policy that no longer existed anywhere, while the one-polarity rule it broke is
+    # stated three other places in this file (the `--check` arm, the walk's ICR=2 arm, the dispatch
+    # arm): missing, unreadable and stale are ONE polarity — refuse.
+    # The refusal is already implemented one branch below by the ask loop, which calls
+    # `issue_claim_verdict` unconditionally and maps its 2 (INCOMPLETE, the answer for a missing
+    # file) to `claim-unknown` → the suppression is KEPT and COUNTED. The arm above pre-empted it.
+    # ⛔ BUT THE OPERATOR LINE STILL SAYS IT (kept from that arm, review E cycle 5): the claim read is
+    # the one fact this pass cannot answer locally, so a pass that could not consult the registry
+    # must not be byte-identical on the line to one that did. `none` means "nothing was refused";
+    # this uses its own value. It records a REFUSAL now, which is what the slug always described.
+    [ -f "$O/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
     _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
     # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
     # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the
@@ -3059,12 +3373,13 @@ _ck_tmp="$O/.checked-decided.$$"
     # an operator to a field that never moves.
     echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — every entry it did not record is counted as skipped_checked_unknown (the breakdown still sums, so reason_conflict cannot show this) rather than name a reason nobody verified"
   fi
-  # ⛔ `refused=` IS PUBLISHED HERE (review): the no-registry fallback above sets
-  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say a release was made WITHOUT the
-  # cross-box claim read — and nothing ever wrote it here, while the funnel's reader re-initialises the
-  # variable from THIS record. Measured before this line existed: `checked_refused=none` on a box with no
-  # `$O/claims.sh`, i.e. the one release that skipped the claim check was byte-identical on the operator
-  # line to a fully claim-checked one — the "a fact with no statement" defect this change exists to end.
+  # ⛔ `refused=` IS PUBLISHED HERE (review): the absent-registry arm above sets
+  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say this pass could not consult
+  # the cross-box registry — and nothing ever wrote it here, while the funnel's reader re-initialises
+  # the variable from THIS record. Measured before this line existed: `checked_refused=none` on a box
+  # with no `$O/claims.sh`, i.e. a pass that never read the claim registry was byte-identical on the
+  # operator line to a fully claim-checked one — the "a fact with no statement" defect this change
+  # exists to end.
   if printf 'released=%s deferred=%s unjustified=%s refused=%s sort_failed=%s at=%s\n' \
        "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${CHECKED_REFUSED:-none}" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
        > "$O/state/.checked-reap.$$" 2>/dev/null \
@@ -4158,30 +4473,30 @@ while read -r N; do
         # the block's own rule is that neither line may claim an action this script did not take. The
         # reset makes the guarantee local: an empty reason can only come from THIS candidate.
         CLAIM_RESULT=''
+        # ⛔ A MISSING REGISTRY IS `ICR=2` (INCOMPLETE, never CLEAN) — agent-infra#2466. This call used
+        # to sit behind `if [ -f "$O/claims.sh" ]`, so an UNPROVISIONED box left `ICR=0` and QUEUED the
+        # issue: the one case the old note called a "documented loud fallthrough" was in fact a silent
+        # fail-open in the only place this block declares it never fails open, and it is the shape a
+        # second cell hits when it was never provisioned — the exact duplicate dispatch the issue claim
+        # exists for. `issue_claim_verdict` already answers 2 for a missing file, so the fix is to ASK
+        # it rather than to decide for it: one verdict, no second path. The cost is that an
+        # unprovisioned box queues nothing until the one-line remedy in `--check` is run.
+        #
         # ⛔ NO "MISSING READER" GUARD IS NEEDED HERE, and a guard was removed rather than kept (review,
         # F1): this loop body is also driven STANDALONE by selftest.sh, where `issue_claim_verdict` is
         # not defined and the call returns 127 — but the `case` below NAMES its CLEAN arm and sends
-        # every unrecognised code to `*)`, which is INCOMPLETE and queues nothing. The removed guard
-        # claimed that 127 "therefore QUEUES"; the `*)` arm forbids exactly that (#1853 review: "only
+        # every unrecognised code to its default, which is INCOMPLETE and queues nothing. The removed
+        # guard claimed that 127 "therefore QUEUES"; that arm forbids exactly that (#1853 review: "only
         # an explicit 0 queues"). It changed the log text only, so it is not restored: a line that
         # claims an invariant the adjacent code already holds is the class this file refuses.
-        # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE on the ordinary CLEAN path — the documented loud
-        # fallthrough (see issue_claim_verdict's STATED LIMIT), and the only case in which a box
-        # without the registry keeps dispatching. It is NOT a verdict: the branch below announces it
-        # every time. It is NOT tolerated when the registry is the ONLY authority left: if the board
-        # could not answer either, nothing has answered the holder question (HOLDER_BY_CLAIMS), so the
-        # fallback below turns it into ICR=2 instead.
-        if [ -f "$O/claims.sh" ]; then
-          # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
-          # condition's status surviving into the else branch.
-          # (A reader that does not exist is the `*)` arm's job, not a special case: 127 is an
-          # unrecognised verdict, so it is INCOMPLETE and never queues.)
-          issue_claim_verdict "$N"; ICR=$?
-        elif [ "${HOLDER_BY_CLAIMS:-0}" = 1 ]; then
-          ICR=2; CLAIM_RESULT="the pre-flight's holder surface could not answer and the cross-box claim registry ($O/claims.sh) is NOT INSTALLED"
-        else
-          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)"
-        fi
+        #
+        # ⛔ AND IT SUBSUMES THE `HOLDER_BY_CLAIMS` ARM THAT STOOD HERE (merge of main's #1853 work with
+        # #2466): that arm spelled the same refusal out by hand (`[ -f "$O/claims.sh" ]` … `elif
+        # HOLDER_BY_CLAIMS=1` … else). One unconditional call reaches all three outcomes from ONE
+        # verdict — a present registry answers, a missing file answers 2, a missing READER answers 127
+        # and falls to the default — so the hand-written arm was a second path to the same answer and
+        # is deleted rather than kept beside it.
+        issue_claim_verdict "$N"; ICR=$?
         # ⛔ THE CLEAN ARM IS NAMED, NOT THE WILDCARD (2026-10-16 review). `case 1) … 2) … *) CLEAN`
         # read EVERY other code — 127 from a missing function, and any code a foreign or future
         # registry might return — as CLEAN and queued the issue: fail-OPEN, in the one place this

@@ -156,7 +156,25 @@ case "${1:-}" in
   surface)
     [ "${CMUX_HOST:-0}" = "1" ] || { echo 'cmux: unknown resource scope "surface"' >&2; exit 1; }
     if [ "${2:-}" = "ls" ]; then exit 0; fi
-    if [ "${2:-}" = "new-terminal" ]; then printf 'surface:term_host42\n'; exit 0; fi
+    if [ "${2:-}" = "new-terminal" ]; then
+      # ⛔ `--machine` IS MANDATORY IN THE CURRENT CLI, AND ITS ABSENCE IS WHAT LOST EVERY SPAWN
+      # (`Error: surface new-terminal: --machine <id|local> is required`, measured 2026-10-29 — six
+      # refusals in one pass while the controller read healthy). A stub that answers regardless of
+      # argv is a PERMISSIVE stub, and a permissive stub is exactly why the default in
+      # worker-terminal.sh had no assertion: the old "add the flag only when WT_MACHINE is set" shape
+      # satisfied every arm here. Modelled faithfully, so the default is EXECUTED — and so a revert
+      # reproduces the OUTAGE (refusal, no record) instead of merely a missing word.
+      _mt=""; shift 2
+      while [ "$#" -gt 0 ]; do
+        case "${1:-}" in
+          --machine) _mt="${2:-}"; shift ;;
+          --) break ;;
+        esac
+        shift
+      done
+      [ -n "$_mt" ] || { echo 'Error: surface new-terminal: --machine <id|local> is required' >&2; exit 1; }
+      printf 'surface:term_host42\n'; exit 0
+    fi
     ;;
   layout)
     # ⛔ FAIL-ONCE, and WITH A CHOSEN MESSAGE (agent-infra#2404). The measured refusal carried the
@@ -461,6 +479,21 @@ ck "…that carries the caller's command verbatim" $rc
 ck "the env snapshot (the keys the terminal does NOT inherit) is written 0600" $rc
 grep -q '^export O=' "$TMP/O1/state/env-lane-7.sh" && rc=0 || rc=1
 ck "…and it carries O, which a durable terminal would otherwise lose" $rc
+# THE uv PIN IS IN THE SNAPSHOT (agent-infra#2159). A lane is the process that runs `uv sync`, so this
+# snapshot is the ONE delivery point that reaches every worker on every platform — the controller's
+# `export -p` alone leaves a box that never pinned its cache at the filesystem's mercy (measured: a
+# cold-cache cell MATERIALISED ~5.8 GB per worktree and went 17 GB free -> 257 MB in ~50 minutes).
+grep -q '^export UV_CACHE_DIR=' "$TMP/O1/state/env-lane-7.sh" && grep -q '^export UV_LINK_MODE=' "$TMP/O1/state/env-lane-7.sh" && rc=0 || rc=1
+ck "…and the uv cache + link-mode pin, so the lane's venv is hardlinked rather than a full copy (#2159)" $rc
+# …and the DEFAULT is what a box that never pinned it gets: with both variables unset in the caller's
+# environment the snapshot must still carry the repo's values. Without this case the line above passes
+# on any box whose shell profile happens to set them (this box's own does), proving nothing.
+rm -rf "$TMP/O4"
+# XDG_CACHE_HOME is unset TOO: on a host that sets it the snapshot would be $XDG_CACHE_HOME/uv and the
+# case would red for a reason that has nothing to do with the pin (hermetic-or-nothing).
+env -u UV_CACHE_DIR -u UV_LINK_MODE -u XDG_CACHE_HOME bash "$TMP/b1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O4" "$TMP/cmux4.log" >/dev/null 2>&1
+grep -q "^export UV_LINK_MODE='hardlink'$" "$TMP/O4/state/env-lane-7.sh" && grep -q "^export UV_CACHE_DIR='.*\.cache/uv'$" "$TMP/O4/state/env-lane-7.sh" && rc=0 || rc=1
+ck "…and with both UNSET in the caller it emits the repo DEFAULTS (the pin is not left to a profile)" $rc
 # A failed create must NOT look like a worker: no record, no run script, non-zero rc.
 rm -rf "$TMP/O2"; CMUX_LAYOUT_RC=1 bash "$TMP/b1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O2" "$TMP/cmux2.log" >"$TMP/b2.out" 2>&1
 grep -q 'rc=1' "$TMP/b2.out" && [ ! -f "$TMP/O2/state/worker-lane-7" ] && rc=0 || { rc=1; cat "$TMP/b2.out"; }
@@ -690,15 +723,18 @@ envout="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-plain" XDG_CONFIG_HOME="$TMP
 case "$envout" in *"XDG=[unset] GHCD=[unset]"*) rc=0 ;; *) rc=1; echo "      $envout";; esac
 ck "…and a DEFAULT-config probe UNSETS both, so an inherited config dir cannot repoint the worker's gh" $rc
 # ⛔ A `keys.env` THAT FAILS TO SOURCE IS FATAL (review finding): `wt_runfile` already dies (`|| exit
-# 98`), and the tmux arm must agree — otherwise a failed source silently drops the token assignment
-# and runs a credential-less lane on a spawn that returned 0 and wrote its record.
+# 94`), and the tmux arm must agree — otherwise a failed source silently drops the token assignment
+# and runs a credential-less lane on a spawn that returned 0 and wrote its record. ⛔ 94, NOT 98
+# (review finding): this comment said 98, which was the code BEFORE the env-file arms got their own
+# code — a `keys.env` fault was never a gh-credential fault, and the stale number is exactly the
+# conflation that renumbering removed.
 rm -rf "$TMP/home-badkeys" "$TMP/O4t"; gh_hosts_fixture "$TMP/home-badkeys"
 printf 'GH_TOKEN=ghp_ok\nBADLINE ( (\n' > "$TMP/home-badkeys/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t" "$TMP/home-badkeys" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 env -i PATH=/usr/bin:/bin "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
-[ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
-ck "a keys.env that fails to source EXITS 98 (the worker's own shell dies before it runs the command)" $rc
+[ "$rcs" = "94" ] && rc=0 || { rc=1; echo "      rc=$rcs prefix=$pfx"; }
+ck "a keys.env that fails to source EXITS 94, an ENV-FILE fault not a credential one (the worker's own shell dies before it runs the command)" $rc
 # ⛔ THAT GUARD IS NOW ENFORCED BEFORE ANY SESSION EXISTS (P1 review finding, 2026-10-23, MEASURED).
 # This note used to say only that `tmux new-session -d` returns 0 as soon as the session object exists,
 # so a worker that exits 98 in its first millisecond is still recorded as started — true, and filed as
@@ -770,8 +806,8 @@ printf 'GH_TOKEN=ghp_ok\nexit 0\n' > "$TMP/home-exit/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t1x" "$TMP/home-exit" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
 reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-exit" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"; rcs=$?
-[ "$reach" = "" ] && [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
-ck "a keys.env with a top-level 'exit 0' exits 98 (the file terminated its shell, so the token check never ran)" $rc
+[ "$reach" = "" ] && [ "$rcs" = "94" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
+ck "a keys.env with a top-level 'exit 0' exits 94 (the file terminated its shell, so the token check never ran)" $rc
 # ⛔ …AND A FILE THAT PARSES BUT ABORTS **BEFORE** THE TOKEN IS STILL FATAL (the other half, measured):
 # `return 1` is legal in a sourced file and `sh -n` accepts it, so a syntax pre-check alone would let the
 # source stop before the token assignment and run the worker credential-less on an rc=0 spawn. The guard
@@ -782,9 +818,14 @@ rm -rf "$TMP/home-return" "$TMP/O4t3"; mkdir -p "$TMP/home-return"
 printf 'FOO=1\nreturn 1\nGH_TOKEN=ghp_ok\n' > "$TMP/home-return/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t3" "$TMP/home-return" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"
-[ "$reach" = "" ] && rc=0 || { rc=1; echo "      reach=[$reach] prefix=$pfx"; }
-ck "a keys.env that aborts BEFORE the token exits 98 (a parse check alone would have run it)" $rc
+reach="$(env -i PATH=/usr/bin:/bin HOME="$TMP/home-return" "$BASH" -c "$pfx; printf 'REACHED'" 2>/dev/null)"; rcs=$?
+# ⛔ THE CODE IS PINNED, NOT JUST THE REFUSAL (review finding, 2026-10-31): this arm used to assert only
+# that the prefix refused, so it stayed green whatever code was emitted — and the 98 message was free to
+# deny this very shape ("a 98 never means a bad keys.env") with nothing to contradict it. The sentinel
+# still sees a `return 1` source succeed, so this file is NOT a 94; the credential guard fires and
+# answers 98, which is the fact the refusal text must state rather than deny.
+[ "$reach" = "" ] && [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      reach=[$reach] rc=$rcs prefix=$pfx"; }
+ck "a keys.env that aborts BEFORE the token exits 98 — an ENV-FILE fault in the gh bucket, so 98 must not claim gh-only" $rc
 # …and the same abort AFTER the token has been exported is NOT fatal — the environment holds the
 # credential the worker needs, which is the question the guard is asking.
 rm -rf "$TMP/home-return2" "$TMP/O4t4"; mkdir -p "$TMP/home-return2"
@@ -969,13 +1010,123 @@ rm -rf "$TMP/home-guard" "$TMP/O4t9"; gh_hosts_fixture "$TMP/home-guard"
 printf 'EXTRA=1\n' > "$TMP/home-guard/keys.env"
 out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-absent" "$TMP/O4t9" "$TMP/home-guard" 2>&1)"
 pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
-case "$pfx" in *"*) false || exit 98"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *) rc=1 ;; esac
+case "$pfx" in *"*) false; exit 97"*) rc=1 ;; *"*) "*"auth token"*) rc=0 ;; *) rc=1 ;; esac
 ck "…the guard never credits a file the worker's own gh could not spend (no gh => REFUSED, not blessed)" $rc
 if command -v perl >/dev/null 2>&1; then
-  case "$pfx" in *"perl -e 'alarm 10; exec @ARGV' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
+  # ⛔ THE `; exit 93` IS PART OF THE PIN (#3138 review): perl's failed `exec` returns FALSE and the
+  # one-liner ends with status 0, so without it the guard BLESSES a worker whose gh could not be run —
+  # the fail-open direction. The bound and the absolute path are pinned here; the fail-closed tail is
+  # pinned by the same string.
+  case "$pfx" in *"perl -e 'alarm 10; exec @ARGV; exit 93' '/"*) rc=0 ;; *) rc=1; echo "      prefix=$pfx";; esac
   ck "…and its gh call is BOUNDED and ABSOLUTE (a hung gh would freeze the controller's whole cycle)" $rc
   case "$pfx" in *"|| gh auth token"*|*"|gh auth token"*) rc=1 ;; *) rc=0 ;; esac
   ck "…and no bare gh lookup survives in the guard (it is the build-time absolute path)" $rc
+fi
+# ── THE GUARD NAMES WHICH FAULT IT HIT (#3138) ──────────────────────────────────
+# ⛔ WHAT THIS PINS, AND WHY THE POLARITY MATTERS. `exit 98` used to mean BOTH "no credential" and "the
+# local read had not finished when the alarm fired". The second is not a credential fault at all — it is
+# a probe that could not answer — and on 2026-10-30 the conflation is what read as `the credential
+# contract FAILS (rc=98)` for a credential that was present, on a controller that had diagnosed the PR
+# queue correctly: the mac's review worker was REFUSED every cycle and agent-infra merged 0 PRs for 9 h.
+# The two arms below are the DISCRIMINATION: the same absent-credential fixture, the only difference
+# being the exit status gh itself produced.
+if command -v perl >/dev/null 2>&1; then
+  # (a) THE PROBE COULD NOT ANSWER — SIGALRM is what perl's `alarm` raises on the exec'd child, and the
+  # stub reproduces exactly that status, so the mapping (and not just the string) is pinned.
+  rm -rf "$TMP/bin-alarm" "$TMP/home-alarm" "$TMP/O4alarm"; mkdir -p "$TMP/bin-alarm"; gh_hosts_fixture "$TMP/home-alarm"
+  printf '#!/usr/bin/env bash\nkill -ALRM $$ 2>/dev/null || exit 142\nsleep 5\n' > "$TMP/bin-alarm/gh"
+  chmod +x "$TMP/bin-alarm/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-alarm/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-alarm" "$TMP/O4alarm" "$TMP/home-alarm" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-alarm:/usr/bin:/bin" HOME="$TMP/home-alarm" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "96" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 96: the PROBE could not answer)"; }
+  ck "…a PROBE that could not answer in time exits 96 (a TIMING fault, not an absent credential)" $rc
+  # (b) THE CREDENTIAL IS ABSENT — gh ran and answered with nothing. Same fixture, different status.
+  rm -rf "$TMP/bin-notoken" "$TMP/home-notoken" "$TMP/O4notoken"; mkdir -p "$TMP/bin-notoken"; gh_hosts_fixture "$TMP/home-notoken"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin-notoken/gh"
+  chmod +x "$TMP/bin-notoken/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-notoken/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-notoken" "$TMP/O4notoken" "$TMP/home-notoken" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-notoken:/usr/bin:/bin" HOME="$TMP/home-notoken" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "98" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 98: credential absent)"; }
+  ck "…and a credential that is ABSENT/UNREADABLE still exits 98 (the fail-closed direction, unchanged)" $rc
+  # (c) THE REFUSAL TEXT CARRIES THE REMEDY, NOT JUST THE NUMBER. Asserted at the SOURCE because producing
+  # a real `wt_spawn` refusal for each arm costs a tmux surface; the decoder is a pure `case` on $pre_rc.
+  grep -qF 'the credential PROBE could not answer in time' "$LIB" \
+    && grep -qF 'the GH CREDENTIAL is absent or unreadable' "$LIB" \
+    && grep -qF 'an ENVIRONMENT FILE the launch line sources is unreadable' "$LIB" \
+    && grep -qF 'the MODEL credential is blank in the worker (rc=95' "$LIB" \
+    && grep -qF 'the credential read NEVER RAN or was KILLED' "$LIB" \
+    && grep -qF 'the launch-line PRE-CHECK could not finish' "$LIB" \
+    && grep -qF 'NO gh BINARY could be resolved' "$LIB" && rc=0 || rc=1
+  ck "…and the refusal text distinguishes them with a remedy each (probe-timing vs the credential arms)" $rc
+  # (d) THE OTHER ARMS GET THEIR OWN CODES TOO, so a `keys.env` that will not parse cannot be reported
+  # as an absent gh credential — the opposite conflation, and the one review caught. ⛔ THE CODES ARE
+  # PINNED, NOT JUST THE MESSAGE TEXT (review finding, 2026-10-30): the first version grepped prose that
+  # is emitted regardless of the status, so reverting `exit 95` to `exit 98` — the exact P1 it was
+  # supposed to guard — left the suite at 299/0.
+  # ⛔ EACH ENV-FILE ARM SEPARATELY (review finding, 2026-10-30): a single `grep -q 'exit 94; if
+  # command -v bash'` is satisfied by the `pi-keys.env` arm ALONE, so reverting the `keys.env` arm to 98
+  # — the exact mis-attribution this arm was written for, restored on the other half — stayed green.
+  # The count is pinned at 2 so a revert of EITHER arm reddens.
+  # ⛔ LITERALS, NOT SUBSTRINGS (review finding, 2026-10-30): `grep -q 'exit 93'` is satisfied by the
+  # COMMENT above the guard and by the SIBLING arm, so deleting the real emitter `93) exit 93` or the
+  # `_guard="false; exit 93"` arm left the suite at 300/0 while a non-executable gh was reported as
+  # "the GH CREDENTIAL is absent" and a box with no `perl` got the same wrong remedy. Each emission is
+  # now pinned by the comment-free literal around it.
+  _94n="$(grep -c 'exit 94; if command -v bash' "$LIB")"
+  [ "$_94n" = "2" ] && grep -qF '126|127|13[0-9]|14[0-9]|15[0-9]) exit 93 ;; *) exit 98' "$LIB" \
+    && grep -qF '_guard="false; exit 93"' "$LIB" && grep -qF 'exec @ARGV; exit 93' "$LIB" \
+    && grep -qF 'this lane could not authenticate a single model call" >&2; exit 95 ;; esac' "$LIB" \
+    && grep -q 'the GH CREDENTIAL is absent or unreadable' "$LIB" && rc=0 || rc=1
+  ck "…and BOTH env-file arms emit 94 (count: $_94n) and the 93/95/98 EMISSIONS are pinned literally" $rc
+  # ⛔ THE FAULT MUST NAME THE **DEFECT**, NOT AN UNRELATED PR (review finding, 2026-10-31): the 96 remedy
+  # cited `agent-infra#3099`, which is a MERGED PR about the shard list — so an operator who hit this
+  # timing fault was sent to an issue that cannot explain it, which is the dead-end diagnosis this very
+  # change exists to remove, one level up. #3138 is the defect. Pinned in BOTH directions: the right
+  # number must be present AND the wrong one must be gone, because a later edit that copies an old
+  # comment would otherwise reinstate it silently.
+  grep -qF 'agent-infra#3138' "$LIB" && ! grep -qF '#3099' "$LIB" && rc=0 || rc=1
+  ck "…and the 96 remedy cites the DEFECT (#3138), never the unrelated shard PR (#3099)" $rc
+  # ⛔ NO DECODED MESSAGE MAY DENY A FAULT IT CAN ACTUALLY REPORT (review finding, 2026-10-31): two
+  # claims contradicted the code they sit next to — the 98 text said "a 98 never means a bad keys.env"
+  # while the `home-return` arm above produces exactly that, and the guard's own contract still said "no
+  # gh at all → exits 98" twelve lines above the `_guard="false; exit 97"` that emits 97. A maintainer
+  # trusting either one would delete the 97 arm (and this suite's 97 arm) as dead code and restore the
+  # bucketing this change removes. Pinned in both directions, like the #3138 pin.
+  ! grep -qF 'a 98 never means a bad keys.env' "$LIB" \
+    && grep -qF 'fires BEFORE its token line also lands here' "$LIB" \
+    && ! grep -qF 'so with no gh at all the fallthrough exits' "$LIB" \
+    && grep -qF 'IT IS **NOT** 98' "$LIB" && rc=0 || rc=1
+  ck "…and no refusal text DENIES a fault it can report (98 is not gh-only; no gh at all is 97, not 98)" $rc
+  # ⛔ AND 93 IS PROVEN BEHAVIOURALLY, which no grep can do: build the launch line with a resolvable
+  # gh, then make that gh NON-EXECUTABLE before the pane runs it. perl's failed `exec` returns FALSE and
+  # ends the one-liner with status 0 — so without the `; exit 93` tail this arm sees rc=0, i.e. a BLESSED
+  # worker with no credential, which is the fail-open direction the guard exists to close.
+  rm -rf "$TMP/bin-noexec" "$TMP/home-noexec" "$TMP/O4noexec"; mkdir -p "$TMP/bin-noexec"; gh_hosts_fixture "$TMP/home-noexec"
+  printf '#!/usr/bin/env bash\nprintf %%s\\n gho_never_used\n' > "$TMP/bin-noexec/gh"
+  chmod +x "$TMP/bin-noexec/gh"
+  printf 'EXTRA=1\n' > "$TMP/home-noexec/keys.env"
+  out="$(bash "$TMP/c8.sh" "$LIB" "$TMP/bin-noexec" "$TMP/O4noexec" "$TMP/home-noexec" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  chmod -x "$TMP/bin-noexec/gh"
+  env -i PATH="$TMP/bin-noexec:/usr/bin:/bin" HOME="$TMP/home-noexec" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "93" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 93: the resolved gh could not be executed)"; }
+  ck "…and a gh that cannot be EXECUTED at pane time exits 93 — never 0 (perl's failed exec would bless)" $rc
+  # 97 HAD NO COVERAGE AT ALL: the only line that looked like a pin was unreachable (`bin-absent` still
+  # resolves a gh). Driven with a PATH carrying NO gh, the way `bin-storenogh` drives the spawn arm.
+  rm -rf "$TMP/bin-nogharm" "$TMP/home-nogharm" "$TMP/O4nogharm"; mkdir -p "$TMP/bin-nogharm"; gh_hosts_fixture "$TMP/home-nogharm"
+  for _u in bash env grep mkdir date rm sed cat perl; do
+    _p="$(command -v "$_u" 2>/dev/null)" && ln -sf "$_p" "$TMP/bin-nogharm/$_u"
+  done
+  printf 'EXTRA=1\n' > "$TMP/home-nogharm/keys.env"
+  out="$(env -i PATH="$TMP/bin-nogharm" bash "$TMP/c8.sh" "$LIB" "$TMP/bin-nogharm" "$TMP/O4nogharm" "$TMP/home-nogharm" 2>&1)"
+  pfx="$(printf '%s\n' "$out" | sed -n 's/^PFX<<\(.*\)>>$/\1/p')"
+  env -i PATH="$TMP/bin-nogharm" HOME="$TMP/home-nogharm" "$BASH" -c "$pfx; echo REACHED" >/dev/null 2>&1; rcs=$?
+  [ "$rcs" = "97" ] && rc=0 || { rc=1; echo "      rc=$rcs (expected 97: no gh anywhere on this box)"; }
+  ck "…and a box with NO gh anywhere exits 97 (its own code — the 98 remedy sends you after a credential that is not the fault)" $rc
 fi
 # ⛔ AND THE GATE-SIDE PROBE IS BOUNDED TOO (recorded rule, README §"Two platform rules …": a plain
 # `gh auth token` can hang for the life of the shell, rc=142 measured — and `wt_spawn` runs on the
@@ -986,7 +1137,11 @@ fi
 # module, so it cannot call the helper. Anything with NEITHER is an unbounded probe, which is the
 # defect. The helper is then separately pinned: a name without the alarm would be a gate that reads
 # correct and enforces nothing.
-n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -vc 'alarm')"
+# ⛔ A MESSAGE IS NOT A CALL SITE (#3138). The refusal text now names `gh auth token` when it explains
+# which fault it hit, and that string must not be read as an unbounded probe — the predicate is about
+# INVOCATIONS. So the operator-facing message lines (`pre_fault=` / `wt_warn`) are excluded; every line
+# that can actually EXECUTE the read must still arrive through `wt_bounded` or the pane's own `alarm`.
+n_unbounded="$(grep -n 'auth token' "$LIB" | grep -v ':[[:space:]]*#' | grep -v 'wt_bounded' | grep -vE '^[0-9]+:[[:space:]]+9[0-9]\) pre_fault=' | grep -vc 'alarm')"
 [ "$n_unbounded" = "0" ] && rc=0 || rc=1
 ck "every non-comment 'gh auth token' in the library is BOUNDED (through the helper, or the pane's own alarm)" $rc
 awk '/^wt_bounded\(\) \{/,/^}/' "$LIB" | grep -q "alarm shift; exec @ARGV" && rc=0 || rc=1
@@ -1364,6 +1519,27 @@ grep -q 'CMUX surface new-terminal --machine vm-abc --cwd /tmp --no-open -- /bin
 ck "…and spawns with the named primitive: --machine/--cwd/--no-open and the run script" $rc
 grep -qx 'grammar=surface' "$TMP/O8/state/worker-merge-5" && rc=0 || rc=1
 ck "…recording which grammar produced it" $rc
+
+# ⛔ THE DEFAULT IS THE WHOLE FIX, SO IT MUST BE EXECUTED BY SOMETHING (#2210). Before this arm,
+# every `grammar=surface` scenario set WT_MACHINE EXPLICITLY (G and I above), so the defaulted value
+# was dead code to the suite: restore `if [ -n "${WT_MACHINE:-}" ]` and every assertion still passed.
+# Driven with WT_MACHINE UNSET — precisely the box state that lost all six spawns — and against a
+# stub that now REFUSES the flag's absence, so the failure mode is the outage itself.
+cat > "$TMP/g1b.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_HOST=1 CMUX_LOG="$4"
+unset WT_MACHINE
+. "$1"
+wt_spawn "merge-5" "/tmp" 'bash /tmp/merge-one.sh --argv /tmp/a'; echo "rc=$?"
+SH
+out="$(bash "$TMP/g1b.sh" "$LIB" "$TMP/bin-host" "$TMP/O8b" "$TMP/cmux8b.log" 2>&1)"
+case "$out" in *"rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an UNSET WT_MACHINE still spawns (the current CLI refuses the flag's absence)" $rc
+grep -q 'CMUX surface new-terminal --machine local --cwd /tmp --no-open -- /bin/bash .*run-merge-5.sh' "$TMP/cmux8b.log" && rc=0 || rc=1
+ck "…and the default target is \`local\` — the machine this process runs on" $rc
+[ -f "$TMP/O8b/state/worker-merge-5" ] && rc=0 || rc=1
+ck "…and the worker is RECORDED, so it can be reaped (the outage left nothing to track)" $rc
 
 echo
 echo "── I) a surface-grammar worker is TRACKED BY ITS TERMINAL ID (it has no workspace name) ──"

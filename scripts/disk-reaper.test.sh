@@ -56,6 +56,23 @@
 #       on EITHER surface (the operator-facing class line and the pass record), for the classes that
 #       keep no tally sentinel (`worktree`, `uv`, `duplicate-install`), and `not-run` for a class that
 #       was not selected at all (#4529).
+#   T61 the delegate's OWN `verdict=` reaches the record AND `--print-status` as
+#       `delegate_verdict_worktree=` without moving the exit-code class verdict, and disagreement
+#       gives the ALARM class precedence (`mixed-benign` vs `mixed`) (#3041/#3058).
+#   T62 a reaper pointed at a checkout that is NOT THERE can never be installed BLIND: an all-empty
+#       resolved list is REFUSED (rc=1, no unit written), and an entry dropped from a PARTIALLY
+#       resolvable list is NAMED on stderr instead of vanishing silently (#2159/#2878). It also pins
+#       the two ACCOMPANYING behaviours: the absolute-path arm hoisted ABOVE the git probe (so a
+#       relative / `git@host:owner/repo.git` candidate is dropped for the reason that applies rather
+#       than blamed on a missing checkout), and the `<git gave no message>` fallback for a git that
+#       exits non-zero without a word.
+#       ⚠️ T62 is the number this block took on rebase: it was written as T61 against a base where
+#       T61 was free, and #3041 landed a DIFFERENT T61 first. Two sections cannot share an ID (nor
+#       `ENVNAME`/`$T/t61`), so this one was renumbered rather than merged under a duplicate label.
+#   T63 the HOURLY pass applies the same rule the installer now applies: `resolve_repos` QUOTES git's
+#       own line instead of stamping every probe failure "not a git checkout", names the silent-git
+#       shape (`<git gave no message>`), and names the BOUND firing as itself (rc=124 on a dead or
+#       hung mount) rather than as a git that said nothing (#2159).
 #
 # PRE-CHANGE BEHAVIOUR. Each assertion below fails before this change, for the reason the section
 # names: there is no entry point at all, so `bash scripts/disk-reaper.test.sh` on the pre-change tree
@@ -3062,6 +3079,306 @@ assert_contains "$ST60" "classified_venv=?" \
     "T60 ... and the partial sum is not published as the class's classified count"
 assert_contains "$(grep -F 'class=venv' <<<"$OUT")" "candidates=1" \
     "T60 the class LINE agrees with the record about the candidate count"
+
+# ── T61: the delegate's OWN verdict is lifted, and does NOT move the class verdict (#3041) ────────
+# `verdict_worktree=` is derived from the delegate's EXIT CODE, and an ineffective reap exits 0 BY
+# DESIGN — so the status file said `verdict_worktree=ok` for a pass that reclaimed nothing on a box at
+# 0 bytes free. The delegate's own `verdict=` is now carried alongside it in a SEPARATE field, with
+# the same `?` / `not-run` vocabulary as `main_proof=`/`pr_merged=` but NOT their disagreement polarity
+# (see the five-leg table at the end of this block: `mixed` here means two ALARM answers). Both
+# properties matter: the answer must be reachable at the surface the fleet reads, and lifting it must
+# not change a verdict that operators and wrappers already key on.
+ENVNAME=t61
+REPO_D1="$(mk_repo t61a)"
+REPO_D2="$(mk_repo t61b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=12 classified=12 remove=0 preserved=12 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:12 main_proof=local pr_merged=na verdict=reap-ineffective"' \
+    'exit 0' >"$T/t61-delegate.sh"
+chmod +x "$T/t61-delegate.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-delegate.sh" run_reaper --apply --repo "$REPO_D1" --only worktree 2>&1)"
+ST61="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST61" "delegate_verdict_worktree=reap-ineffective" \
+    "T61 the delegate's own verdict reaches the STATUS FILE, not just the echoed text"
+assert_contains "$ST61" "verdict_worktree=ok" \
+    "T61 ... beside an UNCHANGED class verdict (the exit code still decides it)"
+assert_contains "$ST61" "classified_worktree=12" "T61 ... and the tally it came with"
+# ⛔ AND IT MUST BE REACHABLE FROM THE READER, not merely present in the file (the rule at
+# `disk-reaper.sh`'s print_status: "a field the reader does not print does not exist"). Asserting the
+# raw file alone let the field be written and unreadable from `--print-status`, which is the surface
+# the fleet's supervisor reads.
+PST61="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$PST61" "delegate_verdict_worktree=reap-ineffective" \
+    "T61 ... and \`--print-status\` PRINTS it (a written field the reader cannot see does not exist)"
+assert_contains "$PST61" "verdict_worktree=ok" "T61 ... beside the unchanged exit-code verdict"
+# A delegate that does not print the field (an older farmed copy) answers NOTHING: `?`, never `idle`.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=2 classified=2 remove=0 preserved=2 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:2 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t61-old.sh"
+chmod +x "$T/t61-old.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-old.sh" run_reaper --apply --repo "$REPO_D1" --only worktree 2>&1)"
+ST61B="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)"
+assert_contains "$ST61B" "delegate_verdict_worktree=?" \
+    "T61 an absent field is \`?\` — never a benign \`idle\`"
+# ⛔ THE ALARM CLASS HAS PRECEDENCE, AND THE TWO KINDS OF DISAGREEMENT ARE SPELLED DIFFERENTLY
+# (#3058 review, P1). A plain `main_proof=`-style "any disagreement => mixed" rule is wrong for a
+# field that is PRINTED WITH A ⛔ for every value outside the benign allow-list: `reap-ineffective`
+# + `idle` (the alarm) and `reclaimed` + `idle` (two ordinary readings) would BOTH read `mixed`, so a
+# healthy multi-repo cell prints a ⛔ on every pass AND `⛔ worktree-delegate=reap-ineffective` — the
+# one line this whole feature exists to put in front of an operator — is never reachable at all.
+# Five legs, each of which fails for a different wrong implementation: benign-only disagreement is
+# `mixed-benign` (and the reader keeps it SILENT); an alarm beside a benign answer is THAT ALARM;
+# the same pair in the other repo order is the same answer (never last-answer-wins); two DIFFERENT
+# alarms are `mixed` (the only case where the cell cannot say); and an UNTAUGHT spelling is surfaced
+# as itself, because the benign side is an allow-list and not a deny-list.
+t61_pair() { # t61_pair <verdict-for-t61a> <verdict-for-t61b> -> writes the two-repo delegate shim
+    local d="$T/t61-pair.sh"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'v=@V1@' \
+        'for a in "$@"; do case "$a" in */t61b) v=@V2@ ;; esac; done' \
+        'echo "SUMMARY examined=1 classified=1 remove=0 preserved=1 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:1 main_proof=local pr_merged=na verdict=$v"' \
+        'exit 0' >"$d"
+    sed -i.bak "s/@V1@/$1/; s/@V2@/$2/" "$d" && rm -f "$d.bak"
+    chmod +x "$d"
+}
+t61_run_pair() { # t61_run_pair <v1> <v2> -> prints the record's delegate_verdict_worktree=
+    t61_pair "$1" "$2"
+    WORKTREE_REAPER="$T/t61-pair.sh" run_reaper --apply --repo "$REPO_D1" --repo "$REPO_D2" --only worktree >/dev/null 2>&1
+    sed -n 's/^delegate_verdict_worktree=//p' "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null | head -1
+}
+assert_eq "$(t61_run_pair reclaimed idle)" "mixed-benign" \
+    "T61 two BENIGN answers that disagree read \`mixed-benign\` (never a ⛔ on a healthy cell, never last-answer-wins)"
+assert_eq "$(t61_run_pair reap-ineffective idle)" "reap-ineffective" \
+    "T61 an ALARM beside a benign answer is carried as ITSELF — \`mixed\` here left the ⛔ line unable to name the alarm"
+assert_eq "$(t61_run_pair idle reap-ineffective)" "reap-ineffective" \
+    "T61 …and the repo ORDER does not decide it (no last-answer-wins, either way round)"
+assert_eq "$(t61_run_pair reap-ineffective unmeasured)" "mixed" \
+    "T61 two DIFFERENT alarms read \`mixed\` — the one case where the cell genuinely cannot say"
+assert_eq "$(t61_run_pair reclaimed unlisted-new-verdict)" "unlisted-new-verdict" \
+    "T61 an UNTAUGHT spelling is surfaced as itself (the benign side is an allow-list, so a new verdict fails loud)"
+# ── T62: a reaper pointed at a checkout that is NOT THERE is refused, never installed BLIND ──────
+# MEASURED (pi-cell-1, 2026-10-30). The hourly unit was installed while the tortoise checkout lived
+# at /tmp/cell-t3 (the cell layout, #2878). The checkout later moved to /home/cmux/tortoise and the
+# unit was never re-validated: every hourly pass then logged
+#     WARNING: ignoring '/tmp/cell-t3' — not a git checkout
+#     ⛔ class=venv  FAIL-CLOSED — no repo to scan
+#     ⛔ class=worktree FAIL-CLOSED — no repo to scan
+# and exited 3 — for 34 worktrees and ~60 GB it had never once looked at. The box sat at 100% used
+# with the reaper "on the clock": an inert enforcer that LOOKS installed.
+# This case pins BOTH guards that make that visible, because they cover different shapes:
+#   (b)(c) an ALL-EMPTY resolved list is REFUSED (rc=1) and writes no unit.
+#   (d)    a PARTIALLY resolvable list — the incident's own shape, since the bring-up passes the
+#          operator's colon-joined list verbatim — installs, but the entry git cannot answer for
+#          must be NAMED on stderr. It was dropped in SILENCE before this change, which is
+#          indistinguishable from success while a configured tree is not scanned.
+#   (e)(f) the two ACCOMPANYING behaviours this change adds, which nothing else pins: the hoisted
+#          absolute-path arm (a relative / `git@host:owner/repo.git` candidate must be dropped for
+#          the reason that ACTUALLY applies, not blamed on a missing checkout), and the
+#          `${_g:-<git gave no message>}` fallback for a git that exits non-zero and says nothing.
+#          (a) is the positive control that the same command path still installs.
+ENVNAME=t62
+REPO_T62="$(mk_repo t62-repo)"
+inst62() { # inst62 <repos-value> <unit-dir>
+    # The fallback candidates are BLANKED so an empty DISK_REAPER_REPOS really is empty: without this
+    # the ambient REPO/AGENT_INFRA_PATH of the shell running the suite resolves a repo and the empty
+    # case silently becomes the valid case (measured: this assertion read OK-then-RED across hosts).
+    # ⛔ AND ELDATO_PLATFORM IS PINNED TO Linux. This case is about `resolve_repos`, not the scheduler
+    # arm: unpinned, the installer defaults `PLATFORM="${ELDATO_PLATFORM:-$(uname -s)}"`, so on a Mac
+    # the install goes to `do_install_launchd`, writes a plist instead of the `.service` every
+    # assertion below reads — AND, with no `LAUNCHCTL` seam pinned, drives the REAL `launchctl`
+    # `bootout gui/<uid>/com.eldato.disk-reaper` against the PRODUCTION label, unloading the
+    # developer's own installed reaper and bootstrapping a job from a directory the EXIT trap deletes.
+    # An enforcer left loaded-but-dead, produced by the test of the PR that exists to remove that shape.
+    # The installer's Linux arm is what CI runs (`runs-on: ubuntu-latest`), so this is the arm to pin.
+    HOME="$T/t62/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$1" ELDATO_PLATFORM=Linux \
+    REPO= TORTOISE_REPO= WORKDIR= AGENT_INFRA_PATH= \
+    DISK_REAPER_STATE_DIR="$T/t62/home/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$2" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t62/calls.log" \
+    bash "$INST" --install 2>&1
+}
+mkdir -p "$T/t62/home"
+
+# (a) a REAL checkout installs, and the rendered unit names it
+OUT="$(inst62 "$REPO_T62" "$T/t62/units-ok")"; RC=$?
+assert_eq "$RC" "0" "T62 a real checkout still installs (the guard is not a blanket refusal)"
+assert_contains "$(cat "$T/t62/units-ok/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 the unit carries the checkout it was validated against"
+
+# (b) THE DISARM CASE: the same box after the checkout moved. A path that git does not answer for
+# must be refused — and must write NOTHING, because a written unit is what runs blind every hour.
+# Assert the GUARD'S OWN text, not a bare "REFUSING": any refusal added ahead of the repo check would
+# otherwise keep this green with the repo guard deleted. Two such refusals DO sit ahead of it ON THE
+# INSTALL PATH — DISK_REAPER_WT_AGED_DAYS (installer:600, in `do_install`) and the root/SUDO_USER check
+# (installer:1254, in `do_install_systemd`, which `do_install` dispatches into before the repo check
+# itself at installer:1265) — so a bare "REFUSING" match is not hypothetical. ⚠️ All three line numbers
+# were RE-READ at this head after the rebase: this comment previously carried 596 / 1250, which were
+# stale by four lines and pointed at prose rather than at the statements they name (a prior review cycle
+# recorded them as "corrected" when they were not — the citation is re-derived here, not adjusted).
+OUT="$(inst62 "$T/t62/vanished-checkout" "$T/t62/units-blind")"; RC=$?
+assert_contains "$OUT" "no repo resolved on this box" \
+    "T62 a repo that is not a git checkout is REFUSED (never a blind unit)"
+assert_eq "$RC" "1" "T62 ... and the refusal is a NON-ZERO exit, not a printed line on a success path"
+assert_absent "$OUT" "installed: target=" "T62 ... the refusal happens BEFORE anything is installed"
+if [ -f "$T/t62/units-blind/eldato-disk-reaper.service" ]; then
+    bad "T62 a disarmed reaper must not leave a unit behind"
+else
+    ok "T62 no unit is written for an unresolvable repo (nothing can fire blind)"
+fi
+# (c) the empty case is the same defect and must be refused too — asserted on the ARTIFACT as well as
+# the message: this is the case whose own text says "a class that scans nothing is not a pass", so a
+# written unit here is precisely the thing that fires blind.
+OUT="$(inst62 "" "$T/t62/units-empty")"; RC=$?
+assert_contains "$OUT" "no repo resolved on this box" \
+    "T62 an EMPTY repo list is refused (a class that scans nothing is not a pass)"
+assert_eq "$RC" "1" "T62 ... with a non-zero exit"
+assert_absent "$OUT" "installed: target=" "T62 ... and nothing is installed for an empty list"
+if [ -f "$T/t62/units-empty/eldato-disk-reaper.service" ]; then
+    bad "T62 an empty repo list must not leave a unit behind"
+else
+    ok "T62 no unit is written for an empty repo list"
+fi
+# (d) THE SILENT-DROP CASE — the incident's actual shape. A colon-joined list where ONE entry no longer
+# resolves (the bring-up passes the operator's list verbatim) must still install, must keep the entries
+# it CAN use, and must NAME the one it dropped. Silence here is a green install that never scans a
+# configured tree.
+OUT="$(inst62 "$REPO_T62:$T/t62/vanished-checkout" "$T/t62/units-partial")"; RC=$?
+assert_eq "$RC" "0" "T62 a partially resolvable list still installs (one dead entry must not block the rest)"
+assert_contains "$OUT" "so the venv/worktree classes cannot scan it" \
+    "T62 a dropped entry is NAMED, never dropped in silence"
+assert_contains "$OUT" "$T/t62/vanished-checkout" "T62 ... and the warning names WHICH entry was dropped"
+# ⛔ GIT'S OWN LINE IS QUOTED — the change's headline behaviour, and nothing else pinned it. Every other
+# assertion here is satisfied by a warning that renders `(<git gave no message>)` on EVERY failure, i.e.
+# by the redirection order swapped to `>/dev/null 2>&1` (which captures nothing at all). That mutant keeps
+# name, consequence clause, channel and outcome identical while silently deleting the one actionable datum
+# this PR exists to recover (dubious ownership / EACCES vs a vanished tree) — so pin the capture itself.
+assert_contains "$OUT" "git cannot use it here (fatal: cannot change to" \
+    "T62 case (d): the warning QUOTES git's own stderr line, not an asserted cause"
+assert_absent "$OUT" "<git gave no message>" \
+    "T62 case (d): ... so the capture is POPULATED (the redirection order is not swapped)"
+# The channel is MEASURED, not assumed: `inst62` merges 2>&1, so a move from `err` (stderr) to stdout
+# would keep the assertion above green while breaking the property it claims. Re-run the same case with
+# stderr captured SEPARATELY: a warning that is not on stderr cannot reach the operator's log.
+_inst62_stderr() {
+    HOME="$T/t62/home-err" DISK_REAPER="$REAPER" \
+    DISK_REAPER_REPOS="$REPO_T62:$T/t62/vanished-checkout" ELDATO_PLATFORM=Linux \
+    REPO= TORTOISE_REPO= WORKDIR= AGENT_INFRA_PATH= \
+    DISK_REAPER_STATE_DIR="$T/t62/home-err/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$T/t62/units-err" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t62/calls.log" \
+    bash "$INST" --install 2>"$T/t62/d.err" >/dev/null
+}
+mkdir -p "$T/t62/home-err"
+_inst62_stderr; ERR_RC=$?
+# The re-run is itself an install: assert it SUCCEEDED and wrote its unit, or the stream measurement
+# would hang off an unverified run.
+assert_eq "$ERR_RC" "0" "T62 the stderr-channel re-run installs (rc=0)"
+assert_file "$T/t62/units-err/eldato-disk-reaper.service" \
+    "T62 ... and writes its unit, so the stream measurement is not taken from a failed run"
+assert_contains "$(cat "$T/t62/d.err" 2>/dev/null)" "so the venv/worktree classes cannot scan it" \
+    "T62 ... and the dropped-entry warning is on STDERR (measured on its own stream, not the merged one)"
+assert_contains "$(cat "$T/t62/d.err" 2>/dev/null)" "cannot change to" \
+    "T62 ... and git's own line survives the stream split (the capture is not lost to the redirect)"
+assert_contains "$(cat "$T/t62/units-partial/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 case (d): the unit keeps the entry that DOES resolve"
+assert_absent "$(cat "$T/t62/units-partial/eldato-disk-reaper.service" 2>/dev/null)" \
+    "vanished-checkout" "T62 case (d): ... and never renders a path that cannot be scanned"
+
+# (e) THE HOISTED ABSOLUTE-PATH ARM. This arm was moved ABOVE the git probe because with the probe
+# first, a relative candidate or `git@host:owner/repo.git` was reported as "not a git checkout" —
+# pointing the operator at a missing checkout — and the `git@…` form was SPLIT ON ':' into two bogus
+# entries by the list loop. Neither shape is pinned anywhere else, so a regression that moved the arm
+# back below the probe, or dropped the split guard, would keep the whole suite green.
+OUT="$(inst62 "$REPO_T62:relative/dir" "$T/t62/units-rel") "; RC=$?
+assert_eq "$RC" "0" "T62 case (e): a relative entry does not block the rest of the list"
+assert_contains "$OUT" "not an absolute path" \
+    "T62 case (e): ... and it is dropped for the reason that ACTUALLY applies (the absolute-path arm)"
+assert_contains "$OUT" "relative/dir" "T62 case (e): ... naming the candidate that was dropped"
+assert_absent "$OUT" "not a git checkout" \
+    "T62 case (e): ... and NOT blamed on a missing checkout (the arm is hoisted above the probe)"
+assert_contains "$(cat "$T/t62/units-rel/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 case (e): ... while the entry that IS absolute still installs"
+assert_absent "$(cat "$T/t62/units-rel/eldato-disk-reaper.service" 2>/dev/null)" \
+    "relative/dir" "T62 case (e): ... and the relative path is never rendered into a unit"
+# The `git@host:owner/repo.git` shape is the one the ':' list-split fragments into two candidates.
+# ⚠️ It is STILL fragmented — that is the list's separator, not a defect this change removes. What the
+# hoist changes is the REASON each fragment is dropped: "not an absolute path" (true, actionable)
+# rather than "not a git checkout" (a cause the code never established). Measured, not assumed: the
+# split yields `git@github.com` and `owner/repo.git`, both reported as not absolute, install rc=0.
+OUT="$(inst62 "$REPO_T62:git@github.com:owner/repo.git" "$T/t62/units-scp") "; RC=$?
+assert_eq "$RC" "0" "T62 case (e): an scp-style remote does not block the rest of the list"
+assert_contains "$OUT" "ignoring repo 'owner/repo.git' — not an absolute path" \
+    "T62 case (e): ... its fragments are dropped for the ABSOLUTE-PATH reason, not a missing checkout"
+assert_absent "$OUT" "not a git checkout" \
+    "T62 case (e): ... and nothing is blamed on a git checkout the code never probed"
+assert_contains "$(cat "$T/t62/units-scp/eldato-disk-reaper.service" 2>/dev/null)" \
+    "DISK_REAPER_REPOS=$REPO_T62" "T62 case (e): ... the absolute entry still installs"
+
+# (f) A GIT THAT EXITS NON-ZERO AND SAYS NOTHING. `${_g:-<git gave no message>}` exists for exactly
+# this shape: without it the warning rendered an empty "()" and named no datum at all. A shim is
+# needed because the real git always says something; it delegates everything except the probe.
+mkdir -p "$T/t62/bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do [ "$a" = rev-parse ] && exit 1; done' \
+    'exec "$_REAL_GIT" "$@"' >"$T/t62/bin/git"
+chmod +x "$T/t62/bin/git"
+OUT="$(PATH="$T/t62/bin:$PATH" _REAL_GIT="$(command -v git)" \
+    inst62 "$REPO_T62" "$T/t62/units-silent") "; RC=$?
+assert_eq "$RC" "1" "T62 case (f): a silent non-zero git leaves nothing resolved, so the install REFUSES"
+assert_contains "$OUT" "<git gave no message>" \
+    "T62 case (f): ... and the warning says git gave no message rather than rendering an empty '()'"
+
+# ── T63: the HOURLY pass applies the SAME rule — it quotes git's own line, never an asserted cause ──
+# The installer's resolve_repos was fixed first. THIS one is the file whose output the 2026-10-30
+# incident's hourly log actually carried, and it kept the old diagnostic: `2>&1` went to /dev/null, so
+# the reason git gave could not reach the operator, and every failure — a vanished checkout, `chmod 000`,
+# `fatal: detected dubious ownership` (the fleet's dominant shape) — was stamped "not a git checkout",
+# the one cause that cannot explain the fault. One concept, one diagnostic: this pins the reaper's copy
+# so the two cannot drift apart again.
+ENVNAME=t63
+REPO_T63="$(mk_repo t63-repo)"
+mkdir -p "$T/t63/home/.pi/agent/state"
+reap63() { # reap63 <repos-value> [extra env is passed by the caller]
+    # The ambient fallback candidates are BLANKED, exactly as in T62: without it a developer box
+    # resolves a real repo and the case silently measures the wrong list.
+    HOME="$T/t63/home" DISK_REAPER_STATE_DIR="$T/t63/home/.pi/agent/state" \
+    DISK_REAPER_LOG="$T/t63/home/.pi/agent/state/disk-reaper.log" \
+    REPO= TORTOISE_REPO= WORKDIR= AGENT_INFRA_PATH= \
+    DISK_REAPER_REPOS="$1" \
+    bash "$REAPER" --dry-run --only venv 2>&1
+}
+# (a) a vanished entry: git's OWN error reaches the operator, and the blanket cause is gone
+OUT="$(reap63 "$REPO_T63:$T/t63/vanished")"; RC=$?
+assert_contains "$OUT" "git cannot use it here (fatal: cannot change to" \
+    "T63 the hourly pass QUOTES git's own line for a repo it drops"
+assert_contains "$OUT" "$T/t63/vanished" "T63 ... and names WHICH entry it dropped"
+assert_absent "$OUT" "not a git checkout" \
+    "T63 ... and never asserts a cause the probe did not establish"
+assert_absent "$OUT" "<git gave no message>" \
+    "T63 ... so the stderr capture is POPULATED (the redirection order is not swapped)"
+# (b) a git that exits NON-ZERO AND SAYS NOTHING still names a datum: an empty "()" would name none.
+# A shim is needed because the real git always says something; it delegates every other call.
+mkdir -p "$T/t63/bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do [ "$a" = rev-parse ] && exit 1; done' \
+    'exec "$_REAL_GIT" "$@"' >"$T/t63/bin/git"
+chmod +x "$T/t63/bin/git"
+_REAL_GIT="$(command -v git)"; export _REAL_GIT
+OUT="$(PATH="$T/t63/bin:$PATH" reap63 "$REPO_T63")"; RC=$?
+assert_eq "$RC" "3" "T63 a list with nothing resolvable is FAIL-CLOSED (rc=3, never a silent no-op)"
+assert_contains "$OUT" "<git gave no message>" \
+    "T63 a silent non-zero git says so, rather than rendering an empty '()'"
+assert_absent "$OUT" "not a git checkout" "T63 ... and still asserts no cause"
+# (c) the BOUND firing is named AS ITSELF. A dead or hung mount makes the probe time out with an EMPTY
+# stderr, so rendering it as "git gave no message" would hide the only thing the pass does know about
+# it. `TB_TIMEOUT_BIN` is pinned to a stub that answers 124 without running the command — the same seam
+# T13/T14 use — so this arm is measured without waiting out a real timeout.
+mkdir -p "$T/t63/bin124"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 124' >"$T/t63/bin124/timeout"
+chmod +x "$T/t63/bin124/timeout"
+OUT="$(DISK_REAPER_GIT_TIMEOUT=5 TB_TIMEOUT_BIN="$T/t63/bin124/timeout" reap63 "$REPO_T63")"; RC=$?
+assert_eq "$RC" "3" "T63 an unanswered probe leaves nothing resolvable, so the class is FAIL-CLOSED"
+assert_contains "$OUT" "the git probe did not finish within 5s" \
+    "T63 a probe killed by the BOUND is named as a timeout, not as a git that said nothing"
+assert_absent "$OUT" "<git gave no message>" \
+    "T63 ... and is never reported as the empty-stderr shape it is not"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

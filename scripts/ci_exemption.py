@@ -407,6 +407,16 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
         # (raw_log=False): there the file IS the id set already.
         guard_steps, _guard_signatures = guard_step_failures(lines)
         ids.extend(guard_steps)
+        # A guard key that IS a shard identity (#3105) is reported with the SHARD family, not
+        # the guard-step one: the operator's remedy for a red shard is the shard, and a
+        # `guard-steps=` count that included shard ids would name the wrong surface. The id is
+        # unchanged either way — only the label it is reported under moves.
+        shard_from_guard = [
+            key for key in guard_steps if key.startswith(_BASH_SHARD_KEY_PREFIX)
+        ]
+        guard_steps = [
+            key for key in guard_steps if not key.startswith(_BASH_SHARD_KEY_PREFIX)
+        ]
         # Pass 3 — NON-NODEID failure evidence (#6798). A watchdog kill leaves no
         # nodeid and no annotation: the capture's only evidence is the kill
         # banner, so no shape-checking pass above can see it. Same treatment and
@@ -440,6 +450,9 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
         # shard now; without this pass a capture whose only failure evidence is those lines
         # still reads as unattributable, so the rail's refusal would survive the fix.
         shard_ids, _shard_signatures = bash_shard_failures(lines)
+        # ...plus the ids the guard pass redirected here (#3105), so ONE shard failure is
+        # reported ONCE, under the family whose token it now carries.
+        shard_ids = sorted(set(list(shard_ids) + shard_from_guard))
         ids.extend(shard_ids)
     return ParseResult(
         ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps,
@@ -1744,9 +1757,11 @@ _BASH_SHARD_RE = re.compile(
 #: bash-suites-shard-recap.txt` is the 7-line tail of the step: it carries the runner's generic
 #: `##[error]Process completed with exit code 1.` (which is deliberately NEVER an identity, see
 #: `_RUNNER_GENERIC_ANNOTATIONS`) but neither the per-shard line nor the step-prefixed
-#: `##[error]bash shard failed:` annotation, so the guard-step pass has nothing to attribute. On
-#: the real run that annotation DOES yield the shard on `main` (the guard-step pass predates
-#: #2648), and #2648's per-shard family — the base of this commit — is a second read of it.
+#: `##[error]bash shard failed:` annotation, so the shard pass's GUARD-STEP half has nothing to
+#: attribute. On the real run that annotation DOES name the shard on `main` — since #3105 it is
+#: re-homed onto the shard family by `_BASH_SHARD_ANNOTATION_RE`/`bash_shard_annotation_key`
+#: (before that, the guard-step pass slugged it into a `guard-step::` key), and #2648's per-shard
+#: family — the base of this commit — is a second read of the same set.
 #: Nothing in `scripts/ci-failure-set.sh` truncates a capture, so no capture of this run was
 #: unattributable by design; what read `ids=0` was the excerpt, on its own.
 #:
@@ -1778,6 +1793,68 @@ _BASH_SHARD_RECAP_RE = re.compile(
 #: (see :func:`bash_shard_failures`): ONE rendering rule for both `❌`-keyed parsers.
 _BASH_SHARD_KEY_PREFIX = "bash-shard::"
 _BASH_SHARD_SIG = "bash-shard"
+
+#: THE RUNNER'S OWN ANNOTATION FOR THE SAME EVENT — ``::error::bash shard failed: <path>``,
+#: emitted by `scripts/run-bash-shards.sh`'s `run_shard` the moment a listed shard fails.
+#:
+#: WHY THIS PATTERN EXISTS AT ALL (#3105). That annotation reached the GUARD-STEP pass, which
+#: builds `guard-step::<step>::<error shape>` and SLUGS the message into the shape. `_slug` is
+#: not injective — `/`, `-`, `:` and a space all become `-` — so the identity it produced was
+#: `guard-step::<step>::bash-shard-failed-scripts-a-b.test.sh` for BOTH `scripts/a-b.test.sh`
+#: and `scripts/a/b.test.sh`. That is #2648's exact defect, left open in the one family it was
+#: never closed for, and it is fail-OPEN rather than cosmetic: an identity is what the decision
+#: compares against the base's rate table, so a base red on ONE of the colliding paths could
+#: exempt a NEW red on the other. The same message ALSO carries the path verbatim, which the
+#: shard family above already turns into an injective `bash-shard::<token>` identity from the
+#: runner's own `❌ failed shard:` line — so the annotation is mapped onto THAT identity instead
+#: of a parallel, lossier one. One event, one identity, both doors.
+#:
+#: ⛔ THE POLARITY IS PRESERVED, and it is the whole safety of the mapping: the resulting id is
+#: an ordinary `bash-shard::<path>`, so it is exempt only when the BASE measured the same token.
+#: A shard the base has never run yields an id the base's rate table cannot carry, which BLOCKS
+#: — the same rule as before, now at a granularity that cannot be forged by a sibling path.
+_BASH_SHARD_ANNOTATION_RE = re.compile(
+    r"^(?i:bash shard failed):\s*(?P<label>\S.*?)\s*$"
+)
+
+#: ⛔ THE RUNNER'S **PARTIAL** RECAP — ``⚠️ RECAP INCOMPLETE (k/n shards ran)`` — is NOT a failure
+#: set, and this module must say so (agent-infra#3174).
+#:
+#: THE DEFECT. Until #3174 a KILLED shard step printed no recap at all, so a job that was terminated
+#: mid-list published a failure set that silently SHRANK as the job got slower — measured over three
+#: consecutive main runs: 13, then 11 (run `41217287437`, killed at 111 min), then 10 failing shards
+#: named, with nothing fixed in between. Every batch verdict in this fleet is
+#: ``batch_failures − main_failures``, so a shard genuinely red on main DROPS OUT of the reference
+#: set, reappears as "a new failure caused by the batch", and gets a constituent dropped or
+#: reverted on a false signal. Read as an improvement, it also HIDES the failures that were real.
+#:
+#: THE RUNNER NOW PRINTS THE PARTIAL RECAP (a TERM/INT trap) and prefixes it with this marker, so an
+#: interrupted run still NAMES what it saw while stating — in the same line — that it is incomplete.
+#: A partial recap that LOOKS FULL is worse than no recap, so the marker is load-bearing: this
+#: pattern is what turns "a shorter list" into "UNPROVEN", and the two readers below refuse rather
+#: than hand a truncated set to `decide()`.
+#:
+#: ⛔ WHY A REFUSAL AND NOT A FILTER. Dropping the missing shards is not available — they are missing,
+#: not absent-from-the-run — and keeping the ones that DID fail is exactly the "a partial set looks
+#: like a set" fold this exists to stop: the truncated capture would then be subtracted as if it
+#: were the whole baseline. So the capture yields NO ids at all and the caller fails closed, naming
+#: this cause (exit code :data:`_EXIT_TRUNCATED_CAPTURE`, the shell's `truncated:` state).
+#:
+#: The emoji is optional in the pattern because a capture's rendering is not the runner's: the
+#: variation selector (`\ufe0f`) can be dropped by whatever re-renders the log — a paste, a
+#: re-encoding, a terminal capture — and a capture that lost the glyph must still be recognised, since
+#: an unrecognised marker is a silent return to the #3174 failure mode. (⛔ NOT by this module's own
+#: ANSI stripping: `_ANSI_RE` removes ANSI CSI sequences — the final byte class `[A-Za-z]` covers
+#: `ESC[2K`/`ESC[1A` as well as SGR — and CANNOT consume U+FE0F, which is not `ESC` and not in that
+#: class. The tolerance is for renderings that happen OUTSIDE this parser, and being glyph-independent
+#: costs nothing.)
+_BASH_SHARD_INCOMPLETE_RE = re.compile(r"^[\u26a0\ufe0f\s]*(?i:RECAP INCOMPLETE)\b")
+
+#: The exit code meaning "this capture was READ and it says its own recap is INCOMPLETE". Distinct
+#: from 1 ("the input could not be read") on purpose: `scripts/ci-failure-set.sh` maps it onto the
+#: `truncated:` state, because the operator's remedy is not "fix the parser" — it is "this RUN is
+#: unproven, do not build a baseline from it" (#3174).
+_EXIT_TRUNCATED_CAPTURE = 4
 
 #: ⛔ THIS PASS MAY ONLY EVER ADD AN IDENTITY — never drop one (#2700 review, cycle 3, P1).
 #: A filter over the SHARED label list was tried and reverted: `$`, a backtick and `<`/`>` ARE
@@ -1854,6 +1931,61 @@ def _shard_token(label: str) -> str:
         else:
             out.extend(f"%{b:02X}" for b in ch.encode("utf-8"))
     return "".join(out)
+
+
+def bash_shard_annotation_key(message: str) -> str | None:
+    """The canonical shard id for the runner's `bash shard failed: <path>` annotation.
+
+    ``None`` when ``message`` is not that annotation, so the caller falls through to the
+    guard-step key it has always built — this function only ever REDIRECTS the shard event, it
+    never widens what counts as an attributable guard failure.
+
+    It builds the id with :func:`_shard_token` — the shard family's own injective encoder — so
+    the two producers of one shard failure (this annotation, and the runner's `❌ failed
+    shard:` line) yield the SAME token for the SAME path. Two encoders for one identity is how
+    a base red on `scripts/a/b.test.sh` came to look like a PR red on `scripts/a-b.test.sh`.
+    A label that encodes to nothing yields ``None``, never a `bash-shard::` half-key: the two
+    doors disagree about an empty token, and that disagreement is the #6798/#2193 fail-open
+    (see `bash_shard_failures`).
+    """
+    m = _BASH_SHARD_ANNOTATION_RE.match(message)
+    if m is None:
+        return None
+    label = m.group("label")
+    # ⛔ THE REDIRECT IS NARROW: the label must LOOK LIKE A SHARD PATH (#3105 review, cycle 1).
+    # Keyed on the phrase alone, any failed step's annotation that merely began with
+    # `bash shard failed:` became a shard identity — `bash shard failed: see logs` and
+    # `bash shard failed: none` included — which both LOSES that failure's step-scoped guard
+    # identity and moves the declared echoed-source residual onto an id that IS in the base's
+    # rate table when the base is red on that shard (i.e. turns a blocking phantom into an
+    # exemptable one). Every shard `run-bash-shards.sh --list` prints is repo-relative
+    # (`scripts/…`, `tests/…`, `pi-bootstrap/…`), so requiring a `/` cannot exclude a real
+    # shard, and anything path-less falls through to the guard key it has always had.
+    if "/" not in label:
+        return None
+    token = _shard_token(label)
+    if not token:
+        return None
+    return f"{_BASH_SHARD_KEY_PREFIX}{token}"
+
+
+def bash_shard_recap_incomplete(text: str) -> str | None:
+    """The runner's INCOMPLETE-RECAP marker line, or ``None`` when the capture recapped fully.
+
+    ONE reader for the marker (``_BASH_SHARD_INCOMPLETE_RE``), so both CLI doors — and any future
+    consumer — agree about whether a capture's failure set is a SET or a TRUNCATED sample
+    (agent-infra#3174).
+
+    Returns the marker LINE rather than a bool: the refusal has to quote what it saw, and a
+    truncation message that names neither the shard counts nor the signal is a claim the operator
+    cannot check. ``None`` means "no marker", which is the only state that may be folded into a set
+    difference — never "the marker was not found, therefore the run was fine": a killed run that
+    printed nothing at all is #3174's original shape, and it is not this function's to certify.
+    """
+    for line in _log_lines(text):
+        if _BASH_SHARD_INCOMPLETE_RE.match(line):
+            return line
+    return None
 
 
 def bash_shard_failures(
@@ -2105,6 +2237,27 @@ def guard_step_key(step: str, error_shape: str) -> str:
     return f"{_GUARD_KEY_PREFIX}{_slug(step)}::{_slug(error_shape)}"
 
 
+def _ann_raw_message(content: str) -> str:
+    """The annotation's message with its ORIGINAL internal spacing, or ``''``.
+
+    ``_attributable_annotation`` returns a whitespace-COLLAPSED message, which is right for the
+    guard-step shape (it is compared as prose) and wrong for a shard PATH: collapsing would make
+    `scripts/a  b.test.sh` and `scripts/a b.test.sh` one identity, and would disagree with the
+    prose door (`bash_shard_failures`), which matches the raw line. The SAME two wrapper rules
+    apply — the marker must be at the line start, and the runner's generic annotations are never
+    attribution — so this can never admit a message `_attributable_annotation` rejected.
+    """
+    m = _ANNOTATION_RE.match(content)
+    if not m:
+        return ""
+    message = m.group("msg").strip()
+    if not message:
+        return ""
+    if any(generic.match(" ".join(message.split())) for generic in _RUNNER_GENERIC_ANNOTATIONS):
+        return ""
+    return message
+
+
 def _attributable_annotation(content: str) -> str:
     """The guard failure message on ``content``, or ``''`` when there is none.
 
@@ -2191,7 +2344,7 @@ def guard_step_failures(text: str) -> tuple[list[str], dict[str, frozenset[str]]
     evidence: set[tuple[str, str]] = set()  # pairs that yielded an identity
     nodeid_steps: set[tuple[str, str]] = set()  # pairs that yielded a NODEID
     e_line_steps: set[tuple[str, str]] = set()  # pairs showing pytest output
-    candidates: list[tuple[tuple[str, str], str, str]] = []  # (unit, step, msg)
+    candidates: list[tuple[tuple[str, str], str, str, str]] = []  # (unit, step, msg, raw msg)
     for raw in text.splitlines():
         job, step, content = _split_log_line(_ANSI_RE.sub("", raw))
         if not step:
@@ -2212,7 +2365,15 @@ def guard_step_failures(text: str) -> tuple[list[str], dict[str, frozenset[str]]
             e_line_steps.add(unit)
         message = _attributable_annotation(payload)
         if message:
-            candidates.append((unit, step, message))
+            # ⛔ THE SHARD REDIRECT READS THE **RAW** MESSAGE, NOT THE COLLAPSED ONE (#3105
+            # review, cycle 1). `_attributable_annotation` collapses every whitespace run to
+            # one space before the guard shape sees it, and a shard path may legally contain
+            # spaces (`_shard_token` encodes them as `%20`). Routing the collapsed text into
+            # `_shard_token` made `scripts/a  b.test.sh` and `scripts/a b.test.sh` — two
+            # DIFFERENT files — share ONE identity, and made the SAME file disagree with the
+            # prose door, which matches the raw line. That is the collision this change exists
+            # to close, so the shard branch must see the bytes the prose door sees.
+            candidates.append((unit, step, message, _ann_raw_message(payload)))
             evidence.add(unit)
             continue
         candidate = _failed_candidate(payload)
@@ -2234,10 +2395,20 @@ def guard_step_failures(text: str) -> tuple[list[str], dict[str, frozenset[str]]
     keys: list[str] = []
     signatures: dict[str, set[str]] = {}
     failing_set = set(failing)
-    for unit, step, message in candidates:
+    for unit, step, message, raw_message in candidates:
         if unit not in failing_set:
             # Clause 1: printed by a step the runner did NOT fail — a same-NAMED
             # step in another leg is a different unit.
+            continue
+        # THE SHARD ANNOTATION IS ONE EVENT WITH ONE IDENTITY (#3105): redirect it onto the
+        # shard family's injective token instead of slugging the path into an error shape.
+        # Slugs collapse `/` and `-`, so the guard key gave TWO different shards ONE identity —
+        # a base red on either could exempt a new red on the other. See
+        # `_BASH_SHARD_ANNOTATION_RE` for the measurement and the polarity argument.
+        shard_key = bash_shard_annotation_key(raw_message)
+        if shard_key is not None:
+            keys.append(shard_key)
+            signatures.setdefault(shard_key, set()).add(_BASH_SHARD_SIG)
             continue
         shape = normalize_guard_error(message)
         if not shape:
@@ -2372,6 +2543,16 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
     for key, sigs in guard_signatures.items():
         signatures[key] = frozenset(sigs)
     id_list.extend(guard_keys)
+    # ⛔ THE SAME FAMILY PARTITION AS THE `ids` DOOR (#3105 review, cycle 1). A guard key that IS
+    # a shard identity must be reported with the SHARD family here too, or this door prints
+    # `guard-steps=1 … bash-shard=0` and then labels a `bash-shard::` id "guard-step failure
+    # ATTRIBUTED" — the wrong-surface reporting both doors exist to avoid.
+    shard_from_guard = [
+        key for key in guard_keys if key.startswith(_BASH_SHARD_KEY_PREFIX)
+    ]
+    guard_keys = [
+        key for key in guard_keys if not key.startswith(_BASH_SHARD_KEY_PREFIX)
+    ]
 
     # Pass 4 — NON-NODEID failure evidence (#6798). Its ids AND signatures come
     # from the SAME helper the `ids` CLI uses, so the two doors cannot disagree
@@ -2410,6 +2591,7 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
     for key, sigs in shard_signatures.items():
         signatures[key] = frozenset(sigs)
     id_list.extend(shard_keys)
+    shard_keys = sorted(set(list(shard_keys) + shard_from_guard))
 
     return SignatureParse(
         ids=sorted(set(id_list)),
@@ -2571,8 +2753,38 @@ def _cmd_ids(args: argparse.Namespace) -> int:
     answer (the caller's `examined > extracted` gate owns "a failing run that
     yielded nothing"). A non-zero exit therefore means exactly one thing: the
     input could not be read. Reading that as "no failures" is the vacuous pass.
+
+    ⛔ ONE EXCEPTION, AND IT IS NOT AN EMPTY SET (agent-infra#3174): a capture whose shard recap is
+    INCOMPLETE (`⚠️ RECAP INCOMPLETE (k/n shards ran)` — `run-bash-shards.sh` was killed mid-list)
+    is READ but does not hold a failure SET, so it exits `_EXIT_TRUNCATED_CAPTURE` (4) and prints
+    NO ids. Emitting the truncated list would be the fold this fix exists to stop: the caller would
+    subtract a partial set as though it were the baseline, which is exactly how a shard red on main
+    drops out of the reference set and comes back as "a new failure caused by the batch". The
+    caller's own `truncated:` state names the remedy (this RUN is unproven — do not re-run the
+    parser); see `scripts/ci-failure-set.sh`.
     """
-    parsed = parse_failed_ids(_read(args.log), raw_log=True)
+    text = _read(args.log)
+    truncated = bash_shard_recap_incomplete(text)
+    parsed = parse_failed_ids(text, raw_log=True)
+    if truncated is not None:
+        # ⛔ NOTHING ON STDOUT. A consumer that ignores the exit code must not be handed a set that
+        # looks whole — the ids that WERE named go to stderr, as evidence, not as an answer.
+        print(
+            "ci-exemption: ⚠️ UNPROVEN: this capture's shard recap is INCOMPLETE — "
+            "scripts/run-bash-shards.sh was TERMINATED before the list finished, so the failure "
+            "set it names is a TRUNCATED SAMPLE, not a set. Refusing to emit ids for it: a set "
+            "difference computed from a partial recap reports real failures as new and hides the "
+            "ones the killed run never reached (agent-infra#3174). The marker it printed was: "
+            f"{truncated}",
+            file=sys.stderr,
+        )
+        for nodeid in parsed.ids:
+            print(
+                "ci-exemption: (TRUNCATED capture — named, NOT in the failure set) "
+                f"{nodeid}",
+                file=sys.stderr,
+            )
+        return _EXIT_TRUNCATED_CAPTURE
     for nodeid in parsed.ids:
         print(nodeid)
     for token in parsed.rejected:
@@ -2641,7 +2853,21 @@ def _cmd_ids(args: argparse.Namespace) -> int:
 
 
 def _cmd_signatures(args: argparse.Namespace) -> int:
-    parsed = parse_pr_failure_text(_read(args.log))
+    text = _read(args.log)
+    # ⛔ THE SAME REFUSAL AS THE `ids` DOOR (agent-infra#3174). A truncated capture has no stable
+    # signature TABLE either — a signature read off the shards that happened to run would certify a
+    # set the run never finished. Both doors are refused so neither can be used to bypass the other.
+    truncated = bash_shard_recap_incomplete(text)
+    if truncated is not None:
+        print(
+            "ci-exemption: ⚠️ UNPROVEN: this capture's shard recap is INCOMPLETE "
+            "(scripts/run-bash-shards.sh was TERMINATED before the list finished) — refusing to "
+            "publish a signature table for a TRUNCATED failure set (agent-infra#3174). The "
+            f"marker it printed was: {truncated}",
+            file=sys.stderr,
+        )
+        return _EXIT_TRUNCATED_CAPTURE
+    parsed = parse_pr_failure_text(text)
     sys.stdout.write(render_signature_table(parsed.signatures))
     for line in parsed.rejected:
         print(f"ci-exemption: rejected FAILED line: {line}", file=sys.stderr)

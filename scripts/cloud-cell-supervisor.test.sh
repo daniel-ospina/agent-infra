@@ -1092,12 +1092,19 @@ case "$PROV_OUT" in
   *"a restart is PENDING and was NOT applied"*) ok "…and says in words that nothing was applied, naming the actuator" ;;
   *) bad "status prints the record but not what it means: $PROV_OUT" ;;
 esac
-# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". `harness-refresh.sh`
-# writes `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
-# is a CLAIM, and NOTHING was measured busy there — so the generic blocked sentence named a cause that
-# does not exist and told the operator to wait for a population that may never exist. The identity cause
-# needs its own arm, and it must come first.
-printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=unknown checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
+# ⛔ `blocked=identity` IS NOT "something this box can see would be interrupted". On that path
+# `harness-refresh.sh` returns from `set_pending` BEFORE `inflight_gate` is consulted, so no population is
+# ever evaluated as the BLOCKER. The record's `lanes=` is still written — it is measured separately, before
+# `set_pending`, and may legitimately be a NON-ZERO number (measured: a live `$O/lane.sh` gives
+# `blocked=identity lanes=1`) — but it is not why the restart is blocked. The identity is. So the generic
+# blocked sentence named a cause that does not exist and told the operator to wait for a population that
+# may never be the thing holding the restart back. The identity cause needs its own arm, and it comes first.
+# ⛔ AND THE SPECIMEN CARRIES A NON-ZERO lanes= ON PURPOSE: it is the HARDEST case for this arm. A record
+# with `blocked=identity lanes=1` has a lane population the operator can SEE, so the generic "wait for that
+# population to go idle" advice looks plausible — yet `inflight_gate` was never consulted on this path, so
+# lanes= is not the blocker and waiting would never clear it. If the arm ever regresses to the generic one,
+# this specimen is what catches it.
+printf 'restart request=pending requested_at=%s waited=9s requested_by=harness-refresh.sh@abc running=abc123 running_from=stamp:abc123 pin=def456 pending=unprovable identity=unprovable actuation=blocked blocked=identity lanes=1 checked=argv,roles,tree blind=reparented-no-wrapper actuator=stop+apply+start\n' \
   "$(( $(date +%s) - 9 ))" > "$P/o/state/restart-request"
 prov status
 case "$PROV_OUT" in
@@ -1105,8 +1112,8 @@ case "$PROV_OUT" in
   *) bad "status does not explain an unprovable identity: $PROV_OUT" ;;
 esac
 case "$PROV_OUT" in
-  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — nothing was measured busy, so the message names a cause that does not exist: $PROV_OUT" ;;
-  *) ok "…and does NOT claim an interruption that was never measured" ;;
+  *"would be interrupted"*) bad "an unprovable identity was explained as 'something would be interrupted' — on this path inflight_gate is never consulted, so no population is the blocker and the message names a cause that does not exist: $PROV_OUT" ;;
+  *) ok "…and does NOT claim an interruption that was never established" ;;
 esac
 # An ABSENT record is not "nothing pending": no cycle has ever recorded one.
 rm -f "$P/o/state/restart-request"
@@ -2086,6 +2093,84 @@ qsup start "$Q/tortoise-repo" "$Q/st-http"
 [ "$Q_RC" -eq 0 ] && ok "an http:// origin derives the same queue" \
                   || bad "start rejected an http:// origin — $Q_OUT"
 git -C "$Q/tortoise-repo" remote set-url origin https://github.com/daniel-ospina/tortoise.git
+
+# (7d) A TRAILING SLASH IS THE SAME REPO HERE TOO — and this copy of the accept list had drifted
+# (review of #3188, P2). `refresh-candidates.sh` had already learned that `git remote add` accepts
+# `https://github.com/<owner>/<repo>/` and that humans type it, so its three copies of the predicate
+# carry the four trailing-slash spellings. THIS copy (in `resolve_repo`, the auto-derive path a cell
+# with no exported `$REPO` takes) did not, so the two entry points disagreed on a URL-shaped origin:
+# `refresh --check` derived the checkout and proceeded, `start`/`check` died "REPO is not set and no
+# single checkout could be derived" — the #1745/#1856 two-authorities class, in the fail-closed
+# direction. Every arm below is a POSITIVE derivation (not a pair of absences) and each spelling is
+# its own fixture, so deleting one spelling from THIS copy reddens exactly its own row. The control at
+# the end keeps them honest: a trailing-slash origin naming ANOTHER repo is still refused.
+# ⛔ THE PER-ROW $O IS SEEDED AND THE ROW ASSERTS rc=0 (review of #3188, P2). The first version of this
+# block left $O unseeded, so `check` died one gate PAST the resolver (cmd_check's worker-scripts
+# precondition) in every fixture: the rows could only report "the resolver PRINTED its derivation
+# line" while the verb this fix exists for still exited non-zero — the block's own framing ("check
+# died") was never demonstrated, and a green row proved less than a reader would read into it. Seeding
+# the shipped set ($SEED_WORKERS, derived from the supervisor at the top of this file) lets `check` run
+# to its verdict, so each spelling now pins the END STATE — rc=0 AND the CELL CAN RUN banner — rather
+# than a log line that a later regression could print while still refusing. Same lesson as (h4)'s "A
+# POSITIVE ASSERTION, NOT TWO ABSENCES" in refresh-provision.test.sh.
+T7D="$T/trailslash"; mkdir -p "$T7D"
+T7D_N=0
+for t7d_spelling in \
+  "https://github.com/acme/trailslash/" \
+  "https://github.com/acme/trailslash.git/" \
+  "git@github.com:acme/trailslash/" \
+  "git@github.com:acme/trailslash.git/"
+do
+  T7D_N=$((T7D_N + 1))
+  t7d_repo="$T7D/repo-$T7D_N"
+  ai_init_repo "$t7d_repo"
+  git -C "$t7d_repo" remote set-url origin "$t7d_spelling"
+  t7d_real="$(cd "$t7d_repo" && pwd -P)"
+  mkdir -p "$T7D/o-$T7D_N"
+  seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$T7D/o-$T7D_N/$f"; done
+  T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-$T7D_N" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+             ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-$T7D_N-$$" O="$T7D/o-$T7D_N" \
+             WORKDIR="$t7d_repo" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+             HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+  case "$T7D_OUT" in
+    *"REPO was not set — using $t7d_real"*)
+      ok "(7d) the auto-derive adopts a checkout whose origin is '$t7d_spelling' (trailing slash = same repo)" ;;
+    *)
+      bad "(7d) FALSE-BLOCKED a trailing-slash origin '$t7d_spelling' (rc=$T7D_RC) — the other verbs derive it: $T7D_OUT" ;;
+  esac
+  case "$T7D_OUT" in
+    *"no single checkout could be derived"*)
+      bad "(7d) '$t7d_spelling' reached the underivable refusal" ;;
+    *)
+      ok "(7d) …and '$t7d_spelling' never reaches the underivable refusal" ;;
+  esac
+  [ "$T7D_RC" -eq 0 ] \
+    && ok "(7d) …so check PROCEEDS on '$t7d_spelling' (rc=0 — the verb the false block killed, not just the resolver)" \
+    || bad "(7d) check still exited $T7D_RC for '$t7d_spelling' AFTER the resolver adopted it: the false block moved, it did not close — $T7D_OUT"
+  case "$T7D_OUT" in
+    *"CELL CAN RUN A CONTROLLER"*)
+      ok "(7d) …and reaches its verdict (the CELL CAN RUN banner), so the derivation is not the end of the pass" ;;
+    *)
+      bad "(7d) '$t7d_spelling' was adopted but check never reached its verdict — an early exit past the resolver still reads as a pass otherwise: $T7D_OUT" ;;
+  esac
+done
+# The CONTROL: the same trailing-slash SHAPE naming another repo is still not adopted, so the four rows
+# above pin the accept list rather than "a trailing slash is always accepted". (Unique slugs on both
+# sides keep this hermetic: no box has a checkout whose origin is acme/trailslash*.) Its $O is
+# deliberately left UNSEEDED: this arm's whole claim is that the refusal IS the derivation — which the
+# block's own third row pins by name — so seeding could only blur which gate answered.
+mkdir -p "$T7D/other" "$T7D/st-other"; ai_init_repo "$T7D/other"
+git -C "$T7D/other" remote set-url origin "https://github.com/acme/something-else/"
+T7D_OUT="$(env -u REPO Q_STATE="$T7D/st-other" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" \
+           ENV_FILE="$Q/keys.env" OR=acme/trailslash SESSION="ai3188-other-$$" O="$T7D/o-other" \
+           WORKDIR="$T7D/other" HARNESS="$Q/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+           HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; T7D_RC=$?
+[ "$T7D_RC" -ne 0 ] && ok "(7d) the trailing-slash shape naming ANOTHER repo is still REFUSED" \
+                   || bad "(7d) adopted a trailing-slash origin that names another repo — $T7D_OUT"
+case "$T7D_OUT" in
+  *"no single checkout could be derived"*) ok "(7d) …and the refusal is the derivation (not an unrelated precondition)" ;;
+  *) bad "(7d) the control refused for an UNRELATED reason, so the four rows above prove nothing: $T7D_OUT" ;;
+esac
 
 # (8) `check` refuses the same pair `start` refuses — a preflight that says YES where `start` dies is
 # a FALSE PASS on exactly the question its verdict answers.
@@ -3093,6 +3178,68 @@ case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
 esac
+# (3b) ⛔ THE INCIDENT SHAPE: an ineffective reap EXITS 0 by design, so `ok=1 rc=0 verdict_worktree=ok`
+# is the CORRECT exit-code reading of the exact pass #3041 was read from — `worktree=<MB>` and nothing
+# else was that pass's misleading sentence. The reaper records the real answer separately as
+# `delegate_verdict_worktree=`, and a field the reader does not print does not exist.
+# ⛔ ORDERING IS LOAD-BEARING: these legs REWRITE the status file above, so they must run AFTER every
+# assertion that reads the previous pass's record (the first draft was inserted mid-block and silently
+# invalidated the `worktree=fail-closed` case).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=reap-ineffective\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"worktree=24MB"*"worktree-delegate=reap-ineffective"*) \
+    ok "status: the HEALTHY line carries the delegate's verdict beside the exit-code reading" ;;
+  *) bad "status: an ineffective reap on a healthy pass still reads as plain ok — $OUT" ;;
+esac
+# (3c) …and it does NOT bolt the note onto a genuinely healthy cell (no noise for `ok`/absent).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"worktree-delegate="*) bad "status: a healthy delegate verdict still grew a note — $OUT" ;;
+  *) ok "status: a healthy cell gains no delegate note (the field is printed only when it informs)" ;;
+esac
+# (3d) ⛔ THE SILENT SET MUST BE THE BENIGN SET, NOT AN "OK-LIKE" SET (#3058 review, P2). The delegate
+# vocabulary is `dry-run|reclaimed|idle|reap-ineffective|unmeasured` (pi-reap-worktrees.sh:642) plus
+# `mixed` at the entry point. THREE of those are a healthy pass and NONE of them may carry the ⛔:
+# `dry-run` is the SHIPPED DEFAULT (disk-reaper.sh:167) — so an ok-like silent set painted
+# `⛔ worktree-delegate=dry-run` onto every pass of every cell that had not armed the reaper — and
+# `idle` is the ordinary reading of an armed pass with nothing to reclaim. The ⛔ is the alarm channel,
+# so a ⛔ on a healthy cell is exactly what trains the operator to skip the one line that must be read.
+# Both polarities are pinned here: benign => silent, alarm-or-unrecognised => ⛔ (fail-loud, so a NEW
+# verdict added to the reaper and not taught to this reader is surfaced rather than swallowed).
+# ⛔ `mixed-benign` IS IN THE BENIGN LOOP AND MUST STAY THERE (#3058 review, P1): it is the entry
+# point's spelling for "two repos with ORDINARY answers that differ" (one reclaimed, one idle) — the
+# everyday shape of a multi-repo cell — and the aggregator has already lifted any alarm answer out of
+# it before the token exists. `mixed` is the alarm spelling (two answers of the alarm class) and stays
+# in the alarm loop below.
+for _dv_benign in dry-run idle reclaimed ok '?' not-run mixed-benign; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=%s\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$([ "$_dv_benign" = dry-run ] && printf dry-run || printf apply)" "$_dv_benign" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"worktree-delegate="*) bad "status: the BENIGN delegate verdict '$_dv_benign' grew a ⛔ note — $OUT" ;;
+    *"disk reaper: last pass"*) ok "status: the BENIGN delegate verdict '$_dv_benign' prints no ⛔ note, and the pass line is still there" ;;
+    *) bad "status: the healthy pass line vanished for delegate verdict '$_dv_benign' — $OUT" ;;
+  esac
+done
+for _dv_alarm in reap-ineffective unmeasured mixed unlisted-new-verdict; do
+  printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndelegate_verdict_worktree=%s\ndetail=ok\n' \
+    "$(date +%s)" "$_dv_alarm" \
+    >"$DR/home/.pi/agent/state/disk-reaper.status"
+  OUT="$(dr_sup)"
+  case "$OUT" in
+    *"⛔ worktree-delegate=$_dv_alarm"*) ok "status: the ALARM delegate verdict '$_dv_alarm' is printed with the ⛔ (fail-loud)" ;;
+    *) bad "status: the ALARM delegate verdict '$_dv_alarm' was swallowed — $OUT" ;;
+  esac
+done
+# ⛔ THE PAIRED ASSERTION LIVES ABOVE, IMMEDIATELY AFTER BLOCK (3)'s OWN `OUT`, and it must stay
+# there: blocks (3b)/(3c) each REWRITE `disk-reaper.status` and reassign `OUT`, so an assertion left
+# down here reads (3c)'s healthy record — which never prints `verdict_worktree=` at all — and the
+# fail-closed property silently stops being tested while still claiming to be (#3058 review).
 # (3b) a DEFERRAL (rc=6) is NOT a failure on the operator's surface. The record keeps ok=0 and
 # `--print-status` still exits 3 (this verb's own exit code comes from the DOCTOR's status, so the
 # headline is the channel here — which is why it must be honest and must not go quiet), but it must not

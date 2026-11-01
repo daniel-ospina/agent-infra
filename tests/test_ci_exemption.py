@@ -27,6 +27,7 @@ import pytest
 import importlib.util
 import itertools
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -2697,9 +2698,10 @@ def test_bash_shard_bold_rendering_matches_its_sibling_parser():
 # per-shard line nor the step-prefixed `##[error]bash shard failed:` annotation — the generic
 # `##[error]Process completed with exit code 1.` it DOES carry (its last line) is deliberately never
 # an identity. That is an artifact of the excerpt, not of the run: the run's own annotation
-# attributes this shard on `main` (guard-step pass, predates #2648), and #2648's per-shard
-# `bash-shard::` family — the base of this commit — is a second read of it. The recap arm is
-# therefore REDUNDANCY, as the module's `#: THE RUNNER'S RECAP LINE` note states.
+# names this shard on `main` — since #3105 `bash_shard_annotation_key` re-homes it onto the shard
+# family, and before that the guard-step pass slugged it into a `guard-step::` key — and #2648's
+# per-shard `bash-shard::` family — the base of this commit — is a second read of it. The recap arm
+# is therefore REDUNDANCY, as the module's `#: THE RUNNER'S RECAP LINE` note states.
 
 _RECAP_FIXTURE = (
     Path(__file__).resolve().parent / "fixtures" / "rail" / "bash-suites-shard-recap.txt"
@@ -3120,22 +3122,25 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
     one), so all 80 took the old slug fallback and the vector stayed green while asserting a
     token nobody would ever compare. Caught in #2648 review cycle 3.
     """
-    src = (Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh").read_text()
-    listed = []
-    for line in src.splitlines():
-        line = line.strip()
-        if not line.startswith("run_shard "):
-            continue
-        # The runner's own `--list` derives the path with `\([^ ]*\.sh\)`, i.e. the first
-        # space-free token ending in `.sh`. Match that, so a trailing `# comment` is never
-        # part of the path this vector tests.
-        m = re.search(r"(\S+\.sh)\b", line.split(None, 1)[1])
-        if m is None or m.group(1).startswith("$"):
-            continue  # an interpolated or sentinel call, not a listed path
-        listed.append(m.group(1))
+    # ⛔ THE ORACLE IS `--list`, NOT THE RUNNER'S OWN TEXT (#2838). This vector used to parse
+    # `run_shard <path>` rows out of `scripts/run-bash-shards.sh` — a SECOND copy of the list, which
+    # #2838 deleted: the enumerated rows ran every suite twice beside the derived loop, so the two
+    # lists disagreed by construction (`executed 212 of 108 listed`) and this vector asserted against
+    # the half that was wrong. Reading `--list` asserts against the list the lanes ACTUALLY execute,
+    # and it is also the shape that cannot pass vacuously: a file-text grep decomposes the moment the
+    # runner stops enumerating, whereas a broken `--list` fails the rc assertion below by name.
+    runner = Path(__file__).resolve().parent.parent / "scripts/run-bash-shards.sh"
+    proc = subprocess.run(
+        ["bash", str(runner), "--list"], capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, (
+        f"`{runner.name} --list` failed (rc {proc.returncode}): {proc.stderr[-2000:]}"
+    )
+    listed = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    assert listed, "`--list` printed nothing — this vector would pass vacuously"
     assert len(listed) >= 60, (
-        f"parsed only {len(listed)} listed shards — the list format changed, so this vector "
-        "would pass vacuously"
+        f"`--list` printed only {len(listed)} listed shards — the list shrank below the floor this "
+        "vector needs to be more than a coincidence"
     )
     ids = {}
     for path in listed:
@@ -3622,3 +3627,396 @@ def test_a_shard_label_is_never_DROPPED_even_when_it_looks_like_source():
     assert ci_exemption.bash_shard_failures(
         "❌ failing shard(s): scripts/x.test.sh, ./scripts/y.test.sh"
     )[0] == ["bash-shard::scripts/x.test.sh", "bash-shard::scripts/y.test.sh"]
+
+
+# ==========================================================================
+# #3105 — THE SHARD ANNOTATION CARRIES THE SHARD'S OWN IDENTITY
+# ==========================================================================
+#
+# THE DEFECT, MEASURED. `scripts/run-bash-shards.sh`'s `run_shard` announces a failing shard
+# TWICE from ONE variable: as its own `❌ failed shard: <path>` line (#2643), and as a GitHub
+# annotation `::error::bash shard failed: <path>`. The annotation reaches the GUARD-STEP pass,
+# which SLUGS the message into `guard-step::<step>::<shape>`. `_slug` is not injective — `/`,
+# `-`, `:` and a space all fold to `-` — so `scripts/a-b.test.sh` and `scripts/a/b.test.sh`
+# produced ONE identity. Measured on main's own `script-validate` capture (run 41058049016):
+# 12 shards arrived as `guard-step::UNKNOWN-STEP::bash-shard-failed-<slugged path>` BESIDE the
+# 12 canonical `bash-shard::<path>` ids for the same shards.
+#
+# WHY IT IS CATEGORY A AND NOT COSMETIC. An identity is what `decide` compares against the
+# base's rate table, so a base red on one colliding path could exempt a NEW red on the other —
+# the fail-OPEN direction, and #2648's exact defect, which was closed for the `bash-shard::`
+# producer while this second producer of the SAME event was left folding paths.
+#
+# THE FIX maps the annotation onto the shard family's own injective `_shard_token`, so one
+# event has one identity on both trees, and the export the operator reads names the shard.
+_SHARD_JOB = "bash-suites (2)"
+_SHARD_STEP = "UNKNOWN STEP"   # GitHub's own placeholder for a job-level annotation
+_SHARD_EXIT = "##[error]Process completed with exit code 1."
+
+
+def _shard_capture(*contents: str) -> str:
+    """A `--log-failed` capture carrying ``contents`` in one failed step, byte-shaped."""
+    prefix = f"{_SHARD_JOB}\t{_SHARD_STEP}\t2026-10-30T10:00:00."
+    lines = [f"{prefix}{i:07d}Z {content}" for i, content in enumerate(contents)]
+    lines.append(f"{prefix}9000000Z {_SHARD_EXIT}")
+    return "\n".join(lines) + "\n"
+
+
+def test_shard_annotation_carries_the_shard_identity_not_a_slug():
+    """The guard-step door emits the SHARD's identity for the shard's own annotation.
+
+    MUTATION: drop the `bash_shard_annotation_key` branch from ``guard_step_failures`` → the
+    id becomes `guard-step::<step>::bash-shard-failed-scripts-a-b.test.sh` → RED here, and on
+    the real capture the SAME suite is reported twice under two identities, one of which the
+    base can never match.
+    """
+    parsed = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh"), raw_log=True
+    )
+
+    assert parsed.ids == ["bash-shard::scripts/a/b.test.sh"]
+    assert parsed.bash_shard == ["bash-shard::scripts/a/b.test.sh"], (
+        "a shard id must be reported with the SHARD family — the operator's remedy is the "
+        "shard, not a guard step"
+    )
+    assert parsed.guard_steps == [], "the shard event is not a guard-step identity as well"
+
+
+def test_shard_annotation_identity_is_injective_where_the_guard_key_was_not():
+    """⛔ THE CATEGORY-A PROPERTY: two different shards must not share one identity.
+
+    This is the vector the change CLOSES. Before it, both paths folded to the same guard key,
+    so `decide` could return `exempt` for a shard nobody had ever run on the base — a false
+    PASS, not a false block.
+
+    MUTATION: route the annotation back through `guard_step_key` → the two ids become equal →
+    RED with the collision named.
+    """
+    dash = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a-b.test.sh"), raw_log=True
+    )
+    slash = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh"), raw_log=True
+    )
+
+    assert dash.ids and slash.ids
+    assert dash.ids != slash.ids, (
+        "two DIFFERENT shards still share one identity — a base red on one can exempt a new "
+        f"red on the other (both read {dash.ids[0]!r})"
+    )
+    # …and neither is the lossy key, which is the identity that could not discriminate.
+    assert not any("guard-step::" in i for i in dash.ids + slash.ids)
+
+
+def test_shard_annotation_and_its_sibling_line_are_one_identity():
+    """ONE failing shard, ONE id — even when the capture carries both of its shapes.
+
+    The two shapes come from the same shell variable in `run_shard`, so a capture that carries
+    both must not report the suite twice: a duplicate id inflates the PR's failing set and
+    names the same failure under two names.
+
+    MUTATION: let the annotation keep a guard key while the shard line keeps its own → two ids
+    for one suite → RED.
+    """
+    parsed = parse_failed_ids(
+        _shard_capture(
+            "❌ failed shard: scripts/selftest.sh",
+            "##[error]bash shard failed: scripts/selftest.sh",
+        ),
+        raw_log=True,
+    )
+
+    assert parsed.ids == ["bash-shard::scripts/selftest.sh"]
+    assert parsed.bash_shard == ["bash-shard::scripts/selftest.sh"]
+    assert parsed.guard_steps == []
+
+
+def test_shard_annotation_ids_door_and_signatures_door_agree():
+    """§4.6 compares signatures; a id signed by one door only fails closed and BLOCKS."""
+    log = _shard_capture("##[error]bash shard failed: scripts/worker.test.sh")
+    parsed_ids = ci_exemption.parse_failed_ids(log, raw_log=True)
+    parsed_sigs = ci_exemption.parse_pr_failure_text(log)
+
+    assert parsed_ids.ids == parsed_sigs.ids == ["bash-shard::scripts/worker.test.sh"]
+    assert parsed_sigs.signatures[parsed_ids.ids[0]] == frozenset(
+        {ci_exemption._BASH_SHARD_SIG}
+    ), "the annotation's id must carry the SHARD family's signature, or the subset rule blocks"
+
+
+def test_shard_annotation_is_exempted_only_when_the_base_measured_the_same_shard():
+    """The exemption fires on the IDENTICAL suite — the whole point of the mapping.
+
+    ⛔ THE IDENTITY ASSERTION IS THE LOAD-BEARING ONE (#3105 review, cycle 1). Asserting only
+    "the decision exempts it" is VACUOUS: a `guard-step::` key is admitted by `_GUARD_KEY_RE`
+    too, so the pre-change code exempts it identically and the vector stays green with the
+    mapping removed. Pinning the IDENTITY is what makes the mutation RED.
+    """
+    key = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh"), raw_log=True
+    ).ids[0]
+    assert key == "bash-shard::scripts/a/b.test.sh", (
+        f"the annotation did not carry the shard identity: {key!r}"
+    )
+    main_rates = parse_rates(f"{key}\t3\t8\n")
+    assert main_rates.rejected == []
+
+    decision = decide(
+        {key: Failure(rate=Rate(3, 8), signatures=frozenset({"bash-shard"}))},
+        main_rates.rates,
+        main_signatures={key: frozenset({"bash-shard"})},
+        k_pr=8,
+    )
+
+    assert not decision.any_blocked
+    assert decision.visible_exemptions(), "an exemption must be RECORDED, never silent"
+
+
+def test_shard_annotation_absent_from_main_still_blocks():
+    """⛔ THE POLARITY PROOF: a NEW red still refuses. Nothing here widens the exemption.
+
+    A shard the base has never measured yields an id absent from the base's table, and that is
+    still a PR-unique failure — the change moves an identity, it does not excuse a shard.
+    """
+    key = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/brand-new.test.sh"), raw_log=True
+    ).ids[0]
+    assert key == "bash-shard::scripts/brand-new.test.sh", (
+        f"the PR's id is not the shard identity ({key!r}) — this vector would be vacuous"
+    )
+
+    decision = decide(
+        {key: Failure(rate=Rate(3, 8), signatures=frozenset({"bash-shard"}))},
+        {},                      # the base measured NOTHING
+        main_signatures={},
+        k_pr=8,
+    )
+
+    assert decision.any_blocked
+    assert decision.blocked[0].blocked is True
+    assert "absent from main's failure set" in decision.blocked[0].reason
+
+
+def test_a_colliding_path_cannot_be_exempted_by_its_sibling():
+    """⛔ THE FAIL-OPEN VECTOR, END TO END: the base is red on `a/b`, the PR breaks `a-b`.
+
+    Under the slugged identity both were `…bash-shard-failed-scripts-a-b.test.sh`, so main's
+    measurement of one exempted the other — a false PASS. With the shard token they are
+    different ids, and the PR's is unknown to the base, so it BLOCKS.
+
+    ⛔ THE PARAMETERS MATTER, and the first version of this vector had them WRONG (#3105 review,
+    cycle 1). The exemption fires on the ATTRIBUTION-ONLY branch — `k_pr < min_runs` (#5250),
+    which is the production norm because a PR head carries ONE sample per check. At `k_pr=8` the
+    RATE comparison catches the collision first (`1.0 > 0.375 * 1.5`) and the vector passed even
+    with the defect present. So it runs at `k_pr=1`, and it pins the identity explicitly: under
+    the mutation `pr_key` becomes `guard-step::UNKNOWN-STEP::…`, which still satisfies
+    `!= base_key`, so a collision assertion alone would not catch the regression.
+    """
+    base_key = "bash-shard::scripts/a/b.test.sh"
+    pr_key = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a-b.test.sh"), raw_log=True
+    ).ids[0]
+    assert pr_key == "bash-shard::scripts/a-b.test.sh", (
+        f"the PR's id is not the shard identity ({pr_key!r}) — a lossy key can collide with a "
+        "sibling path"
+    )
+    assert pr_key != base_key
+
+    decision = decide(
+        {pr_key: Failure(rate=Rate(1, 1), signatures=frozenset({"bash-shard"}))},
+        {base_key: Rate(3, 8)},          # the base is red on the OTHER path only
+        main_signatures={base_key: frozenset({"bash-shard"})},
+        k_pr=1,
+    )
+
+    assert decision.any_blocked, (
+        "a shard the base never measured was exempted on a SIBLING path's history — the "
+        "collision that made this change necessary"
+    )
+
+
+def test_shard_annotation_redirect_is_narrow_to_a_path():
+    """⛔ NARROWNESS (#3105 review, cycle 1): only a SHARD PATH is redirected.
+
+    Keyed on the phrase alone, ANY failed step's annotation beginning `bash shard failed:`
+    became a shard identity (`bash shard failed: see logs` → `bash-shard::see%20logs`) — losing
+    that failure's step-scoped guard identity, and moving the declared echoed-source residual
+    onto an id that IS in the base's table whenever the base is red on that shard, i.e. turning
+    a blocking phantom into an exemptable one. Every shard `run-bash-shards.sh --list` prints is
+    repo-relative, so requiring a `/` excludes no real shard.
+
+    MUTATION: drop the `/` requirement → the first two assertions RED.
+    """
+    assert ci_exemption.bash_shard_annotation_key("bash shard failed: see logs") is None
+    assert ci_exemption.bash_shard_annotation_key("bash shard failed: none") is None
+    assert ci_exemption.bash_shard_annotation_key("redislite server leak: 16") is None
+    assert ci_exemption.bash_shard_annotation_key(
+        "bash shard failed: scripts/orchestrator-harness/selftest.sh"
+    ) == "bash-shard::scripts/orchestrator-harness/selftest.sh"
+
+
+def test_shard_annotation_preserves_internal_spacing_so_paths_cannot_collide():
+    """⛔ ONE SPACE AND TWO SPACES ARE DIFFERENT FILES (#3105 review, cycle 1).
+
+    `_attributable_annotation` collapses whitespace before the guard SHAPE sees it. Routing that
+    collapsed text into `_shard_token` made `scripts/a  b.test.sh` and `scripts/a b.test.sh`
+    share ONE identity — the very collision class this change closes — and made one file
+    disagree with the prose door, which matches the raw line.
+
+    MUTATION: pass the collapsed message into `bash_shard_annotation_key` → the two ids become
+    equal → RED; and the two doors stop agreeing → RED.
+    """
+    one = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a b.test.sh"), raw_log=True
+    )
+    two = parse_failed_ids(
+        _shard_capture("##[error]bash shard failed: scripts/a  b.test.sh"), raw_log=True
+    )
+    prose_one = parse_failed_ids(
+        _shard_capture("❌ failed shard: scripts/a b.test.sh"), raw_log=True
+    )
+    prose_two = parse_failed_ids(
+        _shard_capture("❌ failed shard: scripts/a  b.test.sh"), raw_log=True
+    )
+
+    assert one.ids and two.ids
+    assert one.ids != two.ids, f"two DIFFERENT paths share one id: {one.ids}"
+    assert one.ids == prose_one.ids, (one.ids, prose_one.ids)
+    assert two.ids == prose_two.ids, (two.ids, prose_two.ids)
+
+
+def test_shard_annotation_family_is_reported_identically_by_both_doors():
+    """⛔ THE COUNTERS, NOT JUST THE IDS (#3105 review, cycle 1).
+
+    The `ids` door partitioned the redirected key into the shard family while the `signatures`
+    door did not, so the second printed `guard-steps=1 … bash-shard=0` and then labelled a
+    `bash-shard::` id "guard-step failure ATTRIBUTED" — the wrong-surface reporting both doors
+    exist to avoid.
+    """
+    log = _shard_capture("##[error]bash shard failed: scripts/a/b.test.sh")
+    ids_door = ci_exemption.parse_failed_ids(log, raw_log=True)
+    sig_door = ci_exemption.parse_pr_failure_text(log)
+
+    assert ids_door.guard_steps == sig_door.guard_steps == []
+    assert ids_door.bash_shard == sig_door.bash_shard == [
+        "bash-shard::scripts/a/b.test.sh"
+    ]
+
+
+# ==========================================================================
+# #3174 — THE PARTIAL RECAP MARKS A CAPTURE UNPROVEN, NOT A SHORTER SET
+# ==========================================================================
+#
+# THE DEFECT. Main's `script-validate` was killed mid-run and a killed shard step printed NO recap,
+# so the set of shards red on `main` — the REFERENCE SET every batch verdict subtracts — silently
+# SHRANK as the job got slower. Measured over three consecutive main runs: 13 / 11 / 10 failing
+# shards named, with nothing fixed in between (run `41217287437` was killed at 111 min). A shard
+# genuinely red on main then drops out of the baseline, reappears as "a new failure caused by the
+# batch", and gets a constituent dropped or reverted on a false signal.
+#
+# THE CONTRACT PINNED HERE. The runner prints the partial recap from a TERM/INT trap, prefixed
+# `⚠️ RECAP INCOMPLETE (k/n shards ran)`. The parser must treat that marker as "this capture holds a
+# TRUNCATED SAMPLE, not a set": NO ids on stdout, exit code 4 (which `scripts/ci-failure-set.sh` maps
+# onto its `truncated:` state and reports as UNPROVEN), and the word UNPROVEN on stderr. Emitting the
+# truncated list instead is exactly the fold the fix exists to stop.
+#
+# MUTATION THAT MUST GO RED: delete the `bash_shard_recap_incomplete` refusal from `_cmd_ids` → the
+# truncated capture yields `bash-shard::scripts/a.test.sh` and rc 0 → the tests below fail.
+
+_INCOMPLETE_MARKER = "⚠️ RECAP INCOMPLETE (2/3 shards ran)"
+
+
+def test_recap_incomplete_marker_is_recognised_with_or_without_the_emoji():
+    """The marker is the SIGNAL, so a rendering that lost the glyph must still be recognised.
+
+    A capture is not the runner's stdout: ANSI stripping and log rendering can drop the variation
+    selector, and an unrecognised marker is a SILENT return to #3174's failure mode. The parser
+    matches on the phrase, in a log-prefixed line, with or without the emoji.
+    """
+    prefix = f"{_SHARD_JOB}\t{_SHARD_STEP}\t2026-10-31T17:57:11.1234567Z "
+    for line in (
+        f"{prefix}{_INCOMPLETE_MARKER} — terminated",
+        f"{prefix}\u26a0 RECAP INCOMPLETE (2/3 shards ran)",  # no variation selector
+        f"{prefix}  RECAP INCOMPLETE (2/3 shards ran)",
+    ):
+        assert ci_exemption.bash_shard_recap_incomplete(line) is not None, line
+    # …and a COMPLETE capture — recap plus per-shard lines, no marker — is not truncated. Without
+    # this half the predicate could be "always True" and every baseline would be UNPROVEN.
+    complete = _shard_capture(
+        "❌ FAILED SHARD: scripts/a.test.sh",
+        "❌ 1 bash shard(s) failed",
+        "❌ failing shard(s): scripts/a.test.sh",
+    )
+    assert ci_exemption.bash_shard_recap_incomplete(complete) is None
+
+
+def test_ids_door_refuses_a_truncated_capture_and_names_it_unproven(tmp_path):
+    """`ids --log` on a capture carrying the marker: rc 4, NO ids, `UNPROVEN` on stderr.
+
+    Run through the CLI (subprocess), because the EXIT CODE is the wire contract the shell rail
+    reads — `scripts/ci-failure-set.sh` maps 4 onto `truncated:` (an excluded, UNPROVEN run) and
+    everything else onto a parser failure. A call on the function alone would not pin that.
+    """
+    log = tmp_path / "truncated.log"
+    log.write_text(
+        _shard_capture(
+            "❌ FAILED SHARD: scripts/a.test.sh",
+            _INCOMPLETE_MARKER + " — scripts/run-bash-shards.sh was TERMINATED (TERM)",
+            "❌ 1 bash shard(s) had failed when this run was killed",
+            "❌ failing shard(s): scripts/a.test.sh",
+        )
+    )
+    proc = subprocess.run(
+        [sys.executable, str(_CANONICAL_PATH), "ids", "--log", str(log)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 4, (
+        f"a truncated capture must answer with the truncated state (4), got {proc.returncode}: "
+        f"{proc.stderr[-1500:]}"
+    )
+    assert proc.stdout.strip() == "", (
+        "a truncated capture must emit NO ids (a consumer ignoring the code would subtract a "
+        f"partial set as if it were the baseline): {proc.stdout!r}"
+    )
+    assert "UNPROVEN" in proc.stderr, proc.stderr[-1500:]
+    assert "RECAP INCOMPLETE" in proc.stderr, proc.stderr[-1500:]
+
+
+def test_signatures_door_refuses_a_truncated_capture_too(tmp_path):
+    """Both doors, one rule — a truncated capture has no signature TABLE either.
+
+    Refusing only the `ids` door would leave `signatures` as the surviving way to publish a set read
+    off a run that never finished (and `scripts/ci-failure-set.sh` calls it per run).
+    """
+    log = tmp_path / "truncated-sig.log"
+    log.write_text(_shard_capture("❌ FAILED SHARD: scripts/a.test.sh", _INCOMPLETE_MARKER))
+    proc = subprocess.run(
+        [sys.executable, str(_CANONICAL_PATH), "signatures", "--log", str(log)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 4, f"{proc.returncode}: {proc.stderr[-1500:]}"
+    assert proc.stdout.strip() == "", proc.stdout
+
+
+def test_complete_capture_still_yields_its_ids(tmp_path):
+    """THE CONTROL ARM: a complete recap is NOT truncated, so the refusal cannot be vacuous.
+
+    Without this, a predicate that answered "truncated" for every capture would pass the three tests
+    above and disable the whole baseline — a false UNPROVEN is its own outage.
+    """
+    log = tmp_path / "complete.log"
+    log.write_text(
+        _shard_capture(
+            "❌ FAILED SHARD: scripts/a.test.sh",
+            "❌ 1 bash shard(s) failed",
+            "❌ failing shard(s): scripts/a.test.sh",
+        )
+    )
+    proc = subprocess.run(
+        [sys.executable, str(_CANONICAL_PATH), "ids", "--log", str(log)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    assert proc.stdout.strip().splitlines() == ["bash-shard::scripts/a.test.sh"]

@@ -938,6 +938,7 @@ labels_for() { # $1 = rows, $2 = runner id, $3 = on|off
 # success — that is a readable zero, not a failed read.
 set_labels() { # $1 = on|off
   local eng="$1" id row rid name ok=0 fail=0 rows body bad=0
+  local WANTED_BODY="" verified=0 unverified=0
   if ! rows="$(runner_rows 2>"$GH_ERR")"; then
     rows="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$rows")"
@@ -969,12 +970,45 @@ set_labels() { # $1 = on|off
     log "set_labels runner=$id body=$body"
     if printf '%s' "$body" | gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - >/dev/null 2>&1; then
       ok=$((ok+1))
+      WANTED_BODY="$id=$body"$'\n'"$WANTED_BODY"
     else
       fail=$((fail+1))
     fi
   done
   log "set_labels ok=$ok fail=$fail engagement=$eng"
-  [ "$fail" -eq 0 ]
+  # ⛔ A PUT THAT RETURNED 0 IS NOT AN ATTACHED LABEL — VERIFY BY RE-READING. The runner agent owns
+  # its label set and re-asserts it: a server-side addition lives 60-120s (measured 2026-10-29 on the
+  # live pool, both directions). Reporting `ok` from the exit status let the gate record a transition
+  # to `local` while ZERO runners carried the fallback label, so the queue kept queueing and the
+  # instrument said the pool was routed. Re-read once and compare.
+  verified=0 unverified=0
+  if [ -n "$WANTED_BODY" ]; then
+    local after_rows
+    if after_rows="$(runner_rows 2>/dev/null)"; then
+      while IFS= read -r wantline; do
+        [ -n "$wantline" ] || continue
+        local wid="${wantline%%=*}" wbody="${wantline#*=}" have wl expected
+        have="$(printf '%s\n' "$after_rows" | awk -F'\t' -v i="$wid" '$1==i{print $2}' | tr '\n' ',')"
+        # the body is a JSON label array; the host-owned labels the body deliberately omits are added
+        # back by GitHub, so compare only the labels the gate claims to write.
+        expected="$(printf '%s' "$wbody" | sed 's/^.*\[//; s/\].*$//' | tr ',' '\n' | tr -d '" ' | sort | tr '\n' ',')"
+        wl="$(printf '%s' "$have" | tr ',' '\n' | grep -v '^\(self-hosted\|Linux\|macOS\|Windows\|X64\|ARM64\|ARM\)$' | sort | tr '\n' ',')"
+        if [ "$expected" = "$wl" ]; then
+          verified=$((verified+1))
+        else
+          unverified=$((unverified+1))
+          log "set_labels REJECTED runner=$wid wanted=[$expected] observed=[$wl] — the API did not take the body we sent (agent-infra#3060)"
+        fi
+      done <<<"$WANTED_BODY"
+    else
+      log "set_labels verify SKIPPED: runner re-read failed — the write is UNCONFIRMED"
+      unverified=$((unverified+1))
+    fi
+  fi
+  log "set_labels accepted=$verified rejected=$unverified engagement=$eng (SYNCHRONOUS: what the API took on this call — durability is checked on the NEXT pass, because the runner agent re-asserts its own set 60-120s later)"
+  # Unverified writes are a FAILURE for the caller: recording the transition on them is what produced
+  # a state file claiming `local` with no carrier.
+  [ "$fail" -eq 0 ] && [ "$unverified" -eq 0 ]
 }
 
 fallback_on()  { set_labels on; }
@@ -1255,14 +1289,19 @@ fi
 # per-runner counts instead of parsing prose. `ci-runner-gate.state` keeps its single-word shape (its
 # readers compare it verbatim), and this file is OVERWRITTEN — it is the CURRENT verdict, not a log;
 # the log is the history.
-write_verdict() { # $1 = the verdict word (want); all other fields come from the run's globals
-  printf 'verdict=%s mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s reason=%s\n' \
+write_verdict() { # $1 = the verdict word (want); $2 held, $3 streak, $4 engagement_lost
+  printf 'verdict=%s mode=%s mode_source=%s capacity=%s %s queued=%s in_progress=%s oldest_queued_s=%s capability=%s held=%s streak=%s engagement_lost=%s reason=%s\n' \
     "$1" "$mode" "$MODE_SOURCE" "$CENSUS_VERDICT" "$CENSUS_KV" \
     "${ABSORPTION_QUEUED:-unmeasured}" "${ABSORPTION_IN_PROGRESS:-unmeasured}" "${ABSORPTION_OLDEST_S:-unmeasured}" \
-    "${CAPABILITY:-none}" "$reason" > "$VERDICT_FILE" 2>/dev/null || true
+    "${CAPABILITY:-none}" "${2:-0}" "${3:-0}" "${4:-0}" "$reason" > "$VERDICT_FILE" 2>/dev/null || true
 }
 
 prev="$(cat "$STATE_FILE" 2>/dev/null || echo unknown)"
+# `carriers` is what the pool ADVERTISES right now (mode=local means at least one runner carries the
+# fallback label). It is re-measured on every pass, so a label that evaporated after a previous tick's
+# write is visible HERE and nowhere earlier.
+DUR_FILE="$STATE_DIR/ci-runner-gate.engagement-durability"
+ENGAGEMENT_LOST=0
 
 # ⛔ LOG THE REASON ON THE PATH THAT ACTS, not only in --dry-run (#2904). The reason names the LEG
 # that decided — "not absorbing" vs "queue over threshold" — and without it the durable log records
@@ -1276,16 +1315,67 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-# The current verdict is recorded BEFORE the action, so a relabel that fails still leaves the
-# measurement it acted on visible to whoever reads the state next.
-write_verdict "$want"
-
 # ⛔ RE-CONVERGE UNTIL THE TRANSITION IS RECORDED (review B2-3). `mode != want` is a cheap
 # approximation of "the pool matches the desired labels", and it is not equivalent: a PARTIAL relabel
 # (one PUT failed) leaves one runner labelled, so the next pass reads `mode == want` and would skip
 # the relabel entirely — recording the transition while the un-relabelled runner is never retried
 # and never mentioned. The state file records convergence, so its absence is the trigger to converge:
 # `prev != want` re-applies the (idempotent) labels until the transition is actually recorded.
+# ⛔ HYSTERESIS (agent-infra#3060). Disengaging STRIPS the label the queue is currently using, so a
+# single hostile reading must not be able to do it: require CI_GATE_DISENGAGE_TICKS (default 3)
+# consecutive `github` readings while `local` is engaged. Engaging is never delayed.
+STREAK_FILE="$STATE_DIR/ci-runner-gate.disengage-streak"
+DISENGAGE_TICKS="${CI_GATE_DISENGAGE_TICKS:-3}"
+# ⛔ THE SAME RANGE BOUND EVERY OTHER `[ -ge ]` OPERAND IN THIS FILE CARRIES (#3060 review P2): a value
+# with more than 9 digits (or a corrupt streak file) wraps, an errored comparison reads as FALSE, and
+# FALSE here means RELEASE ON THE FIRST READING — the fail-open shape this whole block exists to stop.
+case "$DISENGAGE_TICKS" in ''|*[!0-9]*) DISENGAGE_TICKS=3 ;; esac
+if [ ${#DISENGAGE_TICKS} -gt 9 ] || [ "$DISENGAGE_TICKS" -lt 1 ]; then DISENGAGE_TICKS=3; fi
+# ⛔ KEY THE HOLD ON `prev` (the DURABLE "we engaged it" record), NOT ON `mode` (this pass's reading).
+# Measured by review: with `prev=local` and a reading that resolves `mode=unknown` (or a jobs-inferred
+# `github`), keying on `mode` skipped the hold, reset the streak, and the `prev != want` re-converge arm
+# then stripped the pool — a single non-local reading stripping capacity, which is what hysteresis is
+# for. `prev` cannot be moved by one hostile reading; that is the whole point of it.
+if [ "$want" = "github" ] && [ "$prev" = "local" ]; then
+  streak="$(cat "$STREAK_FILE" 2>/dev/null)"; case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+  if [ ${#streak} -gt 9 ]; then streak=0; fi
+  streak=$((streak+1))
+  if [ "$streak" -lt "$DISENGAGE_TICKS" ]; then
+    log "hysteresis: holding local (github reading $streak/$DISENGAGE_TICKS) — disengage not taken"
+    want="local"; HELD=1; STREAK="$streak"
+  else
+    log "hysteresis: disengage confirmed ($streak/$DISENGAGE_TICKS) — releasing the pool"
+    HELD=0; STREAK="$streak"
+  fi
+  printf '%s' "$streak" >"$STREAK_FILE" 2>/dev/null || true
+else
+  printf '0' >"$STREAK_FILE" 2>/dev/null || true
+fi
+
+# ⛔ DID THE PREVIOUS ENGAGEMENT SURVIVE? (agent-infra#3060, VGATE P1). `prev=local` means a past pass
+# wrote the labels and the state file recorded engagement. `mode` is re-measured from the API on THIS
+# pass. If the pool now advertises nothing, the label evaporated between the two passes — the measured
+# 60-120s re-assertion — and every synchronous check we can do on the writing pass will have said
+# "accepted". Record it, count it, re-apply, and let the exit status carry the failure: a gate that
+# reports `local` while the pool carries nothing is the exact instrument defect this issue is about.
+if [ "$prev" = "local" ] && [ "$mode" != "local" ] && [ "$want" = "local" ]; then
+  lost="$(cat "$DUR_FILE" 2>/dev/null)"; case "$lost" in ''|*[!0-9]*) lost=0 ;; esac
+  if [ ${#lost} -gt 9 ]; then lost=0; fi
+  lost=$((lost+1))
+  printf '%s' "$lost" >"$DUR_FILE" 2>/dev/null || true
+  ENGAGEMENT_LOST=1
+  log "ENGAGEMENT LOST: the state file says mode=local but this pass measures NO carrier (mode=$mode) — the label did not survive the write; re-applying (lost=$lost)"
+else
+  printf '0' >"$DUR_FILE" 2>/dev/null || true
+fi
+
+# The current verdict is recorded BEFORE the action, so a relabel that fails still leaves the
+# measurement it acted on visible to whoever reads the state next — but AFTER hysteresis, so the file
+# carries the DECISION this pass took, not the reading it started from. `held=` and `streak=` are what
+# separate "we chose to hold the pool" from "the strip was attempted and failed" (both used to look
+# identical: verdict=github with the state file still saying local).
+write_verdict "$want" "${HELD:-0}" "${STREAK:-0}" "${ENGAGEMENT_LOST:-0}"
+
 if [ "$mode" != "$want" ] || [ "$prev" != "$want" ]; then
   relabel_ok=1
   if [ "$want" = local ]; then fallback_on || relabel_ok=0; else fallback_off || relabel_ok=0; fi

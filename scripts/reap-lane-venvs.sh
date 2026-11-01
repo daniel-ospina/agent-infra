@@ -143,6 +143,7 @@
 #   reaping every holder-free env regardless of age. (The sibling FREE FLOOR is validated the same way,
 #   at the point it is read — see `is_pos_int "$REAP_VENV_FREE_FLOOR_MB"`.)
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
+#   REAP_VENV_VENV_COST_TIMEOUT (the hard-link-aware cost walk; default 60s)
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
 #   REAP_VENV_SCAN_CAP (test seam: pins the runaway-guard exhaustion branch, which is unreachable with
 #   the derived cap)
@@ -158,6 +159,11 @@ set -uo pipefail
 SCRIPT_NAME="reap-lane-venvs.sh"
 ISSUE_REF="#1932"
 TAB="$(printf '\t')"
+
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 2>/dev/null || true)}"
+# The sibling probe, resolved beside this script: both are `fleet_srcs`, so a cell runs them from
+# $DEST/scripts and a repo-relative pointer would not resolve where this line is actually read.
+VENV_REAL_BIN="${VENV_REAL_BIN:-$(dirname "${BASH_SOURCE[0]}")/venv-real-cost.py}"
 
 PS_BIN="${PS_BIN:-/bin/ps}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
@@ -177,6 +183,9 @@ REAP_VENV_CWD_TIMEOUT="${REAP_VENV_CWD_TIMEOUT:-20}"
 REAP_VENV_TMUX_TIMEOUT="${REAP_VENV_TMUX_TIMEOUT:-15}"
 REAP_VENV_GIT_TIMEOUT="${REAP_VENV_GIT_TIMEOUT:-20}"
 REAP_VENV_REMOVE_TIMEOUT="${REAP_VENV_REMOVE_TIMEOUT:-120}"
+# The hard-link-aware cost walk (#2159). Bounded like every other probe; on timeout the reading is
+# UNKNOWN (`?`), never a partial number.
+REAP_VENV_VENV_COST_TIMEOUT="${REAP_VENV_VENV_COST_TIMEOUT:-60}"
 REAP_VENV_ALLOW_DEGRADED_CWD="${REAP_VENV_ALLOW_DEGRADED_CWD:-0}"
 # The `/proc` fallback's root. A TEST SEAM (nothing in production sets it): the degraded-cwd branch
 # below is unreachable on Linux unless `/proc` can be made to look absent, and an unreachable
@@ -215,6 +224,16 @@ DF_BEFORE=""
 # "zero" or "fine".
 LANES_LIVE=0
 LANE_VENV_KB_MAX=0
+# The hard-link-aware readings (#2159). Every one of them is `?`/`unknown` when unmeasurable —
+# never 0, which would read as "free".
+LANE_VENV_REAL_KB_MAX=0
+# ⛔ A MEASURED ZERO IS NOT AN UNKNOWN (#2159 review, P2). A perfectly-shared env reports
+# private_kb == 0 — that is the IDEAL reading, and printing `?` for it beside `venv_dedupe=ok`
+# tells a reader the probe is broken on a box that is working exactly as intended. Only a failed
+# or timed-out probe is `?`, so the two states get their own flag.
+LANE_VENV_REAL_MEASURED=0
+VENV_DEDUPE="unknown"
+VENV_DEGRADED=0
 CAPACITY_FLOOR_OK="unknown"
 # The floor ACTUALLY asserted by the pass (validated, defaulted). The audit row must carry this, not the
 # raw environment value: with `REAP_VENV_FREE_FLOOR_MB=abc` the comparison uses 2048 and an operator
@@ -361,6 +380,33 @@ run_probe() {
 # run_bounded <seconds> <outfile> <cmd...> — 0 ok, 124 timed out, else the command's status.
 # stdout AND stderr are merged into <outfile>: a caller that needs to tell "tmux has no server" (a
 # KNOWN zero) from "tmux failed" (an unsound pass) can only do that from stderr text.
+# bound_seconds <value> <fallback> <label> — normalise a watchdog bound and echo it. Always echoes a
+# usable value; the fallback is announced on stderr (and the log) when the input was not usable.
+# ⛔ `0` IS A DELIBERATE DISABLE, not an accident: the header documents it, and it is the only spelling
+# that arms no watchdog WITHOUT a warning. Every other unusable shape — non-numeric, negative, empty,
+# or an all-digit value long enough to overflow the eventual `[ -gt ]` — falls back loudly, because an
+# unbounded probe that nobody asked for is the failure the six seams exist to prevent.
+bound_seconds() {
+    local raw="${1:-}" fallback="$2" label="$3" norm
+    norm="${raw#"${raw%%[!0]*}"}"
+    case "$raw" in
+        ''|*[!0-9]*)
+            echo "warn: $label='$raw' is not a number — using ${fallback}s (an unusable bound would arm no watchdog)" >&2
+            log "warn: $label='$raw' not a number — fell back to ${fallback}s"
+            printf '%s\n' "$fallback"; return 0 ;;
+    esac
+    if [ -z "$norm" ]; then
+        # All zeros (or literal "0"): the documented disable.
+        printf '0\n'; return 0
+    fi
+    if [ "${#norm}" -gt 9 ]; then
+        echo "warn: $label='$raw' is out of range (at most 9 digits) — using ${fallback}s instead of arming no watchdog" >&2
+        log "warn: $label='$raw' out of range — fell back to ${fallback}s"
+        printf '%s\n' "$fallback"; return 0
+    fi
+    printf '%s\n' "$norm"
+}
+
 run_bounded() {
     local secs="$1" out="$2"; shift 2
     local pid wd="" s rc=0 sentinel="" done_flag=""
@@ -372,6 +418,14 @@ run_bounded() {
     : >"$out" 2>/dev/null || { : ; }
     "$@" >"$out" 2>&1 &
     pid=$!
+    # ⛔ ONE PREDICATE FOR EVERY BOUND (#2159 review, round 5). The test below parses with strtoimax: an
+    # all-digit value above 2^63-1 makes the COMPARISON ITSELF error, `if` takes the else branch and NO
+    # WATCHDOG IS ARMED — silently, at every one of the six bound seams (ps/cwd/tmux/git/remove/cost).
+    # The same normalisation is used by the cost seam's own validation; two validators with different
+    # caps and messages is the state that must not ship (see the `REAP_VENV_MIN_AGE_SECONDS` note).
+    #   "0060" -> 60   "100000" -> 100000   "-1"/"abc"/"30s"/""  -> invalid, LOUD fallback
+    #   "0"/"00"/"000" -> zero, which is the DOCUMENTED disable spelling: intentional, so silent.
+    secs="$(bound_seconds "$secs" 120 probe-bound)"
     if is_pos_int "$secs" && [ "$secs" -gt 0 ]; then
         (
             # ⛔ `cd /` IS LOAD-BEARING (#1932). This watchdog is a CHILD of the reaper and inherits its
@@ -856,6 +910,36 @@ venv_newest_mtime() {
 }
 
 du_kb() { "$DU_BIN" -sk "$1" 2>/dev/null | awk 'NR==1 {print $1}'; }
+
+# venv_real_cost <path> — the HARD-LINK-AWARE cost of one env (#2159), as
+# "private_kb<TAB>fair_kb<TAB>total_kb<TAB>dedupe", or "" when it cannot be measured.
+#
+# ⛔ WHY A SECOND NUMBER, WHEN `du` ALREADY RUNS. `du` answers "how many blocks are under this
+# path"; it does NOT answer "how many bytes does a lane cost the filesystem". Where `uv` links
+# packages out of its cache they diverge by more than an order of magnitude, and the headroom
+# arithmetic below was built on the first question. MEASURED on cell-1 (2026-10-31, tortoise):
+#     du -sk <wt>/.venv   5,940,904 KB
+#     private blocks         101,404 KB   <- what reaping it actually frees
+# and the SAME checkout held an env with 5,935,940 private KB (nlink==1 throughout: hardlinking
+# had degraded to a full copy). So the two classes are 58x apart and `du` cannot tell them apart.
+#
+# ⛔ THE HEADROOM DIVISOR IS *NOT* CHANGED TO THIS VALUE. `du` is the UPPER BOUND — sound for a cold
+# cache, which is exactly the case a lane that follows this one lands in — so it remains the gate.
+# What this adds is the measurement the bound was hiding: `lane_venv_real` names the real marginal
+# cost, and `venv_dedupe=degraded` names the class that genuinely does cost the full figure. A
+# reader can then see a box that is 20x less full than `du` implies WITHOUT the pass becoming
+# optimistic about a cache it cannot prove is warm.
+venv_real_cost() {
+    [ -n "${PYTHON_BIN:-}" ] && [ -r "${VENV_REAL_BIN:-}" ] || return 1
+    # ⛔ BOUNDED LIKE EVERY OTHER PROBE (#2159 review, P2). This walk touches the filesystem, and a
+    # stale or unresponsive mount blocks it — an unbounded probe inside the reaper turns "the pass is
+    # slow" into "the pass never returns", which is the failure mode `run_bounded` exists for. The
+    # watchdog kills it and the rc is non-zero, so the caller reads `?`/`unknown` rather than a number.
+    local out
+    out="$(bound_file costout)" || return 1
+    run_bounded "$REAP_VENV_VENV_COST_TIMEOUT" "$out" "$PYTHON_BIN" "$VENV_REAL_BIN" --tsv "$1" || return 1
+    awk -F"$TAB" 'NF==4 && $1 ~ /^[0-9]+$/ {print; found=1} END {exit !found}' "$out"
+}
 df_free_kb() { "$DF_BIN" -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4}'; }
 
 # ── classification ───────────────────────────────────────────────────────────────────────────
@@ -993,6 +1077,27 @@ remove_one() {
 # ── modes ────────────────────────────────────────────────────────────────────────────────────
 parse_args() {
     local a
+    # ⛔ `run_bounded` arms NO watchdog unless its bound is a positive integer, so a misconfigured
+    # timeout silently makes the probe UNBOUNDED — the exact failure the call site claims to
+    # prevent (measured: `0` and `abc` both ran a 30 s probe to completion). Validated here, where
+    # the other seams are, with a loud fallback rather than a silent one.
+    # ⛔ A RANGE CHECK, NOT "DIGITS AND NOT ZERO" (review round 3): `is_pos_int` accepts any digit
+    # string, and `[ <huge> -eq 0 ]` ERRORS rather than returning false — so an all-digit value above
+    # intmax skipped the fallback entirely and left the probe UNBOUNDED, the exact fail-open this
+    # validation was added to prevent (the same class #2158 fixed for the age floor). String compare
+    # for the zero test, and a length cap before any numeric comparison, so the check cannot itself
+    # emit an arithmetic error.
+    # ⛔ THE SAME PREDICATE AS run_bounded (#2159 review, round 5), not a second one with its own cap
+    # and wording: the two disagreed (5 vs 9 digits, 60 vs 120s) and the narrower one refused a VALID
+    # value with the message "is not a positive integer". The cost walk gets its own default only —
+    # and it refuses the disable spelling, because an unbounded cost walk is never what an operator
+    # wants (it is the one seam where "0 = no watchdog" is not a legitimate choice).
+    REAP_VENV_VENV_COST_TIMEOUT="$(bound_seconds "${REAP_VENV_VENV_COST_TIMEOUT:-}" 60 REAP_VENV_VENV_COST_TIMEOUT)"
+    if [ "$REAP_VENV_VENV_COST_TIMEOUT" = "0" ]; then
+        echo "warn: REAP_VENV_VENV_COST_TIMEOUT=0 disables the cost probe's watchdog, which this seam does not allow — using 60s" >&2
+        log "warn: REAP_VENV_VENV_COST_TIMEOUT=0 refused (unbounded cost walk) — fell back to 60s"
+        REAP_VENV_VENV_COST_TIMEOUT=60
+    fi
     while [ $# -gt 0 ]; do
         a="$1"
         case "$a" in
@@ -1111,6 +1216,23 @@ report_row() {
     # The per-lane figure the headroom below divides by: the LARGEST env this pass saw, so the answer
     # is "how many lanes fit if they are all this expensive" rather than an average that under-budgets.
     is_pos_int "${kb:-}" && [ "$kb" -gt "$LANE_VENV_KB_MAX" ] && LANE_VENV_KB_MAX="$kb"
+    # The real cost of THIS env (#2159). Measured per row, not derived: the private-block count is
+    # the one number `du` cannot produce, and it is what separates a 99 MB env from a 5.6 GB one
+    # that `du` prices identically. Tracked as a MAX over the pass, like the `du` figure above, so
+    # the reported per-lane cost is the worst env seen rather than a mean.
+    if [ -d "$path/.venv" ] && real_row="$(venv_real_cost "$path/.venv")"; then
+        real_priv="${real_row%%$TAB*}"; real_rest="${real_row#*$TAB}"
+        real_dedupe="${real_rest##*$TAB}"
+        if is_pos_int "$real_priv"; then
+            LANE_VENV_REAL_MEASURED=1
+            [ "$real_priv" -gt "$LANE_VENV_REAL_KB_MAX" ] && LANE_VENV_REAL_KB_MAX="$real_priv"
+        fi
+        case "$real_dedupe" in
+            degraded) VENV_DEGRADED=$((VENV_DEGRADED + 1)); VENV_DEDUPE="degraded" ;;
+            ok) [ "$VENV_DEDUPE" = "degraded" ] || VENV_DEDUPE="ok" ;;
+            *)  : ;;
+        esac
+    fi
     if [ "$verdict" = reap ]; then
         REAPABLE=$((REAPABLE + 1))
         is_pos_int "$kb" && DU_KB=$((DU_KB + kb))
@@ -1215,10 +1337,18 @@ report_capacity() { # report_capacity <free_kb_after>
             [ "$free_mb" -gt "$floor" ] && headroom=$(( (free_mb - floor) / per_lane_mb ))
         fi
     fi
-    log_line "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
+    # The real-cost pair (#2159): `lane_venv_real` is the LARGEST private-block count seen (what
+    # reaping one such env actually frees), and `venv_dedupe` says whether this box's link regime is
+    # in force. `?`/`unknown` when the probe could not run — never 0.
+    # Gated on MEASURED, not on `> 0`: a shared env legitimately reports 0 private KB.
+    local real_mb="?"
+    if [ "${LANE_VENV_REAL_MEASURED:-0}" = "1" ]; then
+        real_mb=$((LANE_VENV_REAL_KB_MAX / 1024))
+    fi
+    log_line "[$SCRIPT_NAME] capacity: lanes_live=$LANES_LIVE lane_venv_max=${per_lane_mb:-?}MB lane_venv_real=${real_mb}MB venv_dedupe=$VENV_DEDUPE venv_degraded=$VENV_DEGRADED free_after=${free_mb:-?}MB floor=${floor}MB floor_ok=$floor_ok lanes_headroom=$headroom"
     [ -n "$why" ] && log_line "[$SCRIPT_NAME] capacity: $why"
-    log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
-        "$LANES_LIVE" "${per_lane_mb:-}" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
+    log "$(printf 'capacity\tlanes_live=%s\tper_lane_mb=%s\tlane_venv_real_mb=%s\tvenv_dedupe=%s\tvenv_degraded=%s\tfree_after_mb=%s\tfloor_mb=%s\tfloor_ok=%s\tlanes_headroom=%s' \
+        "$LANES_LIVE" "${per_lane_mb:-}" "${real_mb}" "$VENV_DEDUPE" "$VENV_DEGRADED" "${free_mb:-}" "$floor" "$floor_ok" "$headroom")"
     CAPACITY_FLOOR_OK="$floor_ok"
     CAPACITY_FLOOR_MB="$floor"
     return 0
