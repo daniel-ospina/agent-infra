@@ -2977,13 +2977,14 @@ ISSUES 2')"
   fi
   if [ "$_arms_ok" -ne 1 ]; then
     echo "  ❌ merge-one.sh's no-verdict arm could not be extracted (CLEAN arm at ${_clean_ln:-none}, no-verdict arm at ${_star_ln:-none}) — the wiring is UNPROVEN, never green"; FAIL=$((FAIL+1))
-  # ⛔ THE PRODUCER IS CAPTURED, THEN TESTED — never `grep -v … | grep -qF …` (#841/#864). The quiet
-  # grep exits at its first match while the producer is still writing, so the producer takes SIGPIPE,
-  # and under the `pipefail` this gate family runs open the PIPELINE status goes non-zero on a payload
-  # whose match was there all along — a MATCH reads as a FAILURE (#3030). The here-string form keeps
-  # `-v`'s line selection and `-qF`'s per-line substring semantics exactly, because the pattern holds
-  # no newline and can therefore never span a line boundary; an empty capture matches nothing, as the
-  # empty pipeline matched nothing.
+  # ⛔ NO `producer | grep -q` (#841/#864): the SHAPE is refused repo-wide by
+  # `scripts/check-no-sigpipe-grep.sh`, and that guard is what reddened main in #3030. Where `pipefail`
+  # IS open — the producer then takes SIGPIPE once `grep -q` exits at its first match — the inversion
+  # needs the payload to outrun the pipe buffer after the match; ⛔ THIS file runs `set -u` only, so it
+  # is not reachable HERE, and the capture is taken for the shape. It is behaviour-identical either
+  # way: `-v`'s line selection and `-qF`'s per-line substring semantics are preserved exactly, because
+  # the pattern holds no newline and can therefore never span a line boundary, and an empty capture
+  # matches nothing — as the empty pipeline matched nothing.
   elif _star_body="$(grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh")" \
     && grep -qF 'review_state_record "$(verdict_class "$LAST")"' <<<"$_star_body" \
      && ! grep -q 'state/needsfix-' "$TMP/merge_star_arm.sh"; then
