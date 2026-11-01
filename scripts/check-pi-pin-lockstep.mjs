@@ -2623,10 +2623,36 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
 
   // ---- THE TRIGGER -------------------------------------------------------------
   const onTarget = isMap(doc.on?.pull_request_target) ? doc.on.pull_request_target : {};
+  // ⛔ `edited` WAS IN THIS SET AND IS NOT ANY MORE (agent-infra#3196). It was pinned
+  // with no rationale, and the cost it carried was the whole reason #3196 exists:
+  // `scripts/record-review.sh` writes the reviewer attestation INTO THE PR BODY, so every
+  // recorded review was an `edited` activity that bought a full run of this leg — median
+  // 16.1 min of wall clock, for a diff that had not changed — and `pipeline-compliance`, the
+  // repo's ONLY required context, queues behind it. `opened` / `synchronize` / `reopened`
+  // are every event whose HEAD OR DIFF can change, and they are GitHub's own defaults for
+  // this event, so this list is now the default written out explicitly.
+  //
+  // WHAT THE REMOVAL DOES *NOT* BREAK, checked rather than assumed: `scripts/admin-merge.sh`'s
+  // #1417 guard-generation wait (`GUARD_WORKFLOW_KEYS`, `settle_self_edit_generation`) still
+  // requires EVERY guard workflow observed at the head, and this leg is observed from the run
+  // its own PUSH created — a TERMINAL leg counts as observed (`admin-merge.sh` records it
+  // before the completed-skip). The body edit still creates `pipeline-compliance`'s run, whose
+  // `edited` trigger is required by its #513 verdict binding and must stay. Dropping this one
+  // removes runs from that surface; it never adds one, and the "nothing unfinished is ours"
+  // path falls through to §1b's unchanged decision.
+  //
+  // THE DECLARED RESIDUAL: `edited` also fires when a PR's BASE is retargeted, and a base move
+  // can change the merge result. It is not recovered here (see the workflow's own trigger
+  // block for why a `schedule:` leg cannot: a scheduled run's check attaches to the default
+  // branch, and re-posting a per-PR check run would be a new instrument with `checks: write`),
+  // and the next `synchronize`/`reopened` re-validates a retargeted PR. `tests/ci-trigger-scope`
+  // pins this set from the other side, so a re-added `edited` is RED rather than silent.
   assert.deepEqual(
     Array.isArray(onTarget.types) ? [...onTarget.types].sort() : onTarget.types,
-    ["edited", "opened", "reopened", "synchronize"],
-    `${rel}: the trigger's event \`types\` must be pinned to the full set`
+    ["opened", "reopened", "synchronize"],
+    `${rel}: the trigger's event \`types\` must be pinned to the decided set (opened, synchronize, ` +
+      "reopened) — `edited` is deliberately ABSENT (#3196: every recorded review is a body edit, " +
+      "and a body edit cannot change the merge result this leg validates)"
   );
   for (const k of ["paths", "paths-ignore", "branches", "branches-ignore"]) {
     assert.ok(
