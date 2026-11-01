@@ -207,7 +207,7 @@ mk_shallow_case() {
 # only while the queue target is UNDECLARED (`OR_DECLARED=0`) — a DECLARED $OR cannot be proven by a
 # path, so it refuses with rc=3 BEFORE the provision stage runs. This suite cleared every other
 # ambient knob but NOT `$OR`, so on a box whose shell exports one (a cell's keys.env does; measured
-# on this box: `OR=daniel-ospina/tortoise`) **38 of its 98 arms** went red for a reason that has
+# on this box: `OR=daniel-ospina/tortoise`) most of this suite went red for a reason that has
 # nothing to do with provisioning:
 #
 #     [refresh] NOT PROVISIONABLE: $REPO is …/repo, whose 'origin' is the local path …/origin.git —
@@ -218,7 +218,7 @@ mk_shallow_case() {
 # …and the arm then read that EXIT-TRAP sentence off `state/refresh-last` as though the scout had
 # refused, which is why the cluster read as a cause-record defect. It is not: the record is RIGHT —
 # no cause was recorded, because nothing below `resolve_repo` ever ran. `refresh-scout.test.sh` paid
-# for this exact lesson in #1935 (114 arms) and its `rf` clears `-u OR`; this file's `rp` did not.
+# for this exact lesson in #1935 and its `rf` clears `-u OR`; this file's `rp` did not.
 # The `(h)` arms below are the regression test for the clear list itself.
 OUT=""; RC=0
 # ⛔ THE CLEAR LIST IS WRITTEN ONCE, HERE (review cycle 1, P2). It was two verbatim copies — the shape
@@ -649,9 +649,11 @@ fi
 # ── (h) HERMETICITY: AN AMBIENT DECLARED `$OR` MUST NOT REACH THE PASS ───────────────────────────────
 # ⛔ THE REGRESSION TEST FOR THE CLEAR LIST ITSELF (agent-infra#3174). The defect this pins is not in the
 # shipped script at all: `rp`/`rpc` cleared every ambient provisioning knob EXCEPT `$OR`, and every
-# fixture here proves its target with a bare LOCAL origin — which `resolve_repo` refuses the moment `$OR`
-# is DECLARED, before the provision stage runs. Measured on a cell whose shell exports `OR`:
-# 38 of 99 arms red, each recording the EXIT TRAP's `the failing step recorded no cause` because the
+# fixtures that existed when it was measured all prove their target with a bare LOCAL origin — which
+# `resolve_repo` refuses the moment `$OR` is DECLARED, before the provision stage runs. (The
+# `(h3)`/`(h4*)` fixtures below came later and spell their origin differently; `insteadOf` keeps every
+# one of them off the network.) Measured on a cell whose shell exports `OR`:
+# most of the suite red, each recording the EXIT TRAP's `the failing step recorded no cause` because the
 # refusal happened above `scout_sync` — which is why the cluster read as a cause-record defect.
 # The arm EXPORTS the ambient value into the suite's own environment (not into the pass), so it fails
 # on a tree where the clear list has drifted and passes only while `rp`/`rpc` keep `-u OR`.
@@ -750,7 +752,7 @@ ck "(h4) …and the record carries no resolve-repo refusal ($(rec why | cut -c1-
 # mechanism: strip an arm, the row that names that spelling reddens.
 # ⛔ ALL FOUR TRAILING-SLASH SPELLINGS ARE PINNED, ONE ROW EACH (review cycles 6-8, P2). With only
 # `*"/$OR/"` covered, removing any of the other three from ALL THREE lists still printed
-# `118 passed, 0 failed` — i.e. what the commit claims to fix rested on inspection. One row per spelling
+# the whole suite green — i.e. what the change claims to fix rested on inspection. One row per spelling
 # now, and the claim each row makes is the mechanism, not a count: strip that spelling from the accept
 # lists and THAT row reddens. Every fixture redirects the transport with `insteadOf` (so the spelling
 # stays realistic while nothing reaches the network) and asserts rc=0.
@@ -773,7 +775,7 @@ git -C "$D/repo" config "url.$D/origin.git.insteadOf" "git@github.com:daniel-osp
 rp "$D" "" OR="daniel-ospina/tortoise"
 ck "(h4b) an scp-form '…:tortoise.git/' origin is ACCEPTED (rc=$RC)" "$([ "$RC" -eq 0 ]; echo $?)"
 # …and the FOURTH arm, the scp form WITHOUT `.git` (review cycle 7, P2): stripping `*":$OR/"` from all
-# three lists left `120 passed, 0 failed` — the comment above claimed every row was its own fixture while
+# three lists left the suite green — the comment above claimed every row was its own fixture while
 # that one was covered by nothing. Each of the four is now a row, so every arm in the list is pinned.
 mk_case cause-trailing-slash-scp-nogit
 git -C "$D/repo" remote set-url origin "git@github.com:daniel-ospina/tortoise/"
