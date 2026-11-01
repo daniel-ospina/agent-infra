@@ -726,9 +726,15 @@ for _dir in "$O" "$(dirname "$0")"; do
   [ -f "$_cr_mod" ]  || [ ! -f "$_dir/cycle-record.sh" ] || _cr_mod="$_dir/cycle-record.sh"
 done
 [ -n "$_cap_mod" ] && . "$_cap_mod"
-if declare -f cap_probe_local cap_place cap_read_fleet cap_publish >/dev/null 2>&1; then CAPACITY=1; else
+# ⛔ THE INTERFACE GATE MUST COVER EVERY MODULE FUNCTION THE CYCLE CALLS, INCLUDING THE ONES THIS
+# CHANGE ADDED (#3167, review round 10). It listed only the four pre-change names, so a `$O` whose
+# `capacity.sh` had not been re-copied — `deploy-harness.sh` seeds `$O` per file and `continue`s on a
+# failed copy — passed the gate as WIRED, then `cap_publish_logged … || true` swallowed `command not
+# found` (rc 127) and the box published NOTHING, silently: the exact defect this change fixes. The list
+# is what makes a stale module read as unwired, and the message names what is missing.
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars >/dev/null 2>&1; then CAPACITY=1; else
   CAPACITY=0
-  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box\n' >> "$LOG" 2>/dev/null || true
+  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, and this box publishes NOTHING to peers\n' >> "$LOG" 2>/dev/null || true
 fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi

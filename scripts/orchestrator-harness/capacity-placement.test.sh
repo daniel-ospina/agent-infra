@@ -354,6 +354,18 @@ ck "orch-loop.sh sources capacity.sh from \$O, falling back to its own directory
    "$(grep -q 'capacity.sh' "$LOOP" && grep -q '_cap_mod' "$LOOP" && echo 0 || echo 1)"
 ck "…and gates on the INTERFACE (declare -f), not on the file, so a stale copy cannot read as wired" \
    "$(grep -q 'declare -f cap_probe_local cap_place cap_read_fleet cap_publish' "$LOOP" && echo 0 || echo 1)"
+# ⛔ AND THE GATE MUST NAME EVERY FUNCTION THE CYCLE CALLS (#3167, review round 10). The gate listed only
+# the four pre-change names, so a stale `$O/capacity.sh` passed as WIRED and the cycle's
+# `cap_publish_logged … || true` swallowed `command not found` — the box published NOTHING, silently. This
+# arm derives the requirement from the two files: every `cap_*` that the module DEFINES and the
+# controller CALLS must appear in the gate's own list.
+GATELIST="$(sed -n 's/.*declare -f \(cap_[a-z_ ]*\) >\/dev\/null 2>&1; then CAPACITY=1.*/\1/p' "$LOOP" | head -1)"
+MISSING=""
+for _fn in $(grep -o 'cap_[a-z_]*' "$LOOP" | sort -u); do
+  case " $GATELIST " in *" $_fn "*) : ;; *) grep -q "^$_fn() {" "$CAP" && MISSING="$MISSING $_fn" ;; esac
+done
+ck "…and the gate NAMES every module function the cycle calls — a stale capacity.sh cannot read as wired (missing:${MISSING:- none})" \
+   "$([ -n "$GATELIST" ] && [ -z "$MISSING" ] && echo 0 || echo 1)"
 ck "the cycle PROBES this box and PUBLISHES the reading (through the logged publish, #3167)" \
    "$(grep -q 'cap_probe_local "\$REPO"' "$LOOP" && grep -q 'cap_publish_logged "\$REPO"' "$LOOP" && echo 0 || echo 1)"
 ck "…READS the fleet and ASKS cap_place for the target box" \
@@ -988,11 +1000,13 @@ echo "── §14 box identity: the routable address, or an honest refusal — n
 # was the fleet's only eligible box. These arms drive the SHIPPED `cap_boxid_net` through a stubbed
 # `ip`, so the PREDICATE is graded rather than a re-implementation of it.
 IPB="$TMP/bin-ip"; mkdir -p "$IPB"
-# ⛔ THE STUB HONOURS `ip`'s OWN `up` FILTER (review round 6, finding 2): a DOWN interface keeps its
-# address in the listing, so the function asks for `show up` and this stub serves a DIFFERENT listing when
-# `up` is absent — exactly what real `ip` does. Without that, deleting `up` from the query is ungraded.
-printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *" up"*) cat "%s" ;;\n  *) cat "%s" ;;\nesac\n' \
-  "$TMP/iproute.out" "$TMP/ipaddr.up.out" "$TMP/ipaddr.out" > "$IPB/ip"; chmod +x "$IPB/ip"
+# ⛔ THE STUB HONOURS BOTH OF `ip`'s FILTERS the way real `ip` does (review rounds 6 and 10): a DOWN
+# interface keeps its address in the listing (so `show up` must serve a SMALLER file), and `scope global`
+# must filter too — a query WITHOUT it is served a host-scope listing, so deleting the scope filter from
+# the shipped query cannot look correct here.
+printf '#!/bin/sh\ncase "$*" in\n  *"route show default"*) cat "%s" ;;\n  *"scope global"*" up"*|*" up"*"scope global"*) cat "%s" ;;\n  *"scope global"*) cat "%s" ;;\n  *) cat "%s" ;;\nesac\n' \
+  "$TMP/iproute.out" "$TMP/ipaddr.up.out" "$TMP/ipaddr.out" "$TMP/ipaddr.host.out" > "$IPB/ip"; chmod +x "$IPB/ip"
+printf '1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n' > "$TMP/ipaddr.host.out"
 # ipfix <egress-dev> <addr-line…> — one fixture for one box. `CAP_BOXID` is cleared in every arm below:
 # the operator seam must not mask the derivation, which is the thing under test.
 # ⛔ EACH ADDR LINE IS EMITTED IN THE PRODUCTION SHAPE, tail included (`\       valid_lft forever
@@ -1104,6 +1118,15 @@ MUT
   A8="$(boxidnet)"; RC=$?
   ck "(8) a NON-REJECTED-NAME foreign device at a LOWER ifindex is never the identity (got $A8) — the egress anchor is what rejects it" \
      "$([ "$RC" -eq 0 ] && [ "$A8" = 10.238.144.2 ] && echo 0 || echo 1)"
+  # (8b) …and the child test is ANCHORED TO THE PREFIX (review round 10, finding 2): a device whose name
+  # merely CONTAINS the egress name (`fooeth0.9`) is a foreign device, not a VLAN child. Loosening
+  # `index($2, dev ".") != 1` to a substring test published `192.0.2.79` here with the suite green.
+  ipfix eth0 \
+    '3: fooeth0.9 inet 192.0.2.79/24 brd 192.0.2.255 scope global fooeth0.9' \
+    '4: eth0.1911 inet 10.238.144.2/20 brd 10.238.159.255 scope global eth0.1911'
+  A8B="$(boxidnet)"; RC=$?
+  ck "(8b) a device whose name only CONTAINS the egress name is not a VLAN child ($A8B, not 192.0.2.79)" \
+     "$([ "$RC" -eq 0 ] && [ "$A8B" = 10.238.144.2 ] && echo 0 || echo 1)"
   # (9) AND CLAUSE 2 IS LOAD-BEARING (same finding). The EGRESS device itself is a tunnel (`wg0`): its
   # address satisfies the anchor and is routable-looking, so only the name clause refuses it.
   ipfix wg0 '3: wg0 inet 10.8.0.2/24 peer 10.8.0.1/32 scope global wg0'
