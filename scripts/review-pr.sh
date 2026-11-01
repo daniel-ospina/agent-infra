@@ -128,6 +128,9 @@
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
 #      nothing was consumed — re-dispatch when the box is quiet, do NOT read this as a
 #      code verdict (merge-one.sh's code for the same cause)
+#   81 a spawn-point MEMORY refusal (PI_GATE_MEM_REFUSED=82, agent-infra#2387): the reviewer
+#      never started and nothing was consumed either — a capacity event like 75, with a
+#      DIFFERENT remedy (resident lanes must finish; load falling does not clear it)
 #   10 the P0/P1/P2 SCANNER did not run (awk missing/broken): the transcript could not be
 #      read for blocking findings, so a clean verdict cannot be certified — NOT recorded,
 #      and NOT read as clean (a failed scan is not an empty one)
@@ -851,6 +854,17 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
   err "$PROG: the reviewer was NOT STARTED — the spawn-point load gate refused (rc=$AGENT_RC, PI_GATE_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
   err "  This is a capacity event, not a code verdict. Re-run when the box is quieter (the gate's own ceiling is MAX_LOAD)."
   exit 75
+fi
+# ⛔ THE SPAWN POINT'S MEMORY REFUSAL IS THE SAME CLASS AND ITS OWN CODE (agent-infra#2387): the shim
+# exits PI_GATE_MEM_REFUSED=82 when available memory is below the spawn gate's floor, having consumed
+# nothing. Without this arm it reached the `AGENT_RC -ne 0` branch below, which names a
+# "crashed/killed/failed reviewer" and tells the operator to re-run — straight back into the same
+# memory floor, with the true cause (and the fact that nothing was paid for) never stated. Fails
+# closed either way, so this is reporting, not exposure: a capacity event named as a crash.
+if [ "$AGENT_RC" = "${PI_GATE_MEM_REFUSED:-82}" ]; then
+  err "$PROG: the reviewer was NOT STARTED — the spawn-point MEMORY gate refused (rc=$AGENT_RC, PI_GATE_MEM_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
+  err "  This is a capacity event, not a code verdict and not a crash. Re-run when resident lanes finish and release their working set — this does NOT clear by waiting for load; the [pi-gate] line in the transcript carries the reading and the floor (MEM_MIN_AVAIL_MB)."
+  exit "${AGENT_MEM_REFUSED:-81}"
 fi
 # ⛔ THE EXIT STATUS IS THE SIGNAL, NOT A STRING IN THE TRANSCRIPT (P3, fresh review of #2288). This
 # arm used to ALSO match `^\[pi-gate\] REFUSED` anywhere in the log, so a reviewer that QUOTED the

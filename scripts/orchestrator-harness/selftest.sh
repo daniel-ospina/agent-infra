@@ -4310,6 +4310,28 @@ ck "install.sh refuses an out-of-range limit (>=2**63, where [ errors and the ga
 out="$(run_inst "$(mk_sb)" CYC=08)"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=08 -> '$out'"; }
 ck "install.sh refuses a leading-zero limit AND leaves the live plist untouched" $rc
+# ⛔ THE MEMORY FACTORS ARE VALIDATED *BEFORE* THE DERIVATION THAT MULTIPLIES THEM (review, P2/P3).
+# `10#` fixed only the leading-zero shape: measured, `MEM_LANE_RESERVE_MB=1024M` aborted the installer
+# inside its own `$(( 10#… * … ))` with bash's message (`10#1024M: value too great for base`) and the
+# validator that names the variable was NEVER REACHED. Fail-safe (nothing renders) but the operator got
+# a shell error instead of ours — the false statement the comment above that line claims to have fixed.
+out="$(run_inst "$(mk_sb)" MEM_LANE_RESERVE_MB=1024M)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      MEM_LANE_RESERVE_MB=1024M -> '$out'"; }
+ck "install.sh refuses a non-numeric MEMORY FACTOR and leaves the live plist untouched" $rc
+SBM="$(mk_sb)"; out="$(run_inst "$SBM" MEM_LANE_RESERVE_MB=1024M)"
+grep -qF "MEM_LANE_RESERVE_MB='1024M' is not a whole number" "$SBM/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBM/out")"; }
+ck "…and the refusal is OURS, naming the variable — not bash's 'value too great for base' from the multiplication" $rc
+# …and an in-range factor above the gate's own repair bound is refused BY NAME too: the gate repairs
+# >249999999 to the shipped default, so a plist stating one would be a bound the gate does not use.
+SBL="$(mk_sb)"; out="$(run_inst "$SBL" MEM_SPAWN_RESERVE_LANES=999999999)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      MEM_SPAWN_RESERVE_LANES=999999999 -> '$out'"; }
+ck "install.sh refuses an out-of-range MEMORY FACTOR instead of rendering a bound the gate repairs away" $rc
+grep -qF "MEM_SPAWN_RESERVE_LANES='999999999' is out of range" "$SBL/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBL/out")"; }
+ck "…naming the FACTOR the operator typed, not the derived floor it happens to overflow" $rc
+# POSITIVE CONTROL: a legal factor pair still renders (the refusal above is a bound, not a blanket).
+SBO="$(mk_sb)"; out="$(run_inst "$SBO" MEM_LANE_RESERVE_MB=2048)"
+[ "$(inst_rc "$out")" = "0" ] && grep -qF '<integer>4096</integer>' "$SBO/Library/LaunchAgents/$TPL" && rc=0 || { rc=1; echo "      MEM_LANE_RESERVE_MB=2048 -> rc=$(inst_rc "$out")"; }
+ck "…and a legal reserve still renders its DERIVED floor (2048 x 2 = 4096)" $rc
 # ⛔ CYC=0 (P3, third review round, 2026-10-14): a VALID integer that passes the range loop and then
 # makes the loop `sleep 0` — a zero-delay cycle that re-hits the GitHub API. Refused here, floored in
 # the loop, so the two ends cannot disagree. Pre-fix this case exits 0 (RED).

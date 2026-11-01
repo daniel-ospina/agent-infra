@@ -49,6 +49,19 @@ bash "$HERE/brief-gate.sh" --check "$PROMPT" lane 2>/dev/null \
 
 echo "==> spawn-gate self-test ($HERE)"
 
+# ── the MEMORY gate's neutraliser (agent-infra#2387) ───────────────────────────
+# EVERY arm in this suite except section 12 wants the memory gate out of the way, for exactly the
+# reason the disk arms pin `DISK_MIN_FREE_MB=1` below: a spawn assertion must be decided by its
+# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `81` to a
+# load-gate arm and the suite would report "load-gate regressions" that are not regressions. (`81`,
+# NOT `73`: 73 is `AGENT_FORK_REFUSED` on main. That literal is the one the review of #2591 caught in
+# `adopt-fix.sh`, and this file's §10 arms now drive both codes separately.) It is
+# exported once rather than repeated at fourteen call sites, and it is a FLOOR, not a switch: there
+# is still a comparison, still a probe and still a refusal path — section 12 drives all three, and
+# the DEFAULT floor is asserted there under `env -u MEM_MIN_AVAIL_MB` (the same idiom the disk arm
+# uses to prove the shipped default rather than a repaired constant).
+export MEM_MIN_AVAIL_MB=1
+
 # ── 1) the helper exists, parses, and is SOURCED (never executed) by its callers ─
 [ -s "$GATE" ] && bash -n "$GATE"; rc=$?
 ck "spawn-gate.sh exists and parses" $rc
@@ -712,6 +725,9 @@ cp "$HERE/brief-gate.sh" "$RIG/stale/"
 # renders its delivery brief from the AMBIENT `$AGENT_INFRA_PATH` checkout, so this arm read 78 on a
 # box whose main checkout predates #2981 and called it the stale-helper behaviour. What is meant to be
 # stale here is `spawn-gate.sh`'s refusal CONSTANTS, nothing else.
+# Measured at this merge (both sides added the requirement independently): without it this stale
+# fixture exited 78 BEFORE reaching the gate, so the arm read "the stale helper refused" while the
+# stale helper had never run — rc=78, fixcount left at 2.
 cp "$HERE/reviewer-preflight.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
@@ -743,6 +759,23 @@ grep -q 'fixer NOT started (disk gate' "$RO/logs/fix-7.log"; rc=$?
 ck "fix-one.sh NAMES the disk gate on a disk refusal (not the load gate)" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $rc
+
+# ... and the MEMORY refusal through the same caller (#2387). 81, refunded the same way, and NAMED as
+# memory: the third remedy is neither "wait for load" nor "reclaim disk" (a lane must FINISH), so a
+# caller that folds it into either sends the operator to a reading that will never move.
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; mrc=$?
+mgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
+# ⛔ 81, NOT 73: 73 is `AGENT_FORK_REFUSED` on main, so this literal is the renumbered caller-facing
+# memory code. A test that pins the draft's number pins a code the gate no longer returns.
+{ [ "$mrc" -eq 81 ] && [ "$mgot" = "1" ]; }; rc=$?
+ck "fix-one.sh --argv on a MEMORY refusal exits 81 and REFUNDS the attempt (rc=$mrc, fixcount=${mgot:-<gone>})" $rc
+grep -q 'fixer NOT started (memory gate' "$RO/logs/fix-7.log"; rc=$?
+ck "fix-one.sh NAMES the memory gate on a memory refusal (not the load or disk one)" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "a memory-refused fixer starts no agent and does NOT re-run the merge chain" $rc
 
 # ... and the MANUAL path must refund NOTHING: it never incremented the counter, so refunding would
 # hand the controller a free attempt and the count would drift down forever.
@@ -1104,7 +1137,8 @@ export -f pi
 # ⛔ AND EVERY MODULE THE FIXER HARD-REQUIRES, NOT JUST THE TWO THE ARM IS ABOUT (review, P1).
 # `fix-one.sh` `exit 78`s without each of spawn-gate.sh (L54), brief-gate.sh (L62, resolved from
 # `$SELF` here, because spawn-gate.sh's `brief_gate_lib` prefers the script's OWN directory),
-# repo-target.sh (L69) and gate-policy.sh (L73). This rig seeded only four of the five, so the arm
+# repo-target.sh (L69), gate-policy.sh (L73) and — since #2981 — reviewer-preflight.sh (L75). This rig
+# seeded only four of the five it knew about, so the arm
 # returned 78 — a HALF-DEPLOYED BOX — and its assertions read as "the cross-box refusal is broken"
 # when the refusal was never reached (measured: `got 78`, on this tree and in CI). The two modules
 # this comment once left to luck are copied explicitly; the fallbacks `brief_gate_lib` also consults
@@ -1146,7 +1180,7 @@ unset -f gh; unset 'BASH_FUNC_gh%%'
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$HERE/reviewer-preflight.sh" "$RO/"
 # …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
 # `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
@@ -1230,6 +1264,53 @@ printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO
 ck "adopt-fix.sh propagates the DISK refusal 77 (got $arc2) — not normalised to a load refusal" $rc
 grep -q 'DISK gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
+# ⛔ THE MEMORY AND FORK ARMS (review of #2591, P1 — THE ARM THIS SUITE NEVER DROVE). The 75 and 77
+# arms above were green while `adopt-fix.sh` keyed its MEMORY branch on the literal `73`, which is
+# AGENT_FORK_REFUSED on main: a box out of PROCESSES was reported as "memory" (the OPPOSITE remedy —
+# wait for lanes to finish, on a box that cannot start the retry), and a REAL memory refusal (81)
+# matched no arm and wrote no line into `adopt-<PR>.log`, the one log the manual operator reads
+# (#1720). Neither code was ever driven here, which is exactly why it passed. Both are driven now, and
+# each asserts BOTH directions: its own gate is named, AND the other's is not.
+#
+# 81 (the memory gate). `MEM_MIN_AVAIL_MB=999999999` refuses the floor arm on any host — the mem gate is
+# a FLOOR, so an impossible floor is a deterministic refusal rather than a reading-dependent one, and
+# it runs BEFORE the load gate, so `MAX_LOAD=999999999` keeps this arm from being a load refusal.
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$RREPO" \
+    DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MEM_MIN_AVAIL_MB=999999999 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arcm=$?
+[ "$arcm" -eq 81 ]; rc=$?
+ck "adopt-fix.sh propagates the MEMORY refusal 81 (got $arcm) — not normalised to a load refusal" $rc
+grep -q 'fixer NOT started (MEMORY gate)' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh NAMES the MEMORY gate on a memory refusal (81 was silent without this arm)" $rc
+grep -q 'FORK gate' "$RO/logs/adopt-7.log"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and does NOT report the memory refusal as a FORK refusal (each code has its own remedy)" $rc
+# 73 (the fork gate). A genuinely starved box cannot be manufactured on a CI host, so the fork gate's
+# INSTRUMENT is what is stubbed, not its verdict: `spawn_fork_state` consumes
+# `cap_procs_pair_vars`/`cap_h_for_vars` from `capacity.sh`, and `spawn_gate_load_capacity` searches
+# `$O` FIRST — so a copy at `$RO` is the gate's own documented seam, and what is still being driven is
+# the real `run_agent` -> real fork arm -> real `fix-one.sh` `exit "$ar"` -> real `adopt-fix.sh`.
+cat > "$RO/capacity.sh" <<'CAPSTUB'
+cap_procs_pair_vars() { printf -v "$1" '%s' 15840; printf -v "$2" '%s' 15841; printf -v "$3" '%s' fixture; return 0; }
+cap_h_for_vars() { printf -v "$3" '%s' "$(( ${2:-0} - ${1:-0} ))"; return 0; }
+CAPSTUB
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$RREPO" \
+    DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MEM_MIN_AVAIL_MB=1 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arcf=$?
+[ "$arcf" -eq 73 ]; rc=$?
+ck "adopt-fix.sh propagates the FORK refusal 73 (got $arcf) — it is a capacity code of its own" $rc
+grep -q 'fixer NOT started (FORK gate)' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh NAMES the FORK gate on a fork refusal" $rc
+grep -q 'MEMORY gate' "$RO/logs/adopt-7.log"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and does NOT name it a MEMORY refusal — the P1: 'wait for resident lanes' on a box out of PROCESSES" $rc
+grep -q 'restart or drain the BOX from outside' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and carries the remedy that actually helps (restart/drain the box from OUTSIDE), not 'wait'" $rc
+rm -f "$RO/capacity.sh"   # EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)
 
 : > "$MERGE_LOG"
 
@@ -1264,6 +1345,25 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the disk gate on a disk refusal" $rc
+# ... and the MEMORY arm: 81 propagates out of lane.sh, the refusal line NAMES the memory gate, and
+# the capacity record carries `gate=mem`. That last field is not decoration: chain-merge.sh reads it
+# to decide whether a peer box may take the issue, and `mem` is TRANSFERABLE (a peer with free RAM can
+# run this work) while `land` is not — so collapsing it into `load` would be right by luck and
+# collapsing it into `disk` would hold the issue for a whole yield window on a peer that is fine.
+: > "$PI_LOG"; : > "$RO/logs/lane-9999.log"; rm -f "$RO/state/capacity-refused-9999"
+# ⛔ FROM THE WORKTREE ON `work` TOO — the same defect the note above says was fixed for the load and
+# disk arms, left in this third one (measured at the merge: rc=72, the BRANCH assertion, so the memory
+# arm asserted a gate it never reached). `$RREPO`'s HEAD is `main`; lane.sh is told `work`.
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
+[ "$lrc3" -eq 81 ]; rc=$?
+ck "lane.sh on a MEMORY refusal exits 81 (got $lrc3) — not reported as a load or disk refusal" $rc
+grep -q 'MEMORY gate refused' "$RO/logs/lane-9999.log"; rc=$?
+ck "lane.sh NAMES the MEMORY gate on a memory refusal" $rc
+capgate="$(cut -f3 "$RO/state/capacity-refused-9999" 2>/dev/null)"
+[ "$capgate" = "mem" ]; rc=$?
+ck "the capacity record carries gate=mem, not load/disk (read by chain-merge.sh: '${capgate:-<none>}')" $rc
 
 # ── THE CAPABILITY GATE (agent-infra#2935) — the wiring, not the probe ───────────────────────
 # The probe's own arms live in `cell-lane-preflight.test.sh` (stub `pi`: answer+return, answer+never
@@ -2332,7 +2432,329 @@ ck "a NON-NUMERIC reading fails OPEN like an empty one — it is not a claim tha
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
 ck "...and a NON-NUMERIC reading is ANNOUNCED too — the predicates call it unreadable, so the log must agree" $rc
 
-# ── 12) a lane killed at its CAP keeps its work (#2045) ─────────────────────────────
+# ── 12) the MEMORY gate (agent-infra#2387) ───────────────────────
+# THE DEFECT: this file gated on load, disk and the land ratio and consulted NO memory probe, on a box
+# whose OOM killer was taking lanes. MEASURED 2026-10-23 on cell-4 (16 GB): six `dmesg` "killed
+# process" events inside two hours while the controller kept dispatching, and the dead runs included
+# the P0 capstone lane. Every one of those spawns passed the load gate and the disk floor.
+#
+# ⛔ WHAT IS PROVEN HERE, AND THE ONE THING THAT IS NOT. The gate is driven END TO END through the
+# SHIPPED `run_agent` and the SHIPPED `mem_avail_mb`, in BOTH directions, and the same for the shim's
+# translation arm. What is NOT proven is that the shipped DEFAULT floor would have refused the exact
+# cell-4 snapshot — it would not (`available=8379 MB` clears a 2048 MB floor), and the README says so
+# in as many words rather than implying otherwise. The default's job is to remove the STRUCTURAL gap
+# (a spawn path that reads no memory figure cannot be bounded by any floor) and to refuse the
+# documented cell-3 reading (`653 MB`). The two arms below that matter for vacuity: a FABRICATED low
+# reading must REFUSE and a FABRICATED high reading must ALLOW through the same shipped code path,
+# and separately the REAL probe must drive both verdicts through its floor — a gate whose verdict is
+# constant (always refuse, or always allow) fails one of each pair.
+
+drive_mem() { # drive_mem <fake-reading|UNREADABLE> <floor-mb>
+  local reading="$1" floor="$2"
+  : > "$PI_LOG"
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 \
+  MEM_MIN_AVAIL_MB="$floor" MEM_FAKE="$reading" bash -c '
+    . "$1"
+    cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
+    # THE PROBE IS THE SEAM, exactly as `drive()` re-declares `load1` and the way every box supplies
+    # its own reading in production. Only the READING is replaced: the verdict, the refusal line, the
+    # ledger row, the exit code and the ordering are all the shipped file.
+    mem_avail_mb() { [ "$MEM_FAKE" = "UNREADABLE" ] && return 1; printf "%s" "$MEM_FAKE"; }
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "mem gate test" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO"
+}
+
+# ── the PARSER, against fabricated /proc/meminfo files in the SHIPPED format ─────────────────────
+# ⛔ NOT A STUBBED PARSER: `mem_avail_mb` is given a FILE (its documented test seam, the same idiom as
+# `load1`'s), so this drives the real awk that runs on a cell. The numbers are the incident's:
+# cell-3 read `MemAvailable: 653 MB`; on the same box `MemFree` reads ~180 MB while ~9 GB of page
+# cache sits in `Cached`, which is the whole reason the probe must read `MemAvailable`.
+LOWMEM="$TMP/meminfo-low"; HIGHMEM="$TMP/meminfo-high"; NOCACHE="$TMP/meminfo-old-kernel"
+printf 'MemTotal:       16331136 kB\nMemFree:          180000 kB\nMemAvailable:     668672 kB\nBuffers:           12000 kB\nCached:          9000000 kB\n' > "$LOWMEM"
+printf 'MemTotal:       16331136 kB\nMemFree:         4194304 kB\nMemAvailable:   12582912 kB\nCached:          5000000 kB\n' > "$HIGHMEM"
+# A kernel too old to expose MemAvailable (pre-3.14): only MemFree + Cached.
+printf 'MemTotal:       16331136 kB\nMemFree:          180000 kB\nCached:           6100000 kB\n' > "$NOCACHE"
+read_mem() { bash -c '. "$1"; mem_avail_mb "$2"' _ "$GATE" "$1" 2>/dev/null; }
+
+prc=1; got="$(read_mem "$LOWMEM")"
+[ "$got" = "653" ] && prc=0
+ck "POSITIVE CONTROL: mem_avail_mb parses a real /proc/meminfo shape (668672 kB -> ${got:-<empty>}MB, want 653)" $prc
+got="$(read_mem "$HIGHMEM")"
+[ "$got" = "12288" ]; rc=$?
+ck "...and a HIGH reading comes back as itself (12582912 kB -> ${got:-<empty>}MB, want 12288)" $rc
+# ⛔ MemAvailable, NEVER MemFree: the file above says MemFree=180000 kB (175 MB) and Cached=9000000 kB.
+# A probe built on either single field answers 175 or ~8800 and the gate is wrong in the direction that
+# matters (175 refuses healthy spawns; MemFree+Cached on a modern kernel OVER-reports headroom).
+got="$(read_mem "$LOWMEM")"
+{ [ "$got" != "175" ] && [ "$got" != "8967" ]; }; rc=$?
+ck "...and it reads MemAvailable, not MemFree (175MB) and not MemFree+Cached — page cache makes MemFree a lie (got ${got}MB)" $rc
+got="$(read_mem "$NOCACHE")"
+[ "$got" = "6132" ]; rc=$?
+ck "a kernel with no MemAvailable line FALLS BACK to MemFree+Cached (got ${got:-<empty>}MB, want 6132)" $rc
+# A readable file with NO usable field must fail (rc!=0, empty) — that is the input UNREADABLE is for.
+# (A MISSING file cannot prove it: the probe legitimately falls through to vm_stat there.)
+printf 'Nothing: 1\n' > "$TMP/meminfo-empty"
+got="$(read_mem "$TMP/meminfo-empty")"; mrc=$?
+{ [ "$mrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "an unparseable meminfo FAILS (rc=$mrc, '${got:-<empty>}') — it is not a reading, so it cannot default to one" $rc
+
+# ⛔ A FIELD THAT IS PRESENT BUT NOT A NUMBER IS **NOT A READING** (review, blocking). The pre-fix
+# parser tested only `a != ""`, so `MemAvailable: notanumber kB` reached `printf "%d"` and awk
+# COERCED it to 0 with exit 0 — measured `probe rc=0 out=0`. Three consequences, all of them wrong
+# artifacts rather than wrong messages: the refusal took the LOW arm (so the operator was told to wait
+# for resident lanes while the real cause was a broken probe), `state/mem-avail.tsv` recorded `0` as a
+# measurement in the series an incident is diagnosed from, and the UNREADABLE arm in `mem_gate_verdict`
+# became unreachable from the only caller. The arm below fails on that code and passes on a parser that
+# `exit 1`s like it does for an absent field.
+printf 'MemTotal: 1000 kB\nMemAvailable: notanumber kB\n' > "$TMP/meminfo-badfield"
+got="$(read_mem "$TMP/meminfo-badfield")"; mrc=$?
+{ [ "$mrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "a PRESENT-but-NON-NUMERIC MemAvailable FAILS (rc=$mrc, '${got:-<empty>}') — awk coercion must not turn a broken probe into the number 0" $rc
+# …and the same input driven END TO END must reach the UNREADABLE remedy, not the LOW one — and must
+# never write a fabricated `0` into the durable series. The reading is taken by the SHIPPED parser
+# (below) and then handed to the shipped `run_agent` through the same probe seam every other arm uses.
+# ⛔ THIS READ `meminfo-badfield2` — A PATH NOTHING WROTE (found by running this suite on a Darwin host
+# while fixing #2591). A MISSING file is not the input under test: `read_mem` legitimately falls through
+# to the live probe there, so the run took a REAL reading (`avail=1028`), the two assertions below
+# reddened on a host the gate was fine on — and, worse, the one above PASSED for the wrong reason (a
+# LOW reading refuses 81 exactly like an UNREADABLE one, so "REFUSES as UNREADABLE" was satisfied by a
+# refusal that never said UNREADABLE). One path, written once, used twice.
+bad_avail="$(read_mem "$TMP/meminfo-badfield")"
+res="$(drive_mem "${bad_avail:-UNREADABLE}" 2048)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "…and end to end that input REFUSES as UNREADABLE rather than as a LOW reading ($res)" $rc
+grep -q '\[mem-gate\] REFUSED .*UNREADABLE' "$LOG"; rc=$?
+ck "…with the UNREADABLE line, so the remedy names the broken PROBE and not resident lanes" $rc
+bf="$(tail -1 "$TMP/O/state/mem-avail.tsv" 2>/dev/null | cut -f4)"
+{ [ "$bf" = "UNREADABLE" ] || [ -z "$bad_avail" ]; }; rc=$?
+ck "…and the durable series never records a fabricated 0 for it (avail='${bf:-<none>}')" $rc
+
+# ⛔ THE macOS PAGE SIZE IS REQUIRED, NOT DEFAULTED (review, P3). `if (ps=="") ps=16384` made the ONE
+# arm of this otherwise fail-closed gate read FAIL-OPEN on a 4 KiB-page host: an unparseable header
+# substituted a 4x-larger page size and still returned a number, i.e. an ALLOW on a box below the
+# floor. Both shapes are driven through a fake `vm_stat` (the probe falls through to it whenever the
+# meminfo path is unreadable, which is exactly what a Darwin host looks like):
+#   (a) NO header at all — the 16384 default;
+#   (b) a header whose size field is not a number.
+VSTUB="$TMP/vmstat"; mkdir -p "$VSTUB"
+printf '#!/bin/sh\nprintf "Mach Virtual Memory Statistics: (page size of %%s bytes)\\nPages free: 100000.\\nPages inactive: 200000.\\n" "16K"\n' > "$VSTUB/vm_stat"
+chmod +x "$VSTUB/vm_stat"
+got="$(PATH="$VSTUB:$PATH" bash -c '. "$1"; mem_avail_mb /nonexistent-proc-meminfo' _ "$GATE" 2>/dev/null)"; vrc=$?
+{ [ "$vrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "(a) a NON-NUMERIC page size is UNREADABLE, not a coerced 16 (rc=$vrc, '${got:-<empty>}')" $rc
+printf '#!/bin/sh\nprintf "Mach Virtual Memory Statistics:\\nPages free: 100000.\\nPages inactive: 200000.\\n"\n' > "$VSTUB/vm_stat"
+chmod +x "$VSTUB/vm_stat"
+got="$(PATH="$VSTUB:$PATH" bash -c '. "$1"; mem_avail_mb /nonexistent-proc-meminfo' _ "$GATE" 2>/dev/null)"; vrc=$?
+{ [ "$vrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "(b) a MISSING page-size header is UNREADABLE, not the 16384 default that over-reports 4x and ALLOWS (rc=$vrc, '${got:-<empty>}')" $rc
+# POSITIVE CONTROL for both arms: a well-formed vm_stat is still read (so the two failures above are
+# not "vm_stat never works").
+printf '#!/bin/sh\nprintf "Mach Virtual Memory Statistics: (page size of 16384 bytes)\\nPages free: 1000.\\nPages inactive: 2000.\\n"\n' > "$VSTUB/vm_stat"
+chmod +x "$VSTUB/vm_stat"
+got="$(PATH="$VSTUB:$PATH" bash -c '. "$1"; mem_avail_mb /nonexistent-proc-meminfo' _ "$GATE" 2>/dev/null)"
+[ "$got" = "46" ]; rc=$?
+ck "POSITIVE CONTROL: a well-formed vm_stat is still read (3000 pages x 16384 B -> ${got:-<empty>}MB, want 46)" $rc
+
+# ⛔ THE TWO PROBES MUST NOT DRIFT APART (agent-infra#1732 read it for the controller, #2387 for the
+# spawn). orch-loop.sh and this file each carry ONE `mem_avail_mb`, and two readers that disagree
+# would let the controller authorise a dispatch the spawn point then refuses — with two different
+# numbers in the two logs. Pinned as a TEXT EQUALITY of the function bodies, so editing either alone
+# is red (and the fix is one edit in both, as the comment in spawn-gate.sh says).
+mb_a="$(sed -n '/^mem_avail_mb()/,/^}/p' "$GATE")"
+mb_b="$(sed -n '/^mem_avail_mb()/,/^}/p' "$HERE/orch-loop.sh")"
+{ [ -n "$mb_a" ] && [ "$mb_a" = "$mb_b" ]; }; rc=$?
+ck "the spawn gate's mem_avail_mb is BYTE-IDENTICAL to orch-loop.sh's — two readers, one reading ($(printf '%s' "$mb_a" | wc -l | tr -d ' ') lines)" $rc
+
+# ── the FLOOR's arithmetic ──────────────────────────────────────────────────────
+dfl="$(env -u MEM_MIN_AVAIL_MB bash -c '. "$1"; printf "%s/%s/%s" "$MEM_MIN_AVAIL_MB" "$MEM_LANE_RESERVE_MB" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$dfl" = "2048/1024/2" ]; rc=$?
+ck "the shipped DEFAULT floor is DERIVED and reproduces: mem_min_avail_mb/reserve/lanes = $dfl (want 2048/1024/2)" $rc
+# A 0 floor can never refuse (`[ "$mb" -lt 0 ]` is false for every reading) — the no-op gate
+# shape this file refuses everywhere else. Repaired at source time, like DISK_MIN_FREE_MB.
+z="$(MEM_MIN_AVAIL_MB=0 bash -c '. "$1"; printf "%s" "$MEM_MIN_AVAIL_MB"' _ "$GATE")"
+[ "$z" = "2048" ]; rc=$?
+ck "a 0 floor is REPAIRED to the derived default, not honoured — a gate that can never refuse is not a gate (got '$z')" $rc
+# The derived floor must stay inside the range its own predicate accepts: `is_limit` takes 9 digits, so
+# the product of two 9-digit factors could be 10+ digits, and the guard that 'repairs an out-of-range
+# value' would then accept one. Assert the INVARIANT, not one magic value — the disk band's rule.
+ov="$(MEM_LANE_RESERVE_MB=999999999 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '
+  . "$1"
+  if [ "${#MEM_MIN_AVAIL_MB}" -le 9 ] && [ "$MEM_MIN_AVAIL_MB" -ge 1 ]; then echo ok;
+  else echo "out-of-range floor=$MEM_MIN_AVAIL_MB (len=${#MEM_MIN_AVAIL_MB})"; fi' _ "$GATE")"
+[ "$ov" = "ok" ]; rc=$?
+ck "an absurd reserve is REPAIRED so the derived floor stays inside is_limit's range ($ov)" $rc
+# ⛔ AND EACH FACTOR IS REPAIRED AT SOURCE, NOT ONLY BECAUSE THE PRODUCT FAILED LATER (review, P2).
+# The reserve carried an upper guard and the LANE FACTOR did not, so an absurd lane factor was caught
+# one level down: the 13-digit product failed `is_limit`, the FLOOR was repaired to 2048, and the
+# factor an operator reads stayed at 999999999 — a value the gate silently does not use, which is the
+# "accepted value must be the used value" contract broken in the other direction. Both factors now
+# repair to their shipped defaults, and the assertion is on the FACTOR because that is the input.
+lf="$(MEM_LANE_RESERVE_MB=1024 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lf" = "2" ]; rc=$?
+ck "an absurd LANE FACTOR is REPAIRED to the shipped default at source (got '${lf:-<empty>}', want 2) — not merely masked by the floor's own range net" $rc
+lz="$(MEM_SPAWN_RESERVE_LANES=0 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lz" = "2" ]; rc=$?
+ck "…and a zeroed lane factor is repaired too (got '$lz') — a 0x floor is the no-op gate" $rc
+
+# ── the VERDICT, end to end through the SHIPPED run_agent: FABRICATED readings ────────────────────
+# POSITIVE CONTROL FIRST (this file's rule): the same driver, a high reading, the agent must RUN —
+# otherwise the refusal below proves only that a refuse-everything gate refuses.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem 12288 2048)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "POSITIVE CONTROL: MemAvailable=12288M >= 2048M ALLOWS — the agent starts ($res)" $rc
+grep -q PI_RAN "$PI_LOG"; rc=$?
+ck "...and the model really was invoked on that reading (proven live, so the refusal below is not vacuous)" $rc
+
+: > "$LOG"; : > "$PI_LOG"
+rows_w0=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_w0="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+res="$(drive_mem 653 2048)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "a FABRICATED low reading (653M) REFUSES: rc=81, AGENT_STARTED=0 ($res)" $rc
+[ ! -s "$PI_LOG" ]; rc=$?
+ck "no model was invoked on a memory refusal (~proven live by the control above)" $rc
+# THE REFUSAL MUST BE AUDITABLE: the reading, the floor, the arithmetic that produced it, and the
+# remedy (a lane must FINISH — waiting for load is not it). An operator who cannot recompute the
+# number against the box cannot tell this apart from a policy someone typed.
+grep -q '\[mem-gate\] REFUSED .*MemAvailable=653M < mem_min_avail_mb=2048M (= mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2' "$LOG"; rc=$?
+ck "the refusal names the gate, the MEASURED reading, the floor AND the arithmetic (reserve x lanes)" $rc
+grep -q 'clears when resident lanes FINISH' "$LOG"; rc=$?
+ck "...and names the remedy as RESIDENT LANES FINISHING, not 'wait for load to fall' — the remedies differ" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "a memory refusal is NOT reported as a load refusal (a box at its memory floor can have load 2)" $rc
+rows_w1=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_w1="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+[ "$rows_w1" = "$rows_w0" ]; rc=$?
+ck "a memory refusal appends NO walltime row — no agent ran, so a row would fabricate a zero sample ($rows_w1 vs $rows_w0)" $rc
+# ... but it DOES append a mem-avail row, with the reading and the floor: the series that answers "how
+# close did we get", which is the measurement that would have caught this incident early.
+mrow="$(tail -1 "$TMP/O/state/mem-avail.tsv" 2>/dev/null)"
+mf4="$(printf '%s' "$mrow" | cut -f4)"; mf5="$(printf '%s' "$mrow" | cut -f5)"; mnf="$(printf '%s' "$mrow" | awk -F'\t' '{print NF}')"
+{ [ "$mnf" = "5" ] && [ "$mf4" = "653" ] && [ "$mf5" = "2048" ]; }; rc=$?
+ck "a refusal records the MEASURED reading + floor in mem-avail.tsv (nf=$mnf, avail='${mf4:-<none>}', floor='${mf5:-<none>}')" $rc
+
+# ⛔ THE LINE MUST NOT PRINT A FALSE EQUATION (review P3). `MEM_MIN_AVAIL_MB` is a first-class knob, so
+# an operator who sets it directly would otherwise read `4096M (= mem_lane_reserve_mb=1024M x
+# mem_spawn_reserve_lanes=2)` — i.e. `4096 = 2048` — in the one line whose whole purpose is to let the
+# reader recompute the floor. Drive a deliberately operator-set floor and require it to SAY so.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem 653 4096)"
+{ [ "$res" = "rc=81 started=0" ] && grep -q 'mem_min_avail_mb=4096M (SET BY THE OPERATOR' "$LOG" && ! grep -q '4096M (=' "$LOG"; }; rc=$?
+ck "an OPERATOR-SET floor says so and does NOT print '4096M (= 1024M x 2)' — a false equation teaches the reader to distrust the line ($res)" $rc
+
+# ── UNREADABLE: FAIL CLOSED, and say the word ─────────────────────────────────────────────────────
+# The divergence from the disk gate is deliberate and has to be provable: an unreadable probe is NOT
+# "ample". A default here would be a reading that reads as data, which is the class this file's
+# headers exist to prevent.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem UNREADABLE 2048)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "an UNREADABLE probe REFUSES (fail-CLOSED, unlike the disk and load probes): rc=81, started=0 ($res)" $rc
+[ ! -s "$PI_LOG" ]; rc=$?
+ck "...and no agent was started for a probe that could not answer" $rc
+grep -q '\[mem-gate\] REFUSED .*UNREADABLE' "$LOG"; rc=$?
+ck "...and the refusal carries the word UNREADABLE, with its reason — never a default that reads as data" $rc
+uf="$(tail -1 "$TMP/O/state/mem-avail.tsv" 2>/dev/null | cut -f4)"
+[ "$uf" = "UNREADABLE" ]; rc=$?
+ck "...and the durable series records UNREADABLE rather than a number the probe never produced ('${uf:-<none>}')" $rc
+
+# ── the REAL probe, BOTH verdicts, through its floor ───────────────────────────────
+# This is the arm that kills a constant verdict: the reading is this box's OWN, so a gate that always
+# refused would fail the allow arm, one that always allowed would fail the refuse arm, and the refusal
+# must quote the value the probe itself returns.
+real_avail="$(bash -c '. "$1"; mem_avail_mb' _ "$GATE")"
+case "$real_avail" in ''|*[!0-9]*) rr=1 ;; *) [ "$real_avail" -gt 0 ]; rr=$? ;; esac
+ck "POSITIVE CONTROL: the shipped probe reads THIS box's available memory (${real_avail:-<empty>}MB) — a real reading, not a default" $rr
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem "$real_avail" 1)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "the REAL reading ALLOWS at floor 1 ($res)" $rc
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem "$real_avail" 999999999)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "the SAME REAL reading REFUSES at floor 999999999 ($res) — the verdict follows the reading, not a constant" $rc
+grep -q "MemAvailable=${real_avail}M < mem_min_avail_mb=999999999M" "$LOG"; rc=$?
+ck "...and the refusal quotes the probe's own value (${real_avail}MB), so the log can be checked against the box" $rc
+
+# ── the ORDERING, both edges ─────────────────────────────────────────────────────
+# Disk still outranks memory (un-clearable first — the #1765 rule), and memory outranks load (its
+# consequence is a dead lane, not a slow one). A gate that reported the wrong one would send the
+# operator to a reading that cannot move: this is exactly the class lane.sh/fix-one.sh name for disk.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=0 DISK_GATE_PATH="$TMP" \
+  DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "ordering" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "MEMORY outranks a simultaneous LOAD refusal — the reading whose consequence is a dead lane is reported ($res)" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and the load refusal is not what the operator is told in that case" $rc
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=0 DISK_GATE_PATH="$TMP" \
+  DISK_MIN_FREE_MB=9999999 MEM_MIN_AVAIL_MB=999999999 bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "ordering" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "a DISK refusal STILL outranks a simultaneous MEMORY refusal — the un-clearable one wins ($res)" $rc
+
+# ── the SPAWN POINT's memory refusal, TRANSLATED (82 -> 81) ─────────────────────────
+# Without this arm a shim memory refusal reaches every caller as "the agent ran and failed" or as a
+# LOAD refusal — and a reviewer/ fixer that never ran then spends a MAX_REVIEW_TRIES attempt or, worse,
+# authorises a fixer (the #1716/#1720 class the load translation already exists for).
+# ⛔ A SHELL FUNCTION, NOT A PATH STUB, AND FOR THE REASON SECTION 9 ALREADY STATES: the suite exports
+# `pi` as a function so a caller's `export PATH=…` cannot shadow it, and a FUNCTION beats any PATH
+# lookup — so a file stub here would be shadowed by the suite's own. The function below is what
+# reproduces the installed shim's behaviour that matters to run_agent: `pi` exiting 82.
+: > "$LOG"
+rows_t0=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_t0="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    pi() { return "$PI_GATE_MEM_REFUSED"; }
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "shim mem" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "a pi spawn point exiting 82 (its MEMORY refusal) is translated to AGENT_MEM_REFUSED 81 ($res)" $rc
+grep -q '\[mem-gate\] REFUSED .*pi spawn point refused the launch for MEMORY' "$LOG"; rc=$?
+ck "...and the translation NAMES memory, not load — a load refusal here would point at a fine reading" $rc
+rows_t1=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_t1="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+[ "$rows_t1" = "$rows_t0" ]; rc=$?
+ck "...and a spawn-point memory refusal appends NO walltime row ($rows_t1 vs $rows_t0)" $rc
+# ⛔ THE WHOLE CODE TABLE, PAIRWISE DISTINCT — not just the two the arm above happens to compare.
+# MEASURED CAUSE: this PR first claimed 73 for memory and 72 for the spawn point, and by the time it
+# met main BOTH were taken (73 = `AGENT_FORK_REFUSED`, 72 = `REPO_TARGET_REFUSED`). Nothing redded:
+# every reader compares a VARIABLE, so the aliased arm simply became UNREACHABLE while the surviving
+# one labelled the other event — a fork refusal reported with the memory remedy. A per-pair assertion
+# cannot catch that class (the pair it compared was fine), so this one reads EVERY code the file
+# declares and fails on any duplicate. That is the guard the defect deserved.
+codes_tbl="$(bash -c '. "$1"; for v in AGENT_LOAD_REFUSED AGENT_FORK_REFUSED AGENT_CAPABILITY_REFUSED \
+    AGENT_DISK_REFUSED AGENT_LAND_BACKLOG AGENT_MEM_REFUSED AGENT_BRIEF_REFUSED \
+    PI_GATE_REFUSED PI_GATE_MEM_REFUSED PI_FORK_REFUSED; do printf "%s=%s\\n" "$v" "${!v}"; done' _ "$GATE")"
+dupes="$(printf '%s\n' "$codes_tbl" | sed 's/.*=//' | sort | uniq -d | tr '\n' ' ')"
+[ -z "${dupes// /}" ]; rc=$?
+ck "EVERY gate code in the file is a DISTINCT integer (duplicates: '${dupes:-none}')" $rc
+# …and the memory pair must stay OUT of the band main already owns. Listed explicitly because these
+# live in SIBLING files that this suite does not read: 71 capability, 72 repo-target, 73 fork,
+# 74 land, 75 load, 76 the spawn point, 77 disk, 78 the cannot-verify pair, 79 adopt-fix.sh,
+# 80 the brief gate. A memory code in that set is a collision with a live gate by definition.
+taken_band="$(bash -c '. "$1"; for v in 71 72 73 74 75 76 77 78 79 80; do
+    if [ "$AGENT_MEM_REFUSED" = "$v" ] || [ "$PI_GATE_MEM_REFUSED" = "$v" ]; then printf "%s " "$v"; fi
+  done' _ "$GATE")"
+[ -z "${taken_band// /}" ]; rc=$?
+ck "…and neither memory code lands in the band main already assigns to another gate (collides: '${taken_band:-none}')" $rc
+
+# ── 13) a lane killed at its CAP keeps its work (#2045) ─────────────────────────────
 # THE MEASURED DEFECT (2026-10-18): eight background lanes dispatched, THREE produced nothing, and
 # one was killed at its 35-minute cap MID-WORK — 269,237 characters of transcript, seven MODIFIED
 # files in its worktree, no report file, no `.rc`, and the launcher reported

@@ -552,12 +552,17 @@ check_provider() {
     # Diagnostics only — the classification below decides.
     detail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -5)"
     case "$out" in
-      # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling —
-      # which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
+      # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling
+      # — which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
       # the bring-up reports "provider probe failed" for a call that never reached a provider, sending
       # an operator to re-push a perfectly good key. The remedy for a refusal is capacity, so say that.
+      # ⛔ AND IT REFUSES FOR MEMORY TOO (agent-infra#2387), with its own line (`[pi-gate] REFUSED
+      # (memory) …`) — so this arm must NOT assert WHICH cause (review P2). It used to say "1-min load
+      # is at or above MAX_LOAD" and to prescribe raising MAX_LOAD, which cannot clear a memory floor
+      # and would widen the load gate while the memory gate kept refusing. The verdict word is in the
+      # output (`REFUSED (memory)` + `LOW`/`UNREADABLE`), so the operator is pointed at it instead.
       *'[pi-gate] REFUSED'*)
-        die "provider probe NOT RUN: the pi spawn point refused the launch (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $detail" ;;
+        die "provider probe NOT RUN: the pi spawn point refused the launch. That is CAPACITY, not the provider — the [pi-gate] line in the output below says WHICH resource (load above MAX_LOAD, or available memory below its floor: verdict LOW or UNREADABLE). Quieten or free the box (or deliberately raise MAX_LOAD / MEM_MIN_AVAIL_MB) and re-run. Last output: $detail" ;;
       *authentication_error*|*invalid*x-api-key*|*401*)
         die "provider key REJECTED (401). The image's pre-set key is stale — push a valid one." ;;
     esac
@@ -589,7 +594,7 @@ check_provider_layer() {
     # operator is sent to bisect extensions on a box whose only problem is that it is busy (#1884).
     case "$layer_out" in
       *'[pi-gate] REFUSED'*)
-        die "provider probe NOT RUN: the pi spawn point refused the LAYER-LOADED probe (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider and not an extension — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)" ;;
+        die "provider probe NOT RUN: the pi spawn point refused the LAYER-LOADED probe. That is CAPACITY, not the provider and not an extension — the [pi-gate] line below says WHICH resource (load above MAX_LOAD, or available memory below its floor: verdict LOW or UNREADABLE); quieten or free the box (or deliberately raise MAX_LOAD / MEM_MIN_AVAIL_MB) and re-run. Last output: $(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)" ;;
     esac
     # PER-ATTEMPT bookkeeping, not just the last one: a mix (one attempt banner-only, one killed at
     # 120 s) must not be reported as "timed out on both attempts" — that would discard the banner

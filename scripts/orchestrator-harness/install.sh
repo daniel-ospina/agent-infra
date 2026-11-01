@@ -115,6 +115,33 @@ MAX_RED_FIX="${MAX_RED_FIX:-4}"
 MAX_RED_FIX_TRIES="${MAX_RED_FIX_TRIES:-2}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
+# ── the SPAWN gate's memory floor (agent-infra#2387) ─────────────────────────────────────────────
+# These three reach `spawn-gate.sh` through the daemon's environment, so they MUST be rendered: the
+# gate names `MEM_MIN_AVAIL_MB` as the remedy in its own refusal line and the README documents it as
+# the operator lever, and neither is reachable on a plist-managed cell if this installer drops it (a
+# variable that exists only in prose is one nobody can set on the box that needs it). The floor is
+# derived from the two factors — a measured pi lane (1024 MB) times the number of lanes a spawn must
+# leave room for (2, REASON: the second is the peer that peaks alongside it) — so an operator can
+# move either factor and keep the arithmetic auditable, which is what the gate's own line promises.
+MEM_LANE_RESERVE_MB="${MEM_LANE_RESERVE_MB:-1024}"
+MEM_SPAWN_RESERVE_LANES="${MEM_SPAWN_RESERVE_LANES:-2}"
+# ⛔ `10#` ON THE DERIVATION, NOT JUST IN THE GATE (review P3). A bare `$(( ))` parses base 0, so
+# `MEM_LANE_RESERVE_MB=08` aborted the installer HERE ("value too great for base") before the loop's
+# leading-zero arm could name the real problem — the same shell rule this file documents further down
+# and `spawn-gate.sh` already respects. Fail-safe (nothing renders, exit is non-zero), but the operator
+# got a shell error instead of ours.
+# ⛔ AND `10#` FIXED ONLY THE LEADING-ZERO SHAPE (review, P2/P3 — measured). `MEM_LANE_RESERVE_MB=1024M`
+# still aborts at THIS line with bash's own `10#1024M: value too great for base` (exit 1, the validator
+# below never reached), so the operator gets a shell error and no variable name — the exact
+# false-statement the paragraph above claims to have removed. The arithmetic therefore runs ONLY on two
+# plain digit strings; an unusable factor leaves the floor at its shipped default and is then REFUSED BY
+# NAME by the validator loop below, which runs before anything is rendered.
+_mem_whole() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+if _mem_whole "${MEM_LANE_RESERVE_MB:-}" && _mem_whole "${MEM_SPAWN_RESERVE_LANES:-}"; then
+  MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-$(( 10#${MEM_LANE_RESERVE_MB:-1024} * 10#${MEM_SPAWN_RESERVE_LANES:-2} ))}"
+else
+  MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-2048}"
+fi
 BATCH="${BATCH:-2}"
 # The product work floor (agent-infra#2054): how many slots of each batch are filled from
 # `candidates.product.txt` first. 0 disables it — a legitimate setting, so it must be settable through
@@ -1110,7 +1137,7 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
@@ -1121,7 +1148,15 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # (never blocking / always stale), which is never what an operator means.
     0) case "$_n" in MERGE_PRIORITY_MAX_AGE_MIN|FUNNEL_MAX_AGE_MIN)
          die "$_n='0' is not a usable window — the loop coerces it to the default, so the plist would lie about the bound" ;;
+         # ⛔ A ZEROED MEMORY FLOOR IS NOT "NO FLOOR" (agent-infra#2387). `spawn-gate.sh` repairs 0 to
+         # the shipped derivation, so a rendered `MEM_MIN_AVAIL_MB=0` would state a disabled gate while
+         # the gate refuses at 2048 — the same "a value this installer accepts must be the value the gate
+         # uses" contract, and here the lie points the wrong way: an operator who wrote 0 to switch the
+         # gate off would keep watching lanes be refused with no way to see why.
+         MEM_MIN_AVAIL_MB|MEM_LANE_RESERVE_MB|MEM_SPAWN_RESERVE_LANES)
+         die "$_n='0' is not usable — the spawn gate repairs a zeroed factor/floor to the shipped default, so the plist would state a bound the gate does not use" ;;
        esac ;;
+
     # ⛔ LEADING ZEROS (P1/P2, second review round, 2026-10-14). `''|*[!0-9]*` accepted `08`, which
     # rendered into the plist and then reached the loop, where `$(( ))` parses base 0 (leading 0 =
     # OCTAL) and `08`/`09` are not octal — on /bin/bash 3.2.57 the failed arithmetic silently
@@ -1188,6 +1223,16 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
   # install.sh exited 0; the loop then compared, errored, and lost the lane cap. No limit here is near
   # a billion, so bound the length.
   [ "${#_v}" -le 9 ] || die "$_n='$_v' is out of range (at most 9 digits)"
+  # ⛔ AND AN OUT-OF-RANGE FACTOR MUST BE REFUSED WHERE IT IS *WRITTEN*, NOT WHERE IT IS DERIVED
+  # (review, P2). `spawn-gate.sh` repairs a memory factor above 249999999 at source time, so a plist
+  # that rendered one would state a reserve the gate never uses — the same lie as the zeroed arm
+  # above, in the other direction. Naming the FACTOR is the difference between a fixable refusal and a
+  # puzzle: without this arm the run was still refused, but by the LENGTH check on `MEM_MIN_AVAIL_MB`,
+  # a value the operator never typed.
+  case "$_n" in
+    MEM_LANE_RESERVE_MB|MEM_SPAWN_RESERVE_LANES)
+      [ "$_v" -le 249999999 ] || die "$_n='$_v' is out of range (at most 249999999) — the spawn gate repairs a factor above that to the shipped default, so the plist would state a floor the gate does not use" ;;
+  esac
 done
 # ⛔ CYC NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). The loop above
 # deliberately allows `0` — it is a valid integer and every OTHER limit may legitimately be 0 — but
@@ -1271,6 +1316,9 @@ sed \
   -e "s|__MAX_RED_FIX_TRIES__|$MAX_RED_FIX_TRIES|g" \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
+  -e "s|__MEM_MIN_AVAIL_MB__|$MEM_MIN_AVAIL_MB|g" \
+  -e "s|__MEM_LANE_RESERVE_MB__|$MEM_LANE_RESERVE_MB|g" \
+  -e "s|__MEM_SPAWN_RESERVE_LANES__|$MEM_SPAWN_RESERVE_LANES|g" \
   -e "s|__BATCH__|$BATCH|g" \
   -e "s|__PRODUCT_FLOOR__|$PRODUCT_FLOOR|g" \
   -e "s|__CYC__|$CYC|g" \

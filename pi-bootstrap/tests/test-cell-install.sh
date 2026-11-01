@@ -575,11 +575,16 @@ fi
 # BEHAVIOUR, not just the artifact: RUN the installed file as `pi`. MAX_LOAD=0 is the deterministic
 # refusal lever and keeps its documented meaning ("spawn nothing"); the fake real pi behind it is
 # what proves the refusal happened AT the spawn point instead of before the gate ever ran.
+# ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER (#2387), and it is NOT optional here. The
+# installed shim checks MEMORY before load, so on a box whose MemAvailable is under the shipped 2048
+# floor this arm was decided by the memory gate (rc=82) and the suite reported its own subject — the
+# LOAD ceiling — as broken. Both arms pin the lever they are about; the refusal arm asserts the exit
+# code, so a memory refusal can never satisfy the load assertion again.
 mkdir -p "$TMP/gate-real" "$TMP/gate-home"
 printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
 chmod +x "$TMP/gate-real/pi"
 rm -f "$TMP/gate-ran"
-HOME="$TMP/gate-home" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+HOME="$TMP/gate-home" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
 grc=$?
 if [ "$grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
   ok "the INSTALLED gate REFUSES a spawn at MAX_LOAD=0 (exit 76) and the real pi never runs"
@@ -587,7 +592,7 @@ else
   fail "the installed gate did not refuse an over-ceiling spawn (rc=$grc, real pi ran=$([ -e "$TMP/gate-ran" ] && echo yes || echo no))"
 fi
 rm -f "$TMP/gate-ran"
-HOME="$TMP/gate-home" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+HOME="$TMP/gate-home" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
 grc=$?
 if [ "$grc" -eq 0 ] && [ -e "$TMP/gate-ran" ]; then
   ok "POSITIVE CONTROL: below the ceiling the installed gate EXECs the real pi (it is not a wall)"
