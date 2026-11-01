@@ -226,9 +226,16 @@ stage_fixture "$MUTFIX" 30
 # this change removes — an uncatchable signal sent 1 s after the wrapper answered TERM and the driver
 # reaped it, i.e. at a FREED pid that the kernel may already have handed to another process on this
 # host. A control may be wrong; it must not be able to kill a stranger.
+# ⛔ THE PATTERNS FOLLOW THE ESCALATION INTO ITS FUNCTION (#3187 review 8). The group kill used to be
+# spelled inline in `shard_watchdog` as `kill -TERM -"$shard_bg_pid"`; it now lives in
+# `shard_shard_escalate`, whose operand is `"$1"`. A stale pattern does NOT fail loudly here — the
+# `cmp -s` below still sees a change (the `shard_kill_group` gutting), so the control runs with the
+# watchdog's group kill INTACT and reds for the wrong reason. Keep both forms matched.
 awk '
   /^[[:space:]]*if kill -TERM -"\$shard_bg_pid"/ { print "  if kill -TERM \"$shard_bg_pid\" 2>/dev/null; then"; next }
+  /^[[:space:]]*if kill -TERM -"\$1" 2>\/dev\/null; then$/ { print "  if kill -TERM \"$1\" 2>/dev/null; then"; next }
   /^[[:space:]]*kill -KILL -"\$shard_bg_pid"/ { print "    :   # wrapper-only mutation: the group KILL is removed"; next }
+  /^[[:space:]]*kill -KILL -"\$1" 2>\/dev\/null$/ { print "    :   # wrapper-only mutation: the group KILL is removed"; next }
   /^shard_kill_group\(\) \{$/ { print "shard_kill_group() { :; }"; skip = 1; next }
   skip && /^}$/ { skip = 0; next }
   skip { next }
@@ -795,7 +802,7 @@ else
 fi
 
 # ── 10. THE ESCALATION'S BARE-PID KILL IS OWNERSHIP-CHECKED (review cycle 6, P2) ─────────────────
-# The no-group fallback is the one place in the file that names a BARE pid, and it fires a full second
+# The no-group fallback names a BARE pid (see `shard_shard_escalate`), and it fires a full second
 # after the driver may have reaped the shard — an uncatchable `SIGKILL` aimed at a freed pid, i.e.
 # possibly at another lane or the runner agent itself. It is only safe because `shard_pid_is_mine`
 # re-verifies ownership first, and NOTHING pinned that: the arm that neutralises the kill neutralises
@@ -992,6 +999,157 @@ WDHARNESS
       fail "control: the gutted ownership gate still refused the foreign pid — case (b) passes for the wrong reason"
     fi
   fi
+fi
+
+# ── 12. THE WATCHDOG'S SHARD ESCALATION GATES **BOTH** BARE SIGNALS, AT ITS CALL SITE (review 8, P2) ──
+# Arm 10 exercises the ownership PREDICATE — and that was exactly the hole: nothing asserted that the
+# ESCALATION USES it, so deleting the gate at the call site left this suite fully green (measured by a
+# reviewer: 46 assertions, exit 0, with the guard removed). The escalation is therefore a FUNCTION
+# (`shard_shard_escalate`), lifted out of the real runner and run against a LOGGING `kill` exactly like
+# arm 11 — and what it must do is asserted on BOTH of its bare-pid signals, because the TERM was
+# ungated for two review cycles while three artifacts said it was gated.
+ESCARM="$TMP/shardescalate"
+mkdir -p "$ESCARM"
+sed -n '/^shard_pid_is_mine() {$/,/^}$/p' "$RUNNER" >"$ESCARM/pid_is_mine.sh"
+sed -n '/^shard_shard_escalate() {$/,/^}$/p' "$RUNNER" >"$ESCARM/escalate.sh"
+if [ ! -s "$ESCARM/pid_is_mine.sh" ] || [ ! -s "$ESCARM/escalate.sh" ]; then
+  fail "cannot lift shard_shard_escalate/shard_pid_is_mine out of the runner — the watchdog's shard escalation is not a gated function any more"
+else
+  cat >"$ESCARM/harness.sh" <<'ESCHARNESS'
+#!/bin/bash
+# usage: harness.sh <fn-dir> <siglog> <case> — one bound escalation, with `kill` logged instead of hidden
+set -uo pipefail
+FNDIR="$1"; SIGLOG="$2"; CASE="$3"
+: >"$SIGLOG"
+. "$FNDIR/pid_is_mine.sh" || exit 3
+. "$FNDIR/escalate.sh" || exit 3
+kill() { printf '%s\n' "$*" >>"$SIGLOG"; builtin kill "$@" 2>/dev/null; }
+case "$CASE" in
+  deaf)
+    # a TERM-DEAF direct child of THIS shell, in THIS shell's group (no job control): the group TERM
+    # fails ESRCH, so the bare-pid fallback is the only path — and the gate must let BOTH signals
+    # through, or a suite that traps TERM outlives the bound on a host with no per-shard group
+    # ⛔ WAIT FOR THE TRAP TO BE INSTALLED FIRST (measured: without this the arm is FLAKY). Escalate is
+    # otherwise called while the child is still between `fork` and `trap "" TERM`, so the bare TERM
+    # lands on the DEFAULT disposition, kills it, and the second ownership read sees a zombie — case
+    # (a) then reports "bare KILL missing" on a code path that is correct.
+    ES_READY="$SIGLOG.ready" bash -c 'trap "" TERM; : >"$ES_READY"; while :; do sleep 1; done' &
+    p=$!
+    _n=0
+    while [ ! -f "$SIGLOG.ready" ] && [ "$_n" -lt 100 ]; do sleep 0.1; _n=$((_n + 1)); done
+    [ -f "$SIGLOG.ready" ] || exit 5
+    ;;
+  answered)
+    # a child that ANSWERS the TERM: it is a ZOMBIE one second later (this shell has not `wait`ed),
+    # which is the "freed pid" case — the bare KILL must NOT be aimed at it
+    sleep 20 & p=$!
+    ;;
+  foreign)
+    # a live pid whose parent has exited: "the number now names someone else"
+    p="$(bash -c 'sleep 20 >/dev/null 2>&1 & printf "%s\n" "$!"')"
+    sleep 0.5
+    ;;
+  held)
+    # the COMMON path: job control gave the child its own group, so the group form reaches it and the
+    # bare-pid fallback must never be taken
+    set -m
+    sleep 20 & p=$!
+    set +m
+    ;;
+  *) exit 4 ;;
+esac
+shard_shard_escalate "$p"
+builtin kill -KILL "$p" 2>/dev/null
+printf '%s\n' "$p" >"$SIGLOG.pid"
+exit 0
+ESCHARNESS
+  es_run() {  # <fn dir> <tag> <case>
+    bash "$ESCARM/harness.sh" "$1" "$ESCARM/sig-$2.log" "$3" 2>/dev/null
+    printf '%s\n' "$?" >"$ESCARM/rc-$2"
+  }
+  es_pid() { cat "$ESCARM/sig-$1.log.pid" 2>/dev/null; }
+  es_sig() { grep -qxF -- "$2" "$ESCARM/sig-$1.log" 2>/dev/null; }
+
+  es_run "$ESCARM" deaf deaf
+  ES_D="$(es_pid deaf)"
+  if [ ! -s "$ESCARM/rc-deaf" ] || [ "$(cat "$ESCARM/rc-deaf")" -ne 0 ] || [ -z "$ES_D" ]; then
+    fail "the shard-escalation harness did not run case (a) — this arm proves nothing"
+  elif es_sig deaf "-TERM $ES_D" && es_sig deaf "-KILL $ES_D"; then
+    pass "a TERM-DEAF shard with no group of its own gets BOTH bare signals (TERM, then KILL) — the gate does not disarm the bound"
+  else
+    fail "case (a): bare TERM $(es_sig deaf "-TERM $ES_D" && echo ran || echo missing), bare KILL $(es_sig deaf "-KILL $ES_D" && echo ran || echo missing) — a TERM-deaf shard would outlive the bound"
+  fi
+
+  es_run "$ESCARM" answered answered
+  ES_A="$(es_pid answered)"
+  if [ ! -s "$ESCARM/rc-answered" ] || [ "$(cat "$ESCARM/rc-answered")" -ne 0 ] || [ -z "$ES_A" ]; then
+    fail "the shard-escalation harness did not run case (b) — this arm proves nothing"
+  elif es_sig answered "-KILL $ES_A"; then
+    fail "the escalation sent a bare KILL to pid $ES_A after the shard had answered the TERM — that number is a reaped/zombie child, and a recycled one would be signalled"
+  elif es_sig answered "-TERM $ES_A"; then
+    pass "a shard that answers the bare TERM is NOT then KILLed by bare pid (the one-second window is gated at both signals)"
+  else
+    fail "case (b): the bare TERM never ran, so the KILL gate was not actually exercised"
+  fi
+
+  es_run "$ESCARM" foreign foreign
+  ES_F="$(es_pid foreign)"
+  if [ ! -s "$ESCARM/rc-foreign" ] || [ "$(cat "$ESCARM/rc-foreign")" -ne 0 ] || [ -z "$ES_F" ]; then
+    fail "the shard-escalation harness did not run case (c) — this arm proves nothing"
+  elif es_sig foreign "-TERM $ES_F" || es_sig foreign "-KILL $ES_F"; then
+    fail "the escalation bare-signalled pid $ES_F, which is not this driver's child — a recycled pid would be hit"
+  else
+    pass "a pid that belongs to someone else gets NO bare signal (only the group form was attempted)"
+  fi
+
+  es_run "$ESCARM" held held
+  ES_H="$(es_pid held)"
+  if [ ! -s "$ESCARM/rc-held" ] || [ "$(cat "$ESCARM/rc-held")" -ne 0 ] || [ -z "$ES_H" ]; then
+    fail "the shard-escalation harness did not run case (d) — this arm proves nothing"
+  elif es_sig held "-KILL -$ES_H" && ! es_sig held "-TERM $ES_H" && ! es_sig held "-KILL $ES_H"; then
+    pass "a shard WITH its own group still gets the group TERM→KILL and no bare signal — the common bound path is unchanged"
+  else
+    fail "case (d): the group path did not run as expected (group KILL $(es_sig held "-KILL -$ES_H" && echo ran || echo missing), bare TERM $(es_sig held "-TERM $ES_H" && echo ran || echo missing))"
+  fi
+
+  # ⛔ CONTROL for case (c): with the parent comparison gutted, a FOREIGN pid must be signalled. Otherwise
+  # (c) may pass because the fixture died rather than because of the ownership gate.
+  sed 's|\[ "\$_w" = "\$\$" \]|[ -n "$_w" ]|' "$ESCARM/pid_is_mine.sh" >"$ESCARM/pid_is_mine-gutted.sh"
+  if cmp -s "$ESCARM/pid_is_mine.sh" "$ESCARM/pid_is_mine-gutted.sh"; then
+    fail "the ownership-gate mutation did not change the lifted function — case (c) has no control"
+  else
+    mkdir -p "$ESCARM/gutted"
+    cp "$ESCARM/pid_is_mine-gutted.sh" "$ESCARM/gutted/pid_is_mine.sh"
+    cp "$ESCARM/escalate.sh" "$ESCARM/gutted/escalate.sh"
+    es_run "$ESCARM/gutted" foreign-gut foreign
+    ES_FG="$(es_pid foreign-gut)"
+    if [ -n "$ES_FG" ] && es_sig foreign-gut "-TERM $ES_FG"; then
+      pass "control: with the parent comparison removed the foreign pid IS signalled — case (c) is not vacuous"
+    else
+      fail "control: the gutted ownership gate still refused the foreign pid — case (c) passes for the wrong reason"
+    fi
+  fi
+fi
+
+# 12b. THE WATCHDOG'S TERM TRAP MUST NOT NAME A PID IT HAS ALREADY REAPED (review 8, P1, measured on
+# 46 of 46 bound hits). `wait "$shard_timer_pid"` REAPS the timer, so the variable holds a FREED number
+# for the rest of the escalation (>1 s: kill -0, ps, the marker write, the group TERM, the sleep, the
+# group KILL) — and the trap `kill "${shard_timer_pid:-}"` then ran against it, which the reviewer's
+# instrumented `kill` shim measured as `target_state=[NO-SUCH-PID]` on every hit.
+# ⚠️ THIS ONE IS A SOURCE PIN, DELIBERATELY: a `kill` FUNCTION is the only shim bash honours (a PATH
+# `kill` is never consulted — the builtin wins), and the trap string lives INSIDE `shard_watchdog`, so
+# the shim cannot be installed in the shell that runs it. Staging a real freed-pid TERM race
+# hermetically is not possible; the invariant that makes it impossible is stated in one line, so the
+# line is what is pinned. It is NOT vacuous: the pre-fix runner has no such assignment and this fails.
+if awk '
+  /^  wait "\$shard_timer_pid" 2>\/dev\/null \|\| exit 0$/ { seen = 1; next }
+  seen && /^[[:space:]]*(#|$)/ { next }
+  seen { ok = ($0 ~ /^  shard_timer_pid=""[[:space:]]*$/); exit }
+  END { exit ok ? 0 : 1 }
+' "$RUNNER"; then
+  pass "the watchdog CLEARS the timer pid the moment \`wait\` reaps it, so its TERM trap cannot signal a freed number"
+else
+  fail "the watchdog keeps \`\$shard_timer_pid\` after \`wait\` reaped it — its trap would kill a freed pid (measured on every bound hit)"
 fi
 
 echo ""
