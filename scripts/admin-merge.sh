@@ -7418,7 +7418,27 @@ RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$((FIRST_CHECKS_CEILING + FAILSAFE_R
 # lease stolen and two rails would then hold the same PR. `validate_rail_bounds` enforces
 # the relation for any operator override.
 RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$((RAIL_DEADLINE + 3600))}"
+# How many 50ms slices a rail waits for an incumbent lease to publish its pid before it
+# decides. 40 = 2s; the publish gap is microseconds, so this only ever absorbs the gap.
+RAIL_LOCK_PUBLISH_WAIT="${ADMIN_MERGE_LOCK_PUBLISH_WAIT:-40}"
 RAIL_LAST_TERMINAL_CHECK=0
+
+# path_mtime <path> — epoch seconds of a path's mtime, PORTABLY.
+# ⛔ `stat -f %m` IS BSD-ONLY (review cycle 5 finding 2). On GNU coreutils it treats `-f` as
+# `--file-system`, prints the FILESYSTEM LISTING to stdout and exits 1 — so `2>/dev/null`
+# suppresses nothing, the substitution yields listing+`$now`, the arithmetic errors, and the
+# age silently stays 0, meaning a lease can never expire. That is not hypothetical: this rail
+# is executed on Linux cells by `scripts/orchestrator-harness/cloud-cell-doctor.sh`. `date -r`
+# is portable across BSD and GNU and needs no capability probe (the repo already uses it in
+# `scripts/reap-lane-venvs.sh` for this exact reason, per the #1702 note in selftest.sh).
+path_mtime() {
+  local p="$1" m
+  m="$(date -r "$p" +%s 2>/dev/null || true)"
+  case "$m" in
+    ''|*[!0-9]*) printf '%s\n' "" ;;
+    *)           printf '%s\n' "$m" ;;
+  esac
+}
 
 rail_lock_release() {
   [ "${RAIL_LOCK_HELD:-0}" -eq 1 ] || return 0
@@ -7435,7 +7455,7 @@ rail_lock_release() {
 # make a dead holder look alive; that errs toward a duplicate NO-OP exit, never toward a
 # double merge, so it is the safe direction and is stated rather than discovered.)
 rail_lock_acquire() {
-  local key="$1" prefix dir holder started now age acquired=0 stale stolen expired=0
+  local key="$1" prefix dir holder started now age acquired=0 stale stolen expired=0 _m sage _t
   RAIL_LOCK_PR="${key##*-}"
   # ⛔ A PR-LESS INVOCATION TAKES NO LEASE (finding 6, cycle 1). `--print-bounds` must work
   # on a bare invocation, and a key with an empty PR half would make EVERY PR-less run in
@@ -7460,7 +7480,22 @@ rail_lock_acquire() {
   # create it, so the loser is decided by the kernel, not by a check-then-act race.
   mkdir "$dir" 2>/dev/null && acquired=1
   if [ "$acquired" -eq 0 ]; then
-    holder="$(cat "$dir/pid" 2>/dev/null || true)"
+    # ⛔ WAIT BRIEFLY FOR AN INCUMBENT'S IDENTITY BEFORE DECIDING ANYTHING (review cycle 5
+    # finding 1, MEASURED still 2/40 trials double-acquiring). `mkdir` makes the lease VISIBLE
+    # an instant before its pid is written, so a racer that reads during that gap sees "no
+    # holder" and has to guess: guess "dead" and two rails hold one lease; guess "alive" and a
+    # genuinely abandoned lease never frees. Neither guess is needed — the gap is
+    # microseconds, so a reader WAITS for the identity to appear (bounded), and only then
+    # decides from facts. The bound is deliberately tiny and does not weaken any other path.
+    holder=""
+    _t=0
+    while [ "$_t" -lt "${RAIL_LOCK_PUBLISH_WAIT:-40}" ]; do
+      holder="$(cat "$dir/pid" 2>/dev/null || true)"
+      [ -n "$holder" ] && break
+      [ -d "$dir" ] || break          # the lease went away entirely — no identity to wait for
+      sleep 0.05
+      _t=$((_t + 1))
+    done
     started="$(cat "$dir/started" 2>/dev/null || true)"
     now="$(date +%s)"
     age=0
@@ -7468,7 +7503,9 @@ rail_lock_acquire() {
     # not — a lease that is being published has no `started` file yet, and an age of 0 there
     # would make an in-flight lease look both fresh and (via a dead-pid read) stale at once.
     case "${started:-}" in
-      ''|*[!0-9]*) age=$(( now - $(stat -f %m "$dir" 2>/dev/null || echo "$now") )) ;;
+      '')
+        _m="$(path_mtime "$dir")"; [ -n "$_m" ] || _m="$now"
+        age=$((now - _m)) ;;
       *) age=$((now - started)) ;;
     esac
     [ "$age" -lt 0 ] && age=0
@@ -7508,19 +7545,33 @@ rail_lock_acquire() {
       stale="$dir.stale.$$"
       if mv "$dir" "$stale" 2>/dev/null; then
         stolen="$(cat "$stale/pid" 2>/dev/null || true)"
-        # EXPIRY IS THE ONLY AUTHORITY over a lease whose identity cannot be proven.
-        if [ "$expired" -eq 1 ]; then
+        # ⛔ THE DECISION IS MADE FROM WHAT WAS ACTUALLY MOVED, NOT FROM THE PRE-STEAL READ
+        # (review cycle 5 finding 1). `expired` was computed from a read taken BEFORE the
+        # `mv`, so a rail that decided "expired" and then moved the directory AFTER another
+        # rail had reclaimed and re-created it would `rm -rf` that rail's FRESH LIVE lease and
+        # mkdir over it — two rails holding one lease, reproduced deterministically. So the
+        # moved lease is re-read and the ONLY grounds to take it are:
+        #   (i) it is exactly the lease we decided to steal (`$stolen` = `$holder`), or
+        #  (ii) its holder is unreadable AND its own mtime proves it has EXPIRED.
+        # Anything else is restored. Restoring is always safe; acquiring is not.
+        if [ -n "$stolen" ] && [ "$stolen" = "$holder" ]; then
           rm -rf "$stale" 2>/dev/null
           mkdir "$dir" 2>/dev/null && acquired=1
         elif [ -z "$stolen" ]; then
-          say_err "admin-merge: ↻ rail lease ${dir} has NO readable holder and has NOT expired (${age}s of ${RAIL_LOCK_TTL}s) — that is a lease MID-PUBLICATION, not a dead one. RESTORING it rather than stealing a rail that is between mkdir and writing its pid."
-          mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
-        elif [ "$stolen" != "$holder" ] && kill -0 "$stolen" 2>/dev/null; then
-          say_err "admin-merge: ↻ rail lease ${dir}: this rail moved a lease owned by LIVE pid ${stolen} that it had NOT decided to steal (it decided on ${holder:-<unreadable>}) — RESTORING it rather than stealing a running rail's lease."
-          mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
+          # Re-derive expiry from the MOVED directory's own mtime — never from the stale read.
+          _m="$(path_mtime "$stale")"; [ -n "$_m" ] || _m="$now"
+          sage=$((now - _m)); [ "$sage" -lt 0 ] && sage=0
+          if [ "$RAIL_LOCK_TTL" -gt 0 ] && [ "$sage" -ge "$RAIL_LOCK_TTL" ]; then
+            say_err "admin-merge: ↻ rail lease ${dir} has no readable holder and its own mtime proves it EXPIRED (${sage}s of ${RAIL_LOCK_TTL}s) — taking it."
+            rm -rf "$stale" 2>/dev/null
+            mkdir "$dir" 2>/dev/null && acquired=1
+          else
+            say_err "admin-merge: ↻ rail lease ${dir} has NO readable holder and has NOT expired (${sage}s of ${RAIL_LOCK_TTL}s) — that is a lease MID-PUBLICATION, not a dead one. RESTORING it rather than stealing a rail that is between mkdir and writing its pid."
+            mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
+          fi
         else
-          rm -rf "$stale" 2>/dev/null
-          mkdir "$dir" 2>/dev/null && acquired=1
+          say_err "admin-merge: ↻ rail lease ${dir}: this rail moved a lease owned by pid ${stolen} but had decided to steal ${holder:-<unreadable>} — the lease CHANGED between the read and the steal, so it is someone else's now. RESTORING it rather than stealing a running rail's lease."
+          mv "$stale" "$dir" 2>/dev/null || rm -rf "$stale" 2>/dev/null
         fi
       fi
     fi

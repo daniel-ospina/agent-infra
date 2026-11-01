@@ -15299,6 +15299,20 @@ if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ] || [ -f "$(dirnam
   fi
 fi
 
+# #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
+# file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is
+# executed by NOTHING (not even check-bash32-parse.sh, which only does a syntax check)
+# — the inert-enforcer class. That is exactly how the lease's remaining reclaim race
+# shipped green through five review cycles: the test existed and never ran.
+RAIL_EXIT_TEST="$(dirname "${BASH_SOURCE[0]}")/rail-exit.test.sh"
+if [ -f "$RAIL_EXIT_TEST" ]; then
+  if bash "$RAIL_EXIT_TEST"; then
+    checks=$((checks + 1)); pass "(o) rail-exit.test.sh — terminal exit, whole-attempt deadline, per-PR lease"
+  else
+    checks=$((checks + 1)); fail "(o) rail-exit.test.sh FAILED — see its output above"
+  fi
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
