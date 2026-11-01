@@ -741,7 +741,7 @@ mk_case cause-trailing-slash
 git -C "$D/repo" remote set-url origin "https://github.com/daniel-ospina/tortoise/"
 # ⛔ THE TRANSPORT IS REDIRECTED, THE SPELLING IS NOT (review cycle 5, P1-shaped P2): without this line
 # `scout_sync` FETCHES github.com for real — it broke this file's own "no network is touched" invariant
-# (:66) and made the arm's outcome depend on egress. `insteadOf` rewrites the transport while
+# (stated at the top of this file — cited by name, not by line: this PR has moved line numbers twice) and made the arm's outcome depend on egress. `insteadOf` rewrites the transport while
 # `git config --get remote.origin.url` still answers the trailing-slash URL that `resolve_repo` reads,
 # so the arm measures the accept list and nothing else.
 git -C "$D/repo" config "url.$D/origin.git.insteadOf" "https://github.com/daniel-ospina/tortoise/"
