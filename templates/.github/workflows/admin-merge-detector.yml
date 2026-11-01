@@ -57,6 +57,16 @@ on:
   workflow_run:
     workflows: ["CI on main"]
     types: [completed]
+    # ⛔ MAIN-ONLY, and the filter belongs HERE, not on a job `if:` (#3131).
+    # `CI on main` also runs on `integration/**` (the batch train) as a PRE-merge
+    # gate. Without this filter a red train would trigger the detector, which diffs
+    # the commit's failing set against MAIN's union and files "admin-merge carried
+    # unique failures" naming a SHA that never landed — a false issue that buries the
+    # real ones. A job-level `if: github.event.workflow_run.head_branch == 'main'`
+    # would also work for workflow_run but SILENTLY SKIPS the documented
+    # `workflow_dispatch` path below, where that field is null; a trigger filter
+    # leaves manual runs untouched.
+    branches: [main]
   workflow_dispatch:
     inputs:
       sha:

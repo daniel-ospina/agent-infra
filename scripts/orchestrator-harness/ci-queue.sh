@@ -21,9 +21,10 @@
 # measurement (41 consecutive repair dispatches skipped while 8 runners and ~11 lane slots sat idle).
 # ⛔ THE FOURTH-ARM CHURN IS GONE WITH IT (#2408's disclosure, superseded). `orch-loop.sh`'s RED-TREE
 # fixer used to book its attempt, spawn, and then be turned away at `fix-one.sh`'s first push, so the
-# cost was CHURN. Nothing on the repair path reads this module now, so that refusal — and the refund
-# line that had to name both causes (`another box holds the claim, or the CI-queue gate deferred the
-# push`) — cannot happen. A lane that is started will push.
+# cost was CHURN. Nothing on the repair path reads this module now, so that refusal cannot happen,
+# and the refund line no longer has to name a second cause — it reads `another box holds the claim`,
+# not `another box holds the claim, or the CI-queue gate deferred the push`. A lane that is started
+# will push.
 # ⛔ AND IT IS NOT THE ONLY UNGATED PUSHER — this paragraph used to claim it was, which is the class
 # of coverage claim a reader trusts and then stops checking (#2540). `pr-doctor`'s `prfix` workers
 # are the other one, and they are not an orch-loop arm at all: `pr-doctor.py` spawns up to `MAX_FIX`
@@ -31,9 +32,14 @@
 # (:1723-1733) or `gh run rerun …` (:1898), through `nonblocking-dispatch.sh`/`spawn-gate.sh`,
 # neither of which reads this module — `rg -c 'ciq|ci-queue' scripts/pr-doctor.py` is 0. The `prfix`
 # kind is declared for the CREATION back-pressure gate (#2409), not this one, so on the repo whose
-# 92-deep queue this header opens with, a launchd job still adds CI behind it. Wiring that surface
-# is agent-infra #2540; the standalone verb below (`status`, rc 0 deep / 1 ok / 2 unknown) exists so
-# a caller that is not bash can branch on it.
+# 92-deep queue this header opens with, a launchd job still adds CI behind it. ⛔ THAT SURFACE STAYS
+# UNGATED BY DECISION, NOT BY OMISSION: #2540 asks for it to be gated, and #2927 rules repair — of
+# which a `prfix` worker is one — out of this gate on purpose (its bound is the box's lane slots and
+# the load/disk gate). So wiring it is a RE-OPEN OF #2927, argued there with the measurement, and NOT
+# an execution of #2540; the README's §CI back-pressure says the same thing, because two opposite
+# instructions in two files this change touches is how the next lane picks the wrong one. The
+# standalone verb below (`status`, rc 0 deep / 1 ok / 2 unknown) exists so a caller that is not bash
+# can branch on it — it does not by itself decide that anything should be wired to it.
 # ⛔ NOT gated, on purpose: the merge rail's second-sample re-run (`admin-merge.sh`, the flake retry).
 # It is not an omission — a rail that is MERGING removes a PR and its load from the system, and
 # refusing the retry would replace a merge with a stuck red head; the retry happens only inside that
@@ -134,9 +140,10 @@
 #     `runners=~<n>` when it did not.
 #   * ⛔ WHAT THIS GATE IS ALLOWED TO GATE IS TWO CLASSES, AND THE LINE IS THE ACTION'S COST (#2927).
 #     ONLY work that ADDS A NEW CI RUN is queue-gated: opening a PR from an issue (agent-infra's
-#     `dispatch-merge.sh`, and `orch-loop.sh`'s ISSUE path) and the merge rail's own CI-spending
-#     steps. REPAIR — acting on a PR that already exists (a red-check fixer, a review-findings fixer,
-#     a conflict/rebase fixer, the PR-sickness queue) — is NOT queue-gated by this module and must
+#     `dispatch-merge.sh`, and `orch-loop.sh`'s ISSUE path) and the CI RERUN (`orch-loop.sh`'s rerun
+#     site — the one verb in the sweep that queues a fresh run for the same head). REPAIR — acting on a
+#     PR that already exists (a red-check fixer, a review-findings fixer, a conflict/rebase fixer, the
+#     PR-sickness queue) — is NOT queue-gated by this module and must
 #     not become so again: its real bounds are the lane slots (`MAX_LANES` vs lanes alive) and the
 #     load/headroom gate.
 #     ⛔ THE BASIS IS A DECISION PLUS A MEASUREMENT, NOT A COST CLAIM — and it used to be stated as a
@@ -171,7 +178,8 @@
 #           green-with-no-verdict on the newest tree, and on `workflow-lock` would satisfy the
 #           guard-generation wait while contributing no verdict. So the required check is one of the
 #           two that DOES stack, and a repair push costs a run there every time.
-#           NOT in the set, and why: `ci-main.yml` (`push: [main]`) and `enforce-skills.yml`
+#           NOT in the set, and why: `ci-main.yml` (`push` to `main`, plus `integration/**` since
+#           #3131 — never a PR push) and `enforce-skills.yml`
 #           (`schedule` + `push: [main]`) never fire on a PR push, and `admin-merge-detector.yml`
 #           fires on `workflow_run` of main's CI. The four reusable `workflow_call` files
 #           (`docs-ci`, `drift-check`, `node-ci`, `python-ci`) run as JOBS inside a caller's RUN,

@@ -65,7 +65,7 @@ esac
 printf 'alpha\n' > "$f"
 if box_sed_i 's/alpha/beta/' "$f" && [ "$(head -1 "$f")" = "beta" ]; then ok "sed_i: rewrote the file"; else bad "sed_i: did not rewrite"; fi
 printf 'alpha\n' > "$f"
-sed -i 's/alpha/beta/' "$f" >/dev/null 2>&1
+sed -i 's/alpha/beta/' "$f" >/dev/null 2>&1  # portability-ok: DELIBERATE PROBE — the GNU spelling is run on purpose to assert BSD's silent consumption
 got="$(head -1 "$f")"
 case "$OS" in
   darwin)

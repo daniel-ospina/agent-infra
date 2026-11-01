@@ -726,9 +726,15 @@ for _dir in "$O" "$(dirname "$0")"; do
   [ -f "$_cr_mod" ]  || [ ! -f "$_dir/cycle-record.sh" ] || _cr_mod="$_dir/cycle-record.sh"
 done
 [ -n "$_cap_mod" ] && . "$_cap_mod"
-if declare -f cap_probe_local cap_place cap_read_fleet cap_publish >/dev/null 2>&1; then CAPACITY=1; else
+# ⛔ THE INTERFACE GATE MUST COVER EVERY MODULE FUNCTION THE CYCLE CALLS, INCLUDING THE ONES THIS
+# CHANGE ADDED (#3167, review round 10). It listed only the four pre-change names, so a `$O` whose
+# `capacity.sh` had not been re-copied — `deploy-harness.sh` seeds `$O` per file and `continue`s on a
+# failed copy — passed the gate as WIRED, then `cap_publish_logged … || true` swallowed `command not
+# found` (rc 127) and the box published NOTHING, silently: the exact defect this change fixes. The list
+# is what makes a stale module read as unwired, and the message names what is missing.
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars >/dev/null 2>&1; then CAPACITY=1; else
   CAPACITY=0
-  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box\n' >> "$LOG" 2>/dev/null || true
+  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, and this box publishes NOTHING to peers\n' >> "$LOG" 2>/dev/null || true
 fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
@@ -1046,12 +1052,15 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 #   • an UNREADABLE CLOCK in the `now` probe is LIVE, never "not in flight" (P2, cycle-23 review).
 
 # refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
-# fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
-# already owns this head) — OR when the CI-queue gate DEFERS the push before any work (fix-one.sh's
-# `ciq_ci_allowed` arm, #2296). Both are "no agent work was done", which is the only property this
-# marker asserts; the LOG LINE below names both causes, because a deferral logged as a cross-box
-# refusal sends an operator hunting for a lease that never existed (the #1720 "the log names the
-# wrong cause" class). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# fix-one.sh writes $O/state/fixbail-<pr>-<head> on any of its THREE pre-agent deferrals: the
+# cross-box CAS refusal (another box already owns this head), the PR-OWNER lock
+# (`mergeclaim-<PR>.lock` held by a live pid, #2576), and a PR-owner takeover that could not complete.
+# Every one is "no agent work was done", which is the only property this marker asserts; the LOG LINE
+# below names the cause it was given, because a deferral logged as a cross-box refusal sends an
+# operator hunting for a lease that never existed (the #1720 "the log names the wrong cause" class).
+# ⛔ THERE IS NO CI-QUEUE ARM HERE OR IN fix-one.sh (#2927): a repair path reads no CI queue, so it
+# can never write a `DEFERRED by the CI-queue gate` line — the arm that used to sit here was
+# unreachable, and naming it sent a manual operator to wait for a deferral that cannot happen. The controller books the attempt at SPAWN (fixcount+1) and, on the
 # reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
 # used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
 # refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
@@ -1079,12 +1088,12 @@ refund_bailed_fixer() {
     if [ -f "$O/state/fixspend-$pr-$head" ]; then
       rm -f "$O/state/fixspend-$pr-$head"
       touch "$O/state/needsfix-$pr-$head"
-      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, findings marker restored" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, findings marker restored" >>"$LOG"
     else
-      echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
+      echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
     fi
   else
-    echo "#$pr fixer bailed (cross-box refusal or CI-queue deferral) — attempt refunded to $n" >>"$LOG"
+    echo "#$pr fixer bailed (cross-box refusal or PR-owner lock) — attempt refunded to $n" >>"$LOG"
   fi
   # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
   rm -f "$O/state/parked-$pr"
@@ -2329,6 +2338,17 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       *)          parts+=("$notr not reached (cause not recorded)") ;;
     esac
   fi
+  # ⛔ A QUEUED ENTRY IS NOT A SUPPRESSED ONE (#3110, measured on the live mac box: `219 candidates ->
+  # 0 queued, 9 peer-owned, 209 blacklisted (checked: queued 151, dispatched 53, pr 5)`). The 151 were
+  # COUNTED inside `blacklisted`, which is the bucket an operator reads as "suppressed, nothing to do" —
+  # while in fact they are the dispatch backlog: `refresh-candidates.sh` writes a CLEAN candidate to
+  # `candidates.txt` AND `checked.txt` (checked.txt is what stops a re-pre-flight, NOT what stops the
+  # dispatch), so they are waiting for the ISSUE PATH, not excluded. Printing them as blacklisted is
+  # how "the selector spawns zero" read as "there is nothing to spawn" on the one line an operator has.
+  # The sub-breakdown and the reconciled total are unchanged; what changes is that the backlog is
+  # NAMED as backlog beside them instead of reading as one more kind of suppression.
+  local backlog_q=""
+  if is_num "$sk_q" && [ "$sk_q" -gt 0 ]; then backlog_q="$sk_q"; fi
   local joined="" p
   for p in ${parts[@]+"${parts[@]}"}; do joined="${joined:+$joined, }$p"; done
   # A record that does not add up is NOT printed as a clean decomposition: the parts names what
@@ -2350,6 +2370,20 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # recorded something other than `none`, and never with an extra literal: the occurrence count is
   # already inside the field.
   local tail=""
+  # ⛔ THE BACKLOG IS STATED AS ITS OWN FACT, because it is the ONLY part of that line an operator can
+  # ACT on: `209 blacklisted` is a suppression to audit, `151 in the dispatch backlog` is work the box
+  # has already judged CLEAN and simply has not spawned. Two different repairs, and until now one word.
+  # ⛔ IT NAMES ITS REFERENT (#3110 review, P2). `$tail` renders at the END of the line, after
+  # `backlog=<wc -l candidates.txt>` — a DIFFERENT number — so a bare "N of those" read as "of the 219".
+  # It is gated on the `blacklisted` part having rendered at all, in TWO ways, for two real populations.
+  # `skipped_checked` shipped in #2040 while its sub-breakdown (including `skipped_checked_queued`) only
+  # arrived in #2183 — so a record from that window carries the TOTAL and no queued count, which the
+  # `is_num "$sk_q"` conjunct excludes. The `is_num "$sk_ck"` conjunct covers the other case: a total
+  # that is absent or non-numeric, which would otherwise print `7 of the  blacklisted` — a backlog
+  # claimed against a bucket that is not on the line.
+  if is_num "$sk_ck" && is_num "$sk_q" && [ "$sk_q" -gt 0 ]; then
+    tail="$tail — $backlog_q of the $sk_ck blacklisted are the DISPATCH BACKLOG (CLEAN-judged, awaiting the issue path), not suppressed"
+  fi
   case "${unusable:-}" in ''|none) : ;; *) tail="$tail — failing surface: $unusable" ;; esac
   # ⛔ A FAILED REWRITE IS NOT "NOTHING WAS RELEASED". The writer publishes `checked_released=-`
   # when the atomic `checked.txt` rewrite failed — the entries ARE still suppressed and nobody knows
@@ -3147,10 +3181,21 @@ pr_owner_live() { # <pr> [<head-sha>] [<branch>] -> 0 iff a LIVE thing owns it (
     # it and returned 1 unconditionally — so when the probe said OWNED (a lock that appeared between the
     # `pr_owned` call and this one, or a claim caught mid-creation) the arms SPAWNED A SECOND WORKER on
     # a live claim and logged it as a release. Only rc=1 is a release.
-    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then return 0; fi
+    # ⛔ AND AN OWNED VERDICT THAT REPORTS A DESTRUCTION IS NOT DISCARDED (review of #3096, P2-3). rc 0 is
+    # "owned", so the old one-liner threw `_v` away — but three of `pl_verdict`'s OWNED sentences exist ONLY
+    # to be read: a claim this pass detached and could not put back (`peer may be working blind`), and a
+    # record that vanished mid-reclaim. Leaving no artifact for those is the "process claim with no
+    # evidence" class this file bans, and `fix-one.sh`'s equivalent outcome writes a WARNING line.
+    _tab="$(printf '\t')"
+    if _v="$(pl_verdict "$O/state" "$pr" 1 1 2>/dev/null)"; then
+      case "$_v" in
+        *'could NOT be put back'*|*VANISHED*|*'could NOT be detached'*)
+          echo "[lock] #$pr — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true ;;
+      esac
+      return 0
+    fi
     # Strip the verdict label with a REAL TAB: `${_v#RELEASED\t}` never matched (bash reads `\t` in a
     # pattern as an escaped `t`), so every reap line printed a duplicated label and a raw tab — review P2.
-    _tab="$(printf '\t')"
     echo "[reap] #$pr released — ${_v#*"$_tab"}" >> "$LOG" 2>/dev/null || true
     return 1
   fi
@@ -4411,7 +4456,7 @@ while true; do
             refund_bailed_fixer "$PR" "$HEAD_N" 0
             RF_N=$(( RF_N - 1 ))
             printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || true
-            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim, or the CI-queue gate deferred the push) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
+            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
           fi
           # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT (review P1, cycle 3). `fix-one.sh` writes
           # `fixgate-<PR>-<head>` when the load/disk gate refused the agent at the spawn point, so
@@ -4583,6 +4628,29 @@ while true; do
     # so the arm calls this file instead of a lookalike. `$_CK_PY` is resolved once at startup (see
     # there) and is an ABSOLUTE path, so this pipeline's subshell inherits it.
     V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 "${_CK_PY:-/nonexistent/check-class.py}" 2>/dev/null)"
+    # ⛔ AN EMPTY VERDICT IS A READ FAILURE, NEVER A CLASS (#3110). `check-class.py` ALWAYS prints one
+    # token, so `V` empty means the classifier never answered at all — a python that could not start, a
+    # file that vanished between the startup guard and this line, a killed pipeline. That reached the
+    # residual `*)` arm below, which printed `no acting arm for class '<empty>' — nothing spawned
+    # (re-read next cycle)` and then classified it `<empty>` AGAIN on the next cycle, for ever: a
+    # pattern that cannot match the population reads as nothing to do. MEASURED in this box's own log:
+    # `#10214 no acting arm for class '<empty>' — nothing spawned (unreadable/empty check surface;
+    # re-read next cycle)` — the PR was never acted on by any arm.
+    # ⛔ THE FIX IS A READING ARM, NOT A PERMISSION — AND IT IS NOT A ONE-STEP BYPASS EITHER. Mapping it
+    # to `NOCHECKS` ROUTES it into the NOCHECKS arm, which RE-RUNS this same read with retries and, only
+    # when that still cannot answer, consults a DIFFERENT source (the check-runs authority) — so the
+    # first thing it does is not an action, it is another attempt at the question. The EMPTY read itself
+    # reaches no acting arm; what CAN act is the resolver's own answer — `RECOVERED:GREEN` is handed to
+    # the ordinary GREEN arm and merges, `RECOVERED:FAILED:*` reaches the CI fixer — and the resolver
+    # emits `RECOVERED:<label>` only for a label a read actually produced (`nochk-resolve.py`,
+    # `graded()`), never for an empty or ungraded surface. So a merge here rests on a read that
+    # ANSWERED at the live head, never on the failed one that produced the empty output. The
+    # alternatives are worse: GREEN on an unread surface merges blind, and leaving it `<empty>` is the
+    # indefinite re-read this replaces.
+    if [ -z "${V:-}" ]; then
+      V="NOCHECKS"
+      echo "#$PR the classifier produced NO VERDICT (empty output from $_CK_PY) — treating it as an UNREAD surface and handing it to the NOCHECKS arm to re-read from the run list" >>"$LOG"
+    fi
     # ── THE NOCHECKS CLASS GETS AN ARM (agent-infra#2719) ─────────────────────────────────────────
     # ⛔ WHAT THIS REPLACES. `NOCHECKS` used to mean THREE different events at once — the read failed,
     # no run had registered yet, and no run will ever exist — because the pipeline above discards the
@@ -5583,8 +5651,13 @@ PY
       # THE LOCAL FORK BOUND, from the SAME record placement reads — one implementation, two consumers.
       CAP_FORK_BOUND_SELF="$(cap_fork_bound "$CAP_REC" 2>/dev/null)" || CAP_FORK_BOUND_SELF=""
       CAP_LPC_SELF="$(cap_kv "$CAP_REC" lpc)"
-      cap_publish "$REPO" "$CAP_REC" > /dev/null 2>&1 \
-        || echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings)" >> "$LOG"
+      # ⛔ THE REFUSAL'S REASON IS PART OF THE DIAGNOSIS (#3167). `cap_publish` is fail-closed by design —
+      # it prints `publish=refused why=<reason>` and returns 1 — but this call used to discard that output
+      # (`>/dev/null 2>&1`), so a box that could not name itself went INELIGIBLE for a whole lane's worth of
+      # cycles with no gate red and nothing in the log saying why. `cap_publish_logged` surfaces it on one
+      # line AND is driven by the suite (§14 (16)-(18)), so its polarity, its reason parsing and its
+      # CAP_BOXID gate are graded behaviour rather than a grep of this file's text.
+      cap_publish_logged "$REPO" "$CAP_REC" "$LOG" "$CAP_NS" || true
       CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
       [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"
       # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.
