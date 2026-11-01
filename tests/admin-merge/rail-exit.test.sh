@@ -88,22 +88,35 @@ grep -q STOLEN "$TMPROOT/ttl.out" && ok "an EXPIRED lease is stolen (no permanen
 # MEASURED before the atomic steal: both rails acquired in 37 of 120 trials, because a
 # naive reclaim `rm -rf`s a path the other rail already owns and then mkdirs over it —
 # two rails proceed and double-hold, which is what the lease exists to prevent.
+# ⛔ EIGHT CONCURRENT RECLAIMERS, AND EXACTLY ONE WINNER. The first version of this test used
+# TWO rails and only failed when BOTH acquired — which (a) missed the defect entirely (it
+# reproduces at 6-8 reclaimers: measured 19/120 trials with 2-3 simultaneous acquirers) and
+# (b) passed VACUOUSLY when zero rails acquired, because `grep -c` on a missing file is 0 and
+# the arm only rejected `n -eq 2`. It now asserts n == 1 exactly, over 8 rails (review cycle 3
+# finding 3).
 harness "$TMPROOT/race.sh" 'rail_lock_acquire "acme-widget-80" && echo ACQUIRED'
-both=0; trials=30
+trials=40; wrong=0; zero=0
 i=0
 while [ "$i" -lt "$trials" ]; do
   i=$((i + 1))
   rm -rf "$LOCKROOT/acme-widget-80"
   mkdir -p "$LOCKROOT/acme-widget-80"
   printf '999999\n' > "$LOCKROOT/acme-widget-80/pid"
-  ADMIN_MERGE_LOCK_ROOT="$LOCKROOT" bash "$TMPROOT/race.sh" > "$TMPROOT/a.out" 2>/dev/null &
-  ADMIN_MERGE_LOCK_ROOT="$LOCKROOT" bash "$TMPROOT/race.sh" > "$TMPROOT/b.out" 2>/dev/null &
+  printf '1000\n' > "$LOCKROOT/acme-widget-80/started"
+  r=0
+  while [ "$r" -lt 8 ]; do
+    ADMIN_MERGE_LOCK_ROOT="$LOCKROOT" bash "$TMPROOT/race.sh" >> "$TMPROOT/race-$i.out" 2>/dev/null &
+    r=$((r + 1))
+  done
   wait
-  n=$(cat "$TMPROOT/a.out" "$TMPROOT/b.out" 2>/dev/null | grep -c ACQUIRED)
-  [ "$n" -eq 2 ] && both=$((both + 1))
+  n=$(grep -c ACQUIRED "$TMPROOT/race-$i.out" 2>/dev/null); n=${n:-0}
+  [ "$n" -eq 0 ] && zero=$((zero + 1))
+  [ "$n" -gt 1 ] && wrong=$((wrong + 1))
 done
-[ "$both" -eq 0 ] && ok "concurrent reclaim: exactly ONE winner in $trials/$trials trials" \
-  || bad "concurrent reclaim: BOTH rails acquired in $both/$trials trials"
+[ "$wrong" -eq 0 ] && ok "8 concurrent reclaimers: never more than ONE winner in $trials/$trials trials" \
+  || bad "TWO OR MORE rails acquired in $wrong/$trials trials"
+[ "$zero" -eq 0 ] && ok "every trial produced a winner (the assertion cannot pass vacuously)" \
+  || bad "$zero/$trials trials produced ZERO winners — the race harness is broken, not the fix"
 
 # ── 5. A PR-LESS RUN TAKES NO LEASE ───────────────────────────────────────────
 harness "$TMPROOT/nopr.sh" 'rail_lock_acquire "acme-widget-"; echo "HELD=$RAIL_LOCK_HELD"'

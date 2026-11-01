@@ -212,6 +212,16 @@ CFS="$ROOT/scripts/ci-failure-set.sh"
 ADM="${ADMIN_MERGE_SUITE_ADM:-$ROOT/scripts/admin-merge.sh}"
 DETECTOR="$ROOT/.github/workflows/admin-merge-detector.yml"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
+# ⛔ THE SUITE MUST NOT TOUCH THE MACHINE-GLOBAL LEASE ROOT (#3194, review cycle 3 finding 5).
+# The rail now takes a per-PR lease; without this, every one of this suite's ~1843 rail
+# invocations would lease the REAL `$HOME/.pi/agent/state/rail-locks/agent-infra-42`, so two
+# concurrent suite runs on this box (routine: several lanes and reviewers per repo), or a live
+# rail on that key, would hit ALREADY-RAILING (exit 75) and cascade misleading failures — and
+# the suite would delete leases out of the directory a live rail depends on. Each suite run
+# gets its own root.
+ADMIN_MERGE_LOCK_ROOT="$TMP/rail-locks"
+export ADMIN_MERGE_LOCK_ROOT
+mkdir -p "$ADMIN_MERGE_LOCK_ROOT"
 checks=0
 failures=0
 # The two new windows default to "one observation, no waiting" for the WHOLE
