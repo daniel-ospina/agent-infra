@@ -10316,6 +10316,24 @@ const CLASSIFICATION_MASK_EVASIONS: Array<[string, string]> = [
   // (b) `\<<` is a LITERAL `<` plus an input redirect, so bash never sees a heredoc and the next
   //     line is a COMMAND — while the opener scan honoured it and blanked the executed line.
   ['backslash-escaped `<<` is NOT an opener', "cat \\<<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // ⛔ `cat <<<'EOF'` is a HERE-STRING, and a here-string has NO BODY (cycle-2 fresh-context review,
+  // P0 — measured). The bespoke opener scan read the SECOND/THIRD `<` as an opener and blanked the
+  // command lines after it, so the `git -C` push below reached zero dispatches while bash RUNS it.
+  // `heredocOpenersIn` already refuses a `<<<` run; this row is what pins that the masker now asks
+  // it rather than re-deriving the opener.
+  ['here-string `<<<` has no body, so the next line RUNS', "cat <<<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // ⛔ A QUOTED STRING OPENED ON AN *EARLIER* LINE IS TEXT, and the line that closes it RESUME
+  // execution (measured in real bash: the `touch` side effect below IS created). A per-line reader
+  // saw the middle line's `<<'EOF'` as an opener and blanked the executed line, so a `git -C` push
+  // there was invisible to `isGitOp` — the fail-OPEN this whole section exists to prevent.
+  //
+  // ⚠️ THE STATE MUST BE READ ON *EVERY* LINE, not only on lines carrying a `<<` candidate: the
+  // quote is opened by a line the opener scan never looks at. That was a measured P0 in the first
+  // cut of this fix (the carried-state comment was true of the READER and false of the CALLER).
+  [
+    'quote closed on the line before the body, so the body RUNS',
+    'echo "note: run\ncat <<\'EOF\'\nnext"\ngit -C /wt push origin HEAD:main\nEOF',
+  ],
 ];
 
 // One `test` per shape, so a single broken clause cannot mask the others in the report: the whole
@@ -10351,7 +10369,40 @@ const GIT_WRITE_VERB_SPELLINGS: Array<[string, string]> = [
   ['QUOTED --git-dir value with a space', 'git --git-dir "/a b/.git" push'],
   ['QUOTED -C value, commit', 'git -C "/tmp/my wt" commit -am x'],
   ['quoted value then a second flag', 'git -C "/tmp/my wt" --no-pager push'],
+  // ⛔ THE FLAG TOKEN MAY BE QUOTED TOO (cycle-2 fresh-context review, P2 — measured). Widening the
+  // option VALUE to a quoted word left the FLAG literal, so `git "-C" /wt push` — bash strips the
+  // quotes, a real push — matched no arm. A quoted flag must still carry a leading `-`, so this
+  // cannot admit an arbitrary word.
+  ['QUOTED flag token', 'git "-C" /wt push'],
+  ['single-quoted flag token', "git '-C' /wt push"],
+  // ⛔ A LINE CONTINUATION IS A SPACE TO BASH (cycle-2 fresh-context review, P1 — measured):
+  // `git -C /wt \` NEWLINE `  push` RUNS a real push, but the pattern saw `git -C /wt \` and no
+  // verb, so it reached zero dispatches.
+  ['line continuation between flag and verb', 'git -C /wt \\\n  push'],
+  ['line continuation between git and flag', 'git \\\n  -C /wt push'],
 ];
+
+// ── …and the OTHER direction: a heredoc the SHELL really opens stays DATA (PR #3161 P0) ─────────
+// The pin above is fail-closed: an executed body must stay visible. This one is the mirror, and it
+// exists because "read the opener with the proven reader" can overshoot — a mask that refuses too
+// little is a gate hit on a tracker write, which is the parked-lane class this PR also fixes, but a
+// mask that refuses too MUCH is the fail-open. `<<'E'O'F'` builds ONE word (`EOF`) by CONCATENATION,
+// so bash's terminator IS `EOF`: the body below is stdin to `cat`, never executed, and blanking it is
+// CORRECT. Taking the first quoted span (`E`) as the delimiter instead masked PAST bash's terminator
+// and hid the real commands after it.
+console.log("\n── a heredoc the shell really opens stays data (PR #3161 P0)");
+for (const [label, command] of [
+  ['concatenated delimiter `<<\'E\'O\'F\'` builds one word', "cat <<'E'O'F'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['unquoted segment after a quoted one', "cat <<'EOF'x\nignored\nEOFx"],
+] as Array<[string, string]>) {
+  test(`a body the shell treats as data is masked, not gated: ${label}`, () => {
+    equal(
+      /git -C \/wt push|pr merge/.test(withoutQuotedHeredocBodies(command)),
+      false,
+      'the body is stdin to a data-only consumer — it must be blanked, not left readable',
+    );
+  });
+}
 console.log("\n── a git WRITE VERB in every spelling, quoted option values included (PR #3161 P1)");
 for (const [label, command] of GIT_WRITE_VERB_SPELLINGS) {
   test(`a git write verb is gated: ${label}`, () => {
