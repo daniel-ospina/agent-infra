@@ -2654,7 +2654,8 @@ test("workflow-lock.yml is wired to validate the MERGE RESULT, not the head (#67
     Array.isArray(onTarget.types) ? [...onTarget.types].sort() : onTarget.types,
     ["opened", "reopened", "synchronize"],
     `${rel}: the trigger's event \`types\` must be pinned to the decided set (opened, synchronize, ` +
-      "reopened) — `edited` is deliberately ABSENT (#3196: every recorded review is a body edit, " +
+      "reopened) — `edited` is deliberately ABSENT (#3196: every record that APPENDS the marker is " +
+      "a body edit — " +
       "and a body edit cannot change the merge result this leg validates)"
   );
   for (const k of ["paths", "paths-ignore", "branches", "branches-ignore"]) {

@@ -23,6 +23,14 @@
 #      match — the arm exists because an implicit default is not an artifact) → must FAIL.
 #   5. MUTANT: `harness-single-source.yml`'s `paths:` block deleted   → must FAIL.
 #   6. MUTANT: `paths:` reduced to `'**'` (a no-op that reads like a filter) → must FAIL.
+#   6c. MUTANT: `types:`/`branches-ignore:` added to the single-source guard → must FAIL (a second
+#      filter key narrows coverage the path arm cannot see).
+#   6d. MUTANT: a sibling key's block sequence read as `types:`        → must FAIL. The reader used to
+#      attribute a FOLLOWING key's list to the preceding one.
+#   6e. MUTANT: a SECOND `on:` trigger beside `pull_request_target:` / `pull_request:` → must FAIL.
+#      Pinning one trigger's filters is not enough: a second trigger re-opens all of it.
+#   6f. MUTANT: a `push:` trigger added to `pipeline-compliance.yml`  → must FAIL (the same `on:`
+#      key-set pin on the required context, which has no other arm).
 #   7. MUTANT: `edited` dropped from `pipeline-compliance.yml`        → must FAIL. The asymmetry is
 #      the whole design: the required context KEEPS `edited`, because its #513 verdict binding
 #      re-reads the body marker written after the last push. "Finishing the job" there would let a
@@ -355,6 +363,28 @@ if apply_mutation "$HSS" "$HSS_SECOND" \
     branches: [main]" \
   "a second trigger must be constructible"; then
   run_check 1 "a \`push:\` trigger added to the single-source guard is REFUSED" HSS_FILE="$HSS_SECOND"
+  case "$FINDINGS" in
+    *"declares [push]"*) pass "the refusal NAMES the added trigger" ;;
+    *) fail "the refusal did not name the added trigger in its FINDING line" ;;
+  esac
+fi
+
+echo "== 7f. MUTANT: a \`push:\` trigger added to the REQUIRED context =="
+# The third new `on:` pin. It fired when measured, but a pin with no arm is a pin nothing keeps
+# firing (this suite's own header: "a pin that cannot fail is not a pin").
+PC_PUSH="$TMP/pc-push.yml"
+if apply_mutation "$PC" "$PC_PUSH" \
+  "  pull_request:
+    branches:
+      - main" \
+  "  push:
+    branches: [main]
+  pull_request:
+    branches:
+      - main" \
+  "a push trigger on the required context must be constructible"; then
+  run_check 1 "a \`push:\` trigger on pipeline-compliance is REFUSED (its verdict would attach to main)" \
+    PC_FILE="$PC_PUSH"
   case "$FINDINGS" in
     *"declares [push]"*) pass "the refusal NAMES the added trigger" ;;
     *) fail "the refusal did not name the added trigger in its FINDING line" ;;

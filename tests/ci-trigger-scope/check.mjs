@@ -38,8 +38,9 @@ const PC_FILE =
   process.env.PC_FILE || path.join(ROOT, ".github/workflows/pipeline-compliance.yml");
 
 // The decided `types:` for the base-branch checker. `edited` is the whole point (#3196): it is
-// the body-edit activity `scripts/record-review.sh` fires on every recorded review, and it
-// cannot change the merge result this job validates.
+// the body-edit activity `scripts/record-review.sh` fires on every record that APPENDS the marker
+// (it PATCHes only while the marker is absent), and it cannot change the merge result this job
+// validates.
 const WL_EXPECTED_TYPES = ["opened", "synchronize", "reopened"];
 
 const findings = [];

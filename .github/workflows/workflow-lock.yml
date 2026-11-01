@@ -136,7 +136,7 @@ name: Workflow lock (base-branch checker)
 
 # WHY `edited` IS NOT IN `types` (agent-infra#3196). It was, and it cost a full run per
 # recorded review: `scripts/record-review.sh` writes the reviewer attestation INTO THE PR BODY,
-# so every `[3/4] record` step is an `edited` activity — a run for a diff that did not change.
+# so every `[3/4] record` step that APPENDS the marker is a body edit — a run for a diff that did not change.
 # Measured 2026-11-01: this workflow's median wall clock was 16.1 min (max 24.5) for ~9 s of
 # work, and a 9 s job that waits 16 min IS a 16 min job; `pipeline-compliance`, the repo's only
 # required context, queues behind it.
@@ -144,10 +144,12 @@ name: Workflow lock (base-branch checker)
 # WHAT THE REMAINING THREE TYPES COVER. `opened`, `synchronize` and `reopened` are every activity
 # that can change the HEAD, and they are also GitHub's own defaults for this event — so this list is
 # the default in explicit form rather than a narrowing: a value that stops running for a head it
-# should have measured is not something to write implicitly. The fourth thing `edited` covers — "the
-# base branch of a pull request was changed" (GitHub's own definition of the activity) — does change
-# the DIFF, and is the declared residual in the next paragraph rather than something this sentence
-# claims to cover.
+# should have measured is not something to write implicitly. GitHub's definition of the activity
+# `edited` is a DISJUNCTION — "the title or body of a pull request was edited, OR the base branch of a
+# pull request was changed". The first disjunct cannot change the merge result this job validates and
+# is the cost #3196 removes; the second one CAN change the DIFF, and it is the declared residual in
+# the next paragraph rather than something this sentence claims to cover. Quoting only the second
+# disjunct would have made `edited` read as pure diff coverage, which is the opposite of the case.
 #
 # ⛔ THE DECISION ON THE BASE-BRANCH CASE, AND WHY IT IS NOT A `schedule:` SWEEP. `edited` also
 # fires when a PR's BASE is retargeted, and a base move changes the merge result this job
