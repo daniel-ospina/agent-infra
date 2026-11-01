@@ -7,14 +7,24 @@
 # PI_SESSIONS_DIR / SPM_SH seams so it runs hermetically in CI.
 #
 # Coverage:
-#   CLEAN       3 compacting sessions at 290K (in the shipped 300K-clamp
-#               trigger band 283.6–300K), cache-share 70% (≥ floor 0.65,
-#               n≥3) → exit 0, no ESCALATION banner
-#   CEILING     one 996K compaction → exit 1 with 1M-drift escalation
+#   CLEAN       3 compacting sessions at 790K (in the shipped 800K-clamp
+#               trigger band 783.6–800K; the displayed band runs to the
+#               900K drift floor), cache-share 70% (≥ floor 0.65, n≥3)
+#               → exit 0, no ESCALATION banner
+#   CEILING     one 996K compaction → exit 1 with the (a) drift escalation,
+#               qualified as AMBIGUOUS (1M-era drift OR this geometry's own
+#               mid-turn overrun) — never a flat "clamp not live"
 #   FLOOR       3 clamp-regime sessions at cache-share 40% → exit 1
-#   sub-regime  compacting session with tokensBefore < regime_tb (283,616 =
-#               the 300K-clamp trigger) is excluded from (b) — a lone
+#   sub-regime  compacting session with tokensBefore < regime_tb (200K, the
+#               pre-clamp / 200K-transient band) is excluded from (b) — a lone
 #               sub-regime session does not escalate
+#   FLOOR-MOVE  3 sessions compacting at 290,000 (the retired 300K clamp's own
+#               band: above 283,616, below 783,616) are EXCLUDED at this
+#               geometry → n_clamp=0 and CLEAN carries the `(b) not evaluated`
+#               qualifier. This arm is the suite's floor-sensitivity pin: with
+#               `FLEET_REGIME_TB` reverted to 283616 the same three sessions
+#               land IN the pool (n_clamp=3, share 70% ≥ floor) and both
+#               assertions below flip, so the floor cannot be un-moved silently.
 #   env seam    FLEET_CACHE_FLOOR override changes the (b) band
 
 set -euo pipefail
@@ -89,28 +99,32 @@ PY
 
 echo "── fleet-cost-report thresholds ─────────────────────────────"
 
-# CLEAN: 3 clamp-regime sessions at 290K (283.6–300K trigger band — a
+# CLEAN: 3 clamp-regime sessions at 790K (783.6–900K trigger band — a
 # pre-dial sub-300K floor would misclassify these as legacy), cache-share 70%
 # each (pooled 70%)
-D="$T/clean"; for i in 1 2 3; do mk_session "$D" "$i" 290000 0.70; done
+D="$T/clean"; for i in 1 2 3; do mk_session "$D" "$i" 790000 0.70; done
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
 assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
 assert_eq "$RC" "0" "clean fixture exits 0"
 assert_contains "$OUT" "## ✅ CLEAN" "clean fixture reports CLEAN"
 assert_contains "$OUT" "3 compacting" "clean fixture counts 3 compacting sessions"
-assert_contains "$OUT" "3 in the shipped 300K-clamp regime" "290K in-band sessions count as clamp-regime (not legacy)"
-assert_contains "$OUT" "✓ in 300K-clamp regime" "cache-share 70% ≥ floor 65%"
+assert_contains "$OUT" "3 in the shipped 800K-clamp regime" "790K in-band sessions count as clamp-regime (not legacy)"
+assert_contains "$OUT" "✓ in 800K-clamp regime" "cache-share 70% ≥ floor 65%"
 
 # CEILING: 996K compaction → 1M drift escalation
-D="$T/ceiling"; for i in 1 2; do mk_session "$D" "$i" 290000 0.70; done; mk_session "$D" 9 996000 0.70
+D="$T/ceiling"; for i in 1 2; do mk_session "$D" "$i" 790000 0.70; done; mk_session "$D" 9 996000 0.70
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "1" "ceiling fixture exits 1"
 assert_contains "$OUT" "## ❌ ESCALATION" "ceiling fixture escalates"
 assert_contains "$OUT" "ceiling-compaction count 1 > 0" "escalation names 1M drift"
+# The (a) message must NOT conclude the clamp is dead: at this geometry a ≥900K
+# record is also reachable as a clamped session's own mid-turn overrun (116,384
+# tokens past the 783,616 trigger, inside the provider's real 1M).
+assert_contains "$OUT" "Attribute the record by its session's RESOLVED window" "(a) escalation does not assert 'clamp not live' from tokensBefore alone"
 
 # FLOOR: 3 clamp-regime sessions at 40% cache-share → escalation
-D="$T/floor"; for i in 1 2 3; do mk_session "$D" "$i" 290000 0.40; done
+D="$T/floor"; for i in 1 2 3; do mk_session "$D" "$i" 790000 0.40; done
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "1" "floor fixture exits 1"
 assert_contains "$OUT" "✗ BELOW FLOOR" "floor fixture flags below-floor share"
@@ -124,6 +138,19 @@ assert_eq "$RC" "0" "sub-regime only fixture exits 0 (legacy excluded)"
 assert_contains "$OUT" "excluded from the cache-share pool: 3" "legacy sub-regime sessions named"
 assert_contains "$OUT" "no message cost data (n=0)" "n=0 clamp pool not escalated"
 
+# FLOOR-MOVE (floor-sensitivity pin): three sessions compacting at 290,000 —
+# the retired 300K clamp's OWN band (283,616 ≤ 290,000 < 783,616). At this
+# geometry they are sub-floor → legacy_comps → n_clamp=0, and (b) is never
+# evaluated, so CLEAN must say so. Revert `FLEET_REGIME_TB` to 283616 and all
+# three land in the pool (n_clamp=3, pooled 70% ≥ floor, unqualified CLEAN),
+# which flips both assertions below.
+D="$T/floormove"; for i in 1 2 3; do mk_session "$D" "$i" 290000 0.70; done
+RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
+assert_eq "$RC" "0" "300K-era compactions do not escalate at the 800K floor"
+assert_contains "$OUT" "no message cost data (n=0)" "300K-era compactions are EXCLUDED from the pool (n_clamp=0)"
+assert_contains "$OUT" "excluded from the cache-share pool: 3" "the 3 sub-floor sessions are named as excluded"
+assert_contains "$OUT" "the cache-share threshold was NOT evaluated" "CLEAN is qualified when (b) never ran"
+
 # env seam: FLEET_CACHE_FLOOR 0.80 turns the 70% CLEAN fixture into escalation
 RC=0; OUT="$(FLEET_CACHE_FLOOR=0.80 PI_SESSIONS_DIR="$T/clean/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "1" "FLEET_CACHE_FLOOR=0.80 makes 70% fixture escalate"
@@ -132,7 +159,7 @@ assert_contains "$OUT" "floor: 80%" "raised floor reflected in report"
 # SMALL-N GUARD: 3 clamp-regime sessions but only ONE carries message cost data
 # (others no-cost). Pooled share 40% < floor, but n_with_cost=1 < 3 → the
 # guard's "single-session share is noise" rationale applies → NOT escalated.
-D="$T/costless"; mk_session "$D" 1 290000 0.40 0; mk_session "$D" 2 290000 0.70 1; mk_session "$D" 3 290000 0.70 1
+D="$T/costless"; mk_session "$D" 1 790000 0.40 0; mk_session "$D" 2 790000 0.70 1; mk_session "$D" 3 790000 0.70 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "0" "cost-less sessions do not pad n to escalate (n_with_cost=1)"
 assert_contains "$OUT" "(n<3 with cost data" "small-n guard message shown"
@@ -167,11 +194,15 @@ assert_contains "$OUT" "unparseable" "corrupt content named in the gate"
 RC=0; OUT="$(PI_SESSIONS_DIR="$T/does-not-exist" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "2" "missing sessions dir exits 2"
 
-# CLEAN regression: no cost data at all across 3 sessions → undefined, not escalated
-D="$T/nocostall"; mk_session "$D" 1 290000 0.40 1; mk_session "$D" 2 290000 0.40 1; mk_session "$D" 3 290000 0.40 1
+# CLEAN regression: 3 IN-REGIME sessions carrying no cost data at all →
+# undefined share, not escalated. The tokensBefore value must stay ABOVE the
+# floor: a sub-floor value would take the legacy path, leaving n_clamp=0 and
+# making this arm a duplicate of the `$T/small` case one screen above (it would
+# pass for a reason it does not name — the #3136 review's F1).
+D="$T/nocostall"; mk_session "$D" 1 790000 0.40 1; mk_session "$D" 2 790000 0.40 1; mk_session "$D" 3 790000 0.40 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$REPORT" --days 1 2>&1)" || RC=$?
 assert_eq "$RC" "0" "all-no-cost sessions exit 0 (undefined share, not escalated)"
-assert_contains "$OUT" "no message cost data" "no-cost pool reports undefined"
+assert_contains "$OUT" "no message cost data (n=3)" "no-cost pool is IN-regime (n=3) and reports undefined, not empty"
 
 echo ""
 echo "── (d) peak/off-peak split (#634) ──────────────────────────"
