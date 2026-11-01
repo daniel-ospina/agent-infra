@@ -585,8 +585,14 @@ hr_state_line() { # <role>
 # 1 something is not running · 2 something could not be verified (1 outranks 2: a proven absence is a
 # stronger answer than "could not tell").
 hr_status() {
-  local role worst=0 rc
-  for role in $(hr_roles); do
+  local role worst=0 rc roles
+  # ⛔ AN EMPTY (OR UNREADABLE) ROSTER IS NOT A PASS. The loop would iterate ZERO times and this
+  # function would return its success-default having measured NOTHING — the empty-as-pass shape. A
+  # roster that cannot be read, or that names no role, is "could not verify" (2), never "all ok".
+  roles="$(hr_roles)" || return 2
+  [ -n "$roles" ] || { printf 'no roles configured — an empty roster verifies nothing\n' >&2; return 2; }
+  # shellcheck disable=SC2086
+  for role in $roles; do
     hr_state_line "$role"; rc=$?
     case "$rc" in
       1) worst=1 ;;
@@ -610,8 +616,12 @@ hr_status() {
 # "this box is not configured for a role" and "half of it is installed and nobody knows which half".
 hr_install_roster() {
   local roster role rc
-  roster="$(hr_roles)"
+  roster="$(hr_roles)" || return 3
   printf '    configured (HR_ROLES / $O/harness-roles.conf / platform default): %s\n' "$roster"
+  # ⛔ An EMPTY roster must be REFUSED here, not installed-and-reported-ok: the preflight and the
+  # install loop would both walk zero roles and return the success-default, which reads as "every
+  # configured role is up" when in fact NOTHING is configured. Return 3 (refused, wrote NOTHING).
+  [ -n "$roster" ] || { printf 'REFUSED: the roster is EMPTY — nothing is configured, so nothing was installed\n' >&2; return 3; }
   # shellcheck disable=SC2086
   if ! hr_preflight $roster; then
     printf 'NOTHING was written or started — that is why every role is checked before the first installer runs\n'
@@ -684,8 +694,13 @@ hr_heal_role() { # <role>
 }
 
 hr_heal() {
-  local role worst=0 rc
-  for role in $(hr_roles); do
+  local role worst=0 rc roles
+  # ⛔ Same rule as `hr_status`: healing an EMPTY roster would return the success-default over zero
+  # roles. Nothing to heal is not "all healed" — it is a roster that could not be read.
+  roles="$(hr_roles)" || return 2
+  [ -n "$roles" ] || { printf 'no roles configured — an empty roster has nothing to heal\n' >&2; return 2; }
+  # shellcheck disable=SC2086
+  for role in $roles; do
     hr_heal_role "$role"; rc=$?
     [ "$rc" -eq 0 ] || worst=1
   done

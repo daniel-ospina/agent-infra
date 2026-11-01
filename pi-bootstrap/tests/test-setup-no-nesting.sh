@@ -459,7 +459,17 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # held back only because `lane-status.py` is. #1553 declares both in `lane_root_srcs`; when it lands
 # both take the membership branch and this list becomes STALE, which the stale check below FAILS —
 # delete the entries then, so the exemption cannot outlive its reason.
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553"
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 repo-target.sh:#3174"
+# `repo-target.sh` joined on 2026-11-01 (#3174) — a DISCLOSED GAP, not a delivery, and the reason is a
+# DERIVATION defect rather than a farm one. A farmed consumer names it through the ORCHESTRATOR payload
+# (`install-repair-service.sh`: `"$HERE/orchestrator-harness/repo-target.sh"` then `"$O/repo-target.sh"`),
+# and the derivation does not model `$O` as a destination: an `$O/<n>` join classifies as `script:<n>`,
+# i.e. as if it were flat in `$DEST/scripts/`, where no array carries it. In reality `$O` is filled by
+# `deploy-mac-orchestrator.sh`'s whole-directory archive of `scripts/orchestrator-harness/` — the same
+# surface that delivers `brief-gate.sh`/`capacity.sh` through the `other:` branch above. Exempting here
+# keeps the gap NAMED (DECLARED-GAP, never a silent delivery) until #3174 decides between modelling `$O`
+# as its own kind in `derive_lane_producers` and adding an `harness_srcs` farm array. It cannot outlive
+# its reason: the stale-disclosure check FAILS the moment it becomes delivered.
 # A ROOT of the derivation rather than a producer found by it: `heartbeat-loop.sh` is run by a launchd job
 # on the owner's box (no plist template in this repo names it; the label `com.tortoise.heartbeat-loop`
 # appears only in a comment at scripts/lane-status.py:41) and NO farmed consumer execs it (measured at
@@ -517,19 +527,19 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:disk-reaper-run.sh script:cadence-nudge.sh script:fleet-cost-report.sh
-script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
-script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
-script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py
-script:pi-reap-worktrees.sh script:pr-doctor.py
-script:publish-live-workspaces.py
-script:session-postmortem.sh
-script:record-review.sh
-script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
-script:harness-apply-pass.sh
-lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
+script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
+script:disk-reaper.sh script:fleet-cost-report.sh script:goal-state.py script:harness-apply-pass.sh
+script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
+script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
+script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
+script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py
+script:record-review.sh script:repo-target.sh script:session-postmortem.sh script:turn-classify.py
+script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py script:watch-truncation.sh
+lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
+lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
-foreign:cmux_dispatch.py"
+foreign:cmux_dispatch.py
+other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
 # producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
@@ -892,6 +902,18 @@ check_producer_farm_declared() { # <label> <derived-population>
         if [ "$sub" = "fleet" ] && farm_declares fleet_tools "$base" "$root"; then
           delivered=$((delivered+1)); continue
         fi
+        # ...and the ORCHESTRATOR payload is a THIRD delivery surface: `deploy-mac-orchestrator.sh`
+        # archives the WHOLE `scripts/orchestrator-harness/` directory into `$O`
+        # (`git archive … scripts/orchestrator-harness | tar -x -C "$STAGE"`), which is a different
+        # installer with its own destination layout — the gap this file's header names as out of
+        # scope. A producer a farmed consumer execs from there IS delivered, so it must not read as a
+        # gap: the natural remedy for a false block is to widen an exemption list, i.e. to WEAKEN the
+        # gate. Keyed on the deploy script's own archive line AND the file's existence, so the
+        # allowance is derived from the code and dies the moment that deployment stops shipping it.
+        if [ "$sub" = "orchestrator-harness" ] && [ -f "$root/scripts/$name" ] \
+           && grep -q 'archive .*scripts/orchestrator-harness' "$root/scripts/deploy-mac-orchestrator.sh" 2>/dev/null; then
+          delivered=$((delivered+1)); continue
+        fi
         # ...and the loop SKIPS some members (`setup.sh`: `*.plist|*.test.*) continue`), so a skipped file
         # is NOT delivered — counting it as delivered is the gate's central false negative.
         case "$base" in
@@ -1186,6 +1208,52 @@ else
   fail "could not derive the producer population (the exec-site closure did not converge) — refusing to report completeness over a population the guard could not build (#1899)"
 fi
 check_producer_population "producer-set" "$LANE_PRODUCERS_DERIVED"
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# `--cut` — THE COMPUTED RE-CUT REMEDY FOR `LANE_PRODUCERS_CANONICAL`.
+#
+# The pin above is a LITERAL snapshot and it must STAY one: the drift control's whole value is that
+# the expected set comes from an INDEPENDENT oracle (a recorded commit), not from the derivation
+# under test. A pin computed at compare time would compare the derivation to itself — a tautology,
+# an inert control that can no longer FAIL on the thing it exists to catch (agent-infra #3174).
+#
+# What must never happen is the OTHER failure: a human HAND-TYPING the new value when a producer
+# legitimately moves. That is the stale-pin class this repo has already paid for twice (#3122,
+# #3124: a hand-carried digest drifted from the artifact it pinned). So the remedy is COMPUTED, the
+# same way `test-sanctioned-identity.mjs --cut` and `check-false-pass-shapes.sh --update-baseline`
+# produce theirs: this mode prints the exact block derived from THIS tree's code, and the resulting
+# diff is the review artifact. The value is never invented, only re-derived.
+#
+# (The remainder of the file is SKIPPED: `--cut` is a remedy, not a test run.)
+cut_pin_block() { # <derived-population on stdin> -> the pin body, kind-ordered, wrapped at 110 cols
+  awk -v W=110 '
+    NF { kind=$0; sub(/:.*/, "", kind); n[kind]++; e[kind, n[kind]]=$0 }
+    END {
+      split("script lib state foreign other", order, " ")
+      for (i=1; i<=5; i++) {
+        k=order[i]; if (!n[k]) continue
+        line=""
+        for (j=1; j<=n[k]; j++) {
+          v=e[k, j]
+          if (line == "")            { line=v }
+          else if (length(line)+1+length(v) > W) { print line; line=v }
+          else                        { line=line " " v }
+        }
+        if (line != "") print line
+      }
+    }'
+}
+if [ "${1:-}" = "--cut" ]; then
+  if [ -z "$LANE_PRODUCERS_DERIVED" ]; then
+    echo "cut: REFUSED — the derivation produced an EMPTY population, and an empty population is not a pin (0/0 never reads as clean)" >&2
+    exit 1
+  fi
+  printf '<<<PIN-BEGIN>>>\n'
+  printf '%s\n' "$LANE_PRODUCERS_DERIVED" | cut_pin_block
+  printf '<<<PIN-END>>>\n'
+  printf 'cut: %s entr(y|ies) derived from the CODE at %s\n' \
+    "$(printf '%s\n' "$LANE_PRODUCERS_DERIVED" | grep -c .)" "$ROOT" >&2
+  exit 0
+fi
 # EMPTY — the maximal silent skip: a scan that found nothing has verified nothing, and 0/0 must never
 # read as clean (the H1 probe from PR #1855, now against the derivation instead of a hand list).
 # Asserted on the MESSAGE, not the count: an empty set ALSO trips the set comparison, so a count-only
