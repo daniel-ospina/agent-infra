@@ -93,13 +93,16 @@
 #   `…/<instance>/_tmp` is 46 and `…/<instance>/_work/_temp` is 53 for `RUNNER_ROOT=/tmp/actions-runner`
 #   with the fleet's longest instance name, so `_tmp` keeps 7 more bytes of that budget. It was a
 #   TIE-BREAK, not the reason — the reason is the existence/residency argument above.
-#   A STABLE root must be BOUNDED, so every start (and every live repair) sweeps entries older than
-#   `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h): a job's own scratch is minutes old in THIS fleet, so
-#   the default does not race a running job, and a day-old file in a runner's private temp dir is
-#   garbage by definition. ⛔ THAT IS WHY THE OPERAND HAS A FLOOR (360 min) rather than being free: a
-#   self-hosted job may legally run 5 days (`docs.github.com/en/actions/reference/limits`), so the
-#   safety of the sweep depends on the bound exceeding the longest job — the tool refuses values below
-#   the GitHub-hosted 6 h ceiling and says how to be safe on a long-job box. `RUNNER_TEMP` itself is
+#   A STABLE root must be BOUNDED, so every START sweeps entries older than
+#   `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h). A LIVE-repair pass creates and verifies the
+#   root and sweeps NOTHING — mtime age is not a holder witness, so it says so
+#   (`tmpdir-sweep skipped … reason=live-listener`) rather than risking a long-running job's
+#   scratch (`sweep_tmp_root` owns that argument and the call sites enforce it). ⛔ THAT IS WHY THE
+#   OPERAND HAS A FLOOR (360 min) rather than being free: a START can follow a listener that died
+#   MID-JOB, so the sweep can meet scratch whose job is not over — and a self-hosted job may legally
+#   run 5 days (`docs.github.com/en/actions/reference/limits`). The floor keeps a typo-scale "bound"
+#   from deleting scratch the DEAD listener's job still owns; the tool refuses values below the
+#   GitHub-hosted 6 h ceiling and says how to be safe on a long-job box. `RUNNER_TEMP` itself is
 #   NOT touched — the runner owns it, its lifecycle is per job.
 #
 # ⛔ THE LABEL DESCRIBES THE RUNNER. `ci_runner_gate.sh` selects the pool by `self-hosted-arm64` /
@@ -242,16 +245,18 @@ SETTLE_S="${RUNNER_START_SETTLE_S:-5}"        # how long a just-started listener
 MAX_SKEW_S="${RUNNER_MAX_SKEW_S:-120}"
 CLOCK_PROBE_TIMEOUT_S="${RUNNER_CLOCK_PROBE_TIMEOUT_S:-10}"
 # ⛔ THE AGE BOUND OF THE PER-INSTANCE PRIVATE TEMP ROOT (#7815). `_tmp` is STABLE — it survives a job,
-# so it grows — and `$RUNNER_TMP_MAX_AGE_MIN` is what keeps that bounded at every start.
+# so it grows — and `$RUNNER_TMP_MAX_AGE_MIN` is what keeps that bounded at every START.
 # ⛔ AND IT IS THE ONE OPERAND HERE WHOSE VALUE IS A DELETION THRESHOLD, so it has a FLOOR (#7815
-# review, N1): `find -mmin +N` decides what `rm -rf` touches, and `N` is compared against a RUNNING job's
-# scratch on the live-repair arms of `restart`/`reconcile`. The floor is GitHub's own **GitHub-hosted**
-# job ceiling — 6 h (docs.github.com/en/actions/reference/limits) — because below it a legal-looking
-# number deletes an in-flight job's scratch silently. It is not a claim that no job can be longer:
+# review, N1): `find -mmin +N` decides what `rm -rf` touches, and `N` is compared against the scratch a
+# listener that DIED MID-JOB may still own — the START path is the only path that sweeps (a live
+# listener is never swept: mtime age is not a holder witness, see `sweep_tmp_root`). The floor is
+# GitHub's own **GitHub-hosted** job ceiling — 6 h
+# (docs.github.com/en/actions/reference/limits) — because below it a legal-looking number deletes a
+# dead listener's still-unfinished job's scratch silently. It is not a claim that no job can be longer:
 # `limits` documents **5 days** for a SELF-HOSTED job, so an operator on a long-job box must RAISE this
 # bound above their longest job; the default (24 h) sits above this fleet's jobs and the floor refuses
 # only values that are below any plausible one.
-TMP_MAX_AGE_MIN="${RUNNER_TMP_MAX_AGE_MIN:-1440}"   # 24 h: a job's scratch is minutes old, never a day
+TMP_MAX_AGE_MIN="${RUNNER_TMP_MAX_AGE_MIN:-1440}"   # 24 h: far above this fleet's jobs, so the START sweep cannot meet live scratch here
 TMP_MAX_AGE_FLOOR_MIN=360                            # 6 h — GitHub-hosted job ceiling; see above
 POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"
 GH_CMD="${RUNNER_POOL_GH:-gh}"
@@ -312,9 +317,9 @@ validate_operands() {
   #   RUNNER_TMP_MAX_AGE_MIN=24h  -> `find -mmin +24h` is rc 1 with NO output, so nothing is ever swept,
   #                                 `removed=0`, no `swept …` line, `restart` exits 0 — the one property
   #                                 the private root is bounded by is silently disabled;
-  #   RUNNER_TMP_MAX_AGE_MIN=0    -> `-mmin +0` matches EVERY entry older than a minute, i.e. a RUNNING
-  #                                 job's scratch on a live listener (the live-repair arm sweeps while
-  #                                 jobs may be in flight), silently deleted.
+  #   RUNNER_TMP_MAX_AGE_MIN=0    -> `-mmin +0` matches EVERY entry older than a minute, i.e. the
+  #                                 scratch a listener that died MID-JOB may still own — deleted
+  #                                 silently by the START path (a live listener is never swept).
   # `validate_operands` runs in `main` for EVERY verb before dispatch (`--help` still returns first), so
   # this is the one home where no verb can reach the sweep unvalidated.
   if ! is_uint "$TMP_MAX_AGE_MIN"; then

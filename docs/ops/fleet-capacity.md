@@ -330,12 +330,15 @@ ruling that there is no lane ceiling tied to cpu count.
   for reasons no PR controls. ⛔ **`RUNNER_TEMP` (`_work/_temp`) is NOT touched**: the runner owns it and
   empties it per job, and it does not exist before the first job — where an ABSENT `$TMPDIR` makes
   `tempfile.gettempdir()` fall back to the SHARED temp dir with no error (measured), i.e. the isolation
-  would vanish silently. `_tmp` is therefore STABLE, and is therefore **swept**: every start (and every
-  live repair) removes entries older than `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h). ⛔ The safety of
-  that sweep is **conditional and measured, not assumed**: an entry older than the bound cannot belong to
-  a job that runs *shorter* than the bound, and GitHub allows a **self-hosted job up to 5 days**
-  (`/en/actions/reference/limits`), so a bound below your longest job deletes a running job's scratch. The
-  tool therefore **refuses any value under 360 min** (the GitHub-hosted 6 h job ceiling) with
+  would vanish silently. `_tmp` is therefore STABLE, and is therefore **swept**: every START removes entries
+  older than `RUNNER_TMP_MAX_AGE_MIN` (default 1440 = 24 h). A LIVE-repair pass (`restart`, `reconcile`)
+  creates and verifies the root and sweeps **NOTHING** — mtime age is not a holder witness, so it says so
+  (`tmpdir-sweep skipped … reason=live-listener`) instead of risking a long-running job's scratch. ⛔ The
+  safety of that sweep is **conditional, and the condition is the START path**: a start can follow a
+  listener that DIED MID-JOB, so the sweep can meet scratch whose job is not over — and GitHub allows a
+  **self-hosted job up to 5 days** (`/en/actions/reference/limits`), so a bound below your longest job
+  deletes a dead listener's still-running job's scratch. The tool therefore **refuses any value under
+  360 min** (the GitHub-hosted 6 h job ceiling) with
   `cannot-measure why=tmp-max-age-too-small`, refusing nothing at or above it; on a long-job box you RAISE
   the bound above your longest job, and `0`/`1` cannot reach `find -mmin`. A `.env` that names a TMPDIR
   still wins — it is sourced after the export. `status` reports a missing root as `defect tmpdir-missing`

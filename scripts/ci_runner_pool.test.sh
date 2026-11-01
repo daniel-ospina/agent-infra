@@ -1304,7 +1304,7 @@ fresh_pool tmpnone; reset_logs
 register pi-runner-none
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-none)"
 assert_eq "$?" "0" "restart of an instance with no .env is unaffected"
-assert_omits "$out" "created tmpdir=" "no `.env`-named directory is invented"
+assert_omits "$out" "created tmpdir=" "no .env-named directory is invented"
 assert_contains "$out" "created tmpdir-root=$RUNNER_ROOT/pi-runner-none/_tmp" \
   "but the instance's OWN private temp root is created, and printed"
 assert_eq "$(mode_of "$RUNNER_ROOT/pi-runner-none/_tmp")" "700" "mode 0700"
@@ -1785,6 +1785,32 @@ assert_omits "$out" "swept tmpdir-root=" "a wider RUNNER_TMP_MAX_AGE_MIN sweeps 
 assert_file "$root_b/stale-2" "so the SAME file survives the wider bound — the operand is the threshold"
 rm -f "$root_b/stale-2"
 
+# ── the DOCS must state the sweep the CODE performs (doc-mismatch, review P2-2) ─────────────
+# The pair above pins the code. It says nothing about the two operator-facing DESCRIPTIONS of it, and
+# those said the opposite: "every start (and every live repair) sweeps entries older than
+# RUNNER_TMP_MAX_AGE_MIN". An operator reading that concludes a LIVE instance's root is bounded at
+# 24 h; it is not — `ensure_private_tmp` returns before `sweep_tmp_root` whenever a listener is live —
+# so a box that never restarts a listener grows `_tmp` without bound. That is the #3003 failure
+# relocated INSIDE one instance instead of /tmp, and it is the same claim the code is careful never to
+# make: "a pass that stays silent about a skipped sweep reads as a sweep that ran", one layer out, on
+# a `rm -rf` threshold.
+#
+# The assertion is the PROPERTY, not a spelling: each doc must name the skip REASON the code actually
+# logs (`reason=live-listener`, the observable that makes the claim checkable) and must be free of
+# the deleted claim in the forms it shipped. Both halves fail on the pre-fix text.
+echo "── ci_runner_pool: the docs state the sweep the code performs ──"
+DOCS_FLEET="$SCRIPT_DIR/../docs/ops/fleet-capacity.md"
+assert_file "$DOCS_FLEET" "the operator doc that carries this claim exists"
+for _doc in "$POOL" "$DOCS_FLEET"; do
+  assert_contains "$(cat "$_doc")" 'reason=live-listener' \
+    "$(basename "$_doc") names the LIVE-listener skip — the one behaviour the sweep CANNOT have"
+  assert_omits "$(cat "$_doc")" 'and every live repair) sweeps' \
+    "$(basename "$_doc") does NOT claim a live repair sweeps (the shipped pre-fix sentence)"
+  assert_omits "$(cat "$_doc")" 'live-repair arm sweeps' \
+    "$(basename "$_doc") does NOT claim the live-repair arm sweeps"
+done
+unset DOCS_FLEET _doc 2>/dev/null || true
+
 # ── a MISSING private root is a DEFECT (rc 3) and the printed remedy restores it ──────────
 # ⛔ The shape that does the damage: LIVE listener, GitHub says `online`, and the TMPDIR it hands to
 #   every job does not exist. `status` tested only a `.env`-named path, so an instance naming none — the
@@ -1973,15 +1999,17 @@ assert_contains "$out" "cannot-measure why=tmp-max-age-unreadable" "naming the o
 assert_file "$root_b/never-swept" "and NOTHING was swept on the refused pass"
 rm -f "$root_b/never-swept"
 out="$(RUNNER_TMP_MAX_AGE_MIN=0 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b 2>&1)"
-assert_eq "$?" "2" "and `0` (which `find -mmin +0` reads as \"everything older than a minute\") is refused too"
+assert_eq "$?" "2" "and 0 (which find -mmin +0 reads as \"everything older than a minute\") is refused too"
 # ⛔ AND THE BOUND HAS A FLOOR, because it is a DELETION threshold (#7815 review, N1). `is_uint` accepts
-#   `1`; `find -mmin +1` on the LIVE-repair arm matches a 3-minute-old entry, i.e. a RUNNING job's
-#   scratch, `rm -rf`'d silently (stderr is discarded). A self-hosted job may legally run 5 days, so the
-#   floor is the GitHub-hosted 6 h ceiling and the message tells an operator to RAISE the bound, never
-#   to lower it. Both halves asserted: the value is refused, and the live instance's scratch survives it.
+#   `1`; `find -mmin +1` on the START path matches a 3-minute-old entry — scratch a listener that DIED
+#   MID-JOB may still own — and `rm -rf`s it silently (stderr is discarded). A self-hosted job may legally
+#   run 5 days, so the floor is the GitHub-hosted 6 h ceiling and the message tells an operator to RAISE
+#   the bound, never to lower it. Both halves asserted: the value is refused, and the entry survives it.
+#   (The LIVE-repair arm never sweeps at all — mtime age is not a holder witness — so the floor's subject
+#   is the START path, not "a running job on a live listener".)
 : >"$root_b/live-job-scratch"; touch -t 200001010000 "$root_b/live-job-scratch"
 out="$(RUNNER_TMP_MAX_AGE_MIN=1 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b 2>&1)"
-assert_eq "$?" "2" "a sweep bound below the floor is REFUSED (rc 2) rather than deleting a live job's scratch"
+assert_eq "$?" "2" "a sweep bound below the floor is REFUSED (rc 2) rather than deleting a dead listener's unfinished job's scratch"
 assert_contains "$out" "cannot-measure why=tmp-max-age-too-small" "naming the operand"
 assert_contains "$out" "floor=360m" "and the floor it broke"
 assert_file "$root_b/live-job-scratch" "and the entry it would have deleted is STILL THERE"
@@ -2844,7 +2872,7 @@ else
   assert_contains "$out" "quarantined dir=$RUNNER_ROOT/pi-runner-q.retired-" "naming the bytes it could not remove"
   assert_contains "$out" "reclaim: retired=1 preserved=0 revived=0 live=0 quarantined=1" "and counting the quarantine"
   assert_absent "$RUNNER_ROOT/pi-runner-q" "the pool no longer has the install at its registered path"
-  assert_eq "$(ls -d "$RUNNER_ROOT"/pi-runner-q.retired-* 2>/dev/null | wc -l)" "1" "the leftovers are named on disk"
+  assert_eq "$(ls -d "$RUNNER_ROOT"/pi-runner-q.retired-* 2>/dev/null | wc -l | tr -d ' ')" "1" "the leftovers are named on disk"
   # THE POINT OF THE RENAME: those bytes are invisible to nothing. `status` names them, and they are NOT
   # a registration — a `.runner` inside a quarantine dir must never come back as capacity.
   out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
