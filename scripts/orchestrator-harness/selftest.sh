@@ -2476,7 +2476,10 @@ ck "the shipped loop defines is_num() for PR ids" $rc
 # the lenient definition anywhere is RED.
 _tight='0*) return 1'
 _lax=0; _ndefs=0
-for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$HERE/selftest.sh"; do
+# ⛔ `stall-fix.sh` IS A SHIPPED COPY TOO (#3181 review P2): it defines the same `is_num()` and its
+# comment claims THIS census governs it, but the list did not name the file — so a lenient copy added
+# there would have reddened nothing while the check's own wording said "every copy in the tree".
+for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$HERE/selftest.sh" "$HERE/stall-fix.sh"; do
   _found=0
   while IFS= read -r _d; do
     [ -n "$_d" ] || continue
@@ -2489,7 +2492,7 @@ for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$HERE/selftest.sh"; do
 done
 [ "$_lax" = "0" ] && rc=0 || rc=1
 ck "every is_num() copy in the tree (including selftest's) rejects leading zeros and accepts 0" $rc
-[ "$_ndefs" = "4" ] && rc=0 || { rc=1; echo "      is_num() is defined in $_ndefs of the 4 shipped files that need it"; }
+[ "$_ndefs" = "5" ] && rc=0 || { rc=1; echo "      is_num() is defined in $_ndefs of the 5 shipped files that need it"; }
 ck "the four SHIPPED files each still define is_num() (a silently dropped copy is caught)" $rc
 grep -q -- "--argv" "$LOOP" && rc=0 || rc=1
 ck "worker launches pass args via --argv, not string interpolation" $rc

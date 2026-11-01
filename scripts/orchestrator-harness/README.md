@@ -1466,7 +1466,7 @@ manifest path above is what a box that is copied into every deploy should use.
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
 | `MERGE_PRIORITY_AT` | `25` | **no longer a gate — headroom only.** The gate is threshold-free (§7.2f): one workable un-owned PR is enough to stop the issue path, and there is no age-based release (a stalled drain gets `DRAIN STALLED`, never a licence to open work). This value now only selects the *drain posture* — from here the reviewer/fixer headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`, so a 25-PR backlog is drained by the capacity that actually clears it instead of being capped to a trickle. Kept as a name because operators and the `[cap]` line read it |
 | `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m`. ⛔ An **empty** answer — nothing landed inside `mp_recent_land`'s window, including a box whose `state/merged-*.done` set is empty — is now read as the STALL (agent-infra#2929), and the age is set to **that window's own bound** (`2 × MERGE_PRIORITY_MAX_AGE_MIN`), because it is the only floor the empty answer actually proves; the line says so, and the status token prints `no_land=>=<age>m` |
-| `DRAIN_STALL_FIX_EVERY` | `3` | how many **stalled** passes pass between `stall-fix.sh` dispatches of the read-only `prfix` diagnostician (`1` = one per stalled pass). It bounds a box nobody is fixing: the stall keeps escalating every pass, but it does not spawn a worker per cycle forever. A value that is not a whole number `>= 1` falls back to 3, and `0` is not a bound. `DRAIN_STALL_FIX_TIMEOUT` (default `1800`s) bounds the worker itself; `STALL_FIX_WORKTREE`/`HARNESS_REPO` choose the throwaway detached worktree it runs in |
+| `DRAIN_STALL_FIX_EVERY` | `3` | how many **stalled** passes pass between `stall-fix.sh` dispatches of the read-only `prfix` diagnostician (`1` = one per stalled pass). It bounds a box nobody is fixing: the stall keeps escalating every pass, but it does not spawn a worker per cycle forever. A value that is not a whole number `>= 1` falls back to 3, and `0` is not a bound. `DRAIN_STALL_FIX_TIMEOUT` (default `1800`s) bounds the worker itself; `STALL_FIX_WORKTREE`/`HARNESS_REPO` choose the throwaway detached worktree it runs in. ⛔ `STALL_FIX_VERIFY_SECS` (default `10`, clamped to `1–120`) is how long the escalation watches the worker's own record before it states a verdict — see the §drain-health paragraph below, because the verdict is READ from that record and not from the dispatcher's exit status |
 | `MERGE_PRIORITY_MAX_AGE_MIN` | `180` | **display only** — the `[cap] last_land=` field and the `DRAIN STALLED` line. ⛔ This knob used to bound an age-based RELEASE of the gate; that was **deleted** (agent-infra#2099): the release turned *PRs are not landing* into *dispatch more issues*, hiding a stall behind fresh activity, and no unattended lane can move the unowned count itself (every session authenticates as the same GitHub user). `test-gates.sh` pins the release machinery ABSENT |
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
@@ -4366,6 +4366,20 @@ been rate-limited while the REST sweep succeeded: exactly the fallback this desi
   on both stall shapes and on NO healthy or UNMEASURED pass; it never touches a PR a lane holds; and
   every step it cannot complete is printed (`STALL FIX MISSING`, `COULD NOT DISPATCH`, `DISPATCH
   FAILED`) instead of being skipped, so an escalation that cannot act never reads as one that did.
+  ⛔ **AND ITS DISPATCH VERDICT IS READ FROM THE WORKER'S OWN RECORD, NOT FROM THE DISPATCHER'S EXIT
+  STATUS.** `nonblocking-dispatch.sh` backgrounds `run_agent` — and with it every spawn gate — with
+  `exec >/dev/null 2>&1` and then returns `0` once it reaches the launch, so a `[load-gate]`,
+  `[disk-gate]` or `[land-backlog]` refusal used to be recorded as `STALL FIX DISPATCHED` while no
+  agent had started (#3181 review, P1). The escalation now distinguishes five measured states:
+  `DISPATCHED` (a spawn-gate ledger row `allowed` carrying this worker's TAG — the one positive proof),
+  `NOT DISPATCHED` (a `[…-gate] REFUSED` line, or a `refused` ledger row, quoted verbatim), `RAN AND
+  ALREADY ENDED` (a `.rc` with no refusal), `LAUNCH ACCEPTED, AGENT START UNPROVEN` (a live pid and
+  nothing else — a box without the `pi` shim looks like this, so it says so rather than claiming a
+  start) and `DISPATCH UNPROVEN` (an empty record). It also states — rather than denies, as the file
+  once did — that `KIND=prfix` is **measured, not exempt** for this caller: the exemption needs proof
+  that the worktree IS an open PR at its HEAD, which a detached `origin/main` worktree can never
+  produce, so the creation back-pressure gate can legitimately HOLD a stall repair on exactly the box
+  that is stalled. `scripts/orchestrator-harness/stall-fix.test.sh` drives every one of those states.
   ⛔ The land age is measured from `state/merged-<PR>.done`, and `merge-one.sh` is its only writer — so
   the age answers "when did **this box** last land", not "when did the queue last move". Measured
   2026-10-23: 7 PRs merged on the repo between 21:31Z and 22:40Z while the line said "no PR merged in
