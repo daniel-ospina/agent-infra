@@ -53,7 +53,6 @@ for _r in $REPOS; do _n_repos=$(( _n_repos + 1 )); done
 MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
 case "${MAX_TOTAL}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: MAX_TOTAL='${MAX_TOTAL}' is not a positive integer — an unparseable ceiling reads as FALSE and would disarm the aggregate bound" >> /tmp/auto-rail.log; exit 3;; esac
-MAX_TOTAL=${MAX_TOTAL:-$(( MAX * _n_repos ))}
 INTERVAL=${INTERVAL:-180}
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
