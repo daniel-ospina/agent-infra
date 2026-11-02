@@ -6,11 +6,12 @@
 # after it is done — "so we can stop re-discovering the same thing 10 times". A mandate that
 # needs a 40-line python preamble per lane does not get obeyed; this is the primitive it needs.
 #
-# WHY NOT THE MCP SERVER. pi's `tortoise` MCP entry sends `Authorization: Bearer
-# ${TORTOISE_MCP_API_KEY}`, and a long-lived pi process started before that key existed expands it
-# to EMPTY, so the connection fails "Unauthorized: invalid or missing Bearer token" — measured
-# 2026-11-02 on a fleet cell that CARRIES the key, while that same key authenticated a direct POST
-# with HTTP 200 (the endpoint answers 401 without it, and advertises 74 tools).
+# WHY NOT THE MCP SERVER. An env-expanded `Authorization: Bearer …` header in the pi MCP entry
+# (`${TORTOISE_MCP_API_KEY}` where configured, `${TORTOISE_API_KEY}` as the skill shows) expands to
+# EMPTY in a long-lived pi process started before the key existed, so the connection fails
+# "Unauthorized: invalid or missing Bearer token" — measured 2026-11-02 on a fleet cell that
+# CARRIES the key, while that same key authenticated a direct POST with HTTP 200 (the endpoint
+# answers 401 without it, and advertises 74 tools).
 # The endpoint, the key and the tools are all healthy; only the client-side plumbing is stale.
 # Not reproducible on a cell without the key — there this script exits 3 GRAPH-UNREACHABLE(NO-KEY).
 # This script therefore reads the key at CALL time, from the live environment.

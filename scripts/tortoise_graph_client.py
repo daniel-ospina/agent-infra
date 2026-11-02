@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -21,6 +22,10 @@ HDRS = {
 }
 
 _id = 0
+
+# An SSE data line: `data:` at column 0, an optional single space, then the payload.
+# RFC 9110 allows no space after the colon, so `startswith("data: ")` dropped legal frames.
+SSE_DATA = re.compile(r"^data:[ \t]?")
 
 
 def call(method, params, timeout=30):
@@ -38,16 +43,18 @@ def call(method, params, timeout=30):
     except Exception as e:  # noqa: BLE001 - any transport failure is the same verdict
         sys.stderr.write("GRAPH-UNREACHABLE(%s): %s\n" % (type(e).__name__, str(e)[:300]))
         sys.exit(3)
-    # streamable-http answers as SSE frames; take the frame for THIS call
+    # streamable-http answers as SSE frames; take the frame for THIS call.
+    # Detection is by LINE PREFIX, never by the substring `"data: "`: `"metadata: "`
+    # contains it, so a substring test rejected valid JSON replies as unparseable.
     payload = raw
-    if "data: " in raw:
+    sse_lines = [ln for ln in raw.splitlines() if SSE_DATA.match(ln)]
+    if sse_lines:
         frames = []
-        for ln in raw.splitlines():
-            if ln.startswith("data: "):
-                try:
-                    frames.append(json.loads(ln[6:]))
-                except Exception:  # noqa: BLE001 - a non-JSON frame cannot be the reply
-                    continue
+        for ln in sse_lines:
+            try:
+                frames.append(json.loads(SSE_DATA.sub("", ln, count=1)))
+            except Exception:  # noqa: BLE001 - a non-JSON frame cannot be the reply
+                continue
         # The reply is the frame whose id matches the request; a notification
         # (progress/log) can arrive LAST and carries no result, so "the last
         # data: line" would silently answer this call with somebody else's frame.
@@ -130,17 +137,25 @@ def main(argv):
         while i < len(rest):
             if rest[i] == "--to":
                 # A flag with no value must never be folded into the point's CONTENT:
-                # that writes a wrong artifact and reports exit 0.
+                # that writes a wrong artifact and reports exit 0. An EMPTY value is the
+                # same defect from the other side: `--to "$POINT"` with POINT unset is
+                # `--to ''`, and truthiness would then silently write NO edge at exit 0.
                 if i + 1 >= len(rest):
                     sys.stderr.write("usage: --to needs a point id\n")
                     return 2
                 to = rest[i + 1]
+                if not to.strip() or to.startswith("--"):
+                    sys.stderr.write("usage: --to needs a point id (got %r)\n" % to)
+                    return 2
                 i += 2
             elif rest[i] == "--pred":
                 if i + 1 >= len(rest):
                     sys.stderr.write("usage: --pred needs a predicate\n")
                     return 2
                 pred = rest[i + 1]
+                if not pred.strip() or pred.startswith("--"):
+                    sys.stderr.write("usage: --pred needs a predicate (got %r)\n" % pred)
+                    return 2
                 i += 2
             else:
                 text = (text + " " + rest[i]) if text else rest[i]
