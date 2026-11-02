@@ -896,6 +896,10 @@ if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unkno
         PRESERVED_DIR="$STATE_DIR/harness-apply-preserved/$(date -u +%Y%m%dT%H%M%SZ)-$$"
         preserve_dirty "$PRESERVED_DIR" || {
             REC_ACTION=refused-dirty
+            # ⛔ THE REDDEST REFUSAL MUST NOT RECORD `remedy=none` (review finding 6). This `detail=` is
+            # 474 chars, so `cut -c1-240` lands mid-sentence and discards the action clause — the same
+            # class of loss the `remedy=` field exists to prevent, left on the one path that most needs it.
+            REC_REMEDY="recover the work from $PRESERVED_DIR (changes.patch + changes.index.patch), fix the cause, then re-run"
             # ⛔ NOT "nothing was touched". Preservation and restore are one pass over the list, so a
             # failure in the RESTORE half can leave the checkout part-restored — every affected byte was
             # written to $PRESERVED_DIR first, but claiming the tree is untouched would be false in the

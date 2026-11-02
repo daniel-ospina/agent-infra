@@ -20,7 +20,7 @@
 // Secrets never sync: auth.json and env vars stay machine-local by design.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { execSync, execFileSync } from "node:child_process";
 import { isPrintMode } from "./shared/print-mode.js";
@@ -64,17 +64,56 @@ export function pinTreeRoots(home: string = process.env.HOME ?? ""): string[] {
 }
 
 /**
- * Is this pin a record about a deployed tree this box ACTUALLY CARRIES? `harness/<sha12>` present
- * under any pin root means yes. Used to keep `pinMismatchLines` from claiming a deployment on a box
- * that has none (agent-infra#10114).
+ * Is this pin a record about a deployed tree this box ACTUALLY CARRIES? Used to keep
+ * `pinMismatchLines` from claiming a deployment on a box that has none (agent-infra#10114).
+ *
+ * ⛔ ALL THREE SHAPES THE FLEET ITSELF ENUMERATES, NOT JUST THE ONE THIS CHANGE WAS CHASING (review
+ * finding 1, verified against `harness-refresh.sh:394-398,500-507` and `cloud-cell-bringup.sh:996-998`).
+ * A first revision accepted only `<root>/<pin12>`, which SILENCED two real deployments and so lost
+ * the #10114 warning on exactly the boxes that carry it:
+ *   1. `<root>/<sha12…>` — the per-commit child `apply` creates (the common shape);
+ *   2. `<root>` ITSELF — "the legacy flat pin: the ROOT is the worktree";
+ *   3. the directory `HARNESS_PIN_FILE` names — "the only record that can name a READ dir OUTSIDE the
+ *      pin root" (the #2216 shape).
+ * ⛔ AND A PREFIX, NOT AN EQUALITY (review finding 2): `pinnedSha` accepts a 7-char record and slices
+ * to 12, so a short record could never equal a `<sha12>` directory name. Matching by prefix in both
+ * directions makes the two agree about what "the same tree" means.
  */
 export function pinTreeDeployed(pin: string, home: string = process.env.HOME ?? ""): boolean {
   if (pin === "") return false;
+  const sameCommit = (dir: string): boolean => {
+    const h = shortHead(dir);
+    return h !== "?" && h !== "" && (pin.startsWith(h) || h.startsWith(pin));
+  };
   for (const root of pinTreeRoots(home)) {
+    // 1. the per-commit children. `startsWith` in both directions, because the record may be shorter
+    //    than the directory name or (defensively) longer.
     try {
-      if (statSync(join(root, pin)).isDirectory()) return true;
+      for (const name of readdirSync(root)) {
+        if (!(name.startsWith(pin) || pin.startsWith(name))) continue;
+        try {
+          if (statSync(join(root, name)).isDirectory()) return true;
+        } catch {
+          /* raced or unreadable child — keep looking */
+        }
+      }
     } catch {
       /* absent or unreadable root — try the next */
+    }
+    // 2. the legacy flat pin: the ROOT itself is the worktree, so it is identified by its own HEAD.
+    if (sameCommit(root)) return true;
+  }
+  // 3. the tree the PATH record names, which may live outside every pin root.
+  const records: string[] = [];
+  const envFile = process.env.HARNESS_PIN_FILE;
+  if (envFile) records.push(envFile);
+  if (home !== "") records.push(join(home, ".harness-path"));
+  for (const rec of records) {
+    try {
+      const named = readFileSync(rec, "utf-8").split("\n")[0].trim();
+      if (named !== "" && sameCommit(named)) return true;
+    } catch {
+      /* absent or unreadable record — try the next */
     }
   }
   return false;
