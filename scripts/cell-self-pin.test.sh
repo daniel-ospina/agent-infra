@@ -1051,6 +1051,20 @@ if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
     *"${MAIN2:-<unreadable>}"*) ok "…and the tracking-ref spelling 'refs/remotes/origin/main' is FETCHED as 'main' and decided on the fetched commit, not handed to git as a remote ref" ;;
     *) bad "HARNESS_REF=refs/remotes/origin/main did not reach the fetched commit ${MAIN2:-<unreadable>} (rc=$rc): $out" ;;
   esac
+  # ⛔ AND A SPELLING THAT NAMES ANOTHER REMOTE MUST FAIL CLOSED, NOT BE ANSWERED FROM `origin`. A blanket
+  # `refs/remotes/*/*` strip turned `refs/remotes/upstream/main` into the fetch source `main` — i.e. into
+  # ORIGIN's `main` — so `--status` printed origin's tip under the OTHER ref's name, labelled it "(… fetched
+  # just now)", and answered `current` + exit 0 about a ref it never fetched (MEASURED: the same ref's
+  # `--status-nofetch` reading said DRIFT). The verb the header calls the operator's first read therefore
+  # returned a false green, and nothing on that path failed closed. Every fetch here is hardcoded to
+  # `origin`, so the only honest answer is a NAMED refusal (exit 2 = UNKNOWN, the status vocabulary).
+  out="$(runat "$T/home-pass" HARNESS_REF=refs/remotes/upstream/main bash "$PIN" --status 2>&1)"; rc=$?
+  case "$out" in
+    *'verdict        current'*) bad "--status reported 'current' for refs/remotes/upstream/main, a ref it never fetched — the reading came from origin's branch and was printed under another remote's name: $out" ;;
+    *'UNRESOLVED(ref-spelling)'*) [ "$rc" -eq 2 ] && ok "…and a spelling naming ANOTHER remote is REFUSED by name (ref-spelling, exit 2 = UNKNOWN), not answered from origin" \
+        || bad "refused a foreign-remote spelling but exited $rc, not 2=UNKNOWN: $out" ;;
+    *) bad "a foreign-remote spelling was not refused (rc=$rc), so this path does not fail closed: $out" ;;
+  esac
   # The pass-side PEELING control: `attip` is an annotated tag ON the record's commit, so a pass that
   # compares the TAG OBJECT sha to a commit reads DRIFT forever, and one that peels reads current.
   out="$(runat "$T/home-pass" HARNESS_REF=attip bash "$PIN" 2>&1)"; rc=$?

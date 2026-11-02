@@ -122,7 +122,7 @@ HARNESS_REF="${HARNESS_REF:-origin/main}"
 # refreshed one ref and compared another, and `--status` printed "`origin/rel` fetched just now" about a ref
 # it never touched. A knob read one way and refreshed another is two facts pretending to be one, which is
 # the #2215 skew this file exists to remove — one variable over.
-ref_fetch_branch() { # the REMOTE branch to fetch for $HARNESS_REF (see the three forms below)
+ref_fetch_branch() { # the REMOTE branch to fetch for $HARNESS_REF — 1 when the spelling names ANOTHER remote
   local r
   # ⛔ THREE SPELLINGS NAME THE SAME REMOTE BRANCH, AND ONE OF THEM IS NOT A REMOTE REF AT ALL. Only
   # `origin/<b>` and `refs/heads/<b>` were stripped, so `refs/remotes/origin/<b>` — the canonical name of
@@ -132,8 +132,18 @@ ref_fetch_branch() { # the REMOTE branch to fetch for $HARNESS_REF (see the thre
   # then exited 2 `fetch-failed` for EVER on a value that worked before this file decided on the fetched
   # commit, and the `2>/dev/null` on that fetch discarded git's reason, so the journal could not even say
   # why. `refs/remotes/origin/<b>` is this repo's tracking ref; the thing to ask the REMOTE for is `<b>`.
+  # ⛔ AND ONLY `origin` MAY BE STRIPPED. A blanket `refs/remotes/*/*` arm turns
+  # `refs/remotes/upstream/main` into the fetch source `main` — i.e. into `ORIGIN`'s `main` — so the run
+  # answers a DIFFERENT question than the one asked, prints it under the other ref's name, and `--status`
+  # reports `current` + exit 0 for a ref it never fetched (MEASURED: `refs/remotes/upstream/main` printed
+  # origin/main's tip as `(refs/remotes/upstream/main fetched just now)` / `verdict current` while the
+  # `--status-nofetch` reading of the same ref said DRIFT). Every fetch in this file is hardcoded to
+  # `origin`, so a spelling that names another remote has no honest answer here: REFUSE it by name.
+  # ⛔ IT RETURNS 1 RATHER THAN CALLING `loud`: both call sites run this in a COMMAND SUBSTITUTION, so an
+  # `exit` from here would only leave the subshell and the caller would carry on with an empty branch.
   case "$HARNESS_REF" in
-    refs/remotes/*/*) r="${HARNESS_REF#refs/remotes/}"; r="${r#*/}" ;;
+    refs/remotes/origin/*) r="${HARNESS_REF#refs/remotes/origin/}" ;;
+    refs/remotes/*/*) return 1 ;;
     *) r="${HARNESS_REF#origin/}"; r="${r#refs/heads/}" ;;
   esac
   printf '%s\n' "${r:-main}"
@@ -341,7 +351,7 @@ do_pass() {
   # ⛔ `cd` — not `git -C` — because the verb below is the one that decides the cwd for the pin, and the
   # unit deliberately declares no `WorkingDirectory=`. This is where that directory is chosen.
   cd "$repo" || loud 2 chdir "cannot enter the resolved layer ${repo}"
-  fetch_branch="$(ref_fetch_branch)"
+  fetch_branch="$(ref_fetch_branch)" || loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} names another remote's tracking ref, and every fetch in this pass is hardcoded to the 'origin' remote — so the tick would fetch ORIGIN's branch and answer about a ref the operator never asked about; use origin/<branch> or refs/remotes/origin/<branch>"
   fetch_ref="$(pin_fetch_ref "$fetch_branch")"
   # ⛔ ONE FETCH, TWO REFSPECS: the bare one keeps `refs/remotes/origin/<branch>` fresh exactly as before
   # (the `--status-nofetch` reading and every other reader of the tracking ref depend on it), and the second
@@ -464,7 +474,7 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # fetch is reported as possibly stale, never as current-but-unverified silence.
     case "$mode" in
       nofetch) printf '  (%s NOT fetched — the reading below may be STALE)\n' "$HARNESS_REF" ;;
-      *) fetch_branch="$(ref_fetch_branch)"
+      *) fetch_branch="$(ref_fetch_branch)" || loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} names another remote's tracking ref, and every fetch in this pass is hardcoded to the 'origin' remote — this reading would be taken from ORIGIN's branch and reported under a ref the operator never asked about; use origin/<branch> or refs/remotes/origin/<branch>"
          fetch_ref="$(pin_fetch_ref "$fetch_branch")"
          if git -C "$layer" fetch -q origin "$fetch_branch" "+${fetch_branch}:${fetch_ref}" 2>/dev/null; then
            printf '  (%s fetched just now)\n' "$HARNESS_REF"
