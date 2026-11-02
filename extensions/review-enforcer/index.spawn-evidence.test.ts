@@ -85,6 +85,14 @@
  *                                                                  file named `--tags` in the cwd bash
  *                                                                  expands the flag slot to it and the
  *                                                                  push ships every tag)
+ *   M17 neutralise `gitWordAnywhere` in `isGitOp` (`if false && …`) → §boundary. This is the OPPOSITE
+ *                                                                  direction from every row above: the
+ *                                                                  arm must EXIST for the gate to fire.
+ *                                                                  With it neutralised `git -C <path>
+ *                                                                  push` matches no arm at all, reaches
+ *                                                                  zero dispatches, and NO record may
+ *                                                                  authorize it (verified: 26 passed /
+ *                                                                  1 failed, red = §boundary).
  *
  * NOT mutation targets — `evidenceCommandIsPlain` closes these BEFORE the named arm can run, so a
  * green run says nothing about the arm. The list is EXHAUSTIVE, because an earlier revision said
@@ -246,16 +254,30 @@ async function main() {
     ok(res?.block === true, "a review of HEAD cannot authorize committing NEW bytes");
   });
 
-  // ⛔ `git -C <other> push` is OUTSIDE the enforcer's interception surface altogether: `isGitOp`
-  // treats a repo-redirecting global as a foreign checkout and does not gate it (the same declared
-  // boundary VGATE documents — findGitVerbInvocation's `foreignRedirect: "skip"`). So the evidence
-  // path can never be reached for it, which is what this pins; the unit case below pins
-  // resolveShippedHeads' own refusal, so a future widening of isGitOp cannot silently open it.
-  test("§boundary — a `-C` redirect is not gated at all, and yields no evidence even if it were", async () => {
-    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: `git -C ${repoDir()} push origin main` } }, { cwd: repoDir() });
-    equal(res, undefined, "declared boundary: a foreign-redirect git op is not intercepted (pre-existing, unchanged here)");
-    equal(mod.resolveShippedHeads(`git -C ${repoDir()} push origin main`, { cwd: repoDir() }), null,
-      "and the evidence resolver refuses it on its own — widening isGitOp later cannot open this path");
+  // ⛔ `git -C <other> push` IS GATED — BY THE FLOOR, NEVER BY A RECORD (#3161). Two facts, and the
+  // pin below needs both:
+  //   1. `isGitOp` gained a `git` COMMAND-WORD arm (`gitWordAnywhere`), because the literal
+  //      `GIT_COMMIT_PATTERN` / `GH_PR_PATTERN` arms cannot cross a global option — so `git -C <path>
+  //      push`, this fleet's own canonical spelling, matched NO arm and reached ZERO dispatches. The
+  //      round-2 review measured it as a P0 fail-open; index.test.ts's write rows (`git -C /wt push`,
+  //      `git --no-pager push`, `git -C /a -C /b commit`) are the same fact from the other side.
+  //   2. The EVIDENCE path stays closed for it: `resolveShippedHeads` reads the op from the command
+  //      position, and a repo-redirecting global means the tokens are not the argv — `-C` is
+  //      UNATTRIBUTABLE, so no record can authorize it and the op falls back to the ordinary
+  //      ≥1-dispatch floor (the header's "anything else falls back" rule).
+  //
+  // ⚠️ THAT IS A DELIBERATE DIVERGENCE FROM VGATE, and it is fail-closed in the union: VGATE's
+  // `findGitVerbInvocation` SKIPS a `foreignRedirect` (it verifies nothing), while this layer
+  // REFUSES the same op at the floor. Do not "align" them by deleting the arm — that is exactly the
+  // zero-dispatch hole #3161 closes. A record at HEAD EXISTS here (minted by §ALLOW above), so a
+  // block below is proof the record was NOT used, not proof that no record was found.
+  test("§boundary — a `-C` redirect IS gated by the floor, and no record can authorize it", async () => {
+    const cmd = `git -C ${repoDir()} push origin main`;
+    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: cmd } }, { cwd: repoDir() });
+    ok(res?.block === true,
+      "a foreign-redirect push is a git WRITE in this fleet's canonical spelling: it must reach the floor, not zero dispatches");
+    equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null,
+      "and the evidence resolver refuses it on its own — a record at HEAD exists (§ALLOW) and still cannot authorize this op");
   });
 
   test("§REFUSE — with NO repo resolvable, a repo-naming record is not evidence", async () => {
