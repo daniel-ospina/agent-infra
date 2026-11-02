@@ -437,9 +437,11 @@ echo "── §9g a run with NO \$O compared answers harness=surface, and says n
 # it (measured; the fixtures here use an ABSENT `$O`, which is why this assertion is sound either way).
 # §5b grades the other `surface` shape (a clean `$O` plus a
 # hit in another dir) and §9e runs with the surface candidates CLEAN, so it reaches the OK summary and
-# prints `harness=current` (⛔ it is NOT "no token at all" — that was the pre-round-17 state, and §9e's
-# own clean arm asserts `harness=current`; leaving the old wording here told a maintainer that a clean
-# run is tokenless, which is exactly the P0). Nothing stated what THIS shape's token is, which is why the README could
+# prints `harness=current` (⛔ it is NOT "no token at all" — that was THIS arm's state until round 21,
+# which is when its assertion arrived (`df1afa843`); round 17 gave the token to the `O_ABSENT -eq 0`
+# arm only, so the two arms changed four rounds apart and `:466-467`'s round-17 note is about the
+# OTHER one. Leaving the old wording here told a maintainer that a clean run is tokenless, which is
+# exactly the P0). Nothing stated what THIS shape's token is, which is why the README could
 # describe `surface` as `Q_BYTES=0`-gated. (This comment previously said the arm "emits `surface`
 # because NOTHING was compared" — false, and contradicted by its own fixture needing `c.sh` below:
 # `$O`-absent alone emits no token, so the run must have a surface hit to print one at all.)
