@@ -343,9 +343,22 @@ check_pin_resolution() { # <layer repo> <target commit> — 0 when the pin verb'
 
 do_pass() {
   local dry="${1:-}" layer repo sup target applied now rc fetch_branch fetch_ref
-  # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED HERE, ON EVERY TICK, BEFORE ANYTHING ELSE — see
-  # `one_actor_check` for why install time cannot be the only reading.
-  one_actor_check "$([ "$dry" = dry ] && printf dry || printf apply)"
+  # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED ON EVERY TICK, BUT IT IS NOT THE FIRST THING THE TICK DOES.
+  # `retire_actuator` DISABLES the shipped timer, and the first version of this call sat ABOVE
+  # `resolve_layer`, `supervisor_in`, the `cd`, the fetch and the ref check — every one of which can exit
+  # non-zero. A tick that retired the box's working actuator and then failed on any of them left the box
+  # with ZERO pin actuators: `eldato-harness-apply.timer` disabled and stopped, this unit enabled and RED
+  # every ten minutes, nothing advancing the layer — which is #3194's own state, reached by following this
+  # change's documented migration. So the retirement is taken only once the pass has ESTABLISHED IT CAN
+  # ACT (the same order `do_install` uses: the replacement first, the retirement last), and
+  # `pass_rollback` puts it back if the tick fails after that. The DRY reading stays up here because it
+  # retires nothing and `--dry-run` must report the duplicate it would retire without fetching.
+  PASS_RETIRED=""
+  trap pass_rollback EXIT
+  # The DRY reading stays FIRST because it retires NOTHING: it needs no establishment, and `--dry-run` on a
+  # box with no resolvable layer must still report the duplicate actuator it WOULD retire instead of
+  # exiting before it has looked. Only the ACT branch moves down.
+  [ "$dry" = dry ] && one_actor_check dry
   layer="$(resolve_layer)" || loud 2 no-layer "no usable layer: ${HARNESS_PIN_FILE} names nothing readable and ${HARNESS_PIN_DIR} holds no tree git can answer from"
   sup="$(supervisor_in "$layer")" || loud 2 no-supervisor "resolved layer ${layer} carries no cloud-cell-supervisor.sh, so there is no verb to pin with"
   repo="$layer"
@@ -378,6 +391,13 @@ do_pass() {
   # commit is a false DRIFT that can never be `current`). MEASURED, both directions, before this line existed.
   target="$(git rev-parse --verify --quiet "${fetch_ref}^{commit}" 2>/dev/null)" \
     || loud 2 unreadable-ref "${HARNESS_REF} did not resolve to a commit after the fetch in ${repo}"
+  # ⛔ NOW — not one line earlier, not one line later. EARLIER (where this call used to sit) is the
+  # zero-actuator window above: the layer, the supervisor, the `cd`, the fetch and the tip resolution have
+  # all had to succeed before the shipped timer is touched. LATER is a window with two MUTATING actors on
+  # one pin, which is the #2416 race this guard exists to prevent. The remaining fallible steps below are
+  # the apply itself and its convergence read, and `pass_rollback` re-enables what this retired if they
+  # fail — a migration may not destroy the actuator it is replacing before its replacement has worked.
+  one_actor_check apply
   applied="$(pinned_head)"
   if [ -z "$applied" ]; then
     log "no readable pin record at ${HARNESS_PIN_FILE} -- applying (a pin nobody can read is not a pin)"
@@ -388,6 +408,9 @@ do_pass() {
     # every converged tick. #3194's whole punishment was "the record said current while the pid executed a
     # tree 17 commits behind", so the no-op line is exactly where that belief is re-asserted: it must carry
     # the same caveat, or the one surface an operator reads all day is the one that overclaims.
+    # A converged tick KEEPS its re-take: the pin is current, so the retirement this tick made (if any) is
+    # the correct end state and `pass_rollback` must not undo it on the way out.
+    PASS_RETIRED=""
     record_outcome "current ${target} (no-op; record verified — a RUNNING controller keeps the layer it started on)"
     log "current ${target} (no-op; record verified — note: a RUNNING controller keeps the layer it started on until it is restarted)"; return 0
   else
@@ -429,6 +452,9 @@ do_pass() {
       now="$(pinned_head)"
       log "mended: the pin RECORD was missing/empty and now names ${now} (the tree apply created for ${target})"
       record_outcome "mended ${now} (record was missing; now names the tree apply created)"
+      # 11 is a SUCCESS verdict (`mended`), not a failure: the record now names the tree apply created, so
+      # the retirement this tick made stands.
+      PASS_RETIRED=""
       exit 11
     fi
     record_outcome "stale-record (apply exited 0, ${HARNESS_PIN_FILE} names nothing readable, and no tree under ${HARNESS_PIN_DIR} could be recorded)"
@@ -454,6 +480,7 @@ do_pass() {
     fi
     exit 1
   fi
+  PASS_RETIRED=""
   record_outcome "applied -> ${now}"
   log "applied -> ${now} (record verified; ctrl=$(systemctl is-active eldato-orchestrator 2>/dev/null); note: a RUNNING controller keeps the layer it started on until it is restarted)"
   return 0
@@ -1043,6 +1070,15 @@ dropin_dirs() { # <unit-dir> <unit-name> — every directory systemd merges for 
 verify_dropins() { # <unit-dir> <unit-name>
   local _dir f
   for _dir in $(dropin_dirs "$1" "$2"); do
+    # ⛔ A DIRECTORY THIS RUN CANNOT SEARCH IS NOT A DIRECTORY WITH NO DROP-INS. `dropin_dirs` enumerates a
+    # directory on `[ -d ]`, which needs only the PARENT to be searchable — so a drop-in directory the
+    # installer can see but cannot open expanded `"$_dir"/*.conf` to nothing, the loop body never ran, and
+    # this function reported PASS. Systemd still merges a `.conf` from a directory this run could not read:
+    # an unreadable legacy drop-in passed as COMPLIANT while carrying the very `WorkingDirectory=` this
+    # change removes. A guard on the feeder, not a count of an expansion that already lost the evidence.
+    if [ ! -r "$_dir" ] || [ ! -x "$_dir" ]; then
+      bad "the drop-in directory ${_dir} (mode $(ls -ld "$_dir" 2>/dev/null | cut -c1-10)) cannot be READ/SEARCHED by this run, so its .conf files were never inspected — systemd can still load one from it, and 'nothing found here' is not 'nothing installed'; fix its permissions (or remove it) and re-run"; return 1
+    fi
     for f in "$_dir"/*.conf; do
       [ -f "$f" ] || continue
       verify_dropin_file "$f" || return 1
@@ -1053,7 +1089,28 @@ verify_dropins() { # <unit-dir> <unit-name>
 
 verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the search-path loop stays a loop
   local f="$1" body _c _kv
-    body="$(grep -vE '^[[:space:]]*#' "$f")"
+    # ⛔ A READ THAT FAILED IS NOT A FILE WITH NOTHING IN IT, and that is the whole false PASS: `grep`'s
+    # exit status used to be DISCARDED, so a drop-in this run could not read (0600 and root-owned, an I/O
+    # error) produced an EMPTY body, every rule below passed on nothing, and `--install` went on to print
+    # "installed — ONE actuator on this pin" while systemd merged that unread file OVER the unit. Measured
+    # on this host before the fix: `grep -vE … <0600 file>` → rc=2, empty stdout, PASS. A file systemd can
+    # load and this verification cannot see must be a REFUSAL, never a PASS.
+    # ⛔ THIS GATE RUNS FIRST, BEFORE ANYTHING READS THE FILE A SECOND WAY: the shell's own `tr <"$f"` on an
+    # unreadable path prints its redirection error and yields an EMPTY stream, which the NUL rule below
+    # would then mis-report as "a binary file" — the right refusal for the wrong reason, and untestable as
+    # a read gate because no leg could reach it.
+    if ! body="$(LC_ALL=C grep -vE '^[[:space:]]*#' "$f")"; then
+      bad "the installed drop-in ${f} cannot be READ by this run, so its contents were never verified — systemd will still merge it over the rendered unit, and anything inside it (a WorkingDirectory=, a Condition*=, a re-pointed Environment=) is exactly what this gate exists to refuse; fix its permissions (or remove it) and re-run"; return 1
+    fi
+    # ⛔ A BINARY FILE IS NOT A FILE WITH NO DIRECTIVES. `grep` treats a file carrying a NUL byte as binary
+    # and does NOT answer with the matching lines: GNU grep prints one `Binary file <path> matches` line,
+    # BSD/macOS grep prints `binary file matches` on STDERR and nothing on stdout — MEASURED on this host,
+    # rc=0 with an EMPTY body. So a legacy drop-in holding `\0` and `WorkingDirectory=/tmp/cell-ai` produced
+    # a body every rule below passed on nothing, and the gate called it compliant. Refused on the file's
+    # BYTES, before grep can decide what to call it, so the verdict does not depend on which grep is in PATH.
+    if [ "$(LC_ALL=C tr -d '\000' <"$f" | wc -c | tr -d ' ')" != "$(LC_ALL=C wc -c <"$f" | tr -d ' ')" ]; then
+      bad "the installed drop-in ${f} contains a NUL byte, so it is a BINARY file to grep and its directives cannot be read this way (measured: an EMPTY body with rc=0, or a single 'Binary file … matches' line) — every rule in this gate would run on nothing and report COMPLIANT on a file carrying any directive at all; a systemd drop-in is a text file, so remove ${f} and re-run"; return 1
+    fi
     # The same three parse-level rules the rendered unit gets, in the same one place: a drop-in is NOT a
     # safer place for a continuation, a C-style escape, an `Environment=` reset, or an
     # `EnvironmentFile=`/`UnsetEnvironment=`/`PassEnvironment=` — it is a MORE dangerous one, because it is
@@ -1206,6 +1263,29 @@ restore_actuator() {
   actuator_enabled_in "$scope"
 }
 
+# pass_rollback — the TICK's exit guard, the counterpart of `do_install`'s rollback loop.
+# ⛔ WHY THIS EXISTS AT ALL. `do_pass` retires the shipped actuator immediately before the ONE mutation it
+# makes, so a failure AFTER that point leaves the shipped timer disabled AND stopped while this unit goes on
+# failing every ten minutes — ZERO pin actuators, nothing advancing the layer, which is exactly the state
+# #3194 is about. `do_install` already refuses to end there (`:1345`, "Zero actuators is WORSE than two");
+# the tick had no equivalent, so following this change's own migration could reach #3194's own shape.
+# EVERY terminal SUCCESS path in `do_pass` clears `PASS_RETIRED` first (`current`, `applied`, and the `mended`
+# exit 11), so a non-empty value here means the tick failed — including a `loud 2 …` that exits from inside
+# `check_pin_resolution`, which an inline rollback at each `exit` site could not have covered.
+pass_rollback() {
+  local rc=$? s
+  [ -n "${PASS_RETIRED:-}" ] || return 0
+  for s in $PASS_RETIRED; do
+    if restore_actuator "$s"; then
+      err "ROLLED BACK: eldato-harness-apply.timer re-enabled in the ${s} manager — this tick failed AFTER retiring it, so the box keeps the ONE pin actuator it had before the tick instead of none"
+    else
+      err "ROLLBACK FAILED in the ${s} manager: eldato-harness-apply.timer is DISABLED there and this tick failed, so this box now has NO pin actuator. Re-enable it by hand: 'systemctl enable --now eldato-harness-apply.timer'."
+    fi
+  done
+  PASS_RETIRED=""
+  return "$rc"
+}
+
 # one_actor_check <dry|apply> — the ONE-ACTOR invariant, re-read on EVERY tick rather than only at
 # install time. ⛔ THE RE-ARM IS MEASURED, NOT HYPOTHETICAL: `cloud-cell-bringup.sh`'s
 # `check_harness_apply` runs `install-harness-apply-timer.sh --install` on EVERY bring-up (`die` on a
@@ -1251,6 +1331,10 @@ one_actor_check() {
       err "DUPLICATE-ACTUATOR: eldato-harness-apply.timer is ENABLED in the ${s} manager beside this unit (bringup re-arms it) and could NOT be retired -- two mutating actors on one pin is the #2416 race, so this tick is a RED. Remedy: disable it by hand in that manager ('systemctl disable --now eldato-harness-apply.timer', plus '--user' for the user manager), then re-run '$0 --install --takeover'."
       exit 1
     fi
+    # Remembered so a tick that fails AFTER this retirement can put it back — `pass_rollback`. Recorded
+    # here rather than inside `retire_actuator` so `do_install` (which keeps its own `$retired` list) is
+    # not affected by the tick's guard.
+    PASS_RETIRED="${PASS_RETIRED:-} $s"
   done
   log "re-took the pin: eldato-harness-apply.timer was RE-ARMED (${who# }) after --takeover and has been retired again -- ONE actuator on this pin, re-verified rather than assumed"
   record_outcome "re-took the pin (retired a re-armed eldato-harness-apply.timer in ${who# })"

@@ -580,6 +580,49 @@ else bad "REFUSED a benign identity-only drop-in — that is the operator's docu
 # as "REPLACED the placed pass" for a replacement that was correct, i.e. the sentinel would be measuring the
 # wrong install.
 cp "$T/placed.before" "$PLACED"
+# ── 4b-bis. A DROP-IN THIS RUN CANNOT READ IS NOT A DROP-IN WITH NOTHING IN IT ────────────────────
+# ⛔ THE SAME FALSE PASS, ONE SYSCALL OVER (round-3 review, P1). `verify_dropin_file` ran
+# `body="$(grep -vE … "$f")"` and DISCARDED grep's exit status, so an unreadable drop-in (0600 and
+# root-owned, an I/O error) produced an EMPTY body — every rule in that function ran on nothing, and
+# `--install` went on to print "installed — ONE actuator on this pin" while systemd merged that file OVER
+# the unit. Measured on this host, both routes, before the fix:
+#   * `grep -vE … /an-unreadable-file`  → rc=2 on STDERR, EMPTY stdout, body empty;
+#   * `grep -vE … ./nul.conf` (NUL byte) → rc=0, EMPTY stdout on BSD/macOS grep, one
+#     "Binary file … matches" line on GNU grep — in neither case the file's directives.
+#   * and `verify_dropins` iterated a glob that does not expand in a directory it cannot SEARCH, so the
+#     body never ran and the function still returned PASS.
+# Every leg feeds the gate the DEFECT (a real `WorkingDirectory=` inside the unreadable/binary file), so a
+# gate that "passes" by refusing any drop-in cannot satisfy them — the benign identity-only leg above
+# still has to install.
+u_nul="$T/dropin-nul"; mkdir -p "$u_nul/cell-self-pin.service.d"
+printf '[Service]\n\000\nWorkingDirectory=/tmp/cell-ai\nExecStartPre=/bin/bash /srv/nowhere/x.sh\n' >"$u_nul/cell-self-pin.service.d/legacy.conf"
+refuses_dropin 'is a BINARY file (a NUL byte), so grep answers with no directives at all' "$u_nul" 'NUL byte'
+u_unread="$T/dropin-unread"; mkdir -p "$u_unread/cell-self-pin.service.d"
+printf '[Service]\nWorkingDirectory=/srv/harness-current\nConditionPathExists=/srv/nope\n' >"$u_unread/cell-self-pin.service.d/legacy.conf"
+chmod 000 "$u_unread/cell-self-pin.service.d/legacy.conf"
+if [ "$(id -u)" -eq 0 ]; then
+  ok "SKIPS the unreadable-drop-in leg honestly: running as root, where mode 000 does not hide a file (the route can not be reproduced, so it is not claimed)"
+else
+  refuses_dropin 'cannot be READ at all (0600, not ours) — its directives were never verified' "$u_unread" 'cannot be READ by this run'
+fi
+chmod 644 "$u_unread/cell-self-pin.service.d/legacy.conf"
+u_nosearch="$T/dropin-nosearch"; mkdir -p "$u_nosearch/cell-self-pin.service.d"
+printf '[Service]\nWorkingDirectory=/tmp/cell-ai\n' >"$u_nosearch/cell-self-pin.service.d/legacy.conf"
+chmod 000 "$u_nosearch/cell-self-pin.service.d"
+if [ "$(id -u)" -eq 0 ]; then
+  ok "SKIPS the unsearchable-drop-in-directory leg honestly: running as root, where mode 000 does not hide a directory (the route can not be reproduced, so it is not claimed)"
+else
+  refuses_dropin 'lives in a drop-in directory this run cannot SEARCH (the glob never expanded)' "$u_nosearch" 'cannot be READ/SEARCHED'
+fi
+chmod 755 "$u_nosearch/cell-self-pin.service.d"
+# ⛔ THE NON-VACUITY CONTROL FOR *THESE* LEGS TOO: a readable, benign drop-in must still INSTALL, or the
+# three legs above could "pass" by refusing every drop-in the file cannot read for any reason.
+u_nul_ok="$T/dropin-nul-ok"; mkdir -p "$u_nul_ok/cell-self-pin.service.d"
+printf '[Service]\nUser=%s\nEnvironment=HOME=%s\n' "$(id -un)" "$HOME" >"$u_nul_ok/cell-self-pin.service.d/user.conf"
+out_nul_ok="$(install_doctored "$TPL" "$u_nul_ok")"; rc_nul_ok=$?
+[ "$rc_nul_ok" -eq 0 ] && ok "…and a TEXT drop-in with no NUL is still read and accepted (the NUL rule refuses binaries, not drop-ins)" \
+  || bad "refused a plain TEXT identity-only drop-in after the NUL rule was added: $out_nul_ok"
+cp "$T/placed.before" "$PLACED"
 # ── 4c. THE RENDER'S IDENTITY IS THE TREE'S OWNER, NOT THE INVOKER'S ────────────────────
 # ⛔ `--install` writes a SYSTEM unit under /etc/systemd/system and needs `systemctl enable`, so the
 # documented install path is `sudo … --install` — and rendering `{{USER}}` from `id -un` therefore baked
@@ -644,6 +687,7 @@ mk_scoped_systemctl() { # <dir> <state-dir>
     'verb="${1:-}"; shift 2>/dev/null || true' \
     '[ "${1:-}" = "--now" ] && shift' \
     'unit="${1:-}"' \
+    'printf "%s %s\n" "$verb" "$unit" >>"$S/calls.log" 2>/dev/null' \
     'st="$S/$scope-$unit"' \
     'case "$verb" in' \
     '  is-enabled) [ -f "$st" ] && exit 0 || exit 1 ;;' \
@@ -862,6 +906,68 @@ out="$(runat "$TICK" PATH="$T/fake-manual:$PATH" bash "$PIN" 2>&1)"; rc=$?
 [ -f "$T/state-manual/system-$SHIPPED" ] \
   && ok "…and it did NOT retire an actuator it does not replace (a rehearsal never disables the shipped timer)" \
   || bad "a manual run RETIRED the shipped actuator — a test or a rehearsal must never disable the box's pin"
+
+# ── 4d. THE RE-TAKE MAY NOT COST THE BOX ITS LAST ACTUATOR ──────────────────────────────────────
+# ⛔ THE OTHER HALF OF THE INVARIANT, AND IT WAS THE HALF NOTHING READ (round-3 review, P1).
+# `retire_actuator` runs `systemctl disable --now eldato-harness-apply.timer`, and the call used to sit
+# ABOVE `resolve_layer`, `supervisor_in`, the `cd`, the fetch and the tip resolution — every one of which
+# can exit non-zero. `do_install` REFUSES to end at zero actuators (it writes the units first, retires
+# last, and rolls back); the tick had no equivalent. Measured end state of the shipped order: the shipped
+# timer DISABLED and STOPPED, this unit ENABLED and failing every ten minutes, nothing advancing the
+# layer — which is #3194's own state, reached by following this change's own documented migration.
+# Leg (1): a tick that cannot even RESOLVE a layer must not touch the shipped timer at all.
+mk_scoped_systemctl "$T/fake-nolayer" "$T/state-nolayer"
+: >"$T/state-nolayer/system-cell-self-pin.timer"      # this unit IS the installed actuator
+: >"$T/state-nolayer/system-$SHIPPED"                 # …and bringup re-armed the shipped one
+mkdir -p "$T/home-nolayer"                            # a home with NO record and NO pin root
+: >"$T/state-nolayer/calls.log"
+out="$(runat "$T/home-nolayer" PATH="$T/fake-nolayer:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -eq 2 ] && ok "a tick on a home with NO resolvable layer still exits 2 (UNRESOLVED)" \
+  || bad "a tick with no layer exited $rc instead of 2: $out"
+[ -f "$T/state-nolayer/system-$SHIPPED" ] \
+  && ok "…and it did NOT retire the shipped actuator — the retirement is taken only once the pass has established it can ACT" \
+  || bad "a tick that could not resolve a layer RETIRED eldato-harness-apply.timer and then failed: zero pin actuators, reached by a read-only failure"
+# ⛔ AND THE ASSERTION IS ON THE ACTION, NOT ON A LOG LINE. The file check above cannot see the ORDER, and a
+# rollback alone would satisfy it (the tick could disable and then re-enable on every read-only failure,
+# stopping and re-arming the shipped timer every ten minutes). `mk_scoped_systemctl` records every verb it
+# is asked for, so "the retirement was never TAKEN" is a fact about the fake's own log.
+if grep -q "^disable $SHIPPED\$\|^disable --now $SHIPPED\$" "$T/state-nolayer/calls.log" 2>/dev/null; then
+  bad "a tick that could not even resolve a LAYER still issued 'disable' on eldato-harness-apply.timer (calls log: $(tr '\n' ';' <"$T/state-nolayer/calls.log")) — a read-only failure must not touch the box's pin actuator at all, let alone stop and re-arm it"
+else
+  ok "…and it never even ISSUED a disable (the calls log has no retirement for it), so a read-only failure cannot stop and re-arm the box's actuator"
+fi
+# Leg (2): a tick that DOES retire and then FAILS AT APPLY must put the actuator back.
+# The record's HEAD is NOT the ref tip, so the tick really proceeds to the mutation; the supervisor exits
+# non-zero, which is the ordinary disconnected-box tick the template says "is RED and heals on the next one".
+FAILPIN="$T/tick-applyfail"
+mkdir -p "$FAILPIN/harness" "$FAILPIN/orchestrator"
+git clone -q "$T/origin.git" "$FAILPIN/harness/tree" 2>/dev/null
+mkdir -p "$FAILPIN/harness/tree/scripts"
+printf '#!/bin/bash\nexit 1\n' >"$FAILPIN/harness/tree/scripts/cloud-cell-supervisor.sh"
+chmod +x "$FAILPIN/harness/tree/scripts/cloud-cell-supervisor.sh"
+printf '%s\n' "$FAILPIN/harness/tree" >"$FAILPIN/.harness-path"
+git -C "$FAILPIN/harness/tree" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "a record that is NOT the ref tip"
+mk_scoped_systemctl "$T/fake-applyfail" "$T/state-applyfail"
+: >"$T/state-applyfail/system-cell-self-pin.timer"
+: >"$T/state-applyfail/system-$SHIPPED"
+: >"$T/state-applyfail/calls.log"
+out="$(runat "$FAILPIN" PATH="$T/fake-applyfail:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "a tick whose apply FAILS after retiring the re-armed actuator is a RED" \
+  || bad "a tick whose apply failed exited 0 (rc=$rc): $out"
+[ -f "$T/state-applyfail/system-$SHIPPED" ] \
+  && ok "…and the retired actuator is put BACK, so a failed tick never leaves the box with ZERO pin actuators" \
+  || bad "a tick that retired eldato-harness-apply.timer and then failed at apply left it DISABLED and this unit RED — zero pin actuators, i.e. #3194's own state"
+# …and it is a ROLLBACK that undoes a retirement that really happened, not a leg passing because the tick
+# never retired in the first place: both verbs are in the fake's own call log.
+if grep -q "^disable $SHIPPED\$\|^disable --now $SHIPPED\$" "$T/state-applyfail/calls.log" 2>/dev/null; then
+  ok "…after ACTUALLY retiring it first (the calls log has the disable), so the rollback is exercised, not assumed"
+else
+  bad "the failing tick never issued a disable, so the rollback leg above proved nothing (calls log: $(tr '\n' ';' <"$T/state-applyfail/calls.log"))"
+fi
+case "$out" in
+  *'ROLLED BACK'*) ok "…and it says ROLLED BACK on stderr, so journald carries the reason instead of silence" ;;
+  *) bad "…but nothing says the retirement was rolled back: $out" ;;
+esac
 
 # ── 5. the shipped template installs, and the written unit carries no bootstrap path ──────────────
 # ⛔ THE EXIT CODE IS ASSERTED, not merely "the files exist": a leg that only looks for the artifacts
@@ -1228,6 +1334,20 @@ printf '%s\n' "$T/home-ahead/harness/tree" >"$T/home-ahead/.harness-path"
 out="$(pinrun "$T/home-ahead" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "a record that ALREADY CONTAINS the ref tip is green — containment, not equality (no false RED)" \
   || bad "a record ahead of the ref tip was reported as ${rc} — that is the periodic false RED this rule exists to avoid: $out"
+# ⛔ AND A SUCCESSFUL RE-TAKE KEEPS ITS RETIREMENT (the failure rollback is not a blanket undo). The leg
+# above takes the APPLIED path — the record is ahead of the tip, so the pass decides DRIFT, `apply` runs and
+# the containment rule greens it. That path clears the rollback flag before exiting, and this leg is what
+# pins it: a mutation of that one line re-enables the shipped timer on EVERY successful tick, which reads as
+# "the one-actor invariant healed, then un-healed", for ever, on a converging box.
+mk_scoped_systemctl "$T/fake-applied" "$T/state-applied"
+: >"$T/state-applied/system-cell-self-pin.timer"
+: >"$T/state-applied/system-$SHIPPED"
+out="$(runat "$T/home-ahead" PATH="$T/fake-applied:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "a converging DRIFT tick exits 0 with a re-armed duplicate it retired" \
+  || bad "a converging DRIFT tick exited $rc with a retirable duplicate: $out"
+[ -f "$T/state-applied/system-$SHIPPED" ] \
+  && bad "a SUCCESSFUL tick rolled its own retirement back — the shipped timer is re-enabled on a box whose pin it had just taken, so the one-actor invariant un-heals every tick" \
+  || ok "…and a SUCCESSFUL re-take KEEPS the retirement (only a FAILED tick rolls back)"
 
 # ── 8. a LOST record is MENDED (exit 11), not a permanent unhealable RED ─────────────────────────
 # ⛔ `harness_apply` writes $HARNESS_PIN_FILE only in its CHANGED branch, so a pin already at the tip
