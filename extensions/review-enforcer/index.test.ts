@@ -20,6 +20,15 @@ process.env.NODE_ENV = "test";
 // class is exactly what #285 fixes).
 delete process.env.TASK_HEARTBEAT;
 delete process.env.PI_MODE;
+// ⛔ #3297 — the SAME class as KIND above, one round later. `AGENT_ADMIN_MERGE_OVERRIDE=1`
+// is the AUDITED landing route (AGENTS.md): it must be exported BEFORE a session starts, so
+// a LANE — which is exactly how a fix agent verifies its own work — carries it into this
+// suite. A test asserting that a degraded argv layer REFUSES then goes red for a reason that
+// has nothing to do with the code (measured: clean env → 6/6 pass; ambient override → the
+// refusal case fails). Delete it and its alias at load; the cases that exercise the override
+// set it explicitly and restore it.
+delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+delete process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
 // ⛔ `KIND` IS THE SAME CLASS, and #2148 added it to the decision surface: `reviewerRoleFor()`
 // resolves the AUDIENCE from `KIND`, and the factory resolves it ONCE at load. Every launcher in
 // this fleet exports it (`lane.sh` KIND=lane, `fix-one.sh` KIND=fixer, `merge-one.sh`
@@ -8918,7 +8927,8 @@ testAsync("#1382 (c): a spliced invocation is still REFUSED (UNCHANGED by this P
 
 testAsync("#1382 (d): the mask does NOT depend on the argv layer — the fleet has none, and that is where the defect bit", async () => {
   // MEASURED, and this is why the condition was removed: `docs/ops/ACTIVATION-MATRIX.md` row 1 records
-  // the gh shim as ABSENT on this fleet (nothing installs `scripts/gh-shim`; the resolver returns null),
+  // the gh shim as ABSENT on a box (re-measured 2026-11-02: `setup.sh` farms `scripts/gh-shim` and
+  // `cell-install.sh` fails the install without it, so the resolver returns null only on a STALE install),
   // so the previous `ghShimWillEnforce(shimDir) ? maskHeredocData(…) : rawCommand` left the reported
   // false positive refusing the reporter in the ONLY environment that hit it (verified: the
   // shim-conditioned build still refuses the command below verbatim). Masking is not a deferral — a

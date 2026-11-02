@@ -8695,8 +8695,9 @@ export default function (pi: ExtensionAPI) {
       // readable), so the mask cannot hide an invocation — it corrects a mis-read of one.
       //
       // THE CONDITION WAS WORSE THAN USELESS, it was the bug: this fleet runs with the argv layer
-      // ABSENT (`docs/ops/ACTIVATION-MATRIX.md` row 1 — nothing installs `scripts/gh-shim`, and the
-      // resolver returns null: measured on this cell), so tying the mask to it left the reported
+      // ABSENT (`docs/ops/ACTIVATION-MATRIX.md` row 1 — re-measured 2026-11-02: `pi-bootstrap/setup.sh`
+      // farms `scripts/gh-shim` and `cell-install.sh` fails without it, so a FRESH box has it; the
+      // boxes that logged this were stale installs, and the resolver returned null there), so tying the mask to it left the reported
       // defect refusing the reporter — a harmless `cat >> notes.md <<'EOF'` — in the only
       // environment where anybody hit it. Verified, not assumed: with the shim absent the
       // shim-conditioned build still refuses that command verbatim.
