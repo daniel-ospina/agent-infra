@@ -47,7 +47,7 @@ set -uo pipefail
 
 SELF="${BASH_SOURCE[0]}"
 
-say() { printf '%s\n' "$*"; }
+log_line() { printf '%s\n' "$*"; }
 say_err() { printf '%s\n' "$*" >&2; }
 
 # ── Pure decision: may this comment author trigger a re-run? ────────────────
@@ -193,10 +193,10 @@ main() {
   }
   [[ "$issue" =~ ^[0-9]+$ ]] || { say_err "ISSUE_NUMBER must be digits, got '$issue'"; return 1; }
 
-  say "revalidate: issue $repo#$issue"
+  log_line "revalidate: issue $repo#$issue"
 
   if ! trusted_association "$assoc"; then
-    say "  skip:untrusted-comment-author (association='${assoc:-none}') — only OWNER/MEMBER/COLLABORATOR may re-trigger the required check"
+    log_line "  skip:untrusted-comment-author (association='${assoc:-none}') — only OWNER/MEMBER/COLLABORATOR may re-trigger the required check"
     return 0
   fi
   marker_is_artifact "$body"; local mrc=$?
@@ -205,9 +205,9 @@ main() {
   outcome="$(probe_outcome "$mrc" "$prc")"
   [[ "$outcome" == "retracted" ]] && force=1
   case "$outcome" in
-    proceed) say "  scoping artifact detected on the issue" ;;
-    retracted) say "  scoping artifact RETRACTED by this edit (the replaced body carried the marker) — re-reading the gate so the stale green cannot stand" ;;
-    skip) say "  skip:not-a-scoping-artifact — neither this comment nor the body it replaced carries '<!-- issue-scoping:' as its first content line or as a blank-line-separated footer; nothing the gate reads has changed"; return 0 ;;
+    proceed) log_line "  scoping artifact detected on the issue" ;;
+    retracted) log_line "  scoping artifact RETRACTED by this edit (the replaced body carried the marker) — re-reading the gate so the stale green cannot stand" ;;
+    skip) log_line "  skip:not-a-scoping-artifact — neither this comment nor the body it replaced carries '<!-- issue-scoping:' as its first content line or as a blank-line-separated footer; nothing the gate reads has changed"; return 0 ;;
     *) say_err "  BLOCKED-BY-TOOLING — a marker probe could not answer (new=$mrc, previous=$prc); that is NOT a verdict that the issue is un-scoped."; return 2 ;;
   esac
 
@@ -225,7 +225,7 @@ main() {
     return 2
   fi
   if [[ -z "$prs" ]]; then
-    say "  skip:no-open-pr — no open PR cross-references this issue, so no required check depends on it"
+    log_line "  skip:no-open-pr — no open PR cross-references this issue, so no required check depends on it"
     return 0
   fi
 
@@ -233,27 +233,27 @@ main() {
   for pr in $prs; do
     head="$(gh api "repos/$repo/pulls/$pr" --jq '.head.sha // ""' 2>/dev/null)"
     if [[ -z "$head" ]]; then
-      say "  PR #$pr  BLOCKED-BY-TOOLING — could not read the PR head"
+      log_line "  PR #$pr  BLOCKED-BY-TOOLING — could not read the PR head"
       rc=2; continue
     fi
     # The newest Pipeline Compliance run for THIS head. A run created for an
     # older head can never carry a verdict this PR is graded on.
     if ! run_id="$(gh api "repos/$repo/actions/runs?head_sha=$head&per_page=100" \
         --jq '[.workflow_runs[] | select(.name == "Pipeline Compliance")] | sort_by(.id) | last | .id // ""' 2>/dev/null)"; then
-      say "  PR #$pr  BLOCKED-BY-TOOLING — could not list runs for head $head"
+      log_line "  PR #$pr  BLOCKED-BY-TOOLING — could not list runs for head $head"
       rc=2; continue
     fi
     if [[ -z "$run_id" ]]; then
-      say "  PR #$pr  skip:no-run-for-head ($head) — nothing to re-read"
+      log_line "  PR #$pr  skip:no-run-for-head ($head) — nothing to re-read"
       continue
     fi
     if ! verdict="$(gh api "repos/$repo/actions/runs/$run_id" \
         --jq '"\(.status)/\(.conclusion // "")"' 2>/dev/null)"; then
-      say "  PR #$pr  BLOCKED-BY-TOOLING — could not read run $run_id"
+      log_line "  PR #$pr  BLOCKED-BY-TOOLING — could not read run $run_id"
       rc=2; continue
     fi
     if [[ "$verdict" != */* ]]; then
-      say "  PR #$pr  BLOCKED-BY-TOOLING — run $run_id returned no readable status/conclusion"
+      log_line "  PR #$pr  BLOCKED-BY-TOOLING — run $run_id returned no readable status/conclusion"
       rc=2; continue
     fi
     local decision
@@ -261,13 +261,13 @@ main() {
     case "$decision" in
       rerun|rerun:retracted)
         if gh api -X POST "repos/$repo/actions/runs/$run_id/rerun" >/dev/null 2>&1; then
-          say "  PR #$pr  RERUN dispatched (run $run_id, ${verdict##*/}) — the same check over the current issue state; its verdict stands either way"
+          log_line "  PR #$pr  RERUN dispatched (run $run_id, ${verdict##*/}) — the same check over the current issue state; its verdict stands either way"
         else
-          say "  PR #$pr  BLOCKED-BY-TOOLING — rerun of $run_id was refused"
+          log_line "  PR #$pr  BLOCKED-BY-TOOLING — rerun of $run_id was refused"
           rc=2
         fi
         ;;
-      *) say "  PR #$pr  $decision (run $run_id, $verdict)" ;;
+      *) log_line "  PR #$pr  $decision (run $run_id, $verdict)" ;;
     esac
   done
   return "$rc"
