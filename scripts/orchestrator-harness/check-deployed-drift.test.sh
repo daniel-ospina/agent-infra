@@ -623,6 +623,23 @@ done
 # without running it — the INVERSE of the fact `executes:` asserts — yet they nominated the path and
 # reddened a healthy box with a durable `drift=drift:executes:`. `bash -o noexec <abs>` was already a
 # mention, so one fact had two grades; `_noexec` closes the split.
+# ⛔ A SHELL NAME AFTER THE COMMAND PREFIX IS A MENTION, AND A SHELL'S VALUE OPTION IS NOT A FLAG
+# (review round 18, P1/P2). `echo sh -c <abs>` used to mark an interpreter as identified (the `_seen`
+# branch fired on any word spelled like a shell, at any position) and the `-c` arm then nominated the
+# path — a fabricated `executes:` from a mention. And `bash -o pipefail <abs>` was a MENTION because
+# every shell option was treated as a flag, so a real launcher on a GONE tree reported nothing.
+for _m in 'echo sh -c' 'ssh box sh -c' 'man sh -c' 'bash -o noexec'; do
+  printf '4264 %s %s/orch-loop.sh\n' "$_m" "$GONE" > "$TMP/ps-shmention"
+  surf "$TMP/ps-shmention"
+  ck "10a-3e: '$_m <abs>/orch-loop.sh' is a MENTION (no interpreter in command position)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+for _v in 'bash -o pipefail' 'bash -O extglob'; do
+  printf '4265 %s %s/orch-loop.sh\n' "$_v" "$GONE" > "$TMP/ps-shopt"
+  surf "$TMP/ps-shopt"
+  ck "10a-3e: '$_v <abs>/orch-loop.sh' is an INVOCATION (a shell value option claims its operand)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+done
 for _p in 'bash -n' 'sh -n' 'bash -D' 'bash -en' 'bash -xn'; do
   printf '4263 %s %s/orch-loop.sh\n' "$_p" "$GONE" > "$TMP/ps-parseonly"
   surf "$TMP/ps-parseonly"

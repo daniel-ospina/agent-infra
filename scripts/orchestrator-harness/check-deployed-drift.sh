@@ -901,6 +901,12 @@ if [ "$SURFACE" -eq 1 ]; then
                 case "$_w" in
                   -D|--noexec|-n) _noexec=1 ;;
                   -[!-]*n*) _noexec=1 ;;
+                  # ⛔ A SHELL'S VALUE OPTIONS ARE NOT FLAGS (review round 18, P2). bash/zsh accept
+                  # their value as the NEXT word (`-o pipefail`, `-O extglob`, `--rcfile F`), so
+                  # treating every shell option as a flag let that word close the prefix —
+                  # `bash -o pipefail <gone>/orch-loop.sh` was a MENTION, i.e. a real execution of a
+                  # GONE tree reported as nothing: the #10114 silent green, restored for that spelling.
+                  -o|-O|+o|+O|--rcfile|--init-file) _optval=1 ;;
                 esac
               else
                 case "$_w" in
@@ -959,9 +965,20 @@ if [ "$SURFACE" -eq 1 ]; then
               fi ;;
           *) if [ "$_optval" -eq 1 ]; then
                _optval=0                      # this word is the OPTION's value (e.g. `sudo -u <user>`)
+               # ⛔ …AND `bash -o noexec` SPELLS NOEXEC AS A VALUE (review round 18, P2). The value
+               # word is consumed before any option test, so without this a shell told not to execute
+               # anything would still nominate its script — flipping an accepted mention into a
+               # fabricated `executes:`. Every other consumed value is inert.
+               [ "$_w" = noexec ] && _noexec=1
              else
                case "${_w##*/}" in
-                 bash|sh|dash|zsh|ksh|ash|mksh|busybox) _seen=1 ;;
+                 # ⛔ ONLY IN COMMAND POSITION (review round 18, P1). This branch used to set `_seen`
+                 # for ANY word spelled like a shell, at any position — so `echo sh -c <abs>`, `ssh box
+                 # sh -c <abs>` and `man sh -c <abs>` marked an interpreter as identified, and the
+                 # `-c` arm (which trusts `_seen`) then nominated the path: a fabricated `executes:`
+                 # on a healthy box, from a mention. The shell-arming block above already sets `_seen`
+                 # whenever a shell is actually in command position, so this asks the same question.
+                 bash|sh|dash|zsh|ksh|ash|mksh|busybox) [ "$_pfx" -eq 1 ] && _seen=1 ;;
                  env|nice|sudo|timeout|stdbuf|command|exec|nohup|setsid|doas)
                      # a wrapper while the command is still unknown is part of the prefix; seen AFTER a
                      # command, it is an argument and the prefix ends
