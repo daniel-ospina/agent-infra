@@ -4994,7 +4994,11 @@ fi
 # report.sh is an operator summary and MUST be safe to run while the loop is working: read-only,
 # and every section degrades to a message rather than aborting when its surface is absent.
 if [ -f "$HERE/report.sh" ]; then
-  RO="$TMP/report-o"; RREPO="$TMP/report-repo"; mkdir -p "$RO/state" "$RO/logs" "$RREPO"
+  # ⛔ THE FIXTURE REPO MUST BE A GIT CHECKOUT, because report.sh now gets `REPO` from repo-slug.sh's
+  # `resolve_repo`, which PROVES it is one (the same rule every other script had except this one, whose
+  # `$HOME/eldato/tortoise` default meant nothing ever checked). A plain `mkdir` directory is exactly
+  # what the resolver must refuse, so the fixture is a real (empty) repo.
+  RO="$TMP/report-o"; RREPO="$TMP/report-repo"; mkdir -p "$RO/state" "$RO/logs" "$RREPO"; git init -q "$RREPO"
   printf '{ "version": 1, "surface": "laptop", "commit": "0123456789abcdef0123456789abcdef01234567", "relation": "current" }\n' > "$RO/.agent-infra-stamp.json"
   touch "$RO/state/merged-4242.done"
   printf '%s\treviewer\t7\t1800\t1790\t1\n' "$(date +%s)" > "$RO/state/walltime.tsv"
@@ -5378,6 +5382,87 @@ if [ -f "$CSS" ]; then
     ck "check-single-source: an UNSEARCHABLE --fork cannot report 'no fork' (rc 2)" $rc
     chmod 755 "$CSD/noread"
   fi
+  # ⛔ THE FOURTH INSTRUMENT'S OWN ARM — `REPO` IS SET ONCE PER BOX (this PR). A per-script REPO path
+  # default is the same defect as a forked directory one variable over, and before this arm NOTHING
+  # reddened for it: three shipped scripts carried `$HOME/…`, `/tmp/cell-ai` and `$PWD` respectively.
+  # Both directions in a THROWAWAY copy of the harness, so the repo is never mutated.
+  rm -rf "$TMP/rpdef"; mkdir -p "$TMP/rpdef/h"
+  cp -a "$HERE"/. "$TMP/rpdef/h"/
+  # A COMMENT mentioning a default must not red (prose is how the defect is recorded), the assignment
+  # on the next line must.
+  printf '#!/bin/bash\n# REPO="${REPO:-/some/path}" is the shape this arm forbids\nREPO="$HOME/x"\n' > "$TMP/rpdef/h/zz-holdout.sh"
+  # ⛔ `env -u O` ON BOTH ARMS (#3054 review, P2). Without it the throwaway run inherits the ambient
+  # `$O`, so on any box whose deployed copy differs from this checkout — i.e. every box mid-change —
+  # the run exits 1 from the DEPLOYED-COPY divergence arms and the "allowed shapes" arm below blames
+  # the REPO arm for it. It was green only in CI, where `$O` is absent, so it proved the shapes are
+  # allowed nowhere that matters. `check-single-source.sh` reads `O_DIR="${O:-}"`, so unsetting it
+  # narrows the run to the half under test instead of inventing a target.
+  out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+  { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:3' <<<"$out"; } && rc=0 \
+    || { rc=1; echo "      a private REPO path default exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') (a comment mentioning one must NOT be the hit: the reported line is the assignment's)"; }
+  ck "check-single-source: a private REPO path default is refused, naming file AND line (rc 1)" $rc
+  # ⛔ A DEFAULT SPELLED AS ANOTHER VARIABLE IS THE SAME DEFECT, ONE INDIRECTION OVER (#3054 review,
+  # P1). `pathish` only recognised `$HOME`/`$PWD`/a literal path, and `allowed_default` (which catches
+  # `$AI`, `$CELL_HOME/x`, `$(pwd)`) was reached ONLY inside the `${REPO:-…}` branch — so measured at
+  # 637c21c19 these two passed GREEN over a live private default. Both spellings are fixtures here;
+  # `$AI` is not a made-up name: it is deploy-crossbox.sh's old default one variable over.
+  for _aspell in '$AI' '$(pwd)' '${CELL_HOME:-}/tortoise'; do
+    printf '#!/bin/bash\nREPO="%s"\n' "$_aspell" > "$TMP/rpdef/h/zz-holdout.sh"
+    out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:2' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      REPO=\"$_aspell\" exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>')"; }
+    ck "check-single-source: a private REPO default spelled REPO=\"$_aspell\" is refused" $rc
+  done
+  # Non-vacuity in the other direction: the shapes the whole harness is converging ON must not red.
+  # ⛔ THE CARVE-OUTS ARE PINNED HERE (#3054 review, P1), because the rule that catches `$AI` can
+  # over-reach: a value THIS FILE holds (`$L_DIR`, and a substitution derived from a `for` variable)
+  # is something the script MEASURED, and a SLUG — literal or defaulted — is not a checkout path at
+  # all. If a later widening starts reddening these, it reds the shipped tree instead.
+  {
+    printf '#!/bin/bash\n'
+    printf 'REPO="${REPO:-}"\n'
+    printf 'REPO="$1"\n'
+    printf 'REPO="$(resolve_repo)"\n'
+    printf 'REPO="${HARNESS_REPO:-${HARNESS_APPLY_REPO:-}}"\n'   # a nested EMPTY default supplies nothing
+    printf 'REPO="$REPO"\nREPO="${REPO:?REPO is required}"\n'      # the operator's OWN value, re-asserted
+    printf 'REPO="${FLEET_REPO:-daniel-ospina/agent-infra}"\n'      # a SLUG default
+    printf 'REPO="daniel-ospina/agent-infra"\n'                       # a SLUG literal
+    printf 'L_DIR="/tmp/x"\nREPO="$L_DIR"\n'                        # a value THIS FILE holds
+    printf 'for cand in /tmp\ndo\n  REPO="$(cd "$cand" && pwd -P)"\ndone\n'
+  } > "$TMP/rpdef/h/zz-holdout.sh"
+  out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && rc=0 \
+    || { rc=1; echo "      the ALLOWED shapes (no default / assigned from a caller / the one resolver / an empty default / the operator's own value / a slug / a value this file holds) exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' | head -3)"; }
+  ck "check-single-source: REPO=\"\${REPO:-}\", a caller-assigned REPO, resolve_repo, an EMPTY default, a SLUG and a value THIS FILE holds all pass" $rc
+  # ⛔ THE POPULATION IS TWO DIRECTORIES, AND THIS ARM PINS IT (verification finding, P1). The scan was
+  # `$HERE/*.sh` only, so two of the three offenders this arm was written for — `pi-reap-worktrees.sh`
+  # and `deploy-crossbox.sh`, both in the repo's `scripts/` — sat OUTSIDE it: measured, putting
+  # `REPO="${REPO:-$PWD}"` back into the reaper reddened nothing. The fixture is the repo's OWN layout
+  # (`scripts/` containing `orchestrator-harness/`), so a narrowing back to one directory reds here.
+  # ⛔ AND THE PATH CONTAINS A SPACE ON PURPOSE (round 2): the parent path was expanded UNQUOTED in the
+  # population loop, so under a space-bearing checkout the `scripts/` half was never scanned and the gate
+  # exited 0 OVER this exact fixture, printing "nothing to scan there". `$TMP` never holds a space, so
+  # without this the regression is invisible — and macOS space-bearing paths are ordinary.
+  mkdir -p "$TMP/rpdef/repo scripts"
+  cp -a "$HERE"/. "$TMP/rpdef/repo scripts/orchestrator-harness"/
+  cp "$HERE/../pi-reap-worktrees.sh" "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
+  printf 'REPO="${REPO:-$PWD}"\n' >> "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
+  out="$(bash "$TMP/rpdef/repo scripts/orchestrator-harness/check-single-source.sh" 2>&1)"; rc=$?
+  { [ "$rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$out"; } && rc=0 \
+    || { rc=1; echo "      a default in scripts/ (the reaper) exited $rc: $(printf '%s\n' "$out" | grep -iE 'PRIVATE|nothing to scan' || echo '<not named>') — the arm is scanning ONE directory again (or word-split the parent path)"; }
+  ck "check-single-source: a REPO path default in scripts/*.sh (not just the harness dir) is refused" $rc
+  # ⛔ THE SPELLING WAS A WAY AROUND THE ARM (#3054 review, P2). `pathish` matched the LITERAL `$HOME`
+  # and `$PWD`, so writing the exact default this PR removes ONE BRACE AWAY — `${HOME}/eldato/tortoise`,
+  # `${PWD}` — passed the gate untouched: the "a PR or an agent can defeat it" class. Both spellings are
+  # fixtures here, in the same throwaway copy, so a rewrite back to a bare-only match reds.
+  for _bshape in '${HOME}/eldato/tortoise' '${PWD}'; do
+    printf '#!/bin/bash\nREPO="${REPO:-%s}"\n' "$_bshape" > "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
+    out="$(bash "$TMP/rpdef/repo scripts/orchestrator-harness/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      the brace spelling $_bshape exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') — pathish matches only the BARE \$HOME/\$PWD"; }
+    ck "check-single-source: the brace spelling REPO=\"\${REPO:-$_bshape}\" is refused too" $rc
+  done
+  rm -rf "$TMP/rpdef"
 else
   ck "check-single-source.sh is shipped" 1
 fi
