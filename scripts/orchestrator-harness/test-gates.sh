@@ -1577,13 +1577,14 @@ FAKE
     sed -n '/^drain_stall_label() {/,/^}/p' "$ORCH"
   } > "$TMP/drain_helpers.sh"
   DO="$TMP/drainO"; mkdir -p "$DO/state"
-  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP]
+  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP] [MERGE_PRIORITY_MAX_AGE_MIN]
     ( set -u
       O="$DO"; LOG="$TMP/drain.log"; : > "$LOG"; UPN_WORK=50
       PRDISP_ACTS=3
       PRDISP_TOP=""
       if [ "${3+x}" = x ]; then PRDISP_SPAWNS="$3"; fi
       if [ "${4+x}" = x ]; then PRDISP_TOP="$4"; fi
+      if [ "${5+x}" = x ]; then MERGE_PRIORITY_MAX_AGE_MIN="$5"; else unset MERGE_PRIORITY_MAX_AGE_MIN; fi
       . "$TMP/drain_helpers.sh"
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
@@ -1704,6 +1705,31 @@ PYEOF
   case "$_out" in
     *"DRAIN STALLED"*) echo "  ok …and the escalation is STILL taken (an unmeasurable absence must not silence it, #2929)"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ an unsearchable state dir SILENCED the escalation: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ THE SYNTHESISED AGE MUST NOT DISAGREE WITH THE WINDOW THAT WAS SEARCHED (fresh-context review,
+  # 2026-11-02). `mp_recent_land` refuses a `0` bound (`find -mmin -0` matches nothing, so it falls
+  # back to 180x2 = 360m) and this block's copy of the knob had no such clamp: an empty answer then
+  # printed `no PR merged in 0m … the 0m window`, i.e. a claim about a window the FUNCTION searched
+  # at 360m — the age the empty answer supports is 360m. Driven with the knob at 0.
+  _out="$(_drain '' 180 2 0 0)"
+  case "$_out" in
+    *"no PR merged in 360m"*) echo "  ok MERGE_PRIORITY_MAX_AGE_MIN=0 is clamped to 180 like the reader's own bound (the age names 360m, not 0m)"; PASS=$((PASS+1)) ;;
+    *"no PR merged in 0m"*|*"the 0m window"*) echo "  ❌ MERGE_PRIORITY_MAX_AGE_MIN=0 printed an age of 0m for a window searched at 360m: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ MERGE_PRIORITY_MAX_AGE_MIN=0 produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ...and a magnitude that OVERFLOWS `_wmin * 2` makes `_wbound` NEGATIVE, so the synthesised age is
+  # printed as `no PR merged in -2m` and recorded as `age=-2` — an age the empty answer cannot support
+  # (and a nonsense a reader cannot tell from a clock fault).
+  _out="$(_drain '' 180 2 0 9223372036854775807)"
+  case "$_out" in
+    *"in -2m"*|*"in -1m"*|*"in -0m"*) echo "  ❌ an OVERFLOWED window bound printed a NEGATIVE age: $_out"; FAIL=$((FAIL+1)) ;;
+    *"no PR merged in 360m"*) echo "  ok an OVERFLOWED window bound falls back to the default instead of printing a negative age"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an overflowed window bound produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  _out="$(_drain 5 180 0 0 0)"
+  case "$_out" in
+    *"drain alive"*) echo "  ok …and a FRESH land is still 'drain alive' with the knob at 0 (polarity unchanged)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a fresh land with MERGE_PRIORITY_MAX_AGE_MIN=0 did not read 'drain alive': $_out"; FAIL=$((FAIL+1)) ;;
   esac
   _out="$(_drain 200 180 4)"
   case "$_out" in
