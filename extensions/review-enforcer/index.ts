@@ -354,6 +354,15 @@ export function ghArgvLayerRefusal(
   shimDir: string | null,
 ): { block: true; reason: string } | null {
   if (ghArgvLayerState(shimDir) !== "degraded") return null;
+  // ⛔ THE AUDITED OPERATOR OVERRIDE OUTRANKS THIS REFUSAL. `AGENT_ADMIN_MERGE_OVERRIDE=1`
+  // is the landing route recorded in AGENTS.md ("the audited AGENT_ADMIN_MERGE_OVERRIDE=1 …
+  // must be in the AGENT's environment before start"), and it is read deep inside the
+  // evidence branch. Refusing BEFORE that read would silently reverse a recorded decision
+  // and — because both switches must be set before the session starts — leave a lane on a
+  // degraded box with no in-session way to land at all. So the override keeps its route,
+  // and it is audited there as `admin_merge_override`, exactly as on a healthy box. This is
+  // a refusal to CERTIFY without a certifier, never a veto of an explicit operator decision.
+  if (_adminMergeOverride()) return null;
   return {
     block: true,
     reason:
@@ -361,12 +370,17 @@ export function ghArgvLayerRefusal(
       "loaded on this box, so the gate cannot prove the merge in this command is the " +
       "only one — the text scanner's residual is a token splice it cannot resolve. " +
       "This is a DEGRADED GUARD, and an unknown is not a pass.\n" +
-      "FIX: install `scripts/gh-shim/gh` (and its sibling `verify-admin-merge-evidence.sh`) " +
-      "where this extension resolves it — `~/.pi/agent/scripts/gh-shim/gh`. " +
-      "`pi-bootstrap/setup.sh` farms it (its `merge_gate_srcs` array) and " +
-      "`pi-bootstrap/cell-install.sh` fails the install when it is missing, so a rebuild " +
-      "that runs the installer cannot reproduce this state. Alternatively point " +
+      "FIX: install `scripts/gh-shim/gh` AND its sibling `verify-admin-merge-evidence.sh` " +
+      "into whichever directory this extension resolves — for a FARMED install that is " +
+      "`~/.pi/agent/scripts/gh-shim/gh`, and for an extension loaded from a CHECKOUT it is " +
+      "`<checkout>/scripts/gh-shim/gh` (the resolver is `EXTENSION_DIR/../../scripts/gh-shim`). " +
+      "`pi-bootstrap/setup.sh` farms both files (its `merge_gate_srcs` array) and " +
+      "`pi-bootstrap/cell-install.sh` fails the install when the shim is missing, so a " +
+      "rebuild that runs the installer cannot reproduce this state. Alternatively point " +
       "`AGENT_GH_SHIM_DIR` at a directory holding an EXECUTABLE `gh` shim.\n" +
+      "NOTE: this refusal also fires when the shim SOURCE exists but could not be " +
+      "materialized into `~/.pi/agent/shims` (a read-only or noexec home, a failing copy) — " +
+      "check that directory too before reinstalling.\n" +
       "To deliberately accept the degraded layer, set `AGENT_GH_SHIM=0` — that is an " +
       "operator decision, and the gate then runs its fail-closed text path as before.",
   };
@@ -8746,19 +8760,13 @@ export default function (pi: ExtensionAPI) {
               "evidenced. Run them as separate commands.",
           };
         }
-        // ⛔ THE CERTIFIER IS MISSING, SO THE CERTIFICATION IS UNKNOWN — REFUSE (#3302).
+        // ⛔ THE CERTIFIER IS MISSING, SO THE CERTIFICATION IS UNKNOWN — REFUSE (#3297).
         // AFTER the compound-merge count on purpose: `merges > 1` is pure TEXT and needs no
         // argv layer, so a compound command keeps its own, more actionable diagnosis
         // (#2349) instead of being told to reinstall a shim.
         //
-        // AND NOT FOR A COMMAND THE TEXT POSITIVELY READ AS A NON-MERGE. The gate body is
-        // entered here on `!ghShimWillEnforce` alone, so a degraded box would otherwise be
-        // told "this admin merge cannot be certified" about
-        // `gh pr create --title "fix(admin-merge): x"` — inventing a merge and sending the
-        // lane to reinstall a shim for a PR it was opening. That class keeps the evidence
-        // path's own message, exactly as before this change.
         const argvRefusal = ghArgvLayerRefusal(shimDir);
-        if (argvRefusal && !(merges === 0 && readsNonMergeGhCall(command))) {
+        if (argvRefusal) {
           console.log(
             "[review-enforcer] 🚫 Admin-merge evidence gate blocked (argv layer ABSENT) — " +
               "STATE: DEGRADED, no #984 shim resolved, so the merge cannot be certified"

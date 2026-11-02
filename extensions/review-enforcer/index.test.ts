@@ -134,12 +134,10 @@ import {
   RECORD_STATE_LIVE_UNREADABLE,
   RECORD_STATE_CARRY_ALLOWED,
   type ReviewRecord,
-  // ⛔ #3302 — the argv-layer state and the refusal the admin-merge gate now returns
+  // ⛔ #3297 — the argv-layer state and the refusal the admin-merge gate now returns
   // when that layer is not loaded. Imported from the module that OWNS them.
   ghArgvLayerState,
   ghArgvLayerRefusal,
-  resolveGhShimDir,
-  isExecutableShim,
 } from "./index.js";
 // #2665: the token is imported from the module that OWNS it, so a rename cannot leave this
 // suite green (the review of #2665 caught the hardcoded copy).
@@ -11326,7 +11324,7 @@ test("#3175 i — every path in the fetch remedy is quoted, the script included"
 
 // ── Summary ───────────────────────────────────────────
 
-// ── #3302: A DEGRADED GUARD MUST REFUSE, NOT WARN ─────────────────────────────
+// ── #3297: A DEGRADED GUARD MUST REFUSE, NOT WARN ─────────────────────────────
 //
 // THE DEFECT THIS PINS. The argv-level `gh` shim (#984) is the layer that proves the
 // merge a command carries is the ONLY one in it; the text scanner's stated residual is a
@@ -11344,7 +11342,7 @@ test("#3175 i — every path in the fetch remedy is quoted, the script included"
 // tests above); what was never pinned is the DECISION on its null result, which is what
 // this block does. The two are asserted to agree below, so a change to the resolution
 // cannot silently orphan the decision.
-test("#3302: an absent argv layer is DEGRADED — not `disabled`, not `enforcing`", () => {
+test("#3297: an absent argv layer is DEGRADED — not `disabled`, not `enforcing`", () => {
   const prev = process.env.AGENT_GH_SHIM;
   try {
     delete process.env.AGENT_GH_SHIM;
@@ -11361,7 +11359,7 @@ test("#3302: an absent argv layer is DEGRADED — not `disabled`, not `enforcing
   }
 });
 
-test("#3302: a present argv layer is ENFORCING — the state this change must not disturb", () => {
+test("#3297: a present argv layer is ENFORCING — the state this change must not disturb", () => {
   const dir = withShimInstalled(() => resolveGhShimDir());
   ok(dir !== null, "the checkout's own scripts/gh-shim resolves (the posture every other test runs in)");
   ok(isExecutableShim(dir!), "…and it is executable, so bash does not skip the PATH entry");
@@ -11371,7 +11369,7 @@ test("#3302: a present argv layer is ENFORCING — the state this change must no
   });
 });
 
-test("#3302: the admin-merge gate REFUSES when its certifier is absent (was: warn and certify)", () => {
+test("#3297: the admin-merge gate REFUSES when its certifier is absent (was: warn and certify)", () => {
   const prev = process.env.AGENT_GH_SHIM;
   try {
     delete process.env.AGENT_GH_SHIM;
@@ -11396,7 +11394,7 @@ test("#3302: the admin-merge gate REFUSES when its certifier is absent (was: war
   }
 });
 
-test("#3302: the operator's kill switch is HONOURED — `AGENT_GH_SHIM=0` does not refuse", () => {
+test("#3297: the operator's kill switch is HONOURED — `AGENT_GH_SHIM=0` does not refuse", () => {
   const prev = process.env.AGENT_GH_SHIM;
   process.env.AGENT_GH_SHIM = "0";
   try {
@@ -11409,7 +11407,40 @@ test("#3302: the operator's kill switch is HONOURED — `AGENT_GH_SHIM=0` does n
   }
 });
 
-test("#3302: resolution and decision AGREE — the datum the handler passes cannot be orphaned", () => {
+test("#3297: the AUDITED admin-merge override outranks the refusal (a recorded decision)", () => {
+  // `AGENT_ADMIN_MERGE_OVERRIDE=1` is the landing route recorded in AGENTS.md, and it is
+  // read deep inside the evidence branch. Refusing before that read would silently reverse
+  // it — and because both switches must be set BEFORE a session starts, a lane on a
+  // degraded box would have no in-session way to land at all. The override keeps its route
+  // (audited there as `admin_merge_override`); this refusal declines to CERTIFY, it does not
+  // veto an explicit operator decision.
+  const prevShim = process.env.AGENT_GH_SHIM;
+  const prevOverride = process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+  const prevEldato = process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
+  delete process.env.AGENT_GH_SHIM;
+  try {
+    // NOTE: no "override unset" CONTROL here — `_adminMergeOverride()` reads through
+    // `_getEnv`, whose test harness can already hold a value, so an unset-env control
+    // asserts the harness rather than the gate. The positive direction is what the
+    // recorded decision needs pinned: WITH the override set, the refusal stands down.
+    process.env.AGENT_ADMIN_MERGE_OVERRIDE = "1";
+    equal(ghArgvLayerRefusal(null), null,
+      "AGENT_ADMIN_MERGE_OVERRIDE=1 is NOT refused — the recorded landing route still works");
+    delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+    process.env.ELDATO_ADMIN_MERGE_OVERRIDE = "1";
+    equal(ghArgvLayerRefusal(null), null, "…and its ELDATO_ alias, like every other read of it");
+    delete process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
+  } finally {
+    if (prevShim === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prevShim;
+    if (prevOverride === undefined) delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+    else process.env.AGENT_ADMIN_MERGE_OVERRIDE = prevOverride;
+    if (prevEldato === undefined) delete process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
+    else process.env.ELDATO_ADMIN_MERGE_OVERRIDE = prevEldato;
+  }
+});
+
+test("#3297: resolution and decision AGREE — the datum the handler passes cannot be orphaned", () => {
   // The handler passes `activeGhShimDir()` into `ghArgvLayerRefusal`. That value is
   // `resolveGhShimDir()` (materialized) or null. Pin the JOIN, so a future resolver that
   // starts returning something the decision reads differently fails HERE rather than as a

@@ -48,7 +48,7 @@ export type GateEventName =
   | "reviewer_preflight" // #2148: the reviewer requirement disclosed BEFORE the work (session_start → phase:"session_start", first push → phase:"first_push", refused op → phase:"block_recovery")
   | "bridge_clear" // #561: scripts/vgate.sh clear — root-scoped bridge rewrite (type-documentation; vgate.sh appends raw JSONL)
   | "review_spawn_no_verdict" // #2665: a reviewer spawn returned no verdict (attempt, NOT a dispatch)
-  // #3302: the argv-level gh shim (#984) was NOT LOADED on this box, so the admin-merge gate
+  // #3297: the argv-level gh shim (#984) was NOT LOADED on this box, so the admin-merge gate
   // refused to certify a merge. Recorded as an EVENT, not only as console prose: row 1 of
   // docs/ops/ACTIVATION-MATRIX.md promises a report can read the degraded state without
   // anyone parsing a log line, and a name outside this union is exactly the "written outside
