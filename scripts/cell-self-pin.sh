@@ -1116,7 +1116,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
 # clock leaves every surface green. The two rules below are what make the clock one that REPEATS and fires
 # THE PASS.
 verify_timer() { # <rendered timer> [expected Unit= target]
-  local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _eff _c
+  local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _badval _c
   # Comments are stripped for the same reason `verify_unit` strips them: this template documents the
   # cadence decisions it made, and that prose legitimately names the directives the rules below ban.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
@@ -1188,14 +1188,105 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # binary on the one path that must work on a bare box. Everything this template ships
   # (`OnUnitActiveSec=<n>min`) and every ordinary cadence parses; `infinity` does NOT, because it is a
   # VALID timespan that means NEVER — a dead clock, not a repeating one.
+  # ⛔ ⛔ AND A VALUE'S SHAPE IS NOT ITS RANGE (round-13 review, P1 — the same false PASS one spelling
+  # further out, and the last one this rule can hide behind). The first version of this replay asked only
+  # "is this number+unit SHAPED?" / "does it contain `h:mm`?", so a value the manager REFUSES was still
+  # certified: MEASURED at the head this fixes, `OnCalendar=25:00`, `24:00:00`, `04:00:99`,
+  # `*-*-* 25:00:00` and `OnUnitActiveSec=1000000000000000000y` each installed rc=0, while systemd 255
+  # DISCARDS every one of them — `systemd-analyze calendar -- '24:00:00'` => "Invalid argument",
+  # `systemd-analyze timespan -- 1000000000000000000y` => "Numerical result out of range", and
+  # `TimersCalendar=`/`OnUnitActiveUSec=` ABSENT from the loaded property on a probe unit. `24:00:00` is
+  # how an operator spells MIDNIGHT, so this is not a contrived spelling. The manager's own verdict is
+  # therefore what this replay reproduces: every numeric field is RANGE-CHECKED (hour 0-23, minute and
+  # second 0-59, month 1-12, day 1-31) and a timespan must be a duration the manager can act on at all
+  # (≤ 100 years, which is already past its integer range). ⛔ WHERE IT CANNOT VERIFY A FIELD IT REFUSES
+  # RATHER THAN CERTIFY: a calendar form this replay does not model (`~`, a name it does not know) is a
+  # refusal naming what to write instead, never a green. That is the whole lesson of #3194, and it is the
+  # direction this file already chose for `--install`'s drop-ins: an unverifiable reading is not a PASS.
   _replay="$(printf '%s\n' "$timer" | awk '
-    function timespan(v) {
-      return v ~ /^[0-9]+(\.[0-9]+)?(us|ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?([[:space:]]+[0-9]+(\.[0-9]+)?(us|ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?)*$/
+    # timespan multipliers, in seconds. `ms`/`us` are fractions and are kept as such.
+    function unitmul(u) {
+      if (u == "" || u == "s" || u == "sec" || u == "secs" || u == "second" || u == "seconds") return 1
+      if (u == "ms" || u == "msec") return 0.001
+      if (u == "us" || u == "usec") return 0.000001
+      if (u == "m" || u == "min" || u == "mins" || u == "minute" || u == "minutes") return 60
+      if (u == "h" || u == "hr" || u == "hrs" || u == "hour" || u == "hours") return 3600
+      if (u == "d" || u == "day" || u == "days") return 86400
+      if (u == "w" || u == "week" || u == "weeks") return 604800
+      if (u == "M" || u == "month" || u == "months") return 2629800
+      if (u == "y" || u == "year" || u == "years") return 31557600
+      return 0
     }
-    function calendar(v) {
+    function timespan(v,   n, i, p, num, u, mul, total) {
+      if (v !~ /^[0-9]+(\.[0-9]+)?(us|msec|ms|usec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|hrs|hr|h|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?([[:space:]]+[0-9]+(\.[0-9]+)?(us|msec|ms|usec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|hrs|hr|h|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?)*$/) return 0
+      n = split(v, p, /[[:space:]]+/)
+      total = 0
+      for (i = 1; i <= n; i++) {
+        num = p[i]; sub(/[a-zA-Z]+$/, "", num)
+        u = substr(p[i], length(num) + 1)
+        mul = unitmul(u)
+        if (mul == 0) return 0
+        total += num * mul
+      }
+      # ⛔ A TIMESPAN THE MANAGER CANNOT ACT ON IS NOT A CADENCE. systemd keeps time spans in usec, so a
+      # large enough value overflows and is DISCARDED (`Numerical result out of range`). 100 years is past
+      # that boundary and past any cadence this unit could mean, so the bound refuses the overflow class
+      # WITHOUT re-implementing its own integer arithmetic — and `infinity` never reaches here (it is not
+      # number+unit shaped), which is what keeps the VALID spelling that means NEVER a refusal.
+      return total > 0 && total <= 3153600000
+    }
+    function numok(x, lo, hi,   n, p, i) {
+      if (x == "*") return 1
+      if (index(x, "/") > 0) { n = split(x, p, "/"); if (n != 2) return 0; return numok(p[1], lo, hi) && numok(p[2], lo, hi) }
+      if (index(x, "..") > 0) { n = split(x, p, /\.\./); if (n != 2) return 0; return numok(p[1], lo, hi) && numok(p[2], lo, hi) }
+      if (x !~ /^[0-9]+$/) return 0
+      return (x + 0) >= lo && (x + 0) <= hi
+    }
+    # the TIME field: H:M or H:M:S, every numeric part RANGE-CHECKED. `*`, `a/b` and `a..b` are accepted
+    # per part because systemd accepts them there and they cannot hide an out-of-range number.
+    function timeok(f,   n, p) {
+      if (index(f, ":") == 0) return 0
+      n = split(f, p, ":")
+      if (n < 2 || n > 3) return 0
+      if (!numok(p[1], 0, 23)) return 0
+      if (!numok(p[2], 0, 59)) return 0
+      if (n == 3 && !numok(p[3], 0, 59)) return 0
+      return 1
+    }
+    function wk(w) {
+      return tolower(w) ~ /^(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)$/
+    }
+    function weekday_ok(f,   n, i, a, m, b, j) {
+      if (f == "*") return 1
+      n = split(f, a, ",")
+      for (i = 1; i <= n; i++) {
+        m = split(a[i], b, /\.\./)
+        if (m > 2) return 0
+        for (j = 1; j <= m; j++) { if (b[j] == "*") continue; if (!wk(b[j])) return 0 }
+      }
+      return 1
+    }
+    function dateok(f,   n, i, p) {
+      if (f ~ /[^0-9A-Za-z*\/.~-]/) return 0
+      if (index(f, "~") > 0) return 0
+      n = split(f, p, "-")
+      if (n < 1 || n > 3) return 0
+      for (i = 1; i <= n; i++) {
+        if (i == 2) { if (!numok(p[i], 1, 12)) return 0 }
+        else if (i == 3) { if (!numok(p[i], 1, 31)) return 0 }
+        else if (!numok(p[i], 0, 99999999)) return 0
+      }
+      return 1
+    }
+    function calendar(v,   n, i, p) {
       if (v ~ /[#;]/) return 0
       if (v ~ /^(minutely|hourly|daily|weekly|monthly|quarterly|semiannually|annually|yearly)$/) return 1
-      return v ~ /[0-9][0-9]*:[0-9][0-9]/
+      # ⛔ the field order systemd documents is [weekday] [date] TIME, and the TIME field is the one that cannot be omitted.
+      n = split(v, p, /[[:space:]]+/)
+      if (n < 1 || n > 3) return 0
+      if (!timeok(p[n])) return 0
+      for (i = 1; i < n; i++) { if (!weekday_ok(p[i]) && !dateok(p[i])) return 0 }
+      return 1
     }
     { line = $0; sub(/^[[:space:]]*/, "", line) }
     line ~ /^(OnBootSec|OnStartupSec|OnActiveSec|OnUnitActiveSec|OnUnitInactiveSec|OnCalendar)[[:space:]]*=/ {
@@ -1209,7 +1300,7 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   _rep="${_replay%%|*}"
   _badval="${_replay#*|}"
   if [ "$_rep" -ne 1 ] && [ -n "$_badval" ]; then
-    bad "the rendered timer's only REPEATING trigger(s) carry a value systemd cannot parse (${_badval%; }) and no other one is valid — the manager DISCARDS such a value ('Failed to parse timer value, ignoring', systemd.timer(5)), which leaves the ONCE-per-boot OnBootSec=/OnStartupSec=/OnActiveSec= triggers alone, so the pin would run a single time and then stop for ever with every surface green. NOTE systemd.syntax(7): there are NO trailing comments, so a value followed by '#…' is an unparseable value. Give OnUnitActiveSec= a timespan ('10min') or OnCalendar= a calendar expression ('*-*-* 04:00:00', 'daily')"; return 1
+    bad "the rendered timer's only REPEATING trigger(s) carry a value systemd cannot parse or CANNOT ACT ON (${_badval%; }) and no other one is valid — the manager DISCARDS such a value ('Failed to parse timer value, ignoring' / 'Failed to parse calendar specification, ignoring', systemd.timer(5)), which leaves the ONCE-per-boot OnBootSec=/OnStartupSec=/OnActiveSec= triggers alone, so the pin would run a single time and then stop for ever with every surface green. NOTE systemd.syntax(7): there are NO trailing comments, so a value followed by '#…' is an unparseable value; and a field the manager range-checks and this rule cannot (hour >23, minute/second >59, month >12, a timespan beyond the manager's integer range) is REFUSED rather than certified. Give OnUnitActiveSec= a plain timespan ('10min') or OnCalendar= a calendar expression whose every field is in range ('*-*-* 04:00:00', 'daily')"; return 1
   fi
   [ "$_rep" -eq 1 ] || { bad "the rendered timer's EFFECTIVE trigger list declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, and an EMPTY OnUnitActiveSec=/OnCalendar= is a LIST RESET that discards every trigger above it, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare a non-empty OnUnitActiveSec= or OnCalendar= and put no empty assignment after it"; return 1; }
   return 0

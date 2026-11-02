@@ -640,6 +640,26 @@ refuses_timer 'an OnCalendar= that is NOT a calendar expression (10min)' \
   "$(doctor_timer unit-badcal 's|^OnUnitActiveSec=.*$|OnCalendar=10min|')" "$T/tu11" 'cannot parse'
 refuses_timer 'a repeating trigger of exactly infinity (a VALID timespan that means NEVER)' \
   "$(doctor_timer unit-inf 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=infinity|')" "$T/tu12" 'cannot parse'
+# ⛔ AND A VALUE'S SHAPE IS NOT ITS RANGE (round-13 review, P1 — the last spelling this rule could hide
+# behind). The reply above certified `number+unit SHAPED` and `contains h:mm`, which is not what the manager
+# grades: systemd RANGE-CHECKS every field and DISCARDS the value otherwise. MEASURED at the head these
+# legs were added for: each of the five spellings below installed rc=0, while systemd 255 answered
+# `systemd-analyze calendar -- '24:00:00'` => "Invalid argument" and left `TimersCalendar=` ABSENT from the
+# loaded property of a probe unit. `24:00:00` is how an operator spells MIDNIGHT, so this is not a
+# contrived spelling; and a timespan past the manager's usec range is `Numerical result out of range`.
+# Each leg must FAIL on the pre-fix reply (mutation-measured: 5 legs red with the range checks removed).
+refuses_timer 'an OnCalendar= hour OUT OF RANGE (25:00)' \
+  "$(doctor_timer cal-h25 's|^OnUnitActiveSec=.*$|OnCalendar=25:00|')" "$T/tu13" 'cannot parse'
+refuses_timer 'an OnCalendar= spelled 24:00:00 (midnight, which systemd REFUSES)' \
+  "$(doctor_timer cal-midnight 's|^OnUnitActiveSec=.*$|OnCalendar=24:00:00|')" "$T/tu14" 'cannot parse'
+refuses_timer 'an OnCalendar= second OUT OF RANGE (04:00:99)' \
+  "$(doctor_timer cal-s99 's|^OnUnitActiveSec=.*$|OnCalendar=04:00:99|')" "$T/tu15" 'cannot parse'
+refuses_timer 'an OnCalendar= whose TIME field is out of range inside a date (\*-\*-\* 25:00:00)' \
+  "$(doctor_timer cal-dt25 's|^OnUnitActiveSec=.*$|OnCalendar=*-*-* 25:00:00|')" "$T/tu16" 'cannot parse'
+refuses_timer 'an OnCalendar= whose DATE field is out of range (2026-13-45)' \
+  "$(doctor_timer cal-month13 's|^OnUnitActiveSec=.*$|OnCalendar=2026-13-45 04:00:00|')" "$T/tu17" 'cannot parse'
+refuses_timer 'a timespan PAST the manager integer range (1000000000000000000y)' \
+  "$(doctor_timer unit-overflow 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=1000000000000000000y|')" "$T/tu18" 'cannot parse'
 # ⛔ THE POSITIVE CONTROL, because "refuse every value" would satisfy all four legs above. A real calendar
 # expression and the shortcut word must INSTALL: the rule refuses what systemd DISCARDS, never what it can
 # read — and an over-block here would close the one edit an operator is most likely to make.
@@ -649,6 +669,17 @@ u_cal="$T/units-cal"; out="$(install_doctored "$(doctor_timer cal-ok 's|^OnUnitA
 u_daily="$T/units-daily"; out="$(install_doctored "$(doctor_timer cal-daily 's|^OnUnitActiveSec=.*$|OnCalendar=daily|')" "$u_daily")"; rc=$?
 [ "$rc" -eq 0 ] && [ -f "$u_daily/cell-self-pin.timer" ] && ok "…and the OnCalendar= shortcut word 'daily' installs" \
   || bad "refused OnCalendar=daily (rc=$rc): $out"
+# ⛔ TWO MORE POSITIVE CONTROLS, because a rule that was TIGHTENED by range is one edit away from
+# over-blocking: the range checks must refuse what the manager DISCARDS and nothing else. A weekday range
+# and a multi-unit timespan are both ordinary cadences systemd accepts (`systemd-analyze calendar --
+# 'Mon..Fri 04:00:00'`, `systemd-analyze timespan -- '5h 30min'`), so a refusal here is a false RED on a
+# migration that is correct.
+u_wk="$T/units-weekday"; out="$(install_doctored "$(doctor_timer cal-weekday 's|^OnUnitActiveSec=.*$|OnCalendar=Mon..Fri 04:00:00|')" "$u_wk")"; rc=$?
+[ "$rc" -eq 0 ] && [ -f "$u_wk/cell-self-pin.timer" ] && ok "…and a weekday RANGE (OnCalendar=Mon..Fri 04:00:00) still installs — the range rule refuses out-of-range fields, not calendar syntax" \
+  || bad "refused a valid weekday range OnCalendar=Mon..Fri 04:00:00 (rc=$rc): $out"
+u_multi="$T/units-multiunit"; out="$(install_doctored "$(doctor_timer unit-multiunit 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=5h 30min|')" "$u_multi")"; rc=$?
+[ "$rc" -eq 0 ] && [ -f "$u_multi/cell-self-pin.timer" ] && ok "…and a multi-unit timespan (OnUnitActiveSec=5h 30min) installs — the magnitude bound is not a bound on ordinary values" \
+  || bad "refused a valid multi-unit timespan OnUnitActiveSec=5h 30min (rc=$rc): $out"
 
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
