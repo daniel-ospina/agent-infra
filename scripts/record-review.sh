@@ -1081,7 +1081,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_from_sha="" sfr="" range_ok=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1378,7 +1378,15 @@ $m"
         return 1
       fi
     fi
-    anchor="$to"
+    # ⛔ THE ANCHOR IS A, NOT B. A cover attests the REVIEWED head, and a merge-only
+    # range adds no lane-authored content (that is what `--not $base_sha` just
+    # proved), so the merge that created B is the thing being covered, not a thing
+    # needing review. Anchoring on B made a named cover UNREACHABLE: in the ordering
+    # this feature exists for — verdict at A, THEN the base merge creates B — B's
+    # commit date is necessarily later than the verdict, so `created >= B` could never
+    # hold and the remedy printed below the refusal (`+comment:<id>`) could never
+    # work. Measured by review; no vector covered merge-only WITH a cover.
+    anchor="$from"
   fi
   if [ -n "$cover" ]; then
     # The covering artifact is held to the SAME gate as any other evidence
@@ -1386,7 +1394,11 @@ $m"
     # veto) — plus a range-specific anchor: it must POSTDATE the newest authored
     # commit in the range, which is the checkable meaning of "covers the range".
     if ! verify_review_evidence "$cover" "$anchor"; then
-      echo "   delta: the covering artifact '$cover' could not be verified against the range (reason above) — a delta over authored content needs a verdict that postdates ${anchor:0:12}…, the newest authored commit in the range." >&2
+      if [ "$DELTA_KIND" = "authored" ]; then
+        echo "   delta: the covering artifact '$cover' could not be verified against the range (reason above) — a delta over authored content needs a verdict that postdates ${anchor:0:12}…, the newest authored commit in the range." >&2
+      else
+        echo "   delta: the covering artifact '$cover' could not be verified against the range (reason above) — a merge-only delta needs a verdict that covered ${anchor:0:12}…, the reviewed head, and this one predates it." >&2
+      fi
       return 1
     fi
     # ⛔ (10a) THE RANGE MUST BE THE REVIEWER'S CLAIM, NOT AN INFERENCE FROM DATES.
@@ -1399,10 +1411,42 @@ $m"
     # (delta rc 0, plain refused), which made the authored arm either redundant or
     # unsound depending on dates. Dates cannot settle it: the artifact must SAY it
     # covered this range. Any of A..B, or B alone, in 40-hex or 12-char form.
+    # ⛔ A BODY THAT STATES A RANGE MUST STATE THIS ONE. Falling back to a bare-B
+    # needle whenever the body merely CONTAINS B lets an artifact whose own text says
+    # "reviewed delta:X..B only" satisfy the arm for the wider A..B — the record would
+    # then assert a range the very artifact contradicts, and this feature tells
+    # reviewers to quote `delta:X..Y` in their comments, so such bodies are common.
+    # Containment, not equality: a verdict may quote a range that starts at an ANCESTOR
+    # of A (it reviewed more than this delta needs), never one that starts below it.
     body_claim=0
-    for _needle in "$from..$to" "${from:0:12}..${to:0:12}" "$to" "${to:0:12}"; do
-      case "$EVIDENCE_BODY" in *"$_needle"*) body_claim=1; break ;; esac
-    done
+    stated_from=""; stated_to=""
+    if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})\.\.([0-9a-f]{12,40}) ]]; then
+      stated_from="${BASH_REMATCH[1]}"; stated_to="${BASH_REMATCH[2]}"
+    fi
+    if [ -n "$stated_to" ]; then
+      range_ok=0
+      case "$to" in
+        "$stated_to"*) range_ok=1 ;;
+      esac
+      if [ "$range_ok" = 1 ]; then
+        range_ok=0
+        stated_from_sha="$(delta_git "$root" rev-parse --verify "${stated_from}^{commit}" 2>/dev/null || true)"
+        if [ -n "$stated_from_sha" ]; then
+          sfr=0
+          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?
+          [ "$sfr" = 0 ] && range_ok=1
+        fi
+      fi
+      [ "$range_ok" = 1 ] && body_claim=1
+      if [ "$range_ok" -ne 1 ]; then
+        echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}..${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts." >&2
+        return 1
+      fi
+    else
+      for _needle in "$to" "${to:0:12}"; do
+        case "$EVIDENCE_BODY" in *"$_needle"*) body_claim=1; break ;; esac
+      done
+    fi
     if [ "$body_claim" -ne 1 ]; then
       echo "   delta: the covering artifact '$cover' does not NAME the range ${from:0:12}…..${to:0:12}… (it names neither the range nor ${to:0:12}…) — and a verdict that does not state which range it covered cannot be extended over authored commits by DATE alone, because a commit's date records when it was CREATED: an old-dated branch merged in after the review slips through an anchor built only from dates." >&2
       echo "   → if the reviewer did cover this range, quote it in the artifact (e.g. delta:${from:0:12}..${to:0:12}); or run a fresh review at ${to:0:12}… and record it with plain --evidence comment:<id>." >&2

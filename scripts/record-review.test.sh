@@ -5567,6 +5567,33 @@ assert_eq "$RECORD_RC" "3" "20h13 a modify/delete conflict resolved by hand is R
 [ -f "$(Q2 $EH15)" ] && bad "20h13 no record was written at the conflicted merge" ||
     ok "20h13 no record was written at the conflicted merge"
 
+# 20h14 MERGE-ONLY + A NAMED COVER IS REACHABLE. In the ordering this feature
+#       exists for — verdict at A, THEN the base merge creates B — B's commit date is
+#       necessarily later than the verdict, so anchoring the merge-only cover on B
+#       made the printed remedy (`+comment:<id>`) impossible to satisfy. The anchor is
+#       A, so a cover posted after A records.
+EH16=425162; rm -f "$(Q2 $EH16)"
+printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
+run_record_delta $EH16 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516301" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found."
+assert_eq "$RECORD_RC" "0" "20h14 merge-only + a cover posted AFTER A records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EH16)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h14 the range stays merge-only"
+EH17=425164; rm -f "$(Q2 $EH17)"
+run_record_delta $EH17 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516501" \
+    STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found."
+assert_eq "$RECORD_RC" "3" "20h14 a cover PREDATING A is still refused (rc 3)"
+
+# 20h15 A BODY THAT STATES A DIFFERENT RANGE. Quoting a NARROWER range (X..B, X a
+#       descendant of A) must not satisfy the claim for the wider A..B — the record
+#       would assert a range its own artifact contradicts.
+EH18=425166; rm -f "$(Q2 $EH18)"
+run_record_delta $EH18 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h15 a body stating a NARROWER range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal names the contradiction"
+[ -f "$(Q2 $EH18)" ] && bad "20h15 no record was written" || ok "20h15 no record was written"
+
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -5705,6 +5732,10 @@ mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "de
 #       never says which range it reviewed — the date-only inference the arm replaced.
 MUT="$(mk_mutant rangeclaim '    if [ "$body_claim" -ne 1 ]; then' '    if false; then')"
 mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
+# M14 — THE RANGE CONTAINMENT. Deleting it lets a body that declares a NARROWER range
+#       satisfy the claim for a wider one (20h15).
+MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
+mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
 # M8 — the TIER arm. Widening the premise back to the non-review tiers must let a
 #      clean-micro prior record mint `clean`. Inline, not via mut_check: mut_check
 #      clears the record and this vector's premise IS a planted record.
