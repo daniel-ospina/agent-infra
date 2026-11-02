@@ -2659,16 +2659,20 @@ mp_recent_land() { # [<state-dir>]
   # only those. A land older than that reads as "no recent land" — which is exactly the gate's own
   # question (a land outside the window releases anyway), and `[cap]`'s `last_land=` prints `?`.
   local d="${1:-$O/state}" f m newest="" bound list _b
-  # ⛔ SELF-CONTAINED, NOT ONLY LOAD-COERCED (review P2, 2026-11-01). The `10#` below ERRORS on a
+  # ⛔ SELF-CONTAINED, AND NOT VIA `is_limit` (review P2, 2026-11-01). The `10#` below ERRORS on a
   # non-numeric knob, and an errored assignment leaves `bound` unset — `find -mmin -""` then fails and
   # this function prints NOTHING. Since #2929 an empty answer is a DEFINITE escalation (and a dispatched
   # worker), so a typo would have become a stall report about a measurement that never happened. The
-  # knob IS already coerced at load (see the `is_limit` line with the other limits), but this block is
-  # `eval`'d STANDALONE by `test-gates.sh`'s drain legs, which never reach that line: normalising here
-  # keeps the function honest about its own preconditions instead of relying on a caller's earlier line.
+  # coercion is spelled out in `case` form for the reason `floor_norm` documents in this same file: the
+  # test harnesses extract these functions STANDALONE (`test-gates.sh`'s `drain_helpers.sh` and
+  # `pr_all.sh` carry `is_num` and NOT `is_limit`), so a call to `is_limit` here is 127 there — which
+  # would have made the guard a silent no-op in exactly the context it was added for, and it disagreed
+  # with the drain block's own normalisation for `0`. `0` is refused as well: `find -mmin -0` matches
+  # nothing, i.e. a permanently empty answer, i.e. a permanent false stall.
   _b="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
-  is_limit "${_b:-}" && [ "$_b" -gt 0 ] || _b=180
-  bound=$(( 10#$_b * 2 ))
+  case "$_b" in ''|*[!0-9]*) _b=180 ;; *) _b=$(( 10#$_b )) ;; esac
+  [ "$_b" -ge 1 ] || _b=180
+  bound=$(( _b * 2 ))
   list="$(find "$d" -maxdepth 1 -name 'merged-*.done' -mmin -"$bound" 2>/dev/null || true)"
   # A here-string, not `find … | while`: under `pipefail` the reader can exit first and make the
   # pipeline read FAILED (#841's class), and the process substitution would lose `newest` to a
@@ -5969,6 +5973,14 @@ PY
     # 2026-10-27). Initialised here — at the top of the block, so every pass resets it, which is
     # also the reset the drain-alive path needs — and set to 1 only inside the stall arm.
     _stalled=0
+    # ⛔ AN UNSEARCHABLE STATE DIR IS NOT A MEASURED ABSENCE (review P2). `find` on a missing or
+    # unreadable `state/` returns the SAME empty answer as "nothing landed", so the line below would
+    # report a fact about this box's markers that it never read. The VERDICT does not change: #2929
+    # rules that an empty answer IS the stall, and its `OVERRIDES:` records that after a state loss the
+    # markers' absence is unmeasurable in BOTH directions, so silence stays the wrong side. Only the
+    # CLAIM is narrowed to what was actually taken.
+    _lmread=0
+    [ -d "$O/state" ] && [ -r "$O/state" ] && _lmread=1
     _lm="$(mp_recent_land 2>/dev/null || true)"
     if is_num "${_lm:-}"; then
       _lmsyn=0
@@ -6078,7 +6090,11 @@ PY
         # says which it is, in the same place the age is printed (#2929's own reading: an empty answer
         # means no recent land, "which is exactly the gate's own question").
         _lmtail=""
-        [ "${_lmsyn:-0}" = "1" ] && _lmtail=" (no land marker inside the ${_wbound}m window at all — the empty answer to 'has this box landed' IS the stall, so the age is AT LEAST that window's own bound and the real stall may be older)"
+        if [ "${_lmsyn:-0}" = "1" ] && [ "${_lmread:-1}" = "0" ]; then
+          _lmtail=" (state/ could not be searched, so whether a land marker exists is UNMEASURED — the escalation is still taken (#2929), and the age is only the window's own lower bound, not a last-land reading)"
+        elif [ "${_lmsyn:-0}" = "1" ]; then
+          _lmtail=" (no land marker inside the ${_wbound}m window at all — the empty answer to 'has this box landed' IS the stall, so the age is AT LEAST that window's own bound and the real stall may be older)"
+        fi
         if [ "${_spk:-}" = "0" ]; then
           echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m${_lmtail}, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
         else

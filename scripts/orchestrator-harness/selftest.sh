@@ -2493,7 +2493,7 @@ done
 [ "$_lax" = "0" ] && rc=0 || rc=1
 ck "every is_num() copy in the tree (including selftest's) rejects leading zeros and accepts 0" $rc
 [ "$_ndefs" = "5" ] && rc=0 || { rc=1; echo "      is_num() is defined in $_ndefs of the 5 shipped files that need it"; }
-ck "the four SHIPPED files each still define is_num() (a silently dropped copy is caught)" $rc
+ck "the five SHIPPED files each still define is_num() (a silently dropped copy is caught)" $rc
 grep -q -- "--argv" "$LOOP" && rc=0 || rc=1
 ck "worker launches pass args via --argv, not string interpolation" $rc
 grep -qE "'\\\$OR' \\\$PR '\\\$BR'" "$LOOP" && rc=1 || rc=0

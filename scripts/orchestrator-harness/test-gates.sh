@@ -1687,6 +1687,24 @@ PYEOF
   else
     echo "  ❌ a synthesised age was not recorded as such: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
   fi
+  # ⛔ AN UNSEARCHABLE STATE DIR IS NOT A MEASURED ABSENCE (review P2, #3181). `find` on a missing or
+  # unreadable `state/` returns the SAME empty answer as "nothing landed", so the line would report a
+  # fact about this box's markers that it never read. Driven by removing the dir, so `find` cannot run.
+  # The ESCALATION must still be taken (#2929's ruling: an absence is unmeasurable in both directions
+  # after a state loss, so silence is the wrong side) — only the CLAIM narrows.
+  rm -f "$DO/state/drain-stall"
+  rmdir "$DO/state" 2>/dev/null || true
+  _out="$(_drain '' 180 2)"
+  mkdir -p "$DO/state"
+  case "$_out" in
+    *"no land marker inside"*) echo "  ❌ an UNSEARCHABLE state dir was reported as a MEASURED absence: $_out"; FAIL=$((FAIL+1)) ;;
+    *"could not be searched"*) echo "  ok an UNSEARCHABLE state dir says the absence was not measured, instead of asserting one"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unsearchable state dir produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *"DRAIN STALLED"*) echo "  ok …and the escalation is STILL taken (an unmeasurable absence must not silence it, #2929)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unsearchable state dir SILENCED the escalation: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
   _out="$(_drain 200 180 4)"
   case "$_out" in
     *"DRAIN STALLED"*"spawned 4 worker(s)"*) echo "  ok a stall that DID spawn workers names them (a LAND problem, not an idle one)"; PASS=$((PASS+1)) ;;
@@ -1751,6 +1769,27 @@ PYEOF
     case "$_g" in
       *"drain=DEADLOCK(passes=3"*"no_land=240m"*"spawns=0"*) echo "  ok the cycle status line carries the escalation (passes, land age, spawns)"; PASS=$((PASS+1)) ;;
       *) echo "  ❌ the status token lost its evidence: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ A SYNTHESISED AGE MUST NOT RENDER AS A MEASUREMENT (review P2, #3181). `agesrc=synth` is the
+    # ONLY thing that makes the token print `>=`, and until this leg nothing drove that rendering: an
+    # inverted or misspelled guard in `drain_stall_token` left the whole suite green while the status
+    # line — the one line every reader parses — presented a window's lower BOUND as "when this box last
+    # landed". That is the exact claim `agesrc` exists to prevent. A record with NO `agesrc` field (the
+    # leg above, and every marker written before this change) must keep rendering measured.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=synth\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=>=360m"*) echo "  ok a SYNTHESISED age prints as a bound (no_land=>=360m)"; PASS=$((PASS+1)) ;;
+      *"no_land=360m"*) echo "  ❌ a synthesised age was printed as a MEASUREMENT: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ❌ the token lost the synthesised age: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # …and a MEASURED age keeps the exact `no_land=<age>m` shape every existing reader parses.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=measured\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=>="*) echo "  ❌ a MEASURED age was printed as a bound: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"no_land=360m"*) echo "  ok a MEASURED age keeps the exact no_land=<age>m shape (no '>=')"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the token lost the measured age: '$_g'"; FAIL=$((FAIL+1)) ;;
     esac
     # ⛔ THE LABEL IS THE MARKER'S OWN MEASUREMENT, NOT ITS EXISTENCE (review c-1, P1). BOTH stall arms
     # write this file: the DEADLOCK arm records `spawns=0`, and the STALLED arm records the workers it
