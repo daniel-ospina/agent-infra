@@ -854,6 +854,12 @@ if [ "$SURFACE" -eq 1 ]; then
             # …and the PREFIX is closed too, so a shell-name argument after the command string cannot
             # re-arm it (review round 12).
             _pfx=0
+            # ⛔ AND `_seen` GOES WITH THEM (review round 20, P2). This is the THIRD prefix-close site
+            # and the only one round 19 missed, so a second `-c` still believed an interpreter was the
+            # current command: `bash -c x -c <gone>/orch-loop.sh` nominated the trailing path and
+            # fabricated `executes:` — the same class, one spelling along. Everything after the FIRST
+            # command string is `$0`/arguments; no later `-c` belongs to the shell.
+            _seen=0
             fi ;;
         esac
         # ⛔ `_interp` DESCRIBES THE COMMAND PREFIX, NOT "AN INTERPRETER APPEARED SOMEWHERE EARLIER"

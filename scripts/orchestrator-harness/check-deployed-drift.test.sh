@@ -646,7 +646,7 @@ ck "10a-3e: 'bash -o noexec <abs>' is a MENTION (the shell forbids execution)" \
 # ⛔ `-c` IS OWNED BY THE SHELL THAT IS THE CURRENT COMMAND, NOT BY ANY EARLIER ONE (review round 19,
 # P2): `_seen` was never cleared, so `bash other.sh -c <abs>` and `busybox grep -c <abs>` nominated a
 # path that is a `$1`/grep operand — a fabricated `executes:` that also masks a real `behind:`.
-for _x in 'bash other.sh -c' 'busybox grep -c'; do
+for _x in 'bash other.sh -c' 'busybox grep -c' 'bash -c x -c' 'bash -lc x -c'; do
   printf '4267 %s %s/orch-loop.sh\n' "$_x" "$GONE" > "$TMP/ps-staleseem"
   surf "$TMP/ps-staleseem"
   ck "10a-3e: '$_x <abs>/orch-loop.sh' is a MENTION (a closed prefix owns no -c string)" \
