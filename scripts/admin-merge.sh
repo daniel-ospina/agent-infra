@@ -6224,9 +6224,10 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
 #             can only fire EARLY. The run's own green-derived bound is therefore
 #             the ONLY honest discriminator; the message names the shard, its
 #             green n and its green max.
-#   return 2  CEILING — still RUNNING at an EXPLICIT `--rerun-timeout`. An
-#             operator's cap is not a claim about the run, so this stays distinct
-#             from STALLED; it is still NOT a failure of the run.
+#   return 2  CEILING — still RUNNING at an EXPLICIT `--rerun-timeout` OR at the
+#             RE-RUN PHASE BUDGET's clamp (`RERUN_TIMEOUT_CLAMPED`). Either way an
+#             operator POLICY cap is not a claim about the run, so this stays
+#             distinct from STALLED; it is still NOT a failure of the run.
 #   return 3  UNOBSERVABLE — gh could not be read for the whole bound, so the
 #             run's state was NEVER OBSERVED. Deliberately distinct from STALLED
 #             (1): "exceeded its bound" is a claim about a run we watched; an
@@ -6304,8 +6305,6 @@ wait_for_run() {
     RERUN_WAIT_STATE="unobservable"
     return 3
   fi
-  # PROVENANCE, not timing, decides the verdict: an explicit cap is a CEILING;
-  # the derived per-shard bound is a STALL.
   # PROVENANCE, not timing, decides the verdict — and the RE-RUN PHASE BUDGET is
   # a provenance too: when the remaining budget (not the derivation) bounded this
   # wait, expiring it is an operator POLICY ceiling, never a claim that the run
@@ -8877,6 +8876,14 @@ main() {
         refuse_rerun_budget "rerun-attempts" "$((rerun_attempts - 1))" "$rerun_elapsed"
         exit 1
       fi
+      # NOT ARMED BY ANY FIXTURE, DELIBERATELY. Every deterministic path that would
+      # reach this exit is caught EARLIER by the clamp at the wait below (which
+      # refuses with the same named message), so this is defence-in-depth for the
+      # one case a fixture cannot force deterministically: a wait that completes
+      # inside its remaining margin while the iteration's own overhead
+      # (`derive_rerun_timeout`, `gh run rerun`, `describe_run_observation`) pushes
+      # the real clock past the budget. Removing it would leave that divergence
+      # unbounded — the exact class this budget exists to close.
       if [ "$rerun_elapsed" -ge "$RERUN_BUDGET" ]; then
         say_err "admin-merge: the re-run phase has spent its whole budget; run $run_id (and any after it)"
         say_err "   was NOT re-run."
@@ -8938,9 +8945,9 @@ main() {
       # diagnoses with opposite remedies, and relabelling them as "budget" would
       # hide the only signal that says "repair gh" or "the re-run never started".
       # The rc=1 and rc=4 arms below interpolate `${RERUN_TIMEOUT_SOURCE}`, and so does the
-  # rc=3 arm above, so the `; CLAMPED …` disclosure survives on every one of them
-  # without this arm.
-  if [ "$wait_rc" -eq 2 ] && [ "${RERUN_TIMEOUT_CLAMPED:-0}" -eq 1 ]; then
+      # The rc=1, rc=3 and rc=4 arms BELOW each interpolate `${RERUN_TIMEOUT_SOURCE}`,
+      # so the `; CLAMPED …` disclosure survives on all of them without this arm.
+      if [ "$wait_rc" -eq 2 ] && [ "${RERUN_TIMEOUT_CLAMPED:-0}" -eq 1 ]; then
         refuse_rerun_budget "rerun-budget" "$rerun_attempts" "$((SECONDS - rerun_started))"
         exit 1
       fi

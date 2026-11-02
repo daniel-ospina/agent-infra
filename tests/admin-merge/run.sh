@@ -15312,7 +15312,9 @@ log_failed 'tests/test_budget.py::test_never_concludes' > "$SCEN/log-921"
 lane_fail main5252 961 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-961"
 printf 'in_progress\n' > "$SCEN/status-921"
-run_admin 42 --main-runs 1 --rerun-budget 2 >/dev/null 2>&1
+# SUITE_NOSLEEP=1 — see the note above: this arm waits for an EXPIRY, so without the
+# stub a clamp regression makes it sleep the DERIVED bound (>=1200s) instead of failing.
+SUITE_NOSLEEP=1 run_admin 42 --main-runs 1 --rerun-budget 2 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(o1) a re-run that outlives the budget BLOCKS (exit $rc)" \
                 || { fail "(o1) the rail exited 0 after the budget expired — the budget clears a red"; sed 's/^/      /' "$TMP/err" | tail -12; }
@@ -15413,7 +15415,8 @@ log_failed 'tests/test_unobs.py::test_x' > "$SCEN/log-951"
 lane_fail main5656 981 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-981"
 : > "$SCEN/unreadable-951"
-run_admin 42 --main-runs 1 --rerun-budget 3 >/dev/null 2>&1
+# SUITE_NOSLEEP=1 for the same reason as (o1): this arm also waits for an expiry.
+SUITE_NOSLEEP=1 run_admin 42 --main-runs 1 --rerun-budget 3 >/dev/null 2>&1
 grep -q 'UNOBSERVABLE' "$TMP/err" \
   && pass "(o5) a clamped wait that never read the run keeps its UNOBSERVABLE verdict" \
   || { fail "(o5) the UNOBSERVABLE verdict was swallowed by the budget arm"; grep -n 'REFUSED\\|UNOBSERVABLE' "$TMP/err" | sed 's/^/      /' | head -6; }
@@ -15449,6 +15452,10 @@ lane_fail main5757 991 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-991"
 printf 'in_progress\ncompleted\n' > "$SCEN/status-961"
 printf 'in_progress\ncompleted\n' > "$SCEN/status-962"
+# ⛔ NO SUITE_NOSLEEP HERE, DELIBERATELY (unlike (o1)/(o5)). This arm discriminates the
+# buggy accumulation from the fixed restore, and at `elapsed=0` both compute the SAME
+# bound (600), so a stubbed clock would make it vacuous. It needs >= 1 real second
+# between the two iterations; that second is the measurement, not overhead.
 run_admin 42 --main-runs 1 --rerun-timeout 3600 --rerun-budget 600 >/dev/null 2>&1
 if grep -qE 'CLAMPED.*CLAMPED' "$TMP/err"; then
   fail "(o7) the bound's source accumulates a CLAMPED segment per iteration (a stale bound is reported)"
