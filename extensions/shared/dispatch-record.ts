@@ -96,11 +96,21 @@ export interface DispatchOutcomeRow {
    * renderer had been corrected before; this aligns the row with it. */
   dirtyPaths: string[] | null;
   /** Why the attempt ended: "hard-cap" | "cut" | "backstop" | "failed" |
-   * the heartbeat `decision.reason`. */
+   * "orphan-killed" | the heartbeat `decision.reason`.
+   *
+   * `"orphan-killed"` is the ONE reason written by the CHILD rather than the
+   * parent: the #385 orphan watchdog fired because the parent disappeared, so
+   * no parent-side settle can ever happen and this row is the last word for
+   * the attempt. It is never `"done"` — a killed dispatch must not read as a
+   * completed one. */
   reason: string;
   toolAgeMaxMs: number | null;
   toolsInFlight: number | null;
-  everSawTool: boolean;
+  /** Did the child ever run a tool — `null` when the settle cannot know: the
+   * #385 orphan watchdog records a kill from inside a process that may have
+   * been mid-tool for an hour, and `false` there would be a confident claim it
+   * never touched one. Same rule as `dirty` (a failed probe is not `false`). */
+  everSawTool: boolean | null;
   /** Best-known locator for the child's transcript: the session `.jsonl` when
    * it already exists, else the child's session DIRECTORY (a zero-output kill
    * can beat the child's first write). `null` on the `--no-session` degrade. */
@@ -111,6 +121,17 @@ export interface DispatchOutcomeRow {
   /** Dispatch class — `"task"` (default) or a caller-declared reviewer/eval
    * class via `TASK_DISPATCH_CLASS`. */
   dispatchClass: string;
+  /** The pid whose DISAPPEARANCE caused this settle — the parent the child was
+   * orphaned from (`null` on every parent-side row, which settles itself and
+   * has no disappearance to attribute). */
+  parentPid: number | null;
+  /** Pids this settle ENUMERATED for the kill: the DIRECT descendant roots and,
+   * when this process leads its own group, the rest of that group. `[]` on
+   * parent-side rows (they record no kill). The kill recurses below these roots
+   * (`treeKill` walks children-first), so a depth-≥2 descendant is signalled
+   * without being NAMED here — the field is "what we enumerated", never a
+   * complete death list. Read it as attribution, not as a body count. */
+  killedPids: number[];
 }
 
 /** Everything the row needs that is NOT derivable inside the writer. */
@@ -131,10 +152,15 @@ export interface DispatchOutcomeInput {
   reason: string;
   toolAgeMaxMs: number | null;
   toolsInFlight: number | null;
-  everSawTool: boolean;
+  everSawTool: boolean | null;
   transcriptPath: string | null;
   exitCode: number | null;
   dispatchClass: string;
+  /** Optional: only a CHILD-side settle (the #385 orphan watchdog) knows the
+   * parent pid it was orphaned from. Absent → `null`. */
+  parentPid?: number | null;
+  /** Optional: only a CHILD-side settle signals a descendant tree. Absent → `[]`. */
+  killedPids?: number[];
 }
 
 /** Result of a write attempt. `skipped` means the gate was explicitly off —
@@ -266,6 +292,8 @@ export function buildDispatchOutcomeRow(
     transcriptPath: input.transcriptPath,
     exitCode: input.exitCode,
     dispatchClass: input.dispatchClass,
+    parentPid: input.parentPid ?? null,
+    killedPids: input.killedPids ?? [],
   };
 }
 

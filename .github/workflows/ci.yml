@@ -772,6 +772,22 @@ jobs:
         # BYTE-IDENTICAL — the guard must never rewrite a good request.
         run: npx tsx extensions/clamp-output-floor.test.ts
 
+      - name: Orphan-watchdog settle-record suite (#385 — the PR-lane half)
+        # The #385 watchdog killed its descendant tree and exited 137 with only a
+        # free-text line, so "killed by our watchdog", "thought it was done" and
+        # "never started" were indistinguishable — three lanes vanished and only
+        # a postmortem explained it. This suite pins the fix: the durable
+        # `reason: "orphan-killed"` row is written BEFORE any signal (order
+        # assert: record → kill → exit 137), a record failure is diagnosed and
+        # never blocks the kill, and a real parent+grandchild fixture is SIGKILLed
+        # to prove the row lands. Zero-dep by construction: the extension imports
+        # the pi package as a TYPE only (erased by tsx) and node stdlib otherwise,
+        # so it runs in THIS job (the job that performs no `npm ci`); it is
+        # hermetic (PI_CODING_AGENT_DIR + ORPHAN_WATCHDOG_LOG both point into a
+        # tmpdir), so it never touches the real ~/.pi ledger or forensic log.
+        # The post-merge leg in ci-main.yml is KEPT as the backstop.
+        run: npx tsx extensions/task-heartbeat.orphan.test.ts
+
       - name: Secret-echo-guard suite (#5109 — the transcript-leak control)
         # #5109 — a live API key was persisted in plaintext into session
         # transcripts (60/576 files, still growing) because every reading tool
