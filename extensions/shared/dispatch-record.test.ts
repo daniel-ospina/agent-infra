@@ -220,6 +220,11 @@ const ROW_KEYS = [
 	"transcriptPath",
 	"exitCode",
 	"dispatchClass",
+	// Child-side settles (the #385 orphan watchdog) record WHO they killed and
+	// WHICH parent's disappearance caused it; parent-side rows carry the
+	// contract's unknown values (null / []).
+	"parentPid",
+	"killedPids",
 ];
 
 function assertRowContract(row: any, label: string) {
@@ -348,6 +353,8 @@ test("row contract: buildDispatchOutcomeRow emits every key; renderRecordField n
 		dispatchClass: "task",
 	});
 	assertRowContract(row, "built row");
+	equal(row.parentPid, null, "a parent-side row has no disappearance to attribute");
+	equal(row.killedPids.length, 0, "a parent-side row records no kill");
 	equal(renderRecordField({ ok: true, path: "/a/b.jsonl" }), "/a/b.jsonl");
 	const failedField = renderRecordField({ ok: false, path: "/a/b.jsonl", error: "EACCES" });
 	equal(failedField, "failed: EACCES", "a failed write renders `failed: <err>`, never the path");
