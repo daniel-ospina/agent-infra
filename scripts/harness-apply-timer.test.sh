@@ -609,6 +609,7 @@ assert_contains "$OUT" "cannot-verify" "T21 and it says the comparison is not fr
 REC21="$(cat "$T/t21/state/harness-apply.status" 2>/dev/null || true)"
 assert_contains "$REC21" "fetch=failed" "T21 the record carries the fetch state"
 assert_contains "$REC21" "action=cannot-verify-fetch" "T21 and the action names it"
+assert_contains "$REC21" "remedy=restore the fetch" "T21 and the REMEDY survives the record (review round 3, finding 5: it was written, never asserted)"
 OUT="$(run_pass "$T/t21" --print-status 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T21 the readiness gate refuses that record (cannot-verify is not fresh)"
 # The OTHER way to be un-fresh: no fetch was attempted at all (the documented HARNESS_FETCH=0 seam). Same

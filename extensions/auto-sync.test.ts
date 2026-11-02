@@ -1025,9 +1025,8 @@ async function main() {
 
   // ⛔ A SHORT PIN RECORD MUST STILL MATCH A `<sha12>` CHILD (review round 2, finding 4).
   // `pinnedSha` accepts `/^[0-9a-f]{7,40}$/` and slices to 12, so a 7-char record yields a 7-char pin
-  // while every deployed child is named from `cut -c1-12`. An EQUALITY match — and even the
-  // bidirectional prefix, once over-matching was closed — would miss it, and nothing else in this
-  // suite uses a pin shorter than 12, so the arm was unpinned.
+  // while every deployed child is named from `cut -c1-12`. An EQUALITY match would miss it, and
+  // nothing else in this suite uses a pin shorter than 12, so the arm was unpinned.
   await test("pinMismatchLines matches a SHORT pin record against a sha12 child", () => {
     const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
     mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
@@ -1039,6 +1038,45 @@ async function main() {
     mkdirSync(join(home, "harness", full.slice(0, 12)), { recursive: true });
     equal(withoutPinEnv(() => pinMismatchLines(other, home)).length, 2,
       "a 7-char pin record names the same tree as its sha12 child and must still warn");
+  });
+
+  // ⛔ THE OTHER DIRECTION: A LENGTHY RECORD AGAINST A SHORTER CHILD (review round 3, finding 1).
+  // The record is written FULL-LENGTH and `pinnedSha` slices to 12, so the pin here is 12 chars while
+  // the directory carries an 8-char abbreviation — a shape MEASURED on three cells (2026-10-16), not
+  // a hypothetical. Only the reverse prefix arm can join those two names.
+  await test("pinMismatchLines matches a LONG record against a SHORTER (8-char) child", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const pinned = seededRepo();
+    const other = seededRepo();
+    commit(other, "other");
+    const full = git(pinned, "rev-parse HEAD").trim();
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${full}\n`);
+    mkdirSync(join(home, "harness", full.slice(0, 8)), { recursive: true });
+    equal(withoutPinEnv(() => pinMismatchLines(other, home)).length, 2,
+      "a full-length record and an 8-char child name the same tree; forward-only missed it silently");
+  });
+
+  // ⛔ THE FALSE POSITIVES THE SHAPE TEST — NOT THE LOST ARM — HAS TO CLOSE (review round 3, finding
+  // 4). `0` / `0123` are real directory-name shapes (a counter, a date), and `<pin12>-old` is what a
+  // backup looks like. None may certify a deployment; and a box carrying ONLY such a name must stay
+  // silent rather than claim one.
+  await test("pinMismatchLines rejects non-sha directory names and stays silent on them", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const pinned = seededRepo();
+    const other = seededRepo();
+    commit(other, "other");
+    const full = git(pinned, "rev-parse HEAD").trim();
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${full}\n`);
+    for (const junk of ["0", "a", "0123", `${full.slice(0, 12)}-old`, `${full.slice(0, 12)}.bak`]) {
+      mkdirSync(join(home, "harness", junk), { recursive: true });
+    }
+    equal(withoutPinEnv(() => pinMismatchLines(other, home)).length, 0,
+      "only junk names are present, so the pin describes NO tree this box carries and the banner is silent");
+    mkdirSync(join(home, "harness", full.slice(0, 12)), { recursive: true });
+    equal(withoutPinEnv(() => pinMismatchLines(other, home)).length, 2,
+      "a real child beside the junk names is still found, so the mismatch still fires");
   });
   // ⛔ THE TWO DEPLOYED SHAPES A `<root>/<pin12>`-ONLY PREDICATE SILENCED (review finding 1). Both are
   // documented in the fleet: `harness-refresh.sh:396` "the legacy flat pin: the ROOT is the worktree",

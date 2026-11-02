@@ -100,15 +100,24 @@ export function pinTreeDeployed(pin: string, home: string = process.env.HOME ?? 
     //    than the directory name or (defensively) longer.
     try {
       for (const name of readdirSync(root)) {
-        // ⛔ FORWARD PREFIX ONLY, AND ONLY OVER A SHA-SHAPED NAME (review round 2, finding 3). The
-        // bidirectional form accepted `pin.startsWith(name)`, so a directory literally named `0` (or
-        // `a`, or `0123`) matched every pin and declared a deployment on a box with none — the exact
-        // false positive this function exists to prevent, reintroduced one level down. It also
-        // accepted `<pin12>-old` / `<pin12>.bak` leftovers via the reverse direction. The real case
-        // the prefix is for is a SHORT RECORD (7 chars) against a `<sha12>` child, which is a forward
-        // match on a hex name; `sameCommit` below keeps its own bidirectional test, where the value it
-        // compares comes from git and is always a real short sha.
-        if (!/^[0-9a-f]{6,40}$/i.test(name) || !name.startsWith(pin)) continue;
+        // ⛔ A SHA-SHAPED NAME, MATCHED IN BOTH DIRECTIONS (review round 3, findings 1-3 — this
+        // corrects round 2's over-narrowing). The thing that was actually WRONG was the bare
+        // `pin.startsWith(name)`: with no shape test, a directory literally named `0` (or `a`, or
+        // `0123`) matched every pin and declared a deployment on a box that has none — the exact false
+        // positive this function exists to prevent. The fix for that is the SHAPE TEST, not the loss of
+        // the reverse arm: the record is written FULL-LENGTH (`harness-refresh.sh` `write_pin "$TIP"`,
+        // `harness-apply-pass.sh` `$TREE_SHA`) and `pinnedSha` slices to 12, while a directory can be
+        // named from a SHORTER abbreviation. An 8-character child was MEASURED on three cells
+        // (2026-10-16; `pin_name_ok` in cloud-cell-supervisor.sh records it and widens the convention
+        // to 7..40). Forward-only misses that pair, and the miss is silent: `pinTreeDeployed` says no
+        // tree, so `pinMismatchLines` says nothing — silencing the #10114 warning on exactly the boxes
+        // that carry a deployed harness.
+        // 7..40 is the fleet's own convention for a pin directory name (`pin_name_ok`), and its lower
+        // bound is also what closes `0` / `a` / `0123`: they are shorter than git's minimum
+        // abbreviation, so no pin can start with one. `<pin12>-old` / `<pin12>.bak` never matched by
+        // the REVERSE arm (the pin is shorter than they are); what closes them is this regex — they
+        // are not pure hex.
+        if (!/^[0-9a-f]{7,40}$/i.test(name) || !(name.startsWith(pin) || pin.startsWith(name))) continue;
         try {
           if (statSync(join(root, name)).isDirectory()) return true;
         } catch {
