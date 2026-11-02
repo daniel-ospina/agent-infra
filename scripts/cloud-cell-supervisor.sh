@@ -4536,7 +4536,20 @@ pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census 
     fi
     if [ -r "$f/cmdline" ]; then
       while IFS= read -r -d '' tok; do
-        case "$tok" in /*) tok="${tok//$'\n'/ }"; tok="${tok//$'\t'/ }"; PIN_ROWS+=("arg$T$pid$T$tok") ;; esac
+        # ⛔ AN ABSOLUTE PATH CAN ARRIVE ATTACHED (`--repo=/abs/tree`, `ENV=/abs/tree`). A `/*` test
+        # alone missed those spellings — `lib/live-paths.sh` records the measured consequence: "the
+        # tree was reaped while a live process had it in argv". So the value after the first `=` is
+        # tested too, and a RELATIVE token (no leading `/` at all) is resolved against the pid's own
+        # cwd at match time, the same way `git -C wt-x` names a tree with no `/` in it.
+        tok="${tok//$'\n'/ }"; tok="${tok//$'\t'/ }"
+        case "$tok" in
+          /*) PIN_ROWS+=("arg$T$pid$T$tok") ;;
+          -*=/*) PIN_ROWS+=("arg$T$pid$T${tok#*=}") ;;
+          *=/*) PIN_ROWS+=("arg$T$pid$T${tok#*=}") ;;
+          */*) PIN_ROWS+=("relarg$T$pid$T$tok") ;; # a RELATIVE path (contains `/`): joined to its cwd
+          *) ;;                                   # a bare word/flag — the cwd arm already covers a pid
+                                                  # sitting in the tree, so this arm does not fork per token
+        esac
       done < "$f/cmdline" 2>/dev/null
     fi
   done
@@ -4559,6 +4572,13 @@ pin_held_by_process() {
   for row in "${PIN_ROWS[@]}"; do
     IFS=$'\t' read -r kind pid path <<< "$row"
     [ -n "$path" ] || continue
+    # A relative token is resolved against ITS OWN pid's cwd — the one reading a bare `git -C wt-x`
+    # needs, and the reason a relative name is not silently dropped.
+    if [ "$kind" = relarg ]; then
+      local rcwd; rcwd="$(readlink /proc/$pid/cwd 2>/dev/null)" || continue
+      path="${rcwd%/}/${path#./}"
+      kind=arg
+    fi
     for cand in "$1" "$real"; do
       [ -n "$cand" ] || continue
       case "$path" in "$cand"|"$cand"/*) PIN_HOLD_PID="$pid"; PIN_HOLD_KIND="$kind"; return 0 ;; esac
