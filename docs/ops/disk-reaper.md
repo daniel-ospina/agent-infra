@@ -960,9 +960,11 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **9 cases and 10 mutants,
-19 assertions** — also mutation-checked. Run against the PRE-CHANGE tree (the base commit's
-`disk-reaper.sh` beside this owner) it reports **6 passed, 13 failed**, and against this tree
-**19 passed, 0 failed**: the discrimination is measured both ways, not asserted. (The 13 red on the
+19 outcomes per box** (each passed, failed, or — for (f)'s default-glob half on a box with real runner
+roots — SKIPPED, so a run always states which of the three it produced) — also mutation-checked. Run
+against the PRE-CHANGE tree (the base commit's
+`disk-reaper.sh` beside this owner) it reports **6 passed, 13 failed, 0 skipped**, and against this tree
+**19 passed, 0 failed, 0 skipped**: the discrimination is measured both ways, not asserted. (The 13 red on the
 pre-change tree are cases (a)–(h) plus the five entry-point mutants that cannot even be applied there,
 because the arms they edit do not exist in that `disk-reaper.sh`; (i) and the owner-side mutants stay
 green, which is the correct answer for a case whose subject is the owner.)
@@ -983,12 +985,14 @@ and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 run on a box that HAS real runner roots — its whole subject is the default list, so there is nothing to
 pin the seam to — and recording it as a passing check meant a CELL (which skips it) printed the same
 `19 passed, 0 failed` as a laptop on which all 19 arms really ran. The skipped arms are now counted on
-their own line with their reason, so the two runs cannot be mistaken for each other:
+their own line with their reason, so the two runs cannot be mistaken for each other (measured on a box
+told to have real runner roots; `<entry>` is the entry point under test and the second is the mutant
+copy the suite makes in its own `$T`):
 
 ```
   19 passed, 0 failed, 2 skipped
-    skipped: (f) default-glob half, entry point …/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
-    skipped: (f) default-glob half, entry point …/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
+    skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
+    skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
 ```
 
 (two, not one: `(f)` runs twice, against the real entry point and its mutant. The source assertion that
