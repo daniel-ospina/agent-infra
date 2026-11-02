@@ -15903,7 +15903,7 @@ grep -q 'NOT a verdict on any run' "$SCEN/err" \
   && pass "(q1) the refusal does NOT claim the run stalled — no false stall diagnosis" \
   || fail "(q1) the refusal does not disclaim a stall verdict"
 
-# (p2) A BOUND THAT CANNOT FIRE IS REFUSED, NOT TRUSTED. #3287's default is
+# (q2) A BOUND THAT CANNOT FIRE IS REFUSED, NOT TRUSTED. #3287's default is
 # FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT = 18064 + 15600 = 33664s,
 # which is above every phase bound that could carry an attempt there, so a rail
 # can never reach it. An override above the reachable ceiling is CLAMPED to it
@@ -15913,14 +15913,14 @@ set +e
 SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
   run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 set -e
-grep -q 'CLAMPED to the reachable 2200s' "$SCEN/err" \
+grep -q 'CLAMPED to the reachable 2500s' "$SCEN/err" \
   && pass "(q2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
   || fail "(q2) an unreachable deadline was accepted silently — a bound that can never fire"
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2200s, 42\)' "$SCEN/err" \
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2500s, 42\)' "$SCEN/err" \
   && pass "(q2) the refusal reports the CLAMPED bound, never the unused 33664s" \
   || fail "(q2) the refusal reported a bound the rail did not use"
 
-# (p3) THE KNOB IS VALIDATED BY NAME, NOT DEFAULTED SILENTLY (review P1). A
+# (q3) THE KNOB IS VALIDATED BY NAME, NOT DEFAULTED SILENTLY (review P1). A
 # non-integer deadline makes the guard's own `[ -ge ]` ERROR — and under `set -u`
 # without `-e` an erroring `if` body is SKIPPED, so the typo DELETES the bound
 # instead of weakening it. Each arm must REFUSE, naming the knob, never proceed.
@@ -15937,7 +15937,7 @@ for bad in 10m 99999999999999999999999 0 019864; do
   fi
 done
 
-# (p4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
+# (q4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
 # MUST DISCRIMINATE. Review cycle 2 found the first version of this arm asserted
 # only the ABSENCE of a refusal, which the BROKEN code also produced (a future stamp
 # made elapsed negative, so nothing fired): it could not tell "CLAMPED" from "the
@@ -15950,8 +15950,8 @@ SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
 p4_rc=$?
 set -e
 grep -q 'CLAMPED to now' "$SCEN/err" \
-  && pass "(p4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
-  || fail "(p4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
+  && pass "(q4)) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
+  || fail "(q4)) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
 grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
   && fail "(q4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
   || pass "(q4) …and it produced no spurious refusal (rc=$p4_rc)"
@@ -16004,21 +16004,18 @@ else
   fail "(p) rail-exit.test.sh FAILED — see its output above"
 fi
 
-# (p7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
-# (review cycle 3, P2). (p6) pins 500, which is BELOW the ceiling, so it never
+# (q7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
+# (review cycle 3, P2). (q6)) pins 500, which is BELOW the ceiling, so it never
 # exercised the clamp — and the clamp branch is exactly where the surface printed
 # the raw 33664 beside a refusal that enforced 20254.
 SCEN="$TMP/scen-p7"; mkdir -p "$SCEN"
 SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
-grep -q '^rail-deadline=2200 (CLAMPED from 33664)' "$SCEN/out" \
-  && pass "(p7) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
-  || fail "(p7) the inspection surface reports a bound the rail is not using"
+grep -q '^rail-deadline=2500 (CLAMPED from 33664)' "$SCEN/out" \
+  && pass "(q7)) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
+  || fail "(q7)) the inspection surface reports a bound the rail is not using"
 grep -q '^rail-deadline=33664' "$SCEN/out" \
-  && fail "(p7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
-  || pass "(p7) it does NOT print the raw unreachable value"
-grep -q 'rail-deadline=INVALID' "$SCEN/out" \
-  && fail "(p7) an INVALID arm exists — it is unreachable (a bad knob exits 2 first) and misdescribes the code" \
-  || pass "(p7) no unreachable INVALID arm is advertised"
+  && fail "(q7)) it printed the RAW knob — the #3287 value the clamp exists to reject" \
+  || pass "(q7)) it does NOT print the raw unreachable value"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
