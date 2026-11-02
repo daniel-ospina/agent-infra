@@ -381,7 +381,7 @@ assert_absent "$OUT" "SHOULD NOT RUN" "T18 and the materialiser was not called a
 #   behind:<sha>    → a copy at rest differs                                → the pass must NOT fail
 # Both stubs exit 1, exactly as the real `check-deployed-drift.sh` does, so the ONLY thing that can
 # distinguish them is the token.
-say_case "T20 a stale EXECUTING tree reds the pass; other drift does not"
+say_case "T24 a stale EXECUTING tree reds the pass; other drift does not"
 mk_origin t20; mk_clone t20
 REPO_P="$CLONE"; MODE_P=pin
 WANT20="$(advance_origin t20 A.txt "upstream for the drift case")"
@@ -395,20 +395,20 @@ printf '#!/usr/bin/env bash\necho "harness=executes:/gone/709dfb06eac2/scripts/o
 printf '#!/usr/bin/env bash\necho "harness=behind:709dfb06eac2"\nexit 1\n' >"$T/t20/drift-behind.sh"
 chmod +x "$T/t20/drift-exec.sh" "$T/t20/drift-behind.sh"
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-exec.sh" run_pass "$T/t20" 2>&1)"; RC=$?
-assert_eq "$RC" "1" "T20 a live controller on a GONE tree fails an otherwise-successful pass (rc 1)"
-assert_contains "$OUT" "deployed-drift" "T20 and the refusal is NAMED, not a silent green"
-assert_contains "$OUT" "executes:/gone" "T20 and it names the tree that is actually executing"
-assert_contains "$(cat "$T/t20/state/harness-apply.status" 2>/dev/null)" "action=deployed-drift" "T20 and the durable record says what happened, not the log alone"
+assert_eq "$RC" "1" "T24 a live controller on a GONE tree fails an otherwise-successful pass (rc 1)"
+assert_contains "$OUT" "deployed-drift" "T24 and the refusal is NAMED, not a silent green"
+assert_contains "$OUT" "executes:/gone" "T24 and it names the tree that is actually executing"
+assert_contains "$(cat "$T/t20/state/harness-apply.status" 2>/dev/null)" "action=deployed-drift" "T24 and the durable record says what happened, not the log alone"
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-behind.sh" run_pass "$T/t20" 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T20 a copy at rest that is merely BEHIND does NOT red the pass"
-assert_contains "$OUT" "deployed_drift=drift" "T20 and it is still REPORTED, so it is not silent either"
+assert_eq "$RC" "0" "T24 a copy at rest that is merely BEHIND does NOT red the pass"
+assert_contains "$OUT" "deployed_drift=drift" "T24 and it is still REPORTED, so it is not silent either"
 # A CANNOT-VERIFY CHECKER IS NOT A RED ONE, AND NOT A SILENT ONE either: the reason is logged (the
 # record's `detail=` truncates at 240 chars, so the log is the only place it survives).
 printf '#!/usr/bin/env bash\necho "UNKNOWN: the process table could not be read"\nexit 2\n' >"$T/t20/drift-unknown.sh"
 chmod +x "$T/t20/drift-unknown.sh"
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-unknown.sh" run_pass "$T/t20" 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T20 a checker that cannot verify does not by itself red a converged box"
-assert_contains "$OUT" "deployed_drift_unknown=UNKNOWN: the process table could not be read" "T20 but its REASON is kept, never a bare rc"
+assert_eq "$RC" "0" "T24 a checker that cannot verify does not by itself red a converged box"
+assert_contains "$OUT" "deployed_drift_unknown=UNKNOWN: the process table could not be read" "T24 but its REASON is kept, never a bare rc"
 assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 
 # ── T15: a dirty TRACKED SYMLINK is restored as a symlink, never written THROUGH ─────────────

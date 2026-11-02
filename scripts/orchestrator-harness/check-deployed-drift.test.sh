@@ -525,6 +525,25 @@ ck "10a: the one-line token is harness=executes:<dir>, not a token about a copy 
 ck "10a: …and it is NOT harness=surface (that token's remedy, reseeding a dir, cannot clear a gone tree)" \
    "$(qF "harness=surface" "$OUT" && echo 1 || echo 0)"
 ck "10a: the verdict says a redeploy of \$O does not clear it" "$(qF "does not clear it" "$OUT" && echo 0 || echo 1)"
+# (10a-2/10a-3) THE INVOCATION PREDICATE IS PINNED IN BOTH DIRECTIONS (agent-infra#10114, review P1).
+# Both directions used to fail SILENTLY GREEN: every fixture here spells the invocation with an
+# interpreter, and the only mention fixture was the `bash -c` TEXT form. That was tolerable while the
+# token was cosmetic; this lane makes an `executes:` token turn a SUCCESSFUL pass into rc 1, so a
+# predicate that fabricates a controller reds a healthy box on a timer, and one that drops a real
+# controller restores #10114's silent green.
+# (10a-2) argv[0] is a direct shebang exec — a real invocation, with no interpreter to lean on.
+printf '4252 %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-argv0"
+surf "$TMP/ps-argv0"
+ck "10a-2: a controller exec'd directly (argv[0], no interpreter) is still an INVOCATION" \
+   "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+# (10a-3) A mere MENTION of the absolute path is NOT an invocation: `grep -n x <abs>/orch-loop.sh` is
+# routine agent traffic, and reading it as "this process EXECUTES that tree" is the fabrication.
+printf '4253 grep -n x %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-mention"
+surf "$TMP/ps-mention"
+ck "10a-3: grep on an ABSOLUTE orch-loop.sh path does NOT fabricate a controller" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+ck "10a-3: …it is reported as a MENTION instead, so the fact is not lost" \
+   "$(qF "MENTIONS an orch-loop.sh" "$OUT" && echo 0 || echo 1)"
 # ⛔ AN EXEC-ONLY DRIFT IS NOT A SURFACE HIT (review of #3202). `drift_q exec` bumps `problems` from inside
 # the surface block, so `problems > SURF_BASE` was true for a gone executing tree ALONE — and the summary
 # then offered "reseed the copy the RUNNING component uses" directly above "(c) … does not clear it": a
