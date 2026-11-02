@@ -106,6 +106,17 @@
 #     The failure mode is a momentary over/under-count, never a permanent deadlock.
 #     A mutex whose pid file cannot be WRITTEN is released and reported unavailable
 #     rather than entered unowned.
+#   - ⛔ WHICH CREDENTIAL THE EVIDENCE IS ABOUT. The exempt read in `discharge_window` runs
+#     `"$REAL" api rate_limit` with THIS process's environment untouched — no `GH_TOKEN` is set,
+#     cleared or rewritten anywhere in this file, so the probe resolves the same credential the
+#     call itself will use (the env token if one is set, otherwise gh's config-file account).
+#     `refusal_evidence` records the `user ID <n>` a refusal NAMES, so an operator can see which
+#     account was actually refused instead of inferring it. Residual, stated rather than implied: a
+#     call that targets a NON-DEFAULT host (`--hostname`/`GH_HOST`) is probed with a read against the
+#     default host, so that probe is about a different account's buckets — it is still only ever
+#     allowed to LIFT a window, and the evidence record names the refusing bucket so the mismatch is
+#     visible, but it is not evidence about the enterprise host. Not fixed here: the shim has never
+#     modelled per-host budgets, and inventing one inside a courtesy gate would be worse than saying so.
 #   - ⛔ NOTHING HERE MAY TOUCH A SUCCESSFUL CALL'S STDERR. The harness layer ABOVE this one
 #     (`gh-rest/gh`) captures `2>&1` and PARSES the merged bytes as JSON; a pacing banner on a
 #     good answer turns `pr view --json` into a JSONDecodeError, and on the `pr merge` path it
@@ -568,6 +579,12 @@ fi
 # `discharge_window`; the earlier wording predates that read, and leaving it standing would make
 # this header lie about its own code (#3228 review, finding 8).
 #
+# **OVERRIDES:** the "`gh api rate_limit` must not be used as a readiness probe anywhere in this
+# gate" rule this header carried before that read existed — the exempt read is allowed for exactly
+# ONE question (may this ALREADY-RECORDED window be lifted?), because the alternative is the measured
+# box-wide stall and `/rate_limit` is the one cheap read that can tell a justified window from a
+# false one. It never admits a call, and it never lifts a secondary/concurrency window.
+#
 # Four mechanisms, in the order a call meets them:
 #   1. COOLDOWN  — a shared refusal window. A caller that is refused writes a deadline;
 #                  every other caller on the box waits it out BEFORE asking, so a burst of
@@ -995,15 +1012,161 @@ single_flight_acquire() {
   return 0
 }
 
-# Re-derive an open shared window against the exempt read. 0 = discharged (proceed now),
-# 1 = keep the window. It only ever REMOVES a window on positive evidence that the account is fine.
+# Which bucket does THIS call target? The shim's own knowledge of its argv — never a guess at the
+# prose of a refusal. It is used only to NAME the bucket when a refusal carries no URL: the
+# discharge decision reads EVERY bucket (see `rate_limit_verdict`), so a wrong name here can
+# mislabel a log line but can never authorise a call.
+call_bucket() {
+  local a
+  for a in "$@"; do
+    case "$a" in graphql) printf 'graphql'; return 0 ;; esac
+  done
+  # `gh search` queries GraphQL too; the REST `/search/*` endpoints are the `api` case below.
+  case "${1:-}" in
+    pr|issue|label|project|search) printf 'graphql'; return 0 ;;
+  esac
+  case "${2:-}" in search/*|*/search/*) printf 'search'; return 0 ;; esac
+  printf 'core'
+}
+
+# ── THE REFUSAL'S OWN EVIDENCE, NOT ITS PROSE ─────────────────────────────────────────────────
+# ⛔ THE PROSE CANNOT BE THE DISCRIMINATOR, AND NOT JUST BECAUSE IT IS INCOMPLETE. MEASURED
+# 2026-11-01 on this box, from the SAME account and token that produced the refusal: the shim was
+# refused `HTTP 403: API rate limit exceeded for user ID 81560491` while that token's own
+# `gh api rate_limit` read `core: 4575/5000` (and later 4557/5000) — `gh api user` confirmed
+# `daniel-ospina id=81560491` is the account behind both. So:
+#   * it was NOT the primary core limit — the same credential had 4,500+ calls of headroom; and
+#   * the message contains NEITHER `secondary rate limit` NOR `abuse detection`, so a classifier
+#     built on those two phrases is blind to this class (#3228 review, finding 1).
+# What IS authoritative, and what this reads instead:
+#   * `retry-after: N` — the server's own instruction, which the API docs say must be honoured
+#     ("you should not retry your request until after that many seconds has elapsed"). The window
+#     it wrote becomes UNDISCHARGEABLE until that deadline passes, which is the concrete harm the
+#     prose grep allowed: a window lifted ~59 s before its own `retry-after` expired.
+#   * the refusal URL (`…/graphql`, `…/search`) — names the bucket that refused, so the operator's
+#     log states the bucket instead of assuming `core` (#3228 review, finding 2).
+#   * `x-ratelimit-remaining: 0` — positive evidence a PRIMARY bucket was exhausted, i.e. the only
+#     class a later healthy read may legitimately lift.
+#   * `user ID <n>` — WHICH credential was refused, so a probe of one account's bucket can never be
+#     silently passed off as evidence about another's.
+# The secondary/abuse prose is still read, but as CORROBORATION of a secondary classification — it is
+# real evidence when present, and its ABSENCE is never taken as evidence of a primary refusal.
+#
+# Sets globals (bash 3.2: no nameref, and NOTHING may be printed — stdout here is the caller's data):
+#   REV_BUCKET core|graphql|search|unknown   REV_RETRY_S seconds, 0 = none
+#   REV_SECONDARY 0|1                        REV_PRIMARY_HDR 0|1
+#   REV_UID the refusing account id, or empty
+refusal_evidence() {
+  local f="$1" fb="${2:-unknown}" ra bucket sec hdr uid
+  ra="$(awk '{ l = tolower($0)
+               if (match(l, /retry-after:[ \t]*[0-9]+/)) {
+                 v = substr(l, RSTART, RLENGTH); sub(/retry-after:[ \t]*/, "", v); print v; exit } }' \
+        "$f" 2>/dev/null | head -n 1)"
+  # Same <=9-digit rule `retry_wait_ms` applies: a value `[ ]` cannot hold is ABSENT, never clamped
+  # and never wrapped into a poisoned deadline.
+  case "$ra" in
+    ''|*[!0-9]*) ra=0 ;;
+    *) [ "${#ra}" -le 9 ] || ra=0 ;;
+  esac
+  bucket="$fb"
+  if grep -Eqi 'api\.github\.com/graphql' "$f" 2>/dev/null; then bucket=graphql
+  elif grep -Eqi 'api\.github\.com/search' "$f" 2>/dev/null; then bucket=search
+  elif grep -Eqi 'api\.github\.com' "$f" 2>/dev/null; then bucket=core
+  fi
+  sec=0
+  grep -Eqi 'secondary rate limit|abuse detection' "$f" 2>/dev/null && sec=1
+  hdr=0
+  grep -Eqi 'x-ratelimit-remaining:[[:space:]]*0([^0-9]|$)' "$f" 2>/dev/null && hdr=1
+  # ONE awk, no pipeline (see the SIGPIPE note on `rate_limited`).
+  uid="$(awk 'match($0, /user ID [0-9]+/) { s = substr($0, RSTART, RLENGTH); sub(/user ID /, "", s); print s; exit }' \
+           "$f" 2>/dev/null)"
+  REV_BUCKET="$bucket"; REV_RETRY_S="$ra"
+  REV_SECONDARY="$sec"; REV_PRIMARY_HDR="$hdr"; REV_UID="$uid"
+  return 0
+}
+
+# Persist that evidence BESIDE the deadline it explains, as a file that dies with the window.
+# ⛔ A KIND WITHOUT A WINDOW IS THE DEFECT THIS CHANGE EXISTS TO DELETE (#3228 review, finding 3):
+# `secondary.window` used to be an empty file with no TTL, so ONE secondary refusal disabled
+# revalidation for the life of the box. This is the same record with `until=`, and it is pruned by
+# time in `refusal_evidence_live` — never by a later writer's opinion.
+record_refusal_evidence() {
+  local until="$1" rau=""
+  case "$until" in ''|*[!0-9]*) return 0 ;; esac
+  # ⛔ WHEN THE REFUSAL CARRIED A HEADER, THE WINDOW'S OWN DEADLINE IS THE SERVER'S DEADLINE.
+  # `retry_wait_ms` already turned that header into the window length (clamped to RETRY_MAX), so
+  # `until` IS "now + the retry-after the server stated". Recomputing `now + REV_RETRY_S` here would
+  # add the header a SECOND time on top of a deadline that already contains it — MEASURED while
+  # writing this: the two differed by the 107 ms between the two `now_ms` reads, i.e. the window was
+  # 30 s and the record claimed 30 s + 107 ms, drifting by the recorder's own latency for no reason.
+  case "${REV_RETRY_S:-0}" in
+    ''|*[!0-9]*) : ;;
+    *) [ "${REV_RETRY_S:-0}" -gt 0 ] && rau="$until" ;;
+  esac
+  # `2>/dev/null` BEFORE the redirections: an unwritable gate dir must not put a bash redirection
+  # error on the caller's stderr beside a good answer (see gate_note).
+  {
+    printf 'until=%s\n' "$until"
+    printf 'bucket=%s\n' "${REV_BUCKET:-unknown}"
+    printf 'retry_after_until=%s\n' "$rau"
+    printf 'secondary=%s\n' "${REV_SECONDARY:-0}"
+    printf 'primary_hdr=%s\n' "${REV_PRIMARY_HDR:-0}"
+    printf 'uid=%s\n' "${REV_UID:-}"
+  } 2>/dev/null > "$GATE_DIR/refusal.$until.$$"
+  return 0
+}
+
+# The evidence governing the OPEN window: the live record with the LATEST deadline (deadlines are
+# monotonic maxima, so the newest window is the one that governs). Prunes records whose window has
+# already expired, so a killed writer cannot wedge this off. Sets REFUSAL_BUCKET / REFUSAL_RETRY_S /
+# REFUSAL_UID. Returns 1 when no live record exists.
+refusal_evidence_live() {
+  local now f u b v best=0
+  now="$(now_ms)"
+  REFUSAL_BUCKET="unknown"; REFUSAL_RETRY_S=0; REFUSAL_UID=""
+  for f in "$GATE_DIR"/refusal.*; do
+    [ -e "$f" ] || continue
+    u="$(sed -n 's/^until=//p' "$f" 2>/dev/null)"; u="${u%% *}"
+    case "$u" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue ;; esac
+    [ "$u" -le "$now" ] && { rm -f "$f" 2>/dev/null; continue; }
+    [ "$u" -gt "$best" ] || continue
+    best="$u"
+    b="$(sed -n 's/^bucket=//p' "$f" 2>/dev/null)"; b="${b%% *}"
+    REFUSAL_BUCKET="${b:-unknown}"
+    REFUSAL_UID="$(sed -n 's/^uid=//p' "$f" 2>/dev/null)"; REFUSAL_UID="${REFUSAL_UID%% *}"
+    v="$(sed -n 's/^retry_after_until=//p' "$f" 2>/dev/null)"; v="${v%% *}"
+    case "$v" in
+      ''|*[!0-9]*) REFUSAL_RETRY_S=0 ;;
+      *) if [ "$v" -gt "$now" ]; then REFUSAL_RETRY_S=$(( (v - now + 999) / 1000 )); else REFUSAL_RETRY_S=0; fi ;;
+    esac
+  done
+  [ "$best" -gt 0 ] || return 1
+  return 0
+}
+
+
+# Re-derive an open shared window against the exempt read. 0 = discharged (proceed now), 1 = keep
+# the window. It only ever REMOVES a window on positive evidence that the account is fine.
 discharge_window() {
-  local outf rem vrd minrem rlock
+  local outf rem vrd minrem rlock snap="" f cv have_ev=0
   [ "$REVALIDATE_ON" -eq 1 ] || return 1
   # A window a SECONDARY-shaped refusal wrote is never discharged by a primary read, and neither is
   # one the server itself instructed (see `window_kind_live`).
   secondary_live && return 1
   retry_after_live && return 1
+  refusal_evidence_live && have_ev=1
+  # ⛔ AN AUTHORITATIVE DEADLINE IS NOT DISCHARGEABLE, BY ANY READ. When the refusal carried
+  # `retry-after`, the server itself said when to come back, and the API docs are explicit: "you
+  # should not retry your request until after that many seconds has elapsed". A probe of any bucket
+  # cannot contradict that instruction — the bucket's remaining count is not the thing that fired.
+  # MEASURED harm this closes (#3228 review, finding 1): a refusal whose wording carried neither
+  # `secondary rate limit` nor `abuse detection` was recorded as a PRIMARY window, so the first
+  # waiting lane read a healthy `core` and deleted it ~59 s before its own `retry-after` expired,
+  # releasing every lane at once into the same limit.
+  if [ "$REFUSAL_RETRY_S" -gt 0 ]; then
+    gate_note "the shared gh throttle window is NOT re-derivable yet — the refusal that wrote it carried an authoritative retry-after with ${REFUSAL_RETRY_S}s left (refusing bucket: ${REFUSAL_BUCKET}${REFUSAL_UID:+, account id $REFUSAL_UID}) — honouring it"
+    return 1
+  fi
   rem="$(cooldown_remaining_ms)" || return 1
   # Only bother once the wait is long enough to be worth 0.4 s of read (the measured cost).
   [ "$rem" -ge "$REVALIDATE_MIN_MS" ] || return 1
@@ -1012,6 +1175,14 @@ discharge_window() {
     gate_note "another lane is already re-deriving the shared window — honouring it instead of issuing a second exempt read"
     return 1
   fi
+  # ⛔ SNAPSHOT WHAT THIS CALL ACTUALLY READ. The delete at the end of this function is
+  # compare-and-delete against exactly these pairs (see there for why).
+  for f in "$GATE_DIR"/cooldown.*; do
+    [ -e "$f" ] || continue
+    cv="$(cat "$f" 2>/dev/null)"
+    snap="$snap$f|$cv
+"
+  done
   outf="$WORKDIR/revalidate.$$"
   if ! run_bounded "$REVALIDATE_TIMEOUT_MS" "$outf" "$REAL" api rate_limit; then
     rm -rf "$rlock" 2>/dev/null
@@ -1038,9 +1209,31 @@ discharge_window() {
       return 1 ;;
   esac
   rm -f "$outf" 2>/dev/null
+  # A peer's SECONDARY refusal may have landed DURING the probe, and the flag was read BEFORE it.
+  # Re-read it here: a window that has just become secondary must not be released by a read that
+  # predates it (#3228 review, finding 4, second half).
+  secondary_live && return 1
   # Positive evidence the account is fine: the window cannot be explained by a primary limit.
-  rm -f "$GATE_DIR"/cooldown.* 2>/dev/null
-  gate_note "stale shared gh throttle window DISCHARGED (exempt read: no bucket low; lowest remaining $minrem) — this call proceeds now"
+  # ⛔ COMPARE-AND-DELETE, NEVER `rm -f cooldown.*`. Between the snapshot above and this line sits
+  # the exempt read, bounded at REVALIDATE_TIMEOUT_MS — and a peer's FRESH refusal inside that
+  # window writes a `cooldown.<later>` file this call NEVER READ. The blanket `rm` deleted it while
+  # it was still authoritative, so the box lost a live throttle and the peer's `secondary.window`
+  # outlived the window it was protecting (#3228 review, finding 4: "deletes evidence it never
+  # read"). Only a file whose content still equals what this call read is removed; a file that was
+  # rewritten or created during the probe is left exactly where it is.
+  while IFS='|' read -r f cv; do
+    [ -n "$f" ] || continue
+    [ -e "$f" ] || continue
+    [ "$(cat "$f" 2>/dev/null)" = "$cv" ] || continue
+    rm -f "$f" 2>/dev/null
+  done <<EOF
+$snap
+EOF
+  if [ "$have_ev" -eq 1 ]; then
+    gate_note "stale shared gh throttle window DISCHARGED (exempt read: no bucket low; lowest remaining $minrem; refusing bucket: ${REFUSAL_BUCKET}) — this call proceeds now"
+  else
+    gate_note "stale shared gh throttle window DISCHARGED (exempt read: no bucket low; lowest remaining $minrem) — this call proceeds now"
+  fi
   return 0
 }
 
@@ -1534,21 +1727,29 @@ run_paced() {
       # Share the window with the WHOLE box before deciding whether to sleep in it.
       cd_until=""
       [ "$GATE_ON" -eq 1 ] && cd_until="$(set_cooldown_ms "$wait_ms")"
-      # ⛔ RECORD THE KIND OF WINDOW, AND THE DEADLINE IT PROTECTS. A SECONDARY/ABUSE refusal is
-      # invisible to the exempt quota read, so it must never be discharged by one (see
-      # `secondary_live`). ⛔ AND NOTHING HERE CLEARS IT: this used to `rm` the flag on every
-      # ordinary refusal, which un-protected a LONGER secondary window still governing the box —
-      # deadlines are monotonic maxima, so the newest window is not the governing one, and the old
-      # comment had that backwards (#3228 review, finding 2). The flag now expires by its own
+      # ⛔ RECORD THE KIND OF WINDOW, THE DEADLINE IT PROTECTS, AND THE EVIDENCE BEHIND BOTH.
+      # A SECONDARY/ABUSE refusal is invisible to the exempt quota read, so it must never be
+      # discharged by one (see `secondary_live`), and neither must one the server itself instructed
+      # (`retry-after`, see `window_kind_live`). ⛔ AND NOTHING HERE CLEARS A FLAG: this used to `rm`
+      # it on every ordinary refusal, which un-protected a LONGER secondary window still governing the
+      # box — deadlines are monotonic maxima, so the newest window is not the governing one, and the
+      # old comment had that backwards (#3228 review, finding 2). Each flag expires by its own
       # deadline and by nothing else.
       # ⛔ THE SECONDARY PATTERNS ARE THE RUNBOOK'S OWN SYMPTOM, not a guess: `docs/ops/gh-rate-limits.md`
       # §"Two limits" names `API rate limit already exceeded for user ID …` as the secondary
       # signature and records that it strikes *while the primary counter reads healthy*. The word
       # that distinguishes it from a primary exhaustion is `already`, and leaving it out classified
       # exactly that refusal as PRIMARY — so the very read that cannot see a secondary limit
-      # discharged it. `retry-after` is recorded too, on its own flag: it is the server's own
-      # instruction and `gh-limit.py` refuses to discharge one (see `window_kind_live`).
+      # discharged it.
+      # ⛔ AND THE KIND IS RECORDED AS EVIDENCE TOO, NOT ONLY AS A FLAG (`refusal_evidence`): the
+      # measured refusal this box actually gets — `HTTP 403: API rate limit exceeded for user ID
+      # 81560491`, from the SAME token that read `core 4575/5000` — matches NEITHER phrase and carries
+      # no `retry-after`, so a prose-only classifier has nothing to say about it. The record carries
+      # the refusing bucket, any authoritative deadline, a primary-header sighting and the account id,
+      # so the window is judged against evidence about ITSELF (#3228 review, findings 1-3).
       if [ "$GATE_ON" -eq 1 ]; then
+        refusal_evidence "$errf" "$(call_bucket "$@")"
+        record_refusal_evidence "$cd_until"
         case "$cd_until" in
           ''|*[!0-9]*) : ;;
           *)
