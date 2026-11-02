@@ -1100,18 +1100,40 @@ _rc=$?
   && pass "(f)(v) a healthy account is STILL discharged — the small search bucket does not make the gate inert (rc=0)" \
   || fail "(f)(v) the gate is INERT: a healthy account (search 30/30) was treated as exhausted (rc=$_rc)"
 
-# (f)(vi) THE CORROBORATED DIRECTION IS PINNED TOO (finding 9). A floor above the account's own
-# headroom must HONOUR the window. This is the branch that fails toward "always discharge" if it
-# inverts, and the PR body claimed it was proven while nothing referenced the floor at all.
+# (f)(vi) THE CORROBORATED DIRECTION IS PINNED TOO (finding 9). A floor at or above the remaining
+# count of a bucket that is genuinely MORE THAN HALF SPENT must HONOUR the window. This is the branch
+# that fails toward "always discharge" if it inverts, and the PR body claimed it was proven while
+# nothing referenced the floor at all.
+# ⛔ THE FIXTURE MOVED WITH THE PREDICATE, AND THE MOVE IS THE POINT. This arm used to read
+# `core 4684/5000` at floor 4999 — i.e. it demanded that a 93%-HEALTHY bucket be called exhausted
+# purely because the operator set a high floor. That is the same defect as P1-a one layer up: the
+# floor overriding the bucket's own headroom. The floor now corroborates only a bucket at or below
+# half its limit, so the arm drives `core 1500/5000` (30% left — over the 10% rule's line, so ONLY
+# the floor branch can fire) at floor 2000. The pass message names the bucket it acted on, so the arm
+# cannot go green because some other body made it low.
+GREAL_FLOOR="$TMP/gate-real-revalidate-floor"
+cat > "$GREAL_FLOOR" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":1500},"graphql":{"limit":5000,"remaining":4976},"search":{"limit":30,"remaining":30}}}'
+    exit 0 ;;
+esac
+exit 0
+GHEOF
+chmod +x "$GREAL_FLOOR"
 _until=$(( $(date +%s) * 1000 + 60000 ))
 printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
 : > "$GDIR/events.log"
-AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_GATE_REVALIDATE_FLOOR=4999 AGENT_GH_REAL="$GREAL" \
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_GATE_REVALIDATE_FLOOR=2000 AGENT_GH_REAL="$GREAL_FLOOR" \
   AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
 _rc=$?
 [ "$_rc" -eq 75 ] \
-  && pass "(f)(vi) a floor ABOVE the account's headroom HONOURS the window (rc=75)" \
+  && pass "(f)(vi) a floor ABOVE a half-spent bucket's remaining HONOURS the window (core 1500/5000, floor 2000 → rc=75)" \
   || fail "(f)(vi) REVALIDATE_FLOOR did not corroborate: rc=$_rc — the floor branch is dead"
+grep -q 'core 1500/5000' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the corroborating bucket is the one the FLOOR caught (core 1500/5000)" \
+  || fail "  …but the note names a different bucket: '$(grep 'bucket is low' "$GDIR/events.log" 2>/dev/null | head -1)'"
 
 # (f)(vii) ⛔ A SECONDARY WINDOW SURVIVES A PEER'S ORDINARY REFUSAL (finding 2). The flag records
 # the deadline it protects; the old code rm'd it on every non-secondary refusal, un-protecting a
@@ -1254,13 +1276,16 @@ grep -q 'DISCHARGED' "$GDIR/events.log" 2>/dev/null \
   || pass "  …and nothing was discharged"
 # CONTROL: drop the kind flag AND the evidence record that describes the same refusal, and the SAME
 # read DOES discharge — so the arm above cannot be satisfied by a revalidation that never fires.
-# ⛔ BOTH RECORDS, because one refusal writes two: the kind flag this arm asserts, and the evidence
-# record (`refusal.*` — refusing bucket, the deadline it implies, the account it names). Dropping
-# only one leaves the other still saying "the server directed this window", so a control that clears
-# half the evidence would be testing a premise the code no longer holds (#3228 review round 2).
+# ⛔ EVERY RECORD, because one refusal writes THREE: the `retry-after.window` this arm asserts, the
+# evidence record (`refusal.*` — refusing bucket, the deadline it implies, the account it names), and
+# — since the class is decided from structured evidence (#3228 P1-b/P1-c) — `secondary.window`, which
+# a `retry-after` WITHOUT an exhausted primary bucket now correctly also raises. Dropping only the
+# first left the other two still saying "the server directed this window", so a control that clears
+# half the evidence tests a premise the code no longer holds (the same lesson this arm learned once
+# already, for two; the kind set grew to three).
 ls "$GDIR"/refusal.* >/dev/null 2>&1 \
   || fail "(f)(ix) control is VACUOUS: no evidence record was written for the refusal it drops"
-rm -f "$GDIR/retry-after.window" "$GDIR"/refusal.*
+rm -f "$GDIR/retry-after.window" "$GDIR/secondary.window" "$GDIR"/refusal.*
 : > "$GDIR/events.log"
 AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
   AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
@@ -1707,6 +1732,198 @@ _rc=$?
 grep -q 'SECONDARY' "$GDIR/events.log" 2>/dev/null \
   && pass "  …and the operator's log says WHY (secondary/abuse)" \
   || fail "  …but the reason is silent: '$(head -1 "$GDIR/events.log" 2>/dev/null)'"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# (f)(xxviii)–(f)(xxxiii) — #3228's FIFTH REVIEW ROUND: THE THREE P1s AN INDEPENDENT REVIEWER
+# MEASURED ON THIS BRANCH'S OWN HEAD. P1-a and P1-c MASKED EACH OTHER: a broken floor arithmetic hid
+# behind a fixture that never reached the documented default, and a refusal shape the shim INVENTED
+# hid the one GitHub actually returns. Each RED arm below was run against `6599f502f` and failed
+# there; the comment states what it printed.
+#
+# (f)(xxviii) ⛔ P1-a: THE FLOOR BRANCH MUST NOT BE INERT **AT ITS DOCUMENTED DEFAULT**. The previous
+# predicate was `lim>floor_n and rem<=floor_n`, so `floor=100` called a bucket holding 100 of 101
+# requests LOW — and 100 IS the documented default, so on any body carrying such a bucket (GitHub's
+# `/rate_limit` really does report `source_import`/`dependency_snapshots`/`dependency_sbom` with
+# limits in this range) EVERY window was honoured and the discharge could never fire. 
+# ⛔ THIS ARM SETS NO FLOOR. A fixture value chosen to make the arm pass would hide the defect one
+# request further on — which is exactly how the previous two cuts of this branch looked green.
+# MEASURED on `6599f502f`: rc=75 (the window was HONOURED, i.e. the discharge never fired).
+GDIR="$(gate_dir revalidate-floor-default)"
+GREAL_101="$TMP/gate-real-floor-default"
+cat > "$GREAL_101" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976},"search":{"limit":30,"remaining":30},"source_import":{"limit":101,"remaining":100},"dependency_snapshots":{"limit":100,"remaining":100},"dependency_sbom":{"limit":100,"remaining":100},"code_search":{"limit":10,"remaining":10}}}'
+    exit 0 ;;
+esac
+printf '%s\n' '{"number":1}'
+GHEOF
+chmod +x "$GREAL_101"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/events.log"
+# NOTE: no AGENT_GH_GATE_REVALIDATE_FLOOR here — the DEFAULT is what is under test.
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_101" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] \
+  && pass "(f)(xxviii) P1-a: at the DOCUMENTED DEFAULT floor, one-request-of-headroom (source_import 100/101) is DISCHARGED (rc=0)" \
+  || fail "(f)(xxviii) P1-a: the discharge is INERT at its own documented default — source_import 100/101 reads as low (rc=$_rc)"
+
+# (f)(xxix) CONTROL, not a RED arm (it is green on the old head too): the fix must not be re-openable
+# by the ENV. `rate_limit_verdict` claimed in prose that no floor value could call a healthy account
+# low; a prose claim with no arm behind it is how this branch shipped P1-a. A floor far above every
+# bucket must still discharge a healthy account.
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_GATE_REVALIDATE_FLOOR=999999 AGENT_GH_REAL="$GREAL_101" \
+  AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] \
+  && pass "(f)(xxix) a POISONED floor (999999) still cannot call a healthy account low (rc=0)" \
+  || fail "(f)(xxix) a poisoned AGENT_GH_GATE_REVALIDATE_FLOOR made the gate inert (rc=$_rc)"
+
+# (f)(xxx) ⛔ P1-c: THE REFUSAL SHAPE THE SHIM COVERED WAS ONE IT INVENTED. GitHub answers BOTH limits
+# with the SAME sentence — `API rate limit exceeded for user ID <id>` — and the shim's prose grep keyed
+# on words that appear in NEITHER (`secondary rate limit`, `abuse detection`) or only in a variant it
+# assumed (`api rate limit already exceeded`). The measured secondary 403 on this box arrived while
+# the primary budget read 4902/5000, from `/actions/workflows?per_page=100` — the CLI's FIRST call, so
+# every `gh run list` / `gh run view` was refused while `gh api` worked. The discriminator is the
+# `x-ratelimit-remaining` VALUE, not the wording. This fixture is that refusal, byte-for-byte in the
+# fields that matter; MEASURED on `6599f502f`: the record said `secondary=0` and NO `secondary.window`
+# was written (the one protecting flag came from `retry-after`, so the kind — the thing that survives
+# a deadline — was wrong).
+GDIR="$(gate_dir real-secondary-shape)"
+GREAL_SEC403="$TMP/gate-real-secondary-403"
+cat > "$GREAL_SEC403" <<'GHEOF'
+#!/usr/bin/env bash
+if [ -e "$RA403" ]; then printf '%s\n' '{"total_count":0}'; exit 0; fi
+printf '%s' 1 > "$RA403"
+printf '%s\n' 'HTTP 403: API rate limit exceeded for user ID 81560491 (https://api.github.com/actions/workflows?per_page=100)' \
+  'retry-after: 60' 'x-ratelimit-limit: 5000' 'x-ratelimit-remaining: 4902' 'x-ratelimit-reset: 1762100000' >&2
+exit 1
+GHEOF
+chmod +x "$GREAL_SEC403"
+RA403="$TMP/ra403-flag"; rm -f "$RA403"
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_SEC403" AGENT_GH_GATE_DIR="$GDIR" RA403="$RA403" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" run list >/dev/null 2>&1
+_rec="$(grep -h '^secondary=' "$GDIR"/refusal.* 2>/dev/null | head -1)"
+[ "$_rec" = "secondary=1" ] \
+  && pass "(f)(xxx) P1-c: the REAL secondary 403 (healthy remaining + retry-after) is recorded as secondary=1" \
+  || fail "(f)(xxx) P1-c: the REAL secondary 403 was recorded as '${_rec:-<no record>}' — the classifier cannot see the shape GitHub actually sends"
+[ -s "$GDIR/secondary.window" ] \
+  && pass "  …and it writes the protecting secondary.window flag" \
+  || fail "  …and NO secondary.window was written (the kind survives only as a retry-after deadline)"
+grep -h '^bucket=' "$GDIR"/refusal.* 2>/dev/null | grep -qx 'bucket=core' \
+  && pass "  …and it names the bucket the refusing URL went to (/actions/workflows → core)" \
+  || fail "  …but the recorded bucket is '$(grep -h '^bucket=' "$GDIR"/refusal.* 2>/dev/null | head -1)'"
+
+# (f)(xxxi) THE ANTI-OVER-CORRECTION CONTROL. The fix must not turn EVERY 403 into a secondary one —
+# that would make every window undisgargeable for 60 s and re-create the outage from the other side.
+# The PRIMARY shape is the SAME sentence with `x-ratelimit-remaining: 0` and no `retry-after`; it must
+# classify PRIMARY and must be DISCHARGED by a later healthy read. Green on the old head too (that was
+# the only shape the old code got right) — it exists to keep (f)(xxx) honest.
+GDIR="$(gate_dir real-primary-shape)"
+GREAL_PRI403="$TMP/gate-real-primary-403"
+cat > "$GREAL_PRI403" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4800},"graphql":{"limit":5000,"remaining":4976}}}'
+    exit 0 ;;
+esac
+if [ -e "$RAPRI" ]; then printf '%s\n' '{"total_count":0}'; exit 0; fi
+printf '%s' 1 > "$RAPRI"
+printf '%s\n' 'HTTP 403: API rate limit exceeded for user ID 81560491 (https://api.github.com/repos/o/r/pulls)' \
+  'x-ratelimit-limit: 5000' 'x-ratelimit-remaining: 0' 'x-ratelimit-reset: 1762100000' >&2
+exit 1
+GHEOF
+chmod +x "$GREAL_PRI403"
+RAPRI="$TMP/rapri-flag"; rm -f "$RAPRI"
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_PRI403" AGENT_GH_GATE_DIR="$GDIR" RAPRI="$RAPRI" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" run list >/dev/null 2>&1
+_rec="$(grep -h '^secondary=' "$GDIR"/refusal.* 2>/dev/null | head -1)"
+[ "$_rec" = "secondary=0" ] \
+  && pass "(f)(xxxi) the SAME sentence with x-ratelimit-remaining: 0 is recorded as primary (secondary=0)" \
+  || fail "(f)(xxxi) a PRIMARY 403 was classified '${_rec:-<no record>}' — every window would become undisgargeable"
+[ -s "$GDIR/secondary.window" ] \
+  && fail "  …but it wrote a secondary.window — a primary refusal was misclassified" \
+  || pass "  …and no secondary.window flag was written"
+# …and the primary window IS dischargeable by a healthy read: the other half of the control.
+RAPRI="$TMP/rapri-flag2"; rm -f "$RAPRI"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_PRI403" AGENT_GH_GATE_DIR="$GDIR" RAPRI="$RAPRI" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" run list >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] \
+  && pass "  …and a healthy /rate_limit read DISCHARGES it (rc=0) — the gate is not inert in the other direction" \
+  || fail "  …but a healthy read did NOT discharge a primary window (rc=$_rc)"
+
+# (f)(xxxii) ⛔ P1-b: THE STRUCTURED FIELD DECIDES, THE PROSE IS THE FALLBACK. `x-ratelimit-remaining`
+# was parsed, persisted as `primary_hdr=` and READ BY NOTHING, while the class was re-decided by a
+# prose `grep` — twice (once in `refusal_evidence`, again at the call site), so the record and the
+# flag could disagree. This fixture makes the two disagree ON PURPOSE: the wording says abuse, the
+# header says a primary bucket is exhausted. The header must win. (Safety is unchanged either way:
+# `remaining: 0` is low by the 10% rule, so the window stays honoured — the SUBJECT here is the
+# recorded class, which is what a later reader and the operator's log act on.)
+GDIR="$(gate_dir structured-beats-prose)"
+GREAL_LIAR="$TMP/gate-real-liar"
+cat > "$GREAL_LIAR" <<'GHEOF'
+#!/usr/bin/env bash
+if [ -e "$RALIAR" ]; then printf '%s\n' '{"total_count":0}'; exit 0; fi
+printf '%s' 1 > "$RALIAR"
+printf '%s\n' 'HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (https://api.github.com/repos/o/r/pulls)' \
+  'x-ratelimit-limit: 5000' 'x-ratelimit-remaining: 0' 'x-ratelimit-reset: 1762100000' >&2
+exit 1
+GHEOF
+chmod +x "$GREAL_LIAR"
+RALIAR="$TMP/raliar-flag"; rm -f "$RALIAR"
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_LIAR" AGENT_GH_GATE_DIR="$GDIR" RALIAR="$RALIAR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" run list >/dev/null 2>&1
+_rec="$(grep -h '^secondary=' "$GDIR"/refusal.* 2>/dev/null | head -1)"
+_hdr="$(grep -h '^primary_hdr=' "$GDIR"/refusal.* 2>/dev/null | head -1)"
+[ "$_hdr" = "primary_hdr=1" ] \
+  && pass "(f)(xxxii) P1-b: the structured field is READ and persisted (primary_hdr=1)" \
+  || fail "(f)(xxxii) P1-b: the structured field was not recorded ('${_hdr:-<none>}')"
+[ "$_rec" = "secondary=0" ] \
+  && pass "  …and it BEATS the prose: 'secondary rate limit' wording + remaining:0 classifies PRIMARY" \
+  || fail "  …but the PROSE decided the class ('${_rec:-<none>}') — the machine-readable evidence is decoration"
+
+# (f)(xxxiii) ⛔ THE GOLDEN ARM. This shim sits on the hot path of EVERY `gh` call in the fleet, so a
+# NORMAL (non-rate-limited) invocation must be byte-unchanged: same argv to the real gh, same stdout
+# bytes, same stderr bytes, same exit code. A gate that reorders stderr, appends a banner or exits
+# differently on the common path breaks every caller that parses output — `gh-rest/gh` merges `2>&1`
+# and parses it as JSON, so a single stray byte is a JSONDecodeError on a good answer.
+GDIR="$(gate_dir golden)"
+GOLD="$TMP/gate-golden-real"; GCALLS="$TMP/gate-golden-calls"
+cat > "$GOLD" <<GHEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$GCALLS"
+printf '{\n  "number": 1,\n  "title": "a normal answer"\n}\n'
+printf 'a warning gh itself printed\n' >&2
+exit 0
+GHEOF
+chmod +x "$GOLD"
+: > "$GCALLS"
+"$GOLD" api repos/o/r/pulls/1 --jq .number >"$TMP/golden.raw.out" 2>"$TMP/golden.raw.err"; _raw_rc=$?
+_raw_argv="$(cat "$GCALLS")"
+: > "$GCALLS"
+AGENT_GH_REAL="$GOLD" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 GCALLS="$GCALLS" \
+  bash "$SHIM" api repos/o/r/pulls/1 --jq .number >"$TMP/golden.shim.out" 2>"$TMP/golden.shim.err"; _shim_rc=$?
+[ "$_shim_rc" -eq "$_raw_rc" ] \
+  && pass "(f)(xxxiii) GOLDEN: a normal invocation returns the SAME exit code ($_shim_rc)" \
+  || fail "(f)(xxxiii) GOLDEN: exit code changed ($_raw_rc → $_shim_rc)"
+cmp -s "$TMP/golden.raw.out" "$TMP/golden.shim.out" \
+  && pass "  …the SAME stdout bytes" \
+  || fail "  …stdout CHANGED: $(diff <(od -c "$TMP/golden.raw.out") <(od -c "$TMP/golden.shim.out") 2>&1 | head -4 | tr '\n' ' ')"
+cmp -s "$TMP/golden.raw.err" "$TMP/golden.shim.err" \
+  && pass "  …the SAME stderr bytes (nothing prepended, nothing reordered)" \
+  || fail "  …stderr CHANGED: $(diff <(od -c "$TMP/golden.raw.err") <(od -c "$TMP/golden.shim.err") 2>&1 | head -4 | tr '\n' ' ')"
+[ "$(cat "$GCALLS")" = "$_raw_argv" ] \
+  && pass "  …and the real gh received the ORIGINAL argv unchanged ('$_raw_argv')" \
+  || fail "  …argv CHANGED: '$_raw_argv' → '$(cat "$GCALLS" | tr '\n' '|')'"
 
 GDIR="$(gate_dir revalidate)"
 # (g) A NON-rate-limit 403 IS NOT RETRIED. A permissions failure is not a burst, and

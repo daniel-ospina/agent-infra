@@ -246,8 +246,12 @@
 #   AGENT_GH_GATE_REVALIDATE        1 = re-derive an open shared window with one exempt
 #                                  `/rate_limit` read before sleeping on it (default 1; 0 = old
 #                                  behaviour, sleep on the recorded deadline)
-#   AGENT_GH_GATE_REVALIDATE_FLOOR  core `remaining` at or below which a window is CREDIBLE and is
-#                                  honoured without discharge (default 100)
+#   AGENT_GH_GATE_REVALIDATE_FLOOR  a bucket's `remaining` at or below which a window is CREDIBLE
+#                                  and is honoured without discharge (default 100). Only consulted
+#                                  for a bucket that is ALSO at or below half its own `limit`: a
+#                                  bucket with ONE request of headroom in a 101-request budget has no
+#                                  headroom to lose, so the floor must not be able to call it low on a
+#                                  healthy account
 #   AGENT_GH_GATE_LOCK_TIMEOUT_MS  ms to wait for the gate's own mutex (default 2000)
 #   AGENT_GH_GATE_SLOT             INTERNAL: the slot a nested call inherits (never counted twice)
 set -uo pipefail
@@ -912,18 +916,31 @@ set_window_kind() {  # $1 = flag name, $2 = the deadline it protects
 # limit. Both directions are pinned in `tests/gh-shim/run.sh`, so neither an inert gate nor a false
 # discharge can pass.
 #
-# ⛔ AND "BIG ENOUGH" IS `limit > floor`, STRICTLY — NOT `limit >= floor`.
-# MEASURED on a live account (2026-11-02): GitHub's `/rate_limit` reports a long tail of buckets
-# whose WHOLE limit IS 100 — `source_import` 100/100, `dependency_snapshots` 100/100,
-# `dependency_sbom` 100/100 — so the old `lim>=floor_n and rem<=floor_n` was TRUE for every one of
-# them on a perfectly healthy account. `rate_limit_verdict` answered `LOW source_import 100/100` on
-# EVERY call, so no window could ever be discharged: the gate was permanently inert, i.e. the exact
-# failure this comment block claims to have closed, one bucket over. A bucket that can never hold
-# more than the floor has no headroom TO lose, so the floor says nothing about it and the 10% rule
-# is the whole test. Strict `>` (not `>=`) is load-bearing: `>=` still calls 100/100 low at the
-# default floor of 100. Every fixture in the suite used to carry three buckets
-# (core/graphql/search) and so could not see it — `(f)(xxiii)` now reads a body shaped like the real
-# one, and `(f)(vi)` still pins that a floor ABOVE a big bucket's headroom corroborates it.
+# ⛔ AND "BIG ENOUGH" IS A TEST ON THE BUCKET'S OWN HEADROOM (`rem*2 <= limit`), NOT ON
+# `limit` vs THE FLOOR. Two successive cuts of this branch compared the LIMIT to the floor
+# (`lim>=floor_n`, which called GitHub's real limit-100 buckets low on a healthy account at every
+# call, so nothing was ever discharged; then `lim>floor_n`, which moved the same defect ONE REQUEST
+# over). MEASURED 2026-11-02 against the reviewed head (`6599f502f`) with a body whose
+# `source_import` bucket is `limit=101, remaining=100` — i.e. **100 of 101 still available**:
+#   floor=99  → `OK`   (discharged, rc=0)
+#   floor=100 → `LOW source_import 100/101` (**the documented DEFAULT** → honoured, rc=75)
+#   floor=101 → `OK`   (discharged, rc=0)
+# So at its own default the discharge could never fire on any body containing such a bucket: `lim >
+# floor` accepts a bucket with ONE request of headroom above the floor, and such a bucket is
+# permanently "low" the moment it is one call deep. The whole reason `lim > floor` looked right is
+# that it answers "can `rem` ever exceed the floor?" — but the question the floor needs answered is
+# "is this bucket DEPLETED?", and a bucket sitting at 99% of its own limit is not, whatever the
+# operator's floor says. So the floor branch now requires the bucket to be at or below HALF its own
+# limit: the floor can only ever corroborate a window on a bucket that is genuinely more than half
+# spent, and no value of `AGENT_GH_GATE_REVALIDATE_FLOOR` — including one a poisoned env hands us —
+# can turn a healthy account into "low" (the 10% rule is untouched, and it is what catches a bucket
+# sitting at 400/5000). `lim > floor` is implied and no longer tested. Every earlier fixture carried
+# three buckets (core/graphql/search), so no arm could see this; `(f)(xxiii)` reads a body shaped
+# like the real one, `(f)(xxviii)` drives THIS measurement at the **documented DEFAULT** (it sets no
+# floor at all — a fixture value chosen to pass would hide the defect one request further on),
+# `(f)(xxix)` pins that NO floor value, including one a poisoned env hands us, can call a healthy
+# account low, and `(f)(vi)` pins that a floor which DOES corroborate still does (core 1500/5000 at
+# floor 2000, so the arm proves the floor caused it rather than the body).
 # Python is already a hard dependency of the layer above (`gh-limit.py`); without it this fails and
 # the window is kept, which is the safe direction.
 rate_limit_verdict() {
@@ -947,7 +964,7 @@ for name,b in res.items():
     lim=b.get("limit")
     if not isinstance(rem,int) or not isinstance(lim,int): continue
     if lim<=0: continue
-    if rem<=0 or rem*100<=lim*10 or (lim>floor_n and rem<=floor_n):
+    if rem<=0 or rem*100<=lim*10 or (rem<=floor_n and rem*2<=lim):
         if low is None: low=(name,rem,lim)
     if lowest is None or rem*1000000//lim < lowest[1]*1000000//lowest[2]:
         lowest=(name,rem,lim)
@@ -1088,18 +1105,25 @@ call_bucket() {
 #   * the refusal URL (`…/graphql`, `…/search`) — names the bucket that refused, so the operator's
 #     log states the bucket instead of assuming `core` (#3228 review, finding 2).
 #   * `x-ratelimit-remaining: 0` — positive evidence a PRIMARY bucket was exhausted, i.e. the only
-#     class a later healthy read may legitimately lift.
+#     class a later healthy read may legitimately lift. ⛔ AND IT IS THE DISCRIMINATOR, because both
+#     limits are refused with the SAME sentence: the measured PRIMARY 403 carries `remaining: 0`,
+#     the measured SECONDARY 403 carries a healthy remaining plus `retry-after`. `x-ratelimit-reset`
+#     is the deadline on a primary refusal; the class is read from the remaining count, never the
+#     reset (a reset is a time, not a class).
 #   * `user ID <n>` — WHICH credential was refused, so a probe of one account's bucket can never be
 #     silently passed off as evidence about another's.
-# The secondary/abuse prose is still read, but as CORROBORATION of a secondary classification — it is
-# real evidence when present, and its ABSENCE is never taken as evidence of a primary refusal.
+# The classification ORDER is structured-first and the prose is the FALLBACK — see the block at the
+# `if` that assigns `sec`. `x-ratelimit-remaining: 0` ⇒ primary; `429` or `retry-after` ⇒ secondary;
+# only a response carrying NEITHER is classified from its wording.
 #
 # Sets globals (bash 3.2: no nameref, and NOTHING may be printed — stdout here is the caller's data):
 #   REV_BUCKET core|graphql|search|unknown   REV_RETRY_S seconds, 0 = none
-#   REV_SECONDARY 0|1                        REV_PRIMARY_HDR 0|1
+#   REV_SECONDARY 0|1   THE CLASS — the ONE decision every consumer reads (the `secondary.window`
+#                       flag, the evidence record, and `discharge_window`); REV_PRIMARY_HDR 0|1 is
+#                       the structured evidence it was decided FROM, persisted as `primary_hdr=`
 #   REV_UID the refusing account id, or empty
 refusal_evidence() {
-  local f="$1" fb="${2:-unknown}" ra bucket sec hdr uid
+  local f="$1" fb="${2:-unknown}" ra bucket sec hdr st429 uid
   ra="$(awk '{ l = tolower($0)
                if (match(l, /retry-after:[ \t]*[0-9]+/)) {
                  v = substr(l, RSTART, RLENGTH); sub(/retry-after:[ \t]*/, "", v); print v; exit } }' \
@@ -1116,18 +1140,32 @@ refusal_evidence() {
   elif grep -Eqi 'api\.github\.com' "$f" 2>/dev/null; then bucket=core
   fi
   sec=0
-  # ⛔ THE 429 IS A SECONDARY REFUSAL AND THE RUNBOOK SAYS SO. `docs/ops/gh-rate-limits.md`:
-  # "`429`, or `403` whose text names a rate limit / abuse detection → **secondary**".
-  # `rate_limited` already accepts `http 429` to write a window at all, but the KIND was decided by
-  # the three prose phrases alone, so a bare `HTTP 429: Too Many Requests` wrote a window with
-  # NEITHER protecting flag — and a healthy primary read then discharged it, releasing every lane
-  # straight back into the live burst limit the runbook says turns one refusal into a fleet-wide
-  # outage. MEASURED while verifying (#3228 review round 4): lane 1 refused `HTTP 429`, lane 2 read
-  # a healthy `core 4684/5000` 4 s later and DISCHARGED the window (rc=0).
-  grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded|http 429|status code:?[[:space:]]*429' "$f" 2>/dev/null && sec=1
   hdr=0
   grep -Eqi 'x-ratelimit-remaining:[[:space:]]*0([^0-9]|$)' "$f" 2>/dev/null && hdr=1
-  # ONE awk, no pipeline (see the SIGPIPE note on `rate_limited`).
+  st429=0
+  grep -Eqi 'http 429|status code:?[[:space:]]*429' "$f" 2>/dev/null && st429=1
+  # ⛔ THE CLASS IS DECIDED FROM THE STRUCTURED EVIDENCE FIRST; THE PROSE IS ONLY THE FALLBACK.
+  # It was a prose `grep` here, and `x-ratelimit-remaining` was PARSED, written into the record as
+  # `primary_hdr=` and READ BY NOTHING — the one machine-readable field that distinguishes the two
+  # classes sat on disk as decoration (#3228 review, P1-b). THE PROSE CANNOT BE THE DISCRIMINATOR
+  # ON THIS ACCOUNT, and that is measured, not argued: GitHub answers BOTH limits with the SAME
+  # sentence, `API rate limit exceeded for user ID 81560491`. The primary-limit 403 carries
+  # `x-ratelimit-remaining: 0` (and `x-ratelimit-reset`); the secondary-limit 403 carries a HEALTHY
+  # remaining (4902/5000 in the measured refusal below, from `/actions/workflows?per_page=100`) plus
+  # `retry-after`. A classifier keyed on wording reads those two as the same event, and the phrase it
+  # was keyed on — `api rate limit already exceeded` — does not appear in either (#3228 review, P1-c:
+  # the covered shape was one the shim invented).
+  #   * `x-ratelimit-remaining: 0` — a PRIMARY bucket is exhausted. Definitive; nothing else needed.
+  #   * `429`, or `retry-after` on a response whose primary buckets are NOT exhausted — a primary
+  #     refusal announces itself with `remaining: 0`, so `retry-after` with headroom left can only be
+  #     the burst/concurrency limit. The API docs make `retry-after` authoritative in its own right.
+  #   * neither → the response carries no structured evidence about its class at all, so fall back to
+  #     the wording. That fallback is why the old shapes (and a shim behind a proxy that strips
+  #     headers) still classify correctly — it is a FALLBACK, not the primary test.
+  if [ "$hdr" -eq 1 ]; then sec=0
+  elif [ "$st429" -eq 1 ] || [ "$ra" -gt 0 ]; then sec=1
+  elif grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded' "$f" 2>/dev/null; then sec=1
+  fi
   uid="$(awk 'match($0, /user ID [0-9]+/) { s = substr($0, RSTART, RLENGTH); sub(/user ID /, "", s); print s; exit }' \
            "$f" 2>/dev/null)"
   REV_BUCKET="$bucket"; REV_RETRY_S="$ra"
@@ -1852,10 +1890,17 @@ run_paced() {
         case "$cd_until" in
           ''|*[!0-9]*) : ;;
           *)
-            if grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded|http 429|status code:?[[:space:]]*429' "$errf" 2>/dev/null; then
+            # ⛔ READ THE CLASS OFF THE CLASSIFIER — DO NOT RE-GREP HERE. This block decided the
+            # secondary flag with its OWN copy of the prose `grep` and then grepped `retry-after:`
+            # directly, so the record (`secondary=`, `retry_after_until=`) and the flag could
+            # disagree, and the machine-readable evidence the record exists to carry was never the
+            # input to the decision it records (#3228 review, P1-b). ONE classifier, two consumers.
+            # `REV_RETRY_S` is the parsed, ≤9-digit, zero-checked value, so the flag now agrees with
+            # the record (`record_refusal_evidence` already keyed `retry_after_until` off it).
+            if [ "${REV_SECONDARY:-0}" -eq 1 ]; then
               set_window_kind secondary.window "$cd_until"
             fi
-            if grep -Eqi 'retry-after:' "$errf" 2>/dev/null; then
+            if [ "${REV_RETRY_S:-0}" -gt 0 ]; then
               set_window_kind retry-after.window "$cd_until"
             fi ;;
         esac
