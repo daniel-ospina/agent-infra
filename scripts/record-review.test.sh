@@ -5017,15 +5017,30 @@ EH10=425139; rm -f "$(Q2 $EH10)"
 run_record_delta $EH10 "$DG_C" "delta:$DG_A1..$DG_C+comment:42513901" STUB_EVIDENCE_AT="2025-07-01T00:00:00Z"
 assert_eq "$RECORD_RC" "0" "20h7 a cover postdating it still records"
 
-# 20h8 — NOT VECTORED, and declared rather than hidden: the anchor set adds only the
-# NON-CLEAN merges (so a clean forward merge of the base cannot re-charge the
-# agent-infra#3245 cost), but `git merge-tree --write-tree` reports an
-# ancestor/descendant parent pair as a non-clean merge, so a NAMED RESIDUAL remains:
-# a range holding BOTH a hand-resolved merge and a merge whose parents are in an
-# ancestor relationship pushes the anchor later than the authored work. It is
-# fail-closed (over-block, never a bypass), it cannot occur on the #3245 path (a
-# conflict-free base merge lands with unrelated parents), and it is tracked on the
-# PR rather than papered over with a vector that cannot express it.
+# 20h8 A CLEAN merge in the SAME range as an evil merge must NOT move the anchor.
+# Only the NON-CLEAN merges are anchor candidates: charging a re-review for a
+# conflict-free merge of already-reviewed history is the agent-infra#3245 cost this
+# change exists to remove.
+git checkout -q evil2 >/dev/null 2>&1
+git checkout -q -b sib "$DG_A1" >/dev/null 2>&1
+printf 'sib\n' > new.txt; git add -A
+GIT_COMMITTER_DATE='2025-09-02T00:00:00Z' GIT_AUTHOR_DATE='2025-09-02T00:00:00Z' git commit -qm 'clean side work'
+git checkout -q evil2 >/dev/null 2>&1
+GIT_COMMITTER_DATE='2026-03-01T00:00:00Z' GIT_AUTHOR_DATE='2026-03-01T00:00:00Z' \
+  git -c core.editor=true merge --no-ff sib -m 'clean forward merge' >/dev/null 2>&1 || true
+DG_MIXED="$(git rev-parse HEAD)"
+printf '%s\n' '2026-03-01T00:00:00Z' > "$T/dates/$DG_MIXED"
+if [ "$(git -C "$DG" rev-list --parents -n1 "$DG_MIXED" 2>/dev/null | awk '{print NF}')" = "3" ]; then
+    ok "20h8 fixture: the mixed head is a real two-parent merge"
+else
+    bad "20h8 fixture: the clean merge did not happen — the vector would not test the arm"
+fi
+EH11=425150; rm -f "$(Q2 $EH11)"
+# cover 2026-02-15: AFTER the evil merge (2026-02-01), BEFORE the clean merge (2026-03-01).
+run_record_delta $EH11 "$DG_MIXED" "delta:$DG_EV_L..$DG_MIXED+comment:42515001" \
+    STUB_EVIDENCE_AT="2026-02-15T00:00:00Z"
+assert_eq "$RECORD_RC" "0" "20h8 a CLEAN merge does not move the anchor (cover after the evil merge records)"
+assert_contains "$(cat "$(Q2 $EH11)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h8 the mixed range is still AUTHORED (the evil merge is not hidden)"
 
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
@@ -5139,7 +5154,7 @@ MUT="$(mk_mutant baseaware 'rev-list --no-merges "$from..$to" --not "$base_sha"'
 mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
 # M7 — the EVIL MERGE in the anchor candidate set. 20h5's cover predates the
 #      hand-resolved merge, so dropping the merges from `cands` must ACCEPT it.
-MUT="$(mk_mutant evilanchor '    if [ -n "$evil" ]; then' '    if false; then')"
+MUT="$(mk_mutant evilanchor '    if [ -n "$evil_shas" ]; then' '    if false; then')"
 mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42514001" accepted STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
 # M8 — the TIER arm. Widening the premise back to the non-review tiers must let a
 #      clean-micro prior record mint `clean`. Inline, not via mut_check: mut_check
@@ -5159,7 +5174,7 @@ else
 fi
 echo "   MUTATION-MATRIX($MM_OK/$MM)"
 set -e
-if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every guard is load-bearing"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
+if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every DISPATCHED guard is load-bearing (cells below are the ones measured; the other delta arms are pinned by refusal vectors only)"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
 
 cd "$ORIG_PWD" 2>/dev/null || cd "$T" || true
 echo ""

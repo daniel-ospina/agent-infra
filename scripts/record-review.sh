@@ -1049,7 +1049,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1183,6 +1183,8 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
     parents="$(delta_git "$root" rev-list --parents -n1 "$m" 2>/dev/null || true)"
     pcount="$(awk '{print NF-1}' <<< "$parents")"
     if [ "$pcount" != "2" ]; then
+      evil_shas="$evil_shas
+$m"
       evil="merge ${m:0:12} has ${pcount:-unreadable} parent(s) — an octopus or an unreadable parent list cannot be shown to be a clean merge"
       break
     fi
@@ -1200,6 +1202,10 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
     want="${want%%$'\n'*}"
     actual="$(delta_git "$root" rev-parse "$m^{tree}" 2>/dev/null || true)"
     if [ -z "$want" ] || [ -z "$actual" ] || [ "$want" != "$actual" ]; then
+      # The sha is RECORDED before the break: the anchor set needs EVERY non-clean
+      # merge, and `evil` keeps only the first message for the stderr text.
+      evil_shas="$evil_shas
+$m"
       evil="merge ${m:0:12} is NOT a clean merge of its parents (its tree is not what merging ${p1:0:12}… and ${p2:0:12}… produces) — a conflict resolution lives only in the merge commit and no reviewer has seen it"
       break
     fi
@@ -1216,11 +1222,13 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
     #      EVIL MERGE the anchor would be an older non-merge commit and a verdict
     #      written BEFORE the hand-resolution would still verify — attesting
     #      unreviewed conflict lines. So the candidate set is the authored commits
-    #      PLUS (when any merge is not a clean merge) those merges.
+    #      PLUS the merges that are NOT clean merges of their parents. ⛔ Only the
+    #      NON-CLEAN ones: a conflict-free forward merge of the base moved no authored
+    #      content, and including it would re-charge the agent-infra#3245 re-review
+    #      cost this change exists to remove.
     cands="$authored"
-    if [ -n "$evil" ]; then
-      cands="$cands
-$merges_in_range"
+    if [ -n "$evil_shas" ]; then
+      cands="$cands$evil_shas"
     fi
     # shellcheck disable=SC2086  # intentional word-split: one sha per line
     newest="$(delta_git "$root" log --no-walk=unsorted --format='%ct %H' $cands 2>/dev/null \
