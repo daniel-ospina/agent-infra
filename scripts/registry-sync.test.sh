@@ -664,6 +664,71 @@ assert_contains "$RS_LAST" "unreadable=" "§26 ...and counted"
 assert_contains "$RS_LAST" "failed=0" "§26 ...as unreadable, not as a failed move"
 if grep -qE 'unreadable=0' <<<"$RS_LAST"; then bad "§26 the run counted NOTHING despite receiving nothing"; else ok "§26 the counter is non-zero (the pre-fix arm reported 0/0 and exited 0)"; fi
 
+# ═══ 27. THE SPAWN BUDGET (agent-infra#3180) ══════════════════════════════════════
+# THE MEASURED DEFECT. `union` examined every record one at a time with ~21 process spawns each
+# (store_oid's awk over the whole listing, git show, 3-8 `field` seds, a python3, a mktemp) — on
+# records whose bytes were ALREADY identical on both sides. Measured on this harness: a converged
+# 10-record union cost 291 spawns and 40 records cost 1,131 (21/record); a land carries 4,027
+# records, so ~85,000 spawns before anything useful happened.
+#
+# The assertion is the SCALING, not a constant: any per-record cost makes the count grow with N, and
+# no constant hides it. Mutation proof: delete the converged pre-pass from `do_pull` and this
+# section goes red by hundreds.
+echo "── §27 the spawn budget is O(1) in the number of records (the #3180 regression)"
+SPAWN_SHIM="$T/spawn-shim"; mkdir -p "$SPAWN_SHIM"
+for tool in git sed awk python3 comm join sort cut wc mktemp paste head cat tr cmp; do
+  real_tool="$(command -v "/usr/bin/$tool" 2>/dev/null || command -v "$tool")"
+  [ -n "$real_tool" ] || continue
+  printf '#!/bin/sh\nprintf "%%s\\n" %s >> "${SPAWN_LOG:-/dev/null}"\nexec %s "$@"\n' "$tool" "$real_tool" > "$SPAWN_SHIM/$tool"
+  chmod +x "$SPAWN_SHIM/$tool"
+done
+spawns_for_union() { # <root> <n> → "<spawns>\n<summary line>\n<stderr>"
+  local rt="$1" n="$2" i pr out
+  mkdir -p "$rt/reg"
+  git init -q --bare "$rt/origin.git"
+  git init -q "$rt/store"
+  git -C "$rt/store" remote add origin "$rt/origin.git"
+  i=1
+  while [ "$i" -le "$n" ]; do
+    pr=$((100 + i))
+    printf '{"pr":%s,"head_sha":"%s","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-01-01T00:%02d:00Z"}\n' \
+      "$pr" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$i" > "$rt/reg/acme-widget-$pr.json"
+    i=$((i + 1))
+  done
+  bash "$SYNC" union --repo "$rt/store" --dir "$rt/reg" --remote origin --timeout 30 >/dev/null 2>&1
+  : > "$T/spawns.log"
+  out="$(PATH="$SPAWN_SHIM:$PATH" SPAWN_LOG="$T/spawns.log" bash "$SYNC" union --repo "$rt/store" --dir "$rt/reg" --remote origin --timeout 30 2>&1)"
+  printf '%s\n%s\n' "$(wc -l < "$T/spawns.log" | tr -d ' ')" "$out"
+}
+SP10="$(spawns_for_union "$T/n10" 10)"
+SP25="$(spawns_for_union "$T/n25" 25)"
+S10="$(head -1 <<<"$SP10" | tr -d ' ')"
+S25="$(head -1 <<<"$SP25" | tr -d ' ')"
+O10="$(tail -n +2 <<<"$SP10")"
+echo "     spawns: N=10 → $S10   N=25 → $S25   (before #3180: 291 → 1131)"
+case "$S10$S25" in
+  ''|*[!0-9]*) bad "§27 could not count spawns (N=10='$S10', N=25='$S25')" ;;
+  *)
+    DELTA=$((S25 - S10))
+    if [ "$DELTA" -le 2 ]; then
+      ok "§27 the spawn count is FLAT in N (N=10 → $S10, N=25 → $S25, delta $DELTA)"
+    else
+      bad "§27 spawns grow with the record count (N=10 → $S10, N=25 → $S25, delta $DELTA) — the per-record path is still walked"
+    fi ;;
+esac
+assert_contains "$O10" "same=20" "§27 a converged union counts each record ONCE PER HALF (same=2N)"
+assert_contains "$O10" "unchanged=20" "§27 ...and reports the pre-pass's own count (unchanged=2N)"
+assert_contains "$O10" "wrote=0" "§27 ...and writes nothing"
+assert_contains "$O10" "pushed=0" "§27 ...and pushes nothing"
+assert_contains "$O10" "nothing to sync" "§27 ...and says so on stderr (a converged run is never silent about it)"
+# A converged run must never be able to skip a CHANGED record: one byte of difference and the record
+# takes the full path again.
+printf '{"pr":105,"head_sha":"%s","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-02-01T00:00:00Z"}\n' \
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" > "$T/n10/reg/acme-widget-105.json"
+ONE_CHANGED="$(bash "$SYNC" union --repo "$T/n10/store" --dir "$T/n10/reg" --remote origin --timeout 30 2>&1)"
+assert_contains "$ONE_CHANGED" "unchanged=18" "§27 a ONE-BYTE change drops the pre-pass count (9 per half)"
+assert_contains "$ONE_CHANGED" "pushed acme-widget-105" "§27 ...and the changed record is published"
+
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
   b="${pair%%:*}"; f="${pair##*:}"
