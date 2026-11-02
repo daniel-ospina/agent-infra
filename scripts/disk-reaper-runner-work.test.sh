@@ -25,6 +25,13 @@
 #       emptied value, and the widest sweep is the DELETE direction — the same rule BOUNDED_LIB gets.
 #   (i) the owner's OWN `--glob` flag is an EXPLICIT assertion too: an unmatched `--glob` is a refusal,
 #       never a measured empty population — the same verdict the `REAP_RW_GLOBS` env spelling gives.
+#   (j) `_work/_temp` — a LIVE job's `$RUNNER_TEMP` — SURVIVES a stale floor, and so does a vendor
+#       directory the layout table has never seen, in the same pass that reaps a dead checkout. This is
+#       the shipped defect: the vendor resolves `Temp` as `Combine(Work, "_temp")`, so it lives INSIDE
+#       the swept root, and `ScriptHandler.cs` writes each step's script there ONCE PER STEP — a job
+#       whose CURRENT step outruns the floor has a FRESH checkout (correctly KEPT) and a STALE `_temp`.
+#       The checkout gate works perfectly and the live job's temp directory is deleted anyway. Measured
+#       on the shipped tree: a `REAP` row for `_work/_temp`.
 #
 # ⛔ EVERY CASE IS MUTATION-CHECKED (`expect_pass` then `expect_fail` against a mutated copy): a test that
 # passes against a script with the arm deleted proves nothing. A mutation that cannot be applied — the
@@ -39,7 +46,7 @@
 # where the documented defaults are asserted from the source instead. It is `--dry-run` regardless, so
 # even if it did read a cell's 19 G of live checkout it could remove nothing.
 # ⛔ AND A SKIP IS NOT A ✅. That arm used to be recorded as a PASSING check, so a CELL — where the arm
-# does not run at all — printed the same `19 passed, 0 failed` as a laptop on which all 19 arms really
+# does not run at all — printed the same tally as a laptop on which every arm really
 # did run: an unmeasured arm read as a measured one on exactly the box class this suite exists for, and
 # nothing in the transcript said so. `skip()` now records it separately (a file, because a case runs in a
 # subshell and its counters do not survive) and the tally line reports the count plus each reason, so the
@@ -281,6 +288,52 @@ case_c() { # <entry-point> <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (j) a LIVE job's `_temp` is stale by construction, and it must not be a candidate ───────────
+# ⛔ WHAT THIS CASE WOULD HAVE CAUGHT. `_temp` is written ONCE PER STEP (`ScriptHandler.cs:284` writes
+# the action step's script file), so its floor goes stale while the job is still running; the checkout
+# beside it is refreshed by every write the job makes and stays fresh. The class therefore had a LIVE
+# job's `$RUNNER_TEMP` in its population with the checkout gate working PERFECTLY — the disclosed
+# residual does not cover it (that one is about the CHECKOUT going stale because writes land in
+# `_temp`, not about deleting `_temp` itself). Measured on the shipped tree: `REAP … _work/_temp`.
+case_j() { # <entry-point> <owner>
+    local pass="$1" owner="$2" base work live dead out rc s1
+    PASS_OWNER="$owner"
+    base="$T/j.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-8)"
+    # a LIVE job: its checkout was written a moment ago, so the floor KEEPS it …
+    live="$(mk_entry "$work" job-live 0)"
+    # … while `_temp` still holds this step's script and the job's command log, written before the floor
+    mkdir -p "$work/_temp"
+    printf '#!/bin/sh\nset -e\n' >"$work/_temp/2f1c9d4e-0000-4000-8000-000000000000.sh"
+    printf 'step log\n' >"$work/_temp/commands.log"
+    age_tree "$work/_temp" 600 || return $((CASE_FAIL > 0))
+    # and a directory in the runner's `_` namespace that the layout table has never seen — the NEXT one
+    # the vendor adds. It must arrive as a NAMED decision, not as another silent reap candidate.
+    mkdir -p "$work/_vendor_added_later/x"
+    printf 'staging\n' >"$work/_vendor_added_later/x/blob"
+    age_tree "$work/_vendor_added_later" 600 || return $((CASE_FAIL > 0))
+    # the pairing: a genuinely dead checkout in the SAME pass, so this is not a blanket refusal
+    dead="$(mk_entry "$work" job-abandoned 300)"
+    s1="$(uniqstate j1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ -d "$work/_temp" ] && [ -f "$work/_temp/commands.log" ] && echo 0 || echo 1)" \
+               "_temp (the LIVE job's RUNNER_TEMP) SURVIVED its stale floor — the shipped class DELETED it"
+    case_check "$(grep -qE '^(REAP|REAPED) [^ ]*/_temp( |$)' <<<"$out" && echo 1 || echo 0)" \
+               "… and it was never even a candidate: no REAP/REAPED row names it"
+    case_check "$(grep -qF 'reason=live-job-temp' <<<"$out" && echo 0 || echo 1)" \
+               "… it is NAMED with the vendor's own reason, so 'why is this still here' has an answer"
+    case_check "$([ -d "$work/_vendor_added_later" ] && echo 0 || echo 1)" \
+               "a vendor directory the layout table has NEVER SEEN is kept too — not a silent candidate"
+    case_check "$(grep -qF 'reason=vendor-namespace-unlisted' <<<"$out" && echo 0 || echo 1)" \
+               "… and NAMED as an undecided directory, which is the point: the next one is a visible decision"
+    case_check "$([ -d "$live" ] && echo 0 || echo 1)" "the live checkout itself was KEPT by the floor, same pass"
+    case_check "$([ ! -e "$dead" ] && echo 0 || echo 1)" \
+               "the dead checkout in the SAME pass WAS reaped — the retention is not a blanket refusal"
+    case_check "$(grep -qF 'retained=2' <<<"$out" && echo 0 || echo 1)" \
+               "both are counted on the class line (retained=2), so the carve-out is visible without the log"
+    return $((CASE_FAIL > 0))
+}
+
 # ── (d) --only selects exactly one class, in BOTH directions ──────────────────────────────────
 case_d() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead out out2 st c s1 s2
@@ -470,7 +523,11 @@ case_i() { # <owner>
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
 MUT_A='s/when=\$(( \$(now) - MIN_AGE ))/when=$(now)/'
 MUT_B='s/-newer "\$ref" -print 2>\/dev\/null | head -1/-print 2>\/dev\/null | head -1/'
-MUT_C='s/^RETAINED_NAMES="_tool$/RETAINED_NAMES="__nothing__/'
+# ⛔ THE CARVE-OUT'S TWO SPELLINGS ARE ONE ARM: the derived table AND the runner-namespace default, so
+# the mutation removes both. Emptying only the table leaves `_tool`/`_actions`/`_temp` retained by the
+# `_`-prefix default and the case would pass on a tree with no table at all — the "mutant survived"
+# shape this suite exists to catch.
+MUT_C='s/^RETAINED_NAMES=.*$/RETAINED_NAMES="__nothing__"/; s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
 MUT_D='s/^want_class runner-work && { WANT_RW=1;/true \&\& { WANT_RW=1;/'
 MUT_E='s/valid: uv, venv, worktree, duplicate-install, runner-work/valid: uv, venv, worktree, duplicate-install/g'
 MUT_F2='s/^    if \[ "\$_rw_census" = "no-roots" \]; then/    if false; then/'
@@ -483,6 +540,12 @@ MUT_H2='s/^case "\$GLOBS" in \*\[!\[:space:\]\]\*) : ;; \*)/case "$GLOBS" in *[!
 # (`EXPLICIT="${REAP_RW_EXPLICIT-0}"`) does not match the anchor. The mutant replaces the assertion with a
 # no-op — which is exactly the defect that shipped (the `--glob` arm marking nothing the census reads).
 MUT_I='s/^\( *\)EXPLICIT=1$/\1:/'
+# (j) has TWO arms, and each is mutated on its own: the `_temp` ROW (the DECIDED name — with only the
+# row deleted the prefix default still keeps the directory alive, so the case asserts the row by its
+# reason, which is what makes `_temp` a decision rather than an accident of the fallback), and the
+# unlisted-vendor default, which is what makes the NEXT vendor directory safe.
+MUT_J1='/^_temp|retain|live-job-temp|/d'
+MUT_J2='s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -521,7 +584,7 @@ fi
 
 expect_pass "c _tool and _actions survive even when they are the oldest thing in the tree" case_c "$REAPER" "$OWNER"
 if apply_mutation "$OWNER" "$T/mut-c/reap-runner-work.sh" "$MUT_C"; then
-    expect_fail "c mutation: emptying the retained set turns the case RED" case_c "$REAPER" "$T/mut-c/reap-runner-work.sh"
+    expect_fail "c mutation: emptying the retained table AND the vendor-namespace default turns the case RED" case_c "$REAPER" "$T/mut-c/reap-runner-work.sh"
 else
     bad "c mutation could not be applied (the retained table moved) — the case is not checking it any more"
 fi
@@ -573,7 +636,19 @@ else
     bad "i mutation could not be applied (the --glob arm moved) — the case is not checking it any more"
 fi
 
-# ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: `19 passed, 0 failed` from
+expect_pass "j a LIVE job's stale _temp is never a candidate, and neither is an unlisted vendor dir" case_j "$REAPER" "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-j1/reap-runner-work.sh" "$MUT_J1"; then
+    expect_fail "j mutation: deleting the _temp ROW turns the case RED (it is a decision, not a fallback)" case_j "$REAPER" "$T/mut-j1/reap-runner-work.sh"
+else
+    bad "j mutation could not be applied (the WORK_LAYOUT _temp row moved) — the case is not checking it any more"
+fi
+if apply_mutation "$OWNER" "$T/mut-j2/reap-runner-work.sh" "$MUT_J2"; then
+    expect_fail "j mutation: dropping the vendor-namespace default turns the case RED (the NEXT vendor dir)" case_j "$REAPER" "$T/mut-j2/reap-runner-work.sh"
+else
+    bad "j mutation could not be applied (the vendor-namespace default moved) — the case is not checking it any more"
+fi
+
+# ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
 # a CELL (two halves of (f) skipped) and from a laptop (nothing skipped) were the identical line, so an
 # unmeasured arm travelled as a measured one. A nonzero count prints every reason under the total.
 SKIP=0
