@@ -373,6 +373,11 @@ printf '#!/usr/bin/env bash\necho "SHOULD NOT RUN" >&2; exit 9\n' >"$T/t18c/mat.
 OUT="$(HARNESS_MATERIALISER="$T/t18c/mat.sh" run_pass "$T/t18c" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T18 a converged PIN with a lagging checkout is a NO-OP (exit 0)"
 assert_absent "$OUT" "SHOULD NOT RUN" "T18 and the materialiser was not called at all"
+# ⛔ THIS ASSERTION BELONGS TO T18, and it must read T18's `OUT` (review P2). T24 below reassigns `OUT`
+# three times; left after it, this line measured the WRONG run and passed only by coincidence (T24's
+# converged pass logs a no-op of its own), so a regression in T18's pin-mode verdict would have shipped
+# green under a label claiming to check it.
+assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 
 # ── T20: THE DEPLOYED-DRIFT ARM (#10114) — the one branch that turns a green pass RED ────────────
 # This is the arm that closes the silent no-op, so it is the arm that must be PINNED, not assumed.
@@ -409,7 +414,6 @@ chmod +x "$T/t20/drift-unknown.sh"
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-unknown.sh" run_pass "$T/t20" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 a checker that cannot verify does not by itself red a converged box"
 assert_contains "$OUT" "deployed_drift_unknown=UNKNOWN: the process table could not be read" "T24 but its REASON is kept, never a bare rc"
-assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 
 # ── T15: a dirty TRACKED SYMLINK is restored as a symlink, never written THROUGH ─────────────
 # MEASURED IN REVIEW: redirecting the blob at `$REPO/$p` followed the symlink and overwrote the CLEAN

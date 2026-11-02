@@ -136,8 +136,10 @@ export function stalenessBanner(repo: string, behind: number, threshold: number)
     `[auto-sync] 🐌 your loaded extensions are ${behind} commits behind origin/main — this checkout is pinned at ${shortHead(repo)}.`,
     `[auto-sync]    extensions/ on disk is NOT what origin/main ships; a bug you are chasing may already be fixed there.`,
     sync,
-    // #10114: the command above can be a TARGET the reader thinks fixes the box and does not.
-    ...pinMismatchLines(repo),
+    // ⛔ THE PIN CORRECTION IS PRINTED AT THE HINT SITE, NOT HERE (review P2). The banner and the
+    // `update available — run: …` hint both fire on the warn path, so carrying it in both showed the
+    // reader the trap, the correction, the same trap, the same correction at every session start.
+    // One site, and it is the one that shows the command.
   ];
 }
 
