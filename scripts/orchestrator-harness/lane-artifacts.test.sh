@@ -807,24 +807,32 @@ staged="$(find "$out" -maxdepth 2 -name 'pi-cell-1-ci-cause.md' -type f 2>/dev/n
 [ -n "$staged" ] && [ -d "$(dirname "$staged")" ] && ok "T41 the kept stage survives the exit trap" \
   || bad "T41 the exit trap reaped the stage it was told to keep" "$(ls -aR "$out")"
 
-echo "T41b — a PARTIALLY promoted run says so: it must not claim the directory was untouched"
+echo "T41b — a PARTIALLY promoted run says so, and it STOPS: a failure must not keep overwriting"
 # `promote_stage` moves each file onto its final name as it goes. A failure on the SECOND file leaves the
 # FIRST already installed — overwriting the previous collection's copy — while `finish` said "was NOT
 # replaced". Measured by review: the first artifact held the NEW bytes while the published index still
-# recorded the OLD size and path for it. This arm pins the truthful message AND the bounded damage.
+# recorded the OLD size and path for it.
+# ⛔ THREE FILES, AND THE FAILURE IN THE MIDDLE — `break` AND `continue` ARE INDISTINGUISHABLE OTHERWISE.
+# The first version of this arm had two files with the failing destination sorting LAST, and a reviewer
+# measured the regression it was supposed to pin (`break` → `continue`) staying green at 167/0: with
+# nothing left to promote after the failure, stopping and continuing produce the same directory. The
+# failing destination is therefore `...-ci-cause.md`, which is neither first nor last in the glob order
+# (`-2.md` < `.md` < `0.md` in byte order — asserted by the two "landed"/"untouched" arms below), so the
+# THIRD file is the evidence: with `continue` it is overwritten with this run's bytes, with `break` it
+# keeps the previous collection's.
 b41b="$Q/box-41b"; rm -rf "$b41b"; mkdir -p "$b41b"
 printf 'OLD-BODY-one' > "$b41b/ci-cause-2.md"
 printf 'OLD-BODY-two' > "$b41b/ci-cause.md"
+printf 'OLD-BODY-three' > "$b41b/ci-cause0.md"
 out="$Q/out41b"; mkdir -p "$out"
 STUB_BOXES="pi-cell-1=$b41b"; export STUB_BOXES
 run collect ci-cause --out "$out" --box pi-cell-1 > /dev/null 2>&1
 rc=$?
 eq "T41b run 1 (the previous collection) exit 0" "$rc" "0"
 idx_before="$(cat "$out/.lane-artifacts-index" 2>/dev/null)"
-# The box's bytes CHANGE, and a DIRECTORY occupies the destination of the file that promotes SECOND
-# (`...-ci-cause-2.md` sorts before `...-ci-cause.md`), so exactly one file lands before the failure.
 printf 'NEW-BODY-one' > "$b41b/ci-cause-2.md"
 printf 'NEW-BODY-two' > "$b41b/ci-cause.md"
+printf 'NEW-BODY-three' > "$b41b/ci-cause0.md"
 rm -f "$out/pi-cell-1-ci-cause.md"; mkdir -p "$out/pi-cell-1-ci-cause.md"
 run collect ci-cause --out "$out" --box pi-cell-1 > "$Q/t41b.txt" 2>&1
 rc=$?
@@ -844,6 +852,10 @@ grep -q 'the index was NOT updated' "$Q/t41b.txt" \
   && ok "T41b discloses that the index still describes the previous collection" \
   || bad "T41b left a stale index undisclosed" "$(tail -5 "$Q/t41b.txt")"
 eq "T41b the landed file holds THIS run's bytes" "$(cat "$out/pi-cell-1-ci-cause-2.md" 2>/dev/null)" "NEW-BODY-one"
+# ⛔ THE `break` EVIDENCE: the file AFTER the failure must still hold the PREVIOUS collection's bytes.
+[ "$(cat "$out/pi-cell-1-ci-cause0.md" 2>/dev/null)" = 'OLD-BODY-three' ] \
+  && ok "T41b STOPPED at the failure — the file after it was NOT overwritten" \
+  || bad "T41b kept promoting after the failure and overwrote the next file's previous copy" "$(cat "$out/pi-cell-1-ci-cause0.md" 2>/dev/null)"
 eq "T41b the index was NOT updated (it still describes the previous collection)" \
   "$(cat "$out/.lane-artifacts-index" 2>/dev/null)" "$idx_before"
 grep -q "now holds this run" "$Q/t41b.txt" \
@@ -1011,6 +1023,83 @@ ls -A "$out" | grep -q . \
 grep -q 'DECOY-BODY' "$Q/t48.txt" \
   && bad "T48 rendered the DECOY's bytes as the artifact's content" "$(grep -n 'DECOY' "$Q/t48.txt")" \
   || ok "T48 did not present the decoy as the matched artifact"
+
+echo "T49 — the INVENTORY verb has the same split-record hole: a name ending in a newline must ABSTAIN"
+# Fix C was applied to `collect`/`logs` (`emit_box`) and mirrored in `ls` (`show`) — but only the
+# `collect` half had an arm, and a reviewer measured the `ls` guard being deleted with the suite still
+# green at 167/0. `ls` is the verb an operator uses to DISCOVER what exists, so an uncertified map there
+# is the same class: the head row of a split record names a DIFFERENT, shorter path and the inventory
+# presents it as an entry.
+b49="$Q/box-49"; rm -rf "$b49"; mkdir -p "$b49"
+printf 'DECOY-BODY' > "$b49/has.md"
+printf 'REAL-BODY' > "$b49/has.md"$'\n'
+STUB_BOXES="pi-cell-1=$b49"; export STUB_BOXES
+run ls --box pi-cell-1 > "$Q/t49.txt" 2>&1
+rc=$?
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T49 exit 4 (UNMEASURED — a split inventory is not an inventory)" "$rc" "4"
+grep -q 'sent .* row line(s), .* parsed' "$Q/t49.txt" \
+  && ok "T49 names the split record (sent vs parsed)" \
+  || bad "T49 abstained without naming why" "$(tail -4 "$Q/t49.txt")"
+n49="$(grep -c 'has\.md' "$Q/t49.txt")"
+[ "$n49" -eq 0 ] \
+  && ok "T49 printed no inventory row for a listing it could not certify" \
+  || bad "T49 PRINTED the decoy path as an inventory entry" "$(grep 'has\.md' "$Q/t49.txt" | head -3)"
+
+echo "T50 — the no-`-printf` FALLBACK arm must not grade a split listing either"
+# The fallback exists for "a mac, or a stripped image": it builds the rows by re-reading raw path LINES,
+# so a name ending in a newline contributes its row PLUS an empty one. BOTH count checks agree there (the
+# box and the caller see the same split lines), so the sentinel cross-check is structurally incapable of
+# firing — a ROW-SHAPE guard is what that arm needs. A reviewer measured `ls` printing the decoy twice at
+# exit 0 on a box whose `find` refuses `-printf`, while the `-printf` arm abstained correctly.
+REAL_FIND="$(command -v find)"
+b50="$Q/box-50"; rm -rf "$b50"; mkdir -p "$b50"
+printf 'DECOY-BODY' > "$b50/has.md"
+printf 'REAL-BODY' > "$b50/has.md"$'\n'
+printf 'plain artifact' > "$b50/plain.md"
+mkdir -p "$Q/nofind"
+cat > "$Q/nofind/find" <<NOFIND
+#!/usr/bin/env bash
+# A find WITHOUT -printf (BSD/busybox shape). Only the probe and the scan are refused; the fallback's own
+# plain \`find > list\` must still reach the real binary, or the arm tests nothing at all.
+for a in "\$@"; do case "\$a" in -printf*) exit 1 ;; esac; done
+exec "$REAL_FIND" "\$@"
+NOFIND
+chmod +x "$Q/nofind/find"
+STUB_BOXES="pi-cell-1=$b50"; export STUB_BOXES
+# `export`, not a command prefix: `run` is a FUNCTION, and a prefix assignment is not guaranteed to reach
+# the `bash "$TOOL"` it spawns — an arm that silently ran the REAL find would pass for the wrong reason.
+_saved_path="$PATH"
+export PATH="$Q/nofind:$PATH"
+run ls --box pi-cell-1 > "$Q/t50.txt" 2>&1
+rc=$?
+export PATH="$_saved_path"
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T50 the FALLBACK arm abstains on a split listing (exit 4)" "$rc" "4"
+if grep -q 'has\.md' "$Q/t50.txt"; then
+  bad "T50 the fallback still printed an inventory row it could not certify" "$(grep 'has\.md' "$Q/t50.txt" | head -3)"
+else
+  ok "T50 the fallback printed no uncertified inventory row"
+fi
+# ⛔ AND THE FALLBACK MUST STILL WORK ON A CLEAN LISTING — an abstention that fires always is not a guard.
+b50b="$Q/box-50b"; rm -rf "$b50b"; mkdir -p "$b50b"
+printf 'plain artifact' > "$b50b/plain.md"
+STUB_BOXES="pi-cell-1=$b50b"; export STUB_BOXES
+export PATH="$Q/nofind:$PATH"
+run ls --box pi-cell-1 > "$Q/t50b.txt" 2>&1
+rc=$?
+export PATH="$_saved_path"
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T50b the FALLBACK arm still inventories a clean listing (exit 0)" "$rc" "0"
+grep -q 'plain\.md' "$Q/t50b.txt" \
+  && ok "T50b the clean artifact is listed" \
+  || bad "T50b the fallback listed nothing" "$(tail -4 "$Q/t50b.txt")"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"

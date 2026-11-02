@@ -746,6 +746,19 @@ case "$verb" in
         return 1
       fi
       [ -n "$rows" ] || return 0
+      # ⛔ `show` MUST VALIDATE THE SHAPE OF EVERY ROW IT PRINTS. `emit_box` abstains on a non-numeric size
+      # column; this verb had NO such guard, so a row that carries no measurement was printed as an
+      # inventory entry at exit 0. That is not hypothetical: on the no-`-printf` FALLBACK arm (a mac, or a
+      # stripped image) the listing is built by re-reading raw path LINES, so a file whose name ends in a
+      # newline yields its real row plus an EMPTY one, and the empty one became a printed entry — while
+      # the two count checks agree, because the box and the caller both see the same split lines. A count
+      # cannot see this; the row shape can.
+      while IFS= read -r _row; do
+        _sz="${_row%%$(printf '\t')*}"
+        case "${_sz:-}" in
+          ''|*[!0-9]*) echo "   UNMEASURED($what: a row carries no numeric size ('${_row:0:40}') — the listing is not a map this verb can certify)"; return 1 ;;
+        esac
+      done <<< "$rows"
       n="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
       # ⛔ A ROW-CAPPED SCAN IS NOT A TOTAL. `scan` stops at ROW_CAP, so `n` was at most ROW_CAP+1 while this
       # verb printed it as the population ("shown 25 of 201" about a box holding 250) and exited 0 — a
