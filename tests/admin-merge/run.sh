@@ -11864,9 +11864,18 @@ lane_fail mainbusy1 8802 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_main' > "$SCEN/log-8802"
 : > "$SCEN/runs-main.by-workflow.python-ci.yml"
 run_admin_here 42 --main-runs 10 --dry-run >/dev/null 2>&1
+# ⛔ THE REMEDY CHANGED WITH #3229, THE PROPERTY DID NOT. This block used to offer
+# `add --any-workflow BEFORE the -- separator`; it now refuses that widening by name
+# and offers `--baseline-workflow` instead (see 28b). What #4078 is about — the
+# printed remedy must WORK AS WRITTEN, with every parser flag BEFORE the separator —
+# is therefore pinned on the NEW text: the remedy shows no post-`--` spelling, and
+# the widening it used to print is gone.
+grep -q -- "--workflow <pr-lane> --baseline-workflow <main-lane>" "$SCEN/err" \
+  && pass "(#4078) the lane block prints a remedy that works as written (both parser flags before '--')" \
+  || { fail "(#4078/#3229) the lane block prints no usable remedy"; sed 's/^/      /' "$SCEN/err"; }
 grep -q "add --any-workflow BEFORE the -- separator" "$SCEN/err" \
-  && pass "(#4078) the lane block prints the remedy in the order that WORKS" \
-  || { fail "(#4078) the lane block still prints an order-dependent remedy"; sed 's/^/      /' "$SCEN/err"; }
+  && fail "(#3229) the lane block still prints the WIDENING as the remedy" \
+  || pass "(#4078/#3229) …and it no longer prints the order-dependent widening advice"
 
 # (g) …and so must the HEAD-side lane block — the exact output the issue observed.
 new_scen argorder-remedy-head
