@@ -94,7 +94,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     # ⛔ `shift 2` with one arg left does NOT shift, so the loop would spin forever on a truncated
     # invocation (`collect ci-cause --out`) — a wedge, not an error. Check the count first.
-    --out)     need_val --out "$#";   outdir="$2"; shift 2 ;;
+    # ⛔ AN EMPTY `--out` SILENTLY DISABLES COLLECTION — the same defect the `--box` arm below records one
+    # option over. `need_val` only checks ARITY, so `--out "$outt"` with an unset `$outt` fell through to
+    # `if [ -n "$outdir" ]` and the run behaved as a preview-only invocation: exit 0, nothing written, and
+    # a summary that never mentions --out. The caller believes DIR was written. A usage error is a usage
+    # error, not a mode switch.
+    --out)     need_val --out "$#"
+               [ -n "$2" ] || { echo "lane-artifacts: --out needs a non-empty directory" >&2; usage; }
+               outdir="$2"; shift 2 ;;
     --lines)   need_val --lines "$#"; need_num --lines "$2"; lines="$2"; shift 2 ;;
     # ⛔ AN EMPTY `--box` WIDENS THE UNIVERSE instead of narrowing it: `need_val` only checks ARITY, so
     # `--box "$cell"` with an unset `$cell` fell through to the three default boxes — the tool then swept
@@ -175,7 +182,19 @@ scan() {
       1) NAME="$(printf "%s" "$1" | sed "s/[][*?\\\\]/\\\\&/g")" ;;
       *) NAME="*$1*" ;;
     esac
-    T=$(mktemp 2>/dev/null) || T="/tmp/.lane-artifacts.$$"
+    # ⛔ THE SCRATCH MUST NOT BE ABLE TO MATCH ITS OWN SCAN. `mktemp` with no template creates the file
+    # in TMPDIR — which on a cell IS the scanned root (`$ATIF_ROOT` = /tmp) — BEFORE `find` runs, and the
+    # find was not told to exclude it. So the documented full sweep always matched the scratch file of
+    # this very tool: the pull then failed (the scratch is gone by then), so the run ended PULL-FAILED at
+    # exit 5 and collected nothing. It also inflated the row count, tripping the ROW_CAP abstention one
+    # file early. The reserved `.lane-artifacts.` prefix is what both `find` arms below exclude, so the
+    # fix does not depend on where TMPDIR points.
+    #
+    # ⛔ NO SINGLE-QUOTE CHARACTER IN THIS BLOCK, NOT EVEN IN A COMMENT: the whole block is one
+    # single-quoted argument to the LOCAL shell, so an unmatched quote here CLOSES it early and the rest
+    # is re-split locally — which silently shifts remote `$3` (the root) and makes every box read
+    # `unreadable-root`. Double quotes are safe; prefer them.
+    T=$(mktemp "${TMPDIR:-/tmp}/.lane-artifacts.t.XXXXXX" 2>/dev/null) || T="/tmp/.lane-artifacts.t.$$"
     if find "$R" -maxdepth 1 -type f -printf "" 2>/dev/null; then
       # ⛔ THE PATH IS THE LAST FIELD, AND THAT ORDER IS LOAD-BEARING. The first version put `%p` FIRST,
       # so a filename containing a TAB split the row and pushed the real size into the mtime column. The
@@ -186,7 +205,8 @@ scan() {
       # last, `read -r sz mt p` keeps a TAB inside the path (only the trailing field absorbs the
       # remainder) and the numeric size guard is then sound for real. A NEWLINE in a filename still
       # splits the record, and there the first field is the mangled tail — non-numeric, so it abstains.
-      find "$R" -maxdepth 1 -type f -name "$NAME" ${2:+-mmin -$2} \
+      # DOUBLE QUOTES around the exclusion, never single quotes (see the note above the scratch).
+      find "$R" -maxdepth 1 -type f ! -name ".lane-artifacts.*" -name "$NAME" ${2:+-mmin -$2} \
         -printf "%s\t%TY-%Tm-%TdT%TH:%TM:%TS\t%p\n" > "$T" 2>/dev/null
       rc=$?
     else
@@ -197,8 +217,8 @@ scan() {
       # `stat -c` is tried FIRST because Linux is the production platform; GNU `stat -f` means
       # --file-system and would SUCCEED while printing filesystem status, so the BSD arm would never
       # fall through and the mtime column would be garbage for every row.
-      L=$(mktemp 2>/dev/null) || L="/tmp/.lane-artifacts.l.$$"
-      find "$R" -maxdepth 1 -type f -name "$NAME" ${2:+-mmin -$2} > "$L" 2>/dev/null
+      L=$(mktemp "${TMPDIR:-/tmp}/.lane-artifacts.l.XXXXXX" 2>/dev/null) || L="/tmp/.lane-artifacts.l.$$"
+      find "$R" -maxdepth 1 -type f ! -name ".lane-artifacts.*" -name "$NAME" ${2:+-mmin -$2} > "$L" 2>/dev/null
       rc=$?
       : > "$T"
       while IFS= read -r f; do
@@ -305,7 +325,7 @@ UNRESOLVED_LABELS="$(MAP_RAW=$MAP_RAW awk 'BEGIN{ n=split(ENVIRON["MAP_RAW"],a,"
 # emit_box <label> <vm> … — `collect`-shaped output for one box. Sets R_REACHED=1 when it answered.
 emit_box() {
   local label="$1" vm="$2" pat="$3" exact="$4" outdir="$5" lines="$6" since="$7"
-  local raw first res rows p sz mt dest prev
+  local raw first res rows p sz mt dest prev row _r
   raw="$(scan "$vm" "$pat" "$since" "$exact")"; local _src=$?
   # ⛔ THE EXEC'S OWN STATUS IS CHECKED, not just the sentinel. `__OK__` is printed by the remote shell
   # BEFORE it streams the rows, so a channel that dies mid-scan (the 60 s timeout firing, a dropped
@@ -330,7 +350,14 @@ emit_box() {
     R_TRUNC=$((R_TRUNC + 1))
     res="$(printf '%s\n' "$res" | head -n "$ROW_CAP")"
   fi
-  while IFS="$(printf '\t')" read -r sz mt p; do
+  while IFS= read -r row; do
+    # ⛔ SPLIT BY PATTERN, NOT BY `read`. `IFS=<tab> read -r sz mt p` treats TAB as IFS *whitespace*, so it
+    # strips TABs at the END of the last field: a file named `x<TAB>` was read back as `/tmp/x` — a
+    # DIFFERENT file — which was then pulled and written as the artifact at exit 0 while the matched
+    # artifact was never collected (T28's class, relocated from an interior TAB to a trailing one).
+    # `${…%%…}` / `${…#…}` remove exactly ONE field and preserve the remainder byte for byte.
+    sz="${row%%$(printf '\t')*}"; _r="${row#*$(printf '\t')}"
+    mt="${_r%%$(printf '\t')*}"; p="${_r#*$(printf '\t')}"
     # ⛔ A NON-NUMERIC SIZE COLUMN MEANS THE ROW IS CORRUPT — a newline in a filename splits the record and
     # the leading field then holds a fragment of the path. The old code carried that through to a pull and
     # produced a WRONG VERDICT (a bogus path, then PULL-FAILED) rather than an abstention. Abstain instead:
@@ -396,7 +423,7 @@ emit_box() {
 # recorded and this run did not. Reached only from the exit-0 path (every requested box answered AND
 # every pull succeeded), which is the only state in which replacing the previous collection is honest.
 commit_index() {
-  local _l p _s _n new_keys
+  local _l p _s _n _row _r new_keys
   [ -n "${outdir:-}" ] || return 0
   if [ ! -f "${IDX:-}" ]; then mv -f "$IDX_NEW" "$IDX" 2>/dev/null; return 0; fi
   # ⛔ THE KEY IS THE *DESTINATION NAME*, NOT THE REMOTE PATH. A file's identity inside `$outdir` is
@@ -410,7 +437,12 @@ commit_index() {
   # (The row LAYOUT note lives on the writer in `emit_box`: `label<TAB>SIZE<TAB>path`, path LAST, because
   # the path is the only field that can contain a TAB.)
   new_keys="$(awk -F'\t' '{ p=$0; sub(/^[^\t]*\t/,"",p); sub(/^[^\t]*\t/,"",p); b=p; sub(/.*\//,"",b); print $1 "-" b }' "$IDX_NEW" 2>/dev/null)"
-  while IFS="$(printf '\t')" read -r _l _s p; do
+  while IFS= read -r _row; do
+    # ⛔ THE SAME TRAILING-TAB DEFECT AS `emit_box`'S LOOP: `IFS=<tab> read -r _l _s p` strips TABs at the
+    # end of `p`, so the sweep key is computed from a TRUNCATED basename and `rm -f` then targets the wrong
+    # name. Split by pattern and the key matches the file the promotion actually created.
+    _l="${_row%%$(printf '\t')*}"; _r="${_row#*$(printf '\t')}"
+    _s="${_r%%$(printf '\t')*}"; p="${_r#*$(printf '\t')}"
     [ -n "${p:-}" ] || continue
     _n="$_l-$(basename "$p")"
     # ⛔ A HERE-STRING, NOT A PIPE. `producer | grep -q` is the shape this repo's sigpipe guard exists
@@ -452,6 +484,12 @@ discard_stage() {
   OUT_STAGE=""
 }
 
+# la_cleanup_stage — the ONE cleanup body every trap shares, so the three handlers below cannot drift
+# apart and `KEEP_STAGE=1` has exactly one place to be honoured.
+la_cleanup_stage() {
+  if [ "${KEEP_STAGE:-0}" -eq 0 ] && [ -n "${OUT_STAGE:-}" ]; then rm -rf "$OUT_STAGE" 2>/dev/null; fi
+}
+
 # finish <rc> — the ONE terminal path for `collect`/`logs`: promote the collection on a complete run,
 # discard the side index AND the staged files on any other, and say plainly which collection the
 # directory now holds.
@@ -482,6 +520,11 @@ finish() {
         else
           echo "ℹ '$outdir' still holds the PREVIOUS collection — this run ended at exit $rc and did NOT replace it"
         fi
+      else
+        # ⛔ SILENCE IS NOT A DISCLOSURE. On a FRESH `--out` there is no previous index, so the old
+        # `[ -f "$IDX" ]` guard printed NOTHING at all — a caller had no statement at all that the
+        # directory it named had never been written.
+        echo "ℹ '$outdir' was NOT written — this run did not collect everything, so nothing was installed"
       fi
     fi
   fi
@@ -536,7 +579,15 @@ case "$verb" in
       # (`/tmp/.la-prev.$$`). `KEEP_STAGE=1` disarms the trap on the ONE path that must retain the staged
       # bytes: a failed promotion, where they are the only copy.
       KEEP_STAGE=0
-      trap 'e=$?; trap - EXIT INT TERM; if [ "${KEEP_STAGE:-0}" -eq 0 ] && [ -n "${OUT_STAGE:-}" ]; then rm -rf "$OUT_STAGE" 2>/dev/null; fi; exit $e' EXIT INT TERM
+      # ⛔ A SIGNAL MUST NOT EXIT 0. This used to be ONE handler installed for `EXIT INT TERM` that began
+      # `e=$?` — and at trap time `$?` is the status of the last COMPLETED command, not the signal. Bash
+      # defers an INT/TERM trap until the in-flight command returns, so a run reaped mid-scan (`kill -TERM`,
+      # the shape a reaper uses) reached the handler with `$?` = 0 and EXITED 0 — the tool's code for
+      # "found", from a run that measured nothing. Separate handlers let the signal carry its own status
+      # (130 INT / 143 TERM), and each disarms EXIT first so the handler's own `exit` does not re-enter it.
+      trap 'e=$?; trap - EXIT INT TERM; la_cleanup_stage; exit $e' EXIT
+      trap 'trap - EXIT INT TERM; la_cleanup_stage; exit 130' INT
+      trap 'trap - EXIT INT TERM; la_cleanup_stage; exit 143' TERM
     fi
     UNRES_NOTE=""
     [ "${NUNRESOLVED:-0}" -gt 0 ] && UNRES_NOTE=" (+$NUNRESOLVED unresolved label(s):$UNRESOLVED_LABELS)"
@@ -586,7 +637,19 @@ case "$verb" in
     fi
     # Partial coverage is disclosed on the SUCCESS path too: exit 0 with 1 of 3 boxes silent reads as
     # a complete result to any caller keying on the exit status.
-    echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es)${outdir:+; $R_PULLED pulled into $outdir}"
+    # ⛔ "PULLED INTO `$outdir`" IS ONLY TRUE WHEN `finish` WILL INSTALL THEM. `finish` promotes only on a
+    # COMPLETE run; this line used to promise `$outdir` had been written on a run that then DISCARDED the
+    # stage, so a caller reading the summary plus exit 0 looked for the artifact at a path that was empty.
+    # Say what actually happened, on the same predicate `finish` uses.
+    if [ -n "$outdir" ]; then
+      if [ "${R_PULLFAIL:-0}" -eq 0 ] && [ "$MISSING" -eq 0 ]; then
+        echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es); $R_PULLED pulled into $outdir"
+      else
+        echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es); $R_PULLED pulled and NOT installed — '$outdir' was NOT written (run incomplete)"
+      fi
+    else
+      echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es)"
+    fi
     if [ "$MISSING" -gt 0 ]; then
       echo "⚠ COVERAGE INCOMPLETE: $MISSING requested box(es) did NOT answer (${UNRESOLVED_LABELS:-exec failed}) — files may exist there"
     fi

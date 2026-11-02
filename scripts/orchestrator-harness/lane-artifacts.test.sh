@@ -833,8 +833,94 @@ unset STUB_SLEEP
 ls -a "$out" 2>/dev/null | grep -q '^\.la-stage\.' \
   && bad "T43 SIGTERM leaked a staging directory" "$(ls -a "$out")" \
   || ok "T43 SIGTERM leaves no staging directory"
-grep -q 'trap .*EXIT INT TERM' "$TOOL" && ok "T43 the tool installs the signal trap" \
-  || bad "T43 no signal trap installed" "$(grep -c 'trap ' "$TOOL")"
+# ⛔ THE SIGNAL MUST NOT REPORT SUCCESS. The first version of this case captured `rc` and never asserted
+# it, so the defect it was written beside went unseen: the single `EXIT INT TERM` handler began `e=$?`,
+# and bash defers an INT/TERM trap until the in-flight command returns — so `$?` was the status of the
+# COMPLETED scan (0) and the run EXITED 0, which is this tool's code for "found", from a run that
+# measured nothing. A test that observes a value and does not assert it pins nothing.
+eq "T43 SIGTERM is not reported as success (143)" "$rc" "143"
+# ⛔ ANCHORED ON THE INSTALL, not on `trap .*EXIT INT TERM`: the handler body contains its own
+# `trap - EXIT INT TERM` disarm, so the old pattern was satisfied BY the disarm and stayed green even
+# with the INT/TERM installs deleted entirely.
+grep -q "trap 'trap - EXIT INT TERM; la_cleanup_stage; exit 143' TERM" "$TOOL" \
+  && ok "T43 the tool installs a TERM handler that carries 143" \
+  || bad "T43 no TERM handler carrying 143" "$(grep -n 'trap ' "$TOOL")"
+
+echo "T44 — an EMPTY --out is a usage error, not a silent preview"
+# `need_val` only checked ARITY, so `--out "$unset"` fell through to the `[ -n "$outdir" ]` gate and the
+# run silently behaved as a preview-only invocation: exit 0, nothing written, no mention of --out. The
+# caller believes DIR was written. Same defect the PR already fixed one option over for `--box`.
+run collect ci-cause --out "" > "$Q/t44.txt" 2>&1
+rc=$?
+eq "T44 empty --out exits 64" "$rc" "64"
+grep -q 'needs a non-empty directory' "$Q/t44.txt" && ok "T44 names the empty --out" \
+  || bad "T44 silent on an empty --out" "$(head -3 "$Q/t44.txt")"
+
+echo "T45 — a FRESH --out is told it was NOT written when the run is incomplete"
+# With no PREVIOUS index, `finish` printed NOTHING: the `[ -f "$IDX" ]` guard suppressed the only line
+# that would have said so. Silence is not a disclosure. And the summary line two lines earlier claimed
+# ``$R_PULLED pulled into $outdir`` on a run that then DISCARDED the stage and left the directory empty.
+out="$Q/out45"; mkdir -p "$out"
+STUB_DEAD="pi-cell-3"; run collect ci-cause --out "$out" > "$Q/t45.txt" 2>&1
+rc=$?; STUB_DEAD=""
+eq "T45 exit 0 (the per-box contract is unchanged)" "$rc" "0"
+# ⛔ ASSERT THE `finish` LINE SPECIFICALLY. The summary line also contains "was NOT written (run
+# incomplete)", so a bare `was NOT written` grep was satisfied by the summary and stayed GREEN with the
+# `finish` disclosure deleted entirely (measured: mutant m3 = 150 passed). Pin the finish-only wording.
+grep -q "did not collect everything, so nothing was installed" "$Q/t45.txt" \
+  && ok "T45 finish says plainly that the directory was not written" \
+  || bad "T45 finish said nothing about the unwritten directory" "$(tail -4 "$Q/t45.txt")"
+grep -q 'pulled into' "$Q/t45.txt" \
+  && bad "T45 still claims files were 'pulled into' an empty directory" "$(grep 'pulled' "$Q/t45.txt")" \
+  || ok "T45 does not claim a collection it discarded"
+ls -A "$out" | grep -q . && bad "T45 the fresh --out is NOT empty" "$(ls -A "$out")" \
+  || ok "T45 nothing was installed in the fresh --out"
+
+echo "T46 — the scan does not match the tool's OWN scratch file"
+# `mktemp` with no template creates the scratch in TMPDIR, which on a cell IS the scanned root
+# (ATIF_ROOT = /tmp), BEFORE `find` runs — and `find` was never told to exclude it. So the documented
+# full sweep always matched the scratch, whose pull then failed (it is deleted by then): the run ended
+# PULL-FAILED at exit 5 and collected nothing. Reproduced by making TMPDIR and the scanned root the
+# same directory, which is the production relationship.
+b46="$Q/box-46"; rm -rf "$b46"; mkdir -p "$b46"; printf 'sole artifact' > "$b46/ci-cause.md"
+out="$Q/out46"; mkdir -p "$out"
+LANE_ARTIFACT_ROOT="$b46" TMPDIR="$b46" STUB_BOXES="pi-cell-1=$b46" \
+  run collect '*' --out "$out" --box pi-cell-1 > "$Q/t46.txt" 2>&1
+rc=$?
+eq "T46 exit 0 (the sweep is not poisoned by its own scratch)" "$rc" "0"
+grep -q "\.lane-artifacts\." "$Q/t46.txt" \
+  && bad "T46 the scratch file appears in the scan" "$(grep 'lane-artifacts' "$Q/t46.txt")" \
+  || ok "T46 the scratch file is excluded from the scan"
+eq "T46 exactly one row matched" "$(grep -c 'bytes,' "$Q/t46.txt")" "1"
+[ -f "$out/pi-cell-1-ci-cause.md" ] && ok "T46 the real artifact was collected" \
+  || bad "T46 collected nothing" "$(ls -A "$out")"
+
+# put the shared universe back for anything after this
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+
+echo "T47 — a filename ENDING in a TAB is collected from the right file"
+# `IFS=<tab> read -r sz mt p` treats TAB as IFS WHITESPACE, so it strips TABs at the END of the last
+# field: a file named `has<TAB>` was read back as `$Q/box-47/has` — a DIFFERENT file — which was pulled
+# and written as the artifact at exit 0 while the matched artifact was never collected. This is T28/T39's
+# class relocated from an interior TAB to a trailing one.
+b47="$Q/box-47"; rm -rf "$b47"; mkdir -p "$b47"
+printf 'TRAILING-TAB-BODY' > "$b47/has$(printf '\t')"
+printf 'DECOY-BODY' > "$b47/has"
+out="$Q/out47"; mkdir -p "$out"
+STUB_BOXES="pi-cell-1=$b47"; export STUB_BOXES
+run collect 'has' --out "$out" --box pi-cell-1 > "$Q/t47.txt" 2>&1
+rc=$?
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T47 exit 0" "$rc" "0"
+# The row for the TAB-named file must carry the WHOLE name, so its destination keeps the TAB.
+f47="$out/pi-cell-1-has$(printf '\t')"
+[ -f "$f47" ] && ok "T47 the TAB-named file was collected under its real name" \
+  || bad "T47 the trailing TAB was truncated (wrong file pulled or none)" "$(ls -A "$out")"
+[ -f "$f47" ] && eq "T47 it holds the TAB-named file's bytes" "$(cat "$f47")" "TRAILING-TAB-BODY"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"
