@@ -556,6 +556,19 @@ printf '4255 bash -c %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-cscript"
 surf "$TMP/ps-cscript"
 ck "10a-4: but 'bash -c <abs>/orch-loop.sh' IS an invocation and must still count" \
    "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+# (10a-5) A COMBINED SHORT OPTION INTRODUCES THE COMMAND STRING TOO (review round 9, P1). The arm
+# matched `-c` EXACTLY, so `bash -lc 'exec <path>/orch-loop.sh'` kept `_interp=1` for the command
+# string, which then matched the script patterns and fabricated `executes:` naming `<cwd>/exec …`.
+# `bash -lc '…'` is this repo's own operator idiom, and `executes:` is FIRST in the token chain, so
+# the fabricated token also MASKED a real `behind:`/`uncommitted-edit:` on the same box.
+printf '4256 bash -lc exec_%s/orch-loop.sh\n' "$GONE" > "$TMP/ps-lc"
+surf "$TMP/ps-lc"
+ck "10a-5: 'bash -lc exec <abs>/orch-loop.sh' is TEXT, not a fabricated controller" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+printf '4257 bash -lc %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-lcpath"
+surf "$TMP/ps-lcpath"
+ck "10a-5: but 'bash -lc <abs>/orch-loop.sh' IS an invocation (the path is the first word)" \
+   "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
 # ⛔ AN EXEC-ONLY DRIFT IS NOT A SURFACE HIT (review of #3202). `drift_q exec` bumps `problems` from inside
 # the surface block, so `problems > SURF_BASE` was true for a gone executing tree ALONE — and the summary
 # then offered "reseed the copy the RUNNING component uses" directly above "(c) … does not clear it": a

@@ -762,7 +762,17 @@ if [ "$SURFACE" -eq 1 ]; then
             # pre-change code caught. The `_i -eq 0` half is what keeps argv[0] working; the
             # `_interp` half is what keeps `grep -n x orch-loop.sh` (the word at `_i > 0`) a mention.
             if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
-          -c)
+          -c|-[!-]*c)
+            # ⛔ COMBINED SHORT OPTIONS COUNT (review round 9, P1). This arm used to match `-c` EXACTLY,
+            # so `bash -lc 'exec <path>/orch-loop.sh'` — and `-euc`, `-ic` — fell to the `-*` keep-arm,
+            # leaving `_interp=1` for the COMMAND STRING, which then matched `*/orch-loop.sh` and became
+            # a fabricated `executes:` naming `<cwd>/exec …`. `bash -lc '…'` is this repo's own operator
+            # idiom (docs/ops/fleet-harness-baseline.md, skills/cmux-cells/SKILL.md) and a live
+            # `/bin/bash -lc exec <path>/orch-loop.sh` is already recorded as a non-controller in
+            # tools/fleet/outcome_canary.test.py — so this is a measured population, not a hypothesis.
+            # ⛔ AND IT MASKS: `executes:` is FIRST in the token chain, so the fabricated token replaced
+            # a real `behind:`/`uncommitted-edit:` for the same box and went into the durable `drift=`
+            # field — a false DIAGNOSIS, not just a false red.
             # ⛔ `bash -c <abs>/orch-loop.sh` IS the invocation; `bash -c 'echo-bash-<dir>/orch-loop.sh'` is a
             # shell running TEXT — the self-match class the fleet inventory documents, and the arm that keeps
             # a lane's echo from becoming a candidate dir. The FIRST word decides, and only an ABSOLUTE one
