@@ -55,7 +55,7 @@ installer's promise. Where a row is a *state* that no file declares, it says so.
 
 ## What the matrix says
 
-Counting each **(component, platform)** pair: **7 improvised, 5 absent, 19 provisioned, 1 mixed** (32 pairs — recounted from the table on 2026-11-02, when row 1 moved from improvised/absent to provisioned/mixed).
+Counting each **(component, platform)** pair: **7 improvised, 5 absent, 19 provisioned, 1 mixed**, plus 2 `provisioned (on demand)` — **34 pairs in all** (17 rows × 2). Recounted from the table on 2026-11-02, when row 1 moved from improvised/absent to provisioned/mixed.
 
 The measured per-box state behind the cell column, so the generic verdicts above are not misread:
 
@@ -88,8 +88,9 @@ Three things, in order of how much they cost:
 
 ## Ranked fixes — the single change per gap, by landing capability restored
 
-Ranked by how much capability the change restores. #1 is first for a reason: it is the layer that
-decides whether a merge may happen at all, and it is currently the weakest on every cell.
+Ranked by how much capability the change restores. #1 was first for a reason — it is the layer that
+decides whether a merge may happen at all — and it has since LANDED (`merge_gate_srcs`, plus the
+`#3297` runtime refusal), so it is no longer the weakest on every cell: **the live list starts at #2**.
 
 | rank | gap (rows) | the single change | why this one | cost |
 |---|---|---|---|---|
@@ -98,7 +99,7 @@ decides whether a merge may happen at all, and it is currently the weakest on ev
 | **3** | 8 | **A cell watchdog**: a `systemd --user` timer (or a tmux-side respawn loop) that restarts a dead controller. The MAC half is now shipped — `templates/launchd/com.eldato.controller-watchdog.plist` → `scripts/orchestrator-harness/watchdog-loop.sh`, with the hand-provisioned `com.eldato.orchestrator-watchdog` added to `templates/launchd/RETIRED` so the installer removes it instead of leaving two mutating watchdogs — but **the job is not installed by the change that ships it**, and a cell still has no scheduler above the tmux session. ⛔ The CELL half is now shipped as `templates/systemd/eldato-orchestrator.service` + `install-controller-service.sh` (#2402), which makes the controller its own restarting unit instead of a watched session: installing it (the bring-up's `check_controller_service` does) is what closes this gap on a box | this is the literal content of the "self-healing" claim; today a cell controller dies silently until the unit is installed. The Mac's capability now exists as source, so what is left is arming it (an installer run) | one installer run on the Mac; a per-cell `install-controller-service.sh` run (the bring-up already does it) |
 | **4** | 11 | **Export `AGENT_INFRA_PATH` in the supervisor's controller command** (`cloud-cell-supervisor.sh::cmd_start`, next to `HOME=/REPO=/O=/OR=`) | restores `session-checks`, `auto-sync` and `sequence-enforcer` on cells, all of which currently skip **silently** — the worst failure shape | one word in a `tmux new-session` string; the README already states the requirement |
 | **5** | 6 | **Activate the git hooks on both**: `git config core.hooksPath .husky` in each repo (or a `husky` prepare step) | restores `commit-msg` + `pre-commit` on the Mac too, where they are also absent today — the row is *not* a cell-specific gap, so it is cheap and everywhere | one config line per repo; per-repo state, so it can never live in the layer |
-| **6** | 16 | **Unify the readiness verdicts** — make `cloud-cell-bringup.sh --check` probe the things the merge gate needs (shim resolvable, `scripts/gh-shim/gh` executable, PATH carries `~/.pi/agent/shims`) and delete the claim that `gh auth status` means "ready" | do this **after** 1-2, or it only turns every cell red. It is the row that stops the class from returning | small read-only probes; the same three the matrix used |
+| **6** | 16 | **Unify the readiness verdicts** — make `cloud-cell-bringup.sh --check` probe the things the merge gate needs (shim resolvable, `scripts/gh-shim/gh` executable, PATH carries `~/.pi/agent/shims`) and delete the claim that `gh auth status` means "ready" | do this **after** 2, or it only turns every cell red. It is the row that stops the class from returning | small read-only probes; the same three the matrix used |
 
 Rows **3, 4, 5, 12, 13, 14, 15** are provisioned on both platforms and need nothing.
 
