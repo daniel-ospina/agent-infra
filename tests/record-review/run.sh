@@ -2392,7 +2392,9 @@ fi
 # the single emitter. Round 37 also escaped the two backticked spans in the section-23 `pass`
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
-# the builder arms, so this pin is EXACT: 133, not a floor.
+# the builder arms, so this pin is EXACT: the count below, not a floor. (The literal that used to be
+# here said 133 while the pin said 183 — a review caught it; that same fix was made independently on
+# both sides of this rebase and is kept once.)
 # #3347: 185 -> 190 — section (32) pins the marker-present early return in `post_marker()`
 # (a marker already in the body must not be re-patched, the pre-fix pipe form must re-patch it,
 # and a body with NO marker must still be patched).
