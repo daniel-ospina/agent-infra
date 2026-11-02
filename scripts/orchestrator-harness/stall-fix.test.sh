@@ -180,6 +180,56 @@ run_sh "$D" 3 3
 has "DISPATCH FAILED" && ck 0 "a non-zero dispatcher exit is reported as DISPATCH FAILED" || ck 1 "a non-zero dispatcher exit is reported as DISPATCH FAILED"
 case "$(ledger_of "$D")" in *"stall-fix DISPATCH FAILED (exit 80)"*) ck 0 "…and the durable row carries the exit status" ;; *) ck 1 "…and the durable row carries the exit status" ;; esac
 
+# ⛔ A POST-LAUNCH EXIT 75 IS NOT A PRE-LAUNCH REFUSAL (fresh-context review, 2026-11-02).
+# `nonblocking-dispatch.sh:405-443` exits 75 for `NOT STARTED` and `FAILED EARLY` — the launch
+# HAPPENED and no lane is running — and the gate's own refusal line sits in the WORKER's log, which
+# is the `[land-backlog] REFUSED … rc=74` shape this file's own note records. Classifying every
+# non-zero exit as "refused before launching" bypassed the evidence reader and threw that line away.
+D="$(new_o b9)"
+stub "$D" 'printf "[land-backlog] REFUSED stallfix: landing ratio 0/9 over ceiling — no agent started\n" > "$O/bg/$1.log"; exit 75'
+run_sh "$D" 3 3
+has "NOT DISPATCHED" && ck 0 "a POST-launch exit 75 with a gate refusal in the worker log is NOT DISPATCHED" || ck 1 "a POST-launch exit 75 with a gate refusal in the worker log is NOT DISPATCHED"
+has "[land-backlog] REFUSED" && ck 0 "…and that gate's own line is quoted (it is not discarded on the non-zero path)" || ck 1 "…and that gate's own line is quoted (it is not discarded on the non-zero path)"
+lacks "refused before launching" && ck 0 "…and the pre-launch wording is not used for an exit that happened AFTER the launch" || ck 1 "…and the pre-launch wording is not used for an exit that happened AFTER the launch"
+
+# ...and a 75 that DID leave a worker record is "ran and already ended", not "refused".
+D="$(new_o b10)"
+stub "$D" 'printf "0\n" > "$O/bg/$1.rc"; exit 75'
+run_sh "$D" 3 3
+has "RAN AND ALREADY ENDED" && ck 0 "a POST-launch exit 75 with a worker record is RAN AND ALREADY ENDED" || ck 1 "a POST-launch exit 75 with a worker record is RAN AND ALREADY ENDED"
+lacks "refused before launching" && ck 0 "…and it does not claim a refusal the record contradicts" || ck 1 "…and it does not claim a refusal the record contradicts"
+
+echo
+echo "── §D the worker's tree is REFRESHED, not frozen at the first stall ──────────────────────────"
+# ⛔ (fresh-context review, 2026-11-02) The throwaway worktree was created ONCE and then reused for
+# every later dispatch, so a box stalled for days would get `file:line` reports resolved against a
+# frozen tree — and a repair lane acts on exactly those reports. Driven on a real repository: the
+# worktree is created at commit A, the base moves to B, and a SECOND dispatch must report B.
+GR="$TMP/grepo"
+git init -q -b main "$GR" >/dev/null 2>&1 || true
+gc() { git -C "$GR" -c user.email=t@example.com -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m "$1"; }
+gc A >/dev/null 2>&1 || true
+git -C "$GR" update-ref refs/remotes/origin/main HEAD >/dev/null 2>&1 || true
+SHA_A="$(git -C "$GR" rev-parse --short HEAD 2>/dev/null || true)"
+D="$(new_o d1)"; stub "$D" 'printf "1\tallowed\t26\t80\t9\t8\tprfix\t%s\t/tmp\tbash\n" "$1" >> "$HOME/.pi/agent/state/spawn-gate.tsv"'
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt2" HARNESS_REPO="$GR" DRAIN_STALL_FIX_EVERY=3 \
+       STALL_FIX_VERIFY_SECS=1 bash "$SH" 3 90 2>&1)"
+if [ -n "$SHA_A" ]; then
+  has "worktree $SHA_A" && ck 0 "the dispatch line names the commit the worker will actually read" || ck 1 "the dispatch line names the commit the worker will actually read"
+  gc B >/dev/null 2>&1 || true
+  git -C "$GR" update-ref refs/remotes/origin/main HEAD >/dev/null 2>&1 || true
+  SHA_B="$(git -C "$GR" rev-parse --short HEAD 2>/dev/null || true)"
+  [ -n "$SHA_B" ] && [ "$SHA_A" != "$SHA_B" ]; ck $? "fixture: the base actually advanced (A != B)"
+  OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt2" HARNESS_REPO="$GR" DRAIN_STALL_FIX_EVERY=3 \
+         STALL_FIX_VERIFY_SECS=1 bash "$SH" 3 90 2>&1)"
+  has "worktree $SHA_B" && ck 0 "a SECOND dispatch reports the NEW base (the worktree is refreshed, not frozen)" || ck 1 "a SECOND dispatch reports the NEW base (the worktree is refreshed, not frozen)"
+  lacks "worktree $SHA_A" && ck 0 "…and no longer reports the stale commit" || ck 1 "…and no longer reports the stale commit"
+  [ "$(git -C "$D/wt2" rev-parse HEAD 2>/dev/null || true)" = "$(git -C "$GR" rev-parse HEAD 2>/dev/null || true)" ] \
+    && ck 0 "…and the worktree's own HEAD is the refreshed base" || ck 1 "…and the worktree's own HEAD is the refreshed base"
+else
+  ck 1 "fixture: a git repository could be initialised (the refresh arm cannot be driven without one)"
+fi
+
 echo
 echo "── §C non-vacuity — a mutant that reports DISPATCHED without evidence must redden §B ───────"
 # The mutation removes the EVIDENCE requirement from the positive arm (an unconditional `started`),

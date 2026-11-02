@@ -215,13 +215,32 @@ fi
 # stall fix runs in its own worktree of the harness repo (throwaway, detached).
 WT="${STALL_FIX_WORKTREE:-$O/state/wt-stallfix}"
 HREPO="${HARNESS_REPO:-$HOME/ai-harness-main}"
-if [ ! -e "$WT/.git" ] && [ -e "$HREPO/.git" ]; then
-  git -C "$HREPO" worktree add -f --detach "$WT" origin/main >/dev/null 2>&1 || true
+# ⛔ A THROWAWAY WORKTREE IS NOT A ONE-TIME WORKTREE (fresh-context review, 2026-11-02). It was
+# created ONCE and then reused by every later dispatch, pinned to `$HREPO`'s LOCAL `origin/main` as of
+# the FIRST stall — while this escalation keeps firing every `DRAIN_STALL_FIX_EVERY` stalled passes.
+# The brief orders the worker to report `file:line — what is wrong`, so a box stalled for days would
+# get line numbers resolved against a frozen tree, and those reports are what a repair lane acts on.
+# This is the "stale flag that records a past state and is never revalidated" class. Refresh the base
+# on EVERY dispatch, and name the commit so a report's provenance is checkable.
+if [ -e "$HREPO/.git" ]; then
+  if [ ! -e "$WT/.git" ]; then
+    git -C "$HREPO" worktree add -f --detach "$WT" origin/main >/dev/null 2>&1 || true
+  else
+    # The BASE is $HREPO's own `origin/main`, not the worktree's copy of it: after a failed fetch (an
+    # offline box, a moved remote) the local tracking ref is still newer than a checkout pinned days
+    # ago, and it is the same ref the `worktree add` arm above resolves. Refresh from it either way.
+    git -C "$HREPO" fetch -q origin main >/dev/null 2>&1 || true
+    _base="$(git -C "$HREPO" rev-parse --verify -q refs/remotes/origin/main 2>/dev/null || true)"
+    [ -n "$_base" ] && git -C "$WT" checkout -q --detach "$_base" >/dev/null 2>&1 || true
+  fi
 fi
 if [ ! -e "$WT/.git" ]; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no usable worktree: $WT — set HARNESS_REPO)"
   exit 0
 fi
+# The tree the worker actually reads. Printed in every dispatch line below: a report resolved against
+# an unnamed commit cannot be checked, and an empty value is reported as UNKNOWN rather than guessed.
+_wtsha="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || true)"
 # ── THE DISPATCH — AND WHY ITS EXIT STATUS IS NOT THE VERDICT ─────────────────────────────────────
 # ⛔ A REFUSED SPAWN MUST NOT READ AS A DISPATCHED ONE (review P1, 2026-11-01).
 # `nonblocking-dispatch.sh` runs `run_agent` — and with it EVERY spawn gate — inside a backgrounded
@@ -288,14 +307,23 @@ _launch=0
 KIND=prfix "$DISP" "$NAME" "$WT" "$BRIEF" "$TIMEOUT" prfix >>"$O/logs/stall-fix.log" 2>&1 || _launch=$?
 
 _verdict="unproven"; _vmax="${STALL_FIX_VERIFY_SECS:-10}"; _vwaited=0; _bpid=""
+is_num "${_vmax:-}" && [ "$_vmax" -ge 1 ] || _vmax=10
+[ "$_vmax" -gt 120 ] && _vmax=120
+# ⛔ A NON-ZERO EXIT IS NOT ALWAYS A PRE-LAUNCH REFUSAL (fresh-context review, 2026-11-02). The
+# dispatcher ALSO exits 75 AFTER the launch — `NOT STARTED` (it exited rc=0 without writing a byte)
+# and `FAILED EARLY` (it started and died) at `nonblocking-dispatch.sh:405-443` — and that is
+# precisely the `[land-backlog] REFUSED … rc=74` case this file's own note above records. Treating
+# every non-zero exit as "refused before launching" bypassed the evidence reader and threw that
+# gate's own line away, so the operator was told the wrong thing about a worker that DID run. The
+# reader therefore runs on BOTH paths, and the foreground-refusal wording is reserved for the codes
+# the dispatcher refuses BEFORE it forks (usage 2, missing helper/gate-policy 78, brief-gate 80).
 if [ "$_launch" -ne 0 ]; then
-  # A NON-ZERO EXIT IS A FOREGROUND REFUSAL (usage 2, brief-gate 80, missing helper/gate-policy 78, a
-  # `cd` failure): the dispatcher refused BEFORE it forked, so nothing was launched and no worker
-  # record exists. Its remedy text is on this script's own stderr, not the worker log.
-  _verdict="failed"
+  if spawn_row refused; then _verdict=refused
+  elif [ -n "$(gate_refusal)" ]; then _verdict=refused
+  elif [ -s "$BRC" ]; then _verdict=ended
+  elif spawn_row allowed; then _verdict=started
+  else _verdict=failed; fi
 else
-  is_num "${_vmax:-}" && [ "$_vmax" -ge 1 ] || _vmax=10
-  [ "$_vmax" -gt 120 ] && _vmax=120
   while :; do
     if spawn_row refused; then _verdict=refused; break; fi
     if spawn_row allowed; then _verdict=started; break; fi
@@ -317,14 +345,14 @@ _record() {
 
 case "$_verdict" in
   started)
-    log_line "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; spawn-gate ledger: allowed TAG=$NAME; brief ${BRIEF#$O/}; report $REPORTF)"
+    log_line "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; spawn-gate ledger: allowed TAG=$NAME; brief ${BRIEF#$O/}; report $REPORTF; worktree ${_wtsha:-UNKNOWN})"
     _record "stall-fix dispatched"
     exit 0 ;;
   running)
     # The pid is alive and nothing refused, but this box published no spawn-gate row either (the pi
     # shim is a per-box install). Say exactly that: a live process is not proof an AGENT started, and
     # claiming one would be the same fail-open in a narrower window.
-    log_line "DRAIN STALL -> STALL FIX LAUNCH ACCEPTED, AGENT START UNPROVEN (pass ${SEEN}; worker pid ${_bpid:-?} is alive but no spawn-gate ledger row for TAG=$NAME and no refusal within ${_vmax}s — the pi spawn-point ledger may not be installed on this box; brief ${BRIEF#$O/}; worker log $BLOG)"
+    log_line "DRAIN STALL -> STALL FIX LAUNCH ACCEPTED, AGENT START UNPROVEN (pass ${SEEN}; worker pid ${_bpid:-?} is alive but no spawn-gate ledger row for TAG=$NAME and no refusal within ${_vmax}s — the pi spawn-point ledger may not be installed on this box; brief ${BRIEF#$O/}; worktree ${_wtsha:-UNKNOWN}; worker log $BLOG)"
     _record "stall-fix launch-accepted (agent start unproven)"
     exit 0 ;;
   refused)
@@ -341,7 +369,16 @@ case "$_verdict" in
     # `nonblocking-dispatch.sh`'s own refusal text went to this script's stderr (`$O/logs/stall-fix.log`
     # when the controller runs it), and any worker-side refusal to `$BLOG`. Name BOTH: the old message
     # pointed only at the first, which is where a gate refusal is NOT written.
-    log_line "DRAIN STALL -> STALL FIX DISPATCH FAILED (nonblocking-dispatch.sh refused before launching, exit ${_launch}; see $O/logs/stall-fix.log and $BLOG) — the box is still stalled"
+    # ⛔ AND NAME ONLY WHAT THE CODE MEANS (fresh-context review, 2026-11-02). "Refused before
+    # launching" is TRUE for the foreground codes (usage 2, missing helper/gate-policy 78, brief-gate
+    # 80) and FALSE for the post-launch 75s — but those are classified above, so an exit that reaches
+    # here with a code outside the foreground set is a LAUNCH WHOSE FATE IS UNREAD: no row, no refusal
+    # line, no worker record. Say that, instead of asserting a refusal the evidence does not show.
+    case "$_launch" in
+      2|78|80) _failwhy="nonblocking-dispatch.sh refused before launching, exit ${_launch}" ;;
+      *)      _failwhy="the dispatcher exited ${_launch} and left NO spawn-gate row, NO refusal line and NO worker record — its fate is UNREAD, not a proven refusal" ;;
+    esac
+    log_line "DRAIN STALL -> STALL FIX DISPATCH FAILED (${_failwhy}; see $O/logs/stall-fix.log and $BLOG) — the box is still stalled"
     _record "stall-fix DISPATCH FAILED (exit ${_launch})"
     exit 0 ;;
   *)

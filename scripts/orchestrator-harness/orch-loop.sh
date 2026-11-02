@@ -5966,6 +5966,16 @@ PY
     _wraw="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
     _wmin=180
     case "$_wraw" in ''|*[!0-9]*) : ;; *) _wmin=$(( 10#$_wraw )) ;; esac
+    # ⛔ THE SAME TWO CLAMPS `mp_recent_land` APPLIES, SPELLED HERE (fresh-context review, 2026-11-02).
+    # The function refuses `0` (`find -mmin -0` matches nothing: a permanently empty answer, i.e. a
+    # permanent false stall) and falls back to 180 — this copy did not, so `MERGE_PRIORITY_MAX_AGE_MIN=0`
+    # printed `no PR merged in 0m … the 0m window` for a window the function actually searched at
+    # 360m: an age claim the empty answer does not support. A magnitude that overflows `_wmin * 2` is
+    # worse: `_wbound` goes NEGATIVE and is printed as the box's own stall age (`no PR merged in -2m`,
+    # `age=-2`), which no reader can tell from a clock fault. Both clamp to the default, which is what
+    # the function this window is read from already does.
+    [ "$_wmin" -ge 1 ] || _wmin=180
+    [ "$_wmin" -le 1000000 ] || _wmin=180
     _wbound=$(( _wmin * 2 ))
     # ⛔ THE DISPATCH BELOW MUST SEE "DID THIS PASS STALL", NOT "WHAT IS THE COUNTER".
     # `_dpass` is set only inside the stall arm; read on the drain-alive path it defaults to 0,
