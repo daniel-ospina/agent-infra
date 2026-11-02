@@ -5144,6 +5144,9 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
         export STUB_HEAD_SHA="$sha" DELTA_GIT_DIR="$DG"
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main
+        # (10a) An authored delta needs the artifact to NAME the range, so the default
+        # body states it exactly as a reviewer would quote it.
+        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         for kv in "$@"; do export "$kv"; done
         rc=0
@@ -5499,6 +5502,20 @@ assert_eq "$RECORD_RC" "2" "20h10 delta + --force-stale is refused (rc 2, argume
 assert_contains "$RECORD_ERR" "incompatible with delta evidence" "20h10 the refusal names the contradiction"
 [ -f "$(Q2 $EH13)" ] && bad "20h10 no record was written" || ok "20h10 no record was written"
 
+# 20h12 THE RANGE MUST BE THE REVIEWER'S CLAIM. A committer date records when a
+#      commit was CREATED, not when it was pushed, so an OLD-DATED branch merged in
+#      after the review never moves the date anchor — and the old cover would then
+#      "cover" content nobody read. The plain head-bound path refuses that same head;
+#      an authored delta must not accept what it rejects. A cover that does not NAME
+#      the range is refused, and 20d2/20h5/20h7/20h8 (whose bodies do name it) still
+#      record — so the arm discriminates on the claim, not on the dates.
+EH14=425154; rm -f "$(Q2 $EH14)"
+run_record_delta $EH14 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
+assert_eq "$RECORD_RC" "3" "20h12 an authored delta whose cover does NOT name the range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "does not NAME the range" "20h12 the refusal names the missing range claim"
+[ -f "$(Q2 $EH14)" ] && bad "20h12 no record was written" || ok "20h12 no record was written"
+
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -5530,6 +5547,7 @@ mut_run() { # <mutant-script> <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC
         export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" DELTA_GIT_DIR="$DG"
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra" STUB_HEAD_SHA="$sha"
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main STUB_COMMIT_DATES_DIR="$T/dates"
+        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         for kv in "$@"; do export "$kv"; done
         rc=0
         bash "$mut" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" >/dev/null 2>"$T/merr" || rc=$?
@@ -5632,6 +5650,10 @@ MUT="$(mk_mutant unnamedcheck '  thr=0
   target_head_red "$to" || thr=$?' '  thr=3')"
 mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
 
+# M12 — THE RANGE CLAIM. Deleting the (10a) arm must mint `clean` from a cover that
+#       never says which range it reviewed — the date-only inference the arm replaced.
+MUT="$(mk_mutant rangeclaim '    if [ "$body_claim" -ne 1 ]; then' '    if false; then')"
+mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
 # M8 — the TIER arm. Widening the premise back to the non-review tiers must let a
 #      clean-micro prior record mint `clean`. Inline, not via mut_check: mut_check
 #      clears the record and this vector's premise IS a planted record.
@@ -5650,7 +5672,7 @@ else
 fi
 echo "   MUTATION-MATRIX($MM_OK/$MM)"
 set -e
-if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every DISPATCHED guard is load-bearing (cells below are the ones measured; the other delta arms are pinned by refusal vectors only)"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
+if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every dispatched cell behaved as its vector predicted — the guard-load-bearing cells AND M1b, which deliberately measures the OPPOSITE (that the A==B arm is REDUNDANT because the empty-diff arm already refuses it); the other delta arms are pinned by refusal vectors only, not by a mutant"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
 
 cd "$ORIG_PWD" 2>/dev/null || cd "$T" || true
 echo ""
