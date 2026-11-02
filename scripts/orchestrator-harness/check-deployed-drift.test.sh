@@ -431,8 +431,11 @@ echo
 echo "── §9g a run with NO \$O compared answers harness=surface, and says nothing was identified ──"
 # ⛔ THIS GRADES A POPULATION NO ASSERTION COVERED BEFORE (review of #3090). When `$O` is absent (or a
 # `--surface` run finds no readable record for one) every question about `$O` abstains, and the token
-# block only runs at all because the SURFACE pass raised `problems` — so the token here names the OTHER
-# dir's drift and says nothing about `$O`. §5b grades the other `surface` shape (a clean `$O` plus a
+# block only runs at all because the SURFACE pass raised `problems` — so the token names a real drift in
+# a copy this box carries. ⛔ But NOT necessarily "the OTHER dir": with no record `$O` has no surface
+# exclusion, so an `$O` that drifted is itself the dir the `surface:` line names and the token is about
+# it (measured; the fixtures here use an ABSENT `$O`, which is why this assertion is sound either way).
+# §5b grades the other `surface` shape (a clean `$O` plus a
 # hit in another dir) and §9e runs with the surface candidates CLEAN, so it reaches the OK summary and
 # prints no token at all. Nothing stated what THIS shape's token is, which is why the README could
 # describe `surface` as `Q_BYTES=0`-gated. (This comment previously said the arm "emits `surface`

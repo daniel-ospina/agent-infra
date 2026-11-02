@@ -1314,13 +1314,22 @@ if [ "$problems" -gt 0 ]; then
     # ⛔ THE `O_ABSENT` ARM PRECEDES ALL OF THESE (review of #3090): no question about `$O` was
     # answered, so there is nothing to order it against — and it is NOT the `Q_BYTES=0` surface arm
     # below, where that flag is a real answer rather than the initialisation at the top of the script.
-    # It is reachable only when the SURFACE pass raised `problems` (`SURF_HIT`), so the token still
-    # names a real drift — in another dir — and never a statement about `$O`.
-    # ⛔ THE LAST TWO ARE ALTERNATIVES, NOT A CHAIN (review of #3090, on this PR's own comment): the
-    # `surface` arm below requires `Q_BYTES=0`, so a surface hit that coincides with `$O`'s own bytes
-    # differing falls through to `payload-differs`. A stated chain ending `surface > payload-differs`
-    # described an order the `if` below does not implement — the exact class of claim this PR exists
-    # to remove. The other-directory fact is carried by the report body's surface-hit line.
+    # It is reachable only when the SURFACE pass raised `problems` (`SURF_HIT`), so the token names a
+    # real drift in a copy this box carries — but ⛔ NOT necessarily "another dir": `$O` is a surface
+    # candidate whenever it is a harness dir (`hu_dir_state "$O" = dir`), and its exclusion is
+    # `O_ABSENT=0`-gated, so with no record `$O` has no exclusion and an `$O` that drifted is the dir
+    # this token is about. The NAME in the `surface: <dir>` line is what says which dir; the token
+    # alone does not. (An earlier version of this comment said "in another dir … never a statement
+    # about `$O`", and that sentence was copied into README §4.3, where it told an operator that
+    # redeploying `$O` cannot clear the hit — wrong on precisely the shape where it does.)
+    # ⛔ THE LAST TWO ARE ALTERNATIVES, NOT A CHAIN (review of #3090, on this PR's own comment) — and
+    # WHICH ONE YOU GET IS DECIDED BY WHETHER A RECORD EXISTS, not by where the drift is. With a
+    # record (`O_ABSENT=0`) the `surface` arm below requires `Q_BYTES=0`, so a surface hit that
+    # coincides with `$O`'s own bytes differing falls through to `payload-differs`. With NO record
+    # (`O_ABSENT=1`) this arm has already answered `surface` before that one is reached — measured:
+    # a record-less `$O` whose `merge-one.sh` differs from `$REF` reports `harness=surface`, never
+    # `payload-differs`. A stated chain ending `surface > payload-differs` described an order the
+    # `if` below does not implement — the exact class of claim this PR exists to remove.
     HTOKEN="source-dirty:${HAS:0:12}"
   elif [ "$SURF_HIT" -eq 1 ] && [ "$Q_RECORD" -eq 0 ] && [ "$Q_IDENT" -eq 0 ] && [ "$Q_BYTES" -eq 0 ]; then
     # $O answered clean; the hit is in another harness dir this box carries. `payload-differs` would be
