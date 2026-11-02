@@ -21,7 +21,10 @@
 # Bounded: one dispatch per DRAIN_STALL_FIX_EVERY stalled passes (default 3), so a
 # stall that nobody fixes does not spawn a worker per cycle forever.
 #
-# Exit: 0 whatever happened to the dispatch (it is reported, never raised), 2 usage error.
+# Exit: 0 whatever happened to the dispatch (it is reported, never raised).
+# ⛔ NO USAGE PATH (review P3, 2026-11-02): this file used to advertise "2 usage error" while having no
+# argument parser at all — a claim nothing could produce. Every input degrades to a skip or a default;
+# `2` is never returned, and the dispatcher's OWN `2` is reported, never raised (see the verdict arm).
 set -uo pipefail
 
 O="${O:-$HOME/orchestrator}"
@@ -48,6 +51,20 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 # a bound.
 is_num "$EVERY" && [ "$EVERY" -ge 1 ] || EVERY=3
 is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
+# ⛔ BOTH SINKS THIS SCRIPT OPENS ARE BOUNDED (review P3, 2026-11-02). Nothing else in the tree prunes
+# them: `state/briefs/` had no production writer before this script, and no reaper names either file.
+# Measured from the knobs: `CYC=240`s ⇒ a stalled pass every ~4 min ⇒ one dispatch per
+# `DRAIN_STALL_FIX_EVERY=3` ⇒ ~120 brief files/day, unbounded, on exactly the population this
+# escalation exists for (a box stalled for hours or days), in the directory the controller `find`s
+# over. "A device that fills silently is the defect #1765 exists for" — the same rule `pi_gate_ledger`
+# enforces with its own cap, and the same one-generation rotation (the series an operator reads after
+# an incident is the last two). The cap is a module constant, not an env knob: the size of a ledger
+# is not a policy a caller should be able to lift. The brief bound is a knob because retention is.
+STALL_FIX_LEDGER_MAX_BYTES=5242880
+STALL_FIX_BRIEF_MAX_AGE_MIN="${STALL_FIX_BRIEF_MAX_AGE_MIN:-1440}"
+# ⛔ `-mmin -0` matches NOTHING (the very trap this PR's own `mp_recent_land` clamp exists for), so a
+# zero or non-numeric bound would prune every brief including the one just written. Refuse it here.
+is_num "$STALL_FIX_BRIEF_MAX_AGE_MIN" && [ "$STALL_FIX_BRIEF_MAX_AGE_MIN" -ge 1 ] || STALL_FIX_BRIEF_MAX_AGE_MIN=1440
 # ⛔ A PASS COUNTER OF 0 IS NOT "THE ZEROTH STALL": the caller sets it only inside the stall
 # arm, so 0 means the caller is on a healthy pass (or passed it through a default). Refusing
 # here as well makes the bound hold even if a future call site forgets the gate.
@@ -75,6 +92,13 @@ fi
 BRIEF_DIR="$O/state/briefs"
 mkdir -p "$BRIEF_DIR" 2>/dev/null || {
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (state/briefs is unwritable)"; exit 0; }
+# Prune BEFORE minting the new brief, and only this script's own files (`stall-fix-*.md`, not the whole
+# directory — another writer may legitimately share it). `-mmin +N` is "older than N minutes"; it is
+# the correct polarity for eviction and cannot be confused with the `-mmin -N` selection window. The
+# bound is enforced on every dispatch the script actually makes, which is the only cadence that can
+# create the files — no dependency on an hourly reaper existing on the box.
+find "$BRIEF_DIR" -maxdepth 1 -type f -name 'stall-fix-*.md' \
+  -mmin "+$STALL_FIX_BRIEF_MAX_AGE_MIN" -exec rm -f {} + 2>/dev/null || true
 BRIEF="$BRIEF_DIR/stall-fix-$(date -u '+%Y%m%dT%H%M%SZ').md"
 # ⛔ THE WORKER'S NAME — AND ITS OWN REPORT PATH — ARE MINTED HERE, BEFORE THE BRIEF (review P1,
 # 2026-11-01). The dispatch is bounded by DRAIN_STALL_FIX_EVERY stalled PASSES (default 3, i.e. one
@@ -338,9 +362,18 @@ else
   done
 fi
 # One writer for the durable row, so no verdict can be recorded without the sentence that produced it.
+# ⛔ ROTATED, NOT APPENDED FOREVER (review P3, 2026-11-02). One `.1` generation, checked before the
+# write, keeps the total bounded at ~2x the cap with no timer, no reaper dependency and no
+# cross-process state — the identical mechanism `pi_gate_ledger` uses for the highest-volume sink in
+# the tree. Rotation costs nothing a reader needs: the row being written survives, and the previous
+# generation holds the series an operator reads after an incident.
 _record() {
+  local _f="$O/state/drain-stall-dispatch.log"
+  if [ -f "$_f" ] && [ "$(wc -c < "$_f" 2>/dev/null || printf '0')" -ge "$STALL_FIX_LEDGER_MAX_BYTES" ]; then
+    mv -f "$_f" "$_f.1" 2>/dev/null || :
+  fi
   printf '%s\t%s\tpass=%s\tunowned=%s\tage_min=%s\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" >> "$O/state/drain-stall-dispatch.log" 2>/dev/null
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" >> "$_f" 2>/dev/null
 }
 
 case "$_verdict" in

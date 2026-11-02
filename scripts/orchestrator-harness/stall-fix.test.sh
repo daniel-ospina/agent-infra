@@ -16,6 +16,9 @@
 #     and a REFUSAL never prints DISPATCHED (the #3181 P1 regression)
 # §C  NON-VACUITY — a mutant that reports `started` without evidence makes §B's central assert FAIL.
 #     Without this arm "NOT DISPATCHED" could be green on a tree where nothing is ever dispatched.
+# §D  the worker's worktree is REFRESHED on every dispatch, not frozen at the first stall
+# §E  the two sinks this script opens are BOUNDED — a brief older than the retention bound is pruned,
+#     the escalation ledger rotates at its cap, and a file this script does not own is left alone.
 #
 # Hermetic: every case builds its own `$O`, its own `$HOME` (the spawn-gate ledger lives under it),
 # its own fake worktree and its own stub dispatcher. No network, no real runtime, no `pi`.
@@ -247,6 +250,49 @@ if [ -s "$MUT" ] && grep -qF 'if true; then _verdict=started' "$MUT"; then
 else
   ck 1 "the mutant was actually produced (a mutation that never applied proves nothing)"
 fi
+
+echo
+echo "── §E the sinks are BOUNDED — prune and rotation, not two files that grow forever ───────────"
+# ⛔ review P3, 2026-11-02: `state/briefs/stall-fix-*.md` (~4 KB each, ~120/day on a stalled box) and
+# `state/drain-stall-dispatch.log` (one row per dispatch, forever) were the only two unbounded sinks in
+# the harness with no pruner and no rotation — on exactly the population this escalation exists for.
+# `pi_gate_ledger` bounds its own write with one-generation rotation ("a device that fills silently is
+# the defect #1765 exists for"); these two now do the same.
+D="$(new_o e0)"; stub "$D" "$STUB_OK_TOUCH"
+# A brief past the retention bound, spelled with an absolute old date (`touch -t`, not `-d '3 days
+# ago'`) so it parses identically on BSD and GNU. A file this script does NOT own sits beside it: the
+# prune must be scoped to `stall-fix-*.md`, because another writer may legitimately share the dir.
+touch -t 202001010000 "$D/state/briefs/stall-fix-20200101T000000Z.md"
+touch -t 202001010000 "$D/state/briefs/keep-me.md"
+[ -f "$D/state/briefs/stall-fix-20200101T000000Z.md" ]; ck $? "fixture: a stale brief exists before the run"
+run_sh "$D" 3 3
+[ ! -f "$D/state/briefs/stall-fix-20200101T000000Z.md" ]; ck $? "a brief older than the retention bound is PRUNED"
+[ -f "$D/state/briefs/keep-me.md" ]; ck $? "…and a file this script does not own is left alone"
+_nb="$(find "$D/state/briefs" -maxdepth 1 -type f -name 'stall-fix-*.md' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$_nb" = "1" ]; ck $? "…and exactly the NEW brief remains (pruned before minting, so the run's own brief survives)"
+
+D="$(new_o e1)"; stub "$D" "$STUB_OK_TOUCH"
+# The cap is a module constant, and a test must not be able to lift it — so this writes the REAL cap
+# rather than injecting a smaller one. 5 MiB of filler is a single fast write and keeps the assert
+# honest about the value the script ships.
+dd if=/dev/zero bs=1024 count=5120 2>/dev/null | tr '\0' 'x' > "$D/state/drain-stall-dispatch.log"
+_sz0="$(wc -c < "$D/state/drain-stall-dispatch.log" | tr -d ' ')"
+[ "$_sz0" -ge 5242880 ]; ck $? "fixture: the ledger is at (or past) the cap before the run ($_sz0 bytes)"
+run_sh "$D" 3 3
+[ -f "$D/state/drain-stall-dispatch.log.1" ]; ck $? "a ledger at the cap is ROTATED to one .1 generation"
+_sz1="$(wc -c < "$D/state/drain-stall-dispatch.log" | tr -d ' ')"
+[ "$_sz1" -lt 1000 ]; ck $? "…and the live ledger restarts small ($_sz1 bytes), not at the cap"
+grep -q 'stall-fix' "$D/state/drain-stall-dispatch.log" 2>/dev/null; ck $? "…and the row that triggered the rotation is IN the live file, not discarded"
+
+# Non-vacuity: the retention bound is a POLICY knob, but zero is not a bound — `-mmin -0` matches
+# nothing, so an unclamped `0` would evict every brief including the one this run just minted.
+D="$(new_o e2)"; stub "$D" "$STUB_OK_TOUCH"
+touch -t 202001010000 "$D/state/briefs/stall-fix-20200101T000000Z.md"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       STALL_FIX_BRIEF_MAX_AGE_MIN=0 bash "$SH" 3 90 2>&1)"
+_nb="$(find "$D/state/briefs" -maxdepth 1 -type f -name 'stall-fix-*.md' 2>/dev/null | wc -l | tr -d ' ')"
+[ "$_nb" -ge 1 ]; ck $? "a retention bound of 0 falls back to the default AND still mints this run's brief"
+
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
