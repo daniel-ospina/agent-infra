@@ -3513,6 +3513,10 @@ pool_rc=$?
 # (orch-loop.sh's queue_state_token prints it together with its age, so a frozen value cannot pass
 # as a fresh one). It is the READ's state, not the backlog's: it stays true even when a later step of
 # this pass refuses, and it never overrides the fail-closed refusals below.
+# The ORDER's provenance for THIS pass (severity | priority-unreadable | empty). Declared here, beside
+# the pool read-state, because the handoff line at the end must report what the writer actually did
+# rather than assert severity over a pass whose reorder failed (review P1).
+QUEUE_ORDER_STATE=""
 QUEUE_STATE_FILE="$O/state/queue-state"
 queue_state_write() {  # <STATE> — record what THIS pass learned about the pool, for the heartbeat
   mkdir -p "$O/state" 2>/dev/null
@@ -3612,9 +3616,11 @@ queue_state_write "$POOL_STATE"
 # fleet-board TTL and the delay is bounded and named in the skip line — and it is why the TTL is a
 # SEAM: a fleet that needs faster collision retries lowers it, at the cost of re-reading more often.
 #
-# ⛔ AND "WE SKIPPED" IS NOT "THERE IS NO WORK". Nothing in candidates.txt or checked.txt is read
-# or written by a skip, and the line below says `queue=READ(n)` first and `SKIPPED` second. #1736's
-# vocabulary is preserved: READ/EMPTY describe the queue, this describes the READER's decision.
+# ⛔ AND "WE SKIPPED" IS NOT "THERE IS NO WORK". No VERDICT and no MEMBERSHIP change: checked.txt is
+# neither read nor written by a skip, and candidates.txt's MEMBERSHIP is neither read nor written —
+# only its ORDER is re-derived from `.pool`, which depends on no verdict — and the line below says
+# `queue=READ(n)` first and `SKIPPED` second. #1736's vocabulary is preserved: READ/EMPTY describe the
+# queue, this describes the READER's decision.
 #
 # The token is written TWICE: `<digest> <epoch> <state> 0` BEFORE the loop and `… 1` after it only
 # when the loop exhausted the pool. So an interrupted pass (SIGKILL, a cycle timeout, a budget
@@ -3679,6 +3685,103 @@ ledger_all_live() {
   done < "$COLLISION_LEDGER"
   return 0
 }
+# ── THE QUEUE'S OWN ORDER IS THE DISPATCH ORDER, SO IT IS SEVERITY-FIRST ─────────────────────
+# ⛔ THE DEFECT, IN ONE SENTENCE: `candidates.txt` is what `orch-loop.sh` walks TOP-DOWN, and it was in
+# ARRIVAL order — the tier the pool had just computed ordered the STREAM NEW ARRIVALS WERE APPENDED IN
+# (`printf … >> candidates.txt`), never the QUEUE ITSELF, so the dispatch head was the OLDEST clean
+# entry rather than the most severe one. MEASURED on the live controller 2026-11-01: the queue was 179
+# rows, its head was #2944, and the issues the cycle actually dispatched (#2567, #2653, #2683, #2927)
+# ALL carry `P2-moderate` and NONE carries `P0-blocker`/`P1-severe` — while the pool's first eleven rows
+# are the `P0-blocker` tier. The pass stated the mechanism itself, verbatim: `[refresh] handed to
+# dispatch: #2567 — carried over from an earlier pass — the oldest CLEAN entry still queued`.
+# ⛔ ONE INSTRUMENT, NOT TWO (#1178). The rank is `$O/.pool` — the SAME (tier, number) stream the pool
+# already sorts — so this adds no second priority predicate, no second label vocabulary and no second
+# listing. It is re-derived from the pool on every pass and never persisted as its own ranking.
+# ⛔ ORDER, NEVER MEMBERSHIP. This rewrites the SEQUENCE of `candidates.txt` and never adds or drops a
+# row: an entry the pool does not rank (its label was removed, it became assigned, or it fell outside a
+# tier's `--limit` window) is KEPT, at the TAIL, in its existing order — dropping it would silently
+# discard a CLEAN-judged candidate — and the unranked count is printed, so an unranked population can
+# never read as a ranked one.
+# ⛔ AND A QUEUE IT CANNOT RANK IS NOT A QUEUE "IN AGE ORDER". When the pool ranks NOTHING, this does
+# NOT leave arrival order standing as if it were a decision: it says `priority-unreadable` and refuses
+# to let the order be read as severity. That silent degradation — a ladder that returns "no priority"
+# for everything and reads exactly like a healthy FIFO — is what produced the measured beat.
+rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written, verified reorder
+  local pool="${1:-}" queue="${2:-}" out="${3:-}" cnt="${4:-}"
+  # ⛔ AN EMPTY QUEUE IS NOT AN UNREADABLE ONE (review P2). `[ -s ]` used to send it down the failure
+  # arm, which would have printed `priority-unreadable` over a fully drained queue — the routine state
+  # after a good pass — and re-used a failure word for "there is nothing to order". It is a SUCCESS
+  # with nothing to do, and it says so in its own words.
+  if [ ! -s "$queue" ]; then
+    : > "$out" || return 1
+    printf '0 0 -\n' > "$cnt" 2>/dev/null || return 1
+    return 0
+  fi
+  # The POOL is the second file on purpose: its line order IS the rank, so iterating it emits the
+  # queued members in severity order without a second sort key.
+  awk -v cntf="$cnt" '
+    # `qseen` collapses a DUPLICATE queue row (review P2 — the tail is emitted from this array). At the
+    # main call site the queue was already deduped by the `awk !seen` above, so this is belt-and-braces;
+    # it never drops a DISTINCT row, which is what "order, never membership" is about.
+    NR==FNR { if (!($0 in qseen)) { qseen[$0] = 1; qorder[++nq] = $0 } next }
+    { if (($0 in qseen) && !($0 in done)) {
+          done[$0] = 1; print; ranked++
+          if (head == "") head = $0 } }
+    END { for (i = 1; i <= nq; i++) {
+            n = qorder[i]
+            if (!(n in done)) { print n; unranked++ } }
+          printf "%d %d %s\n", ranked + 0, unranked + 0, (head == "" ? "-" : head) > cntf
+          close(cntf) }' \
+    "$queue" "$pool" > "$out" || return 1
+  [ -s "$out" ] || return 1
+  return 0
+}
+# queue_order_from_pool <O> -> writes $O/candidates.txt in pool order, prints what it did (or why not)
+# ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
+# silently inert, and a caller that skipped it would leave every assertion here green.
+queue_order_from_pool() {
+  local o="${1:-}" _r _u _h
+  [ -n "$o" ] || return 1
+  rm -f "$o/.queue-rank" "$o/.cand.ranked" 2>/dev/null
+  if ! rank_queue_by_pool "$o/.pool" "$o/candidates.txt" "$o/.cand.ranked" "$o/.queue-rank"; then
+    # The reorder could not be produced at all. The queue is UNCHANGED (membership is not this
+    # function's business), and the ORDER's provenance is stated rather than assumed.
+    QUEUE_ORDER_STATE="priority-unreadable"
+    echo "[refresh] priority-unreadable: the queue order could NOT be re-derived from $o/.pool — $o/candidates.txt is in ARRIVAL order, which is NOT a priority decision (this line exists so that state can never read as an ordered queue)"
+    rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
+    return 1
+  fi
+  if ! mv "$o/.cand.ranked" "$o/candidates.txt"; then
+    QUEUE_ORDER_STATE="priority-unreadable"
+    echo "[refresh] priority-unreadable: the pool-ordered queue could not be moved into $o/candidates.txt — the queue on disk is the pre-reorder file, so its order is NOT a priority decision"
+    rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
+    return 1
+  fi
+  _r=0; _u=0; _h=""
+  read -r _r _u _h < "$o/.queue-rank" 2>/dev/null || true
+  case "${_r:-}" in ''|*[!0-9]*) _r=0 ;; esac
+  case "${_u:-}" in ''|*[!0-9]*) _u=0 ;; esac
+  case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
+  rm -f "$o/.queue-rank" 2>/dev/null
+  if [ "$_r" -eq 0 ] && [ "$_u" -eq 0 ]; then
+    # Nothing queued at all: a drained queue, not a blind one.
+    QUEUE_ORDER_STATE="empty"
+    echo "[refresh] queue order: the queue is EMPTY — there is nothing to order"
+    return 0
+  fi
+  if [ -n "$_h" ]; then
+    QUEUE_ORDER_STATE="severity"
+    echo "[refresh] queue order: severity-first from the pool — head #$_h is the highest-ranked CLEAN entry still queued ($_r pool-ranked, $_u unranked at the tail)"
+  else
+    # Not a silent degradation: nothing in the queue is ranked by the pool, so the ORDER MEANS NOTHING.
+    QUEUE_ORDER_STATE="priority-unreadable"
+    echo "[refresh] priority-unreadable: the pool ranked NONE of the $_u queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so candidates.txt is in ARRIVAL order — read that as \"unranked\", never as \"severity-ordered\""
+  fi
+  if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
+    echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry"
+  fi
+  return 0
+}
 # The previous pass's record, parsed strictly. Four fields, all required, none guessed.
 PREV_DIGEST=""; PREV_EPOCH=""; PREV_STATE=""; PREV_EXHAUSTED=""
 if [ -r "$POOL_TOKEN" ]; then
@@ -3692,12 +3795,19 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
   case "${NOW_EPOCH:-}" in ''|*[!0-9]*) NOW_EPOCH=0 ;; esac
   AGE=$(( NOW_EPOCH - PREV_EPOCH ))
   if [ "$AGE" -ge 0 ] && [ "$AGE" -lt "$SKIP_TTL" ]; then
-    echo "[refresh] queue=$POOL_STATE unchanged for ${AGE}s (digest ${POOL_DIGEST%${POOL_DIGEST#????????}}, ttl ${SKIP_TTL}s) — the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate and left nothing unattempted, so this pass SKIPS the per-candidate pre-flight (#1984). Nothing was queued and nothing was judged: this is not \"no work\", it is \"the answer would be the same\", and candidates.txt/checked.txt are untouched."
+    echo "[refresh] queue=$POOL_STATE unchanged for ${AGE}s (digest ${POOL_DIGEST%${POOL_DIGEST#????????}}, ttl ${SKIP_TTL}s) — the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate and left nothing unattempted, so this pass SKIPS the per-candidate pre-flight (#1984). Nothing was queued and nothing was judged: this is not \"no work\", it is \"the answer would be the same\" — checked.txt is untouched, and candidates.txt's MEMBERSHIP is untouched (its ORDER is still re-derived from the pool, which is not a queueing decision and does not depend on a verdict)."
     # ⛔ A SKIPPED PASS IS A SUCCESS, AND IT MUST SAY SO (#2229). Without this record the EXIT trap —
     # which turns an UNRECORDED exit into a failure, correctly — would report every unchanged-input
     # pass as broken. It hands NOTHING (it judged nothing), so it names the queue's head instead of
     # claiming a candidate it did not choose.
     refresh_stage skip "digest compare (.pool, checked.txt, dispatched.txt)"
+    # ⛔ THE ORDER IS RE-DERIVED EVEN ON A SKIPPED PASS, because ORDER IS NOT MEMBERSHIP. The skip's
+    # promise is that nothing was QUEUED and nothing was JUDGED — and it still holds: this pass adds no
+    # row and drops no row. What changes is the sequence, and a queue whose sequence was never
+    # re-derived would keep an arrival order that a previous pass's pool already superseded. Leaving it
+    # here is how the head could stay a `P2-moderate` through an unchanged-input window (measured
+    # 2026-11-01: head #2944 for 23 minutes of skipped passes).
+    queue_order_from_pool "$O" || true
     _skip_head="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
     case "$_skip_head" in ''|*[!0-9]*) _skip_head="" ;; esac
     _skip_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
@@ -3709,7 +3819,7 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     fi
     REFRESH_RECORDED=1
     refresh_record_write ok skip 0 \
-      "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, queue unchanged" \
+      "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, queue membership unchanged (the ORDER was re-derived from the pool: ${QUEUE_ORDER_STATE:-unknown})" \
       "judged=0" "backlog=$_skip_n" "handed=$_skip_head" "unusable="
     exit 0
   fi
@@ -4964,15 +5074,14 @@ fi
 # by issue number, which is what put 238 P2s ahead of 20 P0s (#8465) — the same defect as the pool
 # sort above, and it reappeared here on every cycle.
 #
-# This file is FIFO. The pool above is severity-ordered when it is appended, but an entry added on a
-# LATER cycle joins at the BACK, behind whatever is already queued — so a P0 discovered while P2s sit
-# at the head waits for them instead of displacing them. That residual is deliberate and bounded: the
-# refresh only runs while the backlog is below 6 (orch-loop.sh) and BATCH is 2, so at most 5 entries
-# can be ahead of it. The TIME that costs is contingent, not a ceiling: 5 entries at 2 per cycle is 3
-# cycles only if the capacity gate is open each cycle — a load/lane/swap/memory gate that holds
-# dispatch delays it further. The ENTRY bound is what the refresh guarantees; do not read a wall-clock
-# ceiling into it. Carrying the tier through orch-loop.sh's reader would remove the residual at the
-# cost of a second ordering surface; not worth it for a bounded handful of entries.
+# ⛔ THE "BOUNDED HANDLE" IS NOT BOUNDED, AND THIS FILE'S OWN ORDER IS WHY. This block used to say the
+# residual was deliberate and bounded: "the refresh only runs while the backlog is below 6 and BATCH is
+# 2, so at most 5 entries can be ahead of it". MEASURED on the live controller 2026-11-01: the queue was
+# 179 rows deep and the head was #2944 (a `P2-moderate`), while the pool's first eleven rows were the
+# `P0-blocker` tier — so the P0s were behind 178 rows, not 5. The premise fails whenever the queue is
+# long, which is exactly when ordering matters, and `rank_queue_by_pool` below now re-derives the
+# ORDER from the pool every pass instead of relying on it. (Membership is still FIFO-with-dedupe:
+# nothing is added or dropped here, only sequenced.)
 #
 # `mv` is atomic within the directory (rename(2)), so a concurrent reader sees the old file or the new
 # one, never a torn one; `&&` keeps a failed awk from truncating the live backlog. One deliberate
@@ -4992,6 +5101,7 @@ mv "$O/.cand" "$O/candidates.txt" || {
   refresh_cmd "replace $O/candidates.txt (deduped backlog)"
   refresh_fail persist "$EXIT_TRANSIENT" "cannot replace $O/candidates.txt with the deduped backlog — the queue this pass built is not the one dispatch will read (agent-infra#1736)"
 }
+queue_order_from_pool "$O" || true
 # ── THE TWO QUEUES (agent-infra#2054) ────────────────────────────────────────────────────────
 # ONE extra LISTING per pass reads the `harness`-labelled issues — up to `ceil(limit/100)` = 5 core
 # requests at `--limit 500`, budget-gated below (the bound is derived there, never glossed as "a call").
@@ -5402,9 +5512,19 @@ case "$_backlog_n" in ''|*[!0-9]*) _backlog_n=0 ;; esac
 _head_issue="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
 case "$_head_issue" in ''|*[!0-9]*) _head_issue="" ;; esac
 if [ -n "$_head_issue" ]; then
+  # ⛔ THE ORDER CLAIM IS READ, NEVER TYPED (review P1). This sentence used to say "highest-ranked …
+  # severity order" unconditionally, so it was FALSE in exactly the two cases the writer had just
+  # declared unreadable — a queue the pool ranked nothing in, and a reorder that failed. The pre-change
+  # wording ("the oldest CLEAN entry") was at least true. Now the adjective is chosen from what the
+  # writer recorded, and the unreadable case keeps the honest word.
+  case "${QUEUE_ORDER_STATE:-}" in
+    severity) _head_rank="the highest-ranked CLEAN entry in the pool-ordered queue" ;;
+    empty)    _head_rank="the oldest CLEAN entry still queued (the queue is EMPTY of pool-ranked work, so this row is unranked — its severity is UNKNOWN)" ;;
+    *)        _head_rank="the OLDEST CLEAN entry still queued — priority-unreadable: the order is ARRIVAL order and its severity is UNKNOWN, not a priority decision" ;;
+  esac
   case " ${QUEUED_THIS_PASS:-}" in
-    *" $_head_issue "*) _head_why="judged CLEAN by THIS pass, and the oldest usable entry in the FIFO queue" ;;
-    *)                  _head_why="carried over from an earlier pass — the oldest CLEAN entry still queued" ;;
+    *" $_head_issue "*) _head_why="judged CLEAN by THIS pass, and $_head_rank" ;;
+    *)                  _head_why="carried over from an earlier pass — $_head_rank" ;;
   esac
   echo "[refresh] handed to dispatch: #$_head_issue — $_head_why (queue depth $_backlog_n; orch-loop.sh takes the head first)"
   REFRESH_RECORDED=1
