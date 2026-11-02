@@ -4046,8 +4046,14 @@ const DISPATCH_CLASS_REMEDIES: Record<DispatchFailureClass, string> = {
  * LINE-anchored — that is what keeps prose out (`PASS criteria are met` mid-sentence, `the
  * verifier did not PASS`) — and `\b` after the token keeps `PASSED`/`bypass` out.
  */
+// #3164: ONE definition of "where a verdict token ends", read by the shapes AND by the negation
+// guard below. Duplicating it is how the guard silently false-BLOCKS: if an arm grows (say `PASS!`)
+// and the guard's copy does not, the shape matches, the guard finds no token, and the reply is
+// refused with no error anywhere.
+const VERDICT_TOKEN_TAIL = "(?:\\b|:|\u2014)";
+
 function verdictLine(token: "PASS" | "FAIL"): RegExp {
-  const tok = `${token}(?:\\b|:|—)`;
+  const tok = `${token}${VERDICT_TOKEN_TAIL}`;
   return new RegExp(
     [
       `(?:^|\\n)\\s*(?:[-*•]|\\d+\\.)?\\s*(?:>\\s*)*\\*{0,3}${tok}`, // bare / listed / bold / quoted
@@ -4056,6 +4062,115 @@ function verdictLine(token: "PASS" | "FAIL"): RegExp {
     ].join("|"),
     "i",
   );
+}
+
+/**
+ * #3164 (false PASS): a PASS the gate accepts must be an ATTESTATION, not a MENTION.
+ *
+ * `verdictLine("PASS")` is a SHAPE rule — "this line IS a verdict line". Its arms end at the token
+ * (`PASS(?:\b|:|—)` — "PASS, then anything"), so the tail of the line was never inspected and a
+ * verifier that REFUSED to attest by naming the token was read as having attested:
+ *
+ *     PASS is not claimed — two tests are red.   → the gate merged the files   ❌ false PASS
+ *     PASS: not claimed / PASS isn't claimed / PASS: cannot be claimed / PASS is never claimed
+ *
+ * Measured 2026-10-31 against `origin/main@951e4c8219c7` (real plugin factory, throwaway git repo,
+ * PI_MODE=print + TASK_HEARTBEAT=1 — the mode a lane runs): every negated spelling ALLOWED, and the
+ * files stayed recorded across repeated retries — not a one-shot glitch. That is the one failure
+ * class a verification gate may not have: it turns a refusal into an attestation.
+ *
+ * The rule is deliberately NARROW, because the guard in the other direction is just as costly (a
+ * false BLOCK sends a lane back to re-dispatch a reply that was already correct):
+ *   - the negation must be IMMEDIATELY attached to the token — an optional punctuation/space run,
+ *     an optional auxiliary (`is`/`was`/`has`/`can`/…), then `not` / `n't` / `never` / `cannot` /
+ *     `no longer`. A `not` elsewhere on the line is NOT a negation of the verdict, so the
+ *     affirmative controls stay accepted: `PASS: no failures`, `PASS - 2/2 files verified`,
+ *     `Result: PASS, nothing to fix`, `PASS — I could not reproduce the failure`.
+ *   - the bracketed arm admits up to 40 chars of arbitrary text BEFORE the token, so a tail-only
+ *     guard leaves `[not verified] PASS` / `[no] PASS` merging; the prefix is checked too.
+ *   - PASS ONLY. A negated FAIL must keep blocking (the bare FAIL arm already does), so excluding
+ *     it here would push the reply into the unparseable branch — and the #5724 fail-open MERGES
+ *     that in an interactive session. Fail-closed is kept.
+ *   - per LINE and existential: one un-negated verdict line attests even if another line negates.
+ *
+ * ⛔ KNOWN COST, pinned by the `(e-cost)` cases in index.verdict-line.test.ts: an attested PASS
+ * whose immediate clause OPENS with a negative (`PASS: did not run the e2e suite`) blocks, because
+ * "not all files were needed" (a caveat) and "not all files verified" (a refusal) are the same
+ * shape. Deliberate and asymmetric: a false block costs one re-dispatch, a false PASS merges
+ * unverified bytes. The verifier's escape is to not make the negation adjacent. That escape is a
+ * LANE-only cost: in an interactive session (#5724) a reply this guard refuses does not block at
+ * all — it falls through to the fail-open and merges — so the guard's only effect there is that the
+ * merge is logged as unparseable instead of read as a PASS. Closing that is the fail-open decision,
+ * explicitly out of this fix (see the issue's "Not changing").
+ *
+ * RECORDED residuals (measured, not silently absorbed):
+ *   - CROSS-FILE: the unit is the LINE, so `PASS: f.py verified` + `PASS is not claimed for g.py`
+ *     still merges the whole prompt scope, `g.py` included. Narrowing a line to the files it names
+ *     is the merge/scope rule, out of this fix.
+ *   - CONTRADICTORY COUNTS: `PASS: 0/2 files verified` is not caught. A fraction guard (`0/\d+`)
+ *     would not in fact collide with `PASS: 0 failures` — the earlier claim that it would was
+ *     wrong — but it is a different detector (a count, not a negation) and is left to a separate
+ *     change rather than widening this one.
+ */
+const NEGATION_LEAD = "[^\\p{L}\\p{N}]*";
+const NEGATION_AUX =
+  "(?:(?:is|are|was|were|be|been|being|has|have|had|does|do|did|can|could|will|would|may|might|must|should)\\s*)?";
+/**
+ * A negation attached to the START of a segment — the tail of a verdict line, a bracket prefix, or
+ * the text between a ✅ and the token.
+ *
+ * ⛔ ANY non-letter, non-digit run may sit between the token and the negation (`;`, `…`, `/`, `=`, `**`,
+ * `_`, `[`). The first cut of this guard ENUMERATED the punctuation and omitted `;`, so
+ * `PASS; not claimed` — an ordinary spelling of the same refusal — still merged in all five shapes
+ * (measured through the real plugin factory by review r2 / VGATE). The class is stated POSITIVELY
+ * instead: only a letter or digit ends the run, so no future punctuation can reopen the hole.
+ *
+ * `no` only counts as a whole clause (`no` + end/punctuation), so `PASS: no failures`,
+ * `[no regressions] PASS` and `PASS — no e2e suite exists` stay AFFIRMATIVE; `n['’]t` covers the
+ * smart apostrophe a model emits as often as the ASCII one; `neither`/`nor` are in the class the
+ * cited judge-parser rule uses.
+ */
+const NEGATION_AT_START = new RegExp(
+  `^${NEGATION_LEAD}${NEGATION_AUX}${NEGATION_LEAD}`
+  + "(?:n['’]t|not(?![\\p{L}\\p{N}])|never(?![\\p{L}\\p{N}])|no\\s+longer(?![\\p{L}\\p{N}])"
+  + "|cannot(?![\\p{L}\\p{N}])|neither(?![\\p{L}\\p{N}])|nor(?![\\p{L}\\p{N}])|no(?=\\s*(?:$|[^\\p{L}\\p{N}\\s])))",
+  "iu",
+);
+/** The bracketed-prefix arm's own negation (`[not verified] PASS`) — text BEFORE the token. */
+const NEGATED_BRACKET_PREFIX = new RegExp(`^\\s*\\[([^\\]\\n]{0,40})\\]\\s*\\*{0,3}PASS${VERDICT_TOKEN_TAIL}`, "i");
+/** The ✅ shape's token, with the text between the mark and the token captured for the prefix rule. */
+const TICK_PASS = new RegExp(`\u2705(.*?)(PASS${VERDICT_TOKEN_TAIL})`, "i");
+
+/** The PASS token at or after `from` — the token a verdict line is READ at. */
+function passTokenAt(line: string, from: number): RegExpExecArray | null {
+  const occ = new RegExp(`PASS${VERDICT_TOKEN_TAIL}`, "gi");
+  occ.lastIndex = from;
+  return occ.exec(line);
+}
+
+/** Does this reply ATTEST a PASS — i.e. carry a verdict line whose token is not negated? */
+function passAttested(textContent: string): boolean {
+  const shape = verdictLine("PASS");
+  for (const raw of textContent.split("\n")) {
+    const shaped = shape.exec(raw);
+    let tok: RegExpExecArray | null;
+    if (shaped) {
+      const bracket = NEGATED_BRACKET_PREFIX.exec(raw);
+      if (bracket && NEGATION_AT_START.test(bracket[1])) continue; // `[not verified] PASS`
+      // Read the token the SHAPE anchored, not any token on the line. A later, mid-sentence mention
+      // must not attest: `PASS is not claimed: I cannot give a PASS.` is one refusal, and
+      // `verdictLine` is line-anchored for exactly this reason.
+      tok = passTokenAt(raw, shaped.index);
+    } else {
+      const tick = TICK_PASS.exec(raw);
+      if (!tick) continue;
+      if (NEGATION_AT_START.test(tick[1])) continue; // `✅ not verified: PASS`
+      tok = passTokenAt(raw, tick.index + tick[0].length - tick[2].length);
+    }
+    if (!tok) continue;
+    if (!NEGATION_AT_START.test(raw.slice(tok.index + tok[0].length))) return true;
+  }
+  return false;
 }
 
 /**
@@ -4106,6 +4221,16 @@ export function verdictLineDiagnostics(): string {
   if (lastVerdictLineSeq !== verdictLineDispatchSeq) return "";
   if (lastVerdictLineTested === null) {
     return "\n  ⚠️ No line of the last verifier reply mentioned PASS or FAIL — there was no verdict to read.";
+  }
+  // #3164: a NEGATED PASS is not a shape failure, and telling the lane that it was is the (d3)
+  // failure mode this file already pins — the remedy would point at the SHAPE of a line that was
+  // fine. Worse here: the literal compliance is to re-emit `PASS`, which turns the verifier's
+  // REFUSAL into the merge it was refusing. So the note names the negation and forbids that.
+  if (verdictLine("PASS").test(lastVerdictLineTested) && !passAttested(lastVerdictLineTested)) {
+    return (
+      `\n  ⚠️ The last verifier reply NEGATED its PASS — that is a REFUSAL, not a verdict: "${lastVerdictLineTested}"`
+      + " — the gate accepted the SHAPE and refused the CONTENT. Do NOT re-emit `PASS`: fix what the verifier named, then verify again."
+    );
   }
   return (
     `\n  ⚠️ The last verifier reply mentioned a verdict on this line, and the gate did NOT read it as one: "${lastVerdictLineTested}"`
@@ -5002,8 +5127,12 @@ export default function (pi: ExtensionAPI) {
       // #10219: and now the SAME rendered shapes hasFail reads (verdictLine) —
       // `Result: PASS`, `> PASS`, `[16:42] PASS`. Without them a lane's rendered
       // verdict was refused in print mode and only fail-opened in interactive mode.
-      const hasPass = verdictLine("PASS").test(textContent)
-        || /✅.*PASS(?:\b|:|—)/i.test(textContent);
+      // #3164 false PASS: the #10219 SHAPE arms accept a NEGATED token too (`PASS is not claimed`
+      // matches "PASS, then anything"), which turned a verifier's REFUSAL into an attestation and
+      // merged the files. `passAttested` keeps the same line-anchored shapes and adds the one rule
+      // a shape cannot express: the token must not be negated. A negated FAIL keeps blocking above
+      // (fail-closed) — this narrows PASS acceptance only.
+      const hasPass = passAttested(textContent);
 
       if (hasPass) {
         // #1660: the prompt's explicit `Project root:` is authoritative; the
