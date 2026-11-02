@@ -274,7 +274,15 @@ MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # `MERGE_PRIORITY_AT` is retained ONLY as the unreadable-count fallback (a malformed/invalid count
 # fails CLOSED to `MERGE_PRIORITY_AT + 1`, i.e. "treat the count as over the line"), and `MR`/`MF`
 # (review_slots/fix_slots) still scale the worker budgets with the backlog. Neither can open the gate.
+# ⛔ COERCED AT LOAD, LIKE EVERY OTHER KNOB IN THIS FILE (review P2, 2026-11-01). `mp_recent_land`
+# reads this value with `10#` arithmetic; a non-numeric one made that assignment ERROR, which made the
+# function print NOTHING — and since #2929 an empty answer is the DEFINITE stall shape, so a typo in
+# this knob would have escalated and dispatched a worker about a measurement that never happened.
+# Also refuses `0`: `find -mmin -0` matches nothing, so a zero window is a permanently empty answer,
+# i.e. a permanent false stall.
 MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" && [ "$MERGE_PRIORITY_MAX_AGE_MIN" -gt 0 ] \
+  || MERGE_PRIORITY_MAX_AGE_MIN=180
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
 # printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
 # backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
@@ -2658,8 +2666,16 @@ mp_recent_land() { # [<state-dir>]
   # Only a land inside 2x the gate's window can matter, so `find -mmin` shortlists and the loop stats
   # only those. A land older than that reads as "no recent land" — which is exactly the gate's own
   # question (a land outside the window releases anyway), and `[cap]`'s `last_land=` prints `?`.
-  local d="${1:-$O/state}" f m newest="" bound list
-  bound=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))
+  local d="${1:-$O/state}" f m newest="" bound list _b
+  # ⛔ NORMALISED HERE TOO, NOT ONLY AT LOAD (review P2, 2026-11-01). The `10#` below ERRORS on a
+  # non-numeric knob, and an errored assignment leaves `bound` unset — `find -mmin -""` then fails and
+  # this function prints NOTHING. That empty answer is a MEASURED fact about a numeric window, so
+  # reading it as one when the window could not be computed is a claim the read cannot support: since
+  # #2929 an empty answer is a DEFINITE escalation (and a dispatched worker), so a config typo would
+  # have become a stall report. `is_limit` is this file's own coercion for an age knob.
+  _b="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+  is_limit "${_b:-}" && [ "$_b" -gt 0 ] || _b=180
+  bound=$(( 10#$_b * 2 ))
   list="$(find "$d" -maxdepth 1 -name 'merged-*.done' -mmin -"$bound" 2>/dev/null || true)"
   # A here-string, not `find … | while`: under `pipefail` the reader can exit first and make the
   # pipeline read FAILED (#841's class), and the process substitution would lose `newest` to a
@@ -2711,7 +2727,7 @@ spawns_since() { # spawns_since <since-epoch>  ->  "<n>\t<tag,tag,...>" (empty n
 # records a past state and is never revalidated" failure this file keeps removing, so a land newer
 # than the marker deletes it here — the writer does not have to remember to.
 drain_stall_token() {
-  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl
+  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl agesrc _agepfx
   [ -f "$f" ] || return 0
   at="$(sed -n 's/^at=//p' "$f" 2>/dev/null | head -1)"
   if is_num "${at:-}"; then
