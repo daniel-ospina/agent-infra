@@ -143,9 +143,12 @@ BASE_LABEL="com.eldato.orchestrator-loop"
 # therefore a SEPARATE line.
 LABEL="com.eldato.orchestrator-loop"
 [ -n "${LABEL_OVERRIDE:-}" ] && LABEL="$LABEL_OVERRIDE"
-# The OTHER production label: the recovery agent PR #1986 ships (`watchdog.plist.template`). It is
-# listed here so `label_guard` treats it as production too — the guard's rule is about the LIVE jobs,
-# and a second production label that the guard did not know about would be installable from a sandbox.
+# The OTHER production label: `com.eldato.orchestrator-watchdog`, the hand-provisioned controller
+# watchdog RETIRED by agent-infra#2303 (`templates/launchd/RETIRED` — `install-launchd.sh`'s
+# `retire_pass` unloads and removes it). It has no plist template any more, and it is still listed
+# here so `label_guard` treats it as PRODUCTION: the guard's rule is about the labels launchd may
+# still resolve on a live box, and a retired label a sandbox did not know about would still be
+# addressable from one.
 PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
