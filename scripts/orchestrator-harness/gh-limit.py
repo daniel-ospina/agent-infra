@@ -2984,6 +2984,15 @@ def classify(res, argv, headers):
     """
     if res.rc == 0:
         return None
+    # ⛔ A CONTENDED VERDICT IS NOT A LIMIT. `scripts/gh-shim/gh` exits 75 (EX_TEMPFAIL) when a
+    # shared cooldown outlived its own wait budget and no exempt read cleared it (#3230/#3228). That
+    # says "I could not ask", NOT "the account is out of quota": classifying it as a limit retries a
+    # budget that was already spent (4 attempts under the shim's own 120 s), sleeps 60/120/240 s on
+    # top, and lets `record_limit` write a box-wide `last-limit` marker for a refusal that never
+    # happened — blocking OTHER lanes. Keyed on the rc, never on the message, because the message is
+    # prose and prose drifts (#3228 review, finding 1).
+    if res.rc == 75:
+        return None
     text = (res.err or b"").decode("utf-8", "replace")
     # The status the RESPONSE carried beats a regex over stderr: gh's error prose is not an API.
     status = res.status
