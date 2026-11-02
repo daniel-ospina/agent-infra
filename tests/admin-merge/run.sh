@@ -4731,10 +4731,10 @@ grep -q "never TESTED main" "$TMP/err" \
 # ⛔ THE OLD REMEDY IS GONE ON PURPOSE (BASELINE-INAPPLICABLE). `--any-workflow`
 # widens the BASE side to every workflow on main, and that sample is SATISFIED by
 # runs that measure nothing — measured on main's 200-run window, 187 were
-# `Pipeline Compliance` (issue_comment: 148 skipped, 38 success) and the widening
-# stopped at width 40 with 11 "measurements" = 8 bookkeeping + 2 detector + 1
-# code-lane run. The refusal now names the two honest exits (a NAMED
-# --baseline-workflow, or recording that there is no main-side measurement) and
+# `Pipeline Compliance` (issue_comment: 148 skipped, 38 success, 1 other) and the
+# widening stopped at width 40 with 11 "measurements" = 8 bookkeeping + 2 detector
+# + 1 code-lane run. The refusal now names three honest exits (one spanning lane, a
+# NAMED --baseline-workflow, or no main-side measurement at all) and
 # says out loud that the widening is not one of them.
 grep -q "add --any-workflow\|use --any-workflow\|instead: --any-workflow" "$TMP/err" \
   && fail "the no-baseline block still OFFERS --any-workflow as the way to a baseline" \
@@ -4758,8 +4758,8 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # CONSTRUCTION: `gh run list --branch main --workflow ci.yml` → `[]`. The rail
 # therefore cannot judge, and its old advice (`add --any-workflow`) widened to a
 # sample SATISFIED BY RUNS THAT MEASURE NOTHING (measured on main's 200-run
-# window: 187 `Pipeline Compliance` — issue_comment, 148 skipped / 38 success —
-# 7 detector, 6 `CI on main`; the widening stopped at width 40 with 11
+# window: 187 `Pipeline Compliance` — issue_comment, 148 skipped / 38 success /
+# 1 other — 7 detector, 6 `CI on main`; the widening stopped at width 40 with 11
 # "measurements" = 8 bookkeeping + 2 detector + 1 code-lane run).
 #
 # The fix is TWO LANE NAMES (`--baseline-workflow`) plus a first-class state for
@@ -4886,6 +4886,12 @@ grep -q "lane parity: PR ⊇ main" "$TMP/out" \
 grep -qF "measured sets: PR failing runs=0 | main failing runs=0 (lanes: PR=ci.yml, main=ci-main.yml)" "$TMP/out" \
   && pass "…and the vacuous body names BOTH lanes instead of mislabelling the base side" \
   || fail "the vacuous body still prints one lane for a two-lane run"
+# ⛔ THE CONSOLE TWIN IS A DIFFERENT LINE and needs its own pin: both renderings land on
+# stdout, so the body alone satisfied the arm above. Reverting ONLY the `info` line left
+# the suite green while one run carried two contradictory accounts of the base population.
+grep -qF '⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lanes: PR=ci.yml, main=ci-main.yml)' "$TMP/out" \
+  && pass "…and the CONSOLE summary names both lanes too (one run, one account)" \
+  || fail "the console summary still prints one lane for a two-lane run"
 # PER CALL SCOPE, not a bare count: the rate and signature passes alone supply the
 # baseline name, so `grep -c` stayed GREEN with the parity rebind reverted (proven
 # by mutation). What distinguishes the parity read is that a BRANCH-scoped listing
@@ -4927,6 +4933,28 @@ grep -qF "lane coverage could not be established (lane: ci-main.yml)" "$TMP/err"
 grep -q "for a trigger-split repo" "$TMP/err" \
   && fail "the refusal still offers --any-workflow on a run that already named a baseline" \
   || pass "…and it does not offer the widening as the remedy"
+
+# (b4) THE BASE-SIDE LABEL UNDER --any-workflow IS "any workflow", NEVER THE DEFAULT
+# LANE. With the filter DROPPED the base read is unfiltered, so naming $WORKFLOW would
+# name a lane that appears in no `run list` call — and would point the operator at a
+# knob that cannot change the read. Rebuilding the label from $WORKFLOW left every arm
+# green before this one existed.
+new_scen anyworkflowlabel
+HEAD_AW="bcbc000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AW" > "$SCEN/head"
+lane_pass "$HEAD_AW" 7681 > "$SCEN/runs-$HEAD_AW"
+# main's window is READABLE and carries a run, but its only job is `skipped` — so the
+# window yields NO EXECUTED job and the parity gate refuses. Both measured sets are
+# empty, which is what routes the run into the vacuous/parity branch.
+lane_line completed success anmain 7682 > "$SCEN/runs-main"
+lane_jobset 7682 skipped 'python-ci / test (a)'
+run_admin 42 --any-workflow --main-runs 10 --dry-run >/dev/null 2>&1
+grep -qF "lane coverage could not be established (lane: any workflow)" "$TMP/err" \
+  && pass "…an --any-workflow base-side refusal names the side it read ('any workflow')" \
+  || fail "the base-side refusal names a lane that was never read under --any-workflow"
+grep -qF "(lane: python-ci.yml)" "$TMP/err" \
+  && fail "the refusal names the DEFAULT lane for an UNFILTERED base read" \
+  || pass "…and never names the default lane it did not read"
 
 # (c) --any-workflow IS STILL REFUSED AS A BASELINE SOURCE. A widened sample is
 # not a baseline: it is satisfied by bookkeeping runs, so accepting it would

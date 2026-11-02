@@ -8584,7 +8584,8 @@ main() {
     # EMPTY, so there is nothing to compare against. On a `pull_request`-only lane
     # that is true BY CONSTRUCTION (`gh run list --branch main --workflow ci.yml`
     # returns `[]` because ci.yml never runs on main), so the state is a property
-    # of the LANE PAIR the operator selected, and it has exactly TWO honest exits.
+    # of the LANE PAIR the operator selected, and it has exactly THREE honest exits
+    # (below): one spanning lane, two named lanes, or no main-side measurement at all.
     # ⛔ IT MUST NOT SUGGEST --any-workflow. That widening admits runs that measure
     # nothing (measured on main's 200-run window: 187 `Pipeline Compliance` —
     # issue_comment, 148 skipped / 38 success / 1 other — 7 detector, 6 `CI on main`; the

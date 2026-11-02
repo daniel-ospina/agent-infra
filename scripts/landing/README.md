@@ -269,8 +269,9 @@ measurement state:
   so it exercised nothing;
 - `BLOCK — BASELINE-INAPPLICABLE: the baseline lane '<lane>' never TESTED main, so there is no
   baseline` — main's side of the comparison is empty, and an empty baseline absorbs nothing. The
-  state names the workflow it looked for and two remedies: `--baseline-workflow <main-lane>` (a
-  base-side lane that DOES run on main), or recording that the repo has no base-side measurement;
+  state names the workflow it looked for and three remedies, in order: one lane that runs on both
+  sides (`--workflow` alone), a named base-side lane (`--baseline-workflow <main-lane>`), or — if
+  nothing measures main — the fact that this rail cannot judge it;
 - `no main-side measurement (PR <rate>) — NOT exempt` — main's baseline carries no measurement of
   that file, so absence is **not** exemption.
 

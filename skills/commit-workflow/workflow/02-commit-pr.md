@@ -254,8 +254,11 @@ scripts/admin-merge.sh <PR> --squash
 # `pull_request`-only and `ci-main.yml` is `push`-only, so the PR lane has NO runs
 # on main BY CONSTRUCTION (`gh run list --branch main --workflow ci.yml` → `[]`)
 # and cannot be its own baseline. The rail reports that as the first-class state
-# `BASELINE-INAPPLICABLE` and names two remedies — there is no third:
-#   1. `--baseline-workflow <main-lane>` — the workflow whose runs on the base
+# `BASELINE-INAPPLICABLE` and names three remedies, in order of preference:
+#   1. ONE lane that runs on both sides — `--workflow <spanning-lane>` alone, no
+#      `--baseline-workflow`: both sides are then read from the one population that
+#      exists, exactly as the rail always did. This is the cheapest correct fix.
+#   2. `--baseline-workflow <main-lane>` — the workflow whose runs on the base
 #      branch form the BASELINE, named independently of `--workflow` (the PR's
 #      lane). agent-infra: `--workflow ci.yml --baseline-workflow ci-main.yml`.
 #      The value of two names is the PROVENANCE of the measurement: the reference
@@ -263,9 +266,9 @@ scripts/admin-merge.sh <PR> --squash
 #      which one. (A widened union can reach a verdict too — it is the sample's
 #      composition, decided by whatever traffic main carries, that makes it the
 #      wrong population.)
-#   2. Record that the repo has NO base-side measurement and accept that the rail
-#      cannot judge it; the audited `AGENT_ADMIN_MERGE_OVERRIDE=1` route is the
-#      bypass, which is bypassing rather than a wider sample.
+#   3. If NO workflow of the repo measures main, the rail CANNOT judge it and no
+#      flag changes that: it is a decision, not a knob. The audited
+#      `AGENT_ADMIN_MERGE_OVERRIDE=1` route is a BYPASS, not a wider sample.
 # `--any-workflow` cannot be supplied AS a baseline (`--baseline-workflow any` is
 # refused by name) and the refusal no longer OFFERS it as the way to one — but the
 # precise claim matters: with NO `--baseline-workflow`, `--any-workflow` still
