@@ -709,14 +709,21 @@ if [ "$SURFACE" -eq 1 ]; then
   # reported as a mention (`note`), not as a controller. No launcher this repo ships produces that shape
   # (they pass the script as an argv element), and the alternative — treating any absolute-looking path in
   # a `-c` string as the executing tree — reds the box for `bash -c 'grep -n foo /x/orch-loop.sh'`.
-  # ⛔ SECOND STATED RESIDUAL (review round 12): the predicate is "argv[0], or an interpreter reached
-  # through a command PREFIX" — an absolute path that appears with NO interpreter in front of it is a
-  # MENTION, not a controller. That is deliberate (it is what keeps `grep [-n] [sh] <abs>/orch-loop.sh`
-  # from fabricating a controller), and it means an exotic launcher that puts a non-wrapper word between
-  # the interpreter and the script — `sudo -u <user> -i bash <path>` with the interpreter not reachable
-  # through the two operand slots — would be reported as a mention. No launcher this repo ships does.
-  # The prefix cost is why `_warg` exists: `nice -n 5 /bin/bash <path>`, `timeout 300 bash <path>` and
-  # `sudo -u deploy bash <path>` are measured shapes and all still count.
+  # ⛔ SECOND STATED RESIDUAL (review round 12, corrected in round 14): the predicate is "argv[0], or an
+  # interpreter reached through a command PREFIX" — an absolute path that appears with NO interpreter
+  # in front of it is a MENTION, not a controller. That is deliberate (it is what keeps
+  # `grep [-n] [sh] <abs>/orch-loop.sh` from fabricating a controller). The shape that is genuinely
+  # lost is a NON-WRAPPER word between the launcher and the interpreter — `xterm -e bash <path>`,
+  # `systemd-run -- bash <path>` — where the leading word is not in the wrapper list, so the prefix
+  # closes before a shell is ever seen. No launcher this repo ships does that.
+  # ⛔ (Round 12 named `sudo -u <user> -i bash <path>` here instead. It is CAUGHT — `-i` takes no
+  # operand and `bash` arrives with the prefix alive — so the residual named a hole that did not
+  # exist, while pointing away from the ones that did: a wrapper's OWN `-c` (`sudo -c <class>`) and a
+  # COMBINED cluster ending in a value letter (`sudo -iu <user>`). Both are closed in round 14 and
+  # pinned in `10a-3c`/`10a-3e`; a residual is only worth stating if it is the shape that is actually
+  # open.)
+  # `nice -n 5 /bin/bash <path>`, `timeout 300 bash <path>`, `sudo -u deploy bash <path>` and
+  # `sudo -iu <user> bash <path>` are measured shapes and all still count.
   PROC="${DRIFT_PROC:-/proc}"
   : > "$TMPD/ps-unres"
   if [ -n "$_ps" ]; then
@@ -796,6 +803,13 @@ if [ "$SURFACE" -eq 1 ]; then
             # `_interp` half is what keeps `grep -n x orch-loop.sh` (the word at `_i > 0`) a mention.
             if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
           -c|-[!-]*c)
+            # ⛔ ONLY AN INTERPRETER ALREADY IDENTIFIED OWNS A `-c` COMMAND STRING (review round 14,
+            # P2). `sudo` and `setsid` are both in the WRAPPER list and both have their own `-c`
+            # (`sudo -c <class>` on macOS, `setsid --ctty` shorthand), so this arm fired on the
+            # WRAPPER's option, consumed the real interpreter as if it were a command STRING, and
+            # closed the prefix — `sudo -c staff bash <gone>/orch-loop.sh` was ARMED on the reviewed
+            # head and became a mere mention here (reproduced). `_seen` is set by the shell-arming
+            # block above, so `bash -c` and `bash -lc` are untouched (verified still ARMED).
             # ⛔ COMBINED SHORT OPTIONS COUNT (review round 9, P1). This arm used to match `-c` EXACTLY,
             # so `bash -lc 'exec <path>/orch-loop.sh'` — and `-euc`, `-ic` — fell to the `-*` keep-arm,
             # leaving `_interp=1` for the COMMAND STRING, which then matched `*/orch-loop.sh` and became
@@ -810,6 +824,14 @@ if [ "$SURFACE" -eq 1 ]; then
             # shell running TEXT — the self-match class the fleet inventory documents, and the arm that keeps
             # a lane's echo from becoming a candidate dir. The FIRST word decides, and only an ABSOLUTE one
             # counts, so a text mention can never be read as the executing tree.
+            if [ "$_seen" -ne 1 ]; then
+              # A WRAPPER's own `-c` is not a command string (review round 14, P2). `sudo -c <class>`
+              # (macOS) and `setsid -c` belong to the wrapper, and consuming the next word as TEXT ate
+              # the real interpreter — `sudo -c staff bash <gone>/orch-loop.sh` was ARMED on the
+              # reviewed head and became a mention here (reproduced). Claim the operand instead, which
+              # is what every other wrapper option does, so `bash` still arms.
+              _optval=1
+            else
             _i=$((_i + 1)); _c="${_argv[$_i]:-}"; _c1="${_c%%[[:space:]]*}"
             case "$_c1" in
               /*/orch-loop.sh) _script="$_c1" ;;
@@ -823,7 +845,8 @@ if [ "$SURFACE" -eq 1 ]; then
             _interp=0
             # …and the PREFIX is closed too, so a shell-name argument after the command string cannot
             # re-arm it (review round 12).
-            _pfx=0 ;;
+            _pfx=0
+            fi ;;
         esac
         # ⛔ `_interp` DESCRIBES THE COMMAND PREFIX, NOT "AN INTERPRETER APPEARED SOMEWHERE EARLIER"
         # (review round 8, P2). It used to persist for the whole argv, so
@@ -867,7 +890,24 @@ if [ "$SURFACE" -eq 1 ]; then
                   --command-timeout|--signal|--kill-after|--input|--output|--error) _optval=1 ;;
                   --unset|--adjustment|--split-string) _optval=1 ;;
                   --*) _optval=0 ;;
-                  -u|-g|-p|-C|-D|-h|-r|-t|-U|-T|-R|-n|-s|-k|-o|-e|-a|-S) _optval=1 ;;
+                  -u|-g|-p|-C|-D|-h|-r|-t|-U|-T|-R|-n|-s|-k|-o|-e|-a|-S|-c) _optval=1 ;;
+                  # ⛔ `-c` IS IN THAT LIST FOR THE WRAPPER CASE ONLY (review round 14, P2). `sudo -c
+                  # <class>` (macOS) is a wrapper option taking an operand, and because this table arm
+                  # PRECEDES the `-c|-[!-]*c)` command-string arm, the latter never sees a wrapper's
+                  # `-c` at all — so gating it there could not restore `sudo -c <class> bash <path>`
+                  # (measured: still a mention). This list is only reached while NO interpreter has been
+                  # seen (`_seen -eq 0`), so an interpreter's own `-c`/`-lc` still falls to the
+                  # command-string arm and `bash -c <path>`/`bash -lc <path>` stay invocations.
+                  # ⛔ A COMBINED CLUSTER THAT ENDS IN A VALUE-TAKING LETTER CLAIMS ITS OPERAND (review
+                  # round 14, P1). `sudo -iu <user> bash` and `sudo -Eu <user> bash` are the canonical
+                  # login-shell-as-user spellings, and they are what this table's SAFE default gets
+                  # wrong: an unrecognised word claims nothing, so the USER NAME was read as the
+                  # COMMAND, the prefix died, and the launcher became a mere mention — a live controller
+                  # on a GONE tree reported as nothing at all, i.e. the silent green #10114 exists to
+                  # end. MEASURED: ARMED on d708e68ea, `text` on the round-13 head. The TRAILING letter
+                  # decides, so `-o0` (stdbuf: a digit) still claims nothing and `stdbuf -o0 bash <path>`
+                  # keeps its interpreter, and a GLUED value (`-n5`) is not a claim either.
+                  -[!-]*[ugpCDhrtUTRnsokeaS]) _optval=1 ;;
                   *) _optval=0 ;;
                 esac
               fi ;;

@@ -590,6 +590,19 @@ for _w in 'nice -n 5 /bin/bash' 'timeout 300 bash' 'sudo -u deploy bash' 'stdbuf
   ck "10a-3c: '$_w <abs>/orch-loop.sh' is still an INVOCATION" \
      "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
 done
+# (10a-3e) LAUNCHERS THE ROUND-13 REWRITE SILENTLY LOST (review round 14, P1/P2). Both were ARMED on
+# d708e68ea and became a MENTION on the round-13 head — a live controller on a GONE tree reported as
+# nothing at all, which is the silent green #10114 exists to end. Each is a canonical spelling:
+#   • `sudo -iu <user> bash` / `sudo -Eu <user> bash` — a COMBINED cluster ending in a value letter,
+#     which the bare-2-char claim rule did not recognise, so the user name was read as the COMMAND.
+#   • `sudo -c <class> bash` — the `-c` arm fired on the WRAPPER's own option and ate the interpreter.
+# They are discriminating: each is `text` on the round-13 head and ARMED here.
+for _r in 'sudo -iu deploy bash' 'sudo -Eu deploy bash' 'sudo -c staff bash'; do
+  printf '4261 %s %s/orch-loop.sh\n' "$_r" "$GONE" > "$TMP/ps-restored"
+  surf "$TMP/ps-restored"
+  ck "10a-3e: '$_r <abs>/orch-loop.sh' is still an INVOCATION (round-13 regression)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+done
 # (10a-4) A TRAILING PATH AFTER A `-c` STRING IS `$0`, NOT THE SCRIPT (review VGATE of round 8). The
 # `-c` arm advances past the command string, so an ordinary-word guard never sees it: `_interp` stayed
 # 1 for the rest of the argv and `bash -c 'sleep 30' <gone>/orch-loop.sh` fabricated `executes:` on a

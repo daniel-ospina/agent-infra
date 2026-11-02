@@ -571,9 +571,13 @@ def harness_apply_record():
     token = drift.split(":", 1)[1] if ":" in drift else drift
     # ⛔ AND THE ABSENT-CHECKER ALARM MUST KEY ON THE TOKEN TOO (review round 11, P2). The pre-flow
     # refusals that run AFTER a successful fetch (`action=unresolvable-ref`, `action=unresolvable-head`)
-    # write `drift=not-run:not-run`, so a `startswith("not-run")` test names a MISSING CHECKER on a box
-    # whose real fault is an unresolvable ref — and printed neither `action=` nor `detail=`, so the true
-    # refusal appeared nowhere. Only `absent` means the checker was not found.
+    # write a BARE `drift=not-run` — the token half is EMPTY, because `DRIFT_TOKEN` is unset at that point
+    # (`write_record`'s pre-init callers run before the drift read) — so a `startswith("not-run")` test
+    # names a MISSING CHECKER on a box whose real fault is an unresolvable ref, and printed neither
+    # `action=` nor `detail=`, so the true refusal appeared nowhere. Only `absent` means the checker was
+    # not found. (Round 14, P2: this comment used to say those refusals write `not-run:not-run`, which
+    # nothing can produce — the changed `fleet_health.test.py` asserts the bare form, so the reader and
+    # its own test contradicted each other inside one change.)
     if token.startswith("executes:"):
         return (f"THE BOX EXECUTES A HARNESS TREE IT DOES NOT HAVE ({drift}) — deployed={deployed} "
                 f"ref={ref} rc={rc} action={kv.get('action', '?')}; redeploying the copy at rest does "
