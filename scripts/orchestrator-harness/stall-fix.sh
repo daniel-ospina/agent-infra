@@ -76,11 +76,21 @@ BRIEF_DIR="$O/state/briefs"
 mkdir -p "$BRIEF_DIR" 2>/dev/null || {
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (state/briefs is unwritable)"; exit 0; }
 BRIEF="$BRIEF_DIR/stall-fix-$(date -u '+%Y%m%dT%H%M%SZ').md"
+# ⛔ THE WORKER'S NAME — AND ITS OWN REPORT PATH — ARE MINTED HERE, BEFORE THE BRIEF (review P1,
+# 2026-11-01). The dispatch is bounded by DRAIN_STALL_FIX_EVERY stalled PASSES (default 3, i.e. one
+# every ~12 min), while each worker is given 1800 s — so an unfixed stall normally has TWO OR THREE
+# workers alive at once, and a single hard-coded `state/REPORT-stall-fix.md` meant the newest worker's
+# mandated FIRST ACTION (write a stub there) TRUNCATED the report the previous worker exists to
+# produce. Silent destruction of the only artifact the escalation buys. One report path per dispatch
+# makes concurrent workers independent instead of destructive; the log line names the file.
+NAME="stallfix-$(date -u '+%Y%m%dT%H%M%SZ')"
+REPORTF="$O/state/REPORT-stall-fix-$NAME.md"
+BGD="$O/bg"; BLOG="$BGD/$NAME.log"; BRC="$BGD/$NAME.rc"; BPID="$BGD/$NAME.pid"
 
 # The brief names only MEASURED facts it is handed, plus where to look. It must not
 # tell the worker what the cause is: that is the finding it is dispatched to produce.
 cat > "$BRIEF" <<'BRIEFEOF'
-FIRST ACTION: write `__O__/state/REPORT-stall-fix.md` with a stub. **You are dispatched by a
+FIRST ACTION: write `__REPORT__` with a stub. **You are dispatched by a
 stall escalation, not by a PR or an issue.** 30 minutes, then report even if unfinished.
 
 ⛔ **YOU OWN NO PR — AND THE "COMMIT AS YOU GO" SECTION APPENDED BELOW DOES NOT APPLY TO YOU.** This
@@ -91,7 +101,7 @@ stalled. That decision is not yours and not the brief's — it happened before y
 you are reading this you were admitted. The kind's delivery section contributes the sentence *"Your PR
 is ALREADY OPEN — commit and push onto it, and do NOT open a second PR"*, which describes a FIXER
 working on an existing PR. It does not describe you. **You are READ-ONLY: do not commit, do not push,
-do not open, re-open or touch any PR.** Your only output is `__O__/state/REPORT-stall-fix.md`. If the
+do not open, re-open or touch any PR.** Your only output is `__REPORT__`. If the
 two instructions conflict, this one governs.
 
 ## Why you exist
@@ -143,7 +153,7 @@ finding contradicts either, record it and stop; do not adopt over it.
 
 ## Report
 
-`__O__/state/REPORT-stall-fix.md`: the dominant named reason (verbatim), whether it is a real wait or a
+`__REPORT__`: the dominant named reason (verbatim), whether it is a real wait or a
 phantom owner, the evidence command per claim, and the narrowest fix. If the stall is genuinely
 capacity-shaped, say that instead, with the measurement.
 BRIEFEOF
@@ -171,6 +181,7 @@ _brief="${_brief//__AGEMIN__/$AGEMIN}"
 _brief="${_brief//__UNOWNED__/$UNOWNED}"
 _brief="${_brief//__SEEN__/$SEEN}"
 _brief="${_brief//__O__/$O}"
+_brief="${_brief//__REPORT__/$REPORTF}"
 _brief="${_brief//__SPAWNS__/$SPAWNS_TXT}"
 printf '%s\n' "$_brief" > "$BRIEF" 2>/dev/null || true
 if [ ! -s "$BRIEF" ]; then
@@ -180,7 +191,7 @@ fi
 # ⛔ AND THE SUBSTITUTION IS CHECKED, NOT ASSUMED: a failed write leaves the ORIGINAL file in place,
 # which is NON-EMPTY and passes the size test above — so an unstubbed brief would be dispatched with
 # `__SEEN__` still in it. A surviving placeholder is a brief that cannot be read correctly: refuse.
-if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\)__' "$BRIEF" 2>/dev/null; then
+if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\|REPORT\)__' "$BRIEF" 2>/dev/null; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief still carries unresolved placeholders — not dispatching a worker on it)"
   exit 0
 fi
@@ -233,13 +244,19 @@ fi
 #     where the pi shim is installed; a box without the shim falls back to the record above.
 # The read is BOUNDED (`STALL_FIX_VERIFY_SECS`): the gates run a beat AFTER the launch returns, so the
 # record APPEARS rather than being there at the instant of return.
-NAME="stallfix-$(date -u '+%H%M%S')"
-BGD="$O/bg"; BLOG="$BGD/$NAME.log"; BRC="$BGD/$NAME.rc"; BPID="$BGD/$NAME.pid"
-LG="${HOME:-}/.pi/agent/state/spawn-gate.tsv"
+# ⛔ THE NAME IS DATE-STAMPED, AND ITS RECORDS ARE CLEARED BEFORE THE LAUNCH (review P2, 2026-11-01).
+# `%H%M%S` repeats every 24 h, so a previous day's `stallfix-<HHMMSS>.rc` could answer for THIS worker —
+# and the verdict loop tests `-s "$BRC"` BEFORE it probes the pid, so a stale .rc produced
+# "RAN AND ALREADY ENDED … it DID start" with no evidence about this launch (a fail-open), while a stale
+# .log holding `REFUSED` produced a false "NOT DISPATCHED". Both directions are closed by the two lines
+# below: a name that cannot repeat within a box's lifetime (minted with the brief, above), and records
+# that cannot outlive their own dispatch.
+rm -f "$BLOG" "$BRC" "$BPID"
 # The ledger is APPEND-ONLY and shared by every spawn on the box, so the byte offset taken BEFORE the
 # launch is what stops a row from an earlier worker (or an earlier run of the same name) answering for
 # THIS one. `tr -cd 0-9` because `wc -c` pads its number on some platforms, and an unreadable offset
 # must degrade to 0 (whole file) rather than to an arithmetic error under `set -u`.
+LG="${HOME:-}/.pi/agent/state/spawn-gate.tsv"
 _lgoff=0
 [ -f "$LG" ] && _lgoff="$(wc -c < "$LG" 2>/dev/null | tr -cd '0-9')"
 is_num "${_lgoff:-}" || _lgoff=0
@@ -290,7 +307,7 @@ _record() {
 
 case "$_verdict" in
   started)
-    log_line "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; spawn-gate ledger: allowed TAG=$NAME; brief ${BRIEF#$O/}; report $O/state/REPORT-stall-fix.md)"
+    log_line "DRAIN STALL -> STALL FIX DISPATCHED (pass ${SEEN}; spawn-gate ledger: allowed TAG=$NAME; brief ${BRIEF#$O/}; report $REPORTF)"
     _record "stall-fix dispatched"
     exit 0 ;;
   running)
@@ -307,7 +324,7 @@ case "$_verdict" in
     exit 0 ;;
   ended)
     _rc="$(cat "$BRC" 2>/dev/null || true)"
-    log_line "DRAIN STALL -> STALL FIX RAN AND ALREADY ENDED (pass ${SEEN}; rc=${_rc:-?}) — it DID start, so its report may exist: $O/state/REPORT-stall-fix.md; worker log $BLOG"
+    log_line "DRAIN STALL -> STALL FIX RAN AND ALREADY ENDED (pass ${SEEN}; rc=${_rc:-?}) — it DID start, so its report may exist: $REPORTF; worker log $BLOG"
     _record "stall-fix ran-and-ended rc=${_rc:-?}"
     exit 0 ;;
   failed)

@@ -1653,9 +1653,16 @@ PYEOF
   # marker at all, so removing the applied fix in the shipped block reddens HERE, by name.
   rm -f "$DO/state/drain-stall"
   _out="$(_drain '' 180 0)"
+  # ⛔ THE LITERAL MADE THIS ARM UNREACHABLE (review P2, 2026-11-01). The shipped line is `no land
+  # marker inside the ${_wbound}m window at all`, so the fragment `no land marker inside the window`
+  # could never match it: the arm was DEAD, and had the STALLED shape ever been the one taken this leg
+  # would have fallen to the `*)` arm below and reported "an unexpected verdict" on a correct tree —
+  # a red on a green box, in the very leg added for #2929 ask 2. The window's own bound sits between
+  # "the" and "window", so the pattern spans it. (The DEADLOCK arm is what `_drain '' 180 0` actually
+  # produces, since spawns=0; this arm exists for the same empty answer WITH workers running.)
   case "$_out" in
     *"DRAIN DEADLOCK"*"STARTED NO WORKER"*) echo "  ok a box that has NEVER landed (no merged-*.done at all) escalates — the empty answer IS the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
-    *"DRAIN STALLED"*"no land marker inside the window") echo "  ok a markerless box names the empty answer as the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    *"DRAIN STALLED"*"no land marker inside the "*"m window at all"*) echo "  ok a markerless box names the empty answer as the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
     "") echo "  ❌ a state dir with NO land marker produced NO line at all — the escalation is disabled by the exact condition it exists for (#2929): '$_out'"; FAIL=$((FAIL+1)) ;;
     *) echo "  ❌ a markerless box produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
   esac
@@ -1663,6 +1670,22 @@ PYEOF
     echo "  ok …and it WRITES the escalation record (state/drain-stall), so the next pass still knows"; PASS=$((PASS+1))
   else
     echo "  ❌ a markerless box left no escalation artifact (#2929 ask 2): $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ THE SAME EMPTY ANSWER **WITH WORKERS RUNNING** takes the OTHER stall arm, and until this leg
+  # existed nothing in the suite could reach it: `_drain '' <min> 0` always lands on DEADLOCK, so the
+  # STALLED-with-a-synthesised-age arm was only ever covered by a hand-run. Driven here so the
+  # synthesised age, its "at least" label and the window it is derived from are all pinned.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain '' 180 2)"
+  case "$_out" in
+    *"DRAIN STALLED"*"no land marker inside the "*"m window at all"*) echo "  ok a markerless box WITH workers running escalates as STALLED and says the age is only a floor (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    *"drain alive"*) echo "  ❌ a markerless box reported 'drain alive' when workers ran — an empty answer is not an all-clear: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a markerless box with 2 spawns produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if grep -q '^agesrc=synth$' "$DO/state/drain-stall" 2>/dev/null; then
+    echo "  ok …and the record carries agesrc=synth, so the status token can print the bound as '>='"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a synthesised age was not recorded as such: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
   fi
   _out="$(_drain 200 180 4)"
   case "$_out" in
