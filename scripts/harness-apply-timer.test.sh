@@ -387,37 +387,37 @@ assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 # Both stubs exit 1, exactly as the real `check-deployed-drift.sh` does, so the ONLY thing that can
 # distinguish them is the token.
 say_case "T24 a stale EXECUTING tree reds the pass; other drift does not"
-mk_origin t20; mk_clone t20
+mk_origin t24; mk_clone t24
 REPO_P="$CLONE"; MODE_P=pin
-WANT20="$(advance_origin t20 A.txt "upstream for the drift case")"
-mkdir -p "$T/t20/home/.pi/agent/state"
+WANT24="$(advance_origin t24 A.txt "upstream for the drift case")"
+mkdir -p "$T/t24/home/.pi/agent/state"
 git -C "$CLONE" fetch -q origin main >/dev/null 2>&1
-git -C "$CLONE" worktree add --detach "$T/t20/pin" "$WANT20" >/dev/null 2>&1
-mkdir -p "$T/t20/pin/scripts/orchestrator-harness"
-printf '%s\n' "$WANT20" >"$T/t20/home/.pi/agent/state/HARNESS-PIN"
-printf '%s\n' "$T/t20/pin/scripts/orchestrator-harness" >"$T/t20/home/.harness-path"
-printf '#!/usr/bin/env bash\necho "harness=executes:/gone/709dfb06eac2/scripts/orchestrator-harness"\nexit 1\n' >"$T/t20/drift-exec.sh"
-printf '#!/usr/bin/env bash\necho "harness=behind:709dfb06eac2"\nexit 1\n' >"$T/t20/drift-behind.sh"
-chmod +x "$T/t20/drift-exec.sh" "$T/t20/drift-behind.sh"
-OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-exec.sh" run_pass "$T/t20" 2>&1)"; RC=$?
+git -C "$CLONE" worktree add --detach "$T/t24/pin" "$WANT24" >/dev/null 2>&1
+mkdir -p "$T/t24/pin/scripts/orchestrator-harness"
+printf '%s\n' "$WANT24" >"$T/t24/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$T/t24/pin/scripts/orchestrator-harness" >"$T/t24/home/.harness-path"
+printf '#!/usr/bin/env bash\necho "harness=executes:/gone/709dfb06eac2/scripts/orchestrator-harness"\nexit 1\n' >"$T/t24/drift-exec.sh"
+printf '#!/usr/bin/env bash\necho "harness=behind:709dfb06eac2"\nexit 1\n' >"$T/t24/drift-behind.sh"
+chmod +x "$T/t24/drift-exec.sh" "$T/t24/drift-behind.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-exec.sh" run_pass "$T/t24" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T24 a live controller on a GONE tree fails an otherwise-successful pass (rc 1)"
 assert_contains "$OUT" "deployed-drift" "T24 and the refusal is NAMED, not a silent green"
 assert_contains "$OUT" "executes:/gone" "T24 and it names the tree that is actually executing"
-assert_contains "$(cat "$T/t20/state/harness-apply.status" 2>/dev/null)" "action=deployed-drift" "T24 and the durable record says what happened, not the log alone"
+assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "action=deployed-drift" "T24 and the durable record says what happened, not the log alone"
 # ⛔ THE REFUSAL TEXT ITSELF (review round 6, P1). A pair of BACKTICKS inside this double-quoted
 # assignment was executed as command substitution when the arm fired: the incident line printed
 # `<script>: line 644: executes:: command not found` and the sentence silently lost its token
 # ("and an  state always has a live controller"). Control flow was unaffected, so nothing caught it.
 # This asserts the prose survives intact, which is the only way that class is observable.
 assert_contains "$OUT" "an executes: state always has a live controller" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
-OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-behind.sh" run_pass "$T/t20" 2>&1)"; RC=$?
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-behind.sh" run_pass "$T/t24" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 a copy at rest that is merely BEHIND does NOT red the pass"
 assert_contains "$OUT" "deployed_drift=drift" "T24 and it is still REPORTED, so it is not silent either"
 # A CANNOT-VERIFY CHECKER IS NOT A RED ONE, AND NOT A SILENT ONE either: the reason is logged (the
 # record's `detail=` truncates at 240 chars, so the log is the only place it survives).
-printf '#!/usr/bin/env bash\necho "UNKNOWN: the process table could not be read"\nexit 2\n' >"$T/t20/drift-unknown.sh"
-chmod +x "$T/t20/drift-unknown.sh"
-OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-unknown.sh" run_pass "$T/t20" 2>&1)"; RC=$?
+printf '#!/usr/bin/env bash\necho "UNKNOWN: the process table could not be read"\nexit 2\n' >"$T/t24/drift-unknown.sh"
+chmod +x "$T/t24/drift-unknown.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-unknown.sh" run_pass "$T/t24" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 a checker that cannot verify does not by itself red a converged box"
 assert_contains "$OUT" "deployed_drift_unknown=UNKNOWN: the process table could not be read" "T24 but its REASON is kept, never a bare rc"
 

@@ -109,6 +109,11 @@
 #   HARNESS_APPLY_STALE_SECONDS  a record older than this is STALE (default 3600 = 6 cadences)
 #   HARNESS_APPLY_SYNC_CMD   the sync verb to run on the sync path (default <repo>/sync.sh; the suite
 #                            points it at a stub so the fixture never runs pi-bootstrap)
+#   HARNESS_APPLY_DRIFT_CHECK  1|0 — read the deployed-drift check on this pass (default 1). `0` is
+#                            the KILL SWITCH for `action=deployed-drift`: a box that reds every tick
+#                            needs it found here, not by reading the function body.
+#   HARNESS_APPLY_DRIFT_CMD  the checker to run instead of the discovered `check-deployed-drift.sh`
+#                            (the suite drives the red arm through a stub)
 #
 # Run: bash scripts/harness-apply-pass.sh [--dry-run|--print-status|--help]
 #

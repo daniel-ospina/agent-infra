@@ -754,7 +754,14 @@ if [ "$SURFACE" -eq 1 ]; then
             # interpreter may nominate the script; the `-c` arm below already had exactly this rule.
             if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
           orch-loop.sh|*/orch-loop.sh)
-            if [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
+            # ⛔ THE SAME RULE ON BOTH ARMS (review round 7, P1 — a REGRESSION this diff introduced).
+            # Gating only the absolute arm dropped `cd <dir> && ./orch-loop.sh`, a start shape this
+            # repo's own README names: `./orch-loop.sh` has `_i -eq 0` (a direct shebang exec) and no
+            # interpreter, so it fell to the MENTION note and a controller running a GONE tree exited
+            # rc 0 with NO `executes:` token — the silent green restored for that spelling, which the
+            # pre-change code caught. The `_i -eq 0` half is what keeps argv[0] working; the
+            # `_interp` half is what keeps `grep -n x orch-loop.sh` (the word at `_i > 0`) a mention.
+            if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
           -c)
             # ⛔ `bash -c <abs>/orch-loop.sh` IS the invocation; `bash -c 'echo-bash-<dir>/orch-loop.sh'` is a
             # shell running TEXT — the self-match class the fleet inventory documents, and the arm that keeps
