@@ -1023,6 +1023,23 @@ async function main() {
       "with the deployed tree present the mismatch MUST still fire");
   });
 
+  // ⛔ A SHORT PIN RECORD MUST STILL MATCH A `<sha12>` CHILD (review round 2, finding 4).
+  // `pinnedSha` accepts `/^[0-9a-f]{7,40}$/` and slices to 12, so a 7-char record yields a 7-char pin
+  // while every deployed child is named from `cut -c1-12`. An EQUALITY match — and even the
+  // bidirectional prefix, once over-matching was closed — would miss it, and nothing else in this
+  // suite uses a pin shorter than 12, so the arm was unpinned.
+  await test("pinMismatchLines matches a SHORT pin record against a sha12 child", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const pinned = seededRepo();
+    const other = seededRepo();
+    commit(other, "other");
+    const full = git(pinned, "rev-parse HEAD").trim();
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${full.slice(0, 7)}\n`);
+    mkdirSync(join(home, "harness", full.slice(0, 12)), { recursive: true });
+    equal(withoutPinEnv(() => pinMismatchLines(other, home)).length, 2,
+      "a 7-char pin record names the same tree as its sha12 child and must still warn");
+  });
   // ⛔ THE TWO DEPLOYED SHAPES A `<root>/<pin12>`-ONLY PREDICATE SILENCED (review finding 1). Both are
   // documented in the fleet: `harness-refresh.sh:396` "the legacy flat pin: the ROOT is the worktree",
   // and `:503-507` "the tree HARNESS_PIN_FILE names — the only record that can name a READ dir OUTSIDE

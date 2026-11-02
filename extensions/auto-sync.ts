@@ -28,7 +28,17 @@ import { repoKey, acquireRepoLock, releaseRepoLock } from "./shared/branch-owner
 
 export function shortHead(repo: string, ref = "HEAD"): string {
   try {
-    return execSync(`git -C "${repo}" rev-parse --short ${ref}`, { encoding: "utf-8" }).trim();
+    // ⛔ STDERR IS SWALLOWED (review round 2, finding 2). `execSync` inherits the child's stderr, and
+    // the new deployed-tree arms call this on paths that are DELIBERATELY absent (`<home>/harness` on
+    // a non-deploying box, a pin root that is not a git repo) — so every session start on exactly the
+    // box this change fixes printed `fatal: cannot change to …`. The false banner was replaced by a
+    // `fatal:` on the same line of the same session start: same user-visible defect, new spelling.
+    // `stdio: ["ignore","pipe","ignore"]` keeps stdout (the sha) and drops the diagnostics; it is
+    // already this file's idiom (`stdio: "ignore"` at the sync/auto paths).
+    return execSync(`git -C "${repo}" rev-parse --short ${ref}`, {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
   } catch {
     return "?";
   }
@@ -90,7 +100,15 @@ export function pinTreeDeployed(pin: string, home: string = process.env.HOME ?? 
     //    than the directory name or (defensively) longer.
     try {
       for (const name of readdirSync(root)) {
-        if (!(name.startsWith(pin) || pin.startsWith(name))) continue;
+        // ⛔ FORWARD PREFIX ONLY, AND ONLY OVER A SHA-SHAPED NAME (review round 2, finding 3). The
+        // bidirectional form accepted `pin.startsWith(name)`, so a directory literally named `0` (or
+        // `a`, or `0123`) matched every pin and declared a deployment on a box with none — the exact
+        // false positive this function exists to prevent, reintroduced one level down. It also
+        // accepted `<pin12>-old` / `<pin12>.bak` leftovers via the reverse direction. The real case
+        // the prefix is for is a SHORT RECORD (7 chars) against a `<sha12>` child, which is a forward
+        // match on a hex name; `sameCommit` below keeps its own bidirectional test, where the value it
+        // compares comes from git and is always a real short sha.
+        if (!/^[0-9a-f]{6,40}$/i.test(name) || !name.startsWith(pin)) continue;
         try {
           if (statSync(join(root, name)).isDirectory()) return true;
         } catch {

@@ -706,6 +706,9 @@ finish() { # <ok> <rc> <verdict-phrase>
 case "$FETCH_STATE" in
     ok) ;;
     *) REC_ACTION=cannot-verify-fetch
+       # Its `detail=` is 273 chars (+ the readings suffix), so `cut -c1-240` drops the tail; the remedy
+       # is a FIELD so the action survives regardless (review round 2, finding 5).
+       REC_REMEDY="restore the fetch (check the remote and egress), then re-run"
        finish 0 23 "REFUSED cannot-verify: no fresh fetch was made (fetch=$FETCH_STATE) in $REPO, so 'current' would mean 'current against the ref as of the LAST successful fetch' — the comparison this pass exists to make is not fresh. Nothing was touched." ;;
 esac
 
