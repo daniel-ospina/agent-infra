@@ -116,7 +116,7 @@ LOCK_DIR="$STATE_DIR/reap-abandoned-worktrees.lock"
 LOCK_STALE_SECONDS="${REAP_AW_LOCK_STALE_SECONDS:-1800}"
 AGED_MINUTES="${REAP_AW_AGED_MINUTES:-180}"
 DIRTY_MODE="${REAP_AW_DIRTY:-keep}"
-# ── the GITLESS arm (#3172) ───────────────────────────────────────────────────────────────────
+# ── the GITLESS arm (#3278) ───────────────────────────────────────────────────────────────────
 # OFF by default so every existing caller keeps today's exact behaviour (and its tests keep meaning
 # what they meant). The scheduled pass opts IN, because the class this arm covers is the one that
 # grows: a `/tmp/<name>` scratch tree with NO `.git` was invisible to every arm the hourly pass runs.
@@ -467,7 +467,7 @@ remove_one() { # <worktree-canonical-path> <repo> — 0 removed, 1 not removed (
     return 1
 }
 
-# ── the gitless arm's tests (#3172) ───────────────────────────────────────────────────────────
+# ── the gitless arm's tests (#3278) ───────────────────────────────────────────────────────────
 # ⛔ WHY THIS ARM EXISTS. The sweep below enumerates directories whose `.git` is a FILE. That is the
 # correct test for a LINKED worktree, and it is what keeps a primary checkout out of reach — but it
 # also means a `/tmp/<name>` scratch tree with NO `.git` is skipped by EVERY arm the scheduled pass
@@ -481,7 +481,7 @@ remove_one() { # <worktree-canonical-path> <repo> — 0 removed, 1 not removed (
 # argv-named, pin, containment, toctou re-proof) plus the keep list.
 git_below() { # <dir> — is a git marker INSIDE the tree? Then a git arm owns it, not this one.
     local x y
-    # ⛔ DEPTH 3, NOT ONE LEVEL (review of #3172, measured): a repo nested at `x/a/b/.git` was
+    # ⛔ DEPTH 3, NOT ONE LEVEL (review of #3278, measured): a repo nested at `x/a/b/.git` was
     # classified gitless and removable by the one-level version.
     # ⛔ AND BY PURE PATH EXPANSION, NOT `find` (measured at 08:0xZ, the reason a scheduled pass exited
     # 124): `find -maxdepth 3` forks and re-walks every directory of a 250 MB scratch tree, ~450 times
@@ -492,7 +492,7 @@ git_below() { # <dir> — is a git marker INSIDE the tree? Then a git arm owns i
         x="${x%/}"
         [ -e "$x/.git" ] && return 0
         # a BARE repo nested in the tree is the same object class as a nested `.git`: `HEAD` +
-        # `objects/` + `refs/` ARE the repository (review of #3172 round 2).
+        # `objects/` + `refs/` ARE the repository (review of #3278 round 2).
         if [ -e "$x/HEAD" ] && [ -d "$x/objects" ] && [ -d "$x/refs" ]; then return 0; fi
         for y in "$x"/*/; do
             y="${y%/}"
@@ -504,7 +504,7 @@ git_below() { # <dir> — is a git marker INSIDE the tree? Then a git arm owns i
 }
 gitless_keep() { # <canon> — is it a box dependency named in the keep list?
     # ⛔ COMPARED ON THE CANONICAL PATH, and the list is read with `while read` not `$(…)` word
-    # splitting (review of #3172): splitting dropped the meaning of any entry containing a space —
+    # splitting (review of #3278): splitting dropped the meaning of any entry containing a space —
     # `REAP_AW_GITLESS_KEEP='/tmp/keep dir'` silently discarded the entry and DELETED the tree — and a
     # raw-path comparison let `--root /tmp/` (→ `/tmp//actions-runner`) slip past the runner install.
     local k kc
@@ -519,7 +519,7 @@ gitless_keep() { # <canon> — is it a box dependency named in the keep list?
         # ⛔ A TRAILING-GLOB ENTRY IS A PREFIX RULE. The documented safe-sweep exclusion set
         # (docs/ops/disk-consumers.md R4) is a family, not a list — `/tmp/venv-shared-py312` holds a
         # lane's INTERPRETER via VIRTUAL_ENV, which the cwd/exe/argv census cannot see, so a prefix
-        # entry is the only way to name it (review of #3172).
+        # entry is the only way to name it (review of #3278).
         case "$kc" in
             *'*'*) case "$1" in $kc|$kc/*) GITLESS_KEEP_WHY="matches keep-list pattern ($kc)"; return 0 ;; esac ;;
         esac
@@ -573,11 +573,11 @@ sweep_root() { # <root>
             # `.git` is a DIRECTORY or a SYMLINK: a primary checkout (or a checkout whose gitdir link
             # went dangling — `-L` also catches a broken link, which `-f`/`-e` both miss and which
             # used to fall through into the gitless arm with the tree's work still in it; review of
-            # #3172, measured). Named, so the preservation is visible in the pass log instead of
+            # #3278, measured). Named, so the preservation is visible in the pass log instead of
             # being an anonymous `continue`.
             KEPT=$((KEPT + 1)); log_line "PRESERVED($d, main-checkout) .git is a DIRECTORY/link — a primary checkout is never a candidate"; continue
         else
-            # ── NO `.git` AT ALL: the uncovered class (#3172) ─────────────────────────────────────
+            # ── NO `.git` AT ALL: the uncovered class (#3278) ─────────────────────────────────────
             if [ "$INCLUDE_GITLESS" != 1 ]; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=not-a-worktree (no .git; --include-gitless is off)"; continue
             fi
@@ -594,12 +594,12 @@ sweep_root() { # <root>
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=git-below (a .git lives inside the tree, so a git arm owns it)"; continue
             fi
             # ⛔ A BARE REPO HAS NO `.git` AT ALL: `HEAD` + `objects/` + `refs/` ARE the repository.
-            # Classifying it gitless would take every commit in it (review of #3172, measured).
+            # Classifying it gitless would take every commit in it (review of #3278, measured).
             if [ -e "$d/HEAD" ] && [ -d "$d/objects" ] && [ -d "$d/refs" ]; then
                 KEPT=$((KEPT + 1)); log_line "PRESERVED($d, bare-repo) HEAD+objects/+refs/ — this IS a git repository, not scratch"; continue
             fi
             # ⛔ THE HOME/STATE GUARD IS NOT HERE — it runs on the CANONICAL path below (review of
-            # #3172 round 2: comparing the raw `$d` let `--root /tmp/` — `/tmp//cell-home` — delete the
+            # #3278 round 2: comparing the raw `$d` let `--root /tmp/` — `/tmp//cell-home` — delete the
             # cell HOME in an armed pass; the same spelling bug the keep list had).
             gitless=1
             GITLESS_DONE=$((GITLESS_DONE + 1))
@@ -617,7 +617,7 @@ sweep_root() { # <root>
             KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=outside-root ($canon is not inside $root_canon — this sweep has no authority there)"; continue
         fi
         # ⛔ NEVER THE CELL'S OWN HOME, NOR THE PASS'S STATE DIR — compared on the CANONICAL path,
-        # with each reference canonicalised too (review of #3172 round 2, measured: a non-canonical
+        # with each reference canonicalised too (review of #3278 round 2, measured: a non-canonical
         # `--root` spelling reaped /tmp/cell-home, which holds ~9.8 GB of `.pi` / `.venvs` here, and the
         # structural guard — the stamp's ancestor-pin — is absent on the scheduled path).
         if [ "$gitless" = 1 ]; then
@@ -633,7 +633,7 @@ sweep_root() { # <root>
             done
         fi
         # ⛔ THE KEEP LIST IS CHECKED ON THE CANONICAL PATH, and it is checked for GITLESS candidates
-        # only: a linked worktree's protection is the four git proofs, not this list (review of #3172).
+        # only: a linked worktree's protection is the four git proofs, not this list (review of #3278).
         if [ "$gitless" = 1 ] && gitless_keep "$canon"; then
             KEPT=$((KEPT + 1)); log_line "PRESERVED($canon, keep-list) ${GITLESS_KEEP_WHY:-named in the gitless keep list}"; continue
         fi
@@ -669,7 +669,7 @@ sweep_root() { # <root>
         fi
         # ⛔ ONLY A LINKED WORKTREE IS ASKED FOR ITS TREE STATE. For a gitless tree `head_state` is
         # three bounded git forks on a directory git rejects — charged against the budget that exists
-        # to bound exactly this — and its answer is discarded anyway (review of #3172).
+        # to bound exactly this — and its answer is discarded anyway (review of #3278).
         if [ "$gitless" = 1 ]; then out="kind=gitless"; else out="$(head_state "$d")"; fi
         if [ "$DIRTY_MODE" = keep ] && [ "$gitless" != 1 ]; then
             dirty_n="$(printf '%s' "$out" | sed -n 's/.*dirty=\([0-9][0-9]*\).*/\1/p')"

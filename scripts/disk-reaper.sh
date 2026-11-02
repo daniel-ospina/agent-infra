@@ -525,7 +525,7 @@ esac
 # ⛔ AND EACH IS BOUNDED, not merely digit-checked — see `seam_too_large`: a digit string above intmax_t
 # passes the case below and then makes the comparison itself error, which is the SAME fail-open one
 # size class up (measured on `DISK_REAPER_STALE_SECONDS=99999999999999999999`).
-# ⛔ THE UNDER-RECLAIM SEAMS ARE VALIDATED LIKE EVERY OTHER BOUND (review of #3172 round 2): read
+# ⛔ THE UNDER-RECLAIM SEAMS ARE VALIDATED LIKE EVERY OTHER BOUND (review of #3278 round 2): read
 # here, digit-and-range checked by the loop below, and reused by `record_body`. An unvalidated value
 # makes the `-lt` comparison itself error — a non-numeric `DISK_REAPER_LOW_FREE_MB=abc` silently
 # DISABLED the alert, the fail-open one size class up from the one this loop exists for.
@@ -1602,7 +1602,7 @@ reap_abandoned_arm() {
         [ -n "$root" ] || continue
         b="$(free_kb_for_path "$root")"
         # `--aged-minutes` is the owner's dial; DISK_REAPER_ABANDONED_MINUTES is the operator's seam.
-        # ⛔ `--include-gitless` IS THE SCOPE FIX (#3172), not a new arm: without it this delegate
+        # ⛔ `--include-gitless` IS THE SCOPE FIX (#3278), not a new arm: without it this delegate
         # enumerates ONLY dirs whose `.git` is a FILE, and a `/tmp/<name>` scratch tree with no `.git`
         # is invisible to every class the hourly pass runs. Measured on cell-3: 453 such trees /
         # 4,594 MB, while the box reached 0 bytes free. DISK_REAPER_GITLESS=0 is the off-switch.
@@ -2368,7 +2368,7 @@ record_body() {
         printf 'state_dir=%s\n' "$STATE_DIR"
         printf 'state_dir_primary=%s\n' "$STATE_DIR_PRIMARY"
     fi
-    # ── UNDER-RECLAIM: the signal this box did not have (#3172) ───────────────────────────────
+    # ── UNDER-RECLAIM: the signal this box did not have (#3278) ───────────────────────────────
     # A pass that RUNS, exits 0 and frees 58 MB while the box grows 2,900 MB/h is the failure this
     # line exists to make visible: "the reaper is healthy" and "the disk still went to zero" were
     # both true on cell-3 at 07:05Z, and nothing alerted until a lane happened to measure. This is a
@@ -2383,12 +2383,12 @@ record_body() {
     # ⛔ `${REAP_AW_ROOTS%%:*:-/tmp}` IS NOT A DEFAULT — it is the pattern `*:-/tmp`, so with
     # REAP_AW_ROOTS unset the expansion aborted and `free_mb` was `unmeasured` on exactly the path the
     # shipped unit uses (the template sets no REAP_AW_ROOTS): the whole alert was inert (review of
-    # #3172, measured). Default first, then strip the host list, then read the root the pass sweeps.
+    # #3278, measured). Default first, then strip the host list, then read the root the pass sweeps.
     _first_root="${REAP_AW_ROOTS:-/tmp}"; _first_root="${_first_root%%:*}"
     _kb="$(free_kb_for_path "$_first_root")"
     case "${_kb:-}" in ''|*[!0-9]*) : ;; *) _free_mb=$(( _kb / 1024 )) ;; esac
     # ⛔ A DRY RUN HAS NOT FREED ANYTHING: printing `freed_mb_total=0` there is a measured-looking
-    # zero for a pass that never intended to reclaim (review of #3172).
+    # zero for a pass that never intended to reclaim (review of #3278).
     if is_dry; then printf 'freed_mb_total=not-applicable\n'; else printf 'freed_mb_total=%s\n' "$_freed_total"; fi
     printf 'free_mb_root=%s\n' "$_first_root"
     printf 'free_mb=%s\n' "${_free_mb:-unmeasured}"
