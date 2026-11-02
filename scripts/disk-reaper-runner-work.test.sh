@@ -38,6 +38,12 @@
 # reason on any box whose real `/opt/gh-runner*/_work` or `/tmp/actions-runner*/_work` exists (a cell),
 # where the documented defaults are asserted from the source instead. It is `--dry-run` regardless, so
 # even if it did read a cell's 19 G of live checkout it could remove nothing.
+# ⛔ AND A SKIP IS NOT A ✅. That arm used to be recorded as a PASSING check, so a CELL — where the arm
+# does not run at all — printed the same `19 passed, 0 failed` as a laptop on which all 19 arms really
+# did run: an unmeasured arm read as a measured one on exactly the box class this suite exists for, and
+# nothing in the transcript said so. `skip()` now records it separately (a file, because a case runs in a
+# subshell and its counters do not survive) and the tally line reports the count plus each reason, so the
+# two runs cannot be mistaken for each other.
 #
 # DISCRIMINATION, MEASURED BOTH WAYS: `DR_REAPER` overrides the entry point under test, so the same
 # suite can be run against a tree in which the class does not exist
@@ -53,6 +59,15 @@ PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
+# ⛔ A SKIP IS ITS OWN OUTCOME, NEVER A PASS (`ok`). An arm that did not run proves nothing, and counting
+# it green is how a box that skipped it reports the same number as one that ran it. `skip` is called from
+# INSIDE a case, i.e. from a subshell, so it records the reason in a file the outer runner reads at the
+# end; the counter itself cannot travel back through the subshell.
+SKIP_LOG=""
+skip() { # <reason — say WHICH arm and WHY it could not run>
+    printf '  ⏭  SKIPPED: %s\n' "$1"
+    printf '%s\n' "$1" >>"$SKIP_LOG"
+}
 # `case_check` runs INSIDE a case (a subshell): it prints and counts locally, and the case's own failure
 # count decides the subshell's status. It deliberately does not touch PASS/FAIL — the OUTER runner counts
 # one line per case, so a mutant run can never inflate the real tally.
@@ -71,6 +86,7 @@ expect_fail() { local label="$1"; shift
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/dr-runner-work-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
+SKIP_LOG="$T/skips.log"
 cleanup() { rm -rf "$T"; }
 trap cleanup EXIT
 
@@ -227,6 +243,14 @@ case_b() { # <entry-point> <owner>
     case_check "$([ "${n:-x}" = 0 ] && echo 0 || echo 1)" \
                "a second pass with nothing left reports freed_df=0MB (got '${n:-none}') — no un-caused delta is claimed"
     case_check "$([ -n "$freed" ] && echo 0 || echo 1)" "the first pass's freed figure was readable ('$freed' MB)"
+    # ⛔ THE OWNER'S `unmeasurable=` TALLY MUST REACH THE RECORD (#3057 review). The entry point lifted the
+    # other seven SUMMARY fields and dropped this one, so "kept because nothing wrote here" and "kept
+    # because the walk could not answer" were the SAME number in the record — the one "could not decide"
+    # outcome had no channel at all. Measured 0 here (every entry was read), and a number, never `?`/empty.
+    case_check "$(grep -q '^unmeasurable_runner_work=0$' <<<"$st" && echo 0 || echo 1)" \
+               "the record carries the owner's unmeasurable= tally (0 here), so an ABSTENTION has a field"
+    case_check "$(grep -qF 'unmeasurable=0 ' <<<"$out" && echo 0 || echo 1)" \
+               "… and the class line prints it beside kept=, so the two outcomes are told apart without the log"
     return $((CASE_FAIL > 0))
 }
 
@@ -329,7 +353,10 @@ case_f() { # <entry-point> <owner>
     # is SKIPPED by name and the documented defaults are asserted from the source instead. `--dry-run`
     # either way, so even the skipped-on-a-cell version could remove nothing.
     if has_real_runner_root; then
-        case_check 0 "default-glob arm SKIPPED — this box has REAL runner roots (/opt or /tmp); asserting the documented default list from the source instead"
+        # ⛔ `skip`, NOT `case_check 0` — the arm did NOT run, so it must not be reported as one that did.
+        # The case's own status still comes from the assertions below, which DO run and are falsifiable on
+        # any box (they read the source), so a broken default list still reddens here.
+        skip "(f) default-glob half, entry point $pass — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead"
         case_check "$(grep -qF '/opt/gh-runner*/_work' "$pass" && grep -qF 'actions-runner*/_work' "$pass" && echo 0 || echo 1)" \
                    "… the entry point's DEFAULT glob list still names the documented /opt and actions-runner roots"
         return $((CASE_FAIL > 0))
@@ -546,6 +573,13 @@ else
     bad "i mutation could not be applied (the --glob arm moved) — the case is not checking it any more"
 fi
 
-printf '\n  %s passed, %s failed\n' "$PASS" "$FAIL"
+# ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: `19 passed, 0 failed` from
+# a CELL (two halves of (f) skipped) and from a laptop (nothing skipped) were the identical line, so an
+# unmeasured arm travelled as a measured one. A nonzero count prints every reason under the total.
+SKIP=0
+if [ -f "$SKIP_LOG" ]; then SKIP="$(wc -l <"$SKIP_LOG" | tr -d ' ')"; fi
+case "${SKIP:-}" in ''|*[!0-9]*) SKIP=0 ;; esac
+printf '\n  %s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
+if [ "$SKIP" -gt 0 ]; then sed 's/^/    skipped: /' "$SKIP_LOG"; fi
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
