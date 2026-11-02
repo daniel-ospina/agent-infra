@@ -6759,20 +6759,16 @@ print_bounds() {
   # runs being waited on. It is a floor on patience, never a claim that a shorter
   # silence means a wedged run.
   printf 'first-checks-stall=%s\n' "$FIRST_CHECKS_STALL"
-  # THE BOUND IN FORCE, NOT THE DEFAULT (review cycle 2, P2): printing
-  # `rail_deadline_default` showed 20254 while `ADMIN_MERGE_RAIL_DEADLINE=500` made a
-  # real run use 500 — the "reported bound ≠ bound used" failure the clamp
-  # disclosure exists to prevent, in the one field an operator greps for. An
-  # INVALID override is reported as such, because a real run would exit 2 on it.
-  _pb_dl="${ADMIN_MERGE_RAIL_DEADLINE:-}"
-  if [ -z "$_pb_dl" ]; then
-    printf 'rail-deadline=%s (default)\n' "$(rail_deadline_default)"
-  else
-    case "$_pb_dl" in
-      ''|*[!0-9]*) printf 'rail-deadline=INVALID:%s (a real run REFUSES this value, rc=2)\n' "$_pb_dl" ;;
-      *) printf 'rail-deadline=%s (from ADMIN_MERGE_RAIL_DEADLINE; clamped to the ceiling at start if higher)\n' "$_pb_dl" ;;
-    esac
-  fi
+  # THE BOUND IN FORCE, NOT THE DEFAULT — AND NOT THE RAW KNOB EITHER (cycle 3,
+  # P2 x2). The guard runs ABOVE this function, so `RAIL_DEADLINE` is already
+  # resolved and already CLAMPED; reading `$ADMIN_MERGE_RAIL_DEADLINE` here
+  # reproduced the very fault this line exists to prevent (one invocation printed
+  # `rail-deadline=33664` beside `CLAMPED to the reachable 20254s`). There is no
+  # INVALID arm: a bad knob exits 2 in `rail_attempt_start` before this function
+  # runs, so such an arm could never execute and a comment claiming it would
+  # misdescribe the code.
+  printf 'rail-deadline=%s%s\n' "${RAIL_DEADLINE:-$(rail_deadline_default)}" \
+    "$([ "${RAIL_DEADLINE_CLAMPED:-0}" -eq 1 ] && printf ' (CLAMPED from %s)' "${ADMIN_MERGE_RAIL_DEADLINE:-}" || printf ' (in force)')"
   printf 'rail-deadline-source=CEILING over the WHOLE ATTEMPT = FIRST_CHECKS_CEILING %ss + RERUN_BUDGET %ss + SELF_EDIT_WAIT %ss + MERGE_REF_WAIT %ss — the SUM of the phase bounds the guard supervises, so a value above it can never fire and is CLAMPED; an attempt may spend one full-length first-checks wait and one re-run phase, and no more.\n' "$(_rail_knob "${FIRST_CHECKS_CEILING:-0}")" "$(_rail_knob "${RERUN_BUDGET:-0}")" "$(_rail_knob "${SELF_EDIT_WAIT:-0}")" "$(_rail_knob "${MERGE_REF_WAIT:-0}")"
   printf 'first-checks-ceiling=%s\n' "$FIRST_CHECKS_CEILING"
   printf 'first-checks-window=%s\n' "$FIRST_CHECKS_WAIT"

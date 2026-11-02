@@ -16004,6 +16004,22 @@ else
   fail "(p) rail-exit.test.sh FAILED — see its output above"
 fi
 
+# (p7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
+# (review cycle 3, P2). (p6) pins 500, which is BELOW the ceiling, so it never
+# exercised the clamp — and the clamp branch is exactly where the surface printed
+# the raw 33664 beside a refusal that enforced 20254.
+SCEN="$TMP/scen-p7"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+grep -q '^rail-deadline=2200 (CLAMPED from 33664)' "$SCEN/out" \
+  && pass "(p7) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
+  || fail "(p7) the inspection surface reports a bound the rail is not using"
+grep -q '^rail-deadline=33664' "$SCEN/out" \
+  && fail "(p7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
+  || pass "(p7) it does NOT print the raw unreachable value"
+grep -q 'rail-deadline=INVALID' "$SCEN/out" \
+  && fail "(p7) an INVALID arm exists — it is unreachable (a bad knob exits 2 first) and misdescribes the code" \
+  || pass "(p7) no unreachable INVALID arm is advertised"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
