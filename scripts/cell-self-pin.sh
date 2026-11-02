@@ -487,7 +487,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0 fetch_branch fetch_ref
+  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup unknown fetch_failed=0 fetch_branch fetch_ref
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -941,7 +941,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
       case $_kv in
         CELL_HOME=*) n_home=$((n_home + 1)); home_val="${_kv#CELL_HOME=}" ;;
         HOME=*) ;;
-        *) bad "the rendered unit sets 'Environment=${_kv%%=}=' — every variable this pass reads (CELL_HOME, HARNESS_PIN_FILE, HARNESS_PIN_DIR, HARNESS, HARNESS_REF, O) is derived from the unit's environment, so an assignment other than HOME=/CELL_HOME= silently re-points the pass at a DIFFERENT pin record than the controller while this install reports success; a unit may adjust IDENTITY (HOME=) and the base (CELL_HOME=), never the record it reads"; return 1 ;;
+        *) bad "the rendered unit sets 'Environment=${_kv%%=*}=' — every variable this pass reads (CELL_HOME, HARNESS_PIN_FILE, HARNESS_PIN_DIR, HARNESS, HARNESS_REF, O) is derived from the unit's environment, so an assignment other than HOME=/CELL_HOME= silently re-points the pass at a DIFFERENT pin record than the controller while this install reports success; a unit may adjust IDENTITY (HOME=) and the base (CELL_HOME=), never the record it reads"; return 1 ;;
       esac
     done
   done <<<"$envs"
@@ -1441,12 +1441,28 @@ do_install() { # [--takeover]
     # read the run cannot know what it is leaving behind there — and the failure modes are both bad: leave a
     # duplicate (two actors) or disable the only one (zero actors, #3194's own state). Verified by the READ
     # in every scope, never by the exit code of a disable we could not confirm.
+    # ⛔ ⛔ AND THE REFUSAL MAY NOT BE A DEAD END, WHICH REACHABILITY MAKES IT (round-9 review, P1). A cell's
+    # USER manager is unreachable from the identity that runs this installer (it writes /etc/systemd/system and
+    # needs root; `systemctl --user` from root answers "Failed to connect to bus: No medium found" on a host
+    # with no /run/user/<uid>). So on the fleet this migration targets, EVERY `systemctl --user` probe is
+    # `unknown`, and an unconditional refusal here closes `--takeover` — while plain `--install` refuses too
+    # (the duplicate-actuator arm sends the operator here). The two verbs then point at each other and the
+    # documented ONE-actuator migration cannot be executed at all, with the remaining routes being the
+    # two-actor race this design forbids or a hand `systemctl` retirement that loses `retire_actuator`'s
+    # read-back. So the EXISTING deliberate-decision hatch reaches this path: it already means "I accept an
+    # unverified/duplicate scope, on the record", and the post-install read-back still names every scope it
+    # could not read. The default stays fail-closed; the decision is the operator's, and it is PRINTED.
     unknown="$(actuator_unknown_scopes)"
+    if [ -n "$unknown" ] && [ -z "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
+      who=""
+      for s in $unknown; do who="$who ${s}"; done
+      bad "--takeover cannot retire safely: the${who} manager did not answer, so this run cannot see whether a shipped eldato-harness-apply.timer is ENABLED there — retiring blind could leave TWO actors (a race) or ZERO (no pin at all). Nothing was written and nothing was retired. Re-run where that manager is reachable, or run 'systemctl --user is-enabled eldato-harness-apply.timer' yourself first. ⛔ On a box where that manager can never be reached from this identity (a root install has no user manager of its own), set CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 to accept ONE unverified scope deliberately: the retirement then covers every scope this run could READ, and the read-back names the scope it could not."
+      rm -rf "$tmp"; return 1
+    fi
     if [ -n "$unknown" ]; then
       who=""
       for s in $unknown; do who="$who ${s}"; done
-      bad "--takeover cannot retire safely: the${who} manager did not answer, so this run cannot see whether a shipped eldato-harness-apply.timer is ENABLED there — retiring blind could leave TWO actors (a race) or ZERO (no pin at all). Nothing was written and nothing was retired. Re-run where that manager is reachable, or run 'systemctl --user is-enabled eldato-harness-apply.timer' yourself first."
-      rm -rf "$tmp"; return 1
+      note "  ACCEPTED BLINDLY (CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR): the${who} manager did NOT ANSWER, so a shipped eldato-harness-apply.timer in that scope is NOT retired and the one-actor invariant there is UNVERIFIED — the read-back below says so, and it is not counted as verified"
     fi
   fi
   if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
@@ -1505,7 +1521,14 @@ do_install() { # [--takeover]
   # shipped timer is the same false PASS this function refuses to create. A DELIBERATE duplicate
   # (CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR) is the one case where the invariant is not the claim.
   if [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
-    note "installed (TWO actuators on this pin, as CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR declares). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
+    # ⛔ AND THE CLAIM IS THE MEASUREMENT, NOT THE FLAG. This line used to assert "TWO actuators" whenever the
+    # hatch was set — but the hatch is now also the accepted route through an UNREADABLE scope, where the
+    # true count is unknown: the scope may carry nothing (one actor, fine) or a duplicate (two). Print what
+    # was READ and name what was not, so "deliberately accepted" never reads as "verified".
+    still=""; unknown=""
+    if scopes_now="$(actuator_scopes)"; then for s in $scopes_now; do still="$still ${s}"; done; fi
+    for s in $(actuator_unknown_scopes); do unknown="$unknown ${s}"; done
+    note "installed — invariant NOT fully verified, as CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR declares: shipped actuator STILL ENABLED in:${still:- none read}; manager(s) that did NOT ANSWER:${unknown:- none}. Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
     return 0
   fi
   if scopes="$(actuator_scopes)"; then

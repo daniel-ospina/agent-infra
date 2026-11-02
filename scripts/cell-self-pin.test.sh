@@ -777,6 +777,7 @@ mk_blind_user_systemctl() { # <dir> <state-dir> — SYSTEM answers; the USER man
     'case "$verb" in' \
     '  is-enabled) [ -f "$st" ] && exit 0 || exit 1 ;;' \
     '  enable) : >"$st"; exit 0 ;;' \
+    '  disable) rm -f "$st"; exit 0 ;;' \
     'esac' \
     'exit 0' >"$d/systemctl"
   chmod +x "$d/systemctl"
@@ -827,8 +828,35 @@ case "$out" in
   *'nothing to retire'*) bad "…but it claimed 'nothing to retire' about a manager that never answered: $out" ;;
   *) bad "…but the blindness is not named: $out" ;;
 esac
+case "$out" in
+  *'CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1'*) ok "…and it names the deliberate-decision hatch, so a box where that manager can never be reached is not a dead end" ;;
+  *) bad "…but the refusal offers no route out for a box whose user manager can NEVER answer (a root install has no user manager of its own): $out" ;;
+esac
 [ -f "$T/units-blind3/cell-self-pin.service" ] && bad "a refused blind --takeover (user-only actuator) still wrote the unit" \
   || ok "a refused blind --takeover (user-only actuator) wrote nothing"
+# ── (b3-ter) …AND THE REFUSAL MAY NOT BE A DEAD END — both verbs pointed at each other ───────────
+# ⛔ THE FLEET SHAPE, measured on this box in the identity that actually installs (root writes
+# /etc/systemd/system and needs daemon-reload): `systemctl --user` answers "Failed to connect to bus: No
+# medium found" because root has no user manager of its own (`/run/user` empty). So EVERY `--user` probe is
+# `unknown`, and the unconditional refusal closed `--takeover` on exactly the cells it exists for — while
+# `--install` refuses too (the duplicate arm sends the operator to `--takeover`). The two remedies pointed at
+# each other and the documented ONE-actuator migration could not be executed at all. The existing
+# deliberate-decision hatch is therefore honoured HERE, and the read-back must say what was MEASURED rather
+# than assert a count it could not take.
+mk_blind_user_systemctl "$T/fake-blind-hatch" "$T/state-blind-hatch"
+: >"$T/state-blind-hatch/system-$SHIPPED"          # the readable scope DOES carry the shipped actuator
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-hatch" PATH="$T/fake-blind-hatch:$PATH" \
+       CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 bash "$PIN" --install --takeover 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--takeover with CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 completes on a box whose user manager can NEVER be reached from the installing identity" \
+  || bad "the documented migration could not be completed anywhere: --install sends the operator to --takeover, and --takeover refuses on a manager that is structurally unreachable (rc=$rc): $out"
+[ -f "$T/state-blind-hatch/system-$SHIPPED" ] \
+  && bad "the readable scope's shipped timer survived the accepted-blind migration — the retirement covered nothing" \
+  || ok "…and it retired the scope it could READ"
+case "$out" in
+  *'NOT fully verified'*'user'*) ok "…and the read-back names the unread scope and says the invariant was NOT fully verified, instead of asserting a count" ;;
+  *'TWO actuators on this pin, as'*) bad "…but it asserted TWO actuators when it never read that scope: $out" ;;
+  *) bad "…but the read-back does not name the unread scope: $out" ;;
+esac
 : >"$T/state-blind/user-$SHIPPED"
 # ── (c) BOTH managers carry it: `--takeover` must retire BOTH, not the first one it finds ────────
 # ⛔ MEASURED FALSE PASS, NOT A HYPOTHETICAL: `actuator_scope` returned ONLY the first enabled scope, so
