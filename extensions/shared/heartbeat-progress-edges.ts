@@ -870,6 +870,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     ],
     note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). THREE shapes reach `claim-unreadable` and the bound governs only the third: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because that test is the `if` and the age test only the `elif` — the bound must never be read as re-admitting a failed read), and an `ok` header older than this bound. The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
+  {
+    name: "LANE_ARM_SNAPSHOT_MAX_AGE",
+    owners: ["scripts/lane-arm.sh"],
+    value: "\"${LANE_ARM_SNAPSHOT_MAX_AGE_OPT:-$(( BUDGET * 2 ))}\"",
+    axis: "hygiene",
+    guardedBy: NONE,
+    note: "how old the reading a lane-arm pass publishes may be WHEN IT BECOMES CURRENT (default 2 x --budget = 480 s), reachable as `--max-snapshot-age`. Applied twice: before the renderer (cheap refusal) and again at PUBLISH, which is the binding arm because it also covers the renderer's own bounded run — the stamp in the queue header is rewritten to that same number so the field and the gate cannot disagree. ⛔ DERIVED, NOT A LITERAL, AND THAT WAS THE FIX (2026-10-31 review): over a 240 s sampler budget a literal 900 was a bound the code could not reach — the sample is hard-killed at its budget, so `sa` is always < BUDGET — i.e. an inert enforcer advertising protection it never gave. The derivation makes the ceiling the pass's own structural worst case (sample bound + renderer bound), so it binds exactly when a pass overruns what its own bounds permit, and it does not silently loosen when an operator raises --budget. Deliberately NOT named `MAX_AGE`: that symbol is a REGISTERED term owned by `scripts/monitor-worker.sh` (a worker-log freshness bound at `${2:-60}`), and the reverse scan refused the collision — one name over two unrelated numbers is the divergence this registry exists to surface. Co-owner registration instead would be a lie: the forward check requires the SAME value in every owner. The `_OPT` suffix on the CLI variable keeps this the ONE declaration of the term, so the override fragment is the default assignment rather than a second declaration.",
+  },
+  {
+    name: "LANE_ARM_LOCK_REAP_S",
+    owners: ["scripts/lane-arm.sh"],
+    value: "$(( BUDGET * 2 + 60 ))",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "how old a lane-arm pass's LOCK file may be before the next pass reaps it, default 2 x --budget + 60 s. ⛔ THE INEQUALITY IS THE POINT (2026-10-31 review): this bound must EXCEED the longest legitimate pass (2 x BUDGET, sample plus renderer), or a second fire reaps a LIVE lock and the two passes interleave their artefacts — one pass's snapshot published beside the other's queue. A fixed 900 against a `--budget 1200` pass (2400 s worst case) did exactly that, measured; deriving it from the budget makes the inequality structural instead of a constant an operator can outgrow. ⛔ LOCK OWNERSHIP IS A PID, NOT THIS AGE: the lock records its holder and a pid that no longer exists is stale IMMEDIATELY, so a SIGKILLed pass no longer makes every fire for the whole window print 'skipping' and exit 0 (under Type=oneshot, SUCCESS with nothing produced — the no-op-gate shape). This bound is only the last resort for a lock whose holder this pass cannot identify at all.",
+  },
   // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
   //
   // These are not kill bounds. They are the two readings the bounded
@@ -1467,6 +1483,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     rationale:
       "a MEASURED age in seconds — how old the cached CI-queue reading is (0 on a fresh read, the record's own `at=` delta on a cache hit) — printed in the verdict token so an operator can judge it. It is never a bound: the freshness DECISION is `CIQ_STALE_MAX`/`CIQ_TTL`, and the age is compared against them, not used as one. The `_AGE` suffix rule matches its initializer/assignment lines. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE is exempted (#2333 review)",
     owner: "#2426",
+  },
+  {
+    symbol: "LANE_ARM_SNAPSHOT_AGE",
+    rationale:
+      "a MEASURED age in seconds — the wall time a lane-arm pass spent obtaining its own sample, exported to the queue renderer and stamped into the queue header as `snapshot_age=<N>s` so a reader can judge the datum's currency. It is never a bound: the freshness DECISION is LANE_ARM_SNAPSHOT_MAX_AGE (registered on its own row above), and this age is what that bound is COMPARED AGAINST. The `_AGE` suffix rule matches the `export LANE_ARM_SNAPSHOT_AGE` line. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE and CIQ_AGE are exempted — the failure this exemption guards against is a stamp that reads zero seconds on every row because it was arithmetic rather than a measurement, which is fixed by measuring it, never by registering it",
+    owner: "#1567",
   },
   {
     symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",
