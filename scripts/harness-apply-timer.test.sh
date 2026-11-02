@@ -455,7 +455,14 @@ assert_contains "$OUT" "deployed_drift=clean" "T24 …and the arm that was dead 
 # MEASURED: appending `| grep -v '^current$'` to the token reader in `harness-apply-pass.sh` restores
 # `drift=clean:rc=0` (the original defect) with this suite still 217/0. `docs/ops/harness-apply.md`
 # documents `drift=clean:current` as the clean value a reader keys on, so the record must be pinned.
-assert_contains "$(cat "$T/t24/farmstate/harness-apply.status" 2>/dev/null)" "drift=clean:current" "T24 …and the RECORD carries the documented value, not rc=0"
+# ⛔ AND ANCHOR THE MATCH TO THE FIELD LINE, NOT THE FILE (review round 23, P1). `write_record` writes
+# the token TWICE — as the `drift=` field AND inside `detail=` (`drift=$DRIFT_STATE:$DRIFT_TOKEN`) — so
+# a whole-file grep is satisfied by the `detail=` prose even when the FIELD has lost its token.
+# MEASURED: dropping the token from the field writer alone (`printf 'drift=%s\n' "${DRIFT_STATE:-not-run}"`)
+# left this suite at 218/0, and the token survived only in `detail=`. `detail=` is the string truncated at
+# 240 chars and whose own comment says not to key on it; the field is the durable artifact, so the
+# assertion is `grep '^drift='` and nothing else can satisfy it.
+assert_contains "$(grep '^drift=' "$T/t24/farmstate/harness-apply.status" 2>/dev/null)" "drift=clean:current" "T24 …and the RECORD's drift= FIELD carries the documented value, not rc=0"
 OUT="$(run_farmed "" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T24 with no \$AGENT_INFRA_PATH the search falls through to candidate 4 (\$O) — the PRODUCTION find"
 assert_contains "$OUT" "executes:" "T24 …and that find reds the pass, not just prints a token"

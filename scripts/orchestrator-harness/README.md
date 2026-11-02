@@ -1318,7 +1318,7 @@ bytes"). Every drift token below names a problem; `current` names the absence of
 
 | summary token | question | what it means | what to do |
 |---|---|---|---|
-| `harness=current` | (a)+(b) | the record names this commit AND `$O` holds exactly those bytes | nothing |
+| `harness=current` | (a)+(b) | the record names this commit AND `$O` holds exactly those bytes — **or**, on the `$O`-absent arms, only that every harness dir the box does carry matches `$REF` (the `OK:` sentence carries that caveat, so read it: `current` there is not a statement about `$O`) | nothing |
 | `harness=behind:<sha12>` | (a) | the box is recorded from `<sha12>`, an **ancestor** of the ref: a known, deliberate state | redeploy when you mean to adopt the new tip |
 | `harness=diverged:<sha12>` | (a) | `<sha12>` is **not an ancestor** of the ref — the box runs code main does not carry | find out why before redeploying |
 | `harness=uncommitted-edit:<file>` | (a) | `$O` holds bytes **no deploy wrote** (`<file>` differs from the record) — a hand patch | **recover the patch first**: a redeploy destroys it (§4.1 refusal) |
@@ -1337,11 +1337,17 @@ repo at all (and no redeploy of `$O` reaches it), then unrecoverable bytes, then
 code that is missing, then a record that cannot describe the box at all, then the last two.
 
 **`surface` is never a statement about `$O`'s own bytes, and it has TWO shapes.** The token is printed
-on **every** exit, including clean ones (`harness=current`) — a reader that sees no token at all has
-learned that the check DID NOT RUN (`drift=not-run`), which is why "no token" must never be the clean
-answer: it is indistinguishable from a dead check and it was exactly the P0 (#10114) where a pass
-certified a box from a checker that gave no verdict. The `surface` question with no `$O` abstains, so
-the `O_ABSENT` arm can only be reached when the **surface pass** is what
+on every **CONCLUDED** exit — 0 (`harness=current`) and 1 (a drift token) — so a clean run is
+positively identifiable and a reader that sees no token has learned that the run did not conclude.
+⛔ But "no token" is **not** one state: an exit-**2** run (the `UNKNOWN:` and `BROKEN` arms) prints no
+token either, because `HTOKEN` is assigned only after those arms, and `harness-apply-pass.sh` then
+records it as `drift=cannot-verify-rc2` — **`cannot-verify`, not `not-run`**. `not-run` is written only
+by the arms where the checker was never FOUND or the check was disabled. The distinction has a
+different cause and a different remedy (a `cannot-verify` box needs the reason read out of the log; a
+`not-run` box needs checker discovery fixed), and `docs/ops/harness-apply.md`'s exit vocabulary is the
+authority for it. What must never happen — and was exactly this P0 (#10114) — is a **concluded clean**
+run with no token: a pass certifying a box from a checker that gave no verdict. The `surface` question
+with no `$O` abstains, so the `O_ABSENT` arm can only be reached when the **surface pass** is what
 differed. On that shape `$O` was **never compared at all** (absent, or a `--surface` run with no
 readable record for it — the body prints `identity: SKIPPED`); on the other shape `$O` **was**
 compared and answered clean on all three questions, which is the `Q_BYTES=0` precondition — a
