@@ -1122,6 +1122,50 @@ else
   bad "(cap0) THE CLAIM IS UNWITNESSED: the log says 'the complement was disarmed above' but only ${_CAP0_PUTS:-0} PUT(s) ran — a message asserting an action that did not happen"
 fi
 
+# (cap0-partial) the `fail>0` REFUSAL BRANCH — the arm a review found MISSING (P2, #3261). The gate
+# conditions "the complement was disarmed above" on `fail=0` and otherwise quotes its counts, so a sweep
+# that LEFT A RUNNER UN-DISARMED cannot claim it completed. That conditioning is the only thing standing
+# between this fix and a silent re-creation of the original defect at reduced scope, and it had ZERO
+# coverage — `grep -c 'NOT disarmed'` was 0, so collapsing the two branches would have stayed green.
+# Fixture: 101 and 102 are fully labelled pool members; 103 carries the POOL marker but NO HOST arch
+# label, so `labels_for` cannot classify it, logs `left as-is`, and it keeps what it has.
+ARMF="$T/rows-arm-partial.tsv"
+printf '101\tself-hosted\n101\tLinux\n101\tARM64\n101\tself-hosted-arm64\n101\tubuntu-latest\n102\tself-hosted\n102\tLinux\n102\tARM64\n102\tself-hosted-arm64\n102\tubuntu-latest\n103\tself-hosted\n103\tLinux\n103\tself-hosted-arm64\n' > "$ARMF"
+run_gate arm-cap0-partial GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$ARMF" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=0 --
+assert_eq "$RC" "2" "(cap0p) the refusal still stands even when the sweep could not finish"
+assert_eq "$(grep -c -- '-X PUT' "$GH_LOG")" "2" "(cap0p) exactly the two CLASSIFIABLE runners were swept — 103 could not be"
+assert_contains "$OUT" "left 1 runner(s) NOT disarmed" "(cap0p) the refusal COUNTS what it failed to release instead of claiming completion"
+assert_contains "$OUT" "ok=2 fail=1" "(cap0p) …and quotes both counts, so the shortfall is arithmetic, not prose"
+assert_not_contains "$OUT" "the complement was disarmed above, and the engaging pass refuses" \
+  "(cap0p) THE CLAIM IS WITHHELD: a partial sweep may NOT say the complement was disarmed above"
+
+# (mutant) the `fail=0` conditioning must be LOAD-BEARING, not decoration: collapsing the two branches
+# back into one unconditional "the complement was disarmed above" is the original P1 at reduced scope,
+# and it must redden the arm above. Without this, a future simplification would pass unnoticed.
+PART_MUT="$T/ci_runner_gate.mutant-claimunconditional.sh"
+if python3 - "$GATE" "$PART_MUT" <<'PYPMUT'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+anchor = '    if [ "$fail" -eq 0 ]; then\n      log "WARNING: fallback arm resolved EMPTY'
+if anchor not in text:
+    sys.exit("mutation anchor not found — the empty-arm refusal moved, so this mutation is stale")
+text = text.replace(anchor, '    if true; then\n      log "WARNING: fallback arm resolved EMPTY', 1)
+open(sys.argv[2], "w", encoding="utf-8").write(text)
+PYPMUT
+then
+  ok "(cap0p-mut) the unconditional-claim mutant was generated from the SHIPPED gate (anchor present)"
+  GATE_UNDER_TEST="$PART_MUT"
+  run_gate mutant-claimunconditional GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$ARMF" \
+    CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=0 --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  # The kill: under the mutant the very claim the shipped arm withholds MUST appear, so re-running the
+  # shipped arm's own condition against the mutant is the differential — one of the two reds.
+  assert_contains "$OUT" "the complement was disarmed above, and the engaging pass refuses" "(cap0p-mut) the mutant DOES make the full-disarm claim it did not achieve — so (cap0p)'s withholding assertion is load-bearing, not vacuous"
+else
+  bad "(cap0p-mut) the mutant gate could not be generated (the conditioning anchor moved) — the guard is unproven"
+fi
+
 # (cap-abc) a cap that is not a number must REFUSE, never read as 'no cap' — the bound fail-OPEN is the
 # one direction a blast-radius cap must not fail (`arm_ids` returns 1 for it, and `set_labels` refuses).
 run_gate arm-capunreadable GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \

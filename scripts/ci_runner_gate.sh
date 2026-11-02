@@ -130,7 +130,8 @@ QUEUE_PAGE=100
 #     NOTHING at all is executing — hosted or pool — so the gate stays on the pool;
 #   * the CERTIFY direction is suppressed in fallback mode: the reason line reports the absorption
 #     numbers but says they are NOT ATTRIBUTABLE, and the healthy verdict is the pre-existing legs'
-#     (the pool is re-tested every tick by design — #2327's fallback-only decision — and the length
+#     (the pool is re-tested every tick by design — this header's fallback-only decision (moved on its
+#     timing leg by tortoise#9878); #2327 constrained WHICH LABEL, never WHEN — and the length
 #     leg, not this one, is what restores `github` once the queue has drained below QUEUE_THRESHOLD).
 #
 # THE FLOOR, AND THE CLOCK IT IS MEASURED ON — because queue time is not run time, and this repo
