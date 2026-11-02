@@ -1054,7 +1054,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1212,19 +1212,34 @@ $m"
     # made this whole arm inert (found by the §20h2 vector, which is why the vector
     # asserts the REFUSAL MESSAGE and not merely the exit code).
     read -r _self p1 p2 _extra <<< "$parents"
-    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null || true)"
+    # ⛔ THE EXIT STATUS IS LOAD-BEARING, and this arm had discarded it. `git
+    # merge-tree --write-tree` prints a RESULT TREE ON LINE 1 EVEN WHEN IT CONFLICTS
+    # (exit 1). So a conflicted merge whose hand resolution happens to match the tree
+    # merge-tree produced — a modify/delete conflict resolved git's own way ("kept
+    # them ours": git leaves the modified file in the tree) — compares EQUAL, is
+    # judged a clean merge, the range classifies merge-only, the cover requirement is
+    # skipped and `clean` is minted over a conflict resolution nobody reviewed: the
+    # cycle-1 evil-merge bypass, reachable again. The in-file precedent is
+    # lane_dimension_carry's clause (D), which fixed exactly this and records why:
+    # "rc IS CHECKED, AND THIS IS LOAD-BEARING … An earlier cut discarded the status".
+    mrc=0
+    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)" || mrc=$?
     # merge-tree prints the resulting tree on its FIRST line and extra lines for
     # conflicts. Take that line with a parameter expansion, NEVER `| head -1`: a
     # SIGPIPEd producer under `set -o pipefail` makes the substitution fail and
     # aborts the whole record (measured, 9 of 40; see diff_hash_for_pr's note).
     want="${want%%$'\n'*}"
     actual="$(delta_git "$root" rev-parse "$m^{tree}" 2>/dev/null || true)"
-    if [ -z "$want" ] || [ -z "$actual" ] || [ "$want" != "$actual" ]; then
+    if [ "$mrc" -ne 0 ] || [ -z "$want" ] || [ -z "$actual" ] || [ "$want" != "$actual" ]; then
       # No `break`: see the note in the parent-count arm above. The sha is RECORDED
       # for EVERY non-clean merge; `evil` keeps only the first message for stderr.
       evil_shas="$evil_shas
 $m"
-      : "${evil:=merge ${m:0:12} is NOT a clean merge of its parents (its tree is not what merging ${p1:0:12}… and ${p2:0:12}… produces) — a conflict resolution lives only in the merge commit and no reviewer has seen it}"
+      if [ "$mrc" -ne 0 ]; then
+        : "${evil:=merge ${m:0:12} does NOT merge cleanly (merge-tree rc=$mrc — the parents conflict), so a hand resolution lives in the merge commit and no reviewer has seen it}"
+      else
+        : "${evil:=merge ${m:0:12} is NOT a clean merge of its parents (its tree is not what merging ${p1:0:12}… and ${p2:0:12}… produces) — a conflict resolution lives only in the merge commit and no reviewer has seen it}"
+      fi
     fi
   done <<< "$merges_in_range"
   if [ -n "$authored" ] || [ -n "$evil" ]; then

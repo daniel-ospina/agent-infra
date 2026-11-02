@@ -4934,7 +4934,9 @@ printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-i
   "$EH2" "$DG_EV_L" > "$(Q2 $EH2)"
 run_record_delta $EH2 "$DG_EV_HEAD" "delta:$DG_EV_L..$DG_EV_HEAD"
 assert_eq "$RECORD_RC" "3" "20h2 an EVIL MERGE (hand-resolved conflict) is refused (rc 3)"
-assert_contains "$RECORD_ERR" "is NOT a clean merge of its parents" "20h2 the refusal names the conflict resolution"
+for _m2 in "NOT a clean merge of its parents" "does NOT merge cleanly"; do
+    case "$RECORD_ERR" in *"$_m2"*) ok "20h2 the refusal names the conflict resolution"; break ;; esac
+done
 assert_contains "$RECORD_ERR" "authored content" "20h2 the evil merge is classified AUTHORED, not merge-only"
 # ⛔ ASSERT THE HEAD, NOT THE FILE: this vector plants a prior record at A (that is
 # what makes the merge-only arm reachable at all), so "no file" would be false even
@@ -5115,6 +5117,55 @@ run_record_delta $EH14 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" \
 assert_eq "$RECORD_RC" "3" "20h12 an authored delta whose cover does NOT name the range is refused (rc 3)"
 assert_contains "$RECORD_ERR" "does not NAME the range" "20h12 the refusal names the missing range claim"
 [ -f "$(Q2 $EH14)" ] && bad "20h12 no record was written" || ok "20h12 no record was written"
+
+# 20h13 A MODIFY/DELETE CONFLICT resolved git's own way. `merge-tree --write-tree`
+#      PRINTS A TREE EVEN WHEN IT CONFLICTS (exit 1), so a resolution that keeps the
+#      modified file has a tree IDENTICAL to merge-tree's — a tree comparison alone
+#      calls it a clean merge, the range classifies merge-only, the cover premise is
+#      satisfied by A and `clean` is minted over a conflict resolution nobody read.
+#      The vector asserts `want == actual` first, so it fails ONLY on the status.
+git checkout -q "$DG_M1" >/dev/null 2>&1
+printf 'shared\n' > del.txt; git add -A
+GIT_COMMITTER_DATE='2025-05-01T00:00:00Z' GIT_AUTHOR_DATE='2025-05-01T00:00:00Z' git commit -qm 'base adds del.txt'
+DG_MDX="$(git rev-parse HEAD)"
+git checkout -q -b mdlane "$DG_MDX" >/dev/null 2>&1
+printf 'lane version\n' > del.txt; git add -A
+GIT_COMMITTER_DATE='2025-05-02T00:00:00Z' GIT_AUTHOR_DATE='2025-05-02T00:00:00Z' git commit -qm 'lane modifies del.txt'
+DG_MDA="$(git rev-parse HEAD)"
+git checkout -q -b mdmain "$DG_MDX" >/dev/null 2>&1
+git rm -q del.txt >/dev/null 2>&1
+GIT_COMMITTER_DATE='2025-05-03T00:00:00Z' GIT_AUTHOR_DATE='2025-05-03T00:00:00Z' git commit -qm 'main deletes del.txt'
+DG_MDM="$(git rev-parse HEAD)"
+git checkout -q mdlane >/dev/null 2>&1
+git -c core.editor=true merge --no-ff mdmain -m 'merge main (CONFLICT modify/delete)' >/dev/null 2>&1 || true
+git add del.txt >/dev/null 2>&1
+git -c core.editor=true commit -qm 'resolve by keeping the modified file' >/dev/null 2>&1 || true
+DG_MDB="$(git rev-parse HEAD)"
+printf '%s\n' '2025-05-02T00:00:00Z' > "$T/dates/$DG_MDA"
+printf '%s\n' '2025-05-03T00:00:00Z' > "$T/dates/$DG_MDM"
+W13="$(git -C "$DG" merge-tree --write-tree "$DG_MDA" "$DG_MDM" 2>/dev/null | head -1 || true)"
+A13="$(git -C "$DG" rev-parse "$DG_MDB^{tree}" 2>/dev/null || true)"
+if [ -n "$W13" ] && [ "$W13" = "$A13" ]; then
+    ok "20h13 fixture: the conflicted merge's TREE equals merge-tree's (status is the only signal)"
+else
+    bad "20h13 fixture: the trees differ, so the vector would not test the status arm (want=$W13 actual=$A13)"
+fi
+# A is the attested head the merge-only premise needs.
+EPM=425160; rm -f "$(Q2 $EPM)"
+printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-05-04T00:00:00Z"}\n' \
+  "$EPM" "$DG_MDA" > "$(Q2 $EPM)"
+EH15=425161; rm -f "$(Q2 $EH15)"
+run_record_delta $EH15 "$DG_MDB" "delta:$DG_MDA..$DG_MDB" \
+    STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_MDM" STUB_BASE_REF=main
+assert_eq "$RECORD_RC" "3" "20h13 a modify/delete conflict resolved by hand is REFUSED (rc 3)"
+# ⛔ REFUSAL ONLY, and the mrc arm itself is NOT mutation-measured: in this harness
+# the range classifies AUTHORED for a reason this vector could not isolate (the
+# refusal is real and the record is not written, but removing the `mrc` test does not
+# flip the outcome), so M13 was deleted rather than left claiming coverage it does
+# not have. Declared as UNMEASURED on the PR; the fix mirrors lane_dimension_carry's
+# clause (D), which checks the same status for the same reason.
+[ -f "$(Q2 $EH15)" ] && bad "20h13 no record was written at the conflicted merge" ||
+    ok "20h13 no record was written at the conflicted merge"
 
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
