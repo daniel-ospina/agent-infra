@@ -44,6 +44,16 @@ fi
 echo "[adopt-fix $PR] worktree=$WT branch=$BR ($WT_RESULT) $(date)" >> "$O/logs/adopt-$PR.log"
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
+# ⛔ THE DEFERRAL CODE IS ONE NAMED CONSTANT, NOT A LITERAL REPEATED FOUR TIMES (review of PR #3237,
+# finding 2). `spawn-gate.test.sh` now proves that no two gates in this deploy unit claim one code —
+# and it can only do that for a code it can SEE. Four bare `exit 79`s were a claim no scanner could
+# read, which is the same blindness that let 81 be claimed twice: a code nobody can enumerate is a code
+# somebody will claim again. The VALUE is unchanged (79, unassigned elsewhere in scripts/).
+# ⛔ AND IT IS DEFINED HERE, ABOVE THE `if` CHAIN — not beside the arms it serves. Under `set -u` an
+# assignment that sits between one arm's `echo` and the next `elif` is part of THAT arm's body, so it
+# is simply never executed on the paths that reach the other three: measured on the first cut of this
+# change, `adopt-fix.sh`'s cross-box arm exited 1 ("ADOPT_DEFERRED: unbound variable") instead of 79.
+ADOPT_DEFERRED=79
 # 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate
 # refused it (#1765). Name BOTH here: the fixer's own line is inside fix-$PR.log, and this is the log
 # a manual operator reads (#1720). They are not interchangeable — a load refusal is cleared by the
@@ -75,7 +85,9 @@ elif [ "$rc" = "77" ]; then
 # refusal, which callers translate to 75. Reusing it here would make an operator who applies the
 # repo's documented 76 mapping wait for load to fall while the real cause is a PR-owner LOCK, which no
 # amount of waiting for the box to quieten will clear — the exact wrong-cause class this block exists
-# to fix (#2333 review). 79 is unassigned in scripts/.
+# to fix (#2333 review). 79 is claimed by no other gate in this deploy unit — `spawn-gate.test.sh`
+# proves that across every shipped helper, which is why the code is a NAMED constant here (`ADOPT_DEFERRED`)
+# rather than a literal a scanner cannot enumerate.
 # ⛔ AND THERE IS NO CI-QUEUE ARM ANY MORE (#2927, and #2928's review): `fix-one.sh` no longer reads
 # the CI queue, so it can never write `DEFERRED by the CI-queue gate`. The arm that used to sit here
 # was UNREACHABLE — and worse than dead, because its message told a manual operator to "re-run when
@@ -93,7 +105,7 @@ elif [ "$rc" = "77" ]; then
 # this matches the CAUSE, never a substring shared with the `DEFERRED: the PR-owner lock` arm below.
 elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the LANDER' "$O/logs/fix-$PR.log" 2>/dev/null; then
   echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock) — a lander owns this PR right now (review/record/merge in flight), so nothing was pushed and no attempt was consumed; the holder and the reason are in $O/logs/fix-$PR.log. Re-run once the lander finishes (it lands the PR, or refuses and releases)." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.log" 2>/dev/null; then
   # ⛔ THE REPAIR IS NAMED (review of PR #2576, cycle 2 — P2). A STALE claim is now TAKEN OVER by
   # `fix-one.sh` itself (#2574 (b)), so this arm is reached only when the takeover lost a race with a
@@ -102,7 +114,7 @@ elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.l
   # the reclaim the older wording promised (the controller's next dispatch) never comes on this
   # surface, because this script exists for the case where nothing is dispatching the PR.
   echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, not reclaimable) — the lock's holder could not be proven dead (empty/unparseable content, so it is treated as LIVE), or the takeover displaced a peer's claim and could not restore it; nothing was pushed and no attempt was consumed. If this persists and NO worker is live, REPAIR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh' — a live FIXER also holds this lock, for the whole agent run), then rm -f \"$O/state/mergeclaim-$PR.lock\" and re-run. The exact line is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 # ... and a REFUSAL that can never clear by itself is named here too, with its own repair. It is NOT
 # refundable in fix-one.sh (a re-dispatch cannot change a lock path that is not a lock file, or an
 # unwritable state dir), so an operator who only sees "success" would re-run it for ever.
@@ -112,7 +124,7 @@ elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.l
 # not wait for a park that cannot arrive.
 elif [ "$rc" = "0" ] && grep -q 'REFUSED (NOT refundable' "$O/logs/fix-$PR.log" 2>/dev/null; then
   echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, UNUSABLE) — the lock path cannot be read or created, which no re-dispatch can change, so fix-one.sh does NOT refund it (a CONTROLLER-dispatched run would consume an attempt and park the PR for a human; this manual run booked nothing, so nothing was consumed here). Nothing was pushed. The repair command is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 # ⛔ THE CROSS-BOX REFUSAL IS THE FOURTH, AND IT WAS THE ONE STILL REPORTING SUCCESS (review of PR
 # #2576, P3). `fix-one.sh` refuses — also rc=0, also nothing pushed — when another BOX already holds
 # `refs/claims/<PR>-<head12>`, and its line is `cross-box fixer claim REFUSED: …`, with no `DEFERRED`
@@ -120,7 +132,7 @@ elif [ "$rc" = "0" ] && grep -q 'REFUSED (NOT refundable' "$O/logs/fix-$PR.log" 
 # SUCCESS for a run that did nothing — the same class the two arms above were added to close.
 elif [ "$rc" = "0" ] && grep -q 'cross-box fixer claim REFUSED' "$O/logs/fix-$PR.log" 2>/dev/null; then
   echo "[adopt-fix $PR] fixer NOT started (CROSS-BOX claim) — another box is already fixing this head, so nothing was pushed and no attempt was consumed; re-run once that worker finishes or its lease expires. The holder and the head are in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 fi
 # ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
 # `$?` was already the fixer's. The reporting block ABOVE was added by this change, and an `if` with

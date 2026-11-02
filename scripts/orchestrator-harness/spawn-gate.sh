@@ -2155,7 +2155,8 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
               _pf_remedy="This does NOT clear by waiting: the lane's model/provider PAIR is empty, so no box could run it — fix the dispatch, not the box." ;;
             usage)
               # Version skew, not a property of the box: the probe rejected an argument it was handed.
-              # ⛔ AND IT IS NOT A CAPACITY REFUSAL, WHICH IS WHY IT EXITS 81 (follow-up review of
+              # ⛔ AND IT IS NOT A CAPACITY REFUSAL, WHICH IS WHY IT EXITS 83 (`AGENT_HARNESS_SKEW_REFUSED`
+              # — see that constant for why it is no longer 81; follow-up review of
               # #2991, P2, measured): every reader maps 71 to a BOX property (`lane.sh` mints a
               # `capacity-refused-<N>` record from it, so the item is yielded to a peer), and a skewed
               # pair is identical on that peer. The remedy below is the only correct one, and the code
@@ -2190,7 +2191,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
           # worst — a NEW caller against an OLD deployed helper (the version-skew direction this PR
           # names as the production cause: an argument the old copy rejects exits 2 printing nothing),
           # or a corrupt/truncated copy, where `bash <file>` exits 2 with no stdout. Both are the helper
-          # pair, not the box, so they REFUSE under 81 and say so. `rc=1` (no helper, could not start)
+          # pair, not the box, so they REFUSE under 83 and say so. `rc=1` (no helper, could not start)
           # still warns: that is the absence of a probe, not a reading from one.
           if [ "${_pf_rc:-0}" -eq 2 ]; then
             AGENT_STARTED=0
