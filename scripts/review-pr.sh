@@ -128,6 +128,14 @@
 #   75 a spawn-point LOAD refusal (PI_GATE_REFUSED=76): the reviewer never started,
 #      nothing was consumed — re-dispatch when the box is quiet, do NOT read this as a
 #      code verdict (merge-one.sh's code for the same cause)
+#   81 AGENT_HARNESS_SKEW_REFUSED — the SHARED helper/sync code. Two causes carry it on other
+#      surfaces (a caller vs a deployed cell-lane-preflight.sh usage/version skew #2991, and the
+#      fork resolver's `nodeploy` arm), and only the SECOND is reachable on THIS path because
+#      this command spawns `pi` directly and never runs the capability/preflight probe. What it
+#      means here: the spawn point could not RESOLVE capacity.sh, so the reviewer never started,
+#      nothing was consumed, and this is a HELPER/SYNC fault — sync the pair
+#      (cp scripts/orchestrator-harness/*.sh \$O/) wherever reviewers run; do NOT dispatch the
+#      PR elsewhere and do NOT read it as a code verdict
 #   10 the P0/P1/P2 SCANNER did not run (awk missing/broken): the transcript could not be
 #      read for blocking findings, so a clean verdict cannot be certified — NOT recorded,
 #      and NOT read as clean (a failed scan is not an empty one)
@@ -851,6 +859,18 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
   err "$PROG: the reviewer was NOT STARTED — the spawn-point load gate refused (rc=$AGENT_RC, PI_GATE_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
   err "  This is a capacity event, not a code verdict. Re-run when the box is quieter (the gate's own ceiling is MAX_LOAD)."
   exit 75
+fi
+# ⛔ THE SPAWN POINT'S SYNC REFUSAL (81) IS READ THE SAME WAY, FOR THE SAME REASON. Since the fork
+# resolver can answer `nodeploy`, the spawn point exits 81 when it cannot find `capacity.sh` at all.
+# (81 is the SHARED helper/sync code: on the lane/fixer paths it can also mean a caller vs deployed
+# `cell-lane-preflight.sh` usage skew, #2991 — but this command spawns `pi` directly and never runs
+# that probe, so the unresolvable-instrument cause is the only one reachable HERE.)
+# Unread, that refusal reached the no-verdict branch below, which reports "a crashed/killed/failed
+# reviewer" and tells the operator to RE-RUN — straight back into a sync fault no re-run can clear.
+if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+  err "$PROG: the reviewer was NOT STARTED — the spawn point could not resolve its fork instrument (rc=$AGENT_RC, AGENT_HARNESS_SKEW_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
+  err "  This is a HELPER/SYNC fault, not a code verdict and not a box capacity event: sync the pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever reviewers run, then re-run. Do NOT dispatch the PR elsewhere — every box with these files refuses identically."
+  exit 81
 fi
 # ⛔ THE EXIT STATUS IS THE SIGNAL, NOT A STRING IN THE TRANSCRIPT (P3, fresh review of #2288). This
 # arm used to ALSO match `^\[pi-gate\] REFUSED` anywhere in the log, so a reviewer that QUOTED the

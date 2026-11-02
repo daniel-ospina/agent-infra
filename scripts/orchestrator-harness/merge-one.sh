@@ -1255,6 +1255,19 @@ if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
   echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
   exit 80
 fi
+# ⛔ THE SYNC REFUSAL IS ITS OWN ARM (agent-infra#2293 follow-up), and without it this file turns a
+# helper-deploy fault into a REVIEW VERDICT. The spawn point exits 81 when ITS copy of
+# `spawn-gate.sh` cannot resolve `capacity.sh` at all; 81 matched neither the 76 arm nor the 80 arm
+# above, so the refusal fell through to the verdict extractor, produced an EMPTY verdict, and wrote
+# `needsreview-<PR>-<head>` — spending one of MAX_REVIEW_TRIES per refusal for a review that never
+# started, and PARKING the PR once the budget ran out. That is the #1716/#1720 class this file's own
+# load-gate arm exists to prevent, and no marker may be written for it: no reviewer ran.
+if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+  REV_STARTED=0
+  echo "[merge $PR] reviewer NOT started (HELPER/SYNC gate: capacity.sh not resolvable from the spawn gate) — no verdict, NO marker written; this is not a property of this PR or this box: sync the helper pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever reviewers run, then re-dispatch. Do NOT dispatch the PR elsewhere: every box with these files refuses identically" >> "$L.log"
+  echo "[merge $PR] reviewer NOT started (helper/sync refusal) — no verdict, no marker; see $L.log" >&2
+  exit 81
+fi
 # ⛔ THE EXTRACTOR MUST ADMIT THE SAME SEPARATORS THE CLASSIFIER DOES (review round 8, P2). The
 # pattern required a SPACE after the token, so a reviewer whose final line was `ISSUES: 3` produced an
 # EMPTY `LAST` — the round-7 tolerance in `verdict_class` was unreachable, the fixer was withheld, up to
