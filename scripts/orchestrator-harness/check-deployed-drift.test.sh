@@ -598,7 +598,8 @@ done
 #   • `sudo -c <class> bash` — the `-c` arm fired on the WRAPPER's own option and ate the interpreter.
 # They are discriminating: each is `text` on the round-13 head and ARMED here.
 for _r in 'sudo -iu deploy bash' 'sudo -Eu deploy bash' 'sudo -c staff bash' \
-          'sudo -En bash' 'sudo -Hn bash' 'sudo -Sn bash' 'setsid -c bash'; do
+          'sudo -En bash' 'sudo -Hn bash' 'sudo -Sn bash' 'setsid -c bash' \
+          'sudo -n bash' 'sudo -S bash' 'sudo -k bash' 'doas -n bash'; do
   printf '4261 %s %s/orch-loop.sh\n' "$_r" "$GONE" > "$TMP/ps-restored"
   surf "$TMP/ps-restored"
   ck "10a-3e: '$_r <abs>/orch-loop.sh' is still an INVOCATION (round-13/15 regression)" \
@@ -609,7 +610,11 @@ done
 # `sudo -En bash <abs>` claimed `bash` as `-En`'s operand and the launcher became a mention, and
 # `sudo -Hn grep bash <abs>` fabricated a controller out of a grep PATTERN. Both directions were
 # measured against the lane's head before being fixed; these two hold the fabrication side.
-for _f in 'sudo -Hn grep bash' 'sudo -En cat sh'; do
+# ⛔ THE SAME DEFECT SURVIVED IN THE SINGLE-LETTER ARM (review round 16, P1): `sudo -n bash <abs>`
+# was a MENTION at 6fb6a5b50 — and `sudo -n` is this repo's default privilege prefix in four
+# installers, so the silent green was on the common path. The four INVOCATIONS in 10a-3e above
+# (`sudo -n`, `-S`, `-k`, `doas -n`) pin that arm; these hold its fabricating side.
+for _f in 'sudo -Hn grep bash' 'sudo -En cat sh' 'sudo -n grep -n sh'; do
   printf '4262 %s %s/orch-loop.sh\n' "$_f" "$GONE" > "$TMP/ps-flagcluster"
   surf "$TMP/ps-flagcluster"
   ck "10a-3e: '$_f <abs>/orch-loop.sh' is a MENTION (a wrapper FLAG claims no operand)" \

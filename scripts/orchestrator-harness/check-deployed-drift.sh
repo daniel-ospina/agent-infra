@@ -826,11 +826,13 @@ if [ "$SURFACE" -eq 1 ]; then
             # counts, so a text mention can never be read as the executing tree.
             if [ "$_seen" -ne 1 ]; then
               # A WRAPPER's own `-c` is not a command string (review round 14, P2). `sudo -c <class>`
-              # (macOS) and `setsid -c` belong to the wrapper, and consuming the next word as TEXT ate
-              # the real interpreter — `sudo -c staff bash <gone>/orch-loop.sh` was ARMED on the
-              # reviewed head and became a mention here (reproduced). Claim the operand instead, which
-              # is what every other wrapper option does, so `bash` still arms.
-              _optval=1
+              # (macOS) belongs to the wrapper, and consuming the next word as TEXT ate the real
+              # interpreter — `sudo -c staff bash <gone>/orch-loop.sh` was ARMED on the reviewed head
+              # and became a mention (reproduced). The operand is claimed by the OPTION TABLE below
+              # (`-c)`, gated on `_wrap`), which is the only decider: it runs later in this same
+              # iteration and overwrites whatever is assigned here (round 16, P2), so this arm assigns
+              # nothing and must not imply otherwise.
+              :
             else
             _i=$((_i + 1)); _c="${_argv[$_i]:-}"; _c1="${_c%%[[:space:]]*}"
             case "$_c1" in
@@ -890,14 +892,33 @@ if [ "$SURFACE" -eq 1 ]; then
                   --command-timeout|--signal|--kill-after|--input|--output|--error) _optval=1 ;;
                   --unset|--adjustment|--split-string) _optval=1 ;;
                   --*) _optval=0 ;;
-                  -u|-g|-p|-C|-D|-h|-r|-t|-U|-T|-R|-n|-s|-k|-o|-e|-a|-S) _optval=1 ;;
-                  # ⛔ `-c` CLAIMS ITS OPERAND ONLY FOR THE WRAPPERS WHOSE `-c` TAKES ONE (review round
-                  # 15, P2). `sudo -c <class>` / `doas -c` consume a value; `setsid -c` is `--ctty`, a
-                  # flag — claiming it there swallowed the real interpreter and turned a live
-                  # controller into a mention. This entry is also what MAKES the earlier `_c` string arm
-                  # stick: that arm sets `_optval=1`, and this table (the second `case`) overwrites it,
-                  # so the value has to agree here.
-                  -c) case "$_wrap" in sudo|doas) _optval=1 ;; *) _optval=0 ;; esac ;;
+                  -u|-g|-C|-D|-r|-t|-U|-T|-R|-o|-a) _optval=1 ;;
+                  # ⛔ THE SINGLE-LETTER ARM IS A UNION OVER TEN WRAPPERS, SO THE LETTERS THAT ARE
+                  # FLAGS FOR ONE OF THEM MUST BE GATED ON WHICH WRAPPER IT IS (review round 16, P1).
+                  # `n s k e S` are sudo FLAGS (`-n` non-interactive, `-s` shell, `-k` reset-timestamp,
+                  # `-e` edit, `-S` stdin) — round 15 removed them from the CLUSTER class for exactly
+                  # this reason and left them here, in the same block, still claiming the interpreter:
+                  # `sudo -n bash <gone>/orch-loop.sh` was a MENTION at 6fb6a5b50, i.e. a live
+                  # controller reported as nothing, rc 0, fleet-health certifying the box. `sudo -n`
+                  # is this repo's DEFAULT privilege prefix in four installers, so that is not an edge
+                  # shape. Gating restores it (`-n` claims nothing → `bash` is the COMMAND and arms)
+                  # while `nice -n 5 /bin/bash` and `timeout -s KILL 300 bash` keep their operands.
+                  # `-p` is sudo's prompt (a value) but `command -p` is a flag; `-h` is a value for
+                  # sudo elsewhere, absent from this fleet's launchers, and safe to leave unclaimed.
+                  -h|-n|-s|-k) case "$_wrap" in sudo|doas) _optval=0 ;; *) _optval=1 ;; esac ;;
+                  -e|-S) case "$_wrap" in sudo) _optval=0 ;; *) _optval=1 ;; esac ;;
+                  -p) case "$_wrap" in command) _optval=0 ;; *) _optval=1 ;; esac ;;
+                  # ⛔ `-c` CLAIMS ITS OPERAND ONLY FOR THE WRAPPER WHOSE `-c` TAKES ONE (review rounds
+                  # 15-16). macOS `sudo -c <class>` consumes a value; `setsid -c` is `--ctty`, a flag,
+                  # and claiming it there swallowed the real interpreter and turned a live controller
+                  # into a mention. `doas` has NO `-c` at all (its synopsis is `-a style`, `-C config`,
+                  # `-L`, `-n`, `-s`, `-u user`), so it is deliberately not named here — this table's
+                  # job is recording which options take a value, and a phantom option would be
+                  # inherited by the next edit.
+                  # ⛔ THE TABLE IS THE ONLY DECIDER: the `-c|-[!-]*c)` arm above also assigns
+                  # `_optval`, but every `-`-leading word reaches this arm afterwards in the SAME
+                  # iteration and is overwritten — that assignment is inert (round 16, P2).
+                  -c) case "$_wrap" in sudo) _optval=1 ;; *) _optval=0 ;; esac ;;
                   # ⛔ A COMBINED CLUSTER THAT ENDS IN A VALUE-TAKING LETTER CLAIMS ITS OPERAND (review
                   # round 14, P1). `sudo -iu <user> bash` and `sudo -Eu <user> bash` are the canonical
                   # login-shell-as-user spellings, and they are what this table's SAFE default gets
@@ -926,12 +947,12 @@ if [ "$SURFACE" -eq 1 ]; then
                  env|nice|sudo|timeout|stdbuf|command|exec|nohup|setsid|doas)
                      # a wrapper while the command is still unknown is part of the prefix; seen AFTER a
                      # command, it is an argument and the prefix ends
-                     # ⛔ REMEMBER WHICH WRAPPER (review round 15, P2): whether `-c` takes a value is a
-                     # property of the WRAPPER, not of the letter. `sudo -c <class>` and `doas -c`
-                     # consume an operand; `setsid -c` is `--ctty`, a FLAG. One union rule cannot be
-                     # right for both, and the `-c` claim is the difference between `setsid -c bash
-                     # <gone>/orch-loop.sh` being a mention (a live controller reported as nothing)
-                     # and being caught.
+                     # ⛔ REMEMBER WHICH WRAPPER (review rounds 15-16, P2): whether `-c` takes a value
+                     # is a property of the WRAPPER, not of the letter. macOS `sudo -c <class>`
+                     # consumes an operand; `setsid -c` is `--ctty`, a FLAG; and `doas` has no `-c` at
+                     # all. One union rule cannot be right for all three, and the `-c` claim is the
+                     # difference between `setsid -c bash <gone>/orch-loop.sh` being a mention (a live
+                     # controller reported as nothing) and being caught.
                      if [ "$_seen" -eq 1 ]; then _pfx=0; _interp=0; else _wrap="${_w##*/}"; fi ;;
                  *) case "$_w" in
                       *=*) : ;;                       # an env assignment is an operand, not the command
