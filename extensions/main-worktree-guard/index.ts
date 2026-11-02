@@ -95,7 +95,16 @@
 // hatch M2/M3/M4 are all inactive (the M4 hub-state block is wrapped in
 // `if (!_isAllowMainEdits())`) and M1 detection stays ACTIVE; under the TTL
 // MARKER only M2/M3 are inactive while M4 stays ACTIVE (D3 — a stranded lane
-// recovers with the marker but cannot resume feature work in the hub). There
+// recovers with the marker but cannot resume feature work in the hub). M4's
+// recovery WINDOW is the part the marker opens: the named-path working-tree
+// restore family (`git restore <path>` / `git checkout -- <path>`) classifies
+// as recovery under either hatch, because a dirty hub cannot be cleared by the
+// branch route M4 used to prescribe alone (#1484; measured 2026-11-02 — a hub
+// carrying one truncated tracked file answered every restore with
+// `git checkout main`, a no-op on a dirty tree, and stayed dirty ~12h). Every
+// feature-work verb stays blocked under the marker: no commit, no branch
+// create/force, no foreign push, and `checkout -- .` (whole-tree wipe) is
+// refused — a deliberate discard must name its paths. There
 // is NO auto-bypass: the guard blocks every time, so a rogue/parallel agent
 // cannot retry its way past it.
 //
@@ -167,7 +176,7 @@ let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } = () => ({ disorder: null, branch: null, path: null, dirtyPaths: 0 });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 // #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
@@ -2477,7 +2486,9 @@ function _worktreeDiscardBlockReason(
           `   → Inspect first: git status --porcelain; git diff <path>.`,
           `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
           `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
-          `     marker — both bypass this gate unchanged.`,
+          `     marker — both hatches open the SAME recovery window as M4, so name the`,
+          `     paths: \`git restore <path>\` / \`git checkout -- <path>\`. A whole-tree`,
+          `     discard (\`.\`, pathspec magic) stays refused even with the hatch.`,
         ]),
   ].join("\n");
 }
@@ -2749,8 +2760,45 @@ function _wtExpandedScriptShape(text: string, depth = 0): _WtExpandedHit | null 
  *  tracked work in the checkout it targets, else null. Covers the direct argv
  *  surface, interpreter-inline payloads (via allGitInvocations) and the
  *  script-file surface (`bash /tmp/restore.sh`) to a bounded depth. */
+/** #1484 M4 recovery window — the M5 half (#709).
+ *
+ * Both gates must agree on the SAME window, or the hatch moves the refusal one
+ * line down instead of removing it. Measured (review, 2026-11-02): with the TTL
+ * marker ACTIVE and a hub carrying one truncated tracked file, M4 permitted
+ * `git checkout -- <path>` and M5 then refused it — "Working-tree discard
+ * blocked … it would destroy uncommitted work (#709)" — so the hub stayed
+ * unrecoverable while BOTH messages claimed a hatch worked. #709's own text
+ * says the env hatch and the marker "both bypass this gate unchanged"; that
+ * was false, and the dirty-hub M4 message inherited the false claim.
+ *
+ * The window is derived from M4's OWN verdict rather than re-implemented, so
+ * the two gates cannot drift: a command is in the window iff an escape hatch is
+ * active, the SESSION cwd is the DISORDERED hub (the incident geometry — a
+ * clean repo, a linked worktree and a foreign checkout are all outside it), and
+ * the SAME command is `block` without the hatch but `recovery` with it. That
+ * inherits the arm's allowlist narrowing: named paths only, no `.`/pathspec
+ * magic, no ref operand other than HEAD, no `--source` family. */
+function _m4HatchRecoveryWindow(command: string): boolean {
+  if (!classifierLoaded) return false;
+  const hatch = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(undefined));
+  if (!hatch) return false;
+  const st = _hubState();
+  if (!st.disorder) return false; // the window exists only for a DISORDERED hub
+  try {
+    const base = resolve(process.cwd());
+    const withHatch = evaluateHubGateWithTargets(command, st.branch, base, null, st, { escapeActive: true });
+    if (withHatch.verdict !== "recovery") return false;
+    const withoutHatch = evaluateHubGateWithTargets(command, st.branch, base, null, st);
+    return withoutHatch.verdict === "block";
+  } catch {
+    return false; // degrade — never widen on a classifier failure
+  }
+}
+
 function _worktreeDiscardBlock(command: string): string | null {
   if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
+  // #1484/#709 — the hatch's recovery window, decided ONCE and shared with M4.
+  if (_m4HatchRecoveryWindow(command)) return null;
   // Backslash-newline line continuations (`git \<LF> checkout -- f`) are joined
   // by the shell BEFORE it tokenizes — join them here too, so every textual arm
   // below sees the same command the shell runs (reviewer round-7 P1).
@@ -4847,7 +4895,8 @@ export default function (pi: ExtensionAPI) {
             }
           } catch { /* empty set → only the hub's current branch protects */ }
           if (st.branch) checkedOutNames.add(st.branch);
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st);
+          const escapeActive = _isAllowMainEdits() || markerOn;
+          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
