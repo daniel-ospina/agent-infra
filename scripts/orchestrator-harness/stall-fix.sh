@@ -66,12 +66,18 @@ is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
 # premise back in its report, so a bare number here is the same invented measurement in the worker's
 # own words.
 if [ "$AGESRC" = "synth" ]; then AGEMIN_TXT=">=${AGEMIN}"; else AGEMIN_TXT="$AGEMIN"; fi
-# ⛔ EVERY SINK THIS SCRIPT OPENS IS BOUNDED (review P3, 2026-11-02). Nothing else in the tree prunes
-# them: `state/briefs/` had no production writer before this script, and no reaper names any of them.
-# ⛔ THREE SINKS, NOT TWO (fresh-context review, 2026-11-02, P2): the per-dispatch worker REPORT
-# (`state/REPORT-stall-fix-<name>.md`) is minted on the same cadence as the brief and is the LARGER
-# of the two, and it had no bound at all while this header claimed both were bounded. It is pruned
-# below on the same retention knob.
+# ⛔ FOUR SINKS, AND EVERY ONE OF THEM IS BOUNDED (review P3 → P2 → P1, 2026-11-02). Nothing else in
+# the tree prunes them: `state/briefs/` had no production writer before this script, and no reaper names
+# any of them. The census, because this header has twice claimed a bound it did not have — a header that
+# over-counts its own sinks is the same defect as the sink:
+#   1. `state/briefs/stall-fix-*.md`      — pruned on the retention knob, below.
+#   2. `state/REPORT-stall-fix-*.md`      — the worker's own report, pruned on the same knob, below.
+#   3. `$O/bg/stallfix-*`                 — the worker's WHOLE TRANSCRIPT (+ `.rc`/`.pid`/`.stamp`/
+#      `.end`/`.cap`), minted per dispatch by `nonblocking-dispatch.sh`, pruned below on the same knob.
+#      This was the largest of the four and had no bound at all until a fresh-context review (#3181).
+#   4. `logs/stall-fix.log`               — the dispatcher's stderr, one-generation rotation at the
+#      module cap. It is the one sink a file-level prune cannot reach on the same cadence, so it is
+#      rotated by size immediately BEFORE the dispatch that appends to it (see `_rotate`).
 # Measured from the knobs: `CYC=240`s ⇒ a stalled pass every ~4 min ⇒ one dispatch per
 # `DRAIN_STALL_FIX_EVERY=3` ⇒ ~120 brief files/day, unbounded, on exactly the population this
 # escalation exists for (a box stalled for hours or days), in the directory the controller `find`s
@@ -79,7 +85,16 @@ if [ "$AGESRC" = "synth" ]; then AGEMIN_TXT=">=${AGEMIN}"; else AGEMIN_TXT="$AGE
 # enforces with its own cap, and the same one-generation rotation (the series an operator reads after
 # an incident is the last two). The cap is a module constant, not an env knob: the size of a ledger
 # is not a policy a caller should be able to lift. The brief bound is a knob because retention is.
+# ⛔ ONE ROTATION HELPER FOR EVERY APPEND-ONLY SINK (fresh-context review, 2026-11-02). It used to be
+# spelled inline in `_record` only, which is why the dispatcher's own log had no bound: a second copy of
+# the mechanism is a second place to forget it. Returns 1 when the rotation FAILED, so the caller can say
+# that the sink is now growing past its cap instead of assuming the move happened.
 STALL_FIX_LEDGER_MAX_BYTES=5242880
+_rotate() { # _rotate <file> — one generation at the module cap; a missing file is not an error
+  [ -f "$1" ] || return 0
+  [ "$(wc -c < "$1" 2>/dev/null || printf '0')" -ge "$STALL_FIX_LEDGER_MAX_BYTES" ] || return 0
+  mv -f "$1" "$1.1" 2>/dev/null || return 1
+}
 STALL_FIX_BRIEF_MAX_AGE_MIN="${STALL_FIX_BRIEF_MAX_AGE_MIN:-1440}"
 # ⛔ `-mmin +N`, NOT `-mmin -N` (fresh-context review, 2026-11-02). The mechanism this clamp protects
 # is NOT the one a selection window uses: `+N` means "older than N minutes" — an eviction bound. `-N`
@@ -140,6 +155,18 @@ BRIEF="$BRIEF_DIR/stall-fix-$(date -u '+%Y%m%dT%H%M%SZ').md"
 NAME="stallfix-$(date -u '+%Y%m%dT%H%M%SZ')"
 REPORTF="$O/state/REPORT-stall-fix-$NAME.md"
 BGD="$O/bg"; BLOG="$BGD/$NAME.log"; BRC="$BGD/$NAME.rc"; BPID="$BGD/$NAME.pid"
+# ⛔ THE FOURTH SINK, AND THE LARGEST ONE THE DISPATCHER MINTS FOR US (fresh-context review, 2026-11-02,
+# P1). `nonblocking-dispatch.sh` writes the worker's WHOLE transcript to `$O/bg/<name>.log` (plus its
+# `.rc`/`.pid`/`.stamp`/`.end`/`.cap`), and NOTHING in the tree reaps `$O/bg` — this file's own note in
+# `wt_in_use` records that no reaper DELETES a `$O/bg/*.pid`, and a stale one therefore lives forever. At
+# this script's own measured rate (~120 dispatches/day) that is the biggest artifact of all, so the
+# header's "every sink is bounded" was false until this line.
+# ⛔ SCOPED TO THIS SCRIPT'S OWN NAMES (`stallfix-*`): every other lane's transcript belongs to the
+# dispatcher that started it, and deleting one is the silent-destruction class this repo keeps removing —
+# the same reason the brief prune is scoped to `stall-fix-*.md`. The retention knob is ~48x a worker's own
+# wall clock (`DRAIN_STALL_FIX_TIMEOUT`, 1800 s), so a LIVE worker's records can never be pruned under it.
+find "$BGD" -maxdepth 1 -type f -name 'stallfix-*' \
+  -mmin "+$STALL_FIX_BRIEF_MAX_AGE_MIN" -exec rm -f {} + 2>/dev/null || true
 
 # The brief names only MEASURED facts it is handed, plus where to look. It must not
 # tell the worker what the cause is: that is the finding it is dispatched to produce.
@@ -419,6 +446,10 @@ gate_refusal() {
 }
 
 _launch=0
+# ⛔ THE DISPATCHER'S OWN LOG IS ROTATED BY SIZE BEFORE THIS APPEND (fresh-context review, 2026-11-02). One
+# more appended block per dispatch with no bound is the "device that fills silently" this file bounds its
+# other three sinks against; a failed rotation is reported on the line below, never assumed.
+_rotate "$O/logs/stall-fix.log" || log_line "DRAIN STALL -> WARNING: $O/logs/stall-fix.log could not be rotated (the previous generation is still in place), so this sink is now past its cap"
 KIND=prfix "$DISP" "$NAME" "$WT" "$BRIEF" "$TIMEOUT" prfix >>"$O/logs/stall-fix.log" 2>&1 || _launch=$?
 
 _verdict="unproven"; _vmax="${STALL_FIX_VERIFY_SECS:-10}"; _vwaited=0; _bpid=""
@@ -432,18 +463,32 @@ is_num "${_vmax:-}" && [ "$_vmax" -ge 1 ] || _vmax=10
 # gate's own line away, so the operator was told the wrong thing about a worker that DID run. The
 # reader therefore runs on BOTH paths, and the foreground-refusal wording is reserved for the codes
 # the dispatcher refuses BEFORE it forks (usage 2, missing helper/gate-policy 78, brief-gate 80).
+# ⛔ A WORKER RECORD IS NOT PROOF A WORKER RAN — IT NEEDS A BYTE IN THE LOG TOO (fresh-context review,
+# 2026-11-02, P1). `nonblocking-dispatch.sh:415-427` writes exactly the shape this file was calling
+# "RAN AND ALREADY ENDED": a `.rc` present with **ZERO log bytes**, and it says so in its own words —
+# `NOT STARTED … WITHOUT WRITING A SINGLE LOG BYTE … This is NOT a dispatch: do not record it as one`
+# (exit 75). The `.rc` is written by the same backgrounded subshell that produced no output, so its mere
+# existence proves the subshell reached `run_agent`'s return, NOT that an agent started. Reading it alone
+# put "it DID start, so its report may exist" on the one durable artifact an incident is read from, and
+# pointed the operator at a report that cannot exist — the fail-open this file's verdict reader exists to
+# refuse, on a narrower path.
+# ⛔ AND THE POSITIVE PROOF IS CONSULTED FIRST, as the header above promises: the spawn-gate `allowed`
+# row used to be unreachable whenever a `.rc` existed, so "preferred where the shim is installed" was a
+# claim the ordering denied. The predicate is the dispatcher's own (`bytes > 0`, `:415`).
 if [ "$_launch" -ne 0 ]; then
   if spawn_row refused; then _verdict=refused
   elif [ -n "$(gate_refusal)" ]; then _verdict=refused
-  elif [ -s "$BRC" ]; then _verdict=ended
   elif spawn_row allowed; then _verdict=started
+  elif [ -s "$BRC" ] && [ -s "$BLOG" ]; then _verdict=ended
+  elif [ -s "$BRC" ]; then _verdict=notstarted
   else _verdict=failed; fi
 else
   while :; do
     if spawn_row refused; then _verdict=refused; break; fi
     if spawn_row allowed; then _verdict=started; break; fi
     if [ -n "$(gate_refusal)" ]; then _verdict=refused; break; fi
-    if [ -s "$BRC" ]; then _verdict=ended; break; fi
+    if [ -s "$BRC" ] && [ -s "$BLOG" ]; then _verdict=ended; break; fi
+    if [ -s "$BRC" ]; then _verdict=notstarted; break; fi
     if [ "$_vwaited" -ge "$_vmax" ]; then
       _bpid="$(cat "$BPID" 2>/dev/null || true)"
       is_num "${_bpid:-}" && kill -0 "$_bpid" 2>/dev/null && _verdict=running
@@ -459,15 +504,25 @@ fi
 # the tree. Rotation costs nothing a reader needs: the row being written survives, and the previous
 # generation holds the series an operator reads after an incident.
 _record() {
-  local _f="$O/state/drain-stall-dispatch.log"
-  if [ -f "$_f" ] && [ "$(wc -c < "$_f" 2>/dev/null || printf '0')" -ge "$STALL_FIX_LEDGER_MAX_BYTES" ]; then
-    mv -f "$_f" "$_f.1" 2>/dev/null || :
+  local _f="$O/state/drain-stall-dispatch.log" _rot=ok
+  # ⛔ BOTH WRITES ARE CHECKED, NOT ASSUMED (fresh-context review, 2026-11-02, P2). `mv … || :` and an
+  # unchecked `printf >>` meant the after-incident series lost the row SILENTLY under ENOSPC/EACCES — the
+  # incident mode this tree names twice — while the caller saw a clean log line; and a failed `mv` left the
+  # sink growing past the module cap with nothing saying the bound had stopped binding. This is the same
+  # unchecked-record class the controller closes one file over with `_dpok` (orch-loop.sh). The row is
+  # still attempted on a failed rotation (losing it is worse than exceeding the cap), and the failure is
+  # named on the caller's own line.
+  _rotate "$_f" || { _rot=FAILED; }
+  if [ "$_rot" = "FAILED" ]; then
+    log_line "DRAIN STALL -> WARNING: the ledger rotation FAILED ($_f.1 was not written), so the sink keeps growing past its ${STALL_FIX_LEDGER_MAX_BYTES}-byte cap"
   fi
   # ⛔ THE ROW CARRIES THE AGE'S PROVENANCE (review P3, 2026-11-02): `agesrc=synth` marks a WINDOW
   # BOUND, so the incident ledger cannot be read as a measurement. Additive — no reader is broken by a
   # field it does not know (the same contract `state/drain-stall` uses for its own `agesrc`).
-  printf '%s\t%s\tpass=%s\tunowned=%s\tage_min=%s\tagesrc=%s\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" "$AGESRC" >> "$_f" 2>/dev/null
+  if ! printf '%s\t%s\tpass=%s\tunowned=%s\tage_min=%s\tagesrc=%s\n' \
+       "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" "$AGESRC" >> "$_f" 2>/dev/null; then
+    log_line "DRAIN STALL -> WARNING: the durable escalation row COULD NOT BE WRITTEN ($_f is unwritable or full) — this verdict exists only in this log, not in the series an operator reads after an incident"
+  fi
 }
 
 case "$_verdict" in
@@ -486,6 +541,12 @@ case "$_verdict" in
     _g="$(gate_refusal)"
     log_line "DRAIN STALL -> STALL FIX NOT DISPATCHED (a spawn gate REFUSED this worker, so the box is STILL STALLED): ${_g:-<refusal recorded in the spawn-gate ledger for TAG=$NAME; run: bash $DISP --status $NAME>} — worker log $BLOG"
     _record "stall-fix NOT DISPATCHED (spawn refused)"
+    exit 0 ;;
+  notstarted)
+    # The dispatcher's OWN `NOT STARTED` shape: a recorded status, zero log bytes. Nothing was
+    # dispatched, so the box is STILL STALLED — say that rather than crediting a worker that never ran.
+    log_line "DRAIN STALL -> STALL FIX NOT STARTED (pass ${SEEN}; the dispatcher exited ${_launch} and left a worker record with ZERO log bytes — its own `NOT STARTED … this is NOT a dispatch` shape, so no agent ran): the box is still stalled; see $O/logs/stall-fix.log and $BLOG (empty)"
+    _record "stall-fix NOT STARTED (worker record, zero log bytes)"
     exit 0 ;;
   ended)
     _rc="$(cat "$BRC" 2>/dev/null || true)"

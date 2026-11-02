@@ -1403,6 +1403,43 @@ STUBFIX
   _o="$(stallfix_dispatch 5)"
   [ "$_o" = "not-called" ] && ok "…and a LANDED pass does not (no worker on a healthy box)" \
     || bad "a healthy pass invoked the stall fixer — the gate reads the counter, not the stall: got '$_o'"
+  # ⛔ THE `_dpok` GATE AND THE `STALL FIX MISSING` ARM HAD NO ASSERTION (fresh-context review of #3181,
+  # 2026-11-02, P2). Neither is reachable from the legs above: this fixture's `state/` is always
+  # writable (so `_dpok=1` on every run) and a stub is always present. Deleting the
+  # `[ "${{_dpok:-0}}" != "1" ]` condition left every suite green, while in production an UNPERSISTABLE
+  # `state/drain-stall` would then dispatch on EVERY stalled pass — a record frozen at a multiple of the
+  # cadence reads the same pass number forever (~7 overlapping 1800 s workers, the storm the gate's own
+  # comment says it prevents) — and an absent `$O/stall-fix.sh` would be silent instead of loud.
+  stallfix_fixture() { # <o-dir> <make-unwritable:0|1> <plant-fixer:0|1> -> the counter | "not-called"
+    rm -f "$TMP/called.txt"; mkdir -p "$1/state"; : > "$1/state/merged-1.done"
+    # A DIRECTORY on the record path, not `chmod`: the write fails for every user including root, so the
+    # arm measures the FAILED WRITE rather than the permissions of whoever runs the suite.
+    if [ "$2" = "1" ]; then mkdir -p "$1/state/drain-stall"; fi
+    if [ "$3" = "1" ]; then
+      printf '%s\n' '#!/bin/bash' 'printf "%s" "$1" >> "$STUBMARK"' > "$1/stall-fix.sh"
+      chmod +x "$1/stall-fix.sh"
+    fi
+    (
+      O="$1"; LOG="$1/dh.log"; UPN_WORK=9; LO_CHOICE=pr; MERGE_STALL_MIN=360
+      STUBMARK="$TMP/called.txt"; export STUBMARK
+      mp_recent_land() { echo $(( $(date +%s) - 400 * 60 )); }
+      is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0?*) return 1 ;; *) return 0 ;; esac; }
+      . "$TMP/dh.sh"
+    ) >/dev/null 2>&1
+    [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
+  }
+  _o="$(stallfix_fixture "$TMP/D5" 1 1)"
+  [ "$_o" = "not-called" ] && ok "…and an UNPERSISTABLE pass counter dispatches NOBODY (a cadence that cannot be saved is not a cadence)" \
+    || bad "an unwritable state/drain-stall still dispatched — the one-per-N bound is unenforced in production: got '$_o'"
+  grep -q 'STALL FIX SKIPPED' "$TMP/D5/dh.log" 2>/dev/null \
+    && ok "…and the pass SAYS the fix was skipped (an escalation that silently does nothing is the defect this closes)" \
+    || bad "an unpersistable counter was SILENT — no STALL FIX SKIPPED line: $(cat "$TMP/D5/dh.log" 2>/dev/null)"
+  _o="$(stallfix_fixture "$TMP/D6" 0 0)"
+  [ "$_o" = "not-called" ] && ok "…and a box with NO \$O/stall-fix.sh dispatches nobody rather than pretending" \
+    || bad "an absent stall fixer was still invoked: got '$_o'"
+  grep -q 'STALL FIX MISSING' "$TMP/D6/dh.log" 2>/dev/null \
+    && ok "…and it names why (the box is half-deployed, and the operator is told in the log he reads)" \
+    || bad "a half-deployed box was SILENT — no STALL FIX MISSING line: $(cat "$TMP/D6/dh.log" 2>/dev/null)"
 else
   bad "the [drain-health] block is missing — the stall line is unpinned"
 fi

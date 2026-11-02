@@ -153,13 +153,29 @@ run_sh "$D" 3 3
 has "STALL FIX LAUNCH ACCEPTED, AGENT START UNPROVEN" && ck 0 "a worker-log REFUSED that is NOT a gate line leaves a LIVE worker UNPROVEN, not NOT DISPATCHED" || ck 1 "a worker-log REFUSED that is NOT a gate line leaves a LIVE worker UNPROVEN, not NOT DISPATCHED"
 lacks "NOT DISPATCHED" && ck 0 "…and never records a gate refusal no gate made" || ck 1 "…and never records a gate refusal no gate made"
 
-# A worker that already ENDED (its `.rc` exists and nothing refused) is reported as having run —
-# not as still-dispatching, and not as a failure.
+# A worker that already ENDED (its `.rc` exists, its log carries the worker's own output, and nothing
+# refused) is reported as having run — not as still-dispatching, and not as a failure.
+# ⛔ THE LOG BYTE IS PART OF THE FIXTURE ON PURPOSE (fresh-context review, 2026-11-02, P1): a `.rc` with
+# ZERO bytes is `nonblocking-dispatch.sh`'s own `NOT STARTED … this is NOT a dispatch` shape, and this
+# leg used to assert exactly that shape was "RAN AND ALREADY ENDED" — pinning the false-pass it now
+# refuses. The next leg (b5b) drives the zero-byte shape.
 D="$(new_o b5)"
-stub "$D" 'printf "0\n" > "$O/bg/$1.rc"'
+stub "$D" 'printf "0\n" > "$O/bg/$1.rc"; printf "[worker] report written\n" > "$O/bg/$1.log"'
 run_sh "$D" 3 3
-has "RAN AND ALREADY ENDED" && ck 0 "an .rc with no refusal is reported as RAN AND ALREADY ENDED" || ck 1 "an .rc with no refusal is reported as RAN AND ALREADY ENDED"
+has "RAN AND ALREADY ENDED" && ck 0 "an .rc WITH log bytes and no refusal is reported as RAN AND ALREADY ENDED" || ck 1 "an .rc WITH log bytes and no refusal is reported as RAN AND ALREADY ENDED"
 lacks "STALL FIX DISPATCHED" && ck 0 "…and is not called a dispatch" || ck 1 "…and is not called a dispatch"
+
+# ⛔ THE ZERO-BYTE SHAPE IS THE DISPATCHER'S OWN "NOT STARTED", NOT A DISPATCH (fresh-context review,
+# 2026-11-02, P1). `nonblocking-dispatch.sh:415-427` writes rc + an EMPTY log and exits 75 saying, in its
+# own words, "This is NOT a dispatch: do not record it as one". A verdict reader that treats the `.rc`
+# alone as proof reports "it DID start, so its report may exist" and points the operator at a report that
+# cannot exist — on the one durable artifact an incident is read from.
+D="$(new_o b5b)"
+stub "$D" 'printf "0\n" > "$O/bg/$1.rc"; : > "$O/bg/$1.log"; exit 75'
+run_sh "$D" 3 3
+has "STALL FIX NOT STARTED" && ck 0 "a worker record with ZERO log bytes is NOT STARTED, not a dispatch" || ck 1 "a worker record with ZERO log bytes is NOT STARTED, not a dispatch"
+lacks "RAN AND ALREADY ENDED" && ck 0 "…and it does not claim the worker ran" || ck 1 "…and it does not claim the worker ran"
+case "$(ledger_of "$D")" in *"NOT STARTED"*) ck 0 "…and the durable row says NOT STARTED too" ;; *) ck 1 "…and the durable row says NOT STARTED too: $(ledger_of "$D")" ;; esac
 
 # A live pid with NO ledger row and no refusal is the honest middle: the launcher accepted it, but
 # nothing yet proves an agent started. (A box without the shipped `pi` shim looks exactly like this.)
@@ -195,11 +211,12 @@ has "NOT DISPATCHED" && ck 0 "a POST-launch exit 75 with a gate refusal in the w
 has "[land-backlog] REFUSED" && ck 0 "…and that gate's own line is quoted (it is not discarded on the non-zero path)" || ck 1 "…and that gate's own line is quoted (it is not discarded on the non-zero path)"
 lacks "refused before launching" && ck 0 "…and the pre-launch wording is not used for an exit that happened AFTER the launch" || ck 1 "…and the pre-launch wording is not used for an exit that happened AFTER the launch"
 
-# ...and a 75 that DID leave a worker record is "ran and already ended", not "refused".
+# ...and a 75 that DID leave a worker record AND output is "ran and already ended", not "refused".
+# The log byte is the discriminator (see b5b): the record alone is the zero-byte `NOT STARTED` shape.
 D="$(new_o b10)"
-stub "$D" 'printf "0\n" > "$O/bg/$1.rc"; exit 75'
+stub "$D" 'printf "0\n" > "$O/bg/$1.rc"; printf "[worker] hi\n" > "$O/bg/$1.log"; exit 75'
 run_sh "$D" 3 3
-has "RAN AND ALREADY ENDED" && ck 0 "a POST-launch exit 75 with a worker record is RAN AND ALREADY ENDED" || ck 1 "a POST-launch exit 75 with a worker record is RAN AND ALREADY ENDED"
+has "RAN AND ALREADY ENDED" && ck 0 "a POST-launch exit 75 with a worker record AND log bytes is RAN AND ALREADY ENDED" || ck 1 "a POST-launch exit 75 with a worker record AND log bytes is RAN AND ALREADY ENDED"
 lacks "refused before launching" && ck 0 "…and it does not claim a refusal the record contradicts" || ck 1 "…and it does not claim a refusal the record contradicts"
 
 echo
@@ -284,6 +301,10 @@ echo "── §E the sinks are BOUNDED — prune and rotation, not two files tha
 # the harness with no pruner and no rotation — on exactly the population this escalation exists for.
 # `pi_gate_ledger` bounds its own write with one-generation rotation ("a device that fills silently is
 # the defect #1765 exists for"); these two now do the same.
+# ⛔ THE THIRD AND FOURTH SINKS GET LEGS BELOW (fresh-context review, 2026-11-02, P2): this section drove
+# the brief prune and the ledger rotation only, so mutating the REPORT prune (or the new `$O/bg` prune)
+# to `true` left the suite green — while the script's header, README.md and the heartbeat STALL_TERM
+# registry all assert those sinks are bounded. A bound with no leg is a claim, not a guarantee.
 D="$(new_o e0)"; stub "$D" "$STUB_OK_TOUCH"
 # A brief past the retention bound, spelled with an absolute old date (`touch -t`, not `-d '3 days
 # ago'`) so it parses identically on BSD and GNU. A file this script does NOT own sits beside it: the
@@ -332,6 +353,28 @@ touch -t 202001010000 "$D/state/briefs/stall-fix-20200101T000000Z.md"
 OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
        STALL_FIX_BRIEF_MAX_AGE_MIN=abc bash "$SH" 3 90 2>&1)"
 [ ! -f "$D/state/briefs/stall-fix-20200101T000000Z.md" ]; ck $? "a NON-NUMERIC bound falls back to the default and still prunes (unclamped, find fails and prunes NOTHING)"
+
+# ── §E2 the REPORT sink (the largest of the two `state/` files) is BOUNDED, and scoped ────────────
+# ⛔ `state/REPORT-stall-fix-<name>.md` is minted by the brief's own FIRST ACTION on the same cadence as
+# the brief, and NOTHING else in the tree reaps it. Deleting its prune left every assertion above green.
+D="$(new_o e4)"; stub "$D" "$STUB_OK_TOUCH"
+touch -t 202001010000 "$D/state/REPORT-stall-fix-stallfix-20200101T000000Z.md"
+touch -t 202001010000 "$D/state/keep-me.txt"
+[ -f "$D/state/REPORT-stall-fix-stallfix-20200101T000000Z.md" ]; ck $? "fixture: a stale worker REPORT exists before the run"
+run_sh "$D" 3 3
+[ ! -f "$D/state/REPORT-stall-fix-stallfix-20200101T000000Z.md" ]; ck $? "a REPORT older than the retention bound is PRUNED (the largest state/ sink is bounded, not merely named)"
+[ -f "$D/state/keep-me.txt" ]; ck $? "…and a file this script does not own beside it is left alone"
+
+# ── §E3 the WORKER TRANSCRIPT sink (`$O/bg/stallfix-*`) is BOUNDED, and scoped ────────────────────
+# ⛔ The whole `run_agent` transcript plus its record files are minted per dispatch and `$O/bg` has no
+# reaper at all (this script's own `wt_in_use` note says so). At ~120 dispatches/day this is the biggest
+# artifact this escalation creates, so it is the one that most needs a leg of its own.
+D="$(new_o e5)"; stub "$D" "$STUB_OK_TOUCH"; mkdir -p "$D/bg"
+touch -t 202001010000 "$D/bg/stallfix-20200101T000000Z.log"
+touch -t 202001010000 "$D/bg/lanefix-20200101T000000Z.log"
+run_sh "$D" 3 3
+[ ! -f "$D/bg/stallfix-20200101T000000Z.log" ]; ck $? "a stale worker transcript THIS script minted is PRUNED (the fourth sink is bounded)"
+[ -f "$D/bg/lanefix-20200101T000000Z.log" ]; ck $? "…and ANOTHER lane's transcript is never touched (deleting one would be the defect, not the fix)"
 
 
 echo
