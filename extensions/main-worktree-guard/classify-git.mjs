@@ -3301,13 +3301,116 @@ export function joinContinuations(command) {
  * @param {string} command
  * @returns {boolean}
  */
+/**
+ * Quote-, escape- and extglob-aware split of a command on the PIPELINE operator
+ * `|` (#3243).
+ *
+ * `String.split("|")` has NO quote model, so a `|` inside a QUOTED word was read
+ * as a pipeline: `grep -n "bash\|sh -x" f | head -2` split into `… grep -n "bash\`
+ * and `sh -x" f `, the second segment's head read as the interpreter `sh`, and
+ * the whole command was refused as "piped into a shell" — the scanner reading
+ * DATA as code. That is the false positive `test-command-position.mjs` pins as
+ * KNOWN-FALSE D5, and the one that refused a read-only `grep -E "(bash|sh)" | head`
+ * on 2026-11-02. The `|` of an extglob group (`./undo@(-g|).sh`) and the `||`
+ * logical operator are not pipelines either; a REAL pipeline's `|` is unquoted,
+ * so this narrowing cannot hide one.
+ * @param {string} command
+ * @returns {string[]} the pipeline segments (a one-element array when there is
+ *   no unquoted `|`)
+ */
+export function wtSplitPipeline(command) {
+  const s = String(command ?? "");
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let globDepth = 0; // inside an extglob group `@( … | … )`
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      cur += ch;
+      // A backslash inside DOUBLE quotes escapes only `$`, backtick, `\` and
+      // newline (same rule as `wtShellWords`) — otherwise the quote after it
+      // really closes the word.
+      if (ch === "\\" && quote === '"' && '"$`\\\n'.includes(s[i + 1] ?? "")) { cur += s[i + 1] ?? ""; i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === "(" && /[?*+@!]$/.test(cur)) { globDepth++; cur += ch; continue; }
+    if (globDepth > 0) { if (ch === ")") globDepth--; cur += ch; continue; }
+    if (ch === "|") {
+      if (s[i + 1] === "|") { cur += "||"; i++; continue; } // logical OR
+      out.push(cur); cur = ""; continue;
+    }
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+/**
+ * Is this command-position WORD shaped like a PATH at all? (#3243)
+ *
+ * The #1228 arm exists to refuse a script path the SHELL resolves at runtime, so
+ * the expansion forms themselves (`$`, backtick, `*`, `?`, `[...]`, `{…}`,
+ * extglob, a leading `~`) are ALLOWED here — refusing them is the arm's job.
+ * What a path is not is a PROGRAM'S TEXT. `awk '/^tree=/{t=$2}'`, a sed
+ * expression `s/[[:space:]]*$//` and a grep alternation were each read as an
+ * executed script path, which refused the ENTIRE script that contains them
+ * (measured 2026-11-02 on `scripts/orchestrator-harness/nonblocking-dispatch.sh`,
+ * `pi-bootstrap/tests/test-farm-unfarm.sh`, `scripts/worktree-hygiene-sweep.sh`,
+ * `scripts/pi-cache-reap.test.sh`).
+ *
+ * The rule is POSITIVE, not a deny list of the programs seen so far: replace
+ * every expansion form with a placeholder and require what REMAINS to be a plain
+ * path — components over `[A-Za-z0-9._+@!%~-]` joined by `/`. A `:`, `=`, `^`,
+ * `\`, `(`, `)`, `;`, `&`, `<`, `>`, `|`, `#`, `,` or an unbalanced quote /
+ * bracket / backtick cannot appear, so the word cannot be the script the shell
+ * would run, and the arm must not claim it is.
+ * @param {unknown} word
+ * @returns {boolean}
+ */
+export function wtIsPathShapedScriptWord(word) {
+  let s = String(word ?? "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
+  if (!s) return false;
+  // A path carries a separator or a leading `~`; a bare word resolves through
+  // PATH, not through this arm (same rule `directish` states).
+  if (!/[\/~]/.test(s)) return false;
+  const PH = "\u0000";
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\") return false; // an escape is not a path spelling
+    if (ch === "`") {
+      const end = s.indexOf("`", i + 1);
+      if (end < 0) return false; // unbalanced — prose, not a substitution
+      out += PH; i = end; continue;
+    }
+    if (ch === "$") {
+      let j = i + 1;
+      if (s[j] === "{") { const e = s.indexOf("}", j); if (e < 0) return false; j = e + 1; }
+      else if (s[j] === "(") { const e = s.indexOf(")", j); if (e < 0) return false; j = e + 1; }
+      else while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+      out += PH; i = j - 1; continue;
+    }
+    if (ch === "*") { out += PH; continue; }
+    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    out += ch;
+  }
+  return /^[A-Za-z0-9._+@!%~\u0000/-]+$/.test(out) && /[\/~]/.test(out);
+}
+
 export function wtPipelineFeedsShell(command) {
   const STDIN_ALIAS = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
   // A REDIRECTION is not an operand either (`… | bash 2>/dev/null` executes the
   // pipe as code; treating `2>/dev/null` as a script operand silently disabled
   // the whole arm — reviewer round-11 P0).
   const REDIRECT = /^[0-9]*(?:>>?|<<?|<>|>&|<&|&>)/;
-  return String(command ?? "").split("|").slice(1).some((seg) => {
+  return wtSplitPipeline(command).slice(1).some((seg) => {
     const head = _wtHeadInterpreter(seg);
     if (head === null) return false;
     const base = basename(String(head));
