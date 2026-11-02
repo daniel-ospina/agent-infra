@@ -1465,8 +1465,10 @@ manifest path above is what a box that is copied into every deploy should use.
 | `MAX_LANES` | **derived**: `10#$_NCPU * 5 / 2` — 2.5× cores, floored (25 on a 10-core box, 10 on a 4-core box, 10 on an unprobeable host) | concurrent implementation lanes. **Capacity gates dispatch, not a lane count** (owner ruling, 2026-10-17, verbatim: *"dispatch should be gated on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of CPUs"*). The shipped default was a flat `4`, and the box this was measured on had its plist **pinned** at `8`: `[cap] load=79/100 lanes=9/11 max_lanes=8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load headroom and comfortable swap/memory, so dispatch was refused for a lane count while capacity was available. A **valid** pin (plist/`keys.env`) still wins and is never recomputed; an **invalid** one is refused by `install.sh` and repaired by the loop to the derived default; a derived value that fails `is_limit` falls back to `10`. ⚠️ The plist **pins** the number, so a box picks this default up only on a fresh `install.sh` render. ⚠️ `2.5 × cores` is ALSO `LOAD_SUSPEND_THRESHOLD`'s default (`docs/ops/load-policy.md` §2) — that is a 1-minute **load** threshold, this is a count of **lanes**; they are not one ceiling |
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
 | `MERGE_PRIORITY_AT` | `25` | **no longer a gate — headroom only.** The gate is threshold-free (§7.2f): one workable un-owned PR is enough to stop the issue path, and there is no age-based release (a stalled drain gets `DRAIN STALLED`, never a licence to open work). This value now only selects the *drain posture* — from here the reviewer/fixer headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`, so a 25-PR backlog is drained by the capacity that actually clears it instead of being capped to a trickle. Kept as a name because operators and the `[cap]` line read it |
-| `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m` |
-| `MERGE_PRIORITY_MAX_AGE_MIN` | `180` | **display only** — the `[cap] last_land=` field and the `DRAIN STALLED` line. ⛔ This knob used to bound an age-based RELEASE of the gate; that was **deleted** (agent-infra#2099): the release turned *PRs are not landing* into *dispatch more issues*, hiding a stall behind fresh activity, and no unattended lane can move the unowned count itself (every session authenticates as the same GitHub user). `test-gates.sh` pins the release machinery ABSENT |
+| `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m`. ⛔ An **empty** answer — nothing landed inside `mp_recent_land`'s window, including a box whose `state/merged-*.done` set is empty — is now read as the STALL (agent-infra#2929), and the age is set to **that window's own bound** (`2 × MERGE_PRIORITY_MAX_AGE_MIN`), because it is the only floor the empty answer actually proves; the line says so, and the status token prints `no_land=>=<age>m` |
+| `DRAIN_STALL_FIX_EVERY` | `3` | how many **stalled** passes pass between `stall-fix.sh` dispatches of the read-only `prfix` diagnostician (`1` = one per stalled pass). It bounds a box nobody is fixing: the stall keeps escalating every pass, but it does not spawn a worker per cycle forever. A value that is not a whole number `>= 1` falls back to 3, and `0` is not a bound. `DRAIN_STALL_FIX_TIMEOUT` (default `1800`s) bounds the worker itself; `STALL_FIX_WORKTREE`/`HARNESS_REPO` choose the throwaway detached worktree it runs in. ⛔ `STALL_FIX_VERIFY_SECS` (default `10`, clamped to `1–120`) is how long the escalation watches the worker's own record before it states a verdict — see the §drain-health paragraph below, because the verdict is READ from that record and not from the dispatcher's exit status |
+| `MERGE_PRIORITY_MAX_AGE_MIN` | `180` | **display only** — the `[cap] last_land=` field and the `DRAIN STALLED` line. ⛔ This knob used to bound an age-based RELEASE of the gate; that was **deleted** (agent-infra#2099): the release turned *PRs are not landing* into *dispatch more issues*, hiding a stall behind fresh activity, and no unattended lane can move the unowned count itself (every session authenticates as the same GitHub user). `test-gates.sh` pins the release machinery ABSENT. ⛔ The window is `2 ×` this value and BOTH the search (`mp_recent_land`) and the drain block apply the same two clamps — `>= 1` (a `0` window matches nothing: a permanent false stall) and `<= 1000000` (an overflowing knob wraps `_b * 2` negative, and `find -mmin` on a negative bound succeeds and matches nothing — a search that never ran, reported as `no land`) |
+| `STALL_FIX_BRIEF_MAX_AGE_MIN` | `1440` | minutes a `stall-fix.sh` **brief** is kept under `state/briefs/` before the next dispatch prunes it (`-mmin +N`, i.e. older than N minutes; scoped to `stall-fix-*.md`, so a file the script does not own is untouched). One brief per dispatch, ~4 KB, ~120/day on a box stalled for days — the population this escalation exists for — so the directory is bounded here rather than left to a reaper that never named it. A value that is not a whole number `>= 1` falls back to `1440`: an unclamped `0` would evict every previous brief, and a non-numeric one makes `find` fail and prune nothing at all (the unbounded sink returning silently). Its sibling `state/drain-stall-dispatch.log` is bounded by one-generation rotation at a 5 MiB module constant (`STALL_FIX_LEDGER_MAX_BYTES`), not by a knob |
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
@@ -1486,7 +1488,7 @@ manifest path above is what a box that is copied into every deploy should use.
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 | `SWEEP_ROWS_PER_CYCLE` | `8` | the sweep's per-cycle **window**: how many swept PRs are read per cycle, rotating via `state/sweep-cursor`. A full 70-row pass costs minutes (≥2 `gh pr view` per row) and the controller is relaunched every 12–45 s, so an unbounded pass was torn down before the arms at its end — measured: 0 dispatches in 555 cycles (#2640). The cursor advances AFTER the pass, by the rows that actually produced a disposition, so an interrupted window resumes at its unfinished row instead of stepping over its tail |
 
-⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `SWEEP_ROWS_PER_CYCLE`, `MERGE_STALL_MIN`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist.** The template
+⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `SWEEP_ROWS_PER_CYCLE`, `MERGE_STALL_MIN`, `DRAIN_STALL_FIX_EVERY`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist.** The template
 carries 19 placeholders — the thirteen limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
 — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
@@ -4347,12 +4349,58 @@ been rate-limited while the REST sweep succeeded: exactly the fallback this desi
   The token self-heals: a land newer than the marker deletes it, so it cannot become the stale flag it
   replaces. ⛔ It still opens NOTHING: the escalation exists to make the policy's promise *verifiable*,
   never to add the release valve the ruling forbids.
+* **…AND AN EMPTY ANSWER TAKES THAT ARM, AND THE ARM DISPATCHES (agent-infra#2929).** Two things kept a
+  stalled box silent. (1) The arm ran only when `mp_recent_land` returned a NUMBER, i.e. only when a
+  land already sat inside the window — a dead-man's switch that can only fire on a success event cannot
+  report the absence of success events, so an empty answer (measured: 178 markers, 0 inside 360m, 16–19
+  un-owned, `lanes=0`) skipped the gate entirely and wrote no `state/drain-stall` for hours. It now
+  takes the SAME arm with a synthesised stamp of **`2 × MERGE_PRIORITY_MAX_AGE_MIN`** — the bound
+  `mp_recent_land` itself searched, i.e. the largest floor the empty answer PROVES, so a stall is
+  understated and never invented (deriving it from `MERGE_STALL_MIN`, a display threshold, asserted
+  staleness the box never measured: `MERGE_STALL_MIN=2000` printed `2001m` from a `360m` window) — and the line says the answer was empty
+  rather than presenting that bound as a measured "last land", with `state/drain-stall` recording
+  `agesrc=synth` so the `no_land=` token prints `>=`. A fresh numeric stamp is untouched, so
+  `drain alive` and the marker clear still work (the polarity is pinned by `test-gates.sh`). (2) Nothing
+  was ever DONE about the stall. Every stalled pass now drives `stall-fix.sh`, which dispatches ONE
+  read-only `prfix` diagnostician on the land problem per `DRAIN_STALL_FIX_EVERY` stalled passes, in a
+  throwaway detached worktree. It hangs off the stall itself — never off the pass counter — so it fires
+  on both stall shapes and on NO healthy or UNMEASURED pass; it never touches a PR a lane holds; and
+  every step it cannot complete is printed (`STALL FIX MISSING`, `COULD NOT DISPATCH`, `DISPATCH
+  FAILED`) instead of being skipped, so an escalation that cannot act never reads as one that did.
+  ⛔ **AND ITS DISPATCH VERDICT IS READ FROM THE WORKER'S OWN RECORD, NOT FROM THE DISPATCHER'S EXIT
+  STATUS.** `nonblocking-dispatch.sh` backgrounds `run_agent` — and with it every spawn gate — with
+  `exec >/dev/null 2>&1` and then returns `0` once it reaches the launch, so a `[load-gate]`,
+  `[disk-gate]` or `[land-backlog]` refusal used to be recorded as `STALL FIX DISPATCHED` while no
+  agent had started (#3181 review, P1). The escalation now distinguishes five measured states:
+  `DISPATCHED` (a spawn-gate ledger row `allowed` carrying this worker's TAG — the one positive proof),
+  `NOT DISPATCHED` (a `[…-gate] REFUSED` line, or a `refused` ledger row, quoted verbatim), `RAN AND
+  ALREADY ENDED` (a `.rc` with no refusal), `LAUNCH ACCEPTED, AGENT START UNPROVEN` (a live pid and
+  nothing else — a box without the `pi` shim looks like this, so it says so rather than claiming a
+  start) and `DISPATCH UNPROVEN` (an empty record). It also states — rather than denies, as the file
+  once did — that `KIND=prfix` is **measured, not exempt** for this caller: the exemption needs proof
+  that the worktree IS an open PR at its HEAD, which a detached `origin/main` worktree can never
+  produce, so the creation back-pressure gate can legitimately HOLD a stall repair on exactly the box
+  that is stalled. `scripts/orchestrator-harness/stall-fix.test.sh` drives every one of those states.
   ⛔ The land age is measured from `state/merged-<PR>.done`, and `merge-one.sh` is its only writer — so
   the age answers "when did **this box** last land", not "when did the queue last move". Measured
   2026-10-23: 7 PRs merged on the repo between 21:31Z and 22:40Z while the line said "no PR merged in
   264m", because a PEER box held the landing claims. Both stall lines therefore name their population
   and quote the pass's own dominant NAMED wait (the reason it spawned nothing), so an escalation cannot
   misdiagnose a box whose only "problem" is that it is not the lander.
+  ⛔ **THE ONE ARM THAT DOES NOT CONSULT `MERGE_STALL_MIN`.** That knob is a DISPLAY threshold and the
+  empty answer is a MEASUREMENT, so the empty-answer arm fires at the window's own bound even when an
+  operator has raised `MERGE_STALL_MIN` above it (`MERGE_STALL_MIN=1000` + `MERGE_PRIORITY_MAX_AGE_MIN=180`
+  escalates at `>=360m`, not at `1000m`). This is deliberate and it is #2929's ruling — *an empty answer
+  IS the stall* — not a knob being ignored: the escalation is true at that bound (nothing landed for at
+  least that long), the printed age says it is a floor, and `MERGE_STALL_MIN` still decides the MEASURED
+  arm. A quieter box for the empty-answer shape is a change to #2929's ruling and belongs there — not a
+  threshold comparison, which would print `drain alive` on a box that has landed nothing.
+  ⛔ **THE WORKER'S REPORT IS PER-DISPATCH** (`state/REPORT-stall-fix-<name>.md`, named in the dispatch
+  line). `DRAIN_STALL_FIX_EVERY` bounds the dispatch by stalled PASSES (default 3 ≈ 12 min) while a
+  worker is given 1800 s, so an unfixed stall normally has two or three workers alive at once; a single
+  fixed report path made the newest worker's mandated first action truncate the previous worker's only
+  output. Its `.log`/`.rc`/`.pid` are cleared before each launch and its name carries the date, so a
+  previous day's records cannot answer for this one.
 * **Parked PRs are excluded from the gate's number** — a PR parked at `MAX_FIX_TRIES` is one the
   harness itself declared needs-a-human, and letting it hold the issue path shut forever would be the
   "stale flag that latches a gate" failure. The count is printed so the subtraction is visible.

@@ -1321,10 +1321,13 @@ if [ -s "$TMP/dh.sh" ]; then
   grep -q 'DRAIN STALLED' <<<"$_o" && grep -q '2 spawn(s) REFUSED' <<<"$_o" \
     && ok "DRAIN STALLED (a land inside the window, aged past the stall bound) carries the refusal cause" \
     || bad "the stall line lost the cause: $_o"
-  # ⛔ THE SECOND ARM IS THE ONE THAT PRINTS FOR A REAL STALL (review, cycle 4): `mp_recent_land` only
-  # ever returns a stamp inside 2x the gate's window, so arm 1 covers the 180–360m band — while the
-  # measured incident ran SIX HOURS. Once nothing landed inside that bound the function returns empty
-  # and arm 2 prints; leaving it unpinned left the six-hour stall line itself untested.
+  # ⛔ THE EMPTY ANSWER IS THE ONE THAT PRINTS FOR A REAL STALL (review cycle 4, then #2929).
+  # `mp_recent_land` only ever returns a stamp inside 2x the gate's window, so arm 1 covers the
+  # 180–360m band — while the measured incident ran SIX HOURS. Once nothing landed inside that bound
+  # the function returns empty; before #2929 that landed in a separate arm that PRINTED but recorded
+  # nothing and dispatched nothing. It now takes the SAME escalation arm via the synthesised stamp
+  # (#2929 ask 1), so this leg drives the six-hour stall line itself — and it is the leg that reddens
+  # if that synthesis is ever removed.
   drain_far() {
     : > "$TMP/dh2.log"; mkdir -p "$TMP/D2/state"; : > "$TMP/D2/state/merged-1.done"
     (
@@ -1340,6 +1343,66 @@ if [ -s "$TMP/dh.sh" ]; then
   grep -q 'DRAIN STALLED' <<<"$_o" && grep -q '15 spawn(s) REFUSED' <<<"$_o" \
     && ok "DRAIN STALLED (nothing landed inside the bound — the >=6h arm) carries the refusal cause" \
     || bad "the long-stall line lost the cause: $_o"
+  # ⛔ THE DISPATCH IS GATED ON "DID THIS PASS STALL", NOT ON THE COUNTER (verifier, 2026-10-27).
+  # The first cut read `_dpass` on EVERY path, where it defaults to 0, and `0 % 3 == 0` spawned a
+  # stall-repair worker on every HEALTHY pass; the second cut initialised the flag INSIDE the stall
+  # arm, which reset it immediately and dispatched on NO pass at all. Neither state is visible to any
+  # existing leg, so both are driven here: a stalled pass MUST invoke the fixer, a landed pass MUST NOT.
+  # ⛔ THE STUB RECORDS ITS ARGUMENTS (review P3, #2929). It used to be `echo called`, so the leg proved
+  # only THAT a worker was started, never WHAT it was told: mutating `orch-loop.sh` to pass a constant
+  # `"0"` instead of `"${_dpass:-0}"` made `stall-fix.sh` refuse every call in production (`SEEN=0` is
+  # not a stalled pass — the escalation dispatches NOBODY, the exact inertness this PR removes) while
+  # the whole suite stayed green. Asserting the counter is what makes the leg discriminating.
+  stallfix_dispatch() {   # <land-age-minutes> -> the pass counter the fixer was called with | "not-called"
+    rm -f "$TMP/called.txt"; mkdir -p "$TMP/D3/state"; : > "$TMP/D3/state/merged-1.done"
+    cat > "$TMP/D3/stall-fix.sh" <<'STUBFIX'
+#!/bin/bash
+printf '%s' "$1" >> "$STUBMARK"
+STUBFIX
+    chmod +x "$TMP/D3/stall-fix.sh"
+    (
+      O="$TMP/D3"; LOG="$TMP/dh3.log"; UPN_WORK=9; LO_CHOICE=pr; MERGE_STALL_MIN=360
+      STUBMARK="$TMP/called.txt"; export STUBMARK
+      # ⛔ THE AGE ARRIVES VIA THE ENVIRONMENT, not `$1`: the block calls `mp_recent_land`
+      # with NO arguments, so a stub reading `$1` prints an empty stamp and the whole block is
+      # skipped — which is how this leg first "passed" while dispatching nothing.
+      LAND_AGE_MIN="$1"; export LAND_AGE_MIN
+      mp_recent_land() { echo $(( $(date +%s) - LAND_AGE_MIN * 60 )); }
+      is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0?*) return 1 ;; *) return 0 ;; esac; }
+      . "$TMP/dh.sh"
+    ) >/dev/null 2>&1
+    [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
+  }
+  _o="$(stallfix_dispatch 400)"
+  [ "$_o" = "1" ] && ok "a STALLED pass invokes the stall fixer WITH the pass counter it measured (1) — the escalation dispatches" \
+    || bad "a stalled pass did not hand the stall fixer pass counter 1 — the escalation is inert, or hands it a counter stall-fix.sh refuses: got '$_o'"
+  # ⛔ AND THE SAME EMPTY ANSWER MUST DISPATCH (verifier, cycle 3 + #2929): an empty `mp_recent_land`
+  # is NOTHING landed inside the window — the ≥6h class this box actually reaches, and the state #2929
+  # measured at 178 markers / 0 inside 360m. It printed a line and set no flag, so the escalation was
+  # inert exactly where the stall is worst. The fixture keeps a marker on disk with an empty answer, so
+  # it is the EMPTY-ANSWER path (and not a missing marker) that has to reach the dispatcher.
+  stallfix_dispatch_noland() {
+    rm -f "$TMP/called.txt"; mkdir -p "$TMP/D4/state"; : > "$TMP/D4/state/merged-1.done"
+    cat > "$TMP/D4/stall-fix.sh" <<'STUBFIX'
+#!/bin/bash
+printf '%s' "$1" >> "$STUBMARK"
+STUBFIX
+    chmod +x "$TMP/D4/stall-fix.sh"
+    (
+      O="$TMP/D4"; LOG="$TMP/dh4.log"; UPN_WORK=9; LO_CHOICE=pr; MERGE_STALL_MIN=360
+      STUBMARK="$TMP/called.txt"; export STUBMARK
+      mp_recent_land() { printf ''; }   # nothing landed inside the bound -> the empty answer
+      is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0?*) return 1 ;; *) return 0 ;; esac; }
+      . "$TMP/dh.sh"
+    ) >/dev/null 2>&1
+    [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
+  }
+  _o="$(stallfix_dispatch_noland)"
+  [ "$_o" = "1" ] && ok "…and the EMPTY answer (nothing landed inside the window — the >=6h stall) dispatches too, with the measured counter" \
+    || bad "the empty-answer path printed the line but never invoked the fixer correctly — inert where the stall is worst: got '$_o'"
+  _o="$(stallfix_dispatch 5)"
+  [ "$_o" = "not-called" ] && ok "…and a LANDED pass does not (no worker on a healthy box)" \
+    || bad "a healthy pass invoked the stall fixer — the gate reads the counter, not the stall: got '$_o'"
 else
   bad "the [drain-health] block is missing — the stall line is unpinned"
 fi

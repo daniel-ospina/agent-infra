@@ -1577,13 +1577,14 @@ FAKE
     sed -n '/^drain_stall_label() {/,/^}/p' "$ORCH"
   } > "$TMP/drain_helpers.sh"
   DO="$TMP/drainO"; mkdir -p "$DO/state"
-  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP]
+  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP] [MERGE_PRIORITY_MAX_AGE_MIN]
     ( set -u
       O="$DO"; LOG="$TMP/drain.log"; : > "$LOG"; UPN_WORK=50
       PRDISP_ACTS=3
       PRDISP_TOP=""
       if [ "${3+x}" = x ]; then PRDISP_SPAWNS="$3"; fi
       if [ "${4+x}" = x ]; then PRDISP_TOP="$4"; fi
+      if [ "${5+x}" = x ]; then MERGE_PRIORITY_MAX_AGE_MIN="$5"; else unset MERGE_PRIORITY_MAX_AGE_MIN; fi
       . "$TMP/drain_helpers.sh"
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
@@ -1646,6 +1647,90 @@ PYEOF
   grep -q '^passes=2$' "$DO/state/drain-stall" \
     && { echo "  ok …and a second stalled pass COUNTS itself (pass 2) rather than restarting at 1"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the pass counter did not advance: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1)); }
+  # ⛔ ASK 2 OF #2929, AND THIS LEG FAILS ON THE UNFIXED BLOCK: a state dir with **NO `merged-*.done`
+  # AT ALL** — a fresh cell, a box after state loss, any box that has never landed — beside un-owned
+  # PRs. The gate used to SKIP on an empty answer, so the log stayed empty AND no artifact was written:
+  # the dead-man's switch could not report the one state it most exists for. `_drain ''` creates no
+  # marker at all, so removing the applied fix in the shipped block reddens HERE, by name.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain '' 180 0)"
+  # ⛔ THE LITERAL MADE THIS ARM UNREACHABLE (review P2, 2026-11-01). The shipped line is `no land
+  # marker inside the ${_wbound}m window at all`, so the fragment `no land marker inside the window`
+  # could never match it: the arm was DEAD, and had the STALLED shape ever been the one taken this leg
+  # would have fallen to the `*)` arm below and reported "an unexpected verdict" on a correct tree —
+  # a red on a green box, in the very leg added for #2929 ask 2. The window's own bound sits between
+  # "the" and "window", so the pattern spans it. (The DEADLOCK arm is what `_drain '' 180 0` actually
+  # produces, since spawns=0; this arm exists for the same empty answer WITH workers running.)
+  case "$_out" in
+    *"DRAIN DEADLOCK"*"STARTED NO WORKER"*) echo "  ok a box that has NEVER landed (no merged-*.done at all) escalates — the empty answer IS the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    *"DRAIN STALLED"*"no land marker inside the "*"m window at all"*) echo "  ok a markerless box names the empty answer as the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    "") echo "  ❌ a state dir with NO land marker produced NO line at all — the escalation is disabled by the exact condition it exists for (#2929): '$_out'"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a markerless box produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if [ -s "$DO/state/drain-stall" ] && grep -q '^passes=1$' "$DO/state/drain-stall"; then
+    echo "  ok …and it WRITES the escalation record (state/drain-stall), so the next pass still knows"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a markerless box left no escalation artifact (#2929 ask 2): $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ THE SAME EMPTY ANSWER **WITH WORKERS RUNNING** takes the OTHER stall arm, and until this leg
+  # existed nothing in the suite could reach it: `_drain '' <min> 0` always lands on DEADLOCK, so the
+  # STALLED-with-a-synthesised-age arm was only ever covered by a hand-run. Driven here so the
+  # synthesised age, its "at least" label and the window it is derived from are all pinned.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain '' 180 2)"
+  case "$_out" in
+    *"DRAIN STALLED"*"no land marker inside the "*"m window at all"*) echo "  ok a markerless box WITH workers running escalates as STALLED and says the age is only a floor (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    *"drain alive"*) echo "  ❌ a markerless box reported 'drain alive' when workers ran — an empty answer is not an all-clear: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a markerless box with 2 spawns produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if grep -q '^agesrc=synth$' "$DO/state/drain-stall" 2>/dev/null; then
+    echo "  ok …and the record carries agesrc=synth, so the status token can print the bound as '>='"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a synthesised age was not recorded as such: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ AN UNSEARCHABLE STATE DIR IS NOT A MEASURED ABSENCE (review P2, #3181). `find` on a missing or
+  # unreadable `state/` returns the SAME empty answer as "nothing landed", so the line would report a
+  # fact about this box's markers that it never read. Driven by removing the dir, so `find` cannot run.
+  # The ESCALATION must still be taken (#2929's ruling: an absence is unmeasurable in both directions
+  # after a state loss, so silence is the wrong side) — only the CLAIM narrows.
+  rm -f "$DO/state/drain-stall"
+  rmdir "$DO/state" 2>/dev/null || true
+  _out="$(_drain '' 180 2)"
+  mkdir -p "$DO/state"
+  case "$_out" in
+    *"no land marker inside"*) echo "  ❌ an UNSEARCHABLE state dir was reported as a MEASURED absence: $_out"; FAIL=$((FAIL+1)) ;;
+    *"could not be searched"*) echo "  ok an UNSEARCHABLE state dir says the absence was not measured, instead of asserting one"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unsearchable state dir produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *"DRAIN STALLED"*) echo "  ok …and the escalation is STILL taken (an unmeasurable absence must not silence it, #2929)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unsearchable state dir SILENCED the escalation: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ THE SYNTHESISED AGE MUST NOT DISAGREE WITH THE WINDOW THAT WAS SEARCHED (fresh-context review,
+  # 2026-11-02). `mp_recent_land` refuses a `0` bound (`find -mmin -0` matches nothing, so it falls
+  # back to 180x2 = 360m) and this block's copy of the knob had no such clamp: an empty answer then
+  # printed `no PR merged in 0m … the 0m window`, i.e. a claim about a window the FUNCTION searched
+  # at 360m — the age the empty answer supports is 360m. Driven with the knob at 0.
+  _out="$(_drain '' 180 2 0 0)"
+  case "$_out" in
+    *"no PR merged in 360m"*) echo "  ok MERGE_PRIORITY_MAX_AGE_MIN=0 is clamped to 180 like the reader's own bound (the age names 360m, not 0m)"; PASS=$((PASS+1)) ;;
+    *"no PR merged in 0m"*|*"the 0m window"*) echo "  ❌ MERGE_PRIORITY_MAX_AGE_MIN=0 printed an age of 0m for a window searched at 360m: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ MERGE_PRIORITY_MAX_AGE_MIN=0 produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ...and a magnitude that OVERFLOWS `_wmin * 2` makes `_wbound` NEGATIVE, so the synthesised age is
+  # printed as `no PR merged in -2m` and recorded as `age=-2` — an age the empty answer cannot support
+  # (and a nonsense a reader cannot tell from a clock fault).
+  _out="$(_drain '' 180 2 0 9223372036854775807)"
+  case "$_out" in
+    *"in -2m"*|*"in -1m"*|*"in -0m"*) echo "  ❌ an OVERFLOWED window bound printed a NEGATIVE age: $_out"; FAIL=$((FAIL+1)) ;;
+    *"no PR merged in 360m"*) echo "  ok an OVERFLOWED window bound falls back to the default instead of printing a negative age"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an overflowed window bound produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  _out="$(_drain 5 180 0 0 0)"
+  case "$_out" in
+    *"drain alive"*) echo "  ok …and a FRESH land is still 'drain alive' with the knob at 0 (polarity unchanged)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a fresh land with MERGE_PRIORITY_MAX_AGE_MIN=0 did not read 'drain alive': $_out"; FAIL=$((FAIL+1)) ;;
+  esac
   _out="$(_drain 200 180 4)"
   case "$_out" in
     *"DRAIN STALLED"*"spawned 4 worker(s)"*) echo "  ok a stall that DID spawn workers names them (a LAND problem, not an idle one)"; PASS=$((PASS+1)) ;;
@@ -1710,6 +1795,27 @@ PYEOF
     case "$_g" in
       *"drain=DEADLOCK(passes=3"*"no_land=240m"*"spawns=0"*) echo "  ok the cycle status line carries the escalation (passes, land age, spawns)"; PASS=$((PASS+1)) ;;
       *) echo "  ❌ the status token lost its evidence: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ A SYNTHESISED AGE MUST NOT RENDER AS A MEASUREMENT (review P2, #3181). `agesrc=synth` is the
+    # ONLY thing that makes the token print `>=`, and until this leg nothing drove that rendering: an
+    # inverted or misspelled guard in `drain_stall_token` left the whole suite green while the status
+    # line — the one line every reader parses — presented a window's lower BOUND as "when this box last
+    # landed". That is the exact claim `agesrc` exists to prevent. A record with NO `agesrc` field (the
+    # leg above, and every marker written before this change) must keep rendering measured.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=synth\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=>=360m"*) echo "  ok a SYNTHESISED age prints as a bound (no_land=>=360m)"; PASS=$((PASS+1)) ;;
+      *"no_land=360m"*) echo "  ❌ a synthesised age was printed as a MEASUREMENT: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ❌ the token lost the synthesised age: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # …and a MEASURED age keeps the exact `no_land=<age>m` shape every existing reader parses.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=measured\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=>="*) echo "  ❌ a MEASURED age was printed as a bound: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"no_land=360m"*) echo "  ok a MEASURED age keeps the exact no_land=<age>m shape (no '>=')"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the token lost the measured age: '$_g'"; FAIL=$((FAIL+1)) ;;
     esac
     # ⛔ THE LABEL IS THE MARKER'S OWN MEASUREMENT, NOT ITS EXISTENCE (review c-1, P1). BOTH stall arms
     # write this file: the DEADLOCK arm records `spawns=0`, and the STALLED arm records the workers it
