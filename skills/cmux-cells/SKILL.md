@@ -512,11 +512,19 @@ nothing about an unreviewed diff. Measured 2026-11-02 to show how sharp this is:
 record, **five returned `fresh`** — the batch was two PRs, not six.
 
 **⛔ `main` must be green before the batch means anything.** A batch branch is cut from `main`, so it inherits every
-red on `main`. The rail does **not** refuse those outright: it refuses a red it cannot **attribute** to `main`
+red on `main`. The rail does **not** refuse an inherited red it can **attribute** to `main`
 (`scripts/admin-merge.sh:5-9`, `:25-33`), and it deliberately does not refuse on the main head alone, because that
-"refuses the PR that REPAIRS a red main" — #1261, `:160-166`. The window that bites is the one this skill cares
-about: **when the `main` row is unmeasurable, every inherited red reads as NEW.** That is why fixing `main` is the
-higher-leverage move — one green `main` makes EVERY PR attestable, while batching makes only the handful in the batch.
+"refuses the PR that REPAIRS a red main" — #1261, `:160-166`. **But attribution is not the whole story, and a batch is
+exactly the shape that meets the rest:** **step 4.6** refuses a red base this PR has **not measured** — a base red
+whose run STARTED after the PR's own surface was produced ("THE BASE IS RED AND THIS PR HAS NOT MEASURED IT (a STALE
+surface)", `:9211-9299`, message at `:9269`) — and **step 4.7** refuses when `refs/pull/<N>/merge` lags a red base head
+(`:9302-9335`). Both fire with `main`'s row **perfectly measurable** and the red **fully attributable**, which is the
+window a lane will misread. ⛔ **The remedy for 4.6/4.7 is to RE-RUN THE RAIL — not to re-review, and not to file a
+harness defect:** the rail performs the re-measure itself (`:9278-9295`), and the same file records surface lag as
+routine ("measured on 12 of 12 open tortoise PRs"). That collides with §6's rule above — "a refusal while an
+attestation exists at the head is a **harness defect to record**" — which is true of the *attestation* refusals, **not**
+of 4.6/4.7. **Fixing `main` still is the higher-leverage move: one green `main` makes EVERY PR attestable, while
+batching makes only the handful in the batch.**
 Read `main`'s own sha (never a rollup, never `/status`): group
 check-runs by job name, take the newest attempt by **`id`**, because **a re-run ADDS a red, it does not clear one**.
 
