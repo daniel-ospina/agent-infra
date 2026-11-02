@@ -11,17 +11,30 @@ aboutObjects: agent-infra, issue-365, issue-341, issue-373, session-lifecycle, c
 
 # Session Lifecycle Contract — the behavioral cap on the marathon class (#365)
 
+> ⛔ **GEOMETRY NOTICE (2026-10-31):** the shipped clamp is **800K, trigger
+> 783,616** — owner decision, recorded in `docs/ops/cost-config-policy.md`
+> §7.1 with its `OVERRIDES:` line. This contract **no longer states the live
+> numbers**: it restated the 300K regime (#511 dial) and is kept as written so
+> its reasoning stays auditable. Where it says "300K", "283.6K" or "283,616",
+> read the shipped geometry from the code instead (`CLAMP` in
+> `scripts/check-cost-config.sh`; `--print-regime-floor` on
+> `fleet-cost-report.sh` / `watch-truncation.sh`). The behavioral content —
+> one issue per session, handoff-size budget, max-call guidance — is
+> geometry-independent and **unchanged**.
+
 The fleet's **session-shape contract**: one issue per session, a handoff-size
 budget with a dep-free check, the compaction-trigger expectation, and max-call
 guidance that is consistent with the #363 6h sub-agent cap. Delivered by issue
 #365 (indicator 1 + 2 ship now; indicator 3's escalation is **pre-committed
 with a calibration-pending threshold** — no fabricated numbers). Sibling
 policy: `docs/ops/cost-config-policy.md` (the deepseek context clamp + drift
-guard). NOTE: this contract states the LIVE clamp regime (300K, since #476's
-Compaction fix / PR #511, 2026-09-05); cost-config-policy.md and
-fleet-cost-report.sh's prose/constants are re-anchored from the pre-dial 400K
-regime to the shipped 300K clamp by issue #570 — this doc restates only the
-shipped regime.
+guard). NOTE: at the time it was written this contract restated the then-live
+300K clamp (since #476's Compaction fix / PR #511, 2026-09-05);
+cost-config-policy.md and fleet-cost-report.sh's prose/constants were
+re-anchored from the pre-dial 400K regime to the shipped 300K clamp by issue
+#570. ⛔ The clamp moved again on 2026-10-31 (300K → 800K, trigger 783,616 —
+cost-config-policy.md §7.1); the **300K / 283.6K numbers below are historical**
+and the live values must be read from the guard and the two instruments.
 
 **Driver vs amplifier (honest framing):** #341's postmortem named two
 different cost problems. The **amplifier** is cold compaction at the 1M
@@ -113,22 +126,27 @@ repo artifacts / the session JSONL / the plan doc, not in the seed.
 
 Sessions MUST expect compaction, not be surprised by it. The trigger is pi's
 `compaction.js`: compaction fires when
-`contextTokens > contextWindow − reserveTokens`. With the shipped **300K
+`contextTokens > contextWindow − reserveTokens`. With the **now-retired 300K
 clamp** (dialed 400K→300K by #476's Compaction fix / PR #511, 2026-09-05) and
 `reserveTokens 16384` (the #341 shipped compaction block), a marathon session
-**crosses the trigger at ~283,616 tokens and compacts — that is the design,
-not a failure.** Under the clamp the compaction lands in the cache-read area
+crossed the trigger at ~283,616 tokens and compacted — that was the design,
+not a failure. ⛔ **At the shipped 800K clamp (2026-10-31, §7.1) the trigger
+is 783,616**, so a 283.6K compaction is no longer normal: it means a session
+still resolves the OLD window (a session started before the move keeps the
+window it resolved at start) or a serving leg that is not clamped. Under the
+clamp the compaction lands in the cache-read area
 instead of destroying the prefix at the 1M ceiling.
 
 Expected vs drift:
 
 | Observation | Meaning |
 |---|---|
-| Compaction at `tokensBefore` in the ~283.6K+ band (at/above the 300K-clamp trigger 283,616) | Normal post-clamp marathon behavior — cache-read area retained |
-| Compaction with `tokensBefore ≥ 900K` | **Drift** — a 1M-window session exists (clamp not live). Threshold (a) of the weekly report escalates |
+| Compaction at `tokensBefore` in the ~783.6K+ band (at/above the 800K-clamp trigger 783,616) | Normal post-clamp marathon behavior — cache-read area retained |
+| A compaction at ~283.6K at the 800K geometry | **Not normal** — the session resolved the retired 300K window, or its serving leg is unclamped. Check the session's own resolved window |
+| Compaction with `tokensBefore ≥ 900K` | **Ambiguous at this geometry** — either a 1M-window session (the clamp is not live) OR a clamped session's own mid-turn overrun (900K is only 116,384 past the 783,616 trigger). Attribute by the session's RESOLVED window; threshold (a) of the weekly report escalates either way |
 | `stopReason: "length"` on a message | **Ceiling truncation** — the real truncation marker; the watch-truncation.sh leg + the pre-committed rollback trigger (#341 Task C8) |
 
-So the correct mental model: a long session WILL compact around 283.6K; that
+So the correct mental model: a long session WILL compact around 783.6K; that
 fact alone does not justify killing or restarting it. The alarms are the
 drift classes (≥900K ceiling records, `length` stops, sustained cache-share
 below the fleet-cost-report (b) floor). The lifecycle lever against
@@ -207,11 +225,12 @@ waits on data.**
 
 ## 6. Relationship to the config clamp and #363
 
-- The **clamp** (300K since the #511 dial) reduces what a marathon session
+- The **clamp** (800K since 2026-10-31; 300K during the #511 dial) reduces
+  what a marathon session
   *pays*; this contract
   reduces how *bloated* a session *gets*. They are complementary: the clamp's
   savings are measured over compacting sessions only (cost-config-policy §1,
-  re-anchored to the shipped 300K clamp at #570),
+  re-anchored to the shipped 300K clamp at #570 and to 800K by §7.1),
   and the cheapest compacting session is the one that never needed the
   context that triggered compaction — which is §1 + §2's job.
 - **#363 (6h cap) amplifies the marathon shape** — longer sanctioned runs
@@ -245,7 +264,9 @@ Task D item 10); issue #365 owns the follow-up so the deferral does not
 evaporate. Measured anchors (no new claims): marathon band 1,000–3,800 calls,
 100+ KB handoff seeds, 500–800K pre-clamp context — #341 issue body + #340
 plan (docs/plans/2026-09-05-issue-340-session-cost-guardrail-plan.md); the
-live clamp regime (300K / trigger 283,616 / keepRecentTokens 12K) — the
+live clamp regime (300K / trigger 283,616 / keepRecentTokens 12K at the time
+of writing; **800K / trigger 783,616 since 2026-10-31**, cost-config-policy
+§7.1) — the
 SHIPPED pi-bootstrap/pi-config config + guard (the #511 dial;
 cost-config-policy.md + fleet-cost-report.sh carry the 400K-era prose
 re-anchored by issue #570); the (c) 58%

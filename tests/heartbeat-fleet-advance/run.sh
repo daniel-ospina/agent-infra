@@ -322,7 +322,45 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # not a change somewhere else (the commit's only other edit is a renumbered header comment). The
 # shipped egress is untouched by it: `send` token = 6, MSG reads outside the appends = 0, block
 # depth at the last MSG= = 25 and at the send = 24 — all pinned above and all unmoved.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "16972079405712"
+# ⛔ RE-PINNED A FOURTH TIME 2026-10-31, DELIBERATELY, WITH THE DIFF CHECKED — and this one is
+# the 2026-10-19 class (a REWRITE of one matched line), not an added block. The 300K→800K context
+# clamp move (owner decision 2026-10-31, `docs/ops/cost-config-policy.md` §7.1) teaches the pane
+# probe's footer signature to accept `/800k` (pi renders `formatTokens(800000)`), keeping `/300k`
+# for historical transcripts — so `_pane_has_pi`'s `for _m in (...)` line changed, and the pattern
+# above hashes `for` lines inside heredoc PYTHON as well as shell. Verified when re-pinning, not
+# assumed: the matched-line COUNT is 169 before and after, and the diff of the matched lines is
+# exactly that one line (`for _m in ("/800k",…)`). The executable-line pin below did NOT move
+# (same one-line rewrite), and the shipped egress is untouched: the `send` token, the MSG reads
+# outside the appends, and both block depths are unmoved and pinned above.
+# ⛔ RE-PINNED A FIFTH TIME 2026-10-31, DELIBERATELY, WITH THE DIFF CHECKED — the SAME line, twice
+# in one day, and the second edit is a CORRECTION of the first: `"/1M"`/`"/2M"` are literals pi
+# NEVER DRAWS (`formatTokens`: `count < 1e6 → round(count/1000)+"k"`, else
+# `(count/1e6).toFixed(1)+"M"` → 1,000,000 and 1,048,576 both render `1.0M`), so the tuple was
+# blind to the two windows it most needed to see: the 1,000,000 rollback this PR's own procedure
+# prescribes, and the shipped `kimi-k3` window — and `qwen3.8-max` (262144) renders `/262k`, which
+# the tuple did not carry either. Verified when re-pinning, not assumed: matched-line COUNT is 169
+# before and after, the diff of the matched lines is exactly this one line, and the byte delta
+# 5720 → 5732 reconciles character for character (`1.0` twice = +4, `,"/262k"` = +8). The
+# executable-line pin below did NOT move, and the shipped egress is untouched.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "9059128745732"
+# ⛔ AND THE FOOTER SIGNATURE MUST ACCEPT THE BUDGET pi ACTUALLY DRAWS (2026-10-31).
+# `_pane_has_pi` decides whether a pane is driven by pi from a footer marker, so a marker that
+# does not match the LIVE rendering reads a settled lane as unread/idle — the failure that cost a
+# lane 95 minutes (see the function's own note). The owner decision of 2026-10-31 moved the clamp
+# 300K → 800K and pi renders `formatTokens(800000)` = `/800k`; `/300k` must stay for historical
+# transcripts. `formatTokens` is NOT integer division: 1,000,000 and 1,048,576 render `/1.0M`, so
+# `/1.0M` is the marker for the 1,000,000 window this PR's rollback procedure PRESCRIBES and for
+# the shipped `kimi-k3` window — the tuple carried the dead `/1M` form instead, i.e. the probe was
+# blind to both; `/262k` is the shipped `qwen3.8-max` window. Assert every literal is present in the
+# tuple, so deleting any one — or the pair-projecting rewrite that would pin it to one era — fails
+# here instead of at a dead lane.
+for _needle in '"/800k"' '"/300k"' '"/1.0M"' '"/262k"'; do
+  if grep -qF -- "$_needle" <<<"$(grep -F 'for _m in (' "$HB")"; then
+    pass "_pane_has_pi's footer signature accepts ${_needle}"
+  else
+    fail "_pane_has_pi's footer signature no longer accepts ${_needle} — a pane drawing that budget reads as NO PI (a settled lane reported idle)"
+  fi
+done
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.

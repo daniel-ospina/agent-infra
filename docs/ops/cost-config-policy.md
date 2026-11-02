@@ -1,5 +1,5 @@
 ---
-title: "Cost-Config Policy — deepseek context clamp @300K, drift guard (#341) & bounded retry/hang contract (#1088)"
+title: "Cost-Config Policy — deepseek context clamp @800K (was @300K), drift guard (#341) & bounded retry/hang contract (#1088)"
 type: engineering
 domain: operations
 doc_status: live
@@ -9,14 +9,25 @@ aboutSubjects: organisation-design-team
 aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, issue-1227, issue-1316, pi-config, cost-config-policy
 ---
 
-# Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)
+# Cost-Config Policy — deepseek context clamp @800K & drift guard (#341)
 
 One place that pins the agent-infra fleet's **token-cost guardrail contract**:
-what the shipped 300K deepseek context clamp means, why the guard's classes
+what the shipped 800K deepseek context clamp means, why the guard's classes
 are BLOCK-vs-WARN, and how a deliberate revert (rollback) is done. Delivered by
 issue #341 PR-A (config-as-authority); scope/plan:
 `docs/scoping/2026-08-28-issue-341-token-cost-driver-solution-diverge.md` +
 `docs/plans/2026-08-28-issue-341-session-lifecycle.md`.
+
+> ⛔ **LIVE GEOMETRY — clamp 800,000, compaction trigger 783,616**
+> (`800,000 − 16,384`), owner decision 2026-10-31, recorded in §7.1 with its
+> `OVERRIDES:` line. **Every `300K` / `283,616` / `300000` figure still quoted
+> below is HISTORY**, kept because it dates the era it describes: §1's framing,
+> §5's class narrative, §7's withdrawal record and the store/alias history all
+> predate the move. A maintainer enforcing a "300K contract" from this page
+> would be *reversing* §7.1's decision — read live numbers from the code
+> (`CLAMP` in `scripts/check-cost-config.sh`, `--print-regime-floor` on both
+> instruments), never from historical prose. Re-clamping to 300K requires
+> re-approval (§7.1).
 
 **The problem class:** sessions on a 1M context window compact at
 `contextTokens > contextWindow − reserveTokens` (pi `compaction.js:163`). At
@@ -34,22 +45,25 @@ pre-committed output+reasoning escalation with its calibration-pending
 threshold) is `docs/ops/session-lifecycle-contract.md`.
 
 **Shipped regime (the #511 dial):** this policy pins the LIVE config numbers —
-clamp **300K**, compaction trigger **~283,616** (= 300,000 − 16,384
-`reserveTokens`), `keepRecentTokens` **12000**. Dialed 400K→300K by #476's
-Compaction fix / PR #511 (commit `3211574`, 2026-09-05): pi-config/models.json
-(23 deepseek entries 400000→300000), settings.json (`keepRecentTokens`
-20000→12000), and the guard `CLAMP` 400000→300000
-(`scripts/check-cost-config.sh`). The 400K-selected-at-#341 context in §3 is
-history; the pin below is the shipped 300K regime.
+clamp **800K**, compaction trigger **783,616** (= 800,000 − 16,384
+`reserveTokens`), `keepRecentTokens` **12000**. The 800K window is the owner
+decision of 2026-10-31 (§7.1), which SUPERSEDED the 300K clamp dialed
+400K→300K by #476's Compaction fix / PR #511 (commit `3211574`, 2026-09-05:
+pi-config/models.json 23 deepseek entries 400000→300000, settings.json
+`keepRecentTokens` 20000→12000, and the guard `CLAMP` 400000→300000). The
+400K-selected-at-#341 context in §3 is history; the pin below is the shipped
+**800K** regime, and §7.1 owns any further move.
 
 ---
 
 ## 1. The conditioned savings claim (honest framing)
 
 - The clamp only changes behavior for sessions whose context crosses
-  **~283.6K** (the shipped 300K-clamp trigger, 283,616) — **marathon
+  **~783.6K** (the shipped 800K-clamp trigger, 783,616) — **marathon
   sessions**. The 85–87% cache-share figure is marathon-derived;
-  the fleet median cache-share is 30%.
+  the fleet median cache-share is 30%. (Under the retired 300K clamp this
+  figure was ~283.6K; the *shape* of the argument is unchanged, its window
+  is not.)
 - The pre-registered win is over **COMPACTING sessions**, not fleet-wide: the
   cache-read area (cacheRead $0.003/M on flash) is retained where a 1M
   ceiling would destroy it.
@@ -259,19 +273,19 @@ property; this guard is the pattern to copy, not a substitute for it.
   4h refresh may re-write the live store back to 1M, and that is **DETECTED,
   not blocked**.
 - **Guard classes** (`scripts/check-cost-config.sh`):
-  - `models.json` drift (any deepseek-served id > 300K), **or** a
+  - `models.json` drift (any deepseek-served id > 800K), **or** a
     deepseek-served entry whose `contextWindow` is absent, non-numeric, or not
-    equal to `300000` (the geometry anchor below) → **BLOCK (exit 1)**.
+    equal to `800000` (the geometry anchor below) → **BLOCK (exit 1)**.
   - `settings.json` drift (compaction block: enabled + `reserveTokens` **16384**
     (the reviewed value — asserted independently, see the `#1227` note below) +
-    a geometry check that `300000 − reserveTokens` equals the fleet regime floor
+    a geometry check that `800000 − reserveTokens` equals the fleet regime floor
     the instruments band on (READ from `scripts/fleet-cost-report.sh` and
     `scripts/watch-truncation.sh` via each instrument's `--print-regime-floor`,
     never restated in the guard), **anchored** on
-    every deepseek-served `contextWindow` EQUALLING `300000`: the models check
+    every deepseek-served `contextWindow` EQUALLING `800000`: the models check
     above is only an upper bound (`≤ CLAMP`), so without that anchor a window
     *below* the ceiling left the real trigger at `window − reserve` while the
-    geometry leg certified `300000 − reserve` — a false PASS, closed 2026-09-22
+    geometry leg certified `800000 − reserve` — a false PASS, closed 2026-09-22
     (`scripts/check-cost-config.sh`'s `check_models_window_anchor`). The anchor
     is carried on the **shipped** `models.json` only (the live file stays
     WARN-class, and its geometry is not certified); it treats an **absent or
@@ -281,7 +295,7 @@ property; this guard is the pattern to copy, not a substitute for it.
     file on a non-numeric one, leaving an empty provider map. The walk is
     **per-entry and does not model same-file inheritance**, so a `models[]` row
     that omits the window while the same provider's `modelOverrides[<id>]`
-    supplies `contextWindow: 300000` is refused too, and the message says so
+    supplies `contextWindow: 800000` is refused too, and the message says so
     rather than inventing a cause: reproducing pi's per-provider override
     lookup inside the guard risks a wrong answer, and a wrong answer here is a
     false PASS, which is worse than the false block. It also refuses
@@ -309,9 +323,9 @@ property; this guard is the pattern to copy, not a substitute for it.
     survives a coordinated move of the window and the reserve; the derived leg
     (`CLAMP − reserve ==` the floor read from the two instruments) catches a
     `CLAMP` drift or an instrument drift. Removing the independent leg made the
-    guard read green on `contextWindow 1000000 / reserveTokens 716384`, which
-    preserves the 283616 trigger while inflating the summarization cap to
-    `0.8 × 716384` — the reserve-inflation workaround the recorded owner
+    guard read green on `contextWindow 1000000 / reserveTokens 216384`, which
+    preserves the 783616 trigger while inflating the summarization cap to
+    `0.8 × 216384` — the reserve-inflation workaround the recorded owner
     directive on #1227 forbids.
   - **Fleet regime floor unreadable by execution, or inconsistent → BLOCK
     (exit 2)** (#1342): the guard asks EACH instrument for its floor by
@@ -348,8 +362,13 @@ property; this guard is the pattern to copy, not a substitute for it.
     moment pi's refresh legitimately reverts the store — the verifier P0).
     The alert path is the **weekly report** (`fleet-cost-report.sh`, PR-B) and
     the **tripwire**: any compaction record with `tokensBefore ≥ 900K`
-    (0.9 × 1M — NOT 0.9 × 300K, which sits at 270K — below the 283,616
+    (0.9 × 1M — NOT 0.9 × 800K, which sits at 720K — below the 783,616
     trigger — and would misclassify every post-clamp compaction as a ceiling).
+    ⛔ At the 800K geometry this tripwire reads as **ambiguous**, not as
+    "1M-era": 900K is only 116,384 tokens past the trigger and compaction runs
+    on `agent_end`, so a clamped session's own mid-turn overrun can reach it
+    (§7.1's stated band). Attribute such a record by its session's RESOLVED
+    window before concluding the clamp is not live.
   - **PR-A ships a detect-only store-drift signal**: the store WARN goes to
     stdout and the sync log only — there is **no escalation recipient yet**
     (no email/Slack/ticket) until PR-B lands `fleet-cost-report.sh` (weekly)
@@ -412,8 +431,9 @@ property; this guard is the pattern to copy, not a substitute for it.
 - Re-clamping after a revert requires **re-approval** (the same
   human-gated decision as the original clamp).
 - **Withdrawal record (2026-09-21).** The 2026-09-18 dial **300K→700K** (#1213,
-  PR #1226) is **withdrawn**; the shipped numbers are back at clamp **300K**,
-  trigger **~283,616**, `reserveTokens` **16384**, guard `CLAMP` **300000**.
+  PR #1226) is **withdrawn**; at that date the shipped numbers went back to
+  clamp **300K**, trigger **~283,616**, `reserveTokens` **16384**, guard
+  `CLAMP` **300000** (the geometry was moved again on 2026-10-31 — see §7.1).
   Reason: the wider window published its own sequencing — *withdraw only after
   the floor fix deploys* — and that condition is now met. The installed
   `pi-ai` carries `MIN_USABLE_MAX_TOKENS = 1024` with
@@ -437,9 +457,12 @@ property; this guard is the pattern to copy, not a substitute for it.
   one. The retired regime left **no** truncation records — 0
   `stopReason:"length"` across its session files (2026-09-18..21; measured
   2026-09-21) — so
-  `watch-truncation.sh`'s `700K-clamp-era(650-900K)` bucket is **empty**: it
-  exists so a record from that era cannot be mislabelled, not because one is
-  waiting there. What the era did leave is **compaction** records — 3
+  `watch-truncation.sh`'s retired-era bucket (formerly
+  `700K-clamp-era(650-900K)`) is **empty at this geometry**: it exists so a
+  record from that era cannot be mislabelled, not because one is waiting
+  there — and with `REGIME_TB_ERA_CEIL == REGIME_TB_DRIFT_FLOOR == 900000` the
+  arm is empty BY CONSTRUCTION, so a 660K record now buckets `small-window`.
+  What the era did leave is **compaction** records — 3
   at/above the 650,000 trigger (650,134–650,426) — which put their 2 sessions
   into `fleet-cost-report.sh`'s clamp population for one window. §7's trigger
   above is unchanged.
@@ -448,3 +471,92 @@ property; this guard is the pattern to copy, not a substitute for it.
   300,000, because cold re-ingestion at the 1M ceiling is the cost amplifier
   the clamp exists to stop, and the mechanism that once justified widening it
   (the single-token clamp death) is now closed in code.
+  ⛔ **SUPERSEDED 2026-10-31 — see the decision below. Do not "restore" 300K.**
+
+### 7.1 2026-10-31 decision — the clamp moves 300K → 800K (owner)
+
+**Decision (owner, 2026-10-31, verbatim):** the 300K window *"was done to
+reduce costs but I feel that context loss in the orchestrator is costing us
+way more"* → **800,000 tokens**, with the whole geometry following it.
+
+**What moved (one commit, per #1316):** every deepseek-served `contextWindow`
+in `models.json` 300000 → 800000 (`maxTokens` 384000 unchanged — it is an
+output cap, not the window); **the same 10 deepseek-served rows in the shipped
+`pi-bootstrap/pi-config/models-store.json`** — `deepseek:{v4-flash,
+v4-flash-vision-exp, v4-pro}`, `openrouter:deepseek/deepseek-{v4-flash,
+v4-flash-0731, v4-pro, ~deepseek-v4-flash-latest}`,
+`qwen-token-plan:deepseek-{v4-flash,v4-flash-0731,v4-pro}` — plus that file's
+`checkedAt` bump, which is what makes the migration load-bearing rather than
+cosmetic (`pi-bootstrap/setup.sh`'s `merge_models_store` does
+`merged = {**dst, **src}` and lets the NEWER `checkedAt` win per provider, so a
+bumped snapshot carrying the OLD window would REVERT those 10 entries on the
+next install); the guard's `CLAMP` 300000 → 800000; the regime
+floor in BOTH instruments 283616 → **783616**; `watch-truncation.sh`'s band
+constants (`REGIME_TB_FLOOR` → 783616, `REGIME_TB_ERA_CEIL` → 900000, moved
+together as this section requires); the two literal `/300k` footer parsers
+(`orchestrator-heartbeat.sh`, `safe-send.sh`) now also accept `/800k`, keeping
+`/300k` for historical transcripts. `settings.json`'s `reserveTokens` **stays**
+at the reviewed 16384 — the #1227 directive is untouched.
+
+⛔ **Why the shipped STORE rows are on this list (and why a guard cannot see
+them).** The store is
+the `WARN`-class defense-in-depth surface (§5) and pi's 4h refresh overwrites it,
+which is why an earlier draft of this section described its change as
+"`checkedAt` only". That description was wrong and is worth recording: the 10
+window rows moved WITH it, and they have to. `pi-bootstrap/setup.sh`'s
+`merge_models_store` does `merged = {**dst, **src}` and then keeps the provider
+block whose `checkedAt` is NEWER (`setup.sh:155-166`), so bumping the shipped
+snapshot's `checkedAt` while leaving `300000` in it makes the OLD window WIN over
+a live 800K one — every install from that snapshot reverts the geometry. Nothing
+would say so: the guard asserts only an UPPER bound (`deepseek-served $v >
+${CLAMP}` → block/warn, `check-cost-config.sh:591`), and `300000 ≤ 800000`
+prints `✅`. A future geometry move migrates these same rows, or it does not
+bump `checkedAt`.
+
+**Trigger arithmetic:** `contextTokens > contextWindow − reserveTokens`
+(pi `core/compaction/compaction.js`: `shouldCompact`), so
+**800,000 − 16,384 = 783,616**. No new knob was introduced.
+
+**Consequence the reader must also know (summarization budget).** pi caps a
+compaction summary at `floor(0.8 × reserveTokens)` output tokens
+(`core/compaction/compaction.js`), which is **13,107 tokens — unchanged**,
+because `reserveTokens` stays 16,384; `keepRecentTokens` also stays 12,000. The
+volume compressed into each summary therefore goes from ≤ ~288K tokens (300K
+window) to ≤ ~788K — a **~2.7× larger context loss per summary**. This is the
+one mechanism by which the change can lose context, and it is an **accepted
+trade**, not an oversight: it is bought for the wider window. Making the
+summarizer budget scale with the window is a SEPARATE decision — the `#1227`
+directive forbids moving `reserveTokens` as a workaround, so it needs its own
+ruling (this `OVERRIDES:` covers the window, not the reserve).
+
+**Why this does not reverse §7's withdrawal on its own terms.** The 2026-09-21
+withdrawal rested on a *cost* argument (≈+20% recurring fleet spend) against a
+*hazard* that code now covers (`MIN_USABLE_MAX_TOKENS = 1024`, pi-patch
+#1214(b)). It did not establish 300K as the right window; it declined to pay
+for a hazard fix with tokens. This decision re-prices the same trade from the
+other side — context loss in the orchestrator outweighs the spend — which is
+the owner's call to make, made explicitly, with the number stated.
+
+**Consequence the reader must know (mid-turn band).** Compaction is checked on
+`agent_end`, so a long multi-tool turn can pass the trigger before it is seen.
+Under the 300K clamp that band was ~283.6K–300K; it is now **~783.6K–800K**,
+and a session can overrun past 800K toward the provider's real 1,000,000
+before the provider rejects it. `watch-truncation.sh` fires on the FIRST
+`stopReason:"length"` record — the band constants above describe the NEW
+regime, so a firing record in 783.6K–900K is this geometry's own overrun,
+while records below the floor now also contain the retired eras (400K-era
+383–406K, 700K-era 650–700K) and are not evidence about this clamp. Records
+**at/above the 900K drift floor are AMBIGUOUS**, not "1M-era": 900K is only
+116,384 tokens past this trigger, so a clamped session's own overrun can land
+there — attribute such a record by its session's RESOLVED window.
+
+**Sessions mid-flight:** a running `pi` session keeps the context window it
+resolved at start; the new window applies when the session restarts. Nothing
+live is retroactively resized, and nothing must be killed for this to hold.
+
+**OVERRIDES:** the 300K §7 clamp and its own `OVERRIDES` line (window clamped
+at 300,000 against the vendor's 1,000,000, on the cold-re-ingestion cost
+argument) — replaced by the owner's 2026-10-31 ruling that orchestrator
+context loss costs more than the re-ingestion spend; 800,000 remains inside
+the provider's real 1,000,000 window. Re-clamping to 300K again requires
+re-approval, exactly as this section already required.

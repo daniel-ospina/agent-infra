@@ -68,34 +68,33 @@ assert_eq "$RC" "0" "clean fixture exits 0"
 assert_contains "$OUT" "## ✅ CLEAN" "clean fixture reports no trigger"
 assert_contains "$OUT" "(window-ceiling truncation) records: 0" "clean fixture has no length records"
 
-# LENGTH: 1 session today with a genuine ceiling length stop at 290K ctx —
-# in the shipped 300K-clamp trigger band (at/above 283,616), so it MUST classify
-# as a 300K-clamp session (not fall through to small-window → exit 1)
-D="$T/length"; mk_sess "$D" 9 0 50000 290000 1
+# LENGTH: 1 session today with a genuine ceiling length stop at 790K ctx —
+# in the shipped 800K-clamp trigger band (at/above 783,616), so it MUST classify
+# as an 800K-clamp session (not fall through to small-window → exit 1)
+D="$T/length"; mk_sess "$D" 9 0 50000 790000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
 assert_eq "$RC" "1" "length-record fixture exits 1"
 assert_contains "$OUT" "❌ TRIGGERED" "length fixture prints TRIGGERED"
 assert_contains "$OUT" "pre-committed rollback" "length fixture prints rollback procedure"
-assert_contains "$OUT" "'300K-clamp(283.6-650K)': 1" "290K length record buckets as 300K-clamp-regime, not small-window"
+assert_contains "$OUT" "'800K-clamp(783.6-900K)': 1" "790K length record buckets as 800K-clamp-regime, not small-window"
 
-# LENGTH-LEGACY: a 660K-ceiling length stop from the WITHDRAWN (#1213/#1226)
-# 700K regime must bucket as its own legacy era — NOT small-window (the triage
-# note tells the owner to exclude those) and NOT the restored 300K primary
-# band (it is not current-geometry evidence). Mirror of the 300K-era legacy
-# test #1226 added when the geometry pointed the other way.
-D="$T/length-legacy"; mk_sess "$D" 9 0 20000 660000 1
+# LENGTH-BELOW-FLOOR: at the 800K geometry the RETIRED eras live BELOW the
+# floor (400K-era 383–406K, withdrawn 700K-era 650–700K), so a 660K record is
+# small-window — NOT current-geometry evidence. This test pins that inversion:
+# the retired era did not become current evidence when the floor moved past it,
+# and the triage note says so explicitly rather than implying "200K only".
+D="$T/length-below"; mk_sess "$D" 9 0 20000 660000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
-assert_contains "$OUT" "'700K-clamp-era(650-900K)': 1" "660K length record buckets as the withdrawn 700K era, not small-window"
+assert_contains "$OUT" "small-window(<6" "660K retired-era record is below the 800K floor (small-window, not current)"
 
-# LENGTH-LEGACY-EDGE: the legacy band's UPPER edge must be pinned too — a
-# record in the top of the band (>= 700K, still below the 1M-drift floor) must
-# bucket as the withdrawn era and must NOT fall to small-window. Without this
-# fixture the band's upper bound is unpinned: narrowing the condition to
-# `< 700000` passes the suite unnoticed, which is the very label/condition gap
-# the labels exist to close.
-D="$T/length-legacy-edge"; mk_sess "$D" 9 0 20000 890000 1
+# LENGTH-BAND-EDGE: the current band's UPPER edge must be pinned too — a
+# record at 890K (below the 1M-drift floor) must bucket as the CURRENT regime
+# and must NOT fall to 1M-era. Without this fixture the band's upper bound is
+# unpinned: narrowing the condition passes the suite unnoticed, which is the
+# very label/condition gap the labels exist to close.
+D="$T/length-edge"; mk_sess "$D" 9 0 20000 890000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
-assert_contains "$OUT" "'700K-clamp-era(650-900K)': 1" "890K length record stays in the withdrawn era's band, not small-window"
+assert_contains "$OUT" "'800K-clamp(783.6-900K)': 1" "890K length record stays in the current regime's band, not 1M-era"
 
 # LEG-B: 3 consecutive days each exceeding 2× re-read baseline
 #   reread/session = msg_input + comp_input; want > 3,938,682 → use 4.5M each
@@ -111,7 +110,7 @@ assert_eq "$RC" "0" "non-sustained over-baseline does not trigger"
 
 # --dry-run with a length fixture: still exit 1 (this IS the escalation);
 # the driver passes --dry-run through only to suppress issue filing upstream.
-D="$T/dryrun"; mk_sess "$D" 9 0 50000 290000 1
+D="$T/dryrun"; mk_sess "$D" 9 0 50000 790000 1
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 --dry-run 2>&1)" || RC=$?
 assert_eq "$RC" "1" "--dry-run still exits 1 on a genuine trigger"
 assert_contains "$OUT" "pre-committed rollback" "--dry-run prints the procedure"
@@ -140,6 +139,19 @@ PY
 RC=0; OUT="$(PI_SESSIONS_DIR="$D/sessions" bash "$WATCH" --days 2 2>&1)" || RC=$?
 assert_eq "$RC" "1" "no-compaction 1M-era length stop exits 1"
 assert_contains "$OUT" "'1M-era(≥900K)': 1" "triage bucket uses session ceiling (1M-era, not small-window)"
+# ⛔ THE ≥900K BUCKET IS AMBIGUOUS AT THIS GEOMETRY, and the note must say so.
+# The drift floor is 116,384 tokens past the 783,616 trigger and compaction runs
+# on agent_end, so a CLAMPED session's own mid-turn overrun can land here too
+# (policy §7.1). The old note told the owner such a record is "NOT evidence
+# about the 800K clamp" — an exclusion in the exact direction the pre-committed
+# rollback decision reads, and a confident claim the band cannot support.
+assert_contains "$OUT" "AMBIGUOUS" "≥900K triage note names the band as ambiguous, not 1M-era evidence"
+assert_contains "$OUT" "RESOLVED window" "≥900K triage note tells the owner to attribute by the session's own window"
+if grep -qF "NOT evidence about the 800K clamp" <<<"$OUT"; then
+  bad "≥900K triage note still excludes the band as 'NOT evidence about the 800K clamp' (a clamped overrun can reach it)"
+else
+  ok "≥900K triage note no longer excludes the band outright"
+fi
 
 # DATA-ABSENCE GATE: an unreadable session in the window must NOT vanish into
 # a CLEAN pass — rc=2, names the failures.

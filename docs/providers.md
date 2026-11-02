@@ -454,7 +454,9 @@ window validates the burn economics. Per-dispatch measurement is
 
 Venice is registered flash-ONLY in `pi-bootstrap/pi-config/models.json`
 (`baseUrl https://api.venice.ai/api/v1`, `$VENICE_API_KEY`,
-cost 0.14/0.28 input/output + 0.03 cacheRead, contextWindow 300000). The
+cost 0.14/0.28 input/output + 0.03 cacheRead, contextWindow 800000 — the
+shipped clamp, moved 300000→800000 by the owner decision of 2026-10-31,
+`docs/ops/cost-config-policy.md` §7.1). The
 **#284 carve-out**: `COLD_CLASS_PROVIDER` is an operator override that applies
 only to default-leg (flash) cache-cold reviewer/eval dispatches an operator has
 explicitly opted in.

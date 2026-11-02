@@ -651,7 +651,9 @@ except Exception:
 # RELAUNCH" for 95 minutes -- while its pane was live and running the Slack bridge. THE
 # PRESCRIBED REMEDY IS DESTRUCTIVE (respawn-pane REPLACES the pane command), so a
 # record-only read can kill a live lane. The pane settles it: a pi TUI always draws a
-# footer carrying the context budget (`/300k`) and the model (`-flash • high`), and it
+# footer carrying the context budget (`/800k` at the shipped 800K clamp — it was `/300k`
+# before the 2026-10-31 owner move, and historical transcripts still render that, so BOTH
+# are accepted below) and the model (`-flash • high`), and it
 # draws it even when other output interleaves -- the DMeer footer was present, glued to the
 # end of a bridge line. Confirm against the pane BEFORE condemning a lane.
 def _pane_has_pi(uuid):
@@ -672,7 +674,16 @@ def _pane_has_pi(uuid):
     if not _p.strip():
         return None
     _p=_p.replace("\x1b","")
-    for _m in ("/300k","/1M","/2M","(auto)","\u2022 high","\u2022 medium","\u2022 low"):
+    # ⛔ THE LITERALS MUST BE WHAT pi ACTUALLY DRAWS. The footer renders the budget through
+    # `formatTokens`: `count < 1e6 -> Math.round(count/1000)+"k"`, else
+    # `(count/1e6).toFixed(1)+"M"`. So 800000 -> `800k` (the shipped clamp), 1,000,000 ->
+    # `1.0M` and 1048576 -> `1.0M` -- the retired `"/1M"`/`"/2M"` forms appear in NO footer,
+    # so they were dead. `1.0M` is not cosmetic: it is the window this fleet prescribes for
+    # its OWN rollback (800000 -> 1000000, docs/ops/cost-config-policy.md section 7.1 and the
+    # printed procedure in watch-truncation.sh) and the shipped `kimi-k3` window, so without
+    # it a settled lane running either reads as NO pi -- the 95-minute mis-read above.
+    # `/262k` is the other shipped non-deepseek window (`qwen3.8-max`, 262144).
+    for _m in ("/800k","/300k","/1.0M","/2.0M","/262k","(auto)","\u2022 high","\u2022 medium","\u2022 low"):
         if _m in _p:
             return True
     return False
