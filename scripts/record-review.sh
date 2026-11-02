@@ -1185,8 +1185,14 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
     if [ "$pcount" != "2" ]; then
       evil_shas="$evil_shas
 $m"
-      evil="merge ${m:0:12} has ${pcount:-unreadable} parent(s) — an octopus or an unreadable parent list cannot be shown to be a clean merge"
-      break
+      # ⛔ NO `break` HERE (or below): the loop must examine EVERY merge, because the
+      # anchor needs all non-clean merges and `rev-list` is topology-first, not
+      # date-ordered — a chained pair whose committer dates are not monotone would
+      # otherwise capture the OLDER child and never look at the parent that carries
+      # the later hand-resolution, so a cover predating that resolution would verify.
+      # `evil` holds only the FIRST message (the stderr text names one merge).
+      : "${evil:=merge ${m:0:12} has ${pcount:-unreadable} parent(s) — an octopus or an unreadable parent list cannot be shown to be a clean merge}"
+      continue
     fi
     # ⛔ FIELD 1 IS THE COMMIT ITSELF (rev-list --parents prints `<commit> <p1> <p2>`),
     # so the parents are fields 2 and 3. Reading field 1 as a parent merged the merge
@@ -1202,12 +1208,11 @@ $m"
     want="${want%%$'\n'*}"
     actual="$(delta_git "$root" rev-parse "$m^{tree}" 2>/dev/null || true)"
     if [ -z "$want" ] || [ -z "$actual" ] || [ "$want" != "$actual" ]; then
-      # The sha is RECORDED before the break: the anchor set needs EVERY non-clean
-      # merge, and `evil` keeps only the first message for the stderr text.
+      # No `break`: see the note in the parent-count arm above. The sha is RECORDED
+      # for EVERY non-clean merge; `evil` keeps only the first message for stderr.
       evil_shas="$evil_shas
 $m"
-      evil="merge ${m:0:12} is NOT a clean merge of its parents (its tree is not what merging ${p1:0:12}… and ${p2:0:12}… produces) — a conflict resolution lives only in the merge commit and no reviewer has seen it"
-      break
+      : "${evil:=merge ${m:0:12} is NOT a clean merge of its parents (its tree is not what merging ${p1:0:12}… and ${p2:0:12}… produces) — a conflict resolution lives only in the merge commit and no reviewer has seen it}"
     fi
   done <<< "$merges_in_range"
   if [ -n "$authored" ] || [ -n "$evil" ]; then
@@ -1534,6 +1539,17 @@ esac
 # unknown option; no record written).
 if [ "$VERDICT" = "clean-low" ] && [ "$FORCE_STALE" -eq 1 ]; then
   echo "record-review.sh: --force-stale is incompatible with the clean-low verdict — clean-low certifies the content shape of a specific revision, and the sha a stale record names is not the revision any consumer will read. Re-run at the current head without --force-stale." >&2
+  exit 2
+fi
+# ── delta evidence × --force-stale is the same contradiction for the SAME reason ──
+# A delta CLAIMS its upper bound is the PR's current head (that is what makes the
+# range meaningful: "a reviewer reviewed exactly these commits and nothing else
+# changed"), so recording one against a sha the PR no longer points at mints a
+# record whose own content is false — the shape this file already refuses for
+# clean-low above. --force-stale also clears the diff marker, so nothing downstream
+# re-checks the claim: the falsehood would sit in the audit trail indefinitely.
+if [ "${EVIDENCE#delta:}" != "$EVIDENCE" ] && [ "$FORCE_STALE" -eq 1 ]; then
+  echo "record-review.sh: --force-stale is incompatible with delta evidence — a delta's upper bound is the PR's CURRENT head by definition, so a stale record would assert a range ending at the head being merged when it does not. Re-record at the live head." >&2
   exit 2
 fi
 # ── delta evidence × a non-clean verdict is an argument-level contradiction ──
