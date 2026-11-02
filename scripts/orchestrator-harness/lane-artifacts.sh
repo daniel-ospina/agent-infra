@@ -203,8 +203,17 @@ scan() {
       # of `/root/zz` — a DIFFERENT file — which was then pulled, written as the artifact and counted at
       # exit 0, while the matched artifact was never collected and no warning was emitted. With the path
       # last, `read -r sz mt p` keeps a TAB inside the path (only the trailing field absorbs the
-      # remainder) and the numeric size guard is then sound for real. A NEWLINE in a filename still
-      # splits the record, and there the first field is the mangled tail — non-numeric, so it abstains.
+      # remainder) and the numeric size guard is then sound for real.
+      # ⛔ A NEWLINE IN A FILENAME IS ONLY PARTLY CAUGHT BY THE SIZE GUARD, and the claim this comment
+      # used to make — "the first field is the mangled tail, non-numeric, so it abstains" — is FALSE for
+      # a name that ENDS in a newline. There the continuation line of the record is EMPTY, so the head row
+      # (`<size>\t<mtime>\t<path-without-its-final-newline>`) parses cleanly as a measurement of a
+      # DIFFERENT file: measured with `has` = decoy and `has<newline>` = the real artifact, the decoy was
+      # pulled twice, the real artifact was never collected, and the run exited 0 (T48). An empty tail
+      # line cannot be seen by the caller either, because a command substitution strips trailing newlines.
+      # The count on the `__OK__` line below is what closes it: `wc -l` counts the SPLIT lines, so a
+      # sentinel count that disagrees with the rows the caller could parse is the signature of a record
+      # that split — and the caller ABSTAINS instead of grading a partial map.
       # DOUBLE QUOTES around the exclusion, never single quotes (see the note above the scratch).
       find "$R" -maxdepth 1 -type f ! -name ".lane-artifacts.*" -name "$NAME" ${2:+-mmin -$2} \
         -printf "%s\t%TY-%Tm-%TdT%TH:%TM:%TS\t%p\n" > "$T" 2>/dev/null
@@ -239,7 +248,12 @@ scan() {
     if ! head -n '"$((ROW_CAP + 1))"' "$T" > "$T.rows" 2>/dev/null; then
       rm -f "$T" "$T.rows"; echo "__NOK__ read-failed"; exit 0
     fi
-    echo __OK__
+    # ⛔ THE ROW COUNT TRAVELS WITH THE SENTINEL — it is a CROSS-CHECK the caller cannot derive for
+    # itself, and it is the only thing that catches a filename ending in a newline (see the long note on
+    # the `-printf` above). `wc -l` counts newline-SPLIT lines, i.e. exactly what the caller would see if
+    # nothing were lost; a record whose path contains a newline contributes MORE lines than the caller
+    # can recover rows from, and the caller abstains on the disagreement.
+    echo "__OK__ $(wc -l < "$T.rows" | tr -d " ")"
     cat "$T.rows"
     rm -f "$T" "$T.rows"
   ' lane-artifacts "$pat" "$since_min" "$ATIF_ROOT" "$exact" </dev/null 2>/dev/null
@@ -338,14 +352,32 @@ emit_box() {
     echo "── $label  UNMEASURED(${first#__NOK__ })"
     return 1
   fi
-  if [ "$first" != "__OK__" ]; then
-    echo "── $label  UNMEASURED(exec did not answer — says nothing about whether the file exists)"
-    return 1
-  fi
+  # ⛔ THE SENTINEL CARRIES THE ROW COUNT IT SENT (`__OK__ <n>`). A bare `__OK__` is no longer accepted:
+  # the count is the only evidence that no record SPLIT between the box and here, and a sentinel without
+  # it would silently degrade the cross-check below to "not run" — the fail-open shape this file forbids.
+  case "$first" in
+    "__OK__ "*) remote_rows="${first#__OK__ }" ;;
+    *) echo "── $label  UNMEASURED(exec did not answer — says nothing about whether the file exists)"
+       return 1 ;;
+  esac
+  case "$remote_rows" in
+    ''|*[!0-9]*) echo "── $label  UNMEASURED(sentinel carried an unparseable row count '${remote_rows}' — the box's answer cannot be graded)"
+                 return 1 ;;
+  esac
   R_REACHED=1
   res="$(printf '%s\n' "$raw" | tail -n +2 | grep -v '^$')"
+  rows=0
+  [ -n "$res" ] && rows="$(printf '%s\n' "$res" | wc -l | tr -d ' ')"
+  # ⛔ THE ROW COUNT MUST MATCH THE SENTINEL (T48). A path ENDING in a newline emits its record plus an
+  # EMPTY continuation line, which a command substitution strips and `grep -v '^$'` removes — so the head
+  # row was accepted as a measurement of a DIFFERENT file, the decoy was pulled twice, the real artifact
+  # was never collected, and the run exited 0. The box still knows how many lines it sent, so a count
+  # mismatch is a listing that is NOT a reliable map of what is on the box: abstain, never grade it.
+  if [ "$rows" -ne "$remote_rows" ]; then
+    echo "── $label  UNMEASURED(scan sent ${remote_rows} row line(s), ${rows} could be parsed — a record SPLIT, most likely a NEWLINE in a filename, so the listing is NOT a reliable map of what is on the box)"
+    R_REACHED=0; R_UNPARSE=$((R_UNPARSE + 1)); return 1
+  fi
   [ -n "$res" ] || return 0
-  rows="$(printf '%s\n' "$res" | wc -l | tr -d ' ')"
   if [ "$rows" -gt "$ROW_CAP" ]; then
     R_TRUNC=$((R_TRUNC + 1))
     res="$(printf '%s\n' "$res" | head -n "$ROW_CAP")"
@@ -458,14 +490,23 @@ commit_index() {
 # promote_stage — move this run's staged artifacts onto their final names. Called ONLY from the
 # exit-0 path, after every requested box answered and every pull succeeded.
 promote_stage() {
-  local f rc=0
+  local f base rc=0
   [ -n "${OUT_STAGE:-}" ] || return 0
+  PROMOTED_N=0; PROMOTED_LIST=""
   for f in "$OUT_STAGE"/*; do
     [ -e "$f" ] || continue
+    base="$(basename "$f")"
     if ! mv -f "$f" "$outdir"/; then
-      echo "lane-artifacts: could not promote $(basename "$f") into '$outdir'" >&2
+      echo "lane-artifacts: could not promote $base into '$outdir'" >&2
       rc=1
+      # ⛔ STOP AT THE FIRST FAILURE. The loop used to continue, so every later `mv` OVERWROTE the previous
+      # collection's copy at its own destination name while `commit_index` was never reached — the index
+      # then described bytes that were no longer in the file, and the operator was told nothing had been
+      # replaced. Stopping bounds what a failed promotion can touch; PROMOTED_* is what makes the report
+      # below truthful instead of a blanket claim.
+      break
     fi
+    PROMOTED_N=$((PROMOTED_N + 1)); PROMOTED_LIST="${PROMOTED_LIST:+$PROMOTED_LIST, }$base"
   done
   # ⛔ A STAGE THAT WAS NOT FULLY PROMOTED IS *NOT* DELETED. It used to be: the `mv` only warned, the
   # `rm -rf` below ran anyway, `commit_index` committed an index naming the file, and the run exited 0 —
@@ -499,11 +540,25 @@ finish() {
     if [ "$rc" -eq 0 ] && [ "${R_PULLFAIL:-0}" -eq 0 ] && [ "${MISSING:-0}" -eq 0 ]; then
       if promote_stage; then
         commit_index
+        # ⛔ ONE VOICE FOR WHAT THE DIRECTORY NOW HOLDS. The run summary used to assert "N pulled into
+        # `$outdir`" on the same predicate this branch uses, and `finish`'s failure branch then said the
+        # opposite ("was NOT replaced") — two statements about one directory, both printed, disagreeing
+        # (T41). The placement claim belongs here, where the placement actually happened.
+        echo "ℹ '$outdir' now holds this run's collection (${R_PULLED:-0} file(s) pulled)"
       else
         # Keep the staged bytes (the only copy) and do not commit an index naming files that are not there.
         rm -f "$IDX_NEW"
         KEEP_STAGE=1
-        echo "ℹ '$outdir' was NOT replaced — promotion failed, so the collected bytes are still staged in '$OUT_STAGE'" >&2
+        if [ "${PROMOTED_N:-0}" -gt 0 ]; then
+          # ⛔ THE MESSAGE MUST MATCH THE DIRECTORY, and it did not: `promote_stage` moves each file onto
+          # its final name as it goes, so a failure on the SECOND file leaves the FIRST already installed —
+          # overwriting the previous collection's copy — while this line claimed nothing had been replaced.
+          # Measured with two boxes and a directory occupying the second destination name: the first
+          # artifact held the NEW bytes and the published index still recorded the OLD size and path for it.
+          echo "ℹ '$outdir' was PARTIALLY replaced — ${PROMOTED_N} file(s) landed (${PROMOTED_LIST}) before the promotion failed, and the index was NOT updated, so it still describes the PREVIOUS collection. The remaining collected bytes are still staged in '$OUT_STAGE'" >&2
+        else
+          echo "ℹ '$outdir' was NOT replaced — promotion failed, so the collected bytes are still staged in '$OUT_STAGE'" >&2
+        fi
         exit 5
       fi
     else
@@ -637,13 +692,13 @@ case "$verb" in
     fi
     # Partial coverage is disclosed on the SUCCESS path too: exit 0 with 1 of 3 boxes silent reads as
     # a complete result to any caller keying on the exit status.
-    # ⛔ "PULLED INTO `$outdir`" IS ONLY TRUE WHEN `finish` WILL INSTALL THEM. `finish` promotes only on a
-    # COMPLETE run; this line used to promise `$outdir` had been written on a run that then DISCARDED the
-    # stage, so a caller reading the summary plus exit 0 looked for the artifact at a path that was empty.
-    # Say what actually happened, on the same predicate `finish` uses.
+    # ⛔ THIS LINE NEVER CLAIMS PLACEMENT. `finish` is the single place that states what `$outdir` now
+    # holds, because only `finish` knows whether promotion succeeded; a claim made here was printed on a
+    # run that then discarded the stage (an empty directory at exit 0) and again on a run whose promotion
+    # half-failed. Say how many bytes arrived; let the installer say where they are.
     if [ -n "$outdir" ]; then
       if [ "${R_PULLFAIL:-0}" -eq 0 ] && [ "$MISSING" -eq 0 ]; then
-        echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es); $R_PULLED pulled into $outdir"
+        echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es); $R_PULLED pulled"
       else
         echo "== $R_HITS file(s) collected from $REACHED of $((NBOX + NUNRESOLVED)) requested box(es); $R_PULLED pulled and NOT installed — '$outdir' was NOT written (run incomplete)"
       fi
@@ -669,12 +724,27 @@ case "$verb" in
       if [ "${first:0:7}" = "__NOK__" ]; then
         echo "   UNMEASURED($what: ${first#__NOK__ })"; return 1
       fi
-      if [ "$first" != "__OK__" ]; then
-        # ⛔ The inventory verb must not turn a dead box into an empty, healthy-looking list (exit 0) —
-        # indistinguishable from "nothing in /tmp" — in the verb used to DISCOVER what exists.
-        echo "   UNMEASURED($what: exec did not answer)"; return 1
-      fi
+      case "$first" in
+        "__OK__ "*) _rr="${first#__OK__ }" ;;
+        *) # ⛔ The inventory verb must not turn a dead box into an empty, healthy-looking list (exit 0) —
+           # indistinguishable from "nothing in /tmp" — in the verb used to DISCOVER what exists. The count
+           # on the sentinel is required for the same reason (see the cross-check below).
+           echo "   UNMEASURED($what: exec did not answer)"; return 1 ;;
+      esac
+      case "$_rr" in
+        ''|*[!0-9]*) echo "   UNMEASURED($what: sentinel carried an unparseable row count '$_rr')"; return 1 ;;
+      esac
       rows="$(printf '%s\n' "$raw" | tail -n +2 | grep -v '^$')"
+      # ⛔ THE SAME SENTINEL-COUNT CROSS-CHECK `emit_box` MAKES, because the inventory verb has the same
+      # hole: a path ending in a newline loses its continuation line to the command substitution, so the
+      # head row reads as a measurement of a DIFFERENT, shorter path and the inventory would present a map
+      # it cannot certify. `_rr` is the count the box said it sent; a mismatch abstains.
+      _parsed=0
+      [ -n "$rows" ] && _parsed="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
+      if [ "$_parsed" -ne "$_rr" ]; then
+        echo "   UNMEASURED($what: sent ${_rr} row line(s), ${_parsed} parsed — a record SPLIT (newline in a filename), so this inventory is NOT complete)"
+        return 1
+      fi
       [ -n "$rows" ] || return 0
       n="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
       # ⛔ A ROW-CAPPED SCAN IS NOT A TOTAL. `scan` stops at ROW_CAP, so `n` was at most ROW_CAP+1 while this

@@ -123,13 +123,13 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   # splits the record, and the tail line's first field is then a fragment of the NAME — non-numeric, so
   # the row must ABSTAIN rather than be carried into a pull as a bogus path.
   if [ -n "${STUB_BAD_SIZE:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
-    printf '__OK__\n5\t2026-01-01T00:00:00\t%s/has\ntab.md\n' "$root"; exit 0
+    printf '__OK__ 2\n5\t2026-01-01T00:00:00\t%s/has\ntab.md\n' "$root"; exit 0
   fi
   # STUB_TAB_NAME: a TAB inside a real filename, with the size/metadata intact. The path is the LAST
   # field, so `read -r sz mt p` must keep the whole name — the earlier order accepted this row as a
   # valid measurement of the name's HEAD and pulled a different file, at exit 0.
   if [ -n "${STUB_TAB_NAME:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
-    printf '__OK__\n9\t2026-01-01T00:00:00\t%s/has\ttab.md\n' "$root"; exit 0
+    printf '__OK__ 1\n9\t2026-01-01T00:00:00\t%s/has\ttab.md\n' "$root"; exit 0
   fi
   # STUB_WRAP: model the PRODUCTION encoder. This host's `base64` is FreeBSD and does NOT wrap, so a
   # wrap-guard test cannot fire here — the fix would look right and be untestable. A shim on PATH wraps
@@ -165,7 +165,7 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   # Rows are `size<TAB>mtime<TAB>path` — the SAME order the real remote emits (a stub with a different
   # order would test a parser that does not exist in production).
   if [ -n "${STUB_BULK:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
-    echo __OK__
+    echo '__OK__ 240'
     i=0; while [ $i -lt 240 ]; do printf '1\t2026-01-01T00:00:00\t%s/bulk-%s.md\n' "$STUB_BULK" "$i"; i=$((i+1)); done
     exit 0
   fi
@@ -785,6 +785,19 @@ eq "T41 exit 5 (not 0)" "$rc" "5"
 grep -q 'could not promote' "$Q/t41.txt" && ok "T41 names the promotion failure" || bad "T41 silent failure" "$(tail -4 "$Q/t41.txt")"
 grep -q 'were NOT measured\|was NOT replaced' "$Q/t41.txt" && ok "T41 does not claim the run succeeded" \
   || bad "T41 claimed success after a failed promotion" "$(tail -4 "$Q/t41.txt")"
+# ⛔ AND IT MUST NOT CLAIM THE COLLECTION EITHER. The summary used to assert "N pulled into $outdir" on
+# this very path (the predicate it keyed on was true), while `finish` said the opposite — two statements
+# about one directory, both printed, disagreeing. A reviewer measured the pair and the suite stayed green,
+# because the only guard was the `was NOT replaced` grep above, which `finish`'s own line satisfies.
+grep -q 'pulled into' "$Q/t41.txt" \
+  && bad "T41 still claims files were 'pulled into' a directory it refused to install them in" "$(grep 'pulled' "$Q/t41.txt")" \
+  || ok "T41 makes NO placement claim on the summary line"
+grep -q "now holds this run" "$Q/t41.txt" \
+  && bad "T41 claims the directory now holds this run's collection" "$(grep 'holds' "$Q/t41.txt")" \
+  || ok "T41 does not claim the collection was installed"
+grep -q 'PARTIALLY' "$Q/t41.txt" \
+  && bad "T41 says PARTIALLY when NOTHING landed" "$(grep 'PARTIALLY' "$Q/t41.txt")" \
+  || ok "T41 says NOT replaced when nothing landed (the truthful arm)"
 [ -f "$out/.lane-artifacts-index" ] && bad "T41 committed an index for files it did not promote" \
   || ok "T41 committed no index"
 staged="$(find "$out" -maxdepth 2 -name 'pi-cell-1-ci-cause.md' -type f 2>/dev/null | head -1)"
@@ -793,6 +806,52 @@ staged="$(find "$out" -maxdepth 2 -name 'pi-cell-1-ci-cause.md' -type f 2>/dev/n
 # the trap must not reap the stage we deliberately kept
 [ -n "$staged" ] && [ -d "$(dirname "$staged")" ] && ok "T41 the kept stage survives the exit trap" \
   || bad "T41 the exit trap reaped the stage it was told to keep" "$(ls -aR "$out")"
+
+echo "T41b — a PARTIALLY promoted run says so: it must not claim the directory was untouched"
+# `promote_stage` moves each file onto its final name as it goes. A failure on the SECOND file leaves the
+# FIRST already installed — overwriting the previous collection's copy — while `finish` said "was NOT
+# replaced". Measured by review: the first artifact held the NEW bytes while the published index still
+# recorded the OLD size and path for it. This arm pins the truthful message AND the bounded damage.
+b41b="$Q/box-41b"; rm -rf "$b41b"; mkdir -p "$b41b"
+printf 'OLD-BODY-one' > "$b41b/ci-cause-2.md"
+printf 'OLD-BODY-two' > "$b41b/ci-cause.md"
+out="$Q/out41b"; mkdir -p "$out"
+STUB_BOXES="pi-cell-1=$b41b"; export STUB_BOXES
+run collect ci-cause --out "$out" --box pi-cell-1 > /dev/null 2>&1
+rc=$?
+eq "T41b run 1 (the previous collection) exit 0" "$rc" "0"
+idx_before="$(cat "$out/.lane-artifacts-index" 2>/dev/null)"
+# The box's bytes CHANGE, and a DIRECTORY occupies the destination of the file that promotes SECOND
+# (`...-ci-cause-2.md` sorts before `...-ci-cause.md`), so exactly one file lands before the failure.
+printf 'NEW-BODY-one' > "$b41b/ci-cause-2.md"
+printf 'NEW-BODY-two' > "$b41b/ci-cause.md"
+rm -f "$out/pi-cell-1-ci-cause.md"; mkdir -p "$out/pi-cell-1-ci-cause.md"
+run collect ci-cause --out "$out" --box pi-cell-1 > "$Q/t41b.txt" 2>&1
+rc=$?
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T41b exit 5 (not 0)" "$rc" "5"
+grep -q 'could not promote pi-cell-1-ci-cause.md' "$Q/t41b.txt" \
+  && ok "T41b names the file it could not promote" || bad "T41b did not name the failure" "$(tail -5 "$Q/t41b.txt")"
+grep -q 'was PARTIALLY replaced' "$Q/t41b.txt" \
+  && ok "T41b says PARTIALLY replaced — the message matches the directory" \
+  || bad "T41b said the directory was untouched after installing a file into it" "$(tail -5 "$Q/t41b.txt")"
+grep -q 'was NOT replaced' "$Q/t41b.txt" \
+  && bad "T41b still claims 'was NOT replaced' while a file had already landed" "$(grep 'NOT replaced' "$Q/t41b.txt")" \
+  || ok "T41b does not claim the directory was untouched"
+grep -q 'the index was NOT updated' "$Q/t41b.txt" \
+  && ok "T41b discloses that the index still describes the previous collection" \
+  || bad "T41b left a stale index undisclosed" "$(tail -5 "$Q/t41b.txt")"
+eq "T41b the landed file holds THIS run's bytes" "$(cat "$out/pi-cell-1-ci-cause-2.md" 2>/dev/null)" "NEW-BODY-one"
+eq "T41b the index was NOT updated (it still describes the previous collection)" \
+  "$(cat "$out/.lane-artifacts-index" 2>/dev/null)" "$idx_before"
+grep -q "now holds this run" "$Q/t41b.txt" \
+  && bad "T41b claimed the collection was installed after a partial promotion" "$(grep 'holds' "$Q/t41b.txt")" \
+  || ok "T41b makes no 'installed' claim"
+grep -q 'pulled into' "$Q/t41b.txt" \
+  && bad "T41b claims placement on the summary line" "$(grep 'pulled' "$Q/t41b.txt")" \
+  || ok "T41b makes no placement claim on the summary line"
 
 echo "T42 — the stale sweep keys on the DESTINATION NAME, so a re-collected file is never deleted by its own run"
 # Keying on the remote path made the sweep delete a file THIS RUN had just promoted whenever the same
@@ -921,6 +980,37 @@ f47="$out/pi-cell-1-has$(printf '\t')"
 [ -f "$f47" ] && ok "T47 the TAB-named file was collected under its real name" \
   || bad "T47 the trailing TAB was truncated (wrong file pulled or none)" "$(ls -A "$out")"
 [ -f "$f47" ] && eq "T47 it holds the TAB-named file's bytes" "$(cat "$f47")" "TRAILING-TAB-BODY"
+
+echo "T48 — a filename ENDING in a NEWLINE ABSTAINS: the listing is not a map, so nothing is graded"
+# The third form of T28/T47's class, and the one that was NOT caught: a path ending in a newline emits its
+# record plus an EMPTY continuation line. A command substitution strips trailing newlines and
+# `grep -v '^$'` removes interior empties, so the head row (`<size>\t<mtime>\t<path-minus-its-newline>`)
+# parsed CLEANLY — a numeric size, a real path — and was accepted as a measurement of a DIFFERENT file.
+# Measured on the real `find` path with `has` = DECOY and `has<newline>` = the real artifact: the decoy was
+# pulled, written as the artifact, and the run exited 0, while the matched artifact was never collected
+# and no warning was emitted. The size guard cannot catch this one: the size IS numeric.
+# The sentinel's row COUNT is the fix — the box sent two lines, the caller could parse one, so the map
+# split and the box must ABSTAIN (exit 4) rather than grade a short list as the truth.
+b48="$Q/box-48"; rm -rf "$b48"; mkdir -p "$b48"
+printf 'DECOY-BODY' > "$b48/has"
+printf 'REAL-BODY' > "$b48/has"$'\n'
+out="$Q/out48"; mkdir -p "$out"
+STUB_BOXES="pi-cell-1=$b48"; export STUB_BOXES
+run collect 'has' --out "$out" --box pi-cell-1 > "$Q/t48.txt" 2>&1
+rc=$?
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T48 exit 4 (UNMEASURED — a split listing is not a result)" "$rc" "4"
+grep -q 'record SPLIT' "$Q/t48.txt" \
+  && ok "T48 names the split record (not a generic failure)" \
+  || bad "T48 abstained without naming why" "$(tail -4 "$Q/t48.txt")"
+ls -A "$out" | grep -q . \
+  && bad "T48 installed something into --out from a listing it could not read" "$(ls -A "$out")" \
+  || ok "T48 installed NOTHING (no decoy written under the artifact's name)"
+grep -q 'DECOY-BODY' "$Q/t48.txt" \
+  && bad "T48 rendered the DECOY's bytes as the artifact's content" "$(grep -n 'DECOY' "$Q/t48.txt")" \
+  || ok "T48 did not present the decoy as the matched artifact"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"
