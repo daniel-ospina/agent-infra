@@ -528,6 +528,15 @@ gitless_keep() { # <canon> — is it a box dependency named in the keep list?
 }
 remove_gitless() { # <canon> — no git, so no branch/ref/reflog exists that could preserve anything
     if gb rm -rf "$1" >/dev/null 2>&1; then REMOVE_HOW="rm-gitless"; return 0; fi
+    # ⛔ A READ-ONLY DIRECTORY INSIDE THE TREE DEFEATS `rm -rf` (mode `dr-xr-xr-x`: unlinking an entry
+    # needs WRITE on the directory, not just on the file), and the arm then reports
+    # `removal-failed` on every pass — measured on cell-3: /tmp/atom-e2e held
+    # `…/scripts/olddir` (dr-xr-xr-x, from a 17-day-old test fixture) and kept the hourly pass RED at
+    # rc=4 through two runs, long after the tree itself was proven removable. The tree has already been
+    # proven removable by every guard above (age, no live pid, no `.git`, not kept, inside the root, no
+    # symlink), so restoring the owner's write bit and completing the SAME decision is not a new one.
+    gb chmod -R u+rwX -- "$1" >/dev/null 2>&1
+    if gb rm -rf "$1" >/dev/null 2>&1; then REMOVE_HOW="rm-gitless(chmod)"; return 0; fi
     return 1
 }
 
