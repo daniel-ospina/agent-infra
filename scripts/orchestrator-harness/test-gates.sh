@@ -1817,6 +1817,20 @@ PYEOF
       *"no_land=360m"*) echo "  ok a MEASURED age keeps the exact no_land=<age>m shape (no '>=')"; PASS=$((PASS+1)) ;;
       *) echo "  ❌ the token lost the measured age: '$_g'"; FAIL=$((FAIL+1)) ;;
     esac
+    # ⛔ AN UNMEASURED AGE IS NOT A SMALLER BOUND (fresh-context review of #3181, 2026-11-02, P2).
+    # `agesrc=unmeasured` is written when `state/` could not be SEARCHED — no marker search happened, so
+    # the number in `age=` is the window that could not be searched, not a reading and not a floor. The
+    # token must print `?`. Without this leg the provenance fell through the `synth|measured` pair into
+    # the default arm and rendered the unsearched window as a measured age — a claim about this box that
+    # nothing took, on the one line every reader parses.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=unmeasured\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=?"*) echo "  ok an UNMEASURED age prints as '?', not as a number and not as a bound"; PASS=$((PASS+1)) ;;
+      *"no_land=>"*) echo "  ❌ an UNMEASURED age was printed as a BOUND (nothing was searched): '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"no_land=360m"*) echo "  ❌ an UNMEASURED age was printed as a MEASUREMENT: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ❌ the token lost the unmeasured reading: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
     # ⛔ THE LABEL IS THE MARKER'S OWN MEASUREMENT, NOT ITS EXISTENCE (review c-1, P1). BOTH stall arms
     # write this file: the DEADLOCK arm records `spawns=0`, and the STALLED arm records the workers it
     # DID start. A token keyed on the file existing printed `drain=DEADLOCK(…,spawns=4)` over a pass that

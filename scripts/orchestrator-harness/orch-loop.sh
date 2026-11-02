@@ -2733,7 +2733,7 @@ spawns_since() { # spawns_since <since-epoch>  ->  "<n>\t<tag,tag,...>" (empty n
 # records a past state and is never revalidated" failure this file keeps removing, so a land newer
 # than the marker deletes it here — the writer does not have to remember to.
 drain_stall_token() {
-  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl agesrc _agepfx
+  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl agesrc _agefield
   [ -f "$f" ] || return 0
   at="$(sed -n 's/^at=//p' "$f" 2>/dev/null | head -1)"
   if is_num "${at:-}"; then
@@ -2748,11 +2748,20 @@ drain_stall_token() {
   # reader parses — so it must say so. `>=` on the `no_land=` field is the distinction; a MEASURED age
   # keeps the exact format every existing reader and `test-gates.sh` pin (`no_land=240m`). A record
   # written before `agesrc` existed has no field, reads as measured, and is rendered exactly as before.
+  # ⛔ AND AN UNMEASURED AGE IS NOT A SMALLER BOUND (review P2, 2026-11-02): `agesrc=unmeasured` means the
+  # marker search never ran (a missing or unreadable `state/`), so the number in `age=` is the window
+  # that could not be searched — printing `>=360m` for it would be a claim about this box's stall that
+  # nothing took. The field prints `?`: absence of a measurement, in the shape every other
+  # unmeasurable field in this tree uses.
   agesrc="$(sed -n 's/^agesrc=//p' "$f" 2>/dev/null | head -1)"
-  _agepfx=""; [ "${agesrc:-}" = "synth" ] && _agepfx=">="
+  case "${agesrc:-}" in
+    synth)      _agefield=">=${lage:--}m" ;;
+    unmeasured) _agefield="?" ;;
+    *)          _agefield="${lage:--}m" ;;
+  esac
   lbl="$(drain_stall_label "$f")"
-  printf ' drain=%s(passes=%s,unowned=%s,no_land=%s%sm,spawns=%s)' \
-    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${_agepfx}" "${lage:--}" "${spawns:-?}"
+  printf ' drain=%s(passes=%s,unowned=%s,no_land=%s,spawns=%s)' \
+    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${_agefield}" "${spawns:-?}"
 }
 # ── THE ESCALATION'S LABEL, DERIVED FROM ITS OWN MEASUREMENT (review c-1, 2026-10-23) ─────────────
 # ⛔ THE MARKER IS WRITTEN BY BOTH STALL ARMS, SO ITS *EXISTENCE* CANNOT MEAN "DEADLOCK". A STALLED
@@ -6057,7 +6066,16 @@ PY
         # so `drain_stall_token` printed the synthesised bound through the same `no_land=<age>m` field a
         # MEASURED age uses — on the one line every reader parses. `agesrc` is additive (no reader is
         # broken by a field it does not know) and is what lets the token say `>=` for a bound.
-        if [ "${_lmsyn:-0}" = "1" ]; then _agesrc=synth; else _agesrc=measured; fi
+        # ⛔ AN UNSEARCHABLE `state/` MAKES THE AGE UNMEASURED, NOT A LOWER BOUND (fresh-context review of
+        # #3181, 2026-11-02, P2). `_lmread=0` means no marker search HAPPENED — a missing or unreadable
+        # `state/` returns the same empty answer as "nothing landed" — so `_lage` is the window this pass
+        # never searched, and "no PR merged in 360m" is unknown rather than understated. The VERDICT is
+        # unchanged (the escalation is still taken: #2929 overrides the silence, and the markers' absence
+        # is unmeasurable in both directions); only the CLAIM moves into a third provenance, so `agesrc`
+        # has exactly one vocabulary — measured | synth | unmeasured — and no reader has to guess.
+        if [ "${_lmsyn:-0}" = "1" ] && [ "${_lmread:-1}" = "0" ]; then _agesrc=unmeasured
+        elif [ "${_lmsyn:-0}" = "1" ]; then _agesrc=synth
+        else _agesrc=measured; fi
         if printf 'at=%s\npasses=%s\nage=%s\nagesrc=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
              "$(date +%s)" "$_dpass" "$_lage" "$_agesrc" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
              > "$O/state/drain-stall" 2>/dev/null; then
@@ -6121,7 +6139,10 @@ PY
         # means no recent land, "which is exactly the gate's own question").
         _lmtail=""
         if [ "${_lmsyn:-0}" = "1" ] && [ "${_lmread:-1}" = "0" ]; then
-          _lmtail=" (state/ could not be searched, so whether a land marker exists is UNMEASURED — the escalation is still taken (#2929), and the age is only the window's own lower bound, not a last-land reading)"
+          # ⛔ "THE AGE IS A LOWER BOUND" IS FALSE HERE (review P2): nothing was searched, so there is no
+          # window whose bound the empty answer proves. Say the age is UNMEASURED and name the window that
+          # was ATTEMPTED, so an operator cannot read a number this box never took as one it took.
+          _lmtail=" (state/ could not be searched, so whether a land marker exists is UNMEASURED — the escalation is still taken (#2929), and the age is NOT a reading: the ${_wbound}m window below is the one that could not be searched, so this box's real stall age is unknown, not ${_lage}m)"
         elif [ "${_lmsyn:-0}" = "1" ]; then
           _lmtail=" (no land marker inside the ${_wbound}m window at all — the empty answer to 'has this box landed' IS the stall, so the age is AT LEAST that window's own bound and the real stall may be older)"
         fi

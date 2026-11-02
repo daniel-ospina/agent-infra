@@ -71,6 +71,21 @@ run_sh() { # run_sh <o-dir> <seen> <every> → runs stall-fix.sh, leaves its com
 has()    { case "$OUT" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 lacks()  { case "$OUT" in *"$1"*) return 1 ;; *) return 0 ;; esac; }
 ledger_of() { cat "$1/state/drain-stall-dispatch.log" 2>/dev/null || true; }
+# ⛔ A STAMP `N` MINUTES AGO, PORTABLY (BSD `-v-NM` first, GNU `-d` second). A FIXED old date is wrong for
+# every leg below that ages a file: the `$O/bg` prune runs BEFORE `wt_in_use`, so a 2020 stamp belongs to
+# the PRUNE, not to the liveness pin — a leg built on one measures the wrong mechanism and stays green
+# when the thing it claims to pin is deleted.
+ago_stamp() { date -v-"$1"M +%Y%m%d%H%M 2>/dev/null || date -d "-$1 min" +%Y%m%d%H%M 2>/dev/null; }
+# ⛔ THE AGES THE TWO PIN LEGS USE ARE DERIVED FROM THE SHIPPED `STALL_FIX_PIN_MIN`, NOT RESTATED HERE
+# (fresh-context review of #3181, 2026-11-02, P2). A hard-coded 60/20 pair straddles the pin only while
+# `DRAIN_STALL_FIX_TIMEOUT` keeps its default; if the bound moves, both legs silently stop straddling it
+# and go vacuous while staying green. So the declaration is read out of the shipped script — the same two
+# lines the script itself evaluates — and the file ages are placed relative to it.
+PINMIN="$(TIMEOUT=1800 bash -c 'eval "$(grep -E "^STALL_FIX_PIN_MIN=" "$1"; grep -F "|| STALL_FIX_PIN_MIN=35" "$1")"; printf %s "$STALL_FIX_PIN_MIN"' _ "$SH" 2>/dev/null || true)"
+case "${PINMIN:-}" in ''|*[!0-9]*) PINMIN=0 ;; esac
+[ "$PINMIN" -ge 20 ]; ck $? "fixture: the shipped STALL_FIX_PIN_MIN is readable and leaves room to straddle it (got '${PINMIN:-}')"
+PIN_YOUNG=$(( PINMIN - 15 ))   # younger than the pin: still a LIVE worker's record
+PIN_OLD=$(( PINMIN + 25 ))     # older than the pin: cannot describe a live worker
 
 # The `$HOME` this suite hands the script: the spawn point's per-box state dir lives under it.
 export HOME="$TMP/home"
@@ -219,6 +234,19 @@ run_sh "$D" 3 3
 has "RAN AND ALREADY ENDED" && ck 0 "a POST-launch exit 75 with a worker record AND log bytes is RAN AND ALREADY ENDED" || ck 1 "a POST-launch exit 75 with a worker record AND log bytes is RAN AND ALREADY ENDED"
 lacks "refused before launching" && ck 0 "…and it does not claim a refusal the record contradicts" || ck 1 "…and it does not claim a refusal the record contradicts"
 
+# ⛔ THE POSITIVE ROW IS PREFERRED, AND IT IS NOT A TIE (fresh-context review of #3181, 2026-11-02, P2).
+# `KIND`/`TAG` are EXPORTED into the worker, so a nested `pi` it starts (a `task` sub-agent) records the
+# SAME TAG in the same append-only ledger. When a spawn gate refuses that NESTED call, a `refused` row
+# lands AFTER this worker's own `allowed` row — and a reader that checks `refused` first reported, and
+# durably recorded, a worker that provably started as "NOT DISPATCHED". The positive row is written only
+# when an agent was actually spawned, so it cannot coexist with "nothing ran".
+D="$(new_o b11)"
+stub "$D" 'printf "1\tallowed\t26\t80\t9\t8\tprfix\t%s\t/tmp\tbash\n" "$1" >> "$HOME/.pi/agent/state/spawn-gate.tsv"
+printf "1\trefused\t120\t80\t9\t8\ttask\t%s\t/tmp\tbash\n" "$1" >> "$HOME/.pi/agent/state/spawn-gate.tsv"'
+run_sh "$D" 3 3
+has "STALL FIX DISPATCHED" && ck 0 "an 'allowed' row WINS over a later 'refused' row for the same TAG (a nested pi refusal cannot un-start this worker)" || ck 1 "an 'allowed' row WINS over a later 'refused' row for the same TAG (a nested pi refusal cannot un-start this worker)"
+lacks "NOT DISPATCHED" && ck 0 "…and the worker it provably started is never recorded as NOT DISPATCHED" || ck 1 "…and the worker it provably started is never recorded as NOT DISPATCHED"
+
 echo
 echo "── §D the worker's tree is REFRESHED, not frozen at the first stall ──────────────────────────"
 # ⛔ (fresh-context review, 2026-11-02) The throwaway worktree was created ONCE and then reused for
@@ -271,6 +299,27 @@ if [ -n "$SHA_A" ]; then
   OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt2" HARNESS_REPO="$GR" DRAIN_STALL_FIX_EVERY=3 \
          STALL_FIX_VERIFY_SECS=1 bash "$SH" 3 90 2>&1)"
   has "worktree $SHA_C" && ck 0 "a FINISHED worker lifts the pin: the next dispatch refreshes to the newest base" || ck 1 "a FINISHED worker lifts the pin: the next dispatch refreshes to the newest base"
+  # ⛔ AND A PIDFILE TOO OLD TO DESCRIBE A LIVE WORKER LIFTS IT TOO (fresh-context review of #3181,
+  # 2026-11-02, P2). `.rc` is written on the dispatcher's exit path — NOT on SIGKILL/OOM/reboot — and no
+  # reaper in this tree deletes a `$O/bg/*.pid`, so a stale pidfile can outlive its worker forever; once
+  # the kernel recycles that pid, `kill -0` answers yes on EVERY future dispatch and the tree is frozen
+  # again, silently. The age bound (`STALL_FIX_PIN_MIN`, 35 min at the default timeout) is the fix, and
+  # until this leg it had none: deleting it restored the freeze-forever defect with every suite green.
+  # Aged with `touch -t` (an absolute old stamp) so it parses identically on BSD and GNU.
+  gc E >/dev/null 2>&1 || true
+  git -C "$GR" update-ref refs/remotes/origin/main HEAD >/dev/null 2>&1 || true
+  SHA_E="$(git -C "$GR" rev-parse --short HEAD 2>/dev/null || true)"
+  [ -n "$SHA_E" ] && [ "$SHA_E" != "$SHA_C" ]; ck $? "fixture: the base advanced again (E differs from C)"
+  sleep 60 & _live2=$!
+  printf '%s' "$_live2" > "$D/bg/stallfix-20200102T000000Z.pid"
+  # `$PIN_OLD` min: OLDER than the liveness pin so it cannot be a live worker's record, but YOUNGER than
+  # the 1440-min retention so the prune keeps it — otherwise this leg would measure the prune instead of
+  # the pin's age bound.
+  touch -t "$(ago_stamp "$PIN_OLD")" "$D/bg/stallfix-20200102T000000Z.pid"
+  OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt2" HARNESS_REPO="$GR" DRAIN_STALL_FIX_EVERY=3 \
+         STALL_FIX_VERIFY_SECS=1 bash "$SH" 3 90 2>&1)"
+  has "worktree $SHA_E" && ck 0 "an AGED pidfile lifts the pin (a stale pid the kernel recycled cannot freeze the tree forever)" || ck 1 "an AGED pidfile lifts the pin (a stale pid the kernel recycled cannot freeze the tree forever)"
+  kill "$_live2" 2>/dev/null || true
   kill "$_live" 2>/dev/null || true
 else
   ck 1 "fixture: a git repository could be initialised (the refresh arm cannot be driven without one)"
@@ -375,6 +424,35 @@ touch -t 202001010000 "$D/bg/lanefix-20200101T000000Z.log"
 run_sh "$D" 3 3
 [ ! -f "$D/bg/stallfix-20200101T000000Z.log" ]; ck $? "a stale worker transcript THIS script minted is PRUNED (the fourth sink is bounded)"
 [ -f "$D/bg/lanefix-20200101T000000Z.log" ]; ck $? "…and ANOTHER lane's transcript is never touched (deleting one would be the defect, not the fix)"
+
+# ── §E4 the RETENTION FLOOR: the prune can never evict a LIVE worker's own records ───────────────
+# ⛔ THE PRUNE AND THE LIVENESS PIN (`STALL_FIX_PIN_MIN`) ARE TWO INDEPENDENT BOUNDS, AND THEIR DEFAULT
+# ORDER IS ACCIDENTAL
+# (fresh-context review of #3181, 2026-11-02, P1). The pin is `(DRAIN_STALL_FIX_TIMEOUT + 300)/60` = 35
+# min; the retention knob is accepted down to `1`. Set it below the pin and the `$O/bg` prune deletes the
+# LIVE worker's own `.pid` — after which `wt_in_use` finds no pidfile and the `else` arm re-points the
+# worktree under a worker that is still reading it, so the report it is writing cites `file:line` at two
+# commits. That is the exact defect the pin exists to prevent, reached from the other side. The floor is
+# driven here at the only shape that can reach it: a knob BELOW the pin, over a pidfile young enough to
+# be live. Delete the floor and this leg reddens.
+D="$(new_o e6)"; stub "$D" "$STUB_OK_TOUCH"
+sleep 60 & _live3=$!
+printf '%s' "$_live3" > "$D/bg/stallfix-live.pid"
+# `$PIN_YOUNG` min: OLDER than the `STALL_FIX_BRIEF_MAX_AGE_MIN=5` this leg sets, but YOUNGER than the pin
+# the floor raises it to — so with the floor the record survives, and without it the prune takes the
+# `.pid` of a worker that is still running.
+touch -t "$(ago_stamp "$PIN_YOUNG")" "$D/bg/stallfix-live.pid"
+[ -f "$D/bg/stallfix-live.pid" ]; ck $? "fixture: a LIVE worker's pidfile exists before the run"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       STALL_FIX_BRIEF_MAX_AGE_MIN=5 bash "$SH" 3 90 2>&1)"
+[ -f "$D/bg/stallfix-live.pid" ]; ck $? "a retention knob BELOW the worker's own wall clock cannot prune a LIVE worker's record (the floor holds)"
+# …and the knob still bounds what it is FOR: with the floor in place, a transcript older than the PIN is
+# still evicted — the floor raises the bound, it is not an off-switch for the prune.
+touch -t 202001010000 "$D/bg/stallfix-old.log"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       STALL_FIX_BRIEF_MAX_AGE_MIN=5 bash "$SH" 3 90 2>&1)"
+[ ! -f "$D/bg/stallfix-old.log" ]; ck $? "…and a transcript older than the FLOOR is still pruned (the floor is a floor, not an off-switch)"
+kill "$_live3" 2>/dev/null || true
 
 
 echo

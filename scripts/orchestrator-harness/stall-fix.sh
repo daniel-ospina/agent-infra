@@ -103,6 +103,21 @@ STALL_FIX_BRIEF_MAX_AGE_MIN="${STALL_FIX_BRIEF_MAX_AGE_MIN:-1440}"
 # brief, and a NON-NUMERIC bound makes `find` fail, which (under the `|| true`) prunes nothing at all
 # — the unbounded sink silently returns. Both are refused by the clamps below.
 is_num "$STALL_FIX_BRIEF_MAX_AGE_MIN" && [ "$STALL_FIX_BRIEF_MAX_AGE_MIN" -ge 1 ] || STALL_FIX_BRIEF_MAX_AGE_MIN=1440
+# ⛔ RETENTION MUST OUTLIVE THE WORKER WHOSE OUTPUT IT RETAINS (fresh-context review of #3181,
+# 2026-11-02, P1). The retention bound and the liveness PIN below are INDEPENDENT, and their default
+# order is the only reason "a live worker's records can never be pruned" was true: `DRAIN_STALL_FIX_TIMEOUT`
+# (1800 s) puts the pin at `(TIMEOUT + 300)/60` = 35 min, while THIS knob is accepted down to `1`. Set it
+# below the pin and the `$O/bg` prune deletes the live worker's own `.pid` — after which `wt_in_use`
+# finds no pidfile, the `else` arm re-points the tree under a worker that is still reading it, and the
+# report that worker is writing cites `file:line` at two commits. That is the exact defect the pin was
+# added to prevent, reached from the other side, and the census comment below claimed it could not happen.
+# So the pin is computed ONCE, here, and the retention floor is raised to it: retention shorter than a
+# worker's own maximal wall clock is not retention, it is eviction of LIVE work. The clamp can only
+# KEEP files longer, so no input to it can destroy anything — which is why it is silent where the two
+# clamps above are silent (those refuse an invalid value; this one refuses an UNSAFE one).
+STALL_FIX_PIN_MIN=$(( (TIMEOUT + 300 + 59) / 60 ))
+[ "$STALL_FIX_PIN_MIN" -ge 1 ] || STALL_FIX_PIN_MIN=35
+[ "$STALL_FIX_BRIEF_MAX_AGE_MIN" -ge "$STALL_FIX_PIN_MIN" ] || STALL_FIX_BRIEF_MAX_AGE_MIN="$STALL_FIX_PIN_MIN"
 # ⛔ A PASS COUNTER OF 0 IS NOT "THE ZEROTH STALL": the caller sets it only inside the stall
 # arm, so 0 means the caller is on a healthy pass (or passed it through a default). Refusing
 # here as well makes the bound hold even if a future call site forgets the gate.
@@ -163,8 +178,13 @@ BGD="$O/bg"; BLOG="$BGD/$NAME.log"; BRC="$BGD/$NAME.rc"; BPID="$BGD/$NAME.pid"
 # header's "every sink is bounded" was false until this line.
 # ⛔ SCOPED TO THIS SCRIPT'S OWN NAMES (`stallfix-*`): every other lane's transcript belongs to the
 # dispatcher that started it, and deleting one is the silent-destruction class this repo keeps removing —
-# the same reason the brief prune is scoped to `stall-fix-*.md`. The retention knob is ~48x a worker's own
-# wall clock (`DRAIN_STALL_FIX_TIMEOUT`, 1800 s), so a LIVE worker's records can never be pruned under it.
+# the same reason the brief prune is scoped to `stall-fix-*.md`.
+# ⛔ "A LIVE WORKER'S RECORDS CAN NEVER BE PRUNED UNDER IT" IS A PROPERTY OF THE FLOOR, NOT OF THE KNOB
+# (review P1, 2026-11-02): the knob is accepted down to `1`, so this line is safe only because
+# `STALL_FIX_BRIEF_MAX_AGE_MIN` is raised to `STALL_FIX_PIN_MIN` above — the SAME bound `wt_in_use` uses
+# to decide a pidfile is too old to describe a live worker. Delete that floor and this very prune evicts
+# the `.pid` of a worker that is still reading the tree, which is how `wt_in_use` then re-points the tree
+# under it: the worker's report then cites `file:line` at two commits, and nothing in it says so.
 find "$BGD" -maxdepth 1 -type f -name 'stallfix-*' \
   -mmin "+$STALL_FIX_BRIEF_MAX_AGE_MIN" -exec rm -f {} + 2>/dev/null || true
 
@@ -294,7 +314,7 @@ HREPO="${HARNESS_REPO:-$HOME/ai-harness-main}"
 # dispatcher always writes. Compare this with the alternative — skipping the DISPATCH while a worker
 # runs — whose inference error would silence the escalation entirely, the inert-enforcer class.
 wt_in_use() {
-  local p live _pin
+  local p live
   # ⛔ A STALE PIDFILE CAN OUTLIVE ITS WORKER FOREVER, SO THE PIN NEEDS AN AGE BOUND (review P2,
   # 2026-11-02). `.rc` is written on the dispatcher's exit path, NOT on SIGKILL/OOM/reboot, and no
   # reaper in this tree DELETES a `$O/bg/*.pid` (verified: ai-drainer.sh SKIPS a dead pidfile, it does
@@ -303,11 +323,12 @@ wt_in_use() {
   # never refreshed again — the "frozen tree" this refresh exists to remove, with the extra harm that
   # it is now silent. A pidfile older than a worker's own maximum wall clock cannot describe a live
   # worker, whatever its pid now belongs to. `-mmin -N` is the repo's portable mtime form.
-  _pin=$(( (TIMEOUT + 300 + 59) / 60 ))
+  # `STALL_FIX_PIN_MIN` is computed ONCE, at the top, and is ALSO the retention floor the prunes above
+  # are raised to — so the prune can never delete a pidfile this function would have honoured.
   for p in "$O/bg"/stallfix-*.pid; do
     [ -f "$p" ] || continue
     [ -f "${p%.pid}.rc" ] && continue      # a terminal record means THAT worker is done
-    [ -n "$(find "$p" -mmin "-$_pin" 2>/dev/null || true)" ] || continue   # too old to be live
+    [ -n "$(find "$p" -mmin "-${STALL_FIX_PIN_MIN}" 2>/dev/null || true)" ] || continue   # too old to be live
     live="$(cat "$p" 2>/dev/null || true)"
     is_num "${live:-}" && kill -0 "$live" 2>/dev/null && return 0
   done
@@ -472,20 +493,27 @@ is_num "${_vmax:-}" && [ "$_vmax" -ge 1 ] || _vmax=10
 # put "it DID start, so its report may exist" on the one durable artifact an incident is read from, and
 # pointed the operator at a report that cannot exist — the fail-open this file's verdict reader exists to
 # refuse, on a narrower path.
-# ⛔ AND THE POSITIVE PROOF IS CONSULTED FIRST, as the header above promises: the spawn-gate `allowed`
-# row used to be unreachable whenever a `.rc` existed, so "preferred where the shim is installed" was a
-# claim the ordering denied. The predicate is the dispatcher's own (`bytes > 0`, `:415`).
+# ⛔ AND THE POSITIVE PROOF IS CONSULTED FIRST, IN BOTH BRANCHES (review P2, 2026-11-02): the spawn-gate
+# `allowed` row used to be unreachable whenever a `.rc` existed, and the negative `refused` row was still
+# read BEFORE it — so "preferred where the shim is installed" was a claim the ordering denied twice.
+# ⛔ THE ORDER IS NOT COSMETIC HERE: `KIND`/`TAG` are EXPORTED into the worker, and every `pi` invocation
+# it starts records the SAME TAG — so a nested `pi` that a spawn gate refuses writes a `refused` row for
+# THIS worker AFTER its own `allowed` row. Reading `refused` first then recorded a worker that provably
+# started as "NOT DISPATCHED (a spawn gate REFUSED this worker)" — a false claim on the one durable
+# artifact an incident is read from. An `allowed` row is only written when an agent was actually spawned,
+# so it cannot coexist with "nothing ran", and it is therefore safe to prefer unconditionally.
+# The `.rc` predicate is the dispatcher's own (`bytes > 0`, `:415`).
 if [ "$_launch" -ne 0 ]; then
-  if spawn_row refused; then _verdict=refused
+  if spawn_row allowed; then _verdict=started
+  elif spawn_row refused; then _verdict=refused
   elif [ -n "$(gate_refusal)" ]; then _verdict=refused
-  elif spawn_row allowed; then _verdict=started
   elif [ -s "$BRC" ] && [ -s "$BLOG" ]; then _verdict=ended
   elif [ -s "$BRC" ]; then _verdict=notstarted
   else _verdict=failed; fi
 else
   while :; do
-    if spawn_row refused; then _verdict=refused; break; fi
     if spawn_row allowed; then _verdict=started; break; fi
+    if spawn_row refused; then _verdict=refused; break; fi
     if [ -n "$(gate_refusal)" ]; then _verdict=refused; break; fi
     if [ -s "$BRC" ] && [ -s "$BLOG" ]; then _verdict=ended; break; fi
     if [ -s "$BRC" ]; then _verdict=notstarted; break; fi
