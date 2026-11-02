@@ -66,6 +66,8 @@ import {
   hasBareGhWord,
   mergeVerbInText,
   readsNonMergeGhCall,
+  writesOnlyTrackerRecords,
+  withoutQuotedHeredocBodies,
   ghShimWillEnforce,
   isExecutableShim,
   hasLiteralAdminFlag,
@@ -5085,6 +5087,80 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(!hasAdminMergeFlag("gh pr merge 123 --squash"), "plain merge untouched");
   ok(!hasAdminMergeFlag("gh pr merge 123 --adminx"), "a `--adminx` typo is NOT a bypass (no false block)");
   ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
+});
+
+test("#3161: a git WRITE VERB is gate-relevant in every spelling — and a git READ is not", () => {
+  // ⛔ THE ARM WAS A WORD TEST, AND A WORD TEST REFUSES THE FLEET'S MOST COMMON COMMAND. Measured on
+  // this branch against `origin/main` (`isGitOp` on the same 8 spellings, both trees): `main` allowed
+  // every read below, the word arm blocked every read below, at ZERO dispatches — so `git status` was
+  // refused until a lane dispatched a reviewer FOR THE `git status`. The arm's own docstring priced
+  // the blunt test as "a refusal (`--body \"run git log\"`)", a quoted MENTION; refusing the read
+  // itself was never priced, and 358 green assertions contained no bare-read row, which is exactly
+  // why the suite missed it. Both halves are pinned here, because either one alone is a defect: the
+  // read rows keep the over-block from coming back, the write rows keep `-C`/`--no-pager`/`-c` from
+  // slipping the floor (the fail-open round 2 measured).
+  for (const c of [
+    "git status",
+    "git log --oneline -3",
+    "git diff --stat",
+    "git fetch origin main",
+    "git rev-parse HEAD",
+    "git branch --show-current",
+    "git show HEAD:README.md",
+    "git status --porcelain",
+    "git -c core.pager=less log --oneline -3",
+    "git --no-pager log",
+  ]) {
+    ok(!isGitOp(c), `a git READ ships nothing and must not be gated: ${JSON.stringify(c)}`);
+  }
+  // ⛔ WORKING-TREE / INDEX VERBS ARE NOT SHIPPING OPS EITHER, AND THIS ARM WAS MEASURED REFUSING
+  // THEM (agent-infra#3161 review round 4, P1). The arm's first form listed 20 verbs, so at ZERO
+  // dispatches it refused `git add CHANGELOG.md` — the exact sequence `heredocLineExecutes`'s own
+  // note says must stay allowed — plus `git checkout -b`, `git switch -c`, `git clone`, `git init`,
+  // `git pull`, `git update-index`. `origin/main` allows every one. The floor's stated scope is
+  // "writes that LAND code"; a local verb lands nothing, and the `commit`/`push` that would ship its
+  // effect is gated by the write rows below. Pinned as a set because a future widening re-creates
+  // the over-block one verb at a time, and each one alone reads as harmless strictness.
+  for (const c of [
+    "git add CHANGELOG.md",
+    "git add -A",
+    "git -C /wt add -A",
+    "git checkout -b feat/x",
+    "git switch -c feat/x",
+    "git clone https://github.com/o/r /tmp/r2",
+    "git init -q",
+    "git pull --ff-only",
+    "git merge side",
+    "git rebase main",
+    "git reset --hard side",
+    "git restore f.txt",
+    "git clean -fd",
+    "git update-index --refresh",
+  ]) {
+    ok(!isGitOp(c), `a WORKING-TREE verb ships nothing and must not be gated: ${JSON.stringify(c)}`);
+  }
+  for (const c of [
+    "git commit -m x",
+    "git push",
+    "git -C /wt push",
+    "git --no-pager push",
+    "git -c k=v commit -m x",
+    "git -C /a -C /b commit -m x",
+    "git -c user.name=bot -c user.email=b@x commit -m x",
+    "git status && git push",
+    "git status; git -C /wt push",
+    "cd /wt && git push",
+  ]) {
+    ok(isGitOp(c), `a git WRITE VERB is a shipping op in this spelling: ${JSON.stringify(c)}`);
+  }
+  // The masking still holds for the WRITE test — at the LAYER the gate actually uses. `isGitOp` is
+  // handed `maskHeredocData(rawCommand)` by its only caller (`index.ts`, `tool_call`), so the body is
+  // already blanked by the time either arm reads it; asserting on the RAW text would pin a claim no
+  // arm makes (and would fail on `origin/main` too, because `GIT_COMMIT_PATTERN` is unmasked). The
+  // property under test: a `git push` that is DATA to this command must not make the tracker write
+  // that writes it a shipping op (#485's parked-lane class).
+  ok(!isGitOp(maskHeredocData("cat > /tmp/f.md <<'EOF'\nremember to git push\nEOF\n")),
+     "a git write inside a QUOTED heredoc body is data, not an operation");
 });
 
 test("#1492: a block is a NO-OP — the refused command is recorded, and the message says nothing ran", () => {
@@ -10358,6 +10434,428 @@ testAsync("a report write is allowed at 0 dispatches while every shipping write 
       }
     });
   });
+});
+
+// ── A tracker write is NOT a shipping op (#485 class; measured on pi-cell-1, 2026-10-31) ──────
+//
+// THE DEFECT. A bare `gh pr comment` was already outside the floor (#3132). What reached it is the
+// shape a report-only lane ACTUALLY runs — write the body to a file, then post it:
+//     cd <wt> && cat > /tmp/f.md <<'MDEOF' …prose with `backticks`… MDEOF
+//     gh pr comment <n> --repo <o/r> --body-file /tmp/f.md 2>&1 | tail -2; rm -f /tmp/f.md
+// Two lanes parked on exactly that (gate-events.jsonl, 2026-10-30T19:41:53Z and 23:49:08Z). The
+// heredoc opener line is COMPOUND, so `heredocBodyIsData` declines to mask the body; the prose's
+// backticks then blind the positive non-merge read, and `isGhPrMergeCommand`'s broad `gh`+`pr` arm
+// fires on a COMMENT. The first two commands below are those rows, so the pin is on real text.
+//
+// POLARITY IS UNCHANGED AND IS PINNED TOO: a readable merge, a SPLICED verb, a quoted group word, an
+// admin flag, a `git` verb ANYWHERE (including inside a substitution or a heredoc body), and a
+// comment compounded with a shipping op all keep the floor. Deleting the classifier clause turns the
+// first two assertions RED — mutant measured: 2 of 23 rows wrong, exactly these two.
+const REPORT_ONLY_COMMENT = [
+  "cd /home/cmux/tortoise/.worktrees/fix-10343 && cat > /tmp/fu10343.md <<'MDEOF'",
+  "### Follow-up: the re-run is now GREEN at the same head",
+  "",
+  "`test (g)` is the shard that produced the failures. **Same SHA, no code change.**",
+  "MDEOF",
+  "gh pr comment 10343 --repo daniel-ospina/tortoise --body-file /tmp/fu10343.md 2>&1 | tail -2; rm -f /tmp/fu10343.md",
+].join("\n");
+const REPORT_ONLY_COMMENT_2 = [
+  "cd /home/cmux/agent-infra/.worktrees/rv-ai-3054 && cat > /tmp/rv3054-followup.md <<'EOF'",
+  "## Attribution closed — the two reds are pre-existing, not this PR",
+  "",
+  "| tree | result |",
+  "|---|---|",
+  "| base | **550 passed, 2 failed** |",
+  "EOF",
+  "gh pr comment 3054 --repo daniel-ospina/agent-infra --body-file /tmp/rv3054-followup.md 2>&1 | tail -2",
+].join("\n");
+
+pending.push(async () => {
+  console.log("\n── tracker writes are read-side at the ≥1-dispatch floor (#485 class)");
+  for (const [label, command] of [
+    ["parked lane fi-10343 (gh pr comment + heredoc + pipe)", REPORT_ONLY_COMMENT],
+    ["parked lane rv-ai-3054 (gh pr comment + heredoc + `||`)", REPORT_ONLY_COMMENT_2],
+    ["bare gh pr comment", "gh pr comment 1234 --body-file /tmp/x.md"],
+    ["bare gh issue comment", "gh issue comment 1224 --body-file /tmp/x.md"],
+    ["gh pr edit (already outside — signed-marker reason)", "gh pr edit 3099 --body-file /tmp/body.md"],
+    // ⛔ THE POSITIVE TEST MUST CROSS A GLOBAL FLAG, not just the bare spelling (#3161 round-6
+    // review). The relaxation is keyed on the `gh` COMMAND PAIR, and a global flag stands between
+    // `gh` and the pair — `-R` takes a value, `--repo=` carries one. Both are ordinary in this
+    // fleet (`gh -R o/r pr comment`), so a positive test that only matched the bare form would
+    // re-park exactly the lanes this classification exists to release.
+    ["gh -R <repo> pr comment (global flag before the pair)",
+     "gh -R acme/widget pr comment 5 --body-file /tmp/x.md"],
+    ["gh --repo=<repo> pr comment (global flag with `=`)",
+     "gh --repo=acme/widget pr comment 5 --body-file /tmp/x.md"],
+  ] as Array<[string, string]>) {
+    equal(isGitOp(command), false, `${label}: a tracker write must not be a shipping op`);
+    equal(writesOnlyTrackerRecords(command), true, `${label}: the classification must be the reason`);
+  }
+  // The escapes that must NOT be granted. Each is a real shipping op this floor exists for.
+  for (const [label, command] of [
+    ["readable merge", "gh pr merge 999 --squash"],
+    ["admin merge", "gh pr merge 999 --admin"],
+    ["spliced verb", "gh pr m$'e'rge 99900010 --admin"],
+    ["quoted group word", 'gh "pr" m$`printf e`rge 99900010'],
+    ["comment AND merge", "gh issue comment 1 --body-file /tmp/x.md && gh pr merge 2"],
+    ["comment AND push", "gh pr comment 1 --body-file /tmp/x.md; git push origin main"],
+    ["push INSIDE a substitution in the body", 'gh pr comment 1 --body "$(git push)"'],
+    ["git verb inside a heredoc body", "cat > /tmp/f.md <<'EOF'\ngit push origin main\nEOF\ngh pr comment 1 --body-file /tmp/f.md"],
+    ["var-supplied verb", 'V="pr merge"; gh $V 999 --admin'],
+    // Round 1 and round 2 findings (fresh-context reviews) — every one measured as a fail-open
+    // before it was fixed, and each is now a row here so the spelling class cannot come back.
+    ['git -C push in a substitution', 'gh pr comment 1 --body "$(git -C /wt push)"'],
+    ['git global option before the verb', 'gh pr comment 1 --body "$(git --no-pager push)"'],
+    ['quote-spliced command word in a body', 'gh pr comment 1 --body "$(\'git\' push)"'],
+    ['opener hidden inside a # comment', 'gh pr comment 1 --body-file /tmp/f.md  # cat <<\'EOF\'\ngh --repo o/r pr merge 9\nEOF'],
+    [';# comment opener hides an executed merge', 'gh pr comment 1 --body-file /tmp/x.md;# cat <<\'EOF\'\ngh -R o/r pr merge 9 --squash\nEOF'],
+    ['a heredoc handed to sh is a script', 'sh <<\'EOF\'\ngh -R o/r pr merge 9 --squash\nEOF\ngh pr comment 1 --body-file /tmp/x.md'],
+    ['bare git -C push is a shipping op', 'git -C /wt push origin main'],
+    ['bare git --no-pager push', 'git --no-pager push origin main'],
+    ['git -c k=v commit', 'git -c user.x=1 commit -am x'],
+    ['comment AND git -C push', 'gh pr comment 1 --body-file /tmp/x.md && git -C /wt push origin main'],
+    // ⛔ THE SPELLING THAT DEFINES A GH EXECUTOR IS NOT THE ONE THAT INVOKES IT (#3161 round-6
+    // fresh-context review, P1 — measured). `GH_EXECUTOR_SHAPE` matches `gh alias set …`; the
+    // INVOCATION `gh qq <file>` carries no keyword at all, and gh alias names are arbitrary, so no
+    // negative keyword list can cover it. With the definition on an EARLIER line the relaxation was
+    // granted, the body was blanked and the push inside it reached zero dispatches — measured
+    // through this module at the reviewed head: `isGitOp(raw) === false`,
+    // `writesOnlyTrackerRecords(raw) === true`. The two rows below are the fix's own pin: the
+    // classifier now asks POSITIVELY whether the segment is a tracker WRITE
+    // (`ghTrackerWriteReadsOnly`), and `gh qq …` can never answer yes.
+    // ⛔ MUTATION: restore the negative-only test (`GH_EXECUTOR_SHAPE` alone) and BOTH rows go
+    // isGitOp=false — the first because the definition line is separate, the second because
+    // `--body-file` is just an argv element to the alias.
+    ['gh alias INVOKED by name, definition on an EARLIER line',
+     "gh alias set qq '!bash \"$1\"'\ncat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin main\nEOF\ngh qq /tmp/y.sh"],
+    ['gh alias INVOKED by name with a `--body-file` decoy',
+     "gh alias set pp '!bash \"$1\"'\ncat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin main\nEOF\ngh pp --body-file /tmp/y.sh"],
+    // Round 3: the mask's proof that a body is DATA is line-local, so these four shapes EXECUTE
+    // the body while the opener line still looks like `cat >`. Each measured, each now pinned.
+    ['continuation hides a pipe into sh', 'cat <<\'EOF\' \\\n| sh\ngit -C /wt push origin HEAD:main\nEOF'],
+    ['process substitution in the remainder', 'cat <<\'EOF\' > >(sh)\ngit -C /wt push origin HEAD:main\nEOF'],
+    ['process substitution in the prefix', 'tee >(sh) <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF'],
+    ['redirect plus process substitution', 'cat <<\'EOF\' 1> >(bash -s)\ngit -C /wt push origin HEAD:main\nEOF'],
+  ] as Array<[string, string]>) {
+    equal(isGitOp(command), true, `${label}: must keep the floor`);
+  }
+});
+
+// ── PR #3161 P0: the classification mask may not blank a body the PROVEN masker REFUSES ────────
+//
+// THE FINDING (fresh-context review, re-verified by execution here). `withoutQuotedHeredocBodies`
+// exists to skip ONE of `maskHeredocData`'s clauses — the COMPOUND-PREFIX refusal — and its docstring
+// ARGUED that the other five did not matter ("with a QUOTED delimiter bash performs no expansion, and
+// the body is stdin to `cat`, which cannot run it"). That argument is true about the BODY and false
+// about the COMMAND. Measured through this module at the reviewed head, every shape below was BLANKED
+// while `bash` executes the body, so the `git` word inside it vanished from `isGitOp`'s view — and
+// `isGitOp` is the gate handler's ENTRY predicate, so the ≥1-dispatch floor, the admin-merge evidence
+// gate and the merge registry were all skipped for a real `git -C <wt> push` (the fleet's own
+// canonical push form).
+//
+// FIVE CLAUSES WERE MISSING, not one, and each has a row here. The rows are pins in TWO places:
+// `isGitOp(command) === true` below (the user-visible, fail-closed property) and the differential
+// block after it (the reason, computed against `maskHeredocData` rather than hand-asserted).
+const CLASSIFICATION_MASK_EVASIONS: Array<[string, string]> = [
+  // clause 2 — a WRITTEN TARGET a later line runs
+  ['body written to a file the SAME command then runs', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nbash /tmp/y.sh"],
+  ['body written to a file, run by sh with a continuation', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nsh \\\n/tmp/y.sh"],
+  // clause 5 — a SECOND COMMAND on the opener line, i.e. the same thing one line up
+  ['opener line runs the file it writes', "gh pr comment 1 --body-file /tmp/x.md && cat > /tmp/y.sh <<'EOF' && bash /tmp/y.sh\ngit -C /wt push origin HEAD:main\nEOF"],
+  // …and the same thing when the WRITER is not the line's first word (`tee`/`dd of=` write the body
+  // to a file the next line runs — both were measured masking in the first version of this fix).
+  ['compound prefix + tee writes the file a later line runs', "cd /tmp && tee /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nbash /tmp/y.sh"],
+  ['dd of= writes the file a later line runs', "cd /tmp && dd of=/tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nbash /tmp/y.sh"],
+  // clause 3 — a SHADOWED reader
+  ['shadowed reader: function definition', "cat() { bash; }\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['shadowed reader: alias', "alias cat=bash\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['shadowed reader: assignment', "cat=bash\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // clause 4 — the PREFIX can capture the body or re-resolve the reader
+  ['prefix substitution on the opener line', 'x=$(cat <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF\n)\neval "$x"'],
+  ['prefix substitution on an earlier line', 'x=$(\ncat <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF\n)\neval "$x"'],
+  ['PATH assignment in the opener-line prefix', "PATH=/tmp/evil:$PATH cat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['PATH exported on an earlier line', "PATH=/tmp/evil:$PATH; export PATH\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['continuation on a PREFIX line', "cd /wt && \\\ncat > /tmp/y.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // clause 1 — a FRAME whose stdout can still reach a program
+  ['compound frame piped into bash', "if true; then cat <<'EOF'\ngh -R o/r pr merge 9 --squash\nEOF\n: ; fi | bash"],
+  // …and the frame opened on an EARLIER line, which is the shape that actually reaches the consumer
+  // clause: on one line the reader word is `then`/`do` (already refused), on two it is `cat`.
+  ['opener inside a frame opened earlier', "if true; then\ncat <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\nfi"],
+  ['loop frame opened earlier, done | bash', "for x in 1; do\ncat <<'EOF'\ngh -R o/r pr merge 9 --squash\nEOF\ndone | bash"],
+  // clause 5 (consumer) — a reader that is not proven data-only, and a frameless ELEVATION path
+  ['while read + eval as the consumer', 'while read l; do eval "$l"; done <<\'EOF\'\ngit -C /wt push origin HEAD:main\nEOF'],
+  ['unquoted delimiter EXPANDS its body', 'cat <<EOF\n$(git -C /wt push origin HEAD:main)\nEOF'],
+  // ⛔ TWO SHAPES A FRESH-CONTEXT REVIEW ADDED AT THIS HEAD, both measured fail-open:
+  // (a) `gh alias set` is an EXECUTOR, not a tracker reader — its expansion is evaluated through
+  //     `sh`, so the written body RUNS. `gh` was in `TRACKER_FILE_READERS` justified by the false
+  //     premise "`gh` cannot source or exec a local path".
+  [
+    'gh shell alias RUNS the written body (gh is not a reader)',
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh alias set qq '!bash /tmp/f.sh' && gh qq",
+  ],
+  // ⛔ THE SAME EXECUTOR LINE, WITH THE SUBCOMMAND SPLICED (PR #3161 cycle-5 review, P1 — measured).
+  // `heredocSegmentIsNaming` DEQUOTES the command word (`index.ts:1061`) but `GH_EXECUTOR_SHAPE`
+  // was tested against the RAW segment, so `gh 'alias' set`, `gh a"lias" set` and `gh \alias set`
+  // matched NO alternative in `/(^|\s)alias(\s|=|$)/` — the `gh` relaxation was granted to an
+  // EXECUTOR line, `withoutQuotedHeredocBodies` blanked a body the proven masker keeps readable, and
+  // the arm that sees a push (`gitWordAnywhere`) read doubly-masked text: `isGitOp(maskHeredocData(
+  // raw)) === false` on a push bash EXECUTED — zero dispatches. Shell equivalence is not a gh
+  // claim: all three deliver argv `[alias] [set] …` to the program (measured with an argv-dumping
+  // stub), i.e. they are ONE invocation spelled three ways. The un-spliced control above stayed
+  // green throughout, which is exactly why the splice went unseen.
+  [
+    "gh 'alias' set — QUOTED subcommand is the same executor",
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh 'alias' set qq '!bash /tmp/f.sh' && gh qq",
+  ],
+  [
+    'gh a"lias" set — SPLICED subcommand is the same executor',
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh a\"lias\" set qq '!bash /tmp/f.sh' && gh qq",
+  ],
+  [
+    'gh \\alias set — BACKSLASH-escaped subcommand is the same executor',
+    "cat > /tmp/f.sh <<'EOF'\ngit -C /wt push origin HEAD:main\nEOF\ngh \\alias set qq '!bash /tmp/f.sh' && gh qq",
+  ],
+  // (b) `\<<` is a LITERAL `<` plus an input redirect, so bash never sees a heredoc and the next
+  //     line is a COMMAND — while the opener scan honoured it and blanked the executed line.
+  ['backslash-escaped `<<` is NOT an opener', "cat \\<<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // ⛔ `cat <<<'EOF'` is a HERE-STRING, and a here-string has NO BODY (cycle-2 fresh-context review,
+  // P0 — measured). The bespoke opener scan read the SECOND/THIRD `<` as an opener and blanked the
+  // command lines after it, so the `git -C` push below reached zero dispatches while bash RUNS it.
+  // `heredocOpenersIn` already refuses a `<<<` run; this row is what pins that the masker now asks
+  // it rather than re-deriving the opener.
+  ['here-string `<<<` has no body, so the next line RUNS', "cat <<<'EOF'\ngit -C /wt push origin HEAD:main\nEOF"],
+  // ⛔ A QUOTED STRING OPENED ON AN *EARLIER* LINE IS TEXT, and the line that closes it RESUME
+  // execution (measured in real bash: the `touch` side effect below IS created). A per-line reader
+  // saw the middle line's `<<'EOF'` as an opener and blanked the executed line, so a `git -C` push
+  // there was invisible to `isGitOp` — the fail-OPEN this whole section exists to prevent.
+  //
+  // ⚠️ THE STATE MUST BE READ ON *EVERY* LINE, not only on lines carrying a `<<` candidate: the
+  // quote is opened by a line the opener scan never looks at. That was a measured P0 in the first
+  // cut of this fix (the carried-state comment was true of the READER and false of the CALLER).
+  [
+    'quote closed on the line before the body, so the body RUNS',
+    'echo "note: run\ncat <<\'EOF\'\nnext"\ngit -C /wt push origin HEAD:main\nEOF',
+  ],
+];
+
+// One `test` per shape, so a single broken clause cannot mask the others in the report: the whole
+// point of this section is that the SET of executed-body shapes is enumerated, not sampled.
+//
+// TWO assertions per row, and the second is the one that cannot be satisfied by accident: the gate
+// must fire (`isGitOp`), AND the OPERATION inside the executed body must still be VISIBLE in the
+// classifier's masked read — a row can pass the first while the masker blanks the body, because an
+// unmasked-but-still-refused command exists (the frame rows did exactly that at the reviewed head).
+// ⛔ ONE KNOWN, PRE-EXISTING SHARED GAP — named here rather than hidden, and deliberately NOT pinned
+// as correct. An UNQUOTED delimiter makes bash EXPAND the body before the consumer reads it, so a
+// substitution inside it EXECUTES (measured: `cat <<EOF` / `$(touch /tmp/EXPANDED)` / `EOF`, the
+// side-effect file CREATED). `maskHeredocData` blanks that body anyway — measured at this head, on a
+// shape this PR does not touch and with identical behaviour on `origin/main`: `isGitOp(raw) === true`
+// and `isGitOp(maskHeredocData(raw)) === false`, i.e. the GATE path is blind.
+// `withoutQuotedHeredocBodies` gets it RIGHT (it masks only a QUOTED delimiter), which is why that row
+// still passes on the raw text. FILED as #3210 (agent-infra): the fix is to make the PROVEN masker refuse an
+// unquoted delimiter, which changes `maskHeredocData`'s own proof and does not belong inside a
+// dispatch/classifier PR. The row is left OUT of the masked assertion on purpose — pinning the bug
+// would turn RED when somebody fixes it, which is how a test becomes an argument against a fix.
+const GATE_MASKED_RESIDUALS = new Set<string>([
+  'unquoted delimiter EXPANDS its body',
+]);
+
+console.log("\n── the classification mask may not hide an executed body (PR #3161 P0)");
+for (const [label, command] of CLASSIFICATION_MASK_EVASIONS) {
+  test(`executed body is not masked as data: ${label}`, () => {
+    equal(isGitOp(command), true, "the gate must fire — the body reaches a shell");
+    // ⛔ THE GATE'S INPUT IS THE MASKED TEXT, NOT THE RAW COMMAND (fresh-context review, P2 —
+    // measured). `tool_call` does `const command = maskHeredocData(rawCommand); if (!isGitOp(command))`,
+    // so a pin on the RAW text asks a question no arm is ever asked. It was not academic: a shape
+    // measured `isGitOp(raw) === true` while `isGitOp(maskHeredocData(raw)) === false`, so this whole
+    // section was green over a live fail-open. Both are asserted — raw for the classifier's own
+    // contract, masked for the one production caller's — except for `GATE_MASKED_RESIDUALS`, whose
+    // reason is stated once above `CLASSIFICATION_MASK_EVASIONS`'s loop.
+    if (!GATE_MASKED_RESIDUALS.has(label)) {
+      equal(isGitOp(maskHeredocData(command)), true, "…and it must fire on the text the GATE actually reads");
+      equal(writesOnlyTrackerRecords(maskHeredocData(command)), false, "not a tracker write (masked)");
+    }
+    equal(writesOnlyTrackerRecords(command), false, "not a tracker write");
+    equal(
+      /git -C \/wt push|pr merge/.test(withoutQuotedHeredocBodies(command)),
+      true,
+      "the operation inside an EXECUTED body must stay readable to the classifier",
+    );
+  });
+}
+
+// ── `GIT_WRITE_VERB_PATTERN`: quoted option values are still a WRITE VERB (PR #3161 P1) ────────
+// The option-value alternative was `[^\s;&|]+`, which stops at the first space, so a push whose
+// `-C`/`--git-dir` value is a QUOTED path containing a space matched no arm at all. Measured
+// through this module at the reviewed head: every row below was `isGitOp === false` — a real push
+// reaching zero dispatches with no decoy, and quoted paths with spaces are ordinary here
+// (`docs/teams/<team>/domains (S1)/<domain>`).
+const GIT_WRITE_VERB_SPELLINGS: Array<[string, string]> = [
+  ['plain -C push (control)', 'git -C /wt push'],
+  ['QUOTED -C value with a space', 'git -C "/tmp/my wt" push origin HEAD:main'],
+  ['single-quoted -C value with a space', "git -C '/tmp/my wt' push"],
+  ['QUOTED --git-dir value with a space', 'git --git-dir "/a b/.git" push'],
+  ['QUOTED -C value, commit', 'git -C "/tmp/my wt" commit -am x'],
+  ['quoted value then a second flag', 'git -C "/tmp/my wt" --no-pager push'],
+  // ⛔ THE FLAG TOKEN MAY BE QUOTED TOO (cycle-2 fresh-context review, P2 — measured). Widening the
+  // option VALUE to a quoted word left the FLAG literal, so `git "-C" /wt push` — bash strips the
+  // quotes, a real push — matched no arm. A quoted flag must still carry a leading `-`, so this
+  // cannot admit an arbitrary word.
+  ['QUOTED flag token', 'git "-C" /wt push'],
+  ['single-quoted flag token', "git '-C' /wt push"],
+  // ⛔ A LINE CONTINUATION IS A SPACE TO BASH (cycle-2 fresh-context review, P1 — measured):
+  // `git -C /wt \` NEWLINE `  push` RUNS a real push, but the pattern saw `git -C /wt \` and no
+  // verb, so it reached zero dispatches.
+  ['line continuation between flag and verb', 'git -C /wt \\\n  push'],
+  ['line continuation between git and flag', 'git \\\n  -C /wt push'],
+  // ⛔ A SECOND MASK MUST NOT HIDE WHAT THE FIRST ONE KEPT (fresh-context review, P0 — measured).
+  // The gate hands `isGitOp` text that `maskHeredocData` has ALREADY masked, and both
+  // `gitWordAnywhere` and `writesOnlyTrackerRecords` mask AGAIN. When the proven masker blanked a
+  // heredoc's TERMINATOR line too, the second masker could not find that terminator, so it searched
+  // PAST it and blanked real commands until it reached a LATER surviving `EOF` — the one belonging to
+  // a heredoc the proven masker REFUSED. Measured at the reviewed head: `isGitOp(raw) === true` and
+  // `isGitOp(maskHeredocData(raw)) === false`, i.e. the gate read none of it. Two rows, because the
+  // refusing second heredoc can be refused for two different reasons (an unprovable PREFIX, or a
+  // FRAME).
+  [
+    'a second mask must not swallow a line the first one kept (unprovable prefix)',
+    "cat > /tmp/f.md <<'EOF'\nprose\nEOF\ngit -C /wt push origin HEAD:main\ncd /tmp && cat > /tmp/g.md <<'EOF'\nprose2\nEOF",
+  ],
+  [
+    'a second mask must not swallow a line the first one kept (frame)',
+    "cat > /tmp/f.md <<'EOF'\nprose\nEOF\ngit -C /wt push origin HEAD:main\nfor x in 1; do cat <<'EOF'\nprose2\nEOF\ndone",
+  ],
+  // ⛔ `<<-` IS A PROPERTY OF THE OPENER THE SHELL SEES, NOT OF THE CANDIDATE POSITION (P1 —
+  // measured). One line can hold a decoy and the real opener; reading `<<-` off the decoy searched
+  // for `EOF` where bash terminates at `\tEOF`, so the mask ran past bash's terminator and blanked
+  // the push below (measured: bash created the side-effect file, `isGitOp` was false).
+  [
+    'a `<<-` decoy must not pick the terminator for a plain opener',
+    "cat <<<'EOF' <<-'EOF'\nbody line\n\tEOF\ngit -C /wt push origin HEAD:main\nEOF",
+  ],
+];
+
+// ── …and the OTHER direction: a heredoc the SHELL really opens stays DATA (PR #3161 P0) ─────────
+// The pin above is fail-closed: an executed body must stay visible. This one is the mirror, and it
+// exists because "read the opener with the proven reader" can overshoot — a mask that refuses too
+// little is a gate hit on a tracker write, which is the parked-lane class this PR also fixes, but a
+// mask that refuses too MUCH is the fail-open. `<<'E'O'F'` builds ONE word (`EOF`) by CONCATENATION,
+// so bash's terminator IS `EOF`: the body below is stdin to `cat`, never executed, and blanking it is
+// CORRECT. Taking the first quoted span (`E`) as the delimiter instead masked PAST bash's terminator
+// and hid the real commands after it.
+console.log("\n── a heredoc the shell really opens stays data (PR #3161 P0)");
+for (const [label, command] of [
+  ['concatenated delimiter `<<\'E\'O\'F\'` builds one word', "cat <<'E'O'F'\ngit -C /wt push origin HEAD:main\nEOF"],
+  ['unquoted segment after a quoted one', "cat <<'EOF'x\nignored\nEOFx"],
+] as Array<[string, string]>) {
+  test(`a body the shell treats as data is masked, not gated: ${label}`, () => {
+    equal(
+      /git -C \/wt push|pr merge/.test(withoutQuotedHeredocBodies(command)),
+      false,
+      'the body is stdin to a data-only consumer — it must be blanked, not left readable',
+    );
+    equal(
+      /git -C \/wt push|pr merge/.test(withoutQuotedHeredocBodies(maskHeredocData(command))),
+      false,
+      'and still blanked after the gate has already masked it — a second mask must not UN-mask',
+    );
+  });
+}
+console.log("\n── a git WRITE VERB in every spelling, quoted option values included (PR #3161 P1)");
+for (const [label, command] of GIT_WRITE_VERB_SPELLINGS) {
+  test(`a git write verb is gated: ${label}`, () => {
+    equal(isGitOp(command), true, "a real push/commit must reach the floor in EVERY spelling");
+    // The gate reads the MASKED text (see the note on the block above): a row that only passes on the
+    // raw text pins a claim no arm is ever asked.
+    equal(isGitOp(maskHeredocData(command)), true, "…and on the text the GATE actually reads");
+  });
+}
+
+// ── The classification masker is a SUBSET of the proven one (differential, PR #3161 P0) ────────
+//
+// The property, stated once: for any command, the set of BODY LINES `withoutQuotedHeredocBodies`
+// blanks must be a subset of the lines `maskHeredocData` blanks — i.e. the narrow masker may never
+// mask a body the proven masker refused to mask. It is checked by CALLING both functions over a
+// corpus that spans all six clauses, the reported prose shapes and the PR's own parked rows; nothing
+// here is a hand-written expectation of "masked"/"not masked" except the non-vacuity counts.
+//
+// TWO DECLARED RELAXATIONS are the ONLY permitted difference, and they are enumerated per row, not
+// assumed: (1) the PREFIX of the opener line may be COMPOUND, (2) a written target may be MENTIONED
+// by a tracker-write READER that cannot run it (`gh --body-file`). Both are what the PR exists for.
+// A third row is marked because it is a RESIDUAL the proven masker declares too (a written file
+// renamed by `cp` inside the command) — named here rather than left for a reviewer to find.
+// A declared row must still MASK (or the corpus is vacuous).
+const blankedLineIndexes = (original: string, masked: string): number[] => {
+  const a = original.split("\n");
+  const b = masked.split("\n");
+  // A masker that changes the line COUNT is broken in a way no subset test can rescue.
+  if (a.length !== b.length) return [-1];
+  const out: number[] = [];
+  // Only an ALL-SPACE line is a blanked body; the opener line this classifier REWRITES
+  // (`<<'EOF'` → `</dev/null`) and the terminator it keeps verbatim are not.
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i] && /^[ ]*$/.test(b[i])) out.push(i);
+  return out;
+};
+
+const MASK_CORPUS: Array<[label: string, command: string, declaredRelaxation: boolean]> = [
+  ['prose body under a lone writer', "cat > /tmp/f.md <<'MDEOF'\ngh pr merge 999 --admin\nMDEOF", false],
+  ['parked lane fi-10343 (compound prefix + gh body-file)', REPORT_ONLY_COMMENT, true],
+  ['parked lane rv-ai-3054 (compound prefix + gh body-file)', REPORT_ONLY_COMMENT_2, true],
+  ['compound prefix, no tracker mention', "cd /wt && cat > /tmp/f.md <<'MDEOF'\nprose `git push`\nMDEOF", true],
+  ['written target read by a tracker (gh) later', "cat > /tmp/b.md <<'MDEOF'\nprose `gh pr merge`\nMDEOF\ngh pr comment 1 --body-file /tmp/b.md", true],
+  ['written target piped into a program later', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\ncat /tmp/y.sh | bash", false],
+  // A SHARED RESIDUAL, enumerated rather than hidden: the written path reaches a runner through a
+  // `cp` inside the prefix, which no written-target rule here follows. `maskHeredocData` declares the
+  // same gap (a file a LATER tool call runs, and a file renamed inside the command); it only refuses
+  // this shape because the prefix is compound, which is relaxation (1).
+  ['written target COPIED to another name in the prefix', "cp /tmp/a.sh /tmp/y.sh && cat > /tmp/a.sh <<'EOF'\ngh pr merge 1 --admin\nEOF", true],
+  ['written target run by a later line', "cat > /tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\nbash /tmp/y.sh", false],
+  ['written target under a compound prefix, run later', "cd /tmp && tee /tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\nbash /tmp/y.sh", false],
+  ['written target via `dd of=`, run later', "cd /tmp && dd of=/tmp/y.sh <<'EOF'\ngit -C /wt push\nEOF\nbash /tmp/y.sh", false],
+  ['shadowed reader (function)', "cat() { bash; }\ncat <<'EOF'\ngit push\nEOF", false],
+  ['shadowed reader (alias)', "alias cat=bash\ncat <<'EOF'\ngit push\nEOF", false],
+  ['prefix substitution on the opener line', 'x=$(cat <<\'EOF\'\ngit push\nEOF\n)', false],
+  ['prefix substitution on an earlier line', 'x=$(\ncat <<\'EOF\'\ngit push\nEOF\n)', false],
+  ['continuation on a prefix line', "cd /wt && \\\ncat > /tmp/y.sh <<'EOF'\ngit push\nEOF", false],
+  ['continuation on the opener line', "cat <<'EOF' \\\n| sh\ngit push\nEOF", false],
+  ['frame: if ... fi | bash', "if true; then\ncat <<'EOF'\ngh pr merge 1 --admin\nEOF\nfi | bash", false],
+  ['frame: for ... done | bash', "for x in 1; do\ncat <<'EOF'\ngh pr merge 1 --admin\nEOF\ndone | bash", false],
+  ['pipe into sh', "cat <<'EOF' | sh\ngit push\nEOF", false],
+  ['sh as the consumer', "sh <<'EOF'\ngit push\nEOF", false],
+  ['process substitution in the remainder', "cat <<'EOF' > >(sh)\ngit push\nEOF", false],
+  ['process substitution in the prefix', "tee >(sh) <<'EOF'\ngit push\nEOF", false],
+  ['PATH assignment in the opener-line prefix', "PATH=/tmp/e:$PATH cat <<'EOF'\ngit push\nEOF", false],
+  ['consumer this classifier does not prove', "head -1 <<'EOF'\ngh pr merge 1 --admin\nEOF", false],
+  ['unquoted delimiter EXPANDS its body', 'cat <<EOF\ngh pr merge 1 --admin\nEOF', false],
+];
+
+console.log("\n── the classification masker is a SUBSET of the proven masker (differential)");
+test("no body is blanked that maskHeredocData keeps readable (except the 2 declared relaxations)", () => {
+  const violations: string[] = [];
+  let maskedRows = 0;
+  let relaxationRows = 0;
+  for (const [label, command, declaredRelaxation] of MASK_CORPUS) {
+    const narrow = blankedLineIndexes(command, withoutQuotedHeredocBodies(command));
+    const proven = new Set(blankedLineIndexes(command, maskHeredocData(command)));
+    if (narrow.length > 0) maskedRows++;
+    if (declaredRelaxation) {
+      relaxationRows++;
+      if (narrow.length === 0) violations.push(`${label}: a DECLARED relaxation must still mask — got no mask`);
+      continue;
+    }
+    const extra = narrow.filter((n) => !proven.has(n));
+    if (extra.length > 0) {
+      violations.push(
+        `${label}: blanked line(s) ${extra.join(", ")} that maskHeredocData keeps READABLE — the classifier may never be less conservative than the proven masker`,
+      );
+    }
+  }
+  // NON-VACUITY, asserted rather than assumed: a masker that blanks nothing satisfies every subset
+  // test above for free, and a corpus with no declared relaxation proves nothing about the PR.
+  if (maskedRows < 3) violations.push(`the corpus must contain masked rows (got ${maskedRows})`);
+  if (relaxationRows < 3) violations.push(`the corpus must contain declared-relaxation rows (got ${relaxationRows})`);
+  equal(violations.length, 0, violations.join("\n    ") || "no violation");
+
 });
 
 // ══════════════════════════════════════════════════════════════════════════
