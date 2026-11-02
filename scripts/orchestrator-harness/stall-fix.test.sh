@@ -140,6 +140,16 @@ stub "$D" 'printf "[fork-gate] REFUSED stallfix: box out of processes\n" > "$O/b
 run_sh "$D" 3 3
 has "NOT DISPATCHED" && ck 0 "an 'allowed' row from an earlier worker cannot mask a refusal here" || ck 1 "an 'allowed' row from an earlier worker cannot mask a refusal here"
 
+# ⛔ THE LOG IS A SHARED CHANNEL (review P2, #3181). `$O/bg/<name>.log` is handed to `run_agent`, so
+# it carries the gates' `[<name>] REFUSED` lines AND whatever the worker itself prints — and this worker
+# is dispatched to READ the drain's ledger, whose rows say "landing claim REFUSED: held by …". Matching
+# the bare word reported a live worker as NOT DISPATCHED and wrote the same claim durably.
+D="$(new_o b9)"
+stub "$D" 'sleep 30 & printf "%s\n" "$!" > "$O/bg/$1.pid"; printf "%s\n" "$!" >> "$_SLEEPS"; printf "[pr] landing claim REFUSED: held by another box — merge-9812\n" > "$O/bg/$1.log"'
+run_sh "$D" 3 3
+has "STALL FIX LAUNCH ACCEPTED, AGENT START UNPROVEN" && ck 0 "a worker-log REFUSED that is NOT a gate line leaves a LIVE worker UNPROVEN, not NOT DISPATCHED" || ck 1 "a worker-log REFUSED that is NOT a gate line leaves a LIVE worker UNPROVEN, not NOT DISPATCHED"
+lacks "NOT DISPATCHED" && ck 0 "…and never records a gate refusal no gate made" || ck 1 "…and never records a gate refusal no gate made"
+
 # A worker that already ENDED (its `.rc` exists and nothing refused) is reported as having run —
 # not as still-dispatching, and not as a failure.
 D="$(new_o b5)"

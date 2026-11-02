@@ -269,9 +269,19 @@ spawn_row() {
     | awk -F'\t' -v want="$1" -v tag="$NAME" '$2 == want && $8 == tag { found = 1 } END { exit(found ? 0 : 1) }'
 }
 # gate_refusal — the FIRST gate refusal `run_agent` wrote for this worker, verbatim (empty if none).
+# ⛔ ANCHORED TO THE GATE SHAPE, NOT TO THE WORD (review P2, 2026-11-01). `$BLOG` is a SHARED channel:
+# `nonblocking-dispatch.sh` hands it to `run_agent`, so it holds the gates' refusals AND everything the
+# worker itself prints — and the brief sends this worker to read the drain's own ledger, whose rows say
+# things like "landing claim REFUSED: held by another box". A bare `/REFUSED/` therefore matched the
+# WORKER'S OWN OUTPUT: a live, running diagnostician was reported as "NOT DISPATCHED (a spawn gate
+# REFUSED this worker)" and the durable escalation row said the same — a false claim on the one surface
+# whose whole job is to say what actually happened, and it points the operator at a refusal no gate
+# made. Every refusal this path can write begins `[<name>] REFUSED` at column 0 (`[brief-gate]`,
+# `[fork-gate]`, `[disk-gate]`, `[load-gate]`, `[land-backlog]`, `[capability-gate]`, `[pi-gate]`,
+# `[worker-terminal]`), so the pattern requires that prefix.
 gate_refusal() {
   [ -f "$BLOG" ] || return 0
-  awk '/REFUSED/ { print; exit }' "$BLOG" 2>/dev/null
+  awk '/^\[[^]]*\] REFUSED/ { print; exit }' "$BLOG" 2>/dev/null
 }
 
 _launch=0
