@@ -424,6 +424,40 @@ assert_contains "$OUT" "deployed_drift=clean" "T24 and it says it actually looke
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t24/empty" run_pass "$T/t24" 2>&1)"; RC=$?
 assert_contains "$OUT" "deployed_drift=not-run" "T24 an ABSENT checker is named as not-run, never a silent clean"
 assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "drift=not-run" "T24 and the record carries it, not just the log"
+# ⛔ THE FOUR-CANDIDATE SEARCH ITSELF WAS STILL EXECUTED BY NO TEST (review round 21, P2). Every case
+# above supplies a checker through HARNESS_APPLY_DRIFT_CMD or REPLACES the search root, so the production
+# candidate LIST — the arm that was DEAD on every deployed box, twice — was never run. The FARMED copy is
+# the shape that matters: `$HERE` carries neither the checker nor an `orchestrator-harness/` subdir, so
+# candidates 1-2 cannot match and the reading can only come from `$AGENT_INFRA_PATH` (3) or `$O` (4).
+# Both stubs answer DIFFERENTLY, so which candidate was found is observable in the verdict, not assumed.
+mkdir -p "$T/t24/farm/scripts" "$T/t24/ai/scripts/orchestrator-harness" "$T/t24/home/orchestrator"
+cp "$PASS_SH" "$T/t24/farm/scripts/harness-apply-pass.sh"
+printf '#!/usr/bin/env bash\necho "harness=current"\nexit 0\n' >"$T/t24/ai/scripts/orchestrator-harness/check-deployed-drift.sh"
+printf '#!/usr/bin/env bash\necho "harness=executes:/farmed/gone/scripts/orchestrator-harness"\nexit 1\n' >"$T/t24/home/orchestrator/check-deployed-drift.sh"
+chmod +x "$T/t24/ai/scripts/orchestrator-harness/check-deployed-drift.sh" "$T/t24/home/orchestrator/check-deployed-drift.sh"
+run_farmed() { # <AGENT_INFRA_PATH> — the pass AS DEPLOYED (no sibling checker), discovery left ON
+    local infra="$1"
+    shift
+    HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+    HARNESS_APPLY_STATE_DIR="$T/t24/farmstate" HARNESS_APPLY_MODE=pin \
+    HARNESS_PIN="$T/t24/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t24/home/.harness-path" \
+    HARNESS_PIN_DIR="$T/t24/home/harness" CELL_HOME="$T/t24/home" O="$T/t24/home/orchestrator" \
+    AGENT_INFRA_PATH="$infra" HARNESS_APPLY_DRIFT_CHECK=1 \
+    bash "$T/t24/farm/scripts/harness-apply-pass.sh" "$@"
+}
+OUT="$(run_farmed "$T/t24/ai" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 the FARMED shape finds candidate 3 (\$AGENT_INFRA_PATH) and reads clean"
+assert_contains "$OUT" "deployed_drift=clean" "T24 …and the arm that was dead on every deployed box actually ran"
+OUT="$(run_farmed "" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T24 with no \$AGENT_INFRA_PATH the search falls through to candidate 4 (\$O) — the PRODUCTION find"
+assert_contains "$OUT" "executes:" "T24 …and that find reds the pass, not just prints a token"
+# ⛔ AND THE PREVIEW ANSWERS THE SAME QUESTION (review round 21, P2). `--dry-run` used to exit BEFORE
+# `read_deployed_drift`, so the read-only verb — the one an operator uses to inspect a box without
+# changing it — still could not say whether the EXECUTING tree was this repo's, while the merge evidence
+# printed that line under `--dry-run`. A preview still writes no record and still does not red a box.
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-exec.sh" run_pass "$T/t24" --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 --dry-run still changes nothing (a preview must not red a box)"
+assert_contains "$OUT" "deployed_drift=drift" "T24 and the preview REPORTS the executing-tree reading instead of hiding it"
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-behind.sh" run_pass "$T/t24" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 a copy at rest that is merely BEHIND does NOT red the pass"
 assert_contains "$OUT" "deployed_drift=drift" "T24 and it is still REPORTED, so it is not silent either"

@@ -401,6 +401,11 @@ ck "…and the run does NOT claim no deployed dir was present (it is present)" \
    "$(qF "no deployed dir was present to check" "$OUT" && echo 1 || echo 0)"
 ck "…and it says $O could NOT be identified, so its bytes were NOT verified against a record" \
    "$(qF "could NOT be identified" "$OUT" && echo 0 || echo 1)"
+# ⛔ THIS CLEAN ARM EMITS THE TOKEN TOO (round 21, P2). It is the second of the three clean exits, and
+# the only one a FARMed or operator-synced box ever reaches; without the token the pass recorded
+# `drift=clean:rc=0` and the documented `clean:current` was unreachable on exactly that population.
+ck "…and this clean exit also carries harness=current, not a bare rc=0" \
+   "$(qF "harness=current" "$OUT" && echo 0 || echo 1)"
 
 echo
 echo "── §9f a pathless manifest line is CANNOT-VERIFY here too, not a MISSING named after a hash ──"
@@ -450,19 +455,25 @@ ck "…the identity half reports SKIPPED for the absent \$O" "$(qF "identity: SK
 ck "…and the one-line answer is harness=surface" "$(qF "harness=surface" "$OUT" && echo 0 || echo 1)"
 ck "…and NOT payload-differs, which would name a question nothing asked" \
    "$(qF "harness=payload-differs" "$OUT" && echo 1 || echo 0)"
-# ⛔ AND THE COUNTER-CASE THAT SETTLES WHAT THE TOKEN MEANS (review of #3090, cycle 3): `$O`-absent
-# ALONE emits NO token at all. Without this arm the paragraph in README §4.3 could say the missing
-# `$O` "emits harness=surface" and pass every assertion — which is exactly how that wording drifted
-# twice. The token is printed only under `problems > 0`, so with $O absent it can ONLY come from a
-# surface hit; a clean surface pass reaches the OK summary and stamps nothing.
+# ⛔ AND THE COUNTER-CASE THAT SETTLES WHAT THE TOKEN MEANS (review of #3090, cycle 3; corrected in
+# round 21): what this arm must prove is that the CLEAN path never FABRICATES a DRIFT token — the
+# `surface` value in particular — because that is the reading a redeploy decision gets made on. It used
+# to assert the absence of `harness=` entirely, which was true only before the `O_ABSENT -eq 0` clean arm
+# was given `harness=current` (round 17), and which left the documented `drift=clean:current` unreachable
+# on the other two clean exits: `harness-apply-pass.sh` fell through its reader to `clean:rc=0`, so
+# anything keyed on the documented value could never fire there. The clean exits now ALL carry
+# `harness=current` — the token answers "what state is the deployed tree", and `current` is the answer.
+# The drift-naming claim this arm exists for is kept explicitly: `surface` must NOT appear.
 no_o_clean="$TMP/clean-absent"; rm -rf "$no_o_clean"; mkdir -p "$no_o_clean"
 cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$no_o_clean/"
 OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$no_o_clean" HARNESS_PIN_DIR="" \
         HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
         bash "$DRIFT" --o "$absent_O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
 ck "…with \$O absent and a CLEAN surface pass: rc 0 (nothing differs)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
-ck "…and it stamps NO harness= token at all (the token names a drift; there is none)" \
-   "$(qF "harness=" "$OUT" && echo 1 || echo 0)"
+ck "…and the clean path carries the documented token harness=current (not the reader's rc=0 fallback)" \
+   "$(qF "harness=current" "$OUT" && echo 0 || echo 1)"
+ck "…and it fabricates NO drift token on a clean pass (harness=surface names a drift; there is none)" \
+   "$(qF "harness=surface" "$OUT" && echo 1 || echo 0)"
 
 echo
 echo "── §10 THE EXECUTING TREE: read from the PROCESS, never from a record about it (#10114) ──"
@@ -646,13 +657,17 @@ ck "10a-3e: 'bash -o noexec <abs>' is a MENTION (the shell forbids execution)" \
 # ⛔ `-c` IS OWNED BY THE SHELL THAT IS THE CURRENT COMMAND, NOT BY ANY EARLIER ONE (review round 19,
 # P2): `_seen` was never cleared, so `bash other.sh -c <abs>` and `busybox grep -c <abs>` nominated a
 # path that is a `$1`/grep operand — a fabricated `executes:` that also masks a real `behind:`.
-for _x in 'bash other.sh -c' 'busybox grep -c' 'bash -c x -c' 'bash -lc x -c'; do
+# ⛔ A VALUE-CLAIMING CLUSTER MUST NOT OPEN A FABRICATION (round 21, P1): the operand claim added for
+# `-euo pipefail` must not turn the `-c` string's trailing `$0` into a script path, which is the
+# 10a-4 fabrication one spelling along.
+for _x in 'bash other.sh -c' 'busybox grep -c' 'bash -c x -c' 'bash -lc x -c' 'bash -euo pipefail -c x'; do
   printf '4267 %s %s/orch-loop.sh\n' "$_x" "$GONE" > "$TMP/ps-staleseem"
   surf "$TMP/ps-staleseem"
   ck "10a-3e: '$_x <abs>/orch-loop.sh' is a MENTION (a closed prefix owns no -c string)" \
      "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
 done
-for _v in 'bash -o pipefail' 'bash -O extglob' 'bash +o noexec' 'bash +o errexit' 'bash --rcfile noexec'; do
+for _v in 'bash -o pipefail' 'bash -O extglob' 'bash +o noexec' 'bash +o errexit' 'bash --rcfile noexec' \
+          'bash -euo pipefail' 'bash -eo pipefail' 'bash -euxo pipefail'; do
   printf '4265 %s %s/orch-loop.sh\n' "$_v" "$GONE" > "$TMP/ps-shopt"
   surf "$TMP/ps-shopt"
   ck "10a-3e: '$_v <abs>/orch-loop.sh' is an INVOCATION (a shell value option claims its operand)" \

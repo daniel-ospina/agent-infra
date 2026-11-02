@@ -572,11 +572,15 @@ log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$
 # stub repos that carry no harness dir at all); an ABSENT checker is `not-run`, named as such, never a
 # silent pass — we cannot verify what we did not run.
 DRIFT_STATE=not-run; DRIFT_RC=not-run; DRIFT_TOKEN=not-run
-# ⛔ CALLED EXACTLY ONCE, FROM `finish` (review P1). An earlier revision also called it here, beside
-# the other readings — so every pass took TWO readings, and on an advancing tick the two DISAGREED
-# (this one pre-move, `finish`'s post-move) while the log printed both under the same key. That is the
-# "two numbers for one box in one pass" defect this file already documents twice, and the checker
-# costs ~3 s, so it doubled the pass's cost too.
+# ⛔ CALLED ONCE PER RUN, AND NEVER FROM THE READINGS SECTION (review P1). An earlier revision also
+# called it here, beside the other readings — so every pass took TWO readings, and on an advancing tick
+# the two DISAGREED (this one pre-move, `finish`'s post-move) while the log printed both under the same
+# key. That is the "two numbers for one box in one pass" defect this file already documents twice, and
+# the checker costs ~3 s, so it doubled the pass's cost too.
+# EXACTLY TWO CALL SITES, and they cannot both run: `finish` (a real pass, post-move, the reading the
+# record is written from) and the `--dry-run` branch (a PREVIEW, which exits before `finish` and writes
+# no record). Adding a third beside the readings is the defect above — not the preview, which exists so
+# the read-only verb can answer the executing-tree question at all (review round 21, P2).
 read_deployed_drift() {
     [ "${HARNESS_APPLY_DRIFT_CHECK:-1}" = 0 ] && { DRIFT_STATE=disabled; DRIFT_TOKEN=disabled; return 0; }
     local chk="${HARNESS_APPLY_DRIFT_CMD:-}"
@@ -936,6 +940,13 @@ if [ "$DRY_RUN" = 1 ]; then
     # then read `status=ok age=0s` in `--print-status`, in the installer's `--status` and in
     # fleet-health — the false PASS this whole feature exists to delete, produced by its preview verb.
     [ "$PASS_MODE" = pin ] && read_pin
+    # ⛔ THE PREVIEW ANSWERS THE EXECUTING-TREE QUESTION TOO (review round 21, P2). `read_deployed_drift`
+    # had exactly ONE call site (`finish`), and `--dry-run` exits before `finish`, so the read-only verb
+    # — the one an operator uses to inspect a box without changing it — still could not say whether the
+    # code that is EXECUTING is this repo's, while the merge evidence printed that line under
+    # `--dry-run`. It is PRINT-ONLY here: `read_deployed_drift` writes nothing, and a preview must not
+    # red a box (it changes nothing, including the exit contract).
+    read_deployed_drift
     log_line "dry-run: relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N mode=$PASS_MODE — nothing was changed and no pass record was written"
     exit 0
 fi

@@ -914,6 +914,20 @@ if [ "$SURFACE" -eq 1 ]; then
                 case "$_w" in
                   -D|--noexec|-n) _noexec=1 ;;
                   -[!-]*n*) _noexec=1 ;;
+                  # ⛔ A CLUSTER THAT ENDS IN `o`/`O` CLAIMS ITS OPERAND (review round 21, P1 — a
+                  # REGRESSION this change introduced). Only the EXACT words `-o|-O` were listed, so
+                  # `bash -euo pipefail <gone>/orch-loop.sh` — the canonical bash launcher spelling —
+                  # left `pipefail` to the ordinary-word arm, which closed the prefix; the script path
+                  # then arrived with `_interp=0` and was graded a MENTION, so a live controller on a
+                  # GONE tree produced NO `harness=` token, the pass recorded `drift=clean:rc=0` and
+                  # `fleet-health` certified the box. MEASURED against origin/main's checker on one
+                  # fixture: `-euo pipefail`, `-eo pipefail`, `-euxo pipefail` were ARMED there and
+                  # are mentions here; `-eu -o pipefail` and `-o pipefail` stayed ARMED on both,
+                  # which isolates the CLUSTER as the trigger. Ordering is load-bearing: the `n` rule
+                  # above runs first so `bash -eun` stays parse-only, and the trailing letter is what
+                  # decides — `-o0` (a digit) still claims nothing.
+                  -[!-]*o) _optval=1 ; _optv="-o" ;;
+                  -[!-]*O) _optval=1 ; _optv="-O" ;;
                   # ⛔ A SHELL'S VALUE OPTIONS ARE NOT FLAGS (review round 18, P2). bash/zsh accept
                   # their value as the NEXT word (`-o pipefail`, `-O extglob`, `--rcfile F`), so
                   # treating every shell option as a flag let that word close the prefix —
@@ -1369,8 +1383,15 @@ elif [ -d "$O" ]; then
   # listed as `surface: $O` — a false statement about what was measured, on exactly the population the
   # `--surface` fallback exists for (a hand-placed copy, a farmed cell, an operator-synced $O with no
   # usable record). The identity half abstained; say that, and say the dir's own bytes were not verified.
-  note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — but $O could NOT be identified (no usable harness record), so its own bytes were NOT verified against a record"
+  # ⛔ THE TOKEN BELONGS ON EVERY CLEAN EXIT, NOT ONE OF THREE (review round 21, P2). Only the
+  # `O_ABSENT -eq 0` arm was given `harness=current`, so on the populations this `--surface` fallback
+  # exists for (a hand-placed copy, a farmed cell, an operator-synced `$O` with no usable record) a
+  # clean run fell through the reader's `sed -n 's/.*harness=//p'` to `clean:rc=0` and the documented
+  # `drift=clean:current` was unreachable again — the same defect the arm above records. The verdict is
+  # `current` in both arms: the claim is the DIRS' bytes matching `$REF`, which is what was measured;
+  # the sentence keeps the caveat about the record itself.
+  note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — but $O could NOT be identified (no usable harness record), so its own bytes were NOT verified against a record harness=current"
 else
-  note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — no deployed dir was present to check"
+  note "OK: every harness dir on this box matches $REPO@$REF ($TIP_SHORT) — no deployed dir was present to check harness=current"
 fi
 exit 0
