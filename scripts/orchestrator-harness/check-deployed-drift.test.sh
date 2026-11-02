@@ -544,6 +544,31 @@ ck "10a-3: grep on an ABSOLUTE orch-loop.sh path does NOT fabricate a controller
    "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
 ck "10a-3: …it is reported as a MENTION instead, so the fact is not lost" \
    "$(qF "MENTIONS an orch-loop.sh" "$OUT" && echo 0 || echo 1)"
+# (10a-3b) A WORD THAT MERELY *LOOKS* LIKE AN INTERPRETER IS STILL A MENTION (review round 12, P1).
+# `_interp` used to be ARMED by any word spelled like a shell, at any position — so the grep PATTERN
+# nominated the next absolute path as the executing script. Measured on the round-11 head: every form
+# below produced `executes:` on a box running no controller, which (once #10114 makes the token red a
+# pass and durable in `drift=`) exits 1 on a HEALTHY box with a false diagnosis. `x` above did not
+# catch it because `x` is not a shell name — the class was pinned by one non-shell word only.
+for _pat in sh bash env zsh dash busybox; do
+  printf '4256 grep -n %s %s/orch-loop.sh\n' "$_pat" "$GONE" > "$TMP/ps-pat-$_pat"
+  surf "$TMP/ps-pat-$_pat"
+  ck "10a-3b: a grep PATTERN spelled '$_pat' does NOT fabricate a controller" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+# …and the same for an OPTION-introduced pattern, which used to be the keep-arm's blind spot.
+printf '4257 grep -i env %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-pat-opt"
+surf "$TMP/ps-pat-opt"
+ck "10a-3b: 'grep -i env <abs>' does NOT fabricate a controller" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+# (10a-3c) THE PREFIX MUST SURVIVE A WRAPPER'S OPERANDS (review round 12). The fix for 10a-3b must not
+# cost these: they are measured launcher shapes and each is a REAL invocation.
+for _w in 'nice -n 5 /bin/bash' 'timeout 300 bash' 'sudo -u deploy bash' 'stdbuf -o0 bash' 'env bash'; do
+  printf '4258 %s %s/orch-loop.sh\n' "$_w" "$GONE" > "$TMP/ps-wrap"
+  surf "$TMP/ps-wrap"
+  ck "10a-3c: '$_w <abs>/orch-loop.sh' is still an INVOCATION" \
+     "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+done
 # (10a-4) A TRAILING PATH AFTER A `-c` STRING IS `$0`, NOT THE SCRIPT (review VGATE of round 8). The
 # `-c` arm advances past the command string, so an ordinary-word guard never sees it: `_interp` stayed
 # 1 for the rest of the argv and `bash -c 'sleep 30' <gone>/orch-loop.sh` fabricated `executes:` on a

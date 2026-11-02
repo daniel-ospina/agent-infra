@@ -249,7 +249,11 @@ export function stalenessBanner(repo: string, behind: number, threshold: number)
     // ⛔ THE PIN CORRECTION IS PRINTED AT THE HINT SITE, NOT HERE (review P2). The banner and the
     // `update available — run: …` hint both fire on the warn path, so carrying it in both showed the
     // reader the trap, the correction, the same trap, the same correction at every session start.
-    // One site, and it is the one that shows the command.
+    // ⛔ `syncHint` ITSELF IS PRINTED AT THREE SITES — the warn hint, DIVERGED and the auto-sync
+    // FAILED path — but only the WARN-HINT arm appends `pinLines`; the other two print the command
+    // without the correction (review round 12, finding 6 — the previous sentence here said "one
+    // site", which is true of the correction and false of the command, and the two comments
+    // contradicted each other).
   ];
 }
 

@@ -114,12 +114,13 @@ ahead=0
 dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
+drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
 lanes=none-signalled
 fetch=ok                     <- the comparison was FRESH; a failure is rc=23, never `current`
-detail=current: the pin tree already names origin/main — head=ce987bb2c1de deployed=ce987bb2c1de ref=ce987bb2c1de behind=0 ahead=0 dirty=0 pin=ce987bb2c1de pin_tree=ce987bb2c1de
+detail=current: the pin tree already names origin/main — head=ce987bb2c1de deployed=ce987bb2c1de ref=ce987bb2c1de behind=0 ahead=0 dirty=0 pin=ce987bb2c1de pin_tree=ce987bb2c1de drift=clean:current
 ```
 
 `detail` is the verdict sentence **plus the readings appended by the recorder**, so the line

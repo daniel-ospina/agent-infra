@@ -561,7 +561,8 @@ def harness_apply_record():
     # silent green this whole change exists to end, one level up: the pass is honest, and the reader
     # above it threw the honesty away.
     drift = kv.get("drift", "")
-    # ⛔ THE FIELD IS `<state>:<token>`, SO MATCH THE TOKEN, NOT THE WHOLE FIELD (review round 11, P1\n    # — the round-10 fix was DEAD because of this). `harness-apply-pass.sh` writes
+    # ⛔ THE FIELD IS `<state>:<token>`, SO MATCH THE TOKEN, NOT THE WHOLE FIELD (review round 11, P1
+    # — the round-10 fix was DEAD because of this). `harness-apply-pass.sh` writes
     # `${DRIFT_STATE}${DRIFT_TOKEN:+:$DRIFT_TOKEN}`, and on the red arm the state IS `drift`, so the
     # record reads `drift=drift:executes:/gone/…` — `startswith("executes:")` therefore NEVER matched
     # and the alarm that exists to stop this instrument certifying a box whose executing tree is gone

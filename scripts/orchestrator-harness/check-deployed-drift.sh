@@ -40,7 +40,7 @@
 #
 # So `--surface` now reads the process's OWN argv — `ps -eo pid=,command=`, with `/proc/<pid>/cmdline`
 # where the kernel keeps the argv (so a path containing a space survives, and a RELATIVE one resolves
-# against the CONTROLLER's cwd, never ours) — matching EVERY element rather than a fixed position, so
+# against the CONTROLLER's cwd, never ours) — scanning EVERY element rather than a fixed position, so
 # `bash <dir>/orch-loop.sh`, `env bash <dir>/orch-loop.sh` and `bash -c <dir>/orch-loop.sh` are the same
 # fact; keeping the PID; and answers three ways — only one of which may pass:
 #   dir           → compared against $REF by the candidate pass below, labelled RUNNING;
@@ -709,6 +709,14 @@ if [ "$SURFACE" -eq 1 ]; then
   # reported as a mention (`note`), not as a controller. No launcher this repo ships produces that shape
   # (they pass the script as an argv element), and the alternative — treating any absolute-looking path in
   # a `-c` string as the executing tree — reds the box for `bash -c 'grep -n foo /x/orch-loop.sh'`.
+  # ⛔ SECOND STATED RESIDUAL (review round 12): the predicate is "argv[0], or an interpreter reached
+  # through a command PREFIX" — an absolute path that appears with NO interpreter in front of it is a
+  # MENTION, not a controller. That is deliberate (it is what keeps `grep [-n] [sh] <abs>/orch-loop.sh`
+  # from fabricating a controller), and it means an exotic launcher that puts a non-wrapper word between
+  # the interpreter and the script — `sudo -u <user> -i bash <path>` with the interpreter not reachable
+  # through the two operand slots — would be reported as a mention. No launcher this repo ships does.
+  # The prefix cost is why `_warg` exists: `nice -n 5 /bin/bash <path>`, `timeout 300 bash <path>` and
+  # `sudo -u deploy bash <path>` are measured shapes and all still count.
   PROC="${DRIFT_PROC:-/proc}"
   : > "$TMPD/ps-unres"
   if [ -n "$_ps" ]; then
@@ -727,9 +735,26 @@ if [ "$SURFACE" -eq 1 ]; then
       fi
       if [ "${#_argv[@]}" -eq 0 ]; then read -r -a _argv <<< "$_flat"; fi   # flattened fallback (space path lost)
       _script=""; _interp=0; _text=0; _i=0; _n=${#_argv[@]}
+      # ⛔ `_pfx` IS THE COMMAND PREFIX (review round 12, P1). `_interp` used to be ARMED at the top of
+      # the loop by ANY word spelled like a shell, at any position — so a word that is merely a grep
+      # PATTERN nominated the next absolute path as the executing script. Measured on this head:
+      # `grep -n sh <pin>/…/orch-loop.sh`, `grep -n bash …`, `grep -n env …`, `grep -i sh …` all
+      # produced `DRIFT(exec): … executes <pin>/…` on a box running no controller, i.e. the pass took
+      # the `executes:` arm, exited 1 on a HEALTHY box and wrote a false `drift=drift:executes:…` that
+      # fleet-health alarms on — the exact class this whole change exists to close, and now made worse
+      # because the token is durable and red. Arming is therefore limited to the command prefix.
+      # ⛔ THE PREFIX IS NOT "argv[0] OR ALREADY ARMED" (which would be the obvious wrong fix): that
+      # loses `nice -n 5 /bin/bash <path>` — a measured shape (`tools/fleet/outcome_canary.test.py`) —
+      # because `5` is an ordinary word. So a wrapper word opens N argument SLOTS that keep the prefix
+      # alive (`nice`, `sudo -u <user>`, `timeout 300`, `stdbuf -o0`), and only running out of slots
+      # ends it.
+      _pfx=1; _warg=0
       while [ "$_i" -lt "$_n" ]; do
         _w="${_argv[$_i]}"
-        case "${_w##*/}" in bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) _interp=1 ;; esac
+        # ⛔ ARMED ONLY WHILE THE PREFIX IS ALIVE — see above.
+        case "${_w##*/}" in
+          bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) [ "$_pfx" -eq 1 ] && _interp=1 ;;
+        esac
         case "$_w" in
           # ⛔ AN ABSOLUTE PATH IS UNAMBIGUOUS; A BARE OR RELATIVE WORD IS NOT (review P1, #10114).
           # `orch-loop.sh` as an argv element is produced by ROUTINE agent traffic — `grep -n x
@@ -787,7 +812,10 @@ if [ "$SURFACE" -eq 1 ]; then
             # rest of the argv — `bash -c 'sleep 30' <gone>/orch-loop.sh` therefore nominated the
             # trailing path as the script and fabricated `executes:` on a healthy box (reproduced).
             # Everything after a `-c` string is `$0`/arguments, never the script.
-            _interp=0 ;;
+            _interp=0
+            # …and the PREFIX is closed too, so a shell-name argument after the command string cannot
+            # re-arm it (review round 12).
+            _pfx=0 ;;
         esac
         # ⛔ `_interp` DESCRIBES THE COMMAND PREFIX, NOT "AN INTERPRETER APPEARED SOMEWHERE EARLIER"
         # (review round 8, P2). It used to persist for the whole argv, so
@@ -798,11 +826,19 @@ if [ "$SURFACE" -eq 1 ]; then
         # Cleared only by an ORDINARY word: an interpreter and its options keep the prefix alive,
         # which is what makes `bash <path>`, `bash -x <path>`, `env bash <path>` and `bash -c <path>`
         # all still count.
+        # ⛔ A WRAPPER OPENS ARGUMENT SLOTS (review round 12). `nice -n 5 /bin/bash <path>`,
+        # `sudo -u <user> bash <path>`, `timeout 300 bash <path>` and `stdbuf -o0 bash <path>` are all
+        # real launchers; the words between the wrapper and the interpreter are its OPERANDS, not the
+        # command, so they must not end the prefix. A pure-number word is an operand too and is kept
+        # for the same reason.
         case "$_w" in
           -*) : ;;
           *) case "${_w##*/}" in
-               bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) : ;;
-               *) _interp=0 ;;
+               bash|sh|dash|zsh|ksh|ash|mksh|busybox) : ;;
+               env|nice|sudo|timeout|stdbuf|command|exec|nohup|setsid|doas) _warg=$((_warg + 2)) ;;
+               *) case "$_w" in
+                    *[!0-9]*) if [ "$_warg" -gt 0 ]; then _warg=$((_warg - 1)); else _pfx=0; _interp=0; fi ;;
+                  esac ;;
              esac ;;
         esac
         _i=$((_i + 1))

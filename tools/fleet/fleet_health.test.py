@@ -422,16 +422,21 @@ def leg_harness_apply(mod):
         detail, alarm = rec(rc=23, action="cannot-verify", drift="not-run:absent")
         check(alarm and "NEVER RUN" in detail,
               "HARNESS: an ABSENT checker alarms — we cannot verify what we did not run")
-        # ⛔ THE OPPOSITE ERROR: a pre-flow refusal writes `not-run:not-run`, and naming a MISSING
-        # CHECKER there would send an operator after the wrong fault. It must fall through to the
-        # ordinary reporting arm, which names the refusal it actually was.
-        detail, alarm = rec(rc=23, action="unresolvable-ref", drift="not-run:not-run")
+        # ⛔ THE SHAPE PRODUCTION ACTUALLY WRITES (review round 12, finding 3). The pre-flow refusals
+        # call `write_record` BEFORE `DRIFT_STATE`/`DRIFT_TOKEN` are initialised, so they emit a BARE
+        # `drift=not-run` — never `not-run:not-run`, which nothing can produce. The reader was already
+        # right on the real shape; the FIXTURE was testing an impossible one, so the shape that ships
+        # was uncovered.
+        detail, alarm = rec(rc=23, action="unresolvable-ref", drift="not-run")
         check(alarm and "unresolvable-ref" in detail and "NEVER RUN" not in detail,
               "HARNESS: a pre-flow refusal is NOT reported as a missing checker")
         # A clean pass with drift at rest is REPORTED, not alarmed, and the field is visible either way.
         detail, alarm = rec(drift="drift:behind:709dfb06eac2")
-        check(alarm or "drift=drift:behind" in detail,
-              "HARNESS: a copy-at-rest reading is shown, not swallowed")
+        # ⛔ `not alarm` AND the detail, not `alarm or detail` (review round 12, finding 4): the `or`
+        # form passes even if a benign at-rest reading STARTS ALARMING, which is precisely the
+        # regression this arm exists to catch.
+        check(not alarm and "drift=drift:behind" in detail,
+              "HARNESS: a copy-at-rest reading is shown, not swallowed, and does not alarm")
         detail, alarm = rec(drift="clean:current")
         check(not alarm and "drift=clean:current" in detail,
               "HARNESS: a clean drift reading is green and visible")
