@@ -20,7 +20,7 @@
 // Secrets never sync: auth.json and env vars stay machine-local by design.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { execSync, execFileSync } from "node:child_process";
 import { isPrintMode } from "./shared/print-mode.js";
@@ -50,18 +50,62 @@ export function pinnedSha(home: string = process.env.HOME ?? ""): string {
 }
 
 /**
+ * The directories this box materialises pinned harness trees under, in the order a box names them:
+ * `HARNESS_PIN_DIR` (what the installer, the units and the checker all read), then the historical
+ * `<home>/harness` default. Used only to answer "is this pin a record about a tree that EXISTS here"
+ * — never to decide WHICH tree runs (that is `check-deployed-drift.sh`'s job, from process argv).
+ */
+export function pinTreeRoots(home: string = process.env.HOME ?? ""): string[] {
+  const roots: string[] = [];
+  const env = process.env.HARNESS_PIN_DIR;
+  if (env) roots.push(env);
+  if (home !== "") roots.push(join(home, "harness"));
+  return roots;
+}
+
+/**
+ * Is this pin a record about a deployed tree this box ACTUALLY CARRIES? `harness/<sha12>` present
+ * under any pin root means yes. Used to keep `pinMismatchLines` from claiming a deployment on a box
+ * that has none (agent-infra#10114).
+ */
+export function pinTreeDeployed(pin: string, home: string = process.env.HOME ?? ""): boolean {
+  if (pin === "") return false;
+  for (const root of pinTreeRoots(home)) {
+    try {
+      if (statSync(join(root, pin)).isDirectory()) return true;
+    } catch {
+      /* absent or unreadable root — try the next */
+    }
+  }
+  return false;
+}
+
+/**
  * agent-infra#10114: `cd <checkout> && ./sync.sh` is the advertised repair command, and it is a TRAP
  * when `AGENT_INFRA_PATH` names a checkout that is not the pin — it fast-forwards THAT tree, and the
  * deployed harness keeps running the old code. Measured: the advertised command synced from an Aug-7
  * checkout (HEAD 3b9a41562) while the pin named a different commit, so following the instructions
  * changed nothing the box executes. Returns the correction lines (possibly empty) — EMPTY whenever
- * the pin is unknown OR the checkout already IS the pin, so the normal case stays quiet.
+ * the pin is unknown, OR the checkout already IS the pin, OR the pin describes NO TREE THIS BOX
+ * CARRIES, so the normal case stays quiet.
+ *
+ * ⛔ THE THIRD CONDITION IS A FIX, NOT A WIDENING (measured, 2026-11-02). A leftover
+ * `~/.pi/agent/state/HARNESS-PIN` — a record from an earlier harness era, or a Mac that never
+ * deployed a harness at all — made this function assert, on every session start, that "the box
+ * EXECUTES" a tree that does not exist on that box. `harness/<pin12>` is the only evidence a pin
+ * names a real deployment; without it the record describes nothing, and the honest answer is the
+ * empty one this function already documents as its normal case. ⛔ ONE PREDICATE PER FACT (#1178):
+ * "a live controller executes a GONE tree" is `check-deployed-drift.sh`'s `executes:` token, read
+ * from process argv — NOT this banner, which reads a record. Reporting that fact from a record is
+ * how a healthy box came to read as drifted.
  */
 export function pinMismatchLines(repo: string, home: string = process.env.HOME ?? ""): string[] {
   const pin = pinnedSha(home);
   const head = shortHead(repo);
   if (pin === "" || head === "?" || head === "") return [];
   if (pin.startsWith(head) || head.startsWith(pin)) return [];
+  // A pin that names no deployed tree on THIS box is not a claim about anything the box executes.
+  if (!pinTreeDeployed(pin, home)) return [];
   return [
     `[auto-sync]    ⛔ this checkout is at ${head} but the PIN is ${pin} — ./sync.sh advances THIS tree, not the harness the box EXECUTES.`,
     `[auto-sync]    To advance the deployed harness: scripts/harness-apply-pass.sh (or cloud-cell-supervisor.sh apply --force --pin-only), then restart the controller from the pinned tree.`,

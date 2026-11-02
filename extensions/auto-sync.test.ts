@@ -969,12 +969,38 @@ async function main() {
     const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
     mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
     const repo = seededRepo();
-    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"),
-      "0123456789abcdef0123456789abcdef01234567\n");
+    const pin = "0123456789abcdef0123456789abcdef01234567";
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${pin}\n`);
+    // ⛔ THE FIXTURE MUST CARRY THE DEPLOYED TREE. A pin record alone is a RECORD; `harness/<pin12>`
+    // is the evidence that it names a deployment this box actually carries. Without it the case this
+    // test used to assert is the FALSE POSITIVE (below), not a genuine mismatch (#10114).
+    mkdirSync(join(home, "harness", pin.slice(0, 12)), { recursive: true });
     const lines = pinMismatchLines(repo, home);
     equal(lines.length, 2, "a genuine mismatch names the trap and the remedy");
     ok(lines[1].includes("--force --pin-only"),
       "the remedy must carry --force: apply REFUSES a live cell without it, and a pin box has a live controller");
+  });
+
+  // ⛔ MEASURED FALSE POSITIVE, FIXED HERE (#10114 review finding 10). A leftover
+  // `~/.pi/agent/state/HARNESS-PIN` — an earlier harness era, or a Mac that has never deployed a
+  // harness — made every session start claim "this checkout is at X but the PIN is Y … the harness the
+  // box EXECUTES", on a box that executes no harness at all and whose only sin was carrying `sync.sh`.
+  // Before `pinTreeDeployed()`, both cases below returned 2 lines; only the second is a real mismatch.
+  await test("pinMismatchLines is SILENT when the pin names NO deployed tree this box carries", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const repo = seededRepo();
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"),
+      "0123456789abcdef0123456789abcdef01234567\n");
+    equal(pinMismatchLines(repo, home).length, 0,
+      "a leftover pin record with no harness/<pin12> describes nothing the box executes — it must not " +
+      "read as drift on a healthy non-deploying box");
+    // …and the SAME record DOES speak up once the deployed tree exists: the fix must not have
+    // silenced the true positive. This is the discriminating half — a test that only asserts the
+    // silence would pass on a function that returns [] unconditionally.
+    mkdirSync(join(home, "harness", "0123456789ab"), { recursive: true });
+    equal(pinMismatchLines(repo, home).length, 2,
+      "with the deployed tree present the mismatch MUST still fire");
   });
 
   await test("pinMismatchLines is SILENT on an absent, empty or non-sha pin record", () => {

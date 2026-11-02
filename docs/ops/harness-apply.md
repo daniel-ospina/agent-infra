@@ -152,6 +152,7 @@ this repo keeps deleting.
 | code | meaning | unit colour |
 |---|---|---|
 | 0 | `current` — the pin already names the ref tip; nothing changed | green |
+| 1 | REFUSED `deployed-drift` — the pass itself succeeded, but a live controller is **EXECUTING** a harness tree the box cannot match to this repo (see *Deployed-drift reading* below) | **red** |
 | 10 | `advanced` — the materialiser ran and the pin moved (or a lying pin record was repaired) | green |
 | 11 | `mended` — the pin was missing/empty; what the box actually runs was recorded | green |
 | 20 | REFUSED dirty — the tree carries work that could not be preserved | **red** |
@@ -162,6 +163,40 @@ this repo keeps deleting.
 
 A red tick is deliberate: those are states a **human** must resolve, and the unit colour
 is the only surface that reaches someone who is not tailing a log.
+
+### Exit 1 — `deployed-drift`
+
+Every other code answers *"did this pass advance the box?"*. Exit 1 answers a different
+question, and it is the one `#10114` measured a whole fleet failing on:
+**is the code this box EXECUTES the code this repo ships?**
+
+The pass takes one deployed-drift reading per tick, from the final state, by calling
+`scripts/orchestrator-harness/check-deployed-drift.sh --surface` and printing its token as
+`harness: deployed_drift=<state> token=<token>` (recorded in the `drift=` field).
+
+Only one token reds a pass this way:
+
+| token | pass result |
+|---|---|
+| **`executes:<dir>`** — a live controller executes a directory the box does not have | **exit 1**, `action=deployed-drift` |
+| `behind:<sha>`, `payload-differs`, `uncommitted-edit:<path>`, `surface` | reported in `drift=`, pass stays green |
+| `UNKNOWN:` / exit 2 from the checker | reported, pass stays green (`cannot-verify-rc2`) |
+
+Scoped deliberately: the other tokens legitimately describe a developer box mid-edit or a
+deliberately-behind checkout, and a check that reds every working box is one operators
+learn to ignore. Only a live controller running code the box does not have means
+**nothing** the controller does is this repo's code.
+
+⛔ **Exit 1 is not clearable by redeploying.** A redeploy writes a copy at rest; it does not
+restart the controller, so the gone tree keeps being executed. The remedy — carried in the
+record's own `remedy=` field, untruncated — is: advance the pin
+(`cloud-cell-supervisor.sh apply --force --pin-only`), then **restart the controller from
+the pinned tree**.
+
+`detail=` is bounded at 240 characters, which is why `remedy=` and `preserved=` are
+separate fields: an operator-needed fact must never be at the mercy of a prose truncation
+(measured — the `deployed-drift` sentence is 706 characters and its remedy begins at 272,
+so `detail=` alone loses the remedy entirely).
 
 ## Install, verify, disarm
 
