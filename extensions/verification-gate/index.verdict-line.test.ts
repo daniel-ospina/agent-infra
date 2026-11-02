@@ -26,8 +26,22 @@
  *       "the gate did NOT read this line" about a line the gate DID read and block on — that redirects
  *       the operator from "fix the files" to "re-shape this line", i.e. a re-dispatch of the same
  *       block-attempt shape (#7591).
+ *   (e) a NEGATED PASS (#3164) is a REFUSAL, not an attestation — bare, labelled, quoted, bracketed and
+ *       ✅ shapes; in the smart-apostrophe, markdown-emphasis, `neither` and interrogative spellings a
+ *       model actually emits; and with the token read at the position the SHAPE anchored, so a second
+ *       mid-sentence mention on the same line cannot attest. The AFFIRMATIVE block under it is the guard
+ *       against the opposite error (`[no regressions] PASS`, `PASS: 0 failures`, `PASS: nothing to fix`).
+ *   (e-cost) the ACCEPTED false-block class, pinned so it is not "fixed" away without a decision: an
+ *       attested PASS whose immediate clause opens with a negation (`PASS: did not run the e2e suite`)
+ *       blocks, because "not all files were needed" and "not all files verified" are the same shape.
  *
- * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 26 cases that
+ * NOT pinned here, deliberately: the INTERACTIVE leg of (e). In an interactive session the #5724
+ * fail-open merges an unparseable reply anyway, so a negated PASS is ALLOWED there either way — the
+ * same outcome via a different branch. There is no discriminating assertion to write until that
+ * fail-open is decided; adding a case that passes for the wrong reason is what the (c) note above
+ * warns about. Measured and recorded on the issue instead.
+ *
+ * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 71 cases that
  * went red under that single mutation, not an estimate — an unmeasured count here was review r1's
  * second finding):
  *   M1 revert the `verdictLine` helper to the pre-#10219 bare-token hasPass
@@ -49,6 +63,9 @@
  *   NOT mutation-pinned: the line anchor and the `\b` are pinned by (b) as PRE-EXISTING behavior
  *   (they passed before the fix and must keep passing) — they are regressions guards, not
  *   discriminators, and are stated here rather than implied.
+ *   M6 revert `hasPass = passAttested(textContent)` to the pre-#3164 expression
+ *      → 32 red: every `(e)` negation case, both `(e-cost)` caveat cases, the negation-note case, and
+ *      `(e)`'s `✅ not verified: PASS`. MEASURED on this tree, not estimated.
  *
  * Hermetic: HOME is redirected to a temp dir before the plugin is imported (the bridge and the
  * audit log are HOME-derived) and every case gets its own throwaway git repo.
@@ -301,6 +318,141 @@ async function main() {
     ok(/fail-verdict/.test(reason), `the fail-verdict ceremony must render, proving the class was recorded; got: ${reason.slice(-500)}`);
     ok(!/did NOT read it as one|mentioned a verdict on this line/.test(reason), `a JUDGMENT must never be reported as an unread verdict line; got: ${reason.slice(-500)}`);
     ok(/address the failures it listed/.test(reason), "the remedy must stay 'fix the files it listed', not 're-shape the line'");
+  });
+
+  // ── (e) #3164: a NEGATED PASS is a MENTION, not an ATTESTATION ─────────────────────────────────
+  // The shape arms end at the token (`PASS(?:\b|:|—)` — "PASS, then anything"), so a verifier that
+  // REFUSES to attest by naming the token was read as having attested and the files were MERGED —
+  // a false PASS, the one failure class this gate may not have. Measured against
+  // origin/main@951e4c8219c7 with the real plugin factory (PI_MODE=print, TASK_HEARTBEAT=1): every
+  // spelling below ALLOWED, and the files stayed recorded across repeated retries.
+  //
+  // Each `(e)` case below is the discriminator; the AFFIRMATIVE block beneath it is the guard
+  // against the opposite error — a guard that blocks a correct reply costs a re-dispatch too.
+  console.log("\n(e) a NEGATED PASS does NOT attest (it is a refusal, not a verdict):");
+
+  for (const [label, reply] of [
+    ["prose negation `PASS is not claimed`", "PASS is not claimed — two tests are red."],
+    ["punctuated `PASS: not claimed`", "PASS: not claimed"],
+    ["contraction `PASS isn't claimed`", "PASS isn't claimed"],
+    ["`PASS: cannot be claimed`", "PASS: cannot be claimed"],
+    ["`PASS is never claimed here`", "PASS is never claimed here"],
+    ["auxiliary `PASS was not verified`", "PASS was not verified"],
+    ["labelled `Result: PASS is not claimed`", "Result: PASS is not claimed"],
+    // The same class in the OTHER shapes the gate accepts — a guard that only fixed the bare arm
+    // would leave every rendered spelling of the same refusal merging.
+    ["bold `**PASS** is not claimed`", "**PASS** is not claimed"],
+    ["blockquoted `> PASS — not verified`", "> PASS — not verified"],
+    ["bracketed `[16:42] PASS: not verified`", "[16:42] PASS: not verified"],
+    ["`PASS has not been verified`", "PASS has not been verified"],
+    ["`PASS could not be verified`", "PASS could not be verified"],
+    ["`Verdict: PASS not claimed`", "Verdict: PASS not claimed"],
+    ["`Status: PASS hasn't been verified`", "Status: PASS hasn't been verified"],
+    // PREFIX negation: the bracketed arm admits up to 40 chars of arbitrary text BEFORE the token,
+    // so a tail-only guard does not cover it.
+    ["bracket-prefixed `[not verified] PASS`", "[not verified] PASS"],
+    ["bracket-prefixed `[no] PASS`", "[no] PASS"],
+    ["bracket-prefixed contraction `[isn't verified] PASS`", "[isn't verified] PASS"],
+    // The negation vocabulary a model actually emits. Each of these was MEASURED merging on the
+    // first cut of this fix (review r1): smart-quote contraction, markdown emphasis between the
+    // auxiliary and the negation, `neither`, an interrogative, and the ✅ arm's own prefix.
+    ["smart-apostrophe `PASS hasn’t been verified`", "PASS hasn\u2019t been verified"],
+    ["claimed contraction `PASS isn’t claimed`", "PASS isn\u2019t claimed"],
+    ["emphasis `PASS is **not** claimed`", "PASS is **not** claimed"],
+    ["emphasis `PASS is _not_ claimed`", "PASS is _not_ claimed"],
+    ["`PASS: neither file verified`", "PASS: neither file verified"],
+    ["`PASS: No — two tests are red.`", "PASS: No — two tests are red."],
+    ["`PASS? No.`", "PASS? No."],
+    ["✅ prefixed `✅ not verified: PASS`", "\u2705 not verified: PASS"],
+    // ⛔ THE SEMICOLON (review r2 / VGATE). The first cut ENUMERATED the punctuation that may sit
+    // between the token and the negation and omitted `;`, so `PASS; not claimed` merged in all five
+    // shapes — the same refusal, one keystroke away. It is now stated positively (only a letter or
+    // digit ends the run); these cases are what makes that permanent.
+    ["semicolon `PASS; not claimed`", "PASS; not claimed"],
+    ["semicolon `Result: PASS; not claimed`", "Result: PASS; not claimed"],
+    ["semicolon `**PASS**; not verified`", "**PASS**; not verified"],
+    ["semicolon `[16:42] PASS; not verified`", "[16:42] PASS; not verified"],
+    ["ellipsis `PASS… not verified`", "PASS\u2026 not verified"],
+    ["slash `PASS/not verified`", "PASS/not verified"],
+    // A line attests at the token the SHAPE anchored. A later, mid-sentence mention on the same line
+    // is prose, not a second verdict — `verdictLine` is line-anchored for exactly this reason.
+    ["mid-sentence second mention `PASS is not claimed: I cannot give a PASS.`", "PASS is not claimed: I cannot give a PASS. Two tests are red."],
+  ] as [string, string][]) {
+    test(`(e) ${label} BLOCKS`, async () => {
+      const res = await verdictFor(reply);
+      ok(res && res.block === true, `\`${reply}\` is a REFUSAL — the gate must not merge on it`);
+    });
+  }
+
+  // The other half of the rule: these ATTESTS and must keep clearing. A `not`/`no` that is not
+  // attached to the token is commentary, not a negation of the verdict.
+  for (const [label, reply] of [
+    ["`PASS — I could not reproduce the failure`", "PASS — I could not reproduce the failure"],
+    ["`PASS: no failures` (`no` is not a negation of the verdict)", "PASS: no failures"],
+    ["`PASS: nothing to fix` (`nothing` is not `not`)", "PASS: nothing to fix"],
+    ["`PASS: 0 failures`", "PASS: 0 failures"],
+    ["`PASS - 2/2 files verified`", "PASS - 2/2 files verified"],
+    ["`Result: PASS, nothing to fix`", "Result: PASS, nothing to fix"],
+    // The prefix rule must not eat an affirmative bracket phrase (review r1: the first cut used a
+    // bare `\bno\b` and false-BLOCKED `[no regressions] PASS`, a guard whose stated goal is
+    // "0 false blocks added").
+    ["`[no regressions] PASS`", "[no regressions] PASS"],
+    ["`[no issues] PASS`", "[no issues] PASS"],
+    ["`✅ no regressions — PASS`", "\u2705 no regressions \u2014 PASS"],
+    ["`✅ all 3 checks green — PASS`", "\u2705 all 3 checks green \u2014 PASS"],
+    ["`✅ no e2e suite exists — PASS`", "\u2705 no e2e suite exists \u2014 PASS"],
+  ] as [string, string][]) {
+    test(`(e) AFFIRMATIVE ${label} still clears`, async () => {
+      equal(await verdictFor(reply), undefined, `\`${reply}\` attests — the guard must not turn it into a false block`);
+    });
+  }
+
+  // ⛔ THE ACCEPTED COST of the rule, pinned so nobody "fixes" it by loosening the guard without a
+  // decision. The negative marker attaches to the token, so an attested PASS whose immediate clause
+  // OPENS with one is read as a refusal. That is deliberate and asymmetric on purpose: a false block
+  // costs one re-dispatch, a false PASS merges unverified bytes under a PASS the gate invented. The
+  // escape is in the verifier's hands — word the caveat so the negation is not adjacent
+  // (`PASS: caveat: did not run the e2e suite` clears). "not all files were needed" (a caveat) and
+  // "not all files verified" (a refusal) are the SAME shape; no token-level rule can separate them.
+  console.log("\n(e-cost) an immediately-attached negation blocks even when it is a caveat:");
+  for (const [label, reply] of [
+    ["`PASS: did not run the e2e suite`", "PASS: did not run the e2e suite"],
+    ["`PASS — was not able to run X`", "PASS — was not able to run X"],
+    ["`PASS: not all files were needed`", "PASS: not all files were needed"],
+  ] as [string, string][]) {
+    test(`(e-cost) ${label} blocks (fail-closed trade-off, not an oversight)`, async () => {
+      const res = await verdictFor(reply);
+      ok(res && res.block === true, `\`${reply}\` carries an attached negation — fail-closed here is the decision`);
+    });
+  }
+  test("(e-cost) the SAME caveat clears once the negation is not adjacent (the verifier's escape)", async () => {
+    equal(await verdictFor("PASS: caveat: did not run the e2e suite"), undefined);
+  });
+
+  test("(e) one attested line still clears even when another line negates", async () => {
+    equal(await verdictFor("PASS: f.py verified\nPASS is not claimed for the docs, out of scope"), undefined);
+  });
+  test("(e) a NEGATED PASS is refused by the #285 ceremony, not silently merged", async () => {
+    const res = await verdictFor("PASS is not claimed — two tests are red.");
+    ok(res && res.block === true, "the refusal must block");
+    ok(/fail-open-refused|unparseable/.test(String(res.reason ?? "")), `the block must carry the #285/unparseable ceremony; got: ${String(res.reason ?? "").slice(-400)}`);
+  });
+  // ⛔ The remedy must not instruct the lane to produce the merge it just refused. The generic note
+  // says "an accepted verdict line is `PASS` / …" and a lane's most literal compliance is to re-emit
+  // `PASS` — which converts the verifier's refusal into an attestation. That is the (d3) failure
+  // mode: a remedy pointing at the SHAPE of a line that was fine.
+  test("(e) the reminder names the NEGATION and forbids re-emitting PASS", async () => {
+    const res = await verdictFor("PASS is not claimed — two tests are red.");
+    ok(res && res.block === true, "the refusal must block");
+    const reason = String(res.reason ?? "");
+    ok(/NEGATED its PASS/.test(reason), `the note must name the negation; got: ${reason.slice(-500)}`);
+    ok(/Do NOT re-emit `PASS`/.test(reason), `the note must forbid re-emitting PASS; got: ${reason.slice(-500)}`);
+    ok(!/an accepted verdict line is/.test(reason), "the shapes hint must NOT be shown — the shape was accepted, the content was not");
+  });
+  test("(e) a reply whose line was NOT a shape still gets the generic shapes hint (the note did not move)", async () => {
+    const res = await verdictFor("I looked at everything and it seems fine to me.");
+    ok(res && res.block === true, "prose must block");
+    ok(/No line of the last verifier reply mentioned PASS or FAIL/.test(String(res.reason ?? "")), "the no-verdict note must still render for a prose reply");
   });
 
   await runAll();
