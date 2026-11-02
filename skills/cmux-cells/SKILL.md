@@ -465,7 +465,9 @@ bash scripts/admin-merge.sh <pr>                                                
 - A record for a non-current head is **refused (exit 3)**. Never `--force-stale`.
 - **Never edit the PR body after recording** — it wipes the attestation.
 - One reviewer child per PR; two rail attempts. A refusal while an attestation exists at the head is a **harness defect to
-  record**, not a loop to retry. `queued` / `in progress` is neither a failure nor a stall.
+  record**, not a loop to retry. ⛔ **Scope: that rule is about refusals of the EVIDENCE** — the gate rejecting an
+  attestation that exists. It does **not** cover the rail refusing because the **base tree** is red; that is the rail
+  working correctly, and it names its own remedy (see §6.5). `queued` / `in progress` is neither a failure nor a stall.
 
 ### 6.5 Batching several reviewed PRs into one landing
 
@@ -517,12 +519,14 @@ red on `main`, and a batch is then red for a reason that has nothing to do with 
 re-run ADDS a red, it does not clear one**.
 
 **⛔ Do NOT paraphrase the rail's red-base refusals — read them off the rail.** It has several (an already-red base the
-PR does not repair; a base red the PR has not measured; a merge ref lagging a red base), **each with its own message
-and its own remedy**, and this skill is not their source of truth. A paraphrase written from review findings was wrong
-in a new way on five consecutive rounds, which is the signal to stop writing it: run the rail and read what it prints.
-Two things worth knowing before you guess a remedy — **the remedy differs per step**, and when a review record is bound
-to the PR head the rail will **not** move that head (`refresh_pr_branch`), so "just re-run it until it passes" is not a
-remedy for every step.
+PR does not repair; a base red the PR has not measured; a merge ref lagging a red base; a merge-ref base parent it
+could not read), **each printing its own message**, and this skill is not their source of truth. A paraphrase written
+from review findings was wrong in a new way on five consecutive rounds, which is the signal to stop writing it: run the
+rail and read what it prints.
+Two things worth knowing before you guess a remedy — **the remedy differs per step** (one step says fix the failing
+check; two re-measure and re-run; one says check auth/network), and when a review record is bound to the PR head the
+rail will **not** move that head (`refresh_pr_branch`), so "just re-run it until it passes" is not a remedy for every
+step.
 
 **Fixing `main` is the higher-leverage move: one green `main` makes EVERY PR attestable, while batching makes only the
 handful in the batch.**
