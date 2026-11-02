@@ -8944,7 +8944,6 @@ main() {
       # 4 (the re-run was accepted but the attempt never advanced) are DIFFERENT
       # diagnoses with opposite remedies, and relabelling them as "budget" would
       # hide the only signal that says "repair gh" or "the re-run never started".
-      # The rc=1 and rc=4 arms below interpolate `${RERUN_TIMEOUT_SOURCE}`, and so does the
       # The rc=1, rc=3 and rc=4 arms BELOW each interpolate `${RERUN_TIMEOUT_SOURCE}`,
       # so the `; CLAMPED …` disclosure survives on all of them without this arm.
       if [ "$wait_rc" -eq 2 ] && [ "${RERUN_TIMEOUT_CLAMPED:-0}" -eq 1 ]; then
