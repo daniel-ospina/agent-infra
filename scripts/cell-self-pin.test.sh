@@ -365,6 +365,46 @@ refuses 'ONE Environment=CELL_HOME= naming a different base' "$(doctor_rw cmhome
 # OVERRIDE `Environment=`, so it can re-base `CELL_HOME` while the count rule above still sees exactly one
 # assignment and passes. Refused by name, because the rendered pass needs no environment file at all.
 refuses 'an EnvironmentFile= (overrides Environment=)' "$(doctor envfile 'EnvironmentFile=/srv/cell-pin.env')" "$T/u21" 'EnvironmentFile='
+# ── 4c. WHAT SYSTEMD READS IS NOT WHAT A LINE READER READS (round-5 review findings) ───────────────
+# ⛔ EVERY LEG BELOW INSTALLED rc=0 BEFORE ITS RULE EXISTED. These are not hypothetical spellings: each is
+# documented in `systemd.syntax(7)` / `systemd.exec(5)` and each one changes the pass's EFFECTIVE base
+# while `verify_unit`'s count rule still sees exactly one correct `Environment=CELL_HOME=`.
+#
+# A BACKSLASH CONTINUATION IS ONE DIRECTIVE TO THE MANAGER AND TWO PHYSICAL LINES TO US. systemd: "Lines
+# ending in a backslash are concatenated with the following line while reading and the backslash is
+# replaced by a space character." So the joined directive carries a SECOND `CELL_HOME=`, which is LAST-WINS.
+d_cont="$T/doctored-cont"
+mkdir -p "$d_cont" && cp "$TPL/cell-self-pin.timer" "$d_cont/" && cp "$TPL/cell-self-pin.service" "$d_cont/"
+{
+  printf '\n[Service]\n'
+  printf 'Environment=HOME=%s \\\n' "$HOME"
+  printf 'CELL_HOME=/tmp/other-home\n'
+} >>"$d_cont/cell-self-pin.service"
+refuses 'a BACKSLASH CONTINUATION hiding a second CELL_HOME=' "$d_cont" "$T/u22" 'CONCATENATES'
+# …and the C-STYLE ESCAPE spelling of the same trick: `\x43` is `C` to systemd, an unknown name to a sed.
+refuses 'a C-STYLE ESCAPE spelling CELL_HOME=' "$(doctor escape 'Environment=\x43ELL_HOME=/tmp/other-home')" "$T/u23" 'CONCATENATES'
+# AN EMPTY `Environment=` IS A LIST RESET, and a word-split read of it yields NO words — so the count rule
+# saw one correct assignment while the manager had erased it. `systemd.exec(5)`: "If the empty string is
+# assigned to this option, the list of environment variables is reset, all prior assignments have no effect."
+refuses 'an EMPTY Environment= (a LIST RESET)' "$(doctor envreset 'Environment=')" "$T/u24" 'LIST RESET'
+# THE ENVIRONMENT-MUTATING FAMILY, refused by name and in ONE list: `UnsetEnvironment=` is documented as
+# applied AFTER everything (so it undoes `Environment=`), and `PassEnvironment=` imports the manager's own
+# variables. Both re-base the pass without the `Environment=` rules ever seeing it.
+refuses 'an UnsetEnvironment= (undoes Environment=)' "$(doctor unsetenv 'UnsetEnvironment=CELL_HOME')" "$T/u25" 'UnsetEnvironment='
+refuses 'a PassEnvironment= (imports the manager environment)' "$(doctor passenv 'PassEnvironment=CELL_HOME')" "$T/u26" 'PassEnvironment='
+# EXECSTART CONTAINMENT IS ON THE RESOLVED PATH. `<CELL_HOME>/../nowhere/x.sh` passes a string prefix test
+# and resolves outside the home — measured rc=0 — so two characters defeated the rule that keeps the pass
+# inside the one root a cell keeps. The parent here EXISTS, so the verdict must come from containment.
+mkdir -p "$T/nowhere"   # so the `..` below RESOLVES, and the verdict must come from containment
+refuses 'an ExecStart that escapes CELL_HOME via ..' "$(doctor_rw execdotdot "s|^ExecStart=/bin/bash .*\$|ExecStart=/bin/bash $T/home/../nowhere/cell-self-pin.sh|")" "$T/u27" 'NOT under CELL_HOME'
+# …and when the `..` path does not resolve at all, the containment rule cannot be evaluated, so it is refused
+# as such instead of guessed (a oneshot cannot exec an unresolvable path either way).
+refuses 'an ExecStart with an UNRESOLVABLE .. path' "$(doctor_rw execdotnope "s|^ExecStart=/bin/bash .*\$|ExecStart=/bin/bash $T/home/../no-such-dir/x.sh|")" "$T/u27c" 'traverses'
+# AND THE PAYLOAD MUST BE THE PASS THIS RUN PLACES. The rule used to be "somewhere under CELL_HOME", while
+# the existence check read the COMPUTED path rather than the artifact's — measured: a rendered unit naming
+# `${CELL_HOME}/scripts/gone.sh` installed rc=0 and would go 203/EXEC every tick. Parent exists here, so the
+# refusal can only be the identity rule.
+refuses 'an ExecStart naming a payload this run does not place' "$(doctor_rw execother "s|^ExecStart=/bin/bash .*\$|ExecStart=/bin/bash $T/home/scripts/gone.sh|")" "$T/u28" 'this install places the pass at'
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
 # `<unit>.service.d/*.conf` OVER it, in both managers, whether the drop-in was written before the unit or
@@ -373,10 +413,10 @@ refuses 'an EnvironmentFile= (overrides Environment=)' "$(doctor envfile 'Enviro
 # the defect in the issue was itself carried in a DROP-IN (`WorkingDirectory=/tmp/cell-ai`), and a box in
 # this fleet still carries `cell-self-pin.service.d/user.conf` today. Every leg below is the drop-in half
 # of a rule the artifact legs above already pin, so a guard that reads only the rendered file fails them.
-dropin_doctor() { # <name> <conf body> -> prints a unit dir carrying a drop-in with that body
-  local u="$T/dropin-$1"
-  mkdir -p "$u/cell-self-pin.service.d"
-  printf '[Service]\n%s\n' "$2" >"$u/cell-self-pin.service.d/legacy.conf"
+dropin_doctor() { # <name> <conf body> [drop-in dir name] -> prints a unit dir carrying a drop-in with that body
+  local u="$T/dropin-$1" dd="${3:-cell-self-pin.service.d}"
+  mkdir -p "$u/$dd"
+  printf '[Service]\n%s\n' "$2" >"$u/$dd/legacy.conf"
   printf '%s\n' "$u"
 }
 refuses_dropin() { # <name> <unit-dir> <must-appear-in-the-reason>
@@ -404,6 +444,22 @@ refuses_dropin 'widens the success vocabulary' "$(dropin_doctor okvals 'SuccessE
 refuses_dropin 'sets Environment=CELL_HOME= (re-basing the pass)' "$(dropin_doctor envhome 'Environment=CELL_HOME=/tmp/other-home')" 'never the base'
 refuses_dropin 'sets Environment=HARNESS_PIN_FILE= (re-pointing the record)' "$(dropin_doctor envpin 'Environment=HARNESS_PIN_FILE=/tmp/other-path')" 'never the base'
 refuses_dropin 'declares an EnvironmentFile= (overrides Environment=)' "$(dropin_doctor envfile 'EnvironmentFile=/srv/cell-pin.env')" 'EnvironmentFile='
+# THE SAME PARSE-LEVEL CLASS, ONE LAYER DOWN (round-5 review findings, all rc=0 before the rules existed):
+# a drop-in is a MORE dangerous place for these than the unit, because it is merged OVER the unit and an
+# operator reading the unit will never see it. `Environment=` in a drop-in also clears the list the MAIN
+# UNIT built — the documented way to remove an entry.
+refuses_dropin 'assigns an EMPTY Environment= (clears the unit list too)' "$(dropin_doctor envreset 'Environment=')" 'LIST RESET'
+refuses_dropin 'declares an UnsetEnvironment= (undoes Environment=)' "$(dropin_doctor unsetenv 'UnsetEnvironment=CELL_HOME')" 'UnsetEnvironment='
+refuses_dropin 'declares a PassEnvironment=' "$(dropin_doctor passenv 'PassEnvironment=CELL_HOME')" 'PassEnvironment='
+refuses_dropin 'declares a Unit= (re-targets the timer)' "$(dropin_doctor unit 'Unit=/bin/true.service')" 're-targets'
+refuses_dropin 'declares an OnCalendar= (re-schedules the timer)' "$(dropin_doctor oncal 'OnCalendar=*-*-* 00:00:00')" 're-schedules'
+# ⛔ AND THE DROP-IN IS FOUND WHEREVER systemd LOOKS, NOT ONLY IN `<unit>.service.d` (round-5 review
+# finding). `systemd.unit(5)`: a unit name with dashes also searches the directories made by repeatedly
+# truncating it after a dash, and `type.d/` applies to every unit of that type. Measured before:
+# `cell-.service.d/legacy.conf` carrying `Environment=CELL_HOME=/tmp/other-home` installed rc=0 and nothing
+# in the run mentioned the file — the same false PASS one directory over.
+refuses_dropin 'lives in a DASH-TRUNCATED drop-in dir (cell-.service.d)' "$(dropin_doctor dashdir 'WorkingDirectory=/srv/harness-current' 'cell-.service.d')" 'WorkingDirectory='
+refuses_dropin 'lives in the TYPE-LEVEL drop-in dir (service.d)' "$(dropin_doctor typedir 'ConditionPathExists=/srv/nope' 'service.d')" 'ConditionPathExists='
 # ⛔ THE NON-VACUITY CONTROL, and it is load-bearing: a drop-in that only sets IDENTITY is the operator's
 # DOCUMENTED remedy for the `User=root` render. Without this leg the gate above could "pass" by refusing
 # every drop-in, which would block the one migration this file recommends.
@@ -511,6 +567,59 @@ case "$out" in
   *'user manager'*) ok "…naming the user manager, so the operator knows which one to retire" ;;
   *) bad "…but does not name the user manager: $out" ;;
 esac
+# ── (b2) A MANAGER THAT DOES NOT ANSWER IS NOT A MANAGER WITH NO ACTUATOR ────────────────────────
+# ⛔ MEASURED ON THIS BOX, IN THE ENVIRONMENT A SYSTEM UNIT ACTUALLY HAS: `systemctl --user is-enabled`
+# answers "Failed to connect to bus: No medium found" and exits 1 — INDISTINGUISHABLE, by exit code, from
+# "disabled" — while `--install` went on to print "read back in both managers": a positive claim about a
+# manager that said nothing. A box whose shipped timer lives ONLY in the user manager (the documented
+# no-sudo fallback) would be reported as having ONE actuator while carrying TWO. The fake below makes the
+# system manager answer and the user manager NOT ANSWER, which no exit-code-only probe can tell apart.
+mk_blind_user_systemctl() { # <dir> <state-dir> — SYSTEM answers; the USER manager has NO BUS
+  local d="$1" s="$2"
+  mkdir -p "$d" "$s"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    "S='$s'" \
+    'if [ "${1:-}" = "--user" ]; then echo "Failed to connect to bus: No medium found" >&2; exit 1; fi' \
+    'verb="${1:-}"; shift 2>/dev/null || true' \
+    '[ "${1:-}" = "--now" ] && shift' \
+    'unit="${1:-}"' \
+    'st="$S/system-$unit"' \
+    'case "$verb" in' \
+    '  is-enabled) [ -f "$st" ] && exit 0 || exit 1 ;;' \
+    '  enable) : >"$st"; exit 0 ;;' \
+    'esac' \
+    'exit 0' >"$d/systemctl"
+  chmod +x "$d/systemctl"
+}
+mk_blind_user_systemctl "$T/fake-blind" "$T/state-blind"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-blind" PATH="$T/fake-blind:$PATH" \
+       bash "$PIN" --install 2>&1)"; rc=$?
+# ⛔ rc=0 IS CORRECT HERE AND THE DISTINCTION IS DELIBERATE: the units WERE installed and enabled, so a
+# non-zero exit would be a false RED on a box that is fine. What must change is the CLAIM — and the
+# `--takeover` path, where an unreadable scope really is dangerous, is the one that refuses (leg b3).
+[ "$rc" -eq 0 ] && ok "an UNANSWERABLE user manager does not turn a completed install into a false failure" \
+  || bad "an unreachable user manager made a completed install exit $rc: $out"
+case "$out" in
+  *'read back in both managers'*) bad "claimed 'read back in both managers' while the user manager did NOT answer — the exact false claim this leg exists for: $out" ;;
+  *'user manager did NOT ANSWER'*) ok "…and the claim names the scope it could NOT read, instead of claiming both" ;;
+  *) bad "…but does not name the unverified scope: $out" ;;
+esac
+# ── (b3) `--takeover` WILL NOT RETIRE BLIND ────────────────────────────────────────────────────
+# Retirement DISABLES the shipped actuator, so a scope that cannot be read is a scope whose state this run
+# does not know: retiring blind can leave TWO actors (the race this guard exists for) or ZERO (no pin at
+# all — #3194's own state). It must refuse, and refuse BEFORE writing.
+: >"$T/state-blind/system-$SHIPPED"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-blind2" PATH="$T/fake-blind:$PATH" \
+       bash "$PIN" --install --takeover 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "--takeover REFUSES when the user manager does not answer (a blind retirement can leave two actors or none)" \
+  || bad "--takeover retired blind with an unreadable user scope (rc=$rc): $out"
+case "$out" in
+  *'cannot retire safely'*) ok "…and says why, naming the scope it could not read" ;;
+  *) bad "…but does not explain the blind-retirement refusal: $out" ;;
+esac
+[ -f "$T/units-blind2/cell-self-pin.service" ] && bad "a refused blind --takeover still wrote the unit" \
+  || ok "a refused blind --takeover wrote nothing"
 # ── (c) BOTH managers carry it: `--takeover` must retire BOTH, not the first one it finds ────────
 # ⛔ MEASURED FALSE PASS, NOT A HYPOTHETICAL: `actuator_scope` returned ONLY the first enabled scope, so
 # on a box with the system install AND the no-sudo user fallback `--takeover` retired the system one,
@@ -683,6 +792,15 @@ if git -C "$T/seed" push -q origin main 2>/dev/null; then
   case "$out" in
     *'NOT fetched'*'verdict        current'*) ok "--status-nofetch shows the local-ref reading (current) and SAYS it may be stale" ;;
     *) bad "--status-nofetch did not report a possibly-stale reading: $out" ;;
+  esac
+  # ⛔ AND THE GREEN VERDICT NAMES WHAT IT DID NOT CHECK (review finding). The template claims a current pin
+  # beside a stale RUNNING controller is a real state and that "the pass says so in its log line rather than
+  # greening it away" — but only the APPLIED branch said so. This is the state #3194 lived in for a day
+  # ("the record said current while the pid executed a 17-commits-behind tree"), re-asserted on the one
+  # surface an operator reads all day, so the caveat is pinned here.
+  case "$out" in
+    *'RUNNING controller'*) ok "…and the 'current' verdict says a RUNNING controller keeps the layer it STARTED on — the record is not claimed to be the executed tree" ;;
+    *) bad "the 'current' verdict does not say the executed layer may differ from the record — the exact overclaim #3194 punished: $out" ;;
   esac
   [ "$rc" -eq 0 ] && ok "…and a no-fetch 'current' exits 0 (this is the blind reading, kept for comparison)" || bad "a no-fetch 'current' exited $rc"
   out="$(pinrun "$T/home" --status 2>&1)"; rc=$?

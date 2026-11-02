@@ -282,8 +282,14 @@ do_pass() {
   if [ -z "$applied" ]; then
     log "no readable pin record at ${HARNESS_PIN_FILE} -- applying (a pin nobody can read is not a pin)"
   elif [ "$target" = "$applied" ]; then
-    record_outcome "current ${target} (no-op)"
-    log "current ${target} (no-op)"; return 0
+    # ⛔ THE GREEN LINE NAMES WHAT IT DID NOT CHECK. The template states that a pin which is current while
+    # the RUNNING controller sits on a stale layer is a real state and that "the pass says so in its log line
+    # rather than greening it away" — but only the APPLIED branch said so, and this is the branch that runs on
+    # every converged tick. #3194's whole punishment was "the record said current while the pid executed a
+    # tree 17 commits behind", so the no-op line is exactly where that belief is re-asserted: it must carry
+    # the same caveat, or the one surface an operator reads all day is the one that overclaims.
+    record_outcome "current ${target} (no-op; record verified — a RUNNING controller keeps the layer it started on)"
+    log "current ${target} (no-op; record verified — note: a RUNNING controller keeps the layer it started on until it is restarted)"; return 0
   else
     log "DRIFT pinned=${applied} target=${target} -- applying --force --pin-only"
   fi
@@ -395,7 +401,7 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # ⛔ 1 FOR DRIFT, NOT 0. `scripts/check-deployed-drift.sh` already speaks `0 match / 1 drift /
     # 2 unknown`; a status verb that reports DRIFT and exits 0 cannot be gated on by anything, which is
     # how a third drift dialect (#1178) is born. Nothing here re-decides the vocabulary.
-    if [ -n "${target:-}" ] && [ "${target:-}" = "$(pinned_head)" ]; then printf '  verdict        current\n'; return 0; fi
+    if [ -n "${target:-}" ] && [ "${target:-}" = "$(pinned_head)" ]; then printf '  verdict        current\n'; printf '                 (the RECORD is current — a RUNNING controller keeps the layer it STARTED on until it is restarted, so this is not a claim about the executed tree)\n'; return 0; fi
     printf '  verdict        DRIFT (a RUNNING controller keeps the layer it started on until restarted)\n'; return 1
   else
     printf '  resolved layer <UNRESOLVED — this is a RED, see --status output above>\n'; return 2
@@ -565,13 +571,79 @@ declares() {
   [ -n "$hit" ]
 }
 
-verify_unit() { # <rendered service> — the properties the ISSUE names, asserted on the ARTIFACT
-  local f="$1" body exec_path n_exec execs envs ok_vals v w seen0=0 _interp _x _c
+# ── THE ENVIRONMENT-PARSE CLASS: what systemd reads is NOT what a line reader reads ─────────────────
+# ⛔ THREE WAYS TO CHANGE THE PASS'S ENVIRONMENT THAT THE `Environment=` RULES BELOW CANNOT SEE, all
+# measured at rc=0 against this file before these rules existed:
+#
+#  1. `EnvironmentFile=`  — systemd READS the named file and its values OVERRIDE `Environment=`.
+#  2. `UnsetEnvironment=` — `systemd.exec(5)`: applied as the FINAL step when the environment is compiled,
+#                           so it "may undo assignments from any configuration source, including
+#                           assignments made through Environment= or EnvironmentFile=".
+#  3. `PassEnvironment=`  — imports named variables from the MANAGER's own environment into the service.
+#
+# Every one of them can set, re-base or clear `CELL_HOME` while `verify_unit`'s count rule still sees
+# exactly one correct `Environment=CELL_HOME=`. They are refused BY NAME, together, in ONE list — the same
+# "family closed by name" rule this file already applies to `Exec*` and `Condition*`. Nothing is lost by
+# refusing them: the rendered pin unit needs no environment file, nothing to unset and nothing passed in
+# (`print_unit` emits every value the pass uses).
+ENV_MUTATING_DIRECTIVES="EnvironmentFile UnsetEnvironment PassEnvironment"
+
+# ⛔ AND THE RAW-TEXT PARSE IS ITSELF A BOUNDARY THAT MUST BE CLOSED, not trusted. `directive` reads
+# PHYSICAL LINES; systemd reads the file the way `systemd.syntax(7)` specifies:
+#   · "Lines ending in a backslash are concatenated with the following line while reading and the
+#     backslash is replaced by a space character" — so
+#         Environment=HOME=/x \
+#         CELL_HOME=/tmp/other-home
+#     is ONE directive whose SECOND assignment wins (`Environment=` is LAST-WINS), while a line reader
+#     never sees a second `Environment=` at all and counts one correct assignment;
+#   · "C-style escapes are supported" — `Environment=\x43ELL_HOME=/tmp/other-home` is `CELL_HOME=…` to the
+#     manager (`\x43` = `C`) and an unknown name to the line reader.
+# Both installed rc=0. Refusing a backslash in a directive closes BOTH, plus any future spelling built on
+# the same two constructs, instead of enumerating them — and it costs nothing: the rendered unit is
+# generated from a template of plain paths and numbers, so it needs no continuation and no escape.
+refuse_raw_text_tricks() { # <what> <body>
+  case "$2" in
+    *\\*)
+      bad "$1 carries a backslash in a directive — systemd CONCATENATES a backslash-continued line and EXPANDS C-style escapes (\x43 is 'C'), so its parse differs from the line read this verification performs and a second CELL_HOME= assignment could hide there; the pin unit needs no continuation and no escape"; return 1 ;;
+  esac
+  return 0
+}
+
+# refuse_env_mutators <what> <body> — the three directives in ENV_MUTATING_DIRECTIVES, by name.
+refuse_env_mutators() { # <what> <body>
+  local _n
+  for _n in $ENV_MUTATING_DIRECTIVES; do
+    if declares "$2" "$_n"; then
+      bad "$1 declares ${_n}= — it changes the pass's environment BEHIND the Environment= rules (systemd applies it over or after them, so it can set, re-base or clear CELL_HOME), which would make the pass derive its base from a value this verification never read; the pin unit needs none of ${ENV_MUTATING_DIRECTIVES}"; return 1
+    fi
+  done
+  return 0
+}
+
+# refuse_env_reset <what> <body> — `Environment=` with an EMPTY value is a LIST RESET, not a no-op.
+# ⛔ `systemd.exec(5)`: "If the empty string is assigned to this option, the list of environment variables
+# is reset, all prior assignments have no effect." A word-split read of that value yields NO words, so the
+# count rule below never sees it: the unit installs green with `CELL_HOME` GONE, and the pass then derives
+# its base from `HOME` (`CELL_HOME="${CELL_HOME:-$HOME}"`) — a pin record the controller never reads.
+# MEASURED at rc=0 in the rendered unit AND in a drop-in (in a drop-in it also clears the list the main
+# unit built, which is the documented way to remove an entry).
+refuse_env_reset() { # <what> <body>
+  if printf '%s\n' "$2" | awk '/^[[:space:]]*Environment[[:space:]]*=[[:space:]]*$/{f=1} END{exit(f?0:1)}'; then
+    bad "$1 assigns an EMPTY 'Environment=' — systemd treats that as a LIST RESET (all prior assignments have no effect), so it ERASES the CELL_HOME= line this verification just counted and the pass silently falls back to HOME; drop the line instead of clearing the list"; return 1
+  fi
+  return 0
+}
+
+verify_unit() { # <rendered service> [expected ExecStart payload] — the properties the ISSUE names, asserted on the ARTIFACT
+  local f="$1" expect="${2:-}" body exec_path exec_real exec_dir home_real n_exec execs envs ok_vals v w seen0=0 _interp _x _c
   local n_home home_val _env _kv
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
   # next reader to delete the only explanation of why the line is banned. Strip comments first.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
+  refuse_raw_text_tricks "the rendered unit" "$body" || return 1
+  refuse_env_reset "the rendered unit" "$body" || return 1
+  refuse_env_mutators "the rendered unit" "$body" || return 1
   # ⛔ THE DEFECT ITSELF, AS AN INVARIANT: a rendered pin unit must carry NO bootstrap-only path, AS A
   # TOKEN — not merely after `=` or at line start. `ExecStart=/bin/bash /tmp/cell-ai/scripts/…` puts a
   # SPACE before the path, and that is the reachable form: the placed copy's fallback is whatever
@@ -622,10 +694,43 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   esac
   # ⛔ AND IT MUST LIVE UNDER $CELL_HOME. Any other absolute path can be pruned out from under the unit
   # (a lane worktree, a bootstrap clone); $CELL_HOME is the one root a running cell keeps.
-  case "$exec_path" in
-    "$CELL_HOME"/*) ;;
-    *) bad "ExecStart names '${exec_path}', which is NOT under CELL_HOME ('${CELL_HOME}') — a path outside the one home can be pruned out from under the unit, which is the failure this change exists to remove (203/EXEC every tick)"; return 1 ;;
+  # ⛔ AND THE PREFIX TEST IS ON THE RESOLVED PATH, NOT THE RAW STRING. `<CELL_HOME>/../nowhere/x.sh` IS
+  # `"$CELL_HOME"/*` as a string and resolves OUTSIDE the home — measured rc=0 — so two characters
+  # defeated the rule that keeps the pass inside the one root a cell keeps. Resolve the payload's real
+  # directory (`pwd -P`, which is also what makes this correct on macOS where /tmp is /private/tmp) and
+  # prefix-test THAT. ⛔ A payload whose parent does not resolve at all cannot be resolved by `pwd -P`, so for
+  # that case the lexical path is refused if it carries `..` and is otherwise prefix-tested as written — the
+  # ">path outside the home" verdict must be reached from the prefix rule, not from a parent-existence rule
+  # that would shadow it and report the wrong reason (measured: it did, on the suite's own doctor).
+  exec_dir="$(cd "$(dirname "$exec_path")" 2>/dev/null && pwd -P)" || exec_dir=""
+  if [ -n "$exec_dir" ]; then
+    exec_real="${exec_dir%/}/$(basename "$exec_path")"
+  else
+    case "$exec_path" in
+      */../*|*/..|../*|..)
+        bad "the rendered unit's ExecStart payload '${exec_path}' traverses '..' through a directory that does not resolve — the containment rule this file holds cannot be evaluated on it, so it is refused rather than guessed"; return 1 ;;
+    esac
+    exec_real="$exec_path"
+  fi
+  home_real="$(cd "$CELL_HOME" 2>/dev/null && pwd -P)" || home_real="$CELL_HOME"
+  case "$exec_real" in
+    "${home_real%/}"/*) ;;
+    *) bad "ExecStart resolves to '${exec_real}', which is NOT under CELL_HOME ('${home_real}') — a path outside the one home can be pruned out from under the unit, which is the failure this change exists to remove (203/EXEC every tick)"; return 1 ;;
   esac
+  # ⛔ AND IT MUST BE THE PASS THIS INSTALL PLACES — not merely SOME path under CELL_HOME. `verify_unit`
+  # used to check only that the payload was inside the home, while the existence check after placement read
+  # the COMPUTED `pin_script_path`, never the path in the artifact. So a template/code divergence, or a
+  # stale payload name, installed green and then went 203/EXEC every tick — measured: a rendered unit naming
+  # `${CELL_HOME}/scripts/gone.sh` (absent) installed rc=0. The expected payload is passed in by the caller
+  # because only it knows what it is about to place; when the caller passes nothing (the suite's
+  # single-argument calls) the identity rule is skipped rather than guessed, and existence is then proved by
+  # the `[ -f "$script" ]` assertion after placement.
+  if [ -n "$expect" ]; then
+    case "$expect" in
+      "$exec_real"|"$exec_path") ;;
+      *) bad "the rendered unit's ExecStart payload is '${exec_path}' but this install places the pass at '${expect}' — the unit would exec a file this run did not verify (203/EXEC every tick, or a stale pass)"; return 1 ;;
+    esac
+  fi
   # ⛔ AND THE UNIT MUST CARRY THE SAME BASE THE EXECSTART USES. The service manager's HOME is not the cell
   # home, so a unit that carried only `HOME=` left the pass defaulting CELL_HOME from an unrelated value
   # while its ExecStart sat under the real one — measured: the pass then read `$HOME/.harness-path` while
@@ -656,15 +761,9 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
   if [ "$home_val" != "$CELL_HOME" ]; then
     bad "the rendered unit's Environment=CELL_HOME='${home_val}' is not the cell home '${CELL_HOME}' — the pass would derive its base from a value the controller never read, so it pins a different record"; return 1
   fi
-  # ⛔ `EnvironmentFile=` IS REFUSED BY NAME, AND IT IS THE SAME THREAT SURFACE, NOT AN ADJACENT NICETY.
-  # systemd READS the named file and its assignments OVERRIDE the unit's `Environment=`, so an
-  # `EnvironmentFile=` can set `CELL_HOME` to a base no rule in this file reads — while the count rule
-  # above still sees exactly one `Environment=CELL_HOME=` and passes. Refused rather than modelled: the
-  # rendered pin unit needs no environment file (`print_unit` emits every value it needs), so there is
-  # nothing to preserve by supporting one.
-  if declares "$body" EnvironmentFile; then
-    bad "the rendered unit declares EnvironmentFile= — systemd reads that file and its values OVERRIDE Environment=, so it can re-base the pass onto a pin record this verification never reads; the pin unit needs no environment file"; return 1
-  fi
+  # (`EnvironmentFile=`/`UnsetEnvironment=`/`PassEnvironment=` are refused above, by name, in ONE list — see
+  # ENV_MUTATING_DIRECTIVES. They were refused here first and then generalised, because the drop-in path had
+  # the same hole and two copies of a rule drift.)
   # ⛔ AND IT MUST NOT DECLARE A WORKING DIRECTORY AT ALL. Any absolute path here is a bootstrap-time
   # value outliving its directory; the pass `cd`s itself after resolving the layer. `declares` (not a
   # value read) so `WorkingDirectory=` with an empty or continued value cannot slip past.
@@ -714,14 +813,66 @@ verify_unit() { # <rendered service> — the properties the ISSUE names, asserte
 # that no check in this file looked at.
 # THE RULE. A drop-in MAY adjust IDENTITY (`User=`, `Environment=HOME=`): that is how an operator corrects
 # the render without a second copy of the unit. It MAY NOT re-open a class `verify_unit` closed — an
-# executable directive, a working directory, a condition (a green skip), or a wider success vocabulary —
-# because every one of those is a directive this file does not verify and systemd RUNS anyway.
+# executable directive, a working directory, a condition (a green skip), a wider success vocabulary, or any
+# directive that changes the pass's ENVIRONMENT behind the `Environment=` rules — because every one of those
+# is a directive this file does not verify and systemd applies anyway.
+# ⛔ WHERE systemd ACTUALLY LOOKS — `verify_dropins` READ ONE DIRECTORY, AND THAT IS NOT THE SET.
+# `systemd.unit(5)`:
+#   · "for unit names containing dashes, the set of directories generated by repeatedly truncating the unit
+#     name after all dashes is searched too" — `cell-self-.service.d/` and `cell-.service.d/` BOTH apply to
+#     `cell-self-pin.service`;
+#   · "Units also support a top-level drop-in with type.d/" — `service.d/` applies to EVERY service;
+#   · "the drop-in .d/ directories for system services can be placed in /usr/lib/systemd/system or
+#     /run/systemd/system" as well as /etc/systemd/system.
+# MEASURED before this: a `cell-.service.d/legacy.conf` carrying `Environment=CELL_HOME=/tmp/other-home`
+# installed rc=0 and NOTHING in the run mentioned the file — the same false PASS one directory over, on the
+# very defect class (#3194's drop-in) this section exists for. The dirs are enumerated from systemd's own
+# rule rather than a list of the paths somebody happened to think of.
+dropin_dirs() { # <unit-dir> <unit-name> — every directory systemd merges for this unit
+  local unit_dir="$1" name="$2" root base svc short seen=" " d
+  svc="${name##*.}"
+  base="${name%.*}"
+  for root in "$unit_dir" /run/systemd/system /usr/lib/systemd/system; do
+    [ -d "$root" ] || continue
+    # the unit's OWN drop-in directory is `<unit>.<type>.d` (the full name), not `<unit>.d`
+    for d in "$root/$name.d" "$root/$svc.d"; do
+      case "$seen" in *" $d "*) continue ;; esac
+      if [ -d "$d" ]; then seen="$seen$d "; printf '%s\n' "$d"; fi
+    done
+    # dash truncation: cell-self-pin.service -> cell-self-.service.d, cell-.service.d
+    short="$base"
+    while :; do
+      case "$short" in *-*) ;; *) break ;; esac
+      short="${short%-*}"; short="${short%-}"
+      [ -n "$short" ] || break
+      d="$root/${short}-.${svc}.d"
+      case "$seen" in *" $d "*) continue ;; esac
+      if [ -d "$d" ]; then seen="$seen$d "; printf '%s\n' "$d"; fi
+    done
+  done
+}
+
 verify_dropins() { # <unit-dir> <unit-name>
-  local dir="$1/$2.d" f body _c _kv
-  [ -d "$dir" ] || return 0
-  for f in "$dir"/*.conf; do
-    [ -f "$f" ] || continue
+  local _dir f
+  for _dir in $(dropin_dirs "$1" "$2"); do
+    for f in "$_dir"/*.conf; do
+      [ -f "$f" ] || continue
+      verify_dropin_file "$f" || return 1
+    done
+  done
+  return 0
+}
+
+verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the search-path loop stays a loop
+  local f="$1" body _c _kv
     body="$(grep -vE '^[[:space:]]*#' "$f")"
+    # The same three parse-level rules the rendered unit gets, in the same one place: a drop-in is NOT a
+    # safer place for a continuation, a C-style escape, an `Environment=` reset, or an
+    # `EnvironmentFile=`/`UnsetEnvironment=`/`PassEnvironment=` — it is a MORE dangerous one, because it is
+    # merged OVER the unit and an operator reading the unit will never see it.
+    refuse_raw_text_tricks "the installed drop-in ${f}" "$body" || return 1
+    refuse_env_reset "the installed drop-in ${f}" "$body" || return 1
+    refuse_env_mutators "the installed drop-in ${f}" "$body" || return 1
     if [[ $body =~ (^|[[:space:]=])/(private/)?(var/)?tmp/cell-ai(/|[[:space:]]|$) ]]; then
       bad "the installed drop-in ${f} names the provisioning clone (/tmp/cell-ai) — a drop-in OVERRIDES the rendered unit, so rewriting only the unit cannot remove that path; remove ${f} and re-run (a pin unit needs no drop-in)"; return 1
     fi
@@ -735,8 +886,13 @@ verify_dropins() { # <unit-dir> <unit-name>
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
         SuccessExitStatus)
           bad "the installed drop-in ${f} declares SuccessExitStatus= — it would widen the unit's green vocabulary past 0/11, which is a false PASS; remove ${f}"; return 1 ;;
-        EnvironmentFile)
-          bad "the installed drop-in ${f} declares EnvironmentFile= — systemd reads that file and its values OVERRIDE the unit's Environment=, so it can re-base the pass onto a pin record no rule here reads; remove ${f}"; return 1 ;;
+        Unit|On*)
+          # ⛔ A TIMER DROP-IN CAN RE-TARGET OR RE-SCHEDULE THE PIN. `Unit=` names the unit the timer
+          # activates and the `On*=` family sets when it fires, so a drop-in carrying either makes the timer
+          # activate something else, or stop firing on the ten-minute clock — a pin that silently never
+          # runs, which is #3194's own symptom reached from the timer's side. Both are closed by prefix
+          # (`On*`) rather than one name at a time, the same rule this file uses for `Condition*`.
+          bad "the installed drop-in ${f} declares ${_c}= — it re-targets or re-schedules the timer/unit pair this verification installed (a pin that silently never runs is #3194's symptom), or is a unit-level directive this check cannot honour; remove ${f}"; return 1 ;;
         Environment)
           # ⛔ A DROP-IN MAY ADJUST IDENTITY, AND THAT ALLOWANCE IS EXACTLY ONE VARIABLE WIDE. The
           # comment above this function names the remedy as `User=` and `Environment=HOME=` — so allow
@@ -757,7 +913,6 @@ verify_dropins() { # <unit-dir> <unit-name>
           done ;;
       esac
     done
-  done
   return 0
 }
 
@@ -775,6 +930,40 @@ actuator_enabled_in() { # <scope> — is the SHIPPED timer enabled in that manag
     user)   systemctl --user is-enabled eldato-harness-apply.timer >/dev/null 2>&1 ;;
     *)      return 1 ;;
   esac
+}
+# ⛔ A MANAGER THAT DID NOT ANSWER IS NOT A MANAGER WITH NO ACTUATOR. `systemctl --user is-enabled` exits 1
+# both for "disabled" and for "cannot reach the bus", and `actuator_enabled_in` discarded stderr, so the two
+# were indistinguishable — while `--install` went on to print "read back in both managers". MEASURED on this
+# box, in the environment a SYSTEM unit actually has: `systemctl --user is-enabled …` answers "Failed to
+# connect to bus: No medium found" rc=1, i.e. indistinguishable from "disabled". That matters twice: a box
+# whose shipped timer lives only in the USER manager (the no-sudo fallback `install-harness-apply-timer.sh`
+# documents) would be reported as having ONE actuator while carrying TWO, and the per-tick `one_actor_check`
+# would read the same non-answer as "clean". So the scope state is THREE-valued and the two callers must say
+# which one they got. ⛔ The reachability test is the MANAGER'S OWN failure text, not a second probe: a probe
+# that itself fails is one more thing that can lie, and the exit code carries the "disabled" answer already.
+BUS_UNREACHABLE_PAT='Failed to connect to bus|No medium found|Failed to get D-Bus connection|Connection refused|Could not connect|Transport endpoint is not connected'
+scope_state() { # <scope> — prints enabled | disabled | unknown (an UNANSWERABLE manager is NEVER 'disabled')
+  local out rc
+  case "$1" in
+    system) out="$(systemctl is-enabled eldato-harness-apply.timer 2>&1)"; rc=$? ;;
+    user)   out="$(systemctl --user is-enabled eldato-harness-apply.timer 2>&1)"; rc=$? ;;
+    *)      printf 'unknown\n'; return 0 ;;
+  esac
+  # ⛔ ONE PATTERN LIST, NOT TWO. The spellings live in BUS_UNREACHABLE_PAT and are matched HERE, so a
+  # vendor message added to that list cannot reach one caller and miss the other (an ERE, because `[[ =~ ]]`
+  # is what lets the list stay a single named value; a `case` pattern is parsed before expansion and would
+  # read `a|b` as one literal glob).
+  if [[ "$out" =~ $BUS_UNREACHABLE_PAT ]]; then printf 'unknown\n'; return 0; fi
+  [ "$rc" -eq 0 ] && printf 'enabled\n' || printf 'disabled\n'
+}
+# actuator_unknown_scopes — scopes whose manager did not answer, one per line. A scope listed here was NOT
+# verified; a caller may not claim it was.
+actuator_unknown_scopes() {
+  local s
+  for s in system user; do
+    [ "$(scope_state "$s")" = unknown ] && printf '%s\n' "$s"
+  done
+  return 0
 }
 actuator_scopes() { # EVERY scope in which eldato-harness-apply.timer is ENABLED, one per line, system first
   local s n=0
@@ -839,7 +1028,19 @@ restore_actuator() {
 #   · a re-take that does not take is a RED (`DUPLICATE-ACTUATOR`, exit 1), never a warning — two
 #     mutating `apply --force --pin-only` actors on one pin IS the #2416 race this file exists to avoid.
 one_actor_check() {
-  local mode="$1" s dups ours="" who=""
+  local mode="$1" s dups ours="" who="" unknown=""
+  # ⛔ AN UNANSWERABLE MANAGER IS NAMED HERE, ON EVERY TICK, AND IT DOES NOT MAKE THE TICK RED. The
+  # invariant cannot be RETIRED blind (retiring an actuator in a scope we cannot read could leave the box
+  # with ZERO pin actuators — the #3194 failure reached by the fix), and it must not be a permanent RED
+  # either: a box whose user manager simply has no session bus would then be red every ten minutes for
+  # ever, which is the "unhealable RED" this file refuses elsewhere. So the tick proceeds and the LIE is
+  # removed: the log says which scope was not read, instead of implying the guard covered both.
+  unknown="$(actuator_unknown_scopes)"
+  if [ -n "$unknown" ]; then
+    for s in $unknown; do who="$who ${s}"; done
+    log "note: the${who} manager did NOT ANSWER (its bus is unreachable from here), so a duplicate actuator in that scope could NOT be checked this tick -- the one-actor invariant is UNVERIFIED there, not satisfied"
+    who=""
+  fi
   dups="$(actuator_scopes)" || return 0
   for s in system user; do own_enabled_in "$s" && ours="$ours $s"; done
   for s in $dups; do who="$who ${s}"; done
@@ -864,7 +1065,7 @@ one_actor_check() {
 }
 
 do_install() { # [--takeover]
-  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s
+  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s unknown=""
   case "$takeover" in
     ""|--takeover) ;;
     *) bad "unknown argument '${takeover}' to --install (only --takeover is accepted)"; return 64 ;;
@@ -889,8 +1090,12 @@ do_install() { # [--takeover]
   # happen inside the renderer, so a REFUSED install had already replaced the placed pass, and
   # `--print-unit` wrote a file. Verification now runs against the artifact BEFORE anything is written.
   print_unit "$tmp" || { err "refusing: the units could not be rendered (reason above)"; rm -rf "$tmp"; return 1; }
-  verify_unit "$tmp/cell-self-pin.service" || { err "refusing: the rendered cell-self-pin.service failed verification (reason above)"; rm -rf "$tmp"; return 1; }
+  # ⛔ THE PLACED PATH IS COMPUTED BEFORE VERIFICATION, so `verify_unit` can assert that the artifact's
+  # ExecStart IS the pass this run places — not merely some path under $CELL_HOME. `pin_script_path` is a
+  # pure computation (it writes nothing), so moving it up changes no ordering guarantee: the write is
+  # still `place_pass`, and it is still AFTER every refusal.
   script="$(pin_script_path)" || { err "refusing: cannot locate the pass this unit would exec"; rm -rf "$tmp"; return 1; }
+  verify_unit "$tmp/cell-self-pin.service" "$script" || { err "refusing: the rendered cell-self-pin.service failed verification (reason above)"; rm -rf "$tmp"; return 1; }
   place_pass "$script" || { err "refusing: the pass could not be placed at $script"; rm -rf "$tmp"; return 1; }
   [ -f "$script" ] || { bad "the unit names '${script}' and it does not exist after placement — the unit would fail 203/EXEC before any payload runs"; rm -rf "$tmp"; return 1; }
   # ⛔ ONE ACTUATOR PER PIN. `eldato-harness-apply.timer` already advances this box's harness on the same
@@ -901,6 +1106,19 @@ do_install() { # [--takeover]
   if [ -n "$scopes" ] && [ "$takeover" != --takeover ] && [ -z "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
     bad "eldato-harness-apply.timer is ENABLED in the ${who} manager(s) and already advances this harness on a ten-minute clock — two pin actuators race on one pin. Keep ONE: run '$0 --install --takeover' to RETIRE it and install this unit, or keep 'scripts/install-harness-apply-timer.sh --install' (the shipped, tested one) and do not install this one, or set CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 to override deliberately."
     rm -rf "$tmp"; return 1
+  fi
+  if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
+    # ⛔ A BLIND RETIREMENT IS REFUSED. `--takeover` DISABLES the shipped actuator, so if a scope cannot be
+    # read the run cannot know what it is leaving behind there — and the failure modes are both bad: leave a
+    # duplicate (two actors) or disable the only one (zero actors, #3194's own state). Verified by the READ
+    # in every scope, never by the exit code of a disable we could not confirm.
+    unknown="$(actuator_unknown_scopes)"
+    if [ -n "$unknown" ]; then
+      who=""
+      for s in $unknown; do who="$who ${s}"; done
+      bad "--takeover cannot retire safely: the${who} manager did not answer, so this run cannot see whether a shipped eldato-harness-apply.timer is ENABLED there — retiring blind could leave TWO actors (a race) or ZERO (no pin at all). Nothing was written and nothing was retired. Re-run where that manager is reachable, or run 'systemctl --user is-enabled eldato-harness-apply.timer' yourself first."
+      rm -rf "$tmp"; return 1
+    fi
   fi
   if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
     note "installing into $unit_dir (retiring the duplicate actuator in the ${who} manager(s) LAST, after the units are placed)"
@@ -962,6 +1180,19 @@ do_install() { # [--takeover]
     for s in $scopes; do who="$who ${s}"; done
     bad "eldato-harness-apply.timer still reads ENABLED in the ${who} manager(s) after the migration — two mutating actors on one pin. Fix it with 'systemctl disable --now eldato-harness-apply.timer' in that manager."
     return 1
+  fi
+  # ⛔ AND THE CLAIM NAMES WHAT WAS ACTUALLY READ. "read back in both managers" was printed even when one
+  # manager never answered (see `scope_state`), which is a positive claim about a manager that said nothing.
+  # ⚠️ THIS IS A WARNING, NOT A NON-ZERO EXIT, and the difference is deliberate: the units ARE installed
+  # and enabled, so reporting failure would be a false RED on a box that is fine, and `--takeover` is where
+  # an unreadable scope is genuinely dangerous (see below) — that is the path that refuses.
+  unknown="$(actuator_unknown_scopes)"
+  if [ -n "$unknown" ]; then
+    who=""
+    for s in $unknown; do who="$who ${s}"; done
+    note "installed — but the${who} manager did NOT ANSWER, so the one-actor invariant was verified in ONE scope only. A shipped eldato-harness-apply.timer enabled in the${who} manager would be a SECOND mutating actor on this pin and this run could not see it. Check it by hand: 'systemctl --user is-enabled eldato-harness-apply.timer'."
+    note "  Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
+    return 0
   fi
   note "installed — ONE actuator on this pin (read back in both managers). Read it with: systemctl list-timers cell-self-pin.timer ; systemctl --failed ; $0 --status"
   return 0
