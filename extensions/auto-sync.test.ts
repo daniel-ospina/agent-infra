@@ -956,25 +956,108 @@ async function main() {
   // the pin — or when the pin file is absent, empty or not a sha — it becomes noise on every
   // session start of every box, and an operator learns to skip it. That is how the silent
   // failure this lane fixes survived, so each of those cases is asserted here.
+  // ⛔ THE FIXTURES MUST SCRUB THE PIN ENV (review finding 3). `pinMismatchLines`/`pinTreeDeployed`
+  // consult `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from `process.env` in addition to the injected `home`,
+  // so a test that passes `home` is NOT a function of its arguments alone. Reproduced: with a
+  // cell-style `HARNESS_PIN_DIR` exported at a root carrying the fixture's `<pin12>`, the silence
+  // assertion below returned 2 lines and failed — green only because this developer box leaves the
+  // variable unset, which is the "passes here, reds on the box that matters" shape this repo deletes.
+  function withoutPinEnv<T>(fn: () => T): T {
+    const saved = { dir: process.env.HARNESS_PIN_DIR, file: process.env.HARNESS_PIN_FILE };
+    delete process.env.HARNESS_PIN_DIR;
+    delete process.env.HARNESS_PIN_FILE;
+    try {
+      return fn();
+    } finally {
+      if (saved.dir !== undefined) process.env.HARNESS_PIN_DIR = saved.dir;
+      if (saved.file !== undefined) process.env.HARNESS_PIN_FILE = saved.file;
+      else delete process.env.HARNESS_PIN_FILE;
+    }
+  }
+
   await test("pinMismatchLines is SILENT when the checkout already is the pin", () => {
     const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
     mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
     const repo = seededRepo();
     const head = git(repo, "rev-parse HEAD").trim();
     writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${head}\n`);
-    equal(pinMismatchLines(repo, home).length, 0, "checkout == pin must produce no correction");
+    equal(withoutPinEnv(() => pinMismatchLines(repo, home)).length, 0,
+      "checkout == pin must produce no correction");
   });
 
   await test("pinMismatchLines NAMES the pin when the checkout is not it", () => {
     const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
     mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
     const repo = seededRepo();
-    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"),
-      "0123456789abcdef0123456789abcdef01234567\n");
-    const lines = pinMismatchLines(repo, home);
+    const pin = "0123456789abcdef0123456789abcdef01234567";
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${pin}\n`);
+    // ⛔ THE FIXTURE MUST CARRY THE DEPLOYED TREE. A pin record alone is a RECORD; `harness/<pin12>`
+    // is the evidence that it names a deployment this box actually carries. Without it the case this
+    // test used to assert is the FALSE POSITIVE (below), not a genuine mismatch (#10114).
+    mkdirSync(join(home, "harness", pin.slice(0, 12)), { recursive: true });
+    const lines = withoutPinEnv(() => pinMismatchLines(repo, home));
     equal(lines.length, 2, "a genuine mismatch names the trap and the remedy");
     ok(lines[1].includes("--force --pin-only"),
       "the remedy must carry --force: apply REFUSES a live cell without it, and a pin box has a live controller");
+  });
+
+  // ⛔ MEASURED FALSE POSITIVE, FIXED HERE (#10114 review finding 10). A leftover
+  // `~/.pi/agent/state/HARNESS-PIN` — an earlier harness era, or a Mac that has never deployed a
+  // harness — made every session start claim "this checkout is at X but the PIN is Y … the harness the
+  // box EXECUTES", on a box that executes no harness at all and whose only sin was carrying `sync.sh`.
+  // Before `pinTreeDeployed()`, both cases below returned 2 lines; only the second is a real mismatch.
+  await test("pinMismatchLines is SILENT when the pin names NO deployed tree this box carries", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const repo = seededRepo();
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"),
+      "0123456789abcdef0123456789abcdef01234567\n");
+    equal(withoutPinEnv(() => pinMismatchLines(repo, home)).length, 0,
+      "a leftover pin record with no harness/<pin12> describes nothing the box executes — it must not " +
+      "read as drift on a healthy non-deploying box");
+    // …and the SAME record DOES speak up once the deployed tree exists: the fix must not have
+    // silenced the true positive. This is the discriminating half — a test that only asserts the
+    // silence would pass on a function that returns [] unconditionally.
+    mkdirSync(join(home, "harness", "0123456789ab"), { recursive: true });
+    equal(withoutPinEnv(() => pinMismatchLines(repo, home)).length, 2,
+      "with the deployed tree present the mismatch MUST still fire");
+  });
+
+  // ⛔ THE TWO DEPLOYED SHAPES A `<root>/<pin12>`-ONLY PREDICATE SILENCED (review finding 1). Both are
+  // documented in the fleet: `harness-refresh.sh:396` "the legacy flat pin: the ROOT is the worktree",
+  // and `:503-507` "the tree HARNESS_PIN_FILE names — the only record that can name a READ dir OUTSIDE
+  // the pin root". A false-positive fix that swallows these loses the #10114 warning on real boxes.
+  await test("pinMismatchLines fires on the LEGACY FLAT pin (the pin root IS the worktree)", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const pinned = seededRepo(); // a real checkout whose HEAD is the pin
+    const other = seededRepo(); // a DIFFERENT checkout, so a mismatch is genuine
+    // ⛔ `seededRepo()` twice yields the SAME sha (identical empty trees, same message, same second),
+    // which would make `other` look like the pin and silently turn this into a no-op test.
+    commit(other, "other");
+    const pin = git(pinned, "rev-parse HEAD").trim().slice(0, 12);
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${pin}\n`);
+    // the pin root is ITSELF the pinned worktree; there is NO <root>/<pin12> child at all
+    execSync(`git clone -q "${pinned}" "${join(home, "harness")}"`);
+    equal(withoutPinEnv(() => pinMismatchLines(other, home)).length, 2,
+      "a legacy flat pin IS a deployed tree and must still warn a non-pin checkout");
+  });
+
+  await test("pinMismatchLines fires when HARNESS_PIN_FILE names a tree OUTSIDE the pin root", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const pinned = seededRepo();
+    const other = seededRepo();
+    commit(other, "other"); // see above: identical fixtures share a sha
+    const pin = git(pinned, "rev-parse HEAD").trim().slice(0, 12);
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${pin}\n`);
+    // the PATH record is the only thing that names this tree — it sits outside <home>/harness, and in
+    // production it spells a SUBDIRECTORY (`<tree>/scripts/orchestrator-harness`), so `git -C` must
+    // resolve upward to the tree's HEAD rather than to a repo rooted at the subdir.
+    mkdirSync(join(pinned, "scripts", "orchestrator-harness"), { recursive: true });
+    writeFileSync(join(home, ".harness-path"), `${join(pinned, "scripts", "orchestrator-harness")}\n`);
+    equal(withoutPinEnv(() => pinMismatchLines(other, home)).length, 2,
+      "a tree named by the PATH record is a deployed tree and must still warn a non-pin checkout");
   });
 
   await test("pinMismatchLines is SILENT on an absent, empty or non-sha pin record", () => {

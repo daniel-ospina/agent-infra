@@ -228,7 +228,14 @@ esac
 # One line of key=value, written ATOMICALLY (temp + rename): a truncated record is indistinguishable
 # from "no pass has run", and that is the false-PASS shape this feature exists to remove.
 REC_HEAD=""; REC_REF=""; REC_BEHIND="unknown"; REC_AHEAD="unknown"; REC_DIRTY="unknown"
-REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; PRESERVED_DIR=""; REC_DEPLOYED="unknown"
+REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMEDY=""; PRESERVED_DIR=""; REC_DEPLOYED="unknown"
+# ⛔ `REC_REMEDY` IS A FIELD FOR THE SAME REASON `preserved=` IS (review finding, #10114). Measured
+# on the deployed-drift refusal: its `detail=` is 706 characters and the word `Remedy:` begins at
+# offset 272 — so `cut -c1-240` DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
+# showed it, which is exactly why it survived review: an operator reading a LIVE terminal sees the
+# remedy, and the operator reading the record (or fleet-health, or `--print-status`, or a lane on
+# the next day) sees a refusal that names no action. A refusal whose remedy is lost is a gate that
+# names a defect and leaves nobody to clear it — the half-fix this whole change exists to end.
 write_record() { # <ok> <rc>
     local tmp ok="$1" rc="$2"
     mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR"; return 1; }
@@ -265,6 +272,10 @@ write_record() { # <ok> <rc>
         # documented 23. `not-run` is also the truthful value there: those paths never reached the reading.
         printf 'drift=%s\n' "${DRIFT_STATE:-not-run}${DRIFT_TOKEN:+:$DRIFT_TOKEN}"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
+        # ⛔ NOT TRUNCATED, and last, for the same reason as `preserved=` above: a remedy is the one
+        # line a reader MUST be able to act on, so it is never at the mercy of a prose bound. Bounded
+        # by construction (each is a fixed sentence the call sites author), not by `cut`.
+        printf 'remedy=%s\n' "$(printf '%s' "${REC_REMEDY:-none}" | tr '\n' ' ')"
         printf 'action=%s\n' "$REC_ACTION"
         printf 'lanes=none-signalled\n'
         printf 'fetch=%s\n' "${FETCH_STATE:-notfetched}"
@@ -604,7 +615,18 @@ read_deployed_drift() {
     local out
     # `--surface` is what includes the EXECUTING tree (read from the process's own argv) alongside $O;
     # `--no-fetch` keeps this pass network-free (the fetch above already happened).
-    out="$(bash "$chk" --surface --repo "$REPO" --ref "$REF" --no-fetch 2>&1)"; DRIFT_RC=$?
+    # ⛔ THE THREE VALUES ARE PASSED EXPLICITLY, NOT INHERITED (review finding, #10114). This pass
+    # RESOLVES the pin from `HARNESS_PIN_FILE`/`HARNESS_PIN_DIR` (with `$CELL_HOME` defaults) and
+    # `$O` from its own launcher, but a RESOLVED value is not an EXPORTED one: a shell variable set
+    # here (`PIN_PATH_FILE=…`, `O=…`) is invisible to a child unless something exported it. The
+    # checker then falls back to ITS defaults (`O=$HOME/orchestrator`, pin records from its own
+    # env) and answers a DIFFERENT question than the one this pass asked — measured shape: a pass
+    # that knows the pin lives at `<cell-home>/.harness-path` while the checker looks at
+    # `$HOME/.harness-path`, so `--surface` compares a box it has mis-identified and the reading is
+    # reported beside readings taken against the right one. Passing them on the child's command line
+    # makes the two instruments answer about ONE box; `O` is also how the checker finds the deployed
+    # tree in the FARMED layout, where `$HERE` carries neither the checker nor its subdir.
+    out="$(O="$O" HARNESS_PIN_FILE="$PIN_PATH_FILE" HARNESS_PIN_DIR="$PIN_ROOT" bash "$chk" --surface --repo "$REPO" --ref "$REF" --no-fetch 2>&1)"; DRIFT_RC=$?
     DRIFT_TOKEN="$(printf '%s\n' "$out" | sed -n 's/.*harness=//p' | head -1)"
     [ -n "$DRIFT_TOKEN" ] || DRIFT_TOKEN="rc=$DRIFT_RC"
     case "$DRIFT_RC" in
@@ -658,7 +680,10 @@ finish() { # <ok> <rc> <verdict-phrase>
         case "$DRIFT_TOKEN" in
             executes:*)
                 REC_ACTION=deployed-drift
-                REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory that cannot be matched to this repo (gone, or present with no readable *.sh) (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: cloud-cell-supervisor.sh apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an executes: state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it). Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
+                # The remedy lives in its own FIELD (see `REC_REMEDY`), because `detail=` truncates
+                # at 240 and this sentence does not fit in it — measured: `Remedy:` begins at 272.
+                REC_REMEDY="cloud-cell-supervisor.sh apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an executes: state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it)"
+                REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory that cannot be matched to this repo (gone, or present with no readable *.sh) (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: $REC_REMEDY. Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
                 write_record 0 1 || exit 23
                 err "$REC_DETAIL"
                 exit 1 ;;
@@ -690,10 +715,12 @@ esac
 # "ahead" alone does not tell an operator whether it is one commit worth keeping or twenty.
 if [ "$RELATION" = ahead ]; then
     REC_ACTION=refused-ahead
+    REC_REMEDY="recover or land them first: git -C $REPO log $REF..HEAD, then re-run"
     finish 0 21 "REFUSED ahead: $REPO carries $AHEAD commit(s) that are not on $REF — advancing would drop them. Recover or land them first (git log $REF..HEAD), then re-run. Nothing was touched."
 fi
 if [ "$RELATION" = diverged ]; then
     REC_ACTION=refused-diverged
+    REC_REMEDY="a rebase or cherry-pick is an operator decision, not a scheduled one: resolve divergence by hand, then re-run"
     finish 0 22 "REFUSED diverged: HEAD is neither an ancestor nor a descendant of $REF — a rebase or cherry-pick is an operator decision, not a scheduled one. Nothing was touched."
 fi
 
@@ -881,6 +908,10 @@ if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unkno
         PRESERVED_DIR="$STATE_DIR/harness-apply-preserved/$(date -u +%Y%m%dT%H%M%SZ)-$$"
         preserve_dirty "$PRESERVED_DIR" || {
             REC_ACTION=refused-dirty
+            # ⛔ THE REDDEST REFUSAL MUST NOT RECORD `remedy=none` (review finding 6). This `detail=` is
+            # 474 chars, so `cut -c1-240` lands mid-sentence and discards the action clause — the same
+            # class of loss the `remedy=` field exists to prevent, left on the one path that most needs it.
+            REC_REMEDY="recover the work from $PRESERVED_DIR (changes.patch + changes.index.patch), fix the cause, then re-run"
             # ⛔ NOT "nothing was touched". Preservation and restore are one pass over the list, so a
             # failure in the RESTORE half can leave the checkout part-restored — every affected byte was
             # written to $PRESERVED_DIR first, but claiming the tree is untouched would be false in the
