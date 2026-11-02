@@ -1605,6 +1605,56 @@ printf '%s\n' "$R/pin/$RP_B/scripts/orchestrator-harness" > "$R/home/.harness-pa
 prunesup
 [ ! -e "$R/pin/$RP_A" ] && ok "prune reclaims a SUPERSEDED harness pin (per-commit pinning would otherwise leak disk)" \
                         || bad "prune kept a superseded harness pin — the new pin scheme leaks disk"
+# ⛔ HELD BY A LIVE PROCESS (measured 2026-11-02). A superseded pin is *superseded*, not *unheld*: a
+# controller was executing its `orch-loop.sh` from an open fd when this arm `rm -rf`'d the tree 2 h 32
+# min into its run, leaving a live service on an unlinked inode (`links=0`). Both hold shapes are
+# asserted — a cwd INSIDE the tree, and an OPEN FD into it with the holder's cwd elsewhere (the fd-255
+# shape) — because `pgrep -f <path>` sees neither, and a directory's link count sees neither either.
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness"
+( cd "$R/pin/$RP_A" && exec sleep 120 ) & HLD_CWD=$!
+sleep 0.3
+prunesup
+[ -d "$R/pin/$RP_A" ] && ok "prune PRESERVES a superseded pin whose CWD a live process holds" \
+                      || bad "prune deleted a superseded pin a live process was sitting in — the 2026-11-02 shape"
+case "$PR_OUT" in
+  *"PRESERVED($R/pin/$RP_A, held-by-cwd:$HLD_CWD)"*) ok "the keep is NAMED with the holding pid (PRESERVED(<tree>, held-by-cwd:<pid>))" ;;
+  *) bad "the preserved pin was not named with its holding pid — got: $(printf '%s' "$PR_OUT" | grep -c PRESERVED) PRESERVED line(s)" ;;
+esac
+kill "$HLD_CWD" 2>/dev/null; wait "$HLD_CWD" 2>/dev/null
+( cd /tmp && exec 9<"$R/pin/$RP_A/scripts/orchestrator-harness" && sleep 120 ) & HLD_FD=$!
+sleep 0.3
+prunesup
+[ -d "$R/pin/$RP_A" ] && ok "prune PRESERVES a superseded pin held ONLY by an open FD (the fd-255 shape; pgrep cannot see it)" \
+                      || bad "prune deleted a superseded pin held on an open fd — the exact 2026-11-02 defect"
+case "$PR_OUT" in
+  *"PRESERVED($R/pin/$RP_A, held-by-fd:$HLD_FD)"*) ok "the fd keep says held-by-fd:<pid> — the next reader can see WHY the tree was kept" ;;
+  *) bad "the fd-held pin was not reported as held-by-fd" ;;
+esac
+kill "$HLD_FD" 2>/dev/null; wait "$HLD_FD" 2>/dev/null
+# …and the sweep still WORKS once nothing holds it: the guard must not be a blanket refusal.
+prunesup
+[ ! -e "$R/pin/$RP_A" ] && ok "with the holders released, the SAME superseded pin is reclaimed (the guard is a check, not a wall)" \
+                        || bad "the guard false-blocked its own reclaim — a superseded pin is now permanent"
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness"
+# ⛔ THE OTHER DIRECTION: a holder of the PARENT must NOT block, or one idle shell anywhere above the pin
+# root would pin every superseded tree forever (the #2573 direction, on this arm).
+( cd "$R/pin" && exec sleep 120 ) & HLD_PARENT=$!
+sleep 0.3
+prunesup
+[ ! -e "$R/pin/$RP_A" ] && ok "a holder of the PARENT (the pin root) does not block the reclaim — the match is one-directional" \
+                        || bad "a parent-directory holder kept a superseded pin alive — the match runs the wrong way"
+kill "$HLD_PARENT" 2>/dev/null; wait "$HLD_PARENT" 2>/dev/null
+# ⛔ FAIL-CLOSED, DRIVEN: an unreadable census must PRESERVE and NAME, never delete. Without this seam the
+# check-unavailable arm is undrivable, so a regression turning it into "unheld" would redden nothing.
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness"
+PIN_CENSUS_UNAVAILABLE=1 prunesup
+[ -d "$R/pin/$RP_A" ] && ok "an UNREADABLE process census PRESERVES the pin (cannot-verify is never a licence to delete)" \
+                      || bad "the pin was reclaimed with no census at all — fail-OPEN on the one path that rm -rf's"
+case "$PR_OUT" in
+  *"PRESERVED($R/pin/$RP_A, check-unavailable:"*) ok "the fail-closed keep SAYS check-unavailable:<what>" ;;
+  *) bad "the fail-closed keep was not named check-unavailable — an operator cannot see why the pin survived" ;;
+esac
+rm -rf "$R/pin/$RP_A"
 [ -d "$R/pin/$RP_B" ] && ok "prune KEEPS the ACTIVE harness pin" \
                       || bad "prune deleted the ACTIVE pin — the cell no longer has its harness"
 # An empty pin file means "which pin is live" is NOT KNOWN: an unknown is an abstention, not a licence.
