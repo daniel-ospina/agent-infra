@@ -14,9 +14,17 @@
 #   is the FALLBACK: when GitHub-hosted is unhealthy it re-adds `ubuntu-latest` to the
 #   pool so the same workflows can land locally instead of queueing forever.
 #
-# ⛔ THE FALLBACK-ONLY DECISION ABOVE IS UNCHANGED (agent-infra#2327 did not touch it). The pool
-#   serves CI only while GitHub-hosted is unhealthy — the arch fix below changes WHICH LABEL each
-#   runner accepts, never WHEN the pool is offered to the queue. When the pool gained a second
+# ⛔ THE FALLBACK-ONLY DECISION ABOVE IS AMENDED ON ITS TIMING LEG — deliberately, by owner ruling
+#   (agent-infra#9878, 2026-11-02), and NOT by an accident of tidying. #2327 left `WHEN` untouched and
+#   constrained only `WHICH LABEL`; the ruling below moves WHEN, so it is recorded as an override
+#   rather than absorbed silently:
+#     OVERRIDES: the fallback-only timing rule (#2327 / this header) — the pool is offered only while
+#       GitHub-hosted is unhealthy — because the owner has ruled the pool is capacity BEYOND the
+#       40-job hosted cap (self-hosted jobs do not consume it), so a queue depth that observably
+#       stalls work, not an outage, is the correct trigger. The incident that rule protected against
+#       (fleet/FalkorDB contention, `src/reply.rs:655`, 178 restarts, 2026-10-12) is bounded instead
+#       by the capped arm below and by the memory floor, not by withholding the pool.
+#   The arch fix below changes WHICH LABEL each runner accepts. When the pool gained a second
 #   architecture the marker became per-runner (`self-hosted-arm64` / `self-hosted-x64`), because
 #   one pool-wide body deleted the x86 marker and the capacity silently stopped matching jobs.
 #   The invariant the label code holds: A RUNNER'S LABELS MUST DESCRIBE THAT RUNNER, NOT THE POOL
@@ -74,13 +82,21 @@ LOG_FILE="$STATE_DIR/ci-runner-gate.log"
 # diagnostic is not a measurement: stdout is read as data, stderr goes here and is quoted only when the
 # call FAILED.
 GH_ERR="$STATE_DIR/ci-runner-gate.gh.err"
-QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted backlog
+# queued runs = GitHub-hosted backlog. 60 -> 10: OWNER RULING, 2026-11-02 (agent-infra#9878).
+# The number is a TRIGGER, not a target. At the shipped 60 the pool stayed shut through a 46-run
+# queue whose head had waited 6,355 s (measured 2026-11-02T03:57Z), and the repo's own 21-sample
+# reading shows the queue head at 3,943-12,583 s old WHILE hosted served 2..14 runs — so a depth
+# that observably stalls work is an order of magnitude below 60, and the reason 60 was chosen
+# ("not a stampede") no longer holds once the arm is capped: what lands on the pool is bounded by
+# FALLBACK_ARM_MAX, so queue length alone no longer decides how much contention a fallback creates.
+QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"
 # The runs endpoint's maximum page size, and therefore the deepest queue one read can measure. The
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
 # turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
 QUEUE_PAGE=100
 # ── the THROUGHPUT (absorption) leg — agent-infra#2904 ─────────────────────────────────────────
-# ⛔ LENGTH IS NOT ABSORPTION. `queued < 60` says "not a stampede"; it cannot say "work is moving".
+# ⛔ LENGTH IS NOT ABSORPTION. `queued` below the length threshold says "not a stampede"; it cannot
+# say "work is moving".
 # Measured 2026-10-27, daniel-ospina/tortoise: a run sat QUEUED from 10:26Z to 13:28Z — 3 h — while
 # all three existing legs read healthy (component operational, no incident, queue < 60), and every
 # `runs-on: ubuntu-latest` job in the repo had no runner that could accept it. A CI stop the gate
@@ -154,6 +170,19 @@ BLIND_ALARM_EVERY_S="${CI_GATE_BLIND_ALARM_EVERY_S:-1800}"
 MODE_INFER_RUNS="${CI_GATE_MODE_INFER_RUNS:-3}"
 # The custom label that makes a job land on the LOCAL pool.
 FALLBACK_LABEL="ubuntu-latest"
+# ⛔ THE BLAST RADIUS OF A FALLBACK, IN RUNNERS. Until this cap existed, `set_labels on` PUT
+# `ubuntu-latest` to EVERY managed runner, so the pool took the whole queue at once: measured
+# 2026-11-02T03:58:09Z, `set_labels ok=12` armed all 12 registrations in a single pass while one of
+# the boxes carrying them (pi-cell-4) sat at load 38.6. That is the contention the fallback-only rule
+# existed to prevent, reproduced by the mechanism meant to relieve the queue.
+# 3 is the first BOUNDED step, not a claim about the ceiling, and it is a named variable so the bound
+# is greppable instead of implied. The reading that justifies RAISING it is the containment pair
+# measured ON THE ARMED BOX WHILE IT WORKS — (a) its 1-minute load average below its core count, (b)
+# the FalkorDB restart count flat — the 2026-10-12 incident moved both together. Raise it only with
+# those two readings attached to agent-infra#9878; drop it if either regresses. A value of 0 (or any
+# cap that resolves to no runner on a non-empty pool) means the fallback is DISARMED: the pool is
+# released and the engaging pass refuses, rather than reporting a successful engage carrying nothing.
+FALLBACK_ARM_MAX="${CI_GATE_FALLBACK_ARM_MAX:-3}"
 # ⛔ THERE IS NO LONGER A SINGLE "pool label" (agent-infra#2327). The pool holds two
 # architectures, and each runner carries the marker for ITS OWN: `ARM64` runners keep
 # `self-hosted-arm64`, `X64` runners keep `self-hosted-x64`. Writing one pool-wide body to every
@@ -629,9 +658,9 @@ print(comp, len(inc))
   # ⛔ THE PAGE CAP CAN HIDE THE OLDEST RUN (review P2 — this used to be asserted in prose only).
   # The runs endpoint is newest-first, so a queue LARGER than the page yields the newest page's min,
   # i.e. a LOWER BOUND on the head age. That was previously claimed to be harmless because "such a
-  # queue is already >= QUEUE_THRESHOLD" — true at the shipped 60, FALSE whenever an operator raises
-  # QUEUE_THRESHOLD above the page size, and the operator-invisible result was a gate that read a
-  # 150-deep queue as healthy on a 60 s head. The length leg still decides first (it returns 1 on
+  # queue is already >= QUEUE_THRESHOLD" — TRUE AT THE OLD DEFAULT 60 (`:77` now ships 10 on the
+  # 2026-11-02 owner ruling), FALSE whenever an operator raises QUEUE_THRESHOLD above the page size,
+  # and the operator-invisible result was a gate that read a 150-deep queue as healthy on a 60 s head. The length leg still decides first (it returns 1 on
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
   # that case is now refused by name, before the throughput leg, further down.
   queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE" \
@@ -882,6 +911,45 @@ managed_ids() { # $1 = rows (newline-separated `<id>TAB<label>`)
   done <<<"$1" | awk '!seen[$0]++'
 }
 
+# arm_ids <rows> <on|off> — the runners a label pass may touch, and the BOUND on it.
+#
+# ON  -> at most FALLBACK_ARM_MAX runners, in registration order (lowest id first). Deterministic
+#        order rather than API order, because a cap whose members change between passes arms a
+#        different box every 5 minutes and no containment reading can then be attributed to it.
+# OFF -> EVERY managed runner, uncapped. The bound is on WHAT THE POOL MAY TAKE, never on what it may
+#        give back: a capped disarm would strand `ubuntu-latest` on the runners outside the arm,
+#        where it outlives the fallback and keeps accepting CI onto a box the gate believes it has
+#        released. That asymmetry is the safety property of the pair.
+#
+# ⛔ ARCH IS DELIBERATELY NOT A FILTER HERE. An earlier draft armed X64 only (because `ubuntu-latest`
+# is x86_64 on GitHub-hosted); the suite's fixtures are ARM64 pool members and the fleet's ARM64
+# runners have carried `ubuntu-latest` since before #2327, so filtering the arm by arch would have
+# silently armed NOTHING on a fixture-shaped pool — a cap that bounds the blast radius by bounding it
+# to zero, which reads as success and delivers no capacity. If an arch-restricted arm is wanted, it
+# is a separate change with its own evidence, not a silent narrowing inside this one.
+arm_ids() { # $1 = rows, $2 = on|off
+  local rows="$1" eng="$2" rid name ids=""
+  if [ "$eng" = off ]; then
+    managed_ids "$rows"
+    return 0
+  fi
+  while IFS=$'\t' read -r rid name; do
+    case "$name" in
+      "$POOL_LABEL_ARM64"|"$POOL_LABEL_X64") ids="$ids $rid" ;;
+    esac
+  done <<<"$rows"
+  # A cap that is not a number would make the cap read as no cap — the bound fail-OPEN, the one
+  # direction a blast-radius cap must never fail. Refuse the pass instead.
+  case "$FALLBACK_ARM_MAX" in ''|*[!0-9]*) return 1 ;; esac
+  # ⛔ `awk NR<=n`, NOT `head -n n` (review P1). `head` exits the pipeline early, so on the launchd
+  # host's BSD `head` a cap of 0 exits 1 and — under `set -uo pipefail` — reports "bound UNREADABLE"
+  # for a LEGAL value, while on GNU `head` the same 0 yields an empty arm and a SUCCESSFUL "engage"
+  # with zero carriers; a payload past the pipe buffer also returns 141 (SIGPIPE) and is mis-reported
+  # as unreadable. `awk` consumes its whole input, so 0 is empty-with-rc-0 and a large pool is not a
+  # false failure.
+  printf '%s\n' $ids | awk '!seen[$0]++' | sort -n | awk -v n="$FALLBACK_ARM_MAX" 'NR<=n'
+}
+
 # labels_for <rows> <id> <on|off> — the label body for ONE runner, derived from ITS OWN HOST.
 #
 # ⛔ **A RUNNER'S LABELS MUST DESCRIBE THAT RUNNER, NOT THE POOL IT JOINED FIRST.** That is the
@@ -959,7 +1027,50 @@ set_labels() { # $1 = on|off
     log "WARNING: runner enumeration unreadable — no labels changed; ${rows:0:300}"
     return 1
   fi
-  for id in $(managed_ids "$rows"); do
+  # ⛔ THE ARM IS CAPPED ON ENGAGE AND UNCAPPED ON DISENGAGE — `arm_ids` documents why the asymmetry
+  # is the safety property. A bound that cannot be computed REFUSES the pass rather than falling back
+  # to the full pool, so a bad variable can never silently widen the blast radius.
+  local ARM_IDS ARM_BOUND ARM_COMPLEMENT
+  if ! ARM_IDS="$(arm_ids "$rows" "$eng")"; then
+    log "WARNING: fallback arm bound UNREADABLE (CI_GATE_FALLBACK_ARM_MAX='${FALLBACK_ARM_MAX}') — no labels changed"
+    return 1
+  fi
+  # ⛔ THE CAP MUST BOUND THE POOL'S ARMED SET, NOT JUST THE IDS THIS PASS TOUCHES (review P1). A pool
+  # that is ALREADY armed past the cap — the measured 2026-11-02T03:58:09Z `set_labels ok=12` — would
+  # otherwise keep taking the whole queue while the log read `bound=3`: the cap would change the
+  # sentence and not the load. So an ENGAGE disarms every managed runner OUTSIDE the arm, making the
+  # arm the pool's armed set. A DISARM bounds nothing (arm_ids returns the full managed set), so this
+  # complement is empty there and every managed runner is still swept.
+  ARM_BOUND="$FALLBACK_ARM_MAX"
+  if [ "$eng" = on ]; then
+    ARM_COMPLEMENT="$(printf '%s\n' $(managed_ids "$rows") | awk -v a=" $(printf '%s' "$ARM_IDS" | tr '\n' ' ') " 'index(a, " " $0 " ")==0')"
+    # A cap that leaves the pool with NO carrier is refused rather than reported as a successful
+    # engage with nothing on it (the GNU-`head` failure mode the `awk` above removes structurally).
+    if [ -z "$ARM_IDS" ] && [ -n "$(managed_ids "$rows")" ]; then
+      log "WARNING: fallback arm resolved EMPTY against a non-empty pool (CI_GATE_FALLBACK_ARM_MAX='${FALLBACK_ARM_MAX}') — the fallback is DISARMED by configuration, so no labels changed and the pool is not offered; the complement was disarmed above"
+      return 1
+    fi
+  else
+    ARM_BOUND="uncapped"
+    ARM_COMPLEMENT=""
+  fi
+  log "set_labels arm engagement=$eng bound=${ARM_BOUND} armed_ids=[$(printf '%s' "$ARM_IDS" | tr '\n' ',' )] disarming=[$(printf '%s' "$ARM_COMPLEMENT" | tr '\n' ',' )]"
+  # The complement is disarmed FIRST: if this pass dies half-way, the pool is SMALLER than promised
+  # (a shortage that the next tick repairs) rather than larger than the cap claims.
+  for id in $ARM_COMPLEMENT; do
+    if ! body="$(labels_for "$rows" "$id" off)"; then
+      log "WARNING: runner $id is not classifiable from its own host label — left as-is"
+      fail=$((fail+1)); continue
+    fi
+    log "set_labels runner=$id body=$body (outside the arm)"
+    if printf '%s' "$body" | gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - >/dev/null 2>&1; then
+      ok=$((ok+1))
+      WANTED_BODY="$id=$body"$'\n'"$WANTED_BODY"
+    else
+      fail=$((fail+1))
+    fi
+  done
+  for id in $ARM_IDS; do
     if ! body="$(labels_for "$rows" "$id" "$eng")"; then
       log "WARNING: runner $id is not classifiable from its own host label — left as-is"
       fail=$((fail+1)); continue
