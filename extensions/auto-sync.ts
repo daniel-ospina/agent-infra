@@ -34,6 +34,40 @@ export function shortHead(repo: string, ref = "HEAD"): string {
   }
 }
 
+/**
+ * The commit this box is PINNED to, as `<sha12>` (`~/.pi/agent/state/HARNESS-PIN`), or "" when the
+ * record is absent, unreadable or not a sha. Empty means UNKNOWN, never "no pin" — the caller must
+ * keep its plain wording in that case rather than invent a pin claim (agent-infra#10114).
+ */
+export function pinnedSha(home: string = process.env.HOME ?? ""): string {
+  if (home === "") return "";
+  try {
+    const raw = readFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), "utf-8").trim();
+    return /^[0-9a-f]{7,40}$/i.test(raw) ? raw.slice(0, 12) : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * agent-infra#10114: `cd <checkout> && ./sync.sh` is the advertised repair command, and it is a TRAP
+ * when `AGENT_INFRA_PATH` names a checkout that is not the pin — it fast-forwards THAT tree, and the
+ * deployed harness keeps running the old code. Measured: the advertised command synced from an Aug-7
+ * checkout (HEAD 3b9a41562) while the pin named a different commit, so following the instructions
+ * changed nothing the box executes. Returns the correction lines (possibly empty) — EMPTY whenever
+ * the pin is unknown OR the checkout already IS the pin, so the normal case stays quiet.
+ */
+export function pinMismatchLines(repo: string, home: string = process.env.HOME ?? ""): string[] {
+  const pin = pinnedSha(home);
+  const head = shortHead(repo);
+  if (pin === "" || head === "?" || head === "") return [];
+  if (pin.startsWith(head) || head.startsWith(pin)) return [];
+  return [
+    `[auto-sync]    ⛔ this checkout is at ${head} but the PIN is ${pin} — ./sync.sh advances THIS tree, not the harness the box EXECUTES.`,
+    `[auto-sync]    To advance the deployed harness: scripts/harness-apply-pass.sh (or cloud-cell-supervisor.sh apply --pin-only), then restart the controller from the pinned tree.`,
+  ];
+}
+
 /** Commits HEAD is ahead of origin/main (0 when undetermined). */
 export function aheadCount(repo: string): number {
   try {
@@ -102,6 +136,8 @@ export function stalenessBanner(repo: string, behind: number, threshold: number)
     `[auto-sync] 🐌 your loaded extensions are ${behind} commits behind origin/main — this checkout is pinned at ${shortHead(repo)}.`,
     `[auto-sync]    extensions/ on disk is NOT what origin/main ships; a bug you are chasing may already be fixed there.`,
     sync,
+    // #10114: the command above can be a TARGET the reader thinks fixes the box and does not.
+    ...pinMismatchLines(repo),
   ];
 }
 
@@ -835,6 +871,10 @@ export default function (pi: ExtensionAPI) {
 
     const state = syncState(infraPath);
     const syncHint = `cd "${infraPath}" && ./sync.sh`;
+    // #10114: the hint below is printed as THE remedy. When this checkout is not the pin, it names a
+    // command that cannot deliver that remedy, so say so beside it rather than letting a reader follow
+    // it and believe the harness was fixed.
+    const pinLines = pinMismatchLines(infraPath);
     const behind = state === "behind" ? behindCount(infraPath) : 0;
 
     // #265: every MUTATION (lossless recovery, sync.sh run) is serialized by the
@@ -925,5 +965,8 @@ export default function (pi: ExtensionAPI) {
     if (state !== "behind") return; // current — silent
 
     console.log(`[auto-sync] ⚠️  agent-infra update available (${behind} commit(s) behind) — run: ${syncHint}`);
+    // #10114: printed beside the warn-mode hint — the auto-sync/stash paths print `syncHint` too and
+    // carry no correction, so this is scoped to the arm that actually shows it.
+    for (const l of pinLines) console.log(l);
   });
 }

@@ -530,6 +530,55 @@ log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$
 [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
     log_line "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
 
+# ── DEPLOYED-DRIFT READING (agent-infra#10114) ────────────────────────────────────────────────
+# ⛔ THE BOX CAN BE AT THE PIN AND STILL RUN NOTHING THIS REPO SHIPS. Every reading above answers a
+# question about a RECORD (the pin, the stamp, the checkout). None of them answers the one question the
+# outage asked: is the code that is EXECUTING equal to $REF? Measured on this class of box: the
+# controller executed `<pin-root>/709dfb06eac2/...`, a directory that no longer existed, while the pin
+# record, the unit's active state and the control plane all read green — a stale copy is not fixed, and
+# it was INVISIBLE because the pass reported success.
+# ⛔ ONE PREDICATE (#1178): this calls `check-deployed-drift.sh`, the instrument that already answers
+# this, and prints ITS token. It is NOT re-derived here — a second checker is how two instruments come
+# to disagree about one box. READ-ONLY: that script changes nothing and is safe beside a working loop.
+# ⛔ THE SEAM IS THE POINT. `HARNESS_APPLY_DRIFT_CHECK=0` disables it (the suite runs this pass against
+# stub repos that carry no harness dir at all); an ABSENT checker is `not-run`, named as such, never a
+# silent pass — we cannot verify what we did not run.
+DRIFT_STATE=not-run; DRIFT_RC=not-run; DRIFT_TOKEN=not-run
+# ⛔ CALLED EXACTLY ONCE, FROM `finish` (review P1). An earlier revision also called it here, beside
+# the other readings — so every pass took TWO readings, and on an advancing tick the two DISAGREED
+# (this one pre-move, `finish`'s post-move) while the log printed both under the same key. That is the
+# "two numbers for one box in one pass" defect this file already documents twice, and the checker
+# costs ~3 s, so it doubled the pass's cost too.
+read_deployed_drift() {
+    [ "${HARNESS_APPLY_DRIFT_CHECK:-1}" = 0 ] && { DRIFT_STATE=disabled; DRIFT_TOKEN=disabled; return 0; }
+    local chk="${HARNESS_APPLY_DRIFT_CMD:-}"
+    if [ -z "$chk" ]; then
+        # This pass lives in `scripts/` while the checker lives in `scripts/orchestrator-harness/`;
+        # accept either layout rather than hard-coding the one this checkout happens to have.
+        for _candidate in "$HERE/orchestrator-harness/check-deployed-drift.sh" "$HERE/check-deployed-drift.sh"; do
+            [ -f "$_candidate" ] && { chk="$_candidate"; break; }
+        done
+    fi
+    if [ ! -f "$chk" ]; then
+        DRIFT_STATE=not-run; DRIFT_TOKEN=absent
+        log_line "harness: deployed_drift=not-run token=absent (no check-deployed-drift.sh beside $HERE) — NOT a clean reading, we did not look"
+        return 0
+    fi
+    local out
+    # `--surface` is what includes the EXECUTING tree (read from the process's own argv) alongside $O;
+    # `--no-fetch` keeps this pass network-free (the fetch above already happened).
+    out="$(bash "$chk" --surface --repo "$REPO" --ref "$REF" --no-fetch 2>&1)"; DRIFT_RC=$?
+    DRIFT_TOKEN="$(printf '%s\n' "$out" | sed -n 's/.*harness=//p' | head -1)"
+    [ -n "$DRIFT_TOKEN" ] || DRIFT_TOKEN="rc=$DRIFT_RC"
+    case "$DRIFT_RC" in
+        0) DRIFT_STATE=clean ;;
+        1) DRIFT_STATE=drift ;;
+        *) DRIFT_STATE="cannot-verify-rc$DRIFT_RC" ;;
+    esac
+    log_line "harness: deployed_drift=$DRIFT_STATE token=$DRIFT_TOKEN (check-deployed-drift.sh --surface)"
+    return 0
+}
+
 # finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
 # (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
 # identical from a log, and an operator who reads `current` has to be able to see it WAS current.
@@ -541,7 +590,34 @@ finish() { # <ok> <rc> <verdict-phrase>
     # `--print-status` dumps verbatim — while the record beside it said `behind=0`. So the phrase is
     # passed WITHOUT readings and the numbers are appended here, once, after the recompute.
     recompute_deployed
-    REC_DETAIL="$3 — head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}"
+    # ⛔ ONE READING, TAKEN HERE, FROM THE FINAL STATE (review P1). Unconditional so every exit path —
+    # advance, no-op, refusal — reports the same post-move fact, and no path can carry a stale one.
+    read_deployed_drift
+    # ⛔ A STALE DEPLOYED COPY IS NOT A CLEAN PASS (agent-infra#10114). This is the plain form of the
+    # "gate that answers before its inputs exist": every reading above can be green while the box
+    # executes a tree that is gone, and a `rc=0` there tells every downstream reader the harness is
+    # fine. The drift reading itself was taken ONCE, above. It never downgrades a refusal (a passing
+    # `$1` is required) and never masks a higher code: a box that could not verify is rc 23 and stays 23.
+    if [ "$1" = 1 ]; then
+        # ⛔ WHICH DRIFT EARNS A RED. `executes:<dir>` is the measured #10114/#3194 class and the only
+        # one that is unambiguously a FAILURE OF THE HARNESS THIS PASS GOVERNS: a live controller
+        # executes a directory the box does not have, so NOTHING it runs is this repo's code — and the
+        # pass just called that box fine. The other tokens (`behind:`, `payload-differs`,
+        # `uncommitted-edit:`, `surface`) can legitimately describe a developer box mid-edit or a
+        # deliberately-behind checkout, so they are REPORTED in the log line and in the record's
+        # `drift=` field, but they do not convert an ordinary pass into a refusal. A check that reds
+        # every working box is a check an operator learns to ignore, which is how the silent one
+        # survived. Scoping is stated here rather than implied: only `executes:` fails the pass.
+        case "$DRIFT_TOKEN" in
+            executes:*)
+                REC_ACTION=deployed-drift
+                REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory this box does not have (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: scripts/harness-up or cloud-cell-supervisor.sh apply --pin-only, then restart the controller from the pinned tree (a redeploy does not clear a GONE executing tree). Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
+                write_record 0 1 || exit 23
+                err "$REC_DETAIL"
+                exit 1 ;;
+        esac
+    fi
+    REC_DETAIL="$3 — head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE${DRIFT_TOKEN:+:$DRIFT_TOKEN}${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}"
     write_record "$1" "$2" || exit 23
     if [ "$1" = 1 ]; then log_line "$REC_DETAIL"; else err "$REC_DETAIL"; fi
     exit "$2"

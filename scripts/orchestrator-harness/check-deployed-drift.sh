@@ -731,7 +731,24 @@ if [ "$SURFACE" -eq 1 ]; then
         _w="${_argv[$_i]}"
         case "${_w##*/}" in bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) _interp=1 ;; esac
         case "$_w" in
-          */orch-loop.sh|orch-loop.sh|./orch-loop.sh) _script="$_w" ;;
+          # ⛔ AN ABSOLUTE PATH IS UNAMBIGUOUS; A BARE OR RELATIVE WORD IS NOT (review P1, #10114).
+          # `orch-loop.sh` as an argv element is produced by ROUTINE agent traffic — `grep -n x
+          # orch-loop.sh`, `vim orch-loop.sh`, `git log -- orch-loop.sh`, `python3 -c '…' orch-loop.sh` —
+          # and reading those as "this process EXECUTES orch-loop.sh" fabricates a controller, which
+          # under agent-infra#10114 is no longer cosmetic: the harness pass turns an `executes:` token
+          # into a red and `fleet-health` alarms, so a healthy box reds on a grep. Measured: an argv of
+          # `python3 -c 'time.sleep(20)' orch-loop.sh` produced
+          # `DRIFT(exec): pid … executes /tmp/nosh-dir` on a dir carrying no harness at all.
+          # So the bare/relative forms count ONLY when an interpreter precedes them (`bash ./orch-loop.sh`,
+          # `sh -x orch-loop.sh`), which is how every launcher in this repo actually spells it. A
+          # relative path with no interpreter is a MENTION and is reported as one, never as a controller.
+          # ⛔ `/*/` — ABSOLUTE ONLY. The earlier draft used `*/orch-loop.sh` for the first arm, and `*`
+          # matches `.` and `sub`, so `./orch-loop.sh` and `sub/orch-loop.sh` took THAT arm and were
+          # still read as invocations with no interpreter — the fabrication this fix exists to close,
+          # left open behind a comment that claimed it shut (review VGATE of this change).
+          /*/orch-loop.sh) _script="$_w" ;;
+          orch-loop.sh|*/orch-loop.sh)
+            if [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
           -c)
             # ⛔ `bash -c <abs>/orch-loop.sh` IS the invocation; `bash -c 'echo-bash-<dir>/orch-loop.sh'` is a
             # shell running TEXT — the self-match class the fleet inventory documents, and the arm that keeps
