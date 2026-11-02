@@ -837,6 +837,26 @@ set_cooldown_ms() {
   return 0
 }
 
+# Record the deadline a window-KIND flag protects, NEVER SHRINKING IT.
+# ⛔ DEADLINES ARE MONOTONIC MAXIMA ACROSS `cooldown.*`, SO A SHORTER SAME-KIND REFUSAL MUST NOT
+# REPLACE A LONGER ONE. Lane A takes a 120 s secondary refusal → the flag protects t+120 s. Lane B,
+# 1 s later, takes a 60 s secondary refusal → an overwriting write leaves the flag at t+60 s while
+# `cooldown_remaining_ms` still reports the t+120 s window, because it MAXES across files. At t+60 s
+# `window_kind_live` prunes the flag BY TIME, `secondary_live` turns false, and — for a refusal that
+# carried no `retry-after` header, so `REFUSAL_RETRY_S` is 0 and the evidence record does not gate
+# it either — a healthy primary `/rate_limit` read discharges the remaining 60 s. That is the #1762
+# fail-open this change closes, reopened by a peer (#3228 review round 3, reproduced).
+set_window_kind() {  # $1 = flag name, $2 = the deadline it protects
+  local f="$GATE_DIR/$1" cur
+  case "$2" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$2" -gt 0 ] || return 0
+  cur="$(cat "$f" 2>/dev/null)"
+  case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+  [ "$2" -gt "$cur" ] || return 0
+  printf '%s' "$2" 2>/dev/null > "$f"
+  return 0
+}
+
 # ── A SHARED WINDOW IS EVIDENCE WITH A WINDOW, NOT A STATE ────────────────────────────────────
 # ⛔ THIS LAYER USED TO SLEEP ON A COOLDOWN IT NEVER RE-DERIVED, AND THAT IS THE FLEET STALL.
 # MEASURED 2026-11-01, this box, 19:34-19:38 UTC: `gh run view` was refused
@@ -941,7 +961,11 @@ run_bounded() {
   # still holding a request against a bucket we were told not to touch (#3228 review, finding 5).
   CHILD_PID="$pid"
   while [ "$spent" -lt "$bound" ]; do
-    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return $?; }
+    # ⛔ CLEAR `CHILD_PID` ON THE SUCCESS PATH TOO. `on_signal` forwards the caller's TERM to
+    # `CHILD_PID` only, so leaving a REAPED pid there lets a TERM that arrives before `run_paced`
+    # installs its own child signal a pid the kernel may have recycled — the shim's whole reason
+    # for forwarding signals is that a stray kill matters (#3228 review round 3).
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; local _rc=$?; CHILD_PID=""; return $_rc; }
     sleep_ms 100
     spent=$(( spent + 100 ))
   done
@@ -1148,7 +1172,7 @@ refusal_evidence_live() {
 # Re-derive an open shared window against the exempt read. 0 = discharged (proceed now), 1 = keep
 # the window. It only ever REMOVES a window on positive evidence that the account is fine.
 discharge_window() {
-  local outf rem vrd minrem rlock snap="" f cv have_ev=0
+  local outf rem vrd minrem rlock snap="" f cv have_ev=0 vrd_out
   [ "$REVALIDATE_ON" -eq 1 ] || return 1
   # A window a SECONDARY-shaped refusal wrote is never discharged by a primary read, and neither is
   # one the server itself instructed (see `window_kind_live`).
@@ -1191,8 +1215,19 @@ discharge_window() {
     return 1
   fi
   rm -rf "$rlock" 2>/dev/null
-  rate_limit_verdict "$outf"; vrd=$?
-  minrem="$(sed -n 's/^OK lowest=[^ ]* //p' "$outf" 2>/dev/null)"
+  # ⛔ CAPTURE THE VERDICT — NEVER LET IT REACH STDOUT. `rate_limit_verdict` PRINTS its `OK lowest=…`
+  # line, and uncaptured it lands on the caller's stdout AHEAD OF THE REAL ANSWER, so every consumer
+  # that parses the shim's bytes breaks on a call that SUCCEEDED. MEASURED:
+  #   $ bash scripts/gh-shim/gh api user          # with a discharged window
+  #   OK lowest=core 4684/5000{"number":1,"title":"real answer"}
+  # `gh-rest/gh` jq's that output, so a successful `pr view --json` became a JSONDecodeError — the
+  # stdout twin of the rule in STATED LIMITS that nothing may touch a successful call's stderr. It
+  # was invisible because every discharge arm redirects `>/dev/null`.
+  # The captured string is ALSO the only place the bucket figure exists: `$outf` holds the raw
+  # `/rate_limit` JSON, not the verdict line, so the notes below read `(unreadable)` from a file the
+  # number was never in (#3228 review round 3, reproduced).
+  vrd_out="$(rate_limit_verdict "$outf")"; vrd=$?
+  minrem="$(printf '%s' "$vrd_out" | sed -n 's/^OK lowest=[^ ]* //p')"
   [ -n "$minrem" ] || minrem="(unreadable)"
   case "$vrd" in
     0) ;;  # every bucket has headroom
@@ -1204,7 +1239,7 @@ discharge_window() {
       # ⛔ THE NOTE STATES EXACTLY WHAT WAS READ. The old wording said "core remaining=…" and, on
       # the discharge path, "every bucket available" — a claim about buckets the code never read, in
       # the one log an operator debugs with (#3228 review, finding 3).
-      gate_note "the shared gh throttle window is CORROBORATED by the exempt read (a bucket is low: $(sed -n 's/^LOW //p' "$outf" 2>/dev/null)) — honouring it"
+      gate_note "the shared gh throttle window is CORROBORATED by the exempt read (a bucket is low: $(printf '%s' "$vrd_out" | sed -n 's/^LOW //p')) — honouring it"
       rm -f "$outf" 2>/dev/null
       return 1 ;;
   esac
@@ -1754,10 +1789,10 @@ run_paced() {
           ''|*[!0-9]*) : ;;
           *)
             if grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded' "$errf" 2>/dev/null; then
-              printf '%s' "$cd_until" 2>/dev/null > "$GATE_DIR/secondary.window"
+              set_window_kind secondary.window "$cd_until"
             fi
             if grep -Eqi 'retry-after:' "$errf" 2>/dev/null; then
-              printf '%s' "$cd_until" 2>/dev/null > "$GATE_DIR/retry-after.window"
+              set_window_kind retry-after.window "$cd_until"
             fi ;;
         esac
       fi

@@ -1487,6 +1487,77 @@ ls "$GDIR"/refusal.* >/dev/null 2>&1 \
   && fail "(f)(xx) an expired evidence record survives its window — a state with no window is back (finding 3)" \
   || pass "(f)(xx) evidence records are pruned once their window has expired (no stale kind, no stale deadline)"
 
+# (f)(xxi)–(f)(xxii) — #3228's THIRD REVIEW ROUND: THE TWO RESIDUALS THE ARMS ABOVE CANNOT SEE.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# (f)(xxi) ⛔ A DISCHARGE MUST NOT TOUCH THE CALLER'S STDOUT — AND THE NOTE MUST NAME THE FIGURE.
+# `rate_limit_verdict` PRINTS its `OK lowest=…` line; uncaptured it landed AHEAD OF THE REAL ANSWER,
+# so every consumer that parses the shim's bytes broke on a call that SUCCEEDED (`gh-rest/gh` jq's
+# the output). EVERY discharge arm above redirects `>/dev/null`, which is exactly why none of them
+# caught it — so this one asserts the ANSWER, not just the exit code.
+GDIR="$(gate_dir revalidate-stdout)"
+GREAL_OUT="$TMP/gate-real-stdout"
+cat > "$GREAL_OUT" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976},"search":{"limit":30,"remaining":30}}}'
+    exit 0 ;;
+esac
+printf '%s\n' '{"number":1,"title":"real answer"}'
+GHEOF
+chmod +x "$GREAL_OUT"
+# baseline: no window open — the pristine answer this call prints on its own.
+_out_clean="$(AGENT_GH_REAL="$GREAL_OUT" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  bash "$SHIM" api user 2>/dev/null)"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/events.log"
+_out_w="$(AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_OUT" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user 2>/dev/null)"
+_rc=$?
+[ "$_rc" -eq 0 ] \
+  && pass "(f)(xxi) a discharged call still succeeds (rc=0)" \
+  || fail "(f)(xxi) the discharge did not happen at all (rc=$_rc)"
+[ "$_out_w" = "$_out_clean" ] && [ -n "$_out_clean" ] \
+  && pass "  …and the caller's STDOUT is byte-identical with and without a discharge" \
+  || fail "  …but the discharge leaked into the caller's stdout: '$(printf '%s' "$_out_w" | head -c 120)'"
+grep -q 'lowest remaining 4684/5000' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the note names the bucket figure it actually READ" \
+  || fail "  …but the note does not name the figure: '$(head -1 "$GDIR/events.log" 2>/dev/null)'"
+
+# (f)(xxii) ⛔ A SHORTER SAME-KIND REFUSAL MUST NOT SHRINK THE KIND FLAG. Deadlines are monotonic
+# maxima across `cooldown.*`, so a 5 s refusal overwriting a 300 s one expires the flag at t+5 s
+# while the governing window runs to t+300 s. For a refusal with NO `retry-after` header
+# `REFUSAL_RETRY_S` is 0 and the evidence record does not gate it either, so the only guard left is
+# `secondary_live` — and a shrunk flag leaves 295 s dischargeable by a primary read (#1762 again).
+GDIR="$(gate_dir revalidate-kind-max)"
+GREAL_KIND="$TMP/gate-real-kind"
+cat > "$GREAL_KIND" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684}}}'; exit 0 ;;
+esac
+_hdr="$(cat "$KIND_RETRY" 2>/dev/null || echo 60)"
+echo "HTTP 403: You have exceeded a secondary rate limit. (retry-after: $_hdr)" >&2
+exit 1
+GHEOF
+chmod +x "$GREAL_KIND"
+KIND_RETRY="$TMP/kind-retry"
+printf '%s' 300 > "$KIND_RETRY"
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_KIND" AGENT_GH_GATE_DIR="$GDIR" KIND_RETRY="$KIND_RETRY" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_long="$(cat "$GDIR/secondary.window" 2>/dev/null)"
+printf '%s' 5 > "$KIND_RETRY"
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_KIND" AGENT_GH_GATE_DIR="$GDIR" KIND_RETRY="$KIND_RETRY" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_short="$(cat "$GDIR/secondary.window" 2>/dev/null)"
+case "${_long:-x}${_short:-x}" in
+  *[!0-9]*) fail "(f)(xxii) the kind flag is not a deadline ('$_long' then '$_short')" ;;
+  *) [ "$_short" -ge "$_long" ] \
+      && pass "(f)(xxii) a shorter same-kind refusal does NOT shrink the flag ($_long → $_short)" \
+      || fail "(f)(xxii) the flag SHRANK to a shorter same-kind deadline ($_long → $_short) — a longer governing window is left dischargeable" ;;
+esac
+
 rm -f "$GDIR"/cooldown.* "$GDIR/secondary.window" "$GDIR"/refusal.* 2>/dev/null
 GDIR="$(gate_dir revalidate)"
 # (g) A NON-rate-limit 403 IS NOT RETRIED. A permissions failure is not a burst, and
