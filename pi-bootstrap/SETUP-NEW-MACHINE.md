@@ -93,6 +93,16 @@ API keys. Transfer it (AirDrop works — it's tiny).
 4. **After confirming pi works: delete `pi-keys.env`** (or store it in a
    password manager) — it contains your secrets.
 
+**One key is not like the others: `TORTOISE_MCP_API_KEY`.** The graph mandate (read the hosted
+Tortoise graph before researching, confirm direction in it before implementing, write the learning
+after) needs it, and nothing in this repo can deliver it — there is no secret store wired to the
+fleet, so it is HAND-PROVISIONED: it must be a line in `pi-keys.env` here (and in a cell's `keys.env`).
+The client itself (`~/.pi/agent/scripts/tortoise-graph.sh`) IS delivered by the setup — it is farmed
+from this repo — so a box missing ONLY this key reports `GRAPH-UNREACHABLE(NO-KEY)` on every call
+while `bash scripts/cloud-cell-bringup.sh --check` warns by variable NAME (never its value).
+Re-generate it from the Tortoise dashboard at `tortoise.premiselabs.co` (the sign-up site, not the API
+host).
+
 > Tip: if you ever lose the file, every key is re-generatable from each
 > provider's dashboard (DeepSeek, OpenRouter, Z.ai, Anthropic, Moonshot, Qwen).
 

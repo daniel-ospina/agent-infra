@@ -1413,6 +1413,58 @@ swap_avail_kb() {
   printf '%s' "$kb"
 }
 
+# ── (5c) the graph client, and the ONE credential the delivery path cannot carry (agent-infra#3253) ──
+# The owner's graph mandate is executable only if TWO things are true on this box: the client is in the
+# farm, and its key is in the environment of the process that runs it. Both were false on every cell
+# and NO instrument said so — the client had been hand-copied (so a fresh box received nothing, and the
+# next bring-up would not have changed that), and a missing key surfaced only when a lane tried to use
+# it. So: the client is farmed (`pi-bootstrap/setup.sh`'s `fleet_srcs`, which
+# `pi-bootstrap/cell-install.sh` parses — the ONE seam that already delivers per-box scripts), and the
+# key gets this reading.
+#
+# ⛔ WARNS, NEVER DIES. A cell without a graph key still runs lanes, and refusing readiness would turn a
+# missing optional credential into an unusable box. What must not survive is the SILENT version, so
+# the line is a `warn:` naming the variable and the remedy — and the client itself stays FAIL-CLOSED
+# (exit 3 `GRAPH-UNREACHABLE(NO-KEY)`), which is the contract the mandate states: an unreachable graph
+# is reported, never skipped.
+#
+# ⛔ THE VALUE IS NEVER PRINTED — not to stdout, not into the log, not into the status file. Presence
+# only: this output is captured by an operator, mailed into a postmortem and pasted into issues, which
+# is exactly how a key leaks (the fleet has already had one `keys.env` line exported fleet-wide, #2235).
+check_graph_client() {
+  local client py
+  client="${HOME:-}/.pi/agent/scripts/tortoise-graph.sh"
+  if [ -f "$client" ]; then
+    # "present", not "farmed": a `[ -f ]` cannot tell this farm's copy from the hand-copy this whole
+    # change exists to replace, and claiming otherwise would be the false PASS the review named. The
+    # byte-comparison against the checkout is `cell-install.sh --verify`'s job, not this line's.
+    ok "graph client: present at $client"
+  else
+    warn "graph client MISSING: $client — the graph mandate is UNEXECUTABLE on this box, so every lane must report GRAPH-UNREACHABLE(...). FIX: re-run the farm that installs it (bash pi-bootstrap/cell-install.sh --install, or pi-bootstrap/setup.sh on a Mac) — a hand-copy is not a deployment and does not survive the next bring-up"
+    return 0
+  fi
+  # The .sh execs its SIBLING by `$(dirname "$0")`. A farm that delivers only the .sh looks complete
+  # in the directory listing and dies on the first call, so the pair is checked as a pair.
+  py="$(dirname "$client")/tortoise_graph_client.py"
+  if [ -f "$py" ]; then
+    ok "graph client: tortoise_graph_client.py beside it (the sibling the .sh execs)"
+  else
+    warn "graph client HALF-DELIVERED: $py is absent, so every call dies on its first turn. FIX: the same farm run — fleet_srcs carries BOTH files, and farming the .sh alone is the defect"
+  fi
+  # The client prefers TORTOISE_MCP_API_KEY and falls back to TORTOISE_API_KEY, so this reading mirrors
+  # that precedence instead of inventing a second rule — but it does NOT report the two as equivalent:
+  # TORTOISE_API_KEY is the REST key (`tt_…`, /v1/points) used by `scripts/tortoise-memory.mjs`, a
+  # different transport from the `/mcp/` endpoint this client calls. A box carrying only the REST name
+  # gets a `warn:` — an `ok` there is the false-PASS shape this file exists to remove.
+  if [ -n "${TORTOISE_MCP_API_KEY:-}" ]; then
+    ok "graph credential: TORTOISE_MCP_API_KEY is present in this environment (value not printed)"
+  elif [ -n "${TORTOISE_API_KEY:-}" ]; then
+    warn "graph credential UNCERTAIN: only TORTOISE_API_KEY is set. That is the REST key (tt_…, /v1/points — scripts/tortoise-memory.mjs), and the graph client speaks JSON-RPC to /mcp/, so this key may be REJECTED by the endpoint. FIX: set TORTOISE_MCP_API_KEY alongside it (hand-provisioned, from the Tortoise dashboard) and re-run; a lane will report GRAPH-UNREACHABLE rather than silently skipping the read or the write"
+  else
+    warn "graph credential MISSING: neither TORTOISE_MCP_API_KEY nor TORTOISE_API_KEY is set, so $client exits 3 GRAPH-UNREACHABLE(NO-KEY) and the mandate cannot run. ⛔ The fleet has NO secret store wired to it — this key is HAND-PROVISIONED: add its line to $ENV_FILE on a cell (on a Mac, to pi-keys.env — pi-bootstrap/SETUP-NEW-MACHINE.md step 3) and re-run. Lanes MUST report GRAPH-UNREACHABLE(NO-KEY) rather than silently skipping the read or the write"
+  fi
+}
+
 check_swap() {
   local mem_mb cur target reading missing active=0 tol limit avail_kb need_kb
   mem_mb="$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null)"
@@ -1899,6 +1951,11 @@ main() {
       # AFTER the cache report, and for the same reason: the bound is one question, the COST of a
       # worktree venv on this box is the other (a hardlinked venv versus a 5.8 GB copy, #2159).
       check_uv_env
+      # AFTER the layer exists (`check_operational_layer` installs/verifies the farm) and after
+      # `check_provider` has sourced `$ENV_FILE`, so this reads the CLIENT the box will actually
+      # execute and the KEY the lane will actually see. Earlier would grade an empty farm and an
+      # unsourced environment — the vacuity trap this file already names elsewhere.
+      check_graph_client
       # Before the reaper's install step: a cell that cannot get swap must be refused EARLY, not
       # after the scheduler work — and the reading is what the operator needs from the refusal.
       check_swap
