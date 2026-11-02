@@ -2381,9 +2381,11 @@ plus its tmux server (agent-infra#2159).
 lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|terminals|unknown>
 ```
 
-* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (45 min,
-  deliberately ABOVE `lane.sh`'s 2400 s wall limit: a live lane inside one long silent tool call must
-  not read as dead and license extra dispatch). A lane whose log was **deleted** (a `/tmp` prune can
+* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (125 min,
+  deliberately ABOVE the lane's wall BACKSTOP `LANE_BACKSTOP_S` = 7200 s: a live lane inside one long
+  silent tool call must not read as dead and license extra dispatch. It followed the wall limit while
+  the wall was the primary bound; since agent-infra#2888 the wall is only the backstop, so the window
+  follows the backstop). A lane whose log was **deleted** (a `/tmp` prune can
   do that to a working lane) also counts as live: it may still be working, and for a capacity gate
   "possibly live" must never be counted `0`. This is the number `MAX_LANES` gates.
 * **total** — every resident lane tree THE CENSUS CAN ATTRIBUTE: a `pi` tree whose root or a direct
@@ -2496,6 +2498,15 @@ ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT,
 "off". Both off prints an `UNBOUNDED by construction` WARN. The same contract as `task`'s
 `getCpuStallMs`. Tuning is per dispatch: a lane class that legitimately sits silent for longer (a long
 model call with no tool activity) raises `LANE_BOUND_IDLE_S` rather than removing the limit.
+
+⛔ **THROUGH `run_agent`, `LANE_BOUND_WALL_S` CAN ONLY SHORTEN A RUN** (agent-infra#2888 review, P1).
+A caller that passes a wall also derives its cross-box claim lease from it (`fix-one.sh`: bound + 1200;
+`merge-one.sh`: `REVIEW_TIMEOUT` + gate wait + 300), because the lease exists to cover the run it was
+taken for — so an env value ABOVE the caller's own bound (including `0`, which means OFF = unbounded)
+is REFUSED, the wall stays at the caller's bound, and the refusal is written into the lane log. To give
+a lane a longer wall, raise the seam the CALLER owns — `LANE_BACKSTOP_S`, `LANE_TIMEOUT`,
+`FIX_TIMEOUT` — which moves the lease with the bound in the same expression. `lane-bound.sh` invoked
+directly (its own flag/env, `mac-lane.sh`) still honours the value as given: no lease is derived there.
 
 ⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
 no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent

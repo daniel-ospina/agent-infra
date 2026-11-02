@@ -794,6 +794,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "how old a reaper lock must be before a DEAD owner's lock is broken; a LIVE owner holds it outright whatever the directory age",
   },
   {
+    name: "LANE_BACKSTOP_S",
+    owners: ["scripts/orchestrator-harness/spawn-gate.sh"],
+    value: "${LANE_BACKSTOP_S:-7200}",
+    axis: "kill",
+    overrides: ["LANE_BACKSTOP_S=7200"],
+    guardedBy:
+      "scripts/orchestrator-harness/lane-bound.test.sh (i0) — the backstop is ABOVE the progress allowance, spawn-gate.sh EXPORTS it, and the consumers that outlive a lane (ai-drainer.sh, chain-merge.sh, pr-doctor.py's PRD_SPAWN_BACKSTOP_S) resolve the same number; the bound itself is DRIVEN through run_agent by (h)/(h3)",
+    note: "agent-infra#2888 — the ONE absolute backstop for a dispatch lane, in seconds, consumed by lane.sh, fix-one.sh and nonblocking-dispatch.sh. It is deliberately not the PRIMARY bound: lane-bound.sh's 2700 s PROGRESS allowance decides wedged-vs-slow, and this number (7200, PROVISIONAL) must sit strictly ABOVE it or the backstop pre-empts the bound it is supposed to back up — the shipped pair was wall 2400 < allowance 2700, which is precisely how a flat 40-minute cap came to censor ≥50% of repair lanes at their median. Registered here because a NEW stall bound must not land unregistered: the reverse scan is the only thing that makes a second, silent threshold visible.",
+  },
+  {
     name: "REAP_MIN_S",
     owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
     value: "${REAP_MIN_S:-2700}",
@@ -1428,10 +1438,10 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     name: "IDLE_S",
     owners: ["scripts/orchestrator-harness/lane-bound.sh"],
     value: "IDLE_S=\"\"",
-    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 1200)"'],
+    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 2700)"'],
     axis: "kill",
     guardedBy: NONE,
-    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 1200 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
+    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 2700 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
   },
   {
     name: "MIN_SESSION_AGE_S",
