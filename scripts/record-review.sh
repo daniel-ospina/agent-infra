@@ -1350,33 +1350,23 @@ $m"
     fi
     anchor="$newest"
   else
-    # MERGE-ONLY: A MUST ALREADY BE ATTESTED. Without this arm a lane can pick any
-    # two shas with only merges between them and mint `clean` over a head whose
-    # authored content nobody ever reviewed — the zero-evidence mint both reviewers
-    # of this change reproduced. Accept a prior clean-family record naming exactly
-    # A, or an explicit covering verdict.
+    # MERGE-ONLY: THE COVER IS MANDATORY — there is no local-record shortcut.
+    # ⛔ This arm used to accept `~/.pi/agent/reviews/<owner>-<repo>-<PR>.json` naming
+    # A with verdict `clean`. That file is plain JSON with NO SIGNATURE, and this is
+    # the first place a LOCAL file alone causes a SIGNED marker to be posted to the
+    # PR — converting a local-only forgery into a fleet-visible attestation that the
+    # remote ai-review-gate then reads. Every other arm in this file that trusts a
+    # prior artifact verifies an HMAC first ("THE HMAC IS THE WHOLE SAFETY ARGUMENT"),
+    # and the record file is per-box by design. Review forged the file with one
+    # `printf` and minted a signed `clean` over an unreviewed authored commit, which is
+    # the zero-evidence mint this whole feature exists to prevent. An attestation must
+    # come from something this box cannot manufacture: a review artifact, read through
+    # the API. So a merge-only delta must NAME one (see arm (10a)).
+    :
     if [ -z "$cover" ]; then
-      prior_head=""; prior_verdict=""
-      for _pf in "$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$PR.json" "$HOME/.pi/agent/reviews/$PR.json"; do
-        [ -f "$_pf" ] || continue
-        prior_head="$(awk 'match($0,/"head_sha":"[0-9a-f]*"/){print substr($0,RSTART+12,RLENGTH-13); exit}' "$_pf" 2>/dev/null || true)"
-        if [ "$prior_head" = "$from" ]; then
-          prior_verdict="$(awk 'match($0,/"verdict":"[a-z-]*"/){print substr($0,RSTART+11,RLENGTH-12); exit}' "$_pf" 2>/dev/null || true)"
-          break
-        fi
-        prior_head=""
-      done
-      # ⛔ ONLY `clean` IS A REVIEW. clean-low certifies the content SHAPE and
-      # clean-micro the micro PROCESS — this file documents both as NOT reviews, so
-      # extending one of them into a `clean` record would launder a no-review tier
-      # into a full-review claim (found in review of this change, reproduced both
-      # ways). A micro/low PR keeps recording its own verdict and needs no delta.
-      case "$prior_verdict" in clean) : ;; *) prior_verdict="" ;; esac
-      if [ -z "$prior_verdict" ]; then
-        echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit, but ${from:0:12}… is NOT an attested head on this box (no clean record names it) and no covering verdict was given. A delta EXTENDS an attestation and can never create one — otherwise any two shas with only merges between them would mint 'clean' over content nobody reviewed." >&2
-        echo "   → review at ${from:0:12}… and record that head first, or name the verdict that covered it: --evidence delta:$from..$to+comment:<id>." >&2
-        return 1
-      fi
+      echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit (nothing base-borne entered), but a merge-only delta still needs the VERDICT that covered ${from:0:12}… — a delta EXTENDS an attestation and can never create one. Naming a head is not evidence." >&2
+      echo "   → name the verdict at ${from:0:12}… : --evidence delta:$from..$to+comment:<id> (a verdict at ${to:0:12}… works too: then it is a plain --evidence comment:<id>)." >&2
+      return 1
     fi
     # ⛔ THE ANCHOR IS A, NOT B. A cover attests the REVIEWED head, and a merge-only
     # range adds no lane-authored content (that is what `--not $base_sha` just
@@ -1420,6 +1410,24 @@ $m"
     # of A (it reviewed more than this delta needs), never one that starts below it.
     body_claim=0
     stated_from=""; stated_to=""
+    if [ "$DELTA_KIND" = "merge-only" ]; then
+      # ⛔ A VERDICT AT A CANNOT NAME B — B did not exist when it was written. The
+      # merge-only range's authored content is nil by construction (`--not $base_sha`
+      # proved it) and `verify_review_evidence "$cover" "$anchor"` already ties the
+      # artifact to A, so naming A IS the claim. Demanding B made the remedy printed
+      # below unreachable for exactly the ordering this feature exists for.
+      case "$EVIDENCE_BODY" in
+        *"$from"*) body_claim=1 ;;
+        *"${from:0:12}"*) body_claim=1 ;;
+      esac
+      if [ "$body_claim" -ne 1 ]; then
+        echo "   delta: the covering artifact '$cover' does not name ${from:0:12}…, the REVIEWED head this merge-only range extends — a merge-only delta adds no lane-authored content, so its cover must be the verdict at A, and an artifact that names neither A nor this range cannot be that verdict." >&2
+        echo "   → name the verdict that covered ${from:0:12}… : --evidence delta:$from..$to+comment:<id>." >&2
+        return 1
+      fi
+    fi
+    if [ "$DELTA_KIND" != "merge-only" ]; then
+    stated_from=""; stated_to=""
     if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})\.\.([0-9a-f]{12,40}) ]]; then
       stated_from="${BASH_REMATCH[1]}"; stated_to="${BASH_REMATCH[2]}"
     fi
@@ -1446,6 +1454,7 @@ $m"
       for _needle in "$to" "${to:0:12}"; do
         case "$EVIDENCE_BODY" in *"$_needle"*) body_claim=1; break ;; esac
       done
+    fi
     fi
     if [ "$body_claim" -ne 1 ]; then
       echo "   delta: the covering artifact '$cover' does not NAME the range ${from:0:12}…..${to:0:12}… (it names neither the range nor ${to:0:12}…) — and a verdict that does not state which range it covered cannot be extended over authored commits by DATE alone, because a commit's date records when it was CREATED: an old-dated branch merged in after the review slips through an anchor built only from dates." >&2
