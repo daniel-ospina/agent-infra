@@ -116,6 +116,16 @@ CELL_HOME="${CELL_HOME:-$HOME}"
 HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 HARNESS_REF="${HARNESS_REF:-origin/main}"
+# ⛔ THE FETCH TARGET IS THE REF THE COMPARISON USES. `HARNESS_REF` is a documented knob (see the header),
+# and both verbs fetched `origin main` while DECIDING on `$HARNESS_REF` — so for any other value the pass
+# refreshed one ref and compared another, and `--status` printed "`origin/rel` fetched just now" about a ref
+# it never touched. A knob read one way and refreshed another is two facts pretending to be one, which is
+# the #2215 skew this file exists to remove — one variable over.
+ref_fetch_branch() { # the branch name to fetch for $HARNESS_REF (origin/main -> main, refs/heads/x -> x)
+  local r="${HARNESS_REF#origin/}"
+  r="${r#refs/heads/}"
+  printf '%s\n' "${r:-main}"
+}
 HARNESS="${HARNESS:-}"
 O="${O:-$CELL_HOME/orchestrator}"
 STAMP="$O/.agent-infra-stamp.json"
@@ -257,7 +267,7 @@ mend_record() {
 }
 
 do_pass() {
-  local dry="${1:-}" layer repo sup target applied now rc
+  local dry="${1:-}" layer repo sup target applied now rc ref_branch
   # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED HERE, ON EVERY TICK, BEFORE ANYTHING ELSE — see
   # `one_actor_check` for why install time cannot be the only reading.
   one_actor_check "$([ "$dry" = dry ] && printf dry || printf apply)"
@@ -276,7 +286,7 @@ do_pass() {
   # ⛔ `cd` — not `git -C` — because the verb below is the one that decides the cwd for the pin, and the
   # unit deliberately declares no `WorkingDirectory=`. This is where that directory is chosen.
   cd "$repo" || loud 2 chdir "cannot enter the resolved layer ${repo}"
-  git fetch -q origin main 2>/dev/null || loud 2 fetch-failed "git fetch origin main failed in ${repo} — an unreadable ref is never treated as current"
+  git fetch -q origin "$(ref_fetch_branch)" 2>/dev/null || loud 2 fetch-failed "git fetch origin $(ref_fetch_branch) failed in ${repo} — an unreadable ref is never treated as current"
   target="$(git rev-parse "$HARNESS_REF" 2>/dev/null)" || loud 2 unreadable-ref "${HARNESS_REF} does not resolve in ${repo}"
   applied="$(pinned_head)"
   if [ -z "$applied" ]; then
@@ -356,7 +366,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0
+  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0 ref_branch
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -380,7 +390,7 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # fetch is reported as possibly stale, never as current-but-unverified silence.
     case "$mode" in
       nofetch) printf '  (%s NOT fetched — the reading below may be STALE)\n' "$HARNESS_REF" ;;
-      *) if git -C "$layer" fetch -q origin main 2>/dev/null; then
+      *) ref_branch="$(ref_fetch_branch)"; if git -C "$layer" fetch -q origin "$ref_branch" 2>/dev/null; then
            printf '  (%s fetched just now)\n' "$HARNESS_REF"
          else
            printf '  (git fetch FAILED in %s — the reading below is against an UNREFRESHED local ref; this is not a green)\n' "$layer"
@@ -606,6 +616,18 @@ refuse_raw_text_tricks() { # <what> <body>
     *\\*)
       bad "$1 carries a backslash in a directive — systemd CONCATENATES a backslash-continued line and EXPANDS C-style escapes (\x43 is 'C'), so its parse differs from the line read this verification performs and a second CELL_HOME= assignment could hide there; the pin unit needs no continuation and no escape"; return 1 ;;
   esac
+  # ⛔ AND `%` IS A SPECIFIER, NOT A CHARACTER. `systemd.unit(5)`/`systemd.service(5)`: `Environment=`
+  # values and the `ExecStart=` command line both take `%` SPECIFIERS, expanded by the manager (`%h` = the
+  # user's home, `%n` = the unit name, …). So a base of `/srv/cell%h` is verified as that literal string and
+  # RUNS as `/srv/cell/root` — the unit's effective CELL_HOME, and its ExecStart path, stop being the values
+  # this verification approved, and the pass then reads a pin record the controller never reads (or goes
+  # 203/EXEC), while `--install` says installed. MEASURED rc=0. Refused rather than escaped (`%%` would work)
+  # because the values this file renders are plain paths and numbers, none of which legitimately needs a
+  # specifier — and a refusal names the thing to change instead of silently rewriting an operator's value.
+  case "$2" in
+    *%*)
+      bad "$1 carries a '%' in a directive — systemd EXPANDS %-specifiers in Environment= and ExecStart= (%h is the manager user's home, %n the unit name), so the value this verification reads literally is not the value systemd runs, and the pass would derive its base from something nobody verified; the pin unit needs no specifier (use a plain path)"; return 1 ;;
+  esac
   return 0
 }
 
@@ -635,7 +657,7 @@ refuse_env_reset() { # <what> <body>
 }
 
 verify_unit() { # <rendered service> [expected ExecStart payload] — the properties the ISSUE names, asserted on the ARTIFACT
-  local f="$1" expect="${2:-}" body exec_path exec_real exec_dir home_real n_exec execs envs ok_vals v w seen0=0 _interp _x _c
+  local f="$1" expect="${2:-}" body exec_path exec_real exec_dir home_real n_exec execs envs ok_vals v w seen0=0 seen11=0 _interp _x _c
   local n_home home_val _env _kv
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
@@ -781,6 +803,13 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
     case "$_c" in
       Condition*)
         bad "the rendered unit declares ${_c}= — a failed condition SKIPS the unit and leaves it green; the missing-layer case must be a RED payload exit, not a skip"; return 1 ;;
+      RootDirectory|RootImage)
+        # ⛔ THE HEADER NAMES THIS DIRECTIVE AND NOTHING CHECKED IT. `RootDirectory=`/`RootImage=` make
+        # systemd chroot()/pivot_root() the payload into that path (`systemd.exec(5)`) BEFORE any line of it
+        # runs — so a path that is not a live-cell invariant is the same "unit that never began" class as
+        # `WorkingDirectory=`, just one syscall over (and `EnvironmentFile=` was the sibling this file
+        # already refused). MEASURED rc=0 before this arm. The pass resolves its own layer instead.
+        bad "the rendered unit declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant turns the pin into a unit that never began (the 200/CHDIR class); the pass resolves its own layer instead"; return 1 ;;
     esac
   done
   # ⛔ ONLY THE PASS'S OWN SUCCESS CODES ARE GREEN. 0 = current/applied and 11 = mended are the whole
@@ -792,12 +821,19 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
     for w in $v; do
       case "$w" in
         0)  seen0=1 ;;
-        11) ;;
+        11) seen11=1 ;;
         *)  bad "SuccessExitStatus lists '${w}', which is neither 0 (current/applied) nor 11 (mended) — a wider list greens a failure"; return 1 ;;
       esac
     done
   done <<<"$ok_vals"
   [ "$seen0" -eq 1 ] || { bad "SuccessExitStatus must include 0 — 'current' and 'applied' are only green as 0"; return 1; }
+  # ⛔ AND 11 IS REQUIRED, NOT MERELY ALLOWED. 11 is the MENDED code: a box whose pin record was lost has it
+  # repaired and exits 11. A unit that does not count 11 green REDs on every mend — an unhealable RED on a
+  # box that is in fact correct, the #3133 class this rule's own comment invents 11 for. "Allowed" without
+  # "required" also left the rule untestable in the direction that matters: a doctor cannot tell a missing
+  # 11 from a wider list, so nothing pinned it (measured in review: deleting the must-include-0 rule left the
+  # whole suite green). Both halves are now gating, one doctor each.
+  [ "$seen11" -eq 1 ] || { bad "SuccessExitStatus must include 11 — 'mended' (a lost pin record was repaired) exits 11, and a unit that does not count it green goes RED on a box that is in fact correct (#3133)"; return 1; }
   return 0
 }
 
@@ -882,6 +918,11 @@ verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the 
           bad "the installed drop-in ${f} declares WorkingDirectory= — it refuses to start the unit when the directory is gone (EXIT_CHDIR 200), which is the defect this change replaces; remove ${f}"; return 1 ;;
         Condition*)
           bad "the installed drop-in ${f} declares ${_c}= — a failed condition SKIPS the unit and leaves it green; remove ${f}"; return 1 ;;
+        RootDirectory|RootImage)
+          # The same "never began" class as `WorkingDirectory=`, one syscall over: systemd enters that root
+          # before the payload runs. Refused in the drop-in path too, because a drop-in is merged OVER the
+          # unit and an operator reading the unit will never see it.
+          bad "the installed drop-in ${f} declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant is a unit that never began; remove ${f}"; return 1 ;;
         Exec*)
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
         SuccessExitStatus)
@@ -1086,6 +1127,15 @@ do_install() { # [--takeover]
   # actuator it had instead of being told "installed" while still running the defect.
   verify_dropins "$unit_dir" cell-self-pin.service \
     || { err "refusing: an installed drop-in re-opens a class the rendered unit closed (reason above) — nothing was written and nothing was retired"; rm -rf "$tmp"; return 1; }
+  # ⛔ AND THE TIMER'S DROP-INS ARE A SEPARATE SET. `dropin_dirs` enumerates the directories systemd
+  # merges FOR THE NAME IT IS GIVEN, so verifying only the service left `cell-self-pin.timer.d/*.conf`,
+  # `cell-self-.timer.d/`, `timer.d/` and the `/run` + `/usr/lib` copies completely unread — and the
+  # `Unit=|On*=` arm written for exactly that threat could only ever fire on a SERVICE drop-in, where
+  # systemd ignores both keys. MEASURED rc=0: a `cell-self-pin.timer.d/legacy.conf` carrying
+  # `OnCalendar=` installed green and nothing in the run mentioned the file (and `Unit=/bin/true.service`
+  # likewise). That is a pin that silently never runs — #3194's symptom reached from the timer's side.
+  verify_dropins "$unit_dir" cell-self-pin.timer \
+    || { err "refusing: an installed drop-in re-targets or re-schedules the timer this unit needs (reason above) — nothing was written and nothing was retired"; rm -rf "$tmp"; return 1; }
   # ⛔ RENDER → VERIFY → PLACE → INSTALL, in that order, and the order is the fix. Placement used to
   # happen inside the renderer, so a REFUSED install had already replaced the placed pass, and
   # `--print-unit` wrote a file. Verification now runs against the artifact BEFORE anything is written.
@@ -1096,11 +1146,16 @@ do_install() { # [--takeover]
   # still `place_pass`, and it is still AFTER every refusal.
   script="$(pin_script_path)" || { err "refusing: cannot locate the pass this unit would exec"; rm -rf "$tmp"; return 1; }
   verify_unit "$tmp/cell-self-pin.service" "$script" || { err "refusing: the rendered cell-self-pin.service failed verification (reason above)"; rm -rf "$tmp"; return 1; }
-  place_pass "$script" || { err "refusing: the pass could not be placed at $script"; rm -rf "$tmp"; return 1; }
-  [ -f "$script" ] || { bad "the unit names '${script}' and it does not exist after placement — the unit would fail 203/EXEC before any payload runs"; rm -rf "$tmp"; return 1; }
-  # ⛔ ONE ACTUATOR PER PIN. `eldato-harness-apply.timer` already advances this box's harness on the same
-  # 10-minute clock (#2416), and two mutating actors on one pin is a race, not redundancy. The guard asks
-  # BOTH managers, NAMES every scope it saw, and `--takeover` is the one-actor migration that retires it.
+  # ⛔ ONE ACTUATOR PER PIN, AND THE REFUSAL COMES BEFORE ANY WRITE. `eldato-harness-apply.timer` already
+  # advances this box's harness on the same 10-minute clock (#2416), and two mutating actors on one pin is a
+  # race, not redundancy. The guard asks BOTH managers, NAMES every scope it saw, and `--takeover` is the
+  # one-actor migration that retires it. ⛔ ⛔ THIS BLOCK USED TO SIT AFTER `place_pass`, which made the
+  # duplicate-actuator refusal — the DEFAULT case on this fleet, where both timers are enabled today —
+  # REPLACE the already-placed pass and then refuse: a refused install that had already mutated the box,
+  # which is the exact class the `--install` ordering fix above was made for, left reachable one line later.
+  # MEASURED: sentinel bytes at $CELL_HOME/.pi/agent/scripts/cell-self-pin.sh were overwritten by an
+  # `--install` that exited 1 and wrote no unit. Nothing could see it either: the suite's refusal legs pass
+  # CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1, which switches this very refusal off.
   scopes="$(actuator_scopes)" || scopes=""
   for s in $scopes; do who="$who ${s}"; done
   if [ -n "$scopes" ] && [ "$takeover" != --takeover ] && [ -z "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ]; then
@@ -1128,6 +1183,10 @@ do_install() { # [--takeover]
     [ "$takeover" = --takeover ] && note "  (--takeover given, and no eldato-harness-apply.timer is enabled — nothing to retire)"
     [ "$takeover" = --takeover ] || note "installing into $unit_dir"
   fi
+  # ⛔ AND ONLY NOW THE PLACED PASS — after every refusal that does not need the units on disk. Placement
+  # is the first mutation this verb performs; nothing before it writes to the box.
+  place_pass "$script" || { err "refusing: the pass could not be placed at $script"; rm -rf "$tmp"; return 1; }
+  [ -f "$script" ] || { bad "the unit names '${script}' and it does not exist after placement — the unit would fail 203/EXEC before any payload runs"; rm -rf "$tmp"; return 1; }
   # ⛔ THE UNITS GO IN FIRST, THE RETIREMENT LAST, AND THAT ORDER IS THE FIX. `retire_actuator` used to run
   # before `mkdir`, the writes, `daemon-reload` and `enable --now` — so ANY failure in that second half
   # returned non-zero with the shipped timer already disabled AND stopped, and nothing re-enabled it:
