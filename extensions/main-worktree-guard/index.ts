@@ -2845,6 +2845,14 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   // shape the message tells the reader to use. Everything else falls back to
   // M5's normal (blocking) behaviour — fail closed, never fail open.)
   if (/(^|\s)[A-Za-z_][A-Za-z0-9_]*=/.test(command)) return false;
+  // …and the AMBIENT env (round 6, P2 — MEASURED): with `GIT_DIR`/`GIT_WORK_TREE`
+  // in the pi PROCESS env, a bare `git checkout -- tracked.txt` run from the dirty
+  // hub targeted the OTHER checkout and rewrote its uncommitted work. Under the
+  // TTL marker that was newly reachable (origin/main blocked it; only the env
+  // hatch — a full bypass — allowed it there). No channel predicate can see the
+  // process env, so it is checked directly.
+  if (["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
+    .some((v) => { const x = process.env[v]; return typeof x === "string" && x.length > 0; })) return false;
   const st = _hubState();
   if (!st.disorder) return false; // the window exists only for a DISORDERED hub
   try {
@@ -4394,8 +4402,16 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
             `   The non-shell interpreter backdoor (python -c, node -e, ruby -e,`,
             `   perl -e, php -r, pwsh -Command) is closed: the inline payload`,
             `   contains a non-sanctioned git operation.`,
-            `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
-            `     or work in an isolated worktree:`,
+            `   → Run the git commands directly, or work in an isolated worktree:`,
+            // Round 6 (P2): this was the last message still prescribing the
+            // no-op. On a DIRTY hub `git checkout main && git pull --ff-only`
+            // cannot run (git refuses to switch over modified paths), and it
+            // never named the named-path restore the recovery window sanctions.
+            ...(_hubState().disorder
+              ? [`     (the hub is disordered — the M4 refusal carries the state-appropriate`,
+                 `     recovery route: \`git restore --staged <path>\` / \`git restore <path>\` /`,
+                 `     move an UNTRACKED path out of the checkout, under an escape hatch)`]
+              : [`     (recovery from an off-main hub: git checkout main && git pull --ff-only)`]),
             `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
           ].join("\n");
         }

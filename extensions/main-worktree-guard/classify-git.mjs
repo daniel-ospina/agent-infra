@@ -4735,6 +4735,16 @@ function _invSelectsRepo(inv) {
   const hints = [inv.gitDirHint, inv.workTreeHint, inv.indexFileHint, inv.objDirsHint];
   if (hints.some((h) => typeof h === "string" && h.length > 0)) return true;
   if (Array.isArray(inv.cHints) && inv.cHints.length > 0) return true;
+  // Round 6 (P2, MEASURED): the invocation carries TWO more config channels that
+  // git honours and this predicate ignored — `-c core.worktree=<other>` and
+  // `--config-env=core.worktree=VAR` classified `recovery` at head while
+  // origin/main blocked them. (Their effect was inert here because git ignores
+  // core.worktree inside a worktree, so this is a classification gap rather than
+  // a live discard — but it is the same enumeration hole, so it is closed with
+  // the seam: ANY config override puts the invocation outside the window.)
+  for (const list of [inv.configOverrides, inv.configEnvOverrides, inv.envPrefixes]) {
+    if (Array.isArray(list) && list.length > 0) return true;
+  }
   return false;
 }
 
@@ -5634,10 +5644,15 @@ function _m4RecoveryLines(hubContext) {
     ];
   }
   return [
-    `   → Recover the DIRT (a branch switch cannot — git refuses to switch over`,
-    `     modified paths): \`git restore <path>\` / \`git checkout -- <path>\`, one`,
-    `     NAMED path at a time, permitted while an escape hatch is active:`,
-    `     AGENT_ALLOW_MAIN_EDITS=1 in the session-start env, or the`,
+    `   → Recover the DIRT — a branch switch cannot (git refuses to switch over`,
+    `     modified paths). Which command depends on WHICH dirt; \`git status`,
+    `     --porcelain\` tells you (column 1 = index, column 2 = worktree):`,
+    `       staged/index change  \`M \`  -> \`git restore --staged <path>\``,
+    `       worktree change      \` M\`  -> \`git restore <path>\` / \`git checkout -- <path>\``,
+    `       UNTRACKED            \`??\`  -> move it OUT: \`mv <path> /tmp/\` (\`git clean\``,
+    `                                        stays refused — it is a discard)`,
+    `     These named-path recoveries need an active escape hatch: the`,
+    `     AGENT_ALLOW_MAIN_EDITS=1 session-start env, or the`,
     `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
     `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
   ];

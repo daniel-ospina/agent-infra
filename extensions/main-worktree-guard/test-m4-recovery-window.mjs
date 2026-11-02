@@ -122,6 +122,12 @@ check("C15 `restore -s <ref> <path>` stays blocked",
   verdict("git restore -s HEAD~1 tortoise/__init__.py", { escapeActive: true, hubContext: DIRTY }), "block");
 check("C16 pathspec magic `:/` stays blocked",
   verdict("git checkout -- :/", { escapeActive: true, hubContext: DIRTY }), "block");
+// C17/C18 — round 6 (P2): any CONFIG override can retarget the invocation;
+// `-c core.worktree=<other>` was `recovery` at head while origin/main blocked it.
+check("C17 `-c core.worktree=<other>` stays blocked",
+  verdict("git -c core.worktree=/other checkout -- a.txt", { escapeActive: true, hubContext: DIRTY }), "block");
+check("C18 `--config-env` stays blocked",
+  verdict("git --config-env=core.worktree=WT checkout -- a.txt", { escapeActive: true, hubContext: DIRTY }), "block");
 
 // ── D. clean hub: nothing regresses ───────────────────────────────────────
 const CLEAN = { disorder: null, branch: "main", path: "/repo/hub", dirtyPaths: 0 };
@@ -355,6 +361,26 @@ async function partB() {
     check("B6h marker ⇒ incidental redirect still BLOCKED", b6h !== null, true);
     check("B6h2 …and the message names the WINDOW, not the hatch again",
       /Your hatch IS active/.test(b6h?.reason ?? "") && !/Deliberate discard: set AGENT_ALLOW/.test(b6h?.reason ?? ""), true);
+    // B6g/B6g2 — round 6 (P2) MEASURED: with GIT_DIR/GIT_WORK_TREE in the pi
+    // PROCESS env, a bare restore from the dirty hub targeted the OTHER checkout
+    // and rewrote its uncommitted work (origin/main blocked it; under the TTL
+    // marker it was newly reachable). No channel predicate can see the ambient
+    // env, so the window checks it directly.
+    process.env.GIT_DIR = `${other}/.git`;
+    process.env.GIT_WORK_TREE = other;
+    try {
+      const b6g = await drive("git checkout -- tracked.txt");
+      check("B6g marker + ambient GIT_DIR/GIT_WORK_TREE ⇒ BLOCKED", b6g !== null, true);
+    } finally {
+      delete process.env.GIT_DIR;
+      delete process.env.GIT_WORK_TREE;
+    }
+    // B6g3 — round 6 (P2): the #627 inline-payload message was the LAST one still
+    // prescribing the no-op on a dirty hub.
+    const b6g3 = await drive(`python3 -c 'import subprocess as s; s.run(["git","checkout","--","wip.txt"])'`);
+    check("B6g3 inline-payload still BLOCKED", b6g3 !== null, true);
+    check("B6g4 …and it does NOT prescribe the branch switch as recovery",
+      /recovery: git checkout main/.test(b6g3?.reason ?? ""), false);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {
