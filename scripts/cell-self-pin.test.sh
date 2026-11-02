@@ -623,6 +623,16 @@ out_nul_ok="$(install_doctored "$TPL" "$u_nul_ok")"; rc_nul_ok=$?
 [ "$rc_nul_ok" -eq 0 ] && ok "…and a TEXT drop-in with no NUL is still read and accepted (the NUL rule refuses binaries, not drop-ins)" \
   || bad "refused a plain TEXT identity-only drop-in after the NUL rule was added: $out_nul_ok"
 cp "$T/placed.before" "$PLACED"
+# ⛔ AND "grep SELECTED NOTHING" IS NOT "THE READ FAILED" (round-8 review, measured over-block). The read
+# gate above treats rc>=2 as a read failure — correct — but the first version treated EVERY non-zero as one,
+# so an EMPTY or comment-only drop-in (rc=1: no non-comment line, nothing to verify, benign) was REFUSED with
+# a remedy naming permissions that were already correct. A drop-in with no directives must INSTALL.
+u_empty="$T/dropin-empty"; mkdir -p "$u_empty/cell-self-pin.service.d"
+printf '# nothing but a comment\n' >"$u_empty/cell-self-pin.service.d/empty.conf"
+out_empty="$(install_doctored "$TPL" "$u_empty")"; rc_empty=$?
+[ "$rc_empty" -eq 0 ] && ok "ACCEPTS a comment-only/empty drop-in (grep rc=1 is 'no directives', not a read failure)" \
+  || bad "refused a benign comment-only drop-in and blamed its permissions: $out_empty"
+cp "$T/placed.before" "$PLACED"
 # ── 4c. THE RENDER'S IDENTITY IS THE TREE'S OWNER, NOT THE INVOKER'S ────────────────────
 # ⛔ `--install` writes a SYSTEM unit under /etc/systemd/system and needs `systemctl enable`, so the
 # documented install path is `sudo … --install` — and rendering `{{USER}}` from `id -un` therefore baked
@@ -665,6 +675,16 @@ refuses 'a WIDENED SuccessExitStatus=' "$(doctor_rw wideexit 's|^SuccessExitStat
 # that read it would derive a different pin record than the controller. This suite already resolves `/tmp`
 # for its own git paths (`pwd -P`); the guard has to see the same spelling.
 refuses 'an Environment= naming /private/tmp/cell-ai' "$(doctor privtmp 'Environment=HARNESS_PIN_FILE=/private/tmp/cell-ai/.harness-path')" "$T/u17" 'provisioning clone'
+# ⛔ AND THE ENVIRONMENT ALLOWANCE IS ONE VARIABLE WIDE *IN THE RENDERED UNIT TOO* (round-8 review, P1).
+# The unit arm used to COUNT `Environment=CELL_HOME=` and ignore every other assignment, while the drop-in arm
+# already refused everything but `HOME=` — so a template carrying `Environment=HARNESS_PIN_FILE=/srv/elsewhere`
+# installed rc=0, wrote the line, and the pass then derived its layer from a record the controller never reads.
+# Each leg REPLACES `HOME=` (rather than appending a line) so the plain count/value rule cannot answer for it:
+# the verdict can only come from the allow-list, which is what these legs exist to pin.
+refuses 'an Environment= re-pointing the pin RECORD (HARNESS_PIN_FILE) in the rendered unit' \
+  "$(doctor_rw envrec 's|^Environment=HOME=.*$|Environment=HARNESS_PIN_FILE=/srv/elsewhere/.harness-path|')" "$T/u18" 'Environment=HARNESS_PIN_FILE='
+refuses 'an Environment= re-pointing the pin ROOT (HARNESS_PIN_DIR) in the rendered unit' \
+  "$(doctor_rw envroot 's|^Environment=HOME=.*$|Environment=HARNESS_PIN_DIR=/srv/elsewhere/pins|')" "$T/u19" 'Environment=HARNESS_PIN_DIR='
 
 # ── 4b. ONE ACTUATOR PER PIN — the guard asks BOTH systemd managers, and retires BOTH ────────────
 # ⛔ BARE `systemctl` IS THE SYSTEM MANAGER ONLY, and the shipped sibling installer this guard names as
@@ -789,6 +809,27 @@ case "$out" in
 esac
 [ -f "$T/units-blind2/cell-self-pin.service" ] && bad "a refused blind --takeover still wrote the unit" \
   || ok "a refused blind --takeover wrote nothing"
+# ── (b3-bis) …AND IT REFUSES WHEN THE BLIND SCOPE IS THE *ONLY* PLACE THE ACTUATOR LIVES ─────────
+# ⛔ THE ARM ABOVE PASSES ONLY BECAUSE THE SYSTEM SCOPE ALREADY ANSWERED "ENABLED", i.e. because the run had
+# ALREADY SEEN an actuator — so it could not catch the shape below, which is the one the documented no-sudo
+# box produces. The refusal was gated on `[ -n "$scopes" ]`, the OPPOSITE of the condition it names: on a box
+# whose shipped timer lives only in `systemctl --user` (unreachable from a system unit) the guard was skipped,
+# the timer installed and enabled itself, exit was 0, and the run printed "nothing to retire" — a positive
+# claim about a manager that said nothing, on top of TWO mutating actors.
+rm -f "$T/state-blind/system-$SHIPPED"      # the system manager answers and carries NOTHING
+: >"$T/state-blind/user-$SHIPPED"           # the shipped timer is enabled ONLY in the manager that cannot answer
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-blind3" PATH="$T/fake-blind:$PATH" \
+       bash "$PIN" --install --takeover 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "--takeover REFUSES when the ONLY shipped actuator lives in the manager that did not answer (rc=$rc)" \
+  || bad "--takeover installed and enabled a SECOND actuator while the only shipped one sat in an unreadable manager (rc=$rc): $out"
+case "$out" in
+  *'cannot retire safely'*'user'*) ok "…and it names the manager it could not read, instead of claiming 'nothing to retire'" ;;
+  *'nothing to retire'*) bad "…but it claimed 'nothing to retire' about a manager that never answered: $out" ;;
+  *) bad "…but the blindness is not named: $out" ;;
+esac
+[ -f "$T/units-blind3/cell-self-pin.service" ] && bad "a refused blind --takeover (user-only actuator) still wrote the unit" \
+  || ok "a refused blind --takeover (user-only actuator) wrote nothing"
+: >"$T/state-blind/user-$SHIPPED"
 # ── (c) BOTH managers carry it: `--takeover` must retire BOTH, not the first one it finds ────────
 # ⛔ MEASURED FALSE PASS, NOT A HYPOTHETICAL: `actuator_scope` returned ONLY the first enabled scope, so
 # on a box with the system install AND the no-sudo user fallback `--takeover` retired the system one,
@@ -883,6 +924,18 @@ out="$(runat "$TICK" PATH="$T/fake-rearm:$PATH" bash "$PIN" --status-nofetch 2>&
 case "$out" in
   *'second actuator system '*|*'second actuator user '*|*'second actuator system user '*) ok "--status also reports the re-armed second actuator (the operator's read, not just journald)" ;;
   *) bad "--status does not report the re-armed second actuator: $out" ;;
+esac
+# ⛔ AND THE OPERATOR'S FIRST SCREEN MAY NOT CALL AN UNREAD SCOPE "NONE" (round-8 review, P2). `do_status`
+# was the ONE caller of `actuator_scopes` that never consulted `actuator_unknown_scopes`, so the verb whose
+# documented job is "what it resolved, where it came from, the LAST OUTCOME" printed `second actuator <none>`
+# for a manager that said nothing — the tick was honest about the same reading, the headline was not.
+mk_blind_user_systemctl "$T/fake-blind-status" "$T/state-blind-status"
+: >"$T/state-blind-status/user-$SHIPPED"
+out="$(runat "$TICK" PATH="$T/fake-blind-status:$PATH" bash "$PIN" --status-nofetch 2>&1)"
+case "$out" in
+  *'second actuator <none>'*) bad "--status printed 'second actuator <none>' while the user manager did NOT answer: $out" ;;
+  *'second actuator <UNVERIFIED'*'user'*) ok "--status says UNVERIFIED (naming the scope) when a manager did not answer, instead of 'none'" ;;
+  *) bad "--status did not report the unread scope: $out" ;;
 esac
 # And a re-arm that cannot be retired is a RED, never a warning: on a current box the pin needs no work,
 # so the duplicate is the ONLY thing that can make the tick fail — the leg cannot pass on another guard.

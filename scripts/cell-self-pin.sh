@@ -499,10 +499,20 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # re-arms the shipped timer by design); the tick's own reading belongs where an operator looks FIRST,
     # otherwise "is a second actor back?" is answerable only by reading a journal. Advisory by design —
     # it does NOT change the 0/1/2 verdict, which is the drift vocabulary and nothing else.
+    # ⛔ AND "NOT ASKED" IS NOT "NONE". `actuator_scopes` is exit-code based, so a manager that did not
+    # answer contributes nothing — and this line, the FIRST one an operator reads, printed `<none>` for it.
+    # The tick and `--install` both consult `actuator_unknown_scopes` (`one_actor_check`, the install
+    # read-back) and say UNVERIFIED; this verb alone reported a satisfied invariant from an unread scope,
+    # which is the false PASS #3194 is about, on the surface that exists to surface it.
     if dup="$(actuator_scopes)"; then
       printf '  second actuator %s manager(s) — eldato-harness-apply.timer is ENABLED beside this unit (a tick retires it again; an operator can end it with --install --takeover)\n' "$(printf '%s' "$dup" | tr '\n' ' ')"
     else
-      printf '  second actuator <none>\n'
+      unknown="$(actuator_unknown_scopes)"
+      if [ -n "$unknown" ]; then
+        printf '  second actuator <UNVERIFIED — the%s manager did NOT ANSWER, so a duplicate eldato-harness-apply.timer there could not be checked; this is NOT "none">\n' "$(printf ' %s' $unknown)"
+      else
+        printf '  second actuator <none>\n'
+      fi
     fi
     # ⛔ A STATUS THAT DOES NOT FETCH IS BLIND IN THE EXACT STATE THIS FILE EXISTS TO CATCH. #3194 was
     # a pin RECORD that disagreed with the layer the cell executed for ~a day: "current" against a
@@ -910,14 +920,28 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   # This is the same defect shape as the `ExecStart=` count rule above, and it is fixed the same way —
   # including the spellings systemd accepts (`Environment="CELL_HOME=/x"` — the quotes are stripped —
   # several assignments on one line, and an indented `Environment=`).
+  # ⛔ AND THE ALLOWANCE IS ONE VARIABLE WIDE — THE SAME RULE THE DROP-IN GATE ALREADY STATES. This arm
+  # used to COUNT `CELL_HOME=` and ignore every other assignment, while `verify_dropin_file` refused any
+  # `Environment=` other than `HOME=` and its own comment named this blocklist as the defect ("every one of
+  # those variables is READ by this pass, so a drop-in that sets any of them silently re-points the pass at a
+  # different record"). The rendered unit had exactly that hole: MEASURED before this rule existed, a
+  # template carrying `Environment=HARNESS_PIN_FILE=/elsewhere/.harness-path` installed rc=0, wrote the line,
+  # and `--dry-run` then resolved a layer from that record while the controller read `$CELL_HOME/.harness-path`
+  # — #2215's skew, made permanent in /etc/systemd/system, through the one surface this verb is supposed to
+  # verify. `HOME=` and `CELL_HOME=` are the closed set: identity, and the base the rules below already check.
+  # A name systemd or a future template adds is refused without another review, which is the direction the
+  # "family closed by one name" defect this file has fixed three times now requires.
   envs="$(directive "$body" Environment)"
   n_home=0
   home_val=""
   while IFS= read -r _env; do
     for _kv in $_env; do
       _kv="${_kv%\"}"; _kv="${_kv#\"}"
+      [ -n "$_kv" ] || continue
       case $_kv in
         CELL_HOME=*) n_home=$((n_home + 1)); home_val="${_kv#CELL_HOME=}" ;;
+        HOME=*) ;;
+        *) bad "the rendered unit sets 'Environment=${_kv%%=}=' — every variable this pass reads (CELL_HOME, HARNESS_PIN_FILE, HARNESS_PIN_DIR, HARNESS, HARNESS_REF, O) is derived from the unit's environment, so an assignment other than HOME=/CELL_HOME= silently re-points the pass at a DIFFERENT pin record than the controller while this install reports success; a unit may adjust IDENTITY (HOME=) and the base (CELL_HOME=), never the record it reads"; return 1 ;;
       esac
     done
   done <<<"$envs"
@@ -1088,7 +1112,7 @@ verify_dropins() { # <unit-dir> <unit-name>
 }
 
 verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the search-path loop stays a loop
-  local f="$1" body _c _kv
+  local f="$1" body _c _kv grep_rc
     # ⛔ A READ THAT FAILED IS NOT A FILE WITH NOTHING IN IT, and that is the whole false PASS: `grep`'s
     # exit status used to be DISCARDED, so a drop-in this run could not read (0600 and root-owned, an I/O
     # error) produced an EMPTY body, every rule below passed on nothing, and `--install` went on to print
@@ -1099,7 +1123,13 @@ verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the 
     # unreadable path prints its redirection error and yields an EMPTY stream, which the NUL rule below
     # would then mis-report as "a binary file" — the right refusal for the wrong reason, and untestable as
     # a read gate because no leg could reach it.
-    if ! body="$(LC_ALL=C grep -vE '^[[:space:]]*#' "$f")"; then
+    # ⛔ AND `grep`'s rc=1 IS NOT A READ FAILURE — it is "this file has no non-comment lines", i.e. a drop-in
+    # with NOTHING to verify, which is compliant. Treating every non-zero as a read failure refused an EMPTY
+    # or comment-only drop-in with a remedy naming permissions that were already correct (measured: `: >
+    # empty.conf`, `-rw-r--r--`, refused). The read-failure arm is rc>=2 (GNU and BSD grep both use 2 for
+    # "cannot read"); `-v` selecting nothing is 1.
+    body="$(LC_ALL=C grep -vE '^[[:space:]]*#' "$f")"; grep_rc=$?
+    if [ "$grep_rc" -gt 1 ]; then
       bad "the installed drop-in ${f} cannot be READ by this run, so its contents were never verified — systemd will still merge it over the rendered unit, and anything inside it (a WorkingDirectory=, a Condition*=, a re-pointed Environment=) is exactly what this gate exists to refuse; fix its permissions (or remove it) and re-run"; return 1
     fi
     # ⛔ A BINARY FILE IS NOT A FILE WITH NO DIRECTIVES. `grep` treats a file carrying a NUL byte as binary
@@ -1398,7 +1428,15 @@ do_install() { # [--takeover]
     bad "eldato-harness-apply.timer is ENABLED in the ${who} manager(s) and already advances this harness on a ten-minute clock — two pin actuators race on one pin. Keep ONE: run '$0 --install --takeover' to RETIRE it and install this unit, or keep 'scripts/install-harness-apply-timer.sh --install' (the shipped, tested one) and do not install this one, or set CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 to override deliberately."
     rm -rf "$tmp"; return 1
   fi
-  if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
+  # ⛔ AND THIS REFUSAL DOES NOT DEPEND ON HAVING ALREADY SEEN AN ACTUATOR. It used to be gated on
+  # `[ -n "$scopes" ]`, i.e. on the run having READ an enabled shipped timer somewhere — the OPPOSITE of the
+  # condition it names. A box whose shipped timer lives ONLY in the manager that does not answer (the
+  # documented no-sudo `systemctl --user` fallback, where the system probe answers "not enabled") therefore
+  # skipped the refusal entirely, installed and enabled this timer, exited 0 and printed "nothing to retire"
+  # — TWO mutating actors and a positive claim about a manager that said nothing, which is the #2416 race and
+  # the #3194 punishment in one run. MEASURED with a fake manager whose `--user` answers "Failed to connect
+  # to bus: No medium found": rc=0, user-scope shipped timer still ENABLED.
+  if [ "$takeover" = --takeover ]; then
     # ⛔ A BLIND RETIREMENT IS REFUSED. `--takeover` DISABLES the shipped actuator, so if a scope cannot be
     # read the run cannot know what it is leaving behind there — and the failure modes are both bad: leave a
     # duplicate (two actors) or disable the only one (zero actors, #3194's own state). Verified by the READ
