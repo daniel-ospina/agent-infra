@@ -2504,11 +2504,25 @@ function _worktreeDiscardBlockReason(
           `     ~2.4M files of I/O per cycle (#1141). Where it exists, prefer`,
           `     \`scripts/scratch-worktree.sh run ...\` — it removes the worktree itself.`,
           `   → Inspect first: git status --porcelain; git diff <path>.`,
-          `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
-          `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
-          `     marker — both hatches open the SAME recovery window as M4, so name the`,
-          `     paths: \`git restore <path>\` / \`git checkout -- <path>\`. A whole-tree`,
-          `     discard (\`.\`, pathspec magic) stays refused even with the hatch.`,
+          // Round 4 (P2) — the remedy must depend on whether the hatch is ALREADY
+          // active. Telling a hatched reader to stamp the marker it already holds
+          // is the incident's "each prescription not working" signature: the real
+          // cause is the window's own shape limit (one bare invocation, run from
+          // the hub), which this branch never used to name.
+          ...(_wtDiscardHatchActive
+            ? [
+                `   → Your hatch IS active: the window covers ONE bare invocation run`,
+                `     from the dirty hub — no \`;\`/\`&&\`/pipe, no redirect, no \`cd … &&\``,
+                `     prefix, no \`-C\`/\`GIT_DIR=\` target selection. Run it alone:`,
+                `       git checkout -- <path>          # cwd is the hub`,
+              ]
+            : [
+                `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
+                `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
+                `     marker — both hatches open the SAME recovery window as M4, so name the`,
+                `     paths: \`git restore <path>\` / \`git checkout -- <path>\`. A whole-tree`,
+                `     discard (\`.\`, pathspec magic) stays refused even with the hatch.`,
+              ]),
         ]),
   ].join("\n");
 }
@@ -2822,6 +2836,15 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   // outright — fail closed to M5; the plain form, run from the hub, is the
   // window and is what the message tells the reader to use.
   if (/(^|\s)(-C|--git-dir|--work-tree|--prefix)(\s|=)/.test(command)) return false;
+  // …and the ENV spelling of the same thing (round 4, P1 — MEASURED fail-open:
+  // `GIT_DIR=<other>/.git GIT_WORK_TREE=<other> git checkout -- tracked.txt`
+  // was ALLOWED and discarded a FOREIGN checkout's uncommitted work, where
+  // origin/main blocked it. An enumerated flag list cannot cover a second
+  // spelling family, so the window refuses ANY env-assignment prefix: a bare
+  // restore needs none, and "one bare invocation, run from the hub" is the
+  // shape the message tells the reader to use. Everything else falls back to
+  // M5's normal (blocking) behaviour — fail closed, never fail open.)
+  if (/(^|\s)[A-Za-z_][A-Za-z0-9_]*=/.test(command)) return false;
   const st = _hubState();
   if (!st.disorder) return false; // the window exists only for a DISORDERED hub
   try {
@@ -2835,10 +2858,19 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   }
 }
 
+// Round 4 (P2): set by _worktreeDiscardBlock, read by _worktreeDiscardBlockReason, so the
+// block message can tell a hatched reader what its hatch actually covers.
+let _wtDiscardHatchActive = false;
+
 function _worktreeDiscardBlock(command: string, hatchActive = false): string | null {
   if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
   // #1484/#709 — the hatch's recovery window, decided ONCE and shared with M4.
   if (_m4HatchRecoveryWindow(command, hatchActive)) return null;
+  // The reason builder needs the same datum so it can name the WINDOW (rather
+  // than re-prescribe a hatch the reader already holds). Set per call, read
+  // immediately — every path into `_worktreeDiscardBlockReason` runs through
+  // this function.
+  _wtDiscardHatchActive = hatchActive === true;
   // Backslash-newline line continuations (`git \<LF> checkout -- f`) are joined
   // by the shell BEFORE it tokenizes — join them here too, so every textual arm
   // below sees the same command the shell runs (reviewer round-7 P1).

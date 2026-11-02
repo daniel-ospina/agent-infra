@@ -213,9 +213,22 @@ async function partB() {
   // before M4 and M5 are ever consulted, so it can prove nothing about them;
   // the TTL marker is the partial one the incident's refusal #3 used, and it is
   // the only hatch reachable by an orchestrator or a `task` child.
+  // ⛔ ISOLATE HOME (review round 4, P2): stamping the marker at the operator's
+  // real ~/.pi/agent/.allow-main-edits REPLACES the only hatch an orchestrator or
+  // `task` child can use, and the `finally` restore does not run on SIGKILL, a
+  // timeout or Ctrl-C — so an abnormal exit would leave the box's marker hijacked
+  // by a test stamp. HOME is repointed at the fixture dir BEFORE the path is
+  // resolved (`homedir()` reads HOME per call, which is what `_markerPath()`
+  // uses), so this suite never touches the operator's file at all. The sibling
+  // suite in this directory does the same (test-discard-gate.mjs).
   const { homedir } = await import("node:os");
   const { readFileSync, existsSync, unlinkSync, mkdirSync } = await import("node:fs");
+  const tmp = realpathSync(mkdtempSync(join(tmpdir(), "m4-recovery-window-")));
+  const savedHomedir = process.env.HOME;
+  process.env.HOME = tmp;
   const markerPath = join(homedir(), ".pi", "agent", ".allow-main-edits");
+  // Belt-and-braces: if HOME could not be repointed for any reason, restore the
+  // operator's marker bytes exactly as they were found.
   const markerPrev = existsSync(markerPath) ? readFileSync(markerPath) : null;
   const TID = `test-m4-window-${process.pid}`;
   const setMarker = (on) => {
@@ -231,7 +244,6 @@ async function partB() {
       try { unlinkSync(markerPath); } catch { /* already gone */ }
     }
   };
-  const tmp = realpathSync(mkdtempSync(join(tmpdir(), "m4-recovery-window-")));
   const git = (cwd, cmd) => execSync(cmd, { cwd, stdio: "ignore" });
   try {
     // A hermetic hub: tracked file, one commit, then TRACKED DIRT — the incident
@@ -319,12 +331,25 @@ async function partB() {
     writeFileSync(join(other, "tracked.txt"), "sibling-session-uncommitted-work\n");
     const b6t = await drive(`git -C "${other}" checkout -- tracked.txt`);
     check("B6t marker ⇒ restore aimed at ANOTHER dirty checkout still BLOCKED", b6t !== null, true);
+    // B6e — round 4, P1 MEASURED fail-open: the ENV spelling of the same target
+    // selection walked past the flag-only reject and discarded a foreign
+    // checkout's uncommitted work.
+    const b6e = await drive(`GIT_DIR="${other}/.git" GIT_WORK_TREE="${other}" git checkout -- tracked.txt`);
+    check("B6e marker ⇒ GIT_DIR/GIT_WORK_TREE retarget still BLOCKED", b6e !== null, true);
+    // B6h — round 4, P2: while the hatch is ACTIVE the refusal must name the
+    // window's real shape limit, not re-prescribe the hatch the reader holds.
+    const b6h = await drive("git checkout -- wip.txt > /dev/null");
+    check("B6h marker ⇒ incidental redirect still BLOCKED", b6h !== null, true);
+    check("B6h2 …and the message names the WINDOW, not the hatch again",
+      /Your hatch IS active/.test(b6h?.reason ?? "") && !/Deliberate discard: set AGENT_ALLOW/.test(b6h?.reason ?? ""), true);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {
     process.chdir(prevCwd);
-    // Restore the box's real marker EXACTLY (it is 0 bytes / inert today) — a
-    // test must never leave a live escape hatch behind for other sessions.
+    // Restore HOME first, then the marker bytes (belt-and-braces — with HOME
+    // repointed, `markerPath` lives in the fixture dir and the operator's file
+    // was never opened for writing).
+    if (savedHomedir === undefined) delete process.env.HOME; else process.env.HOME = savedHomedir;
     try {
       if (markerPrev === null) unlinkSync(markerPath);
       else writeFileSync(markerPath, markerPrev);
