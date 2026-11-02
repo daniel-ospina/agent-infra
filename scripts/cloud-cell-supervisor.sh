@@ -4477,6 +4477,136 @@ exclude_root_add() { # <absolute path>
   if [ -n "${EXCLUDE_ROOTS:-}" ]; then EXCLUDE_ROOTS="$EXCLUDE_ROOTS"$'\n'"$1"; else EXCLUDE_ROOTS="$1"; fi
 }
 
+# ⛔ HELD BY A LIVE PROCESS — THE READING A PIN FILE CANNOT MAKE.
+# MEASURED 2026-11-02: a controller (systemd MainPID, uptime 4d 05:12:10) was executing
+# `…/harness-next/709dfb06eac2/scripts/orchestrator-harness/orch-loop.sh` with that file open on
+# fd 255 (inode 1241401, links=0). The pin file had since advanced, so `709dfb06eac2` read as
+# "superseded" — and the superseded-pin sweep below `rm -rf`'d it **2 h 32 min after that
+# controller started**. The tree's disappearance did not stop the loop: bash keeps executing the
+# unlinked inode, so a live service was left running source that exists nowhere. The pre-fix
+# predicate compared the pin FILE and `$HARNESS` — it never read the process table — while a
+# LATER arm of this same function logged "a LIVE process holds it" from a cwd census. An actuator
+# contradicting its own observation, inside one function.
+# WHY THE OBVIOUS CHECKS CANNOT SEE THIS. `pgrep -f <path>` matches the command LINE, and the
+# loop's argv names `orch-loop.sh` by the path it was STARTED with — not the tree we enumerate —
+# besides self-matching the shell that runs the check. A directory's link count says nothing
+# about use: an unlinked inode is still held, and still executing. The kernel's own symlinks are
+# the only complete read — /proc/<pid>/cwd, /proc/<pid>/fd/*, /proc/<pid>/exe — each with the
+# kernel's trailing " (deleted)" stripped, because a holder whose tree was ALREADY deleted still
+# names the path we are about to reclaim, and matching the stripped form is the safe direction.
+# rows in an ARRAY, not a temp file: no census file to leave behind (this verb exists to stop a disk
+# leak), no write-failure path (an ENOSPC — the state the hourly reaper fires in — would have
+# silently dropped rows while the row counter still said "a real census"), and no per-row open.
+# A PARTIAL READ IS STILL A REAL CENSUS (the reasoning `scripts/lib/live-paths.sh` already records:
+# refusing on a partial read makes every sweep permanently inert on a real box, where root's
+# processes are unreadable), so a gap is DISCLOSED on the decision line — `unreadable=<n>`, counted
+# as a pid whose fd directory this uid cannot list — rather than unblocking every reclaim. Only a
+# census with NO rows at all is a cannot-verify, and that fails closed.
+# ONE CENSUS PER PASS, plus a FRESH one immediately before a removal (see cmd_prune): a holder can
+# appear between candidates, and "re-measure at the moment of action" is the fleet rule.
+PIN_ROWS=(); PIN_CENSUS_RC=""; PIN_CENSUS_PIDS=0; PIN_CENSUS_UNREADABLE=0
+PIN_HOLD_PID=""; PIN_HOLD_KIND=""; PIN_HOLD_WHY=""
+pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census could be read at all
+  local proc="${PIN_PROC_ROOT:-/proc}" f pid link path tok seen=0 T=$'\t' lp_line
+  # ⛔ `$'\t'` IS NOT EXPANDED INSIDE DOUBLE QUOTES — measured in review: the row came out as the
+  # literal `cwd$'\t'<pid>$'\t'<path>`, so every row failed to split and the guard reported "unheld"
+  # for a tree a live process was sitting in (the fix's own bug, caught by the proof run). One TAB
+  # variable, expanded by the shell.
+  PIN_ROWS=(); PIN_CENSUS_PIDS=0; PIN_CENSUS_UNREADABLE=0; PIN_HOLD_WHY=""
+  if [ "${PIN_CENSUS_UNAVAILABLE:-0}" = 1 ]; then          # test seam: drive the fail-closed arm
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="forced-unavailable (PIN_CENSUS_UNAVAILABLE=1)"; return 1
+  fi
+  for f in "$proc"/[0-9]*; do
+    [ -d "$f" ] || continue
+    pid="${f##*/}"; seen=$((seen+1))
+    for link in "$f/cwd" "$f/exe"; do
+      path="$(readlink "$link" 2>/dev/null)" || continue
+      path="${path% (deleted)}"; path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
+      case "$path" in /*) PIN_ROWS+=("${link##*/}$T$pid$T$path") ;; esac
+    done
+    # ONE fork for the whole fd table (not one per descriptor), and ONE builtin read for argv —
+    # a path a live process NAMES is held just as surely as one its cwd or an fd resolves to.
+    if ! { [ -d "$f/fd" ] && [ -r "$f/fd" ]; }; then
+      PIN_CENSUS_UNREADABLE=$((PIN_CENSUS_UNREADABLE+1))
+    else
+      while IFS= read -r path; do
+        path="${path% (deleted)}"; path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
+        case "$path" in /*) PIN_ROWS+=("fd$T$pid$T$path") ;; esac
+      done < <(readlink "$f"/fd/* 2>/dev/null)
+    fi
+    if [ -r "$f/cmdline" ]; then
+      while IFS= read -r -d '' tok; do
+        # ⛔ AN ABSOLUTE PATH CAN ARRIVE ATTACHED (`--repo=/abs/tree`, `ENV=/abs/tree`). A `/*` test
+        # alone missed those spellings — `lib/live-paths.sh` records the measured consequence: "the
+        # tree was reaped while a live process had it in argv". So the value after the first `=` is
+        # tested too, and a RELATIVE token (no leading `/` at all) is resolved against the pid's own
+        # cwd at match time, the same way `git -C wt-x` names a tree with no `/` in it.
+        tok="${tok//$'\n'/ }"; tok="${tok//$'\t'/ }"
+        case "$tok" in
+          /*) PIN_ROWS+=("arg$T$pid$T$tok") ;;
+          -*=/*) PIN_ROWS+=("arg$T$pid$T${tok#*=}") ;;
+          *=/*) PIN_ROWS+=("arg$T$pid$T${tok#*=}") ;;
+          */*) PIN_ROWS+=("relarg$T$pid$T$tok") ;; # a RELATIVE path (contains `/`): joined to its cwd
+          *) ;;                                   # a bare word/flag — the cwd arm already covers a pid
+                                                  # sitting in the tree, so this arm does not fork per token
+        esac
+      done < "$f/cmdline" 2>/dev/null
+    fi
+  done
+  # ⛔ NO /proc IS NOT "NOTHING IS LIVE" — and it is also not a licence to go inert. macOS (a platform
+  # this script runs on) has no /proc, and a pin sweep that preserved every tree forever would restore
+  # the per-commit disk leak #1745 exists to stop. `lsof` is the census arm `scripts/lib/live-paths.sh`
+  # already carries for exactly this gap (its own header: "the macOS/container arm falls through to
+  # `lsof` and succeeds"). It reports cwd AND open files, so it covers the fd-255 shape too. This arm
+  # can only ADD evidence — zero rows still fails closed — so it can never cause a removal that the
+  # /proc walk would not have made.
+  if [ "${#PIN_ROWS[@]}" -eq 0 ] && command -v lsof >/dev/null 2>&1; then
+    local lp_pid=""
+    while IFS= read -r lp_line; do
+      case "$lp_line" in
+        p*) lp_pid="${lp_line#p}"; case "$lp_pid" in ''|*[!0-9]*) lp_pid="" ;; esac ;;
+        n*) [ -n "$lp_pid" ] || continue
+            path="${lp_line#n}"; path="${path% (deleted)}"
+            path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
+            case "$path" in /*) PIN_ROWS+=("lsof$T$lp_pid$T$path") ;; esac ;;
+      esac
+    done < <(lsof -n -P -w -F pn 2>/dev/null)
+    [ "${#PIN_ROWS[@]}" -gt 0 ] && PIN_CENSUS_PIDS="$(printf '%s\n' "${PIN_ROWS[@]}" | cut -d"$T" -f2 | sort -u | wc -l | tr -d ' ')"
+  fi
+  if [ "${#PIN_ROWS[@]}" -eq 0 ]; then
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="$proc yielded no readable cwd/fd/exe/argv entry (and no lsof census)"; return 1
+  fi
+  PIN_CENSUS_RC=0; PIN_CENSUS_PIDS="$seen"; return 0
+}
+
+# pin_held_by_process <dir> -> 0 held (sets PIN_HOLD_PID/PIN_HOLD_KIND), 1 provably unheld, 2 cannot check
+# Matched as a PATH PREFIX in ONE direction only: a descriptor or argv token INSIDE the tree holds the
+# tree. A row in a SIBLING tree does not (nothing below recurses into a sibling), and a row for a PARENT
+# directory does not either — the removal takes THIS tree, never its parent. #2573's review found the
+# reverse direction (a held root excluding its siblings) on this very file; the bound is the same here.
+pin_held_by_process() {
+  local real kind pid path row cand
+  real="$(cd "$1" 2>/dev/null && pwd -P)" || real=""
+  PIN_HOLD_PID=""; PIN_HOLD_KIND=""; PIN_HOLD_WHY=""
+  pin_live_census || return 2
+  for row in "${PIN_ROWS[@]}"; do
+    IFS=$'\t' read -r kind pid path <<< "$row"
+    [ -n "$path" ] || continue
+    # A relative token is resolved against ITS OWN pid's cwd — the one reading a bare `git -C wt-x`
+    # needs, and the reason a relative name is not silently dropped.
+    if [ "$kind" = relarg ]; then
+      local rcwd; rcwd="$(readlink /proc/$pid/cwd 2>/dev/null)" || continue
+      path="${rcwd%/}/${path#./}"
+      kind=arg
+    fi
+    for cand in "$1" "$real"; do
+      [ -n "$cand" ] || continue
+      case "$path" in "$cand"|"$cand"/*) PIN_HOLD_PID="$pid"; PIN_HOLD_KIND="$kind"; return 0 ;; esac
+    done
+  done
+  return 1
+}
+
 cmd_prune() {
   local caches_only=0 do_scratch=0 days="$SCRATCH_DAYS" a
   EXCLUDE_ROOTS=""
@@ -4551,7 +4681,33 @@ cmd_prune() {
           *) log_line "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
              continue ;;
         esac
-        log_line "prune: reclaiming superseded harness pin $d"
+        # ⛔ THE OBSERVATION IS TAKEN AT THE MOMENT OF ACTION, AND IT OUTRANKS THE PIN FILE.
+        # "The pin file names a newer commit" answers *superseded*; it does not answer *unheld*.
+        # This is the arm whose absence deleted a live controller's tree on 2026-11-02.
+        pin_held_by_process "$d"; _hrc=$?
+        # ⛔ ALLOW-LIST POLARITY: ONLY 0 and 1 are outcomes we understand. Any other status (127 = the
+        # helper was renamed away, 126, a signal) is a cannot-verify and PRESERVES. A `case` with no
+        # `*)` arm would make every status except exactly 2 mean DELETE — the fail-open this family
+        # has removed elsewhere, inverted on the one path that `rm -rf`s.
+        case "$_hrc" in
+          0) log_line "prune: PRESERVED($d, held-by-${PIN_HOLD_KIND}:${PIN_HOLD_PID}) — a live process holds this tree, so it is NOT reclaimed whatever the pin file says"
+             continue ;;
+          1) ;;   # provably unheld by the pass census — re-measured below, immediately before removal
+          *) log_line "prune: PRESERVED($d, check-unavailable:${PIN_HOLD_WHY:-process census yielded status $_hrc}) — cannot prove it unheld, so it is NOT reclaimed (fail closed)"
+             continue ;;
+        esac
+        # RE-MEASURE AT THE MOMENT OF ACTION. The pass census was taken before this candidate's turn;
+        # a holder can appear between candidates (a controller restarting mid-sweep is exactly how the
+        # 2026-11-02 tree became occupied). Only candidates that already passed pay this second walk.
+        pin_held_by_process "$d"; _hrc=$?
+        case "$_hrc" in
+          0) log_line "prune: PRESERVED($d, held-by-${PIN_HOLD_KIND}:${PIN_HOLD_PID}) — a live process took this tree during the pass; NOT reclaimed"
+             continue ;;
+          1) ;;
+          *) log_line "prune: PRESERVED($d, check-unavailable:${PIN_HOLD_WHY:-re-measure yielded status $_hrc}) — cannot prove it unheld at the moment of removal (fail closed)"
+             continue ;;
+        esac
+        log_line "prune: reclaiming superseded harness pin $d (no live process holds it: census_pids=${PIN_CENSUS_PIDS} unreadable_fd_tables=${PIN_CENSUS_UNREADABLE})"
         # Deregister as well as delete. A bare `git worktree prune` is banned (#1141), so the removal
         # must be PATH-SCOPED — but a removal that only `rm -rf`'d left a phantom `worktree list`
         # entry plus its admin dir behind, one per pin forever, on the very verb that exists to stop a
