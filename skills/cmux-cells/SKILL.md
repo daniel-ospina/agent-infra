@@ -77,7 +77,18 @@ quoting any ceiling:
 | **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~5–105 MB in a normal sample**, with **peaks seen at 207.9 MB (cell-3) and 313 MB (cell-1)** — `docker stats --no-stream`, per sidecar container, cells **1, 3 and 4**, 2026-10-27 (the 313 MB peak is **cell-1's**, so a cells-3–4 re-sample will not reproduce it); plan on the peak, not on ~150 MB, and re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
-| CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
+| CPU | **load up to 8–10× the CPU count is FINE — a load of 80 on 10 CPUs is acceptable and is NOT by itself a wedge signal** (owner, 2026-11-02). Measured reference: load 4.3 with 23 lanes | Two instruments already encode this, at different lines, and **neither is to be tightened**: **spawn** admits up to `MAX_LOAD` = `nproc × 10` (`spawn-gate.sh:119`, so load 80 on 10 CPUs does spawn), while **placement** refuses at `CAP_LPC_CEILING` = 8.00 load-per-cpu (`capacity.sh:235`, enforced `:890`, "DO NOT PLACE HERE"), which `ai-drainer.sh:175` mirrors as `LPC_CEILING=8`. Read it as: **8× is comfortable for work already on the box, and is the edge for ADDING work.** A high load is never by itself evidence the box is wedged — "no capacity" is the wrong report |
+
+**⛔ Why a load of 8–10× the core count is fine on a CELL — and why that number must not travel:** these boxes
+run I/O-heavy work — git, container churn, disk, network — so the runnable/`D`-state task count stacks far
+above the core count while the box still makes real progress. A cell at load 80 on 10 CPUs is working, not
+wedged. **This is a CELLS rule, and it is the OPPOSITE of the rule the laptop obeys.** `~/.pi/agent/AGENTS.md`
+carries the global line *"Keep concurrent workstreams ≤ ~12; load above ~12 on 10 CPUs makes sessions
+unreachable"* **with no platform qualifier**, so a cell session reading only that file would treat a load of
+20 as a wedge. **This skill owns that split — the global file does not make it.** On the laptop the load IS
+the fleet competing for attention, and the remedy is fewer concurrent workstreams; on a cell the load is
+largely I/O wait, and the remedy is to read RAM and disk (below) instead. Do not carry this tolerance back
+to the laptop, and do not read a laptop load of 80 as healthy.
 
 The old row read "`pi` process ~0.6–1 GB RSS per lane". Measured, that is a **test-running peak**; an idle
 lane's whole tree is ~0.2 GB. The old arithmetic applied that peak to EVERY lane and then stacked a flat
