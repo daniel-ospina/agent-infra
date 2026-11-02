@@ -147,8 +147,36 @@
 #   comment:<id>            a PR issue comment        (this fleet's convention)
 #   review:<id>             a PR review
 #   review-comment:<id>     an inline review comment
+#   delta:<A>..<B>          a RANGE-scoped verdict: the reviewer's verdict covers
+#                           exactly the commits in A..B and B is the PR's CURRENT
+#                           head. `delta:A..B+comment:<id>` is the form REQUIRED
+#                           when the range holds authored commits (below)
 #   <a GitHub URL>          any of the three, pasted (…/pull/N#issuecomment-ID,
 #                           #discussion_rID, #pullrequestreview-ID)
+#
+# DELTA EVIDENCE. A delta attestation claims: *"at head B, a reviewer reviewed
+# exactly the commits A..B and nothing else changed in the authored diff."* It
+# COMPOSES with the head-bound record rather than replacing it: `head_sha` is
+# still B, so the next head move makes the record stale exactly as before, and a
+# delta never sets a carry arm — it is a FRESH mint, so the reviewer obligation
+# is untouched (AGENTS.md: "never attest your own review"). It exists because
+# the fleet's briefs prescribed a shape this recorder could not accept, and four
+# lanes in one night had to improvise re-attestation — which is how a live
+# attestation gets replaced by a weaker one.
+# The arms it REFUSES, each stated where it is implemented (delta_verify): an
+# unresolvable range, A == B, A not an ancestor of B (a rebase-shaped range),
+# B not the head being recorded, a measurably RED target head (clause E), an
+# EMPTY `git diff A..B`, an AUTHORED range — including one whose MERGE COMMITS are
+# not clean merges of their parents, because a conflict resolution lives only in
+# the merge commit — with no covering verdict, a MERGE-ONLY range whose A is not
+# an attested head (a delta EXTENDS an attestation, it never creates one), and a
+# covering verdict that does not postdate the range's newest authored commit. The record carries `delta_range`, `delta_kind` and
+# `delta_digest` so the claim stays checkable long after the mint: a reader can
+# re-derive the range, its classification (against the STORED `delta_base`) and
+# the digest from the two shas, and a rewritten history moves them.
+# ⛔ NOT the same verb as agent-infra#3245: that asks for a reviewer-FREE
+# mechanical re-bind at the live head. This is evidence a REVIEWER produced, and
+# the two must not be conflated in either direction.
 # The script then VERIFIES it: it must exist, belong to THIS PR, POSTDATE the
 # recorded head's commit, and NOT assert an UNRESOLVED outcome. THREE ARMS, and
 # the split between them is the whole contract:
@@ -752,8 +780,19 @@ evidence_ref_split() { # <ref> -> "<kind>\t<id>"; rc 1 = not a recognisable arti
     comment:*|issuecomment:*)          kind="comment";        id="${ref#*:}" ;;
     review:*)                          kind="review";         id="${ref#*:}" ;;
     review-comment:*|discussion:*)     kind="review-comment"; id="${ref#*:}" ;;
+    delta:*)                           kind="delta";          id="${ref#*:}" ;;
     *) return 1 ;;
   esac
+  # A delta ref is a RANGE, not an id, so it gets its own shape check: TWO full
+  # shas, `..`, and an OPTIONAL `+<artifact>` naming the verdict that covers an
+  # authored range. Pinning the WHOLE shape here — rather than trusting a parser
+  # downstream — is what keeps `delta:` from becoming a loose prefix that smuggles
+  # arbitrary text into the record's JSON framing.
+  if [ "$kind" = "delta" ]; then
+    [[ "$id" =~ ^[0-9a-f]{40}\.\.[0-9a-f]{40}(\+(comment|issuecomment|review|review-comment|discussion):[0-9]+)?$ ]] || return 1
+    printf '%s\t%s' "$kind" "$id"
+    return 0
+  fi
   # The id must be purely numeric AND the whole tail: `comment:12x` is not a
   # ref, and neither is a URL fragment with trailing junk.
   [[ "$id" =~ ^[0-9]+$ ]] || return 1
@@ -795,11 +834,17 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   fi
   if ! split="$(evidence_ref_split "$ref")"; then
     echo "   not a recognisable review-artifact reference: '$ref'" >&2
-    echo "   accepted: comment:<id>, review:<id>, review-comment:<id>, or the GitHub URL of one of those." >&2
+    echo "   accepted: comment:<id>, review:<id>, review-comment:<id>, delta:<A>..<B>[+<artifact>], or the GitHub URL of one of the first three." >&2
     return 1
   fi
   kind="${split%%$'\t'*}"
   id="${split##*$'\t'}"
+  # A delta's subject is a COMMIT RANGE, so its evidence is the git graph itself,
+  # not a GitHub artifact id. Verified by delta_verify (defined below).
+  if [ "$kind" = "delta" ]; then
+    delta_verify "$id" "$head"
+    return $?
+  fi
   if ! row="$(evidence_fetch "$kind" "$id")" || [ -z "$row" ]; then
     echo "   could not read $kind $id from $REPO — it does not exist, or the API is unreachable. A FAILED READ IS NOT EVIDENCE: retry rather than record." >&2
     return 1
@@ -951,6 +996,318 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
     fi
   fi
   printf '%s %s on %s#%s, created %s, postdates head %s\n' "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
+  return 0
+}
+
+# ── DELTA EVIDENCE: --evidence delta:<A>..<B>[+<artifact>] ───────────────────
+# WHAT IT CLAIMS. "At head B, a reviewer's verdict covers exactly the commits in
+# A..B, and B is the PR's current head." It does NOT replace the head binding:
+# the record's `head_sha` is still B, so the next head move makes it stale exactly
+# as any other record, and a delta never sets CARRY_ARM — it is a FRESH mint and
+# the reviewer obligation (tortoise#7391) is unchanged.
+#
+# WHAT MAKES THE CLAIM FALSIFIABLE. The record stores `delta_range`, `delta_kind`
+# and `delta_digest` (sha256 of the SHARED normalizer's projection of
+# `git diff A..B`). A later reader re-derives all three from the two shas: if the
+# authored history was rewritten (rebase / force-push) the shas stop resolving,
+# and if the range's content moved the digest moves. A record carrying only
+# `delta:<A>..<B>` and no digest would be a signature with no content — which is
+# why an empty range and an empty diff are both REFUSED below rather than
+# recorded as a trivially-true claim.
+#
+# ⛔ REPLACE / GRAFT REFS ARE DISABLED on every git call here. `git replace` (or a
+# graft file) makes `git diff` and `git rev-list` answer about history that does
+# not exist, so a digest computed with one active could attest a range that never
+# existed on the remote. Same posture, same reason, as local_diff_for_pr (#1398).
+DELTA_FROM=""; DELTA_TO=""; DELTA_KIND=""; DELTA_DIGEST=""; DELTA_COVER=""; DELTA_BASE=""
+
+# The checkout the range must be read from: a delta about $REPO read out of some
+# OTHER repo's objects would be a false claim, so the origin must match $REPO.
+# DELTA_GIT_DIR names it explicitly; the default is the cwd (a lane's worktree).
+delta_git_root() { # -> prints the checkout root; rc 1 = not a checkout of $REPO
+  local dir="${DELTA_GIT_DIR:-.}" root="" url="" norm=""
+  command -v git >/dev/null 2>&1 || return 1
+  root="$(command git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$root" ] || return 1
+  url="$(command git -C "$root" config --get remote.origin.url 2>/dev/null || true)"
+  norm="$(printf '%s' "$url" \
+    | sed -e 's#^git@github\.com:##' -e 's#^ssh://git@github\.com/##' \
+          -e 's#^https\{0,1\}://github\.com/##' -e 's#\.git$##')"
+  [ "$norm" = "$REPO" ] || return 1
+  printf '%s' "$root"
+}
+
+# Every git read for the delta goes through here so the replace/graft posture is
+# ONE line rather than a habit each call site can forget.
+delta_git() { # <root> <git args…>
+  local root="$1"; shift
+  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"
+}
+
+delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
+  local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
+  local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
+  local merges_in_range="" evil="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual=""
+  local thr=0 prior_head="" prior_verdict="" _pf=""
+  range="${id%%+*}"
+  [ "$range" != "$id" ] && cover="${id#*+}"
+  from="${range%%..*}"; to="${range##*..}"
+  # (1) SHAPE. evidence_ref_split already pinned it; re-asserted because this
+  # function is also reachable directly from the test suite.
+  if ! [[ "$from" =~ ^[0-9a-f]{40}$ && "$to" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "   delta: '$id' is not <A>..<B> with two FULL 40-hex shas. A short or abbreviated sha cannot be re-derived later, and the whole value of the digest is that a reader can recompute it." >&2
+    return 1
+  fi
+  # (2) A NESTED DELTA IS NOT A VERDICT. `delta:A..B+delta:C..D` would let a
+  # range inherit another range's authority without ever naming a reviewer.
+  if [ -n "$cover" ]; then
+    case "$cover" in
+      delta:*|*delta:*)
+        echo "   delta: the covering artifact '$cover' is itself a delta — a range cannot inherit another range's authority; name the REVIEWER's artifact (comment:<id>, review:<id>, review-comment:<id>)." >&2
+        return 1 ;;
+    esac
+  fi
+  # (3) AN EMPTY RANGE ATTESTS NOTHING. Without this, `delta:<head>..<head>` would
+  # be a trivially merge-only delta that mints `clean` with no content reviewed —
+  # the "signature with no content" this arm exists to refuse.
+  if [ "$from" = "$to" ]; then
+    echo "   delta: A and B are the same commit (${from:0:12}…) — an empty range attests nothing, so it is not evidence of anything." >&2
+    return 1
+  fi
+  # (4) THE RANGE MUST BE ABOUT WHAT MERGES. The stale-sha guard would refuse a
+  # B != live head anyway; refusing here too means the delta cannot be the first
+  # place that divergence is discovered, and a delta can never be the reason a
+  # record names a head nobody is merging.
+  if [ "$to" != "$head" ]; then
+    echo "   delta: B is ${to:0:12}… but the record is being minted at ${head:0:12}… — a delta's upper bound must BE the head it attests." >&2
+    return 1
+  fi
+  # (4b) THE TARGET HEAD'S HEALTH — clause (E) of the carry, applied here for the
+  # same reason it applies there. A delta re-attests an OLD verdict over a NEW
+  # head, so it must not put a signed `clean` on a head whose own checks are
+  # measurably failing. THREE outcomes, never two (#2342): RED refuses, a surface
+  # that could not be READ refuses (a failed read is not a pass), green passes.
+  thr=0
+  target_head_red "$to" || thr=$?
+  case "$thr" in
+    0) echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
+       return 1 ;;
+    2) echo "   delta: the target head's check surface could not be READ — a failed read is not a pass, so the range is not verified. Retry rather than record." >&2
+       return 1 ;;
+  esac
+  # (5) THE CHECKOUT. Fail closed: an unreadable range is not evidence.
+  if ! root="$(delta_git_root)"; then
+    echo "   delta: cannot read the range from a checkout of ${REPO:-<no repo>} (run inside the PR's worktree, or set DELTA_GIT_DIR). A range this box cannot read cannot be verified, and an unverified range is not evidence." >&2
+    return 1
+  fi
+  if ! delta_git "$root" cat-file -e "${from}^{commit}" 2>/dev/null \
+     || ! delta_git "$root" cat-file -e "${to}^{commit}" 2>/dev/null; then
+    echo "   delta: ${from:0:12}… or ${to:0:12}… is not a commit in $root — a force-pushed or unknown sha cannot anchor a range." >&2
+    return 1
+  fi
+  # (6) A RANGE IS A CHAIN. `A..B` is only "the commits between" when A is an
+  # ancestor of B; for a rebased B it is two unrelated points, and the delta would
+  # silently mean "everything B has that A does not", which is a different claim.
+  dg_rc=0
+  delta_git "$root" merge-base --is-ancestor "$from" "$to" 2>/dev/null || dg_rc=$?
+  case "$dg_rc" in
+    0) : ;;
+    1) echo "   delta: ${from:0:12}… is NOT an ancestor of ${to:0:12}… — a rebase/force-push rewrote the history, so 'the commits in between' has no meaning and the reviewed range is not the range that would merge." >&2
+       return 1 ;;
+    *) echo "   delta: the ancestry walk FAILED (git rc $dg_rc) — a failed read is not evidence; retry rather than record." >&2
+       return 1 ;;
+  esac
+  # (7) MERGE-ONLY vs AUTHORED — and the definition is BASE-AWARE, which is the
+  # whole reason this arm needs the base at all. `git rev-list --no-merges A..B`
+  # is NOT the right question: a forward merge of the base into the branch puts
+  # EVERY commit main landed into A..B, so a naive count calls a conflict-free
+  # base merge "authored" and charges a full re-review for content the LANE never
+  # wrote — which is the exact cost agent-infra#3245 measured (8 re-reviews for
+  # zero authored lines). The question the delta actually asks is "did anything
+  # the PR AUTHORED appear in the range?", so the set is
+  #     rev-list --no-merges A..B --not <base tip>
+  # i.e. the in-range commits NOT reachable from the PR's base. Base-borne
+  # commits drop out (they entered through a merge's base side); anything a
+  # lane — or a side branch merged into the PR — added stays in, and requires a
+  # covering verdict.
+  # ⛔ The base is the API's own declaration, never a local ref (a stale
+  # origin/main would silently reclassify base content as authored, or worse,
+  # authored content as base content). An unreadable base REFUSES: a range this
+  # box cannot classify is not evidence, and fail-open here would be a delta that
+  # classifies itself.
+  base_sha=""; base_ref=""
+  if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
+    read -r base_sha base_ref <<<"$(command gh api "repos/$REPO/pulls/$PR" --jq '[.base.sha,.base.ref]|@tsv' 2>/dev/null || true)"
+  fi
+  if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "   delta: could not read the PR's BASE commit from ${REPO:-<no repo>} — without it a range cannot be classified as base-borne or lane-authored, and a delta that cannot tell the two apart is a delta that can be minted for anything. Refusing; retry rather than record." >&2
+    return 1
+  fi
+  if ! delta_git "$root" cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+    case "$base_ref" in
+      ''|*[!A-Za-z0-9._/-]*) base_ref="" ;;
+    esac
+    if [ -n "$base_ref" ]; then
+      delta_git "$root" fetch --quiet --no-tags origin "refs/heads/$base_ref" >/dev/null 2>&1 || true
+    fi
+  fi
+  if ! delta_git "$root" cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+    echo "   delta: the PR's base commit ${base_sha:0:12}… is not in $root — fetch the base branch and retry. A range whose base cannot be read cannot be classified, so it is refused rather than assumed." >&2
+    return 1
+  fi
+  authored="$(delta_git "$root" rev-list --no-merges "$from..$to" --not "$base_sha" 2>/dev/null)" || {
+    echo "   delta: the range walk FAILED — a failed read is not evidence; retry rather than record." >&2
+    return 1
+  }
+  # (7b) THE MERGE COMMITS THEMSELVES — the arm that makes (7) sound, and the one
+  # both reviewers of this change reproduced a bypass through. `--no-merges`
+  # removes EVERY merge from the walk, so a merge whose tree differs from both
+  # parents — a lane resolving a conflict in `git merge origin/main` — is
+  # INVISIBLE to (7): the resolution's content lives ONLY in the merge commit.
+  # This file already records that the walk alone is unsound (lane_dimension_carry
+  # clause (D) exists for exactly this: "a lane can merge the base LOCALLY with
+  # conflict resolutions, and that merge is indistinguishable from a clean one by
+  # commit shape"). So every in-range merge must BE the automatic merge of its
+  # parents. Anything else — a non-clean merge, an octopus, an unreadable parent
+  # list, or a `merge-tree` that cannot answer — makes the range AUTHORED, which
+  # then needs a covering verdict. Fail-closed in every direction.
+  merges_in_range="$(delta_git "$root" rev-list --merges "$from..$to" --not "$base_sha" 2>/dev/null)" || {
+    echo "   delta: the merge walk FAILED — a failed read is not evidence; retry rather than record." >&2
+    return 1
+  }
+  evil=""
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    parents="$(delta_git "$root" rev-list --parents -n1 "$m" 2>/dev/null || true)"
+    pcount="$(awk '{print NF-1}' <<< "$parents")"
+    if [ "$pcount" != "2" ]; then
+      evil="merge ${m:0:12} has ${pcount:-unreadable} parent(s) — an octopus or an unreadable parent list cannot be shown to be a clean merge"
+      break
+    fi
+    # ⛔ FIELD 1 IS THE COMMIT ITSELF (rev-list --parents prints `<commit> <p1> <p2>`),
+    # so the parents are fields 2 and 3. Reading field 1 as a parent merged the merge
+    # with its own second parent — a trivially clean, always-equal comparison that
+    # made this whole arm inert (found by the §20h2 vector, which is why the vector
+    # asserts the REFUSAL MESSAGE and not merely the exit code).
+    read -r _self p1 p2 _extra <<< "$parents"
+    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null || true)"
+    # merge-tree prints the resulting tree on its FIRST line and extra lines for
+    # conflicts. Take that line with a parameter expansion, NEVER `| head -1`: a
+    # SIGPIPEd producer under `set -o pipefail` makes the substitution fail and
+    # aborts the whole record (measured, 9 of 40; see diff_hash_for_pr's note).
+    want="${want%%$'\n'*}"
+    actual="$(delta_git "$root" rev-parse "$m^{tree}" 2>/dev/null || true)"
+    if [ -z "$want" ] || [ -z "$actual" ] || [ "$want" != "$actual" ]; then
+      evil="merge ${m:0:12} is NOT a clean merge of its parents (its tree is not what merging ${p1:0:12}… and ${p2:0:12}… produces) — a conflict resolution lives only in the merge commit and no reviewer has seen it"
+      break
+    fi
+  done <<< "$merges_in_range"
+  if [ -n "$authored" ] || [ -n "$evil" ]; then
+    n_authored="$(printf '%s\n' "$authored" | grep -c . || true)"
+    # The newest authored commit is what a covering verdict must have seen, and it
+    # must be picked by COMMITTER DATE, not by walk order: rev-list's default order
+    # is reverse chronological only when the dates are monotonic, and commit dates
+    # are author-declared (this suite's own fixture sets them), so a backdated child
+    # would otherwise masquerade as the newest. Same predicate as (7), plus
+    # --date-order, and NO pipe into `head` (SIGPIPE under pipefail).
+    newest="$(delta_git "$root" log --no-merges --date-order --format='%cI %H' \
+                 "$from..$to" --not "$base_sha" 2>/dev/null | awk 'NR==1{print $2}' || true)"
+    DELTA_KIND="authored"
+  else
+    DELTA_KIND="merge-only"
+  fi
+  # (8) THE DIGEST — the whole falsifiability of the record. Computed through the
+  # SAME normalizer as the record's `diff_sha256`, so "stable digest" has ONE
+  # definition in this fleet. Fail closed when it cannot be computed: unlike the
+  # master diff binding (which degrades to a legacy marker), the digest IS the
+  # delta's claim, so there is nothing honest to degrade to.
+  if ! command -v python3 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 \
+     || [ ! -s "$DIFF_NORMALIZER" ]; then
+    echo "   delta: cannot compute a stable digest (needs python3, openssl and $DIFF_NORMALIZER) — the digest is the claim, so a delta without one is refused rather than recorded raw." >&2
+    return 1
+  fi
+  tmp="$(mktemp 2>/dev/null)" || { echo "   delta: mktemp failed" >&2; return 1; }
+  norm="$(mktemp 2>/dev/null)" || { rm -f "$tmp"; echo "   delta: mktemp failed" >&2; return 1; }
+  if ! delta_git "$root" \
+         -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.relative=false \
+         -c diff.suppressBlankEmpty=false \
+         diff --no-color --no-ext-diff --no-textconv --full-index \
+              --src-prefix=a/ --dst-prefix=b/ --unified=3 --diff-algorithm=myers \
+              --find-renames "$from" "$to" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp" "$norm"
+    echo "   delta: 'git diff ${from:0:12}… ${to:0:12}…' FAILED — a failed read is not evidence." >&2
+    return 1
+  fi
+  # (9) AN EMPTY DIFF IS NOT A REVIEW. A merge-only range whose tree is identical
+  # to A's reviewed no content, so recording it `clean` would mint a verdict over
+  # nothing.
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp" "$norm"
+    echo "   delta: \`git diff ${from:0:12}… ${to:0:12}…\` is EMPTY — the range changed no content, so no reviewer could have reviewed anything in it. Refusing: an empty delta is a signature with no content." >&2
+    return 1
+  fi
+  if ! python3 "$DIFF_NORMALIZER" < "$tmp" > "$norm" 2>/dev/null || [ ! -s "$norm" ]; then
+    rm -f "$tmp" "$norm"
+    echo "   delta: the shared normalizer produced no output — refusing rather than hashing the raw rendering, because a second definition of 'stable' is exactly what this digest must not have." >&2
+    return 1
+  fi
+  DELTA_DIGEST="$(command openssl dgst -sha256 < "$norm" | awk '{print $NF}')"
+  rm -f "$tmp" "$norm"
+  if ! [[ "$DELTA_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "   delta: could not compute a stable digest of the range — refusing." >&2
+    return 1
+  fi
+  # (10) THE COVERING VERDICT. Authored content must have been READ by a reviewer;
+  # a merge-only range must EXTEND an attestation that already exists — it may never
+  # CREATE one, because "nothing but merges happened" is not a review of anything.
+  if [ "$DELTA_KIND" = "authored" ]; then
+    if [ -z "$cover" ]; then
+      echo "   delta: the range ${from:0:12}…..${to:0:12}… contains authored content (${n_authored} commit(s)) and no covering verdict was named. A delta over authored content is only evidence if a reviewer's verdict covers it:" >&2
+      [ -n "$evil" ] && echo "   → and one of its merges is not a clean merge of its parents: ${evil}." >&2
+      echo "   → record-review.sh $PR $to clean ${REPO:-<owner/repo>} --evidence delta:$from..$to+comment:<review-comment-id>" >&2
+      echo "   (or run a full review at ${to:0:12}… and name its artifact with plain --evidence comment:<id>)." >&2
+      return 1
+    fi
+    anchor="$newest"
+  else
+    # MERGE-ONLY: A MUST ALREADY BE ATTESTED. Without this arm a lane can pick any
+    # two shas with only merges between them and mint `clean` over a head whose
+    # authored content nobody ever reviewed — the zero-evidence mint both reviewers
+    # of this change reproduced. Accept a prior clean-family record naming exactly
+    # A, or an explicit covering verdict.
+    if [ -z "$cover" ]; then
+      prior_head=""; prior_verdict=""
+      for _pf in "$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$PR.json" "$HOME/.pi/agent/reviews/$PR.json"; do
+        [ -f "$_pf" ] || continue
+        prior_head="$(awk 'match($0,/"head_sha":"[0-9a-f]*"/){print substr($0,RSTART+12,RLENGTH-13); exit}' "$_pf" 2>/dev/null || true)"
+        if [ "$prior_head" = "$from" ]; then
+          prior_verdict="$(awk 'match($0,/"verdict":"[a-z-]*"/){print substr($0,RSTART+11,RLENGTH-12); exit}' "$_pf" 2>/dev/null || true)"
+          break
+        fi
+        prior_head=""
+      done
+      case "$prior_verdict" in clean|clean-low|clean-micro) : ;; *) prior_verdict="" ;; esac
+      if [ -z "$prior_verdict" ]; then
+        echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit, but ${from:0:12}… is NOT an attested head on this box (no clean-family record names it) and no covering verdict was given. A delta EXTENDS an attestation and can never create one — otherwise any two shas with only merges between them would mint 'clean' over content nobody reviewed." >&2
+        echo "   → review at ${from:0:12}… and record that head first, or name the verdict that covered it: --evidence delta:$from..$to+comment:<id>." >&2
+        return 1
+      fi
+    fi
+    anchor="$to"
+  fi
+  if [ -n "$cover" ]; then
+    # The covering artifact is held to the SAME gate as any other evidence
+    # (existence, this PR, GitHub's own review state, the unresolved-outcome
+    # veto) — plus a range-specific anchor: it must POSTDATE the newest authored
+    # commit in the range, which is the checkable meaning of "covers the range".
+    if ! verify_review_evidence "$cover" "$anchor"; then
+      echo "   delta: the covering artifact '$cover' could not be verified against the range (reason above) — a delta over authored content needs a verdict that postdates ${anchor:0:12}…, the newest authored commit in the range." >&2
+      return 1
+    fi
+  fi
+  DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_COVER="$cover"; DELTA_BASE="$base_sha"
+  printf 'delta %s..%s on %s#%s, %s, %s authored commit(s), digest %s\n' \
+    "${from:0:12}" "${to:0:12}" "$REPO" "$PR" "$DELTA_KIND" "$n_authored" "${DELTA_DIGEST:0:12}"
   return 0
 }
 
@@ -1151,6 +1508,16 @@ esac
 # unknown option; no record written).
 if [ "$VERDICT" = "clean-low" ] && [ "$FORCE_STALE" -eq 1 ]; then
   echo "record-review.sh: --force-stale is incompatible with the clean-low verdict — clean-low certifies the content shape of a specific revision, and the sha a stale record names is not the revision any consumer will read. Re-run at the current head without --force-stale." >&2
+  exit 2
+fi
+# ── delta evidence × a non-clean verdict is an argument-level contradiction ──
+# A delta is a RANGE-SCOPED REVIEW attestation, so only the `clean` gate covers
+# it. clean-micro certifies the micro PROCESS and clean-low the content SHAPE;
+# neither re-reads a review, so a delta passed with them would be silently
+# dropped by the #7391 gate while the caller believed it had recorded one — the
+# `--second-model` silent-drop shape this script refuses elsewhere.
+if [ "${EVIDENCE#delta:}" != "$EVIDENCE" ] && [ "$VERDICT" != "clean" ]; then
+  echo "record-review.sh: --evidence delta:<A>..<B> is a full-review range attestation and only the 'clean' verdict reads it (got '$VERDICT'). Record 'clean' with the delta, or drop --evidence — with this verdict it would be silently ignored, and a delta nobody verified is worse than no delta." >&2
   exit 2
 fi
 # Input validation (#2055): the ai-review-gate binds the FULL 40-char sha and
@@ -3071,6 +3438,16 @@ fi
 # question asked on any path. NOTE this runs OUTSIDE the REPO/gh block above,
 # so an invocation that cannot reach GitHub at all (no repo, missing gh) is
 # refused rather than silently un-asked: verification is the point.
+# ⛔ A `delta:` REF IS REFUSED WHEN A CARRY ARM FIRED. The delta's claim cannot be
+# expressed by a carried record (a carry is the diff/graph arm's statement, not a
+# reviewer's range statement), and DROPPING the delta silently would tell the
+# caller it recorded a range attestation while the audit trail holds none — the
+# same silent-drop shape the non-clean-verdict exit-2 arm exists to prevent. It is
+# also the only way a MALFORMED delta ref could pass unparsed.
+if [ -n "$CARRY_ARM" ] && [ "${EVIDENCE#delta:}" != "$EVIDENCE" ]; then
+  echo "   delta: a carry arm (${CARRY_ARM}) already re-bound the verdict to the live head, so a delta would be recorded by NOBODY — a carried record states the carry, not a reviewer's range, and the delta would be dropped while you were told it was recorded. Drop --evidence to accept the carry, or re-record a fresh verdict at this head." >&2
+  exit 3
+fi
 if [ "$VERDICT" = "clean" ] && [ -z "$CARRY_ARM" ]; then
   if [ -z "$EVIDENCE" ]; then
     echo "⛔ tortoise#7391: refusing to mint a 'clean' record for ${SHA:0:12}… with NO review evidence." >&2
@@ -3378,6 +3755,15 @@ DIFF_FIELD=""
 if [ -n "${DIFF_HASH:-}" ]; then
   DIFF_FIELD="\"diff_sha256\":\"$DIFF_HASH\","
 fi
+# DELTA BINDING — the range a delta attestation claims, its classification and the
+# digest that makes the claim checkable later. Empty for every non-delta record, so
+# the shape of every existing record is byte-identical to before (the merge gate
+# validates only the fields it reads, and record_identity compares whole strings,
+# so an added field can only ever make two records MORE distinguishable).
+DELTA_FIELDS=""
+if [ -n "$DELTA_FROM" ]; then
+  DELTA_FIELDS="\"delta_range\":\"$DELTA_FROM..$DELTA_TO\",\"delta_base\":\"$DELTA_BASE\",\"delta_kind\":\"$DELTA_KIND\",\"delta_digest\":\"$DELTA_DIGEST\","
+fi
 # tortoise#7391 — MINT PROVENANCE, and the end of the carry overwriting the mint time.
 # A carried record used to be byte-identical in shape to a freshly-minted one
 # and showed the CARRY (≈ merge) time in reviewed_at, so the time the review
@@ -3424,11 +3810,11 @@ if [ -n "$CARRY_ARM" ]; then
   fi
 fi
 if [ -n "$REPO" ]; then
-  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
 else
-  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
 fi
 # ── IDEMPOTENT SAME-HEAD WRITE (#1709 rec 7) ─────────────────────────────
 # The record this run would write is already on disk with the SAME deterministic
