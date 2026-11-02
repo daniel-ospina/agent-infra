@@ -613,6 +613,27 @@ printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' > "$RIG/bin/pi"
 printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
+# ── THE FORK INSTRUMENT, SEEDED INTO THIS RIG (agent-infra#2293 / #2843) ────────────────────────
+# ⛔ A RIG THAT SEEDS THE CALLERS BUT NOT THEIR INSTRUMENT IS A HALF-DEPLOYED BOX, and since the fork
+# floor became a REFUSAL (81 `AGENT_HARNESS_SKEW_REFUSED`) instead of a per-launch WARN, every arm
+# below that drives a caller with `O="$RO"` answers 81 — the SPREAD OF THE INSTRUMENT, not the load or
+# disk gate those arms name. That is the same class this file already fights (round 3's HOME fix, the
+# §9 `_rigmiss` loop): a verdict decided by the host's configuration rather than by the code under
+# test. Locally `O`/`AGENT_INFRA_PATH`/`~/orchestrator` can supply the file from the AMBIENT box, so
+# the arms read green here and red on the runner — seed it, so neither can decide.
+# ⛔ A STUB, NOT THE SHIPPED FILE: the shipped `capacity.sh` reads THIS HOST's process population, and
+# a busy runner would then refuse 73 (fork) before the gate an arm names ever ran. The arithmetic has
+# its own suite (`capacity-placement.test.sh`); here the instrument only has to be PRESENT and HEALTHY.
+cat > "$RO/capacity.sh" <<'CAPEOF'
+# Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
+cap_procs_pair_vars() { printf -v "${1:?}" '%s' 100; printf -v "${2:?}" '%s' 10000; printf -v "${3:?}" '%s' 'fixture'; }
+cap_h_for_vars() { printf -v "${3:?}" '%s' "$(( ${2:-0} - ${1:-0} ))"; }
+cap_fork_probe() { return 0; }
+CAPEOF
+# …and assert it, so a future edit that drops the seed fails HERE naming the file, instead of
+# resurfacing as a bogus 81 two hundred lines later (the `_rigmiss` idiom, applied to the instrument).
+[ -f "$RO/capacity.sh" ]; rc=$?
+ck "the rig carries the fork instrument (a rig without it answers 81 for every load/disk arm)" $rc
 # ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
 # ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
 # because `ci-queue.sh` gated EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue
