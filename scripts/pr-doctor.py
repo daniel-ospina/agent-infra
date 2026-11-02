@@ -1159,11 +1159,20 @@ _RC_RE = re.compile(r"([0-9]{1,3})\n\Z")
 # report WHICH bound the box hit instead of a bare "nobody took it". Keep this the single copy: the
 # keys are the gate's own exported constants, pinned against that file by
 # `test_the_capacity_seams_are_the_gates_own_numbers`.
-GATE_REFUSAL_BOUND = {73: "fork", 74: "land-backlog", 75: "load", 77: "disk"}
+# ⛔ THE CAPABILITY GATE IS THE FIFTH AND IT WAS MISSING (#3161 round-6 fresh-context review, P2 —
+# measured). `run_agent` returns `AGENT_CAPABILITY_REFUSED=71` and writes `[capability-gate] REFUSED …
+# no agent was started, so nothing was consumed` to the worker log — a gate refusal, with its own
+# remedy, that this table did not own. Measured: with `.rc=71` and the gate's marker in the log,
+# `gate_refused` answered False, `gate_refusal_axis` answered "", and the pass fell through to
+# `undeliverable += 1` → `EXIT 3 / UNDELIVERED / next=repair-chain`, i.e. "a human must repair the
+# dispatch chain" for a box whose capability probe proved it cannot complete a call at all. That is
+# the same omission [#2291] recorded for `[fork-gate]` ("the FIFTH and it was missing") — the count
+# was wrong there too, at four. Five, and every one of them is a constant this table must re-read.
+GATE_REFUSAL_BOUND = {71: "capability", 73: "fork", 74: "land-backlog", 75: "load", 77: "disk"}
 GATE_REFUSALS = tuple(sorted(GATE_REFUSAL_BOUND))
 # The NEXT ACTION per axis -- a verdict without one is a diagnosis the reader has to re-derive (#2710).
-# The four remedies genuinely differ, which is why `spawn-gate.sh` gives them four codes: only the
-# load refusal clears by waiting, and telling an operator to wait for the other three wastes the one
+# The remedies genuinely differ, which is why `spawn-gate.sh` gives them a code each: only the
+# load refusal clears by waiting, and telling an operator to wait for the others wastes the one
 # resource the report exists to save.
 GATE_NEXT_ACTION = {
     "load": "wait -- load clears by itself and the controller re-dispatches",
@@ -1171,6 +1180,9 @@ GATE_NEXT_ACTION = {
     "land-backlog": "land/fix the open PRs -- this box is healthy; waiting does NOT clear it",
     "fork": "restart this box from outside, or let its lanes drain -- it is out of PROCESSES and "
             "cannot be cleaned up from inside, and waiting does NOT clear it",
+    "capability": "measure the box by hand, then restart/reprovision it -- its capability probe "
+                  "could not complete a call and return, so a re-dispatch here refuses again and "
+                  "waiting does NOT clear it (LANE_PREFLIGHT=0 only once an operator has measured it)",
 }
 # ⛔ THE TOKEN COMES FIRST, THE SENTENCE AFTER IT (review P1, #2291). `record_exit()`'s own contract
 # is that the reason is a PREFIX because both readers cut the tail -- the tightest at 110 chars
@@ -1182,7 +1194,11 @@ GATE_NEXT_ACTION = {
 # is emitted FIRST and the prose after it: the remedy survives every cut, and the sentence is what a
 # human reads when the line is not truncated.
 GATE_NEXT_TOKEN = {"load": "wait", "disk": "prune-disk",
-                   "land-backlog": "land-prs", "fork": "restart-box"}
+                   "land-backlog": "land-prs", "fork": "restart-box",
+                   # ⛔ NOT "wait": a capability refusal is the one class where waiting is provably
+                   # useless -- the probe already failed on this box. `GATE_NEXT_TOKEN.get(ax, "wait")`
+                   # at the verdict line would have defaulted it to exactly the wrong remedy.
+                   "capability": "fix-box"}
 # The OTHER verdicts' next actions, short enough to survive the same cut. A verdict without one is a
 # diagnosis the reader has to re-derive (#2710).
 VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
@@ -1200,7 +1216,7 @@ VERDICT_NEXT_TOKEN = {"UNDELIVERED": "repair-chain", "REFUSED": "fix-worktree",
 # MEASURED on cell-4 at load 0.32x (#2293) -- was read as a DISPATCH: it wrote a spawn row and burnt
 # a 90-min budget slot for an agent that never existed. The marker is the gate's own line.
 REFUSAL_MARKERS = ("[load-gate] REFUSED", "[disk-gate] REFUSED", "[land-backlog] REFUSED",
-                   "[fork-gate] REFUSED")
+                   "[fork-gate] REFUSED", "[capability-gate] REFUSED")
 # `run_agent` appends this line only AFTER `pi` has been waited on (spawn-gate.sh starts `pi >> $LOG`
 # and writes this line after `wait`), so its presence in a log PROVES an agent ran -- and a gate
 # refusal is written strictly BEFORE any agent starts. That makes it a one-way discriminator: agent
@@ -4254,6 +4270,39 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     _, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=SPAWN_CALL_TIMEOUT_S,
                            cwd=HOME, env=_orch_env(), capture=False)
     if rc != 0:
+        # ⛔ A GATE REFUSAL NOW ARRIVES ON THE FOREGROUND EXIT CODE, AND IT MUST KEEP ITS CLASS
+        # (agent-infra#3161, measured 2026-11-01). `nonblocking-dispatch.sh` used to exit 0 for every
+        # launch -- including one whose worker the gate refused -- so the refusal existed only in
+        # `$O/bg/<name>.rc` and `_confirm()` read it. Its start assertion now exits 75 ITSELF when no
+        # lane becomes a process (`FAILED EARLY` carries the worker's own 75; `NOT STARTED` proves
+        # nothing ran at all), which makes `rc != 0` true for a refusal that consumed NOTHING.
+        # Collapsing that into the chain-failure branch below is not a cosmetic mislabel: measured, a
+        # load refusal (which clears by itself) was reported as
+        # `EXIT rc=3 -- VERDICT=UNDELIVERED next=repair-chain` -- the one verdict that says a human
+        # must repair the dispatch chain -- and, being `record=False` on both paths, it also lost the
+        # distinction the assertion was added to create. So ask the SAME durable artifact `_confirm()`
+        # asks, with the SAME predicate (`gate_refused`: a GATE_REFUSAL code AND the gate's own marker
+        # in the worker log AND no `[timeout] agent pid=` line) -- never a second definition here.
+        # ⛔ ONLY 75, AND THAT IS THE WHOLE GUARD AGAINST STALE EVIDENCE. Every FOREGROUND refusal in
+        # the dispatcher exits 78 (no spawn-gate / no brief-gate / reviewer-preflight) or 80 (the brief
+        # gate refused) and those paths run BEFORE its `rm -f "$RC"` / `: > "$LOG"` -- so a `.rc`,
+        # and a gate marker in the log, can both be LEFTOVER from an earlier dispatch of this same
+        # name. Reading them under an 80 would report a PERMANENT, fleet-wide brief refusal as
+        # `gate REFUSED rc=75 (load)` -- "wait, it clears by itself" -- which is the one direction this
+        # file may never be wrong in. 75 is emitted by the start assertion alone -- its TWO
+        # `NOT STARTED` arms (rc=0 with no log byte; pid gone before a `.rc` appeared) and its
+        # `FAILED EARLY` arm (rc!=0 inside the window) -- and that assertion runs after the two
+        # truncations, so 75 is exactly the code whose durable evidence is guaranteed fresh.
+        # ⛔ `finished early` IS NOT ONE OF THEM: banner it prints is followed by the dispatch row and
+        # `launched`, and the script ends on `echo`, so a worker that started, wrote a log line and
+        # exited 0 inside the window leaves rc=0 -- never 75. Listing it here made this file's
+        # "75 comes from" set name a state the dispatcher cannot produce (fresh-context review, P2;
+        # measured: `grep -n 'exit 7[0-9]' nonblocking-dispatch.sh` -> 425, 433, 443 only).
+        code = read_rc(bg_path(name, "rc")) if rc == 75 else None
+        if code is not None and gate_refused(name, code):
+            detail = "gate REFUSED rc=%d (%s)" % (code, refusal_axis(code))
+            log("spawn %s: %s -- no agent started, nothing consumed" % (name, detail))
+            return False, detail, False
         # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh or a missing
         # brief-gate.sh), rc=80 (THE BRIEF WAS REFUSED by the research-first gate -- see
         # agent-infra#2258: the fix is in `brief()`/`brief-gate.sh`, not in the box), rc=2 (no
@@ -4261,7 +4310,21 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
         # the message is the only thing that names which one it is. 80 is deliberately NOT in
         # GATE_REFUSALS: that tuple is the 75/77 LOAD/DISK class written by run_agent into a
         # backgrounded worker's `.rc`, whereas 80 comes back on the FOREGROUND call and no worker
-        # ever exists to have an `.rc`.
+        # ever exists to have an `.rc`. A dispatcher 75 that the DURABLE EVIDENCE above does not
+        # certify as a gate refusal is the third class below -- a real chain defect, reported loudly,
+        # not waited out.
+        # ⛔ AND IT IS THREE ARMS, NOT ONE, SO DO NOT READ THIS AS "NOTHING RAN" (round-4 review, P2).
+        # The start assertion exits 75 from its TWO `NOT STARTED` arms (no log byte / pid vanished
+        # before a `.rc`) and from `FAILED EARLY: … started and exited rc=N`. Only the `NOT STARTED`
+        # arms consumed nothing; `FAILED EARLY` is a worker that RAN. All three are `record=False`
+        # below, which is right for the two `NOT STARTED` arms and is the RESIDUAL for `FAILED EARLY`:
+        # such a worker gets no state row and no `spent[class]`, so it is re-spawned every pass and
+        # `REFUSAL_ESCALATE_AT` never engages. (`finished early` is NOT among them -- it exits 0; see
+        # the note above, which named it wrongly.)
+        # Safe, not tight: nothing here claims a lane is alive (the next pass re-checks liveness), and
+        # a worker that starts and dies inside the settle window is rare by construction (the window
+        # is seconds). Declared rather than silently absorbed -- giving those two arms a cooldown row
+        # is a separate change with its own test, not a comment fix.
         detail = "rc=%s: %s" % (rc, (errout or "").strip()
                                 or "the dispatcher exited non-zero with no stderr")
         log("spawn %s -> %s: FAIL %s" % (name, wt, detail[:200]))
