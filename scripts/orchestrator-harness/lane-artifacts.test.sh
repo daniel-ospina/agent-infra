@@ -112,17 +112,46 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   if [ -n "${STUB_BAD_SIZE:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
     printf '__OK__\n%s/has\ttab.md\t2026-01-01T00:00:00\n' "$root"; exit 0
   fi
-  # STUB_GROW: append to a file EVERY time a pull exec runs, simulating a LANE STILL WRITING. A pull that
-  # takes its expected length from a second read of the file disagrees with itself; one that derives it
-  # from the payload it actually sent cannot.
-  if [ -n "${STUB_GROW:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
-    printf 'line-appended-by-the-live-lane\n' >> "$STUB_GROW" 2>/dev/null
+  # STUB_WRAP: model the PRODUCTION encoder. This host's `base64` is FreeBSD and does NOT wrap, so a
+  # wrap-guard test cannot fire here — the fix would look right and be untestable. A shim on PATH wraps
+  # at 76 columns like GNU coreutils, so the length check (which must count CHARACTERS, not newlines) is
+  # host-independent and reds on a revert.
+  if [ -n "${STUB_WRAP:-}" ]; then
+    _sh="$STUB_WRAP/shim"; mkdir -p "$_sh"
+    if [ ! -x "$_sh/base64" ]; then
+      printf '#!/bin/sh\nexec /usr/bin/base64 "$@" | fold -w 76\n' > "$_sh/base64"
+      printf '#!/bin/sh\nexec /usr/bin/base64 "$@" | fold -w 76\n' > "$_sh/base64.tmp"
+      chmod +x "$_sh/base64"
+    fi
+    PATH="$_sh:$PATH"; export PATH
+  fi
+  # STUB_GROW: simulate a lane writing WHILE the pull runs. Appending before the exec is not enough — a
+  # first read and a second read inside the same exec then see the same size and the atomicity fix looks
+  # tested when it is not. So append on the base64 read AND again when the script would take a SECOND
+  # read of the file (`wc -c < "$1"`), which is exactly the window the fix closes.
+  if [ -n "${STUB_GROW:-}" ]; then
+    case "${args[2]:-}" in
+      *base64*) printf 'line-appended-by-the-live-lane\n' >> "$STUB_GROW" 2>/dev/null ;;
+    esac
+    case "${args[2]:-}" in
+      *'wc -c < "$1"'*) printf 'line-appended-by-the-live-lane\n' >> "$STUB_GROW" 2>/dev/null ;;
+    esac
+  fi
+  # STUB_READ_FAIL: the READER fails while `find` succeeded — the asymmetry round 5 fixed (find was
+  # converted to __NOK__, the reader was not) and which had no arm to test it.
+  if [ -n "${STUB_READ_FAIL:-}" ] && [ "${args[2]:-}" != "${args[2]%%head -n*}" ]; then
+    echo 'stub: reader exploded' >&2; exit 1
   fi
   # STUB_BULK: a directory with more matches than ROW_CAP, so the truncation notice is exercised.
   if [ -n "${STUB_BULK:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
     echo __OK__
     i=0; while [ $i -lt 240 ]; do printf '%s/bulk-%s.md\t1\t2026-01-01T00:00:00\n' "$STUB_BULK" "$i"; i=$((i+1)); done
     exit 0
+  fi
+  # STUB_UNREADABLE: the file exists for the scan but the pull's read FAILS (chmod 000 / vanished). This
+  # is the case where `rc=$?` after a pipeline used to capture *tr*'s status and report a 0-byte SUCCESS.
+  if [ -n "${STUB_UNREADABLE:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
+    printf 'RC=1 LEN=0\n\n'; exit 0
   fi
   exec "${args[@]}" 2>/dev/null
 fi
@@ -353,6 +382,9 @@ echo "T21 — a LIVE lane's growing log is NOT falsely rejected (the primary use
 mkdir -p "$Q/box-c"
 printf 'line1\n' > "$Q/box-c/growing.log"
 STUB_GROW="$Q/box-c/growing.log"; export STUB_GROW
+STUB_WRAP="$Q/wrap"; export STUB_WRAP   # model the PRODUCTION (GNU) encoder, which wraps at 76 — this
+                                         # host's base64 is FreeBSD and does NOT wrap, so without the
+                                         # shim the wrap guard cannot fire where the suite actually runs.
 out="$Q/out21"; mkdir -p "$out"
 run logs growing --out "$out" > "$Q/t21.txt" 2>&1
 rc=$?; unset STUB_GROW
@@ -380,6 +412,45 @@ run collect bulk- --box pi-cell-1 > "$Q/t22.txt" 2>&1
 rc=$?; unset STUB_BULK
 eq "T22 exit 4 (list is NOT complete)" "$rc" "4"
 grep -q 'NOT complete' "$Q/t22.txt" && ok "T22 says the list is not complete" || bad "T22 wording" "$(tail -3 "$Q/t22.txt")"
+
+# T24 — an UNREADABLE artifact must FAIL, not report a 0-byte success. `rc=$?` after a pipeline captured
+# tr's status (always 0), so a vanished/chmod-000 file looked like a legitimately empty one — a false PASS
+# on the verb whose whole purpose is to stop exactly that.
+echo "T24 — an unreadable artifact is a FAILED pull, not a silent 0-byte success"
+# ⚠ This must exercise the REAL remote script: the bug was that `rc=$?` captured the status of a
+# PIPELINE (`base64 | tr`) rather than base64's own, so an unreadable file reported rc=0 and a 0-byte
+# success. A stub that simply answers `RC=1` tests nothing — it never opens the window. A chmod-000
+# fixture on the box does, because `base64 < f` fails while `find` still lists the file.
+mkdir -p "$Q/box-c"
+printf 'unreadable artifact body' > "$Q/box-c/unreadable.md"
+chmod 000 "$Q/box-c/unreadable.md"
+out="$Q/out24"; mkdir -p "$out"
+run collect unreadable --out "$out" > "$Q/t24.txt" 2>&1
+rc=$?
+chmod 644 "$Q/box-c/unreadable.md" 2>/dev/null
+[ "$rc" -ne 0 ] && ok "T24 fails closed (exit $rc)" || bad "T24 must not exit 0 on an unreadable artifact" "$(cat "$Q/t24.txt")"
+grep -qE 'pull failed|UNMEASURED' "$Q/t24.txt" && ok "T24 says the pull failed" || bad "T24 wording" "$(tail -3 "$Q/t24.txt")"
+[ -f "$out/pi-cell-4-unreadable.md" ] && bad "T24 must not 'write' a 0-byte success" "$(ls -l "$out")" \
+  || ok "T24 wrote no artifact"
+
+# T25 — the READER failing (find succeeded) must be UNMEASURED, not "matched nothing".
+echo "T25 — a failing row-reader is UNMEASURED, never ABSENT"
+STUB_READ_FAIL=1; export STUB_READ_FAIL
+run collect no-such-file > "$Q/t25.txt" 2>&1
+rc=$?; unset STUB_READ_FAIL
+eq "T25 exit 4" "$rc" "4"
+grep -qE 'read-failed|UNMEASURED' "$Q/t25.txt" && ok "T25 abstains" || bad "T25 abstain" "$(head -4 "$Q/t25.txt")"
+grep -q '^ABSENT-EVERYWHERE' "$Q/t25.txt" && bad "T25 must not claim absent" "$(cat "$Q/t25.txt")" \
+  || ok "T25 does not claim absent"
+
+# T26 — the published index records the size WRITTEN, not the stale scan size.
+echo "T26 — the index records the size actually written"
+mkdir -p "$Q/box-c"; printf 'a%.0s' $(seq 1 400) > "$Q/box-c/idxcheck.md"
+out="$Q/out26"; mkdir -p "$out"
+run collect idxcheck --out "$out" >/dev/null 2>&1
+idx_size="$(awk -F"$(printf '\t')" '{print $3}' "$out/.lane-artifacts-index" 2>/dev/null | head -1)"
+file_size="$(wc -c < "$out/pi-cell-4-idxcheck.md" 2>/dev/null | tr -d ' ')"
+eq "T26 index size == file size" "${idx_size:-none}" "${file_size:-none}"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"

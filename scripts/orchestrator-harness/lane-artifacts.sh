@@ -207,7 +207,7 @@ pull() {
   # (The previous version of this file CLAIMED this fix in a comment while the code still emitted the
   # marker last — found by review. The code is the claim.)
   raw="$("$CM" vm exec --timeout 120 "$vm" -- sh -c \
-          'b=$(base64 < "$1" 2>/dev/null | tr -d "\n"); rc=$?; printf "RC=%s LEN=%s\n%s\n" "$rc" "${#b}" "$b"' \
+          'b=$(base64 < "$1" 2>/dev/null); rc=$?; b=$(printf "%s" "$b" | tr -d "\n"); printf "RC=%s LEN=%s\n%s\n" "$rc" "${#b}" "$b"' \
           lane-artifacts "$path" </dev/null 2>/dev/null)"
   rc="$(printf '%s\n' "$raw" | sed -n '1s/^RC=\([0-9]*\) LEN=.*/\1/p' | tr -d '[:space:]')"
   # ⛔ THE LENGTH IS TAKEN FROM THE VERY STRING THAT WAS SENT, NOT FROM A SECOND READ OF THE FILE.
@@ -239,7 +239,18 @@ pull() {
      ! printf '%s' "$b64" | base64 -d > "$dest" 2>/dev/null; then
     printf '  ✗ decode failed: %s\n' "$path" >&2; rm -f "$dest"; return 1
   fi
+  # ⛔ `rc=$?` MUST FOLLOW `base64`, NOT A PIPELINE. The remote is `sh -c` with no `pipefail`, so with
+  # `base64 < f | tr -d "\n"` inside the substitution, `rc` captured *tr*'s status — always 0. An
+  # unreadable or vanished file therefore produced rc=0, LEN=0, and the length check compared 0 == 0 and
+  # PASSED: `✓ wrote … (0 bytes)` at exit 0, indistinguishable from a lane that legitimately wrote nothing.
+  # A false PASS on the one verb whose purpose is to stop exactly that. The strip is a separate statement.
   got="$(wc -c < "$dest" | tr -d '[:space:]')"
+  # `want` (the scan size) may NOT reject — a live lane grows — but it can still say DIRECTIONALLY that a
+  # 0-byte result is suspicious, which is the cheap cross-check for a file that vanished mid-flight.
+  if [ "$got" = "0" ] && [ -n "${want:-}" ] && [ "${want:-0}" != "0" ] && [ "${want:-?}" != "?" ]; then
+    printf '  ⚠ %s pulled 0 bytes but the scan measured %s — the file may have vanished mid-flight\n' \
+      "$path" "$want" >&2
+  fi
   printf '  ✓ wrote %s (%s bytes)\n' "$dest" "$got"
   PULL_BYTES="$got"        # the size actually written, so the index does not record the stale scan size
 }
