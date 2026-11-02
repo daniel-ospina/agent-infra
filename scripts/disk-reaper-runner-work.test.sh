@@ -221,7 +221,7 @@ case_a() { # <entry-point> <owner>
 
 # ── (b) an OLD entry is counted in dry-run and REMOVED under --apply, as a df delta ────────────
 case_b() { # <entry-point> <owner>
-    local pass="$1" owner="$2" base work dead out rc st n freed s1 s2 s3
+    local pass="$1" owner="$2" base work dead out rc st n freed s1 s2 s3 ps_out
     PASS_OWNER="$owner"
     base="$T/b.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-4)"
     dead="$(mk_entry "$work" job-killed 180 24)"   # 3 h old, 24 MB of real bytes: a dead checkout
@@ -258,6 +258,24 @@ case_b() { # <entry-point> <owner>
                "the record carries the owner's unmeasurable= tally (0 here), so an ABSTENTION has a field"
     case_check "$(grep -qF 'unmeasurable=0 ' <<<"$out" && echo 0 || echo 1)" \
                "… and the class line prints it beside kept=, so the two outcomes are told apart without the log"
+    # ⛔ THE VERDICT, AND ITS READER (#3057 review). Case (b) is the only case that REAPS, and it read every
+    # record field except `verdict_runner_work=` — the one that says the pass WORKED. Measured `ok` here,
+    # and not by luck: `rc` was asserted 0 above and `class_verdict 0` is `ok` by construction, so any other
+    # value beside a removed entry is the record contradicting the pass it records. It is asserted at the
+    # ends of (f)/(g) too, but neither of those reaps — the apply path is where a verdict that was dropped,
+    # or hardcoded, would still have read as a clean class.
+    case_check "$(grep -q '^verdict_runner_work=ok$' <<<"$st" && echo 0 || echo 1)" \
+               "the record reads verdict_runner_work=ok on the pass that actually REAPED (measured, not a default)"
+    # … and the RECORD'S OWN READER must render it: `verdict_runner_work` is written for `--print-status`,
+    # so a field that is written and never read is not a channel. ⛔ THE READER'S SHAPE IS NOT THE FILE'S:
+    # the record is one `key=value` per LINE, and `--print-status` renders ONE `|`-joined line — so the
+    # assertion is anchored on a FIELD BOUNDARY, not on a line. (The first version grepped `^verdict_…$`
+    # and could never match; measured, that is how it was caught rather than shipped green forever.)
+    # Captured into a variable rather than piped, because the suite runs under `pipefail` and this verb's
+    # own exit code would then decide the assertion.
+    ps_out="$(DISK_REAPER_STATE_DIR="$s2" bash "$pass" --print-status 2>/dev/null)"
+    case_check "$(grep -qE '(^|\|)verdict_runner_work=ok(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
+               "… and --print-status RENDERS that verdict, so the field has a reader and not only a writer"
     return $((CASE_FAIL > 0))
 }
 
@@ -523,6 +541,12 @@ case_i() { # <owner>
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
 MUT_A='s/when=\$(( \$(now) - MIN_AGE ))/when=$(now)/'
 MUT_B='s/-newer "\$ref" -print 2>\/dev\/null | head -1/-print 2>\/dev\/null | head -1/'
+# (b) has a SECOND mutant, on the ENTRY POINT: DELETE the `verdict_runner_work=` line from the pass
+# record. Every other runner-work field is rendered by a different expression, so only an assertion that
+# reads the VERDICT can redden — which is what makes (b) the instrument for this field rather than a suite
+# that merely prints it. A missing record line is the defect shape the review named: a field that looks
+# checked because it is present in a transcript.
+MUT_BV="/printf 'verdict_runner_work=/d"
 # ⛔ THE CARVE-OUT'S TWO SPELLINGS ARE ONE ARM: the derived table AND the runner-namespace default, so
 # the mutation removes both. Emptying only the table leaves `_tool`/`_actions`/`_temp` retained by the
 # `_`-prefix default and the case would pass on a tree with no table at all — the "mutant survived"
@@ -580,6 +604,11 @@ if apply_mutation "$OWNER" "$T/mut-b/reap-runner-work.sh" "$MUT_B"; then
     expect_fail "b mutation: dropping the -newer floor test turns the case RED" case_b "$REAPER" "$T/mut-b/reap-runner-work.sh"
 else
     bad "b mutation could not be applied (the -newer test moved) — the case is not checking it any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-bv/disk-reaper.sh" "$MUT_BV"; then
+    expect_fail "b mutation: dropping verdict_runner_work from the PASS RECORD turns the case RED" case_b "$T/mut-bv/disk-reaper.sh" "$OWNER"
+else
+    bad "b mutation could not be applied (the verdict_runner_work record line moved) — the case is not checking it any more"
 fi
 
 expect_pass "c _tool and _actions survive even when they are the oldest thing in the tree" case_c "$REAPER" "$OWNER"
