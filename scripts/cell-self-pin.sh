@@ -847,7 +847,7 @@ refuse_env_reset() { # <what> <body>
 
 verify_unit() { # <rendered service> [expected ExecStart payload] — the properties the ISSUE names, asserted on the ARTIFACT
   local f="$1" expect="${2:-}" body exec_path exec_real exec_dir home_real n_exec execs envs ok_vals v w seen11=0 _interp _x _c
-  local n_home home_val _env _kv
+  local n_home home_val _env _kv svc users n_user user_val expect_user
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
   # next reader to delete the only explanation of why the line is banned. Strip comments first.
@@ -855,6 +855,20 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   refuse_raw_text_tricks "the rendered unit" "$body" || return 1
   refuse_env_reset "the rendered unit" "$body" || return 1
   refuse_env_mutators "the rendered unit" "$body" || return 1
+  # ⛔ THE BODY-WIDE REFUSALS ABOVE STAY WHOLE-BODY ON PURPOSE (fail-closed: a backslash continuation or
+  # an `Environment=` RESET is dangerous in ANY section, because the section that carries it is the next
+  # one's problem and we have already established systemd will not complain). The rules BELOW are
+  # different: `Environment=`, `SuccessExitStatus=` and `User=` are `[Service]`-only directives, and
+  # written anywhere else systemd DROPS them with "Unknown key name … ignoring." A rule built on the
+  # section-blind `directive` therefore grades text systemd discards — measured in review: two
+  # `Environment=` lines moved under a trailing `[Unit]` head passed the count rule, the value rule and
+  # the allow-list, `--install` printed "installed", and `systemd-analyze verify` reported BOTH lines as
+  # ignored, so the installed unit ran with NO `CELL_HOME` and fell back to `${CELL_HOME:-$HOME}` (:111)
+  # — a different pin record than the controller reads, which is #2215's skew made permanent in
+  # /etc/systemd/system. `verify_timer` was made section-aware for exactly this class; this is the same
+  # fix on the service, and it uses the same helper.
+  svc="$(unit_section "$body" Service)"
+  [ -n "$svc" ] || { bad "the rendered unit declares no [Service] section (or an empty one) — ExecStart=, Environment=, SuccessExitStatus= and User= are [Service] directives, and systemd ignores them in every other section, so this unit would install green and fail to start (or start under the wrong identity)"; return 1; }
   # ⛔ THE DEFECT ITSELF, AS AN INVARIANT: a rendered pin unit must carry NO bootstrap-only path, AS A
   # TOKEN — not merely after `=` or at line start. `ExecStart=/bin/bash /tmp/cell-ai/scripts/…` puts a
   # SPACE before the path, and that is the reachable form: the placed copy's fallback is whatever
@@ -966,7 +980,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   # verify. `HOME=` and `CELL_HOME=` are the closed set: identity, and the base the rules below already check.
   # A name systemd or a future template adds is refused without another review, which is the direction the
   # "family closed by one name" defect this file has fixed three times now requires.
-  envs="$(directive "$body" Environment)"
+  envs="$(directive "$svc" Environment)"
   n_home=0
   home_val=""
   while IFS= read -r _env; do
@@ -985,6 +999,27 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   fi
   if [ "$home_val" != "$CELL_HOME" ]; then
     bad "the rendered unit's Environment=CELL_HOME='${home_val}' is not the cell home '${CELL_HOME}' — the pass would derive its base from a value the controller never read, so it pins a different record"; return 1
+  fi
+  # ⛔ THE ARTIFACT'S IDENTITY WAS THE ONE PROPERTY NOTHING ASSERTED. `print_unit` derives `User=` from
+  # the owner of `$CELL_HOME` (:704) because `User=root` was MEASURED to break the pin — this file's own
+  # comment quotes the fleet's drop-in: "running as root makes git refuse the fetch (dubious ownership) so
+  # the unit could never pin anything" — but no rule read the value back off the rendered artifact, so a
+  # template carrying `User=root`, or a second `User=` line (systemd is LAST-WINS for a single-valued
+  # key), installed with a positive claim. MEASURED in review, both spellings: rc=0, "installed". That is
+  # #3194's own shape one directive over — a unit that can never pin, reported green — and it is worse
+  # than a broken pin: the payload the unit execs lives under `$CELL_HOME/.pi/agent/scripts`, which is
+  # owned by the cell user, so a `User=root` artifact executes bytes the cell user can replace.
+  # Derived here, not passed in, so the rule and the render can never disagree about the expected owner.
+  expect_user="$(cell_home_owner)" \
+    || { bad "cannot determine the owner of CELL_HOME ('${CELL_HOME}') to verify the rendered unit's User= against — refusing rather than installing a unit whose identity nothing can check"; return 1; }
+  users="$(directive "$svc" User)"
+  n_user=0
+  [ -z "$users" ] || n_user="$(printf '%s\n' "$users" | wc -l | tr -d ' ')"
+  if [ "$n_user" -ne 1 ]; then
+    bad "the rendered unit declares ${n_user} User= line(s) — exactly one is installable and it must name '${expect_user}', the owner of CELL_HOME (systemd is LAST-WINS, so a second one silently changes the identity the payload runs as; and with none, the unit runs as ROOT)"; return 1
+  fi
+  if [ "$users" != "$expect_user" ]; then
+    bad "the rendered unit's User='${users}' is not '${expect_user}', the owner of CELL_HOME — that user's git is the one that can answer for the tree this pass pins, so any other identity makes the fetch refuse (dubious ownership) and every tick REDs with the unit still reporting installed"; return 1
   fi
   # (`EnvironmentFile=`/`UnsetEnvironment=`/`PassEnvironment=` are refused above, by name, in ONE list — see
   # ENV_MUTATING_DIRECTIVES. They were refused here first and then generalised, because the drop-in path had
@@ -1033,7 +1068,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   # loads. (`verify_dropin_file` refuses `SuccessExitStatus=` in a drop-in outright, so this body is the
   # whole of the list.) Refusing the empty line instead was the cheaper fix and would have refused a valid
   # `SuccessExitStatus=` followed by `SuccessExitStatus=11`, which resolves to a correct list.
-  ok_vals="$(printf '%s\n' "$body" | awk '
+  ok_vals="$(printf '%s\n' "$svc" | awk '
     { line = $0; sub(/^[[:space:]]*/, "", line) }
     line ~ /^SuccessExitStatus[[:space:]]*=/ {
       sub(/^[^=]*=[[:space:]]*/, "", line)
@@ -1077,7 +1112,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
 # clock leaves every surface green. The two rules below are what make the clock one that REPEATS and fires
 # THE PASS.
 verify_timer() { # <rendered timer> [expected Unit= target]
-  local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _v _c
+  local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _eff _c
   # Comments are stripped for the same reason `verify_unit` strips them: this template documents the
   # cadence decisions it made, and that prose legitimately names the directives the rules below ban.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
@@ -1125,11 +1160,27 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # again. THE REPEATING TRIGGERS are `OnUnitActiveSec=` (measured from the last pass — what this template
   # uses, and the cadence the unit states) and `OnCalendar=` (wall clock). At least one must carry a VALUE,
   # because an EMPTY `OnUnitActiveSec=` is ignored by systemd and silently degrades to the one-shot case.
-  _rep=0
-  for _v in OnUnitActiveSec OnCalendar; do
-    if [ -n "$(directive "$timer" "$_v" | sed -n '/[^[:space:]]/p' | head -1)" ]; then _rep=1; break; fi
-  done
-  [ "$_rep" -eq 1 ] || { bad "the rendered timer declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare OnUnitActiveSec= or OnCalendar="; return 1; }
+  # ⛔ AND THE RULE MUST READ THE EFFECTIVE LIST, NOT LATCH A LINE. `systemd.timer(5)` on every one of
+  # these: "If the empty string is assigned to ANY of these options, the list of timers is reset (both
+  # monotonic timers and OnCalendar= timers), and all prior assignments will have no effect." So an
+  # `OnCalendar=` (or empty `OnUnitActiveSec=`) placed AFTER a real value DISCARDS it — and `OnBootSec=`
+  # with it — leaving a clock that fires once and never again, which is precisely the defect this rule
+  # exists to refuse. A latch over `directive` cannot see that: it finds the earlier non-blank value and
+  # returns success. MEASURED in review with `OnUnitActiveSec=…` followed by `OnCalendar=` and then
+  # `OnBootSec=3min`: `--install` printed "installed", rc=0, effective clock = one-shot.
+  # The replay below is the SAME shape the `SuccessExitStatus=` rule already uses (:1036) — an empty
+  # assignment is a LIST RESET for every list-shaped directive, so the lesson is applied once, here.
+  _eff="$(printf '%s\n' "$timer" | awk '
+    { line = $0; sub(/^[[:space:]]*/, "", line) }
+    line ~ /^(OnBootSec|OnStartupSec|OnActiveSec|OnUnitActiveSec|OnUnitInactiveSec|OnCalendar)[[:space:]]*=/ {
+      k = line; sub(/[[:space:]]*=.*/, "", k)
+      v = line; sub(/^[^=]*=[[:space:]]*/, "", v)
+      if (v == "") { rep = 0; next }
+      if (k == "OnUnitActiveSec" || k == "OnCalendar") rep = 1
+    }
+    END { print rep + 0 }')"
+  _rep="${_eff:-0}"
+  [ "$_rep" -eq 1 ] || { bad "the rendered timer's EFFECTIVE trigger list declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, and an EMPTY OnUnitActiveSec=/OnCalendar= is a LIST RESET that discards every trigger above it, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare a non-empty OnUnitActiveSec= or OnCalendar= and put no empty assignment after it"; return 1; }
   return 0
 }
 
@@ -1342,7 +1393,27 @@ scope_state() { # <scope> — prints enabled | disabled | unknown (an UNANSWERAB
   # is what lets the list stay a single named value; a `case` pattern is parsed before expansion and would
   # read `a|b` as one literal glob).
   if [[ "$out" =~ $BUS_UNREACHABLE_PAT ]]; then printf 'unknown\n'; return 0; fi
-  [ "$rc" -eq 0 ] && printf 'enabled\n' || printf 'disabled\n'
+  # ⛔ POLARITY, NOT RESIDUE. `disabled` is a CLAIM the manager made about THIS unit, so only the
+  # manager's OWN answer words may produce it — every other non-zero (an unrecognised failure text, a
+  # D-Bus activation timeout, a vendor build's wording, an empty answer) is UNKNOWN, which is what this
+  # function's own docstring promises. The old line was `[ "$rc" -eq 0 ] && enabled || disabled`, a
+  # DENY-LIST: any failure spelling not in BUS_UNREACHABLE_PAT fell through to `disabled`, so an
+  # unanswerable manager was reported as "no actuator" — the false PASS this block's comment says it
+  # fixed, one spelling further out. MEASURED in review: systemd's real system-scope message
+  # `Failed to connect to system scope bus via local transport: No such file or directory` (rc=1) does
+  # NOT match `Failed to connect to bus` (the words `system scope bus via local transport` sit in
+  # between) and read as `disabled`, so `--status` printed `second actuator <none>` over an UNREAD scope.
+  if [ "$rc" -eq 0 ]; then
+    case "$out" in
+      enabled|enabled-runtime) printf 'enabled\n' ;;
+      *) printf 'unknown\n' ;;
+    esac
+    return 0
+  fi
+  case "$out" in
+    disabled|masked|masked-runtime|not-found|bad) printf 'disabled\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
 }
 # actuator_unknown_scopes — scopes whose manager did not answer, one per line. A scope listed here was NOT
 # verified; a caller may not claim it was.

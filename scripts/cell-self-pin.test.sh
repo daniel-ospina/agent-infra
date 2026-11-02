@@ -125,7 +125,12 @@ mk_sup "$T/home/harness/pintree/scripts/cloud-cell-supervisor.sh" "$T/argv.log"
 # ⛔ A MANAGER WITH NO UNITS, on PATH for every `runat`. See the note there: no leg may reach the host's
 # real systemd, because `do_pass` now re-reads (and can re-retire) the one-actor invariant every tick.
 mkdir -p "$T/fakebin-none"
-printf '#!/bin/bash\ncase "$*" in *is-enabled*) exit 1 ;; esac\nexit 0\n' >"$T/fakebin-none/systemctl"
+# ⛔ AND THE STUB MUST ANSWER THE WAY systemd DOES. `is-enabled` prints its ANSWER WORD (`enabled` /
+# `disabled` / `masked` / …); a stub that exits 1 having printed NOTHING is a manager that failed to
+# answer, not one that answered "disabled", and the two are now (correctly) different verdicts. The
+# fixture said "not enabled" with silence, so it silently certified the same fail-open `scope_state`
+# had — found by review, fixed on both sides rather than by weakening the reader.
+printf '#!/bin/bash\ncase "$*" in *is-enabled*) echo disabled; exit 1 ;; esac\nexit 0\n' >"$T/fakebin-none/systemctl"
 chmod +x "$T/fakebin-none/systemctl"
 mkdir -p "$T/home/orchestrator" "$T/empty"
 # The seed doubles as the target of the EXPLICIT-record leg below, so it carries a supervisor too — a
@@ -386,6 +391,28 @@ refuses 'an OVERRIDING Environment=CELL_HOME=' "$(doctor overridehome 'Environme
 # REWRITES the existing line instead of appending (a second line would trip the count rule first and the leg
 # would pass on a rule it never named — the same wrong-reason trap the ExecStart leg hit).
 refuses 'ONE Environment=CELL_HOME= naming a different base' "$(doctor_rw cmhome-wrong "s|^Environment=CELL_HOME=.*\$|Environment=CELL_HOME=/tmp/other-home|")" "$T/u20" 'is not the cell home'
+# ⛔ A RULE THAT GRADES A DIRECTIVE systemd DROPS IS A FALSE PASS (round-11 review, P1). `Environment=`,
+# `SuccessExitStatus=` and `User=` are `[Service]`-only; written in any other section systemd IGNORES them
+# ("Unknown key name … ignoring."). The rules read the WHOLE body section-blind, so BOTH `Environment=`
+# lines MOVED under a trailing `[Unit]` head passed the count rule, the value rule and the allow-list;
+# `--install` printed "installed" and `systemd-analyze verify` reported both lines as ignored — so the
+# installed unit ran with NO `CELL_HOME` and fell back to `${CELL_HOME:-$HOME}`, a DIFFERENT pin record
+# than the controller reads (#2215's skew, made permanent in /etc/systemd/system). This leg MOVES the
+# lines rather than appending them: appending one to a `[Service]` that still has a good one is harmless
+# and must NOT be refused, so only a move can tell a section-aware rule from a section-blind one.
+d_envsec="$T/doctored-env-wrong-section"
+mkdir -p "$d_envsec" && cp "$TPL/cell-self-pin.timer" "$d_envsec/"
+{ grep -vE '^Environment=' "$TPL/cell-self-pin.service"; printf '\n[Unit]\n'; grep -E '^Environment=' "$TPL/cell-self-pin.service"; } >"$d_envsec/cell-self-pin.service"
+refuses 'Environment= moved into a section systemd IGNORES ([Unit])' "$d_envsec" "$T/u20b" 'assignment(s)'
+# ⛔ AND THE ARTIFACT'S IDENTITY WAS THE ONE PROPERTY NOTHING ASSERTED (round-11 review, P1). `print_unit`
+# derives `User=` from the owner of `$CELL_HOME` because `User=root` was MEASURED to break the pin — this
+# file's own comment quotes the fleet's drop-in: "running as root makes git refuse the fetch (dubious
+# ownership) so the unit could never pin anything" — yet no rule read the value back off the artifact. A
+# template carrying a second `User=` (systemd is LAST-WINS for a single-valued key) or a hardcoded
+# `User=root` installed rc=0 with a positive claim: #3194's own shape one directive over, on a unit that
+# also execs a payload living in a cell-user-writable directory.
+refuses 'a SECOND User= (LAST-WINS identity)' "$(doctor usersecond 'User=nobody')" "$T/u20c" 'User= line(s)'
+refuses 'a User= that is not the owner of CELL_HOME' "$(doctor_rw userwrong "s|^User=.*\$|User=nobody|")" "$T/u20d" "is not '"
 # ⛔ `EnvironmentFile=` IS THE SAME HOLE ONE DIRECTIVE OVER: systemd READS the named file and its values
 # OVERRIDE `Environment=`, so it can re-base `CELL_HOME` while the count rule above still sees exactly one
 # assignment and passes. Refused by name, because the rendered pass needs no environment file at all.
@@ -574,6 +601,16 @@ refuses_timer 'a repeating trigger moved into an IGNORED section ([Service])' \
 # in this function can fire (the count rule and the trigger rule both read that section).
 refuses_timer 'a timer with NO [Timer] section at all' \
   "$(doctor_timer_append no-timer-section 's|^\[Timer\]$|[Timers]|' '')" "$T/tu7" 'no [Timer] section'
+# ⛔ AND THE TRIGGER MUST SURVIVE TO THE EFFECTIVE LIST (round-11 review, P1). The rule LATCHED the first
+# non-blank `OnUnitActiveSec=`/`OnCalendar=` and returned success, but `systemd.timer(5)` on both: "If the
+# empty string is assigned to ANY of these options, the list of timers is reset (both monotonic timers and
+# OnCalendar= timers), and all prior assignments will have no effect." So the shipped `OnUnitActiveSec=`
+# followed by an EMPTY `OnCalendar=` DISCARDS it — and `OnBootSec=` with it — and re-adding `OnBootSec=`
+# after the reset leaves a clock that fires once and never again. MEASURED in review: rc=0, "installed".
+# This leg is the difference between "a repeating trigger is WRITTEN" and "the effective list REPEATS";
+# the latch version ACCEPTS it, because it only ever looked for a non-blank line.
+refuses_timer 'the repeating trigger DISCARDED by a later empty OnCalendar= (a LIST RESET)' \
+  "$(doctor_timer_append clock-reset '' '[Timer]\nOnCalendar=\nOnBootSec=3min\n')" "$T/tu8" 'no REPEATING trigger'
 
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
@@ -811,7 +848,7 @@ mk_scoped_systemctl() { # <dir> <state-dir>
     'printf "%s %s\n" "$verb" "$unit" >>"$S/calls.log" 2>/dev/null' \
     'st="$S/$scope-$unit"' \
     'case "$verb" in' \
-    '  is-enabled) [ -f "$st" ] && exit 0 || exit 1 ;;' \
+    '  is-enabled) if [ -f "$st" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;' \
     '  disable) [ -f "$S/$scope-stubborn" ] && exit 0; rm -f "$st"; exit 0 ;;' \
     '  enable) if [ "$unit" = cell-self-pin.timer ] && [ -f "$S/fail-enable-self" ]; then exit 1; fi; : >"$st"; exit 0 ;;' \
     'esac' \
@@ -876,7 +913,7 @@ mk_blind_user_systemctl() { # <dir> <state-dir> — SYSTEM answers; the USER man
     'unit="${1:-}"' \
     'st="$S/system-$unit"' \
     'case "$verb" in' \
-    '  is-enabled) [ -f "$st" ] && exit 0 || exit 1 ;;' \
+    '  is-enabled) if [ -f "$st" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;' \
     '  enable) : >"$st"; exit 0 ;;' \
     '  disable) rm -f "$st"; exit 0 ;;' \
     'esac' \
@@ -1065,6 +1102,26 @@ case "$out" in
   *'second actuator <none>'*) bad "--status printed 'second actuator <none>' while the user manager did NOT answer: $out" ;;
   *'second actuator <UNVERIFIED'*'user'*) ok "--status says UNVERIFIED (naming the scope) when a manager did not answer, instead of 'none'" ;;
   *) bad "--status did not report the unread scope: $out" ;;
+esac
+# ⛔ AND "DID NOT ANSWER" IS NOT A FIXED LIST OF MESSAGES (round-11 review, P1). `scope_state` ended
+# `[ rc -eq 0 ] && enabled || disabled` — a DENY-LIST: any failure spelling not in BUS_UNREACHABLE_PAT fell
+# through to `disabled`, so a manager that said NOTHING was published as "no actuator". systemd's real
+# system-scope wording is exactly such a spelling: `Failed to connect to system scope bus via local
+# transport: No such file or directory` — the words `system scope bus via local transport` sit between
+# `connect to` and `bus`, so `Failed to connect to bus` does not match it. MEASURED before the fix:
+# `--status` printed `second actuator <none>` over an UNREAD scope, the precise false PASS the block above
+# exists to refuse, one failure spelling further out. Polarity is the fix: `disabled` is a CLAIM, so only
+# the manager's own answer words may produce it and everything unrecognised is UNKNOWN.
+mkdir -p "$T/fake-unreadable"
+printf '%s\n' '#!/bin/bash' 'case "$*" in' \
+  '  *is-enabled*) echo "Failed to connect to system scope bus via local transport: No such file or directory" >&2; exit 1 ;;' \
+  'esac' 'exit 0' >"$T/fake-unreadable/systemctl"
+chmod +x "$T/fake-unreadable/systemctl"
+out="$(runat "$TICK" PATH="$T/fake-unreadable:$PATH" bash "$PIN" --status-nofetch 2>&1)"
+case "$out" in
+  *'second actuator <none>'*) bad "--status published 'no actuator' from a manager answer it could not CLASSIFY: $out" ;;
+  *'second actuator <UNVERIFIED'*) ok "--status refuses to call an UNCLASSIFIABLE manager answer 'none' (it says UNVERIFIED)" ;;
+  *) bad "--status did not report the unclassifiable scope: $out" ;;
 esac
 # ⛔ AND THE TICK'S OWN NOTE IS GATED — it is the message the UNATTENDED path prints, and it was the one
 # copy of the claim nothing read (the install read-back and `--status` versions are both gated). Deleting
