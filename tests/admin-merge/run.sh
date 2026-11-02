@@ -4798,13 +4798,20 @@ grep -q "Looked for: runs of 'ci.yml' on main" "$TMP/err" \
 grep -q "the base population is EMPTY" "$TMP/err" \
   && pass "…and states the population is EMPTY (not green)" \
   || fail "the state does not distinguish an EMPTY population from a green one"
-grep -q "1. NAME THE WORKFLOW WHOSE RUNS ON MAIN FORM THE BASELINE" "$TMP/err" \
+grep -q "1. ONE LANE THAT RUNS ON BOTH SIDES" "$TMP/err" \
+  && grep -q -- "--workflow <spanning-lane>" "$TMP/err" \
+  && pass "…remedy 1: ONE lane that runs on both sides (the cheapest correct fix, and the code supports it)" \
+  || fail "the state omits the spanning-lane remedy the default path already implements"
+grep -q "2. TWO LANES" "$TMP/err" \
   && grep -q -- "--baseline-workflow <main-lane>" "$TMP/err" \
-  && pass "…remedy 1: name a --baseline-workflow that DOES run on the base" \
+  && pass "…remedy 2: name a --baseline-workflow that DOES run on the base" \
   || fail "the state does not name the --baseline-workflow remedy"
-grep -q "2. RECORD THAT THIS REPO HAS NO MAIN-SIDE MEASUREMENT" "$TMP/err" \
-  && pass "…remedy 2: record that there is no base-side measurement (the rail cannot judge)" \
+grep -q "3. NO MAIN-SIDE MEASUREMENT AT ALL" "$TMP/err" \
+  && pass "…remedy 3: when no workflow measures main, the rail cannot judge (a decision, not a knob)" \
   || fail "the state pretends there is a measurement when there is none"
+grep -q "There is no third" "$TMP/err" \
+  && fail "the state still asserts an absolute the code contradicts" \
+  || pass "…and no longer claims there is no third option"
 grep -q -- "NOT --any-workflow" "$TMP/err" \
   && pass "…and REFUSES the widening by name, with the measurement that rules it out" \
   || fail "the state does not say why --any-workflow is not an answer"
@@ -4822,6 +4829,10 @@ lane_fail "$HEAD_BL" 7501 > "$SCEN/runs-$HEAD_BL"
 log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-7501"
 # ci.yml is PR-only: EMPTY on main, by construction.
 : > "$SCEN/runs-main.by-workflow.ci.yml"
+# …and the MIRROR of that fixture: the head's ci-main.yml-filtered listing is EMPTY
+# too, so a HEAD-side read that wrongly used the baseline lane would select nothing
+# and block. Nothing else in the suite can see that swap.
+: > "$SCEN/runs-$HEAD_BL.by-workflow.ci-main.yml"
 # …and the NAMED baseline lane measured main, over the min_runs floor, failing
 # the SAME id — which is exactly what the decision needs to exempt it.
 { main_red_n bmain 7502 3 'tests/test_pre.py::test_pre'
@@ -4845,6 +4856,9 @@ grep -q "baseline-workflow" "$TMP/out" \
 grep -q -- "--workflow ci-main.yml" "$SCEN/calls" \
   && pass "…and main's window was filtered by the baseline lane, not the PR's" \
   || fail "main's window was not read through the named baseline lane"
+grep -- '--commit' "$SCEN/calls" | grep -q -- 'ci-main.yml' \
+  && fail "a HEAD-side read used the BASELINE lane — the two directions must not swap" \
+  || pass "…and no head-side (--commit) read used the baseline lane"
 
 # (b2) THE PARITY GATE READS THE SAME BASE LANE. On a CLEAN PR both measured sets
 # are empty, so the vacuous-comparison gate runs — and if it kept asking main's
@@ -4872,10 +4886,18 @@ grep -q "lane parity: PR ⊇ main" "$TMP/out" \
 grep -qF "measured sets: PR failing runs=0 | main failing runs=0 (lanes: PR=ci.yml, main=ci-main.yml)" "$TMP/out" \
   && pass "…and the vacuous body names BOTH lanes instead of mislabelling the base side" \
   || fail "the vacuous body still prints one lane for a two-lane run"
-n="$(grep -c -- '--workflow ci-main.yml' "$SCEN/calls")"
-[ "${n:-0}" -ge 3 ] \
-  && pass "…and the baseline lane served EVERY base-side read (rates, signatures, parity: $n)" \
-  || fail "the baseline lane served only ${n:-0} base-side read(s), so parity still read the PR lane"
+# PER CALL SCOPE, not a bare count: the rate and signature passes alone supply the
+# baseline name, so `grep -c` stayed GREEN with the parity rebind reverted (proven
+# by mutation). What distinguishes the parity read is that a BRANCH-scoped listing
+# carries the baseline and NO branch-scoped listing carries the PR lane.
+n_base="$(grep -- '--branch main' "$SCEN/calls" | grep -c -- '--workflow ci-main.yml')"
+n_base_pr="$(grep -- '--branch main' "$SCEN/calls" | grep -c -- '--workflow ci.yml')"
+[ "${n_base:-0}" -ge 3 ] \
+  && pass "…and the baseline lane served EVERY base-side read (rates, signatures, parity: $n_base branch-scoped calls)" \
+  || fail "only ${n_base:-0} branch-scoped read(s) used the baseline lane, so parity still read the PR lane"
+[ "${n_base_pr:-0}" -eq 0 ] \
+  && pass "…and NO base-side read was filtered by the PR's lane" \
+  || fail "${n_base_pr:-0} base-side read(s) still used the PR lane"
 
 # (b3) A FAILING PARITY REFUSAL NAMES THE LANE THAT WAS READ. When main's window
 # under the BASELINE lane holds no executed job, the refusal is a claim about the
@@ -4922,6 +4944,18 @@ grep -q "a baseline is a NAMED" "$TMP/err" \
 grep -q "187" "$TMP/err" \
   && pass "…with the measurement that makes the widening unusable (187/200 bookkeeping runs)" \
   || fail "the refusal asserts the widening is unusable without the evidence"
+# …AND THE NEAR-MISS SPELLINGS TOO. The case is on a TRIMMED, case-folded value, so
+# whitespace variants are refused pre-gh instead of reaching `gh run list --workflow ''`.
+new_scen sentinelspace
+printf '%s\n' "$HEAD_PR2" > "$SCEN/head"
+for v in ' any' 'ANY ' '  '; do
+  run_admin 42 --workflow ci.yml --baseline-workflow "$v" --dry-run >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 2 ] && pass "…and '${v}' is refused (exit 2), not passed to gh" \
+    || fail "the near-miss baseline value '${v}' was not refused (exit $rc)"
+done
+[ -s "$SCEN/calls" ] && fail "a near-miss sentinel reached gh before being refused" \
+  || pass "…all of them refused BEFORE any gh call"
 [ -s "$SCEN/calls" ] && fail "the refusal made a gh call before refusing" \
   || pass "…and no gh call was made (it is refused before any CI work)"
 
@@ -4987,7 +5021,7 @@ printf '%s\n' "$HEAD_BN" > "$SCEN/head"
 lane_pass "$HEAD_BN" 7904 > "$SCEN/runs-$HEAD_BN"
 : > "$SCEN/runs-main"
 run_admin 42 --any-workflow --dry-run >/dev/null 2>&1
-grep -q "the lane filter was DROPPED for this run (--any-workflow)" "$TMP/err" \
+grep -q "the lane filter was DROPPED for this run (--any-workflow" "$TMP/err" \
   && pass "…and an --any-workflow run says the filter was dropped, not that a flag named a lane" \
   || fail "the note is constant across invocation shapes — a false statement in this one"
 

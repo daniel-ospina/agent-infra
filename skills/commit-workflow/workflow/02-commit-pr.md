@@ -240,8 +240,9 @@ scripts/admin-merge.sh <PR> --squash
 #   non-empty → re-run the PR's failed jobs once (pass-on-retry = flaky, not new)
 #   residual non-empty → BLOCK: prints the list, exits non-zero, does NOT merge
 #
-# Both sides are lane-filtered to the same workflow (default `python-ci.yml`,
-# `--workflow` to override), and the rail BLOCKS unless the lane has actually
+# Both sides are lane-filtered (by default to the SAME workflow — `python-ci.yml`,
+# `--workflow` to move the PR side, `--baseline-workflow` to move the base side
+# independently; see below), and the rail BLOCKS unless the lane has actually
 # TESTED the head — a run that is queued, or one that finished `cancelled`,
 # exercised nothing, so an empty failing set would prove nothing.
 #
@@ -272,7 +273,7 @@ scripts/admin-merge.sh <PR> --squash
 # lane-applicability fallback sets it with no operator flag. It widens the base side
 # to EVERY workflow on main, and that sample is satisfied by runs that measure
 # nothing (measured on main's 200-run window: 187 `Pipeline Compliance` —
-# `issue_comment`, 148 skipped and 38 success — 7 detector, 6 `CI on main`; the
+# `issue_comment`, 148 skipped, 38 success, 1 other — 7 detector, 6 `CI on main`; the
 # widening stopped at width 40 with 11 "measurements" = 8 bookkeeping + 2 detector +
 # 1 code-lane run).
 #
