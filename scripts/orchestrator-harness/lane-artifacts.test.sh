@@ -59,6 +59,13 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   [ "${1:-}" = "--" ] && shift
   label="${vm#vm-}"
   case " $dead " in *" $label "*) echo "Error: The Cloud VM request failed." >&2; exit 1 ;; esac
+  # STUB_SILENT: the channel EXITS 0 AND PRINTS NOTHING — no `__OK__` sentinel, no rows, no error. This is
+  # the one fail-open shape the honesty contract has to survive (an answered-but-empty transport), and it
+  # was reached by NO case until T37: every other dead-box arm exits non-zero and is therefore caught one
+  # check earlier. Measured by review on a mutant: deleting the `first != __OK__` abstention left the suite
+  # at 96/96 while the tool started reporting a confident ABSENT-EVERYWHERE (exit 3) for a box that never
+  # answered. A fixture nothing reaches pins nothing.
+  if [ -n "${STUB_SILENT:-}" ]; then exit 0; fi
   # STUB_DEAD_LOG: let ONLY the `.log` scan fail, so the `ls` verb's second scan can be tested — the
   # reviewer found its failure was silently an empty list at exit 0 because only the `.md` scan was guarded.
   if [ -n "${STUB_DEAD_LOG:-}" ] && [ "${5:-}" != "${5%%.log*}" ]; then
@@ -498,7 +505,9 @@ echo "T26 — the index records the size actually written"
 mkdir -p "$Q/box-c"; printf 'a%.0s' $(seq 1 400) > "$Q/box-c/idxcheck.md"
 out="$Q/out26"; mkdir -p "$out"
 run collect idxcheck --out "$out" >/dev/null 2>&1
-idx_size="$(awk -F"$(printf '\t')" '{print $3}' "$out/.lane-artifacts-index" 2>/dev/null | head -1)"
+# The row is `label<TAB>SIZE<TAB>path` — SIZE is field 2 and the path is field 3-onward (path LAST, so a
+# TAB in a name cannot split the record; see T39).
+idx_size="$(awk -F"$(printf '\t')" '{print $2}' "$out/.lane-artifacts-index" 2>/dev/null | head -1)"
 file_size="$(wc -c < "$out/pi-cell-4-idxcheck.md" 2>/dev/null | tr -d ' ')"
 eq "T26 index size == file size" "${idx_size:-none}" "${file_size:-none}"
 
@@ -622,6 +631,119 @@ if grep -q 'mktemp "${TMPDIR:-/tmp}/la-prev' "$TOOL" && ! grep -q 'prev="/tmp/\.
 else
   bad "T36 the preview uses a fixed /tmp scratch path" "$(grep -n 'la-prev' "$TOOL" | head -3)"
 fi
+
+echo "T37 — a transport that EXITS 0 BUT PRINTS NOTHING is UNMEASURED (exit 4), never absent, and \`ls\` is not an empty healthy inventory"
+# The fail-open arm with no pin: `emit_box`/`show`'s `[ "$first" != "__OK__" ]`. Every other dead-box
+# stub exits non-zero and is caught by the earlier `_src != 0` check, so this branch — the only protection
+# when the channel answers successfully with no payload — was reached by no case and could be deleted with
+# the suite still green (measured by review: 96/96 on that mutant).
+out="$Q/out37"; mkdir -p "$out"
+STUB_SILENT=1; export STUB_SILENT
+run collect ci-cause --out "$out" > "$Q/t37.txt" 2>&1
+rc=$?; unset STUB_SILENT
+eq "T37 collect exit 4 (unmeasured, not absent)" "$rc" "4"
+grep -q 'ABSENT-EVERYWHERE' "$Q/t37.txt" && bad "T37 claimed absent on a silent transport" "$(head -8 "$Q/t37.txt")" \
+  || ok "T37 does not claim absent on a silent transport"
+grep -q 'did not answer' "$Q/t37.txt" && ok "T37 says the exec did not answer" \
+  || bad "T37 does not name the silent transport" "$(head -8 "$Q/t37.txt")"
+[ -f "$out/pi-cell-1-ci-cause.md" ] && bad "T37 wrote an artifact from a silent transport" "$(ls "$out")" \
+  || ok "T37 collected nothing from a silent transport"
+STUB_SILENT=1; export STUB_SILENT
+run ls > "$Q/t37b.txt" 2>&1
+rc=$?; unset STUB_SILENT
+eq "T37 ls exit 4 on a silent transport" "$rc" "4"
+grep -q 'UNMEASURED' "$Q/t37b.txt" && ok "T37 ls says UNMEASURED" || bad "T37 ls rendered an empty inventory" "$(head -8 "$Q/t37b.txt")"
+
+echo "T38 — a FAILED re-run leaves the PREVIOUS collection byte-identical (and no orphan) — the round-7 claim"
+# The head commit claimed "a failed re-run no longer destroys the collection". It was true only for the
+# absent/UNMEASURED path (no rows => no pull). Once a row IS found, `pull` wrote straight at the
+# deterministic destination and unlinked it on EVERY failure path, so the one good copy from run 1 was
+# deleted while `finish` printed "still holds the PREVIOUS collection". The box copy may already be gone
+# after a recycle or a kill, so the orchestrator-side copy IS the durability this tool exists to provide.
+out="$Q/out38"; mkdir -p "$out"
+run collect epic-ledger --out "$out" > "$Q/t38a.txt" 2>&1
+rc=$?
+eq "T38 run 1 (complete) exit 0" "$rc" "0"
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T38 run 1 wrote the artifact" || bad "T38 run 1 wrote nothing" "$(ls "$out")"
+sha1=$(shasum "$out/pi-cell-4-epic-ledger.md" 2>/dev/null | cut -d' ' -f1)
+STUB_TRUNCATE=1; export STUB_TRUNCATE
+run collect epic-ledger --out "$out" > "$Q/t38b.txt" 2>&1
+rc=$?; unset STUB_TRUNCATE
+eq "T38 run 2 (truncated) exit 5" "$rc" "5"
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T38 the previous artifact SURVIVES a failed re-pull" \
+  || bad "T38 a failed re-pull DESTROYED the only copy" "$(ls -a "$out")"
+sha2=$(shasum "$out/pi-cell-4-epic-ledger.md" 2>/dev/null | cut -d' ' -f1)
+eq "T38 the surviving artifact is byte-identical" "$sha2" "$sha1"
+# An orphan: a file this failed run staged and the committed index does not describe.
+for f in "$out"/*; do
+  case "$f" in *.lane-artifacts-index) continue ;; esac
+  grep -qxF "pi-cell-4	$f" "$out/.lane-artifacts-index" 2>/dev/null && continue
+  # Only the pre-existing artifact is legitimate here; anything else is an orphan from the failed run.
+  [ "$(basename "$f")" = "pi-cell-4-epic-ledger.md" ] || bad "T38 orphan left by a failed run" "$f"
+done
+ls -a "$out" | grep -q '^\.la-stage\.' && bad "T38 staging directory leaked" "$(ls -a "$out")" \
+  || ok "T38 no staging directory leaks"
+# A partial run must also not leave a NEW artifact the index does not describe.
+out="$Q/out38b"; mkdir -p "$out"
+run collect p1-10515 --out "$out" > /dev/null 2>&1
+STUB_TRUNCATE=1; export STUB_TRUNCATE
+run collect .md --out "$out" > "$Q/t38c.txt" 2>&1
+rc=$?; unset STUB_TRUNCATE
+eq "T38 partial re-run exit 5" "$rc" "5"
+[ -f "$out/pi-cell-4-p1-10515.md" ] && ok "T38 the pre-existing artifact survives a partial run" \
+  || bad "T38 partial run destroyed the previous collection" "$(ls -a "$out")"
+for f in "$out"/*; do
+  case "$(basename "$f")" in pi-cell-4-p1-10515.md) continue ;; esac
+  bad "T38 orphan from a PARTIAL run" "$f"
+done
+
+echo "T39 — a TAB in a filename does not corrupt the index, and a COMPLETE run still removes a stale artifact"
+# The row was `label<TAB>path<TAB>size` with the path UNESCAPED, so a TAB in the name split it and
+# `cut -f1,2` collapsed two different artifacts onto one key. Measured: after a complete run that
+# collected only the TAB-named file, run 1's ordinary-named artifact SURVIVED — breaking the stale-file
+# invariant T15 pins for every other name, while the index kept misreporting the row.
+mk box-f 'has tab' "$(printf 'has\ttab.md')"
+mk box-f 'has plain' has
+# `cut -f2` must be the SIZE (numeric) and `cut -f3-` the whole path: path LAST, because it is the only
+# field that can contain a TAB.
+export STUB_BOXES="$STUB_BOXES
+f=$Q/box-f"
+out="$Q/out39"; mkdir -p "$out"
+run collect has --out "$out" --box f > "$Q/t39a.txt" 2>&1
+rc=$?
+eq "T39 run 1 exit 0 (both artifacts collected)" "$rc" "0"
+bad_rows=0
+while IFS= read -r row; do
+  [ -n "$row" ] || continue
+  size_field="$(printf '%s' "$row" | cut -f2)"
+  path_field="$(printf '%s' "$row" | cut -f3-)"
+  case "$size_field" in ''|*[!0-9]*) bad_rows=$((bad_rows+1)) ;; esac
+  case "$path_field" in "$Q/box-f/has"|"$Q/box-f/"*"") ;; *) bad_rows=$((bad_rows+1)) ;; esac
+done < "$out/.lane-artifacts-index"
+[ "$bad_rows" -eq 0 ] && ok "T39 every index row has a numeric size and an unsplit path" \
+  || bad "T39 index row was split by the TAB" "$(cat -A "$out/.lane-artifacts-index" | head -3)"
+# The TAB-bearing artifact is the one whose recorded path contains the TAB, and it must be present.
+grep -q "$(printf 'has\ttab.md')" "$out/.lane-artifacts-index" 2>/dev/null \
+  && ok "T39 the index records the TAB-bearing name" \
+  || bad "T39 the TAB-bearing name is missing from the index" "$(cat -A "$out/.lane-artifacts-index")"
+# A COMPLETE run that now collects only the ORDINARY name must delete the stale TAB-named artifact.
+# This is the invariant T15 pins for ordinary names; it silently failed for a TAB name because both
+# rows collapsed onto one key, so the stale file was never recognised as stale.
+rm -f "$Q/box-f/$(printf 'has\ttab.md')"
+run collect has --out "$out" --box f > "$Q/t39b.txt" 2>&1
+rc=$?
+eq "T39 run 2 (complete) exit 0" "$rc" "0"
+if ls "$out" | grep -q "$(printf 'has\ttab')"; then
+  bad "T39 a stale TAB-named artifact survived a COMPLETE run" "$(ls "$out")"
+else
+  ok "T39 a complete run removed the stale artifact it did not collect"
+fi
+[ -f "$out/f-has" ] && ok "T39 the freshly collected artifact is present" \
+  || bad "T39 the run's own artifact is missing" "$(ls "$out")"
+rm -rf "$Q/box-f"
+unset STUB_BOXES; export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"

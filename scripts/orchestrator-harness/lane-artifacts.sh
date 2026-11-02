@@ -373,10 +373,17 @@ emit_box() {
       rm -f "$prev"
     fi
     if [ -n "$outdir" ]; then
-      dest="$outdir/${label}-$(basename "$p")"
+      # ⛔ STAGED, NOT THE DESTINATION. `dest` used to be `$outdir/<label>-<name>` directly, and `pull`
+      # unlinks `$dest` on every failure path (rc!=0, missing in-band length, truncation, decode). So a
+      # failed RE-PULL deleted the only good copy from an earlier run while `finish` printed "still holds
+      # the PREVIOUS collection" — the round-7 claim, false for exactly the case that matters. Writing to
+      # a per-run staging directory keeps the previous collection byte-identical until a run is known
+      # complete, which is what `promote_stage`/`discard_stage` in `finish` enforce.
+      dest="$OUT_STAGE/${label}-$(basename "$p")"
       if pull "$vm" "$p" "$sz" "$dest"; then
         R_PULLED=$((R_PULLED + 1))
-        printf '%s\t%s\t%s\n' "$label" "$p" "${PULL_BYTES:-${sz:-?}}" >> "$IDX_NEW"
+        # label<TAB>SIZE<TAB>path — path LAST, so a TAB inside a filename cannot split the record (#3).
+        printf '%s\t%s\t%s\n' "$label" "${PULL_BYTES:-${sz:-?}}" "$p" >> "$IDX_NEW"
       else
         R_PULLFAIL=$((R_PULLFAIL + 1))
       fi
@@ -395,8 +402,15 @@ commit_index() {
   # label<TAB>path pairs this run recorded. Exact-match, so a caller-supplied label is handled the same
   # way a default one is; the old `pi-cell-*` glob missed any such label and left run 1's file beside
   # run 2's index for any consumer that globs the directory instead of reading the index.
-  new_keys="$(cut -f1,2 "$IDX_NEW" 2>/dev/null)"
-  while IFS="$(printf '\t')" read -r _l p _s; do
+  #
+  # ⛔ THE PATH IS THE LAST FIELD, SO IT MAY CONTAIN A TAB. The row used to be `label<TAB>path<TAB>size`,
+  # and the scan parser was fixed to carry a TAB in a filename (T28) — but the index still split the
+  # path at the TAB, so `cut -f1,2` collapsed two different artifacts onto one key. Measured: after a
+  # complete run that collected only the TAB-named file, run 1's ordinary-named artifact SURVIVED a
+  # "complete" run, breaking the stale-file invariant T15 pins for every other name. Size is the field
+  # in the middle because it can never contain a TAB; the path takes the rest of the line.
+  new_keys="$(awk -F'\t' '{ p=$0; sub(/^[^\t]*\t/,"",p); sub(/^[^\t]*\t/,"",p); print $1 "\t" p }' "$IDX_NEW" 2>/dev/null)"
+  while IFS="$(printf '\t')" read -r _l _s p; do
     [ -n "${p:-}" ] || continue
     _n="$_l-$(basename "$p")"
     # ⛔ A HERE-STRING, NOT A PIPE. `producer | grep -q` is the shape this repo's sigpipe guard exists
@@ -409,15 +423,39 @@ commit_index() {
   mv -f "$IDX_NEW" "$IDX" 2>/dev/null
 }
 
+# promote_stage — move this run's staged artifacts onto their final names. Called ONLY from the
+# exit-0 path, after every requested box answered and every pull succeeded.
+promote_stage() {
+  local f
+  [ -n "${OUT_STAGE:-}" ] || return 0
+  for f in "$OUT_STAGE"/*; do
+    [ -e "$f" ] || continue
+    mv -f "$f" "$outdir"/ || echo "lane-artifacts: could not promote $(basename "$f") into '$outdir'" >&2
+  done
+  rm -rf "$OUT_STAGE" 2>/dev/null
+  OUT_STAGE=""
+}
+
+# discard_stage — throw away everything this run staged. The previous collection is then untouched,
+# byte for byte, AND no orphan arrives that the committed (unpromoted) index does not describe.
+discard_stage() {
+  [ -n "${OUT_STAGE:-}" ] || return 0
+  rm -rf "$OUT_STAGE" 2>/dev/null
+  OUT_STAGE=""
+}
+
 # finish <rc> — the ONE terminal path for `collect`/`logs`: promote the collection on a complete run,
-# discard the side index on any other, and say plainly which collection the directory now holds.
+# discard the side index AND the staged files on any other, and say plainly which collection the
+# directory now holds.
 finish() {
   local rc="$1"
   if [ -n "${outdir:-}" ] && [ -n "${IDX_NEW:-}" ]; then
     if [ "$rc" -eq 0 ] && [ "${R_PULLFAIL:-0}" -eq 0 ]; then
+      promote_stage
       commit_index
     else
       rm -f "$IDX_NEW"
+      discard_stage
       if [ -f "${IDX:-}" ]; then
         echo "ℹ '$outdir' still holds the PREVIOUS collection — this run ended at exit $rc and did NOT replace it"
       fi
@@ -461,6 +499,13 @@ case "$verb" in
       IDX="$outdir/.lane-artifacts-index"
       IDX_NEW="$outdir/.lane-artifacts-index.new"
       : > "$IDX_NEW" 2>/dev/null || { echo "lane-artifacts: --out '$outdir' index is not writable" >&2; exit 64; }
+      # A per-run staging directory INSIDE `$outdir`, so the promotion is a same-filesystem `mv` and a
+      # failed run can be discarded whole — leaving neither a destroyed prior copy nor a new file the
+      # committed index does not describe. Dot-prefixed so a consumer that globs `*` does not see it.
+      OUT_STAGE="$(mktemp -d "$outdir/.la-stage.XXXXXX" 2>/dev/null)" || OUT_STAGE=""
+      if [ -z "$OUT_STAGE" ]; then
+        echo "lane-artifacts: --out '$outdir' cannot create a staging directory" >&2; exit 64
+      fi
     fi
     UNRES_NOTE=""
     [ "${NUNRESOLVED:-0}" -gt 0 ] && UNRES_NOTE=" (+$NUNRESOLVED unresolved label(s):$UNRESOLVED_LABELS)"
