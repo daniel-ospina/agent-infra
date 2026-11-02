@@ -1013,6 +1013,11 @@ if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
   # so the foreign writer is INTERPOSED deterministically: a `git` shim that delegates everything and,
   # after any successful `fetch`, overwrites FETCH_HEAD with main's tip — exactly what the other actor does.
   # Only a decision that reads a ref THIS RUN WROTE can survive it.
+  # ⛔ THE SHIM ALSO SIMULATES A PEER INVOCATION WITH A DIFFERENT `HARNESS_REF` (RACE_OTHER_SRC): it fetches
+  # that OTHER source into `refs/cell-self-pin/fetch`, the single shared destination the cheaper fix used.
+  # A destination keyed by source is untouched by it; a single shared one is clobbered, so the leg below
+  # fails the moment two different questions share one ref — the last-writer-wins skew `HARNESS_REF` makes
+  # reachable on a real box (a manual `--status origin/rel` beside a timer asking about `main`).
   REALGIT="$(command -v git)"
   d_race="$T/fakebin-race"; mkdir -p "$d_race"
   {
@@ -1023,6 +1028,9 @@ if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
     printf '    fp="$("%s" -C "$RACE_REPO" rev-parse --git-path FETCH_HEAD 2>/dev/null)"\n' "$REALGIT"
     printf '    case "$fp" in /*) ;; *) fp="$RACE_REPO/$fp" ;; esac\n'
     printf '    printf "%%s\\t\\tbranch main of a foreign fetch\\n" "$RACE_SHA" >"$fp" 2>/dev/null\n'
+    printf '  fi\n'
+    printf '  if [ "$rc" -eq 0 ] && [ -n "${RACE_REPO:-}" ] && [ -n "${RACE_OTHER_SRC:-}" ]; then\n'
+    printf '    "%s" -C "$RACE_REPO" fetch -q origin "+${RACE_OTHER_SRC}:refs/cell-self-pin/fetch" >/dev/null 2>&1\n' "$REALGIT"
     printf '  fi ;;\n'
     printf 'esac\n'
     printf 'exit $rc\n'
@@ -1041,6 +1049,38 @@ if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
     *'verdict        current'*) bad "a FOREIGN fetch of main greened our layer: --status read FETCH_HEAD, which the other actor in this tree rewrites, and reported 'current' for ${HARNESS_REF:-origin/rel} — a false PASS the timer would print every ten minutes: $out" ;;
     *) if [ "$rc" -eq 1 ]; then ok "a FOREIGN fetch of main cannot green a stale layer — the decision reads the ref THIS RUN wrote, not FETCH_HEAD"
        else bad "with a foreign fetch interposed, --status answered rc=$rc (expected 1=DRIFT for rel at ${RELRACE:-<unreadable>}): $out"; fi ;;
+  esac
+  # ⛔ THE TIMER'S OWN VERB, UNDER THE SAME INTERPOSITION. Every leg above (and the FS race leg above it)
+  # drives `--status`; reverting ONLY `do_pass`'s decision to `'FETCH_HEAD^{commit}'` left this suite green
+  # (MEASURED at the previous head: 238 ok / 0 failed), so the half of the fix that runs on the ten-minute
+  # clock was gated by nothing. Same fixture, same shim, the PASS instead of the status verb.
+  cp -a "$T/home" "$T/home-racep"
+  printf '%s\n' "$T/home-racep/harness/pintree" >"$T/home-racep/.harness-path"
+  git -C "$T/home-racep/harness/pintree" checkout -q --detach "$MAIN2" 2>/dev/null \
+    || bad "could not place the pass-race fixture's record at main's tip"
+  out="$(runat "$T/home-racep" PATH="$d_race:$T/fakebin-none:$PATH" RACE_REPO="$T/home-racep/harness/pintree" \
+           RACE_SHA="$MAIN2" HARNESS_REF=origin/rel bash "$PIN" 2>&1)"; rc=$?
+  case "$out" in
+    *'current'*) bad "the timer's verb read FETCH_HEAD: a foreign fetch of main greened the PASS against a ${HARNESS_REF:-origin/rel} record that is behind — the false PASS this unit exists to prevent, on the verb systemd runs: $out" ;;
+    *) [ "$rc" -ne 0 ] && ok "…and the PASS — the verb the timer runs — is immune to the same foreign fetch, not only --status" \
+         || bad "the PASS reported success while FETCH_HEAD had been rewritten by a foreign fetch (rc=$rc): $out" ;;
+  esac
+  # ⛔ AND ONE SHARED DESTINATION IS NOT OWNED. `HARNESS_REF` is a documented knob, so a manual invocation
+  # asking about `main` can run beside the timer asking about `origin/rel`; with a single destination they
+  # write the SAME ref with DIFFERENT sources and the value is last-writer-wins across runs (measured: a
+  # 12-way concurrent fetch of one refspec gave 8x success — contention serialises and overwrites rather
+  # than failing closed). The shim performs exactly that peer write; a destination keyed by source is
+  # untouched by it, a shared one is clobbered and the tick reports `current` over a stale layer.
+  cp -a "$T/home" "$T/home-keyed"
+  printf '%s\n' "$T/home-keyed/harness/pintree" >"$T/home-keyed/.harness-path"
+  git -C "$T/home-keyed/harness/pintree" checkout -q --detach "$MAIN2" 2>/dev/null \
+    || bad "could not place the keyed-ref fixture's record at main's tip"
+  out="$(runat "$T/home-keyed" PATH="$d_race:$T/fakebin-none:$PATH" RACE_REPO="$T/home-keyed/harness/pintree" \
+           RACE_OTHER_SRC=main HARNESS_REF=origin/rel bash "$PIN" --status 2>&1)"; rc=$?
+  case "$out" in
+    *'verdict        current'*) bad "a PEER invocation asking about 'main' clobbered this run's fetched commit: one shared ref destination is last-writer-wins across invocations, so the tick compared against the wrong tip and greened a stale layer: $out" ;;
+    *) [ "$rc" -eq 1 ] && ok "…and a peer invocation with a DIFFERENT HARNESS_REF cannot overwrite this run's commit — the destination is keyed by source" \
+         || bad "with a peer invocation interposed, --status answered rc=$rc (expected 1=DRIFT for rel at ${RELRACE:-<unreadable>}): $out" ;;
   esac
 else bad "could not push the annotated tag — the peeling legs were not exercised"; fi
 

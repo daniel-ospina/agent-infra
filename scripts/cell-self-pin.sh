@@ -132,10 +132,19 @@ ref_fetch_branch() { # the branch name to fetch for $HARNESS_REF (origin/main ->
 # run `git fetch origin main` in this very repository, and bring-up re-arms `eldato-harness-apply.timer`
 # beside this unit by design, so two actors fetch in one tree. MEASURED: with the record at main's tip, a
 # coexisting `git fetch origin main` made `--status` print a MAIN commit under the label `origin/rel` and
-# answer `current` + exit 0 — a foreign fetch greening a stale layer. A refspec this run writes and no other
-# process names is immune: a foreign `git fetch` cannot reach it. Two writers of THIS ref (two passes in one
-# clone) fail closed on git's ref lock → `fetch-failed` → exit 2, never a false green.
-PIN_FETCH_REF="refs/cell-self-pin/fetch"
+# answer `current` + exit 0 — a foreign fetch greening a stale layer.
+# ⛔ AND THE DESTINATION IS KEYED BY SOURCE, because ONE shared name is not a ref a run owns. `HARNESS_REF`
+# is a documented knob, so a manual `--status` (or the timer) can be asking about `origin/rel` while another
+# invocation asks about `main`; with a single destination the two invocations write the SAME ref with
+# DIFFERENT sources, and the value is last-writer-wins across runs, not owned by either — the same skew the
+# `FETCH_HEAD` bug had, one process further out (measured: a 12-way concurrent fetch of one refspec returned
+# 8x success, so contention mostly serialises and silently overwrites rather than failing closed). Keyed by
+# the source instead, the two writers cannot collide AT ALL, and two runs asking the SAME question write the
+# same commit — contention is idempotent rather than a race.
+PIN_FETCH_REF_BASE="refs/cell-self-pin/fetch"
+pin_fetch_ref() { # <fetch branch> — the run-private destination for ONE source
+  printf '%s-%s\n' "$PIN_FETCH_REF_BASE" "$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+}
 HARNESS="${HARNESS:-}"
 O="${O:-$CELL_HOME/orchestrator}"
 STAMP="$O/.agent-infra-stamp.json"
@@ -277,7 +286,7 @@ mend_record() {
 }
 
 do_pass() {
-  local dry="${1:-}" layer repo sup target applied now rc fetch_branch
+  local dry="${1:-}" layer repo sup target applied now rc fetch_branch fetch_ref
   # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED HERE, ON EVERY TICK, BEFORE ANYTHING ELSE — see
   # `one_actor_check` for why install time cannot be the only reading.
   one_actor_check "$([ "$dry" = dry ] && printf dry || printf apply)"
@@ -297,10 +306,12 @@ do_pass() {
   # unit deliberately declares no `WorkingDirectory=`. This is where that directory is chosen.
   cd "$repo" || loud 2 chdir "cannot enter the resolved layer ${repo}"
   fetch_branch="$(ref_fetch_branch)"
+  fetch_ref="$(pin_fetch_ref "$fetch_branch")"
   # ⛔ ONE FETCH, TWO REFSPECS: the bare one keeps `refs/remotes/origin/<branch>` fresh exactly as before
   # (the `--status-nofetch` reading and every other reader of the tracking ref depend on it), and the second
-  # lands this very fetch in the ref this run owns — see `PIN_FETCH_REF` for why `FETCH_HEAD` is not ours.
-  git fetch -q origin "$fetch_branch" "+${fetch_branch}:${PIN_FETCH_REF}" 2>/dev/null \
+  # lands this very fetch in the run-private ref — see `PIN_FETCH_REF_BASE` for why `FETCH_HEAD` is not ours
+  # and why the destination is keyed by source.
+  git fetch -q origin "$fetch_branch" "+${fetch_branch}:${fetch_ref}" 2>/dev/null \
     || loud 2 fetch-failed "git fetch origin ${fetch_branch} failed in ${repo} — an unreadable ref is never treated as current"
   # ⛔ DECIDE ON THE COMMIT THE FETCH BROUGHT — NOT ON THE KNOB'S SPELLING. `git rev-parse "$HARNESS_REF"`
   # resolves whatever that spelling names LOCALLY, and a fetch of `main` only moves
@@ -309,7 +320,7 @@ do_pass() {
   # symptom through the knob this file documents. The specifier fetched above is the commit the fetch just
   # brought, whatever the spelling, and `^{commit}` peels an annotated tag (comparing a tag OBJECT sha to a
   # commit is a false DRIFT that can never be `current`). MEASURED, both directions, before this line existed.
-  target="$(git rev-parse --verify --quiet "${PIN_FETCH_REF}^{commit}" 2>/dev/null)" \
+  target="$(git rev-parse --verify --quiet "${fetch_ref}^{commit}" 2>/dev/null)" \
     || loud 2 unreadable-ref "${HARNESS_REF} did not resolve to a commit after the fetch in ${repo}"
   applied="$(pinned_head)"
   if [ -z "$applied" ]; then
@@ -389,7 +400,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0 fetch_branch
+  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0 fetch_branch fetch_ref
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -414,7 +425,8 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     case "$mode" in
       nofetch) printf '  (%s NOT fetched — the reading below may be STALE)\n' "$HARNESS_REF" ;;
       *) fetch_branch="$(ref_fetch_branch)"
-         if git -C "$layer" fetch -q origin "$fetch_branch" "+${fetch_branch}:${PIN_FETCH_REF}" 2>/dev/null; then
+         fetch_ref="$(pin_fetch_ref "$fetch_branch")"
+         if git -C "$layer" fetch -q origin "$fetch_branch" "+${fetch_branch}:${fetch_ref}" 2>/dev/null; then
            printf '  (%s fetched just now)\n' "$HARNESS_REF"
          else
            printf '  (git fetch FAILED in %s — the reading below is against an UNREFRESHED local ref; this is not a green)\n' "$layer"
@@ -439,12 +451,13 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # ⛔ AND IN FETCH MODE IT IS THE COMMIT THE FETCH BROUGHT, not the spelling of the knob: a fetch of
     # `main` moves only `refs/remotes/origin/main`, while `git rev-parse main` reads the LOCAL branch the
     # fetch never touched — `current` + exit 0 against a newer remote tip (#3194 through a knob).
-    # ⛔ AND THAT COMMIT IS READ FROM `PIN_FETCH_REF`, the refspec this run wrote — NEVER FROM `FETCH_HEAD`,
-    # which any coexisting fetch in this tree rewrites (see `PIN_FETCH_REF`, and the measured false `current`).
+    # ⛔ AND THAT COMMIT IS READ FROM THE RUN-PRIVATE REF, the refspec this run wrote — NEVER FROM
+    # `FETCH_HEAD`, which any coexisting fetch in this tree rewrites (see `PIN_FETCH_REF_BASE`, and the
+    # measured false `current`).
     if [ "$mode" = nofetch ]; then
       target="$(git -C "$layer" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null)" || target=""
     else
-      target="$(git -C "$layer" rev-parse --verify --quiet "${PIN_FETCH_REF}^{commit}" 2>/dev/null)" || target=""
+      target="$(git -C "$layer" rev-parse --verify --quiet "${fetch_ref}^{commit}" 2>/dev/null)" || target=""
     fi
     if [ -z "$target" ]; then
       printf '  %s <unreadable — does not resolve to a commit>\n' "$HARNESS_REF"
