@@ -4507,7 +4507,7 @@ exclude_root_add() { # <absolute path>
 PIN_ROWS=(); PIN_CENSUS_RC=""; PIN_CENSUS_PIDS=0; PIN_CENSUS_UNREADABLE=0
 PIN_HOLD_PID=""; PIN_HOLD_KIND=""; PIN_HOLD_WHY=""
 pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census could be read at all
-  local proc="${PIN_PROC_ROOT:-/proc}" f pid link path tok seen=0 T=$'\t'
+  local proc="${PIN_PROC_ROOT:-/proc}" f pid link path tok seen=0 T=$'\t' lp_line
   # ⛔ `$'\t'` IS NOT EXPANDED INSIDE DOUBLE QUOTES — measured in review: the row came out as the
   # literal `cwd$'\t'<pid>$'\t'<path>`, so every row failed to split and the guard reported "unheld"
   # for a tree a live process was sitting in (the fix's own bug, caught by the proof run). One TAB
@@ -4553,8 +4553,28 @@ pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census 
       done < "$f/cmdline" 2>/dev/null
     fi
   done
+  # ⛔ NO /proc IS NOT "NOTHING IS LIVE" — and it is also not a licence to go inert. macOS (a platform
+  # this script runs on) has no /proc, and a pin sweep that preserved every tree forever would restore
+  # the per-commit disk leak #1745 exists to stop. `lsof` is the census arm `scripts/lib/live-paths.sh`
+  # already carries for exactly this gap (its own header: "the macOS/container arm falls through to
+  # `lsof` and succeeds"). It reports cwd AND open files, so it covers the fd-255 shape too. This arm
+  # can only ADD evidence — zero rows still fails closed — so it can never cause a removal that the
+  # /proc walk would not have made.
+  if [ "${#PIN_ROWS[@]}" -eq 0 ] && command -v lsof >/dev/null 2>&1; then
+    local lp_pid=""
+    while IFS= read -r lp_line; do
+      case "$lp_line" in
+        p*) lp_pid="${lp_line#p}"; case "$lp_pid" in ''|*[!0-9]*) lp_pid="" ;; esac ;;
+        n*) [ -n "$lp_pid" ] || continue
+            path="${lp_line#n}"; path="${path% (deleted)}"
+            path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
+            case "$path" in /*) PIN_ROWS+=("lsof$T$lp_pid$T$path") ;; esac ;;
+      esac
+    done < <(lsof -n -P -w -F pn 2>/dev/null)
+    [ "${#PIN_ROWS[@]}" -gt 0 ] && PIN_CENSUS_PIDS="$(printf '%s\n' "${PIN_ROWS[@]}" | cut -d"$T" -f2 | sort -u | wc -l | tr -d ' ')"
+  fi
   if [ "${#PIN_ROWS[@]}" -eq 0 ]; then
-    PIN_CENSUS_RC=1; PIN_HOLD_WHY="$proc yielded no readable cwd/fd/exe/argv entry"; return 1
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="$proc yielded no readable cwd/fd/exe/argv entry (and no lsof census)"; return 1
   fi
   PIN_CENSUS_RC=0; PIN_CENSUS_PIDS="$seen"; return 0
 }
