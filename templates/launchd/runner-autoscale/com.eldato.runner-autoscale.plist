@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- eldato runner autoscale, the SAME pass the Linux cells run on a systemd timer (#2403).
+         Scheduled here by scripts/install-runner-autoscale-timer.sh, which renders this file and
+         bootstraps it; ONE install verb, the platform's own scheduler (#2058).
+
+         WHY THIS FILE IS NOT IN templates/launchd/. install-launchd.sh installs EVERY
+         templates/launchd/*.plist with NO arguments and a different substitution set, and
+         pi-bootstrap/setup.sh runs it on every Darwin box. A copy there would render with its
+         placeholders unresolved, be SKIPPED with a warning, and the box would silently have no
+         scheduled pass while the installer printed nothing wrong — the inert-enforcer shape this
+         whole feature exists to remove. The subdirectory keeps it out of that glob and out of
+         templates/launchd/RETIRED (which errors on a label that has both). Same reason
+         templates/launchd/reaper/ and templates/launchd/harness-apply/ exist.
+
+         NO PLACEHOLDER MAY APPEAR INSIDE AN XML COMMENT. This comment is XML text: a doubled dash is
+         forbidden in it, so a placeholder that renders an option flag would make the installed plist
+         not parse, launchd would refuse it, and the box would silently have no pass. That is why this
+         block names placeholders without braces, and why the installer refuses a rendered plist that
+         does not parse.
+
+         WHY THE ENTRY POINT IS THE INTERPRETER ITSELF, NOT bash AND NOT A TCC LAUNCHER. The disk
+         reaper's job needs a checkout's own python to launder a bash script past macOS TCC, because
+         its classes run git against repos under ~/Documents. This pass touches no repo: it reads the
+         runner pool over the GitHub API through gh, counts local listeners under the runner root,
+         and talks to systemctl/launchctl. So there is nothing for TCC to refuse, and the direct
+         interpreter is the honest artifact. gh IS reached over PATH, which is why PATH is exported
+         below rather than inherited.
+
+         NINE MINUTES, matching the systemd timer and the interval the converger renders itself on a
+         cell. The pass is idempotent and cheap when there is nothing to do, and a launchd job that is
+         still running does not get a second instance at the next interval.
+
+         No StandardOutPath/StandardErrorPath: the pass appends its own JSON record under
+         RUNNER_AUTOSCALE_STATE_DIR, and an unbounded launchd-captured log is the symlink-truncation
+         surface the reapers already guard. -->
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PY_BIN}}</string>
+        <string>{{SCRIPT}}</string>
+        <string>--repo</string>
+        <string>{{REPO}}</string>
+        <!-- THE MODE ARGUMENT IS AN ELEMENT OR NOTHING, rendered by the installer. The pass has no
+             "apply" flag: converging is its default and the only switch it accepts is the dry-run one, so
+             an ARMED render omits this element entirely. An empty string element would be handed to the
+             pass as a positional argument and every tick would exit 2 (unrecognized arguments) —
+             measured on pi-cell-1 with a literal apply flag. -->
+{{MODE_ARG}}
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <!-- gh is resolved through PATH by the pass, and a launchd job inherits none of a login
+             shell's rc files, so the installer's PATH is exported verbatim. -->
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <!-- ONE record, one path: the scheduled pass and an operator's status verb read the same
+             file, and the arming record lives beside it. -->
+        <key>RUNNER_AUTOSCALE_STATE_DIR</key>
+        <string>{{STATE_DIR}}</string>
+        <!-- The provisioner pair is rendered ONLY when the install resolved one, for the reason the
+             systemd unit states: the pass can REPAIR and RE-REGISTER without it but can never ADD,
+             because a scheduled pass has no cwd that carries tools/install-ci-runner-x64.sh. It is
+             written as ONE line at column 0: the renderer is sed, and a multi-line replacement is
+             not portable to the BSD sed this installer runs under on the platform that uses THIS
+             file. An empty element here would be worse than none: a variable set to the empty
+             string is not an unset variable. -->
+{{PROVISIONER_ENV}}
+    </dict>
+    <key>StartInterval</key>
+    <integer>{{INTERVAL_SEC}}</integer>
+    <!-- A pass AT LOAD as well as on the interval, so a freshly installed agent has a record within
+         seconds instead of after the first interval. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- A background convergence, never a deadline: it must not compete with a lane for CPU or I/O. -->
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

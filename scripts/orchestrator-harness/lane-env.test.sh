@@ -118,9 +118,10 @@ echo "── A8: an unparseable file is reported as SOURCED WITH ERRORS, never a
 # on a syntax error — that is the honest signal, and it is used here.
 printf 'LANE_CANARY_A="unclosed\nLANE_CANARY_B=b8\n' > "$T/broken.env"
 out="$(logprobe "$T/broken.env")"
-# ⛔ here-strings, never pipes: `grep -q` exits at its first match and the writer takes SIGPIPE
-# (141), which under `pipefail` sends a file that DID report `SOURCED WITH ERRORS` down the
-# `elif`, i.e. a false negative in the assertion (#841/#864, `scripts/check-no-sigpipe-grep.sh`).
+# ⛔ HERE-STRINGS, NOT PIPES INTO A QUIET GREP (#841/#864). Under `pipefail`, `grep -q` exiting at its
+# first match leaves the `printf` writer to take SIGPIPE (141), and the pipeline status becomes non-zero
+# — so a file that DID report `SOURCED WITH ERRORS` falls down the `elif` and the assertions fail a
+# verdict that IS in the output. `scripts/check-no-sigpipe-grep.sh` enforces this shape.
 if grep -q 'SOURCED WITH ERRORS' <<<"$out"; then ok "(A8) an unparseable file reports SOURCED WITH ERRORS"
 elif grep -q 'env: sourced' <<<"$out"; then bad "(A8) an unparseable file was reported as a clean 'sourced': $out"
 else bad "(A8) no verdict at all for an unparseable file: $out"; fi
