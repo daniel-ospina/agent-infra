@@ -405,6 +405,45 @@ refuses 'an ExecStart with an UNRESOLVABLE .. path' "$(doctor_rw execdotnope "s|
 # `${CELL_HOME}/scripts/gone.sh` installed rc=0 and would go 203/EXEC every tick. Parent exists here, so the
 # refusal can only be the identity rule.
 refuses 'an ExecStart naming a payload this run does not place' "$(doctor_rw execother "s|^ExecStart=/bin/bash .*\$|ExecStart=/bin/bash $T/home/scripts/gone.sh|")" "$T/u28" 'this install places the pass at'
+# ── 4d. THE REMAINING DIRECTIVES THAT RESOLVE BEFORE THE PAYLOAD RUNS, AND THE %-SPECIFIER ─────────
+# ⛔ `RootDirectory=` IS NAMED IN THIS FILE'S OWN HEADER as the same "unit that never began" class and was
+# checked NOWHERE. `systemd.exec(5)`: it sets the root directory for executed processes with `pivot_root(2)`
+# or `chroot(2)` — so a path that is not a live-cell invariant is `200/CHDIR` with a different syscall.
+# MEASURED rc=0, unit installed, "ONE actuator" printed.
+refuses 'a RootDirectory= (systemd enters it before the payload)' "$(doctor rootdir 'RootDirectory=/srv/harness-current')" "$T/u29" 'never began'
+# ⛔ AND `%` IS A SPECIFIER, NOT A CHARACTER. Both `Environment=` values and the `ExecStart=` command line
+# are %-specifier-expanded by the manager (`%h` = the manager user's home), so a base that CONTAINS `%` is
+# verified as that literal string and RUNS expanded — the unit's effective CELL_HOME stops being the value
+# the verification approved, while the "equal bases" rule still sees the literal match and passes. rc=0
+# before this rule. The leg makes CELL_HOME itself carry the `%`, so NO OTHER RULE CAN ANSWER FOR IT: every
+# other doctor below would be refused by the base-mismatch rule instead, and the leg would then go green on
+# a rule it never tested (measured: with the `%` arm removed, a doctored value was refused by the WRONG
+# rule). A copy of the pass is placed first, so the refusal is also proved to mutate nothing.
+pcthome="$T/home-pct%h"
+mkdir -p "$pcthome"
+cp "$T/placed.before" "$PLACED"
+out_pct="$(env -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
+  -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
+  -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
+  PATH="$T/fakebin-none:$PATH" CELL_HOME="$pcthome" HOME="$pcthome" \
+  TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-pct" bash "$PIN" --install 2>&1)"; rc_pct=$?
+[ "$rc_pct" -ne 0 ] && ok "REFUSES a %-specifier in a rendered value (systemd would EXPAND it; rc=$rc_pct)" \
+  || bad "a CELL_HOME carrying '%' installed green — systemd expands %-specifiers, so the verified base is not the executed base: $out_pct"
+case "$out_pct" in
+  *'%-specifiers'*) ok "…and says why (%-specifiers: %h is the manager user's home)" ;;
+  *) bad "…but the refusal does not name the specifier expansion: $out_pct" ;;
+esac
+if cmp -s "$T/placed.before" "$PLACED"; then ok "…and that refusal did not replace the already-placed pass"
+else bad "a refused install (%-specifier) REPLACED the placed pass"; cp "$T/placed.before" "$PLACED"; fi
+[ -f "$T/units-pct/cell-self-pin.service" ] && bad "a refused install (%-specifier) still wrote the unit" \
+  || ok "…and it wrote no unit"
+# ⛔ THE SUCCESS VOCABULARY IS 0 *AND* 11, SO BOTH HALVES MUST BE GATED. `SuccessExitStatus=0` alone makes a
+# MENDED record (exit 11) a failed unit — an unhealable RED on a correct box (#3133); `SuccessExitStatus=11`
+# alone makes every converged tick red. The suite claimed "one doctor per rule" while the `must include 0`
+# rule had NO doctor (measured: deleting it left 198 ok / 0 failed), and 11 was only ALLOWED, never required,
+# so a doctor could not tell a missing 11 from a wider list.
+refuses 'a SuccessExitStatus WITHOUT 0 (only 11)' "$(doctor_rw only11 's|^SuccessExitStatus=.*$|SuccessExitStatus=11|')" "$T/u30" 'must include 0'
+refuses 'a SuccessExitStatus WITHOUT 11 (only 0) — a mend would be an unhealable RED' "$(doctor_rw no11 's|^SuccessExitStatus=.*$|SuccessExitStatus=0|')" "$T/u31" 'must include 11'
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
 # `<unit>.service.d/*.conf` OVER it, in both managers, whether the drop-in was written before the unit or
@@ -460,6 +499,15 @@ refuses_dropin 'declares an OnCalendar= (re-schedules the timer)' "$(dropin_doct
 # in the run mentioned the file — the same false PASS one directory over.
 refuses_dropin 'lives in a DASH-TRUNCATED drop-in dir (cell-.service.d)' "$(dropin_doctor dashdir 'WorkingDirectory=/srv/harness-current' 'cell-.service.d')" 'WorkingDirectory='
 refuses_dropin 'lives in the TYPE-LEVEL drop-in dir (service.d)' "$(dropin_doctor typedir 'ConditionPathExists=/srv/nope' 'service.d')" 'ConditionPathExists='
+refuses_dropin 'declares a RootDirectory= (systemd enters it before the payload)' "$(dropin_doctor rootdir 'RootDirectory=/srv/harness-current')" 'never began'
+# ⛔ AND THE TIMER'S DROP-INS ARE A SEPARATE SET, WHICH NOTHING READ. `dropin_dirs` enumerates what systemd
+# merges FOR THE NAME IT IS GIVEN, and `--install` verified only `cell-self-pin.service` — so
+# `cell-self-pin.timer.d/`, `cell-self-.timer.d/`, `timer.d/` and the `/run` + `/usr/lib` copies went unread,
+# and the `Unit=|On*=` arm written for exactly that threat could only ever fire on a SERVICE drop-in, where
+# systemd ignores both keys. MEASURED rc=0: `OnCalendar=` (fires at midnight, not every ten minutes) and
+# `Unit=/bin/true.service` (activates nothing) each installed green and silently — a pin that never runs.
+refuses_dropin 're-schedules the timer, in the TIMER drop-in dir (cell-self-pin.timer.d)' "$(dropin_doctor timerondir 'OnCalendar=*-*-* 00:00:00' 'cell-self-pin.timer.d')" 're-schedules'
+refuses_dropin 're-targets the timer, in the TIMER drop-in dir (Unit=)' "$(dropin_doctor timerunit 'Unit=/bin/true.service' 'cell-self-pin.timer.d')" 're-targets'
 # ⛔ THE NON-VACUITY CONTROL, and it is load-bearing: a drop-in that only sets IDENTITY is the operator's
 # DOCUMENTED remedy for the `User=root` render. Without this leg the gate above could "pass" by refusing
 # every drop-in, which would block the one migration this file recommends.
@@ -503,7 +551,9 @@ fi
 #     `/bin/sh <a path under CELL_HOME>` passes every other rule, so nothing else can answer for it.
 #   · the CELL_HOME environment rule is the only check on `Environment=`;
 #   · the two SuccessExitStatus rules (present; and only 0/11 with 0 included) are the difference between a
-#     RED and a green on every failure this unit exists to surface.
+#     RED and a green on every failure this unit exists to surface. ⛔ AND THAT CLAIM WAS ITSELF HALF-TRUE:
+#     `must include 0` had NO doctor and 11 was only allowed, not required, so the rule could be deleted and
+#     a mend made permanently red without this suite noticing. Both halves now have a doctor (section 4d).
 refuses 'an ExecStart that is not /bin/bash' "$(doctor_rw interp "s|^ExecStart=/bin/bash .*$|ExecStart=/bin/sh $T/home/.pi/agent/scripts/cell-self-pin.sh|")" "$T/u13" "not '/bin/bash'"
 refuses 'a MISSING Environment=CELL_HOME=' "$(doctor_rw nocellhome '/^Environment=CELL_HOME=/d')" "$T/u14" 'Environment=CELL_HOME='
 refuses 'a MISSING SuccessExitStatus=' "$(doctor_rw noexit '/^SuccessExitStatus=/d')" "$T/u15" 'must declare SuccessExitStatus'
@@ -557,6 +607,23 @@ case "$out" in
   *'system manager'*) ok "…and NAMES the system manager it saw" ;;
   *) bad "…but does not name the scope it saw: $out" ;;
 esac
+# ⛔ AND A REFUSED INSTALL MUST MUTATE NOTHING ON *THIS* REFUSAL TOO. Every refusal leg above passes
+# CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 — which switches OFF the duplicate-actuator refusal, the DEFAULT
+# case on this fleet (both timers enabled). So the suite was blind to `place_pass` sitting ABOVE it: an
+# `--install` that exits 1 because a second actor is enabled had already replaced
+# $CELL_HOME/.pi/agent/scripts/cell-self-pin.sh — deployed code no verification ever saw, the class this
+# change exists to remove, reached on the refusal path. No flag here, so this refusal actually runs.
+mk_scoped_systemctl "$T/fake-1sys-dup" "$T/state-1sys-dup"; : >"$T/state-1sys-dup/system-$SHIPPED"
+printf '#!/bin/bash\n# the copy a PREVIOUS install placed — a refusal must not replace these bytes\n' >"$T/dup.before"
+cp "$T/dup.before" "$PLACED"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-dup" PATH="$T/fake-1sys-dup:$PATH" \
+       bash "$PIN" --install 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "a duplicate actuator refuses the install on the DEFAULT path (no override flag)" \
+  || bad "installed beside an enabled eldato-harness-apply.timer with no override (rc=$rc): $out"
+if cmp -s "$T/dup.before" "$PLACED"; then ok "…and that REFUSAL did not replace the already-placed pass (a refused install mutates nothing)"
+else bad "a REFUSED install (duplicate actuator) REPLACED the placed pass before refusing — the installation mutated the box and then said no"; cp "$T/dup.before" "$PLACED"; fi
+[ -f "$T/units-dup/cell-self-pin.service" ] && bad "a refused install (duplicate actuator) still wrote the unit" \
+  || ok "…and it wrote no unit"
 # ── (b) the documented no-sudo fallback: only the USER manager carries it ─────────────────────────
 mk_scoped_systemctl "$T/fake-1user" "$T/state-1user"; : >"$T/state-1user/user-$SHIPPED"
 out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-usr" PATH="$T/fake-1user:$PATH" \
@@ -812,6 +879,34 @@ if git -C "$T/seed" push -q origin main 2>/dev/null; then
   # status verb that reports DRIFT and exits 0 cannot be gated on by anything (#1178's third dialect).
   [ "$rc" -eq 1 ] && ok "…and DRIFT exits 1 (the repo's own 0 match / 1 drift / 2 unknown)" || bad "DRIFT exited $rc, expected 1"
 else bad "could not push a second commit — legs 6-8 not exercised"; fi
+# ── 6b. THE REF THAT IS FETCHED IS THE REF THE DECISION USES ─────────────────────────────────
+# ⛔ `HARNESS_REF` IS A DOCUMENTED KNOB (the file header prints it, and the layer/ref/verb all come from
+# one tree), and BOTH verbs fetched `origin main` while deciding on `$HARNESS_REF`. So for any other value
+# the pass refreshed ONE ref and compared ANOTHER — and `--status` printed "`origin/rel` fetched just now"
+# about a ref it never touched, i.e. the fetch-blindness the surrounding comments say they fixed, one
+# variable over. The layer here has NO local `origin/rel` (it was cloned before the branch existed), so the
+# pre-fix code cannot resolve it at all and the leg discriminates on the resolved SHA, not on wording.
+git -C "$T/seed" checkout -q -B rel main
+git -C "$T/seed" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "a ref the default fetch never refreshes"
+if git -C "$T/seed" push -q origin rel 2>/dev/null; then
+  REL="$(git -C "$T/origin.git" rev-parse rel 2>/dev/null)"
+  printf '%s\n' "$T/home/harness/pintree" >"$T/home/.harness-path"
+  out="$(runat "$T/home" HARNESS_REF=origin/rel bash "$PIN" --status 2>&1)"; rc=$?
+  case "$out" in
+    *"origin/rel $REL"*) ok "--status FETCHES the configured HARNESS_REF, not a hard-coded origin main (the resolved SHA is the one the remote has)" ;;
+    *) bad "--status did not resolve the configured HARNESS_REF 'origin/rel' at ${REL:-<unreadable>} — the fetch target and the decision ref are not the same ref: $out" ;;
+  esac
+  [ "$rc" -eq 1 ] && ok "…and decides on it (DRIFT against the record, exit 1), rather than on main" \
+    || bad "--status decided on a ref other than HARNESS_REF (rc=$rc, expected 1=DRIFT): $out"
+  out="$(runat "$T/home" HARNESS_REF=origin/rel bash "$PIN" 2>&1)"; rc=$?
+  case "$out" in
+    *"target=$REL"*) ok "…and the PASS refreshes and compares the configured ref too (same fetch, same decision)" ;;
+    *) bad "the pass did not act on the configured HARNESS_REF (expected target=$REL): $out" ;;
+  esac
+  [ "$rc" -ne 0 ] && ok "…so a stale record against that ref is a non-zero tick, not a green no-op" \
+    || bad "the pass reported success while its record does not contain the configured ref's tip (rc=$rc): $out"
+  git -C "$T/seed" checkout -q main
+else bad "could not push the 'rel' branch — the HARNESS_REF leg was not exercised"; fi
 
 # ── 7. a FALSE PASS is impossible: `apply` exiting 0 is not a convergence ─────────────────────────
 # ⛔ THE TWO RULES THAT USED TO LIVE HERE OVERLAPPED, SO NEITHER WAS GATED. There was "the record must
