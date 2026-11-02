@@ -99,27 +99,34 @@
 #   * ci.yml — the PR lane's job is `bash-suites`, matrix `shard: [1, 2, …]`, so it PUBLISHES
 #     `bash-suites (1)` … `bash-suites (N)`, one check per slice, and each slice's step is
 #     `run: bash scripts/run-bash-shards.sh`;
-#   * ci-main.yml — "the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job
-#     calls the one runner below, UNSHARDED", and that call is the step
-#     `bash scripts/run-bash-shards.sh`; main publishes ONE check named `script-validate`;
+#   * ci-main.yml — "the main lane runs the SAME sweep as ci.yml's `bash-suites`, and since #3174
+#     it runs it SHARDED the same way — this job calls the one runner below with a SLICE
+#     (`BASH_SHARD_SLICE`)", and that call is the step `bash scripts/run-bash-shards.sh`; main
+#     publishes `script-validate (1)` … `(8)`, one check per SLICE — the same matrix shape as the
+#     PR lane's. ⛔ THE PRE-#3174 CITATION HERE READ "UNSHARDED" AND "main publishes ONE check
+#     named `script-validate`": that is HISTORY now, and the ARM-KEYED map below is what replaced
+#     it. A sharded base that still mapped to the bare name would report a FALSE ABSENCE for every
+#     base-caused red — the one answer this whole block exists to abolish.
 #   * ci.yml — "ci-main.yml's `script-validate`: one runtime for the list, in both lanes",
 #     and "today — ci-main.yml's script-validate job runs bash shards only". ⛔ NOT the block
 #     that is the HISTORY of the pre-#1369 split ("while main's `script-validate` ran the bash
 #     sweeps + the hermetic suites"): it describes a body WIDER than the list, so citing it
 #     here would argue AGAINST the containment this pair rests on (review cycle 3).
-#   So main's ONE check RUNS the same list the PR slices, one shard at a time: the
-#   base reports this program under the other lane's name.
+#   So main's arms RUN the same list the PR slices, one slice at a time: the base reports this
+#   program under the other lane's name, and arm k is the candidate counterpart of arm k.
 #
-# ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
-# `script-validate` job has SEVEN steps: four validation steps (the `node --check` syntax
-# pass, the lane-parity guard, that guard's mutation self-test, and the shard list), the two
-# setup steps (`actions/checkout`, `actions/setup-node`), and the `Materialize origin/main`
-# fetch step added by #3131/#3139 — while a `bash-suites (<n>)` slice runs only the shard
-# list. So a red under that name may be the shard list's red — or ANY other step's,
-# including setup or the fetch. The equivalence therefore establishes that the base RUNS
-# this program and carries A red under its name; it can never establish that the base's red
-# is this suite's. That is why the answer is phrased as a candidate (`base-caused via`) and
-# why the paragraph under it says so out loud.
+# ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Since #3174 a main ARM has
+# FOUR steps: the shard list, the two setup steps (`actions/checkout`, `actions/setup-node`), and
+# the `Materialize origin/main` fetch step added by #3131/#3139 — while a `bash-suites (<n>)` slice
+# runs only the shard list. So a red under an arm's name may be that slice's red — or ANY other
+# step's, including setup or the fetch. The equivalence therefore establishes that the base RUNS
+# this program and carries A red under an arm name; it can never establish that the base's red is
+# this suite's. That is why the answer is phrased as a candidate (`base-caused via`) and why the
+# paragraph under it says so out loud.
+#
+# ⚠️ AND THE `node --check` + GUARD STEPS LEFT THIS JOB IN #3174 — they are the sibling
+# `script-validate-gate` job now (see the `bash-suites-gate` residual above), so this containment
+# argument is SHORTER than it was (4 steps, not 7) rather than merely renumbered.
 #
 # The steps above are NAMED, not line-cited, on purpose: these coordinates had already
 # drifted ~17 lines on main before this PR added its step, and a citation that rots is worse
@@ -1415,16 +1422,14 @@ fetch_run_failed_job_names() {
 # stale the day the matrix widens. A shard number that does not exist cannot appear
 # on any surface, so the un-bounded form cannot manufacture a counterpart.
 #
-# ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
-# `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
-# programs that PR job runs — the lane-parity guard and its mutation self-test — are
-# STEPS inside `script-validate` (named, not line-cited: see the note there). So a
-# `bash-suites-gate` red
-# ALSO has a base counterpart under that name, and this ONE pair does not map it: that
-# refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
-# scoping decision recorded on #2610), NOT a claim that the programs differ. Mapping
-# it would be a second pair with its own fixture, and the brief for this change is
-# explicitly one pair.
+# ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED (STILL OPEN, and #3174 narrowed it
+# without closing it). Main's two guard programs — the lane-parity guard and its mutation self-test —
+# used to be STEPS inside `script-validate`; since #3174 they are a sibling job `script-validate-gate`,
+# so main now DOES publish a base-side red for them. But a PR's `bash-suites-gate` and main's
+# `script-validate-gate` are still TWO DIFFERENT NAMES, and this ONE pair does not map across them: that
+# refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a scoping decision
+# recorded on #2610), NOT a claim that the programs differ. Mapping it would be a second pair with its
+# own fixture, and the brief for this change is explicitly one pair.
 #
 # No exit status is used to mean "no equivalence": an empty stdout is the answer, so a
 # caller can never mistake "not mapped" for a failure of the mapping.
@@ -1437,7 +1442,26 @@ declared_base_equivalent() {
       case "$shard" in
         ''|*[!0-9]*) return 0 ;;
       esac
-      printf '%s\n' 'script-validate'
+      # ⛔ ARM-KEYED SINCE #3174: main's `script-validate` is a MATRIX (`shard: [1..8]`), so it
+      # publishes `script-validate (1)` … `(8)` and NO check named `script-validate` exists any more
+      # — returning the bare name would be the FALSE ABSENCE this whole block exists to abolish.
+      # Both lanes run the SAME derived list under the SAME round-robin rule, so arm k is a
+      # candidate counterpart for arm k, which is strictly MORE precise than the whole-job name it
+      # replaces (it is still a candidate, never an identity — an arm red can be its own slice's or
+      # its setup steps').
+      #
+      # ⚠️ STATED RESIDUAL — BOTH DIRECTIONS OF A WIDTH DIVERGENCE, because they are NOT the same
+      # severity (review cycle 2, P2-5).
+      #   WIDENING (PR wider than main: a PR arm has no base arm): maps to a name the base does not
+      #   publish, so the answer degrades to the pre-#2610 `NO BASE COUNTERPART` — the status quo ante,
+      #   fail-closed, not a new worse state.
+      #   ⛔ NARROWING (main wider than the PR): every PR arm DOES have a base arm, so the map succeeds
+      #   — but arm k is then a DISJOINT set of suites in the two lanes (both use the same `pos % n`
+      #   rule against different n), so the rail would print `base-caused via script-validate (3) ≡
+      #   bash-suites (3)` about two different bodies of work: a false ATTRIBUTION rather than a
+      #   missing one. Nothing pins the two widths equal today; `check-ci-lane-parity.mjs` parses both
+      #   axes and could compare them, which is the follow-up (agent-infra#3233).
+      printf '%s\n' "script-validate (${shard})"
       ;;
   esac
   return 0
@@ -1624,16 +1648,16 @@ named_unattributable_runs() {
             if [ -n "$mapped_kind" ]; then
               say_err "       base: base-caused via ${mapped} ≡ ${name} (${mapped_kind})"
               say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
-              say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
-              say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
-              say_err "       (.github/workflows/ci-main.yml, step 'Bash shards'), and '${name}' is one"
-              say_err "       shard of that same list on a PR (.github/workflows/ci.yml, one runtime in both"
-              say_err "       lanes). The base therefore carries a red under a name that RUNS this list — but"
-              say_err "       that job has SIX other steps (checkout, setup-node, node --check, the lane-parity"
-              say_err "       guard, its self-test, and the origin/main materialization that #3131 added), so the"
-              say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
-              say_err "       an established identity: no identity was produced, so nothing here is"
-              say_err "       comparable yet"
+              say_err "       lanes run ONE list under TWO names, SHARDED THE SAME WAY since #3174 —"
+              say_err "       main's '${mapped}' is one arm of a matrix calling"
+              say_err "       scripts/run-bash-shards.sh with a slice (.github/workflows/ci-main.yml,"
+              say_err "       step 'Bash shards'), and '${name}' is one arm of that same list on a PR"
+              say_err "       (.github/workflows/ci.yml, one runtime in both lanes). The base therefore"
+              say_err "       carries a red under a name that RUNS this list — but that arm also has"
+              say_err "       checkout, setup-node and the origin/main materialization that #3131 added,"
+              say_err "       so the base's red may be this slice's or any of theirs. A CANDIDATE"
+              say_err "       counterpart, not an established identity: no identity was produced, so"
+              say_err "       nothing here is comparable yet"
             elif [ "$mapped_rc" -ne 0 ]; then
               # Same non-empty-wins ordering as the same-name lookup above (cycle 7): a failed
               # lookup must not be narrated as "no counterpart" — that is the false absence.

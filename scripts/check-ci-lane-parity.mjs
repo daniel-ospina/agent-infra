@@ -49,8 +49,14 @@ import { parseWorkflowYaml } from "./workflow-yaml.mjs";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const env = process.env;
 
-const PR_WORKFLOW = env.CI_LANE_PR_WORKFLOW || resolve(ROOT, ".github/workflows/ci.yml");
-const MAIN_WORKFLOW = env.CI_LANE_MAIN_WORKFLOW || resolve(ROOT, ".github/workflows/ci-main.yml");
+// The repo's OWN lane documents. A write to these is a write to the live gate; a fixture (or a
+// mutation of one of these files, copied elsewhere) is audited by the same assertions but is not the
+// live document — see the self-test absence rule in checkLane.
+const DEFAULT_PR_WORKFLOW = resolve(ROOT, ".github/workflows/ci.yml");
+const DEFAULT_MAIN_WORKFLOW = resolve(ROOT, ".github/workflows/ci-main.yml");
+
+const PR_WORKFLOW = env.CI_LANE_PR_WORKFLOW || DEFAULT_PR_WORKFLOW;
+const MAIN_WORKFLOW = env.CI_LANE_MAIN_WORKFLOW || DEFAULT_MAIN_WORKFLOW;
 const PR_JOB = env.CI_LANE_PR_JOB || "bash-suites";
 const MAIN_JOB = env.CI_LANE_MAIN_JOB || "script-validate";
 const RUNNER = env.CI_LANE_RUNNER || "scripts/run-bash-shards.sh";
@@ -279,6 +285,51 @@ function checkLane(label, workflowFile, jobName) {
     note(`   ✅ ${label}: job '${id}' runs the guard and is unconditional and blocking`);
   }
 
+  // ⛔ AND THE GUARD **AND ITS SELF-TEST** MUST STILL BE THERE (#3174 review, measured). The walk
+  // above is NAME-FREE on purpose so a synthetic fixture is not refused for lacking a job NAME — but
+  // that also means a document carrying the shard call and NO guard step was GREEN: a copy of
+  // ci-main.yml with the whole `script-validate-gate` job DELETED exited 0, i.e. the job that runs the
+  // gate could be removed while every assertion in this file still passed.
+  // ⛔ THEY ARE COUNTED SEPARATELY, because they are two different programs: deleting only the
+  // MUTATION SELF-TEST step from BOTH lanes also exited 0 (review cycle 2, mutation E) — and
+  // `tests/ci-lane-parity/run.sh` declares `# shard: off` precisely BECAUSE a dedicated step runs it,
+  // so once that step is gone the suite that kills guard mutants executes NOWHERE.
+  const callsRunner = stepRuns(job).some((v) =>
+    logicalLines(v).some((l) => l.includes(RUNNER))
+  );
+  if (callsRunner) {
+    const runsGuard = guardMentioning.some(([, jj]) =>
+      (jj.steps || []).some((s) => typeof s?.run === "string" && s.run.includes("check-ci-lane-parity"))
+    );
+    const runsSelfTest = guardMentioning.some(([, jj]) =>
+      (jj.steps || []).some((s) => typeof s?.run === "string" && s.run.includes("ci-lane-parity/run.sh"))
+    );
+    if (!runsGuard) {
+      refuse(
+        `${label}: ${file} calls ${RUNNER} but NO job runs the lane-parity guard itself (\`check-ci-lane-parity\`) — the gate is not running on the lane it guards, and every other assertion in this file would stay green; exiting 2`
+      );
+    }
+    // ⛔ THE SELF-TEST IS THE PROGRAM THAT KILLS THIS GUARD'S MUTANTS, and `tests/ci-lane-parity/run.sh`
+    // declares `# shard: off` BECAUSE a dedicated step runs it — so deleting that one step makes the
+    // suite that catches a gutted guard execute NOWHERE. Measured (review cycle 2, mutation E):
+    // deleting it from BOTH lanes exited 0.
+    // It is required only when auditing the repo's OWN workflow: the suite builds most fixtures by
+    // line-filtering the real files, so a mutation aimed at the CALL SITE can legitimately drop this
+    // step, and demanding it from those copies would red the fixture rather than the property. The
+    // failing direction therefore has no arm in this suite, stated here rather than implied — the
+    // LIVE arm exercises the passing direction against the real file.
+    const isLive =
+      workflowFile === (label === "PR" ? DEFAULT_PR_WORKFLOW : DEFAULT_MAIN_WORKFLOW);
+    if (isLive && !runsSelfTest) {
+      refuse(
+        `${label}: ${file} calls ${RUNNER} but NO job runs its MUTATION SELF-TEST (\`tests/ci-lane-parity/run.sh\`) — that suite declares '# shard: off' because this step is what runs it, so deleting the step leaves the program that kills guard mutants executing nowhere; exiting 2`
+      );
+    }
+    note(
+      `   ✅ ${label}: the runner's lane also runs the guard${isLive ? " AND its mutation self-test" : ""}`
+    );
+  }
+
   // THE CALL SITE. The step's `run` value must BE the bare call — ONE logical line, exactly it.
   // A value carrying extra lines (a folded scalar, a script with other commands, a heredoc body)
   // is a MENTION, not the call: refused rather than counted, because only a bare call's exit code
@@ -373,8 +424,123 @@ function checkRunner() {
   return { shards: shards.length, globs: globs.length };
 }
 
+/**
+ * STEP-vs-JOB BOUNDS, AND MATRIX MEMBERSHIP — the two ways a sliced job reads GREEN over a hole.
+ *
+ * ⛔ A JOB-LEVEL `jobs.<id>.timeout-minutes` trip is reported `cancelled`, which this repo's rail
+ * reads NON-RED (`scripts/admin-merge.sh` NON_RED_CONC); a STEP-level trip is `failure` = red. So a
+ * job whose bound sits AT OR BELOW the sum of its own step bounds lets the non-red conclusion win the
+ * race — the fail-open both lanes' bound comments exist to close. Not hypothetical: measured on this
+ * tree at #3174's review, `bash32-parse-guard` (ci-main.yml) and `bash32-parse` (ci.yml) both carried
+ * a 10 min JOB bound over 10 + 5 + 5 = 20 min of steps, and nothing anywhere reddened it. For those
+ * two jobs the consequence is specific and bad: the rail reads the trip as non-red AND
+ * `auto-file-on-failure` is `if: failure()`, which does not fire for a `cancelled` need — so the
+ * 3.2 red signal could go quiet with no red and no filed issue.
+ *
+ * ⛔ AND A MATRIX IS A COVERAGE CLAIM THE RUNNER CANNOT CHECK. `BASH_SHARD_SLICE` is `<index>/<count>`
+ * with count = `strategy.job-total`, so the axis must be exactly 1..N and DISTINCT: an axis of
+ * `[1,1,2,…,7]` leaves slice 8 run by NOBODY while every arm still passes its own set assertion
+ * (each process only knows its own index). Measured: `[1,1,2,3,4,5,6,7]` was accepted before this.
+ */
+function checkBounds(label, workflowFile) {
+  const wf = parse(workflowFile);
+  const file = base(workflowFile);
+  const jobs = (wf && wf.jobs) || {};
+  for (const [id, j] of Object.entries(jobs)) {
+    if (!j || typeof j !== "object" || Array.isArray(j)) continue;
+    const steps = Array.isArray(j.steps) ? j.steps : [];
+    const callsRunner = steps.some(
+      (s) => s && typeof s === "object" && typeof s.run === "string" && s.run.includes(RUNNER)
+    );
+    const sliceStep = steps.find(
+      (s) =>
+        s &&
+        typeof s === "object" &&
+        s.env &&
+        typeof s.env === "object" &&
+        !Array.isArray(s.env) &&
+        Object.prototype.hasOwnProperty.call(s.env, "BASH_SHARD_SLICE")
+    );
+
+    // ── THE JOB BOUND, WHEN ONE IS DECLARED ────────────────────────────────────────────────
+    if (Object.prototype.hasOwnProperty.call(j, "timeout-minutes")) {
+      const raw = j["timeout-minutes"];
+      const jobBound = Number(raw);
+      if (!Number.isFinite(jobBound)) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares a non-numeric timeout-minutes (${JSON.stringify(raw)}) — a bound this guard cannot evaluate is not a bound, and the file's own doctrine is that a workflow this guard cannot read is not a pass; exiting 2`
+        );
+      }
+      // ⛔ EVERY STEP OF A BOUNDED JOB MUST CARRY ITS OWN BOUND. Deleting ONE step bound is the
+      // cheapest way to re-open this whole class: the hang then trips the JOB bound, which is
+      // `cancelled` = NON-RED to the rail, and `auto-file-on-failure` is `if: failure()` so nothing
+      // is even filed. Measured (review cycle 2, mutation A): deleting the shard step's
+      // `timeout-minutes` from this very job left the guard GREEN — and that step is now main's
+      // ONLY red-producing bound, since #3174 removed BASH_SHARDS_BUDGET_SECS.
+      const unbounded = steps
+        .map((s, i) => [i, s])
+        .filter(([, s]) => !s || typeof s !== "object" || !Number.isFinite(Number(s["timeout-minutes"])))
+        .map(([i, s]) => {
+          const what = s && typeof s === "object" ? s.name || s.uses || "(unnamed)" : "(not a mapping)";
+          return `#${i + 1} ${what}`;
+        });
+      if (unbounded.length > 0) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares timeout-minutes ${jobBound} but step(s) ${unbounded.join(
+            ", "
+          )} carry NO finite step bound — a hang in one of them trips the JOB bound, reported 'cancelled' and read NON-RED, so the gate goes quiet instead of red; exiting 2`
+        );
+      }
+      const stepBounds = steps.map((s) => Number(s["timeout-minutes"]));
+      const sum = stepBounds.reduce((a, b) => a + b, 0);
+      if (jobBound <= sum) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares timeout-minutes ${jobBound} but its steps bound ${sum} min in total (${stepBounds.join(" + ")}) — a job-level trip is reported 'cancelled', which the merge rail reads NON-RED, so the non-red conclusion can pre-empt the red step that actually hung; exiting 2`
+        );
+      }
+    }
+
+    // ── THE SLICE EXPRESSION AND THE AXIS IT FEEDS ────────────────────────────────────────
+    // The axis alone is NOT the coverage claim: `BASH_SHARD_SLICE` is `<index>/<count>` and the
+    // runner TRUSTS `count` (it only refuses count > listed). So a stale `/12` over an 8-wide matrix
+    // leaves 4/12 of the list run by nobody while every arm still passes its own reconciliation
+    // (measured, review cycle 2 mutation D → the guard stayed green). The denominator must be
+    // GitHub's own count, which is the only spelling that cannot go stale.
+    if (sliceStep) {
+      const v = String(sliceStep.env.BASH_SHARD_SLICE);
+      if (!v.includes("strategy.job-total")) {
+        refuse(
+          `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE to ${JSON.stringify(
+            v
+          )} — the denominator must be strategy.job-total, GitHub's own count of this matrix, or a widened/narrowed matrix leaves slices NO arm runs while every arm still passes its own set assertion; exiting 2`
+        );
+      }
+    }
+
+    // A matrix is not automatically a SLICE: only a job that feeds the runner is audited here, so an
+    // unrelated 0-indexed `shard:` axis elsewhere is not refused by a rule it has nothing to do with
+    // (review cycle 2, P2-4).
+    const axis = j.strategy && j.strategy.matrix && j.strategy.matrix.shard;
+    if (Array.isArray(axis) && (callsRunner || sliceStep)) {
+      const nums = axis.map((v) => Number(v));
+      const want = Array.from({ length: axis.length }, (_, i) => i + 1);
+      const sorted = [...nums].sort((a, b) => a - b);
+      const okSet = sorted.every((v, i) => v === want[i]);
+      if (!okSet) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares matrix 'shard: [${axis.join(
+            ", "
+          )}]' — the axis must be exactly 1..${axis.length}, distinct: BASH_SHARD_SLICE's denominator is strategy.job-total, so a duplicate or a gap leaves a slice that NO arm runs while every arm still passes its own set assertion; exiting 2`
+        );
+      }
+    }
+  }
+}
+
 const prCount = checkLane("PR", PR_WORKFLOW, PR_JOB);
 const mainCount = checkLane("main", MAIN_WORKFLOW, MAIN_JOB);
+checkBounds("PR", PR_WORKFLOW);
+checkBounds("main", MAIN_WORKFLOW);
 const { shards, globs } = checkRunner();
 
 if (rc === 0 && prCount >= 1 && mainCount >= 1) {
