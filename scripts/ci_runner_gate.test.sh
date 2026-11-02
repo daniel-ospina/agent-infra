@@ -466,6 +466,12 @@ PYDROP
     export CI_GATE_STATE_DIR="$STATE_DIR"
     export CI_GATE_REPO="test-org/test-repo"
     export CI_GATE_QUEUE_THRESHOLD="$GH_THRESHOLD_DEFAULT"
+    # ⛔ THE ARM BUDGET IS PINNED HERE SO THE PRE-EXISTING ARMS KEEP TESTING WHAT THEY WERE WRITTEN TO
+    # TEST. The 2-runner fixture pools below predate the budget and assert that BOTH runners get
+    # labelled; with the shipped default of 1 the second is now (correctly) skipped, so those arms would
+    # silently become budget tests. `2` is NON-BINDING for a 2-runner pool, and the budget's own
+    # behaviour is pinned by its own arm (`arm-budget`).
+    export CI_GATE_ARM_MAX="${GH_ARM_MAX:-2}"
     # The disengage streak is a PRODUCTION default of 3 (agent-infra#3060): one hostile reading must
     # not strip the label the queue is using. Arms that are not about the streak keep the immediate
     # semantics, or they would all be asserting the same counter; the streak has its own section,
@@ -973,6 +979,19 @@ run_gate relabel-empty GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS= CI_GA
 assert_eq "$RC" "0" "a successful EMPTY enumeration exits 0 (a readable zero is not a failed read)"
 assert_contains "$OUT" "set_labels ok=0 fail=0" "empty pool counts zero relabels, not a swallow"
 assert_not_contains "$OUT" "WARNING" "empty pool raises no enumeration warning"
+
+echo "── ARM BUDGET (owner ruling 2026-11-02): the fallback labels AT MOST CI_GATE_ARM_MAX runners ──"
+# A 2-runner pool with a budget of 1 MUST yield one carrier, and must SAY which runner it left out — the
+# failure this pins is an arm that quietly becomes smaller than the operator believes (an offline or
+# skipped runner with no line in the log is indistinguishable from a pool that engaged fully).
+run_gate arm-budget GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="101 102" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_ARM_MAX=1 --
+assert_contains "$OUT" "set_labels ok=1 fail=0" "the arm budget stops engagement at ONE carrier"
+assert_contains "$OUT" "set_labels STRIP runner=102" "the runner the budget left out is NAMED and STRIPPED, not silently dropped"
+assert_contains "$OUT" "arm_max=1 armed=1 skipped=1" "the summary reports the budget and what it skipped"
+assert_contains "$(cat "$GH_LOG")" "PUT 101" "the carrier is the first managed runner"
+assert_not_contains "$(put_body_for 102)" "ubuntu-latest" "the write the runner past the budget received STRIPS the label instead of adding it"
+assert_contains "$OUT" "stripped=1" "the strip is counted in the summary, so an over-budget carrier cannot hide"
 
 # ⛔ A PARTIAL relabel must be RETRIED, not silently recorded (review B2-3). Run 1 fails one PUT, so
 # it exits 2 without advancing state — correct. But one runner now carries the label, so the next

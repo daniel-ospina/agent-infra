@@ -14,6 +14,14 @@
 #   is the FALLBACK: when GitHub-hosted is unhealthy it re-adds `ubuntu-latest` to the
 #   pool so the same workflows can land locally instead of queueing forever.
 #
+# ⛔ THE CONTENTION WARNING ABOVE IS NARROWED, NEVER DELETED (owner ruling 2026-11-02). The pool is
+#   still fallback-only — it is offered only while GitHub-hosted is over its queue threshold, never as
+#   a default routing target — but "fallback-only" is no longer "all nine runners at once". `ARM_MAX`
+#   (below) caps how many runners the gate will actually label, so the number of CI jobs that can run
+#   on this box at the same time is bounded by a declared number rather than by the pool's size. The
+#   FalkorDB/pytest crash named above is the reason that bound exists and the reason raising it needs
+#   an OBSERVABLE, not an opinion: see the `ARM_MAX` comment for the reading that would justify it.
+#
 # ⛔ THE FALLBACK-ONLY DECISION ABOVE IS UNCHANGED (agent-infra#2327 did not touch it). The pool
 #   serves CI only while GitHub-hosted is unhealthy — the arch fix below changes WHICH LABEL each
 #   runner accepts, never WHEN the pool is offered to the queue. When the pool gained a second
@@ -74,7 +82,25 @@ LOG_FILE="$STATE_DIR/ci-runner-gate.log"
 # diagnostic is not a measurement: stdout is read as data, stderr goes here and is quoted only when the
 # call FAILED.
 GH_ERR="$STATE_DIR/ci-runner-gate.gh.err"
-QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted backlog
+# ── WHEN the pool is offered: the queue length that makes GitHub-hosted "unhealthy" ──────────
+# ⚠️ THIS VALUE IS NOT A CAPACITY NUMBER — IT IS A THRESHOLD OWNER-RULED ON 2026-11-02.
+# The default was 60. Owner ruling, 2026-11-02: **10** — "the idle pool should take
+# `ubuntu-latest` work whenever the queue is above 10". The reason the old number was wrong was
+# not arithmetic, it was a MODEL error: the queue is not evidence that this box is saturated, it is
+# evidence that the HOSTED pool is. Owner pays Pro, whose documented ceiling is **40 concurrent
+# GitHub-HOSTED jobs** (`docs.github.com/actions/reference/limits` — the 20/40/60/500 table is
+# titled "Job concurrency limits for GitHub-hosted runners", and self-hosted runners do NOT
+# consume it). `python-ci` fans out to ~26 jobs from ONE run, so two such runs consume most of the
+# 40 slots and everything else waits — measured 2026-11-02: tortoise 1 running / 47 queued,
+# agent-infra 7 running / 13 queued, i.e. 8 runs executing against 60 queued. Against a 40-slot
+# ceiling a 60-deep threshold could never fire, so the fallback was unreachable by construction:
+# we sat at 38-59 queued all night and never crossed it. 10 is chosen so that the pool is offered
+# once the hosted pool is demonstrably over-subscribed, and it is deliberately NOT derived from this
+# box's own capacity.
+# ⛔ RAISING THIS BACK TO 60 (or to "the queue is 56, so 60 is fine") IS A REOPEN OF THE RULING, not
+# a tuning change — the ruling is recorded on daniel-ospina/tortoise#9878. The blast radius is
+# bounded independently of this number by `ARM_MAX` below, which is why a lower threshold is safe.
+QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"   # queued runs = GitHub-hosted backlog
 # The runs endpoint's maximum page size, and therefore the deepest queue one read can measure. The
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
 # turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
@@ -154,6 +180,53 @@ BLIND_ALARM_EVERY_S="${CI_GATE_BLIND_ALARM_EVERY_S:-1800}"
 MODE_INFER_RUNS="${CI_GATE_MODE_INFER_RUNS:-3}"
 # The custom label that makes a job land on the LOCAL pool.
 FALLBACK_LABEL="ubuntu-latest"
+# ── HOW MANY runners may carry the fallback label at once — the containment knob ───────────────
+# ⛔ WHY THIS IS NOT 9 (the pool's size as measured 2026-11-02: 12 registrations, 9 idle x64).
+# GitHub hands a job to ONE online+idle runner and a runner executes ONE job at a time, so the
+# number of runners carrying `ubuntu-latest` IS the maximum number of CI jobs that can run on this
+# box simultaneously — the arm count is the concurrency cap, and there is no per-runner "max jobs"
+# setting to reach for instead. The pool exists fallback-only because jobs landing here compete with
+# the pi fleet and the Tortoise graph on the SAME host (a local pytest run crashed FalkorDB at
+# src/reply.rs:655, 178 restarts, 2026-10-12 — see the header). Arming every idle runner at once
+# converts one queue problem into a host-contention problem with no reading to catch it; arming 2
+# adds two concurrent CI jobs to the box and leaves the fleet's own headroom intact.
+# ⛔ RAISE IT ON AN OBSERVABLE, NOT ON A QUEUE NUMBER — the queue is evidence about HOSTED, not about
+# this box (that conflation is what the 60 threshold got wrong). Raise it when, for a sustained
+# period with the arm at its current value: (a) host load average stays below the fleet's ~12-lane
+# policy with room to spare (`docs/ops/load-policy.md`, `/usr/bin/uptime`), (b) the Tortoise graph
+# logs NO new FalkorDB restart (`docker inspect --format '{{.RestartCount}}' falkordb`, and the
+# restart lines in the graph container's log), and (c) the gate's own verdict file shows the armed
+# runners BUSY rather than idle (`--status` → `online_busy`), i.e. the arm is the binding limit. Any
+# ONE of those going the wrong way is a reason to lower it, not to argue with the number.
+# ⛔ WHY THIS SHIPS AT 1 AND NOT AT 2-3 (the "bounded subset" this change was dispatched with). MEASURED
+# on this box at the moment of the change, 2026-11-02T04:04Z, BEFORE engaging anything:
+#   load average 225.62 / 126.51 / 66.51 (1/5/15 min) on 10 CPUs — ~22 per CPU, and roughly 19x the
+#   fleet's ~12-lane concurrency policy — with 10 of the 12 pool runners already BUSY (they serve this
+#   repo's `ubuntu-24.04` mitigation, not this gate's label) and FalkorDB at restarts=0.
+# So the box is not idle-by-surplus: it is already saturated by CI that this gate did not route. The
+# ruling being implemented is "offer the pool above a queue of 10", and 1 carrier satisfies it. Adding
+# a SECOND concurrent CI job on top of a load of 225 is the marginal action that could turn the
+# recorded failure (a pytest run crashing FalkorDB, 178 restarts, 2026-10-12) into a repeat, and the
+# whole point of this knob is that such a step needs a reading, not a target. 2 is the next step, not
+# the first one: take it when the readings above are green, and change this default in its own commit
+# so the move is visible.
+ARM_MAX="${CI_GATE_ARM_MAX:-1}"
+ARM_MAX_INVALID=0
+# ⛔ THE SAME RANGE BOUND EVERY OTHER NUMERIC OPERAND HERE CARRIES: digits only, <=9 digits (beyond
+# that `[ -ge ]` wraps and an errored comparison reads FALSE), and at least 1 — an arm budget of 0
+# would leave the fallback engaged with no carrier, which `set_labels`' verification reports as a
+# rejection while the state file records a transition. An unreadable value is FAIL-CLOSED: no label
+# is changed at all (see `set_labels`), never silently "2" on a value that was never read.
+case "$ARM_MAX" in
+  ''|*[!0-9]*) ARM_MAX_INVALID=1 ;;
+  *) [ "${#ARM_MAX}" -gt 9 ] && ARM_MAX_INVALID=1
+     [ "$ARM_MAX" -lt 1 ] && ARM_MAX_INVALID=1 ;;
+esac
+# ⛔ AN OFFLINE REGISTRATION IS NOT CAPACITY, and arming one spends the budget for nothing: GitHub
+# hands a job only to an online+idle runner. So the arm selection skips offline registrations and
+# reports what it skipped — measured 2026-11-02 on the live pool, enumeration order put an OFFLINE
+# runner (`pi-runner-cmux-x64-5`) second, so a naive "first N" arm would have delivered 1 carrier for
+# a budget of 2 with nothing in the output saying so.
 # ⛔ THERE IS NO LONGER A SINGLE "pool label" (agent-infra#2327). The pool holds two
 # architectures, and each runner carries the marker for ITS OWN: `ARM64` runners keep
 # `self-hosted-arm64`, `X64` runners keep `self-hosted-x64`. Writing one pool-wide body to every
@@ -685,7 +758,7 @@ print(age)
   # it cannot run before `queued` has been shape-checked as a number.
   if [ "$queued" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
 
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S arm_max=$ARM_MAX"
   ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
 
   # ⛔ SHAPE-CHECK THE COUNT TOO (agent-infra#1704). `comp` was shape-checked; `queued` was not, so
@@ -861,9 +934,19 @@ print(age)
 # (agent-infra#2327), so the read has to carry each runner's own labels. TAB is the delimiter
 # because a runner label cannot contain one, so `id<TAB>label` can never be ambiguous; and a
 # newline-separated pair list keeps every field checkable on its own line, unlike a joined string.
+# ⛔ THE THIRD FIELD (`status`) IS OPTIONAL AND IS NOT A LABEL — it exists so the ARM BUDGET can skip
+# registrations that cannot take a job (see ARM_MAX). A row stream that carries only `<id>TAB<label>`
+# is still readable: an absent status is "unknown", which arms the runner exactly as before, so this
+# stays backward-compatible with every caller and fixture that predates it.
+# ⛔ THE SPELLING IS `.["status"]`, NOT `.status` — deliberately. The suite's gh double tells this read
+# (a per-runner ROW stream) from the CAPACITY CENSUS read (a per-runner state summary) by the tokens
+# in the program it is handed, and `.status` is the census's marker: spelled that way here, the double
+# answered this row read with census bodies (no `id` field), every id came back `null`, and the whole
+# pool was refused as `runner enumeration unreadable` — measured, 120 suite failures. The two reads ask
+# different questions and must stay distinguishable by the program text.
 runner_rows() {
   gh api --paginate "repos/$REPO/actions/runners" \
-    --jq '.runners[] | .id as $id | .labels[] | "\($id)\t\(.name)"'
+    --jq '.runners[] | .id as $id | .["status"] as $st | .labels[] | "\($id)\t\(.name)\t\($st)"'
 }
 
 # managed_ids <rows> — the runners this gate owns: those carrying a pool marker.
@@ -873,9 +956,15 @@ runner_rows() {
 # carrying neither marker is not ours to relabel, and leaving it untouched is the conservative
 # reading. (A runner the legacy gate already stamped ARM64 onto carries a marker, so this still
 # selects it and the derivation below repairs it.)
-managed_ids() { # $1 = rows (newline-separated `<id>TAB<label>`)
-  local rid name
-  while IFS=$'\t' read -r rid name; do
+managed_ids() { # $1 = rows (newline-separated `<id>TAB<label>[TAB<status>]`)
+  # ⛔ THE THIRD FIELD MUST BE CONSUMED HERE. With two read variables bash puts the REMAINDER,
+  # delimiter included, into `name` — `self-hosted-x64<TAB>offline` — which matches neither pool
+  # marker, so this function returned NOTHING for the 3-field stream `runner_rows` now emits: the
+  # gate wrote no label on ENGAGE and stripped none on DISENGAGE, the verify step never ran (its
+  # list was empty), and the state file still recorded the transition. Measured by review: 0 PUTs
+  # in both directions, `TRANSITION unknown -> local`, rc 0.
+  local rid name rest
+  while IFS=$'\t' read -r rid name rest; do
     case "$name" in
       "$POOL_LABEL_ARM64"|"$POOL_LABEL_X64") printf '%s\n' "$rid" ;;
     esac
@@ -900,7 +989,8 @@ managed_ids() { # $1 = rows (newline-separated `<id>TAB<label>`)
 # (what the old code stamped) is NOT consulted — the host label wins, so a stamped runner heals.
 labels_for() { # $1 = rows, $2 = runner id, $3 = on|off
   local rows="$1" id="$2" eng="$3" rid name arch="" extra="" out="" l json=""
-  while IFS=$'\t' read -r rid name; do
+  local st   # the OPTIONAL third row field (a registration's status) — see runner_rows
+  while IFS=$'\t' read -r rid name st; do
     [ "$rid" = "$id" ] || continue
     case "$name" in
       "$HOST_LABEL_ARM64"|"$HOST_LABEL_X64") arch="$name" ;;      # the host, not the pool
@@ -937,8 +1027,16 @@ labels_for() { # $1 = rows, $2 = runner id, $3 = on|off
 # refused the same way rather than iterated as a runner id. "The pool has zero runners" is still a
 # success — that is a readable zero, not a failed read.
 set_labels() { # $1 = on|off
-  local eng="$1" id row rid name ok=0 fail=0 rows body bad=0
+  local eng="$1" id row rid name st rest ok=0 fail=0 rows body bad=0 armed=0 skipped=0 stripped=0
+  local runner_st="" over_budget=0 why="" managed_total=0
   local WANTED_BODY="" verified=0 unverified=0
+  # ⛔ AN UNREADABLE ARM BUDGET CHANGES NOTHING (see ARM_MAX): the numbers here decide HOW MUCH of the
+  # box CI may occupy, so acting on one that was never read is the same class of defect as acting on
+  # an unread queue count. Fail-closed, and the caller records no transition.
+  if [ "$eng" = on ] && [ "$ARM_MAX_INVALID" != 0 ]; then
+    log "WARNING: arm budget UNREADABLE ('${ARM_MAX}') — no labels changed (FAIL-CLOSED)"
+    return 1
+  fi
   if ! rows="$(runner_rows 2>"$GH_ERR")"; then
     rows="$(cat "$GH_ERR" 2>/dev/null)"
     CAPABILITY="$(census_capability "$rows")"
@@ -951,7 +1049,9 @@ set_labels() { # $1 = on|off
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     case "$row" in *$'\t'*) ;; *) bad=1 ;; esac
-    rid="${row%%$'\t'*}"; name="${row#*$'\t'}"
+    rid="${row%%$'\t'*}"; rest="${row#*$'\t'}"
+    name="${rest%%$'\t'*}"; st=""
+    case "$rest" in *$'\t'*) st="${rest#*$'\t'}"; case "$st" in online|offline|"") ;; *) bad=1 ;; esac ;; esac
     case "$rid" in ''|*[!0-9]*) bad=1 ;; esac
     case "$name" in ''|*[!A-Za-z0-9._-]*) bad=1 ;; esac
   done <<<"$rows"
@@ -959,7 +1059,39 @@ set_labels() { # $1 = on|off
     log "WARNING: runner enumeration unreadable — no labels changed; ${rows:0:300}"
     return 1
   fi
+  managed_total=0
   for id in $(managed_ids "$rows"); do
+    managed_total=$((managed_total+1))
+    # ⛔ THE ARM BUDGET BOUNDS **CARRIERS**, NOT WRITES — so a managed runner that is past the budget (or
+    # cannot take a job) is ACTIVELY STRIPPED rather than merely skipped. A bare `continue` left every
+    # already-labelled runner holding `ubuntu-latest` — reachable three ways: shipping this against a
+    # pool the old code armed fully, an armed runner going offline, or a failed PUT letting the next
+    # runner be armed while the old label persisted — so the log could claim "bounds concurrent CI jobs
+    # to N" while three runners carried the label. `off` is idempotent: it writes the runner's own label
+    # set without `ubuntu-latest`, so applying it to a runner that never had the label changes nothing.
+    if [ "$eng" = on ]; then
+      runner_st="$(printf '%s\n' "$rows" | awk -F'\t' -v i="$id" '$1==i{print $3; exit}')"
+      over_budget=0; [ "$armed" -ge "$ARM_MAX" ] && over_budget=1
+      if [ "$over_budget" = 1 ] || [ "$runner_st" = offline ]; then
+        if [ "$over_budget" = 1 ]; then
+          why="arm budget ${ARM_MAX} spent (CI_GATE_ARM_MAX)"
+        else
+          why="registration is OFFLINE, so it cannot be handed a job"
+        fi
+        if body="$(labels_for "$rows" "$id" off)"; then
+          log "set_labels STRIP runner=$id — ${why}; ensuring it carries no ${FALLBACK_LABEL} (body=$body)"
+          if printf '%s' "$body" | gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - >/dev/null 2>&1; then
+            stripped=$((stripped+1))
+          else
+            fail=$((fail+1))
+          fi
+        else
+          log "WARNING: runner $id is not classifiable from its own host label — left as-is"
+          fail=$((fail+1))
+        fi
+        skipped=$((skipped+1)); continue
+      fi
+    fi
     if ! body="$(labels_for "$rows" "$id" "$eng")"; then
       log "WARNING: runner $id is not classifiable from its own host label — left as-is"
       fail=$((fail+1)); continue
@@ -969,13 +1101,13 @@ set_labels() { # $1 = on|off
     # same thing about every runner (#2327).
     log "set_labels runner=$id body=$body"
     if printf '%s' "$body" | gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - >/dev/null 2>&1; then
-      ok=$((ok+1))
+      ok=$((ok+1)); [ "$eng" = on ] && armed=$((armed+1))
       WANTED_BODY="$id=$body"$'\n'"$WANTED_BODY"
     else
       fail=$((fail+1))
     fi
   done
-  log "set_labels ok=$ok fail=$fail engagement=$eng"
+  log "set_labels ok=$ok fail=$fail engagement=$eng arm_max=$ARM_MAX armed=$armed skipped=$skipped stripped=$stripped managed=$managed_total"
   # ⛔ A PUT THAT RETURNED 0 IS NOT AN ATTACHED LABEL — VERIFY BY RE-READING. The runner agent owns
   # its label set and re-asserts it: a server-side addition lives 60-120s (measured 2026-10-29 on the
   # live pool, both directions). Reporting `ok` from the exit status let the gate record a transition
@@ -1006,6 +1138,14 @@ set_labels() { # $1 = on|off
     fi
   fi
   log "set_labels accepted=$verified rejected=$unverified engagement=$eng (SYNCHRONOUS: what the API took on this call — durability is checked on the NEXT pass, because the runner agent re-asserts its own set 60-120s later)"
+  # ⛔ AN ENGAGEMENT WITH ZERO CARRIERS IS ITSELF A FAILURE. Skipping offline runners made an
+  # all-offline pool produce `ok=0 fail=0` and return SUCCESS over a pool that carries nothing — the
+  # transition was recorded, the verify step had no list to check, and the verdict said the pool was
+  # routed. Keyed on `managed_total` so the genuinely EMPTY pool stays a readable zero (rc 0).
+  if [ "$eng" = on ] && [ "$armed" -eq 0 ] && [ "$managed_total" -gt 0 ]; then
+    log "set_labels FAILED: engagement armed NO carrier (managed=$managed_total, all offline or past the budget) — nothing can take a job, so the transition must not be recorded"
+    return 1
+  fi
   # Unverified writes are a FAILURE for the caller: recording the transition on them is what produced
   # a state file claiming `local` with no carrier.
   [ "$fail" -eq 0 ] && [ "$unverified" -eq 0 ]
@@ -1186,7 +1326,10 @@ if [ "$STATUS_ONLY" = 1 ]; then
   fi
   # `unmeasured`, not `measured`: this verb reports the STATES and computes no verdict, and inventing a
   # word outside the documented vocabulary made the two schedulable surfaces disagree about `capacity=`.
-  echo "mode=$mode repo=$REPO source=$MODE_SOURCE capacity=${CENSUS_VERDICT:-unmeasured} ${CENSUS_KV} capability=${CAPABILITY:-none} detail=\"${CENSUS_DETAIL}\""
+  # ⛔ THE THRESHOLD IS PRINTED HERE, so a reader of the manual verb cannot mistake the shipped 10 for
+  # the 60 it replaced — the number decides WHEN the pool is offered, and a status line that omitted
+  # it is how "it is not routing because the threshold is 60" became unfalsifiable prose (#9878).
+  echo "mode=$mode repo=$REPO source=$MODE_SOURCE capacity=${CENSUS_VERDICT:-unmeasured} threshold=$QUEUE_THRESHOLD arm_max=$ARM_MAX ${CENSUS_KV} capability=${CAPABILITY:-none} detail=\"${CENSUS_DETAIL}\""
   exit "$status_rc"
 fi
 
@@ -1277,7 +1420,7 @@ if [ "$healthy" = 0 ]; then
     idle-unused|all-offline|unknown)
       reason="GitHub-hosted legs pass BUT CAPACITY NOT CERTIFIED (capacity=$CENSUS_VERDICT: $CENSUS_DETAIL; $absorption)" ;;
     *)
-      reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, $absorption; capacity=$CENSUS_VERDICT: $CENSUS_DETAIL)" ;;
+      reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, $absorption; capacity=$CENSUS_VERDICT: $CENSUS_DETAIL; arm_max=$ARM_MAX)" ;;
   esac
 else
   want="local"
