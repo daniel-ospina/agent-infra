@@ -561,16 +561,29 @@ def harness_apply_record():
     # silent green this whole change exists to end, one level up: the pass is honest, and the reader
     # above it threw the honesty away.
     drift = kv.get("drift", "")
-    if drift.startswith("not-run"):
-        return (f"record rc={rc} deployed={deployed} ref={ref} behind={behind} drift={drift} — the "
-                f"deployed-drift check was NEVER RUN (no check-deployed-drift.sh was found), so nothing "
-                f"here measured whether the box runs this repo's code", True)
-    if drift.startswith("executes:"):
+    # ⛔ THE FIELD IS `<state>:<token>`, SO MATCH THE TOKEN, NOT THE WHOLE FIELD (review round 11, P1\n    # — the round-10 fix was DEAD because of this). `harness-apply-pass.sh` writes
+    # `${DRIFT_STATE}${DRIFT_TOKEN:+:$DRIFT_TOKEN}`, and on the red arm the state IS `drift`, so the
+    # record reads `drift=drift:executes:/gone/…` — `startswith("executes:")` therefore NEVER matched
+    # and the alarm that exists to stop this instrument certifying a box whose executing tree is gone
+    # could not fire. The `not-run` half happened to work, which is exactly why the asymmetry was
+    # invisible.
+    token = drift.split(":", 1)[1] if ":" in drift else drift
+    # ⛔ AND THE ABSENT-CHECKER ALARM MUST KEY ON THE TOKEN TOO (review round 11, P2). The pre-flow
+    # refusals that run AFTER a successful fetch (`action=unresolvable-ref`, `action=unresolvable-head`)
+    # write `drift=not-run:not-run`, so a `startswith("not-run")` test names a MISSING CHECKER on a box
+    # whose real fault is an unresolvable ref — and printed neither `action=` nor `detail=`, so the true
+    # refusal appeared nowhere. Only `absent` means the checker was not found.
+    if token.startswith("executes:"):
         return (f"THE BOX EXECUTES A HARNESS TREE IT DOES NOT HAVE ({drift}) — deployed={deployed} "
-                f"ref={ref} rc={rc}; redeploying the copy at rest does not clear it", True)
-    # An EMPTY key is a record written before this field existed, or one whose pass hit a pre-flow
-    # refusal. NAMED, not alarmed: the next cadence writes it, and alarming on the upgrade would red
-    # every box once for a field it is about to gain.
+                f"ref={ref} rc={rc} action={kv.get('action', '?')}; redeploying the copy at rest does "
+                f"not clear it", True)
+    if token == "absent":
+        return (f"record rc={rc} deployed={deployed} ref={ref} behind={behind} drift={drift} "
+                f"action={kv.get('action', '?')} — the deployed-drift check was NEVER RUN (no "
+                f"check-deployed-drift.sh was found), so nothing here measured whether the box runs "
+                f"this repo's code", True)
+    # An EMPTY key is a record written before this field existed. NAMED, not alarmed: the next cadence
+    # writes it, and alarming on the upgrade would red every box once for a field it is about to gain.
     drift_note = f"drift={drift}" if drift else "drift=<not recorded by this pass>"
     if rc in ("0", "10", "11") and behind_n == 0:
         return (f"record ok rc={rc} deployed={deployed} head={head} ref={ref} behind=0 age={age}s "
