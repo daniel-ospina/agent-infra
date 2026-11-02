@@ -515,8 +515,10 @@ record, **five returned `fresh`** — the batch was two PRs, not six.
 
 **⛔ `main` must be green before the batch means anything.** A batch branch is cut from `main`, so it inherits every
 red on `main`, and a batch is then red for a reason that has nothing to do with its contents. **Read `main`'s own sha**
-(never a rollup, never `/status`): group check-runs by job name, take the newest attempt by **`id`**, because **a
-re-run ADDS a red, it does not clear one**.
+(never a rollup, never `/status`), and group check-runs by **(app, workflow, job name)**, taking the newest attempt by
+**`id`** — because **a re-run ADDS a red, it does not clear one**. `~/.pi/agent/AGENTS.md` holds that rule and the reason
+it is not just "by job name": two workflows can publish the same job name, so a name-only grouping lets the newest of
+one mask the other and yields a **FALSE GREEN on `main`**. Do not simplify the key.
 
 **⛔ Do NOT paraphrase the rail's red-base refusals — read them off the rail.** It has several (an already-red base the
 PR does not repair; a base red the PR has not measured; a merge ref lagging a red base; a merge-ref base parent it
@@ -534,7 +536,8 @@ handful in the batch.**
 **Build it**
 
 ```bash
-git fetch origin main
+git fetch origin            # ALL branches: merging origin/<branch> refs this clone never refreshed silently lands
+                            #   stale tips — a different commit set than --check-carry approved above
 git worktree add .worktrees/batch-<date> -b batch/<date> origin/main
 cd .worktrees/batch-<date>
 for b in <branch1> <branch2> ...; do git merge --no-ff "origin/$b" -m "batch: $b"; done   # resolve conflicts HERE
