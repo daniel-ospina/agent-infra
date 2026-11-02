@@ -1335,12 +1335,32 @@ PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale
 # gets `head`/`carry` and a ZERO exit while NOTHING was written — the mirror image
 # of accepting a minting flag. It is refused HERE, above the mode dispatch, because
 # `--print-diff-hash` takes the FIRST branch and would otherwise never see it.
-if [ "$FLUSH_PENDING" -eq 1 ] && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ]; }; then
-  echo "record-review.sh: --flush-pending is its own verb and cannot be combined with --check-carry/--recover-body/--print-diff-hash/--print-tier — run one verb at a time." >&2
+# ⛔ --delta IS A MINTING VERB TOO, and it was left OUT of this guard in the first cut — MEASURED
+# by a reviewer against a real fixture: `--delta --print-diff-hash <pr> <repo>` exited 0 with the
+# record UNTOUCHED (the read-only verb answered and exited first), so the lane saw success and no
+# re-attestation happened; `--delta --check-carry` was worse — it answered `fresh … run the
+# code-review skill`, i.e. exactly the paid re-review this verb exists to remove. One verb per line.
+# ⛔ THREE VERBS, ONE GUARD (rebase resolution of #10522 x #10583). `--flush-pending` (#10522) and
+# `--delta` (#10583) landed from opposite sides of the same day, and their flags interlock exactly
+# like the pairs above: `--flush-pending --delta` would deliver the pending marker, exit 0 at the
+# FLUSH block above, and never measure a delta — a successful exit that re-attested nothing, which
+# is the shape this guard exists to refuse. So every minting/read-only pair is refused in ONE place,
+# and the mixed mint pair (`--recover-body --delta`) is refused explicitly: both write a record, and
+# whichever ran second would silently discard the first one's provenance.
+if [ "$FLUSH_PENDING" -eq 1 ] && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ] || [ "$DELTA" -eq 1 ]; }; then
+  echo "record-review.sh: --flush-pending is its own verb and cannot be combined with --check-carry/--recover-body/--delta/--print-diff-hash/--print-tier — run one verb at a time." >&2
   exit 2
 fi
-if [ "$RECOVER_BODY" -eq 1 ] && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; }; then
-  echo "record-review.sh: --recover-body is a MINTING verb and cannot be combined with --check-carry/--print-diff-hash/--print-tier on one command line — the read-only mode answers and exits first, so a successful-looking exit would have written nothing. Run one verb at a time: recover, then ask." >&2
+if [ "$RECOVER_BODY" -eq 1 ] && [ "$DELTA" -eq 1 ]; then
+  echo "record-review.sh: --recover-body and --delta both MINT a record, so one would silently overwrite the other's provenance — run one verb at a time: recover (or delta), then record a fresh verdict separately if one is owed." >&2
+  exit 2
+fi
+if { [ "$RECOVER_BODY" -eq 1 ] || [ "$DELTA" -eq 1 ]; } && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; }; then
+  if [ "$DELTA" -eq 1 ]; then
+    echo "record-review.sh: --delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier on one command line — the read-only verb answers and exits first, so a successful-looking exit would have written nothing (measured: exit 0 with the record untouched). Run one verb at a time: ask, then delta." >&2
+  else
+    echo "record-review.sh: --recover-body is a MINTING verb and cannot be combined with --check-carry/--print-diff-hash/--print-tier on one command line — the read-only mode answers and exits first, so a successful-looking exit would have written nothing. Run one verb at a time: recover, then ask." >&2
+  fi
   exit 2
 fi
 if [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; then
@@ -3480,22 +3500,46 @@ delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
   case "$ct" in *[!0-9a-f]*) ct="" ;; esac
   [ "${#ct}" -eq 40 ] || ct=""
   if [ -n "$p2" ] && [ -n "$ct" ]; then
-    mt="$(command git merge-tree --write-tree "$from" "$p2" 2>/dev/null | command head -1 || true)"
-    if [ -n "$mt" ] && [ "$mt" = "$ct" ]; then
+    # rc IS CHECKED HERE TOO: `merge-tree --write-tree` PRINTS A TREE OID ON LINE 1 EVEN WHEN IT
+    # CONFLICTS (exit 1) — the reason clause (D) requires rc=0 — so comparing the oid alone would
+    # report a CONFLICTED re-merge as a clean fact. A conflict here is what proof (c) must show, so
+    # it reports `no` with the conflict named rather than a silent oid comparison.
+    # rc IS CARRIED HERE TOO. `git merge-tree --write-tree` PRINTS A TREE OID ON LINE 1 EVEN WHEN IT
+    # CONFLICTS (exit 1) — the reason clause (D) requires rc=0 — and an earlier cut piped it through
+    # `head -1 || true`, discarding the status (and `${PIPESTATUS[0]}` cannot recover it inside a
+    # command substitution). Capture the OUTPUT, then the STATUS. A conflicted re-merge is a
+    # legitimate `no` (that is proof (c)); only a merge-tree that produced NO tree is UNMEASURED.
+    mt_raw="$(command git merge-tree --write-tree "$from" "$p2" 2>/dev/null)"; m_rc=$?
+    mt="$(printf '%s' "$mt_raw" | command head -1)"
+    if [ -z "$mt" ]; then
+      printf 'zero-conflict=UNMEASURED(merge-tree produced no tree, rc=%s)\n' "$m_rc"
+    elif [ "$mt" = "$ct" ] && [ "$m_rc" -eq 0 ]; then
       printf 'zero-conflict=yes merged-tree=%s head-tree=%s\n' "${mt:0:12}" "${ct:0:12}"
-    elif [ -n "$mt" ]; then
-      printf 'zero-conflict=no merged-tree=%s head-tree=%s (a RESOLUTION is authored code)\n' "${mt:0:12}" "${ct:0:12}"
     else
-      printf 'zero-conflict=UNMEASURED(merge-tree failed on %s)\n' "${from:0:12}"
+      printf 'zero-conflict=no merged-tree=%s head-tree=%s rc=%s (a RESOLUTION is authored code)\n' "${mt:0:12}" "${ct:0:12}" "$m_rc"
     fi
   else
     printf 'zero-conflict=UNMEASURED(no second parent on %s — not a forward merge)\n' "${to:0:12}"
   fi
   # (3) no new authored commits: clause (C2) stated as a fact.
   if [ -n "$b" ]; then
-    extra="$(command git rev-list --no-merges "$from..$to" --not "$b" 2>/dev/null || true)"
+    # ⛔ THE WALK'S STATUS IS CHECKED, exactly as clause (C2) checks its own: a failed walk
+    # prints NOTHING, and "nothing" here would read as "no authored commits" — the fail-open
+    # direction, and this is the path where the reviewed head may genuinely be absent (a
+    # cross-box record, a pruned or force-pushed head). MEASURED by a reviewer against a record
+    # naming a nonexistent head: before this guard the triple printed `yes commits=0` about a head
+    # that does not exist, next to two honest UNMEASURED lines.
+    n_rc=0
+    extra="$(command git rev-list --no-merges "$from..$to" --not "$b" 2>/dev/null)" || n_rc=$?
+    if [ "$n_rc" -ne 0 ]; then
+      printf 'no-new-authored-commits=UNMEASURED(rev-list failed rc=%s)\n' "$n_rc"
+      n=""
+    else
     n="$(printf '%s\n' "$extra" | command grep -c . || true)"
-    if [ "${n:-0}" -eq 0 ]; then
+    fi
+    if [ -z "$n" ]; then
+      : # already reported UNMEASURED above
+    elif [ "$n" -eq 0 ]; then
       printf 'no-new-authored-commits=yes commits=0\n'
     else
       printf 'no-new-authored-commits=no commits=%s %s\n' "${n:-0}" "$(printf '%s' "$extra" | command head -3 | command tr '\n' ',' | command sed 's/,$//')"
@@ -4214,8 +4258,31 @@ if [ -n "$CARRY_ARM" ]; then
   # a rebase/base-move whose provenance is unrecorded, while this one carries a
   # CLAIM about the authored change that a reader must be able to check. So the
   # record names the pair, and the delta it attests.
+  # ⛔ NAME WHAT THE ARM PROVED, not what would read well. A reviewer measured that the
+  # `authored_unchanged:true` this field used to hardcode is contradicted by the SAME run's own
+  # triple on the commonest path: `arm:"lane"` proves the LANE dimension (forward move, no
+  # intervening authored non-merge commit, a clean re-merge reproduces the head tree) and the
+  # rendered patch may legitimately differ, so `authored-digest-equal` prints `no`/`UNMEASURED`
+  # there. So the field states which dimension carried, and `conflicts:0` is claimed only for the
+  # lanes whose predicate actually recomputed the merge (`lane`, `patch`); the byte-identity `diff`
+  # arm never recomputed anything, so it claims neither.
   if [ "$DELTA" -eq 1 ]; then
-    MINT_FIELDS="\"mint\":\"delta\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"delta\":{\"from\":\"$DELTA_FROM\",\"to\":\"$SHA\",\"authored_unchanged\":true,\"conflicts\":0,\"arm\":\"$CARRY_ARM\"},"
+    DIMENSION="none"
+    case "$CARRY_ARM" in
+      lane) DIMENSION="lane";;
+      patch) DIMENSION="patch";;
+      diff) DIMENSION="diff-bytes";;
+    esac
+    # `authored_unchanged`/`conflicts` are emitted ONLY for the arms that MEASURED them: `patch`
+    # (the #1377 projection really was equal) and `diff-bytes` (the bytes really were identical).
+    # For `lane` the predicate recomputed a clean re-merge and left the rendered digest free to
+    # differ, so asserting `authored_unchanged:true` there would be a claim the same run's triple
+    # contradicts — the review's finding. `proved` always names which dimension carried.
+    DELTA_PROOF=""
+    case "$CARRY_ARM" in
+      patch|diff) DELTA_PROOF="\"authored_unchanged\":true,\"conflicts\":0,";;
+    esac
+    MINT_FIELDS="\"mint\":\"delta\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"delta\":{\"from\":\"$DELTA_FROM\",\"to\":\"$SHA\",\"proved\":\"$DIMENSION\",${DELTA_PROOF}\"arm\":\"$CARRY_ARM\"},"
   fi
 fi
 EVIDENCE_FIELD=""
@@ -4285,7 +4352,7 @@ if [ -n "$CARRY_ARM" ]; then
   if [ -f "$FILE" ] && grep -q '"mint":"recovered-body"' "$FILE"; then PRIOR_RECOVERED=1; fi
   if [ "$PRIOR_RECOVERED" -eq 0 ] && [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
     REVIEWED_AT="$PRIOR_AT"
-    echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=carried, carried_from=${ORIG_SHA:0:12}…)" >&2
+    echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=$([ "$DELTA" -eq 1 ] && echo delta || echo carried), carried_from=${ORIG_SHA:0:12}…)" >&2
   else
     if [ "$PRIOR_RECOVERED" -eq 1 ]; then
       echo "⚠️ tortoise#7391 / #2872: CARRIED record for ${REPO:-<no-repo>}#$PR whose predecessor was RECOVERED from a marker — that record's reviewed_at was a LOWER BOUND (the head commit's date), not a mint time, so it is NOT inherited. reviewed_at is the CARRY time; \`mint\`/\`carried_at\` say so." >&2
