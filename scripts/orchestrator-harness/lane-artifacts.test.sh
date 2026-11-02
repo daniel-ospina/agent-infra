@@ -108,9 +108,18 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   if [ -n "${STUB_SCAN_ERROR:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
     printf '__NOK__ find-failed(rc=1)\n'; exit 0
   fi
-  # STUB_BAD_SIZE: a row whose size column is not numeric — what a TAB/newline in a filename produces.
+  # STUB_BAD_SIZE: a row the listing cannot parse — what a NEWLINE in a filename produces. The path is
+  # the LAST field in a row (see T28 for why), so a TAB in a name is carried intact; a newline still
+  # splits the record, and the tail line's first field is then a fragment of the NAME — non-numeric, so
+  # the row must ABSTAIN rather than be carried into a pull as a bogus path.
   if [ -n "${STUB_BAD_SIZE:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
-    printf '__OK__\n%s/has\ttab.md\t2026-01-01T00:00:00\n' "$root"; exit 0
+    printf '__OK__\n5\t2026-01-01T00:00:00\t%s/has\ntab.md\n' "$root"; exit 0
+  fi
+  # STUB_TAB_NAME: a TAB inside a real filename, with the size/metadata intact. The path is the LAST
+  # field, so `read -r sz mt p` must keep the whole name — the earlier order accepted this row as a
+  # valid measurement of the name's HEAD and pulled a different file, at exit 0.
+  if [ -n "${STUB_TAB_NAME:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
+    printf '__OK__\n9\t2026-01-01T00:00:00\t%s/has\ttab.md\n' "$root"; exit 0
   fi
   # STUB_WRAP: model the PRODUCTION encoder. This host's `base64` is FreeBSD and does NOT wrap, so a
   # wrap-guard test cannot fire here — the fix would look right and be untestable. A shim on PATH wraps
@@ -143,15 +152,31 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
     echo 'stub: reader exploded' >&2; exit 1
   fi
   # STUB_BULK: a directory with more matches than ROW_CAP, so the truncation notice is exercised.
+  # Rows are `size<TAB>mtime<TAB>path` — the SAME order the real remote emits (a stub with a different
+  # order would test a parser that does not exist in production).
   if [ -n "${STUB_BULK:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
     echo __OK__
-    i=0; while [ $i -lt 240 ]; do printf '%s/bulk-%s.md\t1\t2026-01-01T00:00:00\n' "$STUB_BULK" "$i"; i=$((i+1)); done
+    i=0; while [ $i -lt 240 ]; do printf '1\t2026-01-01T00:00:00\t%s/bulk-%s.md\n' "$STUB_BULK" "$i"; i=$((i+1)); done
     exit 0
   fi
   # STUB_UNREADABLE: the file exists for the scan but the pull's read FAILS (chmod 000 / vanished). This
   # is the case where `rc=$?` after a pipeline used to capture *tr*'s status and report a 0-byte SUCCESS.
   if [ -n "${STUB_UNREADABLE:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
     printf 'RC=1 LEN=0\n\n'; exit 0
+  fi
+  # STUB_ZERO_PULL: the pull itself SUCCEEDS (rc 0) but returns nothing, while the scan row said the file
+  # has bytes — the "vanished mid-flight" cross-check. It has no other way to be reached: STUB_UNREADABLE
+  # fails the read (rc 1), which is a different branch.
+  if [ -n "${STUB_ZERO_PULL:-}" ] && [ "${args[2]:-}" != "${args[2]%%base64*}" ]; then
+    printf 'RC=0 LEN=0\n\n'; exit 0
+  fi
+  # STUB_PREVIEW_FAIL: the PREVIEW exec fails while the scan and the pull are fine. Matched on the preview
+  # script's own argv shape (`head -n "$1" -- "$2"`) — matching on `head -n` alone would also fail the
+  # SCAN, which has its own `head -n N` cap.
+  if [ -n "${STUB_PREVIEW_FAIL:-}" ]; then
+    case "${args[2]:-}" in
+      *'head -n "$1" -- "$2"'*) exit 1 ;;
+    esac
   fi
   exec "${args[@]}" 2>/dev/null
 fi
@@ -234,15 +259,34 @@ rc=$?; STUB_DEAD=""
 eq "T6 exit 0" "$rc" "0"
 grep -q 'ledger on c' "$Q/t6.txt" && ok "T6 collected from the live box" || bad "T6 collected" "$(head -6 "$Q/t6.txt")"
 grep -q 'pi-cell-1.*UNMEASURED' "$Q/t6.txt" && ok "T6 names the dead box as UNMEASURED" || bad "T6 names the dead box" "$(head -6 "$Q/t6.txt")"
+# ⛔ The SUCCESS-path disclosure is a separate line from emit_box's per-box line, and it had no assertion:
+# deleting the whole block left the suite green. Exit 0 with 2 of 3 boxes silent reads as a complete
+# result to any caller keying on the status, so this line is the only thing that says otherwise.
+grep -q 'COVERAGE INCOMPLETE' "$Q/t6.txt" && ok "T6 discloses incomplete coverage on the SUCCESS path" \
+  || bad "T6 does not disclose partial coverage" "$(tail -4 "$Q/t6.txt")"
 
-echo "T7 — a KILLED writer's artifact is collectable (the case that matters most)"
-# Asserted STRUCTURALLY: the fixture file is written and then nothing ever touches it again, and
-# collection is a PULL from the orchestrator side — so it cannot depend on the writer surviving,
-# cooperating, or running any code after the write. The live proof (a process SIGKILLed, then its file
-# collected over a real `cmux vm exec`) needs a real box and is quoted in the PR body, not asserted here.
+echo "T7 — a process that wrote a file and was then SIGKILLed leaves a collectable artifact (the case that matters most)"
+# ⛔ The writer below REALLY IS killed with SIGKILL before the tool runs, so the pull cannot depend on the
+# writer surviving, cooperating, or executing anything after the write. The earlier version of this case
+# only contained the word "SIGKILLed" in the fixture body — it was T1 with different bytes and could not
+# fail if killed-lane survival were false. (The live CROSS-BOX proof needs a real `cmux vm exec` and is
+# quoted in the PR body, not asserted here.)
+rm -f "$Q/box-c/killed-lane.md"
+# The writer is killed FROM OUTSIDE, exactly as a reaped lane is: it writes, then blocks, and the test
+# SIGKILLs it. (Killing itself with `kill -9 $$` also works but makes the shell print a "Killed" job
+# notice into the suite's output, which reads like a failure in a CI log.)
+sh -c 'printf "written mid-run, before any chance to upload\n" > "$1"; sleep 30' lane-writer "$Q/box-c/killed-lane.md" &
+wpid=$!
+_i=0; while [ "$_i" -lt 50 ] && [ ! -s "$Q/box-c/killed-lane.md" ]; do sleep 0.1; _i=$((_i + 1)); done
+kill -9 "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null || true
+[ -s "$Q/box-c/killed-lane.md" ] && ok "T7 the writer left its file behind" || bad "T7 fixture was not written" "$(ls "$Q/box-c")"
+kill -0 "$wpid" 2>/dev/null && bad "T7 the writer is still alive — this is not the killed-lane case" "pid $wpid" \
+  || ok "T7 the writer is provably GONE (SIGKILLed) before the pull"
 out="$Q/out7"; mkdir -p "$out"
-run collect killproof --out "$out" --lines 2 > "$Q/t7.txt" 2>&1
-grep -q 'SIGKILLed' "$out/pi-cell-4-killproof-lane.md" 2>/dev/null && ok "T7 killed writer's file collected" \
+run collect killed-lane --out "$out" --lines 2 > "$Q/t7.txt" 2>&1
+rc=$?
+eq "T7 exit 0" "$rc" "0"
+grep -q 'before any chance to upload' "$out/pi-cell-4-killed-lane.md" 2>/dev/null && ok "T7 the dead writer's artifact was collected" \
   || bad "T7 collected" "$(head -6 "$Q/t7.txt")"
 
 echo "T8 — \`ls\` on a dead fleet says UNMEASURED, not an empty healthy inventory"
@@ -310,8 +354,9 @@ echo "T8b — ls: the .log scan failing is UNMEASURED, not an empty list at exit
 STUB_DEAD_LOG=1; export STUB_DEAD_LOG
 run ls > "$Q/t8b.txt" 2>&1
 unset STUB_DEAD_LOG
-# The .md scan succeeded, so the box is REACHED and the verb exits 0; the point is that the failed
-# .log scan is NAMED rather than silently rendering as "this box has no lane logs".
+# The .md scan succeeded, so the box IS reached — but a partial inventory is not an inventory, so the
+# verb still ABSTAINS (exit 4; that half is pinned by T20, which runs this same setup). The point here is
+# that the failed .log scan is NAMED rather than silently rendering as "this box has no lane logs".
 grep -q 'UNMEASURED(log' "$Q/t8b.txt" && ok "T8b names the failed log scan" || bad "T8b names it" "$(head -10 "$Q/t8b.txt")"
 
 echo "T14 — --since 30m is a USAGE error (exit 64), never a false ABSENT"
@@ -321,14 +366,17 @@ eq "T14 exit 64" "$rc" "64"
 grep -q '^ABSENT-EVERYWHERE' "$Q/t14.txt" && bad "T14 must not claim absent" "$(cat "$Q/t14.txt")" \
   || ok "T14 does not claim absent on a bad duration"
 
-echo "T15 — a reused --out does not leave the previous run's artifacts beside this run's index"
+echo "T15 — a COMPLETE reused --out does not leave the previous run's artifacts beside this run's index"
+# The hazard this pins is a MISMATCHED PAIR (run 1's files beside run 2's index), not deletion for its own
+# sake: a run that collected everything replaces the collection, so the pair stays consistent.
 out="$Q/out15"; mkdir -p "$out"
 run collect epic-ledger --out "$out" >/dev/null 2>&1
 [ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T15 run 1 wrote its file" || bad "T15 run 1" "$(ls "$out")"
-STUB_DEAD="pi-cell-1 pi-cell-3 pi-cell-4"; run collect epic-ledger --out "$out" >/dev/null 2>&1
-STUB_DEAD=""
-ls "$out" | grep -q 'pi-cell-4-epic-ledger.md' && bad "T15 stale artifact survived run 2" "$(ls "$out")" \
-  || ok "T15 stale artifact from run 1 removed"
+run collect p1-10515 --out "$out" >/dev/null 2>&1
+ls "$out" | grep -q 'pi-cell-4-epic-ledger.md' && bad "T15 stale artifact survived a complete run 2" "$(ls "$out")" \
+  || ok "T15 stale artifact from run 1 removed by a complete run 2"
+grep -q 'p1-10515' "$out/.lane-artifacts-index" 2>/dev/null && ok "T15 the index names run 2's artifact" \
+  || bad "T15 index" "$(cat "$out/.lane-artifacts-index" 2>/dev/null)"
 
 echo "T16 — the ABSENT message echoes the --since it actually applied"
 run collect no-such-file --since 60 > "$Q/t16.txt" 2>&1
@@ -338,8 +386,10 @@ grep -q -- '-mmin -60' "$Q/t16.txt" && ok "T16 echoes the mmin filter" || bad "T
 grep -q 'in the last 60 minutes' "$Q/t16.txt" && ok "T16 says the window in words" || bad "T16 window wording" "$(cat "$Q/t16.txt")"
 
 echo "T17 — an unparseable scan row ABSTAINS instead of producing a wrong verdict"
-# A TAB/newline in a filename splits the TAB-delimited fields, so the size column lands on the tail of
-# the name. The old code carried that into a pull: a bogus path, then PULL-FAILED — a wrong verdict.
+# A NEWLINE in a filename splits the record; the tail line's leading field is a fragment of the name, so
+# the size column is non-numeric and the row must abstain. (A TAB in a name is a different case and is
+# carried correctly now that the path is the LAST field — see T28.) The old code carried the corruption
+# into a pull: a bogus path, then PULL-FAILED — a wrong verdict.
 out="$Q/out17"; mkdir -p "$out"
 STUB_BAD_SIZE=1; export STUB_BAD_SIZE
 run collect .md --out "$out" > "$Q/t17.txt" 2>&1
@@ -451,6 +501,127 @@ run collect idxcheck --out "$out" >/dev/null 2>&1
 idx_size="$(awk -F"$(printf '\t')" '{print $3}' "$out/.lane-artifacts-index" 2>/dev/null | head -1)"
 file_size="$(wc -c < "$out/pi-cell-4-idxcheck.md" 2>/dev/null | tr -d ' ')"
 eq "T26 index size == file size" "${idx_size:-none}" "${file_size:-none}"
+
+echo "T27 — ⛔ a FAILED re-run must NOT destroy the previous collection (a failed run is not a replacement)"
+# Measured before the fix: the startup pass deleted every file the old index recorded and truncated the
+# index BEFORE scanning, so a typo'd or all-boxes-dead re-run left the directory EMPTY — destroying the
+# only orchestrator-side copy of a cell lane's artifact, which is the durability this tool exists for.
+out="$Q/out27"; mkdir -p "$out"
+run collect epic-ledger --out "$out" >/dev/null 2>&1
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T27 run 1 collected the artifact" || bad "T27 run 1" "$(ls -a "$out")"
+idx_before="$(cat "$out/.lane-artifacts-index" 2>/dev/null)"
+STUB_DEAD="pi-cell-1 pi-cell-3 pi-cell-4"; run collect epic-ledger --out "$out" > "$Q/t27.txt" 2>&1
+rc=$?; STUB_DEAD=""
+eq "T27 the failed re-run exits 4" "$rc" "4"
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T27 the previous artifact SURVIVED the failed run" \
+  || bad "T27 the failed run destroyed the only copy" "$(ls -a "$out")"
+eq "T27 the index still describes the surviving collection" "$(cat "$out/.lane-artifacts-index" 2>/dev/null)" "$idx_before"
+grep -q 'still holds the PREVIOUS collection' "$Q/t27.txt" && ok "T27 says which collection the directory holds" \
+  || bad "T27 does not say what survived" "$(tail -3 "$Q/t27.txt")"
+[ -e "$out/.lane-artifacts-index.new" ] && bad "T27 left a side index behind" "$(ls -a "$out")" \
+  || ok "T27 no side index left behind"
+
+echo "T28 — a TAB inside a filename is carried intact, not truncated into a DIFFERENT file that pulls clean"
+# The decoy is real, readable and is the name's HEAD. With the path FIRST in the scan row, `zz<TAB>7`
+# parsed as size=7 for path `zz`, so the decoy was pulled, written as the artifact and COUNTED at exit 0 —
+# while the matched artifact was never collected and no warning was printed.
+out="$Q/out28"; mkdir -p "$out"; mkdir -p "$Q/box-tab"
+printf 'DECOY' > "$Q/box-tab/has"
+printf 'THE REAL ARTIFACT' > "$Q/box-tab/has$(printf '\t')tab.md"
+bx_stub="$STUB_BOXES"; bx_labels="$LANE_ARTIFACT_BOXES"
+export STUB_BOXES="pi-cell-1=$Q/box-tab"; export LANE_ARTIFACT_BOXES="pi-cell-1"
+STUB_TAB_NAME=1; export STUB_TAB_NAME
+run collect has --out "$out" > "$Q/t28.txt" 2>&1
+rc=$?; unset STUB_TAB_NAME
+export STUB_BOXES="$bx_stub"; export LANE_ARTIFACT_BOXES="$bx_labels"
+eq "T28 exit 0" "$rc" "0"
+got_sha="$(shasum -a 256 < "$out/pi-cell-1-has$(printf '\t')tab.md" 2>/dev/null | cut -d' ' -f1)"
+want_sha="$(shasum -a 256 < "$Q/box-tab/has$(printf '\t')tab.md" | cut -d' ' -f1)"
+eq "T28 the TAB-named artifact is collected byte-exact" "${got_sha:-missing}" "$want_sha"
+decoy_sha="$(shasum -a 256 < "$Q/box-tab/has" | cut -d' ' -f1)"
+[ -n "$got_sha" ] && [ "$got_sha" = "$decoy_sha" ] && bad "T28 collected the DECOY (the name's head) instead" "" \
+  || ok "T28 did not collect the name's head as the artifact"
+
+echo "T29 — \`--since 0\` is a USAGE error: \`find -mmin -0\` matches nothing, so it would become an absence verdict"
+run collect epic-ledger --since 0 > "$Q/t29.txt" 2>&1
+rc=$?
+eq "T29 exit 64" "$rc" "64"
+grep -q '^ABSENT-EVERYWHERE' "$Q/t29.txt" && bad "T29 must not claim absent" "$(cat "$Q/t29.txt")" \
+  || ok "T29 does not claim absent on a filter it cannot honour"
+# The usage text legitimately NAMES the verdict, so the check above is anchored: an unanchored `grep
+# ABSENT-EVERYWHERE` reads the help output as a claim, which is how a fix can look red for a non-reason.
+
+echo "T30 — an EMPTY \`--box\` is a usage error: it widened a one-box request to the whole default fleet"
+run collect epic-ledger --box "" > "$Q/t30.txt" 2>&1
+rc=$?
+eq "T30 exit 64" "$rc" "64"
+grep -q 'collected from' "$Q/t30.txt" && bad "T30 must not scan the default fleet" "$(cat "$Q/t30.txt")" \
+  || ok "T30 does not widen the universe"
+
+echo "T31 — \`ls\` ABSTAINS on a row-capped scan instead of printing a short list as a total"
+# Measured before the fix: a box holding 250 `.md` files was reported as "shown 25 of 201" at exit 0 — a
+# measured total the inventory never measured, in the verb an operator uses to ask what EXISTS.
+mkdir -p "$Q/box-bulkmany"
+export STUB_BULK="$Q/box-bulkmany"
+run ls > "$Q/t31.txt" 2>&1
+rc=$?; unset STUB_BULK
+eq "T31 exit 4" "$rc" "4"
+grep -q 'row-capped' "$Q/t31.txt" && ok "T31 names the row cap" || bad "T31 names the row cap" "$(tail -4 "$Q/t31.txt")"
+
+echo "T32 — \`logs\` ESCAPES glob metacharacters: an exact name is exact, not a glob that finds nothing"
+# The metacharacter escaping is a measured false-ABSENT fix (the previous escape form was a silent no-op,
+# so `logs 'x[1]'` glob-matched and returned ABSENT-EVERYWHERE about a file that existed). It had NO test:
+# reverting it to `NAME="$1"` left the whole suite green, because T12's name has no metacharacters.
+mk box-c 'metachar log' 'x[1].log'
+mk box-c 'the decoy that a GLOB would also match' 'x1.log'
+out="$Q/out32"; mkdir -p "$out"
+run logs 'x[1]' --out "$out" > "$Q/t32.txt" 2>&1
+rc=$?
+eq "T32 exit 0" "$rc" "0"
+grep -q 'metachar log' "$out/pi-cell-4-x[1].log" 2>/dev/null && ok "T32 collected the bracketed name exactly" \
+  || bad "T32 did not collect x[1].log" "$(head -6 "$Q/t32.txt")"
+[ -e "$out/pi-cell-4-x1.log" ] && bad "T32 collected the GLOB decoy x1.log" "$(ls "$out")" \
+  || ok "T32 did not glob-match the decoy"
+
+echo "T33 — a PATH pasted as the pattern is a USAGE error, never an ABSENT-EVERYWHERE"
+# `find -name` cannot match a `/`, so a pasted path is the likely first invocation and used to return a
+# confident "absent everywhere" about a file the tool was pointed straight at. No case reached this guard.
+run collect /tmp/ci-cause.md > "$Q/t33.txt" 2>&1
+rc=$?
+eq "T33 exit 64" "$rc" "64"
+grep -q '^ABSENT-EVERYWHERE' "$Q/t33.txt" && bad "T33 must not claim absent" "$(cat "$Q/t33.txt")" \
+  || ok "T33 does not claim absent for a pasted path"
+
+echo "T34 — a FAILED PREVIEW is disclosed, not rendered as an empty artifact at exit 0"
+out="$Q/out34"; mkdir -p "$out"
+STUB_PREVIEW_FAIL=1; export STUB_PREVIEW_FAIL
+run collect ci-cause --out "$out" --lines 3 > "$Q/t34.txt" 2>&1
+rc=$?; unset STUB_PREVIEW_FAIL
+eq "T34 exit 0 (the PULL is what matters)" "$rc" "0"
+grep -q 'preview failed' "$Q/t34.txt" && ok "T34 discloses the failed preview" || bad "T34 renders an empty artifact" "$(head -8 "$Q/t34.txt")"
+grep -q 'artifact-a-body' "$out/pi-cell-1-ci-cause.md" 2>/dev/null && ok "T34 the full artifact was still collected" \
+  || bad "T34 pull lost" "$(ls "$out")"
+
+echo "T35 — a pull that returns NOTHING while the scan measured bytes is flagged (vanished mid-flight)"
+# T9 asserts a genuine 0-byte artifact is a SUCCESS, but its fixture's scan size is also 0, so the
+# cross-check's condition was never true in the suite.
+out="$Q/out35"; mkdir -p "$out"
+STUB_ZERO_PULL=1; export STUB_ZERO_PULL
+run collect epic-ledger --out "$out" > "$Q/t35.txt" 2>&1
+rc=$?; unset STUB_ZERO_PULL
+eq "T35 exit 0 (rc=0 from the box)" "$rc" "0"
+grep -q 'pulled 0 bytes but the scan measured' "$Q/t35.txt" && ok "T35 flags the vanished-mid-flight case" \
+  || bad "T35 did not flag a 0-byte pull over a non-empty scan" "$(head -8 "$Q/t35.txt")"
+
+echo "T36 — the preview scratch file is created with mktemp in TMPDIR, never a fixed /tmp path"
+# STRUCTURAL pin, deliberately: the old code wrote `/tmp/.la-prev.$$`, which ignores TMPDIR and leaks the
+# file when the tool is killed mid-preview. It cannot be observed from outside (the file is removed on
+# every normal exit path), so the only honest assertion is about the shape of the code.
+if grep -q 'mktemp "${TMPDIR:-/tmp}/la-prev' "$TOOL" && ! grep -q 'prev="/tmp/\.la-prev' "$TOOL"; then
+  ok "T36 the preview scratch path is mktemp'd under TMPDIR"
+else
+  bad "T36 the preview uses a fixed /tmp scratch path" "$(grep -n 'la-prev' "$TOOL" | head -3)"
+fi
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"

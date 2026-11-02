@@ -55,7 +55,10 @@ usage: lane-artifacts.sh <verb> [args]
   collect <pattern> [--out DIR] [--lines N] [--box LABEL] [--since MINUTES]
         Find every /tmp/*<pattern>* on the cells, print it (first --lines, default 40),
         and with --out write each FULL file to DIR/<cell>-<basename>, recorded in
-        DIR/.lane-artifacts-index (rewritten per run).
+        DIR/.lane-artifacts-index.
+        ⛔ DIR is replaced only by a run that collected EVERYTHING (exit 0). A run that finds nothing,
+        cannot reach a box, or fails a pull leaves the previous collection and index untouched and says
+        so — a failed re-run must never destroy the only copy that exists.
         <pattern> is a glob fragment, so `collect ci-cause` finds /tmp/ci-cause.md.
         `collect '*'` sweeps all of /tmp.
 
@@ -64,9 +67,11 @@ usage: lane-artifacts.sh <verb> [args]
         (`nohup pi -p < brief > /tmp/<name>.log`). This IS a cell lane's stdout.
 
   ls [--box LABEL] [--since MINUTES]
-        Inventory of /tmp/*.md and /tmp/*.log per box.
+        Inventory of /tmp/*.md and /tmp/*.log per box. More than 200 matches on a box is a row-capped
+        scan and ABSTAINS (exit 4) rather than printing a short list as a total.
 
-Exit: 0 found · 3 ABSENT-EVERYWHERE · 4 UNMEASURED (absent NOT claimed) · 5 PULL-FAILED.
+Exit: 0 found · 3 ABSENT-EVERYWHERE · 4 UNMEASURED (absent NOT claimed) · 5 PULL-FAILED · 64 usage.
+      `--since` takes whole minutes and must be >= 1. `--box` takes one non-empty label.
 EOF
   exit "$rc"
 }
@@ -80,18 +85,35 @@ shift || true
 
 pattern=""; outdir=""; lines=40; only_box=""; since=""
 need_val() { [ "$2" -ge 2 ] || { echo "lane-artifacts: missing value for $1" >&2; usage; }; }
-need_num() { printf '%s' "$2" | grep -Eq '^[0-9]+$' || { echo "lane-artifacts: $1 must be a whole number, got '$2'" >&2; usage; }; }
+# ⛔ NO PIPE INTO A QUIET GREP. `printf … | grep -Eq` is exactly the idiom scripts/check-no-sigpipe-grep.sh
+# refuses (grep -q exits at the first match, the writer dies of SIGPIPE, and under `pipefail` the pipeline
+# reports failure — so a VALID number could read as invalid, or vice versa on a longer input). A `case`
+# needs no pipe at all, and it is the form the guard itself recommends.
+need_num() { case "$2" in ''|*[!0-9]*) echo "lane-artifacts: $1 must be a whole number, got '$2'" >&2; usage ;; esac; }
 while [ $# -gt 0 ]; do
   case "$1" in
     # ⛔ `shift 2` with one arg left does NOT shift, so the loop would spin forever on a truncated
     # invocation (`collect ci-cause --out`) — a wedge, not an error. Check the count first.
     --out)     need_val --out "$#";   outdir="$2"; shift 2 ;;
     --lines)   need_val --lines "$#"; need_num --lines "$2"; lines="$2"; shift 2 ;;
-    --box)     need_val --box "$#";   only_box="$2"; shift 2 ;;
+    # ⛔ AN EMPTY `--box` WIDENS THE UNIVERSE instead of narrowing it: `need_val` only checks ARITY, so
+    # `--box "$cell"` with an unset `$cell` fell through to the three default boxes — the tool then swept
+    # every cell while the summary asserted "from 3 of 3 requested box(es)", i.e. a one-box request
+    # reported as three, and artifacts from boxes the caller never named landing in --out.
+    --box)     need_val --box "$#"
+               [ -n "$2" ] || { echo "lane-artifacts: --box needs a non-empty label" >&2; usage; }
+               case "$2" in -*) echo "lane-artifacts: --box '$2' looks like an option, not a label" >&2; usage ;; esac
+               only_box="$2"; shift 2 ;;
     # A unit suffix (`--since 30m`) used to reach the remote `find` as `-mmin -30m`, whose error was
     # discarded — so the scan returned no rows and the tool claimed ABSENT about a file that exists.
     # Validate here, where a usage error is a usage error.
-    --since)   need_val --since "$#"; need_num --since "$2"; since="$2"; shift 2 ;;
+    # ⛔ `0` IS A FILTER THE TOOL CANNOT HONOUR: `find -mmin -0` matches NOTHING by construction, so the
+    # run ended at ABSENT-EVERYWHERE about a file present on every box. That is the same defect as
+    # `--since 30m` one value over, and the remedy is the same — refuse it, never let an unhonourable
+    # filter turn into an absence verdict.
+    --since)   need_val --since "$#"; need_num --since "$2"
+               [ "$2" -ge 1 ] || { echo "lane-artifacts: --since must be >= 1 minute (0 matches nothing and cannot be honoured as a filter)" >&2; usage; }
+               since="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *)         if [ -z "$pattern" ]; then pattern="$1"; shift; else echo "unexpected arg: $1" >&2; usage; fi ;;
   esac
@@ -114,7 +136,9 @@ resolve_boxes() {
 }
 
 # scan <vm> <pattern> <since_minutes|""> <exact:0|1>
-#   -> `__OK__` then `path<TAB>size<TAB>mtime` rows, or `__NOK__ <reason>` and nothing else.
+#   -> `__OK__` then `size<TAB>mtime<TAB>path` rows, or `__NOK__ <reason>` and nothing else.
+#      ⛔ the PATH is the LAST field on purpose — see the `-printf` block in `scan` for the false PASS
+#      that a `path<TAB>size<TAB>mtime` order produced (`zz<TAB>7` accepted as a valid row for `zz`).
 #
 # `find <root> -maxdepth 1` is an EXPLICIT, BOUNDED start point (never a root walk).
 #
@@ -153,8 +177,17 @@ scan() {
     esac
     T=$(mktemp 2>/dev/null) || T="/tmp/.lane-artifacts.$$"
     if find "$R" -maxdepth 1 -type f -printf "" 2>/dev/null; then
+      # ⛔ THE PATH IS THE LAST FIELD, AND THAT ORDER IS LOAD-BEARING. The first version put `%p` FIRST,
+      # so a filename containing a TAB split the row and pushed the real size into the mtime column. The
+      # guard against that ("a non-numeric size column means a corrupt row") was INSUFFICIENT: for a name
+      # like `zz<TAB>7` the shifted size column IS numeric, so the row was accepted as a valid measurement
+      # of `/root/zz` — a DIFFERENT file — which was then pulled, written as the artifact and counted at
+      # exit 0, while the matched artifact was never collected and no warning was emitted. With the path
+      # last, `read -r sz mt p` keeps a TAB inside the path (only the trailing field absorbs the
+      # remainder) and the numeric size guard is then sound for real. A NEWLINE in a filename still
+      # splits the record, and there the first field is the mangled tail — non-numeric, so it abstains.
       find "$R" -maxdepth 1 -type f -name "$NAME" ${2:+-mmin -$2} \
-        -printf "%p\t%s\t%TY-%Tm-%TdT%TH:%TM:%TS\n" > "$T" 2>/dev/null
+        -printf "%s\t%TY-%Tm-%TdT%TH:%TM:%TS\t%p\n" > "$T" 2>/dev/null
       rc=$?
     else
       # No -printf => BSD/busybox find (a mac, or a stripped image). Same rows, per-file stat: slower,
@@ -169,8 +202,8 @@ scan() {
       rc=$?
       : > "$T"
       while IFS= read -r f; do
-        printf "%s\t%s\t%s\n" "$f" "$(wc -c < "$f" | tr -d " ")" \
-          "$(stat -c "%y" "$f" 2>/dev/null || stat -f "%Sm" -t "%FT%T" "$f" 2>/dev/null || echo -)" >> "$T"
+        printf "%s\t%s\t%s\n" "$(wc -c < "$f" | tr -d " ")" \
+          "$(stat -c "%y" "$f" 2>/dev/null || stat -f "%Sm" -t "%FT%T" "$f" 2>/dev/null || echo -)" "$f" >> "$T"
       done < "$L"
       rm -f "$L"
     fi
@@ -272,7 +305,7 @@ UNRESOLVED_LABELS="$(MAP_RAW=$MAP_RAW awk 'BEGIN{ n=split(ENVIRON["MAP_RAW"],a,"
 # emit_box <label> <vm> … — `collect`-shaped output for one box. Sets R_REACHED=1 when it answered.
 emit_box() {
   local label="$1" vm="$2" pat="$3" exact="$4" outdir="$5" lines="$6" since="$7"
-  local raw first res rows p sz mt dest
+  local raw first res rows p sz mt dest prev
   raw="$(scan "$vm" "$pat" "$since" "$exact")"; local _src=$?
   # ⛔ THE EXEC'S OWN STATUS IS CHECKED, not just the sentinel. `__OK__` is printed by the remote shell
   # BEFORE it streams the rows, so a channel that dies mid-scan (the 60 s timeout firing, a dropped
@@ -297,44 +330,100 @@ emit_box() {
     R_TRUNC=$((R_TRUNC + 1))
     res="$(printf '%s\n' "$res" | head -n "$ROW_CAP")"
   fi
-  while IFS="$(printf '\t')" read -r p sz mt; do
-    [ -n "${p:-}" ] || continue
-    # ⛔ A NON-NUMERIC SIZE COLUMN MEANS THE ROW IS CORRUPT — a TAB or newline in a filename splits the
-    # TAB-delimited fields, so `sz` lands on the tail of the filename and `${want}` is garbage. The old
-    # code carried that through to a pull and produced a WRONG VERDICT (a bogus path, then PULL-FAILED)
-    # rather than an abstention. Abstain instead: the doctrine is that a failure must never look like a
-    # result, and an unparseable row is a failure of the listing, not evidence about the file.
+  while IFS="$(printf '\t')" read -r sz mt p; do
+    # ⛔ A NON-NUMERIC SIZE COLUMN MEANS THE ROW IS CORRUPT — a newline in a filename splits the record and
+    # the leading field then holds a fragment of the path. The old code carried that through to a pull and
+    # produced a WRONG VERDICT (a bogus path, then PULL-FAILED) rather than an abstention. Abstain instead:
+    # the doctrine is that a failure must never look like a result, and an unparseable row is a failure of
+    # the listing, not evidence about the file.
+    # ⛔ THIS GUARD IS ONLY SOUND BECAUSE `p` IS LAST: with the path first, a TAB in a filename shifted a
+    # real (numeric!) size into this column and the row was accepted as a measurement of a different file.
+    # ⛔ IT MUST RUN BEFORE THE EMPTY-PATH `continue`: a record split by a newline leaves a tail line whose
+    # PATH field is empty and whose first field is a name fragment — checked in the other order that line
+    # was silently skipped and the box read as fully parsed (found while pinning T17).
     case "${sz:-}" in
       ''|""|*[!0-9]*)
-        echo "── $label  UNMEASURED(unparseable scan row — TAB/newline in a filename? raw: $p)"
+        echo "── $label  UNMEASURED(unparseable scan row — newline in a filename? raw: ${sz:-<empty row>} ${p:-<no path field>})"
         R_REACHED=0; R_UNPARSE=$((R_UNPARSE + 1)); return 1 ;;
     esac
+    [ -n "${p:-}" ] || continue
     R_HITS=$((R_HITS + 1))
     echo
     echo "── $label  $p  (${sz:-?} bytes, ${mt:-?})"
     # The count and path go as argv, and stderr is kept OUT of the body: a remote "cannot open" — or a
     # `--lines` that `head` rejected — must never be rendered as though it were the artifact's content.
-    "$CM" vm exec --timeout 60 "$vm" -- sh -c 'head -n "$1" -- "$2" 2>/dev/null; exit $?' \
-      lane-artifacts "$lines" "$p" </dev/null 2>/dev/null > /tmp/.la-prev.$$ 2>/dev/null
-    if [ $? -ne 0 ]; then
-      # A failed preview used to render as an EMPTY artifact at exit 0 — content-absence silently
-      # standing in for a failed read, the one thing this tool refuses to do everywhere else.
-      echo "   ⚠ preview failed (exec did not answer) — the file is ${sz:-?} bytes on the box; content not shown"
+    # ⛔ A SCRATCH FILE IN $TMPDIR, NOT A FIXED /tmp PATH. The preview used `/tmp/.la-prev.$$`: it ignored
+    # TMPDIR (so a host with a small or full /tmp fails the preview, and two shards sharing a host share
+    # one path space), and a run killed mid-preview left the file behind where nothing reaps it. There is
+    # deliberately NO `/tmp/...` fallback: if no scratch file can be made, the preview says so instead of
+    # writing to a path it was never given.
+    prev="$(mktemp "${TMPDIR:-/tmp}/la-prev.XXXXXX" 2>/dev/null)" || prev=""
+    if [ -z "$prev" ]; then
+      echo "   ⚠ preview unavailable (no scratch file under ${TMPDIR:-/tmp}) — the file is ${sz:-?} bytes on the box; content not shown"
     else
-      sed 's/^/   /' /tmp/.la-prev.$$
+      "$CM" vm exec --timeout 60 "$vm" -- sh -c 'head -n "$1" -- "$2" 2>/dev/null; exit $?' \
+        lane-artifacts "$lines" "$p" </dev/null 2>/dev/null > "$prev" 2>/dev/null
+      if [ $? -ne 0 ]; then
+        # A failed preview used to render as an EMPTY artifact at exit 0 — content-absence silently
+        # standing in for a failed read, the one thing this tool refuses to do everywhere else.
+        echo "   ⚠ preview failed (exec did not answer) — the file is ${sz:-?} bytes on the box; content not shown"
+      else
+        sed 's/^/   /' "$prev"
+      fi
+      rm -f "$prev"
     fi
-    rm -f /tmp/.la-prev.$$
     if [ -n "$outdir" ]; then
       dest="$outdir/${label}-$(basename "$p")"
       if pull "$vm" "$p" "$sz" "$dest"; then
         R_PULLED=$((R_PULLED + 1))
-        printf '%s\t%s\t%s\n' "$label" "$p" "${PULL_BYTES:-${sz:-?}}" >> "$outdir/.lane-artifacts-index"
+        printf '%s\t%s\t%s\n' "$label" "$p" "${PULL_BYTES:-${sz:-?}}" >> "$IDX_NEW"
       else
         R_PULLFAIL=$((R_PULLFAIL + 1))
       fi
     fi
   done <<< "$res"
   return 0
+}
+
+# commit_index — promote the side index this run wrote, and only NOW delete what the previous index
+# recorded and this run did not. Reached only from the exit-0 path (every requested box answered AND
+# every pull succeeded), which is the only state in which replacing the previous collection is honest.
+commit_index() {
+  local _l p _s _n new_keys
+  [ -n "${outdir:-}" ] || return 0
+  if [ ! -f "${IDX:-}" ]; then mv -f "$IDX_NEW" "$IDX" 2>/dev/null; return 0; fi
+  # label<TAB>path pairs this run recorded. Exact-match, so a caller-supplied label is handled the same
+  # way a default one is; the old `pi-cell-*` glob missed any such label and left run 1's file beside
+  # run 2's index for any consumer that globs the directory instead of reading the index.
+  new_keys="$(cut -f1,2 "$IDX_NEW" 2>/dev/null)"
+  while IFS="$(printf '\t')" read -r _l p _s; do
+    [ -n "${p:-}" ] || continue
+    _n="$_l-$(basename "$p")"
+    # ⛔ A HERE-STRING, NOT A PIPE. `producer | grep -q` is the shape this repo's sigpipe guard exists
+    # for: grep exits at the first match, the producer dies of SIGPIPE, and under `pipefail` the pipeline
+    # reports failure — which here would read as "not in the new index" and DELETE a file this run had
+    # just collected, the same data-loss class the promotion exists to prevent.
+    if grep -qxF -- "$_l$(printf '\t')$p" <<< "$new_keys"; then continue; fi
+    rm -f "$outdir/$_n"
+  done < "$IDX"
+  mv -f "$IDX_NEW" "$IDX" 2>/dev/null
+}
+
+# finish <rc> — the ONE terminal path for `collect`/`logs`: promote the collection on a complete run,
+# discard the side index on any other, and say plainly which collection the directory now holds.
+finish() {
+  local rc="$1"
+  if [ -n "${outdir:-}" ] && [ -n "${IDX_NEW:-}" ]; then
+    if [ "$rc" -eq 0 ] && [ "${R_PULLFAIL:-0}" -eq 0 ]; then
+      commit_index
+    else
+      rm -f "$IDX_NEW"
+      if [ -f "${IDX:-}" ]; then
+        echo "ℹ '$outdir' still holds the PREVIOUS collection — this run ended at exit $rc and did NOT replace it"
+      fi
+    fi
+  fi
+  exit "$rc"
 }
 
 case "$verb" in
@@ -361,15 +450,17 @@ case "$verb" in
       if [ ! -d "$outdir" ] || [ ! -w "$outdir" ]; then
         echo "lane-artifacts: --out '$outdir' is not a writable directory" >&2; exit 64
       fi
-      # Delete exactly what the PREVIOUS index recorded — label-independent. A `pi-cell-*` glob missed
-      # any caller-supplied label (`--box edge-7`), leaving run 1's file beside run 2's empty index for
-      # any consumer that globs the directory instead of reading the index.
-      if [ -f "$outdir/.lane-artifacts-index" ]; then
-        while IFS="$(printf '\t')" read -r _l p _s; do
-          [ -n "${p:-}" ] && rm -f "$outdir/${_l}-$(basename "$p")"
-        done < "$outdir/.lane-artifacts-index"
-      fi
-      : > "$outdir/.lane-artifacts-index"
+      # ⛔ THE PREVIOUS COLLECTION IS NOT TOUCHED UNTIL THIS RUN HAS SOMETHING TO REPLACE IT WITH.
+      # A startup pass deleted every file the old index recorded and truncated the index BEFORE the
+      # first box was scanned; the run then routinely produced nothing (ABSENT / UNMEASURED /
+      # PULL-FAILED) and never repopulated the directory, so a typo'd or failing re-run silently
+      # DESTROYED the only orchestrator-side copy of a cell lane's artifact — while the box copy may
+      # already be gone after a recycle or a kill. That is the durability this tool exists to provide,
+      # so the deletion is the one thing that must not be optimistic. Rows go to a SIDE index and are
+      # promoted by `commit_index` only on the path that actually collected everything.
+      IDX="$outdir/.lane-artifacts-index"
+      IDX_NEW="$outdir/.lane-artifacts-index.new"
+      : > "$IDX_NEW" 2>/dev/null || { echo "lane-artifacts: --out '$outdir' index is not writable" >&2; exit 64; }
     fi
     UNRES_NOTE=""
     [ "${NUNRESOLVED:-0}" -gt 0 ] && UNRES_NOTE=" (+$NUNRESOLVED unresolved label(s):$UNRESOLVED_LABELS)"
@@ -389,17 +480,17 @@ case "$verb" in
     MISSING=$(( (NBOX - REACHED) + NUNRESOLVED ))
     if [ "$REACHED" -eq 0 ]; then
       echo "UNMEASURED(no box answered — this says nothing about whether the file exists)"
-      exit 4
+      finish 4
     fi
     if [ "$R_HITS" -eq 0 ]; then
       if [ "$MISSING" -gt 0 ]; then
         printf 'UNMEASURED(nothing matched on the %s box(es) actually searched:%s — %s requested box(es) did NOT answer (%s), so ABSENT is NOT claimed)\n' \
           "$REACHED" "$REACHED_LABELS" "$MISSING" "${UNRESOLVED_LABELS:-exec failed}"
-        exit 4
+        finish 4
       fi
       printf 'ABSENT-EVERYWHERE(find %s -maxdepth 1 %s-name "%s" matched nothing%s on all %s box(es):%s)\n' \
         "$ATIF_ROOT" "${since:+-mmin -$since }" "$pat" "${since:+ in the last $since minutes}" "$REACHED" "$REACHED_LABELS"
-      exit 3
+      finish 3
     fi
     [ "$R_TRUNC" -gt 0 ] && echo "⚠ TRUNCATED at the $ROW_CAP-row cap on $R_TRUNC box(es)"
     # ⛔ A ROW-CAPPED LIST IS A PARTIAL LIST. `collect '*'` with more matches than the cap printed "this list
@@ -411,11 +502,11 @@ case "$verb" in
     # would let a caller treat a short list as complete.
     if [ "${R_TRUNC:-0}" -gt 0 ]; then
       echo "FOUND-TRUNCATED($R_HITS file(s) shown, capped at $ROW_CAP per box on $R_TRUNC box(es) — the list is NOT complete; narrow the pattern)"
-      exit 4
+      finish 4
     fi
     if [ "${R_UNPARSE:-0}" -gt 0 ]; then
       echo "UNMEASURED($R_UNPARSE box(es) returned an unparseable scan row — the list above is NOT complete, so no 'found/absent' verdict is claimed)"
-      exit 4
+      finish 4
     fi
     # Partial coverage is disclosed on the SUCCESS path too: exit 0 with 1 of 3 boxes silent reads as
     # a complete result to any caller keying on the exit status.
@@ -425,9 +516,9 @@ case "$verb" in
     fi
     if [ "$R_PULLFAIL" -gt 0 ]; then
       echo "PULL-FAILED($R_PULLFAIL file(s) did NOT arrive — see the ✗ lines)"
-      exit 5
+      finish 5
     fi
-    exit 0
+    finish 0
     ;;
   ls)
     T="$(printf '\t')"; ls_hole=0; any_scanned=0
@@ -447,7 +538,16 @@ case "$verb" in
       rows="$(printf '%s\n' "$raw" | tail -n +2 | grep -v '^$')"
       [ -n "$rows" ] || return 0
       n="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
-      printf '%s\n' "$rows" | head -n "$cap" | awk -F"$T" '{printf "  %10s  %s  %s\n", $2, $1, $3}'
+      # ⛔ A ROW-CAPPED SCAN IS NOT A TOTAL. `scan` stops at ROW_CAP, so `n` was at most ROW_CAP+1 while this
+      # verb printed it as the population ("shown 25 of 201" about a box holding 250) and exited 0 — a
+      # measured total the inventory never measured, in the verb an operator uses to ask what EXISTS. The
+      # display cap is fine (it is disclosed and `n` is then true); the ROW cap is a coverage hole and must
+      # abstain, exactly as `collect` does on the same signal.
+      if [ "$n" -gt "$ROW_CAP" ]; then
+        echo "   UNMEASURED($what: more than $ROW_CAP matches — the scan is row-capped, so this inventory is NOT complete; use \`collect\` with a narrower pattern)"
+        return 1
+      fi
+      printf '%s\n' "$rows" | head -n "$cap" | awk -F"$T" '{printf "  %10s  %s  %s\n", $1, $3, $2}'
       [ "$n" -gt "$cap" ] && echo "   ⚠ shown $cap of $n — pass a narrower pattern with \`collect\` for the rest"
       return 0
     }
