@@ -157,6 +157,13 @@ DRY_RUN=0
 # way to render an armed artifact from the command line, because an operator who can type the armed
 # state is an operator who can arm a box without a record — and then nothing on disk says when or why.
 FORCE_MODE_FLAG=""
+# ⛔ AND WHETHER THE OPERATOR ASKED FOR IT IS A SEPARATE FACT FROM THE FLAG ITSELF. `do_disarm` sets
+# `FORCE_MODE_FLAG="--dry-run"` on purpose — it must re-render DISARMED *while the record still exists*,
+# and only delete the record once the verification accepted that render. So a guard keyed on
+# `FORCE_MODE_FLAG` refuses the disarm's own re-render (measured: it turned `--disarm` into exit 1 and
+# stranded the record). `REPORT_ONLY` is set by the CLI parse alone, so "the operator passed
+# --report-only" and "this render is forced" cannot be confused for one another.
+REPORT_ONLY=0
 
 log_line() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
@@ -481,8 +488,9 @@ artifact_repo_value() { # artifact_repo_value <artifact>
 
 # note_repo_change — an install must not SILENTLY repoint the pool an installed artifact converges.
 # ⛔ MEASURED HARM (the same class as `adopt_installed_provisioner`, one argument over): `--repo` defaults
-# to agent-infra's own repo when `RUNNER_AUTOSCALE_REPO` is unset, so a routine `--install` from a shell
-# that does not export it rewrites a box converged from a NON-default pool to the default — and the pass
+# to `daniel-ospina/tortoise` (the `REPO` default at the top of this file, and the one the header states)
+# when `RUNNER_AUTOSCALE_REPO` is unset, so a routine `--install` from a shell that does not export it
+# rewrites a box converged from a NON-default pool to the default — and the pass
 # then grows the wrong pool every 9 minutes, with `changed=1` and exit 0. Unlike the provisioner there is
 # no "unresolved" state to fall back on (a default is always resolvable), so this REPORTS rather than
 # adopts: the operator may well mean it, and blocking that would be a false block.
@@ -642,6 +650,30 @@ arm_record_valid() {
         && grep -q '^armed-date=.' "$ARM_FILE" 2>/dev/null
 }
 
+# refuse_report_only_over_record — the RECORD half of the `--report-only` guard.
+# ⛔ IT CANNOT RUN AT PARSE TIME, AND RUNNING THERE WAS A MEASURED FALSE DISARM. `ARM_FILE` is frozen at
+# the top of this file from the READER's `$STATE_DIR`, and `adopt_installed_state_dir` above — the rule
+# that "the artifact is the record of what was resolved here too" — does not run until a verb does.
+# So a parse-time check here read the READER's path while the render that follows reads the ARTIFACT's:
+# on a box installed and armed WITH `RUNNER_AUTOSCALE_STATE_DIR`, then read by a routine shell that does
+# not export it, the guard found no record, let the install through, the install adopted the artifact's
+# directory and rendered the FORCED `--dry-run` artifact — while the dated record survived beside it.
+# That is the exact state the refusal below exists to prevent (the next routine `--install` re-arms from
+# that record), and the state `--status` exits 1 on. The verdict depended on the INVOKING SHELL, not on
+# the box: the same invocation WITH the seam refused correctly. So the check belongs AFTER target
+# selection and adoption, immediately before the render — which is where `do_install_systemd` and
+# `do_install_launchd` call it, on both platforms (the launchd arm adopts just as late).
+# ⛔ IT KEYS ON `REPORT_ONLY`, NOT ON `FORCE_MODE_FLAG`: the verb must still be able to force a DISARMED
+# render over a live record (that is `do_disarm`'s whole ordering), and only the OPERATOR's flag means
+# "pretend this box is disarmed without disarming it".
+refuse_report_only_over_record() {
+    [ "$REPORT_ONLY" = 1 ] || return 0
+    arm_record_valid || return 0
+    err "REFUSING --report-only: $ARM_FILE still arms this box, so the next --install would re-arm it and"
+    err "you would believe it was disarmed. Use --disarm (it removes the record AND reinstalls)."
+    return 1
+}
+
 # arm_flag — the mode this render would carry. The record is the ONLY arming input.
 # ⛔ THE ARMED VALUE IS THE EMPTY STRING, NOT A FLAG. The converger has NO `--apply`: converging is its
 # DEFAULT, and `--dry-run` is the only mode switch it accepts (measured on pi-cell-1: the first armed
@@ -714,6 +746,15 @@ render() { # render <template> <dest> <systemd|launchd>
 
 # plist_is_valid <path> — REFUSE a rendered plist launchd cannot parse. `plutil -lint` is the host's own
 # parser where it exists; python's expat is the fallback so a Linux test can prove the shape too.
+# ⛔ THREE ANSWERS, NOT TWO: 0 = parses, 1 = does NOT parse, 2 = UNVERIFIABLE (no parser on this host).
+# It used to answer 0 for the third case ("no parser available: do not invent a refusal"), which is the
+# only `|| return 0` in this file that turned "could not measure" into "PASS" — and both callers' own
+# messages assert well-formedness, so a plist that was never read was certified as one that parses
+# (`verify_installed_artifact_plist` runs this immediately before loading the job). In production the
+# third case is unreachable (launchd only runs on Darwin, where `/usr/bin/plutil` exists, and the Linux
+# arm always needs python3 for the converger) — which is exactly why it must not be a silent PASS: an
+# unreachable-by-construction branch is the one nobody re-reads when it becomes reachable. Both callers
+# branch on 2 and refuse, naming the missing parser instead of claiming the file is malformed.
 plist_is_valid() {
     local f="$1"
     if command -v plutil >/dev/null 2>&1; then
@@ -722,7 +763,7 @@ plist_is_valid() {
     fi
     # ⛔ `type -P` AND NOT A `command -v … || return` CHAIN: the guard splits `||` as a pipe and reads
     # the tail as a program, which made this installer unexecutable from a worktree (#709).
-    type -P python3 >/dev/null 2>&1 || return 0   # no parser available: do not invent a refusal
+    type -P python3 >/dev/null 2>&1 || return 2   # no parser: UNVERIFIABLE, never a pass
     python3 -c 'import sys,xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' "$f" >/dev/null 2>&1
 }
 
@@ -1227,9 +1268,16 @@ classify_exec_args() { # classify_exec_args <newline-separated args AFTER interp
 }
 
 verify_installed_artifact_plist() {
-    local plist="$UNIT_DIR/$LABEL.plist" args
+    local plist="$UNIT_DIR/$LABEL.plist" args prc=0
     [ -f "$plist" ] || { err "REFUSING to load: $plist is not there after the install"; return 1; }
-    plist_is_valid "$plist" || { err "REFUSING to load: the installed plist does not parse"; return 1; }
+    plist_is_valid "$plist" || prc=$?
+    if [ "$prc" = 2 ]; then
+        err "REFUSING to load: no plist parser on this host (neither plutil nor python3), so $plist CANNOT BE VERIFIED — loading a job on the strength of a file this installer never read is the false PASS this check exists to prevent"
+        return 1
+    elif [ "$prc" != 0 ]; then
+        err "REFUSING to load: the installed plist does not parse"
+        return 1
+    fi
     args="$(plist_program_args "$plist")"
     args_has_line "$args" "$SCRIPT" || {
         err "REFUSING to load: the installed plist's ProgramArguments do not name the converger ($SCRIPT): $args"
@@ -1305,6 +1353,7 @@ do_install_systemd() {
     [ -f "$src_svc" ] && [ -f "$src_tim" ] || { err "templates missing under $TEMPLATES_DIR (expected $UNIT_NAME.service + $UNIT_NAME.timer)"; return 1; }
     choose_target || { err "no scheduler available: no passwordless sudo for a system unit, and no systemd user manager. Install by hand, or give the box sudo. NOT silently skipping — a converger that never runs is the failure this exists to remove."; return 1; }
     adopt_installed_state_dir
+    refuse_report_only_over_record || return 1
     refuse_systemd_unsafe_values || return 1
     adopt_installed_provisioner
     note_repo_change
@@ -1399,10 +1448,11 @@ do_install_systemd() {
 
 do_install_launchd() {
     local src_plist="$LAUNCHD_TEMPLATES_DIR/$LABEL.plist"
-    local tmpd changed=0 loaded=0
+    local tmpd changed=0 loaded=0 plist_rc=0
     [ -f "$src_plist" ] || { err "plist template missing: $src_plist (set LAUNCHD_TEMPLATES_DIR)"; return 1; }
     choose_target || { err "no scheduler available"; return 1; }
     adopt_installed_state_dir
+    refuse_report_only_over_record || return 1
     adopt_installed_provisioner
     note_repo_change
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
@@ -1410,7 +1460,16 @@ do_install_launchd() {
     # ⛔ A PLIST THAT DOES NOT PARSE IS NOT INSTALLED. Measured on this family: a placeholder inside an
     # XML comment rendered an option flag into it, a doubled dash is forbidden there, the artifact was
     # not well-formed, and the box would have silently had no scheduled pass while the installer said OK.
-    if ! plist_is_valid "$tmpd/$LABEL.plist"; then
+    # ⛔ AND "COULD NOT PARSE IT" IS NOT "IT PARSES" — the third answer refuses too, with its own message,
+    # so the operator is never told a file is malformed when the truth is that this host has no parser.
+    plist_rc=0
+    plist_is_valid "$tmpd/$LABEL.plist" || plist_rc=$?
+    if [ "$plist_rc" = 2 ]; then
+        err "REFUSING: no plist parser on this host (neither plutil nor python3), so the rendered plist CANNOT BE VERIFIED — installing it would certify a file this installer never read, and launchd would be the first thing to try"
+        err "  rendered: $tmpd/$LABEL.plist"
+        err "  hint: install python3 (or run this on the Darwin host that owns the schedule) so the render can be checked before it is installed"
+        rm -rf "$tmpd"; return 1
+    elif [ "$plist_rc" != 0 ]; then
         err "REFUSING: the rendered plist is not well-formed XML — launchd would refuse it and this box would have no converger"
         err "  rendered: $tmpd/$LABEL.plist"
         if command -v python3 >/dev/null 2>&1; then
@@ -2407,7 +2466,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --install)     MODE=--install ;;
         --dry-run)     DRY_RUN=1 ;;
-        --report-only) FORCE_MODE_FLAG="--dry-run" ;;
+        --report-only) FORCE_MODE_FLAG="--dry-run"; REPORT_ONLY=1 ;;
         --arm)         MODE=--arm ;;
         --reason)      shift; ARM_REASON="${1:-}" ;;
         --reason=*)    ARM_REASON="${1#--reason=}" ;;
@@ -2420,10 +2479,15 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# ⛔ `--report-only` WHILE A RECORD EXISTS IS A FALSE DISARM. It would render `--dry-run`, the operator
-# would see a disarmed box, and the NEXT routine `--install` (a bring-up, a sync, an operator re-running
-# it) would silently re-arm from the record that is still there. So it refuses and names the verb that
-# actually disarms.
+# ⛔ AND `--report-only` WHILE A RECORD EXISTS IS REFUSED — BUT NOT FROM HERE. The RECORD half of that
+# guard cannot be answered at parse time: `ARM_FILE` above is frozen from the READER's `$STATE_DIR`, while
+# the render below reads the path the ARTIFACT declares, and the two are resolved together only once a
+# verb has run `choose_target` + `adopt_installed_state_dir`. A parse-time check therefore answered about
+# a different record than the render it guards, and on a box whose artifact declares its own state dir it
+# let the install through and produced the forced-DISARMED artifact with the dated record surviving —
+# the exact state the refusal exists to forbid. It now runs as `refuse_report_only_over_record`, from
+# BOTH install verbs, immediately after adoption and before the render (see its own comment above).
+# The verb check directly above DOES stay here: it is a property of the invocation, not of the box.
 # ⛔ AND IT IS ONLY A RENDER FLAG FOR `--install`. On any other verb it used to be silently ignored by
 # the verb's own logic and honoured by the render inside it, which produced two measured lies:
 #   * `--arm --report-only` minted a dated arming record, then rendered the FORCED disarmed artifact,
@@ -2431,15 +2495,10 @@ done
 #     after which the next routine `--install` armed from that record with no dated step at that moment;
 #   * `--uninstall --report-only` performed a real removal.
 # A preview flag that a writer ignores is worse than no flag.
-if [ -n "$FORCE_MODE_FLAG" ] && [ "$MODE" != "--install" ]; then
+if [ "$REPORT_ONLY" = 1 ] && [ "$MODE" != "--install" ]; then
     err "REFUSING --report-only with $MODE: it is a render flag for --install only. On $MODE it would either"
     err "be ignored by the verb while its render honoured it (a record written and 'ARMED' printed over a"
     err "disarmed artifact) or let a real removal run under a preview flag."
-    exit 1
-fi
-if [ -n "$FORCE_MODE_FLAG" ] && arm_record_valid; then
-    err "REFUSING --report-only: $ARM_FILE still arms this box, so the next --install would re-arm it and"
-    err "you would believe it was disarmed. Use --disarm (it removes the record AND reinstalls)."
     exit 1
 fi
 
