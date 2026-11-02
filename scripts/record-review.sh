@@ -862,6 +862,11 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   created="${row%%$'\t'*}"; _rest="${row#*$'\t'}"
   parent="${_rest%%$'\t'*}"; _rest="${_rest#*$'\t'}"
   body="${_rest%%$'\t'*}"; state="${_rest#*$'\t'}"
+  # The BODY is the only place a reviewer's own RANGE STATEMENT can live, so the
+  # delta arm (which re-attests a range) must be able to read it. A scratch global
+  # rather than a widened signature keeps every other caller untouched; it is only
+  # meaningful after a 0 return.
+  EVIDENCE_BODY="$body"
   # The comment / review-comment arms emit three fields and carry no state; when
   # the split left `_rest` intact there was no 4th field to take.
   [ "$state" = "$_rest" ] && state=""
@@ -1340,6 +1345,25 @@ $m"
     # commit in the range, which is the checkable meaning of "covers the range".
     if ! verify_review_evidence "$cover" "$anchor"; then
       echo "   delta: the covering artifact '$cover' could not be verified against the range (reason above) — a delta over authored content needs a verdict that postdates ${anchor:0:12}…, the newest authored commit in the range." >&2
+      return 1
+    fi
+    # ⛔ (10a) THE RANGE MUST BE THE REVIEWER'S CLAIM, NOT AN INFERENCE FROM DATES.
+    # A committer date records when a commit was CREATED, not when it was pushed: a
+    # lane that merges an OLD-DATED branch into its PR introduces content committed
+    # months earlier, so nothing newer than the original verdict enters `cands`, the
+    # anchor never moves, and the old cover still "postdates" the range — while the
+    # plain head-bound path (`--evidence comment:<id>`) REFUSES the same head, because
+    # it compares against the HEAD's date. Review reproduced exactly that asymmetry
+    # (delta rc 0, plain refused), which made the authored arm either redundant or
+    # unsound depending on dates. Dates cannot settle it: the artifact must SAY it
+    # covered this range. Any of A..B, or B alone, in 40-hex or 12-char form.
+    body_claim=0
+    for _needle in "$from..$to" "${from:0:12}..${to:0:12}" "$to" "${to:0:12}"; do
+      case "$EVIDENCE_BODY" in *"$_needle"*) body_claim=1; break ;; esac
+    done
+    if [ "$body_claim" -ne 1 ]; then
+      echo "   delta: the covering artifact '$cover' does not NAME the range ${from:0:12}…..${to:0:12}… (it names neither the range nor ${to:0:12}…) — and a verdict that does not state which range it covered cannot be extended over authored commits by DATE alone, because a commit's date records when it was CREATED: an old-dated branch merged in after the review slips through an anchor built only from dates." >&2
+      echo "   → if the reviewer did cover this range, quote it in the artifact (e.g. delta:${from:0:12}..${to:0:12}); or run a fresh review at ${to:0:12}… and record it with plain --evidence comment:<id>." >&2
       return 1
     fi
   fi
