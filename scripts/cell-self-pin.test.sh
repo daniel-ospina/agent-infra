@@ -43,6 +43,14 @@ ck()  { if [ "$1" -eq 0 ]; then ok "$2"; else bad "$2"; fi; }
 # suite for no reason but the host.
 T="$(cd /tmp && pwd -P)/cell-self-pin.selfcheck.$$"
 mkdir -p "$T" || { echo "cannot create $T" >&2; exit 1; }
+# ⛔ THE DROP-IN ROOT IS HERMETIC PER RUN (round-12 review, P2). Unsetting the seam made the installer
+# scan the REAL `/etc/systemd/system`, `/run`, `/usr/local/lib` and `/usr/lib` roots — measured at 151
+# reads of each real root per run, including 66 reads of this host's own
+# `/etc/systemd/system/cell-self-pin.service.d/user.conf`. A host drop-in that is benign makes every install
+# leg pass for a reason unrelated to the code under test; the same file carrying `WorkingDirectory=` or a
+# `Condition*` (precisely the classes `verify_dropins` refuses) reds them all. A suite that gates the
+# effective unit must not READ the host's effective unit.
+mkdir -p "$T/dropins-hermetic"
 # ⛔ AND IT IS RECLAIMED ON SUCCESS. The first version left ~1 MB per run behind on every green run, on
 # cells that sit at 91-98 % disk — a test suite that consumes the resource it is guarding. The failure
 # path still prints the scratch path for a repro.
@@ -66,7 +74,9 @@ runat() {
   env -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
       -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
-      -u CELL_SELF_PIN_DROPIN_ROOTS \
+      -u CELL_SELF_PIN_SYSTEMCTL \
+      CELL_SELF_PIN_DROPIN_ROOTS="$T/dropins-hermetic" \
+      CELL_SELF_PIN_SYSTEMCTL=systemctl \
       PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
@@ -79,7 +89,9 @@ runat_keep_pinfile() {
   env -u HARNESS -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
       -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
-      -u CELL_SELF_PIN_DROPIN_ROOTS \
+      -u CELL_SELF_PIN_SYSTEMCTL \
+      CELL_SELF_PIN_DROPIN_ROOTS="$T/dropins-hermetic" \
+      CELL_SELF_PIN_SYSTEMCTL=systemctl \
       PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
@@ -611,6 +623,32 @@ refuses_timer 'a timer with NO [Timer] section at all' \
 # the latch version ACCEPTS it, because it only ever looked for a non-blank line.
 refuses_timer 'the repeating trigger DISCARDED by a later empty OnCalendar= (a LIST RESET)' \
   "$(doctor_timer_append clock-reset '' '[Timer]\nOnCalendar=\nOnBootSec=3min\n')" "$T/tu8" 'no REPEATING trigger'
+# ⛔ AND A VALUE THE MANAGER CANNOT PARSE IS NOT AN EFFECTIVE TRIGGER (round-12 review, P1). The replay
+# asked only "is there a non-blank value?", and systemd DISCARDS a value it cannot parse — `Failed to parse
+# timer value, ignoring: 10minx` (systemd.timer(5)) — leaving the one-shot `OnBootSec=` alone. MEASURED
+# against the live systemd 255 manager (`systemctl show -p TimersMonotonic` on a probe unit):
+# `OnUnitActiveSec=10minx` installed rc=0 with `TimersMonotonic={ OnBootUSec=3min }` alone, while the control
+# `10min` read back as BOTH `OnUnitActiveUSec=10min` and `OnBootUSec=3min`. So the rule that exists to refuse
+# a dead clock certified one, one spelling further out from the LIST RESET it already handled. The
+# TRAILING COMMENT leg is the realistic one: systemd.syntax(7) has no trailing comments, so an operator
+# editing the cadence and annotating it produces exactly this.
+refuses_timer 'a repeating trigger with an UNPARSEABLE timespan (10minx)' \
+  "$(doctor_timer unit-badspan 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=10minx|')" "$T/tu9" 'cannot parse'
+refuses_timer 'a repeating trigger with a TRAILING COMMENT (systemd has none)' \
+  "$(doctor_timer unit-comment 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=10min # every ten minutes|')" "$T/tu10" 'cannot parse'
+refuses_timer 'an OnCalendar= that is NOT a calendar expression (10min)' \
+  "$(doctor_timer unit-badcal 's|^OnUnitActiveSec=.*$|OnCalendar=10min|')" "$T/tu11" 'cannot parse'
+refuses_timer 'a repeating trigger of exactly infinity (a VALID timespan that means NEVER)' \
+  "$(doctor_timer unit-inf 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=infinity|')" "$T/tu12" 'cannot parse'
+# ⛔ THE POSITIVE CONTROL, because "refuse every value" would satisfy all four legs above. A real calendar
+# expression and the shortcut word must INSTALL: the rule refuses what systemd DISCARDS, never what it can
+# read — and an over-block here would close the one edit an operator is most likely to make.
+u_cal="$T/units-cal"; out="$(install_doctored "$(doctor_timer cal-ok 's|^OnUnitActiveSec=.*$|OnCalendar=*-*-* 04:00:00|')" "$u_cal")"; rc=$?
+[ "$rc" -eq 0 ] && [ -f "$u_cal/cell-self-pin.timer" ] && ok "…and a VALID OnCalendar= expression still installs (the rule refuses unparseable values, not calendars)" \
+  || bad "refused a valid OnCalendar=*-*-* 04:00:00 (rc=$rc): $out"
+u_daily="$T/units-daily"; out="$(install_doctored "$(doctor_timer cal-daily 's|^OnUnitActiveSec=.*$|OnCalendar=daily|')" "$u_daily")"; rc=$?
+[ "$rc" -eq 0 ] && [ -f "$u_daily/cell-self-pin.timer" ] && ok "…and the OnCalendar= shortcut word 'daily' installs" \
+  || bad "refused OnCalendar=daily (rc=$rc): $out"
 
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
@@ -674,13 +712,27 @@ refuses_dropin 'lives in a DASH-TRUNCATED drop-in dir (cell-.service.d)' "$(drop
 # pin" and exited 0: the same false PASS one directory over, in the directory an operator building a cell
 # by hand is most likely to use. MEASURED: deleting `/run` and `/usr/lib` from that list left this suite at
 # 240 ok / 0 failed, so nothing pinned the enumeration at all.
-roots_out="$(runat "$T/home" bash "$PIN" --print-dropin-roots 2>&1)"
+roots_out="$(runat "$T/home" CELL_SELF_PIN_DROPIN_ROOTS= bash "$PIN" --print-dropin-roots 2>&1)"
 for _r in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system; do
   case "$roots_out" in
     *"$_r"*) ok "…and the drop-in gate SCANS ${_r} — a systemd SYSTEM unit directory it merges for this unit" ;;
     *) bad "the drop-in gate does not scan ${_r}: a legacy drop-in there is merged over the rendered unit and read by NOTHING, which is #3194's false PASS one directory over — [$roots_out]" ;;
   esac
 done
+# ⛔ AND EVERY OTHER LEG IS HERMETIC (round-12 review, P2). Unsetting the seam did NOT make the scan
+# hermetic: it fell back to the REAL roots above — measured at 151 reads of each real root per run,
+# including 66 reads of this host's own `/etc/systemd/system/cell-self-pin.service.d/user.conf`. This host
+# happens to carry an identity-only drop-in, which is the only reason the install legs are green here; the
+# same file carrying `WorkingDirectory=` or a `Condition*` (precisely the classes `verify_dropins` refuses)
+# would red every install leg for a reason unrelated to the code, and a REFUSAL leg could be satisfied by
+# host state instead of by its doctor. The leg above asks for the DEFAULT roots deliberately; this one pins
+# that nothing else touches them.
+hermetic_out="$(runat "$T/home" bash "$PIN" --print-dropin-roots 2>&1)"
+case "$hermetic_out" in
+  *'/etc/systemd/system'*) bad "a leg WITHOUT the seam scanned the host's real /etc/systemd/system — the suite gates the effective unit while reading the host's own: [$hermetic_out]" ;;
+  *"$T/dropins-hermetic"*) ok "…and every other leg scans a PER-RUN drop-in root, never the host's real unit directories" ;;
+  *) bad "the per-run drop-in root is not what a default leg scans: [$hermetic_out]" ;;
+esac
 # The real roots are root-owned on every box that has them, so the ENUMERATION is exercised through its
 # documented seam rather than asserted by grep: a drop-in planted under a CONFIGURED root, outside the unit
 # dir, must be refused and name the file. A gate that only reads the unit dir passes the legs above.
@@ -857,6 +909,55 @@ mk_scoped_systemctl() { # <dir> <state-dir>
   return 0
 }
 SHIPPED=eldato-harness-apply.timer
+# mk_vanish_systemctl — the manager ANSWERS its reads, then LOSES ITS BUS after a `disable`. This is not a
+# hypothetical: `Failed to connect to bus: No medium found` is this box's real answer from the identity a
+# system unit runs as, and it is why an EXIT CODE cannot answer "was it retired?".
+mk_vanish_systemctl() { # <dir> <state-dir>
+  local d="$1" s="$2"
+  mkdir -p "$d" "$s"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    "S='$s'" \
+    'scope=system' \
+    'if [ "${1:-}" = "--user" ]; then scope=user; shift; fi' \
+    'verb="${1:-}"; shift 2>/dev/null || true' \
+    '[ "${1:-}" = "--now" ] && shift' \
+    'unit="${1:-}"' \
+    'st="$S/$scope-$unit"' \
+    'if [ -f "$S/gone" ] && [ "$verb" = "is-enabled" ]; then echo "Failed to connect to bus: No medium found" >&2; exit 1; fi' \
+    'case "$verb" in' \
+    '  is-enabled) if [ -f "$st" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;' \
+    '  disable) rm -f "$st"; : >"$S/gone"; exit 0 ;;' \
+    '  enable) : >"$st"; rm -f "$S/gone"; exit 0 ;;' \
+    'esac' \
+    'exit 0' >"$d/systemctl"
+  chmod +x "$d/systemctl"
+  return 0
+}
+# mk_denied_systemctl — the SYSTEM manager ANSWERS, and REFUSES every `disable`. This is polkit's answer to# a non-root `systemctl disable --now` of a system unit (measured as this identity: `Failed to disable
+# unit: Access denied`), and it is the one shape `mk_scoped_systemctl` cannot model: that fixture's
+# `disable` either succeeds or LIES by exiting 0 and changing nothing.
+mk_denied_systemctl() { # <dir> <state-dir>
+  local d="$1" s="$2"
+  mkdir -p "$d" "$s"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    "S='$s'" \
+    'scope=system' \
+    'if [ "${1:-}" = "--user" ]; then scope=user; shift; fi' \
+    'verb="${1:-}"; shift 2>/dev/null || true' \
+    '[ "${1:-}" = "--now" ] && shift' \
+    'unit="${1:-}"' \
+    'st="$S/$scope-$unit"' \
+    'case "$verb" in' \
+    '  is-enabled) if [ -f "$st" ]; then echo enabled; exit 0; fi; echo disabled; exit 1 ;;' \
+    '  disable) echo "Failed to disable unit: Access denied" >&2; exit 1 ;;' \
+    '  enable) : >"$st"; exit 0 ;;' \
+    'esac' \
+    'exit 0' >"$d/systemctl"
+  chmod +x "$d/systemctl"
+  return 0
+}
 # ── (a) a SYSTEM-manager-only box refuses, and names that scope ────────────────────────────────
 mk_scoped_systemctl "$T/fake-1sys" "$T/state-1sys"; : >"$T/state-1sys/system-$SHIPPED"
 out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-sys" PATH="$T/fake-1sys:$PATH" \
@@ -1036,6 +1137,21 @@ esac
 [ -f "$T/state-stub/system-$SHIPPED" ] \
   && ok "…and the retirement that DID take was ROLLED BACK (the box keeps an actuator, not zero)" \
   || bad "a failed migration left the system-scope actuator DISABLED and this unit not enabled — zero pin actuators"
+# ⛔ AND A READ-BACK THAT CANNOT ANSWER IS NOT A RETIREMENT (round-12 review, P2). `actuator_enabled_in` is
+# `systemctl is-enabled … >/dev/null 2>&1`, whose exit code is 1 BOTH for "disabled" and for "cannot reach the
+# bus" — so a manager that goes away after the disable read as RETIRED, in the one place whose comment claims
+# "VERIFIED, NOT ASSUMED". This is not exotic: `Failed to connect to bus: No medium found` is this box's real
+# answer from the identity a system unit runs as.
+mk_vanish_systemctl "$T/fake-vanish" "$T/state-vanish"
+: >"$T/state-vanish/system-$SHIPPED"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-vanish" PATH="$T/fake-vanish:$PATH" \
+       bash "$PIN" --install --takeover 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "a manager that DISAPPEARS after the disable is a REFUSAL — an unanswerable read-back is not a retirement" \
+  || bad "an unverifiable read-back was read as RETIRED (rc=$rc): $out"
+case "$out" in
+  *'UNVERIFIED'*) ok "…and it says the retirement is UNVERIFIED, instead of claiming the actuator is gone" ;;
+  *) bad "…but the refusal does not distinguish an unanswerable read-back from a retirement: $out" ;;
+esac
 # ── (e) an install that fails AFTER the retirement rolls it back ──────────────────────────────────
 # ⛔ THE FIRST VERSION RETIRED FIRST AND INSTALLED SECOND, with no rollback: any failure in mkdir, the
 # writes, `daemon-reload` or `enable` returned non-zero with the shipped timer already disabled AND
@@ -1146,6 +1262,50 @@ out="$(runat "$TICK" PATH="$T/fake-rearm-stub:$PATH" bash "$PIN" 2>&1)"; rc=$?
 case "$out" in
   *'DUPLICATE-ACTUATOR'*) ok "…and it names the state (DUPLICATE-ACTUATOR) and the manager it saw" ;;
   *) bad "…but the failure is not named: $out" ;;
+esac
+# ⛔ AND THE RETIREMENT MUST BE ABLE TO TAKE FROM THE IDENTITY THAT RUNS THIS PASS (round-12 review, P1).
+# The rendered unit runs as the OWNER of $CELL_HOME (non-root — measured render: `User=cmux`) and bring-up
+# re-arms the shipped timer in the SYSTEM manager as root, so a bare `systemctl disable --now` is polkit's
+# `Access denied` — MEASURED as this identity: `Failed to disable unit: Access denied`, before any unit
+# lookup. The re-take then RED'd every ten minutes and never reached the apply, i.e. the pin stopped
+# advancing (#3194's outcome, reached by following this change's own migration). `systemctl_system`
+# negotiates the privilege the sibling installer already requires (`install-harness-apply-timer.sh:390`),
+# and these legs pin both halves: the escalation is TAKEN, and a manager that refuses is still a named RED.
+mk_scoped_systemctl "$T/fake-esc" "$T/state-esc"
+: >"$T/state-esc/system-cell-self-pin.timer"
+: >"$T/state-esc/system-$SHIPPED"
+mkdir -p "$T/fakebin-sudo"
+printf '%s\n' '#!/bin/bash' \
+  '[ "${1:-}" = "-n" ] && shift' \
+  "printf '%s\\n' \"\$*\" >>'$T/sudo.calls.log'" \
+  'exec "$@"' >"$T/fakebin-sudo/sudo"
+chmod +x "$T/fakebin-sudo/sudo"
+: >"$T/sudo.calls.log"
+# `CELL_SELF_PIN_SYSTEMCTL=` (EMPTY) is the documented way to ask for the AUTO probe; it resolves to
+# `sudo -n systemctl` only because the fake `sudo` answers `sudo -n true`, which is exactly the sibling's test.
+out="$(runat "$TICK" CELL_SELF_PIN_SYSTEMCTL= PATH="$T/fakebin-sudo:$T/fake-esc:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "a re-armed SYSTEM actuator is retired by a NON-ROOT tick (the privilege is negotiated)" \
+  || bad "a non-root tick could not retire the re-armed SYSTEM actuator (rc=$rc): $out"
+[ -s "$T/sudo.calls.log" ] && ok "…and it escalated through 'sudo -n' — the same probe install-harness-apply-timer.sh:390 relies on" \
+  || bad "…but the retirement used NO escalation, so on a real box it is polkit's Access denied: $out"
+[ -f "$T/state-esc/system-$SHIPPED" ] && bad "…and the shipped timer is STILL enabled after the tick claimed to re-take the pin" \
+  || ok "…and the shipped SYSTEM timer is really disabled, not merely claimed"
+case "$(cat "$T/sudo.calls.log" 2>/dev/null)" in
+  *'is-enabled'*) bad "a READ was escalated — 'is-enabled' needs no privilege, and escalating it would make the guard's verdicts depend on sudo" ;;
+  *) ok "…and no READ was escalated (only the mutation needs root)" ;;
+esac
+# The refusal half: a manager that WILL NOT disable. Nothing may print "re-took the pin" for it, and the
+# remedy must name the privilege rather than telling the operator to run the same command again.
+mk_denied_systemctl "$T/fake-denied" "$T/state-denied"
+: >"$T/state-denied/system-cell-self-pin.timer"
+: >"$T/state-denied/system-$SHIPPED"
+out="$(runat "$TICK" PATH="$T/fake-denied:$PATH" bash "$PIN" 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "a manager that REFUSES the disable is a RED, not a silent second actor (polkit's Access denied, on a non-root unit)" \
+  || bad "a tick whose retirement was REFUSED still exited 0 (rc=$rc): $out"
+case "$out" in
+  *'re-took the pin'*) bad "…but it CLAIMED to have re-taken the pin over a disable that failed: $out" ;;
+  *'passwordless sudo'*) ok "…and the remedy names the privilege ('passwordless sudo'), so the operator is not sent to the same command again" ;;
+  *) bad "…but the refusal does not name what would make it work: $out" ;;
 esac
 # ⛔ AND A MANUAL RUN MUST NOT RETIRE SOMEONE ELSE'S ACTUATOR. If this unit is not installed in either
 # manager, the pass is not a second scheduled actor: it reports and touches nothing.

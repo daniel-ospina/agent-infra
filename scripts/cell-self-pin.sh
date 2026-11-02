@@ -32,7 +32,11 @@
 # ⛔ THE LESSON IS NOT "USE A DIFFERENT PATH". A hard-coded path in a rendered unit is stale the moment
 # the directory it names goes away, and NOTHING turns that stale into a signal — the unit's own colour
 # stayed green. So this pass DERIVES the layer on every tick, from the same record the controller reads,
-# and it REFUSES LOUDLY (exit 2, a named reason) when the record cannot answer.
+# and it REFUSES LOUDLY (exit 2, a named reason) when NEITHER the record, NOR the pin root, NOR `$HARNESS`
+# names a tree it can pin from. ⛔ The two FALLBACKS (newest tree under the pin root, then `$HARNESS`) are a
+# documented narrowing of that sentence, not an exception to it: each one says on STDERR that the tree it
+# chose is NOT proven to be the layer the controller executes, so the tick's colour is about the pin, never
+# a claim that the executed layer was identified.
 #
 # ── WHAT `--install` RESOLVES, AND WHERE EACH VALUE COMES FROM ─────────────────────────────────
 #   base       ${CELL_HOME:-$HOME}                — the expression this file, the unit's rendered
@@ -453,7 +457,7 @@ do_pass() {
   now="$(pinned_head)"
   if [ -z "$now" ]; then
     # ⛔ A LOST RECORD MUST NOT BE A PERMANENT, UNHEALABLE RED. `cloud-cell-supervisor.sh`'s
-    # `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch (`:1926`/`:1949`), so a
+    # `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch (`:2137`/`:2160`), so a
     # pin that is ALREADY at the tip takes `HARNESS_APPLIED=unchanged` and the record is never written.
     # A cell whose record was lost therefore reads an empty record every tick and REDs for ever on a
     # box that is in fact correct — the #3133 defect (merged), reproduced one layer up. The recorded
@@ -1170,16 +1174,43 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # `OnBootSec=3min`: `--install` printed "installed", rc=0, effective clock = one-shot.
   # The replay below is the SAME shape the `SuccessExitStatus=` rule already uses (:1036) — an empty
   # assignment is a LIST RESET for every list-shaped directive, so the lesson is applied once, here.
-  _eff="$(printf '%s\n' "$timer" | awk '
+  # ⛔ AND THE VALUE MUST BE ONE THE MANAGER CAN PARSE — "non-blank" is not "effective". A rule that asks
+  # only whether a value is PRESENT grades text, and systemd DISCARDS a value it cannot parse: `Failed to
+  # parse timer value, ignoring: 10minx` (systemd.timer(5)), leaving the one-shot `OnBootSec=` alone. So
+  # the rule that exists to refuse a dead clock certified one. MEASURED in review against the live systemd
+  # 255 manager (`systemctl show -p TimersMonotonic` on a probe unit): `OnUnitActiveSec=10minx`,
+  # `OnUnitActiveSec=10min # every ten minutes` and `OnCalendar=10min` each installed rc=0 with the
+  # repeating trigger GONE from the effective list, while the control `10min` read back as
+  # `OnUnitActiveUSec=10min ; OnBootUSec=3min`. The inline-comment spelling is the realistic one: an
+  # operator editing the cadence appends a comment, and systemd.syntax(7) has NO trailing comments.
+  # ⛔ THE GRAMMAR HERE IS DELIBERATELY NARROWER THAN systemd's, AND THAT IS THE SAFE DIRECTION: a
+  # REFUSAL costs an operator one edit, a false PASS costs the pin. `systemd-analyze` would be a second
+  # binary on the one path that must work on a bare box. Everything this template ships
+  # (`OnUnitActiveSec=<n>min`) and every ordinary cadence parses; `infinity` does NOT, because it is a
+  # VALID timespan that means NEVER — a dead clock, not a repeating one.
+  _replay="$(printf '%s\n' "$timer" | awk '
+    function timespan(v) {
+      return v ~ /^[0-9]+(\.[0-9]+)?(us|ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?([[:space:]]+[0-9]+(\.[0-9]+)?(us|ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?)*$/
+    }
+    function calendar(v) {
+      if (v ~ /[#;]/) return 0
+      if (v ~ /^(minutely|hourly|daily|weekly|monthly|quarterly|semiannually|annually|yearly)$/) return 1
+      return v ~ /[0-9][0-9]*:[0-9][0-9]/
+    }
     { line = $0; sub(/^[[:space:]]*/, "", line) }
     line ~ /^(OnBootSec|OnStartupSec|OnActiveSec|OnUnitActiveSec|OnUnitInactiveSec|OnCalendar)[[:space:]]*=/ {
       k = line; sub(/[[:space:]]*=.*/, "", k)
-      v = line; sub(/^[^=]*=[[:space:]]*/, "", v)
+      v = line; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
       if (v == "") { rep = 0; next }
-      if (k == "OnUnitActiveSec" || k == "OnCalendar") rep = 1
+      if (k == "OnUnitActiveSec") { if (timespan(v)) rep = 1; else bad = bad k "=" v "; "; next }
+      if (k == "OnCalendar")      { if (calendar(v)) rep = 1; else bad = bad k "=" v "; "; next }
     }
-    END { print rep + 0 }')"
-  _rep="${_eff:-0}"
+    END { print rep + 0 "|" bad }')"
+  _rep="${_replay%%|*}"
+  _badval="${_replay#*|}"
+  if [ "$_rep" -ne 1 ] && [ -n "$_badval" ]; then
+    bad "the rendered timer's only REPEATING trigger(s) carry a value systemd cannot parse (${_badval%; }) and no other one is valid — the manager DISCARDS such a value ('Failed to parse timer value, ignoring', systemd.timer(5)), which leaves the ONCE-per-boot OnBootSec=/OnStartupSec=/OnActiveSec= triggers alone, so the pin would run a single time and then stop for ever with every surface green. NOTE systemd.syntax(7): there are NO trailing comments, so a value followed by '#…' is an unparseable value. Give OnUnitActiveSec= a timespan ('10min') or OnCalendar= a calendar expression ('*-*-* 04:00:00', 'daily')"; return 1
+  fi
   [ "$_rep" -eq 1 ] || { bad "the rendered timer's EFFECTIVE trigger list declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, and an EMPTY OnUnitActiveSec=/OnCalendar= is a LIST RESET that discards every trigger above it, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare a non-empty OnUnitActiveSec= or OnCalendar= and put no empty assignment after it"; return 1; }
   return 0
 }
@@ -1363,6 +1394,32 @@ verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the 
 # stays silent, and `--install` puts TWO mutating actors on one pin — precisely the race the guard's own
 # comment says it exists to prevent. So ask BOTH, and NAME EVERY scope that answered — the answer is a
 # LIST, not "the" scope (see `actuator_scopes`).
+# systemctl_system — the SYSTEM manager, with the privilege the two MUTATING verbs need.
+# ⛔ THIS PASS RUNS AS THE CELL USER, AND A NON-ROOT `systemctl disable --now` IS POLKIT'S `Access denied`.
+# The rendered unit's `User=` is derived from the owner of `$CELL_HOME` (the identity whose git can answer
+# for the tree being pinned), so the per-tick re-take could NEVER take in the system manager: `disable`
+# failed, `one_actor_check` RED'd, and the tick exited before the apply — the pin stopped advancing, which
+# is #3194's own outcome reached by following this change's documented migration. MEASURED in review as
+# the cell identity: `systemctl disable --now <unit>` → `Failed to disable unit: Access denied` (polkit,
+# before any unit lookup), while `systemd-run --system` fails the same way.
+# READS STAY BARE (`is-enabled` needs no privilege), so the guard's verdicts never depend on privilege;
+# only the two MUTATIONS escalate, and the escalation is the one the sibling installer already relies on
+# (`install-harness-apply-timer.sh:390`: `[ -z "${SUDO+x}" ] && sudo -n true` → `sudo -n systemctl`).
+# `CELL_SELF_PIN_SYSTEMCTL` is the seam that keeps this testable: the suite pins it to the fake manager so
+# no leg can ever reach the host's real one, and the escalation leg (a fake `sudo`) exercises the probe.
+systemctl_system() { # <args…> — the SYSTEM manager, escalated only when escalation is PROVEN to work
+  local sc="${CELL_SELF_PIN_SYSTEMCTL:-}"
+  if [ -z "$sc" ]; then
+    if [ "$(id -u)" -eq 0 ] || ! command -v sudo >/dev/null 2>&1 || ! sudo -n true >/dev/null 2>&1; then
+      sc="systemctl"
+    else
+      sc="sudo -n systemctl"
+    fi
+  fi
+  # ⛔ THE SEAM IS A COMMAND LINE BY CONTRACT (that is how the sibling's `$SC` is used), so it is split
+  # here and nowhere else.
+  $sc "$@"
+}
 actuator_enabled_in() { # <scope> — is the SHIPPED timer enabled in that manager?
   case "$1" in
     system) systemctl is-enabled eldato-harness-apply.timer >/dev/null 2>&1 ;;
@@ -1448,13 +1505,23 @@ own_enabled_in() { # <scope> — is THIS unit installed in that manager?
 # ⛔ VERIFIED, NOT ASSUMED: a `disable` that did not take leaves exactly the state this whole guard exists
 # to prevent, so the refusal is on the READ-BACK, not on the exit code.
 retire_actuator() {
-  local scope="$1"
+  local scope="$1" st
   case "$scope" in
     user)   systemctl --user disable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
-    system) systemctl disable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    system) systemctl_system disable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
     *)      return 1 ;;
-  esac || { bad "could not disable eldato-harness-apply.timer in the ${scope} manager — REFUSING to install a second actuator beside one I cannot retire (that is the race, not redundancy)"; return 1; }
-  if actuator_enabled_in "$scope"; then
+  esac || { bad "could not disable eldato-harness-apply.timer in the ${scope} manager — REFUSING to install a second actuator beside one I cannot retire (that is the race, not redundancy). In the system manager this needs root: '$0' runs as the owner of \$CELL_HOME, so check that passwordless sudo works ('sudo -n true') or retire it by hand: 'sudo systemctl disable --now eldato-harness-apply.timer'"; return 1; }
+  # ⛔ THE READ-BACK IS `scope_state`, NOT AN EXIT CODE (round-12 review, P2). `actuator_enabled_in` is
+  # `systemctl is-enabled … >/dev/null 2>&1`, and that exit code is 1 BOTH for "disabled" and for "cannot
+  # reach the bus" — so an UNANSWERABLE manager read as RETIRED, which is the same deny-list polarity this
+  # file fixed in `scope_state`, one function over, in the one place whose comment claims 'VERIFIED, NOT
+  # ASSUMED'. `scope_state` already answers this question with the manager's OWN words, so it is reused
+  # rather than re-implemented (#1178: one predicate, not a second).
+  st="$(scope_state "$scope")"
+  if [ "$st" = unknown ]; then
+    bad "eldato-harness-apply.timer may still be ENABLED in the ${scope} manager: the manager did NOT ANSWER after 'disable --now', so the retirement is UNVERIFIED — REFUSING, because two mutating actors on one pin is a race, not redundancy. Re-run where that manager answers, or check it by hand ('systemctl is-enabled eldato-harness-apply.timer')"; return 1
+  fi
+  if [ "$st" != disabled ]; then
     bad "eldato-harness-apply.timer still reads ENABLED in the ${scope} manager after 'disable --now' — REFUSING: two mutating actors on one pin is a race, not redundancy"; return 1
   fi
   note "  RETIRED eldato-harness-apply.timer (${scope} manager)"
@@ -1466,7 +1533,7 @@ restore_actuator() {
   local scope="$1"
   case "$scope" in
     user)   systemctl --user enable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
-    system) systemctl enable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
+    system) systemctl_system enable --now eldato-harness-apply.timer >/dev/null 2>&1 ;;
     *)      return 1 ;;
   esac || return 1
   actuator_enabled_in "$scope"
@@ -1551,7 +1618,7 @@ one_actor_check() {
 }
 
 do_install() { # [--takeover]
-  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s unknown=""
+  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s unknown="" still="" scopes_now=""
   case "$takeover" in
     ""|--takeover) ;;
     *) bad "unknown argument '${takeover}' to --install (only --takeover is accepted)"; return 64 ;;
