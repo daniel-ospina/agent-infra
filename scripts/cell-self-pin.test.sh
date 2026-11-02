@@ -437,13 +437,21 @@ if cmp -s "$T/placed.before" "$PLACED"; then ok "…and that refusal did not rep
 else bad "a refused install (%-specifier) REPLACED the placed pass"; cp "$T/placed.before" "$PLACED"; fi
 [ -f "$T/units-pct/cell-self-pin.service" ] && bad "a refused install (%-specifier) still wrote the unit" \
   || ok "…and it wrote no unit"
-# ⛔ THE SUCCESS VOCABULARY IS 0 *AND* 11, SO BOTH HALVES MUST BE GATED. `SuccessExitStatus=0` alone makes a
-# MENDED record (exit 11) a failed unit — an unhealable RED on a correct box (#3133); `SuccessExitStatus=11`
-# alone makes every converged tick red. The suite claimed "one doctor per rule" while the `must include 0`
-# rule had NO doctor (measured: deleting it left 198 ok / 0 failed), and 11 was only ALLOWED, never required,
-# so a doctor could not tell a missing 11 from a wider list.
-refuses 'a SuccessExitStatus WITHOUT 0 (only 11)' "$(doctor_rw only11 's|^SuccessExitStatus=.*$|SuccessExitStatus=11|')" "$T/u30" 'must include 0'
+# ⛔ THE SUCCESS VOCABULARY IS GATED IN THE ONE DIRECTION THAT CAN BE A FALSE PASS, AND IN THE ONE THAT CAN
+# BE AN UNHEALABLE RED. `SuccessExitStatus=0` alone makes a MENDED record (exit 11) a failed unit — an
+# unhealable RED on a correct box (#3133). The reverse rule (“must include 0”) is NOT gated and does not
+# exist: `systemd.service(5)` says the listed values are successful “in addition to the normal successful
+# exit status 0”, so 0 needs no listing — an earlier gate claiming “'current' and 'applied' are only green
+# as 0” could never prevent the false PASS it described and could only REFUSE a valid unit. A rule with a
+# false premise has no doctor worth writing; it was removed (verified against the man page, not the code).
 refuses 'a SuccessExitStatus WITHOUT 11 (only 0) — a mend would be an unhealable RED' "$(doctor_rw no11 's|^SuccessExitStatus=.*$|SuccessExitStatus=0|')" "$T/u31" 'must include 11'
+# …and the NON-VACUITY control for the removal: `0` is not required, so a unit listing only 11 must
+# INSTALL. Without this leg the rule could be re-added (or the removal be a no-op) and nothing would notice.
+d_ok11="$(doctor_rw ok11only 's|^SuccessExitStatus=.*$|SuccessExitStatus=11|')"
+out_ok11="$(install_doctored "$d_ok11" "$T/u31b")"; rc_ok11=$?
+[ "$rc_ok11" -eq 0 ] && ok "ACCEPTS SuccessExitStatus=11 without 0 — 0 is successful regardless (systemd.service(5)); only a MISSING 11 is refused" \
+  || bad "refused a unit that omits the redundant 0 from SuccessExitStatus — a valid unit, refused: $out_ok11"
+cp "$T/placed.before" "$PLACED"   # the refusal legs below re-assert that a REFUSAL cannot replace it
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
 # `<unit>.service.d/*.conf` OVER it, in both managers, whether the drop-in was written before the unit or
@@ -550,10 +558,11 @@ fi
 #   · the INTERPRETER rule is individually gating only because ExecStart is parsed as interpreter+payload;
 #     `/bin/sh <a path under CELL_HOME>` passes every other rule, so nothing else can answer for it.
 #   · the CELL_HOME environment rule is the only check on `Environment=`;
-#   · the two SuccessExitStatus rules (present; and only 0/11 with 0 included) are the difference between a
-#     RED and a green on every failure this unit exists to surface. ⛔ AND THAT CLAIM WAS ITSELF HALF-TRUE:
-#     `must include 0` had NO doctor and 11 was only allowed, not required, so the rule could be deleted and
-#     a mend made permanently red without this suite noticing. Both halves now have a doctor (section 4d).
+#   · the two SuccessExitStatus rules (present; and only 0/11) are the difference between a RED and a green
+#     on every failure this unit exists to surface. ⛔ AND THAT CLAIM WAS HALF-TRUE: 11 was only allowed, not
+#     required, so a unit could be made permanently red on a mend without this suite noticing. It is required
+#     now, with a doctor (section 4d) — and the companion “must include 0” rule was REMOVED there, because
+#     `systemd.service(5)` makes 0 successful regardless, so it only refused valid units.
 refuses 'an ExecStart that is not /bin/bash' "$(doctor_rw interp "s|^ExecStart=/bin/bash .*$|ExecStart=/bin/sh $T/home/.pi/agent/scripts/cell-self-pin.sh|")" "$T/u13" "not '/bin/bash'"
 refuses 'a MISSING Environment=CELL_HOME=' "$(doctor_rw nocellhome '/^Environment=CELL_HOME=/d')" "$T/u14" 'Environment=CELL_HOME='
 refuses 'a MISSING SuccessExitStatus=' "$(doctor_rw noexit '/^SuccessExitStatus=/d')" "$T/u15" 'must declare SuccessExitStatus'
@@ -907,6 +916,41 @@ if git -C "$T/seed" push -q origin rel 2>/dev/null; then
     || bad "the pass reported success while its record does not contain the configured ref's tip (rc=$rc): $out"
   git -C "$T/seed" checkout -q main
 else bad "could not push the 'rel' branch — the HARNESS_REF leg was not exercised"; fi
+# ── 6c. THE DECISION IS ON THE COMMIT THE FETCH BROUGHT, AND ON A COMMIT AT ALL ────────────────
+# ⛔ A REF'S SPELLING IS NOT A REVISION. `git fetch origin main` moves `refs/remotes/origin/main`, while
+# `git rev-parse main` (or `refs/heads/main`) reads the LOCAL branch the fetch never touched — so the knob this
+# file documents and prints could yield `current` + exit 0 against a newer remote tip, which is #3194's own
+# symptom reached through the knob. And `git rev-parse <unknown>` PRINTS ITS ARGUMENT and exits 128, so an
+# unguarded read puts the ref's NAME in the commit column and answers DRIFT for a ref the PASS calls
+# unreadable; a local annotated tag resolves to its TAG OBJECT, which never equals a commit. The record here
+# is the pintree's C1 while `origin/main` is C2 and `attip` is an annotated tag ON C1, so every leg below
+# distinguishes the three readings by VALUE.
+printf '%s\n' "$T/home/harness/pintree" >"$T/home/.harness-path"
+FIRSTC="$(git -C "$T/origin.git" rev-list --max-parents=0 main 2>/dev/null | tail -1)"
+git -C "$T/seed" -c user.email=t@t -c user.name=t -c tag.gpgSign=false tag -f -a attip -m "an annotated tag on the record's commit" "$FIRSTC" >/dev/null 2>&1
+if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
+  out="$(runat "$T/home" HARNESS_REF=refs/heads/main bash "$PIN" --status 2>&1)"; rc=$?
+  [ "$rc" -eq 1 ] && ok "HARNESS_REF=refs/heads/main is NOT decided on the STALE local branch (DRIFT, exit 1)" \
+    || bad "HARNESS_REF=refs/heads/main answered rc=$rc: the decision read the local branch the fetch never moved, i.e. a green tile over an unmoved layer: $out"
+  out="$(runat "$T/home" HARNESS_REF=main bash "$PIN" --status 2>&1)"; rc=$?
+  [ "$rc" -eq 1 ] && ok "…and neither is the BARE branch spelling ('main')" \
+    || bad "HARNESS_REF=main answered rc=$rc instead of DRIFT: $out"
+  out="$(runat "$T/home" HARNESS_REF=attip bash "$PIN" --status 2>&1)"; rc=$?
+  case "$out" in
+    *"attip $FIRSTC"*) ok "…an ANNOTATED TAG is peeled to its COMMIT (the tag-object sha would never read 'current')" ;;
+    *) bad "--status did not report the annotated tag's commit (${FIRSTC:-<unreadable>}) in the commit column: $out" ;;
+  esac
+  [ "$rc" -eq 0 ] && ok "…and a tag pointing AT the record is 'current' (the peeling is discriminating, not cosmetic)" \
+    || bad "an annotated tag on the record's own commit was reported as rc=$rc, not 0=current: $out"
+  out="$(runat "$T/home" HARNESS_REF=refs/heads/rel bash "$PIN" --status 2>&1)"; rc=$?
+  case "$out" in
+    *"refs/heads/rel refs/heads/rel"*|*"refs/heads/rel <unreadable"*) bad "--status put the ref's NAME (or <unreadable>) where the fetched COMMIT belongs — it fetched refs/heads/rel successfully: $out" ;;
+    *"refs/heads/rel "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ok "…a remote-only ref resolves to a COMMIT, never to its own spelling" ;;
+    *) bad "--status did not resolve the remote-only ref to a commit: $out" ;;
+  esac
+  [ "$rc" -eq 1 ] && ok "…and it decides DRIFT against the record (exit 1)" \
+    || bad "the remote-only ref was decided as rc=$rc, expected 1=DRIFT: $out"
+else bad "could not push the annotated tag — the peeling legs were not exercised"; fi
 
 # ── 7. a FALSE PASS is impossible: `apply` exiting 0 is not a convergence ─────────────────────────
 # ⛔ THE TWO RULES THAT USED TO LIVE HERE OVERLAPPED, SO NEITHER WAS GATED. There was "the record must
