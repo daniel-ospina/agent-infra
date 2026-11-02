@@ -506,10 +506,26 @@ cp "$T/placed.before" "$PLACED"   # the refusal legs below re-assert that a REFU
 # `Unit=` re-target and a timer with no repeating trigger both installed rc=0 under the positive claim
 # "installed — ONE actuator on this pin", producing a pin that never runs again: #3194's symptom through
 # the artifact path. These legs are that defect, fed back in, one doctor per rule.
-doctor_timer() { # <name> <sed-expr applied to the TIMER template>
+doctor_timer() { # <name> <sed-expr applied to the TIMER template> [<line inserted after the FIRST Unit=>]
   local d="$T/doctored-$1"
   mkdir -p "$d" && cp "$TPL/cell-self-pin.service" "$d/"
   sed "$2" "$TPL/cell-self-pin.timer" >"$d/cell-self-pin.timer"
+  # ⛔ NOT `\n` IN A sed REPLACEMENT — that is a GNU extension. FreeBSD/macOS `sed(1)` says "To specify a
+  # newline character in the replacement string, precede it with a backslash", so `\n` yields a literal
+  # `n` and the two lines fuse into `Unit=cell-self-pin.servicenUnit=/bin/true.service`. Measured: on such
+  # a host the COUNT rule this leg exists to pin is never exercised and the leg reds with "refused for the
+  # WRONG reason" — a red suite on a host this file explicitly supports, for a reason that has nothing to
+  # do with the defect. `awk` prints the extra line after the first `Unit=` and is portable to both.
+  [ -z "${3:-}" ] || awk -v extra="$3" '1; /^Unit=/ && !done { print extra; done=1 }' \
+    "$d/cell-self-pin.timer" >"$d/.timer.tmp" && mv "$d/.timer.tmp" "$d/cell-self-pin.timer"
+  printf '%s\n' "$d"
+}
+doctor_timer_append() { # <name> <sed-expr or ''> <text appended verbatim at EOF>
+  local d="$T/doctored-$1"
+  mkdir -p "$d" && cp "$TPL/cell-self-pin.service" "$d/"
+  if [ -n "$2" ]; then sed "$2" "$TPL/cell-self-pin.timer" >"$d/cell-self-pin.timer"
+  else cp "$TPL/cell-self-pin.timer" "$d/cell-self-pin.timer"; fi
+  printf '%b' "$3" >>"$d/cell-self-pin.timer"
   printf '%s\n' "$d"
 }
 refuses_timer() { # <name> <doctored-dir> <unit-dir> <must-appear-in-the-reason>
@@ -539,11 +555,25 @@ refuses_timer 'an EMPTY OnUnitActiveSec=' \
 # ⛔ AND A SECOND `Unit=` IS LAST-WINS, exactly like `Environment=CELL_HOME=` and `ExecStart=`: a presence
 # test installs the wrong target green. The shipped target stays FIRST, so only the count rule can catch it.
 refuses_timer 'a SECOND Unit=' \
-  "$(doctor_timer unit-second 's|^Unit=.*$|Unit=cell-self-pin.service\nUnit=/bin/true.service|')" "$T/tu4" 'Unit= line(s)'
+  "$(doctor_timer unit-second 's|^Unit=.*$|Unit=cell-self-pin.service|' 'Unit=/bin/true.service')" "$T/tu4" 'Unit= line(s)'
 # ⛔ A SKIPPED TIMER IS A GREEN NO-OP, and on the TIMER it is unrecoverable: nothing runs, so the pass's own
 # loudness never gets a chance to fire. Closed by PREFIX, so a condition name systemd adds later is closed.
 refuses_timer 'a ConditionPathExists= on the TIMER (a skip is a green no-op)' \
-  "$(doctor_timer cond-timer 's|^Unit=.*$|ConditionPathExists=/srv/nope\nUnit=cell-self-pin.service|')" "$T/tu5" 'ConditionPathExists='
+  "$(doctor_timer cond-timer 's|^Unit=.*$|Unit=cell-self-pin.service|' 'ConditionPathExists=/srv/nope')" "$T/tu5" 'ConditionPathExists='
+# ⛔ AND A TRIGGER IN A SECTION SYSTEMD IGNORES IS NOT A TRIGGER (measured in review — this rule FAILED
+# OPEN before it was section-aware). Deleting `OnUnitActiveSec=` from `[Timer]` and appending
+# `[Service]` + `OnUnitActiveSec=10min` installed **rc=0**; `systemd-analyze verify` said only
+# "Unknown section 'Service'. Ignoring.", so the timer kept `OnBootSec=3min` alone and fired ONCE three
+# minutes after boot and never again — the exact state the repeating-trigger rule exists to refuse,
+# reached through the rule itself. Unlike a service (where a mis-sectioned `ExecStart=` fails `enable
+# --now`), an ignored section on a TIMER has nothing to fail: it is silent, so nothing but this leg is
+# between the box and a dead clock.
+refuses_timer 'a repeating trigger moved into an IGNORED section ([Service])' \
+  "$(doctor_timer_append clock-wrong-section '/^OnUnitActiveSec=/d' '[Service]\nOnUnitActiveSec=10min\n')" "$T/tu6" 'no REPEATING trigger'
+# ⛔ AND THE `[Timer]` SECTION MUST EXIST: with none, every trigger fails the same way and no other rule
+# in this function can fire (the count rule and the trigger rule both read that section).
+refuses_timer 'a timer with NO [Timer] section at all' \
+  "$(doctor_timer_append no-timer-section 's|^\[Timer\]$|[Timers]|' '')" "$T/tu7" 'no [Timer] section'
 
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
@@ -1101,16 +1131,23 @@ else
   ok "…and it never even ISSUED a disable (the calls log has no retirement for it), so a read-only failure cannot stop and re-arm the box's actuator"
 fi
 # Leg (2): a tick that DOES retire and then FAILS AT APPLY must put the actuator back.
-# The record's HEAD is NOT the ref tip, so the tick really proceeds to the mutation; the supervisor exits
-# non-zero, which is the ordinary disconnected-box tick the template says "is RED and heals on the next one".
+# ⛔ THE RECORD MUST **NOT CONTAIN** THE TIP — that is the shape that reaches the mutation. Under the
+# equality-era decision a commit ON TOP of the tip read as DRIFT and got here; now that the tick decides by
+# CONTAINMENT (the same predicate `--status` and the post-apply rule use — one state, one answer), a record
+# that contains the tip is correctly a no-op. And this fixture runs BEFORE origin's second commit, so its
+# clone sits AT the tip and there is nothing behind to check out: the record is put on an UNRELATED
+# history instead (a real shape — a pin record naming a tree that is not on the ref's line), while
+# `origin/main` still resolves there so `check_pin_resolution` is not what refuses the tick.
 FAILPIN="$T/tick-applyfail"
 mkdir -p "$FAILPIN/harness" "$FAILPIN/orchestrator"
 git clone -q "$T/origin.git" "$FAILPIN/harness/tree" 2>/dev/null
 mkdir -p "$FAILPIN/harness/tree/scripts"
 printf '#!/bin/bash\nexit 1\n' >"$FAILPIN/harness/tree/scripts/cloud-cell-supervisor.sh"
 chmod +x "$FAILPIN/harness/tree/scripts/cloud-cell-supervisor.sh"
+git -C "$FAILPIN/harness/tree" checkout -q --orphan off-the-line 2>/dev/null \
+  && git -C "$FAILPIN/harness/tree" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "a record OFF the ref's line" \
+  || bad "could not place the apply-failure fixture's record OFF the ref's line, so the mutation is never reached"
 printf '%s\n' "$FAILPIN/harness/tree" >"$FAILPIN/.harness-path"
-git -C "$FAILPIN/harness/tree" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "a record that is NOT the ref tip"
 mk_scoped_systemctl "$T/fake-applyfail" "$T/state-applyfail"
 : >"$T/state-applyfail/system-cell-self-pin.timer"
 : >"$T/state-applyfail/system-$SHIPPED"
@@ -1511,17 +1548,48 @@ case "$out_st" in
   *'verdict        current'*) ok "…and the verdict LINE says current (not just the exit code)" ;;
   *) bad "…but the verdict line does not say current: $out_st" ;;
 esac
-# ⛔ AND A SUCCESSFUL RE-TAKE KEEPS ITS RETIREMENT (the failure rollback is not a blanket undo). The leg
-# above takes the APPLIED path — the record is ahead of the tip, so the pass decides DRIFT, `apply` runs and
-# the containment rule greens it. That path clears the rollback flag before exiting, and this leg is what
-# pins it: a mutation of that one line re-enables the shipped timer on EVERY successful tick, which reads as
-# "the one-actor invariant healed, then un-healed", for ever, on a converging box.
+# ⛔ AND THE TICK'S **OWN** VERDICT MUST SAY IT — an exit code is not the claim. Moving only the read-back
+# to containment left the DECISION by equality, so on THIS fixture the tick logged `DRIFT … -- applying`
+# and walked the whole MUTATING path (`one_actor_check apply` can `disable --now` the shipped timer) on a
+# pin that already contained the tip, while `--status` and the post-apply rule called the same state
+# converged. Both surfaces now decide by containment, and this leg reads the message the unattended path
+# actually prints — the one copy of that claim nothing gated.
+case "$out" in
+  *DRIFT*|*'-- applying'*) bad "the tick still announces DRIFT/apply for a record that CONTAINS the tip — its decision and --status disagree on one state (#1178), and the mutating path runs on a converged pin: $out" ;;
+  *) ok "…and the TICK's own verdict says current for it — the DECISION, not just the exit code, is one predicate" ;;
+esac
+# ⛔ AND A SUCCESSFUL RE-TAKE KEEPS ITS RETIREMENT (the failure rollback is not a blanket undo). The
+# fixture is a record BEHIND the tip whose stub `apply` MOVES it onto a tree that CONTAINS the tip: the
+# APPLIED path with a GREEN read-back, which the `home-ahead` fixture can no longer reach (its record
+# already contains the tip, so the tick correctly no-opes there — that is the leg above). The applied
+# path clears the rollback flag before exiting, and this leg is what pins it: a mutation of that one line
+# re-enables the shipped timer on EVERY successful tick, which reads as "the one-actor invariant healed,
+# then un-healed", for ever, on a converging box.
+BEH="$T/home-behind"
+mkdir -p "$BEH/harness"
+git clone -q "$T/origin.git" "$BEH/harness/pintree" 2>/dev/null
+git -C "$BEH/harness/pintree" checkout -q --detach "$FIRST" 2>/dev/null \
+  || bad "could not place the applied-path fixture's record BEHIND the tip"
+# ⛔ THE CONVERGED TREE MUST BE AT THE **TARGET**, not one commit past it, because the containment check is
+# computed in the PIN TREE's object database (`git -C "$repo" merge-base`): a commit minted only inside
+# another clone is not in it, so `merge-base --is-ancestor` fails and a correct apply reads as
+# STALE-RECORD. A tree checked out AT the tip needs no object the fetch did not bring.
+git clone -q "$T/origin.git" "$BEH/harness/converged" 2>/dev/null
+mk_sup_pin "$BEH/harness/pintree/scripts/cloud-cell-supervisor.sh" "$BEH/harness/converged"
+printf '%s\n' "$BEH/harness/pintree" >"$BEH/.harness-path"
 mk_scoped_systemctl "$T/fake-applied" "$T/state-applied"
 : >"$T/state-applied/system-cell-self-pin.timer"
 : >"$T/state-applied/system-$SHIPPED"
-out="$(runat "$T/home-ahead" PATH="$T/fake-applied:$PATH" bash "$PIN" 2>&1)"; rc=$?
+out="$(runat "$BEH" PATH="$T/fake-applied:$PATH" bash "$PIN" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "a converging DRIFT tick exits 0 with a re-armed duplicate it retired" \
   || bad "a converging DRIFT tick exited $rc with a retirable duplicate: $out"
+# ⛔ AND IT REALLY IS THE APPLIED PATH (this fixture's record sits behind the tip, so the tick must announce
+# the apply). Without this the leg above would pass on a no-op — which is exactly the vacuity the fixture
+# change was made to avoid.
+case "$out" in
+  *'-- applying'*) ok "…and that tick really took the APPLIED path (its record sits behind the tip), so the retirement rule is exercised, not assumed" ;;
+  *) bad "the converging fixture NO-OPED instead of applying, so the retirement leg above proved nothing: $out" ;;
+esac
 [ -f "$T/state-applied/system-$SHIPPED" ] \
   && bad "a SUCCESSFUL tick rolled its own retirement back — the shipped timer is re-enabled on a box whose pin it had just taken, so the one-actor invariant un-heals every tick" \
   || ok "…and a SUCCESSFUL re-take KEEPS the retirement (only a FAILED tick rolls back)"
