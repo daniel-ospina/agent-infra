@@ -5992,6 +5992,16 @@ PY
     # 2026-10-27). Initialised here — at the top of the block, so every pass resets it, which is
     # also the reset the drain-alive path needs — and set to 1 only inside the stall arm.
     _stalled=0
+    # ⛔ THE DISPATCH CADENCE NEEDS A COUNTER THAT WAS ACTUALLY PERSISTED (fresh-context review,
+    # 2026-11-02, P2). `_dpass` is re-read from `state/drain-stall` and incremented, and the write is
+    # checked — but the dispatch below was taken from `_dpass` regardless of whether that write
+    # succeeded, which fails in BOTH directions from one cause: an UNWRITABLE record (ENOSPC, a
+    # read-only `state/`) leaves `_dpass` at 1 forever, so `1 % EVERY != 0` and stall-fix.sh dispatches
+    # NOBODY under exactly the degraded-disk condition it should act on; a record FROZEN at a multiple
+    # of `EVERY` (a read-only mount) reads the same pass number every time, so `EVERY % EVERY == 0`
+    # dispatches a worker on EVERY stalled pass (~7 overlapping 1800 s workers). A counter that could
+    # not be persisted is not a cadence: `_dpok` gates the dispatch on the write.
+    _dpok=0
     # ⛔ AN UNSEARCHABLE STATE DIR IS NOT A MEASURED ABSENCE (review P2). `find` on a missing or
     # unreadable `state/` returns the SAME empty answer as "nothing landed", so the line below would
     # report a fact about this box's markers that it never read. The VERDICT does not change: #2929
@@ -6051,6 +6061,7 @@ PY
         if printf 'at=%s\npasses=%s\nage=%s\nagesrc=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
              "$(date +%s)" "$_dpass" "$_lage" "$_agesrc" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
              > "$O/state/drain-stall" 2>/dev/null; then
+          _dpok=1
           # ⛔ THE LABEL IS DERIVED, NOT HARD-CODED (review 3-P2). A STALLED pass records `spawns=4`
           # and `drain_stall_label` then prints STALLED, so promising "drain=DEADLOCK" here told the
           # operator to expect a token that is not there — the label drift the "one definition, two
@@ -6149,9 +6160,11 @@ PY
     # dispatch (no brief dir, no dispatch script, no worktree) it SAYS so instead of returning silently.
     # ⛔ ITS OUTPUT GOES TO $LOG, like every other line this block prints: on launchd the loop's stdout
     # is a different file, and an escalation the operator cannot find where he reads is not one.
-    if [ "${_stalled:-0}" = "1" ] && [ -x "$O/stall-fix.sh" ]; then
+    if [ "${_stalled:-0}" = "1" ] && [ "${_dpok:-0}" != "1" ]; then
+      echo "[dispatch] DRAIN STALL -> STALL FIX SKIPPED (the pass counter could not be persisted to state/drain-stall, so the one-per-${DRAIN_STALL_FIX_EVERY:-3} bound cannot be enforced — dispatching anyway would fire on every stalled pass)" >> "$LOG"
+    elif [ "${_stalled:-0}" = "1" ] && [ -x "$O/stall-fix.sh" ]; then
       O="$O" UPN_WORK="${UPN_WORK:-}" HARNESS_REPO="${HARNESS_REPO:-}" \
-        PRDISP_SPAWNS="${PRDISP_SPAWNS:-}" \
+        PRDISP_SPAWNS="${PRDISP_SPAWNS:-}" _AGESRC="${_agesrc:-measured}" \
         bash "$O/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" >> "$LOG" 2>&1 || true
     elif [ "${_stalled:-0}" = "1" ]; then
       echo "[dispatch] DRAIN STALL -> STALL FIX MISSING ($O/stall-fix.sh absent or not executable) — the escalation recorded the stall and dispatched nobody" >> "$LOG"

@@ -33,6 +33,17 @@ EVERY="${DRAIN_STALL_FIX_EVERY:-3}"
 TIMEOUT="${DRAIN_STALL_FIX_TIMEOUT:-1800}"
 UNOWNED="${UPN_WORK:-?}"
 AGEMIN="${2:-?}"                    # minutes since the last land (or the threshold)
+# ⛔ THE AGE'S PROVENANCE TRAVELS WITH THE AGE (fresh-context review, 2026-11-02, P3). orch-loop.sh
+# passes a SYNTHESISED age when `mp_recent_land` answered empty: the window bound an empty answer
+# proves, not a measurement. Without this flag this file presented that bound as a measurement on
+# BOTH surfaces it owns — the brief's "no PR merged in __AGEMIN__ minutes" premise and the durable
+# `age_min=` ledger row an operator reads after the incident — asserting up to 1641m of staleness the
+# box never measured. That is the `OVERRIDES:` direction #2929 forbids ("understated, never
+# invented"), and it was already fixed for the log line and `state/drain-stall`; these two sinks were
+# the ones left behind. `measured` is the default so a caller that passes no flag keeps the old,
+# honest-for-it shape.
+AGESRC="${_AGESRC:-measured}"
+case "$AGESRC" in synth|measured) : ;; *) AGESRC=measured ;; esac
 
 # ⛔ NOT `say` (agent-infra#2910). On macOS `say` is /usr/bin/say — text-to-speech — so a shipped
 # script that defines a helper by that name SPEAKS through the owner's speakers whenever a fragment
@@ -51,8 +62,16 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 # a bound.
 is_num "$EVERY" && [ "$EVERY" -ge 1 ] || EVERY=3
 is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
-# ⛔ BOTH SINKS THIS SCRIPT OPENS ARE BOUNDED (review P3, 2026-11-02). Nothing else in the tree prunes
-# them: `state/briefs/` had no production writer before this script, and no reaper names either file.
+# ⛔ THE BRIEF IS RENDERED WITH `>=` WHEN THE AGE IS A BOUND (review P3, above): the worker quotes the
+# premise back in its report, so a bare number here is the same invented measurement in the worker's
+# own words.
+if [ "$AGESRC" = "synth" ]; then AGEMIN_TXT=">=${AGEMIN}"; else AGEMIN_TXT="$AGEMIN"; fi
+# ⛔ EVERY SINK THIS SCRIPT OPENS IS BOUNDED (review P3, 2026-11-02). Nothing else in the tree prunes
+# them: `state/briefs/` had no production writer before this script, and no reaper names any of them.
+# ⛔ THREE SINKS, NOT TWO (fresh-context review, 2026-11-02, P2): the per-dispatch worker REPORT
+# (`state/REPORT-stall-fix-<name>.md`) is minted on the same cadence as the brief and is the LARGER
+# of the two, and it had no bound at all while this header claimed both were bounded. It is pruned
+# below on the same retention knob.
 # Measured from the knobs: `CYC=240`s ⇒ a stalled pass every ~4 min ⇒ one dispatch per
 # `DRAIN_STALL_FIX_EVERY=3` ⇒ ~120 brief files/day, unbounded, on exactly the population this
 # escalation exists for (a box stalled for hours or days), in the directory the controller `find`s
@@ -102,6 +121,13 @@ mkdir -p "$BRIEF_DIR" 2>/dev/null || {
 # bound is enforced on every dispatch the script actually makes, which is the only cadence that can
 # create the files — no dependency on an hourly reaper existing on the box.
 find "$BRIEF_DIR" -maxdepth 1 -type f -name 'stall-fix-*.md' \
+  -mmin "+$STALL_FIX_BRIEF_MAX_AGE_MIN" -exec rm -f {} + 2>/dev/null || true
+# ⛔ AND THE REPORT, WHICH IS THE THIRD SINK AND THE BIGGEST ONE (review P2). One per dispatch, minted
+# by the brief's own FIRST ACTION, and nothing else in the tree reaps it — so on exactly the box this
+# escalation exists for (~120 dispatches/day) `$O/state/` grew without limit in the directory the
+# controller `find`s over every pass. Same retention knob as the brief: 1440 min is ~48x the 1800 s
+# worker timeout, so a live worker's own report can never be evicted under it.
+find "$O/state" -maxdepth 1 -type f -name 'REPORT-stall-fix-*.md' \
   -mmin "+$STALL_FIX_BRIEF_MAX_AGE_MIN" -exec rm -f {} + 2>/dev/null || true
 BRIEF="$BRIEF_DIR/stall-fix-$(date -u '+%Y%m%dT%H%M%SZ').md"
 # ⛔ THE WORKER'S NAME — AND ITS OWN REPORT PATH — ARE MINTED HERE, BEFORE THE BRIEF (review P1,
@@ -201,34 +227,11 @@ elif [ "${PRDISP_SPAWNS:-0}" -gt 0 ]; then
 else
   SPAWNS_TXT="this pass started no worker at all"
 fi
-# ⛔ THE VALUES ARE SUBSTITUTED, NOT INTERPOLATED: an UNQUOTED heredoc runs the body through the
-# shell, so every backticked path in this brief was executed as a command and the text arrived
-# mangled (measured 2026-10-27: "logs/orch-loop.log: No such file or directory" three times, and a
-# lane dispatched on a corrupted brief). Quote the heredoc, keep placeholders, substitute here.
-# ⛔ AND SUBSTITUTED IN BASH, NOT WITH `sed -i ''` (portability trap `sed-in-place-bsd`, the SILENT
-# kind: a BSD-only `-i ''` edits NOTHING under GNU sed, so a cell would dispatch a worker on a brief
-# full of `__AGEMIN__` placeholders). Parameter expansion is also the SAFER substitution — `&` and `|`
-# are literal here and special inside a sed script.
-_brief="$(cat "$BRIEF" 2>/dev/null || true)"
-_brief="${_brief//__AGEMIN__/$AGEMIN}"
-_brief="${_brief//__UNOWNED__/$UNOWNED}"
-_brief="${_brief//__SEEN__/$SEEN}"
-_brief="${_brief//__O__/$O}"
-_brief="${_brief//__REPORT__/$REPORTF}"
-_brief="${_brief//__WTSHA__/${_wtsha:-UNKNOWN}}"
-_brief="${_brief//__SPAWNS__/$SPAWNS_TXT}"
-printf '%s\n' "$_brief" > "$BRIEF" 2>/dev/null || true
-if [ ! -s "$BRIEF" ]; then
-  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief could not be written)"
-  exit 0
-fi
-# ⛔ AND THE SUBSTITUTION IS CHECKED, NOT ASSUMED: a failed write leaves the ORIGINAL file in place,
-# which is NON-EMPTY and passes the size test above — so an unstubbed brief would be dispatched with
-# `__SEEN__` still in it. A surviving placeholder is a brief that cannot be read correctly: refuse.
-if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\|REPORT\|WTSHA\)__' "$BRIEF" 2>/dev/null; then
-  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief still carries unresolved placeholders — not dispatching a worker on it)"
-  exit 0
-fi
+# ⛔ THE BRIEF IS SUBSTITUTED *AFTER* THE WORKTREE IS CHOSEN (fresh-context review, 2026-11-02, P1).
+# See the substitution block BELOW the worktree refresh: `__WTSHA__` is the commit the worker is told
+# to cite, and it did not exist yet at this point in the script — `${_wtsha:-UNKNOWN}` therefore took
+# its default on EVERY dispatch, and the placeholder guard could not catch it because the token had
+# been *replaced* (with UNKNOWN) rather than left behind. The whole block moved below `_wtsha`.
 
 # KIND=prfix — A MEASUREMENT, NOT AN EXEMPTION (review P2, 2026-11-01: this comment used to say the
 # creation gate "exempts" a stall repair, which spawn-gate.sh denies). `prfix` is exempt ONLY on proof
@@ -264,10 +267,20 @@ HREPO="${HARNESS_REPO:-$HOME/ai-harness-main}"
 # dispatcher always writes. Compare this with the alternative — skipping the DISPATCH while a worker
 # runs — whose inference error would silence the escalation entirely, the inert-enforcer class.
 wt_in_use() {
-  local p live
+  local p live _pin
+  # ⛔ A STALE PIDFILE CAN OUTLIVE ITS WORKER FOREVER, SO THE PIN NEEDS AN AGE BOUND (review P2,
+  # 2026-11-02). `.rc` is written on the dispatcher's exit path, NOT on SIGKILL/OOM/reboot, and no
+  # reaper in this tree DELETES a `$O/bg/*.pid` (verified: ai-drainer.sh SKIPS a dead pidfile, it does
+  # not remove one). So a pidfile with no `.rc` persists indefinitely, and once the kernel recycles
+  # that pid to any long-lived process, `kill -0` answers yes on every future dispatch and the tree is
+  # never refreshed again — the "frozen tree" this refresh exists to remove, with the extra harm that
+  # it is now silent. A pidfile older than a worker's own maximum wall clock cannot describe a live
+  # worker, whatever its pid now belongs to. `-mmin -N` is the repo's portable mtime form.
+  _pin=$(( (TIMEOUT + 300 + 59) / 60 ))
   for p in "$O/bg"/stallfix-*.pid; do
     [ -f "$p" ] || continue
     [ -f "${p%.pid}.rc" ] && continue      # a terminal record means THAT worker is done
+    [ -n "$(find "$p" -mmin "-$_pin" 2>/dev/null || true)" ] || continue   # too old to be live
     live="$(cat "$p" 2>/dev/null || true)"
     is_num "${live:-}" && kill -0 "$live" 2>/dev/null && return 0
   done
@@ -297,6 +310,10 @@ if [ -e "$HREPO/.git" ]; then
 fi
 if [ ! -e "$WT/.git" ]; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no usable worktree: $WT — set HARNESS_REPO)"
+  # The brief block moved BELOW this point (review P1), so this exit now leaves the raw heredoc with
+  # its `__PLACEHOLDER__`s intact. Drop it: a file full of unsubstituted tokens sitting in
+  # `state/briefs/` reads like a real brief to whoever finds it.
+  rm -f "$BRIEF" 2>/dev/null || true
   exit 0
 fi
 # The tree the worker actually reads. Printed in every dispatch line below, and substituted into the
@@ -304,6 +321,41 @@ fi
 # has to travel WITH the report rather than only in a log line an operator may never read. An empty
 # value is reported as UNKNOWN rather than guessed.
 _wtsha="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || true)"
+# ⛔ THE VALUES ARE SUBSTITUTED, NOT INTERPOLATED: an UNQUOTED heredoc runs the body through the
+# shell, so every backticked path in this brief was executed as a command and the text arrived
+# mangled (measured 2026-10-27: "logs/orch-loop.log: No such file or directory" three times, and a
+# lane dispatched on a corrupted brief). Quote the heredoc, keep placeholders, substitute here.
+# ⛔ AND SUBSTITUTED IN BASH, NOT WITH `sed -i ''` (portability trap `sed-in-place-bsd`, the SILENT
+# kind: a BSD-only `-i ''` edits NOTHING under GNU sed, so a cell would dispatch a worker on a brief
+# full of `__AGEMIN__` placeholders). Parameter expansion is also the SAFER substitution — `&` and `|`
+# are literal here and special inside a sed script.
+# ⛔ THIS BLOCK RUNS AFTER `_wtsha` IS READ, AND THAT ORDER IS THE FIX (review P1, 2026-11-02). It used
+# to run BEFORE the worktree refresh, so `__WTSHA__` was substituted from an unset variable and every
+# brief instructed the worker to "CITE THE COMMIT YOU READ … checked out at UNKNOWN". The placeholder
+# guard below could not see it (the token was replaced, not left), so the one guarantee that stops an
+# unattributable `file:line` report — the guarantee the refresh machinery exists for — was silently
+# absent on every single dispatch. Nothing above this line reads `$BRIEF`/`_brief`, so the move is
+# order-only.
+_brief="$(cat "$BRIEF" 2>/dev/null || true)"
+_brief="${_brief//__AGEMIN__/$AGEMIN_TXT}"
+_brief="${_brief//__UNOWNED__/$UNOWNED}"
+_brief="${_brief//__SEEN__/$SEEN}"
+_brief="${_brief//__O__/$O}"
+_brief="${_brief//__REPORT__/$REPORTF}"
+_brief="${_brief//__WTSHA__/${_wtsha:-UNKNOWN}}"
+_brief="${_brief//__SPAWNS__/$SPAWNS_TXT}"
+printf '%s\n' "$_brief" > "$BRIEF" 2>/dev/null || true
+if [ ! -s "$BRIEF" ]; then
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief could not be written)"
+  exit 0
+fi
+# ⛔ AND THE SUBSTITUTION IS CHECKED, NOT ASSUMED: a failed write leaves the ORIGINAL file in place,
+# which is NON-EMPTY and passes the size test above — so an unstubbed brief would be dispatched with
+# `__SEEN__` still in it. A surviving placeholder is a brief that cannot be read correctly: refuse.
+if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\|REPORT\|WTSHA\)__' "$BRIEF" 2>/dev/null; then
+  log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief still carries unresolved placeholders — not dispatching a worker on it)"
+  exit 0
+fi
 # ── THE DISPATCH — AND WHY ITS EXIT STATUS IS NOT THE VERDICT ─────────────────────────────────────
 # ⛔ A REFUSED SPAWN MUST NOT READ AS A DISPATCHED ONE (review P1, 2026-11-01).
 # `nonblocking-dispatch.sh` runs `run_agent` — and with it EVERY spawn gate — inside a backgrounded
@@ -411,8 +463,11 @@ _record() {
   if [ -f "$_f" ] && [ "$(wc -c < "$_f" 2>/dev/null || printf '0')" -ge "$STALL_FIX_LEDGER_MAX_BYTES" ]; then
     mv -f "$_f" "$_f.1" 2>/dev/null || :
   fi
-  printf '%s\t%s\tpass=%s\tunowned=%s\tage_min=%s\n' \
-    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" >> "$_f" 2>/dev/null
+  # ⛔ THE ROW CARRIES THE AGE'S PROVENANCE (review P3, 2026-11-02): `agesrc=synth` marks a WINDOW
+  # BOUND, so the incident ledger cannot be read as a measurement. Additive — no reader is broken by a
+  # field it does not know (the same contract `state/drain-stall` uses for its own `agesrc`).
+  printf '%s\t%s\tpass=%s\tunowned=%s\tage_min=%s\tagesrc=%s\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" "$AGESRC" >> "$_f" 2>/dev/null
 }
 
 case "$_verdict" in
