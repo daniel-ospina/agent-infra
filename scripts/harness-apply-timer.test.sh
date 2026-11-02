@@ -44,7 +44,7 @@ PASS_SH="$HERE/harness-apply-pass.sh"
 # pass shelled out to the REAL `check-deployed-drift.sh`, which scans the REAL `$HOME` — the suite pins
 # HARNESS_REPO/CELL_HOME/O but not HOME — so whether a case was green depended on what the developer's
 # box happened to be running. It stayed green here only because a stub repo makes the checker exit 2.
-# T20 below turns the seam back ON with a stub checker, which is the arm that is actually being tested.
+# T24 below turns the seam back ON with a stub checker, which is the arm that is actually being tested.
 export HARNESS_APPLY_DRIFT_CHECK=0
 PASS=0
 FAIL=0
@@ -379,7 +379,7 @@ assert_absent "$OUT" "SHOULD NOT RUN" "T18 and the materialiser was not called a
 # green under a label claiming to check it.
 assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 
-# ── T20: THE DEPLOYED-DRIFT ARM (#10114) — the one branch that turns a green pass RED ────────────
+# ── T24: THE DEPLOYED-DRIFT ARM (#10114) — the one branch that turns a green pass RED ────────────
 # This is the arm that closes the silent no-op, so it is the arm that must be PINNED, not assumed.
 # Two directions, because a check that reds too much is as useless as one that never reds:
 #   executes:<dir>  → a live controller runs a tree this box does not have → the pass must FAIL
@@ -410,6 +410,20 @@ assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "action
 # ("and an  state always has a live controller"). Control flow was unaffected, so nothing caught it.
 # This asserts the prose survives intact, which is the only way that class is observable.
 assert_contains "$OUT" "an executes: state always has a live controller" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
+# ⛔ DISCOVERY ITSELF (review round 8, P2). Every assertion above hands the checker over through
+# HARNESS_APPLY_DRIFT_CMD, so the four-candidate search — the thing this lane had to fix twice because
+# it was dead in the deployed shape — was executed by NO test. Candidate 1 shadows any fixture on this
+# box, so the search root is overridable; that makes both ends assertable, including `absent`, which
+# is the arm that leaves the pass GREEN and is therefore the one that must be pinned.
+mkdir -p "$T/t24/found" "$T/t24/empty"
+printf '#!/usr/bin/env bash\necho "harness=current"\nexit 0\n' >"$T/t24/found/check-deployed-drift.sh"
+chmod +x "$T/t24/found/check-deployed-drift.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t24/found" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 a checker FOUND through the search root reads clean and does not red the pass"
+assert_contains "$OUT" "deployed_drift=clean" "T24 and it says it actually looked"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t24/empty" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_contains "$OUT" "deployed_drift=not-run" "T24 an ABSENT checker is named as not-run, never a silent clean"
+assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "drift=not-run" "T24 and the record carries it, not just the log"
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-behind.sh" run_pass "$T/t24" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 a copy at rest that is merely BEHIND does NOT red the pass"
 assert_contains "$OUT" "deployed_drift=drift" "T24 and it is still REPORTED, so it is not silent either"

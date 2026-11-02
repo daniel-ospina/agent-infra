@@ -114,6 +114,8 @@
 #                            needs it found here, not by reading the function body.
 #   HARNESS_APPLY_DRIFT_CMD  the checker to run instead of the discovered `check-deployed-drift.sh`
 #                            (the suite drives the red arm through a stub)
+#   HARNESS_APPLY_DRIFT_DIR  OVERRIDE the checker's search root (so `absent` — the state that
+#                            leaves a pass green — is reachable in a test, not just in production)
 #
 # Run: bash scripts/harness-apply-pass.sh [--dry-run|--print-status|--help]
 #
@@ -577,12 +579,22 @@ read_deployed_drift() {
         # arm DEAD on every deployed box: `absent` → not-run → never `executes:` → rc 0 over a stale
         # executing harness, which is exactly the silent green this change exists to end.
         # `$O` is where the checker IS deployed, so it is the candidate that works in production.
+        # ⛔ `HARNESS_APPLY_DRIFT_DIR` IS A SEARCH-ROOT OVERRIDE, not an extra candidate (review round 8,
+        # P2). The discovery path is the thing this lane had to fix TWICE because it was dead in the
+        # deployed shape, and no test executed it — every drift assertion supplied a checker path
+        # directly, and candidate 1 (`$HERE/orchestrator-harness/…`) shadows any fixture on this box.
+        # Overriding the root makes both "found through the seam" and "nothing to find" reachable, so
+        # `absent → not-run` (the arm that leaves the pass GREEN) can be asserted instead of assumed.
+        if [ -n "${HARNESS_APPLY_DRIFT_DIR:-}" ]; then
+            [ -f "$HARNESS_APPLY_DRIFT_DIR/check-deployed-drift.sh" ] && chk="$HARNESS_APPLY_DRIFT_DIR/check-deployed-drift.sh"
+        else
         for _candidate in "$HERE/orchestrator-harness/check-deployed-drift.sh" \
                           "$HERE/check-deployed-drift.sh" \
                           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/check-deployed-drift.sh" \
                           "${O:-}/check-deployed-drift.sh"; do
             [ -n "$_candidate" ] && [ -f "$_candidate" ] && { chk="$_candidate"; break; }
         done
+        fi
     fi
     if [ ! -f "$chk" ]; then
         DRIFT_STATE=not-run; DRIFT_TOKEN=absent

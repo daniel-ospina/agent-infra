@@ -771,7 +771,29 @@ if [ "$SURFACE" -eq 1 ]; then
             case "$_c1" in
               /*/orch-loop.sh) _script="$_c1" ;;
               *orch-loop.sh*) _text=1 ;;
-            esac ;;
+            esac
+            # ⛔ CLOSE THE PREFIX HERE (review VGATE of round 8). This arm ADVANCES `_i` past the command
+            # string, so the ordinary-word clearing below never sees it and `_interp` stayed 1 for the
+            # rest of the argv — `bash -c 'sleep 30' <gone>/orch-loop.sh` therefore nominated the
+            # trailing path as the script and fabricated `executes:` on a healthy box (reproduced).
+            # Everything after a `-c` string is `$0`/arguments, never the script.
+            _interp=0 ;;
+        esac
+        # ⛔ `_interp` DESCRIBES THE COMMAND PREFIX, NOT "AN INTERPRETER APPEARED SOMEWHERE EARLIER"
+        # (review round 8, P2). It used to persist for the whole argv, so
+        # `bash -c 'sleep 30' <gone>/orch-loop.sh` — and `bash -x other.sh <abs>/orch-loop.sh` —
+        # nominated the trailing path as the script even though it is `$0`/an ordinary argument,
+        # fabricating `executes:` on a healthy box. `bash`/`sh`/`zsh` is how that traffic is usually
+        # spelled (the measured `python3 -c …` case was the minority), so the class was still open.
+        # Cleared only by an ORDINARY word: an interpreter and its options keep the prefix alive,
+        # which is what makes `bash <path>`, `bash -x <path>`, `env bash <path>` and `bash -c <path>`
+        # all still count.
+        case "$_w" in
+          -*) : ;;
+          *) case "${_w##*/}" in
+               bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) : ;;
+               *) _interp=0 ;;
+             esac ;;
         esac
         _i=$((_i + 1))
       done
