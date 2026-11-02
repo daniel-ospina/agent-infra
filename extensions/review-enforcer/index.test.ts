@@ -11332,7 +11332,7 @@ test("#3175 i — every path in the fetch remedy is quoted, the script included"
   });
 });
 
-// ── Summary ───────────────────────────────────────────
+// ── #3297: a degraded guard refuses, rather than warns ───────────────────────────────────────────
 
 // ── #3297: A DEGRADED GUARD MUST REFUSE, NOT WARN ─────────────────────────────
 //
@@ -11466,6 +11466,7 @@ test("#3297: resolution and decision AGREE — the datum the handler passes cann
   });
 });
 
+// ── Summary ──
 // Run the async factory tests strictly sequentially (they mutate process.env).
 for (const run of pending) await run();
 

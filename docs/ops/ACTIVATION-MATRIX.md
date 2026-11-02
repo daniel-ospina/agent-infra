@@ -29,6 +29,7 @@ installer's promise. Where a row is a *state* that no file declares, it says so.
 | **provisioned (on demand)** | a shipped *code path* creates it the first time it needs it. An installer neither creates nor restores it; it reappears with the next run of the controller. |
 | **improvised** | it works today because of something a human or a lane did by hand — a shell-rc line, a hand-written plist, a symlink into a worktree, an operator-pushed file. Nothing re-creates it. |
 | **absent** | it is not there. Not degraded, not partial. A read that *failed* is never recorded as absent — see the abstention notes in rows 8, 10 and 16. |
+| **mixed** | provisioned on some boxes and not on others; the row's own body names which, and every box in it was MEASURED. Used where a single verdict would be a claim about boxes nobody read. |
 
 ## The matrix
 
@@ -54,7 +55,7 @@ installer's promise. Where a row is a *state* that no file declares, it says so.
 
 ## What the matrix says
 
-Counting each **(component, platform)** pair: **8 improvised, 6 absent, 18 provisioned**.
+Counting each **(component, platform)** pair: **7 improvised, 5 absent, 19 provisioned, 1 mixed** (32 pairs — recounted from the table on 2026-11-02, when row 1 moved from improvised/absent to provisioned/mixed).
 
 The measured per-box state behind the cell column, so the generic verdicts above are not misread:
 
@@ -66,10 +67,12 @@ The measured per-box state behind the cell column, so the generic verdicts above
 
 Three things, in order of how much they cost:
 
-1. **The component that gates a merge is the one whose activation is improvised on the Mac and
-   absent on cells** (rows 1-2). Rows 8 and 16 are improvised/absent too — but they cost *recovery*
+1. **Row 2 is the merge-gating component that is still improvised on the Mac and absent on cells**
+   (row 1 WAS the same defect and is now farmed — `setup.sh::merge_gate_srcs` provisions the shim and
+   `cell-install.sh` fails the install without it; it is re-measured `provisioned`/`mixed` on
+   2026-11-02). Rows 8 and 16 are improvised/absent too — but they cost *recovery*
    and *truthfulness*, not a merge, and #2130 already owns them. And this is **not** a cell-only
-   defect: the Mac resolves the shim from a shell-rc line the launchd controller does not inherit,
+   defect: the Mac resolved the shim (before the farm landed) from a shell-rc line the launchd controller does not inherit,
    so "the Mac is activated" is true of interactive sessions and unproven for daemon-born lanes.
 2. **The two rows that make the harness *unattended* are the two that cells do not have** — a
    watchdog (8) and an explicit env (9-11). A cell's controller now has a **shipped** service unit that
