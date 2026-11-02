@@ -1513,6 +1513,7 @@ cell_preflight_path() {
 }
 
 # ── the ONE agent invocation ─────────────────────────────────────────────────────
+# (`AGENT_HARNESS_SKEW_REFUSED` is 83 — see its own comment below for why it is no longer 81.)
 # run_agent <seconds> <logfile> <promptfile> [label]
 #
 # Wall-clock limited: `pi -p` has no internal limit, so one hung model call holds a concurrency slot
@@ -1584,9 +1585,20 @@ AGENT_CAPABILITY_REFUSED=71
 # syntax error). Both are properties of the HELPER PAIR, identical on every box that runs it, so the
 # remedy is to sync that pair. Reporting them as 71 sent the operator to "repair this box's installed
 # pi/extension set or provider credential" and then to "dispatch the issue to another box" — where the
-# same skewed pair refuses identically. 81 because 71-80 are all taken (79 is adopt-fix.sh's deferral,
-# 80 the brief gate), and a code that is unique is what lets every caller publish the sync remedy.
-AGENT_HARNESS_SKEW_REFUSED=81
+# same skewed pair refuses identically. A code that is unique is what lets every caller publish the
+# sync remedy — and that is exactly what this gate lost. ⛔ 83, NOT 81 (measured 2026-11-01 on the
+# merged tree of PR #2591): 81 was claimed FIRST by `AGENT_MEM_REFUSED` (#2387,
+# 2026-10-23) and this constant was added nine days later (#3035, 2026-11-01) with "81 because 71-80
+# are all taken" — a list that could not see a code claimed on a branch it had not read. Two gates on
+# 81 made the MEMORY arm of every caller UNREACHABLE, because each caller compares in arm order and
+# the skew arm comes first: reproduced in `fix-one.sh` (skew at :795, mem at :818 on that tree), where
+# a memory refusal exited 81 and was published as "HARNESS/MISMATCH gate". 79-82 are all spoken for
+# (79 adopt-fix.sh's deferral, 80 the brief gate, 81 and 82 #2387's memory gate — caller-facing and
+# spawn-point codes, the second of which lands with that same PR), so 83 is the lowest free code —
+# outside the sysexits range (none of EX_* exceeds 78) and outside bash's reserved 126/127/128+, so no
+# third-party process produces it by accident, the property #2258 chose 80 for.
+# `spawn-gate.test.sh` now DERIVES the set of gates and fails when two of them claim one code.
+AGENT_HARNESS_SKEW_REFUSED=83
 # The disk gate's refusal code, and it is a SEPARATE code on purpose: the remedies are opposite. A
 # load refusal clears when the box quietens and the controller re-dispatches next cycle; a disk
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
@@ -2143,7 +2155,8 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
               _pf_remedy="This does NOT clear by waiting: the lane's model/provider PAIR is empty, so no box could run it — fix the dispatch, not the box." ;;
             usage)
               # Version skew, not a property of the box: the probe rejected an argument it was handed.
-              # ⛔ AND IT IS NOT A CAPACITY REFUSAL, WHICH IS WHY IT EXITS 81 (follow-up review of
+              # ⛔ AND IT IS NOT A CAPACITY REFUSAL, WHICH IS WHY IT EXITS 83 (`AGENT_HARNESS_SKEW_REFUSED`
+              # — see that constant for why it is no longer 81; follow-up review of
               # #2991, P2, measured): every reader maps 71 to a BOX property (`lane.sh` mints a
               # `capacity-refused-<N>` record from it, so the item is yielded to a peer), and a skewed
               # pair is identical on that peer. The remedy below is the only correct one, and the code
@@ -2178,7 +2191,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
           # worst — a NEW caller against an OLD deployed helper (the version-skew direction this PR
           # names as the production cause: an argument the old copy rejects exits 2 printing nothing),
           # or a corrupt/truncated copy, where `bash <file>` exits 2 with no stdout. Both are the helper
-          # pair, not the box, so they REFUSE under 81 and say so. `rc=1` (no helper, could not start)
+          # pair, not the box, so they REFUSE under 83 and say so. `rc=1` (no helper, could not start)
           # still warns: that is the absence of a probe, not a reading from one.
           if [ "${_pf_rc:-0}" -eq 2 ]; then
             AGENT_STARTED=0

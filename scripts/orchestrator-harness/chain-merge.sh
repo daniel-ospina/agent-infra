@@ -273,14 +273,16 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
       # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
-      # 81 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
+      # 83 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
       # and either rejected its own arguments (a usage/version skew between the caller and the deployed
       # helper) or died without a verdict (`rc=2` on a corrupt copy). ⛔ IT MUST NOT BE 71: every reader
       # treats 71 as a property of THIS box, so the operator is told to repair the box's pi/extension
       # set or hand the item to a peer — and the peer runs the SAME helper pair and refuses identically.
       # The chain still stops here (no PR can appear), and the EXIT trap still releases
       # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
-      skew) _cap_rc=81 ;;
+      # ⛔ 83, NOT 81 (2026-11-01): 81 belongs to `AGENT_MEM_REFUSED` (#2387), which claimed it nine days
+      # before this gate was written, and this literal is what pinned the collision into a second caller.
+      skew) _cap_rc=83 ;;
       *)    _cap_rc=75 ;;
     esac
     if [ "$_cap_gate" = "land" ]; then

@@ -32,6 +32,110 @@ ck() { # ck <name> <0|1>
 }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 GATE="$HERE/spawn-gate.sh"
+
+# ══ THE REFUSAL-CODE NAMESPACE: ONE SCANNER, AND IT FAILS CLOSED ════════════════════════════════
+# ⛔ WHY THIS EXISTS (review of PR #3237, findings 1 and 2). The first cut of the code checks below
+# read the codes with `sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1 \2/p'` on
+# `spawn-gate.sh` ONLY, and both of those choices fail OPEN in the direction that matters:
+#   • the `^NAME=` anchor is blind to any declaration form it did not anticipate — measured: appending
+#     `export AGENT_NEW_GATE_REFUSED=83` (a REAL duplicate of the skew code) left the duplicate check
+#     GREEN, while the un-prefixed spelling of the same constant was RED. A verdict that depends on
+#     how a constant was SPELLED is not a guard, and it is exactly how 81 got double-claimed: a reader
+#     that cannot see a constant it did not expect reports "nothing found", which reads as "clean".
+#   • one file is not the deploy unit. `brief-gate.sh:60` declares `BRIEF_GATE_REFUSED=80` and
+#     `adopt-fix.sh` defers under 79 — codes no single-file scan can see, in a class that has ALREADY
+#     fired cross-file twice (74 and 80).
+# So: ONE scanner over every shipped helper of the deploy unit (`cp …/orchestrator-harness/*.sh $O/`
+# — the files that ship TOGETHER, the only set in which a collision can actually happen), and NOTHING
+# is skipped in silence. A declaration in the family that the scanner cannot read as a 70..89 code is
+# a RED naming the file and the raw text, unless it is declared in `_codes_noncode` with a reason. An
+# absent or unreadable required declarer is a RED. A scan that yields NO claim at all is a RED — the
+# "the parse matched nothing" case, which in the first cut read as a clean pass.
+# The scan is computed ONCE per directory and every reader in this file uses it (`codes_for_name`
+# for a value, `$CODE_ROWS` for the claim list): a second parser is a second way to fail open.
+cat > "$TMP/refusal-codes.awk" <<'REFUSAL_AWK'
+BEGIN { OFS = "\t" }
+{
+  if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
+  s = $0
+  sub(/^[ \t]+/, "", s)
+  if      (s ~ /^export[ \t]+/)              sub(/^export[ \t]+/, "", s)
+  else if (s ~ /^(readonly|typeset)[ \t]+/)  sub(/^(readonly|typeset)[ \t]+/, "", s)
+  else if (s ~ /^declare[ \t]+/)             sub(/^declare[ \t]+(-[A-Za-z]+[ \t]+)?/, "", s)
+  if (s !~ /^[A-Za-z_][A-Za-z0-9_]*=/) next
+  eq = index(s, "=")
+  name = substr(s, 1, eq - 1)
+  if (name !~ /_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) next
+  val = substr(s, eq + 1)
+  sub(/[ \t]*#.*$/, "", val); sub(/[ \t]*;.*$/, "", val)
+  gsub(/^[ \t]+|[ \t]+$/, "", val); gsub(/^["']|["']$/, "", val)
+  n = split(FILENAME, p, "/"); f = p[n]
+  if (val ~ /^[0-9]+$/ && val + 0 >= 70 && val + 0 <= 89) print "claim", name, val + 0, f
+  else print "unknown", name, val, f
+}
+REFUSAL_AWK
+
+# The files that DECLARE a gate code in this deploy unit. Presence is not enough: each must actually
+# contribute a parsed claim, so this list cannot rot into naming a file that stopped declaring one,
+# and a file that vanishes from a `$O` copy is a RED rather than a quietly smaller scan.
+_codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh"
+# A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
+# not listed here is a RED: a new non-code in the family needs its own deliberate line.
+#   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
+#   an exit code; nothing compares a shell status against it.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED"
+# The ONLY permitted shared codes, asserted as an EQUALITY so the table cannot rot into a blanket
+# allowance — a share that DISAPPEARS is red too, because it means an alias broke:
+#   78 = the cannot-verify pair (#2258): `PI_FORK_REFUSED` and `BRIEF_GATE_UNAVAILABLE` both mean
+#        "this run could not be verified".
+#   80 = ONE gate under two names: `BRIEF_GATE_REFUSED` is the code `brief-gate.sh` EXITS with and
+#        `AGENT_BRIEF_REFUSED` is the constant callers compare against. brief-gate.sh cannot source
+#        spawn-gate.sh (the helper is a spawn point, not a library), so the alias is kept by hand —
+#        and this line is what makes it a declared alias instead of a second collision.
+_codes_sanctioned="78=BRIEF_GATE_UNAVAILABLE,PI_FORK_REFUSED 80=AGENT_BRIEF_REFUSED,BRIEF_GATE_REFUSED"
+
+refusal_codes() { awk -f "$TMP/refusal-codes.awk" "$1"/*.sh 2>/dev/null; }
+
+# codes_for_name <NAME> — the code a claim declares, or EMPTY when nothing here declares that name.
+# EMPTY therefore means "forward-declared", never "I could not read it": an unreadable declaration is
+# an `unknown` row and a RED, so the two can never be confused.
+codes_for_name() { printf '%s\n' "$CODE_ROWS" | awk -F'\t' -v n="$1" '$1=="claim" && $2==n{print $3; exit}'; }
+
+# codes_verdict <dir> -> CODE_RC (0 = green), CODE_MSG (one line naming everything it read),
+#                        CODE_ROWS (the raw scanner output, reused by every other check here).
+codes_verdict() {
+  CODE_ROWS="$(refusal_codes "$1")"
+  _cv_claims="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="claim"')"
+  _cv_n="$(printf '%s\n' "$_cv_claims" | awk -F'\t' 'NF{n++} END{print n+0}')"
+  _cv_absent=""
+  for _cv_f in $_codes_required; do
+    [ -r "$1/$_cv_f" ] || { _cv_absent="$_cv_absent $_cv_f(absent)"; continue; }
+    printf '%s\n' "$_cv_claims" | awk -F'\t' -v f="$_cv_f" '$4==f{n++} END{exit !(n>0)}' \
+      || _cv_absent="$_cv_absent $_cv_f(declares no code)"
+  done
+  _cv_unknown=""
+  for _cv_u in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unknown"{print $4":"$2}'); do
+    case " $_codes_noncode " in *" $_cv_u "*) : ;; *) _cv_unknown="$_cv_unknown $_cv_u" ;; esac
+  done
+  _cv_shared=""
+  for _cv_c in $(printf '%s\n' "$_cv_claims" | awk -F'\t' '{print $3}' | sort -un); do
+    _cv_ns="$(printf '%s\n' "$_cv_claims" | awk -F'\t' -v c="$_cv_c" '$3==c{print $2}' | sort -u | tr '\n' ',')"
+    _cv_ns="${_cv_ns%,}"
+    case "$_cv_ns" in *,*) _cv_shared="$_cv_shared $_cv_c=$_cv_ns" ;; esac
+  done
+  _cv_shared="${_cv_shared# }"
+  if [ -n "$_cv_absent$_cv_unknown" ] || [ "$_cv_shared" != "$_codes_sanctioned" ] || [ "$_cv_n" -eq 0 ]; then
+    CODE_RC=1
+  else
+    CODE_RC=0
+  fi
+  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none} shared:${_cv_shared:- none}"
+}
+
+# Computed here so every reader below shares ONE parse: the chain gate table, the coverage verdict,
+# the uniqueness check and the arm table. Asserted where each property belongs (§ the class section).
+codes_verdict "$HERE"
+
 mkdir -p "$TMP/bin" "$TMP/O/state"
 LOG="$TMP/log"; PROMPT="$TMP/prompt"; PI_LOG="$TMP/pi.log"; MERGE_LOG="$TMP/merge.log"
 # ⛔ THE FIXTURE IS A REAL BRIEF NOW (agent-infra#2258). `run_agent` refuses a brief that carries no
@@ -1372,7 +1476,7 @@ ck "a probe that produced NO verdict at all with rc=1 WARNS and dispatches (rc=$
 # CALLER refuses on it, so the two halves cannot drift apart in either direction.
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 LANE_PREFLIGHT_BOUND=45s CELL_PREFLIGHT_SH="$HERE/cell-lane-preflight.sh"
-{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+{ [ "$CRC" -eq 83 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "an UNREADABLE usage path (bad \$LANE_PREFLIGHT_BOUND) is REFUSED, not dispatched (rc=$CRC)" $rc
 grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and the remedy names what a usage error actually is — helper/consumer skew, not the extension set" $rc
@@ -1404,17 +1508,37 @@ ck "a GENUINE why=no-answer still WARNS and dispatches (rc=$CRC) even with a hos
 # 3300 s slot this gate exists to protect. Reachable in the version-skew direction the probe's own
 # header names as the production cause (a NEW caller against an OLD deployed helper: a rejected
 # `--bound` exits 2 printing nothing) and from a truncated/corrupt copy (`bash <file>` on broken syntax
-# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 81 (not 71: 71 sends the
+# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 83 (not 71: 71 sends the
 # operator to repair the BOX and then to dispatch the item to a peer that runs the same pair).
 mkfake '' 2
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
-{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
-ck "a probe that RAN and exited 2 with NO verdict is REFUSED 81 and starts NO agent (rc=$CRC)" $rc
+{ [ "$CRC" -eq 83 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that RAN and exited 2 with NO verdict is REFUSED 83 and starts NO agent (rc=$CRC)" $rc
 grep -q 'rc=2 with NO verdict' "$LOG"; rc=$?
 ck "...and the log names the rc=2 reading, so the operator is not left with an unexplained refusal" $rc
 grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and names the pair as the cause (skew/corrupt copy), not the box's pi or credential" $rc
+# (g5) ⛔ NO COMMENT ON A SKEW ARM MAY STATE A STALE CODE (review of PR #3237, finding 4). Two
+# comments on the very branches that now `return $AGENT_HARNESS_SKEW_REFUSED` still said the skew
+# refusal "is 81", nine days after 81 was taken by the memory gate. A comment is a CONTRACT to the next
+# reader: the lane that republishes the remedy takes the number from it, so a stale one re-ships the
+# collision this change exists to end — and nothing could see it, because the CODE was right and only
+# the prose was wrong. The check is DERIVED from the constant (a renumber follows it automatically)
+# and it matches the ASSERTION, not the digits — `:818` and the constant's own "83, NOT 81" rationale
+# do not trip it. The region is the whole capability gate from the reason table to the skew return, so
+# BOTH stale sites are inside ONE range; the range is asserted non-empty AND asserted to contain a
+# numeric claim, because a range that matched nothing (or a rewording that split the number from
+# `EXITS`) would otherwise report "no stale code" over nothing at all.
+_skewcode="$(codes_for_name AGENT_HARNESS_SKEW_REFUSED)"
+_sarm="$(sed -n '/case "\$_pf_reason" in/,/return "\$AGENT_HARNESS_SKEW_REFUSED"/p' "$GATE")"
+_skewclaims="$(printf '%s\n' "$_sarm" | grep -oE '(EXITS|REFUSE under|refuses under) [0-9][0-9]' | grep -oE '[0-9][0-9]$' | sort -u | tr '\n' ' ')"
+_stalecodes=""
+for _sn in $_skewclaims; do
+  [ "$_sn" = "$_skewcode" ] || _stalecodes="$_stalecodes $_sn"
+done
+{ [ -n "$_skewcode" ] && [ -n "$_sarm" ] && [ -n "${_skewclaims// /}" ] && [ -z "$_stalecodes" ]; }; rc=$?
+ck "no comment on a SKEW arm states a code other than the constant's ($_skewcode; arm region: $(printf '%s' "$_sarm" | wc -l | tr -d ' ') lines; numeric claims read: [${_skewclaims}] ; stale:${_stalecodes:- none})" $rc
 # (h) A REFUSAL RESTORES THE CALLER'S JOB CONTROL. `set -m` is turned on above the gate and restored
 # after the launch, so the early return was the one path that left the caller with job control ON —
 # and with it on, an async command in the caller no longer gets its stdin from /dev/null (#2163).
@@ -1569,7 +1693,7 @@ _gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load
 _seen=""; _exercised=""
 for _pair in $_gate_expected; do
   _g="${_pair%%:*}"; _c="${_pair##*:}"
-  _want="$(sed -n "s/^${_c}=//p" "$GATE" | head -1)"
+  _want="$(codes_for_name "$_c")"
   chain_probe "$_g"
   [ -n "$_want" ] && [ "$CHAIN_RC" = "$_want" ]; rc=$?
   ck "chain-merge reports a '$_g' refusal as its own code (want=$_want got=$CHAIN_RC)" $rc
@@ -1587,14 +1711,19 @@ chain_probe load
 ck "...while a load refusal still names the load gate (read: '${CHAIN_REMEDY:-<nothing>}')" $rc
 
 # ── the COVERAGE verdict: defined − (named in CODE ∪ exercised above) must be empty ─────────────
+# The code set is the SCANNER's, not a `sed` on the helper: a constant declared with `export`, or in
+# brief-gate.sh rather than spawn-gate.sh, is still a code a caller may compare against and must be
+# accounted for (review of PR #3237, findings 1 and 2). Derived from $CODE_ROWS so there is ONE parse;
+# a name the scanner could not read at all is already a RED in `unparseable:` above, and a scan that
+# produced nothing is a RED there too — neither can arrive here disguised as an empty list.
 _named=""
-for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GATE" | sort -u); do
+for _code in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="claim" && $2 ~ /^AGENT_.*_REFUSED$/{print $2}' | sort -u); do
   for _f in lane.sh fix-one.sh chain-merge.sh adopt-fix.sh nonblocking-dispatch.sh; do
     strip_comments "$HERE/$_f" | grep -q "$_code" && _named="$_named $_code"
   done
 done
 _unread=""
-for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GATE" | sort -u); do
+for _code in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="claim" && $2 ~ /^AGENT_.*_REFUSED$/{print $2}' | sort -u); do
   case " $_named $_exercised " in
     *" $_code "*) : ;;
     *) _unread="$_unread $_code" ;;
@@ -1602,6 +1731,196 @@ for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GA
 done
 [ -z "$_unread" ]; rc=$?
 ck "every AGENT_*_REFUSED code is ACCOUNTED FOR — named in a caller's CODE or reached by the table (unread:${_unread:- none})" $rc
+
+# ══ THE CLASS: TWO GATES MUST NOT CLAIM ONE CODE, AND EVERY ARM MUST BE REACHED ══════════════════
+# ⛔ WHY THIS SECTION EXISTS (measured 2026-11-01 on the merged tree of PR #2591, parents 317cf6286 +
+# 951e4c821). `AGENT_HARNESS_SKEW_REFUSED` was added at 81 by #3035 (2026-11-01) — nine days AFTER
+# `AGENT_MEM_REFUSED` (#2387, 2026-10-23) had claimed 81 on a branch that had not merged. Nothing
+# detected it, and the reason is that BOTH things that could have were SPOT LISTS, not derivations:
+#   • `_gate_expected` above is a hand-written list of the gates that existed when it was authored, so
+#     a NEW constant needs a row nobody was required to add — #2591's memory gate never got one, and
+#     the chain was therefore never asked to prove its arm reachable;
+#   • the distinctness assertions elsewhere are spot checks too (`capacity-placement.test.sh`: "fork 73,
+#     distinct from land 74, disk 77 and load 75") — a list, so it cannot see a code added after it.
+# The consequence was not cosmetic: callers classify a refusal BY CODE and in ARM ORDER, so with skew
+# at 81 and the skew arm FIRST in `fix-one.sh` (:795 on that tree, the memory arm at :818), every
+# MEMORY refusal exited 81 under the "HARNESS/MISMATCH gate" label and the memory arm was UNREACHABLE.
+# One red out of 113 checks, and only because #2591 happened to write an arm that drove the memory
+# refusal through the fixer.
+# So the two properties below are DERIVED from the shipped files and from the caller's own references,
+# never from a list a future author has to remember to extend:
+#   (1) two gates may not claim one code — and the claim list comes from a SCANNER OVER THE WHOLE
+#       DEPLOY UNIT that fails closed (an unreadable declaration, an absent declarer or an empty scan
+#       is a RED), because the first cut parsed `spawn-gate.sh` alone with a `^NAME=` anchor: it was
+#       measured GREEN on `export AGENT_NEW_GATE_REFUSED=83` and blind to `brief-gate.sh`'s 80 and
+#       `adopt-fix.sh`'s 79, which is precisely how a unique code stops being unique;
+#   (2) every gate the fixer CLASSIFIES is DRIVEN, and must NAME ITSELF. A new constant that fix-one.sh
+#       reads but this table does not declare is a RED ("undeclared"), so the table cannot fall behind
+#       the helper silently — the blind spot that let 81 be claimed twice. The table's own accounting
+#       (`_armseen`) is read and asserted, so "every row was driven" is falsifiable rather than stated.
+
+# (1) THE CODES ARE UNIQUE ACROSS THE WHOLE DEPLOY UNIT, not just the helper. This is the verdict of
+# the ONE scanner defined at the top of this file, and $CODE_MSG carries its readings so a red says
+# WHICH of the three ways it failed: a required declarer absent or silent, a declaration it could not
+# read as a code, or a shared-code group that is not exactly the sanctioned table.
+ck "no two refusal gates claim the SAME code across the deploy unit — the only sanctioned shares are 78's cannot-verify pair and 80's one-gate-two-names alias ($CODE_MSG)" $CODE_RC
+
+# ── THE MUTATIONS: the guard must go RED on each way a parse can MISS a claim ───────────────────
+# ⛔ THESE ARE THE FINDING, NOT DECORATION (review of PR #3237, findings 1 and 2). The first cut read
+# the codes with a `^NAME=`-anchored `sed` on spawn-gate.sh, so `export AGENT_NEW_GATE_REFUSED=83` — a
+# real duplicate — left the check GREEN (measured: the same constant un-prefixed was RED), and a code
+# declared in a sibling helper was not in the scanned set at all. Each arm drives the REAL predicate
+# over a copy of the code-declaring helpers, so what is proven is the shipped scanner, not a
+# description of it. The CONTROL arm comes first: without it, a red could be an artefact of the
+# copying, and every arm below would be evidence of nothing.
+_codemut() { # _codemut <tag> -> a fresh copy of the code-declaring helpers; echoes its path
+  rm -rf "$TMP/codemut-$1"; mkdir -p "$TMP/codemut-$1"
+  for _cm_f in $_codes_required; do cp "$HERE/$_cm_f" "$TMP/codemut-$1/"; done
+  printf '%s\n' "$TMP/codemut-$1"
+}
+_codemut_dir="$(_codemut control)"
+codes_verdict "$_codemut_dir"
+ck "(mutation CONTROL) an unmutated copy of the code-declaring helpers is GREEN — so every red below is the MUTATION, not the copying ($CODE_MSG)" $CODE_RC
+
+# (a) FINDING 1. The spelling that defeated the old parser: a real duplicate of the skew code, which
+# the `^NAME=` anchor could not see. RED, and the message must name the 83 collision — a red for some
+# other reason would not prove the exported form was READ.
+_codemut_dir="$(_codemut export)"
+printf '\nexport AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation a) an EXPORTed duplicate (\`export AGENT_NEW_GATE_REFUSED=83\`) is REFUSED and NAMED — the first cut read this as GREEN (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (b) FINDING 1, the fail-closed half: a constant the parser cannot read as a code must be a RED
+# naming the raw text — never a skip. A skip is what "the parse matched nothing" looks like.
+_codemut_dir="$(_codemut unreadable)"
+printf '\nAGENT_NEW_GATE_REFUSED=$(( 70 + 13 ))\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"unparseable: spawn-gate.sh:AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation b) a declaration the parser CANNOT read (\`AGENT_NEW_GATE_REFUSED=\$(( 70 + 13 ))\`) is REFUSED and names the file+constant (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (c) FINDING 2. The cross-file collision, driven in the sibling that holds the other half of 80: with
+# brief-gate.sh declaring 76, PI_GATE_REFUSED (spawn-gate.sh) is double-claimed and the 80 alias is
+# gone. Both are reds; the message must name the 76 collision, because that is the one a 1-file scan
+# cannot see.
+_codemut_dir="$(_codemut crossfile)"
+sed -i.bak 's/^BRIEF_GATE_REFUSED=80$/BRIEF_GATE_REFUSED=76/' "$_codemut_dir/brief-gate.sh"
+rm -f "$_codemut_dir/brief-gate.sh.bak"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"76=BRIEF_GATE_REFUSED,PI_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation c) a code re-declared from a SIBLING helper (brief-gate.sh:80->76) is REFUSED — a 1-file scan cannot see this class (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d) FINDING 2, the absent half: a required declarer that is missing from the deploy unit is a RED,
+# not a smaller scan. This is the `$O` copy that lost a file — the state in which a real collision in
+# that file would be silently invisible.
+_codemut_dir="$(_codemut absent)"
+rm -f "$_codemut_dir/brief-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"absent: brief-gate.sh(absent)"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation d) an ABSENT required declarer (brief-gate.sh) is REFUSED and named, not skipped (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (e) FINDING 1, the root case: a scan that matches NOTHING. This is the shape a blind parser produces
+# on a tree it does not understand, and in the first cut it read as a clean pass.
+rm -rf "$TMP/codemut-nothing"; mkdir -p "$TMP/codemut-nothing"
+codes_verdict "$TMP/codemut-nothing"
+[ "$CODE_RC" -eq 1 ]; rc=$?
+ck "(mutation e) a scan that finds NO claim at all is REFUSED — an empty parse is not a clean parse (rc=$CODE_RC; $CODE_MSG)" $rc
+# Restore the real verdict for every reader below (the arms above drove copies).
+codes_verdict "$HERE"
+
+# (2) THE ARM TABLE. `<CONSTANT>:<wording the fixer's own log must carry>`. A row may PRECEDE its
+# gate (#2387's memory gate is declared here before main defines it): the moment that constant lands,
+# this row drives it, so the collision cannot be merged into main a second time without a red.
+_fixer_arms="AGENT_BRIEF_REFUSED:BRIEF gate
+AGENT_CAPABILITY_REFUSED:CAPABILITY gate
+AGENT_FORK_REFUSED:fork gate
+AGENT_LOAD_REFUSED:load gate
+AGENT_DISK_REFUSED:disk gate
+AGENT_HARNESS_SKEW_REFUSED:HARNESS/MISMATCH gate
+AGENT_MEM_REFUSED:memory gate"
+_armdecl=" $(printf '%s\n' "$_fixer_arms" | cut -d: -f1 | tr '\n' ' ')"
+# Completeness, in the direction that matters: every gate the FIXER reads must have a row. Derived
+# from fix-one.sh itself, so adding a `${AGENT_X_REFUSED:-…}` arm there without declaring it here is a
+# red rather than an unchecked arm.
+_armmissing=""
+for _ac in $(grep -o 'AGENT_[A-Z_]*_REFUSED' "$HERE/fix-one.sh" | sort -u); do
+  case "$_armdecl" in *" $_ac "*) : ;; *) _armmissing="$_armmissing $_ac" ;; esac
+done
+[ -z "${_armmissing// /}" ]; rc=$?
+ck "every gate fix-one.sh CLASSIFIES has an arm-table row (undeclared:${_armmissing:- none}) — a new arm cannot be added without proving it is reachable" $rc
+
+# The fixture: the shipped fix-one.sh beside the SHIPPED helper with ONE function APPENDED and
+# overridden — `run_agent`, whose RETURN VALUE is the classifier's whole input. Deriving the fixture
+# from the helper (rather than re-implementing a helper that returns a code) is what keeps this from
+# proving only that a `case` statement exists: every constant, every guard and every other function in
+# the fixture is the shipped code, and the prefix identity is asserted below so an edit to the
+# derivation cannot quietly diverge.
+_armdir="$RIG/armtable"; mkdir -p "$_armdir"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" \
+   "$HERE/gate-policy.sh" "$HERE/brief-gate.sh" "$HERE/reviewer-preflight.sh" "$_armdir/"
+cat >> "$_armdir/spawn-gate.sh" <<'ARMTABLE_OVERRIDE'
+
+# ── FIXTURE OVERRIDE (spawn-gate.test.sh's arm table) ───────────────────────────────────────────
+# The fixer's classifier keys on run_agent's RETURN VALUE, so the return value is what is forced here;
+# nothing else in this helper is touched. Appended LAST so this definition wins at source time.
+run_agent() { AGENT_STARTED=0; return "${FIXTURE_GATE_RC:-75}"; }
+ARMTABLE_OVERRIDE
+head -n "$(wc -l < "$GATE" | tr -d ' ')" "$_armdir/spawn-gate.sh" | diff -q - "$GATE" >/dev/null; rc=$?
+ck "the arm-table fixture differs from the shipped helper ONLY by the appended run_agent override" $rc
+grep -q '^run_agent() { AGENT_STARTED=0; return "\${FIXTURE_GATE_RC:-75}"; }$' "$_armdir/spawn-gate.sh"; rc=$?
+ck "...and the override really is there (a derived fixture that silently dropped it would drive the real gate)" $rc
+
+# ⛔ `_armseen` IS READ, AND IT DECIDES THE VERDICT BELOW (review of PR #3237, finding 3). It used to
+# be written three times and read NOWHERE, so "every row was driven" was a claim with no assertion
+# behind it — a status that read better than reality, in a section whose entire subject is exactly
+# that. Every row now RECORDS its own outcome here, and the check after the loop requires the record
+# to account for every declared row AND requires at least one row to have been DRIVEN: a table whose
+# rows had all become forward-declarations would otherwise pass while proving nothing.
+_armseen=""
+# ⛔ `fix_argv` IS RE-BUILT BEFORE EVERY ROW, NOT ONCE: `fix-one.sh --argv` CONSUMES the file
+# (`rm -f "$ARGV"` at its own :10), so a single build would drive row 1 and leave rows 2..n asserting
+# on "missing argv file" — measured on the first cut of this section, where only the first gate passed.
+# ⛔ ITERATED PER LINE, NOT PER WORD (review of PR #3237, finding 3 — found by the accounting check
+# below on its first run). `for _row in $_fixer_arms` word-splits on whitespace, so a row whose wording
+# contains a space (`AGENT_BRIEF_REFUSED:BRIEF gate`) became TWO iterations: the real one, plus a bogus
+# `gate` row whose "constant" is the word `gate`. The bogus rows are inert, so every arm still PASSED
+# and the table drove only half of itself — a defect no arm-level assertion could see, because each arm
+# was individually correct. A here-string loop runs in THIS shell (no subshell), so `_armseen` survives.
+while IFS= read -r _row; do
+  [ -n "$_row" ] || continue
+  _ac="${_row%%:*}"; _aw="${_row#*:}"
+  # The VALUE comes from the one scanner. A name that is DECLARED but unreadable is never mistaken for
+  # an absent one: that case is an `unknown` row and a RED in the mutation arms above.
+  _av="$(codes_for_name "$_ac")"
+  # A forward-declared row (the gate is not on this tree yet) is inert, not vacuous: it fires the day
+  # the constant lands, which is the whole point of declaring it early.
+  [ -n "$_av" ] || { _armseen="$_armseen ${_ac}=forward-declared"; continue; }
+  fix_argv
+  : > "$RO/logs/fix-7.log"; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
+  ( cd "$RREPO" && O="$RO" FIXTURE_GATE_RC="$_av" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 \
+      DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" \
+      PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+      bash "$_armdir/fix-one.sh" --argv "$RIG/argv7" ) >"$_armdir/arm-$_ac.out" 2>&1; _arc=$?
+  if grep -q "fixer NOT started ($_aw" "$RO/logs/fix-7.log" 2>/dev/null && [ "$_arc" = "$_av" ]; then rc=0; else rc=1; fi
+  _armgot="$(grep -o 'fixer NOT started ([^:)]*' "$RO/logs/fix-7.log" 2>/dev/null | head -1 | sed 's/.*(//')"
+  # On a red, the fixture's OWN output is quoted: a label that says only "no refusal line" hides
+  # whether the arm missed the classifier, the derivation, or the fixture.
+  _armwhy=""
+  [ "$rc" -eq 0 ] || _armwhy=" | fixer said: $(tail -2 "$_armdir/arm-$_ac.out" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
+  ck "fix-one.sh NAMES '$_aw' when the gate returns $_ac ($_av) and REPUBLISHES that code (read: '${_armgot:-<no refusal line>}', rc=$_arc)$_armwhy" $rc
+  _armseen="$_armseen ${_ac}=driven"
+done <<< "$_fixer_arms"
+# The assertion `_armseen` exists for. One token per row, so `wc -w` counts rows; a row that falls
+# through the loop without recording itself (a future `continue`, a `break`) is a RED here even though
+# no individual arm failed, which is the only way "every row was driven" can be FALSIFIABLE.
+_armrows="$(printf '%s\n' "$_fixer_arms" | awk 'NF{n++} END{print n+0}')"
+_armacct="$(printf '%s' "$_armseen" | wc -w | tr -d ' ')"
+# ⛔ THE PATTERN IS `=driven`, NOT ` driven` — the entries are `NAME=driven`, so a search for the
+# word alone with a leading SPACE matched nothing and this check failed on a full green table
+# (measured on the first full run of this section, 7 of 7 rows driven and still red).
+case " $_armseen " in *"=driven "*) _armdriven=1 ;; *) _armdriven=0 ;; esac
+{ [ "$_armacct" -eq "$_armrows" ] && [ "$_armdriven" -eq 1 ]; }; rc=$?
+ck "every arm-table row is ACCOUNTED FOR after the drive — driven or explicitly forward-declared, and at least ONE driven (rows: $_armrows, accounted: $_armacct —$_armseen)" $rc
 
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,
