@@ -258,19 +258,32 @@ case_b() { # <entry-point> <owner>
                "the record carries the owner's unmeasurable= tally (0 here), so an ABSTENTION has a field"
     case_check "$(grep -qF 'unmeasurable=0 ' <<<"$out" && echo 0 || echo 1)" \
                "… and the class line prints it beside kept=, so the two outcomes are told apart without the log"
-    # ⛔ THE VERDICT, AND ITS READER (#3057 review). Case (b) is the only case that REAPS, and it read every
-    # record field except `verdict_runner_work=` — the one that says the pass WORKED. Measured `ok` here,
-    # and not by luck: `rc` was asserted 0 above and `class_verdict 0` is `ok` by construction, so any other
-    # value beside a removed entry is the record contradicting the pass it records. It is asserted at the
-    # ends of (f)/(g) too, but neither of those reaps — the apply path is where a verdict that was dropped,
-    # or hardcoded, would still have read as a clean class.
+    # ⛔ THE VERDICT, AND ITS READER (#3057 review). Case (b) read every record field except
+    # `verdict_runner_work=` — the one that says the pass WORKED. Measured `ok` here, and not by luck: `rc`
+    # was asserted 0 above and `class_verdict 0` is `ok` by construction, so any other value beside a
+    # removed entry is the record contradicting the pass it records.
+    # ⛔ CORRECTED — this comment used to say "Case (b) is the only case that REAPS" and "(f)/(g) … neither
+    # of those reaps", and BOTH claims are measurably false: case (a) drives `--apply` (:210) and reads its
+    # record (:214), and case (g) drives `--apply` (:467), reads its record (:469) AND reaps — its own
+    # "and it reaped the dead entry" assertion (:472) passes. At the prior head `301235ef8`, (g) already
+    # reaped and already asserted `^verdict_runner_work=ok$`. What this assertion ACTUALLY closes: (b) reads
+    # every OTHER field of the record, and this one was the exception on the suite's most complete reaping
+    # path — it adds field COMPLETENESS to (b), not a unique mutant kill (deleting the record line reddens
+    # (g) too). The unique kill is the READER assertion below, which nothing else covered.
     case_check "$(grep -q '^verdict_runner_work=ok$' <<<"$st" && echo 0 || echo 1)" \
                "the record reads verdict_runner_work=ok on the pass that actually REAPED (measured, not a default)"
     # … and the RECORD'S OWN READER must render it: `verdict_runner_work` is written for `--print-status`,
-    # so a field that is written and never read is not a channel. ⛔ THE READER'S SHAPE IS NOT THE FILE'S:
-    # the record is one `key=value` per LINE, and `--print-status` renders ONE `|`-joined line — so the
-    # assertion is anchored on a FIELD BOUNDARY, not on a line. (The first version grepped `^verdict_…$`
-    # and could never match; measured, that is how it was caught rather than shipped green forever.)
+    # so a field that is written and never read is not a channel. Until this assertion the suite had NO
+    # `--print-status` assertion at all.
+    # ⛔ CORRECTED ATTRIBUTION — the previous version of this comment said `--print-status` renders "ONE
+    # `|`-joined line", so a `^verdict_…$` grep "could never match". MEASURED FALSE: `print_status` emits
+    # **43 lines, one `key=value` per line, with ZERO `|`**, and `grep -c '^verdict_runner_work=ok$'`
+    # returns **1**. An anchored grep DOES match here, and the rest of the repo relies on exactly that
+    # (`cloud-cell-supervisor.sh:3974-3975` parses this very output with `sed -n 's/^status=//p'`). The
+    # field-boundary form below is therefore a harmless SUPERSET of the anchored one, kept because it is
+    # what the reader-only mutant proves discriminates — NOT because the anchored form cannot work. The
+    # real cause of the original red is the one named next: the suite runs `set -uo pipefail` (:59), and a
+    # PIPED verb whose own exit code is non-zero reddens the pipeline even when `grep` matched.
     # Captured into a variable rather than piped, because the suite runs under `pipefail` and this verb's
     # own exit code would then decide the assertion.
     ps_out="$(DISK_REAPER_STATE_DIR="$s2" bash "$pass" --print-status 2>/dev/null)"

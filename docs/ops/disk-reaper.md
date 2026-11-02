@@ -1152,7 +1152,15 @@ mutants of (a)—(c)/(h) stay green, which is the correct answer for a case whos
 The class's **record fields** at the ENTRY-POINT level (`freed_mb_runner_work=`,
 `candidates_runner_work=`/`cand_runner_work=`, `unmeasurable_runner_work=`, `verdict_runner_work=`, and
 `--print-status` rendering them) are asserted by **`scripts/disk-reaper-runner-work.test.sh` case (b)** —
-the only case in that suite that drives a real `--apply` and then reads back the record that pass wrote.
+the case that drives a real `--apply` and then reads back **every** field of the record that pass wrote.
+⛔ **"only case" is true of the FULL FIELD SET, and NOT of reaping — and an earlier revision of this
+paragraph said the latter and was measurably false.** It read "the only case in that suite that drives a
+real `--apply` and then reads back the record that pass wrote". Measured against the suite: case **(a)**
+drives `--apply` (`runner-work.test.sh:210`) and reads the record (`:214`); case **(g)** drives `--apply`
+(`:467`), reads the record (`:469`) **and reaps** — its own assertion at `:472` ("and it reaped the dead
+entry on the pass the fallback exists for") **passes**. At the *prior* head `301235ef8`, case (g) already
+reaped **and** already asserted `^verdict_runner_work=ok$`. So (b) is not "the only case that reaps"; it is
+the case that reads the **whole** field set on a reaping pass, which is a different and narrower claim.
 ⛔ **That credit was WRONG for one revision, and wrong in the one direction that matters.** It named
 `scripts/disk-reaper-classes.test.sh` as the suite covering these fields. That suite asserts **nothing**
 about this class: `grep -nE 'runner_work|--print-status' scripts/disk-reaper-classes.test.sh` returns no
@@ -1161,11 +1169,15 @@ output, and its record-field assertions are `freed_mb_worktree=`, `verdict_workt
 GREEN with every runner-work assertion deleted — the same shape as the three findings this revision
 exists to fix, an assertion that looks like a check and is not. **The boundary, stated so a reader need
 not infer it:** `classes.test.sh` covers the WORKTREE and DUPLICATE-INSTALL record fields; this class's
-are covered by `runner-work.test.sh` case (b). `verdict_runner_work=` was rendered on that path and
-asserted nowhere **on it** — it is asserted in (f)/(g), and neither of those reaps — so it now reads `ok`
-on the reaping pass (measured at this head), `--print-status` is
-asserted to RENDER it, and deleting the record line turns case (b) red: that mutation is (b)'s second,
-counted in the 13 above.
+are covered by `runner-work.test.sh` case (b). ⛔ **`verdict_runner_work=`'s gap is NARROWER than
+"asserted nowhere", and the previous wording overstated it on both halves.** The field WAS asserted at the
+ends of (f) and (g) — and (g) reaps, as measured above — so "asserted in (f)/(g), and neither of those
+reaps" was false in each clause. What was actually missing, stated so a reader can check it: the field was
+**unasserted on case (b), the primary reaping path that reads every other record field**, and
+`--print-status` — the field's only READER — had **no assertion at all** anywhere in the suite (the only
+`print-status` reference in `runner-work.test.sh` is the one added at this revision). So it now reads `ok`
+on case (b)'s reaping pass (measured at this head), `--print-status` is asserted to RENDER it, and deleting
+the record line turns case (b) red: that mutation is (b)'s second, counted in the 13 above.
 The classes suite was **killed at 30 minutes with no result** on the box that measured this PR (load
 180–220), so at that point the record-field delta was **unmeasured** and a green run of the owner-level
 suite below could not be read as covering it. It was then **run to completion at load ~15 on the same
