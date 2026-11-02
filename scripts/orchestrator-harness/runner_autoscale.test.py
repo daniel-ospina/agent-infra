@@ -3016,7 +3016,7 @@ def t42_absent_gate_record_is_absence():
 def t43_deep_queue_threshold():
     """The third eligibility term exists for a queue nobody's labels explain: a DEEP backlog with an
     idle pool is worth a page whatever the pool advertises, and the number is the gate's own
-    (`ci_runner_gate.sh:43`, `CI_GATE_QUEUE_THRESHOLD:-60`) rather than a second opinion invented
+    (`ci_runner_gate.sh`, `CI_GATE_QUEUE_THRESHOLD:-10`) rather than a second opinion invented
     here. Review finding P1: without this case the constant was documented as "PINNED BY THE SUITE"
     with zero references in it, so a drift from 60 — or the term being dropped — was invisible."""
     with Env():
@@ -3556,7 +3556,7 @@ def t56_queue_age_reader_refusals():
         state for exactly this read.
         ⛔ PINNED AT THE UNIT BOUNDARY ON PURPOSE. In *this* tool the state is unreachable end to end:
         the age read is taken only after the depth term declines, i.e. at `queued <
-        GATE_QUEUE_THRESHOLD` (60), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
+        GATE_QUEUE_THRESHOLD` (10), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
         while the depth read reported 53 would assert an API response that cannot exist (both reads
         are the same endpoint) and would claim a false-open this tool cannot produce. The guard is
         kept for when the two numbers cross — the gate's threshold is operator-settable, its
@@ -5069,7 +5069,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T43",
-        "GATE_QUEUE_THRESHOLD = 60",
+        "GATE_QUEUE_THRESHOLD = 10",
         "GATE_QUEUE_THRESHOLD = 55",
         "the alarm's copy of the gate's threshold drifts away from the gate's own default",
     ),
