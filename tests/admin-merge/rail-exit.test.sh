@@ -121,7 +121,7 @@ done
 printf '  MEASURED (not asserted) reclaim race: %s/%s trials with TWO OR MORE acquirers, %s/%s with none\n' \
   "$wrong" "$trials" "$zero" "$trials"
 if [ "$wrong" -eq 0 ]; then
-  ok "reclaim race: zero double-acquires observed in $trials trials (target state reached)"
+  ok "reclaim race: zero double-acquires observed in $trials trials (target state reached; ${zero}/${trials} trials had NO acquirer — REPORTED, not asserted)"
 else
   printf '  KNOWN  the lease is NOT certified: %s/%s trials double-acquired. It ships off by default.\n' "$wrong" "$trials"
 fi
@@ -143,7 +143,13 @@ grep -q PROCEEDED "$TMPROOT/noroot.out" && bad "ran with NO exclusion" || ok "di
 # ── 7. THE TERMINAL EXIT: ONLY A REAL MERGED EXITS 0 ──────────────────────────
 # A multi-line / malformed read must NOT be taken as MERGED — that is a checkmark over
 # an unmerged PR, because merge-one.sh writes merged-<PR>.done on exit 0.
-printf '#!/bin/bash\nprintf "OPEN\\nMERGED\\t2026-01-01T00:00:00Z\\n"\n' > "$TMPROOT/gh-multiline"
+# ⛔ THE PAYLOAD IS THE WHOLE POINT (batch-9 review finding 1). The previous payload was
+# `OPEN\nMERGED\t…`, which decodes to the state `OPEN\nMERGED` — matching NEITHER the MERGED
+# nor the CLOSED arm — so the assertion passed with the newline guard DELETED and proved
+# nothing. This payload decodes to `MERGED` plus a trailing warning line, so it matches the
+# MERGED arm and ONLY the `*$'\n'*` guard stands between it and a false 0. Verified by
+# mutation: removing the guard from scripts/admin-merge.sh turns this arm red.
+printf '#!/bin/bash\nprintf "MERGED\\t2026-11-01T14:53:07Z\\n(note: shim warning)\\n"\n' > "$TMPROOT/gh-multiline"
 printf '#!/bin/bash\nprintf "CLOSED\\t"\n' > "$TMPROOT/gh-closed"
 printf '#!/bin/bash\nprintf "MERGED\\t2026-11-01T14:53:07Z\\n"\n' > "$TMPROOT/gh-merged"
 chmod +x "$TMPROOT"/gh-multiline "$TMPROOT"/gh-closed "$TMPROOT"/gh-merged
@@ -168,7 +174,8 @@ rc_multiline=$(grep '^multiline:' "$TMPROOT/t.rc" | cut -d: -f2)
 rc_closed=$(grep '^closed:' "$TMPROOT/t.rc" | cut -d: -f2)
 rc_merged=$(grep '^merged:' "$TMPROOT/t.rc" | cut -d: -f2)
 [ "$rc_multiline" -eq 0 ] && grep -q SURVIVED "$TMPROOT/t-multiline.out" \
-  && ok "a MULTI-LINE read does NOT exit 0" || bad "a multi-line read was taken as MERGED"
+  && ok "a MULTI-LINE read does NOT exit 0 (its first line IS 'MERGED', so only the newline guard can save it)" \
+  || bad "a multi-line read was taken as MERGED"
 [ "$rc_closed" -eq 3 ] && ok "CLOSED exits 3, never 0 (no checkmark over an unmerged PR)" \
   || bad "CLOSED exited $rc_closed, expected 3"
 if [ "$rc_merged" -eq 0 ] && ! grep -q SURVIVED "$TMPROOT/t-merged.out" \
