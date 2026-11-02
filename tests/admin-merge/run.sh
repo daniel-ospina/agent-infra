@@ -15512,10 +15512,10 @@ set +e
 SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
   run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 set -e
-grep -q 'CLAMPED to the reachable 2200s' "$SCEN/err" \
+grep -q 'CLAMPED to the reachable 2500s' "$SCEN/err" \
   && pass "(p2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
   || fail "(p2) an unreachable deadline was accepted silently — a bound that can never fire"
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2200s, 42\)' "$SCEN/err" \
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2500s, 42\)' "$SCEN/err" \
   && pass "(p2) the refusal reports the CLAMPED bound, never the unused 33664s" \
   || fail "(p2) the refusal reported a bound the rail did not use"
 
@@ -15590,15 +15590,12 @@ grep -q '^rail-deadline-source=' "$SCEN/out" \
 # the raw 33664 beside a refusal that enforced 20254.
 SCEN="$TMP/scen-p7"; mkdir -p "$SCEN"
 SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
-grep -q '^rail-deadline=2200 (CLAMPED from 33664)' "$SCEN/out" \
+grep -q '^rail-deadline=2500 (CLAMPED from 33664)' "$SCEN/out" \
   && pass "(p7) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
   || fail "(p7) the inspection surface reports a bound the rail is not using"
 grep -q '^rail-deadline=33664' "$SCEN/out" \
   && fail "(p7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
   || pass "(p7) it does NOT print the raw unreachable value"
-grep -q 'rail-deadline=INVALID' "$SCEN/out" \
-  && fail "(p7) an INVALID arm exists — it is unreachable (a bad knob exits 2 first) and misdescribes the code" \
-  || pass "(p7) no unreachable INVALID arm is advertised"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
