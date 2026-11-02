@@ -1042,6 +1042,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "#1932 (review of PR #1949) — the STATED free-disk floor the reaper's per-pass capacity line asserts against (2 GiB = one MEASURED lane env, ~1.85 GB of real non-shared disk per lane), so 'above the floor' means 'one more lane still fits'. Registered rather than left as a bare constant because it bounds how much of the box the fleet may consume, and a bound only the reaper knows about is invisible to the audit that exists to notice exactly that. It ASSERTS, it does not reclaim: a breach exits 5 (the reaper's own `over-bound` code — `disk-reaper.sh` KEEPS that 5 since agent-infra#2156 landed, so an apply pass records `rc=3 verdict_venv=fail-closed` and a dry run records `rc=5 verdict_venv=over-bound`; the old `worst_rc` drop of 5 that recorded `rc=0 verdict=ok` is gone, do not restate it) and is named on the report, and no live lane's env is ever deleted to get back above it. Unlike the age floor this is a SPACE bound, so it answers to the hygiene axis (disk reapers that are not agent-stall detectors), not retention.",
   },
+  {
+    name: "STALL_FIX_BRIEF_MAX_AGE_MIN",
+    owners: ["scripts/orchestrator-harness/stall-fix.sh"],
+    value: "${STALL_FIX_BRIEF_MAX_AGE_MIN:-1440}",
+    axis: "retention",
+    guardedBy:
+      "scripts/orchestrator-harness/stall-fix.test.sh §E (the sinks are BOUNDED) — a brief past this floor is PRUNED while a neighbouring file the script does not own is left alone, an explicit 0 is CLAMPED so a 2 h-old brief SURVIVES (unclamped it is the eviction), the clamped default still prunes a genuinely OLD brief (the clamp is not an off-switch), and a NON-NUMERIC bound falls back to the default and still prunes rather than making the sweep a no-op; the 1440 value itself is pinned by THIS registry's forward check",
+    overrides: ["STALL_FIX_BRIEF_MAX_AGE_MIN=1440"],
+    note: "#2929 — how long a rendered stall brief under `state/` may live before the next dispatch prunes it (24 h, and the bound is CLAMPED to a positive number with 1440 as the fallback, so neither `0` nor a typo can turn the sweep into either an off-switch or a no-op). Registered rather than exempted because it IS a retention bound on exactly the population `#2929` measured — one brief per `DRAIN_STALL_FIX_EVERY` stalled PASSES (~120 files/day, unbounded, on a box that is stalled BECAUSE nothing lands) — and a bound only the dispatcher knows about is invisible to the audit that exists to notice precisely that. The clamp is the half that matters: it is the same shape `mp_recent_land` carries, and `0` here would mean 'prune every brief I just wrote'.",
+  },
   // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
   //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in
   //   #1552). They classify a lane as idle / free capacity; they are liveness
