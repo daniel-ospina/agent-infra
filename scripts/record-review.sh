@@ -195,9 +195,10 @@
 # B not the head being recorded, a measurably RED target head (clause E), an
 # EMPTY `git diff A..B`, an AUTHORED range — including one whose MERGE COMMITS are
 # not clean merges of their parents, because a conflict resolution lives only in
-# the merge commit — with no covering verdict, a MERGE-ONLY range whose A is not a
-# head recorded `clean` (a delta EXTENDS an attestation, it never creates one; a
-# clean-micro/clean-low record attests no review and cannot be the premise), and a
+# the merge commit — with no covering verdict, a MERGE-ONLY range with no cover that
+# NAMES the reviewed head A (a delta EXTENDS an attestation, it never creates one; the
+# unsigned local record file was deleted as a forgery vector, so the premise is an
+# artifact read through the API), and a
 # covering verdict that does not postdate the range's newest authored-or-conflict
 # commit. The record carries `delta_range`, `delta_kind` and
 # `delta_digest` so the claim stays checkable long after the mint: a reader can
@@ -1359,9 +1360,13 @@ $m"
     # prior artifact verifies an HMAC first ("THE HMAC IS THE WHOLE SAFETY ARGUMENT"),
     # and the record file is per-box by design. Review forged the file with one
     # `printf` and minted a signed `clean` over an unreviewed authored commit, which is
-    # the zero-evidence mint this whole feature exists to prevent. An attestation must
-    # come from something this box cannot manufacture: a review artifact, read through
-    # the API. So a merge-only delta must NAME one (see arm (10a)).
+    # the zero-evidence mint this whole feature exists to prevent. The premise is an
+    # artifact read through the API (NOT a local file this box can write), and arm
+    # (10a) requires it to name the reviewed head A. ⛔ Known and declared residual:
+    # `verify_review_evidence` reads no author, so a comment that merely NAMES A also
+    # satisfies it — the same weakness the plain `comment:` path has, and the reason
+    # the durable fix is a machine-readable binding (`review:<id>` whose commit_id IS
+    # A, or the HMAC marker), which needs the reviewer's template to carry the sha.
     :
     if [ -z "$cover" ]; then
       echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit (nothing base-borne entered), but a merge-only delta still needs the VERDICT that covered ${from:0:12}… — a delta EXTENDS an attestation and can never create one. Naming a head is not evidence." >&2
