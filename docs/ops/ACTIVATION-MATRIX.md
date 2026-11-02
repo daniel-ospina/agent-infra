@@ -67,12 +67,15 @@ The measured per-box state behind the cell column, so the generic verdicts above
 
 Three things, in order of how much they cost:
 
-1. **Row 2 is the merge-gating component that is still improvised on the Mac and absent on cells**
-   (row 1 WAS the same defect and is now farmed — `setup.sh::merge_gate_srcs` provisions the shim and
-   `cell-install.sh` fails the install without it; it is re-measured `provisioned`/`mixed` on
-   2026-11-02). Rows 8 and 16 are improvised/absent too — but they cost *recovery*
-   and *truthfulness*, not a merge, and #2130 already owns them. And this is **not** a cell-only
-   defect: the Mac resolved the shim (before the farm landed) from a shell-rc line the launchd controller does not inherit,
+1. **Row 1 is the component that gates a merge, and it WAS improvised on the Mac and absent on
+   cells** — it is now FARMED (`setup.sh::merge_gate_srcs` provisions `scripts/gh-shim/gh` and its
+   verifier sibling; `cell-install.sh` fails the install without it), re-measured
+   `provisioned`/`mixed` on 2026-11-02. Row 2 is the layer a merge *lane* uses and is still
+   improvised/absent, but it is not the gate: the guard injects its own absolute PATH dir, so a lane
+   that does not type `gh` itself never needed it. Rows 8 and 16 are improvised/absent too — but
+   they cost *recovery* and *truthfulness*, not a merge, and #2130 already owns them. And this is
+   **not** a cell-only defect: before the farm landed the Mac resolved the shim from a shell-rc line
+   the launchd controller does not inherit,
    so "the Mac is activated" is true of interactive sessions and unproven for daemon-born lanes.
 2. **The two rows that make the harness *unattended* are the two that cells do not have** — a
    watchdog (8) and an explicit env (9-11). A cell's controller now has a **shipped** service unit that
@@ -90,7 +93,7 @@ decides whether a merge may happen at all, and it is currently the weakest on ev
 
 | rank | gap (rows) | the single change | why this one | cost |
 |---|---|---|---|---|
-| **1** | 1 (+2) | **Farm `gh-shim` onto the box**: add it to the farm set `setup.sh` declares (a `gh_shim_srcs` row + a `FARM_LAYOUT` entry in `cell-install.sh`) so it lands at `$DEST/scripts/gh-shim/gh` on **both** platforms | `resolveGhShimDir`'s relative fallback is `EXTENSION_DIR/../../scripts/gh-shim` — that path is `~/.pi/agent/scripts/gh-shim` for a copied install, and it is what a **launchd-born** Mac lane and **every** cell lane resolves. Farming it fixes both sides with one declaration, needs no env var, and the extension then materializes `~/.pi/agent/shims/gh` itself (`materializeGhShim`) | one array + one layout row; `--verify` then byte-compares it for free |
+| ~~1~~ **LANDED** | — | **Farm `gh-shim` onto the box** — DONE: `pi-bootstrap/setup.sh::merge_gate_srcs` declares `gh-shim/gh` **and** `verify-admin-merge-evidence.sh` (one declaration; `cell-install.sh` parses the same set and FAILS the install without the shim, `:477-480`), so it lands at `$DEST/scripts/gh-shim/gh` on **both** platforms. Row 1 re-measured `provisioned`/`mixed` 2026-11-02; the `#3297` runtime half makes an absent layer refuse rather than warn | `resolveGhShimDir`'s relative fallback is `EXTENSION_DIR/../../scripts/gh-shim` — that path is `~/.pi/agent/scripts/gh-shim` for a copied install, and it is what a **launchd-born** Mac lane and **every** cell lane resolves. Farming it fixes both sides with one declaration, needs no env var, and the extension then materializes `~/.pi/agent/shims/gh` itself (`materializeGhShim`) | one array + one layout row; `--verify` then byte-compares it for free |
 | **2** | 9, 10, 11 | **Provision the env, do not inherit it**: a `keys.env` *template* in the repo (PATH incl. `~/.pi/agent/shims`, `MAX_LOAD`, `AGENT_INFRA_PATH`), and make `cloud-cell-bringup.sh --check` refuse `CELL READY` when `keys.env` is absent | measured: one of three live cells has no `keys.env` at all, and **none** of the two that have one sets `PATH` or `MAX_LOAD`. Without it a cell's throttle is the swap gate alone, `AGENT_INFRA_PATH` is a per-cell lottery, and `gh` is unguarded outside the extension | a template + one refusal; the refusal is the part that keeps it true |
 | **3** | 8 | **A cell watchdog**: a `systemd --user` timer (or a tmux-side respawn loop) that restarts a dead controller. The MAC half is now shipped — `templates/launchd/com.eldato.controller-watchdog.plist` → `scripts/orchestrator-harness/watchdog-loop.sh`, with the hand-provisioned `com.eldato.orchestrator-watchdog` added to `templates/launchd/RETIRED` so the installer removes it instead of leaving two mutating watchdogs — but **the job is not installed by the change that ships it**, and a cell still has no scheduler above the tmux session. ⛔ The CELL half is now shipped as `templates/systemd/eldato-orchestrator.service` + `install-controller-service.sh` (#2402), which makes the controller its own restarting unit instead of a watched session: installing it (the bring-up's `check_controller_service` does) is what closes this gap on a box | this is the literal content of the "self-healing" claim; today a cell controller dies silently until the unit is installed. The Mac's capability now exists as source, so what is left is arming it (an installer run) | one installer run on the Mac; a per-cell `install-controller-service.sh` run (the bring-up already does it) |
 | **4** | 11 | **Export `AGENT_INFRA_PATH` in the supervisor's controller command** (`cloud-cell-supervisor.sh::cmd_start`, next to `HOME=/REPO=/O=/OR=`) | restores `session-checks`, `auto-sync` and `sequence-enforcer` on cells, all of which currently skip **silently** — the worst failure shape | one word in a `tmux new-session` string; the README already states the requirement |
