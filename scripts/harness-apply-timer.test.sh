@@ -448,6 +448,14 @@ run_farmed() { # <AGENT_INFRA_PATH> — the pass AS DEPLOYED (no sibling checker
 OUT="$(run_farmed "$T/t24/ai" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 the FARMED shape finds candidate 3 (\$AGENT_INFRA_PATH) and reads clean"
 assert_contains "$OUT" "deployed_drift=clean" "T24 …and the arm that was dead on every deployed box actually ran"
+# ⛔ THE RECORD IS THE ARTIFACT, NOT THE LOG (review round 22, P1). Every clean assertion above reads
+# the LOG; only the `not-run` arm two cases down asserts the durable `drift=` FIELD. That asymmetry is
+# the whole defect: the P0 was `drift=clean:rc=0` — the pass certifying a box from a checker that gave
+# no verdict — and a record that falls back to `rc=0` is invisible to a log-line assertion. Mutation
+# MEASURED: appending `| grep -v '^current$'` to the token reader in `harness-apply-pass.sh` restores
+# `drift=clean:rc=0` (the original defect) with this suite still 217/0. `docs/ops/harness-apply.md`
+# documents `drift=clean:current` as the clean value a reader keys on, so the record must be pinned.
+assert_contains "$(cat "$T/t24/farmstate/harness-apply.status" 2>/dev/null)" "drift=clean:current" "T24 …and the RECORD carries the documented value, not rc=0"
 OUT="$(run_farmed "" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T24 with no \$AGENT_INFRA_PATH the search falls through to candidate 4 (\$O) — the PRODUCTION find"
 assert_contains "$OUT" "executes:" "T24 …and that find reds the pass, not just prints a token"

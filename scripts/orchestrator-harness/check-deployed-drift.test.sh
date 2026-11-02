@@ -654,6 +654,18 @@ printf '4266 bash -o noexec %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-noexec"
 surf "$TMP/ps-noexec"
 ck "10a-3e: 'bash -o noexec <abs>' is a MENTION (the shell forbids execution)" \
    "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+# ⛔ THE CLUSTER FORM IS A DIFFERENT WORD, AND THE `_optv` VALUE IS WHAT MAKES IT MENTION (round 22,
+# P2). The `-o` arm hard-codes `_optv="-o"` precisely because `$_w` here is `-euo`, not `-o` — so the
+# noexec-value guard must not depend on the spelling that carried the `o`. Nothing graded that: the
+# `-o noexec` case above cannot discriminate, because there `$_w` == `-o` and `_optv="$_w"` would
+# agree. Mutation MEASURED: `_optv="$_w"` leaves the case above MENTION but flips
+# `bash -euo noexec <abs>` to INVOCATION — a fabricated `executes:` that also masks a real `behind:`,
+# since `executes:` leads the token chain — with the suite still 214/0. `-euo` is the canonical bash
+# strict-mode cluster, so the spelling is not exotic.
+printf '4267 bash -euo noexec %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-noexec-cluster"
+surf "$TMP/ps-noexec-cluster"
+ck "10a-3e: 'bash -euo noexec <abs>' is a MENTION (a cluster's noexec operand still forbids it)" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
 # ⛔ `-c` IS OWNED BY THE SHELL THAT IS THE CURRENT COMMAND, NOT BY ANY EARLIER ONE (review round 19,
 # P2): `_seen` was never cleared, so `bash other.sh -c <abs>` and `busybox grep -c <abs>` nominated a
 # path that is a `$1`/grep operand — a fabricated `executes:` that also masks a real `behind:`.

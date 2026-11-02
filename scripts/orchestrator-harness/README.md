@@ -1312,13 +1312,13 @@ bash ~/orchestrator/check-deployed-drift.sh --o ~/orchestrator --repo <agent-inf
 defect: a box printed `harness=diverged:5712e52776c8` for a state the two questions describe
 differently, so a diagnosis made against the checkout described code the box was not running.
 
-A box that answers **both** questions cleanly carries **no `harness=` token at all** — its token is
-`[current]` inside the `OK:` line. Only a box that does NOT match gets one, because a token in a
-dispatch row is a claim that something is wrong:
+A box that answers **both** questions cleanly carries `harness=current` — the token names the verdict,
+and `current` is a positive statement ("the record names this commit AND `$O` holds exactly those
+bytes"). Every drift token below names a problem; `current` names the absence of one:
 
 | summary token | question | what it means | what to do |
 |---|---|---|---|
-| *(none — `OK: … [current]`)* | (a)+(b) | the record names this commit AND `$O` holds exactly those bytes | nothing |
+| `harness=current` | (a)+(b) | the record names this commit AND `$O` holds exactly those bytes | nothing |
 | `harness=behind:<sha12>` | (a) | the box is recorded from `<sha12>`, an **ancestor** of the ref: a known, deliberate state | redeploy when you mean to adopt the new tip |
 | `harness=diverged:<sha12>` | (a) | `<sha12>` is **not an ancestor** of the ref — the box runs code main does not carry | find out why before redeploying |
 | `harness=uncommitted-edit:<file>` | (a) | `$O` holds bytes **no deploy wrote** (`<file>` differs from the record) — a hand patch | **recover the patch first**: a redeploy destroys it (§4.1 refusal) |
@@ -1336,15 +1336,18 @@ answer to "which fact does an operator act on first": the code that is RUNNING c
 repo at all (and no redeploy of `$O` reaches it), then unrecoverable bytes, then where the box sits, then
 code that is missing, then a record that cannot describe the box at all, then the last two.
 
-**`surface` is never a statement about `$O`'s own bytes, and it has TWO shapes.** A token is printed
-only when the run found a problem (`problems > 0` in the script), and with no `$O` every question
-about `$O` abstains — so the `O_ABSENT` arm can only be reached when the **surface pass** is what
+**`surface` is never a statement about `$O`'s own bytes, and it has TWO shapes.** The token is printed
+on **every** exit, including clean ones (`harness=current`) — a reader that sees no token at all has
+learned that the check DID NOT RUN (`drift=not-run`), which is why "no token" must never be the clean
+answer: it is indistinguishable from a dead check and it was exactly the P0 (#10114) where a pass
+certified a box from a checker that gave no verdict. The `surface` question with no `$O` abstains, so
+the `O_ABSENT` arm can only be reached when the **surface pass** is what
 differed. On that shape `$O` was **never compared at all** (absent, or a `--surface` run with no
 readable record for it — the body prints `identity: SKIPPED`); on the other shape `$O` **was**
 compared and answered clean on all three questions, which is the `Q_BYTES=0` precondition — a
-condition on *that* arm alone, not on `surface` as a token. `$O`-absent alone emits **no** token at
-all (a clean surface pass is an `OK` summary): the token names a drift, and the drift is always the
-other dir.
+condition on *that* arm alone, not on `surface` as a token. `$O`-absent alone still emits
+the token (`harness=current`, with the caveat in the sentence), because the claim the token carries is
+about the **dirs' bytes matching `$REF`**, and a token's ABSENCE would claim the check never ran.
 
 **The last two are therefore ALTERNATIVES, not a chain:** a surface hit that coincides with `$O`'s
 own bytes differing reports `payload-differs` — and the other-directory fact is then carried by the
