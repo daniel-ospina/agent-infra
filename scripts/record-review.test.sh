@@ -5620,6 +5620,18 @@ mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_
 #       population was truncated.
 MUT="$(mk_mutant breakanchor '      : "${evil:=merge ${m:0:12} is NOT a clean merge' '      break; : "${evil:=merge ${m:0:12} is NOT a clean merge')"
 mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "delta:$DG_EV_L..$EM_CHILD+comment:42515002" accepted STUB_EVIDENCE_AT="2026-05-01T00:00:00Z"
+# M11 — THE CLAUSE-(E) POLARITY. An unnamed status from target_head_red must refuse.
+#       The mutant replaces the helper's answer with a status the case does not name
+#       (`3`); the shipped code refuses it (only an explicit green rc 1 proceeds),
+#       and a version whose case lists only 0 and 2 ACCEPTED it and minted `clean`
+#       over a head whose checks were never shown non-red — the enum fall-through the
+#       AGENTS.md verification-state rule forbids. The mutant is the SIMULATION of the
+#       drift, so this cell asserts REFUSED: it reddens precisely when the polarity
+#       regresses. It probes a real range (20a's), so the arm is actually reached.
+MUT="$(mk_mutant unnamedcheck '  thr=0
+  target_head_red "$to" || thr=$?' '  thr=3')"
+mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
+
 # M8 — the TIER arm. Widening the premise back to the non-review tiers must let a
 #      clean-micro prior record mint `clean`. Inline, not via mut_check: mut_check
 #      clears the record and this vector's premise IS a planted record.
