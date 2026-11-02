@@ -4113,8 +4113,21 @@ function verdictLine(token: "PASS" | "FAIL"): RegExp {
  *     change rather than widening this one.
  */
 const NEGATION_LEAD = "[^\\p{L}\\p{N}]*";
+/**
+ * The auxiliary that may sit between the token and the negation (`PASS is not claimed`).
+ *
+ * ⛔ MANDATORY here, and NO `\s*` inside it — both are load-bearing, not style. The group that
+ * carries this auxiliary is the optional one (`(?:AUX LEAD)?`), and `NEGATION_LEAD` already matches
+ * every whitespace run, so `\s*` here is redundant. Making the auxiliary itself optional next to a
+ * star over the SAME class is the classic ambiguity that makes the guard QUADRATIC: every backtrack
+ * position of the first star re-scans the whole remainder with the second. Measured on the shipped
+ * source with a FAILING tail (the expensive case — a MATCHING one is linear in both shapes):
+ * `PASS ` + `!`×n → 5 000: 286 ms · 20 000: 5.1 s · 40 000: **17 s**, versus ~0.3 ms after this
+ * change. The guard runs SYNCHRONOUSLY inside the `tool_call` commit hook, so a long punctuation
+ * rule on a verdict line would stall every commit attempt for that lane.
+ */
 const NEGATION_AUX =
-  "(?:(?:is|are|was|were|be|been|being|has|have|had|does|do|did|can|could|will|would|may|might|must|should)\\s*)?";
+  "(?:(?:is|are|was|were|be|been|being|has|have|had|does|do|did|can|could|will|would|may|might|must|should))";
 /**
  * A negation attached to the START of a segment — the tail of a verdict line, a bracket prefix, or
  * the text between a ✅ and the token.
@@ -4126,13 +4139,23 @@ const NEGATION_AUX =
  * instead: only a letter or digit ends the run, so no future punctuation can reopen the hole.
  *
  * `no` only counts as a whole clause (`no` + end/punctuation), so `PASS: no failures`,
- * `[no regressions] PASS` and `PASS — no e2e suite exists` stay AFFIRMATIVE; `n['’]t` covers the
- * smart apostrophe a model emits as often as the ASCII one; `neither`/`nor` are in the class the
- * cited judge-parser rule uses.
+ * `[no regressions] PASS` and `PASS — no e2e suite exists` stay AFFIRMATIVE; `neither`/`nor` are in
+ * the class the cited judge-parser rule uses.
+ *
+ * ⛔ THE CONTRACTION IS A WHOLE WORD, NOT `n` + `'t` (review r3). `n['’]t` alone only fires when the
+ * apostrophe happens to land exactly where the guard looks, which is true for the contractions whose
+ * STEM is itself an auxiliary (`isn't` = `is` + `n't`, `wasn't` = `was` + `n't`) and FALSE for every
+ * one whose stem is not — `can't` = `ca` + `n't`, and `won't`/`shan't`/`ain't`/`needn't` too. Worse,
+ * `NEGATION_AUX` contains `can`, so it consumed the `n` and left `'t`, matching nothing. Measured
+ * end-to-end through the real plugin factory at `ae7c7e1`: seven spellings of
+ * `PASS can't be claimed` (bare / labelled / bold / list / quote / `Result:`) **merged the files**.
+ * `can't` is the most common English contraction, so the same refusal the fix exists to close was
+ * one keystroke away. The stem is therefore stated as what it is — up to six letters before `n't` —
+ * and the smart apostrophe is covered by the same class.
  */
 const NEGATION_AT_START = new RegExp(
-  `^${NEGATION_LEAD}${NEGATION_AUX}${NEGATION_LEAD}`
-  + "(?:n['’]t|not(?![\\p{L}\\p{N}])|never(?![\\p{L}\\p{N}])|no\\s+longer(?![\\p{L}\\p{N}])"
+  `^${NEGATION_LEAD}(?:${NEGATION_AUX}${NEGATION_LEAD})?`
+  + "(?:[\\p{L}'’]{0,6}n['’]t(?![\\p{L}\\p{N}])|not(?![\\p{L}\\p{N}])|never(?![\\p{L}\\p{N}])|no\\s+longer(?![\\p{L}\\p{N}])"
   + "|cannot(?![\\p{L}\\p{N}])|neither(?![\\p{L}\\p{N}])|nor(?![\\p{L}\\p{N}])|no(?=\\s*(?:$|[^\\p{L}\\p{N}\\s])))",
   "iu",
 );
@@ -4140,6 +4163,21 @@ const NEGATION_AT_START = new RegExp(
 const NEGATED_BRACKET_PREFIX = new RegExp(`^\\s*\\[([^\\]\\n]{0,40})\\]\\s*\\*{0,3}PASS${VERDICT_TOKEN_TAIL}`, "i");
 /** The ✅ shape's token, with the text between the mark and the token captured for the prefix rule. */
 const TICK_PASS = new RegExp(`\u2705(.*?)(PASS${VERDICT_TOKEN_TAIL})`, "i");
+
+/**
+ * Does this line have a PASS SHAPE — verdictLine's arms OR the ✅ arm? One definition, read by the
+ * acceptance rule AND by the remedy, so the two cannot disagree about which lines were even eligible.
+ *
+ * ⛔ This exists because they DID disagree (review r3): `verdictLineDiagnostics` asked only
+ * `verdictLine("PASS")`, and the ✅ shape is accepted through `TICK_PASS`, which `verdictLine` does
+ * not cover. So `✅ not verified: PASS` was correctly BLOCKED but then handed the GENERIC hint —
+ * *"an accepted verdict line is `PASS` / `Result: PASS` / …"* — about a line whose shape was
+ * accepted. That is the declared class-5 hazard verbatim: the lane's most literal compliance with
+ * the remedy is to re-emit `PASS`, converting the verifier's refusal into the merge it refused.
+ */
+function passShapeLine(line: string): boolean {
+  return verdictLine("PASS").test(line) || TICK_PASS.test(line);
+}
 
 /** The PASS token at or after `from` — the token a verdict line is READ at. */
 function passTokenAt(line: string, from: number): RegExpExecArray | null {
@@ -4226,7 +4264,7 @@ export function verdictLineDiagnostics(): string {
   // failure mode this file already pins — the remedy would point at the SHAPE of a line that was
   // fine. Worse here: the literal compliance is to re-emit `PASS`, which turns the verifier's
   // REFUSAL into the merge it was refusing. So the note names the negation and forbids that.
-  if (verdictLine("PASS").test(lastVerdictLineTested) && !passAttested(lastVerdictLineTested)) {
+  if (passShapeLine(lastVerdictLineTested) && !passAttested(lastVerdictLineTested)) {
     return (
       `\n  ⚠️ The last verifier reply NEGATED its PASS — that is a REFUSAL, not a verdict: "${lastVerdictLineTested}"`
       + " — the gate accepted the SHAPE and refused the CONTENT. Do NOT re-emit `PASS`: fix what the verifier named, then verify again."
