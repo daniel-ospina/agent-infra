@@ -2977,8 +2977,16 @@ ISSUES 2')"
   fi
   if [ "$_arms_ok" -ne 1 ]; then
     echo "  ❌ merge-one.sh's no-verdict arm could not be extracted (CLEAN arm at ${_clean_ln:-none}, no-verdict arm at ${_star_ln:-none}) — the wiring is UNPROVEN, never green"; FAIL=$((FAIL+1))
-  elif grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh" \
-       | grep -qF 'review_state_record "$(verdict_class "$LAST")"' \
+  # ⛔ NO `producer | grep -q` (#841/#864): the SHAPE is refused repo-wide by
+  # `scripts/check-no-sigpipe-grep.sh`, and that guard is what reddened main in #3030. Where `pipefail`
+  # IS open — the producer then takes SIGPIPE once `grep -q` exits at its first match — the inversion
+  # needs the payload to outrun the pipe buffer after the match; ⛔ THIS file runs `set -u` only, so it
+  # is not reachable HERE, and the capture is taken for the shape. It is behaviour-identical either
+  # way: `-v`'s line selection and `-qF`'s per-line substring semantics are preserved exactly, because
+  # the pattern holds no newline and can therefore never span a line boundary, and an empty capture
+  # matches nothing — as the empty pipeline matched nothing.
+  elif _star_body="$(grep -v '^[[:space:]]*#' "$TMP/merge_star_arm.sh")" \
+    && grep -qF 'review_state_record "$(verdict_class "$LAST")"' <<<"$_star_body" \
      && ! grep -q 'state/needsfix-' "$TMP/merge_star_arm.sh"; then
     echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
   else
