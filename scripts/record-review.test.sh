@@ -5147,7 +5147,8 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
         export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         for kv in "$@"; do export "$kv"; done
         rc=0
-        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" 2>"$errfile" || rc=$?
+        # shellcheck disable=SC2086  # EXTRA_ARGS is intentionally word-split (one flag)
+        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" ${EXTRA_ARGS:-} 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
     ) 2>/dev/null
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
@@ -5442,6 +5443,62 @@ run_record_delta $EH11 "$DG_MIXED" "delta:$DG_EV_L..$DG_MIXED+comment:42515001" 
 assert_eq "$RECORD_RC" "0" "20h8 a CLEAN merge does not move the anchor (cover after the evil merge records)"
 assert_contains "$(cat "$(Q2 $EH11)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h8 the mixed range is still AUTHORED (the evil merge is not hidden)"
 
+# 20h9 TWO CHAINED evil merges whose committer dates are NOT monotone (the child
+# is the OLDER one). `rev-list` is topology-first, so a `break` on the first
+# non-clean merge captures the child and never examines the parent that carries the
+# LATER hand-resolution — a cover predating it would then verify. Every non-clean
+# merge must reach the anchor set.
+ev_tree() {  # $1 = f.txt content, $2 = index file → tree sha of EV2_HEAD with f.txt replaced
+    local blob
+    blob="$(printf '%s\n' "$1" | git -C "$DG" hash-object -w --stdin)"
+    GIT_INDEX_FILE="$2" git -C "$DG" read-tree "$DG_EV2_HEAD"
+    GIT_INDEX_FILE="$2" git -C "$DG" update-index --add --cacheinfo "100644,$blob,f.txt"
+    GIT_INDEX_FILE="$2" git -C "$DG" write-tree
+}
+ET1="$(ev_tree 'hand resolution ONE' "$T/idx1")"
+ET2="$(ev_tree 'hand resolution TWO' "$T/idx2")"
+EM_PARENT="$(GIT_COMMITTER_DATE='2026-06-01T00:00:00Z' GIT_AUTHOR_DATE='2026-06-01T00:00:00Z' \
+    git -C "$DG" commit-tree "$ET1" -p "$DG_EV2_HEAD" -p "$DG_A1" -m 'evil merge PARENT')"
+EM_CHILD="$(GIT_COMMITTER_DATE='2026-04-01T00:00:00Z' GIT_AUTHOR_DATE='2026-04-01T00:00:00Z' \
+    git -C "$DG" commit-tree "$ET2" -p "$EM_PARENT" -p "$DG_A1" -m 'evil merge CHILD (backdated)')"
+printf '%s\n' '2026-06-01T00:00:00Z' > "$T/dates/$EM_PARENT"
+printf '%s\n' '2026-04-01T00:00:00Z' > "$T/dates/$EM_CHILD"
+EMERGE_COUNT="$(git -C "$DG" rev-list --merges "$DG_EV_L..$EM_CHILD" --not "$DG_M1" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$EMERGE_COUNT" = "3" ]; then
+    ok "20h9 fixture: the range holds TWO chained evil merges"
+else
+    bad "20h9 fixture: expected 3 in-range merges, got $EMERGE_COUNT — the vector would not test the arm"
+fi
+if [ "$(git -C "$DG" rev-list --merges "$DG_EV_L..$EM_CHILD" --not "$DG_M1" | head -1)" = "$EM_CHILD" ]; then
+    ok "20h9 fixture: rev-list emits the BACKDATED child first (the trap is live)"
+else
+    bad "20h9 fixture: the child is not emitted first — the vector would not test the trap"
+fi
+EH12=425151; rm -f "$(Q2 $EH12)"
+# cover 2026-05-01: after the child's date (2026-04-01), BEFORE the parent's (2026-06-01)
+run_record_delta $EH12 "$EM_CHILD" "delta:$DG_EV_L..$EM_CHILD+comment:42515002" \
+    STUB_EVIDENCE_AT="2026-05-01T00:00:00Z"
+# ⛔ REFUSAL ONLY — NOT message-attributed. The harness could not pin WHICH arm
+# refused (the stderr carried no delta line), so this vector does not claim to test
+# the evil-merge MESSAGE; what it pins is the security property (no clean record at
+# that head for a cover predating the parent hand-resolution) and M10 below is what
+# proves the population truncation is what makes it refuse.
+if [ "$RECORD_RC" = "0" ]; then
+    bad "20h9 a cover predating the SECOND (parent) evil merge was ACCEPTED (rc 0) — the anchor population is truncated"
+else
+    ok "20h9 a cover predating the SECOND (parent) evil merge is refused (rc $RECORD_RC)"
+fi
+[ -f "$(Q2 $EH12)" ] && bad "20h9 no record was written at the evil head" ||
+    ok "20h9 no record was written at the evil head"
+
+# 20h10 delta × --force-stale: a delta ASSERTS its upper bound is the PR's current
+#       head, so recording one against a stale sha mints a false claim.
+EH13=425152; rm -f "$(Q2 $EH13)"
+run_record_delta $EH13 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" EXTRA_ARGS=--force-stale
+assert_eq "$RECORD_RC" "2" "20h10 delta + --force-stale is refused (rc 2, argument error)"
+assert_contains "$RECORD_ERR" "incompatible with delta evidence" "20h10 the refusal names the contradiction"
+[ -f "$(Q2 $EH13)" ] && bad "20h10 no record was written" || ok "20h10 no record was written"
+
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -5556,6 +5613,13 @@ mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HE
 #      hand-resolved merge, so dropping the merges from `cands` must ACCEPT it.
 MUT="$(mk_mutant evilanchor '    if [ -n "$evil_shas" ]; then' '    if false; then')"
 mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42514001" accepted STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+# M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
+#       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
+#       predates the parent's hand-resolution) is accepted again: the same class as
+#       the inert-anchor bug, one level down — the variable was right, the
+#       population was truncated.
+MUT="$(mk_mutant breakanchor '      : "${evil:=merge ${m:0:12} is NOT a clean merge' '      break; : "${evil:=merge ${m:0:12} is NOT a clean merge')"
+mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "delta:$DG_EV_L..$EM_CHILD+comment:42515002" accepted STUB_EVIDENCE_AT="2026-05-01T00:00:00Z"
 # M8 — the TIER arm. Widening the premise back to the non-review tiers must let a
 #      clean-micro prior record mint `clean`. Inline, not via mut_check: mut_check
 #      clears the record and this vector's premise IS a planted record.
