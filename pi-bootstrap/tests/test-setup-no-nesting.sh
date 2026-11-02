@@ -522,14 +522,38 @@ script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
 script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py
 script:pi-reap-worktrees.sh script:pr-doctor.py
+script:pr-doctor-trigger.py script:pr-repair-loop.sh script:venv-real-cost.py
 script:publish-live-workspaces.py
 script:session-postmortem.sh
 script:record-review.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
 script:harness-apply-pass.sh
-lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
+lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
+# FOUR entries re-cut on 2026-11-01 (#3123): `lib:live-paths.sh`, `script:pr-doctor-trigger.py`,
+# `script:pr-repair-loop.sh` and `script:venv-real-cost.py`. Each is DERIVED (a farmed consumer execs
+# it) and each is DELIVERED by an array that already carries it, so this is a re-pin of the derived
+# population, NOT an exemption and NOT a farm change — the pin simply was not re-cut when those exec
+# sites landed. Verified against the CODE and the farm arrays, not the diff (#1899):
+#   * `lib:live-paths.sh` — `reap-abandoned-worktrees.sh:183` and `reap-duplicate-installs.sh` resolve
+#     `"$SELF_DIR/lib/live-paths.sh"` (F2); `lib_srcs` carries `live-paths.sh`, i.e. a fresh
+#     `$DEST/scripts/lib/live-paths.sh` is exactly the second candidate those consumers try.
+#   * `script:pr-doctor-trigger.py` — `pr-repair-loop.sh:659` (`TRIGGER="$SCRIPTS/pr-doctor-trigger.py"`,
+#     and the `trigger` arm REFUSES when it is absent); `fleet_srcs` carries it, appended AFTER
+#     `pr-repair-loop.sh` for the array-order reason its own comment at `setup.sh:453` gives.
+#   * `script:pr-repair-loop.sh` — `pr-doctor-trigger.py:103` (`os.path.join(HERE, "pr-repair-loop.sh")`);
+#     `fleet_srcs` carries it.
+#   * `script:venv-real-cost.py` — `reap-lane-venvs.sh:166` (F2 self-dir sibling); `fleet_srcs` carries
+#     it, added by #3137 (`5c288f2e0`) in the same landing that created the exec site (the
+#     `disk-reaper-run.sh` precedent, #2354/#2361).
+# ⚠️ This re-cut does NOT make the suite green, and it is not intended to: the four entries the issue
+# also names — `other:orchestrator-harness/brief-gate.sh`, `other:orchestrator-harness/capacity.sh`,
+# `script:repo-target.sh` (delivered by `deploy-harness.sh` into `$O`, never by a farm array — which
+# the derivation's farm-only population cannot model) and `script:x.sh` (a DOCSTRING placeholder at
+# `fleet-schedule.py:423`, i.e. a phantom, not a producer) still need the disposition decision #3123
+# asks for. What this change removes is the four that need NO decision, so the remaining ADDED list
+# is exactly the undecided set.
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
 # producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
