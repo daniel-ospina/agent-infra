@@ -487,7 +487,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup unknown fetch_failed=0 fetch_branch fetch_ref
+  local layer sup target rec_head mode="${1:-fetch}" last="<none recorded>" dup unknown fetch_failed=0 fetch_branch fetch_ref
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -565,7 +565,16 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # ⛔ 1 FOR DRIFT, NOT 0. `scripts/check-deployed-drift.sh` already speaks `0 match / 1 drift /
     # 2 unknown`; a status verb that reports DRIFT and exits 0 cannot be gated on by anything, which is
     # how a third drift dialect (#1178) is born. Nothing here re-decides the vocabulary.
-    if [ -n "${target:-}" ] && [ "${target:-}" = "$(pinned_head)" ]; then printf '  verdict        current\n'; printf '                 (the RECORD is current — a RUNNING controller keeps the layer it STARTED on until it is restarted, so this is not a claim about the executed tree)\n'; return 0; fi
+    # ⛔ ONE CONVERGENCE RULE, ONE PREDICATE (#1178). This arm decided `current` by EQUALITY while the PASS
+    # decides by CONTAINMENT (`merge-base --is-ancestor`, in `do_pass`), so ONE state gave two answers: a
+    # record that legitimately sits AHEAD of the ref tip read `current` from the tick and `DRIFT` from the
+    # verb the header calls the operator's FIRST READ — and false-RED-ing the documented
+    # `0=current / 1=DRIFT` vocabulary for anything that gates on it. The pass's own comment already records
+    # that the equality rule "would have produced a false RED on a record that legitimately sits AHEAD of the
+    # ref"; the rule was deleted there and left live here. The containment test is the one the pass uses,
+    # computed on the same object database (`$layer`), so the two surfaces cannot disagree.
+    rec_head="$(pinned_head)" || rec_head=""
+    if [ -n "${target:-}" ] && [ -n "$rec_head" ] && git -C "$layer" merge-base --is-ancestor "$target" "$rec_head" 2>/dev/null; then printf '  verdict        current\n'; printf '                 (the RECORD is current — a RUNNING controller keeps the layer it STARTED on until it is restarted, so this is not a claim about the executed tree)\n'; return 0; fi
     printf '  verdict        DRIFT (a RUNNING controller keeps the layer it started on until restarted)\n'; return 1
   else
     printf '  resolved layer <UNRESOLVED — this is a RED, see --status output above>\n'; return 2
@@ -1025,6 +1034,68 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   return 0
 }
 
+# ── THE OTHER ARTIFACT THIS VERB INSTALLS: THE TIMER ───────────────────────────────────────────────────
+# ⛔ `--install` WRITES TWO UNITS AND VERIFIED ONE. `verify_unit` is asserted on
+# `$tmp/cell-self-pin.service` only; the rendered `cell-self-pin.timer` was written, placed and ENABLED
+# with no assertion at all — the timer's DROP-INS are verified (`verify_dropins` above) but the timer
+# ARTIFACT ITSELF was not. A timer is the whole mechanism: a pass that is perfect and never invoked is
+# #3194's symptom — the pin stops advancing and NOTHING goes red — reached through the artifact path
+# instead of the drop-in path. This file states that invariant one screen above the missing check, in its
+# own refusal for a timer drop-in (`Unit|On*=`, `verify_dropin_file`): "a pin that silently never runs is
+# #3194's symptom, one directive over".
+# MEASURED in review against a pristine service template, doctoring ONLY the timer:
+#   `Unit=/bin/true.service`   -> rc=0, "installed — ONE actuator"; the wrong target is on the box
+#   `OnUnitActiveSec=` deleted -> rc=0; the timer keeps only `OnBootSec=3min`, so it fires ONCE, three
+#                                 minutes after boot, and never again — the pin stops for ever
+# Nothing reds at runtime either: `--status` prints the LAST OUTCOME and never gates on its age, so a dead
+# clock leaves every surface green. The two rules below are what make the clock one that REPEATS and fires
+# THE PASS.
+verify_timer() { # <rendered timer> [expected Unit= target]
+  local f="$1" expect="${2:-cell-self-pin.service}" body units nunits _rep _v _c
+  # Comments are stripped for the same reason `verify_unit` strips them: this template documents the
+  # cadence decisions it made, and that prose legitimately names the directives the rules below ban.
+  body="$(grep -vE '^[[:space:]]*#' "$f")"
+  refuse_raw_text_tricks "the rendered timer" "$body" || return 1
+  refuse_env_reset "the rendered timer" "$body" || return 1
+  refuse_env_mutators "the rendered timer" "$body" || return 1
+  # ⛔ A SKIPPED TIMER IS THE SAME GREEN NO-OP A SKIPPED SERVICE IS — and on a TIMER it is worse, because
+  # the pass's own loudness never gets a chance to fire (nothing runs). Closed by PREFIX for the reason
+  # `verify_unit` closes it by prefix: `Condition*` has thirty-plus members and every one of them leaves
+  # the unit GREEN on a false condition.
+  for _c in $(directive_names "$body"); do
+    case "$_c" in
+      Condition*) bad "the rendered timer declares ${_c}= — a failed condition SKIPS the timer and leaves it GREEN, so the pin never runs and nothing reds; a missing layer must be a RED payload exit, not a skip"; return 1 ;;
+      RootDirectory|RootImage|WorkingDirectory)
+        bad "the rendered timer declares ${_c}= — a bootstrap-time path or root on the one unit whose job is to survive that directory going away (EXIT_CHDIR / 203 leave the pin stopped with every surface green)"; return 1 ;;
+    esac
+  done
+  # ⛔ EXACTLY ONE `Unit=`, AND IT MUST NAME THE PASS. systemd defaults a MISSING `Unit=` to the same-name
+  # service, so a re-targeted timer is silent on every surface this file prints: the timer is green, the
+  # unit it fires is not this one, and the pin is stopped. A COUNT rule, because `[Timer]` is LAST-WINS — a
+  # second `Unit=` overrides the first, so a presence test installs the wrong target green (the same
+  # count-not-presence defect this file fixed for `Environment=CELL_HOME=` and `ExecStart=`).
+  units="$(directive "$body" Unit)"
+  nunits=0
+  [ -z "$units" ] || nunits="$(printf '%s\n' "$units" | wc -l | tr -d ' ')"
+  if [ "$nunits" -ne 1 ]; then
+    bad "the rendered timer declares ${nunits} Unit= line(s) — exactly one is installable and it must name the pass this run places ('${expect}'); systemd is LAST-WINS, so a second one silently re-targets the clock"; return 1
+  fi
+  if [ "${units%/}" != "${expect%/}" ]; then
+    bad "the rendered timer's Unit='${units}' is not the pass this install places ('${expect}') — the clock would fire a unit this run never verified, and a timer that fires nothing is #3194's symptom (a pin that silently never runs) with every surface green"; return 1
+  fi
+  # ⛔ AND THE CLOCK MUST REPEAT. `OnBootSec=`/`OnStartupSec=` fire ONCE per boot and `OnActiveSec=` fires
+  # once relative to activation, so a timer carrying only those runs the pass a single time and then never
+  # again. THE REPEATING TRIGGERS are `OnUnitActiveSec=` (measured from the last pass — what this template
+  # uses, and the cadence the unit states) and `OnCalendar=` (wall clock). At least one must carry a VALUE,
+  # because an EMPTY `OnUnitActiveSec=` is ignored by systemd and silently degrades to the one-shot case.
+  _rep=0
+  for _v in OnUnitActiveSec OnCalendar; do
+    if [ -n "$(directive "$body" "$_v" | sed -n '/[^[:space:]]/p' | head -1)" ]; then _rep=1; break; fi
+  done
+  [ "$_rep" -eq 1 ] || { bad "the rendered timer declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare OnUnitActiveSec= or OnCalendar="; return 1; }
+  return 0
+}
+
 # ── the EFFECTIVE unit: the fragment systemd loads, which is NOT the file this run wrote ───────────
 # ⛔ `verify_unit` READS THE ARTIFACT THIS RUN RENDERED. systemd does not read that file alone: it MERGES
 # every `<unit>.service.d/*.conf` drop-in over it, in both managers, whether the drop-in was written
@@ -1412,6 +1483,12 @@ do_install() { # [--takeover]
   # still `place_pass`, and it is still AFTER every refusal.
   script="$(pin_script_path)" || { err "refusing: cannot locate the pass this unit would exec"; rm -rf "$tmp"; return 1; }
   verify_unit "$tmp/cell-self-pin.service" "$script" || { err "refusing: the rendered cell-self-pin.service failed verification (reason above)"; rm -rf "$tmp"; return 1; }
+  # ⛔ AND THE TIMER IS THE OTHER HALF OF THE ACTUATOR THIS VERB INSTALLS AND ENABLES. Verifying only the
+  # service left the whole clock unverified: `Unit=` re-targeted, or a timer with no repeating trigger, both
+  # installed with rc=0 under the positive claim "installed — ONE actuator on this pin" and produced a pin
+  # that never runs again — #3194's symptom through the artifact path. A COUNT/predicate gate, not a
+  # presence test, for the same LAST-WINS reason as every other rule in this block.
+  verify_timer "$tmp/cell-self-pin.timer" cell-self-pin.service || { err "refusing: the rendered cell-self-pin.timer failed verification (reason above)"; rm -rf "$tmp"; return 1; }
   # ⛔ ONE ACTUATOR PER PIN, AND THE REFUSAL COMES BEFORE ANY WRITE. `eldato-harness-apply.timer` already
   # advances this box's harness on the same 10-minute clock (#2416), and two mutating actors on one pin is a
   # race, not redundancy. The guard asks BOTH managers, NAMES every scope it saw, and `--takeover` is the

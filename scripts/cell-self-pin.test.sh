@@ -65,7 +65,8 @@ runat() {
   # their own fake, which wins (a later `env` assignment overrides an earlier one).
   env -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
-      -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC \
+      -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
+      -u CELL_SELF_PIN_DROPIN_ROOTS \
       PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
@@ -77,7 +78,8 @@ runat_keep_pinfile() {
   local h="$1"; shift
   env -u HARNESS -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
-      -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC \
+      -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
+      -u CELL_SELF_PIN_DROPIN_ROOTS \
       PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
@@ -223,6 +225,29 @@ out="$(pinrun "$T/bare" 2>&1)"; rc=$?
 case "$out" in
   *'UNRESOLVED(no-supervisor)'*) ok "…and it names the reason (UNRESOLVED(no-supervisor))" ;;
   *) bad "…but it does not name the reason: $out" ;;
+esac
+
+# ── 2b. THE PIN-ROOT FALLBACK: NEWEST BY mtime, AND IT SAYS WHAT IT IS NOT ──────────────────────────
+# ⛔ TWO RULES NOTHING PINNED (measured in review: `ls -1dt` → `ls -1d`, and the deletion of the stderr
+# warning, each left the suite at 280 ok / 0 failed). The fallback picks WHICH TREE GETS PINNED when the
+# record is unusable, so picking lexicographically means pinning an arbitrary commit — and it is that
+# commit's supervisor which then executes. And a fallback that does not SAY it is unproven is the drift this
+# unit exists to prevent, inside the unit itself. The fixture makes the two orders disagree: `aaa` sorts
+# FIRST but is OLDER; `zzz` sorts LAST but is NEWER, so only `-t` can select `zzz`.
+FB="$T/home-fb"
+mkdir -p "$FB/harness" "$FB/orchestrator"
+git init -q "$FB/harness/aaa" 2>/dev/null; mkdir -p "$FB/harness/aaa/scripts/orchestrator-harness"; mk_sup "$FB/harness/aaa/scripts/cloud-cell-supervisor.sh"
+sleep 1
+git init -q "$FB/harness/zzz" 2>/dev/null; mkdir -p "$FB/harness/zzz/scripts/orchestrator-harness"; mk_sup "$FB/harness/zzz/scripts/cloud-cell-supervisor.sh"
+printf '%s\n' "$FB/not-a-git-tree" >"$FB/.harness-path"   # an unusable record → the pin-root fallback runs
+out_fb="$(pinrun "$FB" --dry-run 2>&1)"
+case "$out_fb" in
+  *"$FB/harness/zzz"*) ok "the pin-root fallback picks the NEWEST tree by mtime (zzz), not the lexicographic first (aaa)" ;;
+  *) bad "the fallback did not pick the mtime-newest tree — a lexicographic pick pins an ARBITRARY commit and that commit's supervisor executes: $out_fb" ;;
+esac
+case "$out_fb" in
+  *'NOT proven to be the layer the controller EXECUTES'*) ok "…and the fallback SAYS the tree it chose is not proven to be the executed layer" ;;
+  *) bad "the fallback chose a tree in silence — a silent fallback IS the drift this unit exists to prevent: $out_fb" ;;
 esac
 
 # ── 3. an unresolvable layer is a LOUD named non-zero exit, never a green no-op ─────────────────────
@@ -474,6 +499,52 @@ out_ok11="$(install_doctored "$d_ok11" "$T/u31b")"; rc_ok11=$?
 [ "$rc_ok11" -eq 0 ] && ok "ACCEPTS SuccessExitStatus=11 without 0 — 0 is successful regardless (systemd.service(5)); only a MISSING 11 is refused" \
   || bad "refused a unit that omits the redundant 0 from SuccessExitStatus — a valid unit, refused: $out_ok11"
 cp "$T/placed.before" "$PLACED"   # the refusal legs below re-assert that a REFUSAL cannot replace it
+# ── 4a-bis. THE OTHER ARTIFACT THIS VERB INSTALLS: THE TIMER ITSELF ─────────────────────────────
+# ⛔ `--install` WRITES TWO UNITS AND VERIFIED ONE (round-10 review, P1). `verify_unit` was asserted on
+# `$tmp/cell-self-pin.service` only; the rendered `cell-self-pin.timer` was written, placed and ENABLED
+# with no assertion at all. The timer's DROP-INS were verified while the timer ITSELF was not — so a
+# `Unit=` re-target and a timer with no repeating trigger both installed rc=0 under the positive claim
+# "installed — ONE actuator on this pin", producing a pin that never runs again: #3194's symptom through
+# the artifact path. These legs are that defect, fed back in, one doctor per rule.
+doctor_timer() { # <name> <sed-expr applied to the TIMER template>
+  local d="$T/doctored-$1"
+  mkdir -p "$d" && cp "$TPL/cell-self-pin.service" "$d/"
+  sed "$2" "$TPL/cell-self-pin.timer" >"$d/cell-self-pin.timer"
+  printf '%s\n' "$d"
+}
+refuses_timer() { # <name> <doctored-dir> <unit-dir> <must-appear-in-the-reason>
+  local name="$1" d="$2" u="$3" why="$4" out rc
+  out="$(install_doctored "$d" "$u")"; rc=$?
+  if [ "$rc" -eq 0 ]; then bad "ACCEPTED $name — the timer gate does not exist: $out"; return; fi
+  if [[ $out == *"$why"* ]]; then ok "REFUSES $name, and says why (\"$why\")"
+  else bad "refused $name for the WRONG reason (wanted \"$why\"): $out"; fi
+  [ -f "$u/cell-self-pin.timer" ] && bad "a refused install ($name) still wrote the TIMER" \
+    || ok "a refused install ($name) wrote no timer"
+  if cmp -s "$T/placed.before" "$PLACED"; then ok "a refused install ($name) did NOT replace the already-placed pass"
+  else bad "a refused install ($name) REPLACED the placed pass"; cp "$T/placed.before" "$PLACED"; fi
+}
+# ⛔ RE-TARGETED: `Unit=` must name the pass this run places. systemd defaults a MISSING `Unit=` to the
+# same-name service, so a re-target is silent on every surface this file prints.
+refuses_timer 'a timer Unit= re-targeted away from the pass' \
+  "$(doctor_timer unit-elsewhere 's|^Unit=.*$|Unit=/bin/true.service|')" "$T/tu1" 'is not the pass this install places'
+# ⛔ NO REPEATING TRIGGER: `OnBootSec=` fires ONCE, three minutes after boot. The shipped template's own
+# comment says the cadence is `OnUnitActiveSec=` for exactly this reason; with it deleted the pin runs a
+# single time and then stops for ever, with every surface green.
+refuses_timer 'a timer with only the ONE-SHOT OnBootSec=' \
+  "$(doctor_timer no-clock '/^OnUnitActiveSec=/d')" "$T/tu2" 'no REPEATING trigger'
+# ⛔ AND AN EMPTY VALUE IS THE SAME DEFECT ONE SPELLING OVER: systemd ignores `OnUnitActiveSec=` with no
+# value, so the timer silently degrades to the one-shot case while the directive is present.
+refuses_timer 'an EMPTY OnUnitActiveSec=' \
+  "$(doctor_timer empty-clock 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=|')" "$T/tu3" 'no REPEATING trigger'
+# ⛔ AND A SECOND `Unit=` IS LAST-WINS, exactly like `Environment=CELL_HOME=` and `ExecStart=`: a presence
+# test installs the wrong target green. The shipped target stays FIRST, so only the count rule can catch it.
+refuses_timer 'a SECOND Unit=' \
+  "$(doctor_timer unit-second 's|^Unit=.*$|Unit=cell-self-pin.service\nUnit=/bin/true.service|')" "$T/tu4" 'Unit= line(s)'
+# ⛔ A SKIPPED TIMER IS A GREEN NO-OP, and on the TIMER it is unrecoverable: nothing runs, so the pass's own
+# loudness never gets a chance to fire. Closed by PREFIX, so a condition name systemd adds later is closed.
+refuses_timer 'a ConditionPathExists= on the TIMER (a skip is a green no-op)' \
+  "$(doctor_timer cond-timer 's|^Unit=.*$|ConditionPathExists=/srv/nope\nUnit=cell-self-pin.service|')" "$T/tu5" 'ConditionPathExists='
+
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
 # `<unit>.service.d/*.conf` OVER it, in both managers, whether the drop-in was written before the unit or
@@ -965,6 +1036,18 @@ case "$out" in
   *'second actuator <UNVERIFIED'*'user'*) ok "--status says UNVERIFIED (naming the scope) when a manager did not answer, instead of 'none'" ;;
   *) bad "--status did not report the unread scope: $out" ;;
 esac
+# ⛔ AND THE TICK'S OWN NOTE IS GATED — it is the message the UNATTENDED path prints, and it was the one
+# copy of the claim nothing read (the install read-back and `--status` versions are both gated). Deleting
+# the tick's `log "note: … UNVERIFIED there, not satisfied"` left the suite at 280 ok / 0 failed (measured
+# in review), so a tick that could not check a manager said nothing about it.
+mk_blind_user_systemctl "$T/fake-blind-tick" "$T/state-blind-tick"
+: >"$T/state-blind-tick/system-$SHIPPED"
+: >"$T/state-blind-tick/system-cell-self-pin.timer"
+out_tick="$(runat "$TICK" PATH="$T/fake-blind-tick:$PATH" bash "$PIN" 2>&1)"
+case "$out_tick" in
+  *'one-actor invariant is UNVERIFIED'*) ok "the TICK itself says the invariant is UNVERIFIED when a manager did not answer (not only install/--status)" ;;
+  *) bad "the tick stayed silent about a manager it could not read, so an unattended box cannot be told its invariant is unverified: $out_tick" ;;
+esac
 # And a re-arm that cannot be retired is a RED, never a warning: on a current box the pin needs no work,
 # so the duplicate is the ONLY thing that can make the tick fail — the leg cannot pass on another guard.
 mk_scoped_systemctl "$T/fake-rearm-stub" "$T/state-rearm-stub"
@@ -1415,6 +1498,19 @@ printf '%s\n' "$T/home-ahead/harness/tree" >"$T/home-ahead/.harness-path"
 out="$(pinrun "$T/home-ahead" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "a record that ALREADY CONTAINS the ref tip is green — containment, not equality (no false RED)" \
   || bad "a record ahead of the ref tip was reported as ${rc} — that is the periodic false RED this rule exists to avoid: $out"
+# ⛔ AND THE OPERATOR'S VERB MUST GIVE THE SAME ANSWER AS THE TICK — ONE PREDICATE, NOT TWO (#1178).
+# `do_status` decided `current` by EQUALITY while the pass decides by CONTAINMENT, so THIS EXACT FIXTURE —
+# the one the leg above pins as green — read `verdict DRIFT` + exit 1 from `--status`. Two answers to one
+# question on one box is the third drift dialect this file refuses, and it false-REDs every consumer of the
+# `0=current / 1=DRIFT` vocabulary the header reuses. The leg is non-vacuous because the fixture is the
+# state where the two rules genuinely disagree: an identical-commit record would pass under either.
+out_st="$(runat "$T/home-ahead" bash "$PIN" --status 2>&1)"; rc_st=$?
+[ "$rc_st" -eq 0 ] && ok "--status also reads a record AHEAD of the tip as current — one predicate, not two" \
+  || bad "--status reported rc=$rc_st for the record the pass calls green — the two verbs disagree on one state: $out_st"
+case "$out_st" in
+  *'verdict        current'*) ok "…and the verdict LINE says current (not just the exit code)" ;;
+  *) bad "…but the verdict line does not say current: $out_st" ;;
+esac
 # ⛔ AND A SUCCESSFUL RE-TAKE KEEPS ITS RETIREMENT (the failure rollback is not a blanket undo). The leg
 # above takes the APPLIED path — the record is ahead of the tip, so the pass decides DRIFT, `apply` runs and
 # the containment rule greens it. That path clears the rollback flag before exiting, and this leg is what
@@ -1453,6 +1549,28 @@ RECORDED="$(head -1 "$T/home/.harness-path" 2>/dev/null)"
 [ "$RECORDED" = "$T/home/harness/$SHA12/scripts/orchestrator-harness" ] \
   && ok "…and the record names the HARNESS DIR the controller execs (not a bare toplevel)" \
   || bad "…but the mended record is '${RECORDED}', not '<tree>/scripts/orchestrator-harness'"
+# ⛔ AND IT MINDS ONLY FROM A TREE THAT IS **AT** THE TARGET. `mend_record`'s `[ rev-parse HEAD = target ]`
+# is the only guard between "mended" (exit 11, a SUCCESS verdict that keeps the retirement) and writing a pin
+# record naming a tree that does NOT contain the ref tip — i.e. manufacturing #3194's own defect (a record
+# that disagrees with the tree it is supposed to describe) on the success path. A pin root holds one
+# directory per commit, so a `<sha12>` directory that exists but sits on ANOTHER commit is a real shape.
+# Deleting that one line left the suite at 280 ok / 0 failed (measured in review), so nothing pinned it.
+MG="$T/home-mendbad"
+mkdir -p "$MG/harness"
+git clone -q "$T/origin.git" "$MG/harness/$SHA12" 2>/dev/null
+git -C "$MG/harness/$SHA12" checkout -q "$FIRST" 2>/dev/null
+mkdir -p "$MG/harness/$SHA12/scripts/orchestrator-harness"
+mk_sup "$MG/harness/$SHA12/scripts/cloud-cell-supervisor.sh"
+rm -f "$MG/.harness-path"
+out_mb="$(pinrun "$MG" 2>&1)"; rc_mb=$?
+[ "$rc_mb" -ne 11 ] && ok "a pin-root tree NOT at the target is refused as a MEND source (never 11)" \
+  || bad "the pass MENDED the record to a tree that is not at the target (rc=$rc_mb, 11 is a success verdict): $out_mb"
+case "$out_mb" in
+  *'STALE-RECORD'*) ok "…and it reports STALE-RECORD instead of mending to a tree off the target" ;;
+  *) bad "…but it did not diagnose the un-mendable record: $out_mb" ;;
+esac
+[ -s "$MG/.harness-path" ] && bad "a record was WRITTEN naming a tree that is not at the target: $(head -1 "$MG/.harness-path")" \
+  || ok "…and no record was written for it"
 
 # ── 9. two ways a reading that is NOT a green used to come back GREEN ──────────────────────────
 # ⛔ (a) A FAILED FETCH IS `2 = unknown`, NOT `0 = current`, AND MUST NOT PRINT «current». The status verb
