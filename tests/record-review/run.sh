@@ -2271,7 +2271,7 @@ cd "$TMP" || true
 # the single emitter. Round 37 also escaped the two backticked spans in the section-23 `pass`
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
-# the builder arms, so this pin is EXACT: 133, not a floor.
+# the builder arms, so this pin is EXACT: the count below, not a floor. (The literal that used to be here said 133 while the pin said 183 — a review caught it; section 32 moved it to 186.)
 MIN_ASSERTIONS=186
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
