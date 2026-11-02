@@ -208,7 +208,11 @@ async function partB() {
     if (on) {
       mkdirSync(join(homedir(), ".pi", "agent"), { recursive: true });
       writeFileSync(markerPath, JSON.stringify({ session_id: TID, reason: "m4 recovery-window test", ts: new Date().toISOString() }) + "\n");
-      process.env.PI_SESSION_ID = TID;
+      // PRODUCTION GEOMETRY (review round 2, P1): pi sets PI_SESSION_ID only in
+      // the CHILD shell env — the extension host resolves the id from ctx. The
+      // suite therefore drives the handler with a ctx sessionManager and leaves
+      // the env var UNSET; setting it here would hide the two-id defect that made
+      // M4 permit while M5 refused in every real session.
     } else {
       try { unlinkSync(markerPath); } catch { /* already gone */ }
     }
@@ -231,7 +235,9 @@ async function partB() {
       const mod = await import(pathToFileURL(join(HERE, "index.ts")).href);
       const handlers = new Map();
       mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
-      const res = await handlers.get("tool_call")[0]({ toolName: "bash", input: { command } }, undefined);
+      delete process.env.PI_SESSION_ID; // production: the id comes from ctx, not env
+      const ctx = { sessionManager: { getSessionId: () => TID } };
+      const res = await handlers.get("tool_call")[0]({ toolName: "bash", input: { command } }, ctx);
       return res && res.block === true ? { block: true, reason: String(res.reason ?? "") } : null;
     };
 
@@ -260,6 +266,32 @@ async function partB() {
     check("B5 marker ⇒ abbreviated `--sour` rollback still BLOCKED", b4b !== null, true);
     const b4c = await drive("git checkout -- .");
     check("B6 marker ⇒ whole-tree discard `.` still BLOCKED", b4c !== null, true);
+    // B6b–B6e — round-2 measured fail-open: a TRAILING SLASH, `..`, and a GLOB
+    // were all permitted (they were BLOCKED on main). The window is a NAMED path.
+    for (const [name, cmd] of [
+      ["`./`", "git checkout -- ./"],
+      ["`..`", "git checkout -- .."],
+      ["`../`", "git checkout -- ../"],
+      ["glob `*.txt`", "git checkout -- '*.txt'"],
+      ["`restore ./`", "git restore ./"],
+      ["`restore ..`", "git restore .."],
+    ]) {
+      const r = await drive(cmd);
+      check(`B6x marker ⇒ whole-tree spelling ${name} still BLOCKED`, r !== null, true);
+    }
+    // …but a NAMED DIRECTORY is not a whole-tree wipe: `-- src/` names `src`
+    // (the trailing slash is cosmetic). Refusing it would re-create the dead end
+    // for a hub whose dirt sits in a directory, so it is deliberately permitted.
+    const b6dir = await drive("git checkout -- src/");
+    check("B6w marker ⇒ NAMED DIRECTORY `src/` PERMITTED (still names its target)", b6dir, null);
+    // B6y — round-2 measured compound hole: one permitted restore used to
+    // neutralise M5 for the REST of the command (#1060/D8 closure).
+    const b6y = await drive('git checkout -- other.txt; x=wip.txt; git show HEAD:"$x" > "$x"');
+    check("B6y marker ⇒ compound restore + `$x` self-revert still BLOCKED", b6y !== null, true);
+    // B6z — a bundled short flag is a standard spelling and must NOT be refused
+    // (the mirror defect: the allowlist refused `git restore -SW <path>`).
+    const b6z = await drive("git restore -SW wip.txt");
+    check("B6z marker ⇒ bundled `-SW` restore PERMITTED (no re-created dead end)", b6z, null);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {

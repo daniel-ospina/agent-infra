@@ -4697,6 +4697,26 @@ const HUB_MUTATING_VERBS = new Set([
  *   (session-start AGENT_ALLOW_MAIN_EDITS=1, or the ~/.pi/agent/.allow-main-edits
  *   marker). Opens the recovery window only; never widens to feature work.
  */
+/** #1484 M4 recovery window — is this operand a NAMED path?
+ *
+ * The window is a named-path restore, so the operand test must be about the
+ * EFFECT, not the spelling (review round 2 measured the fail-open): the first
+ * cut refused only the literal `.`, so `git checkout -- ./`, `-- ..`, `-- ../`,
+ * `-- src/` and `-- '*.txt'` were all PERMITTED under the hatch — `./` is the
+ * same wipe as `.`, `..` reaches ABOVE the hub, and a glob discards whatever it
+ * matches. Every one of them was BLOCKED on main, so this was a regression the
+ * arm introduced, not a gap it inherited. Strip trailing slashes, then refuse
+ * the whole-tree/dot-dot/absolute/home/glob forms. */
+function _isNamedPathOperand(x) {
+  const p = String(x ?? "").replace(/\/+$/, "");
+  if (!p) return false;
+  if (p === "." || p === "..") return false;
+  if (p.startsWith("/") || p.startsWith("~") || p.startsWith(":")) return false;
+  if (p.split("/").includes("..")) return false;
+  if (/[*?[]/.test(p)) return false; // glob pathspec — discards whatever it matches
+  return true;
+}
+
 export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive = false) {
   const a = args || [];
   const pos = a.filter((x) => !x.startsWith("-"));
@@ -4747,7 +4767,7 @@ export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive 
         // discard, not a named recovery).
         const paths = a.slice(dash + 1).filter((x) => !x.startsWith("-"));
         if (paths.length === 0) return "block";
-        if (paths.some((x) => x === "." || x === ":/" || x === "-" || x.startsWith(":"))) return "block";
+        if (paths.some((x) => x === "-" || !_isNamedPathOperand(x))) return "block";
         return "recovery";
       }
       // Round-23 (final gate P1): force-create in ANY spelling (attached
@@ -4786,12 +4806,12 @@ export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive 
       // reachable through a sibling spelling. Only the working-tree/index
       // modifiers below are in window; every other flag (including `--source`,
       // `--sour`, `-s`, `--patch`) is out.
-      const RESTORE_FLAGS = /^-(S|W|q)$/;
+      const RESTORE_FLAGS = /^-[SWq]+$/; // bundled shorts too: `-SW` is a valid, standard spelling
       const RESTORE_LONGS = /^--(staged|worktree|quiet|progress|overlay|no-overlay|ignore-unmerged)$/;
       const bad = a.filter((x) => x.startsWith("-") && x !== "--" && !RESTORE_FLAGS.test(x) && !RESTORE_LONGS.test(x));
       if (bad.length > 0) return "block";
       if (pos.length === 0) return "block";
-      if (pos.some((x) => x === "." || x === ":/" || x === "-" || x.startsWith(":"))) return "block";
+      if (pos.some((x) => x === "-" || !_isNamedPathOperand(x))) return "block";
       return "recovery";
     }
     case "status":

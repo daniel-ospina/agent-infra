@@ -564,8 +564,7 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
   };
 }
 
-// ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
-// The hub's only legal states are main+clean. When the session cwd IS the hub
+// ── M4: hub-state gate (#1484) ─────────────────────────────────────────────// The hub's only legal states are main+clean. When the session cwd IS the hub
 // main checkout (agent-infra included since #615) and the hub is off-main or
 // dirty, every git op is
 // gated by the recovery allowlist (classify-git evaluateHubGateWithTargets) and
@@ -601,6 +600,27 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
   if (st.disorder === "off_main" || st.disorder === "both") bits.push(`off-main: ${st.branch ?? "<detached>"}`);
   if (st.disorder === "dirty" || st.disorder === "both") bits.push(`dirty: ${st.dirtyPaths} path(s)`);
   return `   Checkout: ${st.path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`;
+}
+
+/** #1484 — the write/edit route's recovery advice must be as ACTIONABLE as the
+ *  bash route's (review round 2, P2). This route keeps D3's freeze even under
+ *  the hatch, so it cannot tell the reader to just edit; but it CAN tell them
+ *  how to clear the dirt on the route that has a working escape — the bash
+ *  named-path restore, which an active hatch sanctions. The old line said
+ *  `git checkout main && git pull --ff-only`, which on a DIRTY hub is the very
+ *  no-op this change removes from the bash message: git refuses to switch over
+ *  modified paths. */
+function _hubWriteRecoverLines(st: { disorder: string | null } | null): string[] {
+  const dirty = st?.disorder === "dirty" || st?.disorder === "both";
+  if (!dirty) {
+    return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
+  }
+  return [
+    `   → Recover the DIRT first — a branch switch cannot (git refuses to switch`,
+    `     over modified paths). Run this from the BASH route, where an active`,
+    `     escape hatch sanctions it: \`git restore <path>\` / \`git checkout -- <path>\`,`,
+    `     one NAMED path at a time. Edits stay frozen here until the tree is clean (D3).`,
+  ];
 }
 
 // #1919 — refuse a `git worktree add|move` whose target lands INSIDE a git
@@ -2767,21 +2787,28 @@ function _wtExpandedScriptShape(text: string, depth = 0): _WtExpandedHit | null 
  * marker ACTIVE and a hub carrying one truncated tracked file, M4 permitted
  * `git checkout -- <path>` and M5 then refused it — "Working-tree discard
  * blocked … it would destroy uncommitted work (#709)" — so the hub stayed
- * unrecoverable while BOTH messages claimed a hatch worked. #709's own text
- * says the env hatch and the marker "both bypass this gate unchanged"; that
- * was false, and the dirty-hub M4 message inherited the false claim.
+ * unrecoverable while BOTH messages claimed a hatch worked.
  *
- * The window is derived from M4's OWN verdict rather than re-implemented, so
- * the two gates cannot drift: a command is in the window iff an escape hatch is
- * active, the SESSION cwd is the DISORDERED hub (the incident geometry — a
- * clean repo, a linked worktree and a foreign checkout are all outside it), and
- * the SAME command is `block` without the hatch but `recovery` with it. That
- * inherits the arm's allowlist narrowing: named paths only, no `.`/pathspec
- * magic, no ref operand other than HEAD, no `--source` family. */
-function _m4HatchRecoveryWindow(command: string): boolean {
-  if (!classifierLoaded) return false;
-  const hatch = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(undefined));
-  if (!hatch) return false;
+ * The hatch state is PASSED IN (the caller already computed it, the same value
+ * M4's `escapeActive` gets). Recomputing it here resolved the session id from
+ * the ENV only (`_currentSessionId(undefined)`) while M4 and the marker STAMP
+ * use the ctx form (`_currentSessionId(_ctx)`) — two different ids, so in the
+ * production geometry (pi sets PI_SESSION_ID only in the CHILD env, not its own
+ * process) this window silently never opened and "M4 permits, M5 refuses"
+ * survived. Measured by review round 2 driving the real handler with a
+ * ctx-stamped marker and no env id.
+ *
+ * SCOPE (all three required): an active hatch; the SESSION cwd is the DISORDERED
+ * hub (a clean repo, a linked worktree and a foreign checkout are outside it);
+ * and the command is ONE simple git invocation. The last clause closes the
+ * compound hole round 2 measured: exempting the whole command let one permitted
+ * restore neutralise M5 for everything after it (`git checkout -- other.txt; x=w;
+ * git show HEAD:"$x" > "$x"` was ALLOWED, re-opening #1060/D8). */
+function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean {
+  if (!hatchActive || !classifierLoaded) return false;
+  // A compound command is never in the window: no `;`, `&&`, `||`, pipe,
+  // redirect, substitution or subshell. One restore, nothing else.
+  if (/[;&|<>`$()]/.test(command)) return false;
   const st = _hubState();
   if (!st.disorder) return false; // the window exists only for a DISORDERED hub
   try {
@@ -2795,10 +2822,10 @@ function _m4HatchRecoveryWindow(command: string): boolean {
   }
 }
 
-function _worktreeDiscardBlock(command: string): string | null {
+function _worktreeDiscardBlock(command: string, hatchActive = false): string | null {
   if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
   // #1484/#709 — the hatch's recovery window, decided ONCE and shared with M4.
-  if (_m4HatchRecoveryWindow(command)) return null;
+  if (_m4HatchRecoveryWindow(command, hatchActive)) return null;
   // Backslash-newline line continuations (`git \<LF> checkout -- f`) are joined
   // by the shell BEFORE it tokenizes — join them here too, so every textual arm
   // below sees the same command the shell runs (reviewer round-7 P1).
@@ -4937,7 +4964,7 @@ export default function (pi: ExtensionAPI) {
               // was left to decide. The hub's tracked dirt is exactly what that
               // command destroys, so the effect gate must still be consulted
               // before the arm calls the command done.
-              const discardReason = _worktreeDiscardBlock(command);
+              const discardReason = _worktreeDiscardBlock(command, escapeActive);
               if (discardReason) return { block: true, reason: discardReason };
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
@@ -4983,7 +5010,7 @@ export default function (pi: ExtensionAPI) {
                     `   New files are additive (they cannot collide with a sibling's uncommitted`,
                     `   work) but unbounded accumulation is the #347 amplifier, and the hub's`,
                     `   only legal state is main+clean.`,
-                    `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+                    ..._hubWriteRecoverLines(st),
                     `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
                   ].join("\n"),
                 };
@@ -4998,7 +5025,7 @@ export default function (pi: ExtensionAPI) {
                 ...(ctxLine ? [ctxLine] : []),
                 `   The hub's only legal states are main+clean. Non-recovery edits are`,
                 `   blocked even under the TTL marker (D3).`,
-                `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+                ..._hubWriteRecoverLines(st),
                 `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
               ].join("\n"),
             };
@@ -5057,7 +5084,7 @@ export default function (pi: ExtensionAPI) {
       // branch-ownership loaded, and in a linked worktree as well as the hub.
       // It sits AFTER the env/marker hatch return above, so both hatches
       // bypass it unchanged.
-      const discardBlock = _worktreeDiscardBlock(command);
+      const discardBlock = _worktreeDiscardBlock(command, false);
       if (discardBlock) return { block: true, reason: discardBlock };
       // #350: hub-WIP discipline prompts (never block) — bash-write detection
       // (heredoc/tee/python into the hub) + the throttled periodic hub-hygiene
