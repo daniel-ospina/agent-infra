@@ -264,9 +264,12 @@ case_b() { # <entry-point> <owner>
     # removed entry is the record contradicting the pass it records.
     # ⛔ CORRECTED — this comment used to say "Case (b) is the only case that REAPS" and "(f)/(g) … neither
     # of those reaps", and BOTH claims are measurably false: case (a) drives `--apply` (:210) and reads its
-    # record (:214), and case (g) drives `--apply` (:467), reads its record (:469) AND reaps — its own
-    # "and it reaped the dead entry" assertion (:472) passes. At the prior head `301235ef8`, (g) already
-    # reaped and already asserted `^verdict_runner_work=ok$`. What this assertion ACTUALLY closes: (b) reads
+    # record (:214); case_g() (locate it by `grep -n 'case_g()'` → :468, never by a bare number alone) drives
+    # `--apply` (:483), reads its record (:485) AND reaps — its "and it reaped the dead entry" assertion (:487)
+    # passes. ⛔ ALL SIX numbers VERIFIED AT THIS HEAD — re-read them, never carry one over: the prior
+    # revision wrote its numbers from PRE-INSERTION numbering and then placed them after the insertion,
+    # which is exactly how they drifted. At the prior head `301235ef8`, (g) already reaped and already
+    # asserted `^verdict_runner_work=ok$`. What this assertion ACTUALLY closes: (b) reads
     # every OTHER field of the record, and this one was the exception on the suite's most complete reaping
     # path — it adds field COMPLETENESS to (b), not a unique mutant kill (deleting the record line reddens
     # (g) too). The unique kill is the READER assertion below, which nothing else covered.
@@ -279,7 +282,7 @@ case_b() { # <entry-point> <owner>
     # `|`-joined line", so a `^verdict_…$` grep "could never match". MEASURED FALSE: `print_status` emits
     # **43 lines, one `key=value` per line, with ZERO `|`**, and `grep -c '^verdict_runner_work=ok$'`
     # returns **1**. An anchored grep DOES match here, and the rest of the repo relies on exactly that
-    # (`cloud-cell-supervisor.sh:3974-3975` parses this very output with `sed -n 's/^status=//p'`). The
+    # (`cloud-cell-supervisor.sh:3973` parses this very output with `sed -n 's/^status=//p'`). The
     # field-boundary form below is therefore a harmless SUPERSET of the anchored one, kept because it is
     # what the reader-only mutant proves discriminates — NOT because the anchored form cannot work. The
     # real cause of the original red is the one named next: the suite runs `set -uo pipefail` (:59), and a

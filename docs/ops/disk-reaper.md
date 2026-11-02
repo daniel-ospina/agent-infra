@@ -1156,9 +1156,15 @@ the case that drives a real `--apply` and then reads back **every** field of the
 ⛔ **"only case" is true of the FULL FIELD SET, and NOT of reaping — and an earlier revision of this
 paragraph said the latter and was measurably false.** It read "the only case in that suite that drives a
 real `--apply` and then reads back the record that pass wrote". Measured against the suite: case **(a)**
-drives `--apply` (`runner-work.test.sh:210`) and reads the record (`:214`); case **(g)** drives `--apply`
-(`:467`), reads the record (`:469`) **and reaps** — its own assertion at `:472` ("and it reaped the dead
-entry on the pass the fallback exists for") **passes**. At the *prior* head `301235ef8`, case (g) already
+drives `--apply` (`runner-work.test.sh:210`) and reads the record (`:214`); case **(g)** — `case_g()`, which
+`grep -n 'case_g()'` locates at `:468` — drives `--apply` (`:483`), reads the record (`:485`) **and reaps** —
+its own assertion at `:487` ("and it reaped the dead entry on the pass the fallback exists for") **passes**.
+⛔ **Each of those numbers was read out of the file at the head that carries this paragraph, and each is
+anchored to its function as well as to its line.** The revision before this one wrote them from the
+PRE-INSERTION numbering and placed them *after* the insertion, so `:467`/`:469`/`:472` landed on
+`PASS_OWNER=`, `dead="$(mk_entry …)"` and a `mkdir` — not one of them the statement claimed. A bare line
+number is not durable evidence: the block above it can grow, so re-read the number against the file at the
+head you are in. At the *prior* head `301235ef8`, case (g) already
 reaped **and** already asserted `^verdict_runner_work=ok$`. So (b) is not "the only case that reaps"; it is
 the case that reads the **whole** field set on a reaping pass, which is a different and narrower claim.
 ⛔ **That credit was WRONG for one revision, and wrong in the one direction that matters.** It named
