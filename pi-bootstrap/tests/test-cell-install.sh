@@ -575,6 +575,22 @@ fi
 # BEHAVIOUR, not just the artifact: RUN the installed file as `pi`. MAX_LOAD=0 is the deterministic
 # refusal lever and keeps its documented meaning ("spawn nothing"); the fake real pi behind it is
 # what proves the refusal happened AT the spawn point instead of before the gate ever ran.
+# ⛔ AND THE FORK INSTRUMENT IS DEPLOYED FIRST (agent-infra#2293 / #2843), because the spawn point now
+# HARD-REQUIRES `capacity.sh` and refuses under 81 (`AGENT_HARNESS_SKEW_REFUSED`) when it cannot read
+# the fork floor — which is the whole point of that fix and NOT a wall this arm may assume away. A
+# `HOME` with no harness is a HALF-DEPLOYED box: both drives below would answer 81 and this arm would
+# stop testing the load gate at all. `$HOME/orchestrator` is the DOCUMENTED default harness home (one
+# of the resolver's candidates), so seeding it there is the production shape, not a fixture-only
+# dodge; the INSTALL half (shipping the instrument beside the installed `pi`) is #2843's open half.
+# ⛔ A STUB, NOT THE SHIPPED FILE: the shipped `capacity.sh` reads THIS HOST's process population, so
+# the arm's verdict would be decided by the runner's fork headroom instead of by the gate under test.
+mkdir -p "$TMP/gate-home/orchestrator"
+cat > "$TMP/gate-home/orchestrator/capacity.sh" <<'CAPEOF'
+# Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
+cap_procs_pair_vars() { printf -v "${1:?}" '%s' 100; printf -v "${2:?}" '%s' 10000; printf -v "${3:?}" '%s' 'fixture'; }
+cap_h_for_vars() { printf -v "${3:?}" '%s' "$(( ${2:-0} - ${1:-0} ))"; }
+cap_fork_probe() { return 0; }
+CAPEOF
 mkdir -p "$TMP/gate-real" "$TMP/gate-home"
 printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
 chmod +x "$TMP/gate-real/pi"
