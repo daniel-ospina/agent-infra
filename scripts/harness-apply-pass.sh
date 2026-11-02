@@ -575,6 +575,16 @@ read_deployed_drift() {
         1) DRIFT_STATE=drift ;;
         *) DRIFT_STATE="cannot-verify-rc$DRIFT_RC" ;;
     esac
+    # ⛔ CANNOT-VERIFY KEEPS ITS REASON (review P2). The checker's exit 2 means "I could not answer" —
+    # an unreadable process table, an unexaminable dir, an unresolvable controller path — and its
+    # `UNKNOWN:` line is the only place that reason is ever written. Recorded as a bare `token=rc=2` it
+    # survived nowhere an operator reads (the record's `detail=` truncates at 240 chars), leaving a box
+    # whose executing-tree question was NEVER ANSWERED looking like one that answered clean. This is
+    # reported, not turned into a refusal: exit 2 is heavily reachable on a box with no harness at all,
+    # and a check that reds every such box is one operators learn to ignore.
+    if [ "$DRIFT_RC" -gt 1 ] 2>/dev/null; then
+        log_line "harness: deployed_drift_unknown=$(printf '%s\n' "$out" | grep -m1 -E 'UNKNOWN:|BROKEN' || true)"
+    fi
     log_line "harness: deployed_drift=$DRIFT_STATE token=$DRIFT_TOKEN (check-deployed-drift.sh --surface)"
     return 0
 }

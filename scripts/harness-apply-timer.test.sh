@@ -40,6 +40,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INST="$HERE/install-harness-apply-timer.sh"
 PASS_SH="$HERE/harness-apply-pass.sh"
+# ⛔ THE DEPLOYED-DRIFT SEAM IS OFF BY DEFAULT *IN THIS SUITE* (#10114, review P1). Without this the
+# pass shelled out to the REAL `check-deployed-drift.sh`, which scans the REAL `$HOME` — the suite pins
+# HARNESS_REPO/CELL_HOME/O but not HOME — so whether a case was green depended on what the developer's
+# box happened to be running. It stayed green here only because a stub repo makes the checker exit 2.
+# T20 below turns the seam back ON with a stub checker, which is the arm that is actually being tested.
+export HARNESS_APPLY_DRIFT_CHECK=0
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
@@ -367,6 +373,42 @@ printf '#!/usr/bin/env bash\necho "SHOULD NOT RUN" >&2; exit 9\n' >"$T/t18c/mat.
 OUT="$(HARNESS_MATERIALISER="$T/t18c/mat.sh" run_pass "$T/t18c" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T18 a converged PIN with a lagging checkout is a NO-OP (exit 0)"
 assert_absent "$OUT" "SHOULD NOT RUN" "T18 and the materialiser was not called at all"
+
+# ── T20: THE DEPLOYED-DRIFT ARM (#10114) — the one branch that turns a green pass RED ────────────
+# This is the arm that closes the silent no-op, so it is the arm that must be PINNED, not assumed.
+# Two directions, because a check that reds too much is as useless as one that never reds:
+#   executes:<dir>  → a live controller runs a tree this box does not have → the pass must FAIL
+#   behind:<sha>    → a copy at rest differs                                → the pass must NOT fail
+# Both stubs exit 1, exactly as the real `check-deployed-drift.sh` does, so the ONLY thing that can
+# distinguish them is the token.
+say_case "T20 a stale EXECUTING tree reds the pass; other drift does not"
+mk_origin t20; mk_clone t20
+REPO_P="$CLONE"; MODE_P=pin
+WANT20="$(advance_origin t20 A.txt "upstream for the drift case")"
+mkdir -p "$T/t20/home/.pi/agent/state"
+git -C "$CLONE" fetch -q origin main >/dev/null 2>&1
+git -C "$CLONE" worktree add --detach "$T/t20/pin" "$WANT20" >/dev/null 2>&1
+mkdir -p "$T/t20/pin/scripts/orchestrator-harness"
+printf '%s\n' "$WANT20" >"$T/t20/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$T/t20/pin/scripts/orchestrator-harness" >"$T/t20/home/.harness-path"
+printf '#!/usr/bin/env bash\necho "harness=executes:/gone/709dfb06eac2/scripts/orchestrator-harness"\nexit 1\n' >"$T/t20/drift-exec.sh"
+printf '#!/usr/bin/env bash\necho "harness=behind:709dfb06eac2"\nexit 1\n' >"$T/t20/drift-behind.sh"
+chmod +x "$T/t20/drift-exec.sh" "$T/t20/drift-behind.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-exec.sh" run_pass "$T/t20" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T20 a live controller on a GONE tree fails an otherwise-successful pass (rc 1)"
+assert_contains "$OUT" "deployed-drift" "T20 and the refusal is NAMED, not a silent green"
+assert_contains "$OUT" "executes:/gone" "T20 and it names the tree that is actually executing"
+assert_contains "$(cat "$T/t20/state/harness-apply.status" 2>/dev/null)" "action=deployed-drift" "T20 and the durable record says what happened, not the log alone"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-behind.sh" run_pass "$T/t20" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T20 a copy at rest that is merely BEHIND does NOT red the pass"
+assert_contains "$OUT" "deployed_drift=drift" "T20 and it is still REPORTED, so it is not silent either"
+# A CANNOT-VERIFY CHECKER IS NOT A RED ONE, AND NOT A SILENT ONE either: the reason is logged (the
+# record's `detail=` truncates at 240 chars, so the log is the only place it survives).
+printf '#!/usr/bin/env bash\necho "UNKNOWN: the process table could not be read"\nexit 2\n' >"$T/t20/drift-unknown.sh"
+chmod +x "$T/t20/drift-unknown.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-unknown.sh" run_pass "$T/t20" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T20 a checker that cannot verify does not by itself red a converged box"
+assert_contains "$OUT" "deployed_drift_unknown=UNKNOWN: the process table could not be read" "T20 but its REASON is kept, never a bare rc"
 assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 
 # ── T15: a dirty TRACKED SYMLINK is restored as a symlink, never written THROUGH ─────────────

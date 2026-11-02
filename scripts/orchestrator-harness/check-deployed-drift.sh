@@ -746,7 +746,13 @@ if [ "$SURFACE" -eq 1 ]; then
           # matches `.` and `sub`, so `./orch-loop.sh` and `sub/orch-loop.sh` took THAT arm and were
           # still read as invocations with no interpreter — the fabrication this fix exists to close,
           # left open behind a comment that claimed it shut (review VGATE of this change).
-          /*/orch-loop.sh) _script="$_w" ;;
+          /*/orch-loop.sh)
+            # ⛔ AN ABSOLUTE PATH IS UNAMBIGUOUS *AS A PATH*, NOT AS AN INVOCATION (review P1). Without
+            # this guard `grep -n x <pin>/…/orch-loop.sh` — the routine traffic named above — still set
+            # `_script` from the absolute spelling, and once #10114 makes an `executes:` token red a pass
+            # that is a healthy box reddened by a grep. Only argv[0] (a direct shebang exec) or an
+            # interpreter may nominate the script; the `-c` arm below already had exactly this rule.
+            if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
           orch-loop.sh|*/orch-loop.sh)
             if [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
           -c)
