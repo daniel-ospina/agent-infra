@@ -664,7 +664,7 @@ print(comp, len(inc))
   # ⛔ THE PAGE CAP CAN HIDE THE OLDEST RUN (review P2 — this used to be asserted in prose only).
   # The runs endpoint is newest-first, so a queue LARGER than the page yields the newest page's min,
   # i.e. a LOWER BOUND on the head age. That was previously claimed to be harmless because "such a
-  # queue is already >= QUEUE_THRESHOLD" — TRUE AT THE OLD DEFAULT 60 (`:77` now ships 10 on the
+  # queue is already >= QUEUE_THRESHOLD" — TRUE AT THE OLD DEFAULT 60 (`:97` now ships 10 on the
   # 2026-11-02 owner ruling), FALSE whenever an operator raises QUEUE_THRESHOLD above the page size,
   # and the operator-invisible result was a gate that read a 150-deep queue as healthy on a 60 s head. The length leg still decides first (it returns 1 on
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
@@ -1056,7 +1056,7 @@ set_labels() { # $1 = on|off
     # ⛔ THE REFUSAL IS DEFERRED TO BELOW THE COMPLEMENT SWEEP (agent-infra#3261 review P1). It used
     # to `return 1` HERE, before the loop at "The complement is disarmed FIRST", while the message
     # claimed "the complement was disarmed above" — a log line asserting an action that had not run.
-    # The `FALLBACK_ARM_MAX=0` contract (:184-185) is exactly "the pool is RELEASED and the engaging
+    # The `FALLBACK_ARM_MAX=0` contract (:188-190) is exactly "the pool is RELEASED and the engaging
     # pass refuses", so the release is the part that must happen first; measured before this fix,
     # cap=0 produced `rc=1` with **0** PUTs, stranding `ubuntu-latest` on every pool member where it
     # keeps accepting CI and is never swept, because every later pass refuses for the same reason.

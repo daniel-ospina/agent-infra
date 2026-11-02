@@ -443,7 +443,7 @@ GATE_UNDER_TEST_ORIG="$GATE_UNDER_TEST"
 # ⛔ A missing/unreadable default is FATAL, not silently 60 — an absent read must never read as a value.
 GH_THRESHOLD_DEFAULT="$(sed -n 's/^QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-\([0-9][0-9]*\)}".*/\1/p' "${GATE_UNDER_TEST:-$GATE}" | head -1)"
 if [ -z "$GH_THRESHOLD_DEFAULT" ]; then
-  echo "❌ FATAL: cannot read QUEUE_THRESHOLD's own default out of $GATE — the suite refuses to guess it" >&2
+  echo "❌ FATAL: cannot read QUEUE_THRESHOLD's own default out of ${GATE_UNDER_TEST:-$GATE} — the suite refuses to guess it" >&2
   exit 3
 fi
 
@@ -1055,7 +1055,7 @@ KEEP_STATE=1
 run_gate partial GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=1 GH_POOL_IDS="101 102" \
   CI_GATE_QUEUE_THRESHOLD=1 --
 assert_eq "$RC" "0" "the retry pass exits 0"
-assert_contains "$OUT" "set_labels ok=2 fail=0" "the retry pass re-applies the labels to the WHOLE pool"
+assert_contains "$OUT" "set_labels ok=2 fail=0" "the retry pass re-applies the labels to the whole ARM (the whole pool only when |pool| <= cap)"
 assert_contains "$OUT" "TRANSITION unknown -> local" "the retry pass records the transition once it converged"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "the retry pass records mode=local"
 
@@ -1097,7 +1097,7 @@ assert_contains "$OUT" "armed_ids=[101,102]" "(cap2) exactly two ids are armed"
 assert_not_contains "$OUT" "armed_ids=[101,102,103" "(cap2) a THIRD id is not armed — at most 2 means at most 2"
 assert_contains "$OUT" "disarming=[103,104,105]" "(cap2) the other three are disarmed"
 
-# (cap0) the DOCUMENTED OFF SWITCH (:184-185, "the fallback is DISARMED: the pool is released and the
+# (cap0) the DOCUMENTED OFF SWITCH (:188-190, "the fallback is DISARMED: the pool is released and the
 # engaging pass refuses"). ⛔ This is the review P1 that had shipped: the empty-arm refusal used to
 # `return 1` BEFORE the complement sweep while its message claimed "the complement was disarmed above".
 # Measured then: `rc=1` with **0** PUTs, so every pool member kept `ubuntu-latest` from an earlier pass,
