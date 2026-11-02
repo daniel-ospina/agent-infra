@@ -7555,12 +7555,30 @@ RAIL_POLL_TICKS=0
 # fail-safe re-run waits, and it is EXPRESSED IN TERMS OF THE KNOBS so that raising
 # ADMIN_MERGE_FIRST_CHECKS_CEILING raises the deadline with it (cross-checked in
 # `validate_rail_bounds`).
-RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$((FIRST_CHECKS_CEILING + FAILSAFE_RERUN_TIMEOUT * 4))}"
+# ⛔ SOURCE-TIME ARITHMETIC MUST NOT READ AN UNVALIDATED KNOB (#1690's class, re-hit here).
+# The two lines below run when the file is SOURCED, but `validate_timing_knobs` only runs
+# inside `main()` — so the derivation would be the first thing to touch a knob nobody has
+# validated yet. `018064` is a fine DECIMAL to the validator and ILLEGAL OCTAL to the
+# arithmetic, so the shell died with `value too great for base` at this line instead of
+# emitting the validator's NAMED refusal. Measured on the composed head: the `(P1-18)` arms
+# for ADMIN_MERGE_FIRST_CHECKS_CEILING and ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK both reddened,
+# the message naming a line number instead of a knob.
+# So an operand that is not a plain positive decimal yields 0 here, and the derived default
+# becomes 0. That value is never USED: `validate_timing_knobs` refuses the malformed knob BY
+# NAME and exits before any rail logic runs, and a genuinely-0 deadline (an operator-supplied
+# junk ADMIN_MERGE_RAIL_DEADLINE) is then refused BY NAME by `validate_rail_bounds`.
+_as_dec_or_zero() {
+  case "$1" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  if counter_has_leading_zero "$1"; then printf '0'; return 0; fi
+  printf '%s' "$1"
+}
+RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$(( $(_as_dec_or_zero "$FIRST_CHECKS_CEILING") + $(_as_dec_or_zero "$FAILSAFE_RERUN_TIMEOUT") * 4 ))}"
 # TTL is DERIVED from the deadline so the two can never cross: a lease must outlive the
 # attempt that holds it, or a rail still running inside its own deadline could have its
 # lease stolen and two rails would then hold the same PR. `validate_rail_bounds` enforces
-# the relation for any operator override.
-RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$((RAIL_DEADLINE + 3600))}"
+# the relation for any operator override. The +3600 goes through the same guard, so a junk
+# ADMIN_MERGE_RAIL_DEADLINE cannot crash the derivation either.
+RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$(( $(_as_dec_or_zero "$RAIL_DEADLINE") + 3600 ))}"
 # How many 50ms slices a rail waits for an incumbent lease to publish its pid before it
 # decides. 40 = 2s; the publish gap is microseconds, so this only ever absorbs the gap.
 RAIL_LOCK_PUBLISH_WAIT="${ADMIN_MERGE_LOCK_PUBLISH_WAIT:-40}"
