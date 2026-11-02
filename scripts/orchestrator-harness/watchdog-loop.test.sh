@@ -8,14 +8,28 @@
 #
 # Everything here is scratch: $HOME and the state dir are throwaway, the controller is a `sleep` whose
 # command line ends in `orch-loop.sh` (so the pid/identity check is exercised for real), and the
-# platform restart is a STUB we count. No launchctl, no systemctl, no real stack, no network.
+# platform restart is a STUB we count. No REAL launchctl, no systemctl, no real stack, no network.
+# ⛔ "NO REAL launchctl" IS NOW A PRODUCT PROPERTY, NOT A PROMISE (§8b broke it, review P1 #1986).
+# §8b is the one case that must enter the Darwin arm, so it reaches it only behind a launchctl SHIM on
+# PATH *and* `WATCHDOG_LAUNCHCTL_PIN` — the resolved path the product is allowed to execute. A shim that
+# failed to be written therefore REFUSES (case 8b(e) proves it) instead of falling through to the live
+# `/bin/launchctl kickstart -k gui/501/…`: under `set -uo pipefail` with no `-e`, a failed stub write did
+# exactly that, and `mk_darwin_bin`'s status was never checked.
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 WD="$SELF_DIR/watchdog-loop.sh"
 [ -f "$WD" ] || { echo "FATAL: $WD not found" >&2; exit 1; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/watchdog-loop-test.XXXXXX")"
+# ⛔ THE WORK ROOT IS PHYSICAL. The product resolves its own directory with `pwd -P` (§5f's copy of the
+# watchdog derives its SECOND scan pattern from `$SELF_DIR`), while `mktemp -d` under the macOS default
+# TMPDIR hands back the `/var/folders/…` spelling of a `/private/var/folders/…` path. A fixture controller
+# spawned from the unphysical spelling is therefore invisible to the physical pattern, and 5f read DOWN
+# for a controller that WAS running — 3 reds on a correct implementation, measured 2026-11-01 and
+# reproduced identically on a pristine `git worktree` of the same head with the default TMPDIR, green
+# under `TMPDIR=/private/tmp`. Resolving the root ONCE here fixes every case that spawns a fixture by
+# path; narrowing it to 5f would leave the next case to rediscover it.
+WORK="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/watchdog-loop-test.XXXXXX")" && pwd -P)"
 # ⛔ The fake controllers are recorded in their case's .orch.lock (that is the file the watchdog reads),
 # never in a *.ctrlpid this trap invented: the earlier trap killed nothing and every run leaked its
 # fixture processes — `sleep 300`s whose argv ends in `orch-loop.sh`, i.e. exactly the noise the
@@ -75,7 +89,7 @@ run() {
       WATCHDOG_LOG="$C/state/controller-watchdog.log" \
       WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=780 MAX_CONSEC="${MAXC:-3}" \
       ${@:+"/usr/bin/env" "$@"} bash "${RUNSCRIPT:-$WD}" >"$C/pass.out" 2>&1
-  grep -m1 -E 'verdict=(HEALTHY|UNCERTAIN|WEDGED|DOWN|WEDGED_STOPPED|DOWN_STOPPED|RECOVERED|STILL_NOT_CYCLING|PROBE_RESTART|RESTART-FAILED|RESTART-SUPPRESSED)' "$C/pass.out" || true
+  grep -m1 -E 'verdict=(HEALTHY|UNCERTAIN|WEDGED|DOWN|WEDGED_STOPPED|DOWN_STOPPED|RECOVERED|STILL_NOT_CYCLING|PROBE_RESTART|RESTART-FAILED|RESTART-SUPPRESSED|RESTART-REFUSED|RESTART-UNAVAILABLE)' "$C/pass.out" || true
 }
 # runall — every line the pass emitted (the post-restart re-check is a SECOND line, and a case about
 # recovery must read it; `run` returns the DECISION line, so a STILL_NOT_CYCLING follow-up cannot mask it).
@@ -401,6 +415,168 @@ env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/
     WATCHDOG_NO_RESTART=1 SETTLE=0 PATH="$C/bin:$PATH" bash "$WD" >/dev/null 2>&1
 assert_contains "$(grep -m1 RESTART-SUPPRESSED "$C/state/l")" "RESTART-SUPPRESSED" "WATCHDOG_NO_RESTART reaches the platform verb and is taken"
 assert_eq "$([ -f "$C/launchctl.calls" ] && echo 1 || echo 0)" "0" "…and a launchctl shim on PATH records ZERO calls (the live verb was never reached, even though this run had no stub)"
+
+# ═══ 8b. REMOVED vs LOADED — WHICH launchd verb, decided by a MEASURED state (#1986) ═══════════
+echo "── 8b. a REMOVED controller job is BOOTSTRAPPED; a loaded one is KICKSTARTED"
+# ⛔ WHAT THIS ARM EXISTS FOR. KeepAlive cannot restart a service that is no longer in the domain
+# (`launchctl unload -w` / a `bootout` whose `bootstrap` failed: measured five times on 2026-10-17),
+# and `kickstart -k` exits non-zero for ever on such a label — so before this arm the ONE restart the
+# watchdog issues could never restore a REMOVED controller, and nothing said so. The recovery belongs
+# HERE, in the tracked agent: `templates/launchd/RETIRED` retired the second launchd watchdog because
+# two loaded watchdogs are two MUTATING actors on one controller, and `fleet-liveness` names this file
+# as the replacement.
+# ⛔ IT IS DRIVEN WITH NO `WATCHDOG_RESTART_CMD`: the stub seam returns BEFORE the platform arm, so a
+# case that kept it would assert nothing about the verb — the vacuity case 8 records. `uname` is shimmed
+# (this suite runs on Linux) and `launchctl` records every argv, so the assertions are about the verb
+# that was actually issued.
+mk_darwin_bin() { # <print-rc> <print-output> [non-print-rc] → $C/bin/{uname,launchctl}
+  mkdir -p "$C/bin" 2>/dev/null
+  printf '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; exit 0; fi\nexec /usr/bin/uname "$@"\n' > "$C/bin/uname" 2>/dev/null
+  {
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$C/launchctl.calls"
+    # `%b`, because a REAL `launchctl print` answer is often TWO lines — a not-found read is
+    # `Bad request.` THEN `Could not find service …` — and the fixtures below carry that measured shape.
+    printf 'if [ "$1" = print ]; then printf "%%b\\n" "%s"; exit %s; fi\nexit %s\n' "$2" "$1" "${3:-0}"
+  } > "$C/bin/launchctl" 2>/dev/null
+  chmod +x "$C/bin/uname" "$C/bin/launchctl" 2>/dev/null
+  # ⛔ NO `set -e` HERE, SO NOBODY CHECKS THIS RETURN VALUE: the caller must, with `darwin_stub_ok`.
+}
+# ⛔ THE DARWIN ARM IS ENTERED ONLY BEHIND A PROVABLE SHIM. This is the precondition, not a comment: the
+# shim must exist, be executable, and be the binary that `launchctl` actually resolves to on the fixture
+# PATH. If any of that is false the case does NOT run — a failed stub write must never reach the host's
+# real launchctl, which is the machine the suite is running on.
+darwin_stub_ok() {
+  [ -x "$C/bin/launchctl" ] || return 1
+  [ -x "$C/bin/uname" ] || return 1
+  [ "$(PATH="$C/bin:$PATH" command -v launchctl 2>/dev/null)" = "$C/bin/launchctl" ] || return 1
+  return 0
+}
+removed_pass() { # <pass-output-file>
+  if ! darwin_stub_ok; then
+    bad "the launchctl/uname shim is NOT in place — the Darwin arm was NOT entered (a stub write that failed must never reach the real launchctl)"
+    : > "$1"; return 1
+  fi
+  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+      WATCHDOG_PLIST="$C/stack.plist" WATCHDOG_LAUNCHCTL_PIN="$C/bin/launchctl" SETTLE=0 \
+      LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$1" 2>&1
+}
+# (a) ABSENT from both domains → enable + bootstrap from the plist, and NEVER a kickstart.
+# ⚠ THE FIXTURE IS THE MEASURED ANSWER, NOT A TIDY ONE: a real not-found read is rc 113 and its FIRST
+# line is `Bad request.` (verified on this box, gui/ and user/ alike). The old comment in the product
+# called that first line the UNREADABLE marker — it is the not-found marker, and this fixture is what
+# pins the difference (see (d) for the genuinely unreadable read).
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "bootstrap gui/$(id -u) $C/stack.plist" "a REMOVED job is BOOTSTRAPPED from its rendered plist"
+assert_contains "$CALLS_OUT" "enable gui/$(id -u)/com.eldato.orchestrator-stack" "…after ENABLE, because a -w unload leaves a persistent Disabled override that makes bootstrap a silent no-op"
+assert_absent "$CALLS_OUT" "kickstart" "…and NO kickstart was issued for a job launchd does not hold (it could only fail)"
+assert_contains "$(grep -m1 -E 'verdict=(DOWN|WEDGED)' "$C/state/l")" "restart=1" "…the pass still reports the restart it attempted"
+# (b) LOADED → the wedge-curing kickstart, and NO bootstrap (a second bootstrap is a no-op at best
+#     and an error at worst; the state was MEASURED as present).
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 0 'com.eldato.orchestrator-stack = {\n\tactive count = 0\n\tlast exit code = 0\n}'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "kickstart -k gui/$(id -u)/com.eldato.orchestrator-stack" "a LOADED job still takes kickstart -k"
+assert_absent "$CALLS_OUT" "bootstrap" "…and is never re-bootstrapped underneath a live controller"
+# (c) A REMOVED job with NO plist is REPORTED, not guessed at: there is nothing to bootstrap, and a
+#     silent success here would claim a recovery that cannot happen.
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/pass.out")" "RESTART-UNAVAILABLE" "a REMOVED job with no plist on disk reports RESTART-UNAVAILABLE"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and issues no bootstrap with nothing to load"
+# (d) AN UNREADABLE READ IS NOT "ABSENT". ⚠ THE FIXTURE USED TO BE rc 1 `Bad request.`, WHICH IS NOT A
+#     SHAPE launchd PRODUCES: `Bad request.` is the first line of a NOT-FOUND read (rc 113 — case (a)),
+#     and the measured UNREADABLE read is `rc 64` + `Unrecognized target specifier.` for a malformed
+#     target. So the old case pinned a fixture nobody could reproduce, and the comment above it taught
+#     the wrong marker. The polarity under test is unchanged and still the point: an unreadable state
+#     must take `kickstart` (which cannot double-load), never a bootstrap.
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 64 'Unrecognized target specifier.'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "kickstart -k" "an UNREADABLE state (rc 64, a measured answer) takes kickstart, not bootstrap"
+assert_absent "$CALLS_OUT" "bootstrap" "…never a bootstrap decided from an error message"
+
+# ── 8b(e)-(h): THE THREE WAYS THIS ARM COULD STILL HURT THE BOX ──────────────────────────────────
+# (e) THE GUARD REFUSES WHEN THE SHIM IT WAS PINNED TO IS NOT THERE (review P1, #1986). The pin names a
+#     path; the shim answering on PATH is a DIFFERENT one. That is exactly the bookkeeping a failed stub
+#     write leaves behind, and the run must issue NOTHING. ⛔ THE THING ON PATH IS A DECOY THAT RECORDS,
+#     never the host's real launchctl — so if the guard did NOT refuse, this case shows the verb in the
+#     decoy's log instead of mutating the machine running the suite.
+echo "── 8b(e). a pin that is not the launchctl on PATH refuses every verb"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+: > "$C/launchctl.calls"
+if ! darwin_stub_ok; then
+  bad "8b(e): the decoy shim could not be staged — case NOT run"
+else
+  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+      WATCHDOG_PLIST="$C/stack.plist" WATCHDOG_LAUNCHCTL_PIN="$C/pinned-stub-that-is-not-there" SETTLE=0 \
+      LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
+  assert_contains "$(cat "$C/state/l" 2>/dev/null)" "verdict=RESTART-REFUSED" "a mismatched WATCHDOG_LAUNCHCTL_PIN REFUSES instead of running the verb"
+  assert_contains "$(grep -m1 RESTART-REFUSED "$C/state/l" 2>/dev/null)" "NO launchctl verb was issued" "…and says so in the line itself"
+  assert_eq "$(cat "$C/launchctl.calls" 2>/dev/null | wc -l | tr -d ' ')" "0" "…and NOTHING ran — not even the state read (the decoy recorded zero calls)"
+  assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…and the refusal is not reported as a FAILED verb (nothing was executed)"
+fi
+
+# (f) A REMOVED JOB OVER A **LIVING** CONTROLLER IS NEVER BOOTSTRAPPED (review P1, #1986). `WEDGED` is a
+#     state of a LIVE controller — `pid_is_controller` proved the pid alive — so a `bootstrap` here puts a
+#     SECOND controller beside it (`orch-loop.sh:1546-1551` only makes the newcomer defer while the first
+#     is alive, so the repair leaves two processes on one PR queue), and over a job an operator
+#     deliberately stopped it reverses that stop. The trigger must be "the controller is GONE".
+echo "── 8b(f). a REMOVED job over a LIVE (wedged) controller is REFUSED, not bootstrapped"
+newcase; start_ctrl; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/pass.out")" "verdict=WEDGED" "the living controller is observed as WEDGED (its pid is alive)"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and a REMOVED job is NOT bootstrapped beside a LIVE controller"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "kickstart" "…nor kickstarted: the job is not in the domain, so that verb could only fail"
+assert_contains "$(grep -m1 RESTART-REFUSED "$C/state/l" 2>/dev/null)" "pid=$CPID" "…the refusal NAMES the live pid it refused to duplicate"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "STILL_NOT_CYCLING" "…and a refusal is not presented as a restart that did not work"
+# and the contrast that makes it a TRIGGER and not a ban: the same REMOVED state with the controller GONE
+# does bootstrap — case (a) above, whose lock names a dead pid.
+
+# (g) A JOB LOADED IN `user/` IS KICKSTARTED IN `user/` (review P2, #1986). The read walks both domains,
+#     so a job loaded from an SSH session is correctly NOT "REMOVED" — but a `gui/`-only VERB could never
+#     reach it, which is the same defect from the other side.
+echo "── 8b(g). a job loaded in user/<uid> is kickstarted in that domain"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mkdir -p "$C/bin" 2>/dev/null
+printf '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; exit 0; fi\nexec /usr/bin/uname "$@"\n' > "$C/bin/uname" 2>/dev/null
+cat > "$C/bin/launchctl" 2>/dev/null <<'EOS'
+#!/bin/sh
+printf '%s\n' "$*" >> "${LAUNCHCTL_CALLS:-/dev/null}"
+if [ "$1" = print ]; then
+  case "$2" in
+    user/*) printf 'com.eldato.orchestrator-stack = {\n\tpid = 4242\n\tlast exit code = 0\n}\n'; exit 0 ;;
+  esac
+  printf 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501\n'
+  exit 113
+fi
+exit 0
+EOS
+chmod +x "$C/bin/uname" "$C/bin/launchctl" 2>/dev/null
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "kickstart -k user/$(id -u)/com.eldato.orchestrator-stack" "a user/<uid>-loaded job takes kickstart IN user/<uid>"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and is never re-bootstrapped"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-UNAVAILABLE" "…nor reported as unavailable"
+
+# (h) A REFUSED `enable` IS RESTART-FAILED, NOT STILL_NOT_CYCLING (review P2, #1986). `enable … || true`
+#     used to swallow the failure and fall through to a `bootstrap` of a label that may still be disabled —
+#     a documented silent no-op that can exit 0 — so the pass reported "one restart did not restore
+#     cycling" for a restart that never ran.
+echo "── 8b(h). a failed enable stops the arm and is reported as RESTART-FAILED, naming the verb"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501' 1
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "enable " "the arm did try enable"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and did NOT bootstrap a label that may still be disabled"
+assert_contains "$(grep -m1 RESTART-FAILED "$C/state/l" 2>/dev/null)" "verb=launchctl enable" "…a failed enable is RESTART-FAILED, and the line NAMES the verb"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "STILL_NOT_CYCLING" "…instead of STILL_NOT_CYCLING, which claims a restart was attempted"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
