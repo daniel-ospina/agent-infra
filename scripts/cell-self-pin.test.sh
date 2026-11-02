@@ -445,6 +445,28 @@ else bad "a refused install (%-specifier) REPLACED the placed pass"; cp "$T/plac
 # as 0” could never prevent the false PASS it described and could only REFUSE a valid unit. A rule with a
 # false premise has no doctor worth writing; it was removed (verified against the man page, not the code).
 refuses 'a SuccessExitStatus WITHOUT 11 (only 0) — a mend would be an unhealable RED' "$(doctor_rw no11 's|^SuccessExitStatus=.*$|SuccessExitStatus=0|')" "$T/u31" 'must include 11'
+# ⛔ A LATER EMPTY `SuccessExitStatus=` IS A LIST RESET, NOT A NO-OP. `systemd.service(5)`: "if the empty
+# string is assigned to this option, the list is reset, all prior assignments … will have no effect". So a
+# unit carrying the template's `SuccessExitStatus=0 11` AND an empty assignment has an EFFECTIVE vocabulary
+# of nothing — 11 is green no more, and every mend becomes an unhealable RED (#3133), the exact class the
+# required-11 rule above exists to prevent. A line reader latches 11 from the first line and never sees the
+# reset, so this installed at rc=0 before the rule existed (MEASURED). The doctor has to place the empty
+# assignment AFTER the real one and INSIDE `[Service]` — appending it at EOF would land it in `[Install]`,
+# which systemd ignores, and the leg would then pass on a file that is not the defect.
+d_reset="$T/doctored-sstreset"
+mkdir -p "$d_reset" && cp "$TPL/cell-self-pin.timer" "$d_reset/"
+awk '{print} /^SuccessExitStatus=/{print "SuccessExitStatus="}' "$TPL/cell-self-pin.service" >"$d_reset/cell-self-pin.service"
+refuses 'an EMPTY SuccessExitStatus= after the real one (a LIST RESET)' "$d_reset" "$T/u31c" 'LIST RESET'
+# …and the NON-VACUITY control for that rule: a reset FOLLOWED by a real value is a VALID list, so it must
+# INSTALL. Without this leg the cheap fix (refuse any empty `SuccessExitStatus=`) would pass the doctor while
+# refusing a correct unit.
+d_resetrf="$T/doctored-sstresetrefill"
+mkdir -p "$d_resetrf" && cp "$TPL/cell-self-pin.timer" "$d_resetrf/"
+awk '{print} /^SuccessExitStatus=/{print "SuccessExitStatus="; print "SuccessExitStatus=11"}' "$TPL/cell-self-pin.service" >"$d_resetrf/cell-self-pin.service"
+out_resetrf="$(install_doctored "$d_resetrf" "$T/u31d")"; rc_resetrf=$?
+[ "$rc_resetrf" -eq 0 ] && ok "ACCEPTS a reset FOLLOWED by SuccessExitStatus=11 — the effective list is real, the reset is honoured not refused" \
+  || bad "refused a valid unit whose empty SuccessExitStatus= is followed by 11 — the guard refuses the SPELLING instead of evaluating the LIST: $out_resetrf"
+cp "$T/placed.before" "$PLACED"   # the refusal legs below re-assert that a REFUSAL cannot replace it
 # …and the NON-VACUITY control for the removal: `0` is not required, so a unit listing only 11 must
 # INSTALL. Without this leg the rule could be re-added (or the removal be a no-op) and nothing would notice.
 d_ok11="$(doctor_rw ok11only 's|^SuccessExitStatus=.*$|SuccessExitStatus=11|')"
@@ -950,6 +972,76 @@ if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
   esac
   [ "$rc" -eq 1 ] && ok "…and it decides DRIFT against the record (exit 1)" \
     || bad "the remote-only ref was decided as rc=$rc, expected 1=DRIFT: $out"
+  # ⛔ THE PASS TOO, NOT ONLY `--status`. The verb that actually runs on the ten-minute timer is the PASS,
+  # and every leg above drives `--status`: reverting the pass's decision line to `${HARNESS_REF}^{commit}`
+  # left this suite at 228 ok / 0 failed (MEASURED), i.e. the half of the fix that matters was ungated. The
+  # 6b pass leg cannot discriminate either — `git fetch origin rel` also moves `refs/remotes/origin/rel`, so
+  # old and new code read the same commit for that spelling. It DOES discriminate here: the fixture's local
+  # `main` sits at C1 (the record), while the fetch brings C2.
+  # The run happens in a COPY of the home so a pass that applies cannot move the shared fixture's record
+  # under the legs that follow, and the record is re-pointed at C1 explicitly rather than inherited.
+  MAIN2="$(git -C "$T/origin.git" rev-parse main 2>/dev/null)"
+  cp -a "$T/home" "$T/home-pass"
+  printf '%s\n' "$T/home-pass/harness/pintree" >"$T/home-pass/.harness-path"
+  git -C "$T/home-pass/harness/pintree" checkout -q --detach "$FIRSTC" 2>/dev/null \
+    || bad "could not place the pass-side fixture's record at ${FIRSTC:-<unreadable>}"
+  if [ "$(git -C "$T/home-pass/harness/pintree" rev-parse HEAD 2>/dev/null)" = "$FIRSTC" ]; then
+    ok "(control) the pass-side fixture's record is C1 while the fetched ref is C2 — the legs below discriminate by VALUE"
+  else bad "the pass-side fixture's record is not C1, so the legs below could pass vacuously"; fi
+  out="$(runat "$T/home-pass" HARNESS_REF=refs/heads/main bash "$PIN" 2>&1)"; rc=$?
+  case "$out" in
+    *"target=${MAIN2:-<unreadable>}"*) ok "the PASS acts on the COMMIT the fetch brought for refs/heads/main, not the stale local branch" ;;
+    *) bad "the PASS did not resolve HARNESS_REF=refs/heads/main to the fetched commit ${MAIN2:-<unreadable>} — it decided on the LOCAL branch the fetch never moved, which is #3194 through the knob: $out" ;;
+  esac
+  [ "$rc" -ne 0 ] && ok "…and a record at C1 against that C2 tick is a non-zero pass, not a green no-op" \
+    || bad "the PASS reported success against a newer fetched tip (rc=$rc) — a false green on the timer's own verb: $out"
+  out="$(runat "$T/home-pass" HARNESS_REF=main bash "$PIN" 2>&1)"; rc=$?
+  [ "$rc" -ne 0 ] && ok "…and the BARE branch spelling ('main') is not decided on the stale local branch either" \
+    || bad "the PASS with HARNESS_REF=main answered rc=$rc — a bare spelling read the local branch: $out"
+  # The pass-side PEELING control: `attip` is an annotated tag ON the record's commit, so a pass that
+  # compares the TAG OBJECT sha to a commit reads DRIFT forever, and one that peels reads current.
+  out="$(runat "$T/home-pass" HARNESS_REF=attip bash "$PIN" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && ok "…and a PASS on an annotated tag AT the record converges (exit 0), so the pass peels too" \
+    || bad "the PASS on an annotated tag pointing at the record's own commit exited $rc, not 0=current — it read a tag object where a commit belongs: $out"
+  # ⛔ AND `FETCH_HEAD` IS NOT OURS TO READ. It is a plain mutable file in the worktree, bound to no run: any
+  # other git process in the SAME tree that fetches between our fetch and our read becomes OUR result. That
+  # coexistence is by design here — `cloud-cell-supervisor.sh:1698`/`:2116` run `git fetch origin main` in
+  # this repository, and bring-up re-arms `eldato-harness-apply.timer` beside this unit. MEASURED on the
+  # pre-fix code: the record sat at MAIN's tip, our ref was `origin/rel` (one commit ahead), a coexisting
+  # `git fetch origin main` landed, and `--status` printed a MAIN commit under the `origin/rel` label and
+  # answered `current` + exit 0 — a foreign fetch greening a stale layer. A race is not testable by timing,
+  # so the foreign writer is INTERPOSED deterministically: a `git` shim that delegates everything and,
+  # after any successful `fetch`, overwrites FETCH_HEAD with main's tip — exactly what the other actor does.
+  # Only a decision that reads a ref THIS RUN WROTE can survive it.
+  REALGIT="$(command -v git)"
+  d_race="$T/fakebin-race"; mkdir -p "$d_race"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '"%s" "$@"; rc=$?\n' "$REALGIT"
+    printf 'case " $* " in *" fetch "*)\n'
+    printf '  if [ "$rc" -eq 0 ] && [ -n "${RACE_REPO:-}" ] && [ -n "${RACE_SHA:-}" ]; then\n'
+    printf '    fp="$("%s" -C "$RACE_REPO" rev-parse --git-path FETCH_HEAD 2>/dev/null)"\n' "$REALGIT"
+    printf '    case "$fp" in /*) ;; *) fp="$RACE_REPO/$fp" ;; esac\n'
+    printf '    printf "%%s\\t\\tbranch main of a foreign fetch\\n" "$RACE_SHA" >"$fp" 2>/dev/null\n'
+    printf '  fi ;;\n'
+    printf 'esac\n'
+    printf 'exit $rc\n'
+  } >"$d_race/git"
+  chmod +x "$d_race/git"
+  RELRACE="$(git -C "$T/origin.git" rev-parse rel 2>/dev/null)"
+  cp -a "$T/home" "$T/home-race"
+  printf '%s\n' "$T/home-race/harness/pintree" >"$T/home-race/.harness-path"
+  # The record is AT main's tip and the ref we ask about is `rel` (a commit ahead), so the defended reading
+  # (the tip of `rel`) is DRIFT, while the foreign reading (main's tip) equals the record and would be green.
+  git -C "$T/home-race/harness/pintree" checkout -q --detach "$MAIN2" 2>/dev/null \
+    || bad "could not place the race fixture's record at main's tip"
+  out="$(runat "$T/home-race" PATH="$d_race:$T/fakebin-none:$PATH" RACE_REPO="$T/home-race/harness/pintree" \
+           RACE_SHA="$MAIN2" HARNESS_REF=origin/rel bash "$PIN" --status 2>&1)"; rc=$?
+  case "$out" in
+    *'verdict        current'*) bad "a FOREIGN fetch of main greened our layer: --status read FETCH_HEAD, which the other actor in this tree rewrites, and reported 'current' for ${HARNESS_REF:-origin/rel} — a false PASS the timer would print every ten minutes: $out" ;;
+    *) if [ "$rc" -eq 1 ]; then ok "a FOREIGN fetch of main cannot green a stale layer — the decision reads the ref THIS RUN wrote, not FETCH_HEAD"
+       else bad "with a foreign fetch interposed, --status answered rc=$rc (expected 1=DRIFT for rel at ${RELRACE:-<unreadable>}): $out"; fi ;;
+  esac
 else bad "could not push the annotated tag — the peeling legs were not exercised"; fi
 
 # ── 7. a FALSE PASS is impossible: `apply` exiting 0 is not a convergence ─────────────────────────
