@@ -759,7 +759,7 @@ if [ "$SURFACE" -eq 1 ]; then
       # The model that holds is positional, not counted: skip wrapper words, their options and those
       # options' VALUES, then the FIRST remaining word is the COMMAND. If the command is not a shell,
       # the prefix is closed for good — nothing later can arm it.
-      _pfx=1; _seen=0; _optval=0; _wrap=""; _noexec=0
+      _pfx=1; _seen=0; _optval=0; _wrap=""; _noexec=0; _optv=""
       while [ "$_i" -lt "$_n" ]; do
         _w="${_argv[$_i]}"
         # ⛔ ARM ONLY ON A REAL INTERPRETER, IN COMMAND POSITION, AND NOT WHILE SWALLOWING AN OPTION'S
@@ -876,6 +876,13 @@ if [ "$SURFACE" -eq 1 ]; then
         # ⛔ A COMBINED OPTION CARRIES ITS OWN VALUE (`-o0`, `-n5`), so it claims nothing — otherwise
         # `stdbuf -o0 bash <path>` would eat `bash` as `-o0`'s value and lose a real launcher.
         case "$_w" in
+          +o|+O)
+            # ⛔ THE `+`-FORM OF A SHELL OPTION (review round 19, P2). It is not `-`-prefixed, so it
+            # never reaches the option arm below and used to close the prefix — leaving
+            # `bash +o noexec <gone>/orch-loop.sh`, a REAL execution (because `+o` turns noexec
+            # OFF), reported as a mention. It claims its operand like `-o`, but is never a noexec
+            # claim: `_optv` records the actual option word so only `-o noexec` disables execution.
+            if [ "$_seen" -eq 1 ]; then _optval=1; _optv="$_w"; fi ;;
           -*) # An OPTION never closes the prefix. It claims the NEXT word as its value ONLY while the
               # command is still unknown — once the command is a shell, its options are flags and the
               # next ordinary word is its SCRIPT operand (`bash -x other.sh <abs>` must stay a
@@ -906,7 +913,12 @@ if [ "$SURFACE" -eq 1 ]; then
                   # treating every shell option as a flag let that word close the prefix —
                   # `bash -o pipefail <gone>/orch-loop.sh` was a MENTION, i.e. a real execution of a
                   # GONE tree reported as nothing: the #10114 silent green, restored for that spelling.
-                  -o|-O|+o|+O|--rcfile|--init-file) _optval=1 ;;
+                  # ⛔ `+o`/`+O` ARE NOT `-`-PREFIXED, SO THEY LIVE IN THE OUTER ARM (review round 19,
+                  # P2). Listing them here was DEAD CODE: a `+o noexec` word never reaches this `-*`
+                  # arm, so it fell to the ordinary-word arm, closed the prefix, and
+                  # `bash +o noexec <gone>/orch-loop.sh` — a real execution, since `+o` turns noexec
+                  # OFF — stayed a mention. They are handled in the outer case, with the same claim.
+                  -o|-O|--rcfile|--init-file) _optval=1 ; _optv="$_w" ;;
                 esac
               else
                 case "$_w" in
@@ -969,7 +981,11 @@ if [ "$SURFACE" -eq 1 ]; then
                # word is consumed before any option test, so without this a shell told not to execute
                # anything would still nominate its script — flipping an accepted mention into a
                # fabricated `executes:`. Every other consumed value is inert.
-               [ "$_w" = noexec ] && _noexec=1
+               # ⛔ ONLY THE MINUS FORM, AND ONLY AS `-o`'s VALUE (review round 19, P2).
+               # `--rcfile noexec` / `--init-file noexec` do NOT disable execution, `+o noexec`
+               # turns noexec OFF, and a wrapper operand spelled `noexec` is unrelated — the
+               # first draft fired on the WORD alone and turned real executions into mentions.
+               if [ "$_w" = noexec ] && [ "$_optv" = "-o" ]; then _noexec=1; fi
              else
                case "${_w##*/}" in
                  # ⛔ ONLY IN COMMAND POSITION (review round 18, P1). This branch used to set `_seen`
@@ -988,10 +1004,10 @@ if [ "$SURFACE" -eq 1 ]; then
                      # all. One union rule cannot be right for all three, and the `-c` claim is the
                      # difference between `setsid -c bash <gone>/orch-loop.sh` being a mention (a live
                      # controller reported as nothing) and being caught.
-                     if [ "$_seen" -eq 1 ]; then _pfx=0; _interp=0; else _wrap="${_w##*/}"; fi ;;
+                     if [ "$_seen" -eq 1 ]; then _pfx=0; _interp=0; _seen=0; else _wrap="${_w##*/}"; fi ;;
                  *) case "$_w" in
                       *=*) : ;;                       # an env assignment is an operand, not the command
-                      *[!0-9]*) _pfx=0; _interp=0 ;;   # the COMMAND (or the script operand): closed
+                      *[!0-9]*) _pfx=0; _interp=0; _seen=0 ;;   # the COMMAND (or the script operand): closed
                     esac ;;
                esac
              fi ;;

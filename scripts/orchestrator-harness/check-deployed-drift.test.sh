@@ -628,13 +628,31 @@ done
 # branch fired on any word spelled like a shell, at any position) and the `-c` arm then nominated the
 # path — a fabricated `executes:` from a mention. And `bash -o pipefail <abs>` was a MENTION because
 # every shell option was treated as a flag, so a real launcher on a GONE tree reported nothing.
-for _m in 'echo sh -c' 'ssh box sh -c' 'man sh -c' 'bash -o noexec'; do
+for _m in 'echo sh -c' 'ssh box sh -c' 'man sh -c'; do
   printf '4264 %s %s/orch-loop.sh\n' "$_m" "$GONE" > "$TMP/ps-shmention"
   surf "$TMP/ps-shmention"
   ck "10a-3e: '$_m <abs>/orch-loop.sh' is a MENTION (no interpreter in command position)" \
      "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
 done
-for _v in 'bash -o pipefail' 'bash -O extglob'; do
+# ⛔ `-o noexec` IS A DIFFERENT MECHANISM FROM THE THREE ABOVE, SO IT GETS ITS OWN LABEL (review round
+# 19, P2): an interpreter IS in command position there; the mention comes from the shell forbidding
+# execution, not from a closed prefix. Sharing one label pointed a reader at the wrong block.
+# ⛔ AND ONLY THE MINUS FORM DISABLES EXECUTION: `+o noexec` turns noexec OFF, and `--rcfile noexec`
+# never disabled it, so those two are real executions and must stay INVOCATIONS.
+printf '4266 bash -o noexec %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-noexec"
+surf "$TMP/ps-noexec"
+ck "10a-3e: 'bash -o noexec <abs>' is a MENTION (the shell forbids execution)" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+# ⛔ `-c` IS OWNED BY THE SHELL THAT IS THE CURRENT COMMAND, NOT BY ANY EARLIER ONE (review round 19,
+# P2): `_seen` was never cleared, so `bash other.sh -c <abs>` and `busybox grep -c <abs>` nominated a
+# path that is a `$1`/grep operand — a fabricated `executes:` that also masks a real `behind:`.
+for _x in 'bash other.sh -c' 'busybox grep -c'; do
+  printf '4267 %s %s/orch-loop.sh\n' "$_x" "$GONE" > "$TMP/ps-staleseem"
+  surf "$TMP/ps-staleseem"
+  ck "10a-3e: '$_x <abs>/orch-loop.sh' is a MENTION (a closed prefix owns no -c string)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+for _v in 'bash -o pipefail' 'bash -O extglob' 'bash +o noexec' 'bash +o errexit' 'bash --rcfile noexec'; do
   printf '4265 %s %s/orch-loop.sh\n' "$_v" "$GONE" > "$TMP/ps-shopt"
   surf "$TMP/ps-shopt"
   ck "10a-3e: '$_v <abs>/orch-loop.sh' is an INVOCATION (a shell value option claims its operand)" \
