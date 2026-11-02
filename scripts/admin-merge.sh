@@ -70,8 +70,11 @@
 #      only if it has TESTED runs on main too (the same `tested` counter as
 #      precondition 1). Repos that split their lanes by TRIGGER (a
 #      `pull_request`-only lane and a `push`-only lane) have no single --workflow
-#      spanning both sides; `--any-workflow` compares against every lane on main
-#      (#1003).
+#      spanning both sides: the PR lane's base population is empty BY
+#      CONSTRUCTION, and the rail reports BASELINE-INAPPLICABLE. The remedy is
+#      `--baseline-workflow <main-lane>` — TWO names, so the reference comes from
+#      a lane that measures main (provenance), not `--any-workflow`, whose widened
+#      sample is satisfied by bookkeeping runs that measure nothing.
 #   4. THE TREE MUST BE GREEN WHERE THE RAIL CAN SEE IT. Preconditions 1-3 are
 #      all LANE-SCOPED. A lane-scoped comparison is blind to the rest of the
 #      tree, and that blindness is a false PASS at the merge level — not a
@@ -398,6 +401,7 @@
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
 #                              [--workflow <file|name>] [--any-workflow]
+#                              [--baseline-workflow <file|name>]
 #                              [--no-rerun] [--rerun-timeout S] [--dry-run]
 #                              [-- <gh pr merge flags>]
 #
@@ -429,8 +433,10 @@
 #                        most 200 lane runs per side, one Jobs-API call each), and the
 #                        posted evidence says when the reference came from a wider
 #                        window than N.
-#   --workflow <f>       the TEST lane both sides are read from (default
-#                        `python-ci.yml`). NOT cosmetic: an unfiltered main
+#   --workflow <f>       the TEST lane the PR side is read from (and the BASE
+#                        side too, unless `--baseline-workflow` names another —
+#                        see below). Default is
+#                        `python-ci.yml`. NOT cosmetic: an unfiltered main
 #                        window is dominated by cron/watchdog lanes and can
 #                        contain ZERO test runs, so the baseline extracts EMPTY
 #                        and every PR failure reads as new — the bogus zero. See
@@ -455,6 +461,42 @@
 #                        changed set (#1614), the lane is INAPPLICABLE, not
 #                        missing, and the rail drops the filter for that run AFTER
 #                        saying so — see LANE APPLICABILITY below.
+#                        ⛔ NOT A BASELINE SOURCE — A STATEMENT ABOUT REMEDIES AND
+#                        VALUES, NOT ABOUT WHAT THE CODE READS. With no
+#                        `--baseline-workflow`, `--any-workflow` STILL supplies the
+#                        base side exactly as before (this flag's default is ONE name
+#                        for both sides), and step 0b's #1614 fallback can set it with
+#                        no operator flag at all — both paths are unchanged. What is
+#                        new: (a) the BASELINE-INAPPLICABLE refusal no longer OFFERS
+#                        it as the way to a baseline, and (b) it cannot be supplied AS
+#                        the baseline's value (`--baseline-workflow any|*|all` is
+#                        refused by name; a baseline is a NAMED workflow). The reason
+#                        it is no longer offered: it widens the BASE side to a sample
+#                        whose composition is decided by whatever traffic main happens
+#                        to carry, and that sample is SATISFIED by runs that measure
+#                        nothing — measured on main's 200-run window, 187 were
+#                        `Pipeline Compliance` (issue_comment: 148 skipped, 38 success),
+#                        7 detector and 6 `CI on main`; the widening stopped at width 40
+#                        with 11 "measurements" = 8 bookkeeping + 2 detector + 1
+#                        code-lane run. Reachable is not the same as MEASURED.
+#   --baseline-workflow <f>
+#                        the workflow whose runs on the BASE branch form the
+#                        BASELINE, independent of the PR's own lane (--workflow).
+#                        Default: --workflow, so no existing invocation moves.
+#                        WHY IT EXISTS. A `pull_request`-only lane has NO runs on
+#                        main BY CONSTRUCTION (`gh run list --branch main --workflow
+#                        ci.yml` -> `[]`), so it cannot be its own baseline: the
+#                        certificate is a comparison and there is nothing to compare
+#                        against. Naming the main-side lane makes the two sides
+#                        INDEPENDENT — and the value is PROVENANCE, not reachability
+#                        (the widened union can reach a verdict too; tonight's run
+#                        reached the same 19/2 through a sample another lane's traffic
+#                        decided). With a named baseline, the reference is drawn from a
+#                        workflow that MEASURES main, and the evidence names it.
+#                        ⛔ It can only make the rail able to judge WITH provenance,
+#                        never to judge WITHOUT: an empty base population and no
+#                        --baseline-workflow is the BASELINE-INAPPLICABLE refusal at
+#                        step 2b, never a pass.
 #
 #   ── LANE APPLICABILITY (#1614) — the ONE measured fallback ──────────────
 #   Precondition 1 requires a TESTED run of the watched lane on the head. A PR
@@ -3710,6 +3752,11 @@ lane_prefix_candidates() {
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
+# #3229: the lane MAIN's side was actually read from — the named `--baseline-workflow`
+# when one was given, else the watched lane. Set by lane_parity_check and read by the
+# refusal renderer, so a base-side reason can never name the PR's lane (nor point the
+# operator at `--any-workflow`, which is not a baseline source).
+LANE_PARITY_BASE_LANE=""
 # #2842: WHICH condition left the reference EMPTY, when that condition is not an
 # unreadable list. The refusal used to assert ONE cause for every empty reference
 # ("the shard lists are not readable"), which is FALSE — and misleading in a
@@ -3753,6 +3800,23 @@ lane_parity_check() {
   # comparison is made of, and no comparison of the files can detect it. So state
   # the invariant instead of discovering it: both must be regular files, and they
   # must not be the same file.
+  # ── NAME THE LANE THAT WAS ACTUALLY READ (#3229 review) ─────────────────
+  # Every reason below is a claim about MAIN's window. With `--baseline-workflow`
+  # that window is the BASELINE lane's, so a refusal that names the PR lane sends
+  # the operator to the one lane the base side never read — and the old remedy
+  # (`--any-workflow`) is the widening this change exists to stop. `base_lane` /
+  # `base_hint` are therefore used in preference to `$WORKFLOW` / `$lane` below.
+  # Without the flag both reduce to the previous text byte-for-byte.
+  LANE_PARITY_BASE_LANE="${BASELINE_WORKFLOW:-${WORKFLOW:-any workflow}}"
+  local base_lane="$LANE_PARITY_BASE_LANE"
+  local base_hint="--workflow, or --any-workflow for a trigger-split repo"
+  local base_lane_hint="--workflow <file>"
+  local base_widen_note=" --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
+  if [ -n "${BASELINE_WORKFLOW:-}" ]; then
+    base_hint="--baseline-workflow (currently '${BASELINE_WORKFLOW}')"
+    base_lane_hint="--baseline-workflow <main-lane>"
+    base_widen_note=" --any-workflow would widen the BASE side to every workflow on main, which is not a baseline source (#3229)"
+  fi
   if [ -L "$TMP/lane-pr.txt" ] || [ -L "$TMP/lane-main.txt" ] \
      || [ "$TMP/lane-pr.txt" -ef "$TMP/lane-main.txt" ]; then
     say_err "admin-merge: ✗ the lane references are not two distinct regular files — lane coverage unverifiable (a scratch path is a symlink or is aliased onto another)"
@@ -3778,10 +3842,28 @@ lane_parity_check() {
   # (The identity check above catches the alias directly; this catches the class of
   # writes that arrive through any OTHER scratch name.)
   LANE_PR_FROZEN="$(cat "$TMP/lane-pr.txt")"
+  # ── THE BASE SIDE IS READ FROM THE BASELINE LANE WHEN ONE IS NAMED ──────────
+  # The question this gate answers is "did the PR execute every test shard MAIN's
+  # lane executed", so MAIN's lane has to be the workflow main's runs are actually
+  # drawn from — and when the operator named `--baseline-workflow`, THAT is it.
+  # Without the rebind, a pull_request-only lane is compared against main's
+  # population of a workflow that never runs there: it selects nothing and refuses
+  # with the `no EXECUTED job` reason whose remedy is `--any-workflow` — the one
+  # widening the base side must not take. `WORKFLOW`/`ANY_WORKFLOW` are `main()`'s
+  # locals, so bash's dynamic scope makes this rebind exactly what `lane_shard_set`
+  # reads. It cannot fire when no baseline is named, which is why every invocation
+  # that does not use the flag keeps its previous selector byte-for-byte.
+  local saved_workflow="${WORKFLOW:-}" saved_any="${ANY_WORKFLOW:-0}"
+  if [ -n "${BASELINE_WORKFLOW:-}" ]; then
+    WORKFLOW="$BASELINE_WORKFLOW"
+    ANY_WORKFLOW=0
+  fi
   if ! lane_shard_set --branch main "$main_runs" "$TMP/lane-main.txt"; then
+    WORKFLOW="$saved_workflow"; ANY_WORKFLOW="$saved_any"
     LANE_PARITY_REASON="main's lane runs could not be listed or read"
     return 2
   fi
+  WORKFLOW="$saved_workflow"; ANY_WORKFLOW="$saved_any"
   # #2842: main's RAW executed names, frozen for the refusal's derived retry value.
   # Read here, not later: the scratch dir is shared and a later write could alias it.
   printf '%s\n' "${LANE_SET_ALLNAMES:-}" > "$TMP/lane-main-alljobs.txt"
@@ -3829,12 +3911,12 @@ lane_parity_check() {
     # read is STATED either way, because "widened past --main-runs" is a fact the
     # operator must be able to audit.
     if [ "$main_jobs" -eq 0 ]; then
-      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
+      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector '${base_lane}': ${base_hint}) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
     else
       # #2842: the lists WERE readable — this is a NAMING mismatch, and the refusal
       # must say so rather than borrow the unreadable-list wording above.
       LANE_PARITY_EMPTY_KIND="family"
-      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: --workflow <file>. --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
+      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: ${base_lane_hint}.${base_widen_note}"
     fi
     return 2
   fi
@@ -6363,6 +6445,13 @@ build_evidence() {
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
   local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}" exempt_raw="${12:-}"
   local unattr_tokens="${13:-}" unattr_count="${14:-0}" repro_raw="${15:-}" repro_count="${16:-0}"
+  # The BASE side's lane. It differs from the PR's lane exactly when the operator
+  # named `--baseline-workflow`, and the provenance line must say which workflow
+  # the reference was actually drawn from — that IS the point of two names. A
+  # reader who sees `of python-ci.yml` on a lane that never ran on main would be
+  # reading a claim the run did not make. Defaults to the PR lane, so a caller
+  # that does not pass it renders byte-identically to before.
+  local main_lane="${17:-$lane}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
@@ -6378,7 +6467,7 @@ build_evidence() {
   if [ -f "$main_prov" ]; then main_union_n="$(count_lines "$main_prov")"; fi
   local run_word="runs"
   if [ "$main_union_n" = "1" ]; then run_word="run"; fi
-  printf 'main compared (union of %s %s of %s): %s\n' "$main_union_n" "$run_word" "$lane" "$(provenance_ids "$main_prov")"
+  printf 'main compared (union of %s %s of %s): %s\n' "$main_union_n" "$run_word" "$main_lane" "$(provenance_ids "$main_prov")"
   printf 'PR failing: %s | main failing: %s | blocked by the decision: 0\n' "$pr_count" "$main_count"
   printf '%s\n' "$analyzed"
   # THE AUDITABLE SET, not just its verdict (#3467 item 2): the decision only
@@ -7346,6 +7435,10 @@ resolve_rail_repo() {
 main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
   local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
+  # The BASE-side lane, when the operator names one (see --baseline-workflow).
+  # Empty means "the same lane as --workflow" — the pre-existing behaviour, so a
+  # rail invocation that does not use the flag is byte-unchanged.
+  local BASELINE_WORKFLOW="" BASELINE_WORKFLOW_SET=0
   local PRINT_BOUNDS=0 PRINT_BOUNDS_RUN=""
   # Numeric operator knobs are validated BEFORE anything reads them: a value that
   # is not a positive integer makes the `-ge`/`-lt` guards return 2 and silently
@@ -7371,7 +7464,8 @@ main() {
   # the default, and the rail blocks with a remedy its own invocation could not
   # have applied. Nothing said the flag was ignored — a silent, documented
   # no-op. So the boundary is now enforced in BOTH directions:
-  #   * the two LANE-SELECTOR flags are RECOVERED from after `--` and applied as
+  #   * the THREE lane-selector flags (--workflow, --any-workflow,
+  #     --baseline-workflow) are RECOVERED from after `--` and applied as
   #     parser flags (LOUDLY, so the caller learns the boundary) — the documented
   #     order is no longer a trap; and
   #   * every OTHER post-`--` token must be one of `gh pr merge`'s own flags. An
@@ -7401,6 +7495,16 @@ main() {
       --repo) REPO="${2:-}"; shift 2 ;;
       --workflow) WORKFLOW="${2:-}"; shift 2 ;;
       --any-workflow) ANY_WORKFLOW=1; shift ;;
+      --baseline-workflow)
+        # ⛔ A TRAILING FLAG (no value) MUST BE REFUSED, NOT SHIFTED PAST THE END.
+        # `shift 2` with one argument left FAILS, leaves `$#` unchanged, and the
+        # loop re-reads the SAME token forever (stderr says "shift count out of
+        # range" once per turn, and the rail never returns). Leave the value empty
+        # and let the validation below refuse it with the documented message.
+        # (`--workflow`/`--repo`/`--main-runs` carry the same pre-existing shape;
+        # this new flag does not get to:
+        if [ $# -lt 2 ]; then BASELINE_WORKFLOW=""; BASELINE_WORKFLOW_SET=1; shift
+        else BASELINE_WORKFLOW="${2:-}"; BASELINE_WORKFLOW_SET=1; shift 2; fi ;;
       --rerun-timeout) RERUN_TIMEOUT="${2:-}"; RERUN_TIMEOUT_EXPLICIT=1; RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"; shift 2 ;;
       --no-rerun) NO_RERUN=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
@@ -7435,6 +7539,21 @@ main() {
                   exit 2
                 fi
                 RECOVERED+=(--any-workflow); shift; continue ;;
+              --baseline-workflow)
+                if [ "$ps_inline" -eq 1 ]; then
+                  say_err "admin-merge: ✗ refusing '$1' — the parser's --baseline-workflow takes its value as"
+                  say_err "   the NEXT argument and must precede the separator:"
+                  say_err "   admin-merge.sh <PR> --baseline-workflow <f> -- …"
+                  exit 2
+                fi
+                if [ $# -lt 2 ] || [ -z "${2:-}" ] || [ "${2#-}" != "$2" ]; then
+                  say_err "admin-merge: ✗ refusing '--baseline-workflow' after the '--' separator — it needs"
+                  say_err "   its value as the NEXT argument, and a flag cannot be that value. Put it BEFORE"
+                  say_err "   the separator: admin-merge.sh <PR> --baseline-workflow <file> -- <gh flags>"
+                  exit 2
+                fi
+                RECOVERED+=(--baseline-workflow "$2"); shift 2
+                continue ;;
               --workflow)
                 if [ "$ps_inline" -eq 1 ]; then
                   say_err "admin-merge: ✗ refusing '$1' — the parser's --workflow takes its value as the NEXT"
@@ -7494,6 +7613,18 @@ main() {
             esac
           done ;;
       --admin|--admin=true) shift ;;  # always added by this script
+      # ⛔ A PARSER FLAG SPELLED INLINE (`--workflow=x`, `--baseline-workflow=y`)
+      # would otherwise fall through to `-*)` and be handed to `gh pr merge`: the
+      # operator's selector is then SILENTLY IGNORED — the certificate is computed
+      # against a lane they did not ask for — and gh rejects the stray token only
+      # later, after the analysis. Refused by name, exactly as the post-`--`
+      # recovery refuses the inline spelling (the two spellings must not disagree).
+      --workflow=*|--baseline-workflow=*|--main-runs=*|--repo=*|--rerun-timeout=*)
+        say_err "admin-merge: ✗ refusing '$1' — this parser's flags take their value as the NEXT"
+        say_err "   argument, so an inline '=' spelling never reaches the rail: it would be handed"
+        say_err "   to gh instead, and the selector you wrote would be silently ignored."
+        say_err "   Write it as: ${1%%=*} <value>"
+        exit 2 ;;
       -*) case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
           MERGE_ARGS+=("$1"); shift ;;
       *)
@@ -7512,15 +7643,48 @@ main() {
     say_err "admin-merge: ⚠ parser flag(s) found AFTER the '--' separator — recovering them for the parser"
     say_err "   (only 'gh pr merge' flags belong after '--'; a lane selector is recovered instead of being"
     say_err "    handed to gh, which would reject it)."
-    say_err "   Prefer: admin-merge.sh <PR> [--workflow <f>|--any-workflow] -- <gh flags>"
+    say_err "   Prefer: admin-merge.sh <PR> [--workflow <f>|--any-workflow|--baseline-workflow <f>] -- <gh flags>"
     local ri=0 rn="${#RECOVERED[@]}"
     while [ "$ri" -lt "$rn" ]; do
       case "${RECOVERED[$ri]}" in
         --any-workflow) ANY_WORKFLOW=1; ri=$((ri + 1)) ;;
         --workflow) WORKFLOW="${RECOVERED[$((ri + 1))]:-}"; ri=$((ri + 2)) ;;
+        --baseline-workflow) BASELINE_WORKFLOW="${RECOVERED[$((ri + 1))]:-}"; BASELINE_WORKFLOW_SET=1; ri=$((ri + 2)) ;;
         *) ri=$((ri + 1)) ;;
       esac
     done
+  fi
+
+  # ── --baseline-workflow: VALIDATED BEFORE ANY CI WORK ───────────────────
+  # Three refusals, all pre-gh, because each one would otherwise be a SILENT
+  # widening of the certificate rather than an error:
+  #   * EMPTY  — an empty value cannot be distinguished from "not given", so it
+  #     would quietly fall back to --workflow, i.e. to the lane whose absence from
+  #     main is the whole reason the flag is being passed (#4078's own class).
+  #   * a FLAG  — `--baseline-workflow --any-workflow` would swallow the opt-out
+  #     as a filename and then look for a workflow literally named
+  #     `--any-workflow`; refuse the spelling instead of the symptom.
+  #   * a SENTINEL meaning "any" (`any`, `*`, `ANY`) — refused BY NAME. A widened
+  #     sample is not a baseline source (see the usage note): it is satisfied by
+  #     bookkeeping runs that measure nothing, so accepting it would restore the
+  #     exact failure this flag exists to remove. A baseline is a NAMED workflow.
+  if [ "$BASELINE_WORKFLOW_SET" -eq 1 ]; then
+    case "$BASELINE_WORKFLOW" in
+      ""|-*)
+        say_err "admin-merge: ✗ refusing --baseline-workflow '${BASELINE_WORKFLOW}' — it must name the WORKFLOW"
+        say_err "   whose runs on main form the baseline (a file or a display name), as the NEXT argument."
+        say_err "   Omit the flag entirely if the PR lane is also the main-side lane (that is the default)."
+        exit 2 ;;
+      any|ANY|Any|'*'|all|ALL)
+        say_err "admin-merge: ✗ refusing --baseline-workflow '${BASELINE_WORKFLOW}' — a baseline is a NAMED"
+        say_err "   workflow, never a widening. Widening the reference to EVERY workflow on main admits runs"
+        say_err "   that MEASURE NOTHING as measurements — measured on main's 200-run window: 187 were"
+        say_err "   'Pipeline Compliance' (issue_comment: 148 skipped, 38 success), so the widening stopped at"
+        say_err "   width 40 with 11 'measurements' = 8 bookkeeping + 2 detector + 1 code-lane run."
+        say_err "   Name the workflow whose runs on main actually measure the tree (--baseline-workflow <f>),"
+        say_err "   or record that this repo has no main-side measurement and let the rail say so."
+        exit 2 ;;
+    esac
   fi
 
   # The baseline WINDOW is an operator knob like the timing ones, and it is
@@ -8204,8 +8368,38 @@ main() {
   # Both halves of ONE measurement. The rate table alone is not enough: an empty
   # `main_signatures` makes the decision's subset rule fail CLOSED and no failure
   # is ever exempt. Neither side is drawn from the repo being merged.
+  #
+  # ── THE BASE SIDE MAY BE A DIFFERENT LANE THAN THE HEAD SIDE ─────────────
+  # `--baseline-workflow` names the workflow whose runs on MAIN are the
+  # reference; `--workflow` names the PR's own lane. The certificate is a
+  # comparison, and on a `pull_request`-only lane the base population is empty BY
+  # CONSTRUCTION, so one name cannot serve both sides.
+  # ⛔ THE DEFAULT IS THE PRE-EXISTING ONE, and it is taken HERE rather than early
+  # on purpose: step 0b's #1614 fallback REWRITES `wf_args` (to --any-workflow)
+  # when the watched lane cannot fire for this diff, and the base side must keep
+  # widening WITH it exactly as before. With no flag, `baseline_wf_args` IS
+  # `wf_args` and `blane` IS `lane`, so every invocation that does not use the flag
+  # is byte-unchanged (pinned by the suite's golden arm).
+  # ⛔ AND `--any-workflow` STILL SUPPLIES THE BASE SIDE WHEN NO BASELINE IS NAMED —
+  # unchanged, including step 0b's #1614 fallback, which can set it with no operator
+  # flag at all. The copy below is what preserves that; do not "tighten" it into a
+  # refusal. What `--any-workflow` cannot do is BE the baseline once one is named (the
+  # first branch wins) or be given AS one (`--baseline-workflow any` is refused by
+  # name, pre-gh) — that is a statement about remedies and values, not about the
+  # pre-existing read path.
+  local baseline_wf_args=() blane="$lane"
+  if [ -n "$BASELINE_WORKFLOW" ]; then
+    baseline_wf_args=(--workflow "$BASELINE_WORKFLOW")
+    blane="$BASELINE_WORKFLOW"
+  elif [ "${#wf_args[@]}" -gt 0 ]; then
+    # QUOTED, element-by-element. `--workflow` accepts a display NAME as well as a
+    # file, and a display name can contain spaces (agent-infra's own push lane
+    # shows as `CI on main`): an unquoted `${wf_args[@]}` would split it into three
+    # arguments and hand the parser a mangled selector.
+    baseline_wf_args=("${wf_args[@]}")
+  fi
   local main_status=0
-  run_failure_set --main-union-rates "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+  run_failure_set --main-union-rates "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${baseline_wf_args[@]+"${baseline_wf_args[@]}"} \
     --exclude "$head" --provenance "$TMP/main-runs.txt" --runs-report "$TMP/main-report.txt" \
     > "$TMP/main-rates.txt" 2> "$TMP/main-drops.err" || main_status=$?
   [ -s "$TMP/main-drops.err" ] && cat "$TMP/main-drops.err" >&2
@@ -8273,7 +8467,7 @@ main() {
   # its drops are the same tokens the rate pass already counted — capturing them
   # into the rate file would DOUBLE the count in the evidence. They are re-emitted
   # for visibility and deliberately NOT counted.
-  run_failure_set --main-union-signatures "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+  run_failure_set --main-union-signatures "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${baseline_wf_args[@]+"${baseline_wf_args[@]}"} \
     --exclude "$head" --runs-report "$TMP/main-sig-report.txt" \
     > "$TMP/main-signatures.txt" 2> "$TMP/main-sig-drops.err" || main_sig_status=$?
   [ -s "$TMP/main-sig-drops.err" ] && cat "$TMP/main-sig-drops.err" >&2
@@ -8334,8 +8528,10 @@ main() {
   # OUTCOME of a comparison that happened, "never tested main" is a
   # MISCONFIGURATION in which none did, and a reader must tell them apart. Repos
   # that split their lanes by trigger (a pull_request-only lane and a push-only
-  # lane — this one does) have no single --workflow spanning both sides, which is
-  # what --any-workflow is for (#1003).
+  # lane — this one does) have no single --workflow spanning both sides. The
+  # remedy for that is `--baseline-workflow <main-lane>`: TWO names, so the
+  # reference is drawn from a lane that MEASURES main. It is NOT `--any-workflow`
+  # (see BASELINE-INAPPLICABLE below for the measurement that rules it out).
   local main_tested main_completed
   # The EMPTY-baseline reason, computed ONCE at step 2b-bis and reused verbatim in the
   # posted evidence's `main side:` line, so stdout and the durable artifact cannot
@@ -8344,15 +8540,57 @@ main() {
   main_tested="$(report_value "$TMP/main-report.txt" tested)"
   main_completed="$(report_value "$TMP/main-report.txt" completed)"
   if ! counter_is_positive "$main_tested"; then
-    say_err "admin-merge: ✗ BLOCK — the lane '$lane' never TESTED main, so there is no baseline."
-    say_err "   main: completed=${main_completed:-0} run(s), of which tested=${main_tested:-0}."
+    # ── BASELINE-INAPPLICABLE — a FIRST-CLASS STATE, not a pass ───────────────
+    # The BASE-side population of the lane this run drew its baseline from is
+    # EMPTY, so there is nothing to compare against. On a `pull_request`-only lane
+    # that is true BY CONSTRUCTION (`gh run list --branch main --workflow ci.yml`
+    # returns `[]` because ci.yml never runs on main), so the state is a property
+    # of the LANE PAIR the operator selected, and it has exactly TWO honest exits.
+    # ⛔ IT MUST NOT SUGGEST --any-workflow. That widening admits runs that measure
+    # nothing (measured on main's 200-run window: 187 `Pipeline Compliance` —
+    # issue_comment, 148 skipped / 38 success — 7 detector, 6 `CI on main`; the
+    # widening stopped at width 40 with 11 "measurements" = 8 bookkeeping + 2
+    # detector + 1 code-lane run). A reached sample is not a measured one.
+    # ⛔ AND IT MUST NOT SOFTEN: with an empty base population and no
+    # --baseline-workflow the outcome is THIS REFUSAL, never a pass. Naming a
+    # baseline can only let the rail judge WITH provenance — never WITHOUT.
+    #
+    # WHY THE TWO NAMES EXIST AT ALL. The widened union CAN reach a verdict (it
+    # reached the same 19/2 on 2026-11-02 through an unfiltered window), so this
+    # state is not about reachability: it is about PROVENANCE. A baseline whose
+    # composition is decided by whatever traffic main happens to carry is a
+    # measurement of the wrong population, even when its arithmetic works out.
+    local baseline_source_note
+    if [ -n "$BASELINE_WORKFLOW" ]; then
+      baseline_source_note="that name came from --baseline-workflow, which you named"
+    elif [ "$ANY_WORKFLOW" -eq 1 ]; then
+      baseline_source_note="the lane filter was DROPPED for this run (--any-workflow), so EVERY workflow on main was read"
+    else
+      baseline_source_note="that name came from --workflow; no --baseline-workflow was named"
+    fi
+    say_err "admin-merge: ✗ BLOCK — BASELINE-INAPPLICABLE: the baseline lane '$blane' never TESTED main, so there is no baseline."
+    say_err "   Looked for: runs of '$blane' on main — ${baseline_source_note}."
+    say_err "   main: completed=${main_completed:-0} run(s), of which tested=${main_tested:-0} — the base population is EMPTY."
     say_err "   A rail certificate claims \"this PR carries no failure that is not already red"
-    say_err "   on main\". That claim IS a comparison. With nothing on main to compare against,"
-    say_err "   every failure this PR carries reads as new — PRE-EXISTING ones included — and a"
-    say_err "   safe merge is refused for the wrong reason."
-    say_err "   A repo can split its lanes by TRIGGER (a PR-only lane and a main-only lane), and"
-    say_err "   then no single --workflow spans both sides. Compare against every lane on main"
-    say_err "   instead: add --any-workflow BEFORE the -- separator."
+    say_err "   on main\". That claim IS a comparison, and an EMPTY comparison is not a clean"
+    say_err "   one: every failure this PR carries would read as new, PRE-EXISTING ones included,"
+    say_err "   and a safe merge would be refused for the wrong reason. A pull_request-only lane"
+    say_err "   is empty on main BY CONSTRUCTION — it cannot be its own baseline."
+    say_err "   TWO honest remedies. There is no third:"
+    say_err "   1. NAME THE WORKFLOW WHOSE RUNS ON MAIN FORM THE BASELINE — the PR's lane and the"
+    say_err "      base's lane are independent:"
+    say_err "        admin-merge.sh <PR> --workflow <pr-lane> --baseline-workflow <main-lane>"
+    say_err "      The reference is then drawn from a workflow that MEASURES main, and the posted"
+    say_err "      evidence names it ('main compared (union of N runs of <main-lane>)')."
+    say_err "   2. RECORD THAT THIS REPO HAS NO MAIN-SIDE MEASUREMENT and accept that this rail"
+    say_err "      cannot judge it. Nothing is certified then: the merge needs a different decision"
+    say_err "      (the audited AGENT_ADMIN_MERGE_OVERRIDE=1 bypass, logged as admin_merge_override),"
+    say_err "      not a wider sample."
+    say_err "   NOT --any-workflow: widening the reference to EVERY workflow on main admits runs that"
+    say_err "   MEASURE NOTHING as measurements — measured on main's 200-run window, 187 of 200 were"
+    say_err "   'Pipeline Compliance' (issue_comment: 148 skipped, 38 success), and the widening"
+    say_err "   stopped at width 40 with 11 'measurements' = 8 bookkeeping + 2 detector + 1 code-lane"
+    say_err "   run. That path can reach a verdict; it cannot say what was measured."
     exit 1
   fi
 
@@ -8375,7 +8613,7 @@ main() {
     local main_examined main_extracted
     main_examined="$(report_value "$TMP/main-report.txt" examined)"
     main_extracted="$(report_value "$TMP/main-report.txt" extracted)"
-    info "admin-merge: main's baseline is EMPTY BY MEASUREMENT — 0 failing id(s) over ${main_tested} tested run(s) of ${main_completed} completed (lane: $lane)."
+    info "admin-merge: main's baseline is EMPTY BY MEASUREMENT — 0 failing id(s) over ${main_tested} tested run(s) of ${main_completed} completed (lane: $blane)."
     # ONE predicate, and the reason it produces is used BOTH here and in the POSTED
     # EVIDENCE below (`main side:`), because the evidence body is the durable artifact
     # a human and the verifier read: `verify-admin-merge-evidence.sh` names that very
@@ -9320,7 +9558,7 @@ $attribution_line"
             say_err "   matched only workflow LIFECYCLE (bookkeeping) jobs, which measure no test."
             say_err "   That is a MISNAMED family — NOT an unreadable list and NOT a red check." ;;
           *)
-            say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
+            say_err "   lane coverage could not be established (lane: ${LANE_PARITY_BASE_LANE:-$lane}). 'Nothing was compared'"
             say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
             say_err "   readable — and an unreadable shard list is NOT an empty one." ;;
         esac
@@ -9397,15 +9635,32 @@ $attribution_line"
     # The vacuous outcome is STATED, never implied — and it states WHAT it rests
     # on: the comparison, its coverage, and per side WHY each set is empty. The
     # two are different facts and a reader must not have to guess.
+    #
+    # ⛔ AND IT MUST NAME BOTH LANES WHEN THERE ARE TWO (#3229 review). With
+    # `--baseline-workflow` the two measured sets came from DIFFERENT workflows by
+    # design, so a single `(lane: $lane)` misnames the base population — and the
+    # closing sentence, which says the zeros are 'Correct … ONLY when both sides ran
+    # the SAME lane', would contradict the run it is describing. The default renders
+    # exactly as before (the contract suite pins those bytes); the two-name run says
+    # which lane each side was measured over, and what the parity line therefore
+    # rests on.
+    local vac_lanes vac_closing
+    if [ "$blane" = "$lane" ]; then
+      vac_lanes="(lane: $lane)"
+      vac_closing="Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."
+    else
+      vac_lanes="(lanes: PR=$lane, main=$blane)"
+      vac_closing="Correct when BOTH lanes are green — and here the two sides were measured over DIFFERENT workflows by declaration (--baseline-workflow), so 'the same lane' is not the question: the per-side counters tell 'green' from 'never run', and the parity line tells whether the PR's lane executed every shard MAIN's lane executed. A wrong lane selector on either side certifies neither."
+    fi
     analyzed="$analyzed
 ⚠️ vacuous comparison — no failure was compared, because NEITHER measured set carried one.
-   measured sets: PR failing runs=0 | main failing runs=0 (lane: $lane)
+   measured sets: PR failing runs=0 | main failing runs=0 ${vac_lanes}
    lane parity: $parity_evidence
    PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
    main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). ${main_side_reason:-EMPTY, but the window published no examined/extracted counters, so its completeness is UNKNOWN.}
    main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
-   Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."
+   ${vac_closing}"
     # The widening disclosure is appended HERE, after the literal: the `lane
     # parity:` line above must stay byte-identical to what the gate and the
     # contract suite pin (#4844, #1388).
@@ -9444,7 +9699,7 @@ ${parity_forgiven_note}"
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
     "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
-    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" "$repro_line" "$repro_n" > "$TMP/evidence.md"
+    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" "$repro_line" "$repro_n" "$blane" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
