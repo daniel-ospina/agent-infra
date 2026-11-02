@@ -1788,13 +1788,18 @@ spawn_fork_state() {
   # two-fork probe, and the gate answered `ok` on a box with ONE pid of headroom, launching pi. A
   # non-numeric value on either side now REFUSES under `nodeploy`, because that is a broken instrument
   # or a broken knob, not an unmeasurable box.
-  if [ "$_sf_h" != 'unbounded' ] && ! is_num "$_sf_h"; then
-    printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} but cap_h_for_vars produced NO NUMBER (headroom='${_sf_h}') from mod=${SPAWN_GATE_CAP_MOD:-?}, so the fork floor cannot be decided"
+  # ⛔ `is_limit`, NOT `is_num` (cycle-5 review, P1 — driven): `is_num` accepts an unbounded digit
+  # string, and `[ … -lt … ]` above intmax returns 2, which is a FALSE CONDITION — so a 24-digit
+  # headroom (or knob) skipped the comparison, the gate answered `ok`, and the shim LAUNCHED pi on a
+  # box with 5 pids of headroom. The same wrap class `is_limit` was introduced for on `_NCPU`. Both
+  # sides are bounded to what the arithmetic can actually compare.
+  if [ "$_sf_h" != 'unbounded' ] && ! is_limit "$_sf_h"; then
+    printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} but cap_h_for_vars produced NO USABLE NUMBER (headroom='${_sf_h}' — empty, non-numeric, or beyond 9 digits) from mod=${SPAWN_GATE_CAP_MOD:-?}, so the fork floor cannot be decided"
     printf -v "$_sf_sv" '%s' 'nodeploy'
     return 0
   fi
-  if ! is_num "${CAP_MIN_FORK_HEADROOM:-200}"; then
-    printf -v "$_sf_dv" '%s' "CAP_MIN_FORK_HEADROOM='${CAP_MIN_FORK_HEADROOM:-}' is not a number (it came from mod=${SPAWN_GATE_CAP_MOD:-?}), so the fork floor cannot be decided (procs=${_sf_p}/${_sf_m}, headroom=${_sf_h})"
+  if ! is_limit "${CAP_MIN_FORK_HEADROOM:-200}"; then
+    printf -v "$_sf_dv" '%s' "CAP_MIN_FORK_HEADROOM='${CAP_MIN_FORK_HEADROOM:-}' is not a usable number (empty, non-numeric, or beyond 9 digits — it came from mod=${SPAWN_GATE_CAP_MOD:-?}), so the fork floor cannot be decided (procs=${_sf_p}/${_sf_m}, headroom=${_sf_h})"
     printf -v "$_sf_sv" '%s' 'nodeploy'
     return 0
   fi

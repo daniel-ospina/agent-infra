@@ -1855,12 +1855,30 @@ cap_fork_probe() { :; }
 PINONUM
 nd4="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/nonum" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
        bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
-case "$nd4" in *'state=nodeploy'*'NO NUMBER'*) rc=0 ;; *) rc=1 ;; esac
+case "$nd4" in *'state=nodeploy'*'NO USABLE NUMBER'*) rc=0 ;; *) rc=1 ;; esac
 ck "a NON-NUMERIC headroom REFUSES (nodeploy) instead of skipping the test and answering ok [$nd4]" $rc
 nd5="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$(dirname "$cap_abspath")" CAP_MIN_FORK_HEADROOM=abc HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
        bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
 case "$nd5" in *'state=nodeploy'*'CAP_MIN_FORK_HEADROOM'*) rc=0 ;; *) rc=1 ;; esac
 ck "...and a NON-NUMERIC CAP_MIN_FORK_HEADROOM REFUSES too, naming the knob (no silent \`[: integer expression expected\`) [$nd5]" $rc
+# ⛔ NUMERIC-BUT-BEYOND-INTMAX IS NOT A READING EITHER (cycle-5 review, P1 — driven): `[ … -lt … ]`
+# above intmax returns 2, a FALSE condition, so a 24-digit headroom skipped the comparison and the
+# gate answered `ok` and LAUNCHED pi. `is_limit` (is_num AND <= 9 digits) is the file's own predicate
+# for exactly this wrap class.
+mkdir -p "$ND/huge"
+cat > "$ND/huge/capacity.sh" <<'PIHUGE'
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 401; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { printf -v "$3" '%s' 999999999999999999999999; return 0; }
+cap_fork_probe() { :; }
+PIHUGE
+nd8="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/huge" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd8" in *'state=nodeploy'*'NO USABLE NUMBER'*) rc=0 ;; *) rc=1 ;; esac
+ck "a headroom BEYOND INTMAX REFUSES — [ -lt ] above intmax is a FALSE condition, so it used to answer ok and launch [$nd8]" $rc
+nd9="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$(dirname "$cap_abspath")" CAP_MIN_FORK_HEADROOM=999999999999999999999999 HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd9" in *'state=nodeploy'*'not a usable number'*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a BEYOND-INTMAX CAP_MIN_FORK_HEADROOM REFUSES rather than silently disabling the floor [$nd9]" $rc
 # ⛔ A BROKEN CANDIDATE IS SKIPPED, NOT FATAL (cycle-3 review, P2): one stale `$O/capacity.sh` must not
 # refuse every spawn on a box that holds a complete copy in the next candidate.
 mkdir -p "$ND/mixedO" "$ND/home3/orchestrator"
