@@ -247,6 +247,16 @@ write_record() { # <ok> <rc>
         printf 'dirty=%s\n' "$REC_DIRTY"
         printf 'pin=%s\n' "$REC_PIN"
         printf 'pin_tree=%s\n' "$REC_PIN_TREE"
+        # ⛔ A FIELD, NOT PROSE IN `detail=` (review P1/P2, #10114). The whole point of this reading is
+        # that a downstream instrument (fleet-health, --print-status) can see the deployed-drift state;
+        # `detail=` is truncated at 240 chars, and this file already argues that an operator-needed
+        # fact must not be at the mercy of a prose truncation (`preserved=` carries the same note).
+        # ⛔ `${DRIFT_STATE:-not-run}` IS LOAD-BEARING, NOT DEFENSIVE STYLE (review VGATE, fatal).
+        # `write_record` is called from the PRE-FLOW refusals long before `read_deployed_drift` exists, so a
+        # bare `$DRIFT_STATE` under `set -u` ABORTED the record block — whose stderr is discarded — and every
+        # no-checkout / unresolvable-ref pass exited 1 with NO record and no diagnostic instead of the
+        # documented 23. `not-run` is also the truthful value there: those paths never reached the reading.
+        printf 'drift=%s\n' "${DRIFT_STATE:-not-run}${DRIFT_TOKEN:+:$DRIFT_TOKEN}"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
         printf 'action=%s\n' "$REC_ACTION"
         printf 'lanes=none-signalled\n'
@@ -553,15 +563,25 @@ read_deployed_drift() {
     [ "${HARNESS_APPLY_DRIFT_CHECK:-1}" = 0 ] && { DRIFT_STATE=disabled; DRIFT_TOKEN=disabled; return 0; }
     local chk="${HARNESS_APPLY_DRIFT_CMD:-}"
     if [ -z "$chk" ]; then
-        # This pass lives in `scripts/` while the checker lives in `scripts/orchestrator-harness/`;
-        # accept either layout rather than hard-coding the one this checkout happens to have.
-        for _candidate in "$HERE/orchestrator-harness/check-deployed-drift.sh" "$HERE/check-deployed-drift.sh"; do
-            [ -f "$_candidate" ] && { chk="$_candidate"; break; }
+        # ⛔ THE SCHEDULED PASS IS THE **FARMED** COPY, NOT A CHECKOUT COPY — and the farm does NOT ship
+        # the checker (review P1, measured on this box). `install-harness-apply-timer.sh` installs the
+        # farmed copy first ("that is what a cell has after pi-bootstrap/setup.sh"), the unit runs
+        # `<cell-home>/.pi/agent/scripts/harness-apply-pass.sh`, and that directory carries neither
+        # `check-deployed-drift.sh` nor an `orchestrator-harness/` subdir — while `pi-bootstrap`'s
+        # `fleet_srcs` farms this pass and NOT the checker. So searching only `$HERE` made the whole
+        # arm DEAD on every deployed box: `absent` → not-run → never `executes:` → rc 0 over a stale
+        # executing harness, which is exactly the silent green this change exists to end.
+        # `$O` is where the checker IS deployed, so it is the candidate that works in production.
+        for _candidate in "$HERE/orchestrator-harness/check-deployed-drift.sh" \
+                          "$HERE/check-deployed-drift.sh" \
+                          "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/check-deployed-drift.sh" \
+                          "${O:-}/check-deployed-drift.sh"; do
+            [ -n "$_candidate" ] && [ -f "$_candidate" ] && { chk="$_candidate"; break; }
         done
     fi
     if [ ! -f "$chk" ]; then
         DRIFT_STATE=not-run; DRIFT_TOKEN=absent
-        log_line "harness: deployed_drift=not-run token=absent (no check-deployed-drift.sh beside $HERE) — NOT a clean reading, we did not look"
+        log_line "harness: deployed_drift=not-run token=absent (no check-deployed-drift.sh beside $HERE, in \$O=$O, or at AGENT_INFRA_PATH) — NOT a clean reading, we did not look"
         return 0
     fi
     local out
