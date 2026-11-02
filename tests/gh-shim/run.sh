@@ -14,7 +14,17 @@
 # mattering, which is the whole claim.
 #
 # Hermetic: a fake `gh` serves every call and records the argv it received.
+#
+# ⛔ THE SUITE UNSETS THE NO_WAIT KNOBS, AND THAT IS A HERMETICITY FIX, NOT TIDYING (#3228 review,
+# finding 3). `NO_WAIT` makes `run_paced` take a DIFFERENT BRANCH: `wait_for_cooldown` — and with it
+# `discharge_window`, the exempt read and the whole re-derivation — is never called, so the call
+# proceeds unchallenged. An arm that asserts a discharge through `rc=0` alone is therefore SATISFIED
+# BY THE BYPASS, and on this box's own tool shell (`GH_LIMIT_NO_WAIT=1`) the suite reported 45 ❌
+# while 4 discharge arms still said ✅ — a green that proved the opposite of its name. MEASURED:
+# `env -u GH_LIMIT_NO_WAIT bash tests/gh-shim/run.sh` → all 243 pass. Every arm that DELIBERATELY
+# wants the bypass sets it inline on that invocation, so clearing the ambient value takes nothing away.
 set -uo pipefail
+unset GH_LIMIT_NO_WAIT AGENT_GH_GATE_NO_WAIT
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SHIM="$ROOT/scripts/gh-shim/gh"
@@ -1096,9 +1106,9 @@ printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
 AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
   AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" pr view 1 >/dev/null 2>&1
 _rc=$?
-[ "$_rc" -eq 0 ] \
+[ "$_rc" -eq 0 ] && grep -q 'DISCHARGED' "$GDIR/events.log" 2>/dev/null \
   && pass "(f)(v) a healthy account is STILL discharged — the small search bucket does not make the gate inert (rc=0)" \
-  || fail "(f)(v) the gate is INERT: a healthy account (search 30/30) was treated as exhausted (rc=$_rc)"
+  || fail "(f)(v) the gate is INERT: a healthy account (search 30/30) was treated as exhausted, or nothing discharged it (rc=$_rc, discharge=$(grep -c DISCHARGED "$GDIR/events.log" 2>/dev/null))"
 
 # (f)(vi) THE CORROBORATED DIRECTION IS PINNED TOO (finding 9). A floor at or above the remaining
 # count of a bucket that is genuinely MORE THAN HALF SPENT must HONOUR the window. This is the branch
@@ -1613,9 +1623,9 @@ printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
 AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_REAL_SHAPE" AGENT_GH_GATE_DIR="$GDIR" \
   AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
 _rc=$?
-[ "$_rc" -eq 0 ] \
+[ "$_rc" -eq 0 ] && grep -q 'DISCHARGED' "$GDIR/events.log" 2>/dev/null \
   && pass "(f)(xxiii) a REAL-shaped healthy body (limit-100 buckets at 100/100) is DISCHARGED (rc=0)" \
-  || fail "(f)(xxiii) the gate is INERT on a real /rate_limit body — a limit-100 bucket at 100/100 reads as low (rc=$_rc)"
+  || fail "(f)(xxiii) the gate is INERT on a real /rate_limit body — a limit-100 bucket at 100/100 reads as low, or nothing discharged it (rc=$_rc, discharge=$(grep -c DISCHARGED "$GDIR/events.log" 2>/dev/null))"
 
 # (f)(xxiv) ⛔ THE CORROBORATING NOTE MUST NAME THE BUCKET. The `LOW` verdict was returned WITHOUT
 # being printed, so the caller's `sed -n 's/^LOW //p'` produced an empty figure and the operator's
@@ -1781,9 +1791,9 @@ printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
 AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_GATE_REVALIDATE_FLOOR=999999 AGENT_GH_REAL="$GREAL_101" \
   AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
 _rc=$?
-[ "$_rc" -eq 0 ] \
+[ "$_rc" -eq 0 ] && grep -q 'DISCHARGED' "$GDIR/events.log" 2>/dev/null \
   && pass "(f)(xxix) a POISONED floor (999999) still cannot call a healthy account low (rc=0)" \
-  || fail "(f)(xxix) a poisoned AGENT_GH_GATE_REVALIDATE_FLOOR made the gate inert (rc=$_rc)"
+  || fail "(f)(xxix) a poisoned AGENT_GH_GATE_REVALIDATE_FLOOR made the gate inert, or nothing discharged it (rc=$_rc, discharge=$(grep -c DISCHARGED "$GDIR/events.log" 2>/dev/null))"
 
 # (f)(xxx) ⛔ P1-c: THE REFUSAL SHAPE THE SHIM COVERED WAS ONE IT INVENTED. GitHub answers BOTH limits
 # with the SAME sentence — `API rate limit exceeded for user ID <id>` — and the shim's prose grep keyed
@@ -1924,6 +1934,63 @@ cmp -s "$TMP/golden.raw.err" "$TMP/golden.shim.err" \
 [ "$(cat "$GCALLS")" = "$_raw_argv" ] \
   && pass "  …and the real gh received the ORIGINAL argv unchanged ('$_raw_argv')" \
   || fail "  …argv CHANGED: '$_raw_argv' → '$(cat "$GCALLS" | tr '\n' '|')'"
+
+GDIR="$(gate_dir revalidate)"
+# (f)(xxxiv) ⛔ THE WAIT BUDGET IS PER `gh` CALL, NOT PER ATTEMPT — AND THIS IS THE ONLY SHAPE IN
+# WHICH THE CARRY IS OBSERVABLE (#3228 review, finding 4). `wait_for_cooldown` reads
+# `spent="${WAIT_SPENT_MS:-0}"` and hands it back out, so `run_paced`'s SECOND pass sees the budget
+# the FIRST pass already consumed. Every other arm in this section sets `AGENT_GH_GATE_WAIT_BUDGET=1`
+# and either discharges or exits 75 on the first pass, so `wait_for_cooldown` is never entered twice
+# with a partly spent budget — and a revert to the per-attempt `local spent=0` (the exact defect
+# review finding 6 records: ONE call spending MAX_ATTEMPTS budgets) left all 243 checks green.
+#
+# THE SHAPE: pass 1 sleeps out a 3 s window it may NOT discharge (a `retry-after` deadline — the
+# server's own instruction, so no exempt read can lift it), then the call TRANSPORT-FAILS. The
+# transport arm retries after 1 s with NO cooldown of its own, and the fake stamps a fresh 20 s
+# `retry-after` window on its way out. Pass 2 therefore finds an undischargeable window with only
+# 4000-3000 = 1000 ms of budget left. Carried: pass 2 waits 1 s. Not carried: pass 2 waits the whole
+# 4 s. Both end rc=75, so the discriminator is ELAPSED — 3 s apart, which is why this measures
+# elapsed rather than inferring it.
+GDIR="$(gate_dir budget-carry)"; GREAL_CARRY="$TMP/gate-real-carry"; CARRY_COUNT="$TMP/carry-count"
+rm -f "$CARRY_COUNT"
+cat > "$GREAL_CARRY" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684}}}'; exit 0 ;; esac
+n=\$(cat "$CARRY_COUNT" 2>/dev/null || echo 0)
+n=\$(( n + 1 )); printf '%s' "\$n" > "$CARRY_COUNT"
+if [ "\$n" -eq 1 ]; then
+  _u=\$(( \$(date +%s) * 1000 + 20000 ))
+  printf '%s\n' "\$_u" > "$GDIR/cooldown.\$_u.\$\$"
+  printf '%s\n' "\$_u" > "$GDIR/retry-after.window"
+  printf 'error connecting to api.github.com\n' >&2
+  exit 1
+fi
+printf '%s\n' '{"number":1}'
+GHEOF
+chmod +x "$GREAL_CARRY"
+_now=$(( $(date +%s) * 1000 ))
+printf '%s\n' "$(( _now + 3000 ))" > "$GDIR/retry-after.window"
+printf '%s\n' "$(( _now + 3000 ))" > "$GDIR/cooldown.$(( _now + 3000 )).$$"
+: > "$GDIR/events.log"
+_t0=$(( $(date +%s%N) / 1000000 ))
+AGENT_GH_GATE_WAIT_BUDGET=4 AGENT_GH_GATE_RETRY_BASE=1 AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_REAL="$GREAL_CARRY" AGENT_GH_GATE_DIR="$GDIR" CARRY_COUNT="$CARRY_COUNT" \
+  bash "$SHIM" pr view 1 >/dev/null 2>&1
+_rc=$?
+_t1=$(( $(date +%s%N) / 1000000 )); _el_ms=$(( _t1 - _t0 ))
+if [ "$_rc" -eq 75 ]; then
+  pass "(f)(xxxiv) the per-call budget still ends in the contended verdict (rc=75)"
+else
+  fail "(f)(xxxiv) the per-call budget did not produce a contended verdict (rc=$_rc, expected 75)"
+fi
+# 3 s (pass 1) + 1 s (transport retry) + 1 s (the remaining budget) ≈ 5 s carried.
+# Not carried: 3 + 1 + 4 ≈ 8 s. Threshold 6.5 s keeps >1.4 s of margin on both sides.
+[ "$_el_ms" -lt 6500 ] \
+  && pass "  …and ONE call never waited more than its budget (${_el_ms}ms, budget 4000ms + the transport retry)" \
+  || fail "  …but the budget reset per ATTEMPT, not per call: ${_el_ms}ms elapsed (carried about 5 s, per-attempt about 8 s) — WAIT_SPENT_MS is not being carried"
+grep -q 'gh-contended' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the contended note was emitted" \
+  || fail "  …but no gh-contended note reached events.log"
 
 GDIR="$(gate_dir revalidate)"
 # (g) A NON-rate-limit 403 IS NOT RETRIED. A permissions failure is not a burst, and
