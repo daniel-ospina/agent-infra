@@ -975,17 +975,27 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     asserts the call ARRIVES at the gate -- which is where the load gate lives -- by recording it.
     If the routing is ever "simplified" back to a direct `pi` spawn, this goes RED.
 
-    ⛔ AND IT PINS THE OTHER HALF OF THE P0: the stub worker SLEEPS 3 s, so a CAPTURED call can only
-    return promptly if the worker subshell closed the parent's stdout/stderr (`exec >/dev/null
-    2>&1`). Without that line this test takes the worker's lifetime; measured pre-fix, 5.02 s for a
-    5 s worker. Removing the `exec` from the harness reddens THIS test and nothing else, which is
-    the point: pr-doctor no longer captures, so no shipped pr-doctor caller would notice.
+    ⛔ AND IT PINS THE OTHER HALF OF THE P0: the stub worker OUTLIVES the dispatcher's start window,
+    so a CAPTURED call can only return promptly if the worker subshell closed the parent's
+    stdout/stderr (`exec >/dev/null 2>&1`). Without that line this test takes the worker's lifetime;
+    measured for the shape below, ~12 s for a 12 s worker. Removing the `exec` from the harness
+    reddens THIS test and nothing else, which is the point: pr-doctor no longer captures, so no
+    shipped pr-doctor caller would notice.
+
+    ⛔ THE STUB MUST SATISFY THE DISPATCHER'S OWN START CONTRACT (agent-infra, measured 2026-10-31).
+    `nonblocking-dispatch.sh` no longer reports `launched` for a pid it captured — it asserts a
+    POSITIVE start after a settle window, and a worker that returns rc=0 having written NOT ONE LOG
+    BYTE is deliberately NOT a dispatch (exit 75). The stub therefore (a) writes a line to its own
+    log (`$2` of `run_agent`) as the evidence a lane ran, and (b) stays alive past the window, so the
+    verdict under test is `launched` rather than a race between `finished early` and `NOT STARTED`.
+    The window is pinned to the floor (2 s) via `NB_START_SETTLE` so this test stays fast.
     """
     d = tmp_path / "orch"
     d.mkdir()
     marker = tmp_path / "marker.txt"
     (d / "spawn-gate.sh").write_text(
-        'run_agent() { echo "GATED $*" > "$MARK"; sleep 3; echo ran; return 0; }\n')
+        'run_agent() { echo "GATED $*" > "$MARK"; echo "[worker] started" >> "$2"; '
+        'sleep 12; echo ran; return 0; }\n')
     # …and the REAL brief validator, because `nonblocking-dispatch.sh` refuses an unvalidated brief
     # in the FOREGROUND, before `run_agent` — which is the call this test asserts arrives (#2258).
     shutil.copy(str(_HARNESS / "brief-gate.sh"), str(d / "brief-gate.sh"))
@@ -998,14 +1008,19 @@ def test_nonblocking_dispatch_routes_through_run_agent(tmp_path):
     # dispatcher backgrounds anything, so the routing this test proves would never be exercised.
     prompt.write_text(subprocess.run(["bash", str(_HARNESS / "brief-gate.sh"), "--section", "worker"],
                                      capture_output=True, text=True, check=True).stdout)
-    env = dict(os.environ, O=str(d), MARK=str(marker))
+    env = dict(os.environ, O=str(d), MARK=str(marker), NB_START_SETTLE="2")
     nb = _HARNESS / "nonblocking-dispatch.sh"
     t0 = time.monotonic()
     r = subprocess.run(["bash", str(nb), "prd-1", str(wt), str(prompt), "5"],
                        capture_output=True, text=True, env=env, timeout=30)
     elapsed = time.monotonic() - t0
     assert r.returncode == 0, r.stderr
-    assert elapsed < 2.0, ("the captured call waited %.2fs for a 3 s worker -- the worker "
+    # Lower bound: the start assertion is NOT optional — the window (2 s) elapses before `launched`.
+    assert elapsed >= 2.0, ("the dispatcher returned in %.2fs, before its own start window -- "
+                            "the launch was reported without a positive start assertion" % elapsed)
+    # Upper bound: the worker (12 s) must NOT be waited on. If `exec >/dev/null 2>&1` is removed from
+    # the worker subshell, the captured call holds the caller's pipe for the worker's whole life.
+    assert elapsed < 6.0, ("the captured call waited %.2fs for a 12 s worker -- the worker "
                            "subshell is holding the caller's pipe" % elapsed)
     for _ in range(100):
         if marker.exists():
@@ -1925,12 +1940,18 @@ def test_fix_and_review_budgets_are_separate(monkeypatch):
 # distinguish the defect: a worker that exits at once closes its own end of the pipe, so even a
 # captured pre-fix call returned promptly for that shape.
 _WORKERS = {
+    # ⛔ THE WORKER MUST OUTLIVE THE DISPATCHER'S START WINDOW BY A WIDE MARGIN (agent-infra#3161).
+    # `nonblocking-dispatch.sh` now sleeps a bounded settle window before it certifies a launch, so a
+    # worker that dies INSIDE the window is (correctly) reported `NOT STARTED` and `dispatch()` never
+    # reaches the promptness question at all. 12 s against the 2 s window pinned in `_wire_dispatch`
+    # keeps "the call ended with the dispatcher" the thing under test, and keeps the bound below far
+    # from the worker's own lifetime.
     # silent for its whole life
-    "sleeps past the window and writes nothing": "run_agent() { sleep 6; return 0; }\n",
+    "sleeps past the window and writes nothing": "run_agent() { sleep 12; return 0; }\n",
     # writes IMMEDIATELY (the shape where a caller with a pipe receives output first) and runs on
-    "writes at once, then sleeps": 'run_agent() { echo starting; sleep 6; return 0; }\n',
+    "writes at once, then sleeps": 'run_agent() { echo starting; sleep 12; return 0; }\n',
     # writes to BOTH streams at the end
-    "sleeps, then writes to stdout and stderr": 'run_agent() { sleep 6; echo OUT; echo ERR >&2; }\n',
+    "sleeps, then writes to stdout and stderr": 'run_agent() { sleep 12; echo OUT; echo ERR >&2; }\n',
 }
 
 
@@ -1975,6 +1996,13 @@ def _wire_dispatch(monkeypatch, tmp_path, d, wt):
     monkeypatch.setattr(pr, "materialise_worktree", lambda p: (str(wt), ""))
     monkeypatch.setattr(pr, "log", lambda m: None)
     monkeypatch.setenv("O", str(d))
+    # ⛔ THE START WINDOW IS PINNED TO ITS FLOOR FOR THE SUITE (agent-infra#3161). The dispatcher now
+    # spends `NB_START_SETTLE` (default 5 s) PROVING a lane became a process before it reports a
+    # launch; at the default every dispatch test in this file would carry 5 s of wall clock the test is
+    # not about, and the promptness arm could no longer tell "waited for the window" from "waited for
+    # the worker". 2 is the documented floor, so this exercises the real assertion at its cheapest --
+    # the DEFAULT is covered by `nonblocking-dispatch.test.sh`, which is the launcher's own suite.
+    monkeypatch.setenv("NB_START_SETTLE", "2")
 
 
 def _stub_the_spawn(monkeypatch, rc_ok=False):
@@ -2006,8 +2034,14 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
 
     PRE-FIX (`sh_err(spawn_argv(...), timeout=120)` with `capture_output=True`): `subprocess.run`
     blocks on EOF of the capture pipe, and the worker subshell inherits it -- so this call lasted
-    the worker's whole life. For the sleeping worker that is 6 s here and TimeoutExpired at
+    the worker's whole life. For the sleeping worker that is 12 s here and TimeoutExpired at
     timeout=120 in production, which returned rc=-1, logged `FAIL`, and wrote NO state row.
+
+    ⛔ AND THE CALL MUST NOT RETURN *BEFORE* THE DISPATCHER'S OWN START ASSERTION (agent-infra#3161).
+    "Prompt" means it stopped waiting for the WORKER, never that it may skip proving a lane started:
+    a dispatch that returns before `NB_START_SETTLE` has elapsed is the false `launched` this pair of
+    bounds exists to keep out. Both bounds are load-bearing and they are the same pair
+    `test_nonblocking_dispatch_routes_through_run_agent` uses.
     """
     d, wt = _orch(tmp_path, _WORKERS[label])
     _wire_dispatch(monkeypatch, tmp_path, d, wt)
@@ -2015,7 +2049,11 @@ def test_dispatch_returns_promptly_whatever_the_worker_does(monkeypatch, tmp_pat
     ok, detail, record = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
     elapsed = time.monotonic() - t0
     assert ok is True and record is True, (ok, detail)
-    assert elapsed < 3.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
+    # Lower bound: the start assertion is NOT optional -- the window (2 s) elapses before `launched`.
+    assert elapsed >= 2.0, ("dispatch returned in %.2fs, before the dispatcher's own start window -- "
+                           "the launch was reported without a positive start assertion" % elapsed)
+    # Upper bound: the worker (12 s) must NOT be waited on.
+    assert elapsed < 6.0, "dispatch took %.2fs -- it waited for the worker" % elapsed
 
 
 def test_a_worker_that_outlives_the_pass_still_writes_a_state_row(monkeypatch, tmp_path):
@@ -2487,6 +2525,41 @@ def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
     (d / "bg" / "prd-9.log").write_text(
         "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=74\n")
     assert pr.gate_refused("prd-9", 74) is False
+
+
+def test_a_capability_refusal_is_the_gates_own_class_and_never_waits(tmp_path, monkeypatch):
+    """Exit 71 is the FIFTH gate refusal, and it was the one missing (#3161 round-6 review, P2).
+
+    `run_agent` returns `AGENT_CAPABILITY_REFUSED=71` and writes `[capability-gate] REFUSED … no agent
+    was started, so nothing was consumed` BEFORE any agent runs — the same class as 73/74/75/77, and
+    the same accounting consequence when it is left out: `_confirm()`/`dispatch()` read the `.rc` as a
+    failure, the pass reaches `undeliverable += 1`, and it exits 3 with `next=repair-chain` — "a human
+    must repair the dispatch chain" — for a box whose own capability probe proved it cannot complete a
+    call and return. Measured on the pre-fix tree: `gate_refused("prd-5", 71) is False` and the detail
+    read `rc=75: FAILED EARLY: prd-5 started and exited rc=71`.
+
+    ⛔ AND THE REMEDY MUST NOT BE "wait" (#2291's own lesson, restated per axis). `GATE_NEXT_TOKEN` is
+    read with `.get(ax, "wait")` at the verdict line, so an axis with no token would default to the
+    one remedy that is provably useless here. Both halves are asserted: the code must be recognised,
+    the marker must be the gate's own line, and the token must be neither `wait` nor `repair-chain`.
+    """
+    assert 71 in pr.GATE_REFUSALS
+    assert pr.GATE_REFUSAL_BOUND[71] == "capability"
+    assert pr.GATE_NEXT_TOKEN["capability"] != "wait"
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-5.rc").write_text("71\n")
+    (d / "bg" / "prd-5.log").write_text(
+        "[capability-gate] REFUSED prd-5: LANE_CAPABILITY (exit 3) — no agent was started, so "
+        "nothing was consumed and no 3300s slot is spent on a box that cannot complete one call "
+        "and return.\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-5", 71) is True
+    assert pr.refusal_axis(71) == "capability"
+    # The cooldown-VOIDING direction: an agent that exits 71 itself is not a gate refusal.
+    (d / "bg" / "prd-5.log").write_text(
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=71\n")
+    assert pr.gate_refused("prd-5", 71) is False
 
 
 def test_the_refusal_markers_are_the_gates_own_lines():
@@ -3455,7 +3528,14 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     gate = (_HARNESS / "spawn-gate.sh").read_text()
     exported = dict(re.findall(r"^(AGENT_[A-Z_]+)=(\d+)$", gate, re.M))
     for const, code in (("AGENT_FORK_REFUSED", 73), ("AGENT_LAND_BACKLOG", 74),
-                        ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77)):
+                        ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77),
+                        # ⛔ AND THE CAPABILITY GATE (#3161 round-6 review, P2): `run_agent`
+                        # returns this code and writes "[capability-gate] REFUSED … no agent was
+                        # started", so it is the SAME class as the four above and was the one
+                        # missing -- measured, it fell through to `EXIT 3 / UNDELIVERED /
+                        # next=repair-chain` for a box its own probe had proved cannot complete a
+                        # call. Pinned here so neither side can renumber or drop it again.
+                        ("AGENT_CAPABILITY_REFUSED", 71)):
         assert exported.get(const) == str(code), (
             "spawn-gate.sh no longer exports %s=%d -- GATE_REFUSAL_BOUND is stale" % (const, code))
         assert pr.GATE_REFUSAL_BOUND[code], "the gate declares %d and this file does not" % code
@@ -3469,7 +3549,8 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     # tell them to restart a healthy box. Derived from the gate's own CONSTANT NAMES, so a
     # renumbering or a rename on either side reddens here.
     want = {"AGENT_FORK_REFUSED": "fork", "AGENT_LAND_BACKLOG": "land-backlog",
-            "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk"}
+            "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk",
+            "AGENT_CAPABILITY_REFUSED": "capability"}
     for const, axis in want.items():
         code = int(exported[const])
         assert pr.GATE_REFUSAL_BOUND[code] == axis, (
@@ -3560,6 +3641,44 @@ def test_the_two_rc3_causes_are_reproduced_END_TO_END_through_the_REAL_gate(monk
     assert side_chain["verdict"] == "UNDELIVERED", side_chain
     assert rc_box != rc_chain, (
         "the two facts share a code again -- this is the defect #2291 was filed for")
+
+
+def test_a_STALE_rc_cannot_relabel_a_permanent_refusal_as_a_gate_refusal(monkeypatch, tmp_path):
+    """⛔ THE EVIDENCE UNDER A 75 IS FRESH; UNDER ANY OTHER CODE IT IS NOT (agent-infra#3161).
+
+    `nonblocking-dispatch.sh`'s FOREGROUND refusals (78: no spawn-gate / no brief-gate /
+    reviewer-preflight; 80: the brief gate refused) exit BEFORE its `rm -f "$RC"` / `: > "$LOG"`, so
+    a `.rc` and a gate marker in the log can both be LEFTOVER from an earlier dispatch of the same
+    name. Reading them under those codes would report a PERMANENT, fleet-wide code fault as
+    `gate REFUSED rc=75 (load)` — i.e. "wait, it clears by itself" — which is the one direction this
+    file may never be wrong in. So the recovery is bound to 75, the only code the START ASSERTION
+    emits (it runs after both truncations).
+
+    The leftovers here are REAL, which is the only version of this arm that proves anything: the
+    stale pair is exactly what a previous load refusal leaves behind.
+    """
+    d, wt = _orch(tmp_path, "run_agent() { :; }\n")
+    _wire_dispatch(monkeypatch, tmp_path, d, wt)
+    name = pr.worker_name(5)
+    bg = pathlib.Path(d) / "bg"
+    bg.mkdir(parents=True, exist_ok=True)
+    (bg / (name + ".rc")).write_text("75\n")                     # stale: an EARLIER load refusal
+    (bg / (name + ".log")).write_text(
+        '[load-gate] REFUSED x: load=99 >= max_load=40 — no agent started\n')   # stale too
+    real = pr.sh_err
+
+    def fake(argv, timeout=180, cwd=None, env=None, capture=True):
+        if "--status" in argv:
+            return real(argv, timeout=timeout, cwd=cwd, env=env, capture=capture)
+        return ("", "nonblocking-dispatch.sh: REFUSED — brief-gate=/o/brief-gate.sh judged the "
+                     "brief at /o/p and refused it (agent-infra#2258)", 80)
+
+    monkeypatch.setattr(pr, "sh_err", fake)
+    ok, detail, record = pr.dispatch(_pr(5), "fix-ci", _OK_BRIEF, dry=False)
+    assert ok is False and record is False, (ok, detail, record)
+    assert "gate REFUSED" not in detail, (
+        "a permanent brief refusal was relabelled from LEFTOVER gate evidence: %r" % detail)
+    assert detail.startswith("rc=80:"), detail
 
 
 def _through_the_real_transport(monkeypatch, tmp_path, run_agent_body, dispatcher=None):
