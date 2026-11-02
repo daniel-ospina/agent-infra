@@ -107,9 +107,11 @@ comes from `/login` instead (Step 3 item 3), a graph key living in `pi-keys.env`
 every lane reports `GRAPH-UNREACHABLE(NO-KEY)` — the dependency is real and is stated here rather than
 rediscovered as a mystery. Losing it silently is the one outcome worse than a loud NO-KEY.
 The client itself (`~/.pi/agent/scripts/tortoise-graph.sh`) IS delivered by the setup — it is farmed
-from this repo — so a box missing ONLY this key reports `GRAPH-UNREACHABLE(NO-KEY)` on every call
-(`bash ~/.pi/agent/scripts/tortoise-graph.sh health` is the local reading; on a cell,
-`bash scripts/cloud-cell-bringup.sh --check` additionally warns by variable NAME, never its value).
+from this repo — so a box with NEITHER name set reports `GRAPH-UNREACHABLE(NO-KEY)` on every call (with
+only the REST name `TORTOISE_API_KEY` present the client takes that fallback and reports the endpoint's
+verdict instead — often `GRAPH-UNREACHABLE(HTTP 401)`, because the REST key is not the MCP key).
+`bash ~/.pi/agent/scripts/tortoise-graph.sh health` is the local reading; on a cell,
+`bash scripts/cloud-cell-bringup.sh --check` additionally warns by variable NAME, never its value.
 Re-generate it from the Tortoise dashboard at `tortoise.premiselabs.co` (the sign-up site, not the API
 host).
 
