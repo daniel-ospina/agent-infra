@@ -528,14 +528,47 @@ CLEAN_LOW_MARKER_RE='verdict=clean-low @ [0-9a-f]{40}'
 #   so `[[ =~ ]]` over a multi-MB body cannot race the way `grep -q` did.
 #   BASH_REMATCH is used instead of a subprocess per line — the scan is over
 #   EVERY line of a body that may carry many stale markers from earlier heads.
+# live_diff_sha <pr> <owner/repo> — the PR's LIVE normalized diff digest, read
+# through the PRODUCER's own read-only seam (`record-review.sh --print-diff-hash`,
+# #1351). Prints NOTHING unless that fetch reported status `ok`, so a degraded or
+# refused read can never be mistaken for a digest. That emptiness is what keeps
+# the carry below fail-CLOSED: absent a digest, the caller refuses as before.
+#
+live_diff_sha() {
+  local out h
+  out="$("$RECORD_REVIEW_SH" --print-diff-hash "$1" "$2" 2>/dev/null)" || return 0
+  [[ "${out%%$'\t'*}" == "ok" ]] || return 0
+  h="${out#*$'\t'}"
+  [[ "$h" =~ ^[0-9a-f]{64}$ ]] && printf '%s' "$h"
+  return 0
+}
+
+#   ‼️ A GATE BINDS TO THE SUBJECT IT EXAMINED, NOT TO THE ADDRESS IT ARRIVED AT.
+#   The marker's `@ <sha40>` is an ADDRESS: a base move (a forward merge, a
+#   squash, a rebase) changes it without changing one byte of the reviewed diff.
+#   Refusing on the address alone re-opened a recorded decision through a side
+#   door: the review gate DELIBERATELY carries a record across a moved head when
+#   the reviewed content is digest-identical (`extensions/review-enforcer`
+#   `carried` arm; `record-review.sh --check-carry`; `tools/fleet/pr_state.py`
+#   `at-head`/`carried`/`owes-review`; issues #1351/#1690/#2982/#2349). Because
+#   THIS gate is a REQUIRED check, an address-only rule refused first and the
+#   rail never reached its own carry logic — a full re-review of untouched code.
+#   So the optional 5th argument is the LIVE diff digest, and a marker whose own
+#   `diff=<64hex>` equals it is the SAME subject at a different address.
+#   ⛔ This does not weaken the gate: a changed diff still refuses, and an
+#   unreadable live diff supplies no argument at all (see live_diff_sha).
 has_review_record() {
-  local text="$1" pr="$2" repo="$3" head="$4" line want_repo got_repo
+  local text="$1" pr="$2" repo="$3" head="$4" live_diff="${5:-}" line want_repo got_repo
   [[ -n "$pr" && -n "$repo" && -n "$head" ]] || return 1
   want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
   while IFS= read -r line; do
     [[ "$line" =~ $REVIEW_RECORD_MARKER_RE ]] || continue
     [[ "${BASH_REMATCH[1]}" == "$pr" ]] || continue
-    [[ "${BASH_REMATCH[3]}" == "$head" ]] || continue
+    if [[ "${BASH_REMATCH[3]}" != "$head" ]]; then
+      # group 4 is ` diff=<64hex>` INCLUDING the leading space (the optional
+      # group in REVIEW_RECORD_MARKER_RE) — compare the whole field, not the hex.
+      [[ -n "$live_diff" && "${BASH_REMATCH[4]}" == " diff=$live_diff" ]] || continue
+    fi
     got_repo="$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')"
     [[ "$got_repo" == "$want_repo" ]] || continue
     return 0
@@ -1361,7 +1394,13 @@ run_checks() {
       fail c "code-review evidence cannot be graded — the PR's current head sha could not be read, so no record can be BOUND to this revision. Re-run the gate once the API is reachable (the fetch this check needs is pulls/$PR_NUMBER .head.sha)."
       echo "      Missing: a readable PR head sha."
       echo "      Invoke:  re-run this gate — a transient API/permission failure leaves the head unresolved."
-    elif has_review_record "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD"; then
+    elif has_review_record "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD" \
+         || { _ld="$(live_diff_sha "$PR_NUMBER" "$GH_REPO")" \
+              && [[ -n "$_ld" ]] \
+              && has_review_record "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD" "$_ld"; }; then
+      # the address matched, OR the record CARRIES on content identity (the same
+      # reviewed diff at a moved head). The carry arm is reached only on a head
+      # mismatch, so the common path costs no extra fetch.
       # #513 verdict-tier binding (Approach B): clean-micro certifies the
       # MICRO process only (record-review.sh verifies the linked issue's
       # complexity:micro label at mint; micro skips checks b–e, so reaching
