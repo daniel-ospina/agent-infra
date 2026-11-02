@@ -1559,6 +1559,155 @@ case "${_long:-x}${_short:-x}" in
 esac
 
 rm -f "$GDIR"/cooldown.* "$GDIR/secondary.window" "$GDIR"/refusal.* 2>/dev/null
+
+# (f)(xxiii)–(f)(xxvii) — #3228's FOURTH REVIEW ROUND. Each of these was RED on the head it was
+# written against; each names the defect it pins rather than the fix it hopes for.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# (f)(xxiii) ⛔ THE VERDICT MUST READ A BODY SHAPED LIKE THE REAL ONE. GitHub's `/rate_limit`
+# reports a long tail of buckets whose WHOLE limit is 100 (`source_import`, `dependency_snapshots`,
+# `dependency_sbom`). With the floor branch written as `lim>=floor_n and rem<=floor_n`, a healthy
+# account made `source_import` 100/100 permanently "low", so EVERY window was honoured and the
+# revalidation could never fire — the gate was INERT on a real box while every fixture (three
+# buckets: core/graphql/search) stayed green. MEASURED on the live account: floor 100 against the
+# real body printed `LOW source_import 100/100`.
+GDIR="$(gate_dir revalidate-real-shape)"
+GREAL_REAL_SHAPE="$TMP/gate-real-real-shape"
+cat > "$GREAL_REAL_SHAPE" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976},"search":{"limit":30,"remaining":30},"source_import":{"limit":100,"remaining":100},"dependency_snapshots":{"limit":100,"remaining":100},"dependency_sbom":{"limit":100,"remaining":100},"code_search":{"limit":10,"remaining":10},"audit_log_streaming":{"limit":15,"remaining":15}}}'
+    exit 0 ;;
+esac
+printf '%s\n' '{"number":1,"title":"real answer"}'
+GHEOF
+chmod +x "$GREAL_REAL_SHAPE"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_REAL_SHAPE" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] \
+  && pass "(f)(xxiii) a REAL-shaped healthy body (limit-100 buckets at 100/100) is DISCHARGED (rc=0)" \
+  || fail "(f)(xxiii) the gate is INERT on a real /rate_limit body — a limit-100 bucket at 100/100 reads as low (rc=$_rc)"
+
+# (f)(xxiv) ⛔ THE CORROBORATING NOTE MUST NAME THE BUCKET. The `LOW` verdict was returned WITHOUT
+# being printed, so the caller's `sed -n 's/^LOW //p'` produced an empty figure and the operator's
+# log read `(a bucket is low: )` — a claim with nothing in it, from the one surface a human debugs
+# with. This body has a limit-100 bucket GENUINELY exhausted (0 left), which must stay low.
+GDIR="$(gate_dir revalidate-low-names)"
+GREAL_LOW_NAME="$TMP/gate-real-low-names"
+cat > "$GREAL_LOW_NAME" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976},"source_import":{"limit":100,"remaining":0}}}'
+    exit 0 ;;
+esac
+printf '%s\n' '{"number":1}'
+GHEOF
+chmod +x "$GREAL_LOW_NAME"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_LOW_NAME" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "(f)(xxiv) a limit-100 bucket genuinely EXHAUSTED (0 left) still corroborates (rc=75)" \
+  || fail "(f)(xxiv) an exhausted small bucket was discharged (rc=$_rc)"
+grep -q 'a bucket is low: source_import 0/100' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the note NAMES the bucket it read (not '(a bucket is low: )')" \
+  || fail "  …but the note does not name the bucket: '$(grep 'bucket is low' "$GDIR/events.log" 2>/dev/null | head -1)'"
+
+# (f)(xxv) ⛔ A BARE `HTTP 429` IS A SECONDARY REFUSAL. `rate_limited` accepts it (so a window is
+# written), but the KIND was decided by three prose phrases that a bare 429 does not contain — so the
+# window carried NO protecting flag and a healthy primary read discharged it, releasing every lane
+# into the live burst limit (`docs/ops/gh-rate-limits.md`: "429 → secondary").
+GDIR="$(gate_dir revalidate-429)"
+GREAL_429="$TMP/gate-real-429"
+cat > "$GREAL_429" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976}}}'; exit 0 ;;
+esac
+if [ -e "$RA429" ]; then printf '%s\n' '{"number":1}'; exit 0; fi
+printf '%s' 1 > "$RA429"
+echo 'HTTP 429: Too Many Requests' >&2
+exit 1
+GHEOF
+chmod +x "$GREAL_429"
+RA429="$TMP/ra429-flag"
+rm -f "$RA429"
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_429" AGENT_GH_GATE_DIR="$GDIR" RA429="$RA429" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+[ -s "$GDIR/secondary.window" ] \
+  && pass "(f)(xxv) a bare 429 writes a PROTECTED (secondary) window" \
+  || fail "(f)(xxv) a bare 429 wrote an UNPROTECTED window — the kind classifier does not know 429"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_429" AGENT_GH_GATE_DIR="$GDIR" RA429="$RA429" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "  …and a HEALTHY primary read does NOT discharge it (rc=75) — the 429 burst stays honoured" \
+  || fail "  …and a healthy read DISCHARGED a 429 window (rc=$_rc) — every lane released into the burst limit"
+
+# (f)(xxvi) ⛔ A `retry-after.window` ARRIVING DURING THE PROBE MUST SURVIVE — the same guarantee
+# `(f)(xix)` pins for a `cooldown.*` file, for the OTHER undisgargeable kind. `retry_after_live` was
+# read BEFORE the lock and only `secondary_live` was re-read after the probe, so a peer whose
+# `cooldown.<until>` was already in the snapshot and whose flag landed during the 5 s read had its
+# server-mandated deadline deleted as an ordinary stale window.
+GDIR="$(gate_dir retry-after-during-probe)"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+printf 'until=%s\nbucket=core\nretry_after_until=\nsecondary=0\nprimary_hdr=0\nuid=\n' "$_until" \
+  > "$GDIR/refusal.$_until.$$"
+GREAL_RA_DURING="$TMP/gate-real-ra-during"
+cat > "$GREAL_RA_DURING" <<GHEOF
+#!/usr/bin/env bash
+case "\$*" in
+  *rate_limit*)
+    # The peer finishes its ARM-1 write sequence while OUR exempt read is in flight.
+    printf '%s' "$_until" > "$GDIR/retry-after.window"
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976}}}'
+    exit 0 ;;
+esac
+printf '%s\n' '{"number":1}'
+GHEOF
+chmod +x "$GREAL_RA_DURING"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_RA_DURING" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "(f)(xxvi) a retry-after window that arrived DURING the probe is HONOURED (rc=75)" \
+  || fail "(f)(xxvi) a retry-after window arriving mid-probe was DISCHARGED (rc=$_rc) — the server's deadline was overruled"
+[ -e "$GDIR/cooldown.$_until.$$" ] \
+  && pass "  …and the cooldown it protects was not deleted" \
+  || fail "  …and the peer's cooldown was deleted by a read that never saw its kind"
+
+# (f)(xxvii) ⛔ THE EVIDENCE RECORD IS DEFENCE IN DEPTH, NOT DECORATION. `refusal_evidence_live`
+# wrote `secondary=` and NEVER READ IT, so a writer killed between `cooldown.<until>` and the
+# `secondary.window` flag left a burst window dischargeable. Here the record alone says secondary.
+GDIR="$(gate_dir evidence-secondary)"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+printf 'until=%s\nbucket=graphql\nretry_after_until=\nsecondary=1\nprimary_hdr=0\nuid=81560491\n' "$_until" \
+  > "$GDIR/refusal.$_until.$$"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "(f)(xxvii) a secondary EVIDENCE RECORD with no flag still protects the window (rc=75)" \
+  || fail "(f)(xxvii) a secondary evidence record was ignored (rc=$_rc) — the field is written and never read"
+grep -q 'SECONDARY' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the operator's log says WHY (secondary/abuse)" \
+  || fail "  …but the reason is silent: '$(head -1 "$GDIR/events.log" 2>/dev/null)'"
+
 GDIR="$(gate_dir revalidate)"
 # (g) A NON-rate-limit 403 IS NOT RETRIED. A permissions failure is not a burst, and
 #     retrying a mutating command would run it twice.

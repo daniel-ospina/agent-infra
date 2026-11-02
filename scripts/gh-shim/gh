@@ -911,6 +911,19 @@ set_window_kind() {  # $1 = flag name, $2 = the deadline it protects
 # below EITHER the absolute floor (and big enough for that floor to mean anything) OR 10% of its own
 # limit. Both directions are pinned in `tests/gh-shim/run.sh`, so neither an inert gate nor a false
 # discharge can pass.
+#
+# ⛔ AND "BIG ENOUGH" IS `limit > floor`, STRICTLY — NOT `limit >= floor`.
+# MEASURED on a live account (2026-11-02): GitHub's `/rate_limit` reports a long tail of buckets
+# whose WHOLE limit IS 100 — `source_import` 100/100, `dependency_snapshots` 100/100,
+# `dependency_sbom` 100/100 — so the old `lim>=floor_n and rem<=floor_n` was TRUE for every one of
+# them on a perfectly healthy account. `rate_limit_verdict` answered `LOW source_import 100/100` on
+# EVERY call, so no window could ever be discharged: the gate was permanently inert, i.e. the exact
+# failure this comment block claims to have closed, one bucket over. A bucket that can never hold
+# more than the floor has no headroom TO lose, so the floor says nothing about it and the 10% rule
+# is the whole test. Strict `>` (not `>=`) is load-bearing: `>=` still calls 100/100 low at the
+# default floor of 100. Every fixture in the suite used to carry three buckets
+# (core/graphql/search) and so could not see it — `(f)(xxiii)` now reads a body shaped like the real
+# one, and `(f)(vi)` still pins that a floor ABOVE a big bucket's headroom corroborates it.
 # Python is already a hard dependency of the layer above (`gh-limit.py`); without it this fails and
 # the window is kept, which is the safe direction.
 rate_limit_verdict() {
@@ -934,7 +947,7 @@ for name,b in res.items():
     lim=b.get("limit")
     if not isinstance(rem,int) or not isinstance(lim,int): continue
     if lim<=0: continue
-    if rem<=0 or rem*100<=lim*10 or (lim>=floor_n and rem<=floor_n):
+    if rem<=0 or rem*100<=lim*10 or (lim>floor_n and rem<=floor_n):
         if low is None: low=(name,rem,lim)
     if lowest is None or rem*1000000//lim < lowest[1]*1000000//lowest[2]:
         lowest=(name,rem,lim)
@@ -943,9 +956,14 @@ if low is not None:
     print("LOW %s %d/%d" % low)
 else:
     print("OK lowest=%s %d/%d" % lowest)' "$f" "$REVALIDATE_CORE_FLOOR" 2>/dev/null)" || return 1
+  # ⛔ THE `LOW` VERDICT IS PRINTED TOO. The caller's note says "a bucket is low: $(…)" by scraping
+  # this line, so returning 2 WITHOUT printing made the operator's log read `(a bucket is low: )` —
+  # a claim with no bucket in it, produced by the one surface a human debugs with (#3228 review
+  # round 4). The value is still never treated as stdout for the CALLER: `discharge_window`
+  # captures it (`vrd_out=`), which is what keeps it off the answer.
   case "$out" in
     'OK lowest='?*) printf '%s' "$out"; return 0 ;;
-    'LOW '?*) return 2 ;;
+    'LOW '?*) printf '%s' "$out"; return 2 ;;
   esac
   return 1
 }
@@ -1098,7 +1116,15 @@ refusal_evidence() {
   elif grep -Eqi 'api\.github\.com' "$f" 2>/dev/null; then bucket=core
   fi
   sec=0
-  grep -Eqi 'secondary rate limit|abuse detection' "$f" 2>/dev/null && sec=1
+  # ⛔ THE 429 IS A SECONDARY REFUSAL AND THE RUNBOOK SAYS SO. `docs/ops/gh-rate-limits.md`:
+  # "`429`, or `403` whose text names a rate limit / abuse detection → **secondary**".
+  # `rate_limited` already accepts `http 429` to write a window at all, but the KIND was decided by
+  # the three prose phrases alone, so a bare `HTTP 429: Too Many Requests` wrote a window with
+  # NEITHER protecting flag — and a healthy primary read then discharged it, releasing every lane
+  # straight back into the live burst limit the runbook says turns one refusal into a fleet-wide
+  # outage. MEASURED while verifying (#3228 review round 4): lane 1 refused `HTTP 429`, lane 2 read
+  # a healthy `core 4684/5000` 4 s later and DISCHARGED the window (rc=0).
+  grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded|http 429|status code:?[[:space:]]*429' "$f" 2>/dev/null && sec=1
   hdr=0
   grep -Eqi 'x-ratelimit-remaining:[[:space:]]*0([^0-9]|$)' "$f" 2>/dev/null && hdr=1
   # ONE awk, no pipeline (see the SIGPIPE note on `rate_limited`).
@@ -1143,27 +1169,41 @@ record_refusal_evidence() {
 # The evidence governing the OPEN window: the live record with the LATEST deadline (deadlines are
 # monotonic maxima, so the newest window is the one that governs). Prunes records whose window has
 # already expired, so a killed writer cannot wedge this off. Sets REFUSAL_BUCKET / REFUSAL_RETRY_S /
-# REFUSAL_UID. Returns 1 when no live record exists.
+# REFUSAL_UID / REFUSAL_SECONDARY. Returns 1 when no live record exists.
+#
+# ⛔ THE TWO UNDISCHARGEABLE KINDS ARE ACCUMULATED ACROSS EVERY LIVE RECORD, NOT READ OFF THE NEWEST.
+# This reader used to read `retry_after_until` from the newest record ONLY and to ignore the
+# `secondary=` field ENTIRELY — so the one field that says "/rate_limit cannot see this limit" was
+# written to disk and never consumed. MEASURED consequence (#3228 review round 4): a bare `HTTP 429`
+# wrote `secondary=0` (its own classifier gap, now fixed) with no flag, and a healthy read
+# discharged the window. Defence in depth is the point of the record: if ANY live record says
+# `secondary=1`, or carries a `retry-after` deadline that has not passed, the window is honoured —
+# whichever record happens to hold the latest `until`. A missing or malformed field stays 0, so a
+# killed writer cannot wedge the gate OFF either (the flag TTL and this prune both bound it).
 refusal_evidence_live() {
-  local now f u b v best=0
+  local now f u b v s best=0 sec_any=0 ra_max=0
   now="$(now_ms)"
-  REFUSAL_BUCKET="unknown"; REFUSAL_RETRY_S=0; REFUSAL_UID=""
+  REFUSAL_BUCKET="unknown"; REFUSAL_RETRY_S=0; REFUSAL_UID=""; REFUSAL_SECONDARY=0
   for f in "$GATE_DIR"/refusal.*; do
     [ -e "$f" ] || continue
     u="$(sed -n 's/^until=//p' "$f" 2>/dev/null)"; u="${u%% *}"
     case "$u" in ''|*[!0-9]*) rm -f "$f" 2>/dev/null; continue ;; esac
     [ "$u" -le "$now" ] && { rm -f "$f" 2>/dev/null; continue; }
+    s="$(sed -n 's/^secondary=//p' "$f" 2>/dev/null)"; s="${s%% *}"
+    [ "$s" = "1" ] && sec_any=1
+    v="$(sed -n 's/^retry_after_until=//p' "$f" 2>/dev/null)"; v="${v%% *}"
+    case "$v" in
+      ''|*[!0-9]*) : ;;
+      *) if [ "$v" -gt "$now" ] && [ $(( v - now )) -gt "$ra_max" ]; then ra_max=$(( v - now )); fi ;;
+    esac
     [ "$u" -gt "$best" ] || continue
     best="$u"
     b="$(sed -n 's/^bucket=//p' "$f" 2>/dev/null)"; b="${b%% *}"
     REFUSAL_BUCKET="${b:-unknown}"
     REFUSAL_UID="$(sed -n 's/^uid=//p' "$f" 2>/dev/null)"; REFUSAL_UID="${REFUSAL_UID%% *}"
-    v="$(sed -n 's/^retry_after_until=//p' "$f" 2>/dev/null)"; v="${v%% *}"
-    case "$v" in
-      ''|*[!0-9]*) REFUSAL_RETRY_S=0 ;;
-      *) if [ "$v" -gt "$now" ]; then REFUSAL_RETRY_S=$(( (v - now + 999) / 1000 )); else REFUSAL_RETRY_S=0; fi ;;
-    esac
   done
+  REFUSAL_SECONDARY="$sec_any"
+  [ "$ra_max" -gt 0 ] && REFUSAL_RETRY_S=$(( (ra_max + 999) / 1000 ))
   [ "$best" -gt 0 ] || return 1
   return 0
 }
@@ -1187,6 +1227,15 @@ discharge_window() {
   # `secondary rate limit` nor `abuse detection` was recorded as a PRIMARY window, so the first
   # waiting lane read a healthy `core` and deleted it ~59 s before its own `retry-after` expired,
   # releasing every lane at once into the same limit.
+  # ⛔ A SECONDARY/ABUSE WINDOW IS NOT DISCHARGEABLE BY A PRIMARY READ — INCLUDING WHEN ONLY THE
+  # EVIDENCE RECORD SAYS SO. The `secondary.window` flag is the mechanism, but a writer killed
+  # between `cooldown.<until>` and the flag (or a refusal whose kind lives only in the record) would
+  # otherwise leave a burst window unprotected. `refusal_evidence_live` now reports the field, so the
+  # record is defence in depth rather than a file nothing read (#3228 review round 4).
+  if [ "${REFUSAL_SECONDARY:-0}" -eq 1 ]; then
+    gate_note "the shared gh throttle window was written by a SECONDARY/abuse refusal (refusing bucket: ${REFUSAL_BUCKET}${REFUSAL_UID:+, account id $REFUSAL_UID}) — /rate_limit cannot see one, so it is honoured"
+    return 1
+  fi
   if [ "$REFUSAL_RETRY_S" -gt 0 ]; then
     gate_note "the shared gh throttle window is NOT re-derivable yet — the refusal that wrote it carried an authoritative retry-after with ${REFUSAL_RETRY_S}s left (refusing bucket: ${REFUSAL_BUCKET}${REFUSAL_UID:+, account id $REFUSAL_UID}) — honouring it"
     return 1
@@ -1248,6 +1297,21 @@ discharge_window() {
   # Re-read it here: a window that has just become secondary must not be released by a read that
   # predates it (#3228 review, finding 4, second half).
   secondary_live && return 1
+  # ⛔ AND THE SAME RE-READ FOR THE OTHER UNDISCHARGEABLE KIND — AND FOR THE EVIDENCE RECORD. Both
+  # were read BEFORE the lock and before the probe, so a peer that wrote `cooldown.<until>` in that
+  # gap and had not yet written its `retry-after.window` flag / `refusal.<until>` record was NOT
+  # visible to either test, while its cooldown file IS in the snapshot taken below — so the compare-
+  # and-delete removed a window carrying the server's own deadline as if it were an ordinary stale
+  # one. `secondary_live` was re-read here and these two were not, which is the whole asymmetry
+  # (#3228 review round 4, found independently of the peer's own findings). One re-read covers both
+  # halves of the gap: the flag, and the record that is written BEFORE the flag.
+  retry_after_live && return 1
+  if refusal_evidence_live; then
+    if [ "$REFUSAL_RETRY_S" -gt 0 ] || [ "${REFUSAL_SECONDARY:-0}" -eq 1 ]; then
+      gate_note "a peer recorded an authoritative (retry-after or secondary) window during the exempt read — honouring it instead of discharging"
+      return 1
+    fi
+  fi
   # Positive evidence the account is fine: the window cannot be explained by a primary limit.
   # ⛔ COMPARE-AND-DELETE, NEVER `rm -f cooldown.*`. Between the snapshot above and this line sits
   # the exempt read, bounded at REVALIDATE_TIMEOUT_MS — and a peer's FRESH refusal inside that
@@ -1788,7 +1852,7 @@ run_paced() {
         case "$cd_until" in
           ''|*[!0-9]*) : ;;
           *)
-            if grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded' "$errf" 2>/dev/null; then
+            if grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded|http 429|status code:?[[:space:]]*429' "$errf" 2>/dev/null; then
               set_window_kind secondary.window "$cd_until"
             fi
             if grep -Eqi 'retry-after:' "$errf" 2>/dev/null; then
