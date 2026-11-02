@@ -37,6 +37,16 @@ ok()  { pass=$((pass+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31m✗ %s\033[0m\n     %s\n' "$1" "${2:-}"; }
 eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "want [$3] got [$2]"; fi; }
 
+# ⛔ THE HASHER MUST BE PROBED, NOT ASSUMED. `shasum` is a perl script that is not on every image
+# (ubuntu-latest ships `sha256sum` and no `shasum`); an unprobed hasher leaves BOTH sides of an equality
+# empty, so the assertion passes over NO evidence — the repo's already-paid-for false-PASS class, which
+# `deploy-harness.test.sh` resolves the same way. `SHA_CMD` is unquoted at the call sites on purpose: the
+# `shasum` arm is two words.
+if command -v sha256sum >/dev/null 2>&1; then SHA_CMD="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then SHA_CMD="shasum -a 256"
+else printf 'FATAL: no sha256 hasher (sha256sum or shasum) on PATH — refusing to report byte assertions as passed\n' >&2; exit 1
+fi
+
 # ── the stub ─────────────────────────────────────────────────────────────────────────────────────
 mkdir -p "$Q/bin"
 cat > "$Q/bin/stub-cmux" <<'STUB'
@@ -124,6 +134,14 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   # the row must ABSTAIN rather than be carried into a pull as a bogus path.
   if [ -n "${STUB_BAD_SIZE:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
     printf '__OK__ 2\n5\t2026-01-01T00:00:00\t%s/has\ntab.md\n' "$root"; exit 0
+  fi
+  # STUB_BAD_SIZE_NUM: the SAME split record as STUB_BAD_SIZE, but the continuation line is NUMERIC — the
+  # shape a filename like `has<newline>2026` actually produces. STUB_BAD_SIZE's tail (`tab.md`) is
+  # non-numeric, so a guard that only asks "is field 1 numeric?" passes T48/T49 while the numeric tail —
+  # the case that was MEASURED shipping a false PASS — stays completely uncovered. The sentinel count is
+  # `2` and the caller parses `2`, so the count check agrees with itself and only the SHAPE can abstain.
+  if [ -n "${STUB_BAD_SIZE_NUM:-}" ] && [ "${args[2]:-}" != "${args[2]%%find *}" ]; then
+    printf '__OK__ 2\n9\t2026-01-01T00:00:00\t%s/has\n2026\n' "$root"; exit 0
   fi
   # STUB_TAB_NAME: a TAB inside a real filename, with the size/metadata intact. The path is the LAST
   # field, so `read -r sz mt p` must keep the whole name — the earlier order accepted this row as a
@@ -226,8 +244,8 @@ grep -q 'artifact-a-body' "$Q/t1.txt" && ok "T1 body printed" || bad "T1 body pr
 [ -f "$out/pi-cell-1-ci-cause.md" ] && ok "T1 wrote pi-cell-1-ci-cause.md" || bad "T1 wrote the file" "$(ls "$out")"
 # sha, not `cat`: command substitution strips trailing newlines, so a `cat` comparison would pass even
 # if the final newline were lost.
-eq "T1 byte-exact (sha256)" "$(shasum -a 256 < "$out/pi-cell-1-ci-cause.md" | cut -d' ' -f1)" \
-   "$(shasum -a 256 < "$Q/box-a/ci-cause.md" | cut -d' ' -f1)"
+eq "T1 byte-exact (sha256)" "$($SHA_CMD < "$out/pi-cell-1-ci-cause.md" | cut -d' ' -f1)" \
+   "$($SHA_CMD < "$Q/box-a/ci-cause.md" | cut -d' ' -f1)"
 
 echo "T2 — a name held by a DIFFERENT box is collected from that box"
 run collect blocked-histogram > "$Q/t2.txt" 2>&1
@@ -547,10 +565,10 @@ run collect has --out "$out" > "$Q/t28.txt" 2>&1
 rc=$?; unset STUB_TAB_NAME
 export STUB_BOXES="$bx_stub"; export LANE_ARTIFACT_BOXES="$bx_labels"
 eq "T28 exit 0" "$rc" "0"
-got_sha="$(shasum -a 256 < "$out/pi-cell-1-has$(printf '\t')tab.md" 2>/dev/null | cut -d' ' -f1)"
-want_sha="$(shasum -a 256 < "$Q/box-tab/has$(printf '\t')tab.md" | cut -d' ' -f1)"
+got_sha="$($SHA_CMD < "$out/pi-cell-1-has$(printf '\t')tab.md" 2>/dev/null | cut -d' ' -f1)"
+want_sha="$($SHA_CMD < "$Q/box-tab/has$(printf '\t')tab.md" | cut -d' ' -f1)"
 eq "T28 the TAB-named artifact is collected byte-exact" "${got_sha:-missing}" "$want_sha"
-decoy_sha="$(shasum -a 256 < "$Q/box-tab/has" | cut -d' ' -f1)"
+decoy_sha="$($SHA_CMD < "$Q/box-tab/has" | cut -d' ' -f1)"
 [ -n "$got_sha" ] && [ "$got_sha" = "$decoy_sha" ] && bad "T28 collected the DECOY (the name's head) instead" "" \
   || ok "T28 did not collect the name's head as the artifact"
 
@@ -668,14 +686,14 @@ run collect epic-ledger --out "$out" > "$Q/t38a.txt" 2>&1
 rc=$?
 eq "T38 run 1 (complete) exit 0" "$rc" "0"
 [ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T38 run 1 wrote the artifact" || bad "T38 run 1 wrote nothing" "$(ls "$out")"
-sha1=$(shasum "$out/pi-cell-4-epic-ledger.md" 2>/dev/null | cut -d' ' -f1)
+sha1=$($SHA_CMD "$out/pi-cell-4-epic-ledger.md" 2>/dev/null | cut -d' ' -f1)
 STUB_TRUNCATE=1; export STUB_TRUNCATE
 run collect epic-ledger --out "$out" > "$Q/t38b.txt" 2>&1
 rc=$?; unset STUB_TRUNCATE
 eq "T38 run 2 (truncated) exit 5" "$rc" "5"
 [ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T38 the previous artifact SURVIVES a failed re-pull" \
   || bad "T38 a failed re-pull DESTROYED the only copy" "$(ls -a "$out")"
-sha2=$(shasum "$out/pi-cell-4-epic-ledger.md" 2>/dev/null | cut -d' ' -f1)
+sha2=$($SHA_CMD "$out/pi-cell-4-epic-ledger.md" 2>/dev/null | cut -d' ' -f1)
 eq "T38 the surviving artifact is byte-identical" "$sha2" "$sha1"
 # An orphan: a file this failed run staged and the committed index does not describe.
 for f in "$out"/*; do
@@ -1048,7 +1066,7 @@ n49="$(grep -c 'has\.md' "$Q/t49.txt")"
   && ok "T49 printed no inventory row for a listing it could not certify" \
   || bad "T49 PRINTED the decoy path as an inventory entry" "$(grep 'has\.md' "$Q/t49.txt" | head -3)"
 
-echo "T50 — the no-`-printf` FALLBACK arm must not grade a split listing either"
+echo "T50 — the no-\`-printf\` FALLBACK arm must not grade a split listing either"
 # The fallback exists for "a mac, or a stripped image": it builds the rows by re-reading raw path LINES,
 # so a name ending in a newline contributes its row PLUS an empty one. BOTH count checks agree there (the
 # box and the caller see the same split lines), so the sentinel cross-check is structurally incapable of
@@ -1100,6 +1118,72 @@ eq "T50b the FALLBACK arm still inventories a clean listing (exit 0)" "$rc" "0"
 grep -q 'plain\.md' "$Q/t50b.txt" \
   && ok "T50b the clean artifact is listed" \
   || bad "T50b the fallback listed nothing" "$(tail -4 "$Q/t50b.txt")"
+
+echo "T51 — a NUMERIC tail line is a SPLIT record too, and must ABSTAIN"
+# The guard that only checked 'is the size numeric?' shipped a false PASS: a phantom path, the decoy pulled `has<newline>2026` = the artifact (10 B).
+# The record splits into `9\t<mt>\t/root/has` and `2026`. BOTH lines parse as rows under a numeric-size-only
+# guard — `2026` is numeric and its "path" is non-empty — so the tool reported a phantom path at exit 0,
+# never collected the artifact, and pulled the decoy twice. The count check cannot see it (box sends 2,
+# caller parses 2), so this arm is the ONLY thing that pins the shape guard.
+b51="$Q/box-51"; rm -rf "$b51"; mkdir -p "$b51"
+printf 'DECOY-BODY' > "$b51/has"
+printf 'REAL-BODY!' > "$b51/has"$'\n'"2026"
+out="$Q/out51"; mkdir -p "$out"
+STUB_BOXES="pi-cell-1=$b51"; export STUB_BOXES
+export STUB_BAD_SIZE_NUM=1
+run collect 'has' --out "$out" --box pi-cell-1 > "$Q/t51.txt" 2>&1
+rc=$?
+unset STUB_BAD_SIZE_NUM
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T51 exit 4 (UNMEASURED — a numeric split row is not a measurement)" "$rc" "4"
+grep -q 'UNMEASURED' "$Q/t51.txt" \
+  && ok "T51 abstained" \
+  || bad "T51 did not abstain on a numeric split row" "$(tail -4 "$Q/t51.txt")"
+grep -qE '── .*  2026  \(' "$Q/t51.txt" \
+  && bad "T51 reported a phantom path row" "$(grep -E '2026' "$Q/t51.txt" | head -2)" \
+  || ok "T51 reported no phantom row for a path that does not exist"
+grep -q 'file(s) collected from' "$Q/t51.txt" \
+  && bad "T51 claimed a collection from a listing it could not certify" "$(grep 'collected from' "$Q/t51.txt")" \
+  || ok "T51 claimed no collection"
+ls -A "$out" | grep -q . \
+  && bad "T51 installed something from a listing it could not certify" "$(ls -A "$out")" \
+  || ok "T51 installed NOTHING from the split listing"
+
+# ⛔ AND THE GUARD MUST NOT FIRE ON A REAL ROW — an abstention that always fires is not a guard.
+b51b="$Q/box-51b"; rm -rf "$b51b"; mkdir -p "$b51b"
+printf 'REAL-BODY!' > "$b51b/has.md"
+STUB_BOXES="pi-cell-1=$b51b"; export STUB_BOXES
+run ls --box pi-cell-1 > "$Q/t51b.txt" 2>&1
+rc=$?
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T51b a NORMAL row still inventories (exit 0)" "$rc" "0"
+grep -q 'has\.md' "$Q/t51b.txt" \
+  && ok "T51b the ordinary artifact is still listed" \
+  || bad "T51b the shape guard swallowed a legitimate row" "$(tail -4 "$Q/t51b.txt")"
+
+echo "T52 — \`ls\` REFUSES --out instead of silently discarding it"
+# `--out` was parsed for every verb and read by none of `ls`'s branches: exit 0, directory never created,
+# no warning — a caller asking for a durable inventory got a success code and nothing. Same class as the
+# `--out ""` arm; the usage text never offered --out for `ls`.
+b52="$Q/box-52"; rm -rf "$b52"; mkdir -p "$b52"
+printf 'REAL-BODY!' > "$b52/thing.md"
+STUB_BOXES="pi-cell-1=$b52"; export STUB_BOXES
+run ls --box pi-cell-1 --out "$Q/out52" > "$Q/t52.txt" 2>&1
+rc=$?
+export STUB_BOXES="pi-cell-1=$Q/box-a
+pi-cell-3=$Q/box-b
+pi-cell-4=$Q/box-c"
+eq "T52 exit 64 (usage error, not a silent success)" "$rc" "64"
+grep -q 'ls takes no --out' "$Q/t52.txt" \
+  && ok "T52 names the option it refused" \
+  || bad "T52 refused without naming why" "$(head -3 "$Q/t52.txt")"
+[ -d "$Q/out52" ] \
+  && bad "T52 created the --out directory it refused" "$(ls -A "$Q/out52")" \
+  || ok "T52 wrote nothing"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"

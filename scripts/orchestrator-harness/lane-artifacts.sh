@@ -142,6 +142,49 @@ resolve_boxes() {
   done
 }
 
+# row_shape_why <row> -> sets ROW_SHAPE_WHY and returns 0 when the row is NOT a shape `scan` emits.
+#
+# ⛔ A NUMERIC SIZE COLUMN IS NOT ENOUGH TO CERTIFY A ROW. A newline in a filename splits the record, and
+# the continuation line is a SUFFIX OF THE PATH — so the guard that only asks "is field 1 numeric?" is
+# defeated by any name whose tail happens to be digits. Measured with `has` = DECOY (9 bytes) and
+# `has<newline>2026` = the real artifact (10 bytes), `collect has`:
+#
+#   ── pi-cell-1  …/box/has  (9 bytes, …)   DECOY-BODY
+#   ── pi-cell-1  2026  (2026 bytes, 2026)  ⚠ preview failed
+#   ── pi-cell-1  …/box/has  (10 bytes, …)  DECOY-BODY
+#   == 3 file(s) collected from 1 of 1 requested box(es)                    EXIT=0
+#
+# The artifact was NEVER collected, the decoy was pulled twice, a PHANTOM path `2026` was reported with
+# the artifact's bytes, and the run exited 0 = "found". The row COUNT cannot see it either: the box and
+# the caller count the same three split lines, so the sentinel agrees with itself. Only the SHAPE can.
+#
+# What every emitted row actually has, and a path fragment cannot: exactly the two TAB separators the
+# remote's `-printf` writes (a TAB inside a real name only ever adds MORE), and an ABSOLUTE path field
+# (the root is absolute — `$ATIF_ROOT` defaults to /tmp on a cell, and `find "$R"` echoes it back).
+#
+# STATED RESIDUAL: this is a shape test, not an escaping scheme. A filename containing a newline AND two
+# TABs AND an absolute-looking suffix can still forge a row. Closing that needs an escaped or
+# length-prefixed wire format — a change to the `cmux vm exec` protocol, not to this guard. The doctrine
+# is unchanged either way: a failure must never look like a result, so the cheap guard abstains now.
+row_shape_why() {
+  local _row="${1:-}" _t _sz _p
+  _t="$(printf '\t')"
+  case "$_row" in
+    *"$_t"*"$_t"*) ;;
+    *) ROW_SHAPE_WHY="no field separators — a bare fragment of a path ('${_row:0:24}')"; return 0 ;;
+  esac
+  _sz="${_row%%"$_t"*}"
+  case "${_sz:-}" in
+    ''|*[!0-9]*) ROW_SHAPE_WHY="a non-numeric size column ('${_sz:0:24}')"; return 0 ;;
+  esac
+  _p="${_row#*"$_t"}"; _p="${_p#*"$_t"}"
+  case "${_p:-}" in
+    /*) ;;
+    *) ROW_SHAPE_WHY="a non-absolute path ('${_p:0:24}')"; return 0 ;;
+  esac
+  return 1
+}
+
 # scan <vm> <pattern> <since_minutes|""> <exact:0|1>
 #   -> `__OK__` then `size<TAB>mtime<TAB>path` rows, or `__NOK__ <reason>` and nothing else.
 #      ⛔ the PATH is the LAST field on purpose — see the `-printf` block in `scan` for the false PASS
@@ -400,11 +443,10 @@ emit_box() {
     # ⛔ IT MUST RUN BEFORE THE EMPTY-PATH `continue`: a record split by a newline leaves a tail line whose
     # PATH field is empty and whose first field is a name fragment — checked in the other order that line
     # was silently skipped and the box read as fully parsed (found while pinning T17).
-    case "${sz:-}" in
-      ''|""|*[!0-9]*)
-        echo "── $label  UNMEASURED(unparseable scan row — newline in a filename? raw: ${sz:-<empty row>} ${p:-<no path field>})"
-        R_REACHED=0; R_UNPARSE=$((R_UNPARSE + 1)); return 1 ;;
-    esac
+    if row_shape_why "$row"; then
+      echo "── $label  UNMEASURED(unparseable scan row — newline in a filename? ${ROW_SHAPE_WHY}; raw: ${sz:-<empty row>} ${p:-<no path field>})"
+      R_REACHED=0; R_UNPARSE=$((R_UNPARSE + 1)); return 1
+    fi
     [ -n "${p:-}" ] || continue
     R_HITS=$((R_HITS + 1))
     echo
@@ -715,6 +757,13 @@ case "$verb" in
     finish 0
     ;;
   ls)
+    # ⛔ `--out` IS PARSED FOR EVERY VERB BUT THIS ONE WRITES NO FILE. It was accepted, parsed into
+    # `$outdir`, and then never read by this branch — exit 0, the directory never created, no warning — so
+    # a caller who asked for a durable inventory got a success code and nothing. That is the same
+    # "silently ignored option" defect the `--out ""` and `--box ""` arms below record one value over,
+    # and the usage text never advertised --out for `ls` in the first place. A usage error is a usage
+    # error, not a silently dropped request.
+    [ -z "$outdir" ] || { echo "lane-artifacts: ls takes no --out (it writes no file — use collect or logs for that)" >&2; usage; }
     T="$(printf '\t')"; ls_hole=0; any_scanned=0
     show() {  # show <label> <vm> <fragment> <cap> <what> — checked in BOTH scans, not just the first
       local label="$1" vm="$2" frag="$3" cap="$4" what="$5" raw first rows
@@ -753,11 +802,14 @@ case "$verb" in
       # newline yields its real row plus an EMPTY one, and the empty one became a printed entry — while
       # the two count checks agree, because the box and the caller both see the same split lines. A count
       # cannot see this; the row shape can.
+      # ⛔ THE SHAPE TEST IS `row_shape_why`, NOT "is the size numeric". A numeric-only guard is defeated by
+      # a filename whose newline tail is itself digits (`has<newline>2026` emits a row whose first field is
+      # `2026`), which this verb printed as an inventory entry with the artifact's size and a phantom path,
+      # at exit 0. Both count checks agree on that record, so only the shape can catch it.
       while IFS= read -r _row; do
-        _sz="${_row%%$(printf '\t')*}"
-        case "${_sz:-}" in
-          ''|*[!0-9]*) echo "   UNMEASURED($what: a row carries no numeric size ('${_row:0:40}') — the listing is not a map this verb can certify)"; return 1 ;;
-        esac
+        if row_shape_why "$_row"; then
+          echo "   UNMEASURED($what: ${ROW_SHAPE_WHY} — the listing is not a map this verb can certify)"; return 1
+        fi
       done <<< "$rows"
       n="$(printf '%s\n' "$rows" | wc -l | tr -d ' ')"
       # ⛔ A ROW-CAPPED SCAN IS NOT A TOTAL. `scan` stops at ROW_CAP, so `n` was at most ROW_CAP+1 while this
