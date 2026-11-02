@@ -4768,10 +4768,10 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
 # skipped exactly this premise: with no record at A, `clean` was minted for a head
 # whose authored content nobody had reviewed).
 EP=425100; rm -f "$(Q2 $EP)"
-printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
-  "$EP" "$DG_A1" > "$(Q2 $EP)"
-run_record_delta $EP "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
-assert_eq "$RECORD_RC" "0" "20a a base-borne merge-only delta records clean (rc 0)"
+printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
+run_record_delta $EP "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42510001" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+assert_eq "$RECORD_RC" "0" "20a a base-borne merge-only delta with a real cover records clean (rc 0)"
 R20="$(cat "$(Q2 $EP)" 2>/dev/null || true)"
 assert_contains "$R20" '"delta_kind":"merge-only"' "20a the record says the range was merge-only"
 assert_contains "$R20" "\"delta_base\":\"$DG_M1\"" "20a the record stores the BASE it was classified against (re-derivable)"
@@ -4902,7 +4902,7 @@ assert_eq "$(cat "$T/drc6" 2>/dev/null || echo 99)" "2" "20f delta evidence with
 EH1=425130; rm -f "$(Q2 $EH1)"
 run_record_delta $EH1 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
 assert_eq "$RECORD_RC" "3" "20h1 a merge-only delta whose A is NOT attested is refused (rc 3)"
-assert_contains "$RECORD_ERR" "NOT an attested head" "20h1 the refusal names the missing premise (extends, never creates)"
+assert_contains "$RECORD_ERR" "EXTENDS an attestation and can never create one" "20h1 the refusal names the missing premise (extends, never creates)"
 [ ! -f "$(Q2 $EH1)" ] && ok "20h1 no record written (zero-evidence mint closed)" || bad "20h1 a zero-evidence clean was minted"
 
 # 20h2 AN EVIL MERGE: a conflict resolution living ONLY in the merge commit. The
@@ -5194,6 +5194,31 @@ assert_eq "$RECORD_RC" "3" "20h15 a body stating a NARROWER range is refused (rc
 assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal names the contradiction"
 [ -f "$(Q2 $EH18)" ] && bad "20h15 no record was written" || ok "20h15 no record was written"
 
+# 20h14 MERGE-ONLY + A NAMED COVER IS REACHABLE. In the ordering this feature exists
+#       for — verdict at A, THEN the base merge creates B — a verdict written before B
+#       existed cannot name B. The cover anchor is A and the claim is "names A".
+EH16=425162; rm -f "$(Q2 $EH16)"
+printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
+run_record_delta $EH16 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516301" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+assert_eq "$RECORD_RC" "0" "20h14 merge-only + a cover naming A records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EH16)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h14 the range stays merge-only"
+EH17=425164; rm -f "$(Q2 $EH17)"
+run_record_delta $EH17 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516501" \
+    STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+assert_eq "$RECORD_RC" "3" "20h14 a cover PREDATING A is still refused (rc 3)"
+
+# 20h15 A BODY THAT STATES A DIFFERENT RANGE. Quoting a NARROWER range must not
+#       satisfy the claim for a wider one — the record would assert a range its own
+#       artifact contradicts.
+EH18=425166; rm -f "$(Q2 $EH18)"
+run_record_delta $EH18 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h15 a body stating a NARROWER range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal names the contradiction"
+[ -f "$(Q2 $EH18)" ] && bad "20h15 no record was written" || ok "20h15 no record was written"
+
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -5309,6 +5334,10 @@ mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HE
 #      hand-resolved merge, so dropping the merges from `cands` must ACCEPT it.
 MUT="$(mk_mutant evilanchor '    if [ -n "$evil_shas" ]; then' '    if false; then')"
 mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42514001" accepted STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+# M14 — THE RANGE CONTAINMENT. Removing the ancestry test lets a body that declares a
+#       NARROWER range satisfy the claim for a wider one (20h15).
+MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
+mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
@@ -5330,28 +5359,16 @@ mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "de
 
 # M12 — THE RANGE CLAIM. Deleting the (10a) arm must mint `clean` from a cover that
 #       never says which range it reviewed — the date-only inference the arm replaced.
-MUT="$(mk_mutant rangeclaim '    if [ "$body_claim" -ne 1 ]; then' '    if false; then')"
+MUT="$(mk_mutant rangeclaim '      for _needle in "$to" "${to:0:12}"; do' '      body_claim=1; for _needle in "$to" "${to:0:12}"; do')"
 mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
 # M14 — THE RANGE CONTAINMENT. Deleting it lets a body that declares a NARROWER range
 #       satisfy the claim for a wider one (20h15).
 MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
 mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
-# M8 — the TIER arm. Widening the premise back to the non-review tiers must let a
-#      clean-micro prior record mint `clean`. Inline, not via mut_check: mut_check
-#      clears the record and this vector's premise IS a planted record.
-MUT="$(mk_mutant tier "case \"\$prior_verdict\" in clean) : ;; *) prior_verdict=\"\" ;; esac" \
-                "case \"\$prior_verdict\" in clean|clean-micro|clean-low) : ;; *) prior_verdict=\"\" ;; esac")"
-MM=$((MM+1))
-if [ ! -s "${MUT:-}" ]; then
-    bad "20g M8 tier arm: the mutant could not be built — this vector was NOT measured"
-else
-    rm -f "$(Q2 425141)"
-    printf '{"pr":%d,"head_sha":"%s","verdict":"clean-micro","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
-      425141 "$DG_A1" > "$(Q2 425141)"
-    mut_run "$MUT" 425141 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
-    if [ "$RECORD_RC" = "0" ]; then MM_OK=$((MM_OK+1)); ok "20g M8 tier arm: guard removed → a clean-micro prior record mints 'clean' (rc 0), so 20h6 is load-bearing"
-    else bad "20g M8 tier arm: mutant still refused (rc=$RECORD_RC) — the vector is vacuous"; fi
-fi
+# M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
+# forgery vector (review minted a signed `clean` from one `printf`), so there is no
+# tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
+# mandatory-cover arm.
 echo "   MUTATION-MATRIX($MM_OK/$MM)"
 set -e
 if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every dispatched cell behaved as its vector predicted — the guard-load-bearing cells AND M1b, which deliberately measures the OPPOSITE (that the A==B arm is REDUNDANT because the empty-diff arm already refuses it); the other delta arms are pinned by refusal vectors only, not by a mutant"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
