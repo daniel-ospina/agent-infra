@@ -15937,19 +15937,53 @@ for bad in 10m 99999999999999999999999 0 019864; do
   fi
 done
 
-# (p4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review P1). A future start stamp
-# used to let a live rail outlive its own deadline. Now it is clamped to real now,
-# so the attempt can only be OLDER — the fail-safe direction.
+# (p4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
+# MUST DISCRIMINATE. Review cycle 2 found the first version of this arm asserted
+# only the ABSENCE of a refusal, which the BROKEN code also produced (a future stamp
+# made elapsed negative, so nothing fired): it could not tell "CLAMPED" from "the
+# guard was never reached". It now asserts the clamp's own DISCLOSURE, which only
+# exists when the clamp ran.
 SCEN="$TMP/scen-p4"; mkdir -p "$SCEN"
 set +e
 SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
   run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 p4_rc=$?
 set -e
+grep -q 'CLAMPED to now' "$SCEN/err" \
+  && pass "(p4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
+  || fail "(p4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
 grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
   && fail "(q4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
-  || pass "(q4) a future start stamp cannot make the attempt younger (rail ran its normal course, no false refusal at rc=$p4_rc)"
+  || pass "(q4) …and it produced no spurious refusal (rc=$p4_rc)"
 
+# (q5) THE SEAM IS VALIDATED LIKE THE KNOB (review cycle 2 P1). An all-digit
+# 23-digit stamp made `[ -lt ]` ERROR, the erroring body was SKIPPED under `set -u`
+# without `-e`, and the age was silently CANCELLED — the young direction. A leading
+# zero was worse: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL.
+for bads in 999999999999999999999999 01767000000 notanepoch; do
+  SCEN="$TMP/scen-p5-$bads"; mkdir -p "$SCEN"
+  set +e
+  SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT="$bads" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+  bads_rc=$?
+  set -e
+  if [ "$bads_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_STARTED_AT' "$SCEN/err"; then
+    pass "(q5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' is REFUSED BY NAME (rc=2), never a silent age-cancel or octal misread"
+  else
+    fail "(q5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' was accepted (rc=$bads_rc) — the seam's age can be cancelled or misread"
+  fi
+done
+
+# (q6) THE INSPECTION SURFACE REPORTS THE BOUND IN FORCE (review cycle 2 P2). It
+# used to print the DEFAULT, so `--print-bounds` said 20254 while a real run used
+# 500 — "reported bound ≠ bound used" in the one field an operator greps.
+SCEN="$TMP/scen-p6"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=500 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+grep -q '^rail-deadline=500' "$SCEN/out" \
+  && pass "(q6) --print-bounds reports the bound IN FORCE (500), not the 20254 default" \
+  || fail "(q6) --print-bounds does not report the bound in force — the operator is sent to a number the rail is not using"
+grep -q '^rail-deadline-source=' "$SCEN/out" \
+  && pass "(q6) --print-bounds carries the derivation, so the number is auditable" \
+  || fail "(q6) --print-bounds has no rail-deadline-source line"
 
 # #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
 # file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is
