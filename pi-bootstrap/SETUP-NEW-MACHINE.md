@@ -97,9 +97,14 @@ API keys. Transfer it (AirDrop works — it's tiny).
 Tortoise graph before researching, confirm direction in it before implementing, write the learning
 after) needs it, and nothing in this repo can deliver it — there is no secret store wired to the
 fleet, so it is HAND-PROVISIONED: it must be a line in `pi-keys.env` here (and in a cell's `keys.env`).
+⛔ **Step 4's "delete `pi-keys.env`" does not apply to this key** — nothing re-creates it (unlike the
+provider keys, which pi keeps after `/login`), so put it where your keys survive that deletion (a
+password manager, or `~/keys.env` sourced by your profile) before deleting the file, or the graph
+mandate silently loses its credential.
 The client itself (`~/.pi/agent/scripts/tortoise-graph.sh`) IS delivered by the setup — it is farmed
 from this repo — so a box missing ONLY this key reports `GRAPH-UNREACHABLE(NO-KEY)` on every call
-while `bash scripts/cloud-cell-bringup.sh --check` warns by variable NAME (never its value).
+(`bash ~/.pi/agent/scripts/tortoise-graph.sh health` is the local reading; on a cell,
+`bash scripts/cloud-cell-bringup.sh --check` additionally warns by variable NAME, never its value).
 Re-generate it from the Tortoise dashboard at `tortoise.premiselabs.co` (the sign-up site, not the API
 host).
 

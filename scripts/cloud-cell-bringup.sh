@@ -1456,10 +1456,27 @@ check_graph_client() {
   # TORTOISE_API_KEY is the REST key (`tt_…`, /v1/points) used by `scripts/tortoise-memory.mjs`, a
   # different transport from the `/mcp/` endpoint this client calls. A box carrying only the REST name
   # gets a `warn:` — an `ok` there is the false-PASS shape this file exists to remove.
-  if [ -n "${TORTOISE_MCP_API_KEY:-}" ]; then
-    ok "graph credential: TORTOISE_MCP_API_KEY is present in this environment (value not printed)"
+  #
+  # ⛔ WHOSE ENVIRONMENT ANSWERS THE QUESTION. The mandate needs "a LANE will have the key", and a
+  # lane's environment is `$ENV_FILE` — the controller session RE-SOURCES it, while an ambient export
+  # in this bring-up shell never reaches a lane (`cloud-cell-supervisor.sh` states the rule). So the
+  # FILE is the authority and the running environment only proves the value is readable at all; the
+  # probe is the supervisor's own idiom (source it in a throwaway `env -u` subshell), not a second
+  # rule. Reporting `ok` on an ambient-only export would certify a box whose every lane reports NO-KEY.
+  local in_file="unknown"
+  if [ -r "$ENV_FILE" ]; then
+    if env -u TORTOISE_MCP_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${TORTOISE_MCP_API_KEY:-}" ]' _ "$ENV_FILE" 2>/dev/null; then
+      in_file="set"
+    else
+      in_file="unset"
+    fi
+  fi
+  if [ "$in_file" = "set" ]; then
+    ok "graph credential: TORTOISE_MCP_API_KEY is set in $ENV_FILE (the file every lane re-sources; value not printed)"
+  elif [ -n "${TORTOISE_MCP_API_KEY:-}" ]; then
+    warn "graph credential NOT REACHING LANES: TORTOISE_MCP_API_KEY is in this bring-up shell but NOT in $ENV_FILE, and a lane's environment comes from that file (the controller re-sources it; an ambient export does not follow). FIX: add the line to $ENV_FILE and re-run — until then every lane reports GRAPH-UNREACHABLE(NO-KEY)"
   elif [ -n "${TORTOISE_API_KEY:-}" ]; then
-    warn "graph credential UNCERTAIN: only TORTOISE_API_KEY is set. That is the REST key (tt_…, /v1/points — scripts/tortoise-memory.mjs), and the graph client speaks JSON-RPC to /mcp/, so this key may be REJECTED by the endpoint. FIX: set TORTOISE_MCP_API_KEY alongside it (hand-provisioned, from the Tortoise dashboard) and re-run; a lane will report GRAPH-UNREACHABLE rather than silently skipping the read or the write"
+    warn "graph credential UNCERTAIN: only TORTOISE_API_KEY is set. That is the REST key (tt_…, /v1/points — scripts/tortoise-memory.mjs), and the graph client speaks JSON-RPC to /mcp/, so this key may be REJECTED by the endpoint. FIX: add TORTOISE_MCP_API_KEY to $ENV_FILE (hand-provisioned, from the Tortoise dashboard) and re-run; a lane will report GRAPH-UNREACHABLE rather than silently skipping the read or the write"
   else
     warn "graph credential MISSING: neither TORTOISE_MCP_API_KEY nor TORTOISE_API_KEY is set, so $client exits 3 GRAPH-UNREACHABLE(NO-KEY) and the mandate cannot run. ⛔ The fleet has NO secret store wired to it — this key is HAND-PROVISIONED: add its line to $ENV_FILE on a cell (on a Mac, to pi-keys.env — pi-bootstrap/SETUP-NEW-MACHINE.md step 3) and re-run. Lanes MUST report GRAPH-UNREACHABLE(NO-KEY) rather than silently skipping the read or the write"
   fi
