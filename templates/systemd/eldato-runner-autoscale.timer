@@ -1,0 +1,26 @@
+[Unit]
+# Every ~9 minutes, and the cadence is not a guess: it is the interval the converger itself renders
+# into the unit pair it writes with `--install-unit` ("Run the CI runner converger every ~9 minutes",
+# OnBootSec=2min / OnUnitActiveSec=9min). Two artifacts that schedule the same pass on different
+# clocks is a drift nobody reads, so the template carries the pass's own number rather than a second
+# opinion. Why 9 and not hourly: a DEAD listener costs a whole shard's throughput for every minute it
+# is down, and an over-subscribed box queues every job behind CPU contention — both are conditions the
+# pass repairs, so the repair is worth more often than an hour. The pass is cheap and idempotent when
+# there is nothing to do (one pool read, one queue read, no action), and systemd will not overlap two
+# instances of an active oneshot service, so a long pass simply consumes its next tick.
+Description=eldato runner autoscale every ~9 minutes
+
+[Timer]
+# A pass shortly after boot (so a rebooted cell is converged without waiting out an interval), then
+# every 9 minutes measured from the last activation.
+OnBootSec=2min
+OnUnitActiveSec=9min
+Unit=eldato-runner-autoscale.service
+# ⛔ NOT `OnCalendar=` AND NOT `Persistent=`: both belong to a pass whose failure is an AGE (the disk
+# reaper's hourly sweep). This pass's failure is a STATE — a runner that died, a box under-filled, a
+# queue nobody is draining — and it is re-measured from scratch on every tick, so a missed tick costs
+# nothing but a later repair. `Persistent=true` only applies to `OnCalendar=` anyway, and writing it
+# here would suggest a catch-up semantic this unit does not have.
+
+[Install]
+WantedBy=timers.target

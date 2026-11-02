@@ -1,0 +1,109 @@
+[Unit]
+# eldato runner autoscale — converge this box's CI runner pool to the ceiling it can actually
+# sustain, on a clock (agent-infra#2403, under the owner ruling in #2344).
+#
+# WHY THIS IS SCHEDULED AND NOT A HUMAN'S MEMORY. The converger
+# (scripts/orchestrator-harness/runner_autoscale.py — landed in #2877/#2900, reviewed and tested since)
+# is the pass that DERIVES this box's ceiling from its cores plus its MEASURED free memory, restarts a
+# dead listener, re-registers an orphaned one, and adds capacity up to that ceiling. Until this unit
+# existed NOTHING RAN IT: the file's own header said so, `templates/systemd/` carried one job pair (the
+# disk reaper), and the capability was reachable only by a human who remembered the path. MEASURED on
+# pi-cell-1 (2026-10-29): 8 cores => ceiling 3, and the box carried FIVE live listeners against it
+# while the tortoise CI queue sat at 34 waiting runs with no landing for 13 hours. A capacity predicate
+# that only runs when someone types it is not a predicate, it is a note.
+#
+# WHY A TIMER AND NOT A LINE IN THE BRING-UP. Same split as the rest of this family (#2032/#2048/#2058,
+# #2416): the artifact has to be RENDERED from machine state (HOME, PATH, the interpreter, the script,
+# the state dir) and installed IDEMPOTENTLY; the bring-up is the trigger, this is the policy of WHERE
+# and HOW. One place renders and converges — scripts/install-runner-autoscale-timer.sh.
+#
+# ⛔ IT SHIPS DISARMED, AND ARMING IS A SEPARATE DATED OWNER STEP. The mode value is rendered by the
+# installer from an arming record in this box's own state dir (the mechanism #1678 established for
+# deletion tools and #1863/#2053 reuse): no record means the pass measures, classifies and PRINTS its
+# plan while changing nothing (the disarmed flag); a record carrying BOTH `armed-by=` and `armed-date=`
+# means NO mode argument is passed at all, because converging is the pass's DEFAULT and it accepts no
+# flag to select it. There is deliberately no environment default that can arm this unit — an ambient
+# export would arm a fleet with nothing on disk to show for it, and a merged template that armed a box
+# by itself would make a per-box capacity decision on every box that installs it.
+Description=eldato runner autoscale — converge this box's CI runner pool to its measured ceiling
+Documentation=file:{{SCRIPT}}
+# It reads the pool and the queue over the network and may start a runner. This ordering only avoids a
+# guaranteed first-read failure on a box that boots disconnected; an unreadable pool is exit 2 (RED) and
+# heals on the next tick, never a silent pass.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The pass runs as the INVOKING user: the runner installs are that account's, and a root pass would
+# look after root's processes while the lanes' runners were untouched — a green tick that converged
+# nothing. (The installer refuses a sudo-invoked root install for the same reason; this line is the
+# other half of that guard. The user-scope arm drops it, because systemd rejects `User=` there.)
+User={{USER}}
+Environment=HOME={{HOME}}
+Environment=PATH={{PATH}}
+# The record dir: the pass appends its JSON log there, and the installer keeps the arming record there
+# too. Exported so the scheduled pass and an operator's `--status` read ONE path, not two that look
+# alike.
+Environment=RUNNER_AUTOSCALE_STATE_DIR={{STATE_DIR}}
+# ⛔ THE PROVISIONER IS PINNED WHEN THE INSTALL RESOLVED ONE, AND THE WHOLE LINE IS OMITTED WHEN IT DID
+# NOT. The pass creates a NEW install only through tools/install-ci-runner-x64.sh (the one registration
+# path — it downloads and sha256-checks the runner binary), and its own candidate list cannot resolve
+# that from a scheduled pass: with no `WorkingDirectory=` the cwd is `/`, which kills the `$PWD/tools/…`
+# candidate. So the install measures the path ONCE, while the operator stands in a checkout that has
+# it, and pins the answer here. With no line, the unit can REPAIR and RE-REGISTER but can never ADD —
+# the installer states that loudly at install time rather than leaving it to be discovered as red ticks
+# every nine minutes. (An EMPTY pin would be worse than no line: `Environment="X="` sets the variable to
+# the empty string, which the pass would then have to tell apart from unset.)
+{{PROVISIONER_ENV}}
+# ⛔ NO `WorkingDirectory=` — AND THAT IS A MEASURED FIX, NOT AN OMISSION. `%h` means the home of the
+# account running the SERVICE MANAGER, which for a SYSTEM unit is /root even with `User=` set
+# (systemd.unit(5)), and this unit is normally installed into /etc/systemd/system: measured on
+# pi-cell-1, the first install of this very pair failed `status=200/CHDIR` ("Changing to the requested
+# working directory failed: Permission denied") because the service account cannot enter /root — the
+# unit was installed, enabled, scheduled, and started NOTHING. The pass needs no cwd at all (every path
+# it uses is absolute, and the one candidate that was cwd-relative is the provisioner, which is PINNED
+# below), so the honest artifact states none and inherits systemd's default `/`: an existing, durable
+# directory that no reclaim and no permission bit can take away.
+# A user-scope install does not need `%h` either, so the pair renders identically in both scopes — the
+# installer drops `User=` for the user scope and changes nothing else.
+# A background convergence, never a deadline: it must not compete with a lane (or with a runner it is
+# repairing) for CPU.
+Nice=10
+IOSchedulingClass=idle
+# ⛔ QUOTED, AND THE INTERPRETER AND SCRIPT ARE ABSOLUTE AND MEASURED. systemd splits ExecStart on
+# whitespace, so an unquoted path containing a space yields a unit that fails on EVERY tick — a
+# cron-style silent break of the very schedule being installed. A bare `python3` is not a PATH lookup
+# either: it fails 203/EXEC on a box whose interpreter is `python3.12` only. The installer resolves the
+# interpreter (refusing one older than 3.12, which the pass's own guard rejects) and pins both.
+#
+# ⛔ THE MODE VALUE HERE IS `--dry-run` WHEN DISARMED AND NOTHING WHEN ARMED. The pass has no
+# affirmative-mode flag: converging is its DEFAULT and `--dry-run` is the ONLY switch it accepts, so an
+# armed render leaves the value empty (`ExecStart=` then ends with a space, which systemd drops).
+# Measured on pi-cell-1: an armed install that rendered the affirmative flag made the pass exit 2 on
+# every tick (unrecognized arguments) — a schedule that was installed, enabled, listed and inert.
+ExecStart="{{PYTHON}}" "{{SCRIPT}}" --repo "{{REPO}}" {{MODE_FLAG}}
+# ⛔ THE TIMEOUT MUST NOT BE SHORTER THAN A LEGITIMATE PASS. This is the converger's own number — it
+# renders 5400 s into the pair it writes with `--install-unit`, and its comment there carries the
+# arithmetic: the provisioner alone is bounded at 1800 s, a DEAD restart adds up to 180 s plus a
+# pool-read wait, `config.sh` is 600 s and may run twice on the already-configured retry. systemd's
+# default SIGTERM lands inside `register()`'s clear -> configure -> restore window, which leaves an
+# install with its `.runner` and key DELETED and its slot reading FREE to the provisioner — so the next
+# pass adds a SECOND install over the top. A bound above that sum still bounds a wedge, and the
+# 9-minute cadence below is unchanged either way: systemd will not start a second instance of an active
+# oneshot, which is the mutual exclusion the CLI deliberately keeps no lock for. It is the reason two
+# passes can never repair one runner at once.
+TimeoutStartSec=5400
+# ⛔ NO `-` PREFIX, AND NO `SuccessExitStatus=` LINE — both deliberate. The pass's exit vocabulary is:
+#   0 a CAPACITY ANSWER (converged / at-ceiling / under-target / over-ceiling / provisioner-refused —
+#     it measured the box, decided, and changed nothing it could have changed);
+#   1 a REFUSAL (`--want` above the ceiling — unreachable on this timer, which never passes `--want`);
+#   2 a measurement or pool read was UNREADABLE (fail-closed, nothing changed);
+#   3 an ACTION failed;
+#   4 STARVATION — `queued>0`, `busy==0`, `online>0` confirmed, and the queue can reach this pool.
+# 2, 3 and 4 are exactly the states a human must look at, so 0 is the ONLY green. Greening 2 would hide
+# a pass that could not measure; greening 4 would silently retire the alarm #2875 exists for — a
+# starved box otherwise reads perfectly healthy, and that is the one failure this unit is best placed
+# to catch.
+[Install]
+WantedBy=multi-user.target
