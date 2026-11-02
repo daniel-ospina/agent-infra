@@ -160,7 +160,7 @@ if ! mkdir "$LOCK.d" 2>/dev/null; then
   echo "$(date -u +%FT%TZ) stale lock from pid $holder — taking it" >> "$LOG"; rm -rf "$LOCK.d"; mkdir "$LOCK.d" || exit 0
 fi
 echo $$ > "$LOCK.d/pid"; trap 'rm -rf "$LOCK.d"' EXIT INT TERM
-say() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+log_line() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 # ── merge-slot accounting, PER REPO ─────────────────────────────────
 # Attribution has PRECEDENCE, and it is ONE pass over the process table rather than three greps over it —
 # three greps is how a rail can be counted twice by one and never by another.
@@ -179,7 +179,7 @@ rails_for_repo() {
   # `0 0 0`: the guard in `rails_should_defer` never fired, BOTH bounds disarmed, and the log read
   # byte-identically to a healthy idle box. Capture the table and its STATUS first, and print NOTHING
   # on failure — empty output is exactly what makes that guard defer (fail-closed).
-  tbl="$(ps -eo args= 2>/dev/null)" || { say "COUNTER-FAILED: ps rc=$? — cannot read the process table, deferring $1 (fail-closed)"; return 1; }
+  tbl="$(ps -eo args= 2>/dev/null)" || { log_line "COUNTER-FAILED: ps rc=$? — cannot read the process table, deferring $1 (fail-closed)"; return 1; }
   printf '%s\n' "$tbl" | python3 -c '
 import sys
 me = sys.argv[1].split("/")[-1]
@@ -218,7 +218,7 @@ rails_should_defer() {  # $1 = this repo (owner/name), $2.. = every repo driven
   # errors — and an errored `[` reads as FALSE, i.e. LAUNCH. So say it and defer: a population I cannot
   # read is load I cannot rule out, which is the same fail-closed rule as the unknown bucket.
   case ":${own}:${total}:${unk}:" in
-    *[!0-9:]*|::*|*::|*:::*) say "COUNTER-FAILED: rails_for_repo produced no usable counts — deferring $1 (fail-closed)"; return 0;;
+    *[!0-9:]*|::*|*::|*:::*) log_line "COUNTER-FAILED: rails_for_repo produced no usable counts — deferring $1 (fail-closed)"; return 0;;
   esac
   [ $(( own + unk )) -ge "$MAX" ] || [ "$total" -ge "$MAX_TOTAL" ]
 }
@@ -244,7 +244,7 @@ candidate_deferred() {  # $1 = this repo, $2.. = every repo driven  (rc 0 = defe
 # change exists to unstarve get deferred. A FUNCTION so the suite drives all three answers.
 rail_already_running() {  # $1 = PR number
   local tbl live
-  tbl=$(ps -eo args= 2>/dev/null) || { say "COUNTER-FAILED: ps rc=$? — cannot rule out an existing rail for #$1 (fail-closed)"; return 2; }
+  tbl=$(ps -eo args= 2>/dev/null) || { log_line "COUNTER-FAILED: ps rc=$? — cannot rule out an existing rail for #$1 (fail-closed)"; return 2; }
   live=$(printf '%s\n' "$tbl" | grep -cE "[a]dmin-merge[.]sh([[:space:]]+[^[:space:]]+)*[[:space:]]+$1([[:space:]]|$)")
   [ "$live" -gt 0 ]
 }
@@ -264,15 +264,15 @@ rail_says_skip() {  # $1 = rc from rail_already_running  (rc 0 = skip this candi
 if [ -d "$RAIL_HUB/.git" ]; then
   if git -C "$RAIL_HUB" fetch -q --depth 1 origin main 2>>"$LOG" \
      && git -C "$RAIL_HUB" -c advice.detachedHead=false checkout -q -B main origin/main 2>>"$LOG"; then
-    say "rail-hub refreshed -> $(git -C "$RAIL_HUB" rev-parse --short HEAD)"
+    log_line "rail-hub refreshed -> $(git -C "$RAIL_HUB" rev-parse --short HEAD)"
   else
-    say "rail-hub REFRESH FAILED — running $(git -C "$RAIL_HUB" rev-parse --short HEAD) (possibly stale)"
+    log_line "rail-hub REFRESH FAILED — running $(git -C "$RAIL_HUB" rev-parse --short HEAD) (possibly stale)"
   fi
 else
-  say "REFUSED: no rail clone at $RAIL_HUB — the rail cannot be executed from ~/Documents (TCC)"
+  log_line "REFUSED: no rail clone at $RAIL_HUB — the rail cannot be executed from ~/Documents (TCC)"
   exit 3
 fi
-say "auto-rail started max=$MAX interval=${INTERVAL}s rail=$RAIL_SCRIPT"
+log_line "auto-rail started max=$MAX interval=${INTERVAL}s rail=$RAIL_SCRIPT"
 
 while :; do
   for repo in $REPOS; do
@@ -336,15 +336,15 @@ PY
     # NOTHING between 14:47 and 15:20 — alive, polling, and either finding zero candidates or
     # refusing silently — and those two readings are indistinguishable from the log. That is the
     # exact ALIVE / REFUSING / IDLE ambiguity the fleet keeps paying for (agent-infra #2700): a
-    # capability that cannot say "I looked and found nothing" gets diagnosed as dead on the next
+    # capability that cannot log_line "I looked and found nothing" gets diagnosed as dead on the next
     # bad day. One line per repo per pass makes the answer readable.
     # The counts are PER REPO (that is the fix) and `unattributed` is printed rather than dropped: a
     # rail nobody can attribute is unknown load, and a report that omits it reads as "none".
     read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
-    say "$repo pass: candidates=$(wc -l < /tmp/auto-rail-cand.$$) cand_bytes=$(wc -c < /tmp/auto-rail-cand.$$ 2>/dev/null || echo MISSING) rails_on_repo=$_own rails_live=$_total unattributed=$_unk max=$MAX max_total=$MAX_TOTAL"
+    log_line "$repo pass: candidates=$(wc -l < /tmp/auto-rail-cand.$$) cand_bytes=$(wc -c < /tmp/auto-rail-cand.$$ 2>/dev/null || echo MISSING) rails_on_repo=$_own rails_live=$_total unattributed=$_unk max=$MAX max_total=$MAX_TOTAL"
     while read -r pr; do
       [ -z "${pr:-}" ] && continue
-      case "$DENY" in *" $pr "*) say "$repo #$pr DENIED — duplicate-pair member or contradictory PR pending a decision"; continue;; esac
+      case "$DENY" in *" $pr "*) log_line "$repo #$pr DENIED — duplicate-pair member or contradictory PR pending a decision"; continue;; esac
       # ⛔ THE SAME FAIL-OPEN THIS FILE FORBIDS AT THE COUNTER, one line below it. No `pipefail` here,
       # so a `ps` that cannot run left `grep -c` reading EOF and printing `0`: "I cannot see the process
       # table" became "no rail is running for #pr", and the actuator would launch a SECOND rail for a PR
@@ -353,8 +353,8 @@ PY
       # Unreadable is not zero: skip the candidate loudly (a pass that cannot rule a rail out must not add one).
       rail_already_running "$pr"; _rail_rc=$?
       if rail_says_skip "$_rail_rc"; then
-        if [ "$_rail_rc" -eq 0 ]; then say "$repo #$pr skipped (rail already running)"
-        else say "$repo #$pr skipped — cannot rule out an existing rail (fail-closed)"; fi
+        if [ "$_rail_rc" -eq 0 ]; then log_line "$repo #$pr skipped (rail already running)"
+        else log_line "$repo #$pr skipped — cannot rule out an existing rail (fail-closed)"; fi
         continue
       fi
       # ⛔ THIS REPO'S BUDGET, NOT THE BOX'S. `rails_should_defer` adds the unattributable population to
@@ -362,15 +362,15 @@ PY
       # another repo's rails can only decide this repo's candidates once the AGGREGATE is reached.
       if candidate_deferred "$repo" $REPOS; then
         read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
-        say "$repo #$pr deferred ($_own rails on this repo + $_unk unattributed, $_total live in total, max=$MAX max_total=$MAX_TOTAL)"; continue
+        log_line "$repo #$pr deferred ($_own rails on this repo + $_unk unattributed, $_total live in total, max=$MAX max_total=$MAX_TOTAL)"; continue
       fi
       # ⛔ A FAILED HEAD READ IS NOT AN EMPTY HEAD. `gh` failing here used to write the cooldown key
       # with an EMPTY head, which no later pass's real head can ever match — so the same PR was railed
       # again every interval, each launch taking a MAX slot from the candidates this actuator exists to
       # serve. Skip the candidate instead, and say so.
       head=$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid 2>/dev/null) \
-        || { say "$repo #$pr HEAD-READ-FAILED: gh rc=$? — skipping this candidate (a cooldown keyed to an empty head would re-rail it every pass)"; continue; }
-      [ -n "$head" ] || { say "$repo #$pr HEAD-READ-FAILED: gh returned an empty head — skipping this candidate"; continue; }
+        || { log_line "$repo #$pr HEAD-READ-FAILED: gh rc=$? — skipping this candidate (a cooldown keyed to an empty head would re-rail it every pass)"; continue; }
+      [ -n "$head" ] || { log_line "$repo #$pr HEAD-READ-FAILED: gh returned an empty head — skipping this candidate"; continue; }
       now=$(date +%s)
       if grep -q "^$pr[[:space:]]$head[[:space:]]" "$TRIED" 2>/dev/null; then
         ts=$(grep "^$pr[[:space:]]$head[[:space:]]" "$TRIED" | tail -1 | awk '{print $3}')
@@ -384,9 +384,9 @@ PY
         fi
         if [ "$age" -lt "$_cool" ]; then
           if [ "$_cool" = "$COOLDOWN_TRANSIENT_S" ]; then
-            say "$repo #$pr skipped — railed $(( age / 60 ))m ago on a verdict that CAN change without a new head; retry in $(( (_cool - age) / 60 ))m"
+            log_line "$repo #$pr skipped — railed $(( age / 60 ))m ago on a verdict that CAN change without a new head; retry in $(( (_cool - age) / 60 ))m"
           else
-            say "$repo #$pr skipped — this head ($head) was already railed $(( age / 60 ))m ago on a verdict that only a NEW HEAD can change"
+            log_line "$repo #$pr skipped — this head ($head) was already railed $(( age / 60 ))m ago on a verdict that only a NEW HEAD can change"
           fi
           continue
         fi
@@ -398,7 +398,7 @@ PY
       # is prevented by the precondition checks at startup (rail script present, `$RAIL_DIR` writable,
       # `$TRIED` writable), not by this ordering.
       echo "$pr	$head	$now" >> "$TRIED"
-      say "$repo #$pr GREEN+terminal -> launching rail (head $head)"
+      log_line "$repo #$pr GREEN+terminal -> launching rail (head $head)"
       # ⛔ agent-infra SPLITS ITS LANES BY TRIGGER (agent-infra #1257): `ci.yml` is pull_request-only and
       # `ci-main.yml` is push:[main]-only, so no single `--workflow` spans both sides and the rail's own
       # BLOCK line tells the operator to add `--any-workflow`. Without it every agent-infra launch from here

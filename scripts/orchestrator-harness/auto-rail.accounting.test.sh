@@ -46,10 +46,14 @@ eval "$(sed -n '/^max_total_for() {/,/^}$/p' "$SUT")"
 for _fn in rails_for_repo rails_should_defer candidate_deferred rail_already_running rail_says_skip max_total_for; do
   command -v "$_fn" >/dev/null || { echo "FATAL: $_fn not found in $SUT"; exit 2; }
 done
-# ⛔ `rails_should_defer` calls `say`, which the SCRIPT defines and this file does not — so without a stub
-# the fail-closed diagnostic resolves to /usr/bin/say (macOS text-to-speech) and is SPOKEN instead of
-# printed, a silent dependency on an unrelated system binary (measured, round 5).
-say() { printf '%s\n' "$*" >&2; }
+# ⛔ `rails_should_defer` calls `log_line`, which the SCRIPT defines and this file does not — so without a
+# stub the fail-closed diagnostic resolves to a name this file never defined. The stub is NOT cosmetic:
+# the helper was called `say` until #2910's prohibition (tests/no-tts/run.sh refuses that NAME in every
+# shipped script, because on macOS it is /usr/bin/say and the diagnostic is SPOKEN instead of printed),
+# and the same hazard applies to whatever the helper is called next. Measured round 5: without the stub
+# the message went to a system binary; measured 2026-11-02: with `say` still defined here, this suite's
+# own file was named by no-tts as an offender.
+log_line() { printf '%s\n' "$*" >&2; }
 
 REPOS="daniel-ospina/tortoise daniel-ospina/agent-infra"
 TABLE="$(cat <<'ROWS'
