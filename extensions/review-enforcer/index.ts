@@ -303,6 +303,75 @@ export function ghShimWillEnforce(shimDir: string | null): boolean {
   return process.env.AGENT_GH_SHIM !== "0" && shimDir !== null && isExecutableShim(shimDir);
 }
 
+/**
+ * The argv layer's state, NAMED — the same three-way answer the refusal and the
+ * log line both read, so they cannot disagree.
+ *
+ *   enforcing — switched on, and the directory we injected holds an executable `gh`.
+ *   disabled  — the OPERATOR set `AGENT_GH_SHIM=0`. A deliberate choice, not a defect.
+ *   degraded  — switched on, but nothing resolved: the layer the merge gate relies
+ *               on is NOT RUNNING, while every other part of the gate still is.
+ */
+export type GhArgvLayerState = "enforcing" | "disabled" | "degraded";
+export function ghArgvLayerState(shimDir: string | null): GhArgvLayerState {
+  if (process.env.AGENT_GH_SHIM === "0") return "disabled";
+  return ghShimWillEnforce(shimDir) ? "enforcing" : "degraded";
+}
+
+/**
+ * ⛔ A GUARD THAT CANNOT LOAD MUST NOT CERTIFY — the admin-merge gate's refusal when
+ * its argv-level layer is absent (#984).
+ *
+ * WHAT THE DEFECT WAS, MEASURED. `#984 argv-level gh shim not found` was printed ONCE
+ * per session as a `⚠️` console line and the gate then certified admin merges exactly
+ * as if the layer were present. Nothing was red, nothing failed, and the protection the
+ * fleet believed it had was simply absent on that box — a `scripts/gh-shim` that no
+ * installer had farmed onto it (measured 2026-11-02: `pi-cell-1`'s account home carried
+ * a six-entry `scripts/` with `gh-shim/gh`, `review-pr.sh` and
+ * `verify-admin-merge-evidence.sh` all MISSING while its lanes ran with that home, and
+ * its own task-run logs carried the warning). This gate is what CERTIFIES an admin
+ * merge; the argv scanner is what proves the merge it certifies is the only one in the
+ * command — the text layer's own stated residual is a token splice (`--ad""min`,
+ * `$'--admin'`) it cannot resolve. So an absent argv layer makes this gate's verdict
+ * UNKNOWN, not PASSING, and UNKNOWN must refuse.
+ *
+ * WHY THIS IS NOT A POLICY CHANGE. The installer already treats a missing shim as
+ * FATAL (`cell-install.sh` fails the install by name without it), and
+ * `docs/ops/ACTIVATION-MATRIX.md` row 1 already records the runtime as DEGRADED.
+ * Refusing here only makes the runtime agree with the installer and with its own
+ * documentation — the gate stops claiming a coverage it does not have. It cannot wedge a
+ * box that was never degraded: on every box where the shim resolved, `shimDir !== null`
+ * and this returns null.
+ *
+ * THE OPERATOR'S OWN SWITCH IS HONOURED. `AGENT_GH_SHIM=0` is a documented, deliberate
+ * kill switch: it returns null here, so a lane that chose the degraded posture keeps the
+ * old behaviour and the gate keeps its fail-closed text path. Only an UNINTENDED
+ * absence refuses.
+ *
+ * Returns the block payload, so the caller's `return` and this message cannot drift.
+ */
+export function ghArgvLayerRefusal(
+  shimDir: string | null,
+): { block: true; reason: string } | null {
+  if (ghArgvLayerState(shimDir) !== "degraded") return null;
+  return {
+    block: true,
+    reason:
+      "This admin merge cannot be certified: the argv-level `gh` shim (#984) is NOT " +
+      "loaded on this box, so the gate cannot prove the merge in this command is the " +
+      "only one — the text scanner's residual is a token splice it cannot resolve. " +
+      "This is a DEGRADED GUARD, and an unknown is not a pass.\n" +
+      "FIX: install `scripts/gh-shim/gh` (and its sibling `verify-admin-merge-evidence.sh`) " +
+      "where this extension resolves it — `~/.pi/agent/scripts/gh-shim/gh`. " +
+      "`pi-bootstrap/setup.sh` farms it (its `merge_gate_srcs` array) and " +
+      "`pi-bootstrap/cell-install.sh` fails the install when it is missing, so a rebuild " +
+      "that runs the installer cannot reproduce this state. Alternatively point " +
+      "`AGENT_GH_SHIM_DIR` at a directory holding an EXECUTABLE `gh` shim.\n" +
+      "To deliberately accept the degraded layer, set `AGENT_GH_SHIM=0` — that is an " +
+      "operator decision, and the gate then runs its fail-closed text path as before.",
+  };
+}
+
 // ── gh invocation seam (testable) ─────────────────────
 // ESM named imports of builtin CJS modules (child_process) are not patchable
 // from tests, so gh calls route through runGh(). Tests inject a fake via
@@ -8573,14 +8642,23 @@ export default function (pi: ExtensionAPI) {
 
       if (!extensionEnabled) return undefined;
       const shimDir = activeGhShimDir();
-      if (shimDir === null && !ghShimAbsenceWarned && process.env.AGENT_GH_SHIM !== "0") {
+      // ⛔ LOUD, NOT ⚠️. This line used to be the ONLY surface that knew the guard was
+      // degraded, and it read as advisory — a box could run for weeks in this state with
+      // nobody acting. It now names the consequence and the remedy, and it RECORDS a gate
+      // event so a report can read the state without anyone parsing prose. The refusal
+      // itself is `ghArgvLayerRefusal` at the admin-merge gate below.
+      if (ghArgvLayerState(shimDir) === "degraded" && !ghShimAbsenceWarned) {
         ghShimAbsenceWarned = true;
         console.log(
-          "[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner " +
-            "is active, so bash token splicing can still hide an admin merge, and a heredoc body " +
-            "written to a script file and run by a LATER command is not followed by any text gate. " +
-            "Set AGENT_GH_SHIM_DIR, or install scripts/gh-shim."
+          "[review-enforcer] 🚫 DEGRADED GUARD — STATE: #984 argv-level gh shim NOT LOADED on " +
+            "this box. The admin-merge gate will REFUSE to certify a merge (an unknown is not " +
+            "a pass): bash token splicing can otherwise hide an admin merge from the string " +
+            "scanner, and a heredoc body written to a script file and run by a LATER command " +
+            "is not followed by any text gate. FIX: install scripts/gh-shim/gh at " +
+            "~/.pi/agent/scripts/gh-shim/gh (setup.sh farms it; cell-install.sh fails without " +
+            "it) or set AGENT_GH_SHIM_DIR. Deliberate acceptance: AGENT_GH_SHIM=0."
         );
+        logGateEvent("gh_shim_degraded", { reason: "argv_layer_absent", command: auditCommand(rawCommand) });
       }
       const shimmed = withGhShim(rawCommand, shimDir);
       if (shimmed !== null) event.input.command = shimmed;
@@ -8667,6 +8745,31 @@ export default function (pi: ExtensionAPI) {
               "gate can only certify ONE PR per call, so it cannot prove the others are " +
               "evidenced. Run them as separate commands.",
           };
+        }
+        // ⛔ THE CERTIFIER IS MISSING, SO THE CERTIFICATION IS UNKNOWN — REFUSE (#3302).
+        // AFTER the compound-merge count on purpose: `merges > 1` is pure TEXT and needs no
+        // argv layer, so a compound command keeps its own, more actionable diagnosis
+        // (#2349) instead of being told to reinstall a shim.
+        //
+        // AND NOT FOR A COMMAND THE TEXT POSITIVELY READ AS A NON-MERGE. The gate body is
+        // entered here on `!ghShimWillEnforce` alone, so a degraded box would otherwise be
+        // told "this admin merge cannot be certified" about
+        // `gh pr create --title "fix(admin-merge): x"` — inventing a merge and sending the
+        // lane to reinstall a shim for a PR it was opening. That class keeps the evidence
+        // path's own message, exactly as before this change.
+        const argvRefusal = ghArgvLayerRefusal(shimDir);
+        if (argvRefusal && !(merges === 0 && readsNonMergeGhCall(command))) {
+          console.log(
+            "[review-enforcer] 🚫 Admin-merge evidence gate blocked (argv layer ABSENT) — " +
+              "STATE: DEGRADED, no #984 shim resolved, so the merge cannot be certified"
+          );
+          // The refused command is in the audit row: this block is the one an operator has
+          // to be able to reconstruct from the log alone after a rebuild lost the shim.
+          logGateEvent("merge_gate_block", {
+            reason: "admin_merge_argv_layer_absent",
+            command: auditCommand(rawCommand),
+          });
+          return argvRefusal;
         }
         // #1485: ZERO merge invocations, and the argv scan POSITIVELY read every
         // `gh` in the command as a non-merge subcommand — there is no merge for an
