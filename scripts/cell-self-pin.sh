@@ -126,6 +126,16 @@ ref_fetch_branch() { # the branch name to fetch for $HARNESS_REF (origin/main ->
   r="${r#refs/heads/}"
   printf '%s\n' "${r:-main}"
 }
+# ⛔ THE DECISION READS A REF THIS RUN OWNS, NOT `FETCH_HEAD`. `FETCH_HEAD` is an ordinary mutable file in
+# the worktree, bound to no run: any other git process in the SAME tree that fetches between our fetch and
+# our read is read as OUR result. That is not hypothetical here — `cloud-cell-supervisor.sh:1698`/`:2116`
+# run `git fetch origin main` in this very repository, and bring-up re-arms `eldato-harness-apply.timer`
+# beside this unit by design, so two actors fetch in one tree. MEASURED: with the record at main's tip, a
+# coexisting `git fetch origin main` made `--status` print a MAIN commit under the label `origin/rel` and
+# answer `current` + exit 0 — a foreign fetch greening a stale layer. A refspec this run writes and no other
+# process names is immune: a foreign `git fetch` cannot reach it. Two writers of THIS ref (two passes in one
+# clone) fail closed on git's ref lock → `fetch-failed` → exit 2, never a false green.
+PIN_FETCH_REF="refs/cell-self-pin/fetch"
 HARNESS="${HARNESS:-}"
 O="${O:-$CELL_HOME/orchestrator}"
 STAMP="$O/.agent-infra-stamp.json"
@@ -267,7 +277,7 @@ mend_record() {
 }
 
 do_pass() {
-  local dry="${1:-}" layer repo sup target applied now rc
+  local dry="${1:-}" layer repo sup target applied now rc fetch_branch
   # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED HERE, ON EVERY TICK, BEFORE ANYTHING ELSE — see
   # `one_actor_check` for why install time cannot be the only reading.
   one_actor_check "$([ "$dry" = dry ] && printf dry || printf apply)"
@@ -286,15 +296,20 @@ do_pass() {
   # ⛔ `cd` — not `git -C` — because the verb below is the one that decides the cwd for the pin, and the
   # unit deliberately declares no `WorkingDirectory=`. This is where that directory is chosen.
   cd "$repo" || loud 2 chdir "cannot enter the resolved layer ${repo}"
-  git fetch -q origin "$(ref_fetch_branch)" 2>/dev/null || loud 2 fetch-failed "git fetch origin $(ref_fetch_branch) failed in ${repo} — an unreadable ref is never treated as current"
+  fetch_branch="$(ref_fetch_branch)"
+  # ⛔ ONE FETCH, TWO REFSPECS: the bare one keeps `refs/remotes/origin/<branch>` fresh exactly as before
+  # (the `--status-nofetch` reading and every other reader of the tracking ref depend on it), and the second
+  # lands this very fetch in the ref this run owns — see `PIN_FETCH_REF` for why `FETCH_HEAD` is not ours.
+  git fetch -q origin "$fetch_branch" "+${fetch_branch}:${PIN_FETCH_REF}" 2>/dev/null \
+    || loud 2 fetch-failed "git fetch origin ${fetch_branch} failed in ${repo} — an unreadable ref is never treated as current"
   # ⛔ DECIDE ON THE COMMIT THE FETCH BROUGHT — NOT ON THE KNOB'S SPELLING. `git rev-parse "$HARNESS_REF"`
   # resolves whatever that spelling names LOCALLY, and a fetch of `main` only moves
   # `refs/remotes/origin/main`: so `HARNESS_REF=refs/heads/main` (or a bare `main`) read the STALE local
   # branch the fetch never touched, and printed `current` + exit 0 against a newer remote tip — #3194's own
-  # symptom through the knob this file documents. `FETCH_HEAD` is what the fetch just brought, whatever the
-  # spelling, and `^{commit}` peels an annotated tag (comparing a tag OBJECT sha to a commit is a false
-  # DRIFT that can never be `current`). MEASURED, both directions, before this line existed.
-  target="$(git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' 2>/dev/null)" \
+  # symptom through the knob this file documents. The specifier fetched above is the commit the fetch just
+  # brought, whatever the spelling, and `^{commit}` peels an annotated tag (comparing a tag OBJECT sha to a
+  # commit is a false DRIFT that can never be `current`). MEASURED, both directions, before this line existed.
+  target="$(git rev-parse --verify --quiet "${PIN_FETCH_REF}^{commit}" 2>/dev/null)" \
     || loud 2 unreadable-ref "${HARNESS_REF} did not resolve to a commit after the fetch in ${repo}"
   applied="$(pinned_head)"
   if [ -z "$applied" ]; then
@@ -374,7 +389,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0
+  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0 fetch_branch
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -398,7 +413,8 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # fetch is reported as possibly stale, never as current-but-unverified silence.
     case "$mode" in
       nofetch) printf '  (%s NOT fetched — the reading below may be STALE)\n' "$HARNESS_REF" ;;
-      *) if git -C "$layer" fetch -q origin "$(ref_fetch_branch)" 2>/dev/null; then
+      *) fetch_branch="$(ref_fetch_branch)"
+         if git -C "$layer" fetch -q origin "$fetch_branch" "+${fetch_branch}:${PIN_FETCH_REF}" 2>/dev/null; then
            printf '  (%s fetched just now)\n' "$HARNESS_REF"
          else
            printf '  (git fetch FAILED in %s — the reading below is against an UNREFRESHED local ref; this is not a green)\n' "$layer"
@@ -420,13 +436,15 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # the equality test failed, and `--status` reported `verdict DRIFT (1)` for a ref the PASS calls
     # `unreadable` — the verb an operator reads first contradicting the tick. And a local annotated tag
     # resolves to its TAG OBJECT, which never equals a commit, so it could never read `current`.
-    # ⛔ AND IN FETCH MODE IT IS THE COMMIT THE FETCH BROUGHT (`FETCH_HEAD`), not the spelling of the knob:
-    # a fetch of `main` moves only `refs/remotes/origin/main`, while `git rev-parse main` reads the LOCAL
-    # branch the fetch never touched — `current` + exit 0 against a newer remote tip (#3194 through a knob).
+    # ⛔ AND IN FETCH MODE IT IS THE COMMIT THE FETCH BROUGHT, not the spelling of the knob: a fetch of
+    # `main` moves only `refs/remotes/origin/main`, while `git rev-parse main` reads the LOCAL branch the
+    # fetch never touched — `current` + exit 0 against a newer remote tip (#3194 through a knob).
+    # ⛔ AND THAT COMMIT IS READ FROM `PIN_FETCH_REF`, the refspec this run wrote — NEVER FROM `FETCH_HEAD`,
+    # which any coexisting fetch in this tree rewrites (see `PIN_FETCH_REF`, and the measured false `current`).
     if [ "$mode" = nofetch ]; then
       target="$(git -C "$layer" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null)" || target=""
     else
-      target="$(git -C "$layer" rev-parse --verify --quiet 'FETCH_HEAD^{commit}' 2>/dev/null)" || target=""
+      target="$(git -C "$layer" rev-parse --verify --quiet "${PIN_FETCH_REF}^{commit}" 2>/dev/null)" || target=""
     fi
     if [ -z "$target" ]; then
       printf '  %s <unreadable — does not resolve to a commit>\n' "$HARNESS_REF"
@@ -845,8 +863,26 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   # list must NOT do is WIDEN the vocabulary (any value beyond 0/11 greens a real failure), and what it MUST
   # do is COUNT 11 green: a lost pin record is mended and exits 11, so a unit that omits it goes RED on a box
   # that is in fact correct (#3133). Both halves are gated, one doctor each.
-  ok_vals="$(directive "$body" SuccessExitStatus)"
-  [ -n "$ok_vals" ] || { bad "the rendered unit must declare SuccessExitStatus=… — a non-zero exit is how this pass goes RED"; return 1; }
+  declares "$body" SuccessExitStatus || { bad "the rendered unit must declare SuccessExitStatus=… — a non-zero exit is how this pass goes RED"; return 1; }
+  # ⛔ THE EFFECTIVE LIST, NOT THE LINES CONCATENATED. `SuccessExitStatus=` may appear more than once and the
+  # lists are MERGED — but `systemd.service(5)` adds that "if the empty string is assigned to this option,
+  # the list is reset, all prior assignments … will have no effect". A line reader latches `11` from the
+  # first line and never sees the empty one, so `SuccessExitStatus=` placed after the template's
+  # `SuccessExitStatus=0 11` verified GREEN and wrote a unit whose effective vocabulary EXCLUDES 11 — the
+  # unhealable mend RED (#3133) that the required-11 rule exists to prevent. MEASURED at rc=0, installed.
+  # The directives are replayed IN ORDER with the reset honoured, so what is asserted on is what systemd
+  # loads. (`verify_dropin_file` refuses `SuccessExitStatus=` in a drop-in outright, so this body is the
+  # whole of the list.) Refusing the empty line instead was the cheaper fix and would have refused a valid
+  # `SuccessExitStatus=` followed by `SuccessExitStatus=11`, which resolves to a correct list.
+  ok_vals="$(printf '%s\n' "$body" | awk '
+    { line = $0; sub(/^[[:space:]]*/, "", line) }
+    line ~ /^SuccessExitStatus[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      if (line == "") { acc = ""; next }
+      acc = (acc == "" ? line : acc " " line)
+    }
+    END { print acc }')"
+  [ -n "$ok_vals" ] || { bad "the EFFECTIVE SuccessExitStatus list is EMPTY — an empty 'SuccessExitStatus=' is a LIST RESET (systemd.service(5)), so every value counted above it is discarded and 'mended' (11) is no longer green, which makes every mend an unhealable RED (#3133); drop the empty line instead of clearing the list"; return 1; }
   while IFS= read -r v; do
     for w in $v; do
       case "$w" in
