@@ -1087,14 +1087,21 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   # (4b) THE TARGET HEAD'S HEALTH — clause (E) of the carry, applied here for the
   # same reason it applies there. A delta re-attests an OLD verdict over a NEW
   # head, so it must not put a signed `clean` on a head whose own checks are
-  # measurably failing. THREE outcomes, never two (#2342): RED refuses, a surface
-  # that could not be READ refuses (a failed read is not a pass), green passes.
+  # measurably failing. POLARITY: only an EXPLICIT green (rc 1) proceeds — every
+  # other status refuses, including one this case does not name. Three outcomes are
+  # DOCUMENTED (#2342: red / unreadable / green), but a four-outcome future, or a
+  # helper whose own last command cannot run, must not fall through as "not red":
+  # that is the enum-allow-list error the verification-state rule in AGENTS.md names
+  # ("an unnamed value must never be allowed to fall through a gap"), and the carry
+  # arm 2,300 lines below already implements exactly this polarity — this arm was
+  # the odd one out (found by review: a stubbed rc 3 was ACCEPTED and minted clean).
   thr=0
   target_head_red "$to" || thr=$?
   case "$thr" in
+    1) : ;;   # the ONLY green: measured, non-red
     0) echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
        return 1 ;;
-    2) echo "   delta: the target head's check surface could not be READ — a failed read is not a pass, so the range is not verified. Retry rather than record." >&2
+    *) echo "   delta: the target head's check surface returned status '$thr', which is neither a measured green nor a known red — a read this code cannot interpret is not a pass, so the range is not verified. Retry rather than record." >&2
        return 1 ;;
   esac
   # (5) THE CHECKOUT. Fail closed: an unreadable range is not evidence.
