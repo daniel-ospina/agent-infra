@@ -1159,7 +1159,7 @@ GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_ORD" AGENT_GH_GATE_DIR="$GDIR2" \
 # …and while that flag is live, a healthy exempt read still cannot discharge the window.
 : > "$GDIR2/events.log"
 AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR2" \
-  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>"$TMP/contended.err"
 _rc=$?
 [ "$_rc" -eq 75 ] \
   && pass "  …and the live secondary window is still honoured by a healthy primary read (rc=75)" \
@@ -1180,22 +1180,32 @@ case "$(printf '%s' "$SHIM_NOTE" | tr 'A-Z' 'a-z')" in
   *)
     fail "(f)(viii) the rc=75 note was not found where this arm looks for it ('$SHIM_NOTE')" ;;
 esac
-_GLC="$(python3 - "$ROOT/scripts/orchestrator-harness/gh-limit.py" <<'PYEOF'
+_GLC="$(python3 - "$ROOT/scripts/orchestrator-harness/gh-limit.py" "$TMP/contended.err" <<'PYEOF'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("gh_limit_under_test", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-contended = m.Result(75, b"", b"gh-contended - a shared gh throttle window outlived this call's wait budget")
-limitish = m.Result(1, b"", b"HTTP 403: API rate limit exceeded for user ID 81560491")
-print("contended=%s control=%s" % (m.classify(contended, ["pr", "view", "1"], {}) is None,
-                                    m.classify(limitish, ["pr", "view", "1"], {}) is not None))
+# ⛔ THE REAL STDERR OF A CONTENDED CALL, not a message written to make the arm pass. The shim
+# flushes EVERY note it accumulated on the rc=75 path (`flush_notes 75`), and one of them is
+# "the account is in a shared rate-limit window — waiting …" — so this stderr DOES carry a
+# LIMIT_PHRASE however the contended note itself is worded. That is why the rc==75 arm is
+# load-bearing and not belt-and-braces, and this arm proves the hazard is real before proving it
+# is handled: `phrase=True` is asserted, so the arm cannot pass on a message that never had one.
+err = open(sys.argv[2], "rb").read()
+phrase = any(p in err.decode("utf-8", "replace").lower() for p in m.LIMIT_PHRASES)
+contended = m.Result(75, b"", err)
+control = m.Result(1, b"", err)
+print("phrase=%s contended=%s control=%s" % (
+    phrase,
+    m.classify(contended, ["pr", "view", "1"], {}) is None,
+    m.classify(control, ["pr", "view", "1"], {}) is not None))
 PYEOF
 )"
 case "$_GLC" in
-  'contended=True control=True')
-    pass "  …and classify() itself returns no limit for rc=75 (control: a real 403 is still a limit)" ;;
+  'phrase=True contended=True control=True')
+    pass "  …and the emitted stderr DOES carry a LIMIT_PHRASE, yet rc=75 is not a limit (a real 403 still is)" ;;
   *)
-    fail "  …and classify() mishandles the contended verdict: $_GLC" ;;
+    fail "  …and the contended verdict is mishandled or the arm is inert: $_GLC" ;;
 esac
 
 rm -f "$GDIR"/cooldown.* "$GDIR/secondary.window" 2>/dev/null
