@@ -267,7 +267,7 @@ mend_record() {
 }
 
 do_pass() {
-  local dry="${1:-}" layer repo sup target applied now rc ref_branch
+  local dry="${1:-}" layer repo sup target applied now rc
   # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED HERE, ON EVERY TICK, BEFORE ANYTHING ELSE — see
   # `one_actor_check` for why install time cannot be the only reading.
   one_actor_check "$([ "$dry" = dry ] && printf dry || printf apply)"
@@ -279,7 +279,7 @@ do_pass() {
     # ⛔ A DRY RUN TOUCHES NOTHING — not even refs. It reports the recorded layer and the ref as it
     # currently resolves locally, and SAYS the reading is possibly stale rather than fetching to freshen
     # it (a "read-only" verb that writes FETCH_HEAD is the kind of lie this file exists to remove).
-    target="$(git -C "$repo" rev-parse "$HARNESS_REF" 2>/dev/null)"
+    target="$(git -C "$repo" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null)"
     log "dry-run (no fetch) layer=${layer} repo=${repo} supervisor=${sup} pinned=$(pinned_head || echo '<unreadable>') target=${target:-<unreadable, possibly stale>}"
     return 0
   fi
@@ -287,7 +287,15 @@ do_pass() {
   # unit deliberately declares no `WorkingDirectory=`. This is where that directory is chosen.
   cd "$repo" || loud 2 chdir "cannot enter the resolved layer ${repo}"
   git fetch -q origin "$(ref_fetch_branch)" 2>/dev/null || loud 2 fetch-failed "git fetch origin $(ref_fetch_branch) failed in ${repo} — an unreadable ref is never treated as current"
-  target="$(git rev-parse "$HARNESS_REF" 2>/dev/null)" || loud 2 unreadable-ref "${HARNESS_REF} does not resolve in ${repo}"
+  # ⛔ DECIDE ON THE COMMIT THE FETCH BROUGHT — NOT ON THE KNOB'S SPELLING. `git rev-parse "$HARNESS_REF"`
+  # resolves whatever that spelling names LOCALLY, and a fetch of `main` only moves
+  # `refs/remotes/origin/main`: so `HARNESS_REF=refs/heads/main` (or a bare `main`) read the STALE local
+  # branch the fetch never touched, and printed `current` + exit 0 against a newer remote tip — #3194's own
+  # symptom through the knob this file documents. `FETCH_HEAD` is what the fetch just brought, whatever the
+  # spelling, and `^{commit}` peels an annotated tag (comparing a tag OBJECT sha to a commit is a false
+  # DRIFT that can never be `current`). MEASURED, both directions, before this line existed.
+  target="$(git rev-parse --verify --quiet 'FETCH_HEAD^{commit}' 2>/dev/null)" \
+    || loud 2 unreadable-ref "${HARNESS_REF} did not resolve to a commit after the fetch in ${repo}"
   applied="$(pinned_head)"
   if [ -z "$applied" ]; then
     log "no readable pin record at ${HARNESS_PIN_FILE} -- applying (a pin nobody can read is not a pin)"
@@ -366,7 +374,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0 ref_branch
+  local layer sup target mode="${1:-fetch}" last="<none recorded>" dup fetch_failed=0
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -390,7 +398,7 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # fetch is reported as possibly stale, never as current-but-unverified silence.
     case "$mode" in
       nofetch) printf '  (%s NOT fetched — the reading below may be STALE)\n' "$HARNESS_REF" ;;
-      *) ref_branch="$(ref_fetch_branch)"; if git -C "$layer" fetch -q origin "$ref_branch" 2>/dev/null; then
+      *) if git -C "$layer" fetch -q origin "$(ref_fetch_branch)" 2>/dev/null; then
            printf '  (%s fetched just now)\n' "$HARNESS_REF"
          else
            printf '  (git fetch FAILED in %s — the reading below is against an UNREFRESHED local ref; this is not a green)\n' "$layer"
@@ -403,11 +411,29 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
     # exactly the reading the header calls unverified. An unrefreshed local ref cannot distinguish current
     # from DRIFT, so it decides NOTHING; the vocabulary this file reuses already has the word for it.
     if [ "${fetch_failed:-0}" -ne 0 ]; then
-      printf '  %s %s (NOT refreshed — the value above may be stale)\n' "$HARNESS_REF" "$(git -C "$layer" rev-parse "$HARNESS_REF" 2>/dev/null || echo '<unreadable>')"
+      printf '  %s %s (NOT refreshed — the value above may be stale)\n' "$HARNESS_REF" "$(git -C "$layer" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null || echo '<unreadable>')"
       printf '  verdict        UNKNOWN (2) — the fetch failed, so this reading can NOT be called current\n'
       return 2
     fi
-    target="$(git -C "$layer" rev-parse "$HARNESS_REF" 2>/dev/null)"; printf '  %s %s\n' "$HARNESS_REF" "${target:-<unreadable>}"
+    # ⛔ THE COMMIT, PEELED, OR NOTHING — NEVER A REF NAME IN THE COMMIT COLUMN. `git rev-parse <unknown>`
+    # PRINTS ITS ARGUMENT and exits 128, so the unguarded form below put the ref's NAME where a SHA belongs,
+    # the equality test failed, and `--status` reported `verdict DRIFT (1)` for a ref the PASS calls
+    # `unreadable` — the verb an operator reads first contradicting the tick. And a local annotated tag
+    # resolves to its TAG OBJECT, which never equals a commit, so it could never read `current`.
+    # ⛔ AND IN FETCH MODE IT IS THE COMMIT THE FETCH BROUGHT (`FETCH_HEAD`), not the spelling of the knob:
+    # a fetch of `main` moves only `refs/remotes/origin/main`, while `git rev-parse main` reads the LOCAL
+    # branch the fetch never touched — `current` + exit 0 against a newer remote tip (#3194 through a knob).
+    if [ "$mode" = nofetch ]; then
+      target="$(git -C "$layer" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null)" || target=""
+    else
+      target="$(git -C "$layer" rev-parse --verify --quiet 'FETCH_HEAD^{commit}' 2>/dev/null)" || target=""
+    fi
+    if [ -z "$target" ]; then
+      printf '  %s <unreadable — does not resolve to a commit>\n' "$HARNESS_REF"
+      printf '  verdict        UNKNOWN (2) — the ref did not resolve to a commit, so it decides NOTHING\n'
+      return 2
+    fi
+    printf '  %s %s\n' "$HARNESS_REF" "$target"
     # ⛔ 1 FOR DRIFT, NOT 0. `scripts/check-deployed-drift.sh` already speaks `0 match / 1 drift /
     # 2 unknown`; a status verb that reports DRIFT and exits 0 cannot be gated on by anything, which is
     # how a third drift dialect (#1178) is born. Nothing here re-decides the vocabulary.
@@ -657,7 +683,7 @@ refuse_env_reset() { # <what> <body>
 }
 
 verify_unit() { # <rendered service> [expected ExecStart payload] — the properties the ISSUE names, asserted on the ARTIFACT
-  local f="$1" expect="${2:-}" body exec_path exec_real exec_dir home_real n_exec execs envs ok_vals v w seen0=0 seen11=0 _interp _x _c
+  local f="$1" expect="${2:-}" body exec_path exec_real exec_dir home_real n_exec execs envs ok_vals v w seen11=0 _interp _x _c
   local n_home home_val _env _kv
   # ⛔ ASSERT ON DIRECTIVES, NOT ON PROSE. The template documents the defect it replaced, and that prose
   # legitimately contains `/tmp/cell-ai`; a guard that also refused the documentation would force the
@@ -812,27 +838,29 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
         bad "the rendered unit declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant turns the pin into a unit that never began (the 200/CHDIR class); the pass resolves its own layer instead"; return 1 ;;
     esac
   done
-  # ⛔ ONLY THE PASS'S OWN SUCCESS CODES ARE GREEN. 0 = current/applied and 11 = mended are the whole
-  # success vocabulary (`harness-apply-pass.sh`'s recorded codes, adopted rather than re-invented); any
-  # other value would green a failure, which is the false PASS #3194 is about.
+  # ⛔ NOTHING HERE IS GREEN ON A READING IT COULD NOT TAKE. 0 is ALWAYS a successful exit for a unit
+  # (`systemd.service(5)`, `SuccessExitStatus=`: "…will be considered successful termination, IN ADDITION TO
+  # THE NORMAL SUCCESSFUL EXIT STATUS 0"), so there is no rule to write about including it — the old
+  # "must include 0" gate refused a valid unit and claimed a false PASS it could never prevent. What the
+  # list must NOT do is WIDEN the vocabulary (any value beyond 0/11 greens a real failure), and what it MUST
+  # do is COUNT 11 green: a lost pin record is mended and exits 11, so a unit that omits it goes RED on a box
+  # that is in fact correct (#3133). Both halves are gated, one doctor each.
   ok_vals="$(directive "$body" SuccessExitStatus)"
   [ -n "$ok_vals" ] || { bad "the rendered unit must declare SuccessExitStatus=… — a non-zero exit is how this pass goes RED"; return 1; }
   while IFS= read -r v; do
     for w in $v; do
       case "$w" in
-        0)  seen0=1 ;;
+        0)  ;;
         11) seen11=1 ;;
         *)  bad "SuccessExitStatus lists '${w}', which is neither 0 (current/applied) nor 11 (mended) — a wider list greens a failure"; return 1 ;;
       esac
     done
   done <<<"$ok_vals"
-  [ "$seen0" -eq 1 ] || { bad "SuccessExitStatus must include 0 — 'current' and 'applied' are only green as 0"; return 1; }
-  # ⛔ AND 11 IS REQUIRED, NOT MERELY ALLOWED. 11 is the MENDED code: a box whose pin record was lost has it
+  # ⛔ 11 IS REQUIRED, NOT MERELY ALLOWED. 11 is the MENDED code: a box whose pin record was lost has it
   # repaired and exits 11. A unit that does not count 11 green REDs on every mend — an unhealable RED on a
   # box that is in fact correct, the #3133 class this rule's own comment invents 11 for. "Allowed" without
   # "required" also left the rule untestable in the direction that matters: a doctor cannot tell a missing
-  # 11 from a wider list, so nothing pinned it (measured in review: deleting the must-include-0 rule left the
-  # whole suite green). Both halves are now gating, one doctor each.
+  # 11 from a wider list, so nothing pinned it.
   [ "$seen11" -eq 1 ] || { bad "SuccessExitStatus must include 11 — 'mended' (a lost pin record was repaired) exits 11, and a unit that does not count it green goes RED on a box that is in fact correct (#3133)"; return 1; }
   return 0
 }
