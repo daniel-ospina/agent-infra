@@ -146,7 +146,17 @@ ref_fetch_branch() { # the REMOTE branch to fetch for $HARNESS_REF — 1 when th
     refs/remotes/*/*) return 1 ;;
     *) r="${HARNESS_REF#origin/}"; r="${r#refs/heads/}" ;;
   esac
-  printf '%s\n' "${r:-main}"
+  # ⛔ AN EMPTY BRANCH PART IS NOT `main`. The fallback here was `${r:-main}`, so a malformed spelling
+  # (`origin/`, `refs/remotes/origin/`, `refs/heads/`) was silently RE-WRITTEN to `main`: `--status` fetched
+  # `main`, printed `(origin/ fetched just now)` and `origin/ <main's sha>`, and answered `verdict current`
+  # + exit 0 about a name that resolves to nothing — while the SAME knob's `--status-nofetch` said UNKNOWN
+  # and the timer's own verb refused with `ref-spelling` (MEASURED). Three surfaces of one knob disagreeing
+  # is the #2215 skew, and the green one is the first screen an operator reads. Same rule as the arm above:
+  # a spelling this fetch cannot answer is REFUSED by name, never answered from some other branch.
+  # `HARNESS_REF` is defaulted to `origin/main` at the top of this file, so `r` is empty ONLY for a
+  # malformed spelling — the default and every documented form still resolve.
+  [ -n "$r" ] || return 1
+  printf '%s\n' "$r"
 }
 # ⛔ THE DECISION READS A REF THIS RUN OWNS, NOT `FETCH_HEAD`. `FETCH_HEAD` is an ordinary mutable file in
 # the worktree, bound to no run: any other git process in the SAME tree that fetches between our fetch and

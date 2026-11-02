@@ -1065,6 +1065,18 @@ if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
         || bad "refused a foreign-remote spelling but exited $rc, not 2=UNKNOWN: $out" ;;
     *) bad "a foreign-remote spelling was not refused (rc=$rc), so this path does not fail closed: $out" ;;
   esac
+  # ⛔ AND NEITHER IS AN EMPTY BRANCH PART. `${r:-main}` turned `origin/` into `main`, so `--status` fetched
+  # main, printed `(origin/ fetched just now)` and answered `verdict current` + exit 0 about a name that
+  # resolves to nothing — a green on the operator's first screen for a knob whose `--status-nofetch` said
+  # UNKNOWN (2) and whose PASS exited 2. The fallback exists for the DEFAULT, but `HARNESS_REF` is already
+  # defaulted to `origin/main` at the top of the file, so it can only ever hide a malformed spelling.
+  out="$(runat "$T/home-pass" HARNESS_REF=origin/ bash "$PIN" --status 2>&1)"; rc=$?
+  case "$out" in
+    *'verdict        current'*) bad "--status reported 'current' for HARNESS_REF=origin/ — an empty branch part was rewritten to 'main', so the screen greened a knob the timer's own verb refuses: $out" ;;
+    *'UNRESOLVED(ref-spelling)'*) [ "$rc" -eq 2 ] && ok "…and an EMPTY branch part ('origin/') is REFUSED by name (exit 2 = UNKNOWN), not silently rewritten to 'main'" \
+        || bad "refused an empty branch part but exited $rc, not 2=UNKNOWN: $out" ;;
+    *) bad "an empty branch part was not refused (rc=$rc): the defaulting fallback answers a branch nobody asked for: $out" ;;
+  esac
   # The pass-side PEELING control: `attip` is an annotated tag ON the record's commit, so a pass that
   # compares the TAG OBJECT sha to a commit reads DRIFT forever, and one that peels reads current.
   out="$(runat "$T/home-pass" HARNESS_REF=attip bash "$PIN" 2>&1)"; rc=$?
