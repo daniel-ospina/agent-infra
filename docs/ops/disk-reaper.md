@@ -1148,13 +1148,18 @@ there, because the arms they edit do not exist in that `disk-reaper.sh`; (i), (j
 mutants and the owner-side mutants of (a)–(c)/(h) stay green, which is the correct answer for a case
 whose subject is the owner.)
 
-⚠️ **What this suite does NOT cover, disclosed rather than implied:** the class's **record fields** at the
+⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement.** The class's **record fields** at the
 ENTRY-POINT level (`freed_mb_runner_work=`, `candidates_runner_work=`/`cand_runner_work=`,
 `unmeasurable_runner_work=`, `verdict_runner_work=`, and `--print-status` printing them) are the subject
-of `scripts/disk-reaper-classes.test.sh`, and that suite was **killed at 30 minutes with no result** on
-the box that measured this PR (load 180–220). So the record-field DELTA this change would have covered
-is **unmeasured**: the owner-level suite below is measured, the entry-point record fields are not. A
-green run of `disk-reaper-runner-work.test.sh` must not be read as covering them.
+of `scripts/disk-reaper-classes.test.sh`. That suite was **killed at 30 minutes with no result** on the
+box that measured this PR (load 180–220), so at that point the record-field delta was **unmeasured** and
+a green run of the owner-level suite below could not be read as covering it. It was then **run to
+completion at load ~15 on the same 8-core box**: `1 failed, 32 passed`, and the single failure is case
+**N** (a tree that CHANGES during the pass is preserved, `reason=toctou`) — the same case and the same
+count as the pre-change baseline, i.e. pre-existing and not this class's. The record fields are therefore
+MEASURED at this head; the caveat that stood here for one revision is recorded rather than dropped
+silently, because "we could not measure it" and "it is fine" are different claims and only the first one
+was true when it was written.
 
 The measured transcript, `bash scripts/disk-reaper-runner-work.test.sh`:
 
