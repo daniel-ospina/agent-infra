@@ -1208,7 +1208,108 @@ case "$_GLC" in
     fail "  …and the contended verdict is mishandled or the arm is inert: $_GLC" ;;
 esac
 
-rm -f "$GDIR"/cooldown.* "$GDIR/secondary.window" 2>/dev/null
+rm -f "$GDIR"/cooldown.* "$GDIR/secondary.window" "$GDIR/retry-after.window" 2>/dev/null
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# (f)(ix)–(f)(x) — THE TWO DISCHARGES THE SECOND REVIEW ROUND FOUND STILL OPEN. Both were reported
+# with a recorded decision behind them, and both are pinned BEHAVIOURALLY with an anti-inert
+# control, so neither can pass for a gate that simply never discharges anything.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# (f)(ix) ⛔ A `retry-after` WINDOW IS THE SERVER'S OWN INSTRUCTION AND IS NEVER DISCHARGED. The
+# header is also the documented way a secondary refusal announces itself without using the
+# runbook's exact wording, and `/rate_limit` cannot see a secondary limit at all — so before this
+# arm, a 300 s server-directed window was deleted by a 0.4 s read of a budget that does not predict
+# it (`gh-limit.py:843-851` records the identical measured failure one layer up).
+GDIR="$(gate_dir revalidate-retry-after)"
+GREAL_RA="$TMP/gate-real-retry-after"
+cat > "$GREAL_RA" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976},"search":{"limit":30,"remaining":30}}}'
+    exit 0 ;;
+esac
+echo 'HTTP 403: API rate limit exceeded for user ID 81560491. (retry-after: 300)' >&2
+exit 1
+GHEOF
+chmod +x "$GREAL_RA"
+# Lane A: the refusal's KIND is recorded. NO_WAIT so it returns at once instead of sleeping 300 s.
+GH_LIMIT_NO_WAIT=1 AGENT_GH_REAL="$GREAL_RA" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_ra="$(cat "$GDIR/retry-after.window" 2>/dev/null)"
+case "$_ra" in
+  ''|*[!0-9]*) fail "(f)(ix) a retry-after refusal recorded NO window kind ('$_ra') — the discharge cannot know to refuse it" ;;
+  *) pass "(f)(ix) a retry-after refusal stamps the window kind with the deadline it protects ($_ra)" ;;
+esac
+# Lane B: a HEALTHY exempt read must still HONOUR it.
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "  …and a healthy primary read HONOURS it (rc=75) — headroom does not contradict the server" \
+  || fail "  …but a retry-after window was DISCHARGED on healthy buckets (rc=$_rc) — the server's own instruction was overruled"
+grep -q 'DISCHARGED' "$GDIR/events.log" 2>/dev/null \
+  && fail "  …and it was recorded as DISCHARGED" \
+  || pass "  …and nothing was discharged"
+# CONTROL: drop the kind flag and the SAME read DOES discharge — so the arm above cannot be
+# satisfied by a revalidation that never fires.
+rm -f "$GDIR/retry-after.window"
+: > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] \
+  && pass "(f)(ix) control: the same healthy read DOES lift it once the kind flag is gone (rc=0)" \
+  || fail "(f)(ix) control: the gate is inert — an ordinary window is no longer discharged (rc=$_rc)"
+
+# (f)(x) ⛔ ONE EXEMPT READ AT A TIME, BOX-WIDE (finding 4). Without the single-flight lock the read
+# fires exactly when a shared window is open — the contention peak — so N blocked lanes issue N
+# concurrent requests, which is how a primary window is converted into the secondary concurrency
+# limit the runbook says causes the fleet-wide outage. gh-limit.py:2941 takes this lock for the
+# identical read: "the ONE gh request the layer issues unserialised … One invariant, no exemptions".
+GDIR="$(gate_dir revalidate-single-flight)"
+GREAL_SF="$TMP/gate-real-single-flight"; GSFC="$TMP/gate-sf-count"
+cat > "$GREAL_SF" <<'GHEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*)
+    n=$(cat "$GSFC" 2>/dev/null || echo 0); n=$(( n + 1 )); printf '%s' "$n" > "$GSFC"
+    printf '%s\n' '{"resources":{"core":{"limit":5000,"remaining":4684},"graphql":{"limit":5000,"remaining":4976},"search":{"limit":30,"remaining":30}}}'
+    exit 0 ;;
+esac
+exit 0
+GHEOF
+chmod +x "$GREAL_SF"
+_until=$(( $(date +%s) * 1000 + 60000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+sleep 30 &
+_sfholder=$!
+mkdir -p "$GDIR/revalidate.lock" && printf '%s\n' "$_sfholder" > "$GDIR/revalidate.lock/pid"
+: > "$GSFC"; : > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_SF" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 GSFC="$GSFC" bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 75 ] \
+  && pass "(f)(x) a HELD single-flight lock honours the window instead of asking again (rc=75)" \
+  || fail "(f)(x) a peer's single-flight lock was ignored (rc=$_rc) — the discharge is not serialised"
+[ ! -s "$GSFC" ] \
+  && pass "  …and NO second exempt read was issued while a peer held the lock (0 requests at the peak)" \
+  || fail "  …but it issued $(cat "$GSFC" 2>/dev/null) exempt read(s) while a peer held the lock — the peak becomes a burst"
+grep -q 'already re-deriving' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and says why, rather than honouring silently" \
+  || fail "  …and the reason is silent: $(head -2 "$GDIR/events.log" 2>/dev/null | tr '\n' ' ')"
+# CONTROL: release the lock and the SAME call issues exactly one read and proceeds.
+rm -rf "$GDIR/revalidate.lock"; kill "$_sfholder" 2>/dev/null; wait "$_sfholder" 2>/dev/null
+: > "$GSFC"; : > "$GDIR/events.log"
+AGENT_GH_GATE_WAIT_BUDGET=1 AGENT_GH_REAL="$GREAL_SF" AGENT_GH_GATE_DIR="$GDIR" \
+  AGENT_GH_GATE_INTERVAL_MS=0 GSFC="$GSFC" bash "$SHIM" api user >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] && [ "$(cat "$GSFC" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "(f)(x) control: with the lock free the read IS issued (exactly 1) and the window is lifted (rc=0)" \
+  || fail "(f)(x) control: free lock did not revalidate (rc=$_rc, reads=$(cat "$GSFC" 2>/dev/null || echo 0))"
+
+rm -f "$GDIR"/cooldown.* "$GDIR/secondary.window" "$GDIR/retry-after.window" 2>/dev/null
 
 # (g) A NON-rate-limit 403 IS NOT RETRIED. A permissions failure is not a burst, and
 #     retrying a mutating command would run it twice.

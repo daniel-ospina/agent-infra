@@ -840,6 +840,22 @@ set_cooldown_ms() {
 # records that the MOST RECENT window was written by such a refusal, and while it exists the window
 # is honoured unconditionally. Absence of evidence is never a discharge: a revalidation that cannot
 # complete (no real binary, unparseable body, timeout) leaves the window exactly as it was.
+#
+# ⛔ AND IT CAN NEVER DISCHARGE A `retry-after` WINDOW EITHER — `$GATE_DIR/retry-after.window`. That
+# deadline is the SERVER's own instruction, and headroom on the primary counter does not contradict
+# it; gh-limit.py refuses the identical discharge and states the measured consequence: "Clearing a
+# 300 s cool-down on `remaining > 0` put every later client on the box back inside a cool-down this
+# layer was still obeying" (`gh-limit.py:843-851`, `kind != "retry-after"`). The header is also the
+# documented way a secondary refusal announces itself when it does not use the runbook's exact
+# wording (`docs/ops/gh-rate-limits.md` — secondary "may carry `retry-after`, may not"), so folding
+# it in here closes both ways that window could otherwise be discharged by a read that cannot see it.
+#
+# ⛔ ONE EXEMPT READ AT A TIME, BOX-WIDE. This read fires ONLY when a shared window is open — the
+# contention peak — so N blocked lanes would otherwise issue N concurrent requests, and the gate's
+# health signal is its OWN in-flight count (#1910). gh-limit.py:2941 takes a single-flight lock for
+# the identical read, calling it "the ONE gh request the layer issues unserialised … One invariant,
+# no exemptions". `single_flight_acquire` is that lock here: a second lane honours the window
+# instead of asking again, so the fleet never converts a primary window into a concurrency burst.
 
 # ⛔ EVERY BUCKET, NOT JUST `core`. This used to read `resources.core.remaining` alone and then
 # claim "every bucket available" in the note. A `pr`/`issue`/`search` refusal is raised on
@@ -920,16 +936,16 @@ run_bounded() {
   return 124
 }
 
-# Re-derive an open shared window against the exempt read. 0 = discharged (proceed now),
-# 1 = keep the window. It only ever REMOVES a window on positive evidence that the account is fine.
-# ⛔ THE SECONDARY FLAG CARRIES ITS DEADLINE. An empty flag is not a fact — but neither is a
-# box-wide "secondary" boolean: `cooldown_remaining_ms` is a MONOTONIC MAX across files, so a
-# secondary window's 120 s deadline outlives the 60 s one a later ordinary refusal writes, and a
-# boolean that any ordinary refusal clears would un-protect it (#3228 review, finding 2 — measured:
-# lane B refused without a secondary phrase, flag gone, the 120 s secondary window left dischargeable
-# by lane C). So the flag records the deadline it protects and is only ever cleared BY TIME.
-secondary_live() {
-  local f="$GATE_DIR/secondary.window" v now
+# One window-KIND flag: a deadline recorded by the refusal that wrote the window, honoured until
+# TIME passes it and by nothing else.
+# ⛔ THE FLAG CARRIES ITS DEADLINE. An empty flag is not a fact — but neither is a box-wide
+# "secondary" boolean: `cooldown_remaining_ms` is a MONOTONIC MAX across files, so a secondary
+# window's 120 s deadline outlives the 60 s one a later ordinary refusal writes, and a boolean that
+# any ordinary refusal clears would un-protect it (#3228 review, finding 2 — measured: lane B
+# refused without a secondary phrase, flag gone, the 120 s secondary window left dischargeable by
+# lane C). So the flag records the deadline it protects and is only ever cleared BY TIME.
+window_kind_live() {
+  local f="$GATE_DIR/$1" v now
   [ -e "$f" ] || return 1
   v="$(cat "$f" 2>/dev/null)"
   now="$(now_ms)"
@@ -946,21 +962,64 @@ secondary_live() {
   rm -f "$f" 2>/dev/null
   return 1
 }
+# A window a SECONDARY-shaped refusal wrote: `/rate_limit` cannot see it at all (#1762).
+secondary_live() { window_kind_live secondary.window; }
+# A window the SERVER told us to wait out: headroom does not contradict it (gh-limit.py, #1762).
+retry_after_live() { window_kind_live retry-after.window; }
 
+# Non-blocking single-flight for the exempt read (see the header block): at most ONE such read per
+# box, never a queue behind it. A lane that cannot take it HONOURS the window rather than issue a
+# second request at the contention peak. A dead holder is reaped by its recorded pid, so a killed
+# shim cannot wedge revalidation off forever.
+single_flight_acquire() {
+  local lock="$1" pid stale now
+  if ! mkdir "$lock" 2>/dev/null; then
+    pid="$(cat "$lock/pid" 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*) pid="" ;; esac
+    if [ -n "$pid" ]; then
+      kill -0 "$pid" 2>/dev/null && return 1
+    else
+      # Unrecorded holder: it may be in the mkdir→write window (microseconds) or gone, so only a
+      # lock clearly older than that window is touched.
+      stale="$(mtime_ms "$lock")" || stale=""
+      now="$(now_ms)"
+      [ -n "$stale" ] && [ "$now" -lt $(( stale + 5000 )) ] && return 1
+    fi
+    rm -rf "$lock" 2>/dev/null
+    mkdir "$lock" 2>/dev/null || return 1
+  fi
+  if ! printf '%s\n' "$$" 2>/dev/null > "$lock/pid"; then
+    rm -rf "$lock" 2>/dev/null
+    return 1
+  fi
+  return 0
+}
+
+# Re-derive an open shared window against the exempt read. 0 = discharged (proceed now),
+# 1 = keep the window. It only ever REMOVES a window on positive evidence that the account is fine.
 discharge_window() {
-  local outf rem vrd minrem
+  local outf rem vrd minrem rlock
   [ "$REVALIDATE_ON" -eq 1 ] || return 1
-  # A window a SECONDARY-shaped refusal wrote is never discharged by a primary read.
+  # A window a SECONDARY-shaped refusal wrote is never discharged by a primary read, and neither is
+  # one the server itself instructed (see `window_kind_live`).
   secondary_live && return 1
+  retry_after_live && return 1
   rem="$(cooldown_remaining_ms)" || return 1
   # Only bother once the wait is long enough to be worth 0.4 s of read (the measured cost).
   [ "$rem" -ge "$REVALIDATE_MIN_MS" ] || return 1
+  rlock="$GATE_DIR/revalidate.lock"
+  if ! single_flight_acquire "$rlock"; then
+    gate_note "another lane is already re-deriving the shared window — honouring it instead of issuing a second exempt read"
+    return 1
+  fi
   outf="$WORKDIR/revalidate.$$"
   if ! run_bounded "$REVALIDATE_TIMEOUT_MS" "$outf" "$REAL" api rate_limit; then
+    rm -rf "$rlock" 2>/dev/null
     rm -f "$outf" 2>/dev/null
     gate_note "could not re-derive the shared rate-limit window (the exempt /rate_limit read failed or exceeded ${REVALIDATE_TIMEOUT_MS}ms) — honouring it"
     return 1
   fi
+  rm -rf "$rlock" 2>/dev/null
   rate_limit_verdict "$outf"; vrd=$?
   minrem="$(sed -n 's/^OK lowest=[^ ]* //p' "$outf" 2>/dev/null)"
   [ -n "$minrem" ] || minrem="(unreadable)"
@@ -1482,13 +1541,24 @@ run_paced() {
       # deadlines are monotonic maxima, so the newest window is not the governing one, and the old
       # comment had that backwards (#3228 review, finding 2). The flag now expires by its own
       # deadline and by nothing else.
+      # ⛔ THE SECONDARY PATTERNS ARE THE RUNBOOK'S OWN SYMPTOM, not a guess: `docs/ops/gh-rate-limits.md`
+      # §"Two limits" names `API rate limit already exceeded for user ID …` as the secondary
+      # signature and records that it strikes *while the primary counter reads healthy*. The word
+      # that distinguishes it from a primary exhaustion is `already`, and leaving it out classified
+      # exactly that refusal as PRIMARY — so the very read that cannot see a secondary limit
+      # discharged it. `retry-after` is recorded too, on its own flag: it is the server's own
+      # instruction and `gh-limit.py` refuses to discharge one (see `window_kind_live`).
       if [ "$GATE_ON" -eq 1 ]; then
-        if grep -Eqi 'secondary rate limit|abuse detection' "$errf" 2>/dev/null; then
-          case "$cd_until" in
-            ''|*[!0-9]*) : ;;
-            *) printf '%s' "$cd_until" 2>/dev/null > "$GATE_DIR/secondary.window" ;;
-          esac
-        fi
+        case "$cd_until" in
+          ''|*[!0-9]*) : ;;
+          *)
+            if grep -Eqi 'secondary rate limit|abuse detection|api rate limit already exceeded' "$errf" 2>/dev/null; then
+              printf '%s' "$cd_until" 2>/dev/null > "$GATE_DIR/secondary.window"
+            fi
+            if grep -Eqi 'retry-after:' "$errf" 2>/dev/null; then
+              printf '%s' "$cd_until" 2>/dev/null > "$GATE_DIR/retry-after.window"
+            fi ;;
+        esac
       fi
       # ⛔ A CALLER THAT DECLARED ITS OWN BOUND IS NOT SLEPT INSIDE. gh-limit.py sets
       # GH_LIMIT_NO_WAIT=1 precisely so a caller with a 60-420 s timeout gets the refusal back AT
