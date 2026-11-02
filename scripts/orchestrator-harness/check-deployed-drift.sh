@@ -759,7 +759,7 @@ if [ "$SURFACE" -eq 1 ]; then
       # The model that holds is positional, not counted: skip wrapper words, their options and those
       # options' VALUES, then the FIRST remaining word is the COMMAND. If the command is not a shell,
       # the prefix is closed for good — nothing later can arm it.
-      _pfx=1; _seen=0; _optval=0
+      _pfx=1; _seen=0; _optval=0; _wrap=""
       while [ "$_i" -lt "$_n" ]; do
         _w="${_argv[$_i]}"
         # ⛔ ARM ONLY ON A REAL INTERPRETER, IN COMMAND POSITION, AND NOT WHILE SWALLOWING AN OPTION'S
@@ -890,24 +890,31 @@ if [ "$SURFACE" -eq 1 ]; then
                   --command-timeout|--signal|--kill-after|--input|--output|--error) _optval=1 ;;
                   --unset|--adjustment|--split-string) _optval=1 ;;
                   --*) _optval=0 ;;
-                  -u|-g|-p|-C|-D|-h|-r|-t|-U|-T|-R|-n|-s|-k|-o|-e|-a|-S|-c) _optval=1 ;;
-                  # ⛔ `-c` IS IN THAT LIST FOR THE WRAPPER CASE ONLY (review round 14, P2). `sudo -c
-                  # <class>` (macOS) is a wrapper option taking an operand, and because this table arm
-                  # PRECEDES the `-c|-[!-]*c)` command-string arm, the latter never sees a wrapper's
-                  # `-c` at all — so gating it there could not restore `sudo -c <class> bash <path>`
-                  # (measured: still a mention). This list is only reached while NO interpreter has been
-                  # seen (`_seen -eq 0`), so an interpreter's own `-c`/`-lc` still falls to the
-                  # command-string arm and `bash -c <path>`/`bash -lc <path>` stay invocations.
+                  -u|-g|-p|-C|-D|-h|-r|-t|-U|-T|-R|-n|-s|-k|-o|-e|-a|-S) _optval=1 ;;
+                  # ⛔ `-c` CLAIMS ITS OPERAND ONLY FOR THE WRAPPERS WHOSE `-c` TAKES ONE (review round
+                  # 15, P2). `sudo -c <class>` / `doas -c` consume a value; `setsid -c` is `--ctty`, a
+                  # flag — claiming it there swallowed the real interpreter and turned a live
+                  # controller into a mention. This entry is also what MAKES the earlier `_c` string arm
+                  # stick: that arm sets `_optval=1`, and this table (the second `case`) overwrites it,
+                  # so the value has to agree here.
+                  -c) case "$_wrap" in sudo|doas) _optval=1 ;; *) _optval=0 ;; esac ;;
                   # ⛔ A COMBINED CLUSTER THAT ENDS IN A VALUE-TAKING LETTER CLAIMS ITS OPERAND (review
                   # round 14, P1). `sudo -iu <user> bash` and `sudo -Eu <user> bash` are the canonical
                   # login-shell-as-user spellings, and they are what this table's SAFE default gets
                   # wrong: an unrecognised word claims nothing, so the USER NAME was read as the
                   # COMMAND, the prefix died, and the launcher became a mere mention — a live controller
                   # on a GONE tree reported as nothing at all, i.e. the silent green #10114 exists to
-                  # end. MEASURED: ARMED on d708e68ea, `text` on the round-13 head. The TRAILING letter
-                  # decides, so `-o0` (stdbuf: a digit) still claims nothing and `stdbuf -o0 bash <path>`
-                  # keeps its interpreter, and a GLUED value (`-n5`) is not a claim either.
-                  -[!-]*[ugpCDhrtUTRnsokeaS]) _optval=1 ;;
+                  # end. MEASURED: ARMED on d708e68ea, `text` on the round-13 head.
+                  # ⛔ THE CLASS EXCLUDES THE WRAPPER FLAGS (review round 15, P1). The first draft used
+                  # `ugpCDhrtUTRnsokeaS`, which includes `n s k e S` — sudo FLAGS, not value-taking
+                  # options. Both directions broke, measured against the lane's head:
+                  # `sudo -En bash`, `-Hn`, `-Sn`, `-kn`, `-ns`, `-kS`, `-Es` → ARMED there, MENTION here
+                  #   (a live controller reported as nothing — the #10114 harm), and
+                  # `sudo -Hn grep bash`, `sudo -En cat sh` → MENTION there, ARMED here (the very
+                  #   fabrication class the option table was added to close).
+                  # The TRAILING letter still decides, so `-o0` (stdbuf: a digit) claims nothing and a
+                  # GLUED value (`-n5`) is not a claim either.
+                  -[!-]*[ugpCDhrtUTRoa]) _optval=1 ;;
                   *) _optval=0 ;;
                 esac
               fi ;;
@@ -919,7 +926,13 @@ if [ "$SURFACE" -eq 1 ]; then
                  env|nice|sudo|timeout|stdbuf|command|exec|nohup|setsid|doas)
                      # a wrapper while the command is still unknown is part of the prefix; seen AFTER a
                      # command, it is an argument and the prefix ends
-                     if [ "$_seen" -eq 1 ]; then _pfx=0; _interp=0; fi ;;
+                     # ⛔ REMEMBER WHICH WRAPPER (review round 15, P2): whether `-c` takes a value is a
+                     # property of the WRAPPER, not of the letter. `sudo -c <class>` and `doas -c`
+                     # consume an operand; `setsid -c` is `--ctty`, a FLAG. One union rule cannot be
+                     # right for both, and the `-c` claim is the difference between `setsid -c bash
+                     # <gone>/orch-loop.sh` being a mention (a live controller reported as nothing)
+                     # and being caught.
+                     if [ "$_seen" -eq 1 ]; then _pfx=0; _interp=0; else _wrap="${_w##*/}"; fi ;;
                  *) case "$_w" in
                       *=*) : ;;                       # an env assignment is an operand, not the command
                       *[!0-9]*) _pfx=0; _interp=0 ;;   # the COMMAND (or the script operand): closed

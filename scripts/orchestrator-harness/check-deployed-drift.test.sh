@@ -597,11 +597,23 @@ done
 #     which the bare-2-char claim rule did not recognise, so the user name was read as the COMMAND.
 #   • `sudo -c <class> bash` — the `-c` arm fired on the WRAPPER's own option and ate the interpreter.
 # They are discriminating: each is `text` on the round-13 head and ARMED here.
-for _r in 'sudo -iu deploy bash' 'sudo -Eu deploy bash' 'sudo -c staff bash'; do
+for _r in 'sudo -iu deploy bash' 'sudo -Eu deploy bash' 'sudo -c staff bash' \
+          'sudo -En bash' 'sudo -Hn bash' 'sudo -Sn bash' 'setsid -c bash'; do
   printf '4261 %s %s/orch-loop.sh\n' "$_r" "$GONE" > "$TMP/ps-restored"
   surf "$TMP/ps-restored"
-  ck "10a-3e: '$_r <abs>/orch-loop.sh' is still an INVOCATION (round-13 regression)" \
+  ck "10a-3e: '$_r <abs>/orch-loop.sh' is still an INVOCATION (round-13/15 regression)" \
      "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+done
+# ⛔ AND THE CLUSTER ARM MUST NOT CLAIM A WRAPPER **FLAG** AS IF IT TOOK A VALUE (review round 15, P1).
+# Round 14's cluster class included sudo's `n s k e S` — flags, not value-taking options — so
+# `sudo -En bash <abs>` claimed `bash` as `-En`'s operand and the launcher became a mention, and
+# `sudo -Hn grep bash <abs>` fabricated a controller out of a grep PATTERN. Both directions were
+# measured against the lane's head before being fixed; these two hold the fabrication side.
+for _f in 'sudo -Hn grep bash' 'sudo -En cat sh'; do
+  printf '4262 %s %s/orch-loop.sh\n' "$_f" "$GONE" > "$TMP/ps-flagcluster"
+  surf "$TMP/ps-flagcluster"
+  ck "10a-3e: '$_f <abs>/orch-loop.sh' is a MENTION (a wrapper FLAG claims no operand)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
 done
 # (10a-4) A TRAILING PATH AFTER A `-c` STRING IS `$0`, NOT THE SCRIPT (review VGATE of round 8). The
 # `-c` arm advances past the command string, so an ordinary-word guard never sees it: `_interp` stayed
