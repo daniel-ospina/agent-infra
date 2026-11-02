@@ -336,7 +336,7 @@ PY
     # NOTHING between 14:47 and 15:20 — alive, polling, and either finding zero candidates or
     # refusing silently — and those two readings are indistinguishable from the log. That is the
     # exact ALIVE / REFUSING / IDLE ambiguity the fleet keeps paying for (agent-infra #2700): a
-    # capability that cannot log_line "I looked and found nothing" gets diagnosed as dead on the next
+    # capability that cannot report "I looked and found nothing" gets diagnosed as dead on the next
     # bad day. One line per repo per pass makes the answer readable.
     # The counts are PER REPO (that is the fix) and `unattributed` is printed rather than dropped: a
     # rail nobody can attribute is unknown load, and a report that omits it reads as "none".
