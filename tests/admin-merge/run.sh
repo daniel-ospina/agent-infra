@@ -15048,7 +15048,12 @@ grep -q 'NAMED (0)' "$SCEN/err" \
 grep -q "run 9961 — check 'bash-suites (5)'" "$SCEN/err" \
   && pass "(j) …while the runs themselves are still named (the lines are real)" \
   || fail "(j) the runs were dropped along with the count: $(grep -n '9961' "$SCEN/err" 2>/dev/null | head -3)"
-grep -q 'INCOMPLETE' "$SCEN/err" \
+# ⛔ THE BARE TOKEN IS NOT THE CLAIM. `INCOMPLETE` alone also matches the rail's
+# unconditional `#3174` narration ("OR its shard recap was INCOMPLETE", admin-merge.sh
+# :1609) which is printed on this path regardless — so this arm was red on main with
+# nothing wrong (agent-infra#3282). Pin the CROSS-CHECK's own verdict phrase, exactly
+# as the neighbouring (k) arm already does (:1591 "… this list is INCOMPLETE …").
+grep -q 'this list is INCOMPLETE' "$SCEN/err" \
   && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
   || pass "(j) …and no completeness verdict is claimed from an unknown count"
 
