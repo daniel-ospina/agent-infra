@@ -4717,7 +4717,28 @@ function _isNamedPathOperand(x) {
   return true;
 }
 
-export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive = false) {
+/** #1484 M4 recovery window — an invocation whose REPO SELECTION is explicit.
+ *
+ * Round 5 (P1, MEASURED fail-open): the window must be decided on the PARSED
+ * invocation, never on the command text. `allGitInvocations` STRIPS the
+ * target-selecting token into hints (`cHints`/`gitDirHint`/`workTreeHint`), so
+ * `git "-C" <other> checkout -- p` arrives as
+ * `{verb:"checkout", args:["--","p"], cHints:["<other>"]}` — an EMPTY prefix
+ * for the allowlist below, and a raw-text regex for `-C` does not match the
+ * quoted spelling. Measured: that form (and `git "--git-dir" … checkout --`)
+ * ALLOWED under a hatch and DESTROYED a foreign checkout's uncommitted work,
+ * and `--git-dir=<other>/.git` wrote a foreign blob INTO the hub — all three
+ * BLOCKED on main. A restore in the recovery window never needs to name another
+ * repository, so any target hint puts the invocation outside it. */
+function _invSelectsRepo(inv) {
+  if (!inv) return false;
+  const hints = [inv.gitDirHint, inv.workTreeHint, inv.indexFileHint, inv.objDirsHint];
+  if (hints.some((h) => typeof h === "string" && h.length > 0)) return true;
+  if (Array.isArray(inv.cHints) && inv.cHints.length > 0) return true;
+  return false;
+}
+
+export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive = false, inv = null) {
   const a = args || [];
   const pos = a.filter((x) => !x.startsWith("-"));
   const flag = (f) => a.includes(f);
@@ -4744,6 +4765,7 @@ export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive 
         // deliberate discard must NAME its paths — and every non-restore verb
         // in this function is untouched.
         if (!escapeActive) return "block";
+        if (_invSelectsRepo(inv)) return "block"; // round-5 target fail-open
         if (["-b", "-B", "-c", "-C", "-f", "--force", "--create", "--force-create", "--orphan", "--detach"].some(flag) ||
             a.some((x) => x.startsWith("--force-create=") || /^-[bBcC][^-]/.test(x))) return "block";
         // ALLOWLIST, not a denylist (review P1, measured). The first cut accepted
@@ -4799,6 +4821,7 @@ export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive 
       // Same recovery window as the `checkout --` path-restore above: without
       // it the gate's advice is a no-op and the dirt cannot be cleared.
       if (!escapeActive) return "block";
+      if (_invSelectsRepo(inv)) return "block"; // round-5 target fail-open
       // ALLOWLIST (review P2, measured): the denylist `x.startsWith("--source")`
       // missed git's unambiguous long-option ABBREVIATIONS — `git restore --sour
       // HEAD~1 a.txt` runs and restored HEAD~1's content while classifying
@@ -5628,7 +5651,7 @@ export function evaluateHubGate(command, currentBranch, opts = {}) {
   let sawRecovery = false;
   for (const inv of invocations) {
     if (!inv.verb) continue;
-    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, escapeActive);
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, escapeActive, inv);
     if (v === "block") {
       return {
         verdict: "block",
@@ -6341,7 +6364,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         ].join("\n"),
       };
     }
-    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, escapeActive);
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, escapeActive, inv);
     // Main-protection interception for the SANCTIONED form: `checkout main` from
     // a worktree while the hub is off-main lets the wt take the protected branch
     // (git allows it — main is free) and then commit/push mutate main.
@@ -9857,7 +9880,7 @@ function _gitInvocationsVerdict(invocations, currentBranch, executionCwd, sessio
   for (const inv of invocations) {
     if (!inv.verb) continue;
     if (inv.verb === "__unverifiable__") return "block"; // round-12: multiword $VAR command
-    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, false, inv);
     // Round-20 (second-model P1): the script surface lacked the bash gate's
     // recovery-checkout main-protection — `cd <wt> && bash evil.sh` with
     // `git checkout main` content (hub off-main) takes the protected branch.

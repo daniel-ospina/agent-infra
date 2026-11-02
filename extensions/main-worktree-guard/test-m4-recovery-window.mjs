@@ -336,6 +336,19 @@ async function partB() {
     // checkout's uncommitted work.
     const b6e = await drive(`GIT_DIR="${other}/.git" GIT_WORK_TREE="${other}" git checkout -- tracked.txt`);
     check("B6e marker ⇒ GIT_DIR/GIT_WORK_TREE retarget still BLOCKED", b6e !== null, true);
+    // B6q–B6q3 — round 5, P1 MEASURED fail-opens. `allGitInvocations` strips the
+    // target-selecting token into hints, so a QUOTED `"-C"` reached the arm as an
+    // empty prefix and a text regex never saw it: all three ALLOWED and destroyed
+    // (or imported) a foreign checkout's work, where origin/main blocked them.
+    for (const [name, cmd] of [
+      ["quoted `\"-C\"`", `git "-C" "${other}" checkout -- tracked.txt`],
+      ["quoted `\"--git-dir\"`", `git "--git-dir" "${other}/.git" "--work-tree" "${other}" checkout -- tracked.txt`],
+      ["attached `--git-dir=`", `git --git-dir="${other}/.git" checkout -- tracked.txt`],
+      ["quoted + restore", `git "-C" "${other}" restore tracked.txt`],
+    ]) {
+      const r = await drive(cmd);
+      check(`B6q marker ⇒ ${name} retarget still BLOCKED (decided on the PARSED target)`, r !== null, true);
+    }
     // B6h — round 4, P2: while the hatch is ACTIVE the refusal must name the
     // window's real shape limit, not re-prescribe the hatch the reader holds.
     const b6h = await drive("git checkout -- wip.txt > /dev/null");
