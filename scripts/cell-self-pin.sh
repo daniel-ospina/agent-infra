@@ -1115,8 +1115,102 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
 # Nothing reds at runtime either: `--status` prints the LAST OUTCOME and never gates on its age, so a dead
 # clock leaves every surface green. The two rules below are what make the clock one that REPEATS and fires
 # THE PASS.
+# ⛔⛔ THE AUTHORITY ON "CAN systemd PARSE THIS VALUE" IS systemd, NOT THIS FILE (round-14 review).
+# Three rounds of review each found ANOTHER spelling this file certified while the manager DISCARDED it
+# (`10minx`, then `24:00:00`/`25:00`/`1000000000000000000y`, then `1..5 04:00:00`, `2200-01-01 04:00:00`,
+# `32 04:00:00`, `04..03:00`, `04:0/0:00`, duplicate and misordered fields). MEASURED at the head this
+# replaces: of a generated 240-form cross-product, 77 forms were accepted here and DISCARDED by systemd.
+# That is not a bug to patch spelling-by-spelling — a hand-written re-implementation of systemd's calendar
+# grammar is the defect, and each patch moved the boundary. So the parser is now ASKED, not imitated:
+# `systemd-analyze calendar|timespan` ships in the same package as the `systemctl` this pass already
+# depends on, and it is the only implementation that is faithful to the manager that will load the unit.
+#
+# ⛔ AND WHEN THERE IS NO PARSER TO ASK, THE FALLBACK IS A WHITELIST, NOT A GRAMMAR. `CELL_SELF_PIN_ANALYZE`
+# is the seam (the suite pins it, so no leg depends on the host's binaries):
+#   unset  → resolve `systemd-analyze` from PATH, and use it when present
+#   none   → pretend there is no parser, which is the tier the by-construction whitelist governs
+#   <cmd>  → that command line IS the parser (contract: `calendar -- <v>` / `timespan -- <v>`, rc=0 = ok)
+# For `OnCalendar=` that tier accepts ONLY the ten documented shortcut words: any explicit expression is
+# REFUSED, because verifying one without the manager's parser means writing that parser — and every
+# attempt certified values systemd throws away. That is a REFUSAL (an operator edits one line, or installs
+# `systemd-analyze`), never a false PASS — the whole lesson of #3194, and this file's own direction for
+# `--install`'s drop-ins: an unverifiable reading is not a PASS.
+timer_analyzer() { # prints the parser to ask, or nothing (rc=1) when there is none
+  # ⛔ `:-`, NOT `-`: an EMPTY value means "resolve it", never "there is no parser". `-` distinguished
+  # unset from empty and made `CELL_SELF_PIN_ANALYZE= ` — which is what a shell expands an unset variable to
+  # in common launcher spellings — silently fall into the whitelist tier on a box that HAS the parser.
+  # MEASURED while verifying this fix: with `CELL_SELF_PIN_ANALYZE=` set-empty, `OnCalendar=*-*-* 04:00:00`
+  # was REFUSED although systemd accepts it. Only the explicit word `none` selects the fallback tier.
+  local an="${CELL_SELF_PIN_ANALYZE:-__auto__}"
+  case "$an" in
+    none) return 1 ;;
+    __auto__) an="$(command -v systemd-analyze 2>/dev/null || true)" ;;
+  esac
+  [ -n "$an" ] || return 1
+  printf '%s\n' "$an"
+}
+# The NARROW timespan grammar, used ONLY when there is no parser. A time span is a closed, small grammar
+# (number + unit, repeated), unlike a calendar expression, so this tier can verify it completely — and a
+# review measured 31 spellings against `systemd-analyze timespan` without finding one it accepts and the
+# manager refuses. The magnitude bound is a POLICY bound (100 years), not systemd's overflow edge: the
+# manager accepts as far as ~584000y and refuses past it, and a cadence for a ten-minute pin is nowhere
+# near either. `infinity` never reaches here — it is a VALID timespan that means NEVER, and is refused by
+# name in `timer_value_ok` before any parser is asked.
+timer_timespan_ok() { # <value>
+  printf '%s\n' "$1" | awk '
+    function unitmul(u) {
+      if (u == "" || u == "s" || u == "sec" || u == "secs" || u == "second" || u == "seconds") return 1
+      if (u == "ms" || u == "msec") return 0.001
+      if (u == "us" || u == "usec") return 0.000001
+      if (u == "m" || u == "min" || u == "mins" || u == "minute" || u == "minutes") return 60
+      if (u == "h" || u == "hr" || u == "hrs" || u == "hour" || u == "hours") return 3600
+      if (u == "d" || u == "day" || u == "days") return 86400
+      if (u == "w" || u == "week" || u == "weeks") return 604800
+      if (u == "M" || u == "month" || u == "months") return 2629800
+      if (u == "y" || u == "year" || u == "years") return 31557600
+      return 0
+    }
+    {
+      v = $0
+      if (v !~ /^[0-9]+(\.[0-9]+)?(us|msec|ms|usec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|hrs|hr|h|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?([[:space:]]+[0-9]+(\.[0-9]+)?(us|msec|ms|usec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|hrs|hr|h|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?)*$/) exit 1
+      n = split(v, p, /[[:space:]]+/)
+      total = 0
+      for (i = 1; i <= n; i++) {
+        num = p[i]; sub(/[a-zA-Z]+$/, "", num)
+        u = substr(p[i], length(num) + 1)
+        mul = unitmul(u)
+        if (mul == 0) exit 1
+        total += num * mul
+      }
+      exit (total > 0 && total <= 3153600000) ? 0 : 1
+    }'
+}
+timer_value_ok() { # <directive> <value> — ok iff systemd can ACT on this value
+  local k="$1" v="$2" an
+  # ⛔ BEFORE ANY PARSER: `infinity` is a VALID timespan that means NEVER, so `systemd-analyze timespan`
+  # ACCEPTS it — and a rule that only asked the parser would certify a clock that fires once. Measured, so
+  # this refusal is deliberate and must not be "simplified" away by delegating.
+  case " $v " in *" infinity "*) return 1 ;; esac
+  if an="$(timer_analyzer)"; then
+    case "$k" in
+      OnCalendar) $an calendar -- "$v" >/dev/null 2>&1 ;;
+      *)          $an timespan -- "$v" >/dev/null 2>&1 ;;
+    esac
+    return $?
+  fi
+  case "$k" in
+    OnCalendar)
+      case "$v" in
+        minutely|hourly|daily|weekly|monthly|quarterly|semiannually|annually|yearly) return 0 ;;
+      esac
+      return 1 ;;
+    *) timer_timespan_ok "$v" ;;
+  esac
+}
+
 verify_timer() { # <rendered timer> [expected Unit= target]
   local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _badval _c
+  local _trigs _reset _n _k _v
   # Comments are stripped for the same reason `verify_unit` strips them: this template documents the
   # cadence decisions it made, and that prose legitimately names the directives the rules below ban.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
@@ -1183,124 +1277,46 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # repeating trigger GONE from the effective list, while the control `10min` read back as
   # `OnUnitActiveUSec=10min ; OnBootUSec=3min`. The inline-comment spelling is the realistic one: an
   # operator editing the cadence appends a comment, and systemd.syntax(7) has NO trailing comments.
-  # ⛔ THE GRAMMAR HERE IS DELIBERATELY NARROWER THAN systemd's, AND THAT IS THE SAFE DIRECTION: a
-  # REFUSAL costs an operator one edit, a false PASS costs the pin. `systemd-analyze` would be a second
-  # binary on the one path that must work on a bare box. Everything this template ships
-  # (`OnUnitActiveSec=<n>min`) and every ordinary cadence parses; `infinity` does NOT, because it is a
-  # VALID timespan that means NEVER — a dead clock, not a repeating one.
-  # ⛔ ⛔ AND A VALUE'S SHAPE IS NOT ITS RANGE (round-13 review, P1 — the same false PASS one spelling
-  # further out, and the last one this rule can hide behind). The first version of this replay asked only
-  # "is this number+unit SHAPED?" / "does it contain `h:mm`?", so a value the manager REFUSES was still
-  # certified: MEASURED at the head this fixes, `OnCalendar=25:00`, `24:00:00`, `04:00:99`,
-  # `*-*-* 25:00:00` and `OnUnitActiveSec=1000000000000000000y` each installed rc=0, while systemd 255
-  # DISCARDS every one of them — `systemd-analyze calendar -- '24:00:00'` => "Invalid argument",
-  # `systemd-analyze timespan -- 1000000000000000000y` => "Numerical result out of range", and
-  # `TimersCalendar=`/`OnUnitActiveUSec=` ABSENT from the loaded property on a probe unit. `24:00:00` is
-  # how an operator spells MIDNIGHT, so this is not a contrived spelling. The manager's own verdict is
-  # therefore what this replay reproduces: every numeric field is RANGE-CHECKED (hour 0-23, minute and
-  # second 0-59, month 1-12, day 1-31) and a timespan must be a duration the manager can act on at all
-  # (≤ 100 years, which is already past its integer range). ⛔ WHERE IT CANNOT VERIFY A FIELD IT REFUSES
-  # RATHER THAN CERTIFY: a calendar form this replay does not model (`~`, a name it does not know) is a
-  # refusal naming what to write instead, never a green. That is the whole lesson of #3194, and it is the
-  # direction this file already chose for `--install`'s drop-ins: an unverifiable reading is not a PASS.
-  _replay="$(printf '%s\n' "$timer" | awk '
-    # timespan multipliers, in seconds. `ms`/`us` are fractions and are kept as such.
-    function unitmul(u) {
-      if (u == "" || u == "s" || u == "sec" || u == "secs" || u == "second" || u == "seconds") return 1
-      if (u == "ms" || u == "msec") return 0.001
-      if (u == "us" || u == "usec") return 0.000001
-      if (u == "m" || u == "min" || u == "mins" || u == "minute" || u == "minutes") return 60
-      if (u == "h" || u == "hr" || u == "hrs" || u == "hour" || u == "hours") return 3600
-      if (u == "d" || u == "day" || u == "days") return 86400
-      if (u == "w" || u == "week" || u == "weeks") return 604800
-      if (u == "M" || u == "month" || u == "months") return 2629800
-      if (u == "y" || u == "year" || u == "years") return 31557600
-      return 0
-    }
-    function timespan(v,   n, i, p, num, u, mul, total) {
-      if (v !~ /^[0-9]+(\.[0-9]+)?(us|msec|ms|usec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|hrs|hr|h|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?([[:space:]]+[0-9]+(\.[0-9]+)?(us|msec|ms|usec|s|sec|secs|second|seconds|m|min|mins|minute|minutes|hrs|hr|h|hour|hours|d|day|days|w|week|weeks|M|month|months|y|year|years)?)*$/) return 0
-      n = split(v, p, /[[:space:]]+/)
-      total = 0
-      for (i = 1; i <= n; i++) {
-        num = p[i]; sub(/[a-zA-Z]+$/, "", num)
-        u = substr(p[i], length(num) + 1)
-        mul = unitmul(u)
-        if (mul == 0) return 0
-        total += num * mul
-      }
-      # ⛔ A TIMESPAN THE MANAGER CANNOT ACT ON IS NOT A CADENCE. systemd keeps time spans in usec, so a
-      # large enough value overflows and is DISCARDED (`Numerical result out of range`). 100 years is past
-      # that boundary and past any cadence this unit could mean, so the bound refuses the overflow class
-      # WITHOUT re-implementing its own integer arithmetic — and `infinity` never reaches here (it is not
-      # number+unit shaped), which is what keeps the VALID spelling that means NEVER a refusal.
-      return total > 0 && total <= 3153600000
-    }
-    function numok(x, lo, hi,   n, p, i) {
-      if (x == "*") return 1
-      if (index(x, "/") > 0) { n = split(x, p, "/"); if (n != 2) return 0; return numok(p[1], lo, hi) && numok(p[2], lo, hi) }
-      if (index(x, "..") > 0) { n = split(x, p, /\.\./); if (n != 2) return 0; return numok(p[1], lo, hi) && numok(p[2], lo, hi) }
-      if (x !~ /^[0-9]+$/) return 0
-      return (x + 0) >= lo && (x + 0) <= hi
-    }
-    # the TIME field: H:M or H:M:S, every numeric part RANGE-CHECKED. `*`, `a/b` and `a..b` are accepted
-    # per part because systemd accepts them there and they cannot hide an out-of-range number.
-    function timeok(f,   n, p) {
-      if (index(f, ":") == 0) return 0
-      n = split(f, p, ":")
-      if (n < 2 || n > 3) return 0
-      if (!numok(p[1], 0, 23)) return 0
-      if (!numok(p[2], 0, 59)) return 0
-      if (n == 3 && !numok(p[3], 0, 59)) return 0
-      return 1
-    }
-    function wk(w) {
-      return tolower(w) ~ /^(mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)$/
-    }
-    function weekday_ok(f,   n, i, a, m, b, j) {
-      if (f == "*") return 1
-      n = split(f, a, ",")
-      for (i = 1; i <= n; i++) {
-        m = split(a[i], b, /\.\./)
-        if (m > 2) return 0
-        for (j = 1; j <= m; j++) { if (b[j] == "*") continue; if (!wk(b[j])) return 0 }
-      }
-      return 1
-    }
-    function dateok(f,   n, i, p) {
-      if (f ~ /[^0-9A-Za-z*\/.~-]/) return 0
-      if (index(f, "~") > 0) return 0
-      n = split(f, p, "-")
-      if (n < 1 || n > 3) return 0
-      for (i = 1; i <= n; i++) {
-        if (i == 2) { if (!numok(p[i], 1, 12)) return 0 }
-        else if (i == 3) { if (!numok(p[i], 1, 31)) return 0 }
-        else if (!numok(p[i], 0, 99999999)) return 0
-      }
-      return 1
-    }
-    function calendar(v,   n, i, p) {
-      if (v ~ /[#;]/) return 0
-      if (v ~ /^(minutely|hourly|daily|weekly|monthly|quarterly|semiannually|annually|yearly)$/) return 1
-      # ⛔ the field order systemd documents is [weekday] [date] TIME, and the TIME field is the one that cannot be omitted.
-      n = split(v, p, /[[:space:]]+/)
-      if (n < 1 || n > 3) return 0
-      if (!timeok(p[n])) return 0
-      for (i = 1; i < n; i++) { if (!weekday_ok(p[i]) && !dateok(p[i])) return 0 }
-      return 1
-    }
+  # ⛔ AND THE VALUE MUST BE ONE THE MANAGER CAN ACT ON, NOT MERELY ONE THAT IS SHAPED LIKE ONE. Three
+  # review rounds each found another spelling this file certified while systemd DISCARDED it — `10minx`, a
+  # trailing comment, `24:00:00`, `25:00`, `1000000000000000000y`, `1..5 04:00:00`, `2200-01-01 04:00:00`,
+  # `32 04:00:00`, a duplicate field — and MEASURED at the head before this, 77 of a 240-form cross-product
+  # were accepted here and thrown away by the manager. The lesson is not a better grammar: a hand-written
+  # re-implementation of systemd's calendar parser IS the defect, and each patch moved its boundary. So the
+  # value is referred to `timer_value_ok`, which ASKS the manager's own parser (see above) and, with no
+  # parser available, certifies only what it can verify by construction.
+  # ⛔ THE ORDER AND THE RESET SEMANTICS ARE READ HERE, THE VALUES ARE JUDGED ELSEWHERE. This awk pass
+  # only answers "which trigger directives are EFFECTIVE" — the ones after the LAST empty assignment,
+  # because `systemd.timer(5)`: "If the empty string is assigned to any of these options, the list of
+  # timers is reset". Whether a value is one the manager can ACT on is `timer_value_ok`'s job, so it is
+  # answered by the manager's own parser rather than by a grammar written here.
+  _trigs="$(printf '%s\n' "$timer" | awk '
     { line = $0; sub(/^[[:space:]]*/, "", line) }
     line ~ /^(OnBootSec|OnStartupSec|OnActiveSec|OnUnitActiveSec|OnUnitInactiveSec|OnCalendar)[[:space:]]*=/ {
       k = line; sub(/[[:space:]]*=.*/, "", k)
       v = line; sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]+$/, "", v)
-      if (v == "") { rep = 0; next }
-      if (k == "OnUnitActiveSec") { if (timespan(v)) rep = 1; else bad = bad k "=" v "; "; next }
-      if (k == "OnCalendar")      { if (calendar(v)) rep = 1; else bad = bad k "=" v "; "; next }
+      n++
+      if (v == "") { reset = n; next }
+      print n "\t" k "\t" v
     }
-    END { print rep + 0 "|" bad }')"
-  _rep="${_replay%%|*}"
-  _badval="${_replay#*|}"
+    END { print "R\t" reset + 0 }')"
+  _reset="$(printf '%s\n' "$_trigs" | awk -F'\t' '$1 == "R" { print $2 }')"
+  _reset="${_reset:-0}"
+  _rep=0
+  _badval=""
+  while IFS=$'\t' read -r _n _k _v; do
+    [ "$_n" = R ] && continue
+    [ "$_n" -le "$_reset" ] && continue
+    # Only a REPEATING trigger can keep the clock alive: `OnBootSec=`/`OnStartupSec=`/`OnActiveSec=`/
+    # `OnUnitInactiveSec=` fire once, so a value of theirs never makes the pin repeat.
+    case "$_k" in
+      OnUnitActiveSec|OnCalendar) ;;
+      *) continue ;;
+    esac
+    if timer_value_ok "$_k" "$_v"; then _rep=1; else _badval="$_badval $_k=$_v;"; fi
+  done < <(printf '%s\n' "$_trigs")
   if [ "$_rep" -ne 1 ] && [ -n "$_badval" ]; then
-    bad "the rendered timer's only REPEATING trigger(s) carry a value systemd cannot parse or CANNOT ACT ON (${_badval%; }) and no other one is valid — the manager DISCARDS such a value ('Failed to parse timer value, ignoring' / 'Failed to parse calendar specification, ignoring', systemd.timer(5)), which leaves the ONCE-per-boot OnBootSec=/OnStartupSec=/OnActiveSec= triggers alone, so the pin would run a single time and then stop for ever with every surface green. NOTE systemd.syntax(7): there are NO trailing comments, so a value followed by '#…' is an unparseable value; and a field the manager range-checks and this rule cannot (hour >23, minute/second >59, month >12, a timespan beyond the manager's integer range) is REFUSED rather than certified. Give OnUnitActiveSec= a plain timespan ('10min') or OnCalendar= a calendar expression whose every field is in range ('*-*-* 04:00:00', 'daily')"; return 1
+    bad "the rendered timer's only REPEATING trigger(s) carry a value systemd cannot parse or CANNOT ACT ON (${_badval%; }) and no other one is valid — the manager DISCARDS such a value ('Failed to parse timer value, ignoring' / 'Failed to parse calendar specification, ignoring', systemd.timer(5)), which leaves the ONCE-per-boot OnBootSec=/OnStartupSec=/OnActiveSec= triggers alone, so the pin would run a single time and then stop for ever with every surface green. NOTE systemd.syntax(7): there are NO trailing comments, so a value followed by '#…' is an unparseable value. The verdict is the MANAGER's ('systemd-analyze calendar|timespan'), not this file's; where no parser is available on the box, an explicit OnCalendar= expression is REFUSED rather than certified, because verifying it without the parser means re-implementing it. Write a value the manager accepts ('OnUnitActiveSec=10min', 'OnCalendar=daily', 'OnCalendar=*-*-* 04:00:00'), or make 'systemd-analyze' available"; return 1
   fi
   [ "$_rep" -eq 1 ] || { bad "the rendered timer's EFFECTIVE trigger list declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, and an EMPTY OnUnitActiveSec=/OnCalendar= is a LIST RESET that discards every trigger above it, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare a non-empty OnUnitActiveSec= or OnCalendar= and put no empty assignment after it"; return 1; }
   return 0

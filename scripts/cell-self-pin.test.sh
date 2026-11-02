@@ -64,6 +64,10 @@ trap cleanup EXIT
 # runat <home> [VAR=VAL…] <command…> — ONE isolated invocation. Every leg goes through this (review
 # finding: legs that called `env` directly inherited the ambient record and resolved a FOREIGN tree, so
 # the suite went red on exactly the box it exists to guard).
+# AN — which value PARSER the pass is told to ask. `none` is the DEFAULT so every leg is hermetic and
+# deterministic (no leg depends on whether THIS host has systemd-analyze); a leg that exercises the
+# delegation tier sets AN to a fake for one call and puts it back, so the tier cannot leak between legs.
+AN=none
 runat() {
   local h="$1"; shift
   # ⛔ AND PATHS: no leg may reach the HOST's real `systemctl`. `do_pass` now re-reads the one-actor
@@ -74,9 +78,10 @@ runat() {
   env -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
       -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
-      -u CELL_SELF_PIN_SYSTEMCTL \
+      -u CELL_SELF_PIN_SYSTEMCTL -u CELL_SELF_PIN_ANALYZE \
       CELL_SELF_PIN_DROPIN_ROOTS="$T/dropins-hermetic" \
       CELL_SELF_PIN_SYSTEMCTL=systemctl \
+      CELL_SELF_PIN_ANALYZE="${AN:-none}" \
       PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
@@ -89,9 +94,10 @@ runat_keep_pinfile() {
   env -u HARNESS -u HARNESS_PIN_DIR -u HARNESS_REPO -u O -u STAMP \
       -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
       -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
-      -u CELL_SELF_PIN_SYSTEMCTL \
+      -u CELL_SELF_PIN_SYSTEMCTL -u CELL_SELF_PIN_ANALYZE \
       CELL_SELF_PIN_DROPIN_ROOTS="$T/dropins-hermetic" \
       CELL_SELF_PIN_SYSTEMCTL=systemctl \
+      CELL_SELF_PIN_ANALYZE="${AN:-none}" \
       PATH="$T/fakebin-none:$PATH" \
       CELL_HOME="$h" HOME="$h" "$@"
 }
@@ -328,6 +334,29 @@ doctor_rw() { # <name> <sed-expr applied to the service template>
   sed "$2" "$TPL/cell-self-pin.service" >"$d/cell-self-pin.service"
   printf '%s\n' "$d"
 }
+# mk_analyzer <dir> <accept|refuse|table> — a fake `systemd-analyze`. The pass no longer grades a value's
+# SHAPE: it asks the manager's own parser (`calendar -- <v>` / `timespan -- <v>`, rc=0 = ok). That makes the
+# parser the AUTHORITY, so the suite has to be able to speak for it — otherwise every leg silently depends
+# on the host's binaries, and a leg could pass for the wrong reason on a box without systemd-analyze.
+#   accept  → every value is ok        (proves the pass does NOT re-grade what the parser accepted)
+#   refuse  → no value is ok           (proves the pass does not accept what the parser refused)
+#   table   → ok iff the value is listed in <dir>/accept
+mk_analyzer() { # <dir> [accept|refuse|table] <accept-list…>
+  local d="$1" mode="${2:-accept}"; shift 2 || true
+  mkdir -p "$d"
+  { printf '#!/bin/bash\n'; printf 'd=%q\n' "$d"
+    case "$mode" in
+      accept) printf 'exit 0\n' ;;
+      refuse) printf 'exit 1\n' ;;
+      table)  printf 'want=""; shift 2>/dev/null || true; for a in "$@"; do [ "$a" = "--" ] && continue; want="$a"; done\n'
+              printf 'grep -Fxq -- "$want" %q && exit 0\nexit 1\n' "$d/accept" ;;
+    esac
+  } >"$d/systemd-analyze"
+  chmod +x "$d/systemd-analyze"
+  [ "$mode" = table ] && shift 0
+  for v in "$@"; do printf '%s\n' "$v" >>"$d/accept"; done
+  printf '%s\n' "$d"
+}
 install_doctored() { # <dir> <unit-dir>
   runat "$T/home" TEMPLATES_DIR="$1" SYSTEMD_UNIT_DIR="$2" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
     PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1
@@ -555,8 +584,8 @@ doctor_timer() { # <name> <sed-expr applied to the TIMER template> [<line insert
   # a host the COUNT rule this leg exists to pin is never exercised and the leg reds with "refused for the
   # WRONG reason" — a red suite on a host this file explicitly supports, for a reason that has nothing to
   # do with the defect. `awk` prints the extra line after the first `Unit=` and is portable to both.
-  [ -z "${3:-}" ] || awk -v extra="$3" '1; /^Unit=/ && !done { print extra; done=1 }' \
-    "$d/cell-self-pin.timer" >"$d/.timer.tmp" && mv "$d/.timer.tmp" "$d/cell-self-pin.timer"
+  [ -z "${3:-}" ] || { awk -v extra="$3" '1; /^Unit=/ && !done { print extra; done=1 }' \
+    "$d/cell-self-pin.timer" >"$d/.timer.tmp" && mv "$d/.timer.tmp" "$d/cell-self-pin.timer"; }
   printf '%s\n' "$d"
 }
 doctor_timer_append() { # <name> <sed-expr or ''> <text appended verbatim at EOF>
@@ -663,23 +692,50 @@ refuses_timer 'a timespan PAST the manager integer range (1000000000000000000y)'
 # ⛔ THE POSITIVE CONTROL, because "refuse every value" would satisfy all four legs above. A real calendar
 # expression and the shortcut word must INSTALL: the rule refuses what systemd DISCARDS, never what it can
 # read — and an over-block here would close the one edit an operator is most likely to make.
-u_cal="$T/units-cal"; out="$(install_doctored "$(doctor_timer cal-ok 's|^OnUnitActiveSec=.*$|OnCalendar=*-*-* 04:00:00|')" "$u_cal")"; rc=$?
+# ⛔ THE CONTROL THAT STOPS "refuse every value" FROM PASSING, and it must run in the tier where an
+# explicit expression is certifiable at all: with a parser available, a real calendar expression installs.
+an_real="$(mk_analyzer "$T/an-table" table '*-*-* 04:00:00' 'daily')"
+u_cal="$T/units-cal"; AN="$an_real/systemd-analyze"; out="$(install_doctored "$(doctor_timer cal-ok 's|^OnUnitActiveSec=.*$|OnCalendar=*-*-* 04:00:00|')" "$u_cal")"; rc=$?; AN=none
 [ "$rc" -eq 0 ] && [ -f "$u_cal/cell-self-pin.timer" ] && ok "…and a VALID OnCalendar= expression still installs (the rule refuses unparseable values, not calendars)" \
   || bad "refused a valid OnCalendar=*-*-* 04:00:00 (rc=$rc): $out"
 u_daily="$T/units-daily"; out="$(install_doctored "$(doctor_timer cal-daily 's|^OnUnitActiveSec=.*$|OnCalendar=daily|')" "$u_daily")"; rc=$?
 [ "$rc" -eq 0 ] && [ -f "$u_daily/cell-self-pin.timer" ] && ok "…and the OnCalendar= shortcut word 'daily' installs" \
   || bad "refused OnCalendar=daily (rc=$rc): $out"
-# ⛔ TWO MORE POSITIVE CONTROLS, because a rule that was TIGHTENED by range is one edit away from
-# over-blocking: the range checks must refuse what the manager DISCARDS and nothing else. A weekday range
-# and a multi-unit timespan are both ordinary cadences systemd accepts (`systemd-analyze calendar --
-# 'Mon..Fri 04:00:00'`, `systemd-analyze timespan -- '5h 30min'`), so a refusal here is a false RED on a
-# migration that is correct.
-u_wk="$T/units-weekday"; out="$(install_doctored "$(doctor_timer cal-weekday 's|^OnUnitActiveSec=.*$|OnCalendar=Mon..Fri 04:00:00|')" "$u_wk")"; rc=$?
-[ "$rc" -eq 0 ] && [ -f "$u_wk/cell-self-pin.timer" ] && ok "…and a weekday RANGE (OnCalendar=Mon..Fri 04:00:00) still installs — the range rule refuses out-of-range fields, not calendar syntax" \
-  || bad "refused a valid weekday range OnCalendar=Mon..Fri 04:00:00 (rc=$rc): $out"
 u_multi="$T/units-multiunit"; out="$(install_doctored "$(doctor_timer unit-multiunit 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=5h 30min|')" "$u_multi")"; rc=$?
-[ "$rc" -eq 0 ] && [ -f "$u_multi/cell-self-pin.timer" ] && ok "…and a multi-unit timespan (OnUnitActiveSec=5h 30min) installs — the magnitude bound is not a bound on ordinary values" \
+[ "$rc" -eq 0 ] && [ -f "$u_multi/cell-self-pin.timer" ] && ok "…and a multi-unit timespan (OnUnitActiveSec=5h 30min) installs — the narrow tier is a bound on nonsense, not on ordinary values" \
   || bad "refused a valid multi-unit timespan OnUnitActiveSec=5h 30min (rc=$rc): $out"
+
+# ── 4a-bis. THE VALUE PARSER IS THE MANAGER'S, NOT THIS FILE'S ──────────────────────────────────────
+# ⛔ THREE REVIEW ROUNDS EACH FOUND ANOTHER SPELLING THE HAND-WRITTEN GRAMMAR CERTIFIED WHILE systemd
+# DISCARDED IT (`10minx`; then `24:00:00`/`25:00`/`1000000000000000000y`; then `1..5 04:00:00`,
+# `2200-01-01 04:00:00`, `32 04:00:00`, `04..03:00`, `04:0/0:00`, a duplicate field). MEASURED at the head
+# before this: 77 of a 240-form cross-product were ACCEPTED here and thrown away by the manager. Each patch
+# moved the boundary, because a re-implementation of systemd's calendar parser IS the defect. So the pass
+# now ASKS `systemd-analyze calendar|timespan`. These legs pin BOTH directions of that delegation: a value
+# the parser REFUSES is refused however ordinary it looks, and a value the parser ACCEPTS is installed
+# however exotic it looks — i.e. the pass does not re-grade what the parser decided.
+u_del="$(mk_analyzer "$T/an-refuse" refuse)"
+AN="$u_del/systemd-analyze"; out="$(install_doctored "$(doctor_timer cal-delegated 's|^OnUnitActiveSec=.*$|OnCalendar=*-*-* 04:00:00|')" "$T/units-deleg-refuse")"; rc=$?; AN=none
+[ "$rc" -ne 0 ] && ok "…and a value the PARSER refuses is refused even though it is well formed (the verdict is the manager's, not this file's)" \
+  || bad "installed OnCalendar=*-*-* 04:00:00 while the parser REFUSED it — the grammar is grading shape again (rc=$rc): $out"
+u_acc="$(mk_analyzer "$T/an-accept" accept)"
+AN="$u_acc/systemd-analyze"; out="$(install_doctored "$(doctor_timer cal-exotic 's|^OnUnitActiveSec=.*$|OnCalendar=1..5 04:00:00|')" "$T/units-deleg-accept")"; rc=$?; AN=none
+[ "$rc" -eq 0 ] && [ -f "$T/units-deleg-accept/cell-self-pin.timer" ] && ok "…and a value the parser ACCEPTS is installed without this file re-grading it (OnCalendar=1..5 04:00:00 — a form the old grammar could only guess at)" \
+  || bad "refused OnCalendar=1..5 04:00:00 although the parser ACCEPTED it — the pass is still re-implementing the parser (rc=$rc): $out"
+
+# ⛔ AND WITH NO PARSER ON THE BOX, THE FALLBACK IS A WHITELIST, NOT A GUESS: the ten documented shortcut
+# words are certifiable by construction, and any explicit EXPRESSION is REFUSED with the two routes out
+# named. That direction is deliberate — a refusal an operator fixes with one line, never a false PASS —
+# and this leg exists so the over-block is RECORDED rather than discovered by an operator.
+AN=none; out="$(install_doctored "$(doctor_timer cal-noparser 's|^OnUnitActiveSec=.*$|OnCalendar=Mon..Fri 04:00:00|')" "$T/units-noparser")"; rc=$?
+if [ "$rc" -ne 0 ] && [[ $out == *"systemd-analyze"* ]]; then
+  ok "…and with NO parser available an explicit OnCalendar= is REFUSED and the refusal names the route (the documented fail-closed tier)"
+else
+  bad "with no parser available, an explicit OnCalendar= was not refused by name (rc=$rc): $out"
+fi
+AN=none; out="$(install_doctored "$(doctor_timer cal-noparser-daily 's|^OnUnitActiveSec=.*$|OnCalendar=daily|')" "$T/units-noparser-daily")"; rc=$?
+[ "$rc" -eq 0 ] && [ -f "$T/units-noparser-daily/cell-self-pin.timer" ] && ok "…while the shortcut word 'daily' still installs with no parser (a whitelist, so it cannot certify nonsense)" \
+  || bad "refused OnCalendar=daily with no parser (rc=$rc): $out"
 
 # ── 4b. THE EFFECTIVE UNIT: the drop-in systemd MERGES over the rendered one ──────────────────────
 # ⛔ THE FALSE PASS THIS CLOSES. `verify_unit` reads the file this run WRITES; systemd merges
