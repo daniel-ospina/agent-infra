@@ -528,6 +528,33 @@ refuses_dropin 'declares an OnCalendar= (re-schedules the timer)' "$(dropin_doct
 # `cell-.service.d/legacy.conf` carrying `Environment=CELL_HOME=/tmp/other-home` installed rc=0 and nothing
 # in the run mentioned the file — the same false PASS one directory over.
 refuses_dropin 'lives in a DASH-TRUNCATED drop-in dir (cell-.service.d)' "$(dropin_doctor dashdir 'WorkingDirectory=/srv/harness-current' 'cell-.service.d')" 'WorkingDirectory='
+# ⛔ AND THE ROOT LIST ITSELF IS AN ASSERTION A TEST CAN MAKE, NOT A LIST NOTHING READS. `dropin_dirs`
+# scanned three hardcoded paths and omitted `/usr/local/lib/systemd/system` — a SYSTEM unit directory on
+# systemd 255 (`systemd-analyze unit-paths` prints it), and the one `systemd.unit(5)` Table 1 lists ABOVE
+# `/usr/lib/systemd/system` as "System units installed by the administrator". A drop-in there is merged OVER
+# the rendered unit and was read by NOTHING, while `--install` printed "installed — ONE actuator on this
+# pin" and exited 0: the same false PASS one directory over, in the directory an operator building a cell
+# by hand is most likely to use. MEASURED: deleting `/run` and `/usr/lib` from that list left this suite at
+# 240 ok / 0 failed, so nothing pinned the enumeration at all.
+roots_out="$(runat "$T/home" bash "$PIN" --print-dropin-roots 2>&1)"
+for _r in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system; do
+  case "$roots_out" in
+    *"$_r"*) ok "…and the drop-in gate SCANS ${_r} — a systemd SYSTEM unit directory it merges for this unit" ;;
+    *) bad "the drop-in gate does not scan ${_r}: a legacy drop-in there is merged over the rendered unit and read by NOTHING, which is #3194's false PASS one directory over — [$roots_out]" ;;
+  esac
+done
+# The real roots are root-owned on every box that has them, so the ENUMERATION is exercised through its
+# documented seam rather than asserted by grep: a drop-in planted under a CONFIGURED root, outside the unit
+# dir, must be refused and name the file. A gate that only reads the unit dir passes the legs above.
+u_alt="$T/units-altroot"; mkdir -p "$u_alt" "$T/altroot/cell-self-pin.service.d"
+printf '[Service]\nWorkingDirectory=/tmp/cell-ai\n' >"$T/altroot/cell-self-pin.service.d/legacy.conf"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$u_alt" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
+         CELL_SELF_PIN_DROPIN_ROOTS="$T/altroot" PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "ACCEPTED a drop-in living under a configured SYSTEM root OUTSIDE the unit dir — so a box carrying /usr/local/lib/systemd/system/cell-self-pin.service.d/legacy.conf installs rc=0 and keeps the defect: $out"
+elif [[ $out == *'provisioning clone'* ]]; then
+  ok "…and a drop-in under a root OTHER than the unit dir is REFUSED by name, so the root list is load-bearing"
+else bad "refused an out-of-unit-dir drop-in for the WRONG reason: $out"; fi
 refuses_dropin 'lives in the TYPE-LEVEL drop-in dir (service.d)' "$(dropin_doctor typedir 'ConditionPathExists=/srv/nope' 'service.d')" 'ConditionPathExists='
 refuses_dropin 'declares a RootDirectory= (systemd enters it before the payload)' "$(dropin_doctor rootdir 'RootDirectory=/srv/harness-current')" 'never began'
 # ⛔ AND THE TIMER'S DROP-INS ARE A SEPARATE SET, WHICH NOTHING READ. `dropin_dirs` enumerates what systemd
@@ -998,6 +1025,32 @@ if git -C "$T/seed" push -q origin refs/tags/attip 2>/dev/null; then
   out="$(runat "$T/home-pass" HARNESS_REF=main bash "$PIN" 2>&1)"; rc=$?
   [ "$rc" -ne 0 ] && ok "…and the BARE branch spelling ('main') is not decided on the stale local branch either" \
     || bad "the PASS with HARNESS_REF=main answered rc=$rc — a bare spelling read the local branch: $out"
+  # ⛔ AND IT IS REFUSED BY NAME, BEFORE ANY MUTATION — not left to RED as STALE-RECORD for ever. `apply`
+  # pins what IT resolves LOCALLY (`cloud-cell-supervisor.sh:2118`), so for a spelling that names a LOCAL ref
+  # the record can NEVER advance; and the remedy the STALE-RECORD line prints (`git fetch origin main &&
+  # apply --force --pin-only`) cannot change that either, because that fetch does not move the local branch
+  # it pins. MEASURED before this guard, tick after tick on a two-clone fixture: `DRIFT … -- applying
+  # --force --pin-only`, then `STALE-RECORD: … does not contain main …`, rc=1, pin tree never advancing —
+  # i.e. `apply` (a MUTATION) re-run ten times an hour on a box whose pin can never converge. An unhealable
+  # RED is as useless as a false GREEN, and a useless remedy is worse than a name.
+  case "$out" in
+    *'UNRESOLVED(ref-spelling)'*) ok "…and the BARE spelling is REFUSED BY NAME (ref-spelling) before the mutation, instead of re-applying for ever" ;;
+    *'STALE-RECORD'*) bad "the bare spelling was not refused up front: the tick ran apply and then blamed an unmoved record — the diagnosis repeats for ever and its remedy cannot work: $out" ;;
+    *) bad "the bare spelling exited rc=$rc without naming why it can never converge: $out" ;;
+  esac
+  # ⛔ THE CANONICAL SPELLING OF THE DEFAULT VALUE MUST NOT DIE IN `git fetch`. `ref_fetch_branch` stripped
+  # only `origin/` and `refs/heads/`, so `refs/remotes/origin/main` — the name of THIS repo's tracking ref,
+  # which the sibling reader resolves happily (`git rev-parse refs/remotes/origin/main^{commit}`, rc=0) —
+  # was handed to `git fetch` verbatim as a REMOTE source: `fatal: couldn't find remote ref
+  # refs/remotes/origin/main`, rc=128 (MEASURED). The tick then exited 2 `fetch-failed` for ever on a value
+  # that worked before this file decided on the fetched commit, and the `2>/dev/null` on that fetch threw
+  # git's own reason away, so the journal could not say why.
+  out="$(runat "$T/home-pass" HARNESS_REF=refs/remotes/origin/main bash "$PIN" 2>&1)"; rc=$?
+  case "$out" in
+    *'fetch-failed'*) bad "HARNESS_REF=refs/remotes/origin/main cannot be fetched — the tracking-ref spelling was handed to git as a REMOTE ref, so the tick exits 2 for ever: $out" ;;
+    *"${MAIN2:-<unreadable>}"*) ok "…and the tracking-ref spelling 'refs/remotes/origin/main' is FETCHED as 'main' and decided on the fetched commit, not handed to git as a remote ref" ;;
+    *) bad "HARNESS_REF=refs/remotes/origin/main did not reach the fetched commit ${MAIN2:-<unreadable>} (rc=$rc): $out" ;;
+  esac
   # The pass-side PEELING control: `attip` is an annotated tag ON the record's commit, so a pass that
   # compares the TAG OBJECT sha to a commit reads DRIFT forever, and one that peels reads current.
   out="$(runat "$T/home-pass" HARNESS_REF=attip bash "$PIN" 2>&1)"; rc=$?

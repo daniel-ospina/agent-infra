@@ -7,6 +7,7 @@
 #   ./cell-self-pin.sh --dry-run       # resolve + decide + print: change NOTHING, fetch NOTHING
 #   ./cell-self-pin.sh --install [--takeover]   # render + verify + PLACE the pass + install the units
 #   ./cell-self-pin.sh --print-unit    # render the units to stdout ONLY — writes no file, places no pass
+#   ./cell-self-pin.sh --print-dropin-roots  # the systemd system-unit dirs the drop-in gate scans
 #   ./cell-self-pin.sh --help
 #
 # Exit (pass):   0 = current or applied (and ONE actuator on the pin); 11 = the pin RECORD was missing
@@ -121,9 +122,20 @@ HARNESS_REF="${HARNESS_REF:-origin/main}"
 # refreshed one ref and compared another, and `--status` printed "`origin/rel` fetched just now" about a ref
 # it never touched. A knob read one way and refreshed another is two facts pretending to be one, which is
 # the #2215 skew this file exists to remove — one variable over.
-ref_fetch_branch() { # the branch name to fetch for $HARNESS_REF (origin/main -> main, refs/heads/x -> x)
-  local r="${HARNESS_REF#origin/}"
-  r="${r#refs/heads/}"
+ref_fetch_branch() { # the REMOTE branch to fetch for $HARNESS_REF (see the three forms below)
+  local r
+  # ⛔ THREE SPELLINGS NAME THE SAME REMOTE BRANCH, AND ONE OF THEM IS NOT A REMOTE REF AT ALL. Only
+  # `origin/<b>` and `refs/heads/<b>` were stripped, so `refs/remotes/origin/<b>` — the canonical name of
+  # the DEFAULT knob value, and the spelling the sibling reader accepts
+  # (`git rev-parse refs/remotes/origin/main^{commit}`, rc=0) — was handed to `git fetch` verbatim as a
+  # REMOTE source: `fatal: couldn't find remote ref refs/remotes/origin/main`, rc=128 (MEASURED). The tick
+  # then exited 2 `fetch-failed` for EVER on a value that worked before this file decided on the fetched
+  # commit, and the `2>/dev/null` on that fetch discarded git's reason, so the journal could not even say
+  # why. `refs/remotes/origin/<b>` is this repo's tracking ref; the thing to ask the REMOTE for is `<b>`.
+  case "$HARNESS_REF" in
+    refs/remotes/*/*) r="${HARNESS_REF#refs/remotes/}"; r="${r#*/}" ;;
+    *) r="${HARNESS_REF#origin/}"; r="${r#refs/heads/}" ;;
+  esac
   printf '%s\n' "${r:-main}"
 }
 # ⛔ THE DECISION READS A REF THIS RUN OWNS, NOT `FETCH_HEAD`. `FETCH_HEAD` is an ordinary mutable file in
@@ -285,6 +297,30 @@ mend_record() {
   return 0
 }
 
+# ⛔ THE PIN VERB RESOLVES `$HARNESS_REF` **LOCALLY**; THIS FILE DECIDES ON THE COMMIT THE FETCH BROUGHT.
+# They are two facts, and for a spelling that names a LOCAL ref they are DIFFERENT facts — so the pass could
+# never converge, and the failure was neither silent nor honest:
+#   · `apply --force --pin-only` runs `cloud-cell-supervisor.sh::harness_apply`, which fetches `origin main`
+#     (HARDCODED, `:2115`) and then pins `$(git rev-parse "$HARNESS_REF^{commit}")` (`:2118`) — a LOCAL read;
+#   · a fetch of `main` moves `refs/remotes/origin/main` and NEVER `refs/heads/main`, so `HARNESS_REF=main`
+#     (or `refs/heads/main`) pins this repo's local branch, the record does not move, and `:387`'s containment
+#     test REDs with STALE-RECORD — every ten minutes, for ever, while the box is in fact behind;
+#   · the remedy the STALE-RECORD line prints (`git fetch origin main && apply --force --pin-only`) cannot
+#     change the outcome either, because that fetch does not move the local branch it pins. An UNHEALABLE RED
+#     is as useless as a false GREEN, and a useless remedy is worse than a name.
+# MEASURED on a two-clone fixture, `HARNESS_REF=main`, tick after tick: `DRIFT … -- applying --force
+# --pin-only` then `STALE-RECORD: … does not contain main …`, rc=1, with the pin tree never advancing.
+# So the spelling is REFUSED — named, exit 2, BEFORE the mutation — instead of being run ten times an hour.
+check_pin_resolution() { # <layer repo> <target commit> — 0 when the pin verb's OWN resolution is our target
+  local repo="$1" target="$2" local_target
+  local_target="$(git -C "$repo" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null)" || local_target=""
+  [ "$local_target" = "$target" ] && return 0
+  if [ -z "$local_target" ]; then
+    loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} resolves to no commit in ${repo}, and 'apply' pins what IT resolves locally, so the record could never advance. Use the remote spelling: HARNESS_REF=origin/<branch>"
+  fi
+  loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} resolves LOCALLY to ${local_target} in ${repo}, but this run fetched ${target} — 'apply' pins the LOCAL ref (cloud-cell-supervisor.sh:2118), so the record could never advance and every tick would re-apply for ever. Use the remote spelling: HARNESS_REF=origin/<branch>"
+}
+
 do_pass() {
   local dry="${1:-}" layer repo sup target applied now rc fetch_branch fetch_ref
   # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED HERE, ON EVERY TICK, BEFORE ANYTHING ELSE — see
@@ -337,6 +373,10 @@ do_pass() {
   else
     log "DRIFT pinned=${applied} target=${target} -- applying --force --pin-only"
   fi
+  # ⛔ BEFORE ANY MUTATION: IS THE REF THIS RUN DECIDED ON THE REF THE PIN VERB WILL PIN? See
+  # `check_pin_resolution` — a spelling the verb resolves to something ELSE cannot converge however many
+  # ticks it gets, and this is the last point where refusing costs nothing.
+  check_pin_resolution "$repo" "$target"
   mkdir -p "$O" 2>/dev/null || true
   # ⛔ `--force --pin-only`, BOTH FLAGS, AND FOR DIFFERENT REASONS (#2215, honoured rather than
   # re-decided). `--pin-only`: a live cell always runs a controller, so a bare `apply` dies on it — and
@@ -941,11 +981,26 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
 # installed rc=0 and NOTHING in the run mentioned the file — the same false PASS one directory over, on the
 # very defect class (#3194's drop-in) this section exists for. The dirs are enumerated from systemd's own
 # rule rather than a list of the paths somebody happened to think of.
+# ⛔ THE ROOT LIST MUST BE systemd's OWN LOAD PATH, AND IT WAS THREE PATHS SOMEBODY THOUGHT OF. On systemd
+# 255 `systemd-analyze unit-paths` lists `/etc/systemd/system`, `/run/systemd/system`,
+# `/usr/local/lib/systemd/system` and `/usr/lib/systemd/system` as SYSTEM unit directories, and
+# `systemd.unit(5)` Table 1 puts `/usr/local/lib/systemd/system` — "System units installed by the
+# administrator" — ABOVE `/usr/lib/systemd/system`. The list below omitted it, so a legacy
+# `cell-self-pin.service.d/*.conf` carrying the very `WorkingDirectory=/tmp/cell-ai` this change exists to
+# remove was merged OVER the rendered unit by systemd and read by NOTHING, while `--install` printed
+# "installed — ONE actuator on this pin" and exited 0: the exact false PASS this section exists to close,
+# in the directory an administrator building a cell by hand is most likely to use. `/lib/systemd/system` is
+# the same directory on a non-usrmerge host, and `/etc/systemd/system` is scanned even when the caller
+# redirects the unit dir (`SYSTEMD_UNIT_DIR`, which the suite uses), because systemd loads it regardless.
+# `CELL_SELF_PIN_DROPIN_ROOTS` is the SEAM the suite plants a drop-in under: the real roots are root-owned,
+# so a leg that cannot write them proves nothing about the enumeration — and MEASURED, deleting `/run` and
+# `/usr/lib` from this list left the suite at 240 ok / 0 failed, i.e. nothing pinned it at all.
+SYSTEMD_UNIT_ROOTS="/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system"
 dropin_dirs() { # <unit-dir> <unit-name> — every directory systemd merges for this unit
   local unit_dir="$1" name="$2" root base svc short seen=" " d
   svc="${name##*.}"
   base="${name%.*}"
-  for root in "$unit_dir" /run/systemd/system /usr/lib/systemd/system; do
+  for root in "$unit_dir" ${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS}; do
     [ -d "$root" ] || continue
     # the unit's OWN drop-in directory is `<unit>.<type>.d` (the full name), not `<unit>.d`
     for d in "$root/$name.d" "$root/$svc.d"; do
@@ -1340,6 +1395,9 @@ case "${1:---pass}" in
   --status)       do_status fetch ;;
   --status-nofetch) do_status nofetch ;;
   --print-unit)   print_unit ;;
+  # read-only: the SYSTEM unit directories `dropin_dirs` scans, so the enumeration is an assertion a test
+  # can make instead of a list nothing reads (see SYSTEMD_UNIT_ROOTS).
+  --print-dropin-roots) printf '%s\n' ${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS} ;;
   --install)      shift; do_install "${1:-}" ;;
   --takeover)     err "--takeover is an argument to --install: '$0 --install --takeover'"; exit 64 ;;
   # ⛔ THE RANGE IS DERIVED, NOT TYPED. `sed -n '2,68p'` cut mid-sentence and printed `set -u` plus the
