@@ -68,21 +68,31 @@ GATE="$HERE/spawn-gate.sh"
 # line it cannot classify:
 #   claim       X=… · export X=… · declare/readonly/typeset [-flags] X=… · local X=… · X+=… ·
 #               after `;` `&&` `||` `then` `do` `else` `{` `(` `)` (a case-branch body) ·
-#               ${X:=…} and ${X=…} (assign-if-unset)
+#               ${X:=…} and ${X=…} (assign-if-unset) · declare/readonly X=(83) (an ARRAY LITERAL —
+#               the parenthesis is part of the operand, not of the value) · printf -v X %d 83 (a
+#               declaration with NO `=` at all, when its value is readable)
 #   fallback    ${X:-…} ${X-…} ${X:+…} — a READ default. It cannot declare a code, but a default
 #               that DISAGREES with the declaration silently mislabels every refusal that hits it, so
 #               it must equal the declared code (a mismatch is a RED naming file:line). A QUOTED
 #               operand (`${X:-"81"}`) and an operand that cannot be read are refused too: the first
 #               cut cut at the leading quote and folded both into `${X:-}`, i.e. a false PASS.
 #   unknown     an assignment in the family that is not a 70..89 code (sanctionable by name, above)
-#   unparseable an assignment OPERATOR on a family token that is not in a declaration position (e.g.
-#               `echo "AGENT_X_REFUSED=83"`), or an operand that cannot be read at all. RED, named
-#               `unparseable declaration: <file>:<line>`, and deliberately NOT sanctionable: an escape
-#               hatch here would restore the drop.
-# STATED LIMIT: a family token with NO assignment operator is a READ, not a declaration (`exit
-# "$AGENT_X_REFUSED"`, `${X}`), and is not reported — the scan is about declarations. A COMMENT line
-# is documentation, not a declaration, so a commented-out declaration is not claimed (the required-
-# declarer rule is what catches a helper that stops declaring its code).
+#   unparseable an assignment-shaped declaration of a family token this parse cannot classify. FOUR
+#               shapes, all RED, all named `unparseable declaration: <file>:<line>`, none
+#               sanctionable (an escape hatch here would restore the drop):
+#                 • an assignment OPERATOR outside a declaration position — `echo "AGENT_X_REFUSED=83"`;
+#                 • an operand that cannot be read at all — `X=$(( 70 + 13 ))`;
+#                 • an ARRAY SUBSCRIPT completed by an assignment — `X[0]=83`, `X[0]+=83`, `X[k]=83`,
+#                   `${X[0]:=83}` (the P1: these produced NO ROW and read GREEN, measured);
+#                 • an assignment BUILTIN whose value this scanner cannot know — `read -r X`,
+#                   `mapfile X` — or a `printf -v X …` whose format it cannot read.
+# STATED LIMIT (and it is now TRUE, which it was not before): a family token with NO assignment
+# operator and no assignment builtin writing it is a READ, not a declaration (`exit "$AGENT_X_REFUSED"`,
+# `${X}`, `${X[0]}`, `[ "$X" = 83 ]`), and is not reported — the scan is about declarations. That
+# sentence used to be false as written: `printf -v AGENT_X_REFUSED %d 83` IS a declaration with no
+# operator, and it read GREEN with 0 rows. A COMMENT line is documentation, not a declaration, so a
+# commented-out declaration is not claimed (the required-declarer rule is what catches a helper that
+# stops declaring its code).
 # The scan is computed ONCE per directory and every reader in this file uses it (`codes_for_name`
 # for a value, `$CODE_ROWS` for the claim list): a second parser is a second way to fail open.
 cat > "$TMP/refusal-codes.awk" <<'REFUSAL_AWK'
@@ -106,6 +116,13 @@ function cmdpos(pre,   p) {
 # which the caller then read as `${X:-}` (a bare read) — a stale default passing as clean, measured.
 function valof(v,   out, q, i) {
   out = v
+  # ⛔ AN ARRAY LITERAL IS AN OPERAND (#P1 review of 87b8d708b, body/parse disagreement): the body
+  # table listed `readonly -a X=(83)` as a claim while the parse cut at the leading `)` and produced
+  # `(83`, i.e. an `unknown` row naming a value that is not in the file. `declare -a X=(83)` IS a
+  # declaration of 83 at index 0 (`${X}` is 83), so the parenthesis is part of the OPERAND, not of
+  # the value: drop it and let the ordinary value rules read what is inside. `X=()` still reads as
+  # the empty value, i.e. `unknown` — a RED, which is the correct answer for a declaration with no code.
+  if (out ~ /^\(/) out = substr(out, 2)
   if (out ~ /^["']/) {
     q = substr(out, 1, 1)
     out = substr(out, 2)
@@ -115,6 +132,51 @@ function valof(v,   out, q, i) {
   sub(/[ \t;#\\)}"'\/].*$/, "", out)
   gsub(/^["']|["']$/, "", out)
   return out
+}
+# ── A DECLARATION WITH NO ASSIGNMENT OPERATOR, AND ITS VALUE ────────────────────────────────────
+# ⛔ `printf -v NAME <fmt> [arg]` DECLARES THE CODE and carries no `=`, so the operator chain cannot
+# see it at all: measured on the reviewed head, `printf -v AGENT_X_REFUSED %d 83` produced NO ROW and
+# the duplicate check stayed GREEN. It is classified as a claim when its value is READABLE (a single
+# conversion and a single literal integer argument) and REFUSED otherwise — never left silent, which
+# is the defect this whole scanner exists to close.
+function printfval(t,   a, n, fmt, v) {
+  sub(/^[ \t]+/, "", t)
+  n = split(t, a, /[ \t]+/)
+  if (n != 2) return ""                       # a multi-conversion / multi-arg format: unreadable
+  fmt = a[1]
+  gsub(/^["']|["']$/, "", fmt)
+  if (fmt !~ /^[^%]*%[dis][^%]*$/) return ""   # exactly one `%d`/`%i`/`%s`, no other conversion
+  v = a[2]
+  gsub(/^["']|["']$/, "", v)
+  return (v ~ /^[0-9]+$/) ? v : ""
+}
+# ⛔ THE RESIDUAL ARM: FAIL CLOSED ON WHAT THE OPERATOR CHAIN DID NOT CLASSIFY (P1, review of
+# 87b8d708b — the BLOCKING finding). The chain above is a WHITELIST, and it used to end by DROPPING
+# any residual text it had not anticipated: `X[0]=83` leaves `tail` beginning with `[`, matches no
+# arm, and produced NO ROW — GREEN, 0 rows for the name — while bash treats it as a genuine
+# assignment (`bash -c 'X[0]=83; echo "${X}"'` prints 83). Measured drops on the reviewed head:
+# `X[0]=83`, `X[0]+=83`, `X[0]="83"`, `X[k]=83`, `declare -a X[0]=83`, `X[0]=83; exit "${X}"`.
+# Adding `[` to the chain would fix today's instance and leave the CLASS alive, because the arm list
+# IS the safety property. So the chain is now an OPTIMISATION and this is the safety property: after
+# the chain, any residual that still DECLARES the token is REFUSED (`unparseable`, RED, named
+# file:line) instead of skipped. Two residual shapes are DECLARATION-shaped:
+#   • an ARRAY SUBSCRIPT completed by an assignment — `[<any>]=`, `[<any>]+=`, `[<any>]:=`;
+#   • an assignment BUILTIN that writes its value INTO the name — `printf -v`, `read`/`mapfile`/
+#     `readarray` (a value this scanner cannot know, so it cannot claim a code).
+# A residual that only READS the token (`${X}`, `${X#*=}`, `X[0]`, `[ "$X" = 83 ]`) is untouched: a
+# read declares nothing, and turning reads into REDs would be the over-block that makes a scanner
+# ignored. The subscript test is anchored at the `]` for the same reason — `[ "$X[0]" = 83 ]` is a
+# comparison, and its `=` comes after a QUOTE, so it stays silent.
+function residual(pre, tail, s, name, f, ln) {
+  if (tail ~ /^\[[^]]*\][ \t]*:?\+?=/) { print "unparseable", name, s, f, ln; return }
+  if (pre ~ /(^|[ \t;&|({])printf[ \t]+-v[ \t]+$/) {
+    v = printfval(tail)
+    if (v != "") row("claim", name, v, f, ln)
+    else         print "unparseable", name, s, f, ln
+    return
+  }
+  if (pre ~ /(^|[ \t;&|({])(read|mapfile|readarray)([ \t]+-[A-Za-z]+)*[ \t]+$/) \
+    print "unparseable", name, s, f, ln
 }
 function row(kind, name, v, f, ln) {
   if (iscode(v)) print kind, name, v + 0, f, ln
@@ -146,8 +208,11 @@ function row(kind, name, v, f, ln) {
           # case: the first cut folded both, and `${X:-"81"}` passed as clean.
           if (raw !~ /^}/ && raw !~ /^["']["']/) print "unparseable", name, s, f, FNR
         } else row("fallback", name, v, f, FNR)
+      } else {
+        # A plain read inside braces (`${X}`, `${X#*=}`) — UNLESS it is a declaration shape this
+        # chain did not classify (`${X[0]:=83}`), which the residual arm REFUSES rather than drops.
+        residual(pre, tail, s, name, f, FNR)
       }
-      # else: a plain read inside braces (`${X}`, `${X#*=}`) — not a declaration
     } else if (tail ~ /^\+=/) {
       if (cmdpos(pre)) row("claim", name, valof(substr(tail, 3)), f, FNR)
       else             print "unparseable", name, s, f, FNR
@@ -156,6 +221,11 @@ function row(kind, name, v, f, ln) {
       else             print "unparseable", name, s, f, FNR
     } else if (tail ~ /^:?[-+]/) {
       print "unparseable", name, s, f, FNR
+    } else {
+      # ⛔ NOT A FALL-THROUGH ANY MORE. This `else` used to be absent, and its absence is the P1: the
+      # line was dropped in silence, so the name read GREEN with no row while the code it declares
+      # collided with a sibling. See `residual` for the two shapes it now REFUSES.
+      residual(pre, tail, s, name, f, FNR)
     }
     rest = tail
   }
@@ -1385,21 +1455,56 @@ cp "$HERE/brief-gate.sh" "$RO/"
 # would be worse than none: the propagation arms invoke `bash "$HERE/chain-merge.sh"`, never
 # `$RO/chain-merge.sh`, so its only reachable outcome is a RED that no arm's behaviour earned.
 cp "$HERE/reviewer-preflight.sh" "$RO/"
-# chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
+# ⛔ THE STUB MUST LIVE IN `$O/gh-limit/`, NOT IN `$RIG/bin` (P1, review of `87b8d708b`, finding 3 —
+# "§10's gh stub is inert", REPRODUCED before it was fixed). `chain-merge.sh:7` runs
+# `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH` and only THEN re-prepends `$O/gh-limit` /
+# `$O/gh-rest` — so a stub the RIG prepends is outranked by a real `/opt/homebrew/bin/gh` on every host
+# that has one. Measured on the reviewed head with an INSTRUMENTED stub: the stub log stayed EMPTY,
+# the real `gh` was called, no PR was ever found, and the wait fell through to the chain's OWN
+# "no PR appeared" `exit 1` — so `want=1` read a FALSE PASS (the chain's timeout code IS 1, the number
+# the row asserts) while `0` and `75` read reds that say nothing about the wrapper at all. That is the
+# instrument false positive under a comment diagnosing a verdict decided by the HOST's configuration.
+# `$O/gh-limit` is the production seam the chain ITSELF guarantees outranks the tool dirs (it is how
+# #1988's adapter is installed), so the arm uses it — and the stub LOGS, because a stub that is never
+# called is exactly the inert layer #1988 exists to prevent, and silence is how this arm rotted.
+GH_LOG="$TMP/ghstub.log"
+# …`$RIG/bin/gh` is kept for the arms that do NOT prepend the tool dirs (adopt-fix and the fixers);
+# it is NOT what `chain-merge.sh` resolves, which is the whole point of the seam below.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
+mkdir -p "$RO/gh-limit"
+printf '#!/bin/sh\necho "GH_STUB: $*" >> "%s"\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' "$GH_LOG" > "$RO/gh-limit/gh"
+chmod +x "$RO/gh-limit/gh"
 # ⛔ THE STUB'S STATUS IS A DELIBERATE STAND-IN, NOT A CLAIM ABOUT merge-one.sh: the shipped
 # merge-one.sh ends on a reporting `echo` and contains no `exit 75` (0 hits), so it returns 0 on the
 # paths that reach its end. Its early guards DO exit 1/2/3/4, and those propagate through this wrapper
 # today; the 75 arm is forward-looking until the blocked #8521 half lands in merge-one.sh. That
 # residual is recorded in port-provenance.txt — this check pins the WRAPPER, which is what changed.
+# ⛔ AND THE ARM ASSERTS THE PATH WAS TRAVELLED, not just the number returned: the stub must be CALLED
+# and merge-one.sh must have RUN. Without that pair a future PATH change silently restores the inert
+# stub, and `want=1` goes back to being indistinguishable from the chain's own timeout.
+# ⛔ AND THE HANDOFF WAIT IS BOUNDED HERE, because finding the PR is what UNLOCKS it (P1 follow-up,
+# measured). Once the stub answers, `chain-merge.sh` no longer exits on its own no-PR timeout — it
+# runs the REAL path, and the rig's `$RO/state` carries a `lanemerge-<PR>.phase` marker from the earlier
+# arms, so the chain enters its merge-phase handoff wait: `HANDOFF_WAIT` (1800s) in `CHAIN_POLL` (15s)
+# steps, i.e. ~120 polls PER ARM and three arms in a row. Measured: the suite sat on this arm for over
+# 4 minutes with no progress. The wait is correct in production and irrelevant to what these rows
+# assert (propagation), so it is bounded to one 1s tick here — the same class of bound as
+# `CHAIN_POLLS=1` below, and stated for the same reason: an arm that hangs is an arm nobody runs.
 for want in 0 1 75; do
-  : > "$MERGE_LOG"
-  ( cd "$RREPO" && O="$RO" MERGE_RC="$want" PATH="$RIG/bin:$PATH" \
+  : > "$MERGE_LOG"; : > "$GH_LOG"
+  # ⛔ `MERGE_LOG` IS PASSED IN ON PURPOSE: the merge-one stub is written in SINGLE quotes, so it reads
+  # `$MERGE_LOG` from the ENVIRONMENT at run time (that is how every other arm here drives it) — an
+  # arm that asserts on its output without exporting the path asserts on nothing.
+  ( cd "$RREPO" && O="$RO" MERGE_RC="$want" CHAIN_POLLS=1 CHAIN_POLL_SECS=1 CHAIN_POLL=1 \
+      LANE_HANDOFF_WAIT=1 MERGE_LOG="$MERGE_LOG" PATH="$RIG/bin:$PATH" \
       bash "$HERE/chain-merge.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; crc=$?
-  [ "$crc" -eq "$want" ]; rc=$?
-  ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — not a constant" $rc
+  { [ "$crc" -eq "$want" ] && grep -q 'GH_STUB: pr list' "$GH_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
+  ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — its gh stub was actually CALLED and merge-one.sh really RAN, so this is propagation and not the chain's own timeout" $rc
 done
+# ...and the seam is removed again: `$O/gh-limit` is on the chain's PATH for EVERY gh call, so leaving
+# it behind would divert the adopt-fix arms below onto a stub written for this one arm.
+rm -rf "$RO/gh-limit"
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc=$?
@@ -1981,7 +2086,8 @@ assign-if-unset|: \"\${AGENT_NEW_GATE_REFUSED:=83}\"
 assign-if-unset-bare|: \"\${AGENT_NEW_GATE_REFUSED=83}\"
 in-if-then|if true; then AGENT_NEW_GATE_REFUSED=83; fi
 after-andand|true && AGENT_NEW_GATE_REFUSED=83
-before-semicolon|AGENT_NEW_GATE_REFUSED=83; true"
+before-semicolon|AGENT_NEW_GATE_REFUSED=83; true
+array-literal|readonly -a AGENT_NEW_GATE_REFUSED=(83)"
 _shape_unread=""; _shape_unred=""
 while IFS='|' read -r _shtag _shline; do
   [ -n "$_shtag" ] || continue
@@ -2004,6 +2110,66 @@ _shape_n="$(printf '%s\n' "$_codeshapes" | awk 'NF{n++} END{print n+0}')"
 ck "the scanner CLASSIFIES all $_shape_n declaration shapes as a claim of the code they carry (unread:${_shape_unread:- none}) — the parser this replaces reported 0 rows for each of them" $rc
 [ -z "${_shape_unred// /}" ]; rc=$?
 ck "...and EVERY one of them REDDENS the duplicate check as the 83 collision, not for some other reason (green:${_shape_unred:- none})" $rc
+
+# ⛔ THE P1 THE LIST ITSELF COULD NOT SEE (review of `87b8d708b`, BLOCKING). The list above is a
+# WHITELIST and the mutation arms ARE that list, so no arm in it can catch a shape its author did not
+# think of — that is why this block is NOT another row appended to the list. Measured through the
+# shipped scanner on the reviewed head, every shape below was GREEN with **0 rows for the name**,
+# while bash treats it as a genuine assignment (`bash -c 'AGENT_X_REFUSED[0]=83; echo "${AGENT_X_REFUSED}"'`
+# prints `83`):
+#   AGENT_X_REFUSED[0]=83 · [0]+=83 · [0]="83" · [k]=83 · declare -a X[0]=83 · X[0]=83; exit "${X}"
+# The cause is the shape of the chain, not a missing spelling: every arm keys off the text IMMEDIATELY
+# after the token, a tail beginning with `[` matches none of them, and the chain then FELL THROUGH with
+# no row — the same "`next` drops what it did not anticipate" defect this PR already fixed twice.
+# Two residual declarations therefore had no home at all:
+#   • an ARRAY SUBSCRIPT completed by an assignment (`[<any>]=`, `[<any>]+=`, `[<any>]:=`) — the P1;
+#   • an assignment BUILTIN that writes into the name: `printf -v X %d 83` (a DECLARATION with no
+#     `=` — measured GREEN with 0 rows, which falsifies the old "no operator ⇒ it is a READ" sentence),
+#     and `read -r X` / `mapfile X` (a value this scanner cannot know).
+# The fix is the INVERSION, not a longer chain: what the chain does not classify is now REFUSED by the
+# residual arm (`residual()` in the awk), so `unparseable` is the destination for ANY future shape and
+# the whitelist becomes an optimisation instead of the safety property. Each row below carries the
+# classification the scanner MUST produce, and drives it twice for the same two reasons as above —
+# the PARSE arm fails if the shape vanishes again, the VERDICT arm fails if it reddens for some other
+# reason (a copy artefact, a required declarer, an unrelated collision).
+_residshapes="array-idx0|unparseable|AGENT_NEW_GATE_REFUSED[0]=83
+array-idx0-plus|unparseable|AGENT_NEW_GATE_REFUSED[0]+=83
+array-idx0-quoted|unparseable|AGENT_NEW_GATE_REFUSED[0]=\"83\"
+array-idxvar|unparseable|AGENT_NEW_GATE_REFUSED[k]=83
+array-declare-idx0|unparseable|declare -a AGENT_NEW_GATE_REFUSED[0]=83
+array-readonly-idx0|unparseable|readonly -a AGENT_NEW_GATE_REFUSED[0]=83
+array-braced-assign|unparseable|: \"\${AGENT_NEW_GATE_REFUSED[0]:=83}\"
+array-then-exit|unparseable|AGENT_NEW_GATE_REFUSED[0]=83; exit \"\${AGENT_NEW_GATE_REFUSED}\"
+printf-v|claim|printf -v AGENT_NEW_GATE_REFUSED %d 83
+read-builtin|unparseable|read -r AGENT_NEW_GATE_REFUSED"
+_resid_unread=""; _resid_unred=""
+while IFS='|' read -r _rtag _rkind _rline; do
+  [ -n "$_rtag" ] || continue
+  # PARSE arm: ONE line, ONE file, read by the SHIPPED scanner — no verdict, no other helpers.
+  rm -rf "$TMP/resid-$_rtag"; mkdir -p "$TMP/resid-$_rtag"
+  printf '%s\n' "$_rline" > "$TMP/resid-$_rtag/shape.sh"
+  refusal_codes "$TMP/resid-$_rtag" | awk -F'\t' -v nm=AGENT_NEW_GATE_REFUSED -v k="$_rkind" \
+    '$2==nm && $1==k { if (k != "claim" || $3 == 83) c++ } END{exit !(c==1)}' \
+    || _resid_unread="$_resid_unread $_rtag"
+  # VERDICT arm: the same line appended to a real copy of the code-declaring helpers.
+  _codemut_dir="$(_codemut resid-$_rtag)"
+  printf '\n%s\n' "$_rline" >> "$_codemut_dir/spawn-gate.sh"
+  _rwantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+  codes_verdict "$_codemut_dir"
+  case "$_rkind" in
+    # A readable `printf -v` is a CLAIM, so it must redden as the 83 COLLISION — the property the whole
+    # namespace check exists for — not as a refusal that happens to be red.
+    claim) case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) : ;;
+                               *) _resid_unred="$_resid_unred $_rtag" ;; esac ;;
+    *)     case "$CODE_MSG" in *"unparseable declaration: spawn-gate.sh:$_rwantline"*) : ;;
+                               *) _resid_unred="$_resid_unred $_rtag" ;; esac ;;
+  esac
+done <<< "$_residshapes"
+_resid_n="$(printf '%s\n' "$_residshapes" | awk 'NF{n++} END{print n+0}')"
+[ -z "${_resid_unread// /}" ]; rc=$?
+ck "the scanner CLASSIFIES all $_resid_n RESIDUAL declaration shapes (array subscripts, printf -v, read) — the reviewed head reported 0 rows for every one of them (unread:${_resid_unread:- none})" $rc
+[ -z "${_resid_unred// /}" ]; rc=$?
+ck "...and EVERY one of them REDDENS the code check as a NAMED collision or 'unparseable declaration: file:line' — a shape that vanishes again fails HERE (green:${_resid_unred:- none})" $rc
 
 # (f) THE FAIL-CLOSED HALF: an assignment OPERATOR on a family token that is NOT in a declaration
 # position cannot be classified, so it must be RED and NAMED WITH ITS LINE — never dropped. This is the
@@ -2067,9 +2233,12 @@ true && _c="${AGENT_HARNESS_SKEW_REFUSED:-83}"
 true && _q="${AGENT_HARNESS_SKEW_REFUSED:-"83"}"
 [ -n "${AGENT_LOAD_REFUSED:-}" ] && :
 exit "$AGENT_HARNESS_SKEW_REFUSED"
+_c="${AGENT_HARNESS_SKEW_REFUSED[0]}"
+_e="$(printf '%s' "${AGENT_HARNESS_SKEW_REFUSED#*=}")"
+if [ "$AGENT_HARNESS_SKEW_REFUSED" = 83 ]; then :; fi
 CONSIST
 codes_verdict "$_codemut_dir"
-ck "(control) a reader default that AGREES (:-83 and :-\"83\"), a \${X:-} bare read and a plain \$AGENT_HARNESS_SKEW_REFUSED READ are ALL GREEN — the parse reddens what it cannot classify, not legitimate code (rc=$CODE_RC; $CODE_MSG)" $CODE_RC
+ck "(control) a reader default that AGREES (:-83 and :-\"83\"), a \${X:-} bare read, a plain \$AGENT_HARNESS_SKEW_REFUSED READ, an ARRAY-ELEMENT read (\${X[0]}), a \${X#*=} strip and a \`[ \"\$X\" = 83 ]\` COMPARISON are ALL GREEN — the parse reddens what it cannot classify, not legitimate code, and the residual arm did not turn READS into reds (rc=$CODE_RC; $CODE_MSG)" $CODE_RC
 
 # Restore the real verdict for every reader below (the arms above drove copies).
 codes_verdict "$HERE"
