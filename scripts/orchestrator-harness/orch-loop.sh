@@ -2672,6 +2672,15 @@ mp_recent_land() { # [<state-dir>]
   _b="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
   case "$_b" in ''|*[!0-9]*) _b=180 ;; *) _b=$(( 10#$_b )) ;; esac
   [ "$_b" -ge 1 ] || _b=180
+  # ⛔ AND THE UPPER CLAMP, so the SEARCH and any caller reporting this window cannot disagree
+  # (fresh-context review, 2026-11-02). Bash wraps silently rather than erroring: `_b * 2` on an
+  # overflowing knob produces a NEGATIVE bound, and `find -mmin --2` SUCCEEDS AND MATCHES NOTHING —
+  # so the function answers "no recent land" for a search it never ran. The drain block clamps to
+  # 1000000 and this function did not, so a box that landed 5 minutes ago could be reported as stalled
+  # over "the 360m window" that was never searched. Both copies now spell the SAME two clamps for the
+  # same reason the `is_num` copy above is spelled inline (test harnesses extract this function
+  # STANDALONE, so a shared helper would be 127 there).
+  [ "$_b" -le 1000000 ] || _b=180
   bound=$(( _b * 2 ))
   list="$(find "$d" -maxdepth 1 -name 'merged-*.done' -mmin -"$bound" 2>/dev/null || true)"
   # A here-string, not `find … | while`: under `pipefail` the reader can exit first and make the

@@ -62,8 +62,12 @@ is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
 # is not a policy a caller should be able to lift. The brief bound is a knob because retention is.
 STALL_FIX_LEDGER_MAX_BYTES=5242880
 STALL_FIX_BRIEF_MAX_AGE_MIN="${STALL_FIX_BRIEF_MAX_AGE_MIN:-1440}"
-# ⛔ `-mmin -0` matches NOTHING (the very trap this PR's own `mp_recent_land` clamp exists for), so a
-# zero or non-numeric bound would prune every brief including the one just written. Refuse it here.
+# ⛔ `-mmin +N`, NOT `-mmin -N` (fresh-context review, 2026-11-02). The mechanism this clamp protects
+# is NOT the one a selection window uses: `+N` means "older than N minutes" — an eviction bound. `-N`
+# means "newer than N", and `-mmin -0` matches NOTHING. So the trap here is the opposite polarity:
+# an UNCLAMPED `0` collapses retention to "older than a full minute" and evicts every previous
+# brief, and a NON-NUMERIC bound makes `find` fail, which (under the `|| true`) prunes nothing at all
+# — the unbounded sink silently returns. Both are refused by the clamps below.
 is_num "$STALL_FIX_BRIEF_MAX_AGE_MIN" && [ "$STALL_FIX_BRIEF_MAX_AGE_MIN" -ge 1 ] || STALL_FIX_BRIEF_MAX_AGE_MIN=1440
 # ⛔ A PASS COUNTER OF 0 IS NOT "THE ZEROTH STALL": the caller sets it only inside the stall
 # arm, so 0 means the caller is on a healthy pass (or passed it through a default). Refusing
@@ -134,6 +138,11 @@ The controller reported a DRAIN STALL: **no PR merged in __AGEMIN__ minutes** wh
 **__UNOWNED__ un-owned PR(s)** remain, and **__SPAWNS__**. The issue path is
 held closed by merge-priority (un-owned PRs first), so the box is holding capacity it is not using.
 That has now happened for __SEEN__ consecutive stalled passes.
+
+⛔ **CITE THE COMMIT YOU READ.** The tree you are in was checked out at **`__WTSHA__`**. Put that
+commit in your report beside every `file:line` claim (or quote it once at the top and say all
+citations are at it). Another dispatch may refresh this tree while you run, so a line number quoted
+without its commit cannot be checked later — and a report nobody can check is not evidence.
 
 ## Your job: find out WHY nothing lands, and say it with evidence
 
@@ -206,6 +215,7 @@ _brief="${_brief//__UNOWNED__/$UNOWNED}"
 _brief="${_brief//__SEEN__/$SEEN}"
 _brief="${_brief//__O__/$O}"
 _brief="${_brief//__REPORT__/$REPORTF}"
+_brief="${_brief//__WTSHA__/${_wtsha:-UNKNOWN}}"
 _brief="${_brief//__SPAWNS__/$SPAWNS_TXT}"
 printf '%s\n' "$_brief" > "$BRIEF" 2>/dev/null || true
 if [ ! -s "$BRIEF" ]; then
@@ -215,7 +225,7 @@ fi
 # ⛔ AND THE SUBSTITUTION IS CHECKED, NOT ASSUMED: a failed write leaves the ORIGINAL file in place,
 # which is NON-EMPTY and passes the size test above — so an unstubbed brief would be dispatched with
 # `__SEEN__` still in it. A surviving placeholder is a brief that cannot be read correctly: refuse.
-if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\|REPORT\)__' "$BRIEF" 2>/dev/null; then
+if grep -q '__\(AGEMIN\|UNOWNED\|SEEN\|O\|SPAWNS\|REPORT\|WTSHA\)__' "$BRIEF" 2>/dev/null; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (brief still carries unresolved placeholders — not dispatching a worker on it)"
   exit 0
 fi
@@ -239,6 +249,30 @@ fi
 # stall fix runs in its own worktree of the harness repo (throwaway, detached).
 WT="${STALL_FIX_WORKTREE:-$O/state/wt-stallfix}"
 HREPO="${HARNESS_REPO:-$HOME/ai-harness-main}"
+# ⛔ NEVER RE-POINT THE TREE UNDER A LIVE WORKER (fresh-context review, 2026-11-02, P2). The refresh
+# below fixed a FROZEN base; a single shared `$WT` refreshed on EVERY dispatch is the same defect
+# inverted. This file's own note (see the report-path comment) records that an unfixed stall normally
+# has TWO OR THREE workers alive at once — one dispatch per ~12 min, worker timeout 1800 s — so the
+# second dispatch `git checkout`ed the tree the first worker was still reading. That worker's brief
+# orders it to report `file:line — what is wrong`, and those citations are what a repair lane acts on:
+# a report mixing two commits is unattributable, and nothing in it named the commit it read.
+#
+# ⛔ THE LIVENESS READ IS BENIGN IN BOTH DIRECTIONS, WHICH IS WHY IT IS SAFE HERE. A wrong "in use"
+# only DEFERS the refresh — the worker gets the tree from the previous dispatch (at most ~12 min old)
+# instead of one frozen for days, and the dispatch still HAPPENS. A wrong "free" is the only way to
+# re-point a live tree, and it needs a worker that is running with no `.pid` AND no `.rc`, which the
+# dispatcher always writes. Compare this with the alternative — skipping the DISPATCH while a worker
+# runs — whose inference error would silence the escalation entirely, the inert-enforcer class.
+wt_in_use() {
+  local p live
+  for p in "$O/bg"/stallfix-*.pid; do
+    [ -f "$p" ] || continue
+    [ -f "${p%.pid}.rc" ] && continue      # a terminal record means THAT worker is done
+    live="$(cat "$p" 2>/dev/null || true)"
+    is_num "${live:-}" && kill -0 "$live" 2>/dev/null && return 0
+  done
+  return 1
+}
 # ⛔ A THROWAWAY WORKTREE IS NOT A ONE-TIME WORKTREE (fresh-context review, 2026-11-02). It was
 # created ONCE and then reused by every later dispatch, pinned to `$HREPO`'s LOCAL `origin/main` as of
 # the FIRST stall — while this escalation keeps firing every `DRAIN_STALL_FIX_EVERY` stalled passes.
@@ -249,6 +283,9 @@ HREPO="${HARNESS_REPO:-$HOME/ai-harness-main}"
 if [ -e "$HREPO/.git" ]; then
   if [ ! -e "$WT/.git" ]; then
     git -C "$HREPO" worktree add -f --detach "$WT" origin/main >/dev/null 2>&1 || true
+  elif wt_in_use; then
+    # A worker is still reading this tree — leave it exactly where it is and report that commit.
+    :
   else
     # The BASE is $HREPO's own `origin/main`, not the worktree's copy of it: after a failed fetch (an
     # offline box, a moved remote) the local tracking ref is still newer than a checkout pinned days
@@ -262,8 +299,10 @@ if [ ! -e "$WT/.git" ]; then
   log_line "DRAIN STALL -> STALL FIX COULD NOT DISPATCH (no usable worktree: $WT — set HARNESS_REPO)"
   exit 0
 fi
-# The tree the worker actually reads. Printed in every dispatch line below: a report resolved against
-# an unnamed commit cannot be checked, and an empty value is reported as UNKNOWN rather than guessed.
+# The tree the worker actually reads. Printed in every dispatch line below, and substituted into the
+# brief as `__WTSHA__`: a report resolved against an unnamed commit cannot be checked, so the commit
+# has to travel WITH the report rather than only in a log line an operator may never read. An empty
+# value is reported as UNKNOWN rather than guessed.
 _wtsha="$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || true)"
 # ── THE DISPATCH — AND WHY ITS EXIT STATUS IS NOT THE VERDICT ─────────────────────────────────────
 # ⛔ A REFUSED SPAWN MUST NOT READ AS A DISPATCHED ONE (review P1, 2026-11-01).

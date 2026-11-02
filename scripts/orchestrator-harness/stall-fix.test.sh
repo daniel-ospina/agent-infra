@@ -229,6 +229,32 @@ if [ -n "$SHA_A" ]; then
   lacks "worktree $SHA_A" && ck 0 "…and no longer reports the stale commit" || ck 1 "…and no longer reports the stale commit"
   [ "$(git -C "$D/wt2" rev-parse HEAD 2>/dev/null || true)" = "$(git -C "$GR" rev-parse HEAD 2>/dev/null || true)" ] \
     && ck 0 "…and the worktree's own HEAD is the refreshed base" || ck 1 "…and the worktree's own HEAD is the refreshed base"
+
+  # ⛔ BUT NOT WHILE A WORKER IS STILL READING IT (fresh-context review, 2026-11-02, P2). The refresh
+  # fixed a frozen base; a refresh on EVERY dispatch is that defect inverted, because two or three
+  # workers overlap by design (one dispatch per ~12 min, worker timeout 1800 s) and they share ONE
+  # tree. The brief makes each worker cite `file:line` AT A NAMED COMMIT, so re-pointing the tree
+  # mid-run mixes two commits in one report. A live worker (a pid with no terminal `.rc`, which is
+  # exactly what the dispatcher writes) must PIN it. Driven with a real process, not a fake file.
+  gc C >/dev/null 2>&1 || true
+  git -C "$GR" update-ref refs/remotes/origin/main HEAD >/dev/null 2>&1 || true
+  SHA_C="$(git -C "$GR" rev-parse --short HEAD 2>/dev/null || true)"
+  [ -n "$SHA_C" ] && [ "$SHA_C" != "$SHA_B" ]; ck $? "fixture: the base advanced again (C differs from B)"
+  sleep 60 & _live=$!
+  printf '%s' "$_live" > "$D/bg/stallfix-20200101T000000Z.pid"
+  OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt2" HARNESS_REPO="$GR" DRAIN_STALL_FIX_EVERY=3 \
+         STALL_FIX_VERIFY_SECS=1 bash "$SH" 3 90 2>&1)"
+  has "worktree $SHA_B" && ck 0 "a LIVE worker PINS the tree: the dispatch reports the commit it is reading, not the newest" || ck 1 "a LIVE worker PINS the tree: the dispatch reports the commit it is reading, not the newest"
+  lacks "worktree $SHA_C" && ck 0 "…and the base was NOT moved under it (no mid-run re-point)" || ck 1 "…and the base was NOT moved under it (no mid-run re-point)"
+  [ "$(git -C "$D/wt2" rev-parse HEAD 2>/dev/null || true)" != "$(git -C "$GR" rev-parse HEAD 2>/dev/null || true)" ] \
+    && ck 0 "…and the worktree's HEAD is still the one that worker reads" || ck 1 "…and the worktree's HEAD is still the one that worker reads"
+  # A TERMINAL record means that worker is done, so the pin must LIFT — otherwise a leaked pid file
+  # freezes the tree forever, which is the very defect the refresh exists to remove.
+  : > "$D/bg/stallfix-20200101T000000Z.rc"
+  OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt2" HARNESS_REPO="$GR" DRAIN_STALL_FIX_EVERY=3 \
+         STALL_FIX_VERIFY_SECS=1 bash "$SH" 3 90 2>&1)"
+  has "worktree $SHA_C" && ck 0 "a FINISHED worker lifts the pin: the next dispatch refreshes to the newest base" || ck 1 "a FINISHED worker lifts the pin: the next dispatch refreshes to the newest base"
+  kill "$_live" 2>/dev/null || true
 else
   ck 1 "fixture: a git repository could be initialised (the refresh arm cannot be driven without one)"
 fi
@@ -284,14 +310,28 @@ _sz1="$(wc -c < "$D/state/drain-stall-dispatch.log" | tr -d ' ')"
 [ "$_sz1" -lt 1000 ]; ck $? "…and the live ledger restarts small ($_sz1 bytes), not at the cap"
 grep -q 'stall-fix' "$D/state/drain-stall-dispatch.log" 2>/dev/null; ck $? "…and the row that triggered the rotation is IN the live file, not discarded"
 
-# Non-vacuity: the retention bound is a POLICY knob, but zero is not a bound — `-mmin -0` matches
-# nothing, so an unclamped `0` would evict every brief including the one this run just minted.
+# Non-vacuity — and the two ways this clamp can be defeated (fresh-context review, 2026-11-02). The
+# first version of this leg asserted only that the run's own brief existed, which is true in BOTH the
+# clamped and unclamped case (the prune runs BEFORE the brief is minted, so the run's own file is
+# never at risk). It is rewritten around a brief that sits BETWEEN the two bounds, so each clamp is
+# pinned by a file that would actually be lost without it:
+#   · `0`     → unclamped, `-mmin +0` evicts everything older than a minute ⇒ the MIDDLE-AGED brief dies.
+#   · `abc`   → unclamped, `find -mmin +abc` FAILS and (under `|| true`) prunes nothing ⇒ the OLD brief
+#               survives, i.e. the unbounded sink comes back silently. The OLD brief is the probe.
 D="$(new_o e2)"; stub "$D" "$STUB_OK_TOUCH"
-touch -t 202001010000 "$D/state/briefs/stall-fix-20200101T000000Z.md"
+touch -t 202001010000 "$D/state/briefs/stall-fix-20200101T000000Z.md"   # OLD — must be pruned
+touch -d '-2 hours' "$D/state/briefs/stall-fix-MIDDLEAGED.md" 2>/dev/null \
+  || touch -t "$(date -u -v-2H '+%Y%m%d%H%M' 2>/dev/null || date -u -d '2 hours ago' '+%Y%m%d%H%M')" "$D/state/briefs/stall-fix-MIDDLEAGED.md"
 OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
        STALL_FIX_BRIEF_MAX_AGE_MIN=0 bash "$SH" 3 90 2>&1)"
-_nb="$(find "$D/state/briefs" -maxdepth 1 -type f -name 'stall-fix-*.md' 2>/dev/null | wc -l | tr -d ' ')"
-[ "$_nb" -ge 1 ]; ck $? "a retention bound of 0 falls back to the default AND still mints this run's brief"
+[ -f "$D/state/briefs/stall-fix-MIDDLEAGED.md" ]; ck $? "STALL_FIX_BRIEF_MAX_AGE_MIN=0 is CLAMPED: a 2h-old brief survives (unclamped it is evicted)"
+[ ! -f "$D/state/briefs/stall-fix-20200101T000000Z.md" ]; ck $? "…and the clamped default still prunes a genuinely OLD brief (the clamp is not an off-switch)"
+
+D="$(new_o e3)"; stub "$D" "$STUB_OK_TOUCH"
+touch -t 202001010000 "$D/state/briefs/stall-fix-20200101T000000Z.md"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       STALL_FIX_BRIEF_MAX_AGE_MIN=abc bash "$SH" 3 90 2>&1)"
+[ ! -f "$D/state/briefs/stall-fix-20200101T000000Z.md" ]; ck $? "a NON-NUMERIC bound falls back to the default and still prunes (unclamped, find fails and prunes NOTHING)"
 
 
 echo
