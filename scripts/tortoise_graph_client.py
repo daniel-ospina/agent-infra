@@ -28,6 +28,38 @@ _id = 0
 SSE_DATA = re.compile(r"^data:[ \t]?")
 
 
+def select_reply(frames, rid, raw):
+    """The frame that answers call id `rid`, or exit 4. NEVER another call's frame.
+
+    A notification (progress/log) can arrive LAST and carries no result, so "the last
+    data: line" would silently answer this call with somebody else's frame. The id is
+    compared STRINGIFIED because a server may echo `"2"` for `2`; that is the ONLY
+    tolerance here.
+
+    ⛔ "NO MATCH" IS NOT "TAKE THE LAST ONE". A frame that names a DIFFERENT id is
+    somebody else's answer: accepting it is a FALSE PASS in the one primitive the graph
+    mandate relies on to never read OK from a stranger's reply — and `_first_id` would
+    then bind an edge to an id parsed out of it. Only an ALL-id-less stream (a bare
+    JSON-RPC reply that omits the id) is tolerated, and `tool()` still refuses that
+    unless it carries a real result.
+    """
+    match = [f for f in frames if isinstance(f, dict)
+             and f.get("id") is not None and str(f.get("id")) == str(rid)]
+    if match:
+        return match[-1]
+    if not frames:
+        sys.stderr.write("GRAPH-BAD-RESPONSE: %s\n" % raw[:400])
+        sys.exit(4)
+    idless = [f for f in frames if isinstance(f, dict) and f.get("id") is None]
+    if not idless or len(idless) != len(frames):
+        sys.stderr.write(
+            "GRAPH-FRAME-MISMATCH: %d data frame(s), none carrying id=%s "
+            "(refusing to answer this call with another call's frame): %s\n"
+            % (len(frames), rid, raw[:400]))
+        sys.exit(4)
+    return idless[-1]
+
+
 def call(method, params, timeout=30):
     global _id
     _id += 1
@@ -55,16 +87,7 @@ def call(method, params, timeout=30):
                 frames.append(json.loads(SSE_DATA.sub("", ln, count=1)))
             except Exception:  # noqa: BLE001 - a non-JSON frame cannot be the reply
                 continue
-        # The reply is the frame whose id matches the request; a notification
-        # (progress/log) can arrive LAST and carries no result, so "the last
-        # data: line" would silently answer this call with somebody else's frame.
-        match = [f for f in frames if isinstance(f, dict) and f.get("id") == _id]
-        if match:
-            return match[-1]
-        if not frames:
-            sys.stderr.write("GRAPH-BAD-RESPONSE: %s\n" % raw[:400])
-            sys.exit(4)
-        payload = json.dumps(frames[-1])
+        return select_reply(frames, _id, raw)
     try:
         return json.loads(payload)
     except Exception:

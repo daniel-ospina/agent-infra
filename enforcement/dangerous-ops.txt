@@ -102,6 +102,15 @@ supabase # supabase|migration|RLS|apply_migration_safe|pg_ # hard # Use supabase
 
 how-to-use-tortoise # tortoise_create_point|tortoise_create_operator|tortoise_mitigate_operator|tortoise_delete_point|tortoise_invalidate|tortoise_supersede|tortoise_annotate_operator|tortoise_update|tortoise_delete # hard # Use how-to-use-tortoise/SKILL.md for all Tortoise graph writes. Wrong edges can corrupt EP propagation. The generic update/delete take the Point arm for operators too, so the SKILL.md Hard Gate names them; arming them here keeps the prose list and this manifest 1:1 (issue 6131).
 
+# ⛔ THE SHELL CLIENT IS A WRITE PATH TOO (agent-infra#3253 / PR #3262). The two rules above
+# arm the MCP TOOL NAMES. Since the graph mandate, `AGENTS.md` tells every lane to write with
+# `bash scripts/tortoise-graph.sh evidence|decision` — raw JSON-RPC over `/mcp/`, i.e. the same
+# point and IMPL-edge writes with NO MCP tool name anywhere in the command text, so the `tortoise_`
+# nudge rule below cannot match it either (the filename is hyphenated). Ungated, a compliant agent
+# following the repo's own instructions performed exactly the mutation this gate exists to guard.
+# Only the WRITE verbs are armed; `health|search|get|stats` are reads and stay ungated.
+how-to-use-tortoise # (tortoise-graph\.sh|tortoise_graph_client\.py)\s+(evidence|decision) # hard # Use how-to-use-tortoise/SKILL.md for all Tortoise graph writes — the shell client writes points and IMPL edges too, not just the MCP tools. Wrong edges can corrupt EP propagation.
+
 commit-workflow # gh pr review|gh pr approve # hard # Use commit-workflow/SKILL.md for PR review operations.
 
 how-to-use-tortoise # tortoise_ # nudge # Use how-to-use-tortoise/SKILL.md for Tortoise graph operations.

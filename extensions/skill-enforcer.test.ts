@@ -602,6 +602,41 @@ async function main() {
     }
   });
 
+  await test("#3253 — the SHELL graph client's write verbs are HARD-armed too, and its read verbs are not", async () => {
+    // The two rules above arm the MCP TOOL NAMES. Since the graph mandate,
+    // `AGENTS.md` tells every lane to write with `bash scripts/tortoise-graph.sh
+    // evidence|decision` — raw JSON-RPC over `/mcp/`, so the command text carries
+    // NO MCP tool name and the broad `tortoise_` nudge rule cannot match it either
+    // (the filename is hyphenated). Measured before this rule existed: the exact
+    // commands AGENTS.md documents were unarmed, i.e. a compliant agent following
+    // the repo's own instructions performed the mutation this gate exists to guard
+    // with the skill never read. Only the WRITE verbs are armed — `health`,
+    // `search`, `get` and `stats` are reads and must stay ungated, or every lane
+    // pays a read cost to look at the graph.
+    const rules = MANIFEST_RULES["how-to-use-tortoise"] ?? [];
+    const hard = rules.filter(r => r.mode === "hard").flatMap(r => r.patterns);
+    const WRITES = [
+      "bash scripts/tortoise-graph.sh evidence 'MEASURED: 1 x' --to 1a2b",
+      "bash ~/.pi/agent/scripts/tortoise-graph.sh decision 'DECIDED: y'",
+      "python3 scripts/tortoise_graph_client.py evidence 'MEASURED: 2'",
+    ];
+    for (const cmd of WRITES) {
+      ok(hard.some(p => p.test(cmd)), `${JSON.stringify(cmd)} must be armed by a HARD rule — it writes a point/edge`);
+    }
+    for (const cmd of [
+      "bash scripts/tortoise-graph.sh health",
+      "bash scripts/tortoise-graph.sh search 'attestation staleness'",
+      "bash scripts/tortoise-graph.sh get 1a2b",
+      "bash scripts/tortoise-graph.sh stats",
+    ]) {
+      equal(
+        hard.some(p => p.test(cmd)),
+        false,
+        `${JSON.stringify(cmd)} is a READ and must not be gated — a read-only graph check must not cost a skill read`,
+      );
+    }
+  });
+
   await test("banner reports the count and the rule count; a failed load never prints ✅", () => {
     const healthy = manifestBanner(MANIFEST_LOAD, MANIFEST_PATH);
     ok(healthy.includes("enforcing 4 skill gates from manifest"), healthy);
