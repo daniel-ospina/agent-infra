@@ -2,16 +2,16 @@
   "_why": "sha256 of the audited bytes of every SANCTIONED_SCRIPT_RELPATHS entry (index.ts). The exemption is granted on IDENTITY, not on a path string: a script is the sanctioned one when it sits at a sanctioned relpath inside a framework checkout AND its bytes hash to the value below. Re-cut with `node extensions/main-worktree-guard/test-sanctioned-identity.mjs --cut` in the SAME commit that changes any listed script; test-sanctioned-identity.mjs reds when this file is stale, so a stale pin cannot reach main silently. Why a pin and not a path: a path is purchasable (`git init` + two fingerprint files), and `committed` is purchasable (the #1485 A5 rejection) — but the AUDITED BYTES are not, so the pin is the only reference an agent cannot forge with allowed operations.",
   "version": 2,
   "sha256": {
-    "scripts/check-pipeline-compliance.sh": "0ea4b650854ef4de5761073468bd7c7688afe5cd568a50fd3c3766ff591bddde",
+    "scripts/check-pipeline-compliance.sh": "ab487be3fa99df5556723313cced9b41f9d309ea16cb41c3a5963e72ae9b3120",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
-    "scripts/record-review.sh": "d4afafe5989b1e56bb6fcb801c2dae70f5f5360e778943060a119888165e7e18",
+    "scripts/record-review.sh": "dc4ae37a64d48698ef0ed29a9d9e7723b36ccdaa4fe28229396aebe1311f9df7",
     "scripts/admin-merge.sh": "0c1cd82f8b89f69cd2e1c81e517cfe2dc874b7a2e0626f37707d1950b1d0d72d",
     "scripts/gh-shim/gh": "11a0f554a923eb459a26b98d2f8c7f21d0cabe324d7c3b4754dc7c8ce3c909d0"
   },
   "delegates": {
     "scripts/admin-merge.sh": "0c1cd82f8b89f69cd2e1c81e517cfe2dc874b7a2e0626f37707d1950b1d0d72d",
-    "scripts/check-pipeline-compliance.sh": "0ea4b650854ef4de5761073468bd7c7688afe5cd568a50fd3c3766ff591bddde",
+    "scripts/check-pipeline-compliance.sh": "ab487be3fa99df5556723313cced9b41f9d309ea16cb41c3a5963e72ae9b3120",
     "scripts/checkout-hygiene/hub-worktree-refresh-advance.sh": "88bde611c5f53bc75c94d56f97b8d6048d21029b1396cb0db162b082ebb9a643",
     "scripts/checkout-hygiene/hub-worktree-salvage-commit.sh": "f747ad00b5babe4474a625b3564f27d3e6523f05147bef79126ff5e4a5a5c29e",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
@@ -20,7 +20,7 @@
     "scripts/ci_exemption.py": "09a127da99d5890a038a02ab7db2183e6a2a115ffc973006910ebff32eff08eb",
     "scripts/gh-shim/gh": "11a0f554a923eb459a26b98d2f8c7f21d0cabe324d7c3b4754dc7c8ce3c909d0",
     "scripts/lib/diff-normalize.py": "b62b90d6588dfee446a7034f415c13d0e9a4a366222144db0b89922988febe7c",
-    "scripts/record-review.sh": "d4afafe5989b1e56bb6fcb801c2dae70f5f5360e778943060a119888165e7e18",
+    "scripts/record-review.sh": "dc4ae37a64d48698ef0ed29a9d9e7723b36ccdaa4fe28229396aebe1311f9df7",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/verify-admin-merge-evidence.sh": "cc32da5d99e2a02939d2c4fdf73c1c96c8dd1cc59d447bff13e75ad31d0f5f53"
   }

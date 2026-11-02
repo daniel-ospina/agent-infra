@@ -409,11 +409,23 @@ eval "$(grep -E '^has_test_evidence\(\) \{' "$GATE" | head -1)" 2>/dev/null
 # …and the pattern it reads, so the extracted matcher is the gate's mechanism, not an empty variable.
 eval "$(gate_const TEST_EVIDENCE_RE)" 2>/dev/null
 eval "$(gate_const REVIEW_RECORD_MARKER_RE)" 2>/dev/null
+# #1224 — `has_review_record` takes the verdict of the marker LINE that matched, so
+# it delegates to these two. Extracted with it (and guarded below): if the gate
+# renames or re-inlines them, this section goes RED instead of silently reporting
+# "command not found" as a FAILING GATE ASSERTION — measured, and it read as a
+# gate defect rather than as a stale extractor.
+eval "$(extract_fn review_marker_verdict)" 2>/dev/null
+eval "$(extract_fn review_verdict_rank)" 2>/dev/null
+eval "$(gate_const CLEAN_MICRO_MARKER_RE)" 2>/dev/null
+eval "$(gate_const CLEAN_LOW_MARKER_RE)" 2>/dev/null
+# The verdict predicates `review_marker_verdict` delegates to are one-liners too.
+eval "$(grep -E '^has_clean_micro_marker\(\) \{' "$GATE" | head -1)" 2>/dev/null
+eval "$(grep -E '^has_clean_low_marker\(\) \{' "$GATE" | head -1)" 2>/dev/null
 eval "$(gate_const REFCTX)" 2>/dev/null
 eval "$(gate_const CLOSING_KW)" 2>/dev/null
 eval "$(gate_const TRACE_KW)" 2>/dev/null
 GH_REPO='daniel-ospina/agent-infra'
-if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && declare -f has_test_evidence >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ] && [ -n "${TEST_EVIDENCE_RE:-}" ]; then rc=0; else rc=1; fi
+if declare -f has_scoping_marker >/dev/null && declare -f has_review_record >/dev/null && declare -f parse_issue_ref >/dev/null && declare -f parse_trace_ref >/dev/null && declare -f has_test_evidence >/dev/null && declare -f review_marker_verdict >/dev/null && declare -f review_verdict_rank >/dev/null && declare -f has_clean_micro_marker >/dev/null && declare -f has_clean_low_marker >/dev/null && [ -n "${REVIEW_RECORD_MARKER_RE:-}" ] && [ -n "${TEST_EVIDENCE_RE:-}" ]; then rc=0; else rc=1; fi
 ck $rc "the gate's own parsers + patterns were EXTRACTED (a rename would make this section vacuous)"
 
 # [a] — the shape the brief prescribes passes; the shape it warns about does not.
