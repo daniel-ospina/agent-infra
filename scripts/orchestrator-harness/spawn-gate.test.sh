@@ -47,31 +47,118 @@ GATE="$HERE/spawn-gate.sh"
 #     fired cross-file twice (74 and 80).
 # So: ONE scanner over every shipped helper of the deploy unit (`cp …/orchestrator-harness/*.sh $O/`
 # — the files that ship TOGETHER, the only set in which a collision can actually happen), and NOTHING
-# is skipped in silence. A declaration in the family that the scanner cannot read as a 70..89 code is
-# a RED naming the file and the raw text, unless it is declared in `_codes_noncode` with a reason. An
-# absent or unreadable required declarer is a RED. A scan that yields NO claim at all is a RED — the
+# is skipped in silence. The ONE stated exclusion is the `*.test.sh` fixtures inside that glob, which
+# declare codes ON PURPOSE (a stale-helper arm); it is the scanner's first line and it is named here so
+# the population claim is checkable rather than absolute. A declaration in the family that the scanner
+# cannot read as a 70..89 code is a RED naming the file and the constant, unless it is declared in
+# `_codes_noncode` with a reason (an `unparseable` row is NEVER sanctionable — it names file:line).
+# An absent or unreadable required declarer is a RED. A scan that yields NO claim at all is a RED — the
 # "the parse matched nothing" case, which in the first cut read as a clean pass.
+# ⛔ AND (review round 2, P0) THE PARSE MUST CLASSIFY, NOT DISCARD. The scanner above still had a
+# `next` that DROPPED any line it had not anticipated, so the annotation ``NOTHING is skipped in
+# silence'' was false about the one place it mattered: `: "${AGENT_NEW_GATE_REFUSED:=83}"`, `local
+# AGENT_NEW_GATE_REFUSED=83` and `if true; then AGENT_NEW_GATE_REFUSED=83; fi` all read as GREEN with
+# 0 rows for that name while a real 83 duplicate sat in a scanned file — and the SHAPE it drops is not
+# hypothetical: `: "${VAR:=…}"` is already live in the scanned set (`refresh-candidates.sh:133`,
+# `: "${UV_CACHE_DIR:=$cand/.cache/uv}"`), so the next gate code written that way would have been
+# invisible — measured, no family token uses `:=` TODAY, which is luck, not a property. One parse feeds
+# EVERY reader here (the chain table, the coverage verdict, the arm table), so one blind spot was
+# every reader's blind spot. The parse therefore now CLASSIFIES every family token that carries an
+# assignment operator, in any of the shapes below, and REFUSES (never drops) a declaration-shaped
+# line it cannot classify:
+#   claim       X=… · export X=… · declare/readonly/typeset [-flags] X=… · local X=… · X+=… ·
+#               after `;` `&&` `||` `then` `do` `else` `{` `(` `)` (a case-branch body) ·
+#               ${X:=…} and ${X=…} (assign-if-unset)
+#   fallback    ${X:-…} ${X-…} ${X:+…} — a READ default. It cannot declare a code, but a default
+#               that DISAGREES with the declaration silently mislabels every refusal that hits it, so
+#               it must equal the declared code (a mismatch is a RED naming file:line). A QUOTED
+#               operand (`${X:-"81"}`) and an operand that cannot be read are refused too: the first
+#               cut cut at the leading quote and folded both into `${X:-}`, i.e. a false PASS.
+#   unknown     an assignment in the family that is not a 70..89 code (sanctionable by name, above)
+#   unparseable an assignment OPERATOR on a family token that is not in a declaration position (e.g.
+#               `echo "AGENT_X_REFUSED=83"`), or an operand that cannot be read at all. RED, named
+#               `unparseable declaration: <file>:<line>`, and deliberately NOT sanctionable: an escape
+#               hatch here would restore the drop.
+# STATED LIMIT: a family token with NO assignment operator is a READ, not a declaration (`exit
+# "$AGENT_X_REFUSED"`, `${X}`), and is not reported — the scan is about declarations. A COMMENT line
+# is documentation, not a declaration, so a commented-out declaration is not claimed (the required-
+# declarer rule is what catches a helper that stops declaring its code).
 # The scan is computed ONCE per directory and every reader in this file uses it (`codes_for_name`
 # for a value, `$CODE_ROWS` for the claim list): a second parser is a second way to fail open.
 cat > "$TMP/refusal-codes.awk" <<'REFUSAL_AWK'
 BEGIN { OFS = "\t" }
+function basename(path,   p, n) { n = split(path, p, "/"); return p[n] }
+function iscode(v) { return (v ~ /^[0-9]+$/ && v + 0 >= 70 && v + 0 <= 89) }
+# Is everything to the left of the token a place a command can START? Separators, the compound
+# keywords that introduce one, and a declaration keyword (with its own flags).
+function cmdpos(pre,   p) {
+  p = pre
+  gsub(/[ \t"']+$/, "", p)
+  if (p == "") return 1
+  if (p ~ /(^|[;&|({})])[ \t"']*$/) return 1
+  if (p ~ /(^|[;&|({})])[ \t"']*(if|then|else|elif|while|until|do|!)$/) return 1
+  if (p ~ /(^|[;&|({})])[ \t"']*(export|local|declare|readonly|typeset|int|integer)([ \t]+-[A-Za-z]+)*$/) return 1
+  return 0
+}
+# The value: everything up to the first character that can end it (`X=$y`, `X=83;`, `X=83 # note`,
+# `${X:-83}`), or up to the matching quote when the operand is QUOTED (`${X:-"81"}`, `X='83'`). The
+# quoted form is not decoration: cutting at the leading quote turned `${X:-"81"}` into an EMPTY value,
+# which the caller then read as `${X:-}` (a bare read) — a stale default passing as clean, measured.
+function valof(v,   out, q, i) {
+  out = v
+  if (out ~ /^["']/) {
+    q = substr(out, 1, 1)
+    out = substr(out, 2)
+    i = index(out, q)
+    return (i > 0) ? substr(out, 1, i - 1) : out      # unclosed quote: hand back what there is
+  }
+  sub(/[ \t;#\\)}"'\/].*$/, "", out)
+  gsub(/^["']|["']$/, "", out)
+  return out
+}
+function row(kind, name, v, f, ln) {
+  if (iscode(v)) print kind, name, v + 0, f, ln
+  else           print "unknown", name, v, f, ln
+}
 {
   if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
+  f = basename(FILENAME)
   s = $0
   sub(/^[ \t]+/, "", s)
-  if      (s ~ /^export[ \t]+/)              sub(/^export[ \t]+/, "", s)
-  else if (s ~ /^(readonly|typeset)[ \t]+/)  sub(/^(readonly|typeset)[ \t]+/, "", s)
-  else if (s ~ /^declare[ \t]+/)             sub(/^declare[ \t]+(-[A-Za-z]+[ \t]+)?/, "", s)
-  if (s !~ /^[A-Za-z_][A-Za-z0-9_]*=/) next
-  eq = index(s, "=")
-  name = substr(s, 1, eq - 1)
-  if (name !~ /_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) next
-  val = substr(s, eq + 1)
-  sub(/[ \t]*#.*$/, "", val); sub(/[ \t]*;.*$/, "", val)
-  gsub(/^[ \t]+|[ \t]+$/, "", val); gsub(/^["']|["']$/, "", val)
-  n = split(FILENAME, p, "/"); f = p[n]
-  if (val ~ /^[0-9]+$/ && val + 0 >= 70 && val + 0 <= 89) print "claim", name, val + 0, f
-  else print "unknown", name, val, f
+  if (s ~ /^#/) next                          # documentation, never a declaration
+  rest = s
+  while (match(rest, /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)/)) {
+    name = substr(rest, RSTART, RLENGTH)
+    pre  = substr(rest, 1, RSTART - 1)
+    tail = substr(rest, RSTART + RLENGTH)
+    if (pre ~ /\$\{[ \t"']*$/) {               # inside ${...}
+      # Each operator is matched WHOLE, because its length differs and an off-by-one here silently
+      # reads `=83` as `83` on one spelling and as `=83` on another — measured on the first cut: the
+      # `${X=…}` form (no colon) came out `unknown` while `${X:=…}` was read correctly.
+      if      (tail ~ /^:=/)  row("claim", name, valof(substr(tail, 3)), f, FNR)
+      else if (tail ~ /^=/)   row("claim", name, valof(substr(tail, 2)), f, FNR)
+      else if (tail ~ /^:[-+]/ || tail ~ /^[-+]/) {
+        raw = (tail ~ /^:[-+]/) ? substr(tail, 3) : substr(tail, 2)
+        v = valof(raw)
+        if (v == "") {
+          # `${X:-}` has NO default — that is a bare read (lane.sh does exactly this), not a claim.
+          # But an operand that IS there and cannot be read must be REFUSED, not folded into that
+          # case: the first cut folded both, and `${X:-"81"}` passed as clean.
+          if (raw !~ /^}/ && raw !~ /^["']["']/) print "unparseable", name, s, f, FNR
+        } else row("fallback", name, v, f, FNR)
+      }
+      # else: a plain read inside braces (`${X}`, `${X#*=}`) — not a declaration
+    } else if (tail ~ /^\+=/) {
+      if (cmdpos(pre)) row("claim", name, valof(substr(tail, 3)), f, FNR)
+      else             print "unparseable", name, s, f, FNR
+    } else if (tail ~ /^=/) {
+      if (cmdpos(pre)) row("claim", name, valof(substr(tail, 2)), f, FNR)
+      else             print "unparseable", name, s, f, FNR
+    } else if (tail ~ /^:?[-+]/) {
+      print "unparseable", name, s, f, FNR
+    }
+    rest = tail
+  }
 }
 REFUSAL_AWK
 
@@ -80,10 +167,17 @@ REFUSAL_AWK
 # and a file that vanishes from a `$O` copy is a RED rather than a quietly smaller scan.
 _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh"
 # A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
-# not listed here is a RED: a new non-code in the family needs its own deliberate line.
+# not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
+# now READS the bookkeeping assignments it used to drop, so the three names below are the full set it
+# finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
+# any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
 #   an exit code; nothing compares a shell status against it.
-_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED"
+#   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
+#   number, a `-`, or the empty string), printed into the funnel line; not an exit code.
+#   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
+#   (`claim-registry-absent`) or `none`; not an exit code either.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED"
 # The ONLY permitted shared codes, asserted as an EQUALITY so the table cannot rot into a blanket
 # allowance — a share that DISAPPEARS is red too, because it means an alias broke:
 #   78 = the cannot-verify pair (#2258): `PI_FORK_REFUSED` and `BRIEF_GATE_UNAVAILABLE` both mean
@@ -114,9 +208,26 @@ codes_verdict() {
       || _cv_absent="$_cv_absent $_cv_f(declares no code)"
   done
   _cv_unknown=""
-  for _cv_u in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unknown"{print $4":"$2}'); do
+  for _cv_u in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unknown"{print $4":"$2}' | sort -u); do
     case " $_codes_noncode " in *" $_cv_u "*) : ;; *) _cv_unknown="$_cv_unknown $_cv_u" ;; esac
   done
+  # A declaration-shaped line the parser could NOT classify: RED and named with its LINE, and it has
+  # no sanction list on purpose (see the scanner's contract above) — the drop it replaces was exactly
+  # this case reported as nothing.
+  _cv_unparsed=""
+  for _cv_l in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unparseable"{print $4":"$5}' | sort -u); do
+    _cv_unparsed="$_cv_unparsed unparseable declaration: $_cv_l"
+  done
+  # A reader's `${X:-N}` default must EQUAL the code declared for X: a default that lags the
+  # declaration mislabels every refusal that takes it, and it is invisible to a claims-only scan
+  # because it declares nothing itself. An UNDECLARED name is not a mismatch — that is a forward
+  # reference to a helper that is not in this copy (the same case `codes_for_name`'s EMPTY means).
+  _cv_stale="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '
+    $1=="claim"    { decl[$2] = $3 }
+    $1=="fallback" { if (!($2 in decl)) next
+                     if (decl[$2] != $3) printf "%s:%s:%s=%s(want %s)\n", $2, $4, $5, $3, decl[$2] }
+  ' | sort | tr '\n' ' ')"
+  _cv_stale="${_cv_stale% }"
   _cv_shared=""
   for _cv_c in $(printf '%s\n' "$_cv_claims" | awk -F'\t' '{print $3}' | sort -un); do
     _cv_ns="$(printf '%s\n' "$_cv_claims" | awk -F'\t' -v c="$_cv_c" '$3==c{print $2}' | sort -u | tr '\n' ',')"
@@ -124,12 +235,13 @@ codes_verdict() {
     case "$_cv_ns" in *,*) _cv_shared="$_cv_shared $_cv_c=$_cv_ns" ;; esac
   done
   _cv_shared="${_cv_shared# }"
-  if [ -n "$_cv_absent$_cv_unknown" ] || [ "$_cv_shared" != "$_codes_sanctioned" ] || [ "$_cv_n" -eq 0 ]; then
+  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale" ] \
+     || [ "$_cv_shared" != "$_codes_sanctioned" ] || [ "$_cv_n" -eq 0 ]; then
     CODE_RC=1
   else
     CODE_RC=0
   fi
-  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none} shared:${_cv_shared:- none}"
+  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale} shared:${_cv_shared:- none}"
 }
 
 # Computed here so every reader below shares ONE parse: the chain gate table, the coverage verdict,
@@ -1843,8 +1955,132 @@ rm -rf "$TMP/codemut-nothing"; mkdir -p "$TMP/codemut-nothing"
 codes_verdict "$TMP/codemut-nothing"
 [ "$CODE_RC" -eq 1 ]; rc=$?
 ck "(mutation e) a scan that finds NO claim at all is REFUSED — an empty parse is not a clean parse (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# ══ AND THE PARSE MUST CLASSIFY, NOT DISCARD (review round 2, the BLOCKING finding) ═══════════════
+# ⛔ WHAT WAS MEASURED ON THE HEAD BEFORE THIS SECTION (the shipped predicate, driven directly):
+# `: "${AGENT_NEW_GATE_REFUSED:=83}"`, `local AGENT_NEW_GATE_REFUSED=83` and `if true; then
+# AGENT_NEW_GATE_REFUSED=83; fi` were all "GREEN, 0 rows" while a real 83 duplicate sat in a scanned
+# file — one `next` in the parser dropped every shape it had not anticipated, and because that ONE
+# parse feeds every reader here (the chain table, the coverage verdict, the arm table), one blind spot
+# was every reader's blind spot. The SHAPE is live in the scanned set today (`: "${VAR:=…}"` at
+# `refresh-candidates.sh:133`); no FAMILY token uses `:=` yet, which is luck rather than a property.
+# So every assignment-OPERATOR shape the parser is supposed to read is DRIVEN here, with TWO arms each,
+# because the two can fail for different reasons and only one of them is about the subject:
+#   • the PARSE arm proves the scanner READ the line as a claim of that code — it reddens the moment
+#     the classification is disabled, even if the verdict happened to red for an unrelated reason;
+#   • the VERDICT arm proves the duplicate is then NAMED as the 83 collision, so a red produced by the
+#     copying, the fixture or a required-declarer artefact cannot pass as coverage of the shape.
+# A shape missing from the parser is a RED here, never a silent gap in the list.
+_codeshapes="plain|AGENT_NEW_GATE_REFUSED=83
+export|export AGENT_NEW_GATE_REFUSED=83
+declare|declare -r AGENT_NEW_GATE_REFUSED=83
+readonly|readonly AGENT_NEW_GATE_REFUSED=83
+typeset|typeset -i AGENT_NEW_GATE_REFUSED=83
+local|local AGENT_NEW_GATE_REFUSED=83
+assign-if-unset|: \"\${AGENT_NEW_GATE_REFUSED:=83}\"
+assign-if-unset-bare|: \"\${AGENT_NEW_GATE_REFUSED=83}\"
+in-if-then|if true; then AGENT_NEW_GATE_REFUSED=83; fi
+after-andand|true && AGENT_NEW_GATE_REFUSED=83
+before-semicolon|AGENT_NEW_GATE_REFUSED=83; true"
+_shape_unread=""; _shape_unred=""
+while IFS='|' read -r _shtag _shline; do
+  [ -n "$_shtag" ] || continue
+  # PARSE arm: ONE line, ONE file, read by the SHIPPED scanner (no verdict, no other helpers).
+  rm -rf "$TMP/shape-$_shtag"; mkdir -p "$TMP/shape-$_shtag"
+  printf '%s\n' "$_shline" > "$TMP/shape-$_shtag/shape.sh"
+  refusal_codes "$TMP/shape-$_shtag" | awk -F'\t' -v n=AGENT_NEW_GATE_REFUSED \
+    '$1=="claim" && $2==n && $3==83{n++} END{exit !(n==1)}' || _shape_unread="$_shape_unread $_shtag"
+  # VERDICT arm: the same line appended to a real copy of the code-declaring helpers.
+  _codemut_dir="$(_codemut shape-$_shtag)"
+  printf '\n%s\n' "$_shline" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in
+    *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) : ;;
+    *) _shape_unred="$_shape_unred $_shtag" ;;
+  esac
+done <<< "$_codeshapes"
+_shape_n="$(printf '%s\n' "$_codeshapes" | awk 'NF{n++} END{print n+0}')"
+[ -z "${_shape_unread// /}" ]; rc=$?
+ck "the scanner CLASSIFIES all $_shape_n declaration shapes as a claim of the code they carry (unread:${_shape_unread:- none}) — the parser this replaces reported 0 rows for each of them" $rc
+[ -z "${_shape_unred// /}" ]; rc=$?
+ck "...and EVERY one of them REDDENS the duplicate check as the 83 collision, not for some other reason (green:${_shape_unred:- none})" $rc
+
+# (f) THE FAIL-CLOSED HALF: an assignment OPERATOR on a family token that is NOT in a declaration
+# position cannot be classified, so it must be RED and NAMED WITH ITS LINE — never dropped. This is the
+# shape a quoting bug produces, and it is the one that reads identically to "nothing there" if the
+# parser is allowed to skip.
+_codemut_dir="$(_codemut unparseable)"
+printf '\necho "AGENT_NEW_GATE_REFUSED=83"\n' >> "$_codemut_dir/spawn-gate.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"unparseable declaration: spawn-gate.sh:$_wantline"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation f) a declaration-shaped line the parser CANNOT classify is REFUSED and named with its FILE:LINE (want 'spawn-gate.sh:$_wantline') (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (g) A READER DEFAULT (\`${X:-N}\`) IS READ, AND MUST AGREE WITH THE DECLARATION. It was another
+# dropped shape, and a stale one is not cosmetic: `fix-one.sh` LABELS a refusal from it, so a default
+# of 81 under the skew name relabels every skew refusal as the memory gate — the collision this PR
+# exists to end, reinstated by one digit and invisible to a claims-only scan because a default
+# declares nothing.
+_codemut_dir="$(_codemut stale-default)"
+printf '\ntrue && _c="${AGENT_HARNESS_SKEW_REFUSED:-81}"\n' >> "$_codemut_dir/spawn-gate.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:spawn-gate.sh:$_wantline=81(want 83)"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(mutation g) a reader default that DISAGREES with the declaration is REFUSED and named (want 'AGENT_HARNESS_SKEW_REFUSED:spawn-gate.sh:$_wantline=81(want 83)') (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (g1, g2) A QUOTED DEFAULT IS STILL A DEFAULT — and this pair was a FALSE PASS (review round 3, P1,
+# REPRODUCED before it was fixed). `valof` cut the operand at its leading quote, the empty result was
+# read as `${X:-}` (a bare read, which legitimately declares nothing), so `${X:-"81"}` reddened
+# NOTHING while bash took 81 as the value — a stale default silently passing in the exact class this
+# block says is caught. Both quote styles, because the fix has to consume the CLOSING quote rather
+# than drop the character a regex happened to stop on.
+for _qtag in dq sq; do
+  _codemut_dir="$(_codemut quoted-default-$_qtag)"
+  if [ "$_qtag" = dq ]; then
+    cat >> "$_codemut_dir/spawn-gate.sh" <<'QDEF_DQ'
+true && _c="${AGENT_HARNESS_SKEW_REFUSED:-"81"}"
+QDEF_DQ
+  else
+    cat >> "$_codemut_dir/spawn-gate.sh" <<'QDEF_SQ'
+true && _c="${AGENT_HARNESS_SKEW_REFUSED:-'81'}"
+QDEF_SQ
+  fi
+  _wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in
+    *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:spawn-gate.sh:$_wantline=81(want 83)"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(mutation g/$_qtag) a QUOTED reader default that disagrees is REFUSED too — the first cut read it as \`\${X:-}\`, i.e. as clean (want line $_wantline) (rc=$CODE_RC; $CODE_MSG)" $rc
+done
+
+# (h) THE OTHER DIRECTION — a guard that reddens everything detects nothing. A default that AGREES
+# (bare AND quoted), a `${X:-}` with no default at all (a bare read: `lane.sh` does this), and a plain
+# READ with no assignment operator (`exit "$AGENT_X_REFUSED"`) are legitimate code and must stay GREEN,
+# or "fails closed" would just mean "always red".
+_codemut_dir="$(_codemut consistent-default)"
+cat >> "$_codemut_dir/spawn-gate.sh" <<'CONSIST'
+true && _c="${AGENT_HARNESS_SKEW_REFUSED:-83}"
+true && _q="${AGENT_HARNESS_SKEW_REFUSED:-"83"}"
+[ -n "${AGENT_LOAD_REFUSED:-}" ] && :
+exit "$AGENT_HARNESS_SKEW_REFUSED"
+CONSIST
+codes_verdict "$_codemut_dir"
+ck "(control) a reader default that AGREES (:-83 and :-\"83\"), a \${X:-} bare read and a plain \$AGENT_HARNESS_SKEW_REFUSED READ are ALL GREEN — the parse reddens what it cannot classify, not legitimate code (rc=$CODE_RC; $CODE_MSG)" $CODE_RC
+
 # Restore the real verdict for every reader below (the arms above drove copies).
 codes_verdict "$HERE"
+# ... and the REAL deploy unit must be clean in the two dimensions the arms above introduce: nothing
+# unparseable, nothing stale. Without this, a parser that reddened every copy (and every real tree)
+# would satisfy the arms above while telling the operator nothing.
+case "$CODE_MSG" in
+  *"rejected:"*|*"stale-defaults:"*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck "the REAL deploy unit reports NOTHING unparseable and NO stale reader default — the fail-closed parse is not reddening the tree it ships on (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (2) THE ARM TABLE. `<CONSTANT>:<wording the fixer's own log must carry>`. A row may PRECEDE its
 # gate (#2387's memory gate is declared here before main defines it): the moment that constant lands,
