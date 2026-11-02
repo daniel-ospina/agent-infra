@@ -553,12 +553,31 @@ def harness_apply_record():
     if fetch_state not in ("ok", ""):
         return (f"record rc={rc} was written from a comparison that was NOT fresh (fetch={fetch_state}) — "
                 f"deployed={deployed} ref={ref} — cannot-verify is not current", True)
+    # ⛔ THE DEPLOYED-DRIFT READING MUST BE READ, OR WRITING IT CHANGES NOTHING (review round 10, P2).
+    # `harness-apply-pass.sh` records `drift=` so an instrument can see whether the box actually runs
+    # this repo's code; this reader ignored the key, so `drift=not-run:absent` (the checker was NOT
+    # FOUND — the arm is inert) printed as `record ok rc=0 … action=current` and the operator-facing
+    # instrument CERTIFIED a box whose executing-tree question was never answered. That is the same
+    # silent green this whole change exists to end, one level up: the pass is honest, and the reader
+    # above it threw the honesty away.
+    drift = kv.get("drift", "")
+    if drift.startswith("not-run"):
+        return (f"record rc={rc} deployed={deployed} ref={ref} behind={behind} drift={drift} — the "
+                f"deployed-drift check was NEVER RUN (no check-deployed-drift.sh was found), so nothing "
+                f"here measured whether the box runs this repo's code", True)
+    if drift.startswith("executes:"):
+        return (f"THE BOX EXECUTES A HARNESS TREE IT DOES NOT HAVE ({drift}) — deployed={deployed} "
+                f"ref={ref} rc={rc}; redeploying the copy at rest does not clear it", True)
+    # An EMPTY key is a record written before this field existed, or one whose pass hit a pre-flow
+    # refusal. NAMED, not alarmed: the next cadence writes it, and alarming on the upgrade would red
+    # every box once for a field it is about to gain.
+    drift_note = f"drift={drift}" if drift else "drift=<not recorded by this pass>"
     if rc in ("0", "10", "11") and behind_n == 0:
         return (f"record ok rc={rc} deployed={deployed} head={head} ref={ref} behind=0 age={age}s "
-                f"action={kv.get('action', '?')}", False)
+                f"action={kv.get('action', '?')} {drift_note}", False)
     if behind_n is not None and behind_n > 0:
         return (f"BEHIND origin/{ref}: {behind_n} commit(s) — deployed={deployed} (rc={rc}, "
-                f"action={kv.get('action', '?')}) — the box is not being moved", True)
+                f"action={kv.get('action', '?')}, {drift_note}) — the box is not being moved", True)
     return (f"record rc={rc} deployed={deployed} head={head} ref={ref} behind={behind} "
             f"action={kv.get('action', '?')} detail={kv.get('detail', '?')} age={age}s — a human must look "
             f"(an ahead box may hold work that exists nowhere else)", True)
