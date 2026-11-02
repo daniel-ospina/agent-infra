@@ -467,6 +467,80 @@ bash scripts/admin-merge.sh <pr>                                                
 - One reviewer child per PR; two rail attempts. A refusal while an attestation exists at the head is a **harness defect to
   record**, not a loop to retry. `queued` / `in progress` is neither a failure nor a stall.
 
+### 6.5 Batching several reviewed PRs into one landing
+
+**Measure first — batching is a fix for a queue that may not exist.** Before building a batch, measure whether CI
+concurrency is actually binding. If there are free GitHub-hosted slots and runs finish in single-digit minutes,
+batching buys nothing. Measured 2026-11-02 on this account: **12 of 40 hosted slots in use, 28 free, 1 job queued,
+runs finishing in 1–8 minutes** — the waits were elsewhere. Quote the reading you took, not this one.
+
+**What a batch does and does not save.** It saves **(a)** CI runs — one run instead of N — and **(b)** base-drift
+re-reviews, because N PRs are judged against one base instead of each being re-reviewed as `main` moves under it.
+It does **NOT** remove the review of a **changed diff**: if a PR gained commits after its review, someone must read
+those changes whether they land alone or in a batch. One review of the union, not zero reviews.
+
+**⛔ Eligibility — ask `--check-carry`, never "it is probably still fine".** A record is bound to a head *and* to a
+`diff_sha256`. "Slightly stale" is not something you can judge by eye: a moved **base** and a PR's own **content
+changing** look identical from the outside, and only one of them is safe.
+
+```bash
+scripts/record-review.sh --check-carry <pr> <owner/repo>   # prints: <verdict> TAB <record digest> TAB <live digest>
+```
+
+⚠️ **The verdicts are not three, and the two middle ones cost you a review cycle if you misread them.** Read all of
+them off the tool's own output/exit code — never off this table alone, and never off "it looks stale":
+
+| verdict | meaning | what to DO |
+|---|---|---|
+| `head` | bound to the CURRENT head | ✅ land it |
+| `carry` | the reviewed **DIFF is unchanged** — only the base moved | ✅ the gate carries it — land, do not re-review |
+| `carry-patch` | the reviewed **PATCH is byte-identical** but the rendered diff moved (a rebase/base move). The gate will NOT carry it as-is | ⚠️ **re-record at the current head — do NOT run a review cycle** |
+| `nodigest` | the record carries no usable diff digest (legacy, or minted during a degraded read) | ⚠️ re-record at the current head — that is a **CARRY, not a fresh review** |
+| `fresh` | **the DIFF CHANGED** — the record does not cover what would merge | ⛔ run a review, or drop it from the batch |
+| `norecord` | no record for this PR at all | ⛔ run a review |
+| `unreadable` | the PR's live diff **could not be READ** (transport, shared gate queue, rate limit) | ⚠️ **RETRY** — this is NOT a changed diff and NOT a carry |
+
+`carry-patch`, `nodigest` and `unreadable` are the expensive mistakes: each one *looks* like "needs re-review" and
+isn't. `unreadable` in particular is a transient read failure, and a lane that re-reviews on it burns a full review
+cycle for nothing.
+
+**A conflict resolved at batch time does NOT repair `fresh`.** Resolving a conflict reconciles a moved base; it says
+nothing about an unreviewed diff. Measured 2026-11-02 to show how sharp this is: of six open PRs carrying a *clean*
+record, **five returned `fresh`** — the batch was two PRs, not six.
+
+**⛔ `main` must be green before the batch means anything.** A batch branch is cut from `main`, so it inherits every
+red on `main`, and the rail then refuses the batch for reasons unrelated to its contents — exactly as it refuses any
+single PR. **Fixing `main` is therefore strictly higher leverage than batching: one green `main` makes EVERY PR
+attestable; batching makes the handful in the batch.** Read `main`'s own sha (never a rollup, never `/status`): group
+check-runs by job name, take the newest attempt by **`id`**, because **a re-run ADDS a red, it does not clear one**.
+
+**Build it**
+
+```bash
+git fetch origin main
+git worktree add .worktrees/batch-<date> -b batch/<date> origin/main
+cd .worktrees/batch-<date>
+for b in <branch1> <branch2> ...; do git merge --no-ff "origin/$b" -m "batch: $b"; done   # resolve conflicts HERE
+git push origin batch/<date>
+gh pr create --base main --title "batch(<date>): N reviewed PRs" --body-file <file>
+```
+
+Then treat it as ONE PR under §6 above: **one** fresh review of the **union** diff, **one** `record-review.sh` at the
+batch head, **one** rail. The constituents' own records justify *inclusion*; the attestation that lands is the
+batch's. After it merges, the constituents close as merged because their heads become ancestors of `main` — **verify
+each one actually closed rather than assuming it.**
+
+**Traps**
+
+- **Blast radius.** One bad commit in a batch blocks N changes and makes the revert N-wide. Prefer small batches of
+  related work over one grand bundle.
+- **A conflict resolution is an unreviewed change.** It produces a NEW diff on the batch branch that nobody has read.
+  If a constituent conflicted during the build, the batch review must cover that resolution explicitly.
+- **`fresh` is not "slightly stale".** The check exists precisely because the safe and unsafe cases are
+  indistinguishable to the eye.
+- **Never edit a PR body after recording** (§6) — and the batch body is the one people forget, because it naturally
+  wants updating as members land. Put new information in a comment.
+
 ## 7. Fleet roles and what "full capacity" means
 
 The shape below is durable; the **numbers are a reading** — re-read `cmux vm stats` (RAM) and the guest's own `df -Pm /` (disk) at
