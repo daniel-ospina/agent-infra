@@ -401,7 +401,18 @@ do_pass() {
   applied="$(pinned_head)"
   if [ -z "$applied" ]; then
     log "no readable pin record at ${HARNESS_PIN_FILE} -- applying (a pin nobody can read is not a pin)"
-  elif [ "$target" = "$applied" ]; then
+  # ⛔ ONE CONVERGENCE RULE, ONE PREDICATE (#1178) — and it has to hold on the DECISION, not just on the
+  # read-back. This arm decided `current` by EQUALITY while the POST-apply rule below (:484) decides by
+  # CONTAINMENT, so ONE state gave TWO verdicts: a record that legitimately sits AHEAD of the ref tip took
+  # the mutating path here (`DRIFT … -- applying`) and read `current` + exit 0 from `--status`. Whichever
+  # side you call correct, deciding them by different predicates is the third drift dialect this file
+  # refuses — and the direction of the disagreement is the dangerous one: `--status` is the verb the header
+  # calls the operator's FIRST READ, and it said `current` about a box whose tick was still doing work.
+  # Containment is the rule the file's own comment already records as "the convergence rule", it fails on
+  # #3194's shape (a record 17 commits BEHIND does not contain the tip), and it does not produce the
+  # periodic false RED that equality produced on a record ahead of the ref. Same object database (`$repo`)
+  # as the read-back, so the two cannot disagree; `--status` computes this exact test on `$layer`.
+  elif git -C "$repo" merge-base --is-ancestor "$target" "$applied" 2>/dev/null; then
     # ⛔ THE GREEN LINE NAMES WHAT IT DID NOT CHECK. The template states that a pin which is current while
     # the RUNNING controller sits on a stale layer is a real state and that "the pass says so in its log line
     # rather than greening it away" — but only the APPLIED branch said so, and this is the branch that runs on
@@ -738,6 +749,21 @@ directive() {
 directive_names() {
   printf '%s\n' "$1" | sed -n 's/^[[:space:]]*\([A-Za-z][A-Za-z0-9]*\)[[:space:]]*=.*/\1/p' | sort -u
 }
+# unit_section <body> <section> — the lines under `[<section>]`, to the next section header.
+# A REPEATED `[<section>]` header CONTINUES the section rather than restarting it (which is what systemd
+# does), so its lines are merged into one stream instead of the last block winning.
+# ⛔ SECTION-AWARE PARSING IS LOAD-BEARING WHEREVER A RULE IS ABOUT A DIRECTIVE SYSTEMD ONLY HONOURS IN
+# ONE SECTION. `directive` reads PHYSICAL lines and tracks no section, so it cannot tell a `Unit=` systemd
+# obeys from a `Unit=` in a section it IGNORES — and an unknown or wrong section is not an error, it is a
+# silent skip (`systemd-analyze verify`: "Unknown section 'Service'. Ignoring."). A rule built on
+# `directive` alone therefore reads a directive that does nothing as satisfied, which is a false PASS.
+unit_section() {
+  printf '%s\n' "$1" | awk -v want="$2" '
+    { line=$0; sub(/^[ \t]*\[/, "", line); sub(/\].*$/, "", line) }
+    /^[ \t]*\[/ { sec=line; next }
+    sec==want { print }
+  '
+}
 declares() {
   local hit
   hit="$(printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*.*/x/p")"
@@ -1051,7 +1077,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
 # clock leaves every surface green. The two rules below are what make the clock one that REPEATS and fires
 # THE PASS.
 verify_timer() { # <rendered timer> [expected Unit= target]
-  local f="$1" expect="${2:-cell-self-pin.service}" body units nunits _rep _v _c
+  local f="$1" expect="${2:-cell-self-pin.service}" body timer units nunits _rep _v _c
   # Comments are stripped for the same reason `verify_unit` strips them: this template documents the
   # cadence decisions it made, and that prose legitimately names the directives the rules below ban.
   body="$(grep -vE '^[[:space:]]*#' "$f")"
@@ -1074,7 +1100,18 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # unit it fires is not this one, and the pin is stopped. A COUNT rule, because `[Timer]` is LAST-WINS — a
   # second `Unit=` overrides the first, so a presence test installs the wrong target green (the same
   # count-not-presence defect this file fixed for `Environment=CELL_HOME=` and `ExecStart=`).
-  units="$(directive "$body" Unit)"
+  # ⛔ SECTION-BLIND PARSING IS A FAIL-OPEN ON A TIMER (measured in review). Deleting `OnUnitActiveSec=`
+  # from `[Timer]` and appending `[Service]` + `OnUnitActiveSec=10min` installed **rc=0** and
+  # `systemd-analyze verify` said only "Unknown section 'Service'. Ignoring." — so the timer kept
+  # `OnBootSec=3min` alone, fired once three minutes after boot and never again, with every surface green:
+  # the exact defect this function exists to refuse, reached THROUGH the rule meant to close it. The same
+  # blindness in `verify_unit` fails CLOSED (a mis-sectioned `ExecStart=` makes `enable --now` fail); on a
+  # timer there is nothing to fail, so the rules below read ONLY the `[Timer]` section. `Unit=` and the
+  # repeating triggers are `[Timer]` directives: written anywhere else systemd ignores them, and a rule
+  # that counted them there would be grading text nobody reads.
+  timer="$(unit_section "$body" Timer)"
+  [ -n "$timer" ] || { bad "the rendered timer declares no [Timer] section (or an empty one) — every trigger this unit needs lives there, and systemd ignores a trigger written in any other section, so this timer would install green and fire nothing"; return 1; }
+  units="$(directive "$timer" Unit)"
   nunits=0
   [ -z "$units" ] || nunits="$(printf '%s\n' "$units" | wc -l | tr -d ' ')"
   if [ "$nunits" -ne 1 ]; then
@@ -1090,7 +1127,7 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # because an EMPTY `OnUnitActiveSec=` is ignored by systemd and silently degrades to the one-shot case.
   _rep=0
   for _v in OnUnitActiveSec OnCalendar; do
-    if [ -n "$(directive "$body" "$_v" | sed -n '/[^[:space:]]/p' | head -1)" ]; then _rep=1; break; fi
+    if [ -n "$(directive "$timer" "$_v" | sed -n '/[^[:space:]]/p' | head -1)" ]; then _rep=1; break; fi
   done
   [ "$_rep" -eq 1 ] || { bad "the rendered timer declares no REPEATING trigger — OnBootSec=/OnStartupSec=/OnActiveSec= each fire ONCE, so the pin would run a single time and then stop for ever with every surface green (this template uses OnUnitActiveSec= for exactly this reason); declare OnUnitActiveSec= or OnCalendar="; return 1; }
   return 0
