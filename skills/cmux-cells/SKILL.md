@@ -484,10 +484,13 @@ those changes whether they land alone or in a batch. One review of the union, no
 changing** look identical from the outside, and only one of them is safe.
 
 ```bash
-scripts/record-review.sh --check-carry <pr> <owner/repo>   # prints: <verdict> TAB <record digest> TAB <live digest>
+scripts/record-review.sh --check-carry <pr> <owner/repo>   # prints: <verdict> TAB <record digest|-> TAB <live digest|fetch-status>
 ```
 
-⚠️ **The verdicts are not three, and the two middle ones cost you a review cycle if you misread them.** Read all of
+⚠️ **The verdicts are not three, and THREE of them cost you a review cycle if you misread them** (`carry-patch`,
+`nodigest`, `unreadable`). The columns are **not uniform** — `norecord`/`nodigest` print `-` in column 2, and
+`unreadable` prints the **fetch status** in column 3 instead of a digest — so **branch on the verdict, never parse the
+columns**. Read all of
 them off the tool's own output/exit code — never off this table alone, and never off "it looks stale":
 
 | verdict | meaning | what to DO |
@@ -497,7 +500,7 @@ them off the tool's own output/exit code — never off this table alone, and nev
 | `carry-patch` | the reviewed **PATCH is byte-identical** but the rendered diff moved (a rebase/base move). The gate will NOT carry it as-is | ⚠️ **re-record at the current head — do NOT run a review cycle** |
 | `nodigest` | the record carries no usable diff digest (legacy, or minted during a degraded read) | ⚠️ re-record at the current head — that is a **CARRY, not a fresh review** |
 | `fresh` | **the DIFF CHANGED** — the record does not cover what would merge | ⛔ run a review, or drop it from the batch |
-| `norecord` | no record for this PR at all | ⛔ run a review |
+| `norecord` | no record in **this box's** store | ⛔ a review — **but take the cheaper paths the tool prints first**: `scripts/registry-sync.sh pull` (it may have run on another box) and `record-review.sh --recover-body <pr> <owner/repo>` (the PR body carries a signed marker). An absence here is **not** evidence no review happened |
 | `unreadable` | the PR's live diff **could not be READ** (transport, shared gate queue, rate limit) | ⚠️ **RETRY** — this is NOT a changed diff and NOT a carry |
 
 `carry-patch`, `nodigest` and `unreadable` are the expensive mistakes: each one *looks* like "needs re-review" and
@@ -509,9 +512,12 @@ nothing about an unreviewed diff. Measured 2026-11-02 to show how sharp this is:
 record, **five returned `fresh`** — the batch was two PRs, not six.
 
 **⛔ `main` must be green before the batch means anything.** A batch branch is cut from `main`, so it inherits every
-red on `main`, and the rail then refuses the batch for reasons unrelated to its contents — exactly as it refuses any
-single PR. **Fixing `main` is therefore strictly higher leverage than batching: one green `main` makes EVERY PR
-attestable; batching makes the handful in the batch.** Read `main`'s own sha (never a rollup, never `/status`): group
+red on `main`. The rail does **not** refuse those outright: it refuses a red it cannot **attribute** to `main`
+(`scripts/admin-merge.sh:5-9`, `:25-33`), and it deliberately does not refuse on the main head alone, because that
+"refuses the PR that REPAIRS a red main" — #1261, `:160-166`. The window that bites is the one this skill cares
+about: **when the `main` row is unmeasurable, every inherited red reads as NEW.** That is why fixing `main` is the
+higher-leverage move — one green `main` makes EVERY PR attestable, while batching makes only the handful in the batch.
+Read `main`'s own sha (never a rollup, never `/status`): group
 check-runs by job name, take the newest attempt by **`id`**, because **a re-run ADDS a red, it does not clear one**.
 
 **Build it**
@@ -527,8 +533,13 @@ gh pr create --base main --title "batch(<date>): N reviewed PRs" --body-file <fi
 
 Then treat it as ONE PR under §6 above: **one** fresh review of the **union** diff, **one** `record-review.sh` at the
 batch head, **one** rail. The constituents' own records justify *inclusion*; the attestation that lands is the
-batch's. After it merges, the constituents close as merged because their heads become ancestors of `main` — **verify
-each one actually closed rather than assuming it.**
+batch's. ⛔ **The constituents will NOT close as merged.** The rail defaults to `--squash`
+(`scripts/admin-merge.sh:558-566`, applied at `:7754`), and a squash lands a **NEW** commit — the constituents' tips
+never become ancestors of `main`, so GitHub has no ancestry to close them on, and they stay **open**, closable only as
+"closed". So do exactly one of two things, and say which you did: **close them by hand** after confirming their
+content is in the batch commit, or land the batch with an explicit method —
+`bash scripts/admin-merge.sh <pr> -- --merge` (the pass-through is an allow-list, `:550-556`) — and only then may you
+rely on ancestry. **Verify which actually happened; do not assume either.**
 
 **Traps**
 
