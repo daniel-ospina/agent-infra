@@ -303,9 +303,19 @@ headroom.
   nothing reports `freed=0` and names the un-attributed `df` change in `detail=`, like every other class.
 * **The record** carries `freed_mb_runner_work=`, `candidates_runner_work=` (and the same number as
   `cand_runner_work=`, the spelling this class's brief uses — both written from one expression so they
-  cannot disagree), `verdict_runner_work=` and `note_runner_work=` (the class's own cause channel; it
-  rides in `detail=` too). `--print-status` prints all of them (`freed_mb_`, `would_free_mb_`,
-  `candidates_`, `cand_`, `note_`, `verdict_`) — a field the reader does not print does not exist.
+  cannot disagree), `unmeasurable_runner_work=`, `verdict_runner_work=` and `note_runner_work=` (the
+  class's own cause channel; it rides in `detail=` too). `--print-status` prints all of them
+  (`freed_mb_`, `would_free_mb_`, `candidates_`, `cand_`, `unmeasurable_`, `note_`, `verdict_`) — a field
+  the reader does not print does not exist.
+* **`unmeasurable_runner_work=` is the ABSTENTION channel, and it is a field of its own on purpose.** The
+  owner answers `unmeasurable=<n>`: entries it KEPT because its bounded walk could not ANSWER (a
+  permission error, a vanished mount, a watchdog 124, a TOCTOU re-probe that could not answer). Those
+  entries are correctly kept — an unanswerable walk is not proof of death — but with only `kept=` and
+  `failed=` in the record, "kept because nothing was written for an hour" (a measured decision) and "kept
+  because the walk could not read it" (an abstention, i.e. a probe to fix) printed the same number. It is
+  `?` when the owner did not answer, `not-run` when this pass did not select the class, `?` when the class
+  could not be set up, and a nonzero value is also named in `note_runner_work=`/`detail=` so an operator
+  finds it without knowing the field exists.
 * **A class that scanned NOTHING is not a pass.** With the globs set EXPLICITLY and no directory
   matching, the owner reports `census=no-roots` and the class records `misconfigured` +
   `candidates_runner_work=?`, exit 3 — the same rule (and shape) as `venv-no-repo`. With the DEFAULT
@@ -960,14 +970,29 @@ green, which is the correct answer for a case whose subject is the owner.)
 The measured transcript, `bash scripts/disk-reaper-runner-work.test.sh`:
 
 ```
-  19 passed, 0 failed
+  19 passed, 0 failed, 0 skipped
 ```
 
 and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 
 ```
-  6 passed, 13 failed
+  6 passed, 13 failed, 0 skipped
 ```
+
+**The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
+run on a box that HAS real runner roots — its whole subject is the default list, so there is nothing to
+pin the seam to — and recording it as a passing check meant a CELL (which skips it) printed the same
+`19 passed, 0 failed` as a laptop on which all 19 arms really ran. The skipped arms are now counted on
+their own line with their reason, so the two runs cannot be mistaken for each other:
+
+```
+  19 passed, 0 failed, 2 skipped
+    skipped: (f) default-glob half, entry point …/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
+    skipped: (f) default-glob half, entry point …/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
+```
+
+(two, not one: `(f)` runs twice, against the real entry point and its mutant. The source assertion that
+follows the skip still runs on both, so a broken default list still reddens a cell.)
 
 | case | proves | mutant that must turn it red |
 |---|---|---|
@@ -976,7 +1001,7 @@ and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 | (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the `RETAINED_NAMES` table is emptied |
 | (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one | `want_class runner-work` → `true` |
 | (e) | an unknown `--only` value is refused, the valid list names `runner-work`, and a near-miss (`runner`) is refused too | the valid list is shortened in the refusal |
-| (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) | the `census=no-roots` arm is deleted |
+| (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0). On a box with REAL runner roots (a cell) the default-glob half is **SKIPPED by name and counted as skipped, never as passed** — the documented default list is then asserted from the source — and `(b)` pins that the record carries the owner's `unmeasurable=` tally | the `census=no-roots` arm is deleted |
 | (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
 | (h) | a SET-but-EMPTY glob list is a refusal at **both** layers (the entry point's seam and the owner's), never "scan nothing for ever" — `${X:-default}` would substitute the *widest* sweep for an emptied value, and this class's output is deletions | the entry point's empty-glob arm never matches; and, separately, the owner's |
 | (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |

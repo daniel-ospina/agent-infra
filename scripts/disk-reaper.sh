@@ -268,6 +268,15 @@ WANT_RW=0
 # 1 = this pass MEASURED the candidate count (a lifted, fully-answered SUMMARY). 0 = it did not, and the
 # record must say `?` rather than the initialised 0 — the sentinel every other class already carries.
 HAVE_RW_CAND=0
+# The owner's `unmeasurable=` tally: entries it KEPT because the bounded walk could not ANSWER (a
+# permission error, a vanished mount, a watchdog 124, or a TOCTOU re-probe that could not answer).
+# ⛔ THIS IS THE CLASS'S ONLY "COULD NOT DECIDE" OUTCOME AND IT NEEDED ITS OWN CHANNEL. The entry point
+# lifted seven SUMMARY fields and dropped this one, so in the record a pass that read "nothing wrote here
+# for an hour" (proof of death, reaped) and one that read "I could not read it at all" (kept, fail-closed)
+# were the same number — `kept=`/`failed=` alone cannot tell a decision from an abstention, which is the
+# distinction the whole class rests on. `?` until a fully-answered SUMMARY lifts a numeric value, the
+# same sentinel `HAVE_RW_CAND` carries (an initialised 0 is never published as a measurement).
+RW_UNMEAS='?'
 RC_RW=0
 VERDICT_RW="not-run"
 NOTE_RW=""
@@ -493,6 +502,11 @@ print_status() {
     log_line "candidates_runner_work=$(status_field candidates_runner_work)"
     log_line "cand_runner_work=$(status_field cand_runner_work)"
     log_line "note_runner_work=$(status_field note_runner_work)"
+    # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST (the rule this block already carries for
+    # `skipped_worktree=`): `unmeasurable_runner_work=` is written every pass, so it must be readable
+    # without opening the record file — it is the only surface that distinguishes "nothing was written
+    # for an hour" (reaped) from "the walk could not answer" (kept).
+    log_line "unmeasurable_runner_work=$(status_field unmeasurable_runner_work)"
     log_line "verdict_uv=$(status_field verdict_uv)"
     log_line "verdict_venv=$(status_field verdict_venv)"
     log_line "verdict_worktree=$(status_field verdict_worktree)"
@@ -2280,7 +2294,7 @@ rw_df_targets() {
 reap_runner_work() {
     local out rc line path size why cands="" rows="" all_c=0 freed=0 raw=0 MEASURED=1 rec=""
     local tgt before after d _rw_line="" _rw_cand="" _rw_roots="" _rw_census="" _rw_reaped=""
-    local _rw_retained="" _rw_failed="" _rw_kept="" _rw_why=""
+    local _rw_retained="" _rw_failed="" _rw_kept="" _rw_why="" _rw_unmeasurable=""
     if [ -z "$RUNNER_WORK_REAPER_PATH" ]; then
         log_line "disk-reaper: ⛔ class=runner-work FAIL-CLOSED — reap-runner-work.sh not found (looked at \$RUNNER_WORK_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         NOTE_RW="reap-runner-work.sh not found"; RC_RW=3
@@ -2324,7 +2338,17 @@ reap_runner_work() {
     _rw_retained="$(kv_field "$_rw_line" retained)"
     _rw_kept="$(kv_field "$_rw_line" kept)"
     _rw_failed="$(kv_field "$_rw_line" failed)"
+    # The eighth field — the one the lift used to drop. Carried, never re-derived: the owner is the only
+    # component that can say which entries its walk could not read.
+    _rw_unmeasurable="$(kv_field "$_rw_line" unmeasurable)"
     case "${_rw_reaped:-}" in ''|*[!0-9]*) _rw_reaped=0 ;; esac
+    case "${_rw_unmeasurable:-}" in
+        ''|*[!0-9]*) : ;;                       # unanswered: `RW_UNMEAS` stays `?`, never an invented 0
+        *) RW_UNMEAS="$_rw_unmeasurable"
+           # A nonzero tally is NAMED in the note, because it is a decision an operator must be able to
+           # find without knowing the field exists: these entries were KEPT for want of an answer.
+           [ "$RW_UNMEAS" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${RW_UNMEAS} entr$( [ "$RW_UNMEAS" = 1 ] && printf 'y' || printf 'ies') KEPT as unreadable (the bounded walk could not answer, which is never proof of death); see unmeasurable_runner_work" ;;
+    esac
     # ⛔ AN EXPLICIT GLOB LIST THAT MATCHED NOTHING IS `misconfigured`, NEVER A MEASURED ZERO — the same
     # rule (and the same shape) as `venv-no-repo`: a class that scanned NOTHING is not a pass, and the
     # remedy is different from "the delegate ran and could not work". The owner only reports this for a
@@ -2392,12 +2416,15 @@ reap_runner_work() {
         # that did not (a truncated line). Never an invented 0.
         [ "$HAVE_RW_CAND" = 1 ] || { CAND_RW="$all_c"; [ "$all_c" -gt 0 ] && HAVE_RW_CAND=1; }
         [ -n "$cands" ] && log_line "$cands"
-        log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=dry-run candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") would_free_du=${WOULD_RW}MB (du estimate) freed_df=0MB min_age=${RUNNER_MIN_AGE}s retained=${_rw_retained:-?} kept=$(_tally_num "$HAVE_RW_CAND" "${_rw_kept:-?}") roots=${_rw_roots:-?}"
+        # ⛔ `kept=` IS NOT A DECISION AND `unmeasurable=` IS AN ABSTENTION — both are on the line, so an
+        # operator reading the class line alone can tell "ten entries were written within the floor" from
+        # "ten entries could not be read at all" (the second is a broken probe, not a healthy box).
+        log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=dry-run candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") would_free_du=${WOULD_RW}MB (du estimate) freed_df=0MB min_age=${RUNNER_MIN_AGE}s retained=${_rw_retained:-?} kept=$(_tally_num "$HAVE_RW_CAND" "${_rw_kept:-?}") unmeasurable=$RW_UNMEAS roots=${_rw_roots:-?}"
     else
         if [ "${DF_RW_OK:-0}" = 1 ]; then
-            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=${FREED_RW}MB df_raw=${RAW_RW}MB (df delta) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
+            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=${FREED_RW}MB df_raw=${RAW_RW}MB (df delta) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
         else
-            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
+            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
         fi
     fi
     return 0
@@ -2597,6 +2624,19 @@ record_body() {
     # one pass can produce is a STALE or re-derived value, not an alias of one expression). Either name
     # answers "how many candidates did runner-work see", which is the only reason the field exists.
     printf 'candidates_runner_work=%s\n' "$(_class_rec "${VERDICT_RW:-not-run}" "${WANT_RW:-0}" "${HAVE_RW_CAND:-0}" "$CAND_RW")"
+    # ⛔ THE EIGHTH SUMMARY FIELD (#3057 review): the owner answers `unmeasurable=<n>` — entries KEPT
+    # because its bounded walk could not answer — and the entry point lifted the other seven and dropped
+    # it, so the one "could not decide" outcome had no channel in the record at all. Same polarity as
+    # `_class_rec`: a class that could not be SET UP answers `?` (it measured nothing), a class this pass
+    # did not SELECT answers `not-run`, and otherwise the owner's own number (or `?` if it did not answer).
+    _unmeas_rec() {
+        case "${VERDICT_RW:-not-run}" in
+            misconfigured) printf '?' ;;
+            not-run)       printf 'not-run' ;;
+            *) [ "${WANT_RW:-0}" = 1 ] && printf '%s' "$RW_UNMEAS" || printf 'not-run' ;;
+        esac
+    }
+    printf 'unmeasurable_runner_work=%s\n' "$(_unmeas_rec)"
     printf 'cand_runner_work=%s\n' "$(_class_rec "${VERDICT_RW:-not-run}" "${WANT_RW:-0}" "${HAVE_RW_CAND:-0}" "$CAND_RW")"
     # The class's own cause channel. `detail=` still carries it joined with its siblings (the supervisor
     # prints one line); this field exists so a reader can ask "why is runner-work not ok" without
