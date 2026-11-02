@@ -2602,11 +2602,18 @@ def t4b_retry_is_confined_to_replace():
 @test("T33 a fallback-only queue is NOT starvation: the counts hold, the work is GitHub-hosted's")
 def t33_starvation_eligibility_healthy():
     """MEASURED ON agent-infra 2026-10-27: `queued=14` sustained across the confirmation window while
-    the pool was idle. That is the DESIGNED steady state of the fallback-only ruling — while the gate
-    says `github`, `ubuntu-latest` belongs to GitHub-hosted, our pool deliberately does not advertise
-    it, and every online runner is idle BY DESIGN. The old invariant (`queued>0 ∧ busy==0 ∧
+    the pool was idle. Under the fallback-only ruling that was the DESIGNED steady state — while the
+    gate says `github`, `ubuntu-latest` belongs to GitHub-hosted, our pool deliberately does not
+    advertise it, and every online runner is idle BY DESIGN. The old invariant (`queued>0 ∧ busy==0 ∧
     online>0`) paged exit 4 on that every ~9 minutes for ever, and noise is how the incident the
     alarm exists for (#2875) becomes invisible.
+
+    ⛔ THE RULING THAT MADE 14 QUIET WAS REVERSED BY THE OWNER ON #9878 — `GATE_QUEUE_THRESHOLD` is
+    now 10, so a 14-deep queue is AT/ABOVE it and correctly reads ELIGIBLE. That is not this case
+    going stale silently; it is the reversal working, and the depth boundary is pinned by T43. This
+    case now takes the SILENT side at the deepest depth that still leaves the depth term inert
+    (`GATE_QUEUE_THRESHOLD - 1`), so the invariant it protects — a genuinely shallow GitHub-hosted
+    backlog is not this pool's starvation — stays asserted rather than deleted.
 
     The alarm's second half is ELIGIBILITY (`starvation_eligible`): the pool advertises the fallback,
     OR the gate wants `local`, OR the queue is at/above the gate's own backlog threshold."""
@@ -2615,7 +2622,7 @@ def t33_starvation_eligibility_healthy():
         try:
             # The pool is up and idle; NOTHING advertises ubuntu-latest, and the gate says github.
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64", "Linux"])])
-            box.queued(14)
+            box.queued(ra.GATE_QUEUE_THRESHOLD - 1)
             box.gate_state("github")
             record = converge(box, want=0)
             check(
@@ -2628,7 +2635,7 @@ def t33_starvation_eligibility_healthy():
             )
             check(record["verdict"] != "starvation", f"verdict: {record['verdict']}")
             # ⛔ THE EVIDENCE SURVIVES THE VERDICT: the counts and the reason are still published.
-            check(record.get("queued_runs") == 14, f"the counts must stay published: {record}")
+            check(record.get("queued_runs") == ra.GATE_QUEUE_THRESHOLD - 1, f"the counts must stay published: {record}")
             blob = " ".join(record["notes"])
             contains(blob, "starvation NOT armed", "the record")
             contains(blob, "GitHub-hosted", "the record")
@@ -3016,9 +3023,12 @@ def t42_absent_gate_record_is_absence():
 def t43_deep_queue_threshold():
     """The third eligibility term exists for a queue nobody's labels explain: a DEEP backlog with an
     idle pool is worth a page whatever the pool advertises, and the number is the gate's own
-    (`ci_runner_gate.sh:43`, `CI_GATE_QUEUE_THRESHOLD:-60`) rather than a second opinion invented
+    (`ci_runner_gate.sh:119`, `CI_GATE_QUEUE_THRESHOLD:-10`) rather than a second opinion invented
     here. Review finding P1: without this case the constant was documented as "PINNED BY THE SUITE"
-    with zero references in it, so a drift from 60 — or the term being dropped — was invisible."""
+    with zero references in it, so a drift from the gate's default — or the term being dropped — was
+    invisible. The value itself (10, was 60) is the owner's reversal of #2327's fallback-only timing
+    rule on #9878; the `OVERRIDES:` marker for it lives in the gate's header. This case pins PARITY
+    with the gate, never the number, so the reversal moved both together and this case still holds."""
     with Env():
         box = Box("starve-threshold")
         try:
@@ -3484,21 +3494,30 @@ def t44_queue_age_eligibility():
     through to the 60-deep threshold and reported `ok`, exit 0. The tool was written for an outage it
     could not see from the boxes it runs on.
 
+    ⛔ #2875's OWN 53-DEEP SHAPE IS NOW CAUGHT BY A DIFFERENT TERM, AND THAT IS THE REVERSAL. On
+    #9878 the owner set `GATE_QUEUE_THRESHOLD` to 10, so 53 is above it and the DEPTH term fires — the
+    "fell through to the threshold and reported ok" half of the finding is closed by the ruling. What
+    still has no other explanation is a SHALLOW queue whose head has waited an age, which is why this
+    case now runs at a below-threshold depth (`GATE_QUEUE_THRESHOLD - 1`): the depth term is inert
+    there, so AGE is the only term that can decide and the case keeps testing exactly what it claims.
+
     ⛔ AND THE FIX IS NOT "THE QUEUE IS NOT DRAINING": `queued=14` sustained across the confirmation
-    window is the measured, HEALTHY steady state of the fallback-only ruling (round 9's own fix), so
-    that term would re-arm the false alarm it removed. AGE separates them — a healthy GitHub-hosted
-    scheduler serves in seconds-to-minutes — so both halves are asserted here: the starved queue pages,
-    and the served backlog stays silent with the reason and the counts published.
+    window was the measured, HEALTHY steady state of the fallback-only ruling (round 9's own fix), and
+    a plain `queued>0` term would re-arm the false alarm it removed. AGE separates them — a healthy
+    GitHub-hosted scheduler serves in seconds-to-minutes — so both halves are asserted here: the
+    starved queue pages, and the served backlog stays silent with the reason and the counts published.
     """
     with Env():
         box = Box("queue-age")
         try:
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
-            # #2875's own counts: the label is GONE from every runner (the gate on the hub stripped
-            # it), the pool is online and IDLE, and 53 runs are waiting (below the gate's 60).
+            # #2875's shape with the DEPTH made inert: the label is GONE from every runner (the gate on
+            # the hub stripped it) and the pool is online and IDLE. The depth is held below the gate's
+            # threshold on purpose — at 53 the depth term decides and the AGE term this case exists to
+            # prove is never reached.
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
-            box.queued(53)
+            box.queued(ra.GATE_QUEUE_THRESHOLD - 1)
             # ⛔ ROW 0 IS NOT THE OLDEST (round-13 review finding P1). The runs endpoint is
             # newest-first and ignores `sort`/`direction`, so the page's first row is the run that
             # arrived a moment ago — and a queue STILL RECEIVING WORK is exactly #2875's shape. Pin
@@ -3539,7 +3558,7 @@ def t44_queue_age_eligibility():
                 "the reason must name the age bound it did not reach",
             )
             check(
-                record.get("starvation_queued") == 53,
+                record.get("starvation_queued") == ra.GATE_QUEUE_THRESHOLD - 1,
                 f"the counts are published on BOTH verdicts: {record}",
             )
         finally:
@@ -3556,8 +3575,9 @@ def t56_queue_age_reader_refusals():
         state for exactly this read.
         ⛔ PINNED AT THE UNIT BOUNDARY ON PURPOSE. In *this* tool the state is unreachable end to end:
         the age read is taken only after the depth term declines, i.e. at `queued <
-        GATE_QUEUE_THRESHOLD` (60), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
-        while the depth read reported 53 would assert an API response that cannot exist (both reads
+        GATE_QUEUE_THRESHOLD` (10), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
+        while the depth read reported GATE_QUEUE_THRESHOLD - 1 would assert an API response that cannot
+        exist (both reads
         are the same endpoint) and would claim a false-open this tool cannot produce. The guard is
         kept for when the two numbers cross — the gate's threshold is operator-settable, its
         counterpart here is a constant — so it is tested where it is reachable: the reader itself.
@@ -3624,7 +3644,12 @@ def t56_queue_age_reader_refusals():
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
-            box.queued(53)
+            # ⛔ BELOW THE GATE'S THRESHOLD ON PURPOSE (#9878 set it to 10): at a deeper queue the DEPTH
+            # term decides and the age read this case is about is never taken, so the refusal it
+            # proves would go untested. #2875's own sample measured 53, which the DEPTH term now
+            # catches on its own (see T44) — so this fixture holds the depth under the threshold to
+            # isolate the head reader, and still asserts the measured depth survives the failed read.
+            box.queued(ra.GATE_QUEUE_THRESHOLD - 1)
             record = converge(box, nproc="2", dry_run=True)
             check(
                 record.get("starvation") == "unmeasured",
@@ -3640,7 +3665,7 @@ def t56_queue_age_reader_refusals():
                 "the refusal must carry its cause to the record, not a bare `unmeasured`",
             )
             check(
-                record.get("queued_runs") == 53,
+                record.get("queued_runs") == ra.GATE_QUEUE_THRESHOLD - 1,
                 f"and the depth the sample DID measure must survive the failed read — `--json` "
                 f"reporting it as absent is the round-7 defect: {record.get('queued_runs')}",
             )
@@ -5069,8 +5094,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T43",
-        "GATE_QUEUE_THRESHOLD = 60",
-        "GATE_QUEUE_THRESHOLD = 55",
+        "GATE_QUEUE_THRESHOLD = 10",
+        "GATE_QUEUE_THRESHOLD = 5",
         "the alarm's copy of the gate's threshold drifts away from the gate's own default",
     ),
     Mutation(

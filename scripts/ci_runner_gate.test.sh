@@ -424,7 +424,15 @@ GATE_UNDER_TEST="${GATE_UNDER_TEST:-}"
 # evidence a "this arm is load-bearing" claim rests on. Restoring the caller's value makes the
 # lever work end to end; for a normal run the value is empty, so nothing else changes.
 GATE_UNDER_TEST_ORIG="$GATE_UNDER_TEST"
-GH_THRESHOLD_DEFAULT=60
+# ⛔ THIS DOUBLE MIRRORS THE GATE'S SHIPPED DEFAULT, and it must keep mirroring it (#9878 moved that
+# default 60 -> 10). While it sat at 60, NO arm exercised the gate's own `:-10` — every `run_gate`
+# exported 60 — so the value the fleet actually ships was untested here, and the arms titled
+# "at the shipped threshold" were testing a number that was no longer shipped. Arms whose POINT is a
+# deep-but-serving queue now say `CI_GATE_QUEUE_THRESHOLD=60` explicitly: at the shipped 10 a >= 10
+# backlog legitimately engages the pool, so a case that needs the LENGTH leg out of the way to reach
+# the throughput / capacity / attribution term must name the depth it is reasoning about rather than
+# borrow the default.
+GH_THRESHOLD_DEFAULT=10
 
 # run_gate <case> [ENV=…]... -- [gate args] — one hermetic invocation.
 # CI_GATE_ORCH_WS="" keeps the cmux leg out of the picture: the durable inbox file is the
@@ -765,7 +773,7 @@ KEEP_STATE=0
 # on 2026-10-27 the live repo held a queue HEAD 3,943-12,583 s old while hosted was serving 2..14 runs, so
 # an age-only leg would have fired continuously on a healthy repo.
 echo "── #2904: a STALLED queue (healthy component, nothing executing) takes the fallback path ──"
-run_gate stall GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 --
+run_gate stall CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 --
 assert_eq "$RC" "0" "a stalled queue with a healthy component still exits 0 (it ACTS, it does not fail)"
 assert_contains "$OUT" "oldest_queued_s=36" "the probe reports the queue-wait age in SECONDS"
 assert_contains "$OUT" "in_progress=0" "the probe reports the absorption field it branched on"
@@ -779,7 +787,7 @@ assert_contains "$(cat "$GH_LOG")" "-X PUT" "a stalled queue actually relabels t
 # head 12,583 s (3 h 29 m) old is what the live repo looked like while 13 runs were executing. Hosted was
 # absorbing; the gate must stay on github.
 echo "── #2904: a DEEP BUT SERVING queue (old head, runs executing) leaves mode=github ──"
-run_gate serving GH_QUEUED=54 GH_INPROGRESS=13 GH_QUEUE_OLDEST_AGE=12400 GH_FALLBACK_N=0 --
+run_gate serving CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=54 GH_INPROGRESS=13 GH_QUEUE_OLDEST_AGE=12400 GH_FALLBACK_N=0 --
 assert_eq "$RC" "0" "a deep but serving queue exits 0"
 assert_contains "$OUT" "in_progress=13" "the probe reports the runs that ARE executing"
 assert_not_contains "$OUT" "not absorbing" "a deep but serving queue is NOT read as a stall"
@@ -808,7 +816,7 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "an id
 # ⛔ A LEG THAT ERRORS is neither healthy NOR unhealthy-but-act (#2904): every unreadable input below
 # must exit 2, leave the mode alone, notify nothing and relabel nothing.
 echo "── #2904: an unreadable absorption read must FAIL CLOSED (no action either way) ──"
-run_gate stalled-inprog-fail GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
+run_gate stalled-inprog-fail CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
   GH_MODE=inprog-fail --
 assert_eq "$RC" "2" "a failed in-progress read → exit 2 (could-not-measure)"
 assert_contains "$OUT" "in-progress probe FAILED" "the failure NAMES the read that failed"
@@ -817,7 +825,7 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "a failed in-progress read advan
 assert_not_contains "$OUT" "TRANSITION" "a failed in-progress read sent no transition notification"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a failed in-progress read relabelled no runner"
 
-run_gate inprog-null GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
+run_gate inprog-null CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 \
   GH_MODE=inprog-null --
 assert_eq "$RC" "2" "a null in-progress count → exit 2 (never 'nothing executing')"
 assert_contains "$OUT" "in_progress count UNREADABLE" "a null in-progress count names the read failure"
@@ -855,9 +863,11 @@ assert_contains "$OUT" "DEEPER than the read page" "the refusal NAMES the satura
 assert_contains "$OUT" "lower bound" "the refusal says WHY the head age is unusable"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a saturated queue read advanced no state file"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a saturated queue read relabelled no runner"
-# …and the saturation is NOT a new way to red the normal path: with the SHIPPED threshold the length
-# leg decides a 150-deep queue first (unhealthy -> fallback), which is the state it always was.
-run_gate page-saturated-shipped GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 --
+# …and the saturation is NOT a new way to red the normal path: with the threshold set to 60 the
+# length leg decides a 150-deep queue first (unhealthy -> fallback), which is the state it always was.
+# ⛔ NOT "the shipped threshold": the shipped value is 10 (#9878), at which a 150-deep queue ALSO
+# takes this leg — this arm pins the leg's ORDER, not the shipped value, so it names its own 60.
+run_gate page-saturated-shipped CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=150 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=60 GH_FALLBACK_N=0 --
 assert_eq "$RC" "0" "a 150-deep queue at the shipped threshold still ACTS (rc 0), it does not fail"
 assert_contains "$OUT" "queue/component/incident leg" "the LENGTH leg is the one that decides it"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a 150-deep queue engages the pool"
@@ -871,13 +881,13 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a 150-
 # re-tested every tick by the legs that existed before this one) — it is pinned here so nobody
 # reads it as this leg's verdict.
 echo "── #2904 (P1): while the pool is engaged, the reason never claims hosted is absorbing ──"
-run_gate fallback-attribution GH_QUEUED=16 GH_INPROGRESS=2 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+run_gate fallback-attribution CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=16 GH_INPROGRESS=2 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
 assert_eq "$RC" "0" "a drained queue with the pool serving exits 0"
 assert_contains "$OUT" "absorption NOT attributable in mode=local" "the reason says the reading cannot be attributed to hosted"
 assert_contains "$OUT" "in_progress=2" "the reason still QUOTES the figures it read"
 assert_not_contains "$OUT" "queue absorbing" "the reason never claims hosted absorption while the pool is executing"
 # The deny direction is unchanged in fallback mode: pool engaged, nothing executing, stuck head ⇒ stay.
-run_gate fallback-deny GH_QUEUED=16 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+run_gate fallback-deny CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=16 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
 assert_eq "$RC" "0" "a stuck queue with nothing executing exits 0 in fallback mode too"
 assert_contains "$OUT" "not absorbing" "and it is still named as not absorbing (the deny holds in both modes)"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a stuck queue with nothing executing keeps the pool engaged"
@@ -1195,7 +1205,7 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capaci
 # all that could distinguish this from "9 busy" — so it certified the state that keeps the pool out of
 # the queue while seven runners sat unused.
 echo "── #2904: IDLE CAPACITY WHILE WORK WAITS is measured, named, and NEVER certified ──"
-run_gate census-idle-unused GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 \
+run_gate census-idle-unused CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 \
   GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" --
 assert_eq "$RC" "0" "(2) idle capacity is a report, not an action — the pass still completes"
 assert_contains "$OUT" "online_idle=7" "(2) the SEVEN IDLE runners are counted, per runner"
@@ -1211,7 +1221,7 @@ assert_not_contains "$OUT" "GitHub Actions healthy" "(2) and never prints the wo
 # `saturated` is a CERTIFYING word, the reason read "GitHub Actions healthy". Same census, same queue,
 # demand unmeasurable: the pool's own state still decides, and it has idle capacity.
 echo "── #3002 P1: an UNMEASURABLE demand must not turn 7 idle runners into 'saturated' ──"
-run_gate census-mixed-demand-unknown GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_DEMAND_MODE=fail \
+run_gate census-mixed-demand-unknown CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_DEMAND_MODE=fail \
   GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" --
 assert_eq "$RC" "0" "(2b) the pass completes (idle capacity is a report, not a deny)"
 assert_contains "$OUT" "demand=unknown" "(2b) the demand really was unmeasured in this state"
@@ -1228,7 +1238,7 @@ assert_not_contains "$OUT" "GitHub Actions healthy" "(2b) the words 'healthy' ne
 # Actions healthy". The pool is exhausted FOR THIS DEMAND while capacity sits idle — a report an
 # operator needs (it may mean the label reached only one runner), never a certification.
 echo "── #3002 P1 (round 3): demand-matching exhaustion is NOT 'saturated' while other runners idle ──"
-run_gate census-demand-busy-idle-other GH_QUEUED=54 GH_FALLBACK_N=1 GH_INPROGRESS=2 \
+run_gate census-demand-busy-idle-other CI_GATE_QUEUE_THRESHOLD=60 GH_QUEUED=54 GH_FALLBACK_N=1 GH_INPROGRESS=2 \
   GH_CENSUS="busy@self-hosted|Linux|X64|self-hosted-x64|ubuntu-latest,idle@self-hosted|Linux|X64|self-hosted-x64,idle@self-hosted|Linux|X64|self-hosted-x64" --
 assert_eq "$RC" "0" "(2c) the pass completes (a report, not a deny)"
 assert_contains "$OUT" "demanding_busy=1" "(2c) the ONE demand-matching runner is busy"

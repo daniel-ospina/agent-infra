@@ -14,13 +14,43 @@
 #   is the FALLBACK: when GitHub-hosted is unhealthy it re-adds `ubuntu-latest` to the
 #   pool so the same workflows can land locally instead of queueing forever.
 #
-# ⛔ THE FALLBACK-ONLY DECISION ABOVE IS UNCHANGED (agent-infra#2327 did not touch it). The pool
-#   serves CI only while GitHub-hosted is unhealthy — the arch fix below changes WHICH LABEL each
-#   runner accepts, never WHEN the pool is offered to the queue. When the pool gained a second
-#   architecture the marker became per-runner (`self-hosted-arm64` / `self-hosted-x64`), because
-#   one pool-wide body deleted the x86 marker and the capacity silently stopped matching jobs.
-#   The invariant the label code holds: A RUNNER'S LABELS MUST DESCRIBE THAT RUNNER, NOT THE POOL
-#   IT JOINED FIRST.
+# ⛔ THE FALLBACK-ONLY DECISION ABOVE WAS UNCHANGED BY agent-infra#2327 (which touched only WHICH
+#   LABEL each runner accepts, never WHEN the pool is offered to the queue). It is now REVERSED BY
+#   THE OWNER, in the one place it was always measured — the backlog threshold:
+#
+# **OVERRIDES:** the fallback-only timing rule of #2327 (the pool is offered to the queue ONLY while
+#   GitHub-hosted is UNHEALTHY — an outage or a stalled queue) — the owner ruled on #9878 that a
+#   backlog of >= 10 queued runs IS the signal to offer the pool, and accepted that this buys only a
+#   modest gain in slot availability (the owner's own estimate on #9878 is 5-20%; it is NOT a figure
+#   measured by this repo, so treat it as the ruling's sizing, not as an instrument reading). The rule
+#   change is the THRESHOLD VALUE (`QUEUE_THRESHOLD`, 60 -> 10), never which legs exist:
+#   `queued >= QUEUE_THRESHOLD` is one arm of `evaluate()`'s disjunction and still routes `want=local`.
+#
+#   ⛔ THIS IS A DELIBERATE REVERSAL, NOT AN ACCIDENT OF HISTORY, and the difference is recorded on
+#   #9878 with its revert command. If you are here to "restore the documented behaviour", that is a
+#   REOPEN of #9878 — argue it there against the owner's ruling. Nothing else in the fallback logic
+#   changed: the pool is offered by the SAME legs it always was (the component/incident terms and the
+#   length term on the one disjunction in `evaluate()`, plus the throughput and capacity legs), and
+#   the pool is still SIZED by the converger's own per-box ceiling
+#   (`ceil(ncpu / RUNNER_CORES_PER_SLOT)` — 3 on an 8-core box, 2 on a 4-core box), which this file
+#   does not touch. The owner's "bounded to 2-3 runners, memory floor intact" is exactly that
+#   pre-existing ceiling plus the untouched memory floors (`RUNNER_MEM_FLOOR_MB` in
+#   `ci_runner_pool.sh`, `MEM_RESERVE_MB`/`MEM_PER_RUNNER_MB` in `runner_autoscale.py`).
+#
+#   ⛔ THE RELEASE SIDE MOVED TOO, AND THAT IS NOT FREE. `want=github` is the only path that STRIPS
+#   `ubuntu-latest`, and it now requires `queued < 10` for `CI_GATE_DISENGAGE_TICKS` consecutive
+#   passes. So a sustained >= 10 backlog keeps the pool engaged indefinitely instead of releasing it
+#   at 60 — stated here rather than left to be rediscovered, because it is the mirror of the
+#   engagement change and it changes when local capacity is returned to the box.
+#
+#   ⛔ AND IT DOES NOT MAKE THE QUEUE HEALTHY. A modest gain in slot availability does not drain a
+#   demand problem; the queue is a DEMAND problem (#9878 ruling 3). Do not read a lower threshold as
+#   a queue fix and do not add jobs, shards or a scheduler to this file.
+#
+#   When the pool gained a second architecture the marker became per-runner (`self-hosted-arm64` /
+#   `self-hosted-x64`), because one pool-wide body deleted the x86 marker and the capacity silently
+#   stopped matching jobs. The invariant the label code holds: A RUNNER'S LABELS MUST DESCRIBE THAT
+#   RUNNER, NOT THE POOL IT JOINED FIRST.
 #
 # WHY IT RUNS OUTSIDE ACTIONS
 #   If GitHub Actions itself is degraded, anything scheduled INSIDE Actions is dead
@@ -74,15 +104,28 @@ LOG_FILE="$STATE_DIR/ci-runner-gate.log"
 # diagnostic is not a measurement: stdout is read as data, stderr goes here and is quoted only when the
 # call FAILED.
 GH_ERR="$STATE_DIR/ci-runner-gate.gh.err"
-QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"   # queued runs = GitHub-hosted backlog
+# ⛔ 10, NOT 60 — a DELIBERATE REVERSAL of #2327's fallback-only timing rule, ruled by the owner on
+# #9878 (the `OVERRIDES:` marker in the header block names the default it overrides and the reason).
+# This is the operand of the LENGTH leg. It is NOT the only way the pool gets offered: in `evaluate()`
+# the same disjunction also routes `want=local` on `comp != operational` and `incident != 0`, and the
+# throughput leg and the capacity leg each return 1 to the same end. What the value DOES wholly own is
+# THIS leg's decision — `queued >= QUEUE_THRESHOLD` -> return 1 (unhealthy) -> `want=local` ->
+# `set_labels on` -> the pool advertises `ubuntu-latest` — which is why the correction is a value and
+# not a new branch. It is one trigger among several, so it must not be described as "the switch".
+# Revert (exact): change `:-10` back to `:-60` here, restore `GATE_QUEUE_THRESHOLD = 10` to `= 60` in
+# scripts/orchestrator-harness/runner_autoscale.py (T43 pins the two together and fails on drift), and
+# restore T43's mutation ANCHOR in runner_autoscale.test.py (`GATE_QUEUE_THRESHOLD = 10` / `= 5` back
+# to `= 60` / `= 55`) — the anchor is a literal, so a half-revert makes `--mutations` abort, not report.
+QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"   # queued runs = GitHub-hosted backlog (#9878: was 60)
 # The runs endpoint's maximum page size, and therefore the deepest queue one read can measure. The
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
 # turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
 QUEUE_PAGE=100
 # ── the THROUGHPUT (absorption) leg — agent-infra#2904 ─────────────────────────────────────────
-# ⛔ LENGTH IS NOT ABSORPTION. `queued < 60` says "not a stampede"; it cannot say "work is moving".
-# Measured 2026-10-27, daniel-ospina/tortoise: a run sat QUEUED from 10:26Z to 13:28Z — 3 h — while
-# all three existing legs read healthy (component operational, no incident, queue < 60), and every
+# ⛔ LENGTH IS NOT ABSORPTION. `queued < $QUEUE_THRESHOLD` says "not a stampede"; it cannot say
+# "work is moving". Measured 2026-10-27, daniel-ospina/tortoise: a run sat QUEUED from 10:26Z to
+# 13:28Z — 3 h — while all three existing legs read healthy (component operational, no incident,
+# queue under the then-shipped threshold), and every
 # `runs-on: ubuntu-latest` job in the repo had no runner that could accept it. A CI stop the gate
 # itself certifies as healthy is worse than a red check: nothing pages, nothing reddens.
 #
@@ -629,9 +672,10 @@ print(comp, len(inc))
   # ⛔ THE PAGE CAP CAN HIDE THE OLDEST RUN (review P2 — this used to be asserted in prose only).
   # The runs endpoint is newest-first, so a queue LARGER than the page yields the newest page's min,
   # i.e. a LOWER BOUND on the head age. That was previously claimed to be harmless because "such a
-  # queue is already >= QUEUE_THRESHOLD" — true at the shipped 60, FALSE whenever an operator raises
+  # queue is already >= QUEUE_THRESHOLD" — true whenever the threshold is at or below the page size
+  # (it is 10, so true), FALSE whenever an operator raises
   # QUEUE_THRESHOLD above the page size, and the operator-invisible result was a gate that read a
-  # 150-deep queue as healthy on a 60 s head. The length leg still decides first (it returns 1 on
+  # 150-deep queue as healthy on a head it could not age. The length leg still decides first (it returns 1 on
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
   # that case is now refused by name, before the throughput leg, further down.
   queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE" \
