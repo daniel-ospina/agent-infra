@@ -1463,6 +1463,11 @@ check_graph_client() {
   # FILE is the authority and the running environment only proves the value is readable at all; the
   # probe is the supervisor's own idiom (source it in a throwaway `env -u` subshell), not a second
   # rule. Reporting `ok` on an ambient-only export would certify a box whose every lane reports NO-KEY.
+  #
+  # ⛔ THE FILE PROBE ANSWERS FOR BOTH NAMES, not just the MCP one. A `keys.env` that assigns only
+  # `TORTOISE_API_KEY` is a REAL cell (that is the REST key, and `scripts/tortoise-memory.mjs` needs
+  # it), and a probe that only looked for the MCP name reported "neither key is set" for a box whose
+  # client would happily take the fallback — a false statement on the one line the operator reads.
   local in_file="unknown"
   if [ -r "$ENV_FILE" ]; then
     # The `&& printf x` sentinel is the supervisor idiom's whole point: the exit STATUS alone cannot
@@ -1475,14 +1480,13 @@ check_graph_client() {
     # ABSENT. That is a false warn that sends an operator to re-add a line already there, and it is the
     # `printf | grep -q` shape this very file bans elsewhere (#841/#864). The supervisor compares a
     # CAPTURED value for exactly this reason; so does this.
-    if [ "$(env -u TORTOISE_MCP_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${TORTOISE_MCP_API_KEY:-}" ] && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ]; then
-      in_file="set"
-    else
-      in_file="unset"
-    fi
+    in_file="$(env -u TORTOISE_MCP_API_KEY -u TORTOISE_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; if [ -n "${TORTOISE_MCP_API_KEY:-}" ]; then printf mcp; elif [ -n "${TORTOISE_API_KEY:-}" ]; then printf rest; fi' _ "$ENV_FILE" 2>/dev/null)"
+    case "$in_file" in mcp|rest) ;; *) in_file="unset" ;; esac
   fi
-  if [ "$in_file" = "set" ]; then
+  if [ "$in_file" = "mcp" ]; then
     ok "graph credential: TORTOISE_MCP_API_KEY is set in $ENV_FILE (the file every lane re-sources; value not printed)"
+  elif [ "$in_file" = "rest" ]; then
+    warn "graph credential UNCERTAIN: $ENV_FILE sets only TORTOISE_API_KEY. That is the REST key (tt_…, /v1/points — scripts/tortoise-memory.mjs), and the graph client speaks JSON-RPC to /mcp/, so the client will take that fallback and the endpoint may REJECT it. FIX: add TORTOISE_MCP_API_KEY to $ENV_FILE (hand-provisioned, from the Tortoise dashboard) and re-run; a lane reports GRAPH-UNREACHABLE rather than silently skipping the read or the write"
   elif [ -n "${TORTOISE_MCP_API_KEY:-}" ]; then
     warn "graph credential NOT REACHING LANES: TORTOISE_MCP_API_KEY is in this bring-up shell but NOT in $ENV_FILE, and a lane's environment comes from that file (the controller re-sources it; an ambient export does not follow). FIX: add the line to $ENV_FILE and re-run — until then every lane reports GRAPH-UNREACHABLE(NO-KEY)"
   elif [ -n "${TORTOISE_API_KEY:-}" ]; then
