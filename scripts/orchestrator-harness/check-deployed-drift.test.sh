@@ -571,7 +571,10 @@ ck "10a-3b: 'grep -i env <abs>' does NOT fabricate a controller" \
 for _adv in "env cat" "env vim" "env grep -n foo" "cat" "vim" \
             "timeout 300 grep -n sh" "nice -n 5 grep -n sh" "sudo -u deploy grep -n sh" \
             "stdbuf -o0 grep -n sh" "nohup grep -n sh" "env FOO=bar cat" \
-            "timeout 300 bash -x other.sh"; do
+            "timeout 300 bash -x other.sh" \
+            "sudo -n grep -n sh" "sudo -E grep -rn bash" "sudo -H grep -n sh" \
+            "env -i grep -n sh" "env -v grep -n /bin/sh" "nice -5 grep -n sh" \
+            "command -v grep -n sh" "timeout 300 -- grep -n sh" "sudo -- grep -n sh"; do
   printf '4259 %s %s/orch-loop.sh\n' "$_adv" "$GONE" > "$TMP/ps-adv"
   surf "$TMP/ps-adv"
   ck "10a-3b2: '$_adv <abs>/orch-loop.sh' is a MENTION, not a controller" \
@@ -580,7 +583,8 @@ done
 # (10a-3c) THE PREFIX MUST SURVIVE A WRAPPER'S OPERANDS (review round 12). The fix for 10a-3b must not
 # cost these: they are measured launcher shapes and each is a REAL invocation.
 for _w in 'nice -n 5 /bin/bash' 'timeout 300 bash' 'sudo -u deploy bash' 'stdbuf -o0 bash' 'env bash' \
-          'stdbuf -o L bash' 'sudo -E -u deploy bash' 'env FOO=bar bash' 'bash -lc'; do
+          'stdbuf -o L bash' 'sudo -E -u deploy bash' 'env FOO=bar bash' 'bash -lc' \
+          'sudo --user deploy bash' 'timeout --signal KILL 300 bash'; do
   printf '4258 %s %s/orch-loop.sh\n' "$_w" "$GONE" > "$TMP/ps-wrap"
   surf "$TMP/ps-wrap"
   ck "10a-3c: '$_w <abs>/orch-loop.sh' is still an INVOCATION" \

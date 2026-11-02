@@ -755,10 +755,13 @@ if [ "$SURFACE" -eq 1 ]; then
       _pfx=1; _seen=0; _optval=0
       while [ "$_i" -lt "$_n" ]; do
         _w="${_argv[$_i]}"
-        # ⛔ ARM ONLY ON A REAL INTERPRETER, IN COMMAND POSITION. `env` is deliberately NOT here.
+        # ⛔ ARM ONLY ON A REAL INTERPRETER, IN COMMAND POSITION, AND NOT WHILE SWALLOWING AN OPTION'S
+        # VALUE (review round 14, findings 1-2). The `_optval` guard is load-bearing: without it,
+        # `sudo -n grep -n sh <abs>` armed on the grep PATTERN `sh` — the word was ABOUT to be consumed
+        # as `-n`'s value, but arming runs first and did not know that.
         case "${_w##*/}" in
           bash|sh|dash|zsh|ksh|ash|mksh|busybox)
-            if [ "$_pfx" -eq 1 ]; then _interp=1; _seen=1; fi ;;
+            if [ "$_pfx" -eq 1 ] && [ "$_optval" -eq 0 ]; then _interp=1; _seen=1; fi ;;
         esac
         case "$_w" in
           # ⛔ AN ABSOLUTE PATH IS UNAMBIGUOUS; A BARE OR RELATIVE WORD IS NOT (review P1, #10114).
@@ -846,7 +849,28 @@ if [ "$SURFACE" -eq 1 ]; then
               # command is still unknown — once the command is a shell, its options are flags and the
               # next ordinary word is its SCRIPT operand (`bash -x other.sh <abs>` must stay a
               # mention, not become an invocation).
-              if [ "$_seen" -eq 0 ] && [ "${#_w}" -eq 2 ]; then _optval=1; else _optval=0; fi ;;
+              # ⛔ WHICH OPTIONS TAKE A VALUE IS A TABLE, NOT A LENGTH TEST (review round 14). The
+              # length test (`${#_w} -eq 2`) treated every two-character option as value-taking — but
+              # `-n`, `-E`, `-H`, `-i`, `-v` are FLAGS — so the option ate the COMMAND word instead:
+              # `sudo -n grep -n sh <abs>` kept the prefix open through `grep`, and the later `sh` armed
+              # the latch and nominated the path. Nine measured forms did this, `sudo -n`, `sudo -E`,
+              # `sudo -H`, `env -i`, `env -v`, `nice -5`, `command -v`, `timeout 300 --`, `sudo --`.
+              # ⛔ AND THE DEFAULT FOR AN UNRECOGNISED OPTION IS "CLAIMS NOTHING", which is the SAFE
+              # direction: a missed operand costs a MENTION (declared residual below), while a wrong
+              # claim costs a FABRICATED `executes:` — a red on a healthy box. Long options that carry
+              # their value in the same word (`--opt=value`) claim nothing, and `--` claims nothing.
+              if [ "$_seen" -eq 1 ]; then _optval=0; else
+                case "$_w" in
+                  --) _optval=0 ;;
+                  --*=*) _optval=0 ;;
+                  --user|--group|--prompt|--chdir|--chroot|--host|--role|--type|--other-user) _optval=1 ;;
+                  --command-timeout|--signal|--kill-after|--input|--output|--error) _optval=1 ;;
+                  --unset|--adjustment|--split-string) _optval=1 ;;
+                  --*) _optval=0 ;;
+                  -u|-g|-p|-C|-D|-h|-r|-t|-U|-T|-R|-n|-s|-k|-o|-e|-a|-S) _optval=1 ;;
+                  *) _optval=0 ;;
+                esac
+              fi ;;
           *) if [ "$_optval" -eq 1 ]; then
                _optval=0                      # this word is the OPTION's value (e.g. `sudo -u <user>`)
              else
