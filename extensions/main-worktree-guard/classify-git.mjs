@@ -6534,9 +6534,10 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
           `   Sanctioned recovery ops only: git checkout main|master, git pull`,
           `   --ff-only, git fetch, git status, git log, git worktree`,
-          `   add|list|prune, git push origin <checked-out-branch> (WIP), marker touch.`,
-          `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-          `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+          `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
+          `   git restore <path> / git checkout -- <path> under an active escape`,
+          `   hatch, marker touch.`,
+          ..._m4RecoveryLines(hubContext),
         ].join("\n"),
       };
     }

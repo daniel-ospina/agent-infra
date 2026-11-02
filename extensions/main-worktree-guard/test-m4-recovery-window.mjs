@@ -48,7 +48,7 @@ import { join } from "node:path";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const CG = join(HERE, "classify-git.mjs");
-const { evaluateHubGate, isHubRecoveryInvocation } = await import(pathToFileURL(CG).href);
+const { evaluateHubGate, isHubRecoveryInvocation, evaluateHubGateWithTargets } = await import(pathToFileURL(CG).href);
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -146,6 +146,20 @@ check("E4 dirty block states the branch switch cannot clear dirt",
   /cannot/.test(dirtyMsg), true);
 check("E5 dirty block still names the checkout (#1125)",
   /Checkout: \/repo\/hub/.test(dirtyMsg), true);
+// E5b/E5c — the PRODUCTION surface (review round 3, P1). `evaluateHubGate` has no
+// production caller; every real session leaves through
+// `evaluateHubGateWithTargets`, whose own block site was left prescribing the
+// no-op while E1–E5 asserted the other function. Assert BOTH.
+// The cwd is the SYNTHETIC hub path, not process.cwd(): when the suite runs
+// inside a linked worktree, `process.cwd()` makes the invocation resolve to a
+// worktree target and take the #347 exemption (ALLOWED, no reason at all), which
+// would make this case assert nothing.
+const prodReason = (cmd, ctx) => evaluateHubGateWithTargets(cmd, "main", ctx.path, null, ctx).reason ?? "";
+const prodDirtyMsg = prodReason("git commit -am x", DIRTY);
+check("E5b production (evaluateHubGateWithTargets) dirty block does NOT prescribe the no-op",
+  /Terminal recovery: cd <repo> && git checkout main/.test(prodDirtyMsg), false);
+check("E5c production dirty block names the restore route + both hatches",
+  /git restore <path>/.test(prodDirtyMsg) && /\.allow-main-edits/.test(prodDirtyMsg), true);
 // The branch route survives where it is TRUE (off-main, clean-ish tree).
 const offMainMsg = reason("git commit -am x", { hubContext: OFFMAIN });
 check("E6 off-main block keeps the branch recovery route",
@@ -292,6 +306,19 @@ async function partB() {
     // (the mirror defect: the allowlist refused `git restore -SW <path>`).
     const b6z = await drive("git restore -SW wip.txt");
     check("B6z marker ⇒ bundled `-SW` restore PERMITTED (no re-created dead end)", b6z, null);
+    // B6n / B6t — round 3, both P1/P2 measured fail-opens.
+    const b6n = await drive("git checkout -- wip.txt\nbash w.txt");
+    check("B6n marker ⇒ NEWLINE compound still BLOCKED (a newline is a separator)", b6n !== null, true);
+    // A second, INDEPENDENT dirty checkout: the window is the session's hub, so a
+    // repo-selecting flag aimed elsewhere must fall back to M5.
+    const other = join(tmp, "other");
+    git(tmp, `git init -q -b main "${other}"`);
+    git(other, "git config user.email t@t && git config user.name t");
+    writeFileSync(join(other, "tracked.txt"), "committed\n");
+    git(other, "git add -A && git commit -qm init");
+    writeFileSync(join(other, "tracked.txt"), "sibling-session-uncommitted-work\n");
+    const b6t = await drive(`git -C "${other}" checkout -- tracked.txt`);
+    check("B6t marker ⇒ restore aimed at ANOTHER dirty checkout still BLOCKED", b6t !== null, true);
   } catch (e) {
     check("B: part B ran without throwing", String(e?.message ?? e).slice(0, 200), "");
   } finally {

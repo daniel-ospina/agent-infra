@@ -2806,9 +2806,22 @@ function _wtExpandedScriptShape(text: string, depth = 0): _WtExpandedHit | null 
  * git show HEAD:"$x" > "$x"` was ALLOWED, re-opening #1060/D8). */
 function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean {
   if (!hatchActive || !classifierLoaded) return false;
-  // A compound command is never in the window: no `;`, `&&`, `||`, pipe,
-  // redirect, substitution or subshell. One restore, nothing else.
-  if (/[;&|<>`$()]/.test(command)) return false;
+  // A compound command is never in the window. NEWLINE is in the class
+  // deliberately (review round 3, P1 — measured): the first cut listed `;` but
+  // not `\n`, which is the shell's most common separator and a boundary
+  // `allGitInvocations` itself splits on, so
+  //   `git checkout -- wip.txt` NL `bash w.txt`   (w.txt = `git checkout -- .`)
+  // was ALLOWED and wiped a sibling session's uncommitted work — a way to run a
+  // script body the #1484 script backdoor refuses to run in command position.
+  if (/[;&|<>`$()\n\r]/.test(command)) return false;
+  // The window is the SESSION's disordered hub, so the invocation's TARGET must
+  // be that hub too (review round 3, P2 — measured): `git -C <dirty checkout B>
+  // checkout -- p` from a dirty hub A was ALLOWED, exempting M5 for a discard
+  // aimed at a checkout that is NOT the hub (origin/main blocked it). A
+  // repo-SELECTING flag can point the restore anywhere, so it is refused
+  // outright — fail closed to M5; the plain form, run from the hub, is the
+  // window and is what the message tells the reader to use.
+  if (/(^|\s)(-C|--git-dir|--work-tree|--prefix)(\s|=)/.test(command)) return false;
   const st = _hubState();
   if (!st.disorder) return false; // the window exists only for a DISORDERED hub
   try {
