@@ -735,25 +735,30 @@ if [ "$SURFACE" -eq 1 ]; then
       fi
       if [ "${#_argv[@]}" -eq 0 ]; then read -r -a _argv <<< "$_flat"; fi   # flattened fallback (space path lost)
       _script=""; _interp=0; _text=0; _i=0; _n=${#_argv[@]}
-      # ⛔ `_pfx` IS THE COMMAND PREFIX (review round 12, P1). `_interp` used to be ARMED at the top of
-      # the loop by ANY word spelled like a shell, at any position — so a word that is merely a grep
-      # PATTERN nominated the next absolute path as the executing script. Measured on this head:
-      # `grep -n sh <pin>/…/orch-loop.sh`, `grep -n bash …`, `grep -n env …`, `grep -i sh …` all
-      # produced `DRIFT(exec): … executes <pin>/…` on a box running no controller, i.e. the pass took
-      # the `executes:` arm, exited 1 on a HEALTHY box and wrote a false `drift=drift:executes:…` that
-      # fleet-health alarms on — the exact class this whole change exists to close, and now made worse
-      # because the token is durable and red. Arming is therefore limited to the command prefix.
-      # ⛔ THE PREFIX IS NOT "argv[0] OR ALREADY ARMED" (which would be the obvious wrong fix): that
-      # loses `nice -n 5 /bin/bash <path>` — a measured shape (`tools/fleet/outcome_canary.test.py`) —
-      # because `5` is an ordinary word. So a wrapper word opens N argument SLOTS that keep the prefix
-      # alive (`nice`, `sudo -u <user>`, `timeout 300`, `stdbuf -o0`), and only running out of slots
-      # ends it.
-      _pfx=1; _warg=0
+      # ⛔ THREE FLAGS, NOT ONE (review round 13 — this closes TWO holes round 12 left open, both
+      # MEASURED). `_interp` only means "an interpreter was reached through the command prefix".
+      #   `_pfx`   — the command prefix is still alive (nothing has told us the command yet, or we are
+      #              inside that command's own options).
+      #   `_seen`  — the COMMAND has been identified (a shell name, or something that is not one).
+      #   `_optval`— the previous word was a bare short option that takes a VALUE (`-u <user>`, `-n 5`).
+      # ⛔ ROUND 12 GOT THIS WRONG IN TWO WAYS, both fabricating `executes:` on a healthy box:
+      #   (a) `env` was in the ARMING list. `env` is a WRAPPER, not an interpreter, so `env cat <abs>`
+      #       armed the latch with no shell word at all and nominated the path.
+      #   (b) the slot counter (`_warg += 2`) was consumed by the CHILD COMMAND and its arguments, not
+      #       just the wrapper's operands — so `timeout 300 grep -n sh <abs>`, `nice -n 5 grep -n sh
+      #       <abs>`, `sudo -u deploy grep -n sh <abs>`, `stdbuf -o0 …` and `nohup …` all armed on the
+      #       grep PATTERN `sh` and fabricated a controller. `timeout 300 grep -n sh <pin>/…/orch-loop.sh`
+      #       is literally the recon command an agent runs over the deployed tree.
+      # The model that holds is positional, not counted: skip wrapper words, their options and those
+      # options' VALUES, then the FIRST remaining word is the COMMAND. If the command is not a shell,
+      # the prefix is closed for good — nothing later can arm it.
+      _pfx=1; _seen=0; _optval=0
       while [ "$_i" -lt "$_n" ]; do
         _w="${_argv[$_i]}"
-        # ⛔ ARMED ONLY WHILE THE PREFIX IS ALIVE — see above.
+        # ⛔ ARM ONLY ON A REAL INTERPRETER, IN COMMAND POSITION. `env` is deliberately NOT here.
         case "${_w##*/}" in
-          bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) [ "$_pfx" -eq 1 ] && _interp=1 ;;
+          bash|sh|dash|zsh|ksh|ash|mksh|busybox)
+            if [ "$_pfx" -eq 1 ]; then _interp=1; _seen=1; fi ;;
         esac
         case "$_w" in
           # ⛔ AN ABSOLUTE PATH IS UNAMBIGUOUS; A BARE OR RELATIVE WORD IS NOT (review P1, #10114).
@@ -829,17 +834,34 @@ if [ "$SURFACE" -eq 1 ]; then
         # ⛔ A WRAPPER OPENS ARGUMENT SLOTS (review round 12). `nice -n 5 /bin/bash <path>`,
         # `sudo -u <user> bash <path>`, `timeout 300 bash <path>` and `stdbuf -o0 bash <path>` are all
         # real launchers; the words between the wrapper and the interpreter are its OPERANDS, not the
-        # command, so they must not end the prefix. A pure-number word is an operand too and is kept
-        # for the same reason.
+        # command, so they must not end the prefix.
+        # ⛔ POSITIONAL RULE (review round 13): an OPTION keeps the prefix; a bare short option also
+        # claims the NEXT word as its value; a number or a `K=V` assignment is an operand; a WRAPPER is
+        # skipped and the command is still to come; a SHELL becomes the command; and any OTHER word is
+        # the command — so if it is not a shell, the prefix dies here and nothing later can arm it.
+        # ⛔ A COMBINED OPTION CARRIES ITS OWN VALUE (`-o0`, `-n5`), so it claims nothing — otherwise
+        # `stdbuf -o0 bash <path>` would eat `bash` as `-o0`'s value and lose a real launcher.
         case "$_w" in
-          -*) : ;;
-          *) case "${_w##*/}" in
-               bash|sh|dash|zsh|ksh|ash|mksh|busybox) : ;;
-               env|nice|sudo|timeout|stdbuf|command|exec|nohup|setsid|doas) _warg=$((_warg + 2)) ;;
-               *) case "$_w" in
-                    *[!0-9]*) if [ "$_warg" -gt 0 ]; then _warg=$((_warg - 1)); else _pfx=0; _interp=0; fi ;;
-                  esac ;;
-             esac ;;
+          -*) # An OPTION never closes the prefix. It claims the NEXT word as its value ONLY while the
+              # command is still unknown — once the command is a shell, its options are flags and the
+              # next ordinary word is its SCRIPT operand (`bash -x other.sh <abs>` must stay a
+              # mention, not become an invocation).
+              if [ "$_seen" -eq 0 ] && [ "${#_w}" -eq 2 ]; then _optval=1; else _optval=0; fi ;;
+          *) if [ "$_optval" -eq 1 ]; then
+               _optval=0                      # this word is the OPTION's value (e.g. `sudo -u <user>`)
+             else
+               case "${_w##*/}" in
+                 bash|sh|dash|zsh|ksh|ash|mksh|busybox) _seen=1 ;;
+                 env|nice|sudo|timeout|stdbuf|command|exec|nohup|setsid|doas)
+                     # a wrapper while the command is still unknown is part of the prefix; seen AFTER a
+                     # command, it is an argument and the prefix ends
+                     if [ "$_seen" -eq 1 ]; then _pfx=0; _interp=0; fi ;;
+                 *) case "$_w" in
+                      *=*) : ;;                       # an env assignment is an operand, not the command
+                      *[!0-9]*) _pfx=0; _interp=0 ;;   # the COMMAND (or the script operand): closed
+                    esac ;;
+               esac
+             fi ;;
         esac
         _i=$((_i + 1))
       done

@@ -964,6 +964,11 @@ if [ "$PASS_MODE" = pin ]; then
         # pin mode unless the test happened to hand it a stub (measured in review).
         if [ ! -f "$MATERIALISER" ]; then
             REC_ACTION=unmaterialisable
+            # ⛔ `remedy=` CARRIES THE ONLY ACTIONABLE TOKEN (review round 13, finding 2). This
+            # message is 208 chars and `finish` appends a 142-char readings suffix, so the
+            # `(set HARNESS_MATERIALISER)` hint sat past the 240 cut and was DISCARDED — shipping a red
+            # rc=25 the operator could not act on, which is exactly what this field exists to prevent.
+            REC_REMEDY="set HARNESS_MATERIALISER to this box's materialiser (cloud-cell-supervisor.sh), then re-run"
             finish 0 25 "this box has no materialiser at $MATERIALISER, so the pin cannot be advanced to $(short "$REF_SHA") (set HARNESS_MATERIALISER)"
         fi
         BEFORE_PIN_TREE="$PIN_TREE_SHA"
@@ -1138,6 +1143,7 @@ case "$REC_ACTION" in
             # ("the pin already names $REF") contradicted the record's own `pin=` field.
             if [ "$REC_PIN" != "$REC_REF" ]; then
                 REC_ACTION=pin-lies
+                REC_REMEDY="materialise the pin tree named by HARNESS-PIN (apply --pin-only), then re-run; nothing on this box can repair a lying pin record without one"
                 finish 0 25 "the sha record names $REC_PIN but no pin tree resolves, so it cannot be compared with what this box RUNS ($REC_DEPLOYED) — the pin is still lying; nothing here can repair it without a materialised tree"
             fi
             finish 1 0 "current: no pin tree is materialised and the checkout already matches $REF — nothing changed"

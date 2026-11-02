@@ -561,9 +561,26 @@ printf '4257 grep -i env %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-pat-opt"
 surf "$TMP/ps-pat-opt"
 ck "10a-3b: 'grep -i env <abs>' does NOT fabricate a controller" \
    "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+# (10a-3b2) THE MENTION CLASS BEHIND A WRAPPER (review round 13, P1 — round 12's fix was MEASURED to
+# still fabricate here). Round 12 only pinned `grep` in argv[0] position, so two holes stayed open:
+# `env` was in the ARMING list (it is a WRAPPER, not an interpreter), and the wrapper's operand slots
+# were consumed by the CHILD COMMAND and its arguments rather than by the wrapper's own operands. Both
+# nominated `<GONE>/orch-loop.sh` as the executing tree on a box running no controller — and
+# `timeout 300 grep -n sh <pin>/…/orch-loop.sh` is literally the recon command an agent runs over a
+# deployed tree. Each form below is now a MENTION.
+for _adv in "env cat" "env vim" "env grep -n foo" "cat" "vim" \
+            "timeout 300 grep -n sh" "nice -n 5 grep -n sh" "sudo -u deploy grep -n sh" \
+            "stdbuf -o0 grep -n sh" "nohup grep -n sh" "env FOO=bar cat" \
+            "timeout 300 bash -x other.sh"; do
+  printf '4259 %s %s/orch-loop.sh\n' "$_adv" "$GONE" > "$TMP/ps-adv"
+  surf "$TMP/ps-adv"
+  ck "10a-3b2: '$_adv <abs>/orch-loop.sh' is a MENTION, not a controller" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
 # (10a-3c) THE PREFIX MUST SURVIVE A WRAPPER'S OPERANDS (review round 12). The fix for 10a-3b must not
 # cost these: they are measured launcher shapes and each is a REAL invocation.
-for _w in 'nice -n 5 /bin/bash' 'timeout 300 bash' 'sudo -u deploy bash' 'stdbuf -o0 bash' 'env bash'; do
+for _w in 'nice -n 5 /bin/bash' 'timeout 300 bash' 'sudo -u deploy bash' 'stdbuf -o0 bash' 'env bash' \
+          'stdbuf -o L bash' 'sudo -E -u deploy bash' 'env FOO=bar bash' 'bash -lc'; do
   printf '4258 %s %s/orch-loop.sh\n' "$_w" "$GONE" > "$TMP/ps-wrap"
   surf "$TMP/ps-wrap"
   ck "10a-3c: '$_w <abs>/orch-loop.sh' is still an INVOCATION" \
