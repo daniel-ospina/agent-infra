@@ -15,7 +15,8 @@
 #   pool so the same workflows can land locally instead of queueing forever.
 #
 # ⛔ THE FALLBACK-ONLY DECISION ABOVE IS AMENDED ON ITS TIMING LEG — deliberately, by owner ruling
-#   (agent-infra#9878, 2026-11-02), and NOT by an accident of tidying. #2327 left `WHEN` untouched and
+#   (daniel-ospina/tortoise#9878 — the issue that OWNS the fallback-only decision — 2026-11-02), and
+#   NOT by an accident of tidying. #2327 left `WHEN` untouched and
 #   constrained only `WHICH LABEL`; the ruling below moves WHEN, so it is recorded as an override
 #   rather than absorbed silently:
 #     OVERRIDES: the fallback-only timing rule (#2327 / this header) — the pool is offered only while
@@ -82,7 +83,7 @@ LOG_FILE="$STATE_DIR/ci-runner-gate.log"
 # diagnostic is not a measurement: stdout is read as data, stderr goes here and is quoted only when the
 # call FAILED.
 GH_ERR="$STATE_DIR/ci-runner-gate.gh.err"
-# queued runs = GitHub-hosted backlog. 60 -> 10: OWNER RULING, 2026-11-02 (agent-infra#9878).
+# queued runs = GitHub-hosted backlog. 60 -> 10: OWNER RULING, 2026-11-02 (daniel-ospina/tortoise#9878).
 # The number is a TRIGGER, not a target. At the shipped 60 the pool stayed shut through a 46-run
 # queue whose head had waited 6,355 s (measured 2026-11-02T03:57Z), and the repo's own 21-sample
 # reading shows the queue head at 3,943-12,583 s old WHILE hosted served 2..14 runs — so a depth
@@ -179,7 +180,7 @@ FALLBACK_LABEL="ubuntu-latest"
 # is greppable instead of implied. The reading that justifies RAISING it is the containment pair
 # measured ON THE ARMED BOX WHILE IT WORKS — (a) its 1-minute load average below its core count, (b)
 # the FalkorDB restart count flat — the 2026-10-12 incident moved both together. Raise it only with
-# those two readings attached to agent-infra#9878; drop it if either regresses. A value of 0 (or any
+# those two readings attached to daniel-ospina/tortoise#9878; drop it if either regresses. A value of 0 (or any
 # cap that resolves to no runner on a non-empty pool) means the fallback is DISARMED: the pool is
 # released and the engaging pass refuses, rather than reporting a successful engage carrying nothing.
 FALLBACK_ARM_MAX="${CI_GATE_FALLBACK_ARM_MAX:-3}"
