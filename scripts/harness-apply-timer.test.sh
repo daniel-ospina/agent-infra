@@ -404,6 +404,12 @@ assert_eq "$RC" "1" "T24 a live controller on a GONE tree fails an otherwise-suc
 assert_contains "$OUT" "deployed-drift" "T24 and the refusal is NAMED, not a silent green"
 assert_contains "$OUT" "executes:/gone" "T24 and it names the tree that is actually executing"
 assert_contains "$(cat "$T/t20/state/harness-apply.status" 2>/dev/null)" "action=deployed-drift" "T24 and the durable record says what happened, not the log alone"
+# ⛔ THE REFUSAL TEXT ITSELF (review round 6, P1). A pair of BACKTICKS inside this double-quoted
+# assignment was executed as command substitution when the arm fired: the incident line printed
+# `<script>: line 644: executes:: command not found` and the sentence silently lost its token
+# ("and an  state always has a live controller"). Control flow was unaffected, so nothing caught it.
+# This asserts the prose survives intact, which is the only way that class is observable.
+assert_contains "$OUT" "an executes: state always has a live controller" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
 OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t20/drift-behind.sh" run_pass "$T/t20" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 a copy at rest that is merely BEHIND does NOT red the pass"
 assert_contains "$OUT" "deployed_drift=drift" "T24 and it is still REPORTED, so it is not silent either"

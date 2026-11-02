@@ -641,7 +641,7 @@ finish() { # <ok> <rc> <verdict-phrase>
         case "$DRIFT_TOKEN" in
             executes:*)
                 REC_ACTION=deployed-drift
-                REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory that cannot be matched to this repo (gone, or present with no readable *.sh) (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: cloud-cell-supervisor.sh apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an `executes:` state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it). Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
+                REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory that cannot be matched to this repo (gone, or present with no readable *.sh) (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: cloud-cell-supervisor.sh apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an executes: state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it). Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
                 write_record 0 1 || exit 23
                 err "$REC_DETAIL"
                 exit 1 ;;

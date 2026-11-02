@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode, currentBranch } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode, currentBranch, pinMismatchLines } from "./auto-sync.js";
 import { repoKey } from "./shared/branch-ownership.mjs";
 
 // ⛔ `sync.sh` is resolved from the CHECKOUT, never from the working directory
@@ -940,6 +940,54 @@ async function main() {
     git(p, "push -q origin main");
     git(repo, "fetch -q origin");
     equal(behindCount(repo), 3, "three pushed commits must read as 3 behind");
+  });
+
+  // A repo with a committed HEAD, built the way the rest of this suite builds one:
+  // a bare origin plus a clone that carries one commit.
+  function seededRepo(): string {
+    const origin = makeBareOrigin();
+    const r = makeClone(origin);
+    commit(r, "seed");
+    return r;
+  }
+
+  // ── #10114: the pin correction is QUIET unless it is true ────────────────
+  // The value of the correction is that it is rare. If it fires when the checkout already IS
+  // the pin — or when the pin file is absent, empty or not a sha — it becomes noise on every
+  // session start of every box, and an operator learns to skip it. That is how the silent
+  // failure this lane fixes survived, so each of those cases is asserted here.
+  await test("pinMismatchLines is SILENT when the checkout already is the pin", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const repo = seededRepo();
+    const head = git(repo, "rev-parse HEAD").trim();
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"), `${head}\n`);
+    equal(pinMismatchLines(repo, home).length, 0, "checkout == pin must produce no correction");
+  });
+
+  await test("pinMismatchLines NAMES the pin when the checkout is not it", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const repo = seededRepo();
+    writeFileSync(join(home, ".pi", "agent", "state", "HARNESS-PIN"),
+      "0123456789abcdef0123456789abcdef01234567\n");
+    const lines = pinMismatchLines(repo, home);
+    equal(lines.length, 2, "a genuine mismatch names the trap and the remedy");
+    ok(lines[1].includes("--force --pin-only"),
+      "the remedy must carry --force: apply REFUSES a live cell without it, and a pin box has a live controller");
+  });
+
+  await test("pinMismatchLines is SILENT on an absent, empty or non-sha pin record", () => {
+    const home = mkdtempSync(join(tmpdir(), "auto-sync-pin-"));
+    const repo = seededRepo();
+    equal(pinMismatchLines(repo, home).length, 0, "an ABSENT pin record must not invent a pin claim");
+    mkdirSync(join(home, ".pi", "agent", "state"), { recursive: true });
+    const pinFile = join(home, ".pi", "agent", "state", "HARNESS-PIN");
+    writeFileSync(pinFile, "");
+    equal(pinMismatchLines(repo, home).length, 0, "an EMPTY pin record is unknown, not a mismatch");
+    writeFileSync(pinFile, "not-a-sha\n");
+    equal(pinMismatchLines(repo, home).length, 0, "a non-sha pin record is unknown, not a mismatch");
+    equal(pinMismatchLines(repo, "").length, 0, "no HOME means no pin claim either");
   });
 
   // ── Summary ──────────────────────────────────────────────────────────────

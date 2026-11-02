@@ -64,7 +64,7 @@ export function pinMismatchLines(repo: string, home: string = process.env.HOME ?
   if (pin.startsWith(head) || head.startsWith(pin)) return [];
   return [
     `[auto-sync]    ⛔ this checkout is at ${head} but the PIN is ${pin} — ./sync.sh advances THIS tree, not the harness the box EXECUTES.`,
-    `[auto-sync]    To advance the deployed harness: scripts/harness-apply-pass.sh (or cloud-cell-supervisor.sh apply --pin-only), then restart the controller from the pinned tree.`,
+    `[auto-sync]    To advance the deployed harness: scripts/harness-apply-pass.sh (or cloud-cell-supervisor.sh apply --force --pin-only), then restart the controller from the pinned tree.`,
   ];
 }
 
