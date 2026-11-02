@@ -20,11 +20,20 @@
 # (`--min-age`, default 3600 s). The IN-ENTRY witness is the checkout's OWN writes — the outputs, build
 # artefacts, `.venv`/`node_modules` and any file a step creates under the checkout — so "nothing under
 # this entry has been written for N seconds" is a positive fact about a dead entry. ⛔ `_work/_temp`
-# (the step scripts and the command logs) is a SIBLING of `_work/<repo>`, not a child of it — the vendor
-# creates `_temp`/`_tool`/`_actions`/`_work` at the runner root (`actions/runner`
-# `src/Runner.Common/Constants.cs` `WellKnownDirectory`, and the checkout is
-# `Path.Combine(_workDirectory, trackingConfig.PipelineDirectory)` in `JobExecution`), so a write there
-# does NOT refresh the checkout's floor and it is NOT an in-entry witness. The comparison set is everything under the
+# (the step scripts and the command logs) is a SIBLING OF THE CHECKOUT **INSIDE THE ROOT THIS SWEEPS**,
+# not a child of it — the vendor resolves every runner-private directory as `Combine(Work, <name>)`
+# (`actions/runner` `src/Runner.Common/HostContext.cs` `GetDirectory`: `case WellKnownDirectory.Temp`,
+# `.Actions` and `.Tools` each `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)`, over
+# `Constants.Path.{Temp,Actions,Tool}Directory` = `_temp`/`_actions`/`_tool`; the checkout is
+# `Path.Combine(_workDirectory, trackingConfig.PipelineDirectory)` in `JobExecution`) — so a write there
+# does NOT refresh the checkout's floor and it is NOT an in-entry witness. ⛔ AND THAT IS EXACTLY WHY IT
+# IS NOT SAFE ON ITS OWN: "not a child of the checkout" is the SAME sentence as "an entry of `_work`",
+# and `sweep_root` walks every entry of `_work`. While this header said "at the runner root" the
+# directory was invisible here, and the measured result was a `REAP` row for `_work/_temp` — a LIVE
+# job's `$RUNNER_TEMP`: `ScriptHandler.cs` writes each step's script there once per step, so a job whose
+# CURRENT step outruns the floor has a FRESH checkout and a STALE `_temp`. The checkout gate works
+# perfectly and the temp dir still dies. The origin claim is corrected here because a wrong origin is
+# what made the directory undecidable; `WORK_LAYOUT` below is where it is decided. The comparison set is everything under the
 # entry INCLUDING the entry's own top directory (a `find -newer` walk naturally covers it), which is
 # the CONSERVATIVE direction: a stray `touch`/`cp` over a dead entry's top dir restores its floor
 # rather than leaving it removable. What the gate deliberately does NOT use is the top directory's
@@ -49,13 +58,16 @@
 # step after checkout), not merely "one long quiet step". If a box runs such jobs, raise the floor —
 # that is the intended response, not a busy-check.
 #
-# ⛔ DELIBERATELY RETAINED: `_work/_tool` AND `_work/_actions`. They are the runner's CROSS-JOB caches —
-# every downloaded action (`_actions`) and every toolchain it fetched (`_tool`) — so removing them does
-# not free dead checkout, it forces a re-download on the NEXT job and makes every subsequent CI run
-# slower. That is a different trade from the one this class is for, and it is not this class's to make.
-# They are excluded from the candidate set BEFORE anything is measured, and the exclusion is counted
-# (`retained=<n>`) so "why is this directory still here" has an answer on the class line. A test proves
-# they survive even when they are the oldest thing in the tree.
+# ⛔ DELIBERATELY RETAINED: THE WHOLE OF THE RUNNER'S `_work` NAMESPACE, DERIVED from the vendor layout
+# in ONE table (`WORK_LAYOUT`, below). `_temp` is the LIVE job's `$RUNNER_TEMP`; `_actions`/`_tool` are
+# the runner's CROSS-JOB caches — every downloaded action and every toolchain it fetched — so removing
+# those does not free dead checkout, it forces a re-download on the NEXT job and makes every subsequent
+# CI run slower; `_update` is its self-update staging. Each is a different trade from the one this class
+# is for, and none is this class's to make. They are excluded from the candidate set BEFORE anything is
+# measured, and the exclusion is counted (`retained=<n>`) so "why is this directory still here" has an
+# answer on the class line. A test proves they survive even when they are the oldest thing in the tree,
+# and another proves a live checkout's `_temp` — stale, because a step script is written once per step —
+# survives while that checkout is correctly KEPT.
 #
 # Usage:
 #   reap-runner-work.sh [--dry-run|--apply] [--glob PATTERN]... [--min-age S]
@@ -140,10 +152,38 @@ BUDGET="${REAP_RW_BUDGET_SECONDS:-300}"
 PRINT_CONFIG=0
 GLOB_ARGS_GIVEN=0
 
-# The cross-job caches this class deliberately does NOT touch (see the header). One name per line, so a
-# future runner layout is one entry and no loop change.
-RETAINED_NAMES="_tool
-_actions"
+# ── THE RUNNER'S `_work` NAMESPACE — the ONE table deciding what is a job checkout and what is not ──
+# ⛔ THIS TABLE IS THE BUG FIX, NOT A TIDY-UP. `sweep_root` walks `"$root"/*/` — every directory under
+# `_work` — and it cannot tell a job checkout from the runner's own directories, because the vendor
+# keeps BOTH in `_work`: `HostContext.GetDirectory` resolves `Temp`, `Actions`, `Tools` and `Update` as
+# `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)` (`actions/runner`
+# `src/Runner.Common/HostContext.cs`, over `Constants.Path.{Temp,Actions,Tool,Update}Directory`). So a
+# name that appears in NO row here is a reap candidate SILENTLY — which is how `_temp`, a live job's
+# `$RUNNER_TEMP`, became one without a line in any file saying so.
+#
+# Format: <name>|<disposition>|<reason>|<why>. `retain` = the runner's own directory (never a candidate,
+# whatever its age); `reap` = a job checkout. One row per name, so the whole namespace is on one page and
+# the NEXT name the vendor adds is a row to write — not a directory to discover in a REAP line.
+WORK_LAYOUT="
+_temp|retain|live-job-temp|the LIVE job's RUNNER_TEMP: the step script (written once per step, so a long step goes stale here while its checkout is FRESH), the command log, every temp file a step writes
+_actions|retain|cross-job-cache|every downloaded action: reaping it forces a re-download on the NEXT job, i.e. slower CI rather than disk
+_tool|retain|cross-job-cache|every fetched toolchain: the same trade as _actions
+_update|retain|runner-self-update|the runner's own self-update staging: reaping it mid-update breaks the runner it is updating
+"
+# ⛔ DERIVED, NEVER A SECOND LIST. The retain set is read OFF the table, so a name is either decided there
+# or it does not exist as a decision at all — a second literal list is exactly how the third directory
+# (`_temp`) fell out of the carve-out while the first list still read as complete.
+RETAINED_NAMES="$(printf '%s\n' "$WORK_LAYOUT" | awk -F'|' '$1 != "" && $2 == "retain" { print $1 }')"
+# ⛔ AN UNLISTED NAME IN THE RUNNER'S NAMESPACE IS KEPT, NOT REAPED. Every directory the vendor names for
+# itself is `_`-prefixed (`_temp`/`_actions`/`_tool`/`_update` are the four it keeps under `_work`); a job
+# CHECKOUT is a repository name. So a `_`-prefixed name with no row is a directory whose decision nobody
+# has made yet: retaining it turns the next vendor directory into a NAMED, COUNTED line (`reason=`,
+# `retained=`) instead of another silent REAP candidate. Over-retain is the deliberate direction — a
+# checkout wrongly kept costs one dead tree one more pass; a vendor directory wrongly reaped costs a live
+# job. ⚠️ The cost, stated rather than discovered: a repository actually NAMED `_something` would never
+# be reaped. If a box runs one, that is the visible decision this default exists to force — give it a
+# `reap` row above.
+VENDOR_NAMESPACE_PREFIX="_"
 
 log_line() { printf '%s\n' "$*"; }
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
@@ -331,12 +371,24 @@ entry_written_since() { # <entry> <floor-ref>
 ROOTS=0; GLOBS_N=0; CAND=0; REAPED=0; KEPT=0; RETAINED=0; FAILED=0; UNMEASURABLE=0
 DEADLINE=0; MODE_TEXT=dry-run; SCRATCH=""; FLOOR_REF=""
 
-is_retained() { # <entry name> — 0 when this name is a cross-job cache (never a candidate)
-    local n="$1" rn
+is_retained() { # <entry name> — 0 when the RUNNER owns this name (never a candidate)
+    local n="$1" rn row
+    RETAIN_REASON=""; RETAIN_WHY=""
     while IFS= read -r rn; do
         [ -n "$rn" ] || continue
-        [ "$n" = "$rn" ] && return 0
+        [ "$n" = "$rn" ] || continue
+        # The reason is looked up in the SAME table the name came from, so the log line and the
+        # decision cannot drift apart.
+        row="$(printf '%s\n' "$WORK_LAYOUT" | awk -F'|' -v n="$n" '$1 == n { print $3 "|" $4; exit }')"
+        RETAIN_REASON="${row%%|*}"; RETAIN_WHY="${row#*|}"
+        return 0
     done <<<"$RETAINED_NAMES"
+    case "$n" in
+        "$VENDOR_NAMESPACE_PREFIX"*)
+            RETAIN_REASON="vendor-namespace-unlisted"
+            RETAIN_WHY="a name in the runner's own '$VENDOR_NAMESPACE_PREFIX' namespace with no WORK_LAYOUT row: nobody has decided it yet, so it is KEPT and named here rather than reaped — write the row"
+            return 0 ;;
+    esac
     return 1
 }
 
@@ -346,7 +398,7 @@ prune_entry() { # <entry> <root>
     # ── the deliberate carve-out, applied BEFORE anything is measured ────────────────────────────
     if is_retained "$name"; then
         RETAINED=$((RETAINED + 1))
-        log_line "RETAINED $entry reason=cross-job-cache (the runner's downloaded actions and toolchains: reaping them forces a re-download on the NEXT job, so it buys slower CI, not disk)"
+        log_line "RETAINED $entry reason=$RETAIN_REASON ($RETAIN_WHY)"
         return 0
     fi
     entry_written_since "$entry" "$FLOOR_REF"; verdict=$?
@@ -445,7 +497,7 @@ if ! acquire_lock; then exit 3; fi
 
 DEADLINE=$(( $(now) + BUDGET ))
 log_line "reap-runner-work: pass start mode=$MODE_TEXT min_age=${MIN_AGE}s pid=$$ globs=$(printf '%s' "$GLOBS" | tr ' ' ',')"
-log_line "reap-runner-work: retained=$(printf '%s' "$RETAINED_NAMES" | tr '\n' ',' | sed 's/,$//') — cross-job caches, never candidates whatever their age"
+log_line "reap-runner-work: retained=$(printf '%s' "$RETAINED_NAMES" | tr '\n' ',' | sed 's/,$//') — the runner's own _work namespace (WORK_LAYOUT), never candidates whatever their age"
 log "==== pass start mode=$MODE_TEXT min_age=${MIN_AGE}s explicit=$EXPLICIT ===="
 
 # ⛔ THE GLOBS ARE EXPANDED UNQUOTED ON PURPOSE — that expansion IS the discovery mechanism. A pattern

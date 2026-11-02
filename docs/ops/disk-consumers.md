@@ -93,9 +93,13 @@ that GAINED five runners in a week silently lost its headroom and nothing measur
   it has been written for longer than `DISK_REAPER_RUNNER_MIN_AGE`** (default 3600 s), the entry's own
   top directory included — the conservative direction, since any write there restores the floor. The
   in-entry witness is the checkout's OWN writes; `_work/_temp` (step scripts, command logs) is a SIBLING
-  of `_work/<repo>` at the runner root (`actions/runner` `WellKnownDirectory`), so writes there do not
-  refresh the checkout's floor. So mtime is a positive proof of death for that entry; there is no local
-  busy-check on a runner to
+  OF THE CHECKOUT **inside `_work`** — the vendor resolves `Temp` as `Combine(Work, "_temp")`
+  (`actions/runner` `HostContext.GetDirectory`) — so writes there do not refresh the checkout's floor,
+  and, because it sits in the SAME swept population, it is a **reap candidate unless it is retained by
+  name** (it is: `_temp` is the live job's `$RUNNER_TEMP`, written once per step, so a long step leaves
+  it stale while the checkout is fresh). So mtime is a positive proof of death for that entry; there is
+  no local busy-check on a
+  runner to
   consult, and a `pgrep`-shaped guess would keep every dead entry while ANY runner is idle. ⚠️ Residual:
   a job that writes NOTHING inside its checkout for longer than the floor is indistinguishable from a
   dead entry by that test — a whole-job exposure for a job whose artefacts land in `$TMPDIR`,
@@ -103,10 +107,11 @@ that GAINED five runners in a week silently lost its headroom and nothing measur
   (`DISK_REAPER_RUNNER_MIN_AGE=7200`, the only empirically validated value; the shipped default is
   3600 s), which is
   the intended response;
-* **`_work/_tool` and `_work/_actions` are DELIBERATELY RETAINED**: they are the runner's cross-job
-  caches (downloaded actions, fetched toolchains), so reaping them does not free dead checkout — it
-  forces a re-download on the NEXT job and makes every later CI run slower. That is a different trade
-  from this class's, so they are excluded before anything is measured and counted (`retained=`);
+* **the runner's whole `_work` namespace is DELIBERATELY RETAINED**, derived from ONE table in the owner
+  (`_temp` = the live job's `$RUNNER_TEMP`; `_actions`/`_tool` = the cross-job caches, so reaping them
+  does not free dead checkout — it forces a re-download on the NEXT job and makes every later CI run
+  slower; `_update` = self-update staging; plus any `_`-prefixed name the table has not seen). They are
+  excluded before anything is measured and counted (`retained=`);
 * the hand reap that validated it (delete `_work` entries whose newest content was older than 120 min)
   took c1 **98% → 90% without disturbing a single running job**.
 
@@ -270,8 +275,9 @@ Measured on c1 the next day (see *The runner `_work` sink* above): **19 G** in s
 `/opt/gh-runner-x64-*/_work` directories, on a box at **98 % used, 3.5 G free**, with the hourly pass
 reporting healthy. `scripts/disk-reaper-run.sh` had zero coverage of `gh-runner`/`_work`, so the sink
 was unmeasurable by construction. Shipped as `class=runner-work` + `scripts/reap-runner-work.sh`
-(owner), with the mtime gate and the `_tool`/`_actions` carve-out; its suite fails against the
-pre-change tree (6 passed / 13 failed) and kills all ten of its mutants
+(owner), with the mtime gate and the whole runner `_work` namespace (`_temp`, `_actions`, `_tool`,
+`_update`) retained from one declared table; its suite fails against the
+pre-change tree (8 passed / 14 failed) and kills all twelve of its mutants
 (`scripts/disk-reaper-runner-work.test.sh`).
 
 ### G9 — the stale `/tmp` sink (filed as **#3043**, deliberately NOT fixed with G8)

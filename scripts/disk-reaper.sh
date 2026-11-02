@@ -2265,17 +2265,24 @@ reap_dup() {
 #
 # ⛔ THE SAFETY GATE IS ONE SENTENCE: an entry is a candidate ONLY when its NEWEST CONTENT is older than
 # the floor (`DISK_REAPER_RUNNER_MIN_AGE`, default 3600 s). The IN-ENTRY witness is the checkout's own
-# writes; `_work/_temp` (step scripts, command logs) is a SIBLING of `_work/<repo>` and protects nothing
-# here, so the mtime is the proof for the entry being deleted and there is no local busy-check on a
+# writes; `_work/_temp` (step scripts, command logs) is a SIBLING OF THE CHECKOUT **INSIDE `_work`** — the
+# vendor resolves it as `Combine(Work, "_temp")` (`actions/runner` `HostContext.GetDirectory`) — so it
+# protects nothing here, and mtime is the proof for the entry being deleted. ⛔ THAT IS ALSO WHY THE
+# OWNER MUST KNOW ITS NAME: being no part of the checkout does not put it outside the swept population,
+# it makes it a CANDIDATE — `_temp` is a live job's `$RUNNER_TEMP` and the owner retains it by name
+# (`WORK_LAYOUT` there), which is the class's answer to the bug a `REAP` row for `_work/_temp` exposed.
+# There is no local busy-check on a
 # runner to consult, and the owner's header forbids inventing a `pgrep`-shaped one (it would keep every
 # dead entry while ANY runner is idle — always, on a 12-runner box — i.e. an inert class that reports
 # healthy). The owner re-probes the same question immediately before each removal, so a job that starts
 # mid-pass survives.
 #
-# ⛔ `_work/_tool` AND `_work/_actions` ARE DELIBERATELY RETAINED: they are the runner's cross-job caches,
-# so removing them buys a re-download on the NEXT job rather than disk. The owner excludes them BEFORE
+# ⛔ THE RUNNER'S WHOLE `_work` NAMESPACE IS DELIBERATELY RETAINED (`_temp`, `_actions`, `_tool`,
+# `_update`, plus any name the table has not seen), derived from ONE table in the owner so a name is never
+# a silent candidate. `_actions`/`_tool` are its cross-job caches, so removing them buys a re-download on
+# the NEXT job rather than disk; `_temp` is the live job's temp directory. The owner excludes them BEFORE
 # measuring and counts them (`retained=` on the class line), and its suite proves they survive even when
-# they are the oldest thing in the tree.
+# they are the oldest thing in the tree — and that a live checkout's stale `_temp` survives.
 
 # fs_dev <path> — the filesystem a path lives on (`df` field 1), for the per-filesystem dedupe.
 fs_dev() { tb_timeout "$DU_TIMEOUT" "$DF_BIN" -Pk "$1" 2>/dev/null | awk 'NR==2 {print $1}'; }

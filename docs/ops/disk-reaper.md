@@ -400,9 +400,21 @@ headroom.
 * **The gate is CONTENT mtime** — `DISK_REAPER_RUNNER_MIN_AGE` (default **3600 s**). A `_work` entry is a
   candidate only when **nothing under it has been written for longer than the floor**. The in-entry
   witness is the **checkout's own writes** (outputs, build artefacts, `.venv`/`node_modules`, any file a
-  step creates under the checkout) — NOT `_work/_temp`: the runner creates `_temp`/`_tool`/`_actions` as
-  SIBLINGS of `_work/<repo>` at the runner root, so step scripts and command logs written there do not
-  refresh the checkout's floor. So mtime is a positive proof of death for the entry being reaped. The comparison set is everything under the entry **including the
+  step creates under the checkout) — NOT `_work/_temp`: the vendor resolves every runner-private
+  directory as `Combine(Work, <name>)` (`actions/runner` `src/Runner.Common/HostContext.cs`
+  `GetDirectory`, `case WellKnownDirectory.Temp`: `Path.Combine(GetDirectory(WellKnownDirectory.Work),
+  Constants.Path.TempDirectory)`), so `_temp` — like `_actions`, `_tool` and `_update` — is a **sibling
+  of `_work/<repo>` INSIDE `_work`**, not a directory at the runner root (older runner builds put them
+  at the install root; the checkout's `_work` is what this class sweeps). Writes there therefore do not
+  refresh the checkout's floor, and mtime is a positive proof of death for the entry being reaped.
+  ⛔ **But being none of the checkout's business is NOT the same as being invisible here**, and reading
+  it as "at the runner root" was the whole of the shipped defect: `sweep_root` walks **every** entry of
+  `_work`, so a directory that protects nothing is a **candidate**. `_temp` is a live job's
+  `$RUNNER_TEMP`, and `ScriptHandler.cs` writes the step's script there **once per step** — so a job
+  whose CURRENT step outruns the floor has a **fresh checkout** (correctly KEPT) and a **stale
+  `_temp`**, and the class deleted a running job's temp directory while its checkout gate worked
+  perfectly. It is now retained by name (see the next bullet); the residual below does **not** cover
+  this shape, which is why it is stated separately. The comparison set is everything under the entry **including the
   entry's own top directory**, which is the conservative direction (a stray `touch`/`cp` over a dead
   entry's top dir restores its floor). What the gate deliberately does NOT use is the top directory's
   mtime **alone**: a killed job stamps that directory at the moment of the kill while its CONTENTS can
@@ -424,14 +436,34 @@ headroom.
   floor is **7200 s** (the 120-minute hand reap that took c1 98 % → 90 % with no job disturbed); the
   shipped **3600 s** is deliberately more aggressive, so price the difference before adopting it on a
   box whose jobs write outside the checkout.
-* **`_work/_tool` and `_work/_actions` are DELIBERATELY RETAINED.** They are the runner's CROSS-JOB
-  caches (every downloaded action and every fetched toolchain), so removing them does not free dead
-  checkout — it forces a re-download on the NEXT job and makes every subsequent CI run slower. A
-  different trade from this class's, so they are excluded from the candidate set BEFORE anything is
-  measured, counted on the class line (`retained=`), and named per directory
-  (`RETAINED … reason=cross-job-cache`). `scripts/disk-reaper-runner-work.test.sh` case (c) proves they
-  survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling.
-* **`_work/_tool`/`_actions` are the only carve-out; whole entries are the only candidates.** A plain
+* **THE RUNNER'S WHOLE `_work` NAMESPACE IS DELIBERATELY RETAINED, and it is DERIVED from one table.**
+  The owner declares the vendor's layout once (`WORK_LAYOUT` in `scripts/reap-runner-work.sh`, one row per
+  name: `<name>|<disposition>|<reason>|<why>`) and reads the retain set **off** it — never a second
+  literal list, because a second list is exactly how the third directory was missed while the first one
+  still read as complete. The rows:
+
+  | name | why it is not a candidate |
+  |---|---|
+  | `_temp` | the **live job's `$RUNNER_TEMP`** — the step script (written once per step, so it goes stale while the job runs), the command log, every temp file a step writes |
+  | `_actions` | every downloaded action: reaping it forces a re-download on the NEXT job, i.e. slower CI rather than disk |
+  | `_tool` | every fetched toolchain: the same trade as `_actions` |
+  | `_update` | the runner's own self-update staging: reaping it mid-update breaks the runner it is updating |
+
+  ⛔ **A `_`-PREFIXED NAME WITH NO ROW IS ALSO RETAINED**, and named as such
+  (`reason=vendor-namespace-unlisted`). Every directory the vendor names for itself is `_`-prefixed and a
+  job checkout is a repository name, so the next directory the vendor adds arrives as a **named, counted
+  decision** (a `RETAINED` line plus `retained=`) instead of as another silent `REAP` candidate. That is
+  the over-retain direction on purpose: a checkout wrongly kept costs a dead tree one more pass, a vendor
+  directory wrongly reaped costs a live job. ⚠️ The cost, stated rather than discovered: a repository
+  actually NAMED `_something` would never be reaped — if a box runs one, give it a `reap` row, which is
+  the visible decision the default exists to force.
+  The exclusion happens BEFORE anything is measured, is counted on the class line (`retained=`) and is
+  named per directory (`RETAINED … reason=`), so "why is this still here" has an answer.
+  `scripts/disk-reaper-runner-work.test.sh` proves it both ways: case **(c)** — `_tool`/`_actions` survive
+  when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling; case **(j)** —
+  a **live** checkout's stale `_temp` survives, a vendor directory the table has never seen survives,
+  and a genuinely dead checkout in the same pass is still reaped.
+* **The vendor namespace is the only carve-out; whole entries are the only candidates.** A plain
   file in `_work` is not a job's checkout, so it is left alone — the class removes directory entries.
 * **Accounting** is a `df` delta per distinct filesystem the globs can land on (`/tmp` is a tmpfs on
   some boxes and part of `/` on others, so one reading would report 0MB for gigabytes freed from the
@@ -1105,38 +1137,49 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **9 cases and 10 mutants,
-19 outcomes per box** (each passed, failed, or — for (f)'s default-glob half on a box with real runner
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **10 cases and 12 mutants,
+22 outcomes per box** (each passed, failed, or — for (f)'s default-glob half on a box with real runner
 roots — SKIPPED, so a run always states which of the three it produced) — also mutation-checked. Run
 against the PRE-CHANGE tree (the base commit's
-`disk-reaper.sh` beside this owner) it reports **6 passed, 13 failed, 0 skipped**, and against this tree
-**19 passed, 0 failed, 0 skipped**: the discrimination is measured both ways, not asserted. (The 13 red on the
-pre-change tree are cases (a)–(h) plus the five entry-point mutants that cannot even be applied there,
-because the arms they edit do not exist in that `disk-reaper.sh`; (i) and the owner-side mutants stay
-green, which is the correct answer for a case whose subject is the owner.)
+`disk-reaper.sh` beside this owner) it reports **8 passed, 14 failed, 0 skipped**, and against this tree
+**22 passed, 0 failed, 0 skipped**: the discrimination is measured both ways, not asserted. (The 14 red on the
+pre-change tree are cases (a)–(h) and (j) plus the five entry-point mutants that cannot even be applied
+there, because the arms they edit do not exist in that `disk-reaper.sh`; (i), (j)'s two owner-side
+mutants and the owner-side mutants of (a)–(c)/(h) stay green, which is the correct answer for a case
+whose subject is the owner.)
+
+⚠️ **What this suite does NOT cover, disclosed rather than implied:** the class's **record fields** at the
+ENTRY-POINT level (`freed_mb_runner_work=`, `candidates_runner_work=`/`cand_runner_work=`,
+`unmeasurable_runner_work=`, `verdict_runner_work=`, and `--print-status` printing them) are the subject
+of `scripts/disk-reaper-classes.test.sh`, and that suite was **killed at 30 minutes with no result** on
+the box that measured this PR (load 180–220). So the record-field DELTA this change would have covered
+is **unmeasured**: the owner-level suite below is measured, the entry-point record fields are not. A
+green run of `disk-reaper-runner-work.test.sh` must not be read as covering them.
 
 The measured transcript, `bash scripts/disk-reaper-runner-work.test.sh`:
 
 ```
-  19 passed, 0 failed, 0 skipped
+  22 passed, 0 failed, 0 skipped
 ```
 
 and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 
 ```
-  6 passed, 13 failed, 0 skipped
+  8 passed, 14 failed, 0 skipped
 ```
 
 **The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
 run on a box that HAS real runner roots — its whole subject is the default list, so there is nothing to
 pin the seam to — and recording it as a passing check meant a CELL (which skips it) printed the same
-`19 passed, 0 failed` as a laptop on which all 19 arms really ran. The skipped arms are now counted on
+tally as a laptop on which every arm really ran. The skipped arms are now counted on
 their own line with their reason, so the two runs cannot be mistaken for each other (measured on a box
 told to have real runner roots; `<entry>` is the entry point under test and the second is the mutant
-copy the suite makes in its own `$T`):
+copy the suite makes in its own `$T`; ⚠️ that run predates case **(j)**, which never skips — on a cell
+today the same two skips print with three more passes, so the line reads `22 passed, 0 failed, 2
+skipped`. The skip COUNT is what was measured there; the `22` is arithmetic, not a re-measurement):
 
 ```
-  19 passed, 0 failed, 2 skipped
+  22 passed, 0 failed, 2 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
 ```
@@ -1148,13 +1191,14 @@ follows the skip still runs on both, so a broken default list still reddens a ce
 |---|---|---|
 | (a) | a YOUNG `_work` entry is neither counted nor reaped — in `--dry-run` AND `--apply` | the floor reference becomes `now` |
 | (b) | an OLD entry is counted in dry-run and REMOVED by `--apply`, reported as a `df` delta with a numeric record field; a second pass claims no un-caused delta | the `-newer` test is dropped from the walk |
-| (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the `RETAINED_NAMES` table is emptied |
+| (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the derived retain table is emptied **and** the vendor-namespace default disabled (they are one arm) |
 | (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one | `want_class runner-work` → `true` |
 | (e) | an unknown `--only` value is refused, the valid list names `runner-work`, and a near-miss (`runner`) is refused too | the valid list is shortened in the refusal |
 | (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0). On a box with REAL runner roots (a cell) the default-glob half is **SKIPPED by name and counted as skipped, never as passed** — the documented default list is then asserted from the source — and `(b)` pins that the record carries the owner's `unmeasurable=` tally | the `census=no-roots` arm is deleted |
 | (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
 | (h) | a SET-but-EMPTY glob list is a refusal at **both** layers (the entry point's seam and the owner's), never "scan nothing for ever" — `${X:-default}` would substitute the *widest* sweep for an emptied value, and this class's output is deletions | the entry point's empty-glob arm never matches; and, separately, the owner's |
 | (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |
+| (j) | **a LIVE job's `_temp` is never a candidate**: `_work/_temp` — the vendor's `Combine(Work, "_temp")`, written once per step, so it goes stale while the checkout beside it stays fresh — SURVIVES a stale floor and is named (`reason=live-job-temp`); a vendor directory the table has never seen also survives and is named (`reason=vendor-namespace-unlisted`); and a genuinely dead checkout in the SAME pass is still reaped. This is the shipped defect the reviewer measured — a `REAP` row for `_work/_temp`, with the checkout gate working perfectly, which the disclosed residual does not cover | the `_temp` row is deleted (the prefix default still keeps the directory, so the case pins the ROW by its reason); and, separately, the vendor-namespace default is disabled |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
