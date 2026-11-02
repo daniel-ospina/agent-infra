@@ -2147,6 +2147,103 @@ PE="$(pair_of "$Q/e.diff")"
   && pass "(31) the same lines at a DIFFERENT PATH move the patch digest (the path is part of the identity)" \
   || fail "(31) a path move kept the patch digest — the identity ignores paths"
 
+# ── 33. `--delta` (#3245): the verb sources its inputs from the RECORD, and refuses a non-approval ──
+# NUMBERED 33, NOT 32, AND DELIBERATELY: main's #3347 landed its own section (32) — the
+# `post_marker()` marker-present early return — between this branch's fork point and its rebase.
+# Both sections were written independently as "32", so keeping the number would have put TWO
+# sections and TWO sets of (32a)-(32e) labels in one file: a reader chasing "(32c)" would find a
+# post_marker assertion and a delta assertion, and neither message would say which. The delta
+# section moves; main's (32) keeps the number it already shipped under.
+# The GAP this pins: the carry arms are only reachable from the stale-sha guard, so a lane that
+# records at the LIVE head never enters it and pays for a full re-review. `--delta` reads the
+# REVIEWED head AND the verdict from the record, then re-enters the SAME arms. Three facts are
+# asserted here, and each is a REFUSAL or the ACCEPTANCE it exists for — never a narration:
+#   (a) a conflict-free forward merge of main into the attested branch RE-BINDS, and the record
+#       says `mint":"delta"` (never `fresh`) with the delta pair;
+#   (b) a real authored commit landing in the same push is REFUSED and the record is untouched;
+#   (c) a record whose verdict is not clean-family is REFUSED before any git work is done.
+# The stub for THIS section answers what the verb reads (base sha, head sha, the diff, and an
+# EMPTY check surface), which the suite-wide stub above does not.
+echo "── 33. --delta reads the reviewed head and verdict from the RECORD"
+DELTA_REPO="$(new_repo delta33)" || fail "(33) fixture repo could not be created"
+DR_HOME="$TMP/dhome"; rm -rf "$DR_HOME"; mkdir -p "$DR_HOME/.pi/agent/reviews"
+mkdir -p "$TMP/dbin"
+cat > "$TMP/dbin/gh" <<'EOF'
+#!/usr/bin/env bash
+for x in "$@"; do
+  case "$x" in
+    .base.sha) echo "${FIX_BASE:-}"; exit 0 ;;
+    .head.sha) echo "${FIX_HEAD:-}"; exit 0 ;;
+    .body) echo ""; exit 0 ;;
+  esac
+done
+case "$*" in
+  *check-runs*) echo ""; exit 0 ;;
+esac
+case "$*" in
+  *pulls/*)
+    if [ -n "${FIX_HEAD:-}" ] && [ -n "${FIX_BASE:-}" ]; then
+      git -C "${FIX_REPO:-.}" diff --no-color "$FIX_BASE...$FIX_HEAD" 2>/dev/null && exit 0
+    fi ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/dbin/gh"
+delta_write_record() { # <pr> <head> <verdict> -> writes the record this verb reads
+  printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","mint":"fresh","verdict":"%s","repo":"fixture/repo","reviewed_at":"2026-11-02T00:00:00Z"}\n' \
+    "$1" "$2" "$(printf 'x' | openssl dgst -sha256 | awk '{print $NF}')" "$3" \
+    > "$DR_HOME/.pi/agent/reviews/fixture-repo-$1.json"
+}
+# THE STATUS MUST BE CAPTURED OUTSIDE A SUBSHELL. Every call site wants BOTH the
+# output and the exit status, and `OUT="$(delta_run ...)"; rc=$?` captures the
+# substitution's status but LOSES an assignment made inside it. A first cut did
+# exactly that and `$DR_RC` was unbound at the first read, killing the suite under
+# `set -u` BEFORE any assertion printed: three dead assertions that could neither
+# pass nor report a fail. So the verb writes its output to a FILE and the status is
+# assigned in the caller's shell.
+delta_run() { # <pr> <out-file> ; assigns DR_RC, leaves output in <out-file>
+  ( cd "$DELTA_REPO" || exit 9
+    HOME="$DR_HOME" PATH="$TMP/dbin:$PATH" FIX_REPO="$DELTA_REPO" \
+    FIX_BASE="$(git rev-parse main)" FIX_HEAD="${FIX_DELTA_HEAD:?}" \
+      bash "$SRC" --delta "$1" fixture/repo ) > "$2" 2>&1
+  DR_RC=$?
+}
+if [ -d "$DELTA_REPO" ]; then
+  # ⛔ ON `main`, NOT ON `pr`. `new_repo` leaves HEAD on the `pr` branch, so an
+  # advance committed without switching lands as a LANE commit and `git merge main`
+  # is then "Already up to date" — the fixture would never build the topology this
+  # section claims, and the acceptance case would assert about a one-parent head.
+  ( cd "$DELTA_REPO" || exit 9; git checkout -q main; printf 'main advance\n' > adv.txt; git add -A; git commit -qm "main: advance" ) >/dev/null 2>&1
+  ( cd "$DELTA_REPO" || exit 9; git checkout -q pr; git merge --no-ff -q main -m "merge main into pr" ) >/dev/null 2>&1
+  D_BASE="$( cd "$DELTA_REPO" && git rev-parse main )"
+  D_REVIEWED="$( cd "$DELTA_REPO" && git rev-parse pr^1 )"
+  D_MERGED="$( cd "$DELTA_REPO" && git rev-parse pr )"
+  delta_write_record 7101 "$D_REVIEWED" clean
+  FIX_DELTA_HEAD="$D_MERGED"; delta_run 7101 "$TMP/out32a"; OUT32="$(cat "$TMP/out32a")"; DRC_A="$DR_RC"
+  D_REC32="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
+  [ "$DRC_A" -eq 0 ] && [ "$(printf '%s' "$D_REC32" | grep -c '"mint":"delta"')" = 1 ] \
+    && [ "$(printf '%s' "$D_REC32" | grep -c "\"head_sha\":\"$D_MERGED\"")" = 1 ] \
+    && pass "(33a) a conflict-free forward merge RE-BINDS, and the record says mint=delta at the new head" \
+    || fail "(33a) the delta was not rebound as a delta (rc=$DRC_A, record='$D_REC32', out='$OUT32')"
+  # (b) one real authored commit on top of the merge: authorship moved, so a review is owed.
+  ( cd "$DELTA_REPO" || exit 9; printf 'lane fix\n' >> lane.txt; git add -A; git commit -qm "lane: a real fix commit" ) >/dev/null 2>&1
+  D_FIXED="$( cd "$DELTA_REPO" && git rev-parse pr )"
+  delta_write_record 7102 "$D_REVIEWED" clean
+  FIX_DELTA_HEAD="$D_FIXED"; delta_run 7102 "$TMP/out32b"; OUT32B="$(cat "$TMP/out32b")"; DRC_B="$DR_RC"
+  [ "$DRC_B" -eq 3 ] && printf '%s' "$OUT32B" | grep -q 'no-new-authored-commits=no' \
+    && [ "$(grep -c "\"head_sha\":\"$D_REVIEWED\"" "$DR_HOME/.pi/agent/reviews/fixture-repo-7102.json")" = 1 ] \
+    && pass "(33b) an authored commit landing in the same push is REFUSED and the record is untouched" \
+    || fail "(33b) an authored commit was re-attested (rc=$DRC_B)"
+  # (c) a record that is not an approval: a delta re-binds an APPROVAL, it cannot manufacture one.
+  delta_write_record 7103 "$D_REVIEWED" changes-requested
+  FIX_DELTA_HEAD="$D_MERGED"; delta_run 7103 "$TMP/out32c"; OUT32C="$(cat "$TMP/out32c")"; DRC_C="$DR_RC"
+  [ "$DRC_C" -eq 3 ] && printf '%s' "$OUT32C" | grep -q 'not a clean-family verdict' \
+    && pass "(33c) a non-clean record is REFUSED before any git work — a delta cannot manufacture an approval" \
+    || fail "(33c) a non-clean verdict was re-bound as a clean attestation (rc=$DRC_C)"
+else
+  fail "(33a) fixture missing"; fail "(33b) fixture missing"; fail "(33c) fixture missing"
+fi
+
 # ── MUTATION PINS on real output ──────────────────────────────────────────
 # A mutant projection that KEEPS context must make the acceptance assertion
 # redden: otherwise the acceptance would pass for a projection that never
@@ -2303,7 +2400,11 @@ fi
 # contract in this suite too (a refused PATCH is a named rc 5, and the signed marker
 # survives in the pending file), and the (30x) cap vector no longer depends on the
 # marker's fate: its stub answers `.body`/PATCH so the post SUCCEEDS.
-MIN_ASSERTIONS=190
+# #10583: 185 -> 188 on the branch; 190 -> 193 after the rebase onto main, which is where
+# #3347's own section (32) already spent its five. Additive in both directions: the body-marker
+# durability section and the delta section were written independently and neither replaces the
+# other's assertions, so the rebased pin is main's 190 plus this section's 3.
+MIN_ASSERTIONS=193
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
