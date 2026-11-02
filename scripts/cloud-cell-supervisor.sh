@@ -4507,7 +4507,7 @@ exclude_root_add() { # <absolute path>
 PIN_ROWS=(); PIN_CENSUS_RC=""; PIN_CENSUS_PIDS=0; PIN_CENSUS_UNREADABLE=0
 PIN_HOLD_PID=""; PIN_HOLD_KIND=""; PIN_HOLD_WHY=""
 pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census could be read at all
-  local proc="${PIN_PROC_ROOT:-/proc}" f pid link path tok seen=0 T=$'\t' lp_line
+  local proc="${PIN_PROC_ROOT:-/proc}" f pid link path tok seen=0 T=$'\t' lp_line nonarg=0
   # ⛔ `$'\t'` IS NOT EXPANDED INSIDE DOUBLE QUOTES — measured in review: the row came out as the
   # literal `cwd$'\t'<pid>$'\t'<path>`, so every row failed to split and the guard reported "unheld"
   # for a tree a live process was sitting in (the fix's own bug, caught by the proof run). One TAB
@@ -4516,13 +4516,20 @@ pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census 
   if [ "${PIN_CENSUS_UNAVAILABLE:-0}" = 1 ]; then          # test seam: drive the fail-closed arm
     PIN_CENSUS_RC=1; PIN_HOLD_WHY="forced-unavailable (PIN_CENSUS_UNAVAILABLE=1)"; return 1
   fi
+  # ⛔ THE PROBE ITSELF IS VERIFIED BEFORE IT IS TRUSTED. `readlink` supplies EVERY cwd/fd/exe row —
+  # the three arms that cover the 2026-11-02 shape. Measured in review: with `readlink` failing, the
+  # argv rows alone still satisfied "a real census", so the sweep reported a disclosure identical to
+  # the healthy case and then deleted a tree a live process was sitting in. An argv-only census cannot
+  # see an fd holder, so a missing probe is a cannot-verify — never "nothing is live".
+  command -v readlink >/dev/null 2>&1 || {
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="readlink is not on PATH — the cwd/fd/exe probe cannot be read, so only argv would be visible"; return 1; }
   for f in "$proc"/[0-9]*; do
     [ -d "$f" ] || continue
     pid="${f##*/}"; seen=$((seen+1))
     for link in "$f/cwd" "$f/exe"; do
       path="$(readlink "$link" 2>/dev/null)" || continue
       path="${path% (deleted)}"; path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
-      case "$path" in /*) PIN_ROWS+=("${link##*/}$T$pid$T$path") ;; esac
+      case "$path" in /*) PIN_ROWS+=("${link##*/}$T$pid$T$path"); nonarg=$((nonarg+1)) ;; esac
     done
     # ONE fork for the whole fd table (not one per descriptor), and ONE builtin read for argv —
     # a path a live process NAMES is held just as surely as one its cwd or an fd resolves to.
@@ -4531,7 +4538,7 @@ pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census 
     else
       while IFS= read -r path; do
         path="${path% (deleted)}"; path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
-        case "$path" in /*) PIN_ROWS+=("fd$T$pid$T$path") ;; esac
+        case "$path" in /*) PIN_ROWS+=("fd$T$pid$T$path"); nonarg=$((nonarg+1)) ;; esac
       done < <(readlink "$f"/fd/* 2>/dev/null)
     fi
     if [ -r "$f/cmdline" ]; then
@@ -4568,15 +4575,25 @@ pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census 
         n*) [ -n "$lp_pid" ] || continue
             path="${lp_line#n}"; path="${path% (deleted)}"
             path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
-            case "$path" in /*) PIN_ROWS+=("lsof$T$lp_pid$T$path") ;; esac ;;
+            case "$path" in /*) PIN_ROWS+=("lsof$T$lp_pid$T$path"); nonarg=$((nonarg+1)) ;; esac ;;
       esac
     done < <(lsof -n -P -w -F pn 2>/dev/null)
     [ "${#PIN_ROWS[@]}" -gt 0 ] && PIN_CENSUS_PIDS="$(printf '%s\n' "${PIN_ROWS[@]}" | cut -d"$T" -f2 | sort -u | wc -l | tr -d ' ')"
   fi
+  # ⛔ AN ARGV-ONLY CENSUS IS NOT A CENSUS. Measured in review: with the `readlink` probe failing, the
+  # argv rows alone satisfied "a real census", the disclosure looked identical to the healthy case, and
+  # the sweep deleted a tree a live process was sitting in — because argv can NEVER show an fd holder.
+  # So a census with no cwd/exe/fd/lsof row at all is a cannot-verify and fails CLOSED.
+  if [ "$nonarg" -eq 0 ]; then
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="no cwd/exe/fd row could be read from $proc (probe broken?) — an argv-only census cannot see an fd holder"; return 1
+  fi
   if [ "${#PIN_ROWS[@]}" -eq 0 ]; then
     PIN_CENSUS_RC=1; PIN_HOLD_WHY="$proc yielded no readable cwd/fd/exe/argv entry (and no lsof census)"; return 1
   fi
-  PIN_CENSUS_RC=0; PIN_CENSUS_PIDS="$seen"; return 0
+  # `$seen` counts /proc/<pid> DIRECTORY ENTRIES — it is 0 on the very platform the lsof arm exists for,
+  # so an unconditional assignment would print "census_pids=0" for a census of 100k rows.
+  [ "$PIN_CENSUS_PIDS" = 0 ] && PIN_CENSUS_PIDS="$seen"
+  PIN_CENSUS_RC=0; return 0
 }
 
 # pin_held_by_process <dir> -> 0 held (sets PIN_HOLD_PID/PIN_HOLD_KIND), 1 provably unheld, 2 cannot check
@@ -4595,7 +4612,7 @@ pin_held_by_process() {
     # A relative token is resolved against ITS OWN pid's cwd — the one reading a bare `git -C wt-x`
     # needs, and the reason a relative name is not silently dropped.
     if [ "$kind" = relarg ]; then
-      local rcwd; rcwd="$(readlink /proc/$pid/cwd 2>/dev/null)" || continue
+      local rcwd; rcwd="$(readlink "${PIN_PROC_ROOT:-/proc}/$pid/cwd" 2>/dev/null)" || continue
       path="${rcwd%/}/${path#./}"
       kind=arg
     fi

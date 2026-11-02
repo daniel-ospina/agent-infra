@@ -1670,6 +1670,20 @@ case "$PR_OUT" in
   *) bad "the fail-closed keep was not named check-unavailable — an operator cannot see why the pin survived" ;;
 esac
 rm -rf "$R/pin/$RP_A"
+# ⛔ AN ARGV-ONLY CENSUS IS NOT A CENSUS. Measured in review: with the `readlink` probe broken, the argv
+# rows alone still satisfied "a real census", the disclosure looked identical to the healthy case, and
+# the sweep deleted a tree a live process was sitting in — argv can NEVER show an fd holder. A proc root
+# that yields only argv rows must therefore PRESERVE, not report "provably unheld".
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness" "$R/proc-argonly/9/fd"
+printf 'bash\0%s\0' "$R/pin/$RP_A" > "$R/proc-argonly/9/cmdline"
+PRUNE_PROC_ROOT="$R/proc-argonly" prunesup
+[ -d "$R/pin/$RP_A" ] && ok "an ARGV-ONLY census (no cwd/exe/fd row) PRESERVES the pin — it cannot see an fd holder" \
+                      || bad "an argv-only census deleted the tree — the exact review-found fail-open"
+case "$PR_OUT" in
+  *"check-unavailable:no cwd/exe/fd row"*) ok "the argv-only keep names WHY it could not verify" ;;
+  *) bad "the argv-only keep was not explained: $PR_OUT" ;;
+esac
+rm -rf "$R/pin/$RP_A"
 PRUNE_PROC_ROOT=""   # back to the host for the remaining arms
 [ -d "$R/pin/$RP_B" ] && ok "prune KEEPS the ACTIVE harness pin" \
                       || bad "prune deleted the ACTIVE pin — the cell no longer has its harness"
