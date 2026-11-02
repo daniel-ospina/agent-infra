@@ -126,6 +126,16 @@ INCLUDE_GITLESS=0
 # never candidates. `/tmp/actions-runner` is the CI runner install on every cell — removing it
 # breaks every job on the box, which is a worse outcome than the space it holds.
 GITLESS_KEEP="${REAP_AW_GITLESS_KEEP:-/tmp/actions-runner:/tmp/venv-shared*}"
+# ⛔ AND THE CLASS IS BOUNDED PER PASS (measured on cell-3: the unbounded first cut ran >17 min on
+# 487 top-level dirs, overran the entry point's class timeout and left the HOURLY REAPER RED — a
+# scheduled actuator that cannot finish is not a fix, whatever it removes on the way). The cap is a
+# deliberate throughput limit, not a safety rule: successive hourly passes make progress, and the
+# standing population on this box (4,594 MB / 453 trees) clears inside one pass.
+# 10, not 40: the binding cost is REMOVAL I/O, measured on cell-3 at 20-60 s per tree
+# (`08:38:24 - 08:39:41` for three trees on a 126 GB disk at 95 %), so 40 candidates is 15-25 min of
+# removing and overruns the class bound. 10 keeps a pass inside it while still clearing the standing
+# population (26 candidates when this landed) in ~3 hours of hourly passes.
+GITLESS_MAX="${REAP_AW_GITLESS_MAX:-10}"
 ROOTS="${REAP_AW_ROOTS:-/tmp}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
@@ -470,19 +480,26 @@ remove_one() { # <worktree-canonical-path> <repo> — 0 removed, 1 not removed (
 # describe, and it carries every guard they carry that DOES apply (age floor, live-pid census,
 # argv-named, pin, containment, toctou re-proof) plus the keep list.
 git_below() { # <dir> — is a git marker INSIDE the tree? Then a git arm owns it, not this one.
-    local d="$1" h
+    local x y
     # ⛔ DEPTH 3, NOT ONE LEVEL (review of #3172, measured): a repo nested at `x/a/b/.git` was
-    # classified gitless and removable by the one-level version. `-maxdepth` keeps it bounded so it
-    # cannot walk a 250 MB tree, and `-quit` stops at the first hit.
-    [ -n "$(find "$d" -maxdepth 3 -name .git -print -quit 2>/dev/null)" ] && return 0
-    # ⛔ AND A BARE REPO NESTED IN THE TREE IS THE SAME OBJECT CLASS as a nested `.git`: `HEAD` +
-    # `objects/` + `refs/` ARE the repository, so a tree holding one is not scratch (review of #3172
-    # round 2 — the top-level bare guard did not cover `tree/bare/{HEAD,objects/,refs/}`). Bounded to
-    # 20 candidates, depth 3, because this runs per tree against a 300 s sweep budget.
-    while IFS= read -r h; do
-        [ -n "$h" ] || continue
-        [ -d "${h%/*}/objects" ] && [ -d "${h%/*}/refs" ] && return 0
-    done <<<"$(find "$d" -maxdepth 3 -type f -name HEAD -print 2>/dev/null | head -20)"
+    # classified gitless and removable by the one-level version.
+    # ⛔ AND BY PURE PATH EXPANSION, NOT `find` (measured at 08:0xZ, the reason a scheduled pass exited
+    # 124): `find -maxdepth 3` forks and re-walks every directory of a 250 MB scratch tree, ~450 times
+    # per pass — the arm overran its class bound and the whole worktree class went RED. These globs
+    # readdir exactly three levels and fork nothing.
+    for x in "$d"/*/; do
+        [ -d "$x" ] || continue
+        x="${x%/}"
+        [ -e "$x/.git" ] && return 0
+        # a BARE repo nested in the tree is the same object class as a nested `.git`: `HEAD` +
+        # `objects/` + `refs/` ARE the repository (review of #3172 round 2).
+        if [ -e "$x/HEAD" ] && [ -d "$x/objects" ] && [ -d "$x/refs" ]; then return 0; fi
+        for y in "$x"/*/; do
+            y="${y%/}"
+            [ -e "$y/.git" ] && return 0
+            if [ -e "$y/HEAD" ] && [ -d "$y/objects" ] && [ -d "$y/refs" ]; then return 0; fi
+        done
+    done
     return 1
 }
 gitless_keep() { # <canon> — is it a box dependency named in the keep list?
@@ -517,7 +534,7 @@ remove_gitless() { # <canon> — no git, so no branch/ref/reflog exists that cou
 # ── the sweep ─────────────────────────────────────────────────────────────────────────────────
 CAND=0; REAPED=0; KEPT=0; FAILED=0; REMOVE_HOW=""
 sweep_root() { # <root>
-    local root="$1" d canon base mt age repo out deadline dirty_n root_canon gitless GITLESS_KEEP_WHY _ref _refc
+    local root="$1" d canon base mt age repo out deadline dirty_n root_canon gitless GITLESS_KEEP_WHY _ref _refc GITLESS_DONE=0
     deadline=$(( $(now) + BUDGET ))
     [ -d "$root" ] || { log_line "note: scratch root $root does not exist — nothing to sweep there"; return 0; }
     root_canon="$(lp_canon "$root")" || root_canon=""
@@ -555,6 +572,15 @@ sweep_root() { # <root>
             if [ "$INCLUDE_GITLESS" != 1 ]; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=not-a-worktree (no .git; --include-gitless is off)"; continue
             fi
+            # ⛔ BOTH LIMITS ARE CHECKED BEFORE ANY PER-TREE WORK. The budget check used to sit AFTER
+            # `git_below` and canonicalisation, so the expensive part of an over-budget arm still ran
+            # to the end of the root (measured: 17+ min, class timeout, rc=3 every hour).
+            if [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} candidates this pass; the remainder is PRESERVED for the next run)"; continue
+            fi
+            if [ "$(now)" -ge "$deadline" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed trees are PRESERVED)"; continue
+            fi
             if git_below "$d"; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=git-below (a .git lives inside the tree, so a git arm owns it)"; continue
             fi
@@ -567,6 +593,7 @@ sweep_root() { # <root>
             # #3172 round 2: comparing the raw `$d` let `--root /tmp/` — `/tmp//cell-home` — delete the
             # cell HOME in an armed pass; the same spelling bug the keep list had).
             gitless=1
+            GITLESS_DONE=$((GITLESS_DONE + 1))
         fi
         canon="$(lp_canon "$d")" || canon=""
         base="$(basename "$d")"
