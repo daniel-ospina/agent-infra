@@ -2315,7 +2315,7 @@ rw_df_targets() {
 reap_runner_work() {
     local out rc line path size why cands="" rows="" all_c=0 freed=0 raw=0 MEASURED=1 rec=""
     local tgt before after d _rw_line="" _rw_cand="" _rw_roots="" _rw_census="" _rw_reaped=""
-    local _rw_retained="" _rw_failed="" _rw_kept="" _rw_why="" _rw_unmeasurable=""
+    local _rw_retained="" _rw_failed="" _rw_kept="" _rw_why="" _rw_unmeasurable="" _rw_retained_names=""
     if [ -z "$RUNNER_WORK_REAPER_PATH" ]; then
         log_line "disk-reaper: ⛔ class=runner-work FAIL-CLOSED — reap-runner-work.sh not found (looked at \$RUNNER_WORK_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         NOTE_RW="reap-runner-work.sh not found"; RC_RW=3
@@ -2357,6 +2357,15 @@ reap_runner_work() {
     _rw_cand="$(kv_field "$_rw_line" candidates)"
     _rw_reaped="$(kv_field "$_rw_line" reaped)"
     _rw_retained="$(kv_field "$_rw_line" retained)"
+    # ⛔ THE RETAINED NAMES ARE LIFTED FROM THE OWNER, NEVER RESTATED HERE. The WOULD-REMOVE message below
+    # used to name `_tool`/`_actions` literally, and by this revision the owner's `WORK_LAYOUT` retained
+    # FOUR names (`_temp`, `_actions`, `_tool`, `_update`) — so the sentence had already drifted from the
+    # table it describes, in the log of the DELETE direction itself: it told an operator that two
+    # directories are kept whatever their age while four were. A literal list here is a SECOND declaration
+    # of a decision the owner owns, so it drifts by construction; the owner prints the derived set on
+    # every pass (`reap-runner-work: retained=…`, from `WORK_LAYOUT`), and that line is what this reads.
+    # Empty when the delegate did not print it — the fallback names the source rather than inventing a set.
+    _rw_retained_names="$(sed -n 's/^reap-runner-work: retained=\([^ ]*\) .*/\1/p' <<<"$out" | tail -1)"
     _rw_kept="$(kv_field "$_rw_line" kept)"
     _rw_failed="$(kv_field "$_rw_line" failed)"
     # The eighth field — the one the lift used to drop. Carried, never re-derived: the owner is the only
@@ -2429,7 +2438,7 @@ reap_runner_work() {
 }disk-reaper: WOULD-REMOVE class=runner-work (? bytes unmeasured — the owner could not size it) ${path}" ;;
                         *) WOULD_RW=$((WOULD_RW + size))
                            cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=runner-work ${size}MB ${path} (du estimate; no content written for >= ${RUNNER_MIN_AGE}s — _tool/_actions are retained whatever their age)" ;;
+}disk-reaper: WOULD-REMOVE class=runner-work ${size}MB ${path} (du estimate; no content written for >= ${RUNNER_MIN_AGE}s — retained whatever their age: ${_rw_retained_names:-the WORK_LAYOUT retain set, see retained= on the owner line})" ;;
                     esac ;;
             esac
         done <<<"$rows"

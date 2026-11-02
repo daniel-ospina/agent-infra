@@ -1137,40 +1137,56 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **10 cases and 12 mutants,
-22 outcomes per box** (each passed, failed, or — for (f)'s default-glob half on a box with real runner
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **10 cases and 13 mutants,
+23 outcomes per box** (each passed, failed, or — for (f)'s default-glob half on a box with real runner
 roots — SKIPPED, so a run always states which of the three it produced) — also mutation-checked. Run
 against the PRE-CHANGE tree (the base commit's
-`disk-reaper.sh` beside this owner) it reports **8 passed, 14 failed, 0 skipped**, and against this tree
-**22 passed, 0 failed, 0 skipped**: the discrimination is measured both ways, not asserted. (The 14 red on the
-pre-change tree are cases (a)–(h) and (j) plus the five entry-point mutants that cannot even be applied
-there, because the arms they edit do not exist in that `disk-reaper.sh`; (i), (j)'s two owner-side
-mutants and the owner-side mutants of (a)–(c)/(h) stay green, which is the correct answer for a case
-whose subject is the owner.)
+`disk-reaper.sh` beside this owner) it reports **8 passed, 15 failed, 0 skipped**, and against this tree
+**23 passed, 0 failed, 0 skipped**: the discrimination is measured both ways, not asserted. (The 15 red on
+the pre-change tree are cases (a)—(h) and (j) plus the **six** entry-point mutants that cannot even be
+applied there, because the arms they edit — including the `verdict_runner_work=` record line added at this
+revision — do not exist in that `disk-reaper.sh`; (i), (j)'s two owner-side mutants and the owner-side
+mutants of (a)—(c)/(h) stay green, which is the correct answer for a case whose subject is the owner.)
 
-⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement.** The class's **record fields** at the
-ENTRY-POINT level (`freed_mb_runner_work=`, `candidates_runner_work=`/`cand_runner_work=`,
-`unmeasurable_runner_work=`, `verdict_runner_work=`, and `--print-status` printing them) are the subject
-of `scripts/disk-reaper-classes.test.sh`. That suite was **killed at 30 minutes with no result** on the
-box that measured this PR (load 180–220), so at that point the record-field delta was **unmeasured** and
-a green run of the owner-level suite below could not be read as covering it. It was then **run to
-completion at load ~15 on the same 8-core box**: `1 failed, 32 passed`, and the single failure is case
-**N** (a tree that CHANGES during the pass is preserved, `reason=toctou`) — the same case and the same
-count as the pre-change baseline, i.e. pre-existing and not this class's. The record fields are therefore
-MEASURED at this head; the caveat that stood here for one revision is recorded rather than dropped
-silently, because "we could not measure it" and "it is fine" are different claims and only the first one
-was true when it was written.
+⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement — BY THE SUITE THAT ACTUALLY ASSERTS IT.**
+The class's **record fields** at the ENTRY-POINT level (`freed_mb_runner_work=`,
+`candidates_runner_work=`/`cand_runner_work=`, `unmeasurable_runner_work=`, `verdict_runner_work=`, and
+`--print-status` rendering them) are asserted by **`scripts/disk-reaper-runner-work.test.sh` case (b)** —
+the only case in that suite that drives a real `--apply` and then reads back the record that pass wrote.
+⛔ **That credit was WRONG for one revision, and wrong in the one direction that matters.** It named
+`scripts/disk-reaper-classes.test.sh` as the suite covering these fields. That suite asserts **nothing**
+about this class: `grep -nE 'runner_work|--print-status' scripts/disk-reaper-classes.test.sh` returns no
+output, and its record-field assertions are `freed_mb_worktree=`, `verdict_worktree=` and
+`freed_mb_duplicate_install=`. So the evidence chain pointed at an instrument that would have stayed
+GREEN with every runner-work assertion deleted — the same shape as the three findings this revision
+exists to fix, an assertion that looks like a check and is not. **The boundary, stated so a reader need
+not infer it:** `classes.test.sh` covers the WORKTREE and DUPLICATE-INSTALL record fields; this class's
+are covered by `runner-work.test.sh` case (b). `verdict_runner_work=` was rendered on that path and
+asserted nowhere **on it** — it is asserted in (f)/(g), and neither of those reaps — so it now reads `ok`
+on the reaping pass (measured at this head), `--print-status` is
+asserted to RENDER it, and deleting the record line turns case (b) red: that mutation is (b)'s second,
+counted in the 13 above.
+The classes suite was **killed at 30 minutes with no result** on the box that measured this PR (load
+180–220), so at that point the record-field delta was **unmeasured** and a green run of the owner-level
+suite below could not be read as covering it. It was then **run to completion at load ~15 on the same
+8-core box**: `1 failed, 32 passed`, and the single failure is case **N** (a tree that CHANGES during the
+pass is preserved, `reason=toctou`) — the same case and the same count as the pre-change baseline, i.e.
+pre-existing and not this class's. That tally is recorded here as what it is — the classes suite's own
+result, on the fields it actually asserts — and **not** as this class's evidence, which it never was. The
+record fields are MEASURED at this head by case (b) (`23 passed, 0 failed, 0 skipped`); the caveat that
+stood here for one revision is recorded rather than dropped silently, because "we could not measure it"
+and "it is fine" are different claims and only the first one was ever true.
 
 The measured transcript, `bash scripts/disk-reaper-runner-work.test.sh`:
 
 ```
-  22 passed, 0 failed, 0 skipped
+  23 passed, 0 failed, 0 skipped
 ```
 
 and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 
 ```
-  8 passed, 14 failed, 0 skipped
+  8 passed, 15 failed, 0 skipped
 ```
 
 **The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
@@ -1179,9 +1195,10 @@ pin the seam to — and recording it as a passing check meant a CELL (which skip
 tally as a laptop on which every arm really ran. The skipped arms are now counted on
 their own line with their reason, so the two runs cannot be mistaken for each other (measured on a box
 told to have real runner roots; `<entry>` is the entry point under test and the second is the mutant
-copy the suite makes in its own `$T`; ⚠️ that run predates case **(j)**, which never skips — on a cell
-today the same two skips print with three more passes, so the line reads `22 passed, 0 failed, 2
-skipped`. The skip COUNT is what was measured there; the `22` is arithmetic, not a re-measurement):
+copy the suite makes in its own `$T`; ⚠️ that run predates case **(j)** AND the `verdict_runner_work=`
+mutant, so its pass count is not this revision's — with the current **23** outcomes and the same two
+skips the line reads `21 passed, 0 failed, 2 skipped`. The skip COUNT and the reasons below are what was
+measured there; the `21` is arithmetic against a suite that has since grown, not a re-measurement):
 
 ```
   22 passed, 0 failed, 2 skipped
@@ -1195,7 +1212,7 @@ follows the skip still runs on both, so a broken default list still reddens a ce
 | case | proves | mutant that must turn it red |
 |---|---|---|
 | (a) | a YOUNG `_work` entry is neither counted nor reaped — in `--dry-run` AND `--apply` | the floor reference becomes `now` |
-| (b) | an OLD entry is counted in dry-run and REMOVED by `--apply`, reported as a `df` delta with a numeric record field; a second pass claims no un-caused delta | the `-newer` test is dropped from the walk |
+| (b) | an OLD entry is counted in dry-run and REMOVED by `--apply`, reported as a `df` delta with a numeric record field; a second pass claims no un-caused delta; and the record carries `verdict_runner_work=ok` **and** `--print-status` RENDERS it (this case is the instrument for the class's record fields) | the `-newer` test is dropped from the walk; and, separately, the `verdict_runner_work=` line is deleted from the pass record |
 | (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the derived retain table is emptied **and** the vendor-namespace default disabled (they are one arm) |
 | (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one | `want_class runner-work` → `true` |
 | (e) | an unknown `--only` value is refused, the valid list names `runner-work`, and a near-miss (`runner`) is refused too | the valid list is shortened in the refusal |

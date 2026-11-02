@@ -25,7 +25,8 @@
 # (`actions/runner` `src/Runner.Common/HostContext.cs` `GetDirectory`: `case WellKnownDirectory.Temp`,
 # `.Actions` and `.Tools` each `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)`, over
 # `Constants.Path.{Temp,Actions,Tool}Directory` = `_temp`/`_actions`/`_tool`; the checkout is
-# `Path.Combine(_workDirectory, trackingConfig.PipelineDirectory)` in `JobExecution`) — so a write there
+# `Path.Combine(_workDirectory, trackingConfig.PipelineDirectory)` at `Runner.Worker/JobExtension.cs:215`,
+# with `_workDirectory = HostContext.GetDirectory(WellKnownDirectory.Work)`) — so a write there
 # does NOT refresh the checkout's floor and it is NOT an in-entry witness. ⛔ AND THAT IS EXACTLY WHY IT
 # IS NOT SAFE ON ITS OWN: "not a child of the checkout" is the SAME sentence as "an entry of `_work`",
 # and `sweep_root` walks every entry of `_work`. While this header said "at the runner root" the
