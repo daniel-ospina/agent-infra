@@ -16,10 +16,14 @@
 #
 # ⛔ THE FALLBACK-ONLY DECISION ABOVE IS AMENDED ON ITS TIMING LEG — deliberately, by owner ruling
 #   (daniel-ospina/tortoise#9878 — the issue that OWNS the fallback-only decision — 2026-11-02), and
-#   NOT by an accident of tidying. #2327 left `WHEN` untouched and
-#   constrained only `WHICH LABEL`; the ruling below moves WHEN, so it is recorded as an override
-#   rather than absorbed silently:
-#     OVERRIDES: the fallback-only timing rule (#2327 / this header) — the pool is offered only while
+#   NOT by an accident of tidying. One consistent reading, because the marker below cites two
+#   artefacts and a reader must not have to guess which decided what: THE RULE BEING OVERRIDDEN IS
+#   THIS HEADER'S OWN fallback-only timing clause ("the pool is offered only while GitHub-hosted is
+#   unhealthy"); `#2327` — cited in the marker below, and the issue that constrained WHICH LABEL each
+#   runner may carry — left `WHEN` untouched. The ruling below moves `WHEN`, so it is recorded as an
+#   override rather than absorbed silently:
+#     OVERRIDES: the fallback-only timing rule (#2327 owns WHICH LABEL; this header owns WHEN) — the
+#       pool is offered only while
 #       GitHub-hosted is unhealthy — because the owner has ruled the pool is capacity BEYOND the
 #       40-job hosted cap (self-hosted jobs do not consume it), so a queue depth that observably
 #       stalls work, not an outage, is the correct trigger. The incident that rule protected against
@@ -1031,7 +1035,8 @@ set_labels() { # $1 = on|off
   # ⛔ THE ARM IS CAPPED ON ENGAGE AND UNCAPPED ON DISENGAGE — `arm_ids` documents why the asymmetry
   # is the safety property. A bound that cannot be computed REFUSES the pass rather than falling back
   # to the full pool, so a bad variable can never silently widen the blast radius.
-  local ARM_IDS ARM_BOUND ARM_COMPLEMENT
+  local ARM_IDS ARM_BOUND ARM_COMPLEMENT ARM_EMPTY
+  ARM_EMPTY=0
   if ! ARM_IDS="$(arm_ids "$rows" "$eng")"; then
     log "WARNING: fallback arm bound UNREADABLE (CI_GATE_FALLBACK_ARM_MAX='${FALLBACK_ARM_MAX}') — no labels changed"
     return 1
@@ -1047,9 +1052,17 @@ set_labels() { # $1 = on|off
     ARM_COMPLEMENT="$(printf '%s\n' $(managed_ids "$rows") | awk -v a=" $(printf '%s' "$ARM_IDS" | tr '\n' ' ') " 'index(a, " " $0 " ")==0')"
     # A cap that leaves the pool with NO carrier is refused rather than reported as a successful
     # engage with nothing on it (the GNU-`head` failure mode the `awk` above removes structurally).
+    # ⛔ THE REFUSAL IS DEFERRED TO BELOW THE COMPLEMENT SWEEP (agent-infra#3261 review P1). It used
+    # to `return 1` HERE, before the loop at "The complement is disarmed FIRST", while the message
+    # claimed "the complement was disarmed above" — a log line asserting an action that had not run.
+    # The `FALLBACK_ARM_MAX=0` contract (:184-185) is exactly "the pool is RELEASED and the engaging
+    # pass refuses", so the release is the part that must happen first; measured before this fix,
+    # cap=0 produced `rc=1` with **0** PUTs, stranding `ubuntu-latest` on every pool member where it
+    # keeps accepting CI and is never swept, because every later pass refuses for the same reason.
+    # With the refusal below the loop, an EMPTY arm's complement is the WHOLE managed set and the
+    # claim is true by construction — the message can no longer outrun the loop.
     if [ -z "$ARM_IDS" ] && [ -n "$(managed_ids "$rows")" ]; then
-      log "WARNING: fallback arm resolved EMPTY against a non-empty pool (CI_GATE_FALLBACK_ARM_MAX='${FALLBACK_ARM_MAX}') — the fallback is DISARMED by configuration, so no labels changed and the pool is not offered; the complement was disarmed above"
-      return 1
+      ARM_EMPTY=1
     fi
   else
     ARM_BOUND="uncapped"
@@ -1071,6 +1084,25 @@ set_labels() { # $1 = on|off
       fail=$((fail+1))
     fi
   done
+  # ⛔ REFUSED ONLY NOW, BECAUSE THE CONTRACT IS "DISARMED, THEN REFUSED" (agent-infra#3261 P1).
+  # See the ARM_EMPTY assignment above: the pool has been released by the loop immediately preceding
+  # this, so "the complement was disarmed above" names an action that actually ran, and an operator's
+  # "switch the fallback off" gesture fails closed with the label swept instead of stranded.
+  # The refusal still precedes the ARM_IDS loop, so a zero-carrier arm never engages anything.
+  # ⛔ "TRUE BY CONSTRUCTION" IS ONLY TRUE WHEN THE SWEEP FULLY SUCCEEDED (review P2, #3261). A managed
+  # runner that cannot be classified from its own host label logs `left as-is`, raises `fail`, and KEEPS
+  # the label — measured on such a fixture: 103 left as-is, ok=2 fail=1, PUTs=2. A bare "the complement
+  # was disarmed above" would then name an action that did not complete, which is the same defect class
+  # at reduced scope. So the clause is conditioned on `fail=0`, and the failing branch quotes its counts
+  # rather than dropping the claim silently.
+  if [ "$ARM_EMPTY" -eq 1 ]; then
+    if [ "$fail" -eq 0 ]; then
+      log "WARNING: fallback arm resolved EMPTY against a non-empty pool (CI_GATE_FALLBACK_ARM_MAX='${FALLBACK_ARM_MAX}') — the fallback is DISARMED by configuration, the complement was disarmed above, and the engaging pass refuses"
+    else
+      log "WARNING: fallback arm resolved EMPTY against a non-empty pool (CI_GATE_FALLBACK_ARM_MAX='${FALLBACK_ARM_MAX}') — the fallback is DISARMED by configuration and the engaging pass refuses; but the complement sweep above left $fail runner(s) NOT disarmed (ok=$ok fail=$fail), so those runners still carry the label"
+    fi
+    return 1
+  fi
   for id in $ARM_IDS; do
     if ! body="$(labels_for "$rows" "$id" "$eng")"; then
       log "WARNING: runner $id is not classifiable from its own host label — left as-is"
