@@ -1465,7 +1465,11 @@ check_graph_client() {
   # rule. Reporting `ok` on an ambient-only export would certify a box whose every lane reports NO-KEY.
   local in_file="unknown"
   if [ -r "$ENV_FILE" ]; then
-    if env -u TORTOISE_MCP_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${TORTOISE_MCP_API_KEY:-}" ]' _ "$ENV_FILE" 2>/dev/null; then
+    # The `&& printf x` sentinel is the supervisor idiom's whole point: the exit STATUS alone cannot
+    # separate "the test ran and found the key" from "the file terminated the shell before the test"
+    # (a `keys.env` with an early `exit 0` satisfies `if` on status 0). Only a value that came out of
+    # the subshell proves the test ran.
+    if env -u TORTOISE_MCP_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${TORTOISE_MCP_API_KEY:-}" ] && printf x' _ "$ENV_FILE" 2>/dev/null | grep -q x; then
       in_file="set"
     else
       in_file="unset"

@@ -585,7 +585,9 @@ fi
 #     fleet has no secret store wired to it — `keys.env` on a cell and `pi-keys.env` on a Mac are
 #     PUSHED BY HAND. So `TORTOISE_MCP_API_KEY` must be present there for the mandate to run, and
 #     until it is, `cloud-cell-bringup.sh --check` WARNS by variable NAME (never its value) after the
-#     layer is installed, while the client itself fails CLOSED with `GRAPH-UNREACHABLE(NO-KEY)`.
+#     layer is installed, while the client itself fails CLOSED with `GRAPH-UNREACHABLE(NO-KEY)` when
+#     NEITHER name is set (it falls back to `TORTOISE_API_KEY`, the REST key, and lets the endpoint
+#     answer — that is a different key for a different transport, so it may be rejected).
 #     A silent skip is the one outcome worse than the outage; that is what these two lines prevent.
 #   * NOT a second client: `scripts/tortoise-memory.mjs` is the REST client (`TORTOISE_API_KEY`,
 #     /v1/points) the research skill uses. Different transport, different key, different failure
