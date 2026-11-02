@@ -759,7 +759,7 @@ if [ "$SURFACE" -eq 1 ]; then
       # The model that holds is positional, not counted: skip wrapper words, their options and those
       # options' VALUES, then the FIRST remaining word is the COMMAND. If the command is not a shell,
       # the prefix is closed for good — nothing later can arm it.
-      _pfx=1; _seen=0; _optval=0; _wrap=""
+      _pfx=1; _seen=0; _optval=0; _wrap=""; _noexec=0
       while [ "$_i" -lt "$_n" ]; do
         _w="${_argv[$_i]}"
         # ⛔ ARM ONLY ON A REAL INTERPRETER, IN COMMAND POSITION, AND NOT WHILE SWALLOWING AN OPTION'S
@@ -792,7 +792,13 @@ if [ "$SURFACE" -eq 1 ]; then
             # `_script` from the absolute spelling, and once #10114 makes an `executes:` token red a pass
             # that is a healthy box reddened by a grep. Only argv[0] (a direct shebang exec) or an
             # interpreter may nominate the script; the `-c` arm below already had exactly this rule.
-            if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
+            # ⛔ A PARSE-ONLY RUN DOES NOT EXECUTE THE FILE (review round 17, P2). `bash -n <abs>`,
+            # `-D`, `-en` read the script without running it — the inverse of the fact an `executes:`
+            # token asserts — yet they nominated the path and reddened a healthy box with a durable
+            # `drift=drift:executes:…`. `bash -o noexec <abs>` was ALREADY a mention (the unused word
+            # closes the prefix), so the two spellings of one fact were graded differently. `_noexec`
+            # closes that split: the shell's own noexec option means nothing after it is executed.
+            if [ "$_noexec" -eq 0 ] && { [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; }; then _script="$_w"; else _text=1; fi ;;
           orch-loop.sh|*/orch-loop.sh)
             # ⛔ THE SAME RULE ON BOTH ARMS (review round 7, P1 — a REGRESSION this diff introduced).
             # Gating only the absolute arm dropped `cd <dir> && ./orch-loop.sh`, a start shape this
@@ -801,7 +807,7 @@ if [ "$SURFACE" -eq 1 ]; then
             # rc 0 with NO `executes:` token — the silent green restored for that spelling, which the
             # pre-change code caught. The `_i -eq 0` half is what keeps argv[0] working; the
             # `_interp` half is what keeps `grep -n x orch-loop.sh` (the word at `_i > 0`) a mention.
-            if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
+            if [ "$_noexec" -eq 0 ] && { [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; }; then _script="$_w"; else _text=1; fi ;;
           -c|-[!-]*c)
             # ⛔ ONLY AN INTERPRETER ALREADY IDENTIFIED OWNS A `-c` COMMAND STRING (review round 14,
             # P2). `sudo` and `setsid` are both in the WRAPPER list and both have their own `-c`
@@ -836,7 +842,7 @@ if [ "$SURFACE" -eq 1 ]; then
             else
             _i=$((_i + 1)); _c="${_argv[$_i]:-}"; _c1="${_c%%[[:space:]]*}"
             case "$_c1" in
-              /*/orch-loop.sh) _script="$_c1" ;;
+              /*/orch-loop.sh) [ "$_noexec" -eq 1 ] || _script="$_c1" ;;
               *orch-loop.sh*) _text=1 ;;
             esac
             # ⛔ CLOSE THE PREFIX HERE (review VGATE of round 8). This arm ADVANCES `_i` past the command
@@ -884,7 +890,19 @@ if [ "$SURFACE" -eq 1 ]; then
               # direction: a missed operand costs a MENTION (declared residual below), while a wrong
               # claim costs a FABRICATED `executes:` — a red on a healthy box. Long options that carry
               # their value in the same word (`--opt=value`) claim nothing, and `--` claims nothing.
-              if [ "$_seen" -eq 1 ]; then _optval=0; else
+              if [ "$_seen" -eq 1 ]; then
+                # ⛔ A SHELL'S OWN NOEXEC OPTION (review round 17, P2) — recognised HERE, in the
+                # branch for a shell's options, because the same letters mean the opposite for a
+                # wrapper: `sudo -n` is ordinary sudo, not "do not execute". Putting this in the
+                # table's branch made `sudo -n bash <gone>/orch-loop.sh` a mention — the silent green
+                # round 16 had just closed. `-n`, `-D`, `--noexec` and any short cluster containing
+                # `n` (`-en`, `-xn`, `-ln`) all mean "read the script, do not run it".
+                _optval=0
+                case "$_w" in
+                  -D|--noexec|-n) _noexec=1 ;;
+                  -[!-]*n*) _noexec=1 ;;
+                esac
+              else
                 case "$_w" in
                   --) _optval=0 ;;
                   --*=*) _optval=0 ;;
@@ -915,9 +933,9 @@ if [ "$SURFACE" -eq 1 ]; then
                   # `-L`, `-n`, `-s`, `-u user`), so it is deliberately not named here — this table's
                   # job is recording which options take a value, and a phantom option would be
                   # inherited by the next edit.
-                  # ⛔ THE TABLE IS THE ONLY DECIDER: the `-c|-[!-]*c)` arm above also assigns
-                  # `_optval`, but every `-`-leading word reaches this arm afterwards in the SAME
-                  # iteration and is overwritten — that assignment is inert (round 16, P2).
+                  # ⛔ THE TABLE IS THE ONLY DECIDER: the `-c|-[!-]*c)` arm above assigns NO
+                  # `_optval` (round 16, P2), so nothing is overwritten here — this entry is the sole
+                  # source of the claim, which is why it is gated on `_wrap`.
                   -c) case "$_wrap" in sudo) _optval=1 ;; *) _optval=0 ;; esac ;;
                   # ⛔ A COMBINED CLUSTER THAT ENDS IN A VALUE-TAKING LETTER CLAIMS ITS OPERAND (review
                   # round 14, P1). `sudo -iu <user> bash` and `sudo -Eu <user> bash` are the canonical
@@ -1297,7 +1315,14 @@ if [ "$problems" -gt 0 ]; then
   exit 1
 fi
 if [ "$O_ABSENT" -eq 0 ]; then
-  note "OK: deployed $O matches $REPO@$REF ($TIP_SHORT) — recorded commit ${HAS:0:12} [current] (record: $RECORD)"
+  # ⛔ THE CLEAN PATH EMITS THE TOKEN TOO (review round 17, P2). It used to print `[current]` and no
+  # `harness=` at all, so `drift=clean:current` — the value `docs/ops/harness-apply.md` documents and
+  # BOTH fixtures model — was a shape production never emitted: a clean run fell through the reader's
+  # `sed -n 's/.*harness=//p'` to its `clean:rc=0` fallback instead. Anything keyed on the documented
+  # value (`grep 'drift=clean:current'`) could never fire, and because the fixtures asserted the
+  # unreachable shape, nothing in the suite could notice if this line changed. Same class as the
+  # `not-run:not-run` this change already fixed: a fixture must describe what production writes.
+  note "OK: deployed $O matches $REPO@$REF ($TIP_SHORT) — recorded commit ${HAS:0:12} [current] (record: $RECORD) harness=current"
 elif [ -d "$O" ]; then
   # ⛔ `O_ABSENT` MEANS TWO THINGS AND THE SENTENCE BELOW MUST NOT. It is set both when there is no $O and
   # when there IS one whose record is unusable (`--surface` keeps going in that case, by design). Reusing

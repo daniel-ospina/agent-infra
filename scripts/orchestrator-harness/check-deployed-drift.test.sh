@@ -605,19 +605,28 @@ for _r in 'sudo -iu deploy bash' 'sudo -Eu deploy bash' 'sudo -c staff bash' \
   ck "10a-3e: '$_r <abs>/orch-loop.sh' is still an INVOCATION (round-13/15 regression)" \
      "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
 done
-# ⛔ AND THE CLUSTER ARM MUST NOT CLAIM A WRAPPER **FLAG** AS IF IT TOOK A VALUE (review round 15, P1).
+# ⛔ AND A WRAPPER **FLAG** MUST NOT BE CLAIMED AS IF IT TOOK A VALUE (review rounds 15-16, P1).
 # Round 14's cluster class included sudo's `n s k e S` — flags, not value-taking options — so
 # `sudo -En bash <abs>` claimed `bash` as `-En`'s operand and the launcher became a mention, and
-# `sudo -Hn grep bash <abs>` fabricated a controller out of a grep PATTERN. Both directions were
-# measured against the lane's head before being fixed; these two hold the fabrication side.
-# ⛔ THE SAME DEFECT SURVIVED IN THE SINGLE-LETTER ARM (review round 16, P1): `sudo -n bash <abs>`
-# was a MENTION at 6fb6a5b50 — and `sudo -n` is this repo's default privilege prefix in four
-# installers, so the silent green was on the common path. The four INVOCATIONS in 10a-3e above
-# (`sudo -n`, `-S`, `-k`, `doas -n`) pin that arm; these hold its fabricating side.
+# `sudo -Hn grep bash <abs>` fabricated a controller out of a grep PATTERN. The same defect survived
+# in the SINGLE-LETTER arm (`sudo -n bash <abs>`), and `sudo -n` is this repo's default privilege
+# prefix in four installers — so the silent green was on the common path. These hold the fabricating
+# side; the INVOCATIONS that hold the other side are in 10a-3e above.
 for _f in 'sudo -Hn grep bash' 'sudo -En cat sh' 'sudo -n grep -n sh'; do
   printf '4262 %s %s/orch-loop.sh\n' "$_f" "$GONE" > "$TMP/ps-flagcluster"
   surf "$TMP/ps-flagcluster"
   ck "10a-3e: '$_f <abs>/orch-loop.sh' is a MENTION (a wrapper FLAG claims no operand)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+# ⛔ A PARSE-ONLY RUN IS NOT AN EXECUTION (review round 17, P2). `bash -n <abs>`, `sh -n`, `-D` and any
+# short cluster containing `n` (but NOT a wrapper's `-n`, which is ordinary sudo) read the script
+# without running it — the INVERSE of the fact `executes:` asserts — yet they nominated the path and
+# reddened a healthy box with a durable `drift=drift:executes:`. `bash -o noexec <abs>` was already a
+# mention, so one fact had two grades; `_noexec` closes the split.
+for _p in 'bash -n' 'sh -n' 'bash -D' 'bash -en' 'bash -xn'; do
+  printf '4263 %s %s/orch-loop.sh\n' "$_p" "$GONE" > "$TMP/ps-parseonly"
+  surf "$TMP/ps-parseonly"
+  ck "10a-3e: '$_p <abs>/orch-loop.sh' is a MENTION (parse-only does not execute)" \
      "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
 done
 # (10a-4) A TRAILING PATH AFTER A `-c` STRING IS `$0`, NOT THE SCRIPT (review VGATE of round 8). The
