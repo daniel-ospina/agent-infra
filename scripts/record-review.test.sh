@@ -5144,7 +5144,7 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
         export STUB_HEAD_SHA="$sha" DELTA_GIT_DIR="$DG"
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main
-        export STUB_COMMIT_DATES_DIR="$T/dates"
+        export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         for kv in "$@"; do export "$kv"; done
         rc=0
         bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" 2>"$errfile" || rc=$?
@@ -5310,8 +5310,9 @@ git commit -qm 'lane edits f'
 DG_EV_L="$(git rev-parse HEAD)"
 git checkout -q "$DG_MAIN" >/dev/null 2>&1
 printf 'base side\n' > f.txt; git add -A
-git commit -qm 'base edits f'
+GIT_COMMITTER_DATE='2025-07-01T00:00:00Z' GIT_AUTHOR_DATE='2025-07-01T00:00:00Z' git commit -qm 'base edits f'
 DG_EV_B="$(git rev-parse HEAD)"
+printf '%s\n' '2025-07-01T00:00:00Z' > "$T/dates/$DG_EV_B"
 git checkout -q evil >/dev/null 2>&1
 git -c core.editor=true merge --no-ff "$DG_EV_B" -m 'merge base (CONFLICT)' >/dev/null 2>&1 || true
 printf 'EVIL RESOLUTION nobody reviewed\n' > f.txt; git add -A
@@ -5359,6 +5360,72 @@ assert_contains "$RECORD_ERR" "cannot read the range from a checkout of" "20h4 t
 EH5=425134; rm -f "$(Q2 $EH5)"
 run_record_delta $EH5 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" DELTA_GIT_DIR="$T/not-a-repo"
 assert_eq "$RECORD_RC" "3" "20h4 a directory that is not a checkout is refused (rc 3)"
+
+# 20h5 A COVER DATED BETWEEN the authored work and an EVIL MERGE must REFUSE: the
+#      anchor is the newest commit the verdict had to postdate, and a hand-resolved
+#      merge is authored content even though `--no-merges` cannot see it.
+git checkout -q evil >/dev/null 2>&1
+git checkout -q -b evil2 "$DG_EV_L" >/dev/null 2>&1
+printf 'lane 2\n' > l2.txt; git add -A
+GIT_COMMITTER_DATE='2025-12-01T00:00:00Z' GIT_AUTHOR_DATE='2025-12-01T00:00:00Z' git commit -qm 'more lane work'
+DG_L2="$(git rev-parse HEAD)"
+printf '%s\n' '2025-12-01T00:00:00Z' > "$T/dates/$DG_L2"
+git -c core.editor=true merge --no-ff "$DG_EV_B" -m 'merge base again' >/dev/null 2>&1 || true
+printf 'EVIL RESOLUTION 2\n' > f.txt; git add -A
+GIT_COMMITTER_DATE='2026-02-01T00:00:00Z' GIT_AUTHOR_DATE='2026-02-01T00:00:00Z' \
+  git -c core.editor=true commit -qm 'resolve again' >/dev/null 2>&1 || true
+DG_EV2_HEAD="$(git rev-parse HEAD)"
+printf '%s\n' '2026-02-01T00:00:00Z' > "$T/dates/$DG_EV2_HEAD"
+EH6=425135; rm -f "$(Q2 $EH6)"
+run_record_delta $EH6 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42513501" \
+    STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20h5 a cover predating an EVIL MERGE is refused (the merge is in the anchor set)"
+assert_eq "$(cat "$(Q2 $EH6)" 2>/dev/null | wc -c | tr -d ' ')" "0" "20h5 no record written"
+# and the SAME range with a cover that postdates the merge IS accepted — the arm
+# refuses the ordering, not the shape.
+EH7=425136; rm -f "$(Q2 $EH7)"
+run_record_delta $EH7 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42513601" \
+    STUB_EVIDENCE_AT="2026-03-01T00:00:00Z"
+assert_eq "$RECORD_RC" "0" "20h5 a cover that postdates the evil merge still records (arm is an ordering test)"
+
+# 20h6 A NON-REVIEW TIER CANNOT BE LAUNDERED. A prior clean-micro/clean-low record
+#      attests no review, so extending it into a `clean` delta would claim one.
+for _tier in clean-micro clean-low; do
+    EH8=425137; rm -f "$(Q2 $EH8)"
+    printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
+      "$EH8" "$DG_A1" "$_tier" > "$(Q2 $EH8)"
+    run_record_delta $EH8 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
+    assert_eq "$RECORD_RC" "3" "20h6 a prior $_tier record is NOT a review → merge-only delta refused (rc 3)"
+    assert_contains "$(cat "$(Q2 $EH8)" 2>/dev/null || true)" "\"verdict\":\"$_tier\"" "20h6 the planted $_tier record was not overwritten"
+done
+
+# 20h7 THE ANCHOR IS THE MAX BY COMMITTER DATE, not the tip. A backdated child must
+#      not drag the anchor earlier than its own parent.
+git checkout -q -b dated "$DG_A1" >/dev/null 2>&1
+printf 'p\n' > p.txt; git add -A
+GIT_COMMITTER_DATE='2025-06-20T00:00:00Z' GIT_AUTHOR_DATE='2025-06-20T00:00:00Z' git commit -qm 'parent (newer)'
+DG_P="$(git rev-parse HEAD)"
+printf 'c\n' > c.txt; git add -A
+GIT_COMMITTER_DATE='2025-06-01T00:00:00Z' GIT_AUTHOR_DATE='2025-06-01T00:00:00Z' git commit -qm 'child (backdated)'
+DG_C="$(git rev-parse HEAD)"
+printf '%s\n' '2025-06-20T00:00:00Z' > "$T/dates/$DG_P"
+printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_C"
+EH9=425138; rm -f "$(Q2 $EH9)"
+run_record_delta $EH9 "$DG_C" "delta:$DG_A1..$DG_C+comment:42513801" STUB_EVIDENCE_AT="2025-06-10T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20h7 a cover predating the NEWEST-DATED authored commit is refused (anchor is the max, not the tip)"
+EH10=425139; rm -f "$(Q2 $EH10)"
+run_record_delta $EH10 "$DG_C" "delta:$DG_A1..$DG_C+comment:42513901" STUB_EVIDENCE_AT="2025-07-01T00:00:00Z"
+assert_eq "$RECORD_RC" "0" "20h7 a cover postdating it still records"
+
+# 20h8 — NOT VECTORED, and declared rather than hidden: the anchor set adds only the
+# NON-CLEAN merges (so a clean forward merge of the base cannot re-charge the
+# agent-infra#3245 cost), but `git merge-tree --write-tree` reports an
+# ancestor/descendant parent pair as a non-clean merge, so a NAMED RESIDUAL remains:
+# a range holding BOTH a hand-resolved merge and a merge whose parents are in an
+# ancestor relationship pushes the anchor later than the authored work. It is
+# fail-closed (over-block, never a bypass), it cannot occur on the #3245 path (a
+# conflict-free base merge lands with unrelated parents), and it is tracked on the
+# PR rather than papered over with a vector that cannot express it.
 
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
@@ -5470,6 +5537,26 @@ mut_check "M5 covering-verdict anchor" 425124 "$DG_HEAD" "delta:$DG_BASE..$DG_HE
 #      REFUSE the merge-only acceptance vector, or 20a tests nothing).
 MUT="$(mk_mutant baseaware 'rev-list --no-merges "$from..$to" --not "$base_sha"' 'rev-list --no-merges "$from..$to"')"
 mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
+# M7 — the EVIL MERGE in the anchor candidate set. 20h5's cover predates the
+#      hand-resolved merge, so dropping the merges from `cands` must ACCEPT it.
+MUT="$(mk_mutant evilanchor '    if [ -n "$evil" ]; then' '    if false; then')"
+mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42514001" accepted STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+# M8 — the TIER arm. Widening the premise back to the non-review tiers must let a
+#      clean-micro prior record mint `clean`. Inline, not via mut_check: mut_check
+#      clears the record and this vector's premise IS a planted record.
+MUT="$(mk_mutant tier "case \"\$prior_verdict\" in clean) : ;; *) prior_verdict=\"\" ;; esac" \
+                "case \"\$prior_verdict\" in clean|clean-micro|clean-low) : ;; *) prior_verdict=\"\" ;; esac")"
+MM=$((MM+1))
+if [ ! -s "${MUT:-}" ]; then
+    bad "20g M8 tier arm: the mutant could not be built — this vector was NOT measured"
+else
+    rm -f "$(Q2 425141)"
+    printf '{"pr":%d,"head_sha":"%s","verdict":"clean-micro","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
+      425141 "$DG_A1" > "$(Q2 425141)"
+    mut_run "$MUT" 425141 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
+    if [ "$RECORD_RC" = "0" ]; then MM_OK=$((MM_OK+1)); ok "20g M8 tier arm: guard removed → a clean-micro prior record mints 'clean' (rc 0), so 20h6 is load-bearing"
+    else bad "20g M8 tier arm: mutant still refused (rc=$RECORD_RC) — the vector is vacuous"; fi
+fi
 echo "   MUTATION-MATRIX($MM_OK/$MM)"
 set -e
 if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every guard is load-bearing"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi

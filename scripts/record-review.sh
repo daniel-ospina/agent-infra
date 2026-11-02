@@ -195,9 +195,11 @@
 # B not the head being recorded, a measurably RED target head (clause E), an
 # EMPTY `git diff A..B`, an AUTHORED range — including one whose MERGE COMMITS are
 # not clean merges of their parents, because a conflict resolution lives only in
-# the merge commit — with no covering verdict, a MERGE-ONLY range whose A is not
-# an attested head (a delta EXTENDS an attestation, it never creates one), and a
-# covering verdict that does not postdate the range's newest authored commit. The record carries `delta_range`, `delta_kind` and
+# the merge commit — with no covering verdict, a MERGE-ONLY range whose A is not a
+# head recorded `clean` (a delta EXTENDS an attestation, it never creates one; a
+# clean-micro/clean-low record attests no review and cannot be the premise), and a
+# covering verdict that does not postdate the range's newest authored-or-conflict
+# commit. The record carries `delta_range`, `delta_kind` and
 # `delta_digest` so the claim stays checkable long after the mint: a reader can
 # re-derive the range, its classification (against the STORED `delta_base`) and
 # the digest from the two shas, and a rewritten history moves them.
@@ -1074,7 +1076,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual=""
+  local merges_in_range="" evil="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1231,14 +1233,25 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   done <<< "$merges_in_range"
   if [ -n "$authored" ] || [ -n "$evil" ]; then
     n_authored="$(printf '%s\n' "$authored" | grep -c . || true)"
-    # The newest authored commit is what a covering verdict must have seen, and it
-    # must be picked by COMMITTER DATE, not by walk order: rev-list's default order
-    # is reverse chronological only when the dates are monotonic, and commit dates
-    # are author-declared (this suite's own fixture sets them), so a backdated child
-    # would otherwise masquerade as the newest. Same predicate as (7), plus
-    # --date-order, and NO pipe into `head` (SIGPIPE under pipefail).
-    newest="$(delta_git "$root" log --no-merges --date-order --format='%cI %H' \
-                 "$from..$to" --not "$base_sha" 2>/dev/null | awk 'NR==1{print $2}' || true)"
+    # THE ANCHOR: the newest commit a covering verdict must have POSTDATED.
+    # ⛔ Two traps, both measured on this change:
+    #  (1) `git log` CANNOT order by date on a linear range — it must emit the tip
+    #      first — so `--date-order | awk 'NR==1'` returns the TIP, never the max. A
+    #      backdated child then masquerades as the newest. Compute the MAX over
+    #      `%ct` with sort instead (sort, not head: no SIGPIPE under pipefail).
+    #  (2) `--no-merges` cannot contain the merge commit, so when the range holds an
+    #      EVIL MERGE the anchor would be an older non-merge commit and a verdict
+    #      written BEFORE the hand-resolution would still verify — attesting
+    #      unreviewed conflict lines. So the candidate set is the authored commits
+    #      PLUS (when any merge is not a clean merge) those merges.
+    cands="$authored"
+    if [ -n "$evil" ]; then
+      cands="$cands
+$merges_in_range"
+    fi
+    # shellcheck disable=SC2086  # intentional word-split: one sha per line
+    newest="$(delta_git "$root" log --no-walk=unsorted --format='%ct %H' $cands 2>/dev/null \
+                 | sort -rn | awk 'NR==1{print $2}' || true)"
     DELTA_KIND="authored"
   else
     DELTA_KIND="merge-only"
@@ -1313,9 +1326,14 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
         fi
         prior_head=""
       done
-      case "$prior_verdict" in clean|clean-low|clean-micro) : ;; *) prior_verdict="" ;; esac
+      # ⛔ ONLY `clean` IS A REVIEW. clean-low certifies the content SHAPE and
+      # clean-micro the micro PROCESS — this file documents both as NOT reviews, so
+      # extending one of them into a `clean` record would launder a no-review tier
+      # into a full-review claim (found in review of this change, reproduced both
+      # ways). A micro/low PR keeps recording its own verdict and needs no delta.
+      case "$prior_verdict" in clean) : ;; *) prior_verdict="" ;; esac
       if [ -z "$prior_verdict" ]; then
-        echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit, but ${from:0:12}… is NOT an attested head on this box (no clean-family record names it) and no covering verdict was given. A delta EXTENDS an attestation and can never create one — otherwise any two shas with only merges between them would mint 'clean' over content nobody reviewed." >&2
+        echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit, but ${from:0:12}… is NOT an attested head on this box (no clean record names it) and no covering verdict was given. A delta EXTENDS an attestation and can never create one — otherwise any two shas with only merges between them would mint 'clean' over content nobody reviewed." >&2
         echo "   → review at ${from:0:12}… and record that head first, or name the verdict that covered it: --evidence delta:$from..$to+comment:<id>." >&2
         return 1
       fi
