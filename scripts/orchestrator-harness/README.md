@@ -1326,7 +1326,7 @@ bytes"). Every drift token below names a problem; `current` names the absence of
 | `harness=incomplete:<file>` | (a) | the record names `<file>` and `$O` does not have it — the deployed tree is **incomplete**; nothing was edited and no byte differs | redeploy: it **creates** the file; nothing you wrote is discarded |
 | `harness=payload-differs` | (b) | the bytes differ from the checkout but the record still describes `$O` (e.g. the checkout moved on) | redeploy to adopt |
 | `harness=executes:<dir>` | **neither — it is a statement about the PROCESS** | a live controller is **executing** `<dir>/orch-loop.sh` and that directory **cannot be matched to this repo**: it **does not exist**, *or* it exists with **no readable `*.sh`** (the interpreter holds a deleted script open, so the process outlives the file) — the `DRIFT(exec)` line above the token says which of the two (`--surface` reads it from the process's own argv, `ps -eo pid=,command=` with `/proc/<pid>/cmdline` where the kernel keeps it, so it is what the box runs rather than what a record says). The pin record, the deploy record and the unit can all be correct — they describe copies at rest — while the tree that is running is one of those two states (#10114, #3194) | **restart the controller from the pinned tree** (`scripts/harness-up`); redeploying `$O` cannot clear it |
-| `harness=surface` | neither — not a statement about `$O`'s bytes | a surface hit on a **different** harness dir this box carries (the running controller's, `~/orchestrator`, a cell's copy) is the only failing comparison. It appears in **two shapes**: `$O`'s own bytes are not what failed — either it was genuinely ABSENT, or a `--surface` run found no readable record for it while still comparing it against `$REF` as a surface candidate whenever `$O` IS a harness dir (the body prints `identity: SKIPPED`, so what that shape could not answer is the **record identity** question, not `$O`'s bytes) — **or** `$O` was compared and answered clean on all three questions | reseed *that* dir (or move the box onto the pin: `scripts/harness-up`); redeploying `$O` cannot clear it. On the first shape `$O` also has no usable deploy record, so redeploying is what would make the box identifiable |
+| `harness=surface` | (b) on a copy — see the two shapes | a **copy at rest that this box carries** has drifted from `$REF`. The body NAMES the dir (`surface: <dir>`), and that dir may be `$O` or another one (`~/orchestrator`, a cell's copy, the running controller's). It appears in **two shapes**: `$O` has **no readable record** — then the token is `surface` for *any* surface drift, `$O`'s included, because `$O` is compared against `$REF` as a surface candidate even without a record (the body prints `identity: SKIPPED`; what that shape cannot answer is **record identity**, and an `$O` that drifted will be the dir named) — **or** `$O` answered all three questions and the drift is another dir | **reseed the dir the body names** (or move the box onto the pin: `scripts/harness-up`). Read the name: if it is `$O`, a redeploy/`apply` DOES clear it, and on the record-less shape it also makes the box identifiable; if it is another dir, redeploying `$O` cannot clear it. ⛔ The comparison scope is **top-level `*.sh`** in the harness rel: a hand patch to a non-`.sh` file is invisible on the record-less shape and only the record form (`uncommitted-edit`) catches it |
 
 ### Precedence when more than one state is true
 
@@ -1336,7 +1336,7 @@ answer to "which fact does an operator act on first": the code that is RUNNING c
 repo at all (and no redeploy of `$O` reaches it), then unrecoverable bytes, then where the box sits, then
 code that is missing, then a record that cannot describe the box at all, then the last two.
 
-**`surface` is never a statement about `$O`'s own bytes, and it has TWO shapes.** The token is printed
+**`surface` names a COMPARED COPY, and it has TWO shapes.** It is not a claim about `$O`'s *identity*, but it is not silent about `$O`'s bytes either: `$O` is in the surface candidate list whenever it is a harness dir, and with no readable record it has no exclusion, so an `$O` that drifted IS compared and IS named in the body. The token is printed
 on every **CONCLUDED** exit — 0 (`harness=current`) and 1 (a drift token) — so a clean run is
 positively identifiable and a reader that sees no token has learned that the run did not conclude.
 ⛔ But "no token" is **not** one state: an exit-**2** run (the `UNKNOWN:` and `BROKEN` arms) prints no
@@ -1349,7 +1349,7 @@ its absence) before naming a cause:
 |---|---|---|
 | `drift=not-run:absent` | the checker was never FOUND (the search found no `check-deployed-drift.sh`) | checker discovery / deployment of the checker |
 | `drift=disabled:disabled` | the seam was switched off (`HARNESS_APPLY_DRIFT_CHECK=0`) | nothing — this is an operator choice, not a finding |
-| `drift=not-run` (**bare**, no token) | the pass REFUSED before the reading (rc 23; see `action=` — `no-checkout`, `unresolvable-ref`) | the path in `action=`, **not** discovery |
+| `drift=not-run` (**bare**, no token) | the pass REFUSED before the reading (rc 23; see `action=` — `no-checkout`, `unresolvable-ref`, `unresolvable-head`) | the path in `action=`, **not** discovery |
 
 The distinction has a different cause and a different remedy (a `cannot-verify` box needs the reason
 read out of the log; the `not-run` rows need the specific producer above). `docs/ops/harness-apply.md`
@@ -1361,17 +1361,20 @@ What must never happen — and was exactly this P0 (#10114) — is a **concluded
 with no `$O` abstains, so the `O_ABSENT` arm can only be reached when the **surface pass** is what
 differed. On that shape `$O`'s bytes may still have been compared — `check-deployed-drift.sh` adds `$O`
 to the surface candidate list whenever `$O` IS a harness dir, so a `--surface` run against a
-record-less `$O` DOES compare it and a hand patch there reds the box — what that shape cannot answer is
+record-less `$O` DOES compare it, and a hand patch to a top-level `*.sh` there reds the box (non-`.sh` files a deploy writes are NOT compared on that shape — only the record form catches those) — what that shape cannot answer is
 the **record identity** question (the body prints `identity: SKIPPED`); on the other shape `$O` **was**
 compared and answered clean on all three questions, which is the `Q_BYTES=0` precondition — a
 condition on *that* arm alone, not on `surface` as a token. `$O`-absent alone still emits
 the token (`harness=current`, with the caveat in the sentence), because the claim the token carries is
 about the **dirs' bytes matching `$REF`**, and a token's ABSENCE would claim the check never ran.
 
-**The last two are therefore ALTERNATIVES, not a chain:** a surface hit that coincides with `$O`'s
-own bytes differing reports `payload-differs` — and the other-directory fact is then carried by the
-report body's "for a surface hit, reseed the copy the RUNNING component uses" line, not by the
-token. It is stated here rather than left to the `if` order in the code; `check-deployed-drift.test.sh`
+**The last two are therefore ALTERNATIVES, not a chain — and which one you get depends on whether a
+record exists, not on where the drift is.** With a record for `$O` (`O_ABSENT=0`), a surface hit that
+coincides with `$O`'s own bytes differing reports `payload-differs`, and the other-directory fact is
+carried by the report body's "for a surface hit, reseed the copy the RUNNING component uses" line, not
+by the token. ⛔ With NO record (`O_ABSENT=1`) the `surface` arm is taken **before** that one, so the
+token is `surface` even when `$O` itself is the dir that drifted — which is why the remedy above says
+"read the name the body prints" instead of "redeploying `$O` cannot clear it". It is stated here rather than left to the `if` order in the code; `check-deployed-drift.test.sh`
 §9b grades the `incomplete` over `source-dirty` case, `dirty + behind/diverged` is the other combined
 state the chain produces (it reports `behind:`/`diverged:`), and §9g grades the `O_ABSENT` shape —
 the one that emits `surface` with no question about `$O` answered.

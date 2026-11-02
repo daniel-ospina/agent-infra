@@ -1276,8 +1276,16 @@ if [ "$problems" -gt 0 ]; then
     # so listing it under any of the others would print a remedy that does not fix the box.
     HTOKEN="executes:$EXEC_FIRST"
   elif [ "$O_ABSENT" -eq 1 ]; then
-    # A --surface-only run: no $O was compared, so neither question was answered about one. Saying
-    # "payload-differs" here would name a question nothing asked.
+    # A --surface-only run: no $O RECORD was read, so neither question was answered about its
+    # identity. Saying "payload-differs" here would name a question nothing asked.
+    # ⛔ "NO RECORD" IS NOT "NOT COMPARED" (review round 25, P1). `$O` IS added to the surface
+    # candidate list whenever it is a harness dir (`hu_dir_state "$O" = dir` above), and its exclusion
+    # is gated on `O_ABSENT = 0` — so it is skipped PRECISELY when it is absent. A record-less `$O`
+    # that drifted is therefore compared, is named in the `surface: <dir>` line, and lands here: the
+    # token is `surface` for ANY surface drift on this shape, `$O`'s included. The old comment said
+    # "no $O was compared", and that sentence was copied into `README` §4.3 where it told an operator
+    # the failing dir was always ANOTHER one (so "redeploying $O cannot clear it") while `$O` was in
+    # fact the dir that failed — a wrong remedy on the one shape where a redeploy does clear it.
     HTOKEN="surface"
   elif [ "$Q_RECORD" -eq 1 ]; then
     EDIT1="$(head -1 "$TMPD/edit-names" 2>/dev/null)"
