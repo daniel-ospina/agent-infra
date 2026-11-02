@@ -205,6 +205,30 @@ run_install() {
         bash ./install-runner-autoscale-timer.sh "$@" 2>&1
 }
 
+# run_install_noseam — the SAME invocation with the state-dir / arm-file seam REMOVED.
+# ⛔ T64 NEEDS THE ONE ARRANGEMENT WHERE THE TWO PATHS DIFFER. `run_install` above pins
+# `RUNNER_AUTOSCALE_STATE_DIR` and `RUNNER_AUTOSCALE_ARM_FILE` for every other case, so the reader's
+# default and the directory the artifact declares are always the same string there — and the defect this
+# entry point exists to pin is exactly what that agreement hides. `env -u` rather than simply omitting
+# the lines: `env` otherwise INHERITS them from whatever shell launched the suite, and a developer with
+# the seam exported would then be running a different case from CI.
+run_install_noseam() {
+    local plat="$1" dir="$2"; shift 2
+    local dirmap=()
+    [ "$dir" != "-" ] && dirmap=(SYSTEMD_UNIT_DIR="$dir" LAUNCHD_AGENTS_DIR="$dir")
+    cd "$HERE" || return 1
+    env -u RUNNER_AUTOSCALE_STATE_DIR -u RUNNER_AUTOSCALE_ARM_FILE \
+        HOME="$T/home" \
+        RUNNER_AUTOSCALE_SCRIPT="$T/home/converger.py" \
+        RUNNER_AUTOSCALE_PYTHON="$GOOD_PY" \
+        RUNNER_AUTOSCALE_REPO="o/r" \
+        ELDATO_PLATFORM="$plat" \
+        SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" LOGINCTL="$T/bin/loginctl" \
+        RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes" \
+        ${dirmap[@]+"${dirmap[@]}"} ${ENVV[@]+"${ENVV[@]}"} \
+        bash ./install-runner-autoscale-timer.sh "$@" 2>&1
+}
+
 # A fresh install dir per case, so one case’s artifact can never satisfy another’s assertion.
 # ⛔ NO DISCARD HERE. Every case gets its OWN fresh path under $T (c1..c14), so there is nothing to
 # remove — and a `rm -rf "$1"` on a helper argument is an UNVERIFIABLE discard that makes the whole
@@ -1744,6 +1768,49 @@ assert_eq "$RC" 1 "a MERGED token is red"
 assert_contains "$OUT" "did not render" "and still gets a diagnostic (the substring filter deleted both names and printed NOTHING)"
 assert_contains "$OUT" "--install-unit--check-units" "naming the token it could not read"
 rm -f "$ARM"
+
+# ── T64: `--report-only` reads the record the ARTIFACT declares, not the reader's ──────────
+# ⛔ T11 CANNOT SEE THIS: it mints its record at the READER's default path, so reader and artifact agree
+# there and the assertion passes for the wrong reason. `--report-only`'s record guard used to run at PARSE
+# time, against the `ARM_FILE` frozen from the READER's `$STATE_DIR`, while the render that follows adopts
+# the directory the ARTIFACT declares — which is the PR's own `adopt_installed_state_dir` rule, and it did
+# not yet apply where this guard ran. On a box installed and armed WITH `RUNNER_AUTOSCALE_STATE_DIR`, then
+# read by a routine shell that does not export it, the guard found no record, the install went through,
+# adopted the artifact's directory and rendered the FORCED `--dry-run` artifact — with the dated record
+# SURVIVING beside it. That is the state the guard exists to prevent (the very next routine `--install`
+# re-arms from that record, so the operator's `--report-only` becomes a silent re-arm) and the state
+# `--status` exits 1 on. The control below is what makes it a defect rather than a documented seam
+# limitation: the refusal must depend on the BOX, not on the invoking shell.
+say_case "T64 --report-only reads the arming record the ARTIFACT declares, not the reader's"
+D="$T/c64"; fresh "$D"; rm -f "$ARM"
+ALT="$T/c64state/runner-autoscale.armed"
+mkdir -p "$T/c64state"
+# Installed AND armed WITH the seam, so the artifact EXPORTS the directory its record lives in.
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$T/c64state" RUNNER_AUTOSCALE_ARM_FILE="$ALT")
+run_install Linux "$D" --install >/dev/null 2>&1
+run_install Linux "$D" --arm --reason fixture >/dev/null 2>&1; ENVV=()
+assert_file "$ALT" "precondition: the record was minted at the DECLARED path"
+assert_nofile "$ARM" "precondition: nothing was written at the reader's default path"
+assert_contains "$(grep '^Environment=RUNNER_AUTOSCALE_STATE_DIR=' "$D/$UNIT_NAME.service")" "c64state" \
+    "precondition: the artifact declares its own state dir, so the two paths really differ"
+# The invocation that used to slip through: NO seam in the shell, record live at the DECLARED path.
+OUT="$(run_install_noseam Linux "$D" --report-only)"; RC=$?
+assert_eq "$RC" 1 "--report-only refuses a live record at the DECLARED path (this exited 0 before the fix)"
+assert_contains "$OUT" "REFUSING --report-only" "and the refusal is the RECORD guard's, not a target failure"
+assert_contains "$OUT" "$ALT" "naming the record it actually read"
+assert_file "$ALT" "the record is left alone (the old path rendered DISARMED over it)"
+assert_absent "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "--dry-run" \
+    "and the forced-DISARMED artifact never lands — the record and the artifact still agree"
+# Control: the SAME refusal when the seam IS exported (T11's arrangement), so the verdict is about the box.
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$T/c64state" RUNNER_AUTOSCALE_ARM_FILE="$ALT")
+OUT="$(run_install Linux "$D" --report-only)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "control: the same refusal when the seam IS exported"
+# …and the box is COHERENT afterwards: an armed artifact beside its own record, which is the property the
+# defect destroyed and the one `--status` exists to certify.
+OUT="$(run_install_noseam Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 0 "--status certifies the box afterwards: armed artifact plus its record (this exited 1 before)"
+assert_contains "$OUT" "arm_record=present" "…reading the record at the declared path"
+rm -f "$ALT"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
