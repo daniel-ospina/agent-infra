@@ -399,17 +399,17 @@ commit_index() {
   local _l p _s _n new_keys
   [ -n "${outdir:-}" ] || return 0
   if [ ! -f "${IDX:-}" ]; then mv -f "$IDX_NEW" "$IDX" 2>/dev/null; return 0; fi
-  # label<TAB>path pairs this run recorded. Exact-match, so a caller-supplied label is handled the same
-  # way a default one is; the old `pi-cell-*` glob missed any such label and left run 1's file beside
-  # run 2's index for any consumer that globs the directory instead of reading the index.
+  # ⛔ THE KEY IS THE *DESTINATION NAME*, NOT THE REMOTE PATH. A file's identity inside `$outdir` is
+  # `<label>-<basename>`, which is exactly what the sweep below deletes — so keying on the remote path
+  # made the sweep delete a file THIS RUN had just promoted whenever the same label+basename arrived
+  # under a different remote root (reachable through the LANE_ARTIFACT_ROOT seam, and through any future
+  # change of root/label shape). Measured: a second COMPLETE run exited 0 with its own just-promoted
+  # artifact GONE while the index named it. Destination-name keys make the promotion order irrelevant
+  # and the sweep exact.
   #
-  # ⛔ THE PATH IS THE LAST FIELD, SO IT MAY CONTAIN A TAB. The row used to be `label<TAB>path<TAB>size`,
-  # and the scan parser was fixed to carry a TAB in a filename (T28) — but the index still split the
-  # path at the TAB, so `cut -f1,2` collapsed two different artifacts onto one key. Measured: after a
-  # complete run that collected only the TAB-named file, run 1's ordinary-named artifact SURVIVED a
-  # "complete" run, breaking the stale-file invariant T15 pins for every other name. Size is the field
-  # in the middle because it can never contain a TAB; the path takes the rest of the line.
-  new_keys="$(awk -F'\t' '{ p=$0; sub(/^[^\t]*\t/,"",p); sub(/^[^\t]*\t/,"",p); print $1 "\t" p }' "$IDX_NEW" 2>/dev/null)"
+  # (The row LAYOUT note lives on the writer in `emit_box`: `label<TAB>SIZE<TAB>path`, path LAST, because
+  # the path is the only field that can contain a TAB.)
+  new_keys="$(awk -F'\t' '{ p=$0; sub(/^[^\t]*\t/,"",p); sub(/^[^\t]*\t/,"",p); b=p; sub(/.*\//,"",b); print $1 "-" b }' "$IDX_NEW" 2>/dev/null)"
   while IFS="$(printf '\t')" read -r _l _s p; do
     [ -n "${p:-}" ] || continue
     _n="$_l-$(basename "$p")"
@@ -417,7 +417,7 @@ commit_index() {
     # for: grep exits at the first match, the producer dies of SIGPIPE, and under `pipefail` the pipeline
     # reports failure — which here would read as "not in the new index" and DELETE a file this run had
     # just collected, the same data-loss class the promotion exists to prevent.
-    if grep -qxF -- "$_l$(printf '\t')$p" <<< "$new_keys"; then continue; fi
+    if grep -qxF -- "$_n" <<< "$new_keys"; then continue; fi
     rm -f "$outdir/$_n"
   done < "$IDX"
   mv -f "$IDX_NEW" "$IDX" 2>/dev/null
@@ -426,14 +426,22 @@ commit_index() {
 # promote_stage — move this run's staged artifacts onto their final names. Called ONLY from the
 # exit-0 path, after every requested box answered and every pull succeeded.
 promote_stage() {
-  local f
+  local f rc=0
   [ -n "${OUT_STAGE:-}" ] || return 0
   for f in "$OUT_STAGE"/*; do
     [ -e "$f" ] || continue
-    mv -f "$f" "$outdir"/ || echo "lane-artifacts: could not promote $(basename "$f") into '$outdir'" >&2
+    if ! mv -f "$f" "$outdir"/; then
+      echo "lane-artifacts: could not promote $(basename "$f") into '$outdir'" >&2
+      rc=1
+    fi
   done
+  # ⛔ A STAGE THAT WAS NOT FULLY PROMOTED IS *NOT* DELETED. It used to be: the `mv` only warned, the
+  # `rm -rf` below ran anyway, `commit_index` committed an index naming the file, and the run exited 0 —
+  # a false PASS with the only copy destroyed, in the file that forbids exactly this everywhere else.
+  [ "$rc" -eq 0 ] || return 1
   rm -rf "$OUT_STAGE" 2>/dev/null
   OUT_STAGE=""
+  return 0
 }
 
 # discard_stage — throw away everything this run staged. The previous collection is then untouched,
@@ -450,14 +458,30 @@ discard_stage() {
 finish() {
   local rc="$1"
   if [ -n "${outdir:-}" ] && [ -n "${IDX_NEW:-}" ]; then
-    if [ "$rc" -eq 0 ] && [ "${R_PULLFAIL:-0}" -eq 0 ]; then
-      promote_stage
-      commit_index
+    if [ "$rc" -eq 0 ] && [ "${R_PULLFAIL:-0}" -eq 0 ] && [ "${MISSING:-0}" -eq 0 ]; then
+      if promote_stage; then
+        commit_index
+      else
+        # Keep the staged bytes (the only copy) and do not commit an index naming files that are not there.
+        rm -f "$IDX_NEW"
+        KEEP_STAGE=1
+        echo "ℹ '$outdir' was NOT replaced — promotion failed, so the collected bytes are still staged in '$OUT_STAGE'" >&2
+        exit 5
+      fi
     else
       rm -f "$IDX_NEW"
       discard_stage
       if [ -f "${IDX:-}" ]; then
-        echo "ℹ '$outdir' still holds the PREVIOUS collection — this run ended at exit $rc and did NOT replace it"
+        # ⛔ THE MESSAGE MUST MATCH THE REASON. `collect` deliberately exits 0 when SOME boxes answered
+        # (T6 pins that, and the COVERAGE INCOMPLETE line discloses it) — but that exit 0 is not complete
+        # coverage, so a run that could not reach a box must NOT be described as having "ended at exit 0".
+        # The old branch said exactly that while promoting and deleting the unreachable box's artifacts:
+        # the durability this tool exists to provide, destroyed by the case that most needs it.
+        if [ "$rc" -eq 0 ] && [ "${MISSING:-0}" -gt 0 ]; then
+          echo "ℹ '$outdir' still holds the PREVIOUS collection — $MISSING requested box(es) were NOT measured on this run"
+        else
+          echo "ℹ '$outdir' still holds the PREVIOUS collection — this run ended at exit $rc and did NOT replace it"
+        fi
       fi
     fi
   fi
@@ -506,6 +530,13 @@ case "$verb" in
       if [ -z "$OUT_STAGE" ]; then
         echo "lane-artifacts: --out '$outdir' cannot create a staging directory" >&2; exit 64
       fi
+      # ⛔ A KILLED RUN MUST NOT LEAVE THE STAGE BEHIND. Nothing reaped it: the only cleanup paths are
+      # `promote_stage`/`discard_stage`, both reachable only from `finish`, so one directory leaked per
+      # killed run — the same defect this file already records fixing for the PREVIEW scratch
+      # (`/tmp/.la-prev.$$`). `KEEP_STAGE=1` disarms the trap on the ONE path that must retain the staged
+      # bytes: a failed promotion, where they are the only copy.
+      KEEP_STAGE=0
+      trap 'e=$?; trap - EXIT INT TERM; if [ "${KEEP_STAGE:-0}" -eq 0 ] && [ -n "${OUT_STAGE:-}" ]; then rm -rf "$OUT_STAGE" 2>/dev/null; fi; exit $e' EXIT INT TERM
     fi
     UNRES_NOTE=""
     [ "${NUNRESOLVED:-0}" -gt 0 ] && UNRES_NOTE=" (+$NUNRESOLVED unresolved label(s):$UNRESOLVED_LABELS)"

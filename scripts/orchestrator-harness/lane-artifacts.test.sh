@@ -66,6 +66,9 @@ if [ "${1:-}" = "vm" ] && [ "${2:-}" = "exec" ]; then
   # at 96/96 while the tool started reporting a confident ABSENT-EVERYWHERE (exit 3) for a box that never
   # answered. A fixture nothing reaches pins nothing.
   if [ -n "${STUB_SILENT:-}" ]; then exit 0; fi
+  # STUB_SLEEP: hold the exec open so a run can be signalled MID-FLIGHT (T43). A tool that is never
+  # interrupted cannot be tested for what it leaves behind.
+  if [ -n "${STUB_SLEEP:-}" ]; then sleep "${STUB_SLEEP}"; fi
   # STUB_DEAD_LOG: let ONLY the `.log` scan fail, so the `ls` verb's second scan can be tested — the
   # reviewer found its failure was silently an empty list at exit 0 because only the `.md` scan was guarded.
   if [ -n "${STUB_DEAD_LOG:-}" ] && [ "${5:-}" != "${5%%.log*}" ]; then
@@ -744,6 +747,94 @@ rm -rf "$Q/box-f"
 unset STUB_BOXES; export STUB_BOXES="pi-cell-1=$Q/box-a
 pi-cell-3=$Q/box-b
 pi-cell-4=$Q/box-c"
+
+echo "T40 — an INCOMPLETE-coverage run must NOT replace the collection (a reached-because-some-box-answered exit 0 is not 'everything')"
+# `collect` deliberately exits 0 when SOME boxes answered — T6 pins that, and the COVERAGE INCOMPLETE
+# line discloses it. `finish` used to treat that exit 0 as "complete": it promoted and ran the stale
+# sweep, which DELETED the unreachable box's only orchestrator-side copy while the usage text and the
+# promote comment both promised a run that "cannot reach a box" leaves the previous collection untouched.
+# That is the durability this tool exists for, destroyed by the case that most needs it.
+out="$Q/out40"; mkdir -p "$out"
+run collect .md --out "$out" > "$Q/t40a.txt" 2>&1
+rc=$?
+eq "T40 run 1 (all boxes) exit 0" "$rc" "0"
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T40 run 1 collected the pi-cell-4 artifact" \
+  || bad "T40 run 1 collected nothing from pi-cell-4" "$(ls "$out")"
+idx_before="$(cat "$out/.lane-artifacts-index" 2>/dev/null)"
+STUB_DEAD="pi-cell-4"; run collect .md --out "$out" > "$Q/t40b.txt" 2>&1
+rc=$?; STUB_DEAD=""
+eq "T40 run 2 (pi-cell-4 dead) still exits 0 — the contract is unchanged" "$rc" "0"
+grep -q 'COVERAGE INCOMPLETE' "$Q/t40b.txt" && ok "T40 run 2 discloses incomplete coverage" \
+  || bad "T40 run 2 hid the coverage hole" "$(tail -5 "$Q/t40b.txt")"
+[ -f "$out/pi-cell-4-epic-ledger.md" ] && ok "T40 the unreachable box's artifact SURVIVES" \
+  || bad "T40 an incomplete run DELETED the unreachable box's only copy" "$(ls "$out")"
+eq "T40 the index still describes the previous collection" "$(cat "$out/.lane-artifacts-index" 2>/dev/null)" "$idx_before"
+grep -q "still holds the PREVIOUS collection — 1 requested box(es) were NOT measured" "$Q/t40b.txt" \
+  && ok "T40 names the real reason (not 'ended at exit 0')" \
+  || bad "T40 gives the wrong reason" "$(tail -4 "$Q/t40b.txt")"
+ls -a "$out" | grep -q '^\.la-stage\.' && bad "T40 staging directory leaked" "$(ls -a "$out")" \
+  || ok "T40 no staging directory leaks"
+
+echo "T41 — a FAILED promotion is not a success: it must not claim the collection, and must not destroy the staged bytes"
+# `mv` only warned, `rm -rf` then deleted the pulled bytes, the index was committed naming the file, and
+# the run exited 0 — a false PASS with the only copy destroyed.
+out="$Q/out41"; mkdir -p "$out/pi-cell-1-ci-cause.md"   # occupy the destination name with a DIRECTORY
+run collect ci-cause --out "$out" > "$Q/t41.txt" 2>&1
+rc=$?
+eq "T41 exit 5 (not 0)" "$rc" "5"
+grep -q 'could not promote' "$Q/t41.txt" && ok "T41 names the promotion failure" || bad "T41 silent failure" "$(tail -4 "$Q/t41.txt")"
+grep -q 'were NOT measured\|was NOT replaced' "$Q/t41.txt" && ok "T41 does not claim the run succeeded" \
+  || bad "T41 claimed success after a failed promotion" "$(tail -4 "$Q/t41.txt")"
+[ -f "$out/.lane-artifacts-index" ] && bad "T41 committed an index for files it did not promote" \
+  || ok "T41 committed no index"
+staged="$(find "$out" -maxdepth 2 -name 'pi-cell-1-ci-cause.md' -type f 2>/dev/null | head -1)"
+[ -n "$staged" ] && ok "T41 the staged bytes are KEPT for recovery" \
+  || bad "T41 a failed promotion DESTROYED the pulled bytes" "$(ls -aR "$out")"
+# the trap must not reap the stage we deliberately kept
+[ -n "$staged" ] && [ -d "$(dirname "$staged")" ] && ok "T41 the kept stage survives the exit trap" \
+  || bad "T41 the exit trap reaped the stage it was told to keep" "$(ls -aR "$out")"
+
+echo "T42 — the stale sweep keys on the DESTINATION NAME, so a re-collected file is never deleted by its own run"
+# Keying on the remote path made the sweep delete a file THIS RUN had just promoted whenever the same
+# label+basename arrived under a different remote root — the run exited 0 with its own artifact GONE.
+# The destination name (`<label>-<basename>`) is the file's actual identity in `--out`, and it is
+export _bx_saved="$STUB_BOXES"
+mkdir -p "$Q/box-r1" "$Q/box-r2"
+printf 'first body' > "$Q/box-r1/ci-cause.md"
+printf 'second body' > "$Q/box-r2/ci-cause.md"
+out="$Q/out42"; mkdir -p "$out"
+STUB_BOXES="pi-cell-1=$Q/box-r1"; export STUB_BOXES
+run collect ci-cause --box pi-cell-1 --out "$out" > "$Q/t42a.txt" 2>&1
+rc=$?
+eq "T42 run 1 exit 0" "$rc" "0"
+STUB_BOXES="pi-cell-1=$Q/box-r2"; export STUB_BOXES
+run collect ci-cause --box pi-cell-1 --out "$out" > "$Q/t42b.txt" 2>&1
+rc=$?
+STUB_BOXES="$_bx_saved"; export STUB_BOXES
+eq "T42 run 2 (same name, different root) exit 0" "$rc" "0"
+[ -f "$out/pi-cell-1-ci-cause.md" ] && ok "T42 the file this run promoted SURVIVES its own stale sweep" \
+  || bad "T42 a run deleted the artifact it had just collected" "$(ls -a "$out")"
+grep -q 'second body' "$out/pi-cell-1-ci-cause.md" 2>/dev/null && ok "T42 it holds THIS run's bytes" \
+  || bad "T42 holds the wrong bytes" "$(cat "$out/pi-cell-1-ci-cause.md" 2>/dev/null)"
+
+echo "T43 — a SIGNALLED run leaves no staging directory behind (SIGKILL is stated, not claimed)"
+# Nothing reaped the stage: both cleanup paths are reachable only from `finish`, so one directory leaked
+# per killed run — the defect this file already records for the preview scratch. SIGKILL cannot be
+# trapped, so this asserts the TERM/INT case and the comment records the SIGKILL residual honestly.
+out="$Q/out43"; mkdir -p "$out"
+STUB_SLEEP=5; export STUB_SLEEP
+bash "$TOOL" collect ci-cause --out "$out" > "$Q/t43.txt" 2>&1 &
+bg=$!
+sleep 1
+kill -TERM "$bg" 2>/dev/null
+wait "$bg" 2>/dev/null
+rc=$?
+unset STUB_SLEEP
+ls -a "$out" 2>/dev/null | grep -q '^\.la-stage\.' \
+  && bad "T43 SIGTERM leaked a staging directory" "$(ls -a "$out")" \
+  || ok "T43 SIGTERM leaves no staging directory"
+grep -q 'trap .*EXIT INT TERM' "$TOOL" && ok "T43 the tool installs the signal trap" \
+  || bad "T43 no signal trap installed" "$(grep -c 'trap ' "$TOOL")"
 
 echo
 printf 'lane-artifacts.test.sh: %d passed, %d failed\n' "$pass" "$fail"
