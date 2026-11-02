@@ -2294,15 +2294,17 @@ cd "$TMP" || true
 # the single emitter. Round 37 also escaped the two backticked spans in the section-23 `pass`
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
-# the builder arms, so this pin is EXACT: 133, not a floor.
+# the builder arms, so this pin is EXACT: the count below, not a floor. (The literal that used to be
+# here said 133 while the pin said 183 — a review caught it; that same fix was made independently on
+# both sides of this rebase and is kept once.)
 # #10522: 183 -> 185 — (30x-b) and (30x-c) pin the NEW body-marker durability
 # contract in this suite too (a refused PATCH is a named rc 5, and the signed marker
 # survives in the pending file), and the (30x) cap vector no longer depends on the
 # marker's fate: its stub answers `.body`/PATCH so the post SUCCEEDS.
 # #10583: 185 -> 188 — section 32 drives the REAL `--delta` verb against a hermetic
-# git fixture (+3 assertions). Both counts are additive: the body-marker durability
+# git fixture (+3 assertions). Both counts are ADDITIVE: the body-marker durability
 # section and the delta section were written independently and neither replaces the
-# other's assertions.
+# other's assertions, so the merged pin is 183 + 2 + 3.
 MIN_ASSERTIONS=188
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
