@@ -98,11 +98,14 @@ Tortoise graph before researching, confirm direction in it before implementing, 
 after) needs it, and nothing in this repo can deliver it — there is no secret store wired to the
 fleet, so it is HAND-PROVISIONED: it must be a line in `pi-keys.env` here (and in a cell's `keys.env`).
 ⛔ **Step 3 item 4's "delete `pi-keys.env`" does not apply to this key** — nothing re-creates it (unlike
-the provider keys, which pi keeps after `/login`), so before deleting the file, copy the
-`TORTOISE_MCP_API_KEY` line into a password manager **and keep the `pi-keys.env` path itself**: that
-file is the only one the setup sources into your profile, and on a Mac the controller's lanes are
-launchd-spawned and read no profile at all — a key moved to a different file would be invisible to
-them. Losing it silently is the one outcome worse than a loud `GRAPH-UNREACHABLE(NO-KEY)`.
+the provider keys, which pi keeps after `/login`), so keep the `pi-keys.env` file itself (and the line
+in it) rather than copying the key somewhere tidier. It is the only file the setup sources into your
+profile — but note that a profile only covers INTERACTIVE sessions: a Mac **lane** receives the file
+through `scripts/orchestrator-harness/worker-terminal.sh`, which emits it **only when `pi-keys.env`
+also assigns the model-provider key** that launch line resolves. So on a Mac whose provider credential
+comes from `/login` instead (Step 3 item 3), a graph key living in `pi-keys.env` reaches no lane, and
+every lane reports `GRAPH-UNREACHABLE(NO-KEY)` — the dependency is real and is stated here rather than
+rediscovered as a mystery. Losing it silently is the one outcome worse than a loud NO-KEY.
 The client itself (`~/.pi/agent/scripts/tortoise-graph.sh`) IS delivered by the setup — it is farmed
 from this repo — so a box missing ONLY this key reports `GRAPH-UNREACHABLE(NO-KEY)` on every call
 (`bash ~/.pi/agent/scripts/tortoise-graph.sh health` is the local reading; on a cell,

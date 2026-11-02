@@ -1469,7 +1469,13 @@ check_graph_client() {
     # separate "the test ran and found the key" from "the file terminated the shell before the test"
     # (a `keys.env` with an early `exit 0` satisfies `if` on status 0). Only a value that came out of
     # the subshell proves the test ran.
-    if env -u TORTOISE_MCP_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${TORTOISE_MCP_API_KEY:-}" ] && printf x' _ "$ENV_FILE" 2>/dev/null | grep -q x; then
+    # ⛔ THE SENTINEL IS CAPTURED, NOT PIPED. `… | grep -q x` is judged by the WHOLE pipeline under
+    # `set -o pipefail` (this file sets it), so a non-zero left-hand exit — a `keys.env` with
+    # `trap "exit 1" EXIT`, say — overrode a matching `grep` and reported a key that IS in the file as
+    # ABSENT. That is a false warn that sends an operator to re-add a line already there, and it is the
+    # `printf | grep -q` shape this very file bans elsewhere (#841/#864). The supervisor compares a
+    # CAPTURED value for exactly this reason; so does this.
+    if [ "$(env -u TORTOISE_MCP_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${TORTOISE_MCP_API_KEY:-}" ] && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ]; then
       in_file="set"
     else
       in_file="unset"
