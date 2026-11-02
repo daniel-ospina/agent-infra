@@ -1,5 +1,5 @@
 // test-command-position.mjs — agent-infra#1158: the highest-leverage FALSE
-// POSITIVE in the guard stack, and a measured map of the four that remain.
+// POSITIVE in the guard stack, and a measured map of the five that remain.
 //
 // THE DEFECT (measured, not re-derived here). The git-command classifier treated
 // ANY token whose basename was `git` as the start of a git invocation
@@ -41,7 +41,7 @@
 // Part A/B are the predicate layer; Part C drives the REAL tool_call handler
 // against a hermetic MAIN checkout (the #1484 actor in scope).
 //
-// Part D pins four shapes that are STILL false positives, deliberately NOT fixed
+// Part D pins five shapes that are STILL false positives, deliberately NOT fixed
 // here, so the next lane inherits a measured map instead of a surprise. Each is
 // commented `KNOWN-FALSE` with the predicate and the reason it was left alone.
 // Analysis: /tmp/research-guard-false-positives.md (session artifact of
@@ -140,6 +140,85 @@ only("A2q `watch`", `watch -n1 ${RESET}`, "reset");
 // Before the fix the verb was the redirect operator (unknown verb, fail-closed).
 only("A2r redirect before the verb", `git > /dev/null ${RESET_VERB}`, "reset");
 only("A2s fd-redirect before the verb", `git 2>&1 ${RESET_VERB}`, "reset");
+// A2t — process substitution is NOT a redirect operand: `cat <(git …)` runs git
+// in a subshell. The redirect arm used to swallow the `(` as the redirect's
+// filename, so no frame was pushed and the invocation vanished (reviewer B P1).
+only("A2t process substitution `<(...)`", `cat <(${RESET})`, "reset");
+only("A2t2 process substitution `>(...)` in argument position", `tee >(${RESET})`, "reset");
+// A2u — a redirect AND a global flag: the flag loop must skip redirects too, or
+// the verb becomes the flag (`-C`) and the M5 descriptor is never built (P2).
+only("A2u redirect then a global flag", `git > /dev/null -C /hub ${RESET_VERB}`, "reset");
+// A2w — a POSITIONAL-PARAMETER command word: `set -- git …; "$@"` runs git. The
+// M5 discard gate is the only consumer with no unverifiable rescue, so a blind
+// spot here ALLOWS a working-tree discard (cycle-2 adversarial P1).
+only("A2w `set -- …` then `\"$@\"`", `set -- ${RESET}; "$@"`, "reset");
+only("A2w2 `set -- …` then `$@`", `set -- ${RESET}; $@`, "reset");
+none("A2w3 `set --` with no git word", `set -- echo hi; "$@"`);
+
+// A2v — EVERY word in SPAWNER_WORDS that executes its trailing argv, one fixture
+// each. A single whole-set fixture leaves a per-WORD regression invisible (remove
+// one word and the suite stays green while that wrapper becomes a blind spot —
+// reviewer D's mutation run: chroot/taskset/ltrace/unbuffer all flipped to ZERO
+// invocations, silently).
+// Measured (cycle-2 reviewer): deleting any ONE entry reds exactly one arm, with
+// ONE documented exception — sh/bash/zsh/dash/ksh are covered INDEPENDENTLY by
+// SHELL_INTERPRETERS, so their own removal leaves this arm green (behaviour is
+// identical across 18 interpreter forms). That redundancy is why the claim is
+// stated per-word rather than absolutely.
+const WRAPPER_SHAPES = {
+  env: `env -i ${RESET}`,
+  sudo: `sudo -u root ${RESET}`,
+  doas: `doas ${RESET}`,
+  command: `command ${RESET}`,
+  builtin: `builtin command ${RESET}`,
+  xargs: `printf x | xargs -0 ${RESET}`,
+  exec: `exec ${RESET}`,
+  nohup: `nohup ${RESET}`,
+  nice: `nice -n 5 ${RESET}`,
+  ionice: `ionice -c 2 ${RESET}`,
+  time: `time ${RESET}`,
+  timeout: `timeout 5 ${RESET}`,
+  gtimeout: `gtimeout 5 ${RESET}`,
+  caffeinate: `caffeinate -i ${RESET}`,
+  script: `script -q /dev/null ${RESET}`,
+  runuser: `runuser -u root ${RESET}`,
+  setpriv: `setpriv --reuid 0 ${RESET}`,
+  docker: `docker run -v /w:/w img ${RESET}`,
+  stdbuf: `stdbuf -o0 ${RESET}`,
+  setsid: `setsid ${RESET}`,
+  eval: `eval ${RESET}`,
+  sh: `sh -c '${RESET}'`,
+  bash: `bash -c '${RESET}'`,
+  zsh: `zsh -c '${RESET}'`,
+  dash: `dash -c '${RESET}'`,
+  ksh: `ksh -c '${RESET}'`,
+  strace: `strace -f ${RESET}`,
+  ltrace: `ltrace ${RESET}`,
+  taskset: `taskset -c 0 ${RESET}`,
+  flock: `flock /tmp/l ${RESET}`,
+  watch: `watch -n1 ${RESET}`,
+  chroot: `chroot /x ${RESET}`,
+  unbuffer: `unbuffer ${RESET}`,
+  busybox: `busybox ${RESET}`,
+  parallel: `parallel ${RESET}`,
+  "xvfb-run": `xvfb-run ${RESET}`,
+  "systemd-run": `systemd-run ${RESET}`,
+  nsenter: `nsenter -t 1 ${RESET}`,
+  setarch: `setarch x86_64 ${RESET}`,
+  numactl: `numactl --cpunodebind=0 ${RESET}`,
+  unshare: `unshare -m ${RESET}`,
+  chrt: `chrt -f 1 ${RESET}`,
+  ifne: `printf x | ifne ${RESET}`,
+  firejail: `firejail ${RESET}`,
+  eatmydata: `eatmydata ${RESET}`,
+  cpulimit: `cpulimit -l 10 ${RESET}`,
+  ssh: `ssh host ${RESET}`,
+};
+for (const [word, cmd] of Object.entries(WRAPPER_SHAPES)) {
+  const got = verbsOf(cmd);
+  expectTrue(`A2v wrapper \`${word}\`: ${JSON.stringify(cmd)} → invocation verb "reset"`,
+    got.length === 1 && got[0] === "reset", `got ${JSON.stringify(got)} — this word is in SPAWNER_WORDS but no longer recognised`);
+}
 
 // A3 — the lookup must not SWALLOW a later invocation in the same command.
 {
@@ -302,6 +381,10 @@ async function partC() {
     const d2 = await bash("source ~/.rc-probe");
     expectTrue("D2  KNOWN-FALSE: `source ~/.rc-probe` is refused as an unresolvable `~` path",
       blocked(d2) && /#709/.test(why(d2)), `got: ${why(d2)}`);
+    // The control: the SAME file by ABSOLUTE path is allowed, so D2 is the `~`
+    // spelling and not "sourcing is refused".
+    expectTrue("D2c control: `source /abs/.rc-probe` → ALLOWED (so D2 is the tilde, not sourcing)",
+      allowed(await bash(`source ${join(home, ".rc-probe")}`)), "was blocked");
 
     // D3 (#1158 / analysis FIX 5). A whole-FILE three-way co-occurrence:
     // `<</` + a shell word + `\bgit\b` anywhere in the file ⇒ block, and `<<<`
@@ -318,6 +401,16 @@ async function partC() {
     const d3 = await bash("bash scripts/herestring.sh");
     expectTrue("D3  KNOWN-FALSE: `<<<` here-string + a `bash|sh` word + `git` in one file is refused",
       blocked(d3) && /#1484/.test(why(d3)), `got: ${why(d3)}`);
+    // The control: drop the shell word from the SAME file — the co-occurrence is
+    // broken and the file is allowed, so D3 pins the THREE-WAY test, not the `<<<`.
+    writeFileSync(join(hub, "scripts", "herestring2.sh"), [
+      "#!/bin/bash",
+      'read -r _x <<< "$(printf x)"',
+      'git status --porcelain',
+      '',
+    ].join("\n"));
+    expectTrue("D3b control: the same file WITHOUT the shell word → ALLOWED (so D3 is the co-occurrence)",
+      allowed(await bash("bash scripts/herestring2.sh")), "was blocked");
 
     // D4 (#1158 / analysis FIX 6). `join(" ")` in the pipe-to-shell arm destroys
     // quoting, so English PROSE in an error message becomes an invocation:
@@ -332,6 +425,15 @@ async function partC() {
     const d4 = await bash("bash scripts/prose.sh");
     expectTrue("D4  KNOWN-FALSE: shell words + prose naming `git checkout` in one file is refused",
       blocked(d4) && /#1484/.test(why(d4)), `got: ${why(d4)}`);
+    // The control: the same prose WITHOUT the pipe-to-shell arm is allowed, so D4
+    // pins the rejoin IN COMBINATION with that arm, exactly as it is claimed.
+    writeFileSync(join(hub, "scripts", "prose2.sh"), [
+      "#!/bin/bash",
+      'echo "$1 is not a git checkout"',
+      '',
+    ].join("\n"));
+    expectTrue("D4b control: the same prose without the shell words → ALLOWED (so D4 is the rejoin + that arm)",
+      allowed(await bash("bash scripts/prose2.sh")), "was blocked");
 
     // D5 (#1158 / analysis new class 6). `wtPipelineFeedsShell` splits on `|`
     // with NO quote model, so a quoted `grep -n "bash\|sh -x"` alternation is read

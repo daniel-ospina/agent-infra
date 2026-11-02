@@ -1705,6 +1705,10 @@ function _walkShell(command, h = {}, seedVars = {}) {
   let pendingHints = {}; // GIT_DIR=x / GIT_WORK_TREE=x prefixes — next command only
   let prevWasBoundary = true; // cd is the builtin only in command-word position (round-3)
   let spawnerPending = false; // round-14: a spawner's args keep command position
+  // agent-infra#1158: the words after `set --` become the POSITIONAL parameters,
+  // which a later `"$@"` / `$@` / `$1` command word expands to. Modelled so a
+  // `set -- git reset --hard; "$@"` wrapper script stays visible (cycle-2 P1).
+  let positionalWords = [];
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];
@@ -1844,6 +1848,17 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // word position — a following `$VAR` must resolve (`G=git; for i in 1; do
     // $G …; done` ran git — probe). They never consume command position.
     if (COMPOUND_WORDS.has(t)) { i++; prevWasBoundary = true; continue; }
+    // agent-infra#1158: `set -- …` defines the POSITIONAL parameters (consumes
+    // ALL following words; `set -euo pipefail` has no `--` and defines none).
+    if (t === "set" && prevWasBoundary && !spawnerPending) {
+      let j = i + 1;
+      while (j < tokens.length && !_isShellBoundary(tokens[j])) j++;
+      const words = tokens.slice(i + 1, j);
+      positionalWords = words[0] === "--" ? words.slice(1) : [];
+      i = j;
+      prevWasBoundary = true;
+      continue;
+    }
     // agent-infra#1158: find(1) `-exec`/`-execdir`/`-ok`/`-okdir` spawn a command
     // from their NEXT word, so that word is in command position (`find . -name
     // src -exec git checkout-index -f {} \;` really runs git). Without this the
@@ -1943,6 +1958,14 @@ function _walkShell(command, h = {}, seedVars = {}) {
     if (t === "<<" && tokens[i + 1] === "<") { i += 3; continue; } // <<< word (here-string)
     if (t === ">" || t === ">>" || t === "<" || t === "<<" || t === "&>" || t === ">&" || t === "&>>" || /^(?:[0-9]+)?[<>]/.test(t) || /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(t)) {
       const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(t); // 2>&1 — no separate operand
+      // agent-infra#1158 (reviewer B P1): PROCESS SUBSTITUTION is not a redirect
+      // OPERAND. `cat <(git checkout -- f)` runs git in a subshell — consuming the
+      // `(` as the redirect's filename (i += 2) skipped the `(` arm entirely, so no
+      // frame was pushed, prevWasBoundary stayed false, and the positional gate
+      // could not see the invocation (measured: verbs=[] on a real discard).
+      // Leave the `(` to the main walk, which pushes the subshell frame and opens
+      // a command word, exactly as it does for `cat < <(git checkout -- f)`.
+      if (tokens[i + 1] === "(") { i += 1; continue; }
       i += fdSingle ? 1 : 2;
       continue;
     }
@@ -2142,11 +2165,35 @@ function _walkShell(command, h = {}, seedVars = {}) {
     //       scripts: check-deployed-drift.sh, harness-refresh.sh).
     // `command -v git`, `type git`, `which git`, `grep -n git f`, `echo git`
     // and a path containing `git` can never invoke git, so requiring position
-    // costs no true positive: a real invocation IS always in command position.
+    // costs no true positive: a real invocation IS always in command position. —
+    // ONE exception, measured and recorded rather than papered over: a command
+    // word produced by COMMAND SUBSTITUTION (`$(echo git) reset --hard`) is
+    // already blind in BOTH trees (the pre-change verb was the phantom `)`), so
+    // it is a pre-existing residual, not a cost of this narrowing.
     // prevWasBoundary IS the model of that position (true at start, after
     // `; & && || | ( ) { }`, after a COMPOUND_WORDS reserved word, and while a
     // spawner's/env-prefix's own args are pending).
     let isGitToken = prevWasBoundary && /^(?:.*\/)?git$/.test(t);
+    // agent-infra#1158 (cycle-2 adversarial P1): a POSITIONAL-PARAMETER command
+    // word is a real invocation — `set -- git reset --hard; "$@"` runs git. The
+    // `$VAR` arm below models NAMED variables only and `$@`/`$*`/`$1` match
+    // neither it nor the git-token test, so the invocation VANISHED and the M5
+    // discard gate (the only consumer with no unverifiable rescue) saw nothing.
+    // Pre-change it was caught only by position-blindness, i.e. by accident.
+    if (!isGitToken && prevWasBoundary && positionalWords.length > 0
+        && /^(?:\$(?:@|\*|[0-9]+)|\$\{(?:@|\*|[0-9]+)\})$/.test(t)
+        && /^(?:.*\/)?git$/.test(positionalWords[0])) {
+      h.onGitEnd?.({
+        verb: positionalWords[1] ?? null, args: positionalWords.slice(2),
+        cdChain: [...frame().chain], cHints: [],
+        gitDirHint: null, workTreeHint: null, indexFileHint: null, objDirsHint: null,
+        configOverrides: [], configEnvOverrides: [], envPrefixes: [], vars: { ...frame().vars },
+        cmdVisible: false,
+      });
+      i++;
+      prevWasBoundary = false;
+      continue;
+    }
     if (!isGitToken && prevWasBoundary && /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(t)) {
       const name = t.replace(/^\$\{?/, "").replace(/\}?$/, "");
       const val = frame().vars[name];
@@ -2232,6 +2279,17 @@ function _walkShell(command, h = {}, seedVars = {}) {
       return e === null ? "\u0000" : e;
     };
     while (i < tokens.length) {
+      // agent-infra#1158 (reviewer B P2): a redirect may appear ANYWHERE in a
+      // simple command, so it must be skipped BY THE FLAG LOOP too — otherwise
+      // `git > /dev/null -C /hub reset --hard` selected `-C` as the verb (and
+      // dropped the -C hint) instead of `reset --hard`, leaving the M5 discard
+      // descriptor unbuilt for that ordering.
+      if (tokens[i] === "<<" && tokens[i + 1] === "<") { i += 3; continue; } // <<< here-string
+      if (_isRedirectOperator(tokens[i])) {
+        const fd = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(tokens[i]);
+        i += fd ? 1 : 2;
+        continue;
+      }
       const g = tokens[i];
       if (/^GIT_DIR=/.test(g)) { gitDirHint = expand(g.slice("GIT_DIR=".length)); i++; continue; }
       if (/^GIT_WORK_TREE=/.test(g)) { workTreeHint = expand(g.slice("GIT_WORK_TREE=".length)); i++; continue; }
@@ -2253,20 +2311,12 @@ function _walkShell(command, h = {}, seedVars = {}) {
       break;
     }
     // agent-infra#1158: choose the VERB the way bash reads the simple command.
-    // (a) Redirects may appear anywhere in a simple command, so `git > /dev/null
-    //     reset --hard` runs `git reset --hard` — skip redirects + their operands
-    //     before picking the verb (previously the verb WAS the redirect operator,
-    //     which then failed closed as an unknown verb).
-    // (b) A REAL boundary here (`git || exit 1`, `git;`, `git | cat`, bare `git`)
-    //     means git ran with NO subcommand: it prints usage and mutates nothing,
-    //     so emit NO invocation instead of inventing a verb from the operator.
-    for (;;) {
-      const g = tokens[i];
-      if (g === "<<" && tokens[i + 1] === "<") { i += 3; continue; } // <<< here-string
-      if (!_isRedirectOperator(g)) break;
-      const fdSingle = /^[0-9]+[<>]&[0-9]*-?$|^[0-9]+[<>]&-$|^[<>]&(?:[0-9]+|-)$/.test(g);
-      i += fdSingle ? 1 : 2;
-    }
+    // The global-flag loop above already skipped any redirect (bash allows one
+    // ANYWHERE in a simple command, so `git > /dev/null reset --hard` IS
+    // `git reset --hard`) — that left this one job: a REAL boundary here
+    // (`git || exit 1`, `git;`, `git | cat`, bare `git`) means git ran with NO
+    // subcommand, so it prints usage and mutates nothing; emit NO invocation
+    // instead of inventing a verb from the operator.
     if (i < tokens.length && _isShellBoundary(tokens[i])) {
       prevWasBoundary = false; // the outer walk resumes AT the boundary token
       continue;
@@ -5878,7 +5928,17 @@ function _extractSubstitutionSpans(token) {
 // re-opening the operand-`git` false positive. Each entry executes its
 // remaining argv as its command (`busybox` dispatches the applet, `flock FILE
 // cmd`, `watch cmd`, `chroot DIR cmd`, `taskset MASK cmd`).
-const SPAWNER_WORDS = new Set(["env", "sudo", "doas", "command", "xargs", "exec", "nohup", "nice", "ionice", "time", "timeout", "stdbuf", "setsid", "eval", "sh", "bash", "zsh", "dash", "ksh", "strace", "ltrace", "taskset", "flock", "watch", "chroot", "unbuffer", "busybox"]);
+const SPAWNER_WORDS = new Set(["env", "sudo", "doas", "command", "builtin", "xargs", "exec", "nohup", "nice", "ionice", "time", "timeout", "gtimeout", "stdbuf", "setsid", "eval", "sh", "bash", "zsh", "dash", "ksh", "strace", "ltrace", "taskset", "flock", "watch", "chroot", "unbuffer", "busybox", "parallel", "xvfb-run", "systemd-run", "nsenter", "setarch", "numactl", "unshare", "chrt", "ifne", "firejail", "eatmydata", "cpulimit", "ssh", "caffeinate", "script", "runuser", "setpriv", "docker"]);
+// ⚠️ RESIDUAL, stated so it cannot be mistaken for completeness (reviewer B P1):
+// the set of programs that execute their trailing argv is UNBOUNDED, and a
+// positional gate plus a closed list turns every unlisted one into a blind spot
+// (`"/some/wrapper" git reset --hard`). The list above covers the wrappers that
+// (a) execute their argv verbatim and (b) plausibly wrap a git call; `builtin` is
+// included because this file's OTHER walker (`:7327`) already models it as a
+// command word — the inconsistency WAS the defect. Anything else is recorded on
+// agent-infra#1158 rather than chased here, because the alternative (treat every
+// operand `git` as an invocation) is exactly the false-positive class this change
+// exists to remove. `test-command-position.mjs` pins every word in this set.
 
 /** Compound-command reserved words (round-13): they start a new command-word
  * position — a following `$VAR` must resolve as the command. */
