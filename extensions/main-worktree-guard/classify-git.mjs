@@ -1849,12 +1849,17 @@ function _walkShell(command, h = {}, seedVars = {}) {
     // $G …; done` ran git — probe). They never consume command position.
     if (COMPOUND_WORDS.has(t)) { i++; prevWasBoundary = true; continue; }
     // agent-infra#1158: `set -- …` defines the POSITIONAL parameters (consumes
-    // ALL following words; `set -euo pipefail` has no `--` and defines none).
+    // ALL following words). ⛔ ONLY `--` REDEFINES THEM: a FLAG-only `set`
+    // (`set -e`, `set -u -o pipefail`) leaves the positional parameters alone in
+    // bash — assigning `[]` for every `set` made `set -- git reset --hard;
+    // set -e; "$@"` a FAIL-OPEN (measured end to end: invocations=0, discard
+    // descriptor=0, ALLOWED on a dirty worktree where the pre-change classifier
+    // blocked it). `set --` with no words still clears them, which is bash.
     if (t === "set" && prevWasBoundary && !spawnerPending) {
       let j = i + 1;
       while (j < tokens.length && !_isShellBoundary(tokens[j])) j++;
       const words = tokens.slice(i + 1, j);
-      positionalWords = words[0] === "--" ? words.slice(1) : [];
+      if (words[0] === "--") positionalWords = words.slice(1);
       i = j;
       prevWasBoundary = true;
       continue;

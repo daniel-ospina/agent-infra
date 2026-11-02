@@ -153,6 +153,14 @@ only("A2u redirect then a global flag", `git > /dev/null -C /hub ${RESET_VERB}`,
 // spot here ALLOWS a working-tree discard (cycle-2 adversarial P1).
 only("A2w `set -- …` then `\"$@\"`", `set -- ${RESET}; "$@"`, "reset");
 only("A2w2 `set -- …` then `$@`", `set -- ${RESET}; $@`, "reset");
+// A2w4–A2w6 — a FLAG-only `set` between the definition and the expansion must
+// NOT clear the positional parameters (bash leaves them alone). Treating every
+// `set` as a definition made this a fail-open: invocations=0, descriptor=0,
+// ALLOWED on a dirty worktree (found by the confirmation round on this fix).
+only("A2w4 `set -- …; set -e; \"$@\"`", `set -- ${RESET}; set -e; "$@"`, "reset");
+only("A2w5 `set -- …; set -u -o pipefail; $@`", `set -- ${RESET}; set -u -o pipefail; $@`, "reset");
+only("A2w6 `set -- …; set +e; \"$@\"`", `set -- ${RESET}; set +e; "$@"`, "reset");
+none("A2w7 flag-only `set` defines nothing", `set -euo pipefail; "$@"`);
 none("A2w3 `set --` with no git word", `set -- echo hi; "$@"`);
 
 // A2v — EVERY word in SPAWNER_WORDS that executes its trailing argv, one fixture
