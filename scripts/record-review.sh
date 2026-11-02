@@ -1480,7 +1480,7 @@ if [ "$DELTA" -eq 1 ]; then
   # re-binds an APPROVAL, and relabelling a non-approval as one is the bypass this
   # whole mode must never become.
   case "$D_VERDICT" in
-    clean | clean-micro) ;;
+    clean | clean-micro | clean-low) ;;
     *)
       echo "⛔ --delta REFUSED for $REPO#$PR: the record carries verdict '$D_VERDICT', which is not a clean-family verdict. A delta re-binds an APPROVAL onto a new head; it cannot manufacture one. Nothing was written — a full review is owed." >&2
       exit 3 ;;
