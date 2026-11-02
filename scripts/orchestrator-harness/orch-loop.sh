@@ -2658,8 +2658,17 @@ mp_recent_land() { # [<state-dir>]
   # Only a land inside 2x the gate's window can matter, so `find -mmin` shortlists and the loop stats
   # only those. A land older than that reads as "no recent land" — which is exactly the gate's own
   # question (a land outside the window releases anyway), and `[cap]`'s `last_land=` prints `?`.
-  local d="${1:-$O/state}" f m newest="" bound list
-  bound=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))
+  local d="${1:-$O/state}" f m newest="" bound list _b
+  # ⛔ SELF-CONTAINED, NOT ONLY LOAD-COERCED (review P2, 2026-11-01). The `10#` below ERRORS on a
+  # non-numeric knob, and an errored assignment leaves `bound` unset — `find -mmin -""` then fails and
+  # this function prints NOTHING. Since #2929 an empty answer is a DEFINITE escalation (and a dispatched
+  # worker), so a typo would have become a stall report about a measurement that never happened. The
+  # knob IS already coerced at load (see the `is_limit` line with the other limits), but this block is
+  # `eval`'d STANDALONE by `test-gates.sh`'s drain legs, which never reach that line: normalising here
+  # keeps the function honest about its own preconditions instead of relying on a caller's earlier line.
+  _b="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+  is_limit "${_b:-}" && [ "$_b" -gt 0 ] || _b=180
+  bound=$(( 10#$_b * 2 ))
   list="$(find "$d" -maxdepth 1 -name 'merged-*.done' -mmin -"$bound" 2>/dev/null || true)"
   # A here-string, not `find … | while`: under `pipefail` the reader can exit first and make the
   # pipeline read FAILED (#841's class), and the process substitution would lose `newest` to a
@@ -2711,7 +2720,7 @@ spawns_since() { # spawns_since <since-epoch>  ->  "<n>\t<tag,tag,...>" (empty n
 # records a past state and is never revalidated" failure this file keeps removing, so a land newer
 # than the marker deletes it here — the writer does not have to remember to.
 drain_stall_token() {
-  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl
+  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl agesrc _agepfx
   [ -f "$f" ] || return 0
   at="$(sed -n 's/^at=//p' "$f" 2>/dev/null | head -1)"
   if is_num "${at:-}"; then

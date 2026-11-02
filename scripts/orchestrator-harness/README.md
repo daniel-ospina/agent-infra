@@ -4386,6 +4386,20 @@ been rate-limited while the REST sweep succeeded: exactly the fallback this desi
   264m", because a PEER box held the landing claims. Both stall lines therefore name their population
   and quote the pass's own dominant NAMED wait (the reason it spawned nothing), so an escalation cannot
   misdiagnose a box whose only "problem" is that it is not the lander.
+  ⛔ **THE ONE ARM THAT DOES NOT CONSULT `MERGE_STALL_MIN`.** That knob is a DISPLAY threshold and the
+  empty answer is a MEASUREMENT, so the empty-answer arm fires at the window's own bound even when an
+  operator has raised `MERGE_STALL_MIN` above it (`MERGE_STALL_MIN=1000` + `MERGE_PRIORITY_MAX_AGE_MIN=180`
+  escalates at `>=360m`, not at `1000m`). This is deliberate and it is #2929's ruling — *an empty answer
+  IS the stall* — not a knob being ignored: the escalation is true at that bound (nothing landed for at
+  least that long), the printed age says it is a floor, and `MERGE_STALL_MIN` still decides the MEASURED
+  arm. A quieter box for the empty-answer shape is a change to #2929's ruling and belongs there — not a
+  threshold comparison, which would print `drain alive` on a box that has landed nothing.
+  ⛔ **THE WORKER'S REPORT IS PER-DISPATCH** (`state/REPORT-stall-fix-<name>.md`, named in the dispatch
+  line). `DRAIN_STALL_FIX_EVERY` bounds the dispatch by stalled PASSES (default 3 ≈ 12 min) while a
+  worker is given 1800 s, so an unfixed stall normally has two or three workers alive at once; a single
+  fixed report path made the newest worker's mandated first action truncate the previous worker's only
+  output. Its `.log`/`.rc`/`.pid` are cleared before each launch and its name carries the date, so a
+  previous day's records cannot answer for this one.
 * **Parked PRs are excluded from the gate's number** — a PR parked at `MAX_FIX_TRIES` is one the
   harness itself declared needs-a-human, and letting it hold the issue path shut forever would be the
   "stale flag that latches a gate" failure. The count is printed so the subtraction is visible.
