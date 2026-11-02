@@ -544,6 +544,31 @@ ck "10a-3: grep on an ABSOLUTE orch-loop.sh path does NOT fabricate a controller
    "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
 ck "10a-3: …it is reported as a MENTION instead, so the fact is not lost" \
    "$(qF "MENTIONS an orch-loop.sh" "$OUT" && echo 0 || echo 1)"
+# (10a-4) A TRAILING PATH AFTER A `-c` STRING IS `$0`, NOT THE SCRIPT (review VGATE of round 8). The
+# `-c` arm advances past the command string, so an ordinary-word guard never sees it: `_interp` stayed
+# 1 for the rest of the argv and `bash -c 'sleep 30' <gone>/orch-loop.sh` fabricated `executes:` on a
+# healthy box. Reproduced against this script's own seams, and pinned here in both directions.
+printf '4254 bash -c sleep_30 %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-ctrail"
+surf "$TMP/ps-ctrail"
+ck "10a-4: a path AFTER a -c command string is \$0, never the executing tree" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+printf '4255 bash -c %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-cscript"
+surf "$TMP/ps-cscript"
+ck "10a-4: but 'bash -c <abs>/orch-loop.sh' IS an invocation and must still count" \
+   "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+# (10a-5) A COMBINED SHORT OPTION INTRODUCES THE COMMAND STRING TOO (review round 9, P1). The arm
+# matched `-c` EXACTLY, so `bash -lc 'exec <path>/orch-loop.sh'` kept `_interp=1` for the command
+# string, which then matched the script patterns and fabricated `executes:` naming `<cwd>/exec …`.
+# `bash -lc '…'` is this repo's own operator idiom, and `executes:` is FIRST in the token chain, so
+# the fabricated token also MASKED a real `behind:`/`uncommitted-edit:` on the same box.
+printf '4256 bash -lc exec_%s/orch-loop.sh\n' "$GONE" > "$TMP/ps-lc"
+surf "$TMP/ps-lc"
+ck "10a-5: 'bash -lc exec <abs>/orch-loop.sh' is TEXT, not a fabricated controller" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+printf '4257 bash -lc %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-lcpath"
+surf "$TMP/ps-lcpath"
+ck "10a-5: but 'bash -lc <abs>/orch-loop.sh' IS an invocation (the path is the first word)" \
+   "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
 # ⛔ AN EXEC-ONLY DRIFT IS NOT A SURFACE HIT (review of #3202). `drift_q exec` bumps `problems` from inside
 # the surface block, so `problems > SURF_BASE` was true for a gone executing tree ALONE — and the summary
 # then offered "reseed the copy the RUNNING component uses" directly above "(c) … does not clear it": a

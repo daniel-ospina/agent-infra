@@ -762,7 +762,17 @@ if [ "$SURFACE" -eq 1 ]; then
             # pre-change code caught. The `_i -eq 0` half is what keeps argv[0] working; the
             # `_interp` half is what keeps `grep -n x orch-loop.sh` (the word at `_i > 0`) a mention.
             if [ "$_i" -eq 0 ] || [ "$_interp" -eq 1 ]; then _script="$_w"; else _text=1; fi ;;
-          -c)
+          -c|-[!-]*c)
+            # ⛔ COMBINED SHORT OPTIONS COUNT (review round 9, P1). This arm used to match `-c` EXACTLY,
+            # so `bash -lc 'exec <path>/orch-loop.sh'` — and `-euc`, `-ic` — fell to the `-*` keep-arm,
+            # leaving `_interp=1` for the COMMAND STRING, which then matched `*/orch-loop.sh` and became
+            # a fabricated `executes:` naming `<cwd>/exec …`. `bash -lc '…'` is this repo's own operator
+            # idiom (docs/ops/fleet-harness-baseline.md, skills/cmux-cells/SKILL.md) and a live
+            # `/bin/bash -lc exec <path>/orch-loop.sh` is already recorded as a non-controller in
+            # tools/fleet/outcome_canary.test.py — so this is a measured population, not a hypothesis.
+            # ⛔ AND IT MASKS: `executes:` is FIRST in the token chain, so the fabricated token replaced
+            # a real `behind:`/`uncommitted-edit:` for the same box and went into the durable `drift=`
+            # field — a false DIAGNOSIS, not just a false red.
             # ⛔ `bash -c <abs>/orch-loop.sh` IS the invocation; `bash -c 'echo-bash-<dir>/orch-loop.sh'` is a
             # shell running TEXT — the self-match class the fleet inventory documents, and the arm that keeps
             # a lane's echo from becoming a candidate dir. The FIRST word decides, and only an ABSOLUTE one
@@ -771,7 +781,29 @@ if [ "$SURFACE" -eq 1 ]; then
             case "$_c1" in
               /*/orch-loop.sh) _script="$_c1" ;;
               *orch-loop.sh*) _text=1 ;;
-            esac ;;
+            esac
+            # ⛔ CLOSE THE PREFIX HERE (review VGATE of round 8). This arm ADVANCES `_i` past the command
+            # string, so the ordinary-word clearing below never sees it and `_interp` stayed 1 for the
+            # rest of the argv — `bash -c 'sleep 30' <gone>/orch-loop.sh` therefore nominated the
+            # trailing path as the script and fabricated `executes:` on a healthy box (reproduced).
+            # Everything after a `-c` string is `$0`/arguments, never the script.
+            _interp=0 ;;
+        esac
+        # ⛔ `_interp` DESCRIBES THE COMMAND PREFIX, NOT "AN INTERPRETER APPEARED SOMEWHERE EARLIER"
+        # (review round 8, P2). It used to persist for the whole argv, so
+        # `bash -c 'sleep 30' <gone>/orch-loop.sh` — and `bash -x other.sh <abs>/orch-loop.sh` —
+        # nominated the trailing path as the script even though it is `$0`/an ordinary argument,
+        # fabricating `executes:` on a healthy box. `bash`/`sh`/`zsh` is how that traffic is usually
+        # spelled (the measured `python3 -c …` case was the minority), so the class was still open.
+        # Cleared only by an ORDINARY word: an interpreter and its options keep the prefix alive,
+        # which is what makes `bash <path>`, `bash -x <path>`, `env bash <path>` and `bash -c <path>`
+        # all still count.
+        case "$_w" in
+          -*) : ;;
+          *) case "${_w##*/}" in
+               bash|sh|dash|zsh|ksh|ash|mksh|busybox|env) : ;;
+               *) _interp=0 ;;
+             esac ;;
         esac
         _i=$((_i + 1))
       done
