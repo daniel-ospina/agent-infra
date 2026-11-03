@@ -375,8 +375,15 @@ _phase_age() {
 }
 _PHASE_AGE="$(_phase_age)"
 # The lane's own wall clock bounds how long its marker can mean anything (LANE_TIMEOUT, +60s slack).
-_PHASE_STALE_AFTER="${LANE_TIMEOUT:-3300}"
-case "$_PHASE_STALE_AFTER" in ''|*[!0-9]*|0[0-9]*) _PHASE_STALE_AFTER=3300 ;; esac
+# ⛔ THAT CLOCK IS `LANE_BACKSTOP_S`, NOT 3300 ANY MORE (agent-infra#2888). The wall stopped being the
+# lane's PRIMARY bound — the progress allowance (45 min) is — and the backstop above it is 7200 s. A
+# literal 3300 here would declare a still-working lane's merge marker STALE at 56 minutes while the
+# lane may legitimately run to its 2 h backstop, and this block's response to a stale marker is to
+# DELETE it and review at the tip — i.e. two processes on one PR. `LANE_BACKSTOP_S` is exported by
+# `spawn-gate.sh`, so a lane's chain inherits the operator's override; the literal is the fallback for
+# a chain started outside a lane shell, and `lane-bound.test.sh` (i0) pins it to that seam.
+_PHASE_STALE_AFTER="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"
+case "$_PHASE_STALE_AFTER" in ''|*[!0-9]*|0[0-9]*) _PHASE_STALE_AFTER=7200 ;; esac
 _PHASE_STALE_AFTER=$(( _PHASE_STALE_AFTER + 60 ))
 if [ -f "$PR_PHASE" ] && [ "$_PHASE_AGE" -ge 0 ] && [ "$_PHASE_AGE" -gt "$_PHASE_STALE_AFTER" ]; then
   echo "[chain $N] STALE merge-phase marker (age ${_PHASE_AGE}s > lane wall limit ${_PHASE_STALE_AFTER}s) — the lane is gone; reviewing at the tip now" >> "$LOG"
