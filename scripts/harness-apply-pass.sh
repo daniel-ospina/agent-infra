@@ -1128,9 +1128,18 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # remedy off at exactly the states that need it (#10114 review round 7, reproduced with
                 # a 20-row farm). So the rows are a bounded excerpt — SAYING it is an excerpt — and the
                 # remedy is forwarded separately and unconditionally.
-                FARM_ROWS="$(printf '%s\n' "$FARM_OUT" | grep -E 'STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT')"
+                # ⛔ MATCH THE FINAL COLUMN, NOT THE WHOLE LINE. The instrument prints four unconditional
+                # CLASS-PROSE lines ("A STALE file is a copy launchd/systemd will EXECUTE…"), so a
+                # whole-line grep counts prose as file rows — 3 real rows measured as "7 row(s)"
+                # (#10114 review round 8). `FARM_NAMED` above uses the same predicate; reuse it.
+                FARM_ROWS="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
                 FARM_NROWS="$(printf '%s' "$FARM_ROWS" | grep -c .)"
-                FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | grep -E 'Next:' | head -4)"
+                # ⛔ THE REMEDY IS A BLOCK, NOT A LINE. Two of the instrument's three remedies are TWO
+                # lines and the CONTINUATION carries the actions ("…, delete it, or retire it in
+                # pi-bootstrap/farm-retired.txt; then re-run this."), so forwarding only the `Next:`
+                # line cut the remedy mid-word for exactly the classes whose remedy differs from
+                # "re-farm" (#10114 review round 8). Everything from the first `Next:` to EOF.
+                FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
                 log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) from the instrument:"
                 printf '%s\n' "$FARM_ROWS" | head -12 | while IFS= read -r _row; do
                     log_line "farm:   $_row"

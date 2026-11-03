@@ -1226,6 +1226,9 @@ i=0
 while [ "$i" -lt 20 ]; do printf 'file-%s.py | a | b | STALE\n' "$i" >&2; i=$((i+1)); done
 printf 'check-farm-drift: DRIFT — 20 stale\n'
 printf '   Next: re-run the farm from a ref-consistent checkout\n'
+printf '   then re-run this check; for an UNSOURCED name: declare it LOCAL, delete it, or retire it\n'
+printf 'A STALE file is a copy launchd/systemd will EXECUTE that is not the code the repo ships.\n'
+printf 'An UNSOURCED file is on the box and in no repo file — declare it local or delete it.\n'
 exit 1
 FARM
 chmod +x "$T/t24q/stub-checker.sh"
@@ -1233,7 +1236,13 @@ OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24q/stub-checker.sh" run_pass "$T/t24q" 2
 assert_eq "$RC" "24" "T24 control: a 20-row drift is RED"
 assert_contains "$OUT" "re-run the farm from a ref-consistent checkout" \
     "T24 control: and the instrument's own REMEDY survives a long row list (it is its last line)"
+assert_contains "$OUT" "declare it LOCAL, delete it, or retire it" \
+    "T24 control: including the remedy's CONTINUATION line, which carries the actions"
 assert_contains "$OUT" "and 8 more row(s)" "T24 control: while the row excerpt says how many it elided"
+# ⛔ THE COUNT MUST NOT COUNT PROSE. The instrument prints class-prose lines that contain the same
+# words as a row ("A STALE file is a copy …"), so a whole-line match reported 3 real rows as 7
+# (review round 8). 20 stub rows + 2 prose lines must still read as 20.
+assert_contains "$OUT" "20 row(s)" "T24 control: the row count counts ROWS, not the instrument's class prose"
 
 echo
 echo "────────────────────────────────────────────────────────"
