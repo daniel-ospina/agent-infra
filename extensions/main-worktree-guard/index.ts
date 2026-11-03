@@ -176,7 +176,7 @@ let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } = () => ({ disorder: null, branch: null, path: null, dirtyPaths: 0 });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean; hatchActive?: boolean } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 // #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
@@ -296,6 +296,12 @@ let readAllowMarkerState: (path: string, sessionId: string | null | undefined, n
 // (M4's classifier reason and this file's write/edit + bash-write surfaces) so
 // the advice cannot drift from the enforcement.
 let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean) => string[] = () => [];
+// Round 11 (P2): the REAL hatch state for the CURRENT tool call, resolved with the
+// ctx session id (not the env-only form). `_hubWriteRecoverLines` used to derive
+// it itself via `_currentSessionId(undefined)`, which is empty in production (pi
+// sets PI_SESSION_ID only in bash CHILDREN), so the hatch-active paragraph was
+// unreachable on the write/edit, bash-write and inline-payload surfaces.
+let _currentHatchActive = false;
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
@@ -615,11 +621,10 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
  *  `git checkout main && git pull --ff-only`, which on a DIRTY hub is the very
  *  no-op this change removes from the bash message: git refuses to switch over
  *  modified paths. */
-function _hubWriteRecoverLines(st: { disorder: string | null } | null): string[] {
+function _hubWriteRecoverLines(st: { disorder: string | null } | null, hatchActive: boolean = _currentHatchActive): string[] {
   // ONE text, shared with M4's classifier reason (round 9): the two used to
   // diverge, and only the classifier's covered all three dirt shapes.
-  const hatch = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(undefined));
-  const lines = hubDirtyRecoveryLines(st, hatch);
+  const lines = hubDirtyRecoveryLines(st, hatchActive);
   if (lines.length > 0) return lines;
   return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
 }
@@ -4949,6 +4954,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, _ctx) => {
     const pid = process.pid;
+    // Round 11 (P2): resolve the hatch ONCE per tool call, with the CTX session
+    // id, before any gate or message runs. The write/edit, bash-write and
+    // inline-payload messages used to derive it themselves from the env-only id —
+    // empty in production (pi sets PI_SESSION_ID only in bash CHILDREN) — so the
+    // hatch-active paragraph was unreachable on exactly the surfaces a stranded
+    // lane hits.
+    _currentHatchActive = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
 
     // M1 runs on EVERY tool_call (read included — a reviewer whose tree moved
     // mid-review sees the warn before proceeding, AC8). Active under the
@@ -5035,7 +5047,7 @@ export default function (pi: ExtensionAPI) {
           // recovery and M5 never consulted. Wiring the hatch to the shape (not
           // just to the window) makes M4 refuse those forms exactly as main does.
           const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(command);
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive });
+          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a

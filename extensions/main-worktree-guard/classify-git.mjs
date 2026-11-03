@@ -4714,6 +4714,15 @@ function _isNamedPathOperand(x) {
   if (p.startsWith("/") || p.startsWith("~") || p.startsWith(":")) return false;
   if (p.split("/").includes("..")) return false;
   if (/[*?[]/.test(p)) return false; // glob pathspec — discards whatever it matches
+  // Round 11 (P1, MEASURED — whole-tree wipe): stripping only TRAILING slashes let
+  // every dotted spelling of the whole tree through, because they normalize to
+  // `.`: `git checkout -- ./.` / `././` / `.//.` / `git restore ./.` were all
+  // `recovery` and ALLOWED under a hatch, and git reset EVERY tracked file —
+  // i.e. every sibling session's uncommitted work, the exact harm the `.` refusal
+  // exists to prevent. Normalize the remaining dot segments: an operand that
+  // collapses to nothing is the whole tree, not a named path.
+  const norm = p.split("/").filter((seg) => seg !== "" && seg !== ".").join("/");
+  if (norm === "") return false;
   return true;
 }
 
@@ -5737,6 +5746,7 @@ function _m4RecoveryLines(hubContext, hatchActive = false) {
 
 export function evaluateHubGate(command, currentBranch, opts = {}) {
   const escapeActive = opts.escapeActive === true;
+  const hatchActive = typeof opts.hatchActive === "boolean" ? opts.hatchActive : escapeActive;
   const hubContext = opts.hubContext ?? null;
   const invocations = allGitInvocations(command);
   if (invocations.length === 0) return { verdict: "non-git" };
@@ -5756,7 +5766,7 @@ export function evaluateHubGate(command, currentBranch, opts = {}) {
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext, escapeActive),
+          ..._m4RecoveryLines(hubContext, hatchActive),
         ].join("\n"),
       };
     }
@@ -6423,6 +6433,11 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
   // permitted?" — which is exactly why #709's documented marker appeared to do
   // nothing here (measured 2026-11-02).
   const escapeActive = opts.escapeActive === true;
+  // Round 11 (P2): the DECISION uses `escapeActive` (hatch AND bare-`git` shape),
+  // but the MESSAGE must know whether the hatch itself is held — otherwise a
+  // hatched lane refused for a SHAPE reason (`nice …`, `cd … && …`, a wrapper) is
+  // told to acquire the hatch it already has, and the real cause is never named.
+  const hatchActive = typeof opts.hatchActive === "boolean" ? opts.hatchActive : escapeActive;
   const invocations = allGitInvocations(command);
   // Round-5/6 (second-model P1): eval / $( ) / backtick / alias / function
   // command substitution is an UNVERIFIABLE one-token shell construct — the
@@ -6438,7 +6453,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
-        ..._m4RecoveryLines(hubContext, escapeActive),
+        ..._m4RecoveryLines(hubContext, hatchActive),
       ].join("\n"),
     };
   }
@@ -6455,7 +6470,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
-          ..._m4RecoveryLines(hubContext, escapeActive),
+          ..._m4RecoveryLines(hubContext, hatchActive),
         ].join("\n"),
       };
     }
@@ -6655,7 +6670,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext, escapeActive),
+          ..._m4RecoveryLines(hubContext, hatchActive),
         ].join("\n"),
       };
     }

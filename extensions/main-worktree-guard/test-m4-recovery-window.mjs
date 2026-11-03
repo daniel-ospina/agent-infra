@@ -150,7 +150,20 @@ check("C21 mid-path `..` stays blocked",
   verdict("git checkout -- ../other/f.txt", { escapeActive: true, hubContext: DIRTY }), "block");
 check("C22 `a/../b` stays blocked",
   verdict("git checkout -- a/../b.txt", { escapeActive: true, hubContext: DIRTY }), "block");
-// C17/C18 — round 6 (P2): any CONFIG override can retarget the invocation;
+
+// C23–C25 — round 11 (P1 MEASURED, whole-tree wipe): every DOTTED spelling
+// normalizes to `.` and was `recovery` under a hatch — `git checkout -- ./.` reset
+// every tracked file, i.e. every sibling session's uncommitted work.
+for (const [name, cmd] of [
+  ["`./.`", "git checkout -- ./."],
+  ["`././`", "git checkout -- ././"],
+  ["`.//.`", "git checkout -- .//."],
+  ["`restore ./.`", "git restore ./."],
+  ["`checkout HEAD -- ./.`", "git checkout HEAD -- ./."],
+]) {
+  check(`C23 marker ⇒ dotted whole-tree spelling ${name} stays blocked`,
+    verdict(cmd, { escapeActive: true, hubContext: DIRTY }), "block");
+}// C17/C18 — round 6 (P2): any CONFIG override can retarget the invocation;
 // `-c core.worktree=<other>` was `recovery` at head while origin/main blocked it.
 check("C17 `-c core.worktree=<other>` stays blocked",
   verdict("git -c core.worktree=/other checkout -- a.txt", { escapeActive: true, hubContext: DIRTY }), "block");
@@ -440,6 +453,28 @@ async function partB() {
       delete process.env.GIT_DIR;
       delete process.env.GIT_WORK_TREE;
     }
+    // B6r — round 11 (P2): assert the ROUTES, not the helper. E5i called the
+    // helper directly, so a route that stopped using it (or used it with the
+    // wrong hatch) survived a revert at 91/0.
+    const writeRes = await (async () => {
+      const mod = await import(pathToFileURL(join(HERE, "index.ts")).href);
+      const hs = new Map();
+      mod.default({ on(n, fn) { if (!hs.has(n)) hs.set(n, []); hs.get(n).push(fn); } });
+      delete process.env.PI_SESSION_ID;
+      const ctx = { sessionManager: { getSessionId: () => TID } };
+      const r = await hs.get("tool_call")[0]({ toolName: "write", input: { path: join(hub, "wip.txt"), content: "x" } }, ctx);
+      return r && r.block === true ? String(r.reason ?? "") : "";
+    })();
+    check("B6r write tool still frozen on a dirty hub (D3)", writeRes.length > 0, true);
+    check("B6r2 …and it knows the hatch is ACTIVE (ctx-resolved, not env)", /Your hatch IS active/.test(writeRes), true);
+    check("B6r3 …and it carries the three-shape recovery", /--staged --worktree/.test(writeRes) && /mv <path> \/tmp\//.test(writeRes), true);
+    // DECLARED RESIDUAL (round 11, P2) — the cross-checkout tracked-write arm's
+    // `_targetHubState` is NOT pinned here. Reproducing it needs the #618/#621
+    // cross-checkout block to fire from a session rooted in a DIFFERENT clean
+    // checkout; in this fixture `cp copy.txt ../hub/wip.txt` from a clean hub is
+    // not blocked at all (measured), so the target-state advice cannot be
+    // exercised without a second gate's fixture. Declared, not skipped: the
+    // helper is a message-only change and the arm's block itself is unchanged.
     // B6w — round 10 (P1 MEASURED, data loss): a WRAPPER carrying the target
     // selection (`env -C<dir>`, the ATTACHED form; BSD accepts it, GNU env
     // -C/--chdir on the Linux cells) slipped both layers, because the parser sees
@@ -449,6 +484,12 @@ async function partB() {
     check("B6w marker ⇒ `env -C<dir>` wrapper still BLOCKED", b6w !== null, true);
     const b6w2 = await drive(`nice git checkout -- wip.txt`);
     check("B6w2 marker ⇒ `nice`-wrapped restore still BLOCKED (one bare invocation only)", b6w2 !== null, true);
+    // B6w2b — round 11 (VGATE P1): the SHAPE-refused-but-HATCHED lane. B6w/B6w2
+    // asserted only "blocked", so the hatchActive plumbing inside
+    // evaluateHubGateWithTargets could be (and was) deleted with the suite green:
+    // the refusal then told a hatched lane to acquire the hatch it holds.
+    check("B6w2b shape-refused + hatched ⇒ names the hatch as ACTIVE",
+      /Your hatch IS active/.test(b6w2?.reason ?? "") && !/need an active escape hatch/.test(b6w2?.reason ?? ""), true);
     // B6w3 — round 10 (P2): the bash-tracked-write arm is the incident's refusal
     // #4 surface; its advice must be the shared three-shape text.
     writeFileSync(join(hub, "copy.txt"), "copy\n");
