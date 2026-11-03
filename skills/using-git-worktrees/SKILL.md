@@ -383,7 +383,8 @@ sequence, in order:
    git push origin <stranded-branch>   # the sanctioned WIP-preservation carve-out
    ```
 3. **Recover** — pick the route that matches the STATE (`git status --porcelain`):
-   - **DIRTY hub** → a branch switch does not help (it carries the dirt along, and
+   - **DIRTY hub** → a branch switch cannot clear it (it may refuse or carry the dirt
+     along, and
      the pair cannot clear it, whether or not the hub is already on `main`).
    Clear the dirt with the
      marker's named-path window, from the hub:
