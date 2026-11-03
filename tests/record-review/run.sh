@@ -2270,9 +2270,15 @@ if [ -d "$DELTA_REPO" ]; then
     "$D_REVIEWED" "$(printf 'x' | openssl dgst -sha256 | awk '{print $NF}')" \
     > "$DR_HOME/.pi/agent/reviews/7105.json"
   FIX_DELTA_HEAD="$D_MERGED"; delta_run 7105 "$TMP/out32e"; OUT32E="$(cat "$TMP/out32e")"; DRC_E="$DR_RC"
+  # BOTH reads must see the legacy predecessor: the EVIDENCE (rc=0 at all) and the MINT TIME.
+  # `rc=0` + `mint=delta` alone passes while the wrong branch fires on the second read, which is
+  # exactly the review finding that produced this arm's second half — the record was minted with the
+  # CARRY time and a "not recoverable" warning that was false for the input.
   [ "$DRC_E" -eq 0 ] && [ "$(grep -c '"mint":"delta"' "$DR_HOME/.pi/agent/reviews/fixture-repo-7105.json" 2>/dev/null)" = 1 ] \
-    && pass "(32e) a LEGACY <pr>.json record re-binds through the same arms — the provenance guard reads the record the verb resolved" \
-    || fail "(32e) a legacy record carrying evidence was refused by the delta path (rc=$DRC_E, out='$OUT32E')"
+    && [ "$(grep -c '"reviewed_at":"2026-11-02T00:00:00Z"' "$DR_HOME/.pi/agent/reviews/fixture-repo-7105.json" 2>/dev/null)" = 1 ] \
+    && ! printf '%s' "$OUT32E" | grep -q 'not recoverable' \
+    && pass "(32e) a LEGACY <pr>.json record re-binds through the same arms — evidence AND mint time come from the record the verb resolved" \
+    || fail "(32e) a legacy record carrying evidence+reviewed_at was mishandled (rc=$DRC_E, record='$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7105.json" 2>/dev/null)', out='$OUT32E')"
 else
   fail "(32a) fixture missing"; fail "(32b) fixture missing"; fail "(32c) fixture missing"; fail "(32d) fixture missing"; fail "(32e) fixture missing"
 fi

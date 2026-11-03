@@ -3926,6 +3926,30 @@ else
   LEGACY=""
 fi
 TMP="$FILE.tmp"
+# ── THE PREDECESSOR RECORD: ONE RESOLUTION, EVERY CARRY READ ────────────────
+# A carry must READ the record it supersedes — for its evidence (#10177) and for
+# its mint time (tortoise#7391). Both used to read `$FILE` alone, which is only
+# "the record" when the predecessor happens to be the REPO-QUALIFIED one.
+# `--delta` deliberately resolves through the legacy `<pr>.json` fallback as well
+# ("one definition of the record", shared with --check-carry), so on a box whose
+# record predates #426's repo-qualified key the delta proved the authored diff
+# unchanged and then (a) REFUSED the carry claiming the record named no evidence,
+# both measured together as one class: two readers, two definitions of "the
+# record", and each drifted from the resolver in its own direction. Resolved
+# ONCE here, with the embedded-repo collision rule, so neither reader can drift
+# again and NEITHER can read another repo's record (an embedded `repo` that
+# differs is a different record — fail-closed, never inherited).
+PRIOR_REC=""
+if [ "$DELTA" -eq 1 ] && [ -n "${D_REC:-}" ] && [ -f "${D_REC:-}" ]; then
+  # The delta verb already resolved the predecessor with exactly this rule —
+  # reuse its answer rather than re-deriving a second opinion.
+  PRIOR_REC="$D_REC"
+elif [ -f "$FILE" ]; then
+  PRIOR_REC="$FILE"
+elif [ -n "$LEGACY" ] && [ -f "$LEGACY" ]; then
+  _prior_repo="$(sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$LEGACY" 2>/dev/null | command head -1 || true)"
+  if [ -z "$_prior_repo" ] || [ "$_prior_repo" = "$REPO" ]; then PRIOR_REC="$LEGACY"; fi
+fi
 # ── CARRY EVIDENCE (#10177): a carried verdict must NAME the review behind it ──
 # A carry used to omit `evidence` entirely, so `"evidence":null` was the normal
 # shape of a re-bound verdict — a field that a reader is entitled to read as "no
@@ -3949,17 +3973,10 @@ if [ -n "$CARRY_ARM" ] && [ -z "$EVIDENCE_VERIFIED" ]; then
   # and was then refused HERE with "the superseded record carries no evidence", a sentence that is
   # FALSE for that input, in a direction the caller cannot escape (`--delta` refuses `--evidence` by
   # design), landing on "review the current head and record it fresh": a paid full re-review for the
-  # exact case #10583 exists to remove. `$D_REC` is the SAME definition the delta verb resolved, and
-  # it is STRICTER than `$FILE` (it applies the embedded-repo collision rule), so seeding from it
-  # closes the gap without widening the guard.
-  CARRY_EVIDENCE_SRC=""
-  if [ "$DELTA" -eq 1 ] && [ -n "${D_REC:-}" ] && [ -f "${D_REC:-}" ]; then
-    CARRY_EVIDENCE_SRC="$D_REC"
-  elif [ -f "$FILE" ]; then
-    CARRY_EVIDENCE_SRC="$FILE"
-  fi
-  if [ -n "$CARRY_EVIDENCE_SRC" ]; then
-    CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$CARRY_EVIDENCE_SRC" 2>/dev/null | command head -1 || true)"
+  # exact case #10583 exists to remove.
+  CARRY_EVIDENCE=""
+  if [ -n "$PRIOR_REC" ] && [ -f "$PRIOR_REC" ]; then
+    CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$PRIOR_REC" 2>/dev/null | command head -1 || true)"
   fi
   # ⛔ THE ARM SELECTS THE PAIR (fresh-review cycle 3): a marker may only be named
   # by the arm that CONSUMED it. The lane arm proves itself from the commits and
@@ -4076,13 +4093,17 @@ if [ -n "$CARRY_ARM" ]; then
 fi
 REVIEWED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ -n "$CARRY_ARM" ]; then
-  # $FILE is read BEFORE the mv below, so it still holds the record this carry
-  # supersedes; that record names the head the verdict was minted at, so its
-  # reviewed_at IS the mint time.
+  # `$PRIOR_REC` is resolved ONCE above (before the record is rewritten), and it is
+  # the record this carry supersedes — the one that names the head the verdict was
+  # minted at, so its reviewed_at IS the mint time. Reading `$FILE` here instead was
+  # the SAME `$FILE`-only assumption as the evidence guard: for a legacy-predecessor
+  # delta it printed "the ORIGINAL mint time is not recoverable (no record on disk
+  # names …)" while holding that exact record, and dropped its mint time for the
+  # carry time — the tortoise#7391 corruption one field over.
   PRIOR_HEAD=""; PRIOR_AT=""
-  if [ -f "$FILE" ]; then
-    PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
-    PRIOR_AT="$(sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
+  if [ -n "$PRIOR_REC" ] && [ -f "$PRIOR_REC" ]; then
+    PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$PRIOR_REC" | command head -1)"
+    PRIOR_AT="$(sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' "$PRIOR_REC" | command head -1)"
   fi
   # ⛔ A RECOVERED reviewed_at IS A LOWER BOUND, NOT A MINT TIME (#2872 review,
   # round 3). Carrying it forward verbatim and printing "preserved as the ORIGINAL
@@ -4091,7 +4112,7 @@ if [ -n "$CARRY_ARM" ]; then
   # whole arm exists to prevent. So a recovered predecessor falls into the honest
   # branch below, which says the mint time is NOT recoverable.
   PRIOR_RECOVERED=0
-  if [ -f "$FILE" ] && grep -q '"mint":"recovered-body"' "$FILE"; then PRIOR_RECOVERED=1; fi
+  if [ -n "$PRIOR_REC" ] && [ -f "$PRIOR_REC" ] && grep -q '"mint":"recovered-body"' "$PRIOR_REC"; then PRIOR_RECOVERED=1; fi
   if [ "$PRIOR_RECOVERED" -eq 0 ] && [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
     REVIEWED_AT="$PRIOR_AT"
     echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=$([ "$DELTA" -eq 1 ] && echo delta || echo carried), carried_from=${ORIG_SHA:0:12}…)" >&2
