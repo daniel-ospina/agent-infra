@@ -1025,6 +1025,63 @@ OUT="$(HOME="$T/t11/home" HARNESS_APPLY_PASS="$PASS_SH" ELDATO_PLATFORM=Darwin \
     bash "$INST" --install 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T11 no usable interpreter is a REFUSAL, never a degraded bash job that fails closed"
 assert_contains "$OUT" "not executable" "T11 and the refusal names the interpreter"
+# ── T15: THE FARM IS GRADED, AND A STALE FARM IS RED (tortoise#10114) ────────────────────────
+# MEASURED 2026-11-03 on a cloud cell: `$O` was CLEAN at the pin (`check-deployed-drift` exit 0,
+# "matches origin/main") while the FARM the box executes carried a `pr-doctor.py` 1445 lines behind
+# the ref — the copy brief-gate refused 100% of, i.e. the no-op #10114 exists to remove, still
+# running four days after its first hand-repair. Nothing on the clock compared that directory: the
+# pass kept `$O` at the ref and the drift instrument grades `$O`. So the assertion is not "the farm
+# is copied" (a copy can destroy a local edit) — it is that drift is a NAMED, RED pass.
+say_case "T15 a STALE farm is a RED pass that names the file, never a green silence"
+mk_origin t15; mk_clone t15; write_sync_stub
+# The farm checker is a seam like the sync verb: the real instrument's own contract is covered by
+# check-farm-drift.test.sh, so this fixture stubs its EXIT CODE and its report line and asserts the
+# pass's use of them (red on 1 and 3, ok on 0, skipped when there is no farm).
+mkdir -p "$CLONE/scripts"
+cat >"$CLONE/scripts/check-farm-drift.sh" <<'FARM'
+#!/usr/bin/env bash
+# Record the ARGV the pass actually used: the wiring (which ref, which dest, and the two arms that
+# must / must not be passed) is part of the contract, and a stub that ignores its argv cannot fail
+# on it — the reason `--pin-file`/`--no-pin-identity` went unnoticed in the first draft of T15.
+printf '%s\n' "$*" >>"${FARM_ARGV:-/dev/null}"
+printf 'pr-doctor.py | %s | %s | STALE\n' "${FARM_STALE_FROM:-2165b6dbedc0}" "${FARM_STALE_TO:-ba47776b0319}" >&2
+printf 'check-farm-drift: DRIFT — 1 stale\n'
+exit "${FARM_RC:-1}"
+FARM
+chmod +x "$CLONE/scripts/check-farm-drift.sh"
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t15/home/.pi/agent/scripts"; printf 'old bytes\n' >"$T/t15/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_ARGV="$T/t15/argv" run_pass "$T/t15" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T15 a stale farm REDDENS the pass with its own code (24), not 0/10/11"
+assert_contains "$OUT" "farm: DRIFT" "T15 the line says DRIFT"
+assert_contains "$OUT" "pr-doctor.py" "T15 and it NAMES the file, not just a count"
+assert_contains "$(cat "$T/t15/state/harness-apply.status" 2>/dev/null || true)" "action=farm-drift" \
+    "T15 the pass RECORD carries the action, so --print-status is not silent about it either"
+assert_contains "$(cat "$T/t15/argv" 2>/dev/null || true)" "--ref origin/main" \
+    "T15 the checker is graded against the REF, not against whatever this box has checked out"
+assert_contains "$(cat "$T/t15/argv" 2>/dev/null || true)" "--no-pin-identity" \
+    "T15 and the pin-identity arm is OFF — otherwise a pin-lagged box reports a fresh farm as drift"
+assert_absent "$(cat "$T/t15/argv" 2>/dev/null || true)" "--pin-file" \
+    "T15 and no --pin-file is passed, so the grade cannot be pinned to a tree this box may not run"
+# Control 1: exit 3 ('a deploy cannot fix it' — an UNSOURCED / not-farm-declared stale file) is
+# folded in deliberately: drift this box EXECUTES must never read green because the remedy is awkward.
+mkdir -p "$T/t15b/home/.pi/agent/scripts"; printf 'x\n' >"$T/t15b/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_RC=3 run_pass "$T/t15b" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T15 control: an unpaid-by-the-farm stale file is RED too, not an exemption"
+# Control 2: the SAME fixture with a matching farm (checker exits 0) keeps its normal verdict — the
+# leg is a gate, not a hard-coded failure.
+mkdir -p "$T/t15c/home/.pi/agent/scripts"; printf 'x\n' >"$T/t15c/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_RC=0 run_pass "$T/t15c" 2>&1)"; RC=$?
+assert_contains "$OUT" "farm: ok" "T15 control: a matching farm is reported ok"
+assert_eq "$RC" "0" "T15 control: a matching farm leaves the normal verdict intact (exact rc, so a pass broken for an unrelated reason cannot pass this control)"
+# Control 3: no farm at all is SKIPPED with a named reason — a controller-only host farms nothing,
+# and reddening every such box would make the alarm worthless.
+mk_origin t15d; mk_clone t15d
+REPO_P="$CLONE"; MODE_P=sync
+OUT="$(run_pass "$T/t15d" 2>&1)"; RC=$?
+assert_contains "$OUT" "farm: SKIPPED" "T15 control: an absent farm is SKIPPED by name, never silently passed"
+assert_eq "$RC" "0" "T15 control: an absent farm does not redden the pass (exact rc)"
+
 
 echo
 echo "────────────────────────────────────────────────────────"
