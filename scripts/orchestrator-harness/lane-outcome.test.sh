@@ -217,7 +217,7 @@ drive "$WT" "$KEYVAR=sk_fixture" MAX_LOAD=0
 eqv "$LANE_RC" "75" "6a a load refusal still exits 75"
 check_terminal "6b" refused "load-gate" 75
 
-# ═══ 7. THE DRY RUN (no agent, so the traps are cleared — the line is written by hand) ═════════════
+# ═══ 7. THE DRY RUN (the CLEANUP is disarmed; the line is STILL written by the EXIT trap — see 7d) ═════════════
 mk_arm dryrun; WT="$ARMWT"
 pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
 export -f pi
@@ -249,7 +249,8 @@ check_terminal "7f" refused "repo-target:REFUSED" 72
 unset TARGET_SLUG
 
 # ═══ 8. THE VOCABULARY IS ONE SOURCE OF TRUTH ═══════════════════════════════════════════════════════
-# A scanner's whole job is `grep -L '^outcome='`; this arm asserts the four words it can ever see are
+# A scanner's whole job is `grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log`; this arm asserts the four
+# words it can ever see are
 # the four the contract declares, so a fifth cannot be introduced without reddening something.
 has "$(grep -o 'done|refused|failed|died' "$LANE" | head -1)" "done|refused|failed|died" \
     "8 the writer's closed vocabulary is declared in ONE place (done|refused|failed|died)"

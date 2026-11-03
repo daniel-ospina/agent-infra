@@ -2553,10 +2553,15 @@ written by whatever path the lane exited through, is what answers it:
 
 ```bash
 # which lane logs never said what happened?  (0 is the target; an empty list is the pass)
-grep -L '^outcome=' "$O"/logs/lane-*.log
+grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log
 # what did THIS lane do?
 grep '^outcome=' "$O/logs/lane-<N>.log" | tail -1
 ```
+
+⛔ **the glob is `lane-[0-9]*.log`, not `lane-*.log`** — the loose form also matches
+`lane-merge-<PR>.log`, which `lane-merge.sh` writes and which is NOT a lane (`merge-rate.sh` excludes it
+by name, for the same reason: counting it added a fake lane). Lane logs are `<issue>.log` and the id is
+validated numeric.
 
 `grep -L` is the right reader for "is any log unaccounted for" because it asks about the WHOLE file; the
 `tail -1` form is right for a single lane because a child process killed after the lane exits can still

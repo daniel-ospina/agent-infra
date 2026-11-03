@@ -618,8 +618,13 @@ fi
 # the one body that runs the cleanup AND the terminal `outcome=` line, and it reaches `lane_exit_cleanup`.
 # Pinning the dispatcher alone would be a spelling pin again — a `lane_exit_trap` that stopped calling
 # the cleanup would stay green — so the second arm asserts the edge.
+# ⛔ AND THE EDGE ARM MATCHES AN INVOCATION, NOT A SUBSTRING (review round 2, P2, measured): both bodies
+# contain `lane_exit_cleanup` in their own `command -v lane_exit_cleanup` GUARD, so a plain
+# `grep -qF lane_exit_cleanup` stayed green with the CALL replaced by `:` — the pin claimed "the edge, not
+# just the name" while testing the name. Anchoring the pattern to a line that STARTS the call is what
+# makes the mutation visible.
 if awk '/^lane_exit_trap\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$HARNESS/lane.sh" \
-     | grep -qF 'lane_exit_cleanup'; then
+     | grep -qE '^[[:space:]]*lane_exit_cleanup([[:space:]]|$)'; then
   ok "…and that trap's body really calls lane_exit_cleanup (the edge, not just the name)"
 else
   bad "lane_exit_trap does not call lane_exit_cleanup — the EXIT trap reaps nothing"
@@ -637,7 +642,7 @@ fi
 # `died reason=signal:<SIG>`, runs the cleanup, writes the terminal line and exits with the signal's
 # status. So the pin follows the edge: the trap names the handler AND the handler reaches the cleanup.
 if awk '/^lane_terminate\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$HARNESS/lane.sh" \
-     | grep -qF 'lane_exit_cleanup'; then
+     | grep -qE '^[[:space:]]*lane_exit_cleanup([[:space:]]|$)'; then
   ok "…and the signal handler really calls lane_exit_cleanup (the edge, not just the name)"
 else
   bad "lane_terminate does not call lane_exit_cleanup — a signal-killed lane reaps nothing"
