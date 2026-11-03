@@ -63,6 +63,61 @@ export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
 if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
 if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# ── THE TERMINAL LINE: EVERY LANE LOG ENDS BY SAYING WHAT HAPPENED (agent-infra#3331) ─────────────
+# Measured 2026-11-02 on two cells: a lane's log simply STOPPED, and the dispatch record still said
+# "launched". A print-mode `pi` buffers, so a log that ends silently is indistinguishable from a lane
+# that is still working — and `pgrep -f "pi -p"` matched the diagnostic's own command line on top of it.
+# So the ONE line an operator (or a scanner) reads to know a lane ended is written by a TRAP, which is
+# the only construction that fires on EVERY exit: a normal end, a pre-flight refusal, a failing agent,
+# a `set -u` abort, and (through the explicit handlers below) a signal.
+#
+# THE CONTRACT — one physical line, last in `$O/logs/lane-<N>.log`:
+#     outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
+# count the logs that lack one:   grep -L '^outcome=' "$O"/logs/lane-*.log
+# ⛔ `reason` is a TOKEN, never prose: this line is read by instruments, and a free-text field is the
+# field that re-stales. The long-form reason stays in the log's own `[lane N] NOT started: …` lines.
+# ⛔ IT IS INSTALLED THIS EARLY ON PURPOSE. Every exit AFTER the log path exists gets the line,
+# including the `78`s that refuse a half-synced `$O` before a single gate runs — those are exactly the
+# lanes that vanished with nothing said. The exits ABOVE this point are argument validation (78/64),
+# where no lane log exists yet and there is nothing to append to.
+LANE_OUTCOME=""; LANE_OUTCOME_REASON=""; LANE_TERMINAL_DONE=0; LANE_LAST_STATUS=0
+lane_outcome() { # <done|refused|failed|died> <reason-token>  — FIRST writer wins
+  [ -n "${LANE_OUTCOME:-}" ] && return 0
+  case "${1:-}" in
+    done|refused|failed|died) LANE_OUTCOME="$1" ;;
+    # An unmapped word must never be silently written as a legitimate outcome: it is a FAILURE of the
+    # writer, and the line says so (a vocabulary that accepts anything records nothing).
+    *) LANE_OUTCOME="failed"; LANE_OUTCOME_REASON="unmapped-outcome:${1:-<empty>}"; return 0 ;;
+  esac
+  LANE_OUTCOME_REASON="${2:-unknown}"
+  return 0
+}
+lane_terminal_line() {
+  [ "${LANE_TERMINAL_DONE:-0}" = "1" ] && return 0
+  LANE_TERMINAL_DONE=1
+  local o r line
+  o="${LANE_OUTCOME:-}"; r="${LANE_OUTCOME_REASON:-}"
+  if [ -z "$o" ]; then
+    # Nothing recorded an outcome. A lane that reaches its end with no refusal, no agent verdict and no
+    # named cause DID NOT RUN — that is the defect class this line exists to make visible, so it is
+    # `died` and the exit status is the only evidence left. (A signal handler sets `died` itself.)
+    o=died; r="no-outcome-recorded:exit-${LANE_LAST_STATUS:-?}"
+  fi
+  # Collapse anything that would break the one-line contract (a reason is a caller's string).
+  r="$(printf '%s' "$r" | tr '\n\r\t' '   ')"
+  line="outcome=$o reason=$r lane=$N rc=${LANE_LAST_STATUS:-?} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
+  printf '%s\n' "$line" | tee -a "$O/logs/lane-$N.log" 2>/dev/null || printf '%s\n' "$line"
+  return 0
+}
+# The EXIT trap dispatches, so ONE trap site covers both halves as they become available: the cleanup
+# is defined further down (its libraries are sourced there), and a lane that exits before that has
+# nothing to clean up but still owes a terminal line.
+lane_exit_trap() {
+  LANE_LAST_STATUS=$?
+  if command -v lane_exit_cleanup >/dev/null 2>&1; then lane_exit_cleanup; fi
+  lane_terminal_line
+}
+trap 'lane_exit_trap' EXIT
 # The wall-clock limit AND the load gate both live in the shared helper, so this script has no
 # `pi` invocation of its own to forget to gate (agent-infra#1720). Fail LOUD if the helper is
 # missing: an unsourced helper would leave `run_agent` undefined, and an undefined helper must never
@@ -87,6 +142,17 @@ command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_a
   && command -v repo_target_head_branch >/dev/null 2>&1 && command -v repo_target_slug >/dev/null 2>&1 \
   && command -v repo_target_refuse >/dev/null 2>&1 && [ -n "${REPO_TARGET_REFUSED:-}" ] \
   || { echo "[lane $N] FATAL: $SELF/repo-target.sh is stale (needs repo_target_assert/repo_target_branch_assert/repo_target_head_branch/repo_target_slug/repo_target_refuse and REPO_TARGET_REFUSED) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
+# ── THE MODEL-CREDENTIAL GATE (agent-infra#3331) ────────────────────────────────────────
+# The third member of the pre-flight family this file already carries — `brief-gate.sh` (80) and
+# `repo-target.sh` (72) — and the one whose absence was measured as three silent lane deaths on two
+# cells (`No API key found for the selected model.`, then a log that just stops). It is CALLED later,
+# immediately before the agent is spawned (the only point at which the env it will inherit is final);
+# the module is LOADED here, fail-loud, so a half-synced `$O` refuses before doing any work rather than
+# discovering the missing helper at the last gate.
+[ -r "$SELF/key-gate.sh" ] || { echo "[lane $N] FATAL: $SELF/key-gate.sh missing — refusing to start a lane whose model credential nothing asserts (#3331)" >&2; exit 78; }
+. "$SELF/key-gate.sh" || { echo "[lane $N] FATAL: $SELF/key-gate.sh could not be sourced — refusing to start a lane whose model credential nothing asserts (#3331)" >&2; exit 78; }
+command -v key_gate_assert >/dev/null 2>&1 && [ -n "${KEY_GATE_REFUSED:-}" ] \
+  || { echo "[lane $N] FATAL: $SELF/key-gate.sh is stale (needs key_gate_assert and KEY_GATE_REFUSED) — refusing to start a lane whose model credential nothing asserts (#3331)" >&2; exit 78; }
 # ── THE LANE'S OWN CREDENTIALS (agent-infra#3060) ───────────────────────────────────────────────────
 # A lane started OUTSIDE the controller inherits no keys and dies in ~7 s with "No API key found for
 # deepseek" — after passing every gate, because the capability gate sources the key file for its own probe
@@ -159,10 +225,22 @@ lane_exit_cleanup() {
 # SIGHUP, so the cleanup has to be reached by an explicit handler that `exit`s. Each handler clears
 # the traps on entry so the `exit` cannot re-enter it (one cleanup, one exit, status matched to the
 # signal).
-trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 143' TERM
-trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 130' INT
-trap 'trap - EXIT INT TERM HUP; lane_exit_cleanup; exit 129' HUP
-trap 'lane_exit_cleanup' EXIT
+# ⛔ AND EACH ONE RECORDS HOW IT DIED FIRST (agent-infra#3331). The handler clears the EXIT trap, so
+# nothing else will write the terminal line: `died reason=signal:<SIG>` is the lane's record that it did
+# not end, it was ended — which is the fact a log that simply stops cannot carry.
+lane_terminate() { # <exit-status> <signal>
+  trap - EXIT INT TERM HUP
+  lane_outcome died "signal:${2:-?}"
+  if command -v lane_exit_cleanup >/dev/null 2>&1; then lane_exit_cleanup; fi
+  lane_terminal_line
+  exit "${1:-1}"
+}
+trap 'lane_terminate 143 TERM' TERM
+trap 'lane_terminate 130 INT' INT
+trap 'lane_terminate 129 HUP' HUP
+# ⛔ ONE EXIT TRAP, INSTALLED EARLY (above) AND DISPATCHING — `lane_exit_cleanup` is defined below and
+# `lane_exit_trap` runs it only when it exists. Re-assigning `trap … EXIT` here would REPLACE the early
+# one, and the exits between the two sites (a half-synced `$O`) would lose their terminal line.
 # ⛔ ...but NOT on a DRY RUN (agent-infra#2148's `LANE_DRY_RUN` seam, below). No agent ran, so the
 # worktree's `.venv` has no dead holder to reap — and a preview that DELETES a build artifact is
 # exactly the destructive-side-effect class a dry run exists to avoid. The trap is installed
@@ -200,6 +278,7 @@ REPO_ASSERT_LINE="$(repo_target_assert "lane $N" "$PWD" "$OR" "$LANE_REPO_DIR")"
 printf '%s\n' "$REPO_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
 if [ "$REPO_ASSERT_RC" -ne 0 ]; then
   echo "[lane $N] NOT started: repo-target REFUSED (exit $REPO_ASSERT_RC) — no agent, no PR, nothing measured in the wrong repository" >> "$O/logs/lane-$N.log"
+  lane_outcome refused "repo-target:REFUSED"
   exit "$REPO_ASSERT_RC"
 fi
 # ⛔ A `--repo-dir`-ONLY CALL MUST NOT LEAVE `$OR` EMPTY (#2762 review, P1). The module supports
@@ -214,6 +293,7 @@ if [ -z "$OR" ]; then
   if [ -z "$OR" ]; then
     echo "$(repo_target_refuse "lane $N" target-underivable "the target directory passed the assertion but its origin slug cannot be read, so the lane has no repo to name in its brief or its gh calls")" | tee -a "$O/logs/lane-$N.log"
     echo "[lane $N] NOT started: no target slug could be derived from the asserted worktree" >> "$O/logs/lane-$N.log"
+    lane_outcome refused "repo-target:target-underivable"
     exit "$REPO_TARGET_REFUSED"
   fi
 fi
@@ -227,6 +307,7 @@ if [ -n "${BR:-}" ] && [ -n "$HEAD_BRANCH" ]; then
   printf '%s\n' "$BRANCH_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
   if [ "$BRANCH_ASSERT_RC" -ne 0 ]; then
     echo "[lane $N] NOT started: branch assertion REFUSED (exit $BRANCH_ASSERT_RC) — no agent started" >> "$O/logs/lane-$N.log"
+    lane_outcome refused "repo-target:branch-REFUSED"
     exit "$BRANCH_ASSERT_RC"
   fi
 fi
@@ -448,6 +529,11 @@ case "${N:-}" in ''|*[!0-9]*) capacity_record= ;; *) capacity_record="$O/state/c
 # passes on a script whose runtime output lost the text — the "test that cannot fail" class).
 if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
   echo "[lane $N] DRY RUN — prompt written to $O/logs/prompt-$N.txt; no agent started" | tee -a "$O/logs/lane-$N.log"
+  # The dry run cleared the traps (nothing ran, so nothing is cleaned up), so its terminal line is
+  # written by hand. `done` because the lane completed everything it was asked to: it REFUSED nothing
+  # and FAILED at nothing — `reason=dry-run` is what tells a scan this log never had an agent.
+  lane_outcome done dry-run
+  lane_terminal_line
   exit 0
 fi
 # ⛔ THE WALL LIMIT GREW BECAUSE THE JOB DID (3300s, was 2400s). A lane now owns its merge: after the
@@ -456,6 +542,41 @@ fi
 # wrong, and the lane log would end with no MERGED line even on a PR that merges (the chain is detached,
 # so the merge itself still completes — which is exactly why the missing line would be silent). The
 # bound is still a bound, and LANE_TIMEOUT overrides it as before.
+#
+# ── THE KEY GATE (agent-infra#3331) — THE LAST GATE, IMMEDIATELY BEFORE `pi` ───────────────────
+# It is LAST because it is the last thing that can be true: every other gate is checked before it, and
+# this one asserts the exact environment `run_agent` is about to hand to `pi` — after `lane-env.sh` has
+# sourced the box's file, after every export above, with nothing left that could change it. Measured
+# 2026-11-02: two cells, `HOME=/tmp/cell-home` for the operational layer, the credential in the ACCOUNT
+# home's `keys.env` — `pi` printed `No API key found for the selected model.`, exited, and the lane was
+# gone with a log that simply stopped.
+# ⛔ THE OTHER HALF IS `outcome=refused`, written by the trap. A refusal that only reaches stderr is the
+# same silence one layer up: `dispatch-merge.sh` had already recorded "launched" from `nohup … &`.
+if [ "${LANE_KEY_GATE:-1}" = "0" ]; then
+  # ⛔ THE DECLARED ESCAPE, AND IT ANNOUNCES ITSELF. It exists for fixtures that STUB `pi` (so the
+  # credential is not what they measure) — a fixture that inherited the box's own key would be a false
+  # GREEN on one box and a false RED on another. On a live box this line IS a bypass, and it says so in
+  # the log rather than switching the gate off quietly.
+  echo "[key-gate] lane $N check=skipped reason=LANE_KEY_GATE=0 — the model-credential assertion is OFF for this process (declared escape: fixtures that stub pi; on a live box this line is a bypass and says so) (#3331)" >> "$O/logs/lane-$N.log"
+else
+  # ⛔ NOT A `$(…)` CAPTURE, AND THAT IS LOAD-BEARING. A command substitution runs the gate in a
+  # SUBSHELL, so the `KEY_GATE_VAR`/`KEY_GATE_REASON` it sets evaporate — and the lane then announces
+  # the refusal with `var=unknown`, which is the very silence this issue removes (measured on this
+  # change's first draft: `reason=key-gate:credential-missing:unknown`). The gate writes to a file the
+  # caller owns, so its rc AND its state both reach this shell.
+  KEY_GATE_OUT="$O/state/key-gate-$N.line"
+  key_gate_assert "lane $N" "${HOME:-}" > "$KEY_GATE_OUT" 2>&1; KEY_GATE_RC=$?
+  tee -a "$O/logs/lane-$N.log" < "$KEY_GATE_OUT"
+  rm -f "$KEY_GATE_OUT" 2>/dev/null || true
+  if [ "$KEY_GATE_RC" -ne 0 ]; then
+    # The reason token names the VARIABLE, so a fleet scan can count the missing names without reading
+    # prose: `grep -h '^outcome=refused reason=key-gate' $O/logs/lane-*.log`.
+    lane_outcome refused "key-gate:${KEY_GATE_REASON:-credential-missing}:${KEY_GATE_VAR:-unknown}"
+    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — \$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it. NOT a capacity refusal and nothing was consumed: put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — the model credential \$${KEY_GATE_VAR:-?} is missing; see $O/logs/lane-$N.log" >&2
+    exit "$KEY_GATE_RC"
+  fi
+fi
 run_agent "${LANE_TIMEOUT:-3300}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
@@ -480,6 +601,34 @@ fi
 # or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
+# ── THE OUTCOME, RECORDED ONCE, IN THE SAME BREATH AS THE STATUS IT IS DERIVED FROM (#3331) ──────
+# The terminal line's `outcome=` is set HERE and nowhere else for these four cases, from the two facts
+# the code above already measured: did an agent start (`AGENT_STARTED`, authoritative) and what did it
+# return (`rc`). ⛔ EVERY REFUSAL CODE GETS A NAMED GATE, because `outcome=refused` alone would repeat
+# the defect this line exists to remove: an operator told "refused" still cannot tell a brief the box
+# can never satisfy (80) from a full disk (77) from a fork-exhausted box (73), and the remedies are
+# mutually exclusive (#1765, #2293). The tolerant `:-` defaults are the same `$O`-skew guard the block
+# below uses: a helper predating a code can never return it.
+if [ "$AGENT_STARTED" = "0" ]; then
+  case "$rc" in
+    "${AGENT_BRIEF_REFUSED:-80}")        lane_outcome refused "brief-gate" ;;
+    "${AGENT_LOAD_REFUSED:-75}")         lane_outcome refused "load-gate" ;;
+    "${AGENT_FORK_REFUSED:-73}")         lane_outcome refused "fork-gate" ;;
+    "${AGENT_DISK_REFUSED:-77}")         lane_outcome refused "disk-gate" ;;
+    "${AGENT_LAND_BACKLOG:-74}")         lane_outcome refused "land-backlog" ;;
+    "${AGENT_HARNESS_SKEW_REFUSED:-81}") lane_outcome refused "harness-skew" ;;
+    "${AGENT_CAPABILITY_REFUSED:-71}")   lane_outcome refused "capability-gate" ;;
+    "${PI_GATE_REFUSED:-76}")            lane_outcome refused "pi-gate" ;;
+    # ⛔ AN UNMAPPED STATUS FROM A GATE IS STILL A REFUSAL, NOT SILENCE: nothing was started, which is
+    # a fact about the lane whatever the number means. It names the code so the next reader has the one
+    # lead the vocabulary could not supply.
+    *)                                    lane_outcome refused "agent-not-started:rc$rc" ;;
+  esac
+elif [ "$rc" = "0" ]; then
+  lane_outcome done "agent-exit-0"
+else
+  lane_outcome failed "agent-exit-$rc"
+fi
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns

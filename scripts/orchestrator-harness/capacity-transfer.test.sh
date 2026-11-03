@@ -89,6 +89,16 @@ BRIEF_OK="$TMP/brief-ok.txt"; export BRIEF_OK   # every driver below is a `bash 
 
 echo "==> capacity-transfer self-test ($HERE)"
 
+# ⛔ THE MODEL-CREDENTIAL GATE IS DECLARED OFF FOR THIS SUITE, BY NAME AND ON PURPOSE (agent-infra#3331).
+# `lane.sh` now asserts, immediately before it spawns `pi`, that the lane's own environment holds the
+# credential its provider resolves from `models.json`. These arms STUB `pi` — the credential is not what
+# they measure — and a fixture that inherited whatever key the runner happens to have would be a false
+# GREEN on one box and a false RED on another (the same defect provider-credential.test.sh records for
+# `PI_LANE_*`). The ESCAPE IS LOUD: the lane log records `[key-gate] … check=skipped reason=LANE_KEY_GATE=0`
+# on every run here, and `lane-outcome.test.sh` proves the gate refuses by DEFAULT (exit 82) when it is
+# not set — so unsetting this line reddens nothing by accident and enables nothing silently.
+export LANE_KEY_GATE=0
+
 # ── stubs on PATH ────────────────────────────────────────────────────────────────────────────────
 # `pi` must NEVER be reached by a refusing gate; when §1c lets an agent run it records that it did.
 PI_LOG="$TMP/pi.log"; : > "$PI_LOG"; export PI_LOG

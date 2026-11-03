@@ -468,6 +468,14 @@ assert_contains "$OUT" "rc=1" "L5d a checkout on ANOTHER branch is preserved"
 assert_contains "$OUT" "feat/other-17" "L5d the reason names the branch it is actually on"
 assert_dir "$REPO/.worktrees/tm-17" "L5d the checkout survives"
 
+# ⛔ L6/L7 DECLARE THE MODEL-CREDENTIAL GATE OFF, BY NAME AND ON PURPOSE (agent-infra#3331). Both arms
+# replace `pi` with a STUB, so the credential is not what they measure — and `lane.sh` now asserts the
+# credential immediately before it spawns the agent. Without this, the arm's verdict would depend on
+# whether the RUNNER has a key (a false red on a fresh box, a false green on a provisioned one) instead
+# of on the trap it exists to test. The escape is loud: the lane log carries
+# `[key-gate] … check=skipped reason=LANE_KEY_GATE=0`, and `lane-outcome.test.sh` proves the gate refuses
+# by default (82) — so this line cannot hide a broken gate, only omit an unrelated assertion.
+#
 # ── L6: the SHIPPED lane.sh trap does the same, end to end ─────────────
 # The lane is executed for real: a stub `pi` returns immediately (so no model is called), the lane
 # produces no commit and no push, and its EXIT trap must take the worktree and branch back.
@@ -485,7 +493,7 @@ mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/dev/null
 OUT="$( cd "$REPO/.worktrees/tm-15" && \
         O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
-        REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." \
+        REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." LANE_KEY_GATE=0 \
         bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm "$LANE_OR" 2>&1 )"
 assert_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "exited" "L6 the shipped lane.sh ran to its exit path"
 # The repo-identity gate must not be what refused: with the target naming this box's origin it must
@@ -521,7 +529,7 @@ SH
 mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
 ( cd "$REPO/.worktrees/tm-16" && O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
-  REAP_LANE_VENV_DISABLE=1 \
+  REAP_LANE_VENV_DISABLE=1 LANE_KEY_GATE=0 \
   bash -c '. "$1"; exec bash "$2" 16 feat/16-tm "$3"' _ "$T/$ENV/o/stub-pi.sh" "$LANE" "$LANE_OR" \
   >/dev/null 2>&1 )
 assert_not_contains "$(cat "$T/$ENV/o/logs/lane-16.log" 2>/dev/null)" "land-backlog] REFUSED" \
