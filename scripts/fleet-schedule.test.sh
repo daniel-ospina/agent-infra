@@ -2666,6 +2666,109 @@ grep -q 'MUTATION RED' <<<"$mout18tb" \
   || bad "18t(b) MUTATION still holds, so the case grades nothing: $mout18tb"
 
 
+# 18u — "UNDETERMINABLE STAT" MUST NOT MEAN "RETURN THE PATH". The stat-ENOENT re-ask's fall-through
+# arm first read `return path`, justified as "anything else resolves to OURS". Measured false: with
+# a RACER's live-pid lock in place (the steal this publish block exists to survive) plus a one-shot
+# ENOENT then EIO, the caller returned a path while the lock on disk named the racer — and
+# `run_job`'s `finally` then unlinked the RACER's lock by name, after which a THIRD caller acquired
+# it: two concurrent runs of one job. The arm must fall through to the pid read (keep only if ours).
+# Nothing in the suite could see this direction — the 18t(b) mutation only reddens the ABANDON
+# direction — so the case is pinned here in its own right, mutated back.
+out18u="$(python3 - "$SCHED" "$T/state18u" <<'PY18U' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18u", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+path = os.path.join(d, "locks", "race.lock")
+RACER = 4000000 + (os.getpid() % 1000)
+real_stat, real_open, real_unlink = os.stat, open, os.unlink
+seq = {"n": 0}
+
+def racy_stat(p, *a, **k):
+    # ⛔ THE STEAL LANDS INSIDE THE STAT WINDOW — the racer replaces our freshly created lock with
+    # one naming ITS OWN pid, with a real unlink+create, and only THEN does the filesystem lie.
+    # (An earlier version of this case interposed on `open`, which the `return path` arm never
+    # calls — so the mutant saw no steal and the case could not redden: the harness was the bug.)
+    if os.path.abspath(str(p)) == os.path.abspath(path):
+        seq["n"] += 1
+        if seq["n"] == 1:
+            try:
+                real_unlink(path)
+            except OSError:
+                pass
+            with real_open(path, "w") as fh:
+                fh.write("%d\n" % RACER)
+            raise FileNotFoundError(2, "No such file or directory")
+        if seq["n"] == 2:
+            raise OSError(5, "Input/output error")
+    return real_stat(p, *a, **k)
+
+os.stat = racy_stat
+try:
+    r = m.acquire_lock("race")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(path):
+    try:
+        content = real_open(path).read().strip()
+    except OSError:
+        content = "unreadable"
+print("RESULT %s contend=%r content=%r"
+      % ("DOUBLE-HOLD" if (r and content != str(os.getpid())) else
+         ("REFUSED" if not r else "HELD-OURS"), bool(r), content))
+PY18U
+)"
+grep -q 'RESULT DOUBLE-HOLD' <<<"$out18u" \
+  && bad "18u returned a lock naming ANOTHER live pid (two holders, then a deleted racer lock): $out18u" \
+  || ok "18u an undeterminable stat never returns a foreign lock: $(grep -o 'RESULT [A-Z-]*' <<<"$out18u")"
+
+MUT18U="$T/mut-18u.py"
+python3 - "$SCHED" "$MUT18U" <<'PYMUTU'
+import sys
+src = open(sys.argv[1]).read()
+old = ('                    # pid, keep only if it is ours.\n'
+       '                    cur = None\n')
+new = ('                    # pid, keep only if it is ours.\n'
+       '                    return path  # the PRE-FIX reading, restored by the mutation\n')
+assert old in src, "the 18u mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTU
+mout18u="$(python3 - "$MUT18U" "$T/state18u-mut" <<'PYMUTUR' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("m18u", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True); m.STATE = d
+path = os.path.join(d, "locks", "race.lock")
+RACER = 4000000 + (os.getpid() % 1000)
+real_stat, real_open, real_unlink = os.stat, open, os.unlink
+seq = {"n": 0}
+def racy_stat(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path):
+        seq["n"] += 1
+        if seq["n"] == 1:
+            try: real_unlink(path)
+            except OSError: pass
+            with real_open(path, "w") as fh: fh.write("%d\n" % RACER)
+            raise FileNotFoundError(2, "ENOENT")
+        if seq["n"] == 2: raise OSError(5, "EIO")
+    return real_stat(p, *a, **k)
+os.stat = racy_stat
+try: r = m.acquire_lock("race")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(path):
+    try: content = real_open(path).read().strip()
+    except OSError: content = "unreadable"
+print("MUTATION %s contend=%r content=%r" % ("RED double-hold" if (r and content != str(os.getpid())) else "still-refused", bool(r), content))
+PYMUTUR
+)"
+grep -q 'MUTATION RED' <<<"$mout18u" \
+  && ok "18u MUTATION (blind return path) produces two holders — the case discriminates" \
+  || bad "18u MUTATION stayed refused, so the case grades nothing: $mout18u"
+
+
 echo
 echo "───────────────────────────────────────────────────────────────"
 echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

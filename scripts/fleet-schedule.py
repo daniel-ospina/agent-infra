@@ -1115,7 +1115,14 @@ def acquire_lock(label):
                 except FileNotFoundError:
                     continue
                 except OSError:
-                    return path
+                    # ⛔ NOT `return path`. "Anything else resolves to OURS" is FALSE, and measured
+                    # false: with a racer's live-pid lock in place (the steal this block exists to
+                    # survive) plus a one-shot `ENOENT` then `EIO`, returning the path made us run
+                    # the job while the lock on disk named the RACER — and `run_job`'s `finally`
+                    # then unlinked the racer's lock by name, after which a third caller acquired it
+                    # too. Falling through to `cur = None` asks the question properly: read the
+                    # pid, keep only if it is ours.
+                    cur = None
             except OSError:
                 cur = None
             if cur is None:
