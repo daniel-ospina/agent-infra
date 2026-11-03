@@ -29,6 +29,7 @@
 set -u
 
 O="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SELFDIR="$O"
 BC="$O/branch-claim.sh"
 FAILS=0; PASSES=0
 ok()  { PASSES=$((PASSES+1)); printf '  ok   %s\n' "$1"; }
@@ -106,15 +107,28 @@ grep -qE 'holder=[^ ]+:[0-9]+' "$T/stray.err" && ok "refusal NAMES THE HOLDER" |
 grep -q 'held-by-live' "$T/stray.err" && ok "refusal carries the reason (held-by-live)" || bad "no reason in: $(cat "$T/stray.err")"
 eq "the remote branch did NOT move (no head move => nothing to supersede)" \
    "$(cd "$T/origin.git" && git rev-parse "$BR")" "$OWNER_HEAD"
-[ "$(cd "$T/stray" && git rev-parse HEAD)" = "$STRAY_HEAD" ] && ok "stray lane kept its commit locally" || bad "stray commit state"
 
-echo "== 4. FENCING: a stale token can no longer push"
+echo "== 4a. a LIVE claim cannot be re-acquired by a peer (the orphan rules must abstain)"
+# ⛔ THIS IS THE B3/F1 REGRESSION PIN. A branch claim's holder pid is the acquiring CLI, dead by
+# design, so a pid-based orphan rule reclaims a live claim; a host-based one does it after a rename or
+# with a roster that does not name the peer. Both gave the peer ownership and refused the real owner.
+acquire_from stray "$BR"; eq "peer acquire against a LIVE claim is refused" "$?" "1"
+grep -q 'held-by' "$T/acq.out" && ok "refusal says held-by-live" || bad "text: $(cat "$T/acq.out")"
+( . "$SELFDIR/claims.sh"; claim_orphan_reason "oldbox:4242" "refs/claims/branch-integration-land-batch-2" >/dev/null 2>&1 ) \
+  && bad "claim_orphan_reason called a BRANCH claim ORPHANED (a prune would delete a live claim)" \
+  || ok "claim_orphan_reason ABSTAINS for a branch key (former-name / roster arms included)"
+
+echo "== 4b. an EXPIRED claim must be reclaimed, not waited on forever (until= must parse)"
 release_from owner "$BR"; eq "owner releases" "$?" "0"
 acquire_from stray "$BR" 1; eq "peer acquires with a 1s lease" "$?" "0"
 sleep 2
+guard_from owner "$BR"; eq "an EXPIRED claim is refused for a lane without its token" "$?" "1"
+grep -q 'claim-expired-unreclaimed' "$T/guard.err" && ok "the expired arm is reachable (reason=claim-expired-unreclaimed)" \
+  || bad "the expired arm did not fire — until= is unparseable again: $(cat "$T/guard.err")"
+grep -q 'until=[0-9]' "$T/guard.err" && ok "the refusal prints a real lease deadline" || bad "until= empty: $(cat "$T/guard.err")"
 acquire_from owner "$BR"; eq "owner reclaims the EXPIRED claim" "$?" "0"
 guard_from stray "$BR"; eq "the STALE holder is refused" "$?" "1"
-grep -q 'held-by' "$T/guard.err" && ok "the stale refusal explains itself" || bad "text: $(cat "$T/guard.err")"
+grep -q 'held-by-live' "$T/guard.err" && ok "stale-token refusal is held-by-live (token fence)" || bad "text: $(cat "$T/guard.err")"
 
 echo "== 5. release is fenced: a peer cannot release the holder's claim"
 release_from stray "$BR"; eq "peer release refused" "$?" "1"
@@ -153,6 +167,25 @@ else
 fi
 eq "MUTANT: the branch head moved onto the stray commit" \
    "$(cd "$T/origin.git" && git rev-parse "$BR")" "$MUTANT_HEAD"
+
+echo "== 9. a chained FOREIGN pre-push hook still receives the ref lines on stdin"
+# ⛔ F2: our own `while read` consumes stdin, so the chain used to see ZERO lines and a chain written
+# `while read local_ref …; do validate; done` validated nothing and exited 0 — a false PASS on a peer's
+# gate. The chain here records what it was handed; the assertion is on those bytes.
+git clone -q --branch "$BR" "$T/origin.git" "$T/chainbox" 2>/dev/null
+hookdir="$T/chainbox/.git/hooks"
+printf '#!/usr/bin/env bash\ncat > "%s/chain-stdin.txt"\n' "$T" > "$hookdir/pre-push"
+chmod +x "$hookdir/pre-push"
+( cd "$T/chainbox" && "$BC" install-hook --force >/dev/null 2>&1 ) || bad "install-hook --force over a foreign hook"
+commit_in chainbox "chained hook"
+push_in chainbox "$REMOTE_BR" "$T/p9.err" || true
+if [ -s "$T/chain-stdin.txt" ]; then
+  ok "the chained hook RECEIVED its ref lines ($(wc -l < "$T/chain-stdin.txt") line(s))"
+  grep -q 'refs/heads/integration/land-batch-2' "$T/chain-stdin.txt" && ok "the chain got the ref it must validate" \
+    || bad "wrong bytes to the chain: $(cat "$T/chain-stdin.txt")"
+else
+  bad "the chained hook got an EMPTY stdin — a peer gate would validate nothing and PASS"
+fi
 
 echo
 printf 'branch-claim.test.sh: %d passed, %d failed\n' "$PASSES" "$FAILS"

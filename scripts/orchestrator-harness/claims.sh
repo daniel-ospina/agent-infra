@@ -124,6 +124,10 @@ case "${CLAIM_ISSUE_TTL:-}" in
 esac
 
 # ── THE BRANCH CLAIM'S LEASE (agent-infra#3328) ─────────────────────────────────────────────
+# ⛔ THE CEILING IS THIS KEY'S OWN TERM (14400), NOT CLAIM_TTL_MAX (7200): `claim_branch_acquire`
+# passes CLAIM_BRANCH_TTL as BOTH the default and the ceiling, because a batch legitimately outlives the
+# 2 h PR/merge ceiling and clamping to it would expire a live batch mid-flight. Stated because the
+# comment below used to claim the opposite.
 # A BATCH BRANCH is held for the whole batch, which is longer than any single lane: the owner takes
 # it before the first lane pushes and releases it after the last one lands. Its term is therefore the
 # issue claim's ceiling, not the PR claim's 1800s — a batch claim that expires MID-BATCH lets a peer
@@ -578,8 +582,18 @@ claim_orphan_reason() {
     # land-batch-2-fix` matched the PR-shaped `*[0-9]*-*` arm (`…batch-2-fix`), probed the absent pid and
     # RECLAIMED a claim holding 599s of live lease, after which the real owner's pushes were refused —
     # two-lane ownership resolving to "whoever acquired last", which is the loss this key exists to stop.
-    # The pid therefore answers NOTHING for a branch key; the HOST rules below are what judge it.
-    *"/branch-"*) : ;;
+    # ⛔ AND THE HOST RULES DO NOT JUDGE IT EITHER — THE BRANCH KEY ABSTAINS ENTIRELY (agent-infra#3329
+    # cycle-2 review, F1). Skipping only the pid rule left the arms BELOW it (a former name of this box,
+    # CLAIM_DEAD_HOSTS, and the roster that calls an unknown host ORPHANED) still judging a branch key —
+    # and a branch claim's holder has NO liveness evidence of any kind: its pid is the acquiring CLI,
+    # dead by design, and its host is whatever box ran that CLI, which is not the lane. Measured:
+    # `claim_orphan_reason "oldbox:4242" refs/claims/branch-…` returned ORPHANED off the FORMER-NAME arm
+    # after a box rename, and with `CLAIM_KNOWN_HOSTS` set it returned ORPHANED for a live peer's claim —
+    # and `claim_prune` deletes on that verdict with NO expiry needed, after which the guard reads
+    # `unclaimed` and the stray push lands. Ownership of a branch ends at holder RELEASE or LEASE EXPIRY
+    # (claim_prune's expired arm), never at an orphan verdict. The bare spelling is covered too: a
+    # `branch-<slug>` with a digit-hyphen in it would otherwise reach the PR-shaped pid arm.
+    */branch-*|branch-*) return 1 ;;
     *"/issue-"*) : ;;   # the holder is the controller, not the worker -> the pid answers nothing
   # ⚠️ THE RESIDUAL THIS ARM ADMITS is confined to the ISSUE key: a rename frees the renamed box's own
   # IN-FLIGHT issue claims while their chains keep running — "the holder is gone but the work is not".
@@ -899,7 +913,10 @@ claim_branch_forget() { # <token-file>
 # Sets CLAIM_RESULT (one line, always naming the holder when one is known) and echoes it.
 claim_branch_guard() {
   local br="${1:-}" ref out rc cur own owner until now lease tmp orph
-  case "$br" in ''|*' '*'\t'*) CLAIM_RESULT="branch-claim: REFUSED branch=<unreadable> reason=no-branch"; echo "$CLAIM_RESULT"; return 1 ;; esac
+  # ⛔ `$'\t'`, NOT `\t`: inside a quoted case pattern a plain `\t` is a literal backslash-t, so the
+  # tab half of this test could never fire (measured inert — deleted-or-fixed rather than left looking
+  # load-bearing). git rejects such refnames before a hook runs, so this is a cheap last line only.
+  case "$br" in ''|*' '*|*$'\t'*) CLAIM_RESULT="branch-claim: REFUSED branch=<unreadable> reason=no-branch"; echo "$CLAIM_RESULT"; return 1 ;; esac
   ref="$(claim_branch_ref "$br")"
   # ⛔ THE EXIT STATUS IS THE DISTINCTION (the same split every pre-flight here makes): `ls-remote`
   # exits 0 with EMPTY output when the ref does not exist, NON-ZERO only when the remote could not be

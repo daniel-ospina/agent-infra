@@ -196,41 +196,14 @@ cmd_install_hook() {
     [ -e "$hook.chain" ] && mv "$hook.chain" "$hook.chain.$(date +%s)" 2>/dev/null
     mv "$hook" "$hook.chain" || die2 "could not move the existing hook aside"
   fi
-  cat > "$hook" <<HOOK
-#!/usr/bin/env bash
-$marker — refuses a push to a claimed batch branch by anyone but its holder.
-# Installed by scripts/orchestrator-harness/branch-claim.sh install-hook.
-# ⛔ DELETE THIS FILE TO DISARM, and say so in the PR: an unenforced claim is a claim.
-set -u
-here="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
-# ⛔ THE INSTALL-TIME PATH IS BAKED AND TRIED FIRST, because a hook runs with git's environment (no
-# AGENT_INFRA_PATH, an arbitrary cwd) and a hook that cannot find its own gate is a hook that
-# REFUSES every push — measured in this suite's own first run, where the whole fixture went red on
-# "hook cannot find branch-claim.sh" rather than on a claim. The env seams stay as fallbacks for a
-# moved checkout or a consumer repo.
-bc="\${BRANCH_CLAIM_BIN:-}"
-[ -n "\$bc" ] && [ -x "\$bc" ] || bc=""
-for c in "$SELF_DIR/branch-claim.sh" "\$here/../../scripts/orchestrator-harness/branch-claim.sh" "\${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/branch-claim.sh"; do
-  [ -n "\$bc" ] && break
-  [ -n "\$c" ] && [ -x "\$c" ] && bc="\$c"
-done
-[ -n "\$bc" ] || { echo "branch-claim: hook cannot find branch-claim.sh — set BRANCH_CLAIM_BIN or AGENT_INFRA_PATH" >&2; exit 1; }
-rc=0
-while read -r local_ref local_sha remote_ref remote_sha; do
-  [ -n "\${remote_ref:-}" ] || continue
-  if ! "\$bc" hook-ref "\$remote_ref"; then rc=1; fi
-done
-if [ -e "$hook.chain" ]; then
-  # The chain runs even when our check refuses, so a peer hook that refuses NEVER becomes invisible.
-  # ⛔ EXECUTED DIRECTLY, NOT VIA AN INTERPRETER: a hook body that launches an interpreter on a
-  # variable path is refused by
-  # the repo's checkout guard as an unresolvable INDIRECTION (script-indirection), and the guard runs
-  # on every push — including the pushes this hook exists to gate. The chained hook is executable by
-  # construction (git ran it before), so it is invoked as a program.
-  "$hook.chain" || rc=1
-fi
-exit "\$rc"
-HOOK
+  # ⛔ THE HOOK IS A REAL FILE, NOT A HEREDOC (agent-infra#3329 cycle-2 review, F2). The generated
+  # artifact is the program that decides whether a push proceeds; a heredoc cannot be syntax-checked or
+  # reviewed as what it becomes, and the first heredoc version shipped an unbalanced command
+  # substitution — every push from an installed checkout would have failed. The template is
+  # `branch-claim-hook.sh` beside this script; only the gate's own path is substituted.
+  tmpl="$SELF_DIR/branch-claim-hook.sh"
+  [ -r "$tmpl" ] || die2 "cannot read the hook template at $tmpl"
+  sed "s|@BC@|$SELF_DIR/branch-claim.sh|g" "$tmpl" > "$hook" || die2 "cannot write $hook"
   chmod +x "$hook" || die2 "cannot chmod $hook"
   printf 'INSTALLED %s\n' "$hook"
 }
