@@ -71,21 +71,27 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # the only construction that fires on EVERY exit: a normal end, a pre-flight refusal, a failing agent,
 # a `set -u` abort, and (through the explicit handlers below) a signal.
 #
-# THE CONTRACT — one physical line, last in `$O/logs/lane-<N>.log`:
+# THE CONTRACT — one physical line, PER RUN, last in `$O/logs/lane-<N>.log`:
 #     outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
-# count the logs that lack one:   grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log
-# ⛔ `lane-[0-9]*` IS NOT COSMETIC (review round 2, P2, measured): `lane-*.log` ALSO matches
-# `lane-merge-<PR>.log`, which `lane-merge.sh` writes and which is NOT a lane (`merge-rate.sh` excludes it
-# by name for exactly that reason — counting it added a fake lane and a fake MERGED). A scanner built on
-# the loose glob reports a permanent false positive on a healthy box, and the instrument that alarms on
-# the healthy path is the one the next reader learns to ignore. Lane logs are `<issue>.log`, and `$N` is
-# validated numeric above.
+# ⛔ PER RUN, AND THE READ MUST BE RUN-SCOPED (review round 4, P2, measured). The lane log is APPEND-ONLY
+# (`tee -a` / `>>`, nothing truncates it), so a re-dispatched issue leaves the PREVIOUS attempt's terminal
+# line in the same file — and `grep '^outcome=' | tail -1` then answers "this lane has ended" with the
+# EARLIER run's verdict while the current one is still working. That is the stale-flag class, in the very
+# artifact shipped to answer "did this lane run". So the line is also written to a PER-RUN sibling that the
+# next dispatch REMOVES before it starts: its ABSENCE means "no verdict for the current run" (still
+# working, or never started), never a previous verdict.
+#   the verdict of the current run:  cat "$O/logs/lane-<N>.outcome"      (absent = no verdict yet)
+#   which lane logs never said anything, any run:  grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log
+#   ⛔ `lane-[0-9]*` IS NOT COSMETIC (review round 2, P2, measured): `lane-*.log` ALSO matches
+#   `lane-merge-<PR>.log`, which `lane-merge.sh` writes and which is NOT a lane (`merge-rate.sh` excludes
+#   it by name for exactly that reason). Lane logs are `<issue>.log`, and `$N` is validated numeric above.
 # ⛔ `reason` is a TOKEN, never prose: this line is read by instruments, and a free-text field is the
 # field that re-stales. The long-form reason stays in the log's own `[lane N] NOT started: …` lines.
 # ⛔ IT IS INSTALLED THIS EARLY ON PURPOSE. Every exit AFTER the log path exists gets the line,
 # including the `78`s that refuse a half-synced `$O` before a single gate runs — those are exactly the
 # lanes that vanished with nothing said. The exits ABOVE this point are argument validation (78/64),
 # where no lane log exists yet and there is nothing to append to.
+rm -f "$O/logs/lane-$N.outcome" 2>/dev/null || true
 LANE_OUTCOME=""; LANE_OUTCOME_REASON=""; LANE_TERMINAL_DONE=0; LANE_LAST_STATUS=0
 lane_outcome() { # <done|refused|failed|died> <reason-token>  — FIRST writer wins
   [ -n "${LANE_OUTCOME:-}" ] && return 0
@@ -113,6 +119,9 @@ lane_terminal_line() {
   r="$(printf '%s' "$r" | tr '\n\r\t' '   ')"
   line="outcome=$o reason=$r lane=$N rc=${LANE_LAST_STATUS:-?} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
   printf '%s\n' "$line" | tee -a "$O/logs/lane-$N.log" 2>/dev/null || printf '%s\n' "$line"
+  # The per-run verdict (see the contract above): overwritten here, removed at the next dispatch, so its
+  # ABSENCE — not a stale line — is what "no verdict yet" looks like.
+  printf '%s\n' "$line" > "$O/logs/lane-$N.outcome" 2>/dev/null || true
   return 0
 }
 # The EXIT trap dispatches, so ONE trap site covers both halves as they become available: the cleanup
@@ -626,10 +635,31 @@ else
   # the refusal with `var=unknown`, which is the very silence this issue removes (measured on this
   # change's first draft: `reason=key-gate:credential-missing:unknown`). The gate writes to a file the
   # caller owns, so its rc AND its state both reach this shell.
+  # ⛔ A REDIRECT THAT FAILS IS NOT A REFUSAL (review round 4, P2, measured). `> "$KEY_GATE_OUT"` puts the
+  # creation of a file in `$O/state` INSIDE the refusal decision: on a read-only or full `$O` bash never
+  # runs the function, the status is 1, and the arm below announced a MISSING MODEL CREDENTIAL with
+  # `var=?`, `rc=1`, and a credential remedy — for a disk condition the DISK gate (77) exists to name, a
+  # gate that lives 200 lines LATER. So the file is created (and proved writable) first, and anything that
+  # is not exactly KEY_GATE_REFUSED is reported as the gate being UNABLE TO RUN, with its own outcome and
+  # no stand-down record (nothing was measured, so nothing is yielded).
   KEY_GATE_OUT="$O/state/key-gate-$N.line"
+  if ! { : > "$KEY_GATE_OUT"; } 2>/dev/null; then
+    lane_outcome died "key-gate-not-run:no-outcome-file"
+    echo "[lane $N] NOT started: the KEY gate could not be RUN ($O/state is not writable) — this is NOT a credential refusal and NOTHING was measured about the model, so nothing is yielded and the credential is not the suspect. Fix $O (free space / permissions; the DISK gate reports the same condition as 77) and re-dispatch." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: the KEY gate could not be RUN ($O/state not writable) — see $O/logs/lane-$N.log" >&2
+    exit 78
+  fi
   key_gate_assert "lane $N" "${HOME:-}" > "$KEY_GATE_OUT" 2>&1; KEY_GATE_RC=$?
   tee -a "$O/logs/lane-$N.log" < "$KEY_GATE_OUT"
   rm -f "$KEY_GATE_OUT" 2>/dev/null || true
+  if [ "$KEY_GATE_RC" -ne 0 ] && [ "$KEY_GATE_RC" != "$KEY_GATE_REFUSED" ]; then
+    # The gate itself failed (not a verdict). 78 = cannot run, and the reason names it so an operator does
+    # not go looking for a credential that was never the problem.
+    lane_outcome died "key-gate-not-run:rc$KEY_GATE_RC"
+    echo "[lane $N] NOT started: the KEY gate FAILED with status $KEY_GATE_RC — it did not measure the credential, so this is NOT a refusal about it and nothing is yielded. The '[key-gate]' output above is the reading; fix the harness ($SELF/key-gate.sh) and re-dispatch." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: the KEY gate FAILED (status $KEY_GATE_RC) — see $O/logs/lane-$N.log" >&2
+    exit 78
+  fi
   if [ "$KEY_GATE_RC" -ne 0 ]; then
     # The reason token names the VARIABLE, so a fleet scan can count the missing names without reading
     # prose: `grep -h '^outcome=refused reason=key-gate' $O/logs/lane-*.log`.
