@@ -823,6 +823,37 @@ def mark_tick():
         fh.write("%d\n" % int(time.time()))
 
 
+def report_bookkeeping_failure(exc):
+    """Announce a failed bookkeeping write WITHOUT assuming any write works.
+
+    Both of the loop's own surfaces can be the one that failed: `tick` (a file) and `loop.log`
+    (which is also the loop's stdout AND stderr, merged by spawn_loop). So each report attempt is
+    made independently and a failure to report is never allowed to escape — silence is the worst
+    outcome, because the loop would then keep ticking with no tick file and no explanation.
+    """
+    msg = "loop: bookkeeping write failed (%s: %s) — continuing to the next tick" % (
+        type(exc).__name__, exc)
+    # ⛔ ONE LINE, NOT TWO. `spawn_loop` points stderr at stdout, and both at loop.log, so a
+    # stderr write AND the log() write land in the SAME target: one untimestamped copy plus one
+    # timestamped one — the exact doubling log()'s own WRITE ONCE rule exists to prevent, and on a
+    # persistently broken tick that is two lines every TICK into the one file an operator reads.
+    # Emit on stderr only when stderr is a DIFFERENT target than stdout.
+    # ⛔ Exception, not OSError, on both emits: this function's contract is that a failure to
+    # REPORT must never escape, and the report is the one path where a second failure is most
+    # likely (an ASCII locale raises UnicodeEncodeError here, and `sys.stderr` can be None under
+    # a windowed interpreter).
+    if sys.stderr is not None and not _stderr_is_stdout():
+        try:
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001 — see above
+            pass
+    try:
+        log(msg)
+    except Exception:  # noqa: BLE001 — see above
+        pass
+
+
 def loop_pid():
     try:
         with open(os.path.join(STATE, "loop.pid")) as fh:
@@ -1061,6 +1092,21 @@ def _stdout_is(path):
         return False
 
 
+def _stderr_is_stdout():
+    """True when stderr and stdout are the SAME target (so one report is enough).
+
+    ⚠️ The comparison is stderr-vs-STDOUT, not stderr-vs-loop.log — an earlier version compared
+    against loop.log and was only correct in the SPAWNED shape. `--loop > out 2>&1` (and this
+    suite's own `run()` helper, which uses `2>&1`) merges the two streams while neither is
+    loop.log: stderr and log()'s print both went to one file, so every failure was reported
+    twice — measured 6 lines for 3 failures. samestat() covers both shapes.
+    """
+    try:
+        return os.path.samestat(os.fstat(sys.stderr.fileno()), os.fstat(sys.stdout.fileno()))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def log(message):
     line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message)
     path = os.path.join(STATE, "loop.log")
@@ -1076,7 +1122,21 @@ def log(message):
                 fh.write(line + "\n")
         except OSError:
             pass
-    print(line, flush=True)
+    # ⛔ A LOGGING FAILURE MUST NEVER BECOME A PROCESS FAILURE. When the loop's stdout IS this
+    # file (spawn_loop sets stdout to loop.log and stderr=STDOUT at the same target), THIS
+    # print() is the write — and on a full disk it raises ENOSPC. Measured 2026-11-03 on a cmux
+    # cell: that OSError escaped every handler in the loop and the cell's ONLY scheduler died,
+    # its last words a truncated `OSError: [Errno 28] No space left o` — the traceback itself
+    # could not be written. The file-append above is already guarded; leaving the report
+    # unguarded made a failure to REPORT the failure fatal.
+    # ⛔ Exception, NOT OSError: `print()` raises UnicodeEncodeError — a ValueError — when the
+    # stdout encoding cannot represent the message, and EVERY message here contains an em dash.
+    # Measured with PYTHONIOENCODING=ascii: the unguarded print killed the loop, i.e. the guard
+    # added to keep the loop alive was itself what killed it.
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001 — a logging failure is never a process failure
+        pass
 
 
 # ──────────────────────────────────────────────────────────────── the loop
@@ -1124,27 +1184,77 @@ def cmd_loop():
         # the repo" structurally impossible rather than checked-for.
         try:
             jobs = load_jobs()
-        except ScheduleError as exc:
-            log("ERROR: cannot read the job declarations (%s) — keeping the previous set" % exc)
+        except Exception as exc:  # noqa: BLE001 — a loop must outlive one unreadable set
+            # ⛔ Exception, NOT (ScheduleError, OSError). `load_jobs()` reads untrusted plist
+            # files, and the ways that fails are not all OSErrors: a plist whose ROOT is an array
+            # makes `data.get("Label")` raise AttributeError, a non-string StandardOutPath makes
+            # `render()` raise TypeError. Measured: one such file killed the loop permanently —
+            # the identical 3.6-day outcome this change exists to prevent, one line above the
+            # guard that fixes the other half of it. Keeping the previous set is the right
+            # answer to ANY unreadable declaration set.
+            log("ERROR: cannot read the job declarations (%s: %s) — keeping the previous set"
+                % (type(exc).__name__, exc))
         # ⛔ The tick is stamped at the START of the pass, not after it: the pass is
         # single-threaded, so an end-of-pass stamp makes the tick's age equal the duration of the
         # job currently executing — and a job allowed to run for JOB_TIMEOUT (1800s by default,
         # 300s from the shipped templates onward) would then read as "the process exists but is
         # not passing" WHILE it is doing exactly what it was told.
-        mark_tick()
-        if jobs:
-            now = time.time()
-            for job in jobs:
-                if job.error or job.skip:
-                    continue
-                if is_due(job, read_stamp(job.label), now):
-                    # ⛔ ONE BROKEN DECLARATION MUST NOT STOP THE SET. Anything run_job raises
-                    # (a bad log path, an unusable lock dir) used to escape here and terminate
-                    # the loop, leaving every other job unscheduled until a human restarts it.
+        # ⛔ THE LOOP'S OWN BOOKKEEPING IS NOT A JOB, AND IT MUST NOT BE ABLE TO KILL THE LOOP.
+        # Measured 2026-11-03 on a cmux cell: `mark_tick()` hit ENOSPC on a full disk, the
+        # OSError escaped `while True`, and the cell's ONLY scheduler was dead for 3.6 days —
+        # taking `eldato-disk-reaper` with it, i.e. the very job that would have freed the space
+        # that killed it. A closed feedback loop.
+        # The handler below cannot cover this: it protects ONE JOB being run, and these writes are
+        # the loop's own. A full disk is external and transient and this process is the only thing
+        # that will retry, so the correct cost of it is ONE TICK — never the process.
+        # ⚠️ The tick write is guarded SEPARATELY from the pass, on purpose: a failed stamp must
+        # not cancel the jobs. Folding them into one guard made a broken tick discard the whole
+        # pass (caught by case 18a — the marker stopped growing while the loop stayed alive, which
+        # is a quieter failure than the death this fixes and must not be traded for it).
+        try:
+            mark_tick()
+        except OSError as exc:
+            report_bookkeeping_failure(exc)
+        try:
+            if jobs:
+                now = time.time()
+                for job in jobs:
+                    if job.error or job.skip:
+                        continue
+                    # ⛔ ONE UNPARSEABLE JOB MUST NOT UNSCHEDULE THE ONES AFTER IT. `is_due`
+                    # reads THIS job's own stamp (hand-edited, or written by an older copy) and
+                    # its calendar values, so it can raise on one job's data — and the pass guard
+                    # below abandons the REST OF THE SET when it does. Measured with
+                    # `{"started": "yesterday"}` on the middle of three jobs: the ones sorting
+                    # after it ran 0x for the whole window while the loop ticked happily, so every
+                    # liveness check read "fine". Skip and NAME that one job; the others still run.
                     try:
-                        run_job(job)
-                    except Exception as exc:  # noqa: BLE001 — a loop must outlive one job
-                        log("ERROR %s could not be run (%s: %s) — continuing with the set" % (job.label, type(exc).__name__, exc))
+                        due_now = is_due(job, read_stamp(job.label), now)
+                    except Exception as exc:  # noqa: BLE001 — one bad stamp is one bad job
+                        log("ERROR %s has an unusable stamp or calendar (%s: %s) — skipping it; "
+                            "the rest of the set still runs"
+                            % (job.label, type(exc).__name__, exc))
+                        continue
+                    if due_now:
+                        # ⛔ ONE BROKEN DECLARATION MUST NOT STOP THE SET. Anything run_job
+                        # raises (a bad log path, an unusable lock dir) used to escape here and
+                        # terminate the loop, leaving every other job unscheduled until a human
+                        # restarts it.
+                        try:
+                            run_job(job)
+                        except Exception as exc:  # noqa: BLE001 — a loop must outlive one job
+                            log("ERROR %s could not be run (%s: %s) — continuing with the set" % (job.label, type(exc).__name__, exc))
+        except Exception as exc:  # noqa: BLE001 — a loop must outlive one bad pass
+            # ⛔ Exception, NOT OSError, and NOT a second guard on run_job (the inner one already
+            # covers that). What escapes here is everything OUTSIDE a job: `read_stamp`/`is_due`
+            # over a stamp a foreign writer or a hand-edit left malformed (`{"started":
+            # "yesterday"}` ⇒ `float(last)` ⇒ ValueError) and `next_occurrence`'s `int(calendar
+            # ["Hour"])` over a template whose value is not a number (load_jobs validates the
+            # SHAPE of a dict, not its values). Both are one bad file on disk, and both used to
+            # stop every job on the box permanently — the same outcome this whole change exists to
+            # prevent, so the guard must be as wide as the ways a pass can fail. SystemExit is a
+            # BaseException, so `--stop` and the signal handlers are unaffected.
+            report_bookkeeping_failure(exc)
         time.sleep(max(5, TICK))
     try:
         os.unlink(pidfile)
@@ -1463,12 +1573,24 @@ def cmd_verify():
         # clock that stepped back (a resumed VM, an NTP correction of a fast RTC) or a state dir
         # restored from a skewed box is enough, and if it is the only live job the zero-live guard
         # is satisfied too: SCHEDULE VERIFIED over a job that will never run again.
-        if stamp["started"] > now + max(3 * TICK, 300):
+        # ⛔ A `started` WE CANNOT COMPARE IS NOT A LIVE JOB EITHER. This arm used to do
+        # `stamp["started"] > now` unguarded, so a stamp a hand-edit or a foreign writer left as a
+        # string raised TypeError out of --verify — the surface whose whole job is to DIAGNOSE the
+        # unusable stamp that the loop now skips. Report it as the failure it is.
+        started = stamp.get("started")
+        if not isinstance(started, (int, float)) or isinstance(started, bool):
+            failures.append(
+                "%s: its last-run stamp has no usable 'started' value (%r) — a hand-edit or a "
+                "foreign writer broke it, so its due-ness cannot be trusted; clear: rm -f %s"
+                % (job.label, started, stamp_path(job.label))
+            )
+            continue
+        if started > now + max(3 * TICK, 300):
             failures.append(
                 "%s: its last-run stamp is IN THE FUTURE (%s from now) — the clock stepped back "
                 "or the state dir was restored from a skewed box, so the job reads as not-due for "
                 "ever while a stamp makes it look live; clear: rm -f %s"
-                % (job.label, human_secs(stamp["started"] - now), stamp_path(job.label))
+                % (job.label, human_secs(started - now), stamp_path(job.label))
             )
             continue
         ran += 1

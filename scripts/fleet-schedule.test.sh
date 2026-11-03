@@ -1383,6 +1383,152 @@ grep -q 'Traceback' <<<"$out" && bad "--stop raised a traceback: $out" || ok "no
 [ -f "$NOSSTATE/OFF" ] && ok "the OFF switch was created (the decision is recorded)" \
   || bad "no OFF switch was written"
 
+# ── 18. a failed bookkeeping write costs a TICK, never the loop ─────────────────────────────
+# The defect (measured 2026-11-03 on a cmux cell): `mark_tick()` hit ENOSPC on a full disk, the
+# OSError escaped `while True`, and the cell's ONLY scheduler was dead for 3.6 days — taking
+# `eldato-disk-reaper` with it, i.e. the very job that would have freed the space that killed it.
+# A closed feedback loop. `log()` had the same hole from the other side: its file append is
+# guarded but it ends in `print(line, flush=True)`, and when the loop's stdout IS loop.log that
+# print IS the write — so a failure to report the failure was fatal, and the cell's last words
+# were a truncated `OSError: [Errno 28] No space left o`.
+# Both cases drive the SHIPPED code and FAIL if either guard is removed (mutation-tested).
+case_ "18. a failed bookkeeping write costs one tick, never the process"
+
+# 18a — `mark_tick()` cannot write. A DIRECTORY at the tick path raises IsADirectoryError, an
+# OSError of the same family as ENOSPC, hermetically (no full filesystem needed).
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1
+pid="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+before="$(wc -c < "$MARK" 2>/dev/null || echo 0)"
+rm -f "$FLEET_SCHEDULE_STATE/tick"; mkdir -p "$FLEET_SCHEDULE_STATE/tick"
+sleep 12   # > 2 ticks at FLEET_SCHEDULE_TICK=5
+kill -0 "$pid" 2>/dev/null && ok "the loop SURVIVED a failed tick write" \
+  || bad "the loop DIED on a failed bookkeeping write — the cell scheduler is gone"
+after="$(wc -c < "$MARK" 2>/dev/null || echo 0)"
+[ "$after" -gt "$before" ] && ok "it kept running jobs after the failure (the pass continued past the guard)" \
+  || bad "no job ran after the bookkeeping failure — the whole pass was abandoned"
+grep -q 'bookkeeping write failed' "$FLEET_SCHEDULE_STATE/loop.log" 2>/dev/null \
+  && ok "the failure was REPORTED (silence would hide a broken tick)" \
+  || bad "the failure was not reported — an operator would see nothing wrong"
+run "$GOOD" --stop >/dev/null 2>&1; rmdir "$FLEET_SCHEDULE_STATE/tick" 2>/dev/null
+
+# 18b — the report itself cannot be written: writing to our own stdout raises ENOSPC, exactly as
+# it did on the cell. `log()` must swallow it and the caller must keep going.
+# ⚠️ HERMETIC ON PURPOSE. The first version redirected stdout to /dev/full, which exists on Linux
+# and NOT on macOS/BSD — this suite is explicitly run on the Mac (it guards /proc and drives the
+# Darwin branch), so that version reported a permanent false FAIL there blaming `log()` for a
+# missing device node, whose tempting "fix" is to delete the guard under test. An object whose
+# write() raises ENOSPC is the same condition on every platform.
+out18b="$(python3 - "$SCHED" "$T/state18b" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+
+
+class EnospcStdout:
+    """stdout whose every write fails the way a full disk fails."""
+    def write(self, _s):
+        raise OSError(28, "No space left on device")
+    def flush(self):
+        raise OSError(28, "No space left on device")
+
+
+_real_stdout = sys.stdout
+sys.stdout = EnospcStdout()
+try:
+    m.log("hello")      # the print() at the end of log() raises ENOSPC — it must be swallowed
+finally:
+    # Restore it, or CPython's own shutdown flush of the fake stdout adds an ignored exception and
+    # a "Traceback" line that this case would then mistake for log() having raised.
+    sys.stdout = _real_stdout
+sys.stderr.write("SURVIVED\n")
+PY
+)"; rc18b=$?
+# Control reaching the line AFTER log(), with no traceback, is the oracle: rc is NOT usable here
+# (an un-flushable stdout makes CPython exit 120 at shutdown whatever the caller did).
+if [ "$rc18b" -eq 0 ] && grep -q 'SURVIVED' <<<"$out18b" \
+   && [ "$(grep -c 'Traceback' <<<"$out18b")" -eq 0 ]; then
+  ok "log() survived an ENOSPC on its own print (a logging failure is not a process failure)"
+else
+  bad "log() raised on an ENOSPC write and took the caller with it (rc=$rc18b): $out18b"
+fi
+
+# 18d — a logging failure of a NON-OSError kind. `print()` raises UnicodeEncodeError (a ValueError)
+# when the stdout encoding cannot represent the message, and EVERY loop message contains an em dash.
+# Measured with PYTHONIOENCODING=ascii on the guard-narrowed file: both the OFF-switch log line and
+# the new reporter died with a traceback — i.e. the guard added to keep the loop alive was what
+# killed it. An undecodable stdout must cost the line, not the process.
+out18d="$(PYTHONIOENCODING=ascii python3 - "$SCHED" "$T/state18d" <<'PY18D' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+m.log("hello — em dash")                       # UnicodeEncodeError from print()
+m.report_bookkeeping_failure(OSError(28, "No space left on device"))
+sys.stderr.write("SURVIVED\n")
+PY18D
+)"; rc18d=$?
+if [ "$rc18d" -eq 0 ] && grep -q 'SURVIVED' <<<"$out18d" \
+   && [ "$(grep -c 'Traceback' <<<"$out18d")" -eq 0 ]; then
+  ok "an ASCII/undecodable stdout cost the line, not the process (log and report survived)"
+else
+  bad "log()/report raised UnicodeEncodeError and took the caller with it (rc=$rc18d): $out18d"
+fi
+
+# 18c — the OTHER two ways a pass can fail escape the loop, both found by fresh-context review and
+# both measured to kill the shipped pre-fix loop (rc=1, every job on the box stopped for good):
+#   (a) load_jobs() reads UNTRUSTED plists: a templates dir that passes `isdir` and then fails
+#       (EACCES/EIO/EMFILE/ESTALE) raised PermissionError out of the old `except ScheduleError`,
+#       and a plist whose ROOT is an array raises AttributeError.
+#   (b) a stamp a hand-edit or foreign writer left malformed ({"started": "yesterday"}) reaches
+#       `float(last)` inside is_due and raises ValueError.
+# The two arms are measured SEPARATELY and in this order, because they interact: while the
+# templates dir is unreadable the loop deliberately keeps the PREVIOUS job set, so a job declared
+# during that window is not in it and cannot be used to prove anything about the pass.
+state_reset "$GOOD"
+rm -f "$MARK" "$MARK.after"
+cat > "$T/zzzafter.spec" <<PL
+PLIST = {
+    "Label": "com.test.zzzafter",
+    "ProgramArguments": ["/bin/sh", "-c", "echo after >> '$MARK.after'"],
+    "StartInterval": 2,
+}
+PL
+# A job that sorts AFTER com.test.hourly: without it this case proves only that SOME job ran, and a
+# mutation test showed that is not the invariant (com.test.echo sorts FIRST, so it wrote the marker
+# even while the rest of the set was abandoned).
+mkplist "$GOOD" com.test.zzzafter "$T/zzzafter.spec"
+run "$GOOD" --install >/dev/null 2>&1
+pidc="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+
+# ── arm (a): the templates dir cannot be read ────────────────────────────────────────────────
+if [ "$(id -u)" -eq 0 ]; then
+  skip "running as root — chmod 000 blocks nothing, so arm (a) cannot be exercised here"
+else
+  chmod 000 "$GOOD" 2>/dev/null || true
+fi
+sleep 10
+kill -0 "$pidc" 2>/dev/null && ok "an unreadable templates dir did not kill the loop (previous set kept)" \
+  || bad "an unreadable templates dir killed the loop — one EACCES on the templates dir stops the whole cell"
+chmod 755 "$GOOD" 2>/dev/null || true
+
+# ── arm (b): one job's stamp is unparseable ──────────────────────────────────────────────────
+rm -f "$MARK.after"
+printf '{"label": "com.test.hourly", "started": "yesterday", "rc": 0, "duration": 0}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" 2>/dev/null || true
+sleep 12
+kill -0 "$pidc" 2>/dev/null && ok "a malformed stamp did not kill the loop" \
+  || bad "a malformed stamp killed the loop — one bad file on disk stops the whole cell"
+tailran=0; [ -f "$MARK.after" ] && tailran="$(wc -l < "$MARK.after" 2>/dev/null || echo 0)"
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" "$GOOD/com.test.zzzafter.plist" 2>/dev/null || true
+[ "${tailran:-0}" -gt 0 ] && ok "the job sorting AFTER the broken one still ran ($tailran runs) — the set was not abandoned" \
+  || bad "the job after the broken one ran 0x while a stamp was malformed — one bad stamp silently unschedules the rest"
+run "$GOOD" --stop >/dev/null 2>&1
+
 
 # ── 18. residency is DECLARED, read in every documented form, and refused by name ───────────
 # Both P2s a fresh review left on PR #2954 are the #2908 shape: a VALID declaration the runtime did
