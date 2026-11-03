@@ -1456,11 +1456,19 @@ check_graph_client() {
   fi
   # The .sh execs its SIBLING by `$(dirname "$0")`. A farm that delivers only the .sh looks complete
   # in the directory listing and dies on the first call, so the pair is checked as a pair.
-  py="$(dirname "$client")/tortoise_graph_client.py"
-  if [ -f "$py" ]; then
-    ok "graph client: tortoise_graph_client.py beside it (the sibling the .sh execs)"
-  else
-    warn "graph client HALF-DELIVERED: $py is absent, so every call dies on its first turn. FIX: the same farm run — fleet_srcs carries BOTH files, and farming the .sh alone is the defect"
+  # ⛔ AND ONLY WHEN THE CLIENT IS THERE TO HAVE A SIBLING. Ungated, a box carrying
+  # `tortoise_graph_client.py` and NO `tortoise-graph.sh` printed `warn: graph client MISSING` followed
+  # by an `ok: … beside it` — a green line in the graph-client section of `--check` for a box with no
+  # client (measured 2026-11-03), the round-4 unqualified-`ok` shape one layer weaker. The same gate
+  # stops a box where NOTHING was farmed from getting the PARTIAL-farm diagnosis ("farming the .sh
+  # alone is the defect") for a state in which no farm ran at all.
+  if [ -f "$client" ]; then
+    py="$(dirname "$client")/tortoise_graph_client.py"
+    if [ -f "$py" ]; then
+      ok "graph client: tortoise_graph_client.py beside it (the sibling the .sh execs)"
+    else
+      warn "graph client HALF-DELIVERED: $py is absent, so every call dies on its first turn. FIX: the same farm run — fleet_srcs carries BOTH files, and farming the .sh alone is the defect"
+    fi
   fi
   # The client prefers TORTOISE_MCP_API_KEY and falls back to TORTOISE_API_KEY, so this reading mirrors
   # that precedence instead of inventing a second rule — but it does NOT report the two as equivalent:
@@ -1514,7 +1522,7 @@ check_graph_client() {
   elif [ -n "${TORTOISE_API_KEY:-}" ]; then
     warn "graph credential UNCERTAIN: only TORTOISE_API_KEY is set. That is the REST key (tt_…, /v1/points — scripts/tortoise-memory.mjs), and the graph client speaks JSON-RPC to /mcp/, so this key may be REJECTED by the endpoint. FIX: add TORTOISE_MCP_API_KEY to $ENV_FILE (hand-provisioned, from the Tortoise dashboard) and re-run; a lane will report GRAPH-UNREACHABLE rather than silently skipping the read or the write"
   else
-    warn "graph credential MISSING: neither TORTOISE_MCP_API_KEY nor TORTOISE_API_KEY is set, so $client exits 3 GRAPH-UNREACHABLE(NO-KEY) and the mandate cannot run. ⛔ The fleet has NO secret store wired to it — this key is HAND-PROVISIONED: add its line to $ENV_FILE on a cell (on a Mac, to pi-keys.env — pi-bootstrap/SETUP-NEW-MACHINE.md step 3) and re-run. Lanes MUST report GRAPH-UNREACHABLE(NO-KEY) rather than silently skipping the read or the write"
+    warn "graph credential MISSING: neither TORTOISE_MCP_API_KEY nor TORTOISE_API_KEY is set, so the graph mandate cannot run — with the client in place each call exits 3 GRAPH-UNREACHABLE(NO-KEY). ⛔ The fleet has NO secret store wired to it — this key is HAND-PROVISIONED: add its line to $ENV_FILE on a cell (on a Mac, to pi-keys.env — pi-bootstrap/SETUP-NEW-MACHINE.md step 3) and re-run. Lanes MUST report GRAPH-UNREACHABLE(NO-KEY) rather than silently skipping the read or the write"
   fi
 }
 

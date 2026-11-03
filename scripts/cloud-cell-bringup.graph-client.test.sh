@@ -60,8 +60,17 @@ warn() { OUT="${OUT}warn: $*"$'\n'; }
 die()  { OUT="${OUT}fatal: $*"$'\n'; }
 
 # run_case <label> — sources the extraction and records stdout AND stderr separately.
+# ⛔ HERMETIC. This suite reads the SAME two variables the check does, and a provisioned box EXPORTS them
+# (`pi-bootstrap/setup.sh` wires `~/pi-keys.env` into the profile; a cell's `~/keys.env` is sourced by
+# `worker-terminal.sh` under `set -a`). Without this scrub the suite reported a FALSE RED on exactly the
+# boxes this PR provisions — `absent: expected [graph credential MISSING]` — while CI stayed green because
+# no workflow exports them (measured 2026-11-03 on a copy). Cases 8/9/10 opt back in through
+# RUN_CASE_KEEP_ENV, which is the only way an ambient value reaches a case.
 run_case() {
     OUT=""
+    if [ "${RUN_CASE_KEEP_ENV:-0}" != "1" ]; then
+        unset TORTOISE_MCP_API_KEY TORTOISE_API_KEY
+    fi
     # shellcheck source=/dev/null
     . "$FN"
     check_graph_client
@@ -117,6 +126,10 @@ printf 'NOTHING=1\n' >"$E2"
 HOME="$H2" ENV_FILE="$E2" run_case absent >"$TMP/absent.stdout" 2>"$TMP/absent.err"
 expect absent "graph client MISSING:"
 expect absent "graph credential MISSING:"
+# a client that is not there has no SIBLING: "half-delivered" is a partial-farm diagnosis, and a box
+# where nothing was farmed must not be told a farm half-ran.
+expect_absent absent "beside it"
+expect_absent absent "HALF-DELIVERED"
 clean absent
 
 # ── case 3: half-delivered — the .sh without its sibling dies on the first call ──────────────────
@@ -184,7 +197,7 @@ H8="$TMP/h8"; E8="$TMP/h8/keys.env"
 mkdir -p "$H8/.pi/agent/scripts"
 : >"$H8/.pi/agent/scripts/tortoise-graph.sh"; : >"$H8/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'NOTHING=1\n' >"$E8"
-TORTOISE_MCP_API_KEY="$SECRET" HOME="$H8" ENV_FILE="$E8" run_case ambient_mcp >"$TMP/ambient_mcp.stdout" 2>"$TMP/ambient_mcp.err"
+RUN_CASE_KEEP_ENV=1 TORTOISE_MCP_API_KEY="$SECRET" HOME="$H8" ENV_FILE="$E8" run_case ambient_mcp >"$TMP/ambient_mcp.stdout" 2>"$TMP/ambient_mcp.err"
 expect ambient_mcp "graph credential NOT REACHING LANES"
 expect_absent ambient_mcp "$SECRET"
 clean ambient_mcp
@@ -194,7 +207,7 @@ H9="$TMP/h9"; E9="$TMP/h9/keys.env"
 mkdir -p "$H9/.pi/agent/scripts"
 : >"$H9/.pi/agent/scripts/tortoise-graph.sh"; : >"$H9/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'NOTHING=1\n' >"$E9"
-TORTOISE_API_KEY="$SECRET" HOME="$H9" ENV_FILE="$E9" run_case ambient_rest >"$TMP/ambient_rest.stdout" 2>"$TMP/ambient_rest.err"
+RUN_CASE_KEEP_ENV=1 TORTOISE_API_KEY="$SECRET" HOME="$H9" ENV_FILE="$E9" run_case ambient_rest >"$TMP/ambient_rest.stdout" 2>"$TMP/ambient_rest.err"
 expect ambient_rest "graph credential UNCERTAIN"
 expect_absent ambient_rest "graph credential: TORTOISE_MCP_API_KEY is set"
 expect_absent ambient_rest "$SECRET"
@@ -207,7 +220,7 @@ H10="$TMP/h10"; E10="$TMP/h10/keys.env"
 mkdir -p "$H10/.pi/agent/scripts"
 : >"$H10/.pi/agent/scripts/tortoise-graph.sh"; : >"$H10/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E10"
-TORTOISE_MCP_API_KEY="$SECRET" HOME="$H10" ENV_FILE="$E10" run_case both >"$TMP/both.stdout" 2>"$TMP/both.err"
+RUN_CASE_KEEP_ENV=1 TORTOISE_MCP_API_KEY="$SECRET" HOME="$H10" ENV_FILE="$E10" run_case both >"$TMP/both.stdout" 2>"$TMP/both.err"
 expect both "graph credential: TORTOISE_MCP_API_KEY is set in"
 expect_absent both "$SECRET"
 clean both
@@ -262,9 +275,20 @@ SCAN_FILES=()
 for c in $CASES; do
     SCAN_FILES+=("$TMP/$c.out" "$TMP/$c.stdout" "$TMP/$c.err")
 done
-# 10 cases × 3 streams. A run that scans fewer did not look at what this rule is about.
-if [ "${#SCAN_FILES[@]}" -ge 30 ]; then pass; else
-    fail "leak sweep: ${#SCAN_FILES[@]} stream file(s) enumerated from $CASES — the sweep lost cases, so a clean result would be an empty set"
+# ⛔ COVERAGE, NOT A COUNT. A total of 30 is satisfied by enumerating 10 cases × `out,err,out` — the
+# transcript twice and no stdout — which is a plausible slip and defeats the whole rule (measured
+# 2026-11-03: 51/51 green with the value sitting in `ambient_mcp.stdout`). So each case must contribute
+# each of its THREE streams by name.
+missing_streams=""
+for c in $CASES; do
+    for st in out stdout err; do
+        found=0
+        for f in "${SCAN_FILES[@]}"; do [ "$f" = "$TMP/$c.$st" ] && { found=1; break; }; done
+        [ "$found" -eq 1 ] || missing_streams="${missing_streams} $c.$st"
+    done
+done
+if [ -z "$missing_streams" ]; then pass; else
+    fail "leak sweep: the enumeration does not cover these stream(s):$missing_streams — a stream that is never scanned cannot report a leak"
 fi
 missing=0
 for c in $CASES; do [ -s "$TMP/$c.out" ] || missing=$((missing + 1)); done
