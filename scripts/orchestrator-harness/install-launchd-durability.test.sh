@@ -405,13 +405,18 @@ else bad "install.sh does not source launchd-cycle.sh"; fi
 
 # ── A2. the $O DRIFT LIST names every script the daemon or the loop RUNS ─────────────────────────
 # install.sh warns when `$O/<script>` differs from the shipped copy, and the NAMES it walks are a
-# hand-kept list. The plist executes `$O/launchd-controller.sh` and nothing else — so a list without
-# that name is a drift check that can never report the one file whose drift turns every cycle into
-# exit 127 while the controller looks healthy. This is not hypothetical: it happened in the merge
-# that introduced it (our side added launchd-controller.sh, main's side added live-ownership.sh, and
-# a resolution keeping one side leaves a real file unchecked — for live-ownership.sh silently
-# reverting selection to registry-only). So the list is pinned against the PLIST and the loop's own
-# sourced modules, not against a copy of itself.
+# hand-kept list. The plist executes a $O script and nothing else — so a list without that name is a
+# drift check that can never report the one file whose drift turns every cycle into exit 127 while the
+# controller looks healthy. This is not hypothetical: it happened in the merge that introduced it (our
+# side added launchd-controller.sh, main's side added live-ownership.sh, and a resolution keeping one
+# side leaves a real file unchecked — for live-ownership.sh silently reverting selection to
+# registry-only). So the list is pinned against the PLIST and the loop's own sourced modules, not
+# against a copy of itself.
+# ⛔ #3309 CHANGED WHAT THE PLIST EXECUTES. It is no longer `$O/<controller>` rendered literally into
+# the template: the program is the STABLE resolver `__PROGRAM__`, which install.sh substitutes with
+# `$O/orch-pin-exec.sh`. The derivation below therefore resolves the token to the NAME install.sh
+# renders — deriving from the installer's own STABLE_PROG assignment, not from a second copy of the
+# name — so the drift-coverage guarantee still has a real subject on either shape.
 echo "-- A2. the \$O drift list covers what the plist and the loop execute"
 DRIFT_LIST="$(grep -E '^for f in .*gh-rest/gh' "$INSTALL" | head -1 | sed -e 's/^for f in //' -e 's/; do$//')"
 drift_names() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' || true; }
@@ -419,8 +424,13 @@ if [ -n "$DRIFT_LIST" ]; then ok "install.sh's \$O drift list was found ($(drift
 else bad "install.sh's \$O drift list is gone — nothing compares \$O against the shipped copies"; fi
 # The plist's ProgramArguments target IS the file launchd executes; derive it, never assume it.
 PLIST_ENTRY="$(grep -oE '__O__/[A-Za-z0-9._-]+\.sh' "$HARNESS/launchd.plist.template" | head -1 | sed 's|__O__/||')"
+if [ -z "$PLIST_ENTRY" ] && grep -qF '<string>__PROGRAM__</string>' "$HARNESS/launchd.plist.template"; then
+  # #3309: stable-resolver shape. The name is whatever install.sh assigns to STABLE_PROG.
+  PLIST_ENTRY="$(grep -oE 'STABLE_PROG="\$O/[A-Za-z0-9._-]+\.sh"' "$INSTALL" | head -1 | sed -e 's|^STABLE_PROG="\$O/||' -e 's|"$||')"
+  [ -n "$PLIST_ENTRY" ] && ok "the plist template renders the stable resolver __PROGRAM__, which install.sh sets to \$O/$PLIST_ENTRY"
+fi
 if [ -n "$PLIST_ENTRY" ]; then ok "the plist template names its entrypoint ($PLIST_ENTRY)"
-else bad "no __O__/<script> entrypoint found in launchd.plist.template — this pin cannot be derived"; fi
+else bad "no __O__/<script> or __PROGRAM__ entrypoint could be derived from launchd.plist.template — this pin cannot be derived"; fi
 if [ -n "$PLIST_ENTRY" ] && drift_names "$DRIFT_LIST" | grep -qxF "$PLIST_ENTRY"; then
   ok "the drift list checks the entrypoint the plist actually executes ($PLIST_ENTRY)"
 else bad "the drift list does NOT include $PLIST_ENTRY — a drift in the one file launchd runs could never be reported"; fi
@@ -1601,6 +1611,100 @@ unset FAKE_PRINT_FAIL
 if [ "$rc" -ne 0 ]; then ok "an unreadable domain after a start refuses (non-zero)"; else bad "an unreadable domain was scored as a start"; fi
 assert_contains "$out" "could not be read" "…and the message names the failed read, not 'no pid'"
 assert_not_contains "$out" "NO pid" "…it does not claim the label has no pid"
+echo
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# J. THE RENDERED LAUNCHD PROGRAM MUST BE STABLE AND RESOLVABLE (agent-infra#3309)
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# THE INCIDENT (measured 2026-11-02 on this box): the installed plist ran
+#   /Users/home/harness/5712e52776c8/scripts/orchestrator-harness/launchd-controller.sh
+# `~/harness/` holds HASH-NAMED pin snapshots and the GC deletes old ones as the pin advances. When the
+# pin moved to 9ae71c4e118e, 5712e52776c8 was gone, so EVERY tick died `No such file or directory`,
+# exit 127 — and `launchctl list` still printed the job as LOADED, launchd.err repeated one stale-looking
+# line, and a 15-hour-old candidates.txt (194 entries) read as a full queue. The loop was dead ~15h.
+# launchd reads ProgramArguments ONCE at bootstrap and cannot follow a moving pin, so the ONLY stable
+# shapes are (a) a path that never moves, or (b) a stub that resolves the pin per tick. install.sh ships
+# (b): a stable `$O/orch-pin-exec.sh` seeded from the pinned tree. These checks fail if the rendered
+# program can be a path that MOVES or does not RESOLVE.
+printf '== §J the launchd program is STABLE and RESOLVABLE (#3309) ==\n'
+
+# J1. the TEMPLATE must not render the pin path as the program any more.
+if grep -qE '^[[:space:]]*<string>__HARNESS__/__ENTRY__</string>' "$HARNESS/launchd.plist.template"; then
+  bad "the plist template still renders the PIN PATH (__HARNESS__/__ENTRY__) as ProgramArguments — a hash dir the pin GC deletes (#3309)"
+else
+  ok "the plist template does not render the pin path as the program"
+fi
+assert_contains "$(cat "$HARNESS/launchd.plist.template")" "__PROGRAM__" "…it renders the STABLE __PROGRAM__ token instead"
+
+# J2. install.sh must substitute it, refuse a pin-root program, and PROVE resolution before installing.
+assert_contains "$INSTALL_CODE" 's|__PROGRAM__|' "install.sh substitutes __PROGRAM__ (a token with no rule is a rendered plist naming nothing)"
+assert_contains "$INSTALL_CODE" 'INSIDE the harness pin root' "install.sh REFUSES a program inside \$HARNESS_PIN_DIR"
+assert_contains "$INSTALL_CODE" '--resolve-only' "install.sh proves the stable program resolves to the pin BEFORE installing"
+
+# J3. the invariant itself, on a real seeded copy: the program must be OUTSIDE the pin root.
+rm -rf "$T/j"; mkdir -p "$T/j/o" "$T/j/pin/aaaaaaaaaaaa" "$T/j/pin/bbbbbbbbbbbb"
+STABLE_PROG="$T/j/o/orch-pin-exec.sh"
+cp "$HARNESS/orch-pin-exec.sh" "$STABLE_PROG" && chmod +x "$STABLE_PROG"
+for p in aaaaaaaaaaaa bbbbbbbbbbbb; do
+  printf '#!/bin/bash\necho RAN-FROM-%s\n' "$p" > "$T/j/pin/$p/launchd-controller.sh"
+  chmod +x "$T/j/pin/$p/launchd-controller.sh"
+done
+case "$STABLE_PROG" in
+  "$T/j/pin"/*) bad "the stable program is INSIDE the pin root — a hash-named tree that GC deletes (#3309)" ;;
+  *)             ok "the stable program is outside the pin root (a path that never moves)" ;;
+esac
+
+# J4. THE SCENARIO, REPRODUCED: pin advances, the old hash dir is GC'd, the plist cannot move.
+export HARNESS_PIN_FILE="$T/j/harness-path"
+printf '%s\n' "$T/j/pin/aaaaaaaaaaaa" > "$HARNESS_PIN_FILE"
+assert_eq "$(/bin/bash "$STABLE_PROG" --resolve-only 2>&1)" "$T/j/pin/aaaaaaaaaaaa/launchd-controller.sh" "the stub resolves the CURRENT pin (--resolve-only)"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"
+assert_contains "$out" "RAN-FROM-aaaaaaaaaaaa" "…and execs it"
+# the pin advances + the old snapshot is garbage-collected
+rm -rf "$T/j/pin/aaaaaaaaaaaa"
+printf '%s\n' "$T/j/pin/bbbbbbbbbbbb" > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"
+assert_contains "$out" "RAN-FROM-bbbbbbbbbbbb" "after a pin advance + GC of the old hash dir, the SAME unchanged program execs the NEW controller (the plist never has to move)"
+if [ -f "$STABLE_PROG" ]; then ok "the plist's program path still exists after the pin moved (nothing to re-render)"
+else bad "the plist's program path vanished on a pin move — that is the #3309 defect"; fi
+
+# J5. FAIL-BEFORE, stated as an assertion: the OLD shape is exactly what is now gone.
+LEGACY="$T/j/pin/aaaaaaaaaaaa/launchd-controller.sh"
+if [ -e "$LEGACY" ]; then
+  bad "the legacy pin path still resolves — this fixture does not reproduce the GC that killed the loop"
+else
+  ok "the legacy pin path is GONE after the pin advance — the old plist shape would exit 127 here (the 15h outage, reproduced)"
+fi
+if [ -x "$LEGACY" ]; then bad "the old program still exists"; else ok "…so a program pointing at it is NOT resolvable, which §J4 shows the stub survives"; fi
+
+# J6. LOUD, NOT SILENT. The real defect was that a dead supervisor read as "between ticks".
+printf '%s\n' "$T/j/pin/deadbeef0000" > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "an unresolvable pin exits 127 (the code launchctl already shows beside the label)"
+assert_contains "$out" "PIN-EXEC: DEAD-SUPERVISOR" "…with a greppable DEAD-SUPERVISOR marker, so a dead supervisor cannot read as 'between ticks'"
+assert_contains "$out" "DOES NOT EXIST" "…and names the missing pin dir as the cause"
+# an EMPTY record must not resolve to anything either (a blank record is a dead supervisor, not an unset option)
+: > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "an EMPTY pin record exits 127 (not 0 with no controller)"
+assert_contains "$out" "EMPTY" "…and says the record is empty"
+# a GARBAGE record (a diagnostic line instead of a path) must fail loudly, never exec a fragment
+printf 'harness-refresh: advanced pin\n/tmp/nope-xyz\n' > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "a record whose first line is not the pin dir is refused (127)"
+# a HALF-MATERIALISED pin (dir exists, no entrypoint) must not exec nothing
+mkdir -p "$T/j/pin/cccccccccccc"; printf '%s\n' "$T/j/pin/cccccccccccc" > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "a pin dir carrying NEITHER entrypoint is refused (127)"
+assert_contains "$out" "NEITHER launchd-controller.sh NOR orch-loop.sh" "…and names what is absent"
+unset HARNESS_PIN_FILE
+
+# J7. the stub must never resolve to ITSELF — a pin record naming the stub's own dir, with the stub as the
+# entry, would re-exec itself every tick: a launchd fork bomb on a 10 s KeepAlive, not an error.
+printf '%s\n' "$T/j/o" > "$T/j/harness-path"
+out="$(HARNESS_PIN_FILE="$T/j/harness-path" ORCH_ENTRY=orch-pin-exec.sh /bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "a pin that resolves back to the stub itself is refused (not an exec loop)"
+assert_contains "$out" "refusing to exec ourselves" "…and says so by name"
+
 echo
 if [ "$FAIL" -eq 0 ]; then
   printf '==> all %d checks passed (%d skipped)\n' "$PASS" "$SKIP"
