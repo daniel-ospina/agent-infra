@@ -197,7 +197,10 @@ more accurate — so the preparation is recorded on `#3243` with these numbers
 rather than half-landed here.
 
 The two walks and the seven `_expRefusalForBody` readers now share ONE predicate
-(the walks previously duplicated the digest stand-down inline).
+(the walks previously duplicated the digest stand-down inline). That predicate does
+NOT prepare the body — the preparation is the rejected hunk above — so every reader
+sees the same RAW text it saw before, and the sanded-off edges are only the
+recogniser's.
 
 **What did NOT change — and must not.** A nested invocation the guard cannot
 resolve is still refused: `bash ./undo*.sh` on line 3 of a body, `bash "$NB"`

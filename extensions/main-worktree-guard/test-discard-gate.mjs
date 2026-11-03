@@ -1948,6 +1948,69 @@ async function partB() {
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
     for (const f of [bodyPipe, join(wt, "undo-bodypipe.sh")]) rmSync(f, { force: true });
 
+    // ── B15: the REVIEW CYCLE-1 findings — a paraphrase of "/the narrowings must not
+    // make a RECOGNISER go blind". Each of these was a fail-OPEN regression in the
+    // first cut of this change (base BLOCK, head ALLOW), measured through this same
+    // handler, and each really discards when run. They are pinned here so the
+    // regression cannot return, and each is paired with the base's own verdict.
+    //
+    // B15a-d (F1): `wtSplitPipeline` introduced the first quote model this arm ever
+    // had, and ANY construct that leaves a quote open past a `|` — a comment
+    // apostrophe, a here-doc data body, ANSI-C `$'…'` (whose `\'` IS an escape) —
+    // blindfolded it. The blind `split("|")` it replaced had no state to desync.
+    // The fix is a BLIND-SPLIT FALLBACK when the scan ends with a quote open: that
+    // text is not a well-formed word sequence, and the blind split can only
+    // OVER-report. B15d is the control: with balanced quoting, the D5 narrowing
+    // still applies (a quoted `\|` alternation is data).
+    const writeBody = (name, text) => { const p = join(wt, name); write(p, text); return p; };
+    const undoGlob = writeBody("undo-b15-*.sh", "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    write(join(wt, "dirty.txt"), "MUTANT-3243\n");
+    const f1Shapes = [
+      ["B15a", "a COMMENT apostrophe before a real `cat <expanded> | bash`",
+        writeBody("b15a.sh", "#!/bin/bash\n# don't touch the copy\ncat ./undo-b15-*.sh | bash\n")],
+      ["B15b", "a HERE-DOC DATA apostrophe before the same pipeline",
+        writeBody("b15b.sh", "#!/bin/bash\ncat <<EOF\nit's fine\nEOF\ncat ./undo-b15-*.sh | bash\n")],
+      ["B15c", "ANSI-C `$'…'` quoting before the same pipeline (it's `\\'` is an escape)",
+        writeBody("b15c.sh", "#!/bin/bash\nprintf $'it\\'s\\n'\ncat ./undo-b15-*.sh | bash\n")],
+    ];
+    for (const [tag, label, file] of f1Shapes) {
+      expectTrue(`${tag} (#3243 review F1): ${label} is STILL refused inside a body`,
+        blocked(await bash(`bash ./${file.split("/").pop()}`, wt)),
+        "was ALLOWED — the quote model desynced and a REAL pipeline disappeared");
+    }
+    expectTrue("B15a' (#3243 review F1): the same top-level ANSI-C desync is STILL refused",
+      blocked(await bash(`cat $'a\\'b' ./undo-b15-*.sh | bash`, wt)), "was allowed");
+    expectTrue("B15d control (#3243 review F1): BALANCED quoting still takes the D5 narrowing — a quoted `\\|` alternation is data",
+      allowed(await bash('grep -n "bash\\|sh -x" clean.txt | head -2', wt)), "was blocked");
+
+    // B15e-g (F2): quoting is shell SYNTAX and may be MID-WORD, so `"$TOOLS"/undo.sh`
+    // and `./run"$S".sh` are ordinary ways to spell a runtime-resolved path. The
+    // first cut's grammar rejected every quote, so those stopped being candidates
+    // and the file ran UNGATED (base refused them).
+    for (const [tag, cmd] of [
+      ["B15e", 'echo hi && "$TOOLS"/undo-b15-glob.sh'],
+      ["B15f", 'true; ./undo-b15-glo"$S".sh'],
+    ]) {
+      expectTrue(`${tag} (#3243 review F2): a MID-WORD quoted runtime path is STILL refused (${cmd})`,
+        blocked(await bash(cmd, wt)), "was ALLOWED — the shape grammar rejected the quotes and the path vanished");
+    }
+    const f2Body = writeBody("b15g.sh", '#!/bin/bash\n./undo-b15-glo"$S".sh\n');
+    expectTrue("B15g (#3243 review F2): …and the same spelling INSIDE a body is still refused",
+      blocked(await bash(`bash ./${f2Body.split("/").pop()}`, wt)), "was allowed");
+
+    // B15h-i (F3): the `sp` branch had NO shape test, so a segment's FIRST word being
+    // program TEXT was claimed as an executed script — the same misattribution one
+    // branch over from where it was fixed. `~520` still blocks (it IS a valid tilde
+    // expansion spelling), so only the program-text shape is pinned here.
+    const f3Body = writeBody("b15h.sh", "#!/bin/bash\n/^tree=/{t=$2}\n");
+    const f3Var = writeBody("b15i-var.sh", '#!/bin/bash\nNB="$HERE/nonblocking.sh"\nbash "$NB" arg\n');
+    expectTrue("B15h (#3243 review F3): a SEGMENT-INITIAL awk program is not an executed script path → ALLOWED",
+      allowed(await bash(`bash ./${f3Body.split("/").pop()}`, wt)), "was blocked");
+    expectTrue("B15i (#3243 review F3) PROTECTION: the carve-out does not weaken a bare `$VAR` OPERAND — it stays refused",
+      blocked(await bash("bash ./b15i-var.sh", wt)), "was allowed — the #1228 residual must stay closed");
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    for (const f of [undoGlob, join(wt, "b15a.sh"), join(wt, "b15b.sh"), join(wt, "b15c.sh"), f2Body, f3Body, f3Var]) rmSync(f, { force: true });
+
     // ── the PROTECTION side: a real nested script the guard cannot read is
     // STILL refused, and now the refusal must be about the REAL thing (the
     // nested invocation, at a line, in a named file) instead of claiming the
