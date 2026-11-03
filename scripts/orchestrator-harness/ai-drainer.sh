@@ -244,11 +244,16 @@ SLICE_TOTAL="$(_num SLICE_TOTAL "$SLICE_TOTAL" 70)"
 [ "$SLICE_TOTAL" -ge "$SLICE_WIDTH" ] || SLICE_TOTAL="$SLICE_WIDTH"
 
 # ── CPU CEILING: DERIVED, exactly as the controller derives it ────────────────────────────────
-# `orch-loop.sh`/`install.sh`: `MAX_LANES=${MAX_LANES:-$(( _NCPU * 5 / 2 ))}` (2.5 × cores, floored)
-# with a fallback of 10. Same derivation, same fallback, so the drainer and the controller agree about
-# what a box of N cores may run.
-# ⛔ BOUND THE PRODUCT, not just the probe: `_NCPU=999999999` passes a digit check, and `× 5 / 2`
-# turns it into a ten-digit lane count (MEMORY.md). A failed or absurd probe falls back to 10 — a
+# `orch-loop.sh`/`install.sh`: `MAX_LANES=${MAX_LANES:-$(( _NCPU + 2 ))}` (cores+2).
+# Same derivation, same fallback, so the drainer and the controller agree about what a box of N cores
+# may run. ⛔ THEY MUST AGREE, because this is the case the harness comments already cite: the tmux
+# SERVER supplies a session's environment, so a ceiling exported by the launching shell is silently
+# dropped. A drainer that derived its own number would then fan out to 2.5 × cores while the
+# controller capped at cores+2 (2026-11-03 review: on a 10-core box that is 25 vs 12).
+# ⛔ CAPACITY IS THE LOAD CEILING, NOT THIS COUNTER: 2.5 × cores is `MAX_LOAD` (a load gate), and
+# cores+2 is the WORKSTREAM count. The lane number is never the capacity knob.
+# ⛔ BOUND THE PRODUCT, not just the probe: `_NCPU=999999999` passes a digit check, and `+ 2`
+# turns it into a ten-digit lane count (MEMORY.md). A failed or absurd probe falls back to 6 — a
 # plausible default rather than a fan-out.
 _ncpu_probe() {
   local n=""
@@ -259,9 +264,9 @@ _ncpu_probe() {
 }
 NCPU="$(_num NCPU "${NCPU:-}" "$(_ncpu_probe)")"
 [ "$NCPU" -ge 1 ] 2>/dev/null || { log_line "WARN: the core probe could not answer — assuming 4 cores"; NCPU=4; }
-MAX_LANES_DERIVED=$(( NCPU * 5 / 2 ))
-[ "$MAX_LANES_DERIVED" -ge 1 ] || MAX_LANES_DERIVED=10
-[ "$MAX_LANES_DERIVED" -le 100 ] || MAX_LANES_DERIVED=10
+MAX_LANES_DERIVED=$(( NCPU + 2 ))
+[ "$MAX_LANES_DERIVED" -ge 1 ] || MAX_LANES_DERIVED=6
+[ "$MAX_LANES_DERIVED" -le 100 ] || MAX_LANES_DERIVED=6
 MAX_LANES="$(_num MAX_LANES "$MAX_LANES" "$MAX_LANES_DERIVED")"
 TARGET_PIN=""
 case "${TARGET_LANES:-}" in
