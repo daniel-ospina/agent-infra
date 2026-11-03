@@ -2008,8 +2008,50 @@ async function partB() {
       allowed(await bash(`bash ./${f3Body.split("/").pop()}`, wt)), "was blocked");
     expectTrue("B15i (#3243 review F3) PROTECTION: the carve-out does not weaken a bare `$VAR` OPERAND — it stays refused",
       blocked(await bash("bash ./b15i-var.sh", wt)), "was allowed — the #1228 residual must stay closed");
+
+    // ── B15j-n: the REVIEW CYCLE-2 findings. Same polarity as B15: each was a
+    // fail-OPEN measured on the first cut (base BLOCK, head ALLOW) and each
+    // really discards when run. Two SECOND-ORDER versions of the same two bugs.
+    //
+    // B15j-l (F1-c2): `quote` was not the only state variable that can desync.
+    // An UNTERMINATED extglob — in a comment or in heredoc DATA, both inert in a
+    // real shell — strands `globDepth > 0`, swallowing every later `|` as data
+    // and merging a REAL pipeline into one segment.
+    const f1c2Shapes = [
+      ["B15j", "a COMMENT with an unbalanced extglob before a real pipeline",
+        "#!/bin/bash\n# it is *(broken\ncat ./undo-b15-*.sh | bash\n"],
+      ["B15k", "a COMMENT with an unbalanced `a+(b|c` before the same pipeline",
+        "#!/bin/bash\n# regex: a+(b|c\ncat ./undo-b15-*.sh | bash\n"],
+      ["B15l", "HERE-DOC DATA with an unbalanced extglob before the same pipeline",
+        "#!/bin/bash\ncat <<EOF\nit is *(broken\nEOF\ncat ./undo-b15-*.sh | bash\n"],
+    ];
+    const f1c2Files = [];
+    for (const [tag, label, text] of f1c2Shapes) {
+      const p = writeBody(`b15${tag.slice(-1)}.sh`, text);
+      f1c2Files.push(p);
+      expectTrue(`${tag} (#3243 review c2 F1): ${label} is STILL refused inside a body`,
+        blocked(await bash(`bash ./${p.split("/").pop()}`, wt)),
+        "was ALLOWED — a desynced EXTGLOB merged a real pipeline into one segment");
+    }
+    expectTrue("B15j' (#3243 review c2 F1): the same desync at TOP LEVEL is still refused",
+      blocked(await bash("# it is *(broken\ncat ./undo-b15-*.sh | bash", wt)), "was allowed");
+
+    // B15m-n (F2-c2): the shape grammar FILTERS a path the shell executes, so a
+    // REJECTED byte deletes the candidate. `,` is an ordinary filename byte and
+    // `\\*` spells a LITERAL one; the first cut rejected both, so these really
+    // executed the destructive script and ran UNGATED.
+    const f2Comma = writeBody("undo,2-b15.sh", "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    const f2Esc = writeBody("undo2-b15.sh", "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    expectTrue("B15m (#3243 review c2 F2): a COMMA in a really-executed expanded path is STILL refused",
+      blocked(await bash("./undo,2-*.sh", wt)),
+      "was ALLOWED — the `,` byte rejected the candidate and the file ran UNGATED");
+    expectTrue("B15n (#3243 review c2 F2): an ESCAPED star (`\\*` = a literal byte) is still a candidate",
+      blocked(await bash("./undo2-\\*.sh", wt)),
+      "was ALLOWED — the escape rejected the candidate and the file ran UNGATED");
+    expectTrue("B15n' control (#3243 review c2 F2): an awk PROGRAM is still not a script path",
+      allowed(await bash("awk /^tree=/{t=$2} clean.txt", wt)), "was blocked — the widening over-fired");
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
-    for (const f of [undoGlob, join(wt, "b15a.sh"), join(wt, "b15b.sh"), join(wt, "b15c.sh"), f2Body, f3Body, f3Var]) rmSync(f, { force: true });
+    for (const f of [undoGlob, join(wt, "b15a.sh"), join(wt, "b15b.sh"), join(wt, "b15c.sh"), f2Body, f3Body, f3Var, f2Comma, f2Esc, ...f1c2Files]) rmSync(f, { force: true });
 
     // ── the PROTECTION side: a real nested script the guard cannot read is
     // STILL refused, and now the refusal must be about the REAL thing (the
@@ -2572,7 +2614,7 @@ if (process.argv.includes("--mutations")) {
     [
       "the path-shaped word grammar (#3243)",
       [[
-        "  return /^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out);",
+        "  if (/^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out)) return true;\n  return /^(?:\\.{1,2}|~)\\//.test(s);",
         "  return true;",
       ]],
       (m) => m.wtIsPathShapedScriptWord("/^tree=/{t=$2}"),
@@ -2583,13 +2625,85 @@ if (process.argv.includes("--mutations")) {
     [
       "the path-shaped word grammar still admits every EXPANSION form",
       [[
-        "  return /^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out);",
+        "  if (/^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out)) return true;\n  return /^(?:\\.{1,2}|~)\\//.test(s);",
         "  return true;",
       ]],
       (m) => ["./undo-3243*.sh", "~/undo.sh", "$WT/.venv/bin/python", "./undo@(-g|).sh", "sub/undo.sh"].every((w) => m.wtIsPathShapedScriptWord(w)),
       true,
       true,
       "the real expanded-path spellings must stay candidates in BOTH builds",
+    ],
+    // ── M2 (#3243 review cycle-2) — the two SECOND-ORDER fail-opens. ──
+    //
+    // Each of these was a real fail-open measured on THIS head before the fix:
+    // the base BLOCKED and the first cut ALLOWED. The mutation REVERTS the fix,
+    // so a pin that merely reported "the case is handled" cannot pass — it must
+    // show the case goes BLIND again when the fix is removed.
+    //
+    // F1-c2: `quote` was not the only state variable that can desync. An
+    // UNTERMINATED extglob (`# it is *(broken`, `a+(b|c` — comment/heredoc DATA,
+    // inert in a real shell) strands `globDepth > 0`, which swallows every later
+    // `|` AND `'`/`"` as data. Testing only `quote` left a REAL unquoted
+    // `cat ./undo*.sh | bash` merged into one segment (base: BLOCK).
+    [
+      "the blind-split fallback covers a DESYNCED EXTGLOB, not just a desynced quote (#3243 c2 F1)",
+      [[
+        "  if (quote !== null || globDepth > 0) return s.split(\"|\");",
+        "  if (quote !== null) return s.split(\"|\");",
+      ]],
+      (m) => m.wtPipelineFeedsShell("# it is *(broken\ncat ./undo-3243*.sh | bash"),
+      true,
+      false,
+      "an unterminated extglob blindfolds the split and a REAL pipeline disappears",
+    ],
+    [
+      "…and a BALANCED extglob group is still not a pipeline (both builds)",
+      [[
+        "  if (quote !== null || globDepth > 0) return s.split(\"|\");",
+        "  if (quote !== null) return s.split(\"|\");",
+      ]],
+      (m) => m.wtSplitPipeline("./undo@(-g|).sh").length === 1,
+      true,
+      true,
+      "a closed extglob's `|` is data in BOTH builds — the fallback must not over-widen",
+    ],
+    // F2-c2: this grammar FILTERS a path the shell will execute, so a REJECTION
+    // deletes the candidate and blinds the arm. `,` `:` `=` `^` `#` are ordinary
+    // filename bytes and `\\` spells a literal one; the first cut rejected them,
+    // so `./undo,2-*.sh` and `./undo2-\\*.sh` really executed the destructive
+    // script and ran UNGATED (base: BLOCK).
+    [
+      "a REJECTED path byte does not delete the candidate (#3243 c2 F2)",
+      [[
+        "  return /^(?:\\.{1,2}|~)\\//.test(s);",
+        "  return false;",
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("./undo,2-X.sh"),
+      true,
+      false,
+      "a legal filename byte makes the really-executed path invisible to the arm",
+    ],
+    [
+      "an ESCAPED path byte is a LITERAL, not a disqualifier (#3243 c2 F2)",
+      [[
+        "    if (ch === \"\\\\\") { out += PH; i++; continue; }",
+        "    if (ch === \"\\\\\") return false;",
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("./undo2-\\*.sh"),
+      true,
+      false,
+      "`./undo2-\\*.sh` spells a real file and the arm goes blind on it",
+    ],
+    [
+      "…and an awk/sed PROGRAM is still not a path (both builds)",
+      [[
+        "  return /^(?:\\.{1,2}|~)\\//.test(s);",
+        "  return false;",
+      ]],
+      (m) => ["/^tree=/{t=$2}", "s/[[:space:]]*$//"].every((w) => m.wtIsPathShapedScriptWord(w) === false),
+      true,
+      true,
+      "program TEXT carries no explicit path prefix, so it stays non-path in BOTH builds",
     ],
   ];
   for (const [label, reverts, probe, wantBefore, wantAfter, why] of PREDICATE_PAIRS) {

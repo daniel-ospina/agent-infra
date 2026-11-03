@@ -3357,7 +3357,20 @@ export function wtSplitPipeline(command) {
   // therefore the BLIND split: it has no quote state and can only OVER-report,
   // which is this arm's fail-closed direction. A well-formed command never reaches
   // it, so the narrowing that removes the D5 false positive still holds.
-  if (quote !== null) return s.split("|");
+  //
+  // ⛔ AND THE SAME HOLDS FOR THE OTHER STATE VARIABLE (#3243 review cycle-2, F1).
+  // `quote` is not the only thing this model tracks: `globDepth` is stranded
+  // exactly the same way by an UNTERMINATED extglob group (`# it is *(broken`,
+  // `regex: a+(b|c` — a comment or heredoc line that is DATA, inert in a real
+  // shell). While `globDepth > 0`, EVERY `|` and every `'`/`"` is swallowed as
+  // data, so a real unquoted pipeline merges into one segment and
+  // `wtPipelineFeedsShell` cannot see the consumer. Testing only `quote` left
+  // `cat ./undo*.sh | bash` ALLOWED on five measured shapes where the base
+  // BLOCKS — the F1 regression one state variable over, and it also falsified
+  // this function's own claim that "a REAL pipeline's `|` is unquoted, so this
+  // narrowing cannot hide one". Both desync sources take the blind split, which
+  // can only OVER-report.
+  if (quote !== null || globDepth > 0) return s.split("|");
   out.push(cur);
   return out;
 }
@@ -3377,10 +3390,27 @@ export function wtSplitPipeline(command) {
  *
  * The rule is POSITIVE, not a deny list of the programs seen so far: replace
  * every expansion form with a placeholder and require what REMAINS to be a plain
- * path — components over `[A-Za-z0-9._+@!%~-]` joined by `/`. A `:`, `=`, `^`,
- * `\`, `(`, `)`, `;`, `&`, `<`, `>`, `|`, `#`, `,` or an unbalanced quote /
- * bracket / backtick cannot appear, so the word cannot be the script the shell
- * would run, and the arm must not claim it is.
+ * path — components over `[A-Za-z0-9._+@!%~-]` joined by `/`.
+ *
+ * ⛔ BUT A POSITIVE GRAMMAR IS USED AS A **FILTER ON A PATH THE SHELL EXECUTES**,
+ * so every byte it REJECTS is a script this arm can no longer see — a rejection
+ * does not "prove the word is data", it DELETES the candidate (#3243 review
+ * cycle-2, F2). The first cut of this function also rejected `\`, `,`, `:`, `=`,
+ * `^` and `#`, on the stated grounds that a shell would not run a path carrying
+ * them. That is false: `,`, `:`, `=`, `^` and a non-leading `#` are ordinary
+ * FILENAME bytes, and `\` spells a LITERAL (escaped) byte in a path. Measured,
+ * each spelling below really executes the destructive script and the pre-#3243
+ * arm refused it, while the first cut of this change ALLOWED it —
+ * `./undo,2-*.sh`, `./undo2-\*.sh`, `./undo^*X.sh`, `./undo=1*.sh`,
+ * `./undo:1*.sh`, `./undo#1*.sh`. This is the same lesson the `?` branch below
+ * records ("a shape test that drops a glob is a fail-OPEN"), applied to every
+ * other byte.
+ *
+ * The terminal test is therefore TWO-ORed ACCEPTS, both of which can only ADD a
+ * candidate: a remaining word over the plain alphabet, OR a word with an
+ * EXPLICIT path prefix (`./`, `../`, `~/`) whatever bytes follow it. Program text
+ * — `awk '/^tree=/{t=$2}'`, the sed expression `s/[[:space:]]*$//` — carries no
+ * such prefix, so the #3243 false positives stay false.
  * @param {unknown} word
  * @returns {boolean}
  */
@@ -3405,7 +3435,11 @@ export function wtIsPathShapedScriptWord(word) {
     // rest of the word is judged on its own. Skipping can only ADD candidates,
     // never remove one, so it cannot open anything the old test caught.
     if (ch === '"' || ch === "'") continue;
-    if (ch === "\\") return false; // an escape is not a path spelling
+    // An ESCAPE spells one LITERAL byte (`./undo2-\*.sh` is the file whose name
+    // contains a `*`), so it is a path character, not a disqualifier (#3243
+    // review cycle-2, F2). Placeholder it: the byte is present and it is not an
+    // expansion form, which is exactly what the later arms need to know.
+    if (ch === "\\") { out += PH; i++; continue; }
     if (ch === "`") {
       const end = s.indexOf("`", i + 1);
       if (end < 0) return false; // unbalanced — prose, not a substitution
@@ -3430,7 +3464,10 @@ export function wtIsPathShapedScriptWord(word) {
     if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
     out += ch;
   }
-  return /^[A-Za-z0-9._+@!%~\u0000/-]+$/.test(out) && /[\/~]/.test(out);
+  // TWO-ORed ACCEPTS — see the contract above: a rejection here deletes the
+  // candidate and blinds the arm, so the only safe direction is to accept more.
+  if (/^[A-Za-z0-9._+@!%~\u0000/-]+$/.test(out) && /[\/~]/.test(out)) return true;
+  return /^(?:\.{1,2}|~)\//.test(s);
 }
 
 export function wtPipelineFeedsShell(command) {
