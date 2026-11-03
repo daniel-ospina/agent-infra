@@ -3515,7 +3515,7 @@ else
   # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Ten tokens is the arm count
   # this block has; an arm DELETED from the vector while its predicate stays reddens here.
   _missing=""
-  for _arm in 'merge-priority' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
+  for _arm in 'merge-priority' 'landing-floor=' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
     case "$_vec" in *"$_arm"*) ;; *) _missing="$_missing $_arm" ;; esac
   done
   [ -z "$_missing" ] && echo "  ok (v2) every gate arm has its own verdict on the idle line" && PASS=$((PASS+1)) \
@@ -3570,6 +3570,42 @@ ARMS
   if grep -qE '^[[:space:]]*elif ' <<<"$GV"; then
     echo "  ❌ (v9) an \`elif\` is back inside the vector block — the first arm masks the rest again"; FAIL=$((FAIL+1))
   else echo "  ok (v9) the arms are independent guards, not a masking chain"; PASS=$((PASS+1)); fi
+  # ── THE LANDING FLOOR: A WIP LIMIT ON TOTAL OPEN PRs (2026-11-03) ────────────────────────────
+  # ⛔ WHAT THIS GRADES AND WHY IT NEEDS ITS OWN TESTS: `merge-priority` counts UN-OWNED PRs, and a
+  # lane CLAIMS the PR it opens — so producing more work drives the gate's own input toward zero.
+  # Measured 2026-11-03: 68 open on agent-infra and 37 on tortoise read `merge-priority=clear` while
+  # the 2h ratio was 14 opened : 3 merged. The floor reads TOTAL open, which no other arm does.
+  _why="$(gv OPEN_N=68 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(68*) echo "  ok (v10) the landing floor CLOSES the issue path on total WIP (68 >= 25)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v10) 68 open PRs did not arm the landing floor (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  _why="$(gv OPEN_N=4 LANDING_FLOOR=25 | cut -f1)"
+  [ "$_why" = "<open>" ] && echo "  ok (v11) below the floor the issue path stays OPEN (4 < 25)" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v11) a drained queue was still gated: $_why"; FAIL=$((FAIL+1)); }
+  # ⛔ THE BOUNDARY IS INCLUSIVE, and it is the off-by-one that decides a whole fleet's mode.
+  _why="$(gv OPEN_N=25 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(25*) echo "  ok (v12) the boundary is inclusive (25 >= 25 arms the floor)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v12) the floor boundary is off by one (25 vs 25 gave: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ POLARITY, BOTH ARMS FAIL CLOSED: an unreadable count must DRAIN, never open the gate. The
+  # leading-zero case is the specific trap this file has been bitten by (`[ 08 -ge 25 ]` reads 8).
+  _why="$(gv OPEN_N='' LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(open*) echo "  ok (v13) an UNREADABLE open count drains (fails closed)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v13) an unreadable count OPENED the issue path: $_why"; FAIL=$((FAIL+1)) ;; esac
+  _why="$(gv OPEN_N=08 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(open*) echo "  ok (v14) a leading-zero count is UNREADABLE, not 8 (the base-0 trap)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v14) a leading-zero count was read as a valid number: $_why"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ FIRST-WINS IS PRESERVED: the floor is ADDITIVE. When merge-priority already holds the gate, the
+  # floor must not steal the label — the operator must keep seeing the ORIGINAL reason.
+  _why="$(gv GATE_WHY='merge-priority(3 un-owned of 68 open PR(s) — PRs before issues)' OPEN_N=68 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    merge-priority*) echo "  ok (v15) the floor never displaces an earlier winner (merge-priority keeps the label)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v15) the floor changed the WINNER instead of adding an arm (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE VISIBILITY LINE IS THE ARTIFACT. A silent threshold is the same defect class as a silent
+  # reaper, so the cycle's numbers are pinned at the SOURCE, not merely described in a comment.
+  wpin "the cycle logs OPEN_PRS/FLOOR/MODE every cycle" "$ORCH" 'OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LANDING_FLOOR:-?} → MODE('
   # ── the two mutants ────────────────────────────────────────────────────────────────────────────
   mut_gv() { # <name> <old> <new> -> path to the mutant block
     printf '%s\n' "$GV" > "$TMP/gv-$1.in"

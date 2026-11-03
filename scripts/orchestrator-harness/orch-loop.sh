@@ -275,6 +275,26 @@ MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # fails CLOSED to `MERGE_PRIORITY_AT + 1`, i.e. "treat the count as over the line"), and `MR`/`MF`
 # (review_slots/fix_slots) still scale the worker budgets with the backlog. Neither can open the gate.
 MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+# ── THE LANDING FLOOR: a WIP LIMIT ON OPEN PRs (stop starting, start finishing) ──────────────
+# WHY IT EXISTS: `mp_reason` gates the issue path on the UN-OWNED count, and a lane CLAIMS the PR it
+# opens — so every unit of production REMOVES itself from the gate's population. The gate therefore
+# cannot see WIP: 68 open PRs with all of them claimed reads `merge-priority=clear` and the box opens
+# more. Measured 2026-11-03 (2h window, de-batched): agent-infra opened 6 / merged 1; tortoise opened
+# 8 / merged 2 — a ~4:1 produce:land ratio with 68 and 37 open respectively. `MERGE_PRIORITY_AT`
+# does NOT throttle this: it only feeds `review_slots`/`fix_slots` headroom and the unreadable-count
+# fallback. Nothing in the knob set bounds total WIP, which is why the queue grows monotonically.
+# WHAT IT IS: ONE MORE ARM IN THE SAME GATE VECTOR — it sets `GATE_WHY` (so the ISSUE path closes)
+# exactly as `merge-priority` does, and nothing else. It is a WIP limit, not a quota: an unreadable
+# count fails CLOSED (drain), and the door for a red-on-main repair / P0 stays open because that is
+# `floor_emergency`'s existing exemption on the candidate queue, untouched here.
+# WHY 25, AND WHY PER-REPO: 25 is the OWNER's own chosen queue size (the `MERGE_PRIORITY_AT` ruling —
+# "something more like 10 PRs who are not being processed", scaled to 25). It is applied PER REPO
+# because WIP is only landable where it lives — a merged PR in tortoise does not drain agent-infra's
+# queue, so a fleet-wide sum would let one repo's backlog close another repo's issue path.
+# Little's law, for the justification: WIP = throughput x cycle-time. At the measured ~1.5 lands/h,
+# 25 open is ~17h of queue at today's landing rate — the point is that the fleet is FORCED to raise
+# the landing rate rather than open a 68th PR.
+LANDING_FLOOR="${LANDING_FLOOR:-25}"
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
 # printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
 # backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
@@ -483,6 +503,11 @@ is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 # count), rather than on a bare `[ … -ge 1 ]` test a mutation could delete unseen.
 is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" || MERGE_PRIORITY_MAX_AGE_MIN=180; [ "${MERGE_PRIORITY_MAX_AGE_MIN:-0}" -ge 1 ] || MERGE_PRIORITY_MAX_AGE_MIN=180
 is_limit "${FUNNEL_MAX_AGE_MIN:-}" || FUNNEL_MAX_AGE_MIN=30; [ "${FUNNEL_MAX_AGE_MIN:-0}" -ge 1 ] || FUNNEL_MAX_AGE_MIN=30
+# The landing floor follows the same bounded-shape rule. An unreadable value falls back to the
+# owner's existing 25 (never to 0, which would disarm the gate silently, and never to empty, which
+# would make the `-ge` test error and read FALSE — an errored test OPENS a gate).
+is_limit "${LANDING_FLOOR:-}" || LANDING_FLOOR=${MERGE_PRIORITY_AT:-25}
+[ "${LANDING_FLOOR:-0}" -ge 1 ] || LANDING_FLOOR=${MERGE_PRIORITY_AT:-25}
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 # Both red-fixer caps fail OPEN in the same shape MAX_FIX_TRIES documents above (`[ "$n" -ge "$cap" ]`
@@ -5759,6 +5784,32 @@ PY
   else
     GATE_VEC="merge-priority=clear"
   fi
+  # ── THE LANDING FLOOR ARM (WIP limit on OPEN PRs) ────────────────────────────────────────────
+  # ⛔ WHAT IT ADDS THAT NO OTHER ARM CAN: `merge-priority` counts UN-OWNED PRs, and a lane claims
+  # the PR it opens — so producing MORE work moves the gate's own input toward zero. Total WIP is
+  # invisible to it. This arm reads the total open count, which is the population the queue actually
+  # grows in, and closes the issue path at `LANDING_FLOOR`.
+  # ⛔ PURE BUILTINS ON PURPOSE: this block is EXTRACTED and evaled in a bare subshell by
+  # test-gates.sh (the `gv()` harness), where `is_num` is not defined — a helper call here would be
+  # `command not found`, GATE_WHY would stay empty, and the arm would silently never fire.
+  # ⛔ POLARITY: unreadable => CLOSED (drain), never open. A leading-zero count is treated as
+  # unreadable for the same reason `is_num` rejects it everywhere else in this file: `[ 08 -ge 25 ]`
+  # reads 8 and would OPEN the gate on a number that was never valid.
+  LF_M="${LANDING_FLOOR:-25}"
+  case "$LF_M" in ''|*[!0-9]*|0?*) LF_M=25 ;; esac
+  [ "$LF_M" -ge 1 ] || LF_M=25
+  case "${OPEN_N:-}" in
+    ''|*[!0-9]*|0?*)
+      GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
+      GATE_VEC="$GATE_VEC landing-floor=UNKNOWN" ;;
+    *)
+      if [ "${OPEN_N}" -ge "$LF_M" ]; then
+        GATE_WHY="${GATE_WHY:-landing-floor(${OPEN_N} open PR(s) >= ${LF_M} — landing before producing)}"
+        GATE_VEC="$GATE_VEC landing-floor=REFUSE(${OPEN_N}>=${LF_M})"
+      else
+        GATE_VEC="$GATE_VEC landing-floor=ok(${OPEN_N}<${LF_M})"
+      fi ;;
+  esac
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
   # can be completely unable to spawn, so a chain that reports `load=` first describes the wrong
   # resource and points the operator at a remedy (wait) that cannot work. The order is
@@ -6106,6 +6157,15 @@ PY
   if [ "${LO_CHOICE:-none}" != "issue" ] && [ -z "$GATE_WHY" ]; then
     GATE_WHY="selection (funnel chose '${LO_CHOICE:-?}', not issues)"
   fi
+  # ── THE LANDING-FLOOR LINE: ONE LINE PER CYCLE, THE NUMBERS THE DECISION USED ────────────────
+  # ⛔ A SILENT THRESHOLD IS THE SAME DEFECT CLASS AS A SILENT REAPER: a reader must be able to tell
+  # WHY the fleet did or did not dispatch, from the log alone, without reconstructing the gate. This
+  # line is emitted AFTER every arm has had its say, so `MODE` is the cycle's real decision and not a
+  # prediction of one. `MODE(land)` = the issue path is closed and the capacity is on the PR queue;
+  # `MODE(produce)` = the issue path is open. `FLOOR=` and `OPEN_PRS=` are printed even when the floor
+  # is not the binding reason, so the margin is visible before it is crossed — and `BINDING=` names
+  # which gate actually won, so a floor that is satisfied cannot be misread as the cause.
+  echo "[landing-floor] OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LANDING_FLOOR:-?} → MODE($([ -z "${GATE_WHY:-}" ] && echo produce || echo land)) BINDING(${GATE_WHY:-none})" >> "$LOG"
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
     # ── THE PRODUCT FLOOR, APPLIED AS AN ORDER (agent-infra#2054) ───────────────────────────────
