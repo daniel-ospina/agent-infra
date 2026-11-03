@@ -428,8 +428,16 @@ esac
 # the property itself and is form-agnostic: reverting the helper to `case "$(head -c 8192 …)"` fails
 # here (measured 96 stderr bytes on an rc=0 call), while both legitimate outcomes — the value accepted
 # as the real gh, or refused and fallen through — must be silent.
+# The fixture must be a REAL binary on THIS host. `/bin/true` was the original source and it does
+# not exist on macOS (10.15+ moved it to /usr/bin), so the fallback fake-ELF was taken instead and
+# bash — not the shim — refused to exec it, leaking `cannot execute binary file` onto a SUCCESSFUL
+# call: the case read as a false red on every macOS host while passing on Linux CI. Resolve the
+# source portably and keep the fake-ELF only for a host that has no `true` at all.
+# `command -v true` answers the BUILTIN name (`true`), not a path, so it fails `-x` and silently took
+# the fake-ELF fallback — one trap, two ways to land on it. `type -P` forces the PATH lookup.
+TRUEBIN="$(type -P true 2>/dev/null || true)"
 ELFGH="$TMP/elfgh-$$"; ELFERR="$TMP/elfgh.err"
-if [ -x /bin/true ]; then cp /bin/true "$ELFGH"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$ELFGH"; fi
+if [ -n "$TRUEBIN" ] && [ -x "$TRUEBIN" ]; then cp "$TRUEBIN" "$ELFGH"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$ELFGH"; fi
 chmod +x "$ELFGH"
 : > "$ELFERR"
 ( cd "$TMP" && env AGENT_GH_REAL="$ELFGH" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
@@ -448,7 +456,7 @@ fi
 # JSONDecodeError — the class this seam was fixed for, reintroduced by moving the open from `head` to
 # the shell. (a4) cannot catch it (its fixture is readable). Measured pre-fix: 82 bytes at rc=0.
 UNREAD="$TMP/unreadable-gh-$$"; UNREADERR="$TMP/unreadable-gh.err"
-if [ -x /bin/true ]; then cp /bin/true "$UNREAD"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$UNREAD"; fi
+if [ -n "$TRUEBIN" ] && [ -x "$TRUEBIN" ]; then cp "$TRUEBIN" "$UNREAD"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$UNREAD"; fi
 chmod 111 "$UNREAD"
 : > "$UNREADERR"
 ( cd "$TMP" && env AGENT_GH_REAL="$UNREAD" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
@@ -1456,6 +1464,430 @@ else
     && pass "the interactive branch writes nothing before the child and flushes notes from its rc" \
     || fail "the interactive branch can print before the child (contaminating a successful call)"
 fi
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# 17. THE COOLDOWN IS DERIVED FROM THE REFUSAL'S OWN HEADERS (#3230)
+#
+# THE PREMISE THIS CORRECTS. #3230 asked for the shared window to be re-derived from the exempt
+# quota read before sleeping on it. The measurement on that issue falsifies re-derivation as the
+# remedy: a 403 from `/repos/…/actions/jobs/<job>/logs` carried ITS OWN `remaining: 0`, `used: 5000`
+# and ITS OWN reset, and LABELLED ITSELF `x-ratelimit-resource: core`, while the same minute's quota
+# read answered `core: remaining 2660` on a DIFFERENT reset. A quota body cannot describe that
+# bucket under any reading, so the window must come from the response that refused — and this layer
+# must never read the quota endpoint at all (§13(f) already forbids it, and a floor it cannot
+# attribute to the refusing bucket would be the false PASS #3230 is about).
+#
+# WHAT EACH ARM PROVES, AND WHY EACH ONE IS THE EFFECT AND NOT THE SEND:
+#   17(a) a 403 whose OWN headers say remaining 0 + a reset 3 s out -> the shim WAITS TO THAT RESET
+#         (not the 60 s base), names the class/bucket/endpoint/family, and the shared window it
+#         writes is that deadline — asserted from the fake's own attempt timestamps and the file.
+#   17(b) the same refusal whose reset is beyond the caller's budget -> NOT slept, NOT retried,
+#         returns at once, and the shared window IS still recorded for the rest of the box.
+#   17(c) a quota-shaped body showing a healthy bucket beside a refusal is IGNORED — the window is
+#         the refusal's (c1), and with no refusal headers at all the class is `undetermined` rather
+#         than borrowed from the body (c2) — no headroom figure from a class this layer cannot see.
+#   17(d) a non-403/429 response that MENTIONS a rate limit is an ANSWER, not a limit: one
+#         invocation, no cooldown (the measured `422 Validation Failed`-with-the-phrase class).
+#   17(e) the debug capture that supplies the headers never reaches a SUCCESSFUL call's stderr —
+#         the `gh-rest/gh` `2>&1 | jq` invariant, asserted on a child that really emits the dump.
+#   17(f) a pre-call window longer than the budget is refused locally (EX_TEMPFAIL) with NO request
+#         issued — the #3230 stall, in the one shape that used to park a lane for the whole window.
+echo "== 17. the cooldown is derived from the REFUSAL'S own headers, bounded by one budget (#3230) =="
+
+# A fake gh that behaves like the real one under `GH_DEBUG=api`: on its first attempt it prints the
+# response dump (headers + request line) AND the 403, then answers. `GHSEEN` records the GH_DEBUG
+# value the shim actually passed, so "did the shim ask for the headers?" is a fact about the child's
+# environment rather than an inference from the shim's source.
+rl_real() {  # <path> <attempts-to-refuse> <remaining> <reset-epoch|-> <extra-stderr-file|->
+  local p="$1" n="$2" rem="$3" reset="$4" extra="$5"
+  cat > "$p" <<GHEOF
+#!/usr/bin/env bash
+printf '%s' "\${GH_DEBUG:-unset}" > "\$GHSEEN"
+c=\$(cat "\$GCOUNT" 2>/dev/null || echo 0); c=\$(( c + 1 )); printf '%s' "\$c" > "\$GCOUNT"
+date +%s >> "\$GTIMES"
+if [ "\$c" -le $n ]; then
+  printf '* Request to https://api.github.com/repos/o/r/actions/jobs/1/logs\n' >&2
+  printf '> GET /repos/o/r/actions/jobs/1/logs HTTP/1.1\n' >&2
+  printf '< HTTP/2.0 403 Forbidden\n' >&2
+  printf '< X-Ratelimit-Limit: 5000\n' >&2
+  printf '< X-Ratelimit-Remaining: $rem\n' >&2
+  [ "$reset" = "-" ] || printf '< X-Ratelimit-Reset: %s\n' "$( printf '%s' "$reset" )" >&2
+  printf '< X-Ratelimit-Resource: core\n' >&2
+  [ "$extra" = "-" ] || cat "$extra" >&2 2>/dev/null
+  printf 'gh: API rate limit exceeded for user ID 81560491. (HTTP 403)\n' >&2
+  exit 1
+fi
+printf '{"number":1}\n'
+exit 0
+GHEOF
+  chmod +x "$p"
+}
+
+# (a) THE WINDOW IS THE REFUSAL'S OWN RESET.
+GDIR="$(gate_dir rl-primary)"; GCOUNT="$TMP/rl-a-count"; GTIMES="$TMP/rl-a-times"; GHSEEN="$TMP/rl-a-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+_reset=$(( $(date +%s) + 3 ))
+rl_real "$TMP/rl-real-a" 1 0 "$_reset" -
+# ⛔ THE WINDOW IS READ WHILE IT IS LIVE. The wait consumes it by construction (the deadline IS the
+# end of the wait), so a post-hoc `ls` reports "no window written" for a gate that wrote exactly the
+# right one — the measurement artifact this suite has already been bitten by twice (§10, §13(e)).
+_cdsnap="$TMP/rl-a-cooldown"
+rm -f "$_cdsnap"
+( _n=0; while [ "$_n" -lt 120 ]; do
+    _f="$(ls "$GDIR"/cooldown.* 2>/dev/null | head -1)"
+    if [ -n "$_f" ]; then cat "$_f" > "$_cdsnap" 2>/dev/null; break; fi
+    sleep 0.1; _n=$(( _n + 1 ))
+  done ) &
+_watch=$!
+AGENT_GH_REAL="$TMP/rl-real-a" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /repos/o/r/actions/jobs/1/logs >/dev/null 2>"$TMP/rl-a-err"; rc=$?
+wait "$_watch" 2>/dev/null
+a1=$(sed -n '1p' "$GTIMES"); a2="$(sed -n '2p' "$GTIMES")"
+[ "$rc" -eq 0 ] && [ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 2 ] \
+  && [ -n "$a2" ] && [ $(( a2 - a1 )) -ge 3 ] \
+  && pass "a 403 with its own remaining 0 + reset 3 s out → waited to THAT reset (${a1}→${a2}), then succeeded" \
+  || fail "the wait was not the refusing bucket's own reset (rc=$rc attempts=$(cat "$GCOUNT" 2>/dev/null) starts='$(tr '\n' ' ' < "$GTIMES")')"
+[ "$(cat "$GHSEEN" 2>/dev/null)" = "api" ] \
+  && pass "  …and the shim ASKED the child for the response headers (GH_DEBUG=api reached it)" \
+  || fail "the child never saw GH_DEBUG=api ($(cat "$GHSEEN" 2>/dev/null)) — the headers cannot exist, so this arm would be vacuous"
+grep -q 'class=primary' "$GDIR/events.log" 2>/dev/null \
+  && grep -q 'bucket=core' "$GDIR/events.log" 2>/dev/null \
+  && grep -q 'endpoint=GET /repos/o/r/actions/jobs/1/logs' "$GDIR/events.log" 2>/dev/null \
+  && grep -q 'family=actions' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the refusal is NAMED by class, bucket, endpoint and endpoint-family" \
+  || fail "the refusal was not named by its own evidence: $(head -2 "$GDIR/events.log" 2>/dev/null | tr '\n' ' ')"
+grep -q 'resets at ' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and names WHEN the bucket resets (not just how long to wait)" \
+  || fail "the note never states the reset instant: $(head -2 "$GDIR/events.log" | tr '\n' ' ')"
+_cd="$(cat "$_cdsnap" 2>/dev/null | head -1)"
+case "$_cd" in
+  ''|*[!0-9]*) fail "no shared window was observed while the call waited, so other lanes could not know about it" ;;
+  *) if [ "$_cd" -ge $(( _reset * 1000 )) ] && [ "$_cd" -le $(( _reset * 1000 + 4000 )) ]; then
+       pass "  …and the shared window IS that reset ($(( (_cd - _reset * 1000) / 1000 ))s after it), not a 60 s guess"
+     else
+       fail "the shared window ($_cd) is not the refusing bucket's reset ($(( _reset * 1000 )))"
+     fi ;;
+esac
+case "$(cat "$GDIR/events.log" 2>/dev/null)" in
+  *unreadable*) fail "a refusal was reported as 'unreadable' instead of named (#3230, Target 3)" ;;
+  *) pass "  …and never collapses the refusal into 'unreadable'" ;;
+esac
+
+# (b) A WAIT BEYOND THE CALLER'S BUDGET IS NOT SLEPT, AND DOES NOT OUTLIVE IT.
+GDIR="$(gate_dir rl-budget)"; GCOUNT="$TMP/rl-b-count"; GTIMES="$TMP/rl-b-times"; GHSEEN="$TMP/rl-b-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+_reset=$(( $(date +%s) + 900 ))
+rl_real "$TMP/rl-real-b" 9 0 "$_reset" -
+_b0="$(date +%s)"
+AGENT_GH_REAL="$TMP/rl-real-b" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_BUDGET_S=5 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /repos/o/r/actions/jobs/1/logs >/dev/null 2>"$TMP/rl-b-err"; rc=$?
+_b1="$(date +%s)"
+[ "$rc" -ne 0 ] && [ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "a reset 900 s out under a 5 s budget → ONE invocation, no retry (rc=$rc)" \
+  || fail "a refusal beyond the budget was retried (rc=$rc attempts=$(cat "$GCOUNT" 2>/dev/null))"
+[ $(( _b1 - _b0 )) -le 4 ] \
+  && pass "  …and the call returned in $(( _b1 - _b0 ))s, not the window's remaining time" \
+  || fail "the call outlived its 5 s budget ($(( _b1 - _b0 ))s) — the #3230 stall"
+grep -q "BEYOND this call's 5s budget" "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and says so: the wait is BEYOND this call's budget" \
+  || fail "the beyond-budget refusal was not named: $(head -2 "$GDIR/events.log" | tr '\n' ' ')"
+_bcd="$(cat "$GDIR"/cooldown.* 2>/dev/null | head -1)"
+case "$_bcd" in
+  ''|*[!0-9]*) fail "the window was not recorded for the rest of the box" ;;
+  *) if [ "$_bcd" -gt $(( $(date +%s) * 1000 + 100000 )) ]; then
+       pass "  …and the window IS still recorded for other lanes (${_bcd})"
+     else
+       fail "the recorded window is not the refusal's reset: $_bcd"
+     fi ;;
+esac
+
+# ⛔ A QUOTA-SHAPED BODY IS NOT EVIDENCE ABOUT THIS REFUSAL. This is the arm that pins the premise
+# correction: the body shows `core` with 4943 left while the REFUSAL says remaining 0 on its own
+# reset. The measured truth is that both can be true at once, so the body must change nothing.
+_qbody="$TMP/rl-quota-body"
+printf '{"resources":{"core":{"limit":5000,"remaining":4943,"reset":%s}}}\n' "$(( $(date +%s) + 40 ))" > "$_qbody"
+GDIR="$(gate_dir rl-quota)"; GCOUNT="$TMP/rl-c-count"; GTIMES="$TMP/rl-c-times"; GHSEEN="$TMP/rl-c-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+_reset=$(( $(date +%s) + 3 ))
+rl_real "$TMP/rl-real-c" 1 0 "$_reset" "$_qbody"
+AGENT_GH_REAL="$TMP/rl-real-c" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /repos/o/r/actions/jobs/1/logs >/dev/null 2>/dev/null; rc=$?
+c1=$(sed -n '1p' "$GTIMES"); c2="$(sed -n '2p' "$GTIMES")"
+[ "$rc" -eq 0 ] && [ -n "$c2" ] && [ $(( c2 - c1 )) -ge 3 ] \
+  && pass "a healthy 'core' in a quota-shaped body beside the refusal changes NOTHING (waited ${c1}→${c2})" \
+  || fail "the quota body overrode the refusing bucket's own reset (rc=$rc starts='$(tr '\n' ' ' < "$GTIMES")')"
+grep -q 'class=primary' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …the class still comes from the REFUSAL (class=primary)" \
+  || fail "the refusal was not classified from its own headers: $(head -2 "$GDIR/events.log" | tr '\n' ' ')"
+case "$(cat "$GDIR/events.log" 2>/dev/null)" in
+  *4943*) fail "the note quoted a headroom figure from a class this layer cannot observe (#3230, Target 4)" ;;
+  *) pass "  …and no headroom figure is quoted from the quota body it did not ask for" ;;
+esac
+# c2: THE CONTROL — no refusal headers at all. The body must NOT be promoted into evidence; the
+# class stays `undetermined` and the wait is the documented base, never a reset borrowed from it.
+GDIR="$(gate_dir rl-quota-ctl)"; GCOUNT="$TMP/rl-c2-count"; GTIMES="$TMP/rl-c2-times"; GHSEEN="$TMP/rl-c2-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+rl_real "$TMP/rl-real-c2" 1 x - "$_qbody"
+AGENT_GH_REAL="$TMP/rl-real-c2" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_RETRY_BASE=2 AGENT_GH_GATE_BUDGET_S=20 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /repos/o/r/actions/jobs/1/logs >/dev/null 2>/dev/null; rc=$?
+d1=$(sed -n '1p' "$GTIMES"); d2="$(sed -n '2p' "$GTIMES")"
+[ "$rc" -eq 0 ] && [ -n "$d2" ] && [ $(( d2 - d1 )) -ge 2 ] \
+  && pass "  …with NO refusal headers the class is undetermined and the wait is the documented base (${d1}→${d2})" \
+  || fail "the no-header case did not fall back to the base wait (rc=$rc starts='$(tr '\n' ' ' < "$GTIMES")')"
+grep -q 'class=undetermined' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and NAMES that the class cannot be observed (class=undetermined)" \
+  || fail "the unobservable class was not named: $(head -2 "$GDIR/events.log" | tr '\n' ' ')"
+case "$(cat "$GDIR/events.log" 2>/dev/null)" in
+  *'resets at'*) fail "a reset was derived for a refusal whose headers never arrived" ;;
+  *) pass "  …and derives no reset from a body that says nothing about THIS refusal" ;;
+esac
+
+# (d) A NON-403/429 RESPONSE IS AN ANSWER, EVEN WHEN IT SAYS "rate limit". Measured class: a 422
+# whose body mentions the phrase (a PR titled "fix rate limit") — retrying it spends the whole
+# backoff on a call that can never succeed.
+GDIR="$(gate_dir rl-500)"; GCOUNT="$TMP/rl-d-count"; GTIMES="$TMP/rl-d-times"; GHSEEN="$TMP/rl-d-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+cat > "$TMP/rl-real-d" <<'GHEOF'
+#!/usr/bin/env bash
+printf '%s' "${GH_DEBUG:-unset}" > "$GHSEEN"
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+printf '< HTTP/2.0 500 Internal Server Error\n' >&2
+printf '< X-Ratelimit-Remaining: 0\n' >&2
+printf 'gh: API rate limit exceeded for user ID 81560491. (HTTP 500)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-real-d"
+AGENT_GH_REAL="$TMP/rl-real-d" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /repos/o/r/pulls/1 >/dev/null 2>/dev/null; rc=$?
+[ "$rc" -ne 0 ] && [ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "a 500 whose body mentions the phrase is ONE honest refusal, not a retried limit (1 invocation)" \
+  || fail "a non-403 response was retried as a rate limit ($(cat "$GCOUNT" 2>/dev/null) invocations)"
+[ -z "$(ls "$GDIR"/cooldown.* 2>/dev/null)" ] \
+  && pass "  …and writes NO shared window (a 500 is not a limit)" \
+  || fail "a 500 wrote a box-wide cooldown: $(ls "$GDIR"/cooldown.* 2>/dev/null | head -1)"
+
+# (e) THE DEBUG CAPTURE NEVER REACHES A SUCCESSFUL CALL'S STDERR. Without this, every call in the
+# fleet would ship a dump to `gh-rest/gh`'s `2>&1 | jq` — the JSONDecodeError class.
+# ⛔ THE FIXTURE CARRIES A BODY, AND THAT IS THE WHOLE POINT: the real binary's dump includes the
+# WHOLE RESPONSE BODY between `* Request at` and `* Request took` (measured 2026-11-02: a successful
+# `gh api user --jq .login` printed the login on stdout and the full user JSON on stderr). A fixture
+# of header lines only would pass a filter that leaves every real call contaminated — the first cut
+# of this arm did exactly that.
+GDIR="$(gate_dir rl-quiet)"
+cat > "$TMP/rl-real-e" <<'GHEOF'
+#!/usr/bin/env bash
+if [ "${GH_DEBUG:-}" = "api" ]; then
+  printf '* Request at 2026-11-02 00:00:00 +0000 m=+0.01\n' >&2
+  printf '> GET /user HTTP/1.1\n' >&2
+  printf '< HTTP/2.0 200 OK\n' >&2
+  printf '< X-Ratelimit-Remaining: 4000\n' >&2
+  printf '{"login":"daniel-ospina","id":81560491}\n' >&2
+  printf '* Request took 30ms\n' >&2
+fi
+printf '{"number":1,"title":"ok"}\n'
+exit 0
+GHEOF
+chmod +x "$TMP/rl-real-e"
+AGENT_GH_REAL="$TMP/rl-real-e" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  bash "$SHIM" api /user >"$TMP/rl-e-out" 2>"$TMP/rl-e-err"
+if [ -s "$TMP/rl-e-err" ]; then
+  fail "a SUCCESSFUL call replayed the debug dump to stderr (a gh-rest JSONDecodeError): $(head -1 "$TMP/rl-e-err")"
+else
+  pass "a successful call leaves stderr byte-clean even though the child dumped headers AND body"
+fi
+case "$(cat "$TMP/rl-e-err" 2>/dev/null)" in
+  *81560491*) fail "the response BODY reached a successful call's stderr (the duplicate-document class)" ;;
+  *) pass "  …and the dumped BODY is gone too (not just the header lines)" ;;
+esac
+grep -q '"number":1' "$TMP/rl-e-out" \
+  && pass "  …and its stdout is untouched (the dump is stderr-only)" \
+  || fail "the capture corrupted stdout: $(head -1 "$TMP/rl-e-out")"
+# …and gh's OWN message after the block still reaches a FAILING caller, so the strip is not a
+# blanket gag on stderr: the line after `* Request took` is the one an operator reads.
+cat > "$TMP/rl-real-e2" <<'GHEOF'
+#!/usr/bin/env bash
+if [ "${GH_DEBUG:-}" = "api" ]; then
+  printf '* Request at 2026-11-02 00:00:00 +0000 m=+0.01\n' >&2
+  printf '< HTTP/2.0 404 Not Found\n' >&2
+  printf '{"message":"Not Found"}\n' >&2
+  printf '* Request took 30ms\n' >&2
+fi
+printf 'gh: Not Found (HTTP 404)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-real-e2"
+AGENT_GH_REAL="$TMP/rl-real-e2" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  bash "$SHIM" api /nope >/dev/null 2>"$TMP/rl-e2-err"
+grep -q 'gh: Not Found (HTTP 404)' "$TMP/rl-e2-err" \
+  && pass "  …while the child's OWN message after the dump still reaches a failing caller" \
+  || fail "the strip gags the real error message too: $(cat "$TMP/rl-e2-err" | tr '\n' ' ')"
+case "$(cat "$TMP/rl-e2-err" 2>/dev/null)" in
+  *'"message"'*) fail "a FAILING call's error body was replayed from the debug dump" ;;
+  *) pass "  …and the dumped body is not replayed there either (only gh's message)" ;;
+esac
+
+# (f) A PRE-CALL WINDOW LONGER THAN THE BUDGET IS REFUSED, WITH NO REQUEST ISSUED.
+GDIR="$(gate_dir rl-prewin)"; GCOUNT="$TMP/rl-f-count"; GTIMES="$TMP/rl-f-times"; GHSEEN="$TMP/rl-f-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+_until=$(( $(date +%s) * 1000 + 800000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+_f0="$(date +%s)"
+AGENT_GH_REAL="$TMP/rl-real-d" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_BUDGET_S=5 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$TMP/rl-f-ghseen" \
+  bash "$SHIM" api /user >/dev/null 2>"$TMP/rl-f-err"; rc=$?
+_f1="$(date +%s)"
+[ "$rc" -eq 75 ] \
+  && pass "an 800 s window under a 5 s budget → EX_TEMPFAIL (75), the verdict the layer above knows" \
+  || fail "the beyond-budget window did not return EX_TEMPFAIL (rc=$rc)"
+[ $(( _f1 - _f0 )) -le 4 ] \
+  && pass "  …in $(( _f1 - _f0 ))s, instead of being slept out (the #3230 stall)" \
+  || fail "the call waited $(( _f1 - _f0 ))s inside its 5 s budget"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 0 ] \
+  && pass "  …and issued NO request: a known-open window is never walked into blindly" \
+  || fail "a request was issued inside a window the gate already knew about ($(cat "$GCOUNT") invocation(s))"
+grep -q 'BEYOND this call' "$TMP/rl-f-err" 2>/dev/null \
+  && pass "  …and the refusal reaches the caller on stderr, naming the budget" \
+  || fail "the local refusal said nothing on stderr: $(head -2 "$TMP/rl-f-err" | tr '\n' ' ')"
+
+# (g) ⛔ A PERMISSIONS 403 IS NOT A RATE LIMIT, EVEN WHEN `x-ratelimit-*` IS ON IT. GitHub stamps
+# those headers on EVERY response (measured: a plain 403 carried `X-Ratelimit-Remaining: 3955`), so a
+# non-zero `remaining` is not evidence of a burst. Reading it as one retried a MUTATION three times
+# and wrote a box-wide window it never earned — #3230's own symptom, from a far commoner trigger
+# than a limit (review of #3230, P1). The control is the pre-change shim: ONE invocation, no window.
+cat > "$TMP/rl-perm" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf '* Request to https://api.github.com/user\n' >&2
+printf '> GET /user HTTP/1.1\n' >&2
+printf '< HTTP/2.0 403 Forbidden\n' >&2
+printf '< X-Ratelimit-Limit: 5000\n' >&2
+printf '< X-Ratelimit-Remaining: 4832\n' >&2
+printf '< X-Ratelimit-Reset: %s\n' "$(( $(date +%s) + 900 ))" >&2
+printf '{"message":"Resource not accessible by integration"}\n' >&2
+printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-perm"
+GDIR="$(gate_dir rl-perm)"; GCOUNT="$TMP/rl-g-count"; GTIMES="$TMP/rl-g-times"; GHSEEN="$TMP/rl-g-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+AGENT_GH_REAL="$TMP/rl-perm" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_RETRY_BASE=1 AGENT_GH_GATE_BUDGET_S=20 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>"$TMP/rl-g-err"; rc=$?
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "a permission 403 carrying x-ratelimit-* is ONE invocation, not a retried limit" \
+  || fail "a permission 403 was retried as a rate limit ($(cat "$GCOUNT" 2>/dev/null) invocation(s)) — #3230's symptom, from the commonest trigger"
+ls "$GDIR"/cooldown.* >/dev/null 2>&1 \
+  && fail "a permission 403 wrote a box-wide cooldown ($(ls "$GDIR"/cooldown.* | head -1))" \
+  || pass "  …and it writes NO box-wide window"
+case "$(cat "$GDIR/events.log" 2>/dev/null)" in
+  *'shared rate-limit window'*) fail "events.log names a shared rate-limit window for a permissions refusal" ;;
+  *) pass "  …and nothing claims a rate-limit window" ;;
+esac
+
+# (h) ⛔ THE BUDGET IS THE SUM THIS CALL SLEEPS, NOT EACH ARM'S OWN SHARE (#3230 review, P1). A
+# pre-call wait that is never charged to SPENT_MS lets the retry arm spend the SAME budget again —
+# measured at 7.1 s of wall clock under a 4 s budget, i.e. the stall, twice.
+cat > "$TMP/rl-combined" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf '* Request at 2026-11-02 00:00:00 +0000 m=+0.01\n' >&2
+printf '> GET /user HTTP/1.1\n' >&2
+printf '< HTTP/2.0 403 Forbidden\n' >&2
+printf '< Retry-After: 3\n' >&2
+printf 'gh: You have exceeded a secondary rate limit (HTTP 403)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-combined"
+GDIR="$(gate_dir rl-combined)"; GCOUNT="$TMP/rl-h-count"; GTIMES="$TMP/rl-h-times"; GHSEEN="$TMP/rl-h-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+# A live 3 s shared window in front of a refusal that justifies 3 s more, under a 4 s budget: each
+# arm fits on its own, so only a CHARGED pre-call wait stops them being slept back to back.
+_until=$(( $(date +%s) * 1000 + 3000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+_h0="$(date +%s)"
+AGENT_GH_REAL="$TMP/rl-combined" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_BUDGET_S=4 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>/dev/null; rc=$?
+_h1="$(date +%s)"
+[ $(( _h1 - _h0 )) -le 5 ] \
+  && pass "a 3 s window + a 3 s refusal under a 4 s budget → $(( _h1 - _h0 ))s total, not ~6 s" \
+  || fail "each arm was given the full budget: $(( _h1 - _h0 ))s of sleep under a 4 s ceiling"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "  …and the retry is not taken once the budget is spent" \
+  || fail "the call retried after its budget was spent ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
+
+# (i) ⛔ THE TRANSPORT BACKOFF IS GATED BY THE SAME CEILING IT IS CHARGED TO (#3230 review cycle 2,
+# P2). Charging it while never checking it made "ALL waits combined" false by up to 4 s — measured
+# with BUDGET_S=0: 3 invocations and 4.8 s of in-shim sleep under a declared 0 s ceiling.
+cat > "$TMP/rl-transport" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf 'error connecting to api.github.com\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-transport"
+GDIR="$(gate_dir rl-transport)"; GCOUNT="$TMP/rl-i-count"; GTIMES="$TMP/rl-i-times"; GHSEEN="$TMP/rl-i-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+_i0="$(date +%s)"
+AGENT_GH_REAL="$TMP/rl-transport" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_BUDGET_S=0 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>/dev/null; rc=$?
+_i1="$(date +%s)"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "a transport blip under a 0 s budget is ONE invocation, not a 4 s backoff" \
+  || fail "the transport backoff ignored the budget ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
+# ⛔ NO WALL-CLOCK ASSERTION HERE. It was `_i1 - _i0 <= 1` and it went RED on a loaded box (2 s with
+# zero sleep calls) — a timing bound is a measurement of the fleet's load, not of this gate.
+grep -q 'does not fit' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the un-taken backoff is NAMED as not fitting the budget (no silence)" \
+  || fail "the un-taken transport retry was not named: $(head -2 "$GDIR/events.log" 2>/dev/null | tr '\n' ' ')"
+# The `persisted after N attempt(s)` exhaustion note FIRES ONLY WHEN a transport retry was actually
+# taken (`[ "$ttries" -gt 0 ]`), so on this path the gate note above is the whole record — asserting
+# the note here would demand a line the design deliberately does not print.
+
+# (j) ⛔ `remaining: 0` IS STILL A STAMPED HEADER. A permission 403 that lands while the bucket reads
+# 0 wrote a box-wide window from its reset (measured: a 900 s cooldown, where the pre-change shim
+# wrote none) — #3230's shape, for every OTHER lane on the box.
+cat > "$TMP/rl-perm0" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf '> GET /user HTTP/1.1\n' >&2
+printf '< HTTP/2.0 403 Forbidden\n' >&2
+printf '< X-Ratelimit-Limit: 5000\n' >&2
+printf '< X-Ratelimit-Remaining: 0\n' >&2
+printf '< X-Ratelimit-Reset: %s\n' "$(( $(date +%s) + 900 ))" >&2
+printf '{"message":"Resource not accessible by integration"}\n' >&2
+printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-perm0"
+GDIR="$(gate_dir rl-perm0)"; GCOUNT="$TMP/rl-j-count"; GTIMES="$TMP/rl-j-times"; GHSEEN="$TMP/rl-j-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+AGENT_GH_REAL="$TMP/rl-perm0" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_RETRY_BASE=1 AGENT_GH_GATE_BUDGET_S=20 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>/dev/null; rc=$?
+ls "$GDIR"/cooldown.* >/dev/null 2>&1 \
+  && fail "a permission 403 with remaining: 0 wrote a box-wide cooldown ($(cat "$GDIR"/cooldown.* | head -1))" \
+  || pass "a permission 403 with remaining: 0 writes NO box-wide window (the header is not a fact)"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "  …and it is not retried as an exhausted bucket" \
+  || fail "a permissions refusal was retried as a primary exhaustion ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
