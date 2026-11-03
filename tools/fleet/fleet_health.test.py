@@ -49,8 +49,10 @@ patched for the duration of a leg and restored in a `finally`, so nothing touche
 or the real launchd.
 
 ⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
-(three `_drive` arms), and `main()` reaches the REAL process table twice — `cputime_secs(os.getpid())`
-and `_observed(os.getpid(), ...)` -> `scripts/lib/pid-identity.sh probe`. Both are read-only and
+(three `_drive` arms), and `main()` reaches the REAL process table up to THREE times —
+`cputime_secs(os.getpid())` for the lane row, `_observed(os.getpid(), ...)` ->
+`scripts/lib/pid-identity.sh probe`, and a second `cputime_secs(pid)` from the STATE snapshot write
+that the enumeration runs for every recorded pid. All are read-only and
 about THIS process, and the census verdicts the leg asserts are independent of what they return
 (the arm it pins is `pidStartSeconds`-absent, which abstains regardless). But a host with a
 removed `ps` would make the abstaining-record arm abstain for a host-level reason instead of the
@@ -647,9 +649,13 @@ def leg_lane_census(mod):
           "CENSUS: main() prints the mismatch over a readable store holding none of the roster")
     check("no suspects" not in out,
           "CENSUS: main() never prints a clean scan over 0 measured lanes")
-    # ⛔ THE MARKER, NOT THE EXIT CODE, is the discriminating signal: `main()` also exits 1 for
-    # an unrelated scheduled-maintainer alarm (this box has one), so an exit-code-only pairing
-    # stays green under the mutation and reports a red control as MISSED.
+    # ⛔ BOTH ARE CHECKED, AND BOTH DISCRIMINATE (review cycle 5, finding 1). An earlier comment
+    # here claimed the exit code could not fail because this box carries a scheduled-maintainer
+    # alarm — false INSIDE these arms: `_drive` stubs `reaper_section` and `harness_apply_section`
+    # to `[]`, so `main()` reaches `return 1` ONLY through the census. Measured on the shipped
+    # mutation, the exit check goes red. The marker is still checked separately because it names
+    # the STATE, and a scheduler reading an exit code could not tell a census failure from a
+    # maintainer alarm on a real box that has one.
     check("lane census INCOMPLETE" in out,
           "CENSUS: main() marks the scan INCOMPLETE so a scheduler sees it")
     check(rc == 1,
@@ -725,7 +731,8 @@ MUTATIONS = [
      ["CENSUS: pi running vs a roster with no records raises the mismatch",
       "CENSUS: an UNREADABLE process table is NAMED, never rendered as agreement",
       "CENSUS: main() prints the mismatch over a readable store holding none of the roster",
-      "CENSUS: main() NAMES an unreadable process table instead of reporting clean"]),
+      "CENSUS: main() NAMES an unreadable process table instead of reporting clean",
+      "CENSUS: main() exits non-zero — a census that prints rows and exits 0 is the false PASS"]),
     ("drop the orphan row from REAPERS (the pre-#1862 module)",
      _sub('    ("com.eldato.pi-reap-orphans",     "orphan"),\n', ""),
      ["REGISTERED: %s is in REAPERS" % LABEL]),
