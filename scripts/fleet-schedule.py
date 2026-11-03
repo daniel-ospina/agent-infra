@@ -806,7 +806,12 @@ def mark_busy(label, started):
                 },
                 fh,
             )
-    except OSError:
+    except Exception:  # noqa: BLE001 — best effort, and the marker is not worth a job
+        # ⛔ Exception, not OSError: the DEADLINE ARITHMETIC is in this try, and `float()` raises
+        # OverflowError for a `FLEET_SCHEDULE_TICK` too large to be a float (TICK is an int, so
+        # int() accepts 10**400). That escaped mark_busy BEFORE run_job's try/finally — i.e. WITH
+        # the job lock held — which is the 18f wedge: the lock names our live pid for ever.
+        # Measured at #3340. A marker that cannot be written must cost the exemption, not the run.
         pass
 
 
@@ -833,7 +838,15 @@ def busy_jobs(now):
                 entry = json.load(fh)
             deadline = float(entry["deadline"])
             started = float(entry.get("started") or 0)
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            # ⛔ OverflowError, not just ValueError: `float()` raises it for an int too large to be
+            # a float, and `json.load` parses an integer literal into an arbitrary-precision int,
+            # so a corrupted or foreign-written marker (`{"deadline": 10**400}`) raised OUT of
+            # here — and this runs unguarded inside `cmd_verify`, whose failures print only at the
+            # end, so the raise discarded every diagnostic collected so far. `--status` rendered
+            # the same input, so the two surfaces disagreed. Dropping the marker fails CLOSED: the
+            # tick then reads stale, which is the truth. Measured at #3340, same class as the
+            # `started` arm one section up.
             continue
         # ⛔ THE DEADLINE IS SELF-DECLARED, so it is CLAMPED by the budget THIS verifier enforces.
         # Otherwise a marker written once under a large FLEET_SCHEDULE_JOB_TIMEOUT (or left behind
@@ -1393,6 +1406,23 @@ def _stderr_is_stdout():
         return False
 
 
+def _append_log_line(path, line):
+    """Append one line to `loop.log` on an encoding that CANNOT fail. True when it landed.
+
+    The explicit utf-8 + backslashreplace is the point, not a nicety: the failing write in the
+    measured case was `sys.stdout`, whose encoding is the LOCALE's (ASCII under
+    `PYTHONIOENCODING=ascii`), and every loop message carries an em dash. This write is the log
+    FILE's, so a message the console cannot render is still recorded there — reversible, not lost.
+    """
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(path, "a", encoding="utf-8", errors="backslashreplace") as fh:
+            fh.write(line + "\n")
+        return True
+    except Exception:  # noqa: BLE001 — a logging failure is never a process failure
+        return False
+
+
 def log(message):
     line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message)
     path = os.path.join(STATE, "loop.log")
@@ -1401,13 +1431,9 @@ def log(message):
     # reads to find out what the loop is doing, and making a repeated line look like a repeated
     # pass. When our stdout already IS that file the print() below is the write; otherwise (a
     # foreground run, or a pipe) the file is not receiving it, so append explicitly.
+    appended = False
     if not _stdout_is(path):
-        try:
-            os.makedirs(STATE, exist_ok=True)
-            with open(path, "a") as fh:
-                fh.write(line + "\n")
-        except OSError:
-            pass
+        appended = _append_log_line(path, line)
     # ⛔ A LOGGING FAILURE MUST NEVER BECOME A PROCESS FAILURE. When the loop's stdout IS this
     # file (spawn_loop sets stdout to loop.log and stderr=STDOUT at the same target), THIS
     # print() is the write — and on a full disk it raises ENOSPC. Measured 2026-11-03 on a cmux
@@ -1422,7 +1448,18 @@ def log(message):
     try:
         print(line, flush=True)
     except Exception:  # noqa: BLE001 — a logging failure is never a process failure
-        pass
+        # ⛔ A FAILED print IS NOT A FAILED REPORT — this is R2's "no silence" half, and it was
+        # broken in ONE of the two shipped shapes. In the SPAWNED shape stdout already IS loop.log,
+        # so the append above was SKIPPED and this print was the only write; it fails precisely
+        # when the message cannot be encoded (ASCII PYTHONIOENCODING vs the em dash), the exception
+        # is swallowed so the loop survives — and NOTHING was reported anywhere. That includes
+        # `report_bookkeeping_failure`, whose own message carries the same em dash. Measured at
+        # #3340 by fresh-context review: a directory at state/tick under PYTHONIOENCODING=ascii
+        # wrote 0 bookkeeping lines to loop.log; the identical run without it wrote 3. Fall back to
+        # the file — but only when the append above did NOT land, because a second copy is the
+        # doubling the WRITE ONCE rule exists to prevent.
+        if not appended:
+            _append_log_line(path, line)
 
 
 # ──────────────────────────────────────────────────────────────── the loop

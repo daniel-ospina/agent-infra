@@ -1500,6 +1500,76 @@ PY18E
 [ "${n18e:-0}" -eq 1 ] && ok "the failure was reported exactly ONCE (stderr and stdout merged)" \
   || bad "the failure was reported ${n18e:-0}x, not once — a duplicate in every merged log: $out18e"
 
+# 18v — THE OTHER HALF OF R2, IN THE OTHER SHIPPED SHAPE. In `spawn_loop`'s shape stdout IS loop.log
+# and stderr is that same target, so log()'s append is SKIPPED and its print() is the ONLY write —
+# and that print raises whenever the message cannot be encoded, which is always under an ASCII
+# PYTHONIOENCODING because every loop message carries an em dash. The exception is swallowed (the
+# loop survives), so NOTHING was reported anywhere: `report_bookkeeping_failure` went the same way,
+# and an operator saw a healthy-looking log over a tick that was failing every pass. 18d cannot see
+# this (its stdout is a pipe, so the append lands) and neither can 18e (it has no encoding failure).
+# Measured at #3340 by fresh-context review: 0 bookkeeping lines with the ASCII env, 3 without it.
+# `> loop.log 2>&1` is the shape: stdout IS the file and stderr is the same target.
+cat > "$T/spawnreport.py" <<'PYSPAWN'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fsched_spawn", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+os.makedirs(m.STATE, exist_ok=True)
+m.report_bookkeeping_failure(OSError(28, "No space left on device"))
+PYSPAWN
+mkdir -p "$T/state18v"
+PYTHONIOENCODING=ascii python3 "$T/spawnreport.py" "$SCHED" "$T/state18v" > "$T/state18v/loop.log" 2>&1
+n18v="$(grep -c 'bookkeeping write failed' "$T/state18v/loop.log" || true)"
+[ "${n18v:-0}" -eq 1 ] \
+  && ok "18v the SPAWNED shape reports once even when the print itself cannot encode the line" \
+  || bad "18v the spawned shape reported ${n18v:-0}x — stdout IS loop.log, so the print was the only write: $(head -5 "$T/state18v/loop.log")"
+
+# 18w — THE SAME DEFECT CLASS REACHING TWO MORE READERS OF STATE-DIR JSON THROUGH A DIFFERENT DOOR:
+# `float()` of an arbitrary-precision int (which `json.load` hands back for an integer literal)
+# raises OverflowError, and OverflowError was in NEITHER guard. Found by fresh-context review.
+#   (a) busy_jobs() — a corrupted busy marker raised out of --verify, which prints its failures only
+#       at the end, so the raise discarded every diagnostic. The marker must be DROPPED (the tick
+#       then reads stale, which is the truth), never fatal.
+#   (b) mark_busy() — an absurd FLEET_SCHEDULE_TICK reaches this arithmetic, which sits BEFORE
+#       run_job's try/finally: the raise escaped WITH the job lock held, i.e. the 18f wedge.
+#   (c) human_secs() — pinned by nothing until now, and by this file's own standard (18t: a guard
+#       no case can fail is the class this file exists to prevent) it is pinned or declared.
+mkdir -p "$T/state18w/busy"
+python3 -c 'import json,sys; json.dump({"label":"com.test.x","started":1,"pid":1,"deadline":10**400}, open(sys.argv[1],"w"))' \
+  "$T/state18w/busy/com.test.x.json"
+out18w="$(python3 - "$SCHED" "$T/state18w" <<'PY18W' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fsched_18w", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+print("BUSY %r" % (m.busy_jobs(1000000),))
+for v in (10**400, float("inf"), float("nan")):
+    print("AGE %r" % (m.human_secs(v),))
+m.TICK = 10**400
+m.mark_busy("com.test.w", 1.0)
+# The raise lands AFTER open() truncated the marker, so the file exists but is EMPTY — and an empty
+# marker must be dropped (fail closed), never certified as a live exemption.
+print("MARKBUSY %r" % (m.busy_jobs(1000000),))
+PY18W
+)"; rc18w=$?
+if [ "$(grep -c 'Traceback' <<<"$out18w")" -eq 0 ] && grep -q 'BUSY \[\]' <<<"$out18w"; then
+  ok "18w a busy marker holding a 10**400 deadline is DROPPED, not raised out of --verify"
+else
+  bad "18w busy_jobs raised on a big-int deadline (rc=$rc18w): $out18w"
+fi
+if [ "$(grep -c 'AGE .an unusable age' <<<"$out18w")" -eq 3 ]; then
+  ok "18w human_secs answers 'an unusable age' for big-int, inf and NaN instead of raising"
+else
+  bad "18w human_secs did not answer unusably for all three bad ages (rc=$rc18w): $out18w"
+fi
+if [ "$(grep -c 'Traceback' <<<"$out18w")" -eq 0 ] && grep -q 'MARKBUSY \[\]' <<<"$out18w"; then
+  ok "18w mark_busy with an unusable TICK costs the exemption, not the run (no raise, no exemption)"
+else
+  bad "18w mark_busy raised on an unusable TICK (rc=$rc18w): $out18w"
+fi
+
 # 18f — a job whose STAMP WRITE FAILS must not be wedged. `write_stamp` sits in run_job's `finally`,
 # which is the ONLY place the lock and busy marker are released: unguarded, an ENOSPC there aborted
 # the block, the lock survived holding the LOOP'S OWN live pid, `acquire_lock` then answered "already
