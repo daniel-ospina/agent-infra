@@ -2853,6 +2853,14 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   // process env, so it is checked directly.
   if (["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
     .some((v) => { const x = process.env[v]; return typeof x === "string" && x.length > 0; })) return false;
+  // …including the AMBIENT spelling of the config channel (round 7, P2 — the
+  // `-c`/`--config-env` family r6 closed is also settable through the env:
+  // GIT_CONFIG_PARAMETERS / GIT_CONFIG_COUNT+KEY_n/VALUE_n / GIT_CONFIG_GLOBAL /
+  // GIT_CONFIG_SYSTEM all reached the window). Effect was inert (git ignores
+  // core.worktree inside a worktree) so this was a classification gap, but the
+  // fix is the principle rather than three more names: a bare restore needs NO
+  // git config at all, so ANY `GIT_CONFIG_*` in the env puts it out of window.
+  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && (process.env[k] ?? "").length > 0)) return false;
   const st = _hubState();
   if (!st.disorder) return false; // the window exists only for a DISORDERED hub
   try {

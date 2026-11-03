@@ -4745,6 +4745,14 @@ function _invSelectsRepo(inv) {
   for (const list of [inv.configOverrides, inv.configEnvOverrides, inv.envPrefixes]) {
     if (Array.isArray(list) && list.length > 0) return true;
   }
+  // Round 7 (P1, MEASURED — data loss): the `cd` CHAIN is a target channel the
+  // classifier already resolves and this predicate never consulted. With a
+  // dirty hub and an active hatch, `cd <other> && git restore --staged f.txt`
+  // was ALLOWED and reset the FOREIGN checkout's index (its staged work lost),
+  // where origin/main blocked it — and M5 cannot backstop it because its
+  // descriptor family has no staged-only shape. A restore in the recovery
+  // window runs from the hub, so any `cd` prefix puts it outside the window.
+  if (Array.isArray(inv.cdChain) && inv.cdChain.some((c) => c !== null && c !== undefined)) return true;
   return false;
 }
 
@@ -5647,7 +5655,10 @@ function _m4RecoveryLines(hubContext) {
     `   → Recover the DIRT — a branch switch cannot (git refuses to switch over`,
     `     modified paths). Which command depends on WHICH dirt; \`git status`,
     `     --porcelain\` tells you (column 1 = index, column 2 = worktree):`,
-    `       staged/index change  \`M \`  -> \`git restore --staged <path>\``,
+    `       staged/index change  \`M \`  -> \`git restore --staged --worktree <path>\``,
+    `                                     (one command: unstage AND restore — a bare`,
+    `                                      \`--staged\` leaves the file MODIFIED, so the`,
+    `                                      hub stays dirty and you are refused again)`,
     `       worktree change      \` M\`  -> \`git restore <path>\` / \`git checkout -- <path>\``,
     `       UNTRACKED            \`??\`  -> move it OUT: \`mv <path> /tmp/\` (\`git clean\``,
     `                                        stays refused — it is a discard)`,

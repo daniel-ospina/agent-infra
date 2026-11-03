@@ -122,6 +122,20 @@ check("C15 `restore -s <ref> <path>` stays blocked",
   verdict("git restore -s HEAD~1 tortoise/__init__.py", { escapeActive: true, hubContext: DIRTY }), "block");
 check("C16 pathspec magic `:/` stays blocked",
   verdict("git checkout -- :/", { escapeActive: true, hubContext: DIRTY }), "block");
+// C19/C20 — round 7 (P1 MEASURED, data loss): the `cd` CHAIN is a target channel
+// the classifier resolves and the window never consulted.
+// `cd <other> && git restore --staged f` reset a FOREIGN checkout's index at
+// head; origin/main blocked it and M5 has no staged-only descriptor to backstop.
+check("C19 `cd <other> && git restore --staged f` stays blocked",
+  verdict("cd /other && git restore --staged f.txt", { escapeActive: true, hubContext: DIRTY }), "block");
+check("C20 `cd <other> && git checkout -- f` stays blocked",
+  verdict("cd /other && git checkout -- f.txt", { escapeActive: true, hubContext: DIRTY }), "block");
+// C21/C22 — round 7 (P2): the mid-path `..` reject survived a mutation (no
+// assertion discriminated it). These pin it directly.
+check("C21 mid-path `..` stays blocked",
+  verdict("git checkout -- ../other/f.txt", { escapeActive: true, hubContext: DIRTY }), "block");
+check("C22 `a/../b` stays blocked",
+  verdict("git checkout -- a/../b.txt", { escapeActive: true, hubContext: DIRTY }), "block");
 // C17/C18 — round 6 (P2): any CONFIG override can retarget the invocation;
 // `-c core.worktree=<other>` was `recovery` at head while origin/main blocked it.
 check("C17 `-c core.worktree=<other>` stays blocked",
@@ -166,6 +180,19 @@ check("E5b production (evaluateHubGateWithTargets) dirty block does NOT prescrib
   /Terminal recovery: cd <repo> && git checkout main/.test(prodDirtyMsg), false);
 check("E5c production dirty block names the restore route + both hatches",
   /git restore <path>/.test(prodDirtyMsg) && /\.allow-main-edits/.test(prodDirtyMsg), true);
+// E5d–E5g — round 6 (P1) + round 7 (P2): the prescription must cover EVERY dirt
+// shape and must CONVERGE. A bare `git restore --staged <path>` leaves the file
+// MODIFIED, so the hub stays dirty and the reader is refused again — the
+// incident's loop. Measured: `--staged --worktree` is the one-command clean and
+// is inside the window's allowlist.
+check("E5d dirty block names the STAGED recovery that CONVERGES",
+  /git restore --staged --worktree <path>/.test(prodDirtyMsg), true);
+check("E5e dirty block names the UNTRACKED recovery (move it out)",
+  /mv <path> \/tmp\//.test(prodDirtyMsg), true);
+check("E5f dirty block does not prescribe `git clean` as the route",
+  /→ git clean/.test(prodDirtyMsg), false);
+check("E5g dirty block names the WORKTREE recovery",
+  /git restore <path>/.test(prodDirtyMsg) && /git checkout -- <path>/.test(prodDirtyMsg), true);
 // The branch route survives where it is TRUE (off-main, clean-ish tree).
 const offMainMsg = reason("git commit -am x", { hubContext: OFFMAIN });
 check("E6 off-main block keeps the branch recovery route",
@@ -354,6 +381,22 @@ async function partB() {
     ]) {
       const r = await drive(cmd);
       check(`B6q marker ⇒ ${name} retarget still BLOCKED (decided on the PARSED target)`, r !== null, true);
+    }
+    // B6c — round 7 (P1 MEASURED): a `cd`-chained restore into ANOTHER dirty
+    // checkout reset its index (staged work lost) at head; blocked on main.
+    const b6c = await drive(`cd "${other}" && git restore --staged tracked.txt`);
+    check("B6c marker ⇒ `cd <other> && restore --staged` still BLOCKED", b6c !== null, true);
+    // B6c2 — round 7 (P2): the AMBIENT config channel must not open the window.
+    // Asserted with the hub's OWN dirty path (`wip.txt`): with the window closed
+    // M5 protects it and the command blocks, whereas an open window would permit
+    // it exactly like B1. (`tracked.txt` would prove nothing — the hub does not
+    // carry it, so M5 has nothing to protect there either way.)
+    process.env.GIT_CONFIG_PARAMETERS = `'core.worktree=${other}'`;
+    try {
+      const b6c2 = await drive("git checkout -- wip.txt");
+      check("B6c2 marker + ambient GIT_CONFIG_PARAMETERS ⇒ window CLOSED (blocked)", b6c2 !== null, true);
+    } finally {
+      delete process.env.GIT_CONFIG_PARAMETERS;
     }
     // B6h — round 4, P2: while the hatch is ACTIVE the refusal must name the
     // window's real shape limit, not re-prescribe the hatch the reader holds.
