@@ -5671,14 +5671,13 @@ function _ambientGitEnvLines() {
   ];
 }
 
-function _m4RecoveryLines(hubContext) {
+export function hubDirtyRecoveryLines(hubContext) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
-  if (!dirty) {
-    return [
-      `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-      `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
-    ];
-  }
+  if (!dirty) return [];
+  return _dirtyRecoveryBody();
+}
+
+function _dirtyRecoveryBody() {
   return [
     `   → Recover the DIRT — a branch switch cannot (git refuses to switch over`,
     `     modified paths). Which command depends on WHICH dirt; \`git status`,
@@ -5700,6 +5699,17 @@ function _m4RecoveryLines(hubContext) {
     `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
     `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
   ];
+}
+
+function _m4RecoveryLines(hubContext) {
+  const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
+  if (!dirty) {
+    return [
+      `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
+      `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+    ];
+  }
+  return _dirtyRecoveryBody();
 }
 
 export function evaluateHubGate(command, currentBranch, opts = {}) {

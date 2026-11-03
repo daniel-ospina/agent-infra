@@ -48,7 +48,21 @@ import { join } from "node:path";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
 const CG = join(HERE, "classify-git.mjs");
-const { evaluateHubGate, isHubRecoveryInvocation, evaluateHubGateWithTargets } = await import(pathToFileURL(CG).href);
+// ⛔ HERMETIC AGAINST THE AMBIENT GIT ENV (review round 9, P2). The classifier
+// now treats any inherited repo-selecting variable as "outside the recovery
+// window" — correct for the gate, but it makes the suite's verdict depend on the
+// CALLER's shell: measured `GIT_CONFIG_NOSYSTEM=1 node <suite>` ⇒ 9 failures and
+// `GIT_DIR=…` ⇒ 5, on a correct tree. Part A consumes the classifier directly, so
+// the scrub has to be file-scope, before any case runs; Part B restores it.
+const AMBIENT_GIT_VARS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
+  .concat(Object.keys(process.env).filter((k) => /^GIT_CONFIG_/.test(k)));
+const AMBIENT_SAVED = new Map(AMBIENT_GIT_VARS.map((v) => [v, process.env[v]]));
+for (const v of AMBIENT_GIT_VARS) delete process.env[v];
+const restoreAmbient = () => {
+  for (const [v, val] of AMBIENT_SAVED) { if (val === undefined) delete process.env[v]; else process.env[v] = val; }
+};
+const { evaluateHubGate, isHubRecoveryInvocation, evaluateHubGateWithTargets, hubDirtyRecoveryLines } = await import(pathToFileURL(CG).href);
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -193,6 +207,13 @@ check("E5f dirty block does not prescribe `git clean` as the route",
   /→ git clean/.test(prodDirtyMsg), false);
 check("E5g dirty block names the WORKTREE recovery",
   /git restore <path>/.test(prodDirtyMsg) && /git checkout -- <path>/.test(prodDirtyMsg), true);
+// E5h — round 9 (P2): the classifier reason and the write/edit reason must be the
+// SAME text. The write/edit helper used to carry its own (incomplete) list, so
+// two surfaces gave different advice for the same state; only the classifier's
+// covered all three dirt shapes.
+const shared = hubDirtyRecoveryLines(DIRTY);
+check("E5h write/edit helper emits the SAME shared text as the classifier reason",
+  shared.length > 0 && shared.every((l) => prodDirtyMsg.includes(l)), true);
 // The branch route survives where it is TRUE (off-main, clean-ish tree).
 const offMainMsg = reason("git commit -am x", { hubContext: OFFMAIN });
 check("E6 off-main block keeps the branch recovery route",
@@ -457,6 +478,7 @@ async function partB() {
   }
 }
 await partB();
+restoreAmbient();
 
 console.log(failures.join("\n"));
 console.log(`\n${fail === 0 ? "✅" : "❌"} test-m4-recovery-window: ${pass} passed, ${fail} failed`);

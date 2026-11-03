@@ -292,12 +292,17 @@ let extractMarkerReason: (command: string) => string | null = () => null;
 let parseMarkerContent: (content: string) => Record<string, unknown> | null = () => null;
 let isAllowMarkerRealpath: (path: string) => boolean = () => false;
 let readAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => boolean = () => false;
+// #1484: ONE three-shape dirty-hub recovery text, shared by every block message
+// (M4's classifier reason and this file's write/edit + bash-write surfaces) so
+// the advice cannot drift from the enforcement.
+let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null) => string[] = () => [];
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
+     hubDirtyRecoveryLines,
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, scriptIsInterpreted, evaluateHubGateWithTargets,
      extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
@@ -611,16 +616,11 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
  *  no-op this change removes from the bash message: git refuses to switch over
  *  modified paths. */
 function _hubWriteRecoverLines(st: { disorder: string | null } | null): string[] {
-  const dirty = st?.disorder === "dirty" || st?.disorder === "both";
-  if (!dirty) {
-    return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
-  }
-  return [
-    `   → Recover the DIRT first — a branch switch cannot (git refuses to switch`,
-    `     over modified paths). Run this from the BASH route, where an active`,
-    `     escape hatch sanctions it: \`git restore <path>\` / \`git checkout -- <path>\`,`,
-    `     one NAMED path at a time. Edits stay frozen here until the tree is clean (D3).`,
-  ];
+  // ONE text, shared with M4's classifier reason (round 9): the two used to
+  // diverge, and only the classifier's covered all three dirt shapes.
+  const lines = hubDirtyRecoveryLines(st);
+  if (lines.length > 0) return lines;
+  return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
 }
 
 // #1919 — refuse a `git worktree add|move` whose target lands INSIDE a git
@@ -1323,12 +1323,6 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       `   another session's uncommitted hub WIP. Only genuinely NEW files`,
       `   (additive + visible) are allowed cross-checkout (cycle-3 A-2 — the`,
       `   bash route mirrors the write/edit tool's existing-untracked freeze).`,
-      // Round 8 (P2): this is the surface the incident's refusal #4 (`cp` a
-      // worktree copy over the truncated tracked file) hit, and it offered only
-      // routes that cannot work in the state that produced it: a mid-session
-      // lane cannot set a session-start env, and a worktree does not clear the
-      // hub. Name the route that DOES work under the marker the lane holds.
-      ..._hubWriteRecoverLines(_hubState()),
       `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
       `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
@@ -1363,6 +1357,12 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
     `   NEW-file writes and own-main untracked writes stay allowed. Only`,
     `   session-start host env (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a`,
     `   mid-command export cannot.`,
+    // Round 9 (P1): THIS is the arm the incident's refusal #4 (`cp <worktree
+    // copy> <truncated tracked file>`) hits — round 8's lines landed on the
+    // untracked-existing branch instead, which is keyed on a cross-checkout
+    // target and whose `_hubState()` would have described the WRONG checkout.
+    // Here the advice is the state of the hub the write targets.
+    ..._hubWriteRecoverLines(_hubState()),
     `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
     `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
@@ -4421,10 +4421,12 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
             // no-op. On a DIRTY hub `git checkout main && git pull --ff-only`
             // cannot run (git refuses to switch over modified paths), and it
             // never named the named-path restore the recovery window sanctions.
+            // Round 9 (P2): and it listed the BARE `--staged` spelling, which
+            // is the form this PR documents as non-convergent — it leaves the
+            // file MODIFIED so the hub stays dirty. The shared three-shape text
+            // replaces that list.
             ...(_hubState().disorder
-              ? [`     (the hub is disordered — the M4 refusal carries the state-appropriate`,
-                 `     recovery route: \`git restore --staged <path>\` / \`git restore <path>\` /`,
-                 `     move an UNTRACKED path out of the checkout, under an escape hatch)`]
+              ? _hubWriteRecoverLines(_hubState())
               : [`     (recovery from an off-main hub: git checkout main && git pull --ff-only)`]),
             `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
           ].join("\n");
