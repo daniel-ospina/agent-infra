@@ -983,7 +983,15 @@ if [ "$FARM_CHECK_ON" = "0" ]; then
     log_line "farm: SKIPPED — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed; a stale farm will NOT redden this pass)"
 fi
 if [ "$FARM_CHECK_ON" = "1" ]; then
-    FARM_DEST="${HARNESS_APPLY_FARM_DEST:-$CELL_HOME/.pi/agent/scripts}"
+    case "${HARNESS_APPLY_FARM_DEST:-}" in
+        '') FARM_DEST="$CELL_HOME/.pi/agent/scripts" ;;
+        /*) FARM_DEST="$HARNESS_APPLY_FARM_DEST" ;;
+        *)  # ⛔ A RELATIVE VALUE IS NEVER EXPANDED BY `Environment=` OR A PLIST, and `cwd` under the
+            # unit is `/` — so a typo'd seam would resolve to a path with nothing at it and take the
+            # SKIPPED arm, reading green over a stale farm. Refused before the pass runs, like every
+            # other seam here.
+            err "HARNESS_APPLY_FARM_DEST must be an ABSOLUTE path (got '$HARNESS_APPLY_FARM_DEST')"; exit 2 ;;
+    esac
     FARM_CHECKER="${HARNESS_APPLY_FARM_CHECKER:-}"
     if [ -z "$FARM_CHECKER" ]; then
         for _c in "$REPO/scripts/check-farm-drift.sh" "$HERE/check-farm-drift.sh"; do
@@ -992,6 +1000,13 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         unset _c
     fi
     if [ ! -d "$FARM_DEST" ] && [ ! -e "$FARM_DEST" ] && [ ! -L "$FARM_DEST" ]; then
+        # ⛔ ABSENT-BY-DEFAULT AND ABSENT-BECAUSE-MISCONFIGURED ARE DIFFERENT FACTS. A controller-only
+        # host has no farm and nothing to be stale; a box whose operator NAMED a farm that is not
+        # there has a broken config, and calling that `SKIPPED` is the silent green this leg removes.
+        if [ -n "${HARNESS_APPLY_FARM_DEST:-}" ]; then
+            REC_ACTION=farm-unverifiable
+            finish 0 24 "farm: UNKNOWN — HARNESS_APPLY_FARM_DEST names $FARM_DEST, where nothing exists; an explicitly-configured farm that is not there is a misconfiguration, not a controller-only host"
+        fi
         log_line "farm: SKIPPED — no farm at $FARM_DEST (a host that executes nothing from there cannot be stale)"
     elif [ ! -d "$FARM_DEST" ]; then
         REC_ACTION=farm-unverifiable
@@ -1014,13 +1029,26 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # checkout older than this feature `$REPO/scripts/check-farm-drift.sh` is absent, so the
         # fallback would execute the farm's own (possibly stale) checker over the farm's own
         # population. That is the fail-open shape this leg exists to remove, so it refuses instead.
-        FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER")"
+        # ⛔ RESOLVE THE CHECKER'S FINAL TARGET, not just its directory. `pwd -P` resolves the DIR and
+        # appends `basename` unresolved, and comparing against `$FARM_DEST/$(basename ...)` only catches
+        # a link that keeps its NAME — so `grade.sh -> $FARM/_sub/check-farm-drift.sh` (another name,
+        # another path) graded the farm from inside it and printed `farm: ok` (review rounds 2 and 3,
+        # both reproduced). ⛔ `readlink -f` is NOT used: it is a BSD portability trap
+        # (`check-portability-traps.sh`) and this pass runs on macOS — the loop is bash-3.2 safe, with a
+        # bound so a link cycle ends in a refusal instead of a hang.
+        FARM_CHECKER_T="$FARM_CHECKER"; _hops=0
+        while [ -L "$FARM_CHECKER_T" ] && [ "$_hops" -lt 40 ]; do
+            _l="$(readlink "$FARM_CHECKER_T" 2>/dev/null)" || break
+            case "$_l" in
+                /*) FARM_CHECKER_T="$_l" ;;
+                *) FARM_CHECKER_T="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$_l" ;;
+            esac
+            _hops=$((_hops + 1))
+        done
+        unset _l
+        FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
         FARM_DEST_REAL="$(cd "$FARM_DEST" 2>/dev/null && pwd -P)"
-        # ⛔ `pwd -P` resolves the DIRECTORY only; `basename` is appended unresolved, so a SYMLINKED
-        # checker file pointing into the farm slipped past the first test and graded the farm from
-        # inside it (review round 2, reproduced). `-ef` follows links and compares identity.
-        if [ -n "$FARM_DEST_REAL" ] && { [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ] \
-                || [ "$FARM_CHECKER" -ef "$FARM_DEST/$(basename "$FARM_CHECKER")" ]; }; then
+        if [ -n "$FARM_DEST_REAL" ] && [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ]; then
             REC_ACTION=farm-unverifiable
             finish 0 24 "farm: UNKNOWN — the only check-farm-drift.sh found ($FARM_CHECKER) lives INSIDE the farm it would grade, and a copy that grades itself cannot answer whether it is stale — install the CHECKER from a ref-consistent checkout"
         fi

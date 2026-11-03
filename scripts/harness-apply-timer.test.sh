@@ -373,7 +373,7 @@ assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 # MEASURED IN REVIEW: redirecting the blob at `$REPO/$p` followed the symlink and overwrote the CLEAN
 # file it pointed at — bytes that were never preserved, because that file was not dirty — then printed
 # "tracked paths match HEAD" and exited 10. This repo tracks 34 symlinks.
-say_case "T24 a dirty symlink is replaced, not written through"
+say_case "T15 a dirty symlink is replaced, not written through"
 mk_origin t15
 # The symlink and the file it points at are committed in the ORIGIN first, then cloned: a local commit
 # would make the clone AHEAD (and this case must be BEHIND) rather than on the ref's line.
@@ -386,17 +386,17 @@ seed_commit "add B and a symlink" >/dev/null 2>&1
 seed_push >/dev/null 2>&1
 mk_clone t15
 REPO_P="$CLONE"; MODE_P=sync; write_sync_stub
-assert_eq "$(readlink "$CLONE/link")" "A.txt" "T24 fixture: the clone starts with the symlink clean"
+assert_eq "$(readlink "$CLONE/link")" "A.txt" "T15 fixture: the clone starts with the symlink clean"
 WANT15="$(advance_origin t15 A.txt "upstream for the symlink case")"
 ln -sfn B.txt "$CLONE/link"          # the DIRTY change: the symlink now points somewhere else
 OUT="$(run_pass "$T/t15" 2>&1)"; RC=$?
-assert_eq "$RC" "10" "T24 the pass advances past a dirty symlink"
-assert_eq "$(readlink "$CLONE/link")" "A.txt" "T24 the tracked symlink is restored to what HEAD says"
+assert_eq "$RC" "10" "T15 the pass advances past a dirty symlink"
+assert_eq "$(readlink "$CLONE/link")" "A.txt" "T15 the tracked symlink is restored to what HEAD says"
 assert_eq "$(cat "$CLONE/B.txt")" "B-ORIGINAL" \
-    "T24 the CLEAN file the symlink pointed at is untouched (the blob was not written THROUGH it)"
-assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT15" "T24 and the checkout fast-forwarded"
+    "T15 the CLEAN file the symlink pointed at is untouched (the blob was not written THROUGH it)"
+assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT15" "T15 and the checkout fast-forwarded"
 assert_eq "$(git -C "$CLONE" status --porcelain | grep -c 'link' | tr -d ' ')" "0" \
-    "T24 the symlink is no longer reported dirty (it really was replaced)"
+    "T15 the symlink is no longer reported dirty (it really was replaced)"
 
 # ── T16: the unit's OWN environment is enough to run the pass (the #2416 P0) ──────────────────
 # MEASURED IN REVIEW: the rendered unit exports `HARNESS_APPLY_REPO` / `HARNESS_APPLY_REF` while the
@@ -1114,6 +1114,30 @@ chmod +x "$T/t24g/home/.pi/agent/scripts/check-farm-drift.sh"
 OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24g/home/.pi/agent/scripts/check-farm-drift.sh" run_pass "$T/t24g" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: a checker that lives inside the farm is REFUSED, not trusted"
 assert_contains "$OUT" "lives INSIDE the farm" "T24 control: and it names that reason"
+
+# Control 7: the in-farm refusal must survive a checker that is a SYMLINK with a DIFFERENT BASENAME
+# pointing at a farm file at ANOTHER PATH. Comparing the checker against "$FARM_DEST/$(basename)" only
+# covers the same-name shape, so that shape is the one that stayed open (review round 3, reproduced).
+mk_origin t24h; mk_clone t24h
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24h/home/.pi/agent/scripts/_sub"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$T/t24h/home/.pi/agent/scripts/_sub/real-checker.sh"
+chmod +x "$T/t24h/home/.pi/agent/scripts/_sub/real-checker.sh"
+mkdir -p "$T/t24h/bin"
+ln -s "$T/t24h/home/.pi/agent/scripts/_sub/real-checker.sh" "$T/t24h/bin/grade.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24h/bin/grade.sh" run_pass "$T/t24h" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a checker SYMLINKED to another name inside the farm is still REFUSED"
+assert_contains "$OUT" "lives INSIDE the farm" "T24 control: and that refusal names the reason"
+# Control 8: an EXPLICITLY configured farm that is not there is a MISCONFIGURATION, not a
+# controller-only host — a tilde or a relative value in a unit's Environment= is never expanded, and
+# silently skipping it would read green over a stale farm.
+mk_origin t24i; mk_clone t24i
+REPO_P="$CLONE"; MODE_P=sync
+OUT="$(HARNESS_APPLY_FARM_DEST="$T/t24i/typo-nowhere" run_pass "$T/t24i" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an explicitly-configured farm that is absent is REFUSED, not skipped"
+assert_contains "$OUT" "misconfiguration" "T24 control: and it says the config is wrong rather than the host being farmless"
+OUT="$(HARNESS_APPLY_FARM_DEST="relative/farm" run_pass "$T/t24i" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T24 control: a non-absolute farm path is refused before the pass runs"
 
 echo
 echo "────────────────────────────────────────────────────────"
