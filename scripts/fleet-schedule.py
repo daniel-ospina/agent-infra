@@ -860,10 +860,19 @@ def report_bookkeeping_failure(exc):
 
 
 def loop_pid():
+    # ⛔ IndexError, NOT just (OSError, ValueError). `"".split()` is `[]`, so a ZERO-BYTE pidfile
+    # raised IndexError out of here — and this function is called by `cmd_loop` BEFORE the loop
+    # starts and by `--start`/`--install`/`--verify`/`--status`/`--stop`, i.e. by EVERY recovery
+    # command. Measured: a 0-byte loop.pid made all of them die with a traceback and the cell's
+    # only scheduler could never come up again, self-perpetuatingly (each attempt died at this line
+    # before it could rewrite the file). A human `rm loop.pid` was the only way back.
+    # The producer is in THIS file (see `cmd_loop`) and its trigger is this PR's own trigger: it
+    # truncated the pidfile with `open(pidfile, "w")` and then wrote it UNGUARDED, so ENOSPC left
+    # the empty file behind. Both ends are fixed together.
     try:
         with open(os.path.join(STATE, "loop.pid")) as fh:
             pid = int(fh.read().strip().split()[0])
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError, TypeError):
         return None
     if not pid_alive(pid):
         return None
@@ -978,21 +987,35 @@ def acquire_lock(label):
     for _ in range(2):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            os.write(fd, ("%d\n" % os.getpid()).encode())
-            os.close(fd)
+            try:
+                # ⛔ A SMALL WRITE STILL NEEDS A DATA BLOCK, so ENOSPC/EIO/EDQUOT fail here having
+                # already CREATED the file. Unguarded that left a 0-byte lock behind, and every
+                # later `acquire_lock` then raised IndexError on `"".split()[0]` — measured — so the
+                # job never ran again on any pass until a human deleted the lock. This function's
+                # own contract is "A lock whose pid is GONE is stolen: a crashed run must not
+                # disable its job forever"; an EMPTY lock is the strongest case of that.
+                os.write(fd, ("%d\n" % os.getpid()).encode())
+            finally:
+                os.close(fd)
             return path
-        except FileExistsError:
-            try:
-                with open(path) as fh:
-                    pid = int(fh.read().strip().split()[0])
-            except (OSError, ValueError):
-                pid = None
-            if pid is not None and pid_alive(pid):
-                return None
-            try:
-                os.unlink(path)
-            except OSError:
-                return None
+        except OSError:
+            # Either the exclusive create lost the race (FileExistsError, handled below) or the
+            # write failed. In BOTH cases the file may exist and may be unusable; fall through to
+            # the same steal-or-refuse logic rather than propagating an exception that aborts the
+            # pass and wedges the job.
+            if not os.path.exists(path):
+                raise
+        try:
+            with open(path) as fh:
+                pid = int(fh.read().strip().split()[0])
+        except (OSError, ValueError, IndexError, TypeError):
+            pid = None
+        if pid is not None and pid_alive(pid):
+            return None
+        try:
+            os.unlink(path)
+        except OSError:
+            return None
     return None
 
 
@@ -1194,8 +1217,20 @@ def cmd_loop():
     if theirs and theirs != os.getpid() and pid_is_our_loop(theirs):
         log("loop: already running (pid %d) — this instance exits" % theirs)
         return 0
-    with open(pidfile, "w") as fh:
-        fh.write("%d\n" % os.getpid())
+    # ⛔ ATOMIC, AND GUARDED — this file is the cell's ONLY evidence that a loop is running, and the
+    # old `open(pidfile, "w")` TRUNCATED it before writing. On ENOSPC (this PR's own trigger) the
+    # write raised, the process died, and the truncated 0-byte pidfile made every recovery command
+    # (--loop/--start/--install/--verify/--status/--stop) raise IndexError. Write beside it and
+    # rename, exactly as `write_stamp` does, so a failed write leaves the PREVIOUS pidfile intact.
+    try:
+        tmp_pid = pidfile + ".tmp"
+        with open(tmp_pid, "w") as fh:
+            fh.write("%d\n" % os.getpid())
+        os.replace(tmp_pid, pidfile)
+    except OSError as exc:
+        log("ERROR loop: cannot record our pid in %s (%s: %s) — the loop still runs, but "
+            "--verify will read no loop; the previous pidfile (if any) was left intact"
+            % (pidfile, type(exc).__name__, exc))
 
     def bye(signum, _frame):
         log("loop: signal %d — exiting" % signum)
@@ -1399,7 +1434,14 @@ def print_table(jobs, now):
             print("  ERROR  %-38s %-18s %s" % (job.label, "-", job.error))
             continue
         if job.skip:
-            print("  SKIP   %-38s %-18s %s" % (job.label, job.cadence, job.skip))
+            # `job.skip` can be a NAME, not a reason (an unresolved placeholder), and a skipped job
+            # with a non-numeric calendar value made `job.cadence` raise here — outside the guard
+            # below — and blank the whole table.
+            try:
+                cadence = job.cadence
+            except Exception:  # noqa: BLE001 — one bad row must not blank the table
+                cadence = "?"
+            print("  SKIP   %-38s %-18s %s" % (job.label, cadence, job.skip))
             continue
         # ⛔ ONE BAD FILE MUST NOT BLANK THE TABLE. A stamp that is not an object, a missing or
         # non-numeric `started`, or a calendar value that is not a number used to raise straight

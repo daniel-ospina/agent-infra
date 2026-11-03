@@ -1640,6 +1640,51 @@ rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" "$GOOD/com.test.zzzafter
   || bad "the job after the broken one ran 0x while a stamp was malformed — one bad stamp silently unschedules the rest"
 run "$GOOD" --stop >/dev/null 2>&1
 
+# 18h — a ZERO-BYTE loop.pid must be recovered, not fatal. The loop truncates the pidfile
+# (`open(pidfile,"w")`) and then writes it; on ENOSPC that write raised and left an empty file — and
+# `loop_pid()` did `"".split()[0]`, an IndexError, which it did not catch. `loop_pid()` is called by
+# EVERY command (--loop/--start/--install/--verify/--status/--stop), so a 0-byte pidfile made all of
+# them die with a traceback and the cell's only scheduler could never come up again, self-
+# perpetuat ingly: each attempt died at the same line before it could rewrite the file. A human
+# `rm loop.pid` was the only way back. Measured on the pre-fix file.
+state_reset "$GOOD"
+run "$GOOD" --install >/dev/null 2>&1
+run "$GOOD" --stop >/dev/null 2>&1
+: > "$FLEET_SCHEDULE_STATE/loop.pid"          # the exact wreckage an ENOSPC-truncated write leaves
+outh="$(run "$GOOD" --verify)"; rch=$?
+[ "$(grep -c 'Traceback' <<<"$outh")" -eq 0 ] && ok "--verify survives a zero-byte loop.pid" \
+  || bad "--verify raised IndexError on a zero-byte loop.pid: $outh"
+# `--start` is the cell's revival path (it also clears the OFF switch a previous --stop set).
+outh2="$(run "$GOOD" --start)"; rc_start=$?
+[ "$rc_start" -eq 0 ] && ok "--start recovers from a zero-byte loop.pid (it can still come up)" \
+  || bad "--start could not recover from a zero-byte loop.pid (rc=$rc_start): $outh2"
+pidd="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+[ -n "$pidd" ] && kill -0 "$pidd" 2>/dev/null && ok "the loop is running again after an empty pidfile" \
+  || bad "no live loop after recovering an empty pidfile"
+run "$GOOD" --stop >/dev/null 2>&1
+
+# 18i — a ZERO-BYTE lock file must be STOLEN, not fatal. `acquire_lock` creates the lock then writes
+# the pid; a failed write (ENOSPC on a small write) left a 0-byte lock, and the next pass raised
+# IndexError on `"".split()[0]` — a job that NEVER runs again on any pass, with no self-healing path,
+# until a human deletes the lock. That defeats acquire_lock's own documented invariant ("a lock whose
+# pid is GONE is stolen") and, if the job that lost the race is the disk reaper, is the same closed
+# feedback loop this PR opens everywhere else.
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1
+pidi="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+mkdir -p "$FLEET_SCHEDULE_STATE/locks"
+: > "$FLEET_SCHEDULE_STATE/locks/com.test.echo.lock"
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.echo.json"      # make it due on the next pass
+beforei=0; [ -f "$MARK" ] && beforei="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+sleep 12
+afteri=0; [ -f "$MARK" ] && afteri="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+[ "${afteri:-0}" -gt "${beforei:-0}" ] && ok "an empty lock file was STOLEN and the job ran again" \
+  || bad "an empty lock file wedged the job ($beforei -> $afteri runs) — no self-healing path"
+kill -0 "$pidi" 2>/dev/null && ok "the loop survived an empty lock file" \
+  || bad "the loop died on an empty lock file"
+run "$GOOD" --stop >/dev/null 2>&1
+
 
 # ── 18. residency is DECLARED, read in every documented form, and refused by name ───────────
 # Both P2s a fresh review left on PR #2954 are the #2908 shape: a VALID declaration the runtime did
