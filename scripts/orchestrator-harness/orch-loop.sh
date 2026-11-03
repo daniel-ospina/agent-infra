@@ -3038,12 +3038,6 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
     # unowned set (the rows are a different moment than the count). Absent rows make
     # unowned_pr_count assume NOTHING is owned — the conservative direction.
     rm -f "$O/state/last-open-prs"
-    # ⛔ THE FABRICATED/STALE COUNT MUST BE IDENTIFIABLE DOWNSTREAM (review round 2, P1). The caller
-    # receives a NUMBER either way, so a WIP gate that reads a stale `4` as "below the floor" OPENS
-    # the issue path on exactly the cycle the listing is broken — the produce-more direction it exists
-    # to stop. The marker is the fact; the number is not evidence of itself. Written BEFORE either
-    # echo so no caller can observe the number without the marker beside it.
-    : > "$O/state/open-unknown" 2>/dev/null || true
     if is_num "$sticky" && [ "$sticky" -gt 0 ]; then
       echo "[scope] open=UNKNOWN rc=$rc (${err:-no stderr}) -> sticky last-known=$sticky" >> "$LOG"
       echo "$sticky"
@@ -3054,9 +3048,6 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
     return 0
   fi
   printf '%s\n' "$n" > "$O/state/last-open-n"
-  # The count is MEASURED again, so the marker must die with the failure that wrote it — a marker
-  # that outlived its cycle would keep a WIP gate down on a healthy listing (the stale-flag class).
-  rm -f "$O/state/open-unknown" 2>/dev/null || true
   printf '%s\n' "$prs" > "$O/state/last-open-prs"
   echo "$n"
 }
@@ -5812,38 +5803,38 @@ PY
   [ "$LF_M" -ge 1 ] || LF_M=25
   LF_EMERG=""
   declare -f floor_emergency >/dev/null 2>&1 && LF_EMERG="$(floor_emergency "${O:-}" "${BATCH:-1}" 2>/dev/null)"
-  # ⛔ THE COUNT'S PROVENANCE, NOT JUST ITS VALUE (review round 2, P1). `open_pr_count` never returns a
-  # non-numeric: on a failed listing it echoes the last-known STICKY value or a fabricated
-  # `max(MERGE_PRIORITY_AT,10)+1`. Both are plausible digits, so every branch below would read them as
-  # a measurement — and a stale `4` OPENS the issue path while the real queue is far over the floor.
-  # `state/open-unknown` is written by that failure path and deleted on the next good read, so this is
-  # the producer's OWN fact rather than a guess about the fallback's shape.
-  LF_UNK=""
-  [ -f "${O:-}/state/open-unknown" ] && LF_UNK=1
-  case "${OPEN_N:-}" in
-    ''|*[!0-9]*|0?*)
-      GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
-      GATE_VEC="$GATE_VEC landing-floor=UNKNOWN" ;;
-    *)
-      # ⛔ THE LENGTH BOUND IS NOT DECORATION: `[` ERRORS at or above 2^63 and an ERRORED test is
-      # FALSE, which OPENS the gate — that is the exact reason `is_limit` exists. `is_limit` is not in
-      # scope inside this extracted block, so the bound is stated here. An arm whose whole purpose is
-      # "this cannot fail open" must not leave its one fail-open input unbounded.
-      if [ -n "$LF_UNK" ]; then
-        # The digits are a sticky/fabricated stand-in, not this cycle's read. Drain.
-        GATE_WHY="${GATE_WHY:-landing-floor(open PR count is a STALE/FABRICATED fallback (${OPEN_N}) — landing before producing)}"
-        GATE_VEC="$GATE_VEC landing-floor=UNKNOWN(fallback ${OPEN_N})"
-      else
-      if [ "${#OPEN_N}" -gt 6 ]; then
-        GATE_WHY="${GATE_WHY:-landing-floor(open PR count OUT OF RANGE (${#OPEN_N} digits) — landing before producing)}"
-        GATE_VEC="$GATE_VEC landing-floor=UNKNOWN(out-of-range)"
-      else
-        # ⛔ NESTED `if`, NOT `elif`: `elif` is banned inside the vector block (test v9) because that
-        # is the shape by which one arm MASKED every later one (#2924). These branches select among
-        # THIS arm's own verdicts, never among arms — but the structural rule cannot tell the
-        # difference, and a rule that has to be interpreted is the one that gets broken.
-        if [ -n "$LF_EMERG" ]; then
-          GATE_VEC="$GATE_VEC landing-floor=exempt(${LF_EMERG} outranks ${OPEN_N}>=${LF_M})"
+  # ⛔ THE EMERGENCY DOOR IS TESTED FIRST, SO IT COVERS EVERY BRANCH (review round 3, P2). It used to
+  # sit in the deepest `else`, which meant the three fail-closed branches (UNREADABLE, out-of-range,
+  # and the stale-fallback branch round 2 added) each assigned GATE_WHY WITHOUT ever consulting it —
+  # so the arm's own contract ("an emergency that floor_emergency can see OUTRANKS the floor") was
+  # false on 3 of 5 branches, and the one that is reachable on a broken listing was one of them.
+  # Hoisting it makes the statement structurally true instead of true-in-the-happy-path, and it is
+  # also the shortest form: stand down, or decide.
+  # ⛔ NOTE ON PROVENANCE (review round 3, P2 — a CORRECTION of round 2): `open_pr_count` never returns
+  # a non-numeric, but that does NOT let a stale/fabricated number slip past this arm in the shipped
+  # loop — `unowned_scan` (see its `[ -n "${list// /}" ] || { echo "$n"; return 0; }`) reads a
+  # listing-less failure as "NOTHING is owned", so `UPN == OPEN_N > 0` and `mp_reason` sets GATE_WHY
+  # from the FIRST arm, before this one runs. A broken listing therefore fail-CLOSES on `merge-priority`
+  # and this arm can never be the winner on those cycles. Round 2 added a state-file marker + a branch
+  # + two tests for that case; round 3 measured that deleting the marker left the suite green and the
+  # gate behaviour unchanged, so the mechanism was INERT and its tests graded a composition the shipped
+  # loop cannot reach. It has been REMOVED rather than pinned — a check that cannot fail is worse than
+  # no check, and an unpinnable one is worse still. The guards below are defence-in-depth for the arm's
+  # own contract, NOT a live fix for a fail-open.
+  if [ -n "$LF_EMERG" ]; then
+    GATE_VEC="$GATE_VEC landing-floor=exempt(${LF_EMERG} outranks ${OPEN_N:-?})"
+  else
+    case "${OPEN_N:-}" in
+      ''|*[!0-9]*|0?*)
+        GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
+        GATE_VEC="$GATE_VEC landing-floor=UNKNOWN" ;;
+      *)
+        # ⛔ THE LENGTH BOUND IS NOT DECORATION: `[` ERRORS at or above 2^63 and an ERRORED test is
+        # FALSE, which OPENS the gate — that is the exact reason `is_limit` exists. `is_limit` is not
+        # in scope inside this extracted block, so the bound is stated here.
+        if [ "${#OPEN_N}" -gt 6 ]; then
+          GATE_WHY="${GATE_WHY:-landing-floor(open PR count OUT OF RANGE (${#OPEN_N} digits) — landing before producing)}"
+          GATE_VEC="$GATE_VEC landing-floor=UNKNOWN(out-of-range)"
         else
           if [ "${OPEN_N}" -ge "$LF_M" ]; then
             GATE_WHY="${GATE_WHY:-landing-floor(${OPEN_N} open PR(s) >= ${LF_M} — landing before producing)}"
@@ -5851,10 +5842,9 @@ PY
           else
             GATE_VEC="$GATE_VEC landing-floor=ok(${OPEN_N}<${LF_M})"
           fi
-        fi
-      fi
-      fi ;;
-  esac
+        fi ;;
+    esac
+  fi
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
   # can be completely unable to spawn, so a chain that reports `load=` first describes the wrong
   # resource and points the operator at a remedy (wait) that cannot work. The order is
