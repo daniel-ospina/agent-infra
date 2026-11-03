@@ -239,7 +239,7 @@ has "$(cat "$(LOG)" 2>/dev/null)" "outcome=died reason=signal:TERM" "2m …while
 # its verdict back, after which the new dispatch stamps a token without clearing it — the old verdict then
 # reads as the current run's. A timing window cannot be driven deterministically from a shell test, so the
 # ORDER is pinned: the stamp must precede the removal.
-_OWNLN="$(grep -n 'lane-\$N.owner" 2>/dev/null && LANE_OWNER_OK=1' "$LANE" | head -1 | cut -d: -f1)"
+_OWNLN="$(grep -n '> "\$O/logs/lane-\$N.owner" 2>/dev/null' "$LANE" | head -1 | cut -d: -f1)"
 _RMLN="$(grep -n 'rm -f "\$O/logs/lane-\$N.outcome"' "$LANE" | head -1 | cut -d: -f1)"
 { [ -n "${_OWNLN:-}" ] && [ -n "${_RMLN:-}" ] && [ "$_OWNLN" -lt "$_RMLN" ]; }; rc=$?
 ck "2n the owner token is stamped BEFORE the verdict file is removed (line ${_OWNLN:-?} < ${_RMLN:-?}) — the reverse order re-opens the stale-writer window" $rc
@@ -255,6 +255,27 @@ mkdir -p "$ARMDIR/o/logs/lane-3331.owner"
 drive "$WT" LANE_DRY_RUN=1
 eqv "$LANE_RC" "0" "2o a dispatch whose owner stamp FAILS still completes the lane"
 has "$(cat "$ARMDIR/o/logs/lane-3331.outcome" 2>/dev/null)" "reason=dry-run" "2p …and still publishes its OWN run-scoped verdict (fail-open, not silence)"
+
+# ── 2q: AN EXTERNALLY CLEARED OWNER FILE MUST NOT SUPPRESS THE VERDICT (review round 7, P2) ────
+# The ownership read is consulted only when it returns a NON-EMPTY token that is not ours. An absent or
+# unreadable `lane-<N>.owner` (a cleaned logs/ directory, a failed dispatch-side write) means nothing is
+# authoritative, so the run re-stamps and publishes — the other direction makes a lane that RAN read as
+# "still working" for ever, which is the failure the whole mechanism exists to prevent.
+mk_arm ownergone; WT="$ARMWT"
+pi() { sleep 5; return 0; }
+export -f pi
+drive_bg "$WT" "$KEYVAR=sk_fixture"
+_i=0
+while [ "$_i" -lt 200 ]; do
+  grep -q '\[agent\] provider=' "$(LOG)" 2>/dev/null && break
+  kill -0 "$LANE_PID" 2>/dev/null || break
+  _i=$((_i + 1)); sleep 0.1
+done
+rm -f "$ARMDIR/o/logs/lane-3331.owner"
+kill -TERM "$LANE_PID" 2>/dev/null
+wait "$LANE_PID" 2>/dev/null
+GONE_OUT="$ARMDIR/o/logs/lane-3331.outcome"
+has "$(cat "$GONE_OUT" 2>/dev/null)" "outcome=died reason=signal:TERM" "2q a lane whose owner file was cleared mid-run STILL publishes its own verdict (an unreadable token is not a deny)"
 
 # ═══ 3. A LANE WHOSE AGENT FAILS ════════════════════════════════════════════════════════════════════
 mk_arm failed; WT="$ARMWT"
