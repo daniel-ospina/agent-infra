@@ -2515,15 +2515,24 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   # does NOT cover the live head, so the answer here is `norecord` — what a reader
   # can act on — never `head`.
   CC_MINT="$(cc_field "$CC_REC" mint)"
-  if [ "${CC_MINT:-}" = "carried" ]; then
+  # ⛔ A `mint:"delta"` RECORD IS A CARRY TOO (#10583 × #10177). `--delta` re-binds a
+  # verdict minted at ANOTHER head exactly as a `carried` record does; the only difference
+  # is how the reviewed head was FOUND (read from the record instead of passed in).
+  # Exempting it would reopen the hole #10177 closed — a reader could not tell a delta that
+  # PROVED the artifact unchanged from one that merely asserted it — so it is held to the
+  # same proof: the arm that proved it, and the review artifact the verdict rests on.
+  # (Records minted by an earlier revision of the delta verb predate `carry_arm`/`evidence`
+  # and are caught by exactly this rule, which is why the rule must not be mint-specific.)
+  case "${CC_MINT:-}" in
+  carried|delta)
     CC_ARM_F="$(cc_field "$CC_REC" carry_arm)"
     CC_EV_F="$(cc_field "$CC_REC" evidence)"
     if [ -z "$CC_ARM_F" ] || [ -z "$CC_EV_F" ]; then
       printf 'norecord\t-\t%s\n' "${DIFF_HASH:--}"
-      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… is a CARRY with NO recorded proof (carry_arm='${CC_ARM_F:-}', evidence='${CC_EV_F:-}') — it asserts a verdict minted at another head without recording which arm proved the artifact unchanged, or what review artifact it rests on. Nothing in it shows it covers the head that would merge, so it is treated as NO RECORD (the shape tortoise#10677 produced: a clean verdict carried across 4 files/+178 with no provenance). Remedy: re-record at the current head and let the recorder's carry arms decide — they refuse when the reviewed artifact moved, and record the proof when it did not: record-review.sh $PR <current head> <same verdict> ${REPO:-owner/repo}" >&2
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… is a CARRY (mint='${CC_MINT}') with NO recorded proof (carry_arm='${CC_ARM_F:-}', evidence='${CC_EV_F:-}') — it asserts a verdict minted at another head without recording which arm proved the artifact unchanged, or what review artifact it rests on. Nothing in it shows it covers the head that would merge, so it is treated as NO RECORD (the shape tortoise#10677 produced: a clean verdict carried across 4 files/+178 with no provenance). Remedy: re-record at the current head and let the recorder's carry arms decide — they refuse when the reviewed artifact moved, and record the proof when it did not: record-review.sh $PR <current head> <same verdict> ${REPO:-owner/repo}" >&2
       exit 4
-    fi
-  fi
+    fi ;;
+  esac
   # The gate's own identity rule (isDiffSha256 in extensions/review-enforcer):
   # full lowercase 64-hex, and NEVER the sha256 of the empty body — that constant
   # would make every record "match" every PR.
@@ -3456,7 +3465,7 @@ PYC4
 # A measurement is NOT a verdict: a `no` here does not itself refuse (the arms
 # refuse) and a `yes` does not itself carry (the arms carry).
 delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
-  local from="$1" to="$2" b="" p2="" mt="" ct="" extra="" pd1="" pd2="" n="" dtmp=""
+  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp=""
   local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
   b="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
   case "$b" in *[!0-9a-f]* | "") b="" ;; esac
@@ -3509,8 +3518,27 @@ delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
     # `head -1 || true`, discarding the status (and `${PIPESTATUS[0]}` cannot recover it inside a
     # command substitution). Capture the OUTPUT, then the STATUS. A conflicted re-merge is a
     # legitimate `no` (that is proof (c)); only a merge-tree that produced NO tree is UNMEASURED.
-    mt_raw="$(command git merge-tree --write-tree "$from" "$p2" 2>/dev/null)"; m_rc=$?
-    mt="$(printf '%s' "$mt_raw" | command head -1)"
+    # ⛔ AND `VAR="$(…)"` IS ONE FAILING COMMAND UNDER `set -e`: a command substitution inside an
+    # assignment propagates its status into `$?`, so the two statements this line used to be
+    # (`mt_raw="$(…)"; m_rc=$?`) let the SHELL abort before `m_rc` was ever read — the second
+    # statement could not run, and `rc=%s` plus this whole `zero-conflict=no … (a RESOLUTION is
+    # authored code)` branch were UNREACHABLE exactly where they were written. MEASURED on a record
+    # naming a NONEXISTENT reviewed head (`git merge-tree` exits 1 with `merge-tree: <sha> - not
+    # something we can merge` and prints no tree oid at all): exit 1 with the
+    # triple truncated after `authored-digest-equal=UNMEASURED(…)`, so `zero-conflict=` and
+    # `no-new-authored-commits=` never printed and an intended refusal came out as a crash. This is the
+    # same `|| rc=$?` idiom clause (D) of `lane_dimension_carry` and the rev-list walk below use. It is
+    # DIAGNOSTIC REACHABILITY ONLY: the arms above remain the decider, and this line's status is
+    # evidence they already acted on — no gate is loosened here.
+    m_rc=0
+    mt_raw="$(command git merge-tree --write-tree "$from" "$p2" 2>/dev/null)" || m_rc=$?
+    # ⛔ NO PIPE HERE, for the reason this file MEASURED at its clean-low reader: under
+    # `set -o pipefail` a `head` that exits after its one line sends SIGPIPE to the writer, the
+    # substitution fails, and `set -e` aborts the script with NO output at all (measured there: 9 of
+    # 40 identical runs produced empty stdout). Here that would delete the very diagnostic the guard
+    # above exists to make reachable. `${x%%$'\n'*}` is the BASH-native first line the file already
+    # uses for this. The other pre-existing `printf … | head` sites in this file are NOT touched here.
+    mt="${mt_raw%%$'\n'*}"
     if [ -z "$mt" ]; then
       printf 'zero-conflict=UNMEASURED(merge-tree produced no tree, rc=%s)\n' "$m_rc"
     elif [ "$mt" = "$ct" ] && [ "$m_rc" -eq 0 ]; then
