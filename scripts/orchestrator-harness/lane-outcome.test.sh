@@ -231,8 +231,30 @@ kill -TERM "$LANE_PID" 2>/dev/null
 wait "$LANE_PID" 2>/dev/null
 has "$(cat "$OWN_OUT" 2>/dev/null)" "reason=dry-run" "2j the older run's late trap does NOT overwrite the current run's verdict (owner token)"
 hasnt "$(cat "$OWN_OUT" 2>/dev/null)" "signal:TERM" "2k …the killed run's verdict never reaches the run-scoped read"
-has "$(cat "$(LOG)" 2>/dev/null)" "another dispatch of #3331 now owns it" "2l …and it SAYS so in the append-only transcript, instead of dropping its own line silently"
+has "$(cat "$(LOG)" 2>/dev/null)" "a LATER dispatch of #3331 owns that file" "2l …and it SAYS so in the append-only transcript (naming a LATER dispatch, which is what it can observe), instead of dropping its own line silently"
 has "$(cat "$(LOG)" 2>/dev/null)" "outcome=died reason=signal:TERM" "2m …while its own outcome= line is still in the log (the transcript keeps every run)"
+
+# ⛔ THE HANDOVER ORDER IS PART OF THE FIX (review round 6, P2, measured). Removing the verdict file BEFORE
+# stamping the token leaves a window in which an older run's trap still matches its own (old) token and writes
+# its verdict back, after which the new dispatch stamps a token without clearing it — the old verdict then
+# reads as the current run's. A timing window cannot be driven deterministically from a shell test, so the
+# ORDER is pinned: the stamp must precede the removal.
+_OWNLN="$(grep -n 'lane-\$N.owner" 2>/dev/null && LANE_OWNER_OK=1' "$LANE" | head -1 | cut -d: -f1)"
+_RMLN="$(grep -n 'rm -f "\$O/logs/lane-\$N.outcome"' "$LANE" | head -1 | cut -d: -f1)"
+{ [ -n "${_OWNLN:-}" ] && [ -n "${_RMLN:-}" ] && [ "$_OWNLN" -lt "$_RMLN" ]; }; rc=$?
+ck "2n the owner token is stamped BEFORE the verdict file is removed (line ${_OWNLN:-?} < ${_RMLN:-?}) — the reverse order re-opens the stale-writer window" $rc
+
+# ── 2o: A FAILED STAMP FAILS OPEN (review round 6, P2) ────────────────────────────────────────────
+# If the token cannot be written (a transient ENOSPC/EACCES), this run must still publish ITS OWN verdict: the
+# alternative is a lane that RAN reading as "still working" for ever because a write failed hours earlier. A
+# DIRECTORY at the .owner path makes the stamp fail deterministically.
+mk_arm ownerfail; WT="$ARMWT"
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi
+mkdir -p "$ARMDIR/o/logs/lane-3331.owner"
+drive "$WT" LANE_DRY_RUN=1
+eqv "$LANE_RC" "0" "2o a dispatch whose owner stamp FAILS still completes the lane"
+has "$(cat "$ARMDIR/o/logs/lane-3331.outcome" 2>/dev/null)" "reason=dry-run" "2p …and still publishes its OWN run-scoped verdict (fail-open, not silence)"
 
 # ═══ 3. A LANE WHOSE AGENT FAILS ════════════════════════════════════════════════════════════════════
 mk_arm failed; WT="$ARMWT"
