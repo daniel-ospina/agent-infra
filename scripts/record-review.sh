@@ -1154,6 +1154,10 @@ FLUSH_PENDING=0
 # is the whole point: a lane that had to remember the old head could not use it).
 DELTA=0
 DELTA_FROM=""
+# #3247 review (P1) — the head the DECIDING ARM actually measured, which is NOT always
+# DELTA_FROM: only `lane` measures from the record's head. Written into the record as
+# `delta.from`, so the pair a reader checks is the pair the proof covers.
+DELTA_MEASURED_FROM=""
 EVIDENCE=""
 # tortoise#7391: what the record carries. Set ONLY by the verification gate below, so a
 # record claims `evidence` only when this run actually read and accepted that
@@ -3258,6 +3262,46 @@ PYC4
 #                             merge commit is not
 # A measurement is NOT a verdict: a `no` here does not itself refuse (the arms
 # refuse) and a `yes` does not itself carry (the arms carry).
+# ── --delta: WHICH PROOF FIELDS AN ARM MAY CLAIM (#3247) ─────────────────────
+# EACH FIELD NAMES THE PREDICATE THAT MEASURED IT -- never the arm that happened
+# to fire. ONE definition, so the writer and a pin cannot drift apart:
+#   `authored_unchanged` is a claim about the AUTHORED DIGEST, measured only by
+#     `patch` (#1377 projection really equal) and `diff` (rendered bytes really
+#     identical).
+#   `conflicts` is a claim about a RE-MERGE, measured ONLY by `lane` (clause D:
+#     merge-tree rc=0 AND the merged tree equals the head's tree). `patch` never
+#     re-merges, and a `diff` delta taken across a REBASED head has no second
+#     parent -- its own triple prints `zero-conflict=UNMEASURED` -- so neither may
+#     claim it. MEASURED as a bug: keying both fields on `patch|diff` wrote
+#     "conflicts":0 beside a triple that said UNMEASURED.
+delta_proof_fields() { # <arm> -> JSON fragment WITH its trailing comma, or empty
+  case "$1" in
+    patch|diff) printf '"authored_unchanged":true,' ;;
+    lane)       printf '"conflicts":0,' ;;
+  esac
+}
+
+# ── --delta: THE HEAD THE DECIDING ARM MEASURED (#3247 review, P1) ───────────
+# The arms do NOT all start from the record's head. `diff` proves the prior
+# signed marker's `diff=` equals the LIVE digest -- the head it measured is that
+# marker's own (DIFF_ARM_SHA) -- and `patch` re-derives BOTH sides from
+# PRIOR_PATCH_SHA. Only `lane` measures from the record's head (DELTA_FROM).
+# Writing `delta.from=DELTA_FROM` beside `authored_unchanged:true` therefore made
+# the signed record assert an authored-unchanged fact about a pair the run NEVER
+# measured -- MEASURED on a stale record plus a peer-signed marker at a later
+# head: the record said `from=<record head> … authored_unchanged:true` while the
+# same run's triple printed `authored-digest-equal=no` and `commits=2`. That is
+# the identical defect class as the `conflicts` one, on the `from` axis, so the
+# record now names the head the proof covers. `carried_from` still records the
+# RECORD's head, so both facts survive and a reader can tell them apart.
+delta_measured_from() { # <arm> <record-head> <diff-arm-sha> <patch-arm-sha>
+  case "$1" in
+    diff)  [ -n "$3" ] && { printf '%s' "$3"; return 0; } ;;
+    patch) [ -n "$4" ] && { printf '%s' "$4"; return 0; } ;;
+  esac
+  printf '%s' "$2"
+}
+
 delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
   local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp=""
   local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
@@ -3619,8 +3663,13 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         fi
       fi
       if [ "$DELTA" -eq 1 ]; then
-        echo "DELTA-TRIPLE($REPO#$PR) from=${DELTA_FROM:0:12}… to=${CURRENT_HEAD:0:12}…" >&2
-        delta_measure "$DELTA_FROM" "$CURRENT_HEAD" >&2
+        # ⛔ MEASURE AND REPORT THE PAIR THE ARM PROVED (#3247 review, P1). `delta_measured_from`
+        # names the head the decider actually measured (see its definition), so the triple below is
+        # evidence for the SAME pair the record will claim -- and the record write at the bottom of
+        # this file uses the same function, so the diagnostic and the signed artifact cannot diverge.
+        DELTA_MEASURED_FROM="$(delta_measured_from "$CARRY_ARM" "$DELTA_FROM" "$DIFF_ARM_SHA" "$PATCH_ARM_SHA")"
+        echo "DELTA-TRIPLE($REPO#$PR) from=${DELTA_MEASURED_FROM:0:12}… to=${CURRENT_HEAD:0:12}… (arm=$CARRY_ARM)" >&2
+        delta_measure "$DELTA_MEASURED_FROM" "$CURRENT_HEAD" >&2
         echo "DELTA-ARM=$CARRY_ARM (the arm above is the decider; the triple is the evidence it decided on)" >&2
       fi
       if [ "$CARRY_ARM" = "diff" ]; then
@@ -4081,15 +4130,19 @@ if [ -n "$CARRY_ARM" ]; then
   # rendered patch may legitimately differ, so `authored-digest-equal` prints `no`/`UNMEASURED`
   # there. So `proved` states which dimension carried.
   # EACH FIELD NAMES THE PREDICATE THAT MEASURED IT -- never the arm that happened to fire.
-  # `authored_unchanged` is a claim about the AUTHORED DIGEST: only the `patch` arm (#1377
-  # projection equal) and the `diff-bytes` arm (rendered bytes identical) measure it. `conflicts`
-  # is a claim about a RE-MERGE: only the `lane` predicate recomputes one (clause D -- merge-tree
-  # rc=0 AND the merged tree equals the head's tree). The first cut keyed BOTH fields on
-  # `patch|diff`, and MEASURED that is a lie in one direction: a `diff`-arm delta taken across a
-  # REBASED head (no second parent, so the same run's triple prints `zero-conflict=UNMEASURED`)
-  # wrote "conflicts":0 -- a positive claim the run never made, in the very field added to stop
-  # the record overclaiming. The `patch` arm does not re-merge either, so it claims no conflicts
-  # fact. `proved` always names the dimension that carried.
+  # The mapping itself now lives in ONE place, `delta_proof_fields` (defined beside the delta
+  # helpers above), so the writer and its pin cannot drift: `authored_unchanged` is a claim about
+  # the AUTHORED DIGEST (only `patch`/`diff` measure it) and `conflicts` is a claim about a
+  # RE-MERGE (only `lane` recomputes one, clause D). Keying BOTH on `patch|diff` was MEASURED as
+  # a lie in one direction -- a `diff`-arm delta across a REBASED head prints
+  # `zero-conflict=UNMEASURED` in its own triple while the record asserted `"conflicts":0`.
+  # ⛔ AND THE SAME RULE APPLIES TO `from`, not just to these two fields (#3247 review, P1):
+  # the arms do not all measure from the RECORD's head, so `from` is
+  # `${DELTA_MEASURED_FROM:-$DELTA_FROM}` -- set by `delta_measured_from` on the arm that
+  # actually carried. Writing the record's head there made a signed record claim an
+  # authored-unchanged fact about a pair the run never measured (MEASURED: triple said
+  # `authored-digest-equal=no commits=2` while the record said `authored_unchanged:true`).
+  # `proved` always names the dimension that carried; `carried_from` keeps the RECORD's head.
   if [ "$DELTA" -eq 1 ]; then
     DIMENSION="none"
     case "$CARRY_ARM" in
@@ -4097,14 +4150,8 @@ if [ -n "$CARRY_ARM" ]; then
       patch) DIMENSION="patch";;
       diff) DIMENSION="diff-bytes";;
     esac
-    DELTA_PROOF=""
-    case "$CARRY_ARM" in
-      patch|diff) DELTA_PROOF="\"authored_unchanged\":true,";;
-    esac
-    case "$CARRY_ARM" in
-      lane) DELTA_PROOF="${DELTA_PROOF}\"conflicts\":0,";;
-    esac
-    MINT_FIELDS="\"mint\":\"delta\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"delta\":{\"from\":\"$DELTA_FROM\",\"to\":\"$SHA\",\"proved\":\"$DIMENSION\",${DELTA_PROOF}\"arm\":\"$CARRY_ARM\"},"
+    DELTA_PROOF="$(delta_proof_fields "$CARRY_ARM")"
+    MINT_FIELDS="\"mint\":\"delta\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"delta\":{\"from\":\"${DELTA_MEASURED_FROM:-$DELTA_FROM}\",\"to\":\"$SHA\",\"proved\":\"$DIMENSION\",${DELTA_PROOF}\"arm\":\"$CARRY_ARM\"},"
   fi
 fi
 EVIDENCE_FIELD=""
