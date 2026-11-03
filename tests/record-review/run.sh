@@ -2239,13 +2239,26 @@ SH
     PM_BODY="$2" PM_PATCH_LOG="$3" HOME="$PMH" PATH="$PMB:$PATH" \
       bash -c 'set -uo pipefail; . "$1"; post_marker owner/repo 42 "$2"; printf "%s" "$?"' _ "$1" "MARKER-LINE-42" 2>/dev/null
   }
+  # ⛔ 1050 LINES, NOT 1200, AND THE BOUND IS NOT THE PIPE — IT IS `MAX_ARG_STRLEN`. `pm_drive` hands
+  # the body to the child as ONE environment string, and Linux caps a single arg/env string at 131,072
+  # bytes; a 1200-line body is 145,214 and the child never starts, so (32c)/(32d)/(32e) fail for a
+  # reason that has nothing to do with `post_marker` (measured in a Linux container: "Argument list too
+  # long"). Passing it by file would NOT dodge this either — `post_marker` also hands the patched body
+  # to `jq -n --arg body`, argv under the same cap. So the fixture must sit in the window ABOVE the
+  # 64 KiB pipe capacity and BELOW 131,072: 1050 lines x 120 chars ≈ 127 KB. Both bounds are asserted
+  # below, so this cannot silently drift out of the window.
   filler="$(printf 'x%.0s' $(seq 1 120))"
-  pm_big="$(for _i in $(seq 1 1200); do printf '%s\n' "$filler"; done)"
+  pm_big="$(for _i in $(seq 1 1050); do printf '%s\n' "$filler"; done)"
   pm_with_marker="$(printf '%s\n%s\n' "MARKER-LINE-42" "$pm_big")"
   pm_bytes=${#pm_with_marker}
-  [ "$pm_bytes" -gt 65536 ] \
-    && pass "(32b) the fixture body is BIGGER than a 64 KiB pipe buffer ($pm_bytes bytes) — smaller and the pipe arm cannot be reached" \
-    || fail "(32b) the fixture body is only $pm_bytes bytes; below the pipe capacity the pre-fix form would pass too"
+  # BOTH bounds. Too small and the SIGPIPE window never opens (the arm passes vacuously); too large and
+  # the child cannot even be exec'd on Linux (MAX_ARG_STRLEN = 131,072), which reds the arm for a reason
+  # that is not the code under test — measured, not hypothesised.
+  if [ "$pm_bytes" -gt 65536 ] && [ "$pm_bytes" -lt 131072 ]; then
+    pass "(32b) the fixture body is $pm_bytes bytes — ABOVE the 64 KiB pipe buffer (or the SIGPIPE window never opens) and BELOW Linux's 131,072-byte MAX_ARG_STRLEN (or the driver cannot exec at all)"
+  else
+    fail "(32b) the fixture body is $pm_bytes bytes — it must be in the window (65536, 131072): below it the pre-fix form passes too, above it the child cannot be exec'd on Linux"
+  fi
   # (32c) NON-VACUITY: the PRE-FIX form, same body, must re-patch.
   : > "$TMP/pm-old.log"
   pm_drive "$TMP/pm-old.sh" "$pm_with_marker" "$TMP/pm-old.log" >/dev/null
