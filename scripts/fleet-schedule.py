@@ -1048,7 +1048,15 @@ def acquire_lock(label):
                 # running" for ever, and nothing would ever unlink it. So on ANY failure here we
                 # remove the file ourselves (we created it in this iteration, so it is provably
                 # ours) before propagating.
-                os.write(fd, ("%d\n" % os.getpid()).encode())
+                # ⛔ `os.write` RETURNS A COUNT. A short write (ENOSPC/EINTR/SIGPIPE on a dying
+                # filesystem) leaves a TRUNCATED pid in a lock WE created — measured: the file held
+                # `"3"`, which parses as pid 3 and is alive, so the probe refused the lock forever.
+                # Ignoring the return value made that wedge invisible at the one place we can see it.
+                payload = ("%d\n" % os.getpid()).encode()
+                written = os.write(fd, payload)
+                if written != len(payload):
+                    raise OSError(5, "short write to %s (%d of %d bytes)"
+                                  % (path, written, len(payload)))
                 os.close(fd)
             except OSError:
                 try:
@@ -1099,7 +1107,15 @@ def acquire_lock(label):
             try:
                 cur = os.stat(path)
             except FileNotFoundError:
-                continue
+                # Same reasoning: one unreliable filesystem can answer ENOENT for a file it holds.
+                # A second ENOENT is a real deletion (the loop re-creates the lock); anything else
+                # resolves to OURS, which cannot wedge.
+                try:
+                    cur = os.stat(path)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return path
             except OSError:
                 cur = None
             if cur is None:
@@ -1123,7 +1139,25 @@ def acquire_lock(label):
                     with open(path, "rb") as fh:
                         mine = fh.read(64).decode("ascii", "replace").strip()
                 except FileNotFoundError:
-                    continue          # the path is GONE — provably not ours; the loop re-creates
+                    # ⛔ ENOENT FROM THE READ IS NOT PROOF EITHER, because the STAT that just
+                    # failed already told us this filesystem is answering unreliably — and
+                    # ESTALE→ENOENT is the textbook pair on a dying mount. Measured: stat EIO/ESTALE
+                    # then open→ENOENT `continue`d, leaving the lock on disk holding OUR live pid,
+                    # and the next pass (faults lifted) still returned None — the identical wedge.
+                    # Re-ask ONCE: a genuine deletion still answers ENOENT and we re-create it; an
+                    # unreliable answer resolves to ours (KEEP), which cannot wedge.
+                    try:
+                        again = os.stat(path)
+                    except FileNotFoundError:
+                        continue      # really gone, twice over — the loop re-creates it
+                    except OSError:
+                        mine = str(os.getpid())   # still undeterminable → KEEP (cannot wedge)
+                    else:
+                        mine = (str(os.getpid())
+                                if (again.st_dev, again.st_ino) == (own.st_dev, own.st_ino)
+                                else None)
+                        if mine is None:
+                            continue  # the replacement is provably not ours
                 except OSError:
                     mine = None       # undeterminable — fall through to KEEP (see above)
                 # ⛔ AN EMPTY READ IS NOT "PROVABLY FOREIGN" — it is another undeterminable. `read`

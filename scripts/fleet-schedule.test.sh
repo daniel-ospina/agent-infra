@@ -2423,6 +2423,9 @@ def run(name, read_behaviour):
             if read_behaviour == "empty":
                 fh = real_open(p, *a, **k)
                 return EmptyRead(fh)
+            if read_behaviour == "enoent":
+                # the ONE-SHOT lie a dying mount tells: ENOENT for a file that is still there
+                raise FileNotFoundError(2, "No such file or directory")
         return real_open(p, *a, **k)
     import builtins
     os.stat = bad_stat
@@ -2452,7 +2455,12 @@ def run(name, read_behaviour):
     # ⛔ NOT "the content looks like our pid" — THIS process wrote that pid, so that clause can
     # never fail and would make the case vacuous (measured: it stayed green on a wedging mutant).
     # The invariant is the one that matters to a job: this process must still be able to acquire it.
-    okish = bool(first) and bool(second)   # acquired, released, re-acquired
+    # ⛔ `second` IS NOT THE INVARIANT. The harness unlinks the lock first, so re-acquiring is
+    # trivially true and `bool(first) and bool(second)` reduced to `bool(first)` — measured: it was
+    # True in every run, including rows where the code had left a wedge on disk. The invariant that
+    # a job actually feels is "THIS ATTEMPT DID NOT LEAVE ME LOCKED OUT", i.e. the acquire returned a
+    # path; `second` is kept only as a smoke check that the lifecycle still works afterwards.
+    okish = bool(first) and bool(second)   # first is the invariant; second is a smoke check
     print("%-8s first=%-5s second=%-5s content=%r %s"
           % (read_behaviour, bool(first), bool(second), held_content,
              "USABLE" if okish else "WEDGED"))
@@ -2461,9 +2469,10 @@ run("ok", "ok")
 run("eacces", "eacces")
 run("eio", "eio")
 run("empty", "empty")
+run("enoent", "enoent")
 PY18S
 )"
-for shape in ok eacces eio empty; do
+for shape in ok eacces eio empty enoent; do
   grep -qE "^$shape .*USABLE" <<<"$out18s" \
     && ok "18s(stat-fail + read-$shape) leaves the lock USABLE (no wedge)" \
     || bad "18s(stat-fail + read-$shape) WEDGED the job: $(grep -E "^$shape " <<<"$out18s")"
@@ -2516,6 +2525,145 @@ PYMUTSR
 grep -q 'MUTATION RED' <<<"$mout18s" \
   && ok "18s MUTATION (fail-'closed' to not-ours) WEDGES the job — the case discriminates" \
   || bad "18s MUTATION stayed usable, so the case grades nothing: $mout18s"
+
+
+# 18t — THE TWO GUARDS THAT WERE CORRECT BUT GRADED BY NOTHING. Both were added in the same commit
+# as 18s and neither could redden: the short-write check (no case patched `os.write` to a short
+# count) and the stat-ENOENT re-ask (18p(b) builds a GENUINE deletion, which passes identically with
+# and without the re-ask). A guard no case can fail is the class this file exists to prevent, so
+# each is driven here WITH its own mutation.
+#   (a) a SHORT `os.write` leaves a TRUNCATED pid in a lock we created — "3" parses as a live pid, so
+#       the probe refuses the lock forever. The create leg must raise and leave nothing behind.
+#   (b) a filesystem that answers ENOENT for a file it still holds (ESTALE→ENOENT) must not be
+#       believed on ONE answer; the re-ask keeps our own lock instead of abandoning it.
+out18t="$(python3 - "$SCHED" "$T/state18t" <<'PY18T' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18t", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = sys.argv[2]
+real_write, real_stat, real_open = os.write, os.stat, open
+
+def short_write(name):
+    d = os.path.join(base, name); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+    m.STATE = d
+    path = os.path.join(d, "locks", "sw.lock")
+    def one_byte(fd, data):
+        return real_write(fd, data[:1])          # a real short write, not an exception
+    os.write = one_byte
+    try:
+        raised = None
+        try:
+            r = m.acquire_lock("sw")
+        except OSError as exc:
+            raised = exc; r = None
+    finally:
+        os.write = real_write
+    left = os.path.exists(path)
+    content = None
+    if left:
+        try: content = real_open(path).read().strip()
+        except OSError: content = "unreadable"
+    print("SHORTWRITE raised=%s left=%s content=%r result=%r"
+          % (type(raised).__name__ if raised else None, left, content, r))
+
+def enoent_lie(name):
+    d = os.path.join(base, name); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+    m.STATE = d
+    path = os.path.join(d, "locks", "lie.lock")
+    st = {"n": 0}
+    def lying_stat(p, *a, **k):
+        if os.path.abspath(str(p)) == os.path.abspath(path) and st["n"] == 0:
+            st["n"] += 1
+            raise FileNotFoundError(2, "No such file or directory")   # the lie
+        return real_stat(p, *a, **k)
+    os.stat = lying_stat
+    try:
+        r = m.acquire_lock("lie")
+    finally:
+        os.stat = real_stat
+    content = None
+    if os.path.exists(path):
+        try: content = real_open(path).read().strip()
+        except OSError: content = "unreadable"
+    print("ENOENTLIE result=%s content=%r" % (bool(r), content))
+
+short_write("a")
+enoent_lie("b")
+PY18T
+)"
+grep -qE '^SHORTWRITE raised=OSError left=False' <<<"$out18t" \
+  && ok "18t(a) a short write raises and leaves NO truncated-pid lock" \
+  || bad "18t(a) a short write did not raise-and-clean: $(grep '^SHORTWRITE' <<<"$out18t")"
+grep -q '^ENOENTLIE result=True' <<<"$out18t" \
+  && ok "18t(b) a one-shot ENOENT lie from the stat does not abandon our own lock" \
+  || bad "18t(b) believed a one-shot ENOENT and abandoned the lock: $(grep '^ENOENTLIE' <<<"$out18t")"
+
+# MUTATIONS — each guard removed must redden its own arm.
+MUT18TA="$T/mut-18ta.py"; MUT18TB="$T/mut-18tb.py"
+python3 - "$SCHED" "$MUT18TA" "$MUT18TB" <<'PYMUTT'
+import sys
+src = open(sys.argv[1]).read()
+# (a) drop the short-write check
+a_old = ('                written = os.write(fd, payload)\n'
+         '                if written != len(payload):\n')
+assert a_old in src, "18t(a) mutation target moved"
+a_new = ('                written = os.write(fd, payload)\n'
+         '                if False:\n')
+open(sys.argv[2], "w").write(src.replace(a_old, a_new, 1))
+# (b) trust a single ENOENT from the stat again
+b_old = ('            except FileNotFoundError:\n'
+         '                # Same reasoning: one unreliable filesystem can answer ENOENT for a file it holds.\n')
+assert b_old in src, "18t(b) mutation target moved"
+b_new = ('            except FileNotFoundError:\n'
+         '                continue  # PRE-FIX: trust one ENOENT\n'
+         '                # Same reasoning: one unreliable filesystem can answer ENOENT for a file it holds.\n')
+open(sys.argv[3], "w").write(src.replace(b_old, b_new, 1))
+PYMUTT
+mout18ta="$(python3 - "$MUT18TA" "$T/state18ta" <<'PYMUTTA' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("m18ta", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True); m.STATE = d
+path = os.path.join(d, "locks", "sw.lock")
+real_write, real_open = os.write, open
+os.write = lambda fd, data: real_write(fd, data[:1])
+try:
+    raised = None
+    try: r = m.acquire_lock("sw")
+    except OSError as exc: raised = exc; r = None
+finally: os.write = real_write
+left = os.path.exists(path)
+content = None
+if left:
+    try: content = real_open(path).read().strip()
+    except OSError: content = "unreadable"
+print("MUTATION %s raised=%s left=%s content=%r" % ("RED" if not (raised and not left) else "still-clean",
+      type(raised).__name__ if raised else None, left, content))
+PYMUTTA
+)"
+grep -q 'MUTATION RED' <<<"$mout18ta" \
+  && ok "18t(a) MUTATION (short-write check removed) leaves a truncated-pid lock — discriminates" \
+  || bad "18t(a) MUTATION stayed clean, so the case grades nothing: $mout18ta"
+mout18tb="$(python3 - "$MUT18TB" "$T/state18tb" <<'PYMUTTB' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("m18tb", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True); m.STATE = d
+path = os.path.join(d, "locks", "lie.lock")
+real_stat, real_open = os.stat, open
+st = {"n": 0}
+def lying(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path) and st["n"] == 0:
+        st["n"] += 1
+        raise FileNotFoundError(2, "No such file or directory")
+    return real_stat(p, *a, **k)
+os.stat = lying
+try: r = m.acquire_lock("lie")
+finally: os.stat = real_stat
+print("MUTATION %s result=%s" % ("RED" if not r else "still-holds", bool(r)))
+PYMUTTB
+)"
+grep -q 'MUTATION RED' <<<"$mout18tb" \
+  && ok "18t(b) MUTATION (one ENOENT trusted) abandons our own lock — discriminates" \
+  || bad "18t(b) MUTATION still holds, so the case grades nothing: $mout18tb"
 
 
 echo
