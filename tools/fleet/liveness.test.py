@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Forty-eight tests with sixty-four paired mutations: every mutation re-
+Forty-nine tests with sixty-seven paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 31 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (64)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (67)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1796,9 +1796,9 @@ def t41():
             # ⛔ `alive=2` is NOT READ — it used to decode as a POSITIVE False, i.e. a
             # death witness manufactured out of an unreadable field.
             "12\t%s\t0\t0\t\t2\t3000000\t9\t0" % log,
-            # ⛔ an unrecognised `transcript_grew` token is not a flat `False` either:
-            # with the log delta UNREAD, a token read as `False` would leave both output
-            # signals "flat" and convict the lane.
+            # ⛔ an unrecognised `transcript_grew` token must not decode as a flat `False`
+            # (the same `_tri` allow-list row 12 pins for `alive`); with the byte channel
+            # unread the row abstains either way, so ROW 12 is what discriminates it.
             "13\t%s\t?\t0\t\t1\t3000000\t9\tmaybe" % log,
             "14\t%s\t0\t0\tfinished\t0\t3000000\t412\t\t0" % log,
             "15\t-\t?\t?\t\t?\t?\t?\t?",
@@ -1952,6 +1952,16 @@ def t43():
                      % (dead, log))
         lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
         check(lr.verdict == "finished", "a bound verdict IS adopted; got %r" % (lr.verdict,))
+        # …an UNUSABLE pid token (5000 digits: int() would raise "Exceeds the limit") is
+        # DROPPED, never adopted and never an exception.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%s rc=0\n"
+                     % ("9" * 5000))
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check(lr.verdict == "", "an unusable pid token is dropped; got %r" % (lr.verdict,))
+        check("unbound-bound-verdict" in lr.detail, "and named; got %r" % lr.detail)
+        check("invalid-bound-verdict-pid" not in lr.detail,
+              "the CAP is what dropped it, not the fallback guard; got %r" % lr.detail)
         # …and one with NO `pid=` at all is adopted but declared unbound.
         with open(log, "w", encoding="utf-8") as fh:
             fh.write("[lane-bound] VERDICT verdict=finished tag=lane rc=0\n")
@@ -2115,12 +2125,40 @@ def t48():
         check("Traceback" not in out, "a `?` pid must not abort the census; got %r" % out)
         check("finished" not in out, "and must not publish a state; got %r" % out)
 
+        # an unusable pid token (5000 digits) must not raise out of int() either
+        rc, out = census("%s\t%s\t0\t?\tfinished\t0\t999999\t%d\t?\t0\t1\n"
+                         % ("9" * 5000, log, size))
+        check("Traceback" not in out, "an unusable pid token must not abort; got %r" % out[:200])
+        check("finished" not in out, "and must not publish a state; got %r" % out[:200])
         # A 10-column row carries no `verdict_pid`, so the adoption must be DECLARED.
         rc, out = census("123456\t%s\t0\t?\tfinished\t0\t999999\t%d\t?\t0\n" % (log, size))
         check("bound-verdict-without-pid" in out,
               "an unbound adoption is declared on the census surface; got %r" % out)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T49 the no-progress abstention names the FACT, not only the class")
+
+
+def t49():
+    lr = liv.LogRead(readable=True, present=True, path="/x", size_delta=-990,
+                     cpu_delta_cs=0, transcript_grew=None, alive=True,
+                     age_ms=liv.LOG_FREEZE_MS + 1000, window_ms=liv.LOG_WINDOW_MS)
+    v = liv.evaluate(liv.Evidence(log_read=lr))
+    check(v.state == "unknown", "a broken byte read abstains; got %s" % v.state)
+    check("bytes_delta=-990" in v.detail,
+          "and the detail names WHAT was broken; got %r" % v.detail)
+    # The census's `?` row is the same shape and must be equally legible.
+    lr = liv.LogRead(readable=True, present=True, path="/x", size_delta=None,
+                     cpu_delta_cs=0, transcript_grew=None, alive=True,
+                     age_ms=liv.LOG_FREEZE_MS + 1000, window_ms=liv.LOG_WINDOW_MS)
+    v = liv.evaluate(liv.Evidence(log_read=lr))
+    check("bytes_delta=" in v.detail, "an unread field is named too; got %r" % v.detail)
+    # `"\u00b2".isdigit()` is True but `int("\u00b2")` raises; the contract here is None.
+    for bad in ("\u00b2:00", "1:\u00b200", "\u00b2-01:00:00", "0:00.\u00b2"):
+        check(liv._cpu_time_cs(bad) is None,
+              "a non-ASCII digit is unreadable, not an exception: %r" % bad)
 
 
 class Mutation:
@@ -2559,6 +2597,26 @@ MUTATIONS = [
         "the true one (`absent:<path>` lost)",
     ),
     Mutation(
+        "T43", "module",
+        '    return pids[-1] if len(pids[-1]) <= 10 else "?"',
+        '    return pids[-1]',
+        "an unbounded digit token reaches int() and raises, so a lane log line aborts the "
+        "`--log` surface instead of dropping to the fail-closed abstention",
+    ),
+    Mutation(
+        "T48", "module",
+        '                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10',
+        '                return (tok if tok.isascii() and tok.isdigit()',
+        "a census row with an unbounded pid token raises in int() and takes the whole "
+        "run down after printing only the rows before it",
+    ),
+    Mutation(
+        "T49", "module",
+        '    if not 1 <= len(fields) <= 3 or not all(f.isascii() and f.isdigit() for f in fields):',
+        '    if not 1 <= len(fields) <= 3 or not all(f.isdigit() for f in fields):',
+        "a non-ASCII digit passes .isdigit() and raises in int(), where _cpu_time_cs' "
+        "contract is None on an unreadable read (the Mac `ps` path)",
+    ),    Mutation(
         "T46", "module",
         '            if lr.verdict:',
         '            if False:',
@@ -2569,13 +2627,13 @@ MUTATIONS = [
         "T47", "module",
         '                 and lr.transcript_grew is not True)',
         '                 and lr.transcript_grew is None)',
-        "a NEGATIVE byte delta is read as no-output, so a log that was just truncated or "
-        "rotated freezes a lane that is working",
+        "a NEGATIVE byte delta is read as a FLAT reading instead of a broken one, so a log "
+        "that was just truncated or rotated freezes a lane that is working",
     ),
     Mutation(
         "T48", "module",
-        '                return tok if tok.isascii() and tok.isdigit() else ""',
-        '                return tok',
+        '                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10',
+        '                return (tok if tok.isascii() and tok.isdigit()',
         "int('?') raises, so one unreadable census row aborts the WHOLE run with a "
         "traceback after printing only the rows before it",
     ),

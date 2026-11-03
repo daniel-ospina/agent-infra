@@ -1136,7 +1136,15 @@ def parse_bound_pid(text: str):
     line_end = text.find("\n", last.start())
     line = text[last.start(): line_end if line_end >= 0 else len(text)]
     pids = _bound_pid_re().findall(line.split(" log=")[0])
-    return pids[-1] if pids else ""
+    # A pid is <= 7 digits (PID_MAX_DEFAULT 4194304). A longer token is not a pid, and
+    # `int()` on it raises "Exceeds the limit (4300 digits)" — an exception, not a state.
+    if not pids:
+        return ""
+    # A pid is <= 7 digits (PID_MAX_DEFAULT 4194304). A longer token is NOT a pid, and
+    # `int()` on it raises "Exceeds the limit (4300 digits)" — an exception, not a state.
+    # `"?"` marks "present but unusable", which the binding DROPS; `""` means "the line
+    # names no incarnation", which is ADOPTED and declared.
+    return pids[-1] if len(pids[-1]) <= 10 else "?"
 
 
 def _pid_within(root: int, child: int, *, hops: int = 64):
@@ -1245,8 +1253,17 @@ def _bind_verdict(lr: "LogRead", pid: int):
     home.
     """
     line_pid = lr.verdict_line_pid
+    if line_pid == "?":
+        return ("unbound-bound-verdict line_pid=? query_pid=%s source=%s"
+                % (pid, lr.verdict_source), "")
     if not line_pid:
         return None, "bound-verdict-without-pid source=%s" % (lr.verdict_source or "log")
+    # DEFENCE IN DEPTH, and it must be DISTINGUISHABLE from the cap above: a token that is
+    # not a pid at all is dropped with its own reason, so a caller that bypasses
+    # `parse_bound_pid` cannot turn the drop into an `int()` exception.
+    if not (line_pid.isascii() and line_pid.isdigit() and len(line_pid) <= 10):
+        return ("invalid-bound-verdict-pid line_pid=%s source=%s"
+                % (line_pid[:16], lr.verdict_source), "")
     within = _pid_within(int(pid), int(line_pid))
     if within is False:
         return ("stale-bound-verdict line_pid=%s query_pid=%s source=%s"
@@ -1368,7 +1385,15 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
     # The census seam can be handed one in field 3, so the check lives here too.
     no_cpu = (lr.cpu_unreadable or lr.cpu_delta_cs is None or lr.cpu_delta_cs < 0)
     if no_output or no_cpu:
-        return Verdict("unknown", "no-progress-signal-readable", detail=lr.detail)
+        # The reason names the CLASS; the detail must name the FACT, or a reader cannot
+        # tell a rotated log from a failed `ps` read from a caller's `?`, while the two
+        # neighbouring branches both print their numbers.
+        return Verdict("unknown", "no-progress-signal-readable",
+                       detail=("bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s "
+                               "cpu_unreadable=%s window_ms=%d"
+                               % (_n(lr.size_delta), _n(lr.transcript_grew),
+                                  _n(lr.cpu_delta_cs), int(bool(lr.cpu_unreadable)),
+                                  lr.window_ms)) + _also(lr.detail))
     if lr.age_ms is None:
         return Verdict("unknown", "log-age-unreadable", detail=lr.detail)
 
@@ -2262,17 +2287,20 @@ def _cpu_time_cs(text: str) -> Optional[int]:
     body = text.strip()
     if "-" in body:
         d, _, body = body.partition("-")
-        if not d.isdigit():
+        if not (d.isascii() and d.isdigit()):
             return None
         days = int(d)
     frac = 0
     if "." in body:
         body, _, f = body.partition(".")
-        if not f.isdigit():
+        if not (f.isascii() and f.isdigit()):
             return None
         frac = int((f + "00")[:2])
     fields = body.split(":")
-    if not 1 <= len(fields) <= 3 or not all(f.isdigit() for f in fields):
+    # `.isdigit()` admits non-ASCII digits (`\u00b2`), which `int()` then REJECTS —
+    # so the guard passed and the parse raised, where this function's contract is
+    # `None` on an unreadable read (and `subtree_cpu_cs` promises the same).
+    if not 1 <= len(fields) <= 3 or not all(f.isascii() and f.isdigit() for f in fields):
         return None
     vals = [int(f) for f in fields]
     if len(vals) == 1:
@@ -2624,7 +2652,8 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # before it (measured: `?\t<log>\t0\t?\tfinished\t...` -> ValueError, rc=1).
             def _num(idx):
                 tok = f[idx].strip() if idx < len(f) else ""
-                return tok if tok.isascii() and tok.isdigit() else ""
+                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10
+                        else "")
 
             verdict_pid = _num(10)
             row_pid = _num(0)
