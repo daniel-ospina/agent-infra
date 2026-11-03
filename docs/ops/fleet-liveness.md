@@ -1573,7 +1573,7 @@ reader can mistake `finished` for a transcript state.
 |---|---|---|
 | `working` **(`progress:<signal>`)** | the tree is alive **and** work was OBSERVED | at least one progress signal advanced inside the sample window |
 | `working` **(`within-window`)** | the tree is alive and nothing is happening **yet** | every signal flat, but for less than `LOG_FREEZE_MS`. This is NOT positive liveness evidence — it is the fleet's normal resting state — so a consumer must not read `working` as "something happened" without looking at `reason` |
-| `frozen` | the tree is alive **and nothing is happening** | **ZERO progress on EVERY signal** for the full `LOG_FREEZE_MS` window, which is echoed in `detail` as `freeze_ms=` — and named SEPARATELY from `window_ms=`, the sample span the deltas were taken over, so a machine reader can always tell which window it received |
+| `frozen` | the tree is alive **and nothing is happening** | **ZERO progress on EVERY signal** — the log's silence for the full `LOG_FREEZE_MS` window, CPU over the `LOG_WINDOW_MS` sample — with the freeze window echoed in `detail` as `freeze_ms=` and named SEPARATELY from `window_ms=`, the sample span the deltas were taken over, so a machine reader can always tell which window it received |
 | `finished` | the tree is **gone** and the lane **completed** | positive identity evidence of absence + `verdict=finished` **with `rc=0` or `rc=na`** |
 | `no-verdict` | the tree is **gone** and the lane **told us nothing** | positive identity evidence of absence + no recognisable verdict |
 | `dead` | the tree is gone **because the bound killed it** | `verdict=stalled` / `verdict=exceeded-wallclock` |
@@ -1598,18 +1598,38 @@ is STALLED (both signals flat)"*.
 
 | signal | reading | why it is the signal |
 |---|---|---|
-| **S2 — CPU delta on the lane's process TREE** (load-bearing) | cumulative CPU of the pid **and every descendant**, two readings `LOG_WINDOW_MS` apart, compared strictly above `LOG_CPU_TOL_CS` | **this is the one that survives a long silent tool call**: a tool that prints nothing still burns CPU. Measured, tortoise #5387: 1203 s of silence at `toolCpuAdvanced=true`, **154 CPU-seconds burned**. A `pi` parked in `ep_poll` reads exactly 0 |
+| **S2 — CPU delta on the lane's process TREE** (load-bearing) | cumulative CPU of the pid **and every descendant**, two readings `LOG_WINDOW_MS` apart, compared strictly above `LOG_CPU_TOL_CS`. Read from **`/proc`** (Linux) at `SC_CLK_TCK`, with `ps -axo pid=,ppid=,time=` as the BSD/macOS fallback | **this is the one that survives a long silent tool call**: a tool that prints nothing still burns CPU. Measured, tortoise #5387: 1203 s of silence at `toolCpuAdvanced=true`, **154 CPU-seconds burned**. A `pi` parked in `ep_poll` reads exactly 0 |
 | **S1 — log BYTE size** (corroborating veto) | `wc -c` delta across the window | `lane-bound.sh` contracts on it, so it is kept — but it is *insufficient alone*, which is the whole defect. It can only ever turn flat→working, never working→flat |
 | **S1b — TRANSCRIPT growth** | the session JSONL's size delta, when the lane has one (`--no-session` lanes do not) | the signal a session-bearing lane already gets (§3); `None` here is "no transcript", an abstention on this signal, never a flat one |
 
-**Resolution, measured on this host: `LOG_WINDOW_MS` = 30 s (`LANE_REAP_WINDOW`) with
-`LOG_CPU_TOL_CS` = 10 cs (`LANE_REAP_CPU_TOL_CS`) resolves S2 to 0.10 CPU-seconds per 30 s
-(≈3.3 mCPU).** `LOG_FREEZE_MS` = 45 min is `LANE_REAP_LIVE_MIN`'s existing value — already the
+**Resolution, measured — TWO floors, both stated because they differ by 10x:**
+
+| source | floor | measured |
+|---|---|---|
+| `/proc/<pid>/stat` `utime`+`stime` (Linux) | **1 cs** (`SC_CLK_TCK` = 100 Hz) | a 0.65 s CPU burn reads 65 cs |
+| GNU `ps -o time=` | **whole seconds** | procps-ng 4.0.4: 0.65 s of CPU prints `00:00:00`, 1.2 s prints `00:00:01` |
+| BSD/macOS `ps -o time=` | `MM:SS.cc` | `0:00.50` |
+
+So on Linux, `LOG_WINDOW_MS` = 30 s (`LANE_REAP_WINDOW`) with `LOG_CPU_TOL_CS` = 10 cs
+(`LANE_REAP_CPU_TOL_CS`) resolves S2 to **0.10 CPU-seconds per 30 s (about 3.3 mCPU)**. Where only a
+whole-second `ps` is available the floor is **1.0 CPU-s per window (about 33 mCPU)** — a lane burning
+under ~3 % of a core reads flat there, which is why `/proc` is preferred and why the tolerance alone
+is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is `LANE_REAP_LIVE_MIN`'s existing value — already the
 reviewed bound for "log advanced ⇒ live", chosen above `lane.sh`'s 2400 s wall limit — reused so one
 number answers one question instead of a second, unreviewed one.
 
+**A NEGATIVE DELTA IS A BROKEN READING, NOT A FLAT ONE.** A stable subtree cannot *lose* CPU, so a
+negative delta means one of the two reads was incomplete (a child exited between the samples, a
+truncated read, a root row that vanished mid-stream). It ABSTAINS (`no-progress-signal-readable`) —
+the identical rule `lane-reap.sh` states for its own two-sample CPU gate. Measured with real `ps`: a
+silent tool loop spawning short-lived CPU children read -200 cs on 2 of 5 trials; read as "flat", that
+freezes a lane that is working.
+
 **Stated boundary, not hidden:** `lane-bound.sh` requires TWO CONSECUTIVE CONFIRMING samples before it
-will KILL; this axis decides `frozen` on one sample pair plus the mtime age. That is deliberate and it
+will KILL; this axis decides `frozen` on one sample pair plus the mtime age. The two signals therefore
+carry different evidence DURATIONS — the log's silence spans the full 45-minute window, the CPU pair
+spans 30 s — and `frozen` means "45 minutes of no output AND no CPU in the last 30 seconds", not "45
+minutes of no CPU". That is deliberate and it
 is safe here for two reasons: `frozen` is **advisory** (no kill path consumes it), and the *duration*
 half of the evidence — nothing written for the full 45-minute window — is itself the long confirmation
 sample. An unparseable `time=` row anywhere inside the subtree abstains the WHOLE total
@@ -1647,8 +1667,19 @@ usable verdict), so `no-verdict` reuses that name rather than inventing a parall
 ⛔ **THE LAST STATUS LINE WINS, EVEN WHEN ITS TOKEN IS UNRECOGNISED.** Keeping the last *recognised*
 verdict would adopt a STALE earlier one when a future producer appends `verdict=needs-review` — read
 as `finished`, which is the false-PASS class this axis exists to remove. An unrecognised final token
-is `("", None)` = no verdict, never "the previous one". `rc=` is matched GREEDILY (last occurrence on
-the line), so an earlier `rc=`-shaped field such as `tag=rc=7` cannot out-vote the real `rc=`.
+is `("", None)` = no verdict, never "the previous one".
+
+The verdict token and the `rc=` are parsed **separately** — the token alone, then that line's head
+(everything before ` log=`) scanned for `rc=` with the LAST occurrence winning — because one regex
+produced three wrong states: requiring `rc=` inside the match turned a recognised verdict with no
+`rc=` into "no verdict" instead of the documented abstention; a greedy match let
+`log=/tmp/L-rc=5.log` supply the exit status; and a non-greedy one let an earlier `rc=`-shaped field
+(`tag=rc=7`) out-vote the real `rc=`.
+
+**`log_lane_verdict` ALSO validates the token against `BOUND_VERDICTS`**, not only the two parsers: an
+unmodelled token from a direct caller yields `no-verdict`, never `dead/bound-verdict:<it>`. Both the
+parser and the function filter, so a future reader cannot reach `dead` by constructing a `LogRead` by
+hand.
 
 ### 13.5 ONE verdict function — where the axis lives and what it is not
 
@@ -1692,7 +1723,7 @@ publish the same states from the same function; there is no state decided at the
 `log_lane_verdict` does not decide.
 
 Regression contract: `python3 tools/fleet/liveness.test.py` (42 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (55 mutations, each of which must make its paired
+`python3 tools/fleet/liveness.test.py --mutations` (56 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder). Their paired mutations re-introduce the exact pre-fix behaviours — the
@@ -1701,4 +1732,5 @@ absent log as a death witness, the log axis masking a session query, every bound
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped
 fractional seconds, a skipped unparseable CPU row, the census's loose `alive` decode, the census's
 unfiltered verdict token, a `?` CPU channel counting as read, the inverted sample delta, a
-non-regular file read as a readable log, and an unresolvable log path not abstaining.
+non-regular file read as a readable log, a negative CPU delta read as flat, an unvalidated verdict
+token reaching `dead`, an `rc=` swallowed from `log=`, and the census asserting a log is readable.
