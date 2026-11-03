@@ -446,9 +446,13 @@ it, which on a clean checkout sent the reader hunting a phantom dirty tree. The
 dirty arm (`discardDestroysWip` returned true — the status WAS read) keeps both
 the claim and the hatch.
 
-**Escape hatches are unchanged**: M5 sits after the env-hatch / TTL-marker
-return, so `AGENT_ALLOW_MAIN_EDITS=1` and the `~/.pi/agent/.allow-main-edits`
-marker bypass it exactly as they bypass M2/M3. Task children are unhatched by
+**Escape hatches**: `AGENT_ALLOW_MAIN_EDITS=1` and the
+`~/.pi/agent/.allow-main-edits` marker bypass M2/M3 wholesale. For M4/M5 they open
+ONE narrow RECOVERY WINDOW rather than a bypass: a single bare
+`git checkout -- <named path>` / `git restore [--staged] [--worktree] <named path>`
+run from the disordered hub is permitted (so a dirty hub can actually be cleared);
+everything else stays frozen, and a wrapped/compound/`-C`/`GIT_DIR`-retargeted
+form is refused exactly as on main (#1484 D3). Task children are unhatched by
 default (#617/#623), so for the `pi -p` fixer M5 — not a prose rule — is the
 enforcement surface.
 
@@ -1653,7 +1657,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 | env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#1485** narrows the surface to what is actually READ (an opaque executable has no program to read), and adds the merge rail + the argv gh shim to the named `SANCTIONED_SCRIPT_RELPATHS` list; a general "committed repo script" exemption was rejected at review (committed is purchasable — see the #1485 note in the backdoor section). **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`) is closed for INLINE payloads too; residuals: `python -m`/bare-stdin/pipe payloads, dynamic string construction, and file/shebang payloads (`python x.py`, `./x.py`). Env hatch / TTL marker still bypass it. |
-| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
+| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | The sanctioned **branch** recovery (#206) — correct for an off-main AND CLEAN hub; on a DIRTY hub it is a no-op (already on `main`, dirt rides along), so clear the dirt first with the named-path restore window above. Terminals are never intercepted. |
 
 Rule of thumb: **if you are not recovering the hub or working alone, you
 should be in a worktree — `hub-worktree.sh <branch>` makes it one command.**

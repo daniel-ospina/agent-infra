@@ -4794,6 +4794,12 @@ export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive 
       // ONLY `checkout main|master` (recovery). Path-restore (--), discard-all
       // (.), previous-branch (-), create/force/orphan/detach forms → block.
       if (a.includes("--")) {
+        // `git switch` has NO pathspec mode (round 13, P1 MEASURED): after `--`
+        // its operand is a BRANCH, not a path. Reusing the checkout arm for it
+        // let `git switch -- feat-side` through the window, and real git switched
+        // the shared hub off `main` carrying the dirt — the exact state M4 exists
+        // to prevent (blocked on origin/main). Switch is never a restore.
+        if (verb === "switch") return "block";
         // #1484 M4 RECOVERY WINDOW — the actionable escape.
         // A PATH-RESTORE (`git checkout -- <path>`) is the ONLY sanctioned way
         // to clear working-tree dirt, and refusing it made M4 UNRECOVERABLE in
@@ -5720,8 +5726,8 @@ let _dirtyHatchActive = false;
 
 function _dirtyRecoveryBody() {
   return [
-    `   → Recover the DIRT — a branch switch cannot (git refuses to switch over`,
-    `     modified paths). Which command depends on WHICH dirt; \`git status --porcelain\``,
+    `   → Recover the DIRT — a branch switch carries the dirt WITH it and cannot`,
+    `     clear it. Which command depends on WHICH dirt; \`git status --porcelain\``,
     `     tells you (column 1 = index, column 2 = worktree):`,
     `       staged/index change  \`M \`  -> \`git restore --staged --worktree <path>\``,
     `                                     (one command: unstage AND restore — a bare`,

@@ -120,7 +120,15 @@ check("C10 restore --source=<old ref> stays blocked",
   verdict("git restore --source=HEAD~5 tortoise/__init__.py", { escapeActive: true, hubContext: DIRTY }), "block");
 check("C11 bare `checkout --` (no path) stays blocked",
   isHubRecoveryInvocation("checkout", ["--"], "main", true), "block");
-// Review P1 (measured fail-open): an operand BEFORE `--` is a REF. The first cut
+
+// C27 — round 13 (P1 MEASURED): `git switch` has NO pathspec mode — after `--`
+// the operand is a BRANCH, so reusing the checkout arm let
+// `git switch -- feat-side` switch the shared hub off `main` carrying its dirt
+// (the exact state M4 exists to prevent; blocked on origin/main).
+check("C27 `switch -- <branch>` stays blocked (not a restore)",
+  verdict("git switch -- feat-side", { escapeActive: true, hubContext: DIRTY }), "block");
+check("C28 `switch -- <path-looking>` stays blocked",
+  verdict("git switch -- wip.txt", { escapeActive: true, hubContext: DIRTY }), "block");// Review P1 (measured fail-open): an operand BEFORE `--` is a REF. The first cut
 // accepted any of them, so `git checkout feat-side -- src/app.js` wrote another
 // branch's blob into the shared hub AND staged it — feature work, which D3 says
 // this window must never permit.

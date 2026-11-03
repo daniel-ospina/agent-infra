@@ -344,7 +344,14 @@ agents in the hub) is prevented by discipline, not just guards:
 ### Stranded main checkout — terminal one-liner when M4 does NOT sanction (#206)
 
 - **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, and the op needed to un-strand is OUTSIDE the M4 recovery allowlist — `reset --hard`, force ops, or a tree the pull cannot fast-forward) is unrecoverable FROM the agent — the guard's escape hatches are env-only (`AGENT_ALLOW_MAIN_EDITS=1`) and cannot be set on a running process. Agent-side `git checkout main` and `git pull --ff-only` are themselves M4-sanctioned recovery ops needing no window (see the #1484 contract below).
-- **Fix (the sanctioned recovery when M4 blocks):** the human runs ONE command in a **terminal** (terminals are not intercepted by the guard):
+- **Fix (the sanctioned recovery when M4 blocks):** pick the route that matches the STATE — `git status --porcelain` tells you which. On a **dirty** hub a branch switch is NOT the recovery: `git checkout main && git pull --ff-only` is a no-op there (already on `main`, and the dirt rides along), which is exactly the loop that stranded the checkout for ~12h on 2026-11-02. Clear the dirt instead, from the hub, under an active escape hatch (`AGENT_ALLOW_MAIN_EDITS=1` at session start, or the `~/.pi/agent/.allow-main-edits` marker), naming the paths:
+  ```bash
+  cd <repo> && git status --porcelain
+  git restore --staged --worktree <path>   # 'M ' staged
+  git restore <path>                       # ' M' worktree
+  mv <path> /tmp/                          # '??' untracked (git clean stays refused)
+  ```
+  Only an **off-main AND clean** hub wants the branch route, run by the human in a **terminal** (terminals are not intercepted by the guard):
   ```bash
   cd <repo> && git checkout main && git pull --ff-only
   ```
