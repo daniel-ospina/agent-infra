@@ -70,8 +70,11 @@
 #      only if it has TESTED runs on main too (the same `tested` counter as
 #      precondition 1). Repos that split their lanes by TRIGGER (a
 #      `pull_request`-only lane and a `push`-only lane) have no single --workflow
-#      spanning both sides; `--any-workflow` compares against every lane on main
-#      (#1003).
+#      spanning both sides: the PR lane's base population is empty BY
+#      CONSTRUCTION, and the rail reports BASELINE-INAPPLICABLE. The remedy is
+#      `--baseline-workflow <main-lane>` — TWO names, so the reference comes from
+#      a lane that measures main (provenance), not `--any-workflow`, whose widened
+#      sample is satisfied by bookkeeping runs that measure nothing.
 #   4. THE TREE MUST BE GREEN WHERE THE RAIL CAN SEE IT. Preconditions 1-3 are
 #      all LANE-SCOPED. A lane-scoped comparison is blind to the rest of the
 #      tree, and that blindness is a false PASS at the merge level — not a
@@ -398,6 +401,7 @@
 # Usage:
 #   scripts/admin-merge.sh <PR> [--main-runs N] [--repo owner/repo]
 #                              [--workflow <file|name>] [--any-workflow]
+#                              [--baseline-workflow <file|name>]
 #                              [--no-rerun] [--rerun-timeout S] [--dry-run]
 #                              [-- <gh pr merge flags>]
 #
@@ -429,8 +433,10 @@
 #                        most 200 lane runs per side, one Jobs-API call each), and the
 #                        posted evidence says when the reference came from a wider
 #                        window than N.
-#   --workflow <f>       the TEST lane both sides are read from (default
-#                        `python-ci.yml`). NOT cosmetic: an unfiltered main
+#   --workflow <f>       the TEST lane the PR side is read from (and the BASE
+#                        side too, unless `--baseline-workflow` names another —
+#                        see below). Default is
+#                        `python-ci.yml`. NOT cosmetic: an unfiltered main
 #                        window is dominated by cron/watchdog lanes and can
 #                        contain ZERO test runs, so the baseline extracts EMPTY
 #                        and every PR failure reads as new — the bogus zero. See
@@ -455,6 +461,44 @@
 #                        changed set (#1614), the lane is INAPPLICABLE, not
 #                        missing, and the rail drops the filter for that run AFTER
 #                        saying so — see LANE APPLICABILITY below.
+#                        ⛔ NOT A BASELINE SOURCE — A STATEMENT ABOUT REMEDIES AND
+#                        VALUES, NOT ABOUT WHAT THE CODE READS. With no
+#                        `--baseline-workflow`, `--any-workflow` STILL supplies the
+#                        base side exactly as before (this flag's default is ONE name
+#                        for both sides), and step 0b's #1614 fallback can set it with
+#                        no operator flag at all — both paths are unchanged. What is
+#                        new: (a) the BASELINE-INAPPLICABLE refusal no longer OFFERS
+#                        it as the way to a baseline, and (b) it cannot be supplied AS
+#                        the baseline's value (`--baseline-workflow any|*|all` is
+#                        refused by name; a baseline is a NAMED workflow). The reason
+#                        it is no longer offered: it widens the BASE side to a sample
+#                        whose composition is decided by whatever traffic main happens
+#                        to carry, and that sample is SATISFIED by runs that measure
+#                        nothing — measured on main's 200-run window, 187 were
+#                        `Pipeline Compliance` (issue_comment: 148 skipped, 38 success,
+#                        1 other),
+#                        7 detector and 6 `CI on main`; the widening stopped at width 40
+#                        with 11 "measurements" = 8 bookkeeping + 2 detector + 1
+#                        code-lane run. Reachable is not the same as MEASURED.
+#   --baseline-workflow <f>
+#                        the workflow whose runs on the BASE branch form the
+#                        BASELINE, independent of the PR's own lane (--workflow).
+#                        Default: --workflow, so no existing invocation moves.
+#                        WHY IT EXISTS. A `pull_request`-only lane has NO runs on
+#                        main BY CONSTRUCTION (`gh run list --branch main --workflow
+#                        ci.yml` -> `[]`), so it cannot be its own baseline: the
+#                        certificate is a comparison and there is nothing to compare
+#                        against. Naming the main-side lane makes the two sides
+#                        INDEPENDENT — and the value is PROVENANCE, not reachability
+#                        (the widened union can reach a verdict too: on 2026-11-02 a
+#                        widened run reached the same 19 exempt / 2 new through a
+#                        sample another lane's traffic decided). With a named baseline,
+#                        the reference is drawn from a
+#                        workflow that MEASURES main, and the evidence names it.
+#                        ⛔ It can only make the rail able to judge WITH provenance,
+#                        never to judge WITHOUT: an empty base population and no
+#                        --baseline-workflow is the BASELINE-INAPPLICABLE refusal at
+#                        step 2b, never a pass.
 #
 #   ── LANE APPLICABILITY (#1614) — the ONE measured fallback ──────────────
 #   Precondition 1 requires a TESTED run of the watched lane on the head. A PR
@@ -2872,6 +2916,7 @@ resolve_merge_ref() {
   step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
   if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
   while :; do
+  rail_guard_poll
     # ONE call: mergeability and the merge ref sha together. `--jq` is real gh's
     # projection; the harness stub answers with the already-projected line.
     line="$($GH api "$slug/pulls/$pr" --jq '"\(.mergeable)" + "\t" + (.merge_commit_sha // "")' 2>/dev/null || true)"
@@ -3842,6 +3887,11 @@ lane_prefix_candidates() {
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
+# #3229: the lane MAIN's side was actually read from — the named `--baseline-workflow`
+# when one was given, else the watched lane. Set by lane_parity_check and read by the
+# refusal renderer, so a base-side reason can never name the PR's lane (nor point the
+# operator at `--any-workflow`, which is not a baseline source).
+LANE_PARITY_BASE_LANE=""
 # #2842: WHICH condition left the reference EMPTY, when that condition is not an
 # unreadable list. The refusal used to assert ONE cause for every empty reference
 # ("the shard lists are not readable"), which is FALSE — and misleading in a
@@ -3885,6 +3935,28 @@ lane_parity_check() {
   # comparison is made of, and no comparison of the files can detect it. So state
   # the invariant instead of discovering it: both must be regular files, and they
   # must not be the same file.
+  # ── NAME THE LANE THAT WAS ACTUALLY READ (#3229 review) ─────────────────
+  # Every reason below is a claim about MAIN's window. With `--baseline-workflow`
+  # that window is the BASELINE lane's, so a refusal that names the PR lane sends
+  # the operator to the one lane the base side never read — and the old remedy
+  # (`--any-workflow`) is the widening this change exists to stop. `base_lane` /
+  # `base_hint` are therefore used in preference to `$WORKFLOW` / `$lane` below.
+  # Without the flag both reduce to the previous text byte-for-byte.
+  # ⛔ THE SIDE'S OWN NAME, NOT `$WORKFLOW`. Under `--any-workflow` — or when step
+  # 0b's #1614 fallback drops the filter with no operator flag — the base-side read
+  # is UNFILTERED and `lane` is `any workflow` while `$WORKFLOW` still holds the
+  # unwatched default. Naming `$WORKFLOW` there would name a lane that appears in no
+  # `run list` call and would turn a knob that cannot change the read.
+  LANE_PARITY_BASE_LANE="${BASELINE_WORKFLOW:-${lane:-any workflow}}"
+  local base_lane="$LANE_PARITY_BASE_LANE"
+  local base_hint="--workflow, or --any-workflow for a trigger-split repo"
+  local base_remedy="and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: --workflow <file>."
+  local base_widen_note=" --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
+  if [ -n "${BASELINE_WORKFLOW:-}" ]; then
+    base_hint="--baseline-workflow (currently '${BASELINE_WORKFLOW}')"
+    base_remedy="and the fix is to point ADMIN_MERGE_LANE_JOB_PREFIX at the shards the baseline lane '${BASELINE_WORKFLOW}' actually runs, or to name a baseline lane whose shards this PR's lane also runs — the baseline lane is read for MAIN only, so it need not run on pull_request."
+    base_widen_note=" --any-workflow would widen the BASE side to every workflow on main, which is not a baseline source (#3229)"
+  fi
   if [ -L "$TMP/lane-pr.txt" ] || [ -L "$TMP/lane-main.txt" ] \
      || [ "$TMP/lane-pr.txt" -ef "$TMP/lane-main.txt" ]; then
     say_err "admin-merge: ✗ the lane references are not two distinct regular files — lane coverage unverifiable (a scratch path is a symlink or is aliased onto another)"
@@ -3910,10 +3982,28 @@ lane_parity_check() {
   # (The identity check above catches the alias directly; this catches the class of
   # writes that arrive through any OTHER scratch name.)
   LANE_PR_FROZEN="$(cat "$TMP/lane-pr.txt")"
+  # ── THE BASE SIDE IS READ FROM THE BASELINE LANE WHEN ONE IS NAMED ──────────
+  # The question this gate answers is "did the PR execute every test shard MAIN's
+  # lane executed", so MAIN's lane has to be the workflow main's runs are actually
+  # drawn from — and when the operator named `--baseline-workflow`, THAT is it.
+  # Without the rebind, a pull_request-only lane is compared against main's
+  # population of a workflow that never runs there: it selects nothing and refuses
+  # with the `no EXECUTED job` reason whose remedy is `--any-workflow` — the one
+  # widening the base side must not take. `WORKFLOW`/`ANY_WORKFLOW` are `main()`'s
+  # locals, so bash's dynamic scope makes this rebind exactly what `lane_shard_set`
+  # reads. It cannot fire when no baseline is named, which is why every invocation
+  # that does not use the flag keeps its previous selector byte-for-byte.
+  local saved_workflow="${WORKFLOW:-}" saved_any="${ANY_WORKFLOW:-0}"
+  if [ -n "${BASELINE_WORKFLOW:-}" ]; then
+    WORKFLOW="$BASELINE_WORKFLOW"
+    ANY_WORKFLOW=0
+  fi
   if ! lane_shard_set --branch main "$main_runs" "$TMP/lane-main.txt"; then
+    WORKFLOW="$saved_workflow"; ANY_WORKFLOW="$saved_any"
     LANE_PARITY_REASON="main's lane runs could not be listed or read"
     return 2
   fi
+  WORKFLOW="$saved_workflow"; ANY_WORKFLOW="$saved_any"
   # #2842: main's RAW executed names, frozen for the refusal's derived retry value.
   # Read here, not later: the scratch dir is shared and a later write could alias it.
   printf '%s\n' "${LANE_SET_ALLNAMES:-}" > "$TMP/lane-main-alljobs.txt"
@@ -3961,12 +4051,12 @@ lane_parity_check() {
     # read is STATED either way, because "widened past --main-runs" is a fact the
     # operator must be able to audit.
     if [ "$main_jobs" -eq 0 ]; then
-      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
+      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector '${base_lane}': ${base_hint}) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
     else
       # #2842: the lists WERE readable — this is a NAMING mismatch, and the refusal
       # must say so rather than borrow the unreadable-list wording above.
       LANE_PARITY_EMPTY_KIND="family"
-      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: --workflow <file>. --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
+      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — ${base_remedy}${base_widen_note}"
     fi
     return 2
   fi
@@ -4674,6 +4764,7 @@ wait_for_first_checks() {
   case "$rederive_left" in ''|*[!0-9]*) rederive_left=1 ;; esac
   last_clock="$SECONDS"
   while :; do
+  rail_guard_poll
     # shellcheck disable=SC2086
     out="$($GH run list --commit "$head" --limit 100 ${args[@]+"${args[@]}"} \
         --json databaseId,status,conclusion,createdAt --jq "$FIRST_CHECKS_JQ" 2>/dev/null)"; rc=$?
@@ -5272,6 +5363,7 @@ settle_self_edit_generation() {
   local waited=0 step saw=0 status conclusion id key gk self_n foreign_n missing
   local seen_keys=" "
   while :; do
+  rail_guard_poll
     self_n=0; foreign_n=0
     # shellcheck disable=SC2086
     while IFS=$'\t' read -r status conclusion id key; do
@@ -6251,6 +6343,7 @@ wait_for_run() {
   # to 0 — a 0-step loop can never reach its own bound and spins forever.
   step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
   while [ "$waited" -lt "$RERUN_TIMEOUT" ]; do
+  rail_guard_poll
     # ONE gh call: the run's completion state and its run attempt. `updatedAt` is
     # deliberately NOT read — it advances on JOB/STEP TRANSITIONS, so it is frozen
     # for the entire duration of a single long step, and treating its freeze as
@@ -6506,6 +6599,13 @@ build_evidence() {
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
   local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}" exempt_raw="${12:-}"
   local unattr_tokens="${13:-}" unattr_count="${14:-0}" repro_raw="${15:-}" repro_count="${16:-0}"
+  # The BASE side's lane. It differs from the PR's lane exactly when the operator
+  # named `--baseline-workflow`, and the provenance line must say which workflow
+  # the reference was actually drawn from — that IS the point of two names. A
+  # reader who sees `of python-ci.yml` on a lane that never ran on main would be
+  # reading a claim the run did not make. Defaults to the PR lane, so a caller
+  # that does not pass it renders byte-identically to before.
+  local main_lane="${17:-$lane}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
@@ -6521,7 +6621,7 @@ build_evidence() {
   if [ -f "$main_prov" ]; then main_union_n="$(count_lines "$main_prov")"; fi
   local run_word="runs"
   if [ "$main_union_n" = "1" ]; then run_word="run"; fi
-  printf 'main compared (union of %s %s of %s): %s\n' "$main_union_n" "$run_word" "$lane" "$(provenance_ids "$main_prov")"
+  printf 'main compared (union of %s %s of %s): %s\n' "$main_union_n" "$run_word" "$main_lane" "$(provenance_ids "$main_prov")"
   printf 'PR failing: %s | main failing: %s | blocked by the decision: 0\n' "$pr_count" "$main_count"
   printf '%s\n' "$analyzed"
   # THE AUDITABLE SET, not just its verdict (#3467 item 2): the decision only
@@ -7486,14 +7586,451 @@ resolve_rail_repo() {
   return 0
 }
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE RAIL'S OWN DEADLINE, ITS PER-PR LEASE, AND ITS TERMINAL-STATE EXIT (#3194)
+#
+# WHY THIS EXISTS — MEASURED, not theorised (2026-11-01, this mac). Eight rails were
+# alive; #10483's had run 6h47m while its PR had MERGED 1h57m earlier. Its stdout
+# (fd 1 -> $STATE/rails/auto-daniel-ospina-tortoise-10483.out) was BYTE-FROZEN for
+# 6h42m while its only child cycled `gh run view … --json status,attempt` plus
+# `sleep 10` — i.e. it sat inside `wait_for_run`, the RE-RUN wait. Two rails ran on
+# #3055 and two on #10500 at the same time. `auto-rail.sh` counts PROCESSES
+# (`rails_live`), so every rail that never exits holds a merge slot forever; at 8 the
+# auto-rail deferred every candidate on every pass.
+#
+# The per-wait bound was NOT the defect and is NOT removed here: `wait_for_run`
+# already bounds itself and already names STALLED / UNOBSERVABLE / CEILING (#3205).
+# The defect is that a bound on EACH wait is not a bound on the ATTEMPT:
+#   (a) nothing re-read the PR's own state once a wait had begun, so a PR that merged
+#       (or was closed) mid-wait left the rail polling a finished job;
+#   (b) a rail enters several waits in sequence, and a wait whose run never becomes
+#       readable spins its SILENT branch (unreadable => `continue`, no line printed), so
+#       the process outlives every stated bound while producing no output;
+#   (c) no exclusion existed per PR at all (`grep ALREADY-RAILING` found nothing).
+#
+# CONVERGENT PRACTICE (§0 research). GitHub's merge queue bounds the WHOLE merge group
+# and, when the bound is spent, FAILS the group and REMOVES the PR from the queue
+# (a configurable status-check timeout). Mergify does the same for a batch: a
+# check-timeout splits/removes the offending PR and requeues the rest. Both bound the
+# ATTEMPT and ALWAYS emit a terminal verdict; neither waits sub-condition by
+# sub-condition indefinitely. That is the shape implemented here.
+#
+# ⛔ THIS CHANGES NO VERDICT. Nothing here widens, skips, mutes or soft-fails a gate,
+# and nothing here touches the review-attestation requirement. A rail that would have
+# MERGED still merges; one that would have been BLOCKED is still blocked. The only new
+# outcomes are "this rail is out of time" and "another rail already owns this PR" —
+# both refusals to ACT, never permissions to.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# The lease is one directory per (repo, PR). `mkdir` is the atomic primitive: two
+# concurrent rails cannot both create it, so the loser is decided by the kernel and
+# not by a check-then-act race.
+RAIL_LOCK_ROOT="${ADMIN_MERGE_LOCK_ROOT:-${HOME}/.pi/agent/state/rail-locks}"
+RAIL_LOCK_HELD=0
+RAIL_LOCK_PATH=""
+RAIL_LOCK_PR=""
+RAIL_STARTED_AT="$(date +%s)"
+RAIL_POLL_TICKS=0
+# ONE ABSOLUTE BOUND FOR THE WHOLE ATTEMPT.
+# ⛔ IT MUST EXCEED EVERY WAIT THE RAIL IS *ALLOWED* TO TAKE, or it becomes a second,
+# tighter gate that false-blocks healthy PRs (review finding 7). A rail legitimately
+# inside `wait_for_first_checks` may spend the FIRST-CHECKS CEILING (18064s by default)
+# and then still owe a RE-RUN wait (derived per shard, >= the fail-safe 3900s) and a
+# re-collection. So the attempt bound is the ceiling plus BOTH fail-safe per-wait
+# bounds, and an expired deadline can only fire on an attempt that has genuinely
+# outlived every window the rail itself declared.
+# ⛔ THE DEFAULT MUST EXCEED WHAT THE RAIL IS ALLOWED TO SPEND, or this becomes a second,
+# tighter gate that false-blocks healthy PRs (cycle-2 finding 3; cycle-3 finding 1 caught
+# the first attempt at this being TIGHTER than the formula it replaced, and still below
+# FIRST_CHECKS_CEILING + one fail-safe re-run wait = 21964s, so a queue-bound PR spending
+# its declared ceiling plus one re-run would have been refused and its head PARKED).
+# The arithmetic it must cover: `wait_for_first_checks` may spend FIRST_CHECKS_CEILING, and
+# the re-run wait is taken ONCE PER FAILING RUN with a bound of max(RERUN_FLOOR, 2 x
+# green_max) that is NOT clamped to the fail-safe. So the default is the ceiling plus FOUR
+# fail-safe re-run waits, and it is EXPRESSED IN TERMS OF THE KNOBS so that raising
+# ADMIN_MERGE_FIRST_CHECKS_CEILING raises the deadline with it (cross-checked in
+# `validate_rail_bounds`).
+# ⛔ SOURCE-TIME ARITHMETIC MUST NOT READ AN UNVALIDATED KNOB (#1690's class, re-hit here).
+# The two lines below run when the file is SOURCED, but `validate_timing_knobs` only runs
+# inside `main()` — so the derivation would be the first thing to touch a knob nobody has
+# validated yet. `018064` is a fine DECIMAL to the validator and ILLEGAL OCTAL to the
+# arithmetic, so the shell died with `value too great for base` at this line instead of
+# emitting the validator's NAMED refusal. Measured on the composed head: the `(P1-18)` arms
+# for ADMIN_MERGE_FIRST_CHECKS_CEILING and ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK both reddened,
+# the message naming a line number instead of a knob.
+# So an operand that is not a plain positive decimal yields 0 here, and the derived default
+# becomes 0. That value is never USED: `validate_timing_knobs` refuses the malformed knob BY
+# NAME and exits before any rail logic runs, and a genuinely-0 deadline (an operator-supplied
+# junk ADMIN_MERGE_RAIL_DEADLINE) is then refused BY NAME by `validate_rail_bounds`.
+_as_dec_or_zero() {
+  case "$1" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
+  if counter_has_leading_zero "$1"; then printf '0'; return 0; fi
+  printf '%s' "$1"
+}
+RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$(( $(_as_dec_or_zero "$FIRST_CHECKS_CEILING") + $(_as_dec_or_zero "$FAILSAFE_RERUN_TIMEOUT") * 4 ))}"
+# TTL is DERIVED from the deadline so the two can never cross: a lease must outlive the
+# attempt that holds it, or a rail still running inside its own deadline could have its
+# lease stolen and two rails would then hold the same PR. `validate_rail_bounds` enforces
+# the relation for any operator override. The +3600 goes through the same guard, so a junk
+# ADMIN_MERGE_RAIL_DEADLINE cannot crash the derivation either.
+RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$(( $(_as_dec_or_zero "$RAIL_DEADLINE") + 3600 ))}"
+# How many 50ms slices a rail waits for an incumbent lease to publish its pid before it
+# decides. 40 = 2s; the publish gap is microseconds, so this only ever absorbs the gap.
+RAIL_LOCK_PUBLISH_WAIT="${ADMIN_MERGE_LOCK_PUBLISH_WAIT:-40}"
+RAIL_LAST_TERMINAL_CHECK=0
+
+# path_mtime <path> — epoch seconds of a path's mtime, PORTABLY.
+# ⛔ `stat -f %m` IS BSD-ONLY (review cycle 5 finding 2). On GNU coreutils it treats `-f` as
+# `--file-system`, prints the FILESYSTEM LISTING to stdout and exits 1 — so `2>/dev/null`
+# suppresses nothing, the substitution yields listing+`$now`, the arithmetic errors, and the
+# age silently stays 0, meaning a lease can never expire. That is not hypothetical: this rail
+# is executed on Linux cells by `scripts/orchestrator-harness/cloud-cell-doctor.sh`. `date -r`
+# is portable across BSD and GNU and needs no capability probe (the repo already uses it in
+# `scripts/orchestrator-harness/selftest.sh:3928` for this exact reason, per #1702).
+path_mtime() {
+  local p="$1" m
+  m="$(date -r "$p" +%s 2>/dev/null || true)"
+  case "$m" in
+    ''|*[!0-9]*) printf '%s\n' "" ;;
+    *)           printf '%s\n' "$m" ;;
+  esac
+}
+
+rail_lock_release() {
+  [ "${RAIL_LOCK_HELD:-0}" -eq 1 ] || return 0
+  [ -n "${RAIL_LOCK_PATH:-}" ] && rm -rf "$RAIL_LOCK_PATH" 2>/dev/null
+  RAIL_LOCK_HELD=0
+  return 0
+}
+
+# rail_lock_acquire <key> — <key> is `<owner>-<repo>-<pr>`, filesystem-safe.
+# A held lease whose holder is STILL ALIVE => ALREADY-RAILING and EXIT 0. A lease whose
+# holder is GONE is RECLAIMED: a stale flag that records a past state and is never
+# revalidated is the class this file treats as its own defect, so the LIVEness of the
+# holder — not the existence of the directory — is what decides. (A recycled pid could
+# make a dead holder look alive; that errs toward a duplicate NO-OP exit, never toward a
+# double merge, so it is the safe direction and is stated rather than discovered.)
+# rail_lock_restore <dir> <stale> — put a lease back, PROVING it landed.
+# ⛔ `mv a b` SUCCEEDS WHEN b EXISTS — it NESTS (`b/a`), exit 0 (review cycle 6 finding 1,
+# reproduced with two real rails). A naive "restore" therefore leaves the moved lease to
+# live INSIDE another rail's lease directory, and the rail that owns `b` later runs
+# `rm -rf "$dir"` on release — silently deleting the nested, still-live lease of a rail
+# that is mid-merge, after which a third rail can acquire. The old `|| rm -rf "$stale"`
+# fallback was the same hazard from the other side: it DELETED a lease the code had just
+# declared "someone else's". So: if the destination is taken, this execution does NOT
+# merge, does NOT delete anything, and says so.
+rail_lock_restore() {
+  local dir="$1" stale="$2"
+  if [ -e "$dir" ]; then
+    say_err "admin-merge: ✗ rail lease ${dir} was taken by ANOTHER rail while this one was stealing it, so the lease it moved ($stale) CANNOT be put back without nesting inside a live lease. This execution DELETES NOTHING and MERGES NOTHING. EXIT 75 (retryable): re-run the rail, which will re-read the lease from scratch."
+    exit 75
+  fi
+  if ! mv "$stale" "$dir" 2>/dev/null; then
+    say_err "admin-merge: ✗ could not restore the rail lease ${dir} from ${stale} — deleting NOTHING and merging NOTHING. EXIT 75 (retryable)."
+    exit 75
+  fi
+  return 0
+}
+
+rail_lock_acquire() {
+  local key="$1" prefix dir holder started now age acquired=0 stale stolen expired=0 _m sage _t
+  RAIL_LOCK_PR="${key##*-}"
+  # ⛔⛔ OFF BY DEFAULT — NOT SHIPPED AS A GATE (review cycle 6, MEASURED).
+  # The per-PR lease is NOT CERTIFIED and must not hold a merge back until it is. Six
+  # adversarial review cycles went at this, and the reclaim path — the path a SIGKILLed
+  # rail puts every later rail onto — still let TWO rails reach `acquired=1` in 2 of 40
+  # trials, reproducibly, after both the identity compare-and-swap and the bounded
+  # publish-wait. `mkdir` makes a lease visible an instant before its identity is written,
+  # and every scheme tried here either guesses across that gap or nests a restore inside a
+  # live lease. A double-held lease is a double merge, which is worse than the slot leak it
+  # was meant to fix, so the honest state is: the mechanism exists, it is measured, it is
+  # NOT trusted, and it is opt-in for whoever finishes it. Filed with the measurements.
+  #
+  # The two fixes that ARE certified and carry this PR — the terminal-state exit and the
+  # whole-attempt deadline — do not need this function and are always on.
+  [ "${ADMIN_MERGE_PER_PR_LEASE:-0}" -eq 1 ] || return 0
+  # ⛔ A PR-LESS INVOCATION TAKES NO LEASE (finding 6, cycle 1). `--print-bounds` must work
+  # on a bare invocation, and a key with an empty PR half would make EVERY PR-less run in
+  # every repo collide on one lease.
+  case "$RAIL_LOCK_PR" in ''|*[!0-9]*) return 0 ;; esac
+  # ⛔ CANONICALISE THE NUMBER BEFORE IT BECOMES A LEASE NAME (review cycle 4 finding 2,
+  # MEASURED: `admin-merge.sh 01631` and `admin-merge.sh 1631` each took their OWN lease and
+  # BOTH held it, so two rails could run on one PR). The rail explicitly accepts a
+  # zero-padded number, so the exclusion key must be the canonical decimal, not the spelling.
+  RAIL_LOCK_PR=$((10#$RAIL_LOCK_PR))
+  prefix="${key%-*}"
+  # ⛔ FAIL CLOSED, LOUDLY (finding 5, cycle 2). An unusable lease ROOT means exclusion cannot
+  # be proven at all. Returning 0 here would leave every rail running with no lease and no
+  # line in the log — the duplicate-rail race unchanged and invisible, while the function's
+  # own docstring promised the opposite.
+  if ! mkdir -p "$RAIL_LOCK_ROOT" 2>/dev/null; then
+    say_err "admin-merge: ✗ cannot create the rail lease root $RAIL_LOCK_ROOT — per-PR exclusion CANNOT be proven, and a rail that cannot prove it does not run (two rails on the same PR could double-merge). EXIT 76."
+    exit 76
+  fi
+  dir="$RAIL_LOCK_ROOT/${prefix}-${RAIL_LOCK_PR}"
+  # `mkdir` on the lease directory is the atomic primitive: two concurrent rails cannot both
+  # create it, so the loser is decided by the kernel, not by a check-then-act race.
+  mkdir "$dir" 2>/dev/null && acquired=1
+  if [ "$acquired" -eq 0 ]; then
+    # ⛔ WAIT BRIEFLY FOR AN INCUMBENT'S IDENTITY BEFORE DECIDING ANYTHING (review cycle 5
+    # finding 1, MEASURED still 2/40 trials double-acquiring). `mkdir` makes the lease VISIBLE
+    # an instant before its pid is written, so a racer that reads during that gap sees "no
+    # holder" and has to guess: guess "dead" and two rails hold one lease; guess "alive" and a
+    # genuinely abandoned lease never frees. Neither guess is needed — the gap is
+    # microseconds, so a reader WAITS for the identity to appear (bounded), and only then
+    # decides from facts. The bound is deliberately tiny and does not weaken any other path.
+    holder=""
+    _t=0
+    while [ "$_t" -lt "${RAIL_LOCK_PUBLISH_WAIT:-40}" ]; do
+      holder="$(cat "$dir/pid" 2>/dev/null || true)"
+      [ -n "$holder" ] && break
+      [ -d "$dir" ] || break          # the lease went away entirely — no identity to wait for
+      sleep 0.05
+      _t=$((_t + 1))
+    done
+    started="$(cat "$dir/started" 2>/dev/null || true)"
+    now="$(date +%s)"
+    age=0
+    # AGE comes from `started` when it is readable, and from the DIRECTORY's mtime when it is
+    # not — a lease that is being published has no `started` file yet, and an age of 0 there
+    # would make an in-flight lease look both fresh and (via a dead-pid read) stale at once.
+    case "${started:-}" in
+      '')
+        _m="$(path_mtime "$dir")"; [ -n "$_m" ] || _m="$now"
+        age=$((now - _m)) ;;
+      *) age=$((now - started)) ;;
+    esac
+    [ "$age" -lt 0 ] && age=0
+    # ⛔ A LEASE WITH NO EXPIRY CAN BLOCK A PR FOREVER (finding 6, cycle 2). A SIGKILLed rail
+    # leaves the lease behind (no trap runs on SIGKILL), and `kill -0` cannot tell that pid
+    # from a LATER process that reused it — the fleet keeps many long-lived pids. Without a
+    # bound, every subsequent rail exits 75 claiming another rail owns the PR when none does,
+    # and merge-one.sh burns its attempts and PARKS the head. That is the "stale flag that
+    # records a past state and is never revalidated" class this file calls its own defect, so
+    # the lease carries an AGE bound as well as a liveness test.
+    # ⛔ AN UNREADABLE HOLDER IS NOT A STALE HOLDER (review cycle 4 finding 1, MEASURED
+    # deterministically: a lease directory with no pid file let BOTH rails end at
+    # `acquired=1`). An incumbent is exactly in that state between `mkdir` and writing its
+    # pid, so treating "no pid" as "dead" hands the lease to a second rail while the first
+    # still holds it. A lease whose identity cannot be read is only taken when it has also
+    # EXPIRED — and expiry is judged from the directory's own mtime in that state.
+    if { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } \
+       || { [ "$RAIL_LOCK_TTL" -gt 0 ] && [ "$age" -ge "$RAIL_LOCK_TTL" ]; }; then
+      expired=0
+      { [ "$RAIL_LOCK_TTL" -gt 0 ] && [ "$age" -ge "$RAIL_LOCK_TTL" ]; } && expired=1
+      if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+        say_err "admin-merge: ↻ rail lease ${dir} is held by pid ${holder} but is ${age}s old (TTL ${RAIL_LOCK_TTL}s) — EXPIRED, stealing it. A lease older than the whole-attempt bound cannot belong to an attempt still running."
+      else
+        say_err "admin-merge: ↻ rail lease ${dir} was held by pid ${holder:-<unreadable>} (${started:-<unreadable>}) which is NO LONGER ALIVE — reclaiming the stale lease."
+      fi
+      # ⛔ STEAL ATOMICALLY, AND CONDITIONALLY ON IDENTITY (finding 1 cycle 2, re-opened by
+      # finding 2 cycle 3). A naive reclaim `rm -rf`s a path another rail may already own,
+      # deleting that rail's FRESH LIVE lease and mkdir-ing over it, so two rails proceed and
+      # double-hold — the exact defect the lease exists to prevent, in exactly the situation
+      # that triggers reclaim. The first fix used `mv` alone and was still wrong, MEASURED:
+      # 19/120 trials produced 2-3 simultaneous acquirers at 8 concurrent reclaimers, because
+      # `mv` succeeding proves only that SOME directory existed at the theft instant — not
+      # that it was the STALE one we decided to steal. So the steal is a compare-and-swap: we
+      # move the directory aside, then re-read WHICH lease we actually moved. If it is not the
+      # lease we decided on and its holder is alive, we stole a live rail's lease and PUT IT
+      # BACK, leaving `acquired=0` so this rail falls through to ALREADY-RAILING.
+      stale="$dir.stale.$$"
+      if mv "$dir" "$stale" 2>/dev/null; then
+        stolen="$(cat "$stale/pid" 2>/dev/null || true)"
+        # ⛔ THE DECISION IS MADE FROM WHAT WAS ACTUALLY MOVED, NOT FROM THE PRE-STEAL READ
+        # (review cycle 5 finding 1). `expired` was computed from a read taken BEFORE the
+        # `mv`, so a rail that decided "expired" and then moved the directory AFTER another
+        # rail had reclaimed and re-created it would `rm -rf` that rail's FRESH LIVE lease and
+        # mkdir over it — two rails holding one lease, reproduced deterministically. So the
+        # moved lease is re-read and the ONLY grounds to take it are:
+        #   (i) it is exactly the lease we decided to steal (`$stolen` = `$holder`), or
+        #  (ii) its holder is unreadable AND its own mtime proves it has EXPIRED.
+        # Anything else is restored. Restoring is always safe; acquiring is not.
+        if [ -n "$stolen" ] && [ "$stolen" = "$holder" ]; then
+          rm -rf "$stale" 2>/dev/null
+          mkdir "$dir" 2>/dev/null && acquired=1
+        elif [ -z "$stolen" ]; then
+          # Re-derive expiry from the MOVED directory's own mtime — never from the stale read.
+          _m="$(path_mtime "$stale")"; [ -n "$_m" ] || _m="$now"
+          sage=$((now - _m)); [ "$sage" -lt 0 ] && sage=0
+          if [ "$RAIL_LOCK_TTL" -gt 0 ] && [ "$sage" -ge "$RAIL_LOCK_TTL" ]; then
+            say_err "admin-merge: ↻ rail lease ${dir} has no readable holder and its own mtime proves it EXPIRED (${sage}s of ${RAIL_LOCK_TTL}s) — taking it."
+            rm -rf "$stale" 2>/dev/null
+            mkdir "$dir" 2>/dev/null && acquired=1
+          else
+            say_err "admin-merge: ↻ rail lease ${dir} has NO readable holder and has NOT expired (${sage}s of ${RAIL_LOCK_TTL}s) — that is a lease MID-PUBLICATION, not a dead one. RESTORING it rather than stealing a rail that is between mkdir and writing its pid."
+            rail_lock_restore "$dir" "$stale"
+          fi
+        else
+          say_err "admin-merge: ↻ rail lease ${dir}: this rail moved a lease owned by pid ${stolen} but had decided to steal ${holder:-<unreadable>} — the lease CHANGED between the read and the steal, so it is someone else's now. RESTORING it rather than stealing a running rail's lease."
+          rail_lock_restore "$dir" "$stale"
+        fi
+      fi
+    fi
+  fi
+  # ⛔ `acquired` — NOT a second reading of the directory — decides, so a just-reclaimed lease
+  # (whose pid file does not exist yet) is not mistaken for a live holder.
+  if [ "$acquired" -eq 0 ]; then
+    say_err "admin-merge: ✗ ALREADY-RAILING(${RAIL_LOCK_PR}) — the rail lease ${dir} is held by pid ${holder:-<unreadable>} (since ${started:-<unreadable>}) and this execution could not acquire it. A second execution would double-hold the merge slot (two rails on #3055 and two on #10500 were measured racing on 2026-11-01) and could double-merge. EXIT 75: a RETRYABLE refusal for the duplicate, NOT a merge and NOT a verdict about the PR."
+    # ⛔ EXIT 75, NEVER 0. `merge-one.sh:694-696` treats rail exit 0 as a merge: it logs
+    # `MERGED via the rail`, writes `state/merged-<PR>.done` and clears the refusal record.
+    # Exiting 0 here would mark a PR MERGED that nothing merged, and the sweep would then
+    # never retry it.
+    exit 75
+  fi
+  printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
+  date +%s > "$dir/started" 2>/dev/null || true
+  RAIL_LOCK_PATH="$dir"
+  RAIL_LOCK_HELD=1
+  # ⛔ EXIT ONLY — NEVER INT/TERM. A handler on TERM replaces the default action, so the shell
+  # would SURVIVE the signal and keep looping (restoring the un-killable rail this change
+  # exists to remove) while ALSO dropping the lease, letting a second rail acquire the same PR
+  # mid-merge. `main` installs its own EXIT trap later and CHAINS to rail_lock_release rather
+  # than replacing it; this one is the belt for an exit that happens before that.
+  trap 'rail_lock_release' EXIT
+  return 0
+}
+
+# rail_stop_if_pr_terminal — (a) EXIT AFTER SUCCESS.
+# The rail's whole purpose is to reach MERGED. Once the PR IS merged — whoever did it,
+# including a duplicate or a human — there is no work left, so continuing to poll a run
+# is pure slot-holding. The measured 6h47m life belonged to exactly that. CLOSED is
+# treated the same way: nothing can be merged into a closed PR.
+rail_stop_if_pr_terminal() {
+  [ -n "${RAIL_LOCK_PR:-}" ] || return 0
+  local state st
+  # GH_REPO is exported by resolve_rail_repo, so a bare number resolves to THIS rail's repo.
+  # shellcheck disable=SC2086
+  state="$($GH pr view "$RAIL_LOCK_PR" --json state,mergedAt \
+    --jq '( .state // "" ) + "\t" + ( .mergedAt // "" )' 2>/dev/null || true)"
+  # ⛔ A MULTI-LINE / MULTI-SEPARATOR READ IS UNREADABLE, NOT MERGED (finding 4, cycle 2).
+  # `${state%%$'\t'*}` is an ANY-FIRST-LINE / ANY-SEPARATOR split, so a shim notice line, a
+  # multi-line body or a NUL-carrying read would yield a value this case could match — and
+  # `exit 0` on the strength of it makes merge-one.sh write `state/merged-<PR>.done` over an
+  # unmerged PR (the #2235 false checkmark). The hardened sibling reader elsewhere in this
+  # file insists on exactly this shape for exactly this reason; so does this one.
+  case "$state" in
+    ''|*$'\n'*) return 0 ;;
+  esac
+  case "$state" in
+    *$'\t'*) : ;;
+    *) return 0 ;;
+  esac
+  st="${state%%$'\t'*}"
+  # AN ALLOW-LIST, never "anything that is not OPEN" — and MERGED exits 0 only because the
+  # PR really is merged.
+  case "$st" in
+    MERGED)
+      # ⛔ THE SAME TWO IDENTITY PROOFS THE START-OF-RUN NO-OP PATH REQUIRES (finding 6,
+      # cycle 3). With a cross-repo selector (`--repo other/repo` is honoured for real
+      # merges) GH_REPO is `other/repo`, so `other/repo#42` being MERGED would exit 0 and
+      # `merge-one.sh:695` would write `state/merged-42.done` for THIS checkout's UNMERGED
+      # PR 42 — the false-checkmark class step 0a refuses unless the target is this
+      # checkout's repo AND the PR's own url names it. Here the rail simply does not take the
+      # early exit: it keeps its normal path, which does those proofs.
+      if [ "${RAIL_REPO:-}" = "${RAIL_CHECKOUT_REPO:-}" ] \
+         && rail_pr_url_names "$RAIL_LOCK_PR" "${RAIL_CHECKOUT_REPO:-}" 2>/dev/null; then
+        info "admin-merge: ✅ PR #$RAIL_LOCK_PR is MERGED — the rail's work here is DONE; exiting 0 instead of polling a finished job."
+        rail_lock_release
+        exit 0
+      fi
+      info "admin-merge: PR #$RAIL_LOCK_PR reads MERGED, but this rail cannot prove that the merged PR is THIS checkout's PR (repo '${RAIL_REPO:-?}' vs checkout '${RAIL_CHECKOUT_REPO:-?}') — NOT taking the early exit; the normal path performs the identity proofs."
+      return 0 ;;
+    CLOSED)
+      # ⛔ NOT exit 0, and NOT a checkmark. A closed-unmerged PR is NOT merged; exit 0 is
+      # written into `state/merged-<PR>.done` by merge-one.sh, producing a ✅ over an
+      # unmerged PR. Exit 3 names it as its own outcome: nothing to merge, nothing to retry.
+      info "admin-merge: PR #$RAIL_LOCK_PR is CLOSED and NOT MERGED — nothing can be merged into a closed PR; exiting 3 (no merge, no retry)."
+      rail_lock_release
+      exit 3 ;;
+  esac
+  return 0
+}
+
+# rail_guard_poll — (b) THE BOUNDED WAIT. Called at the head of the 5 POLL loops that wait
+# on a REMOTE RUN or on the merge artifact to appear: MERGE-REF, FIRST-CHECKS, the #1417
+# self-edit wait, the RE-RUN wait, and main's #1417 re-read pass.
+# It is NOT on the two ATTEMPT-bounded retry loops (the head read at :2193 and
+# `poll_merge_artifact`'s attempt loop): those stop after a fixed number of attempts and a
+# deadline check there would add nothing. That distinction is the accurate claim (review
+# finding 9). It decides no verdict:
+#   1. the whole-attempt deadline (REFUSED(rail-deadline:…) then EXIT);
+#   2. the terminal-state re-read, throttled on ELAPSED TIME (ADMIN_MERGE_TERMINAL_CHECK_EVERY,
+#      default 60s) — NOT on a tick count, which would be ~6s in a wait that polls every
+#      second and ~6min in one that polls every 60s.
+rail_guard_poll() {
+  RAIL_POLL_TICKS=$((RAIL_POLL_TICKS + 1))
+  local now elapsed
+  now="$(date +%s)"
+  elapsed=$((now - RAIL_STARTED_AT))
+  # The terminal re-read is throttled on ELAPSED TIME, not tick count (review finding 8):
+  # a spinning silent branch polls every ~1s while a FIRST-CHECKS poll is every 60s, so a
+  # tick-based throttle is ~6s in one loop and ~6min in the other — wrong in both
+  # directions. 60s is the value the comment claims.
+  RAIL_TERMINAL_CHECK_EVERY="${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}"
+  if [ "${RAIL_DEADLINE:-0}" -gt 0 ] 2>/dev/null && [ "$elapsed" -ge "$RAIL_DEADLINE" ]; then
+    say_err "admin-merge: ✗ REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s) — the rail has spent its whole-attempt bound (ADMIN_MERGE_RAIL_DEADLINE, default FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + 4 x the fail-safe per-wait bound ${FAILSAFE_RERUN_TIMEOUT}s, i.e. ${RAIL_DEADLINE}s - i.e. every window the rail itself declares). Every individual wait in this rail DOES bound itself; the ATTEMPT is what was unbounded, and it is bounded now. This is a refusal to keep holding the merge slot, NOT a verdict about the PR: no check was made green, widened, skipped or muted, and the head-bound review evidence is untouched. Re-run the rail when the runs are readable — it re-evaluates from scratch."
+    rail_lock_release
+    exit 1
+  fi
+  if [ -n "${RAIL_LOCK_PR:-}" ] \
+     && [ $((now - RAIL_LAST_TERMINAL_CHECK)) -ge "$RAIL_TERMINAL_CHECK_EVERY" ]; then
+    RAIL_LAST_TERMINAL_CHECK=$now
+    rail_stop_if_pr_terminal
+  fi
+  return 0
+}
+validate_rail_bounds() {
+  # ⛔ THE TWO NEW KNOBS ARE VALIDATED BEFORE ANYTHING READS THEM (finding 2, cycle 2,
+  # MEASURED: `ADMIN_MERGE_RAIL_DEADLINE=7h` made `[ "$RAIL_DEADLINE" -gt 0 ]` error out, so
+  # the arm read FALSE and the rail ran with NO bound at all — silently; likewise
+  # `ADMIN_MERGE_TERMINAL_CHECK_EVERY=60s` never fired. A typo silently restoring the very
+  # hang this bound exists to end is the exact defect this file already refuses for every
+  # other timing knob, so these two get the same refusal instead of a quiet no-op.
+  case "${RAIL_DEADLINE}" in
+    ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the whole-attempt bound must be a positive integer NUMBER OF SECONDS; a non-numeric value makes the deadline comparison error out and silently removes the bound this exists to impose."; exit 2 ;;
+  esac
+  [ "$RAIL_DEADLINE" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — 0 is not 'unlimited', it is a refusal to bound the attempt at all. Set a positive number of seconds."; exit 2; }
+  case "${RAIL_LOCK_TTL}" in
+    ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — the lease TTL must be a positive integer NUMBER OF SECONDS; a non-numeric value disables lease expiry, which can block a PR forever behind a recycled pid."; exit 2 ;;
+  esac
+  # ⛔ 0 IS NOT "NO EXPIRY", it is the permanent block this TTL exists to prevent (finding 4,
+  # cycle 3): `[ "$RAIL_LOCK_TTL" -gt 0 ]` goes false, so a SIGKILLed rail's lease whose pid
+  # was reused by a long-lived fleet process is never reclaimable and the head is parked.
+  # Same refusal as RAIL_DEADLINE=0, for the same reason.
+  [ "$RAIL_LOCK_TTL" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — 0 is not 'never expire', it is a lease that can block a PR FOREVER behind a recycled pid. Set a positive number of seconds."; exit 2; }
+  # ⛔ THE TTL MUST OUTLIVE THE ATTEMPT, or a live rail can have its own lease stolen
+  # mid-run by a later rail. Cross-check, matching this file's existing CEILING-vs-STALL rule.
+  [ "$RAIL_LOCK_TTL" -gt "$RAIL_DEADLINE" ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' with ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the lease TTL must EXCEED the whole-attempt bound, or a rail still running inside its own deadline can have its lease stolen and two rails would then hold the same PR."; exit 2; }
+  # ⛔ THE DEADLINE MUST NOT FIRE BEFORE A WAIT THE RAIL DECLARES MAY LEGALLY FINISH
+  # (cycle-3 finding 1, secondary). Without this, raising ADMIN_MERGE_FIRST_CHECKS_CEILING —
+  # a documented knob — leaves the deadline behind, and the rail refuses DURING a wait it
+  # itself declared legal.
+  [ "$RAIL_DEADLINE" -gt "$FIRST_CHECKS_CEILING" ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — it must EXCEED ADMIN_MERGE_FIRST_CHECKS_CEILING='${FIRST_CHECKS_CEILING}', or the whole-attempt bound fires in the middle of a first-checks wait the rail itself declares legal."; exit 2; }
+  case "${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}" in
+    ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_TERMINAL_CHECK_EVERY='${ADMIN_MERGE_TERMINAL_CHECK_EVERY}' — it must be a positive integer NUMBER OF SECONDS, or the terminal-state exit never fires."; exit 2 ;;
+  esac
+  # ⛔ 0 IS NOT "CHECK EVERY POLL" (review cycle 6 finding 6): `[ $((now - last)) -ge 0 ]` is
+  # always true, so every guard poll issues a `gh pr view` — ~3600 calls/hour per rail in the
+  # silent spin branch, against exactly the rate limit this rail is careful about elsewhere.
+  [ "${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_TERMINAL_CHECK_EVERY='${ADMIN_MERGE_TERMINAL_CHECK_EVERY}' — 0 would issue a PR read on EVERY poll and burn the API budget. Set a positive number of seconds (default 60)."; exit 2; }
+  return 0
+}
+
 main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
   local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
+  # The BASE-side lane, when the operator names one (see --baseline-workflow).
+  # Empty means "the same lane as --workflow" — the pre-existing behaviour, so a
+  # rail invocation that does not use the flag is byte-unchanged.
+  local BASELINE_WORKFLOW="" BASELINE_WORKFLOW_SET=0
   local PRINT_BOUNDS=0 PRINT_BOUNDS_RUN=""
   # Numeric operator knobs are validated BEFORE anything reads them: a value that
   # is not a positive integer makes the `-ge`/`-lt` guards return 2 and silently
   # skip, which disables the gate rather than failing it.
   validate_timing_knobs || exit 2
+  validate_rail_bounds || exit 2
   # NO GLOBAL CEILING. An explicit --rerun-timeout (or $RERUN_TIMEOUT) is a
   # verbatim override; otherwise the bound is DERIVED from a GREEN population's
   # observed shard durations at the re-run site, and the fail-safe applies only
@@ -7514,7 +8051,8 @@ main() {
   # the default, and the rail blocks with a remedy its own invocation could not
   # have applied. Nothing said the flag was ignored — a silent, documented
   # no-op. So the boundary is now enforced in BOTH directions:
-  #   * the two LANE-SELECTOR flags are RECOVERED from after `--` and applied as
+  #   * the THREE lane-selector flags (--workflow, --any-workflow,
+  #     --baseline-workflow) are RECOVERED from after `--` and applied as
   #     parser flags (LOUDLY, so the caller learns the boundary) — the documented
   #     order is no longer a trap; and
   #   * every OTHER post-`--` token must be one of `gh pr merge`'s own flags. An
@@ -7540,13 +8078,59 @@ main() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --main-runs) MAIN_RUNS="${2:-}"; shift 2 ;;
-      --repo) REPO="${2:-}"; shift 2 ;;
-      --workflow) WORKFLOW="${2:-}"; shift 2 ;;
+      # ⛔ EVERY VALUE-TAKING FLAG REFUSES A MISSING/EMPTY VALUE, and for one
+      # reason: `shift 2` with one argument left FAILS and leaves `$#` unchanged, so
+      # the loop re-reads the same token FOREVER ("shift count out of range" on
+      # stderr, the rail never exits — a wedged lane, not a refusal). That was live
+      # for all four of these before this change; the guard is uniform rather than
+      # only on the new flag. An empty value is refused for the same class of
+      # reason: `--workflow ''` would read as the `--any-workflow` opt-out and
+      # `--repo ''` would silently fall back to the checkout's origin.
+      --main-runs)
+        if [ $# -lt 2 ]; then MAIN_RUNS=""; shift; else MAIN_RUNS="$2"; shift 2; fi ;;
+      --repo)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          say_err "admin-merge: ✗ refusing '--repo' — it needs owner/name as the NEXT argument."
+          exit 2
+        fi
+        REPO="$2"; shift 2 ;;
+      --workflow)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+          say_err "admin-merge: ✗ refusing '--workflow' — it needs the lane (a file or a display name) as the"
+          say_err "   NEXT argument. An EMPTY lane would read as the --any-workflow opt-out, which is a"
+          say_err "   silent widening; pass --any-workflow if that is what you mean."
+          exit 2
+        fi
+        WORKFLOW="$2"; shift 2 ;;
       --any-workflow) ANY_WORKFLOW=1; shift ;;
-      --rerun-timeout) RERUN_TIMEOUT="${2:-}"; RERUN_TIMEOUT_EXPLICIT=1; RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"; shift 2 ;;
-      --rerun-budget) RERUN_BUDGET="${2:-}"; shift 2 ;;
-      --rerun-attempts) RERUN_MAX_ATTEMPTS="${2:-}"; shift 2 ;;
+      --baseline-workflow)
+        # ⛔ A TRAILING FLAG (no value) MUST BE REFUSED, NOT SHIFTED PAST THE END.
+        # `shift 2` with one argument left FAILS, leaves `$#` unchanged, and the
+        # loop re-reads the SAME token forever (stderr says "shift count out of
+        # range" once per turn, and the rail never returns). Leave the value empty
+        # and let the validation below refuse it with the documented message.
+        # (`--workflow`/`--repo`/`--main-runs` carry the same pre-existing shape;
+        # this new flag does not get to:
+        if [ $# -lt 2 ]; then BASELINE_WORKFLOW=""; BASELINE_WORKFLOW_SET=1; shift
+        else BASELINE_WORKFLOW="${2:-}"; BASELINE_WORKFLOW_SET=1; shift 2; fi ;;
+      --rerun-timeout)
+        if [ $# -lt 2 ]; then RERUN_TIMEOUT=""; else RERUN_TIMEOUT="$2"; fi
+        RERUN_TIMEOUT_EXPLICIT=1; RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"
+        if [ $# -lt 2 ]; then shift; else shift 2; fi ;;
+      # ── THE RE-RUN PHASE BUDGET'S TWO KNOBS (#3280), CARRYING THE SAME GUARD ──
+      # #3280 landed these as a bare `shift 2`, which is the ONE shape the rule at
+      # the top of this loop exists to remove: `--rerun-budget` as the LAST token
+      # makes `shift 2` FAIL, leave `$#` unchanged, and re-read itself FOREVER —
+      # the wedged rail, not a refusal. Left EMPTY instead, the post-parse
+      # `validate_timing_knobs` refuses it by name (exit 2) with the documented
+      # message, which is the same contract the flags above honour. Valid input is
+      # untouched: whenever a value is present these arms assign it verbatim.
+      --rerun-budget)
+        if [ $# -lt 2 ]; then RERUN_BUDGET=""; else RERUN_BUDGET="${2:-}"; fi
+        if [ $# -lt 2 ]; then shift; else shift 2; fi ;;
+      --rerun-attempts)
+        if [ $# -lt 2 ]; then RERUN_MAX_ATTEMPTS=""; else RERUN_MAX_ATTEMPTS="${2:-}"; fi
+        if [ $# -lt 2 ]; then shift; else shift 2; fi ;;
       --no-rerun) NO_RERUN=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       # Make the DERIVATION visible on demand: the re-run bound is not a round
@@ -7580,6 +8164,21 @@ main() {
                   exit 2
                 fi
                 RECOVERED+=(--any-workflow); shift; continue ;;
+              --baseline-workflow)
+                if [ "$ps_inline" -eq 1 ]; then
+                  say_err "admin-merge: ✗ refusing '$1' — the parser's --baseline-workflow takes its value as"
+                  say_err "   the NEXT argument and must precede the separator:"
+                  say_err "   admin-merge.sh <PR> --baseline-workflow <f> -- …"
+                  exit 2
+                fi
+                if [ $# -lt 2 ] || [ -z "${2:-}" ] || [ "${2#-}" != "$2" ]; then
+                  say_err "admin-merge: ✗ refusing '--baseline-workflow' after the '--' separator — it needs"
+                  say_err "   its value as the NEXT argument, and a flag cannot be that value. Put it BEFORE"
+                  say_err "   the separator: admin-merge.sh <PR> --baseline-workflow <file> -- <gh flags>"
+                  exit 2
+                fi
+                RECOVERED+=(--baseline-workflow "$2"); shift 2
+                continue ;;
               --workflow)
                 if [ "$ps_inline" -eq 1 ]; then
                   say_err "admin-merge: ✗ refusing '$1' — the parser's --workflow takes its value as the NEXT"
@@ -7639,6 +8238,18 @@ main() {
             esac
           done ;;
       --admin|--admin=true) shift ;;  # always added by this script
+      # ⛔ A PARSER FLAG SPELLED INLINE (`--workflow=x`, `--baseline-workflow=y`)
+      # would otherwise fall through to `-*)` and be handed to `gh pr merge`: the
+      # operator's selector is then SILENTLY IGNORED — the certificate is computed
+      # against a lane they did not ask for — and gh rejects the stray token only
+      # later, after the analysis. Refused by name, exactly as the post-`--`
+      # recovery refuses the inline spelling (the two spellings must not disagree).
+      --workflow=*|--baseline-workflow=*|--main-runs=*|--repo=*|--rerun-timeout=*)
+        say_err "admin-merge: ✗ refusing '$1' — this parser's flags take their value as the NEXT"
+        say_err "   argument, so an inline '=' spelling never reaches the rail: it would be handed"
+        say_err "   to gh instead, and the selector you wrote would be silently ignored."
+        say_err "   Write it as: ${1%%=*} <value>"
+        exit 2 ;;
       -*) case "$1" in --merge|--rebase|--squash) MERGE_METHOD_SET=1 ;; esac
           MERGE_ARGS+=("$1"); shift ;;
       *)
@@ -7664,15 +8275,56 @@ main() {
     say_err "admin-merge: ⚠ parser flag(s) found AFTER the '--' separator — recovering them for the parser"
     say_err "   (only 'gh pr merge' flags belong after '--'; a lane selector is recovered instead of being"
     say_err "    handed to gh, which would reject it)."
-    say_err "   Prefer: admin-merge.sh <PR> [--workflow <f>|--any-workflow] -- <gh flags>"
+    say_err "   Prefer: admin-merge.sh <PR> [--workflow <f>|--any-workflow|--baseline-workflow <f>] -- <gh flags>"
     local ri=0 rn="${#RECOVERED[@]}"
     while [ "$ri" -lt "$rn" ]; do
       case "${RECOVERED[$ri]}" in
         --any-workflow) ANY_WORKFLOW=1; ri=$((ri + 1)) ;;
         --workflow) WORKFLOW="${RECOVERED[$((ri + 1))]:-}"; ri=$((ri + 2)) ;;
+        --baseline-workflow) BASELINE_WORKFLOW="${RECOVERED[$((ri + 1))]:-}"; BASELINE_WORKFLOW_SET=1; ri=$((ri + 2)) ;;
         *) ri=$((ri + 1)) ;;
       esac
     done
+  fi
+
+  # ── --baseline-workflow: VALIDATED BEFORE ANY CI WORK ───────────────────
+  # Three refusals, all pre-gh, because each one would otherwise be a SILENT
+  # widening of the certificate rather than an error:
+  #   * EMPTY  — an empty value cannot be distinguished from "not given", so it
+  #     would quietly fall back to --workflow, i.e. to the lane whose absence from
+  #     main is the whole reason the flag is being passed (#4078's own class).
+  #   * a FLAG  — `--baseline-workflow --any-workflow` would swallow the opt-out
+  #     as a filename and then look for a workflow literally named
+  #     `--any-workflow`; refuse the spelling instead of the symptom.
+  #   * a SENTINEL meaning "any" (`any`, `*`, `ANY`) — refused BY NAME. A widened
+  #     sample is not a baseline source (see the usage note): it is satisfied by
+  #     bookkeeping runs that measure nothing, so accepting it would restore the
+  #     exact failure this flag exists to remove. A baseline is a NAMED workflow.
+  if [ "$BASELINE_WORKFLOW_SET" -eq 1 ]; then
+    # TRIM FIRST. `--baseline-workflow ' any'` (or a trailing space, or an empty
+    # all-whitespace value) would otherwise slip past the sentinel case and reach
+    # `gh run list --workflow ''` — seven API calls before the rail failed closed.
+    # A workflow name never carries surrounding whitespace, so trimming is total.
+    BASELINE_WORKFLOW="${BASELINE_WORKFLOW#"${BASELINE_WORKFLOW%%[![:space:]]*}"}"
+    BASELINE_WORKFLOW="${BASELINE_WORKFLOW%"${BASELINE_WORKFLOW##*[![:space:]]}"}"
+    local baseline_folded
+    baseline_folded="$(printf '%s' "$BASELINE_WORKFLOW" | tr '[:upper:]' '[:lower:]')"
+    case "$baseline_folded" in
+      ""|-*)
+        say_err "admin-merge: ✗ refusing --baseline-workflow '${BASELINE_WORKFLOW}' — it must name the WORKFLOW"
+        say_err "   whose runs on main form the baseline (a file or a display name), as the NEXT argument."
+        say_err "   Omit the flag entirely if the PR lane is also the main-side lane (that is the default)."
+        exit 2 ;;
+      any|'*'|all)
+        say_err "admin-merge: ✗ refusing --baseline-workflow '${BASELINE_WORKFLOW}' — a baseline is a NAMED"
+        say_err "   workflow, never a widening. Widening the reference to EVERY workflow on main admits runs"
+        say_err "   that MEASURE NOTHING as measurements — measured on main's 200-run window: 187 were"
+        say_err "   'Pipeline Compliance' (issue_comment: 148 skipped, 38 success, 1 other), so the widening stopped at"
+        say_err "   width 40 with 11 'measurements' = 8 bookkeeping + 2 detector + 1 code-lane run."
+        say_err "   Name the workflow whose runs on main actually measure the tree (--baseline-workflow <f>),"
+        say_err "   or record that this repo has no main-side measurement and let the rail say so."
+        exit 2 ;;
+    esac
   fi
 
   # The baseline WINDOW is an operator knob like the timing ones, and it is
@@ -7742,6 +8394,14 @@ main() {
   # every `--print-bounds <run-id>` arm in the suite passes `--repo`).
   resolve_rail_repo "$REPO" || exit 2
   REPO="$RAIL_REPO"
+  # ⛔ (c) PER-PR EXCLUSION — before ANY CI work, comment or merge (#3194).
+  # The key carries the repo because one PR NUMBER exists in BOTH repos, and a bare
+  # number is exactly how #2235 printed a ✅ over an unmerged PR. Acquiring here means
+  # a duplicate exits before it can spend a slot, post a comment or reach a merge.
+  # The PR is validated numeric a few lines below; `rail_lock_acquire` itself refuses to
+  # take a lease on a non-numeric/empty PR, so `--print-bounds` and the usage errors keep
+  # working and can never render `ALREADY-RAILING()` with an empty number (finding 6).
+  rail_lock_acquire "${RAIL_REPO//\//-}-$PR"
 
   # The derivation report is an inspection: print and exit BEFORE any PR is
   # required, so `--print-bounds <run-id>` works on a bare invocation.
@@ -7795,7 +8455,10 @@ main() {
   # nothing can trap that — so this narrows the window rather than closing it to zero. The path
   # is `mktemp`-generated and read from the file-scope `READ_ERRTMP` at TRAP TIME, so it follows
   # the file the reads actually created instead of naming a predictable path (#1750 review).
-  trap 'rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
+  # CHAINED, not replaced: an EXIT trap here OVERWRITES any earlier one, so without the
+  # second call the per-PR lease would survive every normal exit and the exclusion would
+  # rest entirely on the dead-pid reclaim path (review finding 3).
+  trap 'rail_lock_release; rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
 
   # ── 0a. ALREADY MERGED ⇒ BENIGN NO-OP (#1709 rec 7) ──────────────────────
   # The rail runs at-least-once: a crash, a pause that resumes, or a second box
@@ -8026,6 +8689,7 @@ main() {
   # `pr-drops.err` FILE is left intact — the attribution half reads it later.
   local pr_drops_emitted=""
   while :; do
+  rail_guard_poll
     pr_status=0
     # THE PARSER'S DIAGNOSTICS ARE CAPTURED, NOT INHERITED (#1353): the dropped
     # FAILED tokens it names are the ONLY source of the attribution half, and they
@@ -8356,8 +9020,38 @@ main() {
   # Both halves of ONE measurement. The rate table alone is not enough: an empty
   # `main_signatures` makes the decision's subset rule fail CLOSED and no failure
   # is ever exempt. Neither side is drawn from the repo being merged.
+  #
+  # ── THE BASE SIDE MAY BE A DIFFERENT LANE THAN THE HEAD SIDE ─────────────
+  # `--baseline-workflow` names the workflow whose runs on MAIN are the
+  # reference; `--workflow` names the PR's own lane. The certificate is a
+  # comparison, and on a `pull_request`-only lane the base population is empty BY
+  # CONSTRUCTION, so one name cannot serve both sides.
+  # ⛔ THE DEFAULT IS THE PRE-EXISTING ONE, and it is taken HERE rather than early
+  # on purpose: step 0b's #1614 fallback REWRITES `wf_args` (to --any-workflow)
+  # when the watched lane cannot fire for this diff, and the base side must keep
+  # widening WITH it exactly as before. With no flag, `baseline_wf_args` IS
+  # `wf_args` and `blane` IS `lane`, so every invocation that does not use the flag
+  # is byte-unchanged (pinned by the suite's golden arm).
+  # ⛔ AND `--any-workflow` STILL SUPPLIES THE BASE SIDE WHEN NO BASELINE IS NAMED —
+  # unchanged, including step 0b's #1614 fallback, which can set it with no operator
+  # flag at all. The copy below is what preserves that; do not "tighten" it into a
+  # refusal. What `--any-workflow` cannot do is BE the baseline once one is named (the
+  # first branch wins) or be given AS one (`--baseline-workflow any` is refused by
+  # name, pre-gh) — that is a statement about remedies and values, not about the
+  # pre-existing read path.
+  local baseline_wf_args=() blane="$lane"
+  if [ -n "$BASELINE_WORKFLOW" ]; then
+    baseline_wf_args=(--workflow "$BASELINE_WORKFLOW")
+    blane="$BASELINE_WORKFLOW"
+  elif [ "${#wf_args[@]}" -gt 0 ]; then
+    # QUOTED, element-by-element. `--workflow` accepts a display NAME as well as a
+    # file, and a display name can contain spaces (agent-infra's own push lane
+    # shows as `CI on main`): an unquoted `${wf_args[@]}` would split it into three
+    # arguments and hand the parser a mangled selector.
+    baseline_wf_args=("${wf_args[@]}")
+  fi
   local main_status=0
-  run_failure_set --main-union-rates "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+  run_failure_set --main-union-rates "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${baseline_wf_args[@]+"${baseline_wf_args[@]}"} \
     --exclude "$head" --provenance "$TMP/main-runs.txt" --runs-report "$TMP/main-report.txt" \
     > "$TMP/main-rates.txt" 2> "$TMP/main-drops.err" || main_status=$?
   [ -s "$TMP/main-drops.err" ] && cat "$TMP/main-drops.err" >&2
@@ -8425,7 +9119,7 @@ main() {
   # its drops are the same tokens the rate pass already counted — capturing them
   # into the rate file would DOUBLE the count in the evidence. They are re-emitted
   # for visibility and deliberately NOT counted.
-  run_failure_set --main-union-signatures "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+  run_failure_set --main-union-signatures "$MAIN_RUNS" ${repo_args[@]+"${repo_args[@]}"} ${baseline_wf_args[@]+"${baseline_wf_args[@]}"} \
     --exclude "$head" --runs-report "$TMP/main-sig-report.txt" \
     > "$TMP/main-signatures.txt" 2> "$TMP/main-sig-drops.err" || main_sig_status=$?
   [ -s "$TMP/main-sig-drops.err" ] && cat "$TMP/main-sig-drops.err" >&2
@@ -8486,8 +9180,10 @@ main() {
   # OUTCOME of a comparison that happened, "never tested main" is a
   # MISCONFIGURATION in which none did, and a reader must tell them apart. Repos
   # that split their lanes by trigger (a pull_request-only lane and a push-only
-  # lane — this one does) have no single --workflow spanning both sides, which is
-  # what --any-workflow is for (#1003).
+  # lane — this one does) have no single --workflow spanning both sides. The
+  # remedy for that is `--baseline-workflow <main-lane>`: TWO names, so the
+  # reference is drawn from a lane that MEASURES main. It is NOT `--any-workflow`
+  # (see BASELINE-INAPPLICABLE below for the measurement that rules it out).
   local main_tested main_completed
   # The EMPTY-baseline reason, computed ONCE at step 2b-bis and reused verbatim in the
   # posted evidence's `main side:` line, so stdout and the durable artifact cannot
@@ -8496,15 +9192,66 @@ main() {
   main_tested="$(report_value "$TMP/main-report.txt" tested)"
   main_completed="$(report_value "$TMP/main-report.txt" completed)"
   if ! counter_is_positive "$main_tested"; then
-    say_err "admin-merge: ✗ BLOCK — the lane '$lane' never TESTED main, so there is no baseline."
-    say_err "   main: completed=${main_completed:-0} run(s), of which tested=${main_tested:-0}."
+    # ── BASELINE-INAPPLICABLE — a FIRST-CLASS STATE, not a pass ───────────────
+    # The BASE-side population of the lane this run drew its baseline from is
+    # EMPTY, so there is nothing to compare against. On a `pull_request`-only lane
+    # that is true BY CONSTRUCTION (`gh run list --branch main --workflow ci.yml`
+    # returns `[]` because ci.yml never runs on main), so the state is a property
+    # of the LANE PAIR the operator selected, and it has exactly THREE honest exits
+    # (below): one spanning lane, two named lanes, or no main-side measurement at all.
+    # ⛔ IT MUST NOT SUGGEST --any-workflow. That widening admits runs that measure
+    # nothing (measured on main's 200-run window: 187 `Pipeline Compliance` —
+    # issue_comment, 148 skipped / 38 success / 1 other — 7 detector, 6 `CI on main`; the
+    # widening stopped at width 40 with 11 "measurements" = 8 bookkeeping + 2
+    # detector + 1 code-lane run). A reached sample is not a measured one.
+    # (The counts are the research record's; they break down 187 = 148 + 38 + 1.)
+    # ⛔ AND IT MUST NOT SOFTEN: with an empty base population and no
+    # --baseline-workflow the outcome is THIS REFUSAL, never a pass. Naming a
+    # baseline can only let the rail judge WITH provenance — never WITHOUT.
+    #
+    # WHY THE TWO NAMES EXIST AT ALL. The widened union CAN reach a verdict (it
+    # reached the same 19/2 on 2026-11-02 through an unfiltered window), so this
+    # state is not about reachability: it is about PROVENANCE. A baseline whose
+    # composition is decided by whatever traffic main happens to carry is a
+    # measurement of the wrong population, even when its arithmetic works out.
+    local baseline_source_note
+    if [ -n "$BASELINE_WORKFLOW" ]; then
+      baseline_source_note="that name came from --baseline-workflow, which you named"
+    elif [ "$ANY_WORKFLOW" -eq 1 ]; then
+      baseline_source_note="the lane filter was DROPPED for this run (--any-workflow, or step 0b's lane-applicability fallback), so EVERY workflow on main was read"
+    else
+      baseline_source_note="that name is the watched lane (--workflow, or the CI_FAILURE_SET_WORKFLOW/python-ci.yml default), and no --baseline-workflow was named"
+    fi
+    say_err "admin-merge: ✗ BLOCK — BASELINE-INAPPLICABLE: the baseline lane '$blane' never TESTED main, so there is no baseline."
+    say_err "   Looked for: runs of '$blane' on main — ${baseline_source_note}."
+    say_err "   main: completed=${main_completed:-0} run(s), of which tested=${main_tested:-0} — the base population is EMPTY."
     say_err "   A rail certificate claims \"this PR carries no failure that is not already red"
-    say_err "   on main\". That claim IS a comparison. With nothing on main to compare against,"
-    say_err "   every failure this PR carries reads as new — PRE-EXISTING ones included — and a"
-    say_err "   safe merge is refused for the wrong reason."
-    say_err "   A repo can split its lanes by TRIGGER (a PR-only lane and a main-only lane), and"
-    say_err "   then no single --workflow spans both sides. Compare against every lane on main"
-    say_err "   instead: add --any-workflow BEFORE the -- separator."
+    say_err "   on main\". That claim IS a comparison, and an EMPTY comparison is not a clean"
+    say_err "   one: every failure this PR carries would read as new, PRE-EXISTING ones included,"
+    say_err "   and a safe merge would be refused for the wrong reason. A pull_request-only lane"
+    say_err "   is empty on main BY CONSTRUCTION — it cannot be its own baseline."
+    say_err "   REMEDIES, in order of preference — all three are the operator's choice, and none of"
+    say_err "   them is --any-workflow:"
+    say_err "   1. ONE LANE THAT RUNS ON BOTH SIDES. If this repo has a lane that runs on push and"
+    say_err "      on pull_request alike, name it with --workflow ALONE (no --baseline-workflow):"
+    say_err "        admin-merge.sh <PR> --workflow <spanning-lane>"
+    say_err "      Both sides are then read from one population that exists, exactly as this rail"
+    say_err "      always did. This is the cheapest correct fix and it is why this state is a"
+    say_err "      LANE-PAIR fault rather than a repo fault."
+    say_err "   2. TWO LANES. If the PR lane and the base lane are different workflows, name the"
+    say_err "      base one explicitly:"
+    say_err "        admin-merge.sh <PR> --workflow <pr-lane> --baseline-workflow <main-lane>"
+    say_err "      The reference is then drawn from a workflow that MEASURES main, and the posted"
+    say_err "      evidence names it ('main compared (union of N runs of <main-lane>)')."
+    say_err "   3. NO MAIN-SIDE MEASUREMENT AT ALL. If no workflow of this repo measures main, then"
+    say_err "      this rail CANNOT certify the comparison and no flag here changes that. It is a"
+    say_err "      DECISION, not a knob: the audited AGENT_ADMIN_MERGE_OVERRIDE=1 route bypasses the"
+    say_err "      certificate (logged as admin_merge_override) — it is a bypass, never a wider sample."
+    say_err "   NOT --any-workflow: widening the reference to EVERY workflow on main admits runs that"
+    say_err "   MEASURE NOTHING as measurements — measured on main's 200-run window, 187 of 200 were"
+    say_err "   'Pipeline Compliance' (issue_comment: 148 skipped, 38 success, 1 other), and the widening"
+    say_err "   stopped at width 40 with 11 'measurements' = 8 bookkeeping + 2 detector + 1 code-lane"
+    say_err "   run. That path can reach a verdict; it cannot say what was measured."
     exit 1
   fi
 
@@ -8527,7 +9274,7 @@ main() {
     local main_examined main_extracted
     main_examined="$(report_value "$TMP/main-report.txt" examined)"
     main_extracted="$(report_value "$TMP/main-report.txt" extracted)"
-    info "admin-merge: main's baseline is EMPTY BY MEASUREMENT — 0 failing id(s) over ${main_tested} tested run(s) of ${main_completed} completed (lane: $lane)."
+    info "admin-merge: main's baseline is EMPTY BY MEASUREMENT — 0 failing id(s) over ${main_tested} tested run(s) of ${main_completed} completed (lane: $blane)."
     # ONE predicate, and the reason it produces is used BOTH here and in the POSTED
     # EVIDENCE below (`main side:`), because the evidence body is the durable artifact
     # a human and the verifier read: `verify-admin-merge-evidence.sh` names that very
@@ -9542,7 +10289,7 @@ $attribution_line"
             say_err "   matched only workflow LIFECYCLE (bookkeeping) jobs, which measure no test."
             say_err "   That is a MISNAMED family — NOT an unreadable list and NOT a red check." ;;
           *)
-            say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
+            say_err "   lane coverage could not be established (lane: ${LANE_PARITY_BASE_LANE:-$lane}). 'Nothing was compared'"
             say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
             say_err "   readable — and an unreadable shard list is NOT an empty one." ;;
         esac
@@ -9619,15 +10366,32 @@ $attribution_line"
     # The vacuous outcome is STATED, never implied — and it states WHAT it rests
     # on: the comparison, its coverage, and per side WHY each set is empty. The
     # two are different facts and a reader must not have to guess.
+    #
+    # ⛔ AND IT MUST NAME BOTH LANES WHEN THERE ARE TWO (#3229 review). With
+    # `--baseline-workflow` the two measured sets came from DIFFERENT workflows by
+    # design, so a single `(lane: $lane)` misnames the base population — and the
+    # closing sentence, which says the zeros are 'Correct … ONLY when both sides ran
+    # the SAME lane', would contradict the run it is describing. The default renders
+    # exactly as before (the contract suite pins those bytes); the two-name run says
+    # which lane each side was measured over, and what the parity line therefore
+    # rests on.
+    local vac_lanes vac_closing
+    if [ "$blane" = "$lane" ]; then
+      vac_lanes="(lane: $lane)"
+      vac_closing="Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."
+    else
+      vac_lanes="(lanes: PR=$lane, main=$blane)"
+      vac_closing="Correct when BOTH lanes are green — and here the two sides were measured over DIFFERENT workflows by declaration (--baseline-workflow), so 'the same lane' is not the question: the per-side counters tell 'green' from 'never run', and the parity line tells whether the PR's lane executed every shard MAIN's lane executed. A wrong lane selector on either side certifies neither."
+    fi
     analyzed="$analyzed
 ⚠️ vacuous comparison — no failure was compared, because NEITHER measured set carried one.
-   measured sets: PR failing runs=0 | main failing runs=0 (lane: $lane)
+   measured sets: PR failing runs=0 | main failing runs=0 ${vac_lanes}
    lane parity: $parity_evidence
    PR side: ${pr_examined:-0} failing run(s) of ${pr_completed:-0} completed / ${pr_tested:-0} tested for head $head (${pr_pending:-0} pending). EMPTY because nothing FAILED — a failing run whose log yielded no parseable failure identity would have BLOCKED at step 1c, not read as zero.
    main side: $(report_value "$TMP/main-report.txt" examined) failing run(s) of ${main_completed:-0} completed / ${main_tested:-0} tested over the window ($MAIN_RUNS run(s) requested). ${main_side_reason:-EMPTY, but the window published no examined/extracted counters, so its completeness is UNKNOWN.}
    main check surface: $BASE_STATUS — $BASE_RED failing of $BASE_TOTAL measured, $BASE_PENDING pending; read across EVERY workflow, not just this lane. CONTEXT ONLY: it never blocks (a PR that repairs a red base must still land).
    PR evaluated tree: $TREE_STATUS — $TREE_RED failing of $TREE_TOTAL measured, $TREE_PENDING pending; read from the HEAD commit, where GitHub reports the merge-ref evaluation, across EVERY workflow. THIS is the surface that gates the merge.
-   Correct when the lane is green on both sides — but ONLY when both sides ran the SAME lane. The per-side counters tell 'green' from 'never run'; the parity line tells 'the same lane' from 'two different lanes'. A wrong lane selector certifies neither."
+   ${vac_closing}"
     # The widening disclosure is appended HERE, after the literal: the `lane
     # parity:` line above must stay byte-identical to what the gate and the
     # contract suite pin (#4844, #1388).
@@ -9639,7 +10403,7 @@ ${parity_window_note}"
       analyzed="${analyzed}
 ${parity_forgiven_note}"
     fi
-    info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); lane parity: $parity_evidence; PR tree: $TREE_STATUS ($TREE_RED failing of $TREE_TOTAL measured); main check surface: $BASE_STATUS ($BASE_RED failing of $BASE_TOTAL measured, context only)"
+    info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 ${vac_lanes}; lane parity: $parity_evidence; PR tree: $TREE_STATUS ($TREE_RED failing of $TREE_TOTAL measured); main check surface: $BASE_STATUS ($BASE_RED failing of $BASE_TOTAL measured, context only)"
   fi
 
   info "admin-merge: PR failing: $pr_count | main failing: $main_count | blocked by the decision: 0"
@@ -9666,7 +10430,7 @@ ${parity_forgiven_note}"
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
     "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
-    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" "$repro_line" "$repro_n" > "$TMP/evidence.md"
+    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" "$repro_line" "$repro_n" "$blane" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
