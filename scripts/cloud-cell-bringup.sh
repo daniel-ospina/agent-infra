@@ -1481,7 +1481,9 @@ check_graph_client() {
   # client would happily take the fallback — a false statement on the one line the operator reads.
   local in_file="unknown"
   if [ -r "$ENV_FILE" ]; then
-    # The `&& printf x` sentinel is the supervisor idiom's whole point: the exit STATUS alone cannot
+    # The SUPERVISOR's `&& printf x` sentinel is the idiom's whole point, reproduced here as a captured
+    # `printf mcp` / `printf rest` (the construct below, not that one — grepping for `printf x` finds
+    # `cloud-cell-supervisor.sh`, not this check): the exit STATUS alone cannot
     # separate "the test ran and found the key" from "the file terminated the shell before the test"
     # (a `keys.env` with an early `exit 0` satisfies `if` on status 0). Only a value that came out of
     # the subshell proves the test ran.

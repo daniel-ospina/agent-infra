@@ -14,9 +14,9 @@
 # pasted into this file would pass on the broken original too — the same reason
 # `cloud-cell-bringup.test.sh` drives the shipped script end-to-end.
 #
-# THE NON-VACUITY FLOOR: the extraction must produce a non-empty function and the FIRST case must pass,
-# because a probe that silently extracted nothing would report every later arm as a missing-string
-# failure and read as "the fix is broken" instead of "the probe is broken".
+# THE NON-VACUITY FLOOR: the extraction must produce a non-empty function that PARSES, or the suite
+# stops here with rc=1. Without it a probe that silently extracted nothing would report every later arm
+# as a missing-string failure, which reads as "the fix is broken" instead of "the probe is broken".
 #
 # Usage:  bash scripts/cloud-cell-bringup.graph-client.test.sh
 # Exit:   0 = all arms pass, 1 = at least one arm failed.
@@ -102,6 +102,7 @@ expect good "graph client: present at"
 # the sentence itself is pinned.
 expect good "presence only"
 expect good "cell-install.sh --verify"
+expect good "only once this box's checkout declares it in"
 expect good "tortoise_graph_client.py beside it"
 expect good "graph credential: TORTOISE_MCP_API_KEY is set in"
 expect_absent good "warn:"
@@ -179,21 +180,21 @@ fi
 # ── case 8: the key is in THIS SHELL but not in the file — a lane still has none ──────────
 # (this arm and the two below also make case 12's leak assertion NON-VACUOUS: with no ambient value,
 # a check that echoed the environment's key would echo an empty string and pass.)
-H9="$TMP/h9"; E9="$TMP/h9/keys.env"
-mkdir -p "$H9/.pi/agent/scripts"
-: >"$H9/.pi/agent/scripts/tortoise-graph.sh"; : >"$H9/.pi/agent/scripts/tortoise_graph_client.py"
-printf 'NOTHING=1\n' >"$E9"
-TORTOISE_MCP_API_KEY="$SECRET" HOME="$H9" ENV_FILE="$E9" run_case ambient_mcp >"$TMP/ambient_mcp.stdout" 2>"$TMP/ambient_mcp.err"
+H8="$TMP/h8"; E8="$TMP/h8/keys.env"
+mkdir -p "$H8/.pi/agent/scripts"
+: >"$H8/.pi/agent/scripts/tortoise-graph.sh"; : >"$H8/.pi/agent/scripts/tortoise_graph_client.py"
+printf 'NOTHING=1\n' >"$E8"
+TORTOISE_MCP_API_KEY="$SECRET" HOME="$H8" ENV_FILE="$E8" run_case ambient_mcp >"$TMP/ambient_mcp.stdout" 2>"$TMP/ambient_mcp.err"
 expect ambient_mcp "graph credential NOT REACHING LANES"
 expect_absent ambient_mcp "$SECRET"
 clean ambient_mcp
 
 # ── case 9: the REST key ambient, nothing in the file — UNCERTAIN, never ok ────────────────
-H10="$TMP/h10"; E10="$TMP/h10/keys.env"
-mkdir -p "$H10/.pi/agent/scripts"
-: >"$H10/.pi/agent/scripts/tortoise-graph.sh"; : >"$H10/.pi/agent/scripts/tortoise_graph_client.py"
-printf 'NOTHING=1\n' >"$E10"
-TORTOISE_API_KEY="$SECRET" HOME="$H10" ENV_FILE="$E10" run_case ambient_rest >"$TMP/ambient_rest.stdout" 2>"$TMP/ambient_rest.err"
+H9="$TMP/h9"; E9="$TMP/h9/keys.env"
+mkdir -p "$H9/.pi/agent/scripts"
+: >"$H9/.pi/agent/scripts/tortoise-graph.sh"; : >"$H9/.pi/agent/scripts/tortoise_graph_client.py"
+printf 'NOTHING=1\n' >"$E9"
+TORTOISE_API_KEY="$SECRET" HOME="$H9" ENV_FILE="$E9" run_case ambient_rest >"$TMP/ambient_rest.stdout" 2>"$TMP/ambient_rest.err"
 expect ambient_rest "graph credential UNCERTAIN"
 expect_absent ambient_rest "graph credential: TORTOISE_MCP_API_KEY is set"
 expect_absent ambient_rest "$SECRET"
@@ -202,11 +203,11 @@ clean ambient_rest
 # ── case 10: the file carries the key AND the shell does too — the ok line must not echo it ───
 # This is the shape a real cell has (`check_provider` sources keys.env into the bring-up shell), so it
 # is the case in which a `printf %s "$TORTOISE_MCP_API_KEY"` inside the ok line would actually leak.
-H11="$TMP/h11"; E11="$TMP/h11/keys.env"
-mkdir -p "$H11/.pi/agent/scripts"
-: >"$H11/.pi/agent/scripts/tortoise-graph.sh"; : >"$H11/.pi/agent/scripts/tortoise_graph_client.py"
-printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E11"
-TORTOISE_MCP_API_KEY="$SECRET" HOME="$H11" ENV_FILE="$E11" run_case both >"$TMP/both.stdout" 2>"$TMP/both.err"
+H10="$TMP/h10"; E10="$TMP/h10/keys.env"
+mkdir -p "$H10/.pi/agent/scripts"
+: >"$H10/.pi/agent/scripts/tortoise-graph.sh"; : >"$H10/.pi/agent/scripts/tortoise_graph_client.py"
+printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E10"
+TORTOISE_MCP_API_KEY="$SECRET" HOME="$H10" ENV_FILE="$E10" run_case both >"$TMP/both.stdout" 2>"$TMP/both.err"
 expect both "graph credential: TORTOISE_MCP_API_KEY is set in"
 expect_absent both "$SECRET"
 clean both
@@ -233,28 +234,53 @@ if [ "$order_ok" -eq 1 ]; then pass; else
 fi
 
 # ── case 12: THE RULE — the key's value never appears, in any arm ─────────────────────────────────
-# ⛔ SCANNED: the stub transcript, the case's REAL STDOUT, and its STDERR. The first version scanned
-# only "$TMP"/*.out — the `ok`/`warn` transcript — so a check that printed the value with `echo`/`printf`
-# went straight to the suite's own stdout and the suite still reported 43/43 passed (measured
-# 2026-11-03). The rule is about what an OPERATOR ends up pasting into an issue, so the sweep covers
-# every stream the check can write to, not the one this harness happens to capture.
-leaked=0
-for f in "$TMP"/*.out "$TMP"/*.stdout "$TMP"/*.err; do
-    [ -s "$f" ] || continue
-    if grep -qF -- "$SECRET" "$f"; then
-        fail "credential leak: $(basename "$f") contains the key's VALUE — this output is captured, mailed and pasted into issues"
-        leaked=1
-    fi
+# ⛔ ONE SCAN, USED TWICE. The rule is about what an OPERATOR ends up pasting into an issue, so the
+# sweep covers every stream the check can write to — the stub transcript AND the case's real stdout and
+# stderr. The first version scanned only "$TMP"/*.out (a `printf` leak in the check went straight to the
+# suite's own stdout, 43/43 green), and the SECOND version's "self-test" was a separate grep that never
+# exercised the loop at all: deleting the loop, or narrowing it back to *.out, left the suite green while
+# the value sat in a case file (both measured 2026-11-03). So the scan is a FUNCTION, both uses call it,
+# and the self-test asserts the REAL arm's own output — a lost or narrowed arm is loud, not quiet.
+LEAK_FILES=()
+leak_scan() { # <file>... → fills LEAK_FILES with every file carrying the value; rc 0 when any does
+    LEAK_FILES=()
+    local f
+    for f in "$@"; do
+        [ -s "$f" ] || continue
+        grep -qF -- "$SECRET" "$f" && LEAK_FILES+=("$f")
+    done
+    [ "${#LEAK_FILES[@]}" -gt 0 ]
+}
+
+# ⛔ THE FILE SET IS ENUMERATED, NOT GLOBBED. A glob (`"$TMP"/*.stdout`) cannot be asserted from inside:
+# narrowing it back to `"$TMP"/*.out` is the round-4 defect exactly, and with a real `printf` leak in the
+# check the suite still reported 50/50 green (measured 2026-11-03) — the narrowed set simply never looked
+# at the file the value landed in. So the cases are NAMED and every stream of every case is scanned; the
+# floor then asserts the enumeration produced a plausible population, which a narrowed list would shrink.
+CASES="good absent half rest earlyexit trapexit unreadable ambient_mcp ambient_rest both"
+SCAN_FILES=()
+for c in $CASES; do
+    SCAN_FILES+=("$TMP/$c.out" "$TMP/$c.stdout" "$TMP/$c.err")
 done
-[ "$leaked" -eq 0 ] && pass
-# ⛔ THE SWEEP'S OWN SELF-TEST — and the first version of this block was not one. It re-ran a narrower
-# copy of the leak grep and printed "not vacuous", which measures nothing: a scan that finds nothing
-# because nothing ever entered the log is indistinguishable from a scan that finds nothing because the
-# value never leaked (the round-4 P1, one layer down). This plants the sentinel in a throwaway file and
-# requires the SAME scan to flag it, so "clean" is a measurement rather than an empty set.
+# 10 cases × 3 streams. A run that scans fewer did not look at what this rule is about.
+if [ "${#SCAN_FILES[@]}" -ge 30 ]; then pass; else
+    fail "leak sweep: ${#SCAN_FILES[@]} stream file(s) enumerated from $CASES — the sweep lost cases, so a clean result would be an empty set"
+fi
+missing=0
+for c in $CASES; do [ -s "$TMP/$c.out" ] || missing=$((missing + 1)); done
+if [ "$missing" -eq 0 ]; then pass; else
+    fail "leak sweep: $missing case(s) produced no transcript — those arms did not run"
+fi
+
+if leak_scan "${SCAN_FILES[@]}"; then
+    fail "credential leak: the key's VALUE appears in —"$'\n'"$(printf '%s\n' "${LEAK_FILES[@]}" | sed 's/^/    /')"
+else pass; fi
+
+# THE SELF-TEST, against the SAME function: plant the value and require `leak_scan` to flag it. (This is
+# the part the previous version got wrong — it pinned the PATTERN, never the scan.)
 printf 'planted %s\n' "$SECRET" >"$TMP/self_test.stdout"
-if grep -qF -- "$SECRET" "$TMP"/*.stdout "$TMP"/*.err "$TMP"/*.out; then pass; else
-    fail "self-test: the leak scan did not flag a file that provably contains the value — the clean result above is an empty set, not a measurement"
+if leak_scan "$TMP/self_test.stdout"; then pass; else
+    fail "self-test: leak_scan did not flag a file that provably contains the value — the clean result above is an empty set, not a measurement"
 fi
 rm -f "$TMP/self_test.stdout"
 
