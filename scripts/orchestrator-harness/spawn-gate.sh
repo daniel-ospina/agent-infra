@@ -116,13 +116,17 @@ is_limit "${_NCPU:-}"   || _NCPU=4
 # orch-loop.sh:85 and install.sh:47 carry the identical line.
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 # `10#` forces base 10 so a value with a leading zero is not re-read as octal.
-MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+# ⛔ 2.5 x CORES, NOT 10 x CORES (owner rule, 2026-11-03) — kept in lockstep with orch-loop.sh and
+# install.sh, which is why this file's block says "same line" three times over. The spawn point is the
+# LAST gate a worker passes, so a stale 10x here re-opens on every non-controller path (nonblocking
+# dispatch, adopt-fix, merge-one's reviewer) exactly the ceiling the loop just closed.
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 5 / 2 ))}"
 # ⛔ THE FALLBACK MUST BE A TRUE DEFAULT, NOT A RE-DERIVATION. A magnitude guard that falls back to
 # `_NCPU * 10` is a NO-OP in the case it exists for: an out-of-range value that came FROM the core
 # probe re-derives to the same garbage. The first guard repairs a 10-digit MAX_LOAD derived from a
 # 9-digit `_NCPU`; only the literal 40 is genuinely out of range, so it is the final fallback.
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 5 / 2 ))
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=10
 
 # ── the disk gate (agent-infra#1765) ─────────────────────────────────────────────
 # A cell whose filesystem fills is not a warning, and it is not self-correcting: MEASURED twice on
