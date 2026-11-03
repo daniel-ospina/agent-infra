@@ -149,11 +149,18 @@ program text we have not yet listed is rejected"):
 1. **`wtIsPathShapedScriptWord`** (classify-git.mjs) — a command-position word is
 a script-path candidate only if, with every expansion form (`$`, `` ` ``, `*`,
 `?`, `[...]`, `{…}`, extglob, `~`) replaced by a placeholder, what REMAINS is a
-plain path (components over `[A-Za-z0-9._+@!%~-]` joined by `/`). A `:`, `=`,
-`^`, `\`, `(`, `)`, `;`, `&`, `<`, `>`, `|`, `#`, `,` or an unbalanced quote /
-bracket / backtick cannot appear, so program text cannot become a path — and
-every real expanded-path spelling still can (`./undo*.sh`, `~/undo.sh`,
-`$WT/.venv/bin/python`, `./undo@(-g|).sh`, `sub/undo.sh`).
+plain path. ⛔ THE GRAMMAR IS A FILTER ON A PATH THE SHELL **EXECUTES**, so every
+byte it REJECTS deletes the candidate and blinds the arm — a rejection is not
+"proof the word is data", it is a lost script (review cycle-2, F2). The terminal
+test is therefore TWO ORed ACCEPTS: what remains is over the plain alphabet
+`[A-Za-z0-9._+@!%~-]` joined by `/`, OR the word carries an EXPLICIT path prefix
+(`./`, `../`, `~/`) whatever bytes follow it. `,`, `:`, `=`, `^`, a non-leading
+`#` and `\` are all ordinary FILENAME bytes — `./undo,2-*.sh` and `./undo2-\*.sh`
+really execute and the first cut of this change ALLOWED them. Program text
+(`awk '/^tree=/{t=$2}'`, `sed 's/[[:space:]]*$//'`) carries no such prefix, so it
+stays non-path — and every real expanded-path spelling still is
+(`./undo*.sh`, `~/undo.sh`, `$WT/.venv/bin/python`, `./undo@(-g|).sh`,
+`sub/undo.sh`). Accepting more can only ADD candidates, so it cannot fail open.
 2. **The extglob word scan walks the COMMAND only.** The loop always said "only a
 word that IS the command" and walked every word; on a whole file body that made
 any argument containing `+(`/`@(` an executed path, and made the `#!` SHEBANG
@@ -161,8 +168,20 @@ line a "directly-executed path" that opened the whole word list to the hunt.
 3. **`wtSplitPipeline`** (classify-git.mjs) — `wtPipelineFeedsShell` and the
 piped-producer arm split on `|` with no quote model. A quoted alternation, a sed
 `s/…|…/` expression and a markdown table in a comment each became a "pipeline
-into a shell". The split is now quote / escape / extglob / `||`-aware; a REAL
-pipeline's `|` is unquoted, so nothing is hidden.
+into a shell". The split is now quote / escape / extglob / `||`-aware.
+
+⛔ A NARROWED RECOGNISER NEEDS A FALLBACK, AND THE FALLBACK MUST COVER **EVERY**
+STATE VARIABLE (review cycle-2, F1). This model tracks TWO — `quote` and
+`globDepth` — and each one can be stranded by text that is DATA: an unterminated
+quote (a comment apostrophe, a heredoc body, ANSI-C `$'…'`) or an unterminated
+extglob group (`# it is *(broken`, `regex: a+(b|c`). Past either desync every
+later `|` is read as DATA, so a real unquoted `cat ./undo*.sh | bash` merges into
+one segment and disappears. BOTH desyncs therefore take the BLIND split
+(`s.split("|")`), which has no state and can only OVER-report — this arm's
+fail-closed direction. The cycle-1 fix covered only `quote`, so the identical
+fail-open remained one state variable over (measured: base BLOCK, head ALLOW on
+five shapes). It also falsified the earlier claim here that "a REAL pipeline's
+`|` is unquoted, so nothing is hidden".
 
 **MEASURED EFFECT, over all 373 committed `*.sh` (handler-driven, before and
 after, in the `pi -p` child env): 73 refused before, 56 after — 17 scripts newly
@@ -173,6 +192,36 @@ ENVIRONMENT: a verifier running the same census from a fixture HOME got 70 → 5
 (18 newly RUN, 0 newly REFUSED) — the same polarity, a different absolute count,
 because the fixture has no deployed `~/.pi/agent` state. Quote the pair you
 measured together, never one number from one run against another run's total.
+
+⛔ **A REFUSAL CENSUS IS ONE-DIRECTIONAL, AND THAT IS HOW BOTH CYCLE-2 DEFECTS
+SURVIVED IT** (review cycle-2, note 3). Counting *newly REFUSED* only sees a
+narrowing that over-blocks; a shape that became newly ALLOWED is invisible to it,
+and both fail-opens above were exactly that — the same 373-script sweep reported
+"0 newly REFUSED" while a real pipeline and six real execution spellings had
+silently started running UNGATED. The reverse arm is measured separately, at the
+predicate over **380** committed `*.sh` / **352,993** lines, base vs head:
+
+| | base | head |
+|---|---|---|
+| lines `wtPipelineFeedsShell` fires on | 50 | 40 |
+| newly firing (over-widening) | — | **0** |
+| no longer firing | — | **10** |
+
+Every one of the 10 was re-read and is a FALSE POSITIVE the narrowing exists to
+remove, not a hidden pipeline: a quoted `\|` alternation in `printf`/`grep` data,
+an awk regex (`!(pfx ~ /^(sh|bash|dash|zsh)$/ …)`), four `sed 's|…|…|'`
+expressions whose quoted `|` had split the segment head into `/bin/bash`, a
+comment naming `|| sessions=UNKNOWN`, and a `printf '%s\n' '… printf x | sh -c'`
+that writes a shell-out into a file as DATA (consumer `head` / quoted literal in
+every case — none feeds a shell). The reverse arm is committed as the `B15j-n`
+handler arms plus the `M2` both-polarity predicate pairs, where each pair must go
+BLIND when its fix is textually reverted — verified by reverting both cycle-2
+fixes and watching 6 arms go red.
+
+**Residual, recorded not chased:** the one-directional census above is still the
+instrument in CI, because a base-vs-head replay needs the base module at test
+time. A committed corpus of *refused-before* shapes replayed against the live
+head would close it; that is its own change.
 
 ⛔ **A FOURTH HUNK WAS MEASURED AND REJECTED: preparing the body as CODE.** The
 draft of this fix ran a script's body through `stripHeredocData` first (the

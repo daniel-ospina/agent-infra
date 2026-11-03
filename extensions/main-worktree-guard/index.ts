@@ -2779,9 +2779,17 @@ function _wtExpandedPipedProducer(text: string): string | null {
  */
 function _wtBodyExpandedReason(scriptPath: string, hit: _WtExpandedHit, text: string): string {
   const shown = String(scriptPath ?? "(script)");
-  const idx = text.indexOf(hit.token);
-  const line = idx < 0 ? 0 : text.slice(0, idx).split("\n").length;
-  const where = line > 0 ? `line ${line} of ${shown}` : shown;
+  // ⛔ THE LINE IS ONLY CLAIMED WHEN IT IS UNAMBIGUOUS (#3243 review c2, note 4).
+  // `indexOf` returns the FIRST occurrence, so a token that also appears earlier —
+  // in a comment, in a string — reported a line that is not the invocation, in a
+  // message whose whole purpose is honest attribution (`hit` carries no offset,
+  // and threading one through the detection path is a change to load-bearing code
+  // for a cosmetic gain). When the token is not unique, name the file and the
+  // token and claim nothing about where.
+  const first = text.indexOf(hit.token);
+  const unique = first >= 0 && text.indexOf(hit.token, first + 1) < 0;
+  const line = unique ? text.slice(0, first).split("\n").length : 0;
+  const where = line > 0 ? `line ${line} of ${shown}` : `in ${shown}`;
   const observed =
     hit.kind === "producer"
       ? `its piped producer ${JSON.stringify(hit.token)} is fed to a shell as a script (${where})`
