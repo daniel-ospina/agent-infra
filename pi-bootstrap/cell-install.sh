@@ -125,12 +125,25 @@
 #      * `models.json` and `auth.json` are NOT touched. They are the cell's identity and
 #        keys, the measured cell already has them, and the defect table above names only
 #        AGENTS.md / settings.json / .mcp.json as absent.
-#      * `.mcp.json` is deliberately NOT installed. `templates/.mcp.base.json`'s only
-#        NON-lazy server is `tortoise` ("always (core)"), and it resolves
-#        `${TORTOISE_HOME:-$HOME/Documents/GitHub/tortoise}/.venv/bin/python3` — a checkout
-#        and venv a cell does not have. Installing it would make every cell session start
-#        spawn a core server that cannot exist. `mcp-client/` IS installed, so a cell may
-#        add its own `.mcp.json`; the dispatch→review→merge cycle needs no MCP surface.
+#      * `.mcp.json` IS installed (graph-mcp-provision), from `templates/.mcp.base.json`,
+#        MERGED so a cell-local server survives. It was deliberately NOT installed while that
+#        template's only non-lazy server was `tortoise` **stdio** — it resolved
+#        `${TORTOISE_HOME:-$HOME/Documents/GitHub/tortoise}/.venv/bin/python3`, a checkout and
+#        venv a cell does not have, so installing it would have made every cell session start
+#        spawn a core server that could not exist. The template now declares the HOSTED http
+#        entry (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_API_KEY}`, lazy), which
+#        needs neither — and the old skip cost more than it saved: every lane on a cell ran
+#        with ZERO MCP servers and wrote `GRAPH-UNREACHABLE` into its report, so the owner's
+#        "every lane reads and writes the graph through the MCP" mandate was UNOBEYABLE on a
+#        cell rather than disobeyed (measured 2026-11-03: cell-3 and cell-4 had no `.mcp.json`,
+#        no key, and no fallback script). Credentials stay OUT of this file by construction:
+#        the header is env-indirect, and `--verify` FAILS if a literal `tt_`/`tk_` value ever
+#        appears in it. The credential itself is operator-pushed into `~/keys.env` (0600) —
+#        `cloud-cell-bringup.sh` documents keys.env as "operator-pushed, and NOT a bring-up
+#        byproduct" — so `--verify` also refuses a cell whose `TORTOISE_API_KEY` does not
+#        resolve to something a server would accept, because a config with an unresolved
+#        `${VAR}` sends `Bearer ` (empty) and the server answers 401; that failure reads as
+#        an auth problem rather than the set-up gap it is (#5153).
 #
 # 4. ⛔ NOTHING is written under `~/.pi/agent/tools/` except pi's own fd/rg. See the #1277
 #    note above; this script installs nothing there, removes a legacy `tools/fleet/` if it
@@ -197,6 +210,108 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
 die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 log_line()  { printf '  %s\n' "$*"; }
 
+# ── the hosted-graph credential (graph-mcp-provision) ────────────────────────
+# `.mcp.json`'s tortoise header is `Bearer ${TORTOISE_API_KEY}`. A plain `${VAR}` expands to the
+# EMPTY STRING when unset, so an unprovisioned cell reaches the server, sends `Bearer ` and gets
+# a 401 that reads as an auth failure rather than the set-up gap it is (#5153). The credential is
+# OPERATOR state (cloud-cell-bringup.sh: keys.env is "operator-pushed, and NOT a bring-up
+# byproduct"), so its absence is a WARNING with an exact remedy — never a certification failure,
+# which would refuse to certify a working layer over a key nobody pushed yet.
+graph_key_from_env_file() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  # Resolve the way the LANE does — source it in a subshell (set -a) — because the fleet's
+  # keys.env spells the alias form `export TORTOISE_API_KEY="$TORTOISE_MCP_API_KEY"`, which a
+  # line-parser reads as the literal string `$TORTOISE_MCP_API_KEY` and then reports as a
+  # malformed key. The subshell discards every other assignment it makes.
+  KEYFILE="$f" bash -c 'set -a; . "$KEYFILE" >/dev/null 2>&1; set +a; printf "%s" "${TORTOISE_API_KEY:-}"' 2>/dev/null
+}
+
+graph_credential_note() {
+  local key="" src="the environment" f
+  if [ -n "${TORTOISE_API_KEY:-}" ]; then
+    key="$TORTOISE_API_KEY"
+  else
+    # HOME first: that is the home a live lane on a cell actually runs in (measured on cell-3
+    # and cell-4: HOME=/home/cmux), and the launcher sources $HOME/keys.env. CELL_HOME follows
+    # because it is where THIS script installs, and on some images the two differ.
+    for f in "$HOME/keys.env" "$CELL_HOME/keys.env"; do
+      [ -f "$f" ] || continue
+      key="$(graph_key_from_env_file "$f")"
+      src="$f"
+      [ -n "$key" ] && break
+    done
+  fi
+  case "$key" in
+    tt_*|tk_*)
+      log_line "graph credential: resolves from $src (len ${#key}) — the hosted MCP will authenticate" ;;
+    "")
+      log_line "⚠️  graph credential: NOT resolvable — the tortoise MCP entry expands \${TORTOISE_API_KEY} to the EMPTY"
+      log_line "    string, the server answers 401 'invalid or missing Bearer token', and every lane writes"
+      log_line "    GRAPH-UNREACHABLE. Remedy: put the hosted key in $CELL_HOME/keys.env (mode 600) as"
+      log_line "    TORTOISE_API_KEY, or alias an existing one: export TORTOISE_API_KEY=\"\$TORTOISE_MCP_API_KEY\" (#5153)." ;;
+    *)
+      log_line "⚠️  graph credential: TORTOISE_API_KEY in $src does not look like a hosted key (expected tt_/tk_ prefix);"
+      log_line "    the MCP will send whatever it holds and the server may answer 401 (#5153)." ;;
+  esac
+}
+
+# verify_graph_mcp — what pi will ACTUALLY do with this cell's .mcp.json, checked on the artifact.
+verify_graph_mcp() {
+  local f="$DEST/.mcp.json"
+  if [ ! -f "$f" ]; then
+    fail ".mcp.json is missing — this cell has ZERO MCP servers, so no lane can read or write the hosted graph (the exact gap graph-mcp-provision closed)"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail ".mcp.json exists but cannot be checked (no python3) — refusing to certify an unread config"
+    return 1
+  fi
+  python3 - "$f" <<'PY'
+import json
+import re
+import sys
+
+p = sys.argv[1]
+raw = open(p).read()
+try:
+    cfg = json.loads(raw)
+except ValueError as exc:
+    print("NOTJSON:%s" % exc)
+    sys.exit(1)
+servers = cfg.get("mcpServers") or {}
+t = servers.get("tortoise")
+if not isinstance(t, dict):
+    print("NOENTRY")
+    sys.exit(1)
+if t.get("command"):
+    print("STDIO:%s" % t.get("command"))
+    sys.exit(1)
+url = t.get("url") or ""
+if not url:
+    print("NOURL")
+    sys.exit(1)
+auth = ((t.get("headers") or {}).get("Authorization") or "")
+if not auth:
+    print("NOAUTH")
+    sys.exit(1)
+if "${" not in auth:
+    print("LITERAL_AUTH")
+    sys.exit(1)
+# a literal credential in a SHARED file is the leak, not the config
+if re.search(r"\b(t[tk])_[A-Za-z0-9]{10,}", raw):
+    print("SECRET_IN_FILE")
+    sys.exit(1)
+print("OK:%s:%s" % (url, auth))
+PY
+  case $? in
+    0) : ;;
+    *) fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (see the code on the line above) — a hand-edited or stale cell copy, or a checkout that still ships the legacy stdio entry"; return 1 ;;
+  esac
+  graph_credential_note
+  return 0
+}
+
 # ── the deny list: what must not run ON A CELL ──────────────────────────────
 # Kept as data so the deny is readable and testable, and so the DEFAULT for a new
 # manifest entry is "install" — the direction that cannot lose a guard. It is NOT a second
@@ -242,6 +357,7 @@ FARM_LAYOUT="$(printf '%s\n' \
   $'fleet_srcs\tscripts\tscripts' \
   $'mcp_harness_srcs\tscripts/orchestrator-harness\tscripts' \
   $'merge_gate_srcs\tscripts\tscripts' \
+  $'graph_srcs\tscripts\tscripts' \
   $'lane_root_srcs\tscripts\tscripts' \
   $'lane_srcs\tscripts/lane\tscripts' \
   $'lib_srcs\tscripts/lib\tscripts/lib' \
@@ -754,6 +870,30 @@ PY
       log_line "settings.json copied (python3 not found — plain copy)"
     fi
   fi
+
+  # .mcp.json — MERGED from templates/.mcp.base.json (graph-mcp-provision). Source wins per
+  # SERVER KEY, cell-local servers survive — the same contract as settings.json, so a cell that
+  # added its own server keeps it. A plain copy is refused: it would silently drop that server.
+  local mcp_src="$INFRA_ROOT/templates/.mcp.base.json"
+  if [ ! -f "$mcp_src" ]; then
+    fail "templates/.mcp.base.json is MISSING from $INFRA_ROOT — the cell would keep ZERO MCP servers (every lane then writes GRAPH-UNREACHABLE instead of reading the graph)"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 is missing — refusing to write .mcp.json by plain copy (it would drop a cell-local server); install python3 or merge by hand"
+  else
+    python3 - "$mcp_src" "$DEST/.mcp.json" <<'PY' || fail ".mcp.json merge failed"
+import json
+import os
+import sys
+
+src = json.load(open(sys.argv[1]))
+dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
+merged = {**dst, **src}
+merged["mcpServers"] = {**(dst.get("mcpServers") or {}), **(src.get("mcpServers") or {})}
+json.dump(merged, open(sys.argv[2], "w"), indent=2)
+PY
+    log_line ".mcp.json merged (hosted tortoise entry installed, cell-local servers preserved)"
+  fi
+  graph_credential_note
 
   # AGENTS.md — installed when ABSENT, never overwritten.
   local base_agents="$INFRA_ROOT/templates/AGENTS.base.md"
@@ -1476,6 +1616,11 @@ PY
     python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$DEST/settings.json" >/dev/null 2>&1 \
       || fail "settings.json is not valid JSON"
   fi
+
+  # .mcp.json — the hosted graph entry (graph-mcp-provision). Verified on the ARTIFACT: the
+  # entry present, HTTP (not the legacy stdio command that needed a checkout+venv a cell does
+  # not have), an env-indirect Authorization, and NO literal credential in the shared file.
+  verify_graph_mcp || true
 
   guard_tools_dir
   guard_spawn_gate
