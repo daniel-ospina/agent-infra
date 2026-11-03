@@ -2545,11 +2545,18 @@ function _worktreeDiscardBlockReason(
                 `       git checkout -- <path>          # cwd is the hub`,
               ]
             : [
+                // Round 14 (P2): the two hatches are NOT equivalent and this
+                // sentence said they were. `AGENT_ALLOW_MAIN_EDITS=1` is a FULL
+                // bypass (it returns before M4/M5 are consulted, so `.`/globs ARE
+                // permitted under it — measured); only the TTL MARKER opens the
+                // narrow window. The pinned phrase is kept verbatim (test.mjs and
+                // test-discard-gate pin it) and the scoping is stated around it.
                 `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
-                `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
-                `     marker — both hatches open the SAME recovery window as M4, so name the`,
-                `     paths: \`git restore <path>\` / \`git checkout -- <path>\`. A whole-tree`,
-                `     discard (\`.\`, pathspec magic) stays refused even with the hatch.`,
+                `     ELDATO_ALLOW_MAIN_EDITS=1) — a FULL bypass of M4/M5, whole-tree`,
+                `     discards included — or stamp the ~/.pi/agent/.allow-main-edits MARKER,`,
+                `     which opens the same narrow recovery window as M4: name the paths,`,
+                `     \`git restore <path>\` / \`git checkout -- <path>\` (a whole-tree discard —`,
+                `     \`.\`, pathspec magic, a glob — stays refused UNDER THE MARKER).`,
               ]),
         ]),
   ].join("\n");

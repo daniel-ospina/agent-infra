@@ -446,13 +446,16 @@ it, which on a clean checkout sent the reader hunting a phantom dirty tree. The
 dirty arm (`discardDestroysWip` returned true — the status WAS read) keeps both
 the claim and the hatch.
 
-**Escape hatches**: `AGENT_ALLOW_MAIN_EDITS=1` and the
-`~/.pi/agent/.allow-main-edits` marker bypass M2/M3 wholesale. For M4/M5 they open
-ONE narrow RECOVERY WINDOW rather than a bypass: a single bare
+**Escape hatches differ — do not conflate them** (round 14):
+`AGENT_ALLOW_MAIN_EDITS=1` (session start) is a FULL guard bypass — M2/M3/M4 all
+off, whole-tree discards included — and it cannot be set on a running process.
+The `~/.pi/agent/.allow-main-edits` MARKER is the scoped one: it bypasses M2/M3 and
+opens ONE narrow M4/M5 RECOVERY WINDOW — a single bare
 `git checkout -- <named path>` / `git restore [--staged] [--worktree] <named path>`
-run from the disordered hub is permitted (so a dirty hub can actually be cleared);
-everything else stays frozen, and a wrapped/compound/`-C`/`GIT_DIR`-retargeted
-form is refused exactly as on main (#1484 D3). Task children are unhatched by
+run from the disordered hub, so a dirty hub can actually be cleared. Everything
+else stays frozen under the marker, and a wrapped / compound / `-C` /
+`GIT_DIR`-retargeted / whole-tree (`./`, glob, brace, `..`) form is refused
+exactly as on main (#1484 D3). Task children are unhatched by
 default (#617/#623), so for the `pi -p` fixer M5 — not a prose rule — is the
 enforcement surface.
 
