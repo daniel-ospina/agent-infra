@@ -47,6 +47,7 @@ one, which is exactly the behaviour this issue exists to end.
 | **`$HOME/.pi/agent/` and the rest of `$HOME/.pi/agent/state/`** | not enumerated in the first two passes | ⚠️ **Declared gap, and it cost two rounds of review.** An earlier draft listed only the *notes* under `state/`, so searches for `instabox` never touched `INSTABOX-OPERATING-PROMPT.md`, `instabox-setup.sh` or `PAT-INSTABOX.md` sitting there — and concluded the procedure did not exist twice (F8). The whole directory is now read; §5 row 11 and F8 record what it contains |
 | `git log --all` over `scripts/` + `tools/` | **605** files ever *added* to those two trees | `--diff-filter=A --name-only`; the newest 40 inspected |
 | `gh search code` | 1 query, 8 results | returned only this repo's files. ⚠️ It is **not** evidence about other checkouts: the `who-is-on.sh` miss in the first draft came from an `rg` scoped to agent-infra whose conclusion was then written as "every checkout" (F7). One `find -maxdepth 3` across `~/Documents/GitHub` would have caught it, and did, on review |
+| **`skills/cmux-cells/SKILL.md`** | **756** lines | **read in full**, and it changed four tool rows — see [F13](#f13--the-cmux-cells-skill-had-to-be-reconciled-with-four-rows-and-one-of-them-kills-a-tool-as-designed) and [§5.7](#57-semantics-authority--the-governing-skill-section-per-tool). It is the **semantics authority** for these operations, so it was read as a source of record, not as background |
 | **external prior art** | 6 sources, URLs in [§8](#8-external-prior-art) | `research` skill; graph queried first (`tortoise_search`) |
 
 ### 2.2 Reads this document could NOT make — declared, not skipped
@@ -261,6 +262,34 @@ what the red-first fixture must target: [§9](#9-the-six-measured-failures--fixt
 against already-fixed behaviour passes on the broken version and proves nothing — the very thing
 invariant 6 forbids.
 
+### F13 — The `cmux-cells` skill had to be reconciled with four rows, and one of them **kills a tool as designed**
+
+`skills/cmux-cells/SKILL.md` is the semantics authority for the operations these tools expose
+([§5.7](#57-semantics-authority--the-governing-skill-section-per-tool)). Reading it against the 14 rows
+changed four of them, and one change is not cosmetic:
+
+1. **`lane_message` (#8) must be able to REFUSE.** Skill §5: *"⛔ A LANE LAUNCHED WITH `pi -p` CANNOT BE
+   STEERED"* — print mode takes its prompt from argv and never reads stdin, so a message to such a lane
+   is text nothing consumes. Measured in the skill: 9 lanes ordered to stop producing, `order-seen=0` on
+   **every one**. My row treated delivery semantics (`cmux_dispatch.py`'s five exits) as the whole
+   problem. It is not: the tool needs a **precondition** — is this lane steerable at all — or it
+   becomes a very precise instrument for delivering into a void. The skill also names the remedy
+   (kill and relaunch with a new brief; a steerable session is an *interactive* one).
+2. **`fleet_census` (#4) must not carry one load threshold.** Two calibrations, opposite directions
+   (§10.1). This is the change most likely to have shipped as a plausible-looking bug: a cell number
+   applied to the laptop calls a dying box healthy, and the census is exactly the tool the beat trusts.
+3. **`box_exec` (#9) must keep `timed_out` away from `box-unreachable`.** Skill §3: unreachable is a
+   claim about the CHANNEL. A disk-full guest answers `running` while every `exec` times out — the exact
+   case that would be misreported as a dead box.
+4. **`closure_audit` (#12) must not reason from ancestry.** The rail squashes (skill §6.5), so
+   constituents of a batch stay **open**; an ancestry check reports false *not merged* for every batched
+   PR. That is the FALSE MERGED defect mirrored — the same failure family, in the opposite direction.
+
+**The general lesson, recorded because it is the argument for this whole section:** every one of those
+four is a rule that *already had an owner*, and in each case the skill's version was sharper than the one
+I would have re-derived. A tool that restates an owned rule does not merely duplicate it — it replaces a
+measured version with a remembered one.
+
 ---
 
 ## 4. Where the liveness tree actually is today
@@ -280,7 +309,7 @@ Sources: `$HOME/.pi/agent/state/LANE-STATE-DECISION-TREE.md` (the tree),
 | **4 — last tool call + its age** | ✅ `tool_from_jsonl` → `Tool.tool_age_ms`/`silence_age_ms`; `tool_veto_expired` | ✅ `last_tool_call`, `LONG-TOOL` | consumes | ✅ both |
 | **5 — read what it said** (the ONLY step that yields meaning) | ❌ (by design — a pure mechanical verdict) | ❌ | ✅ `classify_row` + one batched JEV call (`state/lane-verdict.py`); `UNCLASSIFIED(JEV-DOWN)` when unread | ✅ here **and** in `scripts/turn-classify.py` (a JEV call over one lane's last text) — **two** callers, this one is one round trip for the fleet (F11) |
 | **6 — hard cases by RECURSION** (CHILD-OVERDUE ⇒ apply THIS SAME TREE to the child) | ❌ | partial: `child_suppresses` suppresses parent verdicts to `WAITING`, does not verdict the child | ❌ | ❌ **nowhere** — see §7.1 |
-| `finished` (§11, #2163) | not a `STATES` member; `running-quiet` + resident | `DONE-IDLE`-family | `DONE_READY` (Step-5 words) | partial — reap evidence is in `lane-reap.sh` |
+| `finished` (§11, #2163) | not a `STATES` member; `running-quiet` + resident | `DONE-IDLE`-family | `DONE_READY` (Step-5 words) | partial — the evidence is `lane-reap.sh reap --dry-run --json` (the three gates). ⛔ **NOT `count`**: that verb is the capacity census — "live iff the process tree exists AND its log advanced within `LANE_REAP_LIVE_MIN`" — with **no CPU gate and no ancestry gate**, so wrapping it would call any silent lane `finished` |
 
 ### 4.2 What this means for the tool (the wrapper plan, not a redesign)
 
@@ -293,7 +322,7 @@ lane-status.py --json            → steps 0-4  (mechanical, cumulative CPU, chi
       ↓ (only for lanes the mechanics did not decide)
 lane-actions.py / lane-verdict.py → step 5    (one batched JEV call)
       ↓ (only where the process exists and the turn ended)
-lane-reap.sh's gates             → `finished` (zero CPU tree-wide + fleet ancestry + log staleness)
+lane-reap.sh reap --dry-run --json → `finished` (three gates: zero CPU tree-wide + fleet ancestry + log staleness)
       ↓ (only where there is no session evidence at all)
 liveness.py                      → DEAD + the named abstentions + the ref-claim axis
 ```
@@ -319,7 +348,7 @@ silently resolved by writing a new ladder.
 | `alive` | `liveness.py:running-quiet` (live holder) | NOT "a process exists" — day-1 `liveness.py` state names |
 | `working` | `lane-status.py:WORKING` / `UNATTRIBUTED-WORKING` (Tree step 2) | only `lane-status.py` can produce it today |
 | `frozen` | `liveness.py:wedged` **only** on a positively open turn | never on a frozen file alone (#1254) |
-| `finished` | `docs/ops/fleet-liveness.md` §11 gates via `lane-reap.sh count` | **not a `STATES` member** today |
+| `finished` | `docs/ops/fleet-liveness.md` §11's three gates, read via `lane-reap.sh reap --dry-run --json` (**not** `count`) | **not a `STATES` member** today |
 | `no-verdict` | `liveness.py:unknown` + its named reason (`ps-unreadable`, `no-holder-record`, `off-fence`, `turn-state-unknown`, `claims-unreadable`, …) | the reason string is part of the contract, never optional |
 | **`dead`** | `liveness.py:dead` (`incarnations-absent`) | **missing from the issue's list** — see F2 |
 
@@ -355,7 +384,7 @@ it) · `NEW` (nothing does; justified in §7).
 
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
-| 1 | `lane_status(lane\|box\|all)` | `scripts/lane-status.py` (`lane_cpu_busy`, `child_suppresses`, `last_tool_call`, `resolve_session_ex`, 2528 lines) + `scripts/lane-actions.py::classify_row` (Step 5, JEV) + `tools/fleet/liveness.py::evaluate`/`gather` (identity, `dead`, abstentions) + `scripts/orchestrator-harness/`lane-reap.sh count` (`finished`) | one typed answer over all four; a stable state vocabulary across them; `dead` absent from the issue's list; `reason` string not surfaced | four sources, not three: `lane-status.py`, `lane-actions.py` and `liveness.py` take `--json`; **`lane-reap.sh count` does not** (`--json` exists only under `reap`) — it prints `lanes=<live>/<total> zombie=<n>` and abstains with `lanes=?/?` + exit 3, so its line is parsed and its exit 3 carried as the abstention. State mapping: the **five** states as the issue writes them, with `dead` carried in a separate `dead: true` field until the owner answers the reopen (§4.3) | **WRAPPER** (composed; no new classifier) |
+| 1 | `lane_status(lane\|box\|all)` | `scripts/lane-status.py` (`lane_cpu_busy`, `child_suppresses`, `last_tool_call`, `resolve_session_ex`, 2528 lines) + `scripts/lane-actions.py::classify_row` (Step 5, JEV) + `tools/fleet/liveness.py::evaluate`/`gather` (identity, `dead`, abstentions) + `scripts/orchestrator-harness/lane-reap.sh reap --dry-run --json` (`finished`, via the three gates) | one typed answer over all four; a stable state vocabulary across them; `dead` absent from the issue's list; `reason` string not surfaced | four sources, each with its own output shape: `lane-status.py`, `lane-actions.py` and `liveness.py` take `--json`; **`lane-reap.sh` exposes `--json` only on `reap`, not on `count`** — so `finished` reads `reap --dry-run --json` (dry-run signals nothing) and `count` is used only for the capacity census, whose `lanes=<live>/<total> zombie=<n>` line or `lanes=?/?` + exit 3 is carried as the abstention. ⛔ Wrapping `count` as the verdict would call every lane silent past `LANE_REAP_LIVE_MIN` `finished`: that verb has no CPU gate and no ancestry gate. State mapping: the **five** states as the issue writes them, with `dead` carried in a separate `dead: true` field until the owner answers the reopen (§4.3) | **WRAPPER** (composed; no new classifier) |
 | 2 | `lane_tree(lane)` | `tools/fleet/lane_liveness.py::child_sids` + `enumerate_lanes(…, children)`; `scripts/orchestrator-harness/lane-artifacts.sh` (cell artifacts); `~/.pi/agent/task-sessions/<uuid>/` | **Applying the tree to the CHILD** (Step 6). `child_suppresses` only demotes the parent's verdict; `enumerate_lanes` lists child sessions but does not verdict them. Measured consequence: `state/FINDING-lane-classifier-ignores-task-children-2026-10-11.md` — **four** lanes tabulated as false `IDLE`/`WEDGED`/`STALL` verdicts (one of them marked "presumed"), plus a fifth entry under a fourth label (`WIP`), every one a lane holding or presumed to hold a `task` child | compose: `lane_status` per node (this is Step 6's own instruction) + `child_sids` for the edge set; the recursion is the tool, not a new rule | **PARTIAL** (§7.1) |
 | 3 | `lane_artifact(lane)` | `scripts/lane-read.py` (`sid_for`, `files_for` — last N assistant messages by pane); `scripts/orchestrator-harness/lane-artifacts.sh` (verbs, exit `0 found · 3 ABSENT-EVERYWHERE · 4 UNMEASURED · 5 PULL-FAILED`); `BEAT-CHECKLIST.md`'s `## LANE-DONE <verdict> <ts>` line | one answer over *both* axes: a session lane's words AND a **cell** lane's file (the 2026-11-01 measurement: four mandated artifacts existed, each on a different box, none reachable from the mac); size/age/terminal-line in one shape | wrap `lane-read.py` for words, `lane-artifacts.sh` for files; read the `## LANE-DONE` line as the terminal verdict; "none written" is a value, not an error | **WRAPPER** (two implementations, one answer) |
 
@@ -363,7 +392,7 @@ it) · `NEW` (nothing does; justified in §7).
 
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
-| 4 | `fleet_census(repos)` | `scripts/beta-progress.py::compute`/`main` (P0/P1 open·with-PR·NONE, age printed, cache validator, `DELIVERY [as of …]` line); `scripts/orchestrator-harness/capacity.sh probe` (measured placement, 8.00/CPU ceiling); `scripts/orchestrator-harness/box-status.sh` (5 machine-parsable lines: deployed/pin/stamp/running); `tools/fleet/fleet-health.py`; `scripts/fleet-schedule.py --status`; `BEAT-CHECKLIST.md` checks 1-3 | one typed object per box+repo; **`fleet-report.py` is untracked (F3)** and its §3 "merged" is a keyword mention (F4); no `measured_at` field (the text line has one, the bytes do not) | wrap `beta-progress.py --json`-shaped output + `capacity.sh probe` + `box-status.sh`; **land `fleet-report.py` into `scripts/`** or drop its dependency (D3); every figure carries `value`, `measured_at`, `age_ms`, `source` | **WRAPPER** (tracked modules only) |
+| 4 | `fleet_census(repos)` | `scripts/beta-progress.py::compute`/`main` (P0/P1 open·with-PR·NONE, age printed, cache validator, `DELIVERY [as of …]` line); `scripts/orchestrator-harness/capacity.sh probe` (measured placement: refuses to ADD work at `CAP_LPC_CEILING` = **8.00 load-per-CPU**, `>=`, which is a placement gate and NOT the platform's tolerance — see [§10.1](#101-the-two-capacity-calibrations--the-trap-that-would-call-a-dying-mac-healthy)); `scripts/orchestrator-harness/box-status.sh` (5 machine-parsable lines: deployed/pin/stamp/running); `tools/fleet/fleet-health.py`; `scripts/fleet-schedule.py --status`; `BEAT-CHECKLIST.md` checks 1-3 | one typed object per box+repo; **`fleet-report.py` is untracked (F3)** and its §3 "merged" is a keyword mention (F4); no `measured_at` field (the text line has one, the bytes do not) | wrap `beta-progress.py --json`-shaped output + `capacity.sh probe` + `box-status.sh`; **land `fleet-report.py` into `scripts/`** or drop its dependency (D3); every figure carries `value`, `measured_at`, `age_ms`, `source` | **WRAPPER** (tracked modules only) |
 | 5 | `pr_queue(repo)` | `tools/fleet/pr_state.py` — `action_for`, `row_action`, `fidelity`, `inherited_reds`, `verdict`; rows `CLOSE-STALE`/`WAIT:draft`/`REPAIR-CONFLICT`/`FIX-RED`/`RERUN-FLAKE`/`WAIT:inherited-red`/`REVIEW`/`WAIT:attested-elsewhere`/`WAIT:owes-review`/`WAIT:diff-unreadable`/`WAIT:in-flight`/`WAIT:no-check-surface`/`WAIT:mergeable-unknown`/`WAIT:authority-unreadable`/`LAND`; exit **2 = the pass could not be made** | the issue's vocabulary is coarser (`CONFLICT`/`STALE-ATTESTATION`/`NO-ATTESTATION`/`READY`/`INHERITED-RED`/`DRAFT`); **closing issues** are not attached to a row; `--json` exists but there is no MCP-typed shape with a `measured_at` | wrap `pr_state.py --json` (never `fleet-report.py::classify` — D1); map its 15 actions onto the issue's 6 classes **lossily in one direction only** (the 6 are a view; the 15 remain the answer); join closing issues per row | **WRAPPER** |
 | 6 | `claim_check(issue, repo)` | **registry axis:** `tools/fleet/claim_lanes.py` (`read_registry`, `read_pull`, `read_snapshot`, `parse_key`, `parse_owner`, `parse_lease`, `to_evidence`) + `tools/fleet/liveness.py::claim_verdict` + `CLAIM_REASONS` (6 named abstentions) + `scripts/orchestrator-harness/claims.sh`. **local-checkout axis:** `tortoise/tools/who-is-on.sh` (tracked, 1954 B — `0` complete answer, `2` a surface could not be read) — a **3-line body** (35 lines with its header) that `exec`s `who_is_on.py` (953 lines), which imports `collision_preflight` (9132 lines) for its git enumeration | one answer across both axes; the registry axis answers "does a claim exist for this issue/head", the local axis answers "is work in flight on this disk". Today they are two tools in two repos and neither names the gap | wrap `claim_lanes.py` for the registry axis (`--json` + exit 3 = nothing established, never freedom) and **port the local axis** — which is **three files, not one**: `who-is-on.sh` + `who_is_on.py` + a declared decision on its `collision_preflight` import (port the gate, or keep the local axis `UNMEASURED(<why>)` rather than a second enumerator). Carry `ClaimRead.readable` and `siblings` into the payload so an absent key can never read as "free" | **WRAPPER** (two axes, both existing) |
 
@@ -371,17 +400,17 @@ it) · `NEW` (nothing does; justified in §7).
 
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
-| 7 | `lane_dispatch(box, repo, name, brief, env)` | `scripts/orchestrator-harness/nonblocking-dispatch.sh` (**typed exits: 2 = caller bug, 78 = validator stale/absent, 80 = brief-gate refused**); `lane.sh` (+ teardown trap); `lane-exec.sh` (launch so no wrapper survives — #2163); `spawn-gate.sh::run_agent` (load gate, watchdog, walltime row); `brief-gate.sh` (exit 80); `tools/fleet/dispatch_preflight.py` (refuse a dispatch with nothing to land); `tools/fleet/successor_preflight.py` (prove a predecessor is gone); `branch-claim.sh` / `branch-claim-hook.sh` (`refs/claims/branch-<slug>`, single-owner) | `env` into the agent's **process** environment (`cmux new-workspace --env KEY=VALUE` — an export inside a tool call does not reach the gates); `pid/log/worktree` in one typed reply; the two measured silent-actuator failures as **typed refusals** (`no-pid`, `branch-exists`) instead of stderr the caller must parse | subprocess the launcher, map exit 2/78/80 + the two extra codes to typed refusals; read `pid` from the `.pid` file, never from the launcher's own stdout (the `launcher did not report a pid: ''` failure); pre-check `refs/claims/branch-<slug>` and the local branch/remote ref for `branch-exists` | **WRAPPER + PARTIAL** (`env`, typed refusals are the added surface — §7.2) |
-| 8 | `lane_message(lane, text)` | `tortoise/tools/cmux_dispatch.py` — **exit 0 = consumed, 1 = sent-but-not-consumed / never-became-ready, 2 = usage error, 3 = cmux transport error, 4 = queued (DELIVERED, not consumed)**; its own header states *"A transport failure (exit 3) is NOT a consumption failure (exit 1)"*; `scripts/objective-reminder.sh` (byte budget, `latest_submitted_at` turn-boundary confirmation, backend-aware cmux-vs-tmux) | MCP-typed delivery semantics over a *lane*, and the `\n` discipline as a parameter rather than a caller's memory | wrap `cmux_dispatch.py`, preserving **all five** exits as distinct typed results — collapsing 3 into 1 would report a refused socket as a message that failed to land | **WRAPPER** |
-| 9 | `box_exec(box, cmd)` | `cmux vm exec --timeout` (the transport `lane-artifacts.sh` already pulls over); `cloud-cell-doctor.sh`; `scripts/orchestrator-harness/box-status.sh` | a typed `{rc, stdout, timed_out, truncated}` — today every caller re-invents truncation and timeout handling; a cell whose argv is literally `pi` (so `grep 'pi -p'` returns 0 while lanes run) | thin wrapper over the transport; **truncate explicitly and say so** — the fleet's own doctrine is that a capped read which NAMES its cap is usable evidence while a silent one is a lower bound published as the fleet (`scripts/lane-actions.py::_SAMPLED_NOTE`); never infer a lane count from a process-name pattern | **WRAPPER** (external CLI verb — §7.4) |
+| 7 | `lane_dispatch(box, repo, name, brief, env)` | `scripts/orchestrator-harness/nonblocking-dispatch.sh` (**typed exits: 2 = caller bug, 78 = validator stale/absent, 80 = brief-gate refused**); `lane.sh` (+ teardown trap); `lane-exec.sh` (launch so no wrapper survives — #2163); `spawn-gate.sh::run_agent` (load gate, watchdog, walltime row); `brief-gate.sh` (exit 80); `tools/fleet/dispatch_preflight.py` (refuse a dispatch with nothing to land); `tools/fleet/successor_preflight.py` (prove a predecessor is gone); `branch-claim.sh` / `branch-claim-hook.sh` (`refs/claims/branch-<slug>`, single-owner) | `env` into the agent's **process** environment (`cmux new-workspace --env KEY=VALUE` — an export inside a tool call does not reach the gates); `pid/log/worktree` in one typed reply; the two measured silent-actuator failures as **typed refusals** (`no-pid`, `branch-exists`) instead of stderr the caller must parse. ⛔ **The refusals are a MAPPING onto `skills/cmux-cells` §5's pre-flight order** (brief gate → repo target → in-flight work), not a new vocabulary: `box-unreachable` must not be synthesised from a timeout either (skill §3 — that is a channel fact) | subprocess the launcher, map exit 2/78/80 + the two extra codes to typed refusals; read `pid` from the `.pid` file, never from the launcher's own stdout (the `launcher did not report a pid: ''` failure); pre-check `refs/claims/branch-<slug>` and the local branch/remote ref for `branch-exists` | **WRAPPER + PARTIAL** (`env`, typed refusals are the added surface — §7.2) |
+| 8 | `lane_message(lane, text)` | `tortoise/tools/cmux_dispatch.py` — **exit 0 = consumed, 1 = sent-but-not-consumed / never-became-ready, 2 = usage error, 3 = cmux transport error, 4 = queued (DELIVERED, not consumed)**; its own header states *"A transport failure (exit 3) is NOT a consumption failure (exit 1)"*; `scripts/objective-reminder.sh` (byte budget, `latest_submitted_at` turn-boundary confirmation, backend-aware cmux-vs-tmux) | MCP-typed delivery semantics over a *lane*, the `\n` discipline as a parameter, and — **materially** — the refusal of an unsteerable lane: a lane launched with `pi -p` does not read stdin, so a message to it types text nothing consumes (skill §5, measured `order-seen=0` on 9 lanes; F13). Today nothing stops a caller doing it | wrap `cmux_dispatch.py`, preserving **all five** exits as distinct typed results — collapsing 3 into 1 would report a refused socket as a message that failed to land | **WRAPPER** |
+| 9 | `box_exec(box, cmd)` | `cmux vm exec --timeout` (the transport `lane-artifacts.sh` already pulls over); `cloud-cell-doctor.sh`; `scripts/orchestrator-harness/box-status.sh` | a typed `{rc, stdout, timed_out, truncated}` — today every caller re-invents truncation and timeout handling; ⛔ **and the distinction skill §3 makes**: `timed_out` is a CHANNEL fact, never a box verdict (a disk-full guest answers `running` while every `exec` times out). The tool must not turn a timeout into `box-unreachable` | thin wrapper over the transport; **truncate explicitly and say so** — the fleet's own doctrine is that a capped read which NAMES its cap is usable evidence while a silent one is a lower bound published as the fleet (`scripts/lane-actions.py::_SAMPLED_NOTE`); never infer a lane count from a process-name pattern | **WRAPPER** (external CLI verb — §7.4) |
 
 ### 5.4 Verification and closure (tools 10–12)
 
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
-| 10 | `review_record(pr)` | `scripts/record-review.sh --check-carry` (**positional** `<pr> [owner/repo]`; `--repo` exits 2); one tab-separated line `<verdict>\t<record digest\|->\t<live digest\|status>`; its full verdict set is **`head` (0) / `carry` (0) / `carry-patch` (6) / `fresh` (1) / `unreadable` (3) / `norecord` (4) / `nodigest` (5)**; `--print-diff-hash` (read-only seam `pr_state.py` already uses) | a typed `{current \| stale \| absent}` + **the head the record is bound to** in one reply; seven verdicts mapped onto three states without losing `carry-patch` (RE-RECORD, not a review cycle) or `unreadable` (RETRY, not re-review) | wrap `record-review.sh --check-carry` positionally; map `head`→current; `carry`/`carry-patch`→stale-with-head; `norecord`→absent; `fresh`/`unreadable`/`nodigest` keep their own names (they are three different next actions). **Pass the repo positionally** (the `--repo` refusal is documented) | **WRAPPER** |
+| 10 | `review_record(pr)` | `scripts/record-review.sh --check-carry` (**positional** `<pr> [owner/repo]`; `--repo` exits 2); one tab-separated line `<verdict>\t<record digest\|->\t<live digest\|status>`; its full verdict set is **`head` (0) / `carry` (0) / `carry-patch` (6) / `fresh` (1) / `unreadable` (3) / `norecord` (4) / `nodigest` (5)**; `--print-diff-hash` (read-only seam `pr_state.py` already uses) | a typed `{current \| stale \| absent}` + **the head the record is bound to** in one reply; seven verdicts mapped onto three states without losing `carry-patch` (RE-RECORD, not a review cycle) or `unreadable` (RETRY, not re-review) | wrap `record-review.sh --check-carry` positionally **as step 1/4 of skill §6's five-step contract** (diff hash → ONE fresh review → verdict comment → record `--evidence` → rail), never as a substitute for the review; map `head`→current; `carry`/`carry-patch`→stale-with-head; `norecord`→absent; `fresh`/`unreadable`/`nodigest` keep their own names (they are three different next actions). **Pass the repo positionally** (the `--repo` refusal is documented) | **WRAPPER** |
 | 11 | `verify_independent(repo, ref)` | `~/.local/share/pi-node/current/bin/instabox` (the CLI, v0.8.125) + `~/.pi/agent/instabox-setup.sh` (toolchain + health check) + `~/.pi/agent/state/INSTABOX-OPERATING-PROMPT.md` (**the documented procedure**: create/start/stop/exec/rm, the `--setup-file` trap, budget, kill-switch) + `~/.pi/agent/state/PAT-INSTABOX.md` (the falsifiable protocol: `SCOPE(...)`, negative write test, `INSTALLED(mode,path)`, `PROVEN(before,after)`). `scripts/scratch-worktree.sh` and the `verifier` agent are the same-box answers and are **not** substitutes | the **typed surface**: `{rc, stdout, timed_out, truncated}`, a stable tool name, and a teardown that is *guaranteed* rather than remembered — plus the standing rule the operating prompt already states (`never change runs-on:`) in a form the tool cannot violate | wrap the CLI and the operating prompt: create → clone at `ref` → run the lane's own steps → post evidence → **stop in a `finally`**; refuse any command the prompt forbids; `INSTALLED`/`PROVEN` lines read from `PAT-INSTABOX.md`'s protocol rather than invented | **PARTIAL** (§7.3) — corrected twice from `NEW`, see F8 |
-| 12 | `closure_audit(pr)` | `gh`'s `closingIssuesReferences` — **already consumed by `scripts/review-pr.sh:501`** (`gh pr view … --json closingIssuesReferences`) and adapted by the `scripts/orchestrator-harness/gh-rest/gh` shim as the GraphQL-only field; `scripts/beta-progress.py::compute`'s `covered()` (open-or-merged PR naming the issue, boundary-exact); `scripts/orchestrator-harness/merged-not-closed.sh`; `tools/fleet/outcome_canary.py` | "what did this merge ACTUALLY close" as a typed fact, and **prose-keyword false closes** — the census counts a `#N` mention in a title/body/branch as merged (F4). No existing tool **compares** the closing references against the prose mentions against the issue's own live `state` | wrap `gh api` `closingIssuesReferences` + re-read each issue's `state`; name `review-pr.sh:501` as the existing consumer of the field rather than claiming it is unused; emit the closed/mentioned/still-open triple | **PARTIAL→WRAPPER** of `gh` (§7.5) |
+| 12 | `closure_audit(pr)` | `gh`'s `closingIssuesReferences` — **already consumed by `scripts/review-pr.sh:501`** (`gh pr view … --json closingIssuesReferences`) and adapted by the `scripts/orchestrator-harness/gh-rest/gh` shim as the GraphQL-only field; `scripts/beta-progress.py::compute`'s `covered()` (open-or-merged PR naming the issue, boundary-exact); `scripts/orchestrator-harness/merged-not-closed.sh`; `tools/fleet/outcome_canary.py` | "what did this merge ACTUALLY close" as a typed fact, and **prose-keyword false closes** — the census counts a `#N` mention in a title/body/branch as merged (F4). No existing tool **compares** the closing references against the prose mentions against the issue's own live `state`. ⛔ **And ancestry is not available**: the rail defaults to **squash** (skill §6.5), so a batched PR's constituents stay **open** — a closure audit that asked "is this commit an ancestor of main" would report a false *not merged* for every batched PR | wrap `gh api` `closingIssuesReferences` + re-read each issue's `state`; name `review-pr.sh:501` as the existing consumer of the field rather than claiming it is unused; emit the closed/mentioned/still-open triple | **PARTIAL→WRAPPER** of `gh` (§7.5) |
 
 ### 5.5 Durability (tools 13–14)
 
@@ -413,6 +442,40 @@ exist, the second said it still did not after a search that omitted `$HOME/.pi/a
 Both were the same error, and both are left in the document rather than tidied away, because a
 Phase-1 inventory that quietly reports "nothing exists" is the failure this phase is designed to
 catch — **three times in one document is a method problem, not three unlucky searches.**
+
+### 5.7 Semantics authority — the governing skill section per tool
+
+`skills/cmux-cells/SKILL.md` (756 lines, merged; read in full for this inventory) already owns the
+semantics of every operation below. **Where a tool re-states a rule the skill owns, the SKILL is the
+authority and the tool is the typed access path to it.** An MCP server that restates a rule becomes a
+second, silently divergent definition — the failure mode this issue exists to prevent, wearing a
+different hat.
+
+| # | tool | governing skill section | what the MCP deliberately does **NOT** decide |
+|---|---|---|---|
+| 1, 2, 3 | `lane_status`, `lane_tree`, `lane_artifact` | **§4** "Liveness of a LANE, and the reaping rule" | the verdict. The skill says the tree and `fleet/liveness.py` are the ONE classifier; a second one in the MCP would be a **third** definition (§4.1 already shows two exist upstream — that is the defect to compose around, not to add to). Also not decided: the reaping gates (three, all required) — the tool reports them, `lane-reap.sh` owns them |
+| 4 | `fleet_census` | **§2** "Capacity is RAM and DISK — load is a distant third" + **§7** "TWO DIFFERENT CEILINGS" | the capacity rule, **and critically the platform calibration**. See [§10.1](#101-the-two-capacity-calibrations--the-trap-that-would-call-a-dying-mac-healthy) — a census that applies the cell tolerance to the laptop reports a dying box as healthy |
+| 5 | `pr_queue` | **§6** (the landing contract) + **§6.5** (`--check-carry` verdicts) | which verdict a PR is in. The seven `--check-carry` verdicts and their next actions are the skill's; `pr_state.py` already consumes them and the tool passes them through. It does not decide that a PR "looks stale" |
+| 6 | `claim_check` | **§5** (pre-flight) + **§4** ("an absent artefact fails closed") | whether an absence is freedom. It is not: every claim verdict is an abstention, and the skill's pre-flight order (brief gate → repo target → in-flight work) is the order |
+| 7 | `lane_dispatch` | **§5** "Dispatching a lane" | the refusal vocabulary and the pre-flight order. The tool's typed refusals are a **mapping onto** what already exists — `brief-gate.sh` exit 80, the repo-target assertion, `spawn-gate.sh`'s load/disk gates, `branch-claim.sh` — never a replacement. It must not re-implement a gate to produce a nicer error |
+| 8 | `lane_message` | **§5** "⛔ A LANE LAUNCHED WITH `pi -p` CANNOT BE STEERED" | **whether the lane can be steered at all.** This one changes the tool: see F13 — a `-p` lane does not read stdin, so messaging it types text nothing consumes (measured: 9 lanes ordered to stop, `order-seen=0` on every one). The tool must **refuse** a print-mode lane, not deliver into the void |
+| 9 | `box_exec` | **§3** "'Unreachable' is a claim about the CHANNEL, not the box" | what "unreachable" means. `timed_out` / `truncated` are **channel** facts; they are never evidence about the box, and the tool must not synthesise a box verdict from one (§3's measured case: a disk-full guest answers `running` while every `exec` times out) |
+| 10 | `review_record` | **§6** "Landing work from a lane — the five-step contract" | the landing order: diff hash → ONE fresh review → verdict comment → record with `--evidence` → rail. The tool **exposes** that order and reports where a PR sits in it; it does not invent a shorter path, and it may not present `--check-carry` as a substitute for step 2 |
+| 11 | `verify_independent` | **§3** (channel vs box) + **§1** ("verify activation by **artifact**, never by a banner") + **§8** (the work-at-risk block before anything destructive) | what counts as evidence, and what must be preserved before a machine is destroyed. The tool does not define "proven"; `PAT-INSTABOX.md`'s `SCOPE`/`INSTALLED`/`PROVEN` shape does |
+| 12 | `closure_audit` | **§6.5** "⛔ The constituents will NOT close as merged" | whether ancestry can be assumed. The rail defaults to **squash**, so a batched PR's constituents stay **open** and a closure audit that assumes ancestry reports a false "not merged" for every batched PR. See the row's own note |
+| 13 | `reminder_*` | **§8** ("a stale heartbeat file does not mean the loop is dead") + **§7** | whether silence is a state. A reminder that did not send and a reminder that had nothing to say are indistinguishable in a log — the tool reports the delivery verdict, not the absence |
+| 14 | `beat_checkpoint` | **§8** ("a readiness banner is a claim; `git rev-parse`, `ls` of the artifact … are facts") | whether a banner or a heartbeat is a state. It records artifacts and their sha256, never a claim |
+| **all** | — | **§8** "Traps that produced wrong conclusions today" | **this section and the issue's six measured failures are the SAME failure family.** False merged, false unmeasured, stale clock, lane counter zero, false death — §8 names the mechanism for each, so a Phase-2 fixture that reproduces one of them should cite §8 rather than derive it again |
+
+**A row that cannot name a governing section either duplicates something or is a new capability — and
+both need the justification §7 already demands.** All 14 name one; none is a new capability.
+
+**Divergence risk, recorded because it has already been hit (lane measurements, not claims from the
+skill):** three lanes died silently on the cells while `pgrep` reported them alive (agent-infra#3331 is
+the fix), and `cmux workspace close` needs `--force` for a running process. Any tool that shells out to
+`cmux` inherits those failure modes, and they therefore appear in the affected rows — #7 (dispatch: a
+launcher that exits 0 while the lane is already gone), #8 (message: delivery is bytes, not a turn), #9
+(exec: a channel timeout is not a box verdict) — plus §10's trap table.
 
 ---
 
@@ -610,7 +673,7 @@ gate.
 |---|---|---|
 | 1 FALSE MERGED | live, in an **untracked** file | land the bytes **or** replace the source; fixture targets `closure_audit` |
 | 2 FALSE UNMEASURED | live as a **mechanism**, in the same untracked file | same; fixture asserts the reason string |
-| 3 STALE CLOCK | **already repaired** in tracked `beta-progress.py` | **pin only** — not a red-first fixture |
+| 3 STALE CLOCK | **already repaired** in tracked `beta-progress.py` | **mutation test from the pre-fix blob** (`git show b54b117fc:scripts/beta-progress.py`) **plus** the HEAD regression pin — that blob is the easiest red in the set, not a fixture to skip |
 | 4 LANE COUNTER ZERO | live on the box, fix exists only in the untracked copy | land the bytes first, then fixture |
 | 5 FALSE DEATH ×3 | **largely closed** in `liveness.py`; reachable only through a composition that does not exist yet | **pin at the `evaluate` level**, red-first at the `lane_status` boundary once the composition exists |
 | 6 SILENT ACTUATOR | **half-closed** (typed exits landed; the two measured failures were prose) | red-first on the mapping half only |
@@ -652,6 +715,45 @@ supposed to work.
 | **`cmux send` must end with `\n`** | `lane_message` (#8) | text sits unsent in the editor and concatenates with the next message | always send the terminating newline as its own step; `--paste` for multi-line |
 | **`ps -o pcpu` is a lifetime average** | Tree step 2 | a long-lived working session reads ~flat (measured: 3 of 73 processes moved) | cumulative `ps -o time`, two samples, **stated tolerance** |
 | **`ps` unreadable ≠ `ps` empty** | `scripts/lib/pid-identity.sh` exit 1 vs 2 | a failed read becomes `dead` | already encoded: exit 1 = positively absent, exit 2 = unknown. Preserve it |
+| **an `exec` timeout is a CHANNEL reading, not a box reading** | `skills/cmux-cells` §3 | a disk-full guest answers `running` while every `exec` times out; a 502 or a silent empty is the channel | carry `timed_out` as its own field; never synthesise `box-unreachable` from it |
+| **`cmux vm <verb>` takes the NAME column, not the LABEL** | `skills/cmux-cells` opening + §3 | `cmux vm stats pi-cell-4` returns a 404 whose own advice is "start a new one" — a spend-flavoured remedy for a running box | resolve LABEL→NAME from `cmux vm ls` and report the resolution |
+| **`cmux workspace close` needs `--force`** for a running process | lane measurement (this brief) | the close appears to succeed while the lane keeps running | pass `--force` when the process is live, and re-read the process afterwards |
+
+### 10.1 The two capacity calibrations — the trap that would call a dying Mac healthy
+
+⛔ **This is the most dangerous single line in the whole inventory**, which is why it gets its own
+subsection rather than a table row. There are **two** load rules on this fleet and they point in
+opposite directions:
+
+| platform | rule | owner / source | what a wrong read costs |
+|---|---|---|---|
+| **Linux cells** | load up to **8–10× the CPU count is normal** — a load of 80 on 10 CPUs is neither a wedge nor grounds to reap a lane | owner ruling 2026-11-02, `skills/cmux-cells` §2 (and the skill is explicit that this is a **CELLS** rule) | applying the laptop rule here refuses healthy dispatches (the skill records the earlier version of §2 doing exactly that, and the opposite error — filling a cell to 23 lanes — OOM-killed 37 processes, agent-infra#2159) |
+| **macOS laptop** | **~12 concurrent workstreams on 10 CPUs; above that sessions become unreachable** | `AGENTS.md`, "Load, not context, is the concurrency ceiling" | applying the cell tolerance here **calls a dying box healthy**: the fleet IS the load, the remedy is fewer workstreams, and a census that reads load 80 as fine will keep dispatching into a box whose sessions cannot answer |
+
+Two further numbers that sit **between** those, and must not be confused with either:
+
+- **`CAP_LPC_CEILING` = 8.00 load-per-CPU** (`capacity.sh:100`, default `:235`, enforced `:890`) and
+  `ai-drainer.sh`'s `LPC_CEILING=8` are **placement** gates: they refuse to **ADD** work. Both compare
+  `>=`, so exactly 8.00 already refuses. This is a *policy floor for new work*, not the tolerance for
+  work already running, and not a statement about any platform's health.
+- **`MAX_LANES` = 2.5 × cores when unset**, and the **cells pin `MAX_LANES=20`** in `keys.env`
+  (operator-pushed — re-read it). All three cells enforce 20 regardless of core count, so on
+  `pi-cell-3` (8 GB / 4 vCPU) it admits 20 lanes into 8 GB. The skill's own conclusion, which this
+  inventory adopts: **`MAX_LANES` is an upper bound, never capacity** — the binding constraint is free
+  disk vs one lane's tree+reserve (§2), then free RAM against the per-lane peak, then load.
+
+**What this obliges the tool to do:** `fleet_census` reports **per box**, with the box's *platform* named
+in the payload, and it must not emit one fleet-wide "load is fine / load is bad" verdict. Concretely, for
+each box it reports `platform: macos|linux`, `load`, `lpc`, the **applicable** threshold with its
+source, and free RAM + free disk (which §2 says are the real capacity terms). A single threshold
+applied across boxes is the defect, and it fails in the direction that looks reassuring.
+
+⛔ The skill also records that **`docs/ops/fleet-capacity.md` states the contrary twice** (≈157 "there is
+deliberately no lane ceiling tied to cpu count", and ≈283 restating it) while the code implements the
+2.5× rule — **two recorded positions, unresolved**, and the skill explicitly does not claim the doc is
+wrong. This inventory does not settle it either: the tool reports the code's behaviour and the doc's
+rule **as they are**, and the resolution belongs in `fleet-capacity.md` with an `OVERRIDES:` marker.
+A census that silently picked one would be the "helpful reader tidies away a ruling" failure.
 
 ---
 
@@ -790,8 +892,10 @@ new surface.
 wraps: `lane-status.py` (**deployed copy is 2046 lines and stale — F10**),
 `lane-actions.py`, `lane-read.py`, `beta-progress.py`, `fleet-schedule.py`, `goal-state.py`,
 `record-review.sh`, `objective.py`, `turn-classify.py`, `ask-owner.py`,
-`live-workspaces-publisher.py` — plus **two deployed-but-untracked** modules, `orch-checkpoint.sh`
-(here) and `lane-verdict.py` (under `$HOME/.pi/agent/state/`), both F3.
+`live-workspaces-publisher.py` — plus **three deployed-but-untracked** modules, `fleet-report.py` (here,
+200 lines; D3 keeps it out of the wrapped set but it is still untracked bytes), `orch-checkpoint.sh`
+(here) and `lane-verdict.py` (under `$HOME/.pi/agent/state/`) — the same three F3 names, because an
+appendix that says "two" invites landing two of three.
 **53 `.bak` files** sit beside them (`lane-actions.py` ×7, `objective.py` ×6, `lane-status.py` ×6,
 `heartbeat-loop.sh` ×5, `ci_runner_gate.sh` ×3, …) — a note on how the fleet currently versions a
 deployed script, not a tool surface. (The total is the measured one; three per-file exemplars were
@@ -821,7 +925,8 @@ classifier/actuator/aggregate defect a tool must not reproduce):
 `FINDING-lane-death-orphan-watchdog-2026-11-02.md`, `FINDING-merge-deadlock-2026-11-01.md`,
 `FINDING-lanes-shared-one-checkout-2026-10-22.md`, `FINDING-cell-auth-is-HOME-2026-10-22.md` (→ §10).
 Also read in full: `LANE-STATE-DECISION-TREE.md` (the tree), `BEAT-CHECKLIST.md` (the six beat checks →
-#4, #14), `LANE-BRIEF-PREAMBLE.md`.
+#4, #14), `LANE-BRIEF-PREAMBLE.md`, and `skills/cmux-cells/SKILL.md` (756 lines — the semantics authority,
+§5.7).
 
 **Not a surface:** nothing. Both artefacts an earlier draft called phantom **exist** — the InstaBox
 procedure (F8: `$HOME/.pi/agent/state/INSTABOX-OPERATING-PROMPT.md` + `instabox-setup.sh` +
@@ -836,5 +941,5 @@ omitted the directory it lived in.
 `orchestrator MCP typed facade / tool inventory duplication`. It returned **no relevant point** — only
 unrelated `:Source` points about `scripts/admin-merge.sh`, with its relationship decoration
 unavailable (`Query timed out`). So this inventory is not re-deriving a recorded conclusion, and the
-findings that *are* durable conclusions (F1–F12, F7b included) are filed to the graph at the end of this lane,
+findings that *are* durable conclusions (F1–F13, F7b included) are filed to the graph at the end of this lane,
 one claim per point, `evidence`-shaped with their numbers.
