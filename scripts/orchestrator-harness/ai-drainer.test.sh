@@ -418,24 +418,38 @@ check "(e4) …and names the memory ceiling in the reasoning" \
   "$(grep "nothing to add" "$LAST_AI/logs/ai-drainer.log" | head -1)"
 
 reset_run
-# ── (e5) THE CPU CEILING IS DERIVED FROM CORES (2.5 × cores, the fleet's recorded ruling) ───
-# 4 cores → 10; the slice clamp then holds it to 7 distinct windows (SLICE_TOTAL/SLICE_WIDTH), so
-# two lanes never work the same PRs. Both numbers are asserted, in the same line.
+# ── (e5) THE LANE CEILING IS DERIVED FROM CORES (cores+2, 2026-11-03) ───────────────────────
+# 4 cores → 6; the slice clamp holds it to 7 distinct windows (SLICE_TOTAL/SLICE_WIDTH), which is
+# ABOVE the lane ceiling on 4 cores, so the LANE ceiling binds here and 6 are dispatched. (This case
+# used to assert the clamp (7) because 2.5 × cores gave 10; 2.5 × cores is now MAX_LOAD, the load
+# gate, not the lane count — see the derivation comment in ai-drainer.sh.)
 RUN_NCPU=4 RUN_MEM=8192 RUN_TARGET= RUN_SLICE_TOTAL=70 RUN_SLICE_WIDTH=10
 run_drainer_fg e5
-check "(e5) 4 cores → cpu ceiling 10, clamped to the 7 distinct slices" \
+check "(e5) 4 cores → cpu ceiling 6 (cores+2), below the 7 distinct slices, so 6 are dispatched" \
+  'grep -q "target=6 (cpu=6 mem=" "$LAST_AI/logs/ai-drainer.log" && grep -q "dispatching 6 " "$LAST_AI/logs/ai-drainer.log"' \
+  "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1)"
+check "(e5) …and the slice clamp is NOT falsely claimed when the lane ceiling binds first" \
+  '! grep -q "exceeds the 7 distinct slice(s)" "$LAST_AI/logs/ai-drainer.log"'
+
+reset_run
+# (e5b) THE CLAMP STILL FIRES AND IS STILL STATED when the lane ceiling exceeds the distinct slices.
+# 8 cores → cpu 10 > 7 slices, so the clamp holds dispatch to 7 and SAYS so. Without this case the
+# `! grep` above would pass vacuously if the clamp line had been deleted outright.
+RUN_NCPU=8 RUN_MEM=8192 RUN_TARGET= RUN_SLICE_TOTAL=70 RUN_SLICE_WIDTH=10
+run_drainer_fg e5b
+check "(e5b) 8 cores → cpu ceiling 10, clamped to the 7 distinct slices" \
   'grep -q "target=10 (cpu=10 mem=" "$LAST_AI/logs/ai-drainer.log" && grep -q "dispatching 7 " "$LAST_AI/logs/ai-drainer.log"' \
   "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1)"
-check "(e5) …and the clamp is STATED, not silent" \
+check "(e5b) …and the clamp is STATED, not silent" \
   'grep -q "exceeds the 7 distinct slice(s)" "$LAST_AI/logs/ai-drainer.log"'
 
 reset_run
 # ── (e6) THE MEMORY TERM BINDS WHEN IT IS SMALLER THAN THE CPU TERM ─────────────────────────
-# 8 cores → cpu 20; 2000MB → pool 1488 → usable 1116 → 2 lanes of 512MB. Memory wins: target=2.
+# 8 cores → cpu 10 (cores+2); 2000MB → pool 1488 → usable 1116 → 2 lanes of 512MB. Memory wins: target=2.
 RUN_NCPU=8 RUN_MEM=2000 RUN_TARGET=
 run_drainer_fg e6
 check "(e6) 8 cores / 2000MB → target 2 (memory binds, not cores)" \
-  'grep -q "target=2 (cpu=20 mem=2" "$LAST_AI/logs/ai-drainer.log" && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 2 ]' \
+  'grep -q "target=2 (cpu=10 mem=2" "$LAST_AI/logs/ai-drainer.log" && [ "$(dispatched "$LAST_AI/logs/ai-drainer.log")" -eq 2 ]' \
   "$(grep "START:" "$LAST_AI/logs/ai-drainer.log" | head -1) dispatched=$(dispatched "$LAST_AI/logs/ai-drainer.log")"
 
 reset_run

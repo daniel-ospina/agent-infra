@@ -135,9 +135,16 @@ cat "$HOME/orchestrator/.orch.lock"     # orch-loop.sh writes its own $$; a seco
 (`tmux new-session` client → `bash -c` → `orch-loop.sh`), and the outer client can carry a *stale* env
 from the launch that created it — measured on cell-3 during this audit: the first match reported
 `MAX_LANES=6`, the deepest reported `10`. `MAX_LANES` is **derived, not configured**:
-`install.sh` computes `MAX_LANES=${MAX_LANES:-$(( _NCPU * 5 / 2 ))}` (2.5 × cores) with a fallback of 10.
-So Mac 25 (10 cores), 8-core cells 20, cell-3 10 (4 cores). **Do not "fix" a per-box MAX_LANES** — a
-mismatch with 2.5 × cores means the *env* was not the plist's, not that the number is wrong.
+`install.sh` computes `MAX_LANES=${MAX_LANES:-$(( _NCPU + 2 ))}` (cores+2) with a fallback of 6.
+So Mac 12 (10 cores), 8-core cells 10, cell-3 6 (4 cores). **Do not "fix" a per-box MAX_LANES** — a
+mismatch with cores+2 means the *env* was not the plist's, not that the number is wrong.
+
+⛔ **`MAX_LANES` is NOT the capacity ceiling — `MAX_LOAD` is.** The owner rule is *capacity ceiling =
+2.5 × CPU count*, and that number belongs to `MAX_LOAD` (a 1-min load gate): Mac 25, 8-core cells 20.
+`MAX_LANES` is the WORKSTREAM count (`cores+2`), which must stay strictly below the load ceiling so
+the load gate is always the binding one. Until 2026-11-03 both were wrong in opposite directions —
+`MAX_LOAD` was `cores*10` (4× the rule, so it never bound) and `MAX_LANES` carried the 2.5× — which is
+how a 10-core mac reached load 75–128 with 18 lanes.
 
 ---
 
