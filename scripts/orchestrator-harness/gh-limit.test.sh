@@ -2143,13 +2143,13 @@ print(m.budget_token(int(sys.argv[2]), r))' "$HELPER" "$@"
 }
 _btok="$(_tok 0 1700002580)"
 ck "budget token: at zero it names the remaining count AND the reset as ISO-8601 [$_btok]" \
-   "$(printf '%s' "$_btok" | grep -Eq '^GH-BUDGET\(remaining=0, resets_at=20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\)$' && echo 0 || echo 1)"
+   "$(grep -Eq '^GH-BUDGET\(remaining=0, resets_at=20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\)$' <<<"$_btok" && echo 0 || echo 1)"
 # ⛔ AN UNDATED RECORD IS `?`, NEVER A SYNTHETIC WINDOW: printing a made-up reset would make a lane
 # wait out a number nobody measured (the same defect `--health`'s `resets_in=?` already documents).
 ck "budget token: an UNDATED record says resets_at=? rather than inventing a window" \
    "$([ "$(_tok 0 none)" = 'GH-BUDGET(remaining=0, resets_at=?)' ] && echo 0 || echo 1)"
 ck "budget token: a non-zero count is reported as measured (the token is not exhaustion-only)" \
-   "$(printf '%s' "$(_tok 42 1700002580)" | grep -q 'remaining=42' && echo 0 || echo 1)"
+   "$(grep -q 'remaining=42' <<<"$(_tok 42 1700002580)" && echo 0 || echo 1)"
 # ⛔ AN OUT-OF-RANGE RESET MUST NOT TAKE THE VERB DOWN. `time.gmtime` raises OverflowError (NOT
 # ValueError) for a corrupt/hand-edited `reset=`, and an uncaught one made `--health` exit 1 with a
 # traceback — the "the check failed" polarity this file's own docstring forbids, from the ONE verb an

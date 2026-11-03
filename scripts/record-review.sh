@@ -1039,7 +1039,11 @@ post_marker() { # <repo> <pr> <marker> -> 0 present/posted, 1 post failed, 2 bod
   local repo="$1" pr="$2" marker="$3" body="" newbody=""
   body="$(command gh api "repos/$repo/pulls/$pr" --jq .body 2>/dev/null)" || return 2
   [ "$body" = "null" ] && body=""
-  if printf '%s\n' "$body" | command grep -qF -- "$marker"; then return 0; fi
+  # ⛔ A HERE-STRING, NOT A PIPE INTO A QUIET grep (#841/#864): `grep -qF` exits at the first
+  # match, so on a body larger than the pipe buffer the writer takes SIGPIPE and `pipefail` reports
+  # the pipeline as FAILED — turning a marker that IS present into "absent" and re-patching a body
+  # that already carries it. The guard (scripts/check-no-sigpipe-grep.sh) reds main on this idiom.
+  if command grep -qF -- "$marker" <<<"$body"; then return 0; fi
   if [ -n "$body" ]; then newbody="${body}
 
 ${marker}"; else newbody="$marker"; fi
