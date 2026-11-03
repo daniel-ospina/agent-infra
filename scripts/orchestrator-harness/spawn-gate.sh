@@ -2264,6 +2264,39 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log"
     fi
   fi
+  # ── THE UV PIN, APPLIED AT THE SPAWN SEAM (agent-infra#3380) ─────────────────────────────────────
+  # `uv-env.sh`'s own header lists the delivery paths it was wired into: the macOS launchd plist, the
+  # Linux cell bring-up, the cell supervisor, and the per-lane env snapshot `worker-terminal.sh`
+  # writes. THIS function was not among them, and it is the seam EVERY launcher routes through
+  # (`lane.sh`, `fix-one.sh`, `nonblocking-dispatch.sh`, and any caller added later), so a lane
+  # started here got `UV_LINK_MODE`/`UV_CACHE_DIR` from whatever the ambient environment happened to
+  # hold. On a cell that is NOTHING — measured 2026-11-03 on pi-cell-1 and pi-cell-4, both
+  # `UV_LINK_MODE=<unset>` in the ambient env AND after sourcing `keys.env` — and `uv`'s default link
+  # mode is `clone`, which on these ext4 boxes is a full COPY. Measured cost of that: ONE worktree's
+  # `.venv` at **5,705 MB** on cell-1, whose uv cache was warm (12 GB) and whose doc-recorded normal
+  # is "venvs hardlink -> ~FREE". Multiply by every lane and the box fills — which is the disk
+  # saturation this fix exists to stop, and it is the same number `spawn-gate`'s own headroom gate
+  # then refuses on, so a box pays it twice.
+  #
+  # ⛔ AN OPERATOR'S PIN ALWAYS WINS. `uv_env_apply` only fills what is UNSET (its own contract, tested
+  # in `uv-env.test.sh`), so a box that has chosen `copy` or a cross-filesystem cache keeps it and the
+  # log line says so via `UV_ENV_DEFAULTED`. This is a default, never an override.
+  # ⛔ AND IT MUST NOT BE ABLE TO REFUSE A SPAWN. The helper is read-only, but a missing or unreadable
+  # copy must degrade to "no pin" — never to a failed launch — because a box with an odd install would
+  # otherwise stop starting lanes entirely, which is worse than the disk it saves.
+  {
+    local _uvdir
+    _uvdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _uvdir=""
+    if [ -n "$_uvdir" ] && [ -r "$_uvdir/uv-env.sh" ]; then
+      # shellcheck source=/dev/null
+      . "$_uvdir/uv-env.sh" 2>/dev/null || true
+      if command -v uv_env_apply >/dev/null 2>&1; then
+        uv_env_apply "${CELL_HOME:-${HOME:-}}" 2>/dev/null || true
+        export UV_CACHE_DIR UV_LINK_MODE
+        echo "[uv-env] link_mode=${UV_LINK_MODE:-<unset>} cache_dir=${UV_CACHE_DIR:-<unset>} defaulted=${UV_ENV_DEFAULTED:-none} (a lane whose venv is a full COPY pays ~5.7 GB per worktree — agent-infra#2159)" >> "$log"
+      fi
+    fi
+  }
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`

@@ -33,7 +33,10 @@ INSTALL="$HERE/install.sh"
 TPL="$HERE/launchd.plist.template"
 BRINGUP="$HERE/../cloud-cell-bringup.sh"
 SUP="$HERE/../cloud-cell-supervisor.sh"
-for f in "$LIB" "$WT" "$INSTALL" "$TPL" "$BRINGUP" "$SUP"; do
+# The SPAWN seam: `run_agent()` in spawn-gate.sh is what `lane.sh`, `fix-one.sh` and
+# `nonblocking-dispatch.sh` all route through, so the pin must be applied THERE and before the launch.
+SPAWN="$HERE/spawn-gate.sh"
+for f in "$LIB" "$WT" "$INSTALL" "$TPL" "$BRINGUP" "$SUP" "$SPAWN"; do
   [ -f "$f" ] || { echo "FATAL: $f not found (run from the harness checkout)" >&2; exit 2; }
 done
 
@@ -175,6 +178,22 @@ ck "CELL bring-up: applies the pin before keys.env (so an operator pin still win
    'grep -q "uv_env_apply" "$BRINGUP" && grep -q "check_uv_env" "$BRINGUP" && grep -q "^      check_uv_env" "$BRINGUP"'
 ck "CELL supervisor: exports the pin (the env every lane snapshots) and reports it in check" \
    'grep -q "uv_env_apply" "$SUP" && grep -q "uv_env_report --estate" "$SUP"'
+# ⛔ THE SPAWN SEAM (agent-infra#3380). `uv-env.sh`'s header enumerates the paths it was wired into —
+# launchd, cell bring-up, the cell supervisor, the per-lane env snapshot — and `run_agent()` was NOT
+# among them, although it is the seam EVERY launcher routes through. Measured on pi-cell-1/pi-cell-4
+# 2026-11-03: `UV_LINK_MODE` unset both ambient and after `keys.env`, and one worktree's `.venv` at
+# 5,705 MB (a full COPY under uv's `clone` default) on a box whose warm cache should have made it
+# near-free. So the assertion is on LIVE lines (comments quote the helper's name and would make a
+# grep-only arm vacuous) and on ORDER (applied BEFORE the launch, or the child never sees it).
+SPAWN_LIVE="$(awk '!/^[[:space:]]*#/' "$SPAWN")"
+ck "SPAWN SEAM: run_agent applies the pin on live lines, not just in a comment" \
+   '[ "$(printf "%s" "$SPAWN_LIVE" | grep -c "uv_env_apply")" -ge 1 ]'
+ck "SPAWN SEAM: …and exports both keys, so the child inherits them" \
+   'printf "%s" "$SPAWN_LIVE" | grep -q "export UV_CACHE_DIR UV_LINK_MODE"'
+ck "SPAWN SEAM: …and applies it BEFORE the pi launch line (afterwards is a no-op)" \
+   '[ "$(printf "%s\n" "$SPAWN_LIVE" | grep -n "uv_env_apply" | head -1 | cut -d: -f1)" -lt "$(printf "%s\n" "$SPAWN_LIVE" | grep -n "pi -p --provider" | head -1 | cut -d: -f1)" ]'
+ck "SPAWN SEAM: …and it can never refuse a spawn (an unreadable helper degrades to no pin)" \
+   '[ "$(printf "%s" "$SPAWN_LIVE" | grep -c "|| true")" -ge 1 ]'
 ck "the estate report states distinct-vs-per-name bytes (not a per-worktree du sum)" \
    'grep -q "du_total_counting_links" "$HERE/../worktree-disk-probe.sh" && grep -q "\[distinct\]" "$HERE/../worktree-disk-probe.sh"'
 
