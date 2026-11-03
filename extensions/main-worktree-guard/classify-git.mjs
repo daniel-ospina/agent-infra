@@ -4701,12 +4701,20 @@ const HUB_MUTATING_VERBS = new Set([
  *
  * The window is a named-path restore, so the operand test must be about the
  * EFFECT, not the spelling (review round 2 measured the fail-open): the first
- * cut refused only the literal `.`, so `git checkout -- ./`, `-- ..`, `-- ../`,
- * `-- src/` and `-- '*.txt'` were all PERMITTED under the hatch — `./` is the
- * same wipe as `.`, `..` reaches ABOVE the hub, and a glob discards whatever it
- * matches. Every one of them was BLOCKED on main, so this was a regression the
- * arm introduced, not a gap it inherited. Strip trailing slashes, then refuse
- * the whole-tree/dot-dot/absolute/home/glob forms. */
+ * cut refused only the literal `.`, so `git checkout -- ./`, `-- ..`, `-- ../`
+ * and `-- '*.txt'` were all PERMITTED under the hatch — `./` is the same wipe
+ * as `.`, `..` reaches ABOVE the hub, and a glob discards whatever it matches.
+ * Every one of them was BLOCKED on main, so this was a regression the arm
+ * introduced, not a gap it inherited. Strip trailing slashes, then refuse the
+ * whole-tree/dot-dot/absolute/home/glob/brace forms.
+ *
+ * ⚠️ ADMITTED ON PURPOSE — and this docblock used to claim otherwise (round 16):
+ * a DIRECTORY operand (`src`, `src/`) names its SUBTREE and is permitted, so one
+ * command discards every dirty tracked file under it. That is a deliberate part
+ * of the "name your paths" contract (the alternative is refusing the only route
+ * that clears dirt sitting in a directory), but it is not a whole-tree wipe and
+ * it is not silent: the M5 block text names the subtree case. Do not re-list it
+ * here as a closed fail-open unless the behaviour changes. */
 function _isNamedPathOperand(x) {
   const p = String(x ?? "").replace(/\/+$/, "");
   if (!p) return false;

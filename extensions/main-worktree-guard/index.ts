@@ -2556,8 +2556,10 @@ function _worktreeDiscardBlockReason(
                 `     ELDATO_ALLOW_MAIN_EDITS=1) — a FULL bypass of M4/M5, whole-tree`,
                 `     discards included — or stamp the ~/.pi/agent/.allow-main-edits MARKER,`,
                 `     which opens the same narrow recovery window as M4: name the paths,`,
-                `     \`git restore <path>\` / \`git checkout -- <path>\` (a whole-tree discard —`,
-                `     \`.\`, pathspec magic, a glob — stays refused UNDER THE MARKER).`,
+                `     \`git restore <path>\` / \`git checkout -- <path>\`. Refused UNDER THE MARKER:`,
+                `     a whole-tree discard (\`.\`, \`./\`, pathspec magic, a glob, a brace) — and`,
+                `     NOTE a DIRECTORY operand (\`src\`, \`src/\`) IS admitted and discards that`,
+                `     entire subtree, so name a FILE when that is what you mean.`,
               ]),
         ]),
   ].join("\n");

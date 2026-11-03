@@ -544,6 +544,19 @@ async function partB() {
     } finally {
       delete process.env.GIT_CONFIG_NOSYSTEM;
     }
+    // B6w6 — round 16 (P2): the MESSAGE must use the SAME predicate as the
+    // decision. A revert of that unification stayed green (the only INHERITED
+    // assertion was the positive GIT_DIR one), so this asserts the NEGATIVE: an
+    // exempt variable must not produce the "window is CLOSED" paragraph.
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    try {
+      const b6w6 = await drive("nice git checkout -- wip.txt");
+      check("B6w6 GIT_CONFIG_NOSYSTEM => refusal does NOT claim a closed window", /INHERITED a repo-selecting env/.test(b6w6?.reason ?? ""), false);
+      const b6w6b = await drive("git commit -am x");
+      check("B6w6b same, on the M4 dirty message", /INHERITED a repo-selecting env/.test(b6w6b?.reason ?? ""), false);
+    } finally {
+      delete process.env.GIT_CONFIG_NOSYSTEM;
+    }
     // B6h — round 4, P2: while the hatch is ACTIVE the refusal must name the
     // window's real shape limit, not re-prescribe the hatch the reader holds.
     const b6h = await drive("git checkout -- wip.txt > /dev/null");
