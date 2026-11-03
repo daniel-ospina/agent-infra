@@ -459,8 +459,64 @@ jobs:
         echo "✅ All extension tests passed"
     secrets: inherit
 
+  script-validate-gates:
+    # ⛔ THE GUARDS MOVE OUT OF THE MATRIX, AND THE REASON IS ARITHMETIC. `script-validate` is now a
+    # shard matrix (see the comment there), so every step left in it runs EIGHT times. These three are
+    # whole-tree checks with no shard dimension — node syntax over `scripts/*`, the lane-parity guard,
+    # and that guard's own mutation self-test (5 + 15 min measured) — so keeping them in the matrix
+    # would cost ~30 runner-minutes x 8 slices to produce ONE verdict, spending more than the sharding
+    # saves. They stay a single job, with the same steps and the same bounds as before.
+    # This mirrors ci.yml, which splits its sweep (`bash-suites`) from its guards (`bash-suites-gate`)
+    # for exactly this reason (#1369).
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+        timeout-minutes: 10
+      - name: Validate Node.js scripts
+        timeout-minutes: 10
+        run: |
+          errors=0
+          for f in scripts/*.{cjs,mjs,js} bin/*.js; do
+            [ -f "$f" ] || continue
+            node --check "$f" || errors=$((errors+1))
+          done
+          if [ $errors -gt 0 ]; then
+            echo "❌ $errors script(s) failed validation"
+            exit 1
+          fi
+          echo "✅ All scripts validated"
+      - name: Lane-parity guard — both lanes must call the one shard runner (#1369)
+        # Bare call: its exit code IS the step's. `runner || errors=$((errors+1))` was the old
+        # form and is REFUSED by scripts/check-ci-lane-parity.sh — the guard cannot see whether
+        # an accumulator is ever read, so accepting it accepts "count the failure and exit 0".
+        timeout-minutes: 5
+        run: bash scripts/check-ci-lane-parity.sh
+      - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
+        # 6-9 s measured on this job since #2529 (8 successful main runs, 2026-10-24; 6-12 s with
+        # one 17 s outlier on the PR lane, 17 runs). 15 min ≈ 100x the 9 s worst observed here; the
+        # old 70 min was sized from a measurement taken before #2529 and could not fail fast.
+        timeout-minutes: 15
+        run: bash tests/ci-lane-parity/run.sh
+
   script-validate:
     runs-on: ubuntu-latest
+    # ⛔ THE SWEEP IS A MATRIX HERE TOO (measured 2026-11-03). This job ran `run-bash-shards.sh`
+    # UNSLIPPED over all 158 shards: 130 min measured (main run 41693024926, job 126116214764), on
+    # EVERY merge, while the PR lane runs the SAME script as an 8-way matrix whose slowest shard is
+    # 41 min. Same work, ~3x the wall, and ~130 runner-minutes per merge is what starves the PR lane
+    # — the queue every merge then waits behind. Slicing is the PR lane's own mechanism (agent-infra
+    # #1369/#2483): the list stays in `scripts/run-bash-shards.sh`, this job only says which slice.
+    strategy:
+      # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
+      # hand-kept number). Width 8 mirrors ci.yml's `bash-suites`; the per-slice sizes are DERIVED
+      # by the runner, so adding a suite shifts them with no workflow edit.
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     # ⛔ #3131 — `merge-reminder.test.sh` §27b is the SECOND ambient-ref reader on this matrix. It
     # requires `box-status.sh` to print `ref: origin/main=<sha>`, a line emitted ONLY when
     # `git -C "$REPO" rev-parse --verify origin/main` resolves; an unresolvable ref produces no
@@ -521,7 +577,7 @@ jobs:
     # step-level `failure` — the whole defect this block exists to close, re-entering through the
     # backstop. 230 also stays ~1.53x the 150 min shard step it backstops, so it cannot
     # false-block.
-    timeout-minutes: 230
+    timeout-minutes: 100
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10
@@ -532,31 +588,6 @@ jobs:
         timeout-minutes: 10
         with:
           node-version: '22'
-      - name: Validate Node.js scripts
-        timeout-minutes: 10
-        run: |
-          errors=0
-          for f in scripts/*.{cjs,mjs,js} bin/*.js; do
-            [ -f "$f" ] || continue
-            node --check "$f" || errors=$((errors+1))
-          done
-          if [ $errors -gt 0 ]; then
-            echo "❌ $errors script(s) failed validation"
-            exit 1
-          fi
-          echo "✅ All scripts validated"
-      - name: Lane-parity guard — both lanes must call the one shard runner (#1369)
-        # Bare call: its exit code IS the step's. `runner || errors=$((errors+1))` was the old
-        # form and is REFUSED by scripts/check-ci-lane-parity.sh — the guard cannot see whether
-        # an accumulator is ever read, so accepting it accepts "count the failure and exit 0".
-        timeout-minutes: 5
-        run: bash scripts/check-ci-lane-parity.sh
-      - name: Lane-parity guard self-test — mutations, not just "it runs" (#1369)
-        # 6-9 s measured on this job since #2529 (8 successful main runs, 2026-10-24; 6-12 s with
-        # one 17 s outlier on the PR lane, 17 runs). 15 min ≈ 100x the 9 s worst observed here; the
-        # old 70 min was sized from a measurement taken before #2529 and could not fail fast.
-        timeout-minutes: 15
-        run: bash tests/ci-lane-parity/run.sh
       - name: Materialize origin/main so checkout-keyed assertions are judgeable (#3131)
         # ⛔ NO `if:` on this step: `scripts/check-ci-lane-parity.sh` refuses a conditional step around the
         # shard call ("a step that may not run, whose failure cannot fail the run"), so the condition
@@ -575,42 +606,27 @@ jobs:
         # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
         # Bare call, one step: a shard failure must fail the RUN, not just a counter.
         #
-        # ⛔ THE BOUND IS SIZED FROM A MEASURED LIST, NOT FROM A GUESS, AND NOT FROM A MEASUREMENT OF A
-        # DIFFERENT LIST (agent-infra#3174). The figure this comment used to carry (46m38s-54m32s,
-        # 8 main runs on 2026-10-24) described about 80 shards; the derived list is 147 today, so
-        # "110 min is ~2.0x the top of that range" was arithmetic about a list that no longer existed.
-        # MEASURED 2026-10-31 from the job's OWN per-suite rows (`▸ <secs> <path>`, run 41240886978,
-        # job 124654357365): 147 listed suites summing 6468 s = 107.8 min of shard work, with the job
-        # itself ending at 108.2 min wall. Against the 110 min step bound that was a 132 s MARGIN —
-        # 98.0 % of the bound — so the list had already outrun its bound in every sense that matters
-        # and 13 of the measured suites are each larger than it — the 891 s suite added the same day
-        # by 4bc7f759 / #3114 is ONE OF THEM and is INSIDE the 6468 s, so it is not extra (a first
-        # draft of this comment charged it twice). No ambiguity about which end was the
-        # defect: the SUITES ARE LEGITIMATE GATES (wired by DERIVATION — a file matching SUITE_GLOBS
-        # joins the list with no workflow edit), and the CONSTANT was sized from an older list.
-        #
-        #   147 suites · 6468 s measured · 110 min bound · +132 s margin (98.0 % of bound)
-        #
-        # 150 min = 9000 s = 1.39x the measured 6468 s: 2532 s (42.2 min) of headroom, which is 2.8x
-        # the largest measured suite (`tests/atomic-land/run.sh`, 899 s = 15.0 min) and 1.5x it even
-        # measured against the runner's 7800 s budget. So the bound survives ANY one more suite of
-        # tonight's largest class without a workflow edit (6468 + 899 = 7367 s < 7800 s budget < 9000 s
-        # step bound) — while still failing fast against the ~2h46m hang that #2055 recorded.
-        #
-        # ⛔ AND THE OVERRUN IS NOW A NAMED RED, NOT AN OPAQUE ONE. `BASH_SHARDS_BUDGET_SECS` below is
-        # the runner's OWN deadline at 7800 s (130 min = 1.20x measured), 20 min INSIDE this platform
-        # bound, so the runner reaches its verdict first and says which defect it is:
-        # `❌ SHARD BUDGET EXCEEDED` (the LIST outran the bound — capacity) versus
-        # `❌ failing shard(s): <paths>` (a suite failed — attributed by name and `::error::`
-        # annotation). Before this, both were the same `failure` with nothing distinguishing them.
-        # 150 also keeps the job bound a pure backstop: 10 + 10 + 10 + 5 + 15 + 150 = 200 < 230.
+        # ⛔ THIS JOB NOW RUNS A SLICE, NOT THE LIST (measured 2026-11-03). It used to run all ~158
+        # shards serially: 130 min measured (main run 41693024926, job 126116214764), on EVERY
+        # merge, while ci.yml's `bash-suites` runs the same script as an 8-way matrix whose slowest
+        # shard is 41 min. Same work, ~3x the wall, and ~130 runner-minutes per merge is what
+        # starves the PR lane — the queue every merge then waits behind. So the slice arrives in
+        # `BASH_SHARD_SLICE` exactly as the PR lane does it, and the LIST still lives in exactly one
+        # place (the runner).
+        # ⛔ THE OLD 150-min STEP BOUND AND THE 7800 s `BASH_SHARDS_BUDGET_SECS` ARE GONE ON PURPOSE,
+        # and neither is a weakening: `run-bash-shards.sh` REFUSES that pairing with a slice (rc 2 —
+        # "the two do not compose"), because a whole-list deadline measured against one slice's share
+        # of the work is ~8x too lenient. What bounds THIS unit is the runner's own per-shard
+        # `SHARD_BOUND` (default 1800 s, killed by process group and NAMED) plus this step's 70 min —
+        # itself ~1.7x the measured worst slice (41 min), so it cannot false-block a slow-but-healthy
+        # slice. The list-wide deadline belongs to a lane that runs the whole list.
         env:
-          # Whole seconds; must stay BELOW `timeout-minutes` here so the named verdict wins. The
-          # runner refuses a non-numeric value, and refuses SET-but-EMPTY (an unset CI variable
-          # expands to empty, and treating that as "no deadline" would be a fail-open). Unsetting the
-          # var is the documented "no deadline" spelling, as is 0.
-          BASH_SHARDS_BUDGET_SECS: '7800'
-        timeout-minutes: 150
+          # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
+          # hand-kept number). The slice arrives in the STEP's env, never as an argument, so the
+          # bare `run:` call below is unchanged — which is what scripts/check-ci-lane-parity.sh
+          # asserts about BOTH lanes.
+          BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+        timeout-minutes: 70
         run: bash scripts/run-bash-shards.sh
 
   skill-lint:
