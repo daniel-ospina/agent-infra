@@ -228,8 +228,16 @@ is_limit "${_NCPU:-}"    || _NCPU=4
 # `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
 # install.sh carries the identical line (P3, fifth review round, 2026-10-14).
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
-MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+# ⛔ THE CEILING IS 2.5 x CORES, NOT 10 x CORES (owner rule, 2026-11-03). `* 10` put the load ceiling
+# FOUR TIMES the owner's capacity rule: on a 10-core box the gate did not close until load 100, and
+# the box was measured at load 75.49 / 94.25 / 128.63 with 18 pi lanes crawling, while every dispatch
+# it admitted was one it could not serve. 2.5 x cores is ALSO the operating point this repo already
+# documents (`docs/ops/load-policy.md`: "load ~25 on 10 cores ≈ 2.5×/core", the same 2.5 multiplier
+# `LOAD_SUSPEND_THRESHOLD` uses), so this is the code catching up to a decision that already exists —
+# it is not a new tuning choice. `MAX_LOAD` is a SANITY CEILING over 1-min load, so 2.5 x cores still
+# leaves the gate open at the box's own happy point rather than pinning it shut.
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 5 / 2 ))}"
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=10
 # ⛔ CAPACITY, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated on capacity,
 # not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of
 # CPUs". Both numbers in play were LANE COUNTS that no hardware decided: the shipped default was a
@@ -237,10 +245,19 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load
 # headroom and comfortable swap/memory, so the NEXT dispatch was refused for a lane count while
 # capacity was available. `MAX_LOAD` above already derives from cores; same rule here.
-# Integer division, so it FLOORS (4 cores -> 10, 3 -> 7). An explicit MAX_LANES still WINS and is not
-# recomputed — with ONE exception, spelled out at the coercion block below: a present-but-INVALID
-# value (`4x`, `09`, ten digits) is repaired there to this same derived default.
-MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
+# ⛔ AND THE LANE COUNT IS A DIFFERENT NUMBER FROM THE CAPACITY CEILING (2026-11-03). The 2026-10-17
+# ruling above read "2.5x the number of CPUs" as a LANE count because, at the time, `MAX_LOAD` was
+# pinned at `10 x cores` and so could never bind — the lane cap was the ONLY lever the box had. It is
+# a proxy, and the ruling's own words say what it is a proxy FOR: "dispatch should be gated on
+# capacity, not on number of lanes". With `MAX_LOAD` now carrying the 2.5x capacity ceiling for real,
+# the lane cap goes back to expressing WORKSTREAM guidance (≲10-12 concurrent workstreams on 10
+# cores), not capacity. `cores + 2` gives 10 cores -> 12, 8 -> 10, 4 -> 6, which is the ≲10-12 band on
+# the box the rule was written for and scales below 2.5 x cores everywhere (so the LOAD gate is always
+# the binding one, never the lane count — the exact defect the 2026-10-17 ruling closed).
+# An explicit MAX_LANES still WINS and is not recomputed — with ONE exception, spelled out at the
+# coercion block below: a present-but-INVALID value (`4x`, `09`, ten digits) is repaired there to this
+# same derived default.
+MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU + 2 ))}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
 # merging takes priority and new lanes stop being dispatched. The pre-fix gate counted the TOTAL
@@ -473,7 +490,7 @@ is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
 # `* 5 / 2` can produce a ten-digit lane count that `is_limit` rejects — and only a TRUE default can
 # repair that, since re-deriving from the same probe returns the same value. 10 = a 4-core box's
 # 2.5x. `MAX_LANES=0` still passes `is_limit` and dispatches nothing — unchanged, deliberate.
-is_limit "${MAX_LANES:-}"         || { MAX_LANES=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LANES:-}" || MAX_LANES=10; }
+is_limit "${MAX_LANES:-}"         || { MAX_LANES=$(( 10#$_NCPU + 2 )); is_limit "${MAX_LANES:-}" || MAX_LANES=6; }
 is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
 is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 # ⛔ A 0 WINDOW MAKES THE GATE INERT, SILENTLY: `is_limit 0` is TRUE (0 is a valid count), and with
