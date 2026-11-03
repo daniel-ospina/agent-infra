@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # cloud-cell-bringup.graph-client.test.sh — the probe for `check_graph_client` (agent-infra#3253).
 #
-# WHY THIS EXISTS. The function is a five-branch reading with one hard rule (never print the key's
-# value) and one subtle mechanism (the `&& printf x` sentinel that separates "the test ran and found
-# the key" from "the file terminated the shell before the test"). Every branch carries the whole value
-# of the reading, and none of them was exercised: a regression in the sentinel, in the REST-vs-MCP
-# distinction, or in the never-print rule would be silent — the check would keep printing a confident
-# line, and nobody could tell "reported absent" from "the probe never ran".
+# WHY THIS EXISTS. The function is a multi-branch reading with one hard rule (never print the key's
+# value) and one subtle mechanism (a CAPTURED `printf mcp` / `printf rest` sentinel whose ABSENCE — not
+# an exit status — separates "the test ran and found the key" from "the file terminated the shell before
+# the test"). Every branch carries the whole value of the reading, and none of them was exercised: a
+# regression in the sentinel, in the REST-vs-MCP distinction, or in the never-print rule would be
+# silent — the check would keep printing a confident line, and nobody could tell "reported absent" from
+# "the probe never ran".
 #
 # HOW IT PROBES. The function is EXTRACTED VERBATIM from the shipped script (`sed` on the function
 # body, not a copy) and sourced beside two stubs (`ok`/`warn`) that append to a transcript. A copy
@@ -95,6 +96,12 @@ mkdir -p "$H1/.pi/agent/scripts"
 printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E1"
 HOME="$H1" ENV_FILE="$E1" run_case good >"$TMP/good.stdout" 2>"$TMP/good.err"
 expect good "graph client: present at"
+# \u26d4 THE SCOPE WORDS ARE THE ASSERTION. Round 4's P1 was an UNQUALIFIED `ok ... present` that read as a
+# clean bill over the measured stale hand-copy; a regression that keeps "present at $client" and drops
+# the sentence passes every other arm here (measured 2026-11-03: 46/46 green with the defect restored), so
+# the sentence itself is pinned.
+expect good "presence only"
+expect good "cell-install.sh --verify"
 expect good "tortoise_graph_client.py beside it"
 expect good "graph credential: TORTOISE_MCP_API_KEY is set in"
 expect_absent good "warn:"
@@ -155,13 +162,21 @@ mkdir -p "$H7/.pi/agent/scripts"
 : >"$H7/.pi/agent/scripts/tortoise-graph.sh"; : >"$H7/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E7"
 chmod 000 "$E7"
+ROOT_UNREADABLE=0
+[ "$(id -u)" = "0" ] && ROOT_UNREADABLE=1
 HOME="$H7" ENV_FILE="$E7" run_case unreadable >"$TMP/unreadable.stdout" 2>"$TMP/unreadable.err"
 chmod 644 "$E7"
-expect unreadable "graph credential UNKNOWN"
-expect_absent unreadable "graph credential MISSING"
-clean unreadable
+if [ "$ROOT_UNREADABLE" -eq 1 ]; then
+    # root reads a mode-000 file, so this arm cannot reproduce "unreadable" here: say so instead of
+    # asserting a state the environment cannot produce (a false RED on every cell, which runs as root).
+    echo "note: case \`unreadable\` skipped — running as uid 0, where mode 000 is still readable"
+else
+    expect unreadable "graph credential UNKNOWN"
+    expect_absent unreadable "graph credential MISSING"
+    clean unreadable
+fi
 
-# ── case 9: the key is in THIS SHELL but not in the file — a lane still has none ──────────
+# ── case 8: the key is in THIS SHELL but not in the file — a lane still has none ──────────
 # (this arm and the two below also make case 12's leak assertion NON-VACUOUS: with no ambient value,
 # a check that echoed the environment's key would echo an empty string and pass.)
 H9="$TMP/h9"; E9="$TMP/h9/keys.env"
@@ -173,7 +188,7 @@ expect ambient_mcp "graph credential NOT REACHING LANES"
 expect_absent ambient_mcp "$SECRET"
 clean ambient_mcp
 
-# ── case 10: the REST key ambient, nothing in the file — UNCERTAIN, never ok ────────────────
+# ── case 9: the REST key ambient, nothing in the file — UNCERTAIN, never ok ────────────────
 H10="$TMP/h10"; E10="$TMP/h10/keys.env"
 mkdir -p "$H10/.pi/agent/scripts"
 : >"$H10/.pi/agent/scripts/tortoise-graph.sh"; : >"$H10/.pi/agent/scripts/tortoise_graph_client.py"
@@ -184,7 +199,7 @@ expect_absent ambient_rest "graph credential: TORTOISE_MCP_API_KEY is set"
 expect_absent ambient_rest "$SECRET"
 clean ambient_rest
 
-# ── case 11: the file carries the key AND the shell does too — the ok line must not echo it ───
+# ── case 10: the file carries the key AND the shell does too — the ok line must not echo it ───
 # This is the shape a real cell has (`check_provider` sources keys.env into the bring-up shell), so it
 # is the case in which a `printf %s "$TORTOISE_MCP_API_KEY"` inside the ok line would actually leak.
 H11="$TMP/h11"; E11="$TMP/h11/keys.env"
@@ -196,7 +211,7 @@ expect both "graph credential: TORTOISE_MCP_API_KEY is set in"
 expect_absent both "$SECRET"
 clean both
 
-# ── case 12: THE WIRING — the reading must still be CALLED by `--check`, after the layer and the env
+# ── case 11: THE WIRING — the reading must still be CALLED by `--check`, after the layer and the env
 # This probe sources the function body directly, so deleting the invocation in `main()` would leave every
 # arm above green while the cell stops reporting the client at all. `pi-bootstrap/tests/test-setup-no-nesting.sh`
 # names the same gap for its own suites ("a probe set alone cannot see the wiring") and proves it with a
@@ -204,7 +219,7 @@ clean both
 # must run AFTER `check_operational_layer` (which installs/verifies the farm) and AFTER `check_provider`
 # (which sources `$ENV_FILE`), or it grades an empty farm and an unsourced environment.
 main_body="$(sed -n '/^main() {$/,/^}$/p' "$SRC")"
-if printf '%s' "$main_body" | grep -q '^      check_graph_client$'; then pass; else
+if grep -q '^      check_graph_client$' <<<"$main_body"; then pass; else
     fail "wiring: \`check_graph_client\` is not invoked from main()'s --check arm — the reading would never run"
 fi
 order_ok=1
@@ -217,7 +232,7 @@ if [ "$order_ok" -eq 1 ]; then pass; else
     fail "wiring: \`check_graph_client\` is not ordered AFTER check_operational_layer/check_provider/check_uv_env in main()"
 fi
 
-# ── case 13: THE RULE — the key's value never appears, in any arm ─────────────────────────────────
+# ── case 12: THE RULE — the key's value never appears, in any arm ─────────────────────────────────
 # ⛔ SCANNED: the stub transcript, the case's REAL STDOUT, and its STDERR. The first version scanned
 # only "$TMP"/*.out — the `ok`/`warn` transcript — so a check that printed the value with `echo`/`printf`
 # went straight to the suite's own stdout and the suite still reported 43/43 passed (measured
@@ -232,11 +247,16 @@ for f in "$TMP"/*.out "$TMP"/*.stdout "$TMP"/*.err; do
     fi
 done
 [ "$leaked" -eq 0 ] && pass
-# ...and the sweep is not vacuous: at least one scanned file must carry the sentinel's CASE (proving the
-# ambient fixtures really put a value in play), so "no match anywhere" is a measurement, not an empty set.
-if grep -lqF -- "SUPERSECRET_VALUE_42" "$TMP"/*.out 2>/dev/null; then
-    fail "credential leak: the transcript itself carries the value"
-else pass; fi
+# ⛔ THE SWEEP'S OWN SELF-TEST — and the first version of this block was not one. It re-ran a narrower
+# copy of the leak grep and printed "not vacuous", which measures nothing: a scan that finds nothing
+# because nothing ever entered the log is indistinguishable from a scan that finds nothing because the
+# value never leaked (the round-4 P1, one layer down). This plants the sentinel in a throwaway file and
+# requires the SAME scan to flag it, so "clean" is a measurement rather than an empty set.
+printf 'planted %s\n' "$SECRET" >"$TMP/self_test.stdout"
+if grep -qF -- "$SECRET" "$TMP"/*.stdout "$TMP"/*.err "$TMP"/*.out; then pass; else
+    fail "self-test: the leak scan did not flag a file that provably contains the value — the clean result above is an empty set, not a measurement"
+fi
+rm -f "$TMP/self_test.stdout"
 
 # ⛔ NO SUCCESS PREFIX ON A RED RUN. `ok: ... FAILURES: 3` is a line a log-grepper reads as a pass; the
 # sibling suites print a bare `FAILURES:` line instead, and `cell-install.sh` states the rule.

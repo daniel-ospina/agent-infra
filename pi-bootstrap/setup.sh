@@ -586,8 +586,11 @@ fi
 #     PUSHED BY HAND. So `TORTOISE_MCP_API_KEY` must be present there for the mandate to run, and
 #     until it is, `cloud-cell-bringup.sh --check` WARNS by variable NAME (never its value) after the
 #     layer is installed, while the client itself fails CLOSED with `GRAPH-UNREACHABLE(NO-KEY)` when
-#     NEITHER name is set (it falls back to `TORTOISE_API_KEY`, the REST key, and lets the endpoint
-#     answer — that is a different key for a different transport, so it may be rejected).
+#     NEITHER name is set (it falls back to `TORTOISE_API_KEY` and lets the endpoint answer). That
+#     fallback name USUALLY carries the same token — `skills/research/SKILL.md` records it measured
+#     identical, Bearer -> 200 — so a box with only the alias may work fine; where the alias carries
+#     the REST token instead (`scripts/tortoise-memory.mjs`'s key, /v1/points), the MCP endpoint may
+#     REJECT it with HTTP 401. Neither outcome excuses leaving the MCP name unprovisioned.
 #     A silent skip is the one outcome worse than the outage; that is what these two lines prevent.
 #   * NOT a second client: `scripts/tortoise-memory.mjs` is the REST client (`TORTOISE_API_KEY`,
 #     /v1/points) the research skill uses. Different transport, different key, different failure
