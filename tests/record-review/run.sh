@@ -2164,6 +2164,17 @@ DR_HOME="$TMP/dhome"; rm -rf "$DR_HOME"; mkdir -p "$DR_HOME/.pi/agent/reviews"
 mkdir -p "$TMP/dbin"
 cat > "$TMP/dbin/gh" <<'EOF'
 #!/usr/bin/env bash
+# ⛔ A REAL `gh` READS THE PAYLOAD. A stub that ignores `--input -` and exits leaves the
+# WRITER (here `jq -n --arg body … |`) with EPIPE, and the recorder runs under
+# `set -o pipefail`: the pipeline's status becomes the writer's failure, `post_marker`
+# returns 1 and the run exits 5 (`body-marker-unposted`) even though the PATCH succeeded.
+# MEASURED as an intermittent failure of (32a) — 1 of 3 runs, with the record written
+# correctly and only the exit status flaking (the pipe lands in #3327's body-marker code,
+# not in this PR's delta path). Draining stdin is what makes this fixture behave like the
+# process it stands in for; it weakens no assertion.
+case "$*" in
+  *--input*) command cat >/dev/null 2>&1 || true ;;
+esac
 for x in "$@"; do
   case "$x" in
     .base.sha) echo "${FIX_BASE:-}"; exit 0 ;;
@@ -2230,6 +2241,29 @@ if [ -d "$DELTA_REPO" ]; then
     && [ "$(printf '%s' "$D_REC32" | grep -c '"evidence":"comment:9000001"')" = 1 ] \
     && pass "(32a) a conflict-free forward merge RE-BINDS, and the record says mint=delta at the new head AND keeps the review artifact its verdict rests on" \
     || fail "(32a) the delta was not rebound as a delta (rc=$DRC_A, record='$D_REC32', out='$OUT32')"
+  # (32a2) THE RECORD SHAPE IS THE CONTRACT, so it is PINNED rather than described. `proved` exists
+  # because the field it replaced (`authored_unchanged:true`, hardcoded) was contradicted by the
+  # SAME run's triple on the lane path — and the lane arm must emit NEITHER `authored_unchanged`
+  # (it never measured the authored digest) NOR the reverse: it DOES measure `conflicts` (clause D
+  # recomputes the merge), so it claims that one. Without this assertion a later edit could revert
+  # `proved` to a hardcoded claim and the suite would stay green, which is exactly how the field
+  # lied the first time.
+  [ "$(printf '%s' "$D_REC32" | grep -c '"proved":"lane"')" = 1 ] \
+    && [ "$(printf '%s' "$D_REC32" | grep -c '"arm":"lane"')" = 1 ] \
+    && [ "$(printf '%s' "$D_REC32" | grep -c 'authored_unchanged')" = 0 ] \
+    && [ "$(printf '%s' "$D_REC32" | grep -c '"conflicts":0')" = 1 ] \
+    && pass "(32a2) the record NAMES what the arm proved (proved/arm=lane, conflicts:0 measured by clause D, NO authored_unchanged claim) — the shape is pinned, not just described" \
+    || fail "(32a2) the delta record's proof fields are wrong (record='$D_REC32')"
+  # (32a3) THE TRIPLE'S VALUES, not just its presence. 32d greps `^zero-conflict=` to prove the line
+  # is REACHABLE; that cannot notice the field degrading to `no`/`UNMEASURED` on an ACCEPTED delta.
+  # On the lane path clause (C2) and clause (D) both require `yes`, so both are asserted; the
+  # authored digest is deliberately NOT asserted `yes` here — the lane arm leaves it free to differ
+  # (that is why `proved` exists), so only its presence is required.
+  printf '%s' "$OUT32" | grep -qx 'zero-conflict=yes.*' \
+    && printf '%s' "$OUT32" | grep -qx 'no-new-authored-commits=yes commits=0' \
+    && printf '%s' "$OUT32" | grep -q '^authored-digest-equal=' \
+    && pass "(32a3) the ACCEPTED lane delta prints zero-conflict=yes and no-new-authored-commits=yes commits=0 (the two facts its own clauses require), plus the authored-digest line" \
+    || fail "(32a3) the accepted delta's triple does not carry the values its clauses require (out='$OUT32')"
   # (b) one real authored commit on top of the merge: authorship moved, so a review is owed.
   ( cd "$DELTA_REPO" || exit 9; printf 'lane fix\n' >> lane.txt; git add -A; git commit -qm "lane: a real fix commit" ) >/dev/null 2>&1
   D_FIXED="$( cd "$DELTA_REPO" && git rev-parse pr )"
@@ -2342,13 +2376,16 @@ cd "$TMP" || true
 # contract in this suite too (a refused PATCH is a named rc 5, and the signed marker
 # survives in the pending file), and the (30x) cap vector no longer depends on the
 # marker's fate: its stub answers `.body`/PATCH so the post SUCCEEDS.
-# #10583: 185 -> 190 — section 32 drives the REAL `--delta` verb against a hermetic git
+# #10583: 185 -> 192 — section 32 drives the REAL `--delta` verb against a hermetic git
 # fixture (32a-32c, +3 assertions); 32d pins the absent-head full triple (+1); 32e pins the
-# #10177 interaction — a delta whose record names NO review artifact must refuse (+1). Both
-# counts are ADDITIVE: the body-marker durability section and the delta section were written
-# independently and neither replaces the other's assertions, so the merged pin is
-# 183 + 2 + 5. MEASURED: `ALL PASSED (190 assertion(s))` after the rebase.
-MIN_ASSERTIONS=190
+# #10177 interaction — a delta whose record names NO review artifact must refuse (+1); 32a2
+# pins the RECORD SHAPE (proved/arm/conflicts present, authored_unchanged absent for the lane
+# arm) and 32a3 pins the ACCEPTED triple's VALUES rather than only their presence (+2), because
+# a description of a record contract is not a pin for it. Both counts are ADDITIVE: the
+# body-marker durability section and the delta section were written independently and neither
+# replaces the other's assertions, so the merged pin is 183 + 2 + 7.
+# MEASURED: `ALL PASSED (192 assertion(s))` after the rebase.
+MIN_ASSERTIONS=192
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

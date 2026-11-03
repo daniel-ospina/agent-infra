@@ -1456,10 +1456,17 @@ fi
 # is measured FROM is the record's own, and the refusal path is unchanged.
 # ⛔ It is STRICTER than the paths it replaces, never a bypass:
 #   · the previous verdict must be clean-family (a delta re-binds an APPROVAL);
+#   · a previous CARRY that records no PROOF is refused, exactly as `--check-carry` refuses it
+#     (see the `carried|delta` block below — the measured shape is `--delta` saying "Land it"
+#     exit 0 over a record the merge gate answers as `norecord`);
 #   · --evidence/--force-stale/--expect-head are REFUSED (no reviewer ran);
-#   · clauses (A)-(D) and clause (E) all still run, so a new authored commit, a
-#     conflict resolution, a rewritten (rebased) head or a measurably red target
-#     each still refuse, with the same exit statuses as any other carry.
+#   · clauses (A)-(D) and clause (E) all still run, so a measurably red target still refuses, and
+#     so do the lane arm's own requirements (a forward move with no intervening authored non-merge
+#     commit and a clean re-merge of the head). The ARM boundary matters and is stated precisely
+#     rather than claimed wholesale: a rewritten (rebased) head is refused by the LANE arm
+#     (clause B is an ancestry test), while the `diff`/`patch` arms legitimately re-bind when the
+#     ARTIFACT ITSELF is byte-identical across the rewrite — that is exactly the #2982/#1377 class
+#     those two arms exist for, so no ancestry requirement is added to them here.
 if [ "$DELTA" -eq 1 ]; then
   if [ -z "$REPO" ]; then
     echo "record-review.sh --delta: no repo resolved — a delta is measured in GIT against the PR's authoritative base, so it needs owner/repo explicitly: record-review.sh --delta $PR owner/repo" >&2
@@ -1469,8 +1476,11 @@ if [ "$DELTA" -eq 1 ]; then
   D_FILE="$D_DIR/${REPO%/*}-${REPO#*/}-$PR.json"
   D_LEGACY="$D_DIR/$PR.json"
   # Same field reader, same collision rule (an embedded repo that differs is a
-  # DIFFERENT record) and same legacy rule as --check-carry above — one definition
-  # of "the record", shared by the answering verb and this minting one.
+  # DIFFERENT record) and same legacy rule as --check-carry above. It is a COPY, not a shared
+  # definition: `cc_field`/`cc_names_this_repo` are defined further down, inside the
+  # `--check-carry` block, and are not in scope here. Kept in step BY HAND — so a future change to
+  # the gate-mirroring lookup must be made in BOTH places (or this block must be hoisted above the
+  # two verbs); the comment used to claim the lookup was "shared", which it never was.
   d_field() { command sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$1" 2>/dev/null | command head -1 || true; }
   D_REC=""
   if [ -f "$D_FILE" ]; then
@@ -1487,6 +1497,23 @@ if [ "$DELTA" -eq 1 ]; then
   D_HEAD="$(d_field "$D_REC" head_sha)"
   D_VERDICT="$(d_field "$D_REC" verdict)"
   D_MINT="$(d_field "$D_REC" mint)"
+  # ⛔ THE GATE'S OWN PROVENANCE PREDICATE, APPLIED HERE TOO (#10177 × #10583). `--check-carry`
+  # treats a `carried`/`delta` record that records NO PROOF as NO RECORD (exit 4). Without this,
+  # `--delta` answered "ALREADY bound … Land it" (exit 0) over exactly that record — MEASURED on a
+  # record at the live head with `mint:"delta"` and neither `carry_arm` nor `evidence`: `--delta`
+  # → rc 0 "Land it", `--check-carry` → `norecord`, rc 4. A successful exit over an artifact the
+  # merge gate rejects is the false PASS this whole file refuses, so the rule is applied BEFORE
+  # the already-bound short circuit and before any git work — the same order `--check-carry` uses,
+  # and the same exit status (4, `norecord`) so the two verbs cannot disagree about one record.
+  case "$D_MINT" in
+    carried|delta)
+      D_ARM_F="$(d_field "$D_REC" carry_arm)"
+      D_EV_F="$(d_field "$D_REC" evidence)"
+      if [ -z "$D_ARM_F" ] || [ -z "$D_EV_F" ]; then
+        echo "⛔ --delta REFUSED for $REPO#$PR: the record is a CARRY (mint='$D_MINT') with NO recorded proof (carry_arm='${D_ARM_F:-}', evidence='${D_EV_F:-}'), so it is NOT a record the merge gate accepts — the READ-ONLY verb --check-carry answers norecord for it, and a delta over it would re-bind a verdict with nothing in the record a reader could check (the tortoise#10677 shape). Nothing was written. Re-record at the current head WITH the review's evidence (--evidence comment:<id>), which mints a record that names what it carried." >&2
+        exit 4
+      fi ;;
+  esac
   case "$D_HEAD" in *[!0-9a-f]* | "") D_HEAD="" ;; esac
   if [ "${#D_HEAD}" -ne 40 ]; then
     echo "record-review.sh --delta: the record for $REPO#$PR names no full 40-hex head_sha, so the head the review happened at is unknown and no delta can be measured from it. Re-record normally." >&2
@@ -4052,9 +4079,17 @@ if [ -n "$CARRY_ARM" ]; then
   # triple on the commonest path: `arm:"lane"` proves the LANE dimension (forward move, no
   # intervening authored non-merge commit, a clean re-merge reproduces the head tree) and the
   # rendered patch may legitimately differ, so `authored-digest-equal` prints `no`/`UNMEASURED`
-  # there. So the field states which dimension carried, and `conflicts:0` is claimed only for the
-  # lanes whose predicate actually recomputed the merge (`lane`, `patch`); the byte-identity `diff`
-  # arm never recomputed anything, so it claims neither.
+  # there. So `proved` states which dimension carried.
+  # EACH FIELD NAMES THE PREDICATE THAT MEASURED IT -- never the arm that happened to fire.
+  # `authored_unchanged` is a claim about the AUTHORED DIGEST: only the `patch` arm (#1377
+  # projection equal) and the `diff-bytes` arm (rendered bytes identical) measure it. `conflicts`
+  # is a claim about a RE-MERGE: only the `lane` predicate recomputes one (clause D -- merge-tree
+  # rc=0 AND the merged tree equals the head's tree). The first cut keyed BOTH fields on
+  # `patch|diff`, and MEASURED that is a lie in one direction: a `diff`-arm delta taken across a
+  # REBASED head (no second parent, so the same run's triple prints `zero-conflict=UNMEASURED`)
+  # wrote "conflicts":0 -- a positive claim the run never made, in the very field added to stop
+  # the record overclaiming. The `patch` arm does not re-merge either, so it claims no conflicts
+  # fact. `proved` always names the dimension that carried.
   if [ "$DELTA" -eq 1 ]; then
     DIMENSION="none"
     case "$CARRY_ARM" in
@@ -4062,14 +4097,12 @@ if [ -n "$CARRY_ARM" ]; then
       patch) DIMENSION="patch";;
       diff) DIMENSION="diff-bytes";;
     esac
-    # `authored_unchanged`/`conflicts` are emitted ONLY for the arms that MEASURED them: `patch`
-    # (the #1377 projection really was equal) and `diff-bytes` (the bytes really were identical).
-    # For `lane` the predicate recomputed a clean re-merge and left the rendered digest free to
-    # differ, so asserting `authored_unchanged:true` there would be a claim the same run's triple
-    # contradicts — the review's finding. `proved` always names which dimension carried.
     DELTA_PROOF=""
     case "$CARRY_ARM" in
-      patch|diff) DELTA_PROOF="\"authored_unchanged\":true,\"conflicts\":0,";;
+      patch|diff) DELTA_PROOF="\"authored_unchanged\":true,";;
+    esac
+    case "$CARRY_ARM" in
+      lane) DELTA_PROOF="${DELTA_PROOF}\"conflicts\":0,";;
     esac
     MINT_FIELDS="\"mint\":\"delta\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"delta\":{\"from\":\"$DELTA_FROM\",\"to\":\"$SHA\",\"proved\":\"$DIMENSION\",${DELTA_PROOF}\"arm\":\"$CARRY_ARM\"},"
   fi
