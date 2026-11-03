@@ -86,8 +86,16 @@ STAGE="$T/stage"; mkdir -p "$STAGE"
 # label seam, reading as `❌ check-class.py is missing or does not parse`); they are shipped companions
 # of install.sh (see install.sh's own drift list), so the stage carries the REAL ones rather than a stub
 # — a stub would pass the parse gate while proving nothing about the ship set.
+# ⛔ `orch-pin-exec.sh` IS STAGED FOR THE SAME REASON, ONE STEP FURTHER (agent-infra#3309). It is the
+# STABLE program the plist now execs, and install.sh seeds $O from it — preferring the PINNED tree and
+# falling back to the installer's own checkout (`$HERE`). Every arm in this suite drives install.sh from
+# STAGE against a fixture pin that predates this commit, so without the stub in STAGE the fallback has
+# nothing to find and install.sh dies at its own seeding gate (`❌ orch-pin-exec.sh not found in the
+# pinned tree … or this checkout`) — 24 arms then read that line instead of their own assertion. The
+# stub is a shipped companion of install.sh, so the stage carries the REAL one, like the companions above.
 cp "$INSTALL" "$HARNESS/launchd-cycle.sh" "$TEMPLATE" "$HARNESS/refresh-candidates.sh" \
-   "$HARNESS/merge-reminder.py" "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" "$STAGE/" 2>/dev/null
+   "$HARNESS/merge-reminder.py" "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" \
+   "$HARNESS/orch-pin-exec.sh" "$STAGE/" 2>/dev/null
 BIN="$T/bin"; mkdir -p "$BIN"
 # install.sh probes the real binaries (gh/network, tmux, pi, jq) and lints the plist with plutil. ALL of
 # them are stubbed IN $BIN: the assertions below are about the RENDERED PROGRAM, not the host's toolchain.
