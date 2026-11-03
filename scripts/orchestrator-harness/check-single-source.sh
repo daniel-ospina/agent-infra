@@ -72,7 +72,12 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # it stops every dispatch); origin/main adds brief-gate.sh (#2258), repo-target.sh (#2724/#2694) and
 # harness-provenance.sh. A file executed from the installed $O that is absent from this list is a
 # divergence nothing byte-compares.
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh"
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh lane-env.sh"
+# …`lane-env.sh` (#3060) is the SAME class already live one line above `key-gate.sh` in `lane.sh`: that
+# file sources it and `exit 78`s without it, and it was in NEITHER this list nor install.sh's drift loop
+# (review of #3331, verified `grep -c lane-env.sh` = 0 on both), so a `$O` deployed before #3060 — or
+# half-synced — stops every lane on the box while this check reports no divergence. Nothing else changes:
+# this arm is presence + byte comparison.
 # …`key-gate.sh` (agent-infra#3331) is presence-required on the sharpest form of the rule above: `lane.sh`
 # SOURCES it fail-loud (`exit 78`) as the last gate before `pi` is spawned, so a `$O` that predates it
 # does not merely lose an assertion — it stops every lane on that box. And the divergence is invisible
