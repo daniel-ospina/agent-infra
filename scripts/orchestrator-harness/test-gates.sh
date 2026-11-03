@@ -3605,11 +3605,32 @@ ARMS
   case "$_why" in
     landing-floor\(open*) echo "  ok (v16) an out-of-range count drains instead of erroring the test open" && PASS=$((PASS+1)) ;;
     *) echo "  ❌ (v16) a 2^63+ count OPENED the gate (errored test read as FALSE): $_why"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE PROVENANCE CASE (review round 2, P1): `open_pr_count` NEVER returns a non-numeric — on a
+  # failed listing it echoes a stale sticky value or a fabricated `max(MERGE_PRIORITY_AT,10)+1`, and a
+  # stale `4` would read as "below the floor" and OPEN the issue path on exactly the cycle the listing
+  # is broken. The arm must therefore consult the producer's marker, not just the digits.
+  _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=4; FORK_STARVED=0; FORK_WHY=""
+         CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
+         L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
+         SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+         LANDING_FLOOR=25; BATCH=1
+         O="$TMP/o-unk"; rm -rf "$O"; mkdir -p "$O/state"; : > "$O/state/open-unknown"
+         eval "$GV" >/dev/null 2>&1
+         printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-}" ) )"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  case "$_why" in
+    landing-floor\(open*) echo "  ok (v19) a STALE/FABRICATED fallback count drains (sticky 4 is not a measurement)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v19) a fallback count read as a measurement and OPENED the gate: $_why"; FAIL=$((FAIL+1)) ;; esac
+  case "$_vec" in
+    *'landing-floor=UNKNOWN(fallback'*) echo "  ok (v20) …and the provenance is NAMED in the vector" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v20) the fallback drain is silent: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  rm -rf "$TMP/o-unk" 2>/dev/null || true
   # ⛔ THE RED-TREE / P0 DOOR IS A CALL, NOT A COMMENT: with `floor_emergency` in scope and returning a
   # reason, the floor must STAND DOWN. Driven by supplying the function the block calls.
   _why="$( gv OPEN_N=68 LANDING_FLOOR=25 )"  # baseline: no floor_emergency in scope => the floor arms
   case "$_why" in
-    landing-floor*) ;; *) echo "  ❌ (v17) baseline: the floor did not arm without an emergency"; FAIL=$((FAIL+1)) ;; esac
+    landing-floor*) : ;;  # baseline only — the assertion is the stand-down below
+    *) echo "  ❌ (v17) baseline: the floor did not arm without an emergency (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
   _t="$( GVX=1; ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=68; FORK_STARVED=0; FORK_WHY=""
          CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
          L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
@@ -3635,7 +3656,7 @@ ARMS
     *) echo "  ❌ (v15) the floor changed the WINNER instead of adding an arm (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
   # ⛔ THE VISIBILITY LINE IS THE ARTIFACT. A silent threshold is the same defect class as a silent
   # reaper, so the cycle's numbers are pinned at the SOURCE, not merely described in a comment.
-  wpin "the cycle logs OPEN_PRS/FLOOR/MODE every cycle" "$ORCH" 'OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LANDING_FLOOR:-?} → MODE('
+  wpin "the cycle logs OPEN_PRS/FLOOR/MODE every cycle" "$ORCH" 'OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} → MODE('
   # ── the two mutants ────────────────────────────────────────────────────────────────────────────
   mut_gv() { # <name> <old> <new> -> path to the mutant block
     printf '%s\n' "$GV" > "$TMP/gv-$1.in"

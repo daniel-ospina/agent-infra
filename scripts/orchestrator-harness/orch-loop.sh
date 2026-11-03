@@ -3038,6 +3038,12 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
     # unowned set (the rows are a different moment than the count). Absent rows make
     # unowned_pr_count assume NOTHING is owned — the conservative direction.
     rm -f "$O/state/last-open-prs"
+    # ⛔ THE FABRICATED/STALE COUNT MUST BE IDENTIFIABLE DOWNSTREAM (review round 2, P1). The caller
+    # receives a NUMBER either way, so a WIP gate that reads a stale `4` as "below the floor" OPENS
+    # the issue path on exactly the cycle the listing is broken — the produce-more direction it exists
+    # to stop. The marker is the fact; the number is not evidence of itself. Written BEFORE either
+    # echo so no caller can observe the number without the marker beside it.
+    : > "$O/state/open-unknown" 2>/dev/null || true
     if is_num "$sticky" && [ "$sticky" -gt 0 ]; then
       echo "[scope] open=UNKNOWN rc=$rc (${err:-no stderr}) -> sticky last-known=$sticky" >> "$LOG"
       echo "$sticky"
@@ -3048,6 +3054,9 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
     return 0
   fi
   printf '%s\n' "$n" > "$O/state/last-open-n"
+  # The count is MEASURED again, so the marker must die with the failure that wrote it — a marker
+  # that outlived its cycle would keep a WIP gate down on a healthy listing (the stale-flag class).
+  rm -f "$O/state/open-unknown" 2>/dev/null || true
   printf '%s\n' "$prs" > "$O/state/last-open-prs"
   echo "$n"
 }
@@ -5803,6 +5812,14 @@ PY
   [ "$LF_M" -ge 1 ] || LF_M=25
   LF_EMERG=""
   declare -f floor_emergency >/dev/null 2>&1 && LF_EMERG="$(floor_emergency "${O:-}" "${BATCH:-1}" 2>/dev/null)"
+  # ⛔ THE COUNT'S PROVENANCE, NOT JUST ITS VALUE (review round 2, P1). `open_pr_count` never returns a
+  # non-numeric: on a failed listing it echoes the last-known STICKY value or a fabricated
+  # `max(MERGE_PRIORITY_AT,10)+1`. Both are plausible digits, so every branch below would read them as
+  # a measurement — and a stale `4` OPENS the issue path while the real queue is far over the floor.
+  # `state/open-unknown` is written by that failure path and deleted on the next good read, so this is
+  # the producer's OWN fact rather than a guess about the fallback's shape.
+  LF_UNK=""
+  [ -f "${O:-}/state/open-unknown" ] && LF_UNK=1
   case "${OPEN_N:-}" in
     ''|*[!0-9]*|0?*)
       GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
@@ -5812,6 +5829,11 @@ PY
       # FALSE, which OPENS the gate — that is the exact reason `is_limit` exists. `is_limit` is not in
       # scope inside this extracted block, so the bound is stated here. An arm whose whole purpose is
       # "this cannot fail open" must not leave its one fail-open input unbounded.
+      if [ -n "$LF_UNK" ]; then
+        # The digits are a sticky/fabricated stand-in, not this cycle's read. Drain.
+        GATE_WHY="${GATE_WHY:-landing-floor(open PR count is a STALE/FABRICATED fallback (${OPEN_N}) — landing before producing)}"
+        GATE_VEC="$GATE_VEC landing-floor=UNKNOWN(fallback ${OPEN_N})"
+      else
       if [ "${#OPEN_N}" -gt 6 ]; then
         GATE_WHY="${GATE_WHY:-landing-floor(open PR count OUT OF RANGE (${#OPEN_N} digits) — landing before producing)}"
         GATE_VEC="$GATE_VEC landing-floor=UNKNOWN(out-of-range)"
@@ -5830,6 +5852,7 @@ PY
             GATE_VEC="$GATE_VEC landing-floor=ok(${OPEN_N}<${LF_M})"
           fi
         fi
+      fi
       fi ;;
   esac
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
@@ -6187,7 +6210,12 @@ PY
   # `MODE(produce)` = the issue path is open. `FLOOR=` and `OPEN_PRS=` are printed even when the floor
   # is not the binding reason, so the margin is visible before it is crossed — and `BINDING=` names
   # which gate actually won, so a floor that is satisfied cannot be misread as the cause.
-  echo "[landing-floor] OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LANDING_FLOOR:-?} → MODE($([ -z "${GATE_WHY:-}" ] && echo produce || echo land)) BINDING(${GATE_WHY:-none})" >> "$LOG"
+  # ⛔ `FLOOR=` PRINTS THE VALUE THE ARM ENFORCED (`LF_M`, already coerced), NOT THE RAW KNOB (review
+  # round 2, P2): the arm re-coerces independently, so `LANDING_FLOOR=0` with `MERGE_PRIORITY_AT=0`
+  # survives the main coercion as 0, is rejected by the arm as 25, and the line used to print
+  # `FLOOR=0` while enforcing 25 — on the one line whose entire purpose is to make the threshold
+  # trustworthy.
+  echo "[landing-floor] OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} → MODE($([ -z "${GATE_WHY:-}" ] && echo produce || echo land)) BINDING(${GATE_WHY:-none})" >> "$LOG"
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
     # ── THE PRODUCT FLOOR, APPLIED AS AN ORDER (agent-infra#2054) ───────────────────────────────
