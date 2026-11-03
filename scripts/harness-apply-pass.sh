@@ -1082,6 +1082,20 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         fi
         FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
         FARM_DEST_REAL="$(cd "$FARM_DEST" 2>/dev/null && pwd -P)"
+        # ⛔ ...AND IT MUST BE THE FARM THIS PASS RUNS FROM. The `case "$HERE"` refusal above only fires
+        # when `$FARM_DEST` names NOTHING; when it names a DIFFERENT farm that exists, the pass grades
+        # that one and reports green over the farm it is executing (review round 7, reproduced with two
+        # farms on one box). On the production install path the two are equal — the unit runs
+        # `$HOME/.pi/agent/scripts/harness-apply-pass.sh` and `$FARM_DEST` defaults to
+        # `$CELL_HOME/.pi/agent/scripts` — so this creates no false red where the box is consistent.
+        case "$HERE" in
+            */.pi/agent/scripts|*/.pi/agent/scripts/)
+                HERE_REAL="$(cd "$HERE" 2>/dev/null && pwd -P)"
+                if [ -n "$HERE_REAL" ] && [ "$HERE_REAL" != "$FARM_DEST_REAL" ]; then
+                    REC_ACTION=farm-unverifiable
+                    finish 0 24 "farm: UNKNOWN — this pass executes FROM $HERE_REAL but grades $FARM_DEST_REAL; the farm that is really running was never graded — pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) to the one the units execute"
+                fi ;;
+        esac
         if [ -n "$FARM_DEST_REAL" ] && [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ]; then
             REC_ACTION=farm-unverifiable
             finish 0 24 "farm: UNKNOWN — the only check-farm-drift.sh found ($FARM_CHECKER) lives INSIDE the farm it would grade, and a copy that grades itself cannot answer whether it is stale — install the CHECKER from a ref-consistent checkout"
@@ -1109,11 +1123,25 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # that just produced it, and the reviewer's own measurement of this box's first repair
                 # was exactly that shape (one row was a LAYOUT MOVE, not a copy). So its `Next:` line
                 # and per-file rows are forwarded verbatim.
-                log_line "farm: $REF ships different bytes than $FARM_DEST execute${FARM_NAMED:+ — named: $FARM_NAMED}"
-                printf '%s\n' "$FARM_OUT" | grep -E 'Next:|STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT' | head -12 | while IFS= read -r _row; do
+                # ⛔ THE REMEDY IS THE LAST LINE THE INSTRUMENT PRINTS, and it prints one row PER FILE,
+                # unbounded (#1552 measured 27 files on one box). A single `head -12` over both cut the
+                # remedy off at exactly the states that need it (#10114 review round 7, reproduced with
+                # a 20-row farm). So the rows are a bounded excerpt — SAYING it is an excerpt — and the
+                # remedy is forwarded separately and unconditionally.
+                FARM_ROWS="$(printf '%s\n' "$FARM_OUT" | grep -E 'STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT')"
+                FARM_NROWS="$(printf '%s' "$FARM_ROWS" | grep -c .)"
+                FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | grep -E 'Next:' | head -4)"
+                log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) from the instrument:"
+                printf '%s\n' "$FARM_ROWS" | head -12 | while IFS= read -r _row; do
                     log_line "farm:   $_row"
                 done
-                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships${FARM_NAMED:+ ($FARM_NAMED)} — the per-file classes and the remedy are printed above, from the instrument itself (a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
+                if [ "$FARM_NROWS" -gt 12 ]; then
+                    log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) in the instrument's own output"
+                fi
+                [ -n "$FARM_REMEDY" ] && printf '%s\n' "$FARM_REMEDY" | while IFS= read -r _row; do
+                    log_line "farm:   $_row"
+                done
+                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s) above, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
             *)
                 REC_ACTION=farm-unknown
                 finish 0 24 "farm: UNKNOWN (check-farm-drift rc=$FARM_RC) — $FARM_DEST could not be graded against $REF, and cannot-verify is not a pass: $(printf '%s' "$FARM_OUT" | grep -m1 -iE 'unknown|cannot|refus' || printf 'no reason printed')" ;;

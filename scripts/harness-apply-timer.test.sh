@@ -1198,6 +1198,43 @@ REPO_P="$CLONE"; MODE_P=sync
 OUT="$(run_pass "$T/t24n" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T24 control: a controller-only host (no farm, pass not farm-shaped) still skips green"
 
+# Control 13: grading a DIFFERENT farm than the one this pass executes from is a false green, even when
+# that other farm really does match the ref — the pass printed `farm: ok` over its own stale farm
+# (review round 7, reproduced with two farms on one box).
+mk_origin t24p; mk_clone t24p
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24p/home1/.pi/agent/scripts" "$T/t24p/home2/.pi/agent/scripts"
+printf 'stale\n' >"$T/t24p/home1/.pi/agent/scripts/pr-doctor.py"
+cp "$PASS_SH" "$T/t24p/home1/.pi/agent/scripts/harness-apply-pass.sh"
+printf '#!/usr/bin/env bash\nprintf "check-farm-drift: ok\\n"; exit 0\n' >"$T/t24p/stub-ok.sh"
+chmod +x "$T/t24p/stub-ok.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24p/stub-ok.sh" \
+    PASS_SH="$T/t24p/home1/.pi/agent/scripts/harness-apply-pass.sh" \
+    HARNESS_APPLY_FARM_DEST="$T/t24p/home2/.pi/agent/scripts" run_pass "$T/t24p" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: grading a different farm than the one this pass runs from is REFUSED"
+assert_contains "$OUT" "but grades" "T24 control: and it names both paths"
+# Control 14: the instrument's REMEDY survives a long row list — it is the LAST line it prints, so a
+# single `head -12` over rows+remedy cut it off at exactly the states that need it.
+mk_origin t24q; mk_clone t24q
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24q/home/.pi/agent/scripts"
+# A STUB (the instrument's own contract is covered by check-farm-drift.test.sh): it prints 20 per-file
+# rows and then its remedy, exactly as the real one does — the remedy is its LAST line.
+cat >"$T/t24q/stub-checker.sh" <<'FARM'
+#!/usr/bin/env bash
+i=0
+while [ "$i" -lt 20 ]; do printf 'file-%s.py | a | b | STALE\n' "$i" >&2; i=$((i+1)); done
+printf 'check-farm-drift: DRIFT — 20 stale\n'
+printf '   Next: re-run the farm from a ref-consistent checkout\n'
+exit 1
+FARM
+chmod +x "$T/t24q/stub-checker.sh"
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24q/stub-checker.sh" run_pass "$T/t24q" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a 20-row drift is RED"
+assert_contains "$OUT" "re-run the farm from a ref-consistent checkout" \
+    "T24 control: and the instrument's own REMEDY survives a long row list (it is its last line)"
+assert_contains "$OUT" "and 8 more row(s)" "T24 control: while the row excerpt says how many it elided"
+
 echo
 echo "────────────────────────────────────────────────────────"
 echo "harness-apply: $PASS passed, $FAIL failed"
