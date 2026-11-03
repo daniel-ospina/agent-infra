@@ -1041,9 +1041,14 @@ def _bound_verdict_re():
     global _BOUND_VERDICT_RE
     if _BOUND_VERDICT_RE is None:
         import re as _re
+        # ⛔ `rc=` IS MATCHED GREEDILY so the LAST `rc=` on the line wins: a non-greedy
+        # `.*?\brc=` takes the FIRST one, and a line whose earlier text contains `rc=`
+        # (e.g. `tag=rc=7`) then reports the wrong exit status — measured
+        # `verdict=finished tag=rc=7 pid=42 rc=0` parsed as `rc=7`, i.e. `no-verdict`
+        # over a lane that completed.
         _BOUND_VERDICT_RE = _re.compile(
             r"\[lane-bound\]\s+VERDICT\b.*?\bverdict=([a-z][a-z-]*)"
-            r".*?\brc=([0-9]+|na)\b")
+            r".*\brc=([0-9]+|na)\b")
     return _BOUND_VERDICT_RE
 
 
@@ -1062,11 +1067,18 @@ def parse_bound_line(text: str):
     """
     if not text:
         return "", None
-    found = ("", None)
+    # ⛔ THE LAST LINE WINS, RECOGNISED OR NOT. Keeping the last RECOGNISED verdict
+    # silently adopts a STALE earlier one when the final status line carries a token
+    # this module does not model — measured: `...verdict=finished ... rc=0` followed by
+    # `VERDICT verdict=needs-review ... rc=0` parsed as `finished`, which is the
+    # false-PASS class this axis exists to remove. An unrecognised final token is
+    # "no verdict", never "the previous one".
+    last = None
     for m in _bound_verdict_re().finditer(text):
-        if m.group(1) in BOUND_VERDICTS:
-            found = (m.group(1), m.group(2))
-    return found
+        last = m
+    if last is None or last.group(1) not in BOUND_VERDICTS:
+        return "", None
+    return (last.group(1), last.group(2))
 
 
 def parse_bound_verdict(text: str) -> str:
@@ -1207,16 +1219,21 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
     # (4) Both signals flat. Inside the window the lane is still working — a
     #     short flat stretch is the fleet's normal resting state, not a freeze.
     if lr.age_ms < freeze_ms:
+        # ⛔ `freeze_ms=` AND `window_ms=` ARE DIFFERENT WINDOWS and both are named:
+        # `freeze_ms` is the inactivity window that decides this branch, `window_ms` is
+        # the sample span the deltas were taken over. One name for two numbers made a
+        # machine reader unable to tell which it had received.
         return Verdict("working", "within-window",
-                       detail="bytes_delta=%s cpu_delta_cs=%s age_ms=%d window_ms=%d"
-                              % (_n(lr.size_delta), _n(lr.cpu_delta_cs), lr.age_ms, freeze_ms))
+                       detail="bytes_delta=%s cpu_delta_cs=%s age_ms=%d freeze_ms=%d window_ms=%d"
+                              % (_n(lr.size_delta), _n(lr.cpu_delta_cs), lr.age_ms, freeze_ms,
+                                 lr.window_ms))
 
     # (5) FROZEN — live tree, ZERO progress on every signal, full window elapsed.
     return Verdict("frozen", "no-progress",
                    detail="bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s tol_cs=%d "
-                          "age_ms=%d window_ms=%d"
+                          "age_ms=%d freeze_ms=%d window_ms=%d"
                           % (_n(lr.size_delta), _n(lr.transcript_grew), _n(lr.cpu_delta_cs),
-                             cpu_tol_cs, lr.age_ms, freeze_ms))
+                             cpu_tol_cs, lr.age_ms, freeze_ms, lr.window_ms))
 
 
 def _n(v) -> str:
@@ -1961,13 +1978,18 @@ def subtree_cpu_cs(pid: int, *, ps_bin: Optional[str] = None) -> Optional[int]:
     bad = set()
     for line in out.splitlines():
         parts = line.split()
+        if not parts:
+            continue  # a blank line carries no row
+        # ⛔ A MALFORMED ROW IS NOT SKIPPED. Whether it belongs to OUR subtree is only
+        # decidable after the walk, and skipping it makes the total SMALLER — which is
+        # how a busy tree reads flat and then `frozen`.
         if len(parts) < 3:
-            continue
+            return None
         try:
             p = int(parts[0])
             par = int(parts[1])
         except ValueError:
-            continue
+            return None
         cs = _cpu_time_cs(parts[2])
         if cs is None:
             # ⛔ AN UNPARSEABLE ROW IS NOT SKIPPED. Dropping it silently makes the
@@ -2218,10 +2240,11 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
     Two shapes, and they answer different questions:
 
       ``--log <file> --pid <pid>``   one lane, sampled over ``--window-ms``
-      ``--log-census``              MANY lanes, stdin ``pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict]``
-                                    — the deltas come FROM THE CALLER, because a
-                                    census that judged 76 lanes must not sleep 30 s
-                                    per lane; the caller already owns the two samples.
+      ``--log-census``              MANY lanes, stdin ``pid\\tlog\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc``
+                                    (``?`` or empty = NOT READ = abstain) — the deltas
+                                    come FROM THE CALLER, because a census that judged 76
+                                    lanes must not sleep 30 s per lane; the caller
+                                    already owns the two samples.
 
     Both publish the same states, from the same function. This is a seam, never a
     second classifier: there is no state decided here that
@@ -2261,6 +2284,13 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
                 window_ms = int(argv[i + 1])
             except ValueError:
                 print("liveness.py: --window-ms must be an integer", file=sys.stderr)
+                return 2
+            # ⛔ A ZERO-LENGTH WINDOW CANNOT PRODUCE A DELTA. It collapses both readings
+            # into one instant, so both progress signals are trivially flat and a LIVE,
+            # working lane reads `frozen` — measured end to end with a CPU burner.
+            if window_ms < 1:
+                print("liveness.py: --window-ms must be >= 1 (a zero-length window cannot "
+                      "produce a delta)", file=sys.stderr)
                 return 2
             i += 2; continue
         if a == "--no-sample":

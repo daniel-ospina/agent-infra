@@ -1573,7 +1573,7 @@ reader can mistake `finished` for a transcript state.
 |---|---|---|
 | `working` **(`progress:<signal>`)** | the tree is alive **and** work was OBSERVED | at least one progress signal advanced inside the sample window |
 | `working` **(`within-window`)** | the tree is alive and nothing is happening **yet** | every signal flat, but for less than `LOG_FREEZE_MS`. This is NOT positive liveness evidence — it is the fleet's normal resting state — so a consumer must not read `working` as "something happened" without looking at `reason` |
-| `frozen` | the tree is alive **and nothing is happening** | **ZERO progress on EVERY signal** for the full `LOG_FREEZE_MS` window, which is echoed in `detail` (`window_ms=`) so no reader has to look it up |
+| `frozen` | the tree is alive **and nothing is happening** | **ZERO progress on EVERY signal** for the full `LOG_FREEZE_MS` window, which is echoed in `detail` as `freeze_ms=` — and named SEPARATELY from `window_ms=`, the sample span the deltas were taken over, so a machine reader can always tell which window it received |
 | `finished` | the tree is **gone** and the lane **completed** | positive identity evidence of absence + `verdict=finished` **with `rc=0` or `rc=na`** |
 | `no-verdict` | the tree is **gone** and the lane **told us nothing** | positive identity evidence of absence + no recognisable verdict |
 | `dead` | the tree is gone **because the bound killed it** | `verdict=stalled` / `verdict=exceeded-wallclock` |
@@ -1644,6 +1644,12 @@ assuming success.
 `test-gates.sh` already uses `NO-VERDICT` for exactly this shape (a review that ended and produced no
 usable verdict), so `no-verdict` reuses that name rather than inventing a parallel one.
 
+⛔ **THE LAST STATUS LINE WINS, EVEN WHEN ITS TOKEN IS UNRECOGNISED.** Keeping the last *recognised*
+verdict would adopt a STALE earlier one when a future producer appends `verdict=needs-review` — read
+as `finished`, which is the false-PASS class this axis exists to remove. An unrecognised final token
+is `("", None)` = no verdict, never "the previous one". `rc=` is matched GREEDILY (last occurrence on
+the line), so an earlier `rc=`-shaped field such as `tag=rc=7` cannot out-vote the real `rc=`.
+
 ### 13.5 ONE verdict function — where the axis lives and what it is not
 
 The axis is an **evidence field of `evaluate`** (`Evidence.log_read`), exactly like `claim_read`, and
@@ -1676,19 +1682,23 @@ liveness.py --log-census  < pid\tlog\tsize_delta\tcpu_delta_cs\tverdict\talive\t
 carries), and it is not optional in practice: the identity probe is the FENCED `probe` subcommand, so
 without a start time every live lane reads `unknown/process-identity-unreadable` (rc 3) rather than a
 presence-only guess. `--no-sample` skips the 30 s second reading (deltas then stay `None`, so a fresh
-call abstains instead of claiming a state).
+call abstains instead of claiming a state), and `--window-ms` below 1 is REFUSED: a zero-length window
+collapses both readings into one instant, making both signals trivially flat, so a live working lane
+would read `frozen`.
 
 `--log-census` takes the deltas **from the caller** (`?` = unread, which abstains) because a census
 that judged 76 lanes must not sleep 30 s per lane — the caller owns the two samples. Both shapes
 publish the same states from the same function; there is no state decided at the seam that
 `log_lane_verdict` does not decide.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (41 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (50 mutations, each of which must make its paired
-test RED). T32–T38 are the log axis's VERDICT; T39–T41 are its ACQUISITION (`_cpu_time_cs` /
+Regression contract: `python3 tools/fleet/liveness.test.py` (42 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (55 mutations, each of which must make its paired
+test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder). Their paired mutations re-introduce the exact pre-fix behaviours — the
 dropped progress veto, the exited process falling into the freeze ladder, the missing window, the
 absent log as a death witness, the log axis masking a session query, every bound verdict reading
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped
-fractional seconds, a skipped unparseable CPU row, and the census's loose `alive` decode.
+fractional seconds, a skipped unparseable CPU row, the census's loose `alive` decode, the census's
+unfiltered verdict token, a `?` CPU channel counting as read, the inverted sample delta, a
+non-regular file read as a readable log, and an unresolvable log path not abstaining.
