@@ -151,6 +151,36 @@ has "$(cat "$(LOG)" 2>/dev/null)" "[key-gate] lane 3331 check=fail result=REFUSE
     "1b the log names the missing variable and where the name came from"
 [ ! -s "$PI_MARK" ]; ck "1c pi was NEVER spawned — the refusal is BEFORE the agent, so no model call was spent" $?
 check_terminal "1d" refused "key-gate:credential-missing:$KEYVAR" 82
+# ⛔ THE REFUSAL YIELDS THE ITEM (review round 3, P2). `chain-merge.sh`'s ONLY early bail-out reads
+# `state/capacity-refused-<N>`, and the key gate refuses 270 lines BEFORE the arm that writes it — so
+# without this record the chain waits its full 90 minutes holding `refs/claims/issue-<N>` for a PR that
+# cannot appear, and every peer's pre-flight reads COLLISION (the R8 defect the record exists to
+# remove). `capability` writes one for the same reason: the credential is a property of THIS box.
+KGREC="$ARMDIR/o/state/capacity-refused-3331"
+[ -s "$KGREC" ]; ck "1d1 a key refusal writes state/capacity-refused-<N> (else chain-merge waits 90 min on a claim a peer must see released)" $?
+KG_GATE=""; _kgep=""; _kguntil=""
+[ -s "$KGREC" ] && read -r _kgep _kguntil KG_GATE < "$KGREC" 2>/dev/null
+i=""; case "${_kgep:-}" in ''|*[!0-9]*) : ;; *) [ "${_kguntil:-0}" -gt "${_kgep:-0}" ] && i=ok ;; esac
+eqv "$i" "ok" "1d2 …with a coherent epoch/yield pair ('${_kgep:-<none>}' -> '${_kguntil:-<none>}')"
+eqv "${KG_GATE:-<none>}" "key" "1d3 …and field 3 names the KEY gate (an unnamed gate is folded to 'load' by every reader, the #2991 defect)"
+
+# ── 1z: A STORED CREDENTIAL IS NOT A MISSING ONE (review round 3, P1) ────────────────────────────
+# `pi` consults `auth.json` (what `pi /login` writes) BEFORE the environment, so a provider logged in
+# that way runs with the variable unset. A gate that refused on the variable alone refused a lane that
+# WOULD have worked — on a supported configuration — so this arm drives it end to end: same fixture, same
+# absent variable, one stored credential added, and the lane must RUN.
+mk_arm storedcred; WT="$ARMWT"
+printf '{"deepseek":{"type":"api_key","key":"sk_stored_fixture"}}\n' > "$ARMDIR/home/.pi/agent/auth.json"
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi
+: > "$PI_MARK"
+drive "$WT"
+eqv "$LANE_RC" "0" "1z a lane whose provider is logged in (auth.json, no env variable) RUNS — the gate does not refuse a working box"
+[ -s "$PI_MARK" ]; ck "1z2 …and the agent really started" $?
+has "$(cat "$(LOG)" 2>/dev/null)" "check=skipped reason=stored-credential" \
+    "1z3 …because the gate says WHICH source answered, instead of passing silently"
+check_terminal "1z4" done "agent-exit-0" 0
+[ ! -s "$ARMDIR/o/state/capacity-refused-3331" ]; ck "1z5 …and no stand-down record is written for a lane that ran" $?
 # ⛔ THE WHOLE POINT: THE REFUSAL MUST NOT READ AS "STILL WORKING". A pre-change log for this arm ended
 # on a cleanup line with the cause buried above it — the shape that was read as a live lane for hours.
 hasnt "$(lastline)" "[venv-reap]" "1e the log does NOT end on a cleanup/reap line (the shape mistaken for a working lane)"
@@ -248,12 +278,26 @@ check_terminal "7f" refused "repo-target:REFUSED" 72
 [ ! -s "$PI_MARK" ]; ck "7g …and no agent was started" $?
 unset TARGET_SLUG
 
-# ═══ 8. THE VOCABULARY IS ONE SOURCE OF TRUTH ═══════════════════════════════════════════════════════
-# A scanner's whole job is `grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log`; this arm asserts the four
-# words it can ever see are
-# the four the contract declares, so a fifth cannot be introduced without reddening something.
-has "$(grep -o 'done|refused|failed|died' "$LANE" | head -1)" "done|refused|failed|died" \
-    "8 the writer's closed vocabulary is declared in ONE place (done|refused|failed|died)"
+# ═══ 8. THE VOCABULARY IS ONE SOURCE OF TRUTH ═══════════════════════════════════════════════════
+# A scanner's whole job is `grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log`; this arm asserts the words it
+# can ever see are the ones the contract declares, so a fifth cannot be introduced without reddening.
+# ⛔ IT PINS THE WRITER'S CASE ARM, NOT A COMMENT (review round 3, P2, measured). The first cut grepped
+# the whole file for the literal `done|refused|failed|died`, which is BRE (so `|` is a plain character) and
+# matched the HEADER COMMENT — adding a fifth word to `lane_outcome`'s `case` left all 65 assertions
+# green, i.e. the arm asserted a doc line while claiming the vocabulary. Extracted from the FUNCTION
+# BODY, an added word changes the pattern and reddens this.
+W_BODY="$(awk '/^lane_outcome\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$LANE")"
+case "$W_BODY" in
+  *'done|refused|failed|died)'*) ok "8 the writer's closed vocabulary is declared in ONE place (done|refused|failed|died), read from lane_outcome's own case" ;;
+  *) bad "8 lane_outcome's case does not declare exactly done|refused|failed|died — a fourth word was added or one was dropped" ;;
+esac
+# …and an OUT-OF-VOCABULARY word can never be written as a legitimate outcome: it becomes `failed` and
+# says so, which is the other half of a closed vocabulary (a writer that accepts anything records
+# nothing). Pinned on the body for the same reason as above.
+case "$W_BODY" in
+  *unmapped-outcome*) ok "8e an unmapped outcome word is reported as failed + unmapped-outcome (the vocabulary is closed, and a bad word is visible)" ;;
+  *) bad "8e lane_outcome has no unmapped-outcome arm — a fifth word would be written as if it were an outcome" ;;
+esac
 FOUND="$(cat "$T"/*/o/logs/lane-3331.log "$STRIPPED"/O/logs/lane-3331.log 2>/dev/null \
          | sed -n 's/^outcome=\([a-z]*\) .*/\1/p' | sort -u | tr '\n' ' ')"
 has " $FOUND" "done " "8a the arms produced a 'done' outcome"

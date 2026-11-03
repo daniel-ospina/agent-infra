@@ -133,6 +133,12 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and retur
     land) printf 'land' ;;
     capability) printf 'capability' ;;
     skew) printf 'skew' ;;
+    # ⛔ `key` IS THE MODEL-CREDENTIAL REFUSAL (agent-infra#3331), and it belongs HERE for the same reason
+    # `capability` does: it is a property of THIS box (this box's lane environment holds no credential
+    # for the provider), so the item must travel to a peer that has one. Without the name in this
+    # normaliser it folded into `*` -> `load`, which is the #2991 defect exactly: a bool number, a peer
+    # yield, and an operator reading "load" about a missing key.
+    key) printf 'key' ;;
     *) printf 'load' ;;
   esac
   return 0
@@ -281,10 +287,19 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # The chain still stops here (no PR can appear), and the EXIT trap still releases
       # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
       skew) _cap_rc=81 ;;
+      # 82 is key-gate.sh's KEY_GATE_REFUSED (#3331): the lane REFUSED before spawning the agent because
+      # its environment holds no model credential for the provider. Named rather than folded, for the
+      # same reason as every other arm: an operator told 75 waits for load to fall on a box whose
+      # credential never arrives, and this box will not re-win the item while the record's yield lives.
+      # Tolerant `:-82` like the other constants, so a `$O` whose key-gate.sh predates the code cannot
+      # turn a refusal into an unbound-variable abort.
+      key)  _cap_rc="${KEY_GATE_REFUSED:-82}" ;;
       *)    _cap_rc=75 ;;
     esac
     if [ "$_cap_gate" = "land" ]; then
       echo "[chain $N] land-backlog: lane-$N was refused because the repo's open-PR backlog is over its own landing ceiling (#2409), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This is NOT a capacity transfer: the backlog is repo-wide, so handing the issue to a peer box would not clear it — the remedy is to LAND the open queue (or dispatch a P0-blocker / base-red repair, which are exempt)" >> "$LOG"
+    elif [ "$_cap_gate" = "key" ]; then
+      echo "[chain $N] credential refusal: lane-$N was refused before its agent started because the lane's environment holds no model credential for its provider (key-gate.sh, exit ${_cap_rc}), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This IS a capacity transfer in the one sense that matters here: the credential is a property of THIS box, so a peer that HAS one can take the item — the remedy is to put the key in the environment lanes run with ([key-gate] line in logs/lane-$N.log names the variable and every candidate file), not to wait" >> "$LOG"
     elif [ "$_cap_gate" = "skew" ]; then
       echo "[chain $N] harness mismatch: lane-$N was refused because the lane's caller and the deployed cell-lane-preflight.sh disagree (a usage/version skew, or a corrupt copy), so the capability probe measured nothing — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: every box running the same helper pair refuses identically, so handing the issue to a peer would only circulate it — the remedy is to sync the pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever lanes run" >> "$LOG"
     else

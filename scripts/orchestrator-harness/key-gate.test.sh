@@ -116,6 +116,27 @@ OUT="$(env -i PATH=/usr/bin:/bin HOME="$H" bash -c 'set -u; . "$1"; . "$2/keys.e
 has "$OUT" "check=ok var=KG_CANARY_KEY" "2e a value SOURCED into this shell passes (the lane-env path, not a file credit)"
 has "$OUT" "RC=0" "2f …and returns 0"
 
+# ── 2g/2h: A STORED CREDENTIAL IS NOT A MISSING ONE (review round 3, P1, measured) ──────────────
+# `pi` resolves a credential STORE FIRST (`$HOME/.pi/agent/auth.json`, what `pi /login` writes), then the
+# environment, then the models.json template. So on a box whose lane provider was logged in, the template's
+# variable being unset says NOTHING about whether the lane can run — and a gate that refused there refused
+# a working box (measured on this host: an `auth.json` carrying `zai` made `pi --list-models` list the
+# provider's models while `$ZAI_API_KEY` was unset, and the first cut of this gate refused with 82).
+HZ="$(mkhome storedcred "$DEEPSEEK_JSON")"
+printf '{"deepseek":{"type":"api_key","key":"sk_stored_fixture"}}\n' > "$HZ/.pi/agent/auth.json"
+OUT="$(run_gate "$HZ")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2g a stored credential for the provider REFUSES NOTHING (rc=${RC:-<none>}) — pi reads the store first" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=skipped reason=stored-credential" "2h …and SAYS which source answered, so a green gate is not read as 'the environment has the key'"
+# The inverse, so the arm cannot pass by refusing nothing unconditionally: a store naming a DIFFERENT
+# provider is not a credential for this one.
+HA="$(mkhome othercred "$DEEPSEEK_JSON")"
+printf '{"zai":{"type":"api_key","key":"sk_other"}}\n' > "$HA/.pi/agent/auth.json"
+OUT="$(run_gate "$HA")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2i a store for a DIFFERENT provider still refuses (rc=${RC:-<none>})" "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+
 # ── 3. BLINDNESS IS NOT A REFUSAL (polarity, the direction that stops a fleet) ───────────────────
 for spec in "absent:ABSENT" \
             "literal:{\"providers\":{\"deepseek\":{\"apiKey\":\"sk_literal_not_a_template\"}}}" \
