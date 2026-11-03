@@ -79,7 +79,8 @@
 #   --glob PATTERN  a shell glob naming runner `_work` roots (repeatable; replaces the default list)
 #   --min-age S     seconds a `_work` entry must have gone unwritten before it is a candidate
 #                   (default 3600)
-#   --print-config  `globs=…` / `min_age=…` / `retained=…` / `mode=…` for the caller
+#   --print-config  `globs=…` / `min_age=…` / `retained=…` / `reaped_by_table=…` / `mode=…` for
+#                   the caller (both halves of WORK_LAYOUT, so neither disposition can be invisible)
 #   --help          this text (exit 0)
 #
 # Env seams:
@@ -175,6 +176,22 @@ _update|retain|runner-self-update|the runner's own self-update staging: reaping 
 # or it does not exist as a decision at all — a second literal list is exactly how the third directory
 # (`_temp`) fell out of the carve-out while the first list still read as complete.
 RETAINED_NAMES="$(printf '%s\n' "$WORK_LAYOUT" | awk -F'|' '$1 != "" && $2 == "retain" { print $1 }')"
+# ⛔ THE OTHER HALF OF THE SAME TABLE, DERIVED THE SAME WAY — AND THE REASON THIS LINE EXISTS.
+# `is_retained` used to consult ONLY `RETAINED_NAMES`, so a `reap` row matched nothing, fell through to the
+# vendor-namespace default below and was reported `reason=vendor-namespace-unlisted` — "no WORK_LAYOUT
+# row" about a name whose row was right there in the table. The documented disposition was INERT and the
+# log named the WRONG CAUSE, which is worse than a missing feature: an operator who follows the table's
+# own guidance (`give it a reap row`) gets a confident, false explanation for why it did not work.
+# Measured on the pre-fix tree: `_foo|reap|job-checkout|…` → `RETAINED … reason=vendor-namespace-unlisted`.
+REAP_DECIDED_NAMES="$(printf '%s\n' "$WORK_LAYOUT" | awk -F'|' '$1 != "" && $2 == "reap" { print $1 }')"
+# ⛔ THE DISPOSITION VOCABULARY IS CHECKED ONCE, HERE, BEFORE ANYTHING IS SWEPT. A typo (`repa`, `Retain`,
+# an empty column) would match NEITHER derivation and turn an operator's explicit decision back into the
+# default — silently, which is the exact failure the block above records.
+_LAYOUT_BAD="$(printf '%s\n' "$WORK_LAYOUT" | awk -F'|' '$1 != "" && $2 != "retain" && $2 != "reap" { printf "%s(%s) ", $1, $2 }')"
+if [ -n "$_LAYOUT_BAD" ]; then
+    printf '%s: ⛔ WORK_LAYOUT has a row whose disposition is neither `retain` nor `reap`: %s — refusing to sweep on a table whose decision this code would ignore\n' "$SCRIPT_NAME" "$_LAYOUT_BAD" >&2
+    exit 2
+fi
 # ⛔ AN UNLISTED NAME IN THE RUNNER'S NAMESPACE IS KEPT, NOT REAPED. Every directory the vendor names for
 # itself is `_`-prefixed (`_temp`/`_actions`/`_tool`/`_update` are the four it keeps under `_work`); a job
 # CHECKOUT is a repository name. So a `_`-prefixed name with no row is a directory whose decision nobody
@@ -245,6 +262,7 @@ if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'globs=%s\n' "$GLOBS"
     printf 'min_age=%s\n' "$MIN_AGE"
     printf 'retained=%s\n' "$(printf '%s' "$RETAINED_NAMES" | tr '\n' ',' | sed 's/,$//')"
+    printf 'reaped_by_table=%s\n' "$(printf '%s' "$REAP_DECIDED_NAMES" | tr '\n' ',' | sed 's/,$//')"
     printf 'mode=%s\n' "$([ "$DRY_RUN" = 1 ] && printf dry-run || printf apply)"
     exit 0
 fi
@@ -373,21 +391,34 @@ ROOTS=0; GLOBS_N=0; CAND=0; REAPED=0; KEPT=0; RETAINED=0; FAILED=0; UNMEASURABLE
 DEADLINE=0; MODE_TEXT=dry-run; SCRATCH=""; FLOOR_REF=""
 
 is_retained() { # <entry name> — 0 when the RUNNER owns this name (never a candidate)
-    local n="$1" rn row
+    local n="$1" row disp rest
     RETAIN_REASON=""; RETAIN_WHY=""
-    while IFS= read -r rn; do
-        [ -n "$rn" ] || continue
-        [ "$n" = "$rn" ] || continue
-        # The reason is looked up in the SAME table the name came from, so the log line and the
-        # decision cannot drift apart.
-        row="$(printf '%s\n' "$WORK_LAYOUT" | awk -F'|' -v n="$n" '$1 == n { print $3 "|" $4; exit }')"
-        RETAIN_REASON="${row%%|*}"; RETAIN_WHY="${row#*|}"
-        return 0
-    done <<<"$RETAINED_NAMES"
+    # ── THE TABLE DECIDES FIRST, IN BOTH DIRECTIONS, THROUGH ONE LOOKUP ──────────────────────────
+    # ⛔ ONE EXPRESSION READS `disposition`, so a row cannot be honoured in one direction and inert in
+    # the other. That asymmetry is what shipped: the retain side was a derived list and the reap side was
+    # not looked up at all, so `reap` fell through to the namespace default below.
+    row="$(printf '%s\n' "$WORK_LAYOUT" | awk -F'|' -v n="$n" '$1 == n { print $2 "|" $3 "|" $4; exit }')"
+    if [ -n "$row" ]; then
+        disp="${row%%|*}"; rest="${row#*|}"
+        case "$disp" in
+            retain)
+                # The reason is read from the SAME row the name came from, so the log line and the
+                # decision cannot drift apart.
+                RETAIN_REASON="${rest%%|*}"; RETAIN_WHY="${rest#*|}"
+                return 0 ;;
+            reap)
+                # An operator's explicit decision that this name IS a job checkout (a repository
+                # literally named `_something`). It is a CANDIDATE like any other — the floor and the
+                # liveness gate still decide, so a LIVE one is KEPT, never deleted.
+                return 1 ;;
+        esac
+    fi
     case "$n" in
         "$VENDOR_NAMESPACE_PREFIX"*)
+            # Reached ONLY when the table really has no row for the name, which is what makes this
+            # reason true rather than a denial of a row that exists.
             RETAIN_REASON="vendor-namespace-unlisted"
-            RETAIN_WHY="a name in the runner's own '$VENDOR_NAMESPACE_PREFIX' namespace with no WORK_LAYOUT row: nobody has decided it yet, so it is KEPT and named here rather than reaped — write the row"
+            RETAIN_WHY="a name in the runner's own '$VENDOR_NAMESPACE_PREFIX' namespace with NO WORK_LAYOUT row: nobody has decided it yet, so it is KEPT and named here rather than reaped — write the row"
             return 0 ;;
     esac
     return 1
@@ -499,6 +530,10 @@ if ! acquire_lock; then exit 3; fi
 DEADLINE=$(( $(now) + BUDGET ))
 log_line "reap-runner-work: pass start mode=$MODE_TEXT min_age=${MIN_AGE}s pid=$$ globs=$(printf '%s' "$GLOBS" | tr ' ' ',')"
 log_line "reap-runner-work: retained=$(printf '%s' "$RETAINED_NAMES" | tr '\n' ',' | sed 's/,$//') — the runner's own _work namespace (WORK_LAYOUT), never candidates whatever their age"
+# ⛔ PRINTED ONLY WHEN A `reap` ROW EXISTS, so the default banner is byte-identical and a decided name is
+# never silently absent from the pass record — the same reason the retain set is on it at all.
+_reap_decided="$(printf '%s' "$REAP_DECIDED_NAMES" | tr '\n' ',' | sed 's/,$//')"
+[ -z "$_reap_decided" ] || log_line "reap-runner-work: reaped-by-table=$_reap_decided — WORK_LAYOUT rows with disposition reap: CANDIDATES like any other checkout (the floor and the liveness gate still decide, so a LIVE one is KEPT)"
 log "==== pass start mode=$MODE_TEXT min_age=${MIN_AGE}s explicit=$EXPLICIT ===="
 
 # ⛔ THE GLOBS ARE EXPANDED UNQUOTED ON PURPOSE — that expansion IS the discovery mechanism. A pattern
