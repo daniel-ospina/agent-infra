@@ -94,6 +94,15 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 #                                   `-X GET` exits 1 (real gh → POST → 404).
 #   PATCH (-X PATCH … --input -)  → swallow stdin; exit 1 when STUB_PATCH_FAIL=1
 #   rerun (-X POST … /rerun)      → 201; exit 1 when STUB_RERUN_FAIL=1
+#   comments (… /issues/<n>/comments) → the DURABLE comment channel (#3168):
+#                                   READ (--paginate … --jq) prints
+#                                   ${STUB_COMMENT_BODIES:-} verbatim, or a
+#                                   NON-EMPTY error body on STDOUT with exit 1
+#                                   when STUB_COMMENT_FAIL=1 (the `gh api`
+#                                   shape that must never be read as "no
+#                                   comment"); POST (-X POST … --input -)
+#                                   captures stdin to ${STUB_COMMENT_CAPTURE:-}
+#                                   and exits 1 when STUB_COMMENT_POST_FAIL=1
 mkdir -p "$T/bin"
 cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -153,6 +162,34 @@ if [ "$1" = "api" ]; then
                     esac ;;
             esac ;;
     esac
+    # agent-infra#3168: the DURABLE comment channel (repos/…/issues/<n>/comments).
+    # Placed before the generic tail so a comments READ cannot fall through to the
+    # body answer. ⛔ The FAILURE arm is the load-bearing one: `gh api` writes a
+    # NON-EMPTY JSON error body to STDOUT *and* exits non-zero, so a producer that
+    # captured stdout without testing the exit status would read `{"message":
+    # "API rate limit exceeded"}` as comment text and could conclude the marker is
+    # already posted when it is not.
+    # ⛔ NARROW: `…/issues/<n>/comments` is the PR's comment LIST; `…/issues/comments/<id>`
+    # is the SINGLE-comment read used by `--evidence comment:<id>` and must keep
+    # falling through to the generic tail. An unanchored `/comments` match swallowed
+    # the evidence read and reddened §13h.
+    if grep -qE -- '/issues/[0-9]+/comments' <<<"$*"; then
+        if grep -qF -- "-X POST" <<<"$*"; then
+            [ "${STUB_COMMENT_POST_FAIL:-0}" = "1" ] && exit 1
+            if [ -n "${STUB_COMMENT_CAPTURE:-}" ]; then
+                cat >"$STUB_COMMENT_CAPTURE"
+            else
+                cat >/dev/null
+            fi
+            exit 0
+        fi
+        if [ "${STUB_COMMENT_FAIL:-0}" = "1" ]; then
+            printf '%s\n' '{"message":"API rate limit exceeded","status":"403"}'
+            exit 1
+        fi
+        [ -n "${STUB_COMMENT_BODIES:-}" ] && printf '%s\n' "${STUB_COMMENT_BODIES}"
+        exit 0
+    fi
     # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
     # --jq, so it would otherwise fall through to the generic body answer.
     if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
@@ -4784,6 +4821,43 @@ fi
 assert_eq "$FL_RC" "0" "14.10b --flush-pending delivers the pending marker (rc 0) [out: $(printf '%s' "$FL_OUT" | tr '\n' ' ')]"
 if [ -f "$PEND14" ]; then bad "14.10b the pending file survives a SUCCESSFUL flush (a retry would re-post forever)"; else ok "14.10b a successful flush clears the pending file"; fi
 assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json")" "14.10b the flush does NOT re-record (the verdict and its reviewed_at are untouched)"
+# 14.10f THE RECOVERY PATH'S PRESENCE PREDICATE (agent-infra#3168, fresh-review P1).
+#       post_marker() tested the body with the UNANCHORED `grep -qF`, so a body that
+#       merely CITES the marker mid-line read as "already present": the flush
+#       PATCHed NOTHING, `rm -f`'d the pending file, and the caller printed
+#       "delivered the pending signed marker". That is silent destruction of the
+#       only copy of the signed bytes, reported as success — reached not just by
+#       --flush-pending but by EVERY later minting run. The predicate must match
+#       the gate's line-anchored `^…$` admission, exactly like the three sites the
+#       main change already anchored. ⛔ ASSERTS THE TRANSPORT (a PATCH was issued),
+#       not the exit code: the destructive mutant also exited 0.
+if [ -n "${QB_LINE:-}" ]; then
+    PEND14F="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424340.marker"
+    printf '%s\n' "$QB_LINE" > "$PEND14F"
+    : > "$LOG"; F_CAP="$T/flushcap14f"; : > "$F_CAP"
+    F_RC=0
+    F_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$F_CAP" \
+        STUB_BODY="A lane cited the attestation inline: $QB_LINE — see above." \
+        bash "$RECORD" --flush-pending 424340 daniel-ospina/agent-infra 2>&1)" || F_RC=$?
+    if grep -qF -- "-X PATCH" "$LOG"; then
+        ok "14.10f flush: a body that only CITES the marker still gets the PATCH (anchored predicate)"
+    else
+        bad "14.10f flush: a mid-line marker SUPPRESSED the PATCH — the unanchored -qF is back in post_marker()"
+    fi
+    if command grep -qxF -- "$QB_LINE" <<<"$(jq -r '.body // empty' "$F_CAP" 2>/dev/null)"; then
+        ok "14.10f …and the delivered body carries the marker on a line of its OWN (gate-admissible)"
+    else
+        bad "14.10f the delivered body carries no anchored marker line"
+    fi
+    assert_eq "$F_RC" "0" "14.10f the flush succeeds (rc 0) [out: $(printf '%s' "$F_OUT" | tr '\n' ' ')]"
+    if [ -f "$PEND14F" ]; then
+        bad "14.10f a DELIVERED marker's pending file survives (a retry would re-post forever)"
+    else
+        ok "14.10f …and the delivered pending file is cleared"
+    fi
+else
+    bad "14.10f vector SKIPPED — no seeded marker line; the unanchored-post_marker pin did NOT run"
+fi
 # 14.10c MUTATION PIN — the exit-5 rule must be load-bearing. With it reverted to
 #       the old `exit 0`, a failed post reads as success again, which is exactly
 #       the invisible-record state defect A reported.

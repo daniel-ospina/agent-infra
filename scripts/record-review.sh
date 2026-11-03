@@ -1066,7 +1066,15 @@ post_marker() { # <repo> <pr> <marker> -> 0 present/posted, 1 post failed, 2 bod
   local repo="$1" pr="$2" marker="$3" body="" newbody=""
   body="$(command gh api "repos/$repo/pulls/$pr" --jq .body 2>/dev/null)" || return 2
   [ "$body" = "null" ] && body=""
-  if printf '%s\n' "$body" | command grep -qF -- "$marker"; then return 0; fi
+  # ⛔ LINE-ANCHORED (`-x`), the SAME predicate the recorder's append decision uses
+  # (agent-infra#3168). This site is the RECOVERY path — reached by `--flush-pending`
+  # and by every later minting run — and it is the one that can DESTROY the marker:
+  # unanchored `-qF` read a body that merely CITES the marker mid-line as "already
+  # present", so it PATCHed nothing, flush_pending_markers() `rm -f`'d the pending
+  # file, and the caller printed "delivered the pending signed marker". Silent loss
+  # of the only copy of the signed bytes, reported as success (a false PASS).
+  # The here-string also removes a `producer | grep -q` pipeline (#841/#864).
+  if command grep -qxF -- "$marker" <<<"$body"; then return 0; fi
   if [ -n "$body" ]; then newbody="${body}
 
 ${marker}"; else newbody="$marker"; fi
