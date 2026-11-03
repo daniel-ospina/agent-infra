@@ -2029,26 +2029,18 @@ else
 import sys
 src = open(sys.argv[1]).read()
 arm = sys.argv[3]
+# ⛔ THE MUTATION MUST STAY A VALID PROGRAM. Replacing `try:` with `if True:` orphans the
+# `except` clauses the guard sits on, so the mutant was a SyntaxError: it could not emit the named
+# refusal, and the "no named refusal" assertion below is then satisfied by ANY failure — the arm
+# would have stayed green for a script that never ran, i.e. graded nothing. Neutering the HANDLER
+# keeps the file compilable and restores the pre-fix behaviour exactly (the OSError escapes).
 if arm == "retired":
-    old = (
-        '    try:\n'
-        '        with open(retired_path) as fh:\n'
-    )
-    new = (
-        '    if True:  # the PRE-FIX reading, restored by the mutation\n'
-        '        with open(retired_path) as fh:\n'
-    )
+    old = '    except OSError as exc:\n        # ⛔ A NAMED REFUSAL, NOT A TRACEBACK.'
+    new = '    except RuntimeError as exc:  # the PRE-FIX reading, restored by the mutation\n        # ⛔ A NAMED REFUSAL, NOT A TRACEBACK.'
 else:
-    old = (
-        '    try:\n'
-        '        entries = sorted(os.listdir(TEMPLATES_DIR))\n'
-        '    except OSError as exc:\n'
-    )
-    new = (
-        '    if True:  # the PRE-FIX reading, restored by the mutation\n'
-        '        entries = sorted(os.listdir(TEMPLATES_DIR))\n'
-        '    if False:\n'
-    )
+    old = '    except OSError as exc:\n        raise ScheduleError(\n            "cannot list %s: %s: %s"'
+    new = '    except RuntimeError as exc:  # the PRE-FIX reading, restored by the mutation\n        raise ScheduleError(\n            "cannot list %s: %s: %s"'
+
 assert old in src, "the 18o mutation target moved (%s)" % arm
 open(sys.argv[2], "w").write(src.replace(old, new, 1))
 PY18O
@@ -2157,20 +2149,8 @@ MUT18P="$T/mut-18p.py"
 python3 - "$SCHED" "$MUT18P" <<'PYMUT'
 import sys
 src = open(sys.argv[1]).read()
-old = (
-    '            try:\n'
-    '                cur = os.stat(path)\n'
-    '            except FileNotFoundError:\n'
-    '                continue\n'
-    '            except OSError:\n'
-    '                return path\n'
-)
-new = (
-    '            try:\n'
-    '                cur = os.stat(path)\n'
-    '            except OSError:  # the PRE-FIX reading, restored by the mutation\n'
-    '                continue\n'
-)
+old = '            except OSError:\n                cur = None\n'
+new = '            except OSError:  # the PRE-FIX reading, restored by the mutation\n                continue\n'
 assert old in src, "the 18p mutation target moved"
 open(sys.argv[2], "w").write(src.replace(old, new, 1))
 PYMUT
@@ -2281,6 +2261,106 @@ PYMUQ
 grep -q 'MUTATION RED' <<<"$mout18q" \
   && ok "18q MUTATION (initialiser removed) raises UnboundLocalError — the case discriminates" \
   || bad "18q MUTATION did not redden, so the case grades nothing: $mout18q"
+
+
+# 18r — "CANNOT STAT" IS NOT "IT IS OURS". 18p(a) pins the wedge (a transient stat failure must not
+# abandon a lock we still hold); this pins the OPPOSITE wrong answer, which `except OSError: return
+# path` gave: `O_EXCL` speaks about CREATE time, not about what now sits at `path`. When the stat
+# failure coincides with the documented steal (a racer reads our zero-byte lock, matches the inode,
+# replaces it and publishes its own live pid), returning the path made us run the job CONCURRENTLY
+# with the racer, and our `finally` then unlinked the RACER's lock by name — after which a third
+# caller acquired it too. So on a stat failure the caller must ask the probe's question: read the
+# file and compare the pid to ours. Ours ⇒ keep (18p). Not ours ⇒ we lost. Unreadable ⇒ fail closed.
+out18r="$(python3 - "$SCHED" "$T/state18r" <<'PY18R' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18r", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+L = os.path.join(d, "locks")
+p = os.path.join(L, "stolen.lock")
+RACER = 4000000 + (os.getpid() % 1000)   # a pid that is NOT us; liveness of it is irrelevant here
+real_stat, real_getpid = os.stat, os.getpid
+state = {"n": 0}
+def racy_stat(path, *a, **k):
+    # the steal lands exactly in the verify window: the file now holds ANOTHER caller's pid, and
+    # the stat that would have told us that fails.
+    if os.path.abspath(str(path)) == os.path.abspath(p) and state["n"] == 0:
+        state["n"] += 1
+        with open(p, "w") as fh:
+            fh.write("%d\n" % RACER)
+        raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = racy_stat
+try:
+    r = m.acquire_lock("stolen")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(p):
+    try:
+        content = open(p).read().strip()
+    except OSError:
+        content = "unreadable"
+if r and content not in (None, str(real_getpid())):
+    print("RESULT DOUBLE-HOLD returned=%r content=%r (MUST NOT HAPPEN)" % (r, content))
+elif r:
+    print("RESULT KEPT-OURS content=%r" % (content,))
+else:
+    print("RESULT LOST-CORRECTLY content=%r" % (content,))
+PY18R
+)"
+grep -q 'RESULT DOUBLE-HOLD' <<<"$out18r" \
+  && bad "18r returned a lock whose content is ANOTHER caller's pid (two holders): $out18r" \
+  || ok "18r a stat failure coinciding with a steal never returns the racer's lock"
+grep -qE 'RESULT (LOST-CORRECTLY|KEPT-OURS)' <<<"$out18r" \
+  && ok "18r resolves to a defensible answer: $(grep -o 'RESULT [A-Z-]*' <<<"$out18r" | head -1)" \
+  || bad "18r produced neither a correct loss nor our own lock: $out18r"
+# MUTATION: restore the blind `except OSError: return path` and 18r must REDDEN.
+MUT18R="$T/mut-18r.py"
+python3 - "$SCHED" "$MUT18R" <<'PYMUTR'
+import sys
+src = open(sys.argv[1]).read()
+old = '            except OSError:\n                cur = None\n'
+new = '            except OSError:  # the PRE-FIX reading, restored by the mutation\n                return path\n'
+assert old in src, "the 18r mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTR
+mout18r="$(python3 - "$MUT18R" "$T/state18r-mut" <<'PYMUR' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18rmut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+p = os.path.join(d, "locks", "stolen.lock")
+RACER = 4000000 + (os.getpid() % 1000)
+real_stat, real_getpid = os.stat, os.getpid
+state = {"n": 0}
+def racy_stat(path, *a, **k):
+    if os.path.abspath(str(path)) == os.path.abspath(p) and state["n"] == 0:
+        state["n"] += 1
+        with open(p, "w") as fh:
+            fh.write("%d\n" % RACER)
+        raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = racy_stat
+try:
+    r = m.acquire_lock("stolen")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(p):
+    try:
+        content = open(p).read().strip()
+    except OSError:
+        content = "unreadable"
+print("MUTATION %s" % ("RED double-hold" if (r and content not in (None, str(real_getpid())))
+                       else "still-correct r=%r content=%r" % (r, content)))
+PYMUR
+)"
+grep -q 'MUTATION RED' <<<"$mout18r" \
+  && ok "18r MUTATION (blind return path) produces two holders — the case discriminates" \
+  || bad "18r MUTATION stayed green, so the case grades nothing: $mout18r"
 
 
 echo

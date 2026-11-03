@@ -1078,23 +1078,42 @@ def acquire_lock(label):
             # injection: with the create→write window widened, both callers were told they held it.
             # Re-verifying ownership here makes the loser LOSE: it re-examines (bounded by the
             # retry count) and answers "held" to the racer that actually owns the lock now.
-            # ⛔ A FAILED STAT IS NOT "SOMEONE ELSE'S LOCK". `except OSError: continue` conflated the
-            # two: one transient EIO/ESTALE (or an EACCES flip landing after the create — the very
-            # fault test 18n constructs) made this caller abandon a lock it DOES still hold, with its
-            # own LIVE pid inside it. Measured at the pre-fix head: RESULT None, the lock left on
-            # disk holding OUR pid, so every later `acquire_lock` answered "held" and the job logged
-            # `SKIP <job>: already running (lock held)` for a lock this very process had created —
-            # a wedged job, which is the class this whole change exists to close. ENOENT is the only
-            # answer that means "not ours": the path is gone, so the retry loop is what answers it.
-            # Any other failure means we cannot PROVE a replacement, and `O_EXCL` says the create we
-            # won was not contested — so we still hold it, and we return it.
+            # ⛔ A FAILED STAT IS NOT "SOMEONE ELSE'S LOCK" — but it is not proof of ownership
+            # either, so neither "abandon" nor "assume ours" is sound. Both wrong answers are
+            # measured:
+            #   • `except OSError: continue` (blind abandon) — one transient EIO/ESTALE, or an
+            #     EACCES flip landing after the create (the fault test 18n constructs), abandoned a
+            #     lock we still held, with OUR live pid inside it. Every later `acquire_lock` then
+            #     read a live holder and answered "held": `SKIP <job>: already running (lock held)`
+            #     for a lock this process had created, and the job never ran again — a wedge.
+            #   • `except OSError: return path` (blind assume) — `O_EXCL` speaks about CREATE time,
+            #     not about what now sits at `path`. A stat failure that coincides with the very
+            #     steal documented above made us return a lock whose content was the RACER's live
+            #     pid; `run_job` then ran the body concurrently with it and its `finally` unlinked
+            #     the racer's lock by name, after which a third caller also acquired it.
+            # So on a stat failure we ask the QUESTION THE PROBE ASKS — read the file and take the
+            # pid from the fd we actually opened. Ours ⇒ we still hold it (keep it). Someone else's
+            # ⇒ we lost (re-examine). Unreadable ⇒ we cannot prove either, so we fail CLOSED to
+            # "not ours" for this attempt; a skipped pass is recoverable, a double-run is not.
+            cur = None
             try:
                 cur = os.stat(path)
             except FileNotFoundError:
                 continue
             except OSError:
-                return path
-            if cur.st_dev != own.st_dev or cur.st_ino != own.st_ino:
+                cur = None
+            if cur is None:
+                mine = None
+                try:
+                    with open(path, "rb") as fh:
+                        mine = fh.read(64).decode("ascii", "replace").strip()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                if mine != str(os.getpid()):
+                    continue
+            elif cur.st_dev != own.st_dev or cur.st_ino != own.st_ino:
                 continue
             return path
         # Probe: refuse a LIVE holder, steal a dead or unusable one, retry a vanished one.
