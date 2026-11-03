@@ -380,6 +380,7 @@
 #   #2541/#3041 (origin/main)         too-young · stranded-stash · stranded-stash-unverifiable ·
 #                                     unpushed-unverifiable · main-proof-vanished ·
 #                                     remote-holds:<remote>/<branch>
+#   #10114 (this branch, pin tree)     pin-tree · pin-tree-shape
 #   pre-existing (both sides)         bare · main-checkout · self-checkout · worktree-locked ·
 #                                     unreadable-path · prunable · live-process · live-cwd · dirty ·
 #                                     ignored-artifact · status-timeout · status-error ·
@@ -873,7 +874,7 @@ Decision table (env REAP_WT_MIN_AGE_MINUTES, default 45):
   5 clean + PR CLOSED unmerged, head not an ancestor   KEEP (named)
   6 clean + no PR at all                               KEEP (named)
   7 younger than REAP_WT_MIN_AGE_MINUTES               KEEP
-  P pre-existing structural gates (main/self/locked/open-PR/revocable-ref)
+  P pre-existing structural gates (main/self/locked/open-PR/revocable-ref/pin-tree)
   R clean + the only holder is refs/remotes/<r>/<b> AND a bounded
     \`git ls-remote\` confirms the REMOTE still points <b> at this HEAD   REMOVE (remote-holds:<r>/<b>)
     — any probe failure, timeout, empty answer or sha mismatch is PRESERVE (remote-only-ref)
@@ -2643,8 +2644,8 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     local canon="$1" rec rec_t rec_c _t
     [ -n "$canon" ] || return 1
     PIN_VERDICT=""; PIN_PROOF=""
-    # ⛔ `$HOME` IS GUARDED, AND THAT IS LOAD-BEARING (#10114 review P1). This file runs `set -uog
-    # pipefail`, and `${CELL_HOME:-$HOME}` does NOT guard `$HOME` — with HOME unset the whole
+    # ⛔ `$HOME` IS GUARDED, AND THAT IS LOAD-BEARING (#10114 review P1). This file runs
+    # `set -uo pipefail`, and `${CELL_HOME:-$HOME}` does NOT guard `$HOME` — with HOME unset the whole
     # expansion aborts, the classifier's subshell returns an EMPTY row, and the caller counts a
     # blank row as a PRESERVE. The measured effect on the shipped parent: `remove=0 preserved=48`,
     # exit 0, `verdict=idle` — a pass that removes nothing and reports the HEALTHY verdict. The
