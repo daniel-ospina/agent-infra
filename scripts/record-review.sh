@@ -1066,11 +1066,21 @@ post_marker() { # <repo> <pr> <marker> -> 0 present/posted, 1 post failed, 2 bod
   local repo="$1" pr="$2" marker="$3" body="" newbody=""
   body="$(command gh api "repos/$repo/pulls/$pr" --jq .body 2>/dev/null)" || return 2
   [ "$body" = "null" ] && body=""
-  # ⛔ A HERE-STRING, NOT A PIPE INTO A QUIET grep (#841/#864): `grep -qF` exits at the first
-  # match, so on a body larger than the pipe buffer the writer takes SIGPIPE and `pipefail` reports
-  # the pipeline as FAILED — turning a marker that IS present into "absent" and re-patching a body
-  # that already carries it. The guard (scripts/check-no-sigpipe-grep.sh) reds main on this idiom.
-  if command grep -qF -- "$marker" <<<"$body"; then return 0; fi
+  # ⛔ LINE-ANCHORED (`-x`), the SAME predicate the recorder's append decision uses
+  # (agent-infra#3168). This site is the RECOVERY path — reached by `--flush-pending`
+  # and by every later minting run — and it is the one that can DESTROY the marker:
+  # unanchored `-qF` read a body that merely CITES the marker mid-line as "already
+  # present", so it PATCHed nothing, flush_pending_markers() `rm -f`'d the pending
+  # file, and the caller printed "delivered the pending signed marker". Silent loss
+  # of the only copy of the signed bytes, reported as success (a false PASS).
+  # ⛔ The here-string is also what makes the SIGPIPE class impossible here (#841/#864,
+  # the idiom scripts/check-no-sigpipe-grep.sh guards): `grep -q` exits at the first
+  # match, so a `producer | grep -q` pipeline over a body larger than the pipe buffer
+  # takes SIGPIPE and `pipefail` reports the pipeline FAILED — reading a marker that IS
+  # present as absent and re-patching a body that already carries it. A here-string is
+  # bash 3.2-safe and has no producer process to signal. Both intents are load-bearing
+  # at this one site, which is why the fix carries both.
+  if command grep -qxF -- "$marker" <<<"$body"; then return 0; fi
   if [ -n "$body" ]; then newbody="${body}
 
 ${marker}"; else newbody="$marker"; fi
@@ -1080,6 +1090,88 @@ ${marker}"; else newbody="$marker"; fi
   fi
   return 1
 }
+# post_marker_comment <repo> <pr> <marker> -> ALWAYS 0 (best-effort, never fatal)
+#
+# agent-infra#1224, PRODUCER HALF — the consumer half shipped in the gate in 2026-09,
+# and docs/ai-review-gate.md carried "Producer status: the producer half is NOT
+# deployed" for a month. Everything below is why this is not optional, and it lives
+# at the FUNCTION because every caller (mint, both failure arms, --flush-pending)
+# must publish the same channel with the same guarantees:
+  # ── Durable channel: the SAME signed marker as an append-only PR COMMENT ──
+  # (agent-infra#1224, producer half — the gate has shipped the consumer half
+  # since 2026-09 and docs/ai-review-gate.md carried "Producer status: the
+  # producer half is NOT deployed" for a month.) Why it is not optional: the PR
+  # body is a MUTABLE field that lanes rewrite routinely, so a body-only marker
+  # is one edit away from being no marker at all, and the edit that removed it
+  # is invisible — the next read reports "No AI review evidence found" for a
+  # review that genuinely happened. Measured 2026-10-31: tortoise#10410 carries a
+  # signed clean marker at its exact head d96ffe8c, its only gate attempt was
+  # created BEFORE that marker landed and concluded `failure` with
+  # "No AI review evidence found in PR #10410 body or comments", and the head
+  # then held that red with the verdict present. tortoise#10424's own review
+  # comment reports the same shape (a `reviews/10424.json ... clean @ 3805f492`
+  # attestation that no longer covers the head it sits on, after a body edit).
+  # The gate already unions body ∪ comments and HMAC-verifies both, admitting
+  # only OWNER/MEMBER/COLLABORATOR comments, so this ADDS AVAILABILITY and
+  # changes no security property: a forged or stale comment still fails the
+  # HMAC or the binding rules. Idempotent — post only when no admitted comment
+  # already carries this exact marker text. Best-effort: NEVER fails the record.
+  # The BODY mirror above stays: it is what fires `edited` and re-runs the gate
+  # (a comment alone fires `issue_comment`, which this gate deliberately does
+  # not trigger on — see the skip-footgun rule in the workflow header).
+post_marker_comment() { # <repo> <pr> <marker>
+  local repo="$1" pr="$2" marker="$3"
+  local PR_EVIDENCE_COMMENTS_JQ="" HAVE_COMMENT=0 EXISTING_COMMENT_BODIES=""
+  # ⛔ AN UNSIGNED MARKER IS NEVER PUBLISHED AS A COMMENT. The gate can never accept
+  # one (it HMAC-verifies), and unlike the body a comment is PERMANENT. Enforced HERE,
+  # at the single chokepoint, so no caller can forget it and no new call site can
+  # reopen the hole. The unsigned path stays body-only, where its warning is loud.
+  case "$marker" in
+    *" sig="*) : ;;
+    *) return 0 ;;
+  esac
+  # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
+  # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
+  # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract says a producer
+  # must declare its admission residuals AT THE CONSTANT (ai-review-gate.yml
+  # :86-87, :421-424), so they live here rather than in a PR body nobody re-reads:
+  #   1. AUTHOR SET. A recording identity whose comment reports
+  #      `author_association` outside {OWNER, MEMBER, COLLABORATOR} (a GitHub-App
+  #      or bot token) is INVISIBLE to its own dedup read and to the gate → one
+  #      duplicate comment per run, and no comment-borne evidence admitted. It
+  #      degrades to the pre-change behaviour (the body mirror still carries the
+  #      verdict), so the record is never lost. Unarmed on this fleet: `gh`
+  #      authenticates as the repo owner (OWNER ⇒ admitted).
+  #   2. READ-FAILURE ARM. When the comment read FAILS (HAVE_COMMENT=-1) the
+  #      durable post is SKIPPED for that run BY DESIGN — an error body printed
+  #      to STDOUT must never be read as comment text. The body copy is
+  #      unaffected and the warning names the retry.
+  PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
+  HAVE_COMMENT=0
+  if EXISTING_COMMENT_BODIES="$(command gh api --paginate \
+       "repos/$repo/issues/$pr/comments" --jq "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null)"; then
+    if grep -qxF -- "$marker" <<<"$EXISTING_COMMENT_BODIES"; then
+      HAVE_COMMENT=1
+    fi
+  else
+    # Fail SOFT here but LOUDLY, and do not conflate this with "no comment
+    # exists": `gh api` prints HTTP error bodies to STDOUT, so an unguarded
+    # capture would read an error body as comment text and could then believe
+    # the marker is already posted when it is not.
+    echo "⚠️ record-review: could not read the PR's comments (transient API failure?) — the durable comment copy of the marker was not verified this run; the body copy above is unaffected. Re-run record-review.sh to retry." >&2
+    HAVE_COMMENT=-1
+  fi
+  if [ "$HAVE_COMMENT" = "0" ]; then
+    if command jq -Rn --arg body "$marker" '{body: $body}' 2>/dev/null \
+        | command gh api -X POST "repos/$repo/issues/$pr/comments" --input - >/dev/null 2>&1; then
+      echo "review evidence posted to $repo#$pr as a durable comment (body mirror retained: it is what re-triggers the gate)"
+    else
+      echo "note: could not post the durable comment copy of the review evidence (record and body copy still saved)" >&2
+    fi
+  fi
+  return 0
+}
+
 # flush_pending_markers <repo-or-empty> <pr> -> 0 all delivered (or none
 # pending), 1 still undelivered. NEVER mints: it only re-delivers bytes a
 # previous run already recorded, so it cannot outrun the review it came from.
@@ -1098,6 +1190,12 @@ flush_pending_markers() { # <repo-or-empty> <pr>
     echo "body-marker-unposted: the pending marker file for $repo#$pr is EMPTY ($f) — there are no bytes to deliver, and nothing was posted or deleted. A record was written whose marker was never built; re-run the recorder at the same head WITH gh available to rebuild and post it." >&2
     return 1
   fi
+  # agent-infra#1224/#3168: attempt the DURABLE copy FIRST, before the body decision.
+  # The flush exists to recover a marker whose body channel failed — so the run that
+  # cannot reach the body is exactly the run that must still leave an admitted
+  # channel copy. Placed before post_marker() so a body-side failure cannot
+  # short-circuit it; post_marker_comment() is best-effort and always returns 0.
+  post_marker_comment "$repo" "$pr" "$marker" || true
   if post_marker "$repo" "$pr" "$marker"; then
     command rm -f "$f"
     return 0
@@ -4335,6 +4433,18 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # them without a second review. Exit 5 names the state instead of reporting
     # success over an invisible record.
     marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || true
+    # ⛔ THE DURABLE CHANNEL IS ATTEMPTED HERE, BEFORE THE exit 5 (agent-infra#3168
+    # review P2). This arm and the PATCH-failure arm below are the ONLY scenarios
+    # the durable channel exists for, and both used to `exit 5` before reaching it —
+    # so the copy that survives a body-channel failure was never created by the one
+    # run that needed it. The permission split makes it real: the body post needs
+    # `pull-requests:write` while the comment needs `issues:write`, so a token
+    # holding the latter but not the former fails the body post and could have
+    # delivered the comment. Best-effort: it cannot change this exit code.
+    # ⛔ THE CALL, not just the paragraph above (measured: the paragraph shipped
+    # WITHOUT it, so the arm this channel exists for still exited 5 having
+    # published nothing — suite vector 14.1d(e) is the discriminator).
+    post_marker_comment "$REPO" "$PR" "$MARKER" || true
     echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the signed marker was NOT posted — the record is saved but CI CANNOT SEE IT. The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers it WITHOUT a new review." >&2
     exit 5
   fi
@@ -4383,6 +4493,11 @@ ${MISSING}"
       # non-zero state, and the marker survives on disk so delivery can be retried
       # without re-recording (which would dilute the evidence).
       marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MISSING" || true
+      # Same reasoning as the read-failure arm above (#3168 review P2): the PATCH
+      # was refused, so the durable channel is the one that can still carry the
+      # signed bytes. Attempted BEFORE the exit, and "$MISSING" not "$MARKER" — it
+      # is the exact line this run tried to deliver.
+      post_marker_comment "$REPO" "$PR" "$MISSING" || true
       echo "⛔ body-marker-unposted: the signed marker for $REPO#$PR could NOT be PATCHed into the PR body (gh/API refused — a spent token budget, a 403, a 5xx). The record IS saved at $FILE, but CI reads the BODY, so the evidence is currently INVISIBLE and ai-review-gate will refuse this PR." >&2
       echo "   The marker is kept verbatim in $(marker_pending_file "$REPO" "$PR") — deliver it with: record-review.sh --flush-pending $PR ${REPO}   (no new review, no new record, no re-record)" >&2
       exit 5
@@ -4390,68 +4505,10 @@ ${MISSING}"
   fi
 
   # ── Durable channel: the SAME signed marker as an append-only PR COMMENT ──
-  # (agent-infra#1224, producer half — the gate has shipped the consumer half
-  # since 2026-09 and docs/ai-review-gate.md carried "Producer status: the
-  # producer half is NOT deployed" for a month.) Why it is not optional: the PR
-  # body is a MUTABLE field that lanes rewrite routinely, so a body-only marker
-  # is one edit away from being no marker at all, and the edit that removed it
-  # is invisible — the next read reports "No AI review evidence found" for a
-  # review that genuinely happened. Measured 2026-10-31: tortoise#10410 carries a
-  # signed clean marker at its exact head d96ffe8c, its only gate attempt was
-  # created BEFORE that marker landed and concluded `failure` with
-  # "No AI review evidence found in PR #10410 body or comments", and the head
-  # then held that red with the verdict present. tortoise#10424's own review
-  # comment reports the same shape (a `reviews/10424.json ... clean @ 3805f492`
-  # attestation that no longer covers the head it sits on, after a body edit).
-  # The gate already unions body ∪ comments and HMAC-verifies both, admitting
-  # only OWNER/MEMBER/COLLABORATOR comments, so this ADDS AVAILABILITY and
-  # changes no security property: a forged or stale comment still fails the
-  # HMAC or the binding rules. Idempotent — post only when no admitted comment
-  # already carries this exact marker text. Best-effort: NEVER fails the record.
-  # The BODY mirror above stays: it is what fires `edited` and re-runs the gate
-  # (a comment alone fires `issue_comment`, which this gate deliberately does
-  # not trigger on — see the skip-footgun rule in the workflow header).
-  if [ -n "${MARKER:-}" ] && [ "${MARKER_SIGNED:-0}" = "1" ]; then
-    # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
-    # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
-    # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract says a producer
-    # must declare its admission residuals AT THE CONSTANT (ai-review-gate.yml
-    # :86-87, :421-424), so they live here rather than in a PR body nobody re-reads:
-    #   1. AUTHOR SET. A recording identity whose comment reports
-    #      `author_association` outside {OWNER, MEMBER, COLLABORATOR} (a GitHub-App
-    #      or bot token) is INVISIBLE to its own dedup read and to the gate → one
-    #      duplicate comment per run, and no comment-borne evidence admitted. It
-    #      degrades to the pre-change behaviour (the body mirror still carries the
-    #      verdict), so the record is never lost. Unarmed on this fleet: `gh`
-    #      authenticates as the repo owner (OWNER ⇒ admitted).
-    #   2. READ-FAILURE ARM. When the comment read FAILS (HAVE_COMMENT=-1) the
-    #      durable post is SKIPPED for that run BY DESIGN — an error body printed
-    #      to STDOUT must never be read as comment text. The body copy is
-    #      unaffected and the warning names the retry.
-    PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
-    HAVE_COMMENT=0
-    if EXISTING_COMMENT_BODIES="$(command gh api --paginate \
-         "repos/$REPO/issues/$PR/comments" --jq "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null)"; then
-      if grep -qxF -- "$MARKER" <<<"$EXISTING_COMMENT_BODIES"; then
-        HAVE_COMMENT=1
-      fi
-    else
-      # Fail SOFT here but LOUDLY, and do not conflate this with "no comment
-      # exists": `gh api` prints HTTP error bodies to STDOUT, so an unguarded
-      # capture would read an error body as comment text and could then believe
-      # the marker is already posted when it is not.
-      echo "⚠️ record-review: could not read the PR's comments (transient API failure?) — the durable comment copy of the marker was not verified this run; the body copy above is unaffected. Re-run record-review.sh to retry." >&2
-      HAVE_COMMENT=-1
-    fi
-    if [ "$HAVE_COMMENT" = "0" ]; then
-      if command jq -Rn --arg body "$MARKER" '{body: $body}' 2>/dev/null \
-          | command gh api -X POST "repos/$REPO/issues/$PR/comments" --input - >/dev/null 2>&1; then
-        echo "review evidence posted to $REPO#$PR as a durable comment (body mirror retained: it is what re-triggers the gate)"
-      else
-        echo "note: could not post the durable comment copy of the review evidence (record and body copy still saved)" >&2
-      fi
-    fi
-  fi
+  # (#1224 producer half.) The doctrine, the cross-repo byte-identity contract and
+  # the declared residuals all live at post_marker_comment() — one chokepoint, so a
+  # new call site cannot quietly skip the unsigned guard or the admission set.
+  post_marker_comment "$REPO" "$PR" "$MARKER" || true
 
   # ── Stale gate-run remediation (#633) ──────────────────────────────────
   # A completed pre-evidence FAILURE (the push-triggered run that evaluated
