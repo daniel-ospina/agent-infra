@@ -2322,14 +2322,19 @@ if [ -d "$DELTA_REPO" ]; then
   D_FIXED="$( cd "$DELTA_REPO" && git rev-parse pr )"
   delta_write_record 7102 "$D_REVIEWED" clean
   FIX_DELTA_HEAD="$D_FIXED"; delta_run 7102 "$TMP/out32b"; OUT32B="$(cat "$TMP/out32b")"; DRC_B="$DR_RC"
-  [ "$DRC_B" -eq 3 ] && printf '%s' "$OUT32B" | grep -q 'no-new-authored-commits=no' \
+  # NOTE the `<<<` form on every assertion below: this file runs under `set -uo pipefail`, and
+  # `printf … | grep -q` is racy there (`grep -q` exits on its FIRST match and can SIGPIPE the
+  # writer, making the pipeline 141). (33a3) de-pipes for exactly that reason and states the
+  # measurement; a fresh review MEASURED the same flake still present in these six (54 of 1500 runs
+  # of the (33d) chain), so they are de-piped too rather than left as the one spot the fix missed.
+  [ "$DRC_B" -eq 3 ] && grep -q 'no-new-authored-commits=no' <<<"$OUT32B" \
     && [ "$(grep -c "\"head_sha\":\"$D_REVIEWED\"" "$DR_HOME/.pi/agent/reviews/fixture-repo-7102.json")" = 1 ] \
     && pass "(33b) an authored commit landing in the same push is REFUSED and the record is untouched" \
     || fail "(33b) an authored commit was re-attested (rc=$DRC_B)"
   # (c) a record that is not an approval: a delta re-binds an APPROVAL, it cannot manufacture one.
   delta_write_record 7103 "$D_REVIEWED" changes-requested
   FIX_DELTA_HEAD="$D_MERGED"; delta_run 7103 "$TMP/out32c"; OUT32C="$(cat "$TMP/out32c")"; DRC_C="$DR_RC"
-  [ "$DRC_C" -eq 3 ] && printf '%s' "$OUT32C" | grep -q 'not a clean-family verdict' \
+  [ "$DRC_C" -eq 3 ] && grep -q 'not a clean-family verdict' <<<"$OUT32C" \
     && pass "(33c) a non-clean record is REFUSED before any git work — a delta cannot manufacture an approval" \
     || fail "(33c) a non-clean verdict was re-bound as a clean attestation (rc=$DRC_C)"
   # (d) A RECORD NAMING AN ABSENT HEAD — pruned, cross-box, or force-pushed away. This is the
@@ -2344,9 +2349,9 @@ if [ -d "$DELTA_REPO" ]; then
   delta_write_record 7104 "$D_ABSENT" clean
   FIX_DELTA_HEAD="$D_MERGED"; delta_run 7104 "$TMP/out32d"; OUT32D="$(cat "$TMP/out32d")"; DRC_D="$DR_RC"
   [ "$DRC_D" -eq 3 ] \
-    && printf '%s' "$OUT32D" | grep -q '^authored-digest-equal=' \
-    && printf '%s' "$OUT32D" | grep -q '^zero-conflict=' \
-    && printf '%s' "$OUT32D" | grep -q '^no-new-authored-commits=' \
+    && grep -q '^authored-digest-equal=' <<<"$OUT32D" \
+    && grep -q '^zero-conflict=' <<<"$OUT32D" \
+    && grep -q '^no-new-authored-commits=' <<<"$OUT32D" \
     && [ "$(grep -c "\"head_sha\":\"$D_ABSENT\"" "$DR_HOME/.pi/agent/reviews/fixture-repo-7104.json")" = 1 ] \
     && pass "(33d) an ABSENT record head REFUSES at exit 3 and prints all THREE delta fields — a set -e abort on the merge-tree assignment used to truncate the triple into a crash" \
     || fail "(33d) absent-head refusal did not print the full triple at exit 3 (rc=$DRC_D, out='$OUT32D')"
@@ -2358,7 +2363,7 @@ if [ -d "$DELTA_REPO" ]; then
   # must be LEFT ALONE (nothing written, no marker posted).
   delta_write_record 7105 "$D_REVIEWED" clean NONE
   FIX_DELTA_HEAD="$D_MERGED"; delta_run 7105 "$TMP/out32e"; OUT32E="$(cat "$TMP/out32e")"; DRC_E="$DR_RC"
-  [ "$DRC_E" -eq 3 ] && printf '%s' "$OUT32E" | grep -q 'carry-provenance' \
+  [ "$DRC_E" -eq 3 ] && grep -q 'carry-provenance' <<<"$OUT32E" \
     && [ "$(grep -c "\"head_sha\":\"$D_REVIEWED\"" "$DR_HOME/.pi/agent/reviews/fixture-repo-7105.json")" = 1 ] \
     && pass "(33e) a delta whose record names NO review artifact is REFUSED (exit 3) and the record is untouched — a carry cannot re-bind a clean verdict with no evidence" \
     || fail "(33e) a delta with no review artifact was re-bound (rc=$DRC_E, out='$OUT32E')"
@@ -2390,8 +2395,101 @@ if [ -d "$DELTA_REPO" ]; then
     && [ "$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7106.json")" = "$D_REC32F" ] \
     && pass "(33f2) --check-carry answers norecord/exit 4 for the SAME record --delta refused — one artifact, one answer, from both verbs" \
     || fail "(33f2) the two verbs disagree about an unproven delta record (check-carry rc=$CC_RC out='$CC_OUT32F')"
+  # (g) A DELTA THAT MEASURED NOTHING MUST NOT MINT A FRESH RECORD — the false PASS a fresh review
+  # found at 426ac51b, and the reason it found it is that nothing pinned this path. Every delta
+  # refusal lives INSIDE the stale-sha chain (`elif [ "$CURRENT_HEAD" != "$SHA" ]`), so a run that
+  # never enters that chain executes NO delta predicate — and the record write is UNCONDITIONAL.
+  # The #7391 evidence gate cannot catch it either, because that gate is keyed on `VERDICT = clean`
+  # while `clean-micro`/`clean-low` are clean-FAMILY but not `clean`. The fixture below therefore
+  # uses **clean-micro** on purpose: it is the verdict a delta most often carries and the one the
+  # evidence gate does not cover.
+  # The lever is the SECOND `.head.sha` read (reached only after the delta block's own first read),
+  # so the verb gets past `DELTA-PAIR` and then cannot confirm the live head — the documented #784
+  # fail-open path, which is exactly where the shipped code used to fall through to the write.
+  mkdir -p "$TMP/dbin-failhead"
+  cat > "$TMP/dbin-failhead/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in *--input*) command cat >/dev/null 2>&1 || true ;; esac
+for x in "$@"; do
+  case "$x" in
+    .head.sha)
+      n="$(cat "${FAILHEAD_COUNTER:?}" 2>/dev/null || echo 0)"; n=$((n+1)); printf '%s' "$n" > "$FAILHEAD_COUNTER"
+      if [ "$n" -ge 2 ]; then exit 1; fi
+      echo "${FIX_HEAD:-}"; exit 0 ;;
+    .base.sha) echo "${FIX_BASE:-}"; exit 0 ;;
+    .body) echo ""; exit 0 ;;
+  esac
+done
+case "$*" in *check-runs*) echo ""; exit 0 ;; esac
+case "$*" in *pulls/*) if [ -n "${FIX_HEAD:-}" ] && [ -n "${FIX_BASE:-}" ]; then git -C "${FIX_REPO:-.}" diff --no-color "$FIX_BASE...$FIX_HEAD" 2>/dev/null && exit 0; fi ;; esac
+exit 0
+EOF
+  chmod +x "$TMP/dbin-failhead/gh"
+  delta_run_with() { # <script> <bindir> <pr> <out-file> ; assigns DR_RC
+    ( cd "$DELTA_REPO" || exit 9
+      HOME="$DR_HOME" PATH="$2:$PATH" FIX_REPO="$DELTA_REPO" FAILHEAD_COUNTER="$TMP/failhead.n" \
+      FIX_BASE="$(git rev-parse main)" FIX_HEAD="${FIX_DELTA_HEAD:?}" \
+        bash "$1" --delta "$3" fixture/repo ) > "$4" 2>&1
+    DR_RC=$?
+  }
+  delta_write_record 7107 "$D_REVIEWED" clean-micro
+  D_REC32G="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7107.json")"
+  FIX_DELTA_HEAD="$D_MERGED"; : > "$TMP/failhead.n"
+  delta_run_with "$SRC" "$TMP/dbin-failhead" 7107 "$TMP/out32g"; OUT32G="$(cat "$TMP/out32g")"; DRC_G="$DR_RC"
+  [ "$DRC_G" -eq 3 ] \
+    && grep -q 'no carry arm ran, so NOTHING was re-attested' <<<"$OUT32G" \
+    && [ "$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7107.json")" = "$D_REC32G" ] \
+    && pass "(33g) a delta whose live head could not be MEASURED refuses at exit 3 and leaves the record BYTE-IDENTICAL — it cannot mint a fresh record, drop the prior evidence, and post a marker on a successful exit" \
+    || fail "(33g) an unmeasurable delta wrote a record (rc=$DRC_G, out='$OUT32G', record='$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7107.json" 2>/dev/null)')"
+  # (33g2) ATTRIBUTION, MEASURED RATHER THAN ARGUED: the same scenario against a mutant with the
+  # post-condition DELETED must STOP REFUSING FOR THIS REASON. Without it, (33g) could be passing
+  # because of some pre-existing refusal — the exact way a "pin" for this file's headline fix was
+  # already found to be green under deletion once.
+  # ⚠️ WHAT THIS FIXTURE DOES AND DOES NOT ESTABLISH, stated so the arm cannot be read as more: on
+  # THIS stub the mutant's fall-through is then stopped by a DIFFERENT guard — the #513 clean-micro
+  # surface cap, exit 4, because the stub serves no readable changed-path payload — so the fixture
+  # proves the (33g) refusal is ATTRIBUTABLE to the post-condition (rc 3 + that message) and that
+  # removing the post-condition removes it. It does NOT reproduce the full write on this host; the
+  # end-to-end shape (rc 0, record overwritten, prior `evidence` dropped, marker posted) was measured
+  # by the fresh review that found this defect, using a stub that DOES serve a readable surface. The
+  # assertion below therefore keys on WHAT CHANGED, never on the mutant's final exit code.
+  python3 - "$SRC" "$TMP/nodelta-postcond.sh" <<'INNERPY' || true
+import sys
+src = open(sys.argv[1], encoding="utf-8").read().split("\n")
+out, i, dropped = [], 0, 0
+needle = 'if [ "$DELTA" -eq 1 ] && [ -z "$CARRY_ARM" ]; then'
+while i < len(src):
+    if src[i] == needle:
+        # drop the whole if-block up to and including its terminating `fi`
+        depth = 1
+        i += 1
+        while i < len(src) and depth > 0:
+            if src[i].rstrip() == 'fi':
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        dropped += 1
+        continue
+    out.append(src[i])
+    i += 1
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(out))
+print(f"mutant: dropped {dropped} post-condition(s)")
+INNERPY
+  if grep -q 'no carry arm ran' "$TMP/nodelta-postcond.sh"; then
+    fail "(33g2) the mutant still contains the post-condition — the deletion did not land, so attribution is unproven"
+  else
+    delta_write_record 7108 "$D_REVIEWED" clean-micro
+    FIX_DELTA_HEAD="$D_MERGED"; : > "$TMP/failhead.n"
+    delta_run_with "$TMP/nodelta-postcond.sh" "$TMP/dbin-failhead" 7108 "$TMP/out32g2"; OUT32G2="$(cat "$TMP/out32g2")"; DRC_G2="$DR_RC"
+    [ "$DRC_G2" -ne 3 ] \
+      && ! grep -q 'no carry arm ran' <<<"$OUT32G2" \
+      && pass "(33g2) ATTRIBUTION: with the post-condition DELETED the same run no longer refuses at 3 nor emits the message (rc=$DRC_G2 — stopped later by this fixture's clean-micro surface cap), so (33g)'s refusal is the post-condition's own and not a pre-existing one" \
+      || fail "(33g2) the mutant reproduced the (33g) refusal without the post-condition (rc=$DRC_G2, out='$OUT32G2'), so (33g) is attributable to something else"
+  fi
 else
-  fail "(33a) fixture missing"; fail "(33b) fixture missing"; fail "(33c) fixture missing"; fail "(33d) fixture missing"; fail "(33e) fixture missing"; fail "(33f) fixture missing"; fail "(33f2) fixture missing"
+  fail "(33a) fixture missing"; fail "(33b) fixture missing"; fail "(33c) fixture missing"; fail "(33d) fixture missing"; fail "(33e) fixture missing"; fail "(33f) fixture missing"; fail "(33f2) fixture missing"; fail "(33g) fixture missing"; fail "(33g2) fixture missing"
 fi
 
 # ── MUTATION PINS on real output ──────────────────────────────────────────
@@ -2567,7 +2665,7 @@ fi
 # section (32), and this PR adds 11, so the pin is 201. The section is numbered 33 for the same
 # reason — (32) was already taken on main by the time this branch was rebased.
 # MEASURED: `ALL PASSED (201 assertion(s))` on the rebased tree.
-MIN_ASSERTIONS=201
+MIN_ASSERTIONS=203
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

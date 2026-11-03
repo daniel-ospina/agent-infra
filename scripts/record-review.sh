@@ -3754,6 +3754,42 @@ if [ -n "$EXPECT_HEAD" ] && [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne
   fi
 fi
 
+# ── #10583 — A `--delta` THAT MINTED NOTHING IS NOT A SUCCESS ───────────────
+# `--delta` is the ONE mode whose contract is "re-attest the record's verdict onto
+# the live head". Every delta refusal lives INSIDE the stale-sha chain
+# (`elif [ "$CURRENT_HEAD" != "$SHA" ]`), so a path that never enters that chain
+# runs NO delta predicate at all — and the record write below is UNCONDITIONAL.
+# MEASURED (fresh-context review of 426ac51b, reproduced against the real script
+# with a stub gh whose second `.head.sha` read fails):
+#
+#   record BEFORE: {... "mint":"fresh", "verdict":"clean-micro", "evidence":"comment:9000001" ...}
+#   rc=0, and AFTER: {... "mint":"fresh", "verdict":"clean-micro" ...}   ← evidence GONE
+#   stderr: "stale-sha guard: could not fetch the current head … continuing fail-open"
+#           "review evidence posted to … as a durable comment"
+#
+# Three claims that run never made, on a SUCCESSFUL exit: `mint:"fresh"` (no
+# reviewer ran — delta mode REFUSES --evidence, :1319), the prior record's
+# `evidence` (the one pointer tortoise#7391/#10177 exist to preserve) is DELETED,
+# and a signed marker is PATCHed. The tortoise#7391 gate below cannot catch it
+# because that gate is keyed on `VERDICT = clean`, and `clean-micro`/`clean-low`
+# are clean-FAMILY but not `clean` — so the two verdicts a delta most often
+# carries are exactly the two it does not cover. The racing-read variant (the
+# second read returns the record's own head) skips the same chain and lands the
+# same way, which is the #784 "pair that never coexisted" shape: a stale
+# `head_sha` beside the live diff, which `--check-carry` then answers `carry` for.
+#
+# So state the post-condition the mode implies: a delta that reached the record
+# write WITHOUT a carry arm re-attested NOTHING, and a no-op that exits 0 while
+# rewriting the record is the false PASS this whole file exists to refuse. It is
+# a refusal at 3, matching the delta block's own unreadable-head answer (also 3,
+# "RETRY"), because a transient gh failure must be retried, never recorded.
+if [ "$DELTA" -eq 1 ] && [ -z "$CARRY_ARM" ]; then
+  echo "⛔ --delta REFUSED for ${REPO:-<no-repo>}#${PR:-?}: no carry arm ran, so NOTHING was re-attested — refusing to write a record. (no record written, no marker posted)" >&2
+  echo "   A --delta whose head or diff could not be MEASURED is not a changed artifact and not an approval: the live head read did not put this invocation through the carry chain, so no arm could prove the authored change unchanged. Writing here would mint a fresh record for a head nothing measured, and would drop the prior record's review artifact." >&2
+  echo "   Remedy: RETRY (a contended gh gate or a rate-limit window is far cheaper than a re-review). If the retry keeps failing, review the current head and record it fresh with --evidence comment:<id>." >&2
+  exit 3
+fi
+
 # ── tortoise#7391 — a FRESH `clean` record must name a review artifact ───────────
 # This is the branch the defect lived on. CARRY_ARM is set ONLY when a verified
 # carry re-bound the verdict to the live head, so an empty CARRY_ARM means this
