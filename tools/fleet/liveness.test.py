@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Forty-eight tests with sixty-three paired mutations: every mutation re-
+Forty-eight tests with sixty-four paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 31 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (63)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (64)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2079,6 +2079,13 @@ def t47():
     v = liv.evaluate(liv.Evidence(log_read=lr))
     check(v.state == "unknown", "a shrink abstains; got %s/%s" % (v.state, v.reason))
     check(v.state != "frozen", "never frozen on a broken delta")
+    # a POSITIVELY FLAT transcript must not rescue an unreadable byte channel: with
+    # `is None` the shrink escaped to `frozen` on both shipped surfaces
+    lr.transcript_grew = False
+    v = liv.evaluate(liv.Evidence(log_read=lr))
+    check(v.state == "unknown", "a shrink + flat transcript abstains; got %s/%s"
+          % (v.state, v.reason))
+    lr.transcript_grew = None
     # a genuinely flat log still freezes, so the guard is not a blanket abstain
     lr.size_delta = 0
     v = liv.evaluate(liv.Evidence(log_read=lr))
@@ -2545,6 +2552,13 @@ MUTATIONS = [
         "a dropped file verdict BLOCKS the lane's own correctly-bound log line",
     ),
     Mutation(
+        "T45", "module",
+        '        if why:\n            lr.detail = " | ".join(x for x in (lr.detail, why) if x)',
+        '        if why:\n            lr.detail = why',
+        "the drop reason CLOBBERS acquisition's facts, publishing a different fact than "
+        "the true one (`absent:<path>` lost)",
+    ),
+    Mutation(
         "T46", "module",
         '            if lr.verdict:',
         '            if False:',
@@ -2553,8 +2567,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T47", "module",
-        '    no_output = ((lr.size_delta is None or lr.size_delta < 0)',
-        '    no_output = ((lr.size_delta is None or lr.size_delta > 10**9)',
+        '                 and lr.transcript_grew is not True)',
+        '                 and lr.transcript_grew is None)',
         "a NEGATIVE byte delta is read as no-output, so a log that was just truncated or "
         "rotated freezes a lane that is working",
     ),

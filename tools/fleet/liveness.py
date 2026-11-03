@@ -1167,14 +1167,14 @@ def _parent_of(pid: int):
         if close < 0:
             return None
         return int(raw[close + 2:].split()[1])
-    except (OSError, IndexError, ValueError):
+    except (OSError, ValueError, IndexError):
         pass
     ps = os.environ.get("PS_BIN") or "ps"
     try:
         out = subprocess.run([ps, "-o", "ppid=", "-p", str(pid)],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              timeout=30).stdout.decode("utf-8", "replace").strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return int(out) if out.isdigit() else None
 
@@ -1350,8 +1350,20 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
     # caller), so a shrink proves the window was mis-measured. Read as "flat" it froze a
     # lane whose log had just been REWRITTEN: measured `size_delta=-990 cpu=0 alive=True
     # age_ms=3h` -> `frozen/no-progress`.
+    # Only a POSITIVELY FLAT byte reading counts as "no output": a shrink is a broken
+    # reading and an unread field is not evidence. The transcript may VETO (a growing
+    # transcript is work) but can never manufacture the flat reading — with `and
+    # lr.transcript_grew is None` a positively-flat transcript suppressed the abstention
+    # and froze a lane whose log had just been REWRITTEN with its own contradicting
+    # evidence (`bytes_delta=-990`) printed in the detail.
+    # `no_output` here means THE OUTPUT CHANNEL COULD NOT BE READ, and it abstains.
+    # A shrink is broken (a log cannot lose bytes without activity) and an unread field
+    # is not evidence; a POSITIVELY FLAT transcript must not rescue either, which is what
+    # `is not True` says — round 6's `is None` let `size_delta=-990` + `transcript_grew=
+    # False` through to `frozen`, printing its own contradicting evidence in the detail.
+    # A growing transcript still vetoes upstream (it is a progress kind).
     no_output = ((lr.size_delta is None or lr.size_delta < 0)
-                 and lr.transcript_grew is None)
+                 and lr.transcript_grew is not True)
     # A negative delta is a BROKEN reading, not a flat one — same rule as the reaper's.
     # The census seam can be handed one in field 3, so the check lives here too.
     no_cpu = (lr.cpu_unreadable or lr.cpu_delta_cs is None or lr.cpu_delta_cs < 0)
@@ -1667,7 +1679,7 @@ def jsonl_state(path: Optional[str], now_ms: int, window_ms: int = STREAM_STALL_
         st = os.stat(path)
     except FileNotFoundError:
         return False, None
-    except OSError:
+    except (OSError, ValueError):
         return None, None
     age = max(0, int(now_ms - st.st_mtime * 1000))
     return age <= window_ms, age
@@ -1769,7 +1781,7 @@ def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
     """
     try:
         size = os.path.getsize(path)
-    except OSError:
+    except (OSError, ValueError):
         return None, None, 0
     window = limit_bytes
     last_entry = None
@@ -1781,7 +1793,7 @@ def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
                 if start:
                     fh.seek(start)
                 blob = fh.read(read)
-        except OSError:
+        except (OSError, ValueError):
             return None, None, size
         lines = blob.split(b"\n")
         if start:
@@ -1964,7 +1976,7 @@ def tool_from_jsonl(
     # after the call, so the call is at least as old as the file.
     try:
         mtime_ms = int(os.stat(path).st_mtime * 1000)
-    except OSError:
+    except (OSError, ValueError):
         mtime_ms = None
     started = _iso_ms(entry.get("timestamp"))
     if started is None:
@@ -2022,7 +2034,7 @@ def session_file_for(sid: str, cwd: Optional[str], sessions_dir: str = DEFAULT_S
     for d in candidates:
         try:
             names = os.listdir(d)
-        except OSError:
+        except (OSError, ValueError):
             continue
         for name in sorted(names):
             if not name.endswith(".jsonl"):
@@ -2114,7 +2126,7 @@ def _proc_cpu_cs() -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
     root = "/proc"
     try:
         names = os.listdir(root)
-    except OSError:
+    except (OSError, ValueError):
         return None
     out: Dict[int, Tuple[int, Optional[int]]] = {}
     for name in names:
@@ -2122,7 +2134,7 @@ def _proc_cpu_cs() -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
             continue
         try:
             raw = open(os.path.join(root, name, "stat"), "rb").read().decode("utf-8", "replace")
-        except OSError:
+        except (OSError, ValueError):
             continue
         # `comm` may contain spaces and parentheses: split on the LAST ')'
         close = raw.rfind(")")
@@ -2181,7 +2193,7 @@ def subtree_cpu_cs(pid: int, *, ps_bin: Optional[str] = None) -> Optional[int]:
         out = subprocess.run([ps, "-axo", "pid=,ppid=,time="],
                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              timeout=60).stdout.decode("utf-8", "replace")
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if not out.strip():
         return None
@@ -2311,7 +2323,7 @@ def gather_log_lane(
         lr.present = False
         lr.readable = False
         lr.detail = "absent:%s" % log_path
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         lr.present = True
         lr.readable = False
         lr.detail = "unreadable:%s (%s)" % (log_path, exc)
@@ -2336,7 +2348,7 @@ def gather_log_lane(
         try:
             with open(verdict_file, "r", encoding="utf-8", errors="replace") as fh:
                 raw = fh.read()
-        except OSError:
+        except (OSError, ValueError):
             raw = ""
         v, rc = parse_bound_line(raw)
         if v:
@@ -2418,7 +2430,7 @@ def gather_log_lane(
             lr.cpu_delta_cs = cpu1 - cpu0
         try:
             lr.size_delta = int(os.stat(log_path).st_size) - int(lr.size or 0)
-        except OSError:
+        except (OSError, ValueError):
             lr.readable = False
             lr.detail = "unreadable-on-second-read:%s" % log_path
         if tsize0 is not None:
@@ -2449,7 +2461,7 @@ def _size_or_none(path: Optional[str]) -> Optional[int]:
         return None
     try:
         return int(os.path.getsize(path))
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 
@@ -2461,7 +2473,7 @@ def _log_tail(path: str, limit: int = 8192) -> str:
             if size > limit:
                 fh.seek(size - limit)
             return fh.read().decode("utf-8", "replace")
-    except OSError:
+    except (OSError, ValueError):
         return ""
 
 
@@ -2659,7 +2671,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             else:
                 try:
                     st = os.stat(path)
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     lr.readable = False
                     lr.detail = "unreadable:%s (%s)" % (path, exc.__class__.__name__)
                 else:
