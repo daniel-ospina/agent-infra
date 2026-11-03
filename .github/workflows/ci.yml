@@ -377,11 +377,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # #2818 — the pin-freshness gate below judges the PR's OWN COMMIT, not
-          # the synthetic merge GitHub checks out for `pull_request` (a merge
-          # result mixes the branch's pin with `main`'s scripts, so the verdict
-          # tracked how far `main` had moved). Depth 2 = the merge commit plus its
-          # two parents, i.e. the head tree, without a full clone.
+          # ⛔ THE PIN GATE IS NOT IN THIS JOB ANY MORE (agent-infra#3121) — it moved
+          # to the `sanctioned-pin` job, which carries its own depth-2 checkout
+          # because `--ref` needs the head commit's tree. This comment used to say
+          # "the pin-freshness gate below", and after the move that sentence was
+          # FALSE: `verify` no longer contains any step that reads it. Depth 2 is
+          # kept here only because it was already the checkout's shape and nothing
+          # in this job is known to read history at a shallower depth; a future
+          # reader must NOT re-plant the pin steps here to match this comment.
           fetch-depth: 2
       - uses: actions/setup-node@v4
         with:

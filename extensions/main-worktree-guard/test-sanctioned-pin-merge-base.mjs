@@ -268,7 +268,7 @@ try {
     // job was red for a different reason; nothing looked wrong, and the gate that
     // says "a stale pin cannot reach main silently" never ran on the PR that made
     // the pin stale (measured: PR #3103, `653b935e3`, merged with a stale pin).
-    // So the wiring is read from the job that now owns it, and (w4) below asserts
+    // So the wiring is read from the job that now owns it, and (w5) below asserts
     // the steps are ABSENT from `verify` — an arm that cannot pass while the gate
     // is skippable.
     const JOB = "sanctioned-pin";
@@ -294,12 +294,30 @@ try {
     // arm is the one that would have caught the original defect: with the steps back
     // inside that shared job, an earlier red skips them and the gate reports nothing
     // while the pin is stale. Asserted on executable YAML only (comments stripped),
-    // because `verify`'s own comments still quote these filenames.
+    // DEFENSIVELY — no line in `verify` names these files today, and a future one (a
+    // comment explaining where the gate went) must not be able to defeat the arm.
     {
       const vb = jobBlock("verify");
       const vlive = vb === null ? "" : vb.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
       expect("(w5) …and NEITHER pin step is a step of `verify` — a gate in a shared job is skippable by an unrelated red (#3121)",
         /test-sanctioned-identity\.mjs|test-sanctioned-pin-merge-base\.mjs/.test(vlive), false);
+    }
+    // ⛔ (w6) THE JOB AND ITS STEPS ARE UNCONDITIONAL. This is the invariant the whole
+    // change rests on: `skipped` is in the rail's NON_RED_CONC allow-list
+    // (`scripts/admin-merge.sh`), so a job made skippable by `if:` would report
+    // `skipped`, read as non-red, and merge — the gate silently disarmed again, with
+    // every arm above still green. `continue-on-error` is worse: the step reports
+    // `success` while the pin is stale. The repo already ships this guard for the
+    // other call-carrying job (`ci.yml` / `check-ci-lane-parity.mjs`, "refuses
+    // `if`/`needs`/`continue-on-error` … so a lane cannot be made to look wired while
+    // it never runs"); this is the same predicate for the job that now carries the gate.
+    {
+      const jb = jobBlock(JOB) || "";
+      const jlive = jb.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+      expect("(w6) …the job itself is UNCONDITIONAL — no `if:`/`needs:`/`continue-on-error:` (a `skipped` job is NON-RED to the rail)",
+        /^\s{4}(if|needs|continue-on-error):/m.test(jlive), false);
+      expect("(w7) …and neither pin STEP is conditional or allowed to fail quietly",
+        /^\s{8}(if|continue-on-error):/m.test(jlive), false);
     }
     expect("(w4) the post-merge lane collects this suite by the extensions/*/test*.mjs glob",
       /(^|\/)test[^/]*\.mjs$/.test("extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs"), true);
