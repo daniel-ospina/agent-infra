@@ -507,10 +507,15 @@ def leg_lane_census(mod):
         for msg in PREDICATE:
             bad(msg)
     else:
-        # signature: (attributed, measured, pi_count, roster_size)
-        note = fn(0, 0, 9, 7)              # no records for any rostered lane, 9 pi running
+        # signature: (alive, dead, pi_count, roster_size)
+        note = fn(0, 0, 9, 7)              # no verdict for any rostered lane, 9 pi running
         check(bool(note) and "MISMATCH" in note, PREDICATE[0])
         check(bool(note) and "9" in note and "7" in note, PREDICATE[1])
+        # ⛔ SILENCE NEEDS A VERDICT PER LANE, NOT A RECORD PER LANE (review cycle 2, finding 1):
+        # one record whose identity read ABSTAINED used to silence the whole census while 18 pi
+        # processes ran -> `✅ no suspects`, exit 0. Only `alive + dead == roster_size` may be quiet.
+        check(bool(fn(0, 0, 18, 7)) and "MISMATCH" in fn(0, 0, 18, 7),
+              "CENSUS: an ABSTAINING record does not silence the census")
         # ⛔ AN ABSTENTION MUST BE NAMED (review cycle 1, finding 2). Rendering an unreadable
         # process table as "no note" is indistinguishable from `pi_count == 0` and lets the
         # summary print `✅ no suspects` — the pre-fix false PASS, through the new gate's input.
@@ -622,7 +627,7 @@ def leg_lane_census(mod):
     # stays green under the mutation and reports a red control as MISSED.
     check("lane census INCOMPLETE" in out,
           "CENSUS: main() marks the scan INCOMPLETE so a scheduler sees it")
-    check(rc != 0,
+    check(rc == 1,
           "CENSUS: main() exits non-zero — a census that prints rows and exits 0 is the false PASS")
 
     # ⛔ THE ABSTENTION ARM (review cycle 1, finding 2): an unreadable process table must be
@@ -634,7 +639,7 @@ def leg_lane_census(mod):
           "CENSUS: main() NAMES an unreadable process table instead of reporting clean")
     check("no suspects" not in out_abs,
           "CENSUS: an unreadable process table is never rendered as a clean scan")
-    check(rc_abs != 0,
+    check(rc_abs == 1,
           "CENSUS: an unreconcilable census exits non-zero, so a scheduler can see it")
 
 
@@ -675,7 +680,7 @@ def _flatten_exit4(src):
 
 MUTATIONS = [
     ("neuter the lane-census reconciliation (the pre-fix module)",
-     _sub("    if measured > 0:\n", "    if True:\n"),
+     _sub("    if established >= roster_size:\n", "    if True:\n"),
      ["CENSUS: pi running vs a roster with no records raises the mismatch",
       "CENSUS: an UNREADABLE process table is NAMED, never rendered as agreement",
       "CENSUS: main() prints the mismatch over a readable store holding none of the roster",

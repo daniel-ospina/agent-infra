@@ -132,42 +132,46 @@ def pi_process_count():
     return n
 
 
-def lane_census(attributed, measured, pi_count, roster_size):
-    """The census note, or None when the roster and the process table are reconcilable.
+def lane_census(alive, dead, pi_count, roster_size):
+    """The census note, or None when every rostered lane carries a CONCLUSIVE verdict.
 
-    Three inputs, because the defect has three distinct shapes and collapsing them is how the
-    message ends up asserting an inference the code does not have (review cycle 1, findings 1+2):
+    ⛔ SILENCE REQUIRES A CONCLUSION PER LANE, NOT A RECORD PER LANE (review cycle 2, finding 1).
+    The previous form keyed silence on "the store has a record for some rostered lane", which
+    let a SINGLE pid-less or abstaining record silence a census in which nothing was established
+    while 18 pi processes ran — `✅ no suspects`, exit 0, the original defect one input over.
+    The only state that may be silent is `alive + dead == roster_size`: every lane either
+    positively bound to a live incarnation, or positively absent/zombie.
 
-    * `measured` -- how many rostered lanes the store even HAS a record for. This is what
-      separates "the roster is stale" (record for none of its own sessions) from "the roster is
-      accurate and every lane has exited" (records present, all positively dead). `attributed`
-      alone cannot tell those apart, and a message that says "the roster is stale" over a table
-      whose every row reads `PID DEAD` is stating a fact the code never established.
-    * `attributed` -- how many lanes the ONE verdict function positively bound to a live
-      incarnation (`observed == holder`). A lane whose identity read ABSTAINED is not attributed.
+    * `alive` -- lanes the ONE verdict function positively bound to a live incarnation (`holder`).
+    * `dead` -- lanes POSITIVELY dead (`absent` / `zombie`). An ABSTENTION (unreadable / off-fence)
+      is neither, which is the whole point: an identity read that did not happen must never be
+      counted as an established one.
     * `pi_count` -- the independent population, or None when unreadable.
 
-    ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When the roster accounts for none of its sessions
-    AND the process table cannot be read, returning None would render that state identically to
-    `pi_count == 0` -- "reconciled, nothing running" -- and the summary would print
-    `✅ no suspects` with exit 0. That is the pre-fix false PASS arriving through the new gate's
-    own input, so it gets its own UNRECONCILED note instead.
+    ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
+    table cannot be read, returning None would render that state identically to `pi_count == 0`
+    -- "reconciled, nothing running" -- and the summary would print `✅ no suspects` with exit 0.
+    That is the pre-fix false PASS arriving through the new gate's own input, so it gets its own
+    UNRECONCILED note instead.
     """
-    if measured > 0:
-        # Records exist for the roster's own lanes: whatever their verdicts, the roster is not
-        # stale and the process table has nothing to contradict. An all-`PID DEAD` table is a
-        # legitimate idle fleet, not an unmeasured one.
+    established = alive + dead
+    if established >= roster_size:
+        # Every rostered lane has a conclusive verdict. An all-`PID DEAD` table is a legitimately
+        # idle fleet, not a stale roster, and must not raise the alarm.
         return None
     if pi_count is None:
-        return ("LANE CENSUS UNRECONCILED: 0 of the %d rostered lanes has a record in the store "
-                "and the process table could not be read — the scan is UNMEASURED, not clean"
-                % roster_size)
+        return ("LANE CENSUS UNRECONCILED: only %d of the %d rostered lanes has a conclusive "
+                "verdict (%d alive, %d dead) and the process table could not be read — the scan "
+                "is UNMEASURED, not clean" % (established, roster_size, alive, dead))
     if pi_count <= 0:
-        # Nothing is running at all: a stale roster cannot mislead about a box with no processes.
+        # Nothing is running at all: an inconclusive roster cannot mislead about a box with no
+        # processes, so there is nothing to reconcile against.
         return None
-    return ("LANE CENSUS MISMATCH: %d pi process(es) running but 0 of the %d rostered lanes has a "
-            "record in the store — the roster is stale on this box, so every row above is "
-            "UNMEASURED (not dead, and NOT a clean result)" % (pi_count, roster_size))
+    return ("LANE CENSUS MISMATCH: %d pi process(es) running but only %d of the %d rostered lanes "
+            "has a conclusive verdict (%d alive, %d dead) — the roster is stale on this box or "
+            "its lanes are unattributable, so every row without a verdict is UNMEASURED "
+            "(not dead, and NOT a clean result)"
+            % (pi_count, established, roster_size, alive, dead))
 
 
 def walk_records(obj, out):
@@ -713,11 +717,9 @@ def main():
     print(f"{'lane':4} {'pid':>7} {'life':9} {'q':>2} {'ctx-age':>8} {'cpu-delta':>10}  flag")
     print("-" * 62)
     attributed = 0
-    measured = 0      # lanes the store has a RECORD for -- separates "stale roster" from "all dead"
+    dead = 0          # lanes POSITIVELY absent/zombie; every other non-holder is UNESTABLISHED
     for lane, sid in LANES:
         rec = hook.get(sid, {})
-        if rec:
-            measured += 1
         pid = rec.get("pid")
         life = rec.get("agentLifecycle") or "?"
         depth = rec.get("activePromptDepth")
@@ -742,6 +744,7 @@ def main():
         if observed in DEAD_OBSERVED:
             # A positively absent/zombie incarnation: the process is gone, so the
             # transcript ladder has nothing left to add.
+            dead += 1
             flag = "PID DEAD"
         else:
             # An ABSTENTION is NOT a clean bill of health. Name it, and STILL run the
@@ -775,7 +778,14 @@ def main():
     # The roster above is a frozen list; the process table is not. When the roster accounts
     # for NONE of the running pi processes, the table is not a census and must say so rather
     # than let the summary below read as a clean scan.
-    census_note = lane_census(attributed, measured, pi_process_count(), len(LANES))
+    # ⛔ NO CENSUS VERDICT WITHOUT A STORE READ (review cycle 2, finding 3). With `hook_ok` False
+    # every lane is `measured == 0`, so the census would report "the roster is stale on this box"
+    # beside "hook store unreadable" — asserting a cause it never established, and pointing an
+    # operator at editing the roster when the STORE READ is the fault. The store failure already
+    # has its own INCOMPLETE path below; the census simply has nothing to say about a roster it
+    # could not read.
+    census_note = (lane_census(attributed, dead, pi_process_count(), len(LANES))
+                   if hook_ok else None)
     if census_note:
         print()
         print(f"⚠️  {census_note}")
