@@ -16,19 +16,18 @@
       "cost": "~$0.005/query flat; zero cost while sleeping (lazy)"
     },
     "tortoise": {
-      "command": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}/.venv/bin/python3",
-      "args": [
-        "-m",
-        "tortoise.mcp_server"
-      ],
-      "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-      "env": {
-        "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-        "TORTOISE_DB_URI": "docker://:@127.0.0.1:16379/tortoise"
+      "_comment": "HOSTED Tortoise MCP over HTTP. This replaced the legacy stdio entry (${TORTOISE_HOME}/.venv/bin/python3 -m tortoise.mcp_server + a local TORTOISE_DB_URI=docker://...:16379) that needed a tortoise checkout, a venv AND a local FalkorDB — none of which exists on a cmux cloud cell, which is why pi-bootstrap/cell-install.sh refused to install this file on cells at all and every fleet lane on a cell ran with ZERO MCP servers, writing GRAPH-UNREACHABLE into its report. The DB target is resolved SERVER-SIDE (FALKORDB_CLOUD_URI), so a client needs only the endpoint and the key. Auth is env-indirect: ${TORTOISE_API_KEY} is canonical (#5153/#5343) and TORTOISE_MCP_API_KEY is the fleet alias, which must be aliased because a plain ${VAR} expands to the EMPTY STRING when unset and the server then answers 401 instead of failing loudly. lazy=true is deliberate: the hosted server's cold handshake routinely exceeds pi's default MCP connect budget, and this entry now lands on memory-constrained cells where a core server would block every session start. Self-host users point url at their own daemon instead (http://localhost:8000/mcp — docs/quickstart-selfhosted.md).",
+      "type": "http",
+      "url": "https://api.premiselabs.co/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${TORTOISE_API_KEY}"
       },
-      "purpose": "Memory graph (Tortoise) — cross-session knowledge",
-      "whenToLoad": "always (core)",
-      "cost": "one python process (venv has fastmcp)"
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "timeoutMs": 60000,
+      "purpose": "Memory graph (Tortoise, hosted) — read before you derive, write what you learn",
+      "whenToLoad": "any lane: graph read before research, write-back after (`mcp_load tortoise`)",
+      "cost": "one HTTP session; lazy, so nothing is paid while it sleeps"
     },
     "playwright-browser": {
       "command": "npx",

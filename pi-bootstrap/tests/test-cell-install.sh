@@ -165,6 +165,7 @@ expected_farm_rows() {
   local name dest src rest rel base line req
   for spec in "fleet_srcs||scripts|required" \
               "merge_gate_srcs||scripts|required" \
+              "graph_srcs||scripts|required" \
               "lib_srcs|lib|scripts/lib|required" \
               "fleet_tools|fleet|tools/fleet|required" \
               "lane_root_srcs||scripts|optional" \
@@ -335,6 +336,29 @@ else
 fi
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("defaultProvider") else 1)' \
   "$DEST/settings.json" && ok "settings.json installed and valid" || fail "settings.json missing or invalid"
+
+# (m) the HOSTED graph MCP (graph-mcp-provision). Before this, a cell had NO .mcp.json at all,
+# so the owner's "every lane reads and writes the graph through the MCP" mandate was unobeyable
+# there and every lane wrote GRAPH-UNREACHABLE. Pinned on the ARTIFACT: the entry is HTTP (not
+# the legacy stdio command that needs a checkout+venv a cell does not have), the header is
+# env-indirect, and no credential is written into the shared file.
+if [ -f "$DEST/.mcp.json" ]; then
+  python3 - "$DEST/.mcp.json" <<'PY' && ok ".mcp.json carries the HOSTED tortoise entry (http + env-indirect Bearer, no literal key)" \
+    || fail ".mcp.json landed but not as the hosted entry (stdio shape, a literal credential, or no entry)"
+import json, re, sys
+raw = open(sys.argv[1]).read()
+t = (json.loads(raw).get("mcpServers") or {}).get("tortoise") or {}
+a = ((t.get("headers") or {}).get("Authorization") or "")
+ok = (not t.get("command")) and (t.get("type") == "http") and bool(t.get("url")) \
+     and "${" in a and not re.search(r"\b(t[tk])_[A-Za-z0-9]{10,}", raw)
+sys.exit(0 if ok else 1)
+PY
+else
+  fail ".mcp.json was NOT installed — the cell has zero MCP servers (no lane can reach the hosted graph)"
+fi
+# the hosted-graph FALLBACK half must land executable — the documented invocation TYPES the path
+[ -x "$DEST/scripts/tortoise-graph.sh" ] && ok "the hosted-graph fallback landed executable (scripts/tortoise-graph.sh)" \
+  || fail "scripts/tortoise-graph.sh missing or not executable — the documented fallback invocation would fail"
 [ -f "$DEST/agents/verifier.md" ] && ok "sub-agent definitions installed (agents/verifier.md)" \
   || fail "agents/ not installed — a cell lane cannot dispatch a reviewer sub-agent"
 if [ -d "$DEST/tools" ] && [ -n "$(ls -A "$DEST/tools" 2>/dev/null)" ]; then
@@ -988,6 +1012,33 @@ run_verify
 [ $? -eq 0 ] && ok "a cell-local extra in an extension directory is tolerated (extras survive, drift does not)" \
   || fail "--verify refused a cell-local extra — a false block the installer cannot repair"
 rm -f "$DEST/extensions/review-enforcer/cell-local-helper.ts"
+
+# The hosted-graph entry is verified on the ARTIFACT, so a hand-edited or stale cell copy is
+# refused BY NAME rather than certified. Three shapes that a lane cannot fix from inside the
+# lane: the LEGACY stdio entry (needs a checkout+venv+FalkorDB a cell does not have), a LITERAL
+# credential written into the shared file, and a missing file. Each must fail --verify.
+cp "$DEST/.mcp.json" "$DEST/.mcp.json.keep"
+for shape in stdio literal; do
+  python3 - "$DEST/.mcp.json" "$shape" <<'PY'
+import json, sys
+p, shape = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+t = d["mcpServers"]["tortoise"]
+if shape == "stdio":
+    d["mcpServers"]["tortoise"] = {"command": "/x/.venv/bin/python3", "args": ["-m", "tortoise.mcp_server"]}
+else:
+    # built at runtime on purpose: the POINT of this case is a literal token IN the file, and
+    # spelling one here would trip the transcript redactor without testing anything more.
+    t["headers"] = {"Authorization": "Bearer " + "t" + "t" + "_" + "A" * 24}
+json.dump(d, open(p, "w"))
+PY
+  run_verify
+  [ $? -eq 1 ] && grep -q "\.mcp.json's tortoise entry is not the hosted shape" "$LOG" \
+    && ok "--verify refuses a .mcp.json with the $shape tortoise entry (the cell must not be started)" \
+    || fail "--verify CERTIFIED a .mcp.json with the $shape tortoise entry"
+  cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
+done
+rm -f "$DEST/.mcp.json.keep"
 # skills/ was `[ -d ]` plus a non-empty `ls` until #1723's `--check` began verifying BEFORE it
 # installs: a cell holding 1 of the checkout's 124 SKILL.md files passed that check, so the fast
 # path would CERTIFY it and skip the re-copy that repairs it. It now compares the WHOLE tree —

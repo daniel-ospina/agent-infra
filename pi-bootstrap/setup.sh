@@ -869,6 +869,15 @@ fi
 # its own location and fails CLOSED without it, so shipping one without the other produces a gate
 # that refuses EVERY admin merge.
 merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh)
+# The hosted-graph FALLBACK half (graph-mcp-provision). The MCP entry in
+# templates/.mcp.base.json is the PRIMARY path; this script is what a lane can still use when
+# the MCP client is unavailable from inside the session (#10605: ${TORTOISE_API_KEY} expanded
+# at process start, so the client sends an EMPTY Bearer while the same key authenticates a
+# direct POST). It existed only as a hand-written file on two boxes and in no repo, so a
+# rebuilt machine lost it silently — farming it is what makes it durable.
+# Keep this array ONE LINE: pi-bootstrap/cell-install.sh parses every top-level `name=(...)`
+# array in this file as a FARM and dies on one it cannot map (FARM_LAYOUT).
+graph_srcs=(tortoise-graph.sh tortoise_graph_client.py)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
 merge_gate_names=""
@@ -903,6 +912,34 @@ done
 # DERIVED from the array, never hard-coded: a summary that omits a name it farmed misreports the
 # farm, and the suite pins every declared entry against this line (#1897 precedent).
 echo "    scripts merge-gate farm: $merge_gate_copied copied (${merge_gate_names:-none} — #562, #984, #2287)"
+
+# ── the hosted-graph FALLBACK farm (graph-mcp-provision) ─────────────────────
+# `tortoise-graph.sh` (+ its python client) is what a lane falls back to when the MCP client
+# cannot reach the graph from inside the session (#10605). It was hand-written on two boxes and
+# existed in NO repo, so a rebuild lost it in silence — the first fleet-wide attempt to put the
+# MCP on the cells found it absent on two of three. Farmed here so it is DELIVERED, not remembered.
+# Same real-copy + chmod discipline as the merge-gate farm above, and the same reason: the
+# documented invocation TYPES the path, so a copy without `x` is a seam nobody can run.
+graph_copied=0
+graph_names=""
+for base in "${graph_srcs[@]}"; do
+  farm_declared_rel+="scripts/$base"$'\n'
+  f="$INFRA_ROOT/scripts/$base"
+  if [ ! -f "$f" ]; then
+    echo "    scripts graph farm: MISSING $f — the hosted-graph fallback would not land" >&2
+    farm_missing+="scripts/$base"$'\n'
+    continue
+  fi
+  dest="$DEST/scripts/$base"
+  if [ -L "$dest" ]; then rm -f "$dest"; fi
+  if cp -f "$f" "$dest" && chmod +x "$dest" 2>/dev/null; then
+    graph_copied=$((graph_copied+1)); graph_names+="${graph_names:+, }$base"
+  else
+    echo "    scripts graph farm: COPY FAILED for $f" >&2
+    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+  fi
+done
+echo "    scripts graph farm: $graph_copied copied (${graph_names:-none} — hosted-graph fallback, graph-mcp-provision)"
 
 # ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
 # Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is

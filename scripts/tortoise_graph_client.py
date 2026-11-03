@@ -121,7 +121,10 @@ def main(argv):
         if not rest:
             sys.stderr.write("usage: tortoise-graph.sh get <point-id>\n")
             return 2
-        print(tool("tortoise_get_point", {"point_id": rest[0]}))
+        # ⛔ The served handler is `tortoise_get_point(id: str)` (tortoise/mcp_server.py).
+        # `point_id` is NOT a parameter of any tool on the surface — passing it fails argument
+        # validation with "required id missing", so `get` was dead on this client.
+        print(tool("tortoise_get_point", {"id": rest[0]}))
         return 0
 
     if verb == "stats":
@@ -183,7 +186,12 @@ def main(argv):
                 sys.exit(4)
             print(tool("tortoise_create_operator", {
                 "op_type": "IMPL", "source_id": src,
-                "target_ids": [to], "label": pred, "direction": "unidirectional",
+                # ⛔ `tortoise_create_operator` takes
+                # (op_type, source_id, target_ids, direction, semantics) — there is NO `label`
+                # parameter on the tool, so passing one drops the predicate (or is rejected AFTER
+                # the point was already written, which reports a partial success). The predicate
+                # goes in `semantics`, whose closed vocabulary is what also resolves direction.
+                "target_ids": [to], "semantics": pred, "direction": "unidirectional",
             }))
         return 0
 
