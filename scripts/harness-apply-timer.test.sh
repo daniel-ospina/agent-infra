@@ -40,6 +40,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INST="$HERE/install-harness-apply-timer.sh"
 PASS_SH="$HERE/harness-apply-pass.sh"
+# ⛔ THE DEPLOYED-DRIFT SEAM IS OFF BY DEFAULT *IN THIS SUITE* (#10114, review P1). Without this the
+# pass shelled out to the REAL `check-deployed-drift.sh`, which scans the REAL `$HOME` — the suite pins
+# HARNESS_REPO/CELL_HOME/O but not HOME — so whether a case was green depended on what the developer's
+# box happened to be running. It stayed green here only because a stub repo makes the checker exit 2.
+# T24 below turns the seam back ON with a stub checker, which is the arm that is actually being tested.
+export HARNESS_APPLY_DRIFT_CHECK=0
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
@@ -367,7 +373,150 @@ printf '#!/usr/bin/env bash\necho "SHOULD NOT RUN" >&2; exit 9\n' >"$T/t18c/mat.
 OUT="$(HARNESS_MATERIALISER="$T/t18c/mat.sh" run_pass "$T/t18c" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T18 a converged PIN with a lagging checkout is a NO-OP (exit 0)"
 assert_absent "$OUT" "SHOULD NOT RUN" "T18 and the materialiser was not called at all"
+# ⛔ THIS ASSERTION BELONGS TO T18, and it must read T18's `OUT` (review P2). T24 below reassigns `OUT`
+# three times; left after it, this line measured the WRONG run and passed only by coincidence (T24's
+# converged pass logs a no-op of its own), so a regression in T18's pin-mode verdict would have shipped
+# green under a label claiming to check it.
 assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
+
+# ── T24: THE DEPLOYED-DRIFT ARM (#10114) — the one branch that turns a green pass RED ────────────
+# This is the arm that closes the silent no-op, so it is the arm that must be PINNED, not assumed.
+# Two directions, because a check that reds too much is as useless as one that never reds:
+#   executes:<dir>  → a live controller runs a tree this box does not have → the pass must FAIL
+#   behind:<sha>    → a copy at rest differs                                → the pass must NOT fail
+# Both stubs exit 1, exactly as the real `check-deployed-drift.sh` does, so the ONLY thing that can
+# distinguish them is the token.
+say_case "T24 a stale EXECUTING tree reds the pass; other drift does not"
+mk_origin t24; mk_clone t24
+REPO_P="$CLONE"; MODE_P=pin
+WANT24="$(advance_origin t24 A.txt "upstream for the drift case")"
+mkdir -p "$T/t24/home/.pi/agent/state"
+git -C "$CLONE" fetch -q origin main >/dev/null 2>&1
+git -C "$CLONE" worktree add --detach "$T/t24/pin" "$WANT24" >/dev/null 2>&1
+mkdir -p "$T/t24/pin/scripts/orchestrator-harness"
+printf '%s\n' "$WANT24" >"$T/t24/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$T/t24/pin/scripts/orchestrator-harness" >"$T/t24/home/.harness-path"
+printf '#!/usr/bin/env bash\necho "harness=executes:/gone/709dfb06eac2/scripts/orchestrator-harness"\nexit 1\n' >"$T/t24/drift-exec.sh"
+printf '#!/usr/bin/env bash\necho "harness=behind:709dfb06eac2"\nexit 1\n' >"$T/t24/drift-behind.sh"
+chmod +x "$T/t24/drift-exec.sh" "$T/t24/drift-behind.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-exec.sh" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T24 a live controller on a GONE tree fails an otherwise-successful pass (rc 1)"
+assert_contains "$OUT" "deployed-drift" "T24 and the refusal is NAMED, not a silent green"
+assert_contains "$OUT" "executes:/gone" "T24 and it names the tree that is actually executing"
+assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "action=deployed-drift" "T24 and the durable record says what happened, not the log alone"
+# ⛔ THE REFUSAL TEXT ITSELF (review round 6, P1). A pair of BACKTICKS inside this double-quoted
+# assignment was executed as command substitution when the arm fired: the incident line printed
+# `<script>: line 644: executes:: command not found` and the sentence silently lost its token
+# ("and an  state always has a live controller"). Control flow was unaffected, so nothing caught it.
+# This asserts the prose survives intact, which is the only way that class is observable.
+assert_contains "$OUT" "an executes: state always has a live controller" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
+# ⛔ THE REMEDY MUST BE PASTEABLE ON THE BOX IT FIRES ON (review P2, #10114). Nothing in this fleet puts
+# `cloud-cell-supervisor.sh` on PATH (`command -v` is empty on a deployed cell; the farm keeps it BESIDE
+# this pass at `~/.pi/agent/scripts/`), so a remedy naming the BARE command is `command not found`
+# exactly where the red fires — the same class round 5 fixed for `--force`, one edit further along.
+# Asserted on the RECORD's own `remedy=` field, because that is the copy a lane reads the next day.
+assert_contains "$(grep '^remedy=' "$T/t24/state/harness-apply.status" 2>/dev/null)" "scripts/cloud-cell-supervisor.sh apply --force --pin-only" "T24 the remedy names a RESOLVED path, not a bare command name (a farmed cell has none on PATH)"
+assert_absent "$(grep '^remedy=' "$T/t24/state/harness-apply.status" 2>/dev/null)" "remedy=cloud-cell-supervisor.sh" "T24 …and it does not start with the unresolvable name (the exact pre-change spelling)"
+# ⛔ DISCOVERY ITSELF (review round 8, P2). Every assertion above hands the checker over through
+# HARNESS_APPLY_DRIFT_CMD, so the candidate search — the thing this lane had to fix three times because
+# it was dead in the deployed shape — was executed by NO test. Candidate 1 shadows any fixture on this
+# box, so the search root is overridable; that makes both ends assertable, including `absent`, which
+# is the arm that leaves the pass GREEN and is therefore the one that must be pinned.
+mkdir -p "$T/t24/found" "$T/t24/empty"
+printf '#!/usr/bin/env bash\necho "harness=current"\nexit 0\n' >"$T/t24/found/check-deployed-drift.sh"
+chmod +x "$T/t24/found/check-deployed-drift.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t24/found" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 a checker FOUND through the search root reads clean and does not red the pass"
+assert_contains "$OUT" "deployed_drift=clean" "T24 and it says it actually looked"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_DIR="$T/t24/empty" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_contains "$OUT" "deployed_drift=not-run" "T24 an ABSENT checker is named as not-run, never a silent clean"
+assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "drift=not-run" "T24 and the record carries it, not just the log"
+# ⛔ THE FOUR-CANDIDATE SEARCH ITSELF WAS STILL EXECUTED BY NO TEST (review round 21, P2). Every case
+# above supplies a checker through HARNESS_APPLY_DRIFT_CMD or REPLACES the search root, so the production
+# candidate LIST — the arm that was DEAD on every deployed box, twice — was never run. The FARMED copy is
+# the shape that matters: `$HERE` carries neither the checker nor an `orchestrator-harness/` subdir, so
+# candidates 1-2 cannot match and the reading can only come from `$AGENT_INFRA_PATH` (3) or `$O` (4).
+# Both stubs answer DIFFERENTLY, so which candidate was found is observable in the verdict, not assumed.
+mkdir -p "$T/t24/farm/scripts" "$T/t24/ai/scripts/orchestrator-harness" "$T/t24/home/orchestrator"
+cp "$PASS_SH" "$T/t24/farm/scripts/harness-apply-pass.sh"
+printf '#!/usr/bin/env bash\necho "harness=current"\nexit 0\n' >"$T/t24/ai/scripts/orchestrator-harness/check-deployed-drift.sh"
+printf '#!/usr/bin/env bash\necho "harness=executes:/farmed/gone/scripts/orchestrator-harness"\nexit 1\n' >"$T/t24/home/orchestrator/check-deployed-drift.sh"
+chmod +x "$T/t24/ai/scripts/orchestrator-harness/check-deployed-drift.sh" "$T/t24/home/orchestrator/check-deployed-drift.sh"
+run_farmed() { # <AGENT_INFRA_PATH> — the pass AS DEPLOYED (no sibling checker), discovery left ON
+    local infra="$1"
+    shift
+    HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+    HARNESS_APPLY_STATE_DIR="$T/t24/farmstate" HARNESS_APPLY_MODE=pin \
+    HARNESS_PIN="$T/t24/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t24/home/.harness-path" \
+    HARNESS_PIN_DIR="$T/t24/home/harness" CELL_HOME="$T/t24/home" O="$T/t24/home/orchestrator" \
+    AGENT_INFRA_PATH="$infra" HARNESS_APPLY_DRIFT_CHECK=1 \
+    bash "$T/t24/farm/scripts/harness-apply-pass.sh" "$@"
+}
+OUT="$(run_farmed "$T/t24/ai" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 the FARMED shape finds candidate 3 (\$AGENT_INFRA_PATH) and reads clean"
+assert_contains "$OUT" "deployed_drift=clean" "T24 …and the arm that was dead on every deployed box actually ran"
+# ⛔ THE RECORD IS THE ARTIFACT, NOT THE LOG (review round 22, P1). Every clean assertion above reads
+# the LOG; only the `not-run` arm two cases down asserts the durable `drift=` FIELD. That asymmetry is
+# the whole defect: the P0 was `drift=clean:rc=0` — the pass certifying a box from a checker that gave
+# no verdict — and a record that falls back to `rc=0` is invisible to a log-line assertion. Mutation
+# MEASURED: appending `| grep -v '^current$'` to the token reader in `harness-apply-pass.sh` restores
+# `drift=clean:rc=0` (the original defect) with this suite still 217/0. `docs/ops/harness-apply.md`
+# documents `drift=clean:current` as the clean value a reader keys on, so the record must be pinned.
+# ⛔ AND ANCHOR THE MATCH TO THE FIELD LINE, NOT THE FILE (review round 23, P1). `write_record` writes
+# the token TWICE — as the `drift=` field AND inside `detail=` (`drift=$DRIFT_STATE:$DRIFT_TOKEN`) — so
+# a whole-file grep is satisfied by the `detail=` prose even when the FIELD has lost its token.
+# MEASURED: dropping the token from the field writer alone (`printf 'drift=%s\n' "${DRIFT_STATE:-not-run}"`)
+# left this suite at 218/0, and the token survived only in `detail=`. `detail=` is the string truncated at
+# 240 chars and whose own comment says not to key on it; the field is the durable artifact, so the
+# assertion is `grep '^drift='` and nothing else can satisfy it.
+assert_contains "$(grep '^drift=' "$T/t24/farmstate/harness-apply.status" 2>/dev/null)" "drift=clean:current" "T24 …and the RECORD's drift= FIELD carries the documented value, not rc=0"
+OUT="$(run_farmed "" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T24 with no \$AGENT_INFRA_PATH the search falls through to candidate 4 (\$O) — the PRODUCTION find"
+assert_contains "$OUT" "executes:" "T24 …and that find reds the pass, not just prints a token"
+# ⛔ THE SCHEDULER'S OWN SHAPE — no AGENT_INFRA_PATH, no checker in $O (review P2, #10114). The unit
+# (`templates/systemd/eldato-harness-apply.service:31`) exports HARNESS_APPLY_REPO and NOT
+# AGENT_INFRA_PATH, and `pi-bootstrap`'s fleet_srcs farms this pass without the checker — so on a box
+# whose $O carries no checker, EVERY pre-change candidate missed while the checker sat in the checkout
+# the pass governs. The verdict was then `drift=not-run:absent` on every tick and fleet-health alarmed
+# about a checker the box had. Stub answers MUST differ from the other candidates', so the assertion
+# proves candidate 5 was the one found rather than inferring it.
+mkdir -p "$T/t24/home/emptyO" "$REPO_P/scripts/orchestrator-harness"
+printf '#!/usr/bin/env bash\necho "harness=behind:709db06eac2"\nexit 1\n' >"$REPO_P/scripts/orchestrator-harness/check-deployed-drift.sh"
+chmod +x "$REPO_P/scripts/orchestrator-harness/check-deployed-drift.sh"
+run_farmed_repo() { # the unit's exact shape: REPO exported, AGENT_INFRA_PATH absent, $O without a checker
+    # ⛔ `AGENT_INFRA_PATH=` IS LOAD-BEARING, NOT TIDINESS: unset, this suite INHERITS the runner's own
+    # value and candidate 3 matches the real repo's checker — the assertion then measures THIS BOX, not
+    # the candidate under test (measured: the run reported the real checker's `UNKNOWN:` message and the
+    # case passed the wrong arm). The unit exports no such variable, so empty IS the production shape.
+    HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+    AGENT_INFRA_PATH= \
+    HARNESS_APPLY_STATE_DIR="$T/t24/repofindstate" HARNESS_APPLY_MODE=pin \
+    HARNESS_PIN="$T/t24/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t24/home/.harness-path" \
+    HARNESS_PIN_DIR="$T/t24/home/harness" CELL_HOME="$T/t24/home" O="$T/t24/home/emptyO" \
+    HARNESS_APPLY_DRIFT_CHECK=1 \
+    bash "$T/t24/farm/scripts/harness-apply-pass.sh" "$@"
+}
+OUT="$(run_farmed_repo 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 no \$AGENT_INFRA_PATH and no checker in \$O: the search finds the GOVERNED CHECKOUT's copy (\$REPO)"
+assert_contains "$OUT" "token=behind:709db06eac2" "T24 …and the verdict is THAT candidate's, not an absent→not-run"
+assert_absent "$OUT" "token=absent" "T24 …and it is not the un-actionable alarm (a checker sat in \$REPO all along)"
+# ⛔ AND THE PREVIEW ANSWERS THE SAME QUESTION (review round 21, P2). `--dry-run` used to exit BEFORE
+# `read_deployed_drift`, so the read-only verb — the one an operator uses to inspect a box without
+# changing it — still could not say whether the EXECUTING tree was this repo's, while the merge evidence
+# printed that line under `--dry-run`. A preview still writes no record and still does not red a box.
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-exec.sh" run_pass "$T/t24" --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 --dry-run still changes nothing (a preview must not red a box)"
+assert_contains "$OUT" "deployed_drift=drift" "T24 and the preview REPORTS the executing-tree reading instead of hiding it"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-behind.sh" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 a copy at rest that is merely BEHIND does NOT red the pass"
+assert_contains "$OUT" "deployed_drift=drift" "T24 and it is still REPORTED, so it is not silent either"
+# A CANNOT-VERIFY CHECKER IS NOT A RED ONE, AND NOT A SILENT ONE either: the reason is logged (the
+# record's `detail=` truncates at 240 chars, so the log is the only place it survives).
+printf '#!/usr/bin/env bash\necho "UNKNOWN: the process table could not be read"\nexit 2\n' >"$T/t24/drift-unknown.sh"
+chmod +x "$T/t24/drift-unknown.sh"
+OUT="$(HARNESS_APPLY_DRIFT_CHECK=1 HARNESS_APPLY_DRIFT_CMD="$T/t24/drift-unknown.sh" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 a checker that cannot verify does not by itself red a converged box"
+assert_contains "$OUT" "deployed_drift_unknown=UNKNOWN: the process table could not be read" "T24 but its REASON is kept, never a bare rc"
 
 # ── T15: a dirty TRACKED SYMLINK is restored as a symlink, never written THROUGH ─────────────
 # MEASURED IN REVIEW: redirecting the blob at `$REPO/$p` followed the symlink and overwrote the CLEAN
@@ -543,6 +692,7 @@ assert_contains "$OUT" "cannot-verify" "T21 and it says the comparison is not fr
 REC21="$(cat "$T/t21/state/harness-apply.status" 2>/dev/null || true)"
 assert_contains "$REC21" "fetch=failed" "T21 the record carries the fetch state"
 assert_contains "$REC21" "action=cannot-verify-fetch" "T21 and the action names it"
+assert_contains "$REC21" "remedy=restore the fetch" "T21 and the REMEDY survives the record (review round 3, finding 5: it was written, never asserted)"
 OUT="$(run_pass "$T/t21" --print-status 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T21 the readiness gate refuses that record (cannot-verify is not fresh)"
 # The OTHER way to be un-fresh: no fetch was attempted at all (the documented HARNESS_FETCH=0 seam). Same
