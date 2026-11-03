@@ -1209,7 +1209,14 @@ refusal_class() {
   esac
   if [ -n "${REV_AFTER:-}" ]; then REV_CLASS="server"; return 0; fi
   case "${REV_REMAINING:-}" in
-    0)  REV_CLASS="primary" ;;
+    # ⛔ `remaining: 0` IS STILL A STAMPED HEADER, NOT A FACT ABOUT THIS REFUSAL. GitHub writes
+    # `x-ratelimit-*` onto PERMISSION denials too, and a denial that lands while the bucket happens
+    # to read 0 wrote a box-wide window from ITS reset (measured: 403 `Resource not accessible by
+    # integration` + `remaining: 0` + a 900 s reset → a 900 s cooldown, where the pre-change shim
+    # wrote none) — #3230's shape for every OTHER lane, which has no budget to escape it. The
+    # reasoning that makes the non-zero arm need prose does not stop being true when the stamped
+    # value is zero, so BOTH arms require it; a real exhaustion always prints the phrase.
+    0)  if [ "${REV_PROSE:-0}" -eq 1 ]; then REV_CLASS="primary"; else REV_CLASS="not-a-limit"; fi ;;
     '') REV_CLASS="undetermined" ;;
     # ⛔ A NON-ZERO `x-ratelimit-remaining` IS NOT EVIDENCE OF A BURST BY ITSELF. GitHub stamps
     # `x-ratelimit-*` onto PERMISSION denials too (measured: a real 404/403 carried
@@ -1625,17 +1632,27 @@ run_paced() {
       # 1 s, then 3 s — <= 4 s in total, and every value is a literal so no knob can unbound it.
       case "$ttries" in 1) wait_ms=1000 ;; *) wait_ms=3000 ;; esac
       # ⛔ NO COOLDOWN AND NO `no_wait_wanted` GATE. A transport blip is not a shared window, so
-      # nothing here may park the box the way a rate-limit refusal does; and a 1 s/3 s backoff is
-      # two orders below the 60-420 s budgets the NO_WAIT contract exists to protect, so suppressing
-      # it would delete the fix for exactly the bounded callers that can least afford a dead read.
-      transport_note "transport retry $ttries/$TRANSPORT_ATTEMPTS ($treason)"
-      release_slot
-      sleep_ms "$wait_ms"
-      # Charged like every other wait: the budget is the SUM this call sleeps, not the rate-limit
-      # share of it. (Two literals, <= 4 s — it cannot move the ceiling on its own, but a budget that
-      # silently omits one arm is not the ceiling its own comment promises.)
-      SPENT_MS=$(( SPENT_MS + wait_ms ))
-      continue
+      # nothing here may park the box the way a rate-limit refusal does.
+      # ⛔ BUT IT IS STILL CHARGED **AND** GATED BY `AGENT_GH_GATE_BUDGET_S`. Charging it while never
+      # checking it made the documented ceiling ("the most this call may SLEEP in-shim, ALL waits
+      # combined") false by up to 4 s — measured with `AGENT_GH_GATE_BUDGET_S=0`: 3 invocations and
+      # 4.8 s of in-shim sleep under a declared 0 s ceiling. A caller sizes its own timeout against
+      # that number, so the arm is gated exactly like the rate-limit one; when the backoff does not
+      # fit, the call falls through to the exhaustion note below instead of continuing.
+      left=$(( BUDGET_MS - SPENT_MS ))
+      [ "$left" -lt 0 ] && left=0
+      if [ "$wait_ms" -gt "$left" ]; then
+        gate_note "transport retry $ttries/$TRANSPORT_ATTEMPTS was not taken: its $(( wait_ms / 1000 ))s backoff does not fit what is left of this call's $(( BUDGET_MS / 1000 ))s budget"
+      else
+        transport_note "transport retry $ttries/$TRANSPORT_ATTEMPTS ($treason)"
+        release_slot
+        sleep_ms "$wait_ms"
+        # Charged like every other wait: the budget is the SUM this call sleeps, not the rate-limit
+        # share of it. (Two literals, <= 4 s — it cannot move the ceiling on its own, but a budget
+        # that silently omits one arm is not the ceiling its own comment promises.)
+        SPENT_MS=$(( SPENT_MS + wait_ms ))
+        continue
+      fi
     fi
     # Name the exhaustion — but ONLY when the call ACTUALLY died of transport, and only with the
     # attempt count that really happened (review of #2768, P2): a transport blip followed by an

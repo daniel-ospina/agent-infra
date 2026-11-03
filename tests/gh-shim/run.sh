@@ -1828,6 +1828,62 @@ _h1="$(date +%s)"
   && pass "  …and the retry is not taken once the budget is spent" \
   || fail "the call retried after its budget was spent ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
 
+# (i) ⛔ THE TRANSPORT BACKOFF IS GATED BY THE SAME CEILING IT IS CHARGED TO (#3230 review cycle 2,
+# P2). Charging it while never checking it made "ALL waits combined" false by up to 4 s — measured
+# with BUDGET_S=0: 3 invocations and 4.8 s of in-shim sleep under a declared 0 s ceiling.
+cat > "$TMP/rl-transport" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf 'error connecting to api.github.com\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-transport"
+GDIR="$(gate_dir rl-transport)"; GCOUNT="$TMP/rl-i-count"; GTIMES="$TMP/rl-i-times"; GHSEEN="$TMP/rl-i-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+_i0="$(date +%s)"
+AGENT_GH_REAL="$TMP/rl-transport" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_BUDGET_S=0 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>/dev/null; rc=$?
+_i1="$(date +%s)"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "a transport blip under a 0 s budget is ONE invocation, not a 4 s backoff" \
+  || fail "the transport backoff ignored the budget ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
+[ $(( _i1 - _i0 )) -le 1 ] \
+  && pass "  …and it returns in $(( _i1 - _i0 ))s, inside its own 0 s ceiling" \
+  || fail "the call slept $(( _i1 - _i0 ))s under a 0 s budget"
+
+# (j) ⛔ `remaining: 0` IS STILL A STAMPED HEADER. A permission 403 that lands while the bucket reads
+# 0 wrote a box-wide window from its reset (measured: a 900 s cooldown, where the pre-change shim
+# wrote none) — #3230's shape, for every OTHER lane on the box.
+cat > "$TMP/rl-perm0" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf '> GET /user HTTP/1.1\n' >&2
+printf '< HTTP/2.0 403 Forbidden\n' >&2
+printf '< X-Ratelimit-Limit: 5000\n' >&2
+printf '< X-Ratelimit-Remaining: 0\n' >&2
+printf '< X-Ratelimit-Reset: %s\n' "$(( $(date +%s) + 900 ))" >&2
+printf '{"message":"Resource not accessible by integration"}\n' >&2
+printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-perm0"
+GDIR="$(gate_dir rl-perm0)"; GCOUNT="$TMP/rl-j-count"; GTIMES="$TMP/rl-j-times"; GHSEEN="$TMP/rl-j-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+AGENT_GH_REAL="$TMP/rl-perm0" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_RETRY_BASE=1 AGENT_GH_GATE_BUDGET_S=20 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>/dev/null; rc=$?
+ls "$GDIR"/cooldown.* >/dev/null 2>&1 \
+  && fail "a permission 403 with remaining: 0 wrote a box-wide cooldown ($(cat "$GDIR"/cooldown.* | head -1))" \
+  || pass "a permission 403 with remaining: 0 writes NO box-wide window (the header is not a fact)"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "  …and it is not retried as an exhausted bucket" \
+  || fail "a permissions refusal was retried as a primary exhaustion ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
   exit 1
