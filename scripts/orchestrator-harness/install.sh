@@ -40,9 +40,9 @@ OR="${OR:-}"
 # Portable core count, IDENTICAL to orch-loop.sh's line. install.sh itself refuses to run off macOS
 # (it renders a launchd plist), but selftest §7 EVALUATES this assignment on whatever host runs the
 # suite and compares it with the loop's — so on a Linux host a divergence here would resolve
-# MAX_LOAD=40 against the loop's cores*10 and fail a check for a difference with no runtime effect.
+# MAX_LOAD=10 against the loop's 2.5 x cores and fail a check for a difference with no runtime effect.
 # sysctl -n hw.ncpu is a macOS-only key and sysctl is absent from a minimal Linux userland
-# (debian:stable-slim ships no procps): in the LOOP that silently pinned _NCPU=4, MAX_LOAD=40 (#1702).
+# (debian:stable-slim ships no procps): in the LOOP that silently pinned _NCPU=4, MAX_LOAD=40 (#1702; the fallback is now 10).
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 # ⛔ THE GUARD, NOT JUST THE LINE (P3, third review round, 2026-10-14). The comment above calls this
 # assignment "IDENTICAL to orch-loop.sh's line" — the LINE was, the PROTECTION was not: orch-loop.sh
@@ -64,12 +64,16 @@ is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 is_limit "${_NCPU:-}"   || _NCPU=4
 # A 0-valued probe is a FAILED probe, not "no cores": the identical line is in orch-loop.sh.
 [ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
-MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+# ⛔ 2.5 x CORES, NOT 10 x CORES (owner rule, 2026-11-03), IDENTICAL to orch-loop.sh — this is the line
+# that SUBSTITUTES __MAX_LOAD__ into the live plist, so leaving `* 10` here would render a ceiling of
+# 100 onto a 10-core box on every fresh install while the loop's own default said 25. `docs/ops/`
+# load-policy.md already documents 2.5 x cores as the operating point.
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 5 / 2 ))}"
 # The same two guards the loop applies, for the same reason: the first fallback re-derives from the
 # SAME `_NCPU`, so it cannot repair an out-of-range PRODUCT (a 9-digit probe yields a 10-digit value
 # that `[ -ge ]` never binds); only a true default does. `is_limit` must NOT reject `0` — it also
 # validates plist limits where 0 is legal (see the `0) : ;;` arm below).
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=10
 # ⛔ CAPACITY GATES DISPATCH, NOT A LANE COUNT (owner ruling, 2026-10-17): "dispatch should be gated
 # on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x
 # the number of CPUs". Both numbers in play here were LANE COUNTS, neither derived from cores: the
@@ -79,21 +83,24 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # capacity was available. A 4-core box got the same 4 that the HARDWARE should have decided.
 # Same rule as MAX_LOAD above, same `_NCPU` probe, same guards (see the block above).
 # A box only picks the derived default up on a fresh render: the live plist PINS the number.
-# Integer division, so it FLOORS: 10 cores -> 25, 4 -> 10, 3 -> 7. An EXPLICIT MAX_LANES (env /
-# plist / keys.env) still WINS and is never recomputed HERE — refusing or replacing an operator's pin
-# is the loop's decision, not the renderer's. The pin reaches the controller through $ENV_FILE, and
+# ⛔ THE LANE COUNT IS NOT THE CAPACITY CEILING (2026-11-03). 2.5 x cores is the LOAD ceiling above;
+# the lane cap expresses workstream guidance (≲10-12 on 10 cores), so `cores + 2`. The 2026-10-17
+# ruling's intent — "gated on capacity, not on number of lanes" — is served BETTER here, because the
+# load gate now binds first on every box (cores+2 < 2.5 x cores for cores >= 2). An EXPLICIT MAX_LANES
+# (env / plist / keys.env) still WINS and is never recomputed HERE — refusing or replacing an operator's
+# pin is the loop's decision, not the renderer's. The pin reaches the controller through $ENV_FILE, and
 # cloud-cell-supervisor.sh:1198 records why it has to: the tmux SERVER supplies a new session's
 # environment, so an exported ceiling is silently dropped and would revert to its default.
-MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
+MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU + 2 ))}"
 # ⛔ BOUND THE DERIVATION, NOT A PINNED VALUE — and only the derivation CAN be out of range here:
-# `_NCPU` is `is_limit`-bounded to nine digits, and `* 5 / 2` carries that to TEN (999999999 ->
-# 2499999997), which the range check below would then refuse while blaming MAX_LANES for a probe
+# `_NCPU` is `is_limit`-bounded to nine digits, and `+ 2` carries that to TEN (999999999 ->
+# 1000000001), which the range check below would then refuse while blaming MAX_LANES for a probe
 # that is not its fault. `MAX_LOAD` above is bounded for the identical reason. An explicit value is
 # never silently replaced: a non-number, a leading zero or a value over nine digits still reaches
 # the range loop below and is REFUSED there, because a value this installer accepts must be the
 # value the loop uses. The one explicit value this CAN touch is one identical to the derivation —
 # the same absurd probe-derived number — so bounding that is the repair, not a substitution.
-if [ "$MAX_LANES" = "$(( 10#$_NCPU * 5 / 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=10; fi
+if [ "$MAX_LANES" = "$(( 10#$_NCPU + 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=6; fi
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # NOTE (BP0, tortoise#8468 — NOT shipped, reconciled onto main's rule): the tortoise fork's P0
@@ -1761,7 +1768,7 @@ cat <<EOF
   workers     $O   (the worker surface lanes/fixers are seeded into)
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR_SHOW)
-  limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES red_fix=$MAX_RED_FIX red_fix_tries=$MAX_RED_FIX_TRIES
+  limits    lanes=$MAX_LANES (default: cores+2 unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES red_fix=$MAX_RED_FIX red_fix_tries=$MAX_RED_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
             merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
 EOF
