@@ -3442,13 +3442,13 @@ export function wtIsPathShapedScriptWord(word) {
     if (ch === "\\") { out += PH; i++; continue; }
     if (ch === "`") {
       const end = s.indexOf("`", i + 1);
-      if (end < 0) return false; // unbalanced — prose, not a substitution
+      if (end < 0) break; // unbalanced — fall through to the terminal accepts
       out += PH; i = end; continue;
     }
     if (ch === "$") {
       let j = i + 1;
-      if (s[j] === "{") { const e = s.indexOf("}", j); if (e < 0) return false; j = e + 1; }
-      else if (s[j] === "(") { const e = s.indexOf(")", j); if (e < 0) return false; j = e + 1; }
+      if (s[j] === "{") { const e = s.indexOf("}", j); if (e < 0) break; j = e + 1; }
+      else if (s[j] === "(") { const e = s.indexOf(")", j); if (e < 0) break; j = e + 1; }
       else while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
       out += PH; i = j - 1; continue;
     }
@@ -3459,11 +3459,21 @@ export function wtIsPathShapedScriptWord(word) {
     // `sp` branch started consulting this predicate). A shape test that drops a
     // glob is a fail-OPEN, which is why it is pinned by an arm in both directions.
     if (ch === "?") { out += PH; continue; }
-    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
-    if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
-    if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) break; out += PH; i = e; continue; }
+    if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) break; out += PH; i = e; continue; }
+    if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) break; out += PH; i = e; continue; }
     out += ch;
   }
+  // ⛔ `break`, NOT `return false`, ON EVERY UNBALANCED BRANCH ABOVE — AND THIS IS
+  // THE WHOLE POINT OF THE TWO-ORed ACCEPTS BELOW (#3243 review cycle-3, F2b).
+  // The contract added the `^(?:\.{1,2}|~)\/` accept so that a rejection could not
+  // delete a candidate — but an in-loop `return false` RETURNS PAST IT, so for
+  // exactly the words the accept was added to rescue it was unreachable. `[`, `{`,
+  // `(`, a backtick or `${`/`$(` with no match is ORDINARY IN A FILENAME, not prose:
+  // `./undo[1.sh`, `./undo{1.sh`, `~/undo{1.sh`, `../undo[1.sh` really execute (the
+  // shell treats an unmatched bracket literally), and the cycle-2 cut ran them
+  // UNGATED where the base refused them. `break` keeps what was built and lets the
+  // terminal test decide, which is the only place a rejection is safe.
   // TWO-ORed ACCEPTS — see the contract above: a rejection here deletes the
   // candidate and blinds the arm, so the only safe direction is to accept more.
   if (/^[A-Za-z0-9._+@!%~\u0000/-]+$/.test(out) && /[\/~]/.test(out)) return true;

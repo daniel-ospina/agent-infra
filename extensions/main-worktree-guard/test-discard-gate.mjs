@@ -2050,8 +2050,31 @@ async function partB() {
       "was ALLOWED — the escape rejected the candidate and the file ran UNGATED");
     expectTrue("B15n' control (#3243 review c2 F2): an awk PROGRAM is still not a script path",
       allowed(await bash("awk /^tree=/{t=$2} clean.txt", wt)), "was blocked — the widening over-fired");
+
+    // ── B15o-s: the REVIEW CYCLE-3 findings. Both are a shape test applied where
+    // its OWN rationale does not hold, and both were base BLOCK -> head ALLOW.
+    //
+    // B15o-q (F1b): `pathShaped` demands a `/` or `~` because "a bare word resolves
+    // through PATH, not through this arm". True for a directly-executed word,
+    // FALSE for an interpreter OPERAND: `bash undo*.sh` opens the file relative to
+    // the CWD after the glob, so the interpreter's presence IS the path evidence.
+    expectTrue("B15o (#3243 review c3 F1b): a SEPARATOR-LESS interpreter operand is still refused",
+      blocked(await bash("bash undo-b15-*.sh", wt)),
+      "was ALLOWED — the shape test demanded a `/` that a CWD-relative operand does not have");
+    expectTrue("B15p (#3243 review c3 F1b): `source <sep-less glob>` is still refused",
+      blocked(await bash("source undo-b15-*.sh", wt)), "was allowed");
+    expectTrue("B15q (#3243 review c3 F1b): a QUOTED dir with a SPACE is still refused",
+      blocked(await bash('bash "my dir"/undo-b15-*.sh', wt)), "was allowed");
+    // B15r (F2b): an unmatched `[` is a literal filename byte, so the shell really
+    // runs it — and the in-loop `return false` bypassed the terminal prefix accept.
+    const bUnbal = writeBody("undo-b15[1.sh", "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    expectTrue("B15r (#3243 review c3 F2b): an UNBALANCED `[` in the FILENAME is still refused",
+      blocked(await bash("./undo-b15[1.sh", wt)),
+      "was ALLOWED — the in-loop `return false` bypassed the terminal prefix accept");
+    expectTrue("B15s control (#3243 review c3 F2b): a program with an UNBALANCED `{` is still not a path",
+      allowed(await bash("awk /^tree=/{t=$2 clean.txt", wt)), "was blocked — the widening over-fired");
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
-    for (const f of [undoGlob, join(wt, "b15a.sh"), join(wt, "b15b.sh"), join(wt, "b15c.sh"), f2Body, f3Body, f3Var, f2Comma, f2Esc, ...f1c2Files]) rmSync(f, { force: true });
+    for (const f of [undoGlob, join(wt, "b15a.sh"), join(wt, "b15b.sh"), join(wt, "b15c.sh"), f2Body, f3Body, f3Var, f2Comma, f2Esc, bUnbal, ...f1c2Files]) rmSync(f, { force: true });
 
     // ── the PROTECTION side: a real nested script the guard cannot read is
     // STILL refused, and now the refusal must be about the REAL thing (the
@@ -2704,6 +2727,22 @@ if (process.argv.includes("--mutations")) {
       true,
       true,
       "program TEXT carries no explicit path prefix, so it stays non-path in BOTH builds",
+    ],
+    // F2b (#3243 review cycle-3): the contract says the terminal test is two ORed
+    // ACCEPTS so a rejection cannot delete the candidate — but an in-loop
+    // `return false` RETURNS PAST those accepts, so on exactly the words the
+    // prefix accept was added to rescue, it was unreachable. An unmatched `[`,
+    // `{`, `(` or backtick is ORDINARY IN A FILENAME (`./undo[1.sh` really runs).
+    [
+      "an UNBALANCED bracket in a FILENAME does not delete the candidate (#3243 c3 F2b)",
+      [[
+        "    if (ch === \"[\") { const e = s.indexOf(\"]\", i + 1); if (e < 0) break; out += PH; i = e; continue; }",
+        "    if (ch === \"[\") { const e = s.indexOf(\"]\", i + 1); if (e < 0) return false; out += PH; i = e; continue; }",
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("./undo[1.sh"),
+      true,
+      false,
+      "the in-loop `return false` bypasses the prefix accept and the really-executed path goes blind",
     ],
   ];
   for (const [label, reverts, probe, wantBefore, wantAfter, why] of PREDICATE_PAIRS) {

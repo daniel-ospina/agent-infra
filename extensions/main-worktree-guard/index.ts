@@ -2653,7 +2653,7 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
   const firstIsShellLike = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|env|nice|nohup|command|sudo|doas|setsid|stdbuf|time|timeout|exec|ionice|busybox|xargs|find|eval)$/.test(
     unqFirst.replace(/^.*\//, ""),
   );
-  if (sp && _wtPathNeedsExpansion(sp) && (pathShaped(sp) || /^["']?\$/.test(sp))) {
+  if (sp && _wtPathNeedsExpansion(sp) && (pathShaped(sp) || /^["']?\$/.test(sp) || firstIsShellLike)) {
     // Interpreter operand (`bash ./undo*.sh`, `sudo bash …`), or a bare path
     // that IS the first word (direct execution, `./undo*.sh`).
     //
@@ -2673,6 +2673,22 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
     // either path-shaped (`./undo*.sh`, `~/undo.sh`, `$(pwd)/x.sh` → placeholder +
     // path) or `$`-rooted (`$NB`, `"$REAPER"`, `${DIR}/x.sh`), so nothing unreadable
     // is lost by the test.
+    //
+    // ⛔ `firstIsShellLike` IS THE POSITIVE SIGNAL HERE, AND ITS ABSENCE WAS A
+    // SECOND fail-OPEN (#3243 review cycle-3, F1b). `pathShaped` requires a `/` or a
+    // leading `~`, on the grounds that "a bare word resolves through PATH, not
+    // through this arm". That rationale is TRUE for a directly-executed word and
+    // FALSE for an interpreter OPERAND: `bash undo*.sh` opens `undo*.sh` relative to
+    // the CWD after the glob — it is not PATH-resolved at all, and it really executes
+    // a file whose contents were chosen at runtime. So `bash undo*.sh`,
+    // `sh undo?.sh`, `bash undo[12].sh`, `bash undo{1,2}.sh`, `source undo*.sh`,
+    // `env bash undo*.sh`, `bash "my dir"/undo*.sh` and
+    // `sh -c 'bash undo*.sh'` each ran UNGATED where the base refused them (the
+    // `$` carve-out above does not rescue a glob, and the separator-less word fails
+    // the shape test). The interpreter's presence is itself the evidence that the
+    // operand is a path, so in THIS branch the shape test is not needed. Program
+    // text is unaffected — `awk`, `sed` and `grep` are not `firstIsShellLike`, so
+    // `awk '/^tree=/{t=$2}'` still fails the shape test and is still ALLOWED.
     if (firstIsShellLike || unqFirst === spUnq) return sp;
   }
   // EXTGROUP (`shopt -s extglob`, or `bash -O extglob -c …`) truncates the
