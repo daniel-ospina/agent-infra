@@ -987,35 +987,48 @@ def acquire_lock(label):
     for _ in range(2):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            # Somebody may hold it (live or abandoned) — fall through to the probe below.
+            pass
+        except OSError:
+            # ⛔ NOT swallowed. EACCES/EROFS/ENOSPC on the CREATE itself is not "somebody else has
+            # it" — the caller's per-job guard names the real cause in the log. An earlier version
+            # answered `None` here, so on the very ENOSPC recovery this whole change is about the
+            # operator read `SKIP <job>: already running (lock held)` for a job nothing held, and
+            # the disk-full cause never appeared in the log at all.
+            raise
+        else:
             try:
                 # ⛔ A SMALL WRITE STILL NEEDS A DATA BLOCK, so ENOSPC/EIO/EDQUOT fail here having
                 # already CREATED the file. Unguarded that left a 0-byte lock behind, and every
                 # later `acquire_lock` then raised IndexError on `"".split()[0]` — measured — so the
                 # job never ran again on any pass until a human deleted the lock. This function's
                 # own contract is "A lock whose pid is GONE is stolen: a crashed run must not
-                # disable its job forever"; an EMPTY lock is the strongest case of that.
+                # disable its job forever"; an EMPTY lock is the strongest case of that. Raising
+                # here is right: the caller names the cause, and the 0-byte file is stolen on the
+                # next attempt by the probe below.
                 os.write(fd, ("%d\n" % os.getpid()).encode())
             finally:
                 os.close(fd)
             return path
-        except OSError:
-            # Either the exclusive create lost the race (FileExistsError) or the write failed. In
-            # BOTH cases fall through to the same steal-or-refuse logic rather than propagating.
-            # ⚠️ NOT `if not exists: raise`: a holder that releases between our O_EXCL and this
-            # probe made that raise FileExistsError out of acquire_lock, which the loop's per-job
-            # guard absorbed but which aborted `--install`'s inline pass with a traceback (measured
-            # in the case-14 shape, where --install runs while the loop holds a job's lock). A
-            # vanished lock is a LOST RACE, which the retry loop below already answers.
-            pass
+        # Probe: refuse a LIVE holder, steal a dead or unusable one, retry a vanished one.
         try:
             with open(path) as fh:
                 pid = int(fh.read().strip().split()[0])
+        except FileNotFoundError:
+            # ⛔ The holder released it between our O_EXCL and this probe. That is a LOST RACE, and
+            # the retry loop is what answers it — `continue` here, not the `unlink` arm below (whose
+            # OSError returns None after a single attempt, i.e. the job is skipped and the log says
+            # "already running (lock held)" for a lock that does not exist).
+            continue
         except (OSError, ValueError, IndexError, TypeError):
             pid = None
         if pid is not None and pid_alive(pid):
             return None
         try:
             os.unlink(path)
+        except FileNotFoundError:
+            continue
         except OSError:
             return None
     return None
