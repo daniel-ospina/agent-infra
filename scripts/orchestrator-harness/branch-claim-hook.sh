@@ -55,7 +55,12 @@ done < "$buf"
 # ⛔ EXECUTED DIRECTLY, NOT VIA AN INTERPRETER: a hook body that launches an interpreter on a variable
 # path is refused by the repo's checkout guard as an unresolvable indirection, and that guard runs on
 # every push — including the pushes this hook exists to gate.
+# ⛔ THE FULL CONTRACT IS FORWARDED — `$@` AS WELL AS STDIN (agent-infra#3329 cycle-3 review). The
+# pre-push contract is `pre-push <remote-name> <remote-url>` PLUS the ref lines on stdin. Replaying only
+# stdin left a chained peer hook with `$1`/`$2` unset: one keyed on the remote validated nothing (no
+# remote matched) and one running under `set -u` aborted — a false PASS on someone else's gate, or a
+# push refused for a reason nobody could see. Both halves are forwarded and both are pinned.
 if [ -e "$here/pre-push.chain" ]; then
-  "$here/pre-push.chain" < "$buf" || rc=1
+  "$here/pre-push.chain" "$@" < "$buf" || rc=1
 fi
 exit "$rc"

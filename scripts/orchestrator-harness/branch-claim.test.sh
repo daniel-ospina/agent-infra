@@ -117,6 +117,26 @@ grep -q 'held-by' "$T/acq.out" && ok "refusal says held-by-live" || bad "text: $
 ( . "$SELFDIR/claims.sh"; claim_orphan_reason "oldbox:4242" "refs/claims/branch-integration-land-batch-2" >/dev/null 2>&1 ) \
   && bad "claim_orphan_reason called a BRANCH claim ORPHANED (a prune would delete a live claim)" \
   || ok "claim_orphan_reason ABSTAINS for a branch key (former-name / roster arms included)"
+# ⛔ THE PROBE ABOVE IS NOT ENOUGH ON ITS OWN (cycle-3 review): in a hermetic state dir with no roster
+# and no former name, EVERY host arm abstains for ANY key — so it stayed green against the very code it
+# was written to catch. These probes PUSH the host arms: a former name on disk, a roster that does not
+# name the peer, and a DEAD_HOSTS entry — plus a PR-claim CONTROL, so a claim_orphan_reason that
+# abstained for everything could not pass them either.
+mkdir -p "$CLAIM_STATE_DIR"; printf 'oldbox\n' >> "$CLAIM_STATE_DIR/claim-hosts"
+(
+  . "$SELFDIR/claims.sh"
+  export CLAIM_OWNER_HOST=mehost CLAIM_KNOWN_HOSTS="mehost,thirdbox" CLAIM_DEAD_HOSTS=deadbox
+  claim_orphan_reason "oldbox:4242" "refs/claims/branch-integration-land-batch-2" >/dev/null 2>&1 && exit 0
+  claim_orphan_reason "peerbox:4242" "refs/claims/branch-integration-land-batch-2" >/dev/null 2>&1 && exit 0
+  claim_orphan_reason "deadbox:4242" "branch-integration-2026-11-03-batch" >/dev/null 2>&1 && exit 0
+  claim_orphan_reason "peerbox:4242" "refs/claims/3329-e70c7e325fd7" >/dev/null 2>&1 || exit 0
+  exit 1
+)
+case "$?" in
+  0) bad "claim_orphan_reason called a BRANCH claim ORPHANED through a HOST arm (a prune would delete a live claim)" ;;
+  1) ok "claim_orphan_reason abstains for a branch key on the FORMER-NAME, ROSTER and DEAD_HOSTS arms (PR control still ORPHANED)" ;;
+  *) bad "the host-arm orphan probe did not run cleanly" ;;
+esac
 
 echo "== 4b. an EXPIRED claim must be reclaimed, not waited on forever (until= must parse)"
 release_from owner "$BR"; eq "owner releases" "$?" "0"
@@ -174,7 +194,7 @@ echo "== 9. a chained FOREIGN pre-push hook still receives the ref lines on stdi
 # gate. The chain here records what it was handed; the assertion is on those bytes.
 git clone -q --branch "$BR" "$T/origin.git" "$T/chainbox" 2>/dev/null
 hookdir="$T/chainbox/.git/hooks"
-printf '#!/usr/bin/env bash\ncat > "%s/chain-stdin.txt"\n' "$T" > "$hookdir/pre-push"
+printf '#!/bin/sh\nfor a in "$@"; do printf "%%s\\n" "$a"; done > "%s/chain-argv.txt"\ncat > "%s/chain-stdin.txt"\n' "$T" "$T" > "$hookdir/pre-push"
 chmod +x "$hookdir/pre-push"
 ( cd "$T/chainbox" && "$BC" install-hook --force >/dev/null 2>&1 ) || bad "install-hook --force over a foreign hook"
 commit_in chainbox "chained hook"
@@ -183,6 +203,10 @@ if [ -s "$T/chain-stdin.txt" ]; then
   ok "the chained hook RECEIVED its ref lines ($(wc -l < "$T/chain-stdin.txt") line(s))"
   grep -q 'refs/heads/integration/land-batch-2' "$T/chain-stdin.txt" && ok "the chain got the ref it must validate" \
     || bad "wrong bytes to the chain: $(cat "$T/chain-stdin.txt")"
+  # ⛔ ARGV IS THE OTHER HALF OF THE CONTRACT (cycle-3 review): a chain keyed on the remote, or one
+  # running under `set -u`, sees `$1`/`$2` unset when only stdin is forwarded.
+  grep -q origin "$T/chain-argv.txt" 2>/dev/null && ok "the chain got its ARGUMENTS (remote name/url)" \
+    || bad "the chain got no arguments: argv=[$(tr '\n' ' ' < "$T/chain-argv.txt" 2>/dev/null)]"
 else
   bad "the chained hook got an EMPTY stdin — a peer gate would validate nothing and PASS"
 fi
