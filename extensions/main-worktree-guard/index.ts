@@ -2544,6 +2544,11 @@ function _worktreeDiscardBlockReason(
                 `     from the dirty hub — no \`;\`/\`&&\`/pipe, no redirect, no \`cd … &&\``,
                 `     prefix, no \`-C\`/\`GIT_DIR=\` target selection. Run it alone:`,
                 `       git checkout -- <path>          # cwd is the hub`,
+                // Round 17 (P3): the DIRECTORY carve-out is a documented trade-off;
+                // it must be named on the surface a HATCHED reader actually sees
+                // (this one), not only in the hatch-inactive text.
+                `     NOTE a DIRECTORY operand (\`src\`, \`src/\`) IS admitted and discards that`,
+                `     entire subtree, so name a FILE when that is what you mean.`,
               ]
             : [
                 // Round 14 (P2): the two hatches are NOT equivalent and this

@@ -79,7 +79,7 @@ There is **no worktree-scoped stash** in git: `git stash push` has no `--ref`/pe
 
 ## Escaping the main-checkout guard (deliberate mid-session escalation)
 
-If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note the branch pair is M4-sanctioned and needs no window, but on a DIRTY hub it is a no-op — the marker's named-path restore is what clears dirt — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
+If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note the branch pair is M4-sanctioned and needs no window, but on a dirty hub it cannot CLEAR the dirt (`git checkout main` may refuse or carry the change along; `git pull --ff-only` may fast-forward or refuse) — the marker's named-path restore is what clears it — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
 
 ```bash
 # must be its OWN bash tool call inside a guard-loaded session
@@ -344,7 +344,7 @@ agents in the hub) is prevented by discipline, not just guards:
 ### Stranded main checkout — terminal one-liner when M4 does NOT sanction (#206)
 
 - **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, and the op needed to un-strand is OUTSIDE the M4 recovery allowlist — `reset --hard`, force ops, or a tree the pull cannot fast-forward) used to be unrecoverable FROM the agent — the env hatch (`AGENT_ALLOW_MAIN_EDITS=1`) cannot be set on a running process; the TTL marker's named-path restore window is the agent-side route for DIRT, and the branch one-liner below is for an off-main AND CLEAN hub. Agent-side `git checkout main` and `git pull --ff-only` are themselves M4-sanctioned recovery ops needing no window (see the #1484 contract below).
-- **Fix (the sanctioned recovery when M4 blocks):** pick the route that matches the STATE — `git status --porcelain` tells you which. On a **dirty** hub a branch switch is NOT the recovery: `git checkout main && git pull --ff-only` is a no-op there (already on `main`, and the dirt rides along), which is exactly the loop that stranded the checkout for ~12h on 2026-11-02. Clear the dirt instead, from the hub, under an active escape hatch (`AGENT_ALLOW_MAIN_EDITS=1` at session start, or the `~/.pi/agent/.allow-main-edits` marker), naming the paths:
+- **Fix (the sanctioned recovery when M4 blocks):** pick the route that matches the STATE — `git status --porcelain` tells you which. On a **dirty** hub a branch switch is NOT the recovery: `git checkout main && git pull --ff-only` cannot clear the dirt (`git checkout main` may refuse or carry the change along; `git pull --ff-only` may fast-forward or refuse), which is exactly the loop that stranded the checkout for ~12h on 2026-11-02. Clear the dirt instead, from the hub, under an active escape hatch (`AGENT_ALLOW_MAIN_EDITS=1` at session start, or the `~/.pi/agent/.allow-main-edits` marker), naming the paths:
   ```bash
   cd <repo> && git status --porcelain
   git restore --staged --worktree <path>   # 'M ' staged
@@ -384,7 +384,8 @@ sequence, in order:
    ```
 3. **Recover** — pick the route that matches the STATE (`git status --porcelain`):
    - **DIRTY hub** → a branch switch does not help (it carries the dirt along, and
-     on an already-`main` hub the pair is a no-op). Clear the dirt with the
+     the pair cannot clear it, whether or not the hub is already on `main`).
+   Clear the dirt with the
      marker's named-path window, from the hub:
      ```bash
      git restore --staged --worktree <path>   # 'M ' staged

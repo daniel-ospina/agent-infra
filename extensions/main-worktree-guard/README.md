@@ -1088,8 +1088,9 @@ one-liner (`cd <repo> && git checkout main && git pull --ff-only`) is
 touched only by humans and is unaffected — a human terminal is never
 intercepted, and inside the disordered hub M4's recovery allowlist admits the
 compound. It is the right route for an **off-main AND clean** hub only: on a
-DIRTY hub it cannot RECOVER — on an already-`main` hub it is two no-ops, and on
-an off-main dirty hub it switches the branch but the dirt rides along — so clear
+DIRTY hub it cannot RECOVER — `git checkout main` may refuse or carry the change
+along, and `git pull --ff-only` may fast-forward or refuse; none of it clears the
+dirty paths — so clear
 the dirt first with the named-path restore window
 (`git restore --staged --worktree <path>` / `git restore <path>` under the
 marker; `mv <untracked> /tmp/` for `??`). (An AGENT on a CLEAN hub has no M4
@@ -1668,7 +1669,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 | env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#1485** narrows the surface to what is actually READ (an opaque executable has no program to read), and adds the merge rail + the argv gh shim to the named `SANCTIONED_SCRIPT_RELPATHS` list; a general "committed repo script" exemption was rejected at review (committed is purchasable — see the #1485 note in the backdoor section). **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`) is closed for INLINE payloads too; residuals: `python -m`/bare-stdin/pipe payloads, dynamic string construction, and file/shebang payloads (`python x.py`, `./x.py`). Env hatch / TTL marker still bypass it. |
-| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | The sanctioned **branch** recovery (#206) — correct for an off-main AND CLEAN hub; on a DIRTY hub it cannot recover (two no-ops if already on `main`; if off-main it switches and the dirt rides along), so clear the dirt first with the named-path restore window above. Terminals are never intercepted. |
+| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | The sanctioned **branch** recovery (#206) — correct for an off-main AND CLEAN hub; on a DIRTY hub it cannot clear the dirt (`git checkout main` may refuse or carry the change along; `git pull --ff-only` may fast-forward or refuse), so clear the dirt first with the named-path restore window above. Terminals are never intercepted. |
 
 Rule of thumb: **if you are not recovering the hub or working alone, you
 should be in a worktree — `hub-worktree.sh <branch>` makes it one command.**
@@ -2080,13 +2081,14 @@ shared main checkout of a project with the guard active:
    since #1484 — the stamp-ordering fix; before that the touch was swallowed
    by the allow-non-git early return and the marker was inert).
 3. `git checkout main && git pull --ff-only` in the **FOLLOW-UP** call →
-   succeeds **on an off-main AND clean hub**. On a DIRTY hub this step is a
-   not a recovery (two no-ops if already on `main`; if off-main it switches but the
-dirt rides along) — there the recovery is
+   succeeds **on an off-main AND clean hub**. On a DIRTY hub this step is
+   **not a recovery** (`git checkout main` may refuse or carry the change along;
+   `git pull --ff-only` may fast-forward or refuse) — there the recovery is
    the named-path restore the marker's window permits:
    `git restore --staged --worktree <path>` (staged), `git restore <path>`
    (worktree), `mv <untracked> /tmp/` (`??`). Any `.`/glob/brace/`..` operand,
-   a wrapper, a compound, or a `-C`/`GIT_DIR` retarget stays refused.
+   a wrapper, a compound, or a `-C`/`GIT_DIR` retarget stays refused. A
+   DIRECTORY operand (`src`, `src/`) is admitted and discards that subtree.
 4. `cat ~/.pi/agent/.allow-main-edits` → shows `session_id` + `reason` + `ts`.
 5. `tail ~/.pi/agent/audit/gate-events.jsonl` → a `gate_bypass` /
    `main_edits_marker` line with session_id + marker content + expires_at.

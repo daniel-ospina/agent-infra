@@ -471,7 +471,13 @@ async function partB() {
       check("B6g2 marker + ambient GIT_DIR ⇒ `restore --staged` BLOCKED (M4 decides)", b6g2 !== null, true);
       check("B6g2b …and the refusal NAMES the inherited env",
         /INHERITED a repo-selecting env/.test(b6g2?.reason ?? ""), true);
-    } finally {
+
+      // B6g2c — round 17 (P2): the two paragraphs are MUTUALLY EXCLUSIVE. With a
+      // repo-selecting env inherited the window is CLOSED, so the hatch-active
+      // paragraph ("the route above is permitted … run ONE bare command") would
+      // contradict it and prescribe a command measured BLOCKED.
+      check("B6g2c inherited env ⇒ the message does NOT also claim the hatch is active",
+        /Your hatch IS active/.test(b6g2?.reason ?? ""), false);    } finally {
       delete process.env.GIT_DIR;
       delete process.env.GIT_WORK_TREE;
     }
@@ -522,6 +528,14 @@ async function partB() {
     // the refusal then told a hatched lane to acquire the hatch it holds.
     check("B6w2b shape-refused + hatched ⇒ names the hatch as ACTIVE",
       /Your hatch IS active/.test(b6w2?.reason ?? "") && !/need an active escape hatch/.test(b6w2?.reason ?? ""), true);
+    // B6w2c — round 17 (P3): the DIRECTORY-operand carve-out is a documented
+    // trade-off, so the message claim that makes it non-silent must be pinned
+    // (the docblock justifies the carve-out BY that message).
+    // Reached via a command M4 PERMITS and M5 refuses (a redirect closes the
+    // window), which is the surface that carries the "Deliberate discard" text.
+    const b6w2c = await drive("git checkout -- wip.txt > /dev/null");
+    check("B6w2c the M5 text names the DIRECTORY operand carve-out",
+      /DIRECTORY operand/.test(b6w2c?.reason ?? ""), true);
     // B6w3 — round 10 (P2): the bash-tracked-write arm is the incident's refusal
     // #4 surface; its advice must be the shared three-shape text.
     writeFileSync(join(hub, "copy.txt"), "copy\n");

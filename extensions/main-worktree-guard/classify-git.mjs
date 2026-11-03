@@ -4811,7 +4811,8 @@ export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive 
         // to clear working-tree dirt, and refusing it made M4 UNRECOVERABLE in
         // the very state it exists to repair: the gate answered `git checkout
         // main && git pull --ff-only`, which on a dirty tree is a NO-OP (git
-        // refuses to switch over modified paths, and an already-main dirty hub
+        // cannot clear the dirt (it may refuse to switch, or carry the change
+        // along, and a pull may fast-forward or refuse), and an already-main dirty hub
         // has nothing left to do). Measured 2026-11-02: one truncated tracked
         // file (`tortoise/__init__.py`, 0 bytes, a pure 383-line deletion)
         // froze a shared hub for ~12h across 7 live sessions, and every
@@ -5749,9 +5750,11 @@ function _hatchParagraph(hatchActive) {
 let _dirtyHatchActive = false;
 
 function _dirtyRecoveryBody() {
+  const _ambientLines = _ambientGitEnvLines();
   return [
-    `   → Recover the DIRT — a branch switch carries the dirt WITH it and cannot`,
-    `     clear it. Which command depends on WHICH dirt; \`git status --porcelain\``,
+    `   → Recover the DIRT — a branch switch cannot clear it (\`git checkout main\` may`,
+    `     refuse or carry the change along; \`git pull --ff-only\` may fast-forward or`,
+    `     refuse). Which command depends on WHICH dirt; \`git status --porcelain\``,
     `     tells you (column 1 = index, column 2 = worktree):`,
     `       staged/index change  \`M \`  -> \`git restore --staged --worktree <path>\``,
     `                                     (one command: unstage AND restore — a bare`,
@@ -5764,8 +5767,12 @@ function _dirtyRecoveryBody() {
     // from here can converge — the recovery window is closed and every restore
     // would target the other checkout. Name the cause instead of prescribing a
     // command that cannot run (the incident's exact failure shape).
-    ..._ambientGitEnvLines(),
-    ..._hatchParagraph(_dirtyHatchActive),
+    // Round 17 (P2): these are MUTUALLY EXCLUSIVE. When a repo-selecting env is
+    // inherited the window is closed, so the hatch paragraph's "the route above is
+    // permitted, run ONE bare command" would contradict the paragraph immediately
+    // above it and prescribe a command measured to be BLOCKED. Emit one or the
+    // other.
+    ...(_ambientLines.length > 0 ? _ambientLines : _hatchParagraph(_dirtyHatchActive)),
     `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
   ];
 }
