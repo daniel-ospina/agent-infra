@@ -373,7 +373,7 @@ assert_contains "$OUT" "no-op" "T18 the verdict says no-op"
 # MEASURED IN REVIEW: redirecting the blob at `$REPO/$p` followed the symlink and overwrote the CLEAN
 # file it pointed at — bytes that were never preserved, because that file was not dirty — then printed
 # "tracked paths match HEAD" and exited 10. This repo tracks 34 symlinks.
-say_case "T15 a dirty symlink is replaced, not written through"
+say_case "T24 a dirty symlink is replaced, not written through"
 mk_origin t15
 # The symlink and the file it points at are committed in the ORIGIN first, then cloned: a local commit
 # would make the clone AHEAD (and this case must be BEHIND) rather than on the ref's line.
@@ -386,17 +386,17 @@ seed_commit "add B and a symlink" >/dev/null 2>&1
 seed_push >/dev/null 2>&1
 mk_clone t15
 REPO_P="$CLONE"; MODE_P=sync; write_sync_stub
-assert_eq "$(readlink "$CLONE/link")" "A.txt" "T15 fixture: the clone starts with the symlink clean"
+assert_eq "$(readlink "$CLONE/link")" "A.txt" "T24 fixture: the clone starts with the symlink clean"
 WANT15="$(advance_origin t15 A.txt "upstream for the symlink case")"
 ln -sfn B.txt "$CLONE/link"          # the DIRTY change: the symlink now points somewhere else
 OUT="$(run_pass "$T/t15" 2>&1)"; RC=$?
-assert_eq "$RC" "10" "T15 the pass advances past a dirty symlink"
-assert_eq "$(readlink "$CLONE/link")" "A.txt" "T15 the tracked symlink is restored to what HEAD says"
+assert_eq "$RC" "10" "T24 the pass advances past a dirty symlink"
+assert_eq "$(readlink "$CLONE/link")" "A.txt" "T24 the tracked symlink is restored to what HEAD says"
 assert_eq "$(cat "$CLONE/B.txt")" "B-ORIGINAL" \
-    "T15 the CLEAN file the symlink pointed at is untouched (the blob was not written THROUGH it)"
-assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT15" "T15 and the checkout fast-forwarded"
+    "T24 the CLEAN file the symlink pointed at is untouched (the blob was not written THROUGH it)"
+assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$WANT15" "T24 and the checkout fast-forwarded"
 assert_eq "$(git -C "$CLONE" status --porcelain | grep -c 'link' | tr -d ' ')" "0" \
-    "T15 the symlink is no longer reported dirty (it really was replaced)"
+    "T24 the symlink is no longer reported dirty (it really was replaced)"
 
 # ── T16: the unit's OWN environment is enough to run the pass (the #2416 P0) ──────────────────
 # MEASURED IN REVIEW: the rendered unit exports `HARNESS_APPLY_REPO` / `HARNESS_APPLY_REF` while the
@@ -1025,15 +1025,15 @@ OUT="$(HOME="$T/t11/home" HARNESS_APPLY_PASS="$PASS_SH" ELDATO_PLATFORM=Darwin \
     bash "$INST" --install 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T11 no usable interpreter is a REFUSAL, never a degraded bash job that fails closed"
 assert_contains "$OUT" "not executable" "T11 and the refusal names the interpreter"
-# ── T15: THE FARM IS GRADED, AND A STALE FARM IS RED (tortoise#10114) ────────────────────────
+# ── T24: THE FARM IS GRADED, AND A STALE FARM IS RED (tortoise#10114) ────────────────────────
 # MEASURED 2026-11-03 on a cloud cell: `$O` was CLEAN at the pin (`check-deployed-drift` exit 0,
 # "matches origin/main") while the FARM the box executes carried a `pr-doctor.py` 1445 lines behind
 # the ref — the copy brief-gate refused 100% of, i.e. the no-op #10114 exists to remove, still
 # running four days after its first hand-repair. Nothing on the clock compared that directory: the
 # pass kept `$O` at the ref and the drift instrument grades `$O`. So the assertion is not "the farm
 # is copied" (a copy can destroy a local edit) — it is that drift is a NAMED, RED pass.
-say_case "T15 a STALE farm is a RED pass that names the file, never a green silence"
-mk_origin t15; mk_clone t15; write_sync_stub
+say_case "T24 a STALE farm is a RED pass that names the file, never a green silence"
+mk_origin t24; mk_clone t24; write_sync_stub
 # The farm checker is a seam like the sync verb: the real instrument's own contract is covered by
 # check-farm-drift.test.sh, so this fixture stubs its EXIT CODE and its report line and asserts the
 # pass's use of them (red on 1 and 3, ok on 0, skipped when there is no farm).
@@ -1050,38 +1050,70 @@ exit "${FARM_RC:-1}"
 FARM
 chmod +x "$CLONE/scripts/check-farm-drift.sh"
 REPO_P="$CLONE"; MODE_P=sync
-mkdir -p "$T/t15/home/.pi/agent/scripts"; printf 'old bytes\n' >"$T/t15/home/.pi/agent/scripts/pr-doctor.py"
-OUT="$(FARM_ARGV="$T/t15/argv" run_pass "$T/t15" 2>&1)"; RC=$?
-assert_eq "$RC" "24" "T15 a stale farm REDDENS the pass with its own code (24), not 0/10/11"
-assert_contains "$OUT" "farm: DRIFT" "T15 the line says DRIFT"
-assert_contains "$OUT" "pr-doctor.py" "T15 and it NAMES the file, not just a count"
-assert_contains "$(cat "$T/t15/state/harness-apply.status" 2>/dev/null || true)" "action=farm-drift" \
-    "T15 the pass RECORD carries the action, so --print-status is not silent about it either"
-assert_contains "$(cat "$T/t15/argv" 2>/dev/null || true)" "--ref origin/main" \
-    "T15 the checker is graded against the REF, not against whatever this box has checked out"
-assert_contains "$(cat "$T/t15/argv" 2>/dev/null || true)" "--no-pin-identity" \
-    "T15 and the pin-identity arm is OFF — otherwise a pin-lagged box reports a fresh farm as drift"
-assert_absent "$(cat "$T/t15/argv" 2>/dev/null || true)" "--pin-file" \
-    "T15 and no --pin-file is passed, so the grade cannot be pinned to a tree this box may not run"
+mkdir -p "$T/t24/home/.pi/agent/scripts"; printf 'old bytes\n' >"$T/t24/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_ARGV="$T/t24/argv" run_pass "$T/t24" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 a stale farm REDDENS the pass with its own code (24), not 0/10/11"
+assert_contains "$OUT" "farm: DRIFT" "T24 the line says DRIFT"
+assert_contains "$OUT" "pr-doctor.py" "T24 and it NAMES the file, not just a count"
+assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null || true)" "action=farm-drift" \
+    "T24 the pass RECORD carries the action, so --print-status is not silent about it either"
+assert_contains "$(cat "$T/t24/argv" 2>/dev/null || true)" "--ref origin/main" \
+    "T24 the checker is graded against the REF, not against whatever this box has checked out"
+assert_contains "$(cat "$T/t24/argv" 2>/dev/null || true)" "--no-pin-identity" \
+    "T24 and the pin-identity arm is OFF — otherwise a pin-lagged box reports a fresh farm as drift"
+assert_absent "$(cat "$T/t24/argv" 2>/dev/null || true)" "--pin-file" \
+    "T24 and no --pin-file is passed, so the grade cannot be pinned to a tree this box may not run"
 # Control 1: exit 3 ('a deploy cannot fix it' — an UNSOURCED / not-farm-declared stale file) is
 # folded in deliberately: drift this box EXECUTES must never read green because the remedy is awkward.
-mkdir -p "$T/t15b/home/.pi/agent/scripts"; printf 'x\n' >"$T/t15b/home/.pi/agent/scripts/pr-doctor.py"
-OUT="$(FARM_RC=3 run_pass "$T/t15b" 2>&1)"; RC=$?
-assert_eq "$RC" "24" "T15 control: an unpaid-by-the-farm stale file is RED too, not an exemption"
+mkdir -p "$T/t24b/home/.pi/agent/scripts"; printf 'x\n' >"$T/t24b/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_RC=3 run_pass "$T/t24b" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: an unpaid-by-the-farm stale file is RED too, not an exemption"
 # Control 2: the SAME fixture with a matching farm (checker exits 0) keeps its normal verdict — the
 # leg is a gate, not a hard-coded failure.
-mkdir -p "$T/t15c/home/.pi/agent/scripts"; printf 'x\n' >"$T/t15c/home/.pi/agent/scripts/pr-doctor.py"
-OUT="$(FARM_RC=0 run_pass "$T/t15c" 2>&1)"; RC=$?
-assert_contains "$OUT" "farm: ok" "T15 control: a matching farm is reported ok"
-assert_eq "$RC" "0" "T15 control: a matching farm leaves the normal verdict intact (exact rc, so a pass broken for an unrelated reason cannot pass this control)"
+mkdir -p "$T/t24c/home/.pi/agent/scripts"; printf 'x\n' >"$T/t24c/home/.pi/agent/scripts/pr-doctor.py"
+OUT="$(FARM_RC=0 run_pass "$T/t24c" 2>&1)"; RC=$?
+assert_contains "$OUT" "farm: ok" "T24 control: a matching farm is reported ok"
+assert_eq "$RC" "0" "T24 control: a matching farm leaves the normal verdict intact (exact rc, so a pass broken for an unrelated reason cannot pass this control)"
 # Control 3: no farm at all is SKIPPED with a named reason — a controller-only host farms nothing,
 # and reddening every such box would make the alarm worthless.
-mk_origin t15d; mk_clone t15d
+mk_origin t24d; mk_clone t24d
 REPO_P="$CLONE"; MODE_P=sync
-OUT="$(run_pass "$T/t15d" 2>&1)"; RC=$?
-assert_contains "$OUT" "farm: SKIPPED" "T15 control: an absent farm is SKIPPED by name, never silently passed"
-assert_eq "$RC" "0" "T15 control: an absent farm does not redden the pass (exact rc)"
+OUT="$(run_pass "$T/t24d" 2>&1)"; RC=$?
+assert_contains "$OUT" "farm: SKIPPED" "T24 control: an absent farm is SKIPPED by name, never silently passed"
+assert_eq "$RC" "0" "T24 control: an absent farm does not redden the pass (exact rc)"
 
+
+# Control 4: a DANGLING farm link is NOT an absent farm — `-d` follows symlinks, so the skipped arm
+# must not swallow a path the box still points at but cannot read.
+mk_origin t24e; mk_clone t24e
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24e/home/.pi/agent"; ln -s "$T/t24e/gone-away" "$T/t24e/home/.pi/agent/scripts"
+OUT="$(run_pass "$T/t24e" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a DANGLING farm link REDDENS the pass (a dangling record is not an absent farm)"
+assert_contains "$OUT" "NOT a readable directory" "T24 control: and it says the farm cannot be read rather than that it is absent"
+# Control 5: the seam is validated, and BEFORE any move.
+mk_origin t24f; mk_clone t24f
+REPO_P="$CLONE"; MODE_P=sync
+BEFORE24F="$(git -C "$CLONE" rev-parse HEAD)"
+OUT="$(HARNESS_APPLY_FARM_CHECK=true run_pass "$T/t24f" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T24 control: an invalid seam value is a REFUSAL (2), never a silent disarm"
+assert_eq "$(git -C "$CLONE" rev-parse HEAD)" "$BEFORE24F" "T24 control: and it is validated BEFORE the box is moved"
+# Control 6: a checker that lives INSIDE the farm it grades cannot answer whether the farm is stale.
+mk_origin t24g; mk_clone t24g
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24g/home/.pi/agent/scripts"
+cat >"$T/t24g/home/.pi/agent/scripts/check-farm-drift.sh" <<'FARM'
+#!/usr/bin/env bash
+printf 'check-farm-drift: ok\n'
+exit 0
+FARM
+chmod +x "$T/t24g/home/.pi/agent/scripts/check-farm-drift.sh"
+# The seam points the leg AT the farm-local checker, which is the shape the unit produces for real
+# (`install-harness-apply-timer.sh` prefers `$HOME/.pi/agent/scripts/harness-apply-pass.sh`, so `$HERE`
+# IS the farm there and the `$HERE` fallback would resolve inside it).
+OUT="$(HARNESS_APPLY_FARM_CHECKER="$T/t24g/home/.pi/agent/scripts/check-farm-drift.sh" run_pass "$T/t24g" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a checker that lives inside the farm is REFUSED, not trusted"
+assert_contains "$OUT" "lives INSIDE the farm" "T24 control: and it names that reason"
 
 echo
 echo "────────────────────────────────────────────────────────"

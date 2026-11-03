@@ -73,13 +73,13 @@
 #   22  REFUSED diverged the running commit is neither ancestor nor descendant — nothing was touched
 #   23  REFUSED unknown the ref/repo/running commit cannot be resolved (cannot-verify is not a pass),
 #                     the materialiser failed, or the pin record could not be written
-#   25  behind        on the ref's line but older, and this box has no materialiser to advance it
 #   24  farm-drift    the FARM ($CELL_HOME/.pi/agent/scripts) — the directory this box EXECUTES —
 #                     carries bytes the ref does not ship, is missing files it owes, or cannot be
 #                     graded at all (tortoise#10114; see PREDICATE 4). 24 is free in BOTH files, so
 #                     adding it here keeps the "ONE VOCABULARY" claim above true — `harness-refresh.sh`
 #                     already spends 25 (`behind`) and 26 (`REFUSED blocked`), and re-using either
 #                     for a different fact is the two-vocabularies defect this header rejects.
+#   25  behind        on the ref's line but older, and this box has no materialiser to advance it
 #   2   usage
 # The systemd unit treats 0/10/11 as success and everything else as RED: a refusal means a HUMAN must
 # resolve something (an ahead box, a tree that cannot be preserved), and reddening the unit is the
@@ -227,6 +227,16 @@ case "$STALE_SECONDS" in
     ''|*[!0-9]*) err "HARNESS_APPLY_STALE_SECONDS must be a whole number of seconds (got '$STALE_SECONDS')"; exit 23 ;;
 esac
 [ "$STALE_SECONDS" -gt 0 ] || { err "HARNESS_APPLY_STALE_SECONDS must be positive (got '$STALE_SECONDS')"; exit 23; }
+# ⛔ AND SO IS THE FARM GATE, for the same reason AND one more: this case used to sit at the END of the
+# pass, AFTER the sync/materialiser legs had already moved the box, so a typo in this seam paid for a
+# full move and then exited 2 writing NO record — `--print-status` and fleet-health then read the
+# PREVIOUS tick as if it were this one. Validated here, a typo costs nothing (#10114 review round 2).
+# A seam that silently accepted `true`/`yes`/`flase` would let a typo DISARM a P0 guard and read green.
+case "${HARNESS_APPLY_FARM_CHECK:-1}" in
+    1) FARM_CHECK_ON=1 ;;
+    0) FARM_CHECK_ON=0 ;;
+    *) err "HARNESS_APPLY_FARM_CHECK must be 1|0 (got '${HARNESS_APPLY_FARM_CHECK:-}')"; exit 2 ;;
+esac
 
 # ── the pass record ────────────────────────────────────────────────────────────────────────────
 # One line of key=value, written ATOMICALLY (temp + rename): a truncated record is indistinguishable
@@ -794,7 +804,11 @@ if [ "$DRY_RUN" = 1 ]; then
     # with no hint of where the red comes from. The check itself is read-only and cheap, but running it
     # here would make the preview's verdict differ from the pass's (different point in the pass), so it
     # is NAMED and declined instead — an abstention that says so, never a silent one.
-    log_line "dry-run: the FARM (${HARNESS_APPLY_FARM_DEST:-$CELL_HOME/.pi/agent/scripts}) was NOT graded against $REF — a real pass does that at the finish line and exits 24 on drift"
+    if [ "$FARM_CHECK_ON" = "1" ]; then
+        log_line "dry-run: the FARM (${HARNESS_APPLY_FARM_DEST:-$CELL_HOME/.pi/agent/scripts}) was NOT graded against $REF — a real pass does that at the finish line and exits 24 on drift"
+    else
+        log_line "dry-run: the FARM was NOT graded — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed; no drift would redden a real pass either)"
+    fi
     exit 0
 fi
 
@@ -964,13 +978,10 @@ fi
 # DANGLING or relocated `$FARM_DEST` link makes `-d` false while the box still POINTS AT a farm it
 # cannot read, and passing that as SKIPPED is the false green `check-farm-drift.sh` names twice. Only
 # a path with NOTHING at it (neither a directory nor a link nor a file) may be skipped.
-case "${HARNESS_APPLY_FARM_CHECK:-1}" in
-    1) FARM_CHECK_ON=1 ;;
-    0) FARM_CHECK_ON=0 ;;
-    *) # ⛔ A NUMERIC SEAM IS VALIDATED BEFORE IT IS USED, as `STALE_SECONDS` is above: a seam that
-       # silently accepts `true`/`yes`/`flase` would let a typo disarm a P0 guard and read green.
-       err "HARNESS_APPLY_FARM_CHECK must be 1|0 (got '${HARNESS_APPLY_FARM_CHECK:-}')"; exit 2 ;;
-esac
+if [ "$FARM_CHECK_ON" = "0" ]; then
+    # ⛔ AN ABSTENTION THAT SAYS SO, never a silent one — the same rule the preview arm below follows.
+    log_line "farm: SKIPPED — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed; a stale farm will NOT redden this pass)"
+fi
 if [ "$FARM_CHECK_ON" = "1" ]; then
     FARM_DEST="${HARNESS_APPLY_FARM_DEST:-$CELL_HOME/.pi/agent/scripts}"
     FARM_CHECKER="${HARNESS_APPLY_FARM_CHECKER:-}"
@@ -1005,16 +1016,22 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # population. That is the fail-open shape this leg exists to remove, so it refuses instead.
         FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER")"
         FARM_DEST_REAL="$(cd "$FARM_DEST" 2>/dev/null && pwd -P)"
-        if [ -n "$FARM_DEST_REAL" ] && [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ]; then
+        # ⛔ `pwd -P` resolves the DIRECTORY only; `basename` is appended unresolved, so a SYMLINKED
+        # checker file pointing into the farm slipped past the first test and graded the farm from
+        # inside it (review round 2, reproduced). `-ef` follows links and compares identity.
+        if [ -n "$FARM_DEST_REAL" ] && { [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ] \
+                || [ "$FARM_CHECKER" -ef "$FARM_DEST/$(basename "$FARM_CHECKER")" ]; }; then
             REC_ACTION=farm-unverifiable
             finish 0 24 "farm: UNKNOWN — the only check-farm-drift.sh found ($FARM_CHECKER) lives INSIDE the farm it would grade, and a copy that grades itself cannot answer whether it is stale — install the CHECKER from a ref-consistent checkout"
         fi
         FARM_OUT="$(bash "$FARM_CHECKER" --src "$REPO" --ref "$REF" --dest "$FARM_DEST" --no-pin-identity 2>&1)"
         FARM_RC=$?
-        # The checker's own per-file vocabulary, matched on the FINAL column. `MISSING` and
-        # `LOCAL (undeclared)` are NOT tokens it emits — naming them here would half-miss the very
-        # rows this line exists to surface (#1014 review).
-        FARM_NAMED="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT|SYMLINK)[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}' | head -6 | paste -sd, -)"
+        # The checker's own per-file vocabulary, matched on the FINAL column, and ONLY the four it
+        # actually prints as a verdict. `MISSING` and `LOCAL (undeclared)` are not tokens it emits;
+        # `SYMLINK` IS printed (`check-farm-drift.sh:485`, "SYMLINK (graded via its target)") but that
+        # row is INFORMATIONAL — a healthy link — so matching the bare token would name a good file as
+        # drift the moment the anchor is relaxed (#10114 review round 2).
+        FARM_NAMED="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}' | head -6 | paste -sd, -)"
         case "$FARM_RC" in
             0)
                 log_line "farm: ok — $FARM_DEST matches $REF" ;;

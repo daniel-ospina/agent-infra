@@ -158,6 +158,7 @@ this repo keeps deleting.
 | 21 | REFUSED ahead — local commits are not on the ref's line | **red** |
 | 22 | REFUSED diverged | **red** |
 | 23 | REFUSED unknown — the ref/repo/HEAD cannot be resolved, the materialiser failed, or the pin record could not be written | **red** |
+| 24 | `farm-drift` — the **FARM** (`$CELL_HOME/.pi/agent/scripts`, the directory this box *executes*) differs from the ref, owes files, or cannot be graded (a dangling link, or a checker that lives inside the farm) | **red** |
 | 25 | behind, and this box has nothing that can advance it | **red** |
 
 A red tick is deliberate: those are states a **human** must resolve, and the unit colour
@@ -250,7 +251,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 197 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 215 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -270,6 +271,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T12 | a unit rendered from **transient scratch** (`/tmp/tmp.XXXX`) is refused — the measured 127-every-tick unit |
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
+| T24 | the **FARM** is graded against the ref: stale → **RED 24** naming the file, exit 3 (undeployable) is red too, a matching farm keeps the normal verdict, an **absent** farm is skipped by name while a **dangling** link reddens, an invalid seam value is refused *before* any move, and a checker living **inside** the farm it grades is refused rather than trusted |
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 
 | T16 | the pass runs from **the unit's own environment** (`env -i` with only `HARNESS_APPLY_REPO`/`_REF`/`_MODE`/`_STATE_DIR`), asserted on the record's `ref=` — the rendered unit exported names the pass did not read, so every scheduled tick exited 23 while `list-timers` showed it scheduled |
