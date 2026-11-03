@@ -1002,18 +1002,31 @@ def acquire_lock(label):
                 # ⛔ A SMALL WRITE STILL NEEDS A DATA BLOCK, so ENOSPC/EIO/EDQUOT fail here having
                 # already CREATED the file. Unguarded that left a 0-byte lock behind, and every
                 # later `acquire_lock` then raised IndexError on `"".split()[0]` — measured — so the
-                # job never ran again on any pass until a human deleted the lock. This function's
-                # own contract is "A lock whose pid is GONE is stolen: a crashed run must not
-                # disable its job forever"; an EMPTY lock is the strongest case of that. Raising
-                # here is right: the caller names the cause, and the 0-byte file is stolen on the
-                # next attempt by the probe below.
+                # job never ran again on any pass until a human deleted the lock.
+                # ⚠️ `close`, NOT `write`, is the leg that defeats the probe's self-healing: a
+                # deferred ENOSPC/EIO is reported by close AFTER the write landed, so the lock then
+                # holds OUR OWN LIVE PID — the probe would read a live holder and answer "already
+                # running" for ever, and nothing would ever unlink it. So on ANY failure here we
+                # remove the file ourselves (we created it in this iteration, so it is provably
+                # ours) before propagating.
                 os.write(fd, ("%d\n" % os.getpid()).encode())
-            finally:
                 os.close(fd)
+            except OSError:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise
             return path
         # Probe: refuse a LIVE holder, steal a dead or unusable one, retry a vanished one.
+        seen = None
         try:
             with open(path) as fh:
+                seen = os.fstat(fh.fileno())
                 pid = int(fh.read().strip().split()[0])
         except FileNotFoundError:
             # ⛔ The holder released it between our O_EXCL and this probe. That is a LOST RACE, and
@@ -1025,6 +1038,21 @@ def acquire_lock(label):
             pid = None
         if pid is not None and pid_alive(pid):
             return None
+        # ⛔ UNLINK BY IDENTITY, NOT BY NAME. Probe-then-unlink is check-then-act: a racer can
+        # replace the abandoned lock with one naming ITS OWN live pid between our read and our
+        # unlink, and we would then delete a live holder's lock and win our own O_EXCL — two
+        # callers both told they hold it, so the same job runs twice concurrently. Measured on
+        # 40 unsynchronised fork trials: 7 produced two winners (18%); 60/60 with a synchronised
+        # start. Comparing (st_dev, st_ino) against the file we actually read makes the deletion
+        # conditional on it still being that file; if it changed, re-examine instead.
+        try:
+            now = os.stat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        if seen is None or (now.st_dev, now.st_ino) != (seen.st_dev, seen.st_ino):
+            continue
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -1855,7 +1883,22 @@ def cmd_install():
     if first:
         print("running the %d due job(s) now (the first pass IS the proof):" % len(first))
     for job in first:
-        rc = run_job(job)
+        # ⛔ THIS PASS IS UNGUARDED ELSEWHERE AND IT MUST NOT BE ABLE TO ABORT `--install`.
+        # `--install` is what `cloud-cell-bringup.sh` runs (and `die`s on non-zero), and its LAST
+        # act is `spawn_loop()` — so an exception here means the cell ends up with NO scheduler and
+        # nothing to retry: the 2026-10-30 closed feedback loop, reintroduced on the install path.
+        # Measured on a real unwritable locks dir: a raw PermissionError traceback out of main(),
+        # the remaining due jobs never run, `--verify` never runs, `loop.pid` absent, `loop.log`
+        # empty. The loop's own pass has wrapped `run_job` this way since #1864; the inline one had
+        # not. Same treatment: name the cause, keep going, still reach spawn_loop.
+        try:
+            rc = run_job(job)
+        except Exception as exc:  # noqa: BLE001 — one job must not abort the install
+            log("ERROR %s could not be run by the inline first pass (%s: %s) — continuing"
+                % (job.label, type(exc).__name__, exc))
+            print("  %-38s ERROR (%s: %s)  log=%s"
+                  % (job.label, type(exc).__name__, exc, job.log_path()))
+            continue
         print("  %-38s rc=%s  log=%s" % (job.label, "held" if rc is None else rc, job.log_path()))
 
     pid = loop_pid()
