@@ -217,6 +217,10 @@ mkdir -p "$H8/.pi/agent/scripts"
 printf 'NOTHING=1\n' >"$E8"
 RUN_CASE_KEEP_ENV=1 TORTOISE_MCP_API_KEY="$SECRET" HOME="$H8" ENV_FILE="$E8" run_case ambient_mcp >"$TMP/ambient_mcp.stdout" 2>"$TMP/ambient_mcp.err"
 expect ambient_mcp "graph credential NOT REACHING LANES"
+# ⛔ THE SIBLING ARMS PIN THIS ABSENCE AND THIS ONE MUST TOO: an ambient-only key is NOT provisioned
+# for a lane (the lane environment comes from the file), so an `ok: graph credential: … is set` here
+# would be the exact false PASS this function's comment names — and, unasserted, nothing would red.
+expect_absent ambient_mcp "graph credential: TORTOISE_MCP_API_KEY is set"
 expect_absent ambient_mcp "$SECRET"
 clean ambient_mcp
 
