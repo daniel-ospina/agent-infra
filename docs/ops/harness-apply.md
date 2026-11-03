@@ -192,8 +192,17 @@ learn to ignore. Only a live controller running code the box does not have means
 ⛔ **Exit 1 is not clearable by redeploying.** A redeploy writes a copy at rest; it does not
 restart the controller, so the gone tree keeps being executed. The remedy — carried in the
 record's own `remedy=` field, untruncated — is: advance the pin
-(`cloud-cell-supervisor.sh apply --force --pin-only`), then **restart the controller from
-the pinned tree**.
+(`bash <resolved>/cloud-cell-supervisor.sh apply --force --pin-only`), then **restart the
+controller from the pinned tree**.
+
+⛔ **The command is RESOLVED to a path, not named.** Nothing in this fleet puts
+`cloud-cell-supervisor.sh` on `PATH` (`command -v` is empty on a deployed cell; the farm keeps
+it beside this pass at `~/.pi/agent/scripts/`), so a bare command name would be
+`command not found` on exactly the boxes the red fires on. The pass emits
+`bash <path>` for the first of `$HARNESS_MATERIALISER`, `$HERE/cloud-cell-supervisor.sh`,
+`$O/cloud-cell-supervisor.sh`, `<repo>/scripts/cloud-cell-supervisor.sh` that exists, and says
+`NOT FOUND on this box — set HARNESS_MATERIALISER` when none does — never an implied command
+that cannot run.
 
 `detail=` is bounded at 240 characters, which is why `remedy=` and `preserved=` are
 separate fields: an operator-needed fact must never be at the mercy of a prose truncation

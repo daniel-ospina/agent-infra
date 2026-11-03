@@ -65,6 +65,11 @@
 # the same question in-loop. A second set of codes for the same facts would be the two-vocabularies
 # defect this repo keeps deleting, so this file adopts it verbatim:
 #    0  current       the pin already names the ref tip; NOTHING was changed (the no-op cadence)
+#    1  REFUSED deployed-drift  the pass above SUCCEEDED, but a live controller is EXECUTING a harness
+#                     tree this box cannot match to this repo (gone, or present with no readable *.sh),
+#                     so the code the box runs is not this repo's — a stale copy is not fixed. Recorded
+#                     as `action=deployed-drift`; scoped to the `executes:` token alone, because
+#                     `behind:`/`surface`/`uncommitted-edit:` legitimately describe a working box
 #   10  advanced      the materialiser ran and the pin moved to the ref tip (or the pin record was
 #                     repaired to the tree's head, or preserved dirt was restored as part of it)
 #   11  mended        the pin was missing/empty/not-a-commit; what this box actually runs was recorded
@@ -652,6 +657,25 @@ read_deployed_drift() {
     return 0
 }
 
+# supervisor_cmd — the repair verb the `deployed-drift` refusal RECORDS, as something an operator can
+# paste. ⛔ A REMEDY THAT DOES NOT RUN IS NOT A REMEDY (review P2, #10114). The sentence used to begin
+# with the bare name `cloud-cell-supervisor.sh`, and NOTHING in this fleet puts that name on PATH:
+# `command -v cloud-cell-supervisor.sh` is empty on a deployed cell, and the farm keeps it at
+# `~/.pi/agent/scripts/cloud-cell-supervisor.sh` (`pi-bootstrap`'s `fleet_srcs` farm). So the one
+# actionable output of a red that repeats every tick until someone acts was `command not found` on
+# exactly the population it fires on. Resolve an EXISTING file, in the order the fleet materialises it:
+# an explicit `HARNESS_MATERIALISER`, the farmed shape BESIDE this pass (`$HERE` — measured: the farm
+# carries both files in one directory), the deployed harness dir, then a checkout. Only when NOTHING
+# exists does it fall back to the bare name, and then it says the path is unknown instead of implying
+# a command that resolves.
+supervisor_cmd() {
+    local c
+    for c in "${HARNESS_MATERIALISER:-}" "$HERE/cloud-cell-supervisor.sh" "${O:-}/cloud-cell-supervisor.sh" "${REPO:-}/scripts/cloud-cell-supervisor.sh"; do
+        [ -n "$c" ] && [ -f "$c" ] && { printf 'bash %s' "$c"; return 0; }
+    done
+    printf 'cloud-cell-supervisor.sh (NOT FOUND on this box — set HARNESS_MATERIALISER)'
+}
+
 # finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
 # (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
 # identical from a log, and an operator who reads `current` has to be able to see it WAS current.
@@ -686,7 +710,9 @@ finish() { # <ok> <rc> <verdict-phrase>
                 REC_ACTION=deployed-drift
                 # The remedy lives in its own FIELD (see `REC_REMEDY`), because `detail=` truncates
                 # at 240 and this sentence does not fit in it — measured: `Remedy:` begins at 272.
-                REC_REMEDY="cloud-cell-supervisor.sh apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an executes: state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it)"
+                # ⛔ THE COMMAND IS RESOLVED, NOT NAMED (see `supervisor_cmd`): a bare name is
+                # `command not found` on the farmed cells this red fires on.
+                REC_REMEDY="$(supervisor_cmd) apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an executes: state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it)"
                 REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory that cannot be matched to this repo (gone, or present with no readable *.sh) (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: $REC_REMEDY. Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
                 write_record 0 1 || exit 23
                 err "$REC_DETAIL"

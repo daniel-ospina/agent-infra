@@ -410,6 +410,13 @@ assert_contains "$(cat "$T/t24/state/harness-apply.status" 2>/dev/null)" "action
 # ("and an  state always has a live controller"). Control flow was unaffected, so nothing caught it.
 # This asserts the prose survives intact, which is the only way that class is observable.
 assert_contains "$OUT" "an executes: state always has a live controller" "T24 and the refusal PROSE survives — no backtick command substitution ate the token"
+# ⛔ THE REMEDY MUST BE PASTEABLE ON THE BOX IT FIRES ON (review P2, #10114). Nothing in this fleet puts
+# `cloud-cell-supervisor.sh` on PATH (`command -v` is empty on a deployed cell; the farm keeps it BESIDE
+# this pass at `~/.pi/agent/scripts/`), so a remedy naming the BARE command is `command not found`
+# exactly where the red fires — the same class round 5 fixed for `--force`, one edit further along.
+# Asserted on the RECORD's own `remedy=` field, because that is the copy a lane reads the next day.
+assert_contains "$(grep '^remedy=' "$T/t24/state/harness-apply.status" 2>/dev/null)" "scripts/cloud-cell-supervisor.sh apply --force --pin-only" "T24 the remedy names a RESOLVED path, not a bare command name (a farmed cell has none on PATH)"
+assert_absent "$(grep '^remedy=' "$T/t24/state/harness-apply.status" 2>/dev/null)" "remedy=cloud-cell-supervisor.sh" "T24 …and it does not start with the unresolvable name (the exact pre-change spelling)"
 # ⛔ DISCOVERY ITSELF (review round 8, P2). Every assertion above hands the checker over through
 # HARNESS_APPLY_DRIFT_CMD, so the four-candidate search — the thing this lane had to fix twice because
 # it was dead in the deployed shape — was executed by NO test. Candidate 1 shadows any fixture on this
