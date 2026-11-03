@@ -3785,7 +3785,15 @@ open(sys.argv[2], "w").write(out)
 PY5
 ck "(p2) the pre-#2956 control was actually produced (the noconnect verdict reverted to 'local')" "$([ -s "$MUTP" ]; echo $?)"
 if [ -s "$MUTP" ]; then
+# ⛔ THE AMBIENT `$OR` IS CLEARED HERE TOO (measured 2026-11-03 on a fleet lane box: this arm alone
+# reddened the shard). `rf` clears it, but this arm builds its env BY HAND, and an operator/lane shell
+# that exports `$OR` (every cell's keys.env does) makes `resolve_repo` REFUSE this fixture's local-path
+# origin — so the mutated `--check` failed for a reason that has nothing to do with the verdict under
+# test, and the assertion below saw a NOT PROVISIONABLE line instead of the `check: FAIL the scout`
+# one. Same rule as `rf`'s: the shard must be deterministic on any box, and a case that WANTS a
+# declared target sets `OR=` on its own invocation.
 OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
+        -u OR -u GH_HOST -u CELL_HOME -u GH_CONFIG_DIR \
         HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUTP" --check 2>&1)"
 RC=$?
 ck "(p2) WITHOUT the fix --check FAILS the stale-tracking-ref checkout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
@@ -3917,6 +3925,14 @@ mk_tmux "$D"                    # no live lane for 42
 printf '42\n' > "$D/o/checked.txt"
 rf "$D" refresh
 [ "$RC" -eq 0 ] && ok "release: the pass succeeds (rc=0)" || bad "release: rc=$RC — output: $OUT"
+# ⛔ THE NAMED-REFUSAL LINE IS NOT UNCONDITIONAL NOISE (agent-infra#2741). The registry here is the
+# sandbox's own `claims.sh`, which ANSWERS (rc=0), so the one-per-pass line the no-registry control
+# below pins must be ABSENT — otherwise that control would pass on a shard that prints the sentence
+# on every pass and names nothing.
+case "$OUT" in
+  *"claim read:"*) bad "release: the claim registry NAMED a refusal on a pass whose registry answered — the line is unconditional noise (agent-infra#2741)" ;;
+  *) ok "release: no 'claim read:' line when the registry ANSWERS — the refusal line tracks the read, not the pass" ;;
+esac
 if grep -qx 42 "$D/o/candidates.txt" 2>/dev/null; then
   ok "release: a checked entry with NO keep-fact is RE-JUDGED and the QUEUE FILLS (#42 in candidates.txt)"
 else
@@ -4081,6 +4097,39 @@ esac
 case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
   *checked_refused=claim-registry-absent*) ok "no registry: the funnel records WHY the release refused (checked_refused=claim-registry-absent)" ;;
   *) bad "no registry: the funnel says checked_refused=$(sed -n 's/.*checked_refused=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a pass that could not consult the claim read is then indistinguishable from one that did" ;;
+esac
+
+# ── Control G2 — the NAMED refusal is one sentence per PASS, not one per entry (agent-infra#2741) ──
+# ⛔ THE HALF CONTROL G COULD NOT PROVE. G has ONE entry, so "the reason is printed" and "the reason is
+# printed once" are the same observation there — and a fix that printed the reason inside the per-entry
+# loop would pass G while turning every pass on a registry-less box into `checked.txt` lines of the same
+# sentence (the noisy-refusal shape an operator learns to skip, which is how a refusal stops being
+# read). TWO entries make the two readings differ: KEEP is per entry (both must survive — the
+# fail-closed half), NAMING is per pass (exactly one line).
+# ⛔ AND THE COUNT IS AN ARTIFACT, NOT A LOG LINE: the funnel's `skipped_checked_claim_unknown` must
+# say 2, so the operator line and the state record agree about how many suppressions the box could not
+# decide.
+mk_case checked-no-registry-two
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42,43
+mk_tmux "$D"
+printf '42\n43\n' > "$D/o/checked.txt"
+rm -f "$D/o/claims.sh"
+rf "$D" refresh
+_kept=0
+for _n in 42 43; do grep -qx "$_n" "$D/o/checked.txt" 2>/dev/null && _kept=$((_kept + 1)); done
+[ "$_kept" -eq 2 ] && ok "no registry (2 entries): BOTH suppressions are KEPT — the refusal is per entry" \
+  || bad "no registry (2 entries): only $_kept of 2 entries survived (checked.txt: $(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)) — an unanswerable claim read released one"
+_named="$(printf '%s\n' "$OUT" | grep -c 'claim read:')"
+[ "$_named" = "1" ] && ok "no registry (2 entries): the refusal is NAMED exactly ONCE for the pass (not per entry)" \
+  || bad "no registry (2 entries): the refusal was named $_named time(s) — 0 is the silent-main defect, >1 is per-entry noise the operator learns to skip — output: $OUT"
+case "$OUT" in
+  *"claim read:"*deploy-harness.sh*) ok "no registry (2 entries): the refusal carries the VERIFIED redeploy remedy, not a depth-1 cp" ;;
+  *) bad "no registry (2 entries): the refusal names no verified remedy — output: $OUT" ;;
+esac
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *skipped_checked_claim_unknown=2*) ok "no registry (2 entries): the funnel COUNTS both undecided suppressions (claim_unknown=2) — the state record agrees with the log" ;;
+  *) bad "no registry (2 entries): the funnel says skipped_checked_claim_unknown=$(sed -n 's/.*skipped_checked_claim_unknown=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — the undecided entries are not counted" ;;
 esac
 
 # ── Control H — the release cap defers, and the CURSOR rotates past a permanently-held head ────
