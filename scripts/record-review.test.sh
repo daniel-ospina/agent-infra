@@ -2421,6 +2421,60 @@ if grep -qF 'if [ "$CC_DIFF" = "$DIFF_HASH" ]; then' "$CC_MUT"; then
 else
     bad "11.13j the mutation anchor 'if [ \"\\\$CC_DIFF\" = \"\\\$DIFF_HASH\" ]; then' is gone — re-anchor the mutant rather than dropping the pin"
 fi
+# (k) #10177 / #10522 (defect B): a CARRY that records NO PROOF is not a record.
+#     The measured shape is tortoise#10677's: `mint:"carried"` onto a head whose
+#     tree differed by 4 files/+178, with no `carry_arm` and no `evidence` — a
+#     verdict re-bound to code nobody reviewed, and nothing in the artifact a
+#     reader could check. The answer must be `norecord` (what a reader can act
+#     on), never `head`.
+CC_REC_10177="$CC_FILE-424919.json"
+CC_HEAD_SAVED="$CC_HEAD"
+CC_HEAD="$CC_SHA"
+# A LITERAL 64-hex identity, not $CC_DIFF: §11.13's earlier arms reassign that
+# variable, and a fixture digest that is not a valid identity makes every arm
+# below answer `nodigest` for a reason of the fixture's own making.
+CC_D64="$(printf 'c%.0s' {1..64})"
+printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carried_from":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+    "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_REPO" > "$CC_REC_10177"
+run_check_carry 424919 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13k an UNPROVEN carry is NOT a record (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13k …it answers norecord, not head/carry"
+assert_contains "$(cat "$T/cc-err")" "CARRY with NO recorded proof" "11.13k …and names the reason a reader can act on"
+# (k2) the SAME record WITH its proof binds at the head — the rule discriminates
+#      on provenance, not on the word "carried".
+printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carry_arm":"lane","reviewed_diff_sha256":"%s","evidence":"comment:1","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+    "$CC_SHA" "$CC_D64" "$CC_D64" "$CC_REPO" > "$CC_REC_10177"
+run_check_carry 424919 "$CC_REPO"
+if [ "${CC_OUT%%"$CC_TAB"*}" != "norecord" ] && [ "$CC_RC" != "4" ]; then
+    ok "11.13k2 the same carry WITH its proof is NOT denied as unproven (out=${CC_OUT%%"$CC_TAB"*}, rc=$CC_RC)"
+else
+    bad "11.13k2 a PROVEN carry is still refused as unproven (rc=$CC_RC, out=$CC_OUT) — the rule keys on the word 'carried', not on provenance"
+fi
+# (k3) MUTATION PIN — the unproven-carry rule must be LOAD-BEARING: with the
+#      provenance test removed, the unproven record reads as a healthy head
+#      again. That is the false green defect B is about, so a pin that stays
+#      green on the mutant proves nothing.
+CC_MUT_K="$T/record-review-10177-mutant.sh"
+cp "$RECORD" "$CC_MUT_K"
+if grep -qF 'if [ -z "$CC_ARM_F" ] || [ -z "$CC_EV_F" ]; then' "$CC_MUT_K"; then
+    sed -i.bak 's/^[[:space:]]*if \[ -z "\$CC_ARM_F" \] || \[ -z "\$CC_EV_F" \]; then$/    if false; then/' "$CC_MUT_K"
+    rm -f "$CC_MUT_K.bak"
+    if cmp -s "$RECORD" "$CC_MUT_K"; then
+        bad "11.13k3 the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
+    fi
+    printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carried_from":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+        "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_REPO" > "$CC_REC_10177"
+    run_check_carry 424919 "$CC_REPO" "$CC_MUT_K"
+    if [ "${CC_OUT%%"$CC_TAB"*}" != "norecord" ]; then
+        ok "11.13k3 MUTATION CAUGHT: without the provenance test the UNPROVEN carry stops reading as 'norecord' (it answers ${CC_OUT%%"$CC_TAB"*}) — so 11.13k is load-bearing"
+    else
+        bad "11.13k3 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — 11.13k cannot fail, so it proves nothing"
+    fi
+else
+    bad "11.13k3 the mutation anchor 'if [ -z \"\\\$CC_ARM_F\" ] || [ -z \"\\\$CC_EV_F\" ]; then' is gone — re-anchor the pin rather than dropping it"
+fi
+rm -f "$CC_REC_10177"
+CC_HEAD="$CC_HEAD_SAVED"
 unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_FILE CC_MUT CC_TAB CC_NONDIFF CC_CAP406
 
 
@@ -3925,7 +3979,28 @@ assert_contains "$R13H" "\"reviewed_at\":\"$T1\"" "13h reviewed_at is PRESERVED 
 assert_contains "$R13H" "\"head_sha\":\"$SHA\"" "13h the carried record binds the CURRENT head"
 # NB: no backticks in these strings — they would run as COMMAND SUBSTITUTION
 # (the same defect this file warns about at §11.5e, and one it caught here).
-if grep -q '"evidence"' <<<"$R13H"; then bad "13h the carry claims an unverified evidence field"; else ok "13h the carry claims no evidence field (it was not verified)"; fi
+# ── #10177 / #10522 (defect B): a carry must SAY WHAT IT CARRIED ─────────
+# Before this, a carried record was indistinguishable from a stale re-record: no
+# arm, no reviewed digest, and no evidence (the measured tortoise#10677 record
+# carried `clean` across 4 files/+178 with `evidence:null`). The evidence field
+# is now ALWAYS populated, and never with the caller's unverified --evidence.
+assert_contains "$R13H" '"evidence":"comment:' "13h the carry INHERITS the predecessor's evidence ref (a carry re-binds a verdict, it does not mint one)"
+assert_not_contains "$R13H" '"evidence":""' "13h a carried record NEVER mints an empty evidence field (\"no verdict\", not \"trust me\")"
+assert_contains "$R13H" '"carry_arm":"diff"' "13h the record names the ARM that proved the artifact unchanged"
+assert_contains "$R13H" '"reviewed_diff_sha256":' "13h the record keeps the digest the REVIEWED head carried"
+assert_contains "$R13H" '"reviewed_diff_source":"marker"' "13h …and says where that digest came from"
+# `carried_delta_sha256` is written only when BOTH commits are local, and this
+# fixture's heads are synthetic (`aaaa…`/`bbbb…`), so here the field is legitimately
+# absent. ⛔ ITS WRITER IS THEREFORE **NOT PINNED BY THIS SECTION** — fresh-review
+# cycle 3 measured that deleting the write leaves every assertion above green, and an
+# "absent ⇒ ok" arm is not a test (cycle 2's version claimed a premise no world could
+# falsify). The honest pin needs a LANE-arm fixture with real commits; it is filed as
+# a follow-up rather than faked here. What is asserted instead is the SHAPE of the
+# field whenever it IS present, so a malformed digest still reddens.
+if grep -q '"carried_delta_sha256":"' <<<"$R13H"; then
+    R13H_DELTA="$(sed -n 's/.*"carried_delta_sha256":"\([^"]*\)".*/\1/p' <<<"$R13H")"
+    if [[ "$R13H_DELTA" =~ ^[0-9a-f]{64}$ ]]; then ok "13h carried_delta_sha256 is a 64-hex digest when written"; else bad "13h carried_delta_sha256 is not a 64-hex digest ($R13H_DELTA)"; fi
+fi
 
 # 13i — an unreadable ORIGINAL mint time must be LOUD, never silently the carry
 # time (the pre-tortoise#7391 behaviour that made the mint time unrecoverable).
@@ -4299,6 +4374,10 @@ assert_eq "$_probe_rc" "3" "13o2 T17 positive control: a run that reached its su
 run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
     local pr="$1" sha="$2" cruns="$3"; shift 3
     local rcfile="$T/rc633" errfile="$T/err633" cap="$T/cap633"
+    # RR633_SCRIPT lets a mutation pin run the SAME vector against a mutated copy
+    # of the recorder (the #10177 pin needs it: a rule that cannot be removed in a
+    # copy cannot be shown to be load-bearing).
+    local rec="${RR633_SCRIPT:-$RECORD}"
     : > "$LOG"; : > "$cap"; rm -f "$errfile"
     (
         export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
@@ -4317,7 +4396,7 @@ run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
         export AI_REVIEW_GATE_CHECK_NAME="${AI_REVIEW_GATE_CHECK_NAME-}"
         [ -n "${STUB_HEAD_SHA:-}" ] && export STUB_HEAD_SHA
         rc=0
-        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" || rc=$?
+        bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
     ) 2>/dev/null || true
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
@@ -4469,18 +4548,104 @@ else
     ok "14.9 in-flight gate run suppresses the rerun"
 fi
 
-# 14.10 No SIGNED marker in the body (PATCH failure) → remediation MUST NOT fire:
-#      a rerun of a marker-less body re-evaluates to a guaranteed red. Record
-#      still saves (best-effort).
+# 14.10 A body PATCH failure is a NAMED non-zero state (defect A, #10522), never
+#      "record still saved" + exit 0: the record is invisible to CI in that state,
+#      so reporting success is how a correctly reviewed PR (tortoise#10677) sat
+#      blocked by a bookkeeping failure. The marker is kept so delivery is
+#      retryable WITHOUT re-recording.
 STUB_BODY="PR body — no review evidence yet" STUB_PATCH_FAIL=1 run_record_633 424329 "$SHA" \
     '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":500}]'
-[ "$RECORD_RC" = "0" ] && ok "14.10 PATCH failure still saves the record (rc 0)" || bad "14.10 PATCH failure saves record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ "$RECORD_RC" = "5" ] && ok "14.10 PATCH failure is a NAMED non-zero exit (rc 5)" || bad "14.10 PATCH failure exit (rc=$RECORD_RC, want 5; err=$RECORD_ERR)"
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json" ] && ok "14.10 record written despite PATCH failure" || bad "14.10 record written despite PATCH failure"
-assert_contains "$RECORD_ERR" "could not post review evidence" "14.10 PATCH failure notes on stderr"
+assert_contains "$RECORD_ERR" "body-marker-unposted" "14.10 the failure has a NAMED state (body-marker-unposted)"
+PEND14="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424329.marker"
+[ -f "$PEND14" ] && ok "14.10 the signed marker is KEPT for retry (durable pending file)" || bad "14.10 no durable pending marker — the evidence would be lost"
+if grep -qF 'review recorded:' "$PEND14" 2>/dev/null; then ok "14.10 …and it holds the marker line verbatim"; else bad "14.10 the pending file does not hold the marker line"; fi
 if grep -qF -- "actions/jobs/" "$LOG"; then
     bad "14.10 no rerun without a posted marker (log: $(cat "$LOG"))"
 else
     ok "14.10 no rerun without a posted marker"
+fi
+# 14.10b …and `--flush-pending` DELIVERS it later without a second review and
+#       without touching the record (a re-record would dilute the evidence).
+REC_BEFORE_14B="$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json" 2>/dev/null || true)"
+FL_RC=0
+FL_CAP="$T/flushcap"
+: > "$FL_CAP"; : > "$LOG"
+FL_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$FL_CAP" \
+    STUB_BODY="PR body — no review evidence yet" \
+    bash "$RECORD" --flush-pending 424329 daniel-ospina/agent-infra 2>&1)" || FL_RC=$?
+# ⛔ DELIVERY, NOT DELETION (fresh-review P2): `rm -f` + exit 0 satisfied every
+# other assertion here, and the empty-pending-file mutant did exactly that.
+if grep -qF -- "-X PATCH" "$LOG"; then ok "14.10b the flush actually PATCHed the body (transport, not just an exit code)"; else bad "14.10b the flush exited 0 without a PATCH — deletion is not delivery (log: $(cat "$LOG"))"; fi
+assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
+# 14.10d an EMPTY pending file is NOT a delivered marker (cycle-2 P1: the helper
+#       used to `rm -f` it and return 0, so the flush claimed delivery and then
+#       destroyed the only copy).
+mkdir -p "$F_HOME/.pi/agent/reviews/pending"
+: > "$PEND14"
+: > "$LOG"
+EMPTY_RC=0
+EMPTY_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_BODY="PR body" \
+    bash "$RECORD" --flush-pending 424329 daniel-ospina/agent-infra 2>&1)" || EMPTY_RC=$?
+assert_eq "$EMPTY_RC" "5" "14.10d an EMPTY pending marker fails closed (rc 5) [out: $(printf '%s' "$EMPTY_OUT" | tr '\n' ' ')]"
+if [ -f "$PEND14" ]; then ok "14.10d …and the (corrupt) pending file is KEPT, not silently deleted"; else bad "14.10d the empty pending file was deleted — the marker is now unrecoverable"; fi
+if grep -qF -- "-X PATCH" "$LOG"; then bad "14.10d an empty marker was PATCHed (log: $(cat "$LOG"))"; else ok "14.10d …and nothing was posted"; fi
+rm -f "$PEND14"
+# 14.10e the gh-MISSING arm must not persist an empty marker (cycle-2 P1: MARKER is
+#       built inside the gh-available block, so the old write persisted a 1-byte
+#       file that a later flush "delivered" and deleted).
+if declare -F run_record_no_gh >/dev/null 2>&1; then
+    run_record_no_gh clean-micro "daniel-ospina/agent-infra" 424332 || true
+    assert_eq "$RECORD_RC" "5" "14.10e with gh missing the record is written but the exit is a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+    assert_contains "$RECORD_ERR" "gh CLI is missing" "14.10e …and the message names the cause"
+    if [ -e "$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424332.marker" ]; then
+        bad "14.10e the gh-missing arm persisted a pending marker (it cannot have built one — MARKER is set inside the gh block)"
+    else
+        ok "14.10e …and no empty pending marker was persisted"
+    fi
+else
+    # A GUARD WITH NO ELSE IS A FAIL-OPEN GATE (fresh-review cycle 3): renaming the
+    # helper would delete this P1 pin silently, and the suite would still print a
+    # summary. A skipped vector is a FAILURE, never a pass.
+    bad "14.10e vector SKIPPED — run_record_no_gh is not defined; the empty-pending-marker pin did NOT run"
+fi
+assert_eq "$FL_RC" "0" "14.10b --flush-pending delivers the pending marker (rc 0) [out: $(printf '%s' "$FL_OUT" | tr '\n' ' ')]"
+if [ -f "$PEND14" ]; then bad "14.10b the pending file survives a SUCCESSFUL flush (a retry would re-post forever)"; else ok "14.10b a successful flush clears the pending file"; fi
+assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json")" "14.10b the flush does NOT re-record (the verdict and its reviewed_at are untouched)"
+# 14.10c MUTATION PIN — the exit-5 rule must be load-bearing. With it reverted to
+#       the old `exit 0`, a failed post reads as success again, which is exactly
+#       the invisible-record state defect A reported.
+FL_MUT="$T/record-review-a-mutant.sh"
+cp "$RECORD" "$FL_MUT"
+if grep -qF 'body-marker-unposted: the signed marker for $REPO#$PR could NOT be PATCHed' "$FL_MUT"; then
+    # The mutant restores the pre-fix behaviour on THAT branch only: warn and exit 0.
+    # ⛔ ANCHORED TO THE BRANCH, AND THE SCOPE IS ASSERTED (fresh-review P2): two
+    # lines in the script carry exactly six spaces before `exit 5` (this one and
+    # --recover-body's refusal), so an address-free `s/^      exit 5$/…/` mutates
+    # BOTH — a mutant wider than its declaration, whose extra change could mask a
+    # fail-closed regression in later assertions.
+    sed -i.bak '/body-marker-unposted: the signed marker for \$REPO#\$PR could NOT be PATCHed/,/^      exit 5$/ s/^      exit 5$/      exit 0/' "$FL_MUT"
+    rm -f "$FL_MUT.bak"
+    if cmp -s "$RECORD" "$FL_MUT"; then
+        bad "14.10c the mutant is byte-identical to the script — the exit-5 sed did not apply (re-anchor it)"
+    fi
+    # `diff` exits 1 ON DIFFERENCES, so the pipeline needs `|| true`: under
+    # `set -euo pipefail` the assignment would abort the harness instead of
+    # reporting the count (this bit once, and the suite reported a bare
+    # "aborted BEFORE its summary").
+    MUT_CHANGED="$( { diff "$RECORD" "$FL_MUT" || true; } | grep -c '^<' || true)"
+    assert_eq "$MUT_CHANGED" "1" "14.10c the mutant changes EXACTLY one line (scope = the declared branch)"
+    rm -f "$PEND14"
+    RR633_SCRIPT="$FL_MUT" STUB_BODY="PR body — no review evidence yet" STUB_PATCH_FAIL=1 run_record_633 424331 "$SHA" '[]'
+    if [ "$RECORD_RC" = "0" ] && ! grep -qF 'review recorded:' "$T/cap633" 2>/dev/null; then
+        ok "14.10c MUTATION CAUGHT: with exit 5 reverted to exit 0 the post failure reads as SUCCESS while the body has no marker — so 14.10 is load-bearing"
+    else
+        bad "14.10c mutation NOT caught (rc=$RECORD_RC) — 14.10 cannot fail, so it proves nothing"
+    fi
+    rm -f "$F_HOME/.pi/agent/reviews/pending/daniel-ospina-agent-infra-424331.marker"
+else
+    bad "14.10c the mutation anchor (body-marker-unposted … could NOT be PATCHed) is gone — re-anchor the pin rather than dropping it"
 fi
 
 # 14.11 gh-200 whose payload fails the LOCAL jq stage (shape drift, broken jq):
