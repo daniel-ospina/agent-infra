@@ -236,7 +236,12 @@ ck "(a) the failover is RECORDED (events.log names it)" \
 ck "(a) nothing on the caller's stderr (the streams stay sacred on success)" $([ -s "$TMP/err" ] && echo 1 || echo 0)
 health core0
 ck "(a) --health still reports the core pool as EMPTY after a GraphQL-served read" \
-   $(grep -q '^gh-core-exhausted resets_in=12m$' <<<"$OUT" && echo 0 || echo 1)
+   $(grep -q '^gh-core-exhausted resets_in=12m' <<<"$OUT" && echo 0 || echo 1)
+# The ONE cheap read the fleet uses to tell quota exhaustion from a product fault: a local-only read
+# of the same line must name the budget AND the reset, so the next beat does not file the second as
+# the first (2026-11-03: three lanes called a 0/5000 account a "broken rail").
+ck "(a) … and it names the budget on the same line: GH-BUDGET(remaining=0, resets_at=<ISO>)" \
+   $(grep -Eq 'GH-BUDGET\(remaining=0, resets_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\)' <<<"$OUT" && echo 0 || echo 1)
 ck "(a) --health exits 3 (a NAMED state, not a generic failure)" $([ "$RC" -eq 3 ] && echo 0 || echo 1)
 
 echo "── (a2) the fleet LEARNS: ONE refusal + ONE exempt probe makes every later lane fail over ────"
@@ -426,7 +431,7 @@ ck "(h) the both-pools refusal still names the state" \
    $(grep -q 'gh-core-exhausted resets_in=' <<<"$ERR" && echo 0 || echo 1)
 health graphqldead
 ck "(h) --health does NOT report gh-ok while the core record is still live" \
-   $(grep -q '^gh-core-exhausted resets_in=12m$' <<<"$OUT" && [ "$RC" -eq 3 ] && echo 0 || echo 1)
+   $(grep -q '^gh-core-exhausted resets_in=12m' <<<"$OUT" && [ "$RC" -eq 3 ] && echo 0 || echo 1)
 run graphqldead api repos/o/r/pulls/7 --jq .head.sha
 ck "(h) the SECOND core read still fails over rather than being sent to the empty pool" \
    $([ "$(reqs 'api graphql')" -ge 1 ] && echo 0 || echo 1)
@@ -700,7 +705,7 @@ health coreok
 ck "(m3) an undated record is STILL a named state (was gh-ok for the 8 NO_WAIT callers' shape)" \
    $([ "$RC" -eq 3 ] && grep -q '^gh-core-exhausted' <<<"$OUT" && echo 0 || echo 1)
 ck "(m3) … and it does NOT print an invented resets_in=<Nm> (was 15m for a 12m window)" \
-   $(grep -q 'resets_in=?$' <<<"$OUT" && echo 0 || echo 1)
+   $(grep -q 'resets_in=? GH-BUDGET(remaining=?, resets_at=?)' <<<"$OUT" && echo 0 || echo 1)
 printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$(( $(date +%s) - 1000 ))" > "$GH_LIMIT_DIR/health"
 health coreok
 ck "(m3) … but an undated record outlives its bound, like every other record here" \
