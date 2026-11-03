@@ -910,6 +910,26 @@ jobs:
         # #3131 -- never on a PR), and a fail-open regression in a guard must not reach
         # main before anything reads it.
         run: node extensions/main-worktree-guard/test-script-backdoor.mjs
+      - name: main-worktree-guard git command POSITION (#1158)
+        # #1158: the classifier treated ANY token whose basename was `git` as the
+        # start of a git invocation, so an OPERAND `git` manufactured a phantom
+        # invocation whose "verb" was the NEXT SHELL OPERATOR — and the
+        # unknown-verb arm (fail-closed) then refused the whole script. Measured:
+        # the CANONICAL defensive idiom
+        #   command -v git >/dev/null 2>&1 || { echo "no git"; exit 1; }
+        # refused `scripts/orchestrator-harness/check-deployed-drift.sh` and
+        # `harness-refresh.sh`, which carry zero blocked git operations. This
+        # suite pins the positional predicate in BOTH directions — operand shapes
+        # ALLOW, command-position and the wrapper spawners that really execute
+        # their trailing argv still REFUSE — and CARRIES the five remaining
+        # measured false positives as explicit KNOWN-FALSE pins (with controls)
+        # so the next lane inherits the map instead of rediscovering it.
+        # Its own step, like #709/#744/#1484 above, because the
+        # `extensions/*/test*.mjs` glob in ci-main.yml runs on the push lane only:
+        # a fail-open regression in the git-command classifier must not reach main
+        # before anything reads it.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
+        run: node extensions/main-worktree-guard/test-command-position.mjs
       - name: main-worktree-guard sanctioned-script IDENTITY + pin (#2332)
         # The exemption for `SANCTIONED_SCRIPT_RELPATHS` was a realpath STRING
         # EQUALITY against the module's own checkout, which is only correct where
