@@ -984,7 +984,10 @@ def acquire_lock(label):
     locks = os.path.join(STATE, "locks")
     os.makedirs(locks, exist_ok=True)
     path = os.path.join(locks, label + ".lock")
-    for _ in range(2):
+    # 3, not 2: the re-examine paths (`continue` when a racer replaced the file we inspected) burn
+    # an iteration without attempting a create, so 2 could discard a legitimate steal on the LAST
+    # iteration and answer "already running (lock held)" for a lock that no longer exists.
+    for _ in range(3):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         except FileExistsError:
@@ -1051,7 +1054,11 @@ def acquire_lock(label):
             continue
         except OSError:
             return None
-        if seen is None or (now.st_dev, now.st_ino) != (seen.st_dev, seen.st_ino):
+        # `seen is None` means we could not read the lock to identify it (EACCES/EMFILE/EIO on a
+        # 0-mode or foreign-uid file). That must stay STEALABLE, exactly as before this change:
+        # refusing it would make an unreadable stale lock a permanent skip — the very "a crashed run
+        # must not disable its job forever" contract this function's docstring makes.
+        if seen is not None and (now.st_dev, now.st_ino) != (seen.st_dev, seen.st_ino):
             continue
         try:
             os.unlink(path)
