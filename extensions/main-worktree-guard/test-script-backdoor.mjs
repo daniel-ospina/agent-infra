@@ -436,8 +436,16 @@ async function partB() {
     writeFileSync(shapeCopy, '#!/bin/bash\ngrep -qa m <(head -c 10 "$HOME/x")\n');
     const shapeRes = await bash("bash scripts/shim-shape", hub);
     expectTrue("B5c3 (b): a NON-sanctioned body with the same expanded-operand shape → BLOCKED (#709), so the arm is still live",
-      blocked(shapeRes) && /#709/.test(String(shapeRes.reason)) && /shell-expansion form/.test(String(shapeRes.reason)),
-      `reason=${String(shapeRes && shapeRes.reason).split("\n")[0]}`);
+      // #3243: the pin used to require the literal words "shell-expansion form".
+      // That phrase is the MISATTRIBUTION this issue removes for a BODY finding
+      // (it describes the command's own path, which was literal here) — the arm
+      // is pinned instead on the observation it now makes: the nested operand,
+      // the LINE, and the file it was found in. Still "cannot pass for the wrong
+      // reason": the #709 form plus that exact sentence is only produced by the
+      // #1228 body arm.
+      blocked(shapeRes) && /#709/.test(String(shapeRes.reason)) &&
+      /is invoked as a script \(line 2 of .*shim-shape\)/.test(String(shapeRes.reason)),
+      `reason=${String(shapeRes && shapeRes.reason).split("\n").slice(0, 4).join(" ")}`);
     // The #1129 adversarial-review P0 boundary: a committed git-DESTRUCTIVE
     // framework helper is NOT on the list and must stay refused.
     expectTrue("B5d (b): `scripts/cleanup-worktree.sh` (committed, destructive) is still refused",

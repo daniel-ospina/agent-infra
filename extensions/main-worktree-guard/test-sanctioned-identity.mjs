@@ -309,7 +309,13 @@ if (typeof stripTypeScriptTypes !== "function" || (typeof register !== "function
     const planted = plant(join(work, "deploy"));
     const plantedRes = await bash(guard, `bash "${planted}" --help`, hub);
     expect("(b3) unaudited bytes at a SANCTIONED relpath under the MODULE root → BLOCKED (#709: the DIGEST decides, not the path)",
-      blocked(plantedRes) && /#709/.test(String(plantedRes.reason)) && /shell-expansion form/.test(String(plantedRes.reason)), true);
+      // #3243: the wording half used to require "shell-expansion form" — the very
+      // misattribution #3243 removes for a BODY finding (the command's own path
+      // here is a literal absolute path). It now requires the OBSERVATION the arm
+      // makes instead: the nested operand, its line, and the file. The DIGEST key
+      // this arm exists for is untouched (M6 below still requires it to admit).
+      blocked(plantedRes) && /#709/.test(String(plantedRes.reason)) &&
+      /is invoked as a script \(line 2 of .*scratch-worktree\.sh\)/.test(String(plantedRes.reason)), true);
 
     // ── (c) THE AUDITED BYTES AT AN ARBITRARY PATH → BLOCKED (#1485 B5b) ──
     // The pin alone would exempt this; the framework-root half is what does not.
