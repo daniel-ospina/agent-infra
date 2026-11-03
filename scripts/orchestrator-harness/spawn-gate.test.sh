@@ -294,11 +294,11 @@ for bad in "08" "abc" "" "9223372036854775807" " 5"; do
   ck "MAX_LOAD='$bad' is coerced to a usable integer (got '${got:-<empty>}')" $rc
 done
 # ... and the derived default uses the PORTABLE probe, not `|| echo 4` (which pinned every Linux
-# cell to 4 cores / MAX_LOAD=40, #1702).
+# cell to 4 cores / MAX_LOAD=10, #1702).
 want_ncpu="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 got="$(env -u MAX_LOAD bash -c '. "$1"; printf "%s" "$MAX_LOAD"' _ "$GATE" 2>/dev/null)"
-[ "$got" = "$(( 10#$want_ncpu * 10 ))" ]; rc=$?
-ck "the derived MAX_LOAD is 10 x the PORTABLE core count (got '${got:-<none>}', want $(( 10#$want_ncpu * 10 )))" $rc
+[ "$got" = "$(( 10#$want_ncpu * 5 / 2 ))" ]; rc=$?
+ck "the derived MAX_LOAD is 2.5 x the PORTABLE core count (got '${got:-<none>}', want $(( 10#$want_ncpu * 5 / 2 )))" $rc
 
 # ⛔ A 0-VALUED PROBE IS A FAILED PROBE, NOT "NO CORES" (P1, 2026-10-15 review). `10 * 0` is 0,
 # `is_num 0` is TRUE, and `[ "$l" -lt 0 ]` is ALWAYS FALSE — so a probe that returns 0 CLOSES the
@@ -316,19 +316,19 @@ for probe in 0 abc "" 999999999 1844674407470955161 9223372036854775807 99999999
   # INERT. A garbage probe must fall back to the DOCUMENTED DEFAULT, so that is what is asserted.
   # ⚠️ THE INVARIANT, EXACTLY, because an earlier comment generalised one digit past what it verifies:
   # a probe that is NON-NUMERIC, ZERO, or whose derivation produces TEN OR MORE digits falls back to
-  # 40. A 1–9 digit probe is a PLAUSIBLE core count and is accepted verbatim — so `hw.ncpu=99999999`
-  # still yields an INERT ceiling of 999999990 in ALL THREE copies that derive it (this file,
+  # 10. A 1–9 digit probe is a PLAUSIBLE core count and is accepted verbatim — so `hw.ncpu=99999999`
+  # still yields an INERT ceiling of 249999997 in ALL THREE copies that derive it (this file,
   # orch-loop.sh, install.sh). That is a SHARED residual, recorded in port-provenance.txt; the durable
   # fix is a plausibility bound on the core count, which the held copies must adopt together.
-  [ "$got" = "40" ]; rc=$?
-  ck "a core probe of '$probe' falls back to the default ceiling 40 (got MAX_LOAD=${got:-<empty>})" $rc
+  [ "$got" = "10" ]; rc=$?
+  ck "a core probe of '$probe' falls back to the default ceiling 10 (got MAX_LOAD=${got:-<empty>})" $rc
 done
 # ... and the fallback must not have REPLACED the derivation: a plausible probe still yields 10 x it.
 # Without this pair, hardcoding the default would satisfy the loop above.
 printf '#!/bin/sh\n[ "$1" = "-n" ] && [ "$2" = "hw.ncpu" ] && { echo 8; exit 0; }\nexit 1\n' > "$TMP/bin/sysctl"
 got="$(env -u MAX_LOAD PATH="$TMP/bin:$PATH" bash -c '. "$1"; printf "%s" "$MAX_LOAD"' _ "$GATE" 2>/dev/null)"
-[ "$got" = "80" ]; rc=$?
-ck "a plausible core probe of 8 still DERIVES 10 x it — the fallback did not become the value (got '${got:-<none>}')" $rc
+[ "$got" = "20" ]; rc=$?
+ck "a plausible core probe of 8 still DERIVES 2.5 x it — the fallback did not become the value (got '${got:-<none>}')" $rc
 rm -f "$TMP/bin/sysctl"
 rm -f "$TMP/bin/sysctl"
 # ... and the repair must not swallow the operator's DELIBERATE "spawn nothing": MAX_LOAD=0 is
