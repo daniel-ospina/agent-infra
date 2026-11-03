@@ -1571,10 +1571,14 @@ DRIFTED=""
 # all: it is the STABLE program the plist execs (see the STABLE_PROG block above), so a `$O` copy that
 # drifted from the pin is the one file whose divergence turns every launchd tick into exit 127 while
 # `launchctl list` still reports the job `loaded`. It is also a $O seed, so it belongs here.
-# ⛔ BOTH NAMES ARE MAINTAINED, NOT EITHER: `stall-fix.sh` came from #2929 and `orch-pin-exec.sh` from
-# #3309, and neither side of that merge was a superset — dropping one leaves a file its caller executes
-# unchecked, which is the exact defect this list exists to catch.
-for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
+# mandate-preflight.sh (#3377) is the disclosure half of the same class: both `run_agent` copies resolve
+# it at SPAWN time, and a `$O` that lost it makes every lane report the mandate files' state as
+# UNVERIFIED — the silence this change exists to end, restored silently.
+# ⛔ EVERY NAME IS MAINTAINED, NOT EITHER: `stall-fix.sh` came from #2929, `orch-pin-exec.sh` from
+# #3309, `mandate-preflight.sh` from #3377, and no side of any of those merges was a superset —
+# dropping one leaves a file its caller executes unchecked, which is the exact defect this list exists
+# to catch. A rebase conflict here is resolved by KEEPING BOTH LISTS' NAMES, never by picking a side.
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
