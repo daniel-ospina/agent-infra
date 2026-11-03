@@ -83,6 +83,68 @@ LANES = [
 SUSPECT_AGE = 300      # 5 min
 CHILD_SUSPECT_AGE = 600  # 10 min
 
+# ── the lane census gets a SECOND population to disagree with ─────────────
+# ⛔ A FROZEN ROSTER IS NOT A CENSUS (measured 2026-11-03). `LANES` above is a fixed list of
+# seven session ids. On a box where none of them is present -- a fresh cell, a reboot, a
+# renamed lane -- the table still prints seven rows, each one `pid None / life ?`, and because
+# every row is UNMEASURED rather than FLAGGED nothing lands in `suspects`; with a readable
+# hook store the summary underneath then reads `✅ no suspects`. That is a false PASS from a
+# liveness instrument: a clean result over ZERO measured lanes, while pi processes were
+# demonstrably running on the box. Reproduced with a readable store containing no rostered
+# session: seven unmeasured rows and `✅ no suspects`, no mention of the running processes.
+#
+# The cure is not a bigger roster (a hardcoded list can always fall behind). It is to count a
+# population the roster does not control -- the process table -- and DISAGREE LOUDLY when the
+# two cannot be reconciled. `lanes=<N> pi=<M>` both unmeasured is a fact worth an alarm; it is
+# never a clean scan.
+PI_PS_ARGV = ["ps", "-Ao", "pid=,command="]
+
+
+def pi_process_count():
+    """How many `pi` processes are running on THIS box, or None when unreadable.
+
+    `None` is the abstention and is NOT interchangeable with `0`: a failed `ps` must never
+    manufacture the "no processes, so no mismatch" clean result this reconciliation exists to
+    prevent (the same unknown-vs-zero rule the identity probe follows). A non-`pi` argv0 is
+    ignored, and a command that merely CONTAINS "pi" (a path, a chatty `-c` wrapper) is not
+    counted -- the matcher reads argv0's basename only.
+    """
+    try:
+        cp = subprocess.run(PI_PS_ARGV, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if cp.returncode != 0:
+        return None
+    n = 0
+    for line in cp.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            continue
+        argv0 = parts[1].split()[0]
+        base = os.path.basename(argv0)
+        if base == "pi" or base.startswith("pi-"):
+            n += 1
+    return n
+
+
+def lane_census(attributed, pi_count, roster_size):
+    """The census note, or None when the two populations are reconcilable.
+
+    `attributed` is the number of rostered lanes the ONE verdict function positively bound to a
+    live incarnation (`observed == holder`) -- never a lane that merely has a record. A lane whose
+    identity read ABSTAINED is not attributed; counting it as alive is the defect this module
+    already refuses one level down.
+
+    A mismatch needs BOTH numbers known: an unreadable process table (`pi_count is None`) and a
+    genuinely empty one (`0`) both abstain, in opposite directions, and neither may be reported as
+    agreement or as an alarm.
+    """
+    if pi_count is None or pi_count <= 0 or attributed > 0:
+        return None
+    return ("LANE CENSUS MISMATCH: %d pi process(es) running but 0 of the %d rostered lanes was "
+            "attributed alive — the roster is stale on this box, so every row above is "
+            "UNMEASURED (not dead, and NOT a clean result)" % (pi_count, roster_size))
+
 
 def walk_records(obj, out):
     """Collect every dict that looks like a session record, whatever the hook file's shape."""
@@ -626,6 +688,7 @@ def main():
     print(f"fleet health — {time.strftime('%H:%M:%S', time.localtime(now))}\n")
     print(f"{'lane':4} {'pid':>7} {'life':9} {'q':>2} {'ctx-age':>8} {'cpu-delta':>10}  flag")
     print("-" * 62)
+    attributed = 0
     for lane, sid in LANES:
         rec = hook.get(sid, {})
         pid = rec.get("pid")
@@ -647,6 +710,8 @@ def main():
         flag = ""
         quiet = ""
         observed = _observed(pid, rec.get("pidStartSeconds")) if pid else None
+        if observed == HOLDER_OBSERVED:
+            attributed += 1      # positively bound to a live incarnation — see lane_census()
         if observed in DEAD_OBSERVED:
             # A positively absent/zombie incarnation: the process is gone, so the
             # transcript ladder has nothing left to add.
@@ -678,6 +743,16 @@ def main():
 
         age_txt = f"{age:.0f}s" if age is not None else "-"
         print(f"{lane:4} {str(pid):>7} {life[:9]:9} {str(depth):>2} {age_txt:>8} {delta_txt:>10}  {flag}")
+
+    # ── lane census reconciliation (see lane_census) ────────────────────
+    # The roster above is a frozen list; the process table is not. When the roster accounts
+    # for NONE of the running pi processes, the table is not a census and must say so rather
+    # than let the summary below read as a clean scan.
+    census_note = lane_census(attributed, pi_process_count(), len(LANES))
+    if census_note:
+        print()
+        print(f"⚠️  {census_note}")
+        suspects.append(("census", census_note))
 
     # --- task children -------------------------------------------------
     kids = []
@@ -728,6 +803,13 @@ def main():
         # SUPPRESS a suspect the ladder did find, which is the same defect one level up
         # from where the identity abstention was fixed.
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
+        return 1
+    if census_note:
+        # ⛔ REPORTED, NOT DEGRADED TO A WARNING. The lane rows were printed, but none of them
+        # was attributed: the scan did not establish lane identity, which is the same
+        # INCOMPLETE class as the unreadable store above and must reach a scheduler the same
+        # way (a census that prints rows and exits 0 is exactly the false PASS this guards).
+        print("⚠️  lane census INCOMPLETE (0 rostered lanes attributed) — the rows above are not a verdict")
         return 1
     if sched_alarms:
         # A reaper alarm does not make the LANE rows wrong, so it is reported after them — but it
