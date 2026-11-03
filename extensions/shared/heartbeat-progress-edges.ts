@@ -1068,6 +1068,26 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "#1932 (review of PR #1949) — the STATED free-disk floor the reaper's per-pass capacity line asserts against (2 GiB = one MEASURED lane env, ~1.85 GB of real non-shared disk per lane), so 'above the floor' means 'one more lane still fits'. Registered rather than left as a bare constant because it bounds how much of the box the fleet may consume, and a bound only the reaper knows about is invisible to the audit that exists to notice exactly that. It ASSERTS, it does not reclaim: a breach exits 5 (the reaper's own `over-bound` code — `disk-reaper.sh` KEEPS that 5 since agent-infra#2156 landed, so an apply pass records `rc=3 verdict_venv=fail-closed` and a dry run records `rc=5 verdict_venv=over-bound`; the old `worst_rc` drop of 5 that recorded `rc=0 verdict=ok` is gone, do not restate it) and is named on the report, and no live lane's env is ever deleted to get back above it. Unlike the age floor this is a SPACE bound, so it answers to the hygiene axis (disk reapers that are not agent-stall detectors), not retention.",
   },
+  {
+    name: "STALL_FIX_BRIEF_MAX_AGE_MIN",
+    owners: ["scripts/orchestrator-harness/stall-fix.sh"],
+    value: "${STALL_FIX_BRIEF_MAX_AGE_MIN:-1440}",
+    axis: "retention",
+    guardedBy:
+      "scripts/orchestrator-harness/stall-fix.test.sh §E (the sinks are BOUNDED) — a brief past this floor is PRUNED while a neighbouring file the script does not own is left alone, an explicit 0 is CLAMPED so a 2 h-old brief SURVIVES (unclamped it is the eviction), the clamped default still prunes a genuinely OLD brief (the clamp is not an off-switch), and a NON-NUMERIC bound falls back to the default and still prunes rather than making the sweep a no-op; the SAME bound prunes the per-dispatch worker REPORT (§E2) and the worker TRANSCRIPT under `$O/bg/stallfix-*` (§E3, scoped so another lane's transcript is never touched), which are the largest two sinks; §E4 drives the FLOOR — a value BELOW the worker's own liveness pin is RAISED to it, so a knob of 5 cannot prune a LIVE worker's `.pid` (its survival is what keeps `wt_in_use` able to see that worker), while a transcript older than the raised floor is still pruned (the floor is not an off-switch); the 1440 value itself is pinned by THIS registry's forward check",
+    overrides: ["STALL_FIX_BRIEF_MAX_AGE_MIN=1440", 'STALL_FIX_BRIEF_MAX_AGE_MIN="$STALL_FIX_PIN_MIN"'],
+    note: "#2929 — how long a rendered stall brief under `state/` may live before the next dispatch prunes it (24 h, and the bound is CLAMPED to a positive number with 1440 as the fallback, so neither `0` nor a typo can turn the sweep into either an off-switch or a no-op). Registered rather than exempted because it IS a retention bound on exactly the population `#2929` measured — one brief per `DRAIN_STALL_FIX_EVERY` stalled PASSES (~120 files/day, unbounded, on a box that is stalled BECAUSE nothing lands) — and a bound only the dispatcher knows about is invisible to the audit that exists to notice precisely that. The clamp is the half that matters: it is the same shape `mp_recent_land` carries, and `0` here would mean 'prune every brief I just wrote'. ⛔ THE SECOND OVERRIDE IS A FLOOR, NOT A DEFAULT: this knob is RAISED to `STALL_FIX_PIN_MIN` because the prune and the liveness pin guard the SAME files — see that term.",
+  },
+  {
+    name: "STALL_FIX_PIN_MIN",
+    owners: ["scripts/orchestrator-harness/stall-fix.sh"],
+    value: null,
+    axis: "retention",
+    overrides: ["STALL_FIX_PIN_MIN=35"],
+    guardedBy:
+      "scripts/orchestrator-harness/stall-fix.test.sh §D (an AGED pidfile lifts the pin: a stale pid the kernel recycled cannot freeze the worktree forever) + §E4 (the retention prune cannot evict a LIVE worker's `.pid`, which is what keeps `wt_in_use` able to see that worker)",
+    note: "#2929 (fresh-context review of #3181, P1) — DERIVED, so `value: null`: `(DRAIN_STALL_FIX_TIMEOUT + 300) / 60`, i.e. a worker's own maximal wall clock plus its launch grace (35 min at the 1800 s default). It is the age past which a `$O/bg/stallfix-*.pid` cannot describe a live worker — `.rc` is written on the dispatcher's exit path, NOT on SIGKILL/OOM/reboot, and no reaper in this tree DELETES a `$O/bg/*.pid`, so without an age bound a recycled pid pins the shared worktree forever and a days-long stall gets `file:line` reports resolved against a frozen tree. Registered rather than left as a bare constant because it is ALSO the retention floor `STALL_FIX_BRIEF_MAX_AGE_MIN` is raised to, and the two bounds were INDEPENDENT before this: a retention knob below the pin deleted the live worker's own pidfile, after which the pin found nothing and the tree was re-pointed under a worker still reading it. One derived constant now answers both, so they cannot disagree again.",
+  },
   // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
   //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in
   //   #1552). They classify a lane as idle / free capacity; they are liveness
