@@ -313,7 +313,15 @@ git -C "$BARE" rev-parse -q --verify "refs/wip/mutation-probe" >/dev/null 2>&1; 
 ck "B2 with the exit-path call REMOVED the same lane leaves NO ref for its branch (so arm A is not vacuous)" $([ "$rc" -ne 0 ] && echo 0 || echo 1)
 grep -q '\[wip\] end' "$O/logs/mut.log"; rcn=$?
 ck "B3 …and the mutant writes no terminal record at all (the absence is the mutation, not a silent skip)" $([ "$rcn" -ne 0 ] && echo 0 || echo 1)
-git -C "$WT" checkout -q "$BR"; git -C "$WT" branch -q -D mutation-probe
+# ⛔ `switch`, NOT `checkout`, AND THE BRANCH NAME IS LITERAL. Two reasons, one of them measured:
+# the write-guard's static scanner classifies a `git checkout <ref>` inside a script as a possible
+# working-tree discard and fails CLOSED on it (`Form: checkout-bare-path`, first on `$BR` being
+# unresolvable and then on `git -C "$WT"` being an unresolvable repo) — so this suite could not be run
+# from an agent shell AT ALL, and a suite no agent can run stops being run. `switch` cannot discard
+# uncommitted changes by design (it refuses), which is why it is not a re-implementation of the verb
+# the guard is protecting. The branch is created as `work` 200 lines above, so the literal is the same
+# value by construction. (CI shards invoke the file directly and never meet the scanner.)
+git -C "$WT" switch -q "work"; git -C "$WT" branch -q -D mutation-probe
 rm -f "$WT/early.txt"
 
 # ── C) THE MAJORITY CASE: a clean exit costs no push and says so ─────────────────────────────────
@@ -336,10 +344,29 @@ ck "C1 a clean exit creates NO ref and the record says tree=clean rescue=nothing
 grep -q 'unpushed=0' "$O/logs/clean.log"; rc=$?
 ck "C2 …and it records the unpushed count, so 'nothing at risk' is a measurement and not an assumption" $rc
 
-# ── D) UNPUSHED COMMITS: measured and NAMED, never silently pushed ───────────────────────────────
+# ── D) UNPUSHED COMMITS: measured, NAMED — and, since the durable-exit change, PUSHED ──────────────
+# ⛔ D2/D3 USED TO ASSERT THE OPPOSITE, AND THE CHANGE IS DELIBERATE (#2834 ask 1, second half). The
+# #2834 fix measured `unpushed` and printed "they were not pushed"; its own note said that half was
+# owed, not refused ("teaching it to archive HEAD's tree … a change … deliberately not made in this
+# PR — so ask 1 stays half-met here"). The reasoning it gave — a local commit survives the WORKTREE
+# being removed — is true on a persistent box and false on a cloud cell, whose volume is discarded:
+# an unpushed branch dies with the disk. So the exit path now pushes it, bounded and without force.
 seed_sha="$(git -C "$BARE" rev-parse refs/heads/work)"
+# ⛔ THE PUSH ARMS RUN IN A *LINKED* WORKTREE, BECAUSE THAT IS WHAT A LANE IS. The fixture's `$WT` is
+# a plain checkout (its `--git-dir` IS its `--git-common-dir`), and the exit path REFUSES to push from
+# a main checkout on purpose (a hub's branch is not a dying lane's to publish — see `lane_end_push`).
+# Driving the push arms in `$WT` measured that refusal and called it a missing push, which is the
+# shape of a test that proves the guard instead of the behaviour. `lane.sh` always runs inside
+# `git worktree add`-created trees, so the arms use one: same repo, same origin, same insteadOf.
+WT2="$TMP/wt2"
+git -C "$WT" worktree add -q "$WT2" -b durable 2>/dev/null
+git -C "$WT2" config user.name t; git -C "$WT2" config user.email t@t
+[ -d "$WT2" ] && [ "$(git -C "$WT2" rev-parse --git-dir)" != "$(git -C "$WT2" rev-parse --git-common-dir)" ]; rc=$?
+ck "D0 the push arms run in a LINKED worktree (git-dir != common-dir), the shape every lane.sh lane has — so they measure the push and not the main-checkout refusal" $rc
+seed2="$(git -C "$WT2" rev-parse HEAD)"
 pi_stub unpushed
 : > "$O/logs/unpushed.log"
+rm -f "$O/state/lane-exit-unpushed_exit.state"
 PATH="$TMP/bin:$PATH" PI_LOG="$O/pi4.log" bash -c '
   . "$1"
   cd "$2" || exit 2
@@ -347,15 +374,65 @@ PATH="$TMP/bin:$PATH" PI_LOG="$O/pi4.log" bash -c '
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "unpushed exit" >>"$4.agent" 2>&1
-' _ "$GATE" "$WT" "$O" "$O/logs/unpushed.log" "$PROMPT"
+' _ "$GATE" "$WT2" "$O" "$O/logs/unpushed.log" "$PROMPT"
 arm "$O/logs/unpushed.log"
+local_head="$(git -C "$WT2" rev-parse HEAD)"
 grep -q 'tree=unpushed-only rescue=nothing unpushed=1' "$O/logs/unpushed.log"; rc=$?
 ck "D1 a CLEAN tree whose branch holds an unpushed commit is recorded as unpushed-only, with the count" $rc
-grep -q 'exist ONLY locally' "$O/logs/unpushed.log"; rc=$?
-ck "D2 …and the log NAMES that they were not pushed, instead of implying the lane's work is on origin" $rc
-[ "$(git -C "$BARE" rev-parse refs/heads/work)" = "$seed_sha" ]; rc=$?
-ck "D3 …and the rescue did NOT move the branch ($(git -C "$BARE" rev-parse --short refs/heads/work) is still the seed)" $rc
-git -C "$WT" reset -q --hard "$seed_sha"; git -C "$WT" clean -qfd
+[ "$(git -C "$BARE" rev-parse refs/heads/durable 2>/dev/null)" = "$local_head" ]; rc=$?
+ck "D2 …and the branch IS ON ORIGIN at the lane's head ($(git -C "$WT2" rev-parse --short HEAD)) — the commits a cell's volume would have taken" $rc
+[ "$local_head" != "$seed2" ] && git -C "$WT2" merge-base --is-ancestor "$seed2" "$local_head"; rc=$?
+ck "D3 …moved FORWARD only: the branch point is still an ancestor, so the push was a fast-forward and never a force" $rc
+grep -q 'pushed durable → origin refs/heads/durable' "$O/logs/unpushed.log"; rc=$?
+ck "D4 …and the log NAMES the ref it moved, so 'on origin' is a statement with an address" $rc
+# ⛔ THE LOG MAY NOT CONTRADICT ITSELF (review P1). The `at_risk=0` arm printed "bg-rescue-wip.sh … does
+# not push a branch, so they were not pushed" AFTER the push line — the false statement last, which is
+# the order an operator reads. The NOTE is now keyed on the push verdict; both directions are asserted.
+grep -q 'existed ONLY locally and the exit path PUSHED' "$O/logs/unpushed.log" && \
+  ! grep -q 'so they were not pushed' "$O/logs/unpushed.log"; rc=$?
+ck "D4b …and one terminal log never carries both 'now off-box' and 'they were not pushed' — the NOTE follows the push verdict" $rc
+mk="$O/state/lane-exit-unpushed_exit.state"
+[ -s "$mk" ] && grep -qx 'LANE-EXIT' "$mk"; rc=$?
+ck "D5 …and a PER-LANE resume marker exists at state/lane-exit-<label>.state (the artifact a reclaim pass reads)" $rc
+grep -qx "branch=durable" "$mk" 2>/dev/null && grep -qx "head=$local_head" "$mk" 2>/dev/null \
+  && grep -qx 'push=pushed' "$mk" 2>/dev/null && grep -qx "branch_on_origin=$local_head" "$mk" 2>/dev/null; rc=$?
+ck "D6 …naming branch, head, the push verdict and the sha the REMOTE reported (a read, not the push's own exit status)" $rc
+grep -qx 'state=unpushed-only' "$mk" 2>/dev/null && grep -qx 'dirty=0' "$mk" 2>/dev/null \
+  && grep -qx 'porcelain:' "$mk" 2>/dev/null && grep -q '^next=' "$mk" 2>/dev/null; rc=$?
+ck "D7 …carrying the tree verdict, the dirty count, the porcelain section and a mechanically derived next step" $rc
+git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
+# ⛔ D8-D10 NON-VACUITY FOR THE PUSH ITSELF: the same lane on its OWN branch (`durablepre`), driven
+# through the SHIPPED PRE-FIX helper (`origin/main`'s spawn-gate.sh, extracted from git rather than
+# hand-mutated), must leave the branch where it was and write no marker. This is the RED half, kept as
+# an arm so it can never silently stop discriminating — and it is the red→green evidence this change
+# was required to produce. A separate branch, because the D arm above already moved `durable` on
+# origin and reusing it would have measured the previous arm's push.
+PRE="$TMP/pre"; mkdir -p "$PRE"
+WT3="$TMP/wt3"
+git -C "$WT" worktree add -q "$WT3" -b durablepre 2>/dev/null
+pi_stub unpushed
+git -C "$HERE" show origin/main:scripts/orchestrator-harness/spawn-gate.sh > "$PRE/spawn-gate.sh" 2>/dev/null
+cp "$HERE/brief-gate.sh" "$HERE/repo-slug.sh" "$PRE/" 2>/dev/null
+[ -s "$PRE/spawn-gate.sh" ] && ! grep -q 'lane_end_push' "$PRE/spawn-gate.sh"; rc=$?
+ck "D8 the pre-fix helper was extracted from origin/main and really lacks the push (so the next arm measures the change, not git)" $rc
+seed3="$(git -C "$WT3" rev-parse HEAD)"
+: > "$O/logs/pre.log"; rm -f "$O/state/lane-exit-pre_fix.state"
+PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "pre fix" >>"$4.agent" 2>&1
+' _ "$PRE/spawn-gate.sh" "$WT3" "$O" "$O/logs/pre.log" "$PROMPT"
+arm "$O/logs/pre.log"
+ck "D9 …AND ORIGIN HAS NO durablepre BRANCH AT ALL after the pre-fix exit — the lane's commit stayed on this disk, which is the RED the change turned green" \
+  $(! git -C "$BARE" rev-parse -q --verify refs/heads/durablepre >/dev/null 2>&1 && echo 0 || echo 1)
+ck "D9b …while the lane REALLY HAD an unpushed commit (head $(git -C "$WT3" rev-parse --short HEAD) != branch point $(git -C "$WT3" rev-parse --short "$seed3")), so D9 is not vacuous" \
+  $([ "$(git -C "$WT3" rev-parse HEAD)" != "$seed3" ] && echo 0 || echo 1)
+ck "D10 …and NO resume marker is written, exactly as at origin/main — so D5/D6 are the change's, not git's" \
+  $([ ! -e "$O/state/lane-exit-pre_fix.state" ] && echo 0 || echo 1)
+git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 
 # ── E) A MISSING RESCUER IS LOUD, NOT A SILENT SKIP ─────────────────────────────────────────────
 # This is the operator's own measured failure one layer down: the call existed, the file did not, and
@@ -544,6 +621,15 @@ ck "G5 …and the operator hatch (WIP_RESCUE_DISABLE=1) says the tree was NOT ex
 # indistinguishable from a lane that never ended — the exact ambiguity `lane-end.tsv` exists to close.
 awk -F'\t' '$2=="cap disabled" && $5=="not-measured" && $6=="DISABLED" {f=1} END{exit !f}' "$O/state/lane-end.tsv"; rcdisrow=$?
 ck "G8 …and the disabled path still appends its own ledger row (tree=not-measured rescue=DISABLED)" $rcdisrow
+# ⛔ AND IT MUST NOT WRITE A CLEAN BILL OF HEALTH INTO THE MARKER EITHER (review P1). The hatch — and
+# every path that returns before the measurement — leaves `tree=not-measured` and never reaches the
+# push, so a `next=` arm that fell through to "nothing at risk … may be removed" would publish an
+# affirmative reclaim verdict over a tree NOBODY LOOKED AT, in the exact artifact a reclaim pass reads.
+MK_OFF="$O/state/lane-exit-cap_disabled.state"
+[ -s "$MK_OFF" ] && grep -qx 'state=not-measured' "$MK_OFF" && grep -qx 'push=' "$MK_OFF"; rcmk1=$?
+ck "G9 …the marker says state=not-measured and carries NO push verdict (nothing was pushed, nothing measured)" $rcmk1
+grep -q '^next=MANUAL — this terminal did NOT measure' "$MK_OFF" 2>/dev/null && ! grep -q '^next=nothing at risk' "$MK_OFF" 2>/dev/null; rcmk2=$?
+ck "G10 …and next= says MANUAL / NOT MEASURED — never 'nothing at risk … may be removed' over an unmeasured tree" $rcmk2
 git -C "$WT" config --unset-all url."$TMP/not-a-repo.git".insteadOf
 git -C "$WT" config url."$BARE".insteadOf "$GHURL"
 

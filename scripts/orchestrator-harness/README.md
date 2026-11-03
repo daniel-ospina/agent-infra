@@ -540,13 +540,24 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
   * it costs a network call only when there IS something to save (one `git status` + one `rev-list`
     otherwise), and it never changes the lane's exit status: a lane's status and the fate of its
     worktree are different facts;
-  * `unpushed-only` is MEASURED and NAMED but never archived **here**, and the reason is the callee's
-    contract rather than branch safety: `bg-rescue-wip.sh` archives only a NON-EMPTY `git status`
-    (`:150-166`), so a clean-but-unpushed tree makes it exit 0 having done nothing, and `refs/wip/<slug>`
-    is a non-force ref built with `commit-tree` — not a branch. Teaching it to archive `HEAD`'s tree is a
-    change to that shipped tool's contract and is deliberately out of scope, so #2834's ask 1 is met for
-    the DIRTY half and recorded for the unpushed half: the commits live in the repo's object database and
-    survive the WORKTREE being removed, but not the BRANCH being deleted.
+  * `unpushed-only` is MEASURED, NAMED **and now PUSHED** (`lane_end_push`, #3396 — the half #2834 left
+    owed). `bg-rescue-wip.sh` archives only a NON-EMPTY `git status` and never moves a branch, so the
+    branch half is its own function: `git push -u origin HEAD:refs/heads/<branch>`, bounded (120 s via
+    `lib/bounded.sh`), **never forced**, and **verified by reading the remote** (`ls-remote`) rather than
+    by the push's exit status — transport success is not delivery. It fires only when the measured
+    unpushed count is > 0, so the majority of lanes cost no network call. It REFUSES, loudly and by name,
+    to push from a hub checkout (`--git-dir` == `--git-common-dir`) or onto the landing branch, because
+    either would publish a ref that only the merge rail may move. A DETACHED head is `push=detached`:
+    nothing is invented, and the marker tells a reclaim pass to refuse that worktree.
+  * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
+    aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
+    writer as the ledger, so no path can forget it: `LABEL`, `state` (the tree verdict), `rc`, `cap`,
+    `branch`, `head`, `root`, `unpushed`, `push`, `branch_on_origin` (the sha the REMOTE reported),
+    `rescue`, `wip_ref`, `dirty`, `ended`, `next` (mechanically derived) and a `porcelain:` section. A
+    path that returned BEFORE the measurement writes `state=not-measured` and `next=MANUAL — …did NOT
+    measure`, never a clean bill of health: the hatch is an escape, not a licence to claim a reading
+    that was never taken. ⛔ It is deliberately NOT written into the worktree — a file at the worktree
+    root would make every clean worktree dirty, which is the exact predicate the reaper keys on.
   * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
     (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
     the spawn and therefore reach neither the rescue nor the ledger. That is the honest reading: nothing
