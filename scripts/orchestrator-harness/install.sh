@@ -1490,7 +1490,11 @@ DRIFTED=""
 # fail-loud and refuses to start a lane whose model credential nothing asserts, so a $O without it stops
 # every dispatch on the box — and the refusal is *meant* to be loud, which is why the DRIFT must be
 # detected here rather than discovered as a box-wide standstill with nothing naming the cause.
-for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh; do
+# lane-env.sh (#3060) is the SAME defect already live one line up in `lane.sh`: that file sources it and
+# `exit 78`s without it, and it was in NEITHER list (review of #3331, verified `grep -c` = 0 on both), so
+# a $O deployed before #3060 — or half-synced — stops every lane while this check reports no divergence
+# and the operator is told nothing. Presence + byte comparison is all this list does, so it is one word.
+for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh lane-env.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
