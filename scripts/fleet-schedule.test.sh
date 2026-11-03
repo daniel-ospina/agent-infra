@@ -1685,6 +1685,176 @@ kill -0 "$pidi" 2>/dev/null && ok "the loop survived an empty lock file" \
   || bad "the loop died on an empty lock file"
 run "$GOOD" --stop >/dev/null 2>&1
 
+# 18j — THE PUBLISH RACE: a lock created by `O_EXCL` is EMPTY until its pid is written, and a racer's
+# probe reads that as an unusable lock, matches the inode (nothing replaced it), and steals it. Then
+# BOTH callers return a lock path and the same job runs twice concurrently — the one invariant
+# `acquire_lock` exists to hold. Measured on the pre-fix file by widening the create→write window:
+# both callers were told they held it. Each leg is fault-injected instead of raced, so the case is
+# deterministic: `os.write` is patched to let a racer steal the empty lock and publish its own.
+out18j="$(python3 - "$SCHED" "$T/state18j" <<'PY18J' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18j", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+os.makedirs(os.path.join(state, "locks"), exist_ok=True)
+fs.STATE = state
+path = os.path.join(state, "locks", "demo.lock")
+real_write = os.write
+def racer(fd, data):
+    # the racer steals our just-created, still-EMPTY lock and publishes its own
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    with open(path, "w") as fh:
+        fh.write("%d\n" % os.getpid())     # a LIVE pid: ours, in this process
+    return real_write(fd, data)
+os.write = racer
+try:
+    got = fs.acquire_lock("demo")
+finally:
+    os.write = real_write
+print("RESULT", "NONE" if got is None else "PATH")
+PY18J
+)"; rc18j=$?
+[ "$rc18j" -eq 0 ] && grep -q 'RESULT NONE' <<<"$out18j" \
+  && ok "a lock stolen while EMPTY is not handed to BOTH callers (the publisher loses, nobody wins twice)" \
+  || bad "both callers were told they hold the same lock after a mid-publish steal: $out18j"
+grep -q 'Traceback' <<<"$out18j" && bad "the publish-race case raised instead of answering: $out18j" || true
+
+# 18k — THE CLEANUP MUST NOT DELETE A RACER'S LOCK. When the pid write fails (ENOSPC on a small
+# write), the create arm removes the file it made — but "we made it, so it is ours" stops being true
+# once a racer can steal an empty lock and publish its own at the same path. Measured on the pre-fix
+# file: the racer's live lock was DELETED by our cleanup (acquire_lock then re-raised, and the job
+# was left with no lock at all while another run held one).
+out18k="$(python3 - "$SCHED" "$T/state18k" <<'PY18K' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18k", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+os.makedirs(os.path.join(state, "locks"), exist_ok=True)
+fs.STATE = state
+path = os.path.join(state, "locks", "demo.lock")
+real_write = os.write
+def failing(fd, data):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    with open(path, "w") as fh:
+        fh.write("%d\n" % os.getpid())
+    raise OSError(errno.ENOSPC, "No space left on device")
+os.write = failing
+try:
+    fs.acquire_lock("demo")
+    print("RESULT NO-RAISE")
+except OSError as exc:
+    print("RESULT RAISED", exc.errno)
+finally:
+    os.write = real_write
+print("SURVIVED", os.path.exists(path))
+PY18K
+)"; rc18k=$?
+[ "$rc18k" -eq 0 ] && grep -q 'RESULT RAISED' <<<"$out18k" \
+  && grep -q 'SURVIVED True' <<<"$out18k" \
+  && ok "a failed pid write still RE-RAISES the cause, and leaves a racer's lock in place" \
+  || bad "a failed pid write answered wrongly or deleted the racer's lock: $out18k"
+
+# 18l — `--install` READS DUE-NESS BEFORE IT RUNS ANYTHING, and that read is the same untrusted pair
+# (`read_stamp` + `is_due`) the loop guards per job. Measured at this head: one hand-edited stamp
+# (`{"started": "yesterday"}`) made `float(last)` raise out of `cmd_install` — `--install` returned 1
+# with NO `loop.pid`, i.e. the cell was left with no scheduler, one line above the guard whose comment
+# says that outcome must not happen. The malformed job must be NAMED and skipped, and the rest of the
+# set must still run and install.
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1                      # first pass: writes the stamps
+run "$GOOD" --stop >/dev/null 2>&1
+# `--stop` drops the OFF switch, which `--install` deliberately refuses to fight; this case is
+# about a malformed STAMP, not about the switch.
+rm -f "$FLEET_SCHEDULE_STATE/OFF"
+printf '{"label": "com.test.hourly", "started": "yesterday", "rc": 0, "duration": 0}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+beforel=0; [ -f "$MARK" ] && beforel="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+sleep 3        # com.test.echo's interval is 2s: let it be DUE, so the case can see the set survive
+outl="$(run "$GOOD" --install)"; rcl=$?
+[ "$(grep -c 'Traceback' <<<"$outl")" -eq 0 ] \
+  && ok "--install did not raise on a malformed stamp (no traceback)" \
+  || bad "--install died on a malformed stamp: $outl"
+grep -q 'com.test.hourly due-ness unusable' <<<"$outl" \
+  && ok "--install NAMED the unusable job" \
+  || bad "--install did not name the job whose due-ness it could not read: $outl"
+afterl=0; [ -f "$MARK" ] && afterl="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+[ "${afterl:-0}" -gt "${beforel:-0}" ] \
+  && ok "--install still ran the healthy due job ($beforel -> $afterl) — one bad stamp did not abandon the set" \
+  || bad "--install ran nothing while one stamp was malformed ($beforel -> $afterl)"
+lpidl="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+[ -n "$lpidl" ] && kill -0 "$lpidl" 2>/dev/null \
+  && ok "--install still ended with a RUNNING loop (the cell is not left without a scheduler)" \
+  || bad "--install left the cell with NO scheduler over one malformed stamp"
+run "$GOOD" --stop >/dev/null 2>&1
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" "$FLEET_SCHEDULE_STATE/OFF"
+
+# 18m — a plist whose ROOT is not a dict must be NAMED, not raised. `plistlib.load` returns a LIST for
+# a truncated/hand-edited file and the parse SUCCEEDS, so the `except Exception` around the load does
+# not cover it; `data.get("Label")` then raised AttributeError. `cmd_loop` had to widen its own call
+# site for this input, but `--check`/`--verify`/`--install` call `load_jobs` bare and `main()` caught
+# only ScheduleError — so every one of them died with a traceback out of main(), and `--install` left
+# the cell with no scheduler.
+BADROOT="$FIX/bad-root"; mkdir -p "$BADROOT"; cp "$GOOD/RETIRED" "$BADROOT/RETIRED"
+rm -f "$FLEET_SCHEDULE_STATE/OFF"        # --install must reach the DECLARATIONS, not the switch
+mkplist "$BADROOT" com.test.echo "$T/echo.spec"
+cat > "$BADROOT/com.test.badroot.plist" <<'PL18M'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><array><string>not-a-declaration</string></array></plist>
+PL18M
+for m18 in --check --verify --install; do
+  out18m="$(run "$BADROOT" "$m18")"; rc18m=$?
+  [ "$(grep -c 'Traceback' <<<"$out18m")" -eq 0 ] \
+    && ok "$m18 did not raise on a non-dict plist root (no traceback)" \
+    || bad "$m18 raised a traceback out of main() on a non-dict plist root: $(tail -3 <<<"$out18m")"
+  [ "$rc18m" -ne 0 ] && ok "$m18 REFUSED the unreadable declaration set (rc=$rc18m, not a silent pass)" \
+    || bad "$m18 returned 0 over a declaration set it could not read"
+  grep -q 'com.test.badroot.plist' <<<"$out18m" \
+    && ok "$m18 NAMED the file whose root is unusable" \
+    || bad "$m18 did not name the offending plist: $out18m"
+done
+
+# 18n — a create failure is NOT "somebody else holds it". The create arm re-raises (EACCES/EROFS/
+# ENOSPC on `os.open`), so the caller's per-job guard logs the REAL cause. Answering None here was the
+# measured defect: on the very ENOSPC recovery this change is about, the operator read
+# `SKIP <job>: already running (lock held)` for a job nothing held, and the disk-full cause never
+# reached the log. The assertion is inside the root skip for the same reason case 18c's is.
+if [ "$(id -u)" -eq 0 ]; then
+  skip "running as root — chmod 500 blocks nothing, so the create-failure arm cannot be exercised here"
+else
+  out18n="$(python3 - "$SCHED" "$T/state18n" <<'PY18N' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18n", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+locks = os.path.join(state, "locks")
+os.makedirs(locks, exist_ok=True)
+fs.STATE = state
+os.chmod(locks, 0o500)          # creatable? no: the CREATE itself must fail
+print("RESULT", end=" ")
+try:
+    got = fs.acquire_lock("demo")
+    print("NONE" if got is None else "PATH")
+except OSError as exc:
+    print("RAISED", type(exc).__name__)
+finally:
+    os.chmod(locks, 0o700)
+PY18N
+)"
+  grep -q 'RESULT RAISED' <<<"$out18n" \
+    && ok "an unwritable locks dir RE-RAISES the cause instead of reporting 'already running'" \
+    || bad "an unwritable locks dir answered without naming the real cause: $out18n"
+fi
+
 
 # ── 18. residency is DECLARED, read in every documented form, and refused by name ───────────
 # Both P2s a fresh review left on PR #2954 are the #2908 shape: a VALID declaration the runtime did

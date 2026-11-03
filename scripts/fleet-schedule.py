@@ -443,12 +443,20 @@ def load_jobs(check_targets: bool = True) -> list:
 
     retired_path = os.path.join(TEMPLATES_DIR, "RETIRED")
     retired = set()
-    if os.path.isfile(retired_path):
+    try:
         with open(retired_path) as fh:
             for line in fh:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     retired.add(line)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        # ⛔ A NAMED REFUSAL, NOT A TRACEBACK. This read is a syscall on an untrusted directory: on
+        # a full disk (ENOSPC) or a root-owned RETIRED (EACCES) it used to escape `load_jobs` as a
+        # raw OSError, and `main()` catches only ScheduleError — so `--check`/`--verify`/`--install`
+        # died with a traceback, and the install path left the cell with no scheduler.
+        raise ScheduleError("cannot read %s: %s: %s" % (retired_path, type(exc).__name__, exc))
 
     values = placeholder_values()
     # ⛔ THE FOURTH COPY IS placeholder_values(), AND NOTHING COMPARED IT. PLACEHOLDERS is checked
@@ -464,7 +472,12 @@ def load_jobs(check_targets: bool = True) -> list:
     # nothing, and refusing over one would block a cell on a tuple entry no template mentions.
     unresolvable = {n for n in PLACEHOLDERS if n not in values}
     jobs = []
-    for name in sorted(os.listdir(TEMPLATES_DIR)):
+    try:
+        entries = sorted(os.listdir(TEMPLATES_DIR))
+    except OSError as exc:
+        raise ScheduleError(
+            "cannot list %s: %s: %s" % (TEMPLATES_DIR, type(exc).__name__, exc))
+    for name in entries:
         if not name.endswith(".plist"):
             continue
         path = os.path.join(TEMPLATES_DIR, name)
@@ -475,6 +488,19 @@ def load_jobs(check_targets: bool = True) -> list:
         except Exception as exc:
             raise ScheduleError("cannot parse %s: %s" % (path, exc))
 
+        # ⛔ THE ROOT IS VALIDATED BEFORE IT IS USED. `plistlib.load` happily returns a LIST (or a
+        # non-dict leaf) for a hand-edited or truncated file, and `data.get("Label")` then raised
+        # AttributeError — an escape path `plistlib`'s own except does not cover, because the parse
+        # SUCCEEDED. Measured at this head with an array-root plist: `--check`, `--verify` and
+        # `--install` each died with a raw `AttributeError: 'list' object has no attribute 'get'`
+        # traceback out of main(), and `--install` left the cell with no scheduler. `cmd_loop` had
+        # to widen its own call site to `except Exception` for this exact input; naming the file
+        # here is the fix the loop's guard was compensating for.
+        if not isinstance(data, dict):
+            raise ScheduleError(
+                "cannot use %s: the plist root is %s, not a dict — a declaration must be a "
+                "<dict> (a truncated or hand-edited file looks like this)"
+                % (path, type(data).__name__))
         label = data.get("Label") or label_from_file
         job = Job(label, [], {}, None, None, "", "")
         # ⛔ A Label is a PATH COMPONENT here (stamp, lock, default log), so it is validated BEFORE
@@ -1001,7 +1027,9 @@ def acquire_lock(label):
             # the disk-full cause never appeared in the log at all.
             raise
         else:
+            own = None
             try:
+                own = os.fstat(fd)
                 # ⛔ A SMALL WRITE STILL NEEDS A DATA BLOCK, so ENOSPC/EIO/EDQUOT fail here having
                 # already CREATED the file. Unguarded that left a 0-byte lock behind, and every
                 # later `acquire_lock` then raised IndexError on `"".split()[0]` — measured — so the
@@ -1019,11 +1047,35 @@ def acquire_lock(label):
                     os.close(fd)
                 except OSError:
                     pass
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+                # ⛔ IDENTITY-CHECKED, NOT NAME-CHECKED. "We created it in this iteration, so it is
+                # provably ours" stopped being true the moment a probe could steal an EMPTY lock
+                # (see the probe's parse arm): a racer can replace the path between our create and
+                # this cleanup, and a bare `unlink(path)` would then delete THEIR live lock — two
+                # callers both told they hold it. Remove it only while it is still our own inode.
+                if own is not None:
+                    try:
+                        cur = os.stat(path)
+                    except OSError:
+                        cur = None
+                    if cur is not None and (cur.st_dev, cur.st_ino) == (own.st_dev, own.st_ino):
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
                 raise
+            # ⛔ PUBLISH IS NOT COMPLETE UNTIL THE FILE AT `path` IS STILL OURS. Between `O_EXCL`
+            # and the write above, the lock is ZERO BYTES, and a racer's probe reads that as an
+            # unusable lock, matches our inode (nothing was replaced), and STEALS it — after which
+            # it publishes its own and both callers would return a lock path. Verified by fault
+            # injection: with the create→write window widened, both callers were told they held it.
+            # Re-verifying ownership here makes the loser LOSE: it re-examines (bounded by the
+            # retry count) and answers "held" to the racer that actually owns the lock now.
+            try:
+                cur = os.stat(path)
+            except OSError:
+                continue
+            if own is None or (cur.st_dev, cur.st_ino) != (own.st_dev, own.st_ino):
+                continue
             return path
         # Probe: refuse a LIVE holder, steal a dead or unusable one, retry a vanished one.
         seen = None
@@ -1886,7 +1938,29 @@ def cmd_install():
     # never runs is precisely this issue" — this is the half that proves it ran. On a re-run the
     # jobs are not due, so this costs nothing.
     now = time.time()
-    first = [j for j in jobs if not j.skip and not j.error and is_due(j, read_stamp(j.label), now)]
+    # ⛔ THE DUE-NESS READ IS UNTRUSTED INPUT AND IT MUST NOT ABORT THE INSTALL EITHER. The guard
+    # below wraps ONE job's RUN; this line decides WHICH jobs run, and it reads the same two
+    # unguarded surfaces the loop's per-job guard was added for (`read_stamp` → a hand-edited
+    # stamp, `is_due`/`due_at` → `float(last)`, `int(calendar["Hour"])`). Measured at this head
+    # with a stamp of `{"started": "yesterday"}`: `ValueError: could not convert string to float`
+    # escaped `main()`, `--install` returned 1 with NO `loop.pid`, and the cell was left with no
+    # scheduler — the identical closed feedback loop as the ENOSPC death, reintroduced one line
+    # above the guard that exists to prevent it. Per-job and NAMED, exactly as the loop does it:
+    # one unusable stamp skips that job and the rest of the set still installs and runs.
+    first = []
+    for j in jobs:
+        if j.skip or j.error:
+            continue
+        try:
+            due = is_due(j, read_stamp(j.label), now)
+        except Exception as exc:  # noqa: BLE001 — one unusable stamp must not abort the install
+            log("ERROR %s due-ness unusable (%s: %s) — skipping it in the inline first pass"
+                % (j.label, type(exc).__name__, exc))
+            print("  %-38s ERROR due-ness unusable (%s: %s) — skipped"
+                  % (j.label, type(exc).__name__, exc))
+            continue
+        if due:
+            first.append(j)
     if first:
         print("running the %d due job(s) now (the first pass IS the proof):" % len(first))
     for job in first:
@@ -2153,6 +2227,17 @@ def main(argv):
         # and `--install`/`--verify` have no caller keying on 3.
         if mode == "--check" and declarations_unresolvable():
             return 3
+        return 1
+    except Exception as exc:  # noqa: BLE001 — a declaration set that cannot be read is NAMED
+        # ⛔ THE LAST NET, AND IT IS DELIBERATE. `load_jobs` parses UNTRUSTED files (plistlib gives
+        # back whatever shape the file holds) and the parse sites are many; a shape nobody
+        # anticipated must still be a NAMED refusal on stderr rather than a traceback out of every
+        # verb — `--install`/`--start` are how a cell gets its ONLY scheduler back, and a traceback
+        # there is the same "no scheduler, nothing to retry" state this change exists to close.
+        # The specific shapes are named by file where they are known (see `load_jobs`); this arm
+        # only guarantees no verb dies without saying what broke.
+        print("FAIL: %s: cannot read the job declarations (%s: %s)"
+              % (mode, type(exc).__name__, exc), file=sys.stderr)
         return 1
 
 
