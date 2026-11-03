@@ -253,9 +253,10 @@ to re-derive.
 
 ### F12 — The issue's own six measured failures are **not all reproducible today**
 
-One is red-first today, one is red-first only against its **replacement** (its mechanism lives in an
-untracked file, so no repo test can exercise it), one is already repaired in tracked code, and three
-live in untracked files or in a composition that does not exist yet. Table with per-failure status and
+One is red-first today, two are red-first only against their **replacement** (their mechanism lives in
+an untracked file, so no repo test can exercise it), one is repaired in tracked code **and**
+mutation-testable from history, one needs a composition that does not exist yet, and one is blocked on
+landing untracked bytes. Table with per-failure status and
 what the red-first fixture must target: [§9](#9-the-six-measured-failures--fixture-status). A "red-first" fixture written
 against already-fixed behaviour passes on the broken version and proves nothing — the very thing
 invariant 6 forbids.
@@ -318,7 +319,7 @@ silently resolved by writing a new ladder.
 | `alive` | `liveness.py:running-quiet` (live holder) | NOT "a process exists" — day-1 `liveness.py` state names |
 | `working` | `lane-status.py:WORKING` / `UNATTRIBUTED-WORKING` (Tree step 2) | only `lane-status.py` can produce it today |
 | `frozen` | `liveness.py:wedged` **only** on a positively open turn | never on a frozen file alone (#1254) |
-| `finished` | §11 gates via `lane-reap.sh count` | **not a `STATES` member** today |
+| `finished` | `docs/ops/fleet-liveness.md` §11 gates via `lane-reap.sh count` | **not a `STATES` member** today |
 | `no-verdict` | `liveness.py:unknown` + its named reason (`ps-unreadable`, `no-holder-record`, `off-fence`, `turn-state-unknown`, `claims-unreadable`, …) | the reason string is part of the contract, never optional |
 | **`dead`** | `liveness.py:dead` (`incarnations-absent`) | **missing from the issue's list** — see F2 |
 
@@ -354,7 +355,7 @@ it) · `NEW` (nothing does; justified in §7).
 
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
-| 1 | `lane_status(lane\|box\|all)` | `scripts/lane-status.py` (`lane_cpu_busy`, `child_suppresses`, `last_tool_call`, `resolve_session_ex`, 2528 lines) + `scripts/lane-actions.py::classify_row` (Step 5, JEV) + `tools/fleet/liveness.py::evaluate`/`gather` (identity, `dead`, abstentions) + `scripts/orchestrator-harness/lane-reap`.sh count` (`finished`) | one typed answer over all four; a stable state vocabulary across them; `dead` absent from the issue's list; `reason` string not surfaced | four sources, not three: `lane-status.py`, `lane-actions.py` and `liveness.py` take `--json`; **`lane-reap.sh count` does not** (`--json` exists only under `reap`) — it prints `lanes=<live>/<total> zombie=<n>` and abstains with `lanes=?/?` + exit 3, so its line is parsed and its exit 3 carried as the abstention. State mapping: the **five** states as the issue writes them, with `dead` carried in a separate `dead: true` field until the owner answers the reopen (§4.3) | **WRAPPER** (composed; no new classifier) |
+| 1 | `lane_status(lane\|box\|all)` | `scripts/lane-status.py` (`lane_cpu_busy`, `child_suppresses`, `last_tool_call`, `resolve_session_ex`, 2528 lines) + `scripts/lane-actions.py::classify_row` (Step 5, JEV) + `tools/fleet/liveness.py::evaluate`/`gather` (identity, `dead`, abstentions) + `scripts/orchestrator-harness/`lane-reap.sh count` (`finished`) | one typed answer over all four; a stable state vocabulary across them; `dead` absent from the issue's list; `reason` string not surfaced | four sources, not three: `lane-status.py`, `lane-actions.py` and `liveness.py` take `--json`; **`lane-reap.sh count` does not** (`--json` exists only under `reap`) — it prints `lanes=<live>/<total> zombie=<n>` and abstains with `lanes=?/?` + exit 3, so its line is parsed and its exit 3 carried as the abstention. State mapping: the **five** states as the issue writes them, with `dead` carried in a separate `dead: true` field until the owner answers the reopen (§4.3) | **WRAPPER** (composed; no new classifier) |
 | 2 | `lane_tree(lane)` | `tools/fleet/lane_liveness.py::child_sids` + `enumerate_lanes(…, children)`; `scripts/orchestrator-harness/lane-artifacts.sh` (cell artifacts); `~/.pi/agent/task-sessions/<uuid>/` | **Applying the tree to the CHILD** (Step 6). `child_suppresses` only demotes the parent's verdict; `enumerate_lanes` lists child sessions but does not verdict them. Measured consequence: `state/FINDING-lane-classifier-ignores-task-children-2026-10-11.md` — **four** lanes tabulated as false `IDLE`/`WEDGED`/`STALL` verdicts (one of them marked "presumed"), plus a fifth entry under a fourth label (`WIP`), every one a lane holding or presumed to hold a `task` child | compose: `lane_status` per node (this is Step 6's own instruction) + `child_sids` for the edge set; the recursion is the tool, not a new rule | **PARTIAL** (§7.1) |
 | 3 | `lane_artifact(lane)` | `scripts/lane-read.py` (`sid_for`, `files_for` — last N assistant messages by pane); `scripts/orchestrator-harness/lane-artifacts.sh` (verbs, exit `0 found · 3 ABSENT-EVERYWHERE · 4 UNMEASURED · 5 PULL-FAILED`); `BEAT-CHECKLIST.md`'s `## LANE-DONE <verdict> <ts>` line | one answer over *both* axes: a session lane's words AND a **cell** lane's file (the 2026-11-01 measurement: four mandated artifacts existed, each on a different box, none reachable from the mac); size/age/terminal-line in one shape | wrap `lane-read.py` for words, `lane-artifacts.sh` for files; read the `## LANE-DONE` line as the terminal verdict; "none written" is a value, not an error | **WRAPPER** (two implementations, one answer) |
 
@@ -387,7 +388,7 @@ it) · `NEW` (nothing does; justified in §7).
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
 | 13 | `reminder_set` / `reminder_list` / `reminder_cancel` | **the verbs do not exist.** The *hard* half does: `scripts/objective-reminder.sh` (byte budget with a LOUD refusal over budget at `:168`; delivery confirmed by `latest_submitted_at` advancing, explicitly *not* by the send's exit status, `:25-27`; backend-aware cmux-vs-tmux; plus its `.test.sh`) and `scripts/fleet-schedule.py` (`--check`/`--status`/`--verify`/`--install`/`--start`/`--stop`, plist-parsed, portable to cells without launchd) | a **settable, listable, cancellable** reminder that survives a session restart, with the owner-confirmed server-owned queue + timer | wrap `objective-reminder.sh` for the delivery contract and `fleet-schedule.py` for the timer; the queue is a **file** under `$HOME/.pi/agent/state/` (as `beta-progress.json`, `NEEDS-ACTION.md` already are) because a server-owned queue that lives only in server memory dies with the server — and "survives session restart" is the requirement | **PARTIAL** (§7.6) |
-| 14 | `beat_checkpoint(state)` | `scripts/orchestrator-harness/cycle-record.sh`; `scripts/goal-state.py` (queries the graph, writes nothing); `scripts/orchestrator-heartbeat.sh` + `BEAT-CHECKLIST.md` (the six checks and their order); `~/.pi/agent/state/ORCHESTRATION-BOARD-<date>.md` (the board AGENTS.md mandates) | the durable write path as one typed call; `orch-checkpoint.sh` (the 20-min nudge) is **untracked** (F3); `goal-state.py` is graph-read-only by design and must stay so | wrap the board/heartbeat artifacts; **land `orch-checkpoint.sh` into `scripts/`**; the graph axis stays the Tortoise MCP (§ "out of scope") | **WRAPPER + PARTIAL** |
+| 14 | `beat_checkpoint(state)` | `scripts/orchestrator-harness/cycle-record.sh`; `scripts/goal-state.py` (queries the graph, writes nothing); `scripts/orchestrator-heartbeat.sh` + `BEAT-CHECKLIST.md` (the six checks and their order); `~/.pi/agent/state/ORCHESTRATION-BOARD-<date>.md` (the board AGENTS.md mandates) | the durable write path as one typed call; `orch-checkpoint.sh` (the 20-min nudge) is **untracked** (F3); `goal-state.py` is graph-read-only by design and must stay so | wrap the board/heartbeat artifacts; **land `orch-checkpoint.sh` into `scripts/`**; the graph axis stays the Tortoise MCP (D5) | **WRAPPER + PARTIAL** |
 
 ### 5.6 Counts
 
@@ -396,6 +397,15 @@ it) · `NEW` (nothing does; justified in §7).
 | **WRAPPER** (existing implementation answers it) | 1, 3, 4, 5, 6, 8, 9, 10, 14 (9 tools) |
 | **PARTIAL** (existing implementation answers part) | 2, 7, 11, 12, 13 (5 tools) |
 | **NEW** (nothing answers it) | **none** |
+
+**How a compound label resolves, stated because three rows carry one.** A row gets **one** bucket, by
+this rule: *the class of the nearest existing implementation it wraps.* Row 7 (`WRAPPER + PARTIAL`)
+counts PARTIAL because the `env` argument and the typed refusals have no implementation at all; row 14
+(`WRAPPER + PARTIAL`) counts WRAPPER because every element of its answer exists and only the
+`orch-checkpoint.sh` landing is missing — a *deployment* gap, not a missing capability; row 12
+(`PARTIAL→WRAPPER`) counts PARTIAL because the field is consumed but the comparison is not written.
+Applying the rule the other way is what makes the partition meaningful: a `PARTIAL` here means "someone
+must write something", never "something must be relocated".
 
 **`NEW` rows: 0 — and this time literally.** Every one of the 14 tools wraps something that exists.
 The last row to fall was #11, and it fell twice: the first draft said the InstaBox procedure did not
@@ -589,7 +599,7 @@ gate.
 |---|---|---|---|---|
 | 1 | **FALSE MERGED** — 7 PRs printed as merged, all `open` | **LIVE, in an untracked file** | `fleet-report.py::section_p0p1` — `merged_refs` from a `#(\d{4,5})` **regex over title/body/branch** (F4). `section_pipeline`'s merged list is correct (verified live: `--state merged --search 'merged:>=<iso>'` returns `state: MERGED`) | write the fixture against `closure_audit`'s replacement: a merged PR **mentioning** `#N` must not report `#N` closed. Two fixtures: mention-only ⇒ not closed; `closes #N` ⇒ closed |
 | 2 | **FALSE UNMEASURED** — `UNMEASURED(gh issue list failed …)` while the same query returned rc=0 | **LIVE** (mechanism), untracked file | `gh_json` returns `None` for **two** causes — `rc != 0` and an unparseable payload — and the caller's message names only `rc != 0` (F5). A third outcome is a crash, not a `None`: `sh()` passes `timeout=120` with no `try/except`, so a timeout raises out of the section | fixture: a payload that is not JSON ⇒ the string inside `UNMEASURED(...)` must name **parse**, not `gh failed`; and a timeout ⇒ `UNMEASURED(timeout)`, not a traceback. Assert on the **reason**, not on the token |
-| 3 | **STALE CLOCK** — `as of 14:16, 0m ago` for a five-hour-old stamp | **REPAIRED in tracked code** (`scripts/beta-progress.py` clamps the age, rejects a future `ts` beyond `CACHE_TS_SKEW_S`, and re-validates every field the render dereferences) | — | **regression pin, labelled as such.** Not a red-first fixture: it passes today. The red-first version exists only against the *pre-fix* code, which is history |
+| 3 | **STALE CLOCK** — `as of 14:16, 0m ago` for a five-hour-old stamp | **REPAIRED in tracked code** (`scripts/beta-progress.py` clamps the age, rejects a future `ts` beyond `CACHE_TS_SKEW_S`, and re-validates every field the render dereferences) | — | **mutation-testable from history**: `git show b54b117fc:scripts/beta-progress.py` renders `ts` / `age_m = int((time.time() - ts) / 60)` with neither the bound nor the validation, so the harness can check that blob out and require a red. Keep the HEAD regression pin as well |
 | 4 | **LANE COUNTER ZERO** — `pi-cell-1: lanes=0 pi=9` | **LIVE in the fleet, fixed only in an untracked file** | `fleet-report.py::section_capacity` now greps `[l]ane.sh` + `^pi$` **in the deployed copy only** (F3). A redeploy deletes the fix | fixture: a `ps` fixture where lanes run argv `pi` (the cell shape) must count them; a wrapper-bash line must not be counted as `pi`. Red-first requires the fix to **land in `scripts/`** first |
 | 5 | **FALSE DEATH ×3** — three **finished** lanes reported dead and re-dispatched | **Largely CLOSED in `liveness.py`** (a resident finished lane is a fenced holder ⇒ `running-quiet`; `dead` needs a non-empty candidate set, every candidate positively absent, and non-growth positively known). Still reachable at the **composition** layer: `liveness.py` has no `finished` state, so a caller that maps `running-quiet` ⇒ "dead" re-creates it | composition, not `evaluate` | fixture at the `lane_status` boundary: a lane whose turn ended, whose process is resident, and whose log is stale ≥ 2 h must read `finished` — **never** `dead`. Three fixtures, one per measured lane shape (27 turns/2 PRs; 7 files verified + 3 reviewer dispatches; 383 B artifact + merged PR) |
 | 6 | **SILENT ACTUATOR** — `launcher did not report a pid: ''`; `fatal: a branch named 'p0-10000' already exists` | **PARTIALLY closed** — `nonblocking-dispatch.sh` now has typed exits 2/78/80; the two measured failures were **stderr prose**, and `queue-dispatch.py` (which produced the pid message) is no longer deployed (only `.bak` files remain) | the launcher→typed-refusal mapping (§7.2) | fixture: a launcher that exits 0 and writes no `.pid` ⇒ `no-pid`; a branch that already exists ⇒ `branch-exists`. Both must be **returned**, not raised as text |
@@ -605,12 +615,22 @@ gate.
 | 5 FALSE DEATH ×3 | **largely closed** in `liveness.py`; reachable only through a composition that does not exist yet | **pin at the `evaluate` level**, red-first at the `lane_status` boundary once the composition exists |
 | 6 SILENT ACTUATOR | **half-closed** (typed exits landed; the two measured failures were prose) | red-first on the mapping half only |
 
-So: **1 red-first today** (#6's mapping half), **1 red-first only against its replacement** (#2 — its
-mechanism lives in the untracked `fleet-report.py`, so no repo test can exercise `gh_json` today; the
-fixture is red-first against the replacement, not against today's code), **1 pin at the unit level that
-becomes red-first only once the composition exists** (#5), **2 blocked on landing untracked bytes**
-(#1, #4 — and #4's red-first test cannot be written against a file git has never seen), and **1 pure
-pin** (#3). Phase 2's test plan states this per fixture rather than claiming six red-first tests.
+So, with each failure in exactly **one** bucket:
+
+| bucket | failures | why |
+|---|---|---|
+| red-first today, against existing code | #6 | typed exits landed; the mapping half is the gap |
+| red-first **against its replacement** (the mechanism lives only in the untracked `fleet-report.py`, so no repo test can exercise it today) | #1, #2 | a fixture written now has nothing to run against |
+| red-first once the composition exists | #5 | `evaluate` is already correct; the boundary is what is missing |
+| **mutation-testable from history** (the pre-fix line IS in git) | #3 | `git show b54b117fc:scripts/beta-progress.py` renders `ts`/`age_m` with no clamp and no future-stamp validation; HEAD carries both — so §12's method (a) can check that blob out |
+| blocked on landing untracked bytes | #4 | its only copy is untracked, **and** the fix exists only in that copy |
+
+So: **1 red-first today**, **2 red-first against a replacement**, **1 mutation-testable from history**,
+**1 red-first once the composition exists**, **1 blocked on landing untracked bytes** — and **0 that are
+merely pinned**. Phase 2's test plan states this per fixture rather than claiming six red-first tests.
+(Corrected twice, and the second correction matters: an earlier tally said "1 pure pin (#3)", which was
+wrong — the pre-fix line for #3 is retrievable, so #3 is the *easiest* mutation test here, not the
+hardest.)
 
 ---
 
@@ -688,12 +708,17 @@ assert, because the obvious assertion is the one that passes on the broken versi
 **Mutation-testing note (this is the invariant most likely to be faked):** the honest form is a small
 harness that (a) checks out the pre-fix line or injects the pre-fix branch, (b) runs the fixture, (c)
 requires a non-zero exit, (d) restores, (e) requires zero. **Three** of the six failures have no
-pre-fix line to check out — #1, #2 and #4 all live in `fleet-report.py`, which **git has never held**
-(`git ls-files | grep -c fleet-report.py` = 0) — and two more cannot be red-first for a different
-reason: #3 is already repaired, and #5 is reachable only through a composition that does not exist yet.
-Each of those five must be declared as a **pin** (or, for #1/#2, red-first **against its replacement**),
-never as a mutation, in the PR body and in the test file's docstring. A Phase 2 that hunts a pre-fix
-line for #1/#2 would be performing the mutation theatre this invariant exists to stop.
+pre-fix line in git — #1, #2 and #4 all live in `fleet-report.py`, which **git has never held**
+(`git ls-files | grep -c fleet-report.py` = 0). Of those three, #1 and #2 are red-first **against their
+replacement** (no landing required) and only #4 is genuinely blocked until its bytes are tracked. One
+more, #5, is reachable only through a composition that does not exist yet, so it is red-first at the
+`lane_status` boundary once that exists and a pin at `evaluate` until then.
+
+**And do not over-claim in the other direction** — #3 is *not* a mere pin: the pre-fix blob is in
+git (`git show b54b117fc:scripts/beta-progress.py`), so it is the easiest mutation test in the set.
+A Phase 2 that hunts a pre-fix line for #1/#2 would be performing the mutation theatre this invariant
+exists to stop; one that refuses to look for #3's pre-fix line is leaving a real mutation test on the
+table.
 
 ---
 
@@ -702,11 +727,13 @@ line for #1/#2 would be performing the mutation theatre this invariant exists to
 1. **§4.3 — six states, `dead` included?** This inventory says yes, because the issue's invariant 3
    presupposes it. A five-state surface can only satisfy invariant 3 by dropping the positive `dead`
    finding, which reverses #1178's purpose.
-2. **§7.3 — is `verify_independent` in Phase 2 or its own issue?** It is the only tool whose
-   *surface* has no implementation, but its **procedure does exist** (F8: operating prompt + setup +
-   evidence protocol, and the live poke already invokes it). So the question is narrower than an
-   earlier draft made it: *does a typed wrapper around a working, documented cloud-machine procedure
-   belong in this batch, or its own?* Reducing to 13 tools costs the same CI run.
+2. **§7.3 — is `verify_independent` in Phase 2 or its own issue?** Its **procedure does exist** (F8:
+   operating prompt + setup + evidence protocol, and the live poke already invokes it); what is
+   missing is only the typed surface. **It is not unique in that** — #13 `reminder_*` is the same
+   shape ("the verbs do not exist", §5 row 13), and it is not being proposed for splitting. So the
+   real question is about **blast radius**, not about novelty: #11 is the only tool in the batch that
+   creates and destroys cloud machines, which is why it is the one worth isolating. Reducing to 13
+   tools costs the same CI run.
 3. **F3 — do the three untracked modules get landed in this issue?** `fleet-report.py` and
    `orch-checkpoint.sh` are wrapped by #4 and #14; `state/lane-verdict.py` holds one of the five
    `jev-latest` pins. Landing them is prerequisites, not scope creep — but it is bytes landing in
@@ -765,9 +792,10 @@ wraps: `lane-status.py` (**deployed copy is 2046 lines and stale — F10**),
 `record-review.sh`, `objective.py`, `turn-classify.py`, `ask-owner.py`,
 `live-workspaces-publisher.py` — plus **two deployed-but-untracked** modules, `orch-checkpoint.sh`
 (here) and `lane-verdict.py` (under `$HOME/.pi/agent/state/`), both F3.
-**53 `.bak` files** sit beside them (`objective.py` ×6, `lane-actions.py` ×6, `lane-status.py` ×5,
-`heartbeat-loop.sh` ×4, `ci_runner_gate.sh` ×3, …) — a note on how the fleet currently versions a
-deployed script, not a tool surface.
+**53 `.bak` files** sit beside them (`lane-actions.py` ×7, `objective.py` ×6, `lane-status.py` ×6,
+`heartbeat-loop.sh` ×5, `ci_runner_gate.sh` ×3, …) — a note on how the fleet currently versions a
+deployed script, not a tool surface. (The total is the measured one; three per-file exemplars were
+transcribed one low and are corrected here.)
 
 **`extensions/` — 47 entries.** Relevant to §8.1: `task-heartbeat.ts` (the `CPU_LIVENESS_TOOL_NAMES`
 allowlist and the #512/#476/#783 ledgers), `builtin-tools/` (`DEFAULT_STREAM_STALL_MS`,
@@ -808,5 +836,5 @@ omitted the directory it lived in.
 `orchestrator MCP typed facade / tool inventory duplication`. It returned **no relevant point** — only
 unrelated `:Source` points about `scripts/admin-merge.sh`, with its relationship decoration
 unavailable (`Query timed out`). So this inventory is not re-deriving a recorded conclusion, and the
-findings that *are* durable conclusions (F1-F9) are filed to the graph at the end of this lane,
+findings that *are* durable conclusions (F1–F12, F7b included) are filed to the graph at the end of this lane,
 one claim per point, `evidence`-shaped with their numbers.
