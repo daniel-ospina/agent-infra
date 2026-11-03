@@ -1207,12 +1207,101 @@ def fence_matches_canon() -> int:
     return 0 if (ok and tail_ok and paths_ok) else 1
 
 
+def venv_arm_paths() -> int:
+    r"""#2285 — `TESTISH` decides the ORPHAN candidate class, and one path SHAPE escaped its venv arm.
+
+    `TESTISH` is the allowlist that decides what the orphan pool even LOOKS at. Its venv arm was
+    anchored (`^\.?/?.+\.venv/bin/python`), so a bare-relative interpreter never matched:
+
+        TESTISH.search(".venv/bin/python tools/x.py")     -> None      (a candidate, silently absent)
+        TESTISH.search("./.venv/bin/python tools/x.py")   -> match
+        TESTISH.search("/home/u/GitHub/x/.venv/bin/python") -> match
+
+    A bare-relative `argv[0]` is what an ACTIVATED venv (or any invocation written without `./`)
+    actually puts in `ps args`, so a test/tooling process in our own checkout was invisible to the
+    pool the header claims (`ours, test/tooling-shaped, any depth`). The direction is a MISSED
+    candidate, never a wrong reap — the fail-closed direction — but the pool was narrower than
+    claimed.
+
+    ⛔ THE FIX ADDS AN ARM; IT MAY NOT REMOVE OR NARROW ONE. `cases[0]` (the bare-relative case) is
+    the load-bearing red against the pre-fix tree — it fails there and passes here. The MUTATION
+    block at the end re-proves the same thing IN PROCESS by re-anchoring the MODULE's own arm and
+    re-running that case, so the control cannot decay into an assertion about a local copy.
+
+    ⛔ AND IT PINS THE FIX'S REACH HONESTLY: `OURS` (the owner-path arm, `^/Users/.../GitHub/`)
+    still refuses a bare-relative argv on its own, so on the shipped default selector the widening
+    is reached only when the argv ALSO names our checkout — or under `--include-any-owner`. Pinning
+    that keeps a later reader from believing this one edit made the bare-relative shape reapable.
+    """
+    bare = ".venv/bin/python tools/x.py"
+    cases = [
+        (bare, True, "bare relative (#2285's case)"),
+        ("./.venv/bin/python tools/x.py", True, "`./`-prefixed (matched before — not narrowed)"),
+        ("/home/u/GitHub/x/.venv/bin/python tools/x.py", True, "absolute (matched before — not narrowed)"),
+        ("/Users/u/Documents/GitHub/x/.venv/bin/python t.py", True, "absolute, ours"),
+        ("python -m pytest -q", True, "the pytest arm"),
+        ("venv/bin/python tools/x.py", False, "a dotless `venv/` is NOT our class"),
+        ("myvenv/bin/python tools/x.py", False, "a named env that is not `.venv`"),
+        ("python tools/x.py", False, "a plain interpreter"),
+    ]
+    fails = 0
+    for args, want, label in cases:
+        got = mod.TESTISH.search(args) is not None
+        ok = got == want
+        fails += 0 if ok else 1
+        print(f"{'PASS' if ok else 'FAIL'} TESTISH {label}: {args!r} -> "
+              f"{'match' if got else 'no match'} (want {'match' if want else 'no match'})")
+
+    # the fix adds a candidate SHAPE to a reaper's allowlist — so no existing match may be lost.
+    # ⛔ THE FIRST ENTRY IS THE ONE THAT MAKES THIS CONTROL REAL. Three of the four shapes below are
+    # ALSO matched by the arm the fix ADDS (`./x`, `/x` — the new arm sees the `/` before `.venv`),
+    # so against them deleting the kept anchored arm changes nothing and the check would print
+    # "none lost" over a narrowed pool. `proj.venv/bin/python` is the anchored arm's OWN case: its
+    # `.+` reaches it, while the new arm cannot (the char before `.venv` is `j`, not whitespace or a
+    # slash). Keep at least one such entry, or this line stops protecting the arm it names.
+    pre_green = ["proj.venv/bin/python tools/x.py",          # anchored arm ONLY
+                 "./.venv/bin/python tools/x.py",           # both arms
+                 "/home/u/GitHub/x/.venv/bin/python tools/x.py",   # both arms
+                 "/Users/u/Documents/GitHub/x/.venv/bin/python t.py",  # both arms
+                 "python -m pytest -q"]                     # the pytest arm
+    shrank = [a for a in pre_green if not mod.TESTISH.search(a)]
+    ok = not shrank
+    fails += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'} no previously-matching shape was narrowed "
+          f"({'none lost' if ok else shrank})")
+
+    # the reach limit, stated as a test so the claim cannot quietly grow.
+    ok = mod.OURS.search(bare) is None
+    fails += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'} OURS still refuses a bare-relative argv on its own — the "
+          f"widening reaches the default selector only via an argv naming our checkout, or "
+          f"--include-any-owner")
+
+    # MUTATION, ON THE MODULE'S OWN ATTRIBUTE: swap in the PRE-FIX regex and re-run the case. A copy
+    # of the pattern compiled in this function would assert something about itself and be green
+    # forever; this one goes RED if `mod.TESTISH` ever stops carrying the arm.
+    pre_fix = re.compile(r"pytest|^\.?/?.+\.venv/bin/python|uvicorn|gunicorn|/bin/bash -c ", re.I)
+    live = mod.TESTISH
+    try:
+        mod.TESTISH = pre_fix
+        red = mod.TESTISH.search(bare) is None
+    finally:
+        mod.TESTISH = live
+    restored = mod.TESTISH is live and mod.TESTISH.search(bare) is not None
+    ok = red and restored
+    fails += 0 if ok else 1
+    print(f"{'PASS' if ok else 'FAIL'} mutation (re-anchor the module's arm): the bare-relative case "
+          f"reads {'no match — the arm is what carries it, and the live regex is restored' if ok else 'the mutation did not discriminate (red=%r, restored=%r)' % (red, restored)}")
+    return 0 if not fails else 1
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     print("── suite ──")
     fails = (suite(None) + four_states_reachable() + utc_stamp() + apply_path()
              + empty_pool_json() + unreadable_json() + bad_etime_row()
-             + cpu_after_arm() + unrecognised_host_kind() + fence_matches_canon())
+             + cpu_after_arm() + unrecognised_host_kind() + fence_matches_canon()
+             + venv_arm_paths())
     if fails:
         print(f"\n{fails} test(s) FAILED")
         return 1

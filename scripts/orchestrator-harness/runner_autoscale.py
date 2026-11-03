@@ -258,13 +258,16 @@ STARVATION_CONFIRM_DEFAULT_S = 30.0
 STARVATION_CONFIRM_MAX_S = 300.0
 
 # ⛔ THE GATE'S OWN ENGAGEMENT THRESHOLD, COPIED DELIBERATELY AND PINNED BY THE SUITE
-# (`ci_runner_gate.sh:43` `QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"`; T43 reads THAT file and
-# fails if this constant drifts from its default). It is the ONE number
+# (`ci_runner_gate.sh` `QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"`; T43 reads THAT file and
+# fails if this constant drifts from its default). The gate's default moved 60 -> 10 on the owner
+# ruling of 2026-11-02 (daniel-ospina/tortoise#9878), and this copy MUST move with it: left at 60 the
+# starvation alarm would only fire on a queue the gate itself had already stopped calling unhealthy,
+# i.e. the term would be dead exactly when the pool is being engaged. It is the ONE number
 # the project already uses to say "this queue is a GitHub-hosted backlog that is not draining". The
 # starvation alarm needs it as an ELIGIBILITY term (see `starvation_eligible`): `queued>0` alone is
 # true of a perfectly healthy fallback-only pool, and a deep queue with an idle pool is a mismatch
 # worth paging on whatever the pool advertises (review finding P1).
-GATE_QUEUE_THRESHOLD = 60
+GATE_QUEUE_THRESHOLD = 10
 
 # ⛔ AND THE ONE DATUM A CELL *CAN* MEASURE WHEN THE GATE'S INTENT IS UNKNOWABLE: THE AGE OF THE
 # OLDEST WAITING RUN (review finding P1, round 11). The eligibility terms above need something only a
@@ -790,7 +793,7 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
 
     ⛔ THAT REFUSAL IS DEFENSIVE, AND ITS RATIONALE IS STATED RATHER THAN IMPLIED (round-13 review,
     2nd round). The age read is only taken when the DEPTH term has not already decided, i.e. when
-    `queued < GATE_QUEUE_THRESHOLD` (60) — and `QUEUE_AGE_PAGE` is 100. So at the shipped constants a
+    `queued < GATE_QUEUE_THRESHOLD` (10) — and `QUEUE_AGE_PAGE` is 100. So at the shipped constants a
     saturated page cannot arise here, and the `total` this read sees always equals the `queued` the
     depth term already declined to alarm on. It is kept because the two numbers are INDEPENDENT (the
     gate's threshold is operator-settable while its counterpart here is a module constant), and
@@ -901,7 +904,7 @@ def starvation_eligible(
       * the pool ADVERTISES the fallback label right now — work can be handed to us and is not; or
       * the gate WANTS `local` — the pool should be carrying it and is not (this is #2875's own shape:
         the label had been stripped while the gate was asking for the fallback); or
-      * the queue is at/above the GATE'S OWN threshold (`GATE_QUEUE_THRESHOLD`, the same 60 the gate
+      * the queue is at/above the GATE'S OWN threshold (`GATE_QUEUE_THRESHOLD`, the same 10 the gate
         uses to call a GitHub-hosted backlog unhealthy) — a deep queue with an idle pool is worth a
         page whatever the labels say, and the pool read is the only other evidence available; or
       * the queue's OLDEST waiting run is older than `STARVATION_QUEUE_AGE_S` — the one term a CELL
