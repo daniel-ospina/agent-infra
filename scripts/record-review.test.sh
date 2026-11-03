@@ -4539,6 +4539,16 @@ run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
         export STUB_CHECK_RUNS_FAIL="${STUB_CHECK_RUNS_FAIL:-0}"
         export STUB_RERUN_FAIL="${STUB_RERUN_FAIL:-0}"
         export STUB_PATCH_FAIL="${STUB_PATCH_FAIL:-0}"
+        # agent-infra#3168: the durable comment channel's knobs. Passed through so a
+        # vector can serve an admitted comment set, model the `gh api` read failure
+        # (a NON-EMPTY error body on STDOUT plus a non-zero exit), and capture the
+        # posted comment body for the idempotency vector.
+        export STUB_COMMENT_BODIES="${STUB_COMMENT_BODIES:-}"
+        export STUB_COMMENT_FAIL="${STUB_COMMENT_FAIL:-0}"
+        export STUB_COMMENT_POST_FAIL="${STUB_COMMENT_POST_FAIL:-0}"
+        export STUB_COMMENT_CAPTURE="${STUB_COMMENT_CAPTURE:-}"
+        export STUB_BODY_FAIL="${STUB_BODY_FAIL:-0}"
+        export STUB_BODY_FAIL_TEXT="${STUB_BODY_FAIL_TEXT:-}"
         # Review finding 3: an UNSIGNED marker (no key) must not fire the rerun.
         # The runner passes the caller's gate key through so a vector can unset
         # it (the suite exports a deterministic key at the top).
@@ -4668,6 +4678,47 @@ if grep -qF -- "actions/jobs/901/rerun" "$LOG"; then
 else
     bad "14.1c the re-read did not see the appended marker ⇒ the stale run was never re-run (log: $(cat "$LOG"))"
 fi
+
+# 14.1d THE DURABLE COMMENT CHANNEL (agent-infra#1224 producer half, #3168).
+#      NO assertion pinned this channel: neutering the POST left the suite at
+#      PASS=908 FAIL=0, so the two arms that can LOSE or DUPLICATE the evidence —
+#      the dedup read and the read-FAILURE arm — were unpinned. Each vector below
+#      reddens when its arm is removed, and each asserts the TRANSPORT (a POST in
+#      the stub log), never the exit code alone.
+DC_PR=424341
+DC_CRUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":902}]'
+dc_posts() { command grep -cF -- "-X POST repos/daniel-ospina/agent-infra/issues/$1/comments" "$LOG" 2>/dev/null || true; }
+# (a) a signed record publishes the marker to the comment channel exactly once.
+STUB_COMMENT_BODIES="" STUB_COMMENT_CAPTURE="$T/ccap_a" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "1" "14.1d a signed record posts the marker to the durable comment channel exactly once"
+DC_MARKER="$(jq -r '.body // empty' "$T/ccap_a" 2>/dev/null || true)"
+if [ -n "$DC_MARKER" ]; then
+    ok "14.1d the posted comment carries a body (prerequisite for the idempotency vector)"
+else
+    bad "14.1d the comment POST captured no body — the idempotency vector would judge a fixture, not the code"
+fi
+# (b) IDEMPOTENCY: an admitted comment already carrying this exact marker ⇒ no POST.
+STUB_COMMENT_BODIES="$DC_MARKER" STUB_COMMENT_CAPTURE="$T/ccap_b" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marker is NOT duplicated (idempotency)"
+# (c) READ-FAILURE: `gh api` writes a NON-EMPTY error body to STDOUT and exits
+#     non-zero. The durable post must be SKIPPED (never read as "no comment" ⇒
+#     post), the warning must name it, and the record must still succeed.
+STUB_COMMENT_FAIL=1 STUB_COMMENT_CAPTURE="$T/ccap_c" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a FAILED comment read does not post (an error body is not 'no comment exists')"
+assert_contains "$RECORD_ERR" "could not read the PR's comments" "14.1d …and the failure is reported loudly, not swallowed"
+assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the record [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+# (d) UNSIGNED-ONLY: the gate can never accept an unsigned marker, and a comment is
+#     permanent, so it must never be published to that channel.
+AI_REVIEW_GATE_KEY="" STUB_COMMENT_CAPTURE="$T/ccap_d" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d an UNSIGNED marker is never published as a comment"
+# (e) THE P2 PIN: when the BODY channel fails, the run that most needs the durable
+#     copy must still attempt it. Both failure arms used to `exit 5` before reaching
+#     the durable block, so the channel never fired in the only scenario it exists
+#     for. Asserts rc 5 AND a comment POST in the same run.
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENT_CAPTURE="$T/ccap_e" \
+    run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "5" "14.1d a failed body read is still a NAMED failure (rc 5)"
+assert_eq "$(dc_posts "$DC_PR")" "1" "14.1d …and the durable comment is STILL attempted — the channel exists for exactly this failure"
 
 # 14.2 Fresh record (marker absent) with a stale FAILURE on the head: posts the
 #     marker AND re-runs the failed gate job in the same call.
