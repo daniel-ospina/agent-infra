@@ -4778,9 +4778,7 @@ function _invSelectsRepo(inv) {
   // checkout's index was reset, staged work destroyed, where origin/main blocked
   // it. The channel check therefore belongs at the SINGLE decision point both
   // gates share — this one.
-  if (["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
-    .some((v) => { const x = process.env[v]; return typeof x === "string" && x.length > 0; })) return true;
-  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && !/^GIT_CONFIG_NOSYSTEM$/.test(k) && (process.env[k] ?? "").length > 0 && process.env[k] !== "/dev/null")) return true;
+  if (Object.keys(process.env).some(isRepoSelectingEnvKey)) return true;
   return false;
 }
 
@@ -5677,14 +5675,32 @@ export function hubNewFileVolumeVerdict(count) {
  *  sanctions — see isHubRecoveryInvocation) and an explicit statement that the
  *  branch route does not apply. Clean/off-main-only keeps the branch route,
  *  which DOES work there. */
+const REPO_SELECTING_ENV = {
+  GIT_DIR: true, GIT_WORK_TREE: true, GIT_INDEX_FILE: true,
+  GIT_OBJECT_DIRECTORY: true, GIT_ALTERNATE_OBJECT_DIRECTORIES: true, GIT_COMMON_DIR: true,
+};
+
+/** Round 15: ONE predicate for "this env var selects/redirects a repo", used by
+ *  BOTH the decision (`_invSelectsRepo`) and the message (`_ambientGitEnvLines`).
+ *  Two copies drifted: the message flagged GIT_CONFIG_NOSYSTEM, which the
+ *  decision exempts (it only suppresses /etc/gitconfig). */
+export function isRepoSelectingEnvKey(k) {
+  if (Object.prototype.hasOwnProperty.call(REPO_SELECTING_ENV, k)) {
+    return (process.env[k] ?? "").length > 0;
+  }
+  if (/^GIT_CONFIG_/.test(k) && !/^GIT_CONFIG_NOSYSTEM$/.test(k)) {
+    const v = process.env[k] ?? "";
+    return v.length > 0 && v !== "/dev/null";
+  }
+  return false;
+}
+
 /** Round 8 (P2): name an INHERITED repo-selecting env instead of prescribing a
  *  restore that cannot converge. Empty when the process env is clean. */
 function _ambientGitEnvLines() {
-  const vars = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
-    .filter((v) => typeof process.env[v] === "string" && process.env[v].length > 0);
-  const cfg = Object.keys(process.env).filter((k) => /^GIT_CONFIG_/.test(k) && (process.env[k] ?? "").length > 0);
-  const found = [...vars, ...cfg];
+  // Round 15: the SAME predicate the DECISION uses (two copies drifted and the
+  // message declared a still-recoverable hub unrecoverable).
+  const found = Object.keys(process.env).filter(isRepoSelectingEnvKey);
   if (found.length === 0) return [];
   return [
     `   ⚠️ THIS PROCESS INHERITED a repo-selecting env (${found.join(", ")}) — every`,

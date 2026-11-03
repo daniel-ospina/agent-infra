@@ -296,6 +296,7 @@ let readAllowMarkerState: (path: string, sessionId: string | null | undefined, n
 // (M4's classifier reason and this file's write/edit + bash-write surfaces) so
 // the advice cannot drift from the enforcement.
 let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean) => string[] = () => [];
+let isRepoSelectingEnvKey: (k: string) => boolean = () => false;
 // Round 11 (P2): the REAL hatch state for the CURRENT tool call, resolved with the
 // ctx session id (not the env-only form). `_hubWriteRecoverLines` used to derive
 // it itself via `_currentSessionId(undefined)`, which is empty in production (pi
@@ -308,7 +309,7 @@ try {
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
-     hubDirtyRecoveryLines,
+     hubDirtyRecoveryLines, isRepoSelectingEnvKey,
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, scriptIsInterpreted, evaluateHubGateWithTargets,
      extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
@@ -2896,8 +2897,7 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   // TTL marker that was newly reachable (origin/main blocked it; only the env
   // hatch — a full bypass — allowed it there). No channel predicate can see the
   // process env, so it is checked directly.
-  if (["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
-    .some((v) => { const x = process.env[v]; return typeof x === "string" && x.length > 0; })) return false;
+  if (Object.keys(process.env).some(isRepoSelectingEnvKey)) return false;
   // …including the AMBIENT spelling of the config channel (round 7, P2 — the
   // `-c`/`--config-env` family r6 closed is also settable through the env:
   // GIT_CONFIG_PARAMETERS / GIT_CONFIG_COUNT+KEY_n/VALUE_n / GIT_CONFIG_GLOBAL /
@@ -2905,7 +2905,7 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   // core.worktree inside a worktree) so this was a classification gap, but the
   // fix is the principle rather than three more names: a bare restore needs NO
   // git config at all, so ANY `GIT_CONFIG_*` in the env puts it out of window.
-  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && !/^GIT_CONFIG_NOSYSTEM$/.test(k) && (process.env[k] ?? "").length > 0 && process.env[k] !== "/dev/null")) return false;
+
   const st = _hubState();
   if (!st.disorder) return false; // the window exists only for a DISORDERED hub
   try {
@@ -5095,7 +5095,10 @@ export default function (pi: ExtensionAPI) {
               // was left to decide. The hub's tracked dirt is exactly what that
               // command destroys, so the effect gate must still be consulted
               // before the arm calls the command done.
-              const discardReason = _worktreeDiscardBlock(command, escapeActive);
+              // Round 15: the MESSAGE needs the hatch itself, not the shape-gated
+              // `escapeActive` — passing the latter told a hatched lane (refused for
+              // being compound/wrapped) to stamp the marker it already holds.
+              const discardReason = _worktreeDiscardBlock(command, _currentHatchActive);
               if (discardReason) return { block: true, reason: discardReason };
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
