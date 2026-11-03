@@ -358,9 +358,10 @@ already held, one opened a duplicate PR — both brief defects, not lane defects
 # at `$HOME/.pi/agent/scripts/`, with no checkout required.
 # The repo-relative form below resolves only where `scripts/` IS A REAL TRACKED TREE. Where `scripts/`
 # is the machine-local pointer instead (⛔ a gitignored symlink, never tracked — tortoise#9475), a
-# fresh worktree has none until it is materialised there (`uv run python
-# tools/link_agent_infra_scripts.py`). Measured 2026-11-03 in a tortoise worktree, which had no
-# `scripts/` at all and returned `No such file or directory` for the repo-relative form.
+# fresh worktree has none until it is materialised there — and that materialiser is a CONSUMER-REPO tool
+# (`uv run python tools/link_agent_infra_scripts.py` in tortoise's checkout), not one that exists here.
+# Measured 2026-11-03 in a tortoise worktree, which had no `scripts/` at all and returned
+# `No such file or directory` for the repo-relative form.
 bash ~/.pi/agent/scripts/tortoise-graph.sh health          # is the graph up
 bash ~/.pi/agent/scripts/tortoise-graph.sh search 'attestation staleness'
 bash ~/.pi/agent/scripts/tortoise-graph.sh get <point-id>

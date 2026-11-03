@@ -130,9 +130,27 @@ expect absent "graph credential MISSING:"
 # where nothing was farmed must not be told a farm half-ran.
 expect_absent absent "beside it"
 expect_absent absent "HALF-DELIVERED"
+# the reading must not claim an ABSENT client's exit code (round 7), and the replacement is pinned the
+# same way the `ok` scope words are — otherwise the old sentence can come back silently.
+expect absent "with the client in place"
+expect_absent absent "client exits 3"
 clean absent
 
-# ── case 3: half-delivered — the .sh without its sibling dies on the first call ──────────────────
+# ── case 3: a PY-ONLY box — the sibling is there, the client is not. This is the shape the
+# `absent` case cannot produce (there BOTH are missing, so the pre-fix code printed HALF-DELIVERED and
+# never the green `ok … beside it`). Measured 2026-11-03: with the sibling probe ungated, this box
+# printed `warn: graph client MISSING` followed by `ok: … tortoise_graph_client.py beside it`.
+H2b="$TMP/h2b"; E2b="$TMP/h2b/keys.env"
+mkdir -p "$H2b/.pi/agent/scripts"
+: >"$H2b/.pi/agent/scripts/tortoise_graph_client.py"
+printf 'NOTHING=1\n' >"$E2b"
+HOME="$H2b" ENV_FILE="$E2b" run_case pyonly >"$TMP/pyonly.stdout" 2>"$TMP/pyonly.err"
+expect pyonly "graph client MISSING:"
+expect_absent pyonly "beside it"
+expect_absent pyonly "HALF-DELIVERED"
+clean pyonly
+
+# ── case 4: half-delivered — the .sh without its sibling dies on the first call ──────────────────
 H3="$TMP/h3"; E3="$TMP/h3/keys.env"
 mkdir -p "$H3/.pi/agent/scripts"
 : >"$H3/.pi/agent/scripts/tortoise-graph.sh"
@@ -142,7 +160,7 @@ expect half "graph client: present at"
 expect half "HALF-DELIVERED"
 clean half
 
-# ── case 4: the REST key only — a warn, never an ok (an `ok` here is the false-PASS shape) ───────
+# ── case 5: the REST key only — a warn, never an ok (an `ok` here is the false-PASS shape) ───────
 H4="$TMP/h4"; E4="$TMP/h4/keys.env"
 mkdir -p "$H4/.pi/agent/scripts"
 : >"$H4/.pi/agent/scripts/tortoise-graph.sh"; : >"$H4/.pi/agent/scripts/tortoise_graph_client.py"
@@ -152,7 +170,7 @@ expect rest "graph credential UNCERTAIN"
 expect_absent rest "graph credential: TORTOISE_MCP_API_KEY is set"
 clean rest
 
-# ── case 5: a keys.env with an early `exit 0` — the sentinel must catch it ────────────────────────
+# ── case 6: a keys.env with an early `exit 0` — the sentinel must catch it ────────────────────────
 H5="$TMP/h5"; E5="$TMP/h5/keys.env"
 mkdir -p "$H5/.pi/agent/scripts"
 : >"$H5/.pi/agent/scripts/tortoise-graph.sh"; : >"$H5/.pi/agent/scripts/tortoise_graph_client.py"
@@ -161,7 +179,7 @@ HOME="$H5" ENV_FILE="$E5" run_case earlyexit >"$TMP/earlyexit.stdout" 2>"$TMP/ea
 expect_absent earlyexit "TORTOISE_MCP_API_KEY is set in"
 clean earlyexit
 
-# ── case 6: a keys.env with `trap "exit 1" EXIT` — the captured sentinel survives pipefail ───────
+# ── case 7: a keys.env with `trap "exit 1" EXIT` — the captured sentinel survives pipefail ───────
 H6="$TMP/h6"; E6="$TMP/h6/keys.env"
 mkdir -p "$H6/.pi/agent/scripts"
 : >"$H6/.pi/agent/scripts/tortoise-graph.sh"; : >"$H6/.pi/agent/scripts/tortoise_graph_client.py"
@@ -170,7 +188,7 @@ HOME="$H6" ENV_FILE="$E6" run_case trapexit >"$TMP/trapexit.stdout" 2>"$TMP/trap
 expect trapexit "graph credential: TORTOISE_MCP_API_KEY is set in"
 clean trapexit
 
-# ── case 7: the file exists but is unreadable — UNKNOWN, never "neither key is set" ──────────────
+# ── case 8: the file exists but is unreadable — UNKNOWN, never "neither key is set" ──────────────
 H7="$TMP/h7"; E7="$TMP/h7/keys.env"
 mkdir -p "$H7/.pi/agent/scripts"
 : >"$H7/.pi/agent/scripts/tortoise-graph.sh"; : >"$H7/.pi/agent/scripts/tortoise_graph_client.py"
@@ -190,7 +208,7 @@ else
     clean unreadable
 fi
 
-# ── case 8: the key is in THIS SHELL but not in the file — a lane still has none ──────────
+# ── case 9: the key is in THIS SHELL but not in the file — a lane still has none ──────────
 # (this arm and the two below also make case 12's leak assertion NON-VACUOUS: with no ambient value,
 # a check that echoed the environment's key would echo an empty string and pass.)
 H8="$TMP/h8"; E8="$TMP/h8/keys.env"
@@ -202,7 +220,7 @@ expect ambient_mcp "graph credential NOT REACHING LANES"
 expect_absent ambient_mcp "$SECRET"
 clean ambient_mcp
 
-# ── case 9: the REST key ambient, nothing in the file — UNCERTAIN, never ok ────────────────
+# ── case 10: the REST key ambient, nothing in the file — UNCERTAIN, never ok ────────────────
 H9="$TMP/h9"; E9="$TMP/h9/keys.env"
 mkdir -p "$H9/.pi/agent/scripts"
 : >"$H9/.pi/agent/scripts/tortoise-graph.sh"; : >"$H9/.pi/agent/scripts/tortoise_graph_client.py"
@@ -213,7 +231,7 @@ expect_absent ambient_rest "graph credential: TORTOISE_MCP_API_KEY is set"
 expect_absent ambient_rest "$SECRET"
 clean ambient_rest
 
-# ── case 10: the file carries the key AND the shell does too — the ok line must not echo it ───
+# ── case 11: the file carries the key AND the shell does too — the ok line must not echo it ───
 # This is the shape a real cell has (`check_provider` sources keys.env into the bring-up shell), so it
 # is the case in which a `printf %s "$TORTOISE_MCP_API_KEY"` inside the ok line would actually leak.
 H10="$TMP/h10"; E10="$TMP/h10/keys.env"
@@ -225,7 +243,7 @@ expect both "graph credential: TORTOISE_MCP_API_KEY is set in"
 expect_absent both "$SECRET"
 clean both
 
-# ── case 11: THE WIRING — the reading must still be CALLED by `--check`, after the layer and the env
+# ── case 12: THE WIRING — the reading must still be CALLED by `--check`, after the layer and the env
 # This probe sources the function body directly, so deleting the invocation in `main()` would leave every
 # arm above green while the cell stops reporting the client at all. `pi-bootstrap/tests/test-setup-no-nesting.sh`
 # names the same gap for its own suites ("a probe set alone cannot see the wiring") and proves it with a
@@ -246,7 +264,7 @@ if [ "$order_ok" -eq 1 ]; then pass; else
     fail "wiring: \`check_graph_client\` is not ordered AFTER check_operational_layer/check_provider/check_uv_env in main()"
 fi
 
-# ── case 12: THE RULE — the key's value never appears, in any arm ─────────────────────────────────
+# ── case 13: THE RULE — the key's value never appears, in any arm ─────────────────────────────────
 # ⛔ ONE SCAN, USED TWICE. The rule is about what an OPERATOR ends up pasting into an issue, so the
 # sweep covers every stream the check can write to — the stub transcript AND the case's real stdout and
 # stderr. The first version scanned only "$TMP"/*.out (a `printf` leak in the check went straight to the
@@ -270,7 +288,7 @@ leak_scan() { # <file>... → fills LEAK_FILES with every file carrying the valu
 # check the suite still reported 50/50 green (measured 2026-11-03) — the narrowed set simply never looked
 # at the file the value landed in. So the cases are NAMED and every stream of every case is scanned; the
 # floor then asserts the enumeration produced a plausible population, which a narrowed list would shrink.
-CASES="good absent half rest earlyexit trapexit unreadable ambient_mcp ambient_rest both"
+CASES="good absent pyonly half rest earlyexit trapexit unreadable ambient_mcp ambient_rest both"
 SCAN_FILES=()
 for c in $CASES; do
     SCAN_FILES+=("$TMP/$c.out" "$TMP/$c.stdout" "$TMP/$c.err")
@@ -300,8 +318,34 @@ if leak_scan "${SCAN_FILES[@]}"; then
     fail "credential leak: the key's VALUE appears in —"$'\n'"$(printf '%s\n' "${LEAK_FILES[@]}" | sed 's/^/    /')"
 else pass; fi
 
-# THE SELF-TEST, against the SAME function: plant the value and require `leak_scan` to flag it. (This is
-# the part the previous version got wrong — it pinned the PATTERN, never the scan.)
+# ⛔ THE SELF-TEST RUNS THE REAL CALL, NOT A STAND-IN. Round 7 pinned the enumeration's contents and
+# left the CALL unpinned: `leak_scan "$TMP"/*.out` instead of `leak_scan "${SCAN_FILES[@]}"` passed
+# 53/53 while a `printf` leak sat in `<case>.stdout` (measured 2026-11-03). So: plant the value in a
+# REAL case stream, re-run the SAME invocation the sweep uses, require LEAK_FILES to name that file,
+# then restore it. And assert the call site itself, so narrowing it reds by name.
+# Both call sites must pass the enumerated list — the sweep AND this self-test. A count is used rather
+# than a presence test because the two lines are textually identical: grepping for the invocation once is
+# satisfied by whichever site survived, which is exactly how a narrowed sweep passed 53/53.
+# ⛔ ANCHORED AND DID-FREE: a plain `grep -cF` for the invocation counts its OWN source line (and the
+# prose that quotes it) — measured 2026-11-03: 4 matches with only 2 call sites, so a narrowed sweep
+# stayed green at `>= 2`. Anchoring to line-start matches exactly the two `if leak_scan ...` statements.
+leak_calls="$(grep -cE '^if leak_scan "\$\{SCAN_FILES\[@\]}"; then' "$0")"
+if [ "${leak_calls:-0}" -ge 2 ]; then pass; else
+    fail "self-test: only ${leak_calls:-0} of 2 leak_scan call site(s) pass the enumerated SCAN_FILES — a narrowed call scans less than the coverage floor below asserts"
+fi
+cp "$TMP/ambient_mcp.stdout" "$TMP/ambient_mcp.stdout.bak"
+printf 'planted %s\n' "$SECRET" >>"$TMP/ambient_mcp.stdout"
+if leak_scan "${SCAN_FILES[@]}"; then
+    case " ${LEAK_FILES[*]} " in
+        *"$TMP/ambient_mcp.stdout"*) pass ;;
+        *) fail "self-test: the real sweep did not name $TMP/ambient_mcp.stdout although it carries the value — it is not scanning that stream" ;;
+    esac
+else
+    fail "self-test: the real sweep found nothing in a case stream that provably carries the value — the clean result above is an empty set, not a measurement"
+fi
+mv "$TMP/ambient_mcp.stdout.bak" "$TMP/ambient_mcp.stdout"
+
+# THE PATTERN SELF-TEST, against the SAME function (kept as well: it pins the matcher, not the sweep).
 printf 'planted %s\n' "$SECRET" >"$TMP/self_test.stdout"
 if leak_scan "$TMP/self_test.stdout"; then pass; else
     fail "self-test: leak_scan did not flag a file that provably contains the value — the clean result above is an empty set, not a measurement"
