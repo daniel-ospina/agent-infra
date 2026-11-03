@@ -1111,7 +1111,41 @@ NONBLOCKING_DISPATCH = os.path.join(ORCH_DIR, "nonblocking-dispatch.sh")
 # PR worktrees a pass creates can only ever be worktrees OF THE REPO BEING GRADED. A fixed root
 # made an agent-infra pass `git -C` tortoise's checkout and add tortoise worktrees for it.
 WORKTREE_ROOT = ""
-SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
+# ⛔ THE BOUND IS A BACKSTOP, NOT THE PRIMARY BOUND (agent-infra#2888) — AND IT IS A SEAM.
+# It was a hardcoded flat 2400 s, handed to the worker as its kill deadline. `walltime.tsv` on
+# `pi-cell-4` (1,202 rows, 2026-10-27) showed what a flat deadline does to a population: `prfix`
+# median = p90 = 2400 s, i.e. THE CAP IS THE MEDIAN — a bound censoring the whole population rather
+# than trimming outliers. Measured in one batch on 2026-10-27/28: five of five lanes ended at
+# `elapsed == cap`, rc 143, ZERO commits and ZERO PRs between them, with 144 KB of finished but
+# uncommitted work. The bound that decides "wedged?" is the PROGRESS allowance inside lane-bound.sh
+# (45 min — the fleet's own declared no-progress window, reused rather than re-derived); this value is
+# only the ABSOLUTE ceiling for a lane that creeps forward for ever, and it MUST sit above the
+# allowance or it pre-empts it (the shipped pair was 2400 < 2700, and that ordering WAS the defect).
+#
+# ⛔ 7200 s (2 h) IS PROVISIONAL, and saying so is part of the change: today's prfix distribution is
+# CENSORED BY THE VERY VALUE BEING REPLACED, so the ceiling cannot be sized from it. Landing the seam
+# first is what makes the real distribution observable; agent-infra#2888 owns the re-measure and the
+# re-size. It also lifts the observed `bg` p90 of 5401 s, so it does not trim that population either.
+#
+# ⛔ A TYPO MUST NEVER DISARM IT. Blank / non-numeric / `0` take the default: an unbounded default for
+# every repair lane on the box is indistinguishable from a typo'd one, and this is a DEFAULT rather
+# than an explicit operator act. The env name is `PRD_SPAWN_BACKSTOP_S`; the Python constant keeps its
+# old name because `worker_live()` also uses it as the age of a recycled pid, and one constant for one
+# duration is the point.
+SPAWN_BACKSTOP_ENV = "PRD_SPAWN_BACKSTOP_S"
+DEFAULT_SPAWN_BACKSTOP_S = 7200
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """A positive-int env seam whose malformed values take the DEFAULT, never `0`/unbounded."""
+    try:
+        v = int((os.environ.get(name) or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+SPAWN_TIMEOUT_S = _positive_int_env(SPAWN_BACKSTOP_ENV, DEFAULT_SPAWN_BACKSTOP_S)
 # ⛔ THE SPAWN CALL MUST NOT WAIT FOR THE WORKER -- AND A CAPTURED CALL DOES. `subprocess.run`
 # blocks until EOF on the capture PIPE, not until the child exits; `nonblocking-dispatch.sh`
 # backgrounds the worker with `( … ) <&- &`, which closes STDIN only, so the worker subshell
@@ -3891,6 +3925,11 @@ def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
     it is the drain, not creation. The dispatcher's default is `bg` -- measured as creation by the
     back-pressure gate -- because an UNdeclared caller is safer held than trusted; declaring it here
     is what keeps `pr-doctor` running when the backlog is over its ceiling.
+
+    ⛔ THE SECOND-TO-LAST ARGUMENT IS THE WALL BACKSTOP, NOT A DEADLINE (agent-infra#2888): the bound
+    that ends a wedged worker is the PROGRESS allowance inside `lane-bound.sh`; this is the absolute
+    ceiling above it. It is in the argv on purpose -- an operator can read what was dispatched without
+    reading this file -- and its own seam is `PRD_SPAWN_BACKSTOP_S`.
     """
     return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S), "prfix"]
 
@@ -3902,7 +3941,7 @@ def _confirm(name: str) -> tuple[str, str]:
 
       1. poll `$O/bg/<name>.rc` for a COMPLETE code inside CONFIRM_WINDOW_S. A gate refusal lands
          there in ~35 ms (measured), so a refusal is caught without waiting for an agent that may
-         run for 40 minutes;
+         run for its whole backstop (2 hours by default);
       2. if nothing landed, ASK THE HARNESS (`--status`): a refusal written just after the window
          is still caught, a live pid is positive proof of a launch, and `lost` means the worker
          vanished without a verdict -- neither a launch nor a refusal, and never a row.
