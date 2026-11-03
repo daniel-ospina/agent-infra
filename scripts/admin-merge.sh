@@ -547,6 +547,21 @@
 #                        named (shard, green n, green max) in the message. An
 #                        explicit value is a CEILING instead: an operator's cap,
 #                        not a claim about the run. See wait_for_run.
+#   --rerun-budget S     TOTAL wall-clock budget (seconds) for the WHOLE re-run
+#                        phase — every run re-run in this invocation, summed.
+#                        The per-shard derived bound governs ONE run and can
+#                        legitimately be hours (a bash-suites shard's green max
+#                        is ~9000s, so 2x it is ~5h); the derived bound is the
+#                        honest test for a WEDGED run, but it is not a budget
+#                        for the PHASE. Past the budget the rail REFUSES BY NAME
+#                        — `REFUSED(rerun-budget, attempts=N, elapsed=Ms)` —
+#                        instead of sitting silently for hours. Default 1800s;
+#                        raise it with this flag for a known-slow shard.
+#   --rerun-attempts N   maximum number of runs this invocation will re-run
+#                        (default 3). One head normally carries 1-2 failing
+#                        runs; a larger N re-runs the same head again and again
+#                        and measures nothing new. Exceeding it refuses by name
+#                        — `REFUSED(rerun-attempts, attempts=N, elapsed=Ms)`.
 #   --no-rerun           skip the flake re-run classification (a non-empty
 #                        unique set then blocks immediately). NOTE: the #3715
 #                        base reproduction still runs — it is a baseline
@@ -696,6 +711,16 @@
 #   ADMIN_MERGE_REPRO_TIMEOUT            the reproduction's mandatory alarm bound in
 #                                         seconds (default 900; a positive integer —
 #                                         anything else is refused)
+#   ADMIN_MERGE_RERUN_BUDGET             TOTAL wall-clock budget in seconds for the
+#                                         whole RE-RUN phase (default 1800). The
+#                                         per-shard bound governs ONE run and can
+#                                         be hours; this governs how long the rail
+#                                         may spend in the phase at all. Exceeding
+#                                         it BLOCKS by name — never merges. The CLI
+#                                         spelling is `--rerun-budget`.
+#   ADMIN_MERGE_RERUN_MAX_ATTEMPTS       how many runs one invocation may re-run
+#                                         (default 3). Exceeding it BLOCKS by name.
+#                                         The CLI spelling is `--rerun-attempts`.
 #   ADMIN_MERGE_RERUN_FLOOR              per-shard bound FLOOR (default 1200). A
 #                                         floor only ever RAISES the bound, so it
 #                                         cannot cause the false block the flat
@@ -860,6 +885,37 @@ VERIFY_ATTEMPTS="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
 # The floor and the fail-safe are validated by name in validate_timing_knobs.
 FAILSAFE_RERUN_TIMEOUT="${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}"
 RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
+
+# ── THE RE-RUN PHASE BUDGET — an ACTUATOR bound, not a quality bound ────
+# The derived per-shard bound answers "is this run wedged?" and is deliberately
+# generous (2 x a green shard's own max). That is the right test for ONE run and
+# the wrong thing to hand to a PHASE: measured on 2026-11-02, the derived bound
+# for a `bash-suites` shard was 18064s (5h) and two rails sat in the RE-RUN wait
+# for 1h46m+ with nothing else to show for it. A wait that long is not patience,
+# it is an actuator burning a fleet slot AND re-running eight shards off the
+# shared runner pool — which starves the queue that caused the timeout.
+#
+# So the phase gets a budget of its own, and EXCEEDING it is refused BY NAME
+# (`REFUSED(rerun-budget, attempts=N, elapsed=Ms)`) rather than waited out. It
+# can never turn a red into a merge: the decision below is unchanged, and the
+# refusal blocks. It only stops the rail from SPENDING hours to reach a verdict
+# a bounded wait reaches too.
+#
+# NUMBERS AND WHY (see also --rerun-budget/--rerun-attempts in the usage block):
+#   * 1800s (30 min) — larger than any flake re-run of a fast/medium shard (the
+#     class the mechanism exists for, minutes), smaller than the ~5h a slow
+#     shard's derived bound permits, and the same order as the fail-safe an
+#     undecidable derivation already falls back to. A slow shard that genuinely
+#     needs longer is an OPERATOR call: raise the budget and say so.
+#   * 3 attempts — one head normally carries 1-2 failing runs, and the second
+#     sample the E5 rotation rule needs is taken on the FIRST re-run, so a
+#     fourth re-run of the same head measures nothing new.
+RERUN_BUDGET="${ADMIN_MERGE_RERUN_BUDGET:-1800}"
+RERUN_MAX_ATTEMPTS="${ADMIN_MERGE_RERUN_MAX_ATTEMPTS:-3}"
+# Set by the re-run loop when the remaining budget — not the derivation — is
+# what bounded a single wait. `wait_for_run` reads it so an operator/policy
+# CEILING is never reported as a claim that the run STALLED (return 2, not 1).
+RERUN_TIMEOUT_CLAMPED=0
 
 # ── THE FIRST-CHECKS WAIT IS PROGRESS-AWARE, NOT A FIXED WINDOW (#2481) ──
 # The head's lane runs must APPEAR and reach status=completed before §1b may
@@ -1870,6 +1926,45 @@ validate_timing_knobs() {
     bad=1
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK='${FAILSAFE_RERUN_TIMEOUT}' — beyond"
     say_err "   the usable range (max ${TIMING_KNOB_MAX}s)."
+  fi
+  # The re-run phase budget (--rerun-budget / --rerun-attempts). Same two-stage
+  # discipline: a LEADING ZERO makes bash arithmetic and the comparison disagree,
+  # and a NON-POSITIVE or over-range value makes the guard's `test` error — which
+  # SKIPS the check inside the re-run loop, i.e. the unbounded wait this knob
+  # exists to remove. Refused by name BEFORE any CI work.
+  if counter_has_leading_zero "$RERUN_BUDGET"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_BUDGET='${RERUN_BUDGET}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL while the bound comparison reads it as"
+    say_err "   DECIMAL. Write it without the leading zero (e.g. '1800', not '01800')."
+    say_err "   The knob is ADMIN_MERGE_RERUN_BUDGET (env) or --rerun-budget (CLI)."
+  elif ! counter_is_positive "$RERUN_BUDGET"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_BUDGET='${RERUN_BUDGET}' — the re-run phase budget"
+    say_err "   (env ADMIN_MERGE_RERUN_BUDGET, or the CLI spelling --rerun-budget) must be a POSITIVE"
+    say_err "   integer number of seconds (0 would refuse every re-run)."
+  elif counter_exceeds_max "$RERUN_BUDGET" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_BUDGET='${RERUN_BUDGET}' — beyond the usable range"
+    say_err "   (max ${TIMING_KNOB_MAX}s). An all-digit value past the shell's integer range makes the"
+    say_err "   budget comparison error out, which SKIPS it instead of failing it."
+    say_err "   The knob is ADMIN_MERGE_RERUN_BUDGET (env) or --rerun-budget (CLI)."
+  fi
+  if counter_has_leading_zero "$RERUN_MAX_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_MAX_ATTEMPTS='${RERUN_MAX_ATTEMPTS}' — a LEADING ZERO"
+    say_err "   is ambiguous: bash ARITHMETIC reads it as OCTAL. Write it without the leading zero."
+    say_err "   The knob is ADMIN_MERGE_RERUN_MAX_ATTEMPTS (env) or --rerun-attempts (CLI)."
+  elif ! counter_is_positive "$RERUN_MAX_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_MAX_ATTEMPTS='${RERUN_MAX_ATTEMPTS}' — the attempt cap"
+    say_err "   (env ADMIN_MERGE_RERUN_MAX_ATTEMPTS, or the CLI spelling --rerun-attempts) must be a"
+    say_err "   POSITIVE integer (0 would refuse every re-run)."
+  elif counter_exceeds_max "$RERUN_MAX_ATTEMPTS" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RERUN_MAX_ATTEMPTS='${RERUN_MAX_ATTEMPTS}' — beyond the"
+    say_err "   usable range (max ${TIMING_KNOB_MAX})."
+    say_err "   The knob is ADMIN_MERGE_RERUN_MAX_ATTEMPTS (env) or --rerun-attempts (CLI)."
   fi
   if counter_has_leading_zero "$POLL_INTERVAL"; then
     bad=1
@@ -2922,6 +3017,43 @@ fail_safe_rerun_timeout() {
   DERIVED_RERUN_SOURCE="fail-safe ${FAILSAFE_RERUN_TIMEOUT}s — derivation unavailable (${reason})"
   DERIVED_TABLE=""
   say_err "admin-merge: derivation unavailable (${reason}) — using the fail-safe ${FAILSAFE_RERUN_TIMEOUT}s (never a small bound)"
+}
+
+# refuse_rerun_budget <reason> <attempts> <elapsed> — the RE-RUN PHASE BUDGET's
+# refusal, printed by name and in one place. Every budget exit goes through here
+# so the shape `REFUSED(<reason>, attempts=<n>, elapsed=<m>s)` cannot drift
+# between the two triggers (attempt cap, wall clock) — an operator greps for one
+# token, and a second spelling of it is a second instrument.
+refuse_rerun_budget() {
+  local reason="$1" attempts="$2" elapsed="$3"
+  say_err "admin-merge: ✗ BLOCK — REFUSED(${reason}, attempts=${attempts}, elapsed=${elapsed}s)"
+  # THE CLAMP IS DISCLOSED ON THE REFUSAL ITSELF, not only in the progress log: the
+  # operator reading the block must see that the bound which expired was the BUDGET
+  # and not the derived per-shard value, or the numbers in the refusal above look
+  # like a stall claim about a run whose own bound was never reached.
+  if [ "${RERUN_TIMEOUT_CLAMPED:-0}" -eq 1 ]; then
+    say_err "   The wait that expired was CLAMPED to the remaining budget: ${RERUN_TIMEOUT_SOURCE}"
+  fi
+  say_err "   The RE-RUN phase budget is --rerun-budget ${RERUN_BUDGET}s / --rerun-attempts ${RERUN_MAX_ATTEMPTS}"
+  say_err "   (env ADMIN_MERGE_RERUN_BUDGET / ADMIN_MERGE_RERUN_MAX_ATTEMPTS). It exists because the"
+  say_err "   DERIVED per-shard bound is the honest test for ONE wedged run and a terrible budget for a"
+  say_err "   PHASE: measured 2026-11-02, a bash-suites shard's derived bound was 18064s (5h) and rails sat"
+  say_err "   in this wait for 1h46m+. Refusing with the numbers beats sitting silently for hours, and it"
+  say_err "   spends no runner capacity on a re-run nobody will read."
+  say_err "   This is NOT a verdict on the run: no claim is made that it stalled. The merge decision is"
+  say_err "   unchanged and the refusal BLOCKS — nothing here clears a red."
+  say_err "   Next: fix or adjudicate the failing check directly (the per-check failure set is above)."
+  # THE REMEDY IS TRIGGER-SPECIFIC. Raising the wall clock cannot clear an attempt-cap
+  # refusal (a head with more failing runs than the cap still refuses with an unbounded
+  # budget), so a single "raise the budget" line sends that operator round the loop.
+  if [ "$reason" = "rerun-attempts" ]; then
+    say_err "   Or raise --rerun-attempts (env ADMIN_MERGE_RERUN_MAX_ATTEMPTS) when this head genuinely"
+    say_err "   carries more failing RUNS than the cap — that, not the wall clock, is the bound here."
+  else
+    say_err "   Or re-run with a larger --rerun-budget (env ADMIN_MERGE_RERUN_BUDGET) when this shard is"
+    say_err "   KNOWN to be slow. A larger --rerun-attempts would NOT help: the wall clock is the bound."
+  fi
+  say_err "   No merge."
 }
 
 # fetch_run_jobs <run-id> → the raw jobs JSON on stdout. The API rather than
@@ -6181,9 +6313,10 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
 #             can only fire EARLY. The run's own green-derived bound is therefore
 #             the ONLY honest discriminator; the message names the shard, its
 #             green n and its green max.
-#   return 2  CEILING — still RUNNING at an EXPLICIT `--rerun-timeout`. An
-#             operator's cap is not a claim about the run, so this stays distinct
-#             from STALLED; it is still NOT a failure of the run.
+#   return 2  CEILING — still RUNNING at an EXPLICIT `--rerun-timeout` OR at the
+#             RE-RUN PHASE BUDGET's clamp (`RERUN_TIMEOUT_CLAMPED`). Either way an
+#             operator POLICY cap is not a claim about the run, so this stays
+#             distinct from STALLED; it is still NOT a failure of the run.
 #   return 3  UNOBSERVABLE — gh could not be read for the whole bound, so the
 #             run's state was NEVER OBSERVED. Deliberately distinct from STALLED
 #             (1): "exceeded its bound" is a claim about a run we watched; an
@@ -6261,9 +6394,14 @@ wait_for_run() {
     RERUN_WAIT_STATE="unobservable"
     return 3
   fi
-  # PROVENANCE, not timing, decides the verdict: an explicit cap is a CEILING;
-  # the derived per-shard bound is a STALL.
-  if [ "${RERUN_TIMEOUT_EXPLICIT:-0}" -eq 1 ]; then RERUN_WAIT_STATE="ceiling"; return 2; fi
+  # PROVENANCE, not timing, decides the verdict — and the RE-RUN PHASE BUDGET is
+  # a provenance too: when the remaining budget (not the derivation) bounded this
+  # wait, expiring it is an operator POLICY ceiling, never a claim that the run
+  # is wedged. Without this arm the budget would be reported as STALLED, i.e. the
+  # rail would assert something about the run it did not measure.
+  if [ "${RERUN_TIMEOUT_EXPLICIT:-0}" -eq 1 ] || [ "${RERUN_TIMEOUT_CLAMPED:-0}" -eq 1 ]; then
+    RERUN_WAIT_STATE="ceiling"; return 2
+  fi
   RERUN_WAIT_STATE="stalled"
   return 1
 }
@@ -6323,7 +6461,10 @@ PY
 }
 
 # print_bounds [<run-id>] — the re-run bound, its per-shard table (each figure
-# carrying its n), and the source. `rerun-timeout=` stays the FIRST line:
+# carrying its n), and the source. `rerun-timeout=` stays its own anchored KEY LINE
+# (every suite assertion anchors `^rerun-timeout=`), with the phase budget printed
+# ABOVE it as its own anchored keys — an operator greps for the knob, not for a
+# position, and a test must not depend on one line being first.
 # existing greps depend on the key, and it is also the STALLED threshold — there
 # is ONE bound for a remote run (see wait_for_run). With NO run id there is
 # nothing to derive from, so this is the one path that prints the fail-safe and
@@ -6352,6 +6493,8 @@ print_bounds() {
 # print_bounds_rerun [<run-id>] — the RE-RUN bound's own half (see above).
 print_bounds_rerun() {
   local run_id="$1"
+  printf 'rerun-budget=%s\n' "$RERUN_BUDGET"
+  printf 'rerun-max-attempts=%s\n' "$RERUN_MAX_ATTEMPTS"
   if [ "$RERUN_TIMEOUT_EXPLICIT" -eq 1 ]; then
     printf 'rerun-timeout=%s\n' "$RERUN_TIMEOUT"
     printf 'source=explicit --rerun-timeout (a CEILING, not a derived stall bound)\n'
@@ -7537,6 +7680,20 @@ main() {
         if [ $# -lt 2 ]; then RERUN_TIMEOUT=""; else RERUN_TIMEOUT="$2"; fi
         RERUN_TIMEOUT_EXPLICIT=1; RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"
         if [ $# -lt 2 ]; then shift; else shift 2; fi ;;
+      # ── THE RE-RUN PHASE BUDGET'S TWO KNOBS (#3280), CARRYING THE SAME GUARD ──
+      # #3280 landed these as a bare `shift 2`, which is the ONE shape the rule at
+      # the top of this loop exists to remove: `--rerun-budget` as the LAST token
+      # makes `shift 2` FAIL, leave `$#` unchanged, and re-read itself FOREVER —
+      # the wedged rail, not a refusal. Left EMPTY instead, the post-parse
+      # `validate_timing_knobs` refuses it by name (exit 2) with the documented
+      # message, which is the same contract the flags above honour. Valid input is
+      # untouched: whenever a value is present these arms assign it verbatim.
+      --rerun-budget)
+        if [ $# -lt 2 ]; then RERUN_BUDGET=""; else RERUN_BUDGET="${2:-}"; fi
+        if [ $# -lt 2 ]; then shift; else shift 2; fi ;;
+      --rerun-attempts)
+        if [ $# -lt 2 ]; then RERUN_MAX_ATTEMPTS=""; else RERUN_MAX_ATTEMPTS="${2:-}"; fi
+        if [ $# -lt 2 ]; then shift; else shift 2; fi ;;
       --no-rerun) NO_RERUN=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
       # Make the DERIVATION visible on demand: the re-run bound is not a round
@@ -7609,7 +7766,7 @@ main() {
               # its short `-R` are the repo selectors: forwarded, either would
               # point the MERGE at another repo while the analysis and the
               # head-bound evidence stayed on this one.
-              --main-runs|--repo|-R|--rerun-timeout|--no-rerun|--dry-run|--print-bounds)
+              --main-runs|--repo|-R|--rerun-timeout|--rerun-budget|--rerun-attempts|--no-rerun|--dry-run|--print-bounds)
                 local ps_hint="$ps_name"
                 [ "$ps_name" = "-R" ] && ps_hint="--repo owner/repo"
                 say_err "admin-merge: ✗ refusing '$ps_name' after the '--' separator — that is a PARSER flag,"
@@ -7663,6 +7820,13 @@ main() {
         shift ;;
     esac
   done
+
+  # ⛔ A KNOB SUPPLIED ON THE COMMAND LINE IS VALIDATED TOO. The startup call above
+  # runs BEFORE the flags are parsed, so it can only see the environment — a
+  # `--rerun-budget 0` (or `01800`) would otherwise reach the clock unvalidated and
+  # either refuse every re-run or be read as OCTAL by arithmetic and DECIMAL by the
+  # comparison. The second, idempotent call closes that.
+  validate_timing_knobs || exit 2
 
   # Apply the lane-selector flags RECOVERED from after `--`. LOUD, because the
   # invocation that needs recovery is one whose author should learn the boundary;
@@ -8980,9 +9144,51 @@ main() {
     # is order/timing flaky, not new — the #3469 shape (a sibling pair that
     # trips alternately on main) must not hard-block a safe merge.
     local run_line run_id wait_rc attempt_before
+    # THE PHASE BUDGET'S CLOCK. `SECONDS` is the shell's own monotonic-ish clock,
+    # so it needs no `date` call and cannot be affected by the test seam's
+    # POLL_INTERVAL=0.
+    local rerun_started="$SECONDS" rerun_attempts=0 rerun_elapsed=0 rerun_remaining=0
+    # THE OPERATOR'S BOUND, SNAPSHOTTED ONCE. Without this the clamp below would
+    # permanently shrink an explicit `--rerun-timeout` for the rest of the rail and
+    # append a "CLAMPED …" segment to its source on every iteration, so iteration 2
+    # would report a bound it was never given (review P2). The DERIVED branch
+    # re-derives per run already; this is the equivalent for the explicit one.
+    local rerun_explicit_bound="$RERUN_TIMEOUT"
     while IFS= read -r run_line; do
       [ -n "$run_line" ] || continue
       run_id="${run_line##*:}"
+      # RESET THE CLAMP FLAG AT THE TOP OF THE ITERATION. It must not survive into
+      # the PRE-SPEND refusals below: they assert a wait outcome ("The wait that
+      # expired was CLAMPED …") and on iteration >=2 a stale 1 makes them claim a
+      # wait expired that never ran at all (review P2).
+      RERUN_TIMEOUT_CLAMPED=0
+      # ── THE BUDGET IS CHECKED BEFORE THE RE-RUN, NOT AFTER IT ───────────
+      # `gh run rerun` is the spend (it restarts real jobs on a shared runner
+      # pool), so a rail that is already out of budget must not issue one and
+      # then refuse. Both triggers are named, both block, neither clears a red.
+      rerun_attempts=$((rerun_attempts + 1))
+      rerun_elapsed=$((SECONDS - rerun_started))
+      if [ "$rerun_attempts" -gt "$RERUN_MAX_ATTEMPTS" ]; then
+        say_err "admin-merge: this head carries more failing run(s) than --rerun-attempts permits; the"
+        say_err "   remaining run(s) were NOT re-run."
+        refuse_rerun_budget "rerun-attempts" "$((rerun_attempts - 1))" "$rerun_elapsed"
+        exit 1
+      fi
+      # NOT ARMED BY ANY FIXTURE, DELIBERATELY. Every deterministic path that would
+      # reach this exit is caught EARLIER by the clamp at the wait below (which
+      # refuses with the same named message), so this is defence-in-depth for the
+      # one case a fixture cannot force deterministically: a wait that completes
+      # inside its remaining margin while the iteration's own overhead
+      # (`derive_rerun_timeout`, `gh run rerun`, `describe_run_observation`) pushes
+      # the real clock past the budget. Removing it would leave that divergence
+      # unbounded — the exact class this budget exists to close.
+      if [ "$rerun_elapsed" -ge "$RERUN_BUDGET" ]; then
+        say_err "admin-merge: the re-run phase has spent its whole budget; run $run_id (and any after it)"
+        say_err "   was NOT re-run."
+        refuse_rerun_budget "rerun-budget" "$((rerun_attempts - 1))" "$rerun_elapsed"
+        exit 1
+      fi
+      rerun_remaining=$((RERUN_BUDGET - rerun_elapsed))
       # DERIVE BEFORE THE RE-RUN. At this point the run is terminal (`pr-runs.txt`
       # carries failing runs), so EVERY shard has a completed sample and the run
       # bound is the slow shard's own 2 x max. Deriving AFTER the re-run would
@@ -8993,12 +9199,26 @@ main() {
         derive_rerun_timeout "$run_id"
         RERUN_TIMEOUT="$DERIVED_RERUN_TIMEOUT"
         RERUN_TIMEOUT_SOURCE="$DERIVED_RERUN_SOURCE"
+      else
+        RERUN_TIMEOUT="$rerun_explicit_bound"
+        RERUN_TIMEOUT_SOURCE="explicit --rerun-timeout"
       fi
       # THE RE-RUN'S OBSERVABLE IDENTITY. GitHub increments `attempt` on every
       # re-run, so the pre-request value is what lets the wait prove the re-run
       # STARTED instead of accepting the old `completed` on its first poll. An
       # unreadable attempt degrades to the status-only contract (fail-closed:
       # the run still has to finish).
+      # CLAMP THE WAIT TO WHAT IS LEFT OF THE BUDGET. The derivation answers
+      # "is this run wedged" across a window that can be hours; the budget says
+      # how long this rail may spend in the phase at all. Taking the SMALLER of
+      # the two is the only reading that honours both, and it is marked so
+      # `wait_for_run` reports a CEILING rather than a stall claim.
+      RERUN_TIMEOUT_CLAMPED=0
+      if [ "$RERUN_TIMEOUT" -gt "$rerun_remaining" ]; then
+        RERUN_TIMEOUT="$rerun_remaining"
+        RERUN_TIMEOUT_SOURCE="${RERUN_TIMEOUT_SOURCE}; CLAMPED to the remaining ${rerun_remaining}s of the ${RERUN_BUDGET}s re-run budget"
+        RERUN_TIMEOUT_CLAMPED=1
+      fi
       attempt_before=""
       # shellcheck disable=SC2086
       attempt_before="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
@@ -9014,6 +9234,20 @@ main() {
         # What it last observed — each job's status/conclusion and its age.
         describe_run_observation "$run_id"
       fi
+      # A CLAMPED WAIT THAT EXPIRED SPENT THE BUDGET — report the budget refusal,
+      # not a generic "still running at the ceiling", so the numbers an operator
+      # needs are on the line that names the policy that stopped the rail.
+      # `wait_for_run` reports a CLAMPED expiry as return 2 (CEILING). ONLY that
+      # code is the budget's own verdict: 3 (UNOBSERVABLE — gh never readable) and
+      # 4 (the re-run was accepted but the attempt never advanced) are DIFFERENT
+      # diagnoses with opposite remedies, and relabelling them as "budget" would
+      # hide the only signal that says "repair gh" or "the re-run never started".
+      # The rc=1, rc=3 and rc=4 arms BELOW each interpolate `${RERUN_TIMEOUT_SOURCE}`,
+      # so the `; CLAMPED …` disclosure survives on all of them without this arm.
+      if [ "$wait_rc" -eq 2 ] && [ "${RERUN_TIMEOUT_CLAMPED:-0}" -eq 1 ]; then
+        refuse_rerun_budget "rerun-budget" "$rerun_attempts" "$((SECONDS - rerun_started))"
+        exit 1
+      fi
       if [ "$wait_rc" -eq 4 ]; then
         say_err "admin-merge: ✗ BLOCK — RE-RUN wait could not OBSERVE the re-run of run $run_id: after ${RERUN_WAIT_WAITED}s (bound ${RERUN_TIMEOUT}s — ${RERUN_TIMEOUT_SOURCE}) the run still reported ${RERUN_WAIT_LAST}. gh accepted the re-run request but the run attempt never advanced, so the OLD result is NOT a re-run result and can neither certify nor clear this PR. Next: re-run the rail (or trigger the workflow) and watch the attempt advance. No merge."
         exit 1
@@ -9023,7 +9257,7 @@ main() {
         exit 1
       fi
       if [ "$wait_rc" -eq 3 ]; then
-        say_err "admin-merge: ✗ BLOCK — RE-RUN wait: run $run_id UNOBSERVABLE: gh could not be read for the whole bound (${RERUN_TIMEOUT}s); waited ${RERUN_WAIT_WAITED}s. This is NOT a stall — a stall is a claim about a run we watched, and this rail never saw the field. Remedy differs: check gh auth/network, then re-run. No merge."
+        say_err "admin-merge: ✗ BLOCK — RE-RUN wait: run $run_id UNOBSERVABLE: gh could not be read for the whole bound (${RERUN_TIMEOUT}s — ${RERUN_TIMEOUT_SOURCE}); waited ${RERUN_WAIT_WAITED}s. This is NOT a stall — a stall is a claim about a run we watched, and this rail never saw the field. Remedy differs: check gh auth/network, then re-run. No merge."
         exit 1
       fi
       if [ "$wait_rc" -ne 0 ]; then

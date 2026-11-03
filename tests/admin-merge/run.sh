@@ -15439,7 +15439,12 @@ grep -q 'NAMED (0)' "$SCEN/err" \
 grep -q "run 9961 — check 'bash-suites (5)'" "$SCEN/err" \
   && pass "(j) …while the runs themselves are still named (the lines are real)" \
   || fail "(j) the runs were dropped along with the count: $(grep -n '9961' "$SCEN/err" 2>/dev/null | head -3)"
-grep -q 'INCOMPLETE' "$SCEN/err" \
+# ⛔ THE BARE TOKEN IS NOT THE CLAIM. `INCOMPLETE` alone also matches the rail's
+# unconditional `#3174` narration ("OR its shard recap was INCOMPLETE", admin-merge.sh
+# :1609) which is printed on this path regardless — so this arm was red on main with
+# nothing wrong (agent-infra#3282). Pin the CROSS-CHECK's own verdict phrase, exactly
+# as the neighbouring (k) arm already does (:1591 "… this list is INCOMPLETE …").
+grep -q 'this list is INCOMPLETE' "$SCEN/err" \
   && fail "(j) the completeness cross-check ran against an UNKNOWN count" \
   || pass "(j) …and no completeness verdict is claimed from an unknown count"
 
@@ -15679,6 +15684,183 @@ if [ -x "$(dirname "${BASH_SOURCE[0]}")/check-unresolved.sh" ] || [ -f "$(dirnam
     checks=$((checks + 1)); fail "(n) check-unresolved.sh FAILED — see its output above"
   fi
 fi
+
+# ── (o) THE RE-RUN PHASE BUDGET — an actuator bound, seen to REFUSE ─────
+# The measured defect (2026-11-02): the DERIVED per-shard bound reached 18064s (5h)
+# on a `bash-suites` shard, and two rails sat in the RE-RUN wait for 1h46m+ before
+# reaching a verdict a bounded wait reaches too. These arms pin the bound in BOTH
+# directions: the wall clock refuses, the attempt cap refuses, and neither one
+# clears a red (the refusal BLOCKS).
+# ⛔ Each arm FAILS when the budget code is reverted: with no budget the rail
+# reaches the DERIVED bound instead and prints STALLED/ceiling wording, never
+# `REFUSED(rerun-`. A guard nobody has seen refuse is not a guard.
+# The fixtures mirror `new_scen flaky` (the canonical re-run scenario) — a main
+# baseline is REQUIRED, or the rail refuses before it ever reaches the re-run and
+# the arm would measure the wrong refusal.
+
+# (o1) THE WALL CLOCK. One failing run whose re-run NEVER concludes: the status
+# projection repeats `in_progress`, so only the budget can end the wait.
+new_scen rerun-budget-clock
+RB_HEAD="$(printf 'b1%038d' 0)"
+printf '%s\n' "$RB_HEAD" > "$SCEN/head"
+lane_fail "$RB_HEAD" 921 > "$SCEN/runs-$RB_HEAD"
+log_failed 'tests/test_budget.py::test_never_concludes' > "$SCEN/log-921"
+lane_fail main5252 961 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-961"
+printf 'in_progress\n' > "$SCEN/status-921"
+# SUITE_NOSLEEP=1 — see the note above: this arm waits for an EXPIRY, so without the
+# stub a clamp regression makes it sleep the DERIVED bound (>=1200s) instead of failing.
+SUITE_NOSLEEP=1 run_admin 42 --main-runs 1 --rerun-budget 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(o1) a re-run that outlives the budget BLOCKS (exit $rc)" \
+                || { fail "(o1) the rail exited 0 after the budget expired — the budget clears a red"; sed 's/^/      /' "$TMP/err" | tail -12; }
+grep -qE 'REFUSED\(rerun-budget, attempts=1, elapsed=[0-9]+s\)' "$TMP/err" \
+  && pass "(o1) the refusal is NAMED with its numbers: REFUSED(rerun-budget, attempts=N, elapsed=Ms)" \
+  || { fail "(o1) the budget expiry is not named by REFUSED(rerun-budget, ...)"; sed 's/^/      /' "$TMP/err" | tail -12; }
+grep -q 'NOT a verdict on the run' "$TMP/err" \
+  && pass "(o1) the refusal says it makes NO claim about the run (a budget is not a stall)" \
+  || fail "(o1) the budget refusal reads as a stall claim — a policy ceiling must not assert the run wedged"
+grep -q 'pr merge' "$SCEN/calls" \
+  && fail "(o1) a merge ran after the re-run budget expired" \
+  || pass "(o1) no merge after the budget refusal"
+grep -q 'CLAMPED to the remaining' "$TMP/err" \
+  && pass "(o1) a clamped wait STATES that the BUDGET (not the derivation) bounded it" \
+  || fail "(o1) the wait was clamped to the budget without saying so — the reported bound would be a lie"
+
+# (o2) THE ATTEMPT CAP. Two failing runs, cap of one: the SECOND is never re-run.
+# `gh run rerun` is the spend, so the cap must bite BEFORE the second request.
+# Run 931 concludes (in_progress then completed, attempt 1 to 2 so the re-run is
+# OBSERVED), so the arm measures the CAP and not the clock.
+new_scen rerun-budget-attempts
+RA_HEAD="$(printf 'a2%038d' 0)"
+printf '%s\n' "$RA_HEAD" > "$SCEN/head"
+{ lane_fail "$RA_HEAD" 931; lane_fail "$RA_HEAD" 932; } > "$SCEN/runs-$RA_HEAD"
+{ log_failed 'tests/test_cap.py::test_one'; log_failed 'tests/test_cap.py::test_two'; } > "$SCEN/log-931"
+cp "$SCEN/log-931" "$SCEN/log-932"
+log_passed 'tests/test_cap.py::test_one' > "$SCEN/log-after-931"
+log_passed 'tests/test_cap.py::test_two' > "$SCEN/log-after-932"
+lane_fail main5353 971 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-971"
+printf 'in_progress\ncompleted\n' > "$SCEN/status-931"
+printf 'in_progress\ncompleted\n' > "$SCEN/status-932"
+run_admin 42 --main-runs 1 --rerun-attempts 1 --rerun-budget 600 >/dev/null 2>&1
+rc=$?
+# Snapshot NOW: the very next scenario overwrites $TMP/err, and (o6) reads this.
+cp "$TMP/err" "$SCEN/err-o2"
+[ "$rc" -ne 0 ] && pass "(o2) exceeding the attempt cap BLOCKS (exit $rc)" \
+                || fail "(o2) the rail exited 0 after re-running more runs than the cap allows"
+grep -qE 'REFUSED\(rerun-attempts, attempts=1, elapsed=[0-9]+s\)' "$TMP/err" \
+  && pass "(o2) the attempt cap is NAMED with its numbers" \
+  || { fail "(o2) the attempt cap is not named by REFUSED(rerun-attempts, ...)"; sed 's/^/      /' "$TMP/err" | tail -12; }
+if [ "$(grep -c '^run rerun' "$SCEN/calls")" -eq 1 ]; then
+  pass "(o2) exactly ONE re-run was requested — the cap stopped the second before it spent CI"
+else
+  fail "(o2) $(grep -c '^run rerun' "$SCEN/calls") re-run(s) were requested under a cap of 1"
+fi
+
+# (o3) A BAD KNOB IS REFUSED BY NAME, BEFORE ANY CI WORK — on the COMMAND LINE too.
+# The startup validation sees only the environment, so a CLI value needs the
+# post-parse call: without it `--rerun-budget 0` would refuse every re-run, and
+# `01800` would be OCTAL to arithmetic and DECIMAL to the comparison.
+new_scen rerun-budget-knobs
+RBK_HEAD="$(printf 'b3%038d' 0)"
+printf '%s\n' "$RBK_HEAD" > "$SCEN/head"
+lane_fail "$RBK_HEAD" 941 > "$SCEN/runs-$RBK_HEAD"
+log_failed 'tests/test_knob.py::test_x' > "$SCEN/log-941"
+run_admin 42 --rerun-budget 0 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "(o3) --rerun-budget 0 is refused at startup (exit 2)" \
+                || fail "(o3) --rerun-budget 0 was accepted (exit $rc) — it would refuse every legitimate re-run"
+grep -q "refusing ADMIN_MERGE_RERUN_BUDGET='0'" "$TMP/err" \
+  && pass "(o3) the zero budget refusal NAMES the knob" \
+  || fail "(o3) the zero budget refusal does not name ADMIN_MERGE_RERUN_BUDGET"
+ENV_RC=0
+env SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_RERUN_BUDGET="01800" \
+  bash "$ADM" 42 >/dev/null 2>"$SCEN/err2" || ENV_RC=$?
+[ "$ENV_RC" -eq 2 ] \
+  && pass "(o3) an env leading-zero budget exits 2, not 1" \
+  || fail "(o3) the leading-zero budget exited $ENV_RC, not 2"
+grep -q "a LEADING ZERO" "$SCEN/err2" \
+  && pass "(o3) a leading-zero budget is refused as OCTAL-ambiguous" \
+  || { fail "(o3) a leading-zero budget was accepted — bash would read 01800 as 1024"; head -4 "$SCEN/err2" | sed 's/^/      /'; }
+
+# (o4) THE BOUND IS DISCOVERABLE, not folklore.
+new_scen rerun-budget-bounds
+RB4_HEAD="$(printf 'b4%038d' 0)"
+lane_pass "$RB4_HEAD" 951 > "$SCEN/runs-$RB4_HEAD"
+run_admin --print-bounds 951 >/dev/null 2>&1 || true
+grep -q '^rerun-budget=1800' "$TMP/out" \
+  && pass "(o4) --print-bounds reports the re-run phase budget" \
+  || { fail "(o4) --print-bounds does not report the phase budget — the bound is undiscoverable"; head -6 "$TMP/out" | sed 's/^/      /'; }
+grep -q '^rerun-max-attempts=3' "$TMP/out" \
+  && pass "(o4) --print-bounds reports the attempt cap" \
+  || fail "(o4) --print-bounds does not report the attempt cap"
+
+
+# (o5) A CLAMPED WAIT THAT WAS NEVER OBSERVABLE IS STILL UNOBSERVABLE, not a budget
+# verdict. Return 3 means "gh could not be read for the whole bound" and its remedy
+# is "check gh auth/network"; relabelling it REFUSED(rerun-budget) hides the one
+# signal that says so — and the clamp makes the SHORT window normal on slow shards,
+# so this collision is the common case, not a corner (review P1).
+new_scen rerun-budget-unobservable
+RU_HEAD="$(printf 'b5%038d' 0)"
+printf '%s\n' "$RU_HEAD" > "$SCEN/head"
+lane_fail "$RU_HEAD" 951 > "$SCEN/runs-$RU_HEAD"
+log_failed 'tests/test_unobs.py::test_x' > "$SCEN/log-951"
+lane_fail main5656 981 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-981"
+: > "$SCEN/unreadable-951"
+# SUITE_NOSLEEP=1 for the same reason as (o1): this arm also waits for an expiry.
+SUITE_NOSLEEP=1 run_admin 42 --main-runs 1 --rerun-budget 3 >/dev/null 2>&1
+grep -q 'UNOBSERVABLE' "$TMP/err" \
+  && pass "(o5) a clamped wait that never read the run keeps its UNOBSERVABLE verdict" \
+  || { fail "(o5) the UNOBSERVABLE verdict was swallowed by the budget arm"; grep -n 'REFUSED\\|UNOBSERVABLE' "$TMP/err" | sed 's/^/      /' | head -6; }
+grep -q 'REFUSED(rerun-budget' "$TMP/err" \
+  && fail "(o5) an unreadable run was relabelled as a budget refusal — opposite remedies, one message" \
+  || pass "(o5) the budget arm does not claim an unreadable run as its own"
+
+# (o6) A PRE-SPEND REFUSAL MUST NOT ASSERT A WAIT OUTCOME. The clamp flag is
+# per-iteration; if it survives into iteration 2 the attempt-cap refusal prints
+# "The wait that expired was CLAMPED …" on an iteration where no wait ran at all
+# (review P2). This is exactly the (o2) fixture's shape.
+if [ ! -s "$TMP/scen-rerun-budget-attempts/err-o2" ]; then
+  # NON-VACUITY FLOOR: an absent fixture must FAIL this arm, not pass it. The first
+  # version of (o6) grepped a path nothing writes, so the `||` branch always passed.
+  fail "(o6) the (o2) stderr snapshot is missing — this arm would be vacuous"
+elif grep -q 'The wait that expired was CLAMPED' "$TMP/scen-rerun-budget-attempts/err-o2"; then
+  fail "(o6) the pre-spend attempt-cap refusal claims a wait expired that never ran"
+else
+  pass "(o6) a pre-spend refusal makes no claim about a wait outcome"
+fi
+
+# (o7) AN EXPLICIT BOUND IS NOT PERMANENTLY SHRUNK, AND ITS SOURCE DOES NOT ACCUMULATE.
+# With `--rerun-timeout` set, the derived branch never restores the bound, so without
+# the snapshot every iteration clamps the ORIGINAL further and appends another
+# "CLAMPED …" segment — iteration 3 then reports a bound it was never given (review P2).
+new_scen rerun-budget-explicit-bound
+RE_HEAD="$(printf 'b6%038d' 0)"
+printf '%s\n' "$RE_HEAD" > "$SCEN/head"
+{ lane_fail "$RE_HEAD" 961; lane_fail "$RE_HEAD" 962; } > "$SCEN/runs-$RE_HEAD"
+{ log_failed 'tests/test_ex.py::test_one'; log_failed 'tests/test_ex.py::test_two'; } > "$SCEN/log-961"
+cp "$SCEN/log-961" "$SCEN/log-962"
+lane_fail main5757 991 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-991"
+printf 'in_progress\ncompleted\n' > "$SCEN/status-961"
+printf 'in_progress\ncompleted\n' > "$SCEN/status-962"
+# ⛔ NO SUITE_NOSLEEP HERE, DELIBERATELY (unlike (o1)/(o5)). This arm discriminates the
+# buggy accumulation from the fixed restore, and at `elapsed=0` both compute the SAME
+# bound (600), so a stubbed clock would make it vacuous. It needs >= 1 real second
+# between the two iterations; that second is the measurement, not overhead.
+run_admin 42 --main-runs 1 --rerun-timeout 3600 --rerun-budget 600 >/dev/null 2>&1
+if grep -qE 'CLAMPED.*CLAMPED' "$TMP/err"; then
+  fail "(o7) the bound's source accumulates a CLAMPED segment per iteration (a stale bound is reported)"
+else
+  pass "(o7) the bound's source carries exactly ONE clamp segment — no accumulation"
+fi
+grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
+  && fail "(o7) the reported bound is the stale pre-clamp 3600s value" \
+  || pass "(o7) the reported bound is the clamped one, not the stale explicit value"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
