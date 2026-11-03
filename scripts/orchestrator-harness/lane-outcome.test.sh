@@ -209,6 +209,31 @@ hasnt "$(cat "$RUNOUT" 2>/dev/null)" "STALE-PREVIOUS-RUN" "2g …and the stale l
 # previous attempt's record) — the per-run file is what makes the two compatible.
 [ "$(grep -c '^outcome=' "$(LOG)" 2>/dev/null || true)" -ge 2 ]; ck "2h the append-only LOG keeps both runs (the run-scoped file is the answer to 'which one is now')" $?
 
+# ═══ 2i. A STILL-RUNNING OLDER RUN CANNOT CLAIM THE CURRENT VERDICT ════════════════════════════
+# Removing the per-run file at dispatch covers a stale FILE, not a stale WRITER: a previous run of the same
+# issue can still be ALIVE — the stuck-lane shape this issue is about — and would overwrite the file with ITS
+# verdict when its own trap finally fires (review round 5, P2). Each dispatch stamps an owner token and the
+# trap writes the file only while it still owns it; the older run's line still lands in the append-only log.
+mk_arm ownertok; WT="$ARMWT"
+pi() { sleep 5; return 0; }
+export -f pi
+drive_bg "$WT" "$KEYVAR=sk_fixture"
+_i=0
+while [ "$_i" -lt 200 ]; do
+  grep -q '\[agent\] provider=' "$(LOG)" 2>/dev/null && break
+  kill -0 "$LANE_PID" 2>/dev/null || break
+  _i=$((_i + 1)); sleep 0.1
+done
+drive "$WT" LANE_DRY_RUN=1
+OWN_OUT="$ARMDIR/o/logs/lane-3331.outcome"
+eqv "$(sed -n 's/.*reason=\([a-z-]*\).*/\1/p' "$OWN_OUT" 2>/dev/null)" "dry-run" "2i the SECOND dispatch owns the per-run verdict while the first is still alive"
+kill -TERM "$LANE_PID" 2>/dev/null
+wait "$LANE_PID" 2>/dev/null
+has "$(cat "$OWN_OUT" 2>/dev/null)" "reason=dry-run" "2j the older run's late trap does NOT overwrite the current run's verdict (owner token)"
+hasnt "$(cat "$OWN_OUT" 2>/dev/null)" "signal:TERM" "2k …the killed run's verdict never reaches the run-scoped read"
+has "$(cat "$(LOG)" 2>/dev/null)" "another dispatch of #3331 now owns it" "2l …and it SAYS so in the append-only transcript, instead of dropping its own line silently"
+has "$(cat "$(LOG)" 2>/dev/null)" "outcome=died reason=signal:TERM" "2m …while its own outcome= line is still in the log (the transcript keeps every run)"
+
 # ═══ 3. A LANE WHOSE AGENT FAILS ════════════════════════════════════════════════════════════════════
 mk_arm failed; WT="$ARMWT"
 pi() { printf 'No API key found for the selected model.\n'; return 3; }

@@ -442,9 +442,10 @@ killed 37 processes *and the tmux server*, losing every lane. The gate would hav
   #3331 investigation: `pgrep -fc "pi -p|pi --"` returned **3 for a dead lane**, because the pattern appears in the
   command the operator just typed (and in any monitor that greps for it). It reported "alive" until the read was
   re-measured with a CPU-time delta. Liveness comes from a POSITIVE read of the lane's own artifact — the
-  **run-scoped** verdict `cat $O/logs/lane-<N>.outcome` (written by the lane's exit trap, REMOVED by the next
-  dispatch of the same issue, so its absence means "no verdict for this run" — the log itself is append-only, so
-  `grep '^outcome=' <log> | tail -1` can hand you the PREVIOUS attempt's verdict while this one is working), a
+  **run-scoped** verdict `cat $O/logs/lane-<N>.outcome` (written by the lane's exit trap, removed AND re-owned by the
+  next dispatch of the same issue, so its absence means "no verdict for this run" and a still-alive older attempt
+  cannot claim it — the log itself is append-only, so `grep '^outcome=' <log> | tail -1` can hand you the PREVIOUS
+  attempt's verdict while this one is working), a
   transcript mtime/size delta, or a CPU-time delta (`lane-status.py`, `lane-bound.sh`'s
   `cpu_cs`) — never from a process-name match. See `docs/ops/fleet-liveness.md` (agent-infra) for the one verdict
   function, and prefer a bracket (`pi [-]-model`) or a script file run detached when a kill pattern is unavoidable.
