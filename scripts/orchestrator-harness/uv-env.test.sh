@@ -192,38 +192,45 @@ ck "CELL supervisor: exports the pin (the env every lane snapshots) and reports 
 # The assertions are on LIVE lines (comments quote the helper's name and would make a grep-only arm
 # vacuous) and on ORDER (applied BEFORE the launch, or the child never sees it).
 SPAWN_LIVE="$(awk '!/^[[:space:]]*#/' "$SPAWN")"
-ck "SPAWN SEAM: run_agent applies the pin on live lines, not just in a comment" \
-   '[ "$(printf "%s" "$SPAWN_LIVE" | grep -c "uv_env_apply")" -ge 1 ]'
-ck "SPAWN SEAM: …and exports both keys, so the child inherits them" \
-   'printf "%s" "$SPAWN_LIVE" | grep -q "export UV_CACHE_DIR UV_LINK_MODE"'
-ck "SPAWN SEAM: …and applies it BEFORE the pi launch line (afterwards is a no-op)" \
-   '[ "$(printf "%s\n" "$SPAWN_LIVE" | grep -n "uv_env_apply" | head -1 | cut -d: -f1)" -lt "$(printf "%s\n" "$SPAWN_LIVE" | grep -n "pi -p --provider" | head -1 | cut -d: -f1)" ]'
-# ⛔ SCOPED TO THE BLOCK, NOT THE FILE. The first cut asserted `grep -c "|| true" -ge 1` over the whole
-# script, which cannot fail on a file that keeps eight other live `|| true`s — a review measured it
-# staying GREEN with this entire block deleted. The assertions below extract the seam's own lines.
+# ⛔ ASSERT THE CALL, NOT THE NAME. The first cut grepped `uv_env_apply`, which ALSO appears in the
+# adjacent `command -v uv_env_apply` guard — so deleting the delivery call itself left the suite GREEN
+# (a review measured exactly that, on both files). The arms below match the invocation WITH its
+# argument, and the block they read is comment-stripped so a comment quoting a message cannot satisfy
+# them either.
 SPAWN_BLOCK="$(awk '/THE UV PIN, APPLIED AT THE SPAWN SEAM/{f=1} f{print} f&&/pi -p --provider/{exit}' "$SPAWN")"
+SPAWN_BLOCK_LIVE="$(printf '%s\n' "$SPAWN_BLOCK" | awk '!/^[[:space:]]*#/')"
+LANEEXEC_BLOCK="$(awk '/THE UV PIN, BEFORE/{f=1} f{print} f&&/exec pi -p/{exit}' "$LANEEXEC")"
+LANEEXEC_BLOCK_LIVE="$(printf '%s\n' "$LANEEXEC_BLOCK" | awk '!/^[[:space:]]*#/')"
 ck "SPAWN SEAM: the block exists and is bounded (seam marker to the launch line)" \
-   '[ -n "$SPAWN_BLOCK" ] && printf "%s" "$SPAWN_BLOCK" | grep -q "uv_env_apply"'
+   '[ -n "$SPAWN_BLOCK" ]'
+ck "SPAWN SEAM: run_agent CALLS the helper with its argument — the delivery, not the guard beside it" \
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "uv_env_apply \"\$_uvbase\""'
+ck "SPAWN SEAM: …and exports both keys, so the child inherits them" \
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "export UV_CACHE_DIR UV_LINK_MODE"'
+ck "SPAWN SEAM: …and applies it BEFORE the pi launch line (afterwards is a no-op)" \
+   '[ "$(printf "%s\n" "$SPAWN_BLOCK_LIVE" | grep -n "uv_env_apply \"\$_uvbase\"" | head -1 | cut -d: -f1)" -ge 1 ]'
 ck "SPAWN SEAM: …and an unusable helper is LOUD, not a silent drop (else it reads as an older harness)" \
-   'printf "%s" "$SPAWN_BLOCK" | grep -q "uv-env.sh not readable beside this helper"'
-ck "LANE-EXEC: the direct-exec lane path carries the same pin BEFORE its own exec (it bypasses run_agent)" \
-   'L="$(awk "!/^[[:space:]]*#/" "$LANEEXEC")"; printf "%s" "$L" | grep -q "uv_env_apply" && [ "$(printf "%s\\n" "$L" | grep -n "uv_env_apply" | head -1 | cut -d: -f1)" -lt "$(printf "%s\\n" "$L" | grep -n "^ *exec pi -p" | head -1 | cut -d: -f1)" ]'
-ck "RETENTION RULE 2: the seam reports whether the cache shares the worktree filesystem (cross-fs degrades to a copy)" \
-   'printf "%s" "$SPAWN_BLOCK" | grep -q "same_fs="'
-ck "LANE-EXEC: …and EVERY skip path is loud — PER ARM, so silencing any one of them reds" \
-   'LB="$(awk "/THE UV PIN, BEFORE/{f=1} f{print} f&&/exec pi -p/{exit}" "$LANEEXEC")";   printf "%s" "$LB" | grep -q "not readable beside this helper" &&   printf "%s" "$LB" | grep -q "neither CELL_HOME nor HOME" &&   printf "%s" "$LB" | grep -q "defines no uv_env_apply"'
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "uv-env.sh not readable beside this helper"'
 ck "SPAWN SEAM: …and its version-skew arm (readable helper, no uv_env_apply) is enforced too" \
-   'printf "%s" "$SPAWN_BLOCK" | grep -q "defines no uv_env_apply"'
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "defines no uv_env_apply"'
+ck "LANE-EXEC: the direct-exec lane path CALLS the helper before its own exec (it bypasses run_agent)" \
+   'printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "uv_env_apply \"\$_uvbase\""'
+ck "LANE-EXEC: …and every skip path is loud — PER ARM, so silencing any one of them reds" \
+   'printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "not readable beside this helper" && printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "neither CELL_HOME nor HOME" && printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "defines no uv_env_apply"'
+ck "RETENTION RULE 2: the seam reports the comparison AND the path it compared (not a bare verdict)" \
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "same_fs=\${_uvsame}" && printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "same_fs_target="'
 ck "RETENTION RULE 2: …and it does NOT apply a root-level cache when no base home exists" \
-   'printf "%s" "$SPAWN_BLOCK" | grep -q "neither CELL_HOME nor HOME is set"'
-# ⛔ A DEVICE COMPARISON WHOSE READS BOTH FAIL MUST NOT ANSWER `yes`. `stat -c %d` is GNU-only; on
-# BSD/macOS it exits 1 with EMPTY output, so two guarded substitutions compare EQUAL — measured on the
-# hub: `same_fs=yes` from zero successful reads. The block must carry the BSD fallback AND require a
-# non-empty read on both sides before it claims anything.
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "neither CELL_HOME nor HOME is set"'
 ck "RETENTION RULE 2: the device read has a BSD fallback (stat -c is GNU-only; macOS exits 1 with no output)" \
-   'printf "%s" "$SPAWN_BLOCK" | grep -q "stat -f %d"'
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "stat -f %d"'
 ck "RETENTION RULE 2: …and an empty/partial read answers '?' rather than an affirmative yes" \
-   'printf "%s" "$SPAWN_BLOCK" | grep -q "if \[ -n \"\$_uvdev_cache\" \] && \[ -n \"\$_uvdev_wt\" \]"'
+   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "if \[ -n \"\$_uvdev_cache\" \] && \[ -n \"\$_uvdev_wt\" \]"'
+# ⛔ NO LIVE BACKTICKS IN A STRING THIS BLOCK EMITS. A residual sentence once read "`uv-env.sh`'s
+# recorded choice" inside a double-quoted echo — a command substitution executed on EVERY spawn, whose
+# output was spliced into the log line (or which printed `command not found` on stderr). A grep cannot
+# see that, because nothing executes the string; this arm can.
+ck "SPAWN SEAM: the emitted [uv-env] line carries NO backticks (a live substitution would run a command per spawn)" \
+   '! printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "\`"'
 ck "the estate report states distinct-vs-per-name bytes (not a per-worktree du sum)" \
    'grep -q "du_total_counting_links" "$HERE/../worktree-disk-probe.sh" && grep -q "\[distinct\]" "$HERE/../worktree-disk-probe.sh"'
 
