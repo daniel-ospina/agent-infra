@@ -70,6 +70,40 @@ KEY_GATE_PROVIDER=""
 KEY_GATE_REASON=""
 KEY_GATE_MODELS_JSON=""
 
+_KEY_GATE_PY_VAR='
+import json, re, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+p = (d.get("providers") or {}).get(sys.argv[2]) or {}
+k = p.get("apiKey")
+if not isinstance(k, str):
+    raise SystemExit(0)
+m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", k.strip())
+if m:
+    print(m.group(1))
+'
+_KEY_GATE_PY_STORE='
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(d, dict):
+    raise SystemExit(1)
+e = d.get(sys.argv[2])
+def nonblank(v):
+    return isinstance(v, str) and v.strip() != ""
+if isinstance(e, str):
+    raise SystemExit(0 if nonblank(e) else 1)
+if isinstance(e, dict):
+    for k in ("key", "api_key", "apikey", "access_token", "refresh_token", "token"):
+        if nonblank(e.get(k)):
+            raise SystemExit(0)
+raise SystemExit(1)
+'
+
 # key_gate_bounded <secs> <cmd...> — run a probe under a TIME BOUND (review round 4, P1, measured).
 # ⛔ AN UNBOUNDED PROBE HERE IS WORSE THAN ELSEWHERE: the gate runs immediately before `run_agent`, which
 # is where `lane-bound.sh` gets installed — so a hang here has no wall bound and no silence bound, and bash
@@ -90,6 +124,12 @@ key_gate_bounded() { # <secs> <cmd...>
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
   local out pid w rc
   out="$(mktemp "${TMPDIR:-/tmp}/key-gate.XXXXXX" 2>/dev/null)" || return 3
+  # ⛔ THE PROGRAM MUST NOT COME FROM STDIN HERE (review round 5, P2, measured). In a non-interactive shell
+  # bash redirects an ASYNC list's stdin from /dev/null unless the command carries its own redirect, so a
+  # `python3 - <<'PY'` probe would be handed an EMPTY program: it exits 0 printing nothing, the gate reads
+  # that as "cannot resolve" and goes INERT — silently, on exactly the hosts this fallback exists for (no
+  # perl, no timeout). That is why both call sites pass their program with `-c "$VAR"` and never a heredoc;
+  # arm 5d drives this path with perl AND timeout hidden from PATH.
   "$@" >"$out" 2>/dev/null & pid=$!
   ( sleep "$s"; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 & w=$!
   wait "$pid" 2>/dev/null; rc=$?
@@ -104,26 +144,14 @@ key_gate_var() {
   local home="${1:-}" prov="${2:-}"
   [ -n "$home" ] || return 0
   local mj="$home/.pi/agent/models.json"
-  [ -r "$mj" ] || return 0
+  # ⛔ NO `[ -r "$mj" ]` HERE (review round 5, P2, measured): that test is access(2)/stat(2) on the SAME
+  # path, so on a hung automount it blocks BEFORE the bound is armed — the round-4 P1 surviving in the other
+  # half of the same function. The read that can block is the `open`, and that one is inside the bound; an
+  # absent or unreadable file simply makes it print nothing, which is the "cannot say" answer.
   [ -n "$prov" ] || prov="${PI_LANE_PROVIDER:-deepseek}"
   command -v python3 >/dev/null 2>&1 || return 0
   # A literal apiKey, a provider absent from the file, and an unparseable file all print NOTHING.
-  # ⛔ BOUNDED (review round 4, P1): an unbounded read here freezes a lane that has no wall bound yet and
-  # cannot even take the TERM that would write its terminal line.
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 - "$mj" "$prov" <<'PY' 2>/dev/null
-import json, re, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    raise SystemExit(0)
-p = (d.get("providers") or {}).get(sys.argv[2]) or {}
-k = p.get("apiKey")
-if not isinstance(k, str):
-    raise SystemExit(0)
-m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", k.strip())
-if m:
-    print(m.group(1))
-PY
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY_VAR" "$mj" "$prov" 2>/dev/null
 }
 
 # key_gate_value_present <VARNAME> — 0 iff THIS environment holds a non-blank value.
@@ -164,29 +192,10 @@ key_gate_stored_credential() {
   local home="${1:-}" prov="${2:-}"
   [ -n "$home" ] && [ -n "$prov" ] || return 1
   local aj="$home/.pi/agent/auth.json"
-  [ -r "$aj" ] || return 1
+  # No `[ -r ]` pre-test, for the same reason as key_gate_var's (review round 5, P2): stat can block before
+  # the bound arms. An absent store makes the bounded open print nothing and answer "cannot say".
   command -v python3 >/dev/null 2>&1 || return 1
-  # ⛔ BOUNDED (review round 4, P1) for the same reason as key_gate_var's read: a hung/mounted-dry store
-  # must not become a lane that cannot be killed and never writes a terminal line.
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 - "$aj" "$prov" <<'PY' 2>/dev/null
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    raise SystemExit(1)
-if not isinstance(d, dict):
-    raise SystemExit(1)
-e = d.get(sys.argv[2])
-def nonblank(v):
-    return isinstance(v, str) and v.strip() != ""
-if isinstance(e, str):
-    raise SystemExit(0 if nonblank(e) else 1)
-if isinstance(e, dict):
-    for k in ("key", "api_key", "apikey", "access_token", "refresh_token", "token"):
-        if nonblank(e.get(k)):
-            raise SystemExit(0)
-raise SystemExit(1)
-PY
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY_STORE" "$aj" "$prov" 2>/dev/null
 }
 
 # key_gate_candidates <home> — the files a box is known to carry credentials in, one per line, deduped
