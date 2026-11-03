@@ -2653,9 +2653,26 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
   const firstIsShellLike = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|env|nice|nohup|command|sudo|doas|setsid|stdbuf|time|timeout|exec|ionice|busybox|xargs|find|eval)$/.test(
     unqFirst.replace(/^.*\//, ""),
   );
-  if (sp && _wtPathNeedsExpansion(sp)) {
+  if (sp && _wtPathNeedsExpansion(sp) && (pathShaped(sp) || /^["']?\$/.test(sp))) {
     // Interpreter operand (`bash ./undo*.sh`, `sudo bash …`), or a bare path
     // that IS the first word (direct execution, `./undo*.sh`).
+    //
+    // ⛔ `pathShaped(sp)` HERE IS #3243 REVIEW CYCLE-1 F3. This branch had NO shape
+    // test, so when a segment's FIRST word was program TEXT it was claimed as an
+    // executed script — the very misattribution this arm exists to stop, one branch
+    // over from where it was fixed: `/^tree=/{t=$2}` (an awk program, refused in
+    // `scripts/orchestrator-harness/nonblocking-dispatch.sh`) and `~520` (a prose
+    // byte count) are both returned by `extractScriptPath` when they lead a segment,
+    // and `pathShaped` was never consulted. Not a regression (identical before this
+    // change) — an incomplete narrowing.
+    //
+    // The `$`-rooted carve-out is deliberate and load-bearing: a BARE `$VAR`
+    // operand has no path shape at all (`bash "$REAPER"`) and must STAY refused —
+    // that is the #1228 fail-closed residual pinned by B14g — while program text
+    // that happens to start a segment must not be. Every real expanded spelling is
+    // either path-shaped (`./undo*.sh`, `~/undo.sh`, `$(pwd)/x.sh` → placeholder +
+    // path) or `$`-rooted (`$NB`, `"$REAPER"`, `${DIR}/x.sh`), so nothing unreadable
+    // is lost by the test.
     if (firstIsShellLike || unqFirst === spUnq) return sp;
   }
   // EXTGROUP (`shopt -s extglob`, or `bash -O extglob -c …`) truncates the
@@ -2754,7 +2771,11 @@ function _wtExpandedPipedProducer(text: string): string | null {
  *  its LOCATION, and the remedy are now true.
  * @param scriptPath the file whose body was read
  * @param hit the observed nested shape
- * @param text the (prepared) text the hit was found in, for the line number
+ * @param text the RAW text the hit was found in, for the line number. It is NOT
+ *   prepared: the body-preparation hunk was measured and is not landed (see
+ *   `_expRefusalForBody`), so a comment line is still in this text and a hit can
+ *   still be reported at a comment's line — that is the recorded residual, and it
+ *   is why the message names the token instead of promising the path is the cause.
  */
 function _wtBodyExpandedReason(scriptPath: string, hit: _WtExpandedHit, text: string): string {
   const shown = String(scriptPath ?? "(script)");
@@ -3365,8 +3386,10 @@ function _worktreeDiscardBlock(command: string): string | null {
       // #1228: a script we DID read runs an EXPANDED path — same unreadable-script hole
       // one level down, as a direct operand or as a piped producer; fail closed before the
       // walk silently skips it. #3243: through `_expRefusalForBody`, so the digest-keyed
-      // sanctioned stand-down, the comment/heredoc-data preparation and the honest
-      // attribution are the SAME as every other body reader (this site duplicated the stand-down).
+      // sanctioned stand-down and the honest attribution are the SAME as every other body
+      // reader (this site duplicated the stand-down). The BODY ITSELF is scanned exactly as
+      // it was before this change — the body-preparation hunk was measured and is NOT
+      // landed (see `_expRefusalForBody`), so nothing about this call prepares it.
       const expNested = _expRefusalForBody(real, content);
       if (expNested) return expNested;
       p = extractScriptPath(content) ?? seeds.shift() ?? null;

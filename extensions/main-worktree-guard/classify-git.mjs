@@ -3345,6 +3345,19 @@ export function wtSplitPipeline(command) {
     }
     cur += ch;
   }
+  // ⛔ AN UNTERMINATED QUOTE MEANS THE MODEL CANNOT BE TRUSTED PAST IT (#3243
+  // review cycle-1, F1). A quote left open at the end of the text is not a valid
+  // shell word sequence — it is a COMMENT apostrophe (`# don't touch the copy`), a
+  // HERE-DOCUMENT body, or ANSI-C `$'…'` quoting (whose `\'` IS an escape while a
+  // plain `'…'` has none, so the model closes or opens the wrong one). Past that
+  // point every later `|` is read as DATA, and a real `cat ./undo*.sh | bash`
+  // became ALLOWED where the pre-#3243 blind `split("|")` refused it — a
+  // fail-OPEN regression, measured on four shapes (top-level ANSI-C, a comment
+  // apostrophe, a here-doc data apostrophe, an ANSI-C `printf`). The fallback is
+  // therefore the BLIND split: it has no quote state and can only OVER-report,
+  // which is this arm's fail-closed direction. A well-formed command never reaches
+  // it, so the narrowing that removes the D5 false positive still holds.
+  if (quote !== null) return s.split("|");
   out.push(cur);
   return out;
 }
@@ -3382,6 +3395,16 @@ export function wtIsPathShapedScriptWord(word) {
   let out = "";
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
+    // ⛔ QUOTING IS SHELL SYNTAX, NOT A PATH CHARACTER — and it may be MID-WORD
+    // (#3243 review cycle-1, F2). Rejecting every quote made `"$TOOLS"/undo.sh`
+    // and `./run"$S".sh` fail this grammar, so the arm stopped seeing a REAL
+    // runtime-resolved script path that the pre-#3243 `directish` (which had no
+    // shape test at all) refused: measured BLOCK on the base, ALLOW on the first
+    // cut of this change, and both spellings really execute the file. Quoting a
+    // path is ordinary shell (`"$DIR"/x.sh`), so the quotes are skipped and the
+    // rest of the word is judged on its own. Skipping can only ADD candidates,
+    // never remove one, so it cannot open anything the old test caught.
+    if (ch === '"' || ch === "'") continue;
     if (ch === "\\") return false; // an escape is not a path spelling
     if (ch === "`") {
       const end = s.indexOf("`", i + 1);
@@ -3396,6 +3419,12 @@ export function wtIsPathShapedScriptWord(word) {
       out += PH; i = j - 1; continue;
     }
     if (ch === "*") { out += PH; continue; }
+    // ⛔ `?` IS A GLOB, and it is named in this function's own contract above — it
+    // was simply not implemented, so `./undo-1228?.sh` failed the grammar and the
+    // arm went BLIND on a real single-character glob (caught by B13 the moment the
+    // `sp` branch started consulting this predicate). A shape test that drops a
+    // glob is a fail-OPEN, which is why it is pinned by an arm in both directions.
+    if (ch === "?") { out += PH; continue; }
     if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
     if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
     if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
