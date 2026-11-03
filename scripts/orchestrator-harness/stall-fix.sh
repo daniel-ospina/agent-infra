@@ -42,8 +42,16 @@ AGEMIN="${2:-?}"                    # minutes since the last land (or the thresh
 # invented"), and it was already fixed for the log line and `state/drain-stall`; these two sinks were
 # the ones left behind. `measured` is the default so a caller that passes no flag keeps the old,
 # honest-for-it shape.
+# ⛔ `unmeasured` IS A THIRD PROVENANCE, NOT A SYNONYM FOR `measured` (fresh-context review of #3181,
+# 2026-11-02, P1). `orch-loop.sh` emits it when `state/` could not be SEARCHED (`_lmread=0`), so there
+# is no window whose bound the empty answer proves: the number travelling beside it is the window that
+# was ATTEMPTED, and the loop's own line says "the age is NOT a reading". The `case` here accepted only
+# `synth|measured` and rewrote everything else to `measured`, so that one pass still put "no PR merged
+# in 360 minutes" in the worker's premise and `agesrc=measured` in the ledger an incident is read from
+# — the exact re-introduction, for the new third value, of the defect the paragraph above says this
+# flag exists to remove. Every value the caller can emit is accepted here.
 AGESRC="${_AGESRC:-measured}"
-case "$AGESRC" in synth|measured) : ;; *) AGESRC=measured ;; esac
+case "$AGESRC" in synth|unmeasured|measured) : ;; *) AGESRC=measured ;; esac
 
 # ⛔ NOT `say` (agent-infra#2910). On macOS `say` is /usr/bin/say — text-to-speech — so a shipped
 # script that defines a helper by that name SPEAKS through the owner's speakers whenever a fragment
@@ -64,8 +72,16 @@ is_num "$EVERY" && [ "$EVERY" -ge 1 ] || EVERY=3
 is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
 # ⛔ THE BRIEF IS RENDERED WITH `>=` WHEN THE AGE IS A BOUND (review P3, above): the worker quotes the
 # premise back in its report, so a bare number here is the same invented measurement in the worker's
-# own words.
-if [ "$AGESRC" = "synth" ]; then AGEMIN_TXT=">=${AGEMIN}"; else AGEMIN_TXT="$AGEMIN"; fi
+# own words. And an UNSEARCHABLE `state/` has NO number to render — see the provenance note above: the
+# value beside it is the window that could not be searched, so the brief must say the age is
+# unmeasured rather than print that window as a stall age (the same shape `drain_stall_token` uses,
+# which renders `?` for this provenance, and the same rule the `PRDISP_SPAWNS` arm above applies to an
+# unmeasured count).
+case "$AGESRC" in
+  synth)      AGEMIN_TXT=">=${AGEMIN}" ;;
+  unmeasured) AGEMIN_TXT="an UNMEASURED number of" ;;
+  *)          AGEMIN_TXT="$AGEMIN" ;;
+esac
 # ⛔ FOUR SINKS, AND EVERY ONE OF THEM IS BOUNDED (review P3 → P2 → P1, 2026-11-02). Nothing else in
 # the tree prunes them: `state/briefs/` had no production writer before this script, and no reaper names
 # any of them. The census, because this header has twice claimed a bound it did not have — a header that
@@ -546,7 +562,11 @@ _record() {
   fi
   # ⛔ THE ROW CARRIES THE AGE'S PROVENANCE (review P3, 2026-11-02): `agesrc=synth` marks a WINDOW
   # BOUND, so the incident ledger cannot be read as a measurement. Additive — no reader is broken by a
-  # field it does not know (the same contract `state/drain-stall` uses for its own `agesrc`).
+  # field it does not know (the same contract `state/drain-stall` uses for its own `agesrc`). The
+  # vocabulary is the loop's own three values — measured | synth | unmeasured — and `unmeasured` is
+  # passed through VERBATIM (review of #3181, 2026-11-02, P1): it is the one value that says this box
+  # took no reading, so normalising it into `measured` would be a false claim on the artifact an
+  # incident is read from.
   if ! printf '%s\t%s\tpass=%s\tunowned=%s\tage_min=%s\tagesrc=%s\n' \
        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" "$SEEN" "$UNOWNED" "$AGEMIN" "$AGESRC" >> "$_f" 2>/dev/null; then
     log_line "DRAIN STALL -> WARNING: the durable escalation row COULD NOT BE WRITTEN ($_f is unwritable or full) — this verdict exists only in this log, not in the series an operator reads after an incident"

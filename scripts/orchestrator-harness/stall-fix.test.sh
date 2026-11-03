@@ -456,5 +456,38 @@ kill "$_live3" 2>/dev/null || true
 
 
 echo
+echo "── §F the age's PROVENANCE reaches both sinks this script owns ────────────────────────────"
+# ⛔ THE THIRD PROVENANCE (fresh-context review of #3181, 2026-11-02, P1). `orch-loop.sh` passes
+# `_AGESRC` beside the age because the age is not always a measurement: `synth` is the WINDOW BOUND an
+# empty `mp_recent_land` answer proves, and `unmeasured` is the window that could NOT BE SEARCHED
+# (a missing/unreadable `state/`). Both sinks this script owns — the brief's premise line, and the
+# `age_min=/agesrc=` ledger row an operator reads after an incident — must say which one they got,
+# because a worker quotes the premise back in its report and the ledger is the durable record.
+# The pre-fix `case` accepted only `synth|measured` and silently rewrote `unmeasured` to `measured`,
+# which asserted a reading this box never took on BOTH surfaces. Delete that alternative and b1
+# reddens; drop the `unmeasured` render and b2 reddens on its own premise line.
+brief_of() { cat "$1"/state/briefs/stall-fix-*.md 2>/dev/null || true; }
+
+D="$(new_o f1)"; stub "$D" "$STUB_OK_TOUCH"
+run_sh "$D" 3 3
+case "$(brief_of "$D")" in *"no PR merged in 90 minutes"*) ck 0 "measured: the brief states the age as a measurement (unchanged)" ;; *) ck 1 "measured: the brief states the age as a measurement (unchanged): $(brief_of "$D" | head -20 | tail -6)" ;; esac
+case "$(ledger_of "$D")" in *"age_min=90	agesrc=measured"*) ck 0 "…and the durable row says agesrc=measured" ;; *) ck 1 "…and the durable row says agesrc=measured: $(ledger_of "$D")" ;; esac
+
+D="$(new_o f2)"; stub "$D" "$STUB_OK_TOUCH"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       _AGESRC=synth bash "$SH" 3 90 2>&1)"
+case "$(brief_of "$D")" in *"no PR merged in >=90 minutes"*) ck 0 "synth: the brief renders the age as a BOUND, not a measurement" ;; *) ck 1 "synth: the brief renders the age as a BOUND, not a measurement: $(brief_of "$D" | head -20 | tail -6)" ;; esac
+case "$(ledger_of "$D")" in *"age_min=90	agesrc=synth"*) ck 0 "…and the durable row says agesrc=synth" ;; *) ck 1 "…and the durable row says agesrc=synth: $(ledger_of "$D")" ;; esac
+
+D="$(new_o f3)"; stub "$D" "$STUB_OK_TOUCH"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       _AGESRC=unmeasured bash "$SH" 3 90 2>&1)"
+case "$(brief_of "$D")" in *"no PR merged in an UNMEASURED number of minutes"*) ck 0 "unmeasured: the brief says the age was NOT taken" ;; *) ck 1 "unmeasured: the brief says the age was NOT taken: $(brief_of "$D" | head -20 | tail -6)" ;; esac
+case "$(brief_of "$D")" in *"no PR merged in 90 minutes"*) ck 1 "…and it never presents the window that could not be searched as the stall age" ;; *) ck 0 "…and it never presents the window that could not be searched as the stall age" ;; esac
+case "$(ledger_of "$D")" in *"age_min=90	agesrc=unmeasured"*) ck 0 "…and the durable row keeps agesrc=unmeasured verbatim (the P1 fix)" ;; *) ck 1 "…and the durable row keeps agesrc=unmeasured verbatim (the P1 fix): $(ledger_of "$D")" ;; esac
+case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; *) ck 0 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; esac
+
+
+ echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
