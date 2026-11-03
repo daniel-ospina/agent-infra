@@ -502,7 +502,7 @@ LAUNCHD_ENTRY_PRODUCERS="heartbeat-loop.sh"
 # entry list exists to pin), and (b) `pi-bootstrap/cell-install.sh`'s own `lane_srcs`/`FARM_LAYOUT`,
 # which is a DIFFERENT installer with its own destination layout. A producer exec'd only from one of
 # those is not in this population; extending here means teaching `farm_source_dir` that destination.
-FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs"
+FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs graph_srcs"
 farm_source_dir() { # <array-name> -> the repo dir its entries are read from
   case "$1" in
     lib_srcs)    printf 'scripts/lib' ;;
@@ -567,16 +567,20 @@ other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
 # #1552/#1899 shape). It is DELIVERED — `fleet_srcs` is what puts it at $DEST/scripts/disk-reaper-run.sh
 # — so this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry.
 #
-# `script:tortoise_graph_client.py` joined on 2026-11-03 (agent-infra#3253): `tortoise-graph.sh` — the
-# ONE way a lane reads/writes the hosted graph — execs it as the SIBLING
-# `$(dirname "$0")/tortoise_graph_client.py`, and BOTH are now declared in `fleet_srcs`, so a fresh
-# $DEST/scripts gets a client whose second half exists. It is DELIVERED — that array is what puts it at
-# $DEST/scripts/tortoise_graph_client.py — so this is a re-pin of the derived population, NOT a
-# `LANE_PRODUCERS_EXEMPT` entry. Verified against the CODE (#1899): the exec site is
-# `scripts/tortoise-graph.sh`'s `exec python3 "$(dirname "$0")/tortoise_graph_client.py"`.
-# Measured 2026-11-03 on the cmux box, which carried a HAND-COPIED (never farmed) client at
-# /tmp/cell-home/.pi/agent/scripts: `check-farm-drift.sh` reported both files STALE and NOT
-# farm-declared, exit 3 (a deploy cannot fix it) — the state this declaration removes.
+# `script:tortoise_graph_client.py` joined on 2026-11-03 (agent-infra#3253, PR #3374):
+# `tortoise-graph.sh` — the ONE way a lane reads/writes the hosted graph — execs it as the SIBLING
+# `$(dirname "$0")/tortoise_graph_client.py`, so a farm that carried the wrapper alone would ship a
+# script whose interpreter is missing. Both are DELIVERED by `pi-bootstrap/setup.sh`'s `graph_srcs`,
+# flat into $DEST/scripts — the array that puts them at $DEST/scripts/tortoise_graph_client.py — so
+# this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry. Verified against
+# the CODE (#1899): the exec site is `scripts/tortoise-graph.sh`'s
+# `exec python3 "$(dirname "$0")/tortoise_graph_client.py"`. Measured 2026-11-03 on the cmux box,
+# which carried a HAND-COPIED (never farmed) client at /tmp/cell-home/.pi/agent/scripts:
+# `check-farm-drift.sh` reported both files STALE and NOT farm-declared, exit 3 (a deploy cannot fix
+# it) — the state this declaration removes. ⛔ ONE declaration, not two: #3253 landed the pair in
+# `fleet_srcs` and #3374 landed the dedicated `graph_srcs` (a farm loop that reports a MISSING entry
+# loudly, the same class `merge_gate_srcs` uses); declaring them in both would copy each file twice
+# and make `farm_declared_rel` list it twice, so the pair lives in `graph_srcs` ONLY.
 #
 # `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
 # the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
@@ -903,7 +907,8 @@ check_producer_farm_declared() { # <label> <derived-population>
         # Every FLAT array counts: `lane_root_srcs` is absent on this tree until #1553 (the membership
         # branch simply goes false), and `merge_gate_srcs` also lands in `$DEST/scripts/`.
         if farm_declares fleet_srcs "$name" "$root" || farm_declares lane_root_srcs "$name" "$root" \
-           || farm_declares merge_gate_srcs "$name" "$root"; then
+           || farm_declares merge_gate_srcs "$name" "$root" \
+           || farm_declares graph_srcs "$name" "$root"; then
           delivered=$((delivered+1)); continue
         fi
         # The fleet directory IS a real deployed location (`setup.sh` mkdirs `$DEST/scripts/fleet/`), so

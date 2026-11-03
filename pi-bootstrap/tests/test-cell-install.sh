@@ -144,11 +144,21 @@ chmod +x "$FAKEBIN/npm"
 # a `$(grep -m1 'FAIL:' "$LOG")` diagnostic reported the FIRST failure of the whole run instead of
 # that arm's (measured: it printed an unrelated `denied extension` line from run 2). Truncating at
 # the start of every run makes every assertion below read ONLY its own run's output.
+# Every install this suite drives goes through here, and each one is COUNTED. The npm spy below
+# asserts "one npm run per dependency-declaring extension PER INSTALL": without the counter the
+# contract silently assumed exactly one install, so a second (correct) install read as a
+# disagreement. The counter also makes the alternative failure loud — an install that never
+# reaches the dependency step at all.
+INSTALLS="$TMP/installs.count"
+: > "$INSTALLS"
 run_install() {
+  local rc=0
   : > "$LOG"
   echo "---- cell-install --install ----" >> "$LOG"
   CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="${1:-$FAKEBIN:$PATH}" \
-    bash "$INSTALLER" --install >> "$LOG" 2>&1
+    bash "$INSTALLER" --install >> "$LOG" 2>&1 || rc=$?
+  printf '.' >> "$INSTALLS"
+  return $rc
 }
 run_verify() {
   : > "$LOG"
@@ -360,6 +370,173 @@ fi
 # the hosted-graph FALLBACK half must land executable — the documented invocation TYPES the path
 [ -x "$DEST/scripts/tortoise-graph.sh" ] && ok "the hosted-graph fallback landed executable (scripts/tortoise-graph.sh)" \
   || fail "scripts/tortoise-graph.sh missing or not executable — the documented fallback invocation would fail"
+# A cell must NOT be handed the base config's other servers: `seo-intelligence` spawns
+# ${AGENT_INFRA_PATH}/mcp-servers/.../node_modules/.bin/tsx and a cell ships extensions/ only
+# (manifest.json carries no mcp-servers/), so the entry cannot spawn — a catalog that advertises
+# an unspawnable tool is worse than a short catalog.
+if python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+s = (json.load(open(sys.argv[1])).get("mcpServers") or {})
+want = {"tortoise"}
+extra = sorted(set(s) - want)
+if extra:
+    print("unexpected server(s) installed on a cell: %s" % extra)
+sys.exit(0 if not extra else 1)
+PY
+then ok "a cell gets the graph server only (no unspawnable base servers)"
+else fail "the installer put base servers a cell cannot spawn into .mcp.json (seo-intelligence needs mcp-servers/ deps, brave/gemini need keys)"
+fi
+# ...while a server the CELL already declared is state, not drift, and must survive a re-install.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.setdefault("mcpServers", {})["cell-local"] = {"command": "/bin/true"}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a cell-local MCP server survives a re-install (state, not drift)" \
+  || fail "re-install dropped a cell-local MCP server"
+import json, sys
+sys.exit(0 if "cell-local" in ((json.load(open(sys.argv[1])).get("mcpServers")) or {}) else 1)
+PY
+# ...and a SELF-HOSTED tortoise url is preserved (the template's own comment tells self-host users
+# to set it; a source-wins merge would silently repoint them at the hosted endpoint, where they
+# have no key, and the failure would read as an auth error rather than the repoint it is).
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = dict(d["mcpServers"]["tortoise"], url="http://localhost:8000/mcp")
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a self-hosted tortoise url is preserved, not silently repointed at the hosted endpoint" \
+  || fail "re-install silently repointed a self-hosted tortoise entry"
+import json, sys
+u = (json.load(open(sys.argv[1])).get("mcpServers", {}).get("tortoise", {}) or {}).get("url")
+sys.exit(0 if u == "http://localhost:8000/mcp" else 1)
+PY
+# The preserved entry must be MARKED, and --verify must accept it BY NAME rather than silently:
+# accepting any non-empty url is what certified a typo'd endpoint LAYER VERIFIED.
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a preserved self-hosted tortoise entry is marked _selfHosted" \
+  || fail "a preserved non-default tortoise url was not marked, so it is indistinguishable from a stale copy"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("_selfHosted") is True else 1)
+PY
+run_verify
+[ $? -eq 0 ] && grep -q "SELFHOSTED:http://localhost:8000/mcp" "$LOG" \
+  && ok "--verify ACCEPTS a marked self-hosted url and says so by name" \
+  || fail "--verify refused a marked self-hosted url, or accepted it without naming it (a false green)"
+# ...but a DIFFERING url that is NOT marked is refused: that is the typo/copied-config case.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+t.pop("_selfHosted", None)
+t["url"] = "https://api.premiselabs.co/mcp"     # no trailing slash — plausible, and wrong
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+[ $? -eq 1 ] && grep -q "not the hosted shape the layer installs" "$LOG" \
+  && ok "--verify REFUSES an unmarked non-default url (a typo'd endpoint is not 'self-hosted')" \
+  || fail "--verify certified an unmarked non-default tortoise url — a false green of exactly the class this closes"
+# A NON-http transport is refused too (the verifier must not be weaker than the test that pins it).
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"], type="sse", url="https://api.premiselabs.co/mcp/")
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+[ $? -eq 1 ] && grep -q "not the hosted shape the layer installs" "$LOG" \
+  && ok "--verify REFUSES a non-http tortoise transport (sse/stdio is not the hosted shape)" \
+  || fail "--verify certified a non-http tortoise transport"
+
+# ⛔ THE DOCUMENTED SELF-HOST SHAPE CARRIES NO KEY — and must survive a sync UNCHANGED.
+# `tortoise`'s docs/quickstart-selfhosted.md spells it exactly like this ("no key here: a local
+# daemon needs none"), and SETUP-NEW-MACHINE.md tells self-host users to do the same. A
+# well-formedness rule that demanded an Authorization unconditionally declared THIS shape
+# "unusable", replaced it with the hosted default, and then had --verify print OK over an endpoint
+# the operator never chose — the silent repoint, reproduced by the rule meant to prevent it.
+cp "$DEST/.mcp.json" "$DEST/.mcp.json.keep"
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"url": "http://localhost:8000/mcp"}   # no type, no headers
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "the DOCUMENTED keyless self-host entry is preserved, not repointed at the hosted endpoint" \
+  || fail "install replaced the documented keyless self-host entry — a self-host user's url is silently moved to the hosted endpoint they have no key for"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "http://localhost:8000/mcp" and t.get("_selfHosted") is True else 1)
+PY
+run_verify
+[ $? -eq 0 ] && grep -q "SELFHOSTED:http://localhost:8000/mcp" "$LOG" \
+  && ok "--verify ACCEPTS the keyless self-host entry (a local daemon needs no key) and names it" \
+  || fail "--verify refused a marked keyless self-host entry — install preserves it and verify refuses it, so the cell cannot be repaired"
+cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
+
+# An UNUSABLE preserved entry must be REPLACED by the installer, or the cell is unrecoverable:
+# install preserves it, verify refuses it, and the operator's only remedy re-creates it. The
+# unusable case is the HOSTED url with no credential — a guaranteed 401 — not a self-host url.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"type": "http", "url": "https://api.premiselabs.co/mcp/"}   # no auth
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a HOSTED url with no credential is replaced (an empty Bearer is a guaranteed 401)" \
+  || fail "install preserved a hosted-url entry with no Authorization — --verify refuses it, so install and verify disagree and the cell cannot be repaired"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+auth = (t.get("headers") or {}).get("Authorization") or ""
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and auth.startswith("Bearer ${") else 1)
+PY
+# ...and a LITERAL key in the file is replaced too (never preserved, never certified).
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+# built at runtime: spelling a token here would trip the transcript redactor and test nothing more
+t["headers"] = {"Authorization": "Bearer " + "t" + "t" + "_" + "A" * 24}
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a LITERAL key in the entry is replaced by the env-indirect header" \
+  || fail "install preserved a literal credential in .mcp.json — the shared config is the leak"
+import json, sys
+raw = open(sys.argv[1]).read()
+sys.exit(1 if ("t" + "t" + "_") in raw else 0)
+PY
+# the LEGACY stdio entry is replaced without ceremony (it can never work here)
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"command": "/x/.venv/bin/python3", "args": ["-m", "tortoise.mcp_server"]}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "the legacy stdio entry is replaced by the hosted one on install" \
+  || fail "install left the legacy stdio tortoise entry in place"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("type") == "http" and not t.get("command") else 1)
+PY
+rm -f "$DEST/.mcp.json.keep"
 [ -f "$DEST/agents/verifier.md" ] && ok "sub-agent definitions installed (agents/verifier.md)" \
   || fail "agents/ not installed — a cell lane cannot dispatch a reviewer sub-agent"
 if [ -d "$DEST/tools" ] && [ -n "$(ls -A "$DEST/tools" 2>/dev/null)" ]; then
@@ -384,10 +561,12 @@ else
     && ok "every npm invocation carries --ignore-scripts (no dependency script executes at install time)" \
     || fail "$noscripts npm invocation(s) ran WITHOUT --ignore-scripts"
   deps="$(expected_dep_count)"
+  installs="$(tr -cd '.' < "$INSTALLS" | wc -c | tr -d ' ')"
   n="$(awk 'NR % 2 == 1' "$SPY" | wc -l | tr -d ' ')"
-  [ "$n" = "$deps" ] \
-    && ok "npm ran for exactly the $deps extension(s) that declare dependencies (install and verify agree)" \
-    || fail "npm ran $n time(s) but $deps extension(s) declare dependencies — the two halves of the contract disagree"
+  [ "$installs" -ge 1 ] || fail "no install was counted — the spy assertions below would be vacuous"
+  [ "$n" = "$((deps * installs))" ] \
+    && ok "npm ran once per dependency-declaring extension, for each of the $installs install(s) — $((deps * installs)) run(s) for $deps extension(s)" \
+    || fail "npm ran $n time(s) across $installs install(s); $deps extension(s) declare dependencies, so $((deps * installs)) were expected — the two halves of the contract disagree"
   # The allowlist is what keeps a mirrored or proxied cell able to install at all; without a
   # pin, deleting it leaves this suite green.
   : > "$SPY"
@@ -1019,7 +1198,11 @@ rm -f "$DEST/extensions/review-enforcer/cell-local-helper.ts"
 # lane: the LEGACY stdio entry (needs a checkout+venv+FalkorDB a cell does not have), a LITERAL
 # credential written into the shared file, and a missing file. Each must fail --verify.
 cp "$DEST/.mcp.json" "$DEST/.mcp.json.keep"
-for shape in stdio literal; do
+# ⛔ THREE shapes, and each must be refused by ITS OWN rule. `literal` and `secret` are not the
+# same case: a literal Bearer hits LITERAL_AUTH, so an env-indirect header with a stray token
+# ELSEWHERE in the file is the only thing that reaches SECRET_IN_FILE — the rule that exists to
+# catch a key pasted into a shared file. With one shape serving both, the leak rule had no test.
+for shape in stdio literal secret; do
   python3 - "$DEST/.mcp.json" "$shape" <<'PY'
 import json, sys
 p, shape = sys.argv[1], sys.argv[2]
@@ -1027,19 +1210,300 @@ d = json.load(open(p))
 t = d["mcpServers"]["tortoise"]
 if shape == "stdio":
     d["mcpServers"]["tortoise"] = {"command": "/x/.venv/bin/python3", "args": ["-m", "tortoise.mcp_server"]}
-else:
+elif shape == "literal":
     # built at runtime on purpose: the POINT of this case is a literal token IN the file, and
     # spelling one here would trip the transcript redactor without testing anything more.
     t["headers"] = {"Authorization": "Bearer " + "t" + "t" + "_" + "A" * 24}
-json.dump(d, open(p, "w"))
+else:
+    # the header stays env-indirect, so LITERAL_AUTH does NOT fire; the token hides in a comment
+    t["_comment"] = "pasted for convenience: " + "t" + "t" + "_" + "A" * 24
+json.dump(t and d, open(p, "w"))
 PY
   run_verify
-  [ $? -eq 1 ] && grep -q "\.mcp.json's tortoise entry is not the hosted shape" "$LOG" \
-    && ok "--verify refuses a .mcp.json with the $shape tortoise entry (the cell must not be started)" \
-    || fail "--verify CERTIFIED a .mcp.json with the $shape tortoise entry"
+  rc=$?
+  # each shape is refused by ITS OWN rule: a literal Bearer is LITERAL_AUTH, a leaked token
+  # elsewhere is SECRET_IN_FILE, the stdio entry is the shape refusal.
+  want="\.mcp.json's tortoise entry is not the hosted shape"
+  [ "$shape" = "literal" ] && want="LITERAL bearer token"
+  [ "$shape" = "secret" ] && want="SECRET_IN_FILE"
+  if [ "$rc" -eq 1 ] && grep -q "$want" "$LOG"; then
+    ok "--verify refuses a .mcp.json with the $shape tortoise entry (the cell must not be started)"
+  else
+    fail "--verify CERTIFIED a .mcp.json with the $shape tortoise entry (rc=$rc, expected refusal by: $want)"
+  fi
   cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
 done
 rm -f "$DEST/.mcp.json.keep"
+
+# ⛔ A LEAK IN ANOTHER SERVER IS NOT A BROKEN TORTOISE ENTRY. The token scan covers the whole file,
+# so a literal pasted into a cell-local server lands in the same refusal as a broken tortoise entry —
+# and reporting it as "tortoise entry is not the hosted shape" points the operator at the one entry
+# that is correct. The marker carries the PATH, so the remedy names the entry that actually leaks.
+cp "$DEST/.mcp.json" "$DEST/.mcp.json.keep"
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["cell-local"] = {
+    "command": "/bin/true",
+    # runtime-built: a literal token here would trip the transcript redactor, not the verifier
+    "env": {"K": "t" + "t" + "_" + "A" * 24},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "credential LITERAL is written into .mcp.json at cell-local.env.K" "$LOG" \
+  && ok "--verify names the entry that actually holds a leaked token (cell-local.env.K), not tortoise" \
+  || fail "--verify refused a leak in another server but blamed the tortoise entry (rc=$rc) — the operator is pointed at the entry that is right"
+cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
+rm -f "$DEST/.mcp.json.keep"
+
+# ⛔ A TYPO IS NOT A SELF-HOST. Marking ANY differing url `_selfHosted` let the INSTALLER mint the
+# exemption `--verify` honours — so the "unmarked non-default url" refusal could never fire after a
+# repair, and a cell pointed at a mangled endpoint by a copy/paste was certified. Same HOST spelled
+# differently is a typo and the default wins; a different host is a real self-host and is preserved.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+t.pop("_selfHosted", None)
+t["url"] = "https://api.premiselabs.co/mcp"      # trailing slash missing — same host, wrong spelling
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a near-miss of the hosted url is REPLACED, not marked _selfHosted (a typo is not a self-host)" \
+  || fail "install blessed a typo'd hosted url as _selfHosted — the verifier then certifies an endpoint nobody intended"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
+PY
+# ...and a self-hosted entry that spells its OWN transport still works: the client never reads `type`
+# (it selects StreamableHTTP from `url` alone), so replacing it would destroy the operator's config.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"type": "sse", "url": "http://localhost:8000/mcp"}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a self-hosted entry declaring its own transport is PRESERVED (the client ignores type)" \
+  || fail "install replaced a working self-hosted entry because of its `type` — the operator's daemon is destroyed and they are pointed at a hosted endpoint they have no key for"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "http://localhost:8000/mcp" else 1)
+PY
+cp "$ROOT/templates/.mcp.base.json" /tmp/_canon.tpl 2>/dev/null || true
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = json.load(open(tpl))["mcpServers"]["tortoise"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+
+# ⛔ THE INSTALL SIDE MUST ENFORCE THE HOSTED HEADER TOO. The verifier has three arms for it; the
+# merge carries its own copy of the predicate, so an install that PRESERVED a foreign variable would
+# write a config `--verify` refuses for ever — the unrecoverable disagreement.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+t["headers"] = {"Authorization": "Bearer ${SOME_OTHER_KEY}"}
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "install REPLACES a hosted entry naming a foreign variable (install and verify agree)" \
+  || fail "install preserved a hosted header naming a variable the client cannot resolve — --verify refuses it, so the cell can never be repaired"
+import json, sys
+auth = (((json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}).get("headers") or {}).get("Authorization") or ""
+sys.exit(0 if "TORTOISE_API_KEY" in auth or "TORTOISE_MCP_API_KEY" in auth else 1)
+PY
+
+# ⛔ THE HOSTED HEADER MUST BE THE CANONICAL SHAPE, not merely "contains ${". The client sends
+# headers VERBATIM (extensions/mcp-client/index.ts:819-821), so a header without the `Bearer ` scheme
+# reaches the server as `Authorization: tt_…` and gets a 401 — while `--verify` used to pass it, and
+# `scripts/cloud-cell-bringup.sh` SKIPS the repair install on a passing verify. Two shapes, both
+# certified before this arm existed.
+cp "$DEST/.mcp.json" "$DEST/.mcp.json.keep"
+for bad in no-scheme foreign-var; do
+  python3 - "$DEST/.mcp.json" "$bad" <<'PY'
+import json, sys
+p, bad = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+if bad == "no-scheme":
+    t["headers"] = {"Authorization": "${TORTOISE_API_KEY}"}          # no `Bearer ` prefix
+else:
+    t["headers"] = {"Authorization": "Bearer ${SOME_OTHER_KEY}"}     # a var the resolver never reads
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+  run_verify
+  [ $? -eq 1 ] && grep -q "Authorization is not 'Bearer" "$LOG" \
+    && ok "--verify REFUSES a hosted Authorization that is not 'Bearer \${TORTOISE_API_KEY}' ($bad)" \
+    || fail "--verify certified a hosted header the client sends VERBATIM ($bad) — the lane gets a 401 with LAYER VERIFIED behind it"
+  cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
+done
+# ...and the fleet ALIAS is accepted, because the resolver reads it too (so the certification line
+# and the entry can never describe different variables).
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+t["headers"] = {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+[ $? -eq 0 ] && ok "--verify ACCEPTS the fleet alias Bearer \${TORTOISE_MCP_API_KEY} (the resolver reads it)" \
+  || fail "--verify refused the fleet alias header it is supposed to accept"
+cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
+rm -f "$DEST/.mcp.json.keep"
+
+# ⛔ THE RESOLVER MUST RESOLVE THE VARIABLE THE ARTIFACT NAMES. The installed entry expands exactly
+# one (`${TORTOISE_API_KEY}`), and pi's mcp-client resolves `process.env[NAME]` VERBATIM — no alias
+# mapping exists. A resolver that also accepted the fleet alias printed "the hosted MCP will
+# authenticate" on a box whose entry expands to the EMPTY string: the exact opposite of the artifact.
+# Here the alias is the ONLY thing set, and the entry names the canonical var — so the verdict must
+# be UNRESOLVED, and the remedy it prints must name the alias it found.
+ALIAS_KEY="t"
+ALIAS_KEY="${ALIAS_KEY}t_$(printf 'A%.0s' $(seq 24))"
+HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
+  env -u TORTOISE_API_KEY TORTOISE_MCP_API_KEY="$ALIAS_KEY" \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+grep -q "graph credential: UNRESOLVED" "$LOG" \
+  && ok "an alias-only box is NOT certified as authenticating when the entry expands the canonical var" \
+  || fail "an alias-only box was certified 'will authenticate' while the installed entry expands an unset variable — the certification contradicts the artifact"
+grep -q "the fleet alias TORTOISE_MCP_API_KEY IS set" "$LOG" \
+  && ok "the refusal names the alias it found, with the line that connects them (#5153)" \
+  || fail "an alias-only box got no alias-specific remedy — it is told to push a key it already has"
+
+# ...and a RE-SYNC must not rewrite that alias-named entry into an empty Bearer.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+t["headers"] = {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a re-sync KEEPS an entry's own credential variable (an alias-named entry is not silently rewritten)" \
+  || fail "a re-sync rewrote a working alias-named Authorization to the canonical variable — on an alias-only box that is an empty Bearer"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+auth = (t.get("headers") or {}).get("Authorization") or ""
+sys.exit(0 if "TORTOISE_MCP_API_KEY" in auth else 1)
+PY
+run_verify
+[ $? -eq 0 ] && ok "--verify accepts the kept alias-named entry (install and verify agree)" \
+  || fail "--verify refused the alias-named entry the install just kept"
+# restore the canonical entry so the arms below start from the shape the layer installs
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = json.load(open(tpl))["mcpServers"]["tortoise"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+
+# ⛔ THE VERDICT MUST DESCRIBE THE TORTOISE ENTRY, NOT ANY SERVER'S HEADER. A cell may declare its
+# own servers (`merge-mcp.py` preserves them on purpose), so a file-wide first-`Authorization` read
+# made `LAYER VERIFIED` say "will authenticate" about a variable the TORTOISE entry does not expand —
+# while that entry expanded an unset one and the lane got a 401. Here another server's header comes
+# FIRST and names the alias; the tortoise entry names the canonical var, which is unset.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+servers = {"acme-hosted": {"type": "http", "url": "https://example.invalid/mcp/",
+                           "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}}}
+servers.update(d["mcpServers"])
+d["mcpServers"] = servers
+json.dump(d, open(p, "w"), indent=2)
+PY
+HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
+  env -u TORTOISE_API_KEY TORTOISE_MCP_API_KEY="$ALIAS_KEY" \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+grep -q "graph credential: UNRESOLVED" "$LOG" \
+  && ok "the verdict follows the TORTOISE entry's variable, not another server's header" \
+  || fail "a cell-local server's Authorization decided the tortoise credential verdict — false green about the entry that actually 401s"
+
+# ...and an entry that declares NO Authorization is NOT reported as missing a key: the documented
+# self-host shape has no header because a local daemon needs none. Reporting UNRESOLVED there is a
+# false red that also tells the operator to push a key they must not use.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"] = {"tortoise": {"url": "http://localhost:8000/mcp", "_selfHosted": True}}
+json.dump(d, open(p, "w"), indent=2)
+PY
+HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" env -u TORTOISE_API_KEY \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "declares no Authorization" "$LOG" \
+  && ! grep -q "NOT resolvable" "$LOG" \
+  && ok "a keyless self-host entry is certified with 'nothing to resolve', not UNRESOLVED" \
+  || fail "a keyless self-host entry was reported as missing a credential (rc=$rc) — a false red that also demands a key it must not use"
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = json.load(open(tpl))["mcpServers"]["tortoise"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+
+# ⛔ A LITERAL TOKEN ANYWHERE IN THE ENTRY IS REPLACED, not only one in Authorization: a token in
+# `env`/`_comment` is still a credential in a shared 0644 file, `--verify` refuses that file, and an
+# install that preserved it would re-write a config it then refuses — for ever, silently.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"url": "http://localhost:8000/mcp",
+                               "env": {"K": "t" + "t" + "_" + "A" * 24}}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a token pasted into the entry's env is replaced on install (never preserved into the shared file)" \
+  || fail "install preserved a literal token in a self-host entry's env — it re-writes a config --verify then refuses, silently"
+import json, sys
+raw = open(sys.argv[1]).read()
+sys.exit(1 if ("t" + "t" + "_") in raw else 0)
+PY
+
+# ⛔ LAYER VERIFIED CARRIES THE CREDENTIAL STATE. Before this, a cell whose TORTOISE_API_KEY did not
+# resolve was certified LAYER VERIFIED with the 401 warning scrolled away above it — and nothing else
+# catches it (the key is not part of the layer; cloud-cell-bringup.sh does not check it). Exit 0 is
+# deliberate; the STATE has to be unmissable instead. Both directions, so neither can be vacuous.
+KEY="t"
+KEY="${KEY}t_$(printf 'A%.0s' $(seq 24))"
+CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" TORTOISE_API_KEY="$KEY" \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "graph credential: resolves from the environment" "$LOG" \
+  && ok "LAYER VERIFIED states the graph credential resolves (a cell certified with a working key)" \
+  || fail "LAYER VERIFIED did not report a resolving graph credential (rc=$rc) — a reader cannot tell a working cell from a 401 one"
+mkdir -p "$TMP/nohome"
+# BOTH names are cleared: a box that exports the fleet alias (the standard variable) would
+# otherwise resolve and the arm would go red on a correctly-configured machine.
+HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
+  env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+rc=$?
+grep -q "graph credential: UNRESOLVED" "$LOG" \
+  && ok "LAYER VERIFIED states an UNRESOLVED graph credential (the 401 trap is not silent)" \
+  || fail "a cell with no resolvable TORTOISE_API_KEY was certified without saying so (rc=$rc) — every lane on it will write GRAPH-UNREACHABLE"
+
 # skills/ was `[ -d ]` plus a non-empty `ls` until #1723's `--check` began verifying BEFORE it
 # installs: a cell holding 1 of the checkout's 124 SKILL.md files passed that check, so the fast
 # path would CERTIFY it and skip the re-copy that repairs it. It now compares the WHOLE tree —

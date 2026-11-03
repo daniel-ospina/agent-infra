@@ -85,34 +85,34 @@ merge_models() {
 merge_mcp() {
   # Base MCP config (#104): install templates/.mcp.base.json → ~/.pi/agent/.mcp.json
   # so every pi session gets MCP servers even in repos without a local .mcp.json.
-  # Source wins per server key; local extra servers survive re-syncs.
+  #
+  # ⛔ THE MERGE RULES LIVE IN `pi-bootstrap/lib/merge-mcp.py`, SHARED WITH cell-install.sh.
+  # The two callers used to merge inline and had already drifted into the same bug: a plain
+  # `{**dst, **src}` source-wins merge silently REPOINTS a self-hosted `tortoise` url at the
+  # hosted endpoint on every re-sync — and the base template's own `_comment` tells self-host
+  # users to set exactly that url. On a machine with no hosted key the repointed entry then sends
+  # `Bearer ` (empty), the server answers 401, and the failure reads as an auth error rather than
+  # the silent repoint it is. One implementation is how the rule stops being obeyed on one
+  # platform only. The lib also carries the `exa` migration (#419 reversed by the owner
+  # 2026-10-31) and the "unusable entry is replaced, never preserved" rule.
   [ -f "$INFRA_ROOT/templates/.mcp.base.json" ] || { echo "    .mcp.base.json missing - skipping MCP config"; return 0; }
+  if [ ! -f "$INFRA_ROOT/pi-bootstrap/lib/merge-mcp.py" ]; then
+    echo "    ERROR: pi-bootstrap/lib/merge-mcp.py is missing from $INFRA_ROOT — refusing to merge" >&2
+    echo "    .mcp.json with a second, private implementation (a wrong merge here repoints a" >&2
+    echo "    self-hosted tortoise url at the hosted endpoint on every sync)." >&2
+    return 1
+  fi
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json" << 'PY'
-import json, os, sys
-src = json.load(open(sys.argv[1]))
-dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
-src_servers = src.get("mcpServers", {})
-dst_servers = dst.get("mcpServers", {})
-# ⛔ THE ONE DELIBERATE EXCEPTION TO "local extras preserved" (#419 reversed by the
-# owner, 2026-10-31: "exa should be uninstalled because I never wanted it. external
-# research should be perplexity"). `exa` is NOT a local extra to carry forward — it
-# was a BASE server, and the merge below is `{**dst_servers, **src_servers}`, which
-# preserves any key that already exists in dst. So dropping it from the TEMPLATE
-# alone would leave every ALREADY-PROVISIONED machine still loading it: the new
-# template wins on the keys it still has, and exa is not one of them, so dst's copy
-# is what survives. That is the opposite of what the operator expects from a
-# bring-up, and it is invisible (the merge prints "local extras preserved" either
-# way). This pop IS the migration.
-if dst_servers.pop("exa", None) is not None:
-    print("    exa removed from .mcp.json (owner ruling 2026-10-31 — uninstalled, not configured)")
-merged = {**dst, **src, "mcpServers": {**dst_servers, **src_servers}}
-json.dump(merged, open(sys.argv[2], "w"), indent=2)
-print("    .mcp.json merged (base servers win; local extras preserved)")
-PY
+    if ! python3 "$INFRA_ROOT/pi-bootstrap/lib/merge-mcp.py" "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json"; then
+      echo "    ERROR: .mcp.json merge failed — the previous config is untouched" >&2
+      return 1
+    fi
   else
+    # A plain copy CLOSES over a self-hosted tortoise url and drops every local server. It is kept
+    # only because a machine with no python3 cannot merge at all, and it is loud.
+    echo "    WARNING: python3 not found — copying .mcp.json wholesale (any local server and any" >&2
+    echo "    self-hosted tortoise url is LOST). Install python3 and re-run to merge properly." >&2
     cp "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json"
-    echo "    .mcp.json copied (python3 not found - plain copy)"
   fi
 }
 merge_settings() {
@@ -567,7 +567,11 @@ fi
 # whose `$O` is the flat `scripts/orchestrator-harness/*` payload (the file lives one directory ABOVE
 # that) and whose launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile):
 # without it every at-risk lane recorded `rescue=UNAVAILABLE`, i.e. the rescue was loud and inert.
-# ⛔ THE GRAPH CLIENT IS FARMED HERE, AND THIS ARRAY IS THE ONLY DELIVERY OF IT (agent-infra#3253).
+# ⛔ THE GRAPH CLIENT IS FARMED BY `graph_srcs` (below), AND THAT ARRAY IS THE ONLY DELIVERY OF IT
+# (agent-infra#3253). ⛔ It is NOT also listed in `fleet_srcs`: #3253 first put the pair there, #3374
+# gave the hosted-graph fallback its own array (with a farm loop that reports a MISSING entry loudly),
+# and a pair declared in BOTH is copied twice and appears twice in `farm_declared_rel` — a duplicate
+# declaration is not extra safety, it is two answers to "who delivers this file".
 # The owner's mandate (2026-11-02) — read the hosted Tortoise graph before researching, confirm
 # direction in it before implementing, write the learning after — was UNEXECUTABLE on every box but
 # the one it was written on, because `~/.pi/agent/scripts/tortoise-graph.sh` existed on no cell and
@@ -577,10 +581,10 @@ fi
 # fresh box would not have it either. A hand-copy is not a deployment (#3253; the same class as the
 # hand-copied harness §11 in cloud-cell-bringup.sh).
 #   * `tortoise_graph_client.py` is the EXECUTED half: `tortoise-graph.sh` runs it as the SIBLING
-#     `$(dirname "$0")/tortoise_graph_client.py`. Both farm FLAT into $DEST/scripts/, which is the
-#     layout that resolution needs — farming the .sh alone yields a client whose first call dies with
-#     `can't open file`, a loud failure but a needless one (the same sibling contract as
-#     lib_srcs/merge_gate_srcs above).
+#     `$(dirname "$0")/tortoise_graph_client.py`. Both farm FLAT into $DEST/scripts/ (the
+#     `graph_srcs` array), which is the layout that resolution needs — farming the .sh alone yields
+#     a client whose first call dies with `can't open file`, a loud failure but a needless one (the
+#     same sibling contract as lib_srcs/merge_gate_srcs above).
 #   * The CREDENTIAL IT NEEDS IS NOT DELIVERED BY THIS FILE, and saying so is part of the fix: the
 #     fleet has no secret store wired to it — `keys.env` on a cell and `pi-keys.env` on a Mac are
 #     PUSHED BY HAND. So `TORTOISE_MCP_API_KEY` must be present there for the mandate to run, and
@@ -1099,10 +1103,13 @@ else
 fi
 echo "    shell profile wired: AGENT_INFRA_PATH + AGENT_SYNC_MODE"
 
-# MCP base config needs TORTOISE_HOME for the local tortoise MCP server.
-# Detect a checkout in standard locations (sibling of the agent-infra clone
-# first, then common layouts) and wire it into the shell profile when the var
-# is unset and not already present (idempotent, mirrors AGENT_INFRA_PATH).
+# TORTOISE_HOME — for LOCAL / self-hosted tortoise tooling only.
+# ⛔ The BASE MCP entry no longer uses it (graph-mcp-provision): templates/.mcp.base.json
+# declares the HOSTED server (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_API_KEY}`),
+# which needs no checkout, no venv and no local FalkorDB. This probe is kept because other
+# local tooling still reads the variable and removing a variable the fleet may use is a bigger
+# change than this one — but the message below must not be allowed to imply the graph is wired
+# because TORTOISE_HOME exists. The graph needs TORTOISE_API_KEY in ~/keys.env.
 TORTOISE_HOME_SET=0
 if [ -n "${TORTOISE_HOME:-}" ]; then
   TORTOISE_HOME_SET=1
@@ -1119,9 +1126,9 @@ else
   done
 fi
 if [ "$TORTOISE_HOME_SET" -eq 1 ]; then
-  echo "    MCP: tortoise will use TORTOISE_HOME for its local MCP server"
+  echo "    TORTOISE_HOME wired (LOCAL/self-hosted tortoise tooling) — the graph MCP itself is the HOSTED server and needs TORTOISE_API_KEY in ~/pi-keys.env (interactive shells) or ~/keys.env (lanes a controller spawns)"
 else
-  echo "    note: TORTOISE_HOME not set and no tortoise checkout found — tortoise MCP server unavailable until set"
+  echo "    note: TORTOISE_HOME not set and no tortoise checkout found — local/self-hosted tortoise tooling unavailable (the base MCP entry does not need it; it needs TORTOISE_API_KEY in ~/pi-keys.env for an interactive shell, or ~/keys.env for lanes)"
 fi
 
 # Launchd agents (idempotent, #304): install the versioned plist templates
