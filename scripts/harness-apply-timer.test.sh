@@ -113,7 +113,7 @@ run_pass() {
     HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH="${HARNESS_FETCH:-1}" \
     HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_MODE="${MODE_P:-}" \
     HARNESS_PIN="$d/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$d/home/.harness-path" \
-    HARNESS_PIN_DIR="$d/home/harness" CELL_HOME="$d/home" O="$d/home/orchestrator" \
+    HARNESS_PIN_DIR="$d/home/harness" CELL_HOME="${CELL_HOME_P:-$d/home}" O="$d/home/orchestrator" \
     HARNESS_APPLY_SYNC_CMD="${HARNESS_APPLY_SYNC_CMD:-$T/sync-stub.sh}" \
     bash "$PASS_SH" "$@"
 }
@@ -1171,6 +1171,14 @@ cp "$PASS_SH" "$T/t24k/pass/harness-apply-pass.sh"
 OUT="$(PASS_SH="$T/t24k/pass/harness-apply-pass.sh" run_pass "$T/t24k" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: a farm with NO reachable instrument is RED, not a silent skip"
 assert_contains "$OUT" "no check-farm-drift.sh could be found" "T24 control: and it says the instrument could not be found"
+
+# Control 11: a RELATIVE CELL_HOME must not resolve to a farm path with nothing at it and read green.
+# It did: `CELL_HOME=relative-cell` produced `relative-cell/.pi/agent/scripts`, hit the SKIPPED arm and
+# exited 0 over a farm that exists and is stale (review round 5, reproduced).
+mk_origin t24l; mk_clone t24l
+REPO_P="$CLONE"; MODE_P=sync
+OUT="$(CELL_HOME_P=relative-cell run_pass "$T/t24l" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T24 control: a relative CELL_HOME is REFUSED, never a green SKIPPED farm"
 
 echo
 echo "────────────────────────────────────────────────────────"

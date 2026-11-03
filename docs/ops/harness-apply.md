@@ -158,7 +158,7 @@ this repo keeps deleting.
 | 21 | REFUSED ahead — local commits are not on the ref's line | **red** |
 | 22 | REFUSED diverged | **red** |
 | 23 | REFUSED unknown — the ref/repo/HEAD cannot be resolved, the materialiser failed, or the pin record could not be written | **red** |
-| 24 | `farm-drift` — the **FARM** (`$CELL_HOME/.pi/agent/scripts`, the directory this box *executes*) differs from the ref, owes files, or cannot be graded (a dangling link, or a checker that lives inside the farm) | **red** |
+| 24 | `farm-drift` — the **FARM** (`$CELL_HOME/.pi/agent/scripts`, the directory this box *executes*) differs from the ref, owes files, or cannot be graded (a dangling link, a checker that lives inside the farm, an explicitly-named farm that is absent) — an **absent *default* farm is SKIPPED and the pass stays green**, because only then does "no farm" describe the host rather than the config | **red** |
 | 25 | behind, and this box has nothing that can advance it | **red** |
 
 A red tick is deliberate: those are states a **human** must resolve, and the unit colour
@@ -251,7 +251,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 224 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 225 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |

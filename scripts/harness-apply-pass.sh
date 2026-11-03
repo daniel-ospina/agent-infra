@@ -237,6 +237,25 @@ case "${HARNESS_APPLY_FARM_CHECK:-1}" in
     0) FARM_CHECK_ON=0 ;;
     *) err "HARNESS_APPLY_FARM_CHECK must be 1|0 (got '${HARNESS_APPLY_FARM_CHECK:-}')"; exit 2 ;;
 esac
+# ⛔ THE FARM PATH IS RESOLVED HERE, WITH THE OTHER SEAMS, AND IT IS CHECKED FOR ABSOLUTENESS *AFTER*
+# RESOLUTION — not just as a seam. Two defects came from doing it at the finish line instead: a
+# relative `HARNESS_APPLY_FARM_DEST` was refused only at the END of the pass (so the sync/materialiser
+# move had already been paid for and NO record was written, leaving `--print-status` showing the
+# PREVIOUS tick), and a relative `CELL_HOME` was never checked at all — it produced
+# `$CELL_HOME/.pi/agent/scripts`, found nothing there, took the SKIPPED arm and reported the pass GREEN
+# over a stale farm (review round 5, reproduced). ⛔ A relative value is never expanded by
+# `Environment=` or a plist, and the unit's `cwd` is `/`.
+if [ "$FARM_CHECK_ON" = "1" ]; then
+    case "${HARNESS_APPLY_FARM_DEST:-}" in
+        '') FARM_DEST="$CELL_HOME/.pi/agent/scripts" ;;
+        /*) FARM_DEST="$HARNESS_APPLY_FARM_DEST" ;;
+        *)  err "HARNESS_APPLY_FARM_DEST must be an ABSOLUTE path (got '$HARNESS_APPLY_FARM_DEST')"; exit 2 ;;
+    esac
+    case "$FARM_DEST" in
+        /*) ;;
+        *)  err "the resolved farm path '$FARM_DEST' is not ABSOLUTE (CELL_HOME='$CELL_HOME') — a relative CELL_HOME cannot name the directory this box executes"; exit 2 ;;
+    esac
+fi
 
 # ── the pass record ────────────────────────────────────────────────────────────────────────────
 # One line of key=value, written ATOMICALLY (temp + rename): a truncated record is indistinguishable
@@ -983,15 +1002,6 @@ if [ "$FARM_CHECK_ON" = "0" ]; then
     log_line "farm: SKIPPED — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed; a stale farm will NOT redden this pass)"
 fi
 if [ "$FARM_CHECK_ON" = "1" ]; then
-    case "${HARNESS_APPLY_FARM_DEST:-}" in
-        '') FARM_DEST="$CELL_HOME/.pi/agent/scripts" ;;
-        /*) FARM_DEST="$HARNESS_APPLY_FARM_DEST" ;;
-        *)  # ⛔ A RELATIVE VALUE IS NEVER EXPANDED BY `Environment=` OR A PLIST, and `cwd` under the
-            # unit is `/` — so a typo'd seam would resolve to a path with nothing at it and take the
-            # SKIPPED arm, reading green over a stale farm. Refused before the pass runs, like every
-            # other seam here.
-            err "HARNESS_APPLY_FARM_DEST must be an ABSOLUTE path (got '$HARNESS_APPLY_FARM_DEST')"; exit 2 ;;
-    esac
     FARM_CHECKER="${HARNESS_APPLY_FARM_CHECKER:-}"
     if [ -z "$FARM_CHECKER" ]; then
         for _c in "$REPO/scripts/check-farm-drift.sh" "$HERE/check-farm-drift.sh"; do
