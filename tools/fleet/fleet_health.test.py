@@ -25,8 +25,9 @@ RED CONTROL — five mutations of the shipped module, each written to a TEMP cop
 (a mutation the suite does not catch is reported as a suite FAILURE). The first one is the
 pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
-  * neuter the lane-census reconciliation      -> 4 paired CENSUS reds, plus collateral
-                                                 reds in the other census checks (measured 14 total)
+  * neuter the lane-census reconciliation      -> 5 paired CENSUS reds (the fifth is the
+                                                 exit-code check), plus collateral reds in the
+                                                 other census checks (measured 14 total)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
