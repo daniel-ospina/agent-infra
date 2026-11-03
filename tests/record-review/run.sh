@@ -2190,6 +2190,98 @@ else
   fail "(31) could not build the changed-lines-dropped mutant"
 fi
 cd "$TMP" || true
+# ── (32) THE MARKER-PRESENT EARLY RETURN IS LOAD-BEARING (#841/#864, agent-infra#2741) ─────────
+# `post_marker()` decides whether the signed review marker is ALREADY in the PR body, and its answer
+# is what stops a second copy being appended to a body that already carries one. It used to ask:
+#
+#     printf '%s\n' "$body" | command grep -qF -- "$marker"
+#
+# `grep -q` exits at the FIRST match, so on a body larger than the pipe buffer the writer takes
+# SIGPIPE, `pipefail` marks the pipeline FAILED, and a marker that IS present reads as ABSENT — the
+# body is then re-patched. #3347 replaced it with a here-string. Nothing asserted the branch it
+# repairs: the guard pins the SHAPE (which is why this is P2), not the behaviour, so a future
+# re-introduction with a producer the guard does not recognise would pass unnoticed.
+#
+# THE FIXTURE MUST DISCRIMINATE, and that is the whole difficulty: the marker has to sit EARLY in a
+# body BIGGER than the pipe buffer. One giant line does NOT work — grep reads to EOF and the writer
+# never sees SIGPIPE (the recorded MEMORY.md lesson) — so the body below is many short lines.
+# Driven through the SHIPPED function, extracted from the script the way refresh-scout.test.sh drives
+# `resolve_cmux`: no re-implementation, so the assertion follows the code.
+echo; echo "── (32) post_marker: a marker already present is NOT re-patched ──"
+awk '/^post_marker\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$SRC" > "$TMP/pm-live.sh"
+if [ -s "$TMP/pm-live.sh" ] && grep -q 'post_marker()' "$TMP/pm-live.sh"; then
+  # The MUTANT is the pre-#3347 line, written the way the script spelled it.
+  sed 's#if command grep -qF -- "[$]marker" <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep -qF -- "$marker"; then return 0; fi#' \
+    "$TMP/pm-live.sh" > "$TMP/pm-old.sh"
+  grep -q 'printf "%s' "$TMP/pm-old.sh" \
+    && pass "(32a) the pre-fix pipe form was rebuilt for the mutation arm (the mutant is real, not a no-op)" \
+    || fail "(32a) could not rebuild the pre-fix pipe form — the mutation arm would be vacuous"
+  # A stub `gh` that serves the body and RECORDS any PATCH, so "was the body re-written?" is
+  # answered by an artifact rather than by an exit status (the old form exits 0 too — it only
+  # takes SIGPIPE, which is exactly why a status-only assertion would miss this).
+  PMH="$TMP/pm-home"; PMB="$TMP/pm-bin"; rm -rf "$PMH" "$PMB"; mkdir -p "$PMH" "$PMB"
+  cat > "$PMB/gh" <<'SH'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    *"-X"*) ;; esac
+done
+case "$*" in
+  *PATCH*) printf '%s\n' "PATCH" >> "$PM_PATCH_LOG"; cat >/dev/null 2>&1; exit 0 ;;
+esac
+case "$*" in
+  *"/pulls/"*) printf '%s' "${PM_BODY:-}"; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$PMB/gh"
+  pm_drive() { # <block> <body> <log> -> echoes post_marker's rc; writes any PATCH to <log>
+    PM_BODY="$2" PM_PATCH_LOG="$3" HOME="$PMH" PATH="$PMB:$PATH" \
+      bash -c 'set -uo pipefail; . "$1"; post_marker owner/repo 42 "$2"; printf "%s" "$?"' _ "$1" "MARKER-LINE-42" 2>/dev/null
+  }
+  # ⛔ 1050 LINES, NOT 1200, AND THE BOUND IS NOT THE PIPE — IT IS `MAX_ARG_STRLEN`. `pm_drive` hands
+  # the body to the child as ONE environment string, and Linux caps a single arg/env string at 131,072
+  # bytes; a 1200-line body is 145,214 and the child never starts, so (32c)/(32d)/(32e) fail for a
+  # reason that has nothing to do with `post_marker` (measured in a Linux container: "Argument list too
+  # long"). Passing it by file would NOT dodge this either — `post_marker` also hands the patched body
+  # to `jq -n --arg body`, argv under the same cap. So the fixture must sit in the window ABOVE the
+  # 64 KiB pipe capacity and BELOW 131,072: 1050 lines x 120 chars ≈ 127 KB. Both bounds are asserted
+  # below, so this cannot silently drift out of the window.
+  filler="$(printf 'x%.0s' $(seq 1 120))"
+  pm_big="$(for _i in $(seq 1 1050); do printf '%s\n' "$filler"; done)"
+  pm_with_marker="$(printf '%s\n%s\n' "MARKER-LINE-42" "$pm_big")"
+  pm_bytes=${#pm_with_marker}
+  # BOTH bounds. Too small and the SIGPIPE window never opens (the arm passes vacuously); too large and
+  # the child cannot even be exec'd on Linux (MAX_ARG_STRLEN = 131,072), which reds the arm for a reason
+  # that is not the code under test — measured, not hypothesised.
+  if [ "$pm_bytes" -gt 65536 ] && [ "$pm_bytes" -lt 131072 ]; then
+    pass "(32b) the fixture body is $pm_bytes bytes — ABOVE the 64 KiB pipe buffer (or the SIGPIPE window never opens) and BELOW Linux's 131,072-byte MAX_ARG_STRLEN (or the driver cannot exec at all)"
+  else
+    fail "(32b) the fixture body is $pm_bytes bytes — it must be in the window (65536, 131072): below it the pre-fix form passes too, above it the child cannot be exec'd on Linux"
+  fi
+  # (32c) NON-VACUITY: the PRE-FIX form, same body, must re-patch.
+  : > "$TMP/pm-old.log"
+  pm_drive "$TMP/pm-old.sh" "$pm_with_marker" "$TMP/pm-old.log" >/dev/null
+  [ -s "$TMP/pm-old.log" ] \
+    && pass "(32c) NON-VACUITY: the pre-fix pipe form RE-PATCHES a body that already carries the marker (SIGPIPE reads it as absent)" \
+    || fail "(32c) the pre-fix form did not re-patch, so the assertion below would pass on the broken code too"
+  # (32d) THE FIX: the shipped form must not touch the body, and must answer 0 (present).
+  : > "$TMP/pm-live.log"
+  pm_rc="$(pm_drive "$TMP/pm-live.sh" "$pm_with_marker" "$TMP/pm-live.log")"
+  [ ! -s "$TMP/pm-live.log" ] && [ "$pm_rc" = "0" ] \
+    && pass "(32d) the SHIPPED form returns 0 and does NOT re-patch the body (the marker already present is recognised)" \
+    || fail "(32d) the shipped form re-patched a present marker (rc=$pm_rc, patched=$([ -s "$TMP/pm-live.log" ] && echo yes || echo no))"
+  # (32e) …and it has not become "never patch": a body WITHOUT the marker must still be patched,
+  # or the fix would have traded a duplicate marker for a marker that is never posted at all.
+  : > "$TMP/pm-none.log"
+  pm_drive "$TMP/pm-live.sh" "$pm_big" "$TMP/pm-none.log" >/dev/null
+  [ -s "$TMP/pm-none.log" ] \
+    && pass "(32e) control: a body with NO marker is still patched (the early return did not become 'never post')" \
+    || fail "(32e) a body without the marker was NOT patched — post_marker now silently never posts the evidence"
+else
+  fail "(32) could not extract post_marker() from $SRC — every arm of this section is unproven"
+fi
+
 # 138 -> 137 (round 36) -> 133 (round 37, PR #1554). The retired-mutant tails printed the SAME
 # "RETIRED" note from more than one place: the mutant BUILDER line itself carried a
 # `|| pass "NOTE ..."` (sections 24, 25 and 26) and section 26 had a bare
@@ -2204,11 +2296,14 @@ cd "$TMP" || true
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
+# #3347: 185 -> 190 — section (32) pins the marker-present early return in `post_marker()`
+# (a marker already in the body must not be re-patched, the pre-fix pipe form must re-patch it,
+# and a body with NO marker must still be patched).
 # #10522: 183 -> 185 — (30x-b) and (30x-c) pin the NEW body-marker durability
 # contract in this suite too (a refused PATCH is a named rc 5, and the signed marker
 # survives in the pending file), and the (30x) cap vector no longer depends on the
 # marker's fate: its stub answers `.body`/PATCH so the post SUCCEEDS.
-MIN_ASSERTIONS=185
+MIN_ASSERTIONS=190
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
