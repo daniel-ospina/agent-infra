@@ -3662,7 +3662,23 @@ ARMS
     *) echo "  ❌ (v15) the floor changed the WINNER instead of adding an arm (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
   # ⛔ THE VISIBILITY LINE IS THE ARTIFACT. A silent threshold is the same defect class as a silent
   # reaper, so the cycle's numbers are pinned at the SOURCE, not merely described in a comment.
-  wpin "the cycle logs OPEN_PRS/FLOOR/MODE every cycle" "$ORCH" 'OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} → MODE('
+  wpin "the cycle logs OPEN_PRS/FLOOR/FLOOR_VERDICT/MODE every cycle" "$ORCH" 'OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} FLOOR_VERDICT=${LF_VERDICT:-?} → MODE('
+  # ⛔ THE EXEMPTION MUST BE NAMED ON THE DISPATCH PATH (review round 4, P2). `GATE_VEC` prints only on
+  # the idle path, so an exempted cycle that then DISPATCHED showed `MODE(produce) BINDING(none)` with
+  # the reason nowhere — the silent-threshold defect, one field over. v21 drives the exemption and
+  # asserts it is named in the vector, which is what feeds `FLOOR_VERDICT`.
+  _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=68; FORK_STARVED=0; FORK_WHY=""
+         CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
+         L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
+         SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+         LANDING_FLOOR=25; O=/nonexistent; BATCH=1
+         floor_emergency() { printf 'red-tree(#1234)'; }
+         eval "$GV" >/dev/null 2>&1
+         printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${LF_VERDICT:-<unset>}" ) )"
+  _v="$(printf '%s' "$_t" | cut -f2)"
+  case "$_v" in
+    exempt*) echo "  ok (v21) an exempted cycle NAMES the exemption (so the log can print it)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v21) the exemption is unnamed, so an exempted dispatch reads BINDING(none): [$_v]"; FAIL=$((FAIL+1)) ;; esac
   # ── the two mutants ────────────────────────────────────────────────────────────────────────────
   mut_gv() { # <name> <old> <new> -> path to the mutant block
     printf '%s\n' "$GV" > "$TMP/gv-$1.in"

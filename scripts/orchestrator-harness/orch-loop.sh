@@ -5802,6 +5802,7 @@ PY
   case "$LF_M" in ''|*[!0-9]*|0?*) LF_M=25 ;; esac
   [ "$LF_M" -ge 1 ] || LF_M=25
   LF_EMERG=""
+  LF_VERDICT=""
   declare -f floor_emergency >/dev/null 2>&1 && LF_EMERG="$(floor_emergency "${O:-}" "${BATCH:-1}" 2>/dev/null)"
   # ⛔ THE EMERGENCY DOOR IS TESTED FIRST, SO IT COVERS EVERY BRANCH (review round 3, P2). It used to
   # sit in the deepest `else`, which meant the three fail-closed branches (UNREADABLE, out-of-range,
@@ -5822,25 +5823,30 @@ PY
   # no check, and an unpinnable one is worse still. The guards below are defence-in-depth for the arm's
   # own contract, NOT a live fix for a fail-open.
   if [ -n "$LF_EMERG" ]; then
-    GATE_VEC="$GATE_VEC landing-floor=exempt(${LF_EMERG} outranks ${OPEN_N:-?})"
+    LF_VERDICT="exempt(${LF_EMERG})"
+    GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
   else
     case "${OPEN_N:-}" in
       ''|*[!0-9]*|0?*)
+        LF_VERDICT="UNKNOWN"
         GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
-        GATE_VEC="$GATE_VEC landing-floor=UNKNOWN" ;;
+        GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT" ;;
       *)
         # ⛔ THE LENGTH BOUND IS NOT DECORATION: `[` ERRORS at or above 2^63 and an ERRORED test is
         # FALSE, which OPENS the gate — that is the exact reason `is_limit` exists. `is_limit` is not
         # in scope inside this extracted block, so the bound is stated here.
         if [ "${#OPEN_N}" -gt 6 ]; then
+          LF_VERDICT="UNKNOWN(out-of-range)"
           GATE_WHY="${GATE_WHY:-landing-floor(open PR count OUT OF RANGE (${#OPEN_N} digits) — landing before producing)}"
-          GATE_VEC="$GATE_VEC landing-floor=UNKNOWN(out-of-range)"
+          GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
         else
           if [ "${OPEN_N}" -ge "$LF_M" ]; then
+            LF_VERDICT="REFUSE(${OPEN_N}>=${LF_M})"
             GATE_WHY="${GATE_WHY:-landing-floor(${OPEN_N} open PR(s) >= ${LF_M} — landing before producing)}"
-            GATE_VEC="$GATE_VEC landing-floor=REFUSE(${OPEN_N}>=${LF_M})"
+            GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
           else
-            GATE_VEC="$GATE_VEC landing-floor=ok(${OPEN_N}<${LF_M})"
+            LF_VERDICT="ok(${OPEN_N}<${LF_M})"
+            GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
           fi
         fi ;;
     esac
@@ -6200,12 +6206,18 @@ PY
   # `MODE(produce)` = the issue path is open. `FLOOR=` and `OPEN_PRS=` are printed even when the floor
   # is not the binding reason, so the margin is visible before it is crossed — and `BINDING=` names
   # which gate actually won, so a floor that is satisfied cannot be misread as the cause.
+  # ⛔ `FLOOR_VERDICT=` IS ON THIS LINE BECAUSE `GATE_VEC` IS NOT (review round 4, P2). `GATE_VEC` is
+  # printed only on the IDLE path, so a cycle where `floor_emergency` stood the floor down and the box
+  # dispatched — the very case R6 creates — read `MODE(produce) BINDING(none)` with the exemption
+  # nowhere on the line. That is the "silent threshold" defect this line exists to prevent, one field
+  # over. Now every cycle states the floor's own verdict, whether or not the floor was the winner,
+  # and whether or not the box dispatched.
   # ⛔ `FLOOR=` PRINTS THE VALUE THE ARM ENFORCED (`LF_M`, already coerced), NOT THE RAW KNOB (review
   # round 2, P2): the arm re-coerces independently, so `LANDING_FLOOR=0` with `MERGE_PRIORITY_AT=0`
   # survives the main coercion as 0, is rejected by the arm as 25, and the line used to print
   # `FLOOR=0` while enforcing 25 — on the one line whose entire purpose is to make the threshold
   # trustworthy.
-  echo "[landing-floor] OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} → MODE($([ -z "${GATE_WHY:-}" ] && echo produce || echo land)) BINDING(${GATE_WHY:-none})" >> "$LOG"
+  echo "[landing-floor] OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} FLOOR_VERDICT=${LF_VERDICT:-?} → MODE($([ -z "${GATE_WHY:-}" ] && echo produce || echo land)) BINDING(${GATE_WHY:-none})" >> "$LOG"
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
     # ── THE PRODUCT FLOOR, APPLIED AS AN ORDER (agent-infra#2054) ───────────────────────────────
