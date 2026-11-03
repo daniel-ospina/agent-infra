@@ -2183,9 +2183,19 @@ esac
 exit 0
 EOF
 chmod +x "$TMP/dbin/gh"
-delta_write_record() { # <pr> <head> <verdict> -> writes the record this verb reads
-  printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","mint":"fresh","verdict":"%s","repo":"fixture/repo","reviewed_at":"2026-11-02T00:00:00Z"}\n' \
-    "$1" "$2" "$(printf 'x' | openssl dgst -sha256 | awk '{print $NF}')" "$3" \
+delta_write_record() { # <pr> <head> <verdict> [evidence|NONE] -> writes the record this verb reads
+  # ⚠️ A REAL `clean` record CARRIES `evidence` — it is minted from a posted review artifact
+  # (tortoise#7391), and #10177/#3327 (landed on main AFTER this PR was written) now REFUSES
+  # to carry a `clean` verdict whose record names no review artifact. The first cut of this
+  # fixture omitted the field, so after the rebase the acceptance case started refusing at
+  # `carry-provenance` — correctly. The fixture was made realistic rather than the gate
+  # loosened, and `NONE` deliberately writes the field-free record so the refusal direction
+  # can be pinned: see (32e).
+  local ev="${4:-comment:9000001}" evjson
+  evjson="\"evidence\":\"$ev\","
+  [ "$ev" = "NONE" ] && evjson=""
+  printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","mint":"fresh","verdict":"%s","repo":"fixture/repo",%s"reviewed_at":"2026-11-02T00:00:00Z"}\n' \
+    "$1" "$2" "$(printf 'x' | openssl dgst -sha256 | awk '{print $NF}')" "$3" "$evjson" \
     > "$DR_HOME/.pi/agent/reviews/fixture-repo-$1.json"
 }
 # THE STATUS MUST BE CAPTURED OUTSIDE A SUBSHELL. Every call site wants BOTH the
@@ -2217,7 +2227,8 @@ if [ -d "$DELTA_REPO" ]; then
   D_REC32="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
   [ "$DRC_A" -eq 0 ] && [ "$(printf '%s' "$D_REC32" | grep -c '"mint":"delta"')" = 1 ] \
     && [ "$(printf '%s' "$D_REC32" | grep -c "\"head_sha\":\"$D_MERGED\"")" = 1 ] \
-    && pass "(32a) a conflict-free forward merge RE-BINDS, and the record says mint=delta at the new head" \
+    && [ "$(printf '%s' "$D_REC32" | grep -c '"evidence":"comment:9000001"')" = 1 ] \
+    && pass "(32a) a conflict-free forward merge RE-BINDS, and the record says mint=delta at the new head AND keeps the review artifact its verdict rests on" \
     || fail "(32a) the delta was not rebound as a delta (rc=$DRC_A, record='$D_REC32', out='$OUT32')"
   # (b) one real authored commit on top of the merge: authorship moved, so a review is owed.
   ( cd "$DELTA_REPO" || exit 9; printf 'lane fix\n' >> lane.txt; git add -A; git commit -qm "lane: a real fix commit" ) >/dev/null 2>&1
@@ -2234,8 +2245,38 @@ if [ -d "$DELTA_REPO" ]; then
   [ "$DRC_C" -eq 3 ] && printf '%s' "$OUT32C" | grep -q 'not a clean-family verdict' \
     && pass "(32c) a non-clean record is REFUSED before any git work — a delta cannot manufacture an approval" \
     || fail "(32c) a non-clean verdict was re-bound as a clean attestation (rc=$DRC_C)"
+  # (d) A RECORD NAMING AN ABSENT HEAD — pruned, cross-box, or force-pushed away. This is the
+  # assertion that keeps the delta-measure triple REACHABLE: MEASURED before the fix, the run exited
+  # 1 with the triple truncated after `authored-digest-equal=UNMEASURED(…)`, because
+  # `mt_raw="$(command git merge-tree …)"; m_rc=$?` is ONE command under `set -e` — the substitution's
+  # status (1: `merge-tree: <sha> - not something we can merge`) aborted the shell before `m_rc` was
+  # read, so `zero-conflict=` and `no-new-authored-commits=` never printed and an intended exit 3 came
+  # out as a crash. All three fields, the status, AND the untouched record are asserted, so this
+  # branch cannot silently become unreachable again.
+  D_ABSENT="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  delta_write_record 7104 "$D_ABSENT" clean
+  FIX_DELTA_HEAD="$D_MERGED"; delta_run 7104 "$TMP/out32d"; OUT32D="$(cat "$TMP/out32d")"; DRC_D="$DR_RC"
+  [ "$DRC_D" -eq 3 ] \
+    && printf '%s' "$OUT32D" | grep -q '^authored-digest-equal=' \
+    && printf '%s' "$OUT32D" | grep -q '^zero-conflict=' \
+    && printf '%s' "$OUT32D" | grep -q '^no-new-authored-commits=' \
+    && [ "$(grep -c "\"head_sha\":\"$D_ABSENT\"" "$DR_HOME/.pi/agent/reviews/fixture-repo-7104.json")" = 1 ] \
+    && pass "(32d) an ABSENT record head REFUSES at exit 3 and prints all THREE delta fields — a set -e abort on the merge-tree assignment used to truncate the triple into a crash" \
+    || fail "(32d) absent-head refusal did not print the full triple at exit 3 (rc=$DRC_D, out='$OUT32D')"
+  # (e) NO REVIEW ARTIFACT, NO DELTA. `--delta` re-binds an APPROVAL, and main's #10177 requires
+  # every carry to name the review artifact the verdict rests on. A delta is a carry (it re-binds
+  # a verdict minted at another head), so the same refusal must reach it — otherwise the delta
+  # verb becomes the one carry path that can re-bind a `clean` onto a tree with nothing in the
+  # record a reader could check, which is exactly the shape tortoise#10677 produced. The record
+  # must be LEFT ALONE (nothing written, no marker posted).
+  delta_write_record 7105 "$D_REVIEWED" clean NONE
+  FIX_DELTA_HEAD="$D_MERGED"; delta_run 7105 "$TMP/out32e"; OUT32E="$(cat "$TMP/out32e")"; DRC_E="$DR_RC"
+  [ "$DRC_E" -eq 3 ] && printf '%s' "$OUT32E" | grep -q 'carry-provenance' \
+    && [ "$(grep -c "\"head_sha\":\"$D_REVIEWED\"" "$DR_HOME/.pi/agent/reviews/fixture-repo-7105.json")" = 1 ] \
+    && pass "(32e) a delta whose record names NO review artifact is REFUSED (exit 3) and the record is untouched — a carry cannot re-bind a clean verdict with no evidence" \
+    || fail "(32e) a delta with no review artifact was re-bound (rc=$DRC_E, out='$OUT32E')"
 else
-  fail "(32a) fixture missing"; fail "(32b) fixture missing"; fail "(32c) fixture missing"
+  fail "(32a) fixture missing"; fail "(32b) fixture missing"; fail "(32c) fixture missing"; fail "(32d) fixture missing"; fail "(32e) fixture missing"
 fi
 
 # ── MUTATION PINS on real output ──────────────────────────────────────────
@@ -2301,11 +2342,13 @@ cd "$TMP" || true
 # contract in this suite too (a refused PATCH is a named rc 5, and the signed marker
 # survives in the pending file), and the (30x) cap vector no longer depends on the
 # marker's fate: its stub answers `.body`/PATCH so the post SUCCEEDS.
-# #10583: 185 -> 188 — section 32 drives the REAL `--delta` verb against a hermetic
-# git fixture (+3 assertions). Both counts are ADDITIVE: the body-marker durability
-# section and the delta section were written independently and neither replaces the
-# other's assertions, so the merged pin is 183 + 2 + 3.
-MIN_ASSERTIONS=188
+# #10583: 185 -> 190 — section 32 drives the REAL `--delta` verb against a hermetic git
+# fixture (32a-32c, +3 assertions); 32d pins the absent-head full triple (+1); 32e pins the
+# #10177 interaction — a delta whose record names NO review artifact must refuse (+1). Both
+# counts are ADDITIVE: the body-marker durability section and the delta section were written
+# independently and neither replaces the other's assertions, so the merged pin is
+# 183 + 2 + 5. MEASURED: `ALL PASSED (190 assertion(s))` after the rebase.
+MIN_ASSERTIONS=190
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
