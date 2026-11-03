@@ -2421,7 +2421,120 @@ if grep -qF 'if [ "$CC_DIFF" = "$DIFF_HASH" ]; then' "$CC_MUT"; then
 else
     bad "11.13j the mutation anchor 'if [ \"\\\$CC_DIFF\" = \"\\\$DIFF_HASH\" ]; then' is gone — re-anchor the mutant rather than dropping the pin"
 fi
-# (k) #10177 / #10522 (defect B): a CARRY that records NO PROOF is not a record.
+
+# ── 11.13k #3315 — THE CALLER-SUPPLIED RECORD PAIR (--recorded-diff/-head) ──
+# WHY THIS EXISTS. check-pipeline-compliance.sh's check (c) is a REQUIRED status
+# check and it runs on a CI runner, which has no $HOME/.pi/agent/reviews — it can
+# only see the PR BODY's marker. So two gates read one record and disagreed: the
+# producer said "the reviewed DIFF is UNCHANGED — carry it, do NOT re-review" from
+# the record FILE, while check (c) refused the SAME record because its marker
+# named an earlier head, and the only way through was minting an UNATTESTED marker
+# at the current head — the shape tortoise#7391 forbids ("naming the PR's current
+# head is not evidence"). The gate now hands in the marker's own
+# (head, diff_sha256) pair and this mode answers.
+#
+# ⛔ THE VECTORS THAT MATTER ARE THE NEGATIVE ONES. A supplied pair must go
+# through the SAME arms a record file does — carry / fresh / unreadable — and must
+# never be accepted where it could not be: a changed diff, an unreadable diff, a
+# non-identity digest (the empty-body constant), or any verb other than
+# --check-carry. If any of those passed, the gate would be able to carry a record
+# the merge gate refuses, which is the same two-gate disagreement inverted.
+run_check_carry_pair() { # <pr> <repo> <recorded-head> <recorded-diff> -> CC_OUT / CC_RC
+    CC_RC=0
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="${STUB_DIFF_FILE:-$CC_DIFF}" STUB_DIFF_FAIL="${STUB_DIFF_FAIL:-0}" \
+        STUB_HEAD_SHA="${STUB_HEAD_SHA:-$CC_HEAD}" \
+        bash "$RECORD" --check-carry "$1" "$2" --recorded-diff "$4" --recorded-head "$3" 2>"$T/cc-err")" || CC_RC=$?
+}
+CC_PRIOR="$(printf 'e%.0s' $(seq 1 40))"
+# (k1) THE CARRY, WITH NO RECORD FILE AT ALL — the CI-runner shape, and the whole
+# point of the flag: same digest, different head, content identical.
+rm -f "$CC_RDIR/424930.json" "$CC_FILE-424930.json"
+run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "$CC_SHA"
+assert_eq "$CC_RC" "0" "11.13k1 a SUPPLIED pair matching the live diff is a carry without any record file (exit 0)"
+assert_eq "$CC_OUT" "carry${CC_TAB}${CC_SHA}${CC_TAB}${CC_SHA}" "11.13k1 …and prints both digests, so the claim is checkable"
+assert_contains "$(cat "$T/cc-err")" "caller-supplied record pair" "11.13k1 …and says WHICH source decided (the marker, not this box's file)"
+# (k2) …and the SAME supplied shape with a CHANGED diff is still `fresh`: the flag
+# buys an answer, never a lenient one.
+run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "$CC_DIFF_B"
+assert_eq "$CC_RC" "1" "11.13k2 a supplied pair that does NOT match the live diff is 'fresh' (exit 1)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "fresh" "11.13k2 …reports 'fresh'"
+# (k3) AN UNREADABLE DIFF IS NEVER A CARRY, with or without a record file — the
+# fail-open this whole mode forbids ("could not read" → "unchanged").
+STUB_DIFF_FAIL=1 run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "$CC_SHA"
+assert_eq "$CC_RC" "3" "11.13k3 a supplied pair over an UNREADABLE diff is refused (exit 3)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13k3 …reports 'unreadable', never a carry"
+unset STUB_DIFF_FAIL
+# (k4) THE IDENTITY RULE STILL APPLIES: the empty-body constant would make every
+# record match every PR, so it is `nodigest`, not a carry — however it was supplied.
+run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+assert_eq "$CC_RC" "5" "11.13k4 the EMPTY-BODY constant is refused even when a caller supplies it (exit 5)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "nodigest" "11.13k4 …reports 'nodigest', not a carry"
+# (k5) THE SUPPLIED PAIR IS THE QUESTION, NOT A HINT — a record file on this box
+# must not override it. This box's record carries the OLD digest while the marker's
+# is the live one; the caller asked about the marker, so `carry` is the answer.
+cc_rec 424931 "$CC_STALE" "$CC_DIFF_B"
+run_check_carry_pair 424931 "$CC_REPO" "$CC_PRIOR" "$CC_SHA"
+assert_eq "$CC_RC" "0" "11.13k5 the supplied pair is answered even when a DIFFERENT record file exists (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "carry" "11.13k5 …so it short-circuits the file lookup instead of deferring to it"
+rm -f "$CC_FILE-424931.json"
+# (k6..k8) THE FLAG CANNOT BE SMUGGLED ONTO ANOTHER VERB, and a malformed value
+# is a usage error — never a silent pass. Each is its own exit-2, because each
+# would otherwise let a caller believe something was pinned/recorded that was not.
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-head "$CC_PRIOR" 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13k6 --recorded-head without --recorded-diff is refused (exit 2)"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" 424932 "$CC_HEAD" clean "$CC_REPO" --recorded-diff "$CC_SHA" 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13k7 --recorded-diff on a MINTING invocation is refused (exit 2)"
+assert_eq "$(ls "$CC_RDIR"/*424932* 2>/dev/null | wc -l | tr -d ' ')" "0" "11.13k7 …and no record was written"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-diff "deadbeef" 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13k8 a malformed --recorded-diff (not 64-hex) is refused (exit 2)"
+# (k9) THE MUTATION PIN FOR THE SHORT-CIRCUIT: with the supplied arm removed, k1
+# must fall back to the record lookup and answer `norecord` — proving k1 tests the
+# supplied arm rather than a path that happened to be taken anyway.
+CC_MUT2="$T/record-review-cc-supplied-mutant.sh"
+cp "$RECORD" "$CC_MUT2"
+if grep -q 'if \[ -n "\$RECORDED_DIFF" \]; then' "$CC_MUT2"; then
+    sed -i.bak 's/^  if \[ -n "\$RECORDED_DIFF" \]; then$/  if false; then/' "$CC_MUT2"
+    rm -f "$CC_MUT2.bak"
+    if cmp -s "$RECORD" "$CC_MUT2"; then
+        bad "11.13k9 the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
+    fi
+    CC_RC=0
+    # ⚠️ THE MUTANT'S ARGUMENT PARSER STILL ACCEPTS THE FLAGS (only the arm is
+    # disabled), so the flags must not be rejected as unknown here.
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="$CC_DIFF" STUB_HEAD_SHA="$CC_HEAD" \
+        bash "$CC_MUT2" --check-carry 424930 "$CC_REPO" --recorded-diff "$CC_SHA" --recorded-head "$CC_PRIOR" 2>/dev/null)" || CC_RC=$?
+    if [ "$CC_RC" = "4" ]; then
+        ok "11.13k9 mutation CAUGHT: with the supplied arm disabled the SAME request answers 'norecord' — so the arm is load-bearing"
+    else
+        bad "11.13k9 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — k1 does not test the supplied arm"
+    fi
+else
+    bad "11.13k9 the mutation anchor 'if [ -n \"\\\$RECORDED_DIFF\" ]; then' is gone — re-anchor it rather than dropping the pin"
+fi
+# (k10) A DIGEST-ONLY SUPPLIED PAIR IS A SUPPORTED SHAPE (review of #3315, P2):
+# a pre-#2982 marker carries no head, so the gate hands in --recorded-diff alone.
+# The content-identity verdict must be the same; only the head-binding arm and the
+# rebase arm are unavailable, and NOTHING may be invented from the absent head
+# (no `head` verdict, no `carry-patch` guess). Both directions are pinned here
+# because both are reachable from check (c).
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    STUB_DIFF_FILE="$CC_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$CC_HEAD" \
+    bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-diff "$CC_SHA" 2>"$T/cc-err")" || CC_RC=$?
+assert_eq "$CC_RC" "0" "11.13k10 --recorded-diff WITHOUT --recorded-head still carries on content identity (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "carry" "11.13k10 …reports 'carry' (the absent head invents nothing)"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    STUB_DIFF_FILE="$CC_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$CC_HEAD" \
+    bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-diff "$CC_DIFF_B" 2>"$T/cc-err")" || CC_RC=$?
+assert_eq "$CC_RC" "1" "11.13k10 …and a NON-matching digest without a head is 'fresh', never a carry"
+
+# (n) #10177 / #10522 (defect B): a CARRY that records NO PROOF is not a record.
 #     The measured shape is tortoise#10677's: `mint:"carried"` onto a head whose
 #     tree differed by 4 files/+178, with no `carry_arm` and no `evidence` — a
 #     verdict re-bound to code nobody reviewed, and nothing in the artifact a
@@ -2437,20 +2550,20 @@ CC_D64="$(printf 'c%.0s' {1..64})"
 printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carried_from":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
     "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_REPO" > "$CC_REC_10177"
 run_check_carry 424919 "$CC_REPO"
-assert_eq "$CC_RC" "4" "11.13k an UNPROVEN carry is NOT a record (exit 4)"
-assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13k …it answers norecord, not head/carry"
-assert_contains "$(cat "$T/cc-err")" "CARRY with NO recorded proof" "11.13k …and names the reason a reader can act on"
-# (k2) the SAME record WITH its proof binds at the head — the rule discriminates
+assert_eq "$CC_RC" "4" "11.13n an UNPROVEN carry is NOT a record (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13n …it answers norecord, not head/carry"
+assert_contains "$(cat "$T/cc-err")" "CARRY with NO recorded proof" "11.13n …and names the reason a reader can act on"
+# (n2) the SAME record WITH its proof binds at the head — the rule discriminates
 #      on provenance, not on the word "carried".
 printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carry_arm":"lane","reviewed_diff_sha256":"%s","evidence":"comment:1","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
     "$CC_SHA" "$CC_D64" "$CC_D64" "$CC_REPO" > "$CC_REC_10177"
 run_check_carry 424919 "$CC_REPO"
 if [ "${CC_OUT%%"$CC_TAB"*}" != "norecord" ] && [ "$CC_RC" != "4" ]; then
-    ok "11.13k2 the same carry WITH its proof is NOT denied as unproven (out=${CC_OUT%%"$CC_TAB"*}, rc=$CC_RC)"
+    ok "11.13n2 the same carry WITH its proof is NOT denied as unproven (out=${CC_OUT%%"$CC_TAB"*}, rc=$CC_RC)"
 else
-    bad "11.13k2 a PROVEN carry is still refused as unproven (rc=$CC_RC, out=$CC_OUT) — the rule keys on the word 'carried', not on provenance"
+    bad "11.13n2 a PROVEN carry is still refused as unproven (rc=$CC_RC, out=$CC_OUT) — the rule keys on the word 'carried', not on provenance"
 fi
-# (k3) MUTATION PIN — the unproven-carry rule must be LOAD-BEARING: with the
+# (n3) MUTATION PIN — the unproven-carry rule must be LOAD-BEARING: with the
 #      provenance test removed, the unproven record reads as a healthy head
 #      again. That is the false green defect B is about, so a pin that stays
 #      green on the mutant proves nothing.
@@ -2460,22 +2573,23 @@ if grep -qF 'if [ -z "$CC_ARM_F" ] || [ -z "$CC_EV_F" ]; then' "$CC_MUT_K"; then
     sed -i.bak 's/^[[:space:]]*if \[ -z "\$CC_ARM_F" \] || \[ -z "\$CC_EV_F" \]; then$/    if false; then/' "$CC_MUT_K"
     rm -f "$CC_MUT_K.bak"
     if cmp -s "$RECORD" "$CC_MUT_K"; then
-        bad "11.13k3 the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
+        bad "11.13n3 the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
     fi
     printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carried_from":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
         "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_REPO" > "$CC_REC_10177"
     run_check_carry 424919 "$CC_REPO" "$CC_MUT_K"
     if [ "${CC_OUT%%"$CC_TAB"*}" != "norecord" ]; then
-        ok "11.13k3 MUTATION CAUGHT: without the provenance test the UNPROVEN carry stops reading as 'norecord' (it answers ${CC_OUT%%"$CC_TAB"*}) — so 11.13k is load-bearing"
+        ok "11.13n3 MUTATION CAUGHT: without the provenance test the UNPROVEN carry stops reading as 'norecord' (it answers ${CC_OUT%%"$CC_TAB"*}) — so 11.13n is load-bearing"
     else
-        bad "11.13k3 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — 11.13k cannot fail, so it proves nothing"
+        bad "11.13n3 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — 11.13n cannot fail, so it proves nothing"
     fi
 else
-    bad "11.13k3 the mutation anchor 'if [ -z \"\\\$CC_ARM_F\" ] || [ -z \"\\\$CC_EV_F\" ]; then' is gone — re-anchor the pin rather than dropping it"
+    bad "11.13n3 the mutation anchor 'if [ -z \"\\\$CC_ARM_F\" ] || [ -z \"\\\$CC_EV_F\" ]; then' is gone — re-anchor the pin rather than dropping it"
 fi
 rm -f "$CC_REC_10177"
 CC_HEAD="$CC_HEAD_SAVED"
-unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_FILE CC_MUT CC_TAB CC_NONDIFF CC_CAP406
+
+unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_FILE CC_MUT CC_TAB CC_NONDIFF CC_CAP406 CC_PRIOR CC_MUT2
 
 
 # ─────────────────────────────────────────────────────────────────────────
