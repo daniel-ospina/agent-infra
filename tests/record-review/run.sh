@@ -2161,6 +2161,12 @@ PE="$(pair_of "$Q/e.diff")"
 #       name the review artifact it inherits (tortoise#10677): a delta IS a carry, so it inherits
 #       that rule rather than routing around it — one predicate, not two. The composed suite was
 #       RED here before this arm was pinned, which is the evidence that the rule is load-bearing.
+#   (e) a LEGACY `<pr>.json` record takes the SAME path. This is the same merge, one layer down: the
+#       delta resolves the legacy filename ("one definition of the record"), and the provenance
+#       guard read `$FILE` alone — so a legacy record was ACCEPTED by the delta, proved unchanged,
+#       and then refused with "the superseded record carries no evidence", which is FALSE for that
+#       input and unescapable (`--delta` refuses `--evidence` by design): a paid re-review for the
+#       exact case #10583 removes. A fresh-context reviewer found it by measuring, not by reading.
 # The stub for THIS section answers what the verb reads (base sha, head sha, the diff, and an
 # EMPTY check surface), which the suite-wide stub above does not.
 echo "── 32. --delta reads the reviewed head and verdict from the RECORD"
@@ -2256,8 +2262,19 @@ if [ -d "$DELTA_REPO" ]; then
     && [ "$(grep -c "\"head_sha\":\"$D_REVIEWED\"" "$DR_HOME/.pi/agent/reviews/fixture-repo-7104.json")" = 1 ] \
     && pass "(32d) a delta whose superseded record names NO evidence is REFUSED — a carry cannot inherit an artifact that was never named" \
     || fail "(32d) an evidence-less clean verdict was re-bound by delta (rc=$DRC_D, out='$OUT32D')"
+  # (e) A LEGACY record must take the SAME path, WITH its evidence. No repo-qualified file exists for
+  # this arm, so the delta's own legacy fallback is the only way in — and the guard must read the
+  # record the verb resolved, not `$FILE`. Before the fix this arm exited 3 with a message claiming
+  # the record carried no evidence, which it plainly did.
+  printf '{"pr":7105,"head_sha":"%s","diff_sha256":"%s","mint":"fresh","evidence":"comment:7000005","verdict":"clean","reviewed_at":"2026-11-02T00:00:00Z"}\n' \
+    "$D_REVIEWED" "$(printf 'x' | openssl dgst -sha256 | awk '{print $NF}')" \
+    > "$DR_HOME/.pi/agent/reviews/7105.json"
+  FIX_DELTA_HEAD="$D_MERGED"; delta_run 7105 "$TMP/out32e"; OUT32E="$(cat "$TMP/out32e")"; DRC_E="$DR_RC"
+  [ "$DRC_E" -eq 0 ] && [ "$(grep -c '"mint":"delta"' "$DR_HOME/.pi/agent/reviews/fixture-repo-7105.json" 2>/dev/null)" = 1 ] \
+    && pass "(32e) a LEGACY <pr>.json record re-binds through the same arms — the provenance guard reads the record the verb resolved" \
+    || fail "(32e) a legacy record carrying evidence was refused by the delta path (rc=$DRC_E, out='$OUT32E')"
 else
-  fail "(32a) fixture missing"; fail "(32b) fixture missing"; fail "(32c) fixture missing"; fail "(32d) fixture missing"
+  fail "(32a) fixture missing"; fail "(32b) fixture missing"; fail "(32c) fixture missing"; fail "(32d) fixture missing"; fail "(32e) fixture missing"
 fi
 
 # ── MUTATION PINS on real output ──────────────────────────────────────────
@@ -2324,8 +2341,9 @@ cd "$TMP" || true
 # section 32 (#3245/#10583) adds 3 more: 185 -> 188 — the delta verb is pinned
 # against a real git fixture ((32a) re-binds, (32b) refuses an authored commit,
 # (32c) refuses a non-clean record); (32d) pins the #3327 x #10583 INTERACTION the
-# merge of the two features created: 188 -> 189.
-MIN_ASSERTIONS=189
+# merge of the two features created, and (32e) the legacy-filename arm of that interaction:
+# 188 -> 190.
+MIN_ASSERTIONS=190
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

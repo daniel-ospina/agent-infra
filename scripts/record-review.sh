@@ -3941,8 +3941,25 @@ TMP="$FILE.tmp"
 #      combination tortoise#10677 produced, and no reader could have caught it.
 if [ -n "$CARRY_ARM" ] && [ -z "$EVIDENCE_VERIFIED" ]; then
   CARRY_EVIDENCE=""
-  if [ -f "$FILE" ]; then
-    CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+  # ⛔ READ THE RECORD THIS INVOCATION ACTUALLY RESOLVED (#10583 × #10177 — found by the MERGE of the
+  # two features, not by either alone). `--delta` resolves its superseded record through the
+  # repo-qualified path AND the legacy `<pr>.json` fallback ("one definition of the record", shared
+  # with --check-carry); this guard used to read `$FILE` alone. So on a box whose record predates
+  # #426's repo-qualified key, the delta ACCEPTED the record, proved the authored diff unchanged —
+  # and was then refused HERE with "the superseded record carries no evidence", a sentence that is
+  # FALSE for that input, in a direction the caller cannot escape (`--delta` refuses `--evidence` by
+  # design), landing on "review the current head and record it fresh": a paid full re-review for the
+  # exact case #10583 exists to remove. `$D_REC` is the SAME definition the delta verb resolved, and
+  # it is STRICTER than `$FILE` (it applies the embedded-repo collision rule), so seeding from it
+  # closes the gap without widening the guard.
+  CARRY_EVIDENCE_SRC=""
+  if [ "$DELTA" -eq 1 ] && [ -n "${D_REC:-}" ] && [ -f "${D_REC:-}" ]; then
+    CARRY_EVIDENCE_SRC="$D_REC"
+  elif [ -f "$FILE" ]; then
+    CARRY_EVIDENCE_SRC="$FILE"
+  fi
+  if [ -n "$CARRY_EVIDENCE_SRC" ]; then
+    CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$CARRY_EVIDENCE_SRC" 2>/dev/null | command head -1 || true)"
   fi
   # ⛔ THE ARM SELECTS THE PAIR (fresh-review cycle 3): a marker may only be named
   # by the arm that CONSUMED it. The lane arm proves itself from the commits and
