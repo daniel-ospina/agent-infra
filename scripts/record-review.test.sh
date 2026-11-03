@@ -2450,6 +2450,18 @@ if [ "${CC_OUT%%"$CC_TAB"*}" != "norecord" ] && [ "$CC_RC" != "4" ]; then
 else
     bad "11.13k2 a PROVEN carry is still refused as unproven (rc=$CC_RC, out=$CC_OUT) — the rule keys on the word 'carried', not on provenance"
 fi
+# (k4) #10583 × #10177 — a `mint:"delta"` record IS a carry, so the same provenance rule
+#      must reach it. A delta re-binds a verdict minted at ANOTHER head exactly as a
+#      `carried` record does (the only difference is how the reviewed head was found), so
+#      exempting it would make the delta verb the ONE carry path that can re-bind a `clean`
+#      onto a tree with nothing in the record a reader could check — the tortoise#10677
+#      shape. The record here carries a full `delta` object and still names NO arm and NO
+#      evidence, so the refusal must come from the missing PROOF, not from the mint word.
+printf '{"pr":424920,"head_sha":"%s","diff_sha256":"%s","mint":"delta","carried_from":"%s","delta":{"from":"%s","to":"%s","proved":"lane","arm":"lane"},"verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+    "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_FILE-424920.json"
+run_check_carry 424920 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13k4 an UNPROVEN delta is NOT a record either (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13k4 …it answers norecord, not head — a delta cannot escape the provenance rule"
 # (k3) MUTATION PIN — the unproven-carry rule must be LOAD-BEARING: with the
 #      provenance test removed, the unproven record reads as a healthy head
 #      again. That is the false green defect B is about, so a pin that stays
