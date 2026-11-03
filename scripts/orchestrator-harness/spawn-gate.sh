@@ -2335,7 +2335,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
             if [ "$_uvdev_cache" = "$_uvdev_wt" ]; then _uvsame=yes; else _uvsame=no; fi
           fi
         fi
-        echo "[uv-env] link_mode=${UV_LINK_MODE:-<unset>} cache_dir=${UV_CACHE_DIR:-<unset>} defaulted=${UV_ENV_DEFAULTED:-none} same_fs=${_uvsame} (rule 2: a cross-filesystem cache degrades hardlinks to a full copy; '?' means the device reads FAILED and nothing was compared; rule 3: the link mode is never unset on a cell — #2159)" >> "$log"
+        echo "[uv-env] link_mode=${UV_LINK_MODE:-<unset>} cache_dir=${UV_CACHE_DIR:-<unset>} defaulted=${UV_ENV_DEFAULTED:-none} same_fs=${_uvsame} (rule 2: a cross-filesystem cache degrades hardlinks to a full copy; '?' means NOT COMPARED — either no readable target or a device read failed; rule 3: the link mode is never unset on a cell — #2159; residual: on a clone-capable filesystem hardlink shares inodes where uv's own default would CoW — deliberate, `uv-env.sh`'s recorded choice)" >> "$log"
       else
         echo "[uv-env] WARN $label: uv-env.sh is readable but defines no uv_env_apply (a truncated or version-skewed copy) — this spawn runs with NO pin (#2159). Redeploy the harness." >> "$log"
       fi

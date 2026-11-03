@@ -181,13 +181,16 @@ ck "CELL bring-up: applies the pin before keys.env (so an operator pin still win
    'grep -q "uv_env_apply" "$BRINGUP" && grep -q "check_uv_env" "$BRINGUP" && grep -q "^      check_uv_env" "$BRINGUP"'
 ck "CELL supervisor: exports the pin (the env every lane snapshots) and reports it in check" \
    'grep -q "uv_env_apply" "$SUP" && grep -q "uv_env_report --estate" "$SUP"'
-# ⛔ THE SPAWN SEAM (agent-infra#3380). `uv-env.sh`'s header enumerates the paths it was wired into —
-# launchd, cell bring-up, the cell supervisor, the per-lane env snapshot — and `run_agent()` was NOT
-# among them, although it is the seam EVERY launcher routes through. Measured on pi-cell-1/pi-cell-4
-# 2026-11-03: `UV_LINK_MODE` unset both ambient and after `keys.env`, and one worktree's `.venv` at
-# 5,705 MB (a full COPY under uv's `clone` default) on a box whose warm cache should have made it
-# near-free. So the assertion is on LIVE lines (comments quote the helper's name and would make a
-# grep-only arm vacuous) and on ORDER (applied BEFORE the launch, or the child never sees it).
+# ⛔ THE SPAWN SEAM (agent-infra#2159). `uv-env.sh`'s header enumerates the paths its pin was wired into
+# — launchd, cell bring-up, the cell supervisor, the per-lane env snapshot — and `run_agent()` was NOT
+# among them. It is the seam `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` route through; it is
+# NOT every launcher (`lane-exec.sh` execs `pi` itself and carries its own block — asserted below).
+# Measured on pi-cell-1/pi-cell-4 2026-11-03: `UV_LINK_MODE` unset both ambient and after `keys.env`,
+# which violates the policy doc's rule 3. ⛔ THIS SUITE DELIBERATELY CLAIMS NO SIZE: a `du` of a venv
+# cannot distinguish the hardlinked class from the full-copy one (58x apart, per the same doc), so the
+# measured 5,705 MB may sit in either. The defect is the ABSENT PIN, not the size.
+# The assertions are on LIVE lines (comments quote the helper's name and would make a grep-only arm
+# vacuous) and on ORDER (applied BEFORE the launch, or the child never sees it).
 SPAWN_LIVE="$(awk '!/^[[:space:]]*#/' "$SPAWN")"
 ck "SPAWN SEAM: run_agent applies the pin on live lines, not just in a comment" \
    '[ "$(printf "%s" "$SPAWN_LIVE" | grep -c "uv_env_apply")" -ge 1 ]'
@@ -207,8 +210,10 @@ ck "LANE-EXEC: the direct-exec lane path carries the same pin BEFORE its own exe
    'L="$(awk "!/^[[:space:]]*#/" "$LANEEXEC")"; printf "%s" "$L" | grep -q "uv_env_apply" && [ "$(printf "%s\\n" "$L" | grep -n "uv_env_apply" | head -1 | cut -d: -f1)" -lt "$(printf "%s\\n" "$L" | grep -n "^ *exec pi -p" | head -1 | cut -d: -f1)" ]'
 ck "RETENTION RULE 2: the seam reports whether the cache shares the worktree filesystem (cross-fs degrades to a copy)" \
    'printf "%s" "$SPAWN_BLOCK" | grep -q "same_fs="'
-ck "LANE-EXEC: …and EVERY skip path is loud — a silent skip reads as an older harness with no block" \
-   '[ "$(grep -c "uv-env\] WARN lane-exec" "$LANEEXEC")" -ge 2 ] && grep -q "defines no uv_env_apply" "$LANEEXEC"'
+ck "LANE-EXEC: …and EVERY skip path is loud — PER ARM, so silencing any one of them reds" \
+   'LB="$(awk "/THE UV PIN, BEFORE/{f=1} f{print} f&&/exec pi -p/{exit}" "$LANEEXEC")";   printf "%s" "$LB" | grep -q "not readable beside this helper" &&   printf "%s" "$LB" | grep -q "neither CELL_HOME nor HOME" &&   printf "%s" "$LB" | grep -q "defines no uv_env_apply"'
+ck "SPAWN SEAM: …and its version-skew arm (readable helper, no uv_env_apply) is enforced too" \
+   'printf "%s" "$SPAWN_BLOCK" | grep -q "defines no uv_env_apply"'
 ck "RETENTION RULE 2: …and it does NOT apply a root-level cache when no base home exists" \
    'printf "%s" "$SPAWN_BLOCK" | grep -q "neither CELL_HOME nor HOME is set"'
 # ⛔ A DEVICE COMPARISON WHOSE READS BOTH FAIL MUST NOT ANSWER `yes`. `stat -c %d` is GNU-only; on
