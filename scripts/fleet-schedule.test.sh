@@ -2005,6 +2005,284 @@ grep -qE '^  (ERROR|FAIL) .*com.test.resident-dict' <<<"$out" \
   || bad "the mutation reddens something else; the dict-form fixture is not what grades this: $out"
 
 
+# 18o — the two `load_jobs` OSError hardenings are PINNED, not decorative. An earlier revision of
+# this change carried them with NO test: removing BOTH left the suite fully green (PASS=233 FAIL=0),
+# so the guards that headline the commit ("ENOSPC/EACCES can no longer escape load_jobs") graded
+# nothing. Two arms, each a named refusal rather than a traceback, each mutated back to prove the
+# case is what grades it:
+#   (a) RETIRED is unreadable (mode 000) — must be a named ScheduleError, never a raw OSError, and
+#       no verb may die with a traceback (main() catches only ScheduleError).
+#   (b) TEMPLATES_DIR cannot be listed — same requirement.
+# `chmod 000` does not stop root, so both arms SKIP there; a SKIP is honest and visible, a false
+# PASS is not.
+if [ "$(id -u)" = "0" ]; then
+  skip "18o(a) RETIRED unreadable → named refusal (root can read anything)"
+  skip "18o(b) TEMPLATES_DIR unlistable → named refusal (root can read anything)"
+else
+  for arm in retired listdir; do
+    D18O="$T/18o-$arm"
+    mkdir -p "$D18O/tpl"
+    mkplist "$D18O/tpl" com.test.echo "$T/echo.spec"
+    printf '# nothing retired\n' > "$D18O/tpl/RETIRED"
+    MUT18O="$T/mut-18o-$arm.py"
+    python3 - "$SCHED" "$MUT18O" "$arm" <<'PY18O'
+import sys
+src = open(sys.argv[1]).read()
+arm = sys.argv[3]
+if arm == "retired":
+    old = (
+        '    try:\n'
+        '        with open(retired_path) as fh:\n'
+    )
+    new = (
+        '    if True:  # the PRE-FIX reading, restored by the mutation\n'
+        '        with open(retired_path) as fh:\n'
+    )
+else:
+    old = (
+        '    try:\n'
+        '        entries = sorted(os.listdir(TEMPLATES_DIR))\n'
+        '    except OSError as exc:\n'
+    )
+    new = (
+        '    if True:  # the PRE-FIX reading, restored by the mutation\n'
+        '        entries = sorted(os.listdir(TEMPLATES_DIR))\n'
+        '    if False:\n'
+    )
+assert old in src, "the 18o mutation target moved (%s)" % arm
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PY18O
+    # 000 on RETIRED isolates the RETIRED read; 0111 on the DIRECTORY isolates the listdir call —
+    # a dir you may enter but not read lets a KNOWN filename (RETIRED) be opened, so the RETIRED
+    # guard stays green and only `os.listdir` can fail. Using 000 for both made the listdir arm
+    # fire the RETIRED guard instead, i.e. the case graded the wrong guard (caught by its own
+    # mutation).
+    if [ "$arm" = "retired" ]; then
+      chmod 000 "$D18O/tpl/RETIRED"
+    else
+      chmod 0111 "$D18O/tpl"
+    fi
+    out="$(TEMPLATES_DIR="$D18O/tpl" python3 "$SCHED" --check 2>&1)"; rc=$?
+    # restore before ANY assertion so a failure cannot leave an unreadable dir behind
+    [ "$arm" = "retired" ] && chmod 644 "$D18O/tpl/RETIRED" || chmod 755 "$D18O/tpl"
+    grep -q 'cannot read\|cannot list' <<<"$out" \
+      && ok "18o($arm) is a NAMED refusal, not a traceback" \
+      || bad "18o($arm) did not name the failure: rc=$rc $out"
+    grep -q 'Traceback' <<<"$out" \
+      && bad "18o($arm) died with a traceback (main() must catch it): $out" \
+      || ok "18o($arm) never reaches a traceback"
+    [ "$rc" -ne 0 ] && ok "18o($arm) exits non-zero ($rc)" \
+      || bad "18o($arm) exited 0 on an unreadable declaration set"
+    # MUTATION: restore the pre-fix reading and the case must go RED (a traceback, not a name)
+    if [ "$arm" = "retired" ]; then
+      chmod 000 "$D18O/tpl/RETIRED"
+    else
+      chmod 0111 "$D18O/tpl"
+    fi
+    mout="$(TEMPLATES_DIR="$D18O/tpl" python3 "$MUT18O" --check 2>&1)"; mrc=$?
+    [ "$arm" = "retired" ] && chmod 644 "$D18O/tpl/RETIRED" || chmod 755 "$D18O/tpl"
+    grep -q 'cannot read\|cannot list' <<<"$mout" \
+      && bad "18o($arm) MUTATION still produced the named refusal — the case grades nothing: $mout" \
+      || ok "18o($arm) MUTATION (guard removed) no longer names the failure (rc=$mrc)"
+  done
+fi
+
+
+# 18p — A FAILED STAT ON THE PUBLISH VERIFY IS NOT "SOMEONE ELSE'S LOCK". The publish re-verify
+# (`os.stat` after the pid write) skips the candidate when the file is no longer ours. An
+# `except OSError: continue` conflated "the path is GONE" with "the stat itself failed" (EIO,
+# ESTALE, an EACCES flip landing after the create — the fault 18n already constructs), so a caller
+# ABANDONED a lock it still held, with its OWN LIVE PID inside it. Every later `acquire_lock` then
+# reads a live holder and answers "held": the job logs `SKIP <job>: already running (lock held)`
+# for a lock this very process created, and never runs again until the loop restarts. That is the
+# wedged-job class this change exists to close, so the arm is pinned in both directions:
+#   (a) a transient stat failure  → the caller KEEPS the lock (path returned, our pid inside)
+#   (b) a really-vanished file    → the caller re-examines and re-creates it (never wedged)
+out18p="$(python3 - "$SCHED" "$T/state18p" <<'PY18P' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18p", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+L = os.path.join(d, "locks")
+real_stat, real_unlink = os.stat, os.unlink
+
+# (a) EIO on the FIRST verify stat: we still hold the inode, so the lock must be kept.
+calls = {"n": 0}
+def flaky(path, *a, **k):
+    if str(path).endswith("eio.lock"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = flaky
+r = m.acquire_lock("eio")
+os.stat = real_stat
+pid = None
+p = os.path.join(L, "eio.lock")
+if os.path.exists(p):
+    pid = open(p).read().strip()
+if r and pid == str(os.getpid()):
+    print("RESULT EIO KEPT")
+else:
+    print("RESULT EIO LOST result=%r pid_in_lock=%r" % (r, pid))
+
+# (b) the file really vanishes between close and verify: the retry loop must re-create it.
+calls2 = {"n": 0}
+def vanish(path, *a, **k):
+    if str(path).endswith("gone.lock") and calls2["n"] == 0:
+        calls2["n"] += 1
+        real_unlink(path)
+        raise FileNotFoundError(2, "No such file or directory")
+    return real_stat(path, *a, **k)
+os.stat = vanish
+r2 = m.acquire_lock("gone")
+os.stat = real_stat
+held = None
+p2 = os.path.join(L, "gone.lock")
+if r2 and os.path.exists(p2):
+    held = open(p2).read().strip() == str(os.getpid())
+print("RESULT ENOENT %s" % ("RECREATED" if held else "WEDGED result=%r" % (r2,)))
+PY18P
+)"
+grep -q 'RESULT EIO KEPT' <<<"$out18p" \
+  && ok "18p(a) a transient stat failure keeps the lock we hold (was: abandoned → job wedged)" \
+  || bad "18p(a) abandoned a lock it still held on a transient stat error: $out18p"
+grep -q 'RESULT ENOENT RECREATED' <<<"$out18p" \
+  && ok "18p(b) a really-vanished lock is recreated, not left wedged" \
+  || bad "18p(b) did not recover a vanished lock: $out18p"
+# MUTATION: restore the PRE-FIX `except OSError: continue` and case (a) must REDDEN. Without this
+# the case could pass on an implementation that never abandons anything for any reason.
+MUT18P="$T/mut-18p.py"
+python3 - "$SCHED" "$MUT18P" <<'PYMUT'
+import sys
+src = open(sys.argv[1]).read()
+old = (
+    '            try:\n'
+    '                cur = os.stat(path)\n'
+    '            except FileNotFoundError:\n'
+    '                continue\n'
+    '            except OSError:\n'
+    '                return path\n'
+)
+new = (
+    '            try:\n'
+    '                cur = os.stat(path)\n'
+    '            except OSError:  # the PRE-FIX reading, restored by the mutation\n'
+    '                continue\n'
+)
+assert old in src, "the 18p mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUT
+mout18p="$(python3 - "$MUT18P" "$T/state18p-mut" <<'PYMU' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18pmut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+L = os.path.join(d, "locks")
+real_stat = os.stat
+calls = {"n": 0}
+def flaky(path, *a, **k):
+    if str(path).endswith("eio.lock"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = flaky
+r = m.acquire_lock("eio")
+os.stat = real_stat
+pid = None
+p = os.path.join(L, "eio.lock")
+if os.path.exists(p):
+    pid = open(p).read().strip()
+print("MUTATION %s" % ("STILL-KEPT (case grades nothing)"
+                       if (r and pid == str(os.getpid()))
+                       else "RED result=%r pid_in_lock=%r" % (r, pid)))
+PYMU
+)"
+grep -q 'MUTATION RED' <<<"$mout18p" \
+  && ok "18p MUTATION (pre-fix except OSError) abandons the lock — the case discriminates" \
+  || bad "18p MUTATION stayed green, so the case grades nothing: $mout18p"
+
+
+# 18q — `os.fstat` ON THE CREATE LEG CAN FAIL, AND THE HANDLER READS ITS RESULT. An earlier revision
+# dropped the `own = None` initialiser as "tidiness" and the suite stayed fully green (PASS=244
+# FAIL=0) because nothing injects an fstat fault. A stat failure on a full or dying filesystem
+# (EIO/ESTALE) is exactly this change's fault class, and without the initialiser it became
+# `UnboundLocalError` — a coding error replacing the real cause — raised BEFORE the identity-checked
+# cleanup, so the 0-byte lock the create had just made was left behind. Pinned both ways:
+#   (a) an fstat fault surfaces the REAL OSError (never UnboundLocalError)
+#   (b) the lock left behind is self-healing: the next `acquire_lock` steals it
+out18q="$(python3 - "$SCHED" "$T/state18q" <<'PY18Q' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18q", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+real_fstat = os.fstat
+def bad_fstat(fd):
+    raise OSError(5, "Input/output error")
+os.fstat = bad_fstat
+try:
+    m.acquire_lock("fstatfault")
+    print("RESULT NO-RAISE")
+except UnboundLocalError as exc:
+    print("RESULT UNBOUND %s" % exc)
+except OSError as exc:
+    print("RESULT REAL-OSERROR %s" % exc)
+finally:
+    os.fstat = real_fstat
+print("LOCK-LEFT %s" % os.path.exists(os.path.join(d, "locks", "fstatfault.lock")))
+# (b) the residue must be self-healing, not a wedge
+r = m.acquire_lock("fstatfault")
+print("RESULT SELFHEAL %s" % ("OK" if r else "WEDGED"))
+PY18Q
+)"
+grep -q 'RESULT REAL-OSERROR' <<<"$out18q" \
+  && ok "18q(a) an fstat fault surfaces the real OSError" \
+  || bad "18q(a) an fstat fault did not surface the real cause: $out18q"
+grep -q 'RESULT UNBOUND' <<<"$out18q" \
+  && bad "18q(a) an fstat fault became UnboundLocalError (the initialiser is load-bearing): $out18q" \
+  || ok "18q(a) never becomes UnboundLocalError"
+grep -q 'RESULT SELFHEAL OK' <<<"$out18q" \
+  && ok "18q(b) the lock residue self-heals on the next attempt" \
+  || bad "18q(b) an fstat fault left a wedge: $out18q"
+MUT18Q="$T/mut-18q.py"
+python3 - "$SCHED" "$MUT18Q" <<'PYMUTQ'
+import sys
+src = open(sys.argv[1]).read()
+old = '            own = None\n            try:\n                own = os.fstat(fd)\n'
+new = '            try:\n                own = os.fstat(fd)\n'
+assert old in src, "the 18q mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTQ
+mout18q="$(python3 - "$MUT18Q" "$T/state18q-mut" <<'PYMUQ' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18qmut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+real_fstat = os.fstat
+def bad_fstat(fd):
+    raise OSError(5, "Input/output error")
+os.fstat = bad_fstat
+try:
+    m.acquire_lock("fstatfault")
+    print("MUTATION NO-RAISE")
+except UnboundLocalError:
+    print("MUTATION RED")
+except OSError:
+    print("MUTATION STILL-REAL")
+finally:
+    os.fstat = real_fstat
+PYMUQ
+)"
+grep -q 'MUTATION RED' <<<"$mout18q" \
+  && ok "18q MUTATION (initialiser removed) raises UnboundLocalError — the case discriminates" \
+  || bad "18q MUTATION did not redden, so the case grades nothing: $mout18q"
+
+
 echo
 echo "───────────────────────────────────────────────────────────────"
 echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

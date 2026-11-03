@@ -1027,6 +1027,14 @@ def acquire_lock(label):
             # the disk-full cause never appeared in the log at all.
             raise
         else:
+            # ⛔ THE INITIALISER IS LOAD-BEARING, NOT TIDINESS. `os.fstat(fd)` can itself fail
+            # (EIO/ESTALE on a full or dying filesystem — the fault class this change is about), and
+            # the handler below reads `own`. Without this line a stat fault became
+            # `UnboundLocalError: cannot access local variable 'own'` — a coding error replacing the
+            # real cause — and because it is raised BEFORE the identity-checked cleanup, the 0-byte
+            # lock the create just made was left behind instead of being removed. Measured: removing
+            # it turns `OSError: [Errno 5]` into `UnboundLocalError`; `if own is not None` then never
+            # reaches the cleanup the comment three lines above promises.
             own = None
             try:
                 own = os.fstat(fd)
@@ -1070,11 +1078,23 @@ def acquire_lock(label):
             # injection: with the create→write window widened, both callers were told they held it.
             # Re-verifying ownership here makes the loser LOSE: it re-examines (bounded by the
             # retry count) and answers "held" to the racer that actually owns the lock now.
+            # ⛔ A FAILED STAT IS NOT "SOMEONE ELSE'S LOCK". `except OSError: continue` conflated the
+            # two: one transient EIO/ESTALE (or an EACCES flip landing after the create — the very
+            # fault test 18n constructs) made this caller abandon a lock it DOES still hold, with its
+            # own LIVE pid inside it. Measured at the pre-fix head: RESULT None, the lock left on
+            # disk holding OUR pid, so every later `acquire_lock` answered "held" and the job logged
+            # `SKIP <job>: already running (lock held)` for a lock this very process had created —
+            # a wedged job, which is the class this whole change exists to close. ENOENT is the only
+            # answer that means "not ours": the path is gone, so the retry loop is what answers it.
+            # Any other failure means we cannot PROVE a replacement, and `O_EXCL` says the create we
+            # won was not contested — so we still hold it, and we return it.
             try:
                 cur = os.stat(path)
-            except OSError:
+            except FileNotFoundError:
                 continue
-            if own is None or (cur.st_dev, cur.st_ino) != (own.st_dev, own.st_ino):
+            except OSError:
+                return path
+            if cur.st_dev != own.st_dev or cur.st_ino != own.st_ino:
                 continue
             return path
         # Probe: refuse a LIVE holder, steal a dead or unusable one, retry a vanished one.
@@ -2236,8 +2256,16 @@ def main(argv):
         # there is the same "no scheduler, nothing to retry" state this change exists to close.
         # The specific shapes are named by file where they are known (see `load_jobs`); this arm
         # only guarantees no verb dies without saying what broke.
-        print("FAIL: %s: cannot read the job declarations (%s: %s)"
-              % (mode, type(exc).__name__, exc), file=sys.stderr)
+        # ⛔ IT MUST NOT CLAIM THE DECLARATIONS FAILED WHEN THEY DID NOT. Measured with an
+        # unwritable STATE dir (the EACCES/ENOSPC case this change exists for): the blanket arm
+        # reported "cannot read the job declarations (PermissionError: .../state/templates-dir)"
+        # when the failing surface was `remember_templates_dir()` — pointing the operator at the
+        # wrong subsystem on the recovery path that matters most. A ScheduleError already NAMES its
+        # own file, so only a non-declaration failure needs different wording; both still exit 1,
+        # so nothing reads this as a success.
+        # (No `isinstance(exc, ScheduleError)` arm here: the `except ScheduleError` above already
+        # consumes those, so it could only ever be dead code that LOOKS like a live distinction.)
+        print("FAIL: %s: %s: %s" % (mode, type(exc).__name__, exc), file=sys.stderr)
         return 1
 
 
