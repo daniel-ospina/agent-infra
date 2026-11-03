@@ -4575,6 +4575,55 @@ else
     ok "14.1b the check-runs read carries its parameters in the query string (transport)"
 fi
 
+# 14.1c THE LINE-ANCHORED PRESENCE PREDICATE (agent-infra#3168). Both the append
+#     decision and MARKER_PRESENT moved from `grep -qF` to `grep -qxF`, so they
+#     match the gate's own `^…$` admission of a body marker. A body that merely
+#     CITES the marker mid-line is the discriminating case: unanchored `-qF` read
+#     it as PRESENT, so the recorder PATCHed nothing and set MARKER_PRESENT=1 on
+#     a line the gate rejects — the evidence never reached the channel the gate
+#     reads, and the stale pre-evidence run was not re-run either, so a correctly
+#     reviewed PR stayed red with its verdict nowhere admissible. 14.1 is this
+#     vector's NEGATIVE CONTROL (the marker alone on its line ⇒ no PATCH): the two
+#     differ ONLY in anchoring, so a revert to `-qF` reddens 14.1c while 14.1
+#     stays green — which is what makes the pair pin the predicate rather than
+#     the fixture. The marker text is SEEDED from the recorder's own post (never
+#     hand-written) so its diff=/sig= contract cannot drift from the script's.
+QB_PR=424326
+QB_SEED="$(seed_marker_body "$QB_PR")"
+QB_LINE=""
+if [ -n "$QB_SEED" ]; then
+    QB_LINE="$(printf '%s\n' "$QB_SEED" | grep -E '^review recorded: ' | head -1 || true)"
+fi
+if [ -n "$QB_LINE" ]; then
+    ok "14.1c the seed produced a marker line to quote (prerequisite)"
+else
+    bad "14.1c no marker line in the seeded body — the anchor vector would judge a fixture, not the predicate"
+fi
+# Same bytes, NOT alone on their line: a lane citing the attestation in prose.
+QB_BODY="A lane cited the attestation inline: $QB_LINE — see above.
+"
+STUB_BODY="$QB_BODY" run_record_633 "$QB_PR" "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":901}]'
+if grep -qF -- "-X PATCH" "$LOG"; then
+    ok "14.1c a mid-line marker does not suppress the append (anchored presence test)"
+else
+    bad "14.1c a mid-line marker SUPPRESSED the append — the unanchored -qF is back (log: $(cat "$LOG"))"
+fi
+QB_NEWBODY="$(printf '%s' "$RECORD_CAP633" | jq -r '.body // empty' 2>/dev/null || true)"
+if [ -n "$QB_LINE" ] && grep -qxF -- "$QB_LINE" <<<"$QB_NEWBODY"; then
+    ok "14.1c …and the posted body carries the marker on a line of its OWN (gate-admissible)"
+else
+    bad "14.1c the posted body carries no anchored marker line (capture: $QB_NEWBODY)"
+fi
+# The OTHER half of the same predicate: MARKER_PRESENT is re-read from the body
+# AFTER the post (BODY_NOW). One-sided anchoring (append fixed, MARKER_PRESENT
+# not) posts the marker and then believes it is absent, skipping the #633 rerun.
+if grep -qF -- "actions/jobs/901/rerun" "$LOG"; then
+    ok "14.1c MARKER_PRESENT sees the appended line — the stale run is re-run, not skipped"
+else
+    bad "14.1c one-sided anchor: marker posted but MARKER_PRESENT missed it ⇒ the stale run was never re-run (log: $(cat "$LOG"))"
+fi
+
 # 14.2 Fresh record (marker absent) with a stale FAILURE on the head: posts the
 #     marker AND re-runs the failed gate job in the same call.
 STUB_BODY="PR body" run_record_633 424321 "$SHA" \
