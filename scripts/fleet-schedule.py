@@ -1108,8 +1108,12 @@ def acquire_lock(label):
                 cur = os.stat(path)
             except FileNotFoundError:
                 # Same reasoning: one unreliable filesystem can answer ENOENT for a file it holds.
-                # A second ENOENT is a real deletion (the loop re-creates the lock); anything else
-                # resolves to OURS, which cannot wedge.
+                # A second ENOENT is treated as a real deletion (the loop re-creates the lock).
+                # ⛔ NOT "anything else resolves to OURS, which cannot wedge" — that was this
+                # comment's earlier claim and it is FALSE, measured in both branches it covered: a
+                # live foreign inode resolved to None, and a live racer alongside a failed re-ask
+                # resolved to a path naming the RACER. Any non-ENOENT outcome ASKS the ownership
+                # question below (read the pid, keep only if it is ours); nothing here may assume.
                 try:
                     cur = os.stat(path)
                 except FileNotFoundError:
