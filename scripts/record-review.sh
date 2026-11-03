@@ -2529,7 +2529,7 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     CC_EV_F="$(cc_field "$CC_REC" evidence)"
     if [ -z "$CC_ARM_F" ] || [ -z "$CC_EV_F" ]; then
       printf 'norecord\t-\t%s\n' "${DIFF_HASH:--}"
-      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… is a CARRY (mint='${CC_MINT}') with NO recorded proof (carry_arm='${CC_ARM_F:-}', evidence='${CC_EV_F:-}') — it asserts a verdict minted at another head without recording which arm proved the artifact unchanged, or what review artifact it rests on. Nothing in it shows it covers the head that would merge, so it is treated as NO RECORD (the shape tortoise#10677 produced: a clean verdict carried across 4 files/+178 with no provenance). Remedy: re-record at the current head and let the recorder's carry arms decide — they refuse when the reviewed artifact moved, and record the proof when it did not: record-review.sh $PR <current head> <same verdict> ${REPO:-owner/repo}" >&2
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… is a CARRY with NO recorded proof (mint='${CC_MINT}', carry_arm='${CC_ARM_F:-}', evidence='${CC_EV_F:-}') — it asserts a verdict minted at another head without recording which arm proved the artifact unchanged, or what review artifact it rests on. Nothing in it shows it covers the head that would merge, so it is treated as NO RECORD (the shape tortoise#10677 produced: a clean verdict carried across 4 files/+178 with no provenance). Remedy: re-record at the current head and let the recorder's carry arms decide — they refuse when the reviewed artifact moved, and record the proof when it did not: record-review.sh $PR <current head> <same verdict> ${REPO:-owner/repo}" >&2
       exit 4
     fi ;;
   esac
