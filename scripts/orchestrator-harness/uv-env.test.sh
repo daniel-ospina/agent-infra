@@ -36,7 +36,10 @@ SUP="$HERE/../cloud-cell-supervisor.sh"
 # The SPAWN seam: `run_agent()` in spawn-gate.sh is what `lane.sh`, `fix-one.sh` and
 # `nonblocking-dispatch.sh` all route through, so the pin must be applied THERE and before the launch.
 SPAWN="$HERE/spawn-gate.sh"
-for f in "$LIB" "$WT" "$INSTALL" "$TPL" "$BRINGUP" "$SUP" "$SPAWN"; do
+# `lane-exec.sh` execs `pi` itself (it does NOT route through `run_agent`), and it IS a lane path that
+# can materialise a per-worktree `.venv`, so it carries its own copy of the block.
+LANEEXEC="$HERE/lane-exec.sh"
+for f in "$LIB" "$WT" "$INSTALL" "$TPL" "$BRINGUP" "$SUP" "$SPAWN" "$LANEEXEC"; do
   [ -f "$f" ] || { echo "FATAL: $f not found (run from the harness checkout)" >&2; exit 2; }
 done
 
@@ -192,8 +195,30 @@ ck "SPAWN SEAM: …and exports both keys, so the child inherits them" \
    'printf "%s" "$SPAWN_LIVE" | grep -q "export UV_CACHE_DIR UV_LINK_MODE"'
 ck "SPAWN SEAM: …and applies it BEFORE the pi launch line (afterwards is a no-op)" \
    '[ "$(printf "%s\n" "$SPAWN_LIVE" | grep -n "uv_env_apply" | head -1 | cut -d: -f1)" -lt "$(printf "%s\n" "$SPAWN_LIVE" | grep -n "pi -p --provider" | head -1 | cut -d: -f1)" ]'
-ck "SPAWN SEAM: …and it can never refuse a spawn (an unreadable helper degrades to no pin)" \
-   '[ "$(printf "%s" "$SPAWN_LIVE" | grep -c "|| true")" -ge 1 ]'
+# ⛔ SCOPED TO THE BLOCK, NOT THE FILE. The first cut asserted `grep -c "|| true" -ge 1` over the whole
+# script, which cannot fail on a file that keeps eight other live `|| true`s — a review measured it
+# staying GREEN with this entire block deleted. The assertions below extract the seam's own lines.
+SPAWN_BLOCK="$(awk '/THE UV PIN, APPLIED AT THE SPAWN SEAM/{f=1} f{print} f&&/pi -p --provider/{exit}' "$SPAWN")"
+ck "SPAWN SEAM: the block exists and is bounded (seam marker to the launch line)" \
+   '[ -n "$SPAWN_BLOCK" ] && printf "%s" "$SPAWN_BLOCK" | grep -q "uv_env_apply"'
+ck "SPAWN SEAM: …and an unusable helper is LOUD, not a silent drop (else it reads as an older harness)" \
+   'printf "%s" "$SPAWN_BLOCK" | grep -q "uv-env.sh not readable beside this helper"'
+ck "LANE-EXEC: the direct-exec lane path carries the same pin BEFORE its own exec (it bypasses run_agent)" \
+   'L="$(awk "!/^[[:space:]]*#/" "$LANEEXEC")"; printf "%s" "$L" | grep -q "uv_env_apply" && [ "$(printf "%s\\n" "$L" | grep -n "uv_env_apply" | head -1 | cut -d: -f1)" -lt "$(printf "%s\\n" "$L" | grep -n "^ *exec pi -p" | head -1 | cut -d: -f1)" ]'
+ck "RETENTION RULE 2: the seam reports whether the cache shares the worktree filesystem (cross-fs degrades to a copy)" \
+   'printf "%s" "$SPAWN_BLOCK" | grep -q "same_fs="'
+ck "LANE-EXEC: …and EVERY skip path is loud — a silent skip reads as an older harness with no block" \
+   '[ "$(grep -c "uv-env\] WARN lane-exec" "$LANEEXEC")" -ge 2 ] && grep -q "defines no uv_env_apply" "$LANEEXEC"'
+ck "RETENTION RULE 2: …and it does NOT apply a root-level cache when no base home exists" \
+   'printf "%s" "$SPAWN_BLOCK" | grep -q "neither CELL_HOME nor HOME is set"'
+# ⛔ A DEVICE COMPARISON WHOSE READS BOTH FAIL MUST NOT ANSWER `yes`. `stat -c %d` is GNU-only; on
+# BSD/macOS it exits 1 with EMPTY output, so two guarded substitutions compare EQUAL — measured on the
+# hub: `same_fs=yes` from zero successful reads. The block must carry the BSD fallback AND require a
+# non-empty read on both sides before it claims anything.
+ck "RETENTION RULE 2: the device read has a BSD fallback (stat -c is GNU-only; macOS exits 1 with no output)" \
+   'printf "%s" "$SPAWN_BLOCK" | grep -q "stat -f %d"'
+ck "RETENTION RULE 2: …and an empty/partial read answers '?' rather than an affirmative yes" \
+   'printf "%s" "$SPAWN_BLOCK" | grep -q "if \[ -n \"\$_uvdev_cache\" \] && \[ -n \"\$_uvdev_wt\" \]"'
 ck "the estate report states distinct-vs-per-name bytes (not a per-worktree du sum)" \
    'grep -q "du_total_counting_links" "$HERE/../worktree-disk-probe.sh" && grep -q "\[distinct\]" "$HERE/../worktree-disk-probe.sh"'
 
