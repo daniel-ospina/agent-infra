@@ -96,9 +96,20 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # including the `78`s that refuse a half-synced `$O` before a single gate runs — those are exactly the
 # lanes that vanished with nothing said. The exits ABOVE this point are argument validation (78/64),
 # where no lane log exists yet and there is nothing to append to.
+# ⛔ THE HANDOVER ORDER IS STAMP-THEN-REMOVE, AND THAT IS THE FIX (review round 6, P2, measured): the first
+# cut removed the verdict file and THEN stamped the owner token, so a previous run whose trap fired in that
+# window still matched its own (old) token and wrote ITS verdict back — and the new dispatch, having already
+# removed the file, then stamped a token without clearing it. Readers saw the old run's verdict as the current
+# one: the stale-flag failure this mechanism exists to close, surviving in the dispatch order rather than in
+# the trap. Stamping first means any older trap that fires during the handover already fails the comparison.
+# ⛔ AND A FAILED STAMP FAILS OPEN (same review): if the token cannot be written — a transient ENOSPC/EACCES
+# that clears before the lane exits — this run must still publish ITS OWN verdict rather than compare against
+# the previous run's token and silently publish none. A reader is then wrong for at most one dispatch
+# overlap; the alternative is a lane that RAN reading as "still working" for ever.
 LANE_RUN_TOKEN="${N:-0}.$$.$(date +%s 2>/dev/null || printf 0)"
+LANE_OWNER_OK=0
+printf '%s\n' "$LANE_RUN_TOKEN" > "$O/logs/lane-$N.owner" 2>/dev/null && LANE_OWNER_OK=1
 rm -f "$O/logs/lane-$N.outcome" 2>/dev/null || true
-printf '%s\n' "$LANE_RUN_TOKEN" > "$O/logs/lane-$N.owner" 2>/dev/null || true
 LANE_OUTCOME=""; LANE_OUTCOME_REASON=""; LANE_TERMINAL_DONE=0; LANE_LAST_STATUS=0
 lane_outcome() { # <done|refused|failed|died> <reason-token>  — FIRST writer wins
   [ -n "${LANE_OUTCOME:-}" ] && return 0
@@ -126,14 +137,15 @@ lane_terminal_line() {
   r="$(printf '%s' "$r" | tr '\n\r\t' '   ')"
   line="outcome=$o reason=$r lane=$N rc=${LANE_LAST_STATUS:-?} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
   printf '%s\n' "$line" | tee -a "$O/logs/lane-$N.log" 2>/dev/null || printf '%s\n' "$line"
-  # The per-run verdict (see the contract above): overwritten here, removed AND re-owned at the next
-  # dispatch, so an ABSENCE — not a stale line, and not an older live run's line — is what "no verdict yet"
-  # looks like. The owner check is what stops a still-running previous attempt from claiming this run's
-  # file when its own trap finally fires.
-  if [ "$(cat "$O/logs/lane-$N.owner" 2>/dev/null)" = "${LANE_RUN_TOKEN:-}" ]; then
-    printf '%s\n' "$line" > "$O/logs/lane-$N.outcome" 2>/dev/null || true
+  # The per-run verdict (see the contract above): re-owned at dispatch, so its ABSENCE — not a stale line, and
+  # not an older live run's line — is what "no verdict yet" looks like. ⛔ THE COMPARISON ONLY DECIDES WHEN IT
+  # CAN BE TRUSTED: it is consulted only if THIS run managed to stamp its token (`LANE_OWNER_OK=1`); an
+  # unstampable dispatch fails OPEN and publishes its own verdict, because a lane that ran must not read as
+  # "still working" on account of a write that failed hours earlier.
+  if [ "${LANE_OWNER_OK:-0}" = "1" ] && [ "$(cat "$O/logs/lane-$N.owner" 2>/dev/null)" != "${LANE_RUN_TOKEN:-}" ]; then
+    echo "[lane $N] (outcome not written to logs/lane-$N.outcome: a LATER dispatch of #$N owns that file — this line is the transcript, that file is the current run's verdict)" >> "$O/logs/lane-$N.log" 2>/dev/null || true
   else
-    echo "[lane $N] (outcome not written to logs/lane-$N.outcome: another dispatch of #$N now owns it — this line is the transcript, that file is the CURRENT run's verdict)" >> "$O/logs/lane-$N.log" 2>/dev/null || true
+    printf '%s\n' "$line" > "$O/logs/lane-$N.outcome" 2>/dev/null || true
   fi
   return 0
 }
