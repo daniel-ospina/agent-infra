@@ -827,11 +827,16 @@ set_cooldown_ms() {
 # park every lane for the whole window, however long it was, with nothing re-deriving it).
 wait_for_cooldown() {
   local left="${1:-0}" rem chunk announced=0 spent=0
+  # ⛔ WHAT THIS CALL ACTUALLY SLEPT IS PUBLISHED, NOT LOCAL. The budget is combined across BOTH
+  # arms (`AGENT_GH_GATE_BUDGET_S` is what callers size their own timeouts against), so a pre-call
+  # wait that is not added to `SPENT_MS` lets the retry arm spend the SAME budget again — measured
+  # at 7.1 s of wall clock under a 4 s budget, i.e. the stall this change exists to remove.
+  WAITED_MS=0
   case "$left" in ''|*[!0-9]*) left=0 ;; esac
   while rem="$(cooldown_remaining_ms)"; do
     case "$rem" in ''|*[!0-9]*) break ;; esac
     [ "$rem" -gt 0 ] || break
-    [ $(( spent + rem )) -gt "$left" ] && return 2
+    [ $(( spent + rem )) -gt "$left" ] && { WAITED_MS=$spent; return 2; }
     if [ "$announced" -eq 0 ]; then
       gate_note "the account is in a shared rate-limit window — waiting $(( (rem + 999) / 1000 ))s before this call"
       announced=1
@@ -839,9 +844,10 @@ wait_for_cooldown() {
     chunk="$rem"
     [ "$chunk" -gt 60000 ] && chunk=60000
     [ $(( spent + chunk )) -gt "$left" ] && chunk=$(( left - spent ))
-    [ "$chunk" -le 0 ] && return 2
+    [ "$chunk" -le 0 ] && { WAITED_MS=$spent; return 2; }
     sleep_ms "$chunk"
     spent=$(( spent + chunk ))
+    WAITED_MS=$spent
   done
   return 0
 }
@@ -864,8 +870,9 @@ wait_out_window() {
   fi
   left=$(( BUDGET_MS - SPENT_MS ))
   [ "$left" -lt 0 ] && left=0
-  wait_for_cooldown "$left"
-  [ "$?" -eq 2 ] || return 0
+  wait_for_cooldown "$left"; wrc=$?
+  SPENT_MS=$(( SPENT_MS + ${WAITED_MS:-0} ))
+  [ "$wrc" -eq 2 ] || return 0
   rem="$(cooldown_remaining_ms)" || rem=0
   gate_note "a shared rate-limit window has $(( (rem + 999) / 1000 ))s left, which is BEYOND this call's $(( BUDGET_MS / 1000 ))s budget — refusing without issuing the call (EX_TEMPFAIL). Raise AGENT_GH_GATE_BUDGET_S to wait it out, or re-run when it clears"
   return 1
@@ -1204,7 +1211,14 @@ refusal_class() {
   case "${REV_REMAINING:-}" in
     0)  REV_CLASS="primary" ;;
     '') REV_CLASS="undetermined" ;;
-    *)  REV_CLASS="secondary" ;;
+    # ⛔ A NON-ZERO `x-ratelimit-remaining` IS NOT EVIDENCE OF A BURST BY ITSELF. GitHub stamps
+    # `x-ratelimit-*` onto PERMISSION denials too (measured: a real 404/403 carried
+    # `X-Ratelimit-Remaining: 3955`), and this layer now captures those headers by DEFAULT — so an
+    # unconditional `secondary` here re-admitted exactly what the old prose requirement kept out: a
+    # `403 Resource not accessible by integration` retried 3 times on a MUTATION and parked in a
+    # box-wide window it never earned (measured against the pre-change shim: 1 invocation, no
+    # window). Only the refusal's OWN PROSE can say a burst happened.
+    *)  if [ "${REV_PROSE:-0}" -eq 1 ]; then REV_CLASS="secondary"; else REV_CLASS="not-a-limit"; fi ;;
   esac
   return 0
 }
@@ -1287,6 +1301,8 @@ rate_limited() {
   # replayed error body) would neither retry NOR write the shared cooldown, with no signal.
   # The same construction is forbidden above in find_real_gh for exactly this reason.
   grep -Eqi 'api rate limit|secondary rate limit|abuse detection|http 429|status code:? 429|retry-after:' "$f" 2>/dev/null && prose=1
+  # Published for `refusal_class`, which must not read a bare `remaining: <non-zero>` as a burst.
+  REV_PROSE=$prose
   refusal_evidence "$f" >/dev/null 2>&1
   refusal_class
   case "${REV_CLASS:-undetermined}" in
@@ -1514,10 +1530,6 @@ run_paced() {
     wait "$CHILD_PID"
     rc=$?
     CHILD_PID=""
-    CHILD_PID=$!
-    wait "$CHILD_PID"
-    rc=$?
-    CHILD_PID=""
     # ⛔ THE DEBUG DUMP IS *OURS*, SO IT IS REMOVED BEFORE ANYTHING READS OR REPLAYS THE CHILD'S
     # STDERR — ON EVERY PATH, INCLUDING SUCCESS. A successful call whose only stderr was that dump
     # must replay NOTHING (`gh-rest/gh` parses `2>&1` as JSON), and a `SilentError` rc=1 — whose whole
@@ -1525,6 +1537,7 @@ run_paced() {
     # rate-limit arm, which needs the headers. When the caller set GH_DEBUG, nothing is stripped:
     # those lines are the caller's own request.
     plainf="$WORKDIR/plain.$$"
+    strip_failed=0
     if [ "${DEBUG_OURS:-0}" -eq 1 ]; then
       : > "$plainf" 2>/dev/null
       if [ -s "$errf" ]; then
@@ -1542,7 +1555,17 @@ run_paced() {
           /^\* Request took/ { dump = 0; next }
           dump { next }
           /^(\* |> |< )/ { next }
-          { print }' "$errf" 2>/dev/null > "$plainf" || cp "$errf" "$plainf" 2>/dev/null
+          { print }' "$errf" 2>/dev/null > "$plainf" || strip_failed=1
+        # ⛔ A FAILED STRIP FAILS TOWARD EMPTY, NEVER TOWARD THE DUMP. The fallback used to be
+        # `cp "$errf" "$plainf"`, which on an awk failure replayed the WHOLE raw capture — the
+        # response body, and for a mutation the REQUEST BODY — onto a call that SUCCEEDS, destroying
+        # both properties this filter exists for (byte-clean stderr for `gh-rest/gh`'s `2>&1 | jq`,
+        # and not leaking the capture). A control whose job is to remove a secret must never fall
+        # back to publishing it; the failure is named in events.log instead.
+        if [ "${strip_failed:-0}" -eq 1 ]; then
+          : > "$plainf" 2>/dev/null
+          gate_note "the debug dump could not be stripped from this call's stderr (awk failed); the attempt's stderr was DROPPED rather than replayed raw"
+        fi
         chmod 600 "$plainf" 2>/dev/null
       fi
     else
@@ -1608,6 +1631,10 @@ run_paced() {
       transport_note "transport retry $ttries/$TRANSPORT_ATTEMPTS ($treason)"
       release_slot
       sleep_ms "$wait_ms"
+      # Charged like every other wait: the budget is the SUM this call sleeps, not the rate-limit
+      # share of it. (Two literals, <= 4 s — it cannot move the ceiling on its own, but a budget that
+      # silently omits one arm is not the ceiling its own comment promises.)
+      SPENT_MS=$(( SPENT_MS + wait_ms ))
       continue
     fi
     # Name the exhaustion — but ONLY when the call ACTUALLY died of transport, and only with the

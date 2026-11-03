@@ -1757,6 +1757,77 @@ grep -q 'BEYOND this call' "$TMP/rl-f-err" 2>/dev/null \
   && pass "  …and the refusal reaches the caller on stderr, naming the budget" \
   || fail "the local refusal said nothing on stderr: $(head -2 "$TMP/rl-f-err" | tr '\n' ' ')"
 
+# (g) ⛔ A PERMISSIONS 403 IS NOT A RATE LIMIT, EVEN WHEN `x-ratelimit-*` IS ON IT. GitHub stamps
+# those headers on EVERY response (measured: a plain 403 carried `X-Ratelimit-Remaining: 3955`), so a
+# non-zero `remaining` is not evidence of a burst. Reading it as one retried a MUTATION three times
+# and wrote a box-wide window it never earned — #3230's own symptom, from a far commoner trigger
+# than a limit (review of #3230, P1). The control is the pre-change shim: ONE invocation, no window.
+cat > "$TMP/rl-perm" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf '* Request to https://api.github.com/user\n' >&2
+printf '> GET /user HTTP/1.1\n' >&2
+printf '< HTTP/2.0 403 Forbidden\n' >&2
+printf '< X-Ratelimit-Limit: 5000\n' >&2
+printf '< X-Ratelimit-Remaining: 4832\n' >&2
+printf '< X-Ratelimit-Reset: %s\n' "$(( $(date +%s) + 900 ))" >&2
+printf '{"message":"Resource not accessible by integration"}\n' >&2
+printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-perm"
+GDIR="$(gate_dir rl-perm)"; GCOUNT="$TMP/rl-g-count"; GTIMES="$TMP/rl-g-times"; GHSEEN="$TMP/rl-g-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+AGENT_GH_REAL="$TMP/rl-perm" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_RETRY_BASE=1 AGENT_GH_GATE_BUDGET_S=20 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>"$TMP/rl-g-err"; rc=$?
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "a permission 403 carrying x-ratelimit-* is ONE invocation, not a retried limit" \
+  || fail "a permission 403 was retried as a rate limit ($(cat "$GCOUNT" 2>/dev/null) invocation(s)) — #3230's symptom, from the commonest trigger"
+ls "$GDIR"/cooldown.* >/dev/null 2>&1 \
+  && fail "a permission 403 wrote a box-wide cooldown ($(ls "$GDIR"/cooldown.* | head -1))" \
+  || pass "  …and it writes NO box-wide window"
+case "$(cat "$GDIR/events.log" 2>/dev/null)" in
+  *'shared rate-limit window'*) fail "events.log names a shared rate-limit window for a permissions refusal" ;;
+  *) pass "  …and nothing claims a rate-limit window" ;;
+esac
+
+# (h) ⛔ THE BUDGET IS THE SUM THIS CALL SLEEPS, NOT EACH ARM'S OWN SHARE (#3230 review, P1). A
+# pre-call wait that is never charged to SPENT_MS lets the retry arm spend the SAME budget again —
+# measured at 7.1 s of wall clock under a 4 s budget, i.e. the stall, twice.
+cat > "$TMP/rl-combined" <<'GHEOF'
+#!/usr/bin/env bash
+c=$(cat "$GCOUNT" 2>/dev/null || echo 0); c=$(( c + 1 )); printf '%s' "$c" > "$GCOUNT"
+date +%s >> "$GTIMES"
+printf '* Request at 2026-11-02 00:00:00 +0000 m=+0.01\n' >&2
+printf '> GET /user HTTP/1.1\n' >&2
+printf '< HTTP/2.0 403 Forbidden\n' >&2
+printf '< Retry-After: 3\n' >&2
+printf 'gh: You have exceeded a secondary rate limit (HTTP 403)\n' >&2
+exit 1
+GHEOF
+chmod +x "$TMP/rl-combined"
+GDIR="$(gate_dir rl-combined)"; GCOUNT="$TMP/rl-h-count"; GTIMES="$TMP/rl-h-times"; GHSEEN="$TMP/rl-h-ghseen"
+rm -f "$GCOUNT"; : > "$GTIMES"
+# A live 3 s shared window in front of a refusal that justifies 3 s more, under a 4 s budget: each
+# arm fits on its own, so only a CHARGED pre-call wait stops them being slept back to back.
+_until=$(( $(date +%s) * 1000 + 3000 ))
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+_h0="$(date +%s)"
+AGENT_GH_REAL="$TMP/rl-combined" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_BUDGET_S=4 \
+  GCOUNT="$GCOUNT" GTIMES="$GTIMES" GHSEEN="$GHSEEN" \
+  bash "$SHIM" api /user >/dev/null 2>/dev/null; rc=$?
+_h1="$(date +%s)"
+[ $(( _h1 - _h0 )) -le 5 ] \
+  && pass "a 3 s window + a 3 s refusal under a 4 s budget → $(( _h1 - _h0 ))s total, not ~6 s" \
+  || fail "each arm was given the full budget: $(( _h1 - _h0 ))s of sleep under a 4 s ceiling"
+[ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
+  && pass "  …and the retry is not taken once the budget is spent" \
+  || fail "the call retried after its budget was spent ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"
   exit 1
