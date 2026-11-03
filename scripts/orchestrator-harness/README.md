@@ -217,6 +217,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `merged-not-closed.sh` | the question no other tool could answer — which OPEN issues already have a MERGED PR (tortoise#8468). Without it, finished work sits in the priority queue looking untouched |
 | `cycle-record.sh` | the self-dispatch proof: one record per controller cycle, and a verdict that refuses to call an absent or stale record healthy (§9) |
 | `repo-slug.sh` | the one `owner/name` resolver the controller and the candidate pool read; its one deliberate exception (`cloud-cell-supervisor.sh`'s own copy) is held in lockstep by `test-gates.sh`, not by prose |
+| `key-gate.sh` | the MODEL-CREDENTIAL assertion, immediately before `pi` is spawned (agent-infra#3331). `key_gate_assert <label> [<home>] [<provider>]` resolves the env var the lane provider's `apiKey` template names (`models.json` → `${PI_LANE_PROVIDER:-deepseek}`, the same default and the same file `pi` reads) and asserts THIS process's environment holds a non-blank value — the environment `run_agent` is about to hand the agent. It REFUSES with **82** (its own code: the remedy is neither a brief to re-author (80), nor a worktree to fix (72), nor load to wait out (75)) and names the variable, the provider, the `models.json` and every candidate file: `${ENV_FILE:-$HOME/keys.env}`, `$HOME/pi-keys.env`, `$CELL_HOME/keys.env` and the ACCOUNT home's `keys.env`. ⛔ **That last one is the whole point of the gate — measured 2026-11-02 on two cells**: a lane runs with `HOME=<CELL_HOME>` (required — the operational layer lives there) while the credential lives under the ACCOUNT home, so the one setting that makes the operational layer work is the setting that hides the credential; `pi` printed `No API key found for the selected model.`, exited, and the lane was gone with a log that just stopped. ⛔ **POLARITY: it refuses ONLY on a positive reading** — no `models.json`, a literal `apiKey`, an unparseable file, no python3 or a provider `pi` authenticates itself all print `check=skipped` and refuse NOTHING (a datum we cannot read is not a verdict; the same rule `worker-terminal.sh`'s credential gate states for #2210), and `key-gate.test.sh` drives BOTH resolvers over one fixture matrix and requires identical answers so the two cannot drift. `LANE_KEY_GATE=0` is the declared escape for a fixture that stubs `pi`, and it writes its own audited `check=skipped` line; sourced by `lane.sh` (fail-loud, `exit 78` without it). Its pass line claims `check=ok` and never `result=` (#2935: a check is not an outcome — the lane's outcome is the terminal line above) |
 | `repo-target.sh` | the ONE repo-identity assertion for a dispatch (agent-infra#2724/#2694): the target is an argument (`--repo`/`--repo-dir`, **no default**), and after the worktree exists its own `origin` and `git-common-dir` are compared with that target. A mismatch, an unreadable origin, or an absent target REFUSES (exit 72) naming **both slugs**; the branch half refuses a branch the target repo does not have, so `cannot materialise <branch>` is never the first line a human reads. Sourced by `lane.sh`, `dispatch-merge.sh`, `fix-one.sh` and `adopt-fix.sh`; a `[repo-target]` line per assertion (identity, and branch when a branch is asserted) makes a wrong-repo lane a grep — a dispatch that refuses after its identity line reads `result=REFUSED` on its LAST line. ⛔ A mirror/`file://` origin cannot name its repo, so such a checkout refuses EVERY batch (72) and `OR=` cannot clear it: the assertion compares the artifact with the target. The remedy is `git -C <checkout> remote set-url origin https://github.com/<owner>/<name>.git`; there is deliberately no env override |
 | `reviewer-preflight.sh` | discloses the reviewer requirement BEFORE the lane works (agent-infra#2148), instead of the lane discovering it by being refused at the rail |
 | `gh-limit.py` | the serialiser every harness `gh` call passes through (agent-infra#1988): four boxes act as ONE account, so one rate-limit bucket is shared and nothing else queues the calls |
@@ -737,6 +738,15 @@ shell is stripped by tmux, so every review and fixer still dies `No API key foun
 agent-infra#1896: it has its own false-block risk (a value that lives only in the key FILE, or a cell
 provisioned for a provider other than deepseek), so it is tracked on the issue rather than asserted
 here. Do not read `CELL CAN RUN A CONTROLLER` as proof that a worker can authenticate.
+
+⛔ **AND THAT HOLE NOW HAS A LANE-SIDE GATE, ONE LAYER DOWN (agent-infra#3331).** `cell-lane-preflight.sh`
+answers "can this box complete one call and RETURN", and it cannot see a lane that starts with no key —
+it sources the key file for its OWN probe. `key-gate.sh` (sourced by `lane.sh`, called immediately
+before `pi` is spawned) asserts that the LANE's environment, after `lane-env.sh` has sourced the box's
+file, holds a value for the provider's credential; a lane with none REFUSES with **82** instead of
+starting and dying. It is a positive-reading gate: where the variable name cannot be resolved it says
+`check=skipped` and refuses nothing. So the cell report and the lane's own log now answer different
+questions, and the second one is the one that decides whether work happens.
 
 The `.worktrees/` gitignore is not probed at all, and
 `tools/collision_preflight.py` is not a dependency `check` refuses on by that name: the only by-name
@@ -1480,6 +1490,7 @@ manifest path above is what a box that is copied into every deploy should use.
 | `CYC` | `240` | seconds between cycles |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
 | `LANE_TIMEOUT` | `3300` | wall-clock limit on a lane's `pi` run (s). Raised from 2400 when a lane took ownership of its merge (#2029) — the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
+| `LANE_KEY_GATE` | `1` | whether `lane.sh` asserts the model credential before it spawns `pi` (#3331). `0` is the DECLARED ESCAPE — for a fixture that stubs `pi` and would otherwise be a false red on a key-less box and a false green on a provisioned one — and it is never silent: the lane log carries `[key-gate] … check=skipped reason=LANE_KEY_GATE=0`, so a box that sets it leaves a trace. There is deliberately no finer knob: a gate that can be pointed at a different credential is a gate that can be satisfied by the wrong one |
 | `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
@@ -2463,7 +2474,6 @@ stalled fleet and a human reading a report.
 
 **How to see why a lane died** — one line, three surfaces (the lane log, stdout, and
 `<lane log>.lanebound`):
-
 ```text
 [lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=1204s wall_bound=3300s
   idle_bound=1200s silent=1204s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
@@ -2481,6 +2491,42 @@ sent (`TERM`, or a following `[lane-bound] KILL` line if the lane ignored the 15
 `grep '\[lane-bound\] VERDICT' $O/logs/lane-<N>.log` answers "was this lane wedged or slow?"
 without re-reading a transcript — the question that previously had no answer at all, because the log is
 truncated on rerun and the CPU counter dies with the process.
+
+**And the LAST line of every lane log is its OUTCOME** (agent-infra#3331), written by a trap in
+`lane.sh` so it fires on every exit — a normal end, a pre-flight refusal, a failing agent, a `set -u`
+abort, and (through the explicit signal handlers) a `TERM`/`INT`/`HUP`:
+
+```text
+outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
+```
+
+- `done` — the agent ran and returned 0 (`reason=agent-exit-0`), or the run was a dry run
+  (`reason=dry-run`).
+- `refused` — a gate refused BEFORE any agent started, and `reason` NAMES it: `load-gate`, `disk-gate`,
+  `fork-gate`, `land-backlog`, `capability-gate`, `harness-skew`, `brief-gate`, `repo-target:…`,
+  `key-gate:credential-missing:<VAR>` (see `key-gate.sh` below). `outcome=refused` alone would repeat
+  the defect this line removes: those six remedies are mutually exclusive (#1765, #2293).
+- `failed` — the agent ran and returned non-zero (`reason=agent-exit-<rc>`).
+- `died` — the lane was ENDED (`reason=signal:TERM`) or reached its end with NOTHING recorded
+  (`reason=no-outcome-recorded:exit-<rc>`): the half-synced-`$O` shape, a crash, an early `78`.
+
+⛔ **This is what makes "a lane that does not run" visible at all.** Measured 2026-11-02 on two cells:
+the log simply STOPPED (a print-mode `pi` buffers, so a silent log reads exactly like a working lane),
+the dispatcher's `nohup … &` had already returned so its record said "launched", and `pgrep -f "pi -p"`
+matched the diagnostic's own command line — three false-positive signals over one event. One line,
+written by whatever path the lane exited through, is what answers it:
+
+```bash
+# which lane logs never said what happened?  (0 is the target; an empty list is the pass)
+grep -L '^outcome=' "$O"/logs/lane-*.log
+# what did THIS lane do?
+grep '^outcome=' "$O/logs/lane-<N>.log" | tail -1
+```
+
+`grep -L` is the right reader for "is any log unaccounted for" because it asks about the WHOLE file; the
+`tail -1` form is right for a single lane because a child process killed after the lane exits can still
+land its own last words in the log (the lane's line is written last by the lane, which is not the same
+claim as "nothing in the world can append afterwards").
 
 **Two observations, and when to expect the kill.** A lane is judged on the sample interval
 `--poll`, default `min(60 s, idle/4)` — ~3 `ps` calls a minute per lane, because on this box the FLEET
