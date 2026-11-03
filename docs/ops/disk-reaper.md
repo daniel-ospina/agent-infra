@@ -1147,8 +1147,9 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **11 cases and 15 mutants,
-26 outcomes per box** (each passed, failed, or — for (f)'s default-glob half on a box with real runner
-roots — SKIPPED, so a run always states which of the three it produced) — also mutation-checked. Run
+26 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
+the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
 against the PRE-CHANGE tree (the base commit's
 `disk-reaper.sh` beside this owner) it reports **9 passed, 17 failed, 0 skipped**, and against this tree
 **26 passed, 0 failed, 0 skipped**: the discrimination is measured both ways, not asserted. (The 17 red on
@@ -1221,22 +1222,32 @@ and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 run on a box that HAS real runner roots — its whole subject is the default list, so there is nothing to
 pin the seam to — and recording it as a passing check meant a CELL (which skips it) printed the same
 tally as a laptop on which every arm really ran. The skipped arms are now counted on
-their own line with their reason, so the two runs cannot be mistaken for each other (measured on a box
-told to have real runner roots; `<entry>` is the entry point under test and the second is the mutant
-copy the suite makes in its own `$T`; ⚠️ that run predates case **(j)** and case **(k)** AND the
-`verdict_runner_work=`/`unmeasurable_runner_work=` mutants, so its pass count is not this revision's —
-with the current **26** outcomes and the same two skips the line reads `24 passed, 0 failed, 2 skipped`.
-The skip COUNT and the reasons below are what was
-measured there; the `24` is arithmetic against a suite that has since grown, not a re-measurement):
+their own line with their reason, so the two runs cannot be mistaken for each other. Measured AT THIS HEAD,
+on a box told to have real runner roots so the skip path is taken (`<entry>` is the entry point under test;
+`mut-f` and `mut-u` are the mutant copies the suite makes in its own `$T`):
 
 ```
-  20 passed, 0 failed, 2 skipped
+  26 passed, 0 failed, 3 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
+    skipped: (f) default-glob half, entry point <suite $T>/mut-u/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
 ```
 
-(two, not one: `(f)` runs twice, against the real entry point and its mutant. The source assertion that
-follows the skip still runs on both, so a broken default list still reddens a cell.)
+**How those two numbers compose — `skipped` is ORTHOGONAL, so the arithmetic must not be "balanced".**
+`passed + failed` is the OUTCOME count (26 here: one line per case and per mutant). `skipped` is an
+independent count of arms that did not run: `skip()` neither increments nor decrements `PASS` — it records
+a reason in a file the outer runner reads at the end — and the arm's own pass line still lands, because the
+assertions beside the skip (the source check of the documented default list) still run. So
+`26 passed … 3 skipped` reads as **26 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
+`passed + skipped` legitimately EXCEEDS 26. ⛔ **A transcript is therefore never "corrected" on the grounds
+that `passed + skipped` exceeds the outcome count.** An earlier revision of this section did exactly that,
+on the false premise that a skip must displace a pass, and replaced a correct transcript with
+`20 passed, 0 failed, 2 skipped` — a line no head of this suite can print; the same false premise then
+re-derived the number here to `24`. What is printed above is measured, not derived.
+
+Three skips, not two: `(f)` is driven from three places in the suite — the real entry point, the `mut-f`
+mutant, and `mut-u`'s mutant, which reaches `case_f` a THIRD time — so an arm that skips `(f)` skips it
+three times, and "the same two skips" was already stale when it was written.
 
 | case | proves | mutant that must turn it red |
 |---|---|---|
@@ -1245,7 +1256,7 @@ follows the skip still runs on both, so a broken default list still reddens a ce
 | (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the `retain` ROWS are deleted from `WORK_LAYOUT` **and** the vendor-namespace default disabled (they are one arm, because the prefix default alone would still keep them) |
 | (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one — whose record then answers `unmeasurable_runner_work=not-run`, the documented polarity for an unselected class, never a number | `want_class runner-work` → `true` |
 | (e) | an unknown `--only` value is refused, the valid list names `runner-work`, and a near-miss (`runner`) is refused too | the valid list is shortened in the refusal |
-| (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) — and the RECORD answers `?` for both `candidates_runner_work=` and `unmeasurable_runner_work=`, a class that measured nothing claiming no number at all. On a box with REAL runner roots (a cell) the default-glob half is **SKIPPED by name and counted as skipped, never as passed** — the documented default list is then asserted from the source — and `(b)` pins that the record carries the owner's `unmeasurable=` tally | the `census=no-roots` arm is deleted; and, separately, the `unmeasurable_runner_work=` `?` polarity answers `not-run` |
+| (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) — and the RECORD answers `?` for both `candidates_runner_work=` and `unmeasurable_runner_work=`, a class that measured nothing claiming no number at all. On a box with REAL runner roots (a cell) the default-glob half is **SKIPPED by name and counted on the `skipped` line — not as an outcome, and never as a pass** (the case itself still passes or fails on the source assertions beside the skip) — the documented default list is then asserted from the source — and `(b)` pins that the record carries the owner's `unmeasurable=` tally | the `census=no-roots` arm is deleted; and, separately, the `unmeasurable_runner_work=` `?` polarity answers `not-run` |
 | (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
 | (h) | a SET-but-EMPTY glob list is a refusal at **both** layers (the entry point's seam and the owner's), never "scan nothing for ever" — `${X:-default}` would substitute the *widest* sweep for an emptied value, and this class's output is deletions | the entry point's empty-glob arm never matches; and, separately, the owner's |
 | (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |
