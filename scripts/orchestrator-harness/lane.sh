@@ -562,6 +562,22 @@ fi
 # so the merge itself still completes — which is exactly why the missing line would be silent). The
 # bound is still a bound, and LANE_TIMEOUT overrides it as before.
 #
+# ── THE STAND-DOWN RECORD, WRITTEN BY ONE FUNCTION (agent-infra#1909's format; #3331 adds a caller) ──
+# `state/capacity-refused-<N>` is one line, three tab-separated fields (`<refused_epoch>\t<yield_until>\t<gate>`)
+# and its two readers are `chain-merge.sh::cap_refusal_gate` and `orch-loop.sh::capacity_yield_live` — see
+# the CAPACITY TRANSFER block below for the contract and why each gate is named rather than folded.
+# ⛔ IT IS A FUNCTION BECAUSE THERE ARE NOW TWO WRITERS (review round 3, P2). The post-`run_agent` arm has
+# always written it; the KEY gate refuses 270 lines EARLIER, and a refusal that mints no record left
+# `chain-merge.sh` waiting its full 90 minutes for a PR that could not appear while HOLDING
+# `refs/claims/issue-<N>` — so a peer that could run the item saw COLLISION, which is precisely the R8
+# defect the record exists to remove (`capability` writes one for the same reason: the credential is a
+# property of THIS box). Two inline `printf`s of a three-field format is how a format drifts.
+lane_standdown_write() { # <gate> <yield-seconds>
+  [ -n "${capacity_record:-}" ] || return 1
+  local now
+  now="$(date +%s)"
+  printf '%s\t%s\t%s\n' "$now" "$(( now + ${2:-0} ))" "$1" > "$capacity_record" 2>/dev/null
+}
 # ── THE KEY GATE (agent-infra#3331) — THE LAST GATE, IMMEDIATELY BEFORE `pi` ───────────────────
 # It is LAST because it is the last thing that can be true: every other gate is checked before it, and
 # this one asserts the exact environment `run_agent` is about to hand to `pi` — after `lane-env.sh` has
@@ -591,6 +607,16 @@ else
     # The reason token names the VARIABLE, so a fleet scan can count the missing names without reading
     # prose: `grep -h '^outcome=refused reason=key-gate' $O/logs/lane-*.log`.
     lane_outcome refused "key-gate:${KEY_GATE_REASON:-credential-missing}:${KEY_GATE_VAR:-unknown}"
+    # ⛔ THE REFUSAL YIELDS THE ITEM (review round 3, P2). A key refusal is a property of THIS box, so a
+    # peer that HAS the credential can take the work — and without this record `chain-merge.sh` has
+    # nothing to read, so it waits out its 90 minutes holding the cross-box claim while every peer's
+    # pre-flight sees COLLISION (the R8 defect the record exists to remove). `capability` writes one for
+    # exactly this reason; the words below say what the stand-down buys, the way `land`/`skew` do.
+    if lane_standdown_write key "$CAPACITY_YIELD_SECS"; then
+      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=key) — the credential is a property of THIS box, so chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min and a peer that has the key can claim it; this box will not re-win it while the yield is live. The remedy HERE is to put the credential in the environment lanes run with (the [key-gate] lines above name the variable and every candidate file)." >> "$O/logs/lane-$N.log"
+    else
+      echo "[lane $N] WARN: could not write $capacity_record — the refusal still releases the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
+    fi
     echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — \$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it. NOT a capacity refusal and nothing was consumed: put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file." >> "$O/logs/lane-$N.log"
     echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — the model credential \$${KEY_GATE_VAR:-?} is missing; see $O/logs/lane-$N.log" >&2
     exit "$KEY_GATE_RC"
@@ -709,8 +735,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # will not clear it. The window itself stays uniform. A `fork` refusal is subject to the same
     # uniform window for the same reason, and the same non-claim: it does not clear by waiting.
     _cap_yield="$CAPACITY_YIELD_SECS"
-    _cap_now="$(date +%s)"
-    if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + _cap_yield ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
+    if lane_standdown_write "$_cap_gate" "$_cap_yield"; then
       # ⛔ THE WORDS MUST MATCH THE GATE (review cycle 3, P2). This line used to call EVERY refusal a
       # "capacity transfer ... yielded to peers", so a `land` lane log carried that claim three lines
       # above its own "This is NOT a capacity refusal" — and an operator grepping `capacity transfer`
