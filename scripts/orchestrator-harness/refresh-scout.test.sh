@@ -137,6 +137,12 @@ mk_issue_claim() {   # <dir> <issue> <lease-seconds-from-now> [<owner-host>]
 # turned 114 arms of this suite red for a reason that has nothing to do with provisioning. A case
 # that WANTS a declared target sets `OR=` on its own invocation (the acme/widget arms do), so
 # clearing the ambient value costs nothing and makes the shard deterministic on any box.
+# ⛔ BOTH KNOBS, NOT ONE (agent-infra#2741 review P2; measured: with `OR_OPERATOR_DECLARED=1` exported
+# this suite ran 236 passed, 220 FAILED, every one of them a `$OR was DECLARED` resolve-repo refusal).
+# `refresh-candidates.sh:27-31` reads the MARKER as "the operator named the target", so clearing `$OR`
+# alone leaves the marker forcing the SAME refusal — and a loop-spawned lane exports it
+# (`orch-loop.sh:96-98`). The sibling suite records this exact rule (`refresh-provision.test.sh`:
+# "BOTH KNOBS, NOT ONE"), and leaving `-u OR_OPERATOR_DECLARED` out left its `(h)` rows green.
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
@@ -146,7 +152,7 @@ rf() {
   local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
-          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u OR \
+          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u OR -u OR_OPERATOR_DECLARED \
           HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
@@ -965,7 +971,7 @@ echo; echo "── an unwritable state dir is refused, not absorbed ──"
 mk_case unwritable-o
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#' > "$D/state-file" # a REGULAR FILE where $O must be a directory
-OUT="$(env -u GH_HOST -u CELL_HOME -u OR HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
+OUT="$(env -u GH_HOST -u CELL_HOME -u OR -u OR_OPERATOR_DECLARED HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
         O="$D/state-file" bash "$REFRESH" 2>&1)"; RC=$?
 [ "$RC" -eq 1 ] && ok "unwritable \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
                || bad "unwritable \$O: rc=$RC (want 1) — output: $OUT"
@@ -3793,7 +3799,7 @@ if [ -s "$MUTP" ]; then
 # one. Same rule as `rf`'s: the shard must be deterministic on any box, and a case that WANTS a
 # declared target sets `OR=` on its own invocation.
 OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u SCOUT_PY -u SCOUT_UV_EXTRAS \
-        -u OR -u GH_HOST -u CELL_HOME -u GH_CONFIG_DIR \
+        -u OR -u OR_OPERATOR_DECLARED -u GH_HOST -u CELL_HOME -u GH_CONFIG_DIR \
         HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" O="$D/o" bash "$MUTP" --check 2>&1)"
 RC=$?
 ck "(p2) WITHOUT the fix --check FAILS the stale-tracking-ref checkout (rc=$RC)" "$([ "$RC" -ne 0 ]; echo $?)"
@@ -4115,7 +4121,15 @@ mk_gh_rest "$D" 42,43
 mk_tmux "$D"
 printf '42\n43\n' > "$D/o/checked.txt"
 rm -f "$D/o/claims.sh"
-rf "$D" refresh
+# ⛔ THE CAP IS PINNED, because the funnel assertion below counts BOTH entries being ASKED. This was a
+# bare `rf`, and the shipped script reads `CHECKED_RELEASE_MAX` from the ENVIRONMENT
+# (`refresh-candidates.sh:3122`, `${CHECKED_RELEASE_MAX:-24}`), so on a box that exports a smaller cap
+# only one of the two entries is ever asked and THIS arm reddens for a reason that has nothing to do
+# with the code under test — the same false-FAIL class the `(p2)` arm above exists to remove
+# (measured: `CHECKED_RELEASE_MAX=1` ambient -> 454 passed, 1 failed, this arm's own funnel
+# assertion). Pinning it on the invocation is what every other cap-dependent arm does (Controls
+# H/I/I-bis: `CHECKED_RELEASE_MAX=2 rf …`).
+CHECKED_RELEASE_MAX=24 rf "$D" refresh
 _kept=0
 for _n in 42 43; do grep -qx "$_n" "$D/o/checked.txt" 2>/dev/null && _kept=$((_kept + 1)); done
 [ "$_kept" -eq 2 ] && ok "no registry (2 entries): BOTH suppressions are KEPT — the refusal is per entry" \
@@ -4130,6 +4144,30 @@ esac
 case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
   *skipped_checked_claim_unknown=2*) ok "no registry (2 entries): the funnel COUNTS both undecided suppressions (claim_unknown=2) — the state record agrees with the log" ;;
   *) bad "no registry (2 entries): the funnel says skipped_checked_claim_unknown=$(sed -n 's/.*skipped_checked_claim_unknown=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — the undecided entries are not counted" ;;
+esac
+
+# ── Control G3 — an UNRECOGNISED code is named BY THE ASK LOOP, with the code (agent-infra#2741) ──
+# ⛔ THE `else` ARM OF THE ASK LOOP HAD NO TEST AT ALL: deleting its `echo` left the whole suite green
+# (measured), so a box whose registry returns a code this pass cannot read would have kept its
+# suppressions for ever with no sentence saying that the CODE — not the box — was the unreadable thing.
+# ⛔ AND WHY THIS IS NOT SEEDED INTO `claim-unrecognised`: that is the obvious place, and it is WRONG.
+# Seeding `checked.txt` there suppresses the entry BEFORE the walk, so the walk never asks it and the
+# arm's own `rc=1` assertion (the TRANSIENT class) drops to 0 — measured: `❌ claim-unrecognised: rc=0
+# (want 1)`. The shape gets its own fixture, which asserts only what it can prove: KEEP, and the code
+# named by the ASK LOOP.
+mk_case checked-unrecognised-code
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mk_tmux "$D"
+printf '42\n' > "$D/o/checked.txt"
+printf '# a registry whose verdict code the ask loop does not recognise\nclaim_issue_preflight() { return 7; }\n' > "$D/o/claims.sh"
+CHECKED_RELEASE_MAX=24 rf "$D" refresh
+grep -qx 42 "$D/o/checked.txt" 2>/dev/null \
+  && ok "unrecognised code (checked ask): the suppression is KEPT — a code the loop cannot read is never evidence of freedom" \
+  || bad "unrecognised code (checked ask): #42 was RELEASED on a code the loop cannot read (checked.txt: $(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)) — fail-open"
+case "$OUT" in
+  *"claim read:"*"rc=7"*) ok "unrecognised code (checked ask): the ask loop NAMES the unrecognised code (rc=7), not silence" ;;
+  *) bad "unrecognised code (checked ask): the ask loop's unrecognised-code line is missing (want 'claim read: … rc=7') — output: $OUT" ;;
 esac
 
 # ── Control H — the release cap defers, and the CURSOR rotates past a permanently-held head ────
