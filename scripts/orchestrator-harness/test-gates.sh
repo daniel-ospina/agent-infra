@@ -3507,7 +3507,7 @@ else
       SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
       for _a in "$@"; do export "$_a"; done
       eval "$GV"
-      printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" )
+      printf '%s\t%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" "${LF_VERDICT:-<unset>}" )
   }
   _t="$(gv)"; _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
   [ "$_why" = "<open>" ] && echo "  ok (v1) a box with no gate reports NO winner" && PASS=$((PASS+1)) \
@@ -3679,6 +3679,22 @@ ARMS
   case "$_v" in
     exempt*) echo "  ok (v21) an exempted cycle NAMES the exemption (so the log can print it)" && PASS=$((PASS+1)) ;;
     *) echo "  ❌ (v21) the exemption is unnamed, so an exempted dispatch reads BINDING(none): [$_v]"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ ALL FIVE VERDICT PATHS MUST CARRY `LF_VERDICT`, NOT JUST THE EXEMPT ONE (review round 5, P2).
+  # The line prints `FLOOR_VERDICT=${LF_VERDICT:-?}`, so a path that forgets to set it prints `?` on
+  # EVERY ordinary cycle — and v21 alone did not notice (measured: dropping LF_VERDICT from REFUSE,
+  # ok and both fail-closed branches left the whole suite green). One assertion per path, driven
+  # through the same extracted block.
+  for _c in '68|REFUSE(' '4|ok(' "''|UNKNOWN" '99999999999999999999|UNKNOWN(out-of-range)'; do
+    _lf="${_c%%|*}"; _want="${_c#*|}"
+    case "$_want" in REFUSE\(|ok\() _want="$_want" ;;
+      UNKNOWN\(out-of-range) _want='UNKNOWN(out-of-range)' ;;
+      UNKNOWN) _want='UNKNOWN' ;;
+    esac
+    _got="$(gv OPEN_N="$_lf" LANDING_FLOOR=25 | cut -f3)"
+    case "$_got" in
+      "$_want"*) echo "  ok (v22) OPEN_N='${_lf}' sets LF_VERDICT=$_want (the printed field is never '?')" && PASS=$((PASS+1)) ;;
+      *) echo "  ❌ (v22) OPEN_N='${_lf}' left LF_VERDICT=[$_got], expected [${_want}...] — the cycle line would print FLOOR_VERDICT=?"; FAIL=$((FAIL+1)) ;; esac
+  done
   # ── the two mutants ────────────────────────────────────────────────────────────────────────────
   mut_gv() { # <name> <old> <new> -> path to the mutant block
     printf '%s\n' "$GV" > "$TMP/gv-$1.in"
