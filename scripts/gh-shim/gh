@@ -120,6 +120,25 @@
 #     `COOLDOWN_ABS_MAX_S` (**86400 s, a FIXED constant** — deliberately not a per-lane knob, so
 #     one lane's `RETRY_MAX` cannot delete a window the whole box is waiting on), so a poisoned
 #     file heals on the next read.
+#   - ⛔ THE WINDOW IS DERIVED FROM THE REFUSAL'S OWN HEADERS, WHICH COSTS A CAPTURE ON DISK. It is
+#     obtained with `GH_DEBUG=api` (the only way gh exposes response headers), so the child's STDERR
+#     FILE for the life of the call holds the request dump — including the `Authorization` header,
+#     which gh masks, and for a mutation the REQUEST BODY, which it does not. That file is `0600` in
+#     the `0700` gate dir, removed on every exit path this layer controls and left behind by a
+#     SIGKILL, exactly like the pre-existing stdout capture. `AGENT_GH_GATE_DEBUG_HEADERS=0` turns
+#     the whole mechanism off. A caller that sets `GH_DEBUG` ITSELF keeps its own value and its own
+#     debug output is replayed untouched — the strip is scoped to the dump THIS layer asked for.
+#   - the derivation reads the LAST response in the dump. For `--paginate` that is the page that
+#     failed (which is the one that refused), and the endpoint named is that page's request line.
+#   - ⛔ THE WINDOW IS STILL BOX-WIDE: it is not keyed by endpoint family. A refusal from
+#     `/repos/…/actions/jobs/<id>/logs` is now NAMED as such (`family=actions`) instead of being
+#     reported as a `core` bucket (the measured lie: those endpoints carry their own counter under
+#     `x-ratelimit-resource: core`), but a lane calling an unrelated endpoint still waits behind a
+#     window it does not need. That over-block is fail-safe and BOUNDED by `AGENT_GH_GATE_BUDGET_S`;
+#     keying the marker per family is a follow-up, not this change.
+#   - ⛔ THE LOCAL REFUSAL FOR A WINDOW LONGER THAN THE BUDGET IS `rc=75` (EX_TEMPFAIL), the same
+#     verdict `gh-limit.py` uses, and it issues NO request. A caller that treats any non-zero rc as a
+#     hard failure now fails FASTER and with a named reason; it does not silently wait.
 #   - the retry is per WHOLE COMMAND. Below `gh-limit.py`'s own 4 attempts this MULTIPLIES: a
 #     call can execute up to 3 (this gate) x 4 (that layer) times, including non-idempotent
 #     creates and comments — the transport arm below does NOT add to a WRITE (it is retried zero times
@@ -214,6 +233,15 @@
 #   AGENT_GH_GATE_MAX_ATTEMPTS     total attempts incl. the first, on a rate-limit refusal (default 3)
 #   AGENT_GH_GATE_RETRY_BASE       seconds to wait when stderr carries no `retry-after` (default 60, floor 1)
 #   AGENT_GH_GATE_RETRY_MAX        ceiling on any single wait, in seconds (default 900)
+#   AGENT_GH_GATE_BUDGET_S         the most this call may SLEEP in-shim, ALL waits combined
+#                                  (default 120). A shared window, or a refusal whose wait, does not fit
+#                                  in what is left: the call is not slept and not retried — it returns
+#                                  EX_TEMPFAIL (75) before asking, or the refusal itself after asking.
+#   AGENT_GH_GATE_DEBUG_HEADERS=0  do not ask the child for the refusing response's headers
+#                                  (`GH_DEBUG=api`, see THE REFUSAL'S OWN EVIDENCE). OFF loses the
+#                                  derivation exactly in the case #3230 measured: the window falls back
+#                                  to `retry-after`/the base wait, and a refusal is named
+#                                  `class=undetermined` instead of naming its bucket.
 #   AGENT_GH_GATE_ACQUIRE_TIMEOUT  seconds to wait for a free slot before running UNGATED (default 300)
 #   AGENT_GH_GATE_NO_WAIT=1        never sleep in-shim: return a rate-limit refusal at once
 #                                  (gh-limit's GH_LIMIT_NO_WAIT=1 is honoured the same way)
@@ -546,11 +574,14 @@ fi
 #                  mutex and reaped by PID so a dead holder cannot wedge the fleet.
 #   3. SPACING   — a minimum interval between call STARTS, under the same mutex, so the
 #                  fleet dribbles instead of bursting.
-#   4. RETRY     — on a RATE-LIMIT signature in stderr: honour `retry-after`; with none,
-#                  wait RETRY_BASE (default 60 s, per GitHub's own guidance) and then
-#                  double. Never an immediate identical retry: RETRY_BASE has a floor
-#                  of 1 s and the wait is always slept, so the "3/3 attempts, identical"
-#                  retry-into-the-burst loop cannot be constructed here.
+#   4. RETRY     — on a RATE-LIMIT refusal: honour `retry-after` (the server's own instruction);
+#                  with none, wait to the refusing bucket's OWN `x-ratelimit-reset` when the refusal
+#                  says it is exhausted (`remaining: 0`); with neither, wait RETRY_BASE (default
+#                  60 s, per GitHub's own guidance) and then double. Never an immediate identical
+#                  retry: RETRY_BASE has a floor of 1 s and the wait is always slept, so the "3/3
+#                  attempts, identical" retry-into-the-burst loop cannot be constructed here. Every
+#                  wait is spent from ONE budget (`AGENT_GH_GATE_BUDGET_S`, default 120 s) and a
+#                  wait that does not fit is not taken — see THE REFUSAL'S OWN EVIDENCE (#3230).
 #
 # Portability: macOS ships bash 3.2 — no `${x,,}`, no associative arrays, no `mapfile`.
 # `stat`: GNU first, BSD second (GNU `stat -f` prints a filesystem listing to stdout
@@ -667,6 +698,7 @@ cleanup_workdir() {
   [ -n "${NOTEF:-}" ] && rm -f "$NOTEF" 2>/dev/null
   [ -n "${errf:-}" ] && rm -f "$errf" 2>/dev/null
   [ -n "${outf:-}" ] && rm -f "$outf" 2>/dev/null
+  [ -n "${plainf:-}" ] && [ "${plainf}" != "${errf:-}" ] && rm -f "$plainf" 2>/dev/null
   [ "${WORKDIR_OWNED:-0}" -eq 1 ] && [ -n "${WORKDIR:-}" ] && rm -rf "$WORKDIR" 2>/dev/null
   return 0
 }
@@ -789,21 +821,54 @@ set_cooldown_ms() {
 }
 
 # Sleep out the shared window, in <=60 s slices so a lane that extends the window while
-# we wait is still honoured.
+# we wait is still honoured — but NEVER past the caller's budget ($1, ms).
+# Returns 0 = no window left (proceed), 2 = the window outlives this call's budget, so the caller
+# must refuse instead of sleeping (the #3230 defect in one line: one endpoint's refusal used to
+# park every lane for the whole window, however long it was, with nothing re-deriving it).
 wait_for_cooldown() {
-  local rem chunk announced=0
+  local left="${1:-0}" rem chunk announced=0 spent=0
+  case "$left" in ''|*[!0-9]*) left=0 ;; esac
   while rem="$(cooldown_remaining_ms)"; do
     case "$rem" in ''|*[!0-9]*) break ;; esac
     [ "$rem" -gt 0 ] || break
+    [ $(( spent + rem )) -gt "$left" ] && return 2
     if [ "$announced" -eq 0 ]; then
       gate_note "the account is in a shared rate-limit window — waiting $(( (rem + 999) / 1000 ))s before this call"
       announced=1
     fi
     chunk="$rem"
     [ "$chunk" -gt 60000 ] && chunk=60000
+    [ $(( spent + chunk )) -gt "$left" ] && chunk=$(( left - spent ))
+    [ "$chunk" -le 0 ] && return 2
     sleep_ms "$chunk"
+    spent=$(( spent + chunk ))
   done
   return 0
+}
+
+# The pre-call half of the budget rule: honour the shared window, or refuse NOW when it outlives
+# this call's budget. Returns 0 = proceed, 1 = refuse locally (the caller exits EX_TEMPFAIL).
+# ⛔ A LOCAL REFUSAL ISSUES NO REQUEST. The alternative — sleep the fraction of the budget and then
+# call anyway — is a blind retry inside a window the box already knows about, which the API docs
+# say may get the integration banned. `gh-limit.py` uses 75 (EX_TEMPFAIL) for the same verdict, so
+# a caller that already understands "rate limited, try later" sees the code it knows.
+wait_out_window() {
+  local rem left
+  if no_wait_wanted; then
+    # The note is emitted ONLY when a window actually exists — saying "the account is in a shared
+    # rate-limit window" on every NO_WAIT call would put a false statement in events.log.
+    if rem="$(cooldown_remaining_ms)"; then
+      gate_note "the account is in a shared rate-limit window ($(( (rem + 999) / 1000 ))s left) — this call is NOT waiting it out (caller set NO_WAIT); it may be refused"
+    fi
+    return 0
+  fi
+  left=$(( BUDGET_MS - SPENT_MS ))
+  [ "$left" -lt 0 ] && left=0
+  wait_for_cooldown "$left"
+  [ "$?" -eq 2 ] || return 0
+  rem="$(cooldown_remaining_ms)" || rem=0
+  gate_note "a shared rate-limit window has $(( (rem + 999) / 1000 ))s left, which is BEYOND this call's $(( BUDGET_MS / 1000 ))s budget — refusing without issuing the call (EX_TEMPFAIL). Raise AGENT_GH_GATE_BUDGET_S to wait it out, or re-run when it clears"
+  return 1
 }
 
 # Admit one call: 0 = holding a slot (MY_SLOT), 1 = waited out ACQUIRE_TIMEOUT, 2 = the
@@ -1011,17 +1076,225 @@ transport_note() {
   return 0
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# THE REFUSAL'S OWN EVIDENCE (#3230) — the window is derived from the response that REFUSED.
+#
+# WHY NOT THE ACCOUNT'S `rate_limit` BUDGET. #3230's stated remedy was to re-derive a shared window
+# from the exempt quota read, and the evidence that falsifies it is on the issue: a 403 from
+# `/repos/…/actions/jobs/<job>/logs` carried ITS OWN `remaining: 0`, `used: 5000` and ITS OWN reset,
+# while the same minute's quota read answered `core: remaining 2660` on a DIFFERENT reset — and the
+# refusing response LABELLED ITSELF `x-ratelimit-resource: core`. So the Actions endpoints carry a
+# separate 5000/hour counter that the quota body's `core` does not describe, under the SAME name.
+# A re-derivation that reads `core` would therefore read 2660, conclude "not exhausted", and
+# either discharge a justified window (release every lane into an exhausted bucket) or never write
+# the one that was earned — exactly in the case that hurt. The only description of the bucket that
+# refused is the refusal's own headers, and they are authoritative under every hypothesis
+# (separate bucket, shared bucket, or secondary/burst limit), so THAT is the source of truth here.
+#
+# THIS GATE DOES NOT READ THE QUOTA ENDPOINT AT ALL — not even as a floor — and that is a recorded
+# decision, not an omission: the shim's health signal is its own slot count (the #1762 finding, in
+# the block above), and `tests/gh-shim/run.sh` §13(f) fails if any EXECUTED line names the endpoint.
+# A floor this layer cannot attribute to the refusing bucket would be a false PASS of precisely the
+# kind #3230 was filed about. The floor lives in `gh-limit.py`, which parses the headers of its own
+# responses (`classify`/`plan_wait`) — one layer that CAN attribute a bucket, never two that disagree.
+#
+# WHERE THE HEADERS COME FROM. gh does not print response headers on an error, so this layer asks for
+# them: the child runs with `GH_DEBUG=api`, whose dump puts `> GET /path HTTP/1.1` beside
+# `< X-Ratelimit-Remaining: 0` / `< X-Ratelimit-Reset: <epoch>` on the SAME response (measured on this
+# box 2026-11-02: `< X-Ratelimit-Remaining: 3211`, `< X-Ratelimit-Reset: 1793658445`). Nothing is
+# re-requested — a refused endpoint is never asked twice to learn why it refused — and a caller that
+# set its own `GH_DEBUG` keeps it.
+refusal_evidence() {  # $1 = the captured stderr of a failing attempt. Sets the REV_* globals.
+  local f="$1" out
+  REV_STATUS=""; REV_ENDPOINT=""; REV_REMAINING=""; REV_LIMIT=""; REV_RESOURCE=""; REV_RESET=""; REV_AFTER=""
+  [ -s "$f" ] || return 1
+  # ONE awk pass, and no pipeline: `grep -q` in a pipeline returns 141 under `pipefail` (see above).
+  # `tolower()` is POSIX, so BSD awk is fine; nothing here early-exits.
+  out="$(LC_ALL=C awk '
+    { l = tolower($0) }
+    # The RESPONSE status, from the last response-dump block gh writes under GH_DEBUG=api.
+    l ~ /^[ \t]*<[ \t]*http\// {
+      s = l; sub(/^[ \t]*<[ \t]*http\/[0-9.]+[ \t]+/, "", s); sub(/[^0-9].*$/, "", s)
+      if (s != "") status = s; next }
+    # The REQUEST line names the endpoint that refused — never inferred from the bucket name.
+    l ~ /^[ \t]*>[ \t]*[a-z]+[ \t]/ {
+      r = $0; sub(/^[ \t]*>[ \t]*/, "", r)
+      if (match(r, /^[A-Za-z]+[ \t]+[^ \t]+/)) { e = substr(r, RSTART, RLENGTH); gsub(/[ \t]+/, " ", e); endpoint = e }
+      next }
+    { h = l
+      if (h ~ /^[ \t]*</) sub(/^[ \t]*<[ \t]*/, "", h); else sub(/^[ \t]*/, "", h)
+      if (match(h, /^[a-z0-9-]+:/)) {
+        name = substr(h, 1, RLENGTH - 1); val = substr(h, RLENGTH + 1)
+        sub(/^[ \t]+/, "", val); sub(/[ \t\r]+$/, "", val)
+        if (name == "x-ratelimit-remaining") rem = val
+        else if (name == "x-ratelimit-limit") lim = val
+        else if (name == "x-ratelimit-reset") reset = val
+        else if (name == "x-ratelimit-resource") resource = val
+        else if (name == "retry-after") ra = val
+      }
+      # `retry-after` ALSO arrives inline in the prose gh prints (`… (retry-after: 1)`), and the
+      # API docs make it authoritative, so both spellings are read — the header wins when both exist.
+      if (ra == "" && match(l, /retry-after:[ \t]*[0-9]+/)) {
+        v = substr(l, RSTART, RLENGTH); sub(/retry-after:[ \t]*/, "", v); ra = v }
+    }
+    END {
+      if (status != "") print "status=" status
+      if (endpoint != "") print "endpoint=" endpoint
+      if (rem != "") print "remaining=" rem
+      if (lim != "") print "limit=" lim
+      if (resource != "") print "resource=" resource
+      if (reset != "") print "reset=" reset
+      if (ra != "") print "after=" ra
+    }' "$f" 2>/dev/null)" || out=""
+  while IFS= read -r kv; do
+    [ -n "$kv" ] || continue
+    case "${kv%%=*}" in
+      status)    REV_STATUS="${kv#*=}" ;;
+      endpoint)  REV_ENDPOINT="${kv#*=}" ;;
+      remaining) REV_REMAINING="${kv#*=}" ;;
+      limit)     REV_LIMIT="${kv#*=}" ;;
+      resource)  REV_RESOURCE="${kv#*=}" ;;
+      reset)     REV_RESET="${kv#*=}" ;;
+      after)     REV_AFTER="${kv#*=}" ;;
+    esac
+  done <<EOF
+$out
+EOF
+  # ⛔ NUMERIC HYGIENE, the same rule `num_or`/`retry_wait_ms` apply: a value `[` cannot hold is
+  # treated as ABSENT — never clamped and never wrapped into a poisoned deadline.
+  case "$REV_STATUS" in ''|*[!0-9]*) REV_STATUS="" ;; *) [ "${#REV_STATUS}" -le 3 ] || REV_STATUS="" ;; esac
+  case "$REV_REMAINING" in ''|*[!0-9]*) REV_REMAINING="" ;; *) [ "${#REV_REMAINING}" -le 9 ] || REV_REMAINING="" ;; esac
+  case "$REV_LIMIT" in ''|*[!0-9]*) REV_LIMIT="" ;; *) [ "${#REV_LIMIT}" -le 9 ] || REV_LIMIT="" ;; esac
+  case "$REV_RESET" in ''|*[!0-9]*) REV_RESET="" ;; *) [ "${#REV_RESET}" -le 10 ] || REV_RESET="" ;; esac
+  case "$REV_AFTER" in ''|*[!0-9]*) REV_AFTER="" ;; *) [ "${#REV_AFTER}" -le 9 ] || REV_AFTER="" ;; esac
+  case "$REV_RESOURCE" in *[!A-Za-z0-9_]*) REV_RESOURCE="" ;; esac
+  [ -n "$REV_STATUS$REV_ENDPOINT$REV_REMAINING$REV_RESET$REV_AFTER" ] || return 1
+  return 0
+}
+
+# The ENDPOINT FAMILY the refusal came from — `/repos/<o>/<r>/actions/jobs/1/logs` -> `actions`.
+# ⛔ NOT `x-ratelimit-resource`: the measured refusal labelled itself `core` while carrying its own
+# counter and its own reset (#3230, 2026-11-02), so the reported bucket name is the one field here
+# that cannot be trusted to name the family. The request path can.
+refusal_family() {
+  local path="${REV_ENDPOINT#* }"
+  case "$path" in *\?*) path="${path%%\?*}" ;; esac
+  printf '%s' "$path" | LC_ALL=C awk -F/ '{ n = 0; for (i = 1; i <= NF; i++) if ($i != "") seg[++n] = $i
+    if (n >= 4 && seg[1] == "repos") print seg[4]; else if (n >= 1) print seg[1] }' 2>/dev/null
+}
+
+# Classify the refusal from its OWN evidence, and set REV_CLASS / REV_FAMILY.
+#   server       — `retry-after`: the server's own instruction (docs: do not retry before it)
+#   primary      — `x-ratelimit-remaining: 0`: THIS bucket is exhausted; its `reset` ends it
+#   secondary    — a 403/429 with the primary counter still showing headroom: burst/concurrency
+#   not-a-limit  — a status that GitHub answers with that is neither 403 nor 429
+#   undetermined — no structured evidence at all (a wrapper stripped the headers)
+# ⛔ THE STATUS BEATS THE PROSE (the lesson `gh-limit.py` measured: a PR titled "fix rate limit"
+# rejected with `422 Validation Failed`). A rate-limit refusal is a 403 or a 429, so a 5xx whose
+# body happens to contain the phrase is an ANSWER, and retrying it spends the whole backoff on a
+# call that can never succeed. The prose therefore remains a FALLBACK only for a refusal whose
+# status this layer could not read at all.
+refusal_class() {
+  [ -n "${REV_ENDPOINT:-}" ] && REV_FAMILY="$(refusal_family)" || REV_FAMILY=""
+  case "${REV_STATUS:-}" in
+    ''|403|429) ;;
+    *) REV_CLASS="not-a-limit"; return 0 ;;
+  esac
+  if [ -n "${REV_AFTER:-}" ]; then REV_CLASS="server"; return 0; fi
+  case "${REV_REMAINING:-}" in
+    0)  REV_CLASS="primary" ;;
+    '') REV_CLASS="undetermined" ;;
+    *)  REV_CLASS="secondary" ;;
+  esac
+  return 0
+}
+
+# The wait the refusal's OWN evidence justifies, in ms. `$1` = the captured stderr, `$2` = attempt.
+refusal_wait_ms() {
+  local secs
+  case "${REV_CLASS:-undetermined}" in
+    server)
+      secs="${REV_AFTER:-1}"
+      [ "$secs" -lt 1 ] && secs=1
+      [ "$secs" -gt "$RETRY_MAX_S" ] && secs="$RETRY_MAX_S"
+      printf '%s' $(( secs * 1000 )); return 0 ;;
+    primary)
+      # The bucket's own reset is the only thing that ends an exhausted bucket. A reset that is
+      # already in the past, absurdly far ahead, or unreadable is NOT evidence, and falls through
+      # to the documented base wait rather than producing a negative or a fleet-wide sleep.
+      reset_wait_ms && return 0 ;;
+  esac
+  retry_wait_ms "$1" "$2"
+}
+
+reset_wait_ms() {
+  local now r w
+  case "${REV_RESET:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#REV_RESET}" -le 10 ] || return 1
+  now="$(now_ms)"
+  # +2 s: the reset SECOND must have passed, not merely arrived — waking on the boundary is a retry
+  # the server still refuses, which is the loop the docs warn can get an integration banned.
+  r=$(( REV_RESET * 1000 + 2000 ))
+  [ "$r" -gt "$now" ] || return 1
+  w=$(( r - now ))
+  [ "$w" -le $(( COOLDOWN_ABS_MAX_S * 1000 )) ] || return 1
+  [ "$w" -gt $(( RETRY_MAX_S * 1000 )) ] && w=$(( RETRY_MAX_S * 1000 ))
+  [ "$w" -lt 1000 ] && w=1000
+  printf '%s' "$w"
+  return 0
+}
+
+# One sentence naming the refusal BY CLASS — never collapsed into "unreadable". The remedies
+# differ (wait vs fix), so the operator must be able to tell them apart from the line alone, and
+# the endpoint must be named because a refusal about a log download is not a refusal about PR state.
+refusal_name() {
+  local s="" fam="${REV_FAMILY:-}" ep="${REV_ENDPOINT:-}" when=""
+  case "${REV_CLASS:-undetermined}" in
+    server)     s="class=server-directed retry-after=${REV_AFTER:-?}s" ;;
+    primary)    s="class=primary bucket=${REV_RESOURCE:-unknown} exhausted remaining=${REV_REMAINING:-0}${REV_LIMIT:+/$REV_LIMIT}" ;;
+    secondary)  s="class=secondary (the primary counter still reads ${REV_REMAINING:-unknown}${REV_LIMIT:+/$REV_LIMIT}) — a burst/concurrency limit, which no bucket reading can describe" ;;
+    not-a-limit) s="class=not-a-limit HTTP ${REV_STATUS:-?}" ;;
+    *)          s="class=undetermined (the response carried no rate-limit headers, so the class cannot be observed)" ;;
+  esac
+  if [ "${REV_CLASS:-undetermined}" = "primary" ] || [ "${REV_CLASS:-undetermined}" = "secondary" ]; then
+    case "${REV_RESET:-}" in
+      ''|*[!0-9]*) ;;
+      *) when="; resets at $(human_time "$REV_RESET")" ;;
+    esac
+  fi
+  printf '%s%s%s%s' "$s" "$when" "${ep:+; endpoint=$ep}" "${fam:+; family=$fam}"
+}
+
+# Epoch seconds -> UTC timestamp, portable: GNU takes `-d @N`, BSD takes `-r N`. Neither failing is
+# not an error — the epoch is printed instead, because an absent timestamp must not hide the fact.
+human_time() {
+  local s
+  s="$(date -u -d "@$1" +%FT%TZ 2>/dev/null)" || s="$(date -u -r "$1" +%FT%TZ 2>/dev/null)"
+  [ -n "$s" ] && printf '%s' "$s" || printf '%s' "$1"
+}
+
 # Is this stderr a RATE-LIMIT refusal? Deliberately NOT "any 403": a permissions 403 is
 # not a burst, and retrying a mutating command on it would run the command twice.
+# ⛔ IT ALSO SETS THE REV_* GLOBALS (refusal_evidence + refusal_class), so the caller classifies a
+# refusal ONCE and then decides with the same evidence it names. Every path that reaches this
+# function either decides here or is a failed call that never reads those globals.
 rate_limited() {
-  local f="$1"
+  local f="$1" prose=0
   [ -s "$f" ] || return 1
   # ⛔ ONE COMMAND, NO PIPELINE. `tr … | grep -Eq …` under `set -o pipefail` returns 141: `grep -q`
   # exits at its first match, `tr` takes SIGPIPE, and the 141 then reads as "not rate limited" —
   # so a refusal whose stderr exceeds the pipe buffer (~16-64 KB: a `--paginate` failure, a
   # replayed error body) would neither retry NOR write the shared cooldown, with no signal.
   # The same construction is forbidden above in find_real_gh for exactly this reason.
-  grep -Eqi 'api rate limit|secondary rate limit|abuse detection|http 429|status code:? 429|retry-after:' "$f" 2>/dev/null
+  grep -Eqi 'api rate limit|secondary rate limit|abuse detection|http 429|status code:? 429|retry-after:' "$f" 2>/dev/null && prose=1
+  refusal_evidence "$f" >/dev/null 2>&1
+  refusal_class
+  case "${REV_CLASS:-undetermined}" in
+    primary|server|secondary) return 0 ;;
+    # A response that is neither 403 nor 429 ANSWERS. No phrase inside it can make it a limit.
+    not-a-limit) return 1 ;;
+  esac
+  [ "$prose" -eq 1 ]
 }
 
 # The wait before retry number <attempt>, in ms. `retry-after` first (that is the server's
@@ -1063,6 +1336,20 @@ gate_init() {
   MAX_ATTEMPTS="$(num_or "${AGENT_GH_GATE_MAX_ATTEMPTS:-}" 3)"
   RETRY_BASE_S="$(num_or "${AGENT_GH_GATE_RETRY_BASE:-}" 60)"
   RETRY_MAX_S="$(num_or "${AGENT_GH_GATE_RETRY_MAX:-}" 900)"
+  # ⛔ ONE BUDGET FOR THIS CALL (#3230, Target 1). Every sleep this layer takes — waiting out a
+  # shared window before the call, and waiting between attempts — is spent from this, so a wait can
+  # never outlive it. Default 120 s: the figure #3230 names, and comfortably above the 60 s the docs
+  # call for when no header is present, so the documented wait still happens by default.
+  BUDGET_MS=$(( $(num_or "${AGENT_GH_GATE_BUDGET_S:-}" 120) * 1000 ))
+  # Whether the child is asked for the refusing response's own headers (GH_DEBUG=api). ON by
+  # default: OFF is the failure this whole block exists to remove — a fix that is inert at its own
+  # default is indistinguishable from no fix (the #3228 review measured exactly that).
+  HEADERS_ON="$(num_or "${AGENT_GH_GATE_DEBUG_HEADERS:-}" 1)"
+  [ "$HEADERS_ON" -eq 0 ] || HEADERS_ON=1
+  DEBUG_OURS=0
+  SPENT_MS=0
+  REV_CLASS=""; REV_STATUS=""; REV_ENDPOINT=""; REV_REMAINING=""; REV_LIMIT=""
+  REV_RESOURCE=""; REV_RESET=""; REV_AFTER=""; REV_FAMILY=""
   # FIXED, not a knob: the self-heal ceiling for the SHARED cooldown. A per-call knob must not
   # decide what counts as an impossible deadline for the whole box (see cooldown_remaining_ms).
   COOLDOWN_ABS_MAX_S=86400
@@ -1078,6 +1365,7 @@ gate_init() {
   [ "$RETRY_MAX_S" -ge "$RETRY_BASE_S" ] || RETRY_MAX_S="$RETRY_BASE_S"
   [ "$LOCK_TIMEOUT_MS" -ge 50 ] || LOCK_TIMEOUT_MS=2000
   [ "$INTERVAL_MS" -ge 0 ] || INTERVAL_MS=0
+  [ "$BUDGET_MS" -ge 0 ] || BUDGET_MS=120000
   # A private directory: the slot count is the gate's ONLY health signal, so another user
   # must not be able to add to it (nor read who is calling what).
   if ! mkdir -p "$GATE_DIR/slots" 2>/dev/null; then GATE_ON=0; fi
@@ -1104,11 +1392,12 @@ gate_init() {
 # exec cannot inspect stderr, so it can neither honour `retry-after` nor tell a burst
 # refusal from a real failure.
 run_paced() {
-  local rc=0 tries=0 ttries=0 treason="" rem wait_ms interactive=0 errf="" outf="" adm=0
+  local rc=0 tries=0 ttries=0 treason="" rem wait_ms interactive=0 errf="" outf="" adm=0 plainf="" noted=0 named="" left=0
   gate_init
   NOTEF="$WORKDIR/notes.$$"
   errf="$WORKDIR/err.$$"
   outf="$WORKDIR/out.$$"
+  plainf="$WORKDIR/plain.$$"
   CHILD_PID=""
   trap 'on_exit' EXIT
   # ⛔ THE CALLER'S TERM MUST REACH `gh`. A bare fork (the obvious way to read stderr) leaves the
@@ -1128,6 +1417,9 @@ run_paced() {
   # calls are retried: a terminal on stdin still takes the un-retried streaming branch, exactly as it
   # did before this change (and it keeps the rate-limit wait it always had).
   if [ -t 0 ]; then interactive=1; fi
+  # Whether THIS layer is the one that asked the child for a debug dump — set once, from the
+  # caller's own environment, so the strip below and the launch agree on the same decision.
+  if [ "${HEADERS_ON:-1}" -eq 1 ] && [ -z "${GH_DEBUG:-}" ]; then DEBUG_OURS=1; else DEBUG_OURS=0; fi
   if [ "$GATE_ON" -eq 0 ]; then
     gate_note "cannot use the gate directory ($GATE_DIR) — running UNGATED (announced); retries still apply"
   fi
@@ -1138,15 +1430,11 @@ run_paced() {
       # past the 60-420 s budgets the NO_WAIT contract exists for, so waiting it out re-created the
       # STALL this gate is supposed to prevent. Such a caller asks immediately and gets the refusal
       # back; the window is still honoured by every caller that did not declare a bound.
-      # The note is emitted ONLY when a window actually exists — saying "the account is in a
-      # shared rate-limit window" on every NO_WAIT call would put a false statement in events.log,
-      # which is the surface an operator debugs with.
-      if no_wait_wanted; then
-        if rem="$(cooldown_remaining_ms)"; then
-          gate_note "the account is in a shared rate-limit window ($(( (rem + 999) / 1000 ))s left) — this call is NOT waiting it out (caller set NO_WAIT); it may be refused"
-        fi
-      else
-        wait_for_cooldown
+      # ⛔ AND EVERY OTHER CALLER IS BOUNDED BY ITS OWN BUDGET (#3230): a window longer than the
+      # budget is not slept, and not called into either — the call returns EX_TEMPFAIL at once.
+      if ! wait_out_window; then
+        release_slot
+        exit 75
       fi
       if [ "$NESTED" -eq 0 ]; then
         admit_slot; adm=$?
@@ -1210,35 +1498,105 @@ run_paced() {
     # and a `--json` reader gets a JSONDecodeError from a call that SUCCEEDED. Capturing means a
     # discarded attempt's output never reaches the caller; only the attempt whose rc we report is
     # replayed, below.
-    "$REAL" "$@" >"$outf" 2>"$errf" <&0 &
+    #
+    # ⛔ CAPTURED STDERR CARRIES THE REFUSAL'S OWN HEADERS — the child is asked for them with
+    # `GH_DEBUG=api`, whose dump puts `< X-Ratelimit-Remaining/Reset` beside `> GET /path` on the
+    # SAME response (measured on this box 2026-11-02). This is the ONLY place the refusing
+    # endpoint's own budget is observable, and it costs no second request: a refused endpoint is
+    # never re-asked. A caller that set GH_DEBUG keeps ITS value — the assignment below is scoped to
+    # the one child, so nothing above this layer sees it and no interactive/human call is affected.
+    if [ "${DEBUG_OURS:-0}" -eq 1 ]; then
+      GH_DEBUG=api "$REAL" "$@" >"$outf" 2>"$errf" <&0 &
+    else
+      "$REAL" "$@" >"$outf" 2>"$errf" <&0 &
+    fi
     CHILD_PID=$!
     wait "$CHILD_PID"
     rc=$?
     CHILD_PID=""
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    rc=$?
+    CHILD_PID=""
+    # ⛔ THE DEBUG DUMP IS *OURS*, SO IT IS REMOVED BEFORE ANYTHING READS OR REPLAYS THE CHILD'S
+    # STDERR — ON EVERY PATH, INCLUDING SUCCESS. A successful call whose only stderr was that dump
+    # must replay NOTHING (`gh-rest/gh` parses `2>&1` as JSON), and a `SilentError` rc=1 — whose whole
+    # signature is EMPTY stderr — must stay empty for the transport arm. The RAW file is kept for the
+    # rate-limit arm, which needs the headers. When the caller set GH_DEBUG, nothing is stripped:
+    # those lines are the caller's own request.
+    plainf="$WORKDIR/plain.$$"
+    if [ "${DEBUG_OURS:-0}" -eq 1 ]; then
+      : > "$plainf" 2>/dev/null
+      if [ -s "$errf" ]; then
+        # ⛔ gh's `api` debug dump is a BLOCK, not a set of lines: `* Request at …` opens it, and it
+        # carries the request dump, the response headers AND THE WHOLE RESPONSE BODY before
+        # `* Request took …` closes it (MEASURED against the real binary 2026-11-02: a successful
+        # `gh api user --jq .login` printed `daniel-ospina` on stdout and the FULL USER JSON on
+        # stderr). A line-prefix filter therefore leaves a duplicate body on a SUCCESSFUL call — the
+        # `gh-rest/gh` `2>&1 | jq` JSONDecodeError class, on every call in the fleet. So the block is
+        # removed by its delimiters, and gh's own messages (which it prints AFTER `* Request took`)
+        # are what survives. An UNTERMINATED block (a child killed mid-dump) loses the rest of that
+        # attempt's stderr instead of leaking a body onto it; that direction is stated, not silent.
+        LC_ALL=C awk '
+          /^\* Request at/  { dump = 1; next }
+          /^\* Request took/ { dump = 0; next }
+          dump { next }
+          /^(\* |> |< )/ { next }
+          { print }' "$errf" 2>/dev/null > "$plainf" || cp "$errf" "$plainf" 2>/dev/null
+        chmod 600 "$plainf" 2>/dev/null
+      fi
+    else
+      plainf="$errf"
+    fi
     [ "$rc" -eq 0 ] && break
-    # ── ARM 1: RATE LIMIT (unchanged) ────────────────────────────────────────────────────────────
-    if [ "$tries" -lt $(( MAX_ATTEMPTS - 1 )) ] && rate_limited "$errf"; then
-      tries=$(( tries + 1 ))
-      wait_ms="$(retry_wait_ms "$errf" "$tries")"
+    # ── ARM 1: RATE LIMIT — bounded, and derived from THIS refusal's own headers ────────────────
+    # `rate_limited` classifies from the refusal's own response (REV_*): a primary bucket that is
+    # exhausted, a `retry-after` the server itself stated, or a burst/secondary limit. The wait it
+    # justifies is the bucket's own RESET — never the account's quota, which describes a different
+    # counter under the same name (#3230, measured: the Actions 403 carried remaining 0 with its own
+    # reset while `core` read 2 660 on another).
+    if rate_limited "$errf"; then
+      noted=0
+      named="$(refusal_name)"
+      wait_ms="$(refusal_wait_ms "$errf" $(( tries + 1 )))"
       # Share the window with the WHOLE box before deciding whether to sleep in it.
       [ "$GATE_ON" -eq 1 ] && set_cooldown_ms "$wait_ms"
-      # ⛔ A CALLER THAT DECLARED ITS OWN BOUND IS NOT SLEPT INSIDE. gh-limit.py sets
-      # GH_LIMIT_NO_WAIT=1 precisely so a caller with a 60-420 s timeout gets the refusal back AT
-      # ONCE and can report RATE-LIMITED instead of STALL — a lower layer must not override the
-      # upper layer's declared policy. The cooldown above is still written, so the box benefits.
-      if no_wait_wanted; then
-        gate_note "caller set NO_WAIT — returning the refusal at once instead of sleeping $(( (wait_ms + 999) / 1000 ))s (the cooldown is shared)"
-        break
+      if [ "$tries" -ge $(( MAX_ATTEMPTS - 1 )) ]; then
+        # ⛔ EVERY REFUSAL IS NAMED, INCLUDING THE ONE WE STOP ON (#3230, Target 3). Surrendering
+        # silently left the operator with a bare rc and a log line from some other layer, which is
+        # how a rate limit gets reported as "unreadable" — a different remedy.
+        gate_note "GitHub refused this call — $named — attempts exhausted ($(( tries + 1 )) of $MAX_ATTEMPTS); returning the refusal instead of retrying"
+        noted=1
+      elif no_wait_wanted; then
+        # ⛔ A CALLER THAT DECLARED ITS OWN BOUND IS NOT SLEPT INSIDE. gh-limit.py sets
+        # GH_LIMIT_NO_WAIT=1 precisely so a caller with a 60-420 s timeout gets the refusal back AT
+        # ONCE and can report RATE-LIMITED instead of STALL. The cooldown above is still written.
+        gate_note "GitHub refused this call — $named — caller set NO_WAIT, so the refusal returns at once instead of sleeping $(( (wait_ms + 999) / 1000 ))s (the cooldown is shared)"
+        noted=1
+      else
+        left=$(( BUDGET_MS - SPENT_MS ))
+        [ "$left" -lt 0 ] && left=0
+        if [ "$wait_ms" -gt "$left" ]; then
+          # ⛔ THE BUDGET IS THE CEILING (#3230, Target 1). Sleeping what is left and then asking
+          # anyway is a blind retry inside a window the box already knows about — the behaviour the
+          # API docs warn can get the integration banned, and the one a lane spent 49 minutes in.
+          gate_note "GitHub refused this call — $named — the wait it justifies ($(( (wait_ms + 999) / 1000 ))s) is BEYOND this call's $(( BUDGET_MS / 1000 ))s budget, so it is NOT slept and the call is NOT retried; the shared window is recorded so other lanes wait it out"
+          noted=1
+        else
+          tries=$(( tries + 1 ))
+          release_slot
+          gate_note "GitHub refused this call — $named — waiting $(( (wait_ms + 999) / 1000 ))s, then retrying (retry $tries of $(( MAX_ATTEMPTS - 1 )))"
+          sleep_ms "$wait_ms"
+          SPENT_MS=$(( SPENT_MS + wait_ms ))
+          continue
+        fi
       fi
-      release_slot
-      gate_note "GitHub refused this call (rate limit) — waiting $(( (wait_ms + 999) / 1000 ))s, then retrying (retry $tries of $(( MAX_ATTEMPTS - 1 )))"
-      sleep_ms "$wait_ms"
-      continue
+      [ "$noted" -eq 1 ] && break
     fi
     # ── ARM 2: TRANSPORT (#2148) ─────────────────────────────────────────────────────────────────
     # `rate_limited` is re-tested here so a rate-limit refusal that has spent its own attempts is
     # NOT picked up by this arm: a refusal is a decision, and this arm exists for a dropped socket.
-    if [ "$ttries" -lt $(( TRANSPORT_ATTEMPTS - 1 )) ] && treason="$(transport_reason "$errf" "$rc")" \
+    if [ "$ttries" -lt $(( TRANSPORT_ATTEMPTS - 1 )) ] && treason="$(transport_reason "$plainf" "$rc")" \
        && ! rate_limited "$errf" && read_only_call "$@"; then
       ttries=$(( ttries + 1 ))
       # 1 s, then 3 s — <= 4 s in total, and every value is a literal so no knob can unbound it.
@@ -1256,7 +1614,7 @@ run_paced() {
     # attempt count that really happened (review of #2768, P2): a transport blip followed by an
     # honest `HTTP 422` used to print "exhausted after 3 attempts" for a 2-attempt call whose last
     # failure was GitHub answering. That is a false cause in the operator's diagnostic surface.
-    if [ "$ttries" -gt 0 ] && transport_reason "$errf" "$rc" >/dev/null; then
+    if [ "$ttries" -gt 0 ] && transport_reason "$plainf" "$rc" >/dev/null; then
       # ⛔ THE COUNT IS EVERY ATTEMPT THIS LOOP MADE, NOT THE TRANSPORT ONES. The two arms share this
       # loop, so a rate-limit retry before the transport ones made `ttries + 1` UNDERSTATE the real
       # count (measured: `ratelimit, connect, connect, connect` = 4 invocations reported as 3).
@@ -1269,7 +1627,10 @@ run_paced() {
   # replayed from a discarded attempt (see the capture comment above), and stdout keeps its own
   # stream so a `--jq`/`--json` reader above this layer sees exactly one document.
   [ -s "$outf" ] && cat "$outf" 2>/dev/null
-  [ -s "$errf" ] && cat "$errf" >&2 2>/dev/null
+  # ⛔ THE CHILD'S STDERR WITHOUT THE DEBUG DUMP THIS LAYER ASKED FOR (see `plainf` above). A
+  # successful call whose only stderr was that dump replays NOTHING, which is what keeps
+  # `gh-rest/gh`'s `2>&1 | jq` parseable — the same invariant the pacing notes obey.
+  [ -s "${plainf:-}" ] && cat "$plainf" >&2 2>/dev/null
   flush_notes "$rc"
   cleanup_workdir
   exit "$rc"
