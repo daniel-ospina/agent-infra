@@ -256,14 +256,25 @@ try {
   // because neither failure has any other symptom. ──
   {
     const ci = readFileSync(join(REPO, ".github/workflows/ci.yml"), "utf-8");
-    const verifyBlock = (() => {
-      const at = ci.indexOf("\n  verify:\n");
+    const jobBlock = (name) => {
+      const at = ci.indexOf(`\n  ${name}:\n`);
       if (at < 0) return null;
       const rest = ci.slice(at + 1);
       const next = rest.slice(1).search(/\n  [a-z][a-z0-9-]*:\n/);
       return next < 0 ? rest : rest.slice(0, next + 1);
-    })();
-    expect("(w0) ci.yml's `verify` job exists", verifyBlock !== null, true);
+    };
+    // ⛔ AGENT-INFRA#3121 — THE GATE MUST BE ITS OWN JOB. These steps used to sit
+    // ~50 steps into `verify`, so an earlier failure there SKIPPED them and the
+    // job was red for a different reason; nothing looked wrong, and the gate that
+    // says "a stale pin cannot reach main silently" never ran on the PR that made
+    // the pin stale (measured: PR #3103, `653b935e3`, merged with a stale pin).
+    // So the wiring is read from the job that now owns it, and (w4) below asserts
+    // the steps are ABSENT from `verify` — an arm that cannot pass while the gate
+    // is skippable.
+    const JOB = "sanctioned-pin";
+    const verifyBlock = jobBlock(JOB);
+    expect(`(w0) ci.yml's \`${JOB}\` job exists (the pin gate owns a job, so no unrelated step can skip it)`,
+      verifyBlock !== null, true);
     if (verifyBlock) {
       // ⛔ COMMENT LINES ARE STRIPPED FIRST. These comments quote the very
       // literals asserted below (`--ref …`, `fetch-depth: 2`, this suite's
@@ -278,6 +289,17 @@ try {
         /actions\/checkout@v4\n\s+with:\n(?:\s+#.*\n)*\s+fetch-depth: 2/.test(live), true);
       expect("(w3) …and this suite runs in the same job (an unwired suite passes by never running)",
         /^\s+(?:run:|- run:)\s*node extensions\/main-worktree-guard\/test-sanctioned-pin-merge-base\.mjs\s*$/m.test(live), true);
+    }
+    // ⛔ (w5) THE GATE IS NOT A STEP IN `verify` ANY MORE (agent-infra#3121), and this
+    // arm is the one that would have caught the original defect: with the steps back
+    // inside that shared job, an earlier red skips them and the gate reports nothing
+    // while the pin is stale. Asserted on executable YAML only (comments stripped),
+    // because `verify`'s own comments still quote these filenames.
+    {
+      const vb = jobBlock("verify");
+      const vlive = vb === null ? "" : vb.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+      expect("(w5) …and NEITHER pin step is a step of `verify` — a gate in a shared job is skippable by an unrelated red (#3121)",
+        /test-sanctioned-identity\.mjs|test-sanctioned-pin-merge-base\.mjs/.test(vlive), false);
     }
     expect("(w4) the post-merge lane collects this suite by the extensions/*/test*.mjs glob",
       /(^|\/)test[^/]*\.mjs$/.test("extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs"), true);
