@@ -1066,11 +1066,21 @@ post_marker() { # <repo> <pr> <marker> -> 0 present/posted, 1 post failed, 2 bod
   local repo="$1" pr="$2" marker="$3" body="" newbody=""
   body="$(command gh api "repos/$repo/pulls/$pr" --jq .body 2>/dev/null)" || return 2
   [ "$body" = "null" ] && body=""
-  # ⛔ A HERE-STRING, NOT A PIPE INTO A QUIET grep (#841/#864): `grep -qF` exits at the first
-  # match, so on a body larger than the pipe buffer the writer takes SIGPIPE and `pipefail` reports
-  # the pipeline as FAILED — turning a marker that IS present into "absent" and re-patching a body
-  # that already carries it. The guard (scripts/check-no-sigpipe-grep.sh) reds main on this idiom.
-  if command grep -qF -- "$marker" <<<"$body"; then return 0; fi
+  # ⛔ LINE-ANCHORED (`-x`), the SAME predicate the recorder's append decision uses
+  # (agent-infra#3168). This site is the RECOVERY path — reached by `--flush-pending`
+  # and by every later minting run — and it is the one that can DESTROY the marker:
+  # unanchored `-qF` read a body that merely CITES the marker mid-line as "already
+  # present", so it PATCHed nothing, flush_pending_markers() `rm -f`'d the pending
+  # file, and the caller printed "delivered the pending signed marker". Silent loss
+  # of the only copy of the signed bytes, reported as success (a false PASS).
+  # ⛔ The here-string is also what makes the SIGPIPE class impossible here (#841/#864,
+  # the idiom scripts/check-no-sigpipe-grep.sh guards): `grep -q` exits at the first
+  # match, so a `producer | grep -q` pipeline over a body larger than the pipe buffer
+  # takes SIGPIPE and `pipefail` reports the pipeline FAILED — reading a marker that IS
+  # present as absent and re-patching a body that already carries it. A here-string is
+  # bash 3.2-safe and has no producer process to signal. Both intents are load-bearing
+  # at this one site, which is why the fix carries both.
+  if command grep -qxF -- "$marker" <<<"$body"; then return 0; fi
   if [ -n "$body" ]; then newbody="${body}
 
 ${marker}"; else newbody="$marker"; fi
