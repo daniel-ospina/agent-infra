@@ -191,7 +191,13 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v) {
   p = pre
   gsub(/[ \t"']+$/, "", p)
   if (p ~ /(^|[ \t;&|({])printf[ \t]+-v$/) {
-    v = printfval(tail)
+    # The NAME may be QUOTED (`printf -v "X" %d 83`), in which case `tail` begins with the CLOSING
+    # quote and `printfval` sees three fields instead of two (review of PR #3237, finding 2 — this
+    # shape read as `unparseable`, which is red but for the wrong reason: the value IS readable and a
+    # duplicate must COLLIDE, that being the property this namespace check exists for).
+    t2 = tail
+    sub(/^["']/, "", t2)
+    v = printfval(t2)
     if (v != "") row("claim", name, v, f, ln)
     else         print "unparseable", name, s, f, ln
     return
@@ -2370,15 +2376,48 @@ AGENT_DISK_REFUSED:disk gate
 AGENT_HARNESS_SKEW_REFUSED:HARNESS/MISMATCH gate
 AGENT_MEM_REFUSED:memory gate"
 _armdecl=" $(printf '%s\n' "$_fixer_arms" | cut -d: -f1 | tr '\n' ' ')"
-# Completeness, in the direction that matters: every gate the FIXER reads must have a row. Derived
-# from fix-one.sh itself, so adding a `${AGENT_X_REFUSED:-…}` arm there without declaring it here is a
-# red rather than an unchecked arm.
+# Completeness, in the direction that matters: every gate the FIXER CLASSIFIES must have a row.
+# Derived from fix-one.sh itself, so adding a `${AGENT_X_REFUSED:-…}` arm there without declaring it
+# here is a red rather than an unchecked arm.
+# ⛔ TWO PROPERTIES, NOT ONE (review of PR #3237, finding 3). The derivation used to be
+# `grep -o 'AGENT_[A-Z_]*_REFUSED'`, which was narrower than the scanner in TWO independent ways: it
+# could not see a `_BACKLOG`/`_DEFERRED`/`_UNAVAILABLE` gate (a fixer arm on the land gate, a LIVE
+# code at 74, would have been added with no row and reported `undeclared: none`), and it read
+# COMMENT text as if it were an arm. Both are fixed by the same step: strip comments, then take the
+# scanner's own four-suffix namespace, then SPLIT the population by what the fixer actually does with
+# the name — a gate the classifier COMPARES against is an arm and needs a row; one it merely `exit`s
+# with (the repo-target refusal, 72, which fires before the classifier is ever reached) is not an arm
+# and must be named as such instead of silently widening the table. Today the two sets are
+# {BRIEF,CAPABILITY,DISK,FORK,HARNESS_SKEW} and {REPO_TARGET_REFUSED}.
+_fixer_code="$(awk '{ sub(/^[ \t]*#.*/, ""); sub(/[ \t]#.*/, ""); print }' "$HERE/fix-one.sh")"
+_arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never compared
+_arm_cls=""; _arm_other=""
+for _ac in $(printf '%s\n' "$_fixer_code" \
+    | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u); do
+  if printf '%s\n' "$_fixer_code" | grep -qE "=[[:space:]]*\"\\\$\\{?${_ac}"; then
+    _arm_cls="$_arm_cls $_ac"
+  else
+    _arm_other="$_arm_other $_ac"
+  fi
+done
 _armmissing=""
-for _ac in $(grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' "$HERE/fix-one.sh" | sort -u); do
+for _ac in $_arm_cls; do
   case "$_armdecl" in *" $_ac "*) : ;; *) _armmissing="$_armmissing $_ac" ;; esac
 done
 [ -z "${_armmissing// /}" ]; rc=$?
 ck "every gate fix-one.sh CLASSIFIES has an arm-table row (undeclared:${_armmissing:- none}) — a new arm cannot be added without proving it is reachable" $rc
+# ... and the OTHER half of the same derivation: a family-named gate the fixer does not CLASSIFY must
+# be named in `_arm_nonclassifier`, so "it has no row" is always a decision rather than an oversight.
+_armstray=""
+for _ac in $_arm_other; do
+  case " $_arm_nonclassifier " in *" $_ac "*) : ;; *) _armstray="$_armstray $_ac" ;; esac
+done
+[ -z "${_armstray// /}" ]; rc=$?
+ck "every family-named gate fix-one.sh does NOT classify is DECLARED as a non-classifier (stray:${_armstray:- none}) — a gate that is exited rather than classified is a stated exclusion, not a silent one" $rc
+# The derivation must not be VACUOUS: a regex that stopped matching would make both arms above pass
+# by asserting nothing.
+[ -n "${_arm_cls// /}" ]; rc=$?
+ck "the arm derivation found at least one CLASSIFIED gate (\"${_arm_cls# }\") — a derivation that matches nothing proves nothing" $rc
 
 # The fixture: the shipped fix-one.sh beside the SHIPPED helper with ONE function APPENDED and
 # overridden — `run_agent`, whose RETURN VALUE is the classifier's whole input. Deriving the fixture
