@@ -36,6 +36,7 @@ import contextlib
 import dataclasses
 import datetime
 import importlib.util
+import io
 import json
 import os
 import re
@@ -1444,6 +1445,311 @@ def t24_length_truncated_call_is_not_a_tool():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# THE LOG-LANE AXIS (T32–T38) — a lane that writes a log and no transcript
+# ══════════════════════════════════════════════════════════════════════════
+# These are the MUTATION tests the 2026-11-03 measurement demands. Each one is
+# stated so that it FAILS against the pre-fix behaviour (a reader keyed on the
+# log's mtime, with one state for "not growing"): the paired Mutation below
+# re-introduces exactly that behaviour and the suite reports the test RED.
+def LR(**kw):
+    base = dict(readable=True, present=True, path="/tmp/L-x.log")
+    base.update(kw)
+    return liv.LogRead(**base)
+
+
+@test("T32 a static LOG + a growing TRANSCRIPT reads `working` — log mtime is not liveness")
+def t32():
+    # The `pi -p` shape: the log froze 40 minutes ago while the lane works hard.
+    # mtime alone says "dead". The transcript's growth says "working".
+    v = liv.log_lane_verdict(LR(size_delta=0, transcript_grew=True, cpu_delta_cs=0,
+                                alive=True, age_ms=40 * M))
+    check(v.state == "working",
+          "a static log with a growing transcript is WORKING; got %s/%s" % (v.state, v.reason))
+    check(v.reason == "progress:transcript", "the reason names the signal; got %r" % v.reason)
+
+    # …and the `pi -p --no-session` shape, which has NO transcript at all: the
+    # CPU delta on the lane's process tree is the signal that survives a silent
+    # tool call. 154 CPU-seconds burned = tortoise #5387's measured lane.
+    v2 = liv.log_lane_verdict(LR(size_delta=0, transcript_grew=None, cpu_delta_cs=15_400,
+                                 alive=True, age_ms=3 * H))
+    check(v2.state == "working" and v2.reason == "progress:cpu",
+          "a CPU-advancing lane with a byte-identical log is WORKING; got %s/%s"
+          % (v2.state, v2.reason))
+
+
+@test("T33 a lane whose process EXITED with no verdict is `no-verdict`, never `frozen`")
+def t33():
+    for age in (10 * M, 3 * H, 30 * H):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="", size_delta=0,
+                                    transcript_grew=False, cpu_delta_cs=0, age_ms=age))
+        check(v.state == "no-verdict",
+              "an exited process that told us nothing reads `no-verdict`, got %s (age %d)"
+              % (v.state, age))
+        check(v.state != "frozen", "an exited process is TERMINAL, never frozen")
+        check("the process ended and told us nothing" in v.detail,
+              "the detail says what happened; got %r" % v.detail)
+    # And it is the SAME answer through the dispatcher a consumer calls.
+    v = liv.evaluate(liv.Evidence(log_read=LR(alive=False, verdict="")))
+    check(v.state == "no-verdict", "evaluate() reaches the log axis; got %s" % v.state)
+
+
+@test("T34 static log + static transcript + zero CPU delta for the WINDOW reads `frozen`")
+def t34():
+    v = liv.log_lane_verdict(LR(alive=True, size_delta=0, transcript_grew=False,
+                                cpu_delta_cs=0, age_ms=liv.LOG_FREEZE_MS + M))
+    check(v.state == "frozen", "both signals flat past the window is frozen; got %s/%s"
+          % (v.state, v.reason))
+    check("window_ms=%d" % liv.LOG_FREEZE_MS in v.detail,
+          "frozen STATES its window; got %r" % v.detail)
+    # A sub-tolerance CPU twitch is NOT progress (the stated tolerance does work).
+    v2 = liv.log_lane_verdict(LR(alive=True, size_delta=0, transcript_grew=False,
+                                 cpu_delta_cs=liv.LOG_CPU_TOL_CS, age_ms=liv.LOG_FREEZE_MS + M))
+    check(v2.state == "frozen", "a delta at the tolerance is NOT progress; got %s" % v2.state)
+    # …and INSIDE the window a flat stretch is the fleet's normal resting state.
+    v3 = liv.log_lane_verdict(LR(alive=True, size_delta=0, transcript_grew=False,
+                                 cpu_delta_cs=0, age_ms=liv.LOG_FREEZE_MS - M))
+    check(v3.state == "working" and v3.reason == "within-window",
+          "flat but inside the window is not frozen; got %s/%s" % (v3.state, v3.reason))
+
+
+@test("T35 a lane with NO log and NO transcript is the ABSTENTION, never `dead`")
+def t35():
+    v = liv.log_lane_verdict(liv.LogRead(readable=False, present=False, path=""))
+    check(v.state == "unknown", "an absent log is an abstention; got %s/%s" % (v.state, v.reason))
+    check(v.state != "dead" and v.state != "no-verdict",
+          "an absence is NOT a death witness (the `no-log-evidence` refusal)")
+    check(v.reason == "log-unreadable", "the reason is named; got %r" % v.reason)
+    # A lane whose signals could not be READ abstains too — never "flat".
+    v2 = liv.log_lane_verdict(LR(alive=True, size_delta=None, transcript_grew=None,
+                                 cpu_unreadable=True, age_ms=3 * H))
+    check(v2.state == "unknown" and v2.reason == "no-progress-signal-readable",
+          "an unreadable signal must never convict; got %s/%s" % (v2.state, v2.reason))
+    # ⛔ AND ONE UNREADABLE SIGNAL IS ENOUGH (the `or` conjunct). With `and` this case
+    # fell through to `frozen`: a readable-but-flat log plus an unreadable CPU channel
+    # is EXACTLY the shape of a lane working through a long silent tool call, so the
+    # conjunction would have rebuilt the log-mtime defect inside the fix.
+    v3 = liv.log_lane_verdict(LR(alive=True, size_delta=0, transcript_grew=False,
+                                 cpu_unreadable=True, cpu_delta_cs=None,
+                                 age_ms=liv.LOG_FREEZE_MS + H))
+    check(v3.state == "unknown",
+          "a flat log with an UNREAD CPU channel is an abstention, never frozen; got %s"
+          % v3.state)
+    v4 = liv.log_lane_verdict(LR(alive=True, size_delta=None, transcript_grew=True,
+                                 cpu_delta_cs=0, age_ms=liv.LOG_FREEZE_MS + H))
+    check(v4.state == "working",
+          "a growing transcript with an unread log delta is still WORKING (progress is "
+          "a veto, not a conjunction); got %s" % v4.state)
+
+
+@test("T36 the log axis is INERT for session queries, and cannot mask session evidence (#1777 B7)")
+def t36():
+    # (a) INERT: with no log_read the ladder answers exactly as it always has.
+    base = ev(jsonl_grew=False, jsonl_age_ms=H, candidates=[])
+    check(liv.evaluate(base).reason == "no-holder-record",
+          "the session ladder is untouched when log_read is None")
+    check(liv.evaluate(ev(log_read=None, candidates=[])).reason == "no-holder-record",
+          "an explicit None is the same as an absent field")
+    # (b) B7: BOTH kinds of evidence in one query is REFUSED by name, not resolved
+    # by whichever axis happens to be checked first.
+    v = liv.evaluate(ev(log_read=LR(alive=False, verdict="finished")))
+    check(v.state == "unknown" and v.reason == "log-read-on-session-query",
+          "a log read on a session query is refused by name; got %s/%s" % (v.state, v.reason))
+
+
+@test("T37 the bound's verdict is PARSED, and only a verdict WITH A CLEAN rc means finished")
+def t37():
+    line = ("[lane-bound] VERDICT verdict=finished tag=lane pid=42 rc=0 elapsed=612s "
+            "wall_bound=3300s idle_bound=1200s silent=3s bytes=9124 bytes_delta=0 "
+            "cpu_cs=15400 cpu_delta_cs=1200 tol_cs=10 cpu_unreadable=0 signal=none log=/tmp/L-x.log")
+    check(liv.parse_bound_verdict(line) == "finished", "the real line parses")
+    check(liv.parse_bound_line(line) == ("finished", "0"),
+          "the rc travels with the verdict; got %r" % (liv.parse_bound_line(line),))
+    check(liv.parse_bound_verdict("nothing here") == "", "no line is NO verdict, not some verdict")
+    check(liv.parse_bound_verdict("[lane-bound] VERDICT verdict=invented-later rc=0") == "",
+          "an unrecognised verdict token is NOT adopted (it would decide an unmodelled state)")
+    check(liv.parse_bound_verdict("".join([line, "\n"]) + line) == "finished",
+          "the LAST line wins (one status line, but a re-run may append)")
+
+    # ⛔ `verdict=finished` IS NOT "the turn completed". `lane-bound.sh` writes it
+    # whenever NO BOUND FIRED and puts the child's real status in `rc=` on the same
+    # line — MEASURED: `lane-bound.sh run --log L -- sh -c 'exit 7'` emits
+    # `verdict=finished … rc=7`. Reading that as `finished` is a false PASS over lost
+    # work: nobody re-dispatches it.
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="7"))
+    check(v.state == "no-verdict", "a crashed lane under verdict=finished is NOT finished; got %s"
+          % v.state)
+    check(v.reason == "bound-finished-rc:7", "the rc is named; got %r" % v.reason)
+    # `na` is `watch` mode's shape (the supervised pid's status is not the bound's).
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na"))
+    check(v.state == "finished", "watch-mode `rc=na` with verdict=finished is finished; got %s"
+          % v.state)
+    # An rc that cannot be read is an ABSTENTION, never an assumed success.
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=None))
+    check(v.state == "unknown" and v.reason == "finished-rc-unreadable",
+          "a verdict without a readable rc abstains; got %s/%s" % (v.state, v.reason))
+
+    # A bound KILL is real death (mechanism 3), and it must not read `finished`.
+    for killed in ("stalled", "exceeded-wallclock"):
+        v = liv.log_lane_verdict(LR(alive=False, verdict=killed, rc="143"))
+        check(v.state == "dead",
+              "verdict=%s is real death, not a finish; got %s" % (killed, v.state))
+        check(v.reason == "bound-verdict:%s" % killed, "the verdict is named; got %r" % v.reason)
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="0"))
+    check(v.state == "finished" and v.reason == "bound-verdict:finished",
+          "verdict=finished with rc=0 is `finished`; got %s/%s" % (v.state, v.reason))
+
+
+@test("T38 the three lanes MEASURED on 2026-11-03 decide correctly (the before/after table)")
+def t38():
+    # `land-10762`: log frozen 18:46, called dead at 19:07 (21 min), and its tail is
+    # `session (27 turns, 2 PRs) saved` + the reflect-hook ran. It FINISHED.
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="0", size_delta=0,
+                                transcript_grew=None, cpu_delta_cs=0, age_ms=21 * M,
+                                size=412))
+    check(v.state == "finished", "land-10762 finished; got %s/%s" % (v.state, v.reason))
+    # `harness-provision-cells`: 210 B artefact, `[verification-gate] ✅ 7 files verified`
+    # + `[review-enforcer] ✅ 3 reviewer dispatches`, no lane-bound verdict line at all.
+    v = liv.log_lane_verdict(LR(alive=False, verdict="", size=210, size_delta=0,
+                                cpu_delta_cs=0, age_ms=60 * M))
+    check(v.state == "no-verdict",
+          "harness-provision-cells finished without a verdict ⇒ `no-verdict`; got %s" % v.state)
+    check(v.state != "dead", "a finished lane must never read dead")
+    # `p0-10537` / `p0-5064`: genuinely frozen — re-dispatch was necessary.
+    v = liv.log_lane_verdict(LR(alive=True, size_delta=0, transcript_grew=False,
+                                cpu_delta_cs=0, age_ms=3 * H))
+    check(v.state == "frozen", "a genuinely frozen lane reads frozen; got %s" % v.state)
+
+
+@test("T39 `_cpu_time_cs` accepts BOTH platforms' `ps` time spellings, and a bad row abstains")
+def t39():
+    # GNU: mm:ss / hh:mm:ss / dd-hh:mm:ss.  BSD/macOS: MM:SS.cc / HH:MM:SS.cc.
+    cases = {
+        "00:00": 0, "00:03": 300, "1:02": 6200, "01:02:03": 372300,
+        "2-01:02:03": 17652300,
+        # ⛔ THE MAC SHAPE. The Mac is where `cmux.app` fleet ancestry (and therefore
+        # the fleet's lanes) lives, so rejecting the fractional form made S2
+        # permanently unreadable there.
+        "0:00.50": 50, "1:02.33": 6233, "1:02:03.45": 372345,
+        "": None, "garbage": None, "1:99": None, "1:02:60": None,
+    }
+    for text, want in cases.items():
+        got = liv._cpu_time_cs(text)
+        check(got == want, "_cpu_time_cs(%r) => %r, wanted %r" % (text, got, want))
+
+    d = tempfile.mkdtemp(prefix="liv-ps-")
+    try:
+        table = os.path.join(d, "table")
+        shim = os.path.join(d, "ps")
+
+        def run(body):
+            with open(table, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            with open(shim, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\ncat %s\n" % table)
+            os.chmod(shim, 0o755)
+            return liv.subtree_cpu_cs(100, ps_bin=shim)
+
+        # root 100 (1 s) + child 101 (2 s) + grandchild 102 (0.5 s) = 3.5 s = 350 cs
+        got = run("100 1 00:01\n101 100 00:02\n102 101 0:00.50\n200 1 09:00\n")
+        check(got == 350, "the subtree sum is root+descendants only; got %r" % (got,))
+        # An unparseable row INSIDE the subtree abstains the whole total — a smaller
+        # total is how a busy tree reads flat.
+        got = run("100 1 00:01\n101 100 nope\n")
+        check(got is None, "an unread member abstains the total, never undercounts; got %r" % (got,))
+        # …but an unparseable row OUTSIDE it is irrelevant.
+        got = run("100 1 00:01\n999 1 nope\n")
+        check(got == 100, "a sibling's bad row does not affect our subtree; got %r" % (got,))
+        check(liv.subtree_cpu_cs(4242, ps_bin=shim) is None, "an absent pid is not 0 CPU")
+        check(liv.subtree_cpu_cs(100, ps_bin=os.path.join(d, "nope")) is None,
+              "an unreadable ps is an abstention")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T40 `gather_log_lane` turns every failure path into the ABSTENTION, never a state")
+def t40():
+    d = tempfile.mkdtemp(prefix="liv-log-")
+    try:
+        log = os.path.join(d, "L-x.log")
+        vfile = os.path.join(d, "verdict")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("working...\n")
+
+        lr = liv.gather_log_lane(log, 10, sample=False, now_ms=NOW_MS)
+        check(lr.readable and lr.present, "the log reads")
+        check(lr.size == 11, "the size is read; got %r" % (lr.size,))
+        check(lr.verdict == "", "no verdict line means no verdict; got %r" % (lr.verdict,))
+        check(lr.size_delta is None and lr.cpu_delta_cs is None,
+              "with sample=False the deltas are NOT READ (None), never 0")
+        check(lr.alive is None, "an unfenceable pid (no start time) is an ABSTENTION")
+        check(liv.evaluate(liv.Evidence(log_read=lr)).state == "unknown",
+              "an unreadable identity/CPU abstains")
+
+        lr = liv.gather_log_lane(os.path.join(d, "nope.log"), 10, sample=False, now_ms=NOW_MS)
+        check(not lr.readable and not lr.present, "absent is absent")
+        check(liv.evaluate(liv.Evidence(log_read=lr)).state == "unknown",
+              "an absent log must never publish a state")
+
+        lr = liv.gather_log_lane(d, 10, sample=False, now_ms=NOW_MS)
+        check(not lr.readable and lr.present, "present-but-unreadable is its own fact")
+        check(liv.evaluate(liv.Evidence(log_read=lr)).state == "unknown",
+              "an unreadable log must never publish a state")
+
+        # the verdict FILE outranks the log's tail, and the rc travels with it
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=stalled tag=t pid=1 rc=143 foo=1\n")
+        with open(vfile, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=t pid=1 rc=0 foo=1\n")
+        lr = liv.gather_log_lane(log, 10, verdict_file=vfile, sample=False, now_ms=NOW_MS)
+        check((lr.verdict, lr.rc) == ("finished", "0"),
+              "the verdict file wins and its rc travels; got %r" % ((lr.verdict, lr.rc),))
+        check(lr.verdict_source == "verdict-file", "the source is declared; got %r" % lr.verdict_source)
+        lr = liv.gather_log_lane(log, 10, sample=False, now_ms=NOW_MS)
+        check((lr.verdict, lr.rc, lr.verdict_source) == ("stalled", "143", "log"),
+              "the log tail is the fallback; got %r"
+              % ((lr.verdict, lr.rc, lr.verdict_source),))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T41 the `--log-census` seam decodes STRICTLY: an unrecognised token is not a death witness")
+def t41():
+    def census(lines, argv=None):
+        buf = io.StringIO()
+        old = sys.stdin
+        sys.stdin = io.StringIO("\n".join(lines) + "\n")
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = liv._log_lane_cli(argv or ["--log-census"])
+        finally:
+            sys.stdin = old
+        return rc, [ln.split("\t") for ln in buf.getvalue().splitlines()]
+
+    rc, rows = census([
+        "11\t/tmp/L.log\t0\t0\t\t1\t200000\t9\t0",
+        # ⛔ `alive=2` is NOT READ — it used to decode as a POSITIVE False, i.e. a death
+        # witness manufactured out of an unreadable field.
+        "12\t/tmp/L.log\t0\t0\t\t2\t3000000\t9\t0",
+        # ⛔ an unrecognised `transcript_grew` token is not a flat `False` either: with
+        # the log delta UNREAD, a token read as `False` would leave both output signals
+        # "flat" and convict the lane.
+        "13\t/tmp/L.log\t?\t0\t\t1\t3000000\t9\tmaybe",
+        "14\t/tmp/L.log\t0\t0\tfinished\t0\t3000000\t412\t\t0",
+        "15\t-\t?\t?\t\t?\t?\t?\t?",
+    ])
+    by_pid = {r[0]: (r[1], r[2]) for r in rows}
+    check(by_pid["11"] == ("working", "within-window"), "row 11: %r" % (by_pid["11"],))
+    check(by_pid["12"][0] == "unknown",
+          "an unreadable `alive` must ABSTAIN, not publish a terminal state; got %r"
+          % (by_pid["12"],))
+    check(by_pid["13"][0] == "unknown",
+          "an unrecognised transcript token must ABSTAIN; got %r" % (by_pid["13"],))
+    check(by_pid["14"] == ("finished", "bound-verdict:finished"), "row 14: %r" % (by_pid["14"],))
+    check(by_pid["15"][0] == "unknown", "row 15: %r" % (by_pid["15"],))
+    check(rc == 3, "an abstaining census exits 3 (cannot-verify); got %r" % (rc,))
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -1454,6 +1760,92 @@ class Mutation:
 
 
 MUTATIONS = [
+    Mutation(
+        "T32", "module",
+        '    if kinds:\n        numbers = []',
+        '    if False and kinds:\n        numbers = []',
+        "the progress VETO is dropped, so a lane working through a long silent tool call "
+        "reads `frozen` — the log-mtime-keyed behaviour the 2026-11-03 table measured",
+    ),
+    Mutation(
+        "T33", "module",
+        '    if lr.alive is False:',
+        '    if False and lr.alive is False:',
+        "an EXITED process falls through to the freeze ladder, so a finished lane reads "
+        "`frozen` and invites a re-dispatch that re-does finished work",
+    ),
+    Mutation(
+        "T34", "module",
+        '    if lr.age_ms < freeze_ms:',
+        '    if lr.age_ms < 0:',
+        "the freeze WINDOW is dropped, so any single flat reading convicts a live lane",
+    ),
+    Mutation(
+        "T35", "module",
+        '        return Verdict("unknown", "log-unreadable", detail=lr.detail or ("path=%s" % (lr.path or "?")))',
+        '        return Verdict("dead", "log-unreadable", detail=lr.detail or ("path=%s" % (lr.path or "?")))',
+        "an ABSENT log becomes a death witness — the `no-log-evidence` fail-open `lane-reap.sh` "
+        "already refuses, reintroduced on the diagnostic",
+    ),
+    Mutation(
+        "T36", "module",
+        '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
+        '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
+        '                or ev.tool is not None or ev.jsonl_turn is not None:\n',
+        '        if False:\n',
+        "the log axis accepts a query that ALSO carries session/claim evidence, so a log "
+        "read can mask it (the #1777 B7 shape, reconstructed on the new axis)",
+    ),
+    Mutation(
+        "T37", "module",
+        '            if lr.verdict in BOUND_FINISHED:',
+        '            if True:',
+        "every bound verdict reads `finished`, so a lane the bound KILLED (stalled / "
+        "exceeded-wallclock) is reported as having completed",
+    ),
+    Mutation(
+        "T35", "module",
+        '    if no_output or no_cpu:',
+        '    if no_output and no_cpu:',
+        "the abstention conjunct becomes `and`, so a flat log with an UNREADABLE CPU "
+        "channel reads `frozen` — `frozen` on ONE signal, which is the log-mtime defect "
+        "rebuilt inside its own fix",
+    ),
+    Mutation(
+        "T36", "module",
+        '    if ev.log_read is not None:\n        # \u26d4 THE REFUSAL',
+        '    if True:\n        # \u26d4 THE REFUSAL',
+        "the axis stops being INERT for session callers: every query enters the log "
+        "branch, so a session verdict can be replaced by a log one (or by the refusal)",
+    ),
+    Mutation(
+        "T37", "module",
+        '                if lr.rc not in BOUND_OK_RC:',
+        '                if False:',
+        "the rc conjunct is dropped, so `verdict=finished rc=7` — a CRASHED lane — reads "
+        "`finished` and nobody re-dispatches the work it lost",
+    ),
+    Mutation(
+        "T39", "module",
+        '    return ((days * 24 + hh) * 3600 + mm * 60 + ss) * 100 + frac',
+        '    return ((days * 24 + hh) * 3600 + mm * 60 + ss) * 100',
+        "BSD/macOS fractional seconds are dropped, so a sub-second CPU delta reads as a "
+        "smaller (or flat) number on the only platform where the fleet has lanes",
+    ),
+    Mutation(
+        "T39", "module",
+        '        if p in bad:\n',
+        '        if False:\n',
+        "an unparseable row inside the subtree is silently skipped, so the total "
+        "undercounts and a busy tree reads flat -> `frozen`",
+    ),
+    Mutation(
+        "T41", "module",
+        '                return None  # "", "?", "2", "gone" \u2026 \u2014 NOT READ',
+        '                return False',
+        "the census seam decodes any unrecognised token as a POSITIVE False, i.e. it "
+        "manufactures a death witness out of an unread field",
+    ),
     Mutation(
         "T1", "lib",
         '    if [ "$diff" -le "$FENCE_TOLERANCE_SECONDS" ]; then',
