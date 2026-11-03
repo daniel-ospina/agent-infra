@@ -285,8 +285,8 @@ MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
 # fallback. Nothing in the knob set bounds total WIP, which is why the queue grows monotonically.
 # WHAT IT IS: ONE MORE ARM IN THE SAME GATE VECTOR — it sets `GATE_WHY` (so the ISSUE path closes)
 # exactly as `merge-priority` does, and nothing else. It is a WIP limit, not a quota: an unreadable
-# count fails CLOSED (drain), and the door for a red-on-main repair / P0 stays open because that is
-# `floor_emergency`'s existing exemption on the candidate queue, untouched here.
+# or out-of-range count fails CLOSED (drain). A red-tree / P0 that `floor_emergency` can see stands
+# the arm down (see the call site — the bound on what that covers is stated there, not glossed).
 # WHY 25, AND WHY PER-REPO: 25 is the OWNER's own chosen queue size (the `MERGE_PRIORITY_AT` ruling —
 # "something more like 10 PRs who are not being processed", scaled to 25). It is applied PER REPO
 # because WIP is only landable where it lives — a merged PR in tortoise does not drain agent-infra's
@@ -5789,25 +5789,47 @@ PY
   # the PR it opens — so producing MORE work moves the gate's own input toward zero. Total WIP is
   # invisible to it. This arm reads the total open count, which is the population the queue actually
   # grows in, and closes the issue path at `LANDING_FLOOR`.
-  # ⛔ PURE BUILTINS ON PURPOSE: this block is EXTRACTED and evaled in a bare subshell by
-  # test-gates.sh (the `gv()` harness), where `is_num` is not defined — a helper call here would be
-  # `command not found`, GATE_WHY would stay empty, and the arm would silently never fire.
-  # ⛔ POLARITY: unreadable => CLOSED (drain), never open. A leading-zero count is treated as
-  # unreadable for the same reason `is_num` rejects it everywhere else in this file: `[ 08 -ge 25 ]`
-  # reads 8 and would OPEN the gate on a number that was never valid.
+  # ⛔ THE DOOR FOR A RED TREE / P0 IS THIS CALL, NOT A CLAIM IN A COMMENT. An emergency that
+  # `floor_emergency` can see OUTRANKS the floor: the arm stands down and the cycle produces the
+  # repair instead. `declare -f` guards the call because this block is EXTRACTED and evaled STANDALONE
+  # by the suite, where the function is unbound (the same `declare -f lo_select` idiom used below) —
+  # an unguarded call would return 127 and read as "no emergency", the fail-OPEN direction.
+  # ⚠️ BOUND ON THAT DOOR, STATED SO IT IS NOT OVERREAD: `floor_emergency` only speaks when it has a
+  # product row it could reorder (its own gate (0)), so on an EMPTY product backlog the floor still
+  # arms. That reachability is the same one `merge-priority` already had and is not widened here —
+  # the exemption is the mechanism, and what it does not cover is said rather than assumed.
   LF_M="${LANDING_FLOOR:-25}"
   case "$LF_M" in ''|*[!0-9]*|0?*) LF_M=25 ;; esac
   [ "$LF_M" -ge 1 ] || LF_M=25
+  LF_EMERG=""
+  declare -f floor_emergency >/dev/null 2>&1 && LF_EMERG="$(floor_emergency "${O:-}" "${BATCH:-1}" 2>/dev/null)"
   case "${OPEN_N:-}" in
     ''|*[!0-9]*|0?*)
       GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
       GATE_VEC="$GATE_VEC landing-floor=UNKNOWN" ;;
     *)
-      if [ "${OPEN_N}" -ge "$LF_M" ]; then
-        GATE_WHY="${GATE_WHY:-landing-floor(${OPEN_N} open PR(s) >= ${LF_M} — landing before producing)}"
-        GATE_VEC="$GATE_VEC landing-floor=REFUSE(${OPEN_N}>=${LF_M})"
+      # ⛔ THE LENGTH BOUND IS NOT DECORATION: `[` ERRORS at or above 2^63 and an ERRORED test is
+      # FALSE, which OPENS the gate — that is the exact reason `is_limit` exists. `is_limit` is not in
+      # scope inside this extracted block, so the bound is stated here. An arm whose whole purpose is
+      # "this cannot fail open" must not leave its one fail-open input unbounded.
+      if [ "${#OPEN_N}" -gt 6 ]; then
+        GATE_WHY="${GATE_WHY:-landing-floor(open PR count OUT OF RANGE (${#OPEN_N} digits) — landing before producing)}"
+        GATE_VEC="$GATE_VEC landing-floor=UNKNOWN(out-of-range)"
       else
-        GATE_VEC="$GATE_VEC landing-floor=ok(${OPEN_N}<${LF_M})"
+        # ⛔ NESTED `if`, NOT `elif`: `elif` is banned inside the vector block (test v9) because that
+        # is the shape by which one arm MASKED every later one (#2924). These branches select among
+        # THIS arm's own verdicts, never among arms — but the structural rule cannot tell the
+        # difference, and a rule that has to be interpreted is the one that gets broken.
+        if [ -n "$LF_EMERG" ]; then
+          GATE_VEC="$GATE_VEC landing-floor=exempt(${LF_EMERG} outranks ${OPEN_N}>=${LF_M})"
+        else
+          if [ "${OPEN_N}" -ge "$LF_M" ]; then
+            GATE_WHY="${GATE_WHY:-landing-floor(${OPEN_N} open PR(s) >= ${LF_M} — landing before producing)}"
+            GATE_VEC="$GATE_VEC landing-floor=REFUSE(${OPEN_N}>=${LF_M})"
+          else
+            GATE_VEC="$GATE_VEC landing-floor=ok(${OPEN_N}<${LF_M})"
+          fi
+        fi
       fi ;;
   esac
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load

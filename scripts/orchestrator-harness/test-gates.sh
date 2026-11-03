@@ -3512,7 +3512,7 @@ else
   _t="$(gv)"; _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
   [ "$_why" = "<open>" ] && echo "  ok (v1) a box with no gate reports NO winner" && PASS=$((PASS+1)) \
     || { echo "  ❌ (v1) a clean box reported a winner: $_why"; FAIL=$((FAIL+1)); }
-  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Ten tokens is the arm count
+  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Eleven tokens is the arm count
   # this block has; an arm DELETED from the vector while its predicate stays reddens here.
   _missing=""
   for _arm in 'merge-priority' 'landing-floor=' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
@@ -3597,6 +3597,36 @@ ARMS
   case "$_why" in
     landing-floor\(open*) echo "  ok (v14) a leading-zero count is UNREADABLE, not 8 (the base-0 trap)" && PASS=$((PASS+1)) ;;
     *) echo "  ❌ (v14) a leading-zero count was read as a valid number: $_why"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AN OUT-OF-RANGE COUNT IS THE ARM'S ONE REMAINING FAIL-OPEN INPUT: `[` ERRORS at or above 2^63
+  # and an ERRORED test is FALSE, which OPENS the gate. `is_limit` bounds it in the loop, but it is
+  # NOT in scope inside this extracted block — so the bound must live in the block, and it is graded
+  # here rather than trusted.
+  _why="$(gv OPEN_N=99999999999999999999 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(open*) echo "  ok (v16) an out-of-range count drains instead of erroring the test open" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v16) a 2^63+ count OPENED the gate (errored test read as FALSE): $_why"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE RED-TREE / P0 DOOR IS A CALL, NOT A COMMENT: with `floor_emergency` in scope and returning a
+  # reason, the floor must STAND DOWN. Driven by supplying the function the block calls.
+  _why="$( gv OPEN_N=68 LANDING_FLOOR=25 )"  # baseline: no floor_emergency in scope => the floor arms
+  case "$_why" in
+    landing-floor*) ;; *) echo "  ❌ (v17) baseline: the floor did not arm without an emergency"; FAIL=$((FAIL+1)) ;; esac
+  _t="$( GVX=1; ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=68; FORK_STARVED=0; FORK_WHY=""
+         CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
+         L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
+         SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+         LANDING_FLOOR=25; O=/nonexistent; BATCH=1
+         floor_emergency() { printf 'red-tree(#1234)'; }
+         eval "$GV" >/dev/null 2>&1
+         printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-}" ) )"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  if [ "$_why" = "<open>" ]; then
+    echo "  ok (v17) a red-tree emergency STANDS THE FLOOR DOWN (the door is real, not a claim)" && PASS=$((PASS+1))
+  else
+    echo "  ❌ (v17) a red-tree emergency did not stop the floor: winner=$_why"; FAIL=$((FAIL+1))
+  fi
+  case "$_vec" in
+    *'landing-floor=exempt('*) echo "  ok (v18) …and the exemption is NAMED in the vector, not silent" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v18) the floor stood down without naming why: $_vec"; FAIL=$((FAIL+1)) ;; esac
   # ⛔ FIRST-WINS IS PRESERVED: the floor is ADDITIVE. When merge-priority already holds the gate, the
   # floor must not steal the label — the operator must keep seeing the ORIGINAL reason.
   _why="$(gv GATE_WHY='merge-priority(3 un-owned of 68 open PR(s) — PRs before issues)' OPEN_N=68 LANDING_FLOOR=25 | cut -f1)"
