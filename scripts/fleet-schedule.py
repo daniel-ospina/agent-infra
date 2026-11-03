@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import errno
 import json
+import math
 import os
 import re
 import signal
@@ -406,6 +407,10 @@ class Job:
 
 
 def human_secs(seconds: float) -> str:
+    # ⛔ A NON-FINITE AGE IS NOT AN AGE. `int(inf)` raises OverflowError and `int(nan)` raises
+    # ValueError, and a stamp carrying either reaches this from `--verify`'s IN-THE-FUTURE arm.
+    if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+        return "an unusable age (%r)" % (seconds,)
     seconds = int(seconds)
     if seconds < 90:
         return "%ds" % seconds
@@ -999,12 +1004,30 @@ def run_job(job):
         return None
     started = time.time()
     mark_busy(job.label, started)
-    log_path = job.log_path()
+    # ⛔ THE FALLBACK `os.makedirs` BELOW USED TO SIT OUTSIDE ANY GUARD, between the lock and the
+    # `try:`/`finally:` that is the ONLY place the lock and busy marker are released. It raises on
+    # ENOSPC/EACCES — so on the very trigger this change exists for, the exception escaped with the
+    # lock still held by the LOOP'S OWN live pid, and the job was wedged for ever: "already running
+    # (lock held)" on every pass while `--verify` certified it. Measured, and it survived recovering
+    # the disk. `mark_busy` is already best-effort internally; the log path was not.
+    # Moved inside the guarded region, whose failure path now releases explicitly.
     try:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    except OSError:
-        log_path = os.path.join(STATE, "logs", job.label + ".log")
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        log_path = job.log_path()
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        except OSError:
+            log_path = os.path.join(STATE, "logs", job.label + ".log")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    except OSError as exc:
+        # Could not even decide where to log: release and report, rather than wedge.
+        log("ERROR %s could not be started (%s: %s) — nothing was run, the job is NOT locked"
+            % (job.label, type(exc).__name__, exc))
+        clear_busy(job.label)
+        try:
+            os.unlink(lock)
+        except OSError:
+            pass
+        return None
 
     env = {"HOME": os.environ.get("CELL_HOME") or os.environ.get("HOME", "")}
     for name in ("PATH", "LANG", "LC_ALL", "TMPDIR"):
@@ -1270,7 +1293,15 @@ def cmd_loop():
             # prevent, so the guard must be as wide as the ways a pass can fail. SystemExit is a
             # BaseException, so `--stop` and the signal handlers are unaffected.
             report_bookkeeping_failure(exc)
-        time.sleep(max(5, TICK))
+        # ⛔ THE LAST UNGUARDED STATEMENT IN THE LOOP. `TICK` comes from an env var with no upper
+        # bound, so `FLEET_SCHEDULE_TICK=10**20` made `time.sleep` raise OverflowError ("timestamp
+        # too large") and killed the loop at the end of its FIRST pass — after writing a fresh
+        # tick, so `--verify` read healthy for max(3*TICK,300) before failing. Clamped, and the
+        # sleep itself guarded as the belt: a scheduler must never die between two passes.
+        try:
+            time.sleep(max(5, min(TICK, 86400)))
+        except Exception as exc:  # noqa: BLE001 — the loop must outlive its own pause
+            report_bookkeeping_failure(exc)
     try:
         os.unlink(pidfile)
     except OSError:
@@ -1370,14 +1401,27 @@ def print_table(jobs, now):
         if job.skip:
             print("  SKIP   %-38s %-18s %s" % (job.label, job.cadence, job.skip))
             continue
-        stamp = read_stamp(job.label)
-        last = fmt_age(now - stamp["started"]) if stamp else "never"
-        rc = "" if not stamp else " rc=%s" % stamp.get("rc")
-        at = due_at(job, stamp, now)
-        nxt = fmt_until(None if at is None else at - now)
+        # ⛔ ONE BAD FILE MUST NOT BLANK THE TABLE. A stamp that is not an object, a missing or
+        # non-numeric `started`, or a calendar value that is not a number used to raise straight
+        # out of this loop, so `--status` — the truth table the docs point operators at, and the
+        # surface they reach right after `--verify` says a hand-edit broke something — printed NO
+        # rows at all. That is the same "aborts for every job after it" defect fixed in --verify.
+        try:
+            cadence = job.cadence          # itself raises on a non-numeric calendar value
+            stamp = read_stamp(job.label)
+            last = fmt_age(now - stamp["started"]) if stamp else "never"
+            rc = "" if not stamp else " rc=%s" % stamp.get("rc")
+            at = due_at(job, stamp, now)
+            nxt = fmt_until(None if at is None else at - now)
+        except Exception as exc:  # noqa: BLE001 — one bad stamp is one table row
+            # ⛔ NOT job.cadence here: for a non-numeric calendar value THAT is what just raised,
+            # so re-evaluating it inside the handler raised again and blanked the table anyway.
+            print("  BROKEN %-38s %-18s unusable stamp/calendar (%s: %s) — clear: rm -f %s"
+                  % (job.label, "-", type(exc).__name__, exc, stamp_path(job.label)))
+            continue
         print(
             "  ok     %-38s %-18s last=%-11s%s next=%s  log=%s"
-            % (job.label, job.cadence, last, rc, nxt, job.log_path())
+            % (job.label, cadence, last, rc, nxt, job.log_path())
         )
 
 
@@ -1604,7 +1648,13 @@ def cmd_verify():
         # string raised TypeError out of --verify — the surface whose whole job is to DIAGNOSE the
         # unusable stamp that the loop now skips. Report it as the failure it is.
         started = stamp.get("started")
-        if not isinstance(started, (int, float)) or isinstance(started, bool):
+        # ⛔ isfinite, not just isinstance: `json.load` parses NaN/Infinity happily, NaN satisfies
+        # isinstance(int,float), and EVERY comparison against NaN is False — so a NaN `started`
+        # passed the type check, made `due_at` permanently not-due with no exception for the loop's
+        # per-job guard to catch, and `--verify` then certified the job `SCHEDULE VERIFIED` (rc=0)
+        # with zero runs and an empty log. Measured. ±Infinity dies further down in human_secs().
+        if not isinstance(started, (int, float)) or isinstance(started, bool) \
+                or not math.isfinite(started):
             failures.append(
                 "%s: its last-run stamp has no usable 'started' value (%r) — a hand-edit or a "
                 "foreign writer broke it, so its due-ness cannot be trusted; clear: rm -f %s"

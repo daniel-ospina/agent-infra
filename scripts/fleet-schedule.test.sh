@@ -1524,20 +1524,67 @@ kill -0 "$pidf" 2>/dev/null && ok "the loop survived the failed stamp write" \
   || bad "the loop died on a failed stamp write"
 run "$GOOD" --stop >/dev/null 2>&1
 
-# 18g — --verify must NAME unusable stamp/calendar values, not raise. It is the surface whose whole
-# job is to diagnose bad state, and it used to traceback (aborting the check for every job after the
-# broken one) on: a stamp that is not an object, and a calendar value that is not a number.
+# 18g — --verify/--status must NAME unusable stamp/calendar values, not raise. They are the
+# surfaces whose whole job is to DIAGNOSE bad state, and they used to traceback (aborting the check
+# for every job after the broken one) on: a stamp that is not an object, a `started` that is not a
+# finite number, and a calendar value that is not a number.
+# ⚠️ No `rc -eq 1` assertion here: `--verify` fails for many reasons, so that arm could never fail
+# (a mutation test showed it stayed green with the guard removed). The oracle is the absence of a
+# traceback plus a message that NAMES the broken job — both of which disappear with the guard.
 state_reset "$GOOD"
 run "$GOOD" --install >/dev/null 2>&1
-run "$GOOD" --stop >/dev/null 2>&1
-printf '[1, 2, 3]\n' > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
-outg="$(run "$GOOD" --verify)"; rcg=$?
-[ "$rcg" -eq 1 ] && ok "a non-object stamp FAILS --verify (rc=1)" || bad "expected rc=1 for a non-object stamp, got $rcg"
-[ "$(grep -c 'Traceback' <<<"$outg")" -eq 0 ] && ok "no traceback out of --verify" \
-  || bad "--verify raised instead of reporting: $outg"
-grep -q 'not a job record' <<<"$outg" && ok "the failure names the broken stamp" \
-  || bad "the failure is not diagnosable: $outg"
+badstamp() { # badstamp <label> <json> <needle>
+  printf '%s\n' "$2" > "$FLEET_SCHEDULE_STATE/jobs/$1.json"
+  local out rc
+  out="$(run "$GOOD" --verify)"; rc=$?
+  if [ "$(grep -c 'Traceback' <<<"$out")" -eq 0 ] && grep -q "$3" <<<"$out"; then
+    ok "--verify names a $3 instead of raising"
+  else
+    bad "--verify did not diagnose '$3' (rc=$rc): $out"
+  fi
+  rm -f "$FLEET_SCHEDULE_STATE/jobs/$1.json"
+}
+badstamp com.test.hourly '[1, 2, 3]' "not a job record"
+badstamp com.test.hourly '{"label": "com.test.hourly", "started": NaN, "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
+badstamp com.test.hourly '{"label": "com.test.hourly", "started": 1e999, "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
+badstamp com.test.hourly '{"label": "com.test.hourly", "started": "yesterday", "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
+# NaN must not read as "live": every comparison against NaN is False, so an unguarded type check
+# certified it SCHEDULE VERIFIED (rc=0) with zero runs and an empty log — the closed loop again.
+printf '{"label": "com.test.hourly", "started": NaN, "finished": 1, "rc": 0, "duration": 0}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+out_nan="$(run "$GOOD" --verify)"; rc_nan=$?
+[ "$rc_nan" -eq 1 ] && ok "a NaN started FAILS --verify (it is never due, and never runs)" \
+  || bad "a NaN started was certified healthy (rc=$rc_nan): $out_nan"
 rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+
+# A calendar value that is not a number: load_jobs validates a calendar's SHAPE, not its values.
+BAD_CAL="$FIX/badcal"; mkdir -p "$BAD_CAL"; cp "$GOOD/RETIRED" "$BAD_CAL/RETIRED" 2>/dev/null || true
+cat > "$T/badcal.spec" <<PL
+PLIST = {
+    "Label": "com.test.badcal",
+    "ProgramArguments": ["/bin/sh", "-c", "true"],
+    "StartCalendarInterval": {"Hour": "noon", "Minute": 0},
+}
+PL
+mkplist "$BAD_CAL" com.test.badcal "$T/badcal.spec"
+mkdir -p "$FLEET_SCHEDULE_STATE/jobs"
+printf '{"label": "com.test.badcal", "started": 1, "finished": 2, "rc": 0, "duration": 1}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.badcal.json"
+out_cal="$(TEMPLATES_DIR="$BAD_CAL" python3 "$SCHED" --verify 2>&1)"; rc_cal=$?
+if [ "$(grep -c 'Traceback' <<<"$out_cal")" -eq 0 ] \
+   && grep -qE "unusable value|unusable calendar|calendar has an unusable" <<<"$out_cal"; then
+  ok "--verify names a non-numeric calendar value instead of raising"
+else
+  bad "--verify raised on a non-numeric calendar value (rc=$rc_cal): $out_cal"
+fi
+out_stat="$(TEMPLATES_DIR="$BAD_CAL" python3 "$SCHED" --status 2>&1)"
+if [ "$(grep -c 'Traceback' <<<"$out_stat")" -eq 0 ] && grep -q 'com.test.badcal' <<<"$out_stat"; then
+  ok "--status still prints a row for a job with a non-numeric calendar value"
+else
+  bad "--status tracebacked or dropped the row: $out_stat"
+fi
+rm -rf "$BAD_CAL"
+run "$GOOD" --stop >/dev/null 2>&1
 
 # 18c — the OTHER two ways a pass can fail escape the loop, both found by fresh-context review and
 # both measured to kill the shipped pre-fix loop (rc=1, every job on the box stopped for good):
