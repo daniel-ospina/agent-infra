@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# mandate-preflight.sh — the files a lane's OWN instructions order it to read FIRST, and whether they
+# exist on THIS box (agent-infra#3377).
+#
+# WHY THIS FILE EXISTS. The dispatch brief for lane `harness-provision-cells` (2026-11-03) opens by
+# saying that every brief the orchestrator writes does: "READ §0 and §0b of LANE-BRIEF-PREAMBLE.md
+# FIRST" — and a consumer repo's (tortoise) `AGENTS.md` skill table orders every lane to read
+# `~/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md` BEFORE it derives anything. Measured 2026-11-03 on
+# cell-3 (`vm-915c3930…`): NEITHER file exists — `ls -l` is rc=2 for both — and nothing said so, so
+# every lane on that box proceeded exactly as though it had read them. That is the inert-enforcer
+# class: a mandate that cannot be satisfied, in silence, and a lane cannot report what it was never
+# told was missing.
+#
+# ⛔ ONE CLAIM HERE IS THE BRIEF'S, NOT THIS TREE'S, AND IT IS LABELLED SO ON PURPOSE. The shipped
+# `templates/LANE-BRIEF.md` does NOT cite the preamble (measured: `grep -c LANE-BRIEF-PREAMBLE` = 0),
+# and NO FILE OF THAT NAME exists in either repo at `origin/main` (`git ls-tree -r` matches nothing in
+# agent-infra or tortoise) — the preamble is hand-authored out-of-tree state, and "every brief" above
+# is the one sample that was measured, not a survey. The GRAPH brief, by contrast, IS witnessed
+# in-tree: `skills/research/SKILL.md` names it as the graph's write path and error-code table, and a
+# consumer repo's `AGENTS.md` skill table orders the read. So the preamble line below attributes the
+# order to the DISPATCH BRIEF, which is where it is actually issued, and a template-derived brief that
+# never gave that order reads the block as a statement about the box rather than a rule it was handed.
+# A next reader cannot verify an in-repo claim about out-of-tree text, and must not be invited to trust
+# one.
+#
+# THE ROOT is why this file CHECKS instead of copying. There is no provisioning path for these files on
+# ANY box: `pi-bootstrap/setup.sh` states that the farm never creates or copies into `$DEST/state/`, and
+# NEITHER NAME EXISTS IN ANY REPO — `git ls-tree -r origin/main` on agent-infra AND tortoise matches
+# neither — so the only copies are hand-authored state on the orchestrator's own machine, and no cell can
+# ever receive one. Shipping the CONTENT is #1193's job (a live, hand-added instruction with no source of
+# truth); inventing it here would mint a SECOND source of truth for rules the owner authored by hand,
+# which is the defect #1193 records, not a fix for it. What this file does is the half that is
+# unambiguous: name the absence, per box, at the moment a lane starts.
+#
+# ⛔ WARNS, NEVER REFUSES — AND THE POLARITY IS DELIBERATE. Precedents: #3256's `check_graph_client`
+# ("warns, never dies … what must not survive is the SILENT version"), #2148's `reviewer-preflight.sh`.
+# A refusal here would make every cell undispatchable until a file no cell can obtain is supplied — an
+# over-block, and a worse failure than the one it fixes. A refusal is the right polarity for a brief the
+# AUTHOR can fix (#2258, exit 80); this is box state the author cannot fix from a brief.
+#
+# ⛔ IT IS NOT A GATE AND CANNOT BECOME ONE: it cannot tell whether a lane READ a file that IS present.
+# It reports presence, which is all a machine can decide here, and says so rather than manufacturing
+# confidence — the same stated limit `brief-gate.sh` carries about judging research quality.
+#
+# THE SURFACE (sourceable, no side effects; or executable):
+#   mandate_preflight_emit <log> <prompt> <label>
+#                                               → the WHOLE dispatch-seam action, so both seams call ONE
+#                                                 implementation instead of each carrying a copy (the
+#                                                 `run_agent` duplication `spawn-gate.sh` already records as
+#                                                 a declared residual). Never refuses; always returns 0.
+#   mandate_preflight_line                      → 0+ lines; EMPTY when every mandate file is present
+#   mandate_missing                             → one absolute path per missing file
+#   mandate_unreadable                          → one absolute path per file that exists but cannot be READ
+#   mandate_files                               → the declaration, one `name|why` per line (the ONE home)
+#   bash mandate-preflight.sh --check           → 0 all present · 1 any missing · 2 CANNOT VERIFY
+#   bash mandate-preflight.sh --line            → the disclosure block (empty when all present)
+#   bash mandate-preflight.sh --missing         → the missing paths, one per line
+#   bash mandate-preflight.sh --files           → the declared names
+# CANNOT VERIFY (2) is never a pass: it is a mandated file that EXISTS but cannot be read (by the caller
+# or by the whole state dir's mode). That is a different fact from "the file is absent" and has a
+# different remedy (`chmod`, not `ship the file`), so this file never reports one as the other.
+#
+# CALLED from BOTH dispatch seams — `spawn-gate.sh::run_agent` (which covers `lane.sh`, `fix-one.sh`,
+# `nonblocking-dispatch.sh` and any hand-written caller of the helper) and `merge-one.sh::run_agent`,
+# which is a SEPARATE copy and spawns the reviewer `pi` session, the harness's highest-volume model call
+# (a `pi` session governed by `AGENTS.md`, so it is ordered to read the graph brief too). BOTH APPEND the
+# block to the brief file before `pi` reads it — so the fact reaches the LANE's own context, not only the
+# operator's log. That placement is #2981's precedent (`nonblocking-dispatch.sh` appends to an authored
+# brief), and `mandate-preflight.test.sh` §E pins BOTH seams so a seam added tomorrow without it reddens a
+# test.
+#
+# ⛔ NO FILE-SCOPE SHELL OPTIONS (this change's review, P2). `set -u` belongs to the EXECUTABLE branch
+# only: this file advertises itself as SOURCEABLE — the #2148 precedent `lane.sh` sources its sibling
+# helper — and a sourced `set -u` would become the CALLER's option, aborting its own unbound-variable
+# reads (`reviewer-preflight.sh` sets no options for exactly this reason). Every function below reads
+# `${var:-}` defaults, so it behaves identically either way.
+
+# ── THE DECLARATION — the ONE home of "what a lane's instructions mandate" ───────────────────────────
+# A mandate file belongs here iff a lane is ORDERED to read it before it works: the preamble by a
+# dispatch brief, the graph brief by a CONSUMER repo's (tortoise's) `AGENTS.md` skill table and by the
+# `research` skill here. A file merely MENTIONED by a lane is not in this list — the list is the
+# population, and a second copy of it anywhere else is a drift the test would have to chase.
+mandate_files() {
+  cat <<'SPECS'
+LANE-BRIEF-PREAMBLE.md|a dispatch brief may open with "READ §0 and §0b of this file FIRST" — the brief then assumes you already have it
+TORTOISE-GRAPH-BRIEF.md|a consumer repo's (tortoise) AGENTS.md skill table orders a lane to read this BEFORE it derives; the research skill names it as the graph's write path and error-code table
+SPECS
+}
+
+# ── THE SENTINEL ────────────────────────────────────────────────────────────────────────────────
+# ONE stable marker, at the TOP of every shape this file renders, and the ONLY thing the append guard
+# matches. ⛔ It is separate from the wording on purpose (this change's review, P2): the guard used to
+# key on the MISSING shape's prose, so the CANNOT-VERIFY shape (an unreadable state dir) carried no
+# marker at all and every re-dispatch appended another copy — measured, two emits gave two blocks. A
+# guard that matches ONE shape's text is a guard with a hole the next shape falls through.
+mandate_sentinel() { printf '%s' '<!-- mandate-preflight #3377 -->'; }
+
+# mandate_state_root — WHERE the files live, resolved the same way the bring-up resolves it. `CELL_HOME`
+# first because the operational layer on a cell is installed under it (§1 of the `cmux-cells` skill), and
+# `$HOME` otherwise, so a Mac and a cell read the same rule instead of two drifting copies.
+mandate_state_root() {
+  printf '%s/.pi/agent/state' "${CELL_HOME:-${HOME:-}}"
+}
+
+# mandate_state_root_undecidable — TRUE when NOTHING can be decided about the state dir's CONTENTS, and it
+# is not merely absent. Three ways that happens, all of which used to be reported as ABSENT:
+#   (a) the dir exists but has no SEARCH (execute) bit for this process — `chmod 000`, `chmod 640`, an
+#       ordinary dir owned by another user at `--x`-less mode;
+#   (b) an ANCESTOR on the path is unsearchable, so `[ -d "$root" ]` is itself FALSE and the absence test
+#       below could never fire (review cycle 9, measured: `chmod 000 ~/.pi/agent` reported both PRESENT
+#       files as MISSING with the `ship it` remedy — the same false-absence claim, one directory up, and on
+#       exactly the box where naming the permission fault is the whole value);
+#   (c) the path exists but is not a directory (a file where a dir belongs) — a deployment fault, not an
+#       absence, so it must not be answered with "ship the file".
+# A GENUINELY absent chain stays undecidable=FALSE: the walk climbs through parents that do not exist and
+# stops at the first one that does, which is the ordinary "not provisioned yet" case (§C's fixture).
+mandate_state_root_undecidable() {
+  local root p
+  root="$(mandate_state_root)"
+  if [ -d "$root" ]; then [ -x "$root" ] || return 0; return 1; fi
+  [ -e "$root" ] && return 0
+  while [ -n "$root" ] && [ "$root" != "/" ]; do
+    p="$(dirname "$root")"
+    [ "$p" = "$root" ] && break
+    if [ -e "$p" ]; then
+      [ -x "$p" ] || return 0
+      return 1
+    fi
+    root="$p"
+  done
+  return 1
+}
+
+# mandate_missing — one absolute path per declared file that is not present. ⛔ A STATE DIR WITH NO SEARCH
+# BIT SHORT-CIRCUITS TO NOTHING (review cycles 6–8, measured): `-f`/`-r` on `$root/<name>` both fail when
+# the directory's EXECUTE (search) bit is clear — `chmod 000`, `chmod 640`, a dir owned by another user
+# without `x` — so
+# the verb reported present files as MISSING and told an operator to SHIP them. Only `x` gates resolving a
+# name inside a directory, so `x` is the ONE bit the predicate tests: `r` (listing) is irrelevant here, and
+# a SEARCHABLE-but-unlistable dir (`chmod 100`, or `711` owned by another user: `--x` to others) still
+# decides correctly, which a `-r`-based test did not.
+# Nothing can be said about individual entries through a dir with no `x`, so it says nothing; `--check` is
+# where the CANNOT VERIFY verdict belongs.
+mandate_missing() {
+  local root spec name
+  root="$(mandate_state_root)"
+  if mandate_state_root_undecidable; then return 0; fi
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    name="${spec%%|*}"
+    [ -n "$name" ] || continue
+    [ -f "$root/$name" ] || printf '%s\n' "$root/$name"
+  done <<EOF
+$(mandate_files)
+EOF
+}
+
+# mandate_unreadable — one absolute path per declared file that EXISTS but cannot be read BY THIS PROCESS,
+# which is a different fact from absence and needs a different remedy. ⛔ It exists because `[ -f ]` alone
+# is a FALSE PASS (found in this change's own review, measured): with both files present and one
+# `chmod 000`, `--check` printed `ok: every mandated file is present` and exited 0 while `head` on that
+# file was `Permission denied` — the lane still could not obey the instruction the check called satisfied.
+mandate_unreadable() {
+  local root spec name
+  root="$(mandate_state_root)"
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    name="${spec%%|*}"
+    [ -n "$name" ] || continue
+    if [ -f "$root/$name" ] && [ ! -r "$root/$name" ]; then printf '%s\n' "$root/$name"; fi
+  done <<EOF
+$(mandate_files)
+EOF
+}
+
+# mandate_why <basename> — the reason, from the ONE declaration above, never restated by a caller.
+mandate_why() {
+  local spec
+  while IFS= read -r spec; do
+    case "$spec" in "$1|"*) printf '%s' "${spec#*|}"; return 0 ;; esac
+  done <<EOF
+$(mandate_files)
+EOF
+  printf 'a mandated file'
+}
+
+# mandate_preflight_line — the disclosure. EMPTY when every file is present, so a healthy box's lane log
+# and brief stay byte-for-byte what they were (an always-on banner is noise a reader learns to skip, and
+# a warning that is always printed is not a warning).
+mandate_preflight_line() {
+  local root path why missing unreadable
+  root="$(mandate_state_root)"
+  # ⛔ AN UNREADABLE STATE DIR MAKES `-f` FALSE FOR EVERY FILE UNDER IT, so testing the files first
+  # reported the whole dir's contents as MISSING — a false ABSENCE claim about files that may be
+  # perfectly present, and the wrong remedy (`ship it` instead of `chmod`). The dir is tested FIRST and
+  # short-circuits: nothing can be said about individual files through a dir that cannot be read.
+  if mandate_state_root_undecidable; then
+    printf '%s\n' "$(mandate_sentinel)"
+    printf '[mandate-preflight] ⛔ CANNOT VERIFY on this box (%s): the mandated files live in %s, which cannot be resolved by this process (its own or a parent directory search (execute) bit is clear, or it is not a directory) — so whether the lane can obey its "READ … FIRST" instruction is UNKNOWN, and a cannot-verify is NEVER a pass (agent-infra#3377). Remedy is a mode fix on that directory, NOT a missing deployment.\n' \
+      "$(hostname 2>/dev/null || printf 'this box')" "$root"
+    return 0
+  fi
+  missing="$(mandate_missing)"
+  unreadable="$(mandate_unreadable)"
+  [ -n "$missing$unreadable" ] || return 0
+  printf '%s\n' "$(mandate_sentinel)"
+  printf '[mandate-preflight] ⛔ MANDATE-UNSATISFIABLE on this box (%s) — the lane was ORDERED to read this before working, and it cannot, so that instruction CANNOT be obeyed. Say so plainly in your report; do NOT claim to have read it (agent-infra#3377):\n' "$(hostname 2>/dev/null || printf 'this box')"
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    printf '[mandate-preflight]   MISSING    %s — %s\n' "$path" "$(mandate_why "${path##*/}")"
+  done <<EOF
+$missing
+EOF
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    printf '[mandate-preflight]   UNREADABLE %s — exists but cannot be read by this process (%s); remedy is a mode fix, NOT a missing deployment\n' "$path" "$(mandate_why "${path##*/}")"
+  done <<EOF
+$unreadable
+EOF
+  printf '[mandate-preflight] There is NO provisioning path for these files today (they exist in no repo; #1193 owns the content, #3377 this report). Proceed with the BRIEF'"'"'s own text as the authority, and name this absence in your final message.\n'
+}
+
+# mandate_preflight_emit <log> <prompt> <label> — THE dispatch-seam action, in ONE place so both
+# `run_agent` copies (spawn-gate.sh and merge-one.sh) call the same implementation instead of each
+# carrying its own. Every branch PROCEEDS and the function never returns non-zero: this is a disclosure,
+# not a gate (the file's header states why a refusal here would be an over-block that halts the fleet).
+mandate_preflight_emit() {
+  local log="${1:-/dev/null}" prompt="${2:-}" label="${3:-agent}" line
+  # ⛔ A FAILED RENDER IS NOT "NOTHING TO SAY" (this change's review, P2). The command substitution used
+  # to swallow the renderer's stderr, so a failure produced an empty `line` and the `[ -n ]` guard read it
+  # as "every file is present" and returned 0 in silence — the exact defect this file exists to end. An
+  # empty render is now only trusted AFTER the state has been re-read independently.
+  line="$(mandate_preflight_line 2>/dev/null)"
+  if [ -z "$line" ]; then
+    if [ -n "$(mandate_missing)$(mandate_unreadable)" ] || mandate_state_root_undecidable; then
+      line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")"
+    else
+      return 0
+    fi
+  fi
+  # ⛔ GROUPED REDIRECT (this change's review, P2): `printf … >> "$log" 2>/dev/null` applies
+  # left-to-right, so an unwritable `$log` emitted `bash: … Permission denied` on the CALLER's stderr —
+  # the same class the brief-append below already fixes, on the other file.
+  { printf '%s\n' "$line" >> "$log"; } 2>/dev/null
+  if [ -z "$prompt" ] || [ ! -f "$prompt" ]; then
+    { echo "[mandate-preflight] WARN $label: no brief file to append to ($prompt), so only THIS LOG names the absence and the LANE will not see it." >> "$log"; } 2>/dev/null
+    return 0
+  fi
+  if grep -qF "$(mandate_sentinel)" "$prompt" 2>/dev/null; then
+    { echo "[mandate-preflight] $label: the brief ALREADY names the unsatisfiable mandate file(s) — not appending a second copy" >> "$log"; } 2>/dev/null
+    return 0
+  fi
+  # ⛔ GROUP THE REDIRECT WITH THE COMMAND (#3377 review, P2): `printf … >> "$prompt" 2>/dev/null` applies
+  # left-to-right, so the FAILING `>>` emitted its raw `: <path>: Permission denied` to the caller's stderr
+  # BEFORE `2>/dev/null` took effect — an untagged bash error escaping run_agent's log contract. The
+  # braces make the suppression cover the redirection itself.
+  if { printf '\n%s\n' "$line" >> "$prompt"; } 2>/dev/null; then
+    { echo "[mandate-preflight] $label: named the absence IN THE BRIEF as well ($prompt) — the lane cannot obey an instruction it was never told was unsatisfiable" >> "$log"; } 2>/dev/null
+  else
+    { echo "[mandate-preflight] WARN $label: could not append the mandate block to $prompt, so only THIS LOG names it and the LANE will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null
+  fi
+  return 0
+}
+
+# mandate_verdict — 0 all present and readable · 1 any missing · 2 CANNOT VERIFY (a present file, or the
+# state dir itself, is unreadable). 2 outranks 1 on purpose: an unreadable file is the one the reader
+# would otherwise mistake for absent and "fix" by shipping a file that is already there.
+mandate_verdict() {
+  local root
+  root="$(mandate_state_root)"
+  if mandate_state_root_undecidable; then
+    printf '[mandate-preflight] CANNOT VERIFY: %s cannot be resolved by %s (no search/execute bit on it or on a parent directory, or it is not a directory) — so nothing can be known about the mandated files. A cannot-verify is NEVER a pass\n' \
+      "$root" "$(id -un 2>/dev/null || printf 'this user')" >&2
+    return 2
+  fi
+  if [ -n "$(mandate_unreadable)" ]; then
+    mandate_unreadable | sed 's/^/[mandate-preflight] CANNOT VERIFY (unreadable) /' >&2
+    return 2
+  fi
+  if [ -n "$(mandate_missing)" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# ── executable surface (sourcing exits before here is reached: BASH_SOURCE guard below) ─────────────
+_mandate_cli() {
+  case "${1:-}" in
+    --check)
+      mandate_verdict; local rc=$?
+      if [ "$rc" -eq 1 ]; then
+        mandate_missing | sed 's/^/[mandate-preflight] MISSING /' >&2
+      elif [ "$rc" -eq 0 ]; then
+        printf '[mandate-preflight] ok: every mandated file is present under %s\n' "$(mandate_state_root)"
+      fi
+      return "$rc" ;;
+    --line)    mandate_preflight_line ;;
+    --missing) mandate_missing ;;
+    --files)   mandate_files | cut -d'|' -f1 ;;
+    -h|--help)
+      printf 'usage: %s [--check|--line|--missing|--files]\n' "$0"
+      printf '  --check    0 every mandated file present · 1 any missing (each named on stderr) · 2 CANNOT VERIFY\n'
+      printf '  --line     the disclosure block appended to a brief (EMPTY when all are present)\n'
+      printf '  --missing  the missing paths, one per line\n'
+      printf '  --files    the declared names, one per line\n' ;;
+    "")
+      mandate_preflight_line ;;
+    *)
+      printf '%s: unknown argument "%s" — see --help\n' "$0" "$1" >&2
+      return 78 ;;
+  esac
+}
+
+# Sourcing must have NO side effects (the #2148 precedent: `lane.sh` sources its sibling helper) — which
+# now includes not importing a shell option into the caller (see the header note above).
+if [ "${BASH_SOURCE[0]:-}" = "${0:-}" ]; then
+  set -u
+  _mandate_cli "$@"
+  exit $?
+fi
