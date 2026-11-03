@@ -128,9 +128,13 @@
 #   LANE_REAP_CPU_TOL_CS   parked tolerance, centiseconds (default 10 = 0.10s)
 #   LANE_REAP_IDLE_MIN     log-untouched bound, minutes (default 120 = 2h)
 #   LANE_REAP_NO_LOG_H     no-log age bound, hours (default 12)
-#   LANE_REAP_LIVE_MIN     log-advanced window that makes a lane LIVE, minutes (default 45 — ABOVE
-#                          the lane wall limit, `LANE_TIMEOUT` 2400s = 40 min: a live lane inside one
-#                          long silent tool call must not read as dead to the MAX_LANES gate)
+#   LANE_REAP_LIVE_MIN     log-advanced window that makes a lane LIVE, minutes (default 125 — it must
+#                          sit ABOVE the lane's wall BACKSTOP, or a lane that is alive and inside one
+#                          long silent tool call reads as dead to the MAX_LANES gate and the box
+#                          over-admits. Was 45, chosen against a 40-minute flat cap; since
+#                          agent-infra#2888 the cap is a 2 h backstop (`LANE_BACKSTOP_S`, spawn-gate.sh)
+#                          and the progress bound — not the wall — is what ends a wedged lane, so this
+#                          window follows the BACKSTOP and lane-bound.test.sh pins the ordering)
 #   LANE_REAP_LOG          durable pass log (default ~/.pi/agent/state/lane-reap.log)
 #   LANE_REAP_LOCK         single-run lock (default ~/.pi/agent/state/lane-reap.lock)
 #   LANE_REAP_TIMEOUT_BIN  timeout(1) (default: timeout; unresolvable ⇒ shell fallback, as on macOS)
@@ -169,7 +173,7 @@ CPU_TOL_CS="${LANE_REAP_CPU_TOL_CS:-10}"
 # the registry exists to surface. The env seam keeps its documented `LANE_REAP_` prefix.
 LANE_IDLE_MIN="${LANE_REAP_IDLE_MIN:-120}"
 NO_LOG_H="${LANE_REAP_NO_LOG_H:-12}"
-LIVE_MIN="${LANE_REAP_LIVE_MIN:-45}"
+LIVE_MIN="${LANE_REAP_LIVE_MIN:-125}"
 READ_TIMEOUT="${LANE_REAP_READ_TIMEOUT:-60}"
 # The budget for ONE pass, in seconds. A controller calls `count` every cycle, and the per-read
 # bound (`READ_TIMEOUT`) bounds ONE fork, not the sweep: 76 lane roots x a slow/hung lsof is a pass
@@ -194,7 +198,7 @@ coerce_limits() {
       CPU_TOL_CS)    is_num "${CPU_TOL_CS:-}"    || CPU_TOL_CS=10 ;;
       LANE_IDLE_MIN) is_num "${LANE_IDLE_MIN:-}" || LANE_IDLE_MIN=120 ;;
       NO_LOG_H)   is_num "${NO_LOG_H:-}"   || NO_LOG_H=12 ;;
-      LIVE_MIN)   is_num "${LIVE_MIN:-}"   || LIVE_MIN=45 ;;
+      LIVE_MIN)   is_num "${LIVE_MIN:-}"   || LIVE_MIN=125 ;;
     esac
   done
 }
