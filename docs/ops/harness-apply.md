@@ -176,6 +176,13 @@ The pass takes one deployed-drift reading per tick, from the final state, by cal
 `scripts/orchestrator-harness/check-deployed-drift.sh --surface` and printing its token as
 `harness: deployed_drift=<state> token=<token>` (recorded in the `drift=` field).
 
+The checker is DISCOVERED, not assumed, and it is not shipped by the farm — so the search covers
+both a deployed box and the scheduler's own environment, first match wins: beside this pass
+(`$HERE`), `$AGENT_INFRA_PATH/scripts/orchestrator-harness/`, `$O`, then the governed checkout
+(`$REPO/scripts/orchestrator-harness/` — the candidate the systemd unit's environment actually
+has, since it exports `HARNESS_APPLY_REPO` and no `AGENT_INFRA_PATH`). When none exists the
+reading is `not-run`/`absent` and says so: we cannot verify what we did not run.
+
 Only one token reds a pass this way:
 
 | token | pass result |

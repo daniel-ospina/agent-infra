@@ -599,6 +599,16 @@ read_deployed_drift() {
         # arm DEAD on every deployed box: `absent` → not-run → never `executes:` → rc 0 over a stale
         # executing harness, which is exactly the silent green this change exists to end.
         # `$O` is where the checker IS deployed, so it is the candidate that works in production.
+        # ⛔ AND THE GOVERNED CHECKOUT IS A CANDIDATE (review P2, #10114). `$AGENT_INFRA_PATH` is DEAD
+        # under the scheduler — this file says so itself (:188: "under the scheduler — where there is no
+        # AGENT_INFRA_PATH and the farmed copy has no checkout beside it") — and `pi-bootstrap`'s
+        # `fleet_srcs` farms THIS PASS WITHOUT the checker, so on a box whose `$O` carries no checker
+        # candidates 1-4 all miss while the checker sits in `$REPO`, which the unit DOES export
+        # (`HARNESS_APPLY_REPO`, templates/systemd/eldato-harness-apply.service:31). That box got
+        # `drift=not-run:absent` every tick and `fleet-health` alarmed about a checker it had — an
+        # un-actionable alarm, the failure the `executes:`-only scoping exists to avoid. `$REPO` is also
+        # the tree this pass GOVERNS, so reading its own committed checker is the closest instrument to
+        # the question the pass is asking. LAST, so every deployed copy still wins.
         # ⛔ `HARNESS_APPLY_DRIFT_DIR` IS A SEARCH-ROOT OVERRIDE, not an extra candidate (review round 8,
         # P2). The discovery path is the thing this lane had to fix TWICE because it was dead in the
         # deployed shape, and no test executed it — every drift assertion supplied a checker path
@@ -611,14 +621,15 @@ read_deployed_drift() {
         for _candidate in "$HERE/orchestrator-harness/check-deployed-drift.sh" \
                           "$HERE/check-deployed-drift.sh" \
                           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/check-deployed-drift.sh" \
-                          "${O:-}/check-deployed-drift.sh"; do
+                          "${O:-}/check-deployed-drift.sh" \
+                          "${REPO:-}/scripts/orchestrator-harness/check-deployed-drift.sh"; do
             [ -n "$_candidate" ] && [ -f "$_candidate" ] && { chk="$_candidate"; break; }
         done
         fi
     fi
     if [ ! -f "$chk" ]; then
         DRIFT_STATE=not-run; DRIFT_TOKEN=absent
-        log_line "harness: deployed_drift=not-run token=absent (no check-deployed-drift.sh beside $HERE, in \$O=$O, or at AGENT_INFRA_PATH) — NOT a clean reading, we did not look"
+        log_line "harness: deployed_drift=not-run token=absent (no check-deployed-drift.sh beside $HERE, in \$O=$O, at AGENT_INFRA_PATH, or in \$REPO=$REPO) — NOT a clean reading, we did not look"
         return 0
     fi
     local out

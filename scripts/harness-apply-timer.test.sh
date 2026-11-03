@@ -418,7 +418,7 @@ assert_contains "$OUT" "an executes: state always has a live controller" "T24 an
 assert_contains "$(grep '^remedy=' "$T/t24/state/harness-apply.status" 2>/dev/null)" "scripts/cloud-cell-supervisor.sh apply --force --pin-only" "T24 the remedy names a RESOLVED path, not a bare command name (a farmed cell has none on PATH)"
 assert_absent "$(grep '^remedy=' "$T/t24/state/harness-apply.status" 2>/dev/null)" "remedy=cloud-cell-supervisor.sh" "T24 …and it does not start with the unresolvable name (the exact pre-change spelling)"
 # ⛔ DISCOVERY ITSELF (review round 8, P2). Every assertion above hands the checker over through
-# HARNESS_APPLY_DRIFT_CMD, so the four-candidate search — the thing this lane had to fix twice because
+# HARNESS_APPLY_DRIFT_CMD, so the candidate search — the thing this lane had to fix three times because
 # it was dead in the deployed shape — was executed by NO test. Candidate 1 shadows any fixture on this
 # box, so the search root is overridable; that makes both ends assertable, including `absent`, which
 # is the arm that leaves the pass GREEN and is therefore the one that must be pinned.
@@ -473,6 +473,33 @@ assert_contains "$(grep '^drift=' "$T/t24/farmstate/harness-apply.status" 2>/dev
 OUT="$(run_farmed "" 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T24 with no \$AGENT_INFRA_PATH the search falls through to candidate 4 (\$O) — the PRODUCTION find"
 assert_contains "$OUT" "executes:" "T24 …and that find reds the pass, not just prints a token"
+# ⛔ THE SCHEDULER'S OWN SHAPE — no AGENT_INFRA_PATH, no checker in $O (review P2, #10114). The unit
+# (`templates/systemd/eldato-harness-apply.service:31`) exports HARNESS_APPLY_REPO and NOT
+# AGENT_INFRA_PATH, and `pi-bootstrap`'s fleet_srcs farms this pass without the checker — so on a box
+# whose $O carries no checker, EVERY pre-change candidate missed while the checker sat in the checkout
+# the pass governs. The verdict was then `drift=not-run:absent` on every tick and fleet-health alarmed
+# about a checker the box had. Stub answers MUST differ from the other candidates', so the assertion
+# proves candidate 5 was the one found rather than inferring it.
+mkdir -p "$T/t24/home/emptyO" "$REPO_P/scripts/orchestrator-harness"
+printf '#!/usr/bin/env bash\necho "harness=behind:709db06eac2"\nexit 1\n' >"$REPO_P/scripts/orchestrator-harness/check-deployed-drift.sh"
+chmod +x "$REPO_P/scripts/orchestrator-harness/check-deployed-drift.sh"
+run_farmed_repo() { # the unit's exact shape: REPO exported, AGENT_INFRA_PATH absent, $O without a checker
+    # ⛔ `AGENT_INFRA_PATH=` IS LOAD-BEARING, NOT TIDINESS: unset, this suite INHERITS the runner's own
+    # value and candidate 3 matches the real repo's checker — the assertion then measures THIS BOX, not
+    # the candidate under test (measured: the run reported the real checker's `UNKNOWN:` message and the
+    # case passed the wrong arm). The unit exports no such variable, so empty IS the production shape.
+    HARNESS_REPO="$REPO_P" HARNESS_REF=origin/main HARNESS_FETCH=1 \
+    AGENT_INFRA_PATH= \
+    HARNESS_APPLY_STATE_DIR="$T/t24/repofindstate" HARNESS_APPLY_MODE=pin \
+    HARNESS_PIN="$T/t24/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$T/t24/home/.harness-path" \
+    HARNESS_PIN_DIR="$T/t24/home/harness" CELL_HOME="$T/t24/home" O="$T/t24/home/emptyO" \
+    HARNESS_APPLY_DRIFT_CHECK=1 \
+    bash "$T/t24/farm/scripts/harness-apply-pass.sh" "$@"
+}
+OUT="$(run_farmed_repo 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 no \$AGENT_INFRA_PATH and no checker in \$O: the search finds the GOVERNED CHECKOUT's copy (\$REPO)"
+assert_contains "$OUT" "token=behind:709db06eac2" "T24 …and the verdict is THAT candidate's, not an absent→not-run"
+assert_absent "$OUT" "token=absent" "T24 …and it is not the un-actionable alarm (a checker sat in \$REPO all along)"
 # ⛔ AND THE PREVIEW ANSWERS THE SAME QUESTION (review round 21, P2). `--dry-run` used to exit BEFORE
 # `read_deployed_drift`, so the read-only verb — the one an operator uses to inspect a box without
 # changing it — still could not say whether the EXECUTING tree was this repo's, while the merge evidence
