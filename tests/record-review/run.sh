@@ -2445,6 +2445,12 @@ EOF
   # post-condition DELETED must STOP REFUSING FOR THIS REASON. Without it, (33g) could be passing
   # because of some pre-existing refusal — the exact way a "pin" for this file's headline fix was
   # already found to be green under deletion once.
+  # ⛔ THE GUARD BELOW IS AN EXISTENCE TEST, NOT AN ABSENCE TEST. A round-4 review MEASURED that the
+  # first cut (`if grep -q 'no carry arm ran' "$TMP/…"` alone) passes VACUOUSLY when the mutant was
+  # never generated: a MISSING file also has no such line, so the else-arm ran `bash` on nothing,
+  # got rc 127, saw `rc != 3`, and PASSED while asserting a reason that had not happened. The
+  # siblings in this file guard on producibility (`[ -s "$TMP/pmut-ctx/diff-normalize.py"`); this
+  # arm now does the same, and also refuses an rc that means "the interpreter never ran the script".
   # ⚠️ WHAT THIS FIXTURE DOES AND DOES NOT ESTABLISH, stated so the arm cannot be read as more: on
   # THIS stub the mutant's fall-through is then stopped by a DIFFERENT guard — the #513 clean-micro
   # surface cap, exit 4, because the stub serves no readable changed-path payload — so the fixture
@@ -2452,7 +2458,8 @@ EOF
   # removing the post-condition removes it. It does NOT reproduce the full write on this host; the
   # end-to-end shape (rc 0, record overwritten, prior `evidence` dropped, marker posted) was measured
   # by the fresh review that found this defect, using a stub that DOES serve a readable surface. The
-  # assertion below therefore keys on WHAT CHANGED, never on the mutant's final exit code.
+  # assertion therefore keys on WHAT CHANGED, never on the mutant's final exit code, and the pass
+  # message reports that code instead of naming a guard this arm cannot see.
   python3 - "$SRC" "$TMP/nodelta-postcond.sh" <<'INNERPY' || true
 import sys
 src = open(sys.argv[1], encoding="utf-8").read().split("\n")
@@ -2477,15 +2484,19 @@ while i < len(src):
 open(sys.argv[2], "w", encoding="utf-8").write("\n".join(out))
 print(f"mutant: dropped {dropped} post-condition(s)")
 INNERPY
-  if grep -q 'no carry arm ran' "$TMP/nodelta-postcond.sh"; then
+  if [ ! -s "$TMP/nodelta-postcond.sh" ]; then
+    fail "(33g2) the mutant was NOT generated — without it this arm can only pass vacuously, so it fails loudly instead"
+  elif grep -q 'no carry arm ran' "$TMP/nodelta-postcond.sh"; then
     fail "(33g2) the mutant still contains the post-condition — the deletion did not land, so attribution is unproven"
   else
     delta_write_record 7108 "$D_REVIEWED" clean-micro
     FIX_DELTA_HEAD="$D_MERGED"; : > "$TMP/failhead.n"
     delta_run_with "$TMP/nodelta-postcond.sh" "$TMP/dbin-failhead" 7108 "$TMP/out32g2"; OUT32G2="$(cat "$TMP/out32g2")"; DRC_G2="$DR_RC"
-    [ "$DRC_G2" -ne 3 ] \
+    # rc 126/127 means the script was not executed at all (unreadable/nonexistent interpreter target),
+    # which would make "it refused differently" meaningless — the same vacuity the -s guard above closes.
+    [ "$DRC_G2" -ne 3 ] && [ "$DRC_G2" -lt 126 ] && [ -n "$OUT32G2" ] \
       && ! grep -q 'no carry arm ran' <<<"$OUT32G2" \
-      && pass "(33g2) ATTRIBUTION: with the post-condition DELETED the same run no longer refuses at 3 nor emits the message (rc=$DRC_G2 — stopped later by this fixture's clean-micro surface cap), so (33g)'s refusal is the post-condition's own and not a pre-existing one" \
+      && pass "(33g2) ATTRIBUTION: with the post-condition DELETED the same run no longer refuses at 3 nor emits the message (rc=$DRC_G2; a LATER guard stops it on this stub — see the caveat above), so (33g)'s refusal is the post-condition's own and not a pre-existing one" \
       || fail "(33g2) the mutant reproduced the (33g) refusal without the post-condition (rc=$DRC_G2, out='$OUT32G2'), so (33g) is attributable to something else"
   fi
 else
@@ -2662,9 +2673,13 @@ fi
 # 33f2 pin the unproven-delta refusal and the "both verbs agree" invariant, which were MEASURED
 # green under deletion before they existed.
 # AFTER THE REBASE the count is main's plus this section's: main spent 185 -> 190 on #3347's own
-# section (32), and this PR adds 11, so the pin is 201. The section is numbered 33 for the same
-# reason — (32) was already taken on main by the time this branch was rebased.
-# MEASURED: `ALL PASSED (201 assertion(s))` on the rebased tree.
+# section (32), and this PR's section adds 13, so the pin is 203. The section is numbered 33 for the
+# same reason — (32) was already taken on main by the time this branch was rebased.
+# Review round 4: 201 -> 203. 33g pins the post-condition that a delta measuring nothing must not
+# mint a fresh record, and 33g2 is its attribution arm. (Round 4 did NOT change the arithmetic
+# above: 190 + 13 = 203 either way. A review caught this paragraph still saying 201/11 after the
+# bump, which is the one place a future reader re-derives the number from.)
+# MEASURED: `ALL PASSED (203 assertion(s))` on the rebased tree.
 MIN_ASSERTIONS=203
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
