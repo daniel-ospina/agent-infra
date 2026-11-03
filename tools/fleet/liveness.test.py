@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Forty-six tests with sixty-one paired mutations: every mutation re-
+Forty-eight tests with sixty-three paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 31 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (61)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (63)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1957,8 +1957,9 @@ def t43():
             fh.write("[lane-bound] VERDICT verdict=finished tag=lane rc=0\n")
         lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
         check(lr.verdict == "finished", "an unbound verdict is adopted; got %r" % (lr.verdict,))
-        check("bound-verdict-without-pid" in lr.detail,
-              "but it says it is unbound; got %r" % lr.detail)
+        check("bound-verdict-without-pid" in liv.evaluate(liv.Evidence(log_read=lr)).detail,
+              "and the PUBLISHED verdict says it is unbound (a reader cannot otherwise "
+              "tell a verified binding from an unbound one)")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2062,6 +2063,55 @@ def t46():
                              stdout=subprocess.PIPE).stdout.decode()
         check("finished" in out,
               "a correctly bound census verdict IS published; got %r" % out)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T47 a SHRINKING log is a broken reading, never no-output (frozen is refused)")
+
+
+def t47():
+    # A log cannot lose bytes without activity. Read as "flat", a truncate/rotate during
+    # the sample window froze a lane whose log had just been REWRITTEN.
+    lr = liv.LogRead(readable=True, present=True, path="/x", size_delta=-990,
+                     cpu_delta_cs=0, transcript_grew=None, alive=True,
+                     age_ms=liv.LOG_FREEZE_MS + 60000, window_ms=liv.LOG_WINDOW_MS)
+    v = liv.evaluate(liv.Evidence(log_read=lr))
+    check(v.state == "unknown", "a shrink abstains; got %s/%s" % (v.state, v.reason))
+    check(v.state != "frozen", "never frozen on a broken delta")
+    # a genuinely flat log still freezes, so the guard is not a blanket abstain
+    lr.size_delta = 0
+    v = liv.evaluate(liv.Evidence(log_read=lr))
+    check(v.state == "frozen", "a flat log still freezes; got %s" % v.state)
+
+
+@test("T48 the census survives the `?` it prints itself, and declares an unbound row")
+
+
+def t48():
+    d = tempfile.mkdtemp(prefix="liv-census2-")
+    try:
+        log = os.path.join(d, "L.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        size = os.path.getsize(log)
+
+        def census(text):
+            r = subprocess.run([sys.executable, liv.__file__, "--log-census"],
+                               input=text.encode(), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+            return r.returncode, r.stdout.decode() + r.stderr.decode()
+
+        # `?` is the census's OWN not-read token for every other column; int("?") used to
+        # abort the whole run with a traceback after printing only the rows before it.
+        rc, out = census("?\t%s\t0\t?\tfinished\t0\t999999\t%d\t?\t0\t1\n" % (log, size))
+        check("Traceback" not in out, "a `?` pid must not abort the census; got %r" % out)
+        check("finished" not in out, "and must not publish a state; got %r" % out)
+
+        # A 10-column row carries no `verdict_pid`, so the adoption must be DECLARED.
+        rc, out = census("123456\t%s\t0\t?\tfinished\t0\t999999\t%d\t?\t0\n" % (log, size))
+        check("bound-verdict-without-pid" in out,
+              "an unbound adoption is declared on the census surface; got %r" % out)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2475,8 +2525,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T43", "module",
-        '        if within is False:',
-        '        if False:',
+        '    if within is False:',
+        '    if False:',
         "a verdict naming ANOTHER incarnation is adopted, so a previous dispatch's "
         "`finished` is published as this lane's — a false PASS over work nobody "
         "re-dispatches (the appended-log case)",
@@ -2495,18 +2545,32 @@ MUTATIONS = [
         "a dropped file verdict BLOCKS the lane's own correctly-bound log line",
     ),
     Mutation(
-        "T45", "module",
-        '            lr.detail = " | ".join(x for x in (lr.detail, why) if x)',
-        '            lr.detail = why',
-        "the drop reason CLOBBERS acquisition's facts, publishing a different fact than "
-        "the true one (`absent:<path>` lost)",
-    ),
-    Mutation(
         "T46", "module",
-        '            if lr.verdict and lr.verdict_line_pid:',
+        '            if lr.verdict:',
         '            if False:',
         "the census seam does not enforce the binding, so the fleet-wide surface stays "
         "fail-open on a previous dispatch's verdict",
+    ),
+    Mutation(
+        "T47", "module",
+        '    no_output = ((lr.size_delta is None or lr.size_delta < 0)',
+        '    no_output = ((lr.size_delta is None or lr.size_delta > 10**9)',
+        "a NEGATIVE byte delta is read as no-output, so a log that was just truncated or "
+        "rotated freezes a lane that is working",
+    ),
+    Mutation(
+        "T48", "module",
+        '                return tok if tok.isascii() and tok.isdigit() else ""',
+        '                return tok',
+        "int('?') raises, so one unreadable census row aborts the WHOLE run with a "
+        "traceback after printing only the rows before it",
+    ),
+    Mutation(
+        "T48", "module",
+        '                    note = "bound-verdict-without-pid source=census"',
+        '                    note = ""',
+        "the census adopts an unbound 10-column row SILENTLY, so the fifth rule of the "
+        "binding table is false on the fleet-wide surface",
     ),
 ]
 

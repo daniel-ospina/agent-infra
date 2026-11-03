@@ -1757,8 +1757,8 @@ hand the token over and have a previous dispatch's outcome published on the surf
 fleet reader's home. A row whose `verdict_pid` does not resolve inside the queried tree is dropped to
 `no-verdict` exactly as in `gather_log_lane`.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (46 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (61 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (48 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (63 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder). Their paired mutations re-introduce the exact pre-fix behaviours — the

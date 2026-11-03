@@ -1230,6 +1230,33 @@ class LogRead:
     detail: str = ""
 
 
+def _also(detail: str) -> str:
+    """``" | <detail>"`` when there is one — the append idiom, never a substitution."""
+    return (" | " + detail) if detail else ""
+
+
+def _bind_verdict(lr: "LogRead", pid: int):
+    """Adopt ``lr``'s verdict only if it names THIS incarnation.
+
+    Returns ``(why_dropped, note)``. ONE implementation, because the rule is needed by
+    `gather_log_lane` AND by `--log-census`, and two copies had already drifted: the
+    census adopted an unbound row silently, so the fifth rule of the doc's binding table
+    ("adopted, and said so") was false on the surface §13.5 names as the fleet reader's
+    home.
+    """
+    line_pid = lr.verdict_line_pid
+    if not line_pid:
+        return None, "bound-verdict-without-pid source=%s" % (lr.verdict_source or "log")
+    within = _pid_within(int(pid), int(line_pid))
+    if within is False:
+        return ("stale-bound-verdict line_pid=%s query_pid=%s source=%s"
+                % (line_pid, pid, lr.verdict_source), "")
+    if within is None:
+        return ("unbound-bound-verdict line_pid=%s query_pid=%s source=%s"
+                % (line_pid, pid, lr.verdict_source), "")
+    return None, ""
+
+
 def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                      cpu_tol_cs: int = LOG_CPU_TOL_CS) -> Verdict:
     """The log-lane state. PURE and TOTAL: every input maps to one state.
@@ -1271,16 +1298,19 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                                           "completion is undecidable")
                 if lr.rc not in BOUND_OK_RC:
                     return Verdict("no-verdict", "bound-finished-rc:%s" % lr.rc,
-                                   detail="verdict=finished rc=%s — the bound fired nothing, "
-                                          "but the turn did NOT complete" % lr.rc)
+                                   detail=("verdict=finished rc=%s — the bound fired nothing, "
+                                           "but the turn did NOT complete" % lr.rc)
+                                          + _also(lr.detail))
                 return Verdict("finished", "bound-verdict:%s" % verdict,
-                               detail="verdict_source=%s rc=%s"
-                                      % (lr.verdict_source or "log", lr.rc))
+                               detail=("verdict_source=%s rc=%s"
+                                       % (lr.verdict_source or "log", lr.rc))
+                                      + _also(lr.detail))
             # `stalled` / `exceeded-wallclock` — the bound's own kill verdict. That is
             # REAL DEATH (mechanism 3), reported by the producer that caused it.
             return Verdict("dead", "bound-verdict:%s" % verdict,
-                           detail="verdict_source=%s rc=%s"
-                                  % (lr.verdict_source or "log", _n(lr.rc)))
+                           detail=("verdict_source=%s rc=%s"
+                                   % (lr.verdict_source or "log", _n(lr.rc)))
+                                  + _also(lr.detail))
         return Verdict("no-verdict", "process-gone-no-verdict",
                        detail=("bytes=%s age_ms=%s (the process ended and told us nothing)"
                                % (_n(lr.size), _n(lr.age_ms)))
@@ -1314,7 +1344,14 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
     # — i.e. `frozen` on ONE signal, which is the log-mtime behaviour this axis
     # exists to delete (a lane working through a long silent tool call has exactly
     # that shape: byte-static log, CPU the only witness).
-    no_output = lr.size_delta is None and lr.transcript_grew is None
+    # A NEGATIVE BYTE DELTA IS A BROKEN READING, NOT A FLAT ONE — the identical rule
+    # this function applies to CPU a few lines below. A log cannot lose bytes without
+    # activity (truncate/rotate/replace, or a negative field handed in by a census
+    # caller), so a shrink proves the window was mis-measured. Read as "flat" it froze a
+    # lane whose log had just been REWRITTEN: measured `size_delta=-990 cpu=0 alive=True
+    # age_ms=3h` -> `frozen/no-progress`.
+    no_output = ((lr.size_delta is None or lr.size_delta < 0)
+                 and lr.transcript_grew is None)
     # A negative delta is a BROKEN reading, not a flat one — same rule as the reaper's.
     # The census seam can be handed one in field 3, so the check lives here too.
     no_cpu = (lr.cpu_unreadable or lr.cpu_delta_cs is None or lr.cpu_delta_cs < 0)
@@ -2329,29 +2366,7 @@ def gather_log_lane(
     # Dropping it yields `no-verdict` (never `finished`, never `dead`): the
     # over-refusal direction, which is the only acceptable one here.
     def _bind():
-        """Adopt the acquired verdict only if it names THIS incarnation.
-
-        Returns ``(why_dropped, note)``: ``why_dropped`` is set when the verdict must
-        NOT be adopted, ``note`` when it WAS adopted but the binding is only declared
-        (a line naming no incarnation). The caller APPENDS either to `lr.detail` rather
-        than assigning it: acquisition has already recorded facts the abstention reasons
-        are built from (`absent:<path>`, `not-a-regular-file:...`, `probe rc=...`), and
-        clobbering them published a different fact than the true one.
-        """
-        line_pid = lr.verdict_line_pid
-        if not line_pid:
-            # §13's table: a line that names NO incarnation is ADOPTED and declared
-            # unbound — dropping it would refuse every supervisor that does not print
-            # `pid=`, which is a different trade than an unverifiable binding.
-            return None, "bound-verdict-without-pid source=%s" % (lr.verdict_source or "log")
-        within = _pid_within(int(pid), int(line_pid))
-        if within is False:
-            return (("stale-bound-verdict line_pid=%s query_pid=%s source=%s"
-                     % (line_pid, pid, lr.verdict_source)), "")
-        if within is None:
-            return (("unbound-bound-verdict line_pid=%s query_pid=%s source=%s"
-                     % (line_pid, pid, lr.verdict_source)), "")
-        return None, ""
+        return _bind_verdict(lr, int(pid))
 
     if lr.verdict:
         why, note = _bind()
@@ -2424,8 +2439,8 @@ def gather_log_lane(
         lr.alive = True
     else:
         lr.alive = None
-        if not lr.detail:
-            lr.detail = "probe rc=%d status=%s" % (res.rc, res.status or "?")
+        lr.detail = " | ".join(x for x in (
+            lr.detail, "probe rc=%d status=%s" % (res.rc, res.status or "?")) if x)
     return lr
 
 
@@ -2591,12 +2606,21 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
                 return None  # "", "?", "2", "gone" … — NOT READ
 
             verdict = f[4] if len(f) > 4 and f[4] in BOUND_VERDICTS else ""
-            verdict_pid = f[10].strip() if len(f) > 10 else ""
+            # ⛔ `int("?")` RAISES, AND `"\u00b2".isdigit()` IS TRUE WHILE `int("\u00b2")`
+            # IS NOT. The census's own "not read" token is `?`, so a row whose pid column
+            # was `?` aborted the WHOLE run with a traceback after printing only the rows
+            # before it (measured: `?\t<log>\t0\t?\tfinished\t...` -> ValueError, rc=1).
+            def _num(idx):
+                tok = f[idx].strip() if idx < len(f) else ""
+                return tok if tok.isascii() and tok.isdigit() else ""
+
+            verdict_pid = _num(10)
+            row_pid = _num(0)
             path = f[1] if len(f) > 1 else ""
             lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=_opt(3),
                          window_ms=window_ms, verdict=verdict,
                          rc=(f[9] if len(f) > 9 and f[9] not in ("", "?") else None),
-                         verdict_line_pid=verdict_pid if verdict_pid.isdigit() else "",
+                         verdict_line_pid=verdict_pid,
                          verdict_source="caller" if verdict else "")
 
             # ⛔ THE CENSUS MUST ENFORCE THE BINDING TOO, OR IT IS THE FAIL-OPEN DOOR.
@@ -2604,14 +2628,25 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # parsed `verdict=finished` out of an APPENDED log publishes a previous
             # dispatch's outcome here, on the surface §13.5 names as the fleet reader's
             # home. Same rule as `gather_log_lane`, same three outcomes.
-            if lr.verdict and lr.verdict_line_pid:
-                within = _pid_within(int(f[0]), int(lr.verdict_line_pid))
-                if within is not True:
-                    lr.detail = " | ".join(x for x in (
-                        lr.detail,
-                        "%s-bound-verdict line_pid=%s query_pid=%s source=census"
-                        % ("stale" if within is False else "unbound",
-                           lr.verdict_line_pid, f[0])) if x)
+            # An UNREADABLE row pid is not freedom either: with no pid to bind to, the
+            # verdict is dropped (fail-closed), exactly as an unverifiable `verdict_pid`.
+            # And an adopted-but-unbound row now DECLARES itself, the fifth rule.
+            if lr.verdict:
+                if not row_pid:
+                    # No readable pid to bind TO: the verdict cannot be attributed at
+                    # all, so it is dropped (fail-closed).
+                    why, note = ("unbound-bound-verdict query_pid=? source=census", "")
+                elif verdict_pid:
+                    why, note = _bind_verdict(lr, int(row_pid))
+                else:
+                    # Column 11 absent — the documented 10-column row. §13's table's
+                    # fifth rule: ADOPT it and DECLARE it unbound.
+                    why = None
+                    note = "bound-verdict-without-pid source=census"
+                if note:
+                    lr.detail = " | ".join(x for x in (lr.detail, note) if x)
+                if why:
+                    lr.detail = " | ".join(x for x in (lr.detail, why) if x)
                     lr.verdict, lr.rc = "", None
             # ⛔ THE SEAM MUST NOT ASSERT THAT A LOG IS READABLE. Decoding `alive`,
             # `verdict` and `rc` strictly while hard-coding `readable=True` made an
@@ -2642,7 +2677,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             v = evaluate(Evidence(log_read=lr))
             if v.state == "unknown":
                 rc = 3
-            print("\t".join([f[0] if f else "?", v.state, v.reason]))
+            print("\t".join([f[0] if f else "?", v.state, v.reason, v.detail or ""]))
         return rc
 
     if not log or pid is None:
