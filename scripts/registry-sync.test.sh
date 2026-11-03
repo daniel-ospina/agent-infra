@@ -31,6 +31,9 @@
 #   §22 a legacy <pr>.json whose own `pr` field denies its filename is never published
 #   §23 `status` counts the STORE's records, not this box's cache
 #   §24 every network op is BOUNDED and cannot block on an invisible prompt
+#   §27 the spawn budget is O(1) in the record count (#3180)
+#   §28 the pre-pass's `join` is pinned to the collation its inputs were sorted with, and a
+#       pre-pass that cannot be computed is NAMED rather than reported as converged (#3249 P1)
 
 set -uo pipefail
 
@@ -728,6 +731,80 @@ printf '{"pr":105,"head_sha":"%s","verdict":"clean","repo":"acme/widget","review
 ONE_CHANGED="$(bash "$SYNC" union --repo "$T/n10/store" --dir "$T/n10/reg" --remote origin --timeout 30 2>&1)"
 assert_contains "$ONE_CHANGED" "unchanged=18" "§27 a ONE-BYTE change drops the pre-pass count (9 per half)"
 assert_contains "$ONE_CHANGED" "pushed acme-widget-105" "§27 ...and the changed record is published"
+
+# ═══ 28. the pre-pass's join is pinned to the collation its inputs were sorted with ══════
+# Review finding P1 on PR #3249: `identical_pairs` sorted BOTH inputs `LC_ALL=C` and then ran an
+# UNQUALIFIED `join`, so the merge was evaluated under the ambient locale over data ordered by C.
+# The two disagree on a mixed-case key set (`Acme-Widget-101` is before `acme-widget-102` in C and
+# after it under en_US), and a locale-collating `join` then mis-merges or refuses: measured on
+# coreutils 9.4, `join --check-order` under en_US.utf8 prints "input is not in sorted order", exits
+# 1 and emits only a PREFIX of the pairs. Every record then falls back to the per-record path (~21
+# spawns apiece) — silently, because `identical_pairs` ended in `return 0`.
+#
+# The shim below IS such a join: it refuses unless the call carries `LC_ALL=C`, which is the property
+# under test and is checkable on a host with NO non-C locale installed (the ambient locale is forced
+# to `C.UTF-8`, a non-`C` STRING whether or not its collation actually differs). Reverting the fix
+# makes this section red — the pre-pass then cannot run at all.
+echo "── §28 the pre-pass's join is pinned to C (a mixed-case key set cannot disable it)"
+LC_ROOT="$T/lc"; LC_REG="$LC_ROOT/reg"; LC_JOIN_SHIM="$T/lc-join-shim"
+mkdir -p "$LC_REG" "$LC_JOIN_SHIM"
+git init -q --bare "$LC_ROOT/origin.git"
+git init -q "$LC_ROOT/store"
+git -C "$LC_ROOT/store" remote add origin "$LC_ROOT/origin.git"
+lc_record() { # <owner/repo> <pr> <n> — the key is DERIVED from repo+pr, exactly as local_keyed does
+  local repo="$1" pr="$2" n="$3" key
+  key="$(printf '%s-%s-%s' "${repo%%/*}" "${repo#*/}" "$pr")"
+  printf '{"pr":%s,"head_sha":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-01-01T00:%02d:00Z"}\n' \
+    "$pr" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$repo" "$n" > "$LC_REG/$key.json"
+}
+lc_record Acme/Widget 201 1
+lc_record acme/widget 202 2
+lc_record _0dot/x     203 3
+lc_record 9lives/x    204 4
+lc_record Zeta/Beta   205 5
+lc_record zeta/beta   206 6
+# premise: the fixture really carries mixed-case keys (the discrimination is C-vs-locale ORDER)
+if [ -f "$LC_REG/Acme-Widget-201.json" ] && [ -f "$LC_REG/acme-widget-202.json" ]; then
+  ok "§28 (premise) the fixture carries mixed-case keys whose C order is not their locale order"
+else
+  bad "§28 (premise) the fixture lost its mixed-case keys"
+fi
+bash "$SYNC" union --repo "$LC_ROOT/store" --dir "$LC_REG" --remote origin --timeout 30 >/dev/null 2>&1
+REAL_JOIN="$(command -v join)"
+cat > "$LC_JOIN_SHIM/join" <<EOS
+#!/bin/sh
+printf '%s\n' "\${LC_ALL:-<unset>}" >> "$T/join.locale"
+if [ "\${LC_ALL:-}" != "C" ]; then
+  echo "join: input is not in sorted order" >&2
+  exit 1
+fi
+exec "$REAL_JOIN" "\$@"
+EOS
+chmod +x "$LC_JOIN_SHIM/join"
+: > "$T/join.locale"
+LC28="$(LC_ALL=C.UTF-8 PATH="$LC_JOIN_SHIM:$PATH" bash "$SYNC" union --repo "$LC_ROOT/store" --dir "$LC_REG" --remote origin --timeout 30 2>&1)"
+# NON-VACUITY: if `join` were never reached, the assertions below would pass for the wrong reason.
+if [ -s "$T/join.locale" ]; then ok "§28 (premise) the emulated locale-collating join WAS invoked"; else bad "§28 (premise) join was never invoked — the pre-pass is not exercised"; fi
+assert_eq "$(LC_ALL=C sort -u "$T/join.locale" | tr '\n' ' ')" "C " \
+  "§28 every join call carries LC_ALL=C (the ambient locale is forced to C.UTF-8)"
+assert_contains "$LC28" "unchanged=12" "§28 the pre-pass still skips all 6 records on both halves (2N)"
+assert_contains "$LC28" "same=12" "§28 ...and the summary agrees the records were examined and identical"
+
+# §28b — a pre-pass that genuinely cannot be computed is NAMED, not `return 0`-ed into silence.
+# This is the other half of the P1: the rc is propagated, so `do_pull`/`do_push` take their existing
+# all-records fallback and SAY SO. Correctness is untouched (every record still converges); what is
+# recovered is the signal that the optimisation did not run.
+cat > "$LC_JOIN_SHIM/join" <<EOS
+#!/bin/sh
+echo "join: input is not in sorted order" >&2
+exit 1
+EOS
+chmod +x "$LC_JOIN_SHIM/join"
+LC_LAST="$(LC_ALL=C.UTF-8 PATH="$LC_JOIN_SHIM:$PATH" bash "$SYNC" union --repo "$LC_ROOT/store" --dir "$LC_REG" --remote origin --timeout 30 2>&1)"; LC_RC=$?
+assert_eq "$LC_RC" "0" "§28b a pre-pass that cannot be computed STILL converges (slower, never wrong)"
+assert_contains "$LC_LAST" "the converged pre-pass could not run" "§28b ...and the fallback is NAMED instead of silently reported as converged"
+assert_contains "$LC_LAST" "unchanged=0" "§28b ...reporting ZERO skipped rather than a count it did not compute"
+assert_contains "$LC_LAST" "same=12" "§28b ...and every record still converges through the per-record path"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do
