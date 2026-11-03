@@ -353,11 +353,19 @@ already held, one opened a duplicate PR — both brief defects, not lane defects
 3. **WRITE after you finish** — the measurement, the refutation, the root cause, the dead end. **Read the write skill first: `skills/how-to-use-tortoise/SKILL.md`.** One claim per point; a finding needs a **number or a source** — `tortoise-graph.sh evidence` refuses one with no digit.
 
 ```bash
-bash scripts/tortoise-graph.sh health                      # is the graph up
-bash scripts/tortoise-graph.sh search 'attestation staleness'
-bash scripts/tortoise-graph.sh get <point-id>
-bash scripts/tortoise-graph.sh evidence 'MEASURED: …' [--to ID] [--pred supports]
-bash scripts/tortoise-graph.sh decision 'DECIDED: …' [--to ID]
+# ⛔ THE PATH THAT ALWAYS EXISTS IS THE FARMED ONE. `pi-bootstrap/setup.sh`'s `fleet_srcs` declares
+# these two files, so every box that has run the farm carries them at `$HOME/.pi/agent/scripts/` —
+# and a lane in a fresh WORKTREE has no `scripts/` pointer at all (that symlink is materialised per
+# checkout: `uv run python tools/link_agent_infra_scripts.py`), where the repo-relative form below
+# fails with `scripts/tortoise-graph.sh: No such file or directory`. Measured 2026-11-03.
+bash ~/.pi/agent/scripts/tortoise-graph.sh health          # is the graph up
+bash ~/.pi/agent/scripts/tortoise-graph.sh search 'attestation staleness'
+bash ~/.pi/agent/scripts/tortoise-graph.sh get <point-id>
+bash ~/.pi/agent/scripts/tortoise-graph.sh evidence 'MEASURED: …' [--to ID] [--pred supports]
+bash ~/.pi/agent/scripts/tortoise-graph.sh decision 'DECIDED: …' [--to ID]
+# SHORTCUT, only where the `scripts/` pointer resolves to the agent-infra scripts tree
+# (tortoise ships it; a linked worktree does not until you materialise it):
+#   bash scripts/tortoise-graph.sh <same verbs>
 ```
 
 **Reachability rule.** If the graph cannot be reached, say so out loud — `GRAPH-UNREACHABLE(<cmd + error>)` — and continue the task. **Never silently switch graphs** (a local graph is **not** a substitute: a lane that reads a different graph reaches an answer nobody else can reproduce), and **never silently skip the write** (an unwritten learning is the re-discovery this rule exists to stop). The primitive resolves the key **at call time**, so it works in a long-lived process whose MCP entry pinned an empty bearer; if the key is absent, report it — do not fall back.

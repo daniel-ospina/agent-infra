@@ -1441,7 +1441,12 @@ check_graph_client() {
     ok "graph client: present at $client"
   else
     warn "graph client MISSING: $client — the graph mandate is UNEXECUTABLE on this box, so every lane must report GRAPH-UNREACHABLE(...). FIX: re-run the farm that installs it (bash pi-bootstrap/cell-install.sh --install, or pi-bootstrap/setup.sh on a Mac) — a hand-copy is not a deployment and does not survive the next bring-up"
-    return 0
+    # ⛔ NO EARLY RETURN. The absence of the client and the absence of its CREDENTIAL are two
+    # independent findings with one remedy, and on the box this function exists for — a fresh cell
+    # where nothing was delivered — BOTH are true at once. Returning here reported only the first,
+    # so the operator learned the key was missing a whole bring-up cycle later. The reads below are
+    # safe with the client absent: they report presence, never a value, and cannot die (this file is
+    # `set -uo pipefail`, no `-e`).
   fi
   # The .sh execs its SIBLING by `$(dirname "$0")`. A farm that delivers only the .sh looks complete
   # in the directory listing and dies on the first call, so the pair is checked as a pair.

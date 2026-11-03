@@ -97,10 +97,12 @@ API keys. Transfer it (AirDrop works — it's tiny).
 Tortoise graph before researching, confirm direction in it before implementing, write the learning
 after) needs it, and nothing in this repo can deliver it — there is no secret store wired to the
 fleet, so it is HAND-PROVISIONED: it must be a line in `pi-keys.env` here (and in a cell's `keys.env`).
-⛔ **Step 3 item 4's "delete `pi-keys.env`" does not apply to this key** — nothing re-creates it (unlike
-the provider keys, which pi keeps after `/login`), so keep the `pi-keys.env` file itself (and the line
-in it) rather than copying the key somewhere tidier. It is the only file the setup sources into your
-profile — but note that a profile only covers INTERACTIVE sessions: a Mac **lane** receives the file
+⛔ **Step 3 item 4's "delete `pi-keys.env`" must not take this key with it.** Item 4 removes SECRET
+MATERIAL, and nothing re-creates this key (unlike the provider keys, which pi keeps after `/login`).
+So when you follow item 4: move the `TORTOISE_MCP_API_KEY` line into whatever replaces the file (the
+password manager) **and keep a `pi-keys.env` in the home folder containing that one line** — it is the
+only file the setup sources into your profile, so deleting the file deletes the mandate's credential
+until someone re-provisions it by hand. It is the one line that must survive. — but note that a profile only covers INTERACTIVE sessions: a Mac **lane** receives the file
 through `scripts/orchestrator-harness/worker-terminal.sh`, which emits it **only when `pi-keys.env`
 also assigns the model-provider key** that launch line resolves. So on a Mac whose provider credential
 comes from `/login` instead (Step 3 item 3), a graph key living in `pi-keys.env` reaches no lane, and
