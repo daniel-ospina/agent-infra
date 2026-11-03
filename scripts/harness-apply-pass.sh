@@ -109,6 +109,13 @@
 #   HARNESS_APPLY_STALE_SECONDS  a record older than this is STALE (default 3600 = 6 cadences)
 #   HARNESS_APPLY_SYNC_CMD   the sync verb to run on the sync path (default <repo>/sync.sh; the suite
 #                            points it at a stub so the fixture never runs pi-bootstrap)
+#   HARNESS_APPLY_DRIFT_CHECK  1|0 — read the deployed-drift check on this pass (default 1). `0` is
+#                            the KILL SWITCH for `action=deployed-drift`: a box that reds every tick
+#                            needs it found here, not by reading the function body.
+#   HARNESS_APPLY_DRIFT_CMD  the checker to run instead of the discovered `check-deployed-drift.sh`
+#                            (the suite drives the red arm through a stub)
+#   HARNESS_APPLY_DRIFT_DIR  OVERRIDE the checker's search root (so `absent` — the state that
+#                            leaves a pass green — is reachable in a test, not just in production)
 #
 # Run: bash scripts/harness-apply-pass.sh [--dry-run|--print-status|--help]
 #
@@ -221,7 +228,14 @@ esac
 # One line of key=value, written ATOMICALLY (temp + rename): a truncated record is indistinguishable
 # from "no pass has run", and that is the false-PASS shape this feature exists to remove.
 REC_HEAD=""; REC_REF=""; REC_BEHIND="unknown"; REC_AHEAD="unknown"; REC_DIRTY="unknown"
-REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; PRESERVED_DIR=""; REC_DEPLOYED="unknown"
+REC_PIN="none"; REC_PIN_TREE="none"; REC_ACTION="none"; REC_DETAIL=""; REC_REMEDY=""; PRESERVED_DIR=""; REC_DEPLOYED="unknown"
+# ⛔ `REC_REMEDY` IS A FIELD FOR THE SAME REASON `preserved=` IS (review finding, #10114). Measured
+# on the deployed-drift refusal: its `detail=` is 706 characters and the word `Remedy:` begins at
+# offset 272 — so `cut -c1-240` DISCARDS THE ENTIRE REMEDY from the durable record. stderr still
+# showed it, which is exactly why it survived review: an operator reading a LIVE terminal sees the
+# remedy, and the operator reading the record (or fleet-health, or `--print-status`, or a lane on
+# the next day) sees a refusal that names no action. A refusal whose remedy is lost is a gate that
+# names a defect and leaves nobody to clear it — the half-fix this whole change exists to end.
 write_record() { # <ok> <rc>
     local tmp ok="$1" rc="$2"
     mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR"; return 1; }
@@ -247,7 +261,21 @@ write_record() { # <ok> <rc>
         printf 'dirty=%s\n' "$REC_DIRTY"
         printf 'pin=%s\n' "$REC_PIN"
         printf 'pin_tree=%s\n' "$REC_PIN_TREE"
+        # ⛔ A FIELD, NOT PROSE IN `detail=` (review P1/P2, #10114). The whole point of this reading is
+        # that a downstream instrument (fleet-health, --print-status) can see the deployed-drift state;
+        # `detail=` is truncated at 240 chars, and this file already argues that an operator-needed
+        # fact must not be at the mercy of a prose truncation (`preserved=` carries the same note).
+        # ⛔ `${DRIFT_STATE:-not-run}` IS LOAD-BEARING, NOT DEFENSIVE STYLE (review VGATE, fatal).
+        # `write_record` is called from the PRE-FLOW refusals long before `read_deployed_drift` exists, so a
+        # bare `$DRIFT_STATE` under `set -u` ABORTED the record block — whose stderr is discarded — and every
+        # no-checkout / unresolvable-ref pass exited 1 with NO record and no diagnostic instead of the
+        # documented 23. `not-run` is also the truthful value there: those paths never reached the reading.
+        printf 'drift=%s\n' "${DRIFT_STATE:-not-run}${DRIFT_TOKEN:+:$DRIFT_TOKEN}"
         printf 'preserved=%s\n' "${PRESERVED_DIR:-none}"
+        # ⛔ NOT TRUNCATED, and last, for the same reason as `preserved=` above: a remedy is the one
+        # line a reader MUST be able to act on, so it is never at the mercy of a prose bound. Bounded
+        # by construction (each is a fixed sentence the call sites author), not by `cut`.
+        printf 'remedy=%s\n' "$(printf '%s' "${REC_REMEDY:-none}" | tr '\n' ' ')"
         printf 'action=%s\n' "$REC_ACTION"
         printf 'lanes=none-signalled\n'
         printf 'fetch=%s\n' "${FETCH_STATE:-notfetched}"
@@ -530,6 +558,100 @@ log_line "harness: mode=$PASS_MODE repo=$REPO ref=$REF fetch=$FETCH_STATE head=$
 [ "$PASS_MODE" = pin ] && [ "$REC_PIN_TREE" != "none" ] && \
     log_line "harness: deployed=$REC_PIN_TREE (the tree the pin names — this is what the box RUNS; the checkout above is not moved by a pin advance)"
 
+# ── DEPLOYED-DRIFT READING (agent-infra#10114) ────────────────────────────────────────────────
+# ⛔ THE BOX CAN BE AT THE PIN AND STILL RUN NOTHING THIS REPO SHIPS. Every reading above answers a
+# question about a RECORD (the pin, the stamp, the checkout). None of them answers the one question the
+# outage asked: is the code that is EXECUTING equal to $REF? Measured on this class of box: the
+# controller executed `<pin-root>/709dfb06eac2/...`, a directory that no longer existed, while the pin
+# record, the unit's active state and the control plane all read green — a stale copy is not fixed, and
+# it was INVISIBLE because the pass reported success.
+# ⛔ ONE PREDICATE (#1178): this calls `check-deployed-drift.sh`, the instrument that already answers
+# this, and prints ITS token. It is NOT re-derived here — a second checker is how two instruments come
+# to disagree about one box. READ-ONLY: that script changes nothing and is safe beside a working loop.
+# ⛔ THE SEAM IS THE POINT. `HARNESS_APPLY_DRIFT_CHECK=0` disables it (the suite runs this pass against
+# stub repos that carry no harness dir at all); an ABSENT checker is `not-run`, named as such, never a
+# silent pass — we cannot verify what we did not run.
+DRIFT_STATE=not-run; DRIFT_RC=not-run; DRIFT_TOKEN=not-run
+# ⛔ CALLED ONCE PER RUN, AND NEVER FROM THE READINGS SECTION (review P1). An earlier revision also
+# called it here, beside the other readings — so every pass took TWO readings, and on an advancing tick
+# the two DISAGREED (this one pre-move, `finish`'s post-move) while the log printed both under the same
+# key. That is the "two numbers for one box in one pass" defect this file already documents twice, and
+# the checker costs ~3 s, so it doubled the pass's cost too.
+# EXACTLY TWO CALL SITES, and they cannot both run: `finish` (a real pass, post-move, the reading the
+# record is written from) and the `--dry-run` branch (a PREVIEW, which exits before `finish` and writes
+# no record). Adding a third beside the readings is the defect above — not the preview, which exists so
+# the read-only verb can answer the executing-tree question at all (review round 21, P2).
+read_deployed_drift() {
+    [ "${HARNESS_APPLY_DRIFT_CHECK:-1}" = 0 ] && { DRIFT_STATE=disabled; DRIFT_TOKEN=disabled; return 0; }
+    local chk="${HARNESS_APPLY_DRIFT_CMD:-}"
+    if [ -z "$chk" ]; then
+        # ⛔ THE SCHEDULED PASS IS THE **FARMED** COPY, NOT A CHECKOUT COPY — and the farm does NOT ship
+        # the checker (review P1, measured on this box). `install-harness-apply-timer.sh` installs the
+        # farmed copy first ("that is what a cell has after pi-bootstrap/setup.sh"), the unit runs
+        # `<cell-home>/.pi/agent/scripts/harness-apply-pass.sh`, and that directory carries neither
+        # `check-deployed-drift.sh` nor an `orchestrator-harness/` subdir — while `pi-bootstrap`'s
+        # `fleet_srcs` farms this pass and NOT the checker. So searching only `$HERE` made the whole
+        # arm DEAD on every deployed box: `absent` → not-run → never `executes:` → rc 0 over a stale
+        # executing harness, which is exactly the silent green this change exists to end.
+        # `$O` is where the checker IS deployed, so it is the candidate that works in production.
+        # ⛔ `HARNESS_APPLY_DRIFT_DIR` IS A SEARCH-ROOT OVERRIDE, not an extra candidate (review round 8,
+        # P2). The discovery path is the thing this lane had to fix TWICE because it was dead in the
+        # deployed shape, and no test executed it — every drift assertion supplied a checker path
+        # directly, and candidate 1 (`$HERE/orchestrator-harness/…`) shadows any fixture on this box.
+        # Overriding the root makes both "found through the seam" and "nothing to find" reachable, so
+        # `absent → not-run` (the arm that leaves the pass GREEN) can be asserted instead of assumed.
+        if [ -n "${HARNESS_APPLY_DRIFT_DIR:-}" ]; then
+            [ -f "$HARNESS_APPLY_DRIFT_DIR/check-deployed-drift.sh" ] && chk="$HARNESS_APPLY_DRIFT_DIR/check-deployed-drift.sh"
+        else
+        for _candidate in "$HERE/orchestrator-harness/check-deployed-drift.sh" \
+                          "$HERE/check-deployed-drift.sh" \
+                          "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/check-deployed-drift.sh" \
+                          "${O:-}/check-deployed-drift.sh"; do
+            [ -n "$_candidate" ] && [ -f "$_candidate" ] && { chk="$_candidate"; break; }
+        done
+        fi
+    fi
+    if [ ! -f "$chk" ]; then
+        DRIFT_STATE=not-run; DRIFT_TOKEN=absent
+        log_line "harness: deployed_drift=not-run token=absent (no check-deployed-drift.sh beside $HERE, in \$O=$O, or at AGENT_INFRA_PATH) — NOT a clean reading, we did not look"
+        return 0
+    fi
+    local out
+    # `--surface` is what includes the EXECUTING tree (read from the process's own argv) alongside $O;
+    # `--no-fetch` keeps this pass network-free (the fetch above already happened).
+    # ⛔ THE THREE VALUES ARE PASSED EXPLICITLY, NOT INHERITED (review finding, #10114). This pass
+    # RESOLVES the pin from `HARNESS_PIN_FILE`/`HARNESS_PIN_DIR` (with `$CELL_HOME` defaults) and
+    # `$O` from its own launcher, but a RESOLVED value is not an EXPORTED one: a shell variable set
+    # here (`PIN_PATH_FILE=…`, `O=…`) is invisible to a child unless something exported it. The
+    # checker then falls back to ITS defaults (`O=$HOME/orchestrator`, pin records from its own
+    # env) and answers a DIFFERENT question than the one this pass asked — measured shape: a pass
+    # that knows the pin lives at `<cell-home>/.harness-path` while the checker looks at
+    # `$HOME/.harness-path`, so `--surface` compares a box it has mis-identified and the reading is
+    # reported beside readings taken against the right one. Passing them on the child's command line
+    # makes the two instruments answer about ONE box; `O` is also how the checker finds the deployed
+    # tree in the FARMED layout, where `$HERE` carries neither the checker nor its subdir.
+    out="$(O="$O" HARNESS_PIN_FILE="$PIN_PATH_FILE" HARNESS_PIN_DIR="$PIN_ROOT" bash "$chk" --surface --repo "$REPO" --ref "$REF" --no-fetch 2>&1)"; DRIFT_RC=$?
+    DRIFT_TOKEN="$(printf '%s\n' "$out" | sed -n 's/.*harness=//p' | head -1)"
+    [ -n "$DRIFT_TOKEN" ] || DRIFT_TOKEN="rc=$DRIFT_RC"
+    case "$DRIFT_RC" in
+        0) DRIFT_STATE=clean ;;
+        1) DRIFT_STATE=drift ;;
+        *) DRIFT_STATE="cannot-verify-rc$DRIFT_RC" ;;
+    esac
+    # ⛔ CANNOT-VERIFY KEEPS ITS REASON (review P2). The checker's exit 2 means "I could not answer" —
+    # an unreadable process table, an unexaminable dir, an unresolvable controller path — and its
+    # `UNKNOWN:` line is the only place that reason is ever written. Recorded as a bare `token=rc=2` it
+    # survived nowhere an operator reads (the record's `detail=` truncates at 240 chars), leaving a box
+    # whose executing-tree question was NEVER ANSWERED looking like one that answered clean. This is
+    # reported, not turned into a refusal: exit 2 is heavily reachable on a box with no harness at all,
+    # and a check that reds every such box is one operators learn to ignore.
+    if [ "$DRIFT_RC" -gt 1 ] 2>/dev/null; then
+        log_line "harness: deployed_drift_unknown=$(printf '%s\n' "$out" | grep -m1 -E 'UNKNOWN:|BROKEN' || true)"
+    fi
+    log_line "harness: deployed_drift=$DRIFT_STATE token=$DRIFT_TOKEN (check-deployed-drift.sh --surface)"
+    return 0
+}
+
 # finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
 # (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
 # identical from a log, and an operator who reads `current` has to be able to see it WAS current.
@@ -541,7 +663,37 @@ finish() { # <ok> <rc> <verdict-phrase>
     # `--print-status` dumps verbatim — while the record beside it said `behind=0`. So the phrase is
     # passed WITHOUT readings and the numbers are appended here, once, after the recompute.
     recompute_deployed
-    REC_DETAIL="$3 — head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}"
+    # ⛔ ONE READING, TAKEN HERE, FROM THE FINAL STATE (review P1). Unconditional so every exit path —
+    # advance, no-op, refusal — reports the same post-move fact, and no path can carry a stale one.
+    read_deployed_drift
+    # ⛔ A STALE DEPLOYED COPY IS NOT A CLEAN PASS (agent-infra#10114). This is the plain form of the
+    # "gate that answers before its inputs exist": every reading above can be green while the box
+    # executes a tree that is gone, and a `rc=0` there tells every downstream reader the harness is
+    # fine. The drift reading itself was taken ONCE, above. It never downgrades a refusal (a passing
+    # `$1` is required) and never masks a higher code: a box that could not verify is rc 23 and stays 23.
+    if [ "$1" = 1 ]; then
+        # ⛔ WHICH DRIFT EARNS A RED. `executes:<dir>` is the measured #10114/#3194 class and the only
+        # one that is unambiguously a FAILURE OF THE HARNESS THIS PASS GOVERNS: a live controller
+        # executes a directory the box does not have, so NOTHING it runs is this repo's code — and the
+        # pass just called that box fine. The other tokens (`behind:`, `payload-differs`,
+        # `uncommitted-edit:`, `surface`) can legitimately describe a developer box mid-edit or a
+        # deliberately-behind checkout, so they are REPORTED in the log line and in the record's
+        # `drift=` field, but they do not convert an ordinary pass into a refusal. A check that reds
+        # every working box is a check an operator learns to ignore, which is how the silent one
+        # survived. Scoping is stated here rather than implied: only `executes:` fails the pass.
+        case "$DRIFT_TOKEN" in
+            executes:*)
+                REC_ACTION=deployed-drift
+                # The remedy lives in its own FIELD (see `REC_REMEDY`), because `detail=` truncates
+                # at 240 and this sentence does not fit in it — measured: `Remedy:` begins at 272.
+                REC_REMEDY="cloud-cell-supervisor.sh apply --force --pin-only (--force is REQUIRED: apply refuses a live cell without it, and an executes: state always has a live controller), then restart the controller from the pinned tree (a redeploy does not clear it)"
+                REC_DETAIL="REFUSED deployed-drift: a live controller EXECUTES a harness directory that cannot be matched to this repo (gone, or present with no readable *.sh) (harness=$DRIFT_TOKEN) — this pass succeeded and the code the box RUNS is still not this repo's; a stale copy is not fixed. Remedy: $REC_REMEDY. Readings: head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE:$DRIFT_TOKEN"
+                write_record 0 1 || exit 23
+                err "$REC_DETAIL"
+                exit 1 ;;
+        esac
+    fi
+    REC_DETAIL="$3 — head=$REC_HEAD deployed=$REC_DEPLOYED ref=$REC_REF behind=$REC_BEHIND ahead=$REC_AHEAD dirty=$REC_DIRTY pin=$REC_PIN pin_tree=$REC_PIN_TREE drift=$DRIFT_STATE${DRIFT_TOKEN:+:$DRIFT_TOKEN}${PRESERVED_DIR:+ preserved=$PRESERVED_DIR}"
     write_record "$1" "$2" || exit 23
     if [ "$1" = 1 ]; then log_line "$REC_DETAIL"; else err "$REC_DETAIL"; fi
     exit "$2"
@@ -558,6 +710,11 @@ finish() { # <ok> <rc> <verdict-phrase>
 case "$FETCH_STATE" in
     ok) ;;
     *) REC_ACTION=cannot-verify-fetch
+       # Its `detail=` is ~250+ chars once the readings suffix is appended, so `cut -c1-240` drops the
+       # tail; `remedy=` is a FIELD so the REMEDY survives regardless (review round 3, finding 5).
+       # (`action=` is written on its own line at :278-279 and never depended on this — what the prose
+       # bound was eating is the sentence a reader has to act on.)
+       REC_REMEDY="restore the fetch (check the remote and egress), then re-run"
        finish 0 23 "REFUSED cannot-verify: no fresh fetch was made (fetch=$FETCH_STATE) in $REPO, so 'current' would mean 'current against the ref as of the LAST successful fetch' — the comparison this pass exists to make is not fresh. Nothing was touched." ;;
 esac
 
@@ -567,10 +724,12 @@ esac
 # "ahead" alone does not tell an operator whether it is one commit worth keeping or twenty.
 if [ "$RELATION" = ahead ]; then
     REC_ACTION=refused-ahead
+    REC_REMEDY="recover or land them first: git -C $REPO log $REF..HEAD, then re-run"
     finish 0 21 "REFUSED ahead: $REPO carries $AHEAD commit(s) that are not on $REF — advancing would drop them. Recover or land them first (git log $REF..HEAD), then re-run. Nothing was touched."
 fi
 if [ "$RELATION" = diverged ]; then
     REC_ACTION=refused-diverged
+    REC_REMEDY="a rebase or cherry-pick is an operator decision, not a scheduled one: resolve divergence by hand, then re-run"
     finish 0 22 "REFUSED diverged: HEAD is neither an ancestor nor a descendant of $REF — a rebase or cherry-pick is an operator decision, not a scheduled one. Nothing was touched."
 fi
 
@@ -758,6 +917,10 @@ if [ "$PASS_MODE" = sync ] && [ "$RELATION" = behind ] && [ "$DIRTY_N" != "unkno
         PRESERVED_DIR="$STATE_DIR/harness-apply-preserved/$(date -u +%Y%m%dT%H%M%SZ)-$$"
         preserve_dirty "$PRESERVED_DIR" || {
             REC_ACTION=refused-dirty
+            # ⛔ THE REDDEST REFUSAL MUST NOT RECORD `remedy=none` (review finding 6). This `detail=` is
+            # 474 chars, so `cut -c1-240` lands mid-sentence and discards the action clause — the same
+            # class of loss the `remedy=` field exists to prevent, left on the one path that most needs it.
+            REC_REMEDY="recover the work from $PRESERVED_DIR (changes.patch + changes.index.patch), fix the cause, then re-run"
             # ⛔ NOT "nothing was touched". Preservation and restore are one pass over the list, so a
             # failure in the RESTORE half can leave the checkout part-restored — every affected byte was
             # written to $PRESERVED_DIR first, but claiming the tree is untouched would be false in the
@@ -777,6 +940,13 @@ if [ "$DRY_RUN" = 1 ]; then
     # then read `status=ok age=0s` in `--print-status`, in the installer's `--status` and in
     # fleet-health — the false PASS this whole feature exists to delete, produced by its preview verb.
     [ "$PASS_MODE" = pin ] && read_pin
+    # ⛔ THE PREVIEW ANSWERS THE EXECUTING-TREE QUESTION TOO (review round 21, P2). `read_deployed_drift`
+    # had exactly ONE call site (`finish`), and `--dry-run` exits before `finish`, so the read-only verb
+    # — the one an operator uses to inspect a box without changing it — still could not say whether the
+    # code that is EXECUTING is this repo's, while the merge evidence printed that line under
+    # `--dry-run`. It is PRINT-ONLY here: `read_deployed_drift` writes nothing, and a preview must not
+    # red a box (it changes nothing, including the exit contract).
+    read_deployed_drift
     log_line "dry-run: relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N mode=$PASS_MODE — nothing was changed and no pass record was written"
     exit 0
 fi
@@ -805,6 +975,11 @@ if [ "$PASS_MODE" = pin ]; then
         # pin mode unless the test happened to hand it a stub (measured in review).
         if [ ! -f "$MATERIALISER" ]; then
             REC_ACTION=unmaterialisable
+            # ⛔ `remedy=` CARRIES THE ONLY ACTIONABLE TOKEN (review round 13, finding 2). This
+            # message is 208 chars and `finish` appends a 142-char readings suffix, so the
+            # `(set HARNESS_MATERIALISER)` hint sat past the 240 cut and was DISCARDED — shipping a red
+            # rc=25 the operator could not act on, which is exactly what this field exists to prevent.
+            REC_REMEDY="set HARNESS_MATERIALISER to this box's materialiser (cloud-cell-supervisor.sh), then re-run"
             finish 0 25 "this box has no materialiser at $MATERIALISER, so the pin cannot be advanced to $(short "$REF_SHA") (set HARNESS_MATERIALISER)"
         fi
         BEFORE_PIN_TREE="$PIN_TREE_SHA"
@@ -979,6 +1154,7 @@ case "$REC_ACTION" in
             # ("the pin already names $REF") contradicted the record's own `pin=` field.
             if [ "$REC_PIN" != "$REC_REF" ]; then
                 REC_ACTION=pin-lies
+                REC_REMEDY="materialise the pin tree named by HARNESS-PIN (apply --pin-only), then re-run; nothing on this box can repair a lying pin record without one"
                 finish 0 25 "the sha record names $REC_PIN but no pin tree resolves, so it cannot be compared with what this box RUNS ($REC_DEPLOYED) — the pin is still lying; nothing here can repair it without a materialised tree"
             fi
             finish 1 0 "current: no pin tree is materialised and the checkout already matches $REF — nothing changed"
