@@ -1323,6 +1323,12 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       `   another session's uncommitted hub WIP. Only genuinely NEW files`,
       `   (additive + visible) are allowed cross-checkout (cycle-3 A-2 — the`,
       `   bash route mirrors the write/edit tool's existing-untracked freeze).`,
+      // Round 8 (P2): this is the surface the incident's refusal #4 (`cp` a
+      // worktree copy over the truncated tracked file) hit, and it offered only
+      // routes that cannot work in the state that produced it: a mid-session
+      // lane cannot set a session-start env, and a worktree does not clear the
+      // hub. Name the route that DOES work under the marker the lane holds.
+      ..._hubWriteRecoverLines(_hubState()),
       `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
       `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,

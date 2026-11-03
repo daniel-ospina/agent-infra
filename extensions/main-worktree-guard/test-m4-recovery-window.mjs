@@ -398,6 +398,22 @@ async function partB() {
     } finally {
       delete process.env.GIT_CONFIG_PARAMETERS;
     }
+    // B6g2 — round 8 (P1 MEASURED, data loss): the ambient check lived only in
+    // the M5 half, so M4 still classified `restore --staged` as recovery and M5
+    // has no staged-only descriptor to backstop it — a FOREIGN index was reset.
+    // The check is now at the single decision point both gates share, so M4
+    // itself refuses.
+    process.env.GIT_DIR = `${other}/.git`;
+    process.env.GIT_WORK_TREE = other;
+    try {
+      const b6g2 = await drive("git restore --staged tracked.txt");
+      check("B6g2 marker + ambient GIT_DIR ⇒ `restore --staged` BLOCKED (M4 decides)", b6g2 !== null, true);
+      check("B6g2b …and the refusal NAMES the inherited env",
+        /INHERITED a repo-selecting env/.test(b6g2?.reason ?? ""), true);
+    } finally {
+      delete process.env.GIT_DIR;
+      delete process.env.GIT_WORK_TREE;
+    }
     // B6h — round 4, P2: while the hatch is ACTIVE the refusal must name the
     // window's real shape limit, not re-prescribe the hatch the reader holds.
     const b6h = await drive("git checkout -- wip.txt > /dev/null");

@@ -4753,6 +4753,17 @@ function _invSelectsRepo(inv) {
   // descriptor family has no staged-only shape. A restore in the recovery
   // window runs from the hub, so any `cd` prefix puts it outside the window.
   if (Array.isArray(inv.cdChain) && inv.cdChain.some((c) => c !== null && c !== undefined)) return true;
+  // Round 8 (P1, MEASURED — data loss). The ambient-env predicate lived ONLY in
+  // index.ts's window, i.e. in the M5 half. M4's own verdict is decided HERE, so
+  // with `GIT_DIR`/`GIT_WORK_TREE` inherited by the pi process M4 classified
+  // `git restore --staged <path>` as recovery and let it through, and M5 cannot
+  // backstop it (its descriptor family has no staged-only shape): the FOREIGN
+  // checkout's index was reset, staged work destroyed, where origin/main blocked
+  // it. The channel check therefore belongs at the SINGLE decision point both
+  // gates share — this one.
+  if (["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
+    .some((v) => { const x = process.env[v]; return typeof x === "string" && x.length > 0; })) return true;
+  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && (process.env[k] ?? "").length > 0)) return true;
   return false;
 }
 
@@ -5643,6 +5654,23 @@ export function hubNewFileVolumeVerdict(count) {
  *  sanctions — see isHubRecoveryInvocation) and an explicit statement that the
  *  branch route does not apply. Clean/off-main-only keeps the branch route,
  *  which DOES work there. */
+/** Round 8 (P2): name an INHERITED repo-selecting env instead of prescribing a
+ *  restore that cannot converge. Empty when the process env is clean. */
+function _ambientGitEnvLines() {
+  const vars = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
+    .filter((v) => typeof process.env[v] === "string" && process.env[v].length > 0);
+  const cfg = Object.keys(process.env).filter((k) => /^GIT_CONFIG_/.test(k) && (process.env[k] ?? "").length > 0);
+  const found = [...vars, ...cfg];
+  if (found.length === 0) return [];
+  return [
+    `   ⚠️ THIS PROCESS INHERITED a repo-selecting env (${found.join(", ")}) — every`,
+    `     restore from here would target THAT checkout, not this hub, so the`,
+    `     recovery window is CLOSED and no command above can converge. Restart pi`,
+    `     without those variables, then restore here.`,
+  ];
+}
+
 function _m4RecoveryLines(hubContext) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
   if (!dirty) {
@@ -5662,6 +5690,11 @@ function _m4RecoveryLines(hubContext) {
     `       worktree change      \` M\`  -> \`git restore <path>\` / \`git checkout -- <path>\``,
     `       UNTRACKED            \`??\`  -> move it OUT: \`mv <path> /tmp/\` (\`git clean\``,
     `                                        stays refused — it is a discard)`,
+    // Round 8 (P2): if this process INHERITED a repo-selecting env, no restore
+    // from here can converge — the recovery window is closed and every restore
+    // would target the other checkout. Name the cause instead of prescribing a
+    // command that cannot run (the incident's exact failure shape).
+    ..._ambientGitEnvLines(),
     `     These named-path recoveries need an active escape hatch: the`,
     `     AGENT_ALLOW_MAIN_EDITS=1 session-start env, or the`,
     `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
