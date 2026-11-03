@@ -105,9 +105,15 @@ def pi_process_count():
 
     `None` is the abstention and is NOT interchangeable with `0`: a failed `ps` must never
     manufacture the "no processes, so no mismatch" clean result this reconciliation exists to
-    prevent (the same unknown-vs-zero rule the identity probe follows). A non-`pi` argv0 is
-    ignored, and a command that merely CONTAINS "pi" (a path, a chatty `-c` wrapper) is not
-    counted -- the matcher reads argv0's basename only.
+    prevent (the same unknown-vs-zero rule the identity probe follows).
+
+    ⛔ EXACT BASENAME, NOT A PREFIX (review cycle 1, finding 4). The matcher was
+    `base == "pi" or base.startswith("pi-")`, which counts every `pi-*` HELPER --
+    `pi-cache-reap`, `pi-reap-orphans.sh`, `pi-task-session-prune.sh` -- as a lane-bearing pi.
+    Measured: `exec -a pi-cache-reap sleep` is counted by the prefix form. That over-count feeds
+    the census a population the fleet does not have, and on a box whose roster is current it
+    fabricates a MISMATCH out of a reaper. The fleet's own binary is exactly `pi` (measured: 18
+    processes, argv0 `pi`), so an exact basename is both correct and narrower.
     """
     try:
         cp = subprocess.run(PI_PS_ARGV, capture_output=True, text=True, timeout=20)
@@ -121,28 +127,46 @@ def pi_process_count():
         if len(parts) < 2 or not parts[1].strip():
             continue
         argv0 = parts[1].split()[0]
-        base = os.path.basename(argv0)
-        if base == "pi" or base.startswith("pi-"):
+        if os.path.basename(argv0) == "pi":
             n += 1
     return n
 
 
-def lane_census(attributed, pi_count, roster_size):
-    """The census note, or None when the two populations are reconcilable.
+def lane_census(attributed, measured, pi_count, roster_size):
+    """The census note, or None when the roster and the process table are reconcilable.
 
-    `attributed` is the number of rostered lanes the ONE verdict function positively bound to a
-    live incarnation (`observed == holder`) -- never a lane that merely has a record. A lane whose
-    identity read ABSTAINED is not attributed; counting it as alive is the defect this module
-    already refuses one level down.
+    Three inputs, because the defect has three distinct shapes and collapsing them is how the
+    message ends up asserting an inference the code does not have (review cycle 1, findings 1+2):
 
-    A mismatch needs BOTH numbers known: an unreadable process table (`pi_count is None`) and a
-    genuinely empty one (`0`) both abstain, in opposite directions, and neither may be reported as
-    agreement or as an alarm.
+    * `measured` -- how many rostered lanes the store even HAS a record for. This is what
+      separates "the roster is stale" (record for none of its own sessions) from "the roster is
+      accurate and every lane has exited" (records present, all positively dead). `attributed`
+      alone cannot tell those apart, and a message that says "the roster is stale" over a table
+      whose every row reads `PID DEAD` is stating a fact the code never established.
+    * `attributed` -- how many lanes the ONE verdict function positively bound to a live
+      incarnation (`observed == holder`). A lane whose identity read ABSTAINED is not attributed.
+    * `pi_count` -- the independent population, or None when unreadable.
+
+    ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When the roster accounts for none of its sessions
+    AND the process table cannot be read, returning None would render that state identically to
+    `pi_count == 0` -- "reconciled, nothing running" -- and the summary would print
+    `✅ no suspects` with exit 0. That is the pre-fix false PASS arriving through the new gate's
+    own input, so it gets its own UNRECONCILED note instead.
     """
-    if pi_count is None or pi_count <= 0 or attributed > 0:
+    if measured > 0:
+        # Records exist for the roster's own lanes: whatever their verdicts, the roster is not
+        # stale and the process table has nothing to contradict. An all-`PID DEAD` table is a
+        # legitimate idle fleet, not an unmeasured one.
         return None
-    return ("LANE CENSUS MISMATCH: %d pi process(es) running but 0 of the %d rostered lanes was "
-            "attributed alive — the roster is stale on this box, so every row above is "
+    if pi_count is None:
+        return ("LANE CENSUS UNRECONCILED: 0 of the %d rostered lanes has a record in the store "
+                "and the process table could not be read — the scan is UNMEASURED, not clean"
+                % roster_size)
+    if pi_count <= 0:
+        # Nothing is running at all: a stale roster cannot mislead about a box with no processes.
+        return None
+    return ("LANE CENSUS MISMATCH: %d pi process(es) running but 0 of the %d rostered lanes has a "
+            "record in the store — the roster is stale on this box, so every row above is "
             "UNMEASURED (not dead, and NOT a clean result)" % (pi_count, roster_size))
 
 
@@ -689,8 +713,11 @@ def main():
     print(f"{'lane':4} {'pid':>7} {'life':9} {'q':>2} {'ctx-age':>8} {'cpu-delta':>10}  flag")
     print("-" * 62)
     attributed = 0
+    measured = 0      # lanes the store has a RECORD for -- separates "stale roster" from "all dead"
     for lane, sid in LANES:
         rec = hook.get(sid, {})
+        if rec:
+            measured += 1
         pid = rec.get("pid")
         life = rec.get("agentLifecycle") or "?"
         depth = rec.get("activePromptDepth")
@@ -748,7 +775,7 @@ def main():
     # The roster above is a frozen list; the process table is not. When the roster accounts
     # for NONE of the running pi processes, the table is not a census and must say so rather
     # than let the summary below read as a clean scan.
-    census_note = lane_census(attributed, pi_process_count(), len(LANES))
+    census_note = lane_census(attributed, measured, pi_process_count(), len(LANES))
     if census_note:
         print()
         print(f"⚠️  {census_note}")
@@ -809,7 +836,7 @@ def main():
         # was attributed: the scan did not establish lane identity, which is the same
         # INCOMPLETE class as the unreadable store above and must reach a scheduler the same
         # way (a census that prints rows and exits 0 is exactly the false PASS this guards).
-        print("⚠️  lane census INCOMPLETE (0 rostered lanes attributed) — the rows above are not a verdict")
+        print("⚠️  lane census INCOMPLETE (0 rostered lanes measured) — the rows above are not a verdict")
         return 1
     if sched_alarms:
         # A reaper alarm does not make the LANE rows wrong, so it is reported after them — but it

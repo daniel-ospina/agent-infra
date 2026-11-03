@@ -492,26 +492,37 @@ def leg_lane_census(mod):
     roster — the exact state the defect rendered as a clean scan.
     """
     PREDICATE = (
-        "CENSUS: 9 pi processes vs 0 attributed lanes raises the mismatch",
+        "CENSUS: pi running vs a roster with no records raises the mismatch",
         "CENSUS: the mismatch names BOTH populations — a bare 0 is the defect",
-        "CENSUS: an UNREADABLE process table abstains — unknown is neither a mismatch nor 0",
+        "CENSUS: an UNREADABLE process table is NAMED, never rendered as agreement",
         "CENSUS: a genuinely empty process table raises nothing",
-        "CENSUS: attributed lanes reconcile the two populations",
+        "CENSUS: a live, attributed lane reconciles the populations",
+        "CENSUS: an ACCURATE roster whose lanes have all exited raises nothing",
     )
     # ⛔ A MISSING FUNCTION IS A RED, NOT A TRACEBACK. The pre-fix module has no `lane_census`,
-    # and this suite must report that as five failed checks so the red control can key on the
-    # ❌ markers — a crash would leave stdout without them and read as "no red happened".
+    # and this suite must report that as failed checks so the red control can key on the ❌
+    # markers — a crash would leave stdout without them and read as "no red happened".
     fn = getattr(mod, "lane_census", None)
     if fn is None:
         for msg in PREDICATE:
             bad(msg)
     else:
-        note = fn(0, 9, 7)
+        # signature: (attributed, measured, pi_count, roster_size)
+        note = fn(0, 0, 9, 7)              # no records for any rostered lane, 9 pi running
         check(bool(note) and "MISMATCH" in note, PREDICATE[0])
         check(bool(note) and "9" in note and "7" in note, PREDICATE[1])
-        check(fn(0, None, 7) is None, PREDICATE[2])
-        check(fn(0, 0, 7) is None, PREDICATE[3])
-        check(fn(2, 9, 7) is None, PREDICATE[4])
+        # ⛔ AN ABSTENTION MUST BE NAMED (review cycle 1, finding 2). Rendering an unreadable
+        # process table as "no note" is indistinguishable from `pi_count == 0` and lets the
+        # summary print `✅ no suspects` — the pre-fix false PASS, through the new gate's input.
+        abst = fn(0, 0, None, 7)
+        check(bool(abst) and "UNRECONCILED" in abst, PREDICATE[2])
+        check(fn(0, 0, 0, 7) is None, PREDICATE[3])
+        check(fn(2, 7, 9, 7) is None, PREDICATE[4])
+        # ⛔ AN ALL-DEAD TABLE IS NOT A STALE ROSTER (review cycle 1, finding 1): `measured > 0`
+        # means the roster's own sessions ARE in the store and positively died — a legitimately
+        # idle fleet. Keying on `attributed == 0` alone made that state print "the roster is
+        # stale ... UNMEASURED (not dead)" over seven `PID DEAD` rows, and forced exit 1.
+        check(fn(0, 7, 1, 7) is None, PREDICATE[5])
 
     # ⛔ THE PRODUCER'S OWN CONTRACT — `pi_process_count()` — was stubbed by this leg and pinned
     # by nothing, the same producer-contract gap this lane closed for `beta-progress.gh()`: a
@@ -523,70 +534,89 @@ def leg_lane_census(mod):
             self.stdout = out
             self.stderr = ""
 
+    PRODUCER = (
+        "CENSUS: a FAILED `ps` read abstains — unknown is never a manufactured 0",
+        "CENSUS: a successful but empty `ps` read is a real 0, not an abstention",
+        "CENSUS: argv0 basename matches exactly `pi` — a `pi-*` helper is not a lane",
+    )
+    counter = getattr(mod, "pi_process_count", None)
     saved_run = mod.subprocess.run
     try:
-        for rc, out in ((1, "1 pi\n"), (0, ""), (2, "")):
-            mod.subprocess.run = lambda *a, **k: _R(rc, out)
-            got = mod.pi_process_count()
-            # rc != 0 is an UNREADABLE table => None; rc == 0 with no matching row is a real 0.
-            want = None if rc != 0 else 0
-            check(got == want,
-                  "CENSUS: an unusable `ps` read abstains (rc=%d -> %r, never a manufactured 0)"
-                  % (rc, want))
-        mod.subprocess.run = lambda *a, **k: _R(
-            0, "  123 pi --flag x\n  124 /usr/bin/pi\n  125 pidb\n")
-        check(mod.pi_process_count() == 2,
-              "CENSUS: argv0 basename matches `pi` only — a path or a name merely CONTAINING it is not a lane")
+        if counter is None:
+            for msg in PRODUCER:
+                bad(msg)
+        else:
+            for rc in (1, 2):                       # unreadable table
+                mod.subprocess.run = lambda *a, **k: _R(rc, "1 pi\n")
+                check(counter() is None, PRODUCER[0])
+            mod.subprocess.run = lambda *a, **k: _R(0, "")   # usable, genuinely empty
+            check(counter() == 0, PRODUCER[1])
+            # ⛔ THE `pi-*` ROW (review cycle 1, finding 4). The matcher was a prefix test, so a
+            # reaper named `pi-cache-reap` counted as a lane-bearing pi and could fabricate a
+            # MISMATCH on a box whose roster is current. Exact basename only.
+            mod.subprocess.run = lambda *a, **k: _R(
+                0, "  123 pi --flag x\n  124 /usr/bin/pi\n  125 pidb\n"
+                   "  126 pi-cache-reap\n  127 /usr/local/bin/pi-task-session-prune.sh\n")
+            check(counter() == 2, PRODUCER[2])
     finally:
         mod.subprocess.run = saved_run
 
-    # ── main() end-to-end: readable store, none of the roster present ──
-    _MISSING = object()
-    saved = {k: getattr(mod, k, _MISSING)
-             for k in ("HOOK", "STATE", "TASK", "SESS", "pi_process_count",
-                       "reaper_section", "harness_apply_section")}
-    tmp = tempfile.mkdtemp(prefix="fleet-health-census-")
-    out = ""
-    rc = None
-    old = sys.stdout
-    buf = io.StringIO()
-    try:
-        hook = os.path.join(tmp, "hook.json")
-        with open(hook, "w", encoding="utf-8") as fh:
-            # A readable store holding two sessions that are NOT in `LANES`: `load_hook`
-            # succeeds, so the "unreadable store" fail-closed path cannot mask this one.
-            json.dump({"sessions": [
-                {"sessionId": "aaaaaaaa-0000-0000-0000-00000000beef", "agentLifecycle": "idle"},
-                {"sessionId": "bbbbbbbb-0000-0000-0000-00000000beef", "agentLifecycle": "idle"},
-            ]}, fh)
-        mod.HOOK = hook
-        mod.STATE = os.path.join(tmp, "prev.json")
-        mod.TASK = os.path.join(tmp, "task-sessions")
-        mod.SESS = os.path.join(tmp, "sessions")   # keep the transcript glob off the real tree
-        os.makedirs(mod.TASK)
-        os.makedirs(mod.SESS)
-        mod.pi_process_count = lambda: 9          # the population the roster cannot account for
-        mod.reaper_section = lambda: []           # keep the leg off the scheduler panels
-        mod.harness_apply_section = lambda: []
-        sys.stdout = buf
-        rc = mod.main()
-    finally:
-        sys.stdout = old
-        out = buf.getvalue()
-        shutil.rmtree(tmp, ignore_errors=True)
-        for k, v in saved.items():
-            if v is _MISSING:
-                # The pre-fix module never had it; do not leave the leg's stub behind on it.
-                try:
-                    delattr(mod, k)
-                except AttributeError:
-                    pass
-            else:
-                setattr(mod, k, v)
+    # ── main() end-to-end over a read-only store holding none of the roster ──
+    def _drive(pi_stub):
+        """Run `main()` over a READABLE hook store whose sessions are none of `LANES`.
+
+        That is the exact state the original defect rendered as a clean scan, and it keeps the
+        "unreadable store" fail-closed path from masking this one. Returns (exit_code, stdout).
+        Every patched global is restored, and a name the pre-fix module never had is deleted
+        rather than left behind, so later legs see the module they expect.
+        """
+        _MISSING = object()
+        keys = ("HOOK", "STATE", "TASK", "SESS", "pi_process_count",
+                "reaper_section", "harness_apply_section")
+        saved = {k: getattr(mod, k, _MISSING) for k in keys}
+        tmp = tempfile.mkdtemp(prefix="fleet-health-census-")
+        old = sys.stdout
+        buf = io.StringIO()
+        rc = None
+        try:
+            hook = os.path.join(tmp, "hook.json")
+            with open(hook, "w", encoding="utf-8") as fh:
+                json.dump({"sessions": [
+                    {"sessionId": "aaaaaaaa-0000-0000-0000-00000000beef",
+                     "agentLifecycle": "idle"},
+                    {"sessionId": "bbbbbbbb-0000-0000-0000-00000000beef",
+                     "agentLifecycle": "idle"},
+                ]}, fh)
+            mod.HOOK = hook
+            mod.STATE = os.path.join(tmp, "prev.json")
+            mod.TASK = os.path.join(tmp, "task-sessions")
+            mod.SESS = os.path.join(tmp, "sessions")   # keep the transcript glob off the real tree
+            os.makedirs(mod.TASK)
+            os.makedirs(mod.SESS)
+            mod.pi_process_count = pi_stub
+            mod.reaper_section = lambda: []           # keep the leg off the scheduler panels
+            mod.harness_apply_section = lambda: []
+            sys.stdout = buf
+            rc = mod.main()
+        finally:
+            sys.stdout = old
+            out = buf.getvalue()
+            shutil.rmtree(tmp, ignore_errors=True)
+            for k, v in saved.items():
+                if v is _MISSING:
+                    try:
+                        delattr(mod, k)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(mod, k, v)
+        return rc, out
+
+    rc, out = _drive(lambda: 9)          # the population the roster cannot account for
     check("LANE CENSUS MISMATCH" in out,
           "CENSUS: main() prints the mismatch over a readable store holding none of the roster")
     check("no suspects" not in out,
-          "CENSUS: main() never prints a clean scan over 0 attributed lanes")
+          "CENSUS: main() never prints a clean scan over 0 measured lanes")
     # ⛔ THE MARKER, NOT THE EXIT CODE, is the discriminating signal: `main()` also exits 1 for
     # an unrelated scheduled-maintainer alarm (this box has one), so an exit-code-only pairing
     # stays green under the mutation and reports a red control as MISSED.
@@ -594,6 +624,18 @@ def leg_lane_census(mod):
           "CENSUS: main() marks the scan INCOMPLETE so a scheduler sees it")
     check(rc != 0,
           "CENSUS: main() exits non-zero — a census that prints rows and exits 0 is the false PASS")
+
+    # ⛔ THE ABSTENTION ARM (review cycle 1, finding 2): an unreadable process table must be
+    # NAMED. Before this check the state returned no note at all, so `main()` printed
+    # `✅ no suspects` and exited 0 — the pre-fix false PASS, reachable through the new gate's
+    # own input, on any host where `ps` is absent, denied or slow.
+    rc_abs, out_abs = _drive(lambda: None)
+    check("LANE CENSUS UNRECONCILED" in out_abs,
+          "CENSUS: main() NAMES an unreadable process table instead of reporting clean")
+    check("no suspects" not in out_abs,
+          "CENSUS: an unreadable process table is never rendered as a clean scan")
+    check(rc_abs != 0,
+          "CENSUS: an unreconcilable census exits non-zero, so a scheduler can see it")
 
 
 def run_legs(mod):
@@ -633,10 +675,11 @@ def _flatten_exit4(src):
 
 MUTATIONS = [
     ("neuter the lane-census reconciliation (the pre-fix module)",
-     _sub("    if pi_count is None or pi_count <= 0 or attributed > 0:", "    if True:"),
-     ["CENSUS: 9 pi processes vs 0 attributed lanes raises the mismatch",
+     _sub("    if measured > 0:\n", "    if True:\n"),
+     ["CENSUS: pi running vs a roster with no records raises the mismatch",
+      "CENSUS: an UNREADABLE process table is NAMED, never rendered as agreement",
       "CENSUS: main() prints the mismatch over a readable store holding none of the roster",
-      "CENSUS: main() marks the scan INCOMPLETE so a scheduler sees it"]),
+      "CENSUS: main() NAMES an unreadable process table instead of reporting clean"]),
     ("drop the orphan row from REAPERS (the pre-#1862 module)",
      _sub('    ("com.eldato.pi-reap-orphans",     "orphan"),\n', ""),
      ["REGISTERED: %s is in REAPERS" % LABEL]),
