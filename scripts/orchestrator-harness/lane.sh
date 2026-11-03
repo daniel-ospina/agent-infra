@@ -73,7 +73,13 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 #
 # THE CONTRACT — one physical line, last in `$O/logs/lane-<N>.log`:
 #     outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
-# count the logs that lack one:   grep -L '^outcome=' "$O"/logs/lane-*.log
+# count the logs that lack one:   grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log
+# ⛔ `lane-[0-9]*` IS NOT COSMETIC (review round 2, P2, measured): `lane-*.log` ALSO matches
+# `lane-merge-<PR>.log`, which `lane-merge.sh` writes and which is NOT a lane (`merge-rate.sh` excludes it
+# by name for exactly that reason — counting it added a fake lane and a fake MERGED). A scanner built on
+# the loose glob reports a permanent false positive on a healthy box, and the instrument that alarms on
+# the healthy path is the one the next reader learns to ignore. Lane logs are `<issue>.log`, and `$N` is
+# validated numeric above.
 # ⛔ `reason` is a TOKEN, never prose: this line is read by instruments, and a free-text field is the
 # field that re-stales. The long-form reason stays in the log's own `[lane N] NOT started: …` lines.
 # ⛔ IT IS INSTALLED THIS EARLY ON PURPOSE. Every exit AFTER the log path exists gets the line,
