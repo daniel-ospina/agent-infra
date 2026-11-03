@@ -1441,8 +1441,12 @@ sys.stdout = EnospcStdout()
 try:
     m.log("hello")      # the print() at the end of log() raises ENOSPC — it must be swallowed
 finally:
-    # Restore it, or CPython's own shutdown flush of the fake stdout adds an ignored exception and
+    # Restore it, or the CPython shutdown flush of the fake stdout adds an ignored exception and
     # a "Traceback" line that this case would then mistake for log() having raised.
+    # ⛔ NO APOSTROPHE IN THIS BODY, and none in any here-doc body nested in a command substitution:
+    # bash 3.2 (macOS) scans such a body as CODE, so an unbalanced quote opens single-quote mode
+    # and desynchronises the parse for the REST of the file — reported far below the defect
+    # (#2930, #2248). scripts/check-bash32-parse.sh is the gate that measures this.
     sys.stdout = _real_stdout
 sys.stderr.write("SURVIVED\n")
 PY
@@ -2295,8 +2299,10 @@ RACER = 4000000 + (os.getpid() % 1000)   # a pid that is NOT us; liveness of it 
 real_stat, real_getpid = os.stat, os.getpid
 state = {"n": 0}
 def racy_stat(path, *a, **k):
-    # the steal lands exactly in the verify window: the file now holds ANOTHER caller's pid, and
-    # the stat that would have told us that fails.
+    # the steal lands exactly in the verify window: the file now holds a FOREIGN pid, and the
+    # stat that would have told us that fails. (No apostrophe here — this body is nested in a
+    # command substitution, and bash 3.2 scans it as CODE: an unbalanced quote desynchronises the
+    # whole file. See scripts/check-bash32-parse.sh, #2930/#2248.)
     if os.path.abspath(str(path)) == os.path.abspath(p) and state["n"] == 0:
         state["n"] += 1
         with open(p, "w") as fh:
