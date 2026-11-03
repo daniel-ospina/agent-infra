@@ -1103,16 +1103,37 @@ def acquire_lock(label):
             except OSError:
                 cur = None
             if cur is None:
+                # ⛔ WHEN NOTHING CAN BE DETERMINED, KEEP — do not "fail closed" with `continue`.
+                # `continue` is the WRONG answer here and it was measured as one: it abandons a lock
+                # this process created, leaving it on disk holding OUR OWN LIVE PID, so every later
+                # `acquire_lock` reads a live holder and refuses forever — `SKIP <job>: already
+                # running (lock held)` for a lock we made. Worse, the failure need not raise: a read
+                # that returns b"" wedges the job with NO exception anywhere. The comment this
+                # replaces claimed a `continue` was a "skipped pass" — it is not, because the lock
+                # persists and nothing steals a live-pid lock.
+                # So the three reachable states are: keep (proved ours), lose (proved someone
+                # else's), and UNDETERMINABLE — and for the last one KEEP is the only answer that
+                # cannot wedge. The residual is the mirror image and is declared rather than
+                # papered over: keep is wrong only if a racer stole the lock AND both the stat and
+                # the read failed, i.e. three coincident faults; `continue` is wrong on ONE. That
+                # asymmetry is the whole argument, and the real fix for the remaining class is the
+                # `flock` redesign in #3353, which removes stealing altogether.
                 mine = None
                 try:
                     with open(path, "rb") as fh:
                         mine = fh.read(64).decode("ascii", "replace").strip()
                 except FileNotFoundError:
-                    continue
+                    continue          # the path is GONE — provably not ours; the loop re-creates
                 except OSError:
-                    continue
-                if mine != str(os.getpid()):
-                    continue
+                    mine = None       # undeterminable — fall through to KEEP (see above)
+                # ⛔ AN EMPTY READ IS NOT "PROVABLY FOREIGN" — it is another undeterminable. `read`
+                # returning b"" raises nothing at all, and the previous `mine is not None and …`
+                # test saw `""` as a pid that is not ours, so it `continue`d and ABANDONED a lock
+                # this process had created and written its own live pid into. Measured: first
+                # acquire False, lock left on disk holding OUR pid, and every later pass refused —
+                # the wedge, with no exception anywhere. Only a NON-EMPTY, different pid is proof.
+                if mine and mine != str(os.getpid()):
+                    continue          # provably someone else's live lock
             elif cur.st_dev != own.st_dev or cur.st_ino != own.st_ino:
                 continue
             return path

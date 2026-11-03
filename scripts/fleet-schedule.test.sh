@@ -2073,9 +2073,21 @@ PY18O
     fi
     mout="$(TEMPLATES_DIR="$D18O/tpl" python3 "$MUT18O" --check 2>&1)"; mrc=$?
     [ "$arm" = "retired" ] && chmod 644 "$D18O/tpl/RETIRED" || chmod 755 "$D18O/tpl"
-    grep -q 'cannot read\|cannot list' <<<"$mout" \
-      && bad "18o($arm) MUTATION still produced the named refusal — the case grades nothing: $mout" \
-      || ok "18o($arm) MUTATION (guard removed) no longer names the failure (rc=$mrc)"
+    # ⛔ THE MUTANT MUST BE SHOWN TO HAVE RUN. An earlier revision made this mutant a SyntaxError
+    # (replacing `try:` orphaned its `except` clauses); it printed NOTHING, and "does not name the
+    # failure" is trivially true of no output — so the arm reported that the case discriminates
+    # while grading a file that never parsed. Two positive requirements now: the mutant must emit a
+    # named refusal AT ALL (a PermissionError naming the path, i.e. main()'s last net caught the
+    # raw OSError the guard used to convert), and it must NOT be the guard's own phrasing.
+    if [ -z "$mout" ]; then
+      bad "18o($arm) MUTATION produced NO OUTPUT — it did not run (a SyntaxError mutant grades nothing): rc=$mrc"
+    elif ! grep -qi 'permission denied\|PermissionError' <<<"$mout"; then
+      bad "18o($arm) MUTATION did not run the pre-fix path either (no PermissionError in its output): $mout"
+    elif grep -q 'cannot read\|cannot list' <<<"$mout"; then
+      bad "18o($arm) MUTATION still produced the guard's named refusal — the case grades nothing: $mout"
+    else
+      ok "18o($arm) MUTATION ran and lost the named refusal (raw OSError surfaced instead, rc=$mrc)"
+    fi
   done
 fi
 
@@ -2361,6 +2373,149 @@ PYMUR
 grep -q 'MUTATION RED' <<<"$mout18r" \
   && ok "18r MUTATION (blind return path) produces two holders — the case discriminates" \
   || bad "18r MUTATION stayed green, so the case grades nothing: $mout18r"
+
+
+# 18s — EVERY WAY THE CONTENT READ CAN FAIL MUST STILL NOT WEDGE. 18p patches only `os.stat`, so the
+# content read always succeeds there and the arm graded only the sub-case that works. Measured on the
+# revision before this case: a stat failure plus a read that RAISES (EACCES/EIO) or returns b""
+# (no exception at all) abandoned a lock this process had created, leaving it on disk holding OUR
+# OWN LIVE PID — after which every later `acquire_lock` read a live holder and refused, i.e. the job
+# logged `SKIP <job>: already running (lock held)` for a lock we made, for the life of the daemon.
+# The invariant is therefore stated over the FAULT SHAPES, not one of them: a lock this process
+# created must still be usable by this process afterwards, whatever the read did.
+out18s="$(python3 - "$SCHED" "$T/state18s" <<'PY18S' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18s", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = sys.argv[2]
+real_stat, real_open, real_getpid = os.stat, open, os.getpid
+
+class EmptyRead:
+    def __init__(self, fh): self._fh = fh
+    def read(self, n=-1): return b""
+    def fileno(self): return self._fh.fileno()   # the probe fstats the fd it opened
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def close(self): pass
+
+def run(name, read_behaviour):
+    d = os.path.join(base, name); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+    m.STATE = d
+    path = os.path.join(d, "locks", "w.lock")
+    state = {"stat": 0}
+    def bad_stat(p, *a, **k):
+        if os.path.abspath(str(p)) == os.path.abspath(path) and state["stat"] == 0:
+            state["stat"] += 1
+            raise OSError(5, "Input/output error")
+        return real_stat(p, *a, **k)
+    reads = {"n": 0}
+    def bad_open(p, *a, **k):
+        # ⛔ TRANSIENT — the ownership read only. Faulting EVERY open also faulted the PROBE, which
+        # then read b""/EIO, parsed pid=None and STOLE the file: the harness healed exactly what
+        # wedges in production, so this loop passed on the PRE-FIX code as well (a false pass,
+        # measured). One faulted read is both the realistic shape and the discriminating one.
+        if os.path.abspath(str(p)) == os.path.abspath(path) and reads["n"] == 0:
+            reads["n"] += 1
+            if read_behaviour == "eacces":
+                raise PermissionError(13, "Permission denied")
+            if read_behaviour == "eio":
+                raise OSError(5, "Input/output error")
+            if read_behaviour == "empty":
+                fh = real_open(p, *a, **k)
+                return EmptyRead(fh)
+        return real_open(p, *a, **k)
+    import builtins
+    os.stat = bad_stat
+    if read_behaviour != "ok":
+        builtins.open = bad_open
+    try:
+        first = m.acquire_lock("w")
+    finally:
+        os.stat = real_stat
+        builtins.open = real_open
+    # The invariant is a JOB's lifecycle, not "acquire twice in one process" (a second acquire in
+    # the SAME process is correctly refused — the holder is alive, so the lock is not stale). The
+    # wedge is different: a FAILED acquire that leaves the lock on disk holding our own live pid, so
+    # EVERY later pass is refused. So: the acquire must succeed, we release as run_job's `finally`
+    # does, and the next pass must be able to take it again.
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    second = m.acquire_lock("w")
+    held_content = None
+    if os.path.exists(path):
+        try:
+            held_content = real_open(path).read().strip()
+        except OSError:
+            held_content = "unreadable"
+    # ⛔ NOT "the content looks like our pid" — THIS process wrote that pid, so that clause can
+    # never fail and would make the case vacuous (measured: it stayed green on a wedging mutant).
+    # The invariant is the one that matters to a job: this process must still be able to acquire it.
+    okish = bool(first) and bool(second)   # acquired, released, re-acquired
+    print("%-8s first=%-5s second=%-5s content=%r %s"
+          % (read_behaviour, bool(first), bool(second), held_content,
+             "USABLE" if okish else "WEDGED"))
+
+run("ok", "ok")
+run("eacces", "eacces")
+run("eio", "eio")
+run("empty", "empty")
+PY18S
+)"
+for shape in ok eacces eio empty; do
+  grep -qE "^$shape .*USABLE" <<<"$out18s" \
+    && ok "18s(stat-fail + read-$shape) leaves the lock USABLE (no wedge)" \
+    || bad "18s(stat-fail + read-$shape) WEDGED the job: $(grep -E "^$shape " <<<"$out18s")"
+done
+# MUTATION: the pre-fix `except OSError: continue` (fail-"closed" to not-ours) must redden the
+# read-failure arms — that is exactly the wedge this case exists to prevent.
+MUT18S="$T/mut-18s.py"
+python3 - "$SCHED" "$MUT18S" <<'PYMUTS'
+import sys
+src = open(sys.argv[1]).read()
+old = '                except OSError:\n                    mine = None       # undeterminable'
+new = '                except OSError:\n                    continue          # the PRE-FIX reading, restored'
+assert old in src, "the 18s mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTS
+mout18s="$(python3 - "$MUT18S" "$T/state18s-mut" <<'PYMUTSR' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18smut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = sys.argv[2]
+real_stat, real_open, real_getpid = os.stat, open, os.getpid
+d = os.path.join(base, "eio"); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+path = os.path.join(d, "locks", "w.lock")
+state = {"stat": 0}
+def bad_stat(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path) and state["stat"] == 0:
+        state["stat"] += 1
+        raise OSError(5, "Input/output error")
+    return real_stat(p, *a, **k)
+def bad_open(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path):
+        raise OSError(5, "Input/output error")
+    return real_open(p, *a, **k)
+import builtins
+os.stat = bad_stat; builtins.open = bad_open
+try:
+    first = m.acquire_lock("w")
+finally:
+    os.stat = real_stat; builtins.open = real_open
+second = m.acquire_lock("w")
+content = None
+if os.path.exists(path):
+    try: content = real_open(path).read().strip()
+    except OSError: content = "unreadable"
+wedged = not (bool(first) and bool(second))
+print("MUTATION %s first=%s second=%s content=%r" % ("RED wedged" if wedged else "still-usable", bool(first), bool(second), content))
+PYMUTSR
+)"
+grep -q 'MUTATION RED' <<<"$mout18s" \
+  && ok "18s MUTATION (fail-'closed' to not-ours) WEDGES the job — the case discriminates" \
+  || bad "18s MUTATION stayed usable, so the case grades nothing: $mout18s"
 
 
 echo
