@@ -756,20 +756,26 @@ store_key_list() { # <store-sorted> <out>  — just the keys
 # alone would pass over it), so field 2 must be `blob` and field 1 must be 40 hex or the key cannot
 # possibly match a local file and takes the full path.
 store_blob_map() { # <store-sorted> <out> → 0 ok, 1 unusable (caller falls back to the full path)
-  local list="$1" out="$2" q="$TMPD/q" r="$TMPD/r" key oid nq nr blob
+  local list="$1" out="$2" q="$TMPD/q" r="$TMPD/r" lr="$TMPD/lr" nq nr
   [ -f "$out" ] && return 0
-  : > "$q"
-  while IFS=$'\t' read -r key oid; do
-    [ -n "$oid" ] || continue
-    printf '%s:record.json\n' "$oid" >> "$q"
-  done < "$list"
+  : > "$q"; : > "$lr"
+  # ⛔ THE BATCH IS PASTED BACK AGAINST THE ROWS IT WAS BUILT FROM, so both must be the SAME rows. A
+  # row with no oid has no query, and skipping it in the query loop alone (`[ -n "$oid" ] ||
+  # continue`) left `$list` one line longer than the replies — `paste` then paired every key from
+  # that row onward with the PREVIOUS record's objectname, producing `key<TAB>wrongblob`. A wrong
+  # blob that happens to equal a local file's OID SKIPS a pair that is not converged (a pull/push
+  # silently dropped), which is precisely what the guard four lines below exists to prevent and
+  # could not see. Dropping the row from both sides here makes the alignment structural.
+  command awk -F'\t' -v lr="$lr" -v q="$q" '
+    NF >= 2 && $2 != "" { print $1 "\t" $2 > lr; print $2 ":record.json" > q }
+  ' "$list"
   nq="$(command wc -l < "$q" | tr -d ' ')"
   git_b cat-file --batch-check='%(objectname) %(objecttype)' < "$q" > "$r" 2>/dev/null || return 1
   nr="$(command wc -l < "$r" | tr -d ' ')"
   # WITHIN this batch the reply is one line per query: a short or long reply pairs keys with OTHER
   # records' oids, and a wrong pairing is a wrong `same`. Discard the whole map, not one line.
   [ "$nq" = "$nr" ] || return 1
-  paste "$list" "$r" | awk -F'\t' 'BEGIN{OFS="\t"} {
+  paste "$lr" "$r" | awk -F'\t' 'BEGIN{OFS="\t"} {
       n = split($3, a, " ")
       blob = (n >= 2 && a[2] == "blob" && length(a[1]) == 40) ? a[1] : ""
       print $1, blob
@@ -796,12 +802,22 @@ hash_pairs() { # <key<TAB>path file> <out>
 # The pairs whose bytes are identical on both sides, KEY-INDEXED (never by line position — the two
 # sides legitimately have different lengths: 4,027 store refs vs 4,023 local files on the hub box).
 # A key present on one side only is simply not paired, so it takes the full path.
-identical_pairs() { # <store-blob-map> <hashed-pairs> <out> → `key<TAB>path`
-  local map="$1" hashed="$2" out="$3" sm="$TMPD/sorted-map" sp="$TMPD/sorted-pairs"
+identical_pairs() { # <store-blob-map> <hashed-pairs> <out> → 0 ok, 1 could not be computed
+  local map="$1" hashed="$2" out="$3" sm="$TMPD/sorted-map" sp="$TMPD/sorted-pairs" jn="$TMPD/joined"
+  : > "$out"
   LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$map" > "$sm"
   LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$hashed" > "$sp"
-  join -t "$(printf '\t')" -1 1 -2 1 "$sm" "$sp" \
-    | awk -F'\t' '$2 != "" && $2 == $4 { print $1 "\t" $3 }' > "$out"
+  # ⛔ `join` COMPARES UNDER THE AMBIENT LOCALE, so it must be pinned to the collation its inputs
+  # were sorted with. Both `sort`s above are `LC_ALL=C`; an unqualified `join` merges under the
+  # ambient locale instead, and on a mixed-case key set (`Zeta-…` sorts before `alpha-…` in C and
+  # after it under en_US) its order check disagrees with the inputs: measured on coreutils 9.4,
+  # `join --check-order` reports "input is not in sorted order", exits 1 and emits only a PREFIX of
+  # the pairs. One such key anywhere in a 4,027-key store is then enough to make the whole pre-pass
+  # degrade — every record back to ~21 spawns apiece, i.e. the 26-minute land #3180 removes — and
+  # the old `return 0` made that a SILENT no-op. So: pin the collation, and report the failure so
+  # the caller can say it fell back instead of pretending it converged.
+  LC_ALL=C join -t "$(printf '\t')" -1 1 -2 1 "$sm" "$sp" > "$jn" || return 1
+  awk -F'\t' '$2 != "" && $2 == $4 { print $1 "\t" $3 }' "$jn" > "$out"
   return 0
 }
 
@@ -855,7 +871,7 @@ converged_pull() { # <store-sorted> <out key list>
     printf '%s\t%s\n' "$k" "$path" >> "$cand"
   done < "$list"
   hash_pairs "$cand" "$hashed" || return 1
-  identical_pairs "$map" "$hashed" "$ident"
+  identical_pairs "$map" "$hashed" "$ident" || return 1   # could not be computed ≠ nothing identical
   # `pull_one`'s own value tests, with the real `field` (spawn-free since #3180).
   while IFS=$'\t' read -r k path; do
     [ -n "$k" ] || continue
@@ -946,7 +962,10 @@ do_push() {
   fi
   map="$TMPD/store.blobs"
   if [ -s "$map" ] && hash_pairs "$keyedcf" "$TMPD/push.hashed" 2>/dev/null; then
-    identical_pairs "$map" "$TMPD/push.hashed" "$TMPD/push.ident"
+    if ! identical_pairs "$map" "$TMPD/push.hashed" "$TMPD/push.ident"; then
+      progress "registry-sync: push — the converged pre-pass could not run; examining all $total records"
+      : > "$TMPD/push.ident"
+    fi
     # `push_one` refuses a record with no readable `reviewed_at` BEFORE any comparison, so a
     # byte-identical record may NOT be skipped when that field is empty.
     : > "$TMPD/push.stamp"
