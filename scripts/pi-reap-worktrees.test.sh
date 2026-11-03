@@ -4359,6 +4359,62 @@ assert_contains "$(row_for "$OUT" "$CTLWT")" "reason=reclaimable" \
 assert_absent "$(row_for "$OUT" "$CTLWT")" "pin-tree" \
     "G15f …and nothing in its row claims a pin tree"
 
+# G15g: the RECORD is spelled through a SYMLINK (the shipped Darwin case: /tmp is
+# /private/tmp) while the canon path is the real one. `$canon` comes from `pwd -P`,
+# so an unnormalised record never matched — and the shape backstop cannot mask it
+# here, because the fixture path carries no `harness` component.
+ENV=pin_tree_link
+REPO="$(mk_repo "$ENV")"
+REALPINS="$T/$ENV/pins"
+mkdir -p "$REALPINS"
+LINKPINS="$T/$ENV/link-to-pins"
+ln -s "$REALPINS" "$LINKPINS"
+LINKWT="$REALPINS/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$LINKWT" HEAD
+# The record names `<tree>/scripts/orchestrator-harness`, so that directory must exist for the
+# normalisation to be exercised at all — on a real pin tree it always does.
+mkdir -p "$LINKWT/scripts/orchestrator-harness"
+mkdir -p "$T/$ENV/home"
+printf '%s\n' "$LINKPINS/5b1b09aad2c1/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$LINKWT")" "reason=pin-tree" \
+    "G15g a record spelled through a SYMLINK still matches the canonicalised worktree"
+
+# G15h: the pin ROOT is ITSELF a registered worktree (the legacy FLAT pin —
+# `cloud-cell-supervisor.sh` `cmd_prune` has a branch for it, and on the affected
+# cell `/tmp/cell-home/harness` was listed as one). Matching only DESCENDANTS left
+# exactly the root unguarded, and an empty clean root at main's tip is rule-3 food.
+ENV=pin_tree_root
+REPO="$(mk_repo "$ENV")"
+ROOTWT="$T/$ENV/harness"
+mkdir -p "$T/$ENV"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$ROOTWT" HEAD
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$ROOTWT")" "reason=pin-tree-shape" \
+    "G15h the pin ROOT itself (no <sha12> child, no record) is preserved by shape"
+
+# G15i: `HOME` UNSET must not abort the classifier. `${CELL_HOME:-$HOME}` does not
+# guard `$HOME`, and this file runs `set -u`: the old code killed the classifier's
+# subshell, which returned an EMPTY row, which the caller counted as a PRESERVE —
+# a pass that removes nothing and reports `verdict=idle`, the HEALTHY verdict.
+ENV=pin_tree_nohome
+REPO="$(mk_repo "$ENV")"
+NHWT="$T/$ENV/harness/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$NHWT" HEAD
+mkdir -p "$T/$ENV/home"
+printf '%s\n' "$NHWT/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
+OUT="$(env -u HOME CELL_HOME="$T/$ENV/home" \
+    REAP_WT_DRY_RUN=1 REAP_WT_STATE_DIR="$T/$ENV/state" REAP_WT_LOG="$T/$ENV/reap.log" \
+    REAP_WT_NOW_EPOCH="$NOW" REAP_WT_MAIN_PROOF=local REAP_WT_TREE_TS=$((NOW - 86400 * 30)) \
+    REAP_WT_MIN_AGE_MINUTES=0 \
+    bash "${REAPER_OVERRIDE:-$REAPER}" --dry-run --repo "$REPO" 2>&1)"
+assert_absent "$OUT" "unbound variable" \
+    "G15i an unset HOME does not abort the classifier (set -u)"
+assert_contains "$(row_for "$OUT" "$NHWT")" "reason=pin-tree" \
+    "G15i …and the pin tree is still classified, not left as a blank row"
+
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

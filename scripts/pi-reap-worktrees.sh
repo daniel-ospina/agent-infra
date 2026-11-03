@@ -364,7 +364,9 @@
 #   unparseable-path (poisoned record) > bare > main-checkout > self-checkout >
 #   worktree-locked (an `initializing` lock older than REAP_WT_STALE_INIT_SECONDS is DETECTED here
 #   and the interrupted-add class stays pending) > unreadable-path | prunable > live-process >
-#   live-cwd > live-claim > claim-unverified > interrupted-add[-unreachable] >
+#   live-cwd > pin-tree | pin-tree-shape (#10114 — a HARNESS PIN TREE is a holder /proc cannot
+#   show, so it outranks every removal rule) > live-claim > claim-unverified >
+#   interrupted-add[-unreachable] >
 #   dirty | ignored-artifact | status-timeout | status-error > abandoned-wip >
 #   detached-unreachable > open-pr > too-recent | ghost-zero-ahead > too-young >
 #   stranded-stash-unverifiable | stranded-stash > unpushed-unverifiable > reclaimable
@@ -522,6 +524,16 @@
 #   live-claim             an issue named by the branch is claimed live on
 #                          origin (refs/claims/issue-<N>) — the issue is in
 #                          flight; see the LANE RESIDUE section above
+#   pin-tree               the checkout is a HARNESS PIN TREE — a tree a
+#                          `.harness-path` record names as the code this box
+#                          EXECUTES. It is a git worktree whose HEAD is main's
+#                          tip by construction, so rule 3 convicts it on every
+#                          pass; #10114 measured a reaper deleting it and the
+#                          box then exiting 23 cannot-verify for 2h17m
+#   pin-tree-shape         the same, matched on SHAPE (`<root>/harness[/<sha12>]`,
+#                          `harness-next`) because a pin record in another HOME
+#                          is unreadable from here — a silent miss deletes the
+#                          tree, so this probe can only PRESERVE
 #   claim-unverified       the claim registry could not be read; the lane-residue
 #                          classes abstain (a claim that cannot be read is LIVE)
 #   backup-unverified      the dirty-tree backup did not verify — NOTHING was
@@ -2628,31 +2640,53 @@ abstain_gate() {
 #       positive here costs DISK, never work: this probe can only PRESERVE.
 PIN_VERDICT=""; PIN_PROOF=""
 pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harness pin tree
-    local canon="$1" rec rec_t
+    local canon="$1" rec rec_t rec_c _t
     [ -n "$canon" ] || return 1
     PIN_VERDICT=""; PIN_PROOF=""
-    for rec in "${HARNESS_PIN_FILE:-}" "${CELL_HOME:-$HOME}/.harness-path" "$HOME/.harness-path"; do
+    # ⛔ `$HOME` IS GUARDED, AND THAT IS LOAD-BEARING (#10114 review P1). This file runs `set -uog
+    # pipefail`, and `${CELL_HOME:-$HOME}` does NOT guard `$HOME` — with HOME unset the whole
+    # expansion aborts, the classifier's subshell returns an EMPTY row, and the caller counts a
+    # blank row as a PRESERVE. The measured effect on the shipped parent: `remove=0 preserved=48`,
+    # exit 0, `verdict=idle` — a pass that removes nothing and reports the HEALTHY verdict. The
+    # parent commit carries zero bare `$HOME` in this file; every sibling uses `${HOME:-…}`.
+    local home="${HOME:-}"
+    # `${home:+"$home/.harness-path"}`: SET-but-EMPTY must not probe `/.harness-path`.
+    for rec in "${HARNESS_PIN_FILE:-}" "${CELL_HOME:-$home}/.harness-path" ${home:+"$home/.harness-path"}; do
         [ -n "$rec" ] || continue
         [ -r "$rec" ] || continue
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"
         [ -n "$rec_t" ] || continue
-        case "$rec_t" in
-            "$canon"|"$canon"/*)
-                PIN_VERDICT="pin-tree"
-                PIN_PROOF="pin record $rec names $rec_t — this box EXECUTES it"
-                return 0 ;;
-        esac
-        case "$canon" in
-            "$rec_t"|"$rec_t"/*)
-                PIN_VERDICT="pin-tree"
-                PIN_PROOF="pin record $rec names $rec_t — this box EXECUTES it"
-                return 0 ;;
-        esac
+        # ⛔ THE RECORD IS NORMALISED BEFORE IT IS COMPARED (#10114 review P1). `$canon` comes from
+        # `pwd -P`, but a record is taken VERBATIM — so a record spelled through a symlink never
+        # matched, and only the shape backstop masked it. That is the shipped Darwin spelling
+        # (`/tmp` is `/private/tmp`), and `HARNESS_PIN_DIR` is operator-settable, so a custom pin
+        # root had NO coverage at all: a silent miss, and a silent miss here deletes the tree.
+        rec_c="$(cd "$(dirname "$rec_t")" 2>/dev/null && pwd -P)" || rec_c=""
+        [ -n "$rec_c" ] && rec_c="$rec_c/$(basename "$rec_t")"
+        for _t in "$rec_t" "$rec_c"; do
+            [ -n "$_t" ] || continue
+            case "$_t" in
+                "$canon"|"$canon"/*)
+                    PIN_VERDICT="pin-tree"
+                    PIN_PROOF="pin record $rec names $_t — this box EXECUTES it"
+                    return 0 ;;
+            esac
+            case "$canon" in
+                "$_t"|"$_t"/*)
+                    PIN_VERDICT="pin-tree"
+                    PIN_PROOF="pin record $rec names $_t — this box EXECUTES it"
+                    return 0 ;;
+            esac
+        done
     done
+    # ⛔ THE ROOT FORMS ARE INCLUDED (#10114 review P1). `<root>/harness` is ITSELF a registered
+    # worktree in the legacy FLAT pin (`cloud-cell-supervisor.sh` `cmd_prune` has a branch for it),
+    # and on the affected cell it was listed as one — so matching only DESCENDANTS left exactly the
+    # root unguarded, and an empty clean root at main's tip is removed by rule 3.
     case "$canon" in
-        */harness/*|*/harness-next/*)
+        */harness|*/harness/*|*/harness-next|*/harness-next/*)
             PIN_VERDICT="pin-tree-shape"
-            PIN_PROOF="a checkout under $(dirname "$canon") — the harness pin-tree shape; a pin tree is the code this box RUNS and nothing has it as a cwd between passes"
+            PIN_PROOF="a checkout at or under $(dirname "$canon") — the harness pin-tree shape; a pin tree is the code this box RUNS and nothing has it as a cwd between passes"
             return 0 ;;
     esac
     return 1
@@ -3958,7 +3992,7 @@ run() {
     log_line "rules: 1 live-holder KEEP · 2 dirty KEEP · 3 ancestor-of-main REMOVE · 4 PR-MERGED REMOVE ·"
     log_line "       5 PR-CLOSED KEEP(named) · 6 no-PR KEEP(named) · 7 younger-than-${REAP_WT_MIN_AGE_MINUTES}m KEEP ·"
     log_line "       L lane residue (ghost-zero-ahead / abandoned-wip / interrupted-add) ·"
-    log_line "       P pre-existing gates (main/self/locked/open-PR/revocable-ref). Every row prints rule= and proof=."
+    log_line "       P pre-existing gates (main/self/locked/open-PR/revocable-ref/pin-tree). Every row prints rule= and proof=."
     log_line ""
     log_line "note: \`git worktree remove\` deletes the CHECKOUT. A LANE-owned ref (feat/<N>-tm) that is 0 commits"
     log_line "      ahead of main is ALSO deleted, by atomic compare-and-delete, because that ref is the residue the"
