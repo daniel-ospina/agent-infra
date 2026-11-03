@@ -353,11 +353,14 @@ already held, one opened a duplicate PR — both brief defects, not lane defects
 3. **WRITE after you finish** — the measurement, the refutation, the root cause, the dead end. **Read the write skill first: `skills/how-to-use-tortoise/SKILL.md`.** One claim per point; a finding needs a **number or a source** — `tortoise-graph.sh evidence` refuses one with no digit.
 
 ```bash
-# ⛔ THE PATH THAT ALWAYS EXISTS IS THE FARMED ONE. `pi-bootstrap/setup.sh`'s `fleet_srcs` declares
-# these two files, so every box that has run the farm carries them at `$HOME/.pi/agent/scripts/` —
-# and a lane in a fresh WORKTREE has no `scripts/` pointer at all (that symlink is materialised per
-# checkout: `uv run python tools/link_agent_infra_scripts.py`), where the repo-relative form below
-# fails with `scripts/tortoise-graph.sh: No such file or directory`. Measured 2026-11-03.
+# ⛔ THE FARMED PATH IS THE ONE THAT ALWAYS EXISTS. `pi-bootstrap/setup.sh`'s `fleet_srcs` declares
+# these two files, so any box that has run the farm (or a cell that ran `cell-install.sh`) carries them
+# at `$HOME/.pi/agent/scripts/`, with no checkout required.
+# The repo-relative form below only resolves where a `scripts/` tree carries them: in THIS repo
+# `scripts/` is tracked, but in a CONSUMER repo it is a machine-local pointer (⛔ NOT a tracked symlink,
+# #9475) that a fresh worktree does not have until it is materialised there (`uv run python
+# tools/link_agent_infra_scripts.py`). Measured 2026-11-03 in a tortoise worktree, which had no
+# `scripts/` at all and returned `No such file or directory` for the repo-relative form.
 bash ~/.pi/agent/scripts/tortoise-graph.sh health          # is the graph up
 bash ~/.pi/agent/scripts/tortoise-graph.sh search 'attestation staleness'
 bash ~/.pi/agent/scripts/tortoise-graph.sh get <point-id>

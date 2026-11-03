@@ -1487,9 +1487,18 @@ check_graph_client() {
     # CAPTURED value for exactly this reason; so does this.
     in_file="$(env -u TORTOISE_MCP_API_KEY -u TORTOISE_API_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; if [ -n "${TORTOISE_MCP_API_KEY:-}" ]; then printf mcp; elif [ -n "${TORTOISE_API_KEY:-}" ]; then printf rest; fi' _ "$ENV_FILE" 2>/dev/null)"
     case "$in_file" in mcp|rest) ;; *) in_file="unset" ;; esac
+  elif [ -e "$ENV_FILE" ]; then
+    # ⛔ EXISTS BUT UNREADABLE IS NOT ABSENT, and saying "neither key is set" over it is a claim this
+    # check cannot make: the file may carry the line and the operator would then be sent to ADD a
+    # line that is already there, while the real fault (mode/ownership — a real cell state, and one
+    # that also means the LANES cannot read it either) is never named. `in_file` stays a distinct
+    # state so the reading reports what it actually has: nothing.
+    in_file="unreadable"
   fi
   if [ "$in_file" = "mcp" ]; then
     ok "graph credential: TORTOISE_MCP_API_KEY is set in $ENV_FILE (the file every lane re-sources; value not printed)"
+  elif [ "$in_file" = "unreadable" ]; then
+    warn "graph credential UNKNOWN: $ENV_FILE exists but is NOT READABLE by this process, so whether it carries TORTOISE_MCP_API_KEY was not determined (a lane re-sourcing the same file cannot read it either). FIX: correct its mode/ownership for the account the lanes run as, then re-run — this line is not evidence that the key is absent"
   elif [ "$in_file" = "rest" ]; then
     warn "graph credential UNCERTAIN: $ENV_FILE sets only TORTOISE_API_KEY. That is the REST key (tt_…, /v1/points — scripts/tortoise-memory.mjs), and the graph client speaks JSON-RPC to /mcp/, so the client will take that fallback and the endpoint may REJECT it. FIX: add TORTOISE_MCP_API_KEY to $ENV_FILE (hand-provisioned, from the Tortoise dashboard) and re-run; a lane reports GRAPH-UNREACHABLE rather than silently skipping the read or the write"
   elif [ -n "${TORTOISE_MCP_API_KEY:-}" ]; then

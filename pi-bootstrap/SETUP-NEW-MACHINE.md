@@ -102,12 +102,17 @@ MATERIAL, and nothing re-creates this key (unlike the provider keys, which pi ke
 So when you follow item 4: move the `TORTOISE_MCP_API_KEY` line into whatever replaces the file (the
 password manager) **and keep a `pi-keys.env` in the home folder containing that one line** — it is the
 only file the setup sources into your profile, so deleting the file deletes the mandate's credential
-until someone re-provisions it by hand. It is the one line that must survive. — but note that a profile only covers INTERACTIVE sessions: a Mac **lane** receives the file
-through `scripts/orchestrator-harness/worker-terminal.sh`, which emits it **only when `pi-keys.env`
-also assigns the model-provider key** that launch line resolves. So on a Mac whose provider credential
-comes from `/login` instead (Step 3 item 3), a graph key living in `pi-keys.env` reaches no lane, and
-every lane reports `GRAPH-UNREACHABLE(NO-KEY)` — the dependency is real and is stated here rather than
-rediscovered as a mystery. Losing it silently is the one outcome worse than a loud NO-KEY.
+until someone re-provisions it by hand. It is the one line that must survive.
+
+**And put it in `~/keys.env` too, because a LANE does not read your profile.**
+`scripts/orchestrator-harness/worker-terminal.sh` sources `~/keys.env` UNCONDITIONALLY when it exists,
+but sources `~/pi-keys.env` **only** when that file is the source of the MODEL-provider key its launch
+line resolves — so on a Mac whose provider credential comes from `/login` instead (Step 3 item 3), a
+graph key living only in `pi-keys.env` reaches no lane and every lane reports
+`GRAPH-UNREACHABLE(NO-KEY)`. The remedy is one line, and it is the difference between the mandate
+running and not: **keep `TORTOISE_MCP_API_KEY` in `~/keys.env`** (same line, hand-provisioned from the
+Tortoise dashboard) alongside the `pi-keys.env` copy that covers interactive sessions. Losing it
+silently is the one outcome worse than a loud NO-KEY.
 The client itself (`~/.pi/agent/scripts/tortoise-graph.sh`) IS delivered by the setup — it is farmed
 from this repo — so a box with NEITHER name set reports `GRAPH-UNREACHABLE(NO-KEY)` on every call (with
 only the REST name `TORTOISE_API_KEY` present the client takes that fallback and reports the endpoint's
