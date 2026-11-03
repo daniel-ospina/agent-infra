@@ -47,9 +47,19 @@ GATE="$HERE/spawn-gate.sh"
 #     fired cross-file twice (74 and 80).
 # So: ONE scanner over every shipped helper of the deploy unit (`cp …/orchestrator-harness/*.sh $O/`
 # — the files that ship TOGETHER, the only set in which a collision can actually happen), and NOTHING
-# is skipped in silence. The ONE stated exclusion is the `*.test.sh` fixtures inside that glob, which
-# declare codes ON PURPOSE (a stale-helper arm); it is the scanner's first line and it is named here so
-# the population claim is checkable rather than absolute. A declaration in the family that the scanner
+# is skipped in silence. TWO stated limits, both named here so the population claim is checkable
+# rather than absolute:
+#   (1) the `*.test.sh` fixtures inside that glob, which declare codes ON PURPOSE (a stale-helper arm)
+#       — the scanner's first line;
+#   (2) the NAMING CONVENTION: the claim scan is over the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED`
+#       namespace, because a gate constant in this deploy unit is written that way (`AGENT_LAND_BACKLOG`
+#       and `ADOPT_DEFERRED` are the two that would look like exceptions and are not). LIMIT (2) IS
+#       NOT MERELY STATED (review of PR #3237, finding 1, measured): a convention nobody checks is the
+#       same hope as the `^NAME=` anchor this scanner replaced, so the parse also emits a `foreign`
+#       row for ANY declaration-position UPPERCASE `NAME=<70..89>` literal outside the namespace, and
+#       a foreign row is a RED. Measured before that arm existed: `AGENT_MEM_GATE=81` — a real
+#       duplicate of the memory gate's code under a name this scan does not know — produced 0 rows and
+#       a GREEN verdict. The namespace is now the CLAIM path, never a blind spot. A declaration in the family that the scanner
 # cannot read as a 70..89 code is a RED naming the file and the constant, unless it is declared in
 # `_codes_noncode` with a reason (an `unparseable` row is NEVER sanctionable — it names file:line).
 # An absent or unreadable required declarer is a RED. A scan that yields NO claim at all is a RED — the
@@ -167,16 +177,46 @@ function printfval(t,   a, n, fmt, v) {
 # read declares nothing, and turning reads into REDs would be the over-block that makes a scanner
 # ignored. The subscript test is anchored at the `]` for the same reason — `[ "$X[0]" = 83 ]` is a
 # comparison, and its `=` comes after a QUOTE, so it stays silent.
-function residual(pre, tail, s, name, f, ln) {
-  if (tail ~ /^\[[^]]*\][ \t]*:?\+?=/) { print "unparseable", name, s, f, ln; return }
-  if (pre ~ /(^|[ \t;&|({])printf[ \t]+-v[ \t]+$/) {
+function residual(pre, tail, s, name, f, ln,   p, t2, v) {
+  # ⛔ A SUBSCRIPT MAY CONTAIN BRACKETS OF ITS OWN (`X[a[0]]=83`) — `[^]]*` stopped at the INNER `]`,
+  # matched no arm, and the form read GREEN with 0 rows (review of PR #3237, finding 2, measured).
+  # Scan to the ASSIGNMENT instead of to the first bracket. A COMPARISON on an element still stays
+  # silent, because its `=` comes after a QUOTE, which `[ \t]*:?\+?=` cannot bridge — that is the
+  # reason the subscript test is anchored at the `]` in the first place.
+  if (tail ~ /^\[[^=]*\][ \t]*:?\+?=/) { print "unparseable", name, s, f, ln; return }
+  # ⛔ A QUOTED OPERAND IS STILL THE SAME BUILTIN: `printf -v "X" %d 83` and `read -r -d "" X`. The
+  # anchors below required a TRAILING SPACE, so a quoted argument between the builtin and the name
+  # defeated them and the declaration again read GREEN with 0 rows (finding 2). Strip trailing quotes
+  # AND spaces with the same rule `cmdpos` uses, then anchor at end-of-token.
+  p = pre
+  gsub(/[ \t"']+$/, "", p)
+  if (p ~ /(^|[ \t;&|({])printf[ \t]+-v$/) {
     v = printfval(tail)
     if (v != "") row("claim", name, v, f, ln)
     else         print "unparseable", name, s, f, ln
     return
   }
-  if (pre ~ /(^|[ \t;&|({])(read|mapfile|readarray)([ \t]+-[A-Za-z]+)*[ \t]+$/) \
+  # `getopts` writes the OPTION CHARACTER into the name (and the index into OPTIND), so it is the same
+  # class as `read`: a value this scanner cannot know (finding 2).
+  if (p ~ /(^|[ \t;&|({])(read|mapfile|readarray|getopts)([ \t]+(-[A-Za-z]+|"[^"]*"|'[^']*'))*$/) {
     print "unparseable", name, s, f, ln
+    return
+  }
+  # AN ARITHMETIC ASSIGNMENT (`(( X = 83 ))`) DECLARES the code with no `=` in a declaration position: the
+  # parenthesised context makes `cmdpos` false, so the operator chain REFUSED it as if it were
+  # `echo "X=83"` — red, but for the wrong reason, and `(( X == 83 ))` must stay SILENT (a comparison,
+  # not a declaration). Claim it when the value is readable so the duplicate COLLIDES — the property
+  # this whole namespace check exists for — and refuse it otherwise.
+  if (p ~ /\(\([^()]*$/ && tail ~ /^[ \t]*(:|\+)?=([^=]|$)/) {
+    t2 = tail
+    sub(/^[ \t]+/, "", t2)
+    sub(/^(:|\+)?=/, "", t2)      # the OPERATOR is the declaration, not the value
+    sub(/^[ \t]+/, "", t2)
+    v = valof(t2)
+    if (v != "") row("claim", name, v, f, ln)
+    else         print "unparseable", name, s, f, ln
+    return
+  }
 }
 function row(kind, name, v, f, ln) {
   if (iscode(v)) print kind, name, v + 0, f, ln
@@ -188,6 +228,28 @@ function row(kind, name, v, f, ln) {
   s = $0
   sub(/^[ \t]+/, "", s)
   if (s ~ /^#/) next                          # documentation, never a declaration
+  # ⛔ THE NAMING CONVENTION IS ASSERTED, NOT ASSUMED (review of PR #3237, finding 1). The claim scan
+  # below is anchored on the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED` namespace, so a gate code
+  # declared under ANY OTHER NAME is invisible to it — measured: `AGENT_MEM_GATE=81`, a real duplicate
+  # of `AGENT_MEM_REFUSED`'s code, produced 0 rows and a GREEN verdict, while the file still
+  # contributed its other claims (so the required-declarer rule did not notice either). Reporting the
+  # convention as a STATED LIMIT would leave exactly the class this PR exists to close. So every
+  # declaration-position UPPERCASE `NAME=<70..89>` literal OUTSIDE the namespace is a `foreign` row,
+  # and `codes_verdict` REDs on it. The filter is what keeps it precise: the right-hand side must be a
+  # BARE two-digit code (so `MEM_BUDGET_PCT=75` in prose, `rc=75` lowercase, `load=79/` and the like
+  # never appear), and `cmdpos` requires a real assignment position — measured on this tree it yields
+  # EXACTLY the 14 family claims and nothing else, which is the property the arm asserts.
+  _fr = s
+  while (match(_fr, /[A-Z_][A-Z0-9_]*=[7-8][0-9]([^0-9]|$)/)) {
+    _w  = substr(_fr, RSTART, RLENGTH)
+    _p  = substr(_fr, 1, RSTART - 1)
+    _eq = index(_w, "=")
+    _nm = substr(_w, 1, _eq - 1)
+    _vv = substr(_w, _eq + 1, 2)
+    _fr = substr(_fr, RSTART + _eq + 2)
+    if (_nm ~ /_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) continue
+    if (cmdpos(_p)) print "foreign", _nm, _vv + 0, f, FNR
+  }
   rest = s
   while (match(rest, /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)/)) {
     name = substr(rest, RSTART, RLENGTH)
@@ -248,6 +310,13 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh"
 #   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
 #   (`claim-registry-absent`) or `none`; not an exit code either.
 _codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED"
+# A declaration-position UPPERCASE `NAME=<70..89>` OUTSIDE the family namespace, named EXACTLY with its
+# reason (`file:NAME=code`). Empty on this tree, and that is ASSERTED below rather than assumed: the
+# derived filter yields exactly the family claims today, so the namespace costs nothing — and a future
+# non-gate numeric assignment written in declaration position must add its own deliberate line here
+# instead of silently widening the net. NEVER a blanket allowance, for the same reason
+# `_codes_sanctioned` is an equality.
+_codes_foreign_ok=""
 # The ONLY permitted shared codes, asserted as an EQUALITY so the table cannot rot into a blanket
 # allowance — a share that DISAPPEARS is red too, because it means an alias broke:
 #   78 = the cannot-verify pair (#2258): `PI_FORK_REFUSED` and `BRIEF_GATE_UNAVAILABLE` both mean
@@ -298,6 +367,13 @@ codes_verdict() {
                      if (decl[$2] != $3) printf "%s:%s:%s=%s(want %s)\n", $2, $4, $5, $3, decl[$2] }
   ' | sort | tr '\n' ' ')"
   _cv_stale="${_cv_stale% }"
+  # A `NAME=<70..89>` in declaration position that is NOT in the family namespace: the claim scan
+  # cannot see it, so it is the blind spot the convention would otherwise hide (review of PR #3237,
+  # finding 1). Red unless sanctioned BY NAME above.
+  _cv_foreign=""
+  for _cv_g in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="foreign"{print $4":"$2"="$3}' | sort -u); do
+    case " $_codes_foreign_ok " in *" $_cv_g "*) : ;; *) _cv_foreign="$_cv_foreign $_cv_g" ;; esac
+  done
   _cv_shared=""
   for _cv_c in $(printf '%s\n' "$_cv_claims" | awk -F'\t' '{print $3}' | sort -un); do
     _cv_ns="$(printf '%s\n' "$_cv_claims" | awk -F'\t' -v c="$_cv_c" '$3==c{print $2}' | sort -u | tr '\n' ',')"
@@ -305,13 +381,13 @@ codes_verdict() {
     case "$_cv_ns" in *,*) _cv_shared="$_cv_shared $_cv_c=$_cv_ns" ;; esac
   done
   _cv_shared="${_cv_shared# }"
-  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale" ] \
+  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale$_cv_foreign" ] \
      || [ "$_cv_shared" != "$_codes_sanctioned" ] || [ "$_cv_n" -eq 0 ]; then
     CODE_RC=1
   else
     CODE_RC=0
   fi
-  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale} shared:${_cv_shared:- none}"
+  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale}${_cv_foreign:+ foreign:$_cv_foreign} shared:${_cv_shared:- none}"
 }
 
 # Computed here so every reader below shares ONE parse: the chain gate table, the coverage verdict,
@@ -2141,7 +2217,12 @@ array-readonly-idx0|unparseable|readonly -a AGENT_NEW_GATE_REFUSED[0]=83
 array-braced-assign|unparseable|: \"\${AGENT_NEW_GATE_REFUSED[0]:=83}\"
 array-then-exit|unparseable|AGENT_NEW_GATE_REFUSED[0]=83; exit \"\${AGENT_NEW_GATE_REFUSED}\"
 printf-v|claim|printf -v AGENT_NEW_GATE_REFUSED %d 83
-read-builtin|unparseable|read -r AGENT_NEW_GATE_REFUSED"
+read-builtin|unparseable|read -r AGENT_NEW_GATE_REFUSED
+read-dash-d|unparseable|read -r -d \"\" AGENT_NEW_GATE_REFUSED
+printf-v-quoted|claim|printf -v \"AGENT_NEW_GATE_REFUSED\" %d 83
+getopts-builtin|unparseable|getopts \"\" AGENT_NEW_GATE_REFUSED
+arith-assign|claim|(( AGENT_NEW_GATE_REFUSED = 83 ))
+array-nested-subscript|unparseable|AGENT_NEW_GATE_REFUSED[a[0]]=83"
 _resid_unread=""; _resid_unred=""
 while IFS='|' read -r _rtag _rkind _rline; do
   [ -n "$_rtag" ] || continue
@@ -2181,6 +2262,33 @@ _wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"unparseable declaration: spawn-gate.sh:$_wantline"*) rc=0 ;; *) rc=1 ;; esac
 ck "(mutation f) a declaration-shaped line the parser CANNOT classify is REFUSED and named with its FILE:LINE (want 'spawn-gate.sh:$_wantline') (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1) THE NAMESPACE IS NOT A BLIND SPOT (review of PR #3237, finding 1). The whole claim scan is
+# anchored on `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED`, so a gate code declared under another name
+# produced NO row and a GREEN verdict — measured before this arm existed: appending `AGENT_MEM_GATE=81`
+# (a real duplicate of the memory gate's code) to a copy left the verdict at RC=0 with
+# `absent: none unparseable: none`. The naming convention is a REAL constraint on this deploy unit, not
+# an assumption about the future, so it is asserted on BOTH sides: a foreign declaration is a RED, and
+# the shipped tree reports none.
+_codemut_dir="$(_codemut foreign-code)"
+printf '\nAGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE=81"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation f1) a code declared OUTSIDE the family namespace (\`AGENT_MEM_GATE=81\`, line $_wantline) is REFUSED and named — the claim scan is namespace-anchored, so this was GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+# ... and the control for the other direction: the SAME code under FAMILY names is caught by the
+# COLLISION rule and reported as a collision, never as foreign — otherwise this arm could be the thing
+# reddening every duplicate and the namespace rule itself would be untested.
+_codemut_dir="$(_codemut foreign-control)"
+printf '\nAGENT_MEM_REFUSED=81\nAGENT_NEW_GATE_REFUSED=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"81=AGENT_MEM_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(control) the same code under FAMILY names is caught as a COLLISION, not as foreign — the namespace arm and the duplicate arm measure different things (want '81=AGENT_MEM_REFUSED,AGENT_NEW_GATE_REFUSED') (rc=$CODE_RC; $CODE_MSG)" $rc
+case "$CODE_MSG" in *"foreign:"*) rc=1 ;; *) rc=0 ;; esac
+ck "...and that control reports NO foreign row — a family-named declaration is claimed, so the namespace arm cannot be what catches it (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (g) A READER DEFAULT (\`${X:-N}\`) IS READ, AND MUST AGREE WITH THE DECLARATION. It was another
 # dropped shape, and a stale one is not cosmetic: `fix-one.sh` LABELS a refusal from it, so a default
@@ -2246,10 +2354,10 @@ codes_verdict "$HERE"
 # unparseable, nothing stale. Without this, a parser that reddened every copy (and every real tree)
 # would satisfy the arms above while telling the operator nothing.
 case "$CODE_MSG" in
-  *"rejected:"*|*"stale-defaults:"*) rc=1 ;;
+  *"rejected:"*|*"stale-defaults:"*|*"foreign:"*) rc=1 ;;
   *) rc=0 ;;
 esac
-ck "the REAL deploy unit reports NOTHING unparseable and NO stale reader default — the fail-closed parse is not reddening the tree it ships on (rc=$CODE_RC; $CODE_MSG)" $rc
+ck "the REAL deploy unit reports NOTHING unparseable, NO stale reader default and NO foreign code declaration — the fail-closed parse is not reddening the tree it ships on, and the namespace rule costs nothing on it (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (2) THE ARM TABLE. `<CONSTANT>:<wording the fixer's own log must carry>`. A row may PRECEDE its
 # gate (#2387's memory gate is declared here before main defines it): the moment that constant lands,
@@ -2266,7 +2374,7 @@ _armdecl=" $(printf '%s\n' "$_fixer_arms" | cut -d: -f1 | tr '\n' ' ')"
 # from fix-one.sh itself, so adding a `${AGENT_X_REFUSED:-…}` arm there without declaring it here is a
 # red rather than an unchecked arm.
 _armmissing=""
-for _ac in $(grep -o 'AGENT_[A-Z_]*_REFUSED' "$HERE/fix-one.sh" | sort -u); do
+for _ac in $(grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' "$HERE/fix-one.sh" | sort -u); do
   case "$_armdecl" in *" $_ac "*) : ;; *) _armmissing="$_armmissing $_ac" ;; esac
 done
 [ -z "${_armmissing// /}" ]; rc=$?
