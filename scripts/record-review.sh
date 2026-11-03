@@ -33,7 +33,7 @@
 #   empty or non-diff body NEVER does. Exit 0 — the status field carries the
 #   outcome, so a non-zero exit stays reserved for a usage/argument error.
 #
-# record-review.sh --check-carry <pr> [owner/repo]
+# record-review.sh --check-carry <pr> [owner/repo] [--recorded-diff <64hex> [--recorded-head <40hex>]]
 #   READ-ONLY, and the ONE way a lane asks "my record's head is stale — is the
 #   diff I reviewed still the diff that would merge?". It runs the SAME
 #   `diff_hash_for_pr` the record path and the GitHub gate use, compares that
@@ -58,6 +58,33 @@
 #                    head and let its carry arms decide (a CARRY, not a review)
 #   A usage/argument error is exit 2. ⛔ It is a PREDICTION, not an authorization:
 #   the merge gate re-decides on the live diff, and it never writes a record.
+#
+#   ── #3315: WHO OWNS THE CARRY VERDICT ──────────────────────────────────────
+#   The pair of arguments after the repo exists so that this predicate can answer
+#   for a record read from the PR BODY instead of from this box's record file:
+#     --recorded-diff <64hex>   the recorded `diff_sha256`
+#     --recorded-head <40hex>   the head it was minted at (optional, but it is
+#                               what lets a REBASE be answered `carry-patch`
+#                               instead of `fresh`)
+#   WHY. Two gates read one review record and disagreed about it: this mode said
+#   "the reviewed DIFF is UNCHANGED — carry it, do NOT re-review" from the record
+#   FILE, while check-pipeline-compliance.sh's check (c) refused the same record
+#   because the marker in the body named an earlier head. Check (c) runs on a CI
+#   runner, which has no `$HOME/.pi/agent/reviews`, so it could never carry — the
+#   only way through was minting an UNATTESTED marker at the current head, which
+#   is precisely the falsified-evidence shape tortoise#7391 forbids ("naming the
+#   PR's current head is not evidence"). Rather than let the gate grow a second
+#   copy of "unchanged", the gate now HANDS the recorded pair in and this file
+#   answers — same `diff_hash_for_pr`, same identity rule, same verdict.
+#   ⛔ A supplied pair is not TRUSTED more than a record file (anyone who can
+#   edit the body can write one, exactly as anyone with write access to the box
+#   can write the file); what this mode decides is CONTENT IDENTITY, and whether
+#   a marker is AUTHENTIC is the signed-marker gate's question (#784/#2055). A
+#   forged pair buys nothing a forged marker line did not already buy check (c),
+#   and it still has to equal the live diff the gate computes for itself.
+#   Both values are validated at argument time (64-hex / 40-hex, exit 2 on a
+#   malformed one), and they are read-only inputs: this never mints, never
+#   rebinds a head, and never writes.
 #
 # record-review.sh --recover-body <pr> [owner/repo]
 #   REBUILD a MISSING record from the PR body's own SIGNED marker (#2872).
@@ -1018,6 +1045,11 @@ PRINT_DIFF_HASH=0
 # #1351 — the LANE's question, answered: "my record's head is stale; is the DIFF I
 # reviewed still the diff that would merge?" Set by --check-carry (read-only).
 CHECK_CARRY=0
+# #3315 — the recorded pair a caller names EXPLICITLY for --check-carry, so the
+# carry predicate is answerable on a box (a CI runner) that has no record file.
+# Empty = read this box's record, exactly as before.
+RECORDED_DIFF=""
+RECORDED_HEAD=""
 # Set by --print-tier: the READ-ONLY surface-cap selector (see the header).
 PRINT_TIER=0
 # #2872 — rebuild a missing record from the PR body's SIGNED marker. Mints, so it
@@ -1037,6 +1069,31 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
   case "$_arg" in
     --print-diff-hash) PRINT_DIFF_HASH=1 ;;
     --check-carry) CHECK_CARRY=1 ;;
+    --recorded-diff)
+      # #3315 — the recorded `diff_sha256`, as carried in the PR body's marker.
+      _i=$((_i + 1))
+      if [ "$_i" -ge "${#_argv[@]}" ]; then
+        echo "record-review.sh: --recorded-diff needs a value (the 64-hex diff_sha256 the record carries) — usage: record-review.sh --check-carry <pr> [owner/repo] [--recorded-diff <64hex> [--recorded-head <40hex>]]" >&2
+        exit 2
+      fi
+      RECORDED_DIFF="${_argv[$_i]}"
+      if ! [[ "$RECORDED_DIFF" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "record-review.sh: --recorded-diff expects a full lowercase 64-hex digest (got '$RECORDED_DIFF') — a short or upper-cased value could only be compared by a rule this mode does not implement, and accepting one would silently weaken the content-identity test." >&2
+        exit 2
+      fi ;;
+    --recorded-head)
+      # #3315 — the recorded head sha, so a REBASE is diagnosable as
+      # `carry-patch` (re-record, no review) instead of `fresh` (review owed).
+      _i=$((_i + 1))
+      if [ "$_i" -ge "${#_argv[@]}" ]; then
+        echo "record-review.sh: --recorded-head needs a value (the 40-hex head the record was minted at) — usage: record-review.sh --check-carry <pr> [owner/repo] [--recorded-diff <64hex> [--recorded-head <40hex>]]" >&2
+        exit 2
+      fi
+      RECORDED_HEAD="${_argv[$_i]}"
+      if ! [[ "$RECORDED_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "record-review.sh: --recorded-head expects a full 40-hex sha (got '$RECORDED_HEAD') — a short sha cannot be compared for equality, and accepting one would silently weaken the pin to a prefix match." >&2
+        exit 2
+      fi ;;
     --print-tier) PRINT_TIER=1 ;;
     --recover-body) RECOVER_BODY=1 ;;
     --force-stale) FORCE_STALE=1 ;;
@@ -1152,6 +1209,22 @@ esac
 if [ "$VERDICT" = "clean-low" ] && [ "$FORCE_STALE" -eq 1 ]; then
   echo "record-review.sh: --force-stale is incompatible with the clean-low verdict — clean-low certifies the content shape of a specific revision, and the sha a stale record names is not the revision any consumer will read. Re-run at the current head without --force-stale." >&2
   exit 2
+fi
+# ── #3315: the caller-supplied pair is a --check-carry INPUT, nothing else ──
+# Refusing it on the minting/selector modes is the same posture as --evidence:
+# a flag that cannot affect what this invocation does must not be accepted, or
+# the caller believes it pinned something it did not. `--recorded-head` alone is
+# refused too: a head answers no question about CONTENT identity, which is the
+# only question a carry asks.
+if [ -n "$RECORDED_DIFF" ] || [ -n "$RECORDED_HEAD" ]; then
+  if [ "$CHECK_CARRY" -ne 1 ]; then
+    echo "record-review.sh: --recorded-diff/--recorded-head describe the RECORD a carry question is about, so they are only meaningful with --check-carry (which writes nothing). This invocation is a different verb, where they would be IGNORED." >&2
+    exit 2
+  fi
+  if [ -z "$RECORDED_DIFF" ]; then
+    echo "record-review.sh: --recorded-head needs --recorded-diff — a head alone answers no question about content identity, and accepting it would let it look as though a carry had been checked." >&2
+    exit 2
+  fi
 fi
 # Input validation (#2055): the ai-review-gate binds the FULL 40-char sha and
 # a numeric PR — reject bad inputs up front rather than posting evidence that
@@ -1862,6 +1935,12 @@ fi
 # would decide; the gate re-decides at merge time, and an unreadable diff is
 # NEVER reported as a carry (see the status arm below).
 if [ "$CHECK_CARRY" -eq 1 ]; then
+  # #3315 — WHICH RECORD THIS QUESTION IS ABOUT. Default: this box's record FILE
+  # (the WRITER's own convention, below). A caller that supplies --recorded-diff
+  # names the pair EXPLICITLY instead — the arm check-pipeline-compliance.sh's
+  # check (c) uses on a CI runner, which has no $HOME/.pi/agent/reviews but does
+  # have the PR body's marker. ONE predicate, one identity rule, one answer; the
+  # source is recorded in CC_ORIGIN so diagnostics can say which one decided.
   # The record path is the WRITER's own convention (see DIR/FILE below), so the
   # reader cannot disagree with the writer. The legacy <pr>.json is honoured
   # only when it names no repo or THIS repo — the #426 collision rule the local
@@ -1901,6 +1980,22 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     [ -z "$r" ] || [ "$r" = "$REPO" ]
   }
   CC_REC=""
+  CC_ORIGIN="record file"
+  CC_SUPPLIED=0
+  # ⛔ THE SUPPLIED PAIR SHORT-CIRCUITS THE LOOKUP — it is not merged with the
+  # file and it never defers to it. A caller that named a digest is asking about
+  # THAT digest; answering from a different record file would recreate exactly
+  # the two-readers divergence this mode exists to end. `--recorded-head` may
+  # legitimately be absent (a pre-#2982 marker carries no head), which is why only
+  # the digest is required: an absent head disables the head arm and the rebase
+  # arm, and NO verdict is invented from it.
+  if [ -n "$RECORDED_DIFF" ]; then
+    CC_SUPPLIED=1
+    CC_ORIGIN="caller-supplied record pair"
+    CC_HEAD="$RECORDED_HEAD"
+    CC_DIFF="$RECORDED_DIFF"
+  fi
+  if [ "$CC_SUPPLIED" -eq 0 ]; then
   # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
   # that lacks the file may still have the verdict in the registry (minted on a
   # peer box) or in the PR body's SIGNED marker (minted anywhere, and the only
@@ -1943,6 +2038,7 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   fi
   CC_HEAD="$(cc_field "$CC_REC" head_sha)"
   CC_DIFF="$(cc_field "$CC_REC" diff_sha256)"
+  fi   # end of the record-FILE arm (#3315): a caller-supplied pair skipped it
   # The gate's own identity rule (isDiffSha256 in extensions/review-enforcer):
   # full lowercase 64-hex, and NEVER the sha256 of the empty body — that constant
   # would make every record "match" every PR.
@@ -1965,6 +2061,9 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   if [ "${#CC_LIVE_HEAD}" -ne 40 ]; then CC_LIVE_HEAD=""; fi
   # HEAD BINDING FIRST: a record at the CURRENT head is valid with no digest at
   # all, and that is the commonest healthy case — it must not read as "carry".
+  # (An EMPTY recorded head — a supplied pair with no --recorded-head — is UNKNOWN
+  # and cannot equal a live head, so the comparison below already refuses it; no
+  # extra guard is needed and none is claimed.)
   if [ -n "$CC_LIVE_HEAD" ] && [ "$CC_HEAD" = "$CC_LIVE_HEAD" ]; then
     printf 'head\t%s\t%s\n' "${CC_DIFF:--}" "${DIFF_HASH:--}"
     echo "record-review.sh --check-carry: the record is bound to the CURRENT head (${CC_HEAD:0:12}…) — nothing is stale and nothing needs re-review." >&2
@@ -2001,7 +2100,7 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   fi
   if [ "$CC_DIFF" = "$DIFF_HASH" ]; then
     printf 'carry\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
-    echo "record-review.sh --check-carry: the reviewed DIFF is UNCHANGED (diff_sha256 ${CC_DIFF:0:12}… matches the PR's live diff) — the merge gate CARRIES this record across the head move (${CC_HEAD:0:12}…). Do NOT re-review and do NOT mint a fresh record: land it." >&2
+    echo "record-review.sh --check-carry: the reviewed DIFF is UNCHANGED (diff_sha256 ${CC_DIFF:0:12}… matches the PR's live diff) — the merge gate CARRIES this record across the head move (${CC_HEAD:-the earlier head}${CC_HEAD:+ }…). Do NOT re-review and do NOT mint a fresh record: land it. [source: $CC_ORIGIN]" >&2
     exit 0
   fi
   # ── #1377 — `carry-patch`: the BINDING moved, the PATCH did not ────────────

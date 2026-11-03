@@ -44,13 +44,27 @@
 #                          check — that keyword match was defeated by typing one
 #                          of six words into a commit message, with no review
 #                          behind it (measured on PR #1822, #1825).
+#                          #3315 — ONE CARRY ARM. When no marker is bound to the
+#                          current head, a marker for an EARLIER head of THIS PR
+#                          and repo is CARRIED instead of refused, iff
+#                          record-review.sh --check-carry says the reviewed diff
+#                          is byte-identical to the live one (see
+#                          review_record_carry_candidates / c_carry_resolve / c_carry_ask; the
+#                          producer owns the digest and the verdict). A carry
+#                          claims CONTENT identity, never a review at this head,
+#                          and it fails CLOSED on anything else the producer can
+#                          answer: a changed diff, an unreadable diff, no record,
+#                          no digest, a rebase (`carry-patch` — refused because
+#                          the merge gate does not carry it either; re-record, do
+#                          not re-review), or a predicate that cannot be run.
 #                          The #513 binding rejects a verdict=clean-micro marker
-#                          on a non-micro issue. #1356 adds the parallel
+#                          on a non-micro issue, and #1356 adds the parallel
 #                          clean-low binding: a verdict=clean-low marker is
 #                          accepted ONLY when the PR's whole diff is in the
 #                          Low content-shape class, read from the producer's
 #                          OWN definition (record-review.sh::clean_low_*,
-#                          SOURCED — never restated here).
+#                          SOURCED — never restated here). Both bindings apply to
+#                          a CARRIED record too — a carry carries its verdict.
 #   d. PLAN DOC          — complexity:standard/complex issues need a plan doc:
 #                          the PR adds/modifies a file under docs/plans/*.md,
 #                          OR the scoping comment contains a `Wiring` section
@@ -228,6 +242,10 @@ Env:
   PIPELINE_COMPLIANCE_DRY_RUN=1 print what WOULD be checked (no gh calls)
   PIPELINE_COMPLIANCE_FAIL_ALL=1 with DRY_RUN: simulate all failures
   PIPELINE_COMPLIANCE_SELF_TEST=1 parser-only self-test (no gh calls)
+  PIPELINE_COMPLIANCE_RECORDER   path to record-review.sh (default: the sibling
+                                script) — check (c)'s carry predicate. The
+                                fixture suite points it at a stub; anything that
+                                is not a readable file is refused FAIL-CLOSED.
 
 Check (a) scope:
   An issue reference — a closing keyword ("Fixes #N" / "Closes #N" /
@@ -245,16 +263,25 @@ Check (a) scope:
   PR implementing only PART of one would have to lie (every closing keyword
   closes the issue it names) or fail the gate.
 
-Check (c) scope (#1825):
+Check (c) scope (#1825, extended by #3315):
   The ONLY accepted evidence is a record-review.sh RECORD MARKER on its own
   line — in the PR body or a commit message — bound to this PR:
     review recorded: reviews/<PR>.json verdict=<clean|clean-micro|clean-low> @
-      <the PR's CURRENT head sha> (<owner/repo>)
+      <the PR's CURRENT head sha> (<owner/repo>) [diff=<64hex>]
   A phrase ('code-review', 'reviewer', '[review]', 'VGATE',
   'review-enforcer', 'review recorded' on its own) is NOT evidence: it names no
   review, no PR and no revision, so it was satisfiable by typing. A marker
-  recorded at an older head does not count either — a record certifies exactly
-  one revision.
+  recorded at an OLDER head does not count on its own either — a record
+  certifies exactly one revision. What #3315 added is the ONE exception, and it
+  is a CARRY rather than a relaxation: when the marker at an earlier head
+  carries its record's diff_sha256 AND record-review.sh --check-carry (the
+  single owner of carry semantics, the same predicate the merge gate uses)
+  reports that digest equal to the PR's live diff, check (c) passes and says
+  CARRIED. Anything else the predicate answers — a changed diff, an unreadable
+  diff, no record, no digest, a rebase (carry-patch: the merge gate does not
+  carry that either, so re-record at the current head instead of re-reviewing) —
+  fails closed. The marker's PR number, repo and the recorded head are checked
+  on the carry path exactly as on the head-bound one.
 EOF
 }
 
@@ -545,6 +572,280 @@ has_review_record() {
 has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
 has_clean_micro_marker() { grep -qE "$CLEAN_MICRO_MARKER_RE" <<<"$1"; }
 has_clean_low_marker() { grep -qE "$CLEAN_LOW_MARKER_RE" <<<"$1"; }
+
+# ── #3315: CHECK (c) CONSULTS THE CARRY — one predicate, not two readers ────
+#
+# THE MEASURED DEFECT. Two gates read one review record and disagreed about it.
+# `scripts/record-review.sh --check-carry` printed "the reviewed DIFF is
+# UNCHANGED (diff_sha256 347c92f1… matches the PR's live diff) — the merge gate
+# CARRIES this record … Do NOT re-review … land it" (exit 0, verdict `carry`),
+# while check (c) below printed "no head-bound code-review record" and BLOCKED —
+# because it only ever looked for a marker naming the CURRENT head. And
+# `pipeline-compliance` is this repo's ONLY required status check, so on every PR
+# whose head moved after its review was minted the sole way through was minting a
+# FRESH marker at the new head with no review behind it. That is the exact shape
+# tortoise#7391 exists to forbid: naming the PR's current head is not evidence.
+#
+# THE FIX IS A SHARED VERDICT, NOT A SECOND PREDICATE. This gate does not learn
+# how to hash a diff or how to decide "unchanged". It finds the record marker for
+# an EARLIER head, hands that record's own (head_sha, diff_sha256) pair to
+# `record-review.sh --check-carry --recorded-diff/--recorded-head`, and reads the
+# producer's documented tab-separated verdict line. The producer keeps sole
+# ownership of the normalizer, of the identity rule (64-hex, never the empty-body
+# constant) and of the unreadable-diff arm — the three things a second reader
+# would inevitably restate, slightly differently.
+#
+# ⛔ WHAT A CARRY CLAIMS, AND WHAT IT DOES NOT. It claims CONTENT IDENTITY: the
+# diff the reviewer read is the diff that would merge. It does NOT claim a review
+# happened at this head, and the PASS line says "CARRIED from <prior head>", never
+# "bound to <this head>". That is the whole point — the old behaviour's only
+# escape was to make the second claim falsely.
+#
+# ⛔ THE TRUST BOUNDARY IS UNCHANGED — AND IT IS NOT A PROOF OF REVIEW (read
+# this before quoting the carry arm as a guarantee). Check (c) is a
+# presence-of-evidence check on a BODY MARKER, and a body is writable: a
+# hand-pasted marker line already satisfies it (#1348 recorded that residual, and
+# #1825 kept the same boundary — no deterministic gate can prove a human read a
+# diff when every session authenticates as one account). The carry arm does not
+# change that class. It requires MORE than the head-bound arm in one respect (the
+# marker's `diff_sha256` must equal the live diff the producer computes for
+# itself, which a forger can only supply by running the producer's own read-only
+# `--print-diff-hash`), and it requires LESS in another: the marker's optional
+# `sig=` is not verified here, exactly as it is not verified on the head-bound
+# path, because a CI runner has no `$AI_REVIEW_GATE_KEY`. So this check can still
+# be satisfied by a typed line, and the producer's carry-forward (which DOES
+# verify the HMAC, #784/#2055) remains the stricter reader. What the gate must
+# never do is PASS something the producer would not carry ON CONTENT IDENTITY —
+# that is why the allow-list below is exactly one pair (exit 0 + token `carry`)
+# and everything else fails closed.
+#
+# review_record_carry_candidates <text> <pr> <repo> <current-head>
+#   Print "<prior-head>\t<diff_sha256|->", ONE LINE PER marker bound to THIS PR
+#   and THIS repo at a head that is NOT the current one, NEWEST FIRST. Always
+#   rc 0 (an empty list is the answer "no candidate").
+#   ⛔ A PR MAY CARRY SEVERAL STALE MARKERS AND NO SINGLE ONE IS "THE" RECORD
+#   (review of #3315, P1). The first version returned ONE candidate — the last
+#   digest-bearing marker in TEXT order — and that is wrong twice over:
+#     · `EVID_TEXT` is the PR BODY followed by the COMMIT MESSAGES, so a marker in
+#       an old commit message always sorts AFTER every body marker and shadows the
+#       newest evidence. Measured: body `@ B diff=2222…` (the live digest) plus a
+#       commit-message `@ A diff=1111…` answered `fresh` and hard-blocked a PR
+#       whose reviewed content was byte-identical — the same false block #3315
+#       exists to remove, re-created on the new arm.
+#     · record-review.sh APPENDS markers and never removes them, so a PR
+#       re-recorded twice legitimately holds two.
+#   Content identity is the CLAIM, so ANY marker whose own digest equals the live
+#   diff establishes it: the caller asks the predicate about each candidate (body
+#   before commits, newest first inside each) and passes on the first `carry`.
+#   Nothing here decides "unchanged" — that stays the producer's call. The scan
+#   is the same whole-line, PR+repo-bound match has_review_record applies, so a
+#   marker for another PR or another repo is not a candidate at all (#426).
+review_record_carry_candidates() {
+  local text="$1" pr="$2" repo="$3" head="$4" line want_repo got_repo i
+  local -a heads=() diffs=()
+  [[ -n "$pr" && -n "$repo" && -n "$head" ]] || return 0
+  want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  while IFS= read -r line; do
+    [[ "$line" =~ $REVIEW_RECORD_MARKER_RE ]] || continue
+    [[ "${BASH_REMATCH[1]}" == "$pr" ]] || continue
+    if [[ "${BASH_REMATCH[3]}" == "$head" ]]; then continue; fi
+    got_repo="$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')"
+    [[ "$got_repo" == "$want_repo" ]] || continue
+    heads+=("${BASH_REMATCH[3]}")
+    diffs+=("${BASH_REMATCH[4]# diff=}")
+  done <<<"$text"
+  # Append order IS the marker order, so the last match is the newest.
+  for (( i=${#heads[@]}-1; i>=0; i-- )); do
+    printf '%s\t%s\n' "${heads[i]}" "${diffs[i]:--}"
+  done
+  return 0
+}
+
+# c_carry_resolve <pr-body> <commit-messages> <pr> <repo> <current-head>
+#   Resolve check (c)'s carry question over EVERY candidate marker. On success
+#   sets C_CARRIED_HEAD / C_CARRIED_DIFF; otherwise C_CARRY_WHY (the NEWEST
+#   candidate's refusal — that is the diagnosis a lane needs) and
+#   C_NODIGEST_HEAD (the newest digest-less marker). Returns:
+#     0  CARRIED — some candidate's own diff is what would merge (the producer's
+#        verdict; PR body before commit messages, newest first within each)
+#     1  no marker for this PR/repo at any other head — nothing to even ask about
+#     2  candidates exist but none carries a digest (a pre-#2982 marker)
+#     3  the producer refused (`carry-patch`, `fresh`, `unreadable`, …)
+#   ⛔ BOUNDED: at most $C_CARRY_MAX_ASKS predicate invocations, so a PR carrying
+#   a hundred stale markers cannot turn the required check into a hundred `gh`
+#   walks. The bound is on COST, never on correctness — the newest candidates are
+#   the ones tried, and exhausting it is REPORTED as a refusal.
+c_carry_resolve() {
+  local body="$1" commits="$2" pr="$3" repo="$4" head="$5"
+  local cands ph pd n=0 tried=0 nodhead="" why="" whyhead=""
+  C_CARRIED_HEAD=""; C_CARRIED_DIFF=""; C_CARRY_WHY=""; C_NODIGEST_HEAD=""; C_REFUSED_HEAD=""
+  C_CARRIED_HEAD=""; C_CARRIED_DIFF=""; C_CARRY_WHY=""; C_NODIGEST_HEAD=""
+  cands="$(review_record_carry_candidates "$body" "$pr" "$repo" "$head"
+           review_record_carry_candidates "$commits" "$pr" "$repo" "$head")"
+  [[ -n "$cands" ]] || return 1
+  while IFS=$'\t' read -r ph pd; do
+    [[ -n "$ph" ]] || continue
+    if [[ -z "$pd" || "$pd" == "-" ]]; then
+      if [[ -z "$nodhead" ]]; then nodhead="$ph"; fi
+      continue
+    fi
+    n=$((n + 1))
+    if [[ "$n" -gt "$C_CARRY_MAX_ASKS" ]]; then
+      if [[ -z "$why" ]]; then
+        why="this PR carries more than $C_CARRY_MAX_ASKS stale record markers and none of the newest $C_CARRY_MAX_ASKS could be carried — re-record naming the head the current record carries (a CARRY, not a review), or run the code-review skill if the diff changed"
+      fi
+      break
+    fi
+    tried=$((tried + 1))
+    if c_carry_ask "$pr" "$repo" "$ph" "$pd"; then
+      C_CARRIED_HEAD="$ph"; C_CARRIED_DIFF="$pd"
+      return 0
+    fi
+    # The FIRST refusal is the NEWEST candidate's — a reason from a marker
+    # further down the list would describe evidence that is not the newest.
+    if [[ -z "$why" ]]; then why="$C_CARRY_WHY"; whyhead="$ph"; fi
+  done <<<"$cands"
+  C_CARRY_WHY="$why"; C_NODIGEST_HEAD="$nodhead"; C_REFUSED_HEAD="$whyhead"
+  if [[ "$tried" -gt 0 ]]; then
+    if [[ -z "$C_CARRY_WHY" ]]; then
+      C_CARRY_WHY="the carry predicate could not be run for any candidate marker"
+    fi
+    return 3
+  fi
+  return 2
+}
+
+# c_carry_ask <pr> <owner/repo> <recorded-head> <recorded-diff>
+#   Ask the PRODUCER for its verdict on a record minted at an EARLIER head.
+#   Returns 0 ONLY for the allow-listed pair (exit 0 + token `carry`), and sets
+#   C_CARRY_TOKEN (the raw token) plus C_CARRY_WHY (one line naming the answer,
+#   including WHY it is not a pass) for the failure message.
+#
+#   ⛔ FAIL-CLOSED POLARITY, NOT A VOCABULARY MATCH. The pass condition is an
+#   ALLOW-LIST of one; an unknown token, an empty answer, a usage error, a
+#   recorder that is absent or unreadable, or a token paired with the wrong exit
+#   code is a REFUSAL. That is deliberate: `--check-carry` documents seven
+#   verdicts today, and a producer that grows an eighth must not be able to make
+#   this gate green by having produced a token nobody here classified.
+#   ⛔ THE ANSWER MUST ALSO BE THE PRODUCER'S, NOT A LOOKALIKE. `--recorded-diff`
+#   is a verb this gate can only get from a producer at this revision; a recorder
+#   too old to understand it exits 2 with no verdict line, which lands on the
+#   catch-all refusal and names the tooling fault instead of grading the PR.
+c_carry_ask() {
+  local pr="$1" repo="$2" rh="$3" rd="$4" out="" rc=0 tok="" recd="" live=""
+  C_CARRY_TOKEN=""
+  C_CARRY_WHY=""
+  if [[ ! -f "$RECORDER" || ! -r "$RECORDER" ]]; then
+    C_CARRY_WHY="the carry predicate could not be EXECUTED — record-review.sh is not readable beside this gate (looked at $RECORDER), so whether the reviewed diff is unchanged is UNVERIFIABLE, and an unverifiable carry is refused"
+    return 1
+  fi
+  out="$(bash "$RECORDER" --check-carry "$pr" "$repo" --recorded-diff "$rd" --recorded-head "$rh" 2>/dev/null)" || rc=$?
+  if [[ -n "$out" ]]; then
+    # The producer's documented line, FIRST line only: `<verdict>\t<record
+    # digest|->\t<live digest|status>`. A recorder that printed diagnostics
+    # first, or a second verdict line after it, must not be able to hand this
+    # gate a token the producer did not decide on.
+    IFS=$'\t' read -r tok recd live <<<"${out%%$'\n'*}" || true
+  fi
+  C_CARRY_TOKEN="$tok"
+  if [[ "$rc" -eq 0 && "$tok" == "carry" ]]; then
+    C_CARRY_WHY="diff unchanged"
+    return 0
+  fi
+  case "$rc:$tok" in
+    1:fresh)
+      C_CARRY_WHY="the reviewed DIFF CHANGED since ${rh:0:12}… (recorded ${recd:0:12}… vs live ${live:0:12}…) — a fresh review is genuinely owed" ;;
+    6:carry-patch)
+      # See the PR body for the decision: this is a REFUSAL, stated with its
+      # reason. A rebase keeps every reviewed line byte-identical while moving
+      # the rendered diff, so the producer answers `carry-patch` — which means
+      # "the merge gate will NOT carry this record as-is; re-mint it at the
+      # current head". Passing here would make the required check greener than
+      # the gate that decides the merge, which is the very disagreement this
+      # issue exists to remove, so check (c) refuses AND names the mechanical
+      # remedy that costs no review cycle.
+      # ⛔ THE REMEDY NAMES THE EARLIER HEAD, NOT THE CURRENT ONE (review of
+      # #3315, P1). record-review.sh runs its carry arms ONLY in the stale-sha
+      # branch (`CURRENT_HEAD != SHA`), so advising `record-review.sh <pr>
+      # $PR_HEAD clean <repo>` advises a FRESH MINT — which its own tortoise#7391
+      # guard refuses without --evidence. Naming the head the record already
+      # carries is what makes the advised command a carry-forward: it verifies
+      # the prior signed marker for this diff and re-binds it to the live head.
+      C_CARRY_WHY="the reviewed PATCH is byte-identical but the RENDERED diff moved (a rebase / base-move). The merge gate does NOT carry a record across that — it re-mints one at the current head — and check (c) must not be greener than the gate that decides the merge. This is a REFUSAL with a mechanical remedy: RE-RECORD naming the head the record carries, record-review.sh $pr $rh <same verdict> $repo (naming $PR_HEAD instead is a FRESH mint, which the producer refuses for a clean verdict without --evidence) — do NOT run a review cycle" ;;
+    3:unreadable)
+      C_CARRY_WHY="the PR's live diff could not be READ (status ${live:-unavailable}) — a failed read is NOT a changed diff and NOT a carry: RETRY (that is the producer's own guidance, and a re-review would not be evidence of anything)" ;;
+    4:norecord)
+      C_CARRY_WHY="the producer answered 'norecord' — it could not identify a record to carry, so the carry predicate did not run (a tooling fault, not a policy verdict on this PR)" ;;
+    5:nodigest)
+      C_CARRY_WHY="the record carries no usable diff digest, so content identity cannot be established and nothing may be carried" ;;
+    0:head)
+      # Unreachable in the normal path (the caller only asks about a head that is
+      # NOT the current one), but reachable on a TOCTOU: the producer read the
+      # live head more recently and found it EQUAL to the recorded head. That is
+      # not a carry and not a review owed — the gate's own head read is stale.
+      C_CARRY_WHY="the producer found the record bound to the CURRENT head (${rh:0:12}…) while this gate read ${PR_HEAD:0:12}… — the head moved between the two reads, so RE-RUN this gate; nothing is owed and nothing may be carried on a stale head read" ;;
+    *)
+      if [[ "$rc" -eq 2 && -z "$tok" ]]; then
+        # The producer understood no argument it was given. The realistic cause
+        # is a VERSION SKEW: a consumer repo's `record-review.sh` (WIRING OPTION 1
+        # copies it into the repo, and the template workflow only fetches it when
+        # absent) predates `--recorded-diff`. Fail closed — but name the skew, or
+        # every PR there is blocked by a message that diagnoses nothing.
+        C_CARRY_WHY="the record-review.sh beside this gate exited 2 (usage) without a verdict — it is almost certainly OLDER than this gate and does not understand --recorded-diff. Fail closed. Fix the tool, not the PR: update scripts/record-review.sh from agent-infra (the pipeline-compliance workflow already fetches it from the same base URL as this gate when it is missing)."
+      else
+        C_CARRY_WHY="the carry predicate answered rc=$rc token='${tok:-<none>}', which this gate cannot classify as a carry — an unrecognised answer is a REFUSAL"
+      fi ;;
+  esac
+  return 1
+}
+
+# grade_c_record <evidence-text> <pass-prefix>
+#   THE #513 / #1356 VERDICT-TIER BINDINGS, shared by the HEAD-BOUND and the
+#   CARRIED arms — one writer, because a second copy is exactly how two readers
+#   drift apart. A carry carries the VERDICT the record was minted with, so
+#   carrying must not become a way to smuggle `clean-micro` past the non-micro
+#   binding or `clean-low` past the content-shape binding.
+#   <pass-prefix> is the whole "code-review record …" clause that distinguishes
+#   the two PASS lines: "… bound to <repo>#<pr> at <head>…" for a head-bound
+#   record, "… CARRIED from <head>… — diff unchanged (diff_sha256 …)" for one the
+#   content-identity test carried. Reads $tier / $FILES / $GH_REPO / $PR_NUMBER
+#   from the caller (bash locals are dynamically scoped).
+#
+#   #513 (Approach B): clean-micro certifies the MICRO process only
+#   (record-review.sh verifies the linked issue's complexity:micro label at mint;
+#   micro skips checks b–e, so reaching this branch means the issue is NOT micro).
+#   A non-micro PR claiming verdict=clean-micro is a false certification. Its
+#   remediation includes removing the stale marker line, because record-review.sh
+#   APPENDS markers and never removes them.
+#   #513 PRECISION (self-review catch): the binding must match the record-review.sh
+#   MARKER shape (verdict=… @ <40-hex sha>) — never bare prose that mentions it
+#   (PR #513's own description tripped the bare-substring grep).
+#   #1356: clean-low claims a property of THE DIFF, and this gate can read the
+#   diff, so the class is SOURCED from its single definition in record-review.sh
+#   (CLEAN_LOW_DOCS_RE / clean_low_path_ok / clean_low_rows / clean_low_shape_ok —
+#   all above its guarded main, so `source` runs no main) and never restated here:
+#   a second matcher would be a second writer of one contract. FAIL CLOSED on
+#   every arm — a marker we cannot shape-check is refused exactly like one we can
+#   prove wrong.
+#   The FAIL texts deliberately do NOT print the accepted phrases: the old
+#   message advertised them, so the fastest path to green was typing one
+#   (agent-infra#1904's own failure text).
+grade_c_record() {
+  local text="$1" prefix="$2"
+  if has_clean_micro_marker "$text"; then
+    fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
+  elif has_clean_low_marker "$text"; then
+    if [[ "$CLEAN_LOW_CLASS_SOURCED" != "true" ]]; then
+      fail c "clean-low verdict marker, but the Low content-shape class could not be read — record-review.sh is not beside this gate (looked at $RECORD_REVIEW_SH), so the diff's shape is UNVERIFIABLE and the clean-low attestation is refused. Ship record-review.sh alongside scripts/check-pipeline-compliance.sh (both are agent-infra files; templates/.github/workflows/pipeline-compliance.yml's WIRING notes cover copying/fetching it), or re-record with the verdict the diff earns."
+    elif pr_is_clean_low_shaped "$FILES"; then
+      pass c "$prefix (clean-low marker; the PR's diff IS Low-shaped)"
+    else
+      fail c "clean-low verdict marker on a diff that is NOT Low-shaped — clean-low certifies that EVERY changed path is in the Low content-shape class, defined ONCE by record-review.sh::clean_low_path_ok (sourced, not restated), and this PR's diff is not. Re-record at the current head with the verdict the diff actually earns (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact> — its own shape guard refuses clean-low here), and remove the stale \"verdict=clean-low\" marker line from the PR body."
+    fi
+  else
+    pass c "$prefix (record-review.sh marker)"
+  fi
+}
 
 # resolve_issue_only_ref <target> — map an --issue-only target to owner/repo#N:
 # a bare number resolves against $GH_REPO, an explicit owner/repo#N passes
@@ -1044,6 +1345,30 @@ pr_is_artifact_only() {
 # assignment, the shape this restore defends against.
 GATE_PARSER_CONSTS="$(declare -p REFCTX CLOSING_KW CLOSING_KW_BOUNDARY)"
 RECORD_REVIEW_SH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/record-review.sh"
+# #3315 — THE CARRY PREDICATE'S EXECUTABLE. Check (c) now delegates the
+# "is the reviewed diff still the diff that would merge?" question to the
+# producer instead of answering it with a head comparison, so the path is a
+# first-class input. The env override exists for the fixture suite: it lets a
+# vector drive a STUB recorder (a `norecord` answer, a crash, a `carry-patch`)
+# without copying a fake `record-review.sh` into this repo's scripts/ dir — the
+# same seam shape the producer's own suite uses (RECORD_REVIEW_LOCAL_REPO). It is
+# NOT a way to point the gate at a different predicate in production: anything
+# that is not an executable file is refused FAIL-CLOSED by c_carry_ask below.
+RECORDER="${PIPELINE_COMPLIANCE_RECORDER:-$RECORD_REVIEW_SH}"
+# ⛔ THE SEAM IS AN OPERATOR-LEVEL INPUT, NOT A TRUST BOUNDARY, AND IT SAYS SO
+# LOUDLY WHEN IT IS USED — the same posture as PIPELINE_COMPLIANCE_SKIP. This
+# gate runs the file it is given with `bash` (so ANY readable file counts, exec
+# bit or not), and a recorder that prints `carry<TAB>…` and exits 0 makes check (c)
+# pass. That is not a new class — the gate already accepts an ambient
+# PIPELINE_COMPLIANCE_SKIP — but SKIP announces itself and a silent seam would
+# not, so an override ANNOUNCES ITSELF on every run where it is in effect. In CI
+# and in production nothing sets it, so the line never fires there.
+if [[ -n "${PIPELINE_COMPLIANCE_RECORDER:-}" && "$RECORDER" != "$RECORD_REVIEW_SH" ]]; then
+  echo "⚠️  ⚠️  PIPELINE_COMPLIANCE_RECORDER is set — check (c)'s carry predicate is NOT this gate's sibling record-review.sh. It is being run as: $RECORDER" >&2
+  echo "    If this is not a test fixture, the carry verdict is being read from a file this repo does not ship." >&2
+fi
+# #3315 — the ceiling on predicate invocations per run (see c_carry_resolve).
+C_CARRY_MAX_ASKS=8
 CLEAN_LOW_CLASS_SOURCED="false"
 if [[ -f "$RECORD_REVIEW_SH" ]]; then
   # The `if source …; then` form is deliberate: it keeps `set -e` from aborting
@@ -1362,59 +1687,39 @@ run_checks() {
       echo "      Missing: a readable PR head sha."
       echo "      Invoke:  re-run this gate — a transient API/permission failure leaves the head unresolved."
     elif has_review_record "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD"; then
-      # #513 verdict-tier binding (Approach B): clean-micro certifies the
-      # MICRO process only (record-review.sh verifies the linked issue's
-      # complexity:micro label at mint; micro skips checks b–e, so reaching
-      # this branch means the issue is NOT micro). A non-micro PR whose
-      # body/commits claim verdict=clean-micro is a false certification —
-      # the record-review.sh marker carries the verdict verbatim. Remediation
-      # includes the stale-marker removal step: record-review.sh APPENDS
-      # markers and never removes them, so re-recording clean leaves the old
-      # clean-micro line behind and this binding keeps firing.
-      # Precision (#513 self-review catch): the binding must match the
-      # record-review.sh MARKER shape (verdict=… @ <40-hex sha>) — never bare
-      # prose mentioning the marker text (this PR's own description tripped
-      # the bare-substring grep on the first pipeline-compliance run).
-      if has_clean_micro_marker "$EVID_TEXT"; then
-        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
-      elif has_clean_low_marker "$EVID_TEXT"; then
-        # #1356 clean-low content-shape binding. clean-low certifies that EVERY
-        # changed path of the recorded revision is in the Low content-shape
-        # class. Unlike clean-micro (a tier exemption), clean-low claims a
-        # property of THE DIFF, and this gate can read the diff — so accepting
-        # the marker on a code-bearing PR would be a false PASS.
-        #
-        # THE CLASS IS NOT RESTATED HERE. It is SOURCED from its single
-        # definition in the producer, scripts/record-review.sh
-        # (CLEAN_LOW_DOCS_RE / clean_low_path_ok / clean_low_rows /
-        # clean_low_shape_ok — all defined above its guarded main, so a
-        # `source` runs no main). A second matcher here would be a second
-        # writer of one contract, and the three content-shape classes in this
-        # repo already diverge deliberately (see the producer's header); this
-        # binding must not add a fourth. See pr_is_clean_low_shaped below.
-        #
-        # FAIL CLOSED on every arm: a marker we cannot shape-check (producer
-        # absent) is refused, exactly like a marker we can prove wrong.
-        if [[ "$CLEAN_LOW_CLASS_SOURCED" != "true" ]]; then
-          fail c "clean-low verdict marker, but the Low content-shape class could not be read — record-review.sh is not beside this gate (looked at $RECORD_REVIEW_SH), so the diff's shape is UNVERIFIABLE and the clean-low attestation is refused. Ship record-review.sh alongside scripts/check-pipeline-compliance.sh (both are agent-infra files; templates/.github/workflows/pipeline-compliance.yml's WIRING notes cover copying/fetching it), or re-record with the verdict the diff earns."
-        elif pr_is_clean_low_shaped "$FILES"; then
-          pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… (clean-low marker; the PR's diff IS Low-shaped)"
-        else
-          fail c "clean-low verdict marker on a diff that is NOT Low-shaped — clean-low certifies that EVERY changed path is in the Low content-shape class, defined ONCE by record-review.sh::clean_low_path_ok (sourced, not restated), and this PR's diff is not. Re-record at the current head with the verdict the diff actually earns (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact> — its own shape guard refuses clean-low here), and remove the stale \"verdict=clean-low\" marker line from the PR body."
-        fi
-      else
-        pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… (record-review.sh marker)"
-      fi
+      # #3315 — the verdict-tier bindings live in grade_c_record, shared with the
+      # CARRIED arm below so a carry cannot smuggle a tier past them.
+      grade_c_record "$EVID_TEXT" "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}…"
     else
-      # #1825 — the remedy NAMES the producer and the head it must bind to, and
-      # it deliberately does NOT print a token list: the old message advertised
-      # the six accepted phrases, so the fastest path to green was typing one of
-      # them (agent-infra#1904's own failure text). A gate that teaches a lane
-      # how to pass it without doing the work is how (c) trained lanes to route
-      # around the process.
-      fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): a line of exactly the form 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825)."
-      echo "      Missing: the code-review record marker for this PR at this head."
-      echo "      Invoke:  code-review — Step 10 records the verdict (record-review.sh <PR> <head-sha> <verdict> --evidence <artifact>), and the tool appends the marker this check reads. If a record already exists at an OLDER head, re-record at the current one: a record certifies exactly one revision."
+      # ── #3315 · THE CARRY, CONSULTED ────────────────────────────────────
+      # No marker at the current head. Before refusing — which, on a required
+      # status check, used to force an unattested marker at the new head — ask
+      # the ONE owner of carry semantics whether the reviewed diff is still the
+      # diff that would merge. `c_carry_resolve` only ever proposes markers bound
+      # to THIS PR and THIS repo, and asks the producer about each (newest first);
+      # the verdict is the producer's.
+      C_CARRY_RC=0
+      c_carry_resolve "$PR_BODY" "$COMMIT_MSGS" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD" || C_CARRY_RC=$?
+      if [[ "$C_CARRY_RC" -eq 0 ]]; then
+        grade_c_record "$EVID_TEXT" "code-review record CARRIED from ${C_CARRIED_HEAD:0:12}… — diff unchanged (diff_sha256 ${C_CARRIED_DIFF:0:12}…)"
+      elif [[ "$C_CARRY_RC" -eq 1 ]]; then
+        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): a line of exactly the form 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825)."
+        echo "      Missing: the code-review record marker for this PR at this head."
+        echo "      Invoke:  code-review — Step 10 records the verdict (record-review.sh <PR> <head-sha> <verdict> --evidence <artifact>), and the tool appends the marker this check reads. If a record already exists at an OLDER head, re-record NAMING THAT HEAD (record-review.sh <PR> <the head the record carries> <same verdict> $GH_REPO): that is the producer's carry-forward, not a review cycle."
+      elif [[ "$C_CARRY_RC" -eq 2 ]]; then
+        # A record that predates the marker's `diff=<64hex>` field cannot answer
+        # the content-identity question at all, and "an older head" is not
+        # evidence on its own (that is the head-binding rule, not a relaxation
+        # of it). The FIRST line is the canonical one — an older-head marker
+        # without a digest IS "no head-bound record" — and the second names what
+        # was tried, so a lane with a pre-#2982 marker is not left guessing.
+        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): a line of exactly the form 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825)."
+        echo "       Carry check: the record for $GH_REPO#$PR_NUMBER is at an OLDER head (${C_NODIGEST_HEAD:0:12}…) and carries NO diff digest (`diff=<64hex>` predates it), so whether the reviewed diff is unchanged cannot be established."
+        echo "      Missing: the code-review record marker for this PR at this head (or an older-head marker carrying its diff digest)."
+        echo "      Invoke:  re-record NAMING THE EARLIER head the record carries — record-review.sh $PR_NUMBER ${C_NODIGEST_HEAD} <same verdict> $GH_REPO — which is the producer's carry-forward (it re-binds the verified record to ${PR_HEAD:0:12}…), not a review cycle; naming the current head instead is a FRESH mint, which it refuses for a clean verdict without --evidence. Run the code-review skill only if the diff changed."
+      else
+        fail c "the code-review record at ${C_REFUSED_HEAD:0:12}… does NOT cover this revision (head ${PR_HEAD:0:12}…): $C_CARRY_WHY"
+      fi
     fi
 
     # d. PLAN DOC — standard/complex only.
@@ -1546,7 +1851,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for an issue reference that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count, and can auto-close an issue on merge): EITHER a closing keyword (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL), which auto-closes on merge, OR a non-closing traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N), which does not — accepted for ANY diff (#1630), so a PR implementing only PART of an issue need not lie; the artifact-only class ($ARTIFACT_CLASS_DESC) is no longer required for the traceability form — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
-  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER + /commits → the PR body or a commit message must carry a record-review.sh RECORD MARKER bound to THIS PR at its CURRENT head: 'review recorded: reviews/<PR>.json verdict=<v> @ <40-hex head sha> (<owner/repo>)'. No phrase ('code-review', 'reviewer', 'VGATE', …) satisfies it (#1825). Two markers carry a VERDICT and are bound: verdict=clean-micro on a non-micro issue fails, and verdict=clean-low is accepted only when the PR's whole diff is in the Low content-shape class sourced from record-review.sh (#513, #1356)"
+  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER + /commits → the PR body or a commit message must carry a record-review.sh RECORD MARKER bound to THIS PR at its CURRENT head: 'review recorded: reviews/<PR>.json verdict=<v> @ <40-hex head sha> (<owner/repo>)'. No phrase ('code-review', 'reviewer', 'VGATE', …) satisfies it (#1825). #3315 adds ONE arm and it is a carry, not a relaxation: a marker for an EARLIER head of this PR passes as 'CARRIED from <head> — diff unchanged' when record-review.sh --check-carry (the single owner of carry semantics) says its diff_sha256 equals the PR's live diff; a changed diff, an unreadable diff, no record, no digest, a rebase (carry-patch — re-record, do not re-review) and an unrunnable predicate all still FAIL CLOSED. Two markers carry a VERDICT and are bound: verdict=clean-micro on a non-micro issue fails, and verdict=clean-low is accepted only when the PR's whole diff is in the Low content-shape class sourced from record-review.sh (#513, #1356) — both apply to a CARRIED record too"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
   echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
   echo ""
@@ -1906,6 +2211,214 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   rm -f "$P14LOG"
   if [[ "$P11_FAILS" -ne 0 ]]; then
     echo "  ❌ passes 11–14: $P11_FAILS field-binding assertion(s) failed" >&2
+    exit 2
+  fi
+  summarize || true
+
+  # ── #3315: CHECK (c) CONSULTS THE CARRY — the fail-closed contract ────────
+  #
+  # WHAT IS BEING PINNED. Before this change the only way past check (c) on a PR
+  # whose head had moved was a FRESH marker at the new head, minted with no
+  # review behind it — while the tool that owns carry semantics said "the reviewed
+  # DIFF is UNCHANGED … do NOT re-review". Check (c) is the repo's ONLY required
+  # status check, so that disagreement was the whole fleet's blocker. The arms
+  # below pin BOTH halves: the one answer that now PASSES (a carry) and every
+  # answer that must still FAIL — a changed diff, an unreadable diff, no record,
+  # no digest, a rebase, a recorder that crashes or prints prose, an absent
+  # recorder, a marker for another repo — plus the tier bindings on a carried
+  # record.
+  #
+  # HOW. The producer's `--check-carry` contract is stubbed (a verdict line + its
+  # documented exit code) and pointed at through RECORDER, the same seam the
+  # production path resolves. The stub LOGS ITS ARGV, which is what proves the
+  # gate handed the marker's OWN (head, diff_sha256) pair to the predicate
+  # instead of re-deriving anything — that is the "one predicate, not two
+  # readers" property, and a vector that only checked the verdict could not see
+  # it. The stub never touches gh, so these arms are hermetic like every other
+  # FAIL_ALL pass.
+  C3315_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-3315.XXXXXX")"
+  C3315_STUB="$C3315_DIR/recorder-stub.sh"
+  C3315_ARGV="$C3315_DIR/argv.log"
+  cat > "$C3315_STUB" <<'C3315_STUB_EOF'
+#!/usr/bin/env bash
+# The producer's --check-carry CONTRACT, stubbed: `<verdict>\t<record>\t<live>`
+# on stdout plus the documented exit code. It records its argv so a vector can
+# prove WHAT the gate asked.
+printf '%s\n' "$*" >> "${PCC3315_ARGV_LOG:-/dev/null}"
+case "${PCC3315_MODE:-carry}" in
+  carry)       printf 'carry\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
+  head)        printf 'head\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
+  fresh)       printf 'fresh\t%s\t%s\n' "${PCC3315_DIGEST:-}" "bbbbbbbbbbbb"; exit 1 ;;
+  norecord)    printf 'norecord\t-\t-\n'; exit 4 ;;
+  nodigest)    printf 'nodigest\t-\t-\n'; exit 5 ;;
+  unreadable)  printf 'unreadable\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 3 ;;
+  carry-patch) printf 'carry-patch\t%s\t%s\n' "${PCC3315_DIGEST:-}" cccccccccccc; exit 6 ;;
+  # THE PREDICATE'S REAL PREDICATE, MODELLED: `carry` only for the digest it was
+  # minted over, `fresh` for anything else. Without this mode a stub that answers
+  # `carry` unconditionally cannot tell a gate that tried the NEWEST marker from
+  # one that tried an older one — which is exactly the P1 a review of #3315 found
+  # (pass 29).
+  selective)
+    while [ $# -gt 0 ]; do
+      [ "$1" = "--recorded-diff" ] && { [ "$2" = "${PCC3315_CARRY_ONLY:-}" ] && { printf 'carry\t%s\t%s\n' "$2" "$2"; exit 0; }; break; }
+      shift
+    done
+    printf 'fresh\t%s\t%s\n' "${PCC3315_CARRY_ONLY:-}" 'dddddddddddd'; exit 1 ;;
+  # `carry` printed with a NON-ZERO exit: the gate's allow-list is a PAIR, and a
+  # token-only match would pass here (pass 27).
+  carry-badrc) printf 'carry\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 1 ;;
+  head)        printf 'head\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
+  crash)       exit 7 ;;
+  prose)       echo 'the diff is probably fine'; exit 0 ;;
+  usage)       exit 2 ;;
+  *)           exit 0 ;;
+ esac
+C3315_STUB_EOF
+  # rec_marker_d <verdict> <head> <diff64> [<repo>] [<pr>] — the producer's
+  # POST-#2982 marker, which carries the record's own `diff_sha256`. The carry arm
+  # reads that field, so a vector that used the bare `rec_marker` could not
+  # exercise it (that shape is passes 11–14's "an earlier head", and it stays
+  # refused).
+  rec_marker_d() {
+    printf 'review recorded: reviews/%s.json verdict=%s @ %s diff=%s (%s)' \
+      "${5:-$PR_NUMBER}" "$1" "$2" "$3" "${4:-daniel-ospina/agent-infra}"
+  }
+  C3315_PRIOR="$(printf 'b%.0s' {1..40})"
+  C3315_DIGEST="$(printf 'c%.0s' {1..64})"
+  C3315_FAILS=0
+  c3315_case() { # <label> <mode> <marker-commits> <pass|fail> <want-substring> [<recorder>] [<body-extra>] [<carry-only-digest>]
+    local label="$1" mode="$2" marker="$3" want="$4" sub="$5" rec="${6:-$C3315_STUB}" body_extra="${7:-}" carry_only="${8:-$C3315_DIGEST}"
+    local log n why_ok=0 c_ok=0 rec_save="$RECORDER"
+    PR_BODY="Fixes #1"; LABELS="complexity:standard"
+    if [[ -n "$body_extra" ]]; then PR_BODY="$(printf 'Fixes #1\n%s' "$body_extra")"; fi
+    SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
+    COMMIT_MSGS="$marker"
+    FILES=$'added\tdocs/plans/2026-10-17-issue-3315-carry.md\t'
+    FILES_EXPECTED=1
+    FAILURES=0
+    : > "$C3315_ARGV"
+    log="$(mktemp /tmp/pipeline-3315case.XXXXXX)"
+    # `export` is load-bearing: the predicate runs as a CHILD PROCESS, so a shell
+    # variable set here would never reach it and every arm would silently
+    # exercise the default mode.
+    export PCC3315_MODE="$mode" PCC3315_DIGEST="$C3315_DIGEST" PCC3315_ARGV_LOG="$C3315_ARGV" PCC3315_CARRY_ONLY="$carry_only"
+    RECORDER="$rec"
+    run_checks > "$log" 2>&1 || true
+    n="$FAILURES"
+    RECORDER="$rec_save"
+    unset PCC3315_MODE PCC3315_DIGEST PCC3315_ARGV_LOG PCC3315_CARRY_ONLY
+    if grep -qF -- "$sub" "$log"; then why_ok=1; fi
+    if [[ "$want" == "pass" ]]; then
+      if [[ "$n" -eq 0 ]] && grep -q '✅ \[c\] code-review record CARRIED from' "$log" && [[ "$why_ok" -eq 1 ]]; then c_ok=1; fi
+    else
+      if [[ "$n" -eq 1 ]] && grep -q '❌ \[c\]' "$log" && [[ "$why_ok" -eq 1 ]]; then c_ok=1; fi
+    fi
+    if [[ "$c_ok" -eq 1 ]]; then
+      echo "  ✅ $label"
+    else
+      echo "  ❌ $label (failures=$n, wanted '$want' with '$sub')" >&2
+      grep -E '❌ \[c\]|✅ \[c\]|Carry check' "$log" >&2 || true
+      C3315_FAILS=$((C3315_FAILS + 1))
+    fi
+    rm -f "$log"
+  }
+  echo ""
+  echo "== SIMULATION: passes 15–29 (#3315: check (c) consults the carry) =="
+  # 15 — THE CARRY ITSELF. A marker at an EARLIER head carrying that record's
+  # diff, and a predicate that says the live diff is that same digest: PASS, and
+  # the line says what was established (content identity from a prior head) and
+  # what was not (a review at this head).
+  c3315_case "pass 15: an earlier-head marker + 'carry' ⇒ check (c) PASSES as CARRIED" \
+    carry "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" pass 'diff unchanged (diff_sha256 cccccccccccc…)'
+  # …and the gate must have asked about THE MARKER'S OWN pair. A gate that
+  # re-derived a digest itself, or asked about the current head, fails here even
+  # though arm 15 was green.
+  C3315_ASKED="$(cat "$C3315_ARGV" 2>/dev/null || true)"
+  if [[ "$C3315_ASKED" == *"--check-carry 1 daniel-ospina/agent-infra"* \
+     && "$C3315_ASKED" == *"--recorded-diff $C3315_DIGEST"* \
+     && "$C3315_ASKED" == *"--recorded-head $C3315_PRIOR"* ]]; then
+    echo "  ✅ pass 15b: the predicate was asked about the MARKER'S recorded pair (pr, repo, prior head, digest) — no second reader, no re-derivation"
+  else
+    echo "  ❌ pass 15b: the gate did not hand the marker's recorded pair to the predicate (argv: ${C3315_ASKED:-<none>})" >&2
+    C3315_FAILS=$((C3315_FAILS + 1))
+  fi
+  # 16 — THE DIFF CHANGED. The one answer that means "buy a review".
+  c3315_case "pass 16: 'fresh' ⇒ check (c) FAILS, naming the changed diff" \
+    fresh "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'the reviewed DIFF CHANGED'
+  # 17 — A READ FAILURE IS NOT A CHANGED ARTIFACT (the fail-open this design
+  # forbids in the other direction: "could not read" must never be reported as
+  # "changed", and it must never be reported as "unchanged" either).
+  c3315_case "pass 17: 'unreadable' ⇒ check (c) FAILS CLOSED, naming a RETRY" \
+    unreadable "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'could not be READ'
+  # 18/19 — the two shapes where there is no verdict to carry.
+  c3315_case "pass 18: 'norecord' ⇒ check (c) FAILS CLOSED" \
+    norecord "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail "answered 'norecord'"
+  c3315_case "pass 19: 'nodigest' ⇒ check (c) FAILS CLOSED" \
+    nodigest "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'no usable diff digest'
+  # 20 — THE REBASE. `carry-patch` says the reviewed lines are identical but the
+  # rendered diff moved, and the MERGE gate re-mints rather than carrying it. If
+  # check (c) passed here it would be greener than the gate that decides the
+  # merge — the same two-gate disagreement, mirrored. So: REFUSED, with the
+  # re-record remedy named (never "run a review", which would be 20-40 minutes
+  # for a diff nobody changed).
+  c3315_case "pass 20: 'carry-patch' ⇒ check (c) REFUSES, naming RE-RECORD (not a review)" \
+    carry-patch "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'RE-RECORD naming the head the record carries'
+  # 21/22 — AN ANSWER THIS GATE CANNOT CLASSIFY IS A REFUSAL, never a pass:
+  # a recorder that dies, and one that prints human prose with exit 0 (the shape
+  # that made the OLD pre-#1825 check satisfiable by typing).
+  c3315_case "pass 21: a recorder that CRASHES (rc 7, no output) ⇒ FAILS CLOSED" \
+    crash "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'cannot classify as a carry'
+  c3315_case "pass 22: a recorder printing PROSE with exit 0 ⇒ FAILS CLOSED" \
+    prose "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'cannot classify as a carry'
+  # 23 — THE PREDICATE CANNOT BE EXECUTED AT ALL. Same posture as #1356's
+  # producer-absent arm: unverifiable is refused, loudly, not skipped.
+  c3315_case "pass 23: an absent/unreadable recorder ⇒ FAILS CLOSED, naming the tooling fault" \
+    carry "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'could not be EXECUTED' \
+    "$C3315_DIR/no-such-recorder.sh"
+  # 24 — THE MARKER'S IDENTITY IS STILL BOUND ON THE CARRY PATH. A marker for
+  # ANOTHER REPO at an earlier head must not become a candidate at all, so the
+  # predicate is never even consulted (the argv log is empty).
+  c3315_case "pass 24: a marker for ANOTHER repo ⇒ check (c) FAILS, predicate not consulted" \
+    carry "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST" daniel-ospina/tortoise)" fail 'no head-bound code-review record'
+  if [[ -s "$C3315_ARGV" ]]; then
+    echo "  ❌ pass 24b: the predicate WAS consulted about a marker naming another repo ($(cat "$C3315_ARGV")) — the identity binding leaked" >&2
+    C3315_FAILS=$((C3315_FAILS + 1))
+  else
+    echo "  ✅ pass 24b: the predicate was NOT consulted about a marker naming another repo — the PR/repo binding still holds on the carry path"
+  fi
+  # 25 — A CARRY CARRIES ITS VERDICT. The tier bindings must survive the carry
+  # arm, or "carried" becomes a way around them.
+  c3315_case "pass 25: a CARRIED clean-micro marker on a standard issue still FAILS (tier binding survives the carry)" \
+    carry "$(rec_marker_d clean-micro "$C3315_PRIOR" "$C3315_DIGEST")" fail 'clean-micro verdict marker on a NON-micro linked issue'
+  # 26 — and the SPECIFIC head-only marker (no diff=) is still refused: the carry
+  # arm needs a digest to compare, and "it is from an older head" is not evidence.
+  c3315_case "pass 26: an earlier-head marker with NO diff digest ⇒ FAILS CLOSED" \
+    carry "$(rec_marker clean "$C3315_PRIOR")" fail 'carries NO diff digest'
+  # 27 — THE ALLOW-LIST IS A PAIR, NOT A TOKEN. `carry` printed with a non-zero
+  # exit must NOT pass: the exit code is half the verdict (the producer's own
+  # header, and the reason `carry-patch` is exit 6 rather than 0).
+  c3315_case "pass 27: 'carry' with a NON-ZERO exit ⇒ FAILS CLOSED (the allow-list is a pair)" \
+    carry-badrc "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'cannot classify as a carry'
+  # 28 — `head` (the producer's freshly-read live head EQUALS the recorded one)
+  # means this gate's own head read went stale: re-run, do not carry, do not
+  # order a review.
+  c3315_case "pass 28: 'head' ⇒ FAILS CLOSED, telling the lane to RE-RUN the gate" \
+    head "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'bound to the CURRENT head'
+  # 29 — THE NEWEST CANDIDATE WINS, ACROSS BOTH EVIDENCE LOCATIONS (review of
+  # #3315, P1). `EVID_TEXT` is the PR body followed by the commit messages, so a
+  # single-candidate reader that took the LAST match in text order picked the
+  # COMMIT-MESSAGE marker and shadowed the newer BODY one — a false block on a PR
+  # whose reviewed content was byte-identical. Here the body marker carries the
+  # live digest and a commit-message marker carries an older one; the predicate
+  # (mode `selective`) only carries the live digest, so a gate that asked only the
+  # commit marker would answer `fresh` and fail.
+  c3315_case "pass 29: the PR BODY marker is preferred to an OLDER commit-message marker ⇒ CARRIED" \
+    selective "$(rec_marker_d clean "$(printf 'f%.0s' {1..40})" "$(printf 'd%.0s' {1..64})")" pass 'diff unchanged (diff_sha256 cccccccccccc…)' \
+    "$C3315_STUB" "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")"
+  unset PCC3315_CARRY_ONLY
+  rm -rf "$C3315_DIR"
+  if [[ "$C3315_FAILS" -ne 0 ]]; then
+    echo "  ❌ passes 15–29: $C3315_FAILS carry-arm assertion(s) failed (#3315)" >&2
     exit 2
   fi
   summarize || true
@@ -3543,6 +4056,88 @@ $big_filler"
   fi
   unset reval_sh pipeline_repo_root pipeline_wf pipeline_is_self 2>/dev/null || true
 
+  # ── #3315 — CHECK (c) CONSULTS THE CARRY: run the FAIL_ALL arms for real ───
+  # The vectors themselves live in the FAIL_ALL block (passes 15–26), the same
+  # way #1356's clean-low vectors do — and for the same reason (#991): CI runs
+  # SELF_TEST and never FAIL_ALL, so a vector that only lives there is executed by
+  # nothing and pins nothing. This subprocess run is what puts them in front of
+  # every PR.
+  # ⛔ IT ASSERTS BOTH DIRECTIONS. A suite that only checked "the carry passes"
+  # would go green on a gate that passed EVERYTHING, which is the fail-open this
+  # change is not allowed to introduce; the fail-closed arms are named here by
+  # their own lines so a regression in any of them is RED here.
+  # SELF_TEST is forced to 0 in the child (else the child re-enters this block),
+  # and the failing vectors are expected: FAIL_ALL exits 1 by design, so only its
+  # per-vector verdict lines are authoritative.
+  C3315_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-3315-selftest.XXXXXX")"
+  C3315_RC=0
+  PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+    PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+    GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$SELF_SRC" >"$C3315_LOG" 2>&1 || C3315_RC=$?
+  C3315_MISS=0
+  for C3315_WANT in \
+    'pass 15: an earlier-head marker' \
+    'pass 15b: the predicate was asked about the MARKER' \
+    "pass 16: 'fresh'" \
+    "pass 17: 'unreadable'" \
+    "pass 18: 'norecord'" \
+    "pass 19: 'nodigest'" \
+    "pass 20: 'carry-patch'" \
+    'pass 21: a recorder that CRASHES' \
+    'pass 22: a recorder printing PROSE' \
+    'pass 23: an absent/unreadable recorder' \
+    'pass 24: a marker for ANOTHER repo' \
+    'pass 24b: the predicate was NOT consulted' \
+    'pass 25: a CARRIED clean-micro marker' \
+    'pass 26: an earlier-head marker with NO diff digest' \
+    "pass 27: 'carry' with a NON-ZERO exit" \
+    "pass 28: 'head'" \
+    'pass 29: the PR BODY marker is preferred' ; do
+    grep -qF -- "  ✅ $C3315_WANT" "$C3315_LOG" || { C3315_MISS=$((C3315_MISS + 1)); printf '   missing: ✅ %s\n' "$C3315_WANT" >&2; }
+  done
+  if [[ "$C3315_MISS" -eq 0 ]]; then
+    printf '✅ #3315: all 17 carry-arm vectors ran green — the carry PASSES (newest evidence first, body before commit messages), and a changed diff / unreadable diff / no record / no digest / rebase / crashing or prose-printing predicate / absent recorder / foreign-repo marker / carried clean-micro marker / carry-with-a-non-zero-exit / head-answer each FAIL CLOSED\n'
+  else
+    printf '❌ #3315: %s carry-arm vector(s) missing or red (FAIL_ALL rc=%s) — check (c)'"'"'s carry contract is unpinned\n' "$C3315_MISS" "$C3315_RC" >&2
+    grep -E 'pass 1[5-9]|pass 2[0-9]|❌ \[c\]' "$C3315_LOG" >&2 || true
+    selffail=$((selffail + 1))
+  fi
+  rm -f "$C3315_LOG"
+
+  # ── #3315 — THE STUB↔PRODUCER CONTRACT IS PINNED, NOT ASSUMED ──────────────
+  # The FAIL_ALL arms drive a STUB that models `--check-carry`'s (token, exit)
+  # pairs, and the gate classifies those pairs. Nothing above connects them to the
+  # REAL producer: if record-review.sh renamed a token or renumbered an exit, every
+  # arm would stay green while production failed closed on every earlier-head PR
+  # forever. The producer's own header is the documented contract its callers read
+  # ("verdict, and exit code" — the block c_carry_ask mirrors), so hold the two
+  # equal: for every pair the gate classifies, the producer must still DOCUMENT
+  # that token at that exit code, and must still PRINT the token.
+  if [[ ! -f "$RECORD_REVIEW_SH" ]]; then
+    printf '⏭️  #3315 contract pin SKIPPED — record-review.sh is not beside this gate (%s), so there is nothing to compare the stub against.\n' "$RECORD_REVIEW_SH"
+  else
+    C3315_CONTRACT_BAD=0
+    for C3315_PAIR in "carry:0" "head:0" "carry-patch:6" "fresh:1" "unreadable:3" "norecord:4" "nodigest:5"; do
+      C3315_TOK="${C3315_PAIR%%:*}"; C3315_CODE="${C3315_PAIR#*:}"
+      # (1) the header still documents `<token> <spaces> <exit> <description>`
+      if ! grep -qE "^#     ${C3315_TOK}[[:space:]]+${C3315_CODE}[[:space:]]" "$RECORD_REVIEW_SH"; then
+        printf '❌ #3315 contract: %s no longer documents `%s` at exit %s — the gate classifies that pair, so the two definitions have drifted\n' "${RECORD_REVIEW_SH##*/}" "$C3315_TOK" "$C3315_CODE" >&2
+        C3315_CONTRACT_BAD=$((C3315_CONTRACT_BAD + 1))
+      fi
+      # (2) the producer still PRINTS the token on its documented line
+      if ! grep -qF "printf '${C3315_TOK}\t" "$RECORD_REVIEW_SH"; then
+        printf '❌ #3315 contract: %s no longer prints `%s<TAB>…` — the gate parses that line, so a renamed token would leave every arm green and production red\n' "${RECORD_REVIEW_SH##*/}" "$C3315_TOK" >&2
+        C3315_CONTRACT_BAD=$((C3315_CONTRACT_BAD + 1))
+      fi
+    done
+    if [[ "$C3315_CONTRACT_BAD" -eq 0 ]]; then
+      printf '✅ #3315 contract: the real producer still DOCUMENTS and PRINTS all seven verdict/exit pairs the gate classifies (carry:0 head:0 carry-patch:6 fresh:1 unreadable:3 norecord:4 nodigest:5) — the FAIL_ALL stub cannot drift from it silently\n'
+    else
+      selffail=$((selffail + 1))
+    fi
+    unset C3315_CONTRACT_BAD C3315_PAIR C3315_TOK C3315_CODE
+  fi
+
   # Run the exit check AFTER the #1611 guards, so a failure there is reported
   # on the same run instead of masking them (this is how the unbound-variable
   # regression above stayed hidden on the first attempt).
@@ -3551,7 +4146,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and the marker-probe seam that the revalidation script DELEGATES its parse to is pinned by its own vectors, with a PR-lane wiring assertion that the revalidation suite is actually executed (#2467)."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and check (c)'s ONE carry arm delegates the content-identity verdict to the producer and is pinned in BOTH directions — a carried record PASSES (naming the prior head and the digest, with the predicate asked about the marker's OWN pair) while a changed diff, an unreadable diff, no record, no digest, a rebase, a crashing or prose-printing or absent predicate, a foreign-repo marker and a carried clean-micro marker each FAIL CLOSED, and the stub's verdict/exit pairs are held to the real producer's own documented contract (#3315); and the marker-probe seam that the revalidation script DELEGATES its parse to is pinned by its own vectors, with a PR-lane wiring assertion that the revalidation suite is actually executed (#2467)."
   exit 0
 fi
 
