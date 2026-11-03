@@ -6536,6 +6536,17 @@ print_bounds() {
   # input and the suite red. The value is a CEILING on the interval, which is what
   # the rest of this table calls one.
   printf 'first-checks-poll-ceiling=%s\n' "$FIRST_CHECKS_POLL_MAX"
+  # ⛔ THE APPLIED CEILING AS WELL AS THE DECLARED ONE. `wait_for_first_checks` floors the ceiling
+  # UP to the base interval, so a POLL_MAX below FIRST_CHECKS_POLL prints a bound the rail does not
+  # apply (measured: POLL_MAX=30 with POLL=60). Printing both means this table can never state a
+  # ceiling the code does not enforce; the DECLARED line above is kept so an operator can see what
+  # they passed.
+  local applied_ceiling="$FIRST_CHECKS_POLL_MAX"
+  if counter_is_positive "$FIRST_CHECKS_POLL" && counter_is_positive "$FIRST_CHECKS_POLL_MAX" \
+     && [ "$((10#$FIRST_CHECKS_POLL_MAX))" -lt "$((10#$FIRST_CHECKS_POLL))" ]; then
+    applied_ceiling="$FIRST_CHECKS_POLL"
+  fi
+  printf 'first-checks-poll-ceiling-applied=%s\n' "$applied_ceiling"
   printf 'first-checks-source=STALL = 2 × the longest MEASURED single step (4380s, "Bash shards"); CEILING = 2 × the slowest MEASURED green run (9032s); STALL is promoted at runtime to 2 × the longest COMPLETED step on the runs being waited on; WINDOW bounds only the states with no progress to observe (no run yet, or an unreadable surface).\n'
 }
 

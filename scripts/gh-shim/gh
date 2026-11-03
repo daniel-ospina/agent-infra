@@ -233,10 +233,15 @@
 #   AGENT_GH_GATE_MAX_ATTEMPTS     total attempts incl. the first, on a rate-limit refusal (default 3)
 #   AGENT_GH_GATE_RETRY_BASE       seconds to wait when stderr carries no `retry-after` (default 60, floor 1)
 #   AGENT_GH_GATE_RETRY_MAX        ceiling on any single wait, in seconds (default 900)
-#   AGENT_GH_GATE_BUDGET_S         the most this call may SLEEP in-shim, ALL waits combined
+#   AGENT_GH_GATE_BUDGET_S         the most this call may SLEEP in-shim across the WAITS THIS
+#                                  BUDGET GOVERNS — the pre-call shared-window wait, the
+#                                  rate-limit retry wait and the transport backoff — combined
 #                                  (default 120). A shared window, or a refusal whose wait, does not fit
 #                                  in what is left: the call is not slept and not retried — it returns
 #                                  EX_TEMPFAIL (75) before asking, or the refusal itself after asking.
+#   ⛔ IT IS NOT THE CALL'S WHOLE IN-SHIM CEILING, AND SAYING SO WOULD BE FALSE: the ADMISSION
+#      wait (AGENT_GH_GATE_ACQUIRE_TIMEOUT, default 300 s) is taken BEFORE any budget check and is
+#      charged to nothing, so a call's worst case is admission + budget (~420 s at the defaults).
 #   AGENT_GH_GATE_DEBUG_HEADERS=0  do not ask the child for the refusing response's headers
 #                                  (`GH_DEBUG=api`, see THE REFUSAL'S OWN EVIDENCE). OFF loses the
 #                                  derivation exactly in the case #3230 measured: the window falls back
@@ -1440,10 +1445,15 @@ gate_init() {
   MAX_ATTEMPTS="$(num_or "${AGENT_GH_GATE_MAX_ATTEMPTS:-}" 3)"
   RETRY_BASE_S="$(num_or "${AGENT_GH_GATE_RETRY_BASE:-}" 60)"
   RETRY_MAX_S="$(num_or "${AGENT_GH_GATE_RETRY_MAX:-}" 900)"
-  # ⛔ ONE BUDGET FOR THIS CALL (#3230, Target 1). Every sleep this layer takes — waiting out a
-  # shared window before the call, and waiting between attempts — is spent from this, so a wait can
-  # never outlive it. Default 120 s: the figure #3230 names, and comfortably above the 60 s the docs
-  # call for when no header is present, so the documented wait still happens by default.
+  # ⛔ ONE BUDGET FOR THIS CALL (#3230, Target 1). Every sleep this layer takes in the WAITS THIS
+  # BUDGET GOVERNS — waiting out a shared window before the call, and waiting between attempts — is
+  # spent from this, so none of them can outlive it. Default 120 s: the figure #3230 names, and
+  # comfortably above the 60 s the docs call for when no header is present, so the documented wait
+  # still happens by default.
+  # ⛔ THE ADMISSION WAIT IS OUTSIDE IT (bounded by AGENT_GH_GATE_ACQUIRE_TIMEOUT, default 300 s).
+  # Stated here because the older wording claimed ALL waits combined, which the code below does not
+  # do: `admit_slot` runs before any budget check. A batch review flagged the gap; closing it is a
+  # behaviour change to the admission path, so it is named as a residual instead of claimed away.
   BUDGET_MS=$(( $(num_or "${AGENT_GH_GATE_BUDGET_S:-}" 120) * 1000 ))
   # Whether the child is asked for the refusing response's own headers (GH_DEBUG=api). ON by
   # default: OFF is the failure this whole block exists to remove — a fix that is inert at its own
