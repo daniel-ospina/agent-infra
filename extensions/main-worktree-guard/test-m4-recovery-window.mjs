@@ -151,6 +151,20 @@ check("C21 mid-path `..` stays blocked",
 check("C22 `a/../b` stays blocked",
   verdict("git checkout -- a/../b.txt", { escapeActive: true, hubContext: DIRTY }), "block");
 
+// C26 — round 12 (P1 MEASURED, whole-tree wipe): the SHELL expands `.{,}` to
+// `[".","."]` BEFORE git sees it, so the operand the test judges is not the one
+// that runs. `git checkout -- .{,}` reset every tracked file under a hatch;
+// origin/main blocks it with and without one.
+for (const [name, cmd] of [
+  [".{,}", "git checkout -- .{,}"],
+  ["{.,.}", "git checkout -- {.,.}"],
+  ["{,}.", "git checkout -- {,}."],
+  ["./{,}", "git checkout -- ./{,}"],
+  ["restore .{,}", "git restore .{,}"],
+]) {
+  check(`C26 brace-expansion spelling ${name} stays blocked`,
+    verdict(cmd, { escapeActive: true, hubContext: DIRTY }), "block");
+}
 // C23–C25 — round 11 (P1 MEASURED, whole-tree wipe): every DOTTED spelling
 // normalizes to `.` and was `recovery` under a hatch — `git checkout -- ./.` reset
 // every tracked file, i.e. every sibling session's uncommitted work.
@@ -224,13 +238,13 @@ check("E5g dirty block names the WORKTREE recovery",
 // SAME text. The write/edit helper used to carry its own (incomplete) list, so
 // two surfaces gave different advice for the same state; only the classifier's
 // covered all three dirt shapes.
-const shared = hubDirtyRecoveryLines(DIRTY);
+const shared = typeof hubDirtyRecoveryLines === "function" ? hubDirtyRecoveryLines(DIRTY) : [];
 check("E5h shared helper returns the three-shape text", shared.length > 0 && shared.some((l) => /--staged --worktree/.test(l)), true);
 // E5i — round 10 (P2): assert the ROUTES actually USE it. E5h used to compare the
 // helper against the classifier's own reason, which is circular: a write/edit or
 // bash-write route that stopped using the helper was invisible (round 10 mutated
 // both and the suite stayed 83/0).
-const writeEditMsg = hubDirtyRecoveryLines({ disorder: "dirty" }, true).join("\n");
+const writeEditMsg = (typeof hubDirtyRecoveryLines === "function" ? hubDirtyRecoveryLines({ disorder: "dirty" }, true) : []).join("\n");
 check("E5i hatch-active text stops re-prescribing the hatch", /Your hatch IS active/.test(writeEditMsg) && !/need an active escape hatch/.test(writeEditMsg), true);
 // The branch route survives where it is TRUE (off-main, clean-ish tree).
 const offMainMsg = reason("git commit -am x", { hubContext: OFFMAIN });
@@ -475,6 +489,16 @@ async function partB() {
     // not blocked at all (measured), so the target-state advice cannot be
     // exercised without a second gate's fixture. Declared, not skipped: the
     // helper is a message-only change and the arm's block itself is unchanged.
+    // B6b2 — round 12 (P1): brace expansion is invisible to Part A (the WINDOW is
+    // what stands between the arm and M5's fail-closed home), so it is driven here.
+    for (const [name, cmd] of [
+      [".{,}", "git checkout -- .{,}"],
+      ["restore .{,}", "git restore .{,}"],
+      ["restore --staged .{,}", "git restore --staged .{,}"],
+    ]) {
+      const r = await drive(cmd);
+      check(`B6b2 marker ⇒ brace-expansion ${name} still BLOCKED`, r !== null, true);
+    }
     // B6w — round 10 (P1 MEASURED, data loss): a WRAPPER carrying the target
     // selection (`env -C<dir>`, the ATTACHED form; BSD accepts it, GNU env
     // -C/--chdir on the Linux cells) slipped both layers, because the parser sees

@@ -4713,7 +4713,15 @@ function _isNamedPathOperand(x) {
   if (p === "." || p === "..") return false;
   if (p.startsWith("/") || p.startsWith("~") || p.startsWith(":")) return false;
   if (p.split("/").includes("..")) return false;
-  if (/[*?[]/.test(p)) return false; // glob pathspec — discards whatever it matches
+  // `{}` is the remaining shell-expansion construct (round 12, P1 MEASURED): the
+  // SHELL expands `. {,}` -> `[".","."]` BEFORE git sees it, so the operand the
+  // test judged is not the operand that runs — `git checkout -- .{,}` reset EVERY
+  // tracked file under a hatch (blocked with and without a hatch on origin/main,
+  // so this arm introduced it). A brace has no legitimate place in a named
+  // recovery path; refusing it falls back to M5's pre-existing fail-closed
+  // "pathspec not statically resolvable", which is what a genuinely brace-named
+  // file already gets on main — no new dead end.
+  if (/[*?[\]{}]/.test(p)) return false; // glob/brace pathspec — matches what it expands to
   // Round 11 (P1, MEASURED — whole-tree wipe): stripping only TRAILING slashes let
   // every dotted spelling of the whole tree through, because they normalize to
   // `.`: `git checkout -- ./.` / `././` / `.//.` / `git restore ./.` were all
@@ -5713,8 +5721,8 @@ let _dirtyHatchActive = false;
 function _dirtyRecoveryBody() {
   return [
     `   → Recover the DIRT — a branch switch cannot (git refuses to switch over`,
-    `     modified paths). Which command depends on WHICH dirt; \`git status`,
-    `     --porcelain\` tells you (column 1 = index, column 2 = worktree):`,
+    `     modified paths). Which command depends on WHICH dirt; \`git status --porcelain\``,
+    `     tells you (column 1 = index, column 2 = worktree):`,
     `       staged/index change  \`M \`  -> \`git restore --staged --worktree <path>\``,
     `                                     (one command: unstage AND restore — a bare`,
     `                                      \`--staged\` leaves the file MODIFIED, so the`,
