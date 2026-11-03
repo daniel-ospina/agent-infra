@@ -224,6 +224,31 @@ else
   bad "5c mkfifo is unavailable, so the blocking-fixture arm could not run"
 fi
 
+# ── 5d. THE NO-perl/no-timeout FALLBACK MUST STILL RESOLVE (review round 5, P2, measured) ──────
+# The shell fallback backgrounds the probe, and bash gives an async list /dev/null as stdin — so a probe
+# whose PROGRAM arrives on stdin is handed an empty program: it exits 0 printing nothing, the gate reads
+# that as "cannot resolve" and goes INERT, silently, on exactly the hosts the fallback exists for. Both
+# call sites therefore pass the program as an argument (`-c "$VAR"`). This arm drives the fallback by
+# hiding perl and timeout from PATH, and requires the SAME answer the normal path gives.
+HX="$(mkhome fallback "$DEEPSEEK_JSON")"
+FB_BIN="$T/fb-bin"; mkdir -p "$FB_BIN"
+for _t in bash env sh python3 sed grep cat mktemp sleep kill date id awk dirname; do
+  _p="$(command -v "$_t" 2>/dev/null)" && ln -sf "$_p" "$FB_BIN/$_t" 2>/dev/null
+done
+[ -x "$FB_BIN/python3" ] || bad "5d the fixture could not link python3 — the fallback arm would measure nothing"
+OUT="$(env -i PATH="$FB_BIN" HOME="$HX" bash -c 'command -v perl >/dev/null 2>&1 && echo PERL-VISIBLE; command -v timeout >/dev/null 2>&1 && echo TIMEOUT-VISIBLE; . "$1"; out=$(key_gate_assert t "$2"); rc=$?; printf "RC=%s\n%s\n" "$rc" "$out"' _ "$KG" "$HX" 2>&1)"
+hasnt "$OUT" "PERL-VISIBLE" "5d the fixture really hides perl (else the fallback is not the code under test)"
+hasnt "$OUT" "TIMEOUT-VISIBLE" "5e …and timeout"
+has "$OUT" "var=KG_CANARY_KEY" "5f the shell fallback resolves the SAME variable — the program did not arrive via /dev/null"
+has "$OUT" "RC=82" "5g …and refuses with the gate's own status (an inert gate would return 0 with check=skipped)"
+
+# ⛔ AND NOTHING IN FRONT OF THE BOUND MAY BLOCK ON THE PATH (review round 5, P2, measured): `[ -r "$file" ]`
+# is access(2)/stat(2) on the same file, so on a hung automount it waits BEFORE the bound is armed — the
+# round-4 P1 surviving in the other half of the same function. There is deliberately no readability
+# pre-test; the read that can block is the `open`, inside key_gate_bounded.
+_PRE_STAT="$(grep -cE '^[[:space:]]*\[ -r "\$(mj|aj)" \]' "$KG")"
+eqv "${_PRE_STAT:-1}" "0" "5h neither probe gates on a stat(2) readability test before the bound (a hung mount would block before the time bound is armed)"
+
 # ── 6. THE `--probe` ENTRY POINT (an operator can ask without running a lane) ───────────────────
 OUT="$(env -i PATH=/usr/bin:/bin HOME="$H" bash "$KG" --probe operator "$H" 2>&1)"; rc=$?
 ck "6a --probe refuses with the gate's own status (rc=$rc)" "$([ "$rc" = "82" ] && echo 0 || echo 1)"

@@ -73,13 +73,18 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 #
 # THE CONTRACT — one physical line, PER RUN, last in `$O/logs/lane-<N>.log`:
 #     outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
-# ⛔ PER RUN, AND THE READ MUST BE RUN-SCOPED (review round 4, P2, measured). The lane log is APPEND-ONLY
-# (`tee -a` / `>>`, nothing truncates it), so a re-dispatched issue leaves the PREVIOUS attempt's terminal
-# line in the same file — and `grep '^outcome=' | tail -1` then answers "this lane has ended" with the
-# EARLIER run's verdict while the current one is still working. That is the stale-flag class, in the very
-# artifact shipped to answer "did this lane run". So the line is also written to a PER-RUN sibling that the
-# next dispatch REMOVES before it starts: its ABSENCE means "no verdict for the current run" (still
-# working, or never started), never a previous verdict.
+# ⛔ PER RUN, AND THE READ MUST BE RUN-SCOPED (review round 4/5, P2, measured). The lane log is
+# APPEND-ONLY (`tee -a` / `>>`, nothing truncates it), so a re-dispatched issue leaves the PREVIOUS
+# attempt's terminal line in the same file — and `grep '^outcome=' | tail -1` then answers "this lane has
+# ended" with the EARLIER run's verdict while the current one is still working. That is the stale-flag
+# class, in the very artifact shipped to answer "did this lane run". So the line is also written to a
+# PER-RUN sibling that the next dispatch REMOVES before it starts: its ABSENCE means "no verdict for the
+# current run" (still working, or never started), never a previous verdict.
+# ⛔ REMOVING IS NOT ENOUGH ON ITS OWN (review round 5, P2): a previous run of the same issue can still be
+# ALIVE (the stuck-lane shape this issue is about) and would overwrite the file with ITS verdict when its
+# own trap fires. So each dispatch also stamps an OWNER token, and the trap writes the per-run file only
+# while the token still names this process: the older run's line goes to the append-only log (its
+# transcript) and cannot be mistaken for the current run's verdict.
 #   the verdict of the current run:  cat "$O/logs/lane-<N>.outcome"      (absent = no verdict yet)
 #   which lane logs never said anything, any run:  grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log
 #   ⛔ `lane-[0-9]*` IS NOT COSMETIC (review round 2, P2, measured): `lane-*.log` ALSO matches
@@ -91,7 +96,9 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # including the `78`s that refuse a half-synced `$O` before a single gate runs — those are exactly the
 # lanes that vanished with nothing said. The exits ABOVE this point are argument validation (78/64),
 # where no lane log exists yet and there is nothing to append to.
+LANE_RUN_TOKEN="${N:-0}.$$.$(date +%s 2>/dev/null || printf 0)"
 rm -f "$O/logs/lane-$N.outcome" 2>/dev/null || true
+printf '%s\n' "$LANE_RUN_TOKEN" > "$O/logs/lane-$N.owner" 2>/dev/null || true
 LANE_OUTCOME=""; LANE_OUTCOME_REASON=""; LANE_TERMINAL_DONE=0; LANE_LAST_STATUS=0
 lane_outcome() { # <done|refused|failed|died> <reason-token>  — FIRST writer wins
   [ -n "${LANE_OUTCOME:-}" ] && return 0
@@ -119,9 +126,15 @@ lane_terminal_line() {
   r="$(printf '%s' "$r" | tr '\n\r\t' '   ')"
   line="outcome=$o reason=$r lane=$N rc=${LANE_LAST_STATUS:-?} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
   printf '%s\n' "$line" | tee -a "$O/logs/lane-$N.log" 2>/dev/null || printf '%s\n' "$line"
-  # The per-run verdict (see the contract above): overwritten here, removed at the next dispatch, so its
-  # ABSENCE — not a stale line — is what "no verdict yet" looks like.
-  printf '%s\n' "$line" > "$O/logs/lane-$N.outcome" 2>/dev/null || true
+  # The per-run verdict (see the contract above): overwritten here, removed AND re-owned at the next
+  # dispatch, so an ABSENCE — not a stale line, and not an older live run's line — is what "no verdict yet"
+  # looks like. The owner check is what stops a still-running previous attempt from claiming this run's
+  # file when its own trap finally fires.
+  if [ "$(cat "$O/logs/lane-$N.owner" 2>/dev/null)" = "${LANE_RUN_TOKEN:-}" ]; then
+    printf '%s\n' "$line" > "$O/logs/lane-$N.outcome" 2>/dev/null || true
+  else
+    echo "[lane $N] (outcome not written to logs/lane-$N.outcome: another dispatch of #$N now owns it — this line is the transcript, that file is the CURRENT run's verdict)" >> "$O/logs/lane-$N.log" 2>/dev/null || true
+  fi
   return 0
 }
 # The EXIT trap dispatches, so ONE trap site covers both halves as they become available: the cleanup
