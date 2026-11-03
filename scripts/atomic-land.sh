@@ -898,7 +898,7 @@ sync_review_registry() {
   # rail ~85 times and must stay hermetic — without the seam it made two real round trips to
   # github.com per invocation, pulled the fleet's LIVE records into each scenario's fixture HOME,
   # and on a box with blackholed egress would have blown the suite's own 30s watchdog per scenario.
-  local sync="${ATOMIC_LAND_REGISTRY_SYNC:-$SELF_DIR/registry-sync.sh}" out="" rc=0
+  local sync="${ATOMIC_LAND_REGISTRY_SYNC:-$SELF_DIR/registry-sync.sh}" out="" rc=0 logf="" streamed=0
   case "$sync" in
     off|none|0)
       log_line "atomic-land: review-record registry union SKIPPED by request (ATOMIC_LAND_REGISTRY_SYNC=$sync)"
@@ -916,28 +916,46 @@ sync_review_registry() {
   # ⛔ THE RUN MUST NOT BE SILENT (agent-infra#3180), AND THE EXIT MUST BE THE SYNC'S.
   # `out="$(…)"` swallowed every byte the sync wrote until it finished: on a loaded box a run that
   # spent 26 minutes in the per-record loop showed a 0-byte log, and an operator could not tell
-  # "syncing" from "hung". `tee /dev/stderr` inside the substitution shows it LIVE while `out` keeps
-  # exactly what it held before (both streams, as `2>&1` already folded them in).
-  # ⛔ AND THE EXIT IS TAKEN INSIDE THE SUBSTITUTION: `${PIPESTATUS[0]}` read AFTER the assignment
-  # names the ASSIGNMENT's status, not the pipeline's (measured: a sync exiting 4 was reported rc=0,
-  # i.e. CONVERGED — a false PASS on the one signal that says the fleet's records are UNKNOWN).
-  out="$( bash "$sync" union 2>&1 | tee /dev/stderr; exit "${PIPESTATUS[0]}" )" || rc=$?
+  # "syncing" from "hung". So the run's output is TEED, live, to stderr.
+  # ⛔ AND IT IS `tee FILE >&2`, NOT `tee /dev/stderr`. The latter REOPENS the path, which fails
+  # when fd 2 is a socket — `tee: /dev/stderr: No such device or address`, exit 1 — i.e. exactly in
+  # the harness that runs this rail, where the silence this change removes was measured (reproduced:
+  # a socketpair as fd 2 gives rc 1 and the consumer receives nothing). `>&2` DUPES the fd that is
+  # already open, so it works for a tty, a pipe and a socket alike.
+  # ⛔ AND THE EXIT IS THE SYNC'S, TAKEN FROM THE PIPELINE. `${PIPESTATUS[0]}` read AFTER an
+  # assignment names the ASSIGNMENT's status, and `pipefail` alone names the RIGHTMOST failure — so a
+  # `tee` that failed while the sync exited 4 (records this box could NOT use) would be reported as
+  # 1, the "registry is UNKNOWN" arm, instead of 4.
+  logf="$(mktemp "${TMPDIR:-/tmp}/atomic-land-registry.XXXXXX" 2>/dev/null)" || logf=""
+  if [ -n "$logf" ]; then
+    bash "$sync" union 2>&1 | tee "$logf" >&2
+    rc="${PIPESTATUS[0]}"; streamed=1
+    out="$(command cat "$logf")"
+    command rm -f "$logf"
+  else
+    # No scratch file: correctness first — the exit is still the sync's and the output is complete.
+    # Only the LIVE view is lost, which is the one thing the scratch file exists to provide.
+    out="$( bash "$sync" union 2>&1; exit "$?" )" || rc=$?
+  fi
+  # ⛔ An arm must not RE-PRINT what was already streamed: that printed every line twice (once live,
+  # once from the arm) on the arms whose text says the divergence is "(above)". When the live path
+  # was unavailable the blob is the only copy, so it is emitted there.
   case "$rc" in
     0) log_line "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
        # A converged run can still carry per-record notices, and this arm used to drop every one of
        # them: a store holding a record this box could not use printed `ok … synced` with the warning
        # discarded, which is the SILENCE the #2349 ruling forbids. Say what the run flagged.
-       printf '%s\n' "$out" | grep -E '⚠️|DIVERGES' | sed 's/^/   /' >&2 || true ;;
-    3) printf '%s\n' "$out" >&2
+       [ "$streamed" -eq 1 ] || printf '%s\n' "$out" | grep -E '⚠️|DIVERGES' | sed 's/^/   /' >&2 || true ;;
+    3) [ "$streamed" -eq 1 ] || printf '%s\n' "$out" >&2
        err "atomic-land: ⚠️ the review-record registry DIVERGES between boxes at the same reviewed_at (above)."
        err "   Neither side was overwritten (#2374 rule 4). Any record this box holds locally is still used below." ;;
-    4) printf '%s\n' "$out" | sed 's/^/   /' >&2
+    4) [ "$streamed" -eq 1 ] || printf '%s\n' "$out" | sed 's/^/   /' >&2
        err "atomic-land: ⚠️ the fleet's registry holds records this box could NOT use (unreadable ref or stamp,"
        err "   or a mis-keyed record) — skipped, nothing overwritten, but that is NOT a converged state."
        err "   A record already present locally is still used below." ;;
     *) err "atomic-land: ⚠️ could not sync the cross-box review-record registry — the fleet's records are"
        err "   UNKNOWN on this box, not empty. A record already present locally is still used below."
-       printf '%s\n' "$out" | sed 's/^/   /' >&2 ;;
+       [ "$streamed" -eq 1 ] || printf '%s\n' "$out" | sed 's/^/   /' >&2 ;;
   esac
   return 0
 }

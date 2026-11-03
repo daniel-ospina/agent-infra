@@ -997,6 +997,11 @@ if [ -f "$SCEN/stub-fail" ]; then
   echo "registry-sync.sh: cannot READ the 'origin' registry from '/x' — it is UNKNOWN, not empty. Not syncing." >&2
   exit 1
 fi
+if [ -f "$SCEN/stub-exit4" ]; then
+  echo "registry-sync.sh: 1 record(s) were SKIPPED because they could not be read or ordered" >&2
+  echo "unreadable=1 failed=0"
+  exit 4
+fi
 if [ -f "$SCEN/stub-record.json" ]; then
   mkdir -p "$HOME/.pi/agent/reviews" && cp "$SCEN/stub-record.json" "$HOME/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
 fi
@@ -1035,6 +1040,36 @@ rc=$?
 called "admin-merge 42" && pass "3b: …and the land step still ran" || fail "3b: the land step did not run"
 grep -q 'UNKNOWN, not empty' "$SCEN/err" && pass "3b: the failure is NAMED on stderr (never silent)" \
   || fail "3b: a failed union was silent — the #2349 silence this must not reintroduce"
+# (b2) THE SYNC'S OWN EXIT SURVIVES A FAILING `tee` (agent-infra#3249 review, P2).
+# `set -o pipefail` names the RIGHTMOST failure, so a `tee` that exits 1 while the sync exits 4
+# (records this box could NOT use) reports the "registry is UNKNOWN" arm — the wrong diagnosis, and
+# the wrong action ("the store is unreachable" vs "the store holds records you cannot read"). The
+# explicit `${PIPESTATUS[0]}` is the only thing that keeps the sync's status, and this arm is the
+# only one able to tell the two apart: with it removed the rail falls into `*`.
+new_scen registrysync-tee-fail
+STUB="$SCEN/registry-sync-stub.sh"
+write_sync_stub "$STUB"
+touch "$SCEN/stub-exit4"
+TEE_SHIM="$SCEN/shim"; mkdir -p "$TEE_SHIM"
+cat > "$TEE_SHIM/tee" <<EOS
+#!/bin/sh
+: > "$SCEN/tee-was-used"
+command cat >/dev/null
+exit 1
+EOS
+chmod +x "$TEE_SHIM/tee"
+SCEN_REGISTRY_SYNC="$STUB"
+( export PATH="$TEE_SHIM:$PATH"; run_rail 42 --repo "$REPO" --poll 0 )
+rc=$?
+if [ -f "$SCEN/tee-was-used" ]; then pass "3b: (premise) the failing tee shim WAS used by the rail"; else fail "3b: (premise) the tee shim was never used — the arm below cannot discriminate"; fi
+[ "$rc" -eq 0 ] && pass "3b: a failing tee still does not block the landing" \
+  || fail "3b: a failing tee blocked the landing (rc $rc, $(tail -1 "$SCEN/err"))"
+grep -q 'records this box could NOT use' "$SCEN/err" \
+  && pass "3b: the sync's rc 4 survives a failing tee (the 'could NOT use' arm)" \
+  || fail "3b: rc 4 was masked by the failing tee — the rail reported the WRONG diagnosis"
+grep -q 'UNKNOWN on this box' "$SCEN/err" \
+  && fail "3b: …and it did NOT fall through to the 'registry is UNKNOWN' arm" \
+  || pass "3b: …and the 'registry is UNKNOWN' arm was not taken"
 # (c) a MISSING sync script is named and is non-fatal
 new_scen registrysync-missing
 SCEN_REGISTRY_SYNC="$SCEN/no-such-registry-sync.sh"

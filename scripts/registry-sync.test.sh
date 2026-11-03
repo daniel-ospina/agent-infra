@@ -34,6 +34,8 @@
 #   §27 the spawn budget is O(1) in the record count (#3180)
 #   §28 the pre-pass's `join` is pinned to the collation its inputs were sorted with, and a
 #       pre-pass that cannot be computed is NAMED rather than reported as converged (#3249 P1)
+#   §29 `field()` is byte-exact with the `sed` it replaced (the comment above it claimed this test
+#       existed; it did not — it pointed at §27, which is the spawn budget)
 
 set -uo pipefail
 
@@ -805,6 +807,104 @@ assert_eq "$LC_RC" "0" "§28b a pre-pass that cannot be computed STILL converges
 assert_contains "$LC_LAST" "the converged pre-pass could not run" "§28b ...and the fallback is NAMED instead of silently reported as converged"
 assert_contains "$LC_LAST" "unchanged=0" "§28b ...reporting ZERO skipped rather than a count it did not compute"
 assert_contains "$LC_LAST" "same=12" "§28b ...and every record still converges through the per-record path"
+
+# ═══ 29. `field` is a BYTE-EXACT replacement for the sed it replaced ═════════════════
+# The comment above `field()` says "Parity with the `sed` is ASSERTED in scripts/registry-sync.test.sh
+# §29" — it was not. It pointed at §27, which is the spawn budget, so the riskiest semantic change in
+# the PR (a JSON field reader reimplemented in parameter expansion) was entirely ungated: a
+# "simplification" to one bracket class would mis-read `reviewed_at`/`repo` and nothing would go red,
+# while the rule-1 ordering and the pull key-identity test then compare garbage.
+#
+# `field` is EXTRACTED from the shipped script rather than re-implemented here, so the assertion is
+# about the code that actually runs; the extraction is GUARDED so a reformat fails loudly instead of
+# silently testing nothing.
+echo "── §29 field() is byte-exact with the sed it replaced"
+FIELD_SRC="$(awk '/^field\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$SYNC")"
+if [ -n "$FIELD_SRC" ] && printf '%s\n' "$FIELD_SRC" | grep -q 'rest="${line##\*"'; then
+  ok "§29 (premise) field() was extracted from the shipped script"
+  eval "$FIELD_SRC"
+else
+  bad "§29 (premise) could not extract field() from $SYNC — the parity check would test nothing"
+fi
+# The sed it replaced, verbatim from ed7f42b0^:scripts/registry-sync.sh:168.
+old_field() { sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | command head -1; }
+if command -v sed >/dev/null 2>&1; then
+  PARITY_CASES=0; PARITY_DIFFS=0
+  PARITY_FILE="$T/parity-record.json"
+  check_field() { # <content>  — every field name against one record shape
+    local c="$1" n a b
+    printf '%s' "$c" > "$PARITY_FILE"
+    for n in reviewed_at pr repo head_sha verdict mint carried_from carried_at; do
+      a="$(field "$PARITY_FILE" "$n")"; b="$(old_field "$PARITY_FILE" "$n")"
+      PARITY_CASES=$((PARITY_CASES + 1))
+      if [ "$a" != "$b" ]; then
+        PARITY_DIFFS=$((PARITY_DIFFS + 1))
+        printf '     · field=%q sed=%q  <- %s\n' "$a" "$b" "$c"
+      fi
+    done
+  }
+  # the ordinary record
+  check_field '{"pr":42,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mint":"carried","carried_from":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","carried_at":"2026-01-01T00:00:00Z","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-01-01T00:00:00Z"}'
+  # a NESTED DUPLICATE key: the LAST feasible occurrence on the line wins (sed's greedy leading `.*`)
+  check_field '{"pr":42,"repo":"outer/repo","evidence":{"repo":"inner/repo"},"verdict":"clean"}'
+  # an UNQUOTED number, and a null
+  check_field '{"pr":42,"repo":"o/r","reviewed_at":20260101,"verdict":"clean"}'
+  check_field '{"pr":42,"repo":null,"verdict":"clean"}'
+  # a value containing `,` and one containing `}` — the two characters a bracket class gets wrong
+  check_field '{"pr":42,"repo":"o/r","verdict":"clean, not-clean","reviewed_at":"2026-01-01T00:00:00Z"}'
+  check_field '{"pr":42,"repo":"o/r","verdict":"a}b","reviewed_at":"2026-01-01T00:00:00Z"}'
+  # multi-line, CRLF, no trailing newline, and a field that is absent
+  check_field '{"pr":42,\n"repo":"o/r",\n"verdict":"clean"\n}'
+  check_field '{"pr":42,\r\n"repo":"o/r",\r\n"verdict":"clean"\r\n}'
+  check_field '{"pr":42,"repo":"o/r"}'
+  assert_eq "$PARITY_DIFFS" "0" "§29 field() agrees with the sed on all $PARITY_CASES comparisons"
+  # NON-VACUITY: the harness must be capable of seeing a difference, or the 0 above means nothing.
+  broken_field() { local f="$1" n="$2" line; line="$(command head -1 "$f")"; line="${line##*\"$n\":}"; line="${line#\"}"; printf '%s' "${line%%[,\"}]*}"; }
+  printf '%s' '{"pr":42,"repo":"o/r","verdict":"clean"}' > "$PARITY_FILE"
+  if [ "$(broken_field "$PARITY_FILE" repo)" != "$(old_field "$PARITY_FILE" repo)" ]; then
+    ok "§29 (premise) the comparison DOES see a divergence (the one-bracket-class form is rejected)"
+  else
+    bad "§29 (premise) the comparison cannot see a divergence — the 0 above is not evidence"
+  fi
+fi
+
+# ═══ 30. a RELATIVE `--dir` cannot make the pre-pass hash the STORE's copy ════════
+# Review finding P1 on PR #3249: `git_b` runs `git -C "$STORE"`, so every path given to `git
+# hash-object` resolves against the STORE while `field`, `[ -f ]` and `local_record_for_key` resolve
+# the same string against the CALLER's cwd. With a relative `--dir` and a store checkout that happens
+# to hold that relative path too, the pre-pass hashed the STORE's bytes and SKIPPED a record that was
+# not converged — the local stale record was never pulled, rc 0, no warning (a FAIL-OPEN, not just a
+# lost optimisation). REG_DIR is absolutised once at parse time; both hazards below must be gone.
+echo "── §30 a relative --dir resolves against the CALLER, never the store"
+REL_ROOT="$T/rel"; REL_CLIENT="$REL_ROOT/client"; REL_KEY="acme-widget-101"
+NEW_REC='{"pr":101,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-02-01T00:00:00Z"}'
+OLD_REC='{"pr":101,"head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-01-01T00:00:00Z"}'
+git init -q --bare "$REL_ROOT/origin.git"
+mkdir -p "$REL_ROOT/store" "$REL_CLIENT/rel"
+git -C "$REL_ROOT/store" init -q
+git -C "$REL_ROOT/store" remote add origin "$REL_ROOT/origin.git"
+git -C "$REL_ROOT/store" config user.email sync@test.invalid
+git -C "$REL_ROOT/store" config user.name  sync-test
+REL_BLOB="$(printf '%s\n' "$NEW_REC" | git -C "$REL_ROOT/store" hash-object -w --stdin)"
+REL_TREE="$(printf '100644 blob %s\trecord.json\n' "$REL_BLOB" | git -C "$REL_ROOT/store" mktree)"
+REL_COMMIT="$(git -C "$REL_ROOT/store" -c user.name=t -c user.email=t@t.invalid commit-tree "$REL_TREE" -m "rel record")"
+git -C "$REL_ROOT/store" push -q origin "$REL_COMMIT:refs/reviews/$REL_KEY"
+git -C "$REL_ROOT/store" update-ref "refs/reviews/$REL_KEY" "$REL_COMMIT"
+# the client holds the OLDER record under the RELATIVE dir
+printf '%s\n' "$OLD_REC" > "$REL_CLIENT/rel/$REL_KEY.json"
+# ...and the STORE checkout holds the NEWER bytes at the SAME relative path (the trigger)
+mkdir -p "$REL_ROOT/store/rel"; printf '%s\n' "$NEW_REC" > "$REL_ROOT/store/rel/$REL_KEY.json"
+if [ "$(command cat "$REL_ROOT/store/rel/$REL_KEY.json")" = "$NEW_REC" ] && [ "$(command cat "$REL_CLIENT/rel/$REL_KEY.json")" = "$OLD_REC" ]; then
+  ok "§30 (premise) the store and the caller hold DIFFERENT bytes at the same relative path"
+else
+  bad "§30 (premise) the collision fixture was not built — the check below would be vacuous"
+fi
+REL_OUT="$( cd "$REL_CLIENT" && bash "$SYNC" pull --repo "$REL_ROOT/store" --dir rel --remote origin --timeout 30 2>&1 )"; REL_RC=$?
+assert_eq "$REL_RC" "0" "§30 the relative-dir pull exits 0"
+assert_contains "$REL_OUT" "pulled $REL_KEY" "§30 the STALE local record IS pulled (never skipped by the pre-pass)"
+assert_eq "$(command cat "$REL_CLIENT/rel/$REL_KEY.json")" "$NEW_REC" \
+  "§30 ...and the local file now holds the STORE's newer bytes"
+assert_contains "$REL_OUT" "unchanged=0" "§30 ...and nothing was reported as already identical"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do

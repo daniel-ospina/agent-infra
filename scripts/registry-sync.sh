@@ -138,6 +138,21 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# ⛔ AN ABSOLUTE REGISTRY PATH, because `git_b` runs `git -C "$STORE"`. EVERY path handed to `git
+# hash-object` is then resolved against the STORE, while `field`, `[ -f ]` and `local_record_for_key`
+# resolve the SAME string against the CALLER's cwd — so a relative `--dir` silently reads a different
+# file whenever the store checkout happens to hold that relative path too. Reproduced as a FAIL-OPEN,
+# not a slowdown: store ref `refs/reviews/acme-widget-101` holding the NEWER record, `client/rel/…`
+# holding the OLDER one, `$STORE/rel/…` holding the NEWER one, `cd client` and `--dir rel` → the
+# pre-pass hashed the STORE's copy, reported `unchanged=2 … nothing to sync`, exited 0, and the stale
+# local record was NEVER pulled (no warning, `unreadable=0`). The same divergence is a pre-existing
+# bug in `push_one`'s `git_b hash-object -w "$f"`, which would PUBLISH the store-relative file — one
+# absolute base removes the whole class for both.
+case "$REG_DIR" in
+  /*) ;;
+  *)  REG_DIR="$PWD/$REG_DIR" ;;
+esac
+
 log_line()  { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
@@ -178,7 +193,7 @@ git_b() { # <git args…>
 # It is now pure parameter expansion, and its semantics are the OLD ONES EXACTLY: per LINE, the LAST
 # feasible occurrence of `"<name>":` (sed's greedy leading `.*`), an OPTIONAL opening quote, a
 # maximal run of [^",}], an optional closing quote; the FIRST matching line wins. Parity with the
-# `sed` is ASSERTED in scripts/registry-sync.test.sh §27 rather than argued here — including the
+# `sed` is ASSERTED in scripts/registry-sync.test.sh §29 rather than argued here — including the
 # cases a "cleaner" reimplementation gets wrong (a nested duplicate key, where the LAST wins rather
 # than the top-level one; an unquoted number; a value containing `,` or `}`).
 #
@@ -987,7 +1002,11 @@ do_push() {
       command cat "$list_sort" > "$changed_f"
     fi
   else
-    progress "registry-sync: push — the converged pre-pass could not run; examining all $total records"
+    # ⛔ AN EMPTY MAP IS NOT A FAILURE: `store_blob_map` leaves an existing-but-empty file when the
+    # store holds no `refs/reviews/*` at all, which is the COLD-START answer for a new box — and
+    # calling it "the pre-pass could not run" sends an operator hunting a fault that is not there.
+    # Only a map we HAVE but could not hash is a pre-pass that actually failed.
+    [ -s "$map" ] && progress "registry-sync: push — the converged pre-pass could not run; examining all $total records"
     command cat "$list_sort" > "$changed_f"
   fi
   changed="$(command wc -l < "$changed_f" | tr -d ' ')"
