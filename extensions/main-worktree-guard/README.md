@@ -446,9 +446,16 @@ it, which on a clean checkout sent the reader hunting a phantom dirty tree. The
 dirty arm (`discardDestroysWip` returned true — the status WAS read) keeps both
 the claim and the hatch.
 
-**Escape hatches are unchanged**: M5 sits after the env-hatch / TTL-marker
-return, so `AGENT_ALLOW_MAIN_EDITS=1` and the `~/.pi/agent/.allow-main-edits`
-marker bypass it exactly as they bypass M2/M3. Task children are unhatched by
+**Escape hatches differ — do not conflate them** (round 14):
+`AGENT_ALLOW_MAIN_EDITS=1` (session start) is a FULL guard bypass — M2/M3/M4 all
+off, whole-tree discards included — and it cannot be set on a running process.
+The `~/.pi/agent/.allow-main-edits` MARKER is the scoped one: it bypasses M2/M3 and
+opens ONE narrow M4/M5 RECOVERY WINDOW — a single bare
+`git checkout -- <named path>` / `git restore [--staged] [--worktree] <named path>`
+run from the disordered hub, so a dirty hub can actually be cleared. Everything
+else stays frozen under the marker, and a wrapped / compound / `-C` /
+`GIT_DIR`-retargeted / whole-tree (`./`, glob, brace, `..`) form is refused
+exactly as on main (#1484 D3). Task children are unhatched by
 default (#617/#623), so for the `pi -p` fixer M5 — not a prose rule — is the
 enforcement surface.
 
@@ -853,7 +860,8 @@ a DIFFERENT checkout the message never named.
 | `git checkout main` / `git checkout master` | `git commit`, `git add` |
 | `git pull --ff-only` (plain pull may merge → blocked) | `git checkout -b` / `switch -c`, any other checkout |
 | `git fetch` | `git push` to any branch but the checked-out one |
-| `git status`, `git log`, read-only ops (`diff`, `show`, …) | `git merge` / `rebase` / `reset` / `clean` / `restore` |
+| `git status`, `git log`, read-only ops (`diff`, `show`, …) | `git merge` / `rebase` / `reset` / `clean` |
+| `git restore [--staged] [--worktree] <named path>`, `git checkout [HEAD] -- <named path>` — **only under an active TTL marker**, run from the hub (the #1484 recovery window) | `git restore` with `--source`; a whole-tree operand (`.`, `./`, glob, brace, `..`); a wrapper/compound/`-C`/`GIT_DIR` retarget; or any of these with NO marker |
 | `git worktree add/list/prune/remove` | `git push -f` / `--delete` (see #436 carve-out below) |
 | `git push origin <currently-checked-out-branch>` (WIP preservation) | write/edit OVERWRITES in the hub (see #436 carve-out below) |
 | `touch ~/.pi/agent/.allow-main-edits` (escape marker) | |
@@ -1072,13 +1080,21 @@ a stranded lane's work never silently dies before recovery.
 **Escape-hatch interaction (D3):** M4 **stays ACTIVE under the TTL marker** —
 consistent with the #265 contract that M1 detection stays active under the
 hatch. A stranded lane can recover with the marker (or even without it — the
-sanctioned recovery ops above are allowed directly), but **cannot resume
+sanctioned recovery ops above are allowed directly, plus the named-path restore
+window), but **cannot resume
 feature work in the hub**. Only `AGENT_ALLOW_MAIN_EDITS=1` (env, set at
 session start, deliberate solo session) disables M4. The sanctioned terminal
 one-liner (`cd <repo> && git checkout main && git pull --ff-only`) is
 touched only by humans and is unaffected — a human terminal is never
 intercepted, and inside the disordered hub M4's recovery allowlist admits the
-compound. (An AGENT on a CLEAN hub has no M4 active and must run the sync on its
+compound. It is the right route for an **off-main AND clean** hub only: on a
+DIRTY hub it cannot RECOVER — `git checkout main` may refuse or carry the change
+along, and `git pull --ff-only` may fast-forward or refuse; none of it clears the
+dirty paths — so clear
+the dirt first with the named-path restore window
+(`git restore --staged --worktree <path>` / `git restore <path>` under the
+marker; `mv <untracked> /tmp/` for `??`). (An AGENT on a CLEAN hub has no M4
+active and must run the sync on its
 own: the #1144 effect arm refuses the compound because its effect evidence
 covers only the first sync op. See "The clean-hub sync allowance" above.)
 
@@ -1653,7 +1669,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 | env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#1485** narrows the surface to what is actually READ (an opaque executable has no program to read), and adds the merge rail + the argv gh shim to the named `SANCTIONED_SCRIPT_RELPATHS` list; a general "committed repo script" exemption was rejected at review (committed is purchasable — see the #1485 note in the backdoor section). **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`) is closed for INLINE payloads too; residuals: `python -m`/bare-stdin/pipe payloads, dynamic string construction, and file/shebang payloads (`python x.py`, `./x.py`). Env hatch / TTL marker still bypass it. |
-| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
+| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | The sanctioned **branch** recovery (#206) — correct for an off-main AND CLEAN hub; on a DIRTY hub it cannot clear the dirt (`git checkout main` may refuse or carry the change along; `git pull --ff-only` may fast-forward or refuse), so clear the dirt first with the named-path restore window above. Terminals are never intercepted. |
 
 Rule of thumb: **if you are not recovering the hub or working alone, you
 should be in a worktree — `hub-worktree.sh <branch>` makes it one command.**
@@ -2065,7 +2081,14 @@ shared main checkout of a project with the guard active:
    since #1484 — the stamp-ordering fix; before that the touch was swallowed
    by the allow-non-git early return and the marker was inert).
 3. `git checkout main && git pull --ff-only` in the **FOLLOW-UP** call →
-   succeeds.
+   succeeds **on an off-main AND clean hub**. On a DIRTY hub this step is
+   **not a recovery** (`git checkout main` may refuse or carry the change along;
+   `git pull --ff-only` may fast-forward or refuse) — there the recovery is
+   the named-path restore the marker's window permits:
+   `git restore --staged --worktree <path>` (staged), `git restore <path>`
+   (worktree), `mv <untracked> /tmp/` (`??`). Any `.`/glob/brace/`..` operand,
+   a wrapper, a compound, or a `-C`/`GIT_DIR` retarget stays refused. A
+   DIRECTORY operand (`src`, `src/`) is admitted and discards that subtree.
 4. `cat ~/.pi/agent/.allow-main-edits` → shows `session_id` + `reason` + `ts`.
 5. `tail ~/.pi/agent/audit/gate-events.jsonl` → a `gate_bypass` /
    `main_edits_marker` line with session_id + marker content + expires_at.
