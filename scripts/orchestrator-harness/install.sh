@@ -1486,7 +1486,11 @@ DRIFTED=""
 # absent-or-half-synced copy is exactly the class this list exists to catch: a NEW orch-loop.sh beside
 # an OLD file set prints `DRAIN STALL -> STALL FIX MISSING` once per pass and dispatches nobody — the
 # escalation records the stall and does nothing with it, which is the defect it was written to close.
-for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
+# key-gate.sh (#3331) is the same class for the same reason, one gate later: `lane.sh` sources it
+# fail-loud and refuses to start a lane whose model credential nothing asserts, so a $O without it stops
+# every dispatch on the box — and the refusal is *meant* to be loud, which is why the DRIFT must be
+# detected here rather than discovered as a box-wide standstill with nothing naming the cause.
+for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
