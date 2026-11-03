@@ -1170,6 +1170,36 @@ if [ -n "$LIVE_ENTRY" ]; then
 fi
 ok "program: $HARNESS/$HARNESS_ENTRY (pinned; selected from the pin, not from \$O)"
 
+# ── THE STABLE LAUNCHD PROGRAM (agent-infra#3309) ────────────────────────────────────────────────
+# ⛔ THE PLIST NO LONGER NAMES THE PIN. `$HARNESS` is `<pin root>/<sha12>`, a HASH-NAMED snapshot that
+# harness-refresh.sh garbage-collects as the pin advances, and launchd reads ProgramArguments ONCE at
+# bootstrap. So a plist naming `$HARNESS/$HARNESS_ENTRY` is correct at install time and DEAD after the
+# next pin move: every tick `No such file or directory`, exit 127, `launchctl list` still `loaded`.
+# Measured on this box 2026-11-02: the loop did not run for ~15 hours, `launchd.err` repeated one
+# stale-looking line, and a 15-hour-old candidates.txt (194 entries) was read as a full queue.
+#
+# The program is therefore a STABLE path in the deployed dir, whose bytes are a fixed RESOLVER: it
+# reads the pin dir record on every tick and execs whatever it names. That is the only shape that
+# survives a pin advance, because launchd cannot re-read the plist when the pin moves.
+# ⛔ NOT the #2231 defect coming back: the stub is seeded from the PINNED TREE on every run (never
+# hand-written into $O), it holds no controller logic to diverge, and the assertion below refuses the
+# install unless the stub, run now, resolves to the pin's own entrypoint.
+STABLE_PROG="$O/orch-pin-exec.sh"
+# Prefer the pinned tree (after this lands the pin carries it); fall back to the installer's checkout so
+# a box installing ON the commit that introduces it is not blocked by a pin that predates it.
+_PIN_EXEC_SRC="$HARNESS/orch-pin-exec.sh"
+[ -f "$_PIN_EXEC_SRC" ] || _PIN_EXEC_SRC="$HERE/orch-pin-exec.sh"
+[ -f "$_PIN_EXEC_SRC" ] || die "orch-pin-exec.sh not found in the pinned tree ($HARNESS) or this checkout ($HERE) — the stable launchd program cannot be seeded, and rendering the pin path instead is exactly the #3309 defect"
+# ⛔ STAGE-THEN-RENAME (same rule as the other $O seeds): a plain `cp` truncates the target first, so a
+# concurrent KeepAlive tick could exec a half-written stub and die with a syntax error.
+mkdir -p "$O" || die "cannot create \$O ($O)"
+_PIN_EXEC_TMP="$O/.orch-pin-exec.$$"
+cp "$_PIN_EXEC_SRC" "$_PIN_EXEC_TMP" || { rm -f "$_PIN_EXEC_TMP"; die "cannot stage $STABLE_PROG from $_PIN_EXEC_SRC"; }
+chmod +x "$_PIN_EXEC_TMP" || { rm -f "$_PIN_EXEC_TMP"; die "cannot make $STABLE_PROG executable"; }
+bash -n "$_PIN_EXEC_TMP" || { rm -f "$_PIN_EXEC_TMP"; die "the seeded stable entrypoint does not parse — refusing to install a program that would crash-loop under KeepAlive"; }
+mv -f "$_PIN_EXEC_TMP" "$STABLE_PROG" || { rm -f "$_PIN_EXEC_TMP"; die "cannot install $STABLE_PROG"; }
+ok "stable launchd program: $STABLE_PROG (resolves the pin on every tick — #3309)"
+
 # ── render plist ─────────────────────────────────────────────────────────────────
 echo "==> rendering $PLIST"
 mkdir -p "$(dirname "$PLIST")" || die "cannot create $(dirname "$PLIST") — is HOME=$HOME correct?"
@@ -1321,6 +1351,7 @@ RENDER="$PLIST.new.$$"
 trap 'rm -f "$RENDER"' EXIT
 sed \
   -e "s|__HARNESS__|$(esc "$HARNESS")|g" \
+  -e "s|__PROGRAM__|$(esc "$STABLE_PROG")|g" \
   -e "s|__ENTRY__|$(esc "$HARNESS_ENTRY")|g" \
   -e "s|__HARNESS_PIN__|$(esc "$HARNESS_PIN")|g" \
   -e "s|__HARNESS_PIN_FILE__|$(esc "$HARNESS_PIN_FILE")|g" \
@@ -1369,13 +1400,33 @@ fi
 # runnable where plutil does not exist (the CI Linux runner stubs it), and an extract that silently
 # returns nothing there would turn this assertion into a no-op — a false PASS of exactly the class it
 # exists to prevent.
-PROGRAM_WANT="$(xml_esc "$HARNESS/$HARNESS_ENTRY")"
+PROGRAM_WANT="$(xml_esc "$STABLE_PROG")"
 PROGRAM_GOT="$(plist_program "$RENDER")"
 [ -n "$PROGRAM_GOT" ] || { rm -f "$RENDER"; die "the rendered plist declares no ProgramArguments program — launchd would load a job with nothing to exec (parse: $(plist_program "$RENDER"))" ; }
 if [ "$PROGRAM_GOT" != "$PROGRAM_WANT" ]; then
   rm -f "$RENDER"
-  die "REFUSED (pin): the rendered job would exec '$PROGRAM_GOT' but the pin resolved '$PROGRAM_WANT' — the plist and the pin disagree, and starting this job would run a tree the pin does not name. Nothing was installed (the previous plist is untouched)."
+  die "REFUSED (pin): the rendered job would exec '$PROGRAM_GOT' but the stable program is '$PROGRAM_WANT' — nothing was installed (the previous plist is untouched)."
 fi
+# ⛔ STABILITY, ASSERTED ON THE RENDERED FILE (agent-infra#3309). Two independent claims, both read
+# back from the plist rather than from this script's variables:
+#   1. the program is NOT inside the pin root — a path under `<pin root>/<sha12>` is garbage-collected
+#      as the pin advances, and launchd cannot follow it. This is the defect itself.
+#   2. the program RESOLVES to the pin's own entrypoint RIGHT NOW — via the stub's --resolve-only, so
+#      what is checked is the behaviour launchd will get, not the installer's bookkeeping.
+# A relative or empty program fails (2) because --resolve-only would not be runnable at all.
+case "$PROGRAM_GOT" in
+  "$HARNESS_PIN_DIR"/*)
+    rm -f "$RENDER"
+    die "REFUSED (#3309): the rendered job execs '$PROGRAM_GOT', which is INSIDE the harness pin root ($HARNESS_PIN_DIR). That tree is hash-named and garbage-collected as the pin advances, so this plist would die 'No such file or directory' (exit 127) on the next pin move while launchd still reported it loaded. Nothing was installed." ;;
+esac
+[ -f "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): the rendered job execs '$STABLE_PROG' but that file does not exist — launchd would load a job that exits 127 on every tick. Nothing was installed." ; }
+[ -x "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): '$STABLE_PROG' is not executable — launchd would fail to spawn it. Nothing was installed." ; }
+_PIN_EXEC_RESOLVED="$(/bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)"
+if [ "$_PIN_EXEC_RESOLVED" != "$HARNESS/$HARNESS_ENTRY" ]; then
+  rm -f "$RENDER"
+  die "REFUSED (#3309): the stable program '$STABLE_PROG' resolves to '${_PIN_EXEC_RESOLVED:-<nothing>}' but the pin is '$HARNESS/$HARNESS_ENTRY' — the plist would run a tree the pin does not name, or nothing at all. Nothing was installed (the previous plist is untouched)."
+fi
+ok "plist program is STABLE ($STABLE_PROG) and resolves to the pin ($_PIN_EXEC_RESOLVED)"
 # ⛔ IS THE LOADED JOB ON THIS RENDER? Recorded BEFORE the mv, because that is the only moment the file
 # content exists — and it is what makes this installer safe on a live box (agent-infra#1975 item 3): a
 # validation run that renders the same bytes must not disturb a healthy production controller.
@@ -1486,7 +1537,14 @@ DRIFTED=""
 # absent-or-half-synced copy is exactly the class this list exists to catch: a NEW orch-loop.sh beside
 # an OLD file set prints `DRAIN STALL -> STALL FIX MISSING` once per pass and dispatches nobody — the
 # escalation records the stall and does nothing with it, which is the defect it was written to close.
-for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
+# orch-pin-exec.sh (#3309) is the opposite end of the same class and the reason the list is walked at
+# all: it is the STABLE program the plist execs (see the STABLE_PROG block above), so a `$O` copy that
+# drifted from the pin is the one file whose divergence turns every launchd tick into exit 127 while
+# `launchctl list` still reports the job `loaded`. It is also a $O seed, so it belongs here.
+# ⛔ BOTH NAMES ARE MAINTAINED, NOT EITHER: `stall-fix.sh` came from #2929 and `orch-pin-exec.sh` from
+# #3309, and neither side of that merge was a superset — dropping one leaves a file its caller executes
+# unchecked, which is the exact defect this list exists to catch.
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1768,7 +1826,14 @@ LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 # the command reports success. It is one `-f` test away from being knowable, so it is refused here.
 case "$ACTION" in
   start|restart)
-    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")"; ;;
+    # ⛔ #3309: THE PLIST NO LONGER NAMES $O/launchd-controller.sh, AND NO LONGER NAMES THE PIN. It execs
+    # the stable resolver, which execs the PIN's entrypoint. So BOTH ends are checked here: the resolver
+    # (seeded by this installer, above) and the pin's entrypoint (resolved now, exactly as launchd will).
+    # A missing resolver bootstraps a job the fleet reads as `loaded` while it exits 127 forever.
+    [ -f "$STABLE_PROG" ] || die "$STABLE_PROG is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Re-run this installer to re-seed it."
+    _pin_prog="$(/bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)" || _pin_prog=""
+    [ -n "$_pin_prog" ] && [ -f "$_pin_prog" ] || die "$LABEL's stable program $STABLE_PROG cannot resolve the pin's controller (got '${_pin_prog:-<nothing>}') — refusing to start a job that would exit 127 on every cycle. Check the pin record ($HARNESS_PIN_FILE) and re-run."
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and the worker surface execs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")" ;;
 esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;
