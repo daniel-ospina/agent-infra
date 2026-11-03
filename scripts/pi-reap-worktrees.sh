@@ -2601,6 +2601,63 @@ abstain_gate() {
 # writing this: one stale shell masked a busy lane's shell). The scan carries a per-record EXCLUDE
 # LIST rather than rewriting the probe output, so one verdict cannot change the evidence the next
 # one sees, and the cap makes a probe that keeps returning the same pid terminate instead of spin.
+# ── IS THIS CHECKOUT A HARNESS PIN TREE? (#10114) ────────────────────────────────────────────────
+# A harness PIN TREE is the tree a box EXECUTES: `<pin root>/<sha12>/scripts/orchestrator-harness`,
+# recorded in a `.harness-path` file beside the sha record `HARNESS-PIN`. It is created as a
+# `git worktree` of the agent-infra checkout, so it is IN SCOPE for this pass — and rule 3
+# (ancestor-of-main) convicts it BY CONSTRUCTION, because a pin tree's HEAD *is* the tip of main.
+# The box's most important checkout is therefore the most removable thing in the fleet by that rule.
+#
+# MEASURED 2026-11-03 on the cmux cell (agent-infra#3323 / tortoise#10114): `/tmp/cell-home/harness`
+# and its `<sha12>` children were worktrees of `/tmp/cell-ai`; the harness-apply pass at 09:01:56
+# read `pin_tree=5b1b09aad2c1`, the disk-reaper pass at 09:02:31 classified them under rule 3, and
+# `/tmp/cell-home/harness` held NOTHING at 09:02:44. From 09:12:53 every tick read `pin_tree=none`
+# and exited 23 cannot-verify — the box's own scheduled pass could not say what it was RUNNING for
+# 2h17m, because a reaper deleted the tree it executes. Nothing was logged as an error: the reaper
+# was acting BY ITS OWN RULES, which is what makes this class invisible.
+#
+# A pin record is a HOLDER that /proc cannot show: between passes nothing has the tree as its cwd,
+# and the record is the ONLY thing that says the box needs the bytes. So this veto outranks rules
+# 3/4/5 exactly like `live-claim` — it is a preserve, never a removal.
+#
+# TWO PROBES, and the second exists because the first can be silent:
+#   (a) RECORD-BASED — every pin record this box can name. Accepted in EITHER direction, because
+#       the record names a DESCENDANT of the worktree (`<tree>/scripts/orchestrator-harness`).
+#   (b) SHAPE BACKSTOP — a checkout under a directory named `harness`/`harness-next`. A pin tree
+#       whose record is unreadable (another HOME, a lost record) still matches, and every false
+#       positive here costs DISK, never work: this probe can only PRESERVE.
+PIN_VERDICT=""; PIN_PROOF=""
+pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harness pin tree
+    local canon="$1" rec rec_t
+    [ -n "$canon" ] || return 1
+    PIN_VERDICT=""; PIN_PROOF=""
+    for rec in "${HARNESS_PIN_FILE:-}" "${CELL_HOME:-$HOME}/.harness-path" "$HOME/.harness-path"; do
+        [ -n "$rec" ] || continue
+        [ -r "$rec" ] || continue
+        rec_t="$(head -n 1 "$rec" 2>/dev/null)"
+        [ -n "$rec_t" ] || continue
+        case "$rec_t" in
+            "$canon"|"$canon"/*)
+                PIN_VERDICT="pin-tree"
+                PIN_PROOF="pin record $rec names $rec_t — this box EXECUTES it"
+                return 0 ;;
+        esac
+        case "$canon" in
+            "$rec_t"|"$rec_t"/*)
+                PIN_VERDICT="pin-tree"
+                PIN_PROOF="pin record $rec names $rec_t — this box EXECUTES it"
+                return 0 ;;
+        esac
+    done
+    case "$canon" in
+        */harness/*|*/harness-next/*)
+            PIN_VERDICT="pin-tree-shape"
+            PIN_PROOF="a checkout under $(dirname "$canon") — the harness pin-tree shape; a pin tree is the code this box RUNS and nothing has it as a cwd between passes"
+            return 0 ;;
+    esac
+    return 1
+}
+
 holders_live() {
     local canon="$1" recorded="$2" sha="$3" pid seen="" n=0 cap
     HL_VERDICT=""; HL_DETAIL=""; HL_STALE=""; HL_PROOF=""
@@ -2745,6 +2802,15 @@ classify_one() {
         printf 'preserve\t%s\t\trule=1 %s\n' "$HL_VERDICT" "$HL_PROOF"; return 0
     fi
     [ -n "$HL_STALE" ] && stale_txt="stale-shell:$HL_STALE"
+
+    # ── THE PIN TREE OUTRANKS EVERY REMOVAL RULE (#10114) ────────────────────────────────────────
+    # Placed HERE, with the other vetoes and before rule 3, because the reason it must run first is
+    # the one that failed: a pin tree is ALWAYS an ancestor of main, so rule 3 fires on it every
+    # single pass unless something says what it is. See `pin_tree_match` for the measurement.
+    if pin_tree_match "$canon"; then
+        printf 'preserve\t%s\t\trule=P %s\n' "$PIN_VERDICT" "$PIN_PROOF"
+        return 0
+    fi
 
     # ── the issue this record belongs to, and whether the fleet says it is IN FLIGHT (#2033) ──
     # A record created seconds ago by a dispatch is clean, 0 commits ahead and lane-owned: without

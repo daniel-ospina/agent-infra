@@ -4305,6 +4305,60 @@ assert_nofile "$VFILE_J" "A27j nothing landed at the record path either (a shim 
 assert_eq "$(find "$T/$ENV/state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -l | tr -d ' ')" "0" \
     "A27j no \`.tmp.<pid>\` is left behind by the failed move"
 
+# ── G15: A HARNESS PIN TREE IS A HOLDER, NOT RESIDUE (#10114) ──────────
+# The pin tree is a `git worktree` of the governed repo whose HEAD *is* main's
+# tip — so rule 3 (ancestor-of-main) convicts it on EVERY pass, by construction.
+# MEASURED on the cmux cell 2026-11-03: the disk-reaper pass at 09:02:31
+# classified `/tmp/cell-home/harness/5b1b09aad2c1` under rule 3 and removed it;
+# from 09:12:53 the scheduled harness-apply pass read `pin_tree=none` and exited
+# 23 cannot-verify for 2h17m. The age floors are pinned OUT of the fixture
+# (`TREE_TS` 30d old, `MIN_AGE_MINUTES=0`) so every assertion below is about the
+# VETO and not about the clock.
+ENV=pin_tree
+REPO="$(mk_repo "$ENV")"
+PINWT="$T/$ENV/harness/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$PINWT" HEAD
+PIN_REC="$T/$ENV/home/.harness-path"
+mkdir -p "$T/$ENV/home"
+printf '%s\n' "$PINWT/scripts/orchestrator-harness" >"$PIN_REC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$PINWT")" "reason=pin-tree" \
+    "G15a a recorded harness pin tree is a HOLDER (reason=pin-tree), not residue"
+assert_contains "$(row_for "$OUT" "$PINWT")" "rule=P" \
+    "G15b the veto prints rule=P (a preserve — never a removal rule)"
+assert_contains "$(row_for "$OUT" "$PINWT")" "this box EXECUTES it" \
+    "G15c the row names the record that says so, not just a class label"
+REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --apply --repo "$REPO" >/dev/null 2>&1
+assert_dir "$PINWT" "G15d --apply does not remove the tree this box EXECUTES"
+
+# G15e: the SHAPE BACKSTOP — the record is unreadable/absent (a different HOME, a
+# lost record) but the checkout is a `<sha12>` under `harness/`. That probe can
+# only PRESERVE, so it must hold on shape alone; a false positive costs disk.
+ENV=pin_tree_shape
+REPO="$(mk_repo "$ENV")"
+SHAPEWT="$T/$ENV/harness/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$SHAPEWT" HEAD
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$SHAPEWT")" "reason=pin-tree-shape" \
+    "G15e with no record at all, the harness shape still preserves (backstop)"
+
+# G15f: the NEGATIVE control — the veto is the RECORD/shape, not 'anything
+# detached at main's tip'. Without either, rule 3 must still reclaim: a patch
+# that preserved every merged worktree would break the reaper entirely.
+ENV=pin_tree_ctl
+REPO="$(mk_repo "$ENV")"
+CTLWT="$T/$ENV/plain-merged-wt"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$CTLWT" HEAD
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$CTLWT")" "reason=reclaimable" \
+    "G15f a merged worktree with no pin record and no pin shape is STILL rule-3 residue"
+assert_absent "$(row_for "$OUT" "$CTLWT")" "pin-tree" \
+    "G15f …and nothing in its row claims a pin tree"
+
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
