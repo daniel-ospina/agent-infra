@@ -3611,7 +3611,11 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
       shell: false,
       detached,
       stdio: ["ignore", "pipe", "pipe"],
-      env: spawnEnv,
+      // `attempt` is retry()'s PER-LEG ordinal — only the parent knows it, and
+      // the child-side orphan watchdog needs it to write a joinable settle row
+      // when it self-terminates on parent death (#385). Without it a killed
+      // dispatch's row could not be told apart from the previous leg's.
+      env: { ...spawnEnv, TASK_DISPATCH_ATTEMPT: String(attempt) },
     });
     // pgid captured at spawn — for a detached spawn this is the child's OWN
     // group (setsid); for a non-detached spawn (TASK_DETACHED=0) it is the
