@@ -275,6 +275,26 @@ MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # fails CLOSED to `MERGE_PRIORITY_AT + 1`, i.e. "treat the count as over the line"), and `MR`/`MF`
 # (review_slots/fix_slots) still scale the worker budgets with the backlog. Neither can open the gate.
 MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+# ── THE LANDING FLOOR: a WIP LIMIT ON OPEN PRs (stop starting, start finishing) ──────────────
+# WHY IT EXISTS: `mp_reason` gates the issue path on the UN-OWNED count, and a lane CLAIMS the PR it
+# opens — so every unit of production REMOVES itself from the gate's population. The gate therefore
+# cannot see WIP: 68 open PRs with all of them claimed reads `merge-priority=clear` and the box opens
+# more. Measured 2026-11-03 (2h window, de-batched): agent-infra opened 6 / merged 1; tortoise opened
+# 8 / merged 2 — a ~4:1 produce:land ratio with 68 and 37 open respectively. `MERGE_PRIORITY_AT`
+# does NOT throttle this: it only feeds `review_slots`/`fix_slots` headroom and the unreadable-count
+# fallback. Nothing in the knob set bounds total WIP, which is why the queue grows monotonically.
+# WHAT IT IS: ONE MORE ARM IN THE SAME GATE VECTOR — it sets `GATE_WHY` (so the ISSUE path closes)
+# exactly as `merge-priority` does, and nothing else. It is a WIP limit, not a quota: an unreadable
+# or out-of-range count fails CLOSED (drain). A red-tree / P0 that `floor_emergency` can see stands
+# the arm down (see the call site — the bound on what that covers is stated there, not glossed).
+# WHY 25, AND WHY PER-REPO: 25 is the OWNER's own chosen queue size (the `MERGE_PRIORITY_AT` ruling —
+# "something more like 10 PRs who are not being processed", scaled to 25). It is applied PER REPO
+# because WIP is only landable where it lives — a merged PR in tortoise does not drain agent-infra's
+# queue, so a fleet-wide sum would let one repo's backlog close another repo's issue path.
+# Little's law, for the justification: WIP = throughput x cycle-time. At the measured ~1.5 lands/h,
+# 25 open is ~17h of queue at today's landing rate — the point is that the fleet is FORCED to raise
+# the landing rate rather than open a 68th PR.
+LANDING_FLOOR="${LANDING_FLOOR:-25}"
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
 # printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
 # backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
@@ -483,6 +503,11 @@ is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 # count), rather than on a bare `[ … -ge 1 ]` test a mutation could delete unseen.
 is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" || MERGE_PRIORITY_MAX_AGE_MIN=180; [ "${MERGE_PRIORITY_MAX_AGE_MIN:-0}" -ge 1 ] || MERGE_PRIORITY_MAX_AGE_MIN=180
 is_limit "${FUNNEL_MAX_AGE_MIN:-}" || FUNNEL_MAX_AGE_MIN=30; [ "${FUNNEL_MAX_AGE_MIN:-0}" -ge 1 ] || FUNNEL_MAX_AGE_MIN=30
+# The landing floor follows the same bounded-shape rule. An unreadable value falls back to the
+# owner's existing 25 (never to 0, which would disarm the gate silently, and never to empty, which
+# would make the `-ge` test error and read FALSE — an errored test OPENS a gate).
+is_limit "${LANDING_FLOOR:-}" || LANDING_FLOOR=${MERGE_PRIORITY_AT:-25}
+[ "${LANDING_FLOOR:-0}" -ge 1 ] || LANDING_FLOOR=${MERGE_PRIORITY_AT:-25}
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 # Both red-fixer caps fail OPEN in the same shape MAX_FIX_TRIES documents above (`[ "$n" -ge "$cap" ]`
@@ -5759,6 +5784,73 @@ PY
   else
     GATE_VEC="merge-priority=clear"
   fi
+  # ── THE LANDING FLOOR ARM (WIP limit on OPEN PRs) ────────────────────────────────────────────
+  # ⛔ WHAT IT ADDS THAT NO OTHER ARM CAN: `merge-priority` counts UN-OWNED PRs, and a lane claims
+  # the PR it opens — so producing MORE work moves the gate's own input toward zero. Total WIP is
+  # invisible to it. This arm reads the total open count, which is the population the queue actually
+  # grows in, and closes the issue path at `LANDING_FLOOR`.
+  # ⛔ THE DOOR FOR A RED TREE / P0 IS THIS CALL, NOT A CLAIM IN A COMMENT. An emergency that
+  # `floor_emergency` can see OUTRANKS the floor: the arm stands down and the cycle produces the
+  # repair instead. `declare -f` guards the call because this block is EXTRACTED and evaled STANDALONE
+  # by the suite, where the function is unbound (the same `declare -f lo_select` idiom used below) —
+  # an unguarded call would return 127 and read as "no emergency", the fail-OPEN direction.
+  # ⚠️ BOUND ON THAT DOOR, STATED SO IT IS NOT OVERREAD: `floor_emergency` only speaks when it has a
+  # product row it could reorder (its own gate (0)), so on an EMPTY product backlog the floor still
+  # arms. That reachability is the same one `merge-priority` already had and is not widened here —
+  # the exemption is the mechanism, and what it does not cover is said rather than assumed.
+  LF_M="${LANDING_FLOOR:-25}"
+  case "$LF_M" in ''|*[!0-9]*|0?*) LF_M=25 ;; esac
+  [ "$LF_M" -ge 1 ] || LF_M=25
+  LF_EMERG=""
+  LF_VERDICT=""
+  declare -f floor_emergency >/dev/null 2>&1 && LF_EMERG="$(floor_emergency "${O:-}" "${BATCH:-1}" 2>/dev/null)"
+  # ⛔ THE EMERGENCY DOOR IS TESTED FIRST, SO IT COVERS EVERY BRANCH (review round 3, P2). It used to
+  # sit in the deepest `else`, which meant the three fail-closed branches (UNREADABLE, out-of-range,
+  # and the stale-fallback branch round 2 added) each assigned GATE_WHY WITHOUT ever consulting it —
+  # so the arm's own contract ("an emergency that floor_emergency can see OUTRANKS the floor") was
+  # false on 3 of 5 branches, and the one that is reachable on a broken listing was one of them.
+  # Hoisting it makes the statement structurally true instead of true-in-the-happy-path, and it is
+  # also the shortest form: stand down, or decide.
+  # ⛔ NOTE ON PROVENANCE (review round 3, P2 — a CORRECTION of round 2): `open_pr_count` never returns
+  # a non-numeric, but that does NOT let a stale/fabricated number slip past this arm in the shipped
+  # loop — `unowned_scan` (see its `[ -n "${list// /}" ] || { echo "$n"; return 0; }`) reads a
+  # listing-less failure as "NOTHING is owned", so `UPN == OPEN_N > 0` and `mp_reason` sets GATE_WHY
+  # from the FIRST arm, before this one runs. A broken listing therefore fail-CLOSES on `merge-priority`
+  # and this arm can never be the winner on those cycles. Round 2 added a state-file marker + a branch
+  # + two tests for that case; round 3 measured that deleting the marker left the suite green and the
+  # gate behaviour unchanged, so the mechanism was INERT and its tests graded a composition the shipped
+  # loop cannot reach. It has been REMOVED rather than pinned — a check that cannot fail is worse than
+  # no check, and an unpinnable one is worse still. The guards below are defence-in-depth for the arm's
+  # own contract, NOT a live fix for a fail-open.
+  if [ -n "$LF_EMERG" ]; then
+    LF_VERDICT="exempt(${LF_EMERG})"
+    GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+  else
+    case "${OPEN_N:-}" in
+      ''|*[!0-9]*|0?*)
+        LF_VERDICT="UNKNOWN"
+        GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
+        GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT" ;;
+      *)
+        # ⛔ THE LENGTH BOUND IS NOT DECORATION: `[` ERRORS at or above 2^63 and an ERRORED test is
+        # FALSE, which OPENS the gate — that is the exact reason `is_limit` exists. `is_limit` is not
+        # in scope inside this extracted block, so the bound is stated here.
+        if [ "${#OPEN_N}" -gt 6 ]; then
+          LF_VERDICT="UNKNOWN(out-of-range)"
+          GATE_WHY="${GATE_WHY:-landing-floor(open PR count OUT OF RANGE (${#OPEN_N} digits) — landing before producing)}"
+          GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+        else
+          if [ "${OPEN_N}" -ge "$LF_M" ]; then
+            LF_VERDICT="REFUSE(${OPEN_N}>=${LF_M})"
+            GATE_WHY="${GATE_WHY:-landing-floor(${OPEN_N} open PR(s) >= ${LF_M} — landing before producing)}"
+            GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+          else
+            LF_VERDICT="ok(${OPEN_N}<${LF_M})"
+            GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+          fi
+        fi ;;
+    esac
+  fi
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
   # can be completely unable to spawn, so a chain that reports `load=` first describes the wrong
   # resource and points the operator at a remedy (wait) that cannot work. The order is
@@ -6106,6 +6198,26 @@ PY
   if [ "${LO_CHOICE:-none}" != "issue" ] && [ -z "$GATE_WHY" ]; then
     GATE_WHY="selection (funnel chose '${LO_CHOICE:-?}', not issues)"
   fi
+  # ── THE LANDING-FLOOR LINE: ONE LINE PER CYCLE, THE NUMBERS THE DECISION USED ────────────────
+  # ⛔ A SILENT THRESHOLD IS THE SAME DEFECT CLASS AS A SILENT REAPER: a reader must be able to tell
+  # WHY the fleet did or did not dispatch, from the log alone, without reconstructing the gate. This
+  # line is emitted AFTER every arm has had its say, so `MODE` is the cycle's real decision and not a
+  # prediction of one. `MODE(land)` = the issue path is closed and the capacity is on the PR queue;
+  # `MODE(produce)` = the issue path is open. `FLOOR=` and `OPEN_PRS=` are printed even when the floor
+  # is not the binding reason, so the margin is visible before it is crossed — and `BINDING=` names
+  # which gate actually won, so a floor that is satisfied cannot be misread as the cause.
+  # ⛔ `FLOOR_VERDICT=` IS ON THIS LINE BECAUSE `GATE_VEC` IS NOT (review round 4, P2). `GATE_VEC` is
+  # printed only on the IDLE path, so a cycle where `floor_emergency` stood the floor down and the box
+  # dispatched — the very case R6 creates — read `MODE(produce) BINDING(none)` with the exemption
+  # nowhere on the line. That is the "silent threshold" defect this line exists to prevent, one field
+  # over. Now every cycle states the floor's own verdict, whether or not the floor was the winner,
+  # and whether or not the box dispatched.
+  # ⛔ `FLOOR=` PRINTS THE VALUE THE ARM ENFORCED (`LF_M`, already coerced), NOT THE RAW KNOB (review
+  # round 2, P2): the arm re-coerces independently, so `LANDING_FLOOR=0` with `MERGE_PRIORITY_AT=0`
+  # survives the main coercion as 0, is rejected by the arm as 25, and the line used to print
+  # `FLOOR=0` while enforcing 25 — on the one line whose entire purpose is to make the threshold
+  # trustworthy.
+  echo "[landing-floor] OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} FLOOR_VERDICT=${LF_VERDICT:-?} → MODE($([ -z "${GATE_WHY:-}" ] && echo produce || echo land)) BINDING(${GATE_WHY:-none})" >> "$LOG"
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
     # ── THE PRODUCT FLOOR, APPLIED AS AN ORDER (agent-infra#2054) ───────────────────────────────

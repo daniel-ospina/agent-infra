@@ -2100,6 +2100,7 @@ Every entry point this directory's consolidation carried, classified against the
 | `scripts/orchestrator-harness/capacity.sh` | measured placement — a **LIBRARY** plus a `probe` CLI | sourced per dispatch | none needed | none needed | current |
 | `scripts/orchestrator-harness/ci-queue.sh` | CI back-pressure — a **LIBRARY** plus a `status` CLI | sourced before dispatch of NEW-PR work and before a CI rerun — **never** by a repair push (#2927) | none needed | none needed | current |
 | `scripts/orchestrator-harness/disk-floor.sh` | the pre-dispatch disk floor — a **LIBRARY** | sourced by the controller | none needed | none needed | current |
+| `scripts/orchestrator-harness/lane-artifacts.sh` | the PULL verb for a CELL lane's artifact (`collect` / `logs` / `ls`): discovery over `cmux vm exec`, byte-exact transfer, and an exit code that carries the honesty — `3` = absent everywhere *because every requested box was searched*, `4` = UNMEASURED (absence NOT claimed), `5` = pull failed | by hand, or by the orchestrator after a lane is killed — ⛔ never by the lane itself | none needed | none needed | current — `--out` is replaced only by a run that collected everything, so a failed re-run cannot destroy the only copy |
 | `scripts/deploy-mac-orchestrator.sh` | copies the harness into `$O` and stamps the commit | by hand (§4 step 1) | — | — | current for the DEPLOY; ACTIVATION is `install.sh --start` / `harness-up up` |
 | `scripts/cloud-cell-bringup.sh` | full cell PROVISIONING (clone, keys, farm, units) | by hand, once per cell | installs several units | — | current — provisioning is not convergence: `up` does not run it |
 | `pi-bootstrap/setup.sh` (+ `SETUP-NEW-MACHINE.md`) | the Mac starter: config farm + `install-launchd.sh` | by hand, once per Mac | — | `install-launchd.sh`'s set | current for CONFIG; **incomplete for the harness** — it installs no controller and no apply timer, and `SETUP-NEW-MACHINE.md` described it only as "the scheduled jobs", which is why this went unnoticed |
@@ -2406,9 +2407,11 @@ plus its tmux server (agent-infra#2159).
 lanes=<live>/<total> max_lanes=<ceiling> zombie=<n> lanes_src=<census|terminals|unknown>
 ```
 
-* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (45 min,
-  deliberately ABOVE `lane.sh`'s 2400 s wall limit: a live lane inside one long silent tool call must
-  not read as dead and license extra dispatch). A lane whose log was **deleted** (a `/tmp` prune can
+* **live** — the process tree exists AND its log/turn advanced inside `LANE_REAP_LIVE_MIN` (125 min,
+  deliberately ABOVE the lane's wall BACKSTOP `LANE_BACKSTOP_S` = 7200 s: a live lane inside one long
+  silent tool call must not read as dead and license extra dispatch. It followed the wall limit while
+  the wall was the primary bound; since agent-infra#2888 the wall is only the backstop, so the window
+  follows the backstop). A lane whose log was **deleted** (a `/tmp` prune can
   do that to a working lane) also counts as live: it may still be working, and for a capacity gate
   "possibly live" must never be counted `0`. This is the number `MAX_LANES` gates.
 * **total** — every resident lane tree THE CENSUS CAN ATTRIBUTE: a `pi` tree whose root or a direct
@@ -2521,6 +2524,15 @@ ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT,
 "off". Both off prints an `UNBOUNDED by construction` WARN. The same contract as `task`'s
 `getCpuStallMs`. Tuning is per dispatch: a lane class that legitimately sits silent for longer (a long
 model call with no tool activity) raises `LANE_BOUND_IDLE_S` rather than removing the limit.
+
+⛔ **THROUGH `run_agent`, `LANE_BOUND_WALL_S` CAN ONLY SHORTEN A RUN** (agent-infra#2888 review, P1).
+A caller that passes a wall also derives its cross-box claim lease from it (`fix-one.sh`: bound + 1200;
+`merge-one.sh`: `REVIEW_TIMEOUT` + gate wait + 300), because the lease exists to cover the run it was
+taken for — so an env value ABOVE the caller's own bound (including `0`, which means OFF = unbounded)
+is REFUSED, the wall stays at the caller's bound, and the refusal is written into the lane log. To give
+a lane a longer wall, raise the seam the CALLER owns — `LANE_BACKSTOP_S`, `LANE_TIMEOUT`,
+`FIX_TIMEOUT` — which moves the lease with the bound in the same expression. `lane-bound.sh` invoked
+directly (its own flag/env, `mac-lane.sh`) still honours the value as given: no lease is derived there.
 
 ⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
 no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
