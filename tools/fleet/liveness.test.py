@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Forty-nine tests with sixty-seven paired mutations: every mutation re-
+Forty-nine tests with sixty-eight paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 31 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (67)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (68)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1962,6 +1962,13 @@ def t43():
         check("unbound-bound-verdict" in lr.detail, "and named; got %r" % lr.detail)
         check("invalid-bound-verdict-pid" not in lr.detail,
               "the CAP is what dropped it, not the fallback guard; got %r" % lr.detail)
+        # …and the FALLBACK guard is executed too, not just asserted: a caller that
+        # bypasses `parse_bound_pid` hands a non-pid token straight to the binding.
+        bad = liv.LogRead(verdict="finished", verdict_line_pid="\u00b2\u00b2",
+                          verdict_source="caller")
+        why, _ = liv._bind_verdict(bad, os.getpid())
+        check(why and "invalid-bound-verdict-pid" in why,
+              "a non-pid token is dropped by name, never int()-ed: got %r" % (why,))
         # …and one with NO `pid=` at all is adopted but declared unbound.
         with open(log, "w", encoding="utf-8") as fh:
             fh.write("[lane-bound] VERDICT verdict=finished tag=lane rc=0\n")
@@ -2600,8 +2607,9 @@ MUTATIONS = [
         "T43", "module",
         '    return pids[-1] if len(pids[-1]) <= 10 else "?"',
         '    return pids[-1]',
-        "an unbounded digit token reaches int() and raises, so a lane log line aborts the "
-        "`--log` surface instead of dropping to the fail-closed abstention",
+        "the cap is gone, so an unusable pid token falls through to the FALLBACK guard: "
+        "the drop reason becomes invalid-bound-verdict-pid instead of unbound-bound-verdict "
+        "(and but for that guard, int() would raise out of gather_log_lane)",
     ),
     Mutation(
         "T48", "module",
@@ -2643,6 +2651,13 @@ MUTATIONS = [
         '                    note = ""',
         "the census adopts an unbound 10-column row SILENTLY, so the fifth rule of the "
         "binding table is false on the fleet-wide surface",
+    ),
+    Mutation(
+        "T43", "module",
+        '    if not (line_pid.isascii() and line_pid.isdigit() and len(line_pid) <= 10):',
+        '    if False:',
+        "a caller that bypasses `parse_bound_pid` hands a non-numeric token to int(), so "
+        "the drop becomes a ValueError out of `gather_log_lane`",
     ),
 ]
 
