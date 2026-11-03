@@ -2537,8 +2537,12 @@ validated numeric.
 APPEND-ONLY (`tee -a` / `>>`; nothing truncates it), so a re-dispatched issue leaves the PREVIOUS
 attempt's terminal line in it, and `grep '^outcome=' | tail -1` then answers "this lane has ended" with
 the earlier run's verdict while the current one is still working — the stale-flag class, in the artifact
-shipped to answer exactly this question. The per-run file is written by the same trap and REMOVED by the
-next dispatch, so its absence means "no verdict for this run": still working, or never started.
+shipped to answer exactly this question. The per-run file is written by the same trap and REMOVED (and
+re-OWNED) by the next dispatch, so its absence means "no verdict for this run": still working, or never
+started. The owner token matters too: a previous attempt that is still ALIVE — the stuck-lane shape this
+whole change is about — would otherwise overwrite the file with ITS verdict when its own trap finally
+fires, so each dispatch stamps `logs/lane-<N>.owner` and the trap writes the verdict only while it still
+owns it (the older run's line still lands in the append-only log, and it says in the log why).
 
 `grep -L` is the right reader for "is any log unaccounted for" because it asks about the WHOLE file; the
 `tail -1` form is right for a single lane when a child process killed after the lane exits can still
