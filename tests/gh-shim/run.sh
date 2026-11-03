@@ -1850,9 +1850,14 @@ _i1="$(date +%s)"
 [ "$(cat "$GCOUNT" 2>/dev/null || echo 0)" -eq 1 ] \
   && pass "a transport blip under a 0 s budget is ONE invocation, not a 4 s backoff" \
   || fail "the transport backoff ignored the budget ($(cat "$GCOUNT" 2>/dev/null) invocation(s))"
-[ $(( _i1 - _i0 )) -le 1 ] \
-  && pass "  …and it returns in $(( _i1 - _i0 ))s, inside its own 0 s ceiling" \
-  || fail "the call slept $(( _i1 - _i0 ))s under a 0 s budget"
+# ⛔ NO WALL-CLOCK ASSERTION HERE. It was `_i1 - _i0 <= 1` and it went RED on a loaded box (2 s with
+# zero sleep calls) — a timing bound is a measurement of the fleet's load, not of this gate.
+grep -q 'does not fit' "$GDIR/events.log" 2>/dev/null \
+  && pass "  …and the un-taken backoff is NAMED as not fitting the budget (no silence)" \
+  || fail "the un-taken transport retry was not named: $(head -2 "$GDIR/events.log" 2>/dev/null | tr '\n' ' ')"
+# The `persisted after N attempt(s)` exhaustion note FIRES ONLY WHEN a transport retry was actually
+# taken (`[ "$ttries" -gt 0 ]`), so on this path the gate note above is the whole record — asserting
+# the note here would demand a line the design deliberately does not print.
 
 # (j) ⛔ `remaining: 0` IS STILL A STAMPED HEADER. A permission 403 that lands while the bucket reads
 # 0 wrote a box-wide window from its reset (measured: a 900 s cooldown, where the pre-change shim
