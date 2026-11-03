@@ -114,9 +114,12 @@ running and not: **keep `TORTOISE_MCP_API_KEY` in `~/keys.env`** (same line, han
 Tortoise dashboard) alongside the `pi-keys.env` copy that covers interactive sessions. Losing it
 silently is the one outcome worse than a loud NO-KEY.
 The client itself (`~/.pi/agent/scripts/tortoise-graph.sh`) IS delivered by the setup — it is farmed
-from this repo — so a box with NEITHER name set reports `GRAPH-UNREACHABLE(NO-KEY)` on every call (with
-only the REST name `TORTOISE_API_KEY` present the client takes that fallback and reports the endpoint's
-verdict instead — often `GRAPH-UNREACHABLE(HTTP 401)`, because the REST key is not the MCP key).
+from this repo — so a box with NEITHER name set reports `GRAPH-UNREACHABLE(NO-KEY)` on every call. With
+only the alias name `TORTOISE_API_KEY` present, the client takes that fallback and reports the endpoint's
+verdict instead — and that name USUALLY carries the same token (`skills/research/SKILL.md` records it
+measured identical, Bearer -> `200`), so a box that has only the alias may work fine; where the alias
+carries the REST token instead, the endpoint answers `GRAPH-UNREACHABLE(HTTP 401)`, because the REST
+key is not the MCP key. Neither outcome is a reason to skip provisioning `TORTOISE_MCP_API_KEY`.
 `bash ~/.pi/agent/scripts/tortoise-graph.sh health` is the local reading; on a cell,
 `bash scripts/cloud-cell-bringup.sh --check` additionally warns by variable NAME, never its value.
 Re-generate it from the Tortoise dashboard at `tortoise.premiselabs.co` (the sign-up site, not the API

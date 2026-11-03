@@ -93,7 +93,7 @@ mkdir -p "$H1/.pi/agent/scripts"
 : >"$H1/.pi/agent/scripts/tortoise-graph.sh"
 : >"$H1/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E1"
-HOME="$H1" ENV_FILE="$E1" run_case good 2>"$TMP/good.err"
+HOME="$H1" ENV_FILE="$E1" run_case good >"$TMP/good.stdout" 2>"$TMP/good.err"
 expect good "graph client: present at"
 expect good "tortoise_graph_client.py beside it"
 expect good "graph credential: TORTOISE_MCP_API_KEY is set in"
@@ -106,7 +106,7 @@ clean good
 H2="$TMP/h2"; E2="$TMP/h2/keys.env"
 mkdir -p "$H2"
 printf 'NOTHING=1\n' >"$E2"
-HOME="$H2" ENV_FILE="$E2" run_case absent 2>"$TMP/absent.err"
+HOME="$H2" ENV_FILE="$E2" run_case absent >"$TMP/absent.stdout" 2>"$TMP/absent.err"
 expect absent "graph client MISSING:"
 expect absent "graph credential MISSING:"
 clean absent
@@ -116,7 +116,7 @@ H3="$TMP/h3"; E3="$TMP/h3/keys.env"
 mkdir -p "$H3/.pi/agent/scripts"
 : >"$H3/.pi/agent/scripts/tortoise-graph.sh"
 printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E3"
-HOME="$H3" ENV_FILE="$E3" run_case half 2>"$TMP/half.err"
+HOME="$H3" ENV_FILE="$E3" run_case half >"$TMP/half.stdout" 2>"$TMP/half.err"
 expect half "graph client: present at"
 expect half "HALF-DELIVERED"
 clean half
@@ -126,7 +126,7 @@ H4="$TMP/h4"; E4="$TMP/h4/keys.env"
 mkdir -p "$H4/.pi/agent/scripts"
 : >"$H4/.pi/agent/scripts/tortoise-graph.sh"; : >"$H4/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'export TORTOISE_API_KEY=%s\n' "$SECRET" >"$E4"
-HOME="$H4" ENV_FILE="$E4" run_case rest 2>"$TMP/rest.err"
+HOME="$H4" ENV_FILE="$E4" run_case rest >"$TMP/rest.stdout" 2>"$TMP/rest.err"
 expect rest "graph credential UNCERTAIN"
 expect_absent rest "graph credential: TORTOISE_MCP_API_KEY is set"
 clean rest
@@ -136,7 +136,7 @@ H5="$TMP/h5"; E5="$TMP/h5/keys.env"
 mkdir -p "$H5/.pi/agent/scripts"
 : >"$H5/.pi/agent/scripts/tortoise-graph.sh"; : >"$H5/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'export TORTOISE_MCP_API_KEY=%s\nexit 0\n' "$SECRET" >"$E5"
-HOME="$H5" ENV_FILE="$E5" run_case earlyexit 2>"$TMP/earlyexit.err"
+HOME="$H5" ENV_FILE="$E5" run_case earlyexit >"$TMP/earlyexit.stdout" 2>"$TMP/earlyexit.err"
 expect_absent earlyexit "TORTOISE_MCP_API_KEY is set in"
 clean earlyexit
 
@@ -145,7 +145,7 @@ H6="$TMP/h6"; E6="$TMP/h6/keys.env"
 mkdir -p "$H6/.pi/agent/scripts"
 : >"$H6/.pi/agent/scripts/tortoise-graph.sh"; : >"$H6/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'trap "exit 1" EXIT\nexport TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E6"
-HOME="$H6" ENV_FILE="$E6" run_case trapexit 2>"$TMP/trapexit.err"
+HOME="$H6" ENV_FILE="$E6" run_case trapexit >"$TMP/trapexit.stdout" 2>"$TMP/trapexit.err"
 expect trapexit "graph credential: TORTOISE_MCP_API_KEY is set in"
 clean trapexit
 
@@ -155,7 +155,7 @@ mkdir -p "$H7/.pi/agent/scripts"
 : >"$H7/.pi/agent/scripts/tortoise-graph.sh"; : >"$H7/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E7"
 chmod 000 "$E7"
-HOME="$H7" ENV_FILE="$E7" run_case unreadable 2>"$TMP/unreadable.err"
+HOME="$H7" ENV_FILE="$E7" run_case unreadable >"$TMP/unreadable.stdout" 2>"$TMP/unreadable.err"
 chmod 644 "$E7"
 expect unreadable "graph credential UNKNOWN"
 expect_absent unreadable "graph credential MISSING"
@@ -168,7 +168,7 @@ H9="$TMP/h9"; E9="$TMP/h9/keys.env"
 mkdir -p "$H9/.pi/agent/scripts"
 : >"$H9/.pi/agent/scripts/tortoise-graph.sh"; : >"$H9/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'NOTHING=1\n' >"$E9"
-TORTOISE_MCP_API_KEY="$SECRET" HOME="$H9" ENV_FILE="$E9" run_case ambient_mcp 2>"$TMP/ambient_mcp.err"
+TORTOISE_MCP_API_KEY="$SECRET" HOME="$H9" ENV_FILE="$E9" run_case ambient_mcp >"$TMP/ambient_mcp.stdout" 2>"$TMP/ambient_mcp.err"
 expect ambient_mcp "graph credential NOT REACHING LANES"
 expect_absent ambient_mcp "$SECRET"
 clean ambient_mcp
@@ -178,7 +178,7 @@ H10="$TMP/h10"; E10="$TMP/h10/keys.env"
 mkdir -p "$H10/.pi/agent/scripts"
 : >"$H10/.pi/agent/scripts/tortoise-graph.sh"; : >"$H10/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'NOTHING=1\n' >"$E10"
-TORTOISE_API_KEY="$SECRET" HOME="$H10" ENV_FILE="$E10" run_case ambient_rest 2>"$TMP/ambient_rest.err"
+TORTOISE_API_KEY="$SECRET" HOME="$H10" ENV_FILE="$E10" run_case ambient_rest >"$TMP/ambient_rest.stdout" 2>"$TMP/ambient_rest.err"
 expect ambient_rest "graph credential UNCERTAIN"
 expect_absent ambient_rest "graph credential: TORTOISE_MCP_API_KEY is set"
 expect_absent ambient_rest "$SECRET"
@@ -191,21 +191,59 @@ H11="$TMP/h11"; E11="$TMP/h11/keys.env"
 mkdir -p "$H11/.pi/agent/scripts"
 : >"$H11/.pi/agent/scripts/tortoise-graph.sh"; : >"$H11/.pi/agent/scripts/tortoise_graph_client.py"
 printf 'export TORTOISE_MCP_API_KEY=%s\n' "$SECRET" >"$E11"
-TORTOISE_MCP_API_KEY="$SECRET" HOME="$H11" ENV_FILE="$E11" run_case both 2>"$TMP/both.err"
+TORTOISE_MCP_API_KEY="$SECRET" HOME="$H11" ENV_FILE="$E11" run_case both >"$TMP/both.stdout" 2>"$TMP/both.err"
 expect both "graph credential: TORTOISE_MCP_API_KEY is set in"
 expect_absent both "$SECRET"
 clean both
 
-# ── case 12: THE RULE — the key's value never appears, in any arm ─────────────────────────────────
+# ── case 12: THE WIRING — the reading must still be CALLED by `--check`, after the layer and the env
+# This probe sources the function body directly, so deleting the invocation in `main()` would leave every
+# arm above green while the cell stops reporting the client at all. `pi-bootstrap/tests/test-setup-no-nesting.sh`
+# names the same gap for its own suites ("a probe set alone cannot see the wiring") and proves it with a
+# sentinel; this is that assertion for this check. The ORDER matters as much as the presence: `check_graph_client`
+# must run AFTER `check_operational_layer` (which installs/verifies the farm) and AFTER `check_provider`
+# (which sources `$ENV_FILE`), or it grades an empty farm and an unsourced environment.
+main_body="$(sed -n '/^main() {$/,/^}$/p' "$SRC")"
+if printf '%s' "$main_body" | grep -q '^      check_graph_client$'; then pass; else
+    fail "wiring: \`check_graph_client\` is not invoked from main()'s --check arm — the reading would never run"
+fi
+order_ok=1
+for before in check_operational_layer check_provider check_uv_env; do
+    a="$(printf '%s\n' "$main_body" | grep -n "^      $before\$" | head -1 | cut -d: -f1)"
+    b="$(printf '%s\n' "$main_body" | grep -n '^      check_graph_client$' | head -1 | cut -d: -f1)"
+    if [ -z "$a" ] || [ -z "$b" ] || [ "$a" -ge "$b" ]; then order_ok=0; fi
+done
+if [ "$order_ok" -eq 1 ]; then pass; else
+    fail "wiring: \`check_graph_client\` is not ordered AFTER check_operational_layer/check_provider/check_uv_env in main()"
+fi
+
+# ── case 13: THE RULE — the key's value never appears, in any arm ─────────────────────────────────
+# ⛔ SCANNED: the stub transcript, the case's REAL STDOUT, and its STDERR. The first version scanned
+# only "$TMP"/*.out — the `ok`/`warn` transcript — so a check that printed the value with `echo`/`printf`
+# went straight to the suite's own stdout and the suite still reported 43/43 passed (measured
+# 2026-11-03). The rule is about what an OPERATOR ends up pasting into an issue, so the sweep covers
+# every stream the check can write to, not the one this harness happens to capture.
 leaked=0
-for f in "$TMP"/*.out; do
+for f in "$TMP"/*.out "$TMP"/*.stdout "$TMP"/*.err; do
+    [ -s "$f" ] || continue
     if grep -qF -- "$SECRET" "$f"; then
         fail "credential leak: $(basename "$f") contains the key's VALUE — this output is captured, mailed and pasted into issues"
         leaked=1
     fi
 done
 [ "$leaked" -eq 0 ] && pass
+# ...and the sweep is not vacuous: at least one scanned file must carry the sentinel's CASE (proving the
+# ambient fixtures really put a value in play), so "no match anywhere" is a measurement, not an empty set.
+if grep -lqF -- "SUPERSECRET_VALUE_42" "$TMP"/*.out 2>/dev/null; then
+    fail "credential leak: the transcript itself carries the value"
+else pass; fi
 
-echo "ok: $OKS assertion(s) passed; FAILURES: $FAILURES"
-[ "$FAILURES" -eq 0 ] || exit 1
+# ⛔ NO SUCCESS PREFIX ON A RED RUN. `ok: ... FAILURES: 3` is a line a log-grepper reads as a pass; the
+# sibling suites print a bare `FAILURES:` line instead, and `cell-install.sh` states the rule.
+if [ "$FAILURES" -eq 0 ]; then
+    echo "ok: $OKS assertion(s) passed"
+else
+    echo "FAILURES: $FAILURES of $((OKS + FAILURES)) assertion(s)"
+    exit 1
+fi
 exit 0
