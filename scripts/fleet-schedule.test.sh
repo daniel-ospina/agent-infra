@@ -1479,6 +1479,66 @@ else
   bad "log()/report raised UnicodeEncodeError and took the caller with it (rc=$rc18d): $out18d"
 fi
 
+# 18e — the report is emitted EXACTLY ONCE. `spawn_loop` merges stderr into stdout, so a reporter
+# that writes to both surfaces doubles every line in the one file an operator reads (~2/ TICK on a
+# persistently broken tick). `_stderr_is_stdout` is the gate; this pins it by COUNT, which the
+# original `grep -q` (presence) could never do — a mutation test showed deleting the gate left the
+# suite green while producing two lines per failure.
+out18e="$(python3 - "$SCHED" "$T/state18e" <<'PY18E' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+m.report_bookkeeping_failure(OSError(28, "No space left on device"))
+PY18E
+)"; n18e="$(grep -c 'bookkeeping write failed' <<<"$out18e" || true)"
+[ "${n18e:-0}" -eq 1 ] && ok "the failure was reported exactly ONCE (stderr and stdout merged)" \
+  || bad "the failure was reported ${n18e:-0}x, not once — a duplicate in every merged log: $out18e"
+
+# 18f — a job whose STAMP WRITE FAILS must not be wedged. `write_stamp` sits in run_job's `finally`,
+# which is the ONLY place the lock and busy marker are released: unguarded, an ENOSPC there aborted
+# the block, the lock survived holding the LOOP'S OWN live pid, `acquire_lock` then answered "already
+# running" for ever, and the job never ran again — the same closed feedback loop this change exists
+# to open, with a healthier-looking log line. Measured on the pre-fix file: the marker froze for 80s+
+# after the disk recovered and --verify returned SCHEDULE VERIFIED over a job that never runs.
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1
+pidf="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+state_reset_jobs="$FLEET_SCHEDULE_STATE/jobs"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "running as root — a 500 jobs dir blocks nothing, so the stamp-write arm cannot run here"
+else
+  chmod 500 "$state_reset_jobs" 2>/dev/null || true
+  sleep 8            # at least one tick where a due job runs and its stamp write fails
+  chmod 755 "$state_reset_jobs" 2>/dev/null || true
+  beforef=0; [ -f "$MARK" ] && beforef="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+  sleep 10           # the window in which a wedged job stays frozen
+  afterf=0; [ -f "$MARK" ] && afterf="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+  [ "${afterf:-0}" -gt "${beforef:-0}" ] \
+    && ok "a failed STAMP write did not wedge the job (it kept running after the disk recovered)" \
+    || bad "the job was WEDGED by a failed stamp write ($beforef -> $afterf runs) — the lock outlived the failure"
+fi
+kill -0 "$pidf" 2>/dev/null && ok "the loop survived the failed stamp write" \
+  || bad "the loop died on a failed stamp write"
+run "$GOOD" --stop >/dev/null 2>&1
+
+# 18g — --verify must NAME unusable stamp/calendar values, not raise. It is the surface whose whole
+# job is to diagnose bad state, and it used to traceback (aborting the check for every job after the
+# broken one) on: a stamp that is not an object, and a calendar value that is not a number.
+state_reset "$GOOD"
+run "$GOOD" --install >/dev/null 2>&1
+run "$GOOD" --stop >/dev/null 2>&1
+printf '[1, 2, 3]\n' > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+outg="$(run "$GOOD" --verify)"; rcg=$?
+[ "$rcg" -eq 1 ] && ok "a non-object stamp FAILS --verify (rc=1)" || bad "expected rc=1 for a non-object stamp, got $rcg"
+[ "$(grep -c 'Traceback' <<<"$outg")" -eq 0 ] && ok "no traceback out of --verify" \
+  || bad "--verify raised instead of reporting: $outg"
+grep -q 'not a job record' <<<"$outg" && ok "the failure names the broken stamp" \
+  || bad "the failure is not diagnosable: $outg"
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+
 # 18c — the OTHER two ways a pass can fail escape the loop, both found by fresh-context review and
 # both measured to kill the shipped pre-fix loop (rc=1, every job on the box stopped for good):
 #   (a) load_jobs() reads UNTRUSTED plists: a templates dir that passes `isdir` and then fails
@@ -1507,14 +1567,18 @@ pidc="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
 
 # ── arm (a): the templates dir cannot be read ────────────────────────────────────────────────
 if [ "$(id -u)" -eq 0 ]; then
+  # ⛔ The ASSERTION is inside the skip too. An earlier version skipped only the chmod, so under
+  # root it printed ✅ over a directory that was never made unreadable — and a mutation test showed
+  # the load_jobs guard could be reverted with the suite fully green. A vacuous ✅ is worse than a
+  # missing case: it is the false PASS this whole suite exists to prevent.
   skip "running as root — chmod 000 blocks nothing, so arm (a) cannot be exercised here"
 else
   chmod 000 "$GOOD" 2>/dev/null || true
+  sleep 10
+  kill -0 "$pidc" 2>/dev/null && ok "an unreadable templates dir did not kill the loop (previous set kept)" \
+    || bad "an unreadable templates dir killed the loop — one EACCES on the templates dir stops the whole cell"
+  chmod 755 "$GOOD" 2>/dev/null || true
 fi
-sleep 10
-kill -0 "$pidc" 2>/dev/null && ok "an unreadable templates dir did not kill the loop (previous set kept)" \
-  || bad "an unreadable templates dir killed the loop — one EACCES on the templates dir stops the whole cell"
-chmod 755 "$GOOD" 2>/dev/null || true
 
 # ── arm (b): one job's stamp is unparseable ──────────────────────────────────────────────────
 rm -f "$MARK.after"

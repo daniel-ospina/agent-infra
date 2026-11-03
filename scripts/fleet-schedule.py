@@ -1065,7 +1065,22 @@ def run_job(job):
         # rc. Writing nothing is the truthful record — the previous stamp stands (a real run at an
         # earlier time), or the job is honestly still NEVER RUN.
         if rc is not None and not exec_failed:
-            write_stamp(job.label, started, rc, time.time() - started)
+            # ⛔ THE STAMP WRITE IS GUARDED, AND IT IS THE ONLY UNGUARDED DISK WRITE IN THIS
+            # `finally` — which is the only place that unlocks the job. Measured 2026-11-03: on
+            # ENOSPC (the very trigger this change exists for) `write_stamp` raised, the `finally`
+            # aborted before `clear_busy()`/`os.unlink(lock)`, and the lock survived holding the
+            # LOOP'S OWN live pid — so `acquire_lock()` then answered "already running (lock
+            # held)" for ever, for every job that fired, including `eldato-disk-reaper`. The log
+            # said the opposite of the truth, the job never ran again, and `--verify` returned
+            # SCHEDULE VERIFIED over it for up to JOB_TIMEOUT + 3*TICK. The loop no longer DIES on
+            # a full disk; without this it merely fails to schedule anything — the same closed
+            # feedback loop with a healthier-looking log line.
+            try:
+                write_stamp(job.label, started, rc, time.time() - started)
+            except OSError as exc:
+                log("ERROR %s ran (rc=%s) but its stamp could not be written (%s: %s) — it will "
+                    "read as never run until a later run succeeds; the job is NOT wedged"
+                    % (job.label, rc, type(exc).__name__, exc))
         clear_busy(job.label)
         try:
             os.unlink(lock)
@@ -1561,6 +1576,17 @@ def cmd_verify():
         # writer only records completed runs now, but stamps written by an older copy of this
         # runtime (and by the exec-failure path, which wrote rc=127) are still on disk, and this
         # arm is what decides whether they count as evidence.
+        # ⛔ A STAMP THAT IS NOT AN OBJECT IS NOT EVIDENCE EITHER. `stamp.get("rc")` below used to
+        # inherit whatever `json.load` returned, so a stamp a foreign writer left as `[1, 2, 3]`
+        # raised AttributeError out of `--verify` — the surface whose whole job is to DIAGNOSE bad
+        # state — and aborted the check for every job after it.
+        if stamp and not isinstance(stamp, dict):
+            failures.append(
+                "%s: its last-run stamp is not a job record (%s) — a foreign or partial writer "
+                "broke it; clear: rm -f %s"
+                % (job.label, type(stamp).__name__, stamp_path(job.label))
+            )
+            continue
         if not stamp or stamp.get("rc") is None:
             failures.append(
                 "%s: declared and runnable here, but has NEVER RUN — 'scheduled' must be read from "
@@ -1593,8 +1619,22 @@ def cmd_verify():
                 % (job.label, human_secs(started - now), stamp_path(job.label))
             )
             continue
+        try:
+            due = due_at(job, stamp, now)
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            # ⛔ The same untrusted values `load_jobs` accepts (it validates a calendar's SHAPE, not
+            # its values) reach `next_occurrence`'s `int(calendar["Hour"])` here. Unguarded that
+            # raised ValueError out of `--verify`, aborting the check for every job after it — the
+            # diagnostic surface could not name the defect it exists to name. OSError belongs in the
+            # tuple too: a hugely negative `started` reaches `datetime.fromtimestamp(-1e18)`, which
+            # raises OSError (errno 75) on this platform rather than ValueError.
+            failures.append(
+                "%s: its calendar has an unusable value (%s: %s) — `is_due` cannot evaluate it, "
+                "so the job never becomes due"
+                % (job.label, type(exc).__name__, exc)
+            )
+            continue
         ran += 1
-        due = due_at(job, stamp, now)
         if due is None:
             # A calendar that never matches again is a job that is scheduled and can never run.
             # Silence here certified such a job as live, which is the same false PASS as a job
