@@ -78,6 +78,12 @@
 #   22  REFUSED diverged the running commit is neither ancestor nor descendant — nothing was touched
 #   23  REFUSED unknown the ref/repo/running commit cannot be resolved (cannot-verify is not a pass),
 #                     the materialiser failed, or the pin record could not be written
+#   24  farm-drift    the FARM ($CELL_HOME/.pi/agent/scripts) — the directory this box EXECUTES —
+#                     carries bytes the ref does not ship, is missing files it owes, or cannot be
+#                     graded at all (tortoise#10114; see PREDICATE 4). 24 is free in BOTH files, so
+#                     adding it here keeps the "ONE VOCABULARY" claim above true — `harness-refresh.sh`
+#                     already spends 25 (`behind`) and 26 (`REFUSED blocked`), and re-using either
+#                     for a different fact is the two-vocabularies defect this header rejects.
 #   25  behind        on the ref's line but older, and this box has no materialiser to advance it
 #   2   usage
 # The systemd unit treats 0/10/11 as success and everything else as RED: a refusal means a HUMAN must
@@ -121,6 +127,11 @@
 #                            (the suite drives the red arm through a stub)
 #   HARNESS_APPLY_DRIFT_DIR  OVERRIDE the checker's search root (so `absent` — the state that
 #                            leaves a pass green — is reachable in a test, not just in production)
+#   HARNESS_APPLY_FARM_CHECK 1|0 — compare the farm against the ref (default 1). A CHECK, never a copy
+#   HARNESS_APPLY_FARM_DEST  the farm directory (default $CELL_HOME/.pi/agent/scripts)
+#   HARNESS_APPLY_FARM_CHECKER  the instrument to run (default <repo>/scripts/check-farm-drift.sh,
+#                            then <this file's dir>/check-farm-drift.sh — and NEVER a copy that lives
+#                            inside the farm being graded, see PREDICATE 4)
 #
 # Run: bash scripts/harness-apply-pass.sh [--dry-run|--print-status|--help]
 #
@@ -228,6 +239,35 @@ case "$STALE_SECONDS" in
     ''|*[!0-9]*) err "HARNESS_APPLY_STALE_SECONDS must be a whole number of seconds (got '$STALE_SECONDS')"; exit 23 ;;
 esac
 [ "$STALE_SECONDS" -gt 0 ] || { err "HARNESS_APPLY_STALE_SECONDS must be positive (got '$STALE_SECONDS')"; exit 23; }
+# ⛔ AND SO IS THE FARM GATE, for the same reason AND one more: this case used to sit at the END of the
+# pass, AFTER the sync/materialiser legs had already moved the box, so a typo in this seam paid for a
+# full move and then exited 2 writing NO record — `--print-status` and fleet-health then read the
+# PREVIOUS tick as if it were this one. Validated here, a typo costs nothing (#10114 review round 2).
+# A seam that silently accepted `true`/`yes`/`flase` would let a typo DISARM a P0 guard and read green.
+case "${HARNESS_APPLY_FARM_CHECK:-1}" in
+    1) FARM_CHECK_ON=1 ;;
+    0) FARM_CHECK_ON=0 ;;
+    *) err "HARNESS_APPLY_FARM_CHECK must be 1|0 (got '${HARNESS_APPLY_FARM_CHECK:-}')"; exit 2 ;;
+esac
+# ⛔ THE FARM PATH IS RESOLVED HERE, WITH THE OTHER SEAMS, AND IT IS CHECKED FOR ABSOLUTENESS *AFTER*
+# RESOLUTION — not just as a seam. Two defects came from doing it at the finish line instead: a
+# relative `HARNESS_APPLY_FARM_DEST` was refused only at the END of the pass (so the sync/materialiser
+# move had already been paid for and NO record was written, leaving `--print-status` showing the
+# PREVIOUS tick), and a relative `CELL_HOME` was never checked at all — it produced
+# `$CELL_HOME/.pi/agent/scripts`, found nothing there, took the SKIPPED arm and reported the pass GREEN
+# over a stale farm (review round 5, reproduced). ⛔ A relative value is never expanded by
+# `Environment=` or a plist, and the unit's `cwd` is `/`.
+if [ "$FARM_CHECK_ON" = "1" ]; then
+    case "${HARNESS_APPLY_FARM_DEST:-}" in
+        '') FARM_DEST="$CELL_HOME/.pi/agent/scripts" ;;
+        /*) FARM_DEST="$HARNESS_APPLY_FARM_DEST" ;;
+        *)  err "HARNESS_APPLY_FARM_DEST must be an ABSOLUTE path (got '$HARNESS_APPLY_FARM_DEST')"; exit 2 ;;
+    esac
+    case "$FARM_DEST" in
+        /*) ;;
+        *)  err "the resolved farm path '$FARM_DEST' is not ABSOLUTE (CELL_HOME='$CELL_HOME') — a relative CELL_HOME cannot name the directory this box executes"; exit 2 ;;
+    esac
+fi
 
 # ── the pass record ────────────────────────────────────────────────────────────────────────────
 # One line of key=value, written ATOMICALLY (temp + rename): a truncated record is indistinguishable
@@ -985,6 +1025,16 @@ if [ "$DRY_RUN" = 1 ]; then
     # red a box (it changes nothing, including the exit contract).
     read_deployed_drift
     log_line "dry-run: relation=$RELATION behind=$BEHIND ahead=$AHEAD dirty=$DIRTY_N mode=$PASS_MODE — nothing was changed and no pass record was written"
+    # ⛔ THE PREVIEW MUST NOT IMPLY A CLEAN FARM IT NEVER GRADED. PREDICATE 4 runs at the END of a real
+    # pass, so a `--dry-run` that printed only `relation=current` left an operator triaging a red unit
+    # with no hint of where the red comes from. The check itself is read-only and cheap, but running it
+    # here would make the preview's verdict differ from the pass's (different point in the pass), so it
+    # is NAMED and declined instead — an abstention that says so, never a silent one.
+    if [ "$FARM_CHECK_ON" = "1" ]; then
+        log_line "dry-run: the FARM (${HARNESS_APPLY_FARM_DEST:-$CELL_HOME/.pi/agent/scripts}) was NOT graded against $REF — a real pass does that at the finish line and exits 24 on drift"
+    else
+        log_line "dry-run: the FARM was NOT graded — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed; no drift would redden a real pass either)"
+    fi
     exit 0
 fi
 
@@ -1129,6 +1179,194 @@ if [ "$PASS_MODE" = pin ]; then
         # reported, never invented. The sha record may legitimately be the only one on a box whose
         # controller was never started from a pin.
         log_line "pin: no tree at $PIN_PATH_FILE — the sha record ${REC_PIN} cannot be checked against a checkout"
+    fi
+fi
+
+# ── PREDICATE 4: THE FARM — the directory this box EXECUTES, which no other leg looks at ──────
+# ⛔ WHY THIS PREDICATE EXISTS (tortoise#10114, MEASURED 2026-11-03 on a cloud cell). This pass keeps
+# `$O` — the harness shell scripts — at the ref, and `check-deployed-drift.sh` grades exactly that
+# directory, so both read GREEN. But the actuators this box actually runs (`pr-doctor.py`,
+# `objective.py`, `fleet/`, `disk-reaper.sh`) live in the FARM, `$CELL_HOME/.pi/agent/scripts`, which
+# NOTHING on the clock compares against the ref: `pi-bootstrap/setup.sh` farms it at INSTALL time and
+# then never looks again. The measured result: `$O` clean at the pin while the farm carried a
+# `pr-doctor.py` 1445 lines behind the ref — the exact copy that brief-gate refused 100% of, the
+# no-op #10114 exists to remove, still running four days after the first hand-repair.
+#
+# ⛔ SO THE MISSING LEG IS NOT "CHECK HARDER", IT IS "CHECK THE FARM AT ALL". `scripts/
+# check-farm-drift.sh` already IS that instrument (it was written for this issue, and its exit
+# vocabulary — 0 match / 1 drift / 3 undeployable / 2 unknown — is adopted here rather than invented
+# again; a second drift checker is the defect #1178 names). This predicate puts it ON THE CLOCK, in
+# the pass that already owns deploy, so a stale farm is a RED PASS BY NAME instead of a green silence.
+#
+# ⛔ IT DOES NOT RE-FARM, and that is deliberate. Copying over a farm can destroy a local edit that
+# exists nowhere else — the `harness-provenance.sh recover` procedure exists for exactly that — so
+# this leg reports the drift and names the remedy; a human or an explicit `setup.sh` run decides.
+#
+# An ABSENT farm is SKIPPED, not red: a controller-only host farms nothing, so there is no stale
+# actuator there to be silent about. That is a verifiable fact about the box (the directory is not
+# there), not a cannot-verify — unlike an absent or unrunnable CHECKER, which is red.
+# ⛔ `-d` FOLLOWS SYMLINKS, so "not a directory" and "nothing is there" are NOT the same fact: a
+# DANGLING or relocated `$FARM_DEST` link makes `-d` false while the box still POINTS AT a farm it
+# cannot read, and passing that as SKIPPED is the false green `check-farm-drift.sh` names twice. Only
+# a path with NOTHING at it (neither a directory nor a link nor a file) may be skipped.
+if [ "$FARM_CHECK_ON" = "0" ]; then
+    # ⛔ AN ABSTENTION THAT SAYS SO, never a silent one — the same rule the preview arm below follows.
+    log_line "farm: SKIPPED — HARNESS_APPLY_FARM_CHECK=0 (deliberately disarmed; a stale farm will NOT redden this pass)"
+fi
+if [ "$FARM_CHECK_ON" = "1" ]; then
+    FARM_CHECKER="${HARNESS_APPLY_FARM_CHECKER:-}"
+    if [ -z "$FARM_CHECKER" ]; then
+        for _c in "$REPO/scripts/check-farm-drift.sh" "$HERE/check-farm-drift.sh"; do
+            [ -f "$_c" ] && { FARM_CHECKER="$_c"; break; }
+        done
+        unset _c
+    fi
+    if [ ! -d "$FARM_DEST" ] && [ ! -e "$FARM_DEST" ] && [ ! -L "$FARM_DEST" ]; then
+        # ⛔ ABSENT-BY-DEFAULT AND ABSENT-BECAUSE-MISCONFIGURED ARE DIFFERENT FACTS. A controller-only
+        # host has no farm and nothing to be stale; a box whose operator NAMED a farm that is not
+        # there has a broken config, and calling that `SKIPPED` is the silent green this leg removes.
+        if [ -n "${HARNESS_APPLY_FARM_DEST:-}" ]; then
+            REC_ACTION=farm-unverifiable
+            finish 0 24 "farm: UNKNOWN — HARNESS_APPLY_FARM_DEST names $FARM_DEST, where nothing exists; an explicitly-configured farm that is not there is a misconfiguration, not a controller-only host"
+        fi
+        # ⛔ ...AND `$HERE` IS THE CHECK ON THE SKIP LINE'S OWN CLAIM. The unit prefers
+        # `$HOME/.pi/agent/scripts/harness-apply-pass.sh`, so on a real box THIS FILE runs out of a
+        # farm: if `$FARM_DEST` names nothing while `$HERE` is farm-shaped, the line "a host that
+        # executes nothing from there cannot be stale" is FALSE about this host, and the skip would be
+        # green over the very farm the pass is executing from (review round 6).
+        case "$HERE" in
+            */.pi/agent/scripts|*/.pi/agent/scripts/)
+                REC_ACTION=farm-unverifiable
+                finish 0 24 "farm: UNKNOWN — this pass executes FROM a farm ($HERE) but $FARM_DEST names nothing (CELL_HOME='$CELL_HOME'), so the directory that is really running was never graded; pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) instead of letting it default to a path with nothing at it" ;;
+        esac
+        log_line "farm: SKIPPED — no farm at $FARM_DEST (a host that executes nothing from there cannot be stale)"
+    elif [ ! -d "$FARM_DEST" ]; then
+        REC_ACTION=farm-unverifiable
+        finish 0 24 "farm: UNKNOWN — $FARM_DEST exists (or is a link) but is NOT a readable directory, so the scripts this box executes cannot be graded — a dangling record is not an absent farm"
+    elif [ -z "$FARM_CHECKER" ] || [ ! -f "$FARM_CHECKER" ]; then
+        REC_ACTION=farm-unverifiable
+        finish 0 24 "farm: UNKNOWN — $FARM_DEST holds the scripts this box EXECUTES, but no check-farm-drift.sh could be found (looked in $REPO/scripts and $HERE) — cannot-verify is not a pass"
+    else
+        # `--ref "$REF" --no-pin-identity` deliberately. The fact under test is "are the farmed bytes
+        # the bytes the ref ships", so the grade must be pinned to the REF — and `check-farm-drift.sh`
+        # enables its PIN-IDENTITY arm by DEFAULT, which would refuse (exit 2, "COMPARING AGAINST THE
+        # WRONG TREE") before grading a single file whenever this box's pin record disagrees with the
+        # checkout. That refusal is a real finding, but it belongs to the deploy leg's own
+        # `pin-lies`/`cannot-verify` arms (exit 25/23 below), not here: without `--no-pin-identity` a
+        # perfectly fresh farm on a pin-lagged box would be reported as farm drift with the wrong
+        # remedy (#10114 review).
+        # ⛔ A CHECKER THAT LIVES INSIDE THE FARM CANNOT GRADE THE FARM. The systemd unit runs this
+        # pass FROM the farm (`install-harness-apply-timer.sh` prefers
+        # `$HOME/.pi/agent/scripts/harness-apply-pass.sh`), so `$HERE` IS `$FARM_DEST` there — and on a
+        # checkout older than this feature `$REPO/scripts/check-farm-drift.sh` is absent, so the
+        # fallback would execute the farm's own (possibly stale) checker over the farm's own
+        # population. That is the fail-open shape this leg exists to remove, so it refuses instead.
+        # ⛔ RESOLVE THE CHECKER'S FINAL TARGET, not just its directory. `pwd -P` resolves the DIR and
+        # appends `basename` unresolved, and comparing against `$FARM_DEST/$(basename ...)` only catches
+        # a link that keeps its NAME — so `grade.sh -> $FARM/_sub/check-farm-drift.sh` (another name,
+        # another path) graded the farm from inside it and printed `farm: ok` (review rounds 2 and 3,
+        # both reproduced). ⛔ `readlink -f` is NOT used: it is a BSD portability trap
+        # (`check-portability-traps.sh`) and this pass runs on macOS — the loop is bash-3.2 safe, with a
+        # bound so a link cycle ends in a refusal instead of a hang.
+        FARM_CHECKER_T="$FARM_CHECKER"; _hops=0
+        while [ -L "$FARM_CHECKER_T" ] && [ "$_hops" -lt 40 ]; do
+            # ⛔ A FAILED `readlink` USED TO `break`, leaving `FARM_CHECKER_T` still the SYMLINK — and a
+            # symlink path is only partly resolved below (`pwd -P` on its DIR + the unresolved basename),
+            # so the containment test read it as OUTSIDE the farm and the leg then EXECUTED it, letting
+            # the farm grade itself green (review round 4, reproduced with a `readlink` that exits 1).
+            # A link whose target cannot be located cannot be ruled outside the farm, so it refuses.
+            _l="$(readlink "$FARM_CHECKER_T" 2>/dev/null)" || {
+                REC_ACTION=farm-unverifiable
+                finish 0 24 "farm: UNKNOWN — readlink failed on $FARM_CHECKER_T, so the checker's FINAL target cannot be resolved, and a copy that cannot be located cannot be ruled outside the farm"
+            }
+            case "$_l" in
+                /*) FARM_CHECKER_T="$_l" ;;
+                *) FARM_CHECKER_T="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$_l" ;;
+            esac
+            _hops=$((_hops + 1))
+        done
+        unset _l
+        # ⛔ THE HOP CAP IS A REFUSAL TOO. A chain longer than the bound exits the loop above with
+        # `-L` STILL TRUE, i.e. with the same half-resolved path the failed-`readlink` arm now refuses.
+        if [ -L "$FARM_CHECKER_T" ]; then
+            REC_ACTION=farm-unverifiable
+            finish 0 24 "farm: UNKNOWN — $FARM_CHECKER is a symlink chain that did not resolve within 40 hops, so where it points cannot be established"
+        fi
+        FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
+        FARM_DEST_REAL="$(cd "$FARM_DEST" 2>/dev/null && pwd -P)"
+        # ⛔ ...AND IT MUST BE THE FARM THIS PASS RUNS FROM. The `case "$HERE"` refusal above only fires
+        # when `$FARM_DEST` names NOTHING; when it names a DIFFERENT farm that exists, the pass grades
+        # that one and reports green over the farm it is executing (review round 7, reproduced with two
+        # farms on one box). On the production install path the two are equal — the unit runs
+        # `$HOME/.pi/agent/scripts/harness-apply-pass.sh` and `$FARM_DEST` defaults to
+        # `$CELL_HOME/.pi/agent/scripts` — so this creates no false red where the box is consistent.
+        case "$HERE" in
+            */.pi/agent/scripts|*/.pi/agent/scripts/)
+                HERE_REAL="$(cd "$HERE" 2>/dev/null && pwd -P)"
+                if [ -n "$HERE_REAL" ] && [ "$HERE_REAL" != "$FARM_DEST_REAL" ]; then
+                    REC_ACTION=farm-unverifiable
+                    finish 0 24 "farm: UNKNOWN — this pass executes FROM $HERE_REAL but grades $FARM_DEST_REAL; the farm that is really running was never graded — pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) to the one the units execute"
+                fi ;;
+        esac
+        if [ -n "$FARM_DEST_REAL" ] && [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ]; then
+            REC_ACTION=farm-unverifiable
+            finish 0 24 "farm: UNKNOWN — the only check-farm-drift.sh found ($FARM_CHECKER) lives INSIDE the farm it would grade, and a copy that grades itself cannot answer whether it is stale — install the CHECKER from a ref-consistent checkout"
+        fi
+        FARM_OUT="$(bash "$FARM_CHECKER" --src "$REPO" --ref "$REF" --dest "$FARM_DEST" --no-pin-identity 2>&1)"
+        FARM_RC=$?
+        # The checker's own per-file vocabulary, matched on the FINAL column, and ONLY the four it
+        # actually prints as a verdict. `MISSING` and `LOCAL (undeclared)` are not tokens it emits;
+        # `SYMLINK` IS printed (`check-farm-drift.sh:485`, "SYMLINK (graded via its target)") but that
+        # row is INFORMATIONAL — a healthy link — so matching the bare token would name a good file as
+        # drift the moment the anchor is relaxed (#10114 review round 2).
+        FARM_NAMED="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}' | head -6 | paste -sd, -)"
+        case "$FARM_RC" in
+            0)
+                log_line "farm: ok — $FARM_DEST matches $REF" ;;
+            1|3)
+                # 3 ("a deploy cannot fix it") is folded in on purpose: an UNSOURCED or
+                # not-farm-declared stale file is drift this box EXECUTES, and the one thing it must
+                # never be is a green pass because the fix is awkward.
+                REC_ACTION=farm-drift
+                # ⛔ THE INSTRUMENT'S OWN REMEDY, NOT ONE OF OURS. `check-farm-drift.sh` separates
+                # three classes with three DIFFERENT remedies and says so in its own words ("A deploy
+                # cannot fix this one", "declare it LOCAL, delete, or retire … never re-run the farm").
+                # Prescribing "re-farm" for an UNSOURCED or not-farm-declared row contradicts the run
+                # that just produced it, and the reviewer's own measurement of this box's first repair
+                # was exactly that shape (one row was a LAYOUT MOVE, not a copy). So its `Next:` line
+                # and per-file rows are forwarded verbatim.
+                # ⛔ THE REMEDY IS THE LAST LINE THE INSTRUMENT PRINTS, and it prints one row PER FILE,
+                # unbounded (#1552 measured 27 files on one box). A single `head -12` over both cut the
+                # remedy off at exactly the states that need it (#10114 review round 7, reproduced with
+                # a 20-row farm). So the rows are a bounded excerpt — SAYING it is an excerpt — and the
+                # remedy is forwarded separately and unconditionally.
+                # ⛔ MATCH THE FINAL COLUMN, NOT THE WHOLE LINE. The instrument prints four unconditional
+                # CLASS-PROSE lines ("A STALE file is a copy launchd/systemd will EXECUTE…"), so a
+                # whole-line grep counts prose as file rows — 3 real rows measured as "7 row(s)"
+                # (#10114 review round 8). `FARM_NAMED` above uses the same predicate; reuse it.
+                FARM_ROWS="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
+                FARM_NROWS="$(printf '%s' "$FARM_ROWS" | grep -c .)"
+                # ⛔ THE REMEDY IS A BLOCK, NOT A LINE. Two of the instrument's three remedies are TWO
+                # lines and the CONTINUATION carries the actions ("…, delete it, or retire it in
+                # pi-bootstrap/farm-retired.txt; then re-run this."), so forwarding only the `Next:`
+                # line cut the remedy mid-word for exactly the classes whose remedy differs from
+                # "re-farm" (#10114 review round 8). Everything from the first `Next:` to EOF.
+                FARM_REMEDY="$(printf '%s\n' "$FARM_OUT" | sed -n '/^[[:space:]]*Next:/,$p' | head -8)"
+                log_line "farm: $REF ships different bytes than $FARM_DEST execute — $FARM_NROWS row(s) from the instrument:"
+                printf '%s\n' "$FARM_ROWS" | head -12 | while IFS= read -r _row; do
+                    log_line "farm:   $_row"
+                done
+                if [ "$FARM_NROWS" -gt 12 ]; then
+                    log_line "farm:   … and $((FARM_NROWS - 12)) more row(s) in the instrument's own output"
+                fi
+                [ -n "$FARM_REMEDY" ] && printf '%s\n' "$FARM_REMEDY" | while IFS= read -r _row; do
+                    log_line "farm:   $_row"
+                done
+                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships (${FARM_NROWS} row(s) above, with the instrument's own remedy — a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
+            *)
+                REC_ACTION=farm-unknown
+                finish 0 24 "farm: UNKNOWN (check-farm-drift rc=$FARM_RC) — $FARM_DEST could not be graded against $REF, and cannot-verify is not a pass: $(printf '%s' "$FARM_OUT" | grep -m1 -iE 'unknown|cannot|refus' || printf 'no reason printed')" ;;
+        esac
     fi
 fi
 
