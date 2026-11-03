@@ -999,12 +999,14 @@ def acquire_lock(label):
                 os.close(fd)
             return path
         except OSError:
-            # Either the exclusive create lost the race (FileExistsError, handled below) or the
-            # write failed. In BOTH cases the file may exist and may be unusable; fall through to
-            # the same steal-or-refuse logic rather than propagating an exception that aborts the
-            # pass and wedges the job.
-            if not os.path.exists(path):
-                raise
+            # Either the exclusive create lost the race (FileExistsError) or the write failed. In
+            # BOTH cases fall through to the same steal-or-refuse logic rather than propagating.
+            # ⚠️ NOT `if not exists: raise`: a holder that releases between our O_EXCL and this
+            # probe made that raise FileExistsError out of acquire_lock, which the loop's per-job
+            # guard absorbed but which aborted `--install`'s inline pass with a traceback (measured
+            # in the case-14 shape, where --install runs while the loop holds a job's lock). A
+            # vanished lock is a LOST RACE, which the retry loop below already answers.
+            pass
         try:
             with open(path) as fh:
                 pid = int(fh.read().strip().split()[0])
