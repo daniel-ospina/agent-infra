@@ -93,6 +93,28 @@ API keys. Transfer it (AirDrop works — it's tiny).
 4. **After confirming pi works: delete `pi-keys.env`** (or store it in a
    password manager) — it contains your secrets.
 
+**One key is not like the others: `TORTOISE_MCP_API_KEY`.** The graph mandate (read the hosted
+Tortoise graph before researching, confirm direction in it before implementing, write the learning
+after) needs it, and nothing in this repo can deliver it — there is no secret store wired to the
+fleet, so it is HAND-PROVISIONED: it must be a line in `pi-keys.env` here (and in a cell's `keys.env`).
+⛔ **Step 3 item 4's "delete `pi-keys.env`" does not apply to this key** — nothing re-creates it (unlike
+the provider keys, which pi keeps after `/login`), so keep the `pi-keys.env` file itself (and the line
+in it) rather than copying the key somewhere tidier. It is the only file the setup sources into your
+profile — but note that a profile only covers INTERACTIVE sessions: a Mac **lane** receives the file
+through `scripts/orchestrator-harness/worker-terminal.sh`, which emits it **only when `pi-keys.env`
+also assigns the model-provider key** that launch line resolves. So on a Mac whose provider credential
+comes from `/login` instead (Step 3 item 3), a graph key living in `pi-keys.env` reaches no lane, and
+every lane reports `GRAPH-UNREACHABLE(NO-KEY)` — the dependency is real and is stated here rather than
+rediscovered as a mystery. Losing it silently is the one outcome worse than a loud NO-KEY.
+The client itself (`~/.pi/agent/scripts/tortoise-graph.sh`) IS delivered by the setup — it is farmed
+from this repo — so a box with NEITHER name set reports `GRAPH-UNREACHABLE(NO-KEY)` on every call (with
+only the REST name `TORTOISE_API_KEY` present the client takes that fallback and reports the endpoint's
+verdict instead — often `GRAPH-UNREACHABLE(HTTP 401)`, because the REST key is not the MCP key).
+`bash ~/.pi/agent/scripts/tortoise-graph.sh health` is the local reading; on a cell,
+`bash scripts/cloud-cell-bringup.sh --check` additionally warns by variable NAME, never its value.
+Re-generate it from the Tortoise dashboard at `tortoise.premiselabs.co` (the sign-up site, not the API
+host).
+
 > Tip: if you ever lose the file, every key is re-generatable from each
 > provider's dashboard (DeepSeek, OpenRouter, Z.ai, Anthropic, Moonshot, Qwen).
 
