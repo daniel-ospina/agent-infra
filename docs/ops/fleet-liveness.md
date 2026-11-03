@@ -1675,7 +1675,9 @@ prunes it — so an earlier run's `[lane-bound] VERDICT verdict=finished … rc=
 the 8 KiB tail until new output pushes it out. Adopting that publishes a **previous
 dispatch's** outcome as this lane's: a false PASS over work nobody re-dispatches, in the
 one state whose whole job is to stop exactly that. (A `--verdict-file` left behind by an
-earlier run has the same shape.) So the line's own `pid=` is parsed
+earlier run has the same shape — **and it is bound by the identical rule**, because it is read
+FIRST: an unbound file arm made the stale file a false PASS that also *outranked* the fresh,
+correctly-bound line in the log's own tail. A dropped file verdict now falls through to the tail.) So the line's own `pid=` is parsed
 (`parse_bound_pid` → `LogRead.verdict_line_pid`) and the verdict is adopted only when it
 is **this** incarnation:
 
@@ -1686,6 +1688,7 @@ is **this** incarnation:
 | a live pid outside that tree | `stale-bound-verdict` | **dropped** → `no-verdict` |
 | a pid that cannot be resolved | `unbound-bound-verdict` | **dropped** → `no-verdict` |
 | absent from the line | `bound-verdict-without-pid` | adopted, and said so |
+| (the same five rules apply to `--verdict-file`, and to column 11 of `--log-census`) | | |
 
 `lane-bound.sh` writes **its own** `${PID}`, which in `run` mode is the child it
 supervised — not necessarily the tree root a caller asks about — which is why the test is
@@ -1731,7 +1734,7 @@ filed as a follow-up rather than bolted on here.
 ```text
 liveness.py --log L-x.log --pid 1234 --start-seconds <epoch> [--verdict-file F] [--transcript T]
             [--window-ms N] [--no-sample] [--json]
-liveness.py --log-census  < pid\tlog\tsize_delta\tcpu_delta_cs\tverdict\talive\tage_ms\tbytes\ttranscript_grew\trc
+liveness.py --log-census  < pid\tlog\tsize_delta\tcpu_delta_cs\tverdict\talive\tage_ms\tbytes\ttranscript_grew\trc[\tverdict_pid]
 ```
 
 `--start-seconds` is the process's start **epoch** (the same field the store's `pidStartSeconds`
@@ -1747,8 +1750,15 @@ that judged 76 lanes must not sleep 30 s per lane — the caller owns the two sa
 publish the same states from the same function; there is no state decided at the seam that
 `log_lane_verdict` does not decide.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (43 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (57 mutations, each of which must make its paired
+The census row's **10th column is `rc`, and its optional 11th is `verdict_pid`** — the `pid=` on the
+line the verdict came from. Without it the census was the fail-open door for the very class the
+binding exists to close: a caller that had just parsed `verdict=finished` out of an APPENDED log could
+hand the token over and have a previous dispatch's outcome published on the surface §13.5 names as the
+fleet reader's home. A row whose `verdict_pid` does not resolve inside the queried tree is dropped to
+`no-verdict` exactly as in `gather_log_lane`.
+
+Regression contract: `python3 tools/fleet/liveness.test.py` (46 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (61 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder). Their paired mutations re-introduce the exact pre-fix behaviours — the
@@ -1758,5 +1768,7 @@ absent log as a death witness, the log axis masking a session query, every bound
 fractional seconds, a skipped unparseable CPU row, the census's loose `alive` decode, the census's
 unfiltered verdict token, a `?` CPU channel counting as read, the inverted sample delta, a
 non-regular file read as a readable log, a negative CPU delta read as flat, an unvalidated verdict
-token reaching `dead`, an `rc=` swallowed from `log=`, the census asserting a log is readable, and a
-verdict adopted from an earlier dispatch's line.
+token reaching `dead`, an `rc=` swallowed from `log=`, the census asserting a log is readable, a
+verdict adopted from an earlier dispatch's line, an UNBOUND `--verdict-file`, a dropped file verdict
+blocking the lane's own log line, a drop reason clobbering the absence it should accompany, and a
+census that ignores `verdict_pid`.

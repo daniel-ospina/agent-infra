@@ -2298,11 +2298,21 @@ def gather_log_lane(
     if verdict_file:
         try:
             with open(verdict_file, "r", encoding="utf-8", errors="replace") as fh:
-                v, rc = parse_bound_line(fh.read())
+                raw = fh.read()
         except OSError:
-            v, rc = "", None
+            raw = ""
+        v, rc = parse_bound_line(raw)
         if v:
             lr.verdict, lr.rc, lr.verdict_source = v, rc, "verdict-file"
+            # ⛔ THE FILE IS BOUND EXACTLY LIKE THE TAIL. Leaving this unset made the
+            # file arm the one unbound door: its verdict was adopted while the detail
+            # claimed `bound-verdict-without-pid` about a line that DID carry a pid —
+            # so a `$log.lanebound` left by an earlier dispatch was still a false PASS,
+            # and it outranked the fresh bound tail (this arm runs first).
+            lr.verdict_line_pid = parse_bound_pid(raw)
+
+    # No file verdict (or no file at all): the tail is the programmatic fallback, because
+    # a lane launched without `--verdict-file` still PRINTS its verdict.
     if not lr.verdict and lr.readable:
         tail = _log_tail(log_path)
         v, rc = parse_bound_line(tail)
@@ -2318,20 +2328,50 @@ def gather_log_lane(
     # verified inside the queried tree", and an UNVERIFIABLE binding drops the verdict.
     # Dropping it yields `no-verdict` (never `finished`, never `dead`): the
     # over-refusal direction, which is the only acceptable one here.
-    if lr.verdict:
+    def _bind():
+        """Adopt the acquired verdict only if it names THIS incarnation.
+
+        Returns ``(why_dropped, note)``: ``why_dropped`` is set when the verdict must
+        NOT be adopted, ``note`` when it WAS adopted but the binding is only declared
+        (a line naming no incarnation). The caller APPENDS either to `lr.detail` rather
+        than assigning it: acquisition has already recorded facts the abstention reasons
+        are built from (`absent:<path>`, `not-a-regular-file:...`, `probe rc=...`), and
+        clobbering them published a different fact than the true one.
+        """
         line_pid = lr.verdict_line_pid
-        if line_pid:
-            within = _pid_within(int(pid), int(line_pid))
-            if within is False:
-                lr.detail = ("stale-bound-verdict line_pid=%s query_pid=%s source=%s"
-                             % (line_pid, pid, lr.verdict_source))
-                lr.verdict, lr.rc = "", None
-            elif within is None:
-                lr.detail = ("unbound-bound-verdict line_pid=%s query_pid=%s source=%s"
-                             % (line_pid, pid, lr.verdict_source))
-                lr.verdict, lr.rc = "", None
-        else:
-            lr.detail = "bound-verdict-without-pid source=%s" % (lr.verdict_source or "log")
+        if not line_pid:
+            # §13's table: a line that names NO incarnation is ADOPTED and declared
+            # unbound — dropping it would refuse every supervisor that does not print
+            # `pid=`, which is a different trade than an unverifiable binding.
+            return None, "bound-verdict-without-pid source=%s" % (lr.verdict_source or "log")
+        within = _pid_within(int(pid), int(line_pid))
+        if within is False:
+            return (("stale-bound-verdict line_pid=%s query_pid=%s source=%s"
+                     % (line_pid, pid, lr.verdict_source)), "")
+        if within is None:
+            return (("unbound-bound-verdict line_pid=%s query_pid=%s source=%s"
+                     % (line_pid, pid, lr.verdict_source)), "")
+        return None, ""
+
+    if lr.verdict:
+        why, note = _bind()
+        if why and lr.verdict_source == "verdict-file":
+            # ⛔ A DROPPED FILE VERDICT MUST NOT BLOCK THE LANE'S OWN. The file is read
+            # first, so without this fall-through a stale `$log.lanebound` would suppress
+            # the fresh, correctly-bound line in the log's own tail.
+            lr.verdict, lr.rc, lr.verdict_line_pid = "", None, ""
+            if lr.readable:
+                tail = _log_tail(log_path)
+                v, rc = parse_bound_line(tail)
+                if v:
+                    lr.verdict, lr.rc, lr.verdict_source = v, rc, "log"
+                    lr.verdict_line_pid = parse_bound_pid(tail)
+                    why, note = _bind() if lr.verdict else (why, note)
+        if note:
+            lr.detail = " | ".join(x for x in (lr.detail, note) if x)
+        if why:
+            lr.detail = " | ".join(x for x in (lr.detail, why) if x)
+            lr.verdict, lr.rc = "", None
 
     # S2, reading 1.
     cpu0 = subtree_cpu_cs(pid)
@@ -2452,7 +2492,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
     Two shapes, and they answer different questions:
 
       ``--log <file> --pid <pid>``   one lane, sampled over ``--window-ms``
-      ``--log-census``              MANY lanes, stdin ``pid\\tlog\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc``
+      ``--log-census``              MANY lanes, stdin ``pid\\tlog\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc[\\tverdict_pid]``
                                     (``?`` or empty = NOT READ = abstain) — the deltas
                                     come FROM THE CALLER, because a census that judged 76
                                     lanes must not sleep 30 s per lane; the caller
@@ -2551,11 +2591,28 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
                 return None  # "", "?", "2", "gone" … — NOT READ
 
             verdict = f[4] if len(f) > 4 and f[4] in BOUND_VERDICTS else ""
+            verdict_pid = f[10].strip() if len(f) > 10 else ""
             path = f[1] if len(f) > 1 else ""
             lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=_opt(3),
                          window_ms=window_ms, verdict=verdict,
                          rc=(f[9] if len(f) > 9 and f[9] not in ("", "?") else None),
+                         verdict_line_pid=verdict_pid if verdict_pid.isdigit() else "",
                          verdict_source="caller" if verdict else "")
+
+            # ⛔ THE CENSUS MUST ENFORCE THE BINDING TOO, OR IT IS THE FAIL-OPEN DOOR.
+            # Column 5 is only a token; without the line's own pid a caller that just
+            # parsed `verdict=finished` out of an APPENDED log publishes a previous
+            # dispatch's outcome here, on the surface §13.5 names as the fleet reader's
+            # home. Same rule as `gather_log_lane`, same three outcomes.
+            if lr.verdict and lr.verdict_line_pid:
+                within = _pid_within(int(f[0]), int(lr.verdict_line_pid))
+                if within is not True:
+                    lr.detail = " | ".join(x for x in (
+                        lr.detail,
+                        "%s-bound-verdict line_pid=%s query_pid=%s source=census"
+                        % ("stale" if within is False else "unbound",
+                           lr.verdict_line_pid, f[0])) if x)
+                    lr.verdict, lr.rc = "", None
             # ⛔ THE SEAM MUST NOT ASSERT THAT A LOG IS READABLE. Decoding `alive`,
             # `verdict` and `rc` strictly while hard-coding `readable=True` made an
             # ABSENT or DELETED log publish a state (`frozen`, or `dead` when the row
@@ -2625,7 +2682,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("usage: liveness.py --sid <session-id> [--store PATH] [--sessions-dir DIR] [--json]\n"
               "       liveness.py --log <file> --pid <pid> [--start-seconds N] [--verdict-file F]\n"
               "                   [--transcript T] [--window-ms N] [--no-sample] [--json]\n"
-              "       liveness.py --log-census  < pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc]",
+              "       liveness.py --log-census  < pid\\tlog[\\tsize_delta\\tcpu_delta_cs\\tverdict\\talive\\tage_ms\\tbytes\\ttranscript_grew\\trc[\\tverdict_pid]]",
               file=sys.stderr)
         return 2
     if not sid:

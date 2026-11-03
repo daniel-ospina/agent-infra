@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Forty-three tests with fifty-seven paired mutations: every mutation re-
+Forty-six tests with sixty-one paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 31 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (57)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (61)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1912,25 +1912,37 @@ def t43():
         # as well: the over-refusal direction is the only acceptable one, and the state
         # is still terminal-and-honest (`no-verdict`), never `finished`, never `dead`.
         with open(log, "w", encoding="utf-8") as fh:
-            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=424242 rc=0 "
-                     "log=%s\n" % log)
+            # A pid that CANNOT exist: `#define PID_MAX_DEFAULT 4194304` on Linux, so
+            # 2**31-1 is never live. (`424242` was used here and is a perfectly legal
+            # pid on any host — on a box where it happened to run, `_pid_within`
+            # returned False, the reason became `stale`, and this assertion went RED for
+            # a non-defect: a false RED in the acceptance suite.)
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=0 "
+                     "log=%s\n" % (2 ** 31 - 1, log))
         lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
         check(lr.verdict == "", "an unverifiable binding is dropped; got %r" % (lr.verdict,))
         check("unbound-bound-verdict" in lr.detail, "and named; got %r" % lr.detail)
         check(liv.evaluate(liv.Evidence(log_read=lr)).state == "no-verdict",
               "still terminal, still honest")
+        # ⛔ RE-GATHER: the previous sub-case already dropped its verdict, so evaluating
+        # that stale `LogRead` asserted a conclusion about an object the appended log
+        # never reached — "asserted evidence it does not have", the class this suite's
+        # own header warns about.
         with open(log, "w", encoding="utf-8") as fh:
             fh.write("[lane 3] cwd=/repo\n")
             fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=1 rc=0 "
                      "elapsed=612s log=%s\n" % log)
             fh.write("[lane 3] exited 0\n=== next dispatch ===\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check(lr.verdict == "", "the appended log's stale verdict is dropped; got %r"
+              % (lr.verdict,))
         v = liv.evaluate(liv.Evidence(log_read=lr))
         check(v.state == "no-verdict",
               "the previous dispatch's `finished` must NOT be published as this lane's; got %s"
               % v.state)
         check(v.state != "finished" and v.state != "dead",
               "never a false PASS and never a death")
-        check("bound-verdict" in v.detail,
+        check("stale-bound-verdict" in v.detail,
               "the reason travels into the verdict; got %r" % v.detail)
 
         # …and a verdict naming THIS incarnation is still adopted.
@@ -1947,6 +1959,109 @@ def t43():
         check(lr.verdict == "finished", "an unbound verdict is adopted; got %r" % (lr.verdict,))
         check("bound-verdict-without-pid" in lr.detail,
               "but it says it is unbound; got %r" % lr.detail)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T44 a stale --verdict-file is bound like the tail, and cannot outrank a fresh log line")
+
+
+def t44():
+    d = tempfile.mkdtemp(prefix="liv-vfile-")
+    try:
+        log = os.path.join(d, "lane-1.log")
+        vfile = os.path.join(d, "lane-1.log.lanebound")
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = child.pid
+        child.wait()
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=0\n" % dead)
+
+        # 1. The file names ANOTHER incarnation: dropped, named, and the fresh correctly
+        #    bound line in the log's own tail is what gets adopted.
+        with open(vfile, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=stalled tag=lane pid=1 rc=137\n")
+        lr = liv.gather_log_lane(log, dead, verdict_file=vfile, sample=False, now_ms=NOW_MS)
+        check(lr.verdict_source == "log",
+              "the stale file must not outrank the lane's own line; got source=%r"
+              % (lr.verdict_source,))
+        check((lr.verdict, lr.rc) == ("finished", "0"),
+              "and the bound log line is adopted; got %r" % ((lr.verdict, lr.rc),))
+
+        # 2. The file names THIS incarnation: adopted from the file.
+        with open(vfile, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=stalled tag=lane pid=%d rc=137\n" % dead)
+        lr = liv.gather_log_lane(log, dead, verdict_file=vfile, sample=False, now_ms=NOW_MS)
+        check((lr.verdict, lr.verdict_source) == ("stalled", "verdict-file"),
+              "a bound file verdict IS adopted; got %r" % ((lr.verdict, lr.verdict_source),))
+
+        # 3. No log line at all + a stale file: dropped, terminal, never `finished`.
+        os.remove(log)
+        with open(vfile, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=1 rc=0\n")
+        lr = liv.gather_log_lane(log, dead, verdict_file=vfile, sample=False,
+                                 now_ms=NOW_MS, window_ms=1)
+        check(lr.verdict == "", "a stale file alone is dropped; got %r" % (lr.verdict,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state not in ("finished", "dead", "frozen"),
+              "and no state is manufactured from it; got %s" % v.state)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T45 the drop reason APPENDS to acquisition's own facts instead of replacing them")
+
+
+def t45():
+    d = tempfile.mkdtemp(prefix="liv-append-")
+    try:
+        log = os.path.join(d, "absent.log")          # never created
+        vfile = os.path.join(d, "v")
+        with open(vfile, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=1 rc=0\n")
+        lr = liv.gather_log_lane(log, os.getpid(), verdict_file=vfile, sample=False,
+                                 now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown", "an absent log is the abstention; got %s" % v.state)
+        check("absent" in v.detail,
+              "and the ABSENCE is still what it reports, not the binding note; got %r"
+              % v.detail)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T46 the --log-census seam enforces the verdict binding too (col 11 = verdict_pid)")
+
+
+def t46():
+    d = tempfile.mkdtemp(prefix="liv-census-")
+    try:
+        log = os.path.join(d, "L.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = child.pid
+        child.wait()
+        size = os.path.getsize(log)
+
+        def row(verdict_pid):
+            return ("%d\t%s\t0\t?\tfinished\t0\t999999\t%d\t?\t0\t%s\n"
+                    % (dead, log, size, verdict_pid))
+
+        # A verdict naming ANOTHER live incarnation must not be published.
+        out = subprocess.run([sys.executable, liv.__file__, "--log-census"],
+                             input=row("1").encode(), stdout=subprocess.PIPE).stdout.decode()
+        check("finished" not in out,
+              "the census must not publish another incarnation's verdict; got %r" % out)
+        check("no-verdict" in out,
+              "it must fall to the terminal-and-honest state; got %r" % out)
+
+        # …and one naming THIS one still is.
+        out = subprocess.run([sys.executable, liv.__file__, "--log-census"],
+                             input=row(str(dead)).encode(),
+                             stdout=subprocess.PIPE).stdout.decode()
+        check("finished" in out,
+              "a correctly bound census verdict IS published; got %r" % out)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2360,11 +2475,38 @@ MUTATIONS = [
     ),
     Mutation(
         "T43", "module",
-        '            if within is False:',
-        '            if False:',
+        '        if within is False:',
+        '        if False:',
         "a verdict naming ANOTHER incarnation is adopted, so a previous dispatch's "
         "`finished` is published as this lane's — a false PASS over work nobody "
         "re-dispatches (the appended-log case)",
+    ),
+    Mutation(
+        "T44", "module",
+        '            lr.verdict_line_pid = parse_bound_pid(raw)',
+        '            pass',
+        "the verdict FILE is never bound, so a `$log.lanebound` left by an earlier "
+        "dispatch is a false PASS and outranks the fresh bound log line",
+    ),
+    Mutation(
+        "T44", "module",
+        '        if why and lr.verdict_source == "verdict-file":',
+        '        if False:',
+        "a dropped file verdict BLOCKS the lane's own correctly-bound log line",
+    ),
+    Mutation(
+        "T45", "module",
+        '            lr.detail = " | ".join(x for x in (lr.detail, why) if x)',
+        '            lr.detail = why',
+        "the drop reason CLOBBERS acquisition's facts, publishing a different fact than "
+        "the true one (`absent:<path>` lost)",
+    ),
+    Mutation(
+        "T46", "module",
+        '            if lr.verdict and lr.verdict_line_pid:',
+        '            if False:',
+        "the census seam does not enforce the binding, so the fleet-wide surface stays "
+        "fail-open on a previous dispatch's verdict",
     ),
 ]
 
