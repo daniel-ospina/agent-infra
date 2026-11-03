@@ -1009,6 +1009,29 @@ ck "§LB chain-merge.sh maps a 'land' record to exit 74 (got $BOUNDED_RC) — no
 grep -q 'land-backlog: lane-106' "$O/logs/chain-106.log"; rc=$?
 ck "§LB …and says it is NOT a capacity transfer (the remedy is to land, not to wait for a peer)" $rc
 
+# ⛔ AND THE KEY REFUSAL HAS ITS OWN CODE AND ITS OWN WORDS (agent-infra#3331, review round 3 P2). The key
+# gate refuses BEFORE the agent, so the record is the ONLY thing that stops the chain waiting 90 minutes
+# while holding refs/claims/issue-<N> — and an unnamed gate word is folded to `load` by
+# `cap_refusal_gate`, so the operator would be told to wait for load on a box whose credential never
+# arrives. Driven end to end: a `key` record must exit 82, must NOT read as load, and must name the
+# credential remedy. `acquire_claim` at a fresh issue number so the release path is the real one.
+acquire_claim 108
+NOW3="$(date +%s)"; EP3=$(( NOW3 - 1 ))
+printf '%s\t%s\t%s\n' "$EP3" "$(( EP3 + 900 ))" "key" > "$O/state/capacity-refused-108"
+run_bounded 20 env O="$O" CHAIN_POLLS=6 CHAIN_POLL_SECS=5 PATH="$PATH" \
+  CHAIN_CLAIM_COMMIT="$(chain_gen 108)" \
+  bash "$CHAIN" "$TMP/box" daniel-ospina/agent-infra 108 feat/108-tm
+{ [ "$BOUNDED_RC" -eq 82 ]; }; rc=$?
+ck "§LB chain-merge.sh maps a 'key' record to exit 82 (got $BOUNDED_RC) — not 75, not a 90-minute wait" $rc
+grep -q 'credential refusal: lane-108' "$O/logs/chain-108.log"; rc=$?
+ck "§LB …and names the CREDENTIAL remedy (not a load wait) — 'credential refusal' present in the chain log" $rc
+grep -q 'refused at the load gate' "$O/logs/chain-108.log"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "§LB …and does NOT report it as a load refusal (the two remedies are mutually exclusive)" $rc
+KEY_GATE_REFUSED_DECL="$(sed -n 's/^KEY_GATE_REFUSED=//p' "$HERE/key-gate.sh" | head -1)"
+[ "${KEY_GATE_REFUSED_DECL:-}" = "82" ]; rc=$?
+ck "§LB …and the code the chain reports is the gate's OWN declared constant (key-gate.sh KEY_GATE_REFUSED='${KEY_GATE_REFUSED_DECL:-<none>}')" $rc
+
 # ── the derivation, driven directly, so the SIZING RULE is a measurement and not a slogan ──
 # Little's law in practice: L_max = λW. 40 landings/24h with a 24h lead budget allows 40 open; with a
 # 48h budget it allows 80. A fixed count could not tell agent-infra (0.6/h) from tortoise (2.6/h).

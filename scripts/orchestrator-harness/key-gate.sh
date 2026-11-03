@@ -42,6 +42,15 @@
 # checked. `key_gate_var` is the same three-line rule as `worker-terminal.sh::wt_provider_key_var`, and
 # key-gate.test.sh drives BOTH against one fixture matrix and requires identical answers — the two
 # cannot drift apart silently, which is the only thing that makes a second reader of that rule safe.
+#
+# ⛔ AND `pi` DOES NOT ALWAYS NEED THE ENVIRONMENT VARIABLE — `auth.json` COMES FIRST (review round 3,
+# P1, measured). `pi`'s resolution is STORED CREDENTIAL (`$HOME/.pi/agent/auth.json`, what `pi /login`
+# writes) → environment → the `models.json` template. So a box whose lane provider was logged in with
+# `/login` runs fine with the variable unset, and a gate that refused on the variable alone refused a
+# lane that WOULD have worked — the false-block direction, on a supported configuration (the provider
+# is settable from `keys.env`, and the fleet's own `provider-credential.test.sh` documents the store).
+# `key_gate_stored_credential` is therefore consulted BEFORE the refusal, and its answer is the third
+# "cannot say" arm: it asserts nothing.
 
 # The refusal carries its own status: 82 is unassigned elsewhere in this tree (70-81 are spawn-gate's,
 # repo-target's and brief-gate's; 93-98 are the worker launch-line guards'), and a shared code would
@@ -107,6 +116,41 @@ key_gate_account_home() {
   case "$h" in /*) printf '%s\n' "$h" ;; *) printf '\n' ;; esac
 }
 
+# key_gate_stored_credential <home> <provider> — 0 iff `pi`'s OWN credential store holds an entry for
+# this provider. ⛔ THIS ARM EXISTS SO THE GATE CANNOT REFUSE A LANE THAT WOULD HAVE RUN (review round 3,
+# P1, measured): with `auth.json` carrying a `zai` api_key, `pi --list-models` lists the provider's models
+# and the lane works, while the models.json template still names `$ZAI_API_KEY` — so a gate that looked
+# only at the environment refused a working box with 82. The store is the FIRST source `pi` consults, so
+# "the variable is unset" is not "the credential is missing".
+# Anything unreadable here answers "cannot say" (rc 1) -> the caller falls through to the environment
+# check, which is the direction that cannot fabricate a refusal.
+key_gate_stored_credential() {
+  local home="${1:-}" prov="${2:-}"
+  [ -n "$home" ] && [ -n "$prov" ] || return 1
+  local aj="$home/.pi/agent/auth.json"
+  [ -r "$aj" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$aj" "$prov" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(d, dict):
+    raise SystemExit(1)
+e = d.get(sys.argv[2])
+def nonblank(v):
+    return isinstance(v, str) and v.strip() != ""
+if isinstance(e, str):
+    raise SystemExit(0 if nonblank(e) else 1)
+if isinstance(e, dict):
+    for k in ("key", "api_key", "apikey", "access_token", "refresh_token", "token"):
+        if nonblank(e.get(k)):
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 # key_gate_candidates <home> — the files a box is known to carry credentials in, one per line, deduped
 # in the order they matter. ⛔ THE REDIRECTED `$HOME` IS THE POINT: `${ENV_FILE:-$HOME/keys.env}` is
 # what `lane-env.sh` actually sourced, `$CELL_HOME/keys.env` is what `cloud-cell-supervisor.sh` sources,
@@ -147,6 +191,14 @@ key_gate_assert() {
   if key_gate_value_present "$KEY_GATE_VAR"; then
     printf '[key-gate] %s check=ok var=%s provider=%s home=%s — the credential holds a value in the environment this lane runs with\n' \
       "$label" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "${home:-<none>}"
+    return 0
+  fi
+  if key_gate_stored_credential "$home" "$KEY_GATE_PROVIDER"; then
+    # The store is what `pi` reads FIRST, so an absent variable is not an absent credential. Nothing is
+    # asserted — and the line says WHICH source answered, so an operator reading a green gate is not
+    # misled into thinking the environment carries the key.
+    printf '[key-gate] %s check=skipped reason=stored-credential provider=%s home=%s — %s/.pi/agent/auth.json holds a credential for this provider, and pi consults that store BEFORE the environment (and before the models.json template that names $%s), so whether $%s is exported here is not the question pi asks first; nothing is asserted here\n' \
+      "$label" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${home:-<none>}" "$KEY_GATE_VAR" "$KEY_GATE_VAR"
     return 0
   fi
   KEY_GATE_REASON="credential-missing"
