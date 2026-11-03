@@ -33,13 +33,20 @@
 
 set -uo pipefail
 
-KEY="${TORTOISE_MCP_API_KEY:-${TORTOISE_API_KEY:-}}"
+# TORTOISE_API_KEY FIRST: it is the canonical name (#5153/#5343) and the one the committed
+# `.mcp.json` expands, so a box that resolves the MCP also resolves this script. The
+# TORTOISE_MCP_API_KEY alias is accepted (never preferred) so a box provisioned under the old
+# name keeps working — and a box carrying only the alias needs the #5153 alias line to use the
+# MCP at all, so preferring the canonical name here keeps the two paths in step.
+KEY="${TORTOISE_API_KEY:-${TORTOISE_MCP_API_KEY:-}}"
 URL="${TORTOISE_API_URL:-https://api.premiselabs.co}"
 EP="${URL%/}/mcp/"
 
 if [ -z "$KEY" ]; then
-    echo "GRAPH-UNREACHABLE(NO-KEY): TORTOISE_MCP_API_KEY is not in this process's environment." >&2
-    echo "  remedy: set it in the lane env (cells: ~/keys.env). Do NOT silently fall back to another graph." >&2
+    echo "GRAPH-UNREACHABLE(NO-KEY): neither TORTOISE_API_KEY nor TORTOISE_MCP_API_KEY is in this process's environment." >&2
+    echo "  remedy: put the hosted key in ~/keys.env (mode 600) as TORTOISE_API_KEY — the launcher sources it — and" >&2
+    echo "          alias it if the box carries the old name: export TORTOISE_API_KEY=\"\$TORTOISE_MCP_API_KEY\" (#5153)." >&2
+    echo "  Do NOT silently fall back to another graph." >&2
     exit 3
 fi
 
