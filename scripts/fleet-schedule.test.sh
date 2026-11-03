@@ -1551,6 +1551,20 @@ badstamp() { # badstamp <label> <json> <needle>
 badstamp com.test.hourly '[1, 2, 3]' "not a job record"
 badstamp com.test.hourly '{"label": "com.test.hourly", "started": NaN, "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
 badstamp com.test.hourly '{"label": "com.test.hourly", "started": 1e999, "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
+# ⛔ A BIG-ENOUGH INT IS STILL AN int, and `math.isfinite` RAISES OverflowError on it. So the guard
+# that exists to NAME an unusable `started` was itself a re-raiser for this one value class: a stamp
+# holding `10**400` tracebacked out of `--verify`, aborting the check for every job after it — the
+# defect the guard replaced, one class over (#3340, found by fresh-context review).
+python3 -c 'import json,sys; json.dump({"label":"com.test.hourly","started":10**400,"finished":1,"rc":0,"duration":0}, open(sys.argv[1],"w"))' \
+  "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+out_big="$(run "$GOOD" --verify)"; rc_big=$?
+if [ "$(grep -c 'Traceback' <<<"$out_big")" -eq 0 ] \
+   && grep -q "no usable 'started' value" <<<"$out_big"; then
+  ok "18g --verify NAMES a 10**400 started instead of raising out of math.isfinite"
+else
+  bad "18g --verify raised on a big-int started (rc=$rc_big): $(head -3 <<<"$out_big")"
+fi
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
 badstamp com.test.hourly '{"label": "com.test.hourly", "started": "yesterday", "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
 # NaN must not read as "live": every comparison against NaN is False, so an unguarded type check
 # certified it SCHEDULE VERIFIED (rc=0) with zero runs and an empty log — the closed loop again.

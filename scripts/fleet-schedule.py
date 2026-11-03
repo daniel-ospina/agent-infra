@@ -406,10 +406,27 @@ class Job:
         return os.path.join(STATE, "logs", self.label + ".log")
 
 
+def _finite(value) -> bool:
+    # ⛔ `math.isfinite` IS ITSELF A RE-RAISER FOR A BIG ENOUGH INT. `json.load` returns an
+    # arbitrary-precision int for an integer literal, so a hand-edited or foreign stamp can hold
+    # `10**400`; `isinstance(value, int)` passes it and `math.isfinite` then raises OverflowError
+    # ("int too large to convert to float"). That lands in the very guards whose job is to NAME a
+    # value they cannot use — `--verify` raised out of them instead, aborting the check for every
+    # job after the broken one, the exact defect those guards replaced one value class earlier.
+    # A number too large to be a float is not a usable time: answer False, never raise.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError):
+        return False
+
+
 def human_secs(seconds: float) -> str:
     # ⛔ A NON-FINITE AGE IS NOT AN AGE. `int(inf)` raises OverflowError and `int(nan)` raises
     # ValueError, and a stamp carrying either reaches this from `--verify`'s IN-THE-FUTURE arm.
-    if not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+    # A big int raises inside `math.isfinite` itself, which is why this asks `_finite` (#3340).
+    if not _finite(seconds):
         return "an unusable age (%r)" % (seconds,)
     seconds = int(seconds)
     if seconds < 90:
@@ -1101,8 +1118,9 @@ def acquire_lock(label):
             #     the racer's lock by name, after which a third caller also acquired it.
             # So on a stat failure we ask the QUESTION THE PROBE ASKS — read the file and take the
             # pid from the fd we actually opened. Ours ⇒ we still hold it (keep it). Someone else's
-            # ⇒ we lost (re-examine). Unreadable ⇒ we cannot prove either, so we fail CLOSED to
-            # "not ours" for this attempt; a skipped pass is recoverable, a double-run is not.
+            # ⇒ we lost (re-examine). Unreadable ⇒ undeterminable, and the answer to that is KEEP —
+            # NOT "fail closed", which WEDGES the job: see the `cur is None` arm below, where a
+            # `continue` here is measured abandoning a lock that holds our own live pid forever.
             cur = None
             try:
                 cur = os.stat(path)
@@ -1902,8 +1920,11 @@ def cmd_verify():
         # passed the type check, made `due_at` permanently not-due with no exception for the loop's
         # per-job guard to catch, and `--verify` then certified the job `SCHEDULE VERIFIED` (rc=0)
         # with zero runs and an empty log. Measured. ±Infinity dies further down in human_secs().
-        if not isinstance(started, (int, float)) or isinstance(started, bool) \
-                or not math.isfinite(started):
+        # ⛔ `_finite`, not `math.isfinite`: a `started` of 10**400 (an int, so the type check
+        # passes) raised OverflowError out of `math.isfinite` ITSELF — from this arm, whose comment
+        # says it exists so that `--verify` reports a stamp it cannot compare instead of raising.
+        # Caught by fresh-context review at #3340 and pinned by 18g's big-int arm.
+        if not _finite(started):
             failures.append(
                 "%s: its last-run stamp has no usable 'started' value (%r) — a hand-edit or a "
                 "foreign writer broke it, so its due-ness cannot be trusted; clear: rm -f %s"
