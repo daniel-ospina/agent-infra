@@ -512,6 +512,13 @@ jobs:
     # — the queue every merge then waits behind. Slicing is the PR lane's own mechanism (agent-infra
     # #1369/#2483): the list stays in `scripts/run-bash-shards.sh`, this job only says which slice.
     strategy:
+      # ⛔ `fail-fast: false`, FOR THE REASON ci.yml RECORDS FOR `bash-suites` AND THIS CHANGE MUST NOT
+      # DROP: one failing slice otherwise CANCELS the in-progress and QUEUED siblings, those legs report
+      # `cancelled` — which the rail treats as NON-RED (`NON_RED_CONC`) — and the runner's per-slice
+      # coverage assertion never executes in them. A single red shard would then silently leave ~7/8 of
+      # the list never executed and never asserted for that sha, while the job still reads as "the
+      # matrix ran". Every slice must report its own verdict.
+      fail-fast: false
       # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
       # hand-kept number). Width 8 mirrors ci.yml's `bash-suites`; the per-slice sizes are DERIVED
       # by the runner, so adding a suite shifts them with no workflow edit.
@@ -744,7 +751,13 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
+    # ⛔ `script-validate-gates` IS LISTED BESIDE `script-validate`, NOT INSTEAD OF IT: the three
+    # guards (node --check, the lane-parity guard, its mutation self-test) moved into that job when
+    # the sweep became a matrix, and `needs:` is the ONLY list this filer reads — so omitting it
+    # makes a red guard unfilable while the filer looks complete. `tests/actionlint/run.sh` Case 4
+    # asserts exactly that, so the omission reds the PR lane too. (Same class as
+    # `sigpipe-grep-guard`, which the suite's own header records as a previous instance.)
+    needs: [extension-tests, script-validate, script-validate-gates, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
     if: failure() && github.ref == 'refs/heads/main'
     # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131), in DIFFERENT directions.
     #   `failure()` must stay: the steps derive the failing set from `needs`, and the
