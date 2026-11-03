@@ -4700,6 +4700,32 @@ fi
 # (b) IDEMPOTENCY: an admitted comment already carrying this exact marker ⇒ no POST.
 STUB_COMMENT_BODIES="$DC_MARKER" STUB_COMMENT_CAPTURE="$T/ccap_b" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marker is NOT duplicated (idempotency)"
+# (b2) ⛔ THE DEDUP IS LINE-ANCHORED — and (b) CANNOT see it (fresh-review finding 1).
+#      (b) serves the marker as the WHOLE comment body, which matches under both
+#      `-qxF` and the weaker `-qF`, so `-qxF`->`-qF` at the dedup read left the suite
+#      at PASS=921 FAIL=0. That is not a style flag: with `-qF`, any admitted comment
+#      that merely CITES or QUOTES the marker mid-line satisfies the dedup on EVERY
+#      later run, so post_marker_comment() never posts again — the durable channel is
+#      permanently dead — and nothing reds. It is the same asymmetry the BODY channel
+#      was already pinned for (14.10f), on the channel this PR adds.
+#      The gate admits a comment only when the marker is ALONE ON A LINE, so the
+#      producer must not treat a quoting comment as "already posted".
+# ⛔ SAME PR AS (b), ON PURPOSE. The marker embeds `reviews/<pr>.json`, so a body
+#    quoting ANOTHER PR's marker cannot match this run's marker under EITHER flag —
+#    that vector passes while proving nothing (measured: the first draft of this
+#    very arm used $DC_PR+1 and stayed GREEN under the `-qF` mutant). Reusing
+#    $DC_PR makes (b) and (b2) a non-vacuous PAIR on one PR and one marker: the
+#    same run that posts 0 for an EXACT whole-body match must post 1 for a body
+#    that merely CONTAINS the marker, so neither arm can pass on a short-circuit.
+STUB_COMMENT_BODIES="see the record below — $DC_MARKER — and that is all" \
+    STUB_COMMENT_CAPTURE="$T/ccap_b2" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "1" \
+    "14.1d a comment that merely QUOTES the marker mid-line does NOT satisfy the dedup (line-anchored, like the gate's admission)"
+if [ -s "$T/ccap_b2" ]; then
+    ok "14.1d …and the post it makes carries a body (the vector is not judging an empty capture)"
+else
+    bad "14.1d the anchored-dedup vector captured no POST body — it would pass on a post that never happened"
+fi
 # (c) READ-FAILURE: `gh api` writes a NON-EMPTY error body to STDOUT and exits
 #     non-zero. The durable post must be SKIPPED (never read as "no comment" ⇒
 #     post), the warning must name it, and the record must still succeed.
@@ -4820,6 +4846,17 @@ assert_contains "$RECORD_ERR" "body-marker-unposted" "14.10 the failure has a NA
 PEND14="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424329.marker"
 [ -f "$PEND14" ] && ok "14.10 the signed marker is KEPT for retry (durable pending file)" || bad "14.10 no durable pending marker — the evidence would be lost"
 if grep -qF 'review recorded:' "$PEND14" 2>/dev/null; then ok "14.10 …and it holds the marker line verbatim"; else bad "14.10 the pending file does not hold the marker line"; fi
+# 14.10a2 THE DURABLE CHANNEL IN THE PATCH-FAILURE ARM (fresh-review finding 2).
+#       `post_marker_comment` is called just BEFORE this arm's `exit 5`, and nothing
+#       asserted it: deleting the call left BOTH suites green (measured: PASS=921
+#       FAIL=0 and 190/190). This is the arm with the MEASURED real-world trigger
+#       (the 403/spent-token window behind tortoise#10677) — and the two channels
+#       need different scopes (`pull-requests:write` for the body, `issues:write`
+#       for the comment), so this is exactly the run where the body fails and the
+#       comment could still have delivered. A revert of that one line re-opens
+#       "exits 5 having published nothing to the channel it exists for".
+assert_eq "$(dc_posts 424329)" "1" \
+    "14.10a2 the PATCH-failure arm still publishes the durable comment (the arm the channel exists for)"
 if grep -qF -- "actions/jobs/" "$LOG"; then
     bad "14.10 no rerun without a posted marker (log: $(cat "$LOG"))"
 else
@@ -4837,6 +4874,15 @@ FL_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$F
 # ⛔ DELIVERY, NOT DELETION (fresh-review P2): `rm -f` + exit 0 satisfied every
 # other assertion here, and the empty-pending-file mutant did exactly that.
 if grep -qF -- "-X PATCH" "$LOG"; then ok "14.10b the flush actually PATCHed the body (transport, not just an exit code)"; else bad "14.10b the flush exited 0 without a PATCH — deletion is not delivery (log: $(cat "$LOG"))"; fi
+# 14.10b2 THE DURABLE CHANNEL IN THE FLUSH (fresh-review finding 2).
+#       `flush_pending_markers` calls post_marker_comment BEFORE post_marker, so a
+#       body-side failure cannot short-circuit the durable copy — and deleting that
+#       call left both suites green. The flush is the run that DELIVERS a marker whose
+#       body channel already failed once, so it is the second place the durable copy
+#       must appear, not an optimization. Asserted by DELTA on the shared log, which
+#       `run_record_633`/this arm truncate first, so the count is this run's alone.
+assert_eq "$(dc_posts 424329)" "1" \
+    "14.10b2 --flush-pending also publishes the durable comment (not just the body PATCH)"
 assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
 # 14.10d an EMPTY pending file is NOT a delivered marker (cycle-2 P1: the helper
 #       used to `rm -f` it and return 0, so the flush claimed delivery and then
