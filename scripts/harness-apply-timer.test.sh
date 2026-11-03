@@ -1091,9 +1091,13 @@ mkdir -p "$T/t24e/home/.pi/agent"; ln -s "$T/t24e/gone-away" "$T/t24e/home/.pi/a
 OUT="$(run_pass "$T/t24e" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: a DANGLING farm link REDDENS the pass (a dangling record is not an absent farm)"
 assert_contains "$OUT" "NOT a readable directory" "T24 control: and it says the farm cannot be read rather than that it is absent"
-# Control 5: the seam is validated, and BEFORE any move.
-mk_origin t24f; mk_clone t24f
+# Control 5: the seam is validated, and BEFORE any move. ⛔ The fixture must be genuinely
+# ADVANCEABLE — with `RELATION=current` no move is possible and the assertion passes identically
+# whether the seam is validated early or last, i.e. it could not fail on the regression it names
+# (review round 4).
+mk_origin t24f; mk_clone t24f; write_sync_stub
 REPO_P="$CLONE"; MODE_P=sync
+advance_origin t24f C.txt "upstream for the invalid-seam case" >/dev/null
 BEFORE24F="$(git -C "$CLONE" rev-parse HEAD)"
 OUT="$(HARNESS_APPLY_FARM_CHECK=true run_pass "$T/t24f" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "T24 control: an invalid seam value is a REFUSAL (2), never a silent disarm"
@@ -1138,6 +1142,35 @@ assert_eq "$RC" "24" "T24 control: an explicitly-configured farm that is absent 
 assert_contains "$OUT" "misconfiguration" "T24 control: and it says the config is wrong rather than the host being farmless"
 OUT="$(HARNESS_APPLY_FARM_DEST="relative/farm" run_pass "$T/t24i" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "T24 control: a non-absolute farm path is refused before the pass runs"
+
+# Control 9: a checker whose FINAL target cannot be RESOLVED must be refused, not half-resolved and
+# executed. A `readlink` that fails leaves the loop with the symlink still in place, which the
+# containment test reads as "outside the farm" (review round 4, reproduced).
+mk_origin t24j; mk_clone t24j
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24j/home/.pi/agent/scripts/_sub" "$T/t24j/bin"
+printf '#!/usr/bin/env bash\nprintf "check-farm-drift: ok\\n"; exit 0\n' >"$T/t24j/home/.pi/agent/scripts/_sub/real-checker.sh"
+chmod +x "$T/t24j/home/.pi/agent/scripts/_sub/real-checker.sh"
+ln -s "$T/t24j/home/.pi/agent/scripts/_sub/real-checker.sh" "$T/t24j/bin/grade.sh"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T/t24j/bin/readlink"
+chmod +x "$T/t24j/bin/readlink"
+OUT="$(PATH="$T/t24j/bin:$PATH" HARNESS_APPLY_FARM_CHECKER="$T/t24j/bin/grade.sh" run_pass "$T/t24j" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a checker whose target cannot be resolved is REFUSED, never half-resolved and executed"
+assert_contains "$OUT" "FINAL target cannot be resolved" "T24 control: and it names that reason"
+# Control 10: NO checker anywhere is a RED arm. Every other fixture runs the pass from the repo, so
+# `$HERE` always carries the real instrument and this arm is otherwise unreachable — but in
+# production `$HERE` IS the farm, so this is the arm that turns "old checkout + farm-local checker"
+# into a refusal rather than a self-grade.
+mk_origin t24k; mk_clone t24k
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24k/home/.pi/agent/scripts" "$T/t24k/pass"
+printf 'x\n' >"$T/t24k/home/.pi/agent/scripts/pr-doctor.py"
+cp "$PASS_SH" "$T/t24k/pass/harness-apply-pass.sh"
+# `PASS_SH` is what run_pass invokes, so overriding it here keeps every other seam identical
+# (fetch, state dir, sync stub) and changes ONLY where the pass lives — which is the whole point.
+OUT="$(PASS_SH="$T/t24k/pass/harness-apply-pass.sh" run_pass "$T/t24k" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a farm with NO reachable instrument is RED, not a silent skip"
+assert_contains "$OUT" "no check-farm-drift.sh could be found" "T24 control: and it says the instrument could not be found"
 
 echo
 echo "────────────────────────────────────────────────────────"

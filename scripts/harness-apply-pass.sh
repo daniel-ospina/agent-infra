@@ -1038,7 +1038,15 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # bound so a link cycle ends in a refusal instead of a hang.
         FARM_CHECKER_T="$FARM_CHECKER"; _hops=0
         while [ -L "$FARM_CHECKER_T" ] && [ "$_hops" -lt 40 ]; do
-            _l="$(readlink "$FARM_CHECKER_T" 2>/dev/null)" || break
+            # ⛔ A FAILED `readlink` USED TO `break`, leaving `FARM_CHECKER_T` still the SYMLINK — and a
+            # symlink path is only partly resolved below (`pwd -P` on its DIR + the unresolved basename),
+            # so the containment test read it as OUTSIDE the farm and the leg then EXECUTED it, letting
+            # the farm grade itself green (review round 4, reproduced with a `readlink` that exits 1).
+            # A link whose target cannot be located cannot be ruled outside the farm, so it refuses.
+            _l="$(readlink "$FARM_CHECKER_T" 2>/dev/null)" || {
+                REC_ACTION=farm-unverifiable
+                finish 0 24 "farm: UNKNOWN — readlink failed on $FARM_CHECKER_T, so the checker's FINAL target cannot be resolved, and a copy that cannot be located cannot be ruled outside the farm"
+            }
             case "$_l" in
                 /*) FARM_CHECKER_T="$_l" ;;
                 *) FARM_CHECKER_T="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$_l" ;;
@@ -1046,6 +1054,12 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             _hops=$((_hops + 1))
         done
         unset _l
+        # ⛔ THE HOP CAP IS A REFUSAL TOO. A chain longer than the bound exits the loop above with
+        # `-L` STILL TRUE, i.e. with the same half-resolved path the failed-`readlink` arm now refuses.
+        if [ -L "$FARM_CHECKER_T" ]; then
+            REC_ACTION=farm-unverifiable
+            finish 0 24 "farm: UNKNOWN — $FARM_CHECKER is a symlink chain that did not resolve within 40 hops, so where it points cannot be established"
+        fi
         FARM_CHECKER_REAL="$(cd "$(dirname "$FARM_CHECKER_T")" 2>/dev/null && pwd -P)/$(basename "$FARM_CHECKER_T")"
         FARM_DEST_REAL="$(cd "$FARM_DEST" 2>/dev/null && pwd -P)"
         if [ -n "$FARM_DEST_REAL" ] && [ "${FARM_CHECKER_REAL#"$FARM_DEST_REAL"/}" != "$FARM_CHECKER_REAL" ]; then
