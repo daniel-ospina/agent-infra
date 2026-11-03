@@ -4588,7 +4588,7 @@ fi
 #     stays green — which is what makes the pair pin the predicate rather than
 #     the fixture. The marker text is SEEDED from the recorder's own post (never
 #     hand-written) so its diff=/sig= contract cannot drift from the script's.
-QB_PR=424326
+QB_PR=424339
 QB_SEED="$(seed_marker_body "$QB_PR")"
 QB_LINE=""
 if [ -n "$QB_SEED" ]; then
@@ -4616,12 +4616,20 @@ else
     bad "14.1c the posted body carries no anchored marker line (capture: $QB_NEWBODY)"
 fi
 # The OTHER half of the same predicate: MARKER_PRESENT is re-read from the body
-# AFTER the post (BODY_NOW). One-sided anchoring (append fixed, MARKER_PRESENT
-# not) posts the marker and then believes it is absent, skipping the #633 rerun.
+# AFTER the post (BODY_NOW). ⛔ THIS PINS THE RE-READ, NOT A HAZARD — say what was
+# MEASURED: the anchoring of the MARKER_PRESENT site cannot be discriminated by
+# ANY fixture here. A successful ANCHORED append always leaves `$MARKER` alone on
+# a line in BODY_NOW, and the pre-fix `-qF` is strictly MORE permissive, so
+# reverting ONLY that site keeps this vector green (measured: PASS=908 FAIL=0 with
+# that one site reverted) — the same reason 14.1 above cannot catch a one-sided
+# revert either; assertions 1–2 are what pin the append decision, which is the one
+# that can lose evidence. What this assertion does catch is the re-read being
+# dropped: without `BODY_NOW="$NEWBODY"` the marker is posted and the recorder
+# still believes it absent, so the #633 rerun is skipped on a head that has it.
 if grep -qF -- "actions/jobs/901/rerun" "$LOG"; then
     ok "14.1c MARKER_PRESENT sees the appended line — the stale run is re-run, not skipped"
 else
-    bad "14.1c one-sided anchor: marker posted but MARKER_PRESENT missed it ⇒ the stale run was never re-run (log: $(cat "$LOG"))"
+    bad "14.1c the re-read did not see the appended marker ⇒ the stale run was never re-run (log: $(cat "$LOG"))"
 fi
 
 # 14.2 Fresh record (marker absent) with a stale FAILURE on the head: posts the
