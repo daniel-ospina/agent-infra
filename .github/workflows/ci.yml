@@ -960,6 +960,24 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: main-worktree-guard M4/M5 recovery window (#3303)
+        # M4 was UNRECOVERABLE in the state it exists to repair: its only
+        # sanctioned recovery was `git checkout main`, a NO-OP on a dirty tree,
+        # and #709's documented escape marker never reached it. Measured
+        # 2026-11-02 — a shared hub carrying one truncated tracked file (0
+        # bytes) answered every restore route with a refusal whose advice could
+        # not recover it, and stayed dirty ~12h across 7 live sessions.
+        # Part A pins the classification: dirty hub + ACTIVE hatch ⇒ the
+        # named-path restore family is permitted; WITHOUT a hatch it stays
+        # blocked; D3 is not reversed (no ref operand before `--`, no
+        # `checkout -- .`, no `--source` family); a clean hub is unchanged; and
+        # a dirty-hub block no longer prescribes the no-op as terminal recovery.
+        # Part B is BEHAVIORAL — the real index.ts handler, a hermetic dirty hub
+        # and a stamped session marker — because a classifier-only suite cannot
+        # see the defect that mattered (M4 permitted, then M5 re-refused it).
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~6s. Its OWN step,
+        # not a flag on the step above (the rule every suite in this job follows).
+        run: node extensions/main-worktree-guard/test-m4-recovery-window.mjs
       - name: main-worktree-guard discard-gate MUTATION evidence (#2161)
         # #2161 closed a fail-OPEN hole: an escaped quote inside an ANSI-C
         # `$'…'` word closed the word early, phantom-quoted the rest of the
