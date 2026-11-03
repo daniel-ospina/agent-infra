@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Forty-two tests with fifty-six paired mutations: every mutation re-
+Forty-three tests with fifty-seven paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 31 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (56)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (57)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1737,16 +1737,16 @@ def t40():
               "an unreadable log must never publish a state")
 
         # the verdict FILE outranks the log's tail, and the rc travels with it
+        me = os.getpid()
         with open(log, "a", encoding="utf-8") as fh:
-            fh.write("[lane-bound] VERDICT verdict=stalled tag=t pid=1 rc=143 foo=1\n")
+            fh.write("[lane-bound] VERDICT verdict=stalled tag=t pid=%d rc=143 foo=1\n" % me)
         with open(vfile, "w", encoding="utf-8") as fh:
-            fh.write("[lane-bound] VERDICT verdict=finished tag=t pid=1 rc=0 foo=1\n")
-        lr = liv.gather_log_lane(log, os.getpid(), verdict_file=vfile, sample=False,
-                                 now_ms=NOW_MS)
+            fh.write("[lane-bound] VERDICT verdict=finished tag=t pid=%d rc=0 foo=1\n" % me)
+        lr = liv.gather_log_lane(log, me, verdict_file=vfile, sample=False, now_ms=NOW_MS)
         check((lr.verdict, lr.rc) == ("finished", "0"),
               "the verdict file wins and its rc travels; got %r" % ((lr.verdict, lr.rc),))
         check(lr.verdict_source == "verdict-file", "the source is declared; got %r" % lr.verdict_source)
-        lr = liv.gather_log_lane(log, os.getpid(), sample=False, now_ms=NOW_MS)
+        lr = liv.gather_log_lane(log, me, sample=False, now_ms=NOW_MS)
         check((lr.verdict, lr.rc, lr.verdict_source) == ("stalled", "143", "log"),
               "the log tail is the fallback; got %r"
               % ((lr.verdict, lr.rc, lr.verdict_source),))
@@ -1877,6 +1877,76 @@ def t42():
         v = liv.log_lane_verdict(live)
         check(v.state == "working", "a sampled lane with real progress is working; got %s" % v.state)
         check(v.reason == "progress:bytes+cpu", "both signals are named; got %r" % v.reason)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T43 a verdict left by an EARLIER dispatch is not this lane's (the appended log)")
+
+
+def t43():
+    d = tempfile.mkdtemp(prefix="liv-stale-")
+    try:
+        log = os.path.join(d, "lane-3.log")
+        # `lane.sh` APPENDS (`tee -a` / `>>`) and nothing truncates the file, so the
+        # previous dispatch's verdict stays in the 8 KiB tail.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane 3] cwd=/repo\n")
+            # pid 1 is a LIVE process outside this tree: the binding is verifiable,
+            # so the drop is named `stale`. (An unverifiable/dead line pid is named
+            # `unbound` and is dropped too — see the second case below.)
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=1 rc=0 "
+                     "elapsed=612s log=%s\n" % log)
+            fh.write("[lane 3] exited 0\n=== next dispatch ===\n")
+
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = child.pid
+        child.wait()
+
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check(lr.verdict == "",
+              "a verdict naming ANOTHER incarnation is DROPPED; got %r" % (lr.verdict,))
+        check("stale-bound-verdict" in lr.detail, "and says why; got %r" % lr.detail)
+
+        # An UNVERIFIABLE line pid (an earlier dispatch's child, now reaped) is dropped
+        # as well: the over-refusal direction is the only acceptable one, and the state
+        # is still terminal-and-honest (`no-verdict`), never `finished`, never `dead`.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=424242 rc=0 "
+                     "log=%s\n" % log)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check(lr.verdict == "", "an unverifiable binding is dropped; got %r" % (lr.verdict,))
+        check("unbound-bound-verdict" in lr.detail, "and named; got %r" % lr.detail)
+        check(liv.evaluate(liv.Evidence(log_read=lr)).state == "no-verdict",
+              "still terminal, still honest")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane 3] cwd=/repo\n")
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=1 rc=0 "
+                     "elapsed=612s log=%s\n" % log)
+            fh.write("[lane 3] exited 0\n=== next dispatch ===\n")
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "no-verdict",
+              "the previous dispatch's `finished` must NOT be published as this lane's; got %s"
+              % v.state)
+        check(v.state != "finished" and v.state != "dead",
+              "never a false PASS and never a death")
+        check("bound-verdict" in v.detail,
+              "the reason travels into the verdict; got %r" % v.detail)
+
+        # …and a verdict naming THIS incarnation is still adopted.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane 3] cwd=/repo\n")
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=0 log=%s\n"
+                     % (dead, log))
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check(lr.verdict == "finished", "a bound verdict IS adopted; got %r" % (lr.verdict,))
+        # …and one with NO `pid=` at all is adopted but declared unbound.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane rc=0\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check(lr.verdict == "finished", "an unbound verdict is adopted; got %r" % (lr.verdict,))
+        check("bound-verdict-without-pid" in lr.detail,
+              "but it says it is unbound; got %r" % lr.detail)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2287,6 +2357,14 @@ MUTATIONS = [
         '            if ev.claim_read is not None:\n                return claim_verdict(ev.claim_read)\n',
         '            return claim_verdict(ev.claim_read or ClaimRead())\n',
         "the None guard is gone, so every session abstention becomes a claim abstention",
+    ),
+    Mutation(
+        "T43", "module",
+        '            if within is False:',
+        '            if False:',
+        "a verdict naming ANOTHER incarnation is adopted, so a previous dispatch's "
+        "`finished` is published as this lane's — a false PASS over work nobody "
+        "re-dispatches (the appended-log case)",
     ),
 ]
 

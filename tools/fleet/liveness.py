@@ -311,6 +311,7 @@ BOUND_FINISHED = frozenset({"finished"})
 BOUND_OK_RC = frozenset({"0", "na"})
 _BOUND_VERDICT_RE = None  # compiled lazily, so importing the module stays cheap
 _BOUND_RC_RE = None
+_BOUND_PID_RE = None
 # `rc=` is captured on the SAME line, because a verdict without its exit status is
 # not a completion (see BOUND_OK_RC).
 
@@ -1038,6 +1039,13 @@ def claim_verdict(cr: ClaimRead) -> Verdict:
 # an ABSTENTION — never death.
 
 
+def _bound_pid_re():
+    global _BOUND_PID_RE
+    if _BOUND_PID_RE is None:
+        _bound_verdict_re()
+    return _BOUND_PID_RE
+
+
 def _bound_rc_re():
     global _BOUND_RC_RE
     if _BOUND_RC_RE is None:
@@ -1063,6 +1071,7 @@ def _bound_verdict_re():
         _BOUND_VERDICT_RE = _re.compile(r"\[lane-bound\]\s+VERDICT\b.*?\bverdict=([a-z][a-z-]*)")
         globals()["_BOUND_RC_RE"] = _re.compile(r"\brc=([0-9]+|na)\b")
         _BOUND_RC_RE = _re.compile(r"\brc=([0-9]+|na)\b")
+        globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=([0-9]+)\b")
     return _BOUND_VERDICT_RE
 
 
@@ -1103,6 +1112,71 @@ def parse_bound_line(text: str):
     head = line.split(" log=")[0]
     rcs = _bound_rc_re().findall(head)
     return (verdict, rcs[-1] if rcs else None)
+
+
+def parse_bound_pid(text: str):
+    """The ``pid=`` named on the LAST ``[lane-bound] VERDICT`` line, or ``""``.
+
+    ⛔ WHY A VERDICT NEEDS A PID AT ALL: the lane log is APPENDED to across
+    dispatches (`lane.sh` uses ``tee -a`` / ``>>`` and nothing truncates the file), so
+    an earlier run's ``[lane-bound] VERDICT verdict=finished ... rc=0`` stays in the
+    tail until new output pushes it out of the 8 KiB window. Adopting it publishes a
+    PREVIOUS dispatch's outcome as this lane's — a false PASS over work that was never
+    re-dispatched, which is the class this axis exists to remove. Measured: the tail
+    ``"[lane 3] cwd=...\n[lane-bound] VERDICT verdict=finished ... rc=0\n[lane 3]
+    exited 0\n=== next dispatch ===\n"`` parsed as ``('finished', '0')``.
+    """
+    if not text:
+        return ""
+    last = None
+    for m in _bound_verdict_re().finditer(text):
+        last = m
+    if last is None:
+        return ""
+    line_end = text.find("\n", last.start())
+    line = text[last.start(): line_end if line_end >= 0 else len(text)]
+    pids = _bound_pid_re().findall(line.split(" log=")[0])
+    return pids[-1] if pids else ""
+
+
+def _pid_within(root: int, child: int, *, hops: int = 64):
+    """Is ``child`` ``root`` itself or inside ``root``'s tree? ``None`` = unverifiable.
+
+    The ppid chain is read from ``/proc`` where it exists and from ``ps`` otherwise.
+    ``None`` (unverifiable) is NOT "no": the caller decides, and it fails closed.
+    """
+    if child == root:
+        return True
+    cur = child
+    for _ in range(hops):
+        par = _parent_of(cur)
+        if par is None:
+            return None
+        if par == root:
+            return True
+        if par <= 1:
+            return False
+        cur = par
+    return None
+
+
+def _parent_of(pid: int):
+    try:
+        raw = open("/proc/%d/stat" % pid, "rb").read().decode("utf-8", "replace")
+        close = raw.rfind(")")
+        if close < 0:
+            return None
+        return int(raw[close + 2:].split()[1])
+    except (OSError, IndexError, ValueError):
+        pass
+    ps = os.environ.get("PS_BIN") or "ps"
+    try:
+        out = subprocess.run([ps, "-o", "ppid=", "-p", str(pid)],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=30).stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(out) if out.isdigit() else None
 
 
 def parse_bound_verdict(text: str) -> str:
@@ -1150,6 +1224,7 @@ class LogRead:
     alive: Optional[bool] = None        # process-tree existence: True/False/None
     verdict: str = ""               # BOUND_VERDICTS member, or ""
     rc: Optional[str] = None        # the bound's `rc=` on the same line: "0" | "na" | "7" …
+    verdict_line_pid: str = ""      # the `pid=` on that line — the verdict's own incarnation
     verdict_source: str = ""        # "log" | "verdict-file" | "caller" | ""
     window_ms: int = LOG_WINDOW_MS
     detail: str = ""
@@ -1207,8 +1282,9 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                            detail="verdict_source=%s rc=%s"
                                   % (lr.verdict_source or "log", _n(lr.rc)))
         return Verdict("no-verdict", "process-gone-no-verdict",
-                       detail="bytes=%s age_ms=%s (the process ended and told us nothing)"
-                              % (_n(lr.size), _n(lr.age_ms)))
+                       detail=("bytes=%s age_ms=%s (the process ended and told us nothing)"
+                               % (_n(lr.size), _n(lr.age_ms)))
+                              + ((" | " + lr.detail) if lr.detail else ""))
     if lr.alive is None:
         return Verdict("unknown", "process-identity-unreadable", detail=lr.detail)
 
@@ -2228,9 +2304,34 @@ def gather_log_lane(
         if v:
             lr.verdict, lr.rc, lr.verdict_source = v, rc, "verdict-file"
     if not lr.verdict and lr.readable:
-        v, rc = parse_bound_line(_log_tail(log_path))
+        tail = _log_tail(log_path)
+        v, rc = parse_bound_line(tail)
         if v:
             lr.verdict, lr.rc, lr.verdict_source = v, rc, "log"
+            lr.verdict_line_pid = parse_bound_pid(tail)
+
+    # ⛔ BIND THE VERDICT TO THE INCARNATION BEING ASKED ABOUT. The log is appended to
+    # across dispatches, and a `--verdict-file` from an earlier run can survive too, so
+    # an unbound verdict is a PREVIOUS dispatch's outcome. The line's `pid=` is
+    # `lane-bound.sh`'s own `${PID}`, which in `run` mode is the CHILD it supervised —
+    # not necessarily the tree root the caller asked about — so the test is "equal OR
+    # verified inside the queried tree", and an UNVERIFIABLE binding drops the verdict.
+    # Dropping it yields `no-verdict` (never `finished`, never `dead`): the
+    # over-refusal direction, which is the only acceptable one here.
+    if lr.verdict:
+        line_pid = lr.verdict_line_pid
+        if line_pid:
+            within = _pid_within(int(pid), int(line_pid))
+            if within is False:
+                lr.detail = ("stale-bound-verdict line_pid=%s query_pid=%s source=%s"
+                             % (line_pid, pid, lr.verdict_source))
+                lr.verdict, lr.rc = "", None
+            elif within is None:
+                lr.detail = ("unbound-bound-verdict line_pid=%s query_pid=%s source=%s"
+                             % (line_pid, pid, lr.verdict_source))
+                lr.verdict, lr.rc = "", None
+        else:
+            lr.detail = "bound-verdict-without-pid source=%s" % (lr.verdict_source or "log")
 
     # S2, reading 1.
     cpu0 = subtree_cpu_cs(pid)

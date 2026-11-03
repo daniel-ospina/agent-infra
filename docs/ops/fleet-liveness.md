@@ -1669,6 +1669,31 @@ verdict would adopt a STALE earlier one when a future producer appends `verdict=
 as `finished`, which is the false-PASS class this axis exists to remove. An unrecognised final token
 is `("", None)` = no verdict, never "the previous one".
 
+**⛔ A VERDICT MUST NAME THE INCARNATION IT DESCRIBES.** The lane log is **appended to**
+across dispatches — `lane.sh` writes it with `tee -a` / `>>` and nothing truncates or
+prunes it — so an earlier run's `[lane-bound] VERDICT verdict=finished … rc=0` stays in
+the 8 KiB tail until new output pushes it out. Adopting that publishes a **previous
+dispatch's** outcome as this lane's: a false PASS over work nobody re-dispatches, in the
+one state whose whole job is to stop exactly that. (A `--verdict-file` left behind by an
+earlier run has the same shape.) So the line's own `pid=` is parsed
+(`parse_bound_pid` → `LogRead.verdict_line_pid`) and the verdict is adopted only when it
+is **this** incarnation:
+
+| the line's `pid=` | binding | result |
+|---|---|---|
+| equals the queried pid | verified | the verdict is adopted |
+| inside the queried pid's tree | verified (the ppid chain is walked) | adopted |
+| a live pid outside that tree | `stale-bound-verdict` | **dropped** → `no-verdict` |
+| a pid that cannot be resolved | `unbound-bound-verdict` | **dropped** → `no-verdict` |
+| absent from the line | `bound-verdict-without-pid` | adopted, and said so |
+
+`lane-bound.sh` writes **its own** `${PID}`, which in `run` mode is the child it
+supervised — not necessarily the tree root a caller asks about — which is why the test is
+"equal **or** verified inside the tree" rather than equality. Dropping yields
+`no-verdict`, never `finished` and never `dead`: an unverifiable binding over-refuses,
+which is the only acceptable direction for this state. §13.6 states the caller-side
+consequence: pass the pid `lane-bound.sh` itself supervised when you have it.
+
 The verdict token and the `rc=` are parsed **separately** — the token alone, then that line's head
 (everything before ` log=`) scanned for `rc=` with the LAST occurrence winning — because one regex
 produced three wrong states: requiring `rc=` inside the match turned a recognised verdict with no
@@ -1722,8 +1747,8 @@ that judged 76 lanes must not sleep 30 s per lane — the caller owns the two sa
 publish the same states from the same function; there is no state decided at the seam that
 `log_lane_verdict` does not decide.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (42 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (56 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (43 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (57 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder). Their paired mutations re-introduce the exact pre-fix behaviours — the
@@ -1733,4 +1758,5 @@ absent log as a death witness, the log axis masking a session query, every bound
 fractional seconds, a skipped unparseable CPU row, the census's loose `alive` decode, the census's
 unfiltered verdict token, a `?` CPU channel counting as read, the inverted sample delta, a
 non-regular file read as a readable log, a negative CPU delta read as flat, an unvalidated verdict
-token reaching `dead`, an `rc=` swallowed from `log=`, and the census asserting a log is readable.
+token reaching `dead`, an `rc=` swallowed from `log=`, the census asserting a log is readable, and a
+verdict adopted from an earlier dispatch's line.
