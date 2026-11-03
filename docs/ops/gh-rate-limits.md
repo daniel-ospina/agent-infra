@@ -248,9 +248,13 @@ Two properties worth knowing before you debug it:
   defaults, whose share is floored at 1 so a conservative setting cannot brick a box. No cross-box
   messaging is needed, which is the point: a partition is testable and does not depend on an
   unreachable peer. What is *still* not bounded: a box whose declaration is wrong (too small a fleet
-  ⇒ too generous a share), and **`core`/REST is not paced by default** — the hot reads were
-  deliberately moved onto REST (#1962/#2137), so pacing it here would push the fleet back onto the
-  bucket that is refusing; opt in with `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`.
+  ⇒ too generous a share), and **both `graphql` and `core`/REST are paced by default**
+  (`GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`). REST joined the default on 2026-11-03, when
+  the earlier premise inverted and was measured: `core` at 0/5000 with every `gh run list` / `gh run
+  view` refused, while `graphql` sat at 4973/5000 — the partitioned bucket was idle and the spent one
+  was unbounded, because the rail's waits poll REST per lane. Set
+  `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql` to restore the old graphql-only pacing if you measure
+  the opposite pressure.
 - **A bounded caller proceeds OVER the partition.** `GH_LIMIT_NO_WAIT` callers (the heartbeat's eight
   telemetry tools) cannot be paced without outliving their own subprocess bound, so they take the
   slot check and proceed when it is exhausted, recording the overdraw in `events.log`. Pacing them
@@ -404,7 +408,8 @@ WITH its age on stderr; off by default), `GH_LIMIT_FLIGHT_STALE_MAX_AGE` (30 s),
 `GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR` (5000 — GitHub's per-account, per-bucket primary limit),
 `GH_LIMIT_ACCOUNT_SAFETY` (0.8 — headroom kept inside the share),
 `GH_LIMIT_ACCOUNT_WINDOW_S` (60 s — the window the share is spent over),
-`GH_LIMIT_ACCOUNT_PARTITION_BUCKETS` (`graphql` — which buckets are paced; `graphql,core` opts REST in),
+`GH_LIMIT_ACCOUNT_PARTITION_BUCKETS` (`graphql,core` — which buckets are paced; `graphql` alone
+restores the pre-2026-11-03 behaviour),
 `GH_LIMIT_MARKER_MAX_AGE` (900 s — a marker older than this is not evidence about now) and
 `GH_LIMIT_GATE_REVALIDATE_S` (30 s — the wait above which a marker is revalidated before it is paid).
 The conditional-GET PASS CACHE has its own three: `GH_LIMIT_PASS_CACHE` (unset/`0` disables it; any
@@ -836,9 +841,16 @@ answers a different question).
 
 ```bash
 python3 scripts/orchestrator-harness/gh-limit.py --health
-# gh-core-exhausted resets_in=12m     (exit 3)
+# gh-core-exhausted resets_in=12m GH-BUDGET(remaining=0, resets_at=2026-11-03T02:07:36Z)   (exit 3)
 # gh-ok                              (exit 0)
 ```
+
+The `GH-BUDGET(...)` token rides the SAME local-only read (no request, no credentials, no quota), so
+at the moment every `gh` call is being refused a lane can still tell **quota exhaustion** from a
+**product fault** with one cheap read — the 2026-11-03 misdiagnosis, where three lanes reported a
+broken rail that was an account at 0/5000. `remaining=?` / `resets_at=?` mean nothing measured that
+field (an undated record from a refusal that carried no reset); they are never filled in with a
+plausible number.
 
 It reads **local state only** — no request, no credentials, no quota — which is what makes it usable at
 exactly the moment every `gh` call is being refused, and it is age-bounded — by the record's own reset
