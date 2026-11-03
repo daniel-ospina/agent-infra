@@ -1983,6 +1983,10 @@ printf '%s\n' '#!/usr/bin/env bash' \
   '      case "$*" in' \
   '        *"@tsv"*) printf "%s\t%s\t%s\n" "${FIX_HEAD}" "${FIX_BASE}" "${FIX_COUNT}"; exit 0 ;;' \
   '        *".head.sha"*) printf "%s\n" "${FIX_HEAD}"; exit 0 ;;' \
+  '        *".body"*) printf "%s" "${FIX_BODY:-}"; exit 0 ;;' \
+  '      esac' \
+  '      case "$*" in' \
+  '        *"-X PATCH"*) cat >/dev/null 2>&1; [ "${FIX_PATCH_FAIL:-0}" = 1 ] && exit 1; exit 0 ;;' \
   '      esac' \
   '      exit 1 ;;' \
   '    *"/compare/"*)  printf "mb\t%s\n" "${FIX_MB}"; printf "%s\n" "${FIX_ROWS}"; exit 0 ;;' \
@@ -1993,7 +1997,8 @@ printf '%s\n' '#!/usr/bin/env bash' \
 chmod +x "$T30/bin/gh"
 rec_micro() { # <rows> → runs the record path for clean-micro; sets REC_RC
   HOME="$T30H" PATH="$T30/bin:$PATH" FIX_HEAD="$HEX40" FIX_BASE="$HEX40" FIX_MB="$HEX40" FIX_COUNT=1 \
-    FIX_ROWS="$1" bash "$SRC" 42 "$HEX40" clean-micro owner/repo >/dev/null 2>&1
+    FIX_ROWS="$1" FIX_PATCH_FAIL="${FIX_PATCH_FAIL:-0}" FIX_BODY="${FIX_BODY:-}" \
+    bash "$SRC" 42 "$HEX40" clean-micro owner/repo >/dev/null 2>&1
   REC_RC=$?
 }
 rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t')"
@@ -2002,9 +2007,27 @@ rec_micro "$(printf 'modified\tscripts/admin-merge.sh\t')"
   || fail "(30ix) clean-micro on a rail diff was NOT refused (rc=$REC_RC, reviews dir: $(ls -d "$T30H/.pi/agent/reviews" 2>/dev/null || echo absent))"
 rec_micro "$(printf 'modified\tdocs/ops/x.md\t')"
 T30_REC="$T30H/.pi/agent/reviews/owner-repo-42.json"
+# ⛔ THIS VECTOR TESTS THE CAP, NOT THE EVIDENCE CHANNEL. The stub now answers
+# `.body` and PATCH so the recorder's signed-marker post SUCCEEDS; before that it
+# answered the `/pulls/` fallback with `exit 1`, which the recorder (correctly,
+# since #10522) reports as `body-marker-unposted`/exit 5 — so this vector was
+# silently asserting the OLD best-effort durability contract and went red on the
+# fix. A vector that tests the cap must not depend on the marker's fate.
 [ "$REC_RC" -eq 0 ] && [ -f "$T30_REC" ] \
   && pass "(30x) the cap does NOT refuse an inert diff — it is a ceiling on the tier, never a blanket block on the micro flow (rc=0 and the record EXISTS)" \
   || fail "(30x) an inert docs diff was not recorded (rc=$REC_RC, record: $([ -f "$T30_REC" ] && echo present || echo absent))"
+# (30x-b/c) THE NEW CONTRACT, pinned in this suite too: a refused body PATCH is a
+# NAMED non-zero state and the signed marker survives for a later --flush-pending
+# (never a silent success over a marker CI cannot see — #10522).
+rm -rf "$T30H/.pi/agent/reviews"
+FIX_PATCH_FAIL=1 rec_micro "$(printf 'modified\tdocs/ops/x.md\t')"
+[ "$REC_RC" -eq 5 ] \
+  && pass "(30x-b) a refused body PATCH is a NAMED non-zero state (rc 5), not a silent success" \
+  || fail "(30x-b) a refused body PATCH exited $REC_RC (want 5) — the marker can go unposted while the record reports success"
+[ -f "$T30H/.pi/agent/reviews/pending/owner__repo-42.marker" ] \
+  && pass "(30x-c) …and the signed marker is KEPT in the pending file for a later --flush-pending" \
+  || fail "(30x-c) no durable pending marker — the evidence would be unrecoverable"
+rm -rf "$T30H/.pi/agent/reviews"
 
 # THE REVIEW'S P1.2, as a fixture: a rail diff that ALSO carries one row of an
 # exotic status. Reading the cap's paths through the clean-low attestation's
@@ -2181,7 +2204,11 @@ cd "$TMP" || true
 # message, which were running as command substitutions and printing two hard shell errors that no
 # assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
 # the builder arms, so this pin is EXACT: 133, not a floor.
-MIN_ASSERTIONS=183
+# #10522: 183 -> 185 — (30x-b) and (30x-c) pin the NEW body-marker durability
+# contract in this suite too (a refused PATCH is a named rc 5, and the signed marker
+# survives in the pending file), and the (30x) cap vector no longer depends on the
+# marker's fate: its stub answers `.body`/PATCH so the post SUCCEEDS.
+MIN_ASSERTIONS=185
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

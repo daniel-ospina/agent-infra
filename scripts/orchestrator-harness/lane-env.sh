@@ -38,12 +38,32 @@
 #
 # PRECEDENCE: the file wins, exactly as on the controller path (it sources the file after inheriting its
 # environment). An override belongs in the file, or after the lane has sourced it.
+#
+# ⛔ EXCEPTION — THE DISPATCH-OWNED SET: `OR` (the target repo), `N` (the issue), `BR` (the branch),
+# `LANE_REPO_DIR` and `O` (where the lane records). Those are ARGUMENTS the lane was dispatched with, not
+# credentials, and `lane.sh` saves and restores them around this sourcing. A cell's `keys.env` carries the
+# CONTROLLER's `export OR=<owner/name>` — written for loops that mean it — and sourced here it silently
+# replaced the target the LANE was dispatched for, so the repo assertion compared the worktree against
+# the wrong repo and refused a correct dispatch (agent-infra#3174). The precedent is
+# `scripts/pr-repair-loop.sh`: "`keys.env` remains authoritative for CREDENTIALS … it may not move WHAT
+# this box repairs or WHERE it records that". ⛔ Do NOT "simplify" the save/restore in `lane.sh` away as
+# redundant — this paragraph is the only record that the exception is deliberate.
 
 _lane_env_file="${ENV_FILE:-${HOME:-/nonexistent}/keys.env}"
 _lane_env_log="${LANE_ENV_LOG:-}"
 _lane_env_label="${LANE_ENV_LABEL:-lane}"
 
 _lane_env_emit() { # <line>
+  # ⛔ A DRY RUN WRITES NOTHING TO STDERR — `lane.sh`'s own contract, stated at its `GP_QUIET` line and
+  # asserted by `reviewer-preflight.test.sh` §C. This snippet is dotted in UNCONDITIONALLY, so writing
+  # the status line to stderr here broke that contract for every dry run (#3060 reddened the shard with
+  # `the dry run writes nothing to stderr`). The line is still RECORDED — it is a credential disclosure
+  # an operator needs, so it goes to the lane LOG — only the human-facing stderr copy is suppressed, the
+  # same way `gate-policy.sh`'s decision line is suppressed under `GP_QUIET`.
+  if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
+    [ -n "$_lane_env_log" ] && printf '%s\n' "$1" >> "$_lane_env_log"
+    return 0
+  fi
   if [ -n "$_lane_env_log" ]; then
     printf '%s\n' "$1" | tee -a "$_lane_env_log" >&2
   else
