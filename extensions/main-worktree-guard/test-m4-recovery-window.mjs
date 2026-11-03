@@ -56,7 +56,7 @@ const CG = join(HERE, "classify-git.mjs");
 // the scrub has to be file-scope, before any case runs; Part B restores it.
 const AMBIENT_GIT_VARS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
   "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
-  .concat(Object.keys(process.env).filter((k) => /^GIT_CONFIG_/.test(k)));
+  .concat(Object.keys(process.env).filter((k) => /^GIT_CONFIG_/.test(k) && !/^GIT_CONFIG_NOSYSTEM$/.test(k)));
 const AMBIENT_SAVED = new Map(AMBIENT_GIT_VARS.map((v) => [v, process.env[v]]));
 for (const v of AMBIENT_GIT_VARS) delete process.env[v];
 const restoreAmbient = () => {
@@ -212,8 +212,13 @@ check("E5g dirty block names the WORKTREE recovery",
 // two surfaces gave different advice for the same state; only the classifier's
 // covered all three dirt shapes.
 const shared = hubDirtyRecoveryLines(DIRTY);
-check("E5h write/edit helper emits the SAME shared text as the classifier reason",
-  shared.length > 0 && shared.every((l) => prodDirtyMsg.includes(l)), true);
+check("E5h shared helper returns the three-shape text", shared.length > 0 && shared.some((l) => /--staged --worktree/.test(l)), true);
+// E5i — round 10 (P2): assert the ROUTES actually USE it. E5h used to compare the
+// helper against the classifier's own reason, which is circular: a write/edit or
+// bash-write route that stopped using the helper was invisible (round 10 mutated
+// both and the suite stayed 83/0).
+const writeEditMsg = hubDirtyRecoveryLines({ disorder: "dirty" }, true).join("\n");
+check("E5i hatch-active text stops re-prescribing the hatch", /Your hatch IS active/.test(writeEditMsg) && !/need an active escape hatch/.test(writeEditMsg), true);
 // The branch route survives where it is TRUE (off-main, clean-ish tree).
 const offMainMsg = reason("git commit -am x", { hubContext: OFFMAIN });
 check("E6 off-main block keeps the branch recovery route",
@@ -434,6 +439,37 @@ async function partB() {
     } finally {
       delete process.env.GIT_DIR;
       delete process.env.GIT_WORK_TREE;
+    }
+    // B6w — round 10 (P1 MEASURED, data loss): a WRAPPER carrying the target
+    // selection (`env -C<dir>`, the ATTACHED form; BSD accepts it, GNU env
+    // -C/--chdir on the Linux cells) slipped both layers, because the parser sees
+    // only the `git` invocation and M4's early-return then calls the window so M5
+    // never runs. It destroyed a foreign checkout's uncommitted work.
+    const b6w = await drive(`env -C"${other}" git checkout -- tracked.txt`);
+    check("B6w marker ⇒ `env -C<dir>` wrapper still BLOCKED", b6w !== null, true);
+    const b6w2 = await drive(`nice git checkout -- wip.txt`);
+    check("B6w2 marker ⇒ `nice`-wrapped restore still BLOCKED (one bare invocation only)", b6w2 !== null, true);
+    // B6w3 — round 10 (P2): the bash-tracked-write arm is the incident's refusal
+    // #4 surface; its advice must be the shared three-shape text.
+    writeFileSync(join(hub, "copy.txt"), "copy\n");
+    const b6w3 = await drive("cp copy.txt wip.txt");
+    check("B6w3 bash tracked-write blocked on a dirty hub", b6w3 !== null, true);
+    check("B6w3b …and it names the three-shape recovery", /--staged --worktree/.test(b6w3?.reason ?? "") && /mv <path> \/tmp\//.test(b6w3?.reason ?? ""), true);
+    // B6w4 — round 10 (P2): M4's own dirty message must be HATCH-AWARE (the
+    // round-4 defect left on this surface): a hatched reader must not be told to
+    // acquire the hatch it holds.
+    const b6w4 = await drive("git checkout -- .");
+    check("B6w4 marker ⇒ whole-tree discard still BLOCKED", b6w4 !== null, true);
+    check("B6w4b …and M4 says the hatch IS active, naming the real cause", /Your hatch IS active/.test(b6w4?.reason ?? ""), true);
+    // B6w5 — round 10 (P2): GIT_CONFIG_NOSYSTEM cannot select a repo (it only
+    // suppresses /etc/gitconfig) and the project's own shards set it; it must not
+    // close the window.
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    try {
+      const b6w5 = await drive("git checkout -- wip.txt");
+      check("B6w5 GIT_CONFIG_NOSYSTEM does not close the window (acceptance case still permitted)", b6w5, null);
+    } finally {
+      delete process.env.GIT_CONFIG_NOSYSTEM;
     }
     // B6h — round 4, P2: while the hatch is ACTIVE the refusal must name the
     // window's real shape limit, not re-prescribe the hatch the reader holds.

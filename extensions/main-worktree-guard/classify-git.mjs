@@ -4763,7 +4763,7 @@ function _invSelectsRepo(inv) {
   // gates share — this one.
   if (["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR"]
     .some((v) => { const x = process.env[v]; return typeof x === "string" && x.length > 0; })) return true;
-  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && (process.env[k] ?? "").length > 0)) return true;
+  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && !/^GIT_CONFIG_NOSYSTEM$/.test(k) && (process.env[k] ?? "").length > 0 && process.env[k] !== "/dev/null")) return true;
   return false;
 }
 
@@ -5671,11 +5671,35 @@ function _ambientGitEnvLines() {
   ];
 }
 
-export function hubDirtyRecoveryLines(hubContext) {
+export function hubDirtyRecoveryLines(hubContext, hatchActive = false) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
   if (!dirty) return [];
+  _dirtyHatchActive = hatchActive === true;
   return _dirtyRecoveryBody();
 }
+
+/** Round 10 (P2): the dirty text must know whether the reader ALREADY holds the
+ *  hatch. Telling a hatched lane to "set AGENT_ALLOW_MAIN_EDITS=1 or stamp the
+ *  marker" is the round-4 defect (it prescribes what the reader has) left on the
+ *  M4 surface: measured `git checkout -- .` under an active marker, where the real
+ *  cause is `.` being a whole-tree pathspec, not a missing hatch. */
+function _hatchParagraph(hatchActive) {
+  if (hatchActive) {
+    return [
+      `     Your hatch IS active, so the route above is permitted — NAME the paths`,
+      `     (\`.\`, pathspec magic, a glob or a \`..\` operand is NOT a named path) and`,
+      `     run ONE bare command from the hub: no \`;\`/\`&&\`/pipe, no redirect, no`,
+      `     \`cd … &&\` prefix, no \`-C\`/\`GIT_DIR\` target, no wrapper (\`env\`/\`nice\`).`,
+    ];
+  }
+  return [
+    `     These named-path recoveries need an active escape hatch: the`,
+    `     AGENT_ALLOW_MAIN_EDITS=1 session-start env, or the`,
+    `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
+  ];
+}
+
+let _dirtyHatchActive = false;
 
 function _dirtyRecoveryBody() {
   return [
@@ -5694,14 +5718,12 @@ function _dirtyRecoveryBody() {
     // would target the other checkout. Name the cause instead of prescribing a
     // command that cannot run (the incident's exact failure shape).
     ..._ambientGitEnvLines(),
-    `     These named-path recoveries need an active escape hatch: the`,
-    `     AGENT_ALLOW_MAIN_EDITS=1 session-start env, or the`,
-    `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
+    ..._hatchParagraph(_dirtyHatchActive),
     `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
   ];
 }
 
-function _m4RecoveryLines(hubContext) {
+function _m4RecoveryLines(hubContext, hatchActive = false) {
   const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
   if (!dirty) {
     return [
@@ -5709,6 +5731,7 @@ function _m4RecoveryLines(hubContext) {
       `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
     ];
   }
+  _dirtyHatchActive = hatchActive === true;
   return _dirtyRecoveryBody();
 }
 
@@ -5733,7 +5756,7 @@ export function evaluateHubGate(command, currentBranch, opts = {}) {
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext),
+          ..._m4RecoveryLines(hubContext, escapeActive),
         ].join("\n"),
       };
     }
@@ -5789,6 +5812,9 @@ function _mainProtectionReason(inv, hubContext, ...notes) {
     ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
     `   ${note}`,
+    // No `escapeActive` in scope here by design: these are FEATURE-WORK refusals
+    // (main-protection / shared-ref), so the hatch must not be described as the
+    // route — the hatch never opens them (D3).
     ..._m4RecoveryLines(hubContext),
   ].join("\n");
 }
@@ -6412,7 +6438,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
-        ..._m4RecoveryLines(hubContext),
+        ..._m4RecoveryLines(hubContext, escapeActive),
       ].join("\n"),
     };
   }
@@ -6429,7 +6455,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
-          ..._m4RecoveryLines(hubContext),
+          ..._m4RecoveryLines(hubContext, escapeActive),
         ].join("\n"),
       };
     }
@@ -6629,7 +6655,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
           `   git restore <path> / git checkout -- <path> under an active escape`,
           `   hatch, marker touch.`,
-          ..._m4RecoveryLines(hubContext),
+          ..._m4RecoveryLines(hubContext, escapeActive),
         ].join("\n"),
       };
     }

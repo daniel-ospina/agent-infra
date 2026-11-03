@@ -295,7 +295,7 @@ let readAllowMarkerState: (path: string, sessionId: string | null | undefined, n
 // #1484: ONE three-shape dirty-hub recovery text, shared by every block message
 // (M4's classifier reason and this file's write/edit + bash-write surfaces) so
 // the advice cannot drift from the enforcement.
-let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null) => string[] = () => [];
+let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean) => string[] = () => [];
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
@@ -618,7 +618,8 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
 function _hubWriteRecoverLines(st: { disorder: string | null } | null): string[] {
   // ONE text, shared with M4's classifier reason (round 9): the two used to
   // diverge, and only the classifier's covered all three dirt shapes.
-  const lines = hubDirtyRecoveryLines(st);
+  const hatch = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(undefined));
+  const lines = hubDirtyRecoveryLines(st, hatch);
   if (lines.length > 0) return lines;
   return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
 }
@@ -1314,6 +1315,19 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
 // cross-checkout write into a hub's `.git/` metadata freezes too; only
 // session-start host env bypasses; a mid-command `export` cannot) plus the
 // sanctioned ways forward (salvage / worktree).
+/** Round 10 (P2): the hub state of the checkout a BLOCKED WRITE TARGETS (not the
+ *  session's cwd — a cross-checkout write is about the OTHER hub, and telling
+ *  that reader to `git checkout main` in a hub already on main and dirty is the
+ *  #1484 no-op again). Falls back to the session hub when the target's repo
+ *  cannot be resolved. */
+function _targetHubState(resolvedPath: string): { disorder: string | null } | null {
+  try {
+    const top = resolveTargetTopLevel(resolvedPath) ?? _mainTopLevel();
+    if (top) return readHubDisorder(top, { skipWorktree: true });
+  } catch { /* fall through */ }
+  return _hubState();
+}
+
 function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind?: "script-depth" | "untracked-existing" }): string {
   if (hit.kind === "untracked-existing") {
     return [
@@ -1359,10 +1373,13 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
     `   mid-command export cannot.`,
     // Round 9 (P1): THIS is the arm the incident's refusal #4 (`cp <worktree
     // copy> <truncated tracked file>`) hits — round 8's lines landed on the
-    // untracked-existing branch instead, which is keyed on a cross-checkout
-    // target and whose `_hubState()` would have described the WRONG checkout.
-    // Here the advice is the state of the hub the write targets.
-    ..._hubWriteRecoverLines(_hubState()),
+    // untracked-existing branch instead.
+    // Round 10 (P2): the state must be the HUB THE WRITE TARGETS, not the
+    // session's cwd. Measured: session rooted in a clean hub A running
+    // `cp A/a.txt B/tracked.txt` (B = a dirty hub main) was told
+    // `git checkout main && git pull --ff-only` — a no-op on B, which is already
+    // on main and dirty. The target's own disorder decides the advice.
+    ..._hubWriteRecoverLines(_targetHubState(hit.resolvedPath)),
     `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
     `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
@@ -2841,6 +2858,16 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   // repo-SELECTING flag can point the restore anywhere, so it is refused
   // outright — fail closed to M5; the plain form, run from the hub, is the
   // window and is what the message tells the reader to use.
+  // Round 10 (P1, MEASURED — data loss): the reject required a separator AFTER
+  // `-C`, so `env -C"<other>" git checkout -- tracked.txt` (BSD env accepts the
+  // attached form; GNU env -C/--chdir on the Linux cells) slipped BOTH layers —
+  // the parser only sees the `git` invocation, and M4's early-return then calls
+  // the window so M5 never runs. It DESTROYED a foreign checkout's uncommitted
+  // work where origin/main blocked it. The documented shape is "ONE bare
+  // invocation run from the hub", so make that literal: the command must START
+  // with `git`. That closes env -C/--chdir, env -i, nice, sudo, xargs and
+  // `sh -c` in one predicate instead of enumerating wrappers.
+  if (!/^\s*git\s/.test(command)) return false;
   if (/(^|\s)(-C|--git-dir|--work-tree|--prefix)(\s|=)/.test(command)) return false;
   // …and the ENV spelling of the same thing (round 4, P1 — MEASURED fail-open:
   // `GIT_DIR=<other>/.git GIT_WORK_TREE=<other> git checkout -- tracked.txt`
@@ -2866,7 +2893,7 @@ function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean 
   // core.worktree inside a worktree) so this was a classification gap, but the
   // fix is the principle rather than three more names: a bare restore needs NO
   // git config at all, so ANY `GIT_CONFIG_*` in the env puts it out of window.
-  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && (process.env[k] ?? "").length > 0)) return false;
+  if (Object.keys(process.env).some((k) => /^GIT_CONFIG_/.test(k) && !/^GIT_CONFIG_NOSYSTEM$/.test(k) && (process.env[k] ?? "").length > 0 && process.env[k] !== "/dev/null")) return false;
   const st = _hubState();
   if (!st.disorder) return false; // the window exists only for a DISORDERED hub
   try {
@@ -4999,7 +5026,15 @@ export default function (pi: ExtensionAPI) {
             }
           } catch { /* empty set → only the hub's current branch protects */ }
           if (st.branch) checkedOutNames.add(st.branch);
-          const escapeActive = _isAllowMainEdits() || markerOn;
+          // Round 10 (P1): the recovery window applies to ONE BARE `git`
+          // invocation run from the hub. A WRAPPER (`env -C<dir>`, `nice`, `sudo`,
+          // `xargs`, `sh -c`) is not that shape: the parser only reports the
+          // inner `git` invocation, so a wrapper's own target selection is
+          // invisible to it, and `env -C"<other>" git checkout -- tracked.txt`
+          // destroyed a foreign checkout's uncommitted work with M4 classifying
+          // recovery and M5 never consulted. Wiring the hatch to the shape (not
+          // just to the window) makes M4 refuse those forms exactly as main does.
+          const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(command);
           const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
