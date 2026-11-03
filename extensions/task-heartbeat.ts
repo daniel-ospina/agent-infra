@@ -72,10 +72,23 @@
  *   - detection: poll process.ppid (module-load scope, unref'd, zero exec —
  *     Node's ppid is dynamic and flips to 1 on reparenting, macOS-verified).
  *     Predicate: ppid !== originalPpid || ppid === 1 (subreaper + boot-race arms).
- *   - self-termination: double-confirm + min-uptime guards, then kill OWN
- *     descendant tree (MCP grandchildren, bash forks) TERM → grace → SIGKILL +
- *     a pgid catch-net, append a durable attribution line, exit(137). The
- *     mcp-client process.on("exit") transport kill runs as a second net.
+ *   - self-termination: double-confirm + min-uptime guards, then WRITE THE
+ *     SETTLE RECORD (below), kill OWN descendant tree (MCP grandchildren, bash
+ *     forks) TERM → grace → SIGKILL + a pgid catch-net, append a durable
+ *     attribution line, exit(137). The mcp-client process.on("exit") transport
+ *     kill runs as a second net.
+ *   - settle record (the SILENCE defect, fixed): an actuator that destroys
+ *     without recording makes "killed by our watchdog", "thought it was done"
+ *     and "never started" indistinguishable to every fleet reader. So BEFORE
+ *     signalling anything, the fire sequence writes ONE durable
+ *     `dispatch-outcome` row (`reason: "orphan-killed"`, `parentPid`,
+ *     `killedPids`, `ts`) through the SAME writer `extensions/shared/
+ *     dispatch-record.ts` owns — never a second record format (#1178). It is
+ *     keyed by `dispatchId` = TASK_HEARTBEAT_NONCE, so it joins the #512 usage
+ *     and #476 failover rows, and by `childSessionId` (read from the child's
+ *     own `--session-id` arg vector). A record failure is DIAGNOSED on stderr
+ *     and never blocks the kill or the exit — but the row's absence is then
+ *     visible rather than silent.
  *   - safety valves: ORPHAN_WATCHDOG=0 (farm-wide opt-out), min-uptime +
  *     double-confirm (false-positive insurance), fired latch, NODE_ENV=test
  *     gated test hooks.
@@ -90,6 +103,20 @@ import * as path from "node:path";
 // getPgid/listPgid for the pgid catch-net.
 import { getChildPids, treeKill } from "./shared/tree-kill.js";
 import { getPgid, listPgid } from "./shared/process-sweep.js";
+// The orphan watchdog's settle record is written through the repo's ONE
+// durable-outcome row contract (#783) — the same `reason`/`dispatchId` shape the
+// parent-side settle writes, so a reader joins both and no second format or
+// second predicate appears (#1178). Stdlib-only import chain
+// (dispatch-record → provider-failover → node:fs/path/os/crypto).
+import {
+  buildDispatchOutcomeRow,
+  recordDispatchOutcome,
+  resolveDispatchClass,
+  resolveTranscriptPath,
+  sessionArgFromArgs,
+  type DispatchOutcomeRow,
+  type RecordWriteResult,
+} from "./shared/dispatch-record.js";
 // #1068: the progress-edge classification is DECLARED once, in shared/, and
 // consumed here — so the child's clock edges and the parent's parsed-marker
 // classification cannot drift apart silently. Re-exported so the parity test
@@ -695,6 +722,17 @@ export const ORPHAN_WATCHDOG_GRACE_MIN_MS = 1_000;
 export const DEFAULT_ORPHAN_WATCHDOG_GRACE_MS = 4_000;
 export const ORPHAN_WATCHDOG_LOG_PATH = path.join(os.homedir(), ".pi", "agent", "orphan-watchdog.log");
 
+/** The attribution line's path. `ORPHAN_WATCHDOG_LOG` overrides the default —
+ * the seam that keeps a TEST from forging `orphan-killed` lines into the
+ * operator's real forensic log (this suite's own comment advertises that log as
+ * a fleet surface, so a fabricated line in it is a fabricated verdict). */
+export function orphanWatchdogLogPath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const override = env.ORPHAN_WATCHDOG_LOG?.trim();
+  return override ? override : ORPHAN_WATCHDOG_LOG_PATH;
+}
+
 /** Poll interval: ORPHAN_WATCHDOG_INTERVAL_MS, default 15s, floor 5s. */
 export function getOrphanIntervalMs(env: Record<string, string | undefined> = process.env): number {
   const raw = Number(env.ORPHAN_WATCHDOG_INTERVAL_MS);
@@ -807,11 +845,23 @@ export interface OrphanWatchdogHooks {
   killDescendants: (graceMs: number) => Promise<void>;
   exitProcess: (code: number) => void;
   appendLog: (line: string) => void;
+  /** Enumerate the pids the kill is ABOUT to signal (the same population
+   * `killDescendants` walks). Recorded into the settle row BEFORE the signal,
+   * because "who did we kill" cannot be reconstructed afterwards. A seam for
+   * the same reason as the others: tests assert the recorded set without
+   * owning real grandchildren. */
+  enumerateKillTargets: () => number[];
+  /** Write the durable settle row. Defaults to the shared
+   * `recordDispatchOutcome`; a seam so the record's CONTENT and its ordering
+   * (before the kill) are assertable without touching the operator's ledger. */
+  recordSettle: (row: DispatchOutcomeRow) => RecordWriteResult;
 }
 
 const defaultAppendLog = (line: string): void => {
   try {
-    fs.appendFileSync(ORPHAN_WATCHDOG_LOG_PATH, `${line}\n`, "utf8");
+    const file = orphanWatchdogLogPath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${line}\n`, "utf8");
   } catch {
     // best-effort — a log failure must never break the kill path
   }
@@ -867,6 +917,147 @@ const defaultKillDescendants = async (graceMs: number): Promise<void> => {
   }
 };
 
+/** The settle row's `reason` — the fleet-readable name for "our own watchdog
+ * killed this dispatch because its parent vanished". Deliberately NOT `done`:
+ * a killed attempt must never read as a completed one, and it must never read
+ * as an absence either (an absence is what made this class invisible). */
+export const ORPHAN_KILLED_REASON = "orphan-killed";
+
+/** The exit code the fire sequence always ends on (128 + SIGKILL). Recorded
+ * into the row so the row and the process agree. */
+export const ORPHAN_KILLED_EXIT_CODE = 137;
+
+/** Enumerate the pids the kill is about to signal: direct children (treeKill
+ * recurses each subtree children-first, so the roots cover their descendants)
+ * plus, when this process is its own pgid leader, the rest of the group (the
+ * same catch-net population `defaultKillDescendants` walks).
+ *
+ * This is a PRE-SIGNAL walk and it is deliberately separate from the kill's
+ * own walks: those re-walk after the TERM/grace so a descendant forked DURING
+ * the grace is still caught. The recorded set is "enumerated at kill time",
+ * which is the only thing knowable before the signal — a post-hoc "what did we
+ * actually kill" read is not available once the pids are gone.
+ *
+ * ⛔ THE PROBE IS ITSELF A CHILD. `getChildPids`/`listPgid` fork `pgrep`, and
+ * that fork is a child of THIS process at the instant it reads the table, so a
+ * naive single read records a pid this process never signals (measured: two
+ * consecutive reads returned `[N, P1]` and `[N, P2]` — N is the real child, P1
+ * and P2 are the two probes). A record that claims to name "who we killed"
+ * must not name the ruler. So each probe runs TWICE and the set is their
+ * INTERSECTION: a genuine descendant is present in both, a probe artifact is
+ * present in exactly one.
+ *
+ * ⚠️ The intersection has TWO error directions, and they are not symmetric. A
+ * descendant that DIED between the two reads is dropped — correct, it will not
+ * be killed. A descendant FORKED between the two reads is also dropped, though
+ * the kill's own re-walk (which happens after this enumeration, by design)
+ * WILL still signal it — so the record can UNDER-report a pid it is about to
+ * kill. That direction is chosen deliberately: naming a pid we never signalled
+ * (the probe) is a false accusation in a forensic record, while omitting a
+ * short-lived fork is a gap. `killedPids` is attribution, not a body count. */
+const enumerateStable = (probe: () => number[]): number[] => {
+  const first = probe();
+  if (first.length === 0) return [];
+  const second = new Set(probe());
+  return first.filter((pid) => second.has(pid));
+};
+
+const defaultEnumerateKillTargets = (): number[] => {
+  const targets = new Set<number>();
+  for (const childPid of enumerateStable(() => getChildPids(process.pid))) {
+    if (childPid !== process.pid) targets.add(childPid);
+  }
+  const ownPgid = orphanWatchdogHooks.ownPgidGetter();
+  if (ownPgid !== null && ownPgid === process.pid) {
+    for (const member of enumerateStable(() => listPgid(ownPgid))) {
+      if (member !== process.pid) targets.add(member);
+    }
+  }
+  return [...targets];
+};
+
+/** Everything the orphan settle row needs that is not readable from the
+ * dying process's own arg vector / env. */
+export interface OrphanSettleInput {
+  /** The pid whose disappearance fired the watchdog (`originalPpid`). */
+  parentPid: number;
+  /** Pids enumerated for the kill, recorded BEFORE they are signalled. */
+  killedPids: number[];
+  now?: Date;
+  env?: Record<string, string | undefined>;
+  /** The child's own arg vector (tests); default `process.argv.slice(1)`. */
+  argv?: string[];
+  cwd?: string;
+}
+
+/**
+ * Build the ORPHAN SETTLE ROW — the one durable record written by the child
+ * itself, through the shared `dispatch-outcome` contract (#783), so a reader
+ * joins it with the parent-side rows on `dispatchId` (+ `childSessionId` +
+ * `attempt`) instead of learning a second format.
+ *
+ * What it names, and why each is knowable HERE and only here:
+ *   · WHO  — `killedPids` (enumerated above) and `cwd` (the worktree the child
+ *            was running in; the child IS the session, so no lookup needed).
+ *   · WHY  — `reason: "orphan-killed"` + `parentPid`: the parent pid that
+ *            vanished. No postmortem is required to infer either.
+ *   · WHEN — `ts`.
+ *   · IDENTITY — `dispatchId` (TASK_HEARTBEAT_NONCE) and `childSessionId`
+ *            (parsed from the child's OWN `--session-id` arg vector — the
+ *            source of truth for what was spawned, the same helper the parent
+ *            uses).
+ *
+ * Values this dying process cannot know are recorded as the contract's
+ * unknown values, never guessed: `branch`/`headSha`/`dirty`/`dirtyPaths` are
+ * `null` (a git probe in a process that is about to be killed is a needless
+ * exec, and "unknown" is what we actually have), `parentSessionId` is `null`,
+ * `everSawTool` is `null` (we may have been mid-tool for an hour — `false`
+ * would assert we never touched one), and `attempt` falls back to the
+ * contract's parent-side default (1) for any dispatcher that does not export
+ * `TASK_DISPATCH_ATTEMPT` — the builtin `task` tool does, so its rows carry the
+ * real per-leg ordinal.
+ *
+ * `transcriptPath` IS knowable with zero exec — the child's own arg vector
+ * carries `--session-id`/`--session-dir` — so it is RESOLVED, never left null
+ * by omission: the transcript locator is the only durable pointer back to what
+ * a killed lane was doing. `null` here therefore means what the contract says
+ * it means (the `--no-session` degrade), not "we did not look". */
+export function buildOrphanSettleRow(input: OrphanSettleInput): DispatchOutcomeRow {
+  const env = input.env ?? process.env;
+  const argv = input.argv ?? process.argv.slice(1);
+  const nonce = env.TASK_HEARTBEAT_NONCE?.trim();
+  const rawAttempt = Number(env.TASK_DISPATCH_ATTEMPT);
+  const attempt = Number.isFinite(rawAttempt) && rawAttempt >= 1 ? Math.floor(rawAttempt) : 1;
+  const childSessionId = sessionArgFromArgs(argv, "--session-id");
+  const childSessionDir = sessionArgFromArgs(argv, "--session-dir");
+  return buildDispatchOutcomeRow(
+    {
+      // The row's writer, not the dispatch path: `extension` is the contract's
+      // discriminator for exactly this case (a row from another writer).
+      extension: "task-heartbeat",
+      dispatchId: nonce ? nonce : null,
+      parentSessionId: null,
+      childSessionId,
+      attempt,
+      cwd: input.cwd ?? process.cwd(),
+      branch: null,
+      headSha: null,
+      dirty: null,
+      dirtyPaths: null,
+      reason: ORPHAN_KILLED_REASON,
+      toolAgeMaxMs: null,
+      toolsInFlight: null,
+      everSawTool: null,
+      transcriptPath: resolveTranscriptPath(childSessionDir, childSessionId),
+      exitCode: ORPHAN_KILLED_EXIT_CODE,
+      dispatchClass: resolveDispatchClass(env),
+      parentPid: input.parentPid,
+      killedPids: input.killedPids,
+    },
+    input.now ?? new Date(),
+  );
+}
+
 /** Module-level test hooks — honored ONLY under NODE_ENV=test (#212
  * security-pass convention: review-enforcer _setRunGhOverride precedent). */
 export const orphanWatchdogHooks: OrphanWatchdogHooks = {
@@ -878,6 +1069,8 @@ export const orphanWatchdogHooks: OrphanWatchdogHooks = {
     process.exit(code);
   }) as (code: number) => void,
   appendLog: defaultAppendLog,
+  enumerateKillTargets: defaultEnumerateKillTargets,
+  recordSettle: (row: DispatchOutcomeRow) => recordDispatchOutcome(row),
 };
 
 let watchdogArmed = false;
@@ -927,10 +1120,17 @@ export function armOrphanWatchdog(): OrphanWatchdogHandle | null {
   return { timer, poll };
 }
 
-/** Fire sequence: EPIPE-guarded stderr line + durable attribution append,
- * then kill the descendant tree (TERM → grace → SIGKILL + pgid catch-net)
- * and exit(137). try/finally: the exit ALWAYS runs even if an unanticipated
- * exception occurs mid-sequence. */
+/** Fire sequence: SETTLE RECORD first, then EPIPE-guarded stderr line +
+ * durable attribution append, then kill the descendant tree (TERM → grace →
+ * SIGKILL + pgid catch-net) and exit(137). try/finally: the exit ALWAYS runs
+ * even if an unanticipated exception occurs mid-sequence.
+ *
+ * ⛔ ORDERING IS THE FIX. The record is written BEFORE any signal, because an
+ * actuator that destroys without recording makes the three end-states (killed
+ * by us / thought it was done / never started) indistinguishable. A record
+ * failure never blocks the kill or the exit — but it is DIAGNOSED on stderr
+ * and carried into the log line, so the row's absence is visible rather than
+ * silent. */
 async function fireSequence(originalPpid: number, curPpid: number, uptimeMs: number): Promise<void> {
   // Capture the hook FUNCTIONS once — the sequence may be suspended across
   // awaits (grace sleep, killDescendants); a later hooks mutation/restore
@@ -938,7 +1138,37 @@ async function fireSequence(originalPpid: number, curPpid: number, uptimeMs: num
   const killDescendants = orphanWatchdogHooks.killDescendants;
   const exitProcess = orphanWatchdogHooks.exitProcess;
   const appendLog = orphanWatchdogHooks.appendLog;
-  const logLine = `[task-heartbeat] orphan_watchdog parent=${originalPpid} ppid=${curPpid} uptime_ms=${uptimeMs} pid=${process.pid} — self-terminating`;
+  const enumerateKillTargets = orphanWatchdogHooks.enumerateKillTargets;
+  const recordSettle = orphanWatchdogHooks.recordSettle;
+
+  // ── 1. SETTLE: name who dies and why, durably, BEFORE signalling anything.
+  let killedPids: number[] = [];
+  let row: DispatchOutcomeRow | null = null;
+  let settleNote = "settle=unrecorded";
+  try {
+    killedPids = enumerateKillTargets();
+    row = buildOrphanSettleRow({ parentPid: originalPpid, killedPids });
+    const result = recordSettle(row);
+    settleNote = result.ok
+      ? `settle=recorded path=${result.path}`
+      : result.skipped
+        ? `settle=skipped path=${result.path}`
+        : `settle=FAILED ${result.error ?? "unknown"} path=${result.path}`;
+  } catch (err) {
+    // The record must never be able to prevent the kill/exit — but it must
+    // never fail silently either: the note rides the log line below.
+    settleNote = `settle=FAILED ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  // ── 2. ATTRIBUTION: the human-readable line, now carrying the same ids the
+  // row carries, so `grep orphan-killed ~/.pi/agent/orphan-watchdog.log` names
+  // the lane without a JSON reader (and names it even if the row FAILED).
+  const logLine =
+    `[task-heartbeat] orphan_watchdog parent=${originalPpid} ppid=${curPpid} uptime_ms=${uptimeMs} pid=${process.pid}` +
+    ` status=${ORPHAN_KILLED_REASON} killed_pids=${killedPids.length > 0 ? killedPids.join(",") : "-"}` +
+    ` dispatch_id=${row?.dispatchId ?? "-"} session_id=${row?.childSessionId ?? "-"} ${settleNote}` +
+    ` — self-terminating`;
+
   try {
     try {
       console.error(logLine);
@@ -947,12 +1177,14 @@ async function fireSequence(originalPpid: number, curPpid: number, uptimeMs: num
       // event (Node swallows it by default) — never break the kill path
     }
     appendLog(logLine);
+    // ── 3. KILL. Policy unchanged: killing on parent death is what makes
+    // cleanup parent-independent — only the SILENCE was the defect.
     await killDescendants(getOrphanGraceMs());
   } catch {
     // An exception in the kill path must never prevent the exit — we are
     // self-terminating anyway. Swallow and fall through to the finally.
   } finally {
-    exitProcess(137);
+    exitProcess(ORPHAN_KILLED_EXIT_CODE);
   }
 }
 
