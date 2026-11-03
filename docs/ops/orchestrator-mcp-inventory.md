@@ -44,6 +44,7 @@ one, which is exactly the behaviour this issue exists to end.
 | `extensions/` | **47** entries | listed; the ones that bear on the decision (`task-heartbeat.ts`, `builtin-tools/`, `mcp-client/`, `review-enforcer/`, `task-signal-forensics.ts`) read to contract level |
 | `tortoise/tools/` | `who_is_on.py`, **`who-is-on.sh`**, `cmux_dispatch.py`, `collision_preflight.py`, `lane_stash.py`, `worktree_report.py`, `test_lane.py`, `run_reaper.py`, `attest_census.py` | docstrings + CLI of each. **Corrected:** the first draft missed `who-is-on.sh` and wrongly concluded it did not exist — see F7 |
 | `$HOME/.pi/agent/state/` notes | **29** `FINDING-*` files, `LANE-STATE-DECISION-TREE.md` (173 lines, read in full), `BEAT-CHECKLIST.md` (37 lines, read in full), `LANE-BRIEF-PREAMBLE.md` | 8 `FINDING-*` notes read in full (the ones naming a classifier, actuator, aggregate or death defect); the rest listed |
+| **`$HOME/.pi/agent/` and the rest of `$HOME/.pi/agent/state/`** | not enumerated in the first two passes | ⚠️ **Declared gap, and it cost two rounds of review.** An earlier draft listed only the *notes* under `state/`, so searches for `instabox` never touched `INSTABOX-OPERATING-PROMPT.md`, `instabox-setup.sh` or `PAT-INSTABOX.md` sitting there — and concluded the procedure did not exist twice (F8). The whole directory is now read; §5 row 11 and F8 record what it contains |
 | `git log --all` over `scripts/` + `tools/` | **605** files ever *added* to those two trees | `--diff-filter=A --name-only`; the newest 40 inspected |
 | `gh search code` | 1 query, 8 results | returned only this repo's files. ⚠️ It is **not** evidence about other checkouts: the `who-is-on.sh` miss in the first draft came from an `rg` scoped to agent-infra whose conclusion was then written as "every checkout" (F7). One `find -maxdepth 3` across `~/Documents/GitHub` would have caught it, and did, on review |
 | **external prior art** | 6 sources, URLs in [§8](#8-external-prior-art) | `research` skill; graph queried first (`tortoise_search`) |
@@ -154,8 +155,9 @@ claimed "every checkout" — an undeclared-coverage inference, the exact defect 
 liveness doctrine names.
 
 `tortoise/tools/who-is-on.sh` is **tracked** (1954 bytes, `git ls-files tools/` returns it alongside
-`tools/who_is_on.py`), and four copies sit across this box's checkouts. It is also **a three-line
-shim**, not an implementation: its body `exec`s `who_is_on.py` (953 lines), which in turn
+`tools/who_is_on.py`), and four copies sit across this box's checkouts. It is **a 35-line file whose
+last three lines are the whole of its body** — a shim, not an implementation: that body `exec`s
+`who_is_on.py` (953 lines), which in turn
 `import collision_preflight as cp` (9132 lines) — "importing it keeps ONE implementation of matching
 and git enumeration". Its header answers #6's exact
 question — *"`tools/who-is-on.sh <N> [--repo <path|owner/name>]` — who holds issue #N (local +
@@ -181,15 +183,32 @@ So the honest count for #6 is **three** existing implementations across **two** 
 `collision_preflight` dependency (pre-dispatch pre-flight) — and Phase 2 must name which one it wraps
 per axis rather than inventing a fourth. See row 6 and D2, which carry the decision.
 
-### F8 — `InstaBox` has **credentials and no code**: the "documented procedure" tool #11 wraps is not documented anywhere
+### F8 — `InstaBox` **is documented, installed and warmed** — tool #11 is a `PARTIAL` wrapper, not a `NEW` tool
 
-`~/.pi/agent/instabox.json` exists — a live key, `scopes: machines:read, machines:write,
-machines:delete, images:read`, created 2026-11-02, expiring 2027-01-31. A bounded search across all
-20 checkouts, `docs/`, `skills/` and `$HOME/.pi/agent/scripts/` for `instabox` returns **zero**
-implementation and **zero** documentation. The closest existing machinery is
-`scripts/scratch-worktree.sh` (an isolated worktree **on the same box**, sharing the object store) plus
-the `verifier` agent (`pi-bootstrap/pi-config/agents/verifier.md`), which is *not* independent-machine
-verification. See [§7.3](#73-verify_independent-11--new-and-gated-on-writing-the-procedure-first).
+**Corrected twice, and the second correction is the one that matters.** A first draft said the
+InstaBox procedure does not exist. A second draft repeated it after widening the search to "all 20
+checkouts, `docs/`, `skills/`, `$HOME/.pi/agent/scripts/`" — which still omitted **`$HOME/.pi/agent/`
+and `$HOME/.pi/agent/state/`**, the two directories the procedure actually lives in. That is the same
+undeclared-coverage inference as F7, reintroduced one finding later, and it is the reason §2.1's read
+scope is now written out field by field rather than summarised.
+
+What is actually on the box:
+
+| artefact | what it is |
+|---|---|
+| `~/.local/share/pi-node/current/bin/instabox` | the installed CLI (v0.8.125) |
+| `~/.pi/agent/instabox.json` | the key — `machines:read/write/delete`, `images:read`, expiring 2027-01-31, **already 0600 in a 0700 dir** |
+| `~/.pi/agent/instabox-setup.sh` | the setup implementation (1473 B): toolchain, `--setup-file` trap, health check |
+| `~/.pi/agent/state/INSTABOX-OPERATING-PROMPT.md` | **the documented procedure** (6283 B, 2026-11-02): create / start / stop / exec / rm recipes, the `--setup-file` toolchain trap, guard gotchas, health check, budget and kill-switch, and the standing rule *"InstaBox is NOT a CI runner for us — never change `runs-on:`"* |
+| `~/.pi/agent/state/PAT-INSTABOX.md` (+ `PAT-INSTABOX-BRIEF.md`) | 14739 B: a falsifiable independent-verification protocol — `SCOPE(...)`, a negative write test, `INSTALLED(mode,path)`, `PROVEN(before,after)` |
+| `~/.pi/agent/state/poke-loop-inner.sh` | the live poke already tells the orchestrator to use it as an independent verifier: *`instabox start …`, then `instabox exec … -- git clone --depth 1 --branch <head-branch> <repo> …`* |
+
+So the create→clone-at-ref→run-the-lane's-steps→stop procedure §7.3 was written to supply **already
+exists and is already in the orchestrator's own instructions**. What does not exist is the **typed
+surface**: `{rc, stdout, timed_out, truncated}`, an MCP tool name, and a teardown that is guaranteed
+rather than remembered. #11 is therefore `PARTIAL` (wrap the CLI + `instabox-setup.sh` + the operating
+prompt), it is not `NEW`, and `~/.pi/agent/instabox.json` being unconsumed **by a script** is not a
+security finding — it is a working credential whose consumer is the agent itself.
 
 ### F9 — `harness-provenance.sh` already answers invariant 5; `instrument_versions()` must not grow a second hasher
 
@@ -234,9 +253,10 @@ to re-derive.
 
 ### F12 — The issue's own six measured failures are **not all reproducible today**
 
-Two are live and red-first-able, one is already repaired in tracked code, three live only in untracked
-files or as a composition that does not exist yet. Table with per-failure status and what the red-first
-fixture must target: [§9](#9-the-six-measured-failures--fixture-status). A "red-first" fixture written
+One is red-first today, one is red-first only against its **replacement** (its mechanism lives in an
+untracked file, so no repo test can exercise it), one is already repaired in tracked code, and three
+live in untracked files or in a composition that does not exist yet. Table with per-failure status and
+what the red-first fixture must target: [§9](#9-the-six-measured-failures--fixture-status). A "red-first" fixture written
 against already-fixed behaviour passes on the broken version and proves nothing — the very thing
 invariant 6 forbids.
 
@@ -258,7 +278,7 @@ Sources: `$HOME/.pi/agent/state/LANE-STATE-DECISION-TREE.md` (the tree),
 | **3 — child in flight** | ❌ no child field in `Evidence` | ✅ `child_suppresses()`, `child_activity()`, `declared_children()`, `lane_child_prefixes()` | consumes (`child_evidence`) | ✅ **only** in `lane-status.py` |
 | **4 — last tool call + its age** | ✅ `tool_from_jsonl` → `Tool.tool_age_ms`/`silence_age_ms`; `tool_veto_expired` | ✅ `last_tool_call`, `LONG-TOOL` | consumes | ✅ both |
 | **5 — read what it said** (the ONLY step that yields meaning) | ❌ (by design — a pure mechanical verdict) | ❌ | ✅ `classify_row` + one batched JEV call (`state/lane-verdict.py`); `UNCLASSIFIED(JEV-DOWN)` when unread | ✅ here **and** in `scripts/turn-classify.py` (a JEV call over one lane's last text) — **two** callers, this one is one round trip for the fleet (F11) |
-| **6 — hard cases by RECURSION** (CHILD-OVERDUE ⇒ apply THIS SAME TREE to the child) | ❌ | partial: `child_suppresses` suppresses parent verdicts to `WAITING`, does not verdict the child | ❌ | ❌ **nowhere** — see §7.2 |
+| **6 — hard cases by RECURSION** (CHILD-OVERDUE ⇒ apply THIS SAME TREE to the child) | ❌ | partial: `child_suppresses` suppresses parent verdicts to `WAITING`, does not verdict the child | ❌ | ❌ **nowhere** — see §7.1 |
 | `finished` (§11, #2163) | not a `STATES` member; `running-quiet` + resident | `DONE-IDLE`-family | `DONE_READY` (Step-5 words) | partial — reap evidence is in `lane-reap.sh` |
 
 ### 4.2 What this means for the tool (the wrapper plan, not a redesign)
@@ -334,7 +354,7 @@ it) · `NEW` (nothing does; justified in §7).
 
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
-| 1 | `lane_status(lane\|box\|all)` | `scripts/lane-status.py` (`lane_cpu_busy`, `child_suppresses`, `last_tool_call`, `resolve_session_ex`, 2528 lines) + `scripts/lane-actions.py::classify_row` (Step 5, JEV) + `tools/fleet/liveness.py::evaluate`/`gather` (identity, `dead`, abstentions) + `scripts/orchestrator-harness/lane-reap.sh count` (`finished`) | one typed answer over all four; a stable state vocabulary across them; `dead` absent from the issue's list; `reason` string not surfaced | subprocess the three CLIs with `--json`, map to the six states, carry each source's `reason` verbatim, emit `UNMEASURED(<cmd> + <error>)` if any returns its abstention exit | **WRAPPER** (composed; no new classifier) |
+| 1 | `lane_status(lane\|box\|all)` | `scripts/lane-status.py` (`lane_cpu_busy`, `child_suppresses`, `last_tool_call`, `resolve_session_ex`, 2528 lines) + `scripts/lane-actions.py::classify_row` (Step 5, JEV) + `tools/fleet/liveness.py::evaluate`/`gather` (identity, `dead`, abstentions) + `scripts/orchestrator-harness/lane-reap`.sh count` (`finished`) | one typed answer over all four; a stable state vocabulary across them; `dead` absent from the issue's list; `reason` string not surfaced | four sources, not three: `lane-status.py`, `lane-actions.py` and `liveness.py` take `--json`; **`lane-reap.sh count` does not** (`--json` exists only under `reap`) — it prints `lanes=<live>/<total> zombie=<n>` and abstains with `lanes=?/?` + exit 3, so its line is parsed and its exit 3 carried as the abstention. State mapping: the **five** states as the issue writes them, with `dead` carried in a separate `dead: true` field until the owner answers the reopen (§4.3) | **WRAPPER** (composed; no new classifier) |
 | 2 | `lane_tree(lane)` | `tools/fleet/lane_liveness.py::child_sids` + `enumerate_lanes(…, children)`; `scripts/orchestrator-harness/lane-artifacts.sh` (cell artifacts); `~/.pi/agent/task-sessions/<uuid>/` | **Applying the tree to the CHILD** (Step 6). `child_suppresses` only demotes the parent's verdict; `enumerate_lanes` lists child sessions but does not verdict them. Measured consequence: `state/FINDING-lane-classifier-ignores-task-children-2026-10-11.md` — **four** lanes tabulated as false `IDLE`/`WEDGED`/`STALL` verdicts (one of them marked "presumed"), plus a fifth entry under a fourth label (`WIP`), every one a lane holding or presumed to hold a `task` child | compose: `lane_status` per node (this is Step 6's own instruction) + `child_sids` for the edge set; the recursion is the tool, not a new rule | **PARTIAL** (§7.1) |
 | 3 | `lane_artifact(lane)` | `scripts/lane-read.py` (`sid_for`, `files_for` — last N assistant messages by pane); `scripts/orchestrator-harness/lane-artifacts.sh` (verbs, exit `0 found · 3 ABSENT-EVERYWHERE · 4 UNMEASURED · 5 PULL-FAILED`); `BEAT-CHECKLIST.md`'s `## LANE-DONE <verdict> <ts>` line | one answer over *both* axes: a session lane's words AND a **cell** lane's file (the 2026-11-01 measurement: four mandated artifacts existed, each on a different box, none reachable from the mac); size/age/terminal-line in one shape | wrap `lane-read.py` for words, `lane-artifacts.sh` for files; read the `## LANE-DONE` line as the terminal verdict; "none written" is a value, not an error | **WRAPPER** (two implementations, one answer) |
 
@@ -344,7 +364,7 @@ it) · `NEW` (nothing does; justified in §7).
 |---|---|---|---|---|---|
 | 4 | `fleet_census(repos)` | `scripts/beta-progress.py::compute`/`main` (P0/P1 open·with-PR·NONE, age printed, cache validator, `DELIVERY [as of …]` line); `scripts/orchestrator-harness/capacity.sh probe` (measured placement, 8.00/CPU ceiling); `scripts/orchestrator-harness/box-status.sh` (5 machine-parsable lines: deployed/pin/stamp/running); `tools/fleet/fleet-health.py`; `scripts/fleet-schedule.py --status`; `BEAT-CHECKLIST.md` checks 1-3 | one typed object per box+repo; **`fleet-report.py` is untracked (F3)** and its §3 "merged" is a keyword mention (F4); no `measured_at` field (the text line has one, the bytes do not) | wrap `beta-progress.py --json`-shaped output + `capacity.sh probe` + `box-status.sh`; **land `fleet-report.py` into `scripts/`** or drop its dependency (D3); every figure carries `value`, `measured_at`, `age_ms`, `source` | **WRAPPER** (tracked modules only) |
 | 5 | `pr_queue(repo)` | `tools/fleet/pr_state.py` — `action_for`, `row_action`, `fidelity`, `inherited_reds`, `verdict`; rows `CLOSE-STALE`/`WAIT:draft`/`REPAIR-CONFLICT`/`FIX-RED`/`RERUN-FLAKE`/`WAIT:inherited-red`/`REVIEW`/`WAIT:attested-elsewhere`/`WAIT:owes-review`/`WAIT:diff-unreadable`/`WAIT:in-flight`/`WAIT:no-check-surface`/`WAIT:mergeable-unknown`/`WAIT:authority-unreadable`/`LAND`; exit **2 = the pass could not be made** | the issue's vocabulary is coarser (`CONFLICT`/`STALE-ATTESTATION`/`NO-ATTESTATION`/`READY`/`INHERITED-RED`/`DRAFT`); **closing issues** are not attached to a row; `--json` exists but there is no MCP-typed shape with a `measured_at` | wrap `pr_state.py --json` (never `fleet-report.py::classify` — D1); map its 15 actions onto the issue's 6 classes **lossily in one direction only** (the 6 are a view; the 15 remain the answer); join closing issues per row | **WRAPPER** |
-| 6 | `claim_check(issue, repo)` | **registry axis:** `tools/fleet/claim_lanes.py` (`read_registry`, `read_pull`, `read_snapshot`, `parse_key`, `parse_owner`, `parse_lease`, `to_evidence`) + `tools/fleet/liveness.py::claim_verdict` + `CLAIM_REASONS` (6 named abstentions) + `scripts/orchestrator-harness/claims.sh`. **local-checkout axis:** `tortoise/tools/who-is-on.sh` (tracked, 1954 B — `0` complete answer, `2` a surface could not be read) — a **3-line shim** that `exec`s `who_is_on.py` (953 lines), which imports `collision_preflight` (9132 lines) for its git enumeration | one answer across both axes; the registry axis answers "does a claim exist for this issue/head", the local axis answers "is work in flight on this disk". Today they are two tools in two repos and neither names the gap | wrap `claim_lanes.py` for the registry axis (`--json` + exit 3 = nothing established, never freedom) and **port the local axis** — which is **three files, not one**: `who-is-on.sh` + `who_is_on.py` + a declared decision on its `collision_preflight` import (port the gate, or keep the local axis `UNMEASURED(<why>)` rather than a second enumerator). Carry `ClaimRead.readable` and `siblings` into the payload so an absent key can never read as "free" | **WRAPPER** (two axes, both existing) |
+| 6 | `claim_check(issue, repo)` | **registry axis:** `tools/fleet/claim_lanes.py` (`read_registry`, `read_pull`, `read_snapshot`, `parse_key`, `parse_owner`, `parse_lease`, `to_evidence`) + `tools/fleet/liveness.py::claim_verdict` + `CLAIM_REASONS` (6 named abstentions) + `scripts/orchestrator-harness/claims.sh`. **local-checkout axis:** `tortoise/tools/who-is-on.sh` (tracked, 1954 B — `0` complete answer, `2` a surface could not be read) — a **3-line body** (35 lines with its header) that `exec`s `who_is_on.py` (953 lines), which imports `collision_preflight` (9132 lines) for its git enumeration | one answer across both axes; the registry axis answers "does a claim exist for this issue/head", the local axis answers "is work in flight on this disk". Today they are two tools in two repos and neither names the gap | wrap `claim_lanes.py` for the registry axis (`--json` + exit 3 = nothing established, never freedom) and **port the local axis** — which is **three files, not one**: `who-is-on.sh` + `who_is_on.py` + a declared decision on its `collision_preflight` import (port the gate, or keep the local axis `UNMEASURED(<why>)` rather than a second enumerator). Carry `ClaimRead.readable` and `siblings` into the payload so an absent key can never read as "free" | **WRAPPER** (two axes, both existing) |
 
 ### 5.3 Actuation (tools 7–9)
 
@@ -359,7 +379,7 @@ it) · `NEW` (nothing does; justified in §7).
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
 |---|---|---|---|---|---|
 | 10 | `review_record(pr)` | `scripts/record-review.sh --check-carry` (**positional** `<pr> [owner/repo]`; `--repo` exits 2); one tab-separated line `<verdict>\t<record digest\|->\t<live digest\|status>`; its full verdict set is **`head` (0) / `carry` (0) / `carry-patch` (6) / `fresh` (1) / `unreadable` (3) / `norecord` (4) / `nodigest` (5)**; `--print-diff-hash` (read-only seam `pr_state.py` already uses) | a typed `{current \| stale \| absent}` + **the head the record is bound to** in one reply; seven verdicts mapped onto three states without losing `carry-patch` (RE-RECORD, not a review cycle) or `unreadable` (RETRY, not re-review) | wrap `record-review.sh --check-carry` positionally; map `head`→current; `carry`/`carry-patch`→stale-with-head; `norecord`→absent; `fresh`/`unreadable`/`nodigest` keep their own names (they are three different next actions). **Pass the repo positionally** (the `--repo` refusal is documented) | **WRAPPER** |
-| 11 | `verify_independent(repo, ref)` | **none.** `scripts/scratch-worktree.sh` is an isolated worktree **on this box** (shares the object store); `pi-bootstrap/pi-config/agents/verifier.md` is an isolated *context*, same box. `~/.pi/agent/instabox.json` holds a live key (`machines:read/write/delete`, `images:read`) and **nothing consumes it** | the whole thing: start/clone/carve-out/stop on a **fresh machine**, plus postable evidence. The "documented InstaBox procedure" the issue names does not exist in any checkout or docs (F8) | **the procedure must be written first**, in this repo and under review, and only then wrapped: create → clone at `ref` → carve-out test → **stop** (a teardown that is not in the path is a leak). Until then the tool cannot be a wrapper | **NEW** (§7.3) |
+| 11 | `verify_independent(repo, ref)` | `~/.local/share/pi-node/current/bin/instabox` (the CLI, v0.8.125) + `~/.pi/agent/instabox-setup.sh` (toolchain + health check) + `~/.pi/agent/state/INSTABOX-OPERATING-PROMPT.md` (**the documented procedure**: create/start/stop/exec/rm, the `--setup-file` trap, budget, kill-switch) + `~/.pi/agent/state/PAT-INSTABOX.md` (the falsifiable protocol: `SCOPE(...)`, negative write test, `INSTALLED(mode,path)`, `PROVEN(before,after)`). `scripts/scratch-worktree.sh` and the `verifier` agent are the same-box answers and are **not** substitutes | the **typed surface**: `{rc, stdout, timed_out, truncated}`, a stable tool name, and a teardown that is *guaranteed* rather than remembered — plus the standing rule the operating prompt already states (`never change runs-on:`) in a form the tool cannot violate | wrap the CLI and the operating prompt: create → clone at `ref` → run the lane's own steps → post evidence → **stop in a `finally`**; refuse any command the prompt forbids; `INSTALLED`/`PROVEN` lines read from `PAT-INSTABOX.md`'s protocol rather than invented | **PARTIAL** (§7.3) — corrected twice from `NEW`, see F8 |
 | 12 | `closure_audit(pr)` | `gh`'s `closingIssuesReferences` — **already consumed by `scripts/review-pr.sh:501`** (`gh pr view … --json closingIssuesReferences`) and adapted by the `scripts/orchestrator-harness/gh-rest/gh` shim as the GraphQL-only field; `scripts/beta-progress.py::compute`'s `covered()` (open-or-merged PR naming the issue, boundary-exact); `scripts/orchestrator-harness/merged-not-closed.sh`; `tools/fleet/outcome_canary.py` | "what did this merge ACTUALLY close" as a typed fact, and **prose-keyword false closes** — the census counts a `#N` mention in a title/body/branch as merged (F4). No existing tool **compares** the closing references against the prose mentions against the issue's own live `state` | wrap `gh api` `closingIssuesReferences` + re-read each issue's `state`; name `review-pr.sh:501` as the existing consumer of the field rather than claiming it is unused; emit the closed/mentioned/still-open triple | **PARTIAL→WRAPPER** of `gh` (§7.5) |
 
 ### 5.5 Durability (tools 13–14)
@@ -374,12 +394,15 @@ it) · `NEW` (nothing does; justified in §7).
 | class | tools |
 |---|---|
 | **WRAPPER** (existing implementation answers it) | 1, 3, 4, 5, 6, 8, 9, 10, 14 (9 tools) |
-| **PARTIAL** (existing implementation answers part) | 2, 7, 12, 13 (4 tools) |
-| **NEW** (nothing answers it) | 11 (1 tool) |
+| **PARTIAL** (existing implementation answers part) | 2, 7, 11, 12, 13 (5 tools) |
+| **NEW** (nothing answers it) | **none** |
 
-**Unexplained `NEW` rows: 0.** The one `NEW` row (#11) is justified in §7.3 *and* carries a
-precondition: the procedure it wraps must be written and reviewed first, which makes Phase 2's slice
-of it "write the procedure", not "wrap a script".
+**`NEW` rows: 0 — and this time literally.** Every one of the 14 tools wraps something that exists.
+The last row to fall was #11, and it fell twice: the first draft said the InstaBox procedure did not
+exist, the second said it still did not after a search that omitted `$HOME/.pi/agent/state/` (F8).
+Both were the same error, and both are left in the document rather than tidied away, because a
+Phase-1 inventory that quietly reports "nothing exists" is the failure this phase is designed to
+catch — **three times in one document is a method problem, not three unlucky searches.**
 
 ---
 
@@ -392,16 +415,20 @@ tools the issue requires. Each one is a sentence the code made unavoidable.
 | ID | Deleted | Why |
 |---|---|---|
 | **D1** | `fleet-report.py::classify` as the implementation of `pr_queue` (#5) | `tools/fleet/pr_state.py` implements the same one-cause-per-row table, tracked and reviewed, plus head-bound attestation fidelity that `classify` lacks. Wrapping both is a second PR classifier — the duplication this issue exists to prevent (F6). `classify` stays in `fleet-report.py` until that file is either landed and reduced or retired; it is **not** an MCP wrap target. |
-| **D2** | Wrapping `claim_lanes.py` **alone** for `claim_check` (#6) | **Corrected.** The first draft deleted `who-is-on.sh` on the claim that it does not exist; it does (F7), and deleting a wrap target the issue names *on a false premise* is the worst version of this deletion rule. What survives is narrower and evidence-backed: `claim_lanes.py` answers the **registry** axis and cannot answer the **local-checkout** axis, and the local axis is not one file — `who-is-on.sh` is a 3-line shim that `exec`s `who_is_on.py` (953 lines), which imports `collision_preflight` (9132 lines) for its enumeration. Phase 2 therefore **ports the local axis or declares it `UNMEASURED`** — it does not drop it, and it does not pretend a one-file copy is the port. |
+| **D2** | Wrapping `claim_lanes.py` **alone** for `claim_check` (#6) | **Corrected.** The first draft deleted `who-is-on.sh` on the claim that it does not exist; it does (F7), and deleting a wrap target the issue names *on a false premise* is the worst version of this deletion rule. What survives is narrower and evidence-backed: `claim_lanes.py` answers the **registry** axis and cannot answer the **local-checkout** axis, and the local axis is not one file — `who-is-on.sh` is a 3-line body (35 lines incl. header) that `exec`s `who_is_on.py` (953 lines), which imports `collision_preflight` (9132 lines) for its enumeration. Phase 2 therefore **ports the local axis or declares it `UNMEASURED`** — it does not drop it, and it does not pretend a one-file copy is the port. |
 | **D3** | A required dependency on `fleet-report.py` for `fleet_census` (#4) | Untracked (F3): it cannot be deployed by bootstrap, so making the MCP server depend on it makes the server unreproducible on a fresh box — a direct violation of Indicator (b). Either its bytes land in `scripts/` (preferred: it carries a fix that exists nowhere else) or `fleet_census` uses `beta-progress.py` + `capacity.sh` + `box-status.sh` only. **Not** a duplicate-wrap: the wiring is one or the other, never both. |
 | **D4** | `fleet-report.py`'s §3 "merged last hour" as a closure source for `closure_audit` (#12) | It is a keyword mention (F4), i.e. it is the *defect*, not the implementation. `closure_audit` exists to replace it. |
 | **D5** | Any Tortoise-graph verb | Out of scope by the issue: the graph is reached through the Tortoise MCP and the `how-to-use-tortoise` skill. `scripts/tortoise-graph.sh` + `scripts/tortoise_graph_client.py` exist and are the **CLI** path; the MCP server must not add a third. Only the `GRAPH-UNREACHABLE(<cmd> + <error>)` convention is recorded. |
-| **D6** | A second PR-state classifier, second lane classifier, second liveness verdict, second hasher | The structural deletion. `pr_state.py` (PR), the `lane-status.py` → `lane-actions.py` → `liveness.py` composition (lane), and `harness-provenance.sh` (versions) each already own their question. Every "NEW" in §5 would have been one of these. |
+| **D6** | A second PR-state classifier, second lane classifier, second liveness verdict, second hasher | The structural deletion. `pr_state.py` (PR), the `lane-status.py` → `lane-actions.py` → `liveness.py` composition (lane), and `harness-provenance.sh` (versions) each already own their question. Every would-be "NEW" tool in §5 was one of these — and after three review rounds, **none of the 14 turned out to be NEW at all**. |
 | **D7** | `tools/fleet/fleet-health.py::cputime_secs` and `scripts/turn-classify.py` **as second homes** for tree steps 2 and 5 | Both exist and both work; neither becomes the wrapper's implementation (F11). The CPU reader must be `lane-status.py::lane_cpu_busy` (the only one with the exactly-one-lane-to-one-process attribution guard); the content reader must be `lane-actions.py`'s single batched JEV call (N round trips for one beat is not an option at ~29 lanes). They are not deleted from the repo — `fleet-health.py` and `turn-classify.py` have their own callers — but they are **deleted from consideration**, so Phase 2 cannot silently pick a second one and produce a verdict that disagrees with the beat's. |
 
 ---
 
-## 7. Non-wrapper justifications (why no existing tool can serve)
+## 7. Non-wrapper justifications (what each `PARTIAL` adds, and why it is not already covered)
+
+The five `PARTIAL` rows (2, 7, 11, 12, 13) each wrap a real implementation and each add one specific
+thing. This section names the thing, and for each one says why no existing tool already supplies it —
+the test the issue's deletion rule applies in the other direction.
 
 ### 7.1 `lane_tree` (#2) — PARTIAL
 
@@ -432,34 +459,38 @@ Two surfaces are genuinely absent from every existing launcher:
    stderr prose. `branch-claim.sh` and `spawn-gate.sh` know how to **detect** both; nothing maps them
    to a machine-readable refusal. The tool adds the mapping, not the detection.
 
-### 7.3 `verify_independent` (#11) — NEW, and gated on writing the procedure first
+### 7.3 `verify_independent` (#11) — `PARTIAL`: the procedure exists, the typed surface does not
 
-There is no existing implementation and **no documented procedure**: the credential file exists and
-nothing consumes it (F8). The two closest things are on the *same box*:
+**This row is the document's own worst moment and is kept as one.** Two drafts called it `NEW` on the
+claim that no InstaBox procedure existed. Both searches omitted `$HOME/.pi/agent/` and
+`$HOME/.pi/agent/state/`, where the procedure, the setup script and the verification protocol live, and
+where the **live poke** already instructs the orchestrator to use the machine as an independent
+verifier (F8). The claim was false; the file table in F8 is what replaced it.
 
-- `scripts/scratch-worktree.sh` — an isolated worktree sharing the object store (its own header bans
-  `git clone`, `cp -R`, `rsync` and `git archive | tar` for scratch checkouts, deliberately).
-- `pi-bootstrap/pi-config/agents/verifier.md` — isolated **context**, same machine.
+So #11 is `PARTIAL`, and the split is precise:
 
-Neither can answer "does a fresh machine, after bootstrap, reach the same answers" — which is
-Indicator (b) of this issue. So no existing tool can serve. But the honest ordering is: **the
-procedure is the deliverable, and it does not exist yet.** Phase 2 therefore ships, for #11:
+| exists | does not exist |
+|---|---|
+| the CLI (`instabox`, v0.8.125), the setup (`instabox-setup.sh`), the **operating procedure** (`INSTABOX-OPERATING-PROMPT.md`), and a falsifiable evidence protocol (`PAT-INSTABOX.md`: `SCOPE(...)`, negative write test, `INSTALLED(mode,path)`, `PROVEN(before,after)`) | a **typed** surface — `{rc, stdout, timed_out, truncated}`, a stable tool name, and a teardown that is *guaranteed* rather than remembered |
 
-- a written procedure in-repo (create → clone at `ref` → run the lane's own steps → post evidence →
-  **stop**), reviewed like any other artifact;
-- the tool as a thin wrapper over that procedure, **refusing** any scope beyond `machines:read` +
-  image start, with teardown in the `finally` path;
-- and an honest statement of the residual this inventory measured: a live key carrying
-  `machines:delete` sits unused on the box. **It is already at 0600 inside a 0700 directory
-  (`-rw------- ~/.pi/agent/instabox.json`), so there is no permission defect to file** — a first draft
-  of this section claimed a world-readable key and would have filed a no-op issue on a false premise.
-  What is left is the absence of a consumer and the absence of a procedure, and both are this issue's
-  work, not a follow-up's.
+Phase 2 therefore ships a **wrapper**, not a procedure:
 
-If the reviewer judges that writing+reviewing a brand-new cloud-machine procedure is too much for a
-"wrap the existing thing" phase, the defensible reduction is: **#11 out of Phase 2, into its own
-issue, with the 13 remaining tools landing together** — the issue's batching rule is about CI cost,
-and a 13-tool PR pays the same CI run as a 14-tool one.
+- call the CLI; read `INSTALLED`/`PROVEN` from the protocol rather than inventing a second evidence
+  format; carry every step's `{rc, stdout, timed_out, truncated}`;
+- **teardown in a `finally`** — the one part of the existing procedure that is a human habit and must
+  become a code path, because a created machine that is not stopped is a spend that outlives the lane;
+- and honour the operating prompt's standing rule (*"InstaBox is NOT a CI runner for us — never change
+  `runs-on:`"*) in a way the tool cannot violate, rather than in a paragraph the next reader may skip.
+
+**Not a security finding:** `~/.pi/agent/instabox.json` is a live key carrying `machines:delete`, and
+it is **already 0600 inside a 0700 directory**. A middle draft of this section claimed a
+world-readable key and would have filed a no-op issue on a false premise; that claim is withdrawn. The
+residual is scope, not permissions: the tool must never pass `machines:delete` through, and the key's
+blast radius is bounded by what the wrapper will call.
+
+If the reviewer judges that a cloud-machine wrapper is too much for a "wrap the existing thing" phase,
+the defensible reduction is: **#11 out of Phase 2, into its own issue, with the 13 remaining tools
+landing together** — the batching rule is about CI cost, and a 13-tool PR pays the same CI run.
 
 ### 7.4 `box_exec` (#9) — a wrapper over an external CLI verb, not over a script
 
@@ -574,7 +605,7 @@ gate.
 | 5 FALSE DEATH ×3 | **largely closed** in `liveness.py`; reachable only through a composition that does not exist yet | **pin at the `evaluate` level**, red-first at the `lane_status` boundary once the composition exists |
 | 6 SILENT ACTUATOR | **half-closed** (typed exits landed; the two measured failures were prose) | red-first on the mapping half only |
 
-So: **1 red-first today** (#6's mapping half), **1 red-first only against the NEW tool** (#2 — its
+So: **1 red-first today** (#6's mapping half), **1 red-first only against its replacement** (#2 — its
 mechanism lives in the untracked `fleet-report.py`, so no repo test can exercise `gh_json` today; the
 fixture is red-first against the replacement, not against today's code), **1 pin at the unit level that
 becomes red-first only once the composition exists** (#5), **2 blocked on landing untracked bytes**
@@ -656,9 +687,13 @@ assert, because the obvious assertion is the one that passes on the broken versi
 
 **Mutation-testing note (this is the invariant most likely to be faked):** the honest form is a small
 harness that (a) checks out the pre-fix line or injects the pre-fix branch, (b) runs the fixture, (c)
-requires a non-zero exit, (d) restores, (e) requires zero. For the two failures that live in an
-**untracked** file (#4) or are **already fixed** (#3), there is no pre-fix line to check out — those
-must be declared as **pins**, not as mutations, in the PR body and in the test file's docstring.
+requires a non-zero exit, (d) restores, (e) requires zero. **Three** of the six failures have no
+pre-fix line to check out — #1, #2 and #4 all live in `fleet-report.py`, which **git has never held**
+(`git ls-files | grep -c fleet-report.py` = 0) — and two more cannot be red-first for a different
+reason: #3 is already repaired, and #5 is reachable only through a composition that does not exist yet.
+Each of those five must be declared as a **pin** (or, for #1/#2, red-first **against its replacement**),
+never as a mutation, in the PR body and in the test file's docstring. A Phase 2 that hunts a pre-fix
+line for #1/#2 would be performing the mutation theatre this invariant exists to stop.
 
 ---
 
@@ -667,9 +702,11 @@ must be declared as **pins**, not as mutations, in the PR body and in the test f
 1. **§4.3 — six states, `dead` included?** This inventory says yes, because the issue's invariant 3
    presupposes it. A five-state surface can only satisfy invariant 3 by dropping the positive `dead`
    finding, which reverses #1178's purpose.
-2. **§7.3 — is `verify_independent` in Phase 2 or its own issue?** It is the only `NEW` tool, its
-   "documented procedure" does not exist, and its credential carries `machines:delete`. Reducing to
-   13 tools costs the same CI run.
+2. **§7.3 — is `verify_independent` in Phase 2 or its own issue?** It is the only tool whose
+   *surface* has no implementation, but its **procedure does exist** (F8: operating prompt + setup +
+   evidence protocol, and the live poke already invokes it). So the question is narrower than an
+   earlier draft made it: *does a typed wrapper around a working, documented cloud-machine procedure
+   belong in this batch, or its own?* Reducing to 13 tools costs the same CI run.
 3. **F3 — do the three untracked modules get landed in this issue?** `fleet-report.py` and
    `orch-checkpoint.sh` are wrapped by #4 and #14; `state/lane-verdict.py` holds one of the five
    `jev-latest` pins. Landing them is prerequisites, not scope creep — but it is bytes landing in
@@ -740,7 +777,7 @@ arm), `task-signal-forensics.ts` (the signal-attribution instrument),
 `sequence-enforcer`/`skill-enforcer`/`search-guard` (the "must refuse a running session" class).
 
 **`tortoise/tools/`:** `cmux_dispatch.py` (wrapped by #8), `who_is-on.sh` + `who_is_on.py` (the local+remote
-axis — `who_is_on.py` is the implementation, the `.sh` is a 3-line shim; it imports
+axis — `who_is_on.py` is the implementation, the `.sh` is a 3-line body behind a header; it imports
 `collision_preflight` for its git enumeration, so a port is three files or a declared `UNMEASURED`),
 `collision_preflight.py` (pre-dispatch in-flight work — **overlaps `claim_check`
 deliberately and must not be re-wrapped**: it answers "is this issue already in flight on any
@@ -758,9 +795,10 @@ classifier/actuator/aggregate defect a tool must not reproduce):
 Also read in full: `LANE-STATE-DECISION-TREE.md` (the tree), `BEAT-CHECKLIST.md` (the six beat checks →
 #4, #14), `LANE-BRIEF-PREAMBLE.md`.
 
-**Not a surface:** any InstaBox procedure does not exist on this box (F8) — the credential does, the
-procedure does not. `who-is-on.sh` **does** exist, in `tortoise/tools/` (F7) — it is a wrap target,
-not a phantom.
+**Not a surface:** nothing. Both artefacts an earlier draft called phantom **exist** — the InstaBox
+procedure (F8: `$HOME/.pi/agent/state/INSTABOX-OPERATING-PROMPT.md` + `instabox-setup.sh` +
+`PAT-INSTABOX.md`) and `tortoise/tools/who-is-on.sh` (F7). Each was reported absent from a search that
+omitted the directory it lived in.
 
 ---
 
