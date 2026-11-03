@@ -4295,6 +4295,109 @@ def t55_restore_cannot_lose_the_key_quietly():
                 shutil.rmtree(d, ignore_errors=True)
 
 
+@test("T57 a ZERO-BYTE `.runner` is a reported CONFIG-LOST slot, never an unmeasurable box")
+def t57_empty_runner_config_does_not_abort_the_pass():
+    """Measured on cell `cmux` 2026-11-03: `/opt/gh-runner-x64-5/.runner` was truncated to 0 bytes
+    (with `.credentials` and `.credentials_rsaparams`) by the ENOSPC that also killed `runsvc.sh`
+    with `No space left on device`. `discover()` raised `Unmeasurable` on it, so ONE destroyed
+    install made the whole pass fatal — `runner-autoscale.service` failed every ~9 minutes for 6
+    hours (42 consecutive passes, 02:38Z–08:29Z) and the box was never measured, its ceiling
+    predicate never ran, and its dead runner was never repaired, while 111 jobs sat queued and 0 of
+    them held a runner.
+
+    The raise in `_read_runner_config` is load-bearing for a config that might describe a LIVE
+    registration. An EMPTY one cannot: it carries no agentName and no URL, and its `.credentials`
+    is empty in the same breath, so nothing can authenticate as it. This case pins the three
+    properties that make the exemption safe — the pass MEASURES, the slot is REPORTED, and it is
+    NEVER handed to the re-registration arm (whose `--replace` would act on an invented name)."""
+    with Env():
+        box = Box("config-lost")
+        try:
+            up = [box.install("gh-runner-x64", "r-1"), box.install("gh-runner-x64-2", "r-2")]
+            lost = box.install("gh-runner-x64-3", "r-3")
+            # the measured shape: the config AND its credentials truncated to nothing
+            for name in (".runner", ".credentials", ".credentials_rsaparams"):
+                with open(os.path.join(lost, name), "wb"):
+                    pass
+            box.alive(up + [lost])  # its service is still spinning; the listener cannot register
+            box.pool(
+                [
+                    ("r-1", "online", False, ["self-hosted-x64"]),
+                    ("r-2", "online", False, ["self-hosted-x64"]),
+                    ("r-3", "offline", False, ["self-hosted-x64"]),
+                ]
+            )
+            record = converge(box, nproc="8", want=2, dry_run=True)
+            states = {c["dir"]: c["state"] for c in record["runners"]}
+            check(
+                states.get(lost) == "CONFIG-LOST",
+                f"an empty config is its OWN state, not OTHER-REPO/ORPHANED: {states}",
+            )
+            check(record["ceiling"] == 3, f"the box is still MEASURED: ceiling={record['ceiling']}")
+            check(
+                lost in record["config_lost"],
+                f"the lost config is NAMED for a machine reader: {record.get('config_lost')}",
+            )
+            check(
+                any(lost in n and "EMPTY" in n for n in record["notes"]),
+                f"…and for a human, never silent: {record['notes']}",
+            )
+            check(
+                record["problems"] == [],
+                "a standing lost slot must NOT become an `action-failed` problem: that verdict sits "
+                f"above `starvation`, so it would mute the queue alarm — {record['problems']}",
+            )
+            # ⛔ ITS LISTENER IS UP (it was put in `box.alive`), so it must still COUNT as live.
+            # Forcing `alive=False` dropped a measured listener out of `running`/`live`, and the fill
+            # loop then added a runner onto an already-full box on the cores arm, which does not read
+            # `live` at all — the round-2 over-fill, re-opened by this exemption.
+            check(
+                record["live"] == 3,
+                f"a spinning listener keeps its liveness even with a lost config: live={record['live']}",
+            )
+            check(
+                any(c["dir"] == lost and c["alive"] for c in record["runners"]),
+                f"…and the classified entry says so: {record['runners']}",
+            )
+            check(
+                not any(lost in w for w in record["would_repair"]),
+                f"it must never reach the re-registration arm: {record['would_repair']}",
+            )
+            check(
+                record["verdict"] not in ("unmeasurable",),
+                f"the pass completed: verdict={record['verdict']}",
+            )
+            # the mutation the exemption must not open: a NON-EMPTY garbage config still aborts.
+            # Silently skipping it would let the provisioner read its slot FREE and add a second
+            # install over the top of a registration that may be live.
+            with open(os.path.join(lost, ".runner"), "w", encoding="utf-8") as fh:
+                fh.write("{ truncated")
+            try:
+                converge(box, nproc="8", want=2, dry_run=True)
+            except ra.Unmeasurable as exc:
+                contains(str(exc), "not a readable runner config", "the abort cause")
+            else:
+                check(False, "an UNPARSEABLE NON-EMPTY config must still raise Unmeasurable")
+            # ⛔ AND IT SURVIVES AN EARLY-RETURN PASS. A `--want N` above the ceiling refuses before
+            # the repair loop runs; when the report was filled IN that loop, the refusal published
+            # `"config_lost": []` — a positive claim that nothing is lost, on the one channel a
+            # machine reader has (this is deliberately not a `problem`).
+            # (the case above left a GARBAGE config in place — restore the measured 0-byte shape)
+            with open(os.path.join(lost, ".runner"), "wb"):
+                pass
+            refused = converge(box, nproc="8", want=9, dry_run=True)
+            check(
+                refused.get("verdict") == "refused",
+                f"the fixture must really refuse: {refused.get('verdict')}",
+            )
+            check(
+                lost in refused.get("config_lost", []),
+                f"a refusal pass still NAMES the lost slot: {refused.get('config_lost')}",
+            )
+        finally:
+            box.destroy()
+
+
 MUTATIONS = [
     # ── review round 3 (this push): the both-facts leg, and the two families of the label strip ──
     Mutation(
