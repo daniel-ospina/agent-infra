@@ -3459,7 +3459,7 @@ export function wtIsPathShapedScriptWord(word) {
     // `sp` branch started consulting this predicate). A shape test that drops a
     // glob is a fail-OPEN, which is why it is pinned by an arm in both directions.
     if (ch === "?") { out += PH; continue; }
-    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) break; out += PH; i = e; continue; }
+    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
     if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) break; out += PH; i = e; continue; }
     if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) break; out += PH; i = e; continue; }
     out += ch;
