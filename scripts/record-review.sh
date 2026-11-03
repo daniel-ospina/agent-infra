@@ -4296,6 +4296,40 @@ fi
 DELTA_FIELDS=""
 if [ -n "$DELTA_FROM" ]; then
   DELTA_FIELDS="\"delta_range\":\"$DELTA_FROM..$DELTA_TO\",\"delta_base\":\"$DELTA_BASE\",\"delta_kind\":\"$DELTA_KIND\",\"delta_digest\":\"$DELTA_DIGEST\","
+elif [ -n "$CARRY_EVIDENCE" ] && [ "${CARRY_EVIDENCE#delta:}" != "$CARRY_EVIDENCE" ]; then
+  # ⛔ A CARRY THAT INHERITS A `delta:` CLAIM MUST CARRY THE CLAIM'S OWN FIELDS.
+  # This is the composition between this feature and the carry-provenance arm
+  # (#10177). A carry re-binds a verdict that was minted at an EARLIER head and
+  # copies that verdict's `evidence` verbatim — so a predecessor whose evidence was
+  # `delta:A..B` produced a carried record asserting a RANGE whose `delta_range`,
+  # `delta_base`, `delta_kind` and `delta_digest` were ABSENT, because `DELTA_FROM`
+  # is set only by `delta_verify` and a carry never reaches it (the delta-vs-carry
+  # guard above refuses a delta ref on the COMMAND LINE; it says nothing about a
+  # carry that INHERITS one). The record then claims exactly the thing this feature
+  # exists to make checkable, and no reader can re-derive it — the header's own
+  # promise ("a reader can re-derive the range, its classification and the digest")
+  # would be false of every carried delta.
+  #
+  # The fields describe the RANGE THE REVIEWER SAW, which the carry just proved is
+  # still the artifact that merges, so copying them from the predecessor is the true
+  # claim — and `carried_from`/`carry_arm`/`reviewed_diff_sha256` say how it moved.
+  # They are COPIED, never re-derived: `delta_verify` would refuse here anyway, since
+  # it requires the range's upper bound to BE the head being recorded and in a carry
+  # that head has moved. The range is re-checked against the inherited evidence below,
+  # so an inconsistent predecessor is refused instead of silently transcribed.
+  _cd_range="$(sed -n 's/.*"delta_range":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+  _cd_base="$(sed -n 's/.*"delta_base":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+  _cd_kind="$(sed -n 's/.*"delta_kind":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+  _cd_digest="$(sed -n 's/.*"delta_digest":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+  _cd_want="${CARRY_EVIDENCE#delta:}"; _cd_want="${_cd_want%%+*}"
+  if [ -n "$_cd_range" ] && [ "$_cd_range" = "$_cd_want" ] && [ -n "$_cd_base" ] && [ -n "$_cd_kind" ] && [ -n "$_cd_digest" ]; then
+    DELTA_FIELDS="\"delta_range\":\"$_cd_range\",\"delta_base\":\"$_cd_base\",\"delta_kind\":\"$_cd_kind\",\"delta_digest\":\"$_cd_digest\","
+    echo "delta binding: inherited from the carried predecessor — range $_cd_range ($_cd_kind), base ${_cd_base:0:12}…, digest ${_cd_digest:0:12}… (copied, not re-derived: the range's upper bound is the REVIEWED head, not this carry's head)" >&2
+  else
+    echo "⛔ refusing a carry that inherits a delta claim: the predecessor record for ${REPO:-<no-repo>}#$PR names evidence '${CARRY_EVIDENCE}' but carries no usable delta_range/delta_base/delta_kind/delta_digest for ${_cd_want:-<the range>} (range='${_cd_range:-}', base='${_cd_base:-}', kind='${_cd_kind:-}', digest='${_cd_digest:-}')." >&2
+    echo "   A carried record would then assert a RANGE whose own fields are absent, and no reader could re-derive the claim — the shape this feature exists to prevent. Re-record at the live head WITH the delta, so the range is re-derived against what merges: record-review.sh $PR ${SHA:0:12}… clean ${REPO:-owner/repo} --evidence delta:<A>..${SHA:0:12}…+<artifact>." >&2
+    exit 3
+  fi
 fi
 # tortoise#7391 — MINT PROVENANCE, and the end of the carry overwriting the mint time.
 # A carried record used to be byte-identical in shape to a freshly-minted one

@@ -5279,10 +5279,105 @@ assert_eq "$RECORD_RC" "3" "20f a short-sha delta ref is refused (shape pinned)"
 EF4=425113; rm -f "$(Q2 $EF4)"
 run_record_delta $EF4 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+nested:1"
 assert_eq "$RECORD_RC" "3" "20f an unknown covering-artifact kind is refused"
-# a NESTED delta cannot inherit authority.
+# a NESTED delta cannot inherit authority. ⛔ THIS VECTOR PINS THE **SHAPE** GUARD,
+# NOT ARM (2). `evidence_ref_split` pins the cover to
+# `(comment|issuecomment|review|review-comment|discussion):<id>`, so a `+delta:` cover
+# is refused as a MALFORMED REF before `delta_verify` is ever entered — the assertion
+# below therefore passes for a reason arm (2) had no part in. 20f-b measures arm (2).
 EF5=425114; rm -f "$(Q2 $EF5)"
 run_record_delta $EF5 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+delta:$DG_A1..$DG_HEAD"
-assert_eq "$RECORD_RC" "3" "20f a delta covering a delta is refused"
+assert_eq "$RECORD_RC" "3" "20f a delta covering a delta is refused (by the pinned REF SHAPE)"
+assert_contains "$RECORD_ERR" "accepted: comment:" "20f …and the refusal is the shape guard's own message, not arm (2)'s"
+# 20f-b ARM (2) MEASURED DIRECTLY. The nested-delta arm is defence-in-depth for a
+#       DIRECT caller (the function is sourceable — this suite extracts functions
+#       elsewhere too), and no CLI invocation can reach it, so only a direct call
+#       measures it. Without this vector the arm is a claim with no test behind it.
+awk '/^delta_verify\(\) \{/,/^\}$/' "$RECORD" > "$T/dvfn.sh"
+[ -s "$T/dvfn.sh" ] && ok "20f-b delta_verify extracted from the recorder" || bad "20f-b could not extract delta_verify"
+dvrc=0
+( . "$T/dvfn.sh"; delta_verify "$DG_BASE..$DG_HEAD+delta:$DG_A1..$DG_HEAD" "$DG_HEAD" ) \
+    >"$T/dvout" 2>"$T/dverr" || dvrc=$?
+assert_eq "$dvrc" "1" "20f-b arm (2) called DIRECTLY refuses a nested delta (rc 1)"
+assert_contains "$(cat "$T/dverr" 2>/dev/null || true)" "is itself a delta" "20f-b …naming the arm's own reason (so the vector is not satisfied by an earlier arm)"
+# 20f-c THE DELTA × CARRY-FIRED ARM. A delta ref supplied while a carry arm already
+#       re-bound the verdict would be recorded by NOBODY: the record states the carry,
+#       not a reviewer's range. The caller is told the delta was recorded while the
+#       audit trail holds none — a silent drop, so this must REFUSE. No vector covered
+#       this arm, so it is measured END TO END below: the recorder is run at a STALE
+#       sha with the LIVE head at $DG_HEAD, which is what puts it on the carry path.
+#       ⛔ It is asserted on the ARM'S OWN MESSAGE, not on the exit code: arm (4)
+#       ("B != the head being recorded") produces a bare rc 3 in exactly this region,
+#       so a code-only assertion would pass with the carry arm never entered.
+# A runner that can carry: cwd must be the FIXTURE (lane_dimension_carry runs bare
+# `git`, not delta_git), and the LIVE head must differ from the recorded sha.
+run_record_carry_at() { # <pr> <recorded-sha> <live-sha> <ref> → $RECORD_RC $RECORD_ERR
+    local pr="$1" rsha="$2" lsha="$3" ref="$4"
+    local rcfile="$T/crc" errfile="$T/cerr"
+    rm -f "$errfile"; : > "$LOG"
+    (
+        cd "$DG" || exit 9
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        export STUB_HEAD_SHA="$lsha" DELTA_GIT_DIR="$DG"
+        export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main
+        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
+        export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
+        export STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+        rc=0
+        if [ -n "$ref" ]; then
+            bash "$RECORD" "$pr" "$rsha" clean "daniel-ospina/agent-infra" --evidence "$ref" 2>"$errfile" || rc=$?
+        else
+            bash "$RECORD" "$pr" "$rsha" clean "daniel-ospina/agent-infra" 2>"$errfile" || rc=$?
+        fi
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+EH20D=425170; rm -f "$(Q2 $EH20D)"
+printf '{"pr":%d,"head_sha":"%s","evidence":"comment:42517001","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
+    "$EH20D" "$DG_A1" > "$(Q2 $EH20D)"
+run_record_carry_at $EH20D "$DG_A1" "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42517002"
+assert_eq "$RECORD_RC" "3" "20f-c a delta supplied while a carry arm re-bound the verdict is refused (rc 3)"
+assert_contains "$RECORD_ERR" "already re-bound" "20f-c …by the carry-vs-delta arm, so the delta cannot be silently dropped"
+# CONTROL: the same invocation WITHOUT the delta ref must actually CARRY, or 20f-c
+# above would be satisfied by a carry path that never fires at all.
+EH20E=425171; rm -f "$(Q2 $EH20E)"
+printf '{"pr":%d,"head_sha":"%s","evidence":"comment:42517101","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
+    "$EH20E" "$DG_A1" > "$(Q2 $EH20E)"
+run_record_carry_at $EH20E "$DG_A1" "$DG_HEAD" "comment:42517102"
+assert_eq "$RECORD_RC" "0" "20f-c control: the SAME invocation without a delta ref carries (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$(cat "$(Q2 $EH20E)" 2>/dev/null || true)" '"mint":"carried"' "20f-c control: …and records mint=carried, so the carry arm really fired"
+
+# 20f-d A CARRY THAT INHERITS A `delta:` CLAIM MUST CARRY THE CLAIM'S FIELDS.
+#       A carry copies the predecessor's `evidence` verbatim, so without this the
+#       carried record asserts a RANGE while `delta_range`/`delta_base`/`delta_kind`/
+#       `delta_digest` are absent — the claim the feature exists to make checkable,
+#       stated with nothing behind it. Composition between this feature and the
+#       carry-provenance arm (#10177); neither side could see it alone.
+DV_DIGEST="$(printf '0123456789abcdef%.0s' 1 2 3 4)"
+EH21=425172; rm -f "$(Q2 $EH21)"
+printf '{"pr":%d,"head_sha":"%s","evidence":"delta:%s..%s+comment:42517201","delta_range":"%s..%s","delta_base":"%s","delta_kind":"lane","delta_digest":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
+    "$EH21" "$DG_A1" "$DG_BASE" "$DG_A1" "$DG_BASE" "$DG_A1" "$DG_M1" "$DV_DIGEST" > "$(Q2 $EH21)"
+run_record_carry_at $EH21 "$DG_A1" "$DG_HEAD" ""
+assert_eq "$RECORD_RC" "0" "20f-d a carry inheriting a delta claim records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+R21="$(cat "$(Q2 $EH21)" 2>/dev/null || true)"
+assert_contains "$R21" '"mint":"carried"' "20f-d …as a carry"
+assert_contains "$R21" "\"delta_range\":\"$DG_BASE..$DG_A1\"" "20f-d …keeping the REVIEWED range, not the range up to the carry head"
+assert_contains "$R21" "\"delta_base\":\"$DG_M1\"" "20f-d …and the base it was classified against (re-derivable)"
+assert_contains "$R21" '"delta_kind":"lane"' "20f-d …and its classification"
+assert_contains "$R21" "\"delta_digest\":\"$DV_DIGEST\"" "20f-d …and the digest, so the inherited claim stays checkable"
+assert_contains "$R21" '"evidence":"delta:' "20f-d …while the evidence it inherits is the delta claim it substantiates"
+# REFUSAL DIRECTION: a predecessor that names a delta but carries none of its fields
+# must be REFUSED, never transcribed — otherwise the record would assert a range with
+# nothing behind it, which is the shape this guard exists to stop.
+EH22=425173; rm -f "$(Q2 $EH22)"
+printf '{"pr":%d,"head_sha":"%s","evidence":"delta:%s..%s+comment:42517301","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
+    "$EH22" "$DG_A1" "$DG_BASE" "$DG_A1" > "$(Q2 $EH22)"
+run_record_carry_at $EH22 "$DG_A1" "$DG_HEAD" ""
+assert_eq "$RECORD_RC" "3" "20f-d a carry inheriting a delta claim with NO delta fields is refused (rc 3)"
+assert_contains "$RECORD_ERR" "inherits a delta claim" "20f-d …naming the unsubstantiated claim"
+assert_not_contains "$(cat "$(Q2 $EH22)" 2>/dev/null || true)" '"mint":"carried"' "20f-d …and nothing was recorded over the predecessor"
 # a delta with a NON-CLEAN verdict is an argument-level contradiction (the
 # clean-micro/clean-low arms never read evidence, so it would be dropped silently).
 EF6=425115; rm -f "$(Q2 $EF6)"
@@ -5394,14 +5489,21 @@ run_record_delta $EH7 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42513
     STUB_EVIDENCE_AT="2026-03-01T00:00:00Z"
 assert_eq "$RECORD_RC" "0" "20h5 a cover that postdates the evil merge still records (arm is an ordering test)"
 
-# 20h6 A NON-REVIEW TIER CANNOT BE LAUNDERED. A prior clean-micro/clean-low record
-#      attests no review, so extending it into a `clean` delta would claim one.
+# 20h6 A MERGE-ONLY DELTA WITH NO COVER IS REFUSED, AND IT DOES NOT LAUNDER AN
+#      EXISTING RECORD. ⛔ Relabelled: the assertion this block has always made is the
+#      REFUSAL, and since the unsigned local-record premise was deleted as a forgery
+#      vector, a planted clean-micro/clean-low record is no longer CONSULTED at all —
+#      the refusal now comes from the missing-cover arm. The vectors below still pin
+#      the only thing that remains true and load-bearing: no cover-less merge-only
+#      delta mints `clean`, whatever record happens to sit on the box, and whatever
+#      is there is left byte-identical (never upgraded to `clean`).
 for _tier in clean-micro clean-low; do
     EH8=425137; rm -f "$(Q2 $EH8)"
     printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
       "$EH8" "$DG_A1" "$_tier" > "$(Q2 $EH8)"
     run_record_delta $EH8 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
-    assert_eq "$RECORD_RC" "3" "20h6 a prior $_tier record is NOT a review → merge-only delta refused (rc 3)"
+    assert_eq "$RECORD_RC" "3" "20h6 a cover-less merge-only delta is refused even with a prior $_tier record present (rc 3)"
+    assert_contains "$RECORD_ERR" "a delta EXTENDS an attestation and can never create one" "20h6 …by the merge-only needs-an-attested-A arm (the local-record premise is deleted, so it is not consulted)"
     assert_contains "$(cat "$(Q2 $EH8)" 2>/dev/null || true)" "\"verdict\":\"$_tier\"" "20h6 the planted $_tier record was not overwritten"
 done
 
@@ -5594,31 +5696,24 @@ assert_eq "$RECORD_RC" "3" "20h15 a body stating a NARROWER range is refused (rc
 assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal names the contradiction"
 [ -f "$(Q2 $EH18)" ] && bad "20h15 no record was written" || ok "20h15 no record was written"
 
-# 20h14 MERGE-ONLY + A NAMED COVER IS REACHABLE. In the ordering this feature exists
-#       for — verdict at A, THEN the base merge creates B — a verdict written before B
-#       existed cannot name B. The cover anchor is A and the claim is "names A".
-EH16=425162; rm -f "$(Q2 $EH16)"
+# 20h16 A COVER THAT NAMES **A ALONE** ALSO SATISFIES THE CLAIM (the other half of
+#       20h14). A verdict written BEFORE B existed cannot name B at all, so demanding
+#       the range would make the printed remedy unreachable in exactly the ordering
+#       this feature exists for. Naming A IS the claim for a merge-only range.
+#       ⛔ Numbered 20h16, not a second 20h14: the earlier draft emitted this block
+#       TWICE with the same PR numbers (425162/425164) and the same labels, so the
+#       later copy silently overwrote the earlier one's record and no reader could
+#       tell which vector had actually been measured.
+EH19=425168; rm -f "$(Q2 $EH19)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
-run_record_delta $EH16 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516301" \
+run_record_delta $EH19 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516801" \
     STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
-assert_eq "$RECORD_RC" "0" "20h14 merge-only + a cover naming A records clean (rc 0)"
-assert_contains "$(cat "$(Q2 $EH16)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h14 the range stays merge-only"
-EH17=425164; rm -f "$(Q2 $EH17)"
-run_record_delta $EH17 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516501" \
+assert_eq "$RECORD_RC" "0" "20h16 merge-only + a cover naming A alone records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EH19)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h16 the range stays merge-only"
+EH20=425169; rm -f "$(Q2 $EH20)"
+run_record_delta $EH20 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516901" \
     STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
-assert_eq "$RECORD_RC" "3" "20h14 a cover PREDATING A is still refused (rc 3)"
-
-# 20h15 A BODY THAT STATES A DIFFERENT RANGE. Quoting a NARROWER range must not
-#       satisfy the claim for a wider one — the record would assert a range its own
-#       artifact contradicts.
-EH18=425166; rm -f "$(Q2 $EH18)"
-run_record_delta $EH18 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" \
-    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
-    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
-assert_eq "$RECORD_RC" "3" "20h15 a body stating a NARROWER range is refused (rc 3)"
-assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal names the contradiction"
-[ -f "$(Q2 $EH18)" ] && bad "20h15 no record was written" || ok "20h15 no record was written"
-
+assert_eq "$RECORD_RC" "3" "20h16 a cover naming A but PREDATING A is still refused (rc 3)"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -5761,10 +5856,6 @@ mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "de
 #       never says which range it reviewed — the date-only inference the arm replaced.
 MUT="$(mk_mutant rangeclaim '      for _needle in "$to" "${to:0:12}"; do' '      body_claim=1; for _needle in "$to" "${to:0:12}"; do')"
 mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
-# M14 — THE RANGE CONTAINMENT. Deleting it lets a body that declares a NARROWER range
-#       satisfy the claim for a wider one (20h15).
-MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
-mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
