@@ -25,7 +25,7 @@ RED CONTROL — five mutations of the shipped module, each written to a TEMP cop
 (a mutation the suite does not catch is reported as a suite FAILURE). The first one is the
 pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
-  * neuter the lane-census reconciliation      -> CENSUS red x3 (the pre-fix lane table)
+  * neuter the lane-census reconciliation      -> CENSUS red x4 (the pre-fix lane table)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -511,11 +511,13 @@ def leg_lane_census(mod):
         note = fn(0, 0, 9, 7)              # no verdict for any rostered lane, 9 pi running
         check(bool(note) and "MISMATCH" in note, PREDICATE[0])
         check(bool(note) and "9" in note and "7" in note, PREDICATE[1])
-        # ⛔ SILENCE NEEDS A VERDICT PER LANE, NOT A RECORD PER LANE (review cycle 2, finding 1):
-        # one record whose identity read ABSTAINED used to silence the whole census while 18 pi
-        # processes ran -> `✅ no suspects`, exit 0. Only `alive + dead == roster_size` may be quiet.
-        check(bool(fn(0, 0, 18, 7)) and "MISMATCH" in fn(0, 0, 18, 7),
-              "CENSUS: an ABSTAINING record does not silence the census")
+        # ⛔ SILENCE NEEDS A VERDICT PER LANE, NOT A RECORD PER LANE (review cycle 2, finding 1).
+        # A PARTIAL census -- 1 of 7 conclusive -- must still alarm, and must say how many it has.
+        # (The record-shaped case is covered end-to-end by `_drive`'s abstention arm; this is the
+        # pure-predicate half, which cannot see records at all.)
+        part = fn(0, 1, 18, 7)
+        check(bool(part) and "MISMATCH" in part and "only 1 of the 7" in part,
+              "CENSUS: a PARTIAL census alarms and names how many lanes it established")
         # ⛔ AN ABSTENTION MUST BE NAMED (review cycle 1, finding 2). Rendering an unreadable
         # process table as "no note" is indistinguishable from `pi_count == 0` and lets the
         # summary print `✅ no suspects` — the pre-fix false PASS, through the new gate's input.
@@ -541,7 +543,7 @@ def leg_lane_census(mod):
 
     PRODUCER = (
         "CENSUS: a FAILED `ps` read abstains — unknown is never a manufactured 0",
-        "CENSUS: a successful but empty `ps` read is a real 0, not an abstention",
+        "CENSUS: an empty `ps` table is UNREADABLE (None), never a measured 0",
         "CENSUS: argv0 basename matches exactly `pi` — a `pi-*` helper is not a lane",
     )
     counter = getattr(mod, "pi_process_count", None)
@@ -554,8 +556,17 @@ def leg_lane_census(mod):
             for rc in (1, 2):                       # unreadable table
                 mod.subprocess.run = lambda *a, **k: _R(rc, "1 pi\n")
                 check(counter() is None, PRODUCER[0])
-            mod.subprocess.run = lambda *a, **k: _R(0, "")   # usable, genuinely empty
-            check(counter() == 0, PRODUCER[1])
+            # ⛔ AN EMPTY rc-0 TABLE IS UNREADABLE, NOT 0 (review cycle 3, finding 3, and the
+            # contract scripts/lib/pid-identity.sh pins as `pid_table_nonempty`: "a read that
+            # 'succeeds' but prints no table is not 'no such process' ... an empty table is an
+            # UNREADABLE read, never absence" (#1178 C3)). `0` here would take the census's
+            # silent arm on exactly the hosts where `ps` degraded.
+            mod.subprocess.run = lambda *a, **k: _R(0, "")
+            check(counter() is None, PRODUCER[1])
+            # ... while a table that IS present and holds no pi row is a real, measured zero.
+            mod.subprocess.run = lambda *a, **k: _R(0, "  1 bash\n  2 sshd\n")
+            check(counter() == 0,
+                  "CENSUS: a present table with no pi row is a real 0 (not an abstention)")
             # ⛔ THE `pi-*` ROW (review cycle 1, finding 4). The matcher was a prefix test, so a
             # reaper named `pi-cache-reap` counted as a lane-bearing pi and could fabricate a
             # MISMATCH on a box whose roster is current. Exact basename only.
@@ -567,8 +578,11 @@ def leg_lane_census(mod):
         mod.subprocess.run = saved_run
 
     # ── main() end-to-end over a read-only store holding none of the roster ──
-    def _drive(pi_stub):
-        """Run `main()` over a READABLE hook store whose sessions are none of `LANES`.
+    def _drive(pi_stub, records=None):
+        """Run `main()` over a READABLE hook store.
+
+        `records` defaults to two NON-rostered sessions (the stale-roster shape). Pass a list to
+        model other store shapes -- notably a roster record whose identity read ABSTAINS.
 
         That is the exact state the original defect rendered as a clean scan, and it keeps the
         "unreadable store" fail-closed path from masking this one. Returns (exit_code, stdout).
@@ -585,13 +599,15 @@ def leg_lane_census(mod):
         rc = None
         try:
             hook = os.path.join(tmp, "hook.json")
-            with open(hook, "w", encoding="utf-8") as fh:
-                json.dump({"sessions": [
+            if records is None:
+                records = [
                     {"sessionId": "aaaaaaaa-0000-0000-0000-00000000beef",
                      "agentLifecycle": "idle"},
                     {"sessionId": "bbbbbbbb-0000-0000-0000-00000000beef",
                      "agentLifecycle": "idle"},
-                ]}, fh)
+                ]
+            with open(hook, "w", encoding="utf-8") as fh:
+                json.dump({"sessions": records}, fh)
             mod.HOOK = hook
             mod.STATE = os.path.join(tmp, "prev.json")
             mod.TASK = os.path.join(tmp, "task-sessions")
@@ -641,6 +657,22 @@ def leg_lane_census(mod):
           "CENSUS: an unreadable process table is never rendered as a clean scan")
     check(rc_abs == 1,
           "CENSUS: an unreconcilable census exits non-zero, so a scheduler can see it")
+
+    # ⛔ THE CYCLE-2 DEFECT ITSELF (review cycle 3, finding 1): a rostered lane whose record is
+    # PRESENT but whose identity read ABSTAINS (a live pid and no `pidStartSeconds` -> the row
+    # prints `PID ? (unreadable)`) must not silence the census. Before cycle 2 that one record was
+    # enough to drop the alarm while 18 pi processes ran. This is the arm that PINS it: the
+    # predicate cannot see records, and the `_drive` arms above carry no rostered session at all.
+    roster_sid = mod.LANES[0][1]
+    rc_abs2, out_abs2 = _drive(
+        lambda: 18,
+        records=[{"sessionId": roster_sid, "pid": os.getpid(), "agentLifecycle": "running"}])
+    check("LANE CENSUS MISMATCH" in out_abs2,
+          "CENSUS: a PRESENT-but-ABSTAINING roster record does not silence the census")
+    check("no suspects" not in out_abs2,
+          "CENSUS: an abstaining roster record is never rendered as a clean scan")
+    check(rc_abs2 == 1,
+          "CENSUS: the abstaining-record arm exits non-zero")
 
 
 def run_legs(mod):

@@ -114,6 +114,15 @@ def pi_process_count():
     the census a population the fleet does not have, and on a box whose roster is current it
     fabricates a MISMATCH out of a reaper. The fleet's own binary is exactly `pi` (measured: 18
     processes, argv0 `pi`), so an exact basename is both correct and narrower.
+
+    ⛔ AN EMPTY TABLE IS AN UNREADABLE READ, NOT A MEASURED ZERO (review cycle 3, finding 3).
+    A `ps` that exits 0 and prints no rows fell through the loop as `0`, which the census maps to
+    its silent arm — the pre-fix false PASS reached through the gate's own input, on any host where
+    `ps` degrades. That is also the contract this repo ALREADY pins one level down:
+    `scripts/lib/pid-identity.sh` `pid_table_nonempty` -- "a read that 'succeeds' but prints no
+    table is not 'no such process' ... an empty table is an UNREADABLE read, never absence"
+    (#1178 C3). The probing process itself must appear in any real table, so zero parsed rows is
+    reported as None here rather than as a second, contradicting ps contract.
     """
     try:
         cp = subprocess.run(PI_PS_ARGV, capture_output=True, text=True, timeout=20)
@@ -122,13 +131,17 @@ def pi_process_count():
     if cp.returncode != 0:
         return None
     n = 0
+    rows = 0
     for line in cp.stdout.splitlines():
         parts = line.strip().split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
             continue
+        rows += 1
         argv0 = parts[1].split()[0]
         if os.path.basename(argv0) == "pi":
             n += 1
+    if rows == 0:
+        return None      # empty table = unreadable, never "zero pi processes"
     return n
 
 
@@ -147,6 +160,10 @@ def lane_census(alive, dead, pi_count, roster_size):
       is neither, which is the whole point: an identity read that did not happen must never be
       counted as an established one.
     * `pi_count` -- the independent population, or None when unreadable.
+
+    ⛔ SILENT ARMS, EXHAUSTIVELY: `alive + dead >= roster_size` (every lane has a conclusive
+    verdict), or `pi_count <= 0` (nothing is running, so an inconclusive roster cannot mislead).
+    Nothing else is silent.
 
     ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
     table cannot be read, returning None would render that state identically to `pi_count == 0`
@@ -779,7 +796,7 @@ def main():
     # for NONE of the running pi processes, the table is not a census and must say so rather
     # than let the summary below read as a clean scan.
     # ⛔ NO CENSUS VERDICT WITHOUT A STORE READ (review cycle 2, finding 3). With `hook_ok` False
-    # every lane is `measured == 0`, so the census would report "the roster is stale on this box"
+    # no lane has a record at all, so the census would report "the roster is stale on this box"
     # beside "hook store unreadable" — asserting a cause it never established, and pointing an
     # operator at editing the roster when the STORE READ is the fault. The store failure already
     # has its own INCOMPLETE path below; the census simply has nothing to say about a roster it
@@ -842,11 +859,15 @@ def main():
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
         return 1
     if census_note:
-        # ⛔ REPORTED, NOT DEGRADED TO A WARNING. The lane rows were printed, but none of them
-        # was attributed: the scan did not establish lane identity, which is the same
-        # INCOMPLETE class as the unreadable store above and must reach a scheduler the same
-        # way (a census that prints rows and exits 0 is exactly the false PASS this guards).
-        print("⚠️  lane census INCOMPLETE (0 rostered lanes measured) — the rows above are not a verdict")
+        # ⛔ REPORTED, NOT DEGRADED TO A WARNING. Some lanes were PRINTED but did not reach a
+        # conclusive verdict, which is the same INCOMPLETE class as the unreadable store above and
+        # must reach a scheduler the same way (a census that prints rows and exits 0 is exactly
+        # the false PASS this guards).
+        # ⛔ AND IT NAMES THE NUMBER IT ACTUALLY HAS (review cycle 3, finding 2): the line used to
+        # read "0 rostered lanes measured" for EVERY note, including a partial mismatch where 1-6
+        # lanes WERE established — telling an operator the census established nothing when it had.
+        print("⚠️  lane census INCOMPLETE (%d of %d rostered lanes conclusive) — rows without a "
+              "verdict are not a verdict" % (attributed + dead, len(LANES)))
         return 1
     if sched_alarms:
         # A reaper alarm does not make the LANE rows wrong, so it is reported after them — but it
