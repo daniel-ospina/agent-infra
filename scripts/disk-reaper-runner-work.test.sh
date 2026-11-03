@@ -368,6 +368,75 @@ case_j() { # <entry-point> <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (k) a `reap` ROW is HONOURED — the table's OTHER disposition is not inert ────────────────────
+# ⛔ WHAT THIS CASE EXISTS FOR, measured on the pre-fix tree. `is_retained` consulted only the DERIVED
+# retain list, so a `reap` row matched nothing, fell through to the `_`-prefix default and printed
+# `RETAINED … reason=vendor-namespace-unlisted` — "no WORK_LAYOUT row" for a name whose row was right
+# there in the table. The disposition the script's own comment AND `docs/ops/disk-reaper.md` instruct an
+# operator to write was therefore INERT, and the log named the WRONG CAUSE — worse than a missing
+# feature, because following the documentation produces a confident, false explanation. Reproduced
+# before the fix with `_foo|reap|job-checkout|…` in WORK_LAYOUT: `_foo` came back
+# RETAINED/vendor-namespace-unlisted while the `job-dead` control was reaped. Nothing asserted the reap
+# direction, which is why nothing reddened — that absence is the defect this case closes.
+# The row is injected into a COPY of the owner (the SHIPPED table has no `reap` row), so this measures the
+# LOOKUP: a lookup that honours only `retain` fails here, and so does one that stopped reading rows.
+mk_reap_variant() { # <owner src> <dest> — a copy whose WORK_LAYOUT carries a `_foo|reap|…` row
+    local src="$1" dest="$2"
+    mkdir -p "$(dirname "$dest")"
+    ln -sfn "$HERE/lib" "$(dirname "$dest")/lib"
+    awk '{ print } /^WORK_LAYOUT="$/ { print "_foo|reap|job-checkout|a repository literally named _foo: an operator decision that this name IS a checkout, so it is a CANDIDATE like any other" }' \
+        "$src" >"$dest" 2>/dev/null || return 1
+    cmp -s "$src" "$dest" && return 1          # the anchor moved: a STALE fixture is not a fixture
+    bash -n "$dest" 2>/dev/null || return 1
+    chmod +x "$dest"
+    return 0
+}
+
+case_k() { # <entry-point> <owner> — a `reap` row must be reaped, and nothing else may move
+    local pass="$1" owner="$2" base work foo dead out rc s1 variant d
+    variant="$T/k-var.$$.$RANDOM/reap-runner-work.sh"
+    case_check "$(mk_reap_variant "$owner" "$variant" && echo 0 || echo 1)" \
+               "the \`_foo|reap|…\` row could be written into a copy of the owner"
+    [ -x "$variant" ] || return $((CASE_FAIL > 0))
+    PASS_OWNER="$variant"
+    base="$T/k.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-9)"
+    # the OPERATOR-DECIDED name: `_`-prefixed, so ONLY its own row can lift it out of the over-retain default
+    foo="$(mk_entry "$work" _foo 300)"
+    # the control: an UNDECIDED checkout, reaped in the same pass — the retention is not a blanket refusal
+    dead="$(mk_entry "$work" job-dead 300)"
+    # and the four the table RETAINS, at the SAME age, so `reap` cannot be honoured by ignoring `retain`
+    mkdir -p "$work/_temp" "$work/_actions/checkout/v4" "$work/_tool/node/20" "$work/_update/stage"
+    printf 'step\n' >"$work/_temp/commands.log"
+    printf 'js\n'   >"$work/_actions/checkout/v4/index.js"
+    printf 'bin\n'  >"$work/_tool/node/20/node"
+    printf 'mark\n' >"$work/_update/stage/marker"
+    for d in _temp _actions _tool _update; do
+        age_tree "$work/$d" 600 || return $((CASE_FAIL > 0))
+    done
+    s1="$(uniqstate k1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
+    case_check "$([ ! -e "$foo" ] && echo 0 || echo 1)" \
+               "a \`reap\` row's directory WAS REAPED — the disposition is honoured, not inert"
+    case_check "$(grep -qE '^(REAP|REAPED) [^ ]*/_foo( |$)' <<<"$out" && echo 0 || echo 1)" \
+               "… it was a CANDIDATE (a REAP/REAPED row names it), which the pre-fix tree never did"
+    case_check "$(grep -qE '^RETAINED [^ ]*/_foo( |$)' <<<"$out" && echo 1 || echo 0)" \
+               "… and NO RETAINED row claims it — least of all reason=vendor-namespace-unlisted, the false cause"
+    case_check "$(grep -qF 'reason=vendor-namespace-unlisted' <<<"$out" && echo 1 || echo 0)" \
+               "… with no undecided-name reason on the pass at all: every name in this fixture IS decided by a row"
+    case_check "$([ ! -e "$dead" ] && echo 0 || echo 1)" \
+               "the UNDECIDED dead checkout was reaped in the SAME pass"
+    case_check "$([ -d "$work/_temp" ] && [ -d "$work/_actions" ] && [ -d "$work/_tool" ] && [ -d "$work/_update" ] && echo 0 || echo 1)" \
+               "_temp/_actions/_tool/_update all SURVIVED — a reap row does not disturb the retain rows"
+    case_check "$(grep -qF 'reason=live-job-temp' <<<"$out" && grep -qF 'reason=cross-job-cache' <<<"$out" && grep -qF 'reason=runner-self-update' <<<"$out" && echo 0 || echo 1)" \
+               "… each NAMED with its OWN row's reason, so the reason and the decision still cannot drift apart"
+    case_check "$(grep -qF 'retained=4' <<<"$out" && echo 0 || echo 1)" \
+               "the class line counts exactly those four (retained=4) — the decided name is not double-counted"
+    case_check "$(grep -qF 'reaped-by-table=_foo' <<<"$out" && echo 0 || echo 1)" \
+               "and the pass record NAMES the decided reap row, so the decision is visible without the table"
+    return $((CASE_FAIL > 0))
+}
+
 # ── (d) --only selects exactly one class, in BOTH directions ──────────────────────────────────
 case_d() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead out out2 st c s1 s2
@@ -393,6 +462,13 @@ case_d() { # <entry-point> <owner>
     case_check "$(grep -qF 'class=runner-work' <<<"$out2" && echo 1 || echo 0)" \
                "a pass selecting ANOTHER class did not run runner-work at all"
     case_check "$([ -d "$dead" ] && echo 0 || echo 1)" "and nothing was removed by that pass either"
+    # ⛔ THE `unmeasurable_runner_work=` POLARITY THE DOC NAMES, IN THE DIRECTION NOTHING PINNED (#3057
+    # review): `not-run` for a class this pass did not SELECT. Every sibling class's verdict was already
+    # asserted here; the runner-work field was documented with three polarities and only `=0` had a test
+    # behind it, so a record printing a NUMBER for an unselected class would have shipped. `?` — the other
+    # non-numeric polarity — is pinned in (f), where the class cannot be set up.
+    case_check "$(grep -q '^unmeasurable_runner_work=not-run$' <<<"$(status_of "$s2")" && echo 0 || echo 1)" \
+               "… and unmeasurable_runner_work=not-run for the EXCLUDED class, never a number-shaped zero"
     return $((CASE_FAIL > 0))
 }
 
@@ -428,6 +504,12 @@ case_f() { # <entry-point> <owner>
                "the record calls it misconfigured (could not be SET UP), not fail-closed"
     case_check "$(grep -q '^candidates_runner_work=?$' <<<"$st" && echo 0 || echo 1)" \
                "and publishes NO candidate count — '?' , never a measured 0"
+    # ⛔ `unmeasurable_runner_work=?` — THE DOC'S OTHER NON-NUMERIC POLARITY (#3057 review). A class that
+    # could not be SET UP measured nothing, so it must not answer `0` either: that would read as "nothing
+    # was kept for lack of an answer", a confident number about a pass that never ran. Until this line the
+    # field's `?` branch was documented and unasserted, which is the shape this PR keeps shipping.
+    case_check "$(grep -q '^unmeasurable_runner_work=?$' <<<"$st" && echo 0 || echo 1)" \
+               "and unmeasurable_runner_work is '?' too — a class that could not be set up measured NOTHING"
     case_check "$(grep -q '^detail=.*runner-work-no-root' <<<"$st" && echo 0 || echo 1)" \
                "detail= names the cause, so the operator knows what to fix"
     case_check "$(grep -q '^note_runner_work=no runner _work root matched' <<<"$st" && echo 0 || echo 1)" \
@@ -567,7 +649,7 @@ MUT_BV="/printf 'verdict_runner_work=/d"
 # the mutation removes both. Emptying only the table leaves `_tool`/`_actions`/`_temp` retained by the
 # `_`-prefix default and the case would pass on a tree with no table at all — the "mutant survived"
 # shape this suite exists to catch.
-MUT_C='s/^RETAINED_NAMES=.*$/RETAINED_NAMES="__nothing__"/; s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
+MUT_C='/|retain|/d; s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
 MUT_D='s/^want_class runner-work && { WANT_RW=1;/true \&\& { WANT_RW=1;/'
 MUT_E='s/valid: uv, venv, worktree, duplicate-install, runner-work/valid: uv, venv, worktree, duplicate-install/g'
 MUT_F2='s/^    if \[ "\$_rw_census" = "no-roots" \]; then/    if false; then/'
@@ -580,6 +662,16 @@ MUT_H2='s/^case "\$GLOBS" in \*\[!\[:space:\]\]\*) : ;; \*)/case "$GLOBS" in *[!
 # (`EXPLICIT="${REAP_RW_EXPLICIT-0}"`) does not match the anchor. The mutant replaces the assertion with a
 # no-op — which is exactly the defect that shipped (the `--glob` arm marking nothing the census reads).
 MUT_I='s/^\( *\)EXPLICIT=1$/\1:/'
+# ⛔ (k)'s MUTANT IS THE SHIPPED BUG ITSELF, not a synthetic edit: `is_retained`'s table lookup filtered
+# to the retain direction — which is exactly what shipped (the lookup read the derived `RETAINED_NAMES`,
+# so a `reap` row matched nothing, fell through to the `_`-prefix default and was retained with a reason
+# that denied the row existed). If this mutant ever survives, the disposition has gone inert again.
+MUT_K='s/\$1 == n { print \$2 "|" \$3 "|" \$4; exit }/$1 == n \&\& $2 == "retain" { print $2 "|" $3 "|" $4; exit }/'
+# (f)'s SECOND arm, on the RECORD rather than on a pass: the `unmeasurable_runner_work=` `?` polarity was
+# documented and unasserted, so a record answering `not-run` for a class that could not be SET UP — a
+# confident non-answer substituted for an abstention — reddened nothing. Only `_unmeas_rec` writes this
+# line at this indent; `_class_rec`'s sibling ends `; return 0 ;;` and is untouched.
+MUT_U="s/^            misconfigured) printf '?' ;;$/            misconfigured) printf not-run ;;/"
 # (j) has TWO arms, and each is mutated on its own: the `_temp` ROW (the DECIDED name — with only the
 # row deleted the prefix default still keeps the directory alive, so the case asserts the row by its
 # reason, which is what makes `_temp` a decision rather than an accident of the fallback), and the
@@ -691,6 +783,18 @@ if apply_mutation "$OWNER" "$T/mut-j2/reap-runner-work.sh" "$MUT_J2"; then
     expect_fail "j mutation: dropping the vendor-namespace default turns the case RED (the NEXT vendor dir)" case_j "$REAPER" "$T/mut-j2/reap-runner-work.sh"
 else
     bad "j mutation could not be applied (the vendor-namespace default moved) — the case is not checking it any more"
+fi
+
+expect_pass "k a \`reap\` row is HONOURED — the table's other disposition is not inert" case_k "$REAPER" "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-k/reap-runner-work.sh" "$MUT_K"; then
+    expect_fail "k mutation: honouring only \`retain\` in the table lookup (the shipped bug) turns the case RED" case_k "$REAPER" "$T/mut-k/reap-runner-work.sh"
+else
+    bad "k mutation could not be applied (the table lookup moved) — the case is not checking it any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-u/disk-reaper.sh" "$MUT_U"; then
+    expect_fail "u mutation: answering a misconfigured class with not-run turns (f) RED — the '?' polarity" case_f "$T/mut-u/disk-reaper.sh" "$OWNER"
+else
+    bad "u mutation could not be applied (the unmeasurable polarity moved) — that field is not checked any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
