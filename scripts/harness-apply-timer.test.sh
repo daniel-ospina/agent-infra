@@ -1180,6 +1180,24 @@ REPO_P="$CLONE"; MODE_P=sync
 OUT="$(CELL_HOME_P=relative-cell run_pass "$T/t24l" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "T24 control: a relative CELL_HOME is REFUSED, never a green SKIPPED farm"
 
+# Control 12: a pass that EXECUTES FROM A FARM must not green-skip a farm path with nothing at it.
+# The unit prefers `$HOME/.pi/agent/scripts/harness-apply-pass.sh`, so this is the production shape;
+# `CELL_HOME` is rendered by nothing, so a mis-pointed absolute value is a real configuration, and the
+# SKIPPED line's claim ("a host that executes nothing from there cannot be stale") would be false.
+mk_origin t24m; mk_clone t24m
+REPO_P="$CLONE"; MODE_P=sync
+mkdir -p "$T/t24m/farm-shaped/.pi/agent/scripts"   # the pass runs from a farm; $FARM_DEST names NOTHING
+cp "$PASS_SH" "$T/t24m/farm-shaped/.pi/agent/scripts/harness-apply-pass.sh"
+OUT="$(PASS_SH="$T/t24m/farm-shaped/.pi/agent/scripts/harness-apply-pass.sh" run_pass "$T/t24m" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T24 control: a pass running FROM a farm refuses to call a nameless farm SKIPPED"
+assert_contains "$OUT" "executes FROM a farm" "T24 control: and it names that reason"
+# ...but the DEFAULT controller-only host (no farm-shaped \$HERE, no farm) still skips GREEN — the
+# refusal above must not make every controller host permanently red.
+mk_origin t24n; mk_clone t24n
+REPO_P="$CLONE"; MODE_P=sync
+OUT="$(run_pass "$T/t24n" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T24 control: a controller-only host (no farm, pass not farm-shaped) still skips green"
+
 echo
 echo "────────────────────────────────────────────────────────"
 echo "harness-apply: $PASS passed, $FAIL failed"

@@ -1017,6 +1017,16 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
             REC_ACTION=farm-unverifiable
             finish 0 24 "farm: UNKNOWN — HARNESS_APPLY_FARM_DEST names $FARM_DEST, where nothing exists; an explicitly-configured farm that is not there is a misconfiguration, not a controller-only host"
         fi
+        # ⛔ ...AND `$HERE` IS THE CHECK ON THE SKIP LINE'S OWN CLAIM. The unit prefers
+        # `$HOME/.pi/agent/scripts/harness-apply-pass.sh`, so on a real box THIS FILE runs out of a
+        # farm: if `$FARM_DEST` names nothing while `$HERE` is farm-shaped, the line "a host that
+        # executes nothing from there cannot be stale" is FALSE about this host, and the skip would be
+        # green over the very farm the pass is executing from (review round 6).
+        case "$HERE" in
+            */.pi/agent/scripts|*/.pi/agent/scripts/)
+                REC_ACTION=farm-unverifiable
+                finish 0 24 "farm: UNKNOWN — this pass executes FROM a farm ($HERE) but $FARM_DEST names nothing (CELL_HOME='$CELL_HOME'), so the directory that is really running was never graded; pin the farm (HARNESS_APPLY_FARM_DEST, or render CELL_HOME) instead of letting it default to a path with nothing at it" ;;
+        esac
         log_line "farm: SKIPPED — no farm at $FARM_DEST (a host that executes nothing from there cannot be stale)"
     elif [ ! -d "$FARM_DEST" ]; then
         REC_ACTION=farm-unverifiable
@@ -1092,7 +1102,18 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # not-farm-declared stale file is drift this box EXECUTES, and the one thing it must
                 # never be is a green pass because the fix is awkward.
                 REC_ACTION=farm-drift
-                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships${FARM_NAMED:+ ($FARM_NAMED)} — files this box EXECUTES differ from the ref's bytes, or are owed and absent, or exist in no repo file; recover any local edit, then re-farm from a ref-consistent checkout (pi-bootstrap/setup.sh)" ;;
+                # ⛔ THE INSTRUMENT'S OWN REMEDY, NOT ONE OF OURS. `check-farm-drift.sh` separates
+                # three classes with three DIFFERENT remedies and says so in its own words ("A deploy
+                # cannot fix this one", "declare it LOCAL, delete, or retire … never re-run the farm").
+                # Prescribing "re-farm" for an UNSOURCED or not-farm-declared row contradicts the run
+                # that just produced it, and the reviewer's own measurement of this box's first repair
+                # was exactly that shape (one row was a LAYOUT MOVE, not a copy). So its `Next:` line
+                # and per-file rows are forwarded verbatim.
+                log_line "farm: $REF ships different bytes than $FARM_DEST execute${FARM_NAMED:+ — named: $FARM_NAMED}"
+                printf '%s\n' "$FARM_OUT" | grep -E 'Next:|STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT' | head -12 | while IFS= read -r _row; do
+                    log_line "farm:   $_row"
+                done
+                finish 0 24 "farm: DRIFT — $FARM_DEST is NOT the code $REF ships${FARM_NAMED:+ ($FARM_NAMED)} — the per-file classes and the remedy are printed above, from the instrument itself (a stale copy, a layout move and an unsourced file do NOT all have the same fix)" ;;
             *)
                 REC_ACTION=farm-unknown
                 finish 0 24 "farm: UNKNOWN (check-farm-drift rc=$FARM_RC) — $FARM_DEST could not be graded against $REF, and cannot-verify is not a pass: $(printf '%s' "$FARM_OUT" | grep -m1 -iE 'unknown|cannot|refus' || printf 'no reason printed')" ;;
