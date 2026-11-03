@@ -129,6 +129,11 @@ LAYOUT = {
     "lane_srcs": "scripts",      # FARM_LAYOUT: src scripts/lane, DEST scripts (flat)
     "lib_srcs": "scripts/lib",
     "fleet_tools": "scripts/fleet",   # source tools/fleet, DEST scripts/fleet
+    # graph-mcp-provision: the hosted-graph fallback CLI + its client. Source scripts/, DEST
+    # scripts/ (flat), exactly like fleet_srcs — `tortoise-graph.sh` execs
+    # `tortoise_graph_client.py` from the same directory, so a partial farm would ship a script
+    # whose interpreter is missing.
+    "graph_srcs": "scripts",
 }
 
 src = open(setup_path).read()
