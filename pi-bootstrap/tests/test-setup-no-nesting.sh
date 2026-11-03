@@ -1874,7 +1874,12 @@ os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: off-fence + stale transcript read PID DEAD"
-  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+  # ⛔ THE LANE'S OWN BULLET, NOT THE `suspect(s)` TOKEN (measured 2026-11-03). `fleet-health.py`'s
+  # census now files `- census: LANE CENSUS MISMATCH ...` in the same list, so on any box with a
+  # running `pi` process the generic token is satisfied by the CENSUS ALONE — even when this
+  # lane's suspect was dropped, which is exactly the regression this leg exists to catch. Keyed on
+  # the lane bullet so only the lane's own suspect can satisfy it.
+  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -qE '^[[:space:]]+- B1:' <<<"$out"; then
     echo "ok: $label an abstaining lane with a stale transcript stays a SUSPECT (the abstention does not suppress the ladder)"
   else
     fail "$label: abstention SUPPRESSED the suspect ladder — a stale lane read as clean: $(grep -E '^B1 |no suspects' <<<"$out")"
@@ -1886,7 +1891,10 @@ os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   # captured with `|| rc=$?` because `out="$(cmd)"; rc=$?` aborts the suite under `set -e`.
   printf '{"sessions":{' > "$store"
   rc=0; out="$(run_promotion)" || rc=$?
-  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+  # Same reasoning as (h): pin the LANE's bullet. (Here the census is silent because the store
+  # read failed, but the token must not be satisfiable by any other channel that happens to file
+  # a suspect — this assertion is about the stale LANE, and must stay about it.)
+  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out" && grep -qE '^[[:space:]]+- B1:' <<<"$out"; then
     echo "ok: $label unreadable hook store ⇒ INCOMPLETE (exit 1) and the stale lane is still a SUSPECT"
   else
     fail "$label: unreadable hook store did not abstain (rc=$rc): $(grep -E '^B1 |no suspects|INCOMPLETE' <<<"$out")"

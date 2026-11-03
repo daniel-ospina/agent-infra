@@ -25,7 +25,8 @@ RED CONTROL — five mutations of the shipped module, each written to a TEMP cop
 (a mutation the suite does not catch is reported as a suite FAILURE). The first one is the
 pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
-  * neuter the lane-census reconciliation      -> CENSUS red x4 (the pre-fix lane table)
+  * neuter the lane-census reconciliation      -> 4 paired CENSUS reds, plus collateral
+                                                 reds in the other census checks (measured 14 total)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -44,8 +45,16 @@ its fail-closed aborts in (`        exit 3`), which a column-0-only `^` anchor d
 
 Zero-dep by construction: python3 only. The module is loaded by path (its filename has a hyphen),
 `launchctl` is never executed (a fake `subprocess.run` returns a table), and `sys.platform` is
-patched for the duration of a leg and restored in a `finally`, so nothing touches the real fleet,
-the real launchd, or the real process table.
+patched for the duration of a leg and restored in a `finally`, so nothing touches the real fleet
+or the real launchd.
+
+⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
+(three `_drive` arms), and `main()` reaches the REAL process table twice — `cputime_secs(os.getpid())`
+and `_observed(os.getpid(), ...)` -> `scripts/lib/pid-identity.sh probe`. Both are read-only and
+about THIS process, and the census verdicts the leg asserts are independent of what they return
+(the arm it pins is `pidStartSeconds`-absent, which abstains regardless). But a host with a
+removed `ps` would make the abstaining-record arm abstain for a host-level reason instead of the
+one it names, and the earlier "touches no real process table" guarantee would have hidden that.
 """
 
 from __future__ import annotations

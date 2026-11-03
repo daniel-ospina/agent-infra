@@ -152,8 +152,6 @@ def lane_census(alive, dead, pi_count, roster_size):
     The previous form keyed silence on "the store has a record for some rostered lane", which
     let a SINGLE pid-less or abstaining record silence a census in which nothing was established
     while 18 pi processes ran — `✅ no suspects`, exit 0, the original defect one input over.
-    The only state that may be silent is `alive + dead == roster_size`: every lane either
-    positively bound to a live incarnation, or positively absent/zombie.
 
     * `alive` -- lanes the ONE verdict function positively bound to a live incarnation (`holder`).
     * `dead` -- lanes POSITIVELY dead (`absent` / `zombie`). An ABSTENTION (unreadable / off-fence)
