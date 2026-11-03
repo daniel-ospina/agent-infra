@@ -11,7 +11,7 @@
       },
       "lazy": true,
       "idleTimeoutMs": 900000,
-      "purpose": "Perplexity Search API + SERP + GSC + HubSpot + Places (24 tools). RUNG 1 of the research skill's tool ladder — ~$0.005/query flat, never the $5-40 chat models",
+      "purpose": "Perplexity Search API + SERP + GSC + HubSpot + Places (24 tools). RUNG 1 of the research skill's tool ladder \u2014 ~$0.005/query flat, never the $5-40 chat models",
       "whenToLoad": "research/search tasks FIRST (prefer over web_search); also GSC, SERP, Places and HubSpot tasks. NOTE: requires a one-time `npm install` in mcp-servers/seo-intelligence per checkout, or the entry fails to spawn",
       "cost": "~$0.005/query flat; zero cost while sleeping (lazy)"
     },
@@ -55,17 +55,18 @@
       "cost": "one npx process"
     },
     "tortoise": {
-      "command": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}/.venv/bin/python3",
-      "args": [
-        "-m",
-        "tortoise.mcp_server"
-      ],
-      "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-      "env": {
-        "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-        "TORTOISE_DB_URI": "docker://:@127.0.0.1:16379/tortoise",
-        "TORTOISE_API_KEY": ""
-      }
+      "_comment": "HOSTED tortoise MCP (graph-mcp-provision). A repo-local .mcp.json is what mcp-client resolves FIRST for a lane working in this repo, so this tracked copy must carry the same entry the installed base does \u2014 otherwise an agent-infra lane on a cell spawns the legacy stdio server (a checkout + venv + local FalkorDB a cell does not have) while `cell-install.sh --verify` reports the base config LAYER VERIFIED. Keep this entry byte-identical in shape to templates/.mcp.base.json's. Auth is env-indirect (${TORTOISE_API_KEY}, canonical per #5153/#5343) so no key is ever committed; the credential comes from ~/keys.env (0600), sourced by the lane launcher.",
+      "type": "http",
+      "url": "https://api.premiselabs.co/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${TORTOISE_API_KEY}"
+      },
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "timeoutMs": 60000,
+      "purpose": "Memory graph (Tortoise, hosted) \u2014 read before you derive, write what you learn",
+      "whenToLoad": "any lane: graph read before research, write-back after (`mcp_load tortoise`)",
+      "cost": "one HTTP session; lazy, so nothing is paid while it sleeps"
     }
   }
 }

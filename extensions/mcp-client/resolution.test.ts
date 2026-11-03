@@ -165,13 +165,43 @@ await test("parses as valid config with the expected server set", () => {
   deepEqual(Object.keys(config.mcpServers).sort(), [...expected].sort());
 
   const tortoise = config.mcpServers.tortoise;
-  ok(tortoise.command.includes(".venv/bin/python3"), "tortoise uses the venv python (has fastmcp)");
-  ok(tortoise.cwd.includes("TORTOISE_HOME"), "tortoise cwd uses TORTOISE_HOME");
-  ok(tortoise.env.PYTHONPATH.includes("TORTOISE_HOME"), "PYTHONPATH uses TORTOISE_HOME");
+  // graph-mcp-provision: the base entry is the HOSTED server. It replaced the local stdio entry
+  // (`${TORTOISE_HOME}/.venv/bin/python3 -m tortoise.mcp_server` + a local FalkorDB) because
+  // pi-bootstrap/cell-install.sh could not install that shape on a cell at all — no checkout, no
+  // venv, no local DB — so every cell lane ran with ZERO MCP servers. Asserted here so a revert to
+  // stdio is caught by CI rather than by a fleet of lanes writing GRAPH-UNREACHABLE.
+  equal(tortoise.type, "http", "tortoise is the hosted HTTP server");
+  equal(tortoise.url, "https://api.premiselabs.co/mcp/", "tortoise points at the hosted endpoint");
+  // ⛔ THE REPO'S OWN `.mcp.json` IS THE COPY THAT WINS for every agent-infra lane: mcp-client takes
+  // the FIRST `.mcp.json` walking up from the lane's cwd (then falls back to ~/.pi/agent/.mcp.json),
+  // so this file decides what an agent-infra lane connects to. Its own `_comment` claims a
+  // byte-identical shape to the template's — and NOTHING checked that, so a revert here would
+  // return agent-infra lanes to the legacy server while `cell-install --verify` still certified the
+  // base config. Asserted for the fields a lane actually needs.
+  const repoConfig = JSON.parse(
+    readFileSync(new URL("../../.mcp.json", import.meta.url), "utf8"),
+  );
+  const repoTortoise = repoConfig.mcpServers?.tortoise;
+  ok(repoTortoise !== undefined, "the repo-root .mcp.json declares tortoise (the copy a lane resolves first)");
+  for (const key of ["type", "url", "headers", "lazy", "timeoutMs"] as const) {
+    equal(
+      JSON.stringify(repoTortoise?.[key]),
+      JSON.stringify(tortoise[key]),
+      `the repo-root .mcp.json's tortoise.${key} matches the template (a revert here is invisible to --verify)`,
+    );
+  }
 
-  // #199/#419: tiering — tortoise is the eager core; every other server is lazy.
-  // (`exa`'s "lazy fallback" assertion that lived here is gone with the server.)
-  equal(config.mcpServers.tortoise.lazy, undefined, "tortoise is core (eager)");
+  ok(
+    String(tortoise.headers?.Authorization ?? "").includes("${"),
+    "tortoise auth is env-indirect (${TORTOISE_API_KEY}) — no key in a shared config file",
+  );
+  equal(tortoise.command, undefined, "tortoise is not the legacy stdio entry");
+
+  // Tiering: everything is lazy now, `tortoise` included. The hosted server's cold handshake
+  // exceeds pi's default connect budget, and this entry lands on memory-constrained cells where a
+  // core server would block every session start.
+  equal(config.mcpServers.tortoise.lazy, true, "tortoise is lazy (slow hosted handshake)");
+  ok(config.mcpServers.tortoise.timeoutMs >= 30000, "tortoise carries a connect budget above the default");
   equal(config.mcpServers["playwright-browser"].lazy, true, "playwright is lazy");
   equal(config.mcpServers.gemini.lazy, true, "gemini is lazy");
   equal(config.mcpServers["brave-search"].lazy, true, "brave-search is lazy");

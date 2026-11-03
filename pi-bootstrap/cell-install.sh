@@ -217,46 +217,135 @@ log_line()  { printf '  %s\n' "$*"; }
 # OPERATOR state (cloud-cell-bringup.sh: keys.env is "operator-pushed, and NOT a bring-up
 # byproduct"), so its absence is a WARNING with an exact remedy — never a certification failure,
 # which would refuse to certify a working layer over a key nobody pushed yet.
-graph_key_from_env_file() {
-  local f="$1"
+graph_key_from_env_file() { # <file> [<variable>] -> its value
+  local f="$1" v="${2:-TORTOISE_API_KEY}"
   [ -f "$f" ] || return 1
   # Resolve the way the LANE does — source it in a subshell (set -a) — because the fleet's
   # keys.env spells the alias form `export TORTOISE_API_KEY="$TORTOISE_MCP_API_KEY"`, which a
   # line-parser reads as the literal string `$TORTOISE_MCP_API_KEY` and then reports as a
   # malformed key. The subshell discards every other assignment it makes.
-  KEYFILE="$f" bash -c 'set -a; . "$KEYFILE" >/dev/null 2>&1; set +a; printf "%s" "${TORTOISE_API_KEY:-}"' 2>/dev/null
+  KEYFILE="$f" KEYVAR="$v" bash -c 'set -a; . "$KEYFILE" >/dev/null 2>&1; set +a; printf "%s" "${!KEYVAR:-}"' 2>/dev/null
+}
+
+# ⛔ RESOLVE THE VARIABLE THE ARTIFACT NAMES, NOT A FAMILY OF NAMES. The installed entry expands
+# exactly ONE variable (`Authorization: Bearer ${TORTOISE_API_KEY}`), and pi's mcp-client resolves
+# `process.env[NAME]` VERBATIM — there is no alias mapping anywhere in it. So a resolver that
+# also accepted the fleet alias `TORTOISE_MCP_API_KEY` certified "the hosted MCP will authenticate"
+# on a box whose entry expands `${TORTOISE_API_KEY}` to the EMPTY STRING: it printed the exact
+# OPPOSITE of what the artifact does. The alias is a REMEDY (the #5153 line `export
+# TORTOISE_API_KEY="$TORTOISE_MCP_API_KEY"`), never a substitute for the canonical name.
+# graph_mcp_var — the one variable the INSTALLED **tortoise** entry expands, or empty when that entry
+# declares no Authorization at all.
+#
+# ⛔ IT MUST READ THE TORTOISE ENTRY, NOT THE FILE. Two whole-file reads were both wrong, silently:
+#   * the first `${…}` in the file is `${TORTOISE_HOME}` inside `_comment` — a variable that is never
+#     a key, so a correctly provisioned box reported UNRESOLVED;
+#   * the first `"Authorization"` in the file is ANY server's header — a cell may declare its own
+#     servers (`merge-mcp.py` preserves them on purpose), so an `acme` entry ahead of `tortoise`
+#     made `LAYER VERIFIED` say "will authenticate" about a VARIABLE THE TORTOISE ENTRY DOES NOT
+#     EXPAND, while the tortoise entry expanded an unset one and the lane got a 401. A verdict that
+#     describes a different server than the one it certifies is the false green this PR exists to
+#     close.
+# An EMPTY result is meaningful, not a fallback: the documented self-host entry
+# (`{"url":"http://localhost:8000/mcp"}`) declares no header, and a local daemon needs no key — so
+# there is nothing to resolve and nothing may be reported as missing.
+graph_mcp_var() {
+  [ -f "$DEST/.mcp.json" ] || return 0
+  python3 -c '
+import json, sys
+try:
+    t = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]
+    auth = (t.get("headers") or {}).get("Authorization") or ""
+except Exception:
+    sys.exit(0)
+if "${" not in auth:
+    sys.exit(0)                     # no env-indirect credential (self-host, or a literal -- which verify refuses)
+name = auth.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
+print(name)
+' "$DEST/.mcp.json" 2>/dev/null
+}
+
+# ONE resolver, two renderings. `graph_credential_note` prints the long explanation; the
+# `LAYER VERIFIED` line prints the one-word state. Two independent resolutions of the same question
+# is how a cell gets certified "credential: OK" while the note below it says NOT resolvable.
+graph_key_resolve() {
+  GRAPH_VAR="$(graph_mcp_var)"
+  GRAPH_KEY=""
+  GRAPH_KEY_SRC="the environment"
+  GRAPH_NOAUTH=0
+  if [ -z "$GRAPH_VAR" ]; then
+    # the tortoise entry declares no env-indirect Authorization: a self-hosted daemon needs none
+    GRAPH_NOAUTH=1
+    return 0
+  fi
+  local val
+  val="$(printenv "$GRAPH_VAR" 2>/dev/null || true)"
+  if [ -n "$val" ]; then
+    GRAPH_KEY="$val"
+    GRAPH_KEY_SRC="the environment ($GRAPH_VAR)"
+    return 0
+  fi
+  # HOME first: that is the home a live lane on a cell actually runs in (measured on cell-3
+  # and cell-4: HOME=/home/cmux), and the launcher sources $HOME/keys.env. CELL_HOME follows
+  # because it is where THIS script installs, and on some images the two differ.
+  local f
+  for f in "$HOME/keys.env" "$CELL_HOME/keys.env"; do
+    [ -f "$f" ] || continue
+    val="$(graph_key_from_env_file "$f" "$GRAPH_VAR")"
+    GRAPH_KEY_SRC="$f ($GRAPH_VAR)"
+    if [ -n "$val" ]; then
+      GRAPH_KEY="$val"
+      break
+    fi
+  done
+  return 0
+}
+
+# The state as it belongs in a certification line — a cell is never reported VERIFIED without it.
+graph_credential_state() {
+  graph_key_resolve
+  if [ "$GRAPH_NOAUTH" -eq 1 ]; then
+    printf 'none required — the tortoise entry declares no Authorization (self-hosted daemon)'
+    return 0
+  fi
+  case "$GRAPH_KEY" in
+    tt_*|tk_*) printf 'resolves from %s' "$GRAPH_KEY_SRC" ;;
+    "")        printf 'UNRESOLVED — the entry expands ${%s}, so the tortoise MCP sends an empty Bearer and the server answers 401' "$GRAPH_VAR" ;;
+    *)         printf 'resolves from %s but is not tt_/tk_-shaped (401 likely)' "$GRAPH_KEY_SRC" ;;
+  esac
 }
 
 graph_credential_note() {
-  local key="" src="the environment" f
-  if [ -n "${TORTOISE_API_KEY:-}" ]; then
-    key="$TORTOISE_API_KEY"
-  else
-    # HOME first: that is the home a live lane on a cell actually runs in (measured on cell-3
-    # and cell-4: HOME=/home/cmux), and the launcher sources $HOME/keys.env. CELL_HOME follows
-    # because it is where THIS script installs, and on some images the two differ.
-    for f in "$HOME/keys.env" "$CELL_HOME/keys.env"; do
-      [ -f "$f" ] || continue
-      key="$(graph_key_from_env_file "$f")"
-      src="$f"
-      [ -n "$key" ] && break
-    done
+  graph_key_resolve
+  local key="$GRAPH_KEY" src="$GRAPH_KEY_SRC"
+  if [ "$GRAPH_NOAUTH" -eq 1 ]; then
+    log_line "graph credential: the tortoise entry declares no Authorization — a self-hosted daemon needs none, so there is nothing to resolve"
+    return 0
   fi
   case "$key" in
     tt_*|tk_*)
       log_line "graph credential: resolves from $src (len ${#key}) — the hosted MCP will authenticate" ;;
     "")
-      log_line "⚠️  graph credential: NOT resolvable — the tortoise MCP entry expands \${TORTOISE_API_KEY} to the EMPTY"
+      log_line "⚠️  graph credential: NOT resolvable — the tortoise MCP entry expands \${$GRAPH_VAR} to the EMPTY"
       log_line "    string, the server answers 401 'invalid or missing Bearer token', and every lane writes"
       log_line "    GRAPH-UNREACHABLE. Remedy: put the hosted key in $CELL_HOME/keys.env (mode 600) as"
-      log_line "    TORTOISE_API_KEY, or alias an existing one: export TORTOISE_API_KEY=\"\$TORTOISE_MCP_API_KEY\" (#5153)." ;;
+      log_line "    $GRAPH_VAR, or alias an existing one: export TORTOISE_API_KEY=\"\$TORTOISE_MCP_API_KEY\" (#5153)."
+      if [ "$GRAPH_VAR" = "TORTOISE_API_KEY" ] && { [ -n "${TORTOISE_MCP_API_KEY:-}" ] \
+         || [ -n "$(graph_key_from_env_file "$HOME/keys.env" TORTOISE_MCP_API_KEY 2>/dev/null)" ] \
+         || [ -n "$(graph_key_from_env_file "$CELL_HOME/keys.env" TORTOISE_MCP_API_KEY 2>/dev/null)" ]; }; then
+        log_line "    ⚠️  the fleet alias TORTOISE_MCP_API_KEY IS set — add the alias line above and it resolves"
+      fi ;;
     *)
-      log_line "⚠️  graph credential: TORTOISE_API_KEY in $src does not look like a hosted key (expected tt_/tk_ prefix);"
+      log_line "⚠️  graph credential: $GRAPH_VAR in $src does not look like a hosted key (expected tt_/tk_ prefix);"
       log_line "    the MCP will send whatever it holds and the server may answer 401 (#5153)." ;;
   esac
 }
 
-# verify_graph_mcp — what pi will ACTUALLY do with this cell's .mcp.json, checked on the artifact.
+# verify_graph_mcp — checks the config this script INSTALLS ($DEST/.mcp.json), on the artifact.
+# ⛔ It does NOT claim to describe what pi resolves: mcp-client takes the FIRST `.mcp.json` found
+# walking up from the lane's cwd (then falls back to $DEST/.mcp.json), so a lane working inside a
+# repo that carries its own `.mcp.json` uses THAT file. This is why the tracked repo configs must
+# carry the hosted entry too — a stale repo-local copy wins over a correctly installed base.
 verify_graph_mcp() {
   local f="$DEST/.mcp.json"
   if [ ! -f "$f" ]; then
@@ -267,12 +356,22 @@ verify_graph_mcp() {
     fail ".mcp.json exists but cannot be checked (no python3) — refusing to certify an unread config"
     return 1
   fi
-  python3 - "$f" <<'PY'
+# graph_mcp_marker — the verifier's python, in ITS OWN FUNCTION BODY.
+#
+# ⛔ The heredoc must NOT be lexically inside `$( )`: the bash 3.2 scanner desynchronises and the
+# whole file stops parsing — on the `bash32-parse` CI gate, not on this box's bash 5, where
+# `bash -n` happily passes it (measured: `scripts/check-bash32-parse.sh` reported
+# "line 676: syntax error near unexpected token `('" for a defect on line 352; #2248/#2930).
+# A heredoc in a FUNCTION body called from the substitution parses correctly in both.
+graph_mcp_marker() { # <config.json> <template.json> -> marker on stdout; non-zero = not certifiable
+  python3 - "$1" "$2" <<'PY'
 import json
 import re
 import sys
 
 p = sys.argv[1]
+tpl = json.load(open(sys.argv[2])) if len(sys.argv) > 2 else {}
+want_url = ((tpl.get("mcpServers") or {}).get("tortoise") or {}).get("url") or ""
 raw = open(p).read()
 try:
     cfg = json.loads(raw)
@@ -281,6 +380,28 @@ except ValueError as exc:
     sys.exit(1)
 servers = cfg.get("mcpServers") or {}
 t = servers.get("tortoise")
+# ⛔ A LEAK IS NOT A TORTOISE PROBLEM. The token scan below covers the WHOLE file, so a literal
+# pasted into any other server's entry (or into a `_comment`) is found there — and reporting it as
+# "tortoise entry is not the hosted shape" points the operator at the one entry that is correct.
+# The marker therefore carries the PATH of the first offending value.
+tok = re.compile(r"\b(t[tk])_[A-Za-z0-9]{10,}")
+
+
+def leak_path(node, trail=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            got = leak_path(v, "%s.%s" % (trail, k) if trail else str(k))
+            if got:
+                return got
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            got = leak_path(v, "%s[%d]" % (trail, i))
+            if got:
+                return got
+    elif isinstance(node, str) and tok.search(node):
+        return trail
+    return ""
+
 if not isinstance(t, dict):
     print("NOENTRY")
     sys.exit(1)
@@ -291,23 +412,79 @@ url = t.get("url") or ""
 if not url:
     print("NOURL")
     sys.exit(1)
-auth = ((t.get("headers") or {}).get("Authorization") or "")
-if not auth:
-    print("NOAUTH")
+# `type` is OPTIONAL, deliberately: the client's `McpServerConfig` has no `type` field and picks
+# the HTTP transport from `url` alone, so requiring it would refuse a config that works — while an
+# explicit OTHER transport (`sse`/`stdio`) is a different thing and must not be certified.
+if t.get("type") not in (None, "http"):
+    print("NOTHTTP:%s" % t.get("type"))
     sys.exit(1)
-if "${" not in auth:
+auth = ((t.get("headers") or {}).get("Authorization") or "")
+if auth and "${" not in auth:
     print("LITERAL_AUTH")
     sys.exit(1)
+# ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client sends headers VERBATIM
+# (extensions/mcp-client/index.ts:819-821), so `Authorization: ${TORTOISE_API_KEY}` (no scheme) is
+# delivered as `Authorization: tt_…` and the server answers 401 — yet it contains "${" and used to
+# be certified. Nor is any variable acceptable: the resolver reads TORTOISE_API_KEY (and the fleet
+# alias TORTOISE_MCP_API_KEY), so an entry naming a third variable would expand to the EMPTY STRING
+# while `LAYER VERIFIED` printed a green credential line beside it. Both names are allowed, nothing
+# else is, and the scheme is required.
+HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$")
 # a literal credential in a SHARED file is the leak, not the config
-if re.search(r"\b(t[tk])_[A-Za-z0-9]{10,}", raw):
-    print("SECRET_IN_FILE")
+if tok.search(raw):
+    # report the path UNDER `mcpServers` — `mcpServers.tortoise._comment` is noise when the whole
+    # file is already known to be that object, and `tortoise._comment` is what an operator greps.
+    print("SECRET_IN_FILE:%s" % (leak_path(servers) or "(unlocatable)"))
     sys.exit(1)
-print("OK:%s:%s" % (url, auth))
+# ⛔ A DIFFERING url is not automatically fine, and a MISSING Authorization is not automatically
+# broken: the two questions are linked. Accepting any non-empty http url let a cell whose endpoint
+# was a typo (or copied from another box) be certified LAYER VERIFIED while pointing at nothing — a
+# false green of exactly the class this function exists to close. And demanding an env-indirect
+# header unconditionally refuses the DOCUMENTED self-host config (a local daemon needs no key,
+# tortoise docs/quickstart-selfhosted.md), which merge-mcp.py then "repairs" by repointing it.
+# So: the hosted default REQUIRES the env-indirect header; any other url requires the operator to
+# have said so with `_selfHosted: true`, and is then reported BY NAME rather than silently passed.
+if want_url and url != want_url:
+    if not t.get("_selfHosted"):
+        print("URL_NOT_DEFAULT:%s" % url)
+        sys.exit(1)
+    print("SELFHOSTED:%s" % url)
+else:
+    if not auth:
+        print("NOAUTH")
+        sys.exit(1)
+    if not HOSTED_AUTH.match(auth.strip()):
+        print("WRONG_AUTH:%s" % auth)
+        sys.exit(1)
+    print("OK:%s:%s" % (url, auth))
 PY
-  case $? in
-    0) : ;;
-    *) fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (see the code on the line above) — a hand-edited or stale cell copy, or a checkout that still ships the legacy stdio entry"; return 1 ;;
-  esac
+}
+
+  # The marker is CAPTURED, not just sniffed from $?: the FAIL sentence must name the thing that is
+  # actually wrong (a leak in another server's entry is not a broken tortoise entry), and $? cannot
+  # tell the two apart. The line is still echoed into the run log — the self-host case is reported
+  # BY NAME there, deliberately.
+  local out=""
+  out="$(graph_mcp_marker "$f" "$INFRA_ROOT/templates/.mcp.base.json")"
+  local rc=$?
+  [ -n "$out" ] && log_line ".mcp.json verify: $out"
+  if [ "$rc" -eq 0 ]; then
+    :
+  else
+    case "$out" in
+      SECRET_IN_FILE:*)
+        fail "a credential LITERAL is written into .mcp.json at ${out#SECRET_IN_FILE:} — a shared config file must be env-indirect (\${TORTOISE_API_KEY}); remove the literal and put the key in \$HOME/keys.env (mode 600)" ;;
+      LITERAL_AUTH*)
+        fail ".mcp.json's tortoise entry carries a LITERAL bearer token instead of \${TORTOISE_API_KEY} — the shared file is the leak" ;;
+      WRONG_AUTH:*)
+        fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_API_KEY}' — the client sends headers VERBATIM, so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
+      NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
+        fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
+      *)
+        fail ".mcp.json verify failed (marker: ${out:-none}) — the hosted entry could not be certified" ;;
+    esac
+    return 1
+  fi
   graph_credential_note
   return 0
 }
@@ -870,27 +1047,36 @@ PY
     fi
   fi
 
-  # .mcp.json — MERGED from templates/.mcp.base.json (graph-mcp-provision). Source wins per
-  # SERVER KEY, cell-local servers survive — the same contract as settings.json, so a cell that
-  # added its own server keeps it. A plain copy is refused: it would silently drop that server.
+  # .mcp.json — the HOSTED graph entry, plus whatever server the cell already declared
+  # (graph-mcp-provision). The merge RULES live in ONE place, `pi-bootstrap/lib/merge-mcp.py`,
+  # shared with setup.sh: the two callers merging inline is how they drift, and this exact drift
+  # (both source-wins) is what silently repointed a self-hosted tortoise url on every re-sync.
+  # In a cell's case that script installs the graph server ONLY — the template's other base
+  # servers cannot spawn here: `seo-intelligence` needs mcp-servers/…/node_modules (a cell ships
+  # extensions/ only), brave/gemini need keys, playwright pulls an npx package onto a
+  # memory-constrained box. A catalog that advertises an unspawnable tool is worse than a short one.
   local mcp_src="$INFRA_ROOT/templates/.mcp.base.json"
+  local mcp_lib="$INFRA_ROOT/pi-bootstrap/lib/merge-mcp.py"
   if [ ! -f "$mcp_src" ]; then
     fail "templates/.mcp.base.json is MISSING from $INFRA_ROOT — the cell would keep ZERO MCP servers (every lane then writes GRAPH-UNREACHABLE instead of reading the graph)"
+  elif [ ! -f "$mcp_lib" ]; then
+    fail "pi-bootstrap/lib/merge-mcp.py is MISSING from $INFRA_ROOT — refusing to merge .mcp.json with a second, private implementation"
   elif ! command -v python3 >/dev/null 2>&1; then
     fail "python3 is missing — refusing to write .mcp.json by plain copy (it would drop a cell-local server); install python3 or merge by hand"
   else
-    python3 - "$mcp_src" "$DEST/.mcp.json" <<'PY' || fail ".mcp.json merge failed"
-import json
-import os
-import sys
-
-src = json.load(open(sys.argv[1]))
-dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
-merged = {**dst, **src}
-merged["mcpServers"] = {**(dst.get("mcpServers") or {}), **(src.get("mcpServers") or {})}
-json.dump(merged, open(sys.argv[2], "w"), indent=2)
-PY
-    log_line ".mcp.json merged (hosted tortoise entry installed, cell-local servers preserved)"
+    # NOTE: lines are surfaced verbatim — a preserved self-hosted url, a replaced unusable entry,
+    # and the servers deliberately not installed here must be visible, not inferred. The merge's
+    # exit status is captured FIRST: a `while read < <(...)` loop cannot report it, so a failing
+    # merge would print its error as a note and then log success.
+    mcp_out=""
+    mcp_rc=0
+    mcp_out="$(python3 "$mcp_lib" "$mcp_src" "$DEST/.mcp.json" --cell 2>&1)" || mcp_rc=$?
+    printf '%s\n' "$mcp_out" | while IFS= read -r note; do [ -n "$note" ] && log_line ".mcp.json $note"; done
+    if [ "$mcp_rc" -ne 0 ]; then
+      fail ".mcp.json merge failed (merge-mcp.py rc=$mcp_rc) — the cell would keep whatever config it already had"
+    else
+      log_line ".mcp.json: hosted tortoise entry installed (cell-local servers preserved)"
+    fi
   fi
   graph_credential_note
 
@@ -1626,7 +1812,19 @@ PY
   guard_gh_shim
 
   if [ "$FAILURES" -eq 0 ]; then
-    log_line "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
+    # ⛔ The credential state rides ON the certification line, not in a warning above it. A
+    # `--verify` that prints LAYER VERIFIED while the graph key does not resolve certifies a cell
+    # whose every lane writes GRAPH-UNREACHABLE — and nothing else catches it: the key is not part
+    # of the layer, cloud-cell-bringup.sh does not check it, and the warning above scrolls away.
+    # The exit code stays 0 on purpose (a missing key is not a broken layer, and refusing here
+    # would leave an operator unable to certify a correctly-installed cell over a key nobody has
+    # pushed yet), so the STATE is what must be unmissable.
+    # ⛔ THE STATE GOES ON THE CERTIFICATION LINE ITSELF. It was a second line, and the only
+    # programmatic consumer (`scripts/cloud-cell-bringup.sh`) filters this output with
+    # `grep -E 'mode=--verify|LAYER VERIFIED'` — so a separate line was DROPPED, and a cell whose
+    # graph key does not resolve was reported as certified with nothing about the credential. The
+    # comment above claimed the state "rides ON the certification line"; now it does.
+    log_line "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config — graph credential: $(graph_credential_state)"
     # ⛔ THE LAYER IS NOT THE CELL (agent-infra#2916 check 2, correcting #2909). This line used to be
     # the last thing an operator saw before starting lanes, and `--install` can end here with NO
     # HARNESS PIN — measured: a `bash -x` trace STOPS at exactly this `log_line`, and the pin was then
