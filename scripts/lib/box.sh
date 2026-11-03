@@ -14,7 +14,7 @@
 #   • `date`        — BSD: `date -r <epoch>` takes epoch SECONDS; GNU: `date -d @<epoch>`.
 #   • CPU count     — macOS: `sysctl -n hw.ncpu`; Linux: `nproc` (or `getconf _NPROCESSORS_ONLN`).
 #                     `spawn-gate.sh` already derives `_NCPU` this way at SOURCE time; a script
-#                     sourced under the wrong PATH pinned `_NCPU=4` and MAX_LOAD=40 for every cell
+#                     sourced under the wrong PATH pinned `_NCPU=4` and MAX_LOAD=40 for every cell (the fallback is 10 since 2026-11-03)
 #                     (#1702). That is the failure this shim exists to make impossible.
 #   • mtime         — BSD: `stat -f %m`; GNU: `stat -c %Y`.
 #   • scheduler     — macOS: launchd; Linux cell: systemd user units, or a bare tmux session.
