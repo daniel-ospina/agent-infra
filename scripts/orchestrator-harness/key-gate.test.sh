@@ -36,6 +36,7 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+eqv() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: '$1', want: '$2')"; fi; }
 has()  { case "$1" in *"$2"*) ok "$3" ;; *) bad "$3 (missing: $2)" ;; esac; }
 hasnt(){ case "$1" in *"$2"*) bad "$3 (unexpected: $2)" ;; *) ok "$3" ;; esac; }
 
@@ -154,6 +155,13 @@ done
 # ── 4. AGREEMENT with worker-terminal.sh (the other reader of the same rule) ────────────────────
 # Two readers of one rule are safe only if a divergence REDDENS something. This drives both against
 # one fixture matrix and requires identical answers — the drift guard for `key_gate_var`.
+# ⛔ THE MATRIX MUST BE ABLE TO DISAGREE (review round 4, P2, measured). Every fixture used to have no
+# `keys.env`, so `worker-terminal.sh` fell back to the same `${PI_LANE_PROVIDER:-deepseek}` default this gate
+# uses — the two agreed BY CONSTRUCTION, and the provider SOURCE divergence (worker-terminal reads the box's
+# env FILE; this gate reads the ENVIRONMENT, which `lane-env.sh` has already populated from that file) was
+# invisible. The `fileprov` fixture below sets `PI_LANE_PROVIDER=zai` IN THE FILE and is probed twice: with
+# the file's value exported into the environment (the production shape, where the two MUST agree) and with
+# it absent (where they legitimately differ, and the gate must fall back to run_agent's own default).
 if [ -r "$WT" ]; then
   agree=0; diffs=""
   for body in "$DEEPSEEK_JSON" \
@@ -165,7 +173,17 @@ if [ -r "$WT" ]; then
     theirs="$(env -i PATH=/usr/bin:/bin HOME="$AH" bash -c '. "$1" >/dev/null 2>&1; wt_provider_key_var "$2"' _ "$WT" "$AH" 2>/dev/null)"
     [ "$mine" = "$theirs" ] || { agree=1; diffs="$diffs [body=$(printf '%s' "$body" | cut -c1-40)… mine='$mine' theirs='$theirs']"; }
   done
-  ck "4a key-gate.sh and worker-terminal.sh resolve the SAME variable for every fixture shape${diffs:+ — $diffs}" "$agree"
+  # …and the provider-source pair, in the production shape (lane-env.sh has exported the file's value).
+  FP="$(mkhome fileprov "{\"providers\":{\"zai\":{\"apiKey\":\"\$KG_CANARY_ALT\"},\"deepseek\":{\"apiKey\":\"\$KG_CANARY_KEY\"}}}")"
+  printf 'export PI_LANE_PROVIDER=zai\n' > "$FP/keys.env"
+  mine="$(env -i PATH=/usr/bin:/bin HOME="$FP" PI_LANE_PROVIDER=zai bash -c '. "$1"; key_gate_var "$2"' _ "$KG" "$FP" 2>/dev/null)"
+  theirs="$(env -i PATH=/usr/bin:/bin HOME="$FP" PI_LANE_PROVIDER=zai bash -c '. "$1" >/dev/null 2>&1; wt_provider_key_var "$2"' _ "$WT" "$FP" 2>/dev/null)"
+  eqv "$mine" "$theirs" "4b both resolvers answer KG_CANARY_ALT when the FILE names the provider and the environment carries it (the production shape: lane-env.sh sources the file)"
+  # …and the disagreement is DOCUMENTED, not silent: with the environment silent this gate falls back to
+  # run_agent's default (deepseek) while worker-terminal reads the file. That is the correct split — the gate
+  # asserts about the env the AGENT inherits, worker-terminal prepares a LAUNCH that has not sourced yet.
+  mine2="$(env -i PATH=/usr/bin:/bin HOME="$FP" bash -c '. "$1"; key_gate_var "$2"' _ "$KG" "$FP" 2>/dev/null)"
+  eqv "$mine2" "KG_CANARY_KEY" "4c …and with the environment silent the gate resolves run_agent's OWN default (deepseek), which is what the lane would really run with"
 else
   bad "4a worker-terminal.sh is missing, so the agreement arm could not run"
 fi
@@ -174,10 +192,37 @@ fi
 # A shared code is how #2293's 73/74 defect happened: one number, two opposite remedies.
 CODEGREP="$(grep -o 'KEY_GATE_REFUSED=[0-9]*' "$KG" | head -1 | cut -d= -f2)"
 ck "5a KEY_GATE_REFUSED is 82 (got '${CODEGREP:-<none>}')" "$([ "${CODEGREP:-}" = "82" ] && echo 0 || echo 1)"
+# ⛔ ONE VERDICT PER CLAIM (review round 4, P2, measured): the first cut printed `bad` inside the loop AND an
+# unconditional `ok` after it, so `KEY_GATE_REFUSED=72` produced BOTH answers and the PASS count — and the
+# "all N assertions passed" recap — credited a check the file had just contradicted. The flag makes the
+# claim falsifiable exactly once.
+reused=""
 for taken in 72 75 80; do
-  [ "${CODEGREP:-}" != "$taken" ] || bad "5b the key gate reuses $taken, whose remedy is a different one"
+  [ "${CODEGREP:-}" != "$taken" ] || reused="$taken"
 done
-ok "5b the key gate does not reuse 72 (repo-target), 75 (load) or 80 (brief) — the four remedies differ"
+if [ -n "$reused" ]; then
+  bad "5b the key gate reuses $reused, whose remedy is a different one (repo-target 72 / load 75 / brief 80)"
+else
+  ok "5b the key gate does not reuse 72 (repo-target), 75 (load) or 80 (brief) — the four remedies differ"
+fi
+
+# ── 5c. THE PROBE IS BOUNDED (review round 4, P1, measured) ─────────────────────────────────────
+# The gate runs immediately before `run_agent` — where `lane-bound.sh` is installed — so an unbounded read
+# here has no wall bound and no silence bound, AND bash defers traps while a foreground command runs, so a
+# TERM cannot reach `lane_terminate` and the lane writes NO terminal line: the exact silent end this change
+# exists to remove. A `models.json` that blocks on `open` (a FIFO) is that fixture.
+if command -v mkfifo >/dev/null 2>&1; then
+  HF="$(mkhome fifo ABSENT)"; rm -f "$HF/.pi/agent/models.json"; mkfifo "$HF/.pi/agent/models.json"
+  _t0="$(date +%s)"
+  OUT="$(env -i PATH=/usr/bin:/bin HOME="$HF" KEY_GATE_BOUND=3 bash -c '. "$1"; key_gate_assert t "$2"; echo "RC=$?"' _ "$KG" "$HF" 2>&1)"
+  _el=$(( $(date +%s) - _t0 ))
+  ck "5c a models.json that BLOCKS on open answers inside the bound (${_el}s, bound 3) — an unbounded read here freezes a lane that cannot even take the TERM that writes its terminal line" \
+     "$([ "$_el" -le 10 ] && echo 0 || echo 1)"
+  has "$OUT" "RC=0" "5c2 …and refuses NOTHING when the bound fires (blindness is not a verdict)"
+  has "$OUT" "check=skipped" "5c3 …and says it could not resolve, rather than passing silently"
+else
+  bad "5c mkfifo is unavailable, so the blocking-fixture arm could not run"
+fi
 
 # ── 6. THE `--probe` ENTRY POINT (an operator can ask without running a lane) ───────────────────
 OUT="$(env -i PATH=/usr/bin:/bin HOME="$H" bash "$KG" --probe operator "$H" 2>&1)"; rc=$?

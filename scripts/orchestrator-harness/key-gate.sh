@@ -64,6 +64,34 @@ KEY_GATE_PROVIDER=""
 KEY_GATE_REASON=""
 KEY_GATE_MODELS_JSON=""
 
+# key_gate_bounded <secs> <cmd...> — run a probe under a TIME BOUND (review round 4, P1, measured).
+# ⛔ AN UNBOUNDED PROBE HERE IS WORSE THAN ELSEWHERE: the gate runs immediately before `run_agent`, which
+# is where `lane-bound.sh` gets installed — so a hang here has no wall bound and no silence bound, and bash
+# DEFERS traps while a foreground command runs, so a TERM could not even reach `lane_terminate` to write
+# the terminal line. Measured with a `models.json` that blocks on `open` (a FIFO, or a hung automount): the
+# lane sat in the probe, survived TERM, and wrote NO `outcome=` line at all — the exact silent end this
+# change exists to remove, reintroduced by the check added to prevent it.
+# Same shape as `worker-terminal.sh::wt_bounded` (perl `alarm`, then `timeout`), and the fallback is
+# BOUNDED TOO rather than best-effort: a fired bound prints nothing, which is the gate's own "cannot say"
+# answer, and blindness refuses nothing.
+key_gate_bounded() { # <secs> <cmd...>
+  local s="${1:-15}"; shift
+  case "$s" in ''|*[!0-9]*) s=15 ;; esac
+  [ "$s" -gt 0 ] 2>/dev/null || s=15
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV' "$s" "$@"; return $?
+  fi
+  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
+  local out pid w rc
+  out="$(mktemp "${TMPDIR:-/tmp}/key-gate.XXXXXX" 2>/dev/null)" || return 3
+  "$@" >"$out" 2>/dev/null & pid=$!
+  ( sleep "$s"; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 & w=$!
+  wait "$pid" 2>/dev/null; rc=$?
+  kill "$w" >/dev/null 2>&1; wait "$w" 2>/dev/null
+  cat "$out" 2>/dev/null; rm -f "$out" 2>/dev/null
+  return "$rc"
+}
+
 # key_gate_var <home> [<provider>] -> the env var name the lane provider's apiKey resolves from, or
 # nothing when it cannot be said. An empty answer is the "do not refuse" answer.
 key_gate_var() {
@@ -74,7 +102,9 @@ key_gate_var() {
   [ -n "$prov" ] || prov="${PI_LANE_PROVIDER:-deepseek}"
   command -v python3 >/dev/null 2>&1 || return 0
   # A literal apiKey, a provider absent from the file, and an unparseable file all print NOTHING.
-  python3 - "$mj" "$prov" <<'PY' 2>/dev/null
+  # ⛔ BOUNDED (review round 4, P1): an unbounded read here freezes a lane that has no wall bound yet and
+  # cannot even take the TERM that would write its terminal line.
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 - "$mj" "$prov" <<'PY' 2>/dev/null
 import json, re, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -130,7 +160,9 @@ key_gate_stored_credential() {
   local aj="$home/.pi/agent/auth.json"
   [ -r "$aj" ] || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  python3 - "$aj" "$prov" <<'PY' 2>/dev/null
+  # ⛔ BOUNDED (review round 4, P1) for the same reason as key_gate_var's read: a hung/mounted-dry store
+  # must not become a lane that cannot be killed and never writes a terminal line.
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 - "$aj" "$prov" <<'PY' 2>/dev/null
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))

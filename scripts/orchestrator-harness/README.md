@@ -2519,8 +2519,8 @@ written by whatever path the lane exited through, is what answers it:
 ```bash
 # which lane logs never said what happened?  (0 is the target; an empty list is the pass)
 grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log
-# what did THIS lane do?
-grep '^outcome=' "$O/logs/lane-<N>.log" | tail -1
+# what did the CURRENT run of THIS lane do?  (an ABSENT file means no verdict yet)
+cat "$O/logs/lane-<N>.outcome"
 ```
 
 ⛔ **the glob is `lane-[0-9]*.log`, not `lane-*.log`** — the loose form also matches
@@ -2528,8 +2528,15 @@ grep '^outcome=' "$O/logs/lane-<N>.log" | tail -1
 by name, for the same reason: counting it added a fake lane). Lane logs are `<issue>.log` and the id is
 validated numeric.
 
+⛔ **and the single-lane read is `lane-<N>.outcome`, not `tail -1` of the log** — the log is
+APPEND-ONLY (`tee -a` / `>>`; nothing truncates it), so a re-dispatched issue leaves the PREVIOUS
+attempt's terminal line in it, and `grep '^outcome=' | tail -1` then answers "this lane has ended" with
+the earlier run's verdict while the current one is still working — the stale-flag class, in the artifact
+shipped to answer exactly this question. The per-run file is written by the same trap and REMOVED by the
+next dispatch, so its absence means "no verdict for this run": still working, or never started.
+
 `grep -L` is the right reader for "is any log unaccounted for" because it asks about the WHOLE file; the
-`tail -1` form is right for a single lane because a child process killed after the lane exits can still
+`tail -1` form is right for a single lane when a child process killed after the lane exits can still
 land its own last words in the log (the lane's line is written last by the lane, which is not the same
 claim as "nothing in the world can append afterwards").
 

@@ -193,6 +193,21 @@ drive "$WT" "$KEYVAR=sk_fixture"
 eqv "$LANE_RC" "0" "2a the lane exits 0"
 [ -s "$PI_MARK" ]; ck "2b the agent DID run (the gate passes what it cannot object to, and pi was spawned)" $?
 check_terminal "2c" done "agent-exit-0" 0
+# ⛔ THE PER-RUN VERDICT (review round 4, P2, measured). The lane LOG is append-only, so a re-dispatched
+# issue keeps the previous attempt's `outcome=` line and `tail -1` on the log can hand a reader that
+# earlier verdict while the current run is still working. The per-run sibling is what a liveness read must
+# use: it is written by the same trap and REMOVED at the next dispatch, so its ABSENCE — not a stale line —
+# is "no verdict yet". Both halves are asserted here.
+RUNOUT="$ARMDIR/o/logs/lane-3331.outcome"
+[ -s "$RUNOUT" ]; ck "2d the run-scoped verdict file exists (logs/lane-<N>.outcome)" $?
+eqv "$(cat "$RUNOUT" 2>/dev/null)" "$(lastline)" "2e …and carries the SAME line the log ends on"
+printf 'outcome=failed reason=STALE-PREVIOUS-RUN lane=3331 rc=9 utc=1999-01-01T00:00:00Z\n' > "$RUNOUT"
+drive "$WT" LANE_DRY_RUN=1
+has "$(cat "$RUNOUT" 2>/dev/null)" "reason=dry-run" "2f a re-dispatch OVERWRITES it — a pre-seeded previous-run verdict is gone, so no reader can act on it"
+hasnt "$(cat "$RUNOUT" 2>/dev/null)" "STALE-PREVIOUS-RUN" "2g …and the stale line does not survive anywhere in the run-scoped read"
+# …while the LOG legitimately keeps both runs (it is the transcript, and truncating it would destroy the
+# previous attempt's record) — the per-run file is what makes the two compatible.
+[ "$(grep -c '^outcome=' "$(LOG)" 2>/dev/null || true)" -ge 2 ]; ck "2h the append-only LOG keeps both runs (the run-scoped file is the answer to 'which one is now')" $?
 
 # ═══ 3. A LANE WHOSE AGENT FAILS ════════════════════════════════════════════════════════════════════
 mk_arm failed; WT="$ARMWT"
@@ -223,8 +238,7 @@ wait "$LANE_PID" 2>/dev/null; LANE_RC=$?
 eqv "$LANE_RC" "143" "4a a TERMed lane exits by the signal's status (143)"
 check_terminal "4b" died "signal:TERM" 143
 
-# ═══ 5. A LANE THAT NEVER GOT AS FAR AS AN OUTCOME ══════════════════════════════════════════════════
-# The half-synced-`$O` shape: lane.sh is present and its libraries are not. It refuses with 78 — which is
+# ═══ 5. A LANE THAT NEVER GOT AS FAR AS AN OUTCOME ══════════════════════════════════════════════════# The half-synced-`$O` shape: lane.sh is present and its libraries are not. It refuses with 78 — which is
 # NOT a gate refusal — and the terminal line must still appear, naming the exit. Without this, the
 # exits that happen BEFORE any gate are exactly the ones that leave a silently truncated log.
 STRIPPED="$T/stripped"; mkdir -p "$STRIPPED/O/logs"
@@ -246,6 +260,27 @@ export -f pi
 drive "$WT" "$KEYVAR=sk_fixture" MAX_LOAD=0
 eqv "$LANE_RC" "75" "6a a load refusal still exits 75"
 check_terminal "6b" refused "load-gate" 75
+
+# ── 6c: A GATE THAT COULD NOT RUN IS NOT A REFUSAL (review round 4, P2, measured) ────────────────
+# The gate writes its output to a file in `$O/state`, and the FIRST cut put that redirect inside the refusal
+# decision: on a read-only `$O` bash never ran the function, status was 1, and the lane announced a MISSING
+# MODEL CREDENTIAL with `var=?` and a credential remedy — for a disk condition the DISK gate (77) exists to
+# name, 200 lines LATER. The file is now created first and anything that is not exactly the gate's own
+# refusal status is reported as the gate being UNABLE TO RUN.
+if [ "$(id -u)" != "0" ]; then
+  mk_arm gatenotrun; WT="$ARMWT"
+  pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+  export -f pi
+  chmod 500 "$ARMDIR/o/state"
+  drive "$WT" "$KEYVAR=sk_fixture"
+  chmod 700 "$ARMDIR/o/state" 2>/dev/null || true
+  eqv "$LANE_RC" "78" "6c an UNWRITABLE \$O/state reports the gate as unable to run (78), not as a credential refusal"
+  has "$(lastline)" "outcome=died reason=key-gate-not-run" "6d …and its outcome says the gate did not run"
+  hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment" "6e …and it does NOT claim the credential is missing (the credential was PRESENT here)"
+  [ ! -s "$ARMDIR/o/state/capacity-refused-3331" ]; ck "6f …and nothing is yielded, because nothing was measured" $?
+else
+  bad "6c the unwritable-\$O arm cannot run as root (chmod does not block root) — the check is skipped, not passed"
+fi
 
 # ═══ 7. THE DRY RUN (the CLEANUP is disarmed; the line is STILL written by the EXIT trap — see 7d) ═════════════
 mk_arm dryrun; WT="$ARMWT"
