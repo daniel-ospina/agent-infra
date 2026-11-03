@@ -136,7 +136,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+log_line() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 say_err() { printf '%s\n' "$*" >&2; }
 
 # ── the digest, portable ────────────────────────────────────────────────────────────────────────
@@ -292,7 +292,7 @@ if [ "$PIN_IDENTITY" -eq 1 ] && [ -f "$PIN_FILE" ]; then
     else
         PIN_TREE_NOTE="no .harness-path record at $_HP_CHECKED"
     fi
-    say "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
+    log_line "$PROG: pin $PIN_SHA — the source checkout IS the pin ($PIN_TREE_NOTE)."
 fi
 
 # ⛔ A DANGLING SYMLINK IS CAUGHT HERE TOO. `[ -e ]` FOLLOWS the link, so a pin record that is a
@@ -684,7 +684,7 @@ else
 fi
 
 total=$((same+stale+unsourced))
-say ""
+log_line ""
 if [ "$matched" -eq 0 ]; then
     say_err "$PROG: UNKNOWN — no SOURCED file was graded; an all-declared-local farm is not a matching farm."
     exit 2
@@ -702,7 +702,7 @@ if [ "$decl_offshape" -gt 0 ] && [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] &&
     exit 2
 fi
 if [ "$stale" -eq 0 ] && [ "$unsourced" -eq 0 ] && [ "$missing" -eq 0 ]; then
-    say "$PROG: OK — $same/$matched sourced file(s) match the source at ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC$([ -n "$SRC_READ" ] && [ -n "${PIN_SHA:-}" ] && printf ' = pin')"
+    log_line "$PROG: OK — $same/$matched sourced file(s) match the source at ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC$([ -n "$SRC_READ" ] && [ -n "${PIN_SHA:-}" ] && printf ' = pin')"
     exit 0
 fi
 say_err "$PROG: DRIFT — $stale stale ($stale_split), $missing declared-but-absent, $unsourced unsourced, of $total deployed file(s) ($matched sourced, $same matching) against ${SRC_SHA:-working-tree} ($SRC_MODE) in $SRC."

@@ -420,7 +420,7 @@ def load_jobs(check_targets: bool = True) -> list:
     """Parse every plist in TEMPLATES_DIR into a Job. Raises ScheduleError for a broken set.
 
     `check_targets=False` grades the DECLARATIONS only, and is what `--check` uses: whether
-    `{{HOME}}/.pi/agent/scripts/x.sh` exists is a fact about the MACHINE (a farm that is or is
+    `{{HOME}}/.pi/agent/scripts/<entry>` exists is a fact about the MACHINE (a farm that is or is
     not installed here), never about the declaration — grading it in CI, where no farm is
     installed, would refuse a perfectly good template set for the runner's own missing layering.
     The layer's real existence is already the cell's gate: `--install`/`--verify`.
