@@ -1152,6 +1152,16 @@ RECOVER_BODY=0
 # without paying for the review again. `--flush-pending` posts the marker a
 # previous run minted but could not deliver; it mints nothing.
 FLUSH_PENDING=0
+# #10583 — re-attest the DELTA: re-bind a CLEAN record's own verdict to the live
+# head ONLY when the authored diff is provably unchanged. A minting verb, so it
+# takes <pr> [owner/repo] and NO head (the record names the reviewed head — that
+# is the whole point: a lane that had to remember the old head could not use it).
+DELTA=0
+DELTA_FROM=""
+# #3247 review (P1) — the head the DECIDING ARM actually measured, which is NOT always
+# DELTA_FROM: only `lane` measures from the record's head. Written into the record as
+# `delta.from`, so the pair a reader checks is the pair the proof covers.
+DELTA_MEASURED_FROM=""
 EVIDENCE=""
 # tortoise#7391: what the record carries. Set ONLY by the verification gate below, so a
 # record claims `evidence` only when this run actually read and accepted that
@@ -1193,6 +1203,7 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
       fi ;;
     --flush-pending) FLUSH_PENDING=1 ;;
     --print-tier) PRINT_TIER=1 ;;
+    --delta) DELTA=1 ;;
     --recover-body) RECOVER_BODY=1 ;;
     --force-stale) FORCE_STALE=1 ;;
     --expect-head)
@@ -1232,6 +1243,10 @@ fi
 # the requested verdict and head — minting the MARKER's verdict with exit 0. The
 # read-only modes can ignore extra positionals harmlessly (they mint nothing); a
 # MINTING mode must not.
+if [ "$DELTA" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]; then
+  echo "record-review.sh: --delta takes <pr> [owner/repo] and nothing else (got ${#POSITIONAL[@]} positional arguments) — a head/verdict here would be silently IGNORED, and this verb deliberately reads BOTH from the record: the reviewed head is what the delta is measured from, so a caller-supplied one could attest a delta nobody reviewed." >&2
+  exit 2
+fi
 if [ "$RECOVER_BODY" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]; then
   echo "record-review.sh: --recover-body takes <pr> [owner/repo] and nothing else (got ${#POSITIONAL[@]} positional arguments) — a head/verdict here would be silently IGNORED, and this verb would mint the marker's verdict while you believed you had chosen one. Recover, then record a fresh verdict as a separate command if one is owed." >&2
   exit 2
@@ -1248,12 +1263,32 @@ PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale
 # gets `head`/`carry` and a ZERO exit while NOTHING was written — the mirror image
 # of accepting a minting flag. It is refused HERE, above the mode dispatch, because
 # `--print-diff-hash` takes the FIRST branch and would otherwise never see it.
-if [ "$FLUSH_PENDING" -eq 1 ] && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ]; }; then
-  echo "record-review.sh: --flush-pending is its own verb and cannot be combined with --check-carry/--recover-body/--print-diff-hash/--print-tier — run one verb at a time." >&2
+# ⛔ --delta IS A MINTING VERB TOO, and it was left OUT of this guard in the first cut — MEASURED
+# by a reviewer against a real fixture: `--delta --print-diff-hash <pr> <repo>` exited 0 with the
+# record UNTOUCHED (the read-only verb answered and exited first), so the lane saw success and no
+# re-attestation happened; `--delta --check-carry` was worse — it answered `fresh … run the
+# code-review skill`, i.e. exactly the paid re-review this verb exists to remove. One verb per line.
+# ⛔ THREE VERBS, ONE GUARD (rebase resolution of #10522 x #10583). `--flush-pending` (#10522) and
+# `--delta` (#10583) landed from opposite sides of the same day, and their flags interlock exactly
+# like the pairs above: `--flush-pending --delta` would deliver the pending marker, exit 0 at the
+# FLUSH block above, and never measure a delta — a successful exit that re-attested nothing, which
+# is the shape this guard exists to refuse. So every minting/read-only pair is refused in ONE place,
+# and the mixed mint pair (`--recover-body --delta`) is refused explicitly: both write a record, and
+# whichever ran second would silently discard the first one's provenance.
+if [ "$FLUSH_PENDING" -eq 1 ] && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ] || [ "$DELTA" -eq 1 ]; }; then
+  echo "record-review.sh: --flush-pending is its own verb and cannot be combined with --check-carry/--recover-body/--delta/--print-diff-hash/--print-tier — run one verb at a time." >&2
   exit 2
 fi
-if [ "$RECOVER_BODY" -eq 1 ] && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; }; then
-  echo "record-review.sh: --recover-body is a MINTING verb and cannot be combined with --check-carry/--print-diff-hash/--print-tier on one command line — the read-only mode answers and exits first, so a successful-looking exit would have written nothing. Run one verb at a time: recover, then ask." >&2
+if [ "$RECOVER_BODY" -eq 1 ] && [ "$DELTA" -eq 1 ]; then
+  echo "record-review.sh: --recover-body and --delta both MINT a record, so one would silently overwrite the other's provenance — run one verb at a time: recover (or delta), then record a fresh verdict separately if one is owed." >&2
+  exit 2
+fi
+if { [ "$RECOVER_BODY" -eq 1 ] || [ "$DELTA" -eq 1 ]; } && { [ "$CHECK_CARRY" -eq 1 ] || [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; }; then
+  if [ "$DELTA" -eq 1 ]; then
+    echo "record-review.sh: --delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier on one command line — the read-only verb answers and exits first, so a successful-looking exit would have written nothing (measured: exit 0 with the record untouched). Run one verb at a time: ask, then delta." >&2
+  else
+    echo "record-review.sh: --recover-body is a MINTING verb and cannot be combined with --check-carry/--print-diff-hash/--print-tier on one command line — the read-only mode answers and exits first, so a successful-looking exit would have written nothing. Run one verb at a time: recover, then ask." >&2
+  fi
   exit 2
 fi
 if [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; then
@@ -1263,7 +1298,7 @@ if [ "$PRINT_DIFF_HASH" -eq 1 ] || [ "$PRINT_TIER" -eq 1 ]; then
   SHA=""
   VERDICT=""
   REPO="${2:-}"
-elif [ "$CHECK_CARRY" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ] || [ "$FLUSH_PENDING" -eq 1 ]; then
+elif [ "$CHECK_CARRY" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ] || [ "$FLUSH_PENDING" -eq 1 ] || [ "$DELTA" -eq 1 ]; then
   # Same shape, same reason. --check-carry answers the lane's question with the
   # merge gate's own predicate instead of leaving it to inference; --recover-body
   # takes <pr> [owner/repo] because a record is identified by BOTH.
@@ -1280,6 +1315,8 @@ elif [ "$CHECK_CARRY" -eq 1 ] || [ "$RECOVER_BODY" -eq 1 ] || [ "$FLUSH_PENDING"
       echo "record-review.sh: --recover-body restores a verdict that was ALREADY recorded, so it takes no --evidence/--force-stale/--expect-head — those describe a review to mint, and accepting them here would let a recovered record claim evidence no reviewer produced. Recover first, then record a fresh verdict separately if one is owed." >&2
     elif [ "$FLUSH_PENDING" -eq 1 ]; then
       echo "record-review.sh: --flush-pending only DELIVERS a marker a previous run already minted — it takes no --evidence/--force-stale/--expect-head, which describe a record to mint. Flush first, then record separately if a verdict is owed." >&2
+    elif [ "$DELTA" -eq 1 ]; then
+      echo "record-review.sh: --delta re-binds the record's OWN verdict onto the live head, so it takes no --evidence/--force-stale/--expect-head — those describe a review to mint, and a delta is precisely the case where NO reviewer ran. If a new review did run, record it normally instead." >&2
     else
       echo "record-review.sh: --check-carry is READ-ONLY (it answers 'would this record carry?' and writes nothing), so it takes no --evidence/--force-stale/--expect-head — those describe a record to mint. Run the mode without them, then record separately if the answer is 'fresh'." >&2
     fi
@@ -1299,7 +1336,7 @@ case "$VERDICT" in
     # `sed 's#^  clean|clean-micro|clean-low) ;;#…#'` anchor keeps matching.
     # --recover-body is here for the same reason (#2872): it takes its verdict
     # from the SIGNED marker it verifies, never from the command line.
-    if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ] && [ "$RECOVER_BODY" -ne 1 ] && [ "$FLUSH_PENDING" -ne 1 ]; then
+    if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ] && [ "$RECOVER_BODY" -ne 1 ] && [ "$FLUSH_PENDING" -ne 1 ] && [ "$DELTA" -ne 1 ]; then
       echo "verdict must be 'clean', 'clean-micro' or 'clean-low'; refusing to record '$VERDICT'" >&2; exit 2
     fi ;;
 esac
@@ -1336,7 +1373,7 @@ fi
 if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
   echo "PR number must be numeric; refusing to record '$PR'" >&2; exit 2
 fi
-if [ "$PRINT_DIFF_HASH" -eq 0 ] && [ "$CHECK_CARRY" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && [ "$RECOVER_BODY" -eq 0 ] && [ "$FLUSH_PENDING" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+if [ "$PRINT_DIFF_HASH" -eq 0 ] && [ "$CHECK_CARRY" -eq 0 ] && [ "$PRINT_TIER" -eq 0 ] && [ "$RECOVER_BODY" -eq 0 ] && [ "$FLUSH_PENDING" -eq 0 ] && [ "$DELTA" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "head_sha must be a full 40-char hex sha (got '${SHA:0:12}…'); refusing to record" >&2; exit 2
 fi
 # tortoise#7391: the sha the CALLER named, kept before any carry re-binds $SHA to the
@@ -1411,6 +1448,114 @@ fi
 if [ -n "$REPO" ] && [ -f "$(marker_pending_file "$REPO" "$PR")" ] && command -v gh >/dev/null 2>&1; then
   flush_pending_markers "$REPO" "$PR" >/dev/null 2>&1 || true
 fi
+
+# ── --delta (#10583): RESOLVE THE DELTA BEFORE ANY SHA/VERDICT VALIDATION ─────
+# THE GAP THIS CLOSES, MEASURED. The predicate for "the head moved, the authored
+# change did not" already exists (`lane_dimension_carry`, clauses A-D). But it is
+# only reachable from the STALE-SHA GUARD, which fires on `$SHA != $CURRENT_HEAD`.
+# A lane that records at the LIVE head — the correct-looking command, and the one
+# the gate's own brief teaches — never enters that branch, so `CARRY_ARM` stays
+# empty, the fresh-clean rule then demands `--evidence`, and the lane concludes
+# "needs review". That is how a conflict-free forward-merge of `main` into 8
+# branches became 8 full re-reviews of code nobody touched (#10583).
+# So this verb supplies the ONE input the caller should not have to remember — the
+# REVIEWED head, read from the record — and then hands the decision to the SAME
+# arms. It adds no predicate: the verdict re-bound is the record's own, the head it
+# is measured FROM is the record's own, and the refusal path is unchanged.
+# ⛔ It is STRICTER than the paths it replaces, never a bypass:
+#   · the previous verdict must be clean-family (a delta re-binds an APPROVAL);
+#   · a previous CARRY that records no PROOF is refused, exactly as `--check-carry` refuses it
+#     (see the `carried|delta` block below — the measured shape is `--delta` saying "Land it"
+#     exit 0 over a record the merge gate answers as `norecord`);
+#   · --evidence/--force-stale/--expect-head are REFUSED (no reviewer ran);
+#   · clauses (A)-(D) and clause (E) all still run, so a measurably red target still refuses, and
+#     so do the lane arm's own requirements (a forward move with no intervening authored non-merge
+#     commit and a clean re-merge of the head). The ARM boundary matters and is stated precisely
+#     rather than claimed wholesale: a rewritten (rebased) head is refused by the LANE arm
+#     (clause B is an ancestry test), while the `diff`/`patch` arms legitimately re-bind when the
+#     ARTIFACT ITSELF is byte-identical across the rewrite — that is exactly the #2982/#1377 class
+#     those two arms exist for, so no ancestry requirement is added to them here.
+if [ "$DELTA" -eq 1 ]; then
+  if [ -z "$REPO" ]; then
+    echo "record-review.sh --delta: no repo resolved — a delta is measured in GIT against the PR's authoritative base, so it needs owner/repo explicitly: record-review.sh --delta $PR owner/repo" >&2
+    exit 2
+  fi
+  D_DIR="$HOME/.pi/agent/reviews"
+  D_FILE="$D_DIR/${REPO%/*}-${REPO#*/}-$PR.json"
+  D_LEGACY="$D_DIR/$PR.json"
+  # Same field reader, same collision rule (an embedded repo that differs is a
+  # DIFFERENT record) and same legacy rule as --check-carry above. It is a COPY, not a shared
+  # definition: `cc_field`/`cc_names_this_repo` are defined further down, inside the
+  # `--check-carry` block, and are not in scope here. Kept in step BY HAND — so a future change to
+  # the gate-mirroring lookup must be made in BOTH places (or this block must be hoisted above the
+  # two verbs); the comment used to claim the lookup was "shared", which it never was.
+  d_field() { command sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$1" 2>/dev/null | command head -1 || true; }
+  D_REC=""
+  if [ -f "$D_FILE" ]; then
+    D_R="$(d_field "$D_FILE" repo)"
+    if [ -z "$D_R" ] || [ "$D_R" = "$REPO" ]; then D_REC="$D_FILE"; fi
+  elif [ -f "$D_LEGACY" ]; then
+    D_R="$(d_field "$D_LEGACY" repo)"
+    if [ -z "$D_R" ] || [ "$D_R" = "$REPO" ]; then D_REC="$D_LEGACY"; fi
+  fi
+  if [ -z "$D_REC" ]; then
+    echo "record-review.sh --delta: no review record for $REPO#$PR — a delta RE-BINDS a verdict that exists; with none there is nothing to re-bind. Run the review, post its verdict, and record it with --evidence comment:<id>." >&2
+    exit 4
+  fi
+  D_HEAD="$(d_field "$D_REC" head_sha)"
+  D_VERDICT="$(d_field "$D_REC" verdict)"
+  D_MINT="$(d_field "$D_REC" mint)"
+  # ⛔ THE GATE'S OWN PROVENANCE PREDICATE, APPLIED HERE TOO (#10177 × #10583). `--check-carry`
+  # treats a `carried`/`delta` record that records NO PROOF as NO RECORD (exit 4). Without this,
+  # `--delta` answered "ALREADY bound … Land it" (exit 0) over exactly that record — MEASURED on a
+  # record at the live head with `mint:"delta"` and neither `carry_arm` nor `evidence`: `--delta`
+  # → rc 0 "Land it", `--check-carry` → `norecord`, rc 4. A successful exit over an artifact the
+  # merge gate rejects is the false PASS this whole file refuses, so the rule is applied BEFORE
+  # the already-bound short circuit and before any git work — the same order `--check-carry` uses,
+  # and the same exit status (4, `norecord`) so the two verbs cannot disagree about one record.
+  case "$D_MINT" in
+    carried|delta)
+      D_ARM_F="$(d_field "$D_REC" carry_arm)"
+      D_EV_F="$(d_field "$D_REC" evidence)"
+      if [ -z "$D_ARM_F" ] || [ -z "$D_EV_F" ]; then
+        echo "⛔ --delta REFUSED for $REPO#$PR: the record is a CARRY (mint='$D_MINT') with NO recorded proof (carry_arm='${D_ARM_F:-}', evidence='${D_EV_F:-}'), so it is NOT a record the merge gate accepts — the READ-ONLY verb --check-carry answers norecord for it, and a delta over it would re-bind a verdict with nothing in the record a reader could check (the tortoise#10677 shape). Nothing was written. Re-record at the current head WITH the review's evidence (--evidence comment:<id>), which mints a record that names what it carried." >&2
+        exit 4
+      fi ;;
+  esac
+  case "$D_HEAD" in *[!0-9a-f]* | "") D_HEAD="" ;; esac
+  if [ "${#D_HEAD}" -ne 40 ]; then
+    echo "record-review.sh --delta: the record for $REPO#$PR names no full 40-hex head_sha, so the head the review happened at is unknown and no delta can be measured from it. Re-record normally." >&2
+    exit 3
+  fi
+  # ⛔ NEVER CLAIM `clean` WHEN THE PREVIOUS VERDICT WAS NOT CLEAN — a delta
+  # re-binds an APPROVAL, and relabelling a non-approval as one is the bypass this
+  # whole mode must never become.
+  case "$D_VERDICT" in
+    clean | clean-micro | clean-low) ;;
+    *)
+      echo "⛔ --delta REFUSED for $REPO#$PR: the record carries verdict '$D_VERDICT', which is not a clean-family verdict. A delta re-binds an APPROVAL onto a new head; it cannot manufacture one. Nothing was written — a full review is owed." >&2
+      exit 3 ;;
+  esac
+  D_LIVE="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
+  case "$D_LIVE" in *[!0-9a-f]*) D_LIVE="" ;; esac
+  if [ "${#D_LIVE}" -ne 40 ]; then
+    echo "record-review.sh --delta: the PR head could not be READ — this is NOT a changed diff and NOT a refusal. RETRY (a contended gh gate or a rate-limit window is far cheaper than a re-review)." >&2
+    exit 3
+  fi
+  if [ "$D_HEAD" = "$D_LIVE" ]; then
+    echo "record-review.sh --delta: the record for $REPO#$PR is ALREADY bound to the live head (${D_HEAD:0:12}…) — nothing is stale and nothing needs re-attestation. Land it." >&2
+    exit 0
+  fi
+  echo "DELTA-PAIR($REPO#$PR) from=${D_HEAD:0:12}… to=${D_LIVE:0:12}… verdict=$D_VERDICT prior-mint=${D_MINT:-none}" >&2
+  DELTA_FROM="$D_HEAD"
+  # The reviewed head and its verdict are now THIS invocation's inputs, so the
+  # stale-sha guard, the arms, clause (E) and the evidence rule all behave exactly
+  # as they do for a hand-passed stale sha — no second code path decides.
+  SHA="$D_HEAD"
+  ORIG_SHA="$D_HEAD"
+  VERDICT="$D_VERDICT"
+fi
+
 # ── Diff binding (#2982, normalized by #1362 D1) ──────────────────────────
 # What a review approves is the DIFF, not the commit sha. Record the sha256 of
 # the PR's three-dot diff and carry it INSIDE the signed marker so the
@@ -2249,15 +2394,24 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   # does NOT cover the live head, so the answer here is `norecord` — what a reader
   # can act on — never `head`.
   CC_MINT="$(cc_field "$CC_REC" mint)"
-  if [ "${CC_MINT:-}" = "carried" ]; then
+  # ⛔ A `mint:"delta"` RECORD IS A CARRY TOO (#10583 × #10177). `--delta` re-binds a
+  # verdict minted at ANOTHER head exactly as a `carried` record does; the only difference
+  # is how the reviewed head was FOUND (read from the record instead of passed in).
+  # Exempting it would reopen the hole #10177 closed — a reader could not tell a delta that
+  # PROVED the artifact unchanged from one that merely asserted it — so it is held to the
+  # same proof: the arm that proved it, and the review artifact the verdict rests on.
+  # (Records minted by an earlier revision of the delta verb predate `carry_arm`/`evidence`
+  # and are caught by exactly this rule, which is why the rule must not be mint-specific.)
+  case "${CC_MINT:-}" in
+  carried|delta)
     CC_ARM_F="$(cc_field "$CC_REC" carry_arm)"
     CC_EV_F="$(cc_field "$CC_REC" evidence)"
     if [ -z "$CC_ARM_F" ] || [ -z "$CC_EV_F" ]; then
       printf 'norecord\t-\t%s\n' "${DIFF_HASH:--}"
-      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… is a CARRY with NO recorded proof (carry_arm='${CC_ARM_F:-}', evidence='${CC_EV_F:-}') — it asserts a verdict minted at another head without recording which arm proved the artifact unchanged, or what review artifact it rests on. Nothing in it shows it covers the head that would merge, so it is treated as NO RECORD (the shape tortoise#10677 produced: a clean verdict carried across 4 files/+178 with no provenance). Remedy: re-record at the current head and let the recorder's carry arms decide — they refuse when the reviewed artifact moved, and record the proof when it did not: record-review.sh $PR <current head> <same verdict> ${REPO:-owner/repo}" >&2
+      echo "record-review.sh --check-carry: the record at ${CC_HEAD:0:12}… is a CARRY with NO recorded proof (mint='${CC_MINT}', carry_arm='${CC_ARM_F:-}', evidence='${CC_EV_F:-}') — it asserts a verdict minted at another head without recording which arm proved the artifact unchanged, or what review artifact it rests on. Nothing in it shows it covers the head that would merge, so it is treated as NO RECORD (the shape tortoise#10677 produced: a clean verdict carried across 4 files/+178 with no provenance). Remedy: re-record at the current head and let the recorder's carry arms decide — they refuse when the reviewed artifact moved, and record the proof when it did not: record-review.sh $PR <current head> <same verdict> ${REPO:-owner/repo}" >&2
       exit 4
-    fi
-  fi
+    fi ;;
+  esac
   # The gate's own identity rule (isDiffSha256 in extensions/review-enforcer):
   # full lowercase 64-hex, and NEVER the sha256 of the empty body — that constant
   # would make every record "match" every PR.
@@ -3094,6 +3248,178 @@ PYC4
   return 0
 }
 
+# ── --delta: the MEASUREMENT half of a delta re-attestation (#10583) ─────────
+# A conflict-free forward-merge of the base moves the HEAD and rewrites the
+# RENDERED diff (hunk context and line numbers), so `diff_sha256` moves and the
+# record reads stale — even though no AUTHORED line changed. The predicate that
+# decides this already exists: `lane_dimension_carry` (clauses A-D) and
+# `patch_dimension_carry` (#1377). ⛔ THIS FUNCTION DECIDES NOTHING. It prints the
+# three facts a delta re-attestation makes its claim on, so the claim can be READ
+# rather than inferred; the arms above remain the single decider.
+#   authored-digest-equal     the #1377 PATCH projection (blob ids, hunk line
+#                             numbers and hunk CONTEXT dropped) of the three-dot
+#                             diff at BOTH heads — the reviewer's lines, unchanged
+#   zero-conflict             a clean re-merge of (from, its base parent) reproduces
+#                             the head's tree exactly ⇒ no resolution was authored
+#   no-new-authored-commits   no non-merge commit between from and to that is not
+#                             base lineage ⇒ a fix commit is authorship, a base
+#                             merge commit is not
+# A measurement is NOT a verdict: a `no` here does not itself refuse (the arms
+# refuse) and a `yes` does not itself carry (the arms carry).
+# ── --delta: WHICH PROOF FIELDS AN ARM MAY CLAIM (#3247) ─────────────────────
+# EACH FIELD NAMES THE PREDICATE THAT MEASURED IT -- never the arm that happened
+# to fire. ONE definition, so the writer and a pin cannot drift apart:
+#   `authored_unchanged` is a claim about the AUTHORED DIGEST, measured only by
+#     `patch` (#1377 projection really equal) and `diff` (rendered bytes really
+#     identical).
+#   `conflicts` is a claim about a RE-MERGE, measured ONLY by `lane` (clause D:
+#     merge-tree rc=0 AND the merged tree equals the head's tree). `patch` never
+#     re-merges, and a `diff` delta taken across a REBASED head has no second
+#     parent -- its own triple prints `zero-conflict=UNMEASURED` -- so neither may
+#     claim it. MEASURED as a bug: keying both fields on `patch|diff` wrote
+#     "conflicts":0 beside a triple that said UNMEASURED.
+delta_proof_fields() { # <arm> -> JSON fragment WITH its trailing comma, or empty
+  case "$1" in
+    patch|diff) printf '"authored_unchanged":true,' ;;
+    lane)       printf '"conflicts":0,' ;;
+  esac
+}
+
+# ── --delta: THE HEAD THE DECIDING ARM MEASURED (#3247 review, P1) ───────────
+# The arms do NOT all start from the record's head. `diff` proves the prior
+# signed marker's `diff=` equals the LIVE digest -- the head it measured is that
+# marker's own (DIFF_ARM_SHA) -- and `patch` re-derives BOTH sides from
+# PRIOR_PATCH_SHA. Only `lane` measures from the record's head (DELTA_FROM).
+# Writing `delta.from=DELTA_FROM` beside `authored_unchanged:true` therefore made
+# the signed record assert an authored-unchanged fact about a pair the run NEVER
+# measured -- MEASURED on a stale record plus a peer-signed marker at a later
+# head: the record said `from=<record head> … authored_unchanged:true` while the
+# same run's triple printed `authored-digest-equal=no` and `commits=2`. That is
+# the identical defect class as the `conflicts` one, on the `from` axis, so the
+# record now names the head the proof covers. `carried_from` still records the
+# RECORD's head, so both facts survive and a reader can tell them apart.
+delta_measured_from() { # <arm> <record-head> <diff-arm-sha> <patch-arm-sha>
+  case "$1" in
+    diff)  [ -n "$3" ] && { printf '%s' "$3"; return 0; } ;;
+    patch) [ -n "$4" ] && { printf '%s' "$4"; return 0; } ;;
+  esac
+  printf '%s' "$2"
+}
+
+delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
+  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp=""
+  local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
+  b="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  case "$b" in *[!0-9a-f]* | "") b="" ;; esac
+  if [ "${#b}" -ne 40 ]; then b=""; fi
+  # (1) authored digest: the #1377 patch projection of the LOCAL three-dot render.
+  patch_projection() { # <sha> -> 64-hex on stdout, rc 1 = uncomputable
+    [ -n "$b" ] && [ -n "$dtmp" ] || return 1
+    command git -c diff.relative=false diff --no-color --no-ext-diff "$b...$1" 2>/dev/null > "$dtmp" || return 1
+    command grep -qE '^diff --git ' "$dtmp" 2>/dev/null || return 1
+    command python3 "$DIFF_NORMALIZER" --patch-only < "$dtmp" > "$dtmp.p" 2>/dev/null || return 1
+    [ -s "$dtmp.p" ] || return 1
+    command openssl dgst -sha256 < "$dtmp.p" | command awk '{print $NF}'
+  }
+  dtmp="$(command mktemp 2>/dev/null || true)"
+  if [ -n "$dtmp" ]; then
+    pd1="$(patch_projection "$from" 2>/dev/null || true)"
+    pd2="$(patch_projection "$to" 2>/dev/null || true)"
+    command rm -f "$dtmp" "$dtmp.p"
+  fi
+  case "$pd1" in *[!0-9a-f]* | "") pd1="" ;; esac
+  case "$pd2" in *[!0-9a-f]* | "") pd2="" ;; esac
+  if [ -n "$pd1" ] && [ -n "$pd2" ]; then
+    if [ "$pd1" = "$pd2" ]; then
+      printf 'authored-digest-equal=yes from=%s to=%s\n' "${pd1:0:12}" "${pd2:0:12}"
+    else
+      printf 'authored-digest-equal=no from=%s to=%s\n' "${pd1:0:12}" "${pd2:0:12}"
+    fi
+  else
+    printf 'authored-digest-equal=UNMEASURED(patch projection uncomputable at %s)\n' "$([ -n "$b" ] && echo 'a head' || echo 'no authoritative base')"
+  fi
+  # (2) zero-conflict: clause (D) stated as a fact.
+  p2="$(command git rev-parse "$to^2" 2>/dev/null || true)"
+  # ⛔ `git rev-parse` ECHOES ITS LITERAL ARGUMENT to stdout on failure (measured:
+  # `rev-parse '<sha>^2'` on a non-merge prints `<sha>^2` and exits 128), so an
+  # ungated p2 makes the "no second parent" branch UNREACHABLE and reports a
+  # merge-tree failure instead of the honest reason. Same 40-hex rule the
+  # authoritative-base read above applies.
+  case "$p2" in *[!0-9a-f]*) p2="" ;; esac
+  [ "${#p2}" -eq 40 ] || p2=""
+  ct="$(command git rev-parse "$to^{tree}" 2>/dev/null || true)"
+  case "$ct" in *[!0-9a-f]*) ct="" ;; esac
+  [ "${#ct}" -eq 40 ] || ct=""
+  if [ -n "$p2" ] && [ -n "$ct" ]; then
+    # rc IS CHECKED HERE TOO: `merge-tree --write-tree` PRINTS A TREE OID ON LINE 1 EVEN WHEN IT
+    # CONFLICTS (exit 1) — the reason clause (D) requires rc=0 — so comparing the oid alone would
+    # report a CONFLICTED re-merge as a clean fact. A conflict here is what proof (c) must show, so
+    # it reports `no` with the conflict named rather than a silent oid comparison.
+    # rc IS CARRIED HERE TOO. `git merge-tree --write-tree` PRINTS A TREE OID ON LINE 1 EVEN WHEN IT
+    # CONFLICTS (exit 1) — the reason clause (D) requires rc=0 — and an earlier cut piped it through
+    # `head -1 || true`, discarding the status (and `${PIPESTATUS[0]}` cannot recover it inside a
+    # command substitution). Capture the OUTPUT, then the STATUS. A conflicted re-merge is a
+    # legitimate `no` (that is proof (c)); only a merge-tree that produced NO tree is UNMEASURED.
+    # ⛔ AND `VAR="$(…)"` IS ONE FAILING COMMAND UNDER `set -e`: a command substitution inside an
+    # assignment propagates its status into `$?`, so the two statements this line used to be
+    # (`mt_raw="$(…)"; m_rc=$?`) let the SHELL abort before `m_rc` was ever read — the second
+    # statement could not run, and `rc=%s` plus this whole `zero-conflict=no … (a RESOLUTION is
+    # authored code)` branch were UNREACHABLE exactly where they were written. MEASURED on a record
+    # naming a NONEXISTENT reviewed head (`git merge-tree` exits 1 with `merge-tree: <sha> - not
+    # something we can merge` and prints no tree oid at all): exit 1 with the
+    # triple truncated after `authored-digest-equal=UNMEASURED(…)`, so `zero-conflict=` and
+    # `no-new-authored-commits=` never printed and an intended refusal came out as a crash. This is the
+    # same `|| rc=$?` idiom clause (D) of `lane_dimension_carry` and the rev-list walk below use. It is
+    # DIAGNOSTIC REACHABILITY ONLY: the arms above remain the decider, and this line's status is
+    # evidence they already acted on — no gate is loosened here.
+    m_rc=0
+    mt_raw="$(command git merge-tree --write-tree "$from" "$p2" 2>/dev/null)" || m_rc=$?
+    # ⛔ NO PIPE HERE, for the reason this file MEASURED at its clean-low reader: under
+    # `set -o pipefail` a `head` that exits after its one line sends SIGPIPE to the writer, the
+    # substitution fails, and `set -e` aborts the script with NO output at all (measured there: 9 of
+    # 40 identical runs produced empty stdout). Here that would delete the very diagnostic the guard
+    # above exists to make reachable. `${x%%$'\n'*}` is the BASH-native first line the file already
+    # uses for this. The other pre-existing `printf … | head` sites in this file are NOT touched here.
+    mt="${mt_raw%%$'\n'*}"
+    if [ -z "$mt" ]; then
+      printf 'zero-conflict=UNMEASURED(merge-tree produced no tree, rc=%s)\n' "$m_rc"
+    elif [ "$mt" = "$ct" ] && [ "$m_rc" -eq 0 ]; then
+      printf 'zero-conflict=yes merged-tree=%s head-tree=%s\n' "${mt:0:12}" "${ct:0:12}"
+    else
+      printf 'zero-conflict=no merged-tree=%s head-tree=%s rc=%s (a RESOLUTION is authored code)\n' "${mt:0:12}" "${ct:0:12}" "$m_rc"
+    fi
+  else
+    printf 'zero-conflict=UNMEASURED(no second parent on %s — not a forward merge)\n' "${to:0:12}"
+  fi
+  # (3) no new authored commits: clause (C2) stated as a fact.
+  if [ -n "$b" ]; then
+    # ⛔ THE WALK'S STATUS IS CHECKED, exactly as clause (C2) checks its own: a failed walk
+    # prints NOTHING, and "nothing" here would read as "no authored commits" — the fail-open
+    # direction, and this is the path where the reviewed head may genuinely be absent (a
+    # cross-box record, a pruned or force-pushed head). MEASURED by a reviewer against a record
+    # naming a nonexistent head: before this guard the triple printed `yes commits=0` about a head
+    # that does not exist, next to two honest UNMEASURED lines.
+    n_rc=0
+    extra="$(command git rev-list --no-merges "$from..$to" --not "$b" 2>/dev/null)" || n_rc=$?
+    if [ "$n_rc" -ne 0 ]; then
+      printf 'no-new-authored-commits=UNMEASURED(rev-list failed rc=%s)\n' "$n_rc"
+      n=""
+    else
+    n="$(printf '%s\n' "$extra" | command grep -c . || true)"
+    fi
+    if [ -z "$n" ]; then
+      : # already reported UNMEASURED above
+    elif [ "$n" -eq 0 ]; then
+      printf 'no-new-authored-commits=yes commits=0\n'
+    else
+      printf 'no-new-authored-commits=no commits=%s %s\n' "${n:-0}" "$(printf '%s' "$extra" | command head -3 | command tr '\n' ',' | command sed 's/,$//')"
+    fi
+  else
+    printf 'no-new-authored-commits=UNMEASURED(no authoritative base read)\n'
+  fi
+  return 0
+}
+
 # ── Clause (E) of the carry contract (#1575): THE TARGET HEAD IS NOT MEASURABLY RED ──
 # A carry re-binds a signed verdict to a NEW head. Clauses (A)-(D) and the #2982
 # byte-identity test are all COMMIT-TOPOLOGY tests: they prove the LANE's artifact is
@@ -3340,6 +3666,16 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         exit 3
         fi
       fi
+      if [ "$DELTA" -eq 1 ]; then
+        # ⛔ MEASURE AND REPORT THE PAIR THE ARM PROVED (#3247 review, P1). `delta_measured_from`
+        # names the head the decider actually measured (see its definition), so the triple below is
+        # evidence for the SAME pair the record will claim -- and the record write at the bottom of
+        # this file uses the same function, so the diagnostic and the signed artifact cannot diverge.
+        DELTA_MEASURED_FROM="$(delta_measured_from "$CARRY_ARM" "$DELTA_FROM" "$DIFF_ARM_SHA" "$PATCH_ARM_SHA")"
+        echo "DELTA-TRIPLE($REPO#$PR) from=${DELTA_MEASURED_FROM:0:12}… to=${CURRENT_HEAD:0:12}… (arm=$CARRY_ARM)" >&2
+        delta_measure "$DELTA_MEASURED_FROM" "$CURRENT_HEAD" >&2
+        echo "DELTA-ARM=$CARRY_ARM (the arm above is the decider; the triple is the evidence it decided on)" >&2
+      fi
       if [ "$CARRY_ARM" = "diff" ]; then
         echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
       elif [ "$CARRY_ARM" = "patch" ]; then
@@ -3380,6 +3716,12 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       esac
       CARRY_DELTA_DIFF="$(carry_delta_digest "$ORIG_SHA" "$CURRENT_HEAD" 2>/dev/null || true)"
       SHA="$CURRENT_HEAD"
+    elif [ "$FORCE_STALE" -ne 1 ] && [ "$DELTA" -eq 1 ]; then
+      echo "⛔ --delta REFUSED for $REPO#$PR: the authored change is NOT provably unchanged between ${DELTA_FROM:0:12}… and ${CURRENT_HEAD:0:12}…, so no delta can be re-attested. Nothing was written." >&2
+      echo "DELTA-TRIPLE($REPO#$PR) from=${DELTA_FROM:0:12}… to=${CURRENT_HEAD:0:12}…" >&2
+      delta_measure "$DELTA_FROM" "$CURRENT_HEAD" >&2
+      echo "   Read the triple: 'no' on ANY line is a fresh review (a changed authored digest, a conflict resolution, or a new authored commit each means a reviewer has not seen this); 'UNMEASURED' is not a 'yes'. A full review is owed — dispatch it, then record with --evidence comment:<id>." >&2
+      exit 3
     elif [ "$FORCE_STALE" -ne 1 ]; then
       echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
       echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
@@ -3410,6 +3752,42 @@ if [ -n "$EXPECT_HEAD" ] && [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne
     echo "   Resolved head: ${CURRENT_HEAD:-<unavailable: no \$REPO, or gh missing/failing>}. A pin exists only if it is checked; recording without checking it would make --expect-head decorative." >&2
     exit 3
   fi
+fi
+
+# ── #10583 — A `--delta` THAT MINTED NOTHING IS NOT A SUCCESS ───────────────
+# `--delta` is the ONE mode whose contract is "re-attest the record's verdict onto
+# the live head". Every delta refusal lives INSIDE the stale-sha chain
+# (`elif [ "$CURRENT_HEAD" != "$SHA" ]`), so a path that never enters that chain
+# runs NO delta predicate at all — and the record write below is UNCONDITIONAL.
+# MEASURED (fresh-context review of 426ac51b, reproduced against the real script
+# with a stub gh whose second `.head.sha` read fails):
+#
+#   record BEFORE: {... "mint":"fresh", "verdict":"clean-micro", "evidence":"comment:9000001" ...}
+#   rc=0, and AFTER: {... "mint":"fresh", "verdict":"clean-micro" ...}   ← evidence GONE
+#   stderr: "stale-sha guard: could not fetch the current head … continuing fail-open"
+#           "review evidence posted to … as a durable comment"
+#
+# Three claims that run never made, on a SUCCESSFUL exit: `mint:"fresh"` (no
+# reviewer ran — delta mode REFUSES --evidence, :1319), the prior record's
+# `evidence` (the one pointer tortoise#7391/#10177 exist to preserve) is DELETED,
+# and a signed marker is PATCHed. The tortoise#7391 gate below cannot catch it
+# because that gate is keyed on `VERDICT = clean`, and `clean-micro`/`clean-low`
+# are clean-FAMILY but not `clean` — so the two verdicts a delta most often
+# carries are exactly the two it does not cover. The racing-read variant (the
+# second read returns the record's own head) skips the same chain and lands the
+# same way, which is the #784 "pair that never coexisted" shape: a stale
+# `head_sha` beside the live diff, which `--check-carry` then answers `carry` for.
+#
+# So state the post-condition the mode implies: a delta that reached the record
+# write WITHOUT a carry arm re-attested NOTHING, and a no-op that exits 0 while
+# rewriting the record is the false PASS this whole file exists to refuse. It is
+# a refusal at 3, matching the delta block's own unreadable-head answer (also 3,
+# "RETRY"), because a transient gh failure must be retried, never recorded.
+if [ "$DELTA" -eq 1 ] && [ -z "$CARRY_ARM" ]; then
+  echo "⛔ --delta REFUSED for ${REPO:-<no-repo>}#${PR:-?}: no carry arm ran, so NOTHING was re-attested — refusing to write a record. (no record written, no marker posted)" >&2
+  echo "   A --delta whose head or diff could not be MEASURED is not a changed artifact and not an approval: the live head read did not put this invocation through the carry chain, so no arm could prove the authored change unchanged. Writing here would mint a fresh record for a head nothing measured, and would drop the prior record's review artifact." >&2
+  echo "   Remedy: RETRY (a contended gh gate or a rate-limit window is far cheaper than a re-review). If the retry keeps failing, review the current head and record it fresh with --evidence comment:<id>." >&2
+  exit 3
 fi
 
 # ── tortoise#7391 — a FRESH `clean` record must name a review artifact ───────────
@@ -3780,6 +4158,41 @@ fi
 MINT_FIELDS="\"mint\":\"fresh\","
 if [ -n "$CARRY_ARM" ]; then
   MINT_FIELDS="\"mint\":\"carried\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+  # #10583 — a DELTA is its own mint state. It is NOT `fresh` (no reviewer ran at
+  # this head) and it must not be reported as a plain `carried` either: a carrier is
+  # a rebase/base-move whose provenance is unrecorded, while this one carries a
+  # CLAIM about the authored change that a reader must be able to check. So the
+  # record names the pair, and the delta it attests.
+  # ⛔ NAME WHAT THE ARM PROVED, not what would read well. A reviewer measured that the
+  # `authored_unchanged:true` this field used to hardcode is contradicted by the SAME run's own
+  # triple on the commonest path: `arm:"lane"` proves the LANE dimension (forward move, no
+  # intervening authored non-merge commit, a clean re-merge reproduces the head tree) and the
+  # rendered patch may legitimately differ, so `authored-digest-equal` prints `no`/`UNMEASURED`
+  # there. So `proved` states which dimension carried.
+  # EACH FIELD NAMES THE PREDICATE THAT MEASURED IT -- never the arm that happened to fire.
+  # The mapping itself now lives in ONE place, `delta_proof_fields` (defined beside the delta
+  # helpers above), so the writer and its pin cannot drift: `authored_unchanged` is a claim about
+  # the AUTHORED DIGEST (only `patch`/`diff` measure it) and `conflicts` is a claim about a
+  # RE-MERGE (only `lane` recomputes one, clause D). Keying BOTH on `patch|diff` was MEASURED as
+  # a lie in one direction -- a `diff`-arm delta across a REBASED head prints
+  # `zero-conflict=UNMEASURED` in its own triple while the record asserted `"conflicts":0`.
+  # ⛔ AND THE SAME RULE APPLIES TO `from`, not just to these two fields (#3247 review, P1):
+  # the arms do not all measure from the RECORD's head, so `from` is
+  # `${DELTA_MEASURED_FROM:-$DELTA_FROM}` -- set by `delta_measured_from` on the arm that
+  # actually carried. Writing the record's head there made a signed record claim an
+  # authored-unchanged fact about a pair the run never measured (MEASURED: triple said
+  # `authored-digest-equal=no commits=2` while the record said `authored_unchanged:true`).
+  # `proved` always names the dimension that carried; `carried_from` keeps the RECORD's head.
+  if [ "$DELTA" -eq 1 ]; then
+    DIMENSION="none"
+    case "$CARRY_ARM" in
+      lane) DIMENSION="lane";;
+      patch) DIMENSION="patch";;
+      diff) DIMENSION="diff-bytes";;
+    esac
+    DELTA_PROOF="$(delta_proof_fields "$CARRY_ARM")"
+    MINT_FIELDS="\"mint\":\"delta\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"delta\":{\"from\":\"${DELTA_MEASURED_FROM:-$DELTA_FROM}\",\"to\":\"$SHA\",\"proved\":\"$DIMENSION\",${DELTA_PROOF}\"arm\":\"$CARRY_ARM\"},"
+  fi
 fi
 EVIDENCE_FIELD=""
 if [ -n "$EVIDENCE_VERIFIED" ]; then
@@ -3822,7 +4235,7 @@ if [ -n "$CARRY_ARM" ]; then
   if [ -f "$FILE" ] && grep -q '"mint":"recovered-body"' "$FILE"; then PRIOR_RECOVERED=1; fi
   if [ "$PRIOR_RECOVERED" -eq 0 ] && [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
     REVIEWED_AT="$PRIOR_AT"
-    echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=carried, carried_from=${ORIG_SHA:0:12}…)" >&2
+    echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=$([ "$DELTA" -eq 1 ] && echo delta || echo carried), carried_from=${ORIG_SHA:0:12}…)" >&2
   else
     if [ "$PRIOR_RECOVERED" -eq 1 ]; then
       echo "⚠️ tortoise#7391 / #2872: CARRIED record for ${REPO:-<no-repo>}#$PR whose predecessor was RECOVERED from a marker — that record's reviewed_at was a LOWER BOUND (the head commit's date), not a mint time, so it is NOT inherited. reviewed_at is the CARRY time; \`mint\`/\`carried_at\` say so." >&2
