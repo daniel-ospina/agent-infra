@@ -4157,8 +4157,11 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # on merge-one.sh's per-head review budget, so the SAME limit feeds a `-ge` in a SECOND file — an
 # uncoerced copy there would let a typo run the review budget unbounded, which is the loop the bound
 # exists to prevent).
-[ "$_ngrd_n" = "19" ] && rcn=0 || { rcn=1; echo "      expected 19 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 19 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 19 -> 20 for the LANDING FLOOR (2026-11-03): `LANDING_FLOOR` feeds `[ "${OPEN_N}" -ge "$LF_M" ]` at
+# a dispatch decision, so an uncoerced typo would either disarm the WIP limit or error the test and
+# OPEN the gate — the same fail-open class as every coercion above.
+[ "$_ngrd_n" = "20" ] && rcn=0 || { rcn=1; echo "      expected 20 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 20 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
