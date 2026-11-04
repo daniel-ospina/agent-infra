@@ -338,18 +338,19 @@ ruling that there is no lane ceiling tied to cpu count.
   tool therefore **refuses any value under 360 min** (the GitHub-hosted 6 h job ceiling) with
   `cannot-measure why=tmp-max-age-too-small`, refusing nothing at or above it; on a long-job box you RAISE
   the bound above your longest job, and `0`/`1` cannot reach `find -mmin`. A `.env` that names a TMPDIR
-  still wins — it is sourced after the export. `status` reports a missing root as `defect tmpdir-missing`
-  (rc 3) and the printed `restart` recreates it.
+  still wins: the **listener** applies it (`LoadAndSetEnv()` in `Runner.Listener`, key = everything before
+  the first `=`) before any job starts — neither `run.sh` nor `run-helper.sh` reads `.env`, so a **bare**
+  `TMPDIR=/x` line is what the runner honours, while an `export TMPDIR=/x` line sets a variable literally
+  named `export TMPDIR` and leaves `TMPDIR` alone. `status` reports a missing root as `defect
+  tmpdir-missing` (rc 3) and the printed `restart` recreates it.
   ⛔ A listener that is ALREADY RUNNING keeps the env it was exec'd with, and **a bare unit restart does
   not confer the private root**: the export lives only in `start_listener`, so a unit restart carries
-  only what the unit's own environment (or an `export TMPDIR=…` line in `.env`) provides — and a BARE
-  `TMPDIR=…` line in `.env` reaches the listener *only* because `start_listener` exported it first, so a
-  unit restart drops it entirely (measured: sourcing a bare assignment sets it in the sourcing shell,
-  not in the child). For an instance with no `.env` the unit restart hands the listener no TMPDIR at
-  all — jobs silently fall back to the box's shared temp dir while `status` grades the layout and reads
-  clean. The remedies that work: start the listener through this tool (stop it, then `restart --name <n>`
-  on the now-dead listener — `add` is **not** one: an already-registered name is refused `rc 4 use
-  restart`), or give the unit `Environment=TMPDIR=$instance/_tmp` (plus `TMP`/`TEMP`).
+  only what the unit's own environment — or a **bare** `TMPDIR=` line the listener itself applies —
+  provides. An instance with NO TMPDIR in `.env` gets none from a unit restart: jobs silently fall back
+  to the box's shared temp dir while `status` grades the layout and reads clean. The remedies that work:
+  start the listener through this tool (stop it, then `restart --name <n>` on the now-dead listener —
+  `add` is **not** one: an already-registered name is refused `rc 4 use restart`), or give the unit
+  `Environment=TMPDIR=$instance/_tmp` (plus `TMP`/`TEMP`).
 - **The pool is every LIVE runner ON THE BOX, not every directory under one root.** `RUNNER_ROOT` must be
 the directory that **CONTAINS** the instance dirs (one level above them) — its default
 `/tmp/actions-runner` is where this tool puts what it creates, and on a hand-provisioned box the

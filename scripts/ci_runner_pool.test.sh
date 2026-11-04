@@ -294,10 +294,15 @@ cat >"$TEMPLATE/run.sh" <<'STUB'
 SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
-# ⛔ GITHUB'S run.sh SOURCES `.env` — so this stub is the ONE place the real contract is observable:
-#   whatever `.env` names becomes the environment the listener and every job step run under. A stub
-#   that skipped it would pass while the SHIPPED launcher left a TMPDIR nobody created, because the
-#   only thing that consumes `TMPDIR=` is the file this stub was ignoring (agent-infra#2937).
+# ⛔ THE LISTENER APPLIES `.env` ITSELF — it does NOT get sourced by `run.sh` (#7815 review, round 3:
+#   neither `run.sh` nor `run-helper.sh.template` reads `.env`; `Runner.Listener`'s `LoadAndSetEnv()`
+#   parses it in-process, key = everything before the FIRST `=`). This stub models that by SOURCING it,
+#   which is faithful for every bare `TMPDIR=/x` line — the form the shipped tool writes and the only form
+#   the runner honours — and is deliberately NOT extended to model the `export ` prefix's real behaviour
+#   (a variable literally named `export TMPDIR`), because on the path this suite exercises the tool
+#   exports the same value it parsed, so the listener's observed env is identical either way. The
+#   divergence is real and only shows on a listener started by a UNIT; it is documented in the shipped
+#   header's UNIT RESTART note and in docs/ops/fleet-capacity.md.
 if [ -f .env ]; then . ./.env; fi
 # ⛔ AND IT RECORDS WHAT IT INHERITED, from INSIDE the listener, at the instant the real run.sh would
 #   hand that env to a job. `absent` here is precisely the state in which every job on the instance
@@ -1743,6 +1748,21 @@ out="$(RUNNER_TMP_MAX_AGE_MIN=100000 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run res
 assert_omits "$out" "swept tmpdir-root=" "a wider RUNNER_TMP_MAX_AGE_MIN sweeps nothing"
 assert_file "$root_b/stale-2" "so the SAME file survives the wider bound — the operand is the threshold"
 rm -f "$root_b/stale-2"
+# ⛔ A DELETION THAT FAILED IS NAMED, NOT SWALLOWED (#7815 review, round 3). `rm -rf … 2>/dev/null` used
+#   to drop the miss: a `chmod 555` victim is selected by `find`, `rm` returns 1, and the line printed
+#   `removed=0` — i.e. NOTHING at all — so `restart` read clean while the root grew without bound. The
+#   entry here is unreachable by `rm` (its owner cannot delete its child), and the assertions are
+#   two-sided: the sweep must count it AND the start must still succeed (one undeletable entry is not a
+#   reason to leave a box without a listener).
+mkdir -p "$root_b/locked/inner"; : >"$root_b/locked/inner/x"
+touch -t 200001010000 "$root_b/locked" "$root_b/locked/inner" "$root_b/locked/inner/x"
+chmod 555 "$root_b/locked" "$root_b/locked/inner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-iso-b 2>&1)"
+assert_eq "$?" "0" "an undeletable stale entry does not fail the start"
+assert_contains "$out" "failed=1" "but the sweep COUNTS what it could not remove (removed=0 alone read as clean)"
+assert_contains "$out" "cannot-measure why=tmpdir-sweep-incomplete" "and says the root is therefore not bounded"
+assert_dir "$root_b/locked" "the entry it could not remove is still there (the count is not a claim)"
+chmod 755 "$root_b/locked/inner" "$root_b/locked"; rm -rf "$root_b/locked"
 
 # ── a MISSING private root is a DEFECT (rc 3) and the printed remedy restores it ──────────
 # ⛔ The shape that does the damage: LIVE listener, GitHub says `online`, and the TMPDIR it hands to
@@ -1815,6 +1835,12 @@ FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$ISOLOG" run restart --n
 assert_contains "$(cat "$ISOLOG")" "present $root_m" "the SHIPPED launcher gives the same instance its private root (the assertion is live)"
 
 # ── the sweep's bound is a VALIDATED operand (a typo must not disable it silently) ───────
+# ⛔ BACK IN THE POOL THE ENTRIES LIVE IN (#7815 review, round 3). `fresh_pool tmpmutex` above moved
+#   `RUNNER_ROOT` to `$T/root-tmpmutex`, where `pi-runner-iso-b` does not exist — so a `restart` here
+#   would have resolved a DIFFERENT (absent) instance and the "nothing was swept" assertions below could
+#   not have failed under any implementation. The stale entries are in `$root_b`, so the pass has to run
+#   against the pool that holds it.
+RUNNER_ROOT="$T/root-tmpiso"; export RUNNER_ROOT
 out="$(RUNNER_TMP_MAX_AGE_MIN=08 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run status)"
 assert_eq "$?" "2" "a zero-padded RUNNER_TMP_MAX_AGE_MIN is cannot-measure (rc 2), never a fatal sweep"
 assert_contains "$out" "cannot-measure why=tmp-max-age-unreadable" "and it names the operand"
