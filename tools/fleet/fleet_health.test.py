@@ -27,9 +27,10 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
   * neuter the lane-census reconciliation      -> 5 paired CENSUS reds (the fifth is the
                                                  exit-code check), plus collateral reds in the
-                                                 other census checks (measured 24 total, up from
-                                                 14 when the stale-roster and UNVERIFIED arms
-                                                 were pinned)
+                                                 other census checks — **26 CENSUS reds**
+                                                 (counted census-only; the suite's total also
+                                                 carries the ambient HARNESS failure, which is
+                                                 red on the UNMUTATED module too)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -52,14 +53,16 @@ patched for the duration of a leg and restored in a `finally`, so nothing touche
 or the real launchd.
 
 ⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
-(three `_drive` arms), and `main()` reaches the REAL process table up to THREE times —
+(**five** `_drive` arms), and `main()` reaches the REAL process table up to THREE times —
 `cputime_secs(os.getpid())` for the lane row, `_observed(os.getpid(), ...)` ->
 `scripts/lib/pid-identity.sh probe`, and a second `cputime_secs(pid)` from the STATE snapshot write
-that the enumeration runs for every recorded pid. All are read-only and
-about THIS process, and the census verdicts the leg asserts are independent of what they return
-(the arm it pins is `pidStartSeconds`-absent, which abstains regardless). But a host with a
-removed `ps` would make the abstaining-record arm abstain for a host-level reason instead of the
-one it names, and the earlier "touches no real process table" guarantee would have hidden that.
+that the enumeration runs for every recorded pid. All are read-only and about THIS process. The
+abstaining-record arm is independent of what they return (its lanes are `pidStartSeconds`-absent,
+which abstains regardless), but the four ALL-DEAD arms added later are NOT: each turns on
+`_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on a usable `ps`
+for a nonexistent pid. That dependency is named by the `CENSUS: PRECONDITION:` check, so a
+host-level `ps` failure surfaces AS THAT CHECK rather than as a silent pass — and the earlier
+"touches no real process table" guarantee would have hidden both facts.
 """
 
 from __future__ import annotations
@@ -568,6 +571,16 @@ def leg_lane_census(mod):
         # which is a state to NAME (R2: "no clean claim"), never one to call clean.
         unverified = fn(0, 7, None, 7)
         check(bool(unverified) and "UNVERIFIED" in unverified, PREDICATE[7])
+        # ⛔ AND THE DIAGNOSIS MUST NOT CONTRADICT THE ROWS IT SITS BENEATH (review cycle 9,
+        # finding 1). Gateing that arm on `established >= roster_size` alone made it fire with SOME
+        # lanes ALIVE, printing "all 7 rostered lanes are DEAD/absent … an idle fleet and a stale
+        # roster are indistinguishable" under a `life running` row — two causes the state excludes.
+        mixed = fn(1, 6, None, 7)
+        check(bool(mixed) and "UNVERIFIED" in mixed and "1 of the 7 rostered lanes is alive" in mixed,
+              "CENSUS: a PARTLY-live roster over an UNREADABLE table names the live lane")
+        check(bool(mixed) and "all 7 rostered lanes are DEAD" not in mixed
+              and "idle fleet" not in mixed,
+              "CENSUS: …and does not claim an all-dead box or an idle fleet it can see is false")
 
     # ⛔ THE PRODUCER'S OWN CONTRACT — `pi_process_count()` — was stubbed by this leg and pinned
     # by nothing, the same producer-contract gap this lane closed for `beta-progress.gh()`: a
@@ -614,6 +627,28 @@ def leg_lane_census(mod):
             check(counter() == 2, PRODUCER[2])
     finally:
         mod.subprocess.run = saved_run
+
+    # ── the note -> exit-line pairing, pinned as a PREDICATE (cycles 7, 8, 9 each found a word
+    # or a tail that described a state its note did not) ───────────────────────────────────────────
+    pair = getattr(mod, "census_exit_verdict", None)
+    PAIR = (
+        "EXITLINE: a STALE ROSTER note says no rostered lane is a running pi process",
+        "EXITLINE: an UNVERIFIED note over a PARTLY-live roster says the population cannot be reconciled",
+        "EXITLINE: …and an UNVERIFIED note over an all-dead roster keeps the idle-fleet wording",
+        "EXITLINE: a partial MISMATCH reads INCOMPLETE — rows without a verdict are not a verdict",
+    )
+    if pair is None:
+        for msg in PAIR:
+            bad(msg)
+    else:
+        w, t = pair("LANE CENSUS STALE ROSTER: x", 0, 7, 7)
+        check(w == "STALE ROSTER" and "running pi process" in t, PAIR[0])
+        w, t = pair("LANE CENSUS UNVERIFIED: x", 1, 7, 7)
+        check(w == "UNVERIFIED" and "cannot be reconciled" in t and "idle fleet" not in t, PAIR[1])
+        w, t = pair("LANE CENSUS UNVERIFIED: x", 0, 7, 7)
+        check(w == "UNVERIFIED" and "idle fleet" in t, PAIR[2])
+        w, t = pair("LANE CENSUS MISMATCH: x", 0, 1, 7)
+        check(w == "INCOMPLETE" and "rows without a verdict" in t, PAIR[3])
 
     # ── main() end-to-end over a read-only store holding none of the roster ──
     def _drive(pi_stub, records=None):

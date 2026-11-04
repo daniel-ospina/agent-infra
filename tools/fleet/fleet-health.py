@@ -168,11 +168,13 @@ def lane_census(alive, dead, pi_count, roster_size):
     ended pid): seven `PID DEAD` rows, NO census line, `✅ no suspects`, exit 0 from the lane section
     — while `ps` showed ~18 live `pi` processes. So the population decides, not the dead count.
 
-    ⛔ SILENT ARMS, EXHAUSTIVELY: `alive == roster_size` (every lane is a live bound incarnation); or
-    every lane conclusive with at least one attributed alive (the roster accounts for at least one
-    running process, so the population is not contradicted); or every lane conclusive and a
-    MEASURED-EMPTY population (nothing is running, so an inconclusive roster cannot mislead); or
-    `pi_count <= 0` on an inconclusive roster (same reason). Nothing else is silent.
+    ⛔ SILENT ARMS, EXHAUSTIVELY: `alive == roster_size` (every lane is a live bound incarnation,
+    whatever the process table says); or every lane conclusive with at least one attributed alive
+    AND a MEASURED population (the roster accounts for at least one running process, so it is not
+    contradicted); or every lane conclusive over a MEASURED-EMPTY population (nothing is running,
+    so a resolved roster cannot mislead); or `pi_count <= 0` on an inconclusive roster (same
+    reason). Nothing else is silent — in particular a conclusive-with-a-live-lane roster over an
+    UNREADABLE table is UNVERIFIED, not silent (see the arm below).
 
     ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
     table cannot be read, returning None would render that state identically to `pi_count == 0`
@@ -188,6 +190,13 @@ def lane_census(alive, dead, pi_count, roster_size):
     a direct violation of R2 ("`pi_count is None` ⇒ abstain: no mismatch, no clean claim, never
     `0`"). An all-dead roster over an unreadable table genuinely cannot be distinguished from an
     idle fleet, so it now says exactly that instead of claiming the clean one.
+
+    ⛔ …AND THE DIAGNOSIS MUST NOT CONTRADICT THE ROWS IT SITS BENEATH (review cycle 9, finding 1).
+    That arm was gated on `established >= roster_size`, so it also fired when SOME lanes were ALIVE
+    and printed "all 7 rostered lanes are DEAD/absent … an idle fleet and a stale roster are
+    indistinguishable" directly under a `life running` row — naming the two causes the state
+    excludes. The alarm was right; the sentence was false. There are two shapes of UNVERIFIED and
+    each names its own.
     """
     established = alive + dead
     if alive >= roster_size:
@@ -203,9 +212,14 @@ def lane_census(alive, dead, pi_count, roster_size):
         #   * some lane alive            -> the roster accounts for at least one running process;
         #   * every lane DEAD while pi runs -> a STALE ROSTER (this is the branch cycle 6 lacked).
         if pi_count is None:
-            return ("LANE CENSUS UNVERIFIED: all %d rostered lanes are DEAD/absent and the process "
-                    "table could not be read — an idle fleet and a stale roster are "
-                    "indistinguishable here, so this is NOT a clean result" % roster_size)
+            if not alive:
+                return ("LANE CENSUS UNVERIFIED: all %d rostered lanes are DEAD/absent and the "
+                        "process table could not be read — an idle fleet and a stale roster are "
+                        "indistinguishable here, so this is NOT a clean result" % roster_size)
+            return ("LANE CENSUS UNVERIFIED: %d of the %d rostered lanes is alive and %d are "
+                    "DEAD/absent, but the process table could not be read — the population "
+                    "cannot be reconciled against the roster, so this is NOT a clean result"
+                    % (alive, roster_size, dead))
         if pi_count <= 0:
             return None
         if alive:
@@ -227,6 +241,31 @@ def lane_census(alive, dead, pi_count, roster_size):
             "its lanes are unattributable, so every row without a verdict is UNMEASURED "
             "(not dead, and NOT a clean result)"
             % (pi_count, established, roster_size, alive, dead))
+
+
+
+def census_exit_verdict(note, attributed, established, roster_size):
+    """The exit line's `(word, tail)` for a census note.
+
+    ⛔ THE LABEL MUST BE DERIVED FROM THE NOTE, NOT FROM A COUNT THAT HAPPENS TO CORRELATE WITH IT
+    (review cycles 7, 8 and 9 — three consecutive rounds found a word or a tail that described a
+    state the note did not). `attributed + dead >= roster_size` was such a correlation: STALE ROSTER
+    was the only note reachable with a complete roster *until* UNVERIFIED became a second one. A
+    pure function is used so the pairing is PINNED directly, instead of only being reachable through
+    a live-pid fixture.
+    """
+    if note.startswith("LANE CENSUS STALE ROSTER"):
+        return ("STALE ROSTER", "no rostered lane is a running pi process")
+    if note.startswith("LANE CENSUS UNVERIFIED"):
+        if attributed:
+            # Some lanes ARE live: do not claim the box is dark, and do not claim it is idle.
+            return ("UNVERIFIED", "the process table could not be read, so the population cannot "
+                                  "be reconciled against the roster")
+        return ("UNVERIFIED", "the process table could not be read, so an idle fleet and a stale "
+                              "roster are indistinguishable here")
+    # MISMATCH (partial census) and UNRECONCILED (inconclusive roster, unreadable table) both leave
+    # rows without a verdict, which is exactly what INCOMPLETE says.
+    return ("INCOMPLETE", "rows without a verdict are not a verdict")
 
 
 def walk_records(obj, out):
@@ -906,20 +945,11 @@ def main():
         # lanes WERE established — telling an operator the census established nothing when it had.
         # ⛔ AND IT MUST NOT SAY "INCOMPLETE" ABOUT A COMPLETE ROSTER (review cycle 7, finding 1):
         # the all-dead arm reaches here with EVERY lane conclusive, so "INCOMPLETE — rows without a
-        # verdict" was false twice over.
-        # ⛔ AND THE WORD FOLLOWS THE NOTE'S KIND, NOT THE ESTABLISHED COUNT (review cycle 8,
-        # finding 1's follow-on): an all-dead roster over an UNREADABLE table now reaches here with
-        # `established == len(LANES)` too, and the count alone would label it STALE ROSTER — "no
-        # rostered lane is a running pi process", a claim that state cannot make. Every arm still
-        # exits 1; only the description differs.
+        # verdict" was false twice over. The word and the tail come from `census_exit_verdict`, which
+        # derives them from the NOTE rather than from `established` — a count that only correlated
+        # with the note while STALE ROSTER was the sole complete-roster arm (review cycle 9).
         established = attributed + dead
-        if census_note.startswith("LANE CENSUS STALE ROSTER"):
-            word, tail = "STALE ROSTER", "no rostered lane is a running pi process"
-        elif census_note.startswith("LANE CENSUS UNVERIFIED"):
-            word, tail = "UNVERIFIED", ("the process table could not be read, so an idle fleet "
-                                        "and a stale roster are indistinguishable here")
-        else:
-            word, tail = "INCOMPLETE", "rows without a verdict are not a verdict"
+        word, tail = census_exit_verdict(census_note, attributed, established, len(LANES))
         print("⚠️  lane census %s (%d of %d rostered lanes conclusive, %d attributed alive) — %s"
               % (word, established, len(LANES), attributed, tail))
         return 1
