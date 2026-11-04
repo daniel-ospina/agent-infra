@@ -409,16 +409,44 @@ function odd_trailing_bs(s,   n, k) {
   while (n - k >= 1 && substr(s, n - k, 1) == "\\") k++
   return (k % 2)
 }
+# ── ONE LOGICAL LINE = the physical lines bash joins with a backslash-newline ─────────────────────
+# The whole-line-comment test is applied to the unit's FIRST physical line, BEFORE the join: in bash a
+# `#` comment ends at the NEWLINE, so a comment line ending in `\` does NOT continue into the next line
+# and the next line really executes. Joining first and then testing `^#` swallowed it — measured, `# note
+# \` followed by `AGENT_NEW_GATE_REFUSED=83` read GREEN with 0 rows while bash assigned 83.
+# And a unit left DANGLING at end of file is SCANNED, not dropped: bash discards the trailing backslash
+# and runs the line, so `AGENT_NEW_GATE_REFUSED=83\` as a file's last line assigns 83 (measured). The
+# accumulator is therefore flushed from END and before the per-file reset, through the SAME function the
+# main rule uses — one scanner, so a unit can never be treated differently according to where it sits.
 {
   if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
-  if (FNR == 1) { ACC = ""; ACCFNR = 0 }
-  # join a backslash-continuation FIRST: the line awk sees is not the line bash runs (see odd_trailing_bs)
+  if (FNR == 1) { flush_unit(); ACC = ""; ACCFNR = 0 }
+  if (ACC == "" && $0 ~ /^[ \t]*#/) next       # documentation — decided on the FIRST physical line
+  if (ACC == "") { s = $0; ACCFNR = FNR } else { s = ACC $0 }
   # ⛔ THE JOIN DROPS BOTH THE BACKSLASH AND THE NEWLINE — it does NOT insert a space (measured on the
   # first cut: joining with " " turned `NAME\`+`=83` into `NAME =83`, which parses as neither an
   # assignment nor the original, so the fix left the fail-open in place AND reddened nothing).
-  if (ACC == "") { s = $0; ACCFNR = FNR } else { s = ACC $0 }
   if (odd_trailing_bs(s)) { ACC = substr(s, 1, length(s) - 1); next }
   ACC = ""
+  scan_unit(s, ACCFNR)
+}
+END { flush_unit() }
+
+# flush_unit() — scan whatever the accumulator still holds, then clear it.
+function flush_unit() {
+  if (ACC == "") return
+  _fu = ACC; _ful = ACCFNR
+  ACC = ""
+  if (_fu ~ /^[ \t]*#/) return                # a comment unit declares nothing
+  scan_unit(_fu, _ful)
+}
+
+# scan_unit(s, ln) — scan ONE logical line. `ln` is its FIRST physical line, so every row points a reader
+# at the start of the declaration rather than into the middle of a continuation.
+function scan_unit(s, ln,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, _vv, _e, _t2) {
+  LN = ln
+  f = basename(FILENAME)
+  sub(/^[ \t]+/, "", s)
   LN = ACCFNR                                 # rows report the declaration's FIRST physical line
   f = basename(FILENAME)
   sub(/^[ \t]+/, "", s)
@@ -2741,6 +2769,28 @@ printf '\n_c="${AGENT_HARNESS_SKEW_REFUSED\\\n:-81}"\n' >> "$_codemut_dir/fix-on
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:fix-one.sh:"*) rc=0 ;; *) rc=1 ;; esac
 ck "(continuation) a CALLER's stale \`:-81\` default split across lines is still caught as a stale default — the check this PR chiefly guards (rc=$CODE_RC; $CODE_MSG)" $rc
+# (f1j) ⛔ THE JOIN ITSELF HAD TWO FAIL-OPENS, BOTH MEASURED, BOTH REGRESSIONS (review of `424fafd7`,
+# P1). Joining before the whole-line-comment test swallowed the line after a comment ending in `\` —
+# bash ends a comment at the NEWLINE, so the next line executes. And an accumulator never flushed at EOF
+# dropped a declaration on a file's last line ending in `\` — bash discards the trailing backslash and
+# runs the line. Each is driven here; each reads GREEN if the fix is removed.
+_codemut_dir="$(_codemut comment-continuation)"
+printf '\n# gate note \\\nAGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a COMMENT line ending in \`\\\` does NOT swallow the declaration below it — bash ends a comment at the newline and runs the next line, so joining before the \`^#\` test read this GREEN (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-block-continuation)"
+printf '\n# a \\\n# b \\\nAGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a whole COMMENT BLOCK whose every line ends in \`\\\` does not swallow the declaration below it (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut dangling-last-line)"
+# NO trailing newline: the file's LAST byte is the backslash, which is the case bash still executes.
+printf '\nAGENT_NEW_GATE_REFUSED=83\\' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a declaration on the file's LAST line ending in \`\\\` (no trailing newline) is READ — an accumulator that is never flushed at EOF drops it silently (rc=$CODE_RC; $CODE_MSG)" $rc
+
 # (f1i) and the other direction: `==` is a COMPARISON, in both spellings. The spaced form was silent and
 # the UNSPACED form was refused, so the verdict held only by whitespace.
 _codemut_dir="$(_codemut arith-compare-tight)"
@@ -2987,6 +3037,16 @@ _armdecl=" $(printf '%s\n' "$_fixer_arms" | cut -d: -f1 | tr '\n' ' ')"
 # appended to a `fix-one.sh` copy left the derived set unchanged. Whole-line-only stripping yields the
 # IDENTICAL set on the real tree, so this costs nothing.
 _fixer_code="$(awk '{ sub(/^[ \t]*#.*/, ""); print }' "$HERE/fix-one.sh")"
+# ⛔ AND THE FIX IS PINNED (review of `424fafd7`, P2). The derivation above is only ever run against the
+# SHIPPED `fix-one.sh`, so re-introducing the inline `sub(/[ \t]#.*/, "")` would pass every existing arm
+# in silence — the exact failure the comment above records as measured. This drives the DERIVATION over a
+# mutated copy instead: a new gate classified on a line that carries a ` #` must reach the classified set.
+_armut="$TMP/armut"; rm -rf "$_armut"; mkdir -p "$_armut"
+{ cat "$HERE/fix-one.sh"; printf '\ntrue && echo "a # b" && _new="${AGENT_NEW_ARM_REFUSED:-85}"\n'; } > "$_armut/fix-one.sh"
+_armut_cls="$(awk '{ sub(/^[ \t]*#.*/, ""); print }' "$_armut/fix-one.sh" \
+  | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u | tr '\n' ' ')"
+case " $_armut_cls " in *" AGENT_NEW_ARM_REFUSED "*) rc=0 ;; *) rc=1 ;; esac
+ck "(arm derivation) a gate classified on a line carrying a \` #\` REACHES the derived set — with an inline comment strip it appears nowhere and both completeness checks pass over it ($_armut_cls)" $rc
 _arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never compared
 _arm_cls=""; _arm_other=""
 for _ac in $(printf '%s\n' "$_fixer_code" \
