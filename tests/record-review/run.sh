@@ -2277,7 +2277,7 @@ if [ -d "$DELTA_REPO" ]; then
     && pass "(33a8) the script initialises D_REC (a default, not a hope) — an ambient D_REC cannot redirect a non-delta predecessor read" \
     || fail "(33a8) scripts/record-review.sh has no top-level D_REC=\"\" default: an ambient D_REC can bypass the no-evidence refusal"
   # (33a9) THE `delta:`-INHERITANCE READ RESOLVES A LEGACY PREDECESSOR TOO. (33a7) cannot reach it
-  # (its predecessor carries `comment:` evidence, so the `elif` at scripts/record-review.sh:4836 is
+  # (its predecessor carries `comment:` evidence, so the `elif` arm that inherits a `delta:` claim is
   # never entered — MEASURED: reverting `_cd_src` to `$FILE` leaves both suites green). Without this
   # vector the `_cd_src` half of the fix is pinned by nothing while the code comment claimed it was:
   # a legacy predecessor whose evidence is `delta:A..B` would be falsely refused at "refusing a
@@ -2291,6 +2291,34 @@ if [ -d "$DELTA_REPO" ]; then
   [ "$DRC_A9" -eq 0 ] && grep -q "\"delta_range\":\"$D_BASE..$D_REVIEWED\"" <<<"$D_REC7103" \
     && pass "(33a9) a LEGACY-key predecessor whose evidence is \`delta:A..B\` INHERITS its range — _cd_src resolves through \${D_REC:-\$FILE} too" \
     || fail "(33a9) the legacy delta-inheriting carry was refused or lost its range (rc=$DRC_A9, record='$D_REC7103')"
+
+  # (33a10) DELTA EVIDENCE × A NON-CLEAN VERDICT IS REFUSED. Only the `clean` gate re-reads a
+  # review; `clean-micro` certifies the micro PROCESS and `clean-low` the content SHAPE, so a delta
+  # passed with either would be SILENTLY DROPPED by the #7391 gate while the caller believed a range
+  # was recorded. Pinned here because NOTHING else distinguishes it: replacing the arm's condition
+  # with `false` left both suites green (MEASURED, review round 7).
+  ( cd "$DELTA_REPO" || exit 9
+    HOME="$DR_HOME" PATH="$TMP/dbin:$PATH" FIX_REPO="$DELTA_REPO" \
+    FIX_BASE="$(git rev-parse main)" FIX_HEAD="$D_MERGED" \
+      bash "$SRC" 7104 "$D_MERGED" clean-micro fixture/repo --evidence "delta:$D_BASE..$D_MERGED+comment:7104" ) \
+      > "$TMP/out32a10" 2>&1
+  DRC_A10=$?
+  if [ "$DRC_A10" -eq 2 ] && grep -q 'verdict reads it' "$TMP/out32a10"; then
+    pass "(33a10) delta evidence with a NON-clean verdict is REFUSED (rc 2, by name) — it would otherwise be silently dropped"
+  else
+    fail "(33a10) delta evidence with clean-micro was not refused at 2 (rc=$DRC_A10, out=$(cat "$TMP/out32a10" 2>/dev/null))"
+  fi
+  # (33a11) A RECORD ALREADY BOUND TO THE LIVE HEAD IS A NO-OP. Turning this arm into the generic
+  # refusal would make EVERY legitimate up-to-date `--delta` exit 3 "RETRY" (a false retry loop on
+  # a healthy record), and nothing else distinguishes it (MEASURED, review round 7).
+  D_BEFORE11="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
+  delta_run 7101 "$TMP/out32a11"; DRC_A11="$DR_RC"
+  D_AFTER11="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
+  if [ "$DRC_A11" -eq 0 ] && [ "$D_BEFORE11" = "$D_AFTER11" ] && grep -q 'ALREADY bound' "$TMP/out32a11"; then
+    pass "(33a11) an already-bound record is a NO-OP (rc 0, record byte-identical) — not turned into a RETRY refusal"
+  else
+    fail "(33a11) the already-bound short circuit did not hold (rc=$DRC_A11, identical=$([ "$D_BEFORE11" = "$D_AFTER11" ] && echo yes || echo no))"
+  fi
 
   # (33a2) THE RECORD SHAPE IS THE CONTRACT, so it is PINNED rather than described. `proved` exists
   # because the field it replaced (`authored_unchanged:true`, hardcoded) was contradicted by the
@@ -2738,12 +2766,13 @@ fi
 # 33f2 pin the unproven-delta refusal and the "both verbs agree" invariant, which were MEASURED
 # green under deletion before they existed.
 # AFTER THE REBASE the count is main's plus this section's: main spent 185 -> 190 on #3347's own
-# section (32), and this section adds 17 (13 delta assertions + the (33a6) integration pin +
-# (33a7)/(33a9) legacy-key vectors + the (33a8) structural D_REC default), so the
-# pin is 207. The section is numbered 33 for the same
+# section (32), and this section adds 19 (13 delta assertions + the (33a6) integration pin +
+# (33a7)/(33a9) legacy-key vectors + the (33a8) structural D_REC default + (33a10)/(33a11), the two
+# previously-unpinned mode arms), so the
+# pin is 209. The section is numbered 33 for the same
 # reason — (32) was already taken on main by the time this branch was rebased.
-# MEASURED: `ALL PASSED (207 assertion(s))` on the merged tree.
-MIN_ASSERTIONS=207
+# MEASURED: `ALL PASSED (209 assertion(s))` on the merged tree.
+MIN_ASSERTIONS=209
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
