@@ -452,8 +452,34 @@ plist_probe() { # <file>
       while ((p = index(rest, "</dict>")) > 0) { n--; rest = substr(rest, p + 7) }
       return n
     }
+    # ⛔ EVERY TAG IS NORMALISED BEFORE ANY SCAN (review P1, cycle 9 of #1986). An XML start tag may legally
+    # carry whitespace or attributes — `<key >Program</key>`, `<dict xml:space="preserve">` — and so may an
+    # end tag: `</dict >`. Every scan below matches the LITERAL spellings, so the same document used to give
+    # a different answer depending on HOW IT WAS SPELLED. Both directions were MEASURED: (a) a foreign
+    # `Program` written `<key >Program</key>` was not a key at all, so a benign ProgramArguments decided the
+    # verdict and `bootstrap` loaded the foreign program under `$LABEL` — the #1761/#1715 class, with this
+    # gate reporting PASS; (b) a legitimate plist closing `</dict >` left `depthat` raised, so its own keys
+    # read as nested and the recovery arm was refused on every pass for ever (an inert arm). Rewriting each
+    # tag to `<name>`/`</name>` before the scans makes the answer a property of the DOCUMENT rather than of
+    # its spelling. Text content is copied untouched; `<!…>`/`<?…>` (DOCTYPE, XML decl) are preserved.
+    function canon(doc,   out, i, p, q, s, name, j) {
+      out = ""; i = 1
+      while ((p = index(substr(doc, i), "<")) > 0) {
+        out = out substr(doc, i, p - 1)
+        q = index(substr(doc, i + p - 1), ">")
+        if (q == 0) return out substr(doc, i + p - 1)
+        s = substr(doc, i + p, q - 2)
+        i = i + p + q - 1
+        if (substr(s, 1, 1) == "!" || substr(s, 1, 1) == "?") { out = out "<" s ">"; continue }
+        if (substr(s, 1, 1) == "/") { name = "/"; j = 2 } else { name = ""; j = 1 }
+        while (j <= length(s) && substr(s, j, 1) ~ /[A-Za-z0-9_.:-]/) { name = name substr(s, j, 1); j++ }
+        out = out "<" name ">"
+      }
+      return out substr(doc, i)
+    }
     { doc = doc strip($0) "\n" }
     END {
+      doc = canon(doc)
       # ⛔ EVERY TOP-LEVEL KEY IS COUNTED, NOT JUST `Label` (review P1, cycle 8). A plist declaring
       # `Program` or `ProgramArguments` TWICE is as ambiguous as one declaring `Label` twice —
       # CFPropertyList keeps the LAST occurrence while a first-match reader keeps the FIRST, so the two
@@ -951,9 +977,15 @@ status_show() {
     # episode's `cause:` under a report that named a different episode (measured: `episode: 2` above
     # `episode=1 … cause: EPISODE-ONE`). Start at the LAST line that begins with an ISO timestamp — the
     # shape `record_crash` writes as each block's header — so the block shown is the one that matters.
+    # ⛔ THE HEADER IS `<ISO>Z<TAB>verdict=…`, NOT `<ISO>Z<SPACE>` (review P1, cycle 9). The evidence
+    # lines `record_crash` embeds are the controller's own log lines, and those are written as
+    # `<ISO>Z<SPACE>[startup] …` (`nochk-guard.sh:27`, `orch-loop.sh:460`) — so a timestamp+space match
+    # selected an EMBEDDED line and `--status` printed one stray tail line with no `cause:` at all, under
+    # a header naming the current episode: the same "superseded evidence" complaint, in a new form. The
+    # selector requires the header's own separator AND the date shape, so an embedded log line cannot win.
     awk 'BEGIN { last = 0 }
          { lines[NR] = $0
-           if ($0 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z[[:space:]]/) last = NR }
+           if (index($0, "Z\tverdict=") == 20 && substr($0, 1, 19) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) last = NR }
          END { if (last == 0) last = 1; for (i = last; i <= NR; i++) print lines[i] }' "$CRASH_FILE" 2>/dev/null
   else
     echo "  crash:  none recorded"

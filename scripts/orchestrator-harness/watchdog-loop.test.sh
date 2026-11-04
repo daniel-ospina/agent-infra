@@ -1026,19 +1026,74 @@ assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "an env var 
 assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses"
 # (ah) A DUPLICATE KEY IS AMBIGUOUS. CFPropertyList keeps the LAST occurrence and a first-match reader
 #      keeps the FIRST, so the reader that decides whether to bootstrap must not be the lenient one.
+#      ⛔ THE FOREIGN OCCURRENCE COMES FIRST (review P2, cycle 9). With the benign one first, dropping the
+#      guard still refuses — the reader takes the LAST array, which is the foreign one — so the
+#      `assert_absent … bootstrap` below was VACUOUS (measured: mutating the guard out reddened only the
+#      'ambiguous' text assertion). This order is the discriminating one: without the guard the last (and
+#      therefore launchd-resolved) array is BENIGN and the pass bootstraps a plist launchd would run
+#      differently.
 echo "── 8b(ah). a plist declaring ProgramArguments TWICE is refused as ambiguous"
 newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
 cat > "$C/stack.plist" <<PLISTAH
 <plist version="1.0"><dict>
   <key>Label</key><string>com.eldato.orchestrator-stack</string>
-  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
   <key>ProgramArguments</key><array><string>/opt/evil/run-agent</string></array>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
 </dict></plist>
 PLISTAH
 mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
 removed_pass "$C/pass.out"
 assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a repeated ProgramArguments key is never resolved by guessing"
 assert_contains "$(cat "$C/state/l" 2>/dev/null)" "ambiguous" "…the refusal names the ambiguity"
+# (ah2) THE SAME FOR A DUPLICATE `Program`, and the same DISCRIMINATING order (foreign first, benign last),
+#      so a reader that resolves the last occurrence cannot quietly accept it.
+echo "── 8b(ah2). a plist declaring Program TWICE is refused as ambiguous"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH2
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>Program</key><string>/opt/evil/run-agent</string>
+  <key>Program</key><string>$C/o/orch-loop.sh</string>
+</dict></plist>
+PLISTAH2
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a repeated Program key is never resolved by guessing"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "ambiguous" "…naming which key was repeated"
+# (ah3) TAGS ARE READ BY NAME, NOT BY SPELLING (review P1, cycle 9). An XML start tag may legally carry
+#      whitespace or attributes. The reader matched the literal `<key>`/`<dict>`, so `<key >Program</key>`
+#      was not a key at all — a benign ProgramArguments decided the verdict while launchd exec'd the
+#      foreign Program (measured: ACCEPTED and bootstrapped).
+echo "── 8b(ah3). a Program spelled '<key >Program</key>' is still the Program that runs"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH3
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key >Program</key><string>/opt/evil/run-agent</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
+</dict></plist>
+PLISTAH3
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a non-canonically spelled Program key still decides what runs"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "run-agent" "…and the refusal names the foreign program it would exec"
+# (ah4) THE OTHER SPELLING DIRECTION, and it must NOT refuse: a NESTED dict carrying an attribute is still a
+#      nested dict, so its `Program` is an env var — and a legit end tag spelled `</dict >` still closes.
+echo "── 8b(ah4). a nested dict with an attribute is still nested, and '</dict >' still closes"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH4
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>EnvironmentVariables</key><dict xml:space="preserve">
+    <key>Program</key><string>$C/o/orch-loop.sh</string>
+  </dict >
+  <key>ProgramArguments</key><array><string>/opt/evil/run-agent</string></array>
+</dict ></plist>
+PLISTAH4
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "the env var is not the job's Program just because the dict carries an attribute"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "run-agent" "…argv[0] still decides"
 # (ai) THE INTERPRETER SKIP APPLIES TO `Program` TOO. `Program=/bin/bash` with the box controller as the
 #      first argument is a box this repo ships the shape for; without the skip it was refused on EVERY
 #      pass, for ever, with a line claiming launchd would run `/bin/bash` — a dead arm that looks healthy.
@@ -1067,16 +1122,22 @@ assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the arm is
 # (ak) THE CRASH RECORD IS APPEND-ONLY, SO `--status` MUST SHOW THE CURRENT EPISODE. It used to print the
 #      first three lines, i.e. the OLDEST block, under a header naming the CURRENT episode — so an
 #      operator read a previous outage's `cause:` while diagnosing this one.
+#      ⛔ EACH BLOCK CARRIES THE CONTROLLER'S OWN LOG LINES, and those begin `<ISO>Z<SPACE>[startup] …`. A
+#      timestamp+space selector picks one of THOSE (measured: `--status` printed a single stray tail line
+#      with no `cause:` at all). The fixture therefore embeds such a line in the newest block and asserts
+#      the block HEADER is shown — which is what proves the selector found the block, not the evidence.
 echo "── 8b(ak). --status shows the CURRENT episode's crash block, not the oldest"
 newcase
 printf '2026-01-01T00:00:00Z\tverdict=WEDGED_STOPPED\tpid=none\theartbeat=900s\tstreak=3/3\trestart=0\tepisode=1\tcrash=x\ncause: EPISODE-ONE syntax error\n--- last 25 lines ---\n' > "$C/state/controller-watchdog.crash"
-printf '2026-01-02T00:00:00Z\tverdict=WEDGED_STOPPED\tpid=none\theartbeat=900s\tstreak=3/3\trestart=0\tepisode=2\tcrash=x\ncause: EPISODE-TWO unbound variable\n--- last 25 lines ---\n' >> "$C/state/controller-watchdog.crash"
+printf '2026-01-02T00:00:00Z\tverdict=WEDGED_STOPPED\tpid=none\theartbeat=900s\tstreak=3/3\trestart=0\tepisode=2\tcrash=x\ncause: EPISODE-TWO unbound variable\n--- last 25 lines ---\n2026-01-02T00:00:30Z [startup] tick 1\n' >> "$C/state/controller-watchdog.crash"
 printf '2' > "$C/state/controller-watchdog.episode"
 stout="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" \
          WATCHDOG_LOG="$C/state/controller-watchdog.log" \
          WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 bash "$WD" --status 2>&1)"
 assert_contains "$stout" "EPISODE-TWO" "--status shows the crash block for the episode it just named"
 assert_absent "$stout" "EPISODE-ONE" "…and not the previous, superseded one"
+assert_contains "$stout" "verdict=WEDGED_STOPPED" "…including that block's HEADER, not just a log line it embeds"
+assert_contains "$stout" "[startup] tick 1" "…and the block's own evidence tail"
 assert_eq "$(restarts)" "0" "…and --status still dispatches nothing"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
