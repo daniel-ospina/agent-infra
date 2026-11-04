@@ -4168,7 +4168,12 @@ delta_measured_from() { # <arm> <record-head> <diff-arm-sha> <patch-arm-sha>
 }
 
 delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
-  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp="" n_rc=0
+  # ⛔ UNION, AND BOTH HALVES ARE LOAD-BEARING (#3247 landed twice — see the (32a)/(33a6b) notes
+  # in the suites). `n_rc` is ours: main's list omits it, so `n_rc` was this function's ONE global,
+  # and a `local` list that forgets it silently reintroduces the leak. `n3`/`_seen`/`_ln` are main's:
+  # its de-piped commit listing below uses them, so taking our list alone would leave them `set -u`
+  # unbound on the `no` path. A "pick a side" here breaks one direction or the other.
+  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp="" n_rc=0 n3="" _seen=0 _ln=""
   local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
   b="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
   case "$b" in *[!0-9a-f]* | "") b="" ;; esac
@@ -4273,7 +4278,23 @@ delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
     elif [ "$n" -eq 0 ]; then
       printf 'no-new-authored-commits=yes commits=0\n'
     else
-      printf 'no-new-authored-commits=no commits=%s %s\n' "${n:-0}" "$(printf '%s' "$extra" | command head -3 | command tr '\n' ',' | command sed 's/,$//')"
+      # ⛔ NO PIPE HERE EITHER (#3247 review, P3). This is the `no-new-authored-commits` listing and
+      # it was the ONE remaining `printf … | head -3 | tr | sed` in the file, ~30 lines below the `mt`
+      # line above and ~90 below the reader whose 9-in-40 empty-stdout measurement justifies de-piping
+      # that shape. It did NOT fault — the pipeline is an ARGUMENT to the outer `printf`, so the 141
+      # was never a command's own status — but "this instance happens not to fault" is not a reason to
+      # keep one convention for the diagnostic the arms above exist to make reachable and another
+      # everywhere else: the next edit that hoists it into a statement would ARM the bug. Built in
+      # BASH, like `${mt_raw%%$'\n'*}` above: no writer process exists, so nothing can be signalled.
+      # (`mapfile`/`readarray` are NOT available — this file must run on bash 3.2.)
+      while IFS= read -r _ln; do
+        if [ "$_seen" -lt 3 ]; then
+          n3="${n3:+$n3,}$_ln"; _seen=$((_seen+1))
+        else
+          break
+        fi
+      done <<<"$extra"
+      printf 'no-new-authored-commits=no commits=%s %s\n' "${n:-0}" "$n3"
     fi
   else
     printf 'no-new-authored-commits=UNMEASURED(no authoritative base read)\n'
@@ -4629,7 +4650,9 @@ fi
 #           "review evidence posted to … as a durable comment"
 #
 # Three claims that run never made, on a SUCCESSFUL exit: `mint:"fresh"` (no
-# reviewer ran — delta mode REFUSES --evidence, :1909), the prior record's
+# reviewer ran — delta mode REFUSES --evidence; the refusal is the `elif [ "$DELTA" -eq 1 ]` arm of
+# the mint-input guard, whose message begins "'--delta' re-binds the record's OWN verdict"), the
+# prior record's
 # `evidence` (the one pointer tortoise#7391/#10177 exist to preserve) is DELETED,
 # and a signed marker is PATCHed. The tortoise#7391 gate below cannot catch it
 # because that gate is keyed on `VERDICT = clean`, and `clean-micro`/`clean-low`

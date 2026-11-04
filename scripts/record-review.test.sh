@@ -2651,7 +2651,11 @@ fi
 #      shape. The record here carries a full `delta` object and still names NO arm and NO
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` (the `CARRY_FIELDS` assigned beside it)
-#      and `evidence`, so naming the mint alone buys nothing.
+#      and `evidence`, so naming the mint alone buys nothing. ⛔ CITED BY SYMBOL, NOT BY LINE: main's
+#      side of this hunk carried a `scripts/record-review.sh:4226` citation plus a warning that the
+#      number "rotted once already, :4174 -> :4210". A citation that needs a warning not to trust it
+#      is the drift this branch's 4ca4a4ed removed; the symbol is what makes the assertion true and
+#      it cannot rot. To re-derive: grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
 printf '{"pr":424920,"head_sha":"%s","diff_sha256":"%s","mint":"delta","carried_from":"%s","delta":{"from":"%s","to":"%s","proved":"lane","arm":"lane"},"verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
     "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_FILE-424920.json"
 run_check_carry 424920 "$CC_REPO"
