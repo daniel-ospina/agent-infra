@@ -115,6 +115,18 @@ drive() {
       bash "$LANE" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
   LANE_RC=$?
 }
+# drivef <worktree> <extra LANE argv…> — the same, but passing ARGUMENTS. The key gate's escape is
+# argv-only (`--key-gate-off`) precisely because an environment variable is inherited from the box: these
+# arms have to prove BOTH that the flag works and that the variable does NOT.
+drivef() {
+  local wt="$1"; shift
+  ( cd "$wt" && env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL \
+      O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
+      REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
+      MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" \
+      bash "$LANE" "$@" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
+  LANE_RC=$?
+}
 # drive_bg <worktree> — the same, in the background, so a signal can reach the LANE process.
 drive_bg() {
   local wt="$1"; shift
@@ -185,6 +197,50 @@ KG_GATE=""; _kgep=""; _kguntil=""
 i=""; case "${_kgep:-}" in ''|*[!0-9]*) : ;; *) [ "${_kguntil:-0}" -gt "${_kgep:-0}" ] && i=ok ;; esac
 eqv "$i" "ok" "1d2 …with a coherent epoch/yield pair ('${_kgep:-<none>}' -> '${_kguntil:-<none>}')"
 eqv "${KG_GATE:-<none>}" "key" "1d3 …and field 3 names the KEY gate (an unnamed gate is folded to 'load' by every reader, the #2991 defect)"
+# ⛔ THE REFUSAL MUST NOT READ AS "STILL WORKING", AND THESE TWO ARMS ARE THE SHAPES THAT DID. A pre-change
+# log for exactly this lane ended on `[venv-reap] lane …: nothing to reap` — with the cause three lines
+# above it — and was read as a live lane for hours. They are stated here, on the REFUSAL arm, because that
+# is the arm whose log the comment is about (they used to sit on the stored-credential `done` arm, where a
+# terminal `outcome=done` line made them unfalsifiable: a `done` log can never end on a cleanup line).
+hasnt "$(lastline)" "[venv-reap]" "1e the REFUSAL log does NOT end on a cleanup/reap line (the shape mistaken for a working lane)"
+hasnt "$(lastline)" "[wip]" "1f …nor on the wip-rescue line"
+
+# ── 1y: THE ESCAPE IS ARGV, AND THE ENVIRONMENT ROUTE IS RETIRED (review, P1, measured) ─────────
+# ⛔ THE HEAD COMMIT'S WHOLE CLAIM, WHICH HAD NO ASSERTION (review, P1: deleting the guard left all three
+# suites green). The escape used to be `LANE_KEY_GATE=0` read from the environment. Fencing it against the
+# box's `keys.env` cannot work by saving/restoring the caller's value, because on a cell the controller
+# sourced that file itself under `set -a` — the box's value and the "caller's" value are the same inherited
+# string. So the switch is argv-only, and all three directions are pinned below.
+mk_arm escapeenv; WT="$ARMWT"
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi
+: > "$PI_MARK"
+drive "$WT" LANE_KEY_GATE=0
+eqv "$LANE_RC" "82" "1y1 LANE_KEY_GATE=0 in the ENVIRONMENT does NOT disable the gate (rc=$LANE_RC) — an inherited variable is a fleet-wide off switch, not a fixture escape"
+[ ! -s "$PI_MARK" ]; ck "1y2 …and the agent was not spawned, so the assertion really ran" $?
+has "$(cat "$(LOG)" 2>/dev/null)" "check=ignored var=LANE_KEY_GATE=0" \
+    "1y3 …and the log SAYS the value was seen and ignored, so an operator whose fixture relied on it is told what changed"
+# …and the same value arriving through the file `lane-env.sh` sources, which is how a cell's box really
+# gets it (the supervisor's `set -a; . "$ENV_FILE"` is inherited by every descendant lane).
+mk_arm escapefile; WT="$ARMWT"
+printf 'export LANE_KEY_GATE=0\n' > "$ARMDIR/home/keys.env"
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi
+: > "$PI_MARK"
+drive "$WT"
+eqv "$LANE_RC" "82" "1y4 the same value SOURCED FROM THE BOX'S keys.env also does NOT disable the gate (rc=$LANE_RC) — this is the route that made the previous cut's fix decorative"
+[ ! -s "$PI_MARK" ]; ck "1y5 …and the agent was not spawned" $?
+# …and the declared escape, the one no environment can inject, DOES work.
+mk_arm escapeflag; WT="$ARMWT"
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi
+: > "$PI_MARK"
+drivef "$WT" --key-gate-off
+eqv "$LANE_RC" "0" "1y6 --key-gate-off on the INVOCATION skips the assertion (rc=$LANE_RC) — the declared escape still exists, for fixtures that stub pi"
+[ -s "$PI_MARK" ]; ck "1y7 …and the agent really ran" $?
+has "$(cat "$(LOG)" 2>/dev/null)" "reason=--key-gate-off" \
+    "1y8 …and the skip is LOUD and named (a silent skip is the bypass this whole change refuses)"
+check_terminal "1y9" done "agent-exit-0" 0
 
 # ── 1z: A STORED CREDENTIAL IS NOT A MISSING ONE (review round 3, P1) ────────────────────────────
 # `pi` consults `auth.json` (what `pi /login` writes) BEFORE the environment, so a provider logged in
@@ -203,10 +259,6 @@ has "$(cat "$(LOG)" 2>/dev/null)" "check=skipped reason=stored-credential" \
     "1z3 …because the gate says WHICH source answered, instead of passing silently"
 check_terminal "1z4" done "agent-exit-0" 0
 [ ! -s "$ARMDIR/o/state/capacity-refused-3331" ]; ck "1z5 …and no stand-down record is written for a lane that ran" $?
-# ⛔ THE WHOLE POINT: THE REFUSAL MUST NOT READ AS "STILL WORKING". A pre-change log for this arm ended
-# on a cleanup line with the cause buried above it — the shape that was read as a live lane for hours.
-hasnt "$(lastline)" "[venv-reap]" "1e the log does NOT end on a cleanup/reap line (the shape mistaken for a working lane)"
-hasnt "$(lastline)" "[wip]" "1f …nor on the wip-rescue line"
 
 # ═══ 2. A LANE WHOSE AGENT RUNS AND RETURNS 0 ═══════════════════════════════════════════════════════
 mk_arm done; WT="$ARMWT"

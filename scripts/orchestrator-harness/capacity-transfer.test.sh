@@ -90,14 +90,18 @@ BRIEF_OK="$TMP/brief-ok.txt"; export BRIEF_OK   # every driver below is a `bash 
 echo "==> capacity-transfer self-test ($HERE)"
 
 # ⛔ THE MODEL-CREDENTIAL GATE IS DECLARED OFF FOR THIS SUITE, BY NAME AND ON PURPOSE (agent-infra#3331).
-# `lane.sh` now asserts, immediately before it spawns `pi`, that the lane's own environment holds the
+# `lane.sh` asserts, immediately before it spawns `pi`, that the lane's own environment holds the
 # credential its provider resolves from `models.json`. These arms STUB `pi` — the credential is not what
 # they measure — and a fixture that inherited whatever key the runner happens to have would be a false
 # GREEN on one box and a false RED on another (the same defect provider-credential.test.sh records for
-# `PI_LANE_*`). The ESCAPE IS LOUD: the lane log records `[key-gate] … check=skipped reason=LANE_KEY_GATE=0`
-# on every run here, and `lane-outcome.test.sh` proves the gate refuses by DEFAULT (exit 82) when it is
-# not set — so unsetting this line reddens nothing by accident and enables nothing silently.
-export LANE_KEY_GATE=0
+# `PI_LANE_*`).
+# ⛔ THE ESCAPE IS ARGV, NOT AN ENVIRONMENT VARIABLE (review, P1). It used to be `export LANE_KEY_GATE=0`
+# here — which worked in this suite and was, in the same breath, a fleet-wide off switch: on a cell the
+# controller sources `keys.env` under `set -a`, so any descendant lane inherited the value and the gate
+# never ran, while the suite stayed green. `--key-gate-off` on the invocation cannot be inherited, so a
+# box cannot turn the assertion off for every lane it dispatches; `lane-outcome.test.sh` pins both
+# directions (the flag skips, the variable is IGNORED and reported). The escape is still loud: every run
+# here logs `[key-gate] … check=skipped reason=--key-gate-off`.
 
 # ── stubs on PATH ────────────────────────────────────────────────────────────────────────────────
 # `pi` must NEVER be reached by a refusing gate; when §1c lets an agent run it records that it did.
@@ -301,7 +305,7 @@ echo "=== §1 the refusal becomes a durable record (state/capacity-refused-<N>) 
 LANE_YIELD=120
 BEFORE="$(date +%s)"
 ( cd "$LANECWD" && O="$O" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
-    CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" 7 feat/7-tm daniel-ospina/agent-infra ) > "$TMP/lane7.out" 2>&1
+    CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" --key-gate-off 7 feat/7-tm daniel-ospina/agent-infra ) > "$TMP/lane7.out" 2>&1
 lrc=$?
 AFTER="$(date +%s)"
 REC="$O/state/capacity-refused-7"
@@ -325,7 +329,7 @@ ck "the lane log states the transfer (an operator can see the release is coming)
 # said 'load' on a full filesystem would send the operator to wait for an event that cannot arrive.
 rm -f "$DF_FUNC_MARK"
 ( cd "$LANECWD" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=500 DISK_GATE_PATH="$TMP" STUB_DISK_FULL=1 \
-    CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" 8 feat/8-tm daniel-ospina/agent-infra ) > "$TMP/lane8.out" 2>&1
+    CAPACITY_YIELD_SECS=$LANE_YIELD bash "$LANE" --key-gate-off 8 feat/8-tm daniel-ospina/agent-infra ) > "$TMP/lane8.out" 2>&1
 l8rc=$?
 dgate=""
 [ -f "$O/state/capacity-refused-8" ] && { read -r _d1 _d2 dgate < "$O/state/capacity-refused-8"; }
@@ -359,7 +363,7 @@ rm -f "$O/state/capacity-refused-17"
   }
   export -f cap_procs_pair_vars cap_h_for_vars
   O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" CAPACITY_YIELD_SECS=$LANE_YIELD \
-    bash "$LANE" 17 feat/17-tm daniel-ospina/agent-infra
+    bash "$LANE" --key-gate-off 17 feat/17-tm daniel-ospina/agent-infra
 ) > "$TMP/lane17.out" 2>&1
 l17rc=$?
 fgate=""
@@ -399,7 +403,7 @@ if [ -e "$PI_FUNC_MARK" ]; then
   # The creation gate's reading, supplied as a box supplies it (see the adapter fixtures above).
   lbgh_install "$TMP/lbgh-ok"
   ( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" LANE_TIMEOUT=5 \
-      bash "$LANE" 9 feat/9-tm daniel-ospina/agent-infra ) > "$TMP/lane9.out" 2>&1
+      bash "$LANE" --key-gate-off 9 feat/9-tm daniel-ospina/agent-infra ) > "$TMP/lane9.out" 2>&1
   l9rc=$?
   lbgh_clear
   { [ "$l9rc" -eq 0 ] && [ ! -f "$O/state/capacity-refused-9" ]; }; rc=$?
@@ -411,7 +415,7 @@ fi
 
 # A non-numeric issue id must not be turned into a path — lane.sh is also invoked by hand.
 ( cd "$LANECWD" && O="$O" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
-    bash "$LANE" '../../escape' 'x' daniel-ospina/agent-infra ) > "$TMP/laneesc.out" 2>&1
+    bash "$LANE" --key-gate-off '../../escape' 'x' daniel-ospina/agent-infra ) > "$TMP/laneesc.out" 2>&1
 esc_rc=$?
 { [ ! -e "$TMP/escape" ] && [ ! -e "$O/state/capacity-refused-../../escape" ]; }; rc=$?
 ck "a non-numeric issue id writes no record and no path outside \$O/state (rc=$esc_rc)" $rc
@@ -781,7 +785,7 @@ lb_drive() { # <shape-file> <lead-hours> <min-ceiling>
 lane_run() { # <shape-file> <issue> -> sets LANE_RC, never spawns a real agent
   lbgh_install "$1"
   ( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" \
-      CAPACITY_YIELD_SECS=$LANE_YIELD LANE_TIMEOUT=5 bash "$LANE" "$2" "feat/$2-tm" daniel-ospina/agent-infra ) > "$TMP/lane-$2.out" 2>&1
+      CAPACITY_YIELD_SECS=$LANE_YIELD LANE_TIMEOUT=5 bash "$LANE" --key-gate-off "$2" "feat/$2-tm" daniel-ospina/agent-infra ) > "$TMP/lane-$2.out" 2>&1
   LANE_RC=$?
 }
 : > "$PI_LOG"; rm -f "$O/logs/lane-101.log" "$O/state/capacity-refused-101"
@@ -842,7 +846,7 @@ ck "§LB BASE-RED BYPASS: a base-red repair is started too — landing it drains
 : > "$PI_LOG"; rm -f "$O/logs/lane-107.log"
 lbgh_install "$TMP/lbgh-broken"
 ( cd "$LBWT" && O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" LANE_TIMEOUT=5 \
-    LB_GH="$TMP/lbgh-ok" bash "$LANE" 107 feat/107-tm daniel-ospina/agent-infra ) > "$TMP/lane-107.out" 2>&1
+    LB_GH="$TMP/lbgh-ok" bash "$LANE" --key-gate-off 107 feat/107-tm daniel-ospina/agent-infra ) > "$TMP/lane-107.out" 2>&1
 l107rc=$?
 { [ "$l107rc" -eq 74 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "§LB an inherited LB_GH cannot open the gate (rc=$l107rc): the measurement is the box's own gh, and a dead one HOLDS" $rc

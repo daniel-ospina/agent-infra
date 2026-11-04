@@ -98,23 +98,25 @@ def nonblank(v):
 if isinstance(e, str):
     raise SystemExit(0 if nonblank(e) else 1)
 if isinstance(e, dict):
-    # ⛔ THE STORE HAS THREE SHAPES, AND ALL THREE MEAN "pi HOLDS A CREDENTIAL" (review P1, verified
-    # against pi\x27s own schema, `dist/core/auth-storage.js` `read()`):
-    #   {"type":"api_key","key":"sk-..."}                      — the plain shape
-    #   {"type":"api_key","env":{"VAR":"sk-..."}}              — `key` is OPTIONAL in pi\x27s validator,
-    #                                                            so this shape is VALID with no `key` at all
+    # ⛔ AN `env` MAP WITHOUT A `key` IS NOT A CREDENTIAL, AND CLAIMING IT IS WAS A FALSE PASS (review,
+    # P1, measured 2026-11-04). `pi` uses `env` only to RESOLVE a `key` template, never as the value:
+    # `dist/core/provider-composer.js` builds `{ apiKey: credential.key }` and reaches it under
+    # `if (input.credential.key)` (:260, :285-286), while `auth-storage.js` returns
+    # `{...credential, key: resolveConfigValue(credential.key, credential.env)}` — undefined when there is
+    # no template. So an entry shaped `{"type":"api_key","env":{"VAR":"sk-..."}}` with $VAR unset was
+    # read here as "pi holds a credential", the gate went quiet, and `pi` then printed exactly the death
+    # this issue exists to remove ("No API key found"). The old arm also **contradicted its own
+    # justification**: it cited pi\x27s *validator* (which accepts the shape) as evidence about
+    # *authentication* (which does not), and those are different questions.
+    # The shapes that DO authenticate, and why each is accepted rather than refused (the first draft
+    # accepted only the first group, so it refused a `pi /login` box — the exact false-block this gate
+    # must not be):
+    #   {"type":"api_key","key":"sk-..."}                                   — the plain shape
     #   {"type":"oauth","access":"at_...","refresh":"rt_...","expires":N}   — what `pi /login` writes
-    # The first draft accepted only key/api_key/apikey/access_token/refresh_token/token, so the latter two
-    # were read as "no credential" and the gate REFUSED (82) a box that would have run — the exact
-    # false-block this gate exists not to be, and it contradicted the file\x27s own polarity claim. The
-    # remedy it printed ("export an API key") cannot even apply to a store-authenticated box.
     for k in ("key", "api_key", "apikey", "access_token", "refresh_token", "token",
               "access", "refresh"):
         if nonblank(e.get(k)):
             raise SystemExit(0)
-    env = e.get("env")
-    if isinstance(env, dict) and any(nonblank(v) for v in env.values()):
-        raise SystemExit(0)
 raise SystemExit(1)
 '
 
@@ -152,12 +154,37 @@ key_gate_bounded() { # <secs> <cmd...>
   return "$rc"
 }
 
+# key_gate_agent_dir <home> -> the directory `pi` ITSELF would read, or nothing.
+# ⛔ `PI_CODING_AGENT_DIR` IS NOT COSMETIC, AND HARDCODING `$home/.pi/agent` MADE THE GATE ANSWER A
+# QUESTION pi DOES NOT ASK (review, P1, measured 2026-11-04). pi resolves its config dir as
+# `${PI_CODING_AGENT_DIR:-~/.pi/agent}`, and THIS REPO ALREADY MIRRORS THAT RULE
+# (`extensions/builtin-tools/index.ts:272-280`: "mirrors pi's own config resolution (PI_CODING_AGENT_DIR
+# override, else ~/.pi/agent/models.json)"; `scripts/checkout-hygiene/deepseek-balance-latch.py:98`
+# does the same). With the override set, the hardcode failed in BOTH directions:
+#   • a box whose store under the override holds the key was REFUSED with 82 — a false block on a
+#     supported configuration, i.e. the polarity the header forbids; a gate that refused on the
+#     variable alone refused a lane that WOULD have worked;
+#   • a box whose models.json lives ONLY under the override printed `check=skipped`, the gate went
+#     blind, and `pi` died with "No API key found" — the silent end this whole change removes.
+# ONLY AN ABSOLUTE OVERRIDE IS HONOURED: a relative one cannot name a location, and guessing what it is
+# relative to is how a gate reads the wrong file convincingly.
+key_gate_agent_dir() {
+  local home="${1:-}"
+  case "${PI_CODING_AGENT_DIR:-}" in
+    /*) printf '%s\n' "$PI_CODING_AGENT_DIR"; return 0 ;;
+  esac
+  [ -n "$home" ] || return 0
+  printf '%s\n' "$home/.pi/agent"
+}
+
 # key_gate_var <home> [<provider>] -> the env var name the lane provider's apiKey resolves from, or
 # nothing when it cannot be said. An empty answer is the "do not refuse" answer.
 key_gate_var() {
   local home="${1:-}" prov="${2:-}"
-  [ -n "$home" ] || return 0
-  local mj="$home/.pi/agent/models.json"
+  local agent_dir mj
+  agent_dir="$(key_gate_agent_dir "$home")"
+  [ -n "$agent_dir" ] || return 0
+  mj="$agent_dir/models.json"
   # ⛔ NO `[ -r "$mj" ]` HERE (review round 5, P2, measured): that test is access(2)/stat(2) on the SAME
   # path, so on a hung automount it blocks BEFORE the bound is armed — the round-4 P1 surviving in the other
   # half of the same function. The read that can block is the `open`, and that one is inside the bound; an
@@ -204,8 +231,11 @@ key_gate_account_home() {
 # check, which is the direction that cannot fabricate a refusal.
 key_gate_stored_credential() {
   local home="${1:-}" prov="${2:-}"
-  [ -n "$home" ] && [ -n "$prov" ] || return 1
-  local aj="$home/.pi/agent/auth.json"
+  local agent_dir aj
+  [ -n "$prov" ] || return 1
+  agent_dir="$(key_gate_agent_dir "$home")"
+  [ -n "$agent_dir" ] || return 1
+  aj="$agent_dir/auth.json"
   # No `[ -r ]` pre-test, for the same reason as key_gate_var's (review round 5, P2): stat can block before
   # the bound arms. An absent store makes the bounded open print nothing and answer "cannot say".
   command -v python3 >/dev/null 2>&1 || return 1
@@ -240,8 +270,9 @@ key_gate_candidates() {
 # verdict. A lane's OUTCOME is the terminal line `lane.sh` writes (`outcome=…`), not this.
 key_gate_assert() {
   local label="${1:-key-gate}" home="${2:-${HOME:-}}" prov="${3:-}"
-  KEY_GATE_VAR=""; KEY_GATE_PROVIDER="${prov:-${PI_LANE_PROVIDER:-deepseek}}"; KEY_GATE_REASON=""; KEY_GATE_MODELS_JSON=""
-  [ -n "$home" ] && KEY_GATE_MODELS_JSON="$home/.pi/agent/models.json"
+  KEY_GATE_VAR=""; KEY_GATE_PROVIDER="${prov:-${PI_LANE_PROVIDER:-deepseek}}"; KEY_GATE_REASON=""; KEY_GATE_MODELS_JSON=""; KEY_GATE_AGENT_DIR=""
+  KEY_GATE_AGENT_DIR="$(key_gate_agent_dir "$home")"
+  [ -n "$KEY_GATE_AGENT_DIR" ] && KEY_GATE_MODELS_JSON="$KEY_GATE_AGENT_DIR/models.json"
   KEY_GATE_VAR="$(key_gate_var "$home" "$KEY_GATE_PROVIDER")"
   if [ -z "$KEY_GATE_VAR" ]; then
     # Blindness is not a refusal (see the header's polarity rule).
@@ -258,8 +289,8 @@ key_gate_assert() {
     # The store is what `pi` reads FIRST, so an absent variable is not an absent credential. Nothing is
     # asserted — and the line says WHICH source answered, so an operator reading a green gate is not
     # misled into thinking the environment carries the key.
-    printf '[key-gate] %s check=skipped reason=stored-credential provider=%s home=%s — %s/.pi/agent/auth.json holds a credential for this provider, and pi consults that store BEFORE the environment (and before the models.json template that names $%s), so whether $%s is exported here is not the question pi asks first; nothing is asserted here\n' \
-      "$label" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${home:-<none>}" "$KEY_GATE_VAR" "$KEY_GATE_VAR"
+    printf '[key-gate] %s check=skipped reason=stored-credential provider=%s home=%s agent_dir=%s — %s/auth.json holds a credential for this provider, and pi consults that store BEFORE the environment (and before the models.json template that names $%s), so whether $%s is exported here is not the question pi asks first; nothing is asserted here\n' \
+      "$label" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "$KEY_GATE_VAR" "$KEY_GATE_VAR"
     return 0
   fi
   KEY_GATE_REASON="credential-missing"
@@ -268,8 +299,8 @@ key_gate_assert() {
   local cands
   cands="$(key_gate_candidates "$home" | paste -sd '|' - 2>/dev/null)"
   [ -n "$cands" ] || cands="<none-derivable>"
-  printf '[key-gate] %s check=fail result=REFUSED reason=%s var=%s provider=%s models_json=%s candidates=%s\n' \
-    "$label" "$KEY_GATE_REASON" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "${KEY_GATE_MODELS_JSON:-<none>}" "$cands"
+  printf '[key-gate] %s check=fail result=REFUSED reason=%s var=%s provider=%s agent_dir=%s models_json=%s candidates=%s\n' \
+    "$label" "$KEY_GATE_REASON" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}" "$cands"
   printf '[key-gate] %s: $%s holds no value in the environment this lane would run with, so `pi` would start, print "No API key found", and exit having done nothing. ⛔ ON A CELL THIS IS THE TRAP: HOME is redirected to the operational home (%s) so the operational layer is found, and the credential usually lives in the ACCOUNT home instead — check every candidate above, export $%s (or point ENV_FILE at a file that does), then re-dispatch.\n' \
     "$label" "$KEY_GATE_VAR" "${CELL_HOME:-/tmp/cell-home}" "$KEY_GATE_VAR"
   return "$KEY_GATE_REFUSED"

@@ -481,7 +481,7 @@ assert_dir "$REPO/.worktrees/tm-17" "L5d the checkout survives"
 # credential immediately before it spawns the agent. Without this, the arm's verdict would depend on
 # whether the RUNNER has a key (a false red on a fresh box, a false green on a provisioned one) instead
 # of on the trap it exists to test. The escape is loud: the lane log carries
-# `[key-gate] … check=skipped reason=LANE_KEY_GATE=0`, and `lane-outcome.test.sh` proves the gate refuses
+# `[key-gate] … check=skipped reason=--key-gate-off`, and `lane-outcome.test.sh` proves the gate refuses
 # by default (82) — so this line cannot hide a broken gate, only omit an unrelated assertion.
 #
 # ⛔ L6/L7 ALSO PIN `ENV_FILE` TO A FIXTURE-OWNED (ABSENT) FILE, FOR THE SAME REASON ONE VARIABLE UP.
@@ -510,8 +510,8 @@ mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/dev/null
 OUT="$( cd "$REPO/.worktrees/tm-15" && \
         O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" ENV_FILE="$T/$ENV/keys.env" \
-        REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." LANE_KEY_GATE=0 MAX_LOAD=999999 \
-        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm "$LANE_OR" 2>&1 )"
+        REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." MAX_LOAD=999999 \
+        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" --key-gate-off "$@"' "$LANE" 15 feat/15-tm "$LANE_OR" 2>&1 )"
 assert_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "exited" "L6 the shipped lane.sh ran to its exit path"
 # The repo-identity gate must not be what refused: with the target naming this box's origin it must
 # PASS, otherwise "the trap reaped an empty checkout" is a statement about a lane that never started.
@@ -546,8 +546,8 @@ SH
 mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
 ( cd "$REPO/.worktrees/tm-16" && O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" ENV_FILE="$T/$ENV/keys.env" \
-  REAP_LANE_VENV_DISABLE=1 LANE_KEY_GATE=0 MAX_LOAD=999999 \
-  bash -c '. "$1"; exec bash "$2" 16 feat/16-tm "$3"' _ "$T/$ENV/o/stub-pi.sh" "$LANE" "$LANE_OR" \
+  REAP_LANE_VENV_DISABLE=1 MAX_LOAD=999999 \
+  bash -c '. "$1"; exec bash "$2" --key-gate-off 16 feat/16-tm "$3"' _ "$T/$ENV/o/stub-pi.sh" "$LANE" "$LANE_OR" \
   >/dev/null 2>&1 )
 assert_not_contains "$(cat "$T/$ENV/o/logs/lane-16.log" 2>/dev/null)" "land-backlog] REFUSED" \
     "L7 the lane REACHED its agent (the creation gate did not refuse the fixture)"
