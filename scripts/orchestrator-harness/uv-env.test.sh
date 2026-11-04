@@ -204,33 +204,33 @@ LANEEXEC_BLOCK_LIVE="$(printf '%s\n' "$LANEEXEC_BLOCK" | awk '!/^[[:space:]]*#/'
 ck "SPAWN SEAM: the block exists and is bounded (seam marker to the launch line)" \
    '[ -n "$SPAWN_BLOCK" ]'
 ck "SPAWN SEAM: run_agent CALLS the helper with its argument — the delivery, not the guard beside it" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "uv_env_apply \"\$_uvbase\""'
+   'grep -q "uv_env_apply \"\$_uvbase\"" <<<"$SPAWN_BLOCK_LIVE"'
 ck "SPAWN SEAM: …and exports both keys, so the child inherits them" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "export UV_CACHE_DIR UV_LINK_MODE"'
+   'grep -q "export UV_CACHE_DIR UV_LINK_MODE" <<<"$SPAWN_BLOCK_LIVE"'
 ck "SPAWN SEAM: …and applies it BEFORE the pi launch line (afterwards is a no-op)" \
    '[ "$(printf "%s\n" "$SPAWN_BLOCK_LIVE" | grep -n "uv_env_apply \"\$_uvbase\"" | head -1 | cut -d: -f1)" -ge 1 ]'
 ck "SPAWN SEAM: …and an unusable helper is LOUD, not a silent drop (else it reads as an older harness)" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "uv-env.sh not readable beside this helper"'
+   'grep -q "uv-env.sh not readable beside this helper" <<<"$SPAWN_BLOCK_LIVE"'
 ck "SPAWN SEAM: …and its version-skew arm (readable helper, no uv_env_apply) is enforced too" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "defines no uv_env_apply"'
+   'grep -q "defines no uv_env_apply" <<<"$SPAWN_BLOCK_LIVE"'
 ck "LANE-EXEC: the direct-exec lane path CALLS the helper before its own exec (it bypasses run_agent)" \
-   'printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "uv_env_apply \"\$_uvbase\""'
+   'grep -q "uv_env_apply \"\$_uvbase\"" <<<"$LANEEXEC_BLOCK_LIVE"'
 ck "LANE-EXEC: …and every skip path is loud — PER ARM, so silencing any one of them reds" \
-   'printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "not readable beside this helper" && printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "neither CELL_HOME nor HOME" && printf "%s" "$LANEEXEC_BLOCK_LIVE" | grep -q "defines no uv_env_apply"'
+   'grep -q "not readable beside this helper" <<<"$LANEEXEC_BLOCK_LIVE" && grep -q "neither CELL_HOME nor HOME" <<<"$LANEEXEC_BLOCK_LIVE" && grep -q "defines no uv_env_apply" <<<"$LANEEXEC_BLOCK_LIVE"'
 ck "RETENTION RULE 2: the seam reports the comparison AND the path it compared (not a bare verdict)" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "same_fs=\${_uvsame}" && printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "same_fs_target="'
+   'grep -q "same_fs=\${_uvsame}" <<<"$SPAWN_BLOCK_LIVE" && grep -q "same_fs_target=" <<<"$SPAWN_BLOCK_LIVE"'
 ck "RETENTION RULE 2: …and it does NOT apply a root-level cache when no base home exists" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "neither CELL_HOME nor HOME is set"'
+   'grep -q "neither CELL_HOME nor HOME is set" <<<"$SPAWN_BLOCK_LIVE"'
 ck "RETENTION RULE 2: the device read has a BSD fallback (stat -c is GNU-only; macOS exits 1 with no output)" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "stat -f %d"'
+   'grep -q "stat -f %d" <<<"$SPAWN_BLOCK_LIVE"'
 ck "RETENTION RULE 2: …and an empty/partial read answers '?' rather than an affirmative yes" \
-   'printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "if \[ -n \"\$_uvdev_cache\" \] && \[ -n \"\$_uvdev_wt\" \]"'
+   'grep -q "if \[ -n \"\$_uvdev_cache\" \] && \[ -n \"\$_uvdev_wt\" \]" <<<"$SPAWN_BLOCK_LIVE"'
 # ⛔ NO LIVE BACKTICKS IN A STRING THIS BLOCK EMITS. A residual sentence once read "`uv-env.sh`'s
 # recorded choice" inside a double-quoted echo — a command substitution executed on EVERY spawn, whose
 # output was spliced into the log line (or which printed `command not found` on stderr). A grep cannot
 # see that, because nothing executes the string; this arm can.
 ck "SPAWN SEAM: the emitted [uv-env] line carries NO backticks (a live substitution would run a command per spawn)" \
-   '! printf "%s" "$SPAWN_BLOCK_LIVE" | grep -q "\`"'
+   '! grep -q "\`" <<<"$SPAWN_BLOCK_LIVE"'
 ck "the estate report states distinct-vs-per-name bytes (not a per-worktree du sum)" \
    'grep -q "du_total_counting_links" "$HERE/../worktree-disk-probe.sh" && grep -q "\[distinct\]" "$HERE/../worktree-disk-probe.sh"'
 
