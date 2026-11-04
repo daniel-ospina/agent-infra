@@ -27,10 +27,10 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
   * neuter the lane-census reconciliation      -> 5 paired CENSUS reds (the fifth is the
                                                  exit-code check), plus collateral reds in the
-                                                 other census checks — **26 CENSUS reds**
-                                                 (counted census-only; the suite's total also
-                                                 carries the ambient HARNESS failure, which is
-                                                 red on the UNMUTATED module too)
+                                                 other census checks — **25 CENSUS reds**
+                                                 (census-only; the same run prints 26 `❌`
+                                                 lines because the ambient HARNESS failure is
+                                                 included and is red on the UNMUTATED module too)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -53,14 +53,17 @@ patched for the duration of a leg and restored in a `finally`, so nothing touche
 or the real launchd.
 
 ⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
-(**five** `_drive` arms), and `main()` reaches the REAL process table up to THREE times —
-`cputime_secs(os.getpid())` for the lane row, `_observed(os.getpid(), ...)` ->
-`scripts/lib/pid-identity.sh probe`, and a second `cputime_secs(pid)` from the STATE snapshot write
-that the enumeration runs for every recorded pid. All are read-only and about THIS process. The
-abstaining-record arm is independent of what they return (its lanes are `pidStartSeconds`-absent,
-which abstains regardless), but the four ALL-DEAD arms added later are NOT: each turns on
-`_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on a usable `ps`
-for a nonexistent pid. That dependency is named by the `CENSUS: PRECONDITION:` check, so a
+(**five** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
+once PER RECORDED LANE for three distinct reads: a lane-row `cputime_secs`, one `_observed` ->
+`scripts/lib/pid-identity.sh probe`, and a `cputime_secs` from the STATE snapshot write the
+enumeration runs for every recorded pid. For the two all-dead arms' seven records that measures
+14 + 7 = **21 real reads** (the abstaining-record arm carries one record, so its bound is 3).
+Those reads are about the FIXTURE's pid (`99999999`), not about `os.getpid()` — the earlier claim
+that they were all "about THIS process" held only while every arm carried at most one recorded
+pid. The abstaining-record arm is independent of what they return (its lane is
+`pidStartSeconds`-absent, which abstains regardless); the four ALL-DEAD arms are NOT: each turns
+on `_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on a usable
+`ps` for a nonexistent pid. That dependency is named by the `CENSUS: PRECONDITION:` check, so a
 host-level `ps` failure surfaces AS THAT CHECK rather than as a silent pass — and the earlier
 "touches no real process table" guarantee would have hidden both facts.
 """
