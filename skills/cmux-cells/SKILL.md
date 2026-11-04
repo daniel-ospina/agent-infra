@@ -49,6 +49,21 @@ writable `HOME=/home/cmux`), but because **the operational layer is installed un
 reads an empty home and silently loses the merge path. (`scripts/cloud-cell-bringup.sh` still carries an older
 `/home/ubuntu` explanation — that part is stale.)
 
+⛔ **AND THE SAME REDIRECTION IS WHAT HIDES THE CREDENTIAL — the half of this fact that bites (agent-infra#3331, measured
+2026-11-02).** The model credential normally lives in the **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), i.e. *not*
+under the `HOME` a lane runs with; and the harness's own `lane-env.sh` sources `${ENV_FILE:-$HOME/keys.env}`, the redirected
+one. So the one setting that makes the operational layer work is the setting that hides the credential: `pi` starts, finds no
+key, and exits having done nothing. Since #3331 `lane.sh` REFUSES that shape before spawning `pi` — `[key-gate] … check=fail
+result=REFUSED var=<NAME>` naming the variable, the provider, `models.json` and every candidate file, exit **82** — and every
+lane log now ends with `outcome=<done|refused|failed|died> reason=<token>`. ⛔ **BUT THE KEY IS ONE OF FOUR FALSIFIED CAUSES,
+NOT THE CAUSE** (see “the launch directory” below): the same issue's record shows `keys.env` sourced, `api-key-errors=0`, and
+the lane STILL dying silently. Do not conclude “a key fixed it” from a green key gate — that gate closes the *reporting*
+half, it does not make a lane run. **If the terminal line is absent**, three things produce that: a box that predates #3331, a
+lane the kernel or `lane-bound.sh` KILLed (no trap runs after SIGKILL), or a cleanup that outran the TERM→KILL grace — so
+check `[lane-bound] KILL` and `dmesg | grep -ci 'killed process'` before blaming provisioning. And never use
+`pgrep -f "pi -p"` for liveness: it matches your own command line. **And what actually made cell lanes run is the launch
+directory — see below.**
+
 **⚠️ One thing is still missing after a verified install — plus a trap for boxes installed before the fix:**
 
 | missing | symptom | fix |
@@ -431,6 +446,36 @@ killed 37 processes *and the tmux server*, losing every lane. The gate would hav
   ```
   and 60 s after launch check `grep -c 'No API key found' /tmp/cell-home/L-<slug>.log` — **0 is the pass condition**. A
   lane log that sits at ~5 KB without a tool call is almost always this, not a slow model.
+- ⛔ **AND THE REDIRECTED `HOME` IS WHAT HIDES IT — the trap this bullet used to state only half of** (agent-infra#3331,
+  measured 2026-11-02 on two cells). A lane MUST run with `HOME=$CELL_HOME` (default `/tmp/cell-home`), because the
+  operational layer — `record-review.sh`, the gh shim, the extensions — lives under `$CELL_HOME/.pi/agent`. But the
+  credential normally lives in the **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), and `lane-env.sh` sources
+  `${ENV_FILE:-$HOME/keys.env}` — the *redirected* one. So **the single setting that makes the operational layer work is the
+  setting that hides the credential**, and the lane dies in seconds having done nothing. Two consequences for an operator:
+  source the key into the LAUNCH line (`HOME=/tmp/cell-home bash -lc '. /tmp/cell-home/keys.env; . /home/cmux/keys.env; …'`),
+  and read the lane's LAST log line before concluding anything — since #3331 `lane.sh` refuses a keyless environment
+  **before** spawning `pi` (`[key-gate] … result=REFUSED var=<NAME>`, exit **82**) and every lane log ends with
+  `outcome=<done|refused|failed|died> reason=<token>`. ⛔ but a log that STOPS is not proof of a key problem: the #3331
+  record falsified that, and the cause it VALIDATED is the launch directory (next bullet).
+- ⛔ **`pgrep -f "pi -p"` IS NOT A LIVENESS TEST — IT MATCHES THE DIAGNOSTIC'S OWN COMMAND LINE.** Measured during the
+  #3331 investigation: `pgrep -fc "pi -p|pi --"` returned **3 for a dead lane**, because the pattern appears in the
+  command the operator just typed (and in any monitor that greps for it). It reported "alive" until the read was
+  re-measured with a CPU-time delta. Liveness comes from a POSITIVE read of the lane's own artifact — the
+  **run-scoped** verdict `cat $O/logs/lane-<N>.outcome` (written by the lane's exit trap, removed AND re-owned by the
+  next dispatch of the same issue, so its absence means "no verdict for this run"), a
+  transcript mtime/size delta, or a CPU-time delta (`lane-status.py`, `lane-bound.sh`'s
+  `cpu_cs`) — never from a process-name match. ⛔ **and the run-scoped file is not absolute either**: a previous attempt
+  that is still ALIVE can write its line into the new run's file in the dispatch handover window (read → re-stamp →
+  write is three steps, stated as a residual in `lane.sh`), and the log is append-only, so `grep '^outcome=' <log> |
+  tail -1` can hand you the PREVIOUS attempt's verdict. Cross-check the timestamp and `lane=`/`rc=` fields rather than
+  trusting either source alone. See `docs/ops/fleet-liveness.md` (agent-infra) for the one verdict
+  function, and prefer a bracket (`pi [-]-model`) or a script file run detached when a kill pattern is unavoidable.
+- ⛔ **LAUNCH A CELL LANE WITH ITS CWD INSIDE A GIT REPOSITORY OR WORKTREE — NEVER A BARE DIRECTORY LIKE `/tmp`.** This is the
+  cause the #3331 record VALIDATED after four falsified hypotheses: a lane launched from a non-repo directory dies on the first
+  git-dependent hook (`fatal: not a git repository (or any of the parent directories): .git`), and the *only* difference between
+  a 6,180-byte log that died mid-work and a 16,812-byte log that reached `agent_end → session_shutdown` was the launch
+  directory. The probes that "worked" from `/tmp` (a PONG, a local read) were runs that never triggered a git call. So: `cd`
+  into the checkout (or the lane's worktree) before launching, and treat "worked from /tmp" as evidence of the opposite.
 - A 0-byte lane log with a live `bash` pane means **`pi` was killed inside the session** — check `dmesg | grep -ci 'killed
   process'` and `free -m`: that is the OOM cliff, and the fix is fewer lanes, not a restart.
 - Ship a brief by base64+gzip (`printf %s '<b64>' | base64 -d | gunzip > brief.md`) — a 113 KB inline heredoc times out,
