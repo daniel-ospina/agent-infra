@@ -50,14 +50,17 @@
 # one). The result would be a class that reaps nothing and reports healthy: the inert-enforcer shape
 # this whole reaper exists to remove. mtime is the proof because the runner's own I/O is the evidence;
 # the FLOOR is the dial, and it is the operator's (`REAP_RW_MIN_AGE` / `--min-age`).
-# Measured: a 120-minute hand reap on a box with 12 live runners lost no job. The default here is the
-# briefer 60 minutes — and because the floor is what prices this trade, a box whose jobs write only
-# OUTSIDE the checkout should use the validated 7200 s (`DISK_REAPER_RUNNER_MIN_AGE=7200`), not the
-# shipped 3600 s. ⚠️ RESIDUAL, stated so it is not discovered: a job that writes NOTHING **INSIDE ITS
-# CHECKOUT** for longer than the floor is indistinguishable from a dead entry by this test. That is a
-# whole-job exposure for any job whose artefacts land in `$TMPDIR`, `~/.cache` or `_work/_temp` (every
-# step after checkout), not merely "one long quiet step". If a box runs such jobs, raise the floor —
-# that is the intended response, not a busy-check.
+# Measured: a 120-minute hand reap on a box with 12 live runners lost no job. ⛔ THE DEFAULT **IS** THAT
+# VALIDATED VALUE (7200 s = the 120 minutes that was measured), and it was 3600 s at an earlier head:
+# the SHIPPED default was half the only floor anything had validated, in a class that is in the entry
+# point's default `DISK_REAPER_ONLY` and is installed by a timer whose `ExecStart` carries `--apply` —
+# so merging it armed a delete at 2x the measured aggressiveness on every box, not in a dry run. A
+# default is not a suggestion here; it is what runs when nobody reads the header. ⚠️ RESIDUAL, stated
+# so it is not discovered: a job that writes NOTHING **INSIDE ITS CHECKOUT** for longer than the floor
+# is indistinguishable from a dead entry by this test. That is a whole-job exposure for any job whose
+# artefacts land in `$TMPDIR`, `~/.cache` or `_work/_temp` (every step after checkout), not merely "one
+# long quiet step". If a box runs such jobs, raise the floor — that is the intended response, not a
+# busy-check.
 #
 # ⛔ DELIBERATELY RETAINED: THE WHOLE OF THE RUNNER'S `_work` NAMESPACE, DERIVED from the vendor layout
 # in ONE table (`WORK_LAYOUT`, below). `_temp` is the LIVE job's `$RUNNER_TEMP`; `_actions`/`_tool` are
@@ -146,7 +149,7 @@ EXPLICIT="${REAP_RW_EXPLICIT-0}"
 # where the farm puts runners elsewhere (cell 3 keeps installs under `/tmp/actions-runner`, cell 4's
 # are in `/opt`).
 GLOBS="${REAP_RW_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work}"
-RUNNER_WORK_MIN_AGE="${REAP_RW_MIN_AGE:-3600}"
+RUNNER_WORK_MIN_AGE="${REAP_RW_MIN_AGE:-7200}"
 DU_TIMEOUT="${REAP_RW_DU_TIMEOUT:-120}"
 FIND_TIMEOUT="${REAP_RW_FIND_TIMEOUT:-120}"
 DRY_RUN="${REAP_RW_DRY_RUN:-1}"
@@ -252,6 +255,21 @@ case "$GLOBS" in *[![:space:]]*) : ;; *)
     exit 3 ;;
 esac
 num "$RUNNER_WORK_MIN_AGE"            || die "REAP_RW_MIN_AGE must be a whole number of seconds (got '$RUNNER_WORK_MIN_AGE')"
+# ⛔ A SET-BUT-EMPTY `REAP_RW_EXPLICIT=` IS A REFUSAL, NOT "NOT EXPLICIT". `${REAP_RW_EXPLICIT-0}` keeps
+# UNSET (→0) and SET apart, which is right — but a set-and-EMPTY value yields `""`, which is neither `1`
+# nor `0`, so every `[ "$EXPLICIT" = 1 ]` below reads FALSE. MEASURED before this guard: an
+# explicitly-asserted layout that matched nothing reported a MEASURED EMPTY POPULATION (`census=ok`, rc 0)
+# instead of `census=no-roots` (rc 3) — the third spelling of the fail-open that case (i) fixed, reopened
+# through an emptied seam. A template that renders `REAP_RW_EXPLICIT=` must not be able to disarm the
+# assertion it carries; every sibling seam (`REAP_RW_GLOBS`, `DISK_REAPER_RUNNER_GLOBS`) already refuses
+# an emptied value, and this one is the gate on "the population I named is not here".
+case "$EXPLICIT" in
+    0|1) : ;;
+    *)  printf '%s: ⛔ FAIL-CLOSED — REAP_RW_EXPLICIT must be 0 or 1 (got %s); an emptied value would disarm the explicit-layout refusal, so a layout that matched nothing would read as a MEASURED empty population\n' "$SCRIPT_NAME" "'$EXPLICIT'" >&2
+        printf '%s: set REAP_RW_EXPLICIT=1 (explicit), =0 (defaults-equivalent), or leave it UNSET\n' "$SCRIPT_NAME" >&2
+        printf 'SKIP reason=explicit-seam-unreadable\n'
+        exit 3 ;;
+esac
 # ⛔ BOUNDED BY MAGNITUDE AND NORMALISED, NOT JUST ALL-DIGITS. `num` accepts ANY digit string, and this
 # floor is the ONLY gate on a `rm -rf`, so an out-of-range value fails OPEN in the direction an operator
 # would use to PROTECT work:
@@ -411,7 +429,16 @@ entry_written_since() { # <entry> <floor-ref>
 }
 
 # ── the sweep ───────────────────────────────────────────────────────────────────────────────────
-ROOTS=0; GLOBS_N=0; CAND=0; REAPED=0; KEPT=0; RETAINED=0; FAILED=0; UNMEASURABLE=0
+ROOTS=0; GLOBS_N=0; CAND=0; REAPED=0; KEPT=0; RETAINED=0; FAILED=0; UNMEASURABLE=0; REFUSED_ROOTS=0
+# Roots already swept, SPACE-delimited and matched with a `case` guard: bash 3.2 (this repo still ships
+# to macOS) has no associative arrays, so the seen-set is a string, exactly as `disk-reaper.sh`'s
+# `SKIPPED_WT` accumulates, and the surrounding spaces are what let ONE pattern cover the FIRST root too.
+# A path containing a space cannot be expressed in `GLOBS` at all (see the expansion note below), so a
+# space is an unambiguous delimiter here. `--glob` is REPEATABLE, so a wildcard and a literal naming the
+# same root is a normal operator spelling — without this the root was swept twice and the population was
+# reported at TWICE its size (`roots=2 candidates=2` for one entry, the same WOULD-REMOVE path logged
+# twice).
+SEEN_ROOTS=""
 DEADLINE=0; MODE_TEXT=dry-run; SCRATCH=""; FLOOR_REF=""
 
 is_retained() { # <entry name> — 0 when the RUNNER owns this name (never a candidate)
@@ -599,6 +626,30 @@ for _g in $GLOBS; do
     _matched=0
     for _r in $_g; do
         [ -d "$_r" ] && [ ! -L "$_r" ] || continue
+        _r="${_r%/}"
+        # ⛔ THE NAME IS THE LAST GATE BEFORE `rm -rf`, AND IT WAS MISSING. This loop tested only
+        # `-d` and `! -L`, so a seam ONE COMPONENT SHORT — `/opt/gh-runner*/` instead of
+        # `/opt/gh-runner*/_work` — matched the runner INSTALL tree itself and swept `bin/`,
+        # `config/`, `externals/` for every runner on the box. MEASURED at that head:
+        # `REAPED …/gh-runner-x//bin how=rm (no content written for >= 3600s)` — and the floor offers
+        # NO protection there, because an install tree is always older than any floor. One character
+        # in a rendered unit would have destroyed the CI hosts.
+        # ⛔ REFUSED BY NAME AND FAIL-CLOSED, not silently skipped: a root whose basename is not
+        # `_work` is an assertion about the box that is WRONG, and the pass must say so (rc 3) rather
+        # than sweep the roots it did find and report a healthy population. `_matched=1` because the
+        # glob DID match something — the "matched no runner _work root" note would be a falsehood.
+        case "${_r##*/}" in
+            _work) : ;;
+            *)  REFUSED_ROOTS=$((REFUSED_ROOTS + 1)); _matched=1
+                log_line "REFUSED $_r reason=not-a-_work-root (a matched root whose BASENAME is not '_work' is refused: it is not a job-checkout namespace, and a seam one component short matches the runner INSTALL tree whose bin/config/externals are ALWAYS older than the floor)"
+                continue ;;
+        esac
+        case " $SEEN_ROOTS " in
+            *" $_r "*) log_line "reap-runner-work: root $_r was already swept from an earlier glob — not counted twice"
+                _matched=1
+                continue ;;
+        esac
+        SEEN_ROOTS="$SEEN_ROOTS $_r"
         _matched=1
         log_line "reap-runner-work: root $_r (glob $_g)"
         sweep_root "$_r"
@@ -610,9 +661,30 @@ done
 # exit status can never disagree about whether this pass measured anything.
 CENSUS=ok
 if [ "$ROOTS" = 0 ] && [ "$EXPLICIT" = 1 ]; then CENSUS=no-roots; fi
+# ⛔ A ZERO THAT NOTHING MEASURED IS NOT A ZERO — THE FALSE PASS A REVIEW FOUND AT THIS CLASS'S OWN FIX.
+# The root-abstention above counts an unlistable root into `unmeasurable=`, which is the right ANSWER and
+# was the wrong RECORD: with nothing readable, `CAND` stays 0, so the owner still printed `census=ok`
+# with `candidates=0`, and the entry point lifted that into `candidates_runner_work=0` /
+# `verdict_runner_work=ok`. MEASURED (a mode-0111 `_work` holding a provably dead entry):
+#   record: ok=1 / candidates_runner_work=0 / unmeasurable_runner_work=1 / verdict_runner_work=ok
+#   dead entry survived? YES
+# — a box whose sink fills and whose alarm reads `ok` for ever, on the very permission mismatch this
+# class's header names as plausible. `census=no-roots` (a WEAKER situation) already had the correct
+# treatment; this is the same rule one state over. The population was not measured, so it is not
+# reported: `candidates` stops being a count and the token says why. rc stays 0 — an abstention is not
+# a failure of the pass, it is the pass saying it could not look (an ALARM is the caller's judgement).
+if [ "$CENSUS" = ok ] && [ "$UNMEASURABLE" -gt 0 ] && [ "$CAND" = 0 ]; then CENSUS=abstained; fi
 
-log_line "SUMMARY class=runner-work mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE min_age=${RUNNER_WORK_MIN_AGE}s explicit=$EXPLICIT census=$CENSUS"
-log "SUMMARY mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED census=$CENSUS"
+log_line "SUMMARY class=runner-work mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE refused=$REFUSED_ROOTS min_age=${RUNNER_WORK_MIN_AGE}s explicit=$EXPLICIT census=$CENSUS"
+log "SUMMARY mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE refused=$REFUSED_ROOTS census=$CENSUS"
+
+# ⛔ A REFUSED ROOT IS LOUD AND FAILS THE PASS. Checked BEFORE the no-roots arm: a layout whose only
+# match was refused is a WRONG LAYOUT seam, not a box with no runners, and the two need different
+# remedies — so the specific one wins.
+if [ "$REFUSED_ROOTS" -gt 0 ]; then
+    log_line "SKIP reason=not-a-_work-root ($REFUSED_ROOTS matched root(s) refused because their BASENAME is not '_work': the seam is one component short, e.g. '/opt/gh-runner*/' instead of '/opt/gh-runner*/_work' — sweeping it would delete the runner INSTALL tree)"
+    exit 3
+fi
 
 if [ "$CENSUS" = no-roots ]; then
     # ⛔ AN EXPLICIT LAYOUT THAT MATCHES NOTHING IS A REFUSAL, NOT A ZERO. When the operator (or the
