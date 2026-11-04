@@ -994,6 +994,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   {
+    name: "REAP_WT_PRESERVE_KEEP_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
+    axis: "retention",
+    guardedBy:
+      "scripts/pi-reap-worktrees.test.sh behaviour pin (the G2aa arms drive BOTH sides of the horizon through the shipped prune: a dated 2020-01-01 dir is removed, a RECENT dated dir survives, a non-date / malformed / date-shaped-suffix name is never a candidate, the dry run reports without removing, `0` keeps everything, a non-numeric value is REFUSED at exit 2, and the FALLBACK root is pruned too)",
+    note: "#3405 round 2 — how long a dated subdirectory of the reclaim path's ARCHIVE is kept (default 14 days; 0 keeps everything). The archive is a NEW sink on the reclaim path, so it needed a bound of its own, and this row is that bound made visible: it landed WITHOUT a registry row, which redded the reverse scan of this registry on main and therefore on every PR based on it (`verify` → `Heartbeat progress-edge declaration drift gate`), naming the declaration but not the PR that added it. Retention axis, not reap: it decides how long a PRESERVED artifact is held, and it never decides whether a checkout is reclaimed. ONLY exact `YYYY-MM-DD` subdirectories are candidates, oldest first, so operator data in the same directory is untouchable.",
+  },
+  {
     name: "REAP_WT_BUDGET_SECONDS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_BUDGET_SECONDS:-300}",
