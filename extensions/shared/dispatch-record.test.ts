@@ -395,8 +395,10 @@ test("#385 review fix: the read-back confirm matches the FULL row identity — a
 	// subagent-tool children are spawned `--no-session` (so `childSessionId` is
 	// null for all of them). Two sibling orphans of one dispatch agree on all
 	// four — so a sibling's successful append would confirm OUR failed one and
-	// print `settle=recorded` for a row that was never written. The fields that
-	// tell those siblings apart are exactly childSessionId/parentPid/killedPids.
+	// print `settle=recorded` for a row that was never written. childSessionId,
+	// parentPid and killedPids separate siblings in the GENERAL case — but NOT
+	// two LEAF siblings (`killedPids: []`, the common case), which is why `ts` is
+	// required as well; see the leaf case below. Do NOT treat `ts` as redundant.
 	const base = {
 		extension: "task-heartbeat",
 		dispatchId: "n1",
@@ -443,7 +445,8 @@ test("#385 review fix: the read-back confirm matches the FULL row identity — a
 	// ⛔ THE CASE THAT MADE `ts` NECESSARY (measured): a sibling leaf orphan shares
 	// childSessionId (null, --no-session), parentPid (the same dispatcher), attempt
 	// (the inherited enclosing ordinal), reason (the constant) AND killedPids ([]
-	// is the common leaf case). Without `ts` the predicate answered TRUE above.
+	// is the common leaf case). Without `ts` the predicate answered TRUE for that
+	// leaf case below — measured, which is why `ts` is in the conjunction.
 	const leaf = { ...base, parentSessionId: null, killedPids: [] };
 	const leafMine = buildDispatchOutcomeRow(leaf, new Date("2026-11-02T22:00:00.000Z"));
 	const leafSibling = buildDispatchOutcomeRow(leaf, new Date("2026-11-02T22:00:00.001Z"));
