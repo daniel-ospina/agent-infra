@@ -2522,7 +2522,7 @@ reap_runner_work() {
     # operator that the sink moved under the pass.
     case "${GONE_RW:-?}" in
         ''|*[!0-9]*) : ;;                       # unanswered: never invent a tally
-        *) [ "$GONE_RW" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${GONE_RW} entr$( [ "$GONE_RW" = 1 ] && printf 'y' || printf 'ies')/root$( [ "$GONE_RW" = 1 ] && printf '' || printf 's') VANISHED during the pass (a job finished and the runner cleaned its own checkout); nothing under them was measured and nothing was removed — a fact about the box, not an abstention; see gone_runner_work" ;;
+        *) [ "$GONE_RW" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${GONE_RW} entr$( [ "$GONE_RW" = 1 ] && printf 'y' || printf 'ies')/root$( [ "$GONE_RW" = 1 ] && printf '' || printf 's') VANISHED during the pass (a job finished and the runner cleaned its own checkout); nothing under them was measured or removed — a fact about the box, not an abstention; see gone_runner_work" ;;
     esac
     # ⛔ NOTHING REMOVED MEANS THE DELTA IS NOT OURS. Another lane (or a runner finishing a job, or the
     # runner's own cleanup) moves `df` inside the window; crediting it would report a reclaim this class
