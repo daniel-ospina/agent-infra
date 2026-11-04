@@ -282,7 +282,28 @@ def main(argv):
     tpl_path, dst_path = args
 
     tpl = json.load(open(tpl_path))
-    dst = json.load(open(dst_path)) if os.path.exists(dst_path) else {}
+    # ⛔ UNPARSEABLE IS THE LAST CONTAINER SHAPE THAT COULD NOT BE REPAIRED. `json.load` raised
+    # `JSONDecodeError` (a `ValueError`) BEFORE the write, so `--install` — the repair path
+    # `cloud-cell-bringup.sh` runs on a verify failure — exited 1 having changed nothing, and the
+    # bring-up died; `setup.sh` aborted too (it calls this under `set -e`), leaving agents,
+    # extensions and farms uninstalled behind an unreadable config. And it is REACHABLE, not
+    # theoretical: the pre-#3374 merge wrote `.mcp.json` with `json.dump(open(dst, "w"))` —
+    # truncate-in-place, the very race the write below documents — so an interrupted legacy run left
+    # a truncated file on an already-provisioned box. `--verify` already refuses this shape
+    # (`NOTJSON:`), so the layer calls it invalid; the repair is a REPLACE, and the replaced bytes
+    # are KEPT. Same rule as the two container shapes below, one level up: a file nothing can parse
+    # is not a config, but it may be hand-written work someone wants back.
+    dst = {}
+    if os.path.exists(dst_path):
+        try:
+            dst = json.load(open(dst_path))
+        except ValueError as exc:
+            print(
+                "NOTE: REPLACED an UNPARSEABLE .mcp.json (%s: %s); the previous file was saved as %s.bak"
+                % (type(exc).__name__, exc, dst_path)
+            )
+            _keep_backup(dst_path)
+            dst = {}
     base = tpl.get("mcpServers") or {}
     want = base.get("tortoise")
     if not isinstance(want, dict) or not want.get("url"):
@@ -414,6 +435,25 @@ def main(argv):
                         "different name if you need it)" % name
                     )
                 have[name] = entry
+
+    # ⛔ A MERGE THAT PRESERVES A LEAK AND SAYS NOTHING is the same defect from the other side. The
+    # token scan above only ever sees the TORTOISE entry, so a literal credential pasted into any
+    # OTHER server was preserved silently: the merge printed `hosted tortoise entry installed`, rc=0,
+    # and the layer then refused the very file it had just written — a bring-up that cannot converge
+    # while the install log reads as success. It is NAMED here rather than refused: the bytes are
+    # ALREADY in the destination (a merge never clobbers, and setup.sh merges on laptops where no
+    # verifier runs), so refusing would turn a diagnostic into a new block without removing the
+    # secret. What was missing is the sentence, not the exit code.
+    for name, entry in sorted(have.items()):
+        if name == "tortoise":
+            continue                    # refused by `usable()`, and named by `--verify` already
+        at = token_path(entry, name)
+        if at:
+            print(
+                "NOTE: .mcp.json STILL carries a literal credential at %s — this merge preserved it, "
+                "and `--verify` will refuse this file until it is removed. Make it env-indirect "
+                '(e.g. "${YOUR_VAR}") or delete the entry' % at
+            )
 
     merged = {**dst, "mcpServers": have}
     # ⛔ NEVER TRUNCATE IN PLACE. `json.dump(open(dst_path, "w"))` empties the file first and writes
