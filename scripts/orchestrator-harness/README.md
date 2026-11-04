@@ -207,6 +207,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `check-deployed-drift.sh` | answers "which harness commit is this box running?" |
 | `report.sh`, the wall-time series, the `[res]` line | cheap measurement — it is how the reviewer stall rate was found |
 | `install.sh` + `launchd.plist.template` | renders config from one source, refuses an out-of-range value instead of writing it, and prints the start command **without running it** unless asked — `--start` starts **and proves it started** (pid + heartbeat), `--restart` is the un-wedging path (§0.6) |
+| `orch-pin-exec.sh` — **the launchd PROGRAM** (agent-infra#3309) | The plist no longer names the pin. `$HARNESS` is `<pin root>/<sha12>`, a hash-named snapshot `harness-refresh.sh` **garbage-collects** as the pin advances, and launchd reads `ProgramArguments` ONCE at bootstrap — so a plist naming the pin is correct at install time and dead after the next pin move: every tick `No such file or directory`, exit 127, while `launchctl list` still says `loaded` (measured 2026-11-02: the loop was dead ~15 h and a 15-hour-old `candidates.txt` read as a full queue). `__PROGRAM__` therefore renders **`$O/orch-pin-exec.sh`**: a fixed resolver at a path that never moves, whose bytes are seeded from the pinned tree on **every** install and which execs whatever the pin dir record names, per tick. `install.sh` **refuses** to install unless the rendered program is outside `$HARNESS_PIN_DIR`, exists, is executable, and — run now — **resolves to `<pin>/<entrypoint>`**; a resolver that cannot resolve makes the installer **refuse and speak** (its `PIN-EXEC: DEAD-SUPERVISOR:` stderr is carried into the refusal) rather than abort silently at rc=127. It exits **127 with that marker** when the pin cannot be resolved, because 127 is the code the fleet already reads in `launchctl list` and the marker is what makes a dead supervisor greppable instead of reading as "between ticks". It also refuses to exec **itself**, comparing **physical** paths — a pin record naming a symlink to the stub's own directory would otherwise re-exec the stub forever under `KeepAlive`. `check-deployed-drift.sh` compares it against the shipped copy, and it is in `install.sh`'s `$O` drift list: it is the one `$O` file whose divergence turns every launchd tick into exit 127 |
 | `nonblocking-dispatch.sh` | removes the blocking-caller problem |
 | `worker-terminal.sh` | the ONE place a worker is launched, asked whether it is alive, counted and killed (`orch-loop.sh` / `dispatch-merge.sh` both source it). Without it a lane is a tmux window that dies at ~21 log lines (§2.1) |
 | `capacity.sh` | R8's other half: MEASURED cross-box placement — load-per-core, lanes, disk and memory per box on the shared origin, so the next lane goes to the least-loaded ELIGIBLE box instead of to whichever controller asked first (§9) |
@@ -1519,6 +1520,10 @@ carries 19 placeholders — the thirteen limits above them, `SCOPE`, `O`, `REPO`
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
+⛔ **`__PROGRAM__` is not one of those:** it names the launchd **program** — `$O/orch-pin-exec.sh`, the
+stable resolver — and is substituted from `STABLE_PROG`, never from the table above. `__HARNESS__` /
+`__ENTRY__` still render, but they now describe the pin the resolver *targets*, not the program the job
+execs (agent-infra#3309; the row for it is in the shipped-scripts table above).
 (That list is hand-kept and had drifted by one — a stall bound was missing from it while being exactly
 the silent no-effect this paragraph warns about. Verify it rather than trusting it: every knob in the table
 above that has no `__NAME__` placeholder in `launchd.plist.template` must be named here, except the three
@@ -5130,9 +5135,13 @@ job NAMES is a tree the repo can be pinned to.
    `orch-loop.sh`. When no pin is recorded it **materialises one through the cells' own materialiser**
    (`cloud-cell-supervisor.sh apply --force --pin-only`); when the resolved dir is a copy, a different
    commit, unreadable, or unexaminable, it **refuses (rc=78) naming both paths**. After rendering it
-   parses the plist back and refuses unless the `ProgramArguments` program IS
-   `<pin>/<entrypoint>`. The render therefore cannot name `$O`, `~/orchestrator` or `~/.cache/orc`,
+   parses the plist back and requires the `ProgramArguments` program to be the **stable resolver**
+   (`$O/orch-pin-exec.sh`), to live **outside** `$HARNESS_PIN_DIR`, and — run now — to **resolve to**
+   `<pin>/<entrypoint>`: both ends are checked, so it cannot render a program the pin does not name, nor
+   one that quits 127 on every tick. The render therefore cannot name `$O`, `~/orchestrator` or `~/.cache/orc`,
    and `$O` keeps its real job — the **worker** surface, exactly as on a cell.
+   (agent-infra#3309 moved the program off the pin path and onto that resolver, because launchd cannot
+   follow a pin that moves — see the `orch-pin-exec.sh` row in the shipped-scripts table.)
 2. **`scripts/harness-up` gained a `box` row**, so `harness-status` names the machine AND the pin sha it
    runs (`box | <host> | <sha12> | OK (darwin via scutil ComputerName; harness <pin dir>)`). The Mac is
    now one of the boxes that answers "which harness?" in the same shape as a cell, instead of the
@@ -5166,7 +5175,8 @@ O="${O:-$HOME/orchestrator}"
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
 those copies **plus every §7.4 fix** (and the §7.4b and §7.4c ones). `install.sh` compares the scripts it invokes — the ten loop
-scripts in §9 plus the manual `adopt-fix.sh`, and `gh-rest/gh` — against the running copies at `$O` and warns loudly
+scripts in §9 plus the manual `adopt-fix.sh`, the stable launchd program `orch-pin-exec.sh`
+(agent-infra#3309), and `gh-rest/gh` — against the running copies at `$O` and warns loudly
 on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not
 compared, since the daemon does not run it. If you are adopting this onto an existing box, sync
