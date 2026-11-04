@@ -30,7 +30,10 @@ THE RULES, in order:
    * a USABLE differing entry is PRESERVED and marked `_selfHosted: true`, so the caller and
      `--verify` can say out loud that this machine points somewhere other than the default instead
      of silently certifying it. Usable is URL-AWARE (`usable()`): a self-hosted daemon needs no
-     key, so "no Authorization" is only a fault when the url IS the hosted endpoint;
+     key, so "no Authorization" is only a fault when the url IS the hosted endpoint. ⛔ "Differing"
+     means a different AUTHORITY: a scheme-only change on the same host (`http://` for `https://`)
+     is a typo, not a self-host, and is NOT preserved — marking it would hand `--verify` an
+     exemption it honours while the live key crossed the wire in cleartext (`near_miss()`);
    * anything else (a hosted url with no key, a literal key, an explicit non-http transport) is
      REPLACED with the template's entry, because preserving it creates a config `--verify` must
      refuse in perpetuity — a cell no repair can fix.
@@ -85,19 +88,27 @@ def token_path(node, trail=""):
 
 
 def near_miss(url, want_url):
-    """True when `url` is the DEFAULT endpoint spelled differently (same scheme+host).
+    """True when `url` is the DEFAULT endpoint spelled differently (SAME AUTHORITY).
 
     A self-host is a DIFFERENT HOST — that is what makes it a self-host. Same host with a different
     path (or a missing trailing slash) is a typo, or a copy that got mangled, and preserving it means
     the box points at an endpoint nobody meant to configure.
+
+    ⛔ THE SCHEME IS PART OF THE SPELLING, and comparing it is what keeps a scheme-only typo OUT of
+    the `_selfHosted` exemption. That exemption is what `--verify` honours, and the hosted entry
+    carries a live `Bearer ${TORTOISE_MCP_API_KEY}`: `http://api.premiselabs.co/mcp/` marked
+    `_selfHosted` is then certified rc=0 by the verifier, and the key crosses the wire in CLEARTEXT
+    while the cell prints LAYER VERIFIED. `https`↔`http` on the SAME host is a typo, never a
+    self-host, so the default wins here and `--verify` refuses a credential on a non-https url as
+    a second line of defence.
     """
     def host(u):
-        m = re.match(r"^([a-z]+)://([^/]+)", u or "", re.I)
-        return (m.group(1).lower(), m.group(2).lower()) if m else ("", "")
+        m = re.match(r"^[a-z][a-z0-9+.\-]*://([^/]+)", u or "", re.I)
+        return m.group(1).lower() if m else ""
     if not url or not want_url or url == want_url:
         return False
     uh, wh = host(url), host(want_url)
-    return bool(wh[1]) and uh == wh
+    return bool(wh) and uh == wh
 
 
 def usable(entry, want_url):
@@ -146,8 +157,21 @@ def usable(entry, want_url):
 
 
 def main(argv):
-    cell = "--cell" in argv
+    # ⛔ AN UNKNOWN FLAG IS A USAGE ERROR, NOT SOMETHING TO DROP. The old `--cell in argv` plus
+    # `[a for a in argv if not a.startswith("--")]` swallowed every stray flag silently, so
+    # `merge-mcp.py <tpl> <dst> --cel` exited 0 having installed the FULL base catalog — the exact
+    # unspawnable set rule 4 exists to keep off a cell (`seo-intelligence` needs a `mcp-servers/`
+    # tree a cell does not ship; `playwright-browser` pulls npx onto a small box). The flag that
+    # decides a cell's whole MCP surface must not fail open on a typo, and a longer catalog reads as
+    # richer, not wrong, so nothing downstream would report it.
+    flags = [a for a in argv if a.startswith("--")]
     args = [a for a in argv if not a.startswith("--")]
+    unknown = [f for f in flags if f != "--cell"]
+    if unknown:
+        sys.stderr.write("FATAL: unknown flag(s): %s\n" % " ".join(unknown))
+        sys.stderr.write(__doc__ or "usage: merge-mcp.py <template> <dest> [--cell]\n")
+        return 2
+    cell = "--cell" in flags
     if len(args) != 2:
         sys.stderr.write(__doc__ or "usage: merge-mcp.py <template> <dest> [--cell]\n")
         return 2
@@ -249,7 +273,20 @@ def main(argv):
                 have[name] = entry
 
     merged = {**dst, "mcpServers": have}
-    json.dump(merged, open(dst_path, "w"), indent=2)
+    # ⛔ NEVER TRUNCATE IN PLACE. `json.dump(open(dst_path, "w"))` empties the file first and writes
+    # it incrementally, so a concurrent reader — a live lane's mcp-client picking the first
+    # `.mcp.json` it finds, or record-review.sh during an install — can read a half-written config
+    # and see ZERO MCP servers: exactly the GRAPH-UNREACHABLE symptom this change exists to remove,
+    # reintroduced as a race. `cell-install.sh`'s own `install_file` writes temp+`mv` for this reason;
+    # `.mcp.json` is now a cell artifact too, so it gets the same treatment.
+    tmp = "%s.tmp.%d" % (dst_path, os.getpid())
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(merged, fh, indent=2)
+        os.replace(tmp, dst_path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
     return 0
 
 

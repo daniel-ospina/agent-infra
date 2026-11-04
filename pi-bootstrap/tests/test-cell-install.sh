@@ -1298,17 +1298,74 @@ sys.exit(0 if t.get("url") == "http://localhost:8000/mcp" else 1)
 PY
 # ⛔ INSTALL AND VERIFY MUST AGREE ABOUT THE ENTRY INSTALL JUST PRESERVED. They did not: the merge
 # deliberately kept a self-hosted `type: "sse"` entry, while `--verify` refused EVERY non-http `type`
-# before it ever looked at the url — so `cloud-cell-bringup.sh`'s repair loop (verify fails -> install ->
-# "operational layer present and verified") certified a layer it had just refused, and could never
-# converge, because each repair re-created the same refusal. The client picks its transport from `url`
-# alone (`extensions/mcp-client/index.ts`: `if (config.url) … StreamableHTTPClientTransport`), so `sse`
-# on a self-hosted daemon is the operator's spelling, not a fault. ONE rule, both sides.
+# before it ever looked at the url. ⛔ THE MECHANISM IS A FALSE **BLOCK**, NOT A FALSE PASS, and the
+# difference matters to whoever reads this next: `--install` runs this same verify (`verify_layer`) and
+# exits 1 on a recorded failure, and `cloud-cell-bringup.sh` turns a non-zero install rc into a `die`
+# — so the repair loop re-created the refusal and the cell could NEVER converge: every bringup failed
+# loudly, on a config the installer had itself just preserved. Certification was never the hole (it
+# comes from the install's rc, which already carries the verdict); convergence was. The client picks
+# its transport from `url` alone (`extensions/mcp-client/index.ts`: `if (config.url) …
+# StreamableHTTPClientTransport`), so `sse` on a self-hosted daemon is the operator's spelling, not a
+# fault. ONE rule, both sides.
 run_verify
 rc=$?
 [ "$rc" -eq 0 ] && grep -q "SELFHOSTED:http://localhost:8000/mcp" "$LOG" \
   && ok "install and verify AGREE on a preserved self-hosted entry (certified BY NAME, not refused for its transport)" \
-  || fail "--verify refused (rc=$rc) an entry install had just deliberately preserved, or did not certify it by name — the bringup repair loop then reports a refused layer as verified"
-cp "$ROOT/templates/.mcp.base.json" /tmp/_canon.tpl 2>/dev/null || true
+  || fail "--verify refused (rc=$rc) an entry install had just deliberately preserved, or did not certify it by name — the cell then fails every bring-up with no repair that can clear it"
+# ⛔ A SCHEME-ONLY TYPO MUST NOT MINT THE `_selfHosted` EXEMPTION. `http://` for `https://` on the
+# SAME host is a typo, not a self-host — but the merge compared (scheme, host), so it read as a
+# self-host, PRESERVED the cleartext url, marked it `_selfHosted`, and `--verify` then honoured the
+# exemption it had just been handed (rc=0, `SELFHOSTED:` printed). The hosted entry carries a live
+# `Bearer ${TORTOISE_MCP_API_KEY}`, so the cost is not a 401: the tenant key crosses the wire in
+# cleartext while the cell prints LAYER VERIFIED beside a green `graph credential: resolves from …`.
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+t = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+t["url"] = "http://api.premiselabs.co/mcp/"      # SCHEME downgraded — SAME host
+# the credential header is the TEMPLATE's own, so this fixture never has to spell one (and cannot
+# drift from the canonical bytes the verifier accepts)
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a SCHEME-only downgrade of the hosted url is REPLACED, not blessed with _selfHosted (a typo is not a self-host)" \
+  || fail "install marked http://api.premiselabs.co/mcp/ as _selfHosted and kept it — the verifier then certifies a cell that sends its tenant key in cleartext"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
+PY
+# ...and the verifier must refuse a credential on a non-https url on its OWN evidence: a hand-edited
+# file can carry the exemption without any install having blessed it, and `_selfHosted` is an
+# assertion by the operator, never a licence to leak.
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+t = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+t["url"] = "http://api.premiselabs.co/mcp/"
+t["_selfHosted"] = True                        # the exemption, asserted by hand
+# again the TEMPLATE's own credential header: the arm is about the SCHEME, not about the header
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "carries a credential over a NON-https scheme" "$LOG" \
+  && ok "--verify refuses a credential on a non-https url even when it is marked _selfHosted (no exemption for cleartext)" \
+  || fail "--verify certified a tortoise url that would send the tenant key over cleartext (rc=$rc) — _selfHosted must not licence a credential in the clear"
+# ⛔ THE FLAG THAT DECIDES A CELL'S MCP SURFACE MUST NOT FAIL OPEN ON A TYPO. The parser dropped
+# every unknown `--flag` and matched `--cell` by exact string, so `--cel` exited 0 having installed
+# the FULL base catalog — the unspawnable set the cell rule exists to keep off a small box — and a
+# longer catalog reads as richer, not wrong, so nothing downstream reports it.
+printf '{"mcpServers":{}}' > "$TMP/typo-dest.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/typo-dest.json" --cel > "$LOG" 2>&1
+rc=$?
+[ "$rc" -eq 2 ] \
+  && ! python3 -c 'import json,sys; sys.exit(0 if (json.load(open(sys.argv[1])).get("mcpServers") or {}) else 1)' "$TMP/typo-dest.json" \
+  && ok "a mistyped --cell is a USAGE ERROR (rc=2) that writes nothing, not a silent full-catalog install" \
+  || fail "merge-mcp.py accepted a mistyped flag (rc=$rc) and installed the full base catalog on a cell"
 python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
 import json, sys
 p, tpl = sys.argv[1], sys.argv[2]
