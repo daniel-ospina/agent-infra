@@ -262,6 +262,31 @@ EOF
   printf '[mandate-preflight] There is NO provisioning path for these files today (they exist in no repo; #1193 owns the content, #3377 this report). Proceed with the BRIEF'"'"'s own text as the authority, and name this absence in your final message.\n'
 }
 
+# mandate_declaration_readable — TRUE only when the ONE declaration above still RENDERS at least one
+# name. ⛔ THIS IS THE `healthy` PREDICATE'S THIRD LEG, AND IT IS MEASURED (this change's review cycle 2,
+# P1). All three collectors iterate `$(mandate_files)`, so a declaration that renders NOTHING empties the
+# whole population BY CONSTRUCTION: `mandate_missing`, `mandate_unreadable` and `mandate_irregular` all
+# return nothing, `mandate_state_root_undecidable` is false (the directory is fine), and "every declared
+# file is missing" became indistinguishable from "nothing is declared". Measured: with `mandate_files`
+# stubbed to render nothing, `--check` printed `ok: every mandated file is present` and exited 0 — a false
+# PASS — and the emit appended "BOTH mandated files are now PRESENT and readable" as the LAST claim a lane
+# reads, on a box where both are absent. `mandate_files` runs an external `cat`, so this is reachable from
+# a truncated or stale `$O` copy without any code change. "Cannot prove clean is not clean."
+# It fails in the SAFE direction by construction: an unreadable declaration counts 0 names → not readable →
+# no `healthy`, → the CANNOT VERIFY path. A permanently broken declaration then discloses on every dispatch,
+# which is the honest answer: without the list, nothing is knowable.
+mandate_declaration_readable() {
+  local spec name n=0
+  while IFS= read -r spec; do
+    name="${spec%%|*}"
+    [ -n "$name" ] || continue
+    n=$((n + 1))
+  done <<EOF
+$(mandate_files)
+EOF
+  [ "$n" -gt 0 ]
+}
+
 # mandate_ends_with <haystack> <needle> — TRUE only when <haystack> ENDS with a NON-EMPTY <needle>.
 # ⛔ THE NON-EMPTY HALF IS THE POINT, AND IT IS MEASURED (this change's review, P1): `case "$x" in *""`
 # matches EVERY string, so an EMPTY needle answered "the brief already ends with this" for a brief that
@@ -295,7 +320,7 @@ mandate_preflight_emit() {
   # are missing. That is #3377's false claim restored inside the code written to end it. `healthy` is now
   # a POSITIVE determination and it is the only way into that branch; "cannot prove clean" is not clean.
   healthy=""
-  if [ -z "$line" ] && ! mandate_state_root_undecidable \
+  if [ -z "$line" ] && ! mandate_state_root_undecidable && mandate_declaration_readable \
      && [ -z "$(mandate_missing)$(mandate_unreadable)$(mandate_irregular)" ]; then healthy=1; fi
   if [ -z "$line" ] && [ -z "$healthy" ]; then
     line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")" || :
@@ -422,6 +447,14 @@ mandate_preflight_emit() {
 mandate_verdict() {
   local root
   root="$(mandate_state_root)"
+  # ⛔ AN UNREADABLE DECLARATION IS CANNOT-VERIFY, NOT OK (this change's review cycle 2, P1, MEASURED):
+  # every collector iterates the declaration, so a declaration that renders nothing made this function
+  # print `ok: every mandated file is present` and exit 0 while no file had been looked for at all. The
+  # declaration is therefore tested FIRST — nothing downstream of an empty population is a reading.
+  if ! mandate_declaration_readable; then
+    printf '[mandate-preflight] CANNOT VERIFY: the mandate declaration renders no names, so no file was looked for and "all present" cannot be concluded — a cannot-verify is NEVER a pass (agent-infra#3377)\n' >&2
+    return 2
+  fi
   if mandate_state_root_undecidable; then
     printf '[mandate-preflight] CANNOT VERIFY: %s cannot be resolved by %s (no search/execute bit on it or on a parent directory, or it is not a directory) — so nothing can be known about the mandated files. A cannot-verify is NEVER a pass\n' \
       "$root" "$(id -un 2>/dev/null || printf 'this user')" >&2
