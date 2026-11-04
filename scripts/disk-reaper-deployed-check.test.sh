@@ -27,12 +27,36 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 eq()  { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi; }
+neq() { if [ "$1" != "$2" ]; then ok "$3"; else bad "$3 (unexpectedly got: $1)"; fi; }
 has() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+
+# ⛔ A MISSING HELPER IS A SILENTLY-SKIPPED ASSERTION, NOT A TEST FAILURE (review of #3405 round 3).
+# `neq` was called here for a whole round while defined nowhere: bash printed "command not found", no
+# assertion was recorded, and the suite still reported `PASS=44 FAIL=0` — one arm short, green. The
+# vocabulary is therefore DERIVED from the file rather than hardcoded: every helper-shaped name the
+# script uses must be defined by a `name()` in the same file (a hardcoded list just moves the hole).
+_self="${BASH_SOURCE[0]}"
+_used="$(grep -oE '\b(assert_[a-z_]+|eq|neq|ok|bad|has)\b' "$_self" | sort -u)"
+_defined="$(grep -oE '^[a-z_][a-z0-9_]*\(\)' "$_self" | sed -E 's/\(\).*$//' | sort -u)"
+# ⛔ NO PIPE IN THE LOOKUP: `printf | grep -q` under `set -o pipefail` is a FALSE-RED GENERATOR.
+# grep -q exits at the first match, printf takes SIGPIPE (141), pipefail propagates it, and `if !`
+# then reports a helper that IS defined as missing — measured 49/100 runs on the unmodified file.
+# A membership test must not be a pipeline: `case` on a newline-delimited string is pure bash.
+for _h in $_used; do
+    case $'\n'"$_defined"$'\n' in
+        *$'\n'"$_h"$'\n'*) : ;;
+        *)
+            if grep -qE "(^|[;&|]|then |else |if |while |! )$_h( |\$)" "$_self"; then
+                echo "  ❌ harness bug: assertion helper '$_h' is CALLED but never DEFINED"; exit 1
+            fi
+            ;;
+    esac
+done
 
 [ -x "$CHECK" ] || { echo "  ❌ the checker is not executable: $CHECK"; echo "PASS=0 FAIL=1"; exit 1; }
 
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh lib/live-paths.sh"
 
 # mk_env — a deployed dir + a matching checkout, both carrying the same bytes.
 mk_env() {
@@ -56,10 +80,10 @@ eq "$RC" "0" "D1 --stamp exits 0"
 has "$OUT" "STAMPED" "D1 --stamp says what it did"
 OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
 eq "$RC" "0" "D1 a fresh stamp VERIFIES (control: the cases below are not red by default)"
-has "$OUT" "SUMMARY deployed ok (8 files" "D1 the summary counts every pinned file"
+has "$OUT" "SUMMARY deployed ok (9 files" "D1 the summary counts every pinned file"
 OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src")"; RC=$?
 eq "$RC" "0" "D1 …and it verifies against the checkout it was stamped from"
-has "$OUT" "SUMMARY deployed ok (8 files; matches $T/src)" "D1 the source is named in the summary"
+has "$OUT" "SUMMARY deployed ok (9 files; matches $T/src)" "D1 the source is named in the summary"
 
 # ── D2: ONE BYTE changed in one delegate => DRIFT, named ─────────────────────────
 printf '#!/bin/bash\n# pi-reap-worktrees.sh v2\n' >"$T/deployed/pi-reap-worktrees.sh"
@@ -162,6 +186,33 @@ eq "$RC" "3" "D10 control: a directory nobody stamped is UNSTAMPED (3), not drif
 run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
 OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
 eq "$RC" "0" "D10 control: the complete set still verifies"
+
+# ── D11: a digest that could not be taken is UNMEASURED, and that is drift (round 3) ─────
+# `printf '%s  %s' "" x` writes two spaces and no digest; the check loop discarded it before counting
+# AND the reconciliation matched it as recorded, so an unreadable file was permanently outside the
+# check while the summary read ok — a file that could then be replaced with anything.
+mk_env
+chmod 000 "$T/deployed/lib/live-paths.sh"
+OUT="$(run --stamp --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
+neq "$RC" "0" "D11 stamping a file it cannot hash is NOT success"
+has "$OUT" "INCOMPLETE stamp" "D11 …and says the stamp is incomplete"
+has "$(cat "$REC")" "unmeasured  lib/live-paths.sh" "D11 …and the record names it unmeasured (never an empty digest field)"
+chmod 644 "$T/deployed/lib/live-paths.sh"
+OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
+eq "$RC" "1" "D11 the check treats UNMEASURED as drift (exit 1), so the file cannot sit outside the check"
+has "$OUT" "DRIFT     lib/live-paths.sh — recorded as UNMEASURED" "D11 …naming it as unmeasured, never as ok"
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
+eq "$RC" "0" "D11 control: a complete stamp over the same set still verifies"
+# ── D12: the two-delegate library is in the pinned set (round 3, P1) ────────────────────
+# reap-abandoned-worktrees.sh and reap-duplicate-installs.sh both `exit 3` without lib/live-paths.sh,
+# and it is the shared process-census code every live-process KEEP verdict comes from.
+mk_env
+printf 'v9 current\n' >"$T/src/scripts/lib/live-paths.sh"
+run --stamp --dir "$T/deployed" --record "$REC" --source "$T/src" >/dev/null 2>&1
+OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src" 2>&1)"; RC=$?
+eq "$RC" "1" "D12 a STALE deployed lib/live-paths.sh is drift, not ok"
+has "$OUT" "SOURCE-DRIFT lib/live-paths.sh" "D12 …and it is named as a deployed-vs-source mismatch"
 
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ] || exit 1

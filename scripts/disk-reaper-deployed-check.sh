@@ -36,8 +36,14 @@ RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
 # bounded-execution library the delegates source (pinned by `Environment=BOUNDED_LIB=`, and the reaper
 # fails closed at startup without it — so a stale or absent copy means no class runs at all, which the
 # checker must not certify as ok; review of #3405 round 2, P2).
+# `lib/live-paths.sh` is here for the same reason as `lib/bounded.sh`, only MORE so: two pinned
+# delegates resolve it from `$(dirname $0)/lib/` and `exit 3` without it (the installer's own farmed set
+# carries it — "a missing library breaks TWO classes"), and it is the shared process-census code every
+# KEEP live-process/live-cwd verdict comes from. It was outside the set until review round 3 (P1), so
+# `--source <checkout>` could report `deployed ok` while the census ran a different library than the
+# checkout's.
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh lib/live-paths.sh"
 
 usage() {
     cat <<EOF
@@ -96,6 +102,9 @@ if [ "$MODE" = stamp ]; then
         src_commit="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null)" || src_commit="-"
     fi
     tmp="$RECORD.tmp.$$"
+    # `set -u` + a group whose stderr is redirected = a SILENT exit on the first unhashable file
+    # (unbound variable, killed by the very redirect meant to quiet the hash). Initialise it.
+    unmeasured=""
     mkdir -p "$(dirname "$RECORD")" 2>/dev/null || { warn "$PROG: cannot create $(dirname "$RECORD")"; exit 2; }
     {
         printf '# disk-reaper deployed set — written by %s --stamp\n' "$PROG"
@@ -105,13 +114,29 @@ if [ "$MODE" = stamp ]; then
         printf 'source_commit=%s\n' "$src_commit"
         for f in $FILES; do
             if [ -f "$DIR/$f" ]; then
-                printf '%s  %s\n' "$(sha256 "$DIR/$f")" "$f"
+                # ⛔ A DIGEST THAT COULD NOT BE TAKEN IS `unmeasured`, NEVER AN EMPTY FIELD (review of
+                # #3405 round 3, P2). `printf '%s  %s' "" x` writes `  x` — two spaces and no digest —
+                # which the check loop discarded before counting it AND the reconciliation matched as
+                # recorded, so an unreadable file was permanently outside the check while the summary
+                # read ok. stamp exits 1 so the operator cannot mistake it for a measurement either.
+                d="$(sha256 "$DIR/$f" 2>/dev/null)" || d=""
+                if [ -n "$d" ]; then
+                    printf '%s  %s\n' "$d" "$f"
+                else
+                    printf 'unmeasured  %s\n' "$f"
+                    unmeasured="$unmeasured $f"
+                fi
             else
                 printf 'missing  %s\n' "$f"
             fi
         done
     } >"$tmp" 2>/dev/null || { warn "$PROG: cannot write $tmp"; rm -f "$tmp"; exit 2; }
     mv -f "$tmp" "$RECORD" 2>/dev/null || { warn "$PROG: cannot replace $RECORD"; rm -f "$tmp"; exit 2; }
+    if [ -n "${unmeasured:-}" ]; then
+        warn "INCOMPLETE stamp: could not hash${unmeasured} — recorded as unmeasured, and the check treats that as drift"
+        warn "  remedy: fix the read/permission problem, then: $PROG --stamp --source <agent-infra checkout>"
+        exit 1
+    fi
     say "STAMPED $RECORD (dir=$DIR source=${SOURCE:--} commit=$src_commit)"
     exit 0
 fi
@@ -146,6 +171,13 @@ while read -r digest name; do
     case "$digest" in ''|\#*) continue ;; esac
     [ -n "$name" ] || continue
     checked=$((checked + 1))
+    # ⛔ AN UNMEASURED RECORD LINE IS DRIFT (review of #3405 round 3, P2). A digest that could not be
+    # taken at stamp time must never read as verified, and a malformed line (a name with no digest at
+    # all) is the same defect one step further along.
+    if [ -z "$digest" ] || [ "$digest" = unmeasured ]; then
+        warn "DRIFT     $name — recorded as UNMEASURED (no digest could be taken); it has never been verified"
+        drift=1; continue
+    fi
     if [ "$digest" = missing ]; then
         # ⛔ "STAMPED MISSING AND STILL ABSENT" IS MISSING, NOT OK (review of #3405 round 2, P1). The
         # first fix only caught "farmed after the stamp"; a file the stamp recorded absent and that is

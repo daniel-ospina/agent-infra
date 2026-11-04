@@ -599,6 +599,9 @@
 #   REAP_WT_LANE_BRANCH_RE REAP_WT_GHOST_AGE_HOURS REAP_WT_STALE_INIT_SECONDS
 #   REAP_WT_WIP REAP_WT_WIP_AGE_HOURS REAP_WT_BACKUP_DIR REAP_WT_CLAIM_NS REAP_WT_CLAIM_TMP_NS
 #   REAP_WT_IGNORED_EVIDENCE REAP_WT_IGNORED_POINTER REAP_WT_PRESERVE REAP_WT_PRESERVE_DIR
+#   REAP_WT_PRESERVE_FALLBACKS (where the gate (b) archive goes when the configured root is not
+#     writable — tmpfs by default, deliberately NOT the volume being reclaimed) REAP_WT_PRESERVE_KEEP_DAYS
+#     (how long a dated archive subdirectory is kept, default 14; `0` keeps everything)
 #     (lane evidence + the agent-infra pointer: what the FLEET requires every checkout to carry, and
 #      the gate (b) archive that lets such a checkout be reclaimed — see IGNORED_LANE_EVIDENCE)
 #   REAP_WT_MAIN_PROOF (auto|local) REAP_WT_MAIN_PUSH_URL
@@ -1044,6 +1047,57 @@ if [ "${TB_TIMEOUT_KIND:-}" = "invalid" ]; then
     exit 3
 fi
 run_bounded() { tb_run "$@"; }
+
+# fs_bounded <secs> <cmd...> — run one filesystem operation under the same watchdog every other fork
+# in this file goes through (review of #3405 round 3, P3). The archive root can be an NFS or a dead
+# mount, and the retention prune now runs at the START of every pass, so an unbounded `mkdir`/`rm -rf`
+# there would block the pass indefinitely on the very box that needs it most — the hang class
+# REAP_WT_*_TIMEOUT exists to prevent. Stdout is discarded; the operation's own rc is returned.
+fs_bounded() {
+    local secs="$1" out rc
+    shift
+    [ $# -gt 0 ] || return 125
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-fsb.XXXXXX" 2>/dev/null)" || return 125
+    run_bounded "$secs" "$out" "$@"; rc=$?
+    rm -f "$out" 2>/dev/null
+    return "$rc"
+}
+
+# fs_bounded_out <secs> <cmd...> — fs_bounded, but emitting the command's stdout (a directory
+# LISTING, not an action). Same watchdog, same reason: a readdir on a hung NFS mount blocks in the
+# kernel where no shell-level timeout can reach the caller's own `for` loop.
+fs_bounded_out() {
+    local secs="$1" out rc
+    shift
+    [ $# -gt 0 ] || return 125
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-fso.XXXXXX" 2>/dev/null)" || return 125
+    run_bounded "$secs" "$out" "$@"; rc=$?
+    [ "$rc" = 0 ] && cat "$out" 2>/dev/null
+    rm -f "$out" 2>/dev/null
+    return "$rc"
+}
+
+# fs_exists_bounded <secs> <path> — `[ -e ] || [ -L ]`, bounded. A `stat` on a dead mount is the same
+# indefinite block as a readdir, and it happens BEFORE any bounded operation on that path.
+fs_exists_bounded() {
+    fs_bounded "$1" sh -c '[ -e "$1" ] || [ -L "$1" ]' _ "$2"
+}
+
+# fs_isdir_bounded <secs> <path> — `[ -d ]`, bounded (same reason: a stat on a dead mount blocks).
+fs_isdir_bounded() {
+    fs_bounded "$1" sh -c '[ -d "$1" ]' _ "$2"
+}
+
+# fs_nonempty_bounded <secs> <path> — `[ -s ]`, bounded.
+fs_nonempty_bounded() {
+    fs_bounded "$1" sh -c '[ -s "$1" ]' _ "$2"
+}
+
+# fs_write_bounded <secs> <dest> <src> — copy <src> over <dest> in a bounded child, so the OPEN on
+# the archive root (the operation that blocks on a dead mount) cannot wedge the pass.
+fs_write_bounded() {
+    fs_bounded "$1" sh -c 'cat "$2" >"$1"' _ "$2" "$3"
+}
 
 # canonicalize <path> — physical path, or "" when it cannot be resolved. Every
 # path comparison uses the canonical form: `git worktree list` reports the
@@ -1783,8 +1837,12 @@ clean_gate() {
 # mid-edit when its PR auto-merged is the ordinary case).
 preserve_before_removal() { # <path> <sha> <branch> <reason>
     local path="$1" sha="$2" br="$3" why="$4"
-    local slug day dir ev tarf out listed e rc ok=1 disc root
-    root="$(preserve_dir_resolve)" || {
+    local slug day dir ev tarf out listed e rc ok=1 disc root mf
+    root="${PRESERVE_ROOT_RESOLVED:-$(preserve_dir_resolve)}" || {
+        log "PRESERVE-FAIL $path no writable preserve root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — nothing may be removed"
+        return 1
+    }
+    [ -n "$root" ] || {
         log "PRESERVE-FAIL $path no writable preserve root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — nothing may be removed"
         return 1
     }
@@ -1805,17 +1863,17 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     # removal's `rm -f` + truncating writes destroyed the first lane's evidence — after its tree was
     # gone. An occupied directory gets a unique sibling instead; re-running over the SAME checkout (a
     # pass that removed nothing) leaves a harmless duplicate rather than an overwrite.
-    if [ -e "$dir/manifest.txt" ]; then
+    if fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/manifest.txt"; then
         dir="$dir.$(now_epoch)"
-        [ -e "$dir/manifest.txt" ] && dir="$dir.$$"
+        fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/manifest.txt" && dir="$dir.$$"
     fi
-    if ! mkdir -p "$dir" 2>/dev/null; then
+    if ! fs_bounded "$REAP_WT_REMOVE_TIMEOUT" mkdir -p "$dir"; then
         log "PRESERVE-FAIL $path cannot create $dir"
         return 1
     fi
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-presv.XXXXXX")" || return 1
     tarf="$dir/lane-evidence.tar.gz"
-    rm -f "$tarf"
+    fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true
 
     # ── the lane's own mandated evidence ─────────────────────────────────
     ev="$(lane_evidence_present "$path")"
@@ -1827,14 +1885,16 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
         rc=$?
         if [ "$rc" != 0 ]; then
             log "PRESERVE-FAIL $path lane-evidence tar rc=$rc"
-            rm -f "$out" "$tarf"; return 1
+            fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true
+            rm -f "$out"; return 1
         fi
         run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -tzf "$tarf"
         rc=$?
         listed="$(cat "$out" 2>/dev/null)"
         if [ "$rc" != 0 ]; then
             log "PRESERVE-FAIL $path lane-evidence tar VERIFY rc=$rc (unreadable archive)"
-            rm -f "$out" "$tarf"; return 1
+            fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true
+            rm -f "$out"; return 1
         fi
         for e in $ev; do
             case "$listed" in
@@ -1842,7 +1902,7 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
                 *) log "PRESERVE-FAIL $path lane-evidence $e missing from the archive"; ok=0 ;;
             esac
         done
-        [ "$ok" = 1 ] || { rm -f "$out" "$tarf"; return 1; }
+        [ "$ok" = 1 ] || { fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true; rm -f "$out"; return 1; }
     fi
 
     # ── the diff and the status: what a human would ask for first ────────
@@ -1863,6 +1923,10 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
         rm -f "$out"; return 1
     fi
 
+    # The manifest is built OFF the archive root (a local temp) and then COPIED through a bounded
+    # child: the open() on the archive root is the operation that blocks on a dead mount, and a
+    # redirect cannot be wrapped by the watchdog (review of #3405 round 4, P2).
+    mf="$out.mf"
     {
         printf 'path=%s\n' "$path"
         printf 'branch=%s\n' "${br:-<detached>}"
@@ -1871,14 +1935,20 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
         printf 'preserved_at=%s\n' "$("$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
         printf 'lane_evidence=%s\n' "${ev:-<none>}"
         printf 'restore=tar -xzf lane-evidence.tar.gz -C <checkout>   # then: git apply worktree.diff\n'
-    } >"$dir/manifest.txt" 2>/dev/null || { log "PRESERVE-FAIL $path manifest unwritable"; rm -f "$out"; return 1; }
+    } >"$mf" 2>/dev/null || { log "PRESERVE-FAIL $path cannot build the manifest"; rm -f "$out" "$mf"; return 1; }
+    fs_write_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/manifest.txt" "$mf" \
+        || { log "PRESERVE-FAIL $path manifest unwritable at $dir"; rm -f "$out" "$mf"; return 1; }
 
-    rm -f "$out"
-    # Final verification, on the artefacts rather than on the exit codes.
-    [ -s "$dir/manifest.txt" ] || { log "PRESERVE-FAIL $path empty manifest at $dir"; return 1; }
-    [ -f "$dir/worktree.diff" ]   || { log "PRESERVE-FAIL $path no worktree.diff at $dir"; return 1; }
-    [ -f "$dir/worktree.status" ] || { log "PRESERVE-FAIL $path no worktree.status at $dir"; return 1; }
-    if [ -n "$ev" ] && [ ! -s "$tarf" ]; then
+    rm -f "$out" "$mf"
+    # Final verification, on the artefacts rather than on the exit codes — and BOUNDED, because each
+    # of these is a stat on the archive root.
+    fs_nonempty_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/manifest.txt" \
+        || { log "PRESERVE-FAIL $path empty manifest at $dir"; return 1; }
+    fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/worktree.diff" \
+        || { log "PRESERVE-FAIL $path no worktree.diff at $dir"; return 1; }
+    fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/worktree.status" \
+        || { log "PRESERVE-FAIL $path no worktree.status at $dir"; return 1; }
+    if [ -n "$ev" ] && ! fs_nonempty_bounded "$REAP_WT_REMOVE_TIMEOUT" "$tarf"; then
         log "PRESERVE-FAIL $path lane evidence exists but $tarf is missing/empty"
         return 1
     fi
@@ -1887,61 +1957,90 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     return 0
 }
 
+# preserve_roots — every candidate root (configured first, then the fallbacks), one per line. This is
+# the SINGLE definition of "where an archive may land", used by both the resolver and the retention
+# prune: bounding only the configured root left the FALLBACK an unbounded sink — on tmpfs (RAM) or the
+# root filesystem, on exactly the box whose configured root is unwritable (review of #3405 round 3, P2).
+preserve_roots() {
+    printf '%s\n' "$REAP_WT_PRESERVE_DIR"
+    # shellcheck disable=SC2086
+    for _pr in $REAP_WT_PRESERVE_FALLBACKS; do printf '%s\n' "$_pr"; done
+}
+
 # preserve_dir_resolve — the first writable root among REAP_WT_PRESERVE_DIR and
-# REAP_WT_PRESERVE_FALLBACKS, resolved at most once per pass and cached. Emits the root on stdout,
-# or nothing when no candidate can be written (the caller must then FAIL, not silently skip: a pass
-# that cannot preserve must not delete).
+# REAP_WT_PRESERVE_FALLBACKS. `run()` calls it ONCE per pass and exports the answer in
+# PRESERVE_ROOT_RESOLVED, which is what the removals use (they run in subshells, so a cache assigned
+# inside them would die with the subshell — the earlier "cached" claim was wrong, review of #3405 round
+# 3, P3). Emits the root on stdout, or nothing when no candidate can be written (the caller must then
+# FAIL, not silently skip: a pass that cannot preserve must not delete).
 PRESERVE_DIR_RESOLVED=""
+PRESERVE_ROOT_RESOLVED=""
 preserve_dir_resolve() {
     local cand probe
     if [ -n "$PRESERVE_DIR_RESOLVED" ]; then printf '%s' "$PRESERVE_DIR_RESOLVED"; return 0; fi
-    # shellcheck disable=SC2086
-    for cand in "$REAP_WT_PRESERVE_DIR" $REAP_WT_PRESERVE_FALLBACKS; do
+    while IFS= read -r cand; do
         [ -n "$cand" ] || continue
         probe="$cand/.pi-reap-probe.$$"
         # Never write THROUGH a pre-planted name (a symlink/FIFO there would truncate a target or
         # hang the pass); the identity check is the same rule the state-dir resolver uses.
-        if [ -e "$probe" ] || [ -L "$probe" ]; then continue; fi
-        if mkdir -p "$cand" 2>/dev/null && : >"$probe" 2>/dev/null; then
-            rm -f "$probe" 2>/dev/null
+        if fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$probe"; then continue; fi
+        if fs_bounded "$REAP_WT_REMOVE_TIMEOUT" mkdir -p "$cand" \
+                && run_bounded "$REAP_WT_REMOVE_TIMEOUT" /dev/null sh -c ': >"$1"' _ "$probe" 2>/dev/null; then
+            fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$probe" 2>/dev/null || true
             PRESERVE_DIR_RESOLVED="$cand"
             if [ "$cand" != "$REAP_WT_PRESERVE_DIR" ]; then
                 log "PRESERVE-DIR-FALLBACK $cand (configured '$REAP_WT_PRESERVE_DIR' is not writable)"
             fi
             printf '%s' "$cand"; return 0
         fi
-        rm -f "$probe" 2>/dev/null
-    done
+        fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$probe" 2>/dev/null || true
+    done <<EOF
+$(preserve_roots)
+EOF
     return 1
 }
 
-# prune_preserve_archive — bound the new sink. ONLY dated directories of the configured root are
-# candidates; anything else in that directory is operator data and is never touched. Dry run
-# reports without removing. A `date` that cannot answer skips the prune and says so (never a guess).
+# prune_preserve_archive — bound the new sink, across EVERY root an archive can land in (configured
+# AND fallbacks). ONLY dated directories are candidates; anything else in one of those directories is
+# operator data and is never touched. Oldest first (the names are dates, so the sorted order IS age
+# order), newest kept. Dry run reports without removing. A `date` that cannot answer skips the prune
+# and says so (never a guess).
 prune_preserve_archive() {
-    local root="$REAP_WT_PRESERVE_DIR" days="$REAP_WT_PRESERVE_KEEP_DAYS" cutoff d
-    [ -n "$root" ] && [ -d "$root" ] || return 0
+    local days="$REAP_WT_PRESERVE_KEEP_DAYS" cutoff root d
     is_pos_int "$days" || { log "PRESERVE-PRUNE skipped: REAP_WT_PRESERVE_KEEP_DAYS='$days' is not a number"; return 0; }
     [ "$days" -gt 0 ] || return 0
     cutoff="$("$DATE_BIN" -u -d "@$(( $(now_epoch) - days * 86400 ))" +%Y-%m-%d 2>/dev/null)" \
         || cutoff="$("$DATE_BIN" -u -v-$((days))d +%Y-%m-%d 2>/dev/null)" \
         || cutoff=""
     [ -n "$cutoff" ] || { log "PRESERVE-PRUNE skipped: DATE_BIN could not compute a cutoff"; return 0; }
-    for d in "$root"/*; do
-        [ -d "$d" ] || continue
-        d="${d##*/}"
-        case "$d" in
-            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
-            *) continue ;;
-        esac
-        [ "$d" \< "$cutoff" ] || continue
-        if [ "$MODE" = apply ]; then
-            if "$RM_BIN" -rf "$root/$d" 2>/dev/null; then log "PRESERVE-PRUNE removed $root/$d (older than $days days)"
-            else log "PRESERVE-PRUNE-FAIL $root/$d"; fi
-        else
-            log "PRESERVE-PRUNE would remove $root/$d (older than $days days)"
-        fi
-    done
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        fs_bounded "$REAP_WT_REMOVE_TIMEOUT" sh -c '[ -d "$1" ]' _ "$root" || continue
+        # Sorted so the log reads oldest-first and a failing rm never blocks a younger candidate's
+        # evaluation; the selection itself is the date comparison, not the order.
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$root/$d" || continue
+            case "$d" in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
+                *) continue ;;
+            esac
+            [ "$d" \< "$cutoff" ] || continue
+            if [ "$MODE" = apply ]; then
+                if fs_bounded "$REAP_WT_REMOVE_TIMEOUT" "$RM_BIN" -rf "$root/$d"; then
+                    log "PRESERVE-PRUNE removed $root/$d (older than $days days)"
+                else
+                    log "PRESERVE-PRUNE-FAIL $root/$d"
+                fi
+            else
+                log "PRESERVE-PRUNE would remove $root/$d (older than $days days)"
+            fi
+        done <<INNER
+$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" ls -1 "$root" | sort)
+INNER
+    done <<EOF
+$(preserve_roots)
+EOF
 }
 
 # pr_state_load — ONE batched call for the whole pass, with an explicit
@@ -3652,10 +3751,11 @@ remove_one() {
     # defaults), so putting it after re-check #3 would re-open that same window, one size class worse:
     # a lane that comes back to life during the archive would be destroyed under it. With this order
     # the last liveness probe is still the LAST thing before the fork, and a row preserved by it
-    # leaves a harmless archive that the next pass rewrites in the same per-checkout directory.
-    # A capture that does not verify takes the PRESERVE arm (rc 2), never a removal: a LANDED
-    # checkout can still hold work a human wanted, and the lane-evidence tarball is the only copy of
-    # the mandatory per-lane report once the tree is gone.
+    # leaves a harmless archive (a re-run gets a unique sibling — an occupied capture is never
+    # rewritten, round 2). A capture that does not verify is a FAILED REMOVAL (rc 1 => `failed=` =>
+    # pass exit 4, red), never a removal and never a benign pause: a LANDED checkout can still hold
+    # work a human wanted, the lane-evidence tarball is the only copy of the mandatory per-lane report
+    # once the tree is gone, and an inert-but-green class is the exact defect this PR removes.
     if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
         if ! presv="$(preserve_before_removal "$path" "$sha" "$br" "${why:-reclaimable}")"; then
             REMOVE_SKIP_VERDICT="preserve-failed"
@@ -4096,9 +4196,19 @@ run() {
     fi
 
     log "==== pi-reap-worktrees pass: MODE=$MODE repo=$REPO_CANON aged=${REAP_WT_AGED_DAYS}d main=${MAIN_CANON} now=$now ===="
+    # Resolve the archive root ONCE, here, so every removal in this pass uses the same root and the
+    # prune bounds exactly what the pass can write (the removals run in subshells, so a cache set
+    # inside one dies with it — review of #3405 round 3, P3).
+    if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
+        PRESERVE_ROOT_RESOLVED="$(preserve_dir_resolve)" || {
+            log "PRESERVE-FAIL no writable archive root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — every removal this pass FAILS rather than deletes unarchived"
+            PRESERVE_ROOT_RESOLVED=""
+        }
+    fi
     # Bound the archive this pass writes (review of #3405 round 2, P2): the preserve directory is a NEW
-    # sink on the reclaim path, so it is pruned oldest-first under REAP_WT_PRESERVE_KEEP_DAYS. Runs
-    # under the lock, so two passes cannot prune the same tree; a dry run only reports.
+    # sink on the reclaim path, so it is pruned oldest-first under REAP_WT_PRESERVE_KEEP_DAYS — across
+    # EVERY root an archive can land in, not only the configured one (round 3, P2). Runs under the
+    # lock, so two passes cannot prune the same tree; a dry run only reports.
     prune_preserve_archive
     WT_TOTAL="$(printf '%s\n' "$WT_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 

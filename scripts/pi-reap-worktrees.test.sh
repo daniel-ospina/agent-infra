@@ -183,6 +183,27 @@ assert_nofile()   { if [ -e "$1" ]; then bad "$2 (present: $1)"; else ok "$2"; f
 assert_branch()   { if "$REAL_GIT" -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; then ok "$3"; else bad "$3 (no ref: $2)"; fi; }
 assert_nobranch() { if "$REAL_GIT" -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; then bad "$3 (ref still exists: $2)"; else ok "$3"; fi; }
 
+# ⛔ A MISSING HELPER IS A SILENTLY-SKIPPED ASSERTION, NOT A TEST FAILURE (review of #3405 round 3: a
+# call to an undefined helper reported "command not found" and the suite stayed GREEN, one arm short —
+# twice, because a hardcoded vocabulary list just moved the hole). So the vocabulary is DERIVED from
+# the file: every helper-shaped name the script uses must be defined by a `name()` in the same file.
+_self="${BASH_SOURCE[0]}"
+_used="$(grep -oE '\b(assert_[a-z_]+|eq|neq|ok|bad|has)\b' "$_self" | sort -u)"
+_defined="$(grep -oE '^[a-z_][a-z0-9_]*\(\)' "$_self" | sed -E 's/\(\).*$//' | sort -u)"
+# ⛔ NO PIPE IN THE LOOKUP: `printf | grep -q` under `set -o pipefail` is a FALSE-RED GENERATOR.
+# grep -q exits at the first match, printf takes SIGPIPE (141), pipefail propagates it, and `if !`
+# then reports a helper that IS defined as missing — measured 49/100 runs on the unmodified file.
+# A membership test must not be a pipeline: `case` on a newline-delimited string is pure bash.
+for _h in $_used; do
+    case $'\n'"$_defined"$'\n' in
+        *$'\n'"$_h"$'\n'*) : ;;
+        *)
+            if grep -qE "(^|[;&|]|then |else |if |while |! )$_h( |\$)" "$_self"; then
+                echo "  ❌ harness bug: assertion helper '$_h' is CALLED but never DEFINED"; exit 1
+            fi
+            ;;
+    esac
+done
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-worktree-test.XXXXXX")"
 # Resolve T once: git records RESOLVED worktree paths (/tmp/x is stored as
 # /private/tmp/x), so every expectation must compare resolved-to-resolved.
@@ -1194,6 +1215,40 @@ else
 fi
 OUT_ZM="$(FAKE_GH_REFS="$GH_PV" REAPER_OVERRIDE="$MUT3" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
 assert_dir "$WT_MUT" "G2z MUTANT GOES RED: inverting the capture result leaves the checkout in place (so the removal assertions above are load-bearing)"
+
+# ── G2aa: the archive is BOUNDED, and bounded in EVERY root it can land in (round 3) ─────
+# `prune_preserve_archive` is the only `rm -rf` in this file whose target is chosen by a string
+# pattern, and round 2 added the archive without any test at all — which is how the fallback root
+# shipped as an unbounded sink. Every arm is pinned here: a dated old dir is removed, a recent dated
+# dir survives, a NON-date name survives (operator data), the dry run reports without removing, `0`
+# disables, a bad value is refused by validation, and the FALLBACK root is pruned too.
+ENV_AA="$ENV-pv-aa"
+PR="$T/$ENV_AA/preserve"; mkdir -p "$PR/2020-01-01" "$PR/2026-11-03" "$PR/notadate" "$PR/2020-01-0" "$PR/2026-11-03-nodash"
+for d in 2020-01-01 2026-11-03 notadate 2020-01-0 2026-11-03-nodash; do : >"$PR/$d/manifest.txt"; done
+REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" run_reaper $ENV_AA --repo "$REPO_PV" >/dev/null 2>&1
+assert_dir "$PR/2020-01-01" "G2aa control: a DRY RUN does not prune"
+assert_contains "$(cat "$T/$ENV_AA/reap.log" 2>/dev/null || true)" "PRESERVE-PRUNE would remove $PR/2020-01-01" \
+    "G2aa …it reports what it would prune"
+REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" run_reaper $ENV_AA --apply --repo "$REPO_PV" >/dev/null 2>&1
+assert_nodir "$PR/2020-01-01" "G2aa a dated dir older than KEEP_DAYS is pruned"
+assert_dir "$PR/2026-11-03" "G2aa a RECENT dated dir survives"
+assert_dir "$PR/notadate" "G2aa a non-date name survives (operator data, never a candidate)"
+assert_dir "$PR/2020-01-0" "G2aa a MALFORMED date survives (a prefix match would have eaten it)"
+assert_dir "$PR/2026-11-03-nodash" "G2aa a date-SHAPED suffix survives (only an exact YYYY-MM-DD is a candidate)"
+mkdir -p "$PR/2020-01-02"
+REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE=0 run_reaper $ENV_AA --apply --repo "$REPO_PV" >/dev/null 2>&1
+assert_dir "$PR/2020-01-02" "G2aa KEEP_DAYS=0 keeps EVERYTHING (0 means disabled, not everything-expired)"
+OUT_AA="$(REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE=abc \
+    run_reaper $ENV_AA --apply --repo "$REPO_PV" 2>&1)"; RC_AA=$?
+assert_eq "$RC_AA" "2" "G2aa an unusable KEEP_DAYS is REFUSED by seam validation (exit 2, not a silent skip)"
+assert_contains "$OUT_AA" "REAP_WT_PRESERVE_KEEP_DAYS" "G2aa …and the refusal names the seam"
+assert_dir "$PR/2020-01-02" "G2aa …and nothing was pruned"
+# the FALLBACK root is bounded too — it is the root a full/read-only data volume pushes writes INTO,
+# so an unbounded fallback is unbounded exactly when the box is already out of space.
+FB="$T/$ENV_AA/preserve-fb"; mkdir -p "$FB/2020-01-01"
+REAP_WT_PRESERVE_DIR_OVERRIDE=/proc/nonexistent/reaped-evidence REAP_WT_PRESERVE_FALLBACKS_OVERRIDE="$FB" \
+    run_reaper $ENV_AA --apply --repo "$REPO_PV" >/dev/null 2>&1
+assert_nodir "$FB/2020-01-01" "G2aa the FALLBACK root is pruned as well (an unbounded fallback is a sink on the full box)"
 
 # ── G3: reachable gate (detached HEAD only) ────────────────────────────
 ENV=G3; REPO="$(mk_repo $ENV)"
