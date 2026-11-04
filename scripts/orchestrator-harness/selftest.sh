@@ -3888,6 +3888,13 @@ ck "refresh-candidates.sh ranks the tiers P0=0 < P1=1 < P2=2 (a constant rank wo
 # nothing reddened: a false-PASS guard. The definitions are therefore PREPENDED here, and a SECOND
 # fixture gives the pool a rank so the drive must actually move the head — a POSITIVE assertion, so an
 # inert call reads RED instead of green.
+# ⛔ BOTH RESULTS START AT 1, BEFORE ANY BRANCH (review P2). They used to be assigned only INSIDE the
+# success branch, while the two `ck` calls below read them unconditionally — so on the very path this
+# check exists for (missing/empty $REFRESH, or either extraction anchor drifting) the run died under
+# `set -u` with `rc_dedupe: unbound variable`: no FAIL line, no summary, and every check after this one
+# never ran. The guard's failure path is the one thing that must never itself crash. Defaulting to 1
+# makes a skipped drive count a named FAIL and lets the suite continue, as it did before this change.
+rc_dedupe=1; rc_rank=1
 if [ -s "$REFRESH" ]; then
   awk '/^done < /{f=1;next} f' "$REFRESH" > "$TMP/tail.sh"
   # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
@@ -3933,9 +3940,8 @@ if [ -s "$REFRESH" ]; then
     [ "$rc_rank" -eq 0 ] || echo "      pool-ranked drive gave '$rank_got' (want '100 5000 9000'); log: $(tr '\n' '|' < "$TMP/qorder-drive.log" 2>/dev/null | head -c 240)"
     [ "$rc_dedupe" -eq 0 ] || echo "      dedupe drive gave '$tail_got' (want '5000 100 9000')"
     rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
-    rc=0; [ "$rc_dedupe" -eq 0 ] && [ "$rc_rank" -eq 0 ] || rc=1
-  else rc=1; fi
-else rc=1; fi
+  fi
+fi
 ck "refresh-candidates.sh dedupes the backlog in place (and leaves the order alone when the pool ranks nothing)" $rc_dedupe
 ck "refresh-candidates.sh re-derives the queue's head from the pool — the ranked row leads, unranked rows keep their tail order" $rc_rank
 

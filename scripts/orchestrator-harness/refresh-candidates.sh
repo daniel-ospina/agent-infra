@@ -3834,6 +3834,18 @@ rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written,
           close(cntf) }' \
     "$queue" "$pool" > "$out" || return 1
   [ -s "$out" ] || return 1
+  # ⛔ THE COUNT FILE IS PART OF THE PRODUCT, NOT A NICETY (review P2). It is what tells the caller
+  # whether the reorder ranked anything, and `0 0` is a CLAIM — "a drained queue" — that only the
+  # empty-queue arm above is entitled to make. An unwritten or unparsable count must therefore FAIL
+  # the reorder HERE, while the caller can still name the state honestly (`priority-unreadable`, queue
+  # untouched), instead of reaching the caller as zeros and being reported as `the queue is EMPTY —
+  # there is nothing to order` over a queue that is not empty. Same convention as this file's own pool
+  # row count (~:3602): an unreadable count is UNKNOWN, never zero (#1931).
+  [ -s "$cnt" ] || return 1
+  case "$(cat "$cnt" 2>/dev/null || true)" in
+    [0-9]*' '*) : ;;   # `<ranked> <unranked> <head|->`; the caller parses each FIELD strictly below
+    *) return 1 ;;
+  esac
   return 0
 }
 # queue_order_from_pool <O> -> writes $O/candidates.txt in pool order, prints what it did (or why not)
@@ -3864,7 +3876,10 @@ queue_order_from_pool() {
   case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
   rm -f "$o/.queue-rank" 2>/dev/null
   if [ "$_r" -eq 0 ] && [ "$_u" -eq 0 ]; then
-    # Nothing queued at all: a drained queue, not a blind one.
+    # Nothing queued at all: a drained queue, not a blind one. REACHABLE ONLY FROM THE DRAINED-QUEUE
+    # ARM of rank_queue_by_pool (which writes `0 0 -`), because that function now REFUSES a reorder
+    # whose count it cannot read — so an unreadable count can never be laundered into this success
+    # word (review P2). The coercion above is belt-and-braces for a count file edited under us.
     QUEUE_ORDER_STATE="empty"
     echo "[refresh] queue order: the queue is EMPTY — there is nothing to order"
     return 0
@@ -3919,7 +3934,7 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     fi
     REFRESH_RECORDED=1
     refresh_record_write ok skip 0 \
-      "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, queue membership unchanged (the ORDER was re-derived from the pool: ${QUEUE_ORDER_STATE:-unknown})" \
+      "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, and NO candidate added or dropped (the ORDER was re-derived from the pool: ${QUEUE_ORDER_STATE:-unknown}; a duplicate row, if the queue somehow carried one, is collapsed to its first occurrence)" \
       "judged=0" "backlog=$_skip_n" "handed=$_skip_head" "unusable="
     exit 0
   fi
