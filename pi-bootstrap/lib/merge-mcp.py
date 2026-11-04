@@ -155,6 +155,27 @@ def _loopback(authority):
         return False                             # a DNS name is never loopback, whatever it says
 
 
+def _keep_backup(path):
+    """Copy `path` to `<path>.bak` before this merge REPLACES an unreadable container.
+
+    The bytes a merge discards are not a config (that is why it is replacing them), but they may be
+    hand-written work, and silently deleting operator content is exactly what this file's rules
+    forbid. Best-effort and LOUD on failure: a backup that cannot be written must not turn the
+    repair path back into the thing that cannot converge. The destination's mode is carried over, so
+    a credential-adjacent file does not get WIDER by being backed up.
+    """
+    import shutil
+    real = os.path.realpath(path)
+    if not os.path.exists(real):
+        return
+    try:
+        shutil.copy2(real, real + ".bak")
+        if os.path.exists(real):
+            os.chmod(real + ".bak", stat.S_IMODE(os.stat(real).st_mode))
+    except OSError as exc:                        # pragma: no cover — environment-dependent
+        sys.stderr.write("WARNING: could not back up %s (%s) — continuing the repair\n" % (path, exc))
+
+
 def credential_in_the_clear(url):
     """True when a credential sent to this url would cross a network unencrypted.
 
@@ -268,7 +289,33 @@ def main(argv):
         sys.stderr.write("FATAL: %s declares no usable tortoise entry\n" % tpl_path)
         return 3
 
-    have = dict(dst.get("mcpServers") or {})
+    # ⛔ TOTAL OVER THE DESTINATION'S *STRUCTURE*, not only over its entries. `usable()` was made
+    # total one level down (a `headers` that is a string, a non-string url/Authorization) and these
+    # two containers were left assuming a mapping: a `.mcp.json` whose ROOT is `[]`/`"x"`/`5`, or
+    # whose `mcpServers` is `5`/`"x"`/`[]`, raised BEFORE the write — merge rc=1 with the file
+    # unchanged, and `--verify` raised on its own copy of the same two lines, so `--install` (the
+    # REPAIR path, and `cloud-cell-bringup.sh` runs it on a verify failure) could never clear it and
+    # EVERY bring-up died. The repair is a REPLACE, and the replaced bytes are kept: a container
+    # nothing can parse is not a config, but it may be hand-written work someone wants back.
+    if not isinstance(dst, dict):
+        print(
+            "NOTE: REPLACED a %s .mcp.json ROOT (not a JSON object); the previous file was saved as %s.bak"
+            % (type(dst).__name__, dst_path)
+        )
+        _keep_backup(dst_path)
+        dst = {}
+    servers = dst.get("mcpServers")
+    if servers is None:
+        servers = {}
+    if not isinstance(servers, dict):
+        print(
+            "NOTE: REPLACED a %s `mcpServers` (not a JSON object); the previous file was saved as %s.bak"
+            % (type(servers).__name__, dst_path)
+        )
+        _keep_backup(dst_path)
+        have = {}
+    else:
+        have = dict(servers)
 
     # 1. the exa migration (owner ruling 2026-10-31)
     if have.pop("exa", None) is not None:

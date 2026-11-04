@@ -1824,6 +1824,33 @@ PY
     && ok "install REPAIRS a non-string $BADSHAPE into the hosted entry (the repair path converges)" \
     || fail "install could not repair a non-string $BADSHAPE (rc=$rc) — the cell is stuck"
 done
+# ⛔ AND THE CONTAINERS, not only the entries. A `.mcp.json` whose ROOT is a JSON array/string/number,
+# or whose `mcpServers` is not an object, raised on BOTH sides before the write: `--verify` printed
+# `marker: none` above a traceback and `--install` — the repair path — failed on its own copy of the
+# assumption, so nothing could clear it and `cloud-cell-bringup.sh` died on every bring-up. The shape,
+# the NAMED refusal, the repair, and the `.bak` that keeps the discarded bytes.
+for BADCONTAINER in root servers; do
+  if [ "$BADCONTAINER" = root ]; then
+    printf '[]' > "$DEST/.mcp.json"
+    EXPECT="BADROOT:list"
+  else
+    printf '{"mcpServers": 5}' > "$DEST/.mcp.json"
+    EXPECT="BADSERVERS:int"
+  fi
+  rm -f "$DEST/.mcp.json.bak"
+  run_verify
+  rc=$?
+  [ "$rc" -eq 1 ] && grep -q "$EXPECT" "$LOG" \
+    && ok "--verify names a non-object .mcp.json $BADCONTAINER ($EXPECT, not an empty marker beside a traceback)" \
+    || fail "--verify did not name a non-object $BADCONTAINER (rc=$rc) — the operator gets 'marker: none' and a traceback, and install cannot clear it"
+  run_install
+  run_verify
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -f "$DEST/.mcp.json.bak" ] \
+    && ok "install REPAIRS a non-object $BADCONTAINER (rc=0) and KEEPS the discarded bytes as .mcp.json.bak" \
+    || fail "install could not repair a non-object $BADCONTAINER, or silently destroyed the bytes it replaced (rc=$rc) — the cell is stuck, or operator content is gone"
+done
+rm -f "$DEST/.mcp.json.bak"
 
 # skills/ was `[ -d ]` plus a non-empty `ls` until #1723's `--check` began verifying BEFORE it
 # installs: a cell holding 1 of the checkout's 124 SKILL.md files passed that check, so the fast
