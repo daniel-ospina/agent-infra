@@ -4716,8 +4716,19 @@ TMP="$FILE.tmp"
 #      combination tortoise#10677 produced, and no reader could have caught it.
 if [ -n "$CARRY_ARM" ] && [ -z "$EVIDENCE_VERIFIED" ]; then
   CARRY_EVIDENCE=""
-  if [ -f "$FILE" ]; then
-    CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+  # ⛔ READ THE RECORD THE ARM ACTUALLY RESOLVED (agent-infra#3401 review, twice-found).
+  # `--delta` mirrors `--check-carry`'s lookup and legitimately accepts the LEGACY key
+  # `$D_DIR/$PR.json` when the repo-qualified file is absent (`D_REC`, :2104-2110) — but the
+  # predecessor reads here and below used `$FILE` only, so a legacy-only predecessor (a record
+  # minted before the #426 qualified-key migration, or one written when repo detection failed)
+  # was refused as "the superseded record carries no evidence" — FALSE: the record the run just
+  # read does carry it, and the printed remedy is a full re-review, the exact cost `--delta`
+  # exists to remove. Fail-closed (no record, no marker), so friction, not a false pass — but a
+  # false DIAGNOSIS is its own defect. `D_REC` is empty outside `--delta`, so every other path
+  # still reads `$FILE`.
+  _carry_src="${D_REC:-$FILE}"
+  if [ -f "$_carry_src" ]; then
+    CARRY_EVIDENCE="$(sed -n 's/.*"evidence":"\([^"]*\)".*/\1/p' "$_carry_src" 2>/dev/null | command head -1 || true)"
   fi
   # ⛔ THE ARM SELECTS THE PAIR (fresh-review cycle 3): a marker may only be named
   # by the arm that CONSUMED it. The lane arm proves itself from the commits and
@@ -4812,10 +4823,11 @@ elif [ -n "$CARRY_EVIDENCE" ] && [ "${CARRY_EVIDENCE#delta:}" != "$CARRY_EVIDENC
   # self-consistent range/digest pair is transcribed verbatim into a freshly SIGNED
   # marker. Declared as a residual (see the PR body); closing it needs a re-deriving
   # read here, which is a larger change than this integration.
-  _cd_range="$(sed -n 's/.*"delta_range":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
-  _cd_base="$(sed -n 's/.*"delta_base":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
-  _cd_kind="$(sed -n 's/.*"delta_kind":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
-  _cd_digest="$(sed -n 's/.*"delta_digest":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
+  _cd_src="${D_REC:-$FILE}"
+  _cd_range="$(sed -n 's/.*"delta_range":"\([^"]*\)".*/\1/p' "$_cd_src" 2>/dev/null | command head -1 || true)"
+  _cd_base="$(sed -n 's/.*"delta_base":"\([^"]*\)".*/\1/p' "$_cd_src" 2>/dev/null | command head -1 || true)"
+  _cd_kind="$(sed -n 's/.*"delta_kind":"\([^"]*\)".*/\1/p' "$_cd_src" 2>/dev/null | command head -1 || true)"
+  _cd_digest="$(sed -n 's/.*"delta_digest":"\([^"]*\)".*/\1/p' "$_cd_src" 2>/dev/null | command head -1 || true)"
   _cd_want="${CARRY_EVIDENCE#delta:}"; _cd_want="${_cd_want%%+*}"
   if [ -n "$_cd_range" ] && [ "$_cd_range" = "$_cd_want" ] && [ -n "$_cd_base" ] && [ -n "$_cd_kind" ] && [ -n "$_cd_digest" ]; then
     DELTA_FIELDS="\"delta_range\":\"$_cd_range\",\"delta_base\":\"$_cd_base\",\"delta_kind\":\"$_cd_kind\",\"delta_digest\":\"$_cd_digest\","
