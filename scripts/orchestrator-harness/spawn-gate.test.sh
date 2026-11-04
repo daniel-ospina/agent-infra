@@ -140,11 +140,19 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `--no-session` — so the pair that matched is prose, exactly like `ai-drainer.sh`. It landed after
   # this census and put the shard RED on `main` for every PR that rebased onto it. Excluded by name,
   # with its own non-launcher assertion below.
+  # ⛔ `harness-refresh.sh` IS THE FOURTH OF THAT CLASS (#2958, `191078ad4`). It is the controller
+  # RESTART gate — it reads argv, role locks and the controller's process tree and KILLS nothing — and
+  # its prose (lines 749/751) quotes `pi -p --no-session` to explain why a lane child is invisible to
+  # every session-store reader. Its `-p` tokens in CODE are all `ps -p <pid>`, and its only
+  # `--no-session` in code was a diagnostic MESSAGE, reworded so the pair is prose only, never a code
+  # position. It landed on `main` after this census and put the shard RED for every PR that rebased
+  # onto it — the same ruling as the three above, not a new exception class. Excluded by name, with
+  # its own non-launcher assertion below.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -219,6 +227,15 @@ ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gat
 _oh_code="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
 if grep -qE -e "$_nl_flag" <<<"$_oh_code" && grep -qF -- '--no-session' <<<"$_oh_code"; then rc=1; else rc=0; fi
 ck "the excluded orphaned-harness.sh is a NON-launcher in CODE (a read-only orphan REPORT whose -p tokens are ps/systemctl flags; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+# …and the same proof for harness-refresh.sh (#2958, `191078ad4`), which landed on `main` after this
+# census and reddened the shard for every PR that rebased onto it. Its prose explains that a lane child
+# runs print-mode `pi`; its `-p` tokens in code are `ps -p <pid>`. With the `#`-comments stripped the
+# token PAIR is gone, so what matched was prose — and a real launch added to that file (in code) puts
+# the pair back and this arm goes RED. (`_hr_code`, not a reuse of `_nl_code`/`_oh_code`, so no arm can
+# be read as asserting another's file.)
+_hr_code="$(sed 's/#.*//' "$HERE/harness-refresh.sh" 2>/dev/null)"
+if grep -qE -e "$_nl_flag" <<<"$_hr_code" && grep -qF -- '--no-session' <<<"$_hr_code"; then rc=1; else rc=0; fi
+ck "the excluded harness-refresh.sh is a NON-launcher in CODE (a read-only RESTART gate whose -p tokens are ps flags; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
