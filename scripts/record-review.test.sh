@@ -4781,21 +4781,50 @@ assert_eq "$(dc_posts "$DC_PR")" "1" "14.1d …and the durable comment is STILL 
 # The READ-failure arm carries the OTHER exit-5 message; pin its scope too (14.10a3).
 assert_contains "$RECORD_ERR" "COVERS THE PR BODY ONLY" "14.1d the body-READ-failure exit-5 message also scopes itself to the body channel"
 assert_not_contains "$RECORD_ERR" "nothing carries the marker yet" "14.1d …and does not claim an ABSENCE it cannot know (a previous run's comment may carry it)"
-# ⛔ THE RETIRED PHRASINGS BELONG TO *THIS* ARM, NOT THE PATCH ARM (#3168 review
-#    cycle 4). "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message
-#    (`git show origin/main:scripts/record-review.sh | grep -n 'CI CANNOT SEE IT'`
-#    → :4201), so pinning its absence against the PATCH arm's stderr (14.10a3)
-#    guarded an arm the phrase was never in — restoring it HERE kept the suite GREEN
-#    (measured). The assertions above prove this variable is populated before these
-#    negatives run, so none of them can pass on an empty capture.
+# ⛔ THE RETIRED PHRASINGS ARE ATTRIBUTED PER PHRASE, NOT EN BLOC (#3168 review
+#    cycle 5). A first attempt at this block said all four belonged to "THIS ARM",
+#    and it was wrong for one of them — so it repeated, in a provenance claim, the
+#    exact defect it was pinning. Verified per phrase against main:
+#      • "CI CANNOT SEE IT"           → body-READ arm  (main :4201)  ← HERE
+#      • "attempted on the line above" → read arm, this PR's own earlier commits
+#      • "already admits the evidence" → read arm, this PR's own earlier commits
+#      • "currently INVISIBLE"         → body-PATCH arm (main :4249)  ← NOT here
+#    So the three above are pinned here, where the phrase actually lived, and the
+#    fourth is pinned ONLY at 14.10a3 — asserting it here would be an inert
+#    duplicate that can never fire for a PATCH-arm phrase (measured: re-adding the
+#    phrase to the PATCH message reds 14.10a3 alone, and this arm stays green). The
+#    assertions above prove this variable is populated, so none of these negatives
+#    can pass on an empty capture.
 assert_not_contains "$RECORD_ERR" "CI CANNOT SEE IT" \
     "14.1d …it must NOT assert that CI cannot see the evidence (a posted comment IS admitted by the gate)"
-assert_not_contains "$RECORD_ERR" "currently INVISIBLE" \
-    "14.1d …nor that the evidence is invisible"
 assert_not_contains "$RECORD_ERR" "attempted on the line above" \
     "14.1d …nor claim a comment post it cannot know happened (the unsigned and read-failure arms post none)"
 assert_not_contains "$RECORD_ERR" "already admits the evidence" \
     "14.1d …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
+# (e2) ⛔ THE PENDING WRITE IS OBSERVED, NOT ASSUMED (#3168 review cycle 5). The
+#      read arm discarded marker_pending_write's result with `|| true` and then
+#      asserted "The marker is kept in …" UNCONDITIONALLY — while the PATCH arm two
+#      screens down warns when that same write fails. `marker_pending_write` returns
+#      1 on any mkdir/printf/mv failure and prints nothing, so on an unwritable
+#      pending dir this arm exited 5 telling the operator the only copy of the signed
+#      marker was safe when it was not. The vector BLOCKS the dir with a regular
+#      file, so the failure is real rather than stubbed.
+assert_contains "$RECORD_ERR" "The marker is kept in" \
+    "14.1d …the read arm states the pending copy IS kept when the write succeeded (control)"
+DC_BLOCK_PR=424952
+command mkdir -p "$F_HOME/.pi/agent/reviews" 2>/dev/null || true
+command rm -rf "$F_HOME/.pi/agent/reviews/pending"
+printf 'not a directory\n' > "$F_HOME/.pi/agent/reviews/pending"
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' \
+    run_record_633 "$DC_BLOCK_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "5" "14.1d …an unwritable pending dir is still the NAMED rc 5"
+assert_contains "$RECORD_ERR" "could not persist the pending marker" \
+    "14.1d …and the failed pending write is REPORTED, not swallowed"
+assert_contains "$RECORD_ERR" "NO --flush-pending retry" \
+    "14.1d …and the exit-5 message does not promise a flush that cannot happen"
+assert_not_contains "$RECORD_ERR" "The marker is kept in" \
+    "14.1d …it must NOT assert the copy is kept when the write failed"
+command rm -f "$F_HOME/.pi/agent/reviews/pending"
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body is the only copy of the verdict that
@@ -4947,11 +4976,15 @@ assert_eq "$(dc_posts 424329)" "1" \
 #        "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message, so
 #        asserting it here — against the PATCH arm's stderr — guarded an arm the
 #        phrase never occupied. It is kept below as defence in depth for the PATCH
-#        message, but 14.1d is where it is load-bearing.
+#        message. ⛔ PER-PHRASE ATTRIBUTION (cycle 5): of the four retired phrases,
+#        ONLY "currently INVISIBLE" belongs to this PATCH arm (main :4249) — the
+#        other three live in the read arm and are pinned in 14.1d. This one is the
+#        load-bearing PATCH pin; do not "deduplicate" it against 14.1d, where it
+#        cannot fire.
 assert_contains "$RECORD_ERR" "body-marker-unposted" "14.10a3 the exit-5 failure still has its NAMED state"
 assert_contains "$RECORD_ERR" "COVERS THE PR BODY ONLY" "14.10a3 …and scopes itself to the body channel (the only thing it can assert)"
 assert_not_contains "$RECORD_ERR" "CI CANNOT SEE IT" "14.10a3 …it must NOT assert that CI cannot see the evidence (a posted comment IS admitted by the gate)"
-assert_not_contains "$RECORD_ERR" "currently INVISIBLE" "14.10a3 …nor that the evidence is invisible"
+assert_not_contains "$RECORD_ERR" "currently INVISIBLE" "14.10a3 …nor that the evidence is invisible (the phrase lived in THIS arm on main :4249 — 14.1d must NOT carry it, it cannot fire there)"
 assert_not_contains "$RECORD_ERR" "attempted on the line above" "14.10a3 …nor claim a comment post it cannot know happened (the unsigned and read-failure arms post none)"
 assert_not_contains "$RECORD_ERR" "already admits the evidence" "14.10a3 …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
 if grep -qF -- "actions/jobs/" "$LOG"; then

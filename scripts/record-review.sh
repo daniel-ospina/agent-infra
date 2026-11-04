@@ -1178,12 +1178,16 @@ post_marker_comment() { # <repo> <pr> <marker>
     # Both were false here. The read's error text is discarded (2>/dev/null on the
     # capture — deliberately, so an HTTP error body can never be read as comment
     # text), so "transient API failure" was a guess that also covered a permanent
-    # 404. And "re-run this to retry" is FALSE at two of the five call sites:
-    # flush_pending_markers deletes its pending marker once its body post succeeds,
-    # and --recover-body refuses outright once a record exists — at both, the verb
-    # that printed this line cannot retry the durable copy at all. The remedy is
-    # the CALLER's to state; this function reports only what it observed.
-    echo "⚠️ record-review: could not read the PR's comments on $repo#$pr — this call created no durable comment copy, and this line makes no claim about the body channel. It does not name a CAUSE either (the read's error text is discarded by design), and ⛔ it deliberately promises NO retry: whether re-running helps is the CALLER's business, and at flush_pending_markers and --recover-body it does not, because those two verbs cannot reach this call a second time. Read the calling verb's own message for the remedy it can honour." >&2
+    # 404. And a blanket "re-run this to retry" is FALSE at two of the five call
+    # sites — but ⛔ NOT UNIFORMLY FALSE, which a first attempt at this line got
+    # wrong in the other direction (fresh review, cycle 5): flush_pending_markers
+    # deletes its pending marker only when its body post SUCCEEDS, so a body-post
+    # failure leaves the file and a re-run DOES retry this call — while a body-post
+    # success removes it and a re-run finds nothing. --recover-body cannot retry at
+    # all: it refuses at its existing-record check once the record the first run
+    # wrote exists. The exact condition is the caller's to state; this function
+    # reports only what it observed.
+    echo "⚠️ record-review: could not read the PR's comments on $repo#$pr — this call created no durable comment copy, and this line makes no claim about the body channel. It does not name a CAUSE either (the read's error text is discarded by design), and ⛔ it deliberately promises NO retry of its own: whether re-running helps is the CALLER's business and differs per call site — --flush-pending retries only while its pending marker survives (it is deleted once a body post SUCCEEDS, so a body-post FAILURE leaves a retry and a success does not), and --recover-body cannot retry at all because it refuses once a record exists. Read the calling verb's own message for the remedy it can honour." >&2
     HAVE_COMMENT=-1
   fi
   if [ "$HAVE_COMMENT" = "0" ]; then
@@ -4067,7 +4071,19 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # file first: a later `--flush-pending` (or any later run of this PR) delivers
     # them without a second review. Exit 5 names the state instead of reporting
     # success over an invisible record.
-    marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || true
+    # ⛔ THE PENDING WRITE'S RESULT IS OBSERVED, NOT ASSUMED (#3168 review cycle 5).
+    # This used to discard it with `|| true` and then assert, unconditionally, that
+    # "the marker is kept in …" — while the PATCH arm below warns when the same
+    # write fails. `marker_pending_write` returns 1 on any mkdir/printf/mv failure
+    # and prints nothing, so on an unwritable pending dir this arm exited 5 telling
+    # the operator the only copy was safe when it was not. The two arms of one
+    # commit must not assert different things about the same fact.
+    PENDING_SAVED=0
+    if marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER"; then
+      PENDING_SAVED=1
+    else
+      echo "⚠️ body-marker: could not persist the pending marker at $(marker_pending_file "$REPO" "$PR") — there is NO flush retry for this run; copy this line from this message instead: $MARKER" >&2
+    fi
     # ⛔ THE DURABLE CHANNEL IS ATTEMPTED HERE, BEFORE THE exit 5 (agent-infra#3168
     # review P2). This arm and the PATCH-failure arm below are the ONLY scenarios
     # the durable channel exists for, and both used to `exit 5` before reaching it —
@@ -4080,7 +4096,12 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # WITHOUT it, so the arm this channel exists for still exited 5 having
     # published nothing — suite vector 14.1d(e) is the discriminator).
     post_marker_comment "$REPO" "$PR" "$MARKER" || true
-    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (gh refused the GET — ⛔ this line does NOT assert WHICH cause: the error text is discarded, so a transient API failure, a throttled token, and a permanent 404 for a wrong PR number or a repo this token cannot see all land here), so the signed marker was NOT written into the PR body — the record is saved. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers the BODY copy WITHOUT a new review IF the cause was transient; a PERMANENT cause fails that retry the same way." >&2
+    if [ "$PENDING_SAVED" = "1" ]; then
+      PENDING_SUFFIX="The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers the BODY copy WITHOUT a new review IF the cause was transient; a PERMANENT cause fails that retry the same way."
+    else
+      PENDING_SUFFIX="The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO delivers it."
+    fi
+    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (gh refused the GET — ⛔ this line does NOT assert WHICH cause: the error text is discarded, so a transient API failure, a throttled token, and a permanent 404 for a wrong PR number or a repo this token cannot see all land here), so the signed marker was NOT written into the PR body — the record is saved. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). ${PENDING_SUFFIX}" >&2
     exit 5
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
