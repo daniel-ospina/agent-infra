@@ -458,7 +458,22 @@ try:
 except ValueError as exc:
     print("NOTJSON:%s" % exc)
     sys.exit(1)
-servers = cfg.get("mcpServers") or {}
+if not isinstance(cfg, dict):
+    # ⛔ THE CONTAINER, NOT ONLY THE ENTRY. `.get` on a non-object ROOT (a JSON array, a string, a
+    # number) raised here, so stdout stayed EMPTY and the operator got `FAIL: … (marker: none)`
+    # above a traceback — while the merge raised on its own copy of the same assumption, so
+    # `--install` could never clear it and every bring-up died. REFUSED BY NAME; a re-install
+    # replaces the container (keeping a `.bak`).
+    print("BADROOT:%s" % type(cfg).__name__)
+    sys.exit(1)
+servers = cfg.get("mcpServers")
+if servers is None:
+    servers = {}
+if not isinstance(servers, dict):
+    # ⛔ SAME RULE ONE LEVEL DOWN: `dict(...)`/`.get` on a `mcpServers` that is a number, a string or
+    # a list raised on both sides. Named, so the refusal says what is wrong and a re-install can fix it.
+    print("BADSERVERS:%s" % type(servers).__name__)
+    sys.exit(1)
 t = servers.get("tortoise")
 # ⛔ A LEAK IS NOT A TORTOISE PROBLEM. The token scan below covers the WHOLE file, so a literal
 # pasted into any other server's entry (or into a `_comment`) is found there — and reporting it as
@@ -650,6 +665,8 @@ PY
         fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED. Use https, or drop the Authorization for a local daemon (which needs none)" ;;
       BADDERS:*)
         fail ".mcp.json's tortoise entry declares its headers value as a ${out#BADDERS:}, not an object — the Authorization cannot be read from it, so nothing can be certified. Make it an object: {\"Authorization\": \"Bearer \${TORTOISE_MCP_API_KEY}\"} — a re-install does this for you" ;;
+      BADROOT:*|BADSERVERS:*)
+        fail ".mcp.json's ${out%%:*} is a JSON ${out#*:}, not an object — nothing can be read from it, so nothing can be certified. A re-install REPLACES it and keeps the old file as .mcp.json.bak" ;;
       BADAUTH:*)
         fail ".mcp.json's tortoise Authorization is a ${out#BADAUTH:}, not a string — a config the client cannot expand, and a shape no merge can repair. Make it \"Bearer \${TORTOISE_MCP_API_KEY}\" (a re-install replaces it)" ;;
       URLTYPE:*)
