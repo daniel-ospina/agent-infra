@@ -1075,7 +1075,11 @@ fs_bounded_out() {
     [ $# -gt 0 ] || return 125
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-fso.XXXXXX" 2>/dev/null)" || return 125
     run_bounded "$secs" "$out" "$@"; rc=$?
-    [ "$rc" = 0 ] && cat "$out" 2>/dev/null
+    # ⛔ A LISTING THAT COULD NOT BE DELIVERED IS NOT AN EMPTY TREE (review of #3422 round 12, P3).
+    # `cat`'s own status was discarded, so a read that failed halfway emitted a PREFIX and returned the
+    # child's rc 0 — a truncated listing that any post-archive comparison reads as "nothing changed".
+    # The caller's contract is "rc 0 ⇒ the output IS the whole output", so a failed `cat` is rc 1.
+    if [ "$rc" = 0 ] && ! cat "$out" 2>/dev/null; then rc=1; fi
     rm -f "$out" 2>/dev/null
     return "$rc"
 }
@@ -1089,6 +1093,9 @@ fs_exists_bounded() {
 # fs_isdir_bounded <secs> <path> — `[ -d ]`, bounded (same reason: a stat on a dead mount blocks).
 fs_isdir_bounded() {
     fs_bounded "$1" sh -c '[ -d "$1" ]' _ "$2"
+}
+fs_link_bounded() { # a symlink, followed or DANGLING (the shape `-e` answers wrongly)
+    fs_bounded "$1" sh -c '[ -L "$1" ]' _ "$2"
 }
 
 # fs_nonempty_bounded <secs> <path> — `[ -s ]`, bounded.
@@ -1851,7 +1858,7 @@ clean_gate() {
 # mid-edit when its PR auto-merged is the ordinary case).
 preserve_before_removal() { # <path> <sha> <branch> <reason>
     local path="$1" sha="$2" br="$3" why="$4"
-    local slug day dir ev tarf out listed e rc ok=1 disc root mf
+    local slug day dir ev ev_rc tarf out listed e rc ok=1 disc root mf
     root="${PRESERVE_ROOT_RESOLVED:-$(preserve_dir_resolve)}" || {
         log "PRESERVE-FAIL $path no writable preserve root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — nothing may be removed"
         return 1
@@ -1890,7 +1897,14 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true
 
     # ── the lane's own mandated evidence ─────────────────────────────────
-    ev="$(lane_evidence_present "$path")"
+    ev="$(lane_evidence_present "$path")"; ev_rc=$?
+    # ⛔ THE THIRD CALLER (review of #3422 round 12, P3): discarding the status here passed the
+    # `!unreadable` sentinel to `tar` as a MEMBER NAME — fail-closed, but red for the wrong reason and
+    # contradicting the invariant the other two call sites enforce.
+    if [ "$ev_rc" = 3 ]; then
+        log "PRESERVE-FAIL $path the lane-evidence probe could not answer before the archive — nothing removed, and this pass is RED"
+        rm -f "$out"; return 1
+    fi
     if [ -n "$ev" ]; then
         # $ev is space-free ROOT names by construction (see IGNORED_LANE_EVIDENCE) — the same
         # discipline the ephemeral payload relies on. `-C "$path"` keeps the member names relative.
@@ -2052,7 +2066,7 @@ EOF
 #
 # Return code: 0 the signature was taken; 1 the walk could not be completed => caller FAILS the removal.
 evidence_signature() {
-    local path="$1" r sig
+    local path="$1" r sig tgt
     shift
     sig="$(
         for r in "$@"; do
@@ -2060,12 +2074,22 @@ evidence_signature() {
             # ⛔ THE LINK TEST COMES FIRST, because `fs_exists_bounded` deliberately says TRUE for a
             # DANGLING symlink (`-e || -L`), so testing existence before link-ness sent a broken link
             # into the `cksum` arm and red'd every pass (review of #3422 round 11, P2).
-            if [ -L "$path/$r" ]; then
-                # its identity is the LINK, never the target: following a live link would make an
-                # out-of-checkout tree count against this checkout, and following a dangling one fails
-                printf 'link %s -> %s\n' "$r" "$(readlink "$path/$r" 2>/dev/null)"
+            # ⛔ BOUNDED, like every other stat on this path (review of #3422 round 12, P3): a bare
+            # `[ -L ]`/`readlink` on a checkout whose mount has hung wedges the whole pass, and the
+            # oneshot unit has no timeout — so the doctrine stated above `lane_evidence_present` has to
+            # hold HERE too. A `readlink` that fails is a walk that could not complete (RED), not a
+            # `link r -> ` line that compares equal to itself forever.
+            if fs_link_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
+                tgt="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" readlink "$path/$r")" || exit 3
+                printf 'link %s -> %s\n' "$r" "$tgt"
             elif fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
-                fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r/" -type f -exec cksum {} + || exit 3
+                # `-type f` for content, PLUS `-type l` for the links inside the root: `tar` stores an
+                # inner link as a link, so retargeting one during the archive is a change the file
+                # listing cannot see (review of #3422 round 12, P3). `cksum` would follow such a link,
+                # so the link arm prints the link's own target instead.
+                fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r/" \
+                    \( -type f -exec cksum {} + \) -o \
+                    \( -type l -exec sh -c 'for l; do printf "link %s -> %s\n" "$l" "$(readlink "$l")"; done' sh {} + \) || exit 3
             elif fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
                 fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r" || exit 3
             fi
@@ -3841,6 +3865,9 @@ remove_one() {
             log "PRESERVE-SKIP $path the lane-evidence probe could not answer — nothing removed, and this pass is RED"
             rm -f "$out"; return 1
         fi
+        # normalised to the manifest's own encoding: an EMPTY "no evidence" must not read as a
+        # vanished root in the waived-precondition note below (review of #3422 round 12, P3)
+        [ -n "$ev_before" ] || ev_before="<none>"
         ev_sig_before=""
         if [ -n "$ev_before" ]; then
             # shellcheck disable=SC2086
