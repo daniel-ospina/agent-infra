@@ -140,10 +140,14 @@
 #        the header is env-indirect, and `--verify` FAILS if a literal `tt_`/`tk_` value ever
 #        appears in it. The credential itself is operator-pushed into `~/keys.env` (0600) —
 #        `cloud-cell-bringup.sh` documents keys.env as "operator-pushed, and NOT a bring-up
-#        byproduct" — so `--verify` also refuses a cell whose `TORTOISE_MCP_API_KEY` does not
-#        resolve to something a server would accept, because a config with an unresolved
+#        byproduct" — so `--verify` WARNS (it never fails) on a cell whose `TORTOISE_MCP_API_KEY`
+#        does not resolve to something a server would accept, because a config with an unresolved
 #        `${VAR}` sends `Bearer ` (empty) and the server answers 401; that failure reads as
-#        an auth problem rather than the set-up gap it is (#5153).
+#        an auth problem rather than the set-up gap it is (#5153). ⛔ WARN, not fail, on purpose: the
+#        key is operator state, so refusing to certify an otherwise-complete LAYER over a key nobody
+#        pushed is a false block — the one thing that teaches an operator to ignore the verifier.
+#        Exit 0 with an unmissable `⚠️  graph credential: NOT resolvable` line (and the same state in
+#        the `LAYER VERIFIED` verdict line) instead. Only a LITERAL credential in the file FAILS.
 #
 # 4. ⛔ NOTHING is written under `~/.pi/agent/tools/` except pi's own fd/rg. See the #1277
 #    note above; this script installs nothing there, removes a legacy `tools/fleet/` if it
@@ -413,11 +417,17 @@ if not url:
     print("NOURL")
     sys.exit(1)
 # `type` is OPTIONAL, deliberately: the client's `McpServerConfig` has no `type` field and picks
-# the HTTP transport from `url` alone, so requiring it would refuse a config that works — while an
-# explicit OTHER transport (`sse`/`stdio`) is a different thing and must not be certified.
-if t.get("type") not in (None, "http"):
-    print("NOTHTTP:%s" % t.get("type"))
-    sys.exit(1)
+# the HTTP transport from `url` alone, so requiring it would refuse a config that works.
+#
+# ⛔ BUT THE `type` JUDGEMENT BELONGS WITH THE URL, NOT BEFORE IT — and this arm used to run first,
+# unconditionally, which made INSTALL and VERIFY disagree about the SAME preserved entry: the merge
+# (`merge-mcp.py` `usable()`) deliberately preserves a self-hosted entry that spells `type: "sse"`
+# for its own daemon, marks it `_selfHosted`, and rc=0; this verifier then refused `sse` and rc=1.
+# `cloud-cell-bringup.sh` on a verify failure runs INSTALL and then prints "operational layer present
+# and verified" WITHOUT re-reading the verdict — so the disagreement was a FALSE PASS on the layer
+# gate, and it repeated on every bringup because the repair could only re-create the refusal. The
+# rule is ONE rule, applied by both sides: a non-http `type` disqualifies the HOSTED default (where
+# `http` is the contract) and is the operator's business on their own daemon. See the url branch below.
 auth = ((t.get("headers") or {}).get("Authorization") or "")
 if auth and "${" not in auth:
     print("LITERAL_AUTH")
@@ -448,8 +458,14 @@ if want_url and url != want_url:
     if not t.get("_selfHosted"):
         print("URL_NOT_DEFAULT:%s" % url)
         sys.exit(1)
+    # A self-hosted entry is certified BY NAME, and its own transport spelling is part of what the
+    # operator chose: the client selects StreamableHTTP from `url` alone and never reads `type`, so
+    # refusing `sse` here would refuse a config that WORKS (and that install preserves on purpose).
     print("SELFHOSTED:%s" % url)
 else:
+    if t.get("type") not in (None, "http"):
+        print("NOTHTTP:%s" % t.get("type"))
+        sys.exit(1)
     if not auth:
         print("NOAUTH")
         sys.exit(1)
