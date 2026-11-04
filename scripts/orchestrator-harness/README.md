@@ -5135,13 +5135,14 @@ same 5.6 GB venv), and the marginal `tree` figure is only true while a warm shar
 cache that pressure prunes first. **The cost of that choice, stated:** a box at ~5 GB free refuses a
 harness lane the live gate would have admitted, until an operator states a smaller worst case.
 
-⚠️ **SCOPE:** these are the three LANE-creation paths. Six scripts create checkouts directly and are
+⚠️ **SCOPE:** these are the three LANE-creation paths. Five scripts create checkouts directly and are
 NOT gated here, which is a named residual of this change: `stall-fix.sh` (`git worktree add` for a
 throwaway mend checkout), `ai-drainer.sh` (the same), `refresh-candidates.sh`,
 `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance checkouts). Their ENOSPC
 behaviour is exactly what it was; each is a place where a lane can still die on a full volume, and
 moving them onto `wt_provision` (or the `--disk-admit` verb) is the follow-up this change does not do.
-`grep -rn 'worktree add' scripts/` is the live list — treat it as the census, not this sentence.
+`grep -rln --include='*.sh' -e 'worktree add' scripts/` is the script-scoped census — treat it, not
+this sentence, as the list.
 
 Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
 the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real

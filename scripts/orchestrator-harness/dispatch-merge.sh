@@ -398,17 +398,19 @@ for N in "$@"; do
        # remainder — this issue and everything after it that nothing was started for — is released.
        _dm_unspawned=""
        _dm_seen=0
-       for _dm in "$N" "$@"; do
+       # ⛔ ITERATE `"$@"` — NOT `"$N" "$@"` (review round 5, P2 — MEASURED). `$N` is already the
+       # element being processed, so putting it FIRST set `_dm_seen=1` on iteration 1 and made the
+       # at-or-after guard below unreachable: a driver with batch `10 11 12` refusing at 11 released
+       # `10 11 12` instead of `11 12`, re-releasing an id an earlier per-issue arm had already
+       # released (`claims.sh` then returns 1 and the log gains a false alarm about work that was never
+       # started). The flag is set BEFORE the spawn/duplicate skips, so reaching this issue opens the
+       # window even when this issue itself is then skipped.
+       for _dm in "$@"; do
          case "${_dm:-}" in ''|*[!0-9]*) continue ;; esac
-         case " $SPAWNED_IDS $CHAIN_IDS " in *" $_dm "*) continue ;; esac
-         case " $_dm_unspawned " in *" $_dm "*) continue ;; esac
-         # ⛔ NOTHING **BEFORE** THIS ISSUE (review round 4, P3 — MEASURED). `$@` carries the WHOLE
-         # batch, so iterating from the first id re-released issues an EARLIER per-issue arm had already
-         # released: `claims.sh` then finds `state/issueclaim-<N>` gone, returns 1, and the log gains a
-         # false alarm per id (`⚠️ the issue claim was NOT released … it runs to its lease`) about work
-         # that was never started. Release only what is at-or-after this issue.
          [ "$_dm" = "$N" ] && _dm_seen=1
          [ "$_dm_seen" -eq 1 ] || continue
+         case " $SPAWNED_IDS $CHAIN_IDS " in *" $_dm "*) continue ;; esac
+         case " $_dm_unspawned " in *" $_dm "*) continue ;; esac
          _dm_unspawned="$_dm_unspawned $_dm"
          release_issue_claim_unspawned "$_dm"
        done

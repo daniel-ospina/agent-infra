@@ -342,15 +342,21 @@ _mut="$T/mut-dispatch-merge.sh"
 sed -e 's/^\([[:space:]]*\)break ;;$/\1continue ;;/' "$HERE/dispatch-merge.sh" > "$_mut" 2>/dev/null
 printf '\nbreak\n' >> "$_mut"
 _marm="$(arm_of "$_mut")"
-if printf '%s' "$_marm" | grep -q 'SPAWNED_IDS\|CHAIN_IDS'; then
-  if grep -qF 'break' <<<"$_marm"; then
-    bad "H) the census is VACUOUS: a mutated dispatch-merge (break→continue, plus a stray break later) still passes"
-  else
-    ok "H) the census is non-vacuous: on the mutated copy it reads the arm and the token IS absent"
-  fi
-else
-  bad "H) the mutation harness could not extract a mutated arm — fix the harness, do not trust the pass above"
-fi
+# ⛔ NO PIPELINE HERE (review round 5, P2 — MEASURED). `printf … | grep -q` under the suite's own
+# `set -o pipefail` is a SIGPIPE flake: `grep -q` exits on the first match, `printf` dies of SIGPIPE
+# (141), and pipefail turns a CORRECT tree into "the mutation harness could not extract a mutated
+# arm" — measured 271 false negatives in 3,000 runs with pipefail on, 0 with a `case` match. A gate
+# that reds at random is the same defect as one that never fires.
+case "$_marm" in
+  *SPAWNED_IDS*|*CHAIN_IDS*)
+    if grep -qF 'break' <<<"$_marm"; then
+      bad "H) the census is VACUOUS: a mutated dispatch-merge (break→continue, plus a stray break later) still passes"
+    else
+      ok "H) the census is non-vacuous: on the mutated copy it reads the arm and the token IS absent"
+    fi ;;
+  *)
+    bad "H) the mutation harness could not extract a mutated arm — fix the harness, do not trust the pass above" ;;
+esac
 
 echo
 echo "── results: $PASS passed, $FAIL failed ──"
