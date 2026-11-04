@@ -347,7 +347,7 @@ chmod 600 "$BRIEF1F" 2>/dev/null
 # file it had not read, the "gate that cannot redden" class §E's own header names. The predicate below
 # anchors only on HOW an assignment starts and on what a GUARDED one ends with, so nesting cannot hide a
 # line from it, and it is exercised by a control on each side (below) instead of being trusted.
-unguarded_subs() { grep -nE '^[[:space:]]+[a-z_]+="\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
+unguarded_subs() { grep -nE '^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*="\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
 UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | unguarded_subs | sed 's/^/emit+/')"; [ -z "$UNGUARDED" ]; ck $? "every command-substitution assignment in the emit carries a guard against a set -e caller (unguarded:${UNGUARDED:- none})"
 # ── E1g: THE CONTROL — the arm above can REDDEN, and does so on the shapes the vacuous version missed ──
 # Three arms, because a one-sided control only proves the predicate is not always-true: a bare assignment
@@ -356,6 +356,29 @@ UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | unguarded_subs
 printf '  v="$(cmd)" || :\n' | unguarded_subs > /dev/null; [ $? -ne 0 ]; ck $? "control: a GUARDED assignment is NOT reported (the predicate is not always-true)"
 printf '  v="$(cmd)"\n' | unguarded_subs | grep -q .; ck $? "control: a BARE assignment IS reported (the arm can redden)"
 printf '  v="$(printf '\''%%s (%s)'\'' "$(hostname)")"\n' | unguarded_subs | grep -q .; ck $? "control: a NESTED / paren-bearing bare assignment IS reported — the shape the vacuous first cut could not match"
+# ⛔ AND THE NAME SHAPE IS NOT JUST LOWERCASE (review cycle 2, P2, MEASURED). The first predicate written
+# here anchored on `[a-z_]+`, so an added `MP_NOTICE="$(cmd)"` or `notice2="$(cmd)"` — the ordinary shape
+# in the rest of this harness — was invisible and the arm still printed "unguarded: none". Env-style and
+# digit-bearing names are now covered, and both are driven below so the hole cannot reopen quietly.
+printf '  MP_NOTICE="$(printf x)"\n' | unguarded_subs | grep -q .; ck $? "control: an UPPERCASE assignment name IS reported (a lowercase-only predicate is the same class of hole)"
+printf '  notice2="$(printf y)"\n' | unguarded_subs | grep -q .; ck $? "control: a DIGIT-bearing assignment name IS reported"
+# ── E1j: A DECLARATION THAT RENDERS NOTHING IS CANNOT-VERIFY, NEVER "ALL PRESENT" (cycle 2, P1) ──
+# Every collector iterates the declaration, so an empty `mandate_files` empties the whole POPULATION: the
+# three lists come back empty, the directory is fine, and "nothing is declared" was graded as "everything
+# is present" — a false PASS in `--check`, and a "BOTH files are now PRESENT" block as the LAST claim a
+# lane reads while both are absent. Measured here by stubbing the declaration (a function override, so no
+# fixture is needed). Both surfaces are driven, because they failed independently.
+DECL_RC="$(bash -c '. "$1"; mandate_files() { :; }; mandate_verdict >/dev/null 2>&1; printf %s $?' _ "$HELPER")"
+[ "$DECL_RC" = "2" ]; ck $? "--check with a declaration that renders NOTHING is CANNOT VERIFY (2), not 0 'all present' (measured rc=$DECL_RC)"
+BRIEF1J="$TMP/brief-decl.txt"; printf '# a brief\n' > "$BRIEF1J"
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" declstamp' _ "$HELPER" "$TMP/decl.log" "$BRIEF1J" >/dev/null 2>&1
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; mandate_preflight_emit "$2" "$3" declempty' _ "$HELPER" "$TMP/decl.log" "$BRIEF1J" >/dev/null 2>&1
+if grep -qF 'BOTH mandated files are now PRESENT' "$BRIEF1J"; then
+  bad "…and an empty DECLARATION still produced the 'now PRESENT' claim on a box where both files are absent"
+else
+  ok "…and it never claims they are present (an empty population is not a clean one)"
+fi
 # ── E1h: AN EMPTY NEEDLE MUST NEVER MATCH — the measured `case *""` hole (review P1) ────────────
 # `case "$x" in *"")` matches EVERY string. Both of the emit's idempotence tests keyed on a RENDERED
 # string, so one failed render meant "the brief already ends with this" about a brief that ends with
@@ -483,15 +506,25 @@ grep -qF 'mandate_preflight_emit "$log" "$prompt" "$label"' "$SPAWN";           
 grep -qF 'mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"' "$MERGE"; ck $? "merge-one.sh calls the SAME shared emit"
 grep -qF 'declare -F mandate_preflight_emit' "$SPAWN"; ck $? "spawn-gate.sh checks the helper is USABLE, not merely sourceable"
 grep -qF 'declare -F mandate_preflight_emit' "$MERGE"; ck $? "merge-one.sh checks the helper is USABLE too"
-# ── E6: THE TWO RESOLVERS MUST AGREE (review P2 — the copy had already diverged) ──────────────────
-# `run_agent` is duplicated (a declared residual, #2208), so the RESOLVER is duplicated too. The copy in
-# merge-one.sh was missing the `MANDATE_PREFLIGHT_SH` entry, which means an override honoured for lanes,
-# fixers and workers was silently ignored for the reviewer `pi` session — the two seams disagreed about
-# where the helper lives on exactly the box that needed the override. Pinned in both: the entry, and the
-# `[ -f ]` test that stops a STALE override short-circuiting to something that is not a file.
-grep -qF 'MANDATE_PREFLIGHT_SH' "$SPAWN"; ck $? "spawn-gate.sh's resolver honours MANDATE_PREFLIGHT_SH"
-grep -qF 'MANDATE_PREFLIGHT_SH' "$MERGE"; ck $? "merge-one.sh's resolver honours it TOO (the copy had diverged — an override that works for every lane but the reviewer)"
-grep -qF '[ -f "${MANDATE_PREFLIGHT_SH}" ]' "$SPAWN"; ck $? "…and spawn-gate.sh tests the override is a FILE, so a stale path falls through to the real candidates instead of degrading the disclosure to log-only"
+# ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
+# ⛔ CYCLE 1'S ARMS WERE VACUOUS (measured in cycle 2): they grepped for the STRING `MANDATE_PREFLIGHT_SH`,
+# which the explanatory COMMENT above the resolver also contains — so reverting the whole merge-one.sh fix
+# left the suite at 86 passed, 0 failed. An arm satisfied by prose guards nothing. The spawn-gate arms are
+# therefore BEHAVIOURAL (source the helper and call the resolver), and merge-one's are pinned to its
+# candidate LINE — its top-level body cannot be sourced, so that one is a source pin and says so, the same
+# stated limit §E5 carries for the delegate.
+RESOLVED="$(MANDATE_PREFLIGHT_SH="$HELPER" bash -c '. "$1"; mandate_preflight_lib' _ "$SPAWN" 2>/dev/null)"
+[ "$RESOLVED" = "$HELPER" ]; ck $? "spawn-gate.sh's resolver RETURNS a valid MANDATE_PREFLIGHT_SH (driven, not grepped)"
+STALE="$(MANDATE_PREFLIGHT_SH="$TMP/does-not-exist/mandate-preflight.sh" bash -c '. "$1"; mandate_preflight_lib' _ "$SPAWN" 2>/dev/null)"
+if [ "$STALE" = "$TMP/does-not-exist/mandate-preflight.sh" ]; then
+  bad "a STALE MANDATE_PREFLIGHT_SH short-circuits the resolver — the disclosure then degrades to log-only on a box whose own copy is fine"
+else
+  [ -f "$STALE" ]; ck $? "…and a STALE override is SKIPPED, falling through to a real candidate ($STALE)"
+fi
+# merge-one.sh: its `run_agent` copy lives in a file whose top-level body cannot be sourced, so this is a
+# SOURCE pin on the resolver line — and it pins CODE, not the comment above it (cycle 2's finding).
+grep -qF 'for _ms in "${MANDATE_PREFLIGHT_SH:-}"' "$MERGE"; ck $? "merge-one.sh's resolver STARTS its candidate list with MANDATE_PREFLIGHT_SH (the copy had diverged — an override that worked for every lane but the reviewer)"
+grep -qF '[ -n "$_ms" ] && [ -f "$_ms" ]' "$MERGE"; ck $? "…and merge-one.sh tests each candidate is a FILE (the stale-override degradation is not re-introduced on the reviewer seam)"
 # The emit itself must be non-fatal on every branch.
 if awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -qE '\breturn [1-9]'; then
   bad "mandate_preflight_emit returns non-zero on some branch — callers would treat a disclosure as a refusal"
