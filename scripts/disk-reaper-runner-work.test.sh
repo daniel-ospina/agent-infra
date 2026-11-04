@@ -263,6 +263,36 @@ case_a() { # <entry-point> <owner>
                "and the record carries a measured 0, not a guess (candidates_runner_work=0)"
     case_check "$(grep -q '^cand_runner_work=0$' <<<"$st" && echo 0 || echo 1)" \
                "… under both spellings of the counter (cand_runner_work=0)"
+    # ⛔ AND THE SHIPPED FLOOR IS THE VALIDATED ONE — this arm exists because every assertion above and
+    # below passes the floor IN explicitly, so the DEFAULT was asserted by nothing at all. A reviewer
+    # measured the consequence at this head: the shipped default was 3600 s, HALF the only floor anything
+    # validated (the 120-minute hand reap), in a class that is in the entry point's default
+    # `DISK_REAPER_ONLY` and is installed by a timer whose `ExecStart` carries `--apply` — so merging it
+    # armed a delete at 2x the measured aggressiveness on every box, and no case would have noticed a
+    # revert to 3600. The fixture sits BETWEEN the two values (90 min): KEPT by 7200 s, a CANDIDATE under
+    # 3600 s, so the arm discriminates them by BEHAVIOUR and by the printed floor.
+    local work2 mid s4 work3 s5 out2
+    work2="$(mk_work "$base" gh-runner-x64-3)"
+    fixture_entry mid "$work2" job-midrun 90 || return 1
+    s4="$(uniqstate a4)"
+    out2="$(run_pass "$pass" "$s4" "$base/gh-runner-x64-3/_work" --dry-run --only runner-work)"
+    case_check "$(grep -qF 'min_age=7200s' <<<"$out2" && echo 0 || echo 1)" \
+               "the SHIPPED floor (no seam set) is 7200 s — the only empirically validated value, not half of it"
+    case_check "$(grep -qF 'candidates=0 ' <<<"$out2" && echo 0 || echo 1)" \
+               "… so a 90-minute-old entry — silent for longer than the OLD default would have allowed — is NOT a candidate"
+    case_check "$(grep -qF 'WOULD-REMOVE' <<<"$out2" && echo 1 || echo 0)" \
+               "… and nothing is named for removal, which is the delete the old 3600 s default would have made"
+    # THE OWNER'S OWN default too: the entry point RELAYS the floor (`--min-age`), so a mutant that
+    # halves only the OWNER's default is invisible through it. Drive the owner directly, no seam.
+    work3="$(mk_work "$base" gh-runner-x64-4)"
+    fixture_entry mid "$work3" job-midrun2 90 || return 1
+    s5="$(uniqstate a5)"
+    out2="$(REAP_RW_STATE_DIR="$s5" REAP_RW_GLOBS="$work3" BOUNDED_LIB="$HERE/lib/bounded.sh" \
+           bash "$owner" --dry-run 2>&1)"
+    case_check "$(grep -qF 'min_age=7200s' <<<"$out2" && echo 0 || echo 1)" \
+               "the OWNER's shipped floor is 7200 s too, with no seam and no relayed flag (min_age=7200s)"
+    case_check "$(grep -qF 'candidates=0 ' <<<"$out2" && echo 0 || echo 1)" \
+               "… so it keeps a 90-minute entry on its own default, exactly as the entry point does"
     return $((CASE_FAIL > 0))
 }
 
@@ -731,6 +761,19 @@ case_l() { # <entry-point> <owner>
                "… and the entry point's RECORD carries it, so the abstention reaches the status channel (not just the log)"
     case_check "$(grep -q 'note_runner_work=1 entry/root KEPT as unreadable' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
                "… and the NOTE names it, so an operator finds it without knowing the field exists"
+    # ⛔ THE ABSTENTION MUST NOT LAND AS A MEASURED ZERO — the FALSE PASS a review found at this head.
+    # `unmeasurable=1` was carried correctly and changed NOTHING ELSE: `candidates=0` still came from a
+    # census that read `ok`, so the RECORD said `candidates_runner_work=0 verdict_runner_work=ok` and a
+    # box whose sink fills behind a permission mismatch read HEALTHY for ever. Three surfaces, asserted
+    # separately, because the entry point can lift the owner's token without honouring it.
+    case_check "$(grep -qF 'census=abstained' <<<"$sum" && echo 0 || echo 1)" \
+               "… and the OWNER's census says abstained, not ok, so its candidates=0 cannot be lifted as a measurement"
+    case_check "$(grep -q '^candidates_runner_work=?$' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… the RECORD publishes ? for the count — never the 0 nothing measured"
+    case_check "$(grep -q '^verdict_runner_work=abstained$' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and a DISTINCT verdict, so nothing keying on 'ok' inherits a false PASS"
+    case_check "$(grep -qF 'candidates=?' <<<"$out" && echo 0 || echo 1)" \
+               "… the class line agrees with the record (candidates=?)"
     return $((CASE_FAIL > 0))
 }
 
@@ -822,6 +865,121 @@ case_n() { # <entry-point>
     return $((CASE_FAIL > 0))
 }
 
+# ── (o) a matched root whose BASENAME is not `_work` is REFUSED, by name and fail-closed ────────
+# ⛔ THE LAST GATE BEFORE `rm -rf`, AND IT WAS MISSING. The root loop tested only `-d` and `! -L`, so a
+# seam ONE COMPONENT SHORT — `/opt/gh-runner*/` instead of `/opt/gh-runner*/_work` — matched the runner
+# INSTALL tree itself and swept `bin/`, `config/`, `externals/`. MEASURED at that head:
+# `REAPED …/gh-runner-x//bin how=rm (no content written for >= 3600s)`; and the floor offers NO protection
+# there, because an install tree is ALWAYS older than any floor — the mtime gate that is this class's
+# whole proof of death is exactly what makes the install tree look dead. One character in a rendered
+# unit would have destroyed the CI hosts. ⛔ REFUSED, NOT SILENTLY SKIPPED: sweeping the roots it did
+# find and reporting a healthy population would hide a wrong layout assertion, which is the same
+# explicit-vs-default rule case (f) applies.
+case_o() { # <entry-point> <owner>
+    local pass="$1" owner="$2" base work dead install out rc sum s1
+    PASS_OWNER="$owner"
+    base="$T/o.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-20)"
+    fixture_entry dead "$work" job-abandoned 300 || return 1
+    # A runner INSTALL tree beside the `_work`: `bin/Runner.Listener` is what a job's lifecycle needs, and
+    # it is old by construction, so the floor would call it dead. ⛔ AGE THE WHOLE TREE (`fixture_age`),
+    # NOT ONLY THE FILES: a directory created a moment ago is `-newer` the floor by itself, so ageing just
+    # `Runner.Listener`/`settings.json` left `bin/`/`config/` looking ALIVE and the mutant below deleted
+    # nothing — the arm would then have "passed" for a reason unrelated to the guard it exists to test.
+    install="$base/gh-runner-x64-21"
+    mkdir -p "$install/bin" "$install/config"
+    printf 'listener\n' >"$install/bin/Runner.Listener"
+    printf 'settings\n' >"$install/config/settings.json"
+    fixture_age "$install" 600 || return 1
+    s1="$(uniqstate o1)"
+    # ONE COMPONENT SHORT: `gh-runner*/` matches the install dirs, not their `_work`.
+    out="$(run_pass "$pass" "$s1" "$base/gh-runner*/" --apply --only runner-work)"; rc=$?
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    # ⛔ NO BACKTICKS IN THESE MESSAGES — a double-quoted string runs them as COMMAND SUBSTITUTION, so
+    # \`_work\` became an empty string (and "_work: command not found" on stderr). The failure is silent in
+    # the assertion text and only the log shows it (the same reason `git commit -m` is banned here).
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "a root that is not a _work dir is a REFUSAL (rc=$rc, expected 3) — a wrong layout seam is loud, not a healthy population"
+    case_check "$(grep -qF 'reason=not-a-_work-root' <<<"$out" && echo 0 || echo 1)" \
+               "… and the root is REFUSED BY NAME, so an operator sees which seam is one component short"
+    case_check "$([ -f "$install/bin/Runner.Listener" ] && [ -f "$install/config/settings.json" ] && echo 0 || echo 1)" \
+               "… the runner INSTALL SURVIVED — bin/Runner.Listener and config/ are still there (the deletion this guard exists to stop)"
+    case_check "$(grep -qF 'REAPED' <<<"$out" && echo 1 || echo 0)" \
+               "… and nothing under it was REAPED, so no path was classified at all"
+    case_check "$(grep -qF 'refused=2 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… both install roots are COUNTED as refused, so 'why did this pass do nothing' has an answer (summary: ${sum:-<none>})"
+    case_check "$(grep -qF 'roots=0 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… and they are not counted as SWEPT roots"
+    # THE CONTROL, and it is what makes the refusal about the NAME and not about sweeping nothing: the
+    # SAME tree with the CORRECT seam reaps the dead checkout and leaves the install alone.
+    s2="$(uniqstate o2)"
+    out="$(run_pass "$pass" "$s2" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
+               "control: the SAME box with the correct seam exits 0 (rc=$rc) — the refusal is about the name, not about the fixture"
+    case_check "$([ ! -e "$dead" ] && echo 0 || echo 1)" \
+               "… the dead checkout was REAPED, so the guard does not make the class inert"
+    case_check "$([ -f "$install/bin/Runner.Listener" ] && echo 0 || echo 1)" \
+               "… and the install tree is untouched by the correct seam too"
+    return $((CASE_FAIL > 0))
+}
+
+# ── (p) a root matched by TWO globs is swept ONCE, not counted twice ───────────────────────────
+# ⛔ `--glob` IS REPEATABLE, so a wildcard and a literal naming the same root is a NORMAL operator
+# spelling — and there was no root dedupe (`rw_df_targets` dedupes filesystems; this loop deduped
+# nothing). MEASURED with one entry: `roots=2 candidates=2`, and the same WOULD-REMOVE path logged twice,
+# i.e. a population reported at TWICE its size and a WOULD-FREE figure doubled by an operator's spelling.
+case_p() { # <entry-point> <owner>
+    local pass="$1" owner="$2" base work dead out rc sum s1 n_row
+    PASS_OWNER="$owner"
+    base="$T/p.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-22)"
+    fixture_entry dead "$work" job-abandoned 300 || return 1
+    s1="$(uniqstate p1)"
+    # Both globs name the SAME root: a wildcard, then the literal under it.
+    out="$(run_pass "$pass" "$s1" "$base/gh-runner*/_work $work" --dry-run --only runner-work)"; rc=$?
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    case_check "$([ "$rc" = 5 ] && echo 0 || echo 1)" \
+               "the pass runs and reports the candidate it would remove (rc=$rc, expected 5 — a dry run that FOUND work)"
+    case_check "$(grep -qF 'roots=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "the same root named twice is ONE root (summary: ${sum:-<none>})"
+    case_check "$(grep -qF 'candidates=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… so the candidate is COUNTED once, not twice — a population is not a function of how many globs name it"
+    n_row="$(grep -cF "WOULD-REMOVE class=runner-work" <<<"$out")"
+    case_check "$([ "${n_row:-0}" = 1 ] && echo 0 || echo 1)" \
+               "… and the path is NAMED exactly once (rows=$n_row), so the would-free figure is not doubled"
+    case_check "$(grep -qF 'was already swept from an earlier glob' <<<"$out" && echo 0 || echo 1)" \
+               "… and the skip is NAMED, so a reader can tell a dedupe from a root that was never matched"
+    return $((CASE_FAIL > 0))
+}
+
+# ── (q) a SET-but-EMPTY `REAP_RW_EXPLICIT=` is a REFUSAL, not a measured empty population ────────
+# ⛔ `${REAP_RW_EXPLICIT-0}` is right to keep UNSET apart from SET — but a set-and-EMPTY value yields `""`,
+# which is neither `1` nor `0`, so every `[ "$EXPLICIT" = 1 ]` read FALSE. An explicitly-asserted layout
+# that matched nothing then reported a MEASURED EMPTY POPULATION (`census=ok`, rc 0) instead of
+# `census=no-roots` (rc 3) — the third spelling of the fail-open case (i) fixed, reopened through an
+# emptied seam. A template that renders `REAP_RW_EXPLICIT=` must not disarm the assertion it carries.
+case_q() { # <owner>
+    local owner="$1" base out rc
+    base="$T/q.$$.$RANDOM"; mkdir -p "$base"
+    out="$(REAP_RW_STATE_DIR="$T/q-st" REAP_RW_EXPLICIT= REAP_RW_GLOBS="$base/nope-*/_work" \
+           BOUNDED_LIB="$HERE/lib/bounded.sh" bash "$owner" --dry-run 2>&1)"; rc=$?
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "a SET-but-EMPTY REAP_RW_EXPLICIT is a REFUSAL (rc=$rc, expected 3) — never a measured empty population"
+    case_check "$(grep -qF 'REAP_RW_EXPLICIT must be 0 or 1' <<<"$out" && echo 0 || echo 1)" \
+               "… and the refusal NAMES the seam, so an operator does not read it as 'the box has no runners'"
+    case_check "$(grep -qE 'census=(ok|no-roots)' <<<"$out" && echo 1 || echo 0)" \
+               "… and NO census was published at all — a census for a layout whose assertion was disarmed would be the false measurement"
+    # ⛔ THE CONTROL: the SAME empty glob list through the SAME seam, with EXPLICIT UNSET, is the WEAKER
+    # documented state (defaults-equivalent, so an empty match is `no-roots` only when EXPLICIT=1 —
+    # unset means the defaults, which this fixture overrode) — the point of the control is that rc 3 here
+    # comes from the EMPTIED assertion and not from the unmatched glob alone.
+    out="$(REAP_RW_STATE_DIR="$T/q-st2" REAP_RW_EXPLICIT=1 REAP_RW_GLOBS="$base/nope-*/_work" \
+           BOUNDED_LIB="$HERE/lib/bounded.sh" bash "$owner" --dry-run 2>&1)"; rc=$?
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "control: the SAME unmatched glob with EXPLICIT=1 is `no-roots` (rc=$rc) — both spellings refuse"
+    case_check "$(grep -qF 'census=no-roots' <<<"$out" && echo 0 || echo 1)" \
+               "… through the documented no-roots route, which the emptied value was bypassing"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
@@ -884,6 +1042,30 @@ MUT_M='s/^if \[ "\${#_rw_floor_norm}" -gt 9 \]; then$/if false; then/'
 # cut-short sweep managed to print into a `candidates=` total — the partial-count-as-a-total the owner
 # refuses to emit itself. If this mutant ever survives, the entry point is free to manufacture one.
 MUT_N='s/ && \[ -n "\$_rw_line" \]; then$/; then/'
+# (o)'s arm: the basename CASE GUARD. Pinning the case label to `_work` makes every matched root look
+# like a `_work`, so the refusal arm can never fire and a one-component-short seam sweeps the install
+# tree — the measured deletion this guard exists to stop.
+MUT_O='s/^        case "\${_r##\*\/}" in$/        case "_work" in/'
+# (p)'s arm: the SEEN-ROOTS dedupe. A `case` that never matches is a dedupe that never fires, so the same
+# root is swept once per glob that names it and the population doubles.
+MUT_P='s/^        case " \$SEEN_ROOTS " in$/        case "" in/'
+# (q)'s arm: the EXPLICIT range guard. Pinning the scrutinee to `0` takes the `0|1)` arm for every value,
+# so the refusal is unreachable and a set-but-empty seam is silently read as "not explicit" again.
+MUT_Q='s/^case "\$EXPLICIT" in$/case "0" in/'
+# (a)'s THIRD and FOURTH arms, on the SHIPPED FLOOR: every other (a) assertion passes the floor in
+# explicitly, so the DEFAULT was covered by nothing and a revert to the aggressive 3600 s would have been
+# silent. Each layer has its own mutant because the entry point RELAYS `--min-age`, which means a mutant of
+# the OWNER's default alone is invisible through the entry point — the two layers must be mutated
+# separately or one of them is decorative.
+MUT_A3='s/^RUNNER_MIN_AGE="\${DISK_REAPER_RUNNER_MIN_AGE:-7200}"$/RUNNER_MIN_AGE="${DISK_REAPER_RUNNER_MIN_AGE:-3600}"/'
+MUT_A4='s/^RUNNER_WORK_MIN_AGE="\${REAP_RW_MIN_AGE:-7200}"$/RUNNER_WORK_MIN_AGE="${REAP_RW_MIN_AGE:-3600}"/'
+# (l)'s SECOND and THIRD arms, on the ABSTENTION VERDICT — the false PASS a review found: the owner
+# published `census=ok` with `candidates=0` for a population it could not read, and the entry point lifted
+# that into `candidates_runner_work=0 verdict_runner_work=ok`. Mutated separately because either half alone
+# would leave one surface lying: the owner's token (so the count is withdrawable) and the entry point's
+# verdict mapping (so `ok` is not published for an abstention).
+MUT_L2='s/^if \[ "\$CENSUS" = ok \] && \[ "\$UNMEASURABLE" -gt 0 \] && \[ "\$CAND" = 0 \]; then CENSUS=abstained; fi$/:/'
+MUT_L3='s/^    \[ "\$RW_ABSTAINED" = 1 \] && VERDICT_RW="abstained"$/    :/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -1002,6 +1184,16 @@ if apply_mutation "$OWNER" "$T/mut-k/reap-runner-work.sh" "$MUT_K"; then
 else
     bad "k mutation could not be applied (the table lookup moved) — the case is not checking it any more"
 fi
+if apply_mutation "$REAPER" "$T/mut-a3/disk-reaper.sh" "$MUT_A3"; then
+    expect_fail "a3 mutation: halving the ENTRY POINT's shipped floor back to 3600 s turns (a) RED" case_a "$T/mut-a3/disk-reaper.sh" "$OWNER"
+else
+    bad "a3 mutation could not be applied (the entry point's floor default moved) — the shipped floor is not checked any more"
+fi
+if apply_mutation "$OWNER" "$T/mut-a4/reap-runner-work.sh" "$MUT_A4"; then
+    expect_fail "a4 mutation: halving the OWNER's shipped floor back to 3600 s turns (a) RED" case_a "$REAPER" "$T/mut-a4/reap-runner-work.sh"
+else
+    bad "a4 mutation could not be applied (the owner's floor default moved) — the shipped floor is not checked any more"
+fi
 if apply_mutation "$REAPER" "$T/mut-u/disk-reaper.sh" "$MUT_U"; then
     expect_fail "u mutation: answering a misconfigured class with not-run turns (f) RED — the '?' polarity" case_f "$T/mut-u/disk-reaper.sh" "$OWNER"
 else
@@ -1013,6 +1205,16 @@ if apply_mutation "$OWNER" "$T/mut-l/reap-runner-work.sh" "$MUT_L"; then
     expect_fail "l mutation: deleting the root-is-a-measurement guard turns the case RED (it is an abstention, not a zero)" case_l "$REAPER" "$T/mut-l/reap-runner-work.sh"
 else
     bad "l mutation could not be applied (the unlistable-root arm moved) — the case is not checking it any more"
+fi
+if apply_mutation "$OWNER" "$T/mut-l2/reap-runner-work.sh" "$MUT_L2"; then
+    expect_fail "l2 mutation: publishing census=ok for a population nothing measured turns the case RED (the false PASS)" case_l "$REAPER" "$T/mut-l2/reap-runner-work.sh"
+else
+    bad "l2 mutation could not be applied (the abstained-census arm moved) — that token is not checked any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-l3/disk-reaper.sh" "$MUT_L3"; then
+    expect_fail "l3 mutation: mapping an abstention back onto verdict=ok turns the case RED" case_l "$T/mut-l3/disk-reaper.sh" "$OWNER"
+else
+    bad "l3 mutation could not be applied (the abstained-verdict override moved) — that verdict is not checked any more"
 fi
 
 expect_pass "m an OUT-OF-RANGE floor is refused (never a wrapped floor that deletes), and a leading-zero floor is normalised" case_m "$REAPER" "$OWNER"
@@ -1027,6 +1229,27 @@ if apply_mutation "$REAPER" "$T/mut-n/disk-reaper.sh" "$MUT_N"; then
     expect_fail "n mutation: reading a MISSING SUMMARY as an answered tally turns the case RED (the rows are partial)" case_n "$T/mut-n/disk-reaper.sh"
 else
     bad "n mutation could not be applied (the \$_rw_line guard moved) — the case is not checking it any more"
+fi
+
+expect_pass "o a root whose BASENAME is not _work is REFUSED by name, and the runner INSTALL survives" case_o "$REAPER" "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-o/reap-runner-work.sh" "$MUT_O"; then
+    expect_fail "o mutation: removing the basename guard turns the case RED (the install tree is deleted)" case_o "$REAPER" "$T/mut-o/reap-runner-work.sh"
+else
+    bad "o mutation could not be applied (the basename guard moved) — the last gate before rm -rf is not checked any more"
+fi
+
+expect_pass "p a root matched by TWO globs is swept once, not counted twice" case_p "$REAPER" "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-p/reap-runner-work.sh" "$MUT_P"; then
+    expect_fail "p mutation: removing the SEEN-ROOTS dedupe turns the case RED (roots and candidates double)" case_p "$REAPER" "$T/mut-p/reap-runner-work.sh"
+else
+    bad "p mutation could not be applied (the root dedupe moved) — double counting is not checked any more"
+fi
+
+expect_pass "q a SET-but-EMPTY REAP_RW_EXPLICIT is a REFUSAL, not a measured empty population" case_q "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-q/reap-runner-work.sh" "$MUT_Q"; then
+    expect_fail "q mutation: taking the 0|1 arm for every value turns the case RED (the emptied assertion is disarmed)" case_q "$T/mut-q/reap-runner-work.sh"
+else
+    bad "q mutation could not be applied (the EXPLICIT range guard moved) — the emptied seam is not checked any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from

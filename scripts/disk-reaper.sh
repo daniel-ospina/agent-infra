@@ -195,11 +195,14 @@ VENV_MIN_AGE="${DISK_REAPER_VENV_MIN_AGE:-1800}"
 RUNNER_GLOBS="${DISK_REAPER_RUNNER_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work}"
 RUNNER_GLOBS_EXPLICIT=0
 if [ -n "${DISK_REAPER_RUNNER_GLOBS+set}" ]; then RUNNER_GLOBS_EXPLICIT=1; fi
-# The floor: a `_work` entry whose NEWEST CONTENT is older than this is reapable. 3600 s is ~2x the
-# longest gap a writing job has been measured to leave, and the hand reap that validated the class on
-# the 98%-full cell used 120 min. It is a SEAM because a box running long quiet steps needs a higher
-# floor, and that is the intended response — never a process-check (see the owner's header).
-RUNNER_MIN_AGE="${DISK_REAPER_RUNNER_MIN_AGE:-3600}"
+# The floor: a `_work` entry whose NEWEST CONTENT is older than this is reapable. ⛔ THE SHIPPED VALUE IS
+# THE ONLY ONE ANYTHING VALIDATED (7200 s, the 120-minute hand reap that took c1 98 % → 90 % with no job
+# disturbed) and it was 3600 s at an earlier head — HALF the measured floor, in a class that is in the
+# default `DISK_REAPER_ONLY` below and is installed by a timer whose `ExecStart` carries `--apply`. A
+# default is what runs when nobody reads the header, so it may not be the aggressive side of a measured
+# trade. It is a SEAM because a box running long quiet steps needs a higher one, and raising it is the
+# intended response — never a process-check (see the owner's header).
+RUNNER_MIN_AGE="${DISK_REAPER_RUNNER_MIN_AGE:-7200}"
 CLASS_TIMEOUT="${DISK_REAPER_CLASS_TIMEOUT:-1800}"
 DU_TIMEOUT="${DISK_REAPER_DU_TIMEOUT:-120}"
 # One bound for the small non-delegate probes (git / ps). They are cheap; a hung mount is not.
@@ -273,6 +276,12 @@ WANT_RW=0
 # 1 = this pass MEASURED the candidate count (a lifted, fully-answered SUMMARY). 0 = it did not, and the
 # record must say `?` rather than the initialised 0 — the sentinel every other class already carries.
 HAVE_RW_CAND=0
+# 1 = the owner took a census it could NOT MEASURE (every entry it reached under a matched root was
+# unreadable, so it reported `census=abstained`). The count is then UNKNOWN — never the owner's 0 — and
+# the class verdict says `abstained` instead of `ok`. Deliberately NOT a failure: an abstention exits 0
+# on the owner side, and rc stays 0 here, because the alarm channel is the RECORD (`verdict_runner_work`
+# + `candidates_runner_work=?`) and not the unit's colour — see the `ok=` contract at `record_body`.
+RW_ABSTAINED=0
 # The owner's `unmeasurable=` tally: entries it KEPT because the bounded walk could not ANSWER (a
 # permission error, a vanished mount, a watchdog 124, or a TOCTOU re-probe that could not answer).
 # ⛔ THIS IS THE CLASS'S ONLY "COULD NOT DECIDE" OUTCOME AND IT NEEDED ITS OWN CHANNEL. The entry point
@@ -2402,6 +2411,19 @@ reap_runner_work() {
     # `candidates=`. Anything else is `?` (a refusal, a killed sweep, a truncated SUMMARY) — never the
     # initialised 0. The owner prints the SUMMARY in BOTH modes, so an ARMED pass answers a real count
     # instead of the structural 0 the worktree arm had to fix (#4529).
+    # ⛔ A CENSUS THE OWNER COULD NOT TAKE IS `abstained`, AND IT MUST NOT LAND AS A MEASURED ZERO. The
+    # owner's `unmeasurable=` says how many entries/roots it could not read; when that is the WHOLE
+    # population it publishes `census=abstained` instead of `census=ok`, and NOTHING here may turn that
+    # into `candidates_runner_work=0 verdict_runner_work=ok` — the false PASS a review measured at this
+    # head (a mode-0111 `_work`: {ok=1, candidates=0, unmeasurable=1, verdict=ok}, dead entry survived).
+    # The count stays UNKNOWN (`HAVE_RW_CAND=0` ⇒ `candidates_runner_work=?`) and the verdict is the
+    # distinct token, so no reader keying on `ok` inherits a lie. rc stays 0: the owner abstained, it did
+    # not fail, and turning a permission mismatch into an hourly red trains operators to ignore the unit.
+    if [ "$_rw_census" = "abstained" ]; then
+        log_line "disk-reaper: ⚠️  class=runner-work ABSTAINED — nothing under a matched _work root could be READ, so the owner's candidates=0 is an ABSTENTION, not a measurement (the entries were KEPT)"
+        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: a matched _work root could not be listed, so no entry was classified and the candidate count is UNKNOWN, not 0"
+        RW_ABSTAINED=1
+    fi
     if [ "$_rw_census" = "ok" ]; then
         case "${_rw_cand:-}" in
             ''|*[!0-9]*) : ;;
@@ -2425,6 +2447,9 @@ reap_runner_work() {
         case "; ${NOTE_RW:-};" in *"; $_rw_why;"*) : ;; *) NOTE_RW="${NOTE_RW}${NOTE_RW:+; }$_rw_why" ;; esac
     fi
     VERDICT_RW="$(class_verdict "$RC_RW")"
+    # ⛔ THE ABSTENTION IS A VERDICT, NOT A FOOTNOTE. `class_verdict 0` is `ok`, which is the one word
+    # this state must never publish; set AFTER the mapping so the two cannot drift apart.
+    [ "$RW_ABSTAINED" = 1 ] && VERDICT_RW="abstained"
     DF_RW_OK="$MEASURED"; RAW_RW="$raw"
     if is_dry; then FREED_RW=0; else FREED_RW="$freed"; fi
     # The owner's `candidates=` is the count; the `REAP` rows carry the BYTES, so they are scanned for the
