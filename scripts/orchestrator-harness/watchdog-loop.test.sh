@@ -488,6 +488,11 @@ mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator
 removed_pass "$C/pass.out"
 assert_contains "$(cat "$C/pass.out")" "RESTART-UNAVAILABLE" "a REMOVED job with no plist on disk reports RESTART-UNAVAILABLE"
 assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and issues no bootstrap with nothing to load"
+# ⛔ NOTHING WAS EXECUTED, SO NOTHING FAILED: the report must not carry a SECOND, false verdict on top of
+# the one the arm already stated (review P2, #1986). It used to, with `verb=unknown`, which is a claim that
+# a verb ran and failed. This assertion is what reddens when that regresses.
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…and the empty-plist arm is NOT restated as a FAILED verb (nothing was executed)"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "verb=unknown" "…so the log never claims an unnamed verb ran"
 # (d) AN UNREADABLE READ IS NOT "ABSENT". ⚠ THE FIXTURE USED TO BE rc 1 `Bad request.`, WHICH IS NOT A
 #     SHAPE launchd PRODUCES: `Bad request.` is the first line of a NOT-FOUND read (rc 113 — case (a)),
 #     and the measured UNREADABLE read is `rc 64` + `Unrecognized target specifier.` for a malformed
@@ -525,9 +530,13 @@ fi
 
 # (f) A REMOVED JOB OVER A **LIVING** CONTROLLER IS NEVER BOOTSTRAPPED (review P1, #1986). `WEDGED` is a
 #     state of a LIVE controller — `pid_is_controller` proved the pid alive — so a `bootstrap` here puts a
-#     SECOND controller beside it (`orch-loop.sh:1546-1551` only makes the newcomer defer while the first
-#     is alive, so the repair leaves two processes on one PR queue), and over a job an operator
-#     deliberately stopped it reverses that stop. The trigger must be "the controller is GONE".
+#     SECOND controller beside it, and over a job an operator deliberately stopped it reverses that stop.
+#     ⛔ THE MECHANISM, cited correctly (review P2, #1986 — an earlier version of this line cited
+#     `orch-loop.sh:1546-1551`, which is the `--check-refresh` case arm, and claimed the newcomer
+#     "defers": nothing in the lock defers). The lock is `LOCKF="$O/.orch.lock"` (`orch-loop.sh:1570`)
+#     and its acquisition EXITS at once beside a live holder (`:1573-1574`, `already running (pid …)`),
+#     so a bootstrapped newcomer is KeepAlive thrash — while where that lock is ABSENT OR STALE it TAKES
+#     OVER, which is the duplicate controller (#1715) in the other direction. The trigger must be "GONE".
 echo "── 8b(f). a REMOVED job over a LIVE (wedged) controller is REFUSED, not bootstrapped"
 newcase; start_ctrl; hb_stale; : > "$C/stack.plist"
 mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
@@ -577,6 +586,21 @@ assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "enable " "the arm did
 assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and did NOT bootstrap a label that may still be disabled"
 assert_contains "$(grep -m1 RESTART-FAILED "$C/state/l" 2>/dev/null)" "verb=launchctl enable" "…a failed enable is RESTART-FAILED, and the line NAMES the verb"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "STILL_NOT_CYCLING" "…instead of STILL_NOT_CYCLING, which claims a restart was attempted"
+
+# (i) A VERB THAT FAILS WITH 75 IS A FAILED VERB, NOT A REFUSAL (review P1, #1986). The refusal used to be
+#     signalled by a RESERVED RETURN CODE, `RC_REFUSED=75` — an in-band sentinel in the value space the
+#     verbs answer in. This file already documents launchctl answering `rc 64` (EX_USAGE), i.e. sysexits.h,
+#     and 75 is EX_TEMPFAIL: an `enable` that failed with it was read as "a refusal" and the pass logged NO
+#     verdict at all (no RESTART-FAILED, no refusal line, rc 0). The distinction is now out of band, so the
+#     same fixture must end in RESTART-FAILED rc=75 with NOTHING claiming it was a refusal. ⛔ THIS IS THE
+#     CASE THAT REDDENS IF THE SENTINEL COMES BACK.
+echo "── 8b(i). a verb failing with rc 75 is RESTART-FAILED, never mistaken for a refusal"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501' 75
+removed_pass "$C/pass.out"
+assert_contains "$(grep -m1 RESTART-FAILED "$C/state/l" 2>/dev/null)" "rc=75" "a verb exiting 75 is reported as RESTART-FAILED with rc=75 (not swallowed as a refusal)"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and is never reported as a deliberate refusal"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-UNAVAILABLE" "…nor as a missing plist (the plist is present)"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"

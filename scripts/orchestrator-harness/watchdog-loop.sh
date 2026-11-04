@@ -59,14 +59,23 @@
 #   loaded  → `launchctl kickstart -k <domain>/<label>`, in the domain the read FOUND it (cures a wedge)
 #   REMOVED → `launchctl enable` + `launchctl bootstrap <domain> <plist>` (agent-infra#1986: KeepAlive
 #             cannot reach a job that is no longer in the domain, and `kickstart` fails for ever on it,
-#             so a controller launchd REMOVED is put back from the plist `install.sh` rendered)
+#             so a controller launchd REMOVED is put back from the plist provisioned for its label —
+#             NOT necessarily one `install.sh` rendered: see `PLIST_PATH` below)
 #             ⛔ AND ONLY ON EVIDENCE THE CONTROLLER IS **GONE**, NEVER MERELY WEDGED (review P1,
 #             #1986). `WEDGED` is a state of a LIVE controller — `pid_is_controller` proved it alive —
-#             so a `bootstrap` there starts a SECOND controller beside the first (the #1715 shape:
-#             `orch-loop.sh:1546-1551` defers the newcomer only until the first exits, so the repair
-#             silently leaves two processes on one PR queue), and on a box whose operator deliberately
-#             stopped the job it resurrects what they stopped. The REMOVED arm therefore RE-PROBES the
-#             controller at the moment of the mutation and REFUSES if anything is alive.
+#             so a `bootstrap` there starts a SECOND controller beside the first, and on a box whose
+#             operator deliberately stopped the job it resurrects what they stopped. The mechanism, in
+#             `orch-loop.sh`'s own words: the lock is `LOCKF="$O/.orch.lock"` (`:1570`) and its
+#             acquisition is `if ! acq; then … if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID"; then echo
+#             "[orch-loop] already running (pid $OPID)"; exit 0` (`:1573-1574`) — so a newcomer beside a
+#             LIVE lock-holder EXITS AT ONCE rather than queueing behind it (and `KeepAlive` then
+#             relaunches it into the same exit, i.e. thrash), while where that controller's lock is
+#             ABSENT OR STALE the newcomer TAKES IT OVER. Both ends are the duplicate-controller class
+#             (#1715). ⛔ AN EARLIER VERSION OF THIS COMMENT CITED `orch-loop.sh:1546-1551` AND CLAIMED
+#             THE NEWCOMER "DEFERS … UNTIL THE FIRST EXITS": that range is the `--check-refresh` case
+#             arm, and nothing in the lock defers. The refusal is unchanged — the RATIONALE is now the
+#             one the code supports. The REMOVED arm therefore RE-PROBES the controller at the moment of
+#             the mutation and REFUSES if anything is alive.
 #   unreadable → `kickstart` (never a bootstrap: that action cannot double-load an existing job)
 # Linux cell: there is no launchd and no KeepAlive — a cell's controller is launched by
 # `cloud-cell-supervisor.sh start`, which is exactly the verb its own doctor role uses, so that is the
@@ -131,15 +140,29 @@ MAX_CONSEC="${MAX_CONSEC:-3}"; num_ok "$MAX_CONSEC" || MAX_CONSEC=3
 [ "$MAX_CONSEC" -ge 1 ] || { _bad="$_bad MAX_CONSEC=$MAX_CONSEC(<1)"; MAX_CONSEC=3; }
 
 STATE_DIR="${WATCHDOG_STATE_DIR:-$HOME/.pi/agent/state}"
-# The plist a REMOVED job is re-loaded from. `install.sh` renders it to this exact path (`$HOME`,
-# resolved from the passwd database, is the only place launchd reads from), so the watchdog never
-# invents a second install location: an absent plist is REPORTED (RESTART-UNAVAILABLE), not guessed at.
+# The plist a REMOVED job is re-loaded from. ⛔ IT IS NOT ASSUMED TO BE A FILE `install.sh` RENDERS
+# (review P2, #1986): `install.sh` renders exactly ONE label — `com.eldato.orchestrator-loop`
+# (`install.sh:147` → `:156` `$HOME/Library/LaunchAgents/$LABEL.plist`) — while this file's DEFAULT label
+# is `com.eldato.orchestrator-stack`, the box's own supervision job (`orchestrator-bringup.sh:1065-1069`:
+# "here the loaded job is `com.eldato.orchestrator-stack` → `/bin/bash $O/supervisor.sh`, while
+# `install.sh` renders `com.eldato.orchestrator-loop`"). So the path is the standard LaunchAgents
+# location for THIS label, provisioned by whatever provisioned the job — and an absent plist is
+# REPORTED (RESTART-UNAVAILABLE) rather than guessed at or rendered in passing.
 PLIST_PATH="${WATCHDOG_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
-# ⛔ A DELIBERATE REFUSAL IS NOT A FAILED VERB. Both are non-zero (a refusal must never be read as a
-# recovery), but only this one means *nothing was executed* — so `main` reports RESTART-REFUSED for it
-# instead of RESTART-FAILED, and never lets it fall through to the post-settle `STILL_NOT_CYCLING` arm as
-# though an attempt had been made and simply did not work.
-RC_REFUSED=75
+# ⛔ A DELIBERATE REFUSAL IS NOT A FAILED VERB — AND IT IS NOT AN EXIT CODE EITHER (review P1, #1986).
+# Both are non-zero (a refusal must never be read as a recovery), but only a refusal means *nothing was
+# executed*, so `main` must not turn it into RESTART-FAILED and must not fall through to the post-settle
+# `STILL_NOT_CYCLING` arm as though an attempt had been made and simply did not work.
+#
+# The distinction is carried OUT OF BAND, in this flag — NOT as a reserved return code. It used to be
+# `RC_REFUSED=75`, and an in-band sentinel shares its value space with the verbs' own exit statuses: this
+# file already documents launchctl answering `rc 64` (EX_USAGE), i.e. it answers in sysexits.h, so an
+# `enable`/`kickstart`/`bootstrap` that failed with 75 (EX_TEMPFAIL) was reported as a REFUSAL and the
+# pass produced NO verdict at all (measured: only `verdict=WEDGED … restart=1`, no RESTART-FAILED, no
+# refusal line, rc 0). Any value a verb can return is unsafe as a sentinel. `RESTART_VERB` below is the
+# same pattern done right, and `RESTART-REFUSED` coverage has its own case (§8b(i)) so a verb's 75 is
+# still RESTART-FAILED.
+RESTART_REFUSED=0
 LOG="${WATCHDOG_LOG:-$STATE_DIR/controller-watchdog.log}"
 STREAK_FILE="$STATE_DIR/controller-watchdog.streak"
 CRASH_FILE="$STATE_DIR/controller-watchdog.crash"
@@ -368,6 +391,8 @@ launchd_job_state() {
 RESTART_VERB=""
 restart_stack() {
   local rc=0
+  # this invocation's own answer: a caller must never inherit a previous pass's refusal (or its absence)
+  RESTART_REFUSED=0
   if [ -n "${WATCHDOG_RESTART_CMD:-}" ]; then
     # TESTS ONLY: an exact stand-in for the platform verb, so every case is driven hermetically.
     RESTART_VERB="$WATCHDOG_RESTART_CMD"
@@ -400,7 +425,7 @@ restart_stack() {
           local lc; lc="$(command -v launchctl 2>/dev/null)"
           if [ "$lc" != "$WATCHDOG_LAUNCHCTL_PIN" ]; then
             log_line "verdict=RESTART-REFUSED"$'\t'"note=WATCHDOG_LAUNCHCTL_PIN=${WATCHDOG_LAUNCHCTL_PIN} but launchctl resolves to ${lc:-nothing} — NO launchctl verb was issued (not even the state read); whatever would have answered is not the binary this caller pinned"
-            return "$RC_REFUSED"
+            RESTART_REFUSED=1; return 1
           fi
         fi
         # ONE restart, but WHICH verb depends on a MEASURED state — see launchd_job_state above. A
@@ -420,11 +445,16 @@ restart_stack() {
             # call site — so this arm asks.
             local live; live="$(controller_pid)"
             if [ -n "$live" ]; then
-              log_line "verdict=RESTART-REFUSED"$'\t'"pid=$live"$'\t'"note=$LABEL is NOT in any launchd domain, but a controller (pid $live) is ALIVE — NOT bootstrapping: a bootstrap beside a live controller is a SECOND controller on one PR queue, and over a job an operator deliberately stopped it is that stop, reversed. Nothing was issued; if the box needs this controller replaced, stop it first (the handoff ritual) and the next REMOVED pass will restore it"
-              return "$RC_REFUSED"
+              log_line "verdict=RESTART-REFUSED"$'\t'"pid=$live"$'\t'"note=$LABEL is NOT in any launchd domain, but a controller (pid $live) is ALIVE — NOT bootstrapping: over a job an operator deliberately stopped this reverses that stop, a bootstrapped job that then loses the lock race exits at once so KeepAlive thrashes it, and where that controller's lock is absent or stale the newcomer WOULD take over — a SECOND controller on one PR queue. Nothing was issued; if the box needs this controller replaced, stop it first (the handoff ritual) and the next REMOVED pass will restore it"
+              RESTART_REFUSED=1; return 1
             elif [ ! -f "$PLIST_PATH" ]; then
-              rc=127
-              log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=$LABEL is NOT loaded and no $PLIST_PATH exists — there is nothing to bootstrap; run scripts/orchestrator-harness/install.sh"
+              # ⛔ ALSO A REFUSAL, FOR THE SAME REASON (review P2, #1986): NOTHING WAS EXECUTED. Without
+              # the flag `main` emitted a second, FALSE verdict over this one — `RESTART-FAILED rc=127
+              # verb=unknown note=the platform restart verb failed` — while the only launchctl calls in
+              # the pass were the two `print` reads. The arm below states the verdict and its reason;
+              # `main` must not restate it as a failed verb. §8b(c) asserts RESTART-FAILED is ABSENT.
+              RESTART_REFUSED=1; rc=127
+              log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=$LABEL is NOT loaded and no $PLIST_PATH exists — there is nothing to bootstrap, so nothing was issued; provision the plist for $LABEL at that path"$'\t'"detail=install.sh renders only com.eldato.orchestrator-loop, so it repairs the loop label and NOT this one (§6 of this file's header)"
             else
               # ⛔ AN `enable` THAT FAILS STOPS THE ARM — it is not swallowed. It used to be
               # `enable … || true`, so a REFUSED verb fell through to a `bootstrap` of a label that may
@@ -665,7 +695,9 @@ main() {
   # ⛔ A REFUSAL IS ITS OWN VERDICT, already stated WITH ITS REASON by the arm that refused. It must not
   # become RESTART-FAILED (nothing was executed, so nothing failed) and must not reach the settle re-read
   # (there is nothing to settle into), which is how a refusal used to surface as STILL_NOT_CYCLING.
-  if [ "$rc" -eq "$RC_REFUSED" ]; then
+  # The flag, not `rc`: see its declaration — a reserved exit code collides with a verb that fails with
+  # that same value, and a failed `kickstart` must stay a FAILED kickstart.
+  if [ "${RESTART_REFUSED:-0}" -eq 1 ]; then
     return 0
   fi
   if [ "$rc" -ne 0 ]; then
