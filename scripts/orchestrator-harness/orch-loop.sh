@@ -2663,7 +2663,7 @@ spawns_since() { # spawns_since <since-epoch>  ->  "<n>\t<tag,tag,...>" (empty n
 # records a past state and is never revalidated" failure this file keeps removing, so a land newer
 # than the marker deletes it here — the writer does not have to remember to.
 drain_stall_token() {
-  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl
+  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl ltxt
   [ -f "$f" ] || return 0
   at="$(sed -n 's/^at=//p' "$f" 2>/dev/null | head -1)"
   if is_num "${at:-}"; then
@@ -2675,8 +2675,16 @@ drain_stall_token() {
   unowned="$(sed -n 's/^unowned=//p' "$f" 2>/dev/null | head -1)"
   lage="$(sed -n 's/^age=//p' "$f" 2>/dev/null | head -1)"
   lbl="$(drain_stall_label "$f")"
-  printf ' drain=%s(passes=%s,unowned=%s,no_land=%sm,spawns=%s)' \
-    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${lage:--}" "${spawns:-?}"
+  # ⛔ `no_land=` CARRIES THE READING THE MARKER HOLDS (agent-infra#2929): a measured age renders as
+  # `<n>m`, while the no-marker readings render as what they ARE — `never` (no land marker at all) or
+  # `>360` (nothing inside the bound) — instead of appending `m` to a non-number (`no_land=neverm`).
+  # A garbled or absent field still reads `-`: a value the token did not receive is never rendered as one.
+  case "${lage:-}" in
+    ''|*[!0-9]*) ltxt="${lage:--}" ;;
+    *)           ltxt="${lage}m" ;;
+  esac
+  printf ' drain=%s(passes=%s,unowned=%s,no_land=%s,spawns=%s)' \
+    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "$ltxt" "${spawns:-?}"
 }
 # ── THE ESCALATION'S LABEL, DERIVED FROM ITS OWN MEASUREMENT (review c-1, 2026-10-23) ─────────────
 # ⛔ THE MARKER IS WRITTEN BY BOTH STALL ARMS, SO ITS *EXISTENCE* CANNOT MEAN "DEADLOCK". A STALLED
@@ -5654,12 +5662,31 @@ PY
     # issues would have made it invisible.
     # ⛔ The datum already exists and needs no new state: `mp_recent_land` reads the
     # `state/merged-<PR>.done` markers the merge sweep writes on every land. Its shortlist is bounded
-    # (2x the merge-priority window), so an EMPTY answer means "no land inside that bound" — which is
-    # the stalled condition, not an absence of evidence, PROVIDED a marker exists at all. A box that
-    # has never landed anything prints nothing: an unread baseline must not be reported as a stall
-    # (agent-infra#1931).
-    _land_any=0
-    for _f in "$O"/state/merged-*.done; do [ -e "$_f" ] && { _land_any=1; break; }; done
+    # (2x the merge-priority window), so an EMPTY answer reads "no land inside that bound".
+    # ⛔ BUT AN EMPTY ANSWER IS NOT ONE READING, AND TREATING IT AS ONE DISABLED THIS ESCALATION
+    # (agent-infra#2929, measured 2026-10-27): the block SKIPPED unless a marker existed at all, so a
+    # box holding 178 markers with none inside the bound printed a bare line with no artifact and no
+    # escape evaluation, and a box with NO marker at all — a fresh cell, or one after state loss —
+    # printed NOTHING, while the exact condition the escalation exists for held. A dead-man's switch
+    # that can only report the PRESENCE of success events cannot report their absence.
+    # ⛔ SO THE READ IS TRI-STATE, because the readings MEAN different things (primary sources:
+    # Grafana's No Data vs Error alert states — "No Data occurs when the alert rule query runs
+    # successfully but returns no data points", Error when the query cannot evaluate; and Prometheus
+    # `absent()`, which exists precisely to alert on the absence of a series):
+    #   age   — a land exists inside the bound and is older than the stall window     => STALLED
+    #   none  — state/ is READABLE, markers exist, none inside the bound (age > bound) => STALLED
+    #   never — state/ is READABLE and holds no land marker at all                    => STALLED
+    #   else  — state/ is UNREADABLE, the stamp is in the FUTURE, or the bound is shorter than the
+    #           window                                                              => UNMEASURED
+    # ⛔ A MEASURED ABSENCE IS NOT AN UNREAD BASELINE — agent-infra#1931 is PRESERVED, not reversed.
+    # Its rule is that a datum the box could not READ must never be reported as a stall, and that now
+    # holds exactly: an unreadable `state/` reads UNMEASURED. An EMPTY but READABLE directory is a
+    # measurement — zero lands. The gate's own question is "has anything landed in the window?", and
+    # "no" answers it whether the box never landed or never landed recently.
+    # ⛔ AND NO SYNTHESISED LAND STAMP (#2929 proposed one): stamping `now-(_stallmin+1)*60` made the
+    # age arm evaluate, but the line then printed "no PR merged in 181m" for a box whose land age was
+    # NEVER MEASURED — the invented-reading class the FUTURE-stamp guard below refuses in the opposite
+    # direction. The state is named honestly instead, and `_agestr` says which reading it is.
     # ⛔ NORMALISE THE TUNABLE (review P3): `[ "200m" -ge … ]` ERRORS (rc 2), an errored test is
     # FALSE, and the else arm would print "drain alive" — a false all-clear on the very condition this
     # line exists to name, every cycle. Every other knob in this file is normalised first (`is_num`,
@@ -5672,7 +5699,11 @@ PY
     _stallraw="${MERGE_STALL_MIN:-180}"
     _stallmin=180
     case "$_stallraw" in ''|*[!0-9]*) : ;; *) _stallmin=$(( 10#$_stallraw )) ;; esac
+    # The bound `mp_recent_land` itself searches, named once so a "no marker inside the bound" reading
+    # quotes a measurement instead of inventing an age.
+    _landbound=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))
     _lm="$(mp_recent_land 2>/dev/null || true)"
+    _lage=""; _landk=""
     if is_num "${_lm:-}"; then
       _lage=$(( ( $(date +%s) - (10#${_lm}) ) / 60 ))
       # ⛔ A FUTURE STAMP IS NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N` passes a file
@@ -5684,7 +5715,41 @@ PY
       # case instead: it is neither a stall nor an all-clear, and it says which it is.
       if [ "$_lage" -lt 0 ]; then
         echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
+        _lage=""   # an invented age must not reach the artifact or a phrase
       elif [ "$_lage" -ge "$_stallmin" ]; then
+        _landk=age
+      else
+        echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
+        # A land clears the escalation: a marker that outlives its condition is a stale flag.
+        rm -f "$O/state/drain-stall" 2>/dev/null || true
+        # ⛔ A LAND ALSO CLEARS THE INERT STREAK (review P2). Without this the counter described "stalled
+        # passes since the last escape" rather than "CONSECUTIVE stalled passes": a box that stalled
+        # N-1 times, landed for hours, then stalled once opened the issue path on its FIRST stall while
+        # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
+        [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
+      fi
+    elif [ ! -d "$O/state" ] || [ ! -r "$O/state" ]; then
+      # ⛔ THE #1931 CLASS, PRESERVED: an UNREADABLE state/ is not a measurement. Tested BEFORE the
+      # marker scan, because an unexpanded glob is indistinguishable from an empty directory.
+      echo "[dispatch] DRAIN STALL UNMEASURED — state/ could not be READ (missing, or not a readable directory), so this box cannot say whether anything landed. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
+    elif [ "$_landbound" -lt "$_stallmin" ]; then
+      # The shortlist is SHORTER than the window, so "nothing inside the bound" cannot decide the gate:
+      # the newest land may be inside the window and invisible to the bounded walk.
+      echo "[dispatch] DRAIN STALL UNMEASURED — mp_recent_land's ${_landbound}m bound is SHORTER than the ${_stallmin}m stall window, so no land inside the bound cannot decide the gate. ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
+    else
+      # READABLE state/, nothing inside the bound => STALLED (agent-infra#2929). `_land_any` separates
+      # "landed once, long ago" (a measured LOWER BOUND on the age) from "no land has ever been
+      # recorded here" — two different faults that used to render as one silence.
+      _land_any=0
+      for _f in "$O"/state/merged-*.done; do [ -e "$_f" ] && { _land_any=1; break; }; done
+      if [ "${_land_any}" = "1" ]; then _landk=none; else _landk=never; fi
+    fi
+    # ── ONLY A MEASURED STALL ENTERS THE ESCALATION ─────────────────────────────────────────────
+    # `age`/`none`/`never` are the three measured stalls. The alive arm and both UNMEASURED arms have
+    # already written their own line above and arrive here with `_landk` empty, so they match no arm.
+    # A `case` rather than an `if` keeps the escalation body's indentation, and with it a readable diff.
+    case "${_landk:-}" in
+      age|none|never)
         # ── THE STALL IS ALSO AN ESCALATION (agent-infra#2590) ───────────────────────────────
         # The stall line alone escalated to nobody: it was printed 8 times on a live box that sat at
         # `lanes=0`, 9 un-owned, nothing landing for 3.4h, and its operator read the log as normal.
@@ -5700,13 +5765,22 @@ PY
         _spk="${PRDISP_SPAWNS:-}"; is_num "${_spk:-}" || _spk=""
         _spn_txt="spawned UNMEASURED (the worker record could not be read)"
         is_num "${_spk:-}" && _spn_txt="spawned ${_spk} worker(s) this pass"
+        # ⛔ THE AGE PHRASE IS THE STATE'S OWN MEASUREMENT (agent-infra#2929). `age` prints the measured
+        # minutes; `none` prints the BOUND it was searched to, never a number it did not measure; `never`
+        # prints that no land has been recorded at all. `_agetok` is the same reading for the durable
+        # artifact, which `drain_stall_token` renders as `no_land=`.
+        case "$_landk" in
+          age)   _agestr="no PR merged in ${_lage}m"; _agetok="$_lage" ;;
+          none)  _agestr="no PR merged within the last ${_landbound}m (no land marker inside that bound)"; _agetok=">${_landbound}" ;;
+          never) _agestr="no land marker at all — state/ holds no merged-*.done, so this box has recorded no merge (a fresh box and a box whose state/ was lost read the same)"; _agetok="never" ;;
+        esac
         _dpass=0
         [ -f "$O/state/drain-stall" ] && { _p="$(sed -n 's/^passes=//p' "$O/state/drain-stall" 2>/dev/null | head -1)"; is_num "${_p:-}" && _dpass="$_p"; }
         _dpass=$(( _dpass + 1 ))
         # ⛔ THE RECORD IS WRITE-CHECKED, like every other record this loop trusts: an escalation the
         # box cannot persist is an escalation that dies with the pass it was printed in.
         if printf 'at=%s\npasses=%s\nage=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
-             "$(date +%s)" "$_dpass" "$_lage" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
+             "$(date +%s)" "$_dpass" "$_agetok" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
              > "$O/state/drain-stall" 2>/dev/null; then
           # ⛔ THE LABEL IS DERIVED, NOT HARD-CODED (review 3-P2). A STALLED pass records `spawns=4`
           # and `drain_stall_label` then prints STALLED, so promising "drain=DEADLOCK" here told the
@@ -5762,7 +5836,7 @@ PY
         fi
         _whysrc="$_whysrc)"
         if [ "${_spk:-}" = "0" ]; then
-          echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
+          echo "[dispatch] DRAIN DEADLOCK — ${_agestr}, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
         else
           # ⛔ AN UNMEASURED COUNT MUST NOT CARRY A POSITIVE DIAGNOSIS (review 2-P2). "the workers run
           # and nothing lands" is a claim ABOUT SPAWNS, and the UNMEASURED arm did not measure them —
@@ -5772,21 +5846,10 @@ PY
           else
             _spn_tail="this pass cannot say whether any worker was started — the LAND problem is measured, the spawn reading is not"
           fi
-          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — ${_spn_tail}. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}.${_refsuf:-}" >> "$LOG"
+          echo "[dispatch] DRAIN STALLED — ${_agestr} while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — ${_spn_tail}. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}.${_refsuf:-}" >> "$LOG"
         fi
-      else
-        echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
-        # A land clears the escalation: a marker that outlives its condition is a stale flag.
-        rm -f "$O/state/drain-stall" 2>/dev/null || true
-        # ⛔ A LAND ALSO CLEARS THE INERT STREAK (review P2). Without this the counter described "stalled
-        # passes since the last escape" rather than "CONSECUTIVE stalled passes": a box that stalled
-        # N-1 times, landed for hours, then stalled once opened the issue path on its FIRST stall while
-        # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
-        [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
-      fi
-    elif [ "${_land_any:-0}" = "1" ]; then
-      echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
-    fi
+        ;;
+    esac
     # [drain-health:end]
   else
     # [drain-clear:begin] (extracted and DRIVEN by test-gates.sh — keep the marker)

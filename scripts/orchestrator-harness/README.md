@@ -4003,7 +4003,23 @@ been rate-limited while the REST sweep succeeded: exactly the fallback this desi
   box that sat at `lanes=0`, 9 un-owned and nothing landing for 3.4h, and read as normal. When a stall
   coincides with **zero spawns** it is now `DRAIN DEADLOCK`, it writes `state/drain-stall`
   (`at= passes= age= unowned= spawns= acts=`) so it OUTLIVES the pass, and the cycle status line carries
-  `drain=DEADLOCK(passes=…,unowned=…,no_land=…m,spawns=…)` — the one line every reader already parses.
+  `drain=DEADLOCK(passes=…,unowned=…,no_land=…,spawns=…)` — the one line every reader already parses.
+  `no_land=` carries the reading the marker holds: `<n>m` for a measured age, `never` when `state/`
+  holds no land marker at all, `>360` when nothing landed inside `mp_recent_land`'s bound — never a
+  number the marker did not measure.
+  ⛔ **AND AN EMPTY LAND READING IS NOT ONE READING (agent-infra#2929).** The escalation used to need
+  a marker to exist, so a box holding 178 `merged-*.done` with none inside the bound printed a bare
+  line (no artifact, no escape evaluation) and a box with NO marker at all — a fresh cell, or one after
+  state loss — printed NOTHING, while the exact condition it exists for held: a dead-man's switch that
+  can only report the PRESENCE of success events cannot report their absence. The gate now reads
+  tri-state, and the three readings are kept apart because they mean different things (Grafana's
+  *No Data* vs *Error* alert states; Prometheus `absent()`): `age` (a land inside the bound, older
+  than `MERGE_STALL_MIN`) → STALLED; `none` (readable `state/`, markers exist, none inside the bound)
+  → STALLED with the bound as its age; `never` (readable `state/`, no marker at all) → STALLED with
+  `age=never`; and an UNREADABLE `state/`, a FUTURE stamp, or a `mp_recent_land` bound shorter than the
+  stall window → `DRAIN STALL UNMEASURED`, which is neither a stall nor an all-clear. That preserves
+  agent-infra#1931 exactly where it applies — an unread baseline is not a stall — because an EMPTY but
+  READABLE directory is a measurement, not an unread one.
   The token self-heals: a land newer than the marker deletes it, so it cannot become the stale flag it
   replaces. ⛔ It still opens NOTHING: the escalation exists to make the policy's promise *verifiable*,
   never to add the release valve the ruling forbids.

@@ -1469,6 +1469,9 @@ FAKE
       PRDISP_TOP=""
       if [ "${3+x}" = x ]; then PRDISP_SPAWNS="$3"; fi
       if [ "${4+x}" = x ]; then PRDISP_TOP="$4"; fi
+      # (5) is MERGE_PRIORITY_MAX_AGE_MIN — the bound `mp_recent_land` searches is 2x it, so a test
+      # can make the shortlist SHORTER than the stall window and prove the block refuses to decide.
+      if [ "${5+x}" = x ]; then MERGE_PRIORITY_MAX_AGE_MIN="$5"; fi
       . "$TMP/drain_helpers.sh"
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
@@ -1616,6 +1619,25 @@ PYEOF
       *"drain=UNMEASURED("*) echo "  ok an unmeasurable marker reads UNMEASURED — a deadlock claim needs a measurement"; PASS=$((PASS+1)) ;;
       *) echo "  ❌ an unmeasurable marker produced no honest label: '$_g'"; FAIL=$((FAIL+1)) ;;
     esac
+    # ⛔ A NO-MARKER READING RENDERS AS ITSELF (agent-infra#2929). `age=` now carries `never` / `>360`
+    # for the two no-recent-land states, and appending `m` to those printed `no_land=neverm` /
+    # `no_land=>360m` — a unit on a value that never held one. A numeric age keeps its `m`.
+    rm -f "$DO"/state/merged-*.done
+    printf 'at=%s\npasses=3\nage=never\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      # ⛔ THE TERMINATOR IS PART OF THE PATTERN: `no_land=never,spawns` — a bare `*no_land=never*`
+      # also matches the BUG (`no_land=neverm`), so it could not fail on the pre-fix token.
+      *"no_land=never,spawns"*) echo "  ok a no-land-marker escalation renders no_land=never (not 'neverm')"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the no-marker reading was rendered with an invented unit: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    printf 'at=%s\npasses=3\nage=>360\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=>360,spawns"*) echo "  ok …and an outside-bound escalation renders no_land=>360 (the bound it was searched to)"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the outside-bound reading lost its bound: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    rm -f "$DO/state/drain-stall"
     # ⛔ ONE DEFINITION, TWO READERS: the cycle record's `drain=` field must go through the same helper,
     # or the status line and the durable record can disagree about what the box is in.
     wpin "the cycle record's drain= field is the SAME helper the status token reads" "$ORCH" '_cr_drain="$(drain_stall_label)"'
@@ -1665,6 +1687,96 @@ PYEOF
     *"the workers run and nothing lands"*) echo "  ok a MEASURED positive count keeps the land-problem diagnosis"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ a measured positive count lost its land-problem diagnosis: $_p"; FAIL=$((FAIL+1)) ;;
   esac
+  # ── AN EMPTY LAND READING IS *NOT* ONE READING (agent-infra#2929) ────────────────────────────
+  # ⛔ THE DEFECT THIS DRIVES: the block used to SKIP unless a marker existed, so on a box holding
+  # 178 markers with none inside `mp_recent_land`'s bound it printed a bare line — no artifact, no
+  # `pl_note_pass` — and on a box with NO marker at all (a fresh cell, or one after state loss) it
+  # printed NOTHING, while the exact condition the escalation exists for held. A dead-man's switch
+  # that can only report the PRESENCE of success events cannot report their absence.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain 400 180 0)"   # a marker EXISTS, but outside the 360m shortlist (the measured case)
+  case "$_out" in
+    *"DRAIN DEADLOCK"*"no land marker inside that bound"*)
+      echo "  ok a land marker OUTSIDE the bound ESCALATES (a deadlock, not a bare line)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a land marker outside the bound did not escalate (#2929): $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  grep -q '^age=>360$' "$DO/state/drain-stall" 2>/dev/null \
+    && { echo "  ok …and its age is recorded as the BOUND it was searched to, never an invented minute"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the outside-bound stall recorded no honest age: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1)); }
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain '' 180 0)"    # NO land marker at all (never landed, or state/ was lost)
+  case "$_out" in
+    *"DRAIN DEADLOCK"*"no land marker at all"*)
+      echo "  ok a state dir with NO merged-*.done escalates as a DEADLOCK (absence of success is a reading)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a state dir with no land marker stayed SILENT (#2929's own defect): $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  grep -q '^age=never$' "$DO/state/drain-stall" 2>/dev/null \
+    && { echo "  ok …and the escalation is RECORDED (state/drain-stall, age=never) so it outlives the pass"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the never-landed stall left no artifact: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1)); }
+  # ⛔ THE POLARITY IS THE SAME IN EVERY ARM: a deadlock needs a MEASURED ZERO spawns. A never-landed
+  # box that DID start workers is a land problem (STALLED), never a deadlock.
+  _out="$(_drain '' 180 4)"
+  case "$_out" in
+    *"DRAIN STALLED"*"spawned 4 worker(s)"*) echo "  ok …while a never-landed pass that DID spawn 4 workers reads STALLED, not DEADLOCK"; PASS=$((PASS+1)) ;;
+    *"DRAIN DEADLOCK"*) echo "  ❌ a never-landed pass with 4 spawns claimed a deadlock: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a never-landed pass lost its spawn reading: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  _out="$(_drain '' 180 '')"
+  case "$_out" in
+    *"DRAIN DEADLOCK"*) echo "  ❌ a never-landed pass with an UNMEASURED spawn count claimed a deadlock: $_out"; FAIL=$((FAIL+1)) ;;
+    *"cannot say whether any worker was started"*) echo "  ok …and an UNMEASURED spawn count still claims no deadlock in the never-landed state"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a never-landed pass with an unmeasured spawn count produced no honest verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ agent-infra#1931's CLASS IS PRESERVED, NOT REVERSED: an UNREADABLE state/ is not a measurement,
+  # so it is UNMEASURED — neither a stall nor an all-clear. A regular FILE where the directory belongs
+  # is portable (a chmod-000 directory proves nothing under a root CI runner).
+  _drn() { # state/ is a FILE, so nothing inside it can be read
+    ( set -u
+      O="$TMP/drainB"; rm -rf "$O"; mkdir -p "$O"; : > "$O/state"
+      LOG="$TMP/drainB.log"; : > "$LOG"; UPN_WORK=50; PRDISP_ACTS=0; PRDISP_SPAWNS=0; PRDISP_TOP=""
+      . "$TMP/drain_helpers.sh"
+      eval "$_DRAIN_BLOCK"
+      cat "$LOG" )
+  }
+  _out="$(_drn)"
+  case "$_out" in
+    *"UNMEASURED"*"could not be READ"*) echo "  ok an UNREADABLE state/ is UNMEASURED (an unread baseline is still not a stall)"; PASS=$((PASS+1)) ;;
+    *"DRAIN DEADLOCK"*|*"DRAIN STALLED"*) echo "  ❌ an unreadable state/ was reported as a STALL — #1931's class reversed: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ an unreadable state/ produced no verdict at all: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  [ -e "$TMP/drainB/state/drain-stall" ] \
+    && { echo "  ❌ an unreadable state/ still produced an escalation artifact"; FAIL=$((FAIL+1)); } \
+    || { echo "  ok …and it writes no escalation artifact"; PASS=$((PASS+1)); }
+  # ⛔ AND A BOUND SHORTER THAN THE WINDOW MAY NOT DECIDE: with a 60m merge-priority window the
+  # shortlist is 120m, so "nothing inside the bound" cannot prove a 360m stall — the newest land may
+  # sit inside the window and be invisible to the bounded walk.
+  _out="$(_drain '' 360 0 '' 60)"
+  case "$_out" in
+    *"DRAIN DEADLOCK"*|*"DRAIN STALLED"*) echo "  ❌ a SHORT shortlist decided the gate it cannot see: $_out"; FAIL=$((FAIL+1)) ;;
+    *"SHORTER than the"*) echo "  ok a shortlist shorter than the stall window reads UNMEASURED, not a stall"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a short shortlist produced no honest verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ AND THE NO-LAND-MARKER STALL MUST REACH THE ESCAPE EVALUATION (#2929: "since #2832 no escape
+  # evaluation either"). The old `elif` arm printed a line and returned: a never-landed box could never
+  # advance the inert streak, so the issue path could never open. The module's own contract is driven by
+  # pr-owner-liveness.test.sh — what this arm pins is the GLUE, stubbed so the assertion is about the call.
+  _drain_nomark() { # <spawns>
+    ( set -u
+      O="$TMP/drainN"; rm -rf "$O"; mkdir -p "$O/state"
+      LOG="$TMP/drainN.log"; : > "$LOG"; UPN_WORK=50; PRDISP_ACTS=1; PRDISP_SPAWNS="$1"; PRDISP_TOP=""
+      PL_MOD=1
+      pl_note_pass() { printf 'noted sp=%s un=%s\n' "${2:-}" "${3:-}" >> "$LOG"; printf '2\n'; }
+      pl_escape_bound() { printf '3\n'; }
+      . "$TMP/drain_helpers.sh"
+      eval "$_DRAIN_BLOCK"
+      cat "$LOG" )
+  }
+  _out="$(_drain_nomark 0)"
+  case "$_out" in
+    *'noted sp=0 un=50'*) echo "  ok a no-land-marker stall REACHES the escape evaluation (pl_note_pass sees the measured 0)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a no-land-marker stall skipped the escape evaluation (#2832): $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  rm -f "$TMP/drainN/state/drain-stall" "$DO/state/drain-stall"
   # ── THE MARKER CANNOT OUTLIVE THE DRAIN (review 1-P1, the stale-flag class) ────────────────
   # The whole drain-health block is gated on `LO_CHOICE=pr`, so its "drain alive" clear never runs
   # once the last un-owned PR is merged by a PEER box: `drain_stall_token` kept printing
@@ -1782,7 +1894,10 @@ PYEOF
   # drain must therefore produce a NAME, never a release: an age-based release turns *PRs are not
   # landing* into *dispatch more issues*, which hides the stall behind fresh activity. The PR queue IS
   # the work, so the correct response to "nothing has landed in 4h" is to say so beside the gate.
-  wpin "a long stall is NAMED beside the gate it explains" "$ORCH" '[dispatch] DRAIN STALLED — no PR merged in ${_lage}m'
+  wpin "a long stall is NAMED beside the gate it explains" "$ORCH" 'DRAIN STALLED — ${_agestr} while ${UPN_WORK:-?} un-owned remain'
+  # ⛔ AND THE AGE PHRASE IS THE STATE'S OWN READING (#2929): the measured case prints its minutes, and
+  # a non-numeric age can never be interpolated as one (`no PR merged in never m`).
+  wpin "…and the age phrase is the STATE's reading, not a hard-coded minutes suffix" "$ORCH" '_agestr="no PR merged in ${_lage}m"'
   wpin "the PR sweep's terminal line is SCOPED to the PR sweep (issue lanes are spawned later)" "$ORCH" \
        'the PR sweep started no worker this pass'
   # ⛔ ABSENCE PIN against the release arm returning: no function here may take an AGE and return
