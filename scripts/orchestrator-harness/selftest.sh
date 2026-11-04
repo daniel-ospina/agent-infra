@@ -68,6 +68,11 @@ TPL="$TEST_LABEL.plist"
 # it — the suite would render the production label into a sandbox $HOME and the label guard would
 # (correctly) refuse every install here.
 export LABEL_OVERRIDE="$TEST_LABEL"
+# ⛔ AND THE WATCHDOG'S LABEL (PR #1986 ships a SECOND agent). `install.sh` renders and addresses the
+# watchdog by label too, so a suite that overrode only the loop's would make every install below
+# address the operator's real safety net — `label_guard` refuses it (correctly) and §6g would list it.
+# A `-watchdog-test` suffix cannot match the stub's production regexes: the pattern excludes `-`.
+export WATCHDOG_LABEL_OVERRIDE="$TEST_LABEL-watchdog"
 export PROD_LABEL PROD_WD_LABEL TEST_LABEL TPL
 
 # ⛔ AND A `launchctl` STUB, WHICH REFUSES THE PRODUCTION LABELS. install.sh READS the domain on every
@@ -1741,10 +1746,15 @@ grep -q 'claim_live "\$PR"' "$LOOP" && rc=0 || rc=1
 ck "controller honours the claim written by the chain path" $rc
 
 # ── 10) template / renderer placeholder parity ───────────────────────────────────
-tpl="$(grep -oE '__[A-Z_]+__' "$HERE/launchd.plist.template" | sort -u)"
-sedlist="$(sed -n '/^sed \\/,/launchd.plist.template/p' "$INST" | grep -oE '__[A-Z_]+__' | sed 's/^__//; s/__$//' | sed 's/^/__/; s/$/__/' | sort -u)"
+# ⛔ EVERY SHIPPED TEMPLATE, not just the loop's: this branch ships a SECOND one
+# (`watchdog.plist.template`), and a placeholder the renderer does not substitute leaves launchd
+# reading a literal `__WD_LABEL__` while the plist still lints — the exact false PASS this parity
+# check exists for. The sed side is read from the substitution RULES (`-e "s|__X__|`) rather than the
+# surrounding `sed ... /` range, because the range now spans more than one template's block.
+tpl="$(grep -ohE '__[A-Z_]+__' "$HERE"/*.plist.template | sort -u)"
+sedlist="$(grep -F -- '-e "s|__' "$INST" | grep -oE '__[A-Z_]+__' | sort -u)"
 [ -n "$tpl" ] && [ "$tpl" = "$sedlist" ] && rc=0 || rc=1
-ck "every template placeholder is substituted by install.sh" $rc
+ck "every template placeholder (loop AND watchdog) is substituted by install.sh" $rc
 
 # The placeholder parity above cannot see a renamed <key>: rename the env KEY, keep the placeholder,
 # and both checks stay green while the loop reads a variable launchd never sets -- so the plist's
@@ -4205,6 +4215,34 @@ if [ -f "$HERE/sweep-quota.test.sh" ]; then
   fi
 else
   ck "sweep-quota.test.sh: the #1762 suite is present" 1
+fi
+
+# ── O2) the controller is RECOVERED when launchd REMOVES it, not merely when it crashes ──────────
+# KeepAlive cannot restart a service that is no longer in the domain, and `launchctl unload -w` (or a
+# `bootout` whose `bootstrap` fails) leaves a persistent disabled flag — measured five times on
+# 2026-10-17: `Setting service … to disabled` → `removing service` → dead controller, no error
+# anywhere. The full contract — a running controller is left ALONE, a removed one is reloaded exactly
+# once, a declared stop (`$O/.watchdog-off`) is never reversed, install.sh renders an install-relative
+# plist and its --uninstall stops the watchdog BEFORE the loop — lives in its own hermetic suite,
+# driven against the shipped script with a stubbed `launchctl`. Run it here so `./selftest.sh` stays
+# the one command that pins the harness.
+if [ -f "$HERE/watchdog.test.sh" ]; then
+  if bash "$HERE/watchdog.test.sh" > "$TMP/watchdog.out" 2>&1; then
+    ck "watchdog.test.sh: a REMOVED controller is recovered; a healthy one is untouched" 0
+    # ⛔ A SKIP INSIDE THE CHILD IS NOT A PASS HERE. The suite's install.sh half is Darwin-only, so off
+    # macOS it reports `SKIPPED=<n>` and still exits 0 — scoring that as a bare pass would print ✅ for
+    # a group that did not run, which is the false PASS this file's platform gate (:3140) forbids. The
+    # child's skip count is carried up so the summary can never say "all passed" over it.
+    _wskip="$(sed -n 's/.*SKIPPED=\([0-9][0-9]*\).*/\1/p' "$TMP/watchdog.out" | tail -1)"
+    if [ "${_wskip:-0}" -gt 0 ] 2>/dev/null; then
+      skipd "watchdog.test.sh: ${_wskip} install.sh assertion(s) inside it — macOS-only (launchd); skipped on $PLATFORM"
+    fi
+  else
+    ck "watchdog.test.sh: a REMOVED controller is recovered; a healthy one is untouched" 1
+    grep -E '❌|Summary|PASS=' "$TMP/watchdog.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "watchdog.test.sh: the controller-removal suite is present" 1
 fi
 
 # ── 21) deployed-harness provenance and drift (#1745) ────────────────────────────
