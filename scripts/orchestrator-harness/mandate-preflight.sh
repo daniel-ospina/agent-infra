@@ -278,7 +278,7 @@ mandate_preflight_emit() {
   # is the over-block the header forbids. `|| :` makes it a read, like every other write in this file.
   line="$(mandate_preflight_line 2>/dev/null)" || :
   if [ -z "$line" ] && { [ -n "$(mandate_missing)$(mandate_unreadable)$(mandate_irregular)" ] || mandate_state_root_undecidable; }; then
-    line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")"
+    line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")" || :
   fi
   # ⛔ THE GUARD IS CONTENT-AWARE, NOT PRESENCE-ONLY (this change's review, P2 — measured, and it is the
   # #3377 defect coming back through the guard written to stop it). It used to test only whether the
@@ -332,7 +332,7 @@ mandate_preflight_emit() {
     # TWO conversions, so the hostname took the first `%s` and split onto its own line while the box name
     # rendered as an empty `()` — in a notice whose whole value is naming WHICH box has WHICH state. The
     # leading `'%s\n'` is unnecessary anyway: the caller wraps the notice in `printf '\n%s\n'`.
-    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: BOTH mandated files are now PRESENT and readable on this box (%s), so that earlier block is a STALE reading of box state and must NOT be reported — do not claim a mandated file is missing (agent-infra#3377).' "$(hostname 2>/dev/null || printf 'this box')")"
+    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: BOTH mandated files are now PRESENT and readable on this box (%s), so that earlier block is a STALE reading of box state and must NOT be reported — do not claim a mandated file is missing (agent-infra#3377).' "$(hostname 2>/dev/null || printf 'this box')")" || :
     # ⛔ AND IT IS IDEMPOTENT (this change's review, P2, measured: five dispatches on a provisioned box
     # produced FIVE notices). `stamped` never clears, so without this test every later dispatch appended
     # another copy and the brief grew without bound. If the brief already ENDS with this notice, the claim
@@ -368,7 +368,7 @@ mandate_preflight_emit() {
   # read both blocks as true at once.
   brief_payload="$line"
   if [ -n "$stamped" ]; then
-    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block(s) earlier in this brief: box state has CHANGED, so the block BELOW is the CURRENT reading and every earlier one is stale — use only what follows (agent-infra#3377).')"
+    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block(s) earlier in this brief: box state has CHANGED, so the block BELOW is the CURRENT reading and every earlier one is stale — use only what follows (agent-infra#3377).')" || :
     brief_payload="$(printf '%s\n%s' "$notice" "$line")" || :
   fi
   # ⛔ GROUP THE REDIRECT WITH THE COMMAND (#3377 review, P2): `printf … >> "$prompt" 2>/dev/null` applies

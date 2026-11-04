@@ -339,7 +339,23 @@ chmod 600 "$BRIEF1F" 2>/dev/null
 # A new `v="$(cmd)"` added later without `|| :` re-opens the abort for whatever data it reads, and E1e/E1f
 # would stay GREEN because they drive only the two that exist today. This asserts the CLASS, so the guard
 # cannot be lost by adding a third.
-UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -nE '^[[:space:]]+[a-z_]+="\$\([^)]*\)"[[:space:]]*$' | sed 's/^/emit+/')"; [ -z "$UNGUARDED" ]; ck $? "every command-substitution assignment in the emit carries a guard against a set -e caller (unguarded:${UNGUARDED:- none})"
+# ⛔ THE FIRST CUT OF THIS ARM WAS VACUOUS (this change's review, P2, MEASURED). It matched
+# `^\s+[a-z_]+="\$\([^)]*\)"\s*$` — a substitution whose RHS contains NO `)` and which ENDS the line.
+# Neither holds for any assignment in the emit: each carries a `)` inside its format string or a nested
+# `$( … )`, and the guarded ones end in `|| :`. Measured on the real file: the grep matched ZERO lines
+# while SIX assignments existed, THREE of them unguarded — so the arm printed "unguarded: none" about a
+# file it had not read, the "gate that cannot redden" class §E's own header names. The predicate below
+# anchors only on HOW an assignment starts and on what a GUARDED one ends with, so nesting cannot hide a
+# line from it, and it is exercised by a control on each side (below) instead of being trusted.
+unguarded_subs() { grep -nE '^[[:space:]]+[a-z_]+="\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
+UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | unguarded_subs | sed 's/^/emit+/')"; [ -z "$UNGUARDED" ]; ck $? "every command-substitution assignment in the emit carries a guard against a set -e caller (unguarded:${UNGUARDED:- none})"
+# ── E1g: THE CONTROL — the arm above can REDDEN, and does so on the shapes the vacuous version missed ──
+# Three arms, because a one-sided control only proves the predicate is not always-true: a bare assignment
+# must be REPORTED, a guarded one must NOT be, and a NESTED/`(`-bearing one — the exact shape the first
+# cut could not see — must be REPORTED. Without these, E1f's rule is prose with a passing line next to it.
+printf '  v="$(cmd)" || :\n' | unguarded_subs > /dev/null; [ $? -ne 0 ]; ck $? "control: a GUARDED assignment is NOT reported (the predicate is not always-true)"
+printf '  v="$(cmd)"\n' | unguarded_subs | grep -q .; ck $? "control: a BARE assignment IS reported (the arm can redden)"
+printf '  v="$(printf '\''%%s (%s)'\'' "$(hostname)")"\n' | unguarded_subs | grep -q .; ck $? "control: a NESTED / paren-bearing bare assignment IS reported — the shape the vacuous first cut could not match"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
