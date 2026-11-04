@@ -1474,6 +1474,19 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # from turning a future producer's new spelling into `dead/bound-verdict:<it>`.
         # `parse_bound_line` and the census seam both filter; this is the third door.
         verdict = lr.verdict if lr.verdict in BOUND_VERDICTS else ""
+        # ⛔ NORMALISE THE `rc` HERE, AT THE ONE DOOR. A `LogRead` can be built by a DIRECT
+        # caller — the reader §13.5 says is next — and an unreadable status must not become
+        # a fact: without this, `rc=0x0` published `no-verdict/bound-finished-rc:0x0`, the
+        # POSITIVE claim "the child did NOT complete" from nothing readable, and a runaway
+        # token was interpolated whole into `reason`. `parse_bound_line` applies the same
+        # 1-10-digit-or-`na` allow-list, and the census deliberately does NOT re-implement
+        # it (a second copy was tried and had to be reverted: it masked its own mutation,
+        # because either copy alone produced the identical observable state). One rule, one
+        # place. An unreadable status ABSTAINS.
+        rc = lr.rc
+        if (rc is not None and rc != "na"
+                and not (rc.isascii() and rc.isdigit() and len(rc) <= 10)):
+            rc = None
         if verdict:
             if verdict in BOUND_FINISHED:
                 # ⛔ `verdict=finished` ALONE IS NOT A COMPLETION — it means "no bound
@@ -1481,11 +1494,11 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                 # `lane-bound.sh run --log L -- sh -c 'exit 7'` → `verdict=finished rc=7`.
                 # Reading that as finished is a FALSE PASS over lost work: nobody
                 # re-dispatches it, and the lane's turn never completed.
-                if lr.rc is None:
+                if rc is None:
                     return Verdict("unknown", "finished-rc-unreadable",
                                    detail="verdict=finished but no rc= on the line; "
                                           "completion is undecidable")
-                if lr.rc == "na":
+                if rc == "na":
                     # ⛔ `na` IS NOT COMPLETION — IT IS THE ABSENCE OF EXIT-STATUS
                     # EVIDENCE. `lane-bound.sh watch` writes it UNCONDITIONALLY
                     # (`:397`) and `watch` is what `spawn-gate.sh`'s `run_agent` uses
@@ -1517,14 +1530,14 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                                    detail=("verdict_source=%s rc=na runner_rc=0"
                                            % (lr.verdict_source or "log"))
                                           + _also(lr.detail))
-                if lr.rc not in BOUND_OK_RC:
-                    return Verdict("no-verdict", "bound-finished-rc:%s" % lr.rc,
+                if rc not in BOUND_OK_RC:
+                    return Verdict("no-verdict", "bound-finished-rc:%s" % rc,
                                    detail=("verdict=finished rc=%s — the bound fired nothing, "
-                                           "but the turn did NOT complete" % lr.rc)
+                                           "but the turn did NOT complete" % rc)
                                           + _also(lr.detail))
                 return Verdict("finished", "bound-verdict:%s" % verdict,
                                detail=("verdict_source=%s rc=%s"
-                                       % (lr.verdict_source or "log", lr.rc))
+                                       % (lr.verdict_source or "log", rc))
                                       + _also(lr.detail))
             # `stalled` / `exceeded-wallclock` — the bound's own kill verdict. That is
             # REAL DEATH (mechanism 3), reported by the producer that caused it.
@@ -2858,9 +2871,19 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
         return 2
 
     if census:
-        if log or pid is not None:
-            print("liveness.py: --log-census reads its lanes from stdin; "
-                  "do not also pass --log/--pid", file=sys.stderr)
+        # ⛔ REFUSE, RATHER THAN SILENTLY DROP, EVERY PER-LANE FLAG. `--log`/`--pid` were
+        # already refused by name; `--verdict-file`, `--transcript`, `--start-seconds` and
+        # `--json` were ACCEPTED AND IGNORED. That is not harmless: measured with a valid
+        # `$log.lanebound`, the single-lane arm publishes `finished` for the same file the
+        # census then publishes as `no-verdict / process-gone-no-verdict` — "the lane told
+        # us nothing" for a lane that finished, which is the §13.1 false-negative class —
+        # and `--json` silently changed nothing about the TSV output. Both exited 0, so no
+        # caller could tell it had been ignored. A refusal is consistent with the surface's
+        # own contract (it reads lanes AND their evidence from stdin).
+        if log or pid is not None or vfile or transcript or start_seconds is not None or as_json:
+            print("liveness.py: --log-census reads its lanes and their evidence from stdin; "
+                  "do not also pass --log/--pid/--verdict-file/--transcript/"
+                  "--start-seconds/--json", file=sys.stderr)
             return 2
         rc = 0
         for line in sys.stdin:
@@ -2917,31 +2940,20 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
                     return ""
                 return _pidtok(f[idx].strip()) or "?"
 
-            def _census_rc(fields):
-                # ⛔ AN UNREADABLE STATUS IS NOT A NEGATIVE FACT — the same rule
-                # `parse_runner_line` and `parse_bound_line` apply. This column used to
-                # accept ANY non-empty, non-`?` token, so `0x0` published
-                # `no-verdict/bound-finished-rc:0x0` — the positive claim "the child did
-                # NOT complete" from nothing readable — where the log path for the SAME
-                # bytes abstains (`rc=None` -> `finished-rc-unreadable` -> `unknown`).
-                # That also contradicted the seam's own contract: no state may be decided
-                # here that `log_lane_verdict` would not decide. And a runaway token was
-                # interpolated whole into `reason` (measured: 400 digits -> 418-char
-                # reason). Only a 1-10 digit status or `na` is a reading.
-                if len(fields) <= 9:
-                    return None
-                tok = fields[9].strip()
-                if tok == "na":
-                    return "na"
-                return (tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10)
-                        else None)
-
             verdict_pid = _pidcol(10)
             row_pid = _num(0)
             path = f[1] if len(f) > 1 else ""
             lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=_opt(3),
                          window_ms=window_ms, verdict=verdict,
-                         rc=_census_rc(f),
+                         # ⛔ THE `rc` ALLOW-LIST IS NOT RE-IMPLEMENTED HERE. It lives
+                         # at ONE door — `log_lane_verdict`, which normalises an
+                         # unreadable status to `None` -> `finished-rc-unreadable`
+                         # -> `unknown` — so this seam cannot decide a state the
+                         # verdict function would not. A second copy here would be
+                         # the second implementation of one rule (and it was: it
+                         # masked its own mutation, because either copy alone
+                         # produced the same observable state).
+                         rc=(f[9] if len(f) > 9 and f[9] not in ("", "?") else None),
                          verdict_line_pid=verdict_pid,
                          verdict_source="caller" if verdict else "")
 

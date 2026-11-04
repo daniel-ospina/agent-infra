@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with seventy-eight paired mutations: every mutation re-
+Fifty-one tests with seventy-nine paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (78)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (79)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1664,6 +1664,24 @@ def t37():
     v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=None))
     check(v.state == "unknown" and v.reason == "finished-rc-unreadable",
           "a verdict without a readable rc abstains; got %s/%s" % (v.state, v.reason))
+    # ⛔ AN UNREADABLE `rc` IS NOT A NEGATIVE FACT AT *THIS* DOOR EITHER. Both shipped
+    # producers apply a 1-10-digit-or-`na` allow-list, but a DIRECT caller — the reader
+    # §13.5 says is next — could hand the verdict function any token, and it published
+    # `bound-finished-rc:0x0`: the positive claim "the child did NOT complete" from nothing
+    # readable, which is the shape the census column had to be fixed for. Same for a
+    # runaway token, which was interpolated whole into `reason`.
+    for junk_rc in ("0x0", "exit:0", "\u00b2", "9" * 40):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=junk_rc))
+        check(v.state == "unknown" and v.reason == "finished-rc-unreadable",
+              "an unreadable rc token must ABSTAIN at the verdict door too; got %s/%s"
+              % (v.state, v.reason))
+        check(len(v.reason) < 64,
+              "…and must not be interpolated into the reason; got %d chars" % len(v.reason))
+    # …while a REAL status still names itself, so the guard is not a blanket abstain.
+    for good_rc in ("7", "255", "137"):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=good_rc))
+        check(v.state == "no-verdict" and v.reason == "bound-finished-rc:%s" % good_rc,
+              "a real non-zero status is still named; got %s/%s" % (v.state, v.reason))
 
     # A bound KILL is real death (mechanism 3), and it must not read `finished`.
     for killed in ("stalled", "exceeded-wallclock"):
@@ -1919,6 +1937,20 @@ def t41():
               % len(by_pid["32"][1]))
         check(by_pid["33"] == ("no-verdict", "bound-finished-rc:7"),
               "a REAL non-zero rc is still named; got %r" % (by_pid["33"],))
+        # ⛔ A PER-LANE FLAG MUST BE REFUSED, NOT SILENTLY DROPPED. `--verdict-file`,
+        # `--transcript`, `--start-seconds` and `--json` were ACCEPTED AND IGNORED: measured
+        # with a valid `$log.lanebound`, the single-lane arm published `finished` for a file
+        # the census then published as `no-verdict / process-gone-no-verdict` — "the lane told
+        # us nothing" for a lane that finished — and `--json` changed nothing about the TSV.
+        # Both exited 0, so no caller could tell. A refusal is the surface's own contract.
+        for argv in (["--log-census", "--json"],
+                     ["--log-census", "--verdict-file", os.path.join(d, "V")],
+                     ["--log-census", "--transcript", os.path.join(d, "T")],
+                     ["--log-census", "--start-seconds", "5"]):
+            refuse_rc, refuse_rows = census([], argv)
+            check(refuse_rc == 2,
+                  "%r must be REFUSED, not ignored; got rc=%r" % (argv[1:], refuse_rc))
+            check(refuse_rows == [], "…and must publish no rows; got %r" % (refuse_rows,))
         check(rc == 3, "an abstaining census exits 3 (cannot-verify); got %r" % (rc,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -2474,7 +2506,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T37", "module",
-        '                if lr.rc not in BOUND_OK_RC:',
+        '                if rc not in BOUND_OK_RC:',
         '                if False:',
         "the rc conjunct is dropped, so `verdict=finished rc=7` — a CRASHED lane — reads "
         "`finished` and nobody re-dispatches the work it lost",
@@ -2910,8 +2942,8 @@ MUTATIONS = [
     # ── the 2026-11-04 review round: `rc=na` is not completion evidence ─────────────
     Mutation(
         "T37", "module",
-        '                if lr.rc == "na":',
-        '                if False and lr.rc == "na":',
+        '                if rc == "na":',
+        '                if False and rc == "na":',
         "the `rc=na` corroboration is dropped, so `watch` mode's unconditional token — the "
         "shape the fleet's ONLY launcher writes for every lane — is no longer required to "
         "be witnessed by the caller's rc line",
@@ -2971,21 +3003,34 @@ MUTATIONS = [
         "flips a completed lane to `no-verdict`, and a runaway token is interpolated "
         "whole into the reason",
     ),
-    # ── round 3: the census `rc` column, and the unbounded bound-line token ──────────
-    Mutation(
-        "T41", "module",
-        '                         rc=_census_rc(f),',
-        '                         rc=(f[9] if len(f) > 9 and f[9] not in ("", "?") else None),',
-        "the census `rc` column accepts ANY non-empty token again, so an unreadable "
-        "status (`0x0`) becomes the positive claim \"the child did NOT complete\" where "
-        "the log path abstains, and a runaway token is interpolated whole into `reason`",
-    ),
+    # ── round 3: the unbounded bound-line token ───────────────────────────────────────
+    # (the census `rc` column needs no mutation of its own: the allow-list lives at ONE
+    # door — `log_lane_verdict` — and the `T37` "stops normalising `rc`" mutation below
+    # is what discriminates it. A census-local copy was tried and reverted: it masked
+    # its own mutation, since either copy alone produced the same observable state.)
     Mutation(
         "T37", "module",
         'globals()["_BOUND_RC_RE"] = _re.compile(r"\\brc=([0-9]{1,10}|na)\\b")',
         'globals()["_BOUND_RC_RE"] = _re.compile(r"\\brc=([0-9]+|na)\\b")',
         "an UNBOUNDED rc token matches a runaway value that then reads as a status and "
         "is interpolated whole into the reason",
+    ),
+    # ── round 4: the verdict door, and the silently-dropped census flags ─────────────
+    Mutation(
+        "T37", "module",
+        '        if (rc is not None and rc != "na"',
+        '        if False and (rc is not None and rc != "na"',
+        "the verdict function stops normalising `rc`, so a DIRECT caller publishes "
+        "`bound-finished-rc:0x0` — a negative fact from an unreadable status — that both "
+        "shipped producers abstain on",
+    ),
+    Mutation(
+        "T41", "module",
+        '        if log or pid is not None or vfile or transcript or start_seconds is not None or as_json:',
+        '        if log or pid is not None:',
+        "`--log-census` silently DROPS the per-lane flags again, so a `--verdict-file` that "
+        "makes the single-lane arm say `finished` is ignored and the census publishes "
+        "`no-verdict` for that lane with exit 0",
     ),
 ]
 
