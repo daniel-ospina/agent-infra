@@ -113,6 +113,15 @@ chmod +x "$T/bin/dscl"
 
 # Fake HOME with a farmed scripts dir + a swarm checkout.
 mkfakehome() { # $1 = home dir
+    # #2413-audit — the three jobs whose templates name the FARMED copy. On a real box they pointed
+    # at `{{AGENT_INFRA_PATH}}/scripts/…` (inside ~/Documents) and launchd exited 126 on every tick
+    # under TCC (#427); the farmed path is the only target it can READ, so the fixture must carry it
+    # or the broken-target guard refuses the whole §1 install and every section after it.
+    mkdir -p "$1/.pi/agent/scripts/orchestrator-harness"
+    for f in objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh; do
+        touch "$1/.pi/agent/scripts/$f"
+        chmod +x "$1/.pi/agent/scripts/$f"
+    done
     mkdir -p "$1/.pi/agent/scripts/checkout-hygiene"
     touch "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
     touch "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
@@ -126,7 +135,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py worktree-hygiene-sweep.sh cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -652,6 +661,44 @@ assert_contains "$OUT" "broken target" "broken target named"
 assert_contains "$OUT" "FAIL" "broken target refuses install"
 BOOTSTRAP_COUNT4="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 assert_eq "$BOOTSTRAP_COUNT4" "$((BOOTSTRAP_COUNT3 + 1))" "no bootstrap for a refused job (count frozen after test 6's failed reload)"
+echo "── 7b. TCC-protected target refusal (#427 / #2413 audit) ─────────"
+# MEASURED 2026-11-03 on the orchestrator box: four jobs were loaded, ran (1766 / 44 / 2 times) and
+# exited 126/2 because their ProgramArguments named a script inside ~/Documents — a tree macOS TCC
+# denies to every launchd-spawned process. `verify_targets` tested EXISTENCE only, so it PASSED them
+# and the installer armed a unit that could never start. This section pins the fix: a target inside a
+# TCC-protected root is refused BY NAME and nothing is bootstrapped for it.
+#
+# The guard reads $HOME at install time, so the case is built under the fixture HOME — never the
+# operator's real ~/Documents.
+mkdir -p "$HOME1/Documents/checkout/scripts"
+touch "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
+chmod +x "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
+sed -i.bak \
+    -e 's#<string>{{HOME}}/.pi/agent/scripts/objective-reminder.sh</string>#<string>{{HOME}}/Documents/checkout/scripts/tcc-dead.sh</string>#' \
+    -e 's/agent-infra-plist-version: 0.2.0/agent-infra-plist-version: 0.2.0-tccprobe/' \
+    "$TEMPLATES/com.eldato.objective-reminder.plist" \
+    && rm -f "$TEMPLATES/com.eldato.objective-reminder.plist".bak || true
+rm -f "$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist"
+set +e
+OUT="$(run_installer "$HOME1" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "1" "TCC-protected target → exit 1"
+assert_contains "$OUT" "TCC-protected target" "TCC-protected target named"
+assert_contains "$OUT" "Operation not permitted" "the 126 symptom is named in the refusal"
+assert_contains "$OUT" "FAIL" "TCC-protected target refuses install"
+# The whole point: the guard must not merely WARN — the unit is absent, not half-installed.
+if [ -e "$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist" ]; then
+    echo "✗ TCC-protected unit was installed anyway" >&2; exit 1
+fi
+# Restore the template + fixture so later sections install cleanly.
+sed -i.bak \
+    -e 's#<string>{{HOME}}/Documents/checkout/scripts/tcc-dead.sh</string>#<string>{{HOME}}/.pi/agent/scripts/objective-reminder.sh</string>#' \
+    -e 's/agent-infra-plist-version: 0.2.0-tccprobe/agent-infra-plist-version: 0.2.0/' \
+    "$TEMPLATES/com.eldato.objective-reminder.plist" \
+    && rm -f "$TEMPLATES/com.eldato.objective-reminder.plist".bak || true
+mkfakehome "$HOME1"
+
 # Restore the farmed script so later tests install cleanly
 mkfakehome "$HOME1"
 

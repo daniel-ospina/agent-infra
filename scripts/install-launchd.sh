@@ -480,15 +480,108 @@ PY
         | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*=[[:space:]]*//p' | grep '^/' || true
 }
 
-# Verify every absolute path in ProgramArguments resolves (catches broken
-# symlinks — e.g. provider-latency-tripwire.sh pointing at a not-yet-pulled checkout).
-# $1 = rendered plist FILE. Prints broken targets; exits 1 if any.
+# ── the TCC-protected tree (#427) ─────────────────────────────────────────
+#
+# MEASURED 2026-11-03T23:30Z on the orchestrator box: FOUR launchd jobs were armed, loaded and
+# unable to do anything, because their ProgramArguments named a script inside `~/Documents`.
+#
+#   com.eldato.worker-supply        runs=1766  last exit code=126
+#   com.eldato.objective-reminder   runs=44    last exit code=126
+#   com.eldato.controller-watchdog  runs=0     last exit code=126
+#   com.tortoise.queue-reconcile    runs=n/a   last exit code=2
+#
+# and every one of them logged the same sentence, 27,322 times for the first:
+#
+#   /bin/bash: /Users/…/Documents/GitHub/agent-infra/scripts/…/worker-supply.sh: Operation not permitted
+#
+# `126` reads like "interpreter missing" or "not executable". It is neither: every one of those
+# paths existed and was `-rwxr-xr-x`. macOS TCC denies EVERY launchd-spawned process access to
+# ~/Documents, ~/Desktop, ~/Downloads and the iCloud tree, `bash` maps the EPERM to 126, and the
+# only way to tell the two apart is to read `launchctl print` (`runs`, `last exit code`) and the
+# job's own log. So the check below exists for the class, not the four instances:
+#
+#   verified with a probe job submitted INTO the launchd bootstrap domain (`launchctl submit`,
+#   ppid=1, uid=501 — the same context the agents run in):
+#     ~/.pi/agent/scripts/objective-reminder.sh                          → would-be READ=ok
+#     ~/harness/<sha12>/scripts/orchestrator-harness/launchd-controller.sh → READ=ok
+#     ~/Documents/GitHub/agent-infra/scripts/objective-reminder.sh       → READ=DENIED
+#     ls ~/Documents/GitHub/agent-infra/scripts                          → listdir DENIED
+#     ~/Documents/GitHub/tortoise/pyproject.toml                         → READ=DENIED (blanket tree)
+#
+# ⛔ THE FARM IS THE REMEDY, NOT A PLIST EDIT. A job must execute the FARMED copy
+# (`~/.pi/agent/scripts/…`, declared in `pi-bootstrap/setup.sh`'s farm arrays) — the same rule this
+# file already applies to `worktree-hygiene-sweep.sh`, `pi-reap-orphans.sh` and the lane-liveness
+# tools. Pointing ProgramArguments at `{{AGENT_INFRA_PATH}}` looks correct on a box whose checkout
+# sits outside the TCC tree and is silently dead on the documented default
+# (`~/Documents/GitHub/agent-infra`), which is why `verify_targets` used to pass it.
+#
+# WHAT THIS GUARD DOES **NOT** COVER, stated so it is not read as a clean bill of health: a job whose
+# *work* touches a `~/Documents` checkout (a `--repo` argument, a `WorkingDirectory`, a `git` call)
+# is just as dead from launchd's context even when its own script is farmed and readable. That is the
+# same root, it is NOT fixable by a path swap here, and it is recorded on #427 rather than papered
+# over.
+tcc_protected_roots() {
+    printf '%s\n' \
+        "$HOME/Documents" \
+        "$HOME/Desktop" \
+        "$HOME/Downloads" \
+        "$HOME/Library/Mobile Documents"
+}
+
+# is_tcc_protected <absolute path> → 0 when launchd cannot read it.
+#
+# TWO resolutions are compared, and BOTH are required:
+#   * the PHYSICAL path of the target, for the reason `launchd_path` does — it is the TARGET that TCC
+#     gates, so a symlink pointing INTO the protected tree is dead while one pointing OUT of it is fine;
+#   * the PHYSICAL path of each ROOT, because the roots are built from `$HOME` and `$HOME` itself is
+#     commonly reached through a symlinked ancestor (`/tmp` → `/private/tmp` on macOS). Measured on
+#     this suite's own fixture: HOME=/tmp/… resolved to /private/tmp/…, the literal prefix never
+#     matched, and the guard PASSED the exact TCC-dead target it exists to refuse.
+# A path whose directory cannot be resolved falls back to the literal, and the literal `case` still
+# matches — an unresolvable path must never be the way past this guard.
+is_tcc_protected() {
+    local arg="$1" arg_phys="" dir phys root root_phys candidate
+    dir="$(dirname -- "$arg")"
+    if phys="$(CDPATH= cd -- "$dir" 2>/dev/null && pwd -P)"; then
+        arg_phys="$phys/$(basename -- "$arg")"
+    fi
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        for candidate in "$arg" "$arg_phys"; do
+            [ -n "$candidate" ] || continue
+            case "$candidate" in "$root" | "$root"/*) return 0 ;; esac
+        done
+        root_phys=""
+        if root_phys="$(CDPATH= cd -- "$root" 2>/dev/null && pwd -P)" && [ "$root_phys" != "$root" ]; then
+            for candidate in "$arg" "$arg_phys"; do
+                [ -n "$candidate" ] || continue
+                case "$candidate" in "$root_phys" | "$root_phys"/*) return 0 ;; esac
+            done
+        fi
+    done < <(tcc_protected_roots)
+    return 1
+}
+
+# Verify every absolute path in ProgramArguments resolves AND is readable from the launchd context
+# (catches broken symlinks — e.g. provider-latency-tripwire.sh pointing at a not-yet-pulled checkout,
+# fixed by re-running setup.sh — and TCC-protected targets, fixed by farming).
+# $1 = rendered plist FILE. Prints offending targets; exits 1 if any.
 verify_targets() {
     local arg bad=0
     while IFS= read -r arg; do
         [ -n "$arg" ] || continue
         if [ ! -e "$arg" ]; then
             echo "    broken target: $arg" >&2
+            bad=1
+            continue
+        fi
+        if is_tcc_protected "$arg"; then
+            echo "    TCC-protected target: $arg" >&2
+            echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427);" >&2
+            echo "        it starts this job and bash exits 126 'Operation not permitted', which" >&2
+            echo "        reads as 'installed' to every instrument that only checks existence." >&2
+            echo "        Render the FARMED copy ({{HOME}}/.pi/agent/scripts/…) and declare it in" >&2
+            echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
             bad=1
         fi
     done < <(plist_program_args "$1")
@@ -534,8 +627,10 @@ install_job() {
     printf '%s' "$rendered" > "$tmp"
     if ! verify_targets "$tmp"; then
         rm -f "$tmp"
-        echo "  FAIL $label: script target(s) above do not resolve — fix the" >&2
-        echo "        farm/checkout first (run sync.sh / pi-bootstrap setup.sh), then re-run." >&2
+        echo "  FAIL $label: script target(s) above are missing or unreachable from launchd —" >&2
+        echo "        fix the farm/checkout first (run sync.sh / pi-bootstrap setup.sh), then re-run." >&2
+        echo "        Refusing to install: a unit launchd cannot start reads as 'armed' and does" >&2
+        echo "        nothing, which is worse than no unit at all." >&2
         return 1
     fi
 

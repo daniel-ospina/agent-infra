@@ -634,7 +634,17 @@ fi
 # is not itself farmed; the unit names the checkout copy, which is the artifact #2877 landed and the
 # path this installer verifies before rendering. It ships DISARMED: `--install` renders a dry-run
 # unit and timer, and `--arm` (a dated owner step) is what lets the pass ACT.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
+# agent-infra#2413-audit farms the three jobs that were ARMED AND DEAD on the orchestrator box
+# (measured 2026-11-03T23:30Z): com.eldato.worker-supply (runs=1766, last exit code=126),
+# com.eldato.objective-reminder (runs=44, 126) and com.eldato.controller-watchdog (126). Their
+# templates named `{{AGENT_INFRA_PATH}}/scripts/…`, which is `~/Documents/GitHub/agent-infra` on the
+# documented default box — a tree macOS TCC denies to every launchd-spawned process, so `/bin/bash`
+# logged `Operation not permitted` and exited 126 on every tick while `launchctl list` said "loaded".
+# Those three templates now name the FARMED path, which makes this array the delivery mechanism the
+# units depend on (#2053's rule for worktree-hygiene-sweep.sh, applied to the same failure).
+# ⛔ NESTED NAMES ARE KEPT NESTED (`orchestrator-harness/…`): `watchdog-loop.sh` resolves the cell
+# supervisor as `$(dirname $0)/../cloud-cell-supervisor.sh`, so flattening the farm would silently
+# break that fallback. The copy leg creates the parent directory for exactly this reason.fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -645,6 +655,13 @@ for base in "${fleet_srcs[@]}"; do
     continue
   fi
   dest="$DEST/scripts/$base"
+  # A NESTED entry (orchestrator-harness/worker-supply.sh) needs its parent: `cp -f` into a missing
+  # directory fails, and the loop would report the farm as complete. Same rule the merge-gate farm
+  # below applies to `gh-shim/gh`.
+  if ! mkdir -p "$(dirname "$dest")"; then
+    farm_missing+="scripts/$base (cannot create $(dirname "$dest"))"$'\n'
+    continue
+  fi
   if [ -L "$dest" ]; then
     echo "    replacing farm symlink with real copy: $base"
     rm -f "$dest"

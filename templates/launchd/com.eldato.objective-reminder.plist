@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- agent-infra-plist-version: 0.1.0 -->
+<!-- agent-infra-plist-version: 0.2.0 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -27,13 +27,20 @@
          the text is in. The script judges the send in the NEXT pass (the boundary lags), and the one
          same-pass verdict it can prove is UNSENT (the payload is still in the composer).
 
-         ⛔ TCC / WHY THE TARGET IS THE CHECKOUT'S SCRIPT. `install-launchd.sh` hard-fails a job whose
-         ProgramArguments target does not resolve, so this job must not point at a farmed copy that
-         may not exist. It renders `{{AGENT_INFRA_PATH}}/scripts/objective-reminder.sh` from
-         resolve_infra_main() — this repo's MAIN checkout, worktree-safe — so the job moves with the
-         merge and survives a worktree teardown. (The farmed `~/.pi/agent/scripts/` copy is what a
-         CELL gets; see templates/systemd/ for that half.) The script is self-contained apart from an
-         OPTIONAL triage helper that it reads if present and skips if not.
+         ⛔ TCC / WHY THE TARGET IS THE FARMED COPY. An earlier version of this template pointed at
+         `{{AGENT_INFRA_PATH}}/scripts/objective-reminder.sh` and reasoned that `install-launchd.sh`
+         "hard-fails a job whose ProgramArguments target does not resolve", so it must not point at a
+         farmed copy that may not exist. MEASURED 2026-11-03: on this box `AGENT_INFRA_PATH` is
+         `~/Documents/GitHub/agent-infra`, macOS TCC denies every launchd-spawned process access to
+         `~/Documents`, and the job ran **44 times with `last exit code=126`**
+         (`/bin/bash: …: Operation not permitted`) while `launchctl list` showed it loaded. The path
+         resolved, so the guard passed it; nobody could tell "armed" from "working".
+         The farmed `~/.pi/agent/scripts/` copy is the only target launchd can READ, and setup.sh's
+         `fleet_srcs` array now delivers it. The objection above is answered rather than ignored: if
+         the farm is missing, `verify_targets` refuses the install LOUDLY (exit 1, nothing installed)
+         instead of arming a unit that cannot start — which is the whole point of the guard.
+         ⛔ And `verify_targets` now also refuses a TCC-protected target, so this defect cannot be
+         reintroduced by a future edit that "simplifies" the path back to `{{AGENT_INFRA_PATH}}`.
 
          ⛔ THE SURFACE IDS ARE WRITTEN OUT, NOT INHERITED. A launchd job gets neither the operator's
          shell env nor its rc files, so an unset WS/SURFACE would fall back to the script's defaults —
@@ -58,7 +65,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{{AGENT_INFRA_PATH}}/scripts/objective-reminder.sh</string>
+        <string>{{HOME}}/.pi/agent/scripts/objective-reminder.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

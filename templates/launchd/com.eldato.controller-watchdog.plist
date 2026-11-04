@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- agent-infra-plist-version: 0.1.0 -->
+<!-- agent-infra-plist-version: 0.2.0 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -88,7 +88,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/watchdog-loop.sh</string>
+        <string>{{HOME}}/.pi/agent/scripts/orchestrator-harness/watchdog-loop.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>

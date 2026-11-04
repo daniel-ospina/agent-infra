@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- agent-infra-plist-version: 0.1.0 -->
+<!-- agent-infra-plist-version: 0.2.0 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -32,11 +32,17 @@
          template: the ONLY plist in templates/launchd that plistlib refused, which silently demoted the
          install-time `verify_targets()` check to the PlistBuddy fallback. Keep prose here em-dashed.
 
-         ⛔ THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY, so the `<string>` resolves on a
-         fresh box (install-launchd.sh hard-fails a job whose target does not resolve, and that check
-         must not be defeated). {{AGENT_INFRA_PATH}} is this repo's MAIN checkout, worktree-safe, so a
-         passing worktree's teardown cannot leave this job pointing at nothing — the same choice
-         com.eldato.controller-watchdog makes.
+         ⛔ THE TARGET IS THE FARMED COPY, AND THAT IS THE WHOLE POINT. This template used to point
+         at the checkout (`{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/worker-supply.sh`), on the
+         argument that install-launchd.sh hard-fails an unresolvable target so a farmed copy "that may
+         not exist" was the riskier choice. MEASURED 2026-11-03: `AGENT_INFRA_PATH` is
+         `~/Documents/GitHub/agent-infra`, macOS TCC denies every launchd-spawned process access to
+         `~/Documents`, and this job respawned **1766 times** under `KeepAlive`, every start ending
+         `/bin/bash: …: Operation not permitted` — `last exit code=126` — while the inventory read
+         "loaded". A path that exists and cannot be READ is worse than a path that is absent, because
+         absence is refused loudly by `verify_targets` and unreadability is refused by nobody.
+         setup.sh's `fleet_srcs` array delivers this file (nested, so `$SELF_DIR`-relative sibling
+         resolution keeps working), and `verify_targets` now refuses a TCC-protected target too.
 
          ⛔ THE BOUNDS ARE IN THE PLIST, NOT INHERITED. A launchd job gets neither the operator's shell
          env nor its rc files, so an unset variable silently keeps the script's default — and for THIS
@@ -69,7 +75,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{{AGENT_INFRA_PATH}}/scripts/orchestrator-harness/worker-supply.sh</string>
+        <string>{{HOME}}/.pi/agent/scripts/orchestrator-harness/worker-supply.sh</string>
         <string>--loop</string>
     </array>
     <key>EnvironmentVariables</key>
