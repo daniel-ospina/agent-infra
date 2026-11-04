@@ -61,8 +61,16 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
                agent names: the box's own inventory, attributable to a name and a repo.
   3. READ      the repo's pool (`gh api …/actions/runners`): name, status, busy, labels.
   4. CLASSIFY  each local install — the ORDER of these checks is the safety property
-               OTHER-REPO  its `.runner` names a DIFFERENT repo. Checked FIRST: this repo's pool
-                         cannot see that registration at all, so the absence below would
+               CONFIG-LOST its `.runner` is present and EMPTY (0 bytes). Checked FIRST, before any
+                         pool comparison: the install has no agentName and no URL, so a slug
+                         comparison would read it OTHER-REPO and `pool.get("")` would answer
+                         ORPHANED — i.e. a `--replace` re-registration of a name that does not
+                         exist. Reported in `config_lost` and in `notes`, never repaired. Its
+                         LIVENESS is still measured (a truncated config does not stop a listener
+                         that is already up). A NON-empty unparseable config is NOT this state:
+                         it may still describe a live registration, so it aborts the pass.
+               OTHER-REPO  its `.runner` names a DIFFERENT repo. Checked before this repo's pool:
+                         the pool cannot see that registration at all, so the absence below would
                          otherwise read as ORPHANED and re-register it HERE with `--replace`,
                          deleting another repo's registration and cancelling its job. Reported,
                          never touched.
@@ -78,8 +86,10 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
                if it is demonstrably still offline is it re-registered (`--replace`), and an
                UNREADABLE pool is never treated as offline. ORPHANED → re-register under its own
                name with `--replace` (adopts the stale registration; never a duplicate), keeping
-               the labels it already carries. A BUSY, SERVING or OTHER-REPO runner is never
-               restarted, relabelled or removed.
+               the labels it already carries. A BUSY, SERVING, OTHER-REPO or CONFIG-LOST runner is
+               never restarted, relabelled or removed — CONFIG-LOST because the agent name a
+               re-registration needs is exactly what it lost, so the arm would act on an invented
+               name.
   6. FILL      while live < target: add ONE runner, printing `mem_available_mb` before and after,
                and stop if the next addition would leave < MEM_RESERVE_MB. A NEW install is
                created by the provisioner (`tools/install-ci-runner-x64.sh`, the one registration
@@ -168,6 +178,16 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
                                    nothing schedules the gate the floor stays disarmed (P1)
     RUNNER_AUTOSCALE_CRONTAB       `crontab` used to answer that question (default: on PATH; a TEST
                                    seam). A COMMENTED-OUT line is not a schedule
+
+  ⛔ `--json` CONSUMERS: `config_lost` is the ONLY machine-readable channel for an install whose
+  `.runner` was destroyed (a 0-byte file). It is a LIST of install directories, and it is
+  deliberately NOT a `problem`: `problems` sets `verdict="action-failed"` above the starvation
+  branch, so a standing lost slot reported there would DELETE `starvation` and return exit 3 on a
+  box that owes the starved exit 4 — the alarm muted by the condition it exists to report. It is
+  derived from the classification at record-build time, so it is present (and NAMES the slot) on
+  passes that stop early — a `--want` refusal included. Read it as "this slot is dead until a
+  human re-registers it", not as "the box is short a runner": its listener may still be live and
+  still counted in `running`/`live`.
 
   ⛔ `--json` CONSUMERS: `starvation` is THREE-VALUED and the healthy value is `"ok"`. `"starved"` is
   the alarm; `"unmeasured"` means the queue could not be read and the invariant was NOT evaluated —
@@ -1676,8 +1696,10 @@ def _clear_local_config(directory: Path) -> dict[str, tuple[int, bytes]]:
     it back exactly as it was.
 
     ⛔ Safe only where it is called from: `register()` is reached for DEAD and ORPHANED installs
-    only — the classifier never repairs a BUSY, SERVING or OTHER-REPO runner — so nothing that may
-    be serving a job loses its credentials.
+    only — the classifier never repairs a BUSY, SERVING, OTHER-REPO or CONFIG-LOST runner — so
+    nothing that may be serving a job loses its credentials, and nothing whose identity is GONE
+    is put through a `--replace` on an empty name (which would delete these files and leave
+    nothing to re-register from).
     ⛔ And it is STASHED, not just deleted: if the re-registration then fails (no network, a spent
     token), the install would otherwise lose its `.runner`, become invisible to `discover()` — which
     requires it — and look FREE to the provisioner, which sends the next pass down the "fresh

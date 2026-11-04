@@ -4359,9 +4359,39 @@ def t57_empty_runner_config_does_not_abort_the_pass():
                 any(c["dir"] == lost and c["alive"] for c in record["runners"]),
                 f"…and the classified entry says so: {record['runners']}",
             )
+            # ⛔ THIS KEYS ON THE STATE, NOT ON THE DIRECTORY (review finding P1, re-verified).
+            # `would_repair` entries are `f"would repair {c['name']} ({c['state']})"`, and a
+            # CONFIG-LOST install's `name` is EMPTY — so the entry a repair-by-mistake appends reads
+            # `would repair  (CONFIG-LOST)` and NEVER contains the install's directory. The earlier
+            # `lost in w` form was therefore satisfied BY CONSTRUCTION: it stayed green with the
+            # repair-loop guard deleted, i.e. it guarded nothing while reading like the assertion
+            # that protects the destructive arm. The paired mutation below is what proves it bites.
             check(
-                not any(lost in w for w in record["would_repair"]),
+                not any("(CONFIG-LOST)" in w for w in record["would_repair"]),
                 f"it must never reach the re-registration arm: {record['would_repair']}",
+            )
+            # ⛔ AND THE DESTRUCTIVE ARM IS SHOWN UNREACHED FOR REAL, not only in `would_repair`. A
+            # dry run never executes a repair, so `would_repair` alone cannot demonstrate that
+            # `config.sh --replace` was never invoked on the empty name — nor that
+            # `_clear_local_config` did not DELETE the credentials on the way there (it unlinks
+            # before `config.sh` runs, and only restores on failure). Measured with the guard
+            # removed: `config.sh --name  --labels self-hosted-x64 --replace`.
+            real = converge(box, nproc="8", want=2, dry_run=False)
+            check(
+                not [c for c in box.calls("config-calls.log") if "argv=" in c],
+                f"`config.sh` must never be invoked on the empty name: {box.calls('config-calls.log')}",
+            )
+            check(
+                all(
+                    os.path.exists(os.path.join(lost, n))
+                    for n in (".runner", ".credentials", ".credentials_rsaparams")
+                ),
+                "the config AND its credentials must survive a real pass — the destructive arm "
+                f"unlinks them before `config.sh` runs: {os.listdir(lost)}",
+            )
+            check(
+                real.get("config_lost") == [lost],
+                f"a real pass names the lost slot too: {real.get('config_lost')}",
             )
             check(
                 record["verdict"] not in ("unmeasurable",),
@@ -5213,6 +5243,22 @@ MUTATIONS = [
         '            record["unverified_cause"] = "disk-unreadable-midpass"',
         '            record["unverified_cause"] = "mid-pass-measurement"',
         "the mid-pass disk failure loses its own cause, so the rendered error blames an install",
+    ),
+    # ── the CONFIG-LOST exemption: its only guard on the DESTRUCTIVE arm (#3355 review P1) ─────────
+    Mutation(
+        "T57",
+        '        if c["state"] == "CONFIG-LOST":\n'
+        "            # Reported (in `record[\"config_lost\"]` + `notes`, both filled at record-build time) and\n"
+        "            # never repaired: `register(..., repo)` needs the agent name this install no longer has,\n"
+        "            # so a repair would either invent a new name or `--replace` on a name it guessed.\n"
+        "            continue",
+        '        if False:  # MUTATION: a CONFIG-LOST install falls through to the repair arm\n'
+        "            continue",
+        "a lost-config install reaches `register(..., --replace)` under the EMPTY agent name it no "
+        "longer has — measured `config.sh --name  --labels self-hosted-x64 --replace` — and "
+        "`_clear_local_config` permanently deletes `.credentials` and `.credentials_rsaparams` on "
+        "the way, so the one class of install that cannot re-register is also the class that loses "
+        "the key a human needs to re-register it",
     ),
 ]
 
