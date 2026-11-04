@@ -592,7 +592,7 @@ n_bound=$(grep -c 'tb_timeout 15 git -C "$root" push' "$GATE" 2>/dev/null)
 n_sym=$(grep -c 'tb_timeout 15 git -C "$root" ls-remote --symref' "$GATE" 2>/dev/null)
 n_ver=$(grep -c 'tb_timeout 5 git -C "$root" ls-remote --heads' "$GATE" 2>/dev/null)
 [ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
-  && ! grep -E 'git -C "\$root" push' "$GATE" 2>/dev/null | grep -qv 'tb_timeout'; rcn14=$?
+  && [ "$(awk '/^lane_end_push\(\)/,/^}/' "$GATE" | grep -E 'git -C "\$root" (push|fetch|ls-remote)' | grep -cv 'tb_timeout')" = 0 ]; rcn14=$?
 ck "N14 …all three network calls are BOUNDED (15/15/5) and no unbounded push exists in the exit path" $rcn14
 # ⛔ N15 — THE HUB REFUSAL IS READ, NOT INHERITED (review cycle 4, gap 3: F7 executes the shape but no arm
 # ever greps `refused-main-checkout`, so deleting the block left the suite green — the merge-gate bypass
@@ -616,12 +616,37 @@ PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
 arm "$O/logs/cloneref.log"
 ck "N16 …with the remote silent, the clone's refs/remotes/origin/HEAD still refuses the renamed default (trunk not moved) [$(tail -1 "$O/logs/cloneref.log" 2>/dev/null | cut -c1-90)]" \
   $(grep -q 'refused-protected' "$O/logs/cloneref.log" && ! git -C "$BARE" rev-parse -q --verify refs/heads/trunk >/dev/null 2>&1 && echo 0 || echo 1)
-# ⛔ N17 — NO FORBIDDEN VERB ON ANY EXIT BRANCH (review cycle 4, gap 4). The dangerous direction is a
-# `--force` on the refusal/failure path: a dying lane reverting a peer's merged head. D3 only proves the
-# happy path was a fast-forward, so a force on the failure branch was invisible.
-awk '/^lane_end_push\(\)/,/^}/' "$GATE" | grep -q -- '--force' && rcn17=1 || rcn17=0
-awk '/^terminal_wip_rescue\(\)/,/^}/' "$GATE" | grep -qE 'git +stash|worktree +remove|worktree +prune|reset +--hard' && rcn17=1
-ck "N17 …the exit path carries no --force, no git stash, no worktree removal/prune, no reset --hard" $rcn17
+# ⛔ N17 — NO FORBIDDEN VERB ON ANY EXIT BRANCH (review cycle 4, gap 4; STRENGTHENED after cycle 5 proven
+# by mutation: `--force` was caught but `-f` and the `+HEAD:refs/heads/…` force-by-refspec spelling were
+# NOT, and `git +stash` required the verb adjacent to `git` while every call in this file is
+# `git -C "$root" …`). The scan matches the file's own idiom and all three force spellings.
+exit_fn=$(awk '/^lane_end_push\(\)/,/^}/' "$GATE"; awk '/^terminal_wip_rescue\(\)/,/^}/' "$GATE")
+# Comment lines are STRIPPED first: the code's own prohibitions name these verbs ("no `--force`, no
+# `git stash`"), so scanning prose would make the arm red on a correct file — the mirror of the
+# false-negative it exists to prevent.
+exit_code_only=$(printf '%s\n' "$exit_fn" | grep -v '^[[:space:]]*#')
+n_force=$(printf '%s\n' "$exit_code_only" | grep -cE 'push.*(--force|(^| )-f( |$)|\+HEAD|\+refs)')
+n_destructive=$(printf '%s\n' "$exit_code_only" | grep -ciE 'stash|worktree +(remove|prune)|reset +--hard')
+[ "$n_force" = 0 ] && [ "$n_destructive" = 0 ]; rcn17=$?
+ck "N17 …the exit path carries no force (--force, -f, or a +refspec) and no stash/worktree-removal/reset --hard, on ANY branch" $rcn17
+# ⛔ N19 — THE R6 PROPERTY BEHAVIOURALLY, NOT BY SPELLING (review cycle 5, gap 1). A scan proves a verb is
+# absent; it cannot prove a DIVERGENT branch is refused rather than overwritten. The dangerous direction —
+# a dying lane reverting a peer's merged head — is exactly the non-fast-forward case, and D3 only proves
+# the happy path was a fast-forward.
+git -C "$WT" worktree add -q "$TMP/wt6" -b diverged 2>/dev/null
+git -C "$TMP/wt6" commit -q --allow-empty -m base 2>/dev/null
+git -C "$TMP/wt6" push -q origin diverged 2>/dev/null
+base_sha=$(git -C "$BARE" rev-parse refs/heads/diverged 2>/dev/null)
+git -C "$TMP/wt6" update-ref refs/heads/diverged "$seed2" 2>/dev/null
+git -C "$TMP/wt6" commit -q --allow-empty -m divergent 2>/dev/null
+O="$O" bash -c '
+  . "$1"
+  lane_end_push "diverged" "$2" "$3" diverged 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$O/logs/diverged.log" "$TMP/wt6" 2>/dev/null > "$TMP/diverged.out"
+grep -q 'push=FAILED' "$TMP/diverged.out" 2>/dev/null \
+  && [ "$(git -C "$BARE" rev-parse refs/heads/diverged 2>/dev/null)" = "$base_sha" ]; rcn19=$?
+ck "N19 …a DIVERGENT branch is refused and the remote sha is UNMOVED (never forced, never rewound) — measured: $(head -1 "$TMP/diverged.out" | cut -c1-40)" $rcn19
 # ⛔ N18 — THE SILENT-WRITE RULE IS LOUD ON THE mkdir/mktemp BRANCHES TOO (review cycle 4, gap 5): N9 sends
 # the log to /dev/null, so those two lines could go silent and stay green.
 mkdir -p "$TMP/ro"
