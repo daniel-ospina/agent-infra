@@ -684,7 +684,7 @@ if [ "$N" -lt 1 ] || [ "$COPIED" -ne "$N" ] || [ "$VERIFIED" -ne "$N" ]; then
   exit 1
 fi
 
-log_line "$PROG: VERIFIED — $VERIFIED/$N file(s) written by this run and byte-identical to $SRC"
+print_note "$PROG: VERIFIED — $VERIFIED/$N file(s) written by this run and byte-identical to $SRC"
 if [ "$MODE_UNSET" -gt 0 ]; then
   # The bytes are verified; the MODE is not. Said here because the line above is what an operator quotes.
   log_line "$PROG: ⚠️  mode NOT set from the source for $MODE_UNSET file(s) (no usable 'stat' on this host) — only the executable bit was restored; do not read this verdict as 'the mode is the source's'"
