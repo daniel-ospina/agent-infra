@@ -609,10 +609,25 @@ echo "── F. wiring pins ─────────────────�
 # fixes the signal defect. So the three facts that carry the behaviour are pinned separately, each
 # independently falsifiable: the trap is installed, the function it names really reaps, and the
 # signals that actually kill a lane reach it.
-if grep -qE '^[[:space:]]*trap .lane_exit_cleanup. EXIT' "$HARNESS/lane.sh"; then
+if grep -qE '^[[:space:]]*trap .lane_exit_trap. EXIT' "$HARNESS/lane.sh"; then
   ok "lane.sh reaps its own worktree from an EXIT trap"
 else
-  bad "lane.sh has no EXIT trap naming lane_exit_cleanup — an exiting lane leaves its venv behind"
+  bad "lane.sh has no EXIT trap naming lane_exit_trap — an exiting lane leaves its venv behind"
+fi
+# ⛔ THE EXIT TRAP NAMES A DISPATCHER NOW (agent-infra#3331), so the pin follows it: `lane_exit_trap` is
+# the one body that runs the cleanup AND the terminal `outcome=` line, and it reaches `lane_exit_cleanup`.
+# Pinning the dispatcher alone would be a spelling pin again — a `lane_exit_trap` that stopped calling
+# the cleanup would stay green — so the second arm asserts the edge.
+# ⛔ AND THE EDGE ARM MATCHES AN INVOCATION, NOT A SUBSTRING (review round 2, P2, measured): both bodies
+# contain `lane_exit_cleanup` in their own `command -v lane_exit_cleanup` GUARD, so a plain
+# `grep -qF lane_exit_cleanup` stayed green with the CALL replaced by `:` — the pin claimed "the edge, not
+# just the name" while testing the name. Anchoring the pattern to a line that STARTS the call is what
+# makes the mutation visible.
+if awk '/^lane_exit_trap\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$HARNESS/lane.sh" \
+     | grep -qE '^[[:space:]]*lane_exit_cleanup([[:space:]]|$)'; then
+  ok "…and that trap's body really calls lane_exit_cleanup (the edge, not just the name)"
+else
+  bad "lane_exit_trap does not call lane_exit_cleanup — the EXIT trap reaps nothing"
 fi
 if awk '/^lane_exit_cleanup\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$HARNESS/lane.sh" \
      | grep -qF 'reap_lane_venv "$LANE_WT" "lane $N"'; then
@@ -623,20 +638,42 @@ fi
 # The signal half is the load-bearing half: `tmux kill-session`, an operator's `kill -HUP`, and a
 # Ctrl-C all bypass an EXIT trap, so each needs its OWN handler (a shell killed by a signal with only
 # an EXIT trap runs nothing). One assertion per signal, so a handler lost later names the signal.
+# ⛔ EACH HANDLER NAMES `lane_terminate` SINCE agent-infra#3331 — the one body that records
+# `died reason=signal:<SIG>`, runs the cleanup, writes the terminal line and exits with the signal's
+# status. So the pin follows the edge: the trap names the handler AND the handler reaches the cleanup.
+if awk '/^lane_terminate\(\) \{/{f=1} f{print} f&&/^\}/{exit}' "$HARNESS/lane.sh" \
+     | grep -qE '^[[:space:]]*lane_exit_cleanup([[:space:]]|$)'; then
+  ok "…and the signal handler really calls lane_exit_cleanup (the edge, not just the name)"
+else
+  bad "lane_terminate does not call lane_exit_cleanup — a signal-killed lane reaps nothing"
+fi
 for _sig in HUP TERM INT; do
-  if grep -qE "^[[:space:]]*trap .*lane_exit_cleanup.* ${_sig}$" "$HARNESS/lane.sh"; then
+  if grep -qE "^[[:space:]]*trap .*lane_terminate.* ${_sig}$" "$HARNESS/lane.sh"; then
     ok "…and a ${_sig} reaches it (a signal-killed lane reaps too)"
   else
-    bad "no ${_sig} handler reaches lane_exit_cleanup — a ${_sig}'d lane keeps its venv and worktree"
+    bad "no ${_sig} handler names lane_terminate — a ${_sig}'d lane keeps its venv and worktree"
   fi
 done
-# ⛔ AND A DRY RUN MUST DISARM ALL FOUR TRAPS, not just EXIT: the cleanup is now reachable from the
-# signal handlers, so an armed HUP/TERM would let a Ctrl-C in a preview run the very deletion the
-# dry-run guard exists to prevent (a preview that removes a build artifact is the defect).
-if grep -qE '^[[:space:]]*trap - EXIT INT TERM HUP[[:space:]]*$' "$HARNESS/lane.sh"; then
-  ok "…and a dry run disarms every trap that could reach the cleanup (a preview deletes nothing)"
+# ⛔ A DRY RUN MUST NOT RUN THE CLEANUP — and this pin asserts THE PROPERTY, because the spelling it
+# used to match has moved (review P2, measured). It required `trap - EXIT INT TERM HUP` as its own line,
+# which after agent-infra#3331 matches the trap-clear inside `lane_terminate` — a line that has nothing to
+# do with a preview — so it printed ✅ while the dry-run no-delete property was pinned by NOTHING: delete
+# the `LANE_CLEANUP_DISABLED` flag and every suite stayed green while `LANE_DRY_RUN=1` started reaping
+# worktrees again. A preview that removes a build artifact is the defect #2148 exists to prevent, so the
+# flag, its setting under LANE_DRY_RUN, and BOTH guards that honour it are pinned here.
+if grep -qE '^[[:space:]]*if \[ "\$\{LANE_DRY_RUN:-0\}" = "1" \]; then$' "$HARNESS/lane.sh" \
+   && awk '/LANE_DRY_RUN:-0.*=.*"1"/{f=1} f&&/LANE_CLEANUP_DISABLED=1/{found=1} f&&/^fi$/{exit} END{exit !found}' "$HARNESS/lane.sh"; then
+  ok "…and a dry run DISARMS the cleanup (LANE_DRY_RUN=1 sets LANE_CLEANUP_DISABLED=1, so a preview deletes nothing)"
 else
-  bad "lane.sh's dry-run branch does not clear all four traps — a Ctrl-C in LANE_DRY_RUN=1 would run the cleanup"
+  bad "lane.sh's dry-run branch does not disarm the cleanup — a preview could run a deletion"
+fi
+# …and EVERY path that can reach the cleanup honours that flag: the EXIT trap AND the signal handlers.
+# One missing guard is one armed path, so the count is asserted rather than the presence.
+_cleanup_guards="$(grep -c 'LANE_CLEANUP_DISABLED' "$HARNESS/lane.sh")"
+if [ "${_cleanup_guards:-0}" -ge 3 ]; then
+  ok "…and every path into it honours the flag (${_cleanup_guards} occurrences: set + EXIT guard + signal guard)"
+else
+  bad "only ${_cleanup_guards} occurrence(s) of LANE_CLEANUP_DISABLED — a path into the cleanup is unguarded, so a preview can delete"
 fi
 if grep -qF 'reap_lane_venv "$WT" "fix $PR"' "$HARNESS/fix-one.sh"; then
   ok "fix-one.sh reaps its worktree"
