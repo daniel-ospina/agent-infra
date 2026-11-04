@@ -2313,7 +2313,7 @@ if [ -d "$DELTA_REPO" ]; then
   # arm below became unreachable for exactly the shape it was written for. Each PR was green in
   # isolation; only the merged tree shows it. MEASURED RED before the fix.
   # ⛔ "MALFORMED", NOT "ABSENT": a delta-over-delta LEGITIMATELY inherits a well-formed range from
-  # a predecessor whose evidence was `delta:A..B` (the `elif` arm at scripts/record-review.sh:4788
+  # a predecessor whose evidence was `delta:A..B` (the `elif` arm that inherits a `delta:` claim
   # copies it, and its own doc-comment demands that it do so). This fixture verifies no range, so
   # ABSENCE is what it must see — but the pin must not call the inherited shape a defect, or it
   # invites reverting to the vacuous `[ -z … ] ||` form that cannot fail on an empty record.

@@ -4728,7 +4728,8 @@ if [ -n "$CARRY_ARM" ] && [ -z "$EVIDENCE_VERIFIED" ]; then
   CARRY_EVIDENCE=""
   # ⛔ READ THE RECORD THE ARM ACTUALLY RESOLVED (agent-infra#3401 review, twice-found).
   # `--delta` mirrors `--check-carry`'s lookup and legitimately accepts the LEGACY key
-  # `$D_DIR/$PR.json` when the repo-qualified file is absent (`D_REC`, :2104-2110) — but the
+  # `$D_DIR/$PR.json` when the repo-qualified file is absent (the `D_REC` resolution in the
+  # `--delta` block) — but the
   # predecessor reads here and below used `$FILE` only, so a legacy-only predecessor (a record
   # minted before the #426 qualified-key migration, or one written when repo detection failed)
   # was refused as "the superseded record carries no evidence" — FALSE: the record the run just
