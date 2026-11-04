@@ -344,6 +344,38 @@ already held, one opened a duplicate PR — both brief defects, not lane defects
 
 ---
 
+## ⛔ THE GRAPH IS MANDATORY — read, confirm, write
+
+**The hosted Tortoise graph is the fleet's shared memory: what we measured, what we refuted, what we decided.** Owner mandate (2026-11-02): *"so we can stop re-discovering the same thing 10 times"*. Three moments, every lane, every task large enough to research:
+
+1. **READ before you research.** `search` the graph for the task's own words before searching anywhere else, and to check system state and previous work. A root that is already in the graph is not re-derived.
+2. **CONFIRM DIRECTION before you dispatch or start building** — create/link the point that says what this task is for, *unless a very recent point for the same task already does* (same task, days not months, and it still describes the work).
+3. **WRITE after you finish** — the measurement, the refutation, the root cause, the dead end. **Read the write skill first: `skills/how-to-use-tortoise/SKILL.md`.** One claim per point; a finding needs a **number or a source** — `tortoise-graph.sh evidence` refuses one with no digit.
+
+```bash
+# ⛔ THE FARMED PATH IS THE ONE THAT ALWAYS EXISTS. `pi-bootstrap/setup.sh`'s `fleet_srcs` declares
+# these two files, so any box that has run the farm (or a cell that ran `cell-install.sh`) carries them
+# at `$HOME/.pi/agent/scripts/`, with no checkout required.
+# The repo-relative form below resolves only where `scripts/` IS A REAL TRACKED TREE. Where `scripts/`
+# is the machine-local pointer instead (⛔ a gitignored symlink, never tracked — tortoise#9475), a
+# fresh worktree has none until it is materialised there — and that materialiser is a CONSUMER-REPO tool
+# (`uv run python tools/link_agent_infra_scripts.py` in tortoise's checkout), not one that exists here.
+# Measured 2026-11-03 in a tortoise worktree, which had no `scripts/` at all and returned
+# `No such file or directory` for the repo-relative form.
+bash ~/.pi/agent/scripts/tortoise-graph.sh health          # is the graph up
+bash ~/.pi/agent/scripts/tortoise-graph.sh search 'attestation staleness'
+bash ~/.pi/agent/scripts/tortoise-graph.sh get <point-id>
+bash ~/.pi/agent/scripts/tortoise-graph.sh evidence 'MEASURED: …' [--to ID] [--pred supports]
+bash ~/.pi/agent/scripts/tortoise-graph.sh decision 'DECIDED: …' [--to ID]
+# SHORTCUT, only where the `scripts/` pointer resolves to the agent-infra scripts tree
+# (tortoise ships it; a linked worktree does not until you materialise it):
+#   bash scripts/tortoise-graph.sh <same verbs>
+```
+
+**Reachability rule.** If the graph cannot be reached, say so out loud — `GRAPH-UNREACHABLE(<cmd + error>)` — and continue the task. **Never silently switch graphs** (a local graph is **not** a substitute: a lane that reads a different graph reaches an answer nobody else can reproduce), and **never silently skip the write** (an unwritten learning is the re-discovery this rule exists to stop). The primitive resolves the key **at call time**, so it works in a long-lived process whose MCP entry pinned an empty bearer; if the key is absent, report it — do not fall back.
+
+---
+
 ## Debugging Discipline
 
 When encountering any bug, test failure, or unexpected behavior:

@@ -401,6 +401,11 @@ ck "…and the run does NOT claim no deployed dir was present (it is present)" \
    "$(qF "no deployed dir was present to check" "$OUT" && echo 1 || echo 0)"
 ck "…and it says $O could NOT be identified, so its bytes were NOT verified against a record" \
    "$(qF "could NOT be identified" "$OUT" && echo 0 || echo 1)"
+# ⛔ THIS CLEAN ARM EMITS THE TOKEN TOO (round 21, P2). It is the second of the three clean exits, and
+# the only one a FARMed or operator-synced box ever reaches; without the token the pass recorded
+# `drift=clean:rc=0` and the documented `clean:current` was unreachable on exactly that population.
+ck "…and this clean exit also carries harness=current, not a bare rc=0" \
+   "$(qF "harness=current" "$OUT" && echo 0 || echo 1)"
 
 echo
 echo "── §9f a pathless manifest line is CANNOT-VERIFY here too, not a MISSING named after a hash ──"
@@ -426,10 +431,17 @@ echo
 echo "── §9g a run with NO \$O compared answers harness=surface, and says nothing was identified ──"
 # ⛔ THIS GRADES A POPULATION NO ASSERTION COVERED BEFORE (review of #3090). When `$O` is absent (or a
 # `--surface` run finds no readable record for one) every question about `$O` abstains, and the token
-# block only runs at all because the SURFACE pass raised `problems` — so the token here names the OTHER
-# dir's drift and says nothing about `$O`. §5b grades the other `surface` shape (a clean `$O` plus a
+# block only runs at all because the SURFACE pass raised `problems` — so the token names a real drift in
+# a copy this box carries. ⛔ But NOT necessarily "the OTHER dir": with no record `$O` has no surface
+# exclusion, so an `$O` that drifted is itself the dir the `surface:` line names and the token is about
+# it (measured; the fixtures here use an ABSENT `$O`, which is why this assertion is sound either way).
+# §5b grades the other `surface` shape (a clean `$O` plus a
 # hit in another dir) and §9e runs with the surface candidates CLEAN, so it reaches the OK summary and
-# prints no token at all. Nothing stated what THIS shape's token is, which is why the README could
+# prints `harness=current` (⛔ it is NOT "no token at all" — that was THIS arm's state until round 21,
+# which is when its assertion arrived (`df1afa843`); round 17 gave the token to the `O_ABSENT -eq 0`
+# arm only, so the two arms changed four rounds apart and the round-17 note (`:468-469`) is about the
+# OTHER one. Leaving the old wording here told a maintainer that a clean run is tokenless, which is
+# exactly the P0). Nothing stated what THIS shape's token is, which is why the README could
 # describe `surface` as `Q_BYTES=0`-gated. (This comment previously said the arm "emits `surface`
 # because NOTHING was compared" — false, and contradicted by its own fixture needing `c.sh` below:
 # `$O`-absent alone emits no token, so the run must have a surface hit to print one at all.)
@@ -450,19 +462,25 @@ ck "…the identity half reports SKIPPED for the absent \$O" "$(qF "identity: SK
 ck "…and the one-line answer is harness=surface" "$(qF "harness=surface" "$OUT" && echo 0 || echo 1)"
 ck "…and NOT payload-differs, which would name a question nothing asked" \
    "$(qF "harness=payload-differs" "$OUT" && echo 1 || echo 0)"
-# ⛔ AND THE COUNTER-CASE THAT SETTLES WHAT THE TOKEN MEANS (review of #3090, cycle 3): `$O`-absent
-# ALONE emits NO token at all. Without this arm the paragraph in README §4.3 could say the missing
-# `$O` "emits harness=surface" and pass every assertion — which is exactly how that wording drifted
-# twice. The token is printed only under `problems > 0`, so with $O absent it can ONLY come from a
-# surface hit; a clean surface pass reaches the OK summary and stamps nothing.
+# ⛔ AND THE COUNTER-CASE THAT SETTLES WHAT THE TOKEN MEANS (review of #3090, cycle 3; corrected in
+# round 21): what this arm must prove is that the CLEAN path never FABRICATES a DRIFT token — the
+# `surface` value in particular — because that is the reading a redeploy decision gets made on. It used
+# to assert the absence of `harness=` entirely, which was true only before the `O_ABSENT -eq 0` clean arm
+# was given `harness=current` (round 17), and which left the documented `drift=clean:current` unreachable
+# on the other two clean exits: `harness-apply-pass.sh` fell through its reader to `clean:rc=0`, so
+# anything keyed on the documented value could never fire there. The clean exits now ALL carry
+# `harness=current` — the token answers "what state is the deployed tree", and `current` is the answer.
+# The drift-naming claim this arm exists for is kept explicitly: `surface` must NOT appear.
 no_o_clean="$TMP/clean-absent"; rm -rf "$no_o_clean"; mkdir -p "$no_o_clean"
 cp "$SRCDIR/a.sh" "$SRCDIR/b.sh" "$no_o_clean/"
 OUT="$( cd "$TMP" && HOME="$TMP/emptyhome" CELL_HOME="" HARNESS="$no_o_clean" HARNESS_PIN_DIR="" \
         HARNESS_PIN_FILE="" DRIFT_PS="$TMP/ps-stub" \
         bash "$DRIFT" --o "$absent_O" --repo "$REPO" --ref main --rel scripts/orchestrator-harness --no-fetch --surface 2>&1 )"; RC=$?
 ck "…with \$O absent and a CLEAN surface pass: rc 0 (nothing differs)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
-ck "…and it stamps NO harness= token at all (the token names a drift; there is none)" \
-   "$(qF "harness=" "$OUT" && echo 1 || echo 0)"
+ck "…and the clean path carries the documented token harness=current (not the reader's rc=0 fallback)" \
+   "$(qF "harness=current" "$OUT" && echo 0 || echo 1)"
+ck "…and it fabricates NO drift token on a clean pass (harness=surface names a drift; there is none)" \
+   "$(qF "harness=surface" "$OUT" && echo 1 || echo 0)"
 
 echo
 echo "── §10 THE EXECUTING TREE: read from the PROCESS, never from a record about it (#10114) ──"
@@ -525,6 +543,186 @@ ck "10a: the one-line token is harness=executes:<dir>, not a token about a copy 
 ck "10a: …and it is NOT harness=surface (that token's remedy, reseeding a dir, cannot clear a gone tree)" \
    "$(qF "harness=surface" "$OUT" && echo 1 || echo 0)"
 ck "10a: the verdict says a redeploy of \$O does not clear it" "$(qF "does not clear it" "$OUT" && echo 0 || echo 1)"
+# (10a-2/10a-3) THE INVOCATION PREDICATE IS PINNED IN BOTH DIRECTIONS (agent-infra#10114, review P1).
+# Both directions used to fail SILENTLY GREEN: every fixture here spells the invocation with an
+# interpreter, and the only mention fixture was the `bash -c` TEXT form. That was tolerable while the
+# token was cosmetic; this lane makes an `executes:` token turn a SUCCESSFUL pass into rc 1, so a
+# predicate that fabricates a controller reds a healthy box on a timer, and one that drops a real
+# controller restores #10114's silent green.
+# (10a-2) argv[0] is a direct shebang exec — a real invocation, with no interpreter to lean on.
+printf '4252 %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-argv0"
+surf "$TMP/ps-argv0"
+ck "10a-2: a controller exec'd directly (argv[0], no interpreter) is still an INVOCATION" \
+   "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+# (10a-3) A mere MENTION of the absolute path is NOT an invocation: `grep -n x <abs>/orch-loop.sh` is
+# routine agent traffic, and reading it as "this process EXECUTES that tree" is the fabrication.
+printf '4253 grep -n x %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-mention"
+surf "$TMP/ps-mention"
+ck "10a-3: grep on an ABSOLUTE orch-loop.sh path does NOT fabricate a controller" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+ck "10a-3: …it is reported as a MENTION instead, so the fact is not lost" \
+   "$(qF "MENTIONS an orch-loop.sh" "$OUT" && echo 0 || echo 1)"
+# (10a-3b) A WORD THAT MERELY *LOOKS* LIKE AN INTERPRETER IS STILL A MENTION (review round 12, P1).
+# `_interp` used to be ARMED by any word spelled like a shell, at any position — so the grep PATTERN
+# nominated the next absolute path as the executing script. Measured on the round-11 head: every form
+# below produced `executes:` on a box running no controller, which (once #10114 makes the token red a
+# pass and durable in `drift=`) exits 1 on a HEALTHY box with a false diagnosis. `x` above did not
+# catch it because `x` is not a shell name — the class was pinned by one non-shell word only.
+for _pat in sh bash env zsh dash busybox; do
+  printf '4256 grep -n %s %s/orch-loop.sh\n' "$_pat" "$GONE" > "$TMP/ps-pat-$_pat"
+  surf "$TMP/ps-pat-$_pat"
+  ck "10a-3b: a grep PATTERN spelled '$_pat' does NOT fabricate a controller" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+# …and the same for an OPTION-introduced pattern, which used to be the keep-arm's blind spot.
+printf '4257 grep -i env %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-pat-opt"
+surf "$TMP/ps-pat-opt"
+ck "10a-3b: 'grep -i env <abs>' does NOT fabricate a controller" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+# (10a-3b2) THE MENTION CLASS BEHIND A WRAPPER (review round 13, P1 — round 12's fix was MEASURED to
+# still fabricate here). Round 12 only pinned `grep` in argv[0] position, so two holes stayed open:
+# `env` was in the ARMING list (it is a WRAPPER, not an interpreter), and the wrapper's operand slots
+# were consumed by the CHILD COMMAND and its arguments rather than by the wrapper's own operands. Both
+# nominated `<GONE>/orch-loop.sh` as the executing tree on a box running no controller — and
+# `timeout 300 grep -n sh <pin>/…/orch-loop.sh` is literally the recon command an agent runs over a
+# deployed tree. Each form below is now a MENTION.
+for _adv in "env cat" "env vim" "env grep -n foo" "cat" "vim" \
+            "timeout 300 grep -n sh" "nice -n 5 grep -n sh" "sudo -u deploy grep -n sh" \
+            "stdbuf -o0 grep -n sh" "nohup grep -n sh" "env FOO=bar cat" \
+            "timeout 300 bash -x other.sh" \
+            "sudo -n grep -n sh" "sudo -E grep -rn bash" "sudo -H grep -n sh" \
+            "env -i grep -n sh" "env -v grep -n /bin/sh" "nice -5 grep -n sh" \
+            "command -v grep -n sh" "timeout 300 -- grep -n sh" "sudo -- grep -n sh"; do
+  printf '4259 %s %s/orch-loop.sh\n' "$_adv" "$GONE" > "$TMP/ps-adv"
+  surf "$TMP/ps-adv"
+  ck "10a-3b2: '$_adv <abs>/orch-loop.sh' is a MENTION, not a controller" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+# (10a-3c) THE PREFIX MUST SURVIVE A WRAPPER'S OPERANDS (review round 12). The fix for 10a-3b must not
+# cost these: they are measured launcher shapes and each is a REAL invocation.
+for _w in 'nice -n 5 /bin/bash' 'timeout 300 bash' 'sudo -u deploy bash' 'stdbuf -o0 bash' 'env bash' \
+          'stdbuf -o L bash' 'sudo -E -u deploy bash' 'env FOO=bar bash' 'bash -lc' \
+          'sudo --user deploy bash' 'timeout --signal KILL 300 bash'; do
+  printf '4258 %s %s/orch-loop.sh\n' "$_w" "$GONE" > "$TMP/ps-wrap"
+  surf "$TMP/ps-wrap"
+  ck "10a-3c: '$_w <abs>/orch-loop.sh' is still an INVOCATION" \
+     "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+done
+# (10a-3e) LAUNCHERS THE ROUND-13 REWRITE SILENTLY LOST (review round 14, P1/P2). Both were ARMED on
+# d708e68ea and became a MENTION on the round-13 head — a live controller on a GONE tree reported as
+# nothing at all, which is the silent green #10114 exists to end. Each is a canonical spelling:
+#   • `sudo -iu <user> bash` / `sudo -Eu <user> bash` — a COMBINED cluster ending in a value letter,
+#     which the bare-2-char claim rule did not recognise, so the user name was read as the COMMAND.
+#   • `sudo -c <class> bash` — the `-c` arm fired on the WRAPPER's own option and ate the interpreter.
+# They are discriminating: each is `text` on the round-13 head and ARMED here.
+for _r in 'sudo -iu deploy bash' 'sudo -Eu deploy bash' 'sudo -c staff bash' \
+          'sudo -En bash' 'sudo -Hn bash' 'sudo -Sn bash' 'setsid -c bash' \
+          'sudo -n bash' 'sudo -S bash' 'sudo -k bash' 'doas -n bash'; do
+  printf '4261 %s %s/orch-loop.sh\n' "$_r" "$GONE" > "$TMP/ps-restored"
+  surf "$TMP/ps-restored"
+  ck "10a-3e: '$_r <abs>/orch-loop.sh' is still an INVOCATION (round-13/15 regression)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+done
+# ⛔ AND A WRAPPER **FLAG** MUST NOT BE CLAIMED AS IF IT TOOK A VALUE (review rounds 15-16, P1).
+# Round 14's cluster class included sudo's `n s k e S` — flags, not value-taking options — so
+# `sudo -En bash <abs>` claimed `bash` as `-En`'s operand and the launcher became a mention, and
+# `sudo -Hn grep bash <abs>` fabricated a controller out of a grep PATTERN. The same defect survived
+# in the SINGLE-LETTER arm (`sudo -n bash <abs>`), and `sudo -n` is this repo's default privilege
+# prefix in four installers — so the silent green was on the common path. These hold the fabricating
+# side; the INVOCATIONS that hold the other side are in 10a-3e above.
+for _f in 'sudo -Hn grep bash' 'sudo -En cat sh' 'sudo -n grep -n sh'; do
+  printf '4262 %s %s/orch-loop.sh\n' "$_f" "$GONE" > "$TMP/ps-flagcluster"
+  surf "$TMP/ps-flagcluster"
+  ck "10a-3e: '$_f <abs>/orch-loop.sh' is a MENTION (a wrapper FLAG claims no operand)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+# ⛔ A PARSE-ONLY RUN IS NOT AN EXECUTION (review round 17, P2). `bash -n <abs>`, `sh -n`, `-D` and any
+# short cluster containing `n` (but NOT a wrapper's `-n`, which is ordinary sudo) read the script
+# without running it — the INVERSE of the fact `executes:` asserts — yet they nominated the path and
+# reddened a healthy box with a durable `drift=drift:executes:`. `bash -o noexec <abs>` was already a
+# mention, so one fact had two grades; `_noexec` closes the split.
+# ⛔ A SHELL NAME AFTER THE COMMAND PREFIX IS A MENTION, AND A SHELL'S VALUE OPTION IS NOT A FLAG
+# (review round 18, P1/P2). `echo sh -c <abs>` used to mark an interpreter as identified (the `_seen`
+# branch fired on any word spelled like a shell, at any position) and the `-c` arm then nominated the
+# path — a fabricated `executes:` from a mention. And `bash -o pipefail <abs>` was a MENTION because
+# every shell option was treated as a flag, so a real launcher on a GONE tree reported nothing.
+for _m in 'echo sh -c' 'ssh box sh -c' 'man sh -c'; do
+  printf '4264 %s %s/orch-loop.sh\n' "$_m" "$GONE" > "$TMP/ps-shmention"
+  surf "$TMP/ps-shmention"
+  ck "10a-3e: '$_m <abs>/orch-loop.sh' is a MENTION (no interpreter in command position)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+# ⛔ `-o noexec` IS A DIFFERENT MECHANISM FROM THE THREE ABOVE, SO IT GETS ITS OWN LABEL (review round
+# 19, P2): an interpreter IS in command position there; the mention comes from the shell forbidding
+# execution, not from a closed prefix. Sharing one label pointed a reader at the wrong block.
+# ⛔ AND ONLY THE MINUS FORM DISABLES EXECUTION: `+o noexec` turns noexec OFF, and `--rcfile noexec`
+# never disabled it, so those two are real executions and must stay INVOCATIONS.
+printf '4266 bash -o noexec %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-noexec"
+surf "$TMP/ps-noexec"
+ck "10a-3e: 'bash -o noexec <abs>' is a MENTION (the shell forbids execution)" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+# ⛔ THE CLUSTER FORM IS A DIFFERENT WORD, AND THE `_optv` VALUE IS WHAT MAKES IT MENTION (round 22,
+# P2). The `-o` arm hard-codes `_optv="-o"` precisely because `$_w` here is `-euo`, not `-o` — so the
+# noexec-value guard must not depend on the spelling that carried the `o`. Nothing graded that: the
+# `-o noexec` case above cannot discriminate, because there `$_w` == `-o` and `_optv="$_w"` would
+# agree. Mutation MEASURED: `_optv="$_w"` leaves the case above MENTION but flips
+# `bash -euo noexec <abs>` to INVOCATION — a fabricated `executes:` that also masks a real `behind:`,
+# since `executes:` leads the token chain — with the suite still 214/0. `-euo` is the canonical bash
+# strict-mode cluster, so the spelling is not exotic.
+printf '4267 bash -euo noexec %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-noexec-cluster"
+surf "$TMP/ps-noexec-cluster"
+ck "10a-3e: 'bash -euo noexec <abs>' is a MENTION (a cluster's noexec operand still forbids it)" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+# ⛔ `-c` IS OWNED BY THE SHELL THAT IS THE CURRENT COMMAND, NOT BY ANY EARLIER ONE (review round 19,
+# P2): `_seen` was never cleared, so `bash other.sh -c <abs>` and `busybox grep -c <abs>` nominated a
+# path that is a `$1`/grep operand — a fabricated `executes:` that also masks a real `behind:`.
+# ⛔ A VALUE-CLAIMING CLUSTER MUST NOT OPEN A FABRICATION (round 21, P1): the operand claim added for
+# `-euo pipefail` must not turn the `-c` string's trailing `$0` into a script path, which is the
+# 10a-4 fabrication one spelling along.
+for _x in 'bash other.sh -c' 'busybox grep -c' 'bash -c x -c' 'bash -lc x -c' 'bash -euo pipefail -c x'; do
+  printf '4267 %s %s/orch-loop.sh\n' "$_x" "$GONE" > "$TMP/ps-staleseem"
+  surf "$TMP/ps-staleseem"
+  ck "10a-3e: '$_x <abs>/orch-loop.sh' is a MENTION (a closed prefix owns no -c string)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+for _v in 'bash -o pipefail' 'bash -O extglob' 'bash +o noexec' 'bash +o errexit' 'bash --rcfile noexec' \
+          'bash -euo pipefail' 'bash -eo pipefail' 'bash -euxo pipefail'; do
+  printf '4265 %s %s/orch-loop.sh\n' "$_v" "$GONE" > "$TMP/ps-shopt"
+  surf "$TMP/ps-shopt"
+  ck "10a-3e: '$_v <abs>/orch-loop.sh' is an INVOCATION (a shell value option claims its operand)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+done
+for _p in 'bash -n' 'sh -n' 'bash -D' 'bash -en' 'bash -xn'; do
+  printf '4263 %s %s/orch-loop.sh\n' "$_p" "$GONE" > "$TMP/ps-parseonly"
+  surf "$TMP/ps-parseonly"
+  ck "10a-3e: '$_p <abs>/orch-loop.sh' is a MENTION (parse-only does not execute)" \
+     "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+done
+# (10a-4) A TRAILING PATH AFTER A `-c` STRING IS `$0`, NOT THE SCRIPT (review VGATE of round 8). The
+# `-c` arm advances past the command string, so an ordinary-word guard never sees it: `_interp` stayed
+# 1 for the rest of the argv and `bash -c 'sleep 30' <gone>/orch-loop.sh` fabricated `executes:` on a
+# healthy box. Reproduced against this script's own seams, and pinned here in both directions.
+printf '4254 bash -c sleep_30 %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-ctrail"
+surf "$TMP/ps-ctrail"
+ck "10a-4: a path AFTER a -c command string is \$0, never the executing tree" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+printf '4255 bash -c %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-cscript"
+surf "$TMP/ps-cscript"
+ck "10a-4: but 'bash -c <abs>/orch-loop.sh' IS an invocation and must still count" \
+   "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
+# (10a-5) A COMBINED SHORT OPTION INTRODUCES THE COMMAND STRING TOO (review round 9, P1). The arm
+# matched `-c` EXACTLY, so `bash -lc 'exec <path>/orch-loop.sh'` kept `_interp=1` for the command
+# string, which then matched the script patterns and fabricated `executes:` naming `<cwd>/exec …`.
+# `bash -lc '…'` is this repo's own operator idiom, and `executes:` is FIRST in the token chain, so
+# the fabricated token also MASKED a real `behind:`/`uncommitted-edit:` on the same box.
+printf '4256 bash -lc exec_%s/orch-loop.sh\n' "$GONE" > "$TMP/ps-lc"
+surf "$TMP/ps-lc"
+ck "10a-5: 'bash -lc exec <abs>/orch-loop.sh' is TEXT, not a fabricated controller" \
+   "$(qF "executes:$GONE" "$OUT" && echo 1 || echo 0)"
+printf '4257 bash -lc %s/orch-loop.sh\n' "$GONE" > "$TMP/ps-lcpath"
+surf "$TMP/ps-lcpath"
+ck "10a-5: but 'bash -lc <abs>/orch-loop.sh' IS an invocation (the path is the first word)" \
+   "$(qF "executes:$GONE" "$OUT" && echo 0 || echo 1)"
 # ⛔ AN EXEC-ONLY DRIFT IS NOT A SURFACE HIT (review of #3202). `drift_q exec` bumps `problems` from inside
 # the surface block, so `problems > SURF_BASE` was true for a gone executing tree ALONE — and the summary
 # then offered "reseed the copy the RUNNING component uses" directly above "(c) … does not clear it": a
