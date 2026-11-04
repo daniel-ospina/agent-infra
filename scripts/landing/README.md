@@ -267,8 +267,11 @@ measurement state:
 
 - `BLOCK — no run of the lane actually TESTED head <sha>` — the lane's run was queued or cancelled,
   so it exercised nothing;
-- `BLOCK — the lane '<lane>' never TESTED main, so there is no baseline` — main's side of the
-  comparison is empty, and an empty baseline absorbs nothing;
+- `BLOCK — BASELINE-INAPPLICABLE: the baseline lane '<lane>' never TESTED main, so there is no
+  baseline` — main's side of the comparison is empty, and an empty baseline absorbs nothing. The
+  state names the workflow it looked for and three remedies, in order: one lane that runs on both
+  sides (`--workflow` alone), a named base-side lane (`--baseline-workflow <main-lane>`), or — if
+  nothing measures main — the fact that this rail cannot judge it;
 - `no main-side measurement (PR <rate>) — NOT exempt` — main's baseline carries no measurement of
   that file, so absence is **not** exemption.
 

@@ -240,8 +240,9 @@ scripts/admin-merge.sh <PR> --squash
 #   non-empty → re-run the PR's failed jobs once (pass-on-retry = flaky, not new)
 #   residual non-empty → BLOCK: prints the list, exits non-zero, does NOT merge
 #
-# Both sides are lane-filtered to the same workflow (default `python-ci.yml`,
-# `--workflow` to override), and the rail BLOCKS unless the lane has actually
+# Both sides are lane-filtered (by default to the SAME workflow — `python-ci.yml`,
+# `--workflow` to move the PR side, `--baseline-workflow` to move the base side
+# independently; see below), and the rail BLOCKS unless the lane has actually
 # TESTED the head — a run that is queued, or one that finished `cancelled`,
 # exercised nothing, so an empty failing set would prove nothing.
 #
@@ -250,8 +251,34 @@ scripts/admin-merge.sh <PR> --squash
 # already red on main" — that claim IS a comparison, and an empty baseline
 # absorbs nothing, so a pre-existing failure would be charged to the PR. This
 # matters for repos that split their lanes by TRIGGER: agent-infra's `ci.yml` is
-# `pull_request`-only and `ci-main.yml` is `push`-only, so neither spans both
-# sides. Pass `--any-workflow` there to compare against every lane on main.
+# `pull_request`-only and `ci-main.yml` is `push`-only, so the PR lane has NO runs
+# on main BY CONSTRUCTION (`gh run list --branch main --workflow ci.yml` → `[]`)
+# and cannot be its own baseline. The rail reports that as the first-class state
+# `BASELINE-INAPPLICABLE` and names three remedies, in order of preference:
+#   1. ONE lane that runs on both sides — `--workflow <spanning-lane>` alone, no
+#      `--baseline-workflow`: both sides are then read from the one population that
+#      exists, exactly as the rail always did. This is the cheapest correct fix.
+#   2. `--baseline-workflow <main-lane>` — the workflow whose runs on the base
+#      branch form the BASELINE, named independently of `--workflow` (the PR's
+#      lane). agent-infra: `--workflow ci.yml --baseline-workflow ci-main.yml`.
+#      The value of two names is the PROVENANCE of the measurement: the reference
+#      is drawn from a lane that measures main, and the posted evidence says
+#      which one. (A widened union can reach a verdict too — it is the sample's
+#      composition, decided by whatever traffic main carries, that makes it the
+#      wrong population.)
+#   3. If NO workflow of the repo measures main, the rail CANNOT judge it and no
+#      flag changes that: it is a decision, not a knob. The audited
+#      `AGENT_ADMIN_MERGE_OVERRIDE=1` route is a BYPASS, not a wider sample.
+# `--any-workflow` cannot be supplied AS a baseline (`--baseline-workflow any` is
+# refused by name) and the refusal no longer OFFERS it as the way to one — but the
+# precise claim matters: with NO `--baseline-workflow`, `--any-workflow` still
+# supplies the base side exactly as before, including when the rail's own #1614
+# lane-applicability fallback sets it with no operator flag. It widens the base side
+# to EVERY workflow on main, and that sample is satisfied by runs that measure
+# nothing (measured on main's 200-run window: 187 `Pipeline Compliance` —
+# `issue_comment`, 148 skipped, 38 success, 1 other — 7 detector, 6 `CI on main`; the
+# widening stopped at width 40 with 11 "measurements" = 8 bookkeeping + 2 detector +
+# 1 code-lane run).
 #
 # A VACUOUS comparison is NOT a certificate (#1319). `PR failing: 0 | main
 # failing: 0` is an ABSENCE of a measurement, not a clean one: the two zeros mean
