@@ -241,20 +241,45 @@ function row(kind, name, v, f, ln) {
   # contributed its other claims (so the required-declarer rule did not notice either). Reporting the
   # convention as a STATED LIMIT would leave exactly the class this PR exists to close. So every
   # declaration-position UPPERCASE `NAME=<70..89>` literal OUTSIDE the namespace is a `foreign` row,
-  # and `codes_verdict` REDs on it. The filter is what keeps it precise: the right-hand side must be a
-  # BARE two-digit code (so `MEM_BUDGET_PCT=75` in prose, `rc=75` lowercase, `load=79/` and the like
-  # never appear), and `cmdpos` requires a real assignment position — measured on this tree it yields
-  # EXACTLY the 14 family claims and nothing else, which is the property the arm asserts.
+  # and `codes_verdict` REDs on it. Two filters keep it precise: the token must be in assignment
+  # position (`cmdpos`), and the OPERAND must READ AS a 70..89 code — so `MEM_BUDGET_PCT=75` in prose,
+  # `rc=75` lowercase, `FOO=$bar` and the like never appear. Measured on this tree it yields EXACTLY
+  # the 14 family claims and nothing else, which is the property the arm asserts.
+  # ⛔ THE OPERAND IS READ WITH `valof`, NOT MATCHED BARE (review of PR #3237, P2 at head 5e6ab20c).
+  # The first cut's regex required a BARE two-digit literal, so the SAME declaration red or green
+  # depending on how it was SPELLED — measured through the shipped predicate on a copy of the deploy
+  # unit, one appended line each:
+  #     AGENT_MEM_GATE=81        → RED   (foreign: spawn-gate.sh:AGENT_MEM_GATE=81)
+  #     AGENT_MEM_GATE="81"      → GREEN, 0 rows      ← a real duplicate of the memory gate's code
+  #     AGENT_MEM_GATE='81'      → GREEN, 0 rows
+  #     AGENT_MEM_GATE=081       → GREEN, 0 rows
+  #     AGENT_MEM_GATE=+81       → GREEN, 0 rows
+  # That is the exact class this file's header says was closed ("a verdict that depends on how a
+  # constant was SPELLED is not a guard"), left alive one filter deeper — so the operand now goes
+  # through the SAME reader the family path uses, with the numeric normalisation a shell applies to a
+  # value (`+81` and `081` ARE 81). STATED LIMIT (and it is TRUE): the foreign net resolves LITERALS
+  # only. An operand whose value is computed (`AGENT_MEM_GATE=$y`, `${OTHER:-81}`) reads as no code
+  # here — the family path can REFUSE such an operand because its name says a code belongs there, but
+  # applying that rule to every uppercase assignment in the tree would redden ordinary variables and
+  # buy a scanner nobody can run. The names that matter are in the family, where a computed operand
+  # is already `unknown`/RED. Likewise an operand that merely BEGINS with a code (`X=81abc`) is a
+  # STRING, not a declaration of a code, so the foreign net stays silent on it — under a FAMILY name
+  # the same operand is an `unknown` row and RED (measured: `AGENT_X_REFUSED=81abc` → `unknown`),
+  # which is where the fail-closed rule belongs. The one shape this narrowing drops, measured: the
+  # old regex reddened `X=81abc` as `foreign 81`; that was a side effect of its `([^0-9]|$)`
+  # terminator, not a code claim.
   _fr = s
-  while (match(_fr, /[A-Z_][A-Z0-9_]*=[7-8][0-9]([^0-9]|$)/)) {
-    _w  = substr(_fr, RSTART, RLENGTH)
-    _p  = substr(_fr, 1, RSTART - 1)
-    _eq = index(_w, "=")
-    _nm = substr(_w, 1, _eq - 1)
-    _vv = substr(_w, _eq + 1, 2)
-    _fr = substr(_fr, RSTART + _eq + 2)
+  while (match(_fr, /[A-Z_][A-Z0-9_]*\+?=/)) {
+    _tok = substr(_fr, RSTART, RLENGTH)
+    _p   = substr(_fr, 1, RSTART - 1)
+    _nm  = _tok; sub(/\+?=$/, "", _nm)
+    _fr  = substr(_fr, RSTART + RLENGTH)
     if (_nm ~ /_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) continue
-    if (cmdpos(_p)) print "foreign", _nm, _vv + 0, f, FNR
+    if (!cmdpos(_p)) continue
+    _vv = valof(_fr)
+    sub(/^\+/, "", _vv)
+    sub(/^0+/, "", _vv)
+    if (iscode(_vv)) print "foreign", _nm, _vv + 0, f, FNR
   }
   rest = s
   while (match(rest, /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)/)) {
@@ -2362,6 +2387,33 @@ _wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE=81"*) rc=0 ;; *) rc=1 ;; esac
 ck "(mutation f1) a code declared OUTSIDE the family namespace (\`AGENT_MEM_GATE=81\`, line $_wantline) is REFUSED and named — the claim scan is namespace-anchored, so this was GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+# (f1b) ⛔ SPELLING MUST NOT DECIDE THE VERDICT (review of PR #3237, P2 at head `5e6ab20c`). The net
+# above matched a BARE two-digit operand, so the SAME declaration reddened or VANISHED by punctuation —
+# measured through the shipped predicate on a copy of the deploy unit, one appended line each:
+#   AGENT_MEM_GATE=81  RED;   AGENT_MEM_GATE="81" / ='81' / =081 / =+81  GREEN with 0 rows.
+# Driven as a TABLE, because the arm above catches exactly the one spelling it was written with —
+# that is how the gap survived it, and a spot check per shape is the class this file names twice.
+_foreign_spell="$(printf '%s\n' 'AGENT_MEM_GATE=81' 'AGENT_MEM_GATE="81"' "AGENT_MEM_GATE='81'" 'AGENT_MEM_GATE=081' 'AGENT_MEM_GATE=+81')"
+_unred_spell=""; _fsi=0
+while IFS= read -r _fsp; do
+  [ -n "$_fsp" ] || continue
+  _fsi=$((_fsi+1))
+  _codemut_dir="$(_codemut "foreign-spelling-$_fsi")"
+  printf '\n%s\n' "$_fsp" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE=81"*) : ;; *) _unred_spell="$_unred_spell [$_fsp]" ;; esac
+done <<< "$_foreign_spell"
+[ -z "${_unred_spell// /}" ]; rc=$?
+ck "...and EVERY spelling of that foreign declaration is REFUSED ($_fsi shapes: bare, double-quoted, single-quoted, leading zero, plus-sign) — a verdict that depends on how a constant was SPELLED is not a guard (unred:${_unred_spell:- none})" $rc
+# ... and the precision half: the net reads CODE-SHAPED operands, not every uppercase assignment, so
+# widening the operand reader must not start reddening ordinary variables. FOO_NOTE="$bar" is a
+# computed value and RC_TOKEN=812 is out of range; under a net that reddened on assignment SHAPE
+# alone both would become foreign rows.
+_codemut_dir="$(_codemut foreign-noncode)"
+printf '\nFOO_NOTE="$bar"\nRC_TOKEN=812\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign:"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) a NON-CODE operand stays OUT of the foreign net — a computed value and an out-of-range number are not gate declarations (rc=$CODE_RC; $CODE_MSG)" $rc
 # ... and the control for the other direction: the SAME code under FAMILY names is caught by the
 # COLLISION rule and reported as a collision, never as foreign — otherwise this arm could be the thing
 # reddening every duplicate and the namespace rule itself would be untested.
