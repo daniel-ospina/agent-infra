@@ -158,8 +158,38 @@ lane_terminal_line() {
 # The EXIT trap dispatches, so ONE trap site covers both halves as they become available: the cleanup
 # is defined further down (its libraries are sourced there), and a lane that exits before that has
 # nothing to clean up but still owes a terminal line.
+#
+# ── ONLY THE LANE'S OWN SHELL MAY RUN THIS (the two P0s a forked child causes) ─────────────────
+# Bash propagates an EXIT trap into some forked children, and this script forks for real work: the
+# agent launch (`pi … &`) and the watchdogs below. A child that inherits the trap does TWO things the
+# lane is still relying on:
+#   • it runs `lane_exit_cleanup` WHILE THE LANE IS STILL RUNNING — reaping the very `.venv` the agent
+#     is executing from, and reconciling a worktree the agent is still writing to;
+#   • it writes a terminal line, and `lane_terminal_line` is idempotent only WITHIN a process (its
+#     `LANE_TERMINAL_DONE` flag is a shell variable a fork COPIES). So the log ends up with the
+#     child's verdict AND the lane's: the reader the whole change exists to give a single authoritative
+#     last line gets two, and the earlier one is a `died reason=no-outcome-recorded` that is a lie
+#     about a lane that then exited 0. Measured on Linux bash 5.2: three arms of lane-outcome.test.sh
+#     carried `got: '2', want: '1'` lines, with the child's `subshell=1` and the lane's `subshell=0`.
+#
+# `BASHPID` identifies the process exactly and is the primary test; `BASH_SUBSHELL` (bash 3.0+, so it
+# exists on the macOS 3.2 this harness also runs on) is the fallback. The SUBSHELL DEPTH IS CAPTURED
+# AT START rather than compared to a literal 0, so a caller that sources this file inside a subshell
+# still gets its line instead of being silently denied one.
+LANE_OWNER_BASHPID="${BASHPID:-}"
+LANE_OWNER_SUBSHELL="${BASH_SUBSHELL:-0}"
+lane_trap_is_owner_shell() {
+  if [ -n "${LANE_OWNER_BASHPID:-}" ] && [ -n "${BASHPID:-}" ]; then
+    [ "$BASHPID" = "$LANE_OWNER_BASHPID" ]
+    return $?
+  fi
+  [ "${BASH_SUBSHELL:-0}" -eq "${LANE_OWNER_SUBSHELL:-0}" ]
+}
 lane_exit_trap() {
   LANE_LAST_STATUS=$?
+  # A forked child owes the lane nothing and may harm it: see the block above. Returning here costs the
+  # child nothing (its own exit status is unaffected) and leaves the lane's run untouched.
+  lane_trap_is_owner_shell || return 0
   if [ "${LANE_CLEANUP_DISABLED:-0}" != "1" ] && command -v lane_exit_cleanup >/dev/null 2>&1; then
     lane_exit_cleanup
   fi
