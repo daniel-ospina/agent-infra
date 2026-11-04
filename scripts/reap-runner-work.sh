@@ -122,7 +122,7 @@ EXPLICIT="${REAP_RW_EXPLICIT-0}"
 # where the farm puts runners elsewhere (cell 3 keeps installs under `/tmp/actions-runner`, cell 4's
 # are in `/opt`).
 GLOBS="${REAP_RW_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work}"
-MIN_AGE="${REAP_RW_MIN_AGE:-3600}"
+RUNNER_WORK_MIN_AGE="${REAP_RW_MIN_AGE:-3600}"
 DU_TIMEOUT="${REAP_RW_DU_TIMEOUT:-120}"
 FIND_TIMEOUT="${REAP_RW_FIND_TIMEOUT:-120}"
 DRY_RUN="${REAP_RW_DRY_RUN:-1}"
@@ -167,7 +167,7 @@ while [ $# -gt 0 ]; do
                    shift 2 ;;
         --min-age) [ $# -ge 2 ] || die "--min-age needs a number"
                    num "$2" || die "--min-age must be a whole number of seconds (got '$2')"
-                   MIN_AGE="$2"; shift 2 ;;
+                   RUNNER_WORK_MIN_AGE="$2"; shift 2 ;;
         --print-config) PRINT_CONFIG=1; shift ;;
         --help|-h) usage ;;
         *) die "unknown argument: $1 (see --help)" ;;
@@ -183,16 +183,16 @@ case "$GLOBS" in *[![:space:]]*) : ;; *)
     printf '%s: set REAP_RW_GLOBS (or pass --glob), or leave it UNSET to take the defaults\n' "$SCRIPT_NAME" >&2
     exit 3 ;;
 esac
-num "$MIN_AGE"            || die "REAP_RW_MIN_AGE must be a whole number of seconds (got '$MIN_AGE')"
-num "$BUDGET"             || die "REAP_RW_BUDGET_SECONDS must be a whole number"
-num "$LOCK_STALE_SECONDS" || die "REAP_RW_LOCK_STALE_SECONDS must be a whole number"
-num "$DU_TIMEOUT"         || die "REAP_RW_DU_TIMEOUT must be a whole number"
-num "$FIND_TIMEOUT"       || die "REAP_RW_FIND_TIMEOUT must be a whole number"
+num "$RUNNER_WORK_MIN_AGE" || die "REAP_RW_MIN_AGE must be a whole number of seconds (got '$RUNNER_WORK_MIN_AGE')"
+num "$BUDGET"              || die "REAP_RW_BUDGET_SECONDS must be a whole number"
+num "$LOCK_STALE_SECONDS"  || die "REAP_RW_LOCK_STALE_SECONDS must be a whole number"
+num "$DU_TIMEOUT"          || die "REAP_RW_DU_TIMEOUT must be a whole number"
+num "$FIND_TIMEOUT"        || die "REAP_RW_FIND_TIMEOUT must be a whole number"
 case "$DRY_RUN" in 0|1) ;; *) die "REAP_RW_DRY_RUN must be 0 or 1 (got '$DRY_RUN')" ;; esac
 
 if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'globs=%s\n' "$GLOBS"
-    printf 'min_age=%s\n' "$MIN_AGE"
+    printf 'min_age=%s\n' "$RUNNER_WORK_MIN_AGE"
     printf 'retained=%s\n' "$(printf '%s' "$RETAINED_NAMES" | tr '\n' ',' | sed 's/,$//')"
     printf 'mode=%s\n' "$([ "$DRY_RUN" = 1 ] && printf dry-run || printf apply)"
     exit 0
@@ -284,12 +284,12 @@ release_lock() { [ "${LOCK_HELD:-0}" = 1 ] && { rm -rf "$LOCK_DIR" 2>/dev/null; 
 
 # ── the mtime floor: one reference FILE, portable across GNU and BSD ────────────────────────────
 # `find -newermt` is GNU-only and `date -d` is GNU-only; `find -newer <file>` and `touch -t` exist on
-# both, so the floor is a file whose mtime is `now - MIN_AGE`: everything newer than it was written
+# both, so the floor is a file whose mtime is `now - RUNNER_WORK_MIN_AGE`: everything newer than it was written
 # since the floor. `date -r` is the BSD spelling and `date -d @` the GNU one — the same pair the class
 # fixtures use, so a host that can age a fixture can age this file.
 make_floor_ref() { # <path> — 0 written, 1 cannot be written (a REFUSAL, never a silent 0 floor)
     local p="$1" when stamp
-    when=$(( $(now) - MIN_AGE ))
+    when=$(( $(now) - RUNNER_WORK_MIN_AGE ))
     stamp="$(date -r "$when" +%Y%m%d%H%M.%S 2>/dev/null || date -d "@$when" +%Y%m%d%H%M.%S 2>/dev/null)"
     [ -n "$stamp" ] || return 1
     : >"$p" 2>/dev/null || return 1
@@ -342,7 +342,7 @@ prune_entry() { # <entry> <root>
     entry_written_since "$entry" "$FLOOR_REF"; verdict=$?
     case "$verdict" in
         0)  KEPT=$((KEPT + 1))
-            log_line "KEPT   $entry reason=written-within-floor (the entry or its content was written within ${MIN_AGE}s — a running job writes continuously, so this is the proof it is alive)" ;;
+            log_line "KEPT   $entry reason=written-within-floor (the entry or its content was written within ${RUNNER_WORK_MIN_AGE}s — a running job writes continuously, so this is the proof it is alive)" ;;
         2)  UNMEASURABLE=$((UNMEASURABLE + 1))
             log_line "KEPT   $entry reason=unreadable (the bounded walk could not answer, so there is no proof the entry is dead; NOT removed)" ;;
         1)  CAND=$((CAND + 1))
@@ -353,7 +353,7 @@ prune_entry() { # <entry> <root>
                 # twice — once here and once in `disk-reaper.sh` — doubles the only cost that matters.
                 # `?` when du cannot answer: a CANDIDATE whose bytes are unknown is still a candidate, and
                 # a caller that dropped the row would report `candidates=0` on a pass with real work.
-                log_line "REAP no-write-for-${MIN_AGE}s $(du_mb "$entry")MB $entry"
+                log_line "REAP no-write-for-${RUNNER_WORK_MIN_AGE}s $(du_mb "$entry")MB $entry"
                 return 0
             fi
             if [ "$(now)" -ge "$DEADLINE" ]; then
@@ -376,7 +376,7 @@ prune_entry() { # <entry> <root>
             esac
             if rm -rf "$entry" 2>/dev/null && [ ! -e "$entry" ]; then
                 REAPED=$((REAPED + 1))
-                log_line "REAPED $entry how=rm (no content written for >= ${MIN_AGE}s)"
+                log_line "REAPED $entry how=rm (no content written for >= ${RUNNER_WORK_MIN_AGE}s)"
                 log "reaped $entry root=$root"
             else
                 FAILED=$((FAILED + 1))
@@ -424,9 +424,9 @@ fi
 if ! acquire_lock; then exit 3; fi
 
 DEADLINE=$(( $(now) + BUDGET ))
-log_line "reap-runner-work: pass start mode=$MODE_TEXT min_age=${MIN_AGE}s pid=$$ globs=$(printf '%s' "$GLOBS" | tr ' ' ',')"
+log_line "reap-runner-work: pass start mode=$MODE_TEXT min_age=${RUNNER_WORK_MIN_AGE}s pid=$$ globs=$(printf '%s' "$GLOBS" | tr ' ' ',')"
 log_line "reap-runner-work: retained=$(printf '%s' "$RETAINED_NAMES" | tr '\n' ',' | sed 's/,$//') — cross-job caches, never candidates whatever their age"
-log "==== pass start mode=$MODE_TEXT min_age=${MIN_AGE}s explicit=$EXPLICIT ===="
+log "==== pass start mode=$MODE_TEXT min_age=${RUNNER_WORK_MIN_AGE}s explicit=$EXPLICIT ===="
 
 # ⛔ THE GLOBS ARE EXPANDED UNQUOTED ON PURPOSE — that expansion IS the discovery mechanism. A pattern
 # that matches nothing expands to ITSELF in bash, which is why every candidate is `-d`-tested rather
@@ -451,7 +451,7 @@ done
 CENSUS=ok
 if [ "$ROOTS" = 0 ] && [ "$EXPLICIT" = 1 ]; then CENSUS=no-roots; fi
 
-log_line "SUMMARY class=runner-work mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE min_age=${MIN_AGE}s explicit=$EXPLICIT census=$CENSUS"
+log_line "SUMMARY class=runner-work mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE min_age=${RUNNER_WORK_MIN_AGE}s explicit=$EXPLICIT census=$CENSUS"
 log "SUMMARY mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED census=$CENSUS"
 
 if [ "$CENSUS" = no-roots ]; then

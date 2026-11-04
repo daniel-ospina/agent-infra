@@ -441,7 +441,7 @@ case_i() { # <owner>
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
-MUT_A='s/when=\$(( \$(now) - MIN_AGE ))/when=$(now)/'
+MUT_A='s/when=\$(( \$(now) - RUNNER_WORK_MIN_AGE ))/when=$(now)/'
 MUT_B='s/-newer "\$ref" -print 2>\/dev\/null | head -1/-print 2>\/dev\/null | head -1/'
 MUT_C='s/^RETAINED_NAMES="_tool$/RETAINED_NAMES="__nothing__/'
 MUT_D='s/^want_class runner-work && { WANT_RW=1;/true \&\& { WANT_RW=1;/'
