@@ -367,20 +367,60 @@ function selfdefault(nm, rhs,   m, head) {
 # comment that happens to name a family token therefore reads as an `unparseable`/foreign RED, which is
 # a FALSE RED and the one direction that is visible to a reader. It is the deliberate trade: refuse a
 # documented declaration rather than risk silently claiming nothing.
-# MEASURED before choosing it, not assumed: of the shipped tree's 1132 code lines carrying a word-start
-# `#`, ZERO have a family token in the comment tail — so this costs the real tree NOTHING, and the
-# real-tree scan is byte-identical (`claims=14`, `unparseable: none`, RC=0). A model would have bought
-# nothing it did not also risk.
+# MEASURED before choosing it, not assumed — and stated WITH ITS COMMAND, because a count a reader cannot
+# reproduce is the class this file spent four rounds eliminating. Over the exact population the scan
+# reads (`scripts/orchestrator-harness/*.sh`, excluding `*.test.sh`), counting non-whole-line-comment
+# lines that carry a word-start `#` (`(^|[ \t;(])#`) and asking whether a family token appears from that
+# `#` onward:
+#   python3 -c "import re,glob;fam=re.compile(r'[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)');n=hits=0
+#   for f in sorted(glob.glob('scripts/orchestrator-harness/*.sh')):
+#     if f.endswith('.test.sh'): continue
+#     for line in open(f,errors='replace'):
+#       s=line.rstrip(chr(10))
+#       if s.lstrip(' \t').startswith('#'): continue
+#       m=re.search(r'(^|[ \t;(])#',s)
+#       if not m: continue
+#       n+=1
+#       if fam.search(s[m.start():]): hits+=1
+#   print(n,hits)"
+#   → 1132 0
+# ZERO. So this costs the real tree NOTHING, and the real-tree scan is byte-identical (`claims=14`,
+# `unparseable: none`, RC=0). A model would have bought nothing it did not also risk.
 # This SUPERSEDES the earlier "an inline comment is documentation too" rule, which was added to silence
 # a false RED and is what produced fail-opens 1-4 above. A false RED is cheaper than a missed duplicate.
 function row(kind, name, v, f, ln) {
   if (iscode(v)) print kind, name, v + 0, f, ln
   else           print "unknown", name, v, f, ln
 }
+# ⛔ A BACKSLASH-NEWLINE IS A LINE CONTINUATION, SO THE "LINE" awk SEES IS NOT THE LINE bash RUNS
+# (review of `da2e2480`, P1 — three measured fail-opens). awk is line-based, so
+#   AGENT_NEW_GATE_REFUSED\      <- physical line 1
+#   =83                          <- physical line 2
+# gave the name no operator and the operator no name: 0 rows, RC=0 GREEN, while bash assigns 83. Same for
+# `X\` + `+=83`, and for a CALLER's stale default split the same way (`_c="${AGENT_HARNESS_SKEW_REFUSED\`
+# + `:-81}"`), which is the regression this whole namespace exists to catch. The mirror spelling
+# (`NAME=\` then `83`) WAS red, so the verdict turned on WHICH SIDE of the break the operator landed on —
+# the spelling-dependence this file says is not a guard.
+# So a logical line is JOINED before it is scanned. This discards NOTHING — it is a text-preserving join,
+# not the comment model that four earlier rounds had to remove — and it reports the FIRST physical line,
+# so a row still points a reader at the declaration's own start.
+function odd_trailing_bs(s,   n, k) {
+  n = length(s); k = 0
+  while (n - k >= 1 && substr(s, n - k, 1) == "\\") k++
+  return (k % 2)
+}
 {
   if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
+  if (FNR == 1) { ACC = ""; ACCFNR = 0 }
+  # join a backslash-continuation FIRST: the line awk sees is not the line bash runs (see odd_trailing_bs)
+  # ⛔ THE JOIN DROPS BOTH THE BACKSLASH AND THE NEWLINE — it does NOT insert a space (measured on the
+  # first cut: joining with " " turned `NAME\`+`=83` into `NAME =83`, which parses as neither an
+  # assignment nor the original, so the fix left the fail-open in place AND reddened nothing).
+  if (ACC == "") { s = $0; ACCFNR = FNR } else { s = ACC $0 }
+  if (odd_trailing_bs(s)) { ACC = substr(s, 1, length(s) - 1); next }
+  ACC = ""
+  LN = ACCFNR                                 # rows report the declaration's FIRST physical line
   f = basename(FILENAME)
-  s = $0
   sub(/^[ \t]+/, "", s)
   if (s ~ /^#/) next                          # documentation, never a declaration
   # ⛔ A GLUED `printf -vNAME` IS THE SAME DECLARATION (review cycle 3, P2 — measured). bash accepts
@@ -449,7 +489,7 @@ function row(kind, name, v, f, ln) {
     if (_nm ~ /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) continue
     if (!cmdpos(_p)) continue
     _vv = codeval(_fr)
-    if (_vv != "") print "foreign", _nm, _vv + 0, f, FNR
+    if (_vv != "") print "foreign", _nm, _vv + 0, f, LN
   }
   rest = scan
   while (match(rest, /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)/)) {
@@ -473,8 +513,8 @@ function row(kind, name, v, f, ln) {
       # Each operator is matched WHOLE, because its length differs and an off-by-one here silently
       # reads `=83` as `83` on one spelling and as `=83` on another — measured on the first cut: the
       # `${X=…}` form (no colon) came out `unknown` while `${X:=…}` was read correctly.
-      if      (tail ~ /^:=/)  row("claim", name, valof(substr(tail, 3)), f, FNR)
-      else if (tail ~ /^=/)   row("claim", name, valof(substr(tail, 2)), f, FNR)
+      if      (tail ~ /^:=/)  row("claim", name, valof(substr(tail, 3)), f, LN)
+      else if (tail ~ /^=/)   row("claim", name, valof(substr(tail, 2)), f, LN)
       else if (tail ~ /^:[-+]/ || tail ~ /^[-+]/) {
         raw = (tail ~ /^:[-+]/) ? substr(tail, 3) : substr(tail, 2)
         v = valof(raw)
@@ -482,30 +522,37 @@ function row(kind, name, v, f, ln) {
           # `${X:-}` has NO default — that is a bare read (lane.sh does exactly this), not a claim.
           # But an operand that IS there and cannot be read must be REFUSED, not folded into that
           # case: the first cut folded both, and `${X:-"81"}` passed as clean.
-          if (raw !~ /^}/ && raw !~ /^["']["']/) print "unparseable", name, s, f, FNR
-        } else row("fallback", name, v, f, FNR)
+          if (raw !~ /^}/ && raw !~ /^["']["']/) print "unparseable", name, s, f, LN
+        } else row("fallback", name, v, f, LN)
       } else {
         # A plain read inside braces (`${X}`, `${X#*=}`) — UNLESS it is a declaration shape this
         # chain did not classify (`${X[0]:=83}`), which the residual arm REFUSES rather than drops.
-        residual(pre, tail, s, name, f, FNR)
+        residual(pre, tail, s, name, f, LN)
       }
     } else if (tail ~ /^\+=/) {
-      if (cmdpos(pre)) row("claim", name, valof(substr(tail, 3)), f, FNR)
-      else             print "unparseable", name, s, f, FNR
-    } else if (tail ~ /^=/) {
+      if (cmdpos(pre)) row("claim", name, valof(substr(tail, 3)), f, LN)
+      else             print "unparseable", name, s, f, LN
+    } else if (tail ~ /^=([^=]|$)/) {
+      # ⛔ `==` IS A COMPARISON, NOT A DECLARATION (review of `da2e2480`, P2 — measured). This arm took
+      # `((X==83))` because the tail begins with `=` and the value read as `=83` → an `unknown` RED. The
+      # arithmetic arm below already guarded this with `=([^=]|$)`; this one did not, so the SPACED form
+      # `(( X == 83 ))` was silent and the UNSPACED form was refused — the verdict held only by
+      # whitespace, and "`(( X == 83 ))` stays silent" was asserted by prose with no arm behind it.
+      # The exclusion is in the ARM CONDITION, not a `next`: `next` would skip the REST OF THE LINE and
+      # silently drop a second declaration on it, which is the fail-open class this scanner exists for.
       if (cmdpos(pre)) {
         v = selfdefault(name, substr(tail, 2))   # `X="${X:-83}"` — the house default idiom
-        if (v != "") row("claim", name, v, f, FNR)
-        else          row("claim", name, valof(substr(tail, 2)), f, FNR)
+        if (v != "") row("claim", name, v, f, LN)
+        else          row("claim", name, valof(substr(tail, 2)), f, LN)
       }
-      else             print "unparseable", name, s, f, FNR
+      else             print "unparseable", name, s, f, LN
     } else if (tail ~ /^:?[-+]/) {
-      print "unparseable", name, s, f, FNR
+      print "unparseable", name, s, f, LN
     } else {
       # ⛔ NOT A FALL-THROUGH ANY MORE. This `else` used to be absent, and its absence is the P1: the
       # line was dropped in silence, so the name read GREEN with no row while the code it declares
       # collided with a sibling. See `residual` for the two shapes it now REFUSES.
-      residual(pre, tail, s, name, f, FNR)
+      residual(pre, tail, s, name, f, LN)
     }
     rest = tail
   }
@@ -2672,6 +2719,41 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
 ck "(quote model: across lines) a declaration after a quote CLOSED on that line, when the quote was OPENED on the previous one, is still READ — awk is line-based, so per-line state read this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
 
+# (f1h) ⛔ A BACKSLASH-NEWLINE SPLITS THE NAME FROM ITS OPERATOR (review of `da2e2480`, P1 — three
+# measured fail-opens). awk is line-based, so `AGENT_NEW_GATE_REFUSED\` + `=83` gave the name no
+# operator and the operator no name: 0 rows, RC=0 GREEN, while bash assigns 83. Same for the `+=` form
+# and for a CALLER's stale default split that way — the very regression this namespace exists to catch.
+# The mirror spelling (operator first, value on the next line) WAS red, so the verdict turned on WHICH
+# SIDE of the break the operator landed on. Logical lines are joined now, and the arms below drive all
+# three shapes; each is GREEN if the join is ever removed.
+_codemut_dir="$(_codemut cont-eq)"
+printf '\nAGENT_NEW_GATE_REFUSED\\\n=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a declaration whose \`=\` sits on the NEXT line is READ and collides — awk is line-based, so an unjoined scan gives the name no operator and reads this GREEN (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut cont-plus-eq)"
+printf '\nAGENT_NEW_GATE_REFUSED\\\n+=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) the \`+=\` form split the same way is READ and collides (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut cont-stale-caller)"
+printf '\n_c="${AGENT_HARNESS_SKEW_REFUSED\\\n:-81}"\n' >> "$_codemut_dir/fix-one.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:fix-one.sh:"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a CALLER's stale \`:-81\` default split across lines is still caught as a stale default — the check this PR chiefly guards (rc=$CODE_RC; $CODE_MSG)" $rc
+# (f1i) and the other direction: `==` is a COMPARISON, in both spellings. The spaced form was silent and
+# the UNSPACED form was refused, so the verdict held only by whitespace.
+_codemut_dir="$(_codemut arith-compare-tight)"
+printf '\n((AGENT_NEW_GATE_REFUSED==83))\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(comparison) \`((X==83))\` UNSPACED is a comparison, not a declaration, and stays SILENT — the spaced form already did, so punctuation decided this one (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut arith-assign-tight)"
+printf '\n((AGENT_NEW_GATE_REFUSED=83))\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(comparison) \`((X=83))\` UNSPACED is still an ASSIGNMENT and collides — the control for the row above (rc=$CODE_RC; $CODE_MSG)" $rc
+
 # (f1g) ⛔ A SCAN THAT COULD NOT RUN IS NOT A CLEAN SCAN (review of `aab646c5`, P2 — measured). The
 # scan was `awk … 2>/dev/null` with its status discarded, so a file awk could not open aborted the scan
 # mid-list and the verdict came back `RC=0 claims=14 unparseable: none` — a CLEAN report over a
@@ -2898,7 +2980,13 @@ _armdecl=" $(printf '%s\n' "$_fixer_arms" | cut -d: -f1 | tr '\n' ' ')"
 # with (the repo-target refusal, 72, which fires before the classifier is ever reached) is not an arm
 # and must be named as such instead of silently widening the table. Today the two sets are
 # {BRIEF,CAPABILITY,DISK,FORK,HARNESS_SKEW} and {REPO_TARGET_REFUSED}.
-_fixer_code="$(awk '{ sub(/^[ \t]*#.*/, ""); sub(/[ \t]#.*/, ""); print }' "$HERE/fix-one.sh")"
+# ⛔ WHOLE-LINE COMMENTS ONLY — THE INLINE STRIP WAS THE SAME FAIL-OPEN THE SCANNER JUST REMOVED (review of
+# `da2e2480`, P2 — measured). `sub(/[ \t]#.*/, "")` deleted the rest of any line carrying a ` #`, so a NEW
+# gate classified on such a line appeared in NEITHER the derived arm table NOR the declared set, and both
+# completeness checks passed over it. Measured: `true && echo "a # b" && _new="${AGENT_NEW_ARM_REFUSED:-85}"`
+# appended to a `fix-one.sh` copy left the derived set unchanged. Whole-line-only stripping yields the
+# IDENTICAL set on the real tree, so this costs nothing.
+_fixer_code="$(awk '{ sub(/^[ \t]*#.*/, ""); print }' "$HERE/fix-one.sh")"
 _arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never compared
 _arm_cls=""; _arm_other=""
 for _ac in $(printf '%s\n' "$_fixer_code" \
