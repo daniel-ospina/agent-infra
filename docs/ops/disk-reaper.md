@@ -1707,8 +1707,16 @@ is 4.5x that floor. `spawn-gate.sh`'s `run_agent` now also applies a **headroom*
 
 ```
 ADMIT  iff  free_mb >= max(tree_mb, self_mb) + reserve_mb      (fresh `df` reading, at every spawn)
-REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK_REFUSED, 77)
+REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM REFUSED-DISK(free=…, need=…, box=…) — …`
+        (AGENT_DISK_REFUSED, 77)
 ```
+
+⛔ **GREP THE TOKEN, NOT THE DASH.** Since agent-infra#3395 the verdict also carries the
+machine-readable `REFUSED-DISK(free=…, need=…, box=…)` term (the same token the PRE-START seam emits
+from `wt_provision` before a worktree is created, e.g.
+`[disk-admit] REFUSED-DISK(free=3.5GB, need=8.0GB, box=cell-3; free_mb=3584, need_mb=8144)`), so the
+line no longer reads `DISK-NOHEADROOM — `. Anchor a grep on **`DISK-NOHEADROOM`** (live arm) or
+**`REFUSED-DISK(`** (either arm), not on the em dash that used to follow the verdict.
 
 `tree` is what ONE more lane costs *while the shared uv cache holds*; `self` is what the same lane
 costs when it does not (a pruned cache, `--link-mode=copy`, a cache on another mount); `reserve` is the

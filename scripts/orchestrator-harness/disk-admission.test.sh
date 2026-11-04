@@ -283,9 +283,13 @@ for pair in "fix-one.sh:AGENT_DISK_REFUSED" "adopt-fix.sh:exit 77" "dispatch-mer
   # live-arm readers, `break` in dispatch-merge's loop), so it could not fail for the reason it claims.
   arm=""
   if grep -qE '^[[:space:]]*4\)' "$script"; then
-    arm="$(awk '/^[[:space:]]*4\)[[:space:]]*#?/{f=1} f&&/^[[:space:]]*;;[[:space:]]*$/{exit} f' "$script")"
+    # ⛔ TERMINATE ON THE ARM'S OWN TERMINATOR, WHICH IS `break ;;` IN dispatch-merge (review round 3,
+    # P2 — MEASURED). Requiring a bare `;;` on its own line ran the capture to the END OF FILE (139
+    # lines instead of 27), so `grep -qF break` was satisfiable by any later `break`: changing the arm's
+    # `break ;;` to `continue ;;` still printed the pass. Any line ENDING in `;;` ends the arm.
+    arm="$(awk '/^[[:space:]]*4\)[[:space:]]*#?/{f=1} f{print} f&&/;;[[:space:]]*$/{exit}' "$script")"
   else
-    arm="$(awk '/(^|[[:space:]])(if|elif)[[:space:]]+\[.*_wt_rc[" ]*=[[:space:]]*["]?4/{f=1;n=0} f{print;n++} f&&n>12{exit}' "$script")"
+    arm="$(awk '/(^|[[:space:]])(if|elif)[[:space:]]+\[.*_wt_rc[" ]*=[[:space:]]*["]?4/{f=1} f{print}' "$script" | awk '{print} /^[[:space:]]*fi[[:space:]]*$/{exit}')"
   fi
   if [ -z "$arm" ]; then
     bad "H) $f has no rc-4 arm — a disk refusal from wt_provision would be read as an add failure"
@@ -300,6 +304,25 @@ case "$(grep -n '4 = REFUSED-DISK' "$WTL" | head -1)" in '')
 *)
   ok "H) wt-lifecycle.sh documents rc 4 = REFUSED-DISK in its own contract table" ;;
 esac
+
+# ⛔ NON-VACUITY PROOF FOR THE CENSUS (review round 3, P2 — the round-2 version was measured vacuous).
+# A source census that cannot fail for its own reason is a decoration. This mutates a COPY twice —
+# `break ;;` → `continue ;;` (the batch no longer stops, exactly the regression the arm exists for)
+# while ADDING an unrelated `break` later in the file — and requires the extraction to see the arm
+# WITHOUT the token. The real tree is untouched.
+_mut="$T/mut-dispatch-merge.sh"
+sed -e 's/^\([[:space:]]*\)break ;;$/\1continue ;;/' "$HERE/dispatch-merge.sh" > "$_mut" 2>/dev/null
+printf '\nbreak\n' >> "$_mut"
+_marm="$(awk '/^[[:space:]]*4\)[[:space:]]*#?/{f=1} f{print} f&&/;;[[:space:]]*$/{exit}' "$_mut")"
+if printf '%s' "$_marm" | grep -q 'SPAWNED_IDS\|CHAIN_IDS'; then
+  if grep -qF 'break' <<<"$_marm"; then
+    bad "H) the census is VACUOUS: a mutated dispatch-merge (break→continue, plus a stray break later) still passes"
+  else
+    ok "H) the census is non-vacuous: on the mutated copy it reads the arm and the token IS absent"
+  fi
+else
+  bad "H) the mutation harness could not extract a mutated arm — fix the harness, do not trust the pass above"
+fi
 
 echo
 echo "── results: $PASS passed, $FAIL failed ──"

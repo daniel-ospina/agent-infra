@@ -82,6 +82,12 @@ release_issue_claim_unspawned() { # <issue>
 #   branch, the `prfixup` shape) reaches it in the field. So the batch publishes what actually reached
 #   a spawn in `$O/.dispatched-ids`, and the controller recounts from that instead of from claims.
 SPAWNED_IDS=""
+# ⛔ AND THE IDS WHOSE **CHAIN** WAS STARTED, which is NOT `SPAWNED_IDS` (review round 3, P3).
+# `SPAWNED_IDS` only grows on a SUCCESSFUL lane spawn, while the chain is attempted regardless — and a
+# failed lane spawn with a LIVE chain is exactly the case this file's own comment forbids releasing
+# ("the chain IS alive and waiting for that PR, so releasing would let a peer duplicate the work"). The
+# disk arm below must skip these too, or a batch stop releases a claim something is still working on.
+CHAIN_IDS=""
 drop_dispatched_rows() {
   local ids="" n tmp
   for n in "$@"; do case "${n:-}" in ''|*[!0-9]*) continue ;; esac; ids="$ids $n"; done
@@ -385,14 +391,15 @@ for N in "$@"; do
        # was a regression against the old `*)` arm, where each issue released its own claim as it went.
        echo "#$N: $WT_RESULT"
        echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take the remaining issues"
-       # ⛔ NEVER RELEASE A CLAIM FOR AN ISSUE THIS BATCH ALREADY **SPAWNED** A LANE FOR. `SPAWNED_IDS`
-       # holds the lanes that ARE running; releasing their claim would let a peer duplicate the work
-       # (the rule the chain-start failure path states at length). Only the unspawned remainder is
-       # released — this issue and everything after it.
+       # ⛔ NEVER RELEASE A CLAIM FOR AN ISSUE THIS BATCH ALREADY **SPAWNED A LANE OR A CHAIN** FOR
+       # (review rounds 2 and 3). `SPAWNED_IDS` holds the lanes that ARE running; `CHAIN_IDS` holds the
+       # ids whose chain was started even when the lane spawn failed — releasing either lets a peer
+       # duplicate live work (the rule this file states at the chain-start failure path). Only the
+       # remainder — this issue and everything after it that nothing was started for — is released.
        _dm_unspawned=""
        for _dm in "$N" "$@"; do
          case "${_dm:-}" in ''|*[!0-9]*) continue ;; esac
-         case " $SPAWNED_IDS " in *" $_dm "*) continue ;; esac
+         case " $SPAWNED_IDS $CHAIN_IDS " in *" $_dm "*) continue ;; esac
          case " $_dm_unspawned " in *" $_dm "*) continue ;; esac
          _dm_unspawned="$_dm_unspawned $_dm"
          release_issue_claim_unspawned "$_dm"
@@ -479,6 +486,7 @@ for N in "$@"; do
   # releasing the claim" ordering. Same rule as `${_lan-}` below: every variable this branch reads
   # must be safe when unset.
   if wt_spawn "chain-$N" "${REPO_ABS:-$REPO}" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '${REPO_ABS:-$REPO}' '$OR' $N '$BR'"; then
+    CHAIN_IDS="$CHAIN_IDS $N"   # the disk arm must not release a claim a live chain holds (round 3, P3)
     echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
     # The same disclosure on the refusal path (see the lane spawn above): a chain that never started
