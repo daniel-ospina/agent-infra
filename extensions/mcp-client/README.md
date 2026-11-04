@@ -93,7 +93,7 @@ stops the server, the next tool call transparently reconnects it.
 ## Hosted graph server
 
 `tortoise` (memory graph) is the HOSTED HTTP server (`type: http`, `url:
-https://api.premiselabs.co/mcp/`, `Authorization: Bearer ${TORTOISE_API_KEY}`) and it is **lazy**:
+https://api.premiselabs.co/mcp/`, `Authorization: Bearer ${TORTOISE_MCP_API_KEY}`) and it is **lazy**:
 its cold handshake routinely exceeds pi's default connect budget, and the same entry ships to
 memory-constrained cloud cells where an eager server would block every session start. Call
 `mcp_load tortoise` before you read the graph.

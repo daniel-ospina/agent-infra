@@ -131,7 +131,7 @@
 #        `${TORTOISE_HOME:-$HOME/Documents/GitHub/tortoise}/.venv/bin/python3`, a checkout and
 #        venv a cell does not have, so installing it would have made every cell session start
 #        spawn a core server that could not exist. The template now declares the HOSTED http
-#        entry (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_API_KEY}`, lazy), which
+#        entry (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_MCP_API_KEY}`, lazy), which
 #        needs neither — and the old skip cost more than it saved: every lane on a cell ran
 #        with ZERO MCP servers and wrote `GRAPH-UNREACHABLE` into its report, so the owner's
 #        "every lane reads and writes the graph through the MCP" mandate was UNOBEYABLE on a
@@ -215,7 +215,7 @@ die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 log_line()  { printf '  %s\n' "$*"; }
 
 # ── the hosted-graph credential (graph-mcp-provision) ────────────────────────
-# `.mcp.json`'s tortoise header is `Bearer ${TORTOISE_API_KEY}`. A plain `${VAR}` expands to the
+# `.mcp.json`'s tortoise header is `Bearer ${TORTOISE_MCP_API_KEY}`. A plain `${VAR}` expands to the
 # EMPTY STRING when unset, so an unprovisioned cell reaches the server, sends `Bearer ` and gets
 # a 401 that reads as an auth failure rather than the set-up gap it is (#5153). The credential is
 # OPERATOR state (cloud-cell-bringup.sh: keys.env is "operator-pushed, and NOT a bring-up
@@ -514,7 +514,14 @@ def _loopback(authority):
         rest = h[end + 1:]
         if rest and not rest.startswith(":"):
             return False
-        return h[1:end] == "::1"
+        # ⛔ ASK ipaddress, DO NOT STRING-MATCH `::1` — the same rule as the IPv4 arm below, and for
+        # the same reason: `[0:0:0:0:0:0:0:1]` IS loopback and `== "::1"` called it remote, so a
+        # legal spelling of the documented local self-host was refused as INSECURE_URL (a false
+        # block on a config that cannot leave the box). `merge-mcp.py`'s `_loopback` MUST MATCH.
+        try:
+            return ipaddress.ip_address(h[1:end]).is_loopback
+        except ValueError:
+            return False
     host = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
     if host == "localhost":
         return True

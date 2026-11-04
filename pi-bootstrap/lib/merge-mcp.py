@@ -96,13 +96,16 @@ def near_miss(url, want_url):
     path (or a missing trailing slash) is a typo, or a copy that got mangled, and preserving it means
     the box points at an endpoint nobody meant to configure.
 
-    ⛔ THE SCHEME IS PART OF THE SPELLING, and comparing it is what keeps a scheme-only typo OUT of
-    the `_selfHosted` exemption. That exemption is what `--verify` honours, and the hosted entry
-    carries a live `Bearer ${TORTOISE_MCP_API_KEY}`: `http://api.premiselabs.co/mcp/` marked
-    `_selfHosted` is then certified rc=0 by the verifier, and the key crosses the wire in CLEARTEXT
-    while the cell prints LAYER VERIFIED. `https`↔`http` on the SAME host is a typo, never a
-    self-host, so the default wins here and `--verify` refuses a credential on a non-https url as
-    a second line of defence.
+    ⛔ THE SCHEME IS PART OF THE SPELLING **AND IT IS DELIBERATELY NOT COMPARED** — the comparison
+    below is on the AUTHORITY ALONE (`host()` drops the scheme), so `http://host/mcp` and
+    `https://host/mcp` are the SAME spelling: a near-miss of the default, which is REPLACED by it.
+    That is what keeps a scheme-only typo OUT of the `_selfHosted` exemption — the exemption
+    `--verify` honours, on an entry that carries a live `Bearer ${TORTOISE_MCP_API_KEY}`, so
+    `http://api.premiselabs.co/mcp/` marked `_selfHosted` would go on to meet the verifier's own
+    https floor with the key on a cleartext transport (`--verify` refuses it as INSECURE_URL, which
+    is the second line of defence, not the first). ⛔ DO NOT "FIX" THIS BY COMPARING THE SCHEME:
+    a scheme-sensitive comparison makes the cleartext spelling a DIFFERENT url, i.e. a self-host to
+    preserve and mark — the exact direction this function exists to refuse.
     """
     def host(u):
         m = re.match(r"^[a-z][a-z0-9+.\-]*://([^/]+)", u or "", re.I)
@@ -131,7 +134,13 @@ def _loopback(authority):
         rest = h[end + 1:]
         if rest and not rest.startswith(":"):
             return False
-        return h[1:end] == "::1"
+        # ⛔ ASK ipaddress, DO NOT STRING-MATCH `::1` — same rule as the IPv4 arm below: a string
+        # match called `[0:0:0:0:0:0:0:1]` remote, so a legal spelling of the documented local
+        # self-host was refused as INSECURE_URL (a false block). MUST MATCH cell-install.sh.
+        try:
+            return ipaddress.ip_address(h[1:end]).is_loopback
+        except ValueError:
+            return False
     host = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
     if host == "localhost":
         return True
@@ -336,7 +345,11 @@ def main(argv):
     tmp = "%s.tmp.%d" % (dst_real, os.getpid())
     try:
         with open(tmp, "w") as fh:
-            json.dump(merged, fh, indent=2)
+            # ⛔ `ensure_ascii=False`: the default re-encodes every non-ASCII character as a `\uXXXX`
+            # escape, so a machine whose `.mcp.json` carries a literal `—` (the shipped
+            # `templates/.mcp.base.json` does) gets that line REWRITTEN on every sync — byte churn in
+            # a line the merge has no opinion about, which reads as a content change in every diff.
+            json.dump(merged, fh, indent=2, ensure_ascii=False)
         if os.path.exists(dst_real):
             os.chmod(tmp, stat.S_IMODE(os.stat(dst_real).st_mode))
         os.replace(tmp, dst_real)
