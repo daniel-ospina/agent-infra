@@ -1883,7 +1883,8 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
         # shellcheck disable=SC2086
         # ⛔ THE TARBALL IS WRITTEN STRAIGHT INTO THE ARCHIVE, AND THAT IS BOUNDED (review of #3422,
         # P3). `tar` IS the watchdog's child, so its own open() of the output happens inside the
-        # bounded fork; only `tb_run`'s `: >"$out"` redirect happens in the caller's shell, which is
+        # bounded fork; only `tb_run`'s redirects (`: >"$out"`, then `tb_timeout … >"$out"`) happen in
+        # the caller's shell — two opens of the same path, which is
         # why the diff/status/manifest halves needed fs_write_bounded and this one does not. Round 5
         # rebuilt the tarball off-root "for the same reason" — a false premise, and it made the ONE
         # large artefact be written TWICE (peak usage doubled in $TMPDIR on the box being reclaimed)
@@ -2013,6 +2014,26 @@ preserve_dir_resolve() {
 $(preserve_roots)
 EOF
     return 1
+}
+
+# evidence_members <path> <root>... — every path a tolerated lane-evidence root covers, as a sorted
+# RELATIVE listing (a root that is a file contributes its own name; a directory contributes everything
+# under it). Used to compare what the archive CAPTURED against what is there NOW: comparing root NAMES
+# alone cannot see a file created inside `.worktree-report/` during the archive, which is where the
+# fleet's own fixtures put the mandated report (review of #3422, P2). Bounded like every other read of
+# the checkout — `find` on a hung mount is the same indefinite block as a bare `stat`.
+evidence_members() {
+    local path="$1" r
+    shift
+    for r in "$@"; do
+        case "$r" in ''|*/*) continue ;; esac
+        if fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
+            fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" find "$path/$r" -print 2>/dev/null \
+                | sed "s|^$path/||; s|/$||" 
+        else
+            printf '%s\n' "$r"
+        fi
+    done | sed '/^$/d' | sort -u
 }
 
 # prune_preserve_archive — bound the new sink, across EVERY root an archive can land in (configured
@@ -3698,7 +3719,7 @@ holder_recheck() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local ev_archived ev_now
+    local ev_archived ev_now ev_members_now ev_members_then
     local path="$1" sha="$2" br="${3:-}" why="${4:-}" presv=""
     local eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
@@ -3809,13 +3830,31 @@ remove_one() {
         # without ever being captured: measured, same fixture and probe index, `.env` ⇒ PRESERVE,
         # `WORKTREE-REPORT.md` ⇒ REMOVED with `evidence=none`. So the tolerated payload is compared
         # against what the archive ACTUALLY captured: a set that grew is not covered.
-        ev_archived="$(sed -n 's/^lane_evidence=//p' "$presv/manifest.txt" 2>/dev/null | head -1)"
+        # ⛔ THE READ OF THE MANIFEST IS BOUNDED TOO (review of #3422, P2): `$presv` lives under the
+        # archive root, so a bare `sed` on it is the same unbounded open the rest of this block exists
+        # to avoid — and it would wedge a oneshot unit with no timeout while the pass lock is held.
+        ev_archived="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" sed -n 's/^lane_evidence=//p' "$presv/manifest.txt" 2>/dev/null | head -1)"
         ev_now="$(lane_evidence_present "$path")"
         [ -n "$ev_now" ] || ev_now="<none>"
         if [ "$ev_now" != "${ev_archived:-<none>}" ]; then
             REMOVE_SKIP_VERDICT="lane-evidence-appeared"
             log "REMOVE-SKIP $path lane evidence changed after the archive ('${ev_archived:-<none>}' -> '$ev_now') — nothing removed, the archive is kept"
             rm -f "$out"; return 2
+        fi
+        # ⛔ AND THE ROOT NAMES ARE NOT ENOUGH (review of #3422, P2). A file created INSIDE a tolerated
+        # root (`.worktree-report/late.md`) leaves the name set unchanged, so the comparison above read
+        # as covered while the archive — taken earlier — did not contain it: the removal took it. The
+        # captured MEMBER listing is compared with the listing now.
+        if [ "$ev_now" != "<none>" ]; then
+            # shellcheck disable=SC2086
+            ev_members_now="$(evidence_members "$path" $ev_now)"
+            ev_members_then="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$TAR_BIN" -tzf "$presv/lane-evidence.tar.gz" 2>/dev/null \
+                | sed 's|/$||' | sed '/^$/d' | sort -u)"
+            if [ "$ev_members_now" != "$ev_members_then" ]; then
+                REMOVE_SKIP_VERDICT="lane-evidence-appeared"
+                log "REMOVE-SKIP $path lane evidence CONTENT changed after the archive (captured $(printf '%s' "$ev_members_then" | wc -l | tr -d ' ') members, now $(printf '%s' "$ev_members_now" | wc -l | tr -d ' ')) — nothing removed, the archive is kept"
+                rm -f "$out"; return 2
+            fi
         fi
     fi
 

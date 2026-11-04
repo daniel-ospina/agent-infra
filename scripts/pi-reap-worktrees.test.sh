@@ -2523,7 +2523,8 @@ assert_dir "$WT_LATEF" "A21f the worktree is still on disk"
 MUT6="$T/$ENV/pi-reap-worktrees.mutant-evidence.sh"
 awk '
     /BUT `clean` HERE STILL TOLERATES THE LANE EVIDENCE/ { skip = 1 }
-    skip && /^        fi$/ { skip = 0; next }
+    skip && /ev_members_then/ { seen = 1 }
+    skip && seen && /^        fi$/ { skip = 0; seen = 0; next }
     !skip { print }
 ' "$REAPER" >"$MUT6"
 if cmp -s "$REAPER" "$MUT6"; then
@@ -2538,6 +2539,30 @@ OUT="$(REAPER_OVERRIDE="$MUT6" GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_L
     FAKE_LATE_COUNTER="$T/$ENV/cnt-f2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
 assert_nodir "$WT_LATEF2" "A21f MUTANT GOES RED: without the comparison the checkout IS removed"
 assert_nofile "$WT_LATEF2/WORKTREE-REPORT.md" "A21f …taking the mandatory report with it"
+
+# A21g — A FILE CREATED *INSIDE* THE TOLERATED DIRECTORY DURING THE ARCHIVE (review of #3422, P2). The
+# root-NAME comparison is blind to this (`.worktree-report` is `.worktree-report` whatever appears under
+# it), and the fleet's own fixture writes the mandated report INSIDE that directory — so the exact loss
+# the comparison was added for still happened one path segment down. The captured MEMBER listing is now
+# compared with the listing at the gate.
+ENV=A21g; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21g)'
+WT_LATEG="$(add_named_wt "$REPO" "$ENV-late3" feat/a21g-late)"
+mkdir -p "$WT_LATEG/.venv/bin" "$WT_LATEG/.worktree-report"
+printf 'py\n' >"$WT_LATEG/.venv/bin/python"
+printf 'stage1\n' >"$WT_LATEG/.worktree-report/run.log"
+rm -f "$T/$ENV/cnt-g"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEG/.worktree-report/late.md" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-g" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21g a file created INSIDE the tolerated dir during the archive is a PRESERVE"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CONTENT changed after the archive" \
+    "A21g …caught by the MEMBER comparison, not the name comparison"
+assert_file "$WT_LATEG/.worktree-report/late.md" "A21g the late file inside the tolerated dir SURVIVED"
+assert_dir "$WT_LATEG" "A21g the worktree is still on disk"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21g nothing was removed"
+
 
 # …AND THE ORDERING THE INSERTION DEPENDS ON (review of #3422, P3): the doc row claims
 # `holder_recheck` stays the LAST probe before the fork. Nothing else asserts it, and it is the reason

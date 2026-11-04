@@ -281,7 +281,6 @@ for sep in '\t' ' '; do
 import sys, re
 rec, sep = sys.argv[1], sys.argv[2].encode().decode('unicode_escape')
 s = open(rec).read()
-s = re.sub(r'^(?=[0-9a-f]{64}  pi-reap-worktrees\.sh$)', '', s, flags=re.M)
 s = s.replace('  pi-reap-worktrees.sh', sep + 'pi-reap-worktrees.sh')
 open(rec, 'w').write(s)
 PYSEP
