@@ -61,10 +61,17 @@ export DISK_LANE_SELF_MB= DISK_LANE_RESERVE_MB= DISK_LANE_TREE_MB=
 # ── the `df` stubs ───────────────────────────────────────────────────────────────────────────────
 # TWO separate directories, never one PATH prefix: the fixture must be able to say "readable, N MB"
 # and "UNREADABLE" without the arms sharing state.
-mkdir -p "$T/bin-ok" "$T/bin-dead"
+mkdir -p "$T/bin-ok" "$T/bin-dead" "$T/bin-select"
 printf '#!/bin/sh\navail=$(( ${FAKE_DF_AVAIL_MB:-0} * 1024 ))\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fake 9999999 0 $avail 1%% /"\n' > "$T/bin-ok/df"
 printf '#!/bin/sh\nexit 1\n' > "$T/bin-dead/df"
-chmod +x "$T/bin-ok/df" "$T/bin-dead/df"
+# ⛔ A PATH-SELECTIVE STUB (review round 4, P3), because the two above are all-or-nothing and so
+# cannot tell the FIXED ancestor walk from the round-1 mutant that walked PAST a failed `df`. Here
+# `df` fails for <dir>/vol — which EXISTS — and answers a roomy 999,999 MB for everything else. A
+# walk that treats a failed read as "not here, try the parent" therefore reaches `/` and ADMITS
+# (measured on the mutant: free=976562, rc 0), while the shipped code refuses as unreadable.
+mkdir -p "$T/vol"
+printf '#!/bin/sh\ncase "$*" in\n  *"$FAKE_DF_FAIL_DIR"*) exit 1 ;;\nesac\navail=999999000\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "fake 9999999 0 $avail 1%% /"\n' > "$T/bin-select/df"
+chmod +x "$T/bin-ok/df" "$T/bin-dead/df" "$T/bin-select/df"
 
 # ── a repo whose worktree creation we can watch ──────────────────────────────────────────────────
 mk_repo() {
@@ -83,20 +90,24 @@ mk_repo() {
 mk_repo
 REPO="$T/repo"
 
-# provision <bin-dir> <avail-mb> <name> [extra env assignments…]
+# provision <bin-dir> <avail-mb> <name> [extra env assignments…] [<absolute-target>]
 # Drives the SHIPPED `wt_provision` in a subshell with the stub on PATH, then reports what the
 # lifecycle actually did: the rc, WT_RESULT, whether a directory exists, whether a ref exists.
+# An ABSOLUTE path anywhere in the extra args overrides the worktree target (the ancestor-walk arm
+# needs a target that is not `$REPO/.worktrees/<name>`); every other extra arg is an env assignment.
 # ⛔ rc 4 IS THE SEAM'S OWN CODE for a disk refusal (nothing was ATTEMPTED); the CALLERS map it to the
 # harness's 77/AGENT_DISK_REFUSED so the capacity ledger and the operator see the disk gate. Both are
 # asserted below: 4 here, 77 in the verb arm — one verdict, two surfaces.
 provision() {
     local bindir="$1" avail="$2" name="$3"; shift 3
+    local target="$REPO/.worktrees/$name" envs="" a
+    for a in "$@"; do case "$a" in /*) target="$a" ;; *) envs="$envs $a" ;; esac; done
     ( cd "$REPO" && env PATH="$bindir:$PATH" FAKE_DF_AVAIL_MB="$avail" DISK_MIN_FREE_MB=500 \
-        DISK_BOX=cell-test "$@" bash -c '
+        DISK_BOX=cell-test $envs bash -c '
           . "$1" || exit 99
-          wt_provision "$2" ".worktrees/$3" "feat/$3" origin/main
+          wt_provision "$2" "$3" "feat/$4" origin/main
           printf "rc=%s\nWT_RESULT=%s\n" "$?" "$WT_RESULT"
-        ' _ "$WTL" "$REPO" "$name" )
+        ' _ "$WTL" "$REPO" "$target" "$name" )
 }
 
 ref_exists() { "$REAL_GIT" -C "$REPO" rev-parse --verify -q "refs/heads/$1" >/dev/null 2>&1; }
@@ -180,8 +191,17 @@ ck "…and it says the measurement is MISSING (free=?) rather than inventing a n
 [ -d "$REPO/.worktrees/d-tm" ] && rc=1 || rc=0
 ck "…and nothing was created" $rc
 
-# ── E) THE VERB: a dispatcher that is not this tree's shell code calls the same predicate ────────
-echo
+# ⛔ THE ANCESTOR WALK MUST NOT WALK PAST A FAILED READ (review round 4, P3 — the round-1 fix was
+# unpinned, so a revert was invisible). The target does not exist; its nearest EXISTING ancestor does,
+# and `df` fails for exactly that directory while answering a roomy figure for `/`. The seam must
+# report UNREADABLE, not hop to `/` and admit on a number that says nothing about this volume.
+OUT="$(provision "$T/bin-select" 0 e0-tm FAKE_DF_FAIL_DIR="$T/vol" "$T/vol/absent/deeper")"
+case "$OUT" in *'rc=4'*) rc=0 ;; *) rc=1 ;; esac
+ck "a failed \`df\` on the nearest EXISTING ancestor is REFUSED, not walked past to / ($(printf '%s' "$OUT" | head -1))" $rc
+case "$OUT" in *'REFUSED-UNKNOWN'*) rc=0 ;; *) rc=1 ;; esac
+ck "…and it is REFUSED-UNKNOWN — a parent's free space is not this volume's" $rc
+
+# ── E) THE VERB: a dispatcher that is not this tree's shell code calls the same predicate ────────echo
 echo "── E) the verb: spawn-gate.sh --disk-admit <target> ──"
 VOUT="$( env PATH="$T/bin-ok:$PATH" FAKE_DF_AVAIL_MB=3584 DISK_BOX=cell-3 DISK_MIN_FREE_MB=500 \
          bash "$GATE" --disk-admit "$REPO/.worktrees/verb-tm" )"; vrc=$?
@@ -274,6 +294,22 @@ echo
 # old `if [ "$_wt_rc" != 0 ]` and folding a disk refusal back into a generic add failure, or forgetting
 # the 77 mapping so the operator is told to wait for a load remedy that cannot arrive.
 echo "── H) every wt_provision caller keeps the rc-4 arm and its documented mapping ──"
+# ⛔ ONE EXTRACTION, USED BY THE CENSUS **AND** BY ITS NON-VACUITY PROOF (review round 4, P2 —
+# MEASURED). The round-3 proof re-implemented the extraction with a SECOND copy of the awk, so
+# reverting the census's own regex to the round-2 terminator left the suite at 40/40 including
+# "✅ the census is non-vacuous": the proof measured a copy of the code rather than the code. Now a
+# regression in HERE breaks the proof too, which is the only thing that makes it a proof.
+arm_of() { # <script> -> the rc-4 arm's body (empty if there is no arm)
+  if grep -qE '^[[:space:]]*4\)' "$1"; then
+    # ⛔ TERMINATE ON THE ARM'S OWN TERMINATOR, WHICH IS `break ;;` IN dispatch-merge (review round 3,
+    # P2 — MEASURED). Requiring a bare `;;` on its own line ran the capture to the END OF FILE (139
+    # lines instead of 27), so `grep -qF break` was satisfiable by any later `break`: changing the arm's
+    # `break ;;` to `continue ;;` still printed the pass. Any line ENDING in `;;` ends the arm.
+    awk '/^[[:space:]]*4\)[[:space:]]*#?/{f=1} f{print} f&&/;;[[:space:]]*$/{exit}' "$1"
+  else
+    awk '/(^|[[:space:]])(if|elif)[[:space:]]+\[.*_wt_rc[" ]*=[[:space:]]*["]?4/{f=1} f{print}' "$1" | awk '{print} /^[[:space:]]*fi[[:space:]]*$/{exit}'
+  fi
+}
 for pair in "fix-one.sh:AGENT_DISK_REFUSED" "adopt-fix.sh:exit 77" "dispatch-merge.sh:break"; do
   f="${pair%%:*}"; want="${pair##*:}"
   script="$HERE/$f"
@@ -281,16 +317,7 @@ for pair in "fix-one.sh:AGENT_DISK_REFUSED" "adopt-fix.sh:exit 77" "dispatch-mer
   # ⛔ SCOPED TO THE rc-4 ARM'S OWN BODY (review round 2, P2 — MEASURED). The first version grepped the
   # WHOLE file, and both tokens already appear pre-change elsewhere (`AGENT_DISK_REFUSED` at fix-one.sh's
   # live-arm readers, `break` in dispatch-merge's loop), so it could not fail for the reason it claims.
-  arm=""
-  if grep -qE '^[[:space:]]*4\)' "$script"; then
-    # ⛔ TERMINATE ON THE ARM'S OWN TERMINATOR, WHICH IS `break ;;` IN dispatch-merge (review round 3,
-    # P2 — MEASURED). Requiring a bare `;;` on its own line ran the capture to the END OF FILE (139
-    # lines instead of 27), so `grep -qF break` was satisfiable by any later `break`: changing the arm's
-    # `break ;;` to `continue ;;` still printed the pass. Any line ENDING in `;;` ends the arm.
-    arm="$(awk '/^[[:space:]]*4\)[[:space:]]*#?/{f=1} f{print} f&&/;;[[:space:]]*$/{exit}' "$script")"
-  else
-    arm="$(awk '/(^|[[:space:]])(if|elif)[[:space:]]+\[.*_wt_rc[" ]*=[[:space:]]*["]?4/{f=1} f{print}' "$script" | awk '{print} /^[[:space:]]*fi[[:space:]]*$/{exit}')"
-  fi
+  arm="$(arm_of "$script")"
   if [ -z "$arm" ]; then
     bad "H) $f has no rc-4 arm — a disk refusal from wt_provision would be read as an add failure"
     continue
@@ -305,15 +332,16 @@ case "$(grep -n '4 = REFUSED-DISK' "$WTL" | head -1)" in '')
   ok "H) wt-lifecycle.sh documents rc 4 = REFUSED-DISK in its own contract table" ;;
 esac
 
-# ⛔ NON-VACUITY PROOF FOR THE CENSUS (review round 3, P2 — the round-2 version was measured vacuous).
-# A source census that cannot fail for its own reason is a decoration. This mutates a COPY twice —
-# `break ;;` → `continue ;;` (the batch no longer stops, exactly the regression the arm exists for)
-# while ADDING an unrelated `break` later in the file — and requires the extraction to see the arm
-# WITHOUT the token. The real tree is untouched.
+# ⛔ NON-VACUITY PROOF FOR THE CENSUS (review rounds 3 and 4). A source census that cannot fail for
+# its own reason is a decoration. This mutates a COPY twice — `break ;;` → `continue ;;` (the batch no
+# longer stops, exactly the regression the arm exists for) while ADDING an unrelated `break` later in
+# the file — and requires the extraction to see the arm WITHOUT the token. It extracts through
+# `arm_of`, the SAME function the census uses, so a regression in that extraction fails HERE rather
+# than being masked by a second copy of it. The real tree is untouched.
 _mut="$T/mut-dispatch-merge.sh"
 sed -e 's/^\([[:space:]]*\)break ;;$/\1continue ;;/' "$HERE/dispatch-merge.sh" > "$_mut" 2>/dev/null
 printf '\nbreak\n' >> "$_mut"
-_marm="$(awk '/^[[:space:]]*4\)[[:space:]]*#?/{f=1} f{print} f&&/;;[[:space:]]*$/{exit}' "$_mut")"
+_marm="$(arm_of "$_mut")"
 if printf '%s' "$_marm" | grep -q 'SPAWNED_IDS\|CHAIN_IDS'; then
   if grep -qF 'break' <<<"$_marm"; then
     bad "H) the census is VACUOUS: a mutated dispatch-merge (break→continue, plus a stray break later) still passes"

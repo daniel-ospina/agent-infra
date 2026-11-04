@@ -418,10 +418,13 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 # verb, so a dispatcher that is not this tree's shell code (an ad-hoc pusher on another box) calls
 # THIS function instead of re-implementing `df`. That divergence — harness copy gated, ad-hoc copy
 # not — is the whole defect.
-# ⚠️ SCOPE, STATED (review round 2, P3): those three are the LANE creation paths, not every checkout
-# this tree ever creates. `stall-fix.sh` and `ai-drainer.sh` call `git worktree add` directly for
-# throwaway / mend checkouts and are NOT gated here — a named residual whose ENOSPC behaviour this
-# change does not alter, not a silent hole.
+# ⚠️ SCOPE, STATED (review rounds 2 and 4, P3): those three are the LANE creation paths, not every
+# checkout this tree ever creates. Five scripts still call `git worktree add` directly and are NOT
+# gated here — `stall-fix.sh` and `ai-drainer.sh` (throwaway / mend checkouts), `refresh-candidates.sh`,
+# `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance / hygiene checkouts). A named
+# residual whose ENOSPC behaviour this change does not alter, not a silent hole; `grep -rn 'worktree
+# add' scripts/` is the census, and moving any of them onto `wt_provision` (or the `--disk-admit` verb)
+# is the follow-up.
 #
 # ⛔ ONE PREDICATE, ON TWO BOUNDS — AND THE DIFFERENCE IS STATED, NOT GLOSSED (review round 2, P2).
 # `disk_admit` reads through `disk_free_mb_target` → `disk_free_mb`, classifies readability through
