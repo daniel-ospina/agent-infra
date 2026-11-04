@@ -4745,6 +4745,9 @@ STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENT_CAP
     run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$RECORD_RC" "5" "14.1d a failed body read is still a NAMED failure (rc 5)"
 assert_eq "$(dc_posts "$DC_PR")" "1" "14.1d …and the durable comment is STILL attempted — the channel exists for exactly this failure"
+# The READ-failure arm carries the OTHER exit-5 message; pin its scope too (14.10a3).
+assert_contains "$RECORD_ERR" "COVERS THE PR BODY ONLY" "14.1d the body-READ-failure exit-5 message also scopes itself to the body channel"
+assert_not_contains "$RECORD_ERR" "nothing carries the marker yet" "14.1d …and does not claim an ABSENCE it cannot know (a previous run's comment may carry it)"
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body is the only copy of the verdict that
@@ -4885,6 +4888,19 @@ if grep -qF 'review recorded:' "$PEND14" 2>/dev/null; then ok "14.10 …and it h
 #       "exits 5 having published nothing to the channel it exists for".
 assert_eq "$(dc_posts 424329)" "1" \
     "14.10a2 the PATCH-failure arm still publishes the durable comment (the arm the channel exists for)"
+# 14.10a3 THE EXIT-5 MESSAGE'S SCOPE (#3168 review cycle 3). Three review cycles in a
+#        row found these operator messages asserting more than the emitting code can
+#        know — "CI CANNOT SEE IT", "a durable comment was attempted on the line above",
+#        "ai-review-gate already admits the evidence". Every one of those was FALSE at a
+#        reachable arm, and NOTHING pinned the text, so any of them could come back with
+#        a green suite. These assertions are the pin: the message scopes itself to the
+#        BODY channel and does not resurrect the discredited claims.
+assert_contains "$RECORD_ERR" "body-marker-unposted" "14.10a3 the exit-5 failure still has its NAMED state"
+assert_contains "$RECORD_ERR" "COVERS THE PR BODY ONLY" "14.10a3 …and scopes itself to the body channel (the only thing it can assert)"
+assert_not_contains "$RECORD_ERR" "CI CANNOT SEE IT" "14.10a3 …it must NOT assert that CI cannot see the evidence (a posted comment IS admitted by the gate)"
+assert_not_contains "$RECORD_ERR" "currently INVISIBLE" "14.10a3 …nor that the evidence is invisible"
+assert_not_contains "$RECORD_ERR" "attempted on the line above" "14.10a3 …nor claim a comment post it cannot know happened (the unsigned and read-failure arms post none)"
+assert_not_contains "$RECORD_ERR" "already admits the evidence" "14.10a3 …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
 if grep -qF -- "actions/jobs/" "$LOG"; then
     bad "14.10 no rerun without a posted marker (log: $(cat "$LOG"))"
 else
