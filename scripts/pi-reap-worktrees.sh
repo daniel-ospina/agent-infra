@@ -1181,11 +1181,20 @@ is_agent_pointer_entry() { # <worktree-path> <entry>
 # (empty when none). Every name comes from IGNORED_LANE_EVIDENCE, which is space-free by construction,
 # so the caller may loop over this unquoted — the same discipline as `clean_gate`'s ephemeral payload.
 lane_evidence_present() {
-    local path="$1" e out=""
+    local path="$1" e out="" rc
     for e in $IGNORED_LANE_EVIDENCE; do
         # Bounded: this runs on the removal hot path (twice, either side of the archive), and a bare
         # `[ -e ]` is the same indefinite block on a hung mount as any other unbounded stat here.
-        if fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$e"; then out="$out$e "; fi
+        if fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$e"; then
+            out="$out$e "
+        else
+            rc=$?
+            # ⛔ "COULD NOT DETERMINE" IS NOT "NO EVIDENCE" (review of #3422 round 11, P3). 124 = the
+            # probe timed out, 125 = its own scratch file could not be made; treating either as absent
+            # skips the archive and the comparison entirely and lets the removal proceed over evidence
+            # nobody could read — the fail-open the sibling gate exists to prevent.
+            if [ "$rc" = 124 ] || [ "$rc" = 125 ]; then printf '!unreadable'; return 3; fi
+        fi
     done
     printf '%s' "${out% }"
 }
@@ -2021,44 +2030,47 @@ EOF
     return 1
 }
 
-# evidence_signature <path> <root>... — a CONTENT signature of the tolerated lane-evidence roots:
-# one `<crc> <size> <path>` line per file (`cksum`, POSIX). Both sides of the post-archive comparison are
-# produced by THIS function, so no two tools' output formats are ever compared — GNU `tar -t` QUOTES
-# member names (`back\slash`, `a\tb`, non-ASCII under a C locale) while `find` prints raw bytes, which
-# made a name-listing comparison differ forever on any such file and turn every pass into a silent,
-# green, permanent preserve (review of #3422 round 9). A size+CRC line also catches what a NAME listing
-# cannot: a member that existed at archive time and was appended to or rewritten during it.
+# evidence_signature <path> <root>... — a CONTENT signature of the tolerated lane-evidence roots.
+# Emits ONE short line: the `cksum` of a sorted stream of `<crc> <size> <path>` lines (one per file, via
+# POSIX `cksum`) plus a line for any root that is a symlink. Both sides of the post-archive comparison
+# are produced by THIS function, so no two tools' output formats are ever compared — GNU `tar -t` QUOTES
+# member names while `find` prints raw bytes, which made a name-listing comparison differ forever on any
+# such file (review of #3422 round 9). The size+CRC line also catches what a NAME listing cannot: a
+# member that existed at archive time and was appended to or rewritten during it.
 #
-# Return codes are a VERDICT, not a boolean (review of #3422 round 10, P1):
-#   0  the signature was taken
-#   1  the walk could not be completed  => the caller FAILS the removal (RED, exit 4)
-#   2  the evidence set exceeds EVIDENCE_SIG_MAX lines => the caller PRESERVES with a NAMED verdict
-# ⛔ AND NO `head -c`: it stops reading, `sort` dies on SIGPIPE (141), and under `pipefail` a perfectly
-# readable tree reds the row forever with the wrong diagnosis ("could not be walked") — measured. The cap
-# is applied with `awk` (which consumes the whole stream) as ONE line past the limit, so an over-large
-# set is DETECTED rather than silently truncated to a pseudo-random subset of files.
-EVIDENCE_SIG_MAX="${REAP_WT_EVIDENCE_SIG_MAX:-2048}"
+# ⛔ THE DIGEST IS STREAMED, SO THERE IS NO SIZE CAP (review of #3422 round 10/11). Holding the listing in
+# a shell variable forced a cap, and a cap had no honest polarity: `head -c` on a `pipefail` pipeline made
+# a READABLE tree red forever via SIGPIPE, and "over the cap ⇒ PRESERVE" made the row permanently
+# unreclaimable while the pass reported success — the inert-but-green disease, back again. `| cksum`
+# consumes the whole stream and emits 11 bytes, so every file is compared and nothing needs a limit.
+#
+# ⛔ AND A SYMLINK IS FINGERPRINTED AS A LINK, NEVER FOLLOWED (review of #3422 round 11). `cksum` through
+# a DANGLING symlink fails, which would red every pass forever with the false diagnosis "evidence could
+# not be walked"; through a live one it makes the target's whole tree count against the checkout, when a
+# target outside the checkout cannot be destroyed by the removal at all. The link's own target string is
+# what the comparison needs and all it can justify.
+#
+# Return code: 0 the signature was taken; 1 the walk could not be completed => caller FAILS the removal.
 evidence_signature() {
-    local path="$1" r sig n rc
+    local path="$1" r sig
     shift
     sig="$(
         for r in "$@"; do
             case "$r" in ''|'<none>'|*/*) continue ;; esac
-            # The trailing `/` makes `find` follow a SYMLINKED root: without it the walk emits nothing
-            # while `fs_isdir_bounded` says "dir" and `tar` stores only the link, so a symlinked
-            # `.worktree-report` would compare equal on both sides and be destroyed with the checkout
-            # (review of #3422 round 10, P3).
-            if fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
+            # ⛔ THE LINK TEST COMES FIRST, because `fs_exists_bounded` deliberately says TRUE for a
+            # DANGLING symlink (`-e || -L`), so testing existence before link-ness sent a broken link
+            # into the `cksum` arm and red'd every pass (review of #3422 round 11, P2).
+            if [ -L "$path/$r" ]; then
+                # its identity is the LINK, never the target: following a live link would make an
+                # out-of-checkout tree count against this checkout, and following a dangling one fails
+                printf 'link %s -> %s\n' "$r" "$(readlink "$path/$r" 2>/dev/null)"
+            elif fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
                 fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r/" -type f -exec cksum {} + || exit 3
-            else
+            elif fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
                 fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r" || exit 3
             fi
-        done | sed '/^$/d' | sort -u | awk -v n="$EVIDENCE_SIG_MAX" 'NR <= n + 1'
-    )"
-    rc=$?
-    [ "$rc" = 0 ] || return 1
-    n="$(printf '%s\n' "$sig" | grep -c .)"
-    [ "$n" -le "$EVIDENCE_SIG_MAX" ] || return 2
+        done | sed '/^$/d' | sort -u | cksum
+    )" || return 1
     printf '%s' "$sig"
     return 0
 }
@@ -3746,7 +3758,7 @@ holder_recheck() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local ev_archived ev_now ev_before ev_sig_before ev_sig_now sig_rc
+    local ev_archived ev_now ev_before ev_sig_before ev_sig_now sig_rc ev_rc
     local path="$1" sha="$2" br="${3:-}" why="${4:-}" presv=""
     local eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
@@ -3823,16 +3835,17 @@ remove_one() {
     if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
         # The signature is taken BEFORE the archive so it can be compared with the tree AFTER it; a
         # walk that cannot complete is a FAILED removal (this gate could not do its job), never a skip.
-        ev_before="$(lane_evidence_present "$path")"
+        ev_before="$(lane_evidence_present "$path")"; ev_rc=$?
+        if [ "$ev_rc" = 3 ]; then
+            REMOVE_SKIP_VERDICT="evidence-unreadable"
+            log "PRESERVE-SKIP $path the lane-evidence probe could not answer — nothing removed, and this pass is RED"
+            rm -f "$out"; return 1
+        fi
         ev_sig_before=""
         if [ -n "$ev_before" ]; then
             # shellcheck disable=SC2086
             ev_sig_before="$(evidence_signature "$path" $ev_before)"; sig_rc=$?
-            if [ "$sig_rc" = 2 ]; then
-                REMOVE_SKIP_VERDICT="lane-evidence-too-large"
-                log "REMOVE-SKIP $path lane evidence exceeds $EVIDENCE_SIG_MAX files — its stability across the archive cannot be proven, nothing removed (the archive is kept)"
-                rm -f "$out"; return 2
-            elif [ "$sig_rc" != 0 ]; then
+            if [ "$sig_rc" != 0 ]; then
                 REMOVE_SKIP_VERDICT="evidence-unreadable"
                 log "PRESERVE-SKIP $path lane evidence could not be walked before the archive — nothing removed, and this pass is RED"
                 rm -f "$out"; return 1
@@ -3878,7 +3891,12 @@ remove_one() {
         # archive root, so a bare `sed` on it is the same unbounded open the rest of this block exists
         # to avoid — and it would wedge a oneshot unit with no timeout while the pass lock is held.
         ev_archived="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" sed -n 's/^lane_evidence=//p' "$presv/manifest.txt" 2>/dev/null | head -1)"
-        ev_now="$(lane_evidence_present "$path")"
+        ev_now="$(lane_evidence_present "$path")"; ev_rc=$?
+        if [ "$ev_rc" = 3 ]; then
+            REMOVE_SKIP_VERDICT="evidence-unreadable"
+            log "PRESERVE-SKIP $path the lane-evidence probe could not answer after the archive — nothing removed, and this pass is RED"
+            rm -f "$out"; return 1
+        fi
         [ -n "$ev_now" ] || ev_now="<none>"
         if [ "$ev_now" != "${ev_archived:-<none>}" ]; then
             REMOVE_SKIP_VERDICT="lane-evidence-appeared"
@@ -3895,20 +3913,22 @@ remove_one() {
         if [ "$ev_now" != "<none>" ]; then
             # shellcheck disable=SC2086
             ev_sig_now="$(evidence_signature "$path" $ev_now)"; sig_rc=$?
-            if [ "$sig_rc" = 2 ]; then
-                REMOVE_SKIP_VERDICT="lane-evidence-too-large"
-                log "REMOVE-SKIP $path lane evidence exceeds $EVIDENCE_SIG_MAX files after the archive — its stability cannot be proven, nothing removed (the archive is kept)"
-                rm -f "$out"; return 2
-            elif [ "$sig_rc" != 0 ]; then
+            if [ "$sig_rc" != 0 ]; then
                 REMOVE_SKIP_VERDICT="evidence-unreadable"
                 log "PRESERVE-SKIP $path lane evidence could not be walked after the archive — nothing removed, and this pass is RED"
                 rm -f "$out"; return 1
             fi
             if [ "$ev_sig_now" != "$ev_sig_before" ]; then
                 REMOVE_SKIP_VERDICT="lane-evidence-changed"
-                log "REMOVE-SKIP $path lane evidence CHANGED during the archive ($(printf '%s' "$ev_sig_before" | grep -c .) -> $(printf '%s' "$ev_sig_now" | grep -c .) files) — nothing removed, the archive is kept"
+                log "REMOVE-SKIP $path lane evidence CHANGED during the archive (signature $ev_sig_before -> $ev_sig_now) — nothing removed, the archive is kept"
                 rm -f "$out"; return 2
             fi
+        elif [ "$ev_before" != "<none>" ] && [ "$ev_before" != "$ev_archived" ]; then
+            # NOT silent (review of #3422 round 11, P3): tolerated evidence that was there before the
+            # archive and GONE after it means the comparison's own precondition was waived. Nothing is
+            # lost (the archive holds what was captured), so this is not a preserve — but a waived gate
+            # that says nothing is how a gate stops being one, so it is named.
+            log "REMOVE-NOTE $path tolerated lane evidence vanished during the archive (was '$ev_before') — the before-signature is waived; what existed at capture time is in the archive"
         fi
     fi
 

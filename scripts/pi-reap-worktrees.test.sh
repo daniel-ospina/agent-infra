@@ -2623,45 +2623,62 @@ printf 'stage1\n' >"$WT_H2/.worktree-report/run.log"
 rm -f "$T/$ENV/cnt-h2"
 OUT="$(REAPER_OVERRIDE="$MUT7" GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_H2/.worktree-report/run.log" \
     FAKE_LATE_COUNTER="$T/$ENV/cnt-h2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
-# A21j — AN OVER-LARGE EVIDENCE SET IS A NAMED PRESERVE, AND THE CAP MUST NOT SIGPIPE (review of #3422
-# round 10, P1). `head -c` stopped reading, `sort` died on SIGPIPE (141) and `pipefail` made a perfectly
-# readable tree RED forever with the wrong diagnosis — and the truncation it did apply compared a
-# pseudo-random subset of files, so a change past the cut was invisible. The cap is now applied with awk
-# (which consumes the stream) and crossing it is `lane-evidence-too-large` (PRESERVE, named).
+assert_nodir "$WT_H2" "A21h MUTANT GOES RED: without the signature comparison the checkout IS removed"
+assert_absent "$(cat "$WT_H2/.worktree-report/run.log" 2>/dev/null)" "stage2 appended during the archive" \
+    "A21h …and the content appended during the archive is GONE (the archive only holds stage 1)"
+# A21j — A LARGE EVIDENCE SET IS COMPARED IN FULL, WITH NO CAP AND NO RED (review of #3422 rounds 10/11,
+# P1/P2). The listing is now streamed into `| cksum`, so there is no size limit to cross: the earlier cap
+# had no honest polarity — `head -c` on a `pipefail` pipeline made a READABLE tree red forever via
+# SIGPIPE, and "over the cap ⇒ PRESERVE" made the row permanently unreclaimable while the pass reported
+# success (inert-but-green). Both arms below fail if a cap comes back: a large set that is stable must be
+# RECLAIMED, and an append to the LAST-sorting member of that same set must still be CAUGHT (a truncated
+# listing would compare equal).
 ENV=A21j; REPO="$(mk_late_repo $ENV)"
 printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
 "$REAL_GIT" -C "$REPO" add .gitignore
 GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21j)'
+mk_set() { # mk_set <worktree> — a set large enough that a truncating cap would hide the last member
+    local wt="$1" i=0
+    mkdir -p "$wt/.venv/bin" "$wt/.worktree-report"
+    printf 'py\n' >"$wt/.venv/bin/python"
+    while [ "$i" -lt 300 ]; do
+        printf 'x\n' >"$wt/.worktree-report/a-$(printf '%03d' "$i").log"; i=$((i + 1))
+    done
+    printf 'stage1\n' >"$wt/.worktree-report/z-last.log"
+}
 WT_J="$(add_named_wt "$REPO" "$ENV-late" feat/a21j-late)"
-mkdir -p "$WT_J/.venv/bin" "$WT_J/.worktree-report"
-printf 'py\n' >"$WT_J/.venv/bin/python"
-i=0; while [ "$i" -lt 8 ]; do printf 'x\n' >"$WT_J/.worktree-report/a-$i.log"; i=$((i + 1)); done
-# The cap is a seam so the arm does not have to create thousands of files (the fixture would take
-# minutes on a loaded box); the CODE PATH is identical.
-EVIDENCE_SIG_MAX=5 OUT="$(REAP_WT_EVIDENCE_SIG_MAX=5 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
-assert_eq "$RC" "0" "A21j an over-large evidence set does NOT red the pass (no SIGPIPE: exit 0, not 4)"
-assert_contains "$(cat "$T/$ENV/reap.log")" "exceeds $EVIDENCE_SIG_MAX files" \
-    "A21j …it is a NAMED verdict (lane-evidence-too-large), not a fabricated 'could not be walked'"
-assert_dir "$WT_J" "A21j nothing was removed (stability across the archive cannot be proven)"
-assert_contains "$(footer $ENV)" "REMOVED=0" "A21j …and the footer agrees"
-# control: with the DEFAULT cap the same fixture is reclaimed — the cap is not a blanket veto
-OUT="$(run_reaper $ENV --apply --repo "$REPO")"
-assert_nodir "$WT_J" "A21j control: under the default cap the same fixture IS reclaimed (not a veto)"
+mk_set "$WT_J"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21j a LARGE evidence set does not red the pass (no SIGPIPE: exit 0, not 4)"
+assert_nodir "$WT_J" "A21j …and it IS reclaimed: there is no cap, so nothing is permanently unreclaimable"
+WT_J2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21j-late2)"
+mk_set "$WT_J2"
+rm -f "$T/$ENV/cnt-j2"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_J2/.worktree-report/z-last.log" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-j2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21j an append to the LAST-sorting member of a large set is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21j …caught: the digest covers the WHOLE set (a truncated listing would compare equal)"
+assert_contains "$(cat "$WT_J2/.worktree-report/z-last.log" 2>/dev/null)" "appended during the archive" \
+    "A21j …and the appended content SURVIVED"
+assert_dir "$WT_J2" "A21j …with the worktree still on disk"
 
-# A21k — a SYMLINKED tolerated root is WALKED (review of #3422 round 10, P3). `find` does not follow its
-# operand without a trailing slash, while `fs_isdir_bounded` says "dir" and `tar` stores only the link —
-# so the CONTENT behind a symlinked `.worktree-report` was never compared. The signature now uses
-# `find "$path/$r/"`, and the walk's operand is what this asserts: the run below reaches the archive for
-# a symlinked root, and `find` is invoked with a trailing slash on it (checked through a recording
-# wrapper), which is the difference between "compared" and "a bare link".
+# A21k — the tolerated roots are compared, in the right SHAPE (review of #3422 rounds 10/11, P3/P2).
+# Two shapes, one pass: (a) a real directory root is walked with a TRAILING-SLASH operand (`find` does not
+# follow its operand without it — with a symlink that silently compared an empty set on both sides), and
+# (b) a SYMLINKED root is compared AS A LINK, never followed: `tar` stores only the link, and following a
+# target that lives OUTSIDE the checkout would count the whole tree against this checkout.
 ENV=A21k; REPO="$(mk_late_repo $ENV)"
 printf '.worktree-report\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
 "$REAL_GIT" -C "$REPO" add .gitignore
 GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21k)'
 mkdir -p "$T/$ENV-evidence"; printf 'keep me\n' >"$T/$ENV-evidence/report.md"
-WT_K="$(add_named_wt "$REPO" "$ENV-late" feat/a21k-late)"
-mkdir -p "$WT_K/.venv/bin"; printf 'py\n' >"$WT_K/.venv/bin/python"
-ln -s "$T/$ENV-evidence" "$WT_K/.worktree-report"
+WT_K="$(add_named_wt "$REPO" "$ENV-dir" feat/a21k-dir)"
+mkdir -p "$WT_K/.venv/bin" "$WT_K/.worktree-report"; printf 'py\n' >"$WT_K/.venv/bin/python"
+printf 'stage1\n' >"$WT_K/.worktree-report/run.log"
+WT_K2="$(add_named_wt "$REPO" "$ENV-link" feat/a21k-link)"
+mkdir -p "$WT_K2/.venv/bin"; printf 'py\n' >"$WT_K2/.venv/bin/python"
+ln -s "$T/$ENV-evidence" "$WT_K2/.worktree-report"
 cat >"$T/bin/find-recording" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FIND_ARGS_LOG:?}"
@@ -2671,15 +2688,45 @@ chmod +x "$T/bin/find-recording"
 : >"$T/$ENV/find-args"
 OUT="$(REAP_WT_FIND_BIN="$T/bin/find-recording" FIND_ARGS_LOG="$T/$ENV/find-args" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 if grep -qF '.worktree-report/' "$T/$ENV/find-args" 2>/dev/null; then
-    ok "A21k a SYMLINKED evidence root is walked WITH A TRAILING SLASH (its content is compared, not a bare link)"
+    ok "A21k a DIRECTORY evidence root is walked with a TRAILING-SLASH operand (its content is compared)"
 else
-    bad "A21k the walk did not use a trailing-slash operand on the symlinked root — content uncompared"
+    bad "A21k the walk did not use a trailing-slash operand on the directory root — content uncompared"
 fi
-assert_eq "$RC" "0" "A21k the pass completes cleanly with a symlinked evidence root (no fabricated RED)"
-assert_nodir "$WT_H2" "A21h MUTANT GOES RED: without the signature comparison the checkout IS removed"
-assert_absent "$(cat "$WT_H2/.worktree-report/run.log" 2>/dev/null)" "stage2 appended during the archive" \
-    "A21h …and the content appended during the archive is GONE (the archive only holds stage 1)"
+if grep -qF '.worktree-report' "$T/$ENV/find-args" 2>/dev/null && \
+   grep -qF "$T/$ENV-evidence" "$T/$ENV/find-args" 2>/dev/null; then
+    bad "A21k a SYMLINKED evidence root was FOLLOWED into its target — a link must be compared as a link"
+else
+    ok "A21k a SYMLINKED evidence root is NOT followed into its target (compared as a link, the shape tar stores)"
+fi
+assert_absent "$(cat "$T/$ENV/reap.log")" "could not be walked" \
+    "A21k neither shape is diagnosed as an unwalkable tree"
+assert_eq "$RC" "0" "A21k the pass completes cleanly with both root shapes (no fabricated RED)"
+assert_nodir "$WT_K" "A21k the directory-root worktree is reclaimed"
+assert_nodir "$WT_K2" "A21k the symlink-root worktree is reclaimed, its out-of-checkout target untouched"
+assert_contains "$(cat "$T/$ENV-evidence/report.md" 2>/dev/null)" "keep me" \
+    "A21k …and the thing the symlink pointed at is still there"
 
+# A21l — A DANGLING tolerated symlink is compared AS A LINK, never followed (review of #3422 round 11,
+# P2). `fs_isdir_bounded` is `[ -d ]`, false for a dangling link, so the walk took the file arm and
+# `cksum` through the broken target failed — turning a benign entry into exit 4 RED on EVERY pass, with
+# the false diagnosis "evidence could not be walked", when the removal destroys nothing (a dangling link
+# has no content). The link's target string is what is compared on both sides.
+ENV=A21l; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21l)'
+WT_L="$(add_named_wt "$REPO" "$ENV-late" feat/a21l-late)"
+mkdir -p "$WT_L/.venv/bin"; printf 'py\n' >"$WT_L/.venv/bin/python"
+ln -s "$T/$ENV-does-not-exist" "$WT_L/.worktree-report"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+if [ "$RC" = 4 ]; then
+    bad "A21l a DANGLING evidence symlink reds the pass (exit 4) — that would repeat every pass forever"
+else
+    ok "A21l a DANGLING evidence symlink does NOT red the pass (got rc=$RC)"
+fi
+assert_absent "$(cat "$T/$ENV/reap.log")" "could not be walked" \
+    "A21l …and it is not logged as an unwalkable tree (the diagnosis names what actually happened)"
+assert_nodir "$WT_L" "A21l a dangling link holds nothing, so the checkout is still reclaimed"
 
 # A21i — A SIGNATURE THAT CANNOT BE TAKEN IS A RED PASS, NOT A SILENT PRESERVE (review of #3422 round 9,
 # P2). `fs_bounded_out` emits nothing on a non-zero rc, so discarding the rc made "the walk failed" look
