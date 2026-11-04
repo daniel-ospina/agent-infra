@@ -3721,7 +3721,7 @@ MUTANT_PRE="$T/mutant-verdict-reverted.sh"
 # Portable across GNU and BSD sed: a `c\` command is not portable, so the
 # loose mutant neutralises the guard's DECISION at its call site instead.
 sed 's#clean_low_shape_ok "\$ROWS"#true#' "$RECORD" > "$MUTANT_LOOSE"
-sed 's#^  clean|clean-micro|clean-low) ;;#  clean|clean-micro) ;;#' "$RECORD" > "$MUTANT_PRE"
+sed 's#^  clean|clean-micro|clean-low|not-clean) ;;#  clean|clean-micro) ;;#' "$RECORD" > "$MUTANT_PRE"
 bash -n "$MUTANT_LOOSE" && ok "mutation: neutered-guard mutant parses" || bad "mutation: neutered-guard mutant is not valid bash"
 bash -n "$MUTANT_PRE" && ok "mutation: reverted-verdict mutant parses" || bad "mutation: reverted-verdict mutant is not valid bash"
 if cmp -s "$MUTANT_LOOSE" "$RECORD"; then bad "mutation: guard-neutering sed did not change the script"; else ok "mutation: guard-neutering sed changed the script"; fi
@@ -5331,9 +5331,417 @@ assert_contains "$RECORD_ERR" "could not verify the PR head" "19.6 the refusal s
 [ ! -f "$(Q2 $E_NOREPO)" ] && ok "19.6 no record written" || bad "19.6 a record was written for an unverifiable pin"
 [ ! -f "$F_HOME/.pi/agent/reviews/$E_NOREPO.json" ] && ok "19.6 no legacy record written" || bad "19.6 a legacy record was written for an unverifiable pin"
 
+# The repo root, so §20 can read the merge gate's OWN allowlist rather than a
+# restatement of it (a copied list is how a new verdict drifts out of the gate).
+REPO_ROOT="$(cd "$(dirname "$RECORD")/.." && pwd)"
+
+# ═════════════════════════════════════════════════════════════════════════
+# 20. #3400 — THE NEGATIVE VERDICT, AND RECENCY-AWARE MARKER READING
+# ═════════════════════════════════════════════════════════════════════════
+# The defect this section pins is a reviewed artifact moving under its record
+# with nothing noticing. Three live instances in one night: a train whose head
+# moved after its composite review, a composed tree that carried code REMOVING a
+# fail-open fix, and tortoise#3295 whose body said `verdict=clean` while the most
+# recent review at that head was NOT CLEAN. The last one survived because the
+# recorder had NO negative verdict (agent-infra#3400) and the marker reader could
+# not SEE a negative marker (agent-infra#3410): a `verdict=not-clean` line fell
+# into RB_NBAD ("a marker whose signature does not verify"), so the keep-LAST rule
+# — which already existed at the base commit, `1f69ab544:2521` — could never be
+# given a negative to keep, and an earlier `clean` won by being the only readable
+# marker. (Stated precisely: the delta is VISIBILITY, not recency. "Recency was
+# presence-based" would be false — the recency rule was already there.)
+#
+# ⛔ EVERY ARM BELOW IS A DISCRIMINATOR, not a smoke test: 20.2 fails if recency
+# handling is removed (first-marker-wins would recover `clean`), and 20.4 fails
+# if `not-clean` grows a path that skips the evidence requirement `clean` has.
+echo "── 20. #3400: the negative verdict + recency-aware marker reading ────────────"
+
+# 20.0 THE MINT. A `not-clean` verdict must be RECORDABLE at all — that was the
+# defect: the verdict list admitted clean|clean-micro|clean-low, so a review that
+# found a defect could not be written down anywhere a gate reads.
+NEG_F=1
+run_record_neg() { # <pr> [extra args…]; $EV_REF names the artifact (empty ⇒ omit)
+    local pr="$1"; shift
+    local rcfile="$T/negrc" errfile="$T/negerr"
+    rm -f "$errfile"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        rc=0
+        if [ -n "${EV_REF:-}" ]; then
+            bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+                --findings "${NEG_F:-1}" --evidence "$EV_REF" "$@" 2>"$errfile" || rc=$?
+        else
+            bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+                --findings "${NEG_F:-1}" "$@" 2>"$errfile" || rc=$?
+        fi
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+NEG_PR=424950
+EV_REF="comment:42495001"
+STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+1 open P2: the retry loop re-reads the claim after the lock is released.'
+export STUB_EVIDENCE_BODY
+run_record_neg "$NEG_PR"
+assert_eq "$RECORD_RC" "0" "20.0 a not-clean verdict MINTS (rc 0) — before #3400 this was exit 2 and no record could exist"
+NEG_REC="$(Q2 "$NEG_PR")"
+if [ -f "$NEG_REC" ]; then ok "20.0 the negative record file is written"; else bad "20.0 no record written for not-clean"; fi
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"verdict":"not-clean"' "20.0 the record carries verdict=not-clean"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"findings":1' "20.0 …and the FINDING COUNT, so the gate can say WHAT is open"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "20.0 …bound to the head exactly as a clean record is"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"evidence":"comment:42495001"' "20.0 …and it names the VERIFIED artifact it rests on"
+assert_contains "$RECORD_ERR" "review evidence verified" "20.0 …because the evidence gate actually RAN (not skipped by the negative verdict)"
+
+# 20.1 THE GATE READS IT AS A FAILURE NAMING THE FINDING — not as "no record".
+# The merge gate's allowlist (`extensions/review-enforcer::ACCEPTED_VERDICTS`) is
+# the ONE place a verdict unlocks a merge, so a recorded negative must be ABSENT
+# from it (recording one must never license a merge) while the gate's own
+# not-clean branch names the head and the count (so a lane is not sent to "record
+# a review" it already did, which is the "no record found" confusion).
+ENF="$REPO_ROOT/extensions/review-enforcer/index.ts"
+if [ -f "$ENF" ]; then
+    ACC_LIST="$(command grep -n 'export const ACCEPTED_VERDICTS' "$ENF" | command head -1)"
+    case "$ACC_LIST" in
+        *not-clean*) bad "20.1 not-clean is in ACCEPTED_VERDICTS — recording a negative would license a merge" ;;
+        *) ok "20.1 not-clean is NOT in the merge allowlist (a negative record blocks, as it must)" ;;
+    esac
+    command grep -q 'reviewed NOT CLEAN at' "$ENF" \
+        && ok "20.1 the gate NAMES the finding (\"reviewed NOT CLEAN at <sha>: N open finding(s)\"), not \"no record found\"" \
+        || bad "20.1 the gate has no not-clean branch — a recorded negative would read as an absent record"
+    command grep -q 'record.findings' "$ENF" \
+        && ok "20.1 …and it reads the recorded COUNT" \
+        || bad "20.1 the gate never reads the recorded finding count"
+else
+    bad "20.1 fixture: extensions/review-enforcer/index.ts not found at $ENF"
+fi
+
+# 20.2 RECENCY. Two markers at the SAME head, `clean` FIRST and `not-clean`
+# SECOND — the exact tortoise#3295 shape. The reader must take the LATEST one.
+# ⛔ MUTATION PIN: with recency handling removed (keep-first, or a presence test
+# that stops at the first match), the recovered record is `clean` and this arm
+# FAILS. That is what makes it a discriminator rather than a smoke test.
+rb_clear
+NEG_HEAD="$(printf 'd%.0s' $(seq 1 40))"
+NEG_DIFF="$(printf '7%.0s' $(seq 1 64))"
+NEG_M_CLEAN="$(rb_marker 424952 "review recorded: reviews/424952.json verdict=clean @ $NEG_HEAD diff=$NEG_DIFF ($RB_REPO)")" \
+  || bad "fixture: the clean marker could not be BUILT — 20.2 would otherwise fail on a missing marker"
+NEG_M_NEG="$(rb_marker 424952 "review recorded: reviews/424952.json verdict=not-clean @ $NEG_HEAD diff=$NEG_DIFF ($RB_REPO) findings=2")" \
+  || bad "fixture: the not-clean marker could not be BUILT — 20.2 would otherwise fail on a missing marker"
+export STUB_BODY="Some PR description.
+
+$NEG_M_CLEAN
+
+$NEG_M_NEG"
+run_recover 424952 "$RB_REPO"
+NEG_REC2="$RB_RDIR/daniel-ospina-agent-infra-424952.json"
+assert_eq "$RB_RC" "0" "20.2 a body with clean-then-not-clean recovers (exit 0)"
+assert_contains "$(cat "$NEG_REC2" 2>/dev/null)" '"verdict":"not-clean"' \
+  "20.2 the LATEST marker wins: verdict=not-clean, NOT the earlier clean (#3410)"
+assert_contains "$(cat "$NEG_REC2" 2>/dev/null)" '"findings":2' \
+  "20.2 …carrying the negative marker's own finding count"
+if command grep -q '"verdict":"clean"' "$NEG_REC2" 2>/dev/null; then
+    bad "20.2 the recovered record says clean — a later NOT CLEAN did not supersede it (recency handling missing)"
+else
+    ok "20.2 …and the superseded clean verdict is not in the record"
+fi
+
+# 20.3 REGRESSION GUARD — the negative verdict must not open a hole in the CLEAN
+# path. §13f proves a clean mint over a NOT-CLEAN artifact refuses; this re-runs
+# that pair AFTER a successful not-clean mint, because the (1b) declared-negative
+# arm is the thing most likely to be refactored while adding a negative family.
+#
+# ⛔ WHAT THIS ARM DOES *NOT* PROVE (review, P3-3): it is NOT a (1b) discriminator.
+# Its artifact carries NO `Outcome:` line, so the LOOSE arm (2) refuses it too on
+# its own (`not[[:space:]_-]*clean`, unsuppressed) — delete arm (1b) entirely and
+# this arm still goes green with rc 3. It is a guard that the CLEAN path still
+# refuses at all, which is worth keeping and is all it claims. The pins that can
+# ONLY pass through (1b) are §13n4/§13n5 (an `**Outcome: CLEAN …**` line, which
+# SUPPRESSES arm (2), plus a declared NOT-CLEAN header) and §20.3b below, which is
+# the same shape placed next to this arm so the claim and its pin travel together.
+rb_clear
+STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+2 P1s remain: unbounded retry, missing auth check.'
+EV_REF="comment:42495301" run_record_ev 424953
+assert_eq "$RECORD_RC" "3" "20.3 a CLEAN mint over a declared-negative artifact still REFUSES (rc 3) — arm (2) alone suffices here; the (1b) pin is 20.3b"
+if [ -f "$(Q2 424953)" ]; then bad "20.3 the refused clean mint wrote a record"; else ok "20.3 …and writes nothing"; fi
+
+# 20.4 `not-clean` DOES NOT BUY A CHEAPER PATH. It is held to `--evidence` exactly
+# as `clean` is: without an artifact it must refuse with exit 3, or a lane could
+# park a PR with a recorded negative it never earned.
+rb_clear
+EV_REF=""
+run_record_neg 424954
+assert_eq "$RECORD_RC" "3" "20.4 a not-clean mint with NO --evidence refuses (exit 3)"
+if [ -f "$(Q2 424954)" ]; then bad "20.4 an unevidenced negative wrote a record"; else ok "20.4 …and writes nothing"; fi
+assert_contains "$RECORD_ERR" "NEGATIVE verdict is still a claim" "20.4 …and says WHY a negative verdict needs evidence"
+
+# 20.5 `--findings` is REQUIRED on not-clean and REFUSED elsewhere. Both are
+# silently wrong otherwise: a negative with no count cannot be reported, and a
+# clean record that swallowed a count looks like it recorded findings it cannot
+# carry.
+NEG_F=0
+EV_REF="comment:42495501"
+run_record_neg 424955
+assert_eq "$RECORD_RC" "2" "20.5 --findings 0 is a contradiction and refuses (rc 2)"
+if [ -f "$(Q2 424955)" ]; then bad "20.5 --findings 0 wrote a record"; else ok "20.5 …and writes nothing"; fi
+NEG_F=1
+run_record_raw 424956 "$SHA" clean "daniel-ospina/agent-infra" --findings 3 $EV_ARGS
+assert_eq "$RECORD_RC" "2" "20.5 --findings on a CLEAN verdict is refused, not silently dropped (rc 2)"
+assert_contains "$RECORD_ERR" "only meaningful with 'not-clean'" "20.5 …and names why"
+
+# ── 20.6 (review P2-1) THE COUNT IS A CANONICAL JSON NUMBER, NOT A SPELLING ──
+# The record writes `"findings":$FINDINGS` UNQUOTED, because every reader binds it
+# as a JSON NUMBER (review-enforcer: `typeof record.findings === "number"`). So a
+# zero-padded count is not cosmetic: `007` emits `"findings":007`, which does not
+# parse, and the gate reads an unparseable record as NO RECORD — the #3400
+# confusion, re-created by the feature that ends it.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX ARM AND CANNOT PASS BY ACCIDENT: before the fix
+# `^[0-9]+$` accepted `007`, `[ 007 -lt 1 ]` was FALSE (bash reads a leading zero
+# as octal) and the raw value was written straight through.
+run_record_neg_cap() { # <pr> [extra args…] — the mint, CAPTURING the posted marker
+    local pr="$1"; shift
+    local rcfile="$T/negrc" errfile="$T/negerr" cap="$T/negcap"
+    rm -f "$errfile"; : > "$cap"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_CAPTURE="$cap"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        rc=0
+        bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+            --findings "${NEG_F:-1}" --evidence "${EV_REF}" "$@" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+    NEG_CAP="$(cat "$cap" 2>/dev/null || true)"
+    # The PATCH sink holds the gh API ENVELOPE (`{"body":"…\n…"}`), whose marker
+    # line is a `\n`-ESCAPED string rather than a line. Decode it: a round-trip has
+    # to start from the body a reader of the PR would actually see.
+    NEG_BODY="$(command python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$cap" 2>/dev/null || true)"
+    [ -n "$NEG_BODY" ] || NEG_BODY="$NEG_CAP"
+}
+NEG_F=007
+EV_REF="comment:42496001"
+run_record_neg_cap 424961
+assert_eq "$RECORD_RC" "0" "20.6 --findings 007 is ACCEPTED and NORMALISED, not written verbatim (rc 0)"
+NEG_PAD_REC="$(Q2 424961)"
+assert_contains "$(cat "$NEG_PAD_REC" 2>/dev/null)" '"findings":7,' "20.6 …the record carries the canonical integer 7"
+if command grep -q '"findings":007' "$NEG_PAD_REC" 2>/dev/null; then
+    bad "20.6 the record holds a ZERO-PADDED count — that is invalid JSON, and the gate would report 'No review record found'"
+else
+    ok "20.6 …and no zero-padded spelling reached the record"
+fi
+# ⛔ THE ASSERTION THAT ACTUALLY MATTERS: the record PARSES. A string comparison
+# ( `grep` above) cannot tell a valid number from a token that only looks like one.
+if command python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["findings"]==7 and isinstance(d["findings"],int) else 1)' "$NEG_PAD_REC" 2>"$T/negpy"; then
+    ok "20.6 …and the record PARSES as JSON with findings==7 as a NUMBER (not a string)"
+else
+    bad "20.6 the record does not parse as JSON with an integer findings — the gate would read it as NO RECORD: $(command head -1 "$T/negpy" 2>/dev/null)"
+fi
+assert_contains "$NEG_CAP" " findings=7 " "20.6 …the posted marker carries the same canonical count"
+# `08` is the case that made the OLD arm emit a bash error as well as a bad record:
+# `[ 08 -lt 1 ]` aborts with "value too great for base".
+NEG_F=08
+run_record_neg_cap 424962
+assert_eq "$RECORD_RC" "0" "20.6b --findings 08 (the octal-abort case) is accepted and normalised (rc 0)"
+assert_contains "$(cat "$(Q2 424962)" 2>/dev/null)" '"findings":8,' "20.6b …recorded as the canonical integer 8"
+# All-zero spellings are still the 'clean' contradiction, and are still refused.
+NEG_F=00
+run_record_neg_cap 424963
+assert_eq "$RECORD_RC" "2" "20.6c --findings 00 is still the zero-findings contradiction (rc 2)"
+if [ -f "$(Q2 424963)" ]; then bad "20.6c a zero count wrote a record"; else ok "20.6c …and writes nothing"; fi
+# A NON-INTEGER is refused at the input arm, not normalised into existence.
+NEG_F=1.5
+run_record_neg_cap 424964
+assert_eq "$RECORD_RC" "2" "20.6d --findings 1.5 (a float) is refused (rc 2)"
+NEG_F=1
+
+# ── 20.7 (review P3-2) A NOTE CANNOT REBIND THE RECOVERED HEAD ─────────────
+# `--recover-body` used to read the head with a GREEDY `s/.* @ \([0-9a-f]\{40\}\).*/\1/p`,
+# i.e. "the LAST ` @ <40hex>` in the line" — and the line carries the free-form
+# `note=`. A note naming a sha ("also fails at @ <sha>", a plausible thing to
+# write) therefore WON the match and the recovered record bound to a head the
+# negative was never minted at.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX READER: measured, it recovered the NOTE's sha.
+# The marker is SIGNED properly, so this is not an HMAC vector — it is the parse.
+rb_clear
+NEG_H_HEAD="$(printf 'b%.0s' $(seq 1 40))"
+NEG_H_FAKE="$(printf 'a%.0s' $(seq 1 40))"
+NEG_H_DIFF="$(printf '5%.0s' $(seq 1 64))"
+NEG_M_HOSTILE="$(rb_marker 424965 "review recorded: reviews/424965.json verdict=not-clean @ $NEG_H_HEAD diff=$NEG_H_DIFF ($RB_REPO) findings=3 note=also fails at @ $NEG_H_FAKE")" \
+  || bad "fixture: the hostile-note marker could not be BUILT — 20.7 would otherwise pass on a missing marker"
+STUB_BODY="$NEG_M_HOSTILE"
+run_recover 424965 "$RB_REPO"
+NEG_H_REC="$RB_RDIR/daniel-ospina-agent-infra-424965.json"
+assert_eq "$RB_RC" "0" "20.7 a not-clean marker whose NOTE names a sha still recovers (exit 0)"
+assert_contains "$(cat "$NEG_H_REC" 2>/dev/null)" "\"head_sha\":\"$NEG_H_HEAD\"" \
+  "20.7 the recovered head is the MINTED one, not the sha the note names"
+if command grep -q "\"head_sha\":\"$NEG_H_FAKE\"" "$NEG_H_REC" 2>/dev/null; then
+    bad "20.7 the record's HEAD bound to the note's sha — a hostile note moved the head (the greedy-sed defect)"
+else
+    ok "20.7 …and the note's sha is not the head the record binds"
+fi
+assert_contains "$(cat "$NEG_H_REC" 2>/dev/null)" '"findings":3' "20.7 …the finding count survives the hostile note"
+
+# ── 20.8 (review P3-4) THE `--check-carry` NEGATIVE DIAGNOSIS AND THE note= ROUND-TRIP ──
+# `cc_report_negative` / `cc_num_field` had ZERO assertions, so the arm that must
+# stop a lane being told "land it" over an open finding rested on reading alone.
+rb_clear
+NEG_F=02
+EV_REF="comment:42496601"
+# `run_check_carry` reads the live head and the live diff from the fixture globals
+# the 11.13 vectors set; this section owns its own, so a lane asking at the
+# CURRENT head is the vector (the negative report must fire there too).
+CC_HEAD="$SHA"
+CC_DIFF="$T/neg-diff"
+printf '%s\n' 'diff --git a/x b/x' > "$CC_DIFF"
+run_record_neg_cap 424966
+assert_eq "$RECORD_RC" "0" "20.8 fixture: the not-clean record mints (rc 0)"
+run_check_carry 424966 "daniel-ospina/agent-infra"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "reviewed NOT CLEAN at" \
+  "20.8a --check-carry STATES the negative verdict (cc_report_negative) instead of advising 'land it' in silence"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "2 open finding(s)" \
+  "20.8b …naming the COUNT it read back with cc_num_field (--findings 02 normalised to 2)"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "NOT a licence to merge" \
+  "20.8c …and refusing the mis-reading: a carried negative is not a permission"
+# cc_num_field reads an UNQUOTED JSON number and nothing else — the same binding the
+# gate makes (`typeof record.findings === "number"`). A quoted count is therefore
+# NOT a count, and the diagnosis must degrade to "no number" rather than print one.
+rb_clear
+CC_HEAD="$NEG_H_HEAD"
+printf '%s\n' "{\"pr\":424967,\"head_sha\":\"$NEG_H_HEAD\",\"diff_sha256\":\"$NEG_H_DIFF\",\"verdict\":\"not-clean\",\"repo\":\"daniel-ospina/agent-infra\",\"findings\":\"4\"}" > "$(Q2 424967)"
+run_check_carry 424967 "daniel-ospina/agent-infra"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "reviewed NOT CLEAN at" \
+  "20.8d a string-typed findings is still a negative verdict"
+if command grep -q "open finding(s)" "$T/cc-err" 2>/dev/null; then
+    bad "20.8d cc_num_field read a QUOTED findings — it must bind an unquoted number, as the gate does"
+else
+    ok "20.8d …and cc_num_field does NOT report a count it cannot bind as a number"
+fi
+# THE ROUND-TRIP: mint → posted marker → --recover-body, with the note intact.
+rb_clear
+NEG_F=3
+EV_REF="comment:42496801"
+run_record_neg_cap 424968 --findings-note "1 P2 + 2 P3"
+assert_eq "$RECORD_RC" "0" "20.8e fixture: a not-clean record with --findings-note mints (rc 0)"
+assert_contains "$(cat "$(Q2 424968)" 2>/dev/null)" '"findings_note":"1 P2 + 2 P3"' \
+  "20.8e the record carries the note it was given"
+assert_contains "$NEG_CAP" " note=1 P2 + 2 P3" "20.8e …and the POSTED marker carries it as the trailer"
+rb_clear
+STUB_BODY="$NEG_BODY"
+run_recover 424968 "$RB_REPO"
+assert_eq "$RB_RC" "0" "20.8f the minted marker RECOVERS on a box that lost the record (exit 0)"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424968.json" 2>/dev/null)" '"findings_note":"1 P2 + 2 P3"' \
+  "20.8f …with the note= ROUND-TRIPPED, not dropped"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424968.json" 2>/dev/null)" '"findings":3' \
+  "20.8f …and the count alongside it"
+unset NEG_CAP NEG_BODY STUB_BODY
+
+# ── 20.9 (review P3-5) THE SECOND WRITER OF THE UNQUOTED COUNT ─────────────
+# `--recover-body` writes `"findings":$RB_FINDINGS` — the SAME unquoted JSON number
+# the mint writes, and for the same reason (every reader binds `typeof … ===
+# "number"`) — but it filtered the marker's value with `*[!0-9]*` ONLY. So the
+# P2-1 canonicaliser the mint holds was never applied on the second writer.
+# Measured: `findings=007` (admissible by RB_RE's `findings=[0-9]+`) recovered to
+# `"findings":007`, which does not parse, so the gate read NO RECORD — while the
+# file now EXISTED, so the next recovery refused ("recovery fills an ABSENCE").
+# A dead end needing manual removal, created by the one verb whose purpose is to
+# avoid a dead end — strictly worse than the absent record it replaced.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX WRITER: `007` was written verbatim (the record
+# does not parse) and `00` was written as `"findings":00` with exit 0, where the
+# mint refuses a zero count outright ('not-clean' with zero findings IS 'clean').
+rb_clear
+NEG_Z_HEAD="$(printf 'e%.0s' $(seq 1 40))"
+NEG_Z_DIFF="$(printf '6%.0s' $(seq 1 64))"
+NEG_M_ZPAD="$(rb_marker 424970 "review recorded: reviews/424970.json verdict=not-clean @ $NEG_Z_HEAD diff=$NEG_Z_DIFF ($RB_REPO) findings=007")" \
+  || bad "fixture: the zero-padded marker could not be BUILT — 20.9 would otherwise pass on a missing marker"
+export STUB_BODY="$NEG_M_ZPAD"
+run_recover 424970 "$RB_REPO"
+NEG_Z_REC="$RB_RDIR/daniel-ospina-agent-infra-424970.json"
+assert_eq "$RB_RC" "0" "20.9 a signed marker carrying findings=007 recovers (exit 0)"
+assert_contains "$(cat "$NEG_Z_REC" 2>/dev/null)" '"findings":7,' "20.9 …writing the CANONICAL count 7, not the marker's spelling"
+if command grep -q '"findings":007' "$NEG_Z_REC" 2>/dev/null; then
+    bad "20.9 the recovered record holds a ZERO-PADDED count — invalid JSON, so the gate reads NO record while the file blocks the next recovery"
+else
+    ok "20.9 …and no zero-padded spelling reached the recovered record"
+fi
+# ⛔ THE ASSERTION THAT MATTERS: the record PARSES. `grep` cannot tell a valid
+# number from a token that only looks like one — and the consequence a reader sees
+# is a JSONDecodeError, then a permanent "a record already exists" refusal.
+if command python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["findings"]==7 and isinstance(d["findings"],int) else 1)' "$NEG_Z_REC" 2>"$T/negzpy"; then
+    ok "20.9 …and the recovered record PARSES as JSON with findings==7 as a NUMBER"
+else
+    bad "20.9 the recovered record does not parse as JSON with an integer findings — the gate would read it as NO RECORD: $(command head -1 "$T/negzpy" 2>/dev/null)"
+fi
+# The other half: `00` is not a count, it is the 'clean' contradiction. Recovery
+# must REFUSE and leave NO file, or the refusal itself becomes the dead end.
+rb_clear
+NEG_M_ZERO="$(rb_marker 424971 "review recorded: reviews/424971.json verdict=not-clean @ $NEG_Z_HEAD diff=$NEG_Z_DIFF ($RB_REPO) findings=00")" \
+  || bad "fixture: the zero-count marker could not be BUILT — 20.9b would otherwise pass on a missing marker"
+export STUB_BODY="$NEG_M_ZERO"
+run_recover 424971 "$RB_REPO"
+assert_eq "$RB_RC" "3" "20.9b a marker carrying findings=00 is REFUSED (exit 3) — zero findings is what 'clean' means"
+if [ -f "$(Q2 424971)" ]; then bad "20.9b a zero-count marker wrote a record"; else ok "20.9b …and writes nothing, so no unparseable file is left blocking the next recovery"; fi
+unset STUB_BODY
+
+# 20.3b REGRESSION GUARD, shape of 13n4/13n5 — the arm that ACTUALLY pins (1b).
+# 20.3 above does NOT (review, P3-3): its artifact has no `Outcome:` line, so the
+# loose arm (2) refuses it too and deleting (1b) leaves 20.3 green. The genuine
+# (1b)-only shape is `**Outcome: CLEAN …**` PLUS a declared NOT-CLEAN header: the
+# Outcome line SUPPRESSES arm (2), so only the declared-negative arm (1b) can
+# refuse. This arm is 20.3's real discriminator, next to it so the claim and the
+# pin travel together.
+rb_clear
+STUB_EVIDENCE_BODY='**Outcome: CLEAN — verified, no issues.**
+
+## Review — NOT CLEAN
+1 P1 remains: the retry loop re-reads the claim after the lock is released.'
+EV_REF="comment:42496901" run_record_ev 424969
+assert_eq "$RECORD_RC" "3" "20.3b (1b) refuses a CLEAN mint whose artifact declares NOT CLEAN even when an Outcome: CLEAN line suppresses arm (2) (rc 3)"
+if [ -f "$(Q2 424969)" ]; then bad "20.3b the refused clean mint wrote a record"; else ok "20.3b …and writes nothing"; fi
+assert_contains "$RECORD_ERR" "DECLARES a non-clean outcome" "20.3b …and names the declaration it refused on, which only (1b) can see"
+# ⛔ RESTORE THE STUB-BODY INVARIANT — THE LEAK THIS FOLD EXPOSED (#3400 x #3247).
+# §20 marks `STUB_EVIDENCE_BODY` for export at the top of the section (line 5389's
+# `export STUB_EVIDENCE_BODY`), so EVERY later plain assignment to it is exported
+# too. That is what the §20 fixtures need — but §20.3b is the LAST of them, and it
+# leaves an EXPORTED body whose text is `**Outcome: CLEAN …** ## Review — NOT CLEAN`.
+# On main this is invisible: §20 is the tail of the file, so nothing ever reads the
+# leaked value. MEASURED on the merged tree, with the next section appended: the
+# delta section's backward-compatibility vector (§21e, "an ORDINARY comment:<id>
+# still records clean") inherited that body and REFUSED at rc 3 — "comment …
+# DECLARES a non-clean outcome" — so a pre-existing shape it exists to protect
+# reddened because of a vector that ran three hundred lines earlier. Each branch was
+# green alone; only the fold shows it. `unset` (not a reset to a default) is the
+# right restore: the stub's own `${STUB_EVIDENCE_BODY-…}` fallback is the documented
+# default, and this is the same shape as §20.9b's `unset STUB_BODY` two fixtures up.
+unset STUB_EVIDENCE_BODY
+# The restore is PINNED, not merely performed: without this line the §21e redden is
+# real but its message ("got: 3, want: 0") names neither the leak nor the vector that
+# caused it, and a future §20 fixture that assigns the body LAST would re-open the
+# leak while every §20 assertion stayed green. Here-string form, not `| grep -q` —
+# the repo's check-no-sigpipe-grep guard refuses the pipe form (SIGPIPE on a large
+# producer), and this suite has to pass it.
+if grep -qF 'STUB_EVIDENCE_BODY' <<<"$(export -p)"; then
+    bad "20.3c the stub-body export was NOT restored — a section appended after §20 inherits this vector's NOT-CLEAN body and refuses an ordinary comment:<id> artifact"
+else
+    ok "20.3c the stub-body export is restored, so no later section inherits this vector's NOT-CLEAN body"
+fi
+NEG_F=1
+EV_REF="comment:42495501"
+
 echo ""
 # ═════════════════════════════════════════════════════════════════════════
-# 20. DELTA EVIDENCE: --evidence delta:<A>..<B>[+<artifact>]
+# 21. DELTA EVIDENCE: --evidence delta:<A>..<B>[+<artifact>]
 #
 # A delta attestation claims "at head B a reviewer reviewed exactly the commits
 # A..B and nothing else changed in the authored diff". Every vector below FAILS
@@ -5342,8 +5750,8 @@ echo ""
 # RED. A delta that can be minted for ANY two shas is worse than no delta: it is
 # a signature with no content, so the refusal vectors are the deliverable.
 # ═════════════════════════════════════════════════════════════════════════
-echo "── 20. delta evidence: a RANGE-scoped verdict ─────────────────"
-ORIG_PWD="$(pwd)"   # §20 cds into its fixture repo; a later §21 must not inherit that cwd
+echo "── 21. delta evidence: a RANGE-scoped verdict ─────────────────"
+ORIG_PWD="$(pwd)"   # §21 cds into its fixture repo; a later §22 must not inherit that cwd
 
 DG="$T/dgit"; mkdir -p "$DG"; cd "$DG" || bad "20 setup: cannot enter fixture repo"
 git init -q . >/dev/null 2>&1; git config user.email t@t; git config user.name t
@@ -5401,7 +5809,7 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
     RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
 }
 
-# ── 20a — the ACCEPTANCE half: a base-borne merge-only range records clean ──
+# ── 21a — the ACCEPTANCE half: a base-borne merge-only range records clean ──
 # A1..HEAD contains exactly one non-merge commit (DG_M1, what main landed) and it
 # is reachable from the PR's base — the LANE authored nothing. Without the
 # base-aware classification this vector is REFUSED as "authored", which is the
@@ -5414,39 +5822,39 @@ EP=425100; rm -f "$(Q2 $EP)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
 run_record_delta $EP "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42510001" \
     STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
-assert_eq "$RECORD_RC" "0" "20a a base-borne merge-only delta with a real cover records clean (rc 0)"
+assert_eq "$RECORD_RC" "0" "21a a base-borne merge-only delta with a real cover records clean (rc 0)"
 R20="$(cat "$(Q2 $EP)" 2>/dev/null || true)"
-assert_contains "$R20" '"delta_kind":"merge-only"' "20a the record says the range was merge-only"
-assert_contains "$R20" "\"delta_base\":\"$DG_M1\"" "20a the record stores the BASE it was classified against (re-derivable)"
-assert_contains "$R20" "\"delta_range\":\"$DG_A1..$DG_HEAD\"" "20a the record stores the range it claims"
-assert_contains "$R20" '"delta_digest":"' "20a the record stores a digest, so the claim is checkable later"
-assert_contains "$R20" '"mint":"fresh"' "20a a delta is a FRESH mint (never a carry)"
-assert_contains "$R20" "\"head_sha\":\"$DG_HEAD\"" "20a the record is still head-bound to B"
+assert_contains "$R20" '"delta_kind":"merge-only"' "21a the record says the range was merge-only"
+assert_contains "$R20" "\"delta_base\":\"$DG_M1\"" "21a the record stores the BASE it was classified against (re-derivable)"
+assert_contains "$R20" "\"delta_range\":\"$DG_A1..$DG_HEAD\"" "21a the record stores the range it claims"
+assert_contains "$R20" '"delta_digest":"' "21a the record stores a digest, so the claim is checkable later"
+assert_contains "$R20" '"mint":"fresh"' "21a a delta is a FRESH mint (never a carry)"
+assert_contains "$R20" "\"head_sha\":\"$DG_HEAD\"" "21a the record is still head-bound to B"
 DIG20="$(sed -n 's/.*"delta_digest":"\([0-9a-f]*\)".*/\1/p' "$(Q2 $EP)" 2>/dev/null | head -1 || true)"
-if [[ "$DIG20" =~ ^[0-9a-f]{64}$ ]]; then ok "20a the digest is a full 64-hex sha256"; else bad "20a digest is not 64-hex (got '$DIG20')"; fi
+if [[ "$DIG20" =~ ^[0-9a-f]{64}$ ]]; then ok "21a the digest is a full 64-hex sha256"; else bad "21a digest is not 64-hex (got '$DIG20')"; fi
 # The digest must be RE-DERIVABLE from the two shas — that is the whole claim.
 RECOMP="$(git -C "$DG" -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.relative=false \
    -c diff.suppressBlankEmpty=false diff --no-color --no-ext-diff --no-textconv --full-index \
    --src-prefix=a/ --dst-prefix=b/ --unified=3 --diff-algorithm=myers --find-renames \
    "$DG_A1" "$DG_HEAD" 2>/dev/null | python3 "$SCRIPT_DIR/lib/diff-normalize.py" 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')"
-assert_eq "$RECOMP" "$DIG20" "20a an independent re-derivation of diff A..B matches the recorded digest"
+assert_eq "$RECOMP" "$DIG20" "21a an independent re-derivation of diff A..B matches the recorded digest"
 
-# ── 20b — A NOT AN ANCESTOR OF B (a rebase-shaped range) is refused ───────
+# ── 21b — A NOT AN ANCESTOR OF B (a rebase-shaped range) is refused ───────
 # DG_HEAD is NOT an ancestor of DG_A1: "the commits in between" has no meaning,
 # and a delta must never be mintable for two arbitrary shas.
 EB=425101; rm -f "$(Q2 $EB)"
 run_record_delta $EB "$DG_A1" "delta:$DG_HEAD..$DG_A1"
-assert_eq "$RECORD_RC" "3" "20b a non-ancestor pair is refused (rc 3)"
-assert_contains "$RECORD_ERR" "NOT an ancestor" "20b the refusal says WHY (not a chain)"
-[ ! -f "$(Q2 $EB)" ] && ok "20b no record written" || bad "20b a record was written for a non-chain range"
+assert_eq "$RECORD_RC" "3" "21b a non-ancestor pair is refused (rc 3)"
+assert_contains "$RECORD_ERR" "NOT an ancestor" "21b the refusal says WHY (not a chain)"
+[ ! -f "$(Q2 $EB)" ] && ok "21b no record written" || bad "21b a record was written for a non-chain range"
 
-# ── 20c — B MUST BE LIVE HEAD: two arms, both refused ─────
+# ── 21c — B MUST BE LIVE HEAD: two arms, both refused ─────
 # (c1) the range's upper bound is not the head being recorded.
 EC=425102; rm -f "$(Q2 $EC)"
 run_record_delta $EC "$DG_A1" "delta:$DG_A1..$DG_HEAD"
-assert_eq "$RECORD_RC" "3" "20c1 B != the recorded head is refused (rc 3)"
-assert_contains "$RECORD_ERR" "must BE the head it attests" "20c1 the refusal says the range must end at the attested head"
-[ ! -f "$(Q2 $EC)" ] && ok "20c1 no record written" || bad "20c1 a record was written for a misbounded range"
+assert_eq "$RECORD_RC" "3" "21c1 B != the recorded head is refused (rc 3)"
+assert_contains "$RECORD_ERR" "must BE the head it attests" "21c1 the refusal says the range must end at the attested head"
+[ ! -f "$(Q2 $EC)" ] && ok "21c1 no record written" || bad "21c1 a record was written for a misbounded range"
 # (c2) the RECORDED head is stale: the delta must not become a carry.
 # A new LANE-authored commit lands after the reviewed merge, so every carry arm
 # must fail on its own terms and the stale-sha guard must refuse.
@@ -5457,55 +5865,55 @@ DG_NEW="$(git rev-parse HEAD)"
 printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_NEW"
 EC2=425103; rm -f "$(Q2 $EC2)"
 run_record_delta $EC2 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" STUB_HEAD_SHA="$DG_NEW"
-assert_eq "$RECORD_RC" "3" "20c2 a delta whose B is no longer the LIVE head is refused (rc 3)"
-assert_contains "$RECORD_ERR" "stale-sha guard" "20c2 the stale-sha guard is what refused it (the delta did not buy a carry)"
-[ ! -f "$(Q2 $EC2)" ] && ok "20c2 no record written" || bad "20c2 a record was written for a stale delta"
+assert_eq "$RECORD_RC" "3" "21c2 a delta whose B is no longer the LIVE head is refused (rc 3)"
+assert_contains "$RECORD_ERR" "stale-sha guard" "21c2 the stale-sha guard is what refused it (the delta did not buy a carry)"
+[ ! -f "$(Q2 $EC2)" ] && ok "21c2 no record written" || bad "21c2 a record was written for a stale delta"
 
-# ── 20d — an AUTHORED range needs a covering verdict ─────
+# ── 21d — an AUTHORED range needs a covering verdict ─────
 # DG_BASE..DG_HEAD contains DG_A1 (lane-authored, not reachable from the base).
 ED1=425104; rm -f "$(Q2 $ED1)"
 run_record_delta $ED1 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD"
-assert_eq "$RECORD_RC" "3" "20d1 an authored range with NO covering verdict is refused (rc 3)"
-assert_contains "$RECORD_ERR" "authored content" "20d1 the refusal names the authored content"
-assert_contains "$RECORD_ERR" "+comment:" "20d1 the refusal names the composed remedy"
-[ ! -f "$(Q2 $ED1)" ] && ok "20d1 no record written" || bad "20d1 a record was written for an uncovered authored range"
-# 20d2 the composed form is ACCEPTED when the verdict postdates the range's
+assert_eq "$RECORD_RC" "3" "21d1 an authored range with NO covering verdict is refused (rc 3)"
+assert_contains "$RECORD_ERR" "authored content" "21d1 the refusal names the authored content"
+assert_contains "$RECORD_ERR" "+comment:" "21d1 the refusal names the composed remedy"
+[ ! -f "$(Q2 $ED1)" ] && ok "21d1 no record written" || bad "21d1 a record was written for an uncovered authored range"
+# 21d2 the composed form is ACCEPTED when the verdict postdates the range's
 #       newest authored commit (artifact 2026-01-02 ≥ 2025-06-01).
 ED2=425105; rm -f "$(Q2 $ED2)"
 run_record_delta $ED2 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42510501"
-assert_eq "$RECORD_RC" "0" "20d2 authored range + a covering verdict records clean (rc 0)"
+assert_eq "$RECORD_RC" "0" "21d2 authored range + a covering verdict records clean (rc 0)"
 R20D="$(cat "$(Q2 $ED2)" 2>/dev/null || true)"
-assert_contains "$R20D" '"delta_kind":"authored"' "20d2 the record says the range was authored"
-assert_contains "$R20D" "+comment:42510501" "20d2 the record keeps the composed ref (which verdict covers the range)"
-# 20d3 the covering verdict must POSTDATE the newest AUTHORED commit — not merely
+assert_contains "$R20D" '"delta_kind":"authored"' "21d2 the record says the range was authored"
+assert_contains "$R20D" "+comment:42510501" "21d2 the record keeps the composed ref (which verdict covers the range)"
+# 21d3 the covering verdict must POSTDATE the newest AUTHORED commit — not merely
 #       the head merge commit (dated 2024-02-01, EARLIER than the authored work).
 ED3=425106; rm -f "$(Q2 $ED3)"
 run_record_delta $ED3 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42510601" \
     STUB_EVIDENCE_AT="2025-01-01T00:00:00Z"
-assert_eq "$RECORD_RC" "3" "20d3 a verdict predating the newest AUTHORED commit is refused (rc 3)"
-[ ! -f "$(Q2 $ED3)" ] && ok "20d3 no record written" || bad "20d3 a record was written for a verdict that never saw the authored work"
-# 20d4 an UNREADABLE base refuses rather than classifying itself.
+assert_eq "$RECORD_RC" "3" "21d3 a verdict predating the newest AUTHORED commit is refused (rc 3)"
+[ ! -f "$(Q2 $ED3)" ] && ok "21d3 no record written" || bad "21d3 a record was written for a verdict that never saw the authored work"
+# 21d4 an UNREADABLE base refuses rather than classifying itself.
 ED4=425107; rm -f "$(Q2 $ED4)"
 run_record_delta $ED4 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" STUB_BASE_PAIR_FAIL=1
-assert_eq "$RECORD_RC" "3" "20d4 an unreadable BASE refuses (rc 3, no self-classification)"
-assert_contains "$RECORD_ERR" "could not read the PR's BASE" "20d4 the refusal names the missing input"
+assert_eq "$RECORD_RC" "3" "21d4 an unreadable BASE refuses (rc 3, no self-classification)"
+assert_contains "$RECORD_ERR" "could not read the PR's BASE" "21d4 the refusal names the missing input"
 
-# ── 20e — BACKWARD COMPATIBILITY: every pre-existing shape still works ──
+# ── 21e — BACKWARD COMPATIBILITY: every pre-existing shape still works ──
 EE=425108; rm -f "$(Q2 $EE)"
 EV_REF="comment:42510801" run_record_ev $EE
-assert_eq "$RECORD_RC" "0" "20e comment:<id> evidence still records clean (rc 0)"
-assert_contains "$(cat "$(Q2 $EE)" 2>/dev/null || true)" '"evidence":"comment:42510801"' "20e the record still names the comment"
-if grep -qF 'delta_' "$(Q2 $EE)" 2>/dev/null; then bad "20e a comment record grew delta fields"; else ok "20e a comment record carries NO delta fields (shape unchanged)"; fi
+assert_eq "$RECORD_RC" "0" "21e comment:<id> evidence still records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EE)" 2>/dev/null || true)" '"evidence":"comment:42510801"' "21e the record still names the comment"
+if grep -qF 'delta_' "$(Q2 $EE)" 2>/dev/null; then bad "21e a comment record grew delta fields"; else ok "21e a comment record carries NO delta fields (shape unchanged)"; fi
 EE2=425109; rm -f "$(Q2 $EE2)"
 EV_REF="review:42510901" run_record_ev $EE2 STUB_REVIEW_STATE=APPROVED
-assert_eq "$RECORD_RC" "0" "20e review:<id> evidence still records clean (rc 0)"
+assert_eq "$RECORD_RC" "0" "21e review:<id> evidence still records clean (rc 0)"
 
-# ── 20f — the OTHER refusal arms ─────
+# ── 21f — the OTHER refusal arms ─────
 # empty range (A == B): a trivially-true delta is a signature with no content.
 EF=425110; rm -f "$(Q2 $EF)"
 run_record_delta $EF "$DG_HEAD" "delta:$DG_HEAD..$DG_HEAD"
-assert_eq "$RECORD_RC" "3" "20f an EMPTY range (A == B) is refused"
-assert_contains "$RECORD_ERR" "empty range attests nothing" "20f the refusal says why"
+assert_eq "$RECORD_RC" "3" "21f an EMPTY range (A == B) is refused"
+assert_contains "$RECORD_ERR" "empty range attests nothing" "21f the refusal says why"
 # an empty DIFF: a merge whose tree matches the range start attests no review.
 git checkout -q pr >/dev/null 2>&1
 git commit -q --allow-empty -m 'empty commit'
@@ -5513,36 +5921,36 @@ DG_EMPTY="$(git rev-parse HEAD)"
 printf '%s\n' '2025-10-01T00:00:00Z' > "$T/dates/$DG_EMPTY"
 EF2=425111; rm -f "$(Q2 $EF2)"
 run_record_delta $EF2 "$DG_EMPTY" "delta:$DG_NEW..$DG_EMPTY"
-assert_eq "$RECORD_RC" "3" "20f a range whose diff is EMPTY is refused"
-assert_contains "$RECORD_ERR" "is EMPTY" "20f the refusal names the empty diff"
+assert_eq "$RECORD_RC" "3" "21f a range whose diff is EMPTY is refused"
+assert_contains "$RECORD_ERR" "is EMPTY" "21f the refusal names the empty diff"
 # a malformed ref: the delta shape is pinned, not a loose prefix.
 EF3=425112; rm -f "$(Q2 $EF3)"
 run_record_delta $EF3 "$DG_HEAD" "delta:abc..def"
-assert_eq "$RECORD_RC" "3" "20f a short-sha delta ref is refused (shape pinned)"
+assert_eq "$RECORD_RC" "3" "21f a short-sha delta ref is refused (shape pinned)"
 EF4=425113; rm -f "$(Q2 $EF4)"
 run_record_delta $EF4 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+nested:1"
-assert_eq "$RECORD_RC" "3" "20f an unknown covering-artifact kind is refused"
+assert_eq "$RECORD_RC" "3" "21f an unknown covering-artifact kind is refused"
 # a NESTED delta cannot inherit authority. ⛔ THIS VECTOR PINS THE **SHAPE** GUARD,
 # NOT ARM (2). `evidence_ref_split` pins the cover to
 # `(comment|issuecomment|review|review-comment|discussion):<id>`, so a `+delta:` cover
 # is refused as a MALFORMED REF before `delta_verify` is ever entered — the assertion
-# below therefore passes for a reason arm (2) had no part in. 20f-b measures arm (2).
+# below therefore passes for a reason arm (2) had no part in. 21f-b measures arm (2).
 EF5=425114; rm -f "$(Q2 $EF5)"
 run_record_delta $EF5 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+delta:$DG_A1..$DG_HEAD"
-assert_eq "$RECORD_RC" "3" "20f a delta covering a delta is refused (by the pinned REF SHAPE)"
-assert_contains "$RECORD_ERR" "accepted: comment:" "20f …and the refusal is the shape guard's own message, not arm (2)'s"
-# 20f-b ARM (2) MEASURED DIRECTLY. The nested-delta arm is defence-in-depth for a
+assert_eq "$RECORD_RC" "3" "21f a delta covering a delta is refused (by the pinned REF SHAPE)"
+assert_contains "$RECORD_ERR" "accepted: comment:" "21f …and the refusal is the shape guard's own message, not arm (2)'s"
+# 21f-b ARM (2) MEASURED DIRECTLY. The nested-delta arm is defence-in-depth for a
 #       DIRECT caller (the function is sourceable — this suite extracts functions
 #       elsewhere too), and no CLI invocation can reach it, so only a direct call
 #       measures it. Without this vector the arm is a claim with no test behind it.
 awk '/^delta_verify\(\) \{/,/^\}$/' "$RECORD" > "$T/dvfn.sh"
-[ -s "$T/dvfn.sh" ] && ok "20f-b delta_verify extracted from the recorder" || bad "20f-b could not extract delta_verify"
+[ -s "$T/dvfn.sh" ] && ok "21f-b delta_verify extracted from the recorder" || bad "21f-b could not extract delta_verify"
 dvrc=0
 ( . "$T/dvfn.sh"; delta_verify "$DG_BASE..$DG_HEAD+delta:$DG_A1..$DG_HEAD" "$DG_HEAD" ) \
     >"$T/dvout" 2>"$T/dverr" || dvrc=$?
-assert_eq "$dvrc" "1" "20f-b arm (2) called DIRECTLY refuses a nested delta (rc 1)"
-assert_contains "$(cat "$T/dverr" 2>/dev/null || true)" "is itself a delta" "20f-b …naming the arm's own reason (so the vector is not satisfied by an earlier arm)"
-# 20f-c THE DELTA × CARRY-FIRED ARM. A delta ref supplied while a carry arm already
+assert_eq "$dvrc" "1" "21f-b arm (2) called DIRECTLY refuses a nested delta (rc 1)"
+assert_contains "$(cat "$T/dverr" 2>/dev/null || true)" "is itself a delta" "21f-b …naming the arm's own reason (so the vector is not satisfied by an earlier arm)"
+# 21f-c THE DELTA × CARRY-FIRED ARM. A delta ref supplied while a carry arm already
 #       re-bound the verdict would be recorded by NOBODY: the record states the carry,
 #       not a reviewer's range. The caller is told the delta was recorded while the
 #       audit trail holds none — a silent drop, so this must REFUSE. No vector covered
@@ -5581,18 +5989,18 @@ EH20D=425170; rm -f "$(Q2 $EH20D)"
 printf '{"pr":%d,"head_sha":"%s","evidence":"comment:42517001","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
     "$EH20D" "$DG_A1" > "$(Q2 $EH20D)"
 run_record_carry_at $EH20D "$DG_A1" "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42517002"
-assert_eq "$RECORD_RC" "3" "20f-c a delta supplied while a carry arm re-bound the verdict is refused (rc 3)"
-assert_contains "$RECORD_ERR" "already re-bound" "20f-c …by the carry-vs-delta arm, so the delta cannot be silently dropped"
-# CONTROL: the same invocation WITHOUT the delta ref must actually CARRY, or 20f-c
+assert_eq "$RECORD_RC" "3" "21f-c a delta supplied while a carry arm re-bound the verdict is refused (rc 3)"
+assert_contains "$RECORD_ERR" "already re-bound" "21f-c …by the carry-vs-delta arm, so the delta cannot be silently dropped"
+# CONTROL: the same invocation WITHOUT the delta ref must actually CARRY, or 21f-c
 # above would be satisfied by a carry path that never fires at all.
 EH20E=425171; rm -f "$(Q2 $EH20E)"
 printf '{"pr":%d,"head_sha":"%s","evidence":"comment:42517101","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
     "$EH20E" "$DG_A1" > "$(Q2 $EH20E)"
 run_record_carry_at $EH20E "$DG_A1" "$DG_HEAD" "comment:42517102"
-assert_eq "$RECORD_RC" "0" "20f-c control: the SAME invocation without a delta ref carries (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
-assert_contains "$(cat "$(Q2 $EH20E)" 2>/dev/null || true)" '"mint":"carried"' "20f-c control: …and records mint=carried, so the carry arm really fired"
+assert_eq "$RECORD_RC" "0" "21f-c control: the SAME invocation without a delta ref carries (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$(cat "$(Q2 $EH20E)" 2>/dev/null || true)" '"mint":"carried"' "21f-c control: …and records mint=carried, so the carry arm really fired"
 
-# 20f-d A CARRY THAT INHERITS A `delta:` CLAIM MUST CARRY THE CLAIM'S FIELDS.
+# 21f-d A CARRY THAT INHERITS A `delta:` CLAIM MUST CARRY THE CLAIM'S FIELDS.
 #       A carry copies the predecessor's `evidence` verbatim, so without this the
 #       carried record asserts a RANGE while `delta_range`/`delta_base`/`delta_kind`/
 #       `delta_digest` are absent — the claim the feature exists to make checkable,
@@ -5603,14 +6011,14 @@ EH21=425172; rm -f "$(Q2 $EH21)"
 printf '{"pr":%d,"head_sha":"%s","evidence":"delta:%s..%s+comment:42517201","delta_range":"%s..%s","delta_base":"%s","delta_kind":"authored","delta_digest":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
     "$EH21" "$DG_A1" "$DG_BASE" "$DG_A1" "$DG_BASE" "$DG_A1" "$DG_M1" "$DV_DIGEST" > "$(Q2 $EH21)"
 run_record_carry_at $EH21 "$DG_A1" "$DG_HEAD" ""
-assert_eq "$RECORD_RC" "0" "20f-d a carry inheriting a delta claim records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_eq "$RECORD_RC" "0" "21f-d a carry inheriting a delta claim records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
 R21="$(cat "$(Q2 $EH21)" 2>/dev/null || true)"
-assert_contains "$R21" '"mint":"carried"' "20f-d …as a carry"
-assert_contains "$R21" "\"delta_range\":\"$DG_BASE..$DG_A1\"" "20f-d …keeping the REVIEWED range, not the range up to the carry head"
-assert_contains "$R21" "\"delta_base\":\"$DG_M1\"" "20f-d …and the base it was classified against (re-derivable)"
-assert_contains "$R21" '"delta_kind":"authored"' "20f-d …and its classification (a value the producer can actually emit: 'authored'|'merge-only', never the carry arm 'lane')"
-assert_contains "$R21" "\"delta_digest\":\"$DV_DIGEST\"" "20f-d …and the digest, so the inherited claim stays checkable"
-assert_contains "$R21" '"evidence":"delta:' "20f-d …while the evidence it inherits is the delta claim it substantiates"
+assert_contains "$R21" '"mint":"carried"' "21f-d …as a carry"
+assert_contains "$R21" "\"delta_range\":\"$DG_BASE..$DG_A1\"" "21f-d …keeping the REVIEWED range, not the range up to the carry head"
+assert_contains "$R21" "\"delta_base\":\"$DG_M1\"" "21f-d …and the base it was classified against (re-derivable)"
+assert_contains "$R21" '"delta_kind":"authored"' "21f-d …and its classification (a value the producer can actually emit: 'authored'|'merge-only', never the carry arm 'lane')"
+assert_contains "$R21" "\"delta_digest\":\"$DV_DIGEST\"" "21f-d …and the digest, so the inherited claim stays checkable"
+assert_contains "$R21" '"evidence":"delta:' "21f-d …while the evidence it inherits is the delta claim it substantiates"
 # REFUSAL DIRECTION: a predecessor that names a delta but carries none of its fields
 # must be REFUSED, never transcribed — otherwise the record would assert a range with
 # nothing behind it, which is the shape this guard exists to stop.
@@ -5618,9 +6026,9 @@ EH22=425173; rm -f "$(Q2 $EH22)"
 printf '{"pr":%d,"head_sha":"%s","evidence":"delta:%s..%s+comment:42517301","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
     "$EH22" "$DG_A1" "$DG_BASE" "$DG_A1" > "$(Q2 $EH22)"
 run_record_carry_at $EH22 "$DG_A1" "$DG_HEAD" ""
-assert_eq "$RECORD_RC" "3" "20f-d a carry inheriting a delta claim with NO delta fields is refused (rc 3)"
-assert_contains "$RECORD_ERR" "inherits a delta claim" "20f-d …naming the unsubstantiated claim"
-assert_not_contains "$(cat "$(Q2 $EH22)" 2>/dev/null || true)" '"mint":"carried"' "20f-d …and nothing was recorded over the predecessor"
+assert_eq "$RECORD_RC" "3" "21f-d a carry inheriting a delta claim with NO delta fields is refused (rc 3)"
+assert_contains "$RECORD_ERR" "inherits a delta claim" "21f-d …naming the unsubstantiated claim"
+assert_not_contains "$(cat "$(Q2 $EH22)" 2>/dev/null || true)" '"mint":"carried"' "21f-d …and nothing was recorded over the predecessor"
 # a delta with a NON-CLEAN verdict is an argument-level contradiction (the
 # clean-micro/clean-low arms never read evidence, so it would be dropped silently).
 EF6=425115; rm -f "$(Q2 $EF6)"
@@ -5632,18 +6040,18 @@ EF6=425115; rm -f "$(Q2 $EF6)"
         --evidence "delta:$DG_A1..$DG_HEAD" >/dev/null 2>"$T/derr6" || rc=$?
     printf '%s' "$rc" > "$T/drc6"
 ) 2>/dev/null
-assert_eq "$(cat "$T/drc6" 2>/dev/null || echo 99)" "2" "20f delta evidence with a non-clean verdict exits 2"
+assert_eq "$(cat "$T/drc6" 2>/dev/null || echo 99)" "2" "21f delta evidence with a non-clean verdict exits 2"
 
-# ── 20h — the arms review of this change reproduced bypasses through ─────
-# 20h1 MERGE-ONLY WITH NO ATTESTED A: the zero-evidence mint. Same shape as 20a
+# ── 21h — the arms review of this change reproduced bypasses through ─────
+# 21h1 MERGE-ONLY WITH NO ATTESTED A: the zero-evidence mint. Same shape as 21a
 #      but with no prior record at A and no cover → refused.
 EH1=425130; rm -f "$(Q2 $EH1)"
 run_record_delta $EH1 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
-assert_eq "$RECORD_RC" "3" "20h1 a merge-only delta whose A is NOT attested is refused (rc 3)"
-assert_contains "$RECORD_ERR" "EXTENDS an attestation and can never create one" "20h1 the refusal names the missing premise (extends, never creates)"
-[ ! -f "$(Q2 $EH1)" ] && ok "20h1 no record written (zero-evidence mint closed)" || bad "20h1 a zero-evidence clean was minted"
+assert_eq "$RECORD_RC" "3" "21h1 a merge-only delta whose A is NOT attested is refused (rc 3)"
+assert_contains "$RECORD_ERR" "EXTENDS an attestation and can never create one" "21h1 the refusal names the missing premise (extends, never creates)"
+[ ! -f "$(Q2 $EH1)" ] && ok "21h1 no record written (zero-evidence mint closed)" || bad "21h1 a zero-evidence clean was minted"
 
-# 20h2 AN EVIL MERGE: a conflict resolution living ONLY in the merge commit. The
+# 21h2 AN EVIL MERGE: a conflict resolution living ONLY in the merge commit. The
 #      `--no-merges` walk is blind to it, so without clause (D)'s tree check the
 #      range classifies merge-only and mints clean over lines no reviewer saw.
 git checkout -q -b evil "$DG_A1" >/dev/null 2>&1
@@ -5663,35 +6071,35 @@ DG_EV_HEAD="$(git rev-parse HEAD)"
 printf '%s\n' '2025-11-01T00:00:00Z' > "$T/dates/$DG_EV_HEAD"
 printf '%s\n' '2025-10-01T00:00:00Z' > "$T/dates/$DG_EV_L"
 if [ "$(git -C "$DG" rev-list --merges "$DG_EV_L..$DG_EV_HEAD" --not "$DG_M1" 2>/dev/null | wc -l | tr -d ' ')" = "1" ]; then
-    ok "20h2 fixture: the range's only new commit is the merge (the evil-merge shape)"
+    ok "21h2 fixture: the range's only new commit is the merge (the evil-merge shape)"
 else
-    bad "20h2 fixture: the range does not hold exactly one merge — the vector would not test the arm"
+    bad "21h2 fixture: the range does not hold exactly one merge — the vector would not test the arm"
 fi
 EH2=425131; rm -f "$(Q2 $EH2)"
 printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-10-02T00:00:00Z"}\n' \
   "$EH2" "$DG_EV_L" > "$(Q2 $EH2)"
 run_record_delta $EH2 "$DG_EV_HEAD" "delta:$DG_EV_L..$DG_EV_HEAD"
-assert_eq "$RECORD_RC" "3" "20h2 an EVIL MERGE (hand-resolved conflict) is refused (rc 3)"
+assert_eq "$RECORD_RC" "3" "21h2 an EVIL MERGE (hand-resolved conflict) is refused (rc 3)"
 for _m2 in "NOT a clean merge of its parents" "does NOT merge cleanly"; do
-    case "$RECORD_ERR" in *"$_m2"*) ok "20h2 the refusal names the conflict resolution"; break ;; esac
+    case "$RECORD_ERR" in *"$_m2"*) ok "21h2 the refusal names the conflict resolution"; break ;; esac
 done
-assert_contains "$RECORD_ERR" "authored content" "20h2 the evil merge is classified AUTHORED, not merge-only"
+assert_contains "$RECORD_ERR" "authored content" "21h2 the evil merge is classified AUTHORED, not merge-only"
 # ⛔ ASSERT THE HEAD, NOT THE FILE: this vector plants a prior record at A (that is
 # what makes the merge-only arm reachable at all), so "no file" would be false even
 # on a correct refusal.
-assert_contains "$(cat "$(Q2 $EH2)" 2>/dev/null || true)" "\"head_sha\":\"$DG_EV_L\"" "20h2 the planted record was NOT overwritten (no clean at the evil head)"
+assert_contains "$(cat "$(Q2 $EH2)" 2>/dev/null || true)" "\"head_sha\":\"$DG_EV_L\"" "21h2 the planted record was NOT overwritten (no clean at the evil head)"
 
-# 20h3 CLAUSE (E): a delta may not put a signed clean on a MEASURABLY RED head.
+# 21h3 CLAUSE (E): a delta may not put a signed clean on a MEASURABLY RED head.
 EH3=425132; rm -f "$(Q2 $EH3)"
 printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
   "$EH3" "$DG_A1" > "$(Q2 $EH3)"
 RED_ROWS='ci|docs|1|completed|failure'
 run_record_delta $EH3 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" STUB_CHECKS_ROWS="$RED_ROWS"
-assert_eq "$RECORD_RC" "3" "20h3 a measurably RED target head is refused (clause E, rc 3)"
-assert_contains "$RECORD_ERR" "MEASURABLY RED" "20h3 the refusal names the red head"
-assert_contains "$(cat "$(Q2 $EH3)" 2>/dev/null || true)" "\"head_sha\":\"$DG_A1\"" "20h3 the planted record was NOT re-bound (no signed clean on a red head)"
+assert_eq "$RECORD_RC" "3" "21h3 a measurably RED target head is refused (clause E, rc 3)"
+assert_contains "$RECORD_ERR" "MEASURABLY RED" "21h3 the refusal names the red head"
+assert_contains "$(cat "$(Q2 $EH3)" 2>/dev/null || true)" "\"head_sha\":\"$DG_A1\"" "21h3 the planted record was NOT re-bound (no signed clean on a red head)"
 
-# 20h4 THE CHECKOUT BINDING: a delta read out of ANOTHER repo's objects would be a
+# 21h4 THE CHECKOUT BINDING: a delta read out of ANOTHER repo's objects would be a
 # false claim, so the origin must match — and a directory that is not a checkout
 # at all must refuse rather than fall through.
 EH4=425133; rm -f "$(Q2 $EH4)"
@@ -5699,13 +6107,13 @@ DG_FOREIGN="$T/foreign"; mkdir -p "$DG_FOREIGN"
 git -C "$DG_FOREIGN" init -q . 2>/dev/null || true
 git -C "$DG_FOREIGN" remote add origin 'git@github.com:daniel-ospina/tortoise.git' 2>/dev/null || true
 run_record_delta $EH4 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" DELTA_GIT_DIR="$DG_FOREIGN" STUB_CHECKS_ROWS=
-assert_eq "$RECORD_RC" "3" "20h4 a checkout of a DIFFERENT repo is refused (rc 3)"
-assert_contains "$RECORD_ERR" "cannot read the range from a checkout of" "20h4 the refusal names the checkout binding"
+assert_eq "$RECORD_RC" "3" "21h4 a checkout of a DIFFERENT repo is refused (rc 3)"
+assert_contains "$RECORD_ERR" "cannot read the range from a checkout of" "21h4 the refusal names the checkout binding"
 EH5=425134; rm -f "$(Q2 $EH5)"
 run_record_delta $EH5 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" DELTA_GIT_DIR="$T/not-a-repo"
-assert_eq "$RECORD_RC" "3" "20h4 a directory that is not a checkout is refused (rc 3)"
+assert_eq "$RECORD_RC" "3" "21h4 a directory that is not a checkout is refused (rc 3)"
 
-# 20h5 A COVER DATED BETWEEN the authored work and an EVIL MERGE must REFUSE: the
+# 21h5 A COVER DATED BETWEEN the authored work and an EVIL MERGE must REFUSE: the
 #      anchor is the newest commit the verdict had to postdate, and a hand-resolved
 #      merge is authored content even though `--no-merges` cannot see it.
 git checkout -q evil >/dev/null 2>&1
@@ -5723,16 +6131,16 @@ printf '%s\n' '2026-02-01T00:00:00Z' > "$T/dates/$DG_EV2_HEAD"
 EH6=425135; rm -f "$(Q2 $EH6)"
 run_record_delta $EH6 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42513501" \
     STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
-assert_eq "$RECORD_RC" "3" "20h5 a cover predating an EVIL MERGE is refused (the merge is in the anchor set)"
-assert_eq "$(cat "$(Q2 $EH6)" 2>/dev/null | wc -c | tr -d ' ')" "0" "20h5 no record written"
+assert_eq "$RECORD_RC" "3" "21h5 a cover predating an EVIL MERGE is refused (the merge is in the anchor set)"
+assert_eq "$(cat "$(Q2 $EH6)" 2>/dev/null | wc -c | tr -d ' ')" "0" "21h5 no record written"
 # and the SAME range with a cover that postdates the merge IS accepted — the arm
 # refuses the ordering, not the shape.
 EH7=425136; rm -f "$(Q2 $EH7)"
 run_record_delta $EH7 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42513601" \
     STUB_EVIDENCE_AT="2026-03-01T00:00:00Z"
-assert_eq "$RECORD_RC" "0" "20h5 a cover that postdates the evil merge still records (arm is an ordering test)"
+assert_eq "$RECORD_RC" "0" "21h5 a cover that postdates the evil merge still records (arm is an ordering test)"
 
-# 20h6 A MERGE-ONLY DELTA WITH NO COVER IS REFUSED, AND IT DOES NOT LAUNDER AN
+# 21h6 A MERGE-ONLY DELTA WITH NO COVER IS REFUSED, AND IT DOES NOT LAUNDER AN
 #      EXISTING RECORD. ⛔ Relabelled: the assertion this block has always made is the
 #      REFUSAL, and since the unsigned local-record premise was deleted as a forgery
 #      vector, a planted clean-micro/clean-low record is no longer CONSULTED at all —
@@ -5745,12 +6153,12 @@ for _tier in clean-micro clean-low; do
     printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
       "$EH8" "$DG_A1" "$_tier" > "$(Q2 $EH8)"
     run_record_delta $EH8 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
-    assert_eq "$RECORD_RC" "3" "20h6 a cover-less merge-only delta is refused even with a prior $_tier record present (rc 3)"
-    assert_contains "$RECORD_ERR" "a delta EXTENDS an attestation and can never create one" "20h6 …by the merge-only needs-an-attested-A arm (the local-record premise is deleted, so it is not consulted)"
-    assert_contains "$(cat "$(Q2 $EH8)" 2>/dev/null || true)" "\"verdict\":\"$_tier\"" "20h6 the planted $_tier record was not overwritten"
+    assert_eq "$RECORD_RC" "3" "21h6 a cover-less merge-only delta is refused even with a prior $_tier record present (rc 3)"
+    assert_contains "$RECORD_ERR" "a delta EXTENDS an attestation and can never create one" "21h6 …by the merge-only needs-an-attested-A arm (the local-record premise is deleted, so it is not consulted)"
+    assert_contains "$(cat "$(Q2 $EH8)" 2>/dev/null || true)" "\"verdict\":\"$_tier\"" "21h6 the planted $_tier record was not overwritten"
 done
 
-# 20h7 THE ANCHOR IS THE MAX BY COMMITTER DATE, not the tip. A backdated child must
+# 21h7 THE ANCHOR IS THE MAX BY COMMITTER DATE, not the tip. A backdated child must
 #      not drag the anchor earlier than its own parent.
 git checkout -q -b dated "$DG_A1" >/dev/null 2>&1
 printf 'p\n' > p.txt; git add -A
@@ -5763,12 +6171,12 @@ printf '%s\n' '2025-06-20T00:00:00Z' > "$T/dates/$DG_P"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_C"
 EH9=425138; rm -f "$(Q2 $EH9)"
 run_record_delta $EH9 "$DG_C" "delta:$DG_A1..$DG_C+comment:42513801" STUB_EVIDENCE_AT="2025-06-10T00:00:00Z"
-assert_eq "$RECORD_RC" "3" "20h7 a cover predating the NEWEST-DATED authored commit is refused (anchor is the max, not the tip)"
+assert_eq "$RECORD_RC" "3" "21h7 a cover predating the NEWEST-DATED authored commit is refused (anchor is the max, not the tip)"
 EH10=425139; rm -f "$(Q2 $EH10)"
 run_record_delta $EH10 "$DG_C" "delta:$DG_A1..$DG_C+comment:42513901" STUB_EVIDENCE_AT="2025-07-01T00:00:00Z"
-assert_eq "$RECORD_RC" "0" "20h7 a cover postdating it still records"
+assert_eq "$RECORD_RC" "0" "21h7 a cover postdating it still records"
 
-# 20h8 A CLEAN merge in the SAME range as an evil merge must NOT move the anchor.
+# 21h8 A CLEAN merge in the SAME range as an evil merge must NOT move the anchor.
 # Only the NON-CLEAN merges are anchor candidates: charging a re-review for a
 # conflict-free merge of already-reviewed history is the agent-infra#3245 cost this
 # change exists to remove.
@@ -5782,18 +6190,18 @@ GIT_COMMITTER_DATE='2026-03-01T00:00:00Z' GIT_AUTHOR_DATE='2026-03-01T00:00:00Z'
 DG_MIXED="$(git rev-parse HEAD)"
 printf '%s\n' '2026-03-01T00:00:00Z' > "$T/dates/$DG_MIXED"
 if [ "$(git -C "$DG" rev-list --parents -n1 "$DG_MIXED" 2>/dev/null | awk '{print NF}')" = "3" ]; then
-    ok "20h8 fixture: the mixed head is a real two-parent merge"
+    ok "21h8 fixture: the mixed head is a real two-parent merge"
 else
-    bad "20h8 fixture: the clean merge did not happen — the vector would not test the arm"
+    bad "21h8 fixture: the clean merge did not happen — the vector would not test the arm"
 fi
 EH11=425150; rm -f "$(Q2 $EH11)"
 # cover 2026-02-15: AFTER the evil merge (2026-02-01), BEFORE the clean merge (2026-03-01).
 run_record_delta $EH11 "$DG_MIXED" "delta:$DG_EV_L..$DG_MIXED+comment:42515001" \
     STUB_EVIDENCE_AT="2026-02-15T00:00:00Z"
-assert_eq "$RECORD_RC" "0" "20h8 a CLEAN merge does not move the anchor (cover after the evil merge records)"
-assert_contains "$(cat "$(Q2 $EH11)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h8 the mixed range is still AUTHORED (the evil merge is not hidden)"
+assert_eq "$RECORD_RC" "0" "21h8 a CLEAN merge does not move the anchor (cover after the evil merge records)"
+assert_contains "$(cat "$(Q2 $EH11)" 2>/dev/null || true)" '"delta_kind":"authored"' "21h8 the mixed range is still AUTHORED (the evil merge is not hidden)"
 
-# 20h9 TWO CHAINED evil merges whose committer dates are NOT monotone (the child
+# 21h9 TWO CHAINED evil merges whose committer dates are NOT monotone (the child
 # is the OLDER one). `rev-list` is topology-first, so a `break` on the first
 # non-clean merge captures the child and never examines the parent that carries the
 # LATER hand-resolution — a cover predating it would then verify. Every non-clean
@@ -5815,14 +6223,14 @@ printf '%s\n' '2026-06-01T00:00:00Z' > "$T/dates/$EM_PARENT"
 printf '%s\n' '2026-04-01T00:00:00Z' > "$T/dates/$EM_CHILD"
 EMERGE_COUNT="$(git -C "$DG" rev-list --merges "$DG_EV_L..$EM_CHILD" --not "$DG_M1" 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$EMERGE_COUNT" = "3" ]; then
-    ok "20h9 fixture: the range holds TWO chained evil merges"
+    ok "21h9 fixture: the range holds TWO chained evil merges"
 else
-    bad "20h9 fixture: expected 3 in-range merges, got $EMERGE_COUNT — the vector would not test the arm"
+    bad "21h9 fixture: expected 3 in-range merges, got $EMERGE_COUNT — the vector would not test the arm"
 fi
 if [ "$(git -C "$DG" rev-list --merges "$DG_EV_L..$EM_CHILD" --not "$DG_M1" | head -1)" = "$EM_CHILD" ]; then
-    ok "20h9 fixture: rev-list emits the BACKDATED child first (the trap is live)"
+    ok "21h9 fixture: rev-list emits the BACKDATED child first (the trap is live)"
 else
-    bad "20h9 fixture: the child is not emitted first — the vector would not test the trap"
+    bad "21h9 fixture: the child is not emitted first — the vector would not test the trap"
 fi
 EH12=425151; rm -f "$(Q2 $EH12)"
 # cover 2026-05-01: after the child's date (2026-04-01), BEFORE the parent's (2026-06-01)
@@ -5834,36 +6242,36 @@ run_record_delta $EH12 "$EM_CHILD" "delta:$DG_EV_L..$EM_CHILD+comment:42515002" 
 # that head for a cover predating the parent hand-resolution) and M10 below is what
 # proves the population truncation is what makes it refuse.
 if [ "$RECORD_RC" = "0" ]; then
-    bad "20h9 a cover predating the SECOND (parent) evil merge was ACCEPTED (rc 0) — the anchor population is truncated"
+    bad "21h9 a cover predating the SECOND (parent) evil merge was ACCEPTED (rc 0) — the anchor population is truncated"
 else
-    ok "20h9 a cover predating the SECOND (parent) evil merge is refused (rc $RECORD_RC)"
+    ok "21h9 a cover predating the SECOND (parent) evil merge is refused (rc $RECORD_RC)"
 fi
-[ -f "$(Q2 $EH12)" ] && bad "20h9 no record was written at the evil head" ||
-    ok "20h9 no record was written at the evil head"
+[ -f "$(Q2 $EH12)" ] && bad "21h9 no record was written at the evil head" ||
+    ok "21h9 no record was written at the evil head"
 
-# 20h10 delta × --force-stale: a delta ASSERTS its upper bound is the PR's current
+# 21h10 delta × --force-stale: a delta ASSERTS its upper bound is the PR's current
 #       head, so recording one against a stale sha mints a false claim.
 EH13=425152; rm -f "$(Q2 $EH13)"
 run_record_delta $EH13 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" EXTRA_ARGS=--force-stale
-assert_eq "$RECORD_RC" "2" "20h10 delta + --force-stale is refused (rc 2, argument error)"
-assert_contains "$RECORD_ERR" "incompatible with delta evidence" "20h10 the refusal names the contradiction"
-[ -f "$(Q2 $EH13)" ] && bad "20h10 no record was written" || ok "20h10 no record was written"
+assert_eq "$RECORD_RC" "2" "21h10 delta + --force-stale is refused (rc 2, argument error)"
+assert_contains "$RECORD_ERR" "incompatible with delta evidence" "21h10 the refusal names the contradiction"
+[ -f "$(Q2 $EH13)" ] && bad "21h10 no record was written" || ok "21h10 no record was written"
 
-# 20h12 THE RANGE MUST BE THE REVIEWER'S CLAIM. A committer date records when a
+# 21h12 THE RANGE MUST BE THE REVIEWER'S CLAIM. A committer date records when a
 #      commit was CREATED, not when it was pushed, so an OLD-DATED branch merged in
 #      after the review never moves the date anchor — and the old cover would then
 #      "cover" content nobody read. The plain head-bound path refuses that same head;
 #      an authored delta must not accept what it rejects. A cover that does not NAME
-#      the range is refused, and 20d2/20h5/20h7/20h8 (whose bodies do name it) still
+#      the range is refused, and 21d2/21h5/21h7/21h8 (whose bodies do name it) still
 #      record — so the arm discriminates on the claim, not on the dates.
 EH14=425154; rm -f "$(Q2 $EH14)"
 run_record_delta $EH14 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
-assert_eq "$RECORD_RC" "3" "20h12 an authored delta whose cover does NOT name the range is refused (rc 3)"
-assert_contains "$RECORD_ERR" "does not NAME the range" "20h12 the refusal names the missing range claim"
-[ -f "$(Q2 $EH14)" ] && bad "20h12 no record was written" || ok "20h12 no record was written"
+assert_eq "$RECORD_RC" "3" "21h12 an authored delta whose cover does NOT name the range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "does not NAME the range" "21h12 the refusal names the missing range claim"
+[ -f "$(Q2 $EH14)" ] && bad "21h12 no record was written" || ok "21h12 no record was written"
 
-# 20h13 A MODIFY/DELETE CONFLICT resolved git's own way. `merge-tree --write-tree`
+# 21h13 A MODIFY/DELETE CONFLICT resolved git's own way. `merge-tree --write-tree`
 #      PRINTS A TREE EVEN WHEN IT CONFLICTS (exit 1), so a resolution that keeps the
 #      modified file has a tree IDENTICAL to merge-tree's — a tree comparison alone
 #      calls it a clean merge, the range classifies merge-only, the cover premise is
@@ -5891,9 +6299,9 @@ printf '%s\n' '2025-05-03T00:00:00Z' > "$T/dates/$DG_MDM"
 W13="$(git -C "$DG" merge-tree --write-tree "$DG_MDA" "$DG_MDM" 2>/dev/null | head -1 || true)"
 A13="$(git -C "$DG" rev-parse "$DG_MDB^{tree}" 2>/dev/null || true)"
 if [ -n "$W13" ] && [ "$W13" = "$A13" ]; then
-    ok "20h13 fixture: the conflicted merge's TREE equals merge-tree's (status is the only signal)"
+    ok "21h13 fixture: the conflicted merge's TREE equals merge-tree's (status is the only signal)"
 else
-    bad "20h13 fixture: the trees differ, so the vector would not test the status arm (want=$W13 actual=$A13)"
+    bad "21h13 fixture: the trees differ, so the vector would not test the status arm (want=$W13 actual=$A13)"
 fi
 # A is the attested head the merge-only premise needs.
 EPM=425160; rm -f "$(Q2 $EPM)"
@@ -5902,17 +6310,17 @@ printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-i
 EH15=425161; rm -f "$(Q2 $EH15)"
 run_record_delta $EH15 "$DG_MDB" "delta:$DG_MDA..$DG_MDB" \
     STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_MDM" STUB_BASE_REF=main
-assert_eq "$RECORD_RC" "3" "20h13 a modify/delete conflict resolved by hand is REFUSED (rc 3)"
+assert_eq "$RECORD_RC" "3" "21h13 a modify/delete conflict resolved by hand is REFUSED (rc 3)"
 # ⛔ REFUSAL ONLY, and the mrc arm itself is NOT mutation-measured: in this harness
 # the range classifies AUTHORED for a reason this vector could not isolate (the
 # refusal is real and the record is not written, but removing the `mrc` test does not
 # flip the outcome), so M13 was deleted rather than left claiming coverage it does
 # not have. Declared as UNMEASURED on the PR; the fix mirrors lane_dimension_carry's
 # clause (D), which checks the same status for the same reason.
-[ -f "$(Q2 $EH15)" ] && bad "20h13 no record was written at the conflicted merge" ||
-    ok "20h13 no record was written at the conflicted merge"
+[ -f "$(Q2 $EH15)" ] && bad "21h13 no record was written at the conflicted merge" ||
+    ok "21h13 no record was written at the conflicted merge"
 
-# 20h14 MERGE-ONLY + A NAMED COVER IS REACHABLE. In the ordering this feature
+# 21h14 MERGE-ONLY + A NAMED COVER IS REACHABLE. In the ordering this feature
 #       exists for — verdict at A, THEN the base merge creates B — B's commit date is
 #       necessarily later than the verdict, so anchoring the merge-only cover on B
 #       made the printed remedy (`+comment:<id>`) impossible to satisfy. The anchor is
@@ -5921,29 +6329,29 @@ EH16=425162; rm -f "$(Q2 $EH16)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
 run_record_delta $EH16 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516301" \
     STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found."
-assert_eq "$RECORD_RC" "0" "20h14 merge-only + a cover posted AFTER A records clean (rc 0)"
-assert_contains "$(cat "$(Q2 $EH16)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h14 the range stays merge-only"
+assert_eq "$RECORD_RC" "0" "21h14 merge-only + a cover posted AFTER A records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EH16)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "21h14 the range stays merge-only"
 EH17=425164; rm -f "$(Q2 $EH17)"
 run_record_delta $EH17 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516501" \
     STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found."
-assert_eq "$RECORD_RC" "3" "20h14 a cover PREDATING A is still refused (rc 3)"
+assert_eq "$RECORD_RC" "3" "21h14 a cover PREDATING A is still refused (rc 3)"
 
-# 20h15 A BODY THAT STATES A DIFFERENT RANGE. Quoting a NARROWER range (X..B, X a
+# 21h15 A BODY THAT STATES A DIFFERENT RANGE. Quoting a NARROWER range (X..B, X a
 #       descendant of A) must not satisfy the claim for the wider A..B — the record
 #       would assert a range its own artifact contradicts.
 EH18=425166; rm -f "$(Q2 $EH18)"
 run_record_delta $EH18 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
     STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
-assert_eq "$RECORD_RC" "3" "20h15 a body stating a NARROWER range is refused (rc 3)"
-assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal names the contradiction"
-[ -f "$(Q2 $EH18)" ] && bad "20h15 no record was written" || ok "20h15 no record was written"
+assert_eq "$RECORD_RC" "3" "21h15 a body stating a NARROWER range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "21h15 the refusal names the contradiction"
+[ -f "$(Q2 $EH18)" ] && bad "21h15 no record was written" || ok "21h15 no record was written"
 
-# 20h16 A COVER THAT NAMES **A ALONE** ALSO SATISFIES THE CLAIM (the other half of
-#       20h14). A verdict written BEFORE B existed cannot name B at all, so demanding
+# 21h16 A COVER THAT NAMES **A ALONE** ALSO SATISFIES THE CLAIM (the other half of
+#       21h14). A verdict written BEFORE B existed cannot name B at all, so demanding
 #       the range would make the printed remedy unreachable in exactly the ordering
 #       this feature exists for. Naming A IS the claim for a merge-only range.
-#       ⛔ Numbered 20h16, not a second 20h14: the earlier draft emitted this block
+#       ⛔ Numbered 21h16, not a second 21h14: the earlier draft emitted this block
 #       TWICE with the same PR numbers (425162/425164) and the same labels, so the
 #       later copy silently overwrote the earlier one's record and no reader could
 #       tell which vector had actually been measured.
@@ -5951,13 +6359,13 @@ EH19=425168; rm -f "$(Q2 $EH19)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
 run_record_delta $EH19 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516801" \
     STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
-assert_eq "$RECORD_RC" "0" "20h16 merge-only + a cover naming A alone records clean (rc 0)"
-assert_contains "$(cat "$(Q2 $EH19)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h16 the range stays merge-only"
+assert_eq "$RECORD_RC" "0" "21h16 merge-only + a cover naming A alone records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EH19)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "21h16 the range stays merge-only"
 EH20=425169; rm -f "$(Q2 $EH20)"
 run_record_delta $EH20 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516901" \
     STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
-assert_eq "$RECORD_RC" "3" "20h16 a cover naming A but PREDATING A is still refused (rc 3)"
-# ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
+assert_eq "$RECORD_RC" "3" "21h16 a cover naming A but PREDATING A is still refused (rc 3)"
+# ── 21g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
 # `if [ ! -s "$tmp" ]` and the entire run dies instead of reporting "this vector
@@ -6001,23 +6409,23 @@ mut_check() { # <label> <pr> <sha> <ref> <expect: accepted|refused|accepted-cons
     MM=$((MM+1))
     local label="$1" pr="$2" sha="$3" ref="$4" expect="$5"; shift 5
     if [ ! -s "${MUT:-}" ]; then
-        bad "20g $label: the mutant could not be built (mutation anchor missing from the recorder) — this vector was NOT measured"
+        bad "21g $label: the mutant could not be built (mutation anchor missing from the recorder) — this vector was NOT measured"
         return 0
     fi
     rm -f "$(Q2 $pr)"
     mut_run "$MUT" "$pr" "$sha" "$ref" "$@"
     if [ "$expect" = "accepted" ] || [ "$expect" = "accepted-constant" ]; then
-        if [ "$RECORD_RC" = "0" ]; then MM_OK=$((MM_OK+1)); ok "20g $label: guard removed → ACCEPTED (rc 0), so the shipped vector is load-bearing"
-        else bad "20g $label: mutant still refused (rc=$RECORD_RC) — the vector is vacuous"; fi
+        if [ "$RECORD_RC" = "0" ]; then MM_OK=$((MM_OK+1)); ok "21g $label: guard removed → ACCEPTED (rc 0), so the shipped vector is load-bearing"
+        else bad "21g $label: mutant still refused (rc=$RECORD_RC) — the vector is vacuous"; fi
         if [ "$expect" = "accepted-constant" ]; then
             local md
             md="$(sed -n 's/.*"delta_digest":"\([0-9a-f]*\)".*/\1/p' "$(Q2 $pr)" 2>/dev/null | head -1)"
             assert_eq "$md" "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
-                "20g $label: the mutant minted the sha256-of-EMPTY constant (one digest for every empty range)"
+                "21g $label: the mutant minted the sha256-of-EMPTY constant (one digest for every empty range)"
         fi
     else
-        if [ "$RECORD_RC" != "0" ]; then MM_OK=$((MM_OK+1)); ok "20g $label: guard broken → REFUSED (rc=$RECORD_RC), so the acceptance vector is load-bearing"
-        else bad "20g $label: mutant still accepted — the vector is vacuous"; fi
+        if [ "$RECORD_RC" != "0" ]; then MM_OK=$((MM_OK+1)); ok "21g $label: guard broken → REFUSED (rc=$RECORD_RC), so the acceptance vector is load-bearing"
+        else bad "21g $label: mutant still accepted — the vector is vacuous"; fi
     fi
 }
 mk_mutant2() { # <mutant-path> <old> <new> — a SECOND replacement in a mutant copy
@@ -6047,7 +6455,7 @@ mut_check "M1b empty-range arm is covered by the empty-diff arm" 425126 "$DG_HEA
 # verdict that postdates it.
 MUT="$(mk_mutant ancestry '  delta_git "$root" merge-base --is-ancestor "$from" "$to" 2>/dev/null || dg_rc=$?' '  dg_rc=0')"
 mut_check "M2 ancestry guard" 425121 "$DG_A1" "delta:$DG_HEAD..$DG_A1+comment:42512101" accepted
-# M3 — B == the recorded head. ⛔ THE VECTOR MUST BE 20c1'S (record at A, range
+# M3 — B == the recorded head. ⛔ THE VECTOR MUST BE 21c1'S (record at A, range
 # ending at the head): the first version of this cell recorded at the head AND
 # ended the range there, so the mutated guard was never reached and the cell
 # passed for BOTH the shipped and the mutant script — a vacuous cell that
@@ -6065,19 +6473,19 @@ mut_check "M4 authored-needs-cover" 425123 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD"
 MUT="$(mk_mutant anchor '    anchor="$newest"' '    anchor="$to"')"
 mut_check "M5 covering-verdict anchor" 425124 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42512401" accepted STUB_EVIDENCE_AT="2025-01-01T00:00:00Z"
 # M6 — the base-aware classification (the reverse direction: breaking it must
-#      REFUSE the merge-only acceptance vector, or 20a tests nothing).
+#      REFUSE the merge-only acceptance vector, or 21a tests nothing).
 MUT="$(mk_mutant baseaware 'rev-list --no-merges "$from..$to" --not "$base_sha"' 'rev-list --no-merges "$from..$to"')"
 mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
-# M7 — the EVIL MERGE in the anchor candidate set. 20h5's cover predates the
+# M7 — the EVIL MERGE in the anchor candidate set. 21h5's cover predates the
 #      hand-resolved merge, so dropping the merges from `cands` must ACCEPT it.
 MUT="$(mk_mutant evilanchor '    if [ -n "$evil_shas" ]; then' '    if false; then')"
 mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42514001" accepted STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
 # M14 — THE RANGE CONTAINMENT. Removing the ancestry test lets a body that declares a
-#       NARROWER range satisfy the claim for a wider one (20h15).
+#       NARROWER range satisfy the claim for a wider one (21h15).
 MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
 mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
-#       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
+#       merge truncates `evil_shas` to the backdated CHILD, so 21h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
 #       the inert-anchor bug, one level down — the variable was right, the
 #       population was truncated.
@@ -6090,7 +6498,7 @@ mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "del
 #       over a head whose checks were never shown non-red — the enum fall-through the
 #       AGENTS.md verification-state rule forbids. The mutant is the SIMULATION of the
 #       drift, so this cell asserts REFUSED: it reddens precisely when the polarity
-#       regresses. It probes a real range (20a's), so the arm is actually reached.
+#       regresses. It probes a real range (21a's), so the arm is actually reached.
 MUT="$(mk_mutant unnamedcheck '  thr=0
   target_head_red "$to" || thr=$?' '  thr=3')"
 mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
@@ -6101,11 +6509,11 @@ MUT="$(mk_mutant rangeclaim '      for _needle in "$to" "${to:0:12}"; do' '     
 mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
-# tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
+# tier left to launder into `clean`. 21h6 keeps its refusal, now reached through the
 # mandatory-cover arm.
 echo "   MUTATION-MATRIX($MM_OK/$MM)"
 set -e
-if [ "$MM" -eq "$MM_OK" ]; then ok "20g MUTATION-MATRIX($MM_OK/$MM) every dispatched cell behaved as its vector predicted — the guard-load-bearing cells AND M1b, which deliberately measures the OPPOSITE (that the A==B arm is REDUNDANT because the empty-diff arm already refuses it); the other delta arms are pinned by refusal vectors only, not by a mutant"; else bad "20g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
+if [ "$MM" -eq "$MM_OK" ]; then ok "21g MUTATION-MATRIX($MM_OK/$MM) every dispatched cell behaved as its vector predicted — the guard-load-bearing cells AND M1b, which deliberately measures the OPPOSITE (that the A==B arm is REDUNDANT because the empty-diff arm already refuses it); the other delta arms are pinned by refusal vectors only, not by a mutant"; else bad "21g MUTATION-MATRIX($MM_OK/$MM) — a guard is vacuous"; fi
 
 cd "$ORIG_PWD" 2>/dev/null || cd "$T" || true
 echo ""

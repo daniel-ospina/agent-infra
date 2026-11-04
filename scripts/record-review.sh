@@ -306,6 +306,36 @@
 #                 accepted and declared — the attestation is deliberately
 #                 limited to a shape this guard can actually read. See the
 #                 clean-low guard in main and the predicates below.
+#   not-clean   — THE NEGATIVE VERDICT (agent-infra#3400). A review that found a
+#                 defect could not be recorded at all: the verdict list admitted
+#                 only the three `clean*` tiers, so the ONLY way to write down
+#                 "a review ran here and it was not clean" was a PR comment that
+#                 no gate reads. That is how tortoise#3295 came to carry
+#                 `verdict=clean` in its body while the most recent review at
+#                 that head was NOT CLEAN — the contradiction had nowhere to
+#                 live except prose.
+#                 A not-clean record is the SAME attestation shape as `clean`:
+#                 same head binding, same `diff=`, same `sig=`, and --evidence is
+#                 required and VERIFIED exactly as for `clean` (a negative
+#                 verdict is still a claim that a review happened, so it must
+#                 name the artifact). Two differences, both in the direction of
+#                 saying MORE:
+#                   * `--findings N` is REQUIRED (a not-clean verdict with zero
+#                     findings is a contradiction) and is recorded as
+#                     `"findings":N`, so the gate can say "reviewed NOT CLEAN at
+#                     <sha>: N open finding(s)" instead of "no record";
+#                   * the evidence's NEGATIVE assertions are EXPECTED rather than
+#                     vetoed — `verify_review_evidence`'s (1)/(1b)/(2) arms exist
+#                     to stop a clean mint over a NOT-CLEAN artifact, and
+#                     inverting them here would refuse the only correct evidence
+#                     a negative verdict can have. Every structural arm (exists,
+#                     belongs to THIS PR, postdates the head, is not a record
+#                     marker) still applies.
+#                 ⛔ IT DOES NOT WEAKEN THE CLEAN PATH. `not-clean` is NOT in the
+#                 merge gate's ACCEPTED_VERDICTS (extensions/review-enforcer), so
+#                 recording one BLOCKS a merge rather than licensing it — which is
+#                 the whole point: the verdict is now legible to the gate instead
+#                 of invisible to it.
 set -euo pipefail
 
 # ⛔ THE RESERVE IS SPENT BY LANDINGS ONLY — AND "THE RESERVE" IS NOT THIS SCRIPT (#2342 review, P1).
@@ -856,8 +886,16 @@ evidence_fetch() { # <kind> <id> -> tsv row; non-zero = unreadable
 
 # Verify that <ref> is a review artifact attesting THIS PR at <head>.
 # Prints one confirmation line on success; prints WHY on stderr and returns 1.
-verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
-  local ref="$1" head="$2" split kind id row created parent body state head_date _rest
+verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
+  # #3400 — POLARITY. The default (`clean`) is the original contract: the
+  # artifact must NOT assert a non-clean outcome. `not-clean` inverts ONLY the
+  # outcome assertions — the artifact is EXPECTED to declare the negative, since
+  # that is what the verdict being recorded says happened. Every structural arm
+  # below (recognisable ref, exists, belongs to THIS PR, postdates the head, is
+  # not itself a record marker) is shared, so a negative record cannot be minted
+  # over an artifact that is missing, foreign or older than the revision it
+  # claims to describe.
+  local ref="$1" head="$2" polarity="${3:-clean}" split kind id row created parent body state head_date _rest
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "   cannot verify review evidence without a repo and the gh CLI (repo='${REPO:-<none>}') — pass <owner/repo> explicitly so the artifact can be read." >&2
     return 1
@@ -917,7 +955,7 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   # GITHUB'S OWN VERDICT ON A REVIEW. PR reviews carry a machine-readable state;
   # anything but APPROVED/COMMENTED (i.e. CHANGES_REQUESTED, DISMISSED, PENDING)
   # is not evidence of a clean review whatever its body says.
-  if [ -n "$state" ] && [[ ! "$state" =~ ^(APPROVED|COMMENTED)$ ]]; then
+  if [ "$polarity" != "not-clean" ] && [ -n "$state" ] && [[ ! "$state" =~ ^(APPROVED|COMMENTED)$ ]]; then
     echo "   $kind $id is a $state review — a review that requested changes, was dismissed, or never concluded is not evidence of a clean review." >&2
     return 1
   fi
@@ -1009,6 +1047,21 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   #     So when the artifact states an explicit `Outcome:` field, that field IS its claim about the
   #     outcome and arm (2) is skipped; arm (1) still applies. Without an `Outcome:` field nothing
   #     changes — the loose arm runs exactly as before, so this cannot widen the fail-open.
+  # ⛔ #3400 — A `not-clean` VERDICT SKIPS THE OUTCOME ARMS, AND ONLY THOSE.
+  # Arms (1)/(1b)/(2) below ask "does this artifact say the review did NOT conclude
+  # clean?" and refuse a CLEAN mint when it does. For a not-clean mint that is the
+  # WRONG question: an artifact declaring the negative is exactly the evidence an
+  # honest negative verdict has, and vetoing it would leave a lane able to record
+  # "NOT CLEAN" only by naming an artifact that never mentions the finding. Every
+  # STRUCTURAL arm above has already run — that is the part that stops an unfounded
+  # record — so nothing is weakened here: a clean mint still runs every arm below,
+  # unchanged and unconditional. (This is also why the veto cannot be reached by a
+  # caller who did not ask for it: polarity comes from the VERDICT, not a flag.)
+  if [ "$polarity" = "not-clean" ]; then
+    printf '%s %s on %s#%s, created %s, postdates head %s (NEGATIVE-polarity evidence: the artifact is expected to declare the not-clean outcome, so arms 1/1b/2 do not apply)\n' \
+      "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
+    return 0
+  fi
   if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]|\[NO-LOOP-BUDGET\]' <<<"$body"; then
     echo "   $kind $id asserts an UNRESOLVED outcome (a stalled/failed/cap/human-input exit) — it is evidence the review did not conclude clean." >&2
     return 1
@@ -1238,8 +1291,11 @@ $m"
     # ⛔ FIELD 1 IS THE COMMIT ITSELF (rev-list --parents prints `<commit> <p1> <p2>`),
     # so the parents are fields 2 and 3. Reading field 1 as a parent merged the merge
     # with its own second parent — a trivially clean, always-equal comparison that
-    # made this whole arm inert (found by the §20h2 vector, which is why the vector
-    # asserts the REFUSAL MESSAGE and not merely the exit code).
+    # made this whole arm inert (found by the §21h2 vector in
+    # scripts/record-review.test.sh, which is why the vector asserts the REFUSAL MESSAGE
+    # and not merely the exit code). The section is §21 and NOT §20 because #3400
+    # landed a §20 in the same suite while this branch was open; `tests/record-review/run.sh`
+    # keeps its OWN §20b, which is a different suite's numbering and is not what this cites.
     read -r _self p1 p2 _extra <<< "$parents"
     # ⛔ THE EXIT STATUS IS LOAD-BEARING, and this arm had discarded it. `git
     # merge-tree --write-tree` prints a RESULT TREE ON LINE 1 EVEN WHEN IT CONFLICTS
@@ -1763,6 +1819,12 @@ D_REC=""
 # `delta.from`, so the pair a reader checks is the pair the proof covers.
 DELTA_MEASURED_FROM=""
 EVIDENCE=""
+# agent-infra#3400 — the NEGATIVE verdict's finding count. Required for
+# `not-clean` (so the gate can name WHAT is open, not merely that something is),
+# refused for every other verdict (a flag that cannot affect the record must not
+# be accepted, or the caller believes it wrote something it did not).
+FINDINGS=""
+FINDINGS_NOTE=""
 # tortoise#7391: what the record carries. Set ONLY by the verification gate below, so a
 # record claims `evidence` only when this run actually read and accepted that
 # artifact — passing --evidence on a path the gate does not cover (a carry, a
@@ -1825,6 +1887,23 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
         exit 2
       fi
       EVIDENCE="${_argv[$_i]}" ;;
+    --findings)
+      # #3400: the open-finding count a `not-clean` record must carry.
+      _i=$((_i + 1))
+      if [ "$_i" -ge "${#_argv[@]}" ]; then
+        echo "record-review.sh: --findings needs a value (the number of OPEN findings the review left) — usage: record-review.sh <pr> <head_sha> not-clean <owner/repo> --findings <n> --evidence <review-artifact>" >&2
+        exit 2
+      fi
+      FINDINGS="${_argv[$_i]}" ;;
+    --findings-note)
+      # #3400: free-form severity detail (e.g. "1 open P2"), quoted into the
+      # gate's message. Never parsed, so it cannot become a second grammar.
+      _i=$((_i + 1))
+      if [ "$_i" -ge "${#_argv[@]}" ]; then
+        echo "record-review.sh: --findings-note needs a value (free-form severity detail, e.g. '1 open P2')" >&2
+        exit 2
+      fi
+      FINDINGS_NOTE="${_argv[$_i]}" ;;
     --second-model|--second-model-independent)
       echo "record-review.sh: '$_arg' was removed with the second-model subsystem (#980/#979) — this repo is single-model; refusing to record. Drop it from the invocation." >&2
       exit 2 ;;
@@ -1928,16 +2007,24 @@ else
   REPO="${4:-}"
 fi
 case "$VERDICT" in
-  clean|clean-micro|clean-low) ;;
+  clean|clean-micro|clean-low|not-clean) ;;
   *)
     # --print-diff-hash carries NO verdict (it writes nothing), so only the
     # record path is refused here. The arm is expressed this way — rather than
     # folding the case into the else above — so the mutation harness's
-    # `sed 's#^  clean|clean-micro|clean-low) ;;#…#'` anchor keeps matching.
+    # `sed 's#^  clean|clean-micro|clean-low|not-clean) ;;#…#'` anchor keeps
+    # matching (verified against scripts/record-review.test.sh:3724, which is
+    # the exact sed that pins this arm; #3400 widened both together).
     # --recover-body is here for the same reason (#2872): it takes its verdict
     # from the SIGNED marker it verifies, never from the command line.
+    # BOTH sides of the #3400 x #3247 fold are load-bearing here, and they are
+    # ORTHOGONAL: `--delta` (#3247) is a mode that takes NO verdict, and
+    # `not-clean` (#3400) is a verdict. Union, not a choice — dropping `$DELTA`
+    # would refuse `--delta` with a verdict-error message that names neither the
+    # mode nor the reason, and dropping `not-clean` from the list would refuse
+    # the only verdict #3400 exists to make recordable.
     if [ "$PRINT_DIFF_HASH" -ne 1 ] && [ "$CHECK_CARRY" -ne 1 ] && [ "$PRINT_TIER" -ne 1 ] && [ "$RECOVER_BODY" -ne 1 ] && [ "$FLUSH_PENDING" -ne 1 ] && [ "$DELTA" -ne 1 ]; then
-      echo "verdict must be 'clean', 'clean-micro' or 'clean-low'; refusing to record '$VERDICT'" >&2; exit 2
+      echo "verdict must be 'clean', 'clean-micro', 'clean-low' or 'not-clean'; refusing to record '$VERDICT'" >&2; exit 2
     fi ;;
 esac
 # ── clean-low × --force-stale is an argument-level contradiction (#1348) ──
@@ -1949,6 +2036,56 @@ esac
 # unknown option; no record written).
 if [ "$VERDICT" = "clean-low" ] && [ "$FORCE_STALE" -eq 1 ]; then
   echo "record-review.sh: --force-stale is incompatible with the clean-low verdict — clean-low certifies the content shape of a specific revision, and the sha a stale record names is not the revision any consumer will read. Re-run at the current head without --force-stale." >&2
+  exit 2
+fi
+# ── #3400: `--findings` binds to `not-clean` and to nothing else ───────────
+# Both directions are refusals, because both are silent otherwise: a clean
+# record that quietly swallowed `--findings 3` would look like it had recorded
+# the findings, and a `not-clean` record with no count leaves the gate able to
+# say only "something was wrong", which is barely better than "no record".
+if [ "$VERDICT" = "not-clean" ]; then
+  if [ -z "$FINDINGS" ]; then
+    echo "record-review.sh: the 'not-clean' verdict requires --findings <n> — a negative verdict asserts that a review found something OPEN, and a count is the minimum that makes that assertable to the gate (which otherwise can only report 'a record exists whose verdict is not clean'). Nothing was recorded." >&2
+    exit 2
+  fi
+  # ⛔ CANONICALISE THE COUNT — DO NOT MERELY ACCEPT IT (review, P2-1). The count
+  # is written UNQUOTED (`"findings":$FINDINGS`) because every reader binds a JSON
+  # NUMBER (review-enforcer: `typeof record.findings === "number"`), so the
+  # spelling of the value IS the record's validity, not a formatting nicety.
+  #
+  # Measured against the previous arms: `^[0-9]+$` accepts `007`, and
+  # `[ 007 -lt 1 ]` is FALSE (bash reads a leading zero as OCTAL), so `--findings 007`
+  # was accepted and wrote `"findings":007` — invalid JSON, therefore an
+  # UNREADABLE record, therefore a gate that reports "No review record found" over
+  # a review that DID happen and WAS correct. `08` was worse still: `-lt` aborts the
+  # test with "value too great for base", and stderr noise does not make the record
+  # any more parseable. Fail-closed both times (a broken record cannot license a
+  # merge), but the arm silently destroyed a CORRECT negative record, so it did not
+  # hold its own contract.
+  #
+  # Why COERCE rather than refuse: `007` is a caller TYPO, not a lie about the
+  # review, and the count it denotes is unambiguous — seven. The strip below is
+  # pure STRING manipulation (no `10#` arithmetic), so a pathologically long value
+  # cannot wrap or overflow into a different number than the caller wrote.
+  if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then
+    echo "record-review.sh: --findings expects a POSITIVE integer (got '$FINDINGS') — 'not-clean' with zero findings is a contradiction: that is what 'clean' means. Nothing was recorded." >&2
+    exit 2
+  fi
+  # `${FINDINGS%%[!0]*}` is the leading-ZERO RUN (empty when it does not start with
+  # 0); removing it from the front yields the canonical decimal (`007` → `7`,
+  # `08` → `8`, `12` → `12`).
+  FINDINGS_ZEROS="${FINDINGS%%[!0]*}"
+  FINDINGS="${FINDINGS#"$FINDINGS_ZEROS"}"
+  if [ -z "$FINDINGS" ]; then
+    echo "record-review.sh: --findings expects a POSITIVE integer, and the value given ('${FINDINGS_ZEROS}') is zero — 'not-clean' with zero findings is a contradiction: that is what 'clean' means. Nothing was recorded." >&2
+    exit 2
+  fi
+  if [[ "$FINDINGS_NOTE" == *'"'* || "$FINDINGS_NOTE" == *'\\'* || "$FINDINGS_NOTE" =~ [[:cntrl:]] ]]; then
+    echo "record-review.sh: --findings-note must be a single-line plain string (no quotes, backslashes or control characters) — it is embedded in the record's JSON, and an unescaped character would make the record unreadable (which the merge gate treats as NO record)." >&2
+    exit 2
+  fi
+elif [ -n "$FINDINGS" ] || [ -n "$FINDINGS_NOTE" ]; then
+  echo "record-review.sh: --findings/--findings-note describe a NEGATIVE verdict and are only meaningful with 'not-clean' (got verdict '$VERDICT'). Accepting them here would let the caller believe findings were recorded when the record cannot carry them." >&2
   exit 2
 fi
 # ── #3315: the caller-supplied pair is a --check-carry INPUT, nothing else ──
@@ -2930,6 +3067,12 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   cc_field() { # <file> <field>
     command sed -n "s/.*\"$2\":\"\\([^\"]*\\)\".*/\\1/p" "$1" 2>/dev/null | command head -1 || true
   }
+  # #3400 — NUMERIC fields (`findings`) are written WITHOUT quotes, so `cc_field`
+  # cannot read them. A second pattern, not a loosened first one: `cc_field` is
+  # shared with the head/diff/verdict reads whose quoting IS the contract.
+  cc_num_field() { # <file> <field>
+    command sed -n "s/.*\"$2\":\\([0-9][0-9]*\\).*/\\1/p" "$1" 2>/dev/null | command head -1 || true
+  }
   # ⛔ MIRROR THE GATE'S LOOKUP EXACTLY, INCLUDING ITS COLLISION RULE (review, #2353 P1).
   # `extensions/review-enforcer::readReviewRecord` returns NULL when the QUALIFIED file
   # exists but its embedded `repo` differs (the identical-slug overwrite class: PR
@@ -3003,6 +3146,26 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   CC_HEAD="$(cc_field "$CC_REC" head_sha)"
   CC_DIFF="$(cc_field "$CC_REC" diff_sha256)"
   fi   # end of the record-FILE arm (#3315): a caller-supplied pair skipped it
+  # ── #3400 — THE VERDICT THIS RECORD CARRIES, so a NEGATIVE one can be reported ──
+  # `--check-carry` answered "may this record carry?" and never said WHAT the
+  # record says, so a `not-clean` record carried exactly like a `clean` one and
+  # the lane was told "Do NOT re-review … land it" over an open finding. The
+  # ANSWER WORD and exit code are unchanged (the seven-verdict contract is
+  # consumed positionally by other tools and #3315 pins it) — what is added is
+  # the diagnosis the answer was missing: the verdict and the open-finding count.
+  # Empty when the pair was CALLER-SUPPLIED (there is no record file to read),
+  # and empty reads as "not negative", never as "negative with no count".
+  CC_VERDICT=""; CC_FINDINGS=""
+  if [ "$CC_SUPPLIED" -eq 0 ]; then
+    CC_VERDICT="$(cc_field "$CC_REC" verdict)"
+    CC_FINDINGS="$(cc_num_field "$CC_REC" findings)"
+  fi
+  case "$CC_FINDINGS" in *[!0-9]*) CC_FINDINGS="" ;; esac
+  cc_report_negative() { # -> one stderr line naming the negative verdict, or nothing
+    [ "${CC_VERDICT:-}" = "not-clean" ] || return 0
+    echo "record-review.sh --check-carry: ⛔ reviewed NOT CLEAN at ${CC_HEAD:0:12}…${CC_FINDINGS:+ — $CC_FINDINGS open finding(s)}. This verdict CARRIES across the head move on the same terms a clean one does (the reviewed DIFF is what identity is over), so the CARRY is legitimate — what it carries is 'this has an open issue', NOT a licence to merge. Resolve the finding and record again; the answer below says whether the record still covers what would merge, not whether it is clean." >&2
+  }
+  cc_report_negative
   # ── AN UNPROVEN CARRY IS NOT A RECORD (#10177) ─────────────────────────────
   # A `mint:"carried"` record re-binds a verdict minted at ANOTHER head onto the
   # live one. That is legitimate only when the record SAYS which proof it used and
@@ -3284,7 +3447,14 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     # a run where RECOVER_BODY is 0 (measured: 214 assertions in the suite went
     # red on one unescaped paren, because bash parses the whole `if … fi` when it
     # reaches it). Expanded from a variable, the regex is an ordinary operand.
-    RB_RE="^review recorded: reviews/${PR}\.json verdict=(clean|clean-micro|clean-low) @ [0-9a-f]{40}( diff=[0-9a-f]{64})? \(([^)]+)\)$"
+    # #3400 — the negative family is admitted HERE, and its trailer is part of the
+    # pattern. Before this, a `verdict=not-clean` marker fell into RB_NBAD ("a
+    # marker whose signature does not verify"), so the ONE body channel that
+    # travels across boxes reported a signature failure for a perfectly good
+    # marker: presence-based reading that could not even SEE the negative, let
+    # alone prefer it. The repo group is UNCHANGED at index 3 — the new
+    # findings/note group is appended AFTER it, so no existing read shifts.
+    RB_RE="^review recorded: reviews/${PR}\.json verdict=(clean|clean-micro|clean-low|not-clean) @ [0-9a-f]{40}( diff=[0-9a-f]{64})? \(([^)]+)\)( findings=[0-9]+( note=[^\"\\\\]*)?)?$"
     [[ "$_text" =~ $RB_RE ]] || { RB_NBAD=$((RB_NBAD + 1)); continue; }
     [ "${BASH_REMATCH[3]}" = "$REPO" ] || { RB_NFOREIGN=$((RB_NFOREIGN + 1)); continue; }
     # (the HMAC is verified below for THIS repo's marker only, so the foreign-arm
@@ -3314,7 +3484,67 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     exit 3
   fi
   RB_VERDICT="${RB_TEXT#*verdict=}"; RB_VERDICT="${RB_VERDICT%% *}"
-  RB_HEAD="$(printf '%s' "$RB_TEXT" | command sed -n 's/.* @ \([0-9a-f]\{40\}\).*/\1/p')"
+  # #3400 — the negative marker's trailer. Absent for every clean tier, so a
+  # recovered clean record is byte-identical to what it was before this change.
+  RB_FINDINGS=""; RB_NOTE=""
+  case "$RB_TEXT" in
+    *" findings="*) RB_FINDINGS="${RB_TEXT#* findings=}"; RB_FINDINGS="${RB_FINDINGS%% *}" ;;
+  esac
+  case "$RB_TEXT" in
+    *" note="*) RB_NOTE="${RB_TEXT#* note=}" ;;
+  esac
+  # ⛔ CANONICALISE THE COUNT AT **THIS** WRITE TOO (review, P3-5) — the mint's
+  # `--findings` canonicaliser exists because the value IS the record's validity:
+  # `"findings":$RB_FINDINGS` is written UNQUOTED, because every reader binds a
+  # JSON NUMBER (review-enforcer: `typeof record.findings === "number"`). This is
+  # the SECOND writer of that field, and it filtered with `*[!0-9]*` ALONE — so the
+  # rule the mint holds was never applied here. MEASURED against the previous arm:
+  # a signed marker carrying `findings=007` (admissible by RB_RE's `findings=[0-9]+`)
+  # recovered to `"findings":007`, which does not parse — `JSONDecodeError`, so the
+  # gate reads NO RECORD — and the file now EXISTS, so the next recovery refuses
+  # ("a record already exists — recovery fills an ABSENCE"). A dead end needing
+  # manual removal, created by the one verb whose job is to avoid a dead end, and
+  # therefore strictly worse than the absent record it replaced. `00` was worse
+  # still: it wrote `"findings":00` and exited 0, where the mint refuses a zero
+  # count outright ('not-clean' with zero findings IS 'clean').
+  #
+  # Same two steps as the mint, deliberately PURE STRING manipulation (`10#`
+  # arithmetic wraps on a pathologically long value): reject non-digits, then strip
+  # the leading-ZERO RUN — `007` → `7`, `08` → `8`, `12` → `12`, `00` → empty,
+  # which the not-clean arm immediately below refuses rather than writes.
+  case "$RB_FINDINGS" in
+    *[!0-9]*) RB_FINDINGS="" ;;
+    *)
+      RB_FINDINGS_ZEROS="${RB_FINDINGS%%[!0]*}"
+      RB_FINDINGS="${RB_FINDINGS#"$RB_FINDINGS_ZEROS"}" ;;
+  esac
+  if [ "$RB_VERDICT" = "not-clean" ] && [ -z "$RB_FINDINGS" ]; then
+    echo "record-review.sh --recover-body: $REPO#$PR's marker is a \`not-clean\` attestation but carries no readable \`findings=\` count, so a recovered record could not tell the gate WHAT is open. Nothing was written; mint it again at the current head: record-review.sh $PR <current head> not-clean $REPO --findings <n> --evidence <artifact>" >&2
+    exit 3
+  fi
+  # ⛔ THE HEAD IS READ FROM ITS STRUCTURAL POSITION, NEVER "the last ` @ <40hex>`"
+  # (review, P3-2). The previous read was a GREEDY sed — `s/.* @ \([0-9a-f]\{40\}\).*/\1/p`
+  # — which takes the LAST ` @ ` followed by 40 hex IN THE LINE. `RB_TEXT` carries
+  # the `note=` trailer, a note is free-form, and a note naming a sha (`also fails
+  # at @ <sha>`, a plausible thing for a lane to write) therefore WON the match:
+  # measured, the sed returned the note's sha instead of the minted head, so the
+  # recovered record bound to a head the negative was never minted at.
+  #
+  # Both expansions below are SHORTEST-prefix (`#`), so each takes the EARLIEST
+  # occurrence, and the head's ` @ ` is the first one after `verdict=` by the
+  # marker's own grammar (RB_RE has already proved that grammar above):
+  #   verdict=<v> @ <40hex> [diff=<64hex>] (<repo>) [findings=<n> [note=<rest>]]
+  # `verdict=` cannot appear before the verdict (the fixed prefix is
+  # `review recorded: reviews/<pr>.json `), the verdict token contains no ` @ `,
+  # and the note/diff/repo all come AFTER the head — so nothing a note contains can
+  # move the read, whether or not this version is the one that wrote the note.
+  RB_AFTER_VERDICT="${RB_TEXT#*verdict=}"
+  RB_AFTER_HEAD="${RB_AFTER_VERDICT#* @ }"
+  RB_HEAD="${RB_AFTER_HEAD:0:40}"
+  if ! [[ "$RB_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "record-review.sh --recover-body: the marker for $REPO#$PR matched the marker grammar but its head could not be read structurally (got '${RB_HEAD:0:40}') — a record bound to a half-read sha is worse than no record, because the gate would key on a head the review never happened at. Nothing was written." >&2
+    exit 3
+  fi
   # ⛔ A `clean-low` MARKER CANNOT BE RECOVERED HONESTLY (review, #2872 P0).
   # That tier certifies the MERGE BASE the diff was taken from, and a normal
   # clean-low record always carries `merge_base_sha`. The signed marker does NOT
@@ -3383,8 +3613,18 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   fi
   RB_DIFF_FIELD=""
   [ -n "$RB_DIFF" ] && RB_DIFF_FIELD="\"diff_sha256\":\"$RB_DIFF\","
-  printf '{"pr":%d,"head_sha":"%s",%s"mint":"recovered-body","recovered_at":"%s","marker_sig":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$RB_HEAD" "$RB_DIFF_FIELD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RB_SIG" "$RB_VERDICT" "$REPO" "$RB_AT" > "$RB_TMP"
+  # #3400 — a recovered NEGATIVE record keeps its finding count, so the gate's
+  # diagnosis survives the box change that recovery exists for. Absent for every
+  # clean tier (empty string), so their record shape is unchanged.
+  RB_FINDINGS_FIELD=""
+  if [ "$RB_VERDICT" = "not-clean" ]; then
+    # `$RB_FINDINGS` is CANONICAL by here (P3-5: the parse path strips leading
+    # zeros and refuses a zero), so this write cannot emit `007`/`00` verbatim.
+    RB_FINDINGS_FIELD="\"findings\":$RB_FINDINGS,"
+    if [ -n "$RB_NOTE" ]; then RB_FINDINGS_FIELD="${RB_FINDINGS_FIELD}\"findings_note\":\"$RB_NOTE\","; fi
+  fi
+  printf '{"pr":%d,"head_sha":"%s",%s%s"mint":"recovered-body","recovered_at":"%s","marker_sig":"%s","verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$RB_HEAD" "$RB_DIFF_FIELD" "$RB_FINDINGS_FIELD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RB_SIG" "$RB_VERDICT" "$REPO" "$RB_AT" > "$RB_TMP"
   # ⛔ THE LAST STEP IS ATOMIC, NOT CHECK-THEN-RENAME (round 3, P2). The re-check
   # above narrows the window to a couple of subprocesses; only a NO-CLOBBER CREATE
   # closes it. `ln` in the SAME directory is the portable compare-and-swap: it
@@ -4429,8 +4669,20 @@ if [ -n "$CARRY_ARM" ] && [ "${EVIDENCE#delta:}" != "$EVIDENCE" ]; then
   echo "   delta: a carry arm (${CARRY_ARM}) already re-bound the verdict to the live head, so a delta would be recorded by NOBODY — a carried record states the carry, not a reviewer's range, and the delta would be dropped while you were told it was recorded. Drop --evidence to accept the carry, or re-record a fresh verdict at this head." >&2
   exit 3
 fi
-if [ "$VERDICT" = "clean" ] && [ -z "$CARRY_ARM" ]; then
+# BOTH sides of the #3400 x #3247 fold are load-bearing, and again ORTHOGONAL:
+# the `delta:` arm above guards a REF SHAPE, while this condition guards which
+# VERDICTS need a review artifact. Taking either side alone drops a real arm —
+# main's form alone would let a `delta:` ref reach a carried record (the
+# silent-drop above), and our form alone would let a `not-clean` record be minted
+# with no evidence at all, which is the hole #3400 closed.
+if { [ "$VERDICT" = "clean" ] || [ "$VERDICT" = "not-clean" ]; } && [ -z "$CARRY_ARM" ]; then
   if [ -z "$EVIDENCE" ]; then
+    if [ "$VERDICT" = "not-clean" ]; then
+      echo "⛔ #3400: refusing to mint a 'not-clean' record for ${SHA:0:12}… with NO review evidence." >&2
+      echo "   A NEGATIVE verdict is still a claim that a review happened — the one it says was NOT clean — so it is held to the same evidence standard as 'clean'. Without the artifact, the record would assert that some review, somewhere, found something: no reader could check it, and a lane could mint it to park a PR it never reviewed." >&2
+      echo "   → Name the artifact the review produced: record-review.sh $PR $SHA not-clean ${REPO:-<owner/repo>} --findings <n> --evidence <comment:<id> | review:<id> | review-comment:<id> | <its URL>>" >&2
+      exit 3
+    fi
     echo "⛔ tortoise#7391: refusing to mint a 'clean' record for ${SHA:0:12}… with NO review evidence." >&2
     echo "   A 'clean' verdict is a full-review attestation, and this invocation is a FRESH one: it is not a carry (no prior signed marker was verified for this diff), so nothing here shows a review happened." >&2
     echo "   Naming the PR's CURRENT head is not evidence — that is precisely the invocation that recorded an unreviewed diff before this guard existed (tortoise#7391; tortoise#3549 merged on exactly such a record while every review comment on it said NOT CLEAN)." >&2
@@ -4438,8 +4690,8 @@ if [ "$VERDICT" = "clean" ] && [ -z "$CARRY_ARM" ]; then
     echo "   → If a verdict is ALREADY recorded at an earlier head and only the base moved, land via the rail (scripts/atomic-land.sh): it carries the verified record and needs no --evidence." >&2
     exit 3
   fi
-  if ! verify_review_evidence "$EVIDENCE" "$SHA" >/dev/null; then
-    echo "⛔ tortoise#7391: refusing to mint a 'clean' record for ${SHA:0:12}… — the named review evidence could not be verified (reason above)." >&2
+  if ! verify_review_evidence "$EVIDENCE" "$SHA" "$VERDICT" >/dev/null; then
+    echo "⛔ tortoise#7391: refusing to mint a '${VERDICT}' record for ${SHA:0:12}… — the named review evidence could not be verified (reason above)." >&2
     exit 3
   fi
   EVIDENCE_VERIFIED="$EVIDENCE"
@@ -4902,6 +5154,32 @@ if [ -n "$EVIDENCE_VERIFIED" ]; then
 elif [ -n "$CARRY_EVIDENCE" ]; then
   EVIDENCE_FIELD="\"evidence\":\"$CARRY_EVIDENCE\","
 fi
+# ── #3400 — THE FINDING COUNT, and why it is a FIELD and not prose ─────────
+# The gate has to be able to say WHAT is open. "verdict is not clean" is a state;
+# "1 open P2" is a diagnosis a lane can act on. `findings` is the machine-readable
+# half (an integer the gate can count and print) and `findings_note` the optional
+# human half (severity detail, verbatim) — never parsed, so it cannot grow into a
+# second grammar. Written ONLY for `not-clean`: a clean record that carried a
+# `findings` field would be a clean verdict admitting an open finding.
+FINDINGS_FIELD=""
+if [ "$VERDICT" = "not-clean" ]; then
+  # ⛔ THE WRITE RE-CHECKS THE SPELLING IT DEPENDS ON (review, P2-1). This field is
+  # UNQUOTED on purpose — quoting it would change its JSON TYPE, and every reader
+  # binds a number (`typeof record.findings === "number"`), so "quote it on write"
+  # is not available here: it would retire the count the negative verdict exists to
+  # carry. What IS available is to refuse to emit a value that would produce an
+  # unparseable record, because the gate reads an unparseable record as NO RECORD —
+  # the exact #3400 confusion. The input arm above canonicalises; this refuses if
+  # that ever stops holding, so no future edit can write `"findings":007`.
+  if ! [[ "$FINDINGS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "record-review.sh: refusing to write findings='$FINDINGS' — the field is emitted as an UNQUOTED JSON number, so a non-canonical spelling (leading zeros, sign, decimals) would make the whole record unparseable, and the merge gate reads an unparseable record as NO record. Nothing was recorded." >&2
+    exit 2
+  fi
+  FINDINGS_FIELD="\"findings\":$FINDINGS,"
+  if [ -n "$FINDINGS_NOTE" ]; then
+    FINDINGS_FIELD="${FINDINGS_FIELD}\"findings_note\":\"$FINDINGS_NOTE\","
+  fi
+fi
 # ── CARRY PROOF FIELDS (#10177) ───────────────────────────────────────────
 # Written for EVERY carry, so `mint:"carried"` is never a bare claim: it names
 # the arm that proved the artifact unchanged, the artifact as reviewed, and the
@@ -4952,11 +5230,19 @@ if [ -n "$CARRY_ARM" ]; then
   fi
 fi
 if [ -n "$REPO" ]; then
-  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$CARRY_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
+  # ⛔ SEVEN field slots, not six — the #3400 x #3247 fold owns one each and they are
+  # INDEPENDENT: `$DELTA_FIELDS` is written only when a delta RANGE was verified HERE
+  # (#3299/#3247) and `$FINDINGS_FIELD` only for a `not-clean` verdict (#3400), so a
+  # record can legitimately hold both (a `not-clean` verdict recorded with a
+  # `delta:` cover). MEASURED both wrong resolutions: dropping either field loses a
+  # signed claim the caller believes it wrote; keeping six `%s` while passing seven
+  # args makes bash RE-USE the format string, appending a second `{...}` object that
+  # makes the record unparseable — which the merge gate reads as NO RECORD.
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$CARRY_FIELDS" "$EVIDENCE_FIELD" "$FINDINGS_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
 else
-  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$CARRY_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$CARRY_FIELDS" "$EVIDENCE_FIELD" "$FINDINGS_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
 fi
 # ── IDEMPOTENT SAME-HEAD WRITE (#1709 rec 7) ─────────────────────────────
 # The record this run would write is already on disk with the SAME deterministic
@@ -5017,6 +5303,21 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} diff=${DIFF_HASH} (${REPO})"
   else
     MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} (${REPO})"
+  fi
+  # ── #3400 — THE NEGATIVE MARKER, and why its trailer is APPENDED ─────────
+  # The marker's leading shape is a contract with `ai-review-gate` (tortoise
+  # .github/workflows/ai-review-gate.yml regex-matches it) and with this script's
+  # own prior-marker greps. Splicing `findings=` into that prefix would change the
+  # shape every one of those parsers reads. So the trailer goes AFTER `(<repo>)`,
+  # where the only consequence is that those parsers do not certify the line as
+  # clean — which is the CORRECT outcome for a NOT CLEAN record: the merge gate
+  # must not accept it. `--recover-body` understands the trailer (see RB_RE) and
+  # is the reader that brings it back intact.
+  if [ "$VERDICT" = "not-clean" ]; then
+    MARKER="${MARKER} findings=${FINDINGS}"
+    if [ -n "$FINDINGS_NOTE" ]; then
+      MARKER="${MARKER} note=${FINDINGS_NOTE}"
+    fi
   fi
   if [ -n "$GATE_KEY" ]; then
     SIG="$(printf '%s' "$MARKER" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"

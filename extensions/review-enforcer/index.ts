@@ -4055,6 +4055,20 @@ export interface ReviewRecord {
    * "carried from <sha>". OPTIONAL and NEVER read by a decision. */
   mint?: string;
   carried_from?: string;
+  /** agent-infra#3400 — the OPEN FINDINGS a `not-clean` verdict left behind.
+   * A negative verdict used to be unrecordable at all (the recorder's verdict
+   * list admitted only the three `clean*` tiers), so "a review ran here and it
+   * was NOT clean" lived only in PR prose that no gate reads — how tortoise#3295
+   * came to carry `verdict=clean` in its body while the most recent review at
+   * that head was NOT CLEAN. Written ONLY for `not-clean`, so a `clean` record
+   * can never admit an open finding. Read by the merge gate ONLY to NAME the
+   * finding in its block message: the block itself is `not-clean` not being in
+   * ACCEPTED_VERDICTS, which is unchanged and is why recording one cannot
+   * license a merge. */
+  findings?: number;
+  /** agent-infra#3400 — free-form severity detail (e.g. "1 open P2") the
+   * recorder quoted verbatim. Never parsed: it is display text only. */
+  findings_note?: string;
 }
 
 /**
@@ -6003,6 +6017,28 @@ export function evaluateMergeGate(
     };
   }
   if (!isAcceptedVerdict(record.verdict)) {
+    // agent-infra#3400 — A NEGATIVE VERDICT SAYS MORE THAN "not accepted", AND THE
+    // GATE MUST SAY IT. Before this, `not-clean` was unrecordable, so the only
+    // reachable shape here was a corrupt/foreign verdict and "no record found" was
+    // the honest message. Now a recorded negative is a DIAGNOSIS: which head, and
+    // how many findings are open — the difference between a lane that knows what to
+    // fix and one that reads "no review record found" (the exact confusion the
+    // shared `record-review.sh` reader exists to end).
+    const negFindings = typeof record.findings === "number" ? record.findings : undefined;
+    const negNote = typeof record.findings_note === "string" ? record.findings_note.trim() : "";
+    if (record.verdict === "not-clean") {
+      const count = negFindings === undefined ? "an unrecorded number of" : String(negFindings);
+      return {
+        status: "block",
+        reason: [
+          "✅ Review enforcement (merge registry) gate is working correctly.",
+          `❌ Review record for PR #${pr} says reviewed NOT CLEAN at ${record.head_sha.slice(0, 12)}…: ${count} open finding(s)${negNote ? ` (${negNote})` : ""}.`,
+          "   This is NOT an absent record and NOT a bookkeeping problem: a review RAN on this head and did not pass.",
+          `   → Fix the finding, re-review, then record again: ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
+          `   → The negative record is superseded by the clean one at the same head (the newest record is what a reader acts on).`,
+        ].join("\n"),
+      };
+    }
     // #513: two-path remediation — the record's tier is not readable from the
     // record (only the verdict), so both paths are named statically.
     return {
