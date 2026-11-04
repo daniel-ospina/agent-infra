@@ -110,7 +110,7 @@ else
   # ⛔ THE `--missing` VERB TOO (review cycle 6, P2): `[ -f ]` is false for every file under an unreadable
   # dir, so this verb used to print both paths and rc 0 — telling an operator to SHIP files that may be
   # perfectly present. A documented operator surface must not hand out the wrong remedy.
-  MISS_UR="$(run --missing)"; [ -z "$MISS_UR" ]; ck $? "--missing prints NOTHING through an unreadable dir (no false 'ship it' advice)"
+  MISS_UR="$(run --missing 2>/dev/null)"; [ -z "$MISS_UR" ]; ck $? "--missing prints NOTHING through an unreadable dir (no false 'ship it' advice)"
   # ⛔ READABLE IS NOT SEARCHABLE (review cycle 7, P2, measured): `chmod -R 640` leaves the dir READABLE
   # (`[ -r ]` true) but with no SEARCH bit, so `[ -f "$root/<name>"`] fails for every entry and the check
   # reported both present files as MISSING — the same wrong remedy, one mode bit away from the case
@@ -120,7 +120,7 @@ else
     ok "(skipped: this user keeps search permission on a 640 dir — running as root?)"
   else
     run --check >/dev/null 2>&1; [ $? -eq 2 ]; ck $? "a readable-but-UNSEARCHABLE dir → rc 2, not 1 (present files must not be called missing)"
-    MISS_NS="$(run --missing)"; [ -z "$MISS_NS" ]; ck $? "--missing prints NOTHING through a search-less dir"
+    MISS_NS="$(run --missing 2>/dev/null)"; [ -z "$MISS_NS" ]; ck $? "--missing prints NOTHING through a search-less dir"
     run --line | grep -qF 'CANNOT VERIFY'; ck $? "--line says CANNOT VERIFY for a search-less dir"
   fi
   chmod 755 "$TMP/home/.pi/agent/state"
@@ -155,7 +155,7 @@ else
     ok "(skipped: this user keeps search permission on a 000 dir — running as root?)"
   else
     run --check >/dev/null 2>&1; [ $? -eq 2 ]; ck $? "an UNSEARCHABLE ANCESTOR → rc 2, not 1 (present files must not be called missing)"
-    MISS_AN="$(run --missing)"; [ -z "$MISS_AN" ]; ck $? "--missing prints NOTHING when an ancestor is unsearchable"
+    MISS_AN="$(run --missing 2>/dev/null)"; [ -z "$MISS_AN" ]; ck $? "--missing prints NOTHING when an ancestor is unsearchable"
     run --line | grep -qF 'CANNOT VERIFY'; ck $? "--line says CANNOT VERIFY, and never MISSING, when an ancestor is unsearchable"
   fi
   chmod 755 "$TMP/home/.pi/agent"
@@ -347,7 +347,7 @@ chmod 600 "$BRIEF1F" 2>/dev/null
 # file it had not read, the "gate that cannot redden" class §E's own header names. The predicate below
 # anchors only on HOW an assignment starts and on what a GUARDED one ends with, so nesting cannot hide a
 # line from it, and it is exercised by a control on each side (below) instead of being trusted.
-unguarded_subs() { grep -nE '^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*="\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
+unguarded_subs() { grep -nE '^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=("|)?\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
 UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | unguarded_subs | sed 's/^/emit+/')"; [ -z "$UNGUARDED" ]; ck $? "every command-substitution assignment in the emit carries a guard against a set -e caller (unguarded:${UNGUARDED:- none})"
 # ── E1g: THE CONTROL — the arm above can REDDEN, and does so on the shapes the vacuous version missed ──
 # Three arms, because a one-sided control only proves the predicate is not always-true: a bare assignment
@@ -362,6 +362,12 @@ printf '  v="$(printf '\''%%s (%s)'\'' "$(hostname)")"\n' | unguarded_subs | gre
 # digit-bearing names are now covered, and both are driven below so the hole cannot reopen quietly.
 printf '  MP_NOTICE="$(printf x)"\n' | unguarded_subs | grep -q .; ck $? "control: an UPPERCASE assignment name IS reported (a lowercase-only predicate is the same class of hole)"
 printf '  notice2="$(printf y)"\n' | unguarded_subs | grep -q .; ck $? "control: a DIGIT-bearing assignment name IS reported"
+# ⛔ AND THE QUOTING IS NOT PART OF IT EITHER (review cycle 3, P2, MEASURED): requiring `="$(` meant an
+# UNQUOTED `v=$(cmd)` was invisible — and that shape DOES abort an `errexit` caller (`v=$(false)` under
+# `set -e` exits 1), which is the failure this arm exists to prevent. (`local x="$(cmd)"` stays out of
+# scope on purpose: `local` masks the substitution's status and cannot abort — verified.)
+printf '  mp_y=$(printf y)\n' | unguarded_subs | grep -q .; ck $? "control: an UNQUOTED substitution assignment IS reported (quoted-only was the same class of hole)"
+printf '  local mp_z="$(printf z)"\n' | unguarded_subs > /dev/null; [ $? -ne 0 ]; ck $? "…and a local-assignment is NOT reported (local masks the status, so it cannot abort a set -e caller)"
 # ── E1j: A DECLARATION THAT RENDERS NOTHING IS CANNOT-VERIFY, NEVER "ALL PRESENT" (cycle 2, P1) ──
 # Every collector iterates the declaration, so an empty `mandate_files` empties the whole POPULATION: the
 # three lists come back empty, the directory is fine, and "nothing is declared" was graded as "everything
@@ -384,7 +390,11 @@ fi
 # string, so one failed render meant "the brief already ends with this" about a brief that ends with
 # anything at all. Driven directly on the primitive, in both directions, because that is where the bug was.
 if bash -c '. "$1"; mandate_ends_with "ANY TEXT AT ALL" ""' _ "$HELPER"; then
-  bad "an EMPTY needle counts as a match — `case *\"\"` matches every string, so an unrendered claim reads as 'already stated'"
+  # ⛔ NO BACKTICKS IN THIS MESSAGE (this change's review cycle 3, P2): the first version quoted the
+  # measured `case *""` shape in backticks INSIDE a double-quoted string, so bash EXECUTED it — the
+  # diagnostic printed a truncated sentence and added `syntax error: unexpected end of file` to the CI log,
+  # in an arm whose whole purpose is to teach the next reader about that trap.
+  bad "an EMPTY needle counts as a match — a case pattern of *<empty> matches every string, so an unrendered claim reads as 'already stated'"
 else
   ok "an EMPTY needle is NOT a match (an unrendered claim is never already stated)"
 fi
@@ -418,6 +428,20 @@ else
 fi
 # The last-resort literal must carry the ONE sentinel, or the block stops being idempotent on that path.
 grep -qF "line='$(bash -c '. "$1"; mandate_sentinel' _ "$HELPER")" "$HELPER"; ck $? "the last-resort literal's first line IS mandate_sentinel's value (the ONE marker cannot drift into two)"
+# ── E1k: NO BASE TO NAME IS CANNOT-VERIFY, AND `--missing` IS NEVER AN EMPTY LIST (cycle 3, P1/P2) ──
+# `"${CELL_HOME:-${HOME:-}}"` with BOTH unset is the EMPTY STRING, so the root became `/.pi/agent/state` — a
+# path no box reads — and `--check` answered MISSING for two files under `/`, `--line` rendered a full
+# MANDATE-UNSATISFIABLE block, and the emit appended it to the dispatched lane's brief as its LAST
+# instruction. Measured below with `env -u HOME -u CELL_HOME`, which is the reachable state
+# (`spawn-gate.sh` handles "neither is set" a few blocks above the same emit).
+NOBASE_RC="$(env -u HOME -u CELL_HOME bash "$HELPER" --check >/dev/null 2>&1; printf %s $?)"
+[ "$NOBASE_RC" = "2" ]; ck $? "no base to name (CELL_HOME and HOME both unset) → --check is CANNOT VERIFY (2), not 0 or 1 (measured rc=$NOBASE_RC)"
+NOBASE_LINE="$(env -u HOME -u CELL_HOME bash "$HELPER" --line 2>/dev/null)"
+case "$NOBASE_LINE" in *'MISSING'*) bad "…and --line calls the files MISSING under a path that exists nowhere (the wrong remedy, delivered as the brief's last word)" ;; *) ok "…and --line never calls them MISSING when there is no base to look under" ;; esac
+case "$NOBASE_LINE" in *'CANNOT VERIFY'*) ok "…and it says CANNOT VERIFY instead (the only truthful verdict)" ;; *) bad "…but --line did not say CANNOT VERIFY either" ;; esac
+# --missing: an UNKNOWN state must not look like the empty list that means "nothing missing".
+MISS_UNDEC_RC="$(T=$(mktemp -d); mkdir -p "$T/.pi/agent/state"; chmod 000 "$T/.pi/agent/state"; CELL_HOME="$T" bash "$HELPER" --missing >/dev/null 2>&1; _r=$?; chmod 755 "$T/.pi/agent/state"; rm -rf "$T"; printf %s "$_r")"
+[ "$MISS_UNDEC_RC" = "2" ]; ck $? "--missing on an UNRESOLVABLE state dir is 2, not 0-with-empty-output (a consumer reading 0 as 'all present' was reading unknown as clean; measured rc=$MISS_UNDEC_RC)"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
