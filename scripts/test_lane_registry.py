@@ -41,8 +41,16 @@ must then FAIL. If a mutant survives, the test is decoration and this suite says
     T21  a HALF-SPENT lease renews the ref without `--push` (this was dead code; a live lane read EXPIRED)
     T22  an unrecognised filter is REFUSED, never answered with a confident zero
     T23  an unsafe `--lane-id` is refused BEFORE any I/O, and no handle is printed
+    T24  repeating an id is REFUSED — including when a corrupt SIBLING record is present, and when only
+         the local copy exists (this guard was vacuous and the suite could not see it)
+    T25  a lane opened during an outage can still be CLOSED once the registry returns (else its terminal
+         record is lost to the fleet for every lane launched in a partition)
+    T26  `show --json` is JSON on every branch — found, NOT-FOUND (its most common answer), and partial
+    T27  the CLI normalises `--state` exactly as the shared reader does
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -53,7 +61,12 @@ import tempfile
 import pytest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_MODULE = os.path.join(_HERE, "orchestrator-harness", "lane_registry.py")
+# ⛔ OVERRIDABLE, SO THE GUARDS CAN BE MUTATION-TESTED FROM THE OUTSIDE. A mutation run that cannot point
+# the suite at a modified copy is a mutation run against the ORIGINAL module, which reports "green" and
+# proves the opposite of what it claims — measured while writing T24..T27 (38 "passed" against an
+# unmodified file, with five mutants reported as surviving).
+_MODULE = os.environ.get("LANE_REGISTRY_UNDER_TEST") or os.path.join(_HERE, "orchestrator-harness",
+                                                                     "lane_registry.py")
 
 
 def _load(name="lane_registry_under_test", path=None):
@@ -822,3 +835,118 @@ def test_T23_an_unsafe_lane_id_is_REFUSED_before_anything_is_written(box, tmp_pa
         assert "RUNNING" not in out, "a refused id must not be reported as a started lane"
     assert _ref_shas(origin) == started, "nothing may be written for a refused id"
     assert not (tmp_path / "escape.json").exists()
+
+
+# ── T24 / T25 / T26 / T27 — the arms a mutation run proved were MISSING ───────────────────────
+
+def test_T24_repeating_an_id_is_REFUSED_even_when_a_sibling_record_is_corrupt(box, tmp_path):
+    """⛔ THE LOCAL-WITNESS GUARD WAS VACUOUS AND NOTHING SAW IT.
+
+    Deleting the guard left the suite 50/50 green. Worse, the guard as first written asked
+    `_read_local()` — which fails the WHOLE directory as soon as ONE record is corrupt — so with a single
+    poisoned sibling present a repeat `start --lane-id X` returned 0 and REPLACED X's record, while the same
+    call without the poison returned 5. The probe is now this lane's own file, so neither the sibling nor
+    the ref path can make it vacuous.
+    """
+    mod, origin, _ = box
+    lane = start(mod, origin, tag="victim")
+    # (a) plain repeat, registry readable
+    rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "0", "--lane-id", lane]
+                       + _remote(origin))
+    assert rc == mod.REFUSED, (rc, out, err)
+    assert "already exists" in err, err
+    # (b) a corrupt SIBLING must not disable the guard
+    (tmp_path / "state" / "lanes" / "poison.json").write_text("{not json")
+    rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "0", "--lane-id", lane]
+                       + _remote(origin))
+    assert rc == mod.REFUSED, ("a corrupt sibling defeated the guard", rc, out, err)
+    local = json.loads((tmp_path / "state" / "lanes" / ("%s.json" % lane)).read_text())
+    assert local["tag"] == "victim", "the existing record must not have been replaced"
+    (tmp_path / "state" / "lanes" / "poison.json").unlink()
+    # (b2) a PEER's record: the ref exists, this box has no local copy. Only the ref probe can refuse it,
+    # so this is the arm that makes deleting `if exists:` visible (it survived every other case).
+    ok, _d, records, _src = mod.read_registry(origin, 20.0)
+    assert ok and lane in records
+    peer = dict(records[lane])
+    for key in ("_ref", "_sha"):
+        peer.pop(key, None)
+    peer["lane_id"] = "peer-host.klane-1-1-p1-abcdef12"
+    peer["host"] = "peer-host"
+    _plant_ref(mod, origin, "%s/%s" % (mod.NS, peer["lane_id"]), peer)
+    rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "0",
+                             "--lane-id", peer["lane_id"]] + _remote(origin))
+    assert rc == mod.REFUSED, ("a ref with no local copy must still refuse", rc, out, err)
+    assert "already exists" in err, err
+    # (c) a repeat whose LOCAL record exists but whose ref does not (the LOCAL_ONLY case) — the ref is
+    # deleted and the local copy KEPT (`_purge` would remove both, which is a different state).
+    subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/lanes/%s" % lane],
+                   check=True, capture_output=True)
+    rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "0", "--lane-id", lane]
+                       + _remote(origin))
+    assert rc == mod.REFUSED, (rc, out, err)
+
+
+def test_T25_a_lane_opened_during_an_outage_can_still_be_CLOSED_afterwards(box, tmp_path):
+    """⛔ A LOCAL-ONLY RECORD WAS UNCLOSABLE, AND THE WARN TOLD THE OPERATOR TO RUN A NO-OP.
+
+    `measure_existing` consulted the local copy only when the SHARED READ FAILED. Once the registry came
+    back without this lane's ref (it was never pushed), `done` answered NOT-FOUND (measured, rc=4): the
+    terminal record was lost to the fleet for every lane launched during a partition, and the advice
+    `run_agent` printed (\"publish by hand: done --lane-id …\") could never work.
+    """
+    mod, origin, _ = box
+    shutil.rmtree(origin)                                # outage: start opens a LOCAL-ONLY record
+    rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "1"] + _remote(origin))
+    assert rc == mod.LOCAL_ONLY, (rc, out, err)
+    lane = out.strip().splitlines()[-1]
+    # the registry comes back (a fresh, empty bare repo) — this lane is NOT in it
+    subprocess.run(["git", "init", "-q", "--bare", origin], check=True)
+    rc, out, err = run(mod, ["done", "--lane-id", lane, "--pr", "42"] + _remote(origin))
+    assert rc == 0, ("a local-only lane must still be closable", rc, out, err)
+    refs = records_on_refs(origin)
+    assert "refs/lanes/%s" % lane in refs, "closing it must PUBLISH the ref, or the fleet never learns"
+    rec = json.loads(run(mod, ["show", "--lane-id", lane] + _remote(origin) + ["--json"])[1])
+    assert rec["state"] == "DONE" and rec["artifacts"] == [{"kind": "pr", "value": "42"}], rec
+
+
+def test_T26_show_json_is_JSON_on_every_branch(box, tmp_path):
+    """`show --json` emitted bare text on NOT-FOUND — its MOST COMMON answer — so `| jq` was a parse error.
+
+    Deleting either JSON abstention branch, or the found branch's coverage marker, left the suite green.
+    """
+    mod, origin, _ = box
+    lane = start(mod, origin, tag="7")
+    rc, out, _e = run(mod, ["show", "--lane-id", lane] + _remote(origin) + ["--json"])
+    assert rc == 0
+    found = json.loads(out)
+    assert found["readable"] is True and found["coverage"] == "shared", found
+    assert found["lane_id"] == lane
+    rc, out, _e = run(mod, ["show", "--lane-id", "nope.never"] + _remote(origin) + ["--json"])
+    assert rc == mod.NOT_FOUND
+    missing = json.loads(out)                       # must PARSE
+    assert missing["not_found"] == "nope.never" and missing["readable"] is True, missing
+    # …and a partial (local-only) read is UNMEASURED, in JSON, with the not-found claim withheld
+    shutil.rmtree(origin)
+    rc, out, _e = run(mod, ["show", "--lane-id", "nope.never"] + _remote(origin) + ["--json"])
+    assert rc == mod.UNMEASURED
+    partial = json.loads(out)
+    assert partial["readable"] is False and "unmeasured" in partial, partial
+    assert "not_found" not in partial, partial
+    # the found record read from the local witness says so
+    rc, out, _e = run(mod, ["show", "--lane-id", lane] + _remote(origin) + ["--json"])
+    assert rc == 0 and json.loads(out)["coverage"] == "local-only", out
+
+
+def test_T27_the_CLI_normalises_state_exactly_as_the_shared_reader_does(box):
+    """`--state " RUNNING "` was rejected by argparse (exit 2, no stdout) while the MCP accepted and
+    answered it — two surfaces disagreeing on the argument `collect` exists to unify."""
+    mod, origin, _ = box
+    lane = start(mod, origin)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert mod.main(["list", "--state", " running ", "--json", "--remote", origin]) == 0
+    payload = json.loads(out.getvalue())
+    assert payload["filters"] == {"state": "RUNNING"}, payload["filters"]
+    assert [r["lane_id"] for r in payload["lanes"]] == [lane]
+    args = mod.build_parser().parse_args(["list", "--state", " RUNNING "])
+    assert args.state == "RUNNING"

@@ -225,11 +225,12 @@ every worker goes through (`lane.sh`, `fix-one.sh`, `nonblocking-dispatch.sh`; `
 that launch-path set as an equality). A per-caller hook would be the drift #1720 removed: a launcher added
 tomorrow would silently not satisfy the contract.
 
-* `lane_registry_begin` immediately **before** the spawn, so a refusal **at the spawn point** (a refused
-  `pi` run, a failed fork) gets its own `FAILED agent-never-started` record rather than a `RUNNING` record
-  that lapses into `EXPIRED` two hours later. **The gates ABOVE it do not** — brief, disk, load,
-  land-backlog and capability refuse *before* a record exists, so such a refusal reads `NOT-FOUND`, which
-  is the honest answer: it never started.
+* `lane_registry_begin` immediately **before** the spawn, so a refusal **at the spawn point** — the `pi`
+  run refused by the loader, or the `pi` **shim's own** fork refusal (`PI_FORK_REFUSED`) — gets its own
+  `FAILED agent-never-started` record rather than a `RUNNING` record that lapses into `EXPIRED` two hours
+  later. **The gates ABOVE it do not**, and the list is specific: brief, disk, load, land-backlog,
+  capability **and the pre-spawn fork gate** (`AGENT_FORK_REFUSED`) all refuse before a record exists, so
+  such a refusal reads `NOT-FOUND` — the honest answer, because the lane never started.
 * `lane_registry_begin` costs **one** bounded `ls-remote` of the exact ref (`ref_exists`), not a full
   registry read: a `start` that fetched every lane's payload before spawning the agent would put the
   registry's read cost on the launch path — 40 s+ on a blackholed remote, and growing with the fleet. It
@@ -347,6 +348,17 @@ Or from a session, without a shell: `lane.list` / `lane.show`.
    caught by that gate. The mitigation shipped here is the `registry_sha256` fingerprint on every payload;
    adding python to the drift gate is #3016's work, not this slice's.
 3. **Clock skew** — see §3.4.
+3b. **A corrupt record has no shipped remedy.** A record that fails `_record_problem` (a bad `lease_until`,
+   a `DONE` with no artifacts, a ref/payload id mismatch) fails the **whole** read by design — skipping it
+   would report the lane as never having existed — and it also disables this box's local fallback for every
+   lane. There is no `prune`/`repair` verb in this slice. The remedies, in order:
+
+   ```bash
+   # a corrupt SHARED ref (this is what makes the fleet read UNMEASURED)
+   git -C <registry-repo> push origin :refs/lanes/<lane-id>
+   # a corrupt record in THIS BOX's witness
+   rm "${LANE_REGISTRY_LOCAL:-$HOME/.pi/agent/state/lanes}/<lane-id>.json"
+   ```
 4. **A beat publishes only when the lease needs renewing** (see §2.3): `beat` re-derives the lease locally
    on every call and pushes at the half-way point, or when `--push` is given. A lane beating every 60 s on
    a 2 h lease therefore performs one small ref push per hour, not per minute. This entry used to say the

@@ -708,7 +708,23 @@ def measure_existing(lane_id: str, remote: Optional[str],
     ok, _detail, records, _source = read_registry(remote, timeout)
     if not ok:
         return False, None
-    return True, records.get(lane_id)
+    rec = records.get(lane_id)
+    if rec is None:
+        # ⛔ THE SHARED STORE ANSWERING WITHOUT THIS LANE IS NOT PROOF THE LANE DOES NOT EXIST — a record
+        # opened during an outage (exit 6, LOCAL_ONLY) lives only here, and the shared read now succeeds
+        # without it. Ignoring the local copy made every such lane UNCLOSABLE: `done`/`fail` answered
+        # NOT-FOUND (measured, rc=4), the terminal record was lost to the fleet, and the WARN in
+        # `run_agent` told the operator to run a command that could never work. The local copy is
+        # consulted for THIS id only, and only on the write path — `start` does not use this function, so
+        # the "do not resurrect a finished lane" guard is untouched.
+        try:
+            with open(os.path.join(local_dir(), "%s.json" % lane_id), "r") as fh:
+                local = json.load(fh)
+        except (OSError, ValueError):
+            return True, None
+        if isinstance(local, dict) and local.get("lane_id") == lane_id and not _record_problem(local):
+            return True, local
+    return True, rec
 
 
 def ref_exists(lane_id: str, remote: Optional[str],
@@ -799,11 +815,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     # read as "absent" and a second `start` for the same id silently REPLACED it, exit 0, while the code
     # below and docs §3.3 both claim an existing id is refused. The local copy is the one axis this box
     # can always answer.
-    lok, ldetail, lrecords = _read_local()
-    if lok and lane_id in lrecords:
+    # ⛔ THE PROBE IS THIS LANE'S OWN FILE, NOT THE DIRECTORY MAP. `_read_local` fails the WHOLE directory
+    # as soon as ONE record is corrupt, so a guard written as `if lok and lane_id in lrecords` is vacuous
+    # in exactly the state the reader treats as first-class: with a single poisoned sibling present,
+    # `start --lane-id X` over an existing local X returned 0 and replaced it (measured), while the same
+    # call without the poison returned 5. Presence of the file is the fact that matters, and an
+    # existing-but-corrupt record must block a start too — one `exists()`, O(1), immune to siblings.
+    own_local = os.path.join(local_dir(), "%s.json" % lane_id)
+    if os.path.exists(own_local):
         return _die(REFUSED, "start REFUSED: %s already exists in this box's own witness (%s) — pick "
-                             "another id, or use `beat` if this IS that lane"
-                    % (lane_id, local_dir()))
+                             "another id, or use `beat` if this IS that lane" % (lane_id, own_local))
     # ⛔ ONE ROUND TRIP, NOT A FULL REGISTRY READ: see `ref_exists`. The id is a freshly generated handle,
     # so the only question worth asking the authority is whether this exact ref is already taken.
     readable, exists, rdetail = ref_exists(lane_id, args.remote, args.timeout)
@@ -1126,6 +1147,7 @@ def cmd_show(args: argparse.Namespace) -> int:
                 out["coverage"] = coverage(str(extra.get("source") or "none"))
                 out["source"] = detail
                 out["measured_at"] = _now()
+                out["readable"] = True            # `list --json` always carries it; `show` must too
                 sys.stdout.write(json.dumps(out, indent=2, sort_keys=True) + "\n")
             else:
                 for k in ("lane_id", "state", "state_reason", "host", "pid", "kind", "tag", "repo",
@@ -1150,7 +1172,7 @@ def cmd_show(args: argparse.Namespace) -> int:
             sys.stdout.write(msg + "\n")
         return UNMEASURED
     if args.json:
-        sys.stdout.write(json.dumps({"not_found": args.lane_id,
+        sys.stdout.write(json.dumps({"not_found": args.lane_id, "readable": True,
                                      "note": "NOT-FOUND is a lookup outcome, not one of the four states",
                                      "source": detail, "measured_at": _now(),
                                      "coverage": coverage(str(extra.get("source") or "none"))},
