@@ -547,7 +547,8 @@ RUNNER_ROOT=/opt bash scripts/ci_runner_pool.sh status --all
 #    (a) systemd-managed:  sudo systemctl stop actions.runner.daniel-ospina-tortoise.<agentName>.service
 #        ⚠️ `<agentName>` is the .runner `agentName` (the GITHUB_NAME column), NOT the NAME column:
 #        on a hand-provisioned install they differ (`/opt/gh-runner-x64-1` carries
-#        agentName=pi-runner-cell4-x64-1), and a wrong name gives `Unit not found`. Read the real
+#        agentName=pi-runner-cell4-x64-1), and a wrong name is refused as `Failed to stop …: Unit …
+#        not loaded` (older systemd: `Unit … not found`). Read the real
 #        ones with:  systemctl list-unit-files 'actions.runner.*' --no-pager
 #        (That unit is written by `svc.sh install` from `bin/actions.runner.service.template`.)
 #    (b) started by ci_runner_pool.sh: it backgrounds `run.sh` and renders NO unit, and the script
@@ -559,7 +560,9 @@ RUNNER_ROOT=/opt bash scripts/ci_runner_pool.sh status --all
 # 3b. REMOVE the unit step 2(a) stopped — BEFORE the directory goes, because svc.sh lives IN it.
 #     Skipping this leaves an ENABLED unit whose WorkingDirectory no longer exists: systemd fails it
 #     at every boot (status=200/CHDIR) and runner_autoscale.py's own unit audit reports it on every
-#     pass — a finding that only clears if the same name is re-registered, i.e. never.
+#     pass until someone deletes that unit file or fixes the path with a drop-in (the audit reads
+#     unit files and their drop-ins, last `WorkingDirectory=` winning — so the finding clears when
+#     the file goes, not only when the same name is re-registered).
 sudo /opt/<name>/svc.sh uninstall     # ⚠️ run it FROM the install dir — see below
 #     `svc.sh` resolves RUNNER_ROOT=$(pwd) and ./bin/actions.runner.service.template against the
 #     CALLER's cwd, and its pre-flight ("Must run from runner root or install is corrupt") fires
