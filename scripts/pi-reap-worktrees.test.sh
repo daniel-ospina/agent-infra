@@ -211,8 +211,15 @@ done
 # hook, so any undefined helper — whatever it is called — is caught, counted, and reported.
 # ⛔ bash runs this handler in a SUBSHELL, so a counter variable would be lost (measured: the hook
 # fired and the summary still read 0). The record is therefore a FILE, and the summary reads it.
-_MISSING_LOG="$(mktemp "${TMPDIR:-/tmp}/pi-reap-missing.XXXXXX")" || _MISSING_LOG=/dev/null
-trap 'rm -f "$_MISSING_LOG"' EXIT
+# ⛔ `|| /dev/null` WOULD FAIL OPEN (review of #3422, P3): if the record cannot be created, every
+# undefined command is recorded nowhere and the summary reads 0 — the false-PASS shape returns silently
+# on exactly the box where the harness is degraded. An unusable record therefore fails the run instead.
+_MISSING_LOG="$(mktemp "${TMPDIR:-/tmp}/pi-reap-missing.XXXXXX")" || {
+    echo "  ❌ harness bug: cannot create the undefined-command record — the detector cannot run"; exit 1; }
+# ⛔ TRAP CHAINING: `trap` REPLACES rather than chains, so registering the record cleanup here and the
+# fixture cleanup below would leave only the LAST one installed — which leaked one file per run into
+# $TMPDIR (measured: 13 orphans at a ~5-18 min cadence) on the very suite whose subject is reclaiming
+# disk. There is exactly ONE EXIT trap, below, and it removes both.
 command_not_found_handle() {
     printf '%s\n' "$1" >>"$_MISSING_LOG" 2>/dev/null
     printf '  ❌ harness bug: undefined command: %s\n' "$1" >&2
@@ -222,7 +229,7 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-worktree-test.XXXXXX")"
 # Resolve T once: git records RESOLVED worktree paths (/tmp/x is stored as
 # /private/tmp/x), so every expectation must compare resolved-to-resolved.
 T="$(cd "$T" && pwd -P)"
-trap 'rm -rf "$T"' EXIT
+trap 'rm -f "$_MISSING_LOG"; rm -rf "$T"' EXIT
 
 REAL_GIT="$(command -v git)"
 [ -n "$REAL_GIT" ] || { echo "git is required" >&2; exit 1; }
@@ -2488,6 +2495,18 @@ OUT="$(REAPER_OVERRIDE="$MUT5" GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_L
     FAKE_LATE_COUNTER="$T/$ENV/cnt-e2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
 assert_nodir "$WT_LATEE2" "A21e MUTANT GOES RED: without the post-archive re-check the checkout IS removed"
 assert_nofile "$WT_LATEE2/.env" "A21e …taking the late ignored file with it (the exposure this closes)"
+# …AND THE ORDERING THE INSERTION DEPENDS ON (review of #3422, P3): the doc row claims
+# `holder_recheck` stays the LAST probe before the fork. Nothing else asserts it, and it is the reason
+# the block is safe to insert here at all, so it is pinned on the source itself.
+_pa_line="$(grep -n 'post-archive re-check not clean' "$REAPER" | head -1 | cut -d: -f1)"
+_hr_line="$(grep -n 'holder_recheck "\$path" "\$sha" ||' "$REAPER" | tail -1 | cut -d: -f1)"
+_fork_line="$(grep -n 'worktree remove "\$path"' "$REAPER" | head -1 | cut -d: -f1)"
+if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
+        && [ "$_pa_line" -lt "$_hr_line" ] && [ "$_hr_line" -lt "$_fork_line" ]; then
+    ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays last before the fork"
+else
+    bad "A21e gate ORDER regressed: post-archive=$_pa_line holder_recheck=$_hr_line fork=$_fork_line"
+fi
 
 # ── A22: a LOCAL TAG is not a survival mechanism either (re-review) ────
 # The first F3 fix blacklisted only refs/remotes/*. A blacklist cannot be

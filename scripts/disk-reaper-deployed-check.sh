@@ -167,32 +167,31 @@ fi
 drift=0
 checked=0
 appeared=""
-while IFS= read -r line; do
-    case "$line" in ''|'#'*) continue ;; esac
-    # A file line is `<digest><two spaces><name>`; every other line is a header (`key=value`).
-    # Splitting with default IFS on the raw line is what made a blanked digest field invisible
-    # (round 5, P2), so the separator is found EXPLICITLY and a header can never look malformed.
-    case "$line" in
-        *'  '*) digest="${line%%  *}"; name="${line#*  }" ;;
-        *) continue ;;
+# ⛔ ONE PARSE RULE FOR THE LOOP AND THE RECONCILIATION (review of #3422, P1). An explicit
+# "two spaces" separator here while the reconciliation split on ANY whitespace made the two disagree:
+# a record line whose separator was a TAB (or a single space) was DROPPED by this loop and still
+# MATCHED by the reconciliation — counted as recorded, never measured, exit 0 — which was also a
+# regression against the pre-#3405 `read -r digest name` that measured those lines. The field split is
+# therefore plain whitespace (the shell's own, as awk does) and the FIELDS are validated instead: a
+# malformed token is DRIFT, never a skip.
+while read -r digest name _rest; do
+    case "$digest" in ''|'#'*|*=*) continue ;; esac
+    if [ -z "${name:-}" ]; then
+        warn "DRIFT     (malformed record line, no name field): $digest"
+        drift=1; continue
+    fi
+    case "$digest" in
+        missing|unmeasured) : ;;
+        *[!0-9a-f]*) warn "DRIFT     (malformed record line, digest is not hex): $digest $name"
+                     drift=1; continue ;;
+        *) [ ${#digest} -eq 64 ] || {
+               warn "DRIFT     (malformed record line, digest is not a sha256): $digest $name"
+               drift=1; continue; } ;;
     esac
-    # ⛔ A LINE WITH NO NAME IS A MALFORMED FILE LINE, NOT A BLANK (review of #3405 round 5, P2).
-    # `  pi-reap-worktrees.sh` (two spaces, no digest) previously split into digest=<name>/name="",
-    # `continue` dropped it, and the reconciliation's `grep "  $f$"` MATCHED it — so a record line with
-    # its digest field blanked certified `deployed ok (8 files)` for a 9-file pinned set, and went on
-    # doing so after that deployed file was DELETED.
-    if [ -z "$name" ]; then
-        warn "DRIFT     (malformed record line, no digest field): $line"
-        drift=1; continue
-    fi
-    if [ -z "$digest" ]; then
-        warn "DRIFT     (malformed record line, EMPTY digest field): $name"
-        drift=1; continue
-    fi
     checked=$((checked + 1))
-    # ⛔ AN UNMEASURED RECORD LINE IS DRIFT (review of #3405 round 3, P2). A digest that could not be
-    # taken at stamp time must never read as verified.
     if [ "$digest" = unmeasured ]; then
+        # ⛔ AN UNMEASURED RECORD LINE IS DRIFT (review of #3405 round 3, P2). A digest that could not
+        # be taken at stamp time must never read as verified.
         warn "DRIFT     $name — recorded as UNMEASURED (no digest could be taken); it has never been verified"
         drift=1; continue
     fi

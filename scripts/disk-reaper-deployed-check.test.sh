@@ -59,8 +59,12 @@ done
 # hook, so any undefined helper — whatever it is called — is caught, counted, and reported.
 # ⛔ bash runs this handler in a SUBSHELL, so a counter variable would be lost (measured: the hook
 # fired and the summary still read 0). The record is therefore a FILE, and the summary reads it.
-_MISSING_LOG="$(mktemp "${TMPDIR:-/tmp}/pi-reap-missing.XXXXXX")" || _MISSING_LOG=/dev/null
-trap 'rm -f "$_MISSING_LOG"' EXIT
+# ⛔ `|| /dev/null` WOULD FAIL OPEN (review of #3422, P3): if the record cannot be created, every
+# undefined command is recorded nowhere and the summary reads 0 — the false-PASS shape returns silently
+# on exactly the box where the harness is degraded — and the EXIT trap would then try to `rm /dev/null`.
+# An unusable record therefore fails the run instead.
+_MISSING_LOG="$(mktemp "${TMPDIR:-/tmp}/pi-reap-missing.XXXXXX")" || {
+    echo "  ❌ harness bug: cannot create the undefined-command record — the detector cannot run"; exit 1; }
 command_not_found_handle() {
     printf '%s\n' "$1" >>"$_MISSING_LOG" 2>/dev/null
     printf '  ❌ harness bug: undefined command: %s\n' "$1" >&2
@@ -72,9 +76,19 @@ command_not_found_handle() {
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
 reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh lib/live-paths.sh"
 
+# ⛔ ONE EXIT TRAP CLEANS EVERYTHING THIS SUITE CREATES (review of #3422, P3). It leaked two ways: the
+# undefined-command record (a trap was removed here without a replacement) and every per-fixture temp
+# dir — measured 1052 `/tmp/drdc-test.*` dirs accumulated across runs. Both are the disk-hygiene shape
+# this PR is about, in its own tests. `_ENV_DIRS` is a plain string (bash arrays + `set -u` are a trap
+# of their own here), newest first.
+_ENV_DIRS=""
+trap 'rm -f "$_MISSING_LOG"; for _d in $_ENV_DIRS; do rm -rf "$_d"; done' EXIT
+
 # mk_env — a deployed dir + a matching checkout, both carrying the same bytes.
 mk_env() {
+    [ -n "$_ENV_DIRS" ] && _ENV_DIRS="$_ENV_DIRS "
     T="$(mktemp -d "${TMPDIR:-/tmp}/drdc-test.XXXXXX")"
+    _ENV_DIRS="$_ENV_DIRS$T"
     mkdir -p "$T/deployed/lib" "$T/src/scripts/lib"
     local f
     for f in $FILES; do
@@ -238,10 +252,30 @@ run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
 sed -i 's|^[0-9a-f]\{64\}  pi-reap-worktrees.sh$|  pi-reap-worktrees.sh|' "$REC"
 OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
 eq "$RC" "1" "D13 a record line with a BLANK digest field is drift (exit 1)"
-has "$OUT" "EMPTY digest field" "D13 …named as a malformed line, not silently skipped"
+has "$OUT" "malformed record line" "D13 …named as a malformed line, not silently skipped"
 rm -f "$T/deployed/pi-reap-worktrees.sh"
 OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
 eq "$RC" "1" "D13 …and the file is STILL not certified ok once it is deleted (the old hole)"
+# ⛔ THE SEPARATOR MUST NOT DECIDE WHETHER A FILE IS MEASURED (review of #3422, P1). An explicit
+# "two spaces" parse paired with an awk reconciliation that split on ANY whitespace meant a TAB or
+# single-space record line was dropped by the loop and still matched by the reconciliation: counted as
+# recorded, never measured, exit 0 — for a 9-file set with a delegate DELETED.
+for sep in '\t' ' '; do
+    mk_env
+    run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+    python3 - "$REC" "$sep" <<'PYSEP'
+import sys, re
+rec, sep = sys.argv[1], sys.argv[2].encode().decode('unicode_escape')
+s = open(rec).read()
+s = re.sub(r'^(?=[0-9a-f]{64}  pi-reap-worktrees\.sh$)', '', s, flags=re.M)
+s = s.replace('  pi-reap-worktrees.sh', sep + 'pi-reap-worktrees.sh')
+open(rec, 'w').write(s)
+PYSEP
+    rm -f "$T/deployed/pi-reap-worktrees.sh"
+    OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
+    eq "$RC" "1" "D13 a record line with a $(printf '%q' "$sep") separator still MEASURES (drift on a deleted file, exit 1)"
+    has "$OUT" "DRIFT     pi-reap-worktrees.sh" "D13 …and names the missing file"
+done
 mk_env
 run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
 printf 'stamped_at=2026-01-01T00:00:00Z\nsource=-\n' >>"$REC"
