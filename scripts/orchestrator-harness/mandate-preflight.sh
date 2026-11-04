@@ -262,12 +262,22 @@ EOF
   printf '[mandate-preflight] There is NO provisioning path for these files today (they exist in no repo; #1193 owns the content, #3377 this report). Proceed with the BRIEF'"'"'s own text as the authority, and name this absence in your final message.\n'
 }
 
+# mandate_ends_with <haystack> <needle> — TRUE only when <haystack> ENDS with a NON-EMPTY <needle>.
+# ⛔ THE NON-EMPTY HALF IS THE POINT, AND IT IS MEASURED (this change's review, P1): `case "$x" in *""`
+# matches EVERY string, so an EMPTY needle answered "the brief already ends with this" for a brief that
+# ends with anything at all. Both of the emit's idempotence tests keyed on a rendered string — the
+# supersession notice, the disclosure block — so a single failed render turned the stale-positive branch
+# into a silent no-op (the lane keeps a FALSE "file is missing" instruction) and, in the other branch,
+# answered "this brief is already current" about a block that is absent. `[ -n "$2" ]` makes "nothing to
+# compare" a NO, which is the only safe answer: an unrendered claim is never already stated.
+mandate_ends_with() { [ -n "${2:-}" ] && case "${1:-}" in *"$2") return 0 ;; esac; return 1; }
+
 # mandate_preflight_emit <log> <prompt> <label> — THE dispatch-seam action, in ONE place so both
 # `run_agent` copies (spawn-gate.sh and merge-one.sh) call the same implementation instead of each
 # carrying its own. Every branch PROCEEDS and the function never returns non-zero: this is a disclosure,
 # not a gate (the file's header states why a refusal here would be an over-block that halts the fleet).
 mandate_preflight_emit() {
-  local log="${1:-/dev/null}" prompt="${2:-}" label="${3:-agent}" line notice brief_text has_brief stamped current brief_payload
+  local log="${1:-/dev/null}" prompt="${2:-}" label="${3:-agent}" line notice brief_text has_brief stamped current brief_payload healthy
   # ⛔ A FAILED RENDER IS NOT "NOTHING TO SAY" (this change's review, P2). The command substitution used
   # to swallow the renderer's stderr, so a failure produced an empty `line` and the `[ -n ]` guard read it
   # as "every file is present" and returned 0 in silence — the exact defect this file exists to end. An
@@ -277,8 +287,26 @@ mandate_preflight_emit() {
   # caller at THIS line — before the disclosure was appended and before the dispatch could start, which
   # is the over-block the header forbids. `|| :` makes it a read, like every other write in this file.
   line="$(mandate_preflight_line 2>/dev/null)" || :
-  if [ -z "$line" ] && { [ -n "$(mandate_missing)$(mandate_unreadable)$(mandate_irregular)" ] || mandate_state_root_undecidable; }; then
+  # ⛔ AN EMPTY RENDER IS TRUSTED ONLY AFTER THE STATE IS RE-READ **CLEAN** (this change's review, P1,
+  # MEASURED). The old shape took "line is empty" as "nothing to declare" and only corrected it when a
+  # SECOND read happened to say the state was bad — so when that second read ALSO failed (the same cause
+  # that emptied the render), `line` stayed empty and control fell into the HEALTHY branch below, which
+  # appended "BOTH mandated files are now PRESENT and readable on this box" to a brief on a box where they
+  # are missing. That is #3377's false claim restored inside the code written to end it. `healthy` is now
+  # a POSITIVE determination and it is the only way into that branch; "cannot prove clean" is not clean.
+  healthy=""
+  if [ -z "$line" ] && ! mandate_state_root_undecidable \
+     && [ -z "$(mandate_missing)$(mandate_unreadable)$(mandate_irregular)" ]; then healthy=1; fi
+  if [ -z "$line" ] && [ -z "$healthy" ]; then
     line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")" || :
+    # ⛔ LAST RESORT, AND IT IS A LITERAL (this change's review, P1). The line above is a SECOND render,
+    # so it can fail for exactly the reason the first one did; if it does, `line` is still empty and the
+    # branch below would append a FALSE present claim. A literal assignment spawns no subshell and runs no
+    # command, so there is nothing left for it to fail on. ⛔ Its first line IS `mandate_sentinel`'s value
+    # (pinned by the suite, so the ONE marker cannot drift into two), which keeps the block idempotent
+    # even on this path.
+    [ -n "$line" ] || line='<!-- mandate-preflight #3377 -->
+[mandate-preflight] ⛔ CANNOT VERIFY: the disclosure could not be rendered on this box, so the state of the mandated files is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (agent-infra#3377).'
   fi
   # ⛔ THE GUARD IS CONTENT-AWARE, NOT PRESENCE-ONLY (this change's review, P2 — measured, and it is the
   # #3377 defect coming back through the guard written to stop it). It used to test only whether the
@@ -320,7 +348,7 @@ mandate_preflight_emit() {
     # the truthful answer: nothing can be claimed about what it already says.
     brief_text="$(cat "$prompt" 2>/dev/null)" || :
     case "$brief_text" in *"$(mandate_sentinel)"*) stamped=1 ;; esac
-    if [ -n "$line" ]; then case "$brief_text" in *"$line") current=1 ;; esac; fi
+    if mandate_ends_with "$brief_text" "$line"; then current=1; fi
   fi
   # ── the HEALTHY case: nothing to declare about the box ───────────────────────────────────────────
   # A CLEAN brief stays byte-for-byte untouched (an always-on banner is noise a reader learns to skip).
@@ -337,7 +365,12 @@ mandate_preflight_emit() {
     # produced FIVE notices). `stamped` never clears, so without this test every later dispatch appended
     # another copy and the brief grew without bound. If the brief already ENDS with this notice, the claim
     # the lane reads last is already correct — there is nothing to add.
-    case "$brief_text" in *"$notice") return 0 ;; esac
+    # ⛔ AN EMPTY NOTICE MUST NOT READ AS "ALREADY STATED" (this change's review, P1, MEASURED: `case x in
+    # *"")` matches EVERYTHING). The render above is a substitution and can fail, so the guard is inside
+    # `mandate_ends_with` — an unrendered notice is a NO, and the lane then gets the literal fallback
+    # below instead of silence on a brief that still orders it to report a false absence.
+    [ -n "$notice" ] || notice='[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: this box is now provisioned, so that earlier block is a STALE reading of box state and must NOT be reported (agent-infra#3377).'
+    if mandate_ends_with "$brief_text" "$notice"; then return 0; fi
     if { printf '\n%s\n' "$notice" >> "$prompt"; } 2>/dev/null; then
       { echo "[mandate-preflight] $label: the brief carried a STALE mandate block (this box is now provisioned); appended the supersession notice to $prompt" >> "$log"; } 2>/dev/null || :
     else
