@@ -217,6 +217,12 @@ EOF
 mandate_unreadable() {
   local root spec name
   root="$(mandate_state_root)"
+  # ⛔ NOTHING CAN BE SAID ABOUT A FILE THROUGH A DIR THAT CANNOT BE SEARCHED, so this says nothing —
+  # stated EXPLICITLY, as both siblings above do, because an implicit empty result is indistinguishable
+  # from "nothing is unreadable" to the next reader. (This is a statement of the invariant, not a
+  # behaviour change: in the undecidable state `-f` already fails below, so the output was empty either
+  # way. `--check` is where the CANNOT VERIFY verdict belongs, and it tests undecidable first.)
+  if mandate_state_root_undecidable; then return 0; fi
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
     name="${spec%%|*}"
@@ -242,7 +248,7 @@ EOF
 # and brief stay byte-for-byte what they were (an always-on banner is noise a reader learns to skip, and
 # a warning that is always printed is not a warning).
 mandate_preflight_line() {
-  local root path why missing unreadable irregular cv_where
+  local root path missing unreadable irregular cv_where
   root="$(mandate_state_root)"
   # ⛔ AN UNREADABLE STATE DIR MAKES `-f` FALSE FOR EVERY FILE UNDER IT, so testing the files first
   # reported the whole dir's contents as MISSING — a false ABSENCE claim about files that may be
