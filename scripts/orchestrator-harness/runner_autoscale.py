@@ -67,7 +67,10 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
                          Without this branch an empty `repo` compares UNEQUAL to `--repo`, so the
                          install reads OTHER-REPO — never repaired either, but SILENT: it would
                          leave `config_lost` and `notes` empty, a positive claim that nothing is
-                         lost, on the only channel a machine reader has. Never repaired (the agent
+                         lost, on the only CLASS-LEVEL channel a machine reader has (the same fact
+                         is also visible per install as `runners[*].state`, see `--json` above;
+                         `config_lost` exists because a consumer asking "is any slot dead?" should
+                         not have to filter `runners`). Never repaired (the agent
                          name a re-registration needs is exactly what it lost). Its LIVENESS is
                          still measured: a truncated config does not stop a listener that is
                          already up. A NON-empty unparseable config is NOT this state — it may
@@ -589,6 +592,18 @@ def _read_runner_config(directory: Path) -> tuple[str, str]:
         data = json.loads(cfg.read_text(encoding="utf-8-sig", errors="replace"))
     except (OSError, ValueError) as exc:
         raise Unmeasurable(f"{cfg} is not a readable runner config ({exc})") from exc
+    if not isinstance(data, dict):
+        # ⛔ A `.runner` whose bytes are VALID JSON but not an OBJECT (`null`, `[]`, `"x"`) is
+        # unreadable in exactly the same sense as a truncated one, and it must leave through the
+        # SAME door. Measured: `data.get(...)` on those shapes raised `AttributeError`, which is not
+        # `Unmeasurable`, so it escaped the tool's error contract and printed a traceback instead of
+        # the one line the log is read for — the pass still aborted (exit 2), so nothing was repaired
+        # on a guess, but the cause was unreadable. Non-empty is NOT exempt (see `discover()`'s
+        # `st_size == 0` gate): anything with bytes could describe a live registration.
+        raise Unmeasurable(
+            f"{cfg} is not a readable runner config (top-level JSON is not an object: "
+            f"{type(data).__name__})"
+        )
     name = str(data.get("agentName") or "").strip()
     repo = str(data.get("gitHubUrl") or "").strip()
     if not name or not repo:
@@ -3027,7 +3042,8 @@ def converge(
         #     OTHER-REPO and the `entry is None` arm is never reached. OTHER-REPO is never repaired
         #     either, so the defective outcome was never destruction — it is that the lost slot
         #     would vanish from `config_lost` and `notes` and be reported as ANOTHER REPO'S runner,
-        #     a positive claim that nothing is lost, on the one channel a machine reader has.)
+        #     a positive claim that nothing is lost, on the one CLASS-LEVEL channel a machine reader
+        #     has.)
         #     It is therefore REPORTED (`config_lost` + `notes`) and never repaired; its slot stays
         #     dead until a human (or a future arm that can name it) re-registers it.
         #  1. ANOTHER REPO next: `pool` is ONE repo's pool, so an install whose `.runner` names
@@ -3093,8 +3109,13 @@ def converge(
         record["notes"].append(
             f"CONFIG-LOST {c['dir']}: .runner is EMPTY (0 bytes) — the install has lost its "
             "identity, so it cannot be re-registered under its old name and nothing was repaired. "
-            "To re-register deliberately, REMOVE the empty .runner first: the installer treats any "
-            ".runner as an OCCUPIED slot, so a re-registration over it looks like a silent no-op."
+            "To re-register deliberately: STOP that slot's listener/service FIRST (its config is "
+            "gone but the process is not), THEN remove the empty .runner — the installer treats any "
+            ".runner as an OCCUPIED slot, so a re-registration over it looks like a silent no-op. "
+            "Order matters: removing it while the listener is still up drops a live listener out of "
+            "`running`/`live` (a pass measures liveness by the listener, not by the config), which "
+            "makes this slot look FREE to the provisioner — it then installs a SECOND runner into "
+            "the directory that listener is still running from."
         )
     record.update(
         ncpu=ncpu,
@@ -3167,7 +3188,10 @@ def converge(
     duplicates = {name: dirs for name, dirs in by_name.items() if len(dirs) > 1}
     # ⛔ THERE IS NO `""` GUARD HERE, AND ADDING ONE BACK WOULD BE DEAD CODE (#3355 review P2). It
     # reads like it prevents a CONFIG-LOST install from being deduplicated, but `_read_runner_config`
-    # raises on an empty `agentName` (`:587`), so `r.name == ""` iff `r.config_lost` — and every
+    # raises on an empty `agentName`/`gitHubUrl` (`_read_runner_config`'s `if not name or not repo:`
+    # guard — deliberately cited by NAME, not by line: a number here was wrong once already, #3355
+    # review), so `r.name == ""` iff `r.config_lost` —
+    # and every
     # CONFIG-LOST entry `continue`s below, BEFORE `duplicates` is ever consulted (its only consumer is
     # the duplicate check inside this loop). A `""` key can therefore sit in `by_name` and never be
     # read: measured, replacing the old guard with `if False:` left the suite byte-identical.

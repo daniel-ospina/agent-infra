@@ -4335,7 +4335,17 @@ def t57_empty_runner_config_does_not_abort_the_pass():
                 states.get(lost) == "CONFIG-LOST",
                 f"an empty config is its OWN state, not OTHER-REPO/ORPHANED: {states}",
             )
-            check(record["ceiling"] == 3, f"the box is still MEASURED: ceiling={record['ceiling']}")
+            # ⛔ `ceiling == 3` STOOD HERE AND COULD NOT FAIL (#3355 review P3): ceiling is
+            # `min(3, running+headroom)`, and the CONFIG-LOST install is neither in `running` nor able
+            # to move it — dropping the install entirely, or forcing `alive=False`, leaves ceiling 3
+            # (measured). It pinned the core-ceiling table, not this exemption, while reading as the
+            # "the box is still MEASURED" assertion. The measurement this case actually needs is the
+            # VERDICT, which the branch mutation DOES redden (`elif False` -> `at-ceiling`), and the
+            # LIVENESS below, which the `alive=False` mutation reddens.
+            check(
+                record["verdict"] == "config-lost",
+                f"the pass COMPLETED, measured the box, and reported the lost slot: {record['verdict']}",
+            )
             check(
                 lost in record["config_lost"],
                 f"the lost config is NAMED for a machine reader: {record.get('config_lost')}",
@@ -4431,21 +4441,32 @@ def t57_empty_runner_config_does_not_abort_the_pass():
             )
             contains(out, "STARVATION", "the alarm is what the exit code names")
             box.queued(0)  # disarm the alarm again: the rest of this case is about the lost slot
-            # the mutation the exemption must not open: a NON-EMPTY garbage config still aborts.
-            # Silently skipping it would let the provisioner read its slot FREE and add a second
-            # install over the top of a registration that may be live.
-            with open(os.path.join(lost, ".runner"), "w", encoding="utf-8") as fh:
-                fh.write("{ truncated")
-            try:
-                converge(box, nproc="8", want=2, dry_run=True)
-            except ra.Unmeasurable as exc:
-                contains(str(exc), "not a readable runner config", "the abort cause")
-            else:
-                check(False, "an UNPARSEABLE NON-EMPTY config must still raise Unmeasurable")
+            # the mutation the exemption must not open: a NON-EMPTY config still aborts — and the
+            # boundary is 0 BYTES, so every non-empty shape must go through the raise, including the
+            # 1-byte ones a short write can leave. Measured before these cases existed: mutating the
+            # guard to `st_size <= 1` left the whole suite GREEN, so the exemption's exact boundary
+            # was unpinned. Silently skipping a non-empty config would let the provisioner read its
+            # slot FREE and add a second install over the top of a registration that may be live.
+            for shape in ("{", " ", "\n", "{}", "null", "[]", '"x"', "{ truncated"):
+                with open(os.path.join(lost, ".runner"), "w", encoding="utf-8") as fh:
+                    fh.write(shape)
+                try:
+                    converge(box, nproc="8", want=2, dry_run=True)
+                except ra.Unmeasurable as exc:
+                    # `{}` is valid JSON and IS an object, so it leaves through the OTHER
+                    # `Unmeasurable` arm (no agentName/gitHubUrl); every other shape cannot be read
+                    # as a runner config at all. Both are the same door — the assertion names which,
+                    # so a message that silently widens or narrows is visible.
+                    expect = (
+                        "has no agentName/gitHubUrl" if shape == "{}" else "not a readable runner config"
+                    )
+                    contains(str(exc), expect, f"the abort cause ({shape!r})")
+                else:
+                    check(False, f"a NON-EMPTY config must still raise Unmeasurable ({shape!r})")
             # ⛔ AND IT SURVIVES AN EARLY-RETURN PASS. A `--want N` above the ceiling refuses before
             # the repair loop runs; when the report was filled IN that loop, the refusal published
-            # `"config_lost": []` — a positive claim that nothing is lost, on the one channel a
-            # machine reader has (this is deliberately not a `problem`).
+            # `"config_lost": []` — a positive claim that nothing is lost, on the one CLASS-LEVEL
+            # channel a machine reader has (this is deliberately not a `problem`).
             # (the case above left a GARBAGE config in place — restore the measured 0-byte shape)
             with open(os.path.join(lost, ".runner"), "wb"):
                 pass
@@ -5336,6 +5357,21 @@ MUTATIONS = [
         "`_clear_local_config` permanently deletes `.credentials` and `.credentials_rsaparams` on "
         "the way, so the one class of install that cannot re-register is also the class that loses "
         "the key a human needs to re-register it",
+    ),
+    Mutation(
+        "T57",
+        # ⛔ THE NON-OBJECT JSON LEG, added with the `isinstance(data, dict)` guard (#3355 review
+        # P3). A `.runner` holding `null` / `[]` / `"x"` is VALID JSON and NOT an object, so without
+        # the guard `data.get(...)` raised `AttributeError` — which is not `Unmeasurable` and escaped
+        # the tool's error contract as a traceback instead of the one line the log is read for.
+        # Measured on the mutant: `FAIL T57 … AttributeError: 'NoneType' object has no attribute
+        # 'get'` (PASS=0 FAIL=1), so the leg is pinned rather than merely present.
+        "    if not isinstance(data, dict):",
+        "    if False:  # MUTATION: a non-object `.runner` escapes as AttributeError",
+        "a `.runner` whose bytes are valid JSON but not an object (`null`) reaches `data.get(…)` and "
+        "dies with `AttributeError` — outside the `Unmeasurable` contract every other unreadable "
+        "config goes through, so the pass aborts on a traceback the log reader is not looking for "
+        "instead of the named cause",
     ),
 ]
 
