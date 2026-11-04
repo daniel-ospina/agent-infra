@@ -182,9 +182,12 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
     RUNNER_AUTOSCALE_CRONTAB       `crontab` used to answer that question (default: on PATH; a TEST
                                    seam). A COMMENTED-OUT line is not a schedule
 
-  ⛔ `--json` CONSUMERS: `config_lost` is the ONLY machine-readable channel for an install whose
-  `.runner` was destroyed (a 0-byte file). It is a LIST of install directories, and it is
-  deliberately NOT a `problem`: `problems` sets `verdict="action-failed"` above the starvation
+  ⛔ `--json` CONSUMERS: `config_lost` is the DEDICATED class-level key for an install whose
+  `.runner` was destroyed (a 0-byte file). It is a LIST of install directories, and the same fact is
+  also visible per install as `runners[*].state == "CONFIG-LOST"` with its `dir` — `config_lost`
+  exists because a consumer asking "is any slot dead?" should not have to filter `runners`, and
+  because it survives a pass that stops early. It is deliberately NOT a `problem`: `problems` sets
+  `verdict="action-failed"` above the starvation
   branch, so a standing lost slot reported there would DELETE `starvation` and return exit 3 on a
   box that owes the starved exit 4 — the alarm muted by the condition it exists to report. It is
   derived from the classification at record-build time, so it is present (and NAMES the slot) on

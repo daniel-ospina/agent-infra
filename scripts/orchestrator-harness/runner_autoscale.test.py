@@ -3435,9 +3435,9 @@ def t31_fill_adds_one_runner():
 def t32_busy_reread_before_replace():
     """`wait_online` re-reads the POOL only — the view that already called the runner offline — and
     `--replace` DELETES a registration. A runner that comes up at the last second and takes a job
-    would therefore lose it, against this file's own invariant ("a BUSY, SERVING or OTHER-REPO runner
-    is never restarted"). The re-check has to be FRESH, too: the classification value is cached, and
-    a cached `False` would certify exactly what the re-check exists to refuse."""
+    would therefore lose it, against this file's own invariant ("a BUSY, SERVING, OTHER-REPO or
+    CONFIG-LOST runner is never restarted"). The re-check has to be FRESH, too: the classification value
+    is cached, and a cached `False` would certify exactly what the re-check exists to refuse."""
     with Env():
         box = Box("busy-reread")
         try:
@@ -4306,10 +4306,12 @@ def t57_empty_runner_config_does_not_abort_the_pass():
     them held a runner.
 
     The raise in `_read_runner_config` is load-bearing for a config that might describe a LIVE
-    registration. An EMPTY one cannot: it carries no agentName and no URL, and its `.credentials`
-    is empty in the same breath, so nothing can authenticate as it. This case pins the three
-    properties that make the exemption safe — the pass MEASURES, the slot is REPORTED, and it is
-    NEVER handed to the re-registration arm (whose `--replace` would act on an invented name)."""
+    registration. An EMPTY one cannot: it carries no agentName and no URL. In the measured 2026-11-03
+    shape its `.credentials` and `.credentials_rsaparams` were truncated in the same breath, but this
+    file does NOT stat those two — the exemption rests on the 0-byte `.runner` ALONE (see the module
+    header). This case pins the three properties that make the exemption safe — the pass MEASURES, the
+    slot is REPORTED, and it is NEVER handed to the re-registration arm (whose `--replace` would act
+    on an invented name)."""
     with Env():
         box = Box("config-lost")
         try:
