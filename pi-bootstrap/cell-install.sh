@@ -140,7 +140,7 @@
 #        the header is env-indirect, and `--verify` FAILS if a literal `tt_`/`tk_` value ever
 #        appears in it. The credential itself is operator-pushed into `~/keys.env` (0600) —
 #        `cloud-cell-bringup.sh` documents keys.env as "operator-pushed, and NOT a bring-up
-#        byproduct" — so `--verify` also refuses a cell whose `TORTOISE_API_KEY` does not
+#        byproduct" — so `--verify` also refuses a cell whose `TORTOISE_MCP_API_KEY` does not
 #        resolve to something a server would accept, because a config with an unresolved
 #        `${VAR}` sends `Bearer ` (empty) and the server answers 401; that failure reads as
 #        an auth problem rather than the set-up gap it is (#5153).
@@ -218,22 +218,22 @@ log_line()  { printf '  %s\n' "$*"; }
 # byproduct"), so its absence is a WARNING with an exact remedy — never a certification failure,
 # which would refuse to certify a working layer over a key nobody pushed yet.
 graph_key_from_env_file() { # <file> [<variable>] -> its value
-  local f="$1" v="${2:-TORTOISE_API_KEY}"
+  local f="$1" v="${2:-TORTOISE_MCP_API_KEY}"
   [ -f "$f" ] || return 1
-  # Resolve the way the LANE does — source it in a subshell (set -a) — because the fleet's
-  # keys.env spells the alias form `export TORTOISE_API_KEY="$TORTOISE_MCP_API_KEY"`, which a
-  # line-parser reads as the literal string `$TORTOISE_MCP_API_KEY` and then reports as a
-  # malformed key. The subshell discards every other assignment it makes.
+  # Resolve the way the LANE does — source it in a subshell (set -a) — because a box provisioning
+  # the LEGACY name spells it as an alias `export TORTOISE_MCP_API_KEY="$TORTOISE_API_KEY"`, which
+  # a line-parser reads as the literal string `$TORTOISE_API_KEY` and then reports as a malformed
+  # key. The subshell discards every other assignment it makes.
   KEYFILE="$f" KEYVAR="$v" bash -c 'set -a; . "$KEYFILE" >/dev/null 2>&1; set +a; printf "%s" "${!KEYVAR:-}"' 2>/dev/null
 }
 
 # ⛔ RESOLVE THE VARIABLE THE ARTIFACT NAMES, NOT A FAMILY OF NAMES. The installed entry expands
-# exactly ONE variable (`Authorization: Bearer ${TORTOISE_API_KEY}`), and pi's mcp-client resolves
+# exactly ONE variable (`Authorization: Bearer ${TORTOISE_MCP_API_KEY}`), and pi's mcp-client resolves
 # `process.env[NAME]` VERBATIM — there is no alias mapping anywhere in it. So a resolver that
-# also accepted the fleet alias `TORTOISE_MCP_API_KEY` certified "the hosted MCP will authenticate"
-# on a box whose entry expands `${TORTOISE_API_KEY}` to the EMPTY STRING: it printed the exact
-# OPPOSITE of what the artifact does. The alias is a REMEDY (the #5153 line `export
-# TORTOISE_API_KEY="$TORTOISE_MCP_API_KEY"`), never a substitute for the canonical name.
+# also accepted the LEGACY alias `TORTOISE_API_KEY` as a substitute certified "the hosted MCP will
+# authenticate" on a box whose entry expands `${TORTOISE_MCP_API_KEY}` to the EMPTY STRING: it
+# printed the exact OPPOSITE of what the artifact does. The alias is a REMEDY (the #5153 line
+# `export TORTOISE_MCP_API_KEY="$TORTOISE_API_KEY"`), never a substitute for the standard name.
 # graph_mcp_var — the one variable the INSTALLED **tortoise** entry expands, or empty when that entry
 # declares no Authorization at all.
 #
@@ -329,11 +329,11 @@ graph_credential_note() {
       log_line "⚠️  graph credential: NOT resolvable — the tortoise MCP entry expands \${$GRAPH_VAR} to the EMPTY"
       log_line "    string, the server answers 401 'invalid or missing Bearer token', and every lane writes"
       log_line "    GRAPH-UNREACHABLE. Remedy: put the hosted key in $CELL_HOME/keys.env (mode 600) as"
-      log_line "    $GRAPH_VAR, or alias an existing one: export TORTOISE_API_KEY=\"\$TORTOISE_MCP_API_KEY\" (#5153)."
-      if [ "$GRAPH_VAR" = "TORTOISE_API_KEY" ] && { [ -n "${TORTOISE_MCP_API_KEY:-}" ] \
-         || [ -n "$(graph_key_from_env_file "$HOME/keys.env" TORTOISE_MCP_API_KEY 2>/dev/null)" ] \
-         || [ -n "$(graph_key_from_env_file "$CELL_HOME/keys.env" TORTOISE_MCP_API_KEY 2>/dev/null)" ]; }; then
-        log_line "    ⚠️  the fleet alias TORTOISE_MCP_API_KEY IS set — add the alias line above and it resolves"
+      log_line "    $GRAPH_VAR, or alias the name an older box carries: export TORTOISE_MCP_API_KEY=\"\$TORTOISE_API_KEY\" (#5153)."
+      if [ "$GRAPH_VAR" = "TORTOISE_MCP_API_KEY" ] && { [ -n "${TORTOISE_API_KEY:-}" ] \
+         || [ -n "$(graph_key_from_env_file "$HOME/keys.env" TORTOISE_API_KEY 2>/dev/null)" ] \
+         || [ -n "$(graph_key_from_env_file "$CELL_HOME/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; }; then
+        log_line "    ⚠️  the LEGACY name TORTOISE_API_KEY IS set — add the alias line above and it resolves"
       fi ;;
     *)
       log_line "⚠️  graph credential: $GRAPH_VAR in $src does not look like a hosted key (expected tt_/tk_ prefix);"
@@ -423,10 +423,10 @@ if auth and "${" not in auth:
     print("LITERAL_AUTH")
     sys.exit(1)
 # ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client sends headers VERBATIM
-# (extensions/mcp-client/index.ts:819-821), so `Authorization: ${TORTOISE_API_KEY}` (no scheme) is
+# (extensions/mcp-client/index.ts:819-821), so `Authorization: ${TORTOISE_MCP_API_KEY}` (no scheme) is
 # delivered as `Authorization: tt_…` and the server answers 401 — yet it contains "${" and used to
-# be certified. Nor is any variable acceptable: the resolver reads TORTOISE_API_KEY (and the fleet
-# alias TORTOISE_MCP_API_KEY), so an entry naming a third variable would expand to the EMPTY STRING
+# be certified. Nor is any variable acceptable: the resolver reads TORTOISE_MCP_API_KEY (and the
+# LEGACY alias TORTOISE_API_KEY), so an entry naming a third variable would expand to the EMPTY STRING
 # while `LAYER VERIFIED` printed a green credential line beside it. Both names are allowed, nothing
 # else is, and the scheme is required.
 HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$")
@@ -473,11 +473,11 @@ PY
   else
     case "$out" in
       SECRET_IN_FILE:*)
-        fail "a credential LITERAL is written into .mcp.json at ${out#SECRET_IN_FILE:} — a shared config file must be env-indirect (\${TORTOISE_API_KEY}); remove the literal and put the key in \$HOME/keys.env (mode 600)" ;;
+        fail "a credential LITERAL is written into .mcp.json at ${out#SECRET_IN_FILE:} — a shared config file must be env-indirect (\${TORTOISE_MCP_API_KEY}); remove the literal and put the key in \$HOME/keys.env (mode 600)" ;;
       LITERAL_AUTH*)
-        fail ".mcp.json's tortoise entry carries a LITERAL bearer token instead of \${TORTOISE_API_KEY} — the shared file is the leak" ;;
+        fail ".mcp.json's tortoise entry carries a LITERAL bearer token instead of \${TORTOISE_MCP_API_KEY} — the shared file is the leak" ;;
       WRONG_AUTH:*)
-        fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_API_KEY}' — the client sends headers VERBATIM, so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
+        fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_MCP_API_KEY}' (or the legacy 'Bearer \${TORTOISE_API_KEY}') — the client sends headers VERBATIM, so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)

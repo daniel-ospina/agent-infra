@@ -193,7 +193,16 @@ await test("parses as valid config with the expected server set", () => {
 
   ok(
     String(tortoise.headers?.Authorization ?? "").includes("${"),
-    "tortoise auth is env-indirect (${TORTOISE_API_KEY}) — no key in a shared config file",
+    "tortoise auth is env-indirect — no key in a shared config file",
+  );
+  // ⛔ THE HEADER MUST NAME THE STANDARD VARIABLE. `TORTOISE_MCP_API_KEY` is the standard name
+  // (`skills/research/SKILL.md`; #5153/#5343) and `TORTOISE_API_KEY` is the legacy alias, so an
+  // entry expanding the legacy name goes EMPTY on the box the mandate was filed from — the owner's
+  // finding on #3374, where the entry said one name and the docs told the operator to provision the
+  // other. A revert to the legacy name is otherwise invisible: the header still contains `${`.
+  ok(
+    String(tortoise.headers?.Authorization ?? "").includes("${TORTOISE_MCP_API_KEY}"),
+    "tortoise auth names the STANDARD variable ${TORTOISE_MCP_API_KEY} (the legacy TORTOISE_API_KEY would send an empty Bearer on this box)",
   );
   equal(tortoise.command, undefined, "tortoise is not the legacy stdio entry");
 
