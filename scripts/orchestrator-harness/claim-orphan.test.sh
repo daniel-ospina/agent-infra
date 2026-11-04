@@ -527,9 +527,21 @@ esac
 # file exists to prevent. So the shipped value must still COVER the sum its own comment derives; that is
 # an acknowledgement (the same pattern install-launchd.test.sh uses), not a cache: any term moving
 # without the TTL reddens.
-LEASE_TERMS=$(( 3300 + 5400 + 1890 + 3000 ))   # lane + chain PR wait + merge-phase wait + review/merge
+# ⛔ AND THE LANE TERM IS READ FROM THE SEAM, NOT CACHED (agent-infra#2888). It was a literal 3300 here;
+# #2888 demoted the wall clock to a BACKSTOP above the 2700s progress allowance and raised the shipped
+# default to `LANE_BACKSTOP_S` = 7200 — so a literal 3300 would have kept this acknowledgement GREEN
+# while the real lease covered 17490s of worst case with a 14400s TTL, i.e. exactly the mid-lane expiry
+# (and the duplicate dispatch) the #1850 class is about. The term is derived the same way lane-bound.test.sh
+# derives its own seam pins, with a historical fallback if the seam cannot be read.
+LANE_TERM="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-*\([0-9][0-9]*\)}".*/\1/p' \
+              "$(dirname "${BASH_SOURCE[0]}")/spawn-gate.sh" 2>/dev/null | head -1)"
+case "$LANE_TERM" in ''|*[!0-9]*)
+  LANE_TERM=3300   # unreadable seam: the pre-#2888 wall, so the assertion still has a floor
+  ;;
+esac
+LEASE_TERMS=$(( LANE_TERM + 5400 + 1890 + 3000 ))   # lane + chain PR wait + merge-phase wait + review/merge
 [ "$ISSUE_TTL_EXPECTED" -ge "$LEASE_TERMS" ]
-ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s)" $?
+ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s, lane term ${LANE_TERM}s from spawn-gate.sh)" $?
 IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
 [ "$IVAL" = "$ISSUE_TTL_EXPECTED" ]
 ck "O7 the ISSUE claim's default TTL is the SHIPPED claims.sh value (${ISSUE_TTL_EXPECTED}s, got '$IVAL')" $?

@@ -39,6 +39,12 @@ Environment=SEED_REPO={{SEED_REPO}}
 # fleet's 2026-10-17 ruling for the lane ceiling), which is what a resized box needs.
 Environment=MAX_LANES={{MAX_LANES}}
 Environment=MIN_SWAP_MB={{MIN_SWAP_MB}}
+# ⛔ RENDERED BLANK BY DEFAULT, and for a stronger reason than MAX_LANES above (agent-infra#2888): blank
+# means "the script's own default", which is `${LANE_BACKSTOP_S:-7200}` in ai-drainer.sh — the ONE wall
+# backstop seam. A pinned literal here is a fourth copy of that duration, and the one this installer used
+# to write was 3000s: BELOW what the seam ships, so an armed drainer kept a 50-minute cap over every
+# repair lane it dispatched while the rest of the harness ran the 2-hour backstop. A pinned value is now
+# only ever an operator's explicit PIN.
 Environment=LANE_TIMEOUT={{LANE_TIMEOUT}}
 # The pass is a dispatch, not a deadline: never compete with a live lane for CPU.
 Nice=10

@@ -13,8 +13,11 @@
 # THE POLICY — a container is removed ONLY when its owning lane is provably gone, by THREE proofs,
 # ALL required and each re-read at the moment of removal (fail-closed: any uncertainty ⇒ report, do
 # not reap):
-#   1. AGE        the container is older than MIN_AGE (default 14400s = 4h, the issue-claim TTL
-#                 ceiling — a lane inside one full working period must never read as dead).
+#   1. AGE        the container is older than MIN_AGE (default 18000s = 5h, the issue-claim TTL —
+#                 `claims.sh`'s CLAIM_ISSUE_TTL, which agent-infra#2888 raised 14400s -> 18000s when the
+#                 lane's wall clock became a 7200s backstop. An age floor BELOW the lease would let this
+#                 reaper look at a container whose lane may still be inside one full working period; the
+#                 other two proofs would keep it, but the floor must not be the thing that decides it).
 #   2. NO LIVE PROCESS   no process's command line names the container (its exact name, or the owning
 #                 token derived from it), after EXCLUDING the reaper's own process tree (its invoking
 #                 agent, its probes, and its greps all carry the names on their own command lines —
@@ -47,7 +50,7 @@
 #   LANE_CONTAINER_DATE_BIN     date    (default: date)
 #   LANE_CONTAINER_REPO         repo whose worktrees own `fdb-lane-*` (default: $REPO, else $PWD)
 #   LANE_CONTAINER_CLAIM_SNAPSHOT   path to the claims snapshot TSV (default: $O/state/claims-snapshot)
-#   LANE_CONTAINER_MIN_AGE      age floor, seconds (default 14400)
+#   LANE_CONTAINER_MIN_AGE      age floor, seconds (default 18000 = the issue-claim TTL)
 #   LANE_CONTAINER_DRY_RUN      1 = report only (default), 0 = armed
 #   LANE_CONTAINER_NOW          epoch seconds (tests pin the clock)
 #   LANE_CONTAINER_LOG          durable pass log
@@ -68,7 +71,7 @@ SHA1_BIN="${LANE_CONTAINER_SHA1_BIN:-sha1sum}"
 DATE_BIN="${LANE_CONTAINER_DATE_BIN:-date}"
 TIMEOUT_BIN="${LANE_CONTAINER_TIMEOUT_BIN:-timeout}"
 READ_TIMEOUT="${LANE_CONTAINER_READ_TIMEOUT:-60}"
-MIN_AGE="${LANE_CONTAINER_MIN_AGE:-14400}"
+MIN_AGE="${LANE_CONTAINER_MIN_AGE:-18000}"   # = claims.sh CLAIM_ISSUE_TTL (agent-infra#2888)
 DRY="${LANE_CONTAINER_DRY_RUN:-1}"
 NOW="${LANE_CONTAINER_NOW:-}"
 REPO="${LANE_CONTAINER_REPO:-${REPO:-$PWD}}"
@@ -101,7 +104,7 @@ Usage:
   --dry-run     report only (the default)
   --apply       arm deletion (or env LANE_CONTAINER_DRY_RUN=0)
   --repo PATH   repo whose worktrees own fdb-lane-* containers (default: \$REPO, else \$PWD)
-  --min-age S   age floor in seconds (default 14400)
+  --min-age S   age floor in seconds (default 18000)
 
 A container is removed ONLY when ALL three proofs hold: it is older than the age floor; no process's
 command line names it (or its owning token), after excluding the reaper's own process tree; and its

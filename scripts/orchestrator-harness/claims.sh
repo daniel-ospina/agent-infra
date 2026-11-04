@@ -95,10 +95,17 @@ esac
 # 1800s default covers a review+merge; the issue claim must cover the lane's own budget plus the
 # chain that follows it, or it expires MID-FLIGHT, a peer reads it as free and reclaims it, and the
 # duplicate dispatch this file exists to prevent happens anyway. The arithmetic, from the shipped
-# defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
+# defaults (neither of the two bounds below is readable from here — `spawn-gate.sh`'s
+# `LANE_BACKSTOP_S` and orch-loop.sh's own `LANE_TIMEOUT` are variables of THOSE files, so the first
+# term is a literal that must be moved with the seam):
 #
-#   lane (LANE_TIMEOUT)            3300s   (~55 min — spawn-gate.sh's wall clock; raised from 2400
-#                                            when a lane took ownership of its merge, #2029)
+#   lane (LANE_BACKSTOP_S)         7200s   (~2 h — spawn-gate.sh's ABSOLUTE BACKSTOP. It read 3300s
+#                                            until agent-infra#2888 demoted the wall clock from a
+#                                            lane's PRIMARY bound to a backstop above the 2700s
+#                                            PROGRESS allowance, so the worst case a lease must
+#                                            outlive is the backstop, not the old 55-minute wall.
+#                                            The progress rule ends most lanes far earlier; this term
+#                                            is sized for the lane that creeps forward to the end.)
 #   chain-merge.sh waits for the PR 5400s  (90 x 60s) — it exits AT ONCE when the lane recorded a
 #                                           capacity refusal, releasing this claim within a poll
 #                                           interval (agent-infra#1909), so the ceiling below is a
@@ -106,7 +113,7 @@ esac
 #   chain-merge.sh merge-phase wait 1890s  (LANE_PHASE_GRACE 90 + LANE_HANDOFF_WAIT 1800, #2029)
 #   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
 #                                 ------  =======
-#                                 13590s  -> 14400s (4 h)
+#                                 17490s  -> 18000s (5 h)
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
@@ -114,13 +121,14 @@ esac
 # BEFORE THE LANE FINISHES — a peer then reads the claim as free and reclaims it, which is the
 # DUPLICATE DISPATCH this file exists to prevent (agent-infra#1850). #2029 raised TWO terms
 # (LANE_TIMEOUT +900s, and the new merge-phase wait +1890s) and this default moved with them in the
-# same commit; any future change to one of the four must do the same, or override CLAIM_ISSUE_TTL
-# (env, or the cell's keys.env).
+# same commit; #2888 raised the FIRST term again (3300s -> the 7200s backstop) and this moved with it
+# in the same commit, 14400s -> 18000s. Any future change to one of the four must do the same, or
+# override CLAIM_ISSUE_TTL (env, or the cell's keys.env).
 # The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
-CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-14400}"
+CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-18000}"
 case "${CLAIM_ISSUE_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=14400 ;;
-  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=14400 ;;
+  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=18000 ;;
+  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=18000 ;;
 esac
 
 # ── THE LEASE CEILING (agent-infra#2094) ──────────────────────────────────────────────────────

@@ -1575,8 +1575,24 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     sh "$_lb_sh" watch --pid "$pid" --log "$log" --wall "$_lb_wall" --tag "$label" \
        --verdict-file "$log.lanebound" >/dev/null 2>&1 &
   else
-    echo "[lane-bound] WARN $label: lane-bound.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane has the WALL CLOCK only (${t}s) and NO silence bound, so a lane that parks produces nothing until the clock expires. Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
-    ( sleep "$_lb_wall"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    echo "[lane-bound] WARN $label: lane-bound.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane has the WALL CLOCK only (${_lb_wall}s) and NO silence bound, so a lane that parks produces nothing until the clock expires. Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
+    # ⛔ `0` IS THE DOCUMENTED OFF SWITCH, AND IT MUST NOT MEAN `kill NOW` (agent-infra#2888).
+    # `_lb_wall` can now arrive from `LANE_BOUND_WALL_S` (the seam this change made reachable), and
+    # lane-bound.sh treats `--wall 0` as "this axis is off, loudly". `sleep 0` here would instead
+    # TERM a lane in its first second — the same value read as the opposite polarity on the one path
+    # where the real bound is missing. So the fallback arms only a POSITIVE backstop, and says out
+    # loud that this lane has no bound at all rather than pretending it has one.
+    case "$_lb_wall" in
+      ''|*[!0-9]*) _lb_wall="$t" ;;   # defensive: the parse above already rejected these
+    esac
+    if [ "$_lb_wall" -gt 0 ]; then
+      ( sleep "$_lb_wall"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    else
+      echo "[lane-bound] WARN $label: LANE_BOUND_WALL_S=0 AND lane-bound.sh is missing — this lane is UNBOUNDED (no wall clock, no progress bound); it ends only when the agent does" >> "$log"
+      # keep `$w` a REAL, still-live pid: the group reap below signals `-$w`, and an
+      # already-reaped pid could be recycled as somebody else's group leader.
+      ( sleep 5 ) >/dev/null 2>&1 &
+    fi
   fi
   w=$!
   [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }

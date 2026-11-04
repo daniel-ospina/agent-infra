@@ -129,12 +129,21 @@ render() { # <template> <dest>
         -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
         -e "s|{{MAX_LANES}}|${MAX_LANES:-}|g" \
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
-        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-3000}|g" \
+        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-}|g" \
         -e "s|{{DRAINER}}|$DRAINER|g" \
         "$1" >"$tmp" || { rm -f "$tmp"; err "sed could not render $1 (a value carries '|' or '&'?) — refusing to install a partial unit"; return 1; }
     # A value carrying `|`/`&` corrupts the substitution; a leftover `{{…}}` means a placeholder
     # nothing substituted. Both are refusals, and so is an empty result: a unit with no ExecStart
     # enables, activates and then does nothing every 20 minutes.
+    # ⛔ LANE_TIMEOUT IS RENDERED BLANK BY DEFAULT, FOR THE SAME REASON MAX_LANES IS — AND NOW FOR A
+    # SECOND ONE (agent-infra#2888). Blank means "use the script's own default", which is
+    # `${LANE_BACKSTOP_S:-7200}` in `ai-drainer.sh`, i.e. the ONE wall backstop seam. A rendered literal
+    # here would be a FOURTH copy of that duration (lane.sh/fix-one.sh/nonblocking-dispatch.sh take it
+    # from `spawn-gate.sh`, pr-doctor.py mirrors it as `PRD_SPAWN_BACKSTOP_S`), and the one this
+    # installer used to write was `3000` — BELOW the value the seam now ships, so every cell that armed
+    # this timer would have kept a 50-minute cap over its repair lanes while the harness believed it was
+    # running the 2-hour backstop. An explicit `LANE_TIMEOUT` in the environment is still honoured (it
+    # is an operator's deliberate PIN, and the unit says so).
     if grep -q '{{' "$tmp"; then rm -f "$tmp"; err "unsubstituted placeholder remains in the rendered unit"; return 1; fi
     if [ ! -s "$tmp" ]; then rm -f "$tmp"; err "rendered $1 is EMPTY — refusing to install it"; return 1; fi
     case "$1" in

@@ -102,7 +102,8 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER (measured on this change's own PR: a
 # 22-check commit on a loaded box reached 7/22 completed at 15 min and was still 15-in-flight at the
 # old 900s bound, so EVERY lane would have spent a chunk on "still in flight — re-run"). 1500s covers
-# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, 3300s), so the
+# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (the `LANE_TIMEOUT` argument,
+# which since agent-infra#2888 is the ABSOLUTE BACKSTOP `LANE_BACKSTOP_S` = 7200s, not the old 3300s), so the
 # supervision bound below is derived from what is left AFTER it AND after the lane's implementation
 # time — the two must not add up to the whole clock. A re-run is still permitted and still cheap (one
 # PR read) — the bound is a runaway guard, never a reason to call a head green.
@@ -127,10 +128,20 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # leaves (never a literal), so raising LANE_TIMEOUT buys supervision and lowering it cannot silently
 # eat the implementation time again. Shipped defaults:
 #     3300 - 1500 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
-# i.e. the merge phase is bounded at 3240s of the 3300s clock, and a lane that implements within its
-# reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
-# WAITING_* (exit 11) and the next invocation resumes the SAME counter.
+# i.e. the merge phase is bounded at 3240s, and a lane that implements within its reserve reaches BOTH
+# bounds. A cycle that needs longer is not a lane failure: it hands off as WAITING_* (exit 11) and the
+# next invocation resumes the SAME counter.
+# ⛔ THIS BUDGET IS NOT RE-DERIVED FROM agent-infra#2888's 7200s BACKSTOP, DELIBERATELY. The backstop is
+# the LANE's lifetime bound; this is a per-invocation runway guard on the supervision loop, and widening
+# it to the backstop (40 chunks) multiplies the supervision ONE invocation may spend — measured: 11
+# fixtures seed `watch=15` and depend on the budget reaching it. Nothing is bought by widening it, because
+# a hand-off is RESUMABLE (the phase file and the counters survive, so the next invocation continues the
+# same round). A conservative budget here can only hand off EARLIER than the lane's own kill, never
+# later: 3240 of the 7200 backstop leaves 3960s of the clock the lane actually pays for implementation.
 IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
+# ⛔ AND IT READS `LANE_TIMEOUT` ONLY — NOT THE 7200 BACKSTOP (see above). The `3300` fallback is this
+# guard's OWN conservative budget, kept on purpose: an operator who raises the lane backstop does not
+# thereby ask one invocation of this loop to supervise five times longer.
 LANE_WALL_S="${LANE_TIMEOUT:-3300}";              is_limit "$LANE_WALL_S" || LANE_WALL_S=3300
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
 # that exits at once at its deadline), and dividing by it would break the arithmetic below instead of

@@ -1239,7 +1239,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `PRODUCT_REPOS` | `daniel-ospina/tortoise` | **comma-separated** `owner/repo` list (no spaces, matched as an element — `$(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ')` then `*" $repo "*`), read by `refresh-candidates.sh` and deciding **which repo counts as PRODUCT**: an issue is product work when its repo is in this list AND it does not carry the `harness` label. ⛔ **TODAY ONLY THE ENTRY EQUAL TO `$OR` CAN EVER MATCH**: the backlog is read from `$OR` alone, and the intake is called with `$OR`, so every other element in the list is inert until a pass spans more than one repo. The list form is kept because that is the shape the decision has; it is not a multi-repo queue. If `$OR` is absent from the list, EVERY candidate is harness and the loop prints `product-floor N/A` — which is how a box says "no product channel here", not an error. This is the single input the whole floor rests on, so it is documented here rather than only in `ARCHITECTURE.md`: a repo **outside** the list reports `NOT-A-PRODUCT-REPO` and the loop prints `product-floor N/A`, which is **not** an unmet floor and **not** a finding about product work. ⛔ **`$ENV_FILE`-only: `install.sh` neither renders nor validates it** (its numeric `[`-based validator would reject a list, so a `__PRODUCT_REPOS__` placeholder is deliberately absent), which means exporting it and re-running `install.sh` has no effect, and a hand-added plist key is overwritten by the next render — set it in `$ENV_FILE` on a cell, or edit the `PRODUCT_REPOS=` default in `refresh-candidates.sh` (search the assignment, not a line number — it moved once already) |
 | `CYC` | `240` | seconds between cycles |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
-| `LANE_TIMEOUT` | `3300` | wall-clock limit on a lane's `pi` run (s). Raised from 2400 when a lane took ownership of its merge (#2029) — the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
+| `LANE_TIMEOUT` | `LANE_BACKSTOP_S` (**7200**) | the lane's ABSOLUTE BACKSTOP (s), handed to `run_agent` — ⛔ **not the primary bound**: the bound that decides wedged-vs-slow is `LANE_BOUND_IDLE_S` (2700 s), and this ceiling must sit above it or it pre-empts it (agent-infra#2888). It no longer carries a literal of its own: `lane.sh`/`fix-one.sh`/`nonblocking-dispatch.sh` default to `LANE_BACKSTOP_S` from `spawn-gate.sh`, and `pr-doctor.py` mirrors it as `PRD_SPAWN_BACKSTOP_S`. Blank/malformed/`0` ENV → the default, never unbounded. Raised from 2400 when a lane took ownership of its merge (#2029), then 3300 → 7200 by #2888 — and the issue-claim lease `CLAIM_ISSUE_TTL` must cover it plus the chain's waits; see `claims.sh`'s arithmetic block |
 | `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
@@ -1605,9 +1605,14 @@ and the exit code **is** the next action (0 MERGED · 10 FIX_REQUIRED · 15 FIX_
 NAMES → fix, push, repeat; when green, launch the harness's per-PR chain **detached** and supervise it with
 `--watch` (short chunks — a lane blocked for 20 minutes inside one shell call reads as wedged to every
 liveness instrument we have). Supervision is **bounded and sized to what the lane can actually spend**:
-`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (1500 + 7 × 120 + 900 = 3240 of the 3300 s
-clock), so the merge phase can never consume the implementation time the same clock pays for — a bound
-the lane itself reaches before its own kill, not one only a later lane could inherit.
+`WAIT_S + MAX_WATCH × POLL + IMPL_RESERVE ≤ LANE_TIMEOUT` (1500 + 7 × 120 + 900 = 3240 of the 7200 s
+backstop clock), so the merge phase can never consume the implementation time the same clock pays for — a
+bound the lane itself reaches before its own kill, not one only a later lane could inherit. ⛔ `MAX_WATCH`
+is DERIVED from a deliberate 3300 s budget of this loop's own, NOT from agent-infra#2888's 7200 s
+backstop: the backstop bounds the lane's LIFE, this bounds ONE invocation's supervision, and a hand-off
+(`WAITING_*`, exit 11) is resumable — so a conservative budget here can only hand off EARLIER than the
+lane's own kill, never outlive it (3240 of 7200 leaves 3960 s of the clock the lane pays for its
+implementation).
 
 **The cap is 3 fix rounds, enforced by the tool**, not by the brief: a lane that would start round 4 is
 refused, the verdict becomes `BLOCKED_ATTEMPTS`, and a **PR comment names the exact blocker**. A lane stuck
@@ -2188,8 +2193,8 @@ measurements behind it**, never inferred from an exit status.
 
 | limit | default | what it is | what it is NOT |
 |---|---|---|---|
-| wall clock | `LANE_TIMEOUT`, 3300 s | a hard ceiling on the lane's total duration | not a progress signal: it cannot tell SLOW from STALLED, so alone it either kills a lane mid-merge or holds a corpse |
-| **silence** | `LANE_BOUND_IDLE_S`, **1200 s** (20 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs |
+| **silence / progress** | `LANE_BOUND_IDLE_S`, **2700 s** (45 min) | **no output growth AND no CPU delta** (subtree, tolerance 0.10 s), confirmed on **two consecutive samples** — ⛔ **this is the PRIMARY bound**, and 2700 s is the fleet's own `no-progress` allowance (45 min, `docs/ops/load-policy.md` §3), reused rather than re-derived | not a byte counter and not a CPU vote: **both** must be quiet, and either one advancing keeps the lane alive however long it runs |
+| wall clock | `LANE_BACKSTOP_S`, **7200 s** (2 h) — **PROVISIONAL** | an **ABSOLUTE BACKSTOP** above the progress allowance, for a lane whose %CPU and log both creep forward for ever | not the primary bound and not a progress signal: it cannot tell SLOW from STALLED, so it is only ever armed ABOVE the allowance. The shipped pair used to be wall 2400 s < allowance, i.e. the backstop pre-empted the rule that judges wedged-vs-slow and a lane was killed by elapsed time before anything could ask whether it was working (agent-infra#2888) |
 
 **Why (measured 2026-10-27).** Nine lanes across two cloud cells parked with **0 bytes** of output and
 **`00:00:00` CPU**, the oldest for **3 h 32 m** — every one a `pi` in `ep_poll`, an event-loop wait
@@ -2218,8 +2223,8 @@ stalled fleet and a human reading a report.
 `<lane log>.lanebound`):
 
 ```text
-[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=1204s wall_bound=3300s
-  idle_bound=1200s silent=1204s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
+[lane-bound] VERDICT verdict=stalled tag=lane-42 pid=4242 rc=143 elapsed=2704s wall_bound=7200s
+  idle_bound=2700s silent=2704s bytes=0 bytes_delta=0 cpu_cs=7 cpu_delta_cs=0 tol_cs=10
   cpu_unreadable=0 signal=TERM log=/home/cmux/orchestrator/logs/lane-42.log
 ```
 
@@ -2238,10 +2243,12 @@ truncated on rerun and the CPU counter dies with the process.
 **Two observations, and when to expect the kill.** A lane is judged on the sample interval
 `--poll`, default `min(60 s, idle/4)` — ~3 `ps` calls a minute per lane, because on this box the FLEET
 is the load. The silence limit needs **two consecutive confirming samples**, so it fires between
-`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (20–22 min at the defaults); the wall ceiling is
-exact to the sample interval it is not allowed to overrun. One sample is never enough: a single reading
-cannot tell a freeze from a missed measurement, which is the same rule §6.5.1 states for the outside
-reapers.
+`LANE_BOUND_IDLE_S` and `LANE_BOUND_IDLE_S + 2 x poll` (**45–47 min** at the defaults); the wall
+backstop is exact to the sample interval it is not allowed to overrun. One sample is never enough: a
+single reading cannot tell a freeze from a missed measurement, which is the same rule §6.5.1 states
+for the outside reapers. The two numbers are ORDERED, not independent: `run_agent`'s backstop must sit
+above the allowance, `lane-bound.sh` prints a WARN on every run where it does not, and
+`lane-bound.test.sh` pins the shipped pair.
 
 **Operating it.** `LANE_BOUND_IDLE_S=0` disables the silence limit (and `LANE_BOUND_WALL_S=0` the
 ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT, because an
@@ -2251,10 +2258,11 @@ ceiling) — an explicit `0` only: a blank or malformed value takes the DEFAULT,
 model call with no tool activity) raises `LANE_BOUND_IDLE_S` rather than removing the limit.
 
 ⛔ **STATED RESIDUAL.** A lane whose model call takes longer than the silence limit with no output and
-no tool CPU is killed as `stalled`. That is the same bound `task` applies to a sub-agent
-(`TASK_STREAM_STALL_MS` = 20 min) and the same window a human used by hand (5–15 min) — but it IS a
+no tool CPU is killed as `stalled`. The allowance is the fleet's own 45-minute `no-progress` window
+(`task`'s sub-agent equivalent is `TASK_STREAM_STALL_MS` = 20 min, and 45 min is deliberately the
+LONGER of the two: a lane is strictly more expensive than a sub-agent) — but it IS a
 bound on a legitimate-but-pathological case, and the verdict line says so instead of hiding it, because
-`silent=1204s bytes=0 cpu_delta_cs=0` is exactly what a 20-minute model call looks like from outside.
+`silent=2704s bytes=0 cpu_delta_cs=0` is exactly what a 45-minute model call looks like from outside.
 
 ### 6.5.2 The instrument that decides must itself be bounded
 
@@ -3318,7 +3326,8 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(14400s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive)
+(18000s — raised from 14400s by #2888, whose 7200 s lane backstop lengthened the worst case the lease
+must outlive; before that, raised from 10800s by #2029, whose merge phase lengthened the wait)
 are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
 caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
@@ -3472,7 +3481,7 @@ reap. The decisions that are not obvious:
   every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
   §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
-  which is sized (`CLAIM_ISSUE_TTL`, default 4 h since #2029) to cover lane + chain — releasing early is the
+  which is sized (`CLAIM_ISSUE_TTL`, default 5 h since #2888) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
