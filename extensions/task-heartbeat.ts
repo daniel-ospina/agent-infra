@@ -1046,6 +1046,15 @@ export function safeCwd(getCwd: (() => string) | undefined = undefined): string 
  * `TASK_DISPATCH_ATTEMPT` — the builtin `task` tool does, so its rows carry the
  * real per-leg ordinal.
  *
+ * ⛔ A NESTED subagent-extension child INHERITS BOTH `TASK_HEARTBEAT_NONCE` and
+ * that ordinal through `...process.env`, and the pair is CONSISTENT: its
+ * `dispatchId` names the ENCLOSING task dispatch, so `attempt` must name that
+ * dispatch's leg. Do not `delete childEnv.TASK_DISPATCH_ATTEMPT` in
+ * `extensions/subagent/index.ts` to "fix" sibling ambiguity — every sibling
+ * inherits the SAME value, so deleting it changes nothing about that, and it
+ * replaces a true enclosing leg with a false `1`. Sibling rows are separated by
+ * `ts` in the writer's confirmation predicate, not by blanking a field.
+ *
  * `transcriptPath` IS knowable with zero exec — the child's own arg vector
  * carries `--session-id`/`--session-dir` — so it is RESOLVED, never left null
  * by omission: the transcript locator is the only durable pointer back to what

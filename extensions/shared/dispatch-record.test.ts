@@ -440,6 +440,19 @@ test("#385 review fix: the read-back confirm matches the FULL row identity — a
 		false,
 		"killedPids is part of the identity",
 	);
+	// ⛔ THE CASE THAT MADE `ts` NECESSARY (measured): a sibling leaf orphan shares
+	// childSessionId (null, --no-session), parentPid (the same dispatcher), attempt
+	// (the inherited enclosing ordinal), reason (the constant) AND killedPids ([]
+	// is the common leaf case). Without `ts` the predicate answered TRUE above.
+	const leaf = { ...base, parentSessionId: null, killedPids: [] };
+	const leafMine = buildDispatchOutcomeRow(leaf, new Date("2026-11-02T22:00:00.000Z"));
+	const leafSibling = buildDispatchOutcomeRow(leaf, new Date("2026-11-02T22:00:00.001Z"));
+	equal(
+		appendedLineNamesRow(line(leafSibling), leafMine),
+		false,
+		"a SIBLING LEAF orphan (same identity tuple, different ts) does not confirm our write",
+	);
+	equal(appendedLineNamesRow(line(leafMine), leafMine), true, "and our own leaf row still confirms");
 	// …and the write path itself still confirms its own row against a REAL ledger.
 	// A SEPARATE agent dir, so this row can never pollute the spawn-level
 	// assertions that read the shared test ledger.

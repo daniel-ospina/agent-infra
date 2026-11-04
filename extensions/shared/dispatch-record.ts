@@ -54,7 +54,9 @@ export const DISPATCH_RECORD_EXTENSION = "builtin-tools";
 export const DEFAULT_DISPATCH_CLASS = "task";
 
 /** The row contract. Every key is always present; unknown-at-settle values are
- * `null` (or `[]`), never omitted, so a reader destructures without branching.
+ * `null` (or `[]`), never omitted, so a reader destructures without branching
+ * — with ONE exception, `cwd`'s `""` (see its field doc: a string field has no
+ * `null` to say "unknown", and `""` must never be resolved as a path).
  * Fields may be ABSENT in rows written by OTHER versions — readers must
  * tolerate missing identity fields (the plan's tolerance rule). */
 export interface DispatchOutcomeRow {
@@ -84,7 +86,15 @@ export interface DispatchOutcomeRow {
    * now it is the resolved target, so a reader must not infer "the repo the
    * parent worked in" from it. PHYSICAL path (canonicalized where the target
    * exists) — it matches the child's own `getcwd()`. `branch`/`headSha`/
-   * `dirty`/`dirtyPaths` describe THIS directory, never the parent's. */
+   * `dirty`/`dirtyPaths` describe THIS directory, never the parent's.
+   *
+   * ⛔ `""` IS NOT A PATH. It is the #385 orphan-killed contract's value for
+   * "the cwd could not be resolved" — `process.cwd()` THROWS once the
+   * directory has been deleted, which is the reaped-worktree case the
+   * child-side settle exists for, and a string field has no `null` to carry
+   * unknown. Never `resolve`/`join` it: `path.resolve("")` is the READER's own
+   * directory, so a downstream consumer that treats it as a path invents a
+   * location rather than reporting an unknown one. */
   cwd: string;
   branch: string | null;
   headSha: string | null;
@@ -351,8 +361,8 @@ function readAppendedLines(file: string, from: number, to: number): unknown[] {
  * Extracted so the predicate itself is a unit-test target rather than an
  * inline closure nobody can falsify without a real write failure.
  *
- * ⛔ WHY THE FULL IDENTITY, AND WHY `childSessionId`/`parentPid`/`killedPids`
- * ARE PART OF IT. The confirmation is a read-back of a byte RANGE, so a
+ * ⛔ WHY THE FULL IDENTITY, AND WHY `childSessionId`/`parentPid`/`killedPids`/
+ * `ts` ARE PART OF IT. The confirmation is a read-back of a byte RANGE, so a
  * concurrent sibling's line lands in the same window; matching too little
  * makes a FAILED write read as `ok`. `event + dispatchId + attempt + reason`
  * was sufficient while every row carried a fresh per-dispatch nonce and a
@@ -360,11 +370,16 @@ function readAppendedLines(file: string, from: number, to: number): unknown[] {
  * tuple DEGENERATES: `dispatchId`/`attempt` are inherited through the child's
  * env and `reason` is the constant `orphan-killed`, while subagent-tool
  * children are spawned `--no-session` (so `childSessionId` is null for all of
- * them, and `extensions/subagent/index.ts` deliberately does not forward
- * `TASK_DISPATCH_ATTEMPT`). Two sibling orphans of one dispatch can therefore
- * agree on all four — and a sibling's successful append would then confirm OUR
- * failed one, printing `settle=recorded` for a row that was never written. The
- * fields that differ between those siblings are exactly these three.
+ * them) under the SAME dispatcher pid (`parentPid` agrees too).
+ *
+ * ⛔ AND `killedPids` ALONE DOES NOT CLOSE IT (measured on this round's
+ * review): `[]` is the COMMON leaf case — the orphan suite's own log line
+ * prints `killed_pids=-` — so two sibling leaf orphans can still agree on
+ * every field above. `ts` is the discriminator that is free and exact: it is
+ * stamped per ROW by the builder, and `appendLedger` spreads the row AFTER its
+ * own `ts`, so the row's value is the one on the line. Residual: two rows
+ * built in the SAME millisecond are still indistinguishable by `ts` — an
+ * unresolvable tie in the data, not a matching gap.
  */
 export function appendedLineNamesRow(
   line: Record<string, unknown>,
@@ -377,6 +392,7 @@ export function appendedLineNamesRow(
     line.attempt === row.attempt &&
     line.reason === row.reason &&
     line.parentPid === row.parentPid &&
+    line.ts === row.ts &&
     JSON.stringify(line.killedPids ?? []) === JSON.stringify(row.killedPids ?? [])
   );
 }
