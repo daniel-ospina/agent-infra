@@ -16,6 +16,14 @@
 #   5. a live-but-ANCIENT lock is reclaimed (a wedged holder may cost one pass, never the box)
 #   6. an UNWRITABLE `$STATE` permits the pass, and says so loudly (the explicit decision)
 #   7. `--dry-run` still answers while a pass is live, and reclaims nothing
+#   8. an exiting tick does not delete a SUCCESSOR's lock
+#   9-11. the numeric bounds fall back rather than silently shortening a window
+#  12. a SIGTERM releases the lock and exits 143 (`kickstart -k` is the operator's repair verb)
+#  13. several contenders over ONE aged lock start exactly ONE pass (the reclaim is atomic)
+#  14. the debris sweep reaps an AGED orphan and leaves a YOUNG one alone
+#  15. an UNREADABLE process table is not a death witness (it must not reclaim a live holder)
+#  16. `--dry-run` does not sweep debris (it is the only destructive step in the guard)
+#  17. an ABSURD settle falls back instead of sleeping past the cadence
 #
 # ⛔ NO NETWORK, NO MODEL, NO FLEET. Each case gets its own `$HOME` fixture: a `$STATE`, an empty lane
 # registry, and a stub `scripts/ask-owner.py` that records that the pass REACHED it (proof the pass ran)
@@ -311,6 +319,112 @@ OUT11="$(run_hb "$H11" 0 0 08)"; RC11=$?
 ck "HB_LOCK_STALE_MIN=08 falls back to 30: a 10-minute-old live lock is NOT reclaimed (rc=$RC11)" \
    "$( [ "$RC11" -eq 0 ] && want "$OUT11" "another instance is live" && ! ran "$H11" && echo 0 || echo 1 )"
 kill -9 "$MID" 2>/dev/null
+
+# ── 12) SIGTERM releases the lock and exits 143 ──────────────────────────────────────────────
+# `launchctl kickstart -k` is the MEASURED operator repair verb in #2890: it SIGTERMs the holder and
+# starts the replacement at once. Two properties are load-bearing and neither was covered before:
+# the lock must be GONE when the holder dies, and the exit must be the signal's (a TERM trap that
+# merely returns is orch-loop.sh's measured #1715 defect, and would leave the lock held by a dead pid).
+echo "-- 12) a SIGTERM releases the lock and exits 143"
+H12="$TMP/twelve"; mkhome "$H12"; ST12="$H12/.pi/agent/state"
+( run_hb "$H12" 8 10 30 > "$TMP/a12.out" 2>&1 ) &
+A12=$!; KIDS="$KIDS $A12"
+n=0; while [ "$n" -lt 40 ]; do ran "$H12" && [ -d "$ST12/heartbeat.lock" ] && break; sleep 0.25; n=$((n+1)); done
+TERMPID="$(lock_pid "$ST12")"
+ck "the fixture has a live holder to signal (pid $TERMPID)" \
+   "$( [ -n "$TERMPID" ] && [ -d "$ST12/heartbeat.lock" ] && echo 0 || echo 1 )"
+kill -TERM "$TERMPID" 2>/dev/null
+wait "$A12" 2>/dev/null; RC12=$?
+ck "a SIGTERMed tick exits 143 (it EXITS on TERM, it does not merely return)" \
+   "$( [ "$RC12" -eq 143 ] && echo 0 || echo 1 )"
+ck "a SIGTERMed tick RELEASES its lock (no lock left naming a dead pid) (rc=$RC12)" \
+   "$( [ ! -e "$ST12/heartbeat.lock" ] && echo 0 || echo 1 )"
+
+# ── 13) several contenders over ONE aged lock start exactly ONE pass ─────────────────────────────
+# The reclaim is `mv`-aside-then-`rm`, which succeeds for exactly one contender; `rm -rf` + `mkdir`
+# lets two delete and then both claim. Every earlier case ran the subject SERIALLY, so that atomicity
+# was asserted in prose only — an `rm -rf`+`mkdir` rewrite would have kept the whole suite green.
+echo "-- 13) three contenders over one aged lock start exactly ONE pass"
+H13="$TMP/thirteen"; mkhome "$H13"; ST13="$H13/.pi/agent/state"
+DEAD13=""
+for _try in 1 2 3 4 5 6 7 8 9 10; do
+  sh -c 'exit 0' & _p=$!; wait "$_p" 2>/dev/null
+  [ -z "$(ident "$_p")" ] && { DEAD13="$_p"; break; }
+done
+mk_lock "$ST13" "$DEAD13" "Mon Jan  1 00:00:00 2024"
+for i in 1 2 3; do ( run_hb "$H13" 3 0 30 > "$TMP/a13.$i.out" 2>&1 ) & KIDS="$KIDS $!"; done
+wait 2>/dev/null
+ck "three contenders over one aged lock started EXACTLY ONE pass (got $(runs "$H13"))" \
+   "$( [ "$(runs "$H13")" -eq 1 ] && echo 0 || echo 1 )"
+ck "the losing contenders left no staging debris behind" \
+   "$( [ -z "$(find "$ST13" -maxdepth 1 -name '.heartbeat.lock.*' -print 2>/dev/null)" ] && echo 0 || echo 1 )"
+ck "the single winner released the lock when its pass exited" \
+   "$( [ ! -e "$ST13/heartbeat.lock" ] && echo 0 || echo 1 )"
+
+# ── 14) the debris sweep reaps an AGED orphan and leaves a YOUNG one alone ────────────────────────
+# A claim SIGKILLed between its `mkdir` and its `mv` leaves `$STATE/.heartbeat.lock.<pid>`, and nothing
+# else in the tree reaps that name — so the claim does. Both directions matter: an orphan that is never
+# reaped leaks a directory forever, and a LIVE claim's staging dir must never be deleted (that would be
+# two passes). No case covered either direction before.
+echo "-- 14) the debris sweep reaps an aged orphan and leaves a young one alone"
+H14="$TMP/fourteen"; mkhome "$H14"; ST14="$H14/.pi/agent/state"
+mkdir -p "$ST14/.heartbeat.lock.999991" "$ST14/.heartbeat.lock.999992"
+touch -t 200001010000 "$ST14/.heartbeat.lock.999991" 2>/dev/null      # an AGED orphan
+OUT14="$(run_hb "$H14" 0 0 30)"; RC14=$?
+ck "an AGED staging orphan is reaped by the next claim (rc=$RC14)" \
+   "$( [ ! -e "$ST14/.heartbeat.lock.999991" ] && echo 0 || echo 1 )"
+ck "a YOUNG staging dir is left alone (a live claim's scratch is never a candidate)" \
+   "$( [ -d "$ST14/.heartbeat.lock.999992" ] && echo 0 || echo 1 )"
+
+# ── 15) an UNREADABLE process table is NOT a death witness ──────────────────────────────────────
+# `ps -p PID` exits 1 BOTH for "no such process" and for "could not see it". Reading an empty answer
+# as death means a `ps` that failed to run — the fork-exhaustion state a loaded box reaches — reclaims a
+# LIVE holder's lock and produces the concurrent pass the guard exists to remove. `pid-identity.sh`'s
+# rule: the ONLY thing that may witness "dead" is exit 1 with nothing read.
+echo "-- 15) an unreadable process table does not reclaim a live holder"
+H15="$TMP/fifteen"; mkhome "$H15"; ST15="$H15/.pi/agent/state"
+live_child; UNREAD="$LIVE_PID"; mk_lock "$ST15" "$UNREAD" "$(ident "$UNREAD")"
+STUB="$TMP/stub-bin"; mkdir -p "$STUB"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$STUB/ps"; chmod +x "$STUB/ps"
+OUT15="$( HOME="$H15" HB_TEST_MARK="$H15/mark" HB_TEST_SLEEP=0 HB_LOCK_WAIT_S=0 HB_LOCK_STALE_MIN=30 \
+          PATH="$STUB:$PATH" bash "$SUBJECT" 2>&1 )"; RC15=$?
+ck "a broken \`ps\` DEFERS instead of reclaiming: the live holder is refused, not replaced (rc=$RC15)" \
+   "$( [ "$RC15" -eq 0 ] && want "$OUT15" "another instance is live (pid $UNREAD" && echo 0 || echo 1 )"
+ck "the unreadable read is reported as unverifiable, not as a death witness" \
+   "$( want "$OUT15" "identity unverifiable" && echo 0 || echo 1 )"
+ck "the live holder's lock survived the broken \`ps\`" \
+   "$( [ "$(lock_pid "$ST15")" = "$UNREAD" ] && echo 0 || echo 1 )"
+ck "and no pass ran on the strength of an unreadable answer" "$( ran "$H15" && echo 1 || echo 0 )"
+kill -9 "$UNREAD" 2>/dev/null
+
+# ── 16) `--dry-run` does not sweep debris ──────────────────────────────────────────────────────
+# The sweep is the guard's ONLY destructive operation, and a diagnostic exists to answer without
+# changing the box. It used to run inside `hb_claim`, which `--dry-run` reaches — so a dry run deleted
+# debris it was merely asked about (measured in review, not assumed).
+echo "-- 16) --dry-run does not delete debris"
+H16="$TMP/sixteen"; mkhome "$H16"; ST16="$H16/.pi/agent/state"
+mkdir -p "$ST16/.heartbeat.lock.999993"
+touch -t 200001010000 "$ST16/.heartbeat.lock.999993" 2>/dev/null
+OUT16="$(run_hb "$H16" 0 0 30 --dry-run)"; RC16=$?
+ck "a dry run leaves AGED debris in place (rc=$RC16)" \
+   "$( [ -d "$ST16/.heartbeat.lock.999993" ] && echo 0 || echo 1 )"
+ck "a dry run still releases the lock it claimed, leaving no heartbeat.lock behind" \
+   "$( [ ! -e "$ST16/heartbeat.lock" ] && echo 0 || echo 1 )"
+
+# ── 17) an ABSURD settle falls back instead of sleeping past the cadence ─────────────────────────
+# The settle is spent by a tick that could otherwise sleep through its own interval: at a 300 s
+# StartInterval, `HB_LOCK_WAIT_S=600` would make one contended tick sleep ten minutes before refusing —
+# two silent lost beats on the component whose job is to report the box's state. The bound is bounded
+# below (`0` legal, `0<n>` falls back); this is the upper side, and nothing covered it.
+echo "-- 17) an absurd settle falls back instead of sleeping past the cadence"
+H17="$TMP/seventeen"; mkhome "$H17"; ST17="$H17/.pi/agent/state"
+live_child; SLOW="$LIVE_PID"; mk_lock "$ST17" "$SLOW" "$(ident "$SLOW")"
+T17a="$(date +%s)"
+OUT17="$(run_hb "$H17" 0 600 30)"; RC17=$?
+T17b="$(date +%s)"
+ck "HB_LOCK_WAIT_S=600 falls back: the refusal is prompt (rc=$RC17, $((T17b-T17a))s, not 600)" \
+   "$( [ "$RC17" -eq 0 ] && want "$OUT17" "another instance is live" && [ "$((T17b-T17a))" -le 30 ] && echo 0 || echo 1 )"
+kill -9 "$SLOW" 2>/dev/null
 
 echo
 printf 'heartbeat-lock: %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"

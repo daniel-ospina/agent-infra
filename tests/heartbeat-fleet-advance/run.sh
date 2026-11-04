@@ -301,12 +301,21 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # That direction is the SAFE one — the digest cannot go stale silently — so the lint is UPDATED
 # rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
 # place to hide a gate).
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "32193281534949"
+# ⛔ RE-PINNED AGAIN 2026-10-27, DELIBERATELY (#2890, PR #2898): the single-instance guard added ~230
+# lines to `scripts/orchestrator-heartbeat.sh` — comments, two helper functions, the claim loop and the
+# traps — and the block-keyword signature moves with them because the guard's own `if`/`case` opener
+# lines are hashed. Both numbers here are MEASURED at this head against the shipped script, not
+# transcribed: `executable lines` 506 -> 602 and the cksum below -> 11455093485862. The BEAT is
+# unchanged — all sixteen goldens and every behavioural assertion in this suite still pass, and the
+# pointer/order/`MSG=` pins above are untouched — so this is a re-cut of a SHAPE pin, not a fixed
+# failure. (The suite says exactly this in its own failure text: "if deliberate, update this number in
+# §0 … and say why in the commit message".)
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "11455093485862"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 506
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 602
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;

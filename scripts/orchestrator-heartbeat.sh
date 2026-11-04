@@ -114,10 +114,20 @@ log() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null;
 #
 # ⛔ A LIVE HOLDER CAN STILL NOT WEDGE THE BOX — THE BOUND IS BY AGE, NOT BY LIVENESS ALONE.
 # `orch-loop.sh`'s lock (the #1985 defect) has no second opinion: if the holder never dies, nothing
-# ever starts. Here a lock older than `HB_LOCK_STALE_MIN` is reclaimed EVEN WHEN ITS PID LOOKS LIVE,
-# because a heartbeat pass cannot legitimately run that long: its target cadence is 540 s and it
-# carries its own stall killer (`STALL … exceeded 390s`). 30 minutes is the bound pr-doctor's own
-# lock already uses. That is the arm that turns "a wedged holder" from a dead box into one lost pass.
+# ever starts. Here a lock older than `HB_LOCK_STALE_MIN` is reclaimed EVEN WHEN ITS PID LOOKS LIVE.
+# 30 minutes is the bound `$STATE/pr-doctor.lock` already uses, and it is 3.3x the 540 s target pass.
+#
+#   ⛔ THE HONEST LIMIT OF THAT ARM, STATED BECAUSE THE FIRST VERSION OF THIS COMMENT GOT IT WRONG:
+#   this script has NO internal killer. `STALL … exceeded 390s` is `run_bounded`'s message from
+#   `heartbeat-loop.sh:534`, which bounds only THAT entry point; the launchd job runs this script
+#   DIRECTLY (`com.eldato.harness-heartbeat`'s ProgramArguments — orchestrator-bringup.sh:630), and
+#   that path has no bound at all. So on the launchd path a genuinely slow pass (a hung `gh`, a
+#   wedged `cmux send`) that exceeds 30 minutes IS preempted, and a peer runs beside it. That is the
+#   deliberate trade — a wedged holder must not be able to stop the box (#1985) — and it is bounded
+#   at one overlapping pass, not forever. The durable fix is an OWNER REFRESH of the lock during the
+#   pass (the rule `disk-reaper.sh:867` applies: `touch "$LOCK_DIR"` every 25 iterations, because
+#   "the age bound is not enough on its own"); it is filed as its own issue rather than invented
+#   here, because a refresh must die with its owner or it becomes a worse wedge than the one it fixes.
 #
 # ⛔ A REFUSAL TOUCHES NOTHING. The guard sits ABOVE the log truncation and above every write below,
 # AND a held lock is detected before the claim stages anything (see hb_claim), so a contended tick
@@ -128,13 +138,24 @@ log() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null;
 # The trade is stated rather than hidden: a refused tick leaves no line in the heartbeat log.
 #
 # ⛔ A REFUSAL EXITS 0 — A DELIBERATE DEPARTURE FROM THE ISSUE'S "exits non-zero" INDICATOR.
-# `scripts/lib/fleet-inventory.sh` renders a job's last exit status as its verdict, so a non-zero
-# exit here would paint the heartbeat FAILING on most ticks: at a 5-minute StartInterval against a
-# 6–9 minute pass, "a second start while one is live" is the EXPECTED, FREQUENT, entirely healthy
-# case, not a failure. A false FAILING on the one component whose job is to report the box's state
-# is worse than the silence it replaces — and this file's own contract (header, EXIT) is "always 0".
-# The signal the operator actually gets is the DUPLICATE row disappearing from the inventory, which
-# is the state this guard removes.
+# Two grounds, both checkable in this tree (an earlier version of this comment cited a THIRD that is
+# NOT true, and a wrong citation in a guard's rationale is worse than no citation):
+#   1. This file's OWN contract — header line "EXIT: always 0". A guard that starts returning
+#      non-zero changes the contract of the thing it guards.
+#   2. `heartbeat-loop.sh:536-539` logs `TICK FAILED rc=N :: <stderr tail>` on ANY non-zero tick. At
+#      a 5-minute StartInterval against a 6–9 minute pass, "a second start while one is live" is the
+#      EXPECTED, FREQUENT, healthy case, so a non-zero exit would write a false TICK FAILED line into
+#      the loop's log on most contended passes — noise on the one component whose job is to report
+#      the box's state.
+#   ⛔ NOT a ground: "fleet-inventory.sh renders this job's non-zero exit as FAILING". It does not.
+#   `fleet-inventory.sh:68` is a line of the STATES legend COMMENT, and NO ROW is registered for the
+#   heartbeat tick job at all (the registered launchd rows are pr-doctor, objective-reminder, the
+#   reapers, ai-drainer, ai-multi-repo and the two watchdogs — `_fleet_row_launchd_job`). The tick is
+#   covered only INDIRECTLY, via `fleet_row_heartbeat_loop`'s freshness read of
+#   `orchestrator-heartbeat.log`. That gap — the issue's own first target ("0 concurrent instances
+#   over a 24 h window") is therefore unobservable in the inventory — is filed separately.
+# The operator signal a refusal DOES produce is the `SKIP — another instance is live` line on stdout
+# (the terminal, and launchd's StandardOutPath), which names the holding pid and its identity.
 #
 # ⛔ THE BOUNDED SETTLE (`HB_LOCK_WAIT_S`, default 10 s) IS FOR `kickstart -k`, NOT FOR CADENCE.
 # `launchctl kickstart -k` SIGTERMs the running instance and starts the replacement IMMEDIATELY, and
@@ -146,11 +167,22 @@ log() { printf '%s %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null;
 # ⛔ WHAT THIS LOCK IS NOT: it serializes the PASS. A detached queue drain (and, on the live copy,
 # the detached `pr-doctor` run) outlives the pass that launched it, and this lock is released when
 # the pass exits — those children are serialized by their OWN locks ($STATE/pr-doctor.lock). Do not
-# extend this one to cover them.
+# extend this one to cover them. ⛔ And do not read that sibling as equivalent protection: measured,
+# `$STATE/pr-doctor.lock` (heartbeat-loop.sh:768-774) reclaims on AGE ALONE — no pid, no identity,
+# no `kill -0` — so a pr-doctor run past 30 minutes can be joined; and the LOOP's own singleton
+# (`heartbeat-loop.pid`, heartbeat-loop.sh:293-296) is a bare `kill -0`, i.e. the exact #1985 shape
+# this file exists to remove. One `$STATE` therefore holds THREE singleton rules with three different
+# definitions of "stale". Those two are pre-existing and are cited, not fixed, here — fixing a
+# sibling guard is its own change with its own review (filed with this one).
 HB_LOCK="$STATE/heartbeat.lock"
 # 30 minutes, matching `$STATE/pr-doctor.lock` (`find -mmin +30`) — see the age arm above.
 HB_LOCK_STALE_MIN="${HB_LOCK_STALE_MIN:-30}"
 HB_LOCK_WAIT_S="${HB_LOCK_WAIT_S:-10}"
+# ⛔ AND THE SETTLE IS BOUNDED ABOVE TOO, because it is spent by a tick that could otherwise sleep
+# past its own cadence: at a 300 s StartInterval, `HB_LOCK_WAIT_S=600` would make a contended tick
+# sleep 600 s before refusing — two silent lost beats on the component whose job is to report the
+# box's state. Above `HB_LOCK_WAIT_MAX_S` (30 s, still far below the cadence) it falls back to 10.
+HB_LOCK_WAIT_MAX_S=30
 # ⛔ A LEADING ZERO IS NOT A NUMBER HERE EITHER. `08` passes a `[!0-9]` test but `$(( ))` and `[ -lt ]`
 # read it as OCTAL on the /bin/bash 3.2 this box runs (watchdog-loop.sh records the same lesson), which
 # would abort the arithmetic inside a guard whose job is to fail closed. `0` stays legal for the settle
@@ -162,10 +194,29 @@ case "$HB_LOCK_WAIT_S" in ''|*[!0-9]*|0?*) HB_LOCK_WAIT_S=10 ;; esac
 # lock for 60 s would be joined by a second one, i.e. an explicit misconfiguration would re-create the
 # very defect this guard exists to remove. Below 1 falls back to the 30-minute default.
 [ "$HB_LOCK_STALE_MIN" -ge 1 ] || HB_LOCK_STALE_MIN=30
+[ "$HB_LOCK_WAIT_S" -le "$HB_LOCK_WAIT_MAX_S" ] || HB_LOCK_WAIT_S=10
 
-# The process's own START TIME, or empty when it is not running. `ps` (not /proc: macOS has none),
-# `LC_ALL=C` so a claim-time and a probe-time reading cannot differ by locale.
-hb_ident() { LC_ALL=C ps -p "${1:-0}" -o lstart= 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+# The process's own START TIME on stdout, or empty; the RETURN CODE is the witness (see hb_probe).
+# `ps` (not /proc: macOS has none), `LC_ALL=C` so a claim-time and a probe-time reading cannot differ
+# by locale. ⛔ This is one of several `lstart` readers in this tree, and the fleet's ONE
+# process-identity rule is `scripts/lib/pid-identity.sh` (#1178) — its contract is "the ONLY thing
+# that may witness 'dead' is exit 1": `ps -p PID` exits 1 BOTH for "no such process" AND for "could
+# not see it", so the exit code, never the emptiness of the output, decides. This file is DEPLOYED
+# STANDALONE (the bringup copies a flat `*.sh` — orchestrator-bringup.sh:677,691), so it cannot
+# source that lib; the rule is mirrored here deliberately, exactly as `cloud-cell-supervisor.sh`
+# mirrors it for the same reason.
+# stdout: the holder process's start time, trimmed (empty when nothing was read).
+# rc: **`ps`'s own exit status**, forwarded — and that is the point. `ps -p PID` exits 1 BOTH for
+# "no such process" and for "could not see it", and those two answers mean OPPOSITE things to this
+# guard (`scripts/lib/pid-identity.sh`: "the ONLY thing that may witness 'dead' is exit 1"). The
+# first version of hb_probe read an empty result as death, so a `ps` that failed to run — the exact
+# fork-exhaustion condition a loaded box reaches — reclaimed a LIVE holder's lock and produced the
+# concurrent pass this whole block exists to remove. Emptiness is not a witness; the exit code is.
+hb_ident() {
+  local raw
+  raw="$(LC_ALL=C ps -p "${1:-0}" -o lstart= 2>/dev/null)" || return $?
+  printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
 
 # hb_claim → 0 the lock is OURS · 1 $STATE cannot hold a lock · 2 someone else holds it.
 # ⛔ STAGED AND ALREADY LABELLED, THEN `mv` (ai-drainer.sh's measured fix): `mkdir` + write leaves a
@@ -186,7 +237,13 @@ hb_claim() {
   # reader) — so the claim does. Bounded twice over: `-maxdepth 1` on one directory, and only entries
   # older than the same age bound that makes a lock stale. A live claim's staging dir is milliseconds
   # old, so it is never a candidate.
-  find "$STATE" -maxdepth 1 -name '.heartbeat.lock.*' -mmin +"$HB_LOCK_STALE_MIN" -exec rm -rf {} + 2>/dev/null
+  # ⛔ THE SWEEP IS NOT RUN UNDER `--dry-run`. It is the only DESTRUCTIVE operation in this block, and
+  # `--dry-run` exists to answer on a box without changing it (`origination-funnel.test.sh`'s rule).
+  # The sweep used to fire here unconditionally, so a diagnostic could delete debris it was only
+  # asked to report on — measured by review, not assumed.
+  if [ "$DRY" != "1" ]; then
+    find "$STATE" -maxdepth 1 -name '.heartbeat.lock.*' -mmin +"$HB_LOCK_STALE_MIN" -exec rm -rf {} + 2>/dev/null
+  fi
   rm -rf "$stage" 2>/dev/null
   mkdir "$stage" 2>/dev/null || return 1
   printf '%s\n' "$$" > "$stage/pid" 2>/dev/null || { rm -rf "$stage" 2>/dev/null; return 1; }
@@ -201,11 +258,20 @@ hb_claim() {
 # `unverifiable` is a LIVE pid whose start time was not recorded (claim-time `ps` failed): the pid is
 # real, the identity is not provable, so it is deferred to — BOUNDED by the age arm, never forever.
 hb_probe() {
-  local pid rec now
+  local pid rec now rc
   pid="$(cat "$1/pid" 2>/dev/null | tr -d '[:space:]')"
   case "$pid" in ''|*[!0-9]*) printf 'nopid %s' "${pid:-?}"; return 0 ;; esac
-  now="$(hb_ident "$pid")"
-  [ -n "$now" ] || { printf 'dead %s' "$pid"; return 0; }
+  now="$(hb_ident "$pid")"; rc=$?
+  # ⛔ `dead` REQUIRES A WITNESS, NEVER AN ABSENCE. rc=1 with no output is `ps` positively reporting
+  # "no such process" — the one shape `pid-identity.sh:24-31` permits. Anything else (a `ps` that could
+  # not run, a truncated read, an unrecognised rc) is UNANSWERABLE, and unanswerable takes the same arm
+  # as `live`: defer, bounded by the age arm. It is never freedom — "UNANSWERABLE IS NOT 'FREE'" is the
+  # rule `fleet-inventory.sh` already applies to lane liveness (`docs/ops/fleet-liveness.md`).
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 1 ] && [ -z "$now" ]; then printf 'dead %s' "$pid"; return 0; fi
+    printf 'unverifiable %s' "$pid"; return 0
+  fi
+  [ -n "$now" ] || { printf 'unverifiable %s' "$pid"; return 0; }
   rec="$(cat "$1/start" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
   [ -n "$rec" ] || { printf 'unverifiable %s' "$pid"; return 0; }
   [ "$now" = "$rec" ] && { printf 'live %s' "$pid"; return 0; }
@@ -223,6 +289,18 @@ hb_release() {
 hb_owned=0
 hb_waited=0
 hb_attempt=0
+# ⛔ THE TRAPS GO IN BEFORE THE CLAIM, NOT AFTER IT (review P2, and the window is the operator's own
+# repair verb). Installing them only once `hb_owned=1` left a gap between winning the lock and the
+# trap install: a `launchctl kickstart -k` landing inside it killed the tick with NO release, leaving
+# `$STATE/heartbeat.lock` naming a dead pid for the next tick to reclaim — up to one full cadence of
+# refused passes on a box already missing beats. `hb_release` is ownership-checked, so an early
+# install is safe on every path: the refusal (`exit 0`) and the unwritable-$STATE permit both find a
+# pid file that is not theirs and return without touching anything.
+trap 'hb_release' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+# `WAIT_S + 8`: the loop re-claims once per waited second, plus a few attempts to absorb the seconds
+# `find`/`ps`/`mv` themselves consume, so the settle expires by TIME rather than by attempt count.
 hb_max_attempt=$((HB_LOCK_WAIT_S + 8))
 while [ "$hb_attempt" -lt "$hb_max_attempt" ]; do
   hb_attempt=$((hb_attempt + 1))
@@ -290,10 +368,11 @@ fi
 # ⛔ THE LOCK IS THE PASS'S, AND THE PASS'S ALONE. TERM/INT EXIT (they do not merely return —
 # orch-loop.sh's measured #1715 defect) so the EXIT trap is the ONE release point: "the lock is gone"
 # and "the process is gone" become the same event, and a SIGTERM from `kickstart -k` releases here.
+# The traps are installed ABOVE the claim loop (see there). This block is the assertion that they
+# really are, and it tests the OUTPUT, not the exit status — `trap -p EXIT` returns 0 whether or not a
+# trap is set, so a `trap -p … ||` form would be an INERT check (a no-op gate that reports protection).
 if [ "$hb_owned" = "1" ]; then
-  trap 'hb_release' EXIT
-  trap 'exit 143' TERM
-  trap 'exit 130' INT
+  [ -n "$(trap -p EXIT 2>/dev/null)" ] || { printf '%s\n' "orchestrator-heartbeat: BUG — the lock was taken with NO EXIT release trap installed; releasing it and refusing to run a pass (#2890)."; hb_release; exit 0; }
 fi
 
 # -- bounded log --------------------------------------------------------------
