@@ -1029,9 +1029,18 @@ window_kind_live() {
     ''|*[!0-9]*)
       # No deadline recorded (an older writer, or one killed mid-write). Absence of evidence is
       # never a discharge, so it is HONOURED — but it is pruned once no window is left to protect,
-      # so a writer that died cannot wedge discharge off forever.
-      cooldown_remaining_ms >/dev/null || rm -f "$f" 2>/dev/null
-      return 0 ;;
+      # so a writer that died cannot wedge discharge off forever. ⛔ That prune lives in
+      # `wait_for_cooldown`, not only here: this function is reached only while a window EXISTS,
+      # so the `rm` below can never fire for the wedge that matters — and an unparseable flag
+      # left in place disables revalidation for the life of the box. Announced, because a flag
+      # silently switching the probe off is exactly the "gate that never fires" defect.
+      if cooldown_remaining_ms >/dev/null; then
+        gate_note "window-kind flag $1 carries no deadline — honouring it (absence of evidence is never a discharge); it is pruned when the gate has no window left"
+        return 0
+      fi
+      gate_note "window-kind flag $1 carries no deadline and no window is left to protect — pruned"
+      rm -f "$f" 2>/dev/null
+      return 1 ;;
   esac
   [ "$v" -gt "$now" ] && return 0
   # Its window is gone: it protected nothing, and it must not shadow a LATER primary window.
@@ -1387,12 +1396,30 @@ wait_for_cooldown() {
   # retry loop, so a per-call `local spent=0` let ONE gh call spend MAX_ATTEMPTS budgets — 240 s of
   # waits here plus the retry arm's own 60 s + 120 s, under gh-limit.py's 4 attempts (#3228 review,
   # finding 6: "a ceiling that outlives its derivation", one layer up). WAIT_SPENT_MS carries it.
-  local rem chunk announced=0 spent="${WAIT_SPENT_MS:-0}"
+  local rem chunk announced=0 spent=0
+  # ⛔ THE KIND FLAGS ARE PRUNED HERE, WHERE "NO WINDOW" IS ACTUALLY OBSERVABLE (#3228 review,
+  # finding 2). `window_kind_live` promises to prune a flag that carries no deadline "once no
+  # window is left to protect", but it is reached ONLY from `discharge_window`, which is reached
+  # ONLY from inside the loop below — i.e. only while `cooldown_remaining_ms` SUCCEEDS. Its own
+  # prune therefore could not fire except under a sub-millisecond expiry race, and a flag whose
+  # write was truncated (or written empty by an older shim) was honoured FOREVER: every later
+  # window read as undischargeable, `discharge_window` returning before it ever probed, and this
+  # whole fix silently inert on that box until someone deleted the file by hand. This function is
+  # called on EVERY non-NO_WAIT `gh` call, including the common one with no window at all, so the
+  # no-window moment is reached here.
+  cooldown_remaining_ms >/dev/null ||
+    rm -f "$GATE_DIR/secondary.window" "$GATE_DIR/retry-after.window" 2>/dev/null
   while rem="$(cooldown_remaining_ms)"; do
     case "$rem" in ''|*[!0-9]*) break ;; esac
     [ "$rem" -gt 0 ] || break
     if [ "$announced" -eq 0 ]; then
-      if discharge_window; then break; fi
+      # ⛔ A DISCHARGE RE-TESTS THE WINDOW, IT DOES NOT `break` (#3228 review, finding 1).
+      # Breaking here left the loop with `spent=0` and then fell into the "a window survived the
+      # budget" verdict below — so a window a PEER wrote during the <=5 s exempt read (the exact
+      # contention the probe runs in) produced `rc=75` after ~1 s of a 120 s budget, and the note
+      # told the operator the budget had been "outlived" when it had not been spent at all. The
+      # peer's window is the next iteration's business: sleep it out INSIDE the same budget.
+      if discharge_window; then announced=1; continue; fi
       gate_note "the account is in a shared rate-limit window — waiting $(( (rem + 999) / 1000 ))s before this call (budget ${WAIT_BUDGET_MS}ms)"
       announced=1
     fi
@@ -1782,7 +1809,12 @@ run_paced() {
           # exists to delete, reintroduced with a far larger ceiling (#3228 review, finding 1).
           # classify() now short-circuits rc=75 as well, so wording drift cannot recapture it;
           # both halves are required, and tests/gh-shim/run.sh pins them.
-          gate_note "gh-contended — a shared gh throttle window outlived this call's ${WAIT_BUDGET_MS}ms wait budget and no exempt quota read cleared it (a burst/concurrency window is never discharged by one) — returning rc=75 rather than hanging into the caller's timeout"
+          # ⛔ THE FIGURE IS MEASURED, NOT ASSERTED (#3228 review, finding 1). This note is
+          # emitted whenever `wait_for_cooldown` returns 3, and after a discharge that re-tests the
+          # loop the wait CAN legitimately be short (a peer window wrote itself during the probe).
+          # Claiming the budget was "outlived" when it was not spent is a false statement on the
+          # one surface an operator debugs with, so the note states what was actually spent.
+          gate_note "gh-contended — a shared gh throttle window was still open after this call waited ${WAIT_SPENT_MS:-0}ms of its ${WAIT_BUDGET_MS}ms budget and no exempt quota read cleared it (a burst/concurrency window is never discharged by one) — returning rc=75 rather than hanging into the caller's timeout"
           release_slot
           flush_notes 75
           cleanup_workdir
