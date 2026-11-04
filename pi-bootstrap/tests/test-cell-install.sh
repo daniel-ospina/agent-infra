@@ -1311,6 +1311,38 @@ rc=$?
 [ "$rc" -eq 0 ] && grep -q "SELFHOSTED:http://localhost:8000/mcp" "$LOG" \
   && ok "install and verify AGREE on a preserved self-hosted entry (certified BY NAME, not refused for its transport)" \
   || fail "--verify refused (rc=$rc) an entry install had just deliberately preserved, or did not certify it by name — the cell then fails every bring-up with no repair that can clear it"
+# ⛔ THE EXACT BYTES THE FIX IS ABOUT, DRIVEN AGAINST `--verify` ALONE. The arm above reaches the
+# preserved state by running `--install` first, so it only proves the two agree AFTER the merge has
+# written `_selfHosted`. The shape that could never be certified is the FILE ON DISK — hand-written,
+# or restored from a backup, already carrying the marking — and there `--verify` is the only thing
+# that runs (the review reproduced exactly this and got `NOTHTTP:sse` -> FAIL). Byte for byte:
+#     {"type": "sse", "url": "http://localhost:8000/mcp", "_selfHosted": true}
+# Before the fix the `type` test ran UNCONDITIONALLY and FIRST, so this file was refused whatever the
+# url and whatever the marking said; `--install` preserved the very entry, ran this same verify, and
+# exited 1, which `cloud-cell-bringup.sh` turns into a `die` — so the repair loop re-created the
+# refusal and the cell could never converge. This arm contains NO install, so nothing the merge did
+# can satisfy it.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"type": "sse", "url": "http://localhost:8000/mcp", "_selfHosted": True}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "SELFHOSTED:http://localhost:8000/mcp" "$LOG" \
+  && ok "--verify ALONE certifies the exact self-hosted bytes {\"type\":\"sse\",\"url\":\"http://localhost:8000/mcp\",\"_selfHosted\":true}" \
+  || fail "--verify refused (rc=$rc) the exact self-hosted bytes {\"type\":\"sse\",\"url\":\"http://localhost:8000/mcp\",\"_selfHosted\":true} — install preserves this shape and verify refuses it, so no repair can make the cell converge (marker: $(grep -m1 'verify:' "$LOG" | sed 's/^ *//'))"
+# …and a re-install over exactly those bytes must leave them alone: a merge that "normalised" the
+# entry into a second spelling would re-open the same disagreement from the other side.
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "…and a re-install over those bytes leaves the entry untouched (no second spelling, no repoint)" \
+  || fail "re-install rewrote the self-hosted entry --verify had just certified — the two sides disagree again"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if (t.get("url"), t.get("type"), t.get("_selfHosted")) == ("http://localhost:8000/mcp", "sse", True) else 1)
+PY
 # ⛔ A SCHEME-ONLY TYPO MUST NOT MINT THE `_selfHosted` EXEMPTION. `http://` for `https://` on the
 # SAME host is a typo, not a self-host — but the merge compared (scheme, host), so it read as a
 # self-host, PRESERVED the cleartext url, marked it `_selfHosted`, and `--verify` then honoured the
@@ -1702,18 +1734,34 @@ PY
 # resolve was certified LAYER VERIFIED with the 401 warning scrolled away above it — and nothing else
 # catches it (the key is not part of the layer; cloud-cell-bringup.sh does not check it). Exit 0 is
 # deliberate; the STATE has to be unmissable instead. Both directions, so neither can be vacuous.
-# Both directions, so neither can be vacuous. ⛔ AND THE POSITIVE ARM MUST READ THE CERTIFICATION
-# LINE ITSELF: `graph_credential_note` prints `graph credential: resolves from …` on the SAME run
-# (`cell-install.sh`), so a whole-log grep stays green with the state removed from the cert line
-# entirely — i.e. it could not detect the very regression the code comment names. Measured: a
-# synthetic two-line log (cert line without the state, state on its own line) passed the old grep.
+# ⛔ AND THE POSITIVE ARM MUST READ THE CERTIFICATION LINE ITSELF: `graph_credential_note` prints
+# `graph credential: resolves from …` on the SAME run (`cell-install.sh`), so a whole-log grep stays
+# green with the state removed from the cert line entirely — i.e. it could not detect the very
+# regression the code comment names. Measured: a synthetic two-line log (cert line without the state,
+# state on its own line) passed the old grep.
+# ⛔ SO THE PATTERN IS ITSELF ASSERTED, not just used. A named `CRED_ON_CERT` with a fixture log that
+# it must NOT match is the difference between "this arm is placement-sensitive" and "this arm was
+# written to be"; without it the next edit can widen the pattern back over the whole log and every
+# assertion below stays green while the property silently disappears. `CRED_ON_CERT` is shared by
+# both directions and by the self-check, so they cannot drift apart.
+CRED_ON_CERT='^[[:space:]]*LAYER VERIFIED .*graph credential: '
+CERT_TWO_LINE="$TMP/cert-two-line.log"
+{
+  printf '  LAYER VERIFIED — %s carries the farmed scripts, the guards, the skills and the config\n' "$DEST"
+  printf 'graph credential: resolves from the environment (TORTOISE_MCP_API_KEY) (len 27) — the hosted MCP will authenticate\n'
+} > "$CERT_TWO_LINE"
+if grep -qE "${CRED_ON_CERT}resolves from the environment" "$CERT_TWO_LINE"; then
+  fail "the credential-state assertion is VACUOUS: its pattern matched a log where the state sits on its OWN line, so it cannot detect the state being removed from LAYER VERIFIED"
+else
+  ok "the credential-state assertion is placement-sensitive (it does NOT match a two-line log: cert line + separate state line)"
+fi
 KEY="t"
 KEY="${KEY}t_$(printf 'A%.0s' $(seq 24))"
 CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" TORTOISE_MCP_API_KEY="$KEY" \
   bash "$INSTALLER" --verify > "$LOG" 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && grep -E 'LAYER VERIFIED' "$LOG" | grep -q 'graph credential: resolves from the environment' \
-  && ok "LAYER VERIFIED states the graph credential resolves (a cell certified with a working key)" \
+[ "$rc" -eq 0 ] && grep -qE "${CRED_ON_CERT}resolves from the environment" "$LOG" \
+  && ok "LAYER VERIFIED states the graph credential resolves ON the certification line (a cell certified with a working key)" \
   || fail "LAYER VERIFIED did not report a resolving graph credential ON THE CERTIFICATION LINE (rc=$rc) — a reader cannot tell a working cell from a 401 one"
 mkdir -p "$TMP/nohome"
 # BOTH names are cleared: a box that exports the legacy alias would
@@ -1722,18 +1770,11 @@ HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
   env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
   bash "$INSTALLER" --verify > "$LOG" 2>&1
 rc=$?
-grep -q "graph credential: UNRESOLVED" "$LOG" \
-  && ok "LAYER VERIFIED states an UNRESOLVED graph credential (the 401 trap is not silent)" \
-  || fail "a cell with no resolvable TORTOISE_MCP_API_KEY was certified without saying so (rc=$rc) — every lane on it will write GRAPH-UNREACHABLE"
-# ⛔ AND THE NEGATIVE ARM MUST READ THE SAME LINE. It grepped the whole log, so a revert that moved
-# the UNRESOLVED state onto its own `log_line` — the regression the code comment names, and the one
-# `cloud-cell-bringup.sh`'s `grep -E 'mode=--verify|LAYER VERIFIED'` silently drops — stayed green.
-# Scoped to the certification line, like its positive twin above.
-HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
-  env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
-  bash "$INSTALLER" --verify > "$LOG" 2>&1
-rc=$?
-grep -E 'LAYER VERIFIED' "$LOG" | grep -q "graph credential: UNRESOLVED" \
+# ⛔ AND THE NEGATIVE ARM MUST READ THE SAME LINE, THROUGH THE SAME PATTERN — one rule, both
+# directions. It grepped the whole log, so a revert that moved the UNRESOLVED state onto its own
+# `log_line` — the regression the code comment names, and the one `cloud-cell-bringup.sh`'s
+# `grep -E 'mode=--verify|LAYER VERIFIED'` silently drops — stayed green.
+grep -qE "${CRED_ON_CERT}UNRESOLVED" "$LOG" \
   && ok "…and the UNRESOLVED state is ON the certification line, not on a line the bring-up drops" \
   || fail "the UNRESOLVED state was not on the LAYER VERIFIED line (rc=$rc) — cloud-cell-bringup.sh filters for that line, so a separate one is silently invisible"
 
