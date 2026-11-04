@@ -202,9 +202,14 @@ def usable(entry, want_url):
     headers = entry.get("headers")
     if headers is not None and not isinstance(headers, dict):
         return False, "headers"
-    url = (entry.get("url") or "").strip()
-    if not url:
+    url = (entry.get("url") or "")
+    # ⛔ TOTAL OVER ARBITRARY JSON: a non-STRING url made `.strip()`/`re.match` raise and a non-string
+    # Authorization made `"${" not in auth` raise TypeError — both BEFORE the write, so the merge
+    # exited 1 with the file unchanged and the repair path could never fix the entry. Refusals, so the
+    # entry is replaced.
+    if not isinstance(url, str) or not url.strip():
         return False, "url"
+    url = url.strip()
     # `type` is only disqualifying for the HOSTED default. The client's McpServerConfig has no
     # `type` field at all (it selects StreamableHTTP from `url` alone), so a self-hosted entry that
     # spells `type: "sse"` for its own daemon WORKS — replacing it would destroy the operator's
@@ -212,6 +217,8 @@ def usable(entry, want_url):
     if (entry.get("url") or "").strip() == (want_url or "").strip() and entry.get("type") not in (None, "http"):
         return False, "type"
     auth = (headers or {}).get("Authorization") or ""
+    if not isinstance(auth, str):
+        return False, "auth"
     if auth and "${" not in auth:
         # a literal credential written into a shared config file is the leak, never the fix
         return False, "literal"

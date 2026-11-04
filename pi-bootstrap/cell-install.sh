@@ -245,9 +245,13 @@ graph_key_from_env_file() { # <file> [<variable>] -> its value
 # True when <file> has no WRITE bit for group or other. GNU `stat -c %a` first, BSD/macOS
 # `stat -f %Lp` second — the repo's tests run on both — and "cannot determine" is a REFUSAL (the
 # caller treats a non-zero return as 'not a credential source'), never an assumed "fine".
+# ⛔ `-L`: the TARGET's mode is the one that matters (a symlinked `~/keys.env` → dotfiles is a
+# legitimate setup), and `stat` without it reports the LINK's 0777 — which refused a perfectly safe
+# file and told the operator it was group-writable when it was not. `-O` in the caller already
+# follows, so the gate follows too rather than inventing a different notion of "the file".
 _no_group_world_write() {
   local m go
-  m="$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null)" || return 1
+  m="$(stat -L -c '%a' "$1" 2>/dev/null || stat -L -f '%Lp' "$1" 2>/dev/null)" || return 1
   [ -n "$m" ] || return 1
   go="$(printf '%s' "$m" | sed 's/.*\(..\)$/\1/')"    # the last two digits: group, other
   case "$go" in *[2367]*) return 1 ;; esac             # 2/3/6/7 all carry the write bit
@@ -485,6 +489,9 @@ if t.get("command"):
     print("STDIO:%s" % t.get("command"))
     sys.exit(1)
 url = t.get("url") or ""
+if not isinstance(url, str):
+    print("URLTYPE:%s" % type(url).__name__)
+    sys.exit(1)
 if not url:
     print("NOURL")
     sys.exit(1)
@@ -510,11 +517,19 @@ if not url:
 # shape — and the INSTALLER's `usable()` raised on the same line, so the repair path could not fix
 # it either. Both sides now treat it as what it is: an unusable entry (replaced on install, refused
 # here by name).
+# ⛔ AND `usable()` MUST BE TOTAL OVER ARBITRARY JSON — the same predicate, one level down: a
+# non-STRING `url` made `.strip()` (and `re.match`) raise, and a non-string `Authorization` made
+# `"${" not in auth` raise `TypeError`. Both left the merge rc=1 with the file unchanged and the
+# verifier with an empty marker, i.e. the "config nothing can repair" state, for a shape a hand-edit
+# produces in one keystroke. A `$TYPE` marker is what makes that legible.
 _headers = t.get("headers")
 if _headers is not None and not isinstance(_headers, dict):
     print("BADDERS:%s" % type(_headers).__name__)
     sys.exit(1)
 auth = ((_headers or {}).get("Authorization") or "")
+if not isinstance(auth, str):
+    print("BADAUTH:%s" % type(auth).__name__)
+    sys.exit(1)
 if auth and "${" not in auth:
     print("LITERAL_AUTH")
     sys.exit(1)
@@ -634,7 +649,11 @@ PY
       INSECURE_URL:*)
         fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED. Use https, or drop the Authorization for a local daemon (which needs none)" ;;
       BADDERS:*)
-        fail ".mcp.json's tortoise entry declares \`headers\` as a ${out#BADDERS:}, not an object — the Authorization cannot be read from it, so nothing can be certified (and a merge cannot repair it). Make it an object: {\"Authorization\": \"Bearer \\${TORTOISE_MCP_API_KEY}\"}" ;;
+        fail ".mcp.json's tortoise entry declares its headers value as a ${out#BADDERS:}, not an object — the Authorization cannot be read from it, so nothing can be certified. Make it an object: {\"Authorization\": \"Bearer \${TORTOISE_MCP_API_KEY}\"} — a re-install does this for you" ;;
+      BADAUTH:*)
+        fail ".mcp.json's tortoise Authorization is a ${out#BADAUTH:}, not a string — a config the client cannot expand, and a shape no merge can repair. Make it \"Bearer \${TORTOISE_MCP_API_KEY}\" (a re-install replaces it)" ;;
+      URLTYPE:*)
+        fail ".mcp.json's tortoise url is a ${out#URLTYPE:}, not a string — nothing can be resolved from it, so nothing can be certified (a re-install replaces the entry)" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)
