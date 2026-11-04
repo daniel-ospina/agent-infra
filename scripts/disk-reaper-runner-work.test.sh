@@ -917,6 +917,29 @@ case_r() { # <entry-point> <owner>
                "… and the UNREADABLE root's entry SURVIVED — nothing was classified there, so nothing may be removed"
     case_check "$(grep -qF 'verdict=partial' <<<"$out" && echo 0 || echo 1)" \
                "the class line agrees with the record (verdict=partial)"
+    # ⛔ THE ORDINARY HEALTHY SHAPE MUST NOT READ AS AN ABSTENTION — this is the half that the first
+    # version of the partial fix got wrong, and it fires on a cell that is FINE: the readable root holds
+    # only a FRESH checkout (`kept=1`), the other root is unlistable (`unmeasurable=1`). Keyed on
+    # `candidates=0`, that pass published `census=abstained`, whose note claims "nothing under a matched
+    # _work root could be READ … no entry was classified" about an entry that WAS classified
+    # `written-within-floor`, and raised a non-`ok` verdict on a healthy box. The gate is REACHED-ness:
+    # one entry classified ⇒ `partial` (count = a lower bound, 0 here), zero classified ⇒ `abstained`.
+    chmod 0111 "$unreadable" 2>/dev/null
+    s2="$(uniqstate r2)"
+    fixture_entry live "$good" job-young 0 || return 1
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s2" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    chmod 0755 "$unreadable" 2>/dev/null
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    case_check "$(grep -qF 'reason=written-within-floor' <<<"$out" && echo 0 || echo 1)" \
+               "… the fresh checkout under the READABLE root is read and KEPT (so an entry WAS classified)"
+    case_check "$(grep -qF 'census=partial' <<<"$sum" && echo 0 || echo 1)" \
+               "… and that pass is PARTIAL, not abstained — nothing-measured and nothing-reapable are different states (summary: ${sum:-<none>})"
+    case_check "$(grep -q 'no entry was classified' <<<"$(status_of "$s2")" && echo 1 || echo 0)" \
+               "… and the record does NOT claim no entry was classified, which would be false about the entry it just kept"
+    case_check "$(grep -q '^candidates_runner_work=0$' <<<"$(status_of "$s2")" && echo 0 || echo 1)" \
+               "… the count is the MEASURED lower bound (0 here), not `?` — something was measured, there was just nothing reapable"
+    case_check "$(grep -q '^verdict_runner_work=partial$' <<<"$(status_of "$s2")" && echo 0 || echo 1)" \
+               "… while the verdict still refuses to say ok, because a root went unread"
     return $((CASE_FAIL > 0))
 }
 
@@ -977,6 +1000,28 @@ case_o() { # <entry-point> <owner>
                "… and does NOT claim the glob matched nothing — it matched, and saying otherwise aims the operator at the wrong remedy"
     case_check "$(grep -q 'runner-work-root-refused' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
                "… with its own misconfiguration token, distinct from the nothing-matched one"
+    # ⛔ THE MIXED SEAM — AND WHY IT IS THE SHARP ONE. With a good `_work` root AND the install tree in the
+    # same list, sweeping as the loop discovered meant the pass REAPED the dead checkout under the good
+    # root and only THEN hit the refusal and exited 3 — with a note that says "nothing was swept" and a
+    # record whose `freed_mb_runner_work=not-run` / `freed_mb=0` denied the bytes it had just freed.
+    # MEASURED at that head: `REAPED …/job-dead how=rm` immediately above `REFUSED …/gh-runner-x64-1`.
+    # The pass is now TWO-PHASE (discover, then sweep), so a wrong seam refuses for the WHOLE pass before
+    # anything is touched — the only shape in which that sentence can be true. This arm is the one that
+    # would have caught it: the all-refused arm cannot, because there was nothing to delete.
+    s3="$(uniqstate o3)"
+    fixture_entry dead2 "$work" job-dead-2 300 || return 1
+    out="$(run_pass "$pass" "$s3" "$work $install" --apply --only runner-work)"; rc=$?
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "a MIXED seam (one good _work root, one install tree) is still a refusal (rc=$rc, expected 3)"
+    case_check "$(grep -qF 'census=refused' <<<"$sum" && echo 0 || echo 1)" \
+               "… and its census says refused (summary: ${sum:-<none>})"
+    case_check "$([ -e "$dead2" ] && echo 0 || echo 1)" \
+               "… and NOTHING was swept: the dead checkout under the GOOD root SURVIVED — a wrong seam must not delete anything at all"
+    case_check "$([ -f "$install/bin/Runner.Listener" ] && echo 0 || echo 1)" \
+               "… the install tree is still there too"
+    case_check "$(grep -q '^freed_mb_runner_work=not-run$' <<<"$(status_of "$s3")" && echo 0 || echo 1)" \
+               "… and the record claims no bytes freed, which is now TRUE — the pre-fix pass credited 0 for a checkout it had deleted"
     # THE CONTROL, and it is what makes the refusal about the NAME and not about sweeping nothing: the
     # SAME tree with the CORRECT seam reaps the dead checkout and leaves the install alone.
     s2="$(uniqstate o2)"
@@ -1013,7 +1058,7 @@ case_p() { # <entry-point> <owner>
     n_row="$(grep -cF "WOULD-REMOVE class=runner-work" <<<"$out")"
     case_check "$([ "${n_row:-0}" = 1 ] && echo 0 || echo 1)" \
                "… and the path is NAMED exactly once (rows=$n_row), so the would-free figure is not doubled"
-    case_check "$(grep -qF 'was already swept from an earlier glob' <<<"$out" && echo 0 || echo 1)" \
+    case_check "$(grep -qF 'was already QUEUED from an earlier glob' <<<"$out" && echo 0 || echo 1)" \
                "… and the skip is NAMED, so a reader can tell a dedupe from a root that was never matched"
     return $((CASE_FAIL > 0))
 }
@@ -1132,7 +1177,7 @@ MUT_A4='s/^RUNNER_WORK_MIN_AGE="\${REAP_RW_MIN_AGE:-7200}"$/RUNNER_WORK_MIN_AGE=
 # that into `candidates_runner_work=0 verdict_runner_work=ok`. Mutated separately because either half alone
 # would leave one surface lying: the owner's token (so the count is withdrawable) and the entry point's
 # verdict mapping (so `ok` is not published for an abstention).
-MUT_L2='s/^if \[ "\$CENSUS" = ok \] && \[ "\$UNMEASURABLE" -gt 0 \]; then$/if false; then/'
+MUT_L2='s/^if \[ "\$UNMEASURABLE" -gt 0 \]; then$/if false; then/'
 MUT_L3='s/^    \[ "\$RW_ABSTAINED" = 1 \] && VERDICT_RW="abstained"$/    :/'
 # (r)'s arms, on the PARTIAL census — the abstention one state over (#3057 review, P1). Each half is
 # mutated separately for the same reason as (l2)/(l3): `else CENSUS=ok` publishes a partly-unread
@@ -1142,7 +1187,7 @@ MUT_R1='s/else CENSUS=partial/else CENSUS=ok/'
 MUT_R2='s/^    \[ "\$RW_PARTIAL" = 1 \] && VERDICT_RW="partial"$/    :/'
 # (o)'s SECOND arm, on the CAUSE the record publishes. Without its own census token, a refused root falls
 # into the `no-roots` arm and the record says the glob "matched nothing" — false, with the wrong remedy.
-MUT_O2='s/^if \[ "\$REFUSED_ROOTS" -gt 0 \]; then CENSUS=refused; fi$/:/'
+MUT_O2='s/^    print_summary refused$/    print_summary no-roots/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"

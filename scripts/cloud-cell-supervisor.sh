@@ -4187,8 +4187,24 @@ cmd_status() {
     # `abstained`/`partial` are rc 0 by decision and the RECORD is the alarm channel — an hourly ⛔ for a
     # permission mismatch is the alarm-fatigue shape the ⏸ symbol below exists to avoid. The benign
     # spellings stay silent so a healthy cell gains no noise; anything unrecognised prints (FAIL-LOUD).
-    _dr_cls_note() { # <class-kebab> <record-field>
-      case "${2:-}" in ''|ok|'?'|not-run) printf '' ;; *) printf ' ⚠️ %s=%s' "$1" "$2" ;; esac; }
+    _dr_cls_note() { # <class-kebab> <verdict>
+      local _k
+      case "${2:-}" in ''|ok|'?'|not-run) printf '' ; return 0 ;; esac
+      case "$1" in runner-work) _k=runner_work ;; duplicate-install) _k=duplicate_install ;; *) _k="$1" ;; esac
+      printf ' ⚠️ %s=%s' "$1" "$2"
+      _dr_unm "$_k"
+    }
+    # The tally that makes the verdict honest: `partial` means the census could not read all of the class's
+    # population, and the CANDIDATE COUNT beside it is a LOWER BOUND — a reader that prints `partial`
+    # without the number leaves the operator unable to tell one unreadable root from fifty. `0` and an
+    # unanswered `?` stay silent (nothing was missed, or the tally itself did not answer — the verdict
+    # already says so).
+    _dr_unm() { # <record-key-suffix>
+      local _n
+      _n="$(printf '%s\n' "$_drs" | sed -n "s/^unmeasurable_$1=//p" | head -1)"
+      case "${_n:-}" in ''|0|'?') return 0 ;; esac
+      printf ' unmeasurable=%s' "$_n"
+    }
     _dr_rw="$(printf '%s\n' "$_drs" | sed -n 's/^verdict_runner_work=//p' | head -1)"
     _dr_dup="$(printf '%s\n' "$_drs" | sed -n 's/^verdict_duplicate_install=//p' | head -1)"
     _dr_cls_all="$(_dr_cls_note runner-work "${_dr_rw:-}")$(_dr_cls_note duplicate-install "${_dr_dup:-}")"
