@@ -87,8 +87,12 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # "launched". A print-mode `pi` buffers, so a log that ends silently is indistinguishable from a lane
 # that is still working — and `pgrep -f "pi -p"` matched the diagnostic's own command line on top of it.
 # So the ONE line an operator (or a scanner) reads to know a lane ended is written by a TRAP, which is
-# the only construction that fires on EVERY exit: a normal end, a pre-flight refusal, a failing agent,
-# a `set -u` abort, and (through the explicit handlers below) a signal.
+# the only construction that fires on EVERY exit a shell can trap: a normal end, a pre-flight refusal, a
+# failing agent, a `set -u` abort, and (through the explicit handlers below) a `TERM`/`INT`/`HUP`.
+# ⛔ THE UNTRAPPED EXITS, stated so nobody reads the sentence above as a guarantee: `SIGKILL` (the OOM
+# killer), `exec`, and a kill that lands while `lane_exit_cleanup` runs (the TERM→KILL grace is 15 s)
+# write NO line. An absent line is therefore not proof of a pre-#3331 box — see README's terminal-line
+# section, which names all three causes and the artifact that tells them apart.
 #
 # THE CONTRACT — one physical line, PER RUN, last in `$O/logs/lane-<N>.log`:
 #     outcome=<done|refused|failed|died> reason=<token> lane=<N> rc=<status> utc=<timestamp>
@@ -150,7 +154,6 @@ lane_terminal_line() {
   # Collapse anything that would break the one-line contract (a reason is a caller's string).
   r="$(printf '%s' "$r" | tr '\n\r\t' '   ')"
   line="outcome=$o reason=$r lane=$N rc=${LANE_LAST_STATUS:-?} utc=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
-  printf '%s\n' "$line" | tee -a "$O/logs/lane-$N.log" 2>/dev/null || printf '%s\n' "$line"
   # The per-run verdict (see the contract above): re-owned at dispatch, so its ABSENCE — not a stale line, and
   # not an older live run's line — is what "no verdict yet" looks like.
   # ⛔ THE DECISION IS MADE FROM WHAT THE READ AT EXIT CAN SEE, AND ONLY WHEN IT CAN SEE SOMETHING (review
@@ -170,6 +173,11 @@ lane_terminal_line() {
   # (the honest remedies are `mkdir`-lock or an flock on the owner file). The dispatch-order note above is
   # therefore true only for a trap that STARTS after the stamp — this comment is the record of that limit,
   # so the next reader does not re-derive it as a guarantee that does not exist.
+  # ⛔ THE OWNER READ COMES BEFORE THE WRITE, AND THE PROSE BEFORE THE LINE (review cycle 1, P2, measured).
+  # The deny arm used to append its explanation AFTER the terminal line, so on that one arm the log's LAST
+  # line was prose — breaking the contract stated 50 lines above and making `tail -1` (the documented
+  # single-lane read) answer "nothing was recorded" for a lane that HAD recorded its outcome. The decision
+  # does not depend on the line, so computing it first costs nothing and keeps the line last in every arm.
   LANE_OWNER_NOW="$(cat "$O/logs/lane-$N.owner" 2>/dev/null || true)"
   if [ -n "$LANE_OWNER_NOW" ] && [ "$LANE_OWNER_NOW" != "${LANE_RUN_TOKEN:-}" ]; then
     echo "[lane $N] (outcome not written to logs/lane-$N.outcome: a LATER dispatch of #$N owns that file — this line is the transcript, that file is the current run's verdict)" >> "$O/logs/lane-$N.log" 2>/dev/null || true
@@ -179,6 +187,7 @@ lane_terminal_line() {
     printf '%s\n' "${LANE_RUN_TOKEN:-}" > "$O/logs/lane-$N.owner" 2>/dev/null || true
     printf '%s\n' "$line" > "$O/logs/lane-$N.outcome" 2>/dev/null || true
   fi
+  printf '%s\n' "$line" | tee -a "$O/logs/lane-$N.log" 2>/dev/null || printf '%s\n' "$line"
   return 0
 }
 # The EXIT trap dispatches, so ONE trap site covers both halves as they become available: the cleanup
@@ -657,14 +666,17 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the SIX refusal gates
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the SEVEN refusal gates
 # `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`.
 # ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
-# emitted six since the fork/capability/skew/key gates were added, and `chain-merge.sh` folds an
-# UNRECOGNISED third field to `load` — so a reader implemented from this sentence alone would report a
-# credential stand-down as a load wait, which is the #2991 mislabelling this file is careful to avoid
-# three lines above. The vocabulary lives in `cap_refusal_gate`; this comment names it rather than
-# restating a list that can drift again.
+# emitted SIX since the fork/capability/skew/key gates were added — and it says SEVEN here because that
+# stale count is exactly how this comment drifted the first time (review cycle 1, P2: it read "SIX"
+# beside a list of seven). The list and the count are asserted against `cap_refusal_gate` by
+# `lane-outcome.test.sh`, so a gateway added without this line reddens a test instead of a reader.
+# `chain-merge.sh` folds an UNRECOGNISED third field to `load` — so a reader implemented from this
+# sentence alone would report a credential stand-down as a load wait, which is the #2991 mislabelling
+# this file is careful to avoid three lines above. The vocabulary lives in `cap_refusal_gate`; this
+# comment names it rather than restating a list that can drift again.
 # (`land` is the CREATION back-pressure refusal, agent-infra#2409 — see run_agent in spawn-gate.sh.
 # It is written by the same line and read by the same two readers; chain-merge.sh maps it to exit 74
 # and says in its own words that it is NOT a capacity transfer, because no peer box can clear a

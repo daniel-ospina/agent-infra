@@ -380,6 +380,49 @@ wait "$LANE_PID" 2>/dev/null; LANE_RC=$?
 eqv "$LANE_RC" "143" "4a a TERMed lane exits by the signal's status (143)"
 check_terminal "4b" died "signal:TERM" 143
 
+# ⛔ 4c/4d: THE OTHER TWO HANDLERS ARE PINNED TOO (review cycle 1, P2, mutation-verified). Only the TERM
+# arm carried a status assertion, so `trap 'lane_terminate 0 HUP' HUP` — which publishes `rc=0` beside
+# `outcome=died`, the exact disagreement the TERM arm exists to catch — left BOTH suites green (measured:
+# lane-outcome 111/111 and reap-lane-venvs 0 failed on that mutant). HUP is the `tmux kill-session` path
+# the code itself calls the usual operator kill, so the unpinned arm was the one most likely to be used.
+for _sig in HUP INT; do
+  case "$_sig" in HUP) _rc=129 ;; INT) _rc=130 ;; esac
+  mk_arm "sig$_sig"; WT="$ARMWT"
+  pi() { sleep 5; return 0; }
+  export -f pi
+  drive_bg "$WT" "$KEYVAR=sk_fixture"
+  i=0
+  while [ "$i" -lt 200 ]; do
+    grep -q '\[agent\] provider=' "$(LOG)" 2>/dev/null && break
+    kill -0 "$LANE_PID" 2>/dev/null || break
+    i=$((i + 1)); sleep 0.1
+  done
+  kill -"$_sig" "$LANE_PID" 2>/dev/null
+  wait "$LANE_PID" 2>/dev/null; LANE_RC=$?
+  eqv "$LANE_RC" "$_rc" "4c a ${_sig}-ed lane exits by that signal's status (${_rc})"
+  check_terminal "4d" died "signal:${_sig}" "$_rc"
+done
+
+# ⛔ 4e: THE FORMAT COMMENT'S GATE LIST IS THE WRITER'S VOCABULARY, AND IT HAD ALREADY DRIFTED (review
+# cycle 1, P2). `lane.sh`'s FORMAT block said "one of the SIX refusal gates" and then listed seven, and
+# `chain-merge.sh`'s return contract listed six while its `case` dispatched on seven — the reader this
+# comment exists for (someone implementing a consumer of field 3) is the one who inherits the fold to
+# `load`. Both halves are asserted against `cap_refusal_gate`, so a gate added to the vocabulary without
+# its name in the contract reddens here rather than in an operator's misread.
+_gates="$(sed -n '/^cap_refusal_gate()/,/^}/p' "$(dirname "$LANE")/chain-merge.sh" \
+          | sed -n 's/^[[:space:]]*\([a-z][a-z-]*\))[[:space:]]*printf.*/\1/p' | sort -u | paste -sd ',' -)"
+eqv "$_gates" "capability,disk,fork,key,land,skew" \
+    "4e the normaliser's own vocabulary is the expected seven-to-six named arms (load is the FOLD, not an arm)"
+_fmt="$(sed -n '/^# FORMAT — one line/,/^# (`land` is the CREATION/p' "$LANE")"
+for _g in load disk land fork capability skew key; do
+  has "$_fmt" "\`$_g\`" "4e …and the FORMAT contract names the \`$_g\` gate (a consumer built from it cannot fold it)"
+done
+has "$_fmt" "SEVEN refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names)"
+_ret="$(head -n 80 "$(dirname "$LANE")/chain-merge.sh" | grep -n '^cap_refusal_gate()')"
+for _g in key skew; do
+  has "$_ret" "$_g" "4e …and chain-merge's return contract names \`$_g\`, which its case arm dispatches on"
+done
+
 # ═══ 5. A LANE THAT NEVER GOT AS FAR AS AN OUTCOME ══════════════════════════════════════════════════# The half-synced-`$O` shape: lane.sh is present and its libraries are not. It refuses with 78 — which is
 # NOT a gate refusal — and the terminal line must still appear, naming the exit. Without this, the
 # exits that happen BEFORE any gate are exactly the ones that leave a silently truncated log.
