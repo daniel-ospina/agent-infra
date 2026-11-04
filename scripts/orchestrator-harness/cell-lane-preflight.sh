@@ -48,6 +48,9 @@
 #   write ~4 KB of banners inside 1-2 s (so "first byte" is a banner, not an answer), and an empty
 #   answer is a LEGITIMATE answer to "say nothing" (so it cannot distinguish "answered nothing" from
 #   "never answered"). The prompt therefore demands a fixed token and the probe waits for the token.
+#   ⛔ AND THE TOKEN IS THE WHOLE ANSWER LINE, not a substring anywhere in the transcript (`TOKEN_RE`):
+#   a banner that merely QUOTES the prompt carries the token too, so an unanchored match certifies a
+#   box that never answered (`ok` when it exits, `exit-hang` — the wrong owner — when it hangs).
 #
 # ⛔ THE KEYS ARE EXTRACTED IN A SUBSHELL. `keys.env` is arbitrary code with the preflight's
 #   privileges and MAY set `HOME` (`cloud-cell-bringup.sh` documents that at length) — sourcing it
@@ -109,6 +112,16 @@ PROVIDER="${PI_LANE_PROVIDER:-deepseek}"
 ATTEMPTS=2
 QUIET=0
 TOKEN="PF_OK_4f2c"
+# ⛔ THE TOKEN MUST BE THE WHOLE ANSWER LINE, NOT A SUBSTRING OF THE TRANSCRIPT. The probe asks for the
+# token and nothing else, and a real `pi -p` on a box puts exactly `PF_OK_4f2c` on one stdout line
+# (measured: stdout 11 bytes, stderr 4623 bytes of extension banners). An UNANCHORED `grep -F` also
+# accepts anything that merely QUOTES the request — an extension banner echoing the argv, an error
+# repeating the prompt — and that flips the verdict in BOTH directions, each of them a defect this gate
+# exists to prevent: echoed + exits 0 reads as `ok` (a box that never answered is certified), and
+# echoed + hangs reads as `exit-hang`, whose remedy blames the installed extension set when the truth is
+# that the probe never asked. Anchoring makes "the ANSWER TOKEN" structural instead of incidental. The
+# failure direction stays safe: an unrecognised answer is `no-return`/`no-answer` — never `ok`.
+TOKEN_RE="^[[:space:]]*${TOKEN}[[:space:]]*$"
 
 die_usage() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
@@ -232,8 +245,9 @@ attempt() {
   pid=$!
   [ "$m_was" = "1" ] || set +m 2>/dev/null || true
   while [ "$i" -lt "$BOUND" ]; do
-    # The ANSWER TOKEN is the signal, not the first byte: banners arrive in the first 1-2 s.
-    if [ -z "$first" ] && grep -qF "$TOKEN" "$out" 2>/dev/null; then
+    # The ANSWER TOKEN is the signal, not the first byte: banners arrive in the first 1-2 s. Anchored
+    # to a whole line — see TOKEN_RE for why a substring match asks a different question.
+    if [ -z "$first" ] && grep -qE "$TOKEN_RE" "$out" 2>/dev/null; then
       now=$(now_ms)
       first=$(( now - start )); [ "$first" -lt 0 ] && first=0
     fi
@@ -272,7 +286,7 @@ n=1
 while [ "$n" -le "$ATTEMPTS" ]; do
   attempt "$n"
   attempts_used=$n
-  if grep -qF "$TOKEN" "$TMPD/out.$n" 2>/dev/null; then
+  if grep -qE "$TOKEN_RE" "$TMPD/out.$n" 2>/dev/null; then
     if [ "$A_RC" -eq 0 ] && [ "$A_KILLED" -eq 0 ]; then
       emit "ok" "answered_ms=$A_FIRST_MS returned_ms=$A_WALL_MS attempts=$n bound=${BOUND}s key=$KEY_SOURCE"
       exit 0

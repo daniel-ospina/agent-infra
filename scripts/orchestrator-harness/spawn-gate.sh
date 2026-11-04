@@ -1585,6 +1585,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # escape; `LANE_PREFLIGHT_BOUND` overrides the bound (default 45 s — the probe's OWN documented
   # default, not a tighter number: a healthy box measured 25 s worst case, so a 30 s bound left ~1 s of
   # slack for the post-answer exit and could refuse a working box on one slow sample).
+  #
+  # ⛔ STATED LIMIT: THIS GATE COVERS THIS FILE'S `run_agent`, AND `merge-one.sh` CARRIES A SECOND COPY
+  # THAT IT DOES NOT REACH. So a REVIEWER/MERGER spawn on a box in the `exit-hang` state is still
+  # unbounded by it — the lane spawns are covered, the merge-phase model calls are not. It is named
+  # here rather than left to be discovered: a gate that reads as fleet-wide while covering one of two
+  # spawn points is the instrument false negative this whole issue is about. Wiring the second copy is
+  # a separate change on a file this one does not touch.
   if [ "${LANE_PREFLIGHT:-1}" != "0" ]; then
     local _pf_sh="" _pf_line="" _pf_rc=0 _pf_remedy=""
     if _pf_sh="$(cell_preflight_path)"; then
@@ -1630,6 +1637,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Sync the harness: cp scripts/orchestrator-harness/*.sh \$O/" >> "$log"
     fi
   fi
+  # ⛔ THE PROBE'S TIME IS NOT THE AGENT'S (review P1, #2935). `start` is taken above, BEFORE this gate,
+  # so leaving it there books up to `LANE_PREFLIGHT_BOUND` x attempts of PROBE time as the agent's wall
+  # time: every `state/walltime.tsv` row (#1709's capacity series) would read high on every lane, and
+  # the `elapsed >= t` cap test below would fire `cap_wip_snapshot` for a lane that finished INSIDE its
+  # cap — a snapshot taken for a cap that never fired, on a clean tree, reported as work at risk.
+  # Re-taken here, immediately before the launch, so `elapsed` measures the AGENT and nothing else.
+  start="$(date +%s)"
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`

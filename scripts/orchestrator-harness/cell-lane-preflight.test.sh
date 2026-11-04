@@ -33,6 +33,12 @@
 #                                            the token is A3's case, not `ok`. This is the artifact
 #                                            the first cut of the measurement hit: `first byte` is a
 #                                            banner at ~1 s on every box, including the broken ones.
+# A8b a banner that QUOTES the request     → `why=no-answer` when the process RETURNS and `why=no-return`
+#                                            when it hangs — never `ok`, never `why=exit-hang`. The token
+#                                            must be the whole ANSWER LINE: as a substring, an extension
+#                                            banner echoing the argv certifies an unanswered box (`ok`, a
+#                                            false PASS) or names the installed extension set as the
+#                                            owner of the probe's own prose (`exit-hang`).
 # A10 hangs BEFORE it ever answers       → `refused why=no-return`, exit 3, `alive_at=`, `attempts=2`.
 #                                            THIS IS THE ARM THE GATE WAS VACUOUS FOR: a box whose
 #                                            provider is blackholed, whose proxy drops, or whose
@@ -119,6 +125,9 @@ i=0; while [ \$i -lt 60 ]; do echo "[stub-extension] banner line \$i — nothing
 case "$mode" in
   answer)        echo "PF_OK_4f2c"; exit 0 ;;
   answer-noret)  echo "PF_OK_4f2c"; sleep 600; exit 0 ;;
+  # A8b/A8c — a banner that ECHOES THE REQUEST: the token is present, but never as an answer line.
+  banner-echo)      echo "request was: Reply with exactly this token and nothing else: PF_OK_4f2c"; exit 0 ;;
+  banner-echo-hang) echo "request was: Reply with exactly this token and nothing else: PF_OK_4f2c"; sleep 600; exit 0 ;;
   silent)        exit 0 ;;
   silent-hang)   sleep 600; exit 0 ;;
   answer-fail)   echo "PF_OK_4f2c"; exit 7 ;;
@@ -177,6 +186,28 @@ assert_has "A3 names the stall" "why=no-answer" "$OUT"
 assert_has "A3 pins the retry (a transient blip must not refuse a wave)" "attempts=2" "$OUT"
 # A3b: a banner-heavy, answer-free box is A3's class, never `ok` (the first-cut artifact)
 assert_not_has "A3/A8 banners are not an answer" "LANE_CAPABILITY=ok" "$OUT"
+
+# ── A8b: a banner that QUOTES the request is NOT an answer (the false PASS) ────────────────────
+# ⛔ THE DISCRIMINATOR IS THE ANCHOR. This stub puts the TOKEN on a line of its own prose and then
+# EXITS 0 — the shape every extension banner can produce, since banners echo argv. Read as a substring,
+# the token is "present" and the process returned cleanly, so the gate certified `ok` on a box that
+# never answered: a false PASS on the one question this file exists to answer. It is a `no-answer`
+# (the process RETURNED without answering), i.e. the transient/WARN side.
+make_stub "$WORK/a8b" banner-echo; make_keys "$WORK/a8b"
+run_gate "$WORK/a8b" 3 --quiet
+[ "$RC" -eq 3 ] && ok "A8b exit 3 when only a banner echoed the request" || bad "A8b expected exit 3, got $RC: $OUT"
+assert_has "A8b a quoted request is a no-answer" "why=no-answer" "$OUT"
+assert_not_has "A8b a quoted request is NEVER ok (a false PASS on the gate's own question)" "LANE_CAPABILITY=ok" "$OUT"
+
+# ── A8c: …and when it HANGS, the refusal must not blame the extension set ──────────────────────
+# Same echo, never returns. Read as a substring this is `exit-hang` — "the request RESOLVED and the
+# process did not RETURN", whose remedy names the installed extension set. The request never resolved,
+# so the owner is the pre-answer arm and the remedy is the one that is actually true.
+make_stub "$WORK/a8c" banner-echo-hang; make_keys "$WORK/a8c"
+run_gate "$WORK/a8c" 2 --quiet
+[ "$RC" -eq 3 ] && ok "A8c exit 3 when a banner echoed the request and the probe never returned" || bad "A8c expected exit 3, got $RC: $OUT"
+assert_has "A8c names the pre-answer hang, not a resolved-but-stuck call" "why=no-return" "$OUT"
+assert_not_has "A8c does not blame the extension set for the probe's own echo" "why=exit-hang" "$OUT"
 
 # ── A4: answered, exited non-zero → call-failed ────────────────────────────────────────────────
 make_stub "$WORK/a4" answer-fail; make_keys "$WORK/a4"

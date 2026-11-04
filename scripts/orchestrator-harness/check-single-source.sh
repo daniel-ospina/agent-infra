@@ -69,7 +69,7 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # UNION of both sides of this merge — neither list is a superset. This branch adds lane-merge.sh and
 # merge-rate.sh (#2029); origin/main adds brief-gate.sh (#2258) and repo-target.sh (#2724/#2694). A file
 # executed from the installed $O that is absent from this list is a divergence nothing byte-compares.
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh cell-lane-preflight.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
 # …`lane-merge.sh` and `merge-rate.sh` are presence-required because install.sh seeds BOTH into `$O`
 # (the DRIFTED list) and a lane's brief EXECUTES `$O/lane-merge.sh` from the tree the daemon installed —
 # so a `$O` missing it makes every lane's merge phase exit 127. merge-rate.sh is carried for the same
@@ -104,6 +104,13 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-ga
 # the right runtime behaviour (a version skew must not halt every lane) and exactly why the missing file
 # must be a DIVERGENCE here: "degraded loudly" is still degraded, and this arm is the only place an
 # operator is told BEFORE the first stalled lane that the bound is not installed.
+# ⛔ `cell-lane-preflight.sh` IS HERE ON THAT SAME TEST, ONE GATE LATER (#2935). `run_agent` executes
+# `$O/cell-lane-preflight.sh` — the capability gate — immediately before EVERY launch, and `install.sh`
+# seeds it into `$O` on that basis. A `$O` without it does not crash: it degrades to a WARN and a
+# probe-less spawn, so the box keeps dispatching lanes it cannot finish — the exact waste the gate
+# exists to stop — and nothing else in this file would say so. It is presence-required for the SAME
+# reason `lane-bound.sh` is: the file the harness RUNS from `$O` is the file an installed box must
+# carry. (The byte comparison is already covered: `DEPLOY_SET` globs every shipped `*.sh`.)
 
 FORKS=(); O_DIR=""; REQUIRE_TARGET=0; QUIET=0
 while [ $# -gt 0 ]; do
