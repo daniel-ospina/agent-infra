@@ -90,7 +90,8 @@ that GAINED five runners in a week silently lost its headroom and nothing measur
 * discovery is a bounded, documented glob list: `/opt/gh-runner*/_work`, `$HOME/actions-runner*/_work`,
   `/tmp/actions-runner*/_work` (`DISK_REAPER_RUNNER_GLOBS`);
 * **the gate is mtime over the entry and its content**: an entry is a candidate only when **nothing in
-  it has been written for longer than `DISK_REAPER_RUNNER_MIN_AGE`** (default 3600 s), the entry's own
+  it has been written for longer than `DISK_REAPER_RUNNER_MIN_AGE`** (default 7200 s — the only
+  empirically validated value; it was 3600 s, half of it), the entry's own
   top directory included — the conservative direction, since any write there restores the floor. The
   in-entry witness is the checkout's OWN writes; `_work/_temp` (step scripts, command logs) is a SIBLING
   OF THE CHECKOUT **inside `_work`** — the vendor resolves `Temp` as `Combine(Work, "_temp")`
@@ -104,9 +105,10 @@ that GAINED five runners in a week silently lost its headroom and nothing measur
   a job that writes NOTHING inside its checkout for longer than the floor is indistinguishable from a
   dead entry by that test — a whole-job exposure for a job whose artefacts land in `$TMPDIR`,
   `~/.cache` or `_work/_temp`, not just one quiet step. Raise the floor for such a box
-  (`DISK_REAPER_RUNNER_MIN_AGE=7200`, the only empirically validated value; the shipped default is
-  3600 s), which is
-  the intended response;
+  (`DISK_REAPER_RUNNER_MIN_AGE=7200`), which is
+  the intended response — note that 7200 s **is** the shipped default (the only empirically validated
+  value: the 120-minute hand reap that took c1 98 % → 90 % with no job disturbed). The shipped default
+  was 3600 s, half of it, in a class armed by default and installed with `--apply`;
 * **the runner's whole `_work` namespace is DELIBERATELY RETAINED**, derived from ONE table in the owner
   (`_temp` = the live job's `$RUNNER_TEMP`; `_actions`/`_tool` = the cross-job caches, so reaping them
   does not free dead checkout — it forces a re-download on the NEXT job and makes every later CI run

@@ -28,7 +28,8 @@ only code that deletes:
 | `venv` | `scripts/reap-lane-venvs.sh` (#1932 / #1949) | per-worktree `.venv`s whose lane is gone, proven by three liveness witnesses; fail-closed |
 | `worktree` | `scripts/pi-reap-worktrees.sh` (#1095) **+** `scripts/reap-abandoned-worktrees.sh` (#2542) | the first arm: clean, reachable, holder-free checkouts; merged heads are exempt from the 7-day floor. The second arm: abandoned LINKED worktree directories under a scratch root — age > 180 min **and** no live process's cwd/exe inside (see *The two classes that were missing* below) |
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
-| `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 3600 s), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
+| `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 7200 s — the only empirically validated value;
+the shipped 3600 s was half of it), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
 
 ## Why one entry point
 
@@ -269,11 +270,16 @@ and the remedy is a re-stamp, never a green summary. The file list is the set th
 **pins** (`Environment=*_REAPER=` **plus** `Environment=BOUNDED_LIB=`, the watchdog every bounded fork
 goes through — absent, the reaper refuses to start — **plus `lib/live-paths.sh`**, the shared
 process-census code two pinned delegates `exit 3` without), written once in the checker, and the record is
-**reconciled** against it every run, so a file the unit executes cannot sit outside the check. A
+**reconciled** against it every run, so a file the unit executes cannot sit outside the check. ⛔ **The
+`rm -rf` owner is in that set** (`reap-runner-work.sh`): it was the one pinned delegate outside it, so a
+cell still carrying an EARLIER farmed copy — one revision of which deleted a LIVE job's `_work/_temp` —
+was a live delete-policy no instrument hashed while the check exited 0 with `same …` for every file it
+knew. A
 pinned file the stamp recorded `missing` and that is **still absent** is `DRIFT` (exit 1): stamping an
 empty directory must not certify a deployment that cannot execute. `disk-reaper-deployed-check.test.sh` drives every
 branch to its red path (D2 a one-byte change, D3 a missing delegate, D5 `SOURCE-DRIFT` for the
-153-commit shape, D6 a checkout that cannot explain the file, D7/D8 unstamped, D9 usage) — a checker
+153-commit shape, D6 a checkout that cannot explain the file, D7/D8 unstamped, D9 usage, D13 the
+delete-policy owner missing from the deployed set) — a checker
 that cannot fail would certify a stale deployment.
 
 ## The two classes that were missing (#2542)
@@ -397,7 +403,24 @@ headroom.
   glob list set EXPLICITLY that matches NOTHING is `misconfigured` + `?` (see below).
   ⚠️ Globs expand ONE level as written: a layout nesting the install one directory deeper
   (`/tmp/actions-runner/<name>/_work`) needs `*/*` in the pattern.
-* **The gate is CONTENT mtime** — `DISK_REAPER_RUNNER_MIN_AGE` (default **3600 s**). A `_work` entry is a
+* ⛔ **A matched root whose BASENAME is not `_work` is REFUSED, by name, and the pass exits 3.** This is
+  the last gate before `rm -rf` and it was missing: a seam ONE COMPONENT SHORT — `/opt/gh-runner*/`
+  instead of `/opt/gh-runner*/_work` — matched the runner INSTALL tree and swept `bin/`,
+  `config/`, `externals/` (**measured: `REAPED …/gh-runner-x//bin`**), and the mtime floor offers NO
+  protection there because an install tree is ALWAYS older than any floor — the very test that is this
+  class's proof of death is what makes the install look dead. One character in a rendered unit would have
+  destroyed the CI hosts. Refused rather than silently skipped: sweeping the roots it did find and
+  reporting a healthy population would hide a wrong layout assertion, which is the same
+  explicit-vs-default rule the glob list gets. The count is on the class line as `refused=<n>`, so "why
+  did this pass do nothing" is answerable.
+* **A root named by more than one glob is swept ONCE.** `--glob` is repeatable, so a wildcard and a
+  literal naming the same root is a normal operator spelling; without a seen-set the root was swept per
+  glob and the population was reported at twice its size (`roots=2 candidates=2` for one entry, the same
+  `WOULD-REMOVE` path logged twice) — a count that is a function of how an operator spelled the list
+  is not a measurement. The skip is NAMED, so a dedupe cannot be mistaken for a root that never matched.
+* **The gate is CONTENT mtime** — `DISK_REAPER_RUNNER_MIN_AGE` (default **7200 s**, the only empirically
+  validated value; it was 3600 s, half of it, until a review of this class measured the consequence). A
+  `_work` entry is a
   candidate only when **nothing under it has been written for longer than the floor**. The in-entry
   witness is the **checkout's own writes** (outputs, build artefacts, `.venv`/`node_modules`, any file a
   step creates under the checkout) — NOT `_work/_temp`: the vendor resolves every runner-private
@@ -433,9 +456,11 @@ headroom.
   exposure for any job whose artefacts land in `$TMPDIR`, `~/.cache` or `_work/_temp` (i.e. every step
   after checkout), not merely "one long quiet step". Raise the floor for such a box
   (`DISK_REAPER_RUNNER_MIN_AGE=7200`) — that is the intended response. The only empirically validated
-  floor is **7200 s** (the 120-minute hand reap that took c1 98 % → 90 % with no job disturbed); the
-  shipped **3600 s** is deliberately more aggressive, so price the difference before adopting it on a
-  box whose jobs write outside the checkout.
+  floor is **7200 s** (the 120-minute hand reap that took c1 98 % → 90 % with no job disturbed), and
+  **that is now the SHIPPED default at both layers** — it was 3600 s, HALF the validated value, in a
+  class that is in the default `--only` list and whose installed `ExecStart` carries `--apply`, so the
+  aggressive side of a measured trade was what ran on every box when nobody read this paragraph. A
+  default is not a suggestion here: it is what runs.
   ⛔ **RAISING THE FLOOR IS A LOAD-BEARING INSTRUCTION, SO THE FLOOR IS BOUNDED — and it was not.**
   The paragraph above tells an operator to raise it, and until this was fixed that instruction could
   delete the very work it was meant to protect. The owner validated its floor with `num()` alone
@@ -521,6 +546,19 @@ headroom.
   whose listing cannot be read is now counted into the SAME `unmeasurable=` field
   (`reason=unlistable`, named per root), so `candidates=` still reports what WAS seen while
   `unmeasurable=` names what was not. Case **(l)** pins it, with its own mutant.
+  ⛔ **AND THE ABSTENTION IS NOW A CENSUS AND A VERDICT, not only a note — added after a second reviewer
+  measured the same hole one state further on.** Counting the root into `unmeasurable=` was the right
+  ANSWER and the wrong RECORD: with nothing readable, `candidates=` stayed 0 from a census that still
+  read `ok`, so the entry point lifted `candidates_runner_work=0 verdict_runner_work=ok` and a box whose
+  sink fills behind a permission mismatch read HEALTHY for ever — `fleet-health.py` alarms on the
+  record's `ok`, not on `note_`. The owner now publishes **`census=abstained`** when `unmeasurable>0`
+  and `candidates=0`, and the entry point records **`candidates_runner_work=?`** with
+  **`verdict_runner_work=abstained`**. The pass still exits **0**: an abstention is not a failure of the
+  pass, it is the pass saying it could not look, and an hourly red for a permission mismatch is the
+  alarm-fatigue shape this family forbids — the RECORD is the alarm channel. Case **(l)** asserts the
+  owner's token, the record's `?`, and the distinct verdict separately, with a mutant for each half
+  (`l2` the owner's census, `l3` the entry point's mapping), because either half alone leaves one
+  surface lying.
 * **A class that scanned NOTHING is not a pass.** With the globs set EXPLICITLY and no directory
   matching, the owner reports `census=no-roots` and the class records `misconfigured` +
   `candidates_runner_work=?`, exit 3 — the same rule (and shape) as `venv-no-repo`. With the DEFAULT
@@ -1035,8 +1073,10 @@ which has no `DRY-RUN` rows to count — records `candidates_uv=?`), and `duplic
 own `SUMMARY … candidates=<n>` did not answer (that delegate prints it in BOTH modes, so an armed pass
 normally CAN answer). `runner-work` (the fifth, added 2026-10-28) is in that same position — its owner
 prints `SUMMARY class=runner-work … candidates=<n> … census=ok` in BOTH modes, so an armed pass answers
-a real count, and `census=no-roots` (an EXPLICIT glob list that matched nothing) is `misconfigured` +
-`?` rather than a `0`.
+a real count; `census=no-roots` (an EXPLICIT glob list that matched nothing) is `misconfigured` + `?`
+rather than a `0`; and **`census=abstained`** (nothing under a matched root could be read, so the
+population was never measured) is `?` plus `verdict_runner_work=abstained` at rc 0 — a zero nothing
+measured is not a zero.
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable
@@ -1184,22 +1224,18 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **14 cases and 19 mutants,
-33 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **17 cases and 26 mutants,
+43 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
 against the PRE-CHANGE tree (the base commit's
-`disk-reaper.sh` beside this owner) it reports **12 passed, 21 failed, 1 skipped**, and against this tree
-**33 passed, 0 failed, 3 skipped**: the discrimination is measured both ways, not asserted. (The 21 red on
-the pre-change tree are cases (a)—(h), (j), (k), (l) and (n) plus the **nine** entry-point mutants that cannot even
-be applied there, because the arms they edit — including the `verdict_runner_work=` record line, the
-`unmeasurable_runner_work=` `?` polarity added at this revision, the `--min-age` relay that carries the
-class's floor, and the `$_rw_line` guard that keeps a cut-short sweep from publishing a partial count —
-do not exist in that `disk-reaper.sh`;
-(i), (k)'s owner-side mutant, (j)'s two owner-side mutants, (l)'s owner-side mutant, (m) and its mutant (whose
-subject is the OWNER's own floor seam, so the base entry point cannot affect them) and the owner-side
-mutants of (a)—(c)/(h) stay
-green, which is the correct answer for a case whose subject is the owner.)
+`disk-reaper.sh` beside this owner) it reports **31 passed, 12 failed, 3 skipped**, and against this tree
+**43 passed, 0 failed, 3 skipped**: the discrimination is measured both ways, not asserted. (The 12 red on
+the pre-change tree are cases **(a)**, **(l)**, **(o)**, **(p)** and **(q)** — the five cases whose subject
+is an arm added at THIS revision (the shipped floor asserted at both layers, the abstention census/verdict,
+the root-name gate, the root dedupe, and the emptied-`EXPLICIT` refusal) — plus the **seven** mutants that
+cannot even be applied there, because the arms they edit do not exist in that tree. Everything else stays
+green, which is the correct answer for a case whose subject is unchanged by this revision.)
 
 ⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement — BY THE SUITE THAT ACTUALLY ASSERTS IT.**
 The class's **record fields** at the ENTRY-POINT level (`freed_mb_runner_work=`,
@@ -1237,7 +1273,7 @@ reaps" was false in each clause. What was actually missing, stated so a reader c
 `--print-status` — the field's only READER — had **no assertion at all** anywhere in the suite (the only
 `print-status` reference in `runner-work.test.sh` is the one added at this revision). So it now reads `ok`
 on case (b)'s reaping pass (measured at this head), `--print-status` is asserted to RENDER it, and deleting
-the record line turns case (b) red: that mutation is (b)'s second, counted among the 18 above.
+the record line turns case (b) red: that mutation is (b)'s second, counted among the 26 above.
 The classes suite was **killed at 30 minutes with no result** on the box that measured this PR (load
 180–220), so at that point the record-field delta was **unmeasured** and a green run of the owner-level
 suite below could not be read as covering it. It was then **run to completion at load ~15 on the same
@@ -1245,7 +1281,7 @@ suite below could not be read as covering it. It was then **run to completion at
 pass is preserved, `reason=toctou`) — the same case and the same count as the pre-change baseline, i.e.
 pre-existing and not this class's. That tally is recorded here as what it is — the classes suite's own
 result, on the fields it actually asserts — and **not** as this class's evidence, which it never was. The
-record fields are MEASURED at this head by case (b) (`33 passed, 0 failed, 3 skipped` at this head on this
+record fields are MEASURED at this head by case (b) (`43 passed, 0 failed, 3 skipped` at this head on this
 box — it has real runner roots, so the (f) default-glob arm is skipped by name; the earlier
 `0 skipped` row was taken on a laptop and is not restated as this head's); the caveat that
 stood here for one revision is recorded rather than dropped silently, because "we could not measure it"
@@ -1255,13 +1291,13 @@ The measured transcript, `./scripts/disk-reaper-runner-work.test.sh`, at this he
 real runner roots (so the (f) default-glob arm is skipped by name, three times):
 
 ```
-  33 passed, 0 failed, 3 skipped
+  43 passed, 0 failed, 3 skipped
 ```
 
 and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 
 ```
-  12 passed, 21 failed, 1 skipped
+  31 passed, 12 failed, 3 skipped
 ```
 
 **The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
@@ -1273,7 +1309,7 @@ on a box told to have real runner roots so the skip path is taken (`<entry>` is 
 `mut-f` and `mut-u` are the mutant copies the suite makes in its own `$T`):
 
 ```
-  33 passed, 0 failed, 3 skipped
+  43 passed, 0 failed, 3 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-u/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
@@ -1284,7 +1320,7 @@ on a box told to have real runner roots so the skip path is taken (`<entry>` is 
 independent count of arms that did not run: `skip()` neither increments nor decrements `PASS` — it records
 a reason in a file the outer runner reads at the end — and the arm's own pass line still lands, because the
 assertions beside the skip (the source check of the documented default list) still run. So
-`33 passed … 3 skipped` reads as **33 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
+`43 passed … 3 skipped` reads as **43 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
 `passed + skipped` legitimately EXCEEDS 33. ⛔ **A transcript is therefore never "corrected" on the grounds
 that `passed + skipped` exceeds the outcome count.** An earlier revision of this section did exactly that,
 on the false premise that a skip must displace a pass, and replaced a correct transcript with
@@ -1297,7 +1333,7 @@ three times, and "the same two skips" was already stale when it was written.
 
 | case | proves | mutant that must turn it red |
 |---|---|---|
-| (a) | a YOUNG `_work` entry is neither counted nor reaped — in `--dry-run` AND `--apply` — and the entry point's floor is **RELAYED, not hardcoded**: every other assertion in this case is satisfied by an entry point that ignores `DISK_REAPER_RUNNER_MIN_AGE` and hands the owner a literal 3600 (the default and the literal are the same number), so the case also drives the seam to **60 s** and requires the 5-minute entry to become a candidate while the 0 s one stays kept — i.e. an operator RAISING the floor on a box whose jobs write outside the checkout must actually get the higher floor, or the class keeps deleting | the owner's floor reference becomes `now`; and, separately, the entry point's `--min-age "$RUNNER_MIN_AGE"` becomes `--min-age 3600` (the inert-knob shape) |
+| (a) | a YOUNG `_work` entry is neither counted nor reaped — in `--dry-run` AND `--apply` — and the entry point's floor is **RELAYED, not hardcoded**: every other assertion in this case is satisfied by an entry point that ignores `DISK_REAPER_RUNNER_MIN_AGE` and hands the owner a literal 3600 (the default and the literal are the same number), so the case also drives the seam to **60 s** and requires the 5-minute entry to become a candidate while the 0 s one stays kept — i.e. an operator RAISING the floor on a box whose jobs write outside the checkout must actually get the higher floor, or the class keeps deleting. ⛔ **AND THE SHIPPED DEFAULT IS ASSERTED, at BOTH layers** — added after a reviewer measured that every other arm passes the floor in, so the default was covered by nothing: a 90-minute entry (sitting BETWEEN 3600 and 7200) must be KEPT with no seam and the line must read `min_age=7200s`, driven once through the entry point and once through the owner directly, because the entry point RELAYS `--min-age` and would hide a halved owner default | the owner's floor reference becomes `now`; separately the entry point's `--min-age "$RUNNER_MIN_AGE"` becomes `--min-age 3600` (the inert-knob shape); and separately each LAYER's shipped default is halved back to 3600 |
 | (b) | an OLD entry is counted in dry-run and REMOVED by `--apply`, reported as a `df` delta with a numeric record field; a second pass claims no un-caused delta; and the record carries `verdict_runner_work=ok` **and** `--print-status` RENDERS it (this case is the instrument for the class's record fields) | the `-newer` test is dropped from the walk; and, separately, the `verdict_runner_work=` line is deleted from the pass record |
 | (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the `retain` ROWS are deleted from `WORK_LAYOUT` **and** the vendor-namespace default disabled (they are one arm, because the prefix default alone would still keep them) |
 | (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one — whose record then answers `unmeasurable_runner_work=not-run`, the documented polarity for an unselected class, never a number | `want_class runner-work` → `true` |
@@ -1308,9 +1344,12 @@ three times, and "the same two skips" was already stale when it was written.
 | (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |
 | (j) | **a LIVE job's `_temp` is never a candidate**: `_work/_temp` — the vendor's `Combine(Work, "_temp")`, written once per step, so it goes stale while the checkout beside it stays fresh — SURVIVES a stale floor and is named (`reason=live-job-temp`); a vendor directory the table has never seen also survives and is named (`reason=vendor-namespace-unlisted`); and a genuinely dead checkout in the SAME pass is still reaped. This is the shipped defect the reviewer measured — a `REAP` row for `_work/_temp`, with the checkout gate working perfectly, which the disclosed residual does not cover | the `_temp` row is deleted (the prefix default still keeps the directory, so the case pins the ROW by its reason); and, separately, the vendor-namespace default is disabled |
 | (k) | **a `reap` ROW is honoured — the table's OTHER disposition is not inert**: a `_foo|reap|…` row is injected into a copy of the owner, and `_work/_foo` is REAPED (a `REAP`/`REAPED` row names it), while the four `retain` rows still hold at the same age with their own reason strings, an UNDECIDED dead checkout beside them is reaped in the same pass, and the pass record names the decided row (`reaped-by-table=_foo`). Measured before the fix: `_foo` came back `RETAINED … reason=vendor-namespace-unlisted` — "no WORK_LAYOUT row" about a name whose row was in the table — while its `job-dead` control was reaped, i.e. the disposition the script and this doc tell an operator to write was inert AND the log named the wrong cause | the table lookup is filtered to `retain` (the shipped bug: a `reap` row then matches nothing and falls through to the `_`-prefix default) |
-| (l) | **a root that cannot be LISTED is an abstention, never a measured zero.** `_work` is set to mode 0111 (stat-able and traversable, NOT listable) with a dead entry under it; the glob then expands to itself and reaches no entry. The pass must count `roots=1 candidates=0 unmeasurable=1`, EXIT 0 (an abstention is not a failure), NAME the root (`reason=unlistable`), carry it into the record as `unmeasurable_runner_work=1`, and — because nothing was classified — the dead entry must SURVIVE. Before this arm the same fixture reported `unmeasurable=0 census=ok`, exit 0, `verdict_runner_work=ok`: an inert class reading healthy. ⚠️ Skipped by name (not passed) when the suite runs **as root**, because `chmod` cannot deny root and the condition cannot be made | the `[ "$_seen" = 0 ] && ! root_is_listable "$root"` guard is deleted, restoring the measured-zero reading |
+| (l) | **a root that cannot be LISTED is an abstention, never a measured zero.** `_work` is set to mode 0111 (stat-able and traversable, NOT listable) with a dead entry under it; the glob then expands to itself and reaches no entry. The pass must count `roots=1 candidates=0 unmeasurable=1`, EXIT 0 (an abstention is not a failure), NAME the root (`reason=unlistable`), carry it into the record as `unmeasurable_runner_work=1`, and — because nothing was classified — the dead entry must SURVIVE. ⛔ **AND THE ZERO MUST NOT LAND AS A MEASUREMENT**, which is what a reviewer found at this head: the owner now publishes `census=abstained`, the record answers `candidates_runner_work=?` and `verdict_runner_work=abstained`, and the class line carries the same `?` — before this, the same fixture recorded `candidates_runner_work=0 verdict_runner_work=ok` and an INERT class read healthy. ⚠️ Skipped by name (not passed) when the suite runs **as root**, because `chmod` cannot deny root and the condition cannot be made | the `[ "$_seen" = 0 ] && ! root_is_listable "$root"` guard is deleted, restoring the measured-zero reading; separately the owner's `census=abstained` arm is removed (the false PASS returns); and separately the entry point's `VERDICT_RW=abstained` override is removed (an abstention reports `ok` again) |
 | (m) | **an OUT-OF-RANGE floor is REFUSED, and a leading-zero floor is NORMALISED** — the floor is the only gate on a `rm -rf`, so its refusal path is load-bearing: `--min-age 18446744073709551616` (2^64) is all-digits, `now − 2^64` WRAPS to `now` in bash's 64-bit arithmetic, the floor ref lands at NOW and every entry is older than it — **measured: a 5-minute-old entry `REAPED` under a floor set to "keep everything"**, the log asserting a flat falsehood about its age; and `--min-age 08` passed the digit check, then `$(( ))` died on the octal spelling, the floor became unusable, and the pass still exited **0** with `census=ok` calling every entry `reason=unreadable` — a bad knob reported as a filesystem problem. The case drives the **OWNER directly**, because the entry point already bounds its own seam and exits 3; the owner's `--min-age` / `REAP_RW_MIN_AGE` was bounded by nothing. Asserts rc 2, the cause named, the entry SURVIVED, no `census=ok`, and that `08` normalises to `min_age=8s` rather than aborting | the magnitude bound `[ "${#_rw_floor_norm}" -gt 9 ]` is disabled, restoring the wrap that deletes |
 | (n) | **a CUT-SHORT sweep publishes no PARTIAL candidate count.** The owner prints its `SUMMARY` unconditionally on every path that reaches the end of a pass, and it deliberately refuses to truncate a `--dry-run` ("a partial count presented as a total, which is the false-measurement shape this class's own `census=` refusal exists to prevent"); the ENTRY POINT then bounds the delegate with `CLASS_TIMEOUT`, so the rows a cut-short dry pass printed first ARE a partial count. Driven with a STUB owner that emits two `REAP` rows and no ledger — the observable shape of that cut, not a race against a real `timeout`, which flakes under load on exactly the box this class exists for. Asserts the record answers `candidates_runner_work=?` and NEVER a number, that the class line carries the same `?`, and that the rows it did scan are still NAMED as `WOULD-REMOVE`, so nothing an operator needs is lost | the `&& [ -n "$_rw_line" ]` guard on the dry-run row-count fallback is dropped, restoring the shipped fallback that turns partial rows into a total |
+| (o) | **THE LAST GATE BEFORE `rm -rf` IS THE ROOT'S NAME, and it was missing.** The root loop tested only `-d` and `! -L`, so a seam ONE COMPONENT SHORT (`/opt/gh-runner*/` instead of `/opt/gh-runner*/_work`) matched the runner INSTALL tree itself and swept `bin/`, `config/`, `externals/` — **measured: `REAPED …/gh-runner-x//bin`** — and the floor offers NO protection there, because an install tree is ALWAYS older than any floor, so the very mtime test that is this class's proof of death is what makes the install look dead. One character in a rendered unit would have destroyed the CI hosts. A matched root whose BASENAME is not `_work` is now REFUSED BY NAME and the pass exits 3 (a wrong layout assertion is loud, not a healthy population over the roots it did find); the fixture carries a real `bin/Runner.Listener` + `config/` tree aged 600 min, asserts both SURVIVE, and the control re-runs the SAME box with the correct seam to prove the refusal is about the name and not about sweeping nothing | the basename `case` label is pinned to `_work`, so the refusal arm can never fire — and the mutant then REAPS the install tree (`reaped=2` of `bin`/`config`), which is the deletion this guard exists to stop |
+| (p) | **a root matched by TWO globs is swept ONCE.** `--glob` is repeatable, so a wildcard and a literal naming the same root is a normal operator spelling, and there was no root dedupe (`rw_df_targets` dedupes filesystems; this loop deduped nothing): measured `roots=2 candidates=2` for ONE entry with the same WOULD-REMOVE path logged twice — a population reported at twice its size and a to-free figure doubled by a spelling. A seen-set (a string, because bash 3.2 has no associative arrays) now dedupes roots and NAMES the skip, so a dedupe cannot be mistaken for a root that never matched | the `case " $SEEN_ROOTS "` guard is replaced by one that never matches, so the same root is swept once per glob and both counts double |
+| (q) | **a SET-but-EMPTY `REAP_RW_EXPLICIT=` is a REFUSAL.** `${REAP_RW_EXPLICIT-0}` is right to keep UNSET distinct from SET — but a set-and-EMPTY value yields `""`, which is neither `1` nor `0`, so every `[ "$EXPLICIT" = 1 ]` read FALSE and an explicitly-asserted layout that matched nothing reported a MEASURED EMPTY POPULATION (`census=ok`, rc 0) instead of `census=no-roots` (rc 3) — the third spelling of the fail-open case (i) fixed, reopened through an emptied seam. A template that renders `REAP_RW_EXPLICIT=` must not disarm the assertion it carries. Asserts rc 3, the seam named, no census published, and the `EXPLICIT=1` control reaching the documented `no-roots` route | the `case "$EXPLICIT"` scrutinee is pinned to `0`, so the `0|1` arm is taken for every value and the emptied assertion is silently read as "not explicit" |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
