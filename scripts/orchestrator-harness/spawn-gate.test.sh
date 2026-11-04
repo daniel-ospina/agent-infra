@@ -1152,7 +1152,11 @@ ck "lane.sh NAMES the disk gate on a disk refusal" $rc
 # run this work) while `land` is not — so collapsing it into `load` would be right by luck and
 # collapsing it into `disk` would hold the issue for a whole yield window on a peer that is fine.
 : > "$PI_LOG"; : > "$RO/logs/lane-9999.log"; rm -f "$RO/state/capacity-refused-9999"
-( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
+# ⛔ FROM THE WORKTREE ON `work`, NOT FROM `$RREPO` (#2762 x #2387). `$RREPO`'s HEAD is `main`, so
+# running this arm from there made the BRANCH half of `repo-target.sh`'s identity assertion refuse 72
+# BEFORE the memory gate was reached — the arm then asserted 81 and read 72, which is that gate, not
+# this one. Same fixture rule the load and disk arms above already follow.
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
 [ "$lrc3" -eq 81 ]; rc=$?

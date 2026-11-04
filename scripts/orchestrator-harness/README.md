@@ -3455,7 +3455,8 @@ already holding):
   remedy is a restart or a drain from OUTSIDE, never a wait; and #2387's `mem`, which the spawn gate may
   hold), and the transfer is driven by the refusal event. Load
   is a symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is
-  also why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
+  also why a lowering of `MAX_LOAD` — the ×8 change proposed in #1907, closed unmerged 2026-10-22 — could
+  not have moved a single item. ⚠️ NOTE what the record
   can carry: the WORKER gate binds on **load, memory, disk, land or fork** (`spawn-gate.sh`), so those are
   the five values field 3 can ever hold (`mem` is #2387's memory refusal); the lanes/swap terms — and the
   CONTROLLER's own memory arm, which compares `mem_avail` against `MIN_MEM_FREE_MB`, a different floor for
