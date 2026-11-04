@@ -189,7 +189,9 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
   because it survives a pass that stops early. It is deliberately NOT a `problem`: `problems` sets
   `verdict="action-failed"` above the starvation
   branch, so a standing lost slot reported there would DELETE `starvation` and return exit 3 on a
-  box that owes the starved exit 4 — the alarm muted by the condition it exists to report. It is
+  box that owes the starved exit 4 — the alarm muted by the condition it exists to report. It gets
+  its OWN verdict (`config-lost`, exit 6) placed BELOW the starvation branch, so the slot is loud
+  without ever muting the queue alarm; a box that needs a human must not read as "nothing to do". It is
   derived from the classification at record-build time, so it is present (and NAMES the slot) on
   passes that stop early — a `--want` refusal included. Read it as "this slot is dead until a
   human re-registers it", not as "the box is short a runner": its listener may still be live and
@@ -229,6 +231,11 @@ EXIT  0 converged / nothing to do, or a CAPACITY ANSWER that is not a failure (`
         path, or more than one ExecStart= on a non-oneshot type) — or an audit that read nothing at
         all. A READ-ONLY finding, deliberately distinct from 3: a consumer keying on "an action
         failed" must not confuse it with "my units are misconfigured".
+      6 an install's `.runner` config was DESTROYED (a 0-byte file). The pass COMPLETED and the box
+        WAS measured — so this is deliberately not 2 — but the slot holds no agentName and no URL,
+        so this tool cannot re-register it: it stays dead until a human does. Placed BELOW
+        STARVATION, so a starved box still exits 4; everything below it in the verdict chain is
+        exit 0, because a box that needs a human is not "nothing to do".
       A pass whose provisioner refuses while THIS tool's disk arm says one more runner fits reports
       the verdict `guard-conflict` (exit 3, both sides' numbers in the notes): the two guards answer
       different questions, and the disagreement is a decision for a human, not an action failure.
@@ -3156,10 +3163,14 @@ def converge(
     # target. `name_owner` is derived from `local`, which is that same sorted list.
     by_name: dict[str, list[str]] = {}
     for r in local:
-        if not r.name:  # a CONFIG-LOST install has no name to deduplicate on
-            continue
         by_name.setdefault(r.name, []).append(str(r.directory))
     duplicates = {name: dirs for name, dirs in by_name.items() if len(dirs) > 1}
+    # ⛔ THERE IS NO `""` GUARD HERE, AND ADDING ONE BACK WOULD BE DEAD CODE (#3355 review P2). It
+    # reads like it prevents a CONFIG-LOST install from being deduplicated, but `_read_runner_config`
+    # raises on an empty `agentName` (`:587`), so `r.name == ""` iff `r.config_lost` — and every
+    # CONFIG-LOST entry `continue`s below, BEFORE `duplicates` is ever consulted (its only consumer is
+    # the duplicate check inside this loop). A `""` key can therefore sit in `by_name` and never be
+    # read: measured, replacing the old guard with `if False:` left the suite byte-identical.
     for c in classified:
         if c["state"] == "CONFIG-LOST":
             # Reported (in `record["config_lost"]` + `notes`, both filled at record-build time) and
@@ -3719,6 +3730,29 @@ def converge(
             "between what the jobs ask for and what the runners advertise (labels/arch/gate), not a "
             "lack of capacity (agent-infra#2875)"
         )
+    elif record.get("config_lost"):
+        # ⛔ A BOX WHOSE ONLY FAULT IS A DESTROYED CONFIG MUST NOT REPORT HEALTHY (#3355 review).
+        # `config_lost` is deliberately NOT a `problem` — that branch sits ABOVE the alarm and would
+        # mute exit 4 — so before this verdict existed the only machine channel for a lost slot left
+        # the verdict chain untouched: a box with a 0-byte `.runner` and nothing else wrong fell
+        # through to `at-ceiling` and **exit 0**, byte-identical to a fully converged box, for an
+        # install no pass can repair and only a human can re-register. The pre-exemption behaviour
+        # was loud by ACCIDENT (the pass did not complete, it ABORTED as `unmeasurable` → exit 2,
+        # which is why 42 consecutive systemd passes failed) and that loudness must not be traded
+        # away as the price of the exemption.
+        # ⛔ PLACED BELOW `starvation` ON PURPOSE. Both exits are non-zero, and exit 4 is the one
+        # exit a health check pages on, so the new verdict must never be the thing that mutes a
+        # starved queue (T57 pins both the single-fault exit and this precedence). Everything BELOW
+        # this line is exit 0 under the contract, so a lost config outranks all of it: a box that
+        # needs a human is not "nothing to do".
+        record["verdict"] = "config-lost"
+        record["error"] = (
+            f"CONFIG-LOST: {len(record['config_lost'])} install(s) carry a DESTROYED config "
+            f"({', '.join(record['config_lost'])}) — a 0-byte `.runner` holds no agentName and no "
+            "URL, so this tool cannot re-register it and the box cannot converge until a human "
+            "does. Nothing was changed for that slot; its listener may still be up and is still "
+            "counted in `running`/`live`"
+        )
     elif record.get("problem_kind") == "refusal":
         record["verdict"] = "provisioner-refused"
     elif live > ceil:
@@ -4024,7 +4058,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"starvation={record['starvation']}")
         if record.get("refusal"):
             print(record["refusal"], file=sys.stderr)
-        if record["verdict"] == "starvation":
+        if record["verdict"] in ("starvation", "config-lost"):
             print(record.get("error", ""), file=sys.stderr)
         print(f"verdict={record['verdict']}")
     if record["verdict"] == "refused":
@@ -4035,6 +4069,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if record["verdict"] == "starvation":
         return 4
+    if record["verdict"] == "config-lost":
+        return 6
     return 0
 
 

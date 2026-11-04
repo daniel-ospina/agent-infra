@@ -4395,10 +4395,42 @@ def t57_empty_runner_config_does_not_abort_the_pass():
                 real.get("config_lost") == [lost],
                 f"a real pass names the lost slot too: {real.get('config_lost')}",
             )
+            # ⛔ THIS ASSERTION USED TO BE UNFALSIFIABLE (#3355 review P2). It read
+            # `record["verdict"] not in ("unmeasurable",)`, which no mutation of this diff could
+            # ever make red: `unmeasurable` needs `record["unverified"]`, and that is set only when a
+            # MEASUREMENT fails after a restart or an install — while this fixture has no DEAD entry
+            # to restart, so the flag can never be raised. "The pass completed" was already proven by
+            # `converge` returning at all. It is now the assertion the design gap needs instead: the
+            # lost slot has its OWN non-zero verdict, and THAT is reachable by mutating the branch
+            # (`elif False:` → falls back to `at-ceiling`, exit 0).
             check(
-                record["verdict"] not in ("unmeasurable",),
-                f"the pass completed: verdict={record['verdict']}",
+                record["verdict"] == "config-lost",
+                "a box whose ONLY fault is a destroyed config must NOT report healthy — before this "
+                f"verdict it fell through to `at-ceiling`/exit 0: verdict={record['verdict']}",
             )
+            # ⛔ AND THE EXIT CODE, not just the word (#3355 review — the design gap). `config_lost`
+            # is deliberately not a `problem`, so with no verdict of its own it left the chain
+            # untouched: a box with a 0-byte `.runner` and nothing else wrong exited **0** — the same
+            # answer a timer gets from a fully converged box — for an install nothing but a human can
+            # re-register. The pre-exemption behaviour was loud by ACCIDENT (the pass ABORTED as
+            # `unmeasurable`, exit 2: the 42 consecutive failed systemd passes). 6 restores the
+            # loudness without claiming a measurement failed, because this pass measured the box fine.
+            rc, out = cli(box, "--root", box.root, "--want", "2")
+            check(rc == 6, f"a destroyed config must not exit 0 — got {rc}: {out[:400]}")
+            contains(out, "verdict=config-lost", "the human output")
+            contains(out, "CONFIG-LOST", "the cause a human reads")
+            # ⛔ AND STARVATION STILL WINS (exit 4). The lost-slot verdict is placed BELOW the
+            # starvation branch ON PURPOSE: exit 4 is the one exit a health check pages on, so the
+            # new non-zero verdict must never be the thing that mutes a starved queue. 53 queued
+            # against online-but-idle runners is the measured #2875 shape from T9.
+            box.queued(53)
+            rc, out = cli(box, "--root", box.root, "--want", "2")
+            check(
+                rc == 4,
+                f"starvation must KEEP exit 4 when a lost config also applies — got {rc}: {out[:400]}",
+            )
+            contains(out, "STARVATION", "the alarm is what the exit code names")
+            box.queued(0)  # disarm the alarm again: the rest of this case is about the lost slot
             # the mutation the exemption must not open: a NON-EMPTY garbage config still aborts.
             # Silently skipping it would let the provisioner read its slot FREE and add a second
             # install over the top of a registration that may be live.
@@ -5246,7 +5278,50 @@ MUTATIONS = [
         '            record["unverified_cause"] = "mid-pass-measurement"',
         "the mid-pass disk failure loses its own cause, so the rendered error blames an install",
     ),
-    # ── the CONFIG-LOST exemption: its only guard on the DESTRUCTIVE arm (#3355 review P1) ─────────
+    # ── the CONFIG-LOST exemption, ONE MUTATION PER ARM IT RESTED ON (#3355 review P1) ───────────
+    Mutation(
+        "T57",
+        # ⛔ THE LIVENESS LEG, WHICH IS THE ONE THE EXEMPTION ITSELF RE-OPENED (#3355 review P1). It
+        # is a SEPARATE mutation from the repair-arm one below because it defends a DIFFERENT arm:
+        # the guard mutation protects the DESTRUCTIVE arm (never `--replace` the empty name), this
+        # one protects the FILL DECISION (never add a runner to a box whose listeners are already
+        # spinning). Measured on the mutant: `live` drops 3→2 and the case reports
+        # `a spinning listener keeps its liveness even with a lost config: live=2`.
+        "                    alive=str(entry) in alive,",
+        "                    alive=False,  # MUTATION: the measured listener is discarded",
+        "a CONFIG-LOST install's listener is MEASURED as spinning but reported not-alive, so it drops "
+        "out of `running`/`live`: the pass under-counts the box and the fill loop then ADDS a runner "
+        "onto an already-full machine, on the core arm that does not read `live` at all — the round-2 "
+        "over-fill, re-opened by the exemption that was added to stop the pass aborting",
+    ),
+    # ── the `config-lost` VERDICT: the loudness the exemption nearly traded away (#3355 review) ──
+    Mutation(
+        "T57",
+        '    elif record.get("config_lost"):',
+        '    elif False:  # MUTATION: a destroyed config leaves the verdict chain untouched',
+        "a box whose ONLY fault is a 0-byte `.runner` falls back through the chain to `at-ceiling` "
+        "and exits **0** — byte-identical, to a 9-minute timer, to a fully converged box — for an "
+        "install no pass can re-register and only a human can — the `exit 0 for a box that needs a "
+        "human` half of the review's design gap",
+    ),
+    Mutation(
+        "T57",
+        '    elif starvation.get("state") == "starved":',
+        '    elif starvation.get("state") == "starved" and not record.get("config_lost"):',
+        "a lost config MUTES THE ALARM: a starved, 53-queued box that also carries one destroyed "
+        "`.runner` stops exiting 4 and exits 6 instead, so the one exit a health check pages on is "
+        "lost to a condition that is merely standing — the exact precedent `problems` was kept out "
+        "of the chain to avoid, and the reason `config-lost` must sit BELOW the starvation branch",
+    ),
+    Mutation(
+        "T57",
+        '    if record["verdict"] == "config-lost":\n        return 6',
+        '    if False:  # MUTATION: the verdict is published but the exit code stays 0\n        return 6',
+        "the verdict is CORRECT and the EXIT CODE is 0 — a 9-minute timer reads `config-lost` in the "
+        "log while the unit's own exit status says the pass was clean, which is the gap the review "
+        "named: nothing in the repo consumes `--json`, so the exit code is the only channel a "
+        "scheduler has",
+    ),
     Mutation(
         "T57",
         '        if c["state"] == "CONFIG-LOST":\n'
