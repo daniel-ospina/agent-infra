@@ -442,6 +442,17 @@ ck "an IDENTICAL reorder does not swap the file's inode, and a real one still do
 GQ="$TMP/guards"; mkdir -p "$GQ"
 printf '200\n300\n' > "$GQ/pool"
 mkdir -p "$GQ/absent-o" "$GQ/dir-o/candidates.txt"
+# ⛔ THE POOL GOES INSIDE EACH $o, WHERE THE DRIVEN CODE ACTUALLY READS IT (review P1, cycle 6).
+# `queue_order_from_pool` reads `$o/.pool`; the first version wrote ONE pool at `$GQ/pool` and drove
+# `$GQ/absent-o` / `$GQ/dir-o`, so in BOTH sub-cases the pass aborted at the POOL guard — one line
+# below the queue guard this check exists to pin — and the assertions were satisfied by the wrong
+# guard entirely. Measured: with the queue-shape guard DELETED the suite stayed `23 passed, 0 failed`,
+# so this check asserted nothing about it. With a pool present, the same mutant reports an ABSENT queue
+# as a MEASURED drained one, CREATES a 0-byte candidates.txt and exits 0 — the #1931 prohibition named
+# in this check's own title, unpinned. A fixture that never reaches the guard is a check about a path
+# the code does not take.
+cp "$GQ/pool" "$GQ/absent-o/.pool"
+cp "$GQ/pool" "$GQ/dir-o/.pool"
 {
   echo 'QUEUE_ORDER_STATE=""'
   cat "$FNS"
