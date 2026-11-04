@@ -567,11 +567,39 @@ fi
 # whose `$O` is the flat `scripts/orchestrator-harness/*` payload (the file lives one directory ABOVE
 # that) and whose launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile):
 # without it every at-risk lane recorded `rescue=UNAVAILABLE`, i.e. the rescue was loud and inert.
+# ⛔ THE GRAPH CLIENT IS FARMED HERE, AND THIS ARRAY IS THE ONLY DELIVERY OF IT (agent-infra#3253).
+# The owner's mandate (2026-11-02) — read the hosted Tortoise graph before researching, confirm
+# direction in it before implementing, write the learning after — was UNEXECUTABLE on every box but
+# the one it was written on, because `~/.pi/agent/scripts/tortoise-graph.sh` existed on no cell and
+# on no fresh Mac: it had been HAND-COPIED onto the cells that carried it. Measured the same hour:
+# cell-1's lane reported `GRAPH-UNREACHABLE(~/.pi/agent/scripts/tortoise-graph.sh: No such file or
+# directory)` — the lane behaved correctly, the DEPLOYMENT did not exist, and the next bring-up on a
+# fresh box would not have it either. A hand-copy is not a deployment (#3253; the same class as the
+# hand-copied harness §11 in cloud-cell-bringup.sh).
+#   * `tortoise_graph_client.py` is the EXECUTED half: `tortoise-graph.sh` runs it as the SIBLING
+#     `$(dirname "$0")/tortoise_graph_client.py`. Both farm FLAT into $DEST/scripts/, which is the
+#     layout that resolution needs — farming the .sh alone yields a client whose first call dies with
+#     `can't open file`, a loud failure but a needless one (the same sibling contract as
+#     lib_srcs/merge_gate_srcs above).
+#   * The CREDENTIAL IT NEEDS IS NOT DELIVERED BY THIS FILE, and saying so is part of the fix: the
+#     fleet has no secret store wired to it — `keys.env` on a cell and `pi-keys.env` on a Mac are
+#     PUSHED BY HAND. So `TORTOISE_MCP_API_KEY` must be present there for the mandate to run, and
+#     until it is, `cloud-cell-bringup.sh --check` WARNS by variable NAME (never its value) after the
+#     layer is installed, while the client itself fails CLOSED with `GRAPH-UNREACHABLE(NO-KEY)` when
+#     NEITHER name is set (it falls back to `TORTOISE_API_KEY` and lets the endpoint answer). That
+#     fallback name USUALLY carries the same token — `skills/research/SKILL.md` records it measured
+#     identical, Bearer -> 200 — so a box with only the alias may work fine; where the alias carries
+#     the REST token instead (`scripts/tortoise-memory.mjs`'s key, /v1/points), the MCP endpoint may
+#     REJECT it with HTTP 401. Neither outcome excuses leaving the MCP name unprovisioned.
+#     A silent skip is the one outcome worse than the outage; that is what these two lines prevent.
+#   * NOT a second client: `scripts/tortoise-memory.mjs` is the REST client (`TORTOISE_API_KEY`,
+#     /v1/points) the research skill uses. Different transport, different key, different failure
+#     contract — see scripts/tortoise-graph.sh's header.
 # agent-infra#2374 adds registry-sync.sh: `cloud-cell-bringup.sh` runs it (the farmed copy is the
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh tortoise-graph.sh tortoise_graph_client.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
