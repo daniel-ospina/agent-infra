@@ -72,6 +72,16 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # it under the pre-export PATH pins `_NCPU=4` and MAX_LOAD=40 for every cell — the exact #1702
 # failure the portable probe exists to prevent.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── THE TERMINAL RECORD (#2833), INSTALLED BEFORE ANYTHING HERE CAN REFUSE ──────────────────────────
+# Measured on cell-3 (agent-infra#2833): of 875 lane logs, 733 carried NO terminal line and only 2 a
+# `.rc` — so "how many lanes died, and did they get wedged and killed or killed without being wedged"
+# was unanswerable from the harness's own records. The record is installed FIRST, before the helper
+# sources below, because a lane that refuses at load time is still a lane the census must be able to
+# classify: an unrecorded refusal is indistinguishable from a lane that vanished.
+# ⛔ FAIL LOUD when the library is missing, for the reason every other source here does: a lane whose
+# record silently does not exist is the exact population this issue is about.
+. "$SELF/lane-terminal.sh" || { echo "[lane $N] FATAL: $SELF/lane-terminal.sh missing — refusing to start a lane whose termination nothing would record (#2833)" >&2; exit 78; }
+lane_terminal_install "$O" "lane-$N" || { echo "[lane $N] FATAL: lane-terminal.sh could not install the terminal record in $O (state/logs unwritable, or an EXIT trap was already set) — refusing to start a lane whose termination would go unrecorded (#2833)" >&2; exit 78; }
 . "$SELF/spawn-gate.sh" || { echo "[lane $N] FATAL: $SELF/spawn-gate.sh missing — refusing to start an ungated agent" >&2; exit 78; }
 # ⛔ THE REPO-IDENTITY GATE (agent-infra#2724/#2694). Required, not optional: a lane that cannot
 # prove which repository its worktree is has no business starting an agent in it. Missing helper =
@@ -111,20 +121,24 @@ RESEARCH_PREFLIGHT="$(bash "$brief_gate_sh" --line lane)"
 printf '%s\n' "$RESEARCH_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
 # ── the lane's own `.venv` is reaped on the way out (agent-infra#1932) ──────────────────────────────
 # A venv is a build artifact that belongs to a RUNNING lane: `uv sync` writes it inside the worktree,
-# and nothing removed it, so 5 lanes held 7.3 GB (~4 lanes, not 6, on a 32 GB box). The EXIT trap is
+# and nothing removed it, so 5 lanes held 7.3 GB (~4 lanes, not 6, on a 32 GB box). The EXIT path is
 # the right place because at lane exit the lane is KNOWN to be done — no liveness has to be inferred —
 # and it covers EVERY exit path, including a TERM'd session (bash runs EXIT traps on SIGTERM: verified).
 # The reaper still re-probes for a live holder before deleting, so a worktree another lane is using,
 # or a `pi`/pytest child still running after the agent returned, keeps its env. Best-effort and loud:
 # `reap_lane_venv` never changes the lane's exit status, and logs every outcome to the lane log.
-trap 'reap_lane_venv "$PWD" "lane $N"' EXIT
-# ⛔ ...but NOT on a DRY RUN (agent-infra#2148's `LANE_DRY_RUN` seam, below). No agent ran, so the
-# worktree's `.venv` has no dead holder to reap — and a preview that DELETES a build artifact is
-# exactly the destructive-side-effect class a dry run exists to avoid. The trap is installed
-# conditionally because it is installed before the dry-run branch is reached.
-if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
-  trap - EXIT
-fi
+# ⛔ REGISTERED THROUGH lane-terminal.sh, NOT AS A BARE `trap … EXIT` (#2833). The record owns the one
+# EXIT trap so it can chain this cleanup and run it AFTER the record is written; a bare trap here would
+# CLOBBER the record (and `lane_terminal_install` refuses to install over one, so the loss would be
+# loud — but the lane would still start with no record). `"$N"` and cwd are interpolated at exit time
+# exactly as the trap body was, and `reap_lane_venv` is defined by the spawn-gate source above.
+# ⛔ ...but NOT on a DRY RUN (agent-infra#2148's `LANE_DRY_RUN` seam, below): no agent ran, so the
+# worktree's `.venv` has no dead holder to reap, and a preview that DELETES a build artifact is exactly
+# the destructive-side-effect class a dry run exists to avoid. The TERMINAL RECORD is deliberately NOT
+# suppressed there (#2833): the dry run is a real process that really ended, it already writes
+# `lane-$N.log` (so it is already in the census population), and a population that hides its own
+# previews would be the same "some terminations are unrecorded" defect one size smaller.
+[ "${LANE_DRY_RUN:-0}" = "1" ] || lane_terminal_at_exit 'reap_lane_venv "$PWD" "lane '"$N"'"'
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319)
 # This line used to export `AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1` UNCONDITIONALLY — a permanent
 # bypass the canon calls emergency-only, on the one machine that lands the most work. The decision is
@@ -152,6 +166,7 @@ REPO_ASSERT_LINE="$(repo_target_assert "lane $N" "$PWD" "$OR" "$LANE_REPO_DIR")"
 printf '%s\n' "$REPO_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
 if [ "$REPO_ASSERT_RC" -ne 0 ]; then
   echo "[lane $N] NOT started: repo-target REFUSED (exit $REPO_ASSERT_RC) — no agent, no PR, nothing measured in the wrong repository" >> "$O/logs/lane-$N.log"
+  lane_terminal_reason "refused:repo-target"
   exit "$REPO_ASSERT_RC"
 fi
 # ⛔ A `--repo-dir`-ONLY CALL MUST NOT LEAVE `$OR` EMPTY (#2762 review, P1). The module supports
@@ -166,6 +181,7 @@ if [ -z "$OR" ]; then
   if [ -z "$OR" ]; then
     echo "$(repo_target_refuse "lane $N" target-underivable "the target directory passed the assertion but its origin slug cannot be read, so the lane has no repo to name in its brief or its gh calls")" | tee -a "$O/logs/lane-$N.log"
     echo "[lane $N] NOT started: no target slug could be derived from the asserted worktree" >> "$O/logs/lane-$N.log"
+    lane_terminal_reason "refused:no-slug"
     exit "$REPO_TARGET_REFUSED"
   fi
 fi
@@ -179,6 +195,7 @@ if [ -n "${BR:-}" ] && [ -n "$HEAD_BRANCH" ]; then
   printf '%s\n' "$BRANCH_ASSERT_LINE" | tee -a "$O/logs/lane-$N.log"
   if [ "$BRANCH_ASSERT_RC" -ne 0 ]; then
     echo "[lane $N] NOT started: branch assertion REFUSED (exit $BRANCH_ASSERT_RC) — no agent started" >> "$O/logs/lane-$N.log"
+    lane_terminal_reason "refused:branch"
     exit "$BRANCH_ASSERT_RC"
   fi
 fi
@@ -389,6 +406,17 @@ run_agent "${LANE_TIMEOUT:-3300}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
+# ⛔ WHO ENDED IT — the one axis the census could not read (#2833 item 4). `AGENT_BOUND_VERDICT` is the
+# harness's OWN bound reporting that it killed the agent (`exceeded-wallclock` / `stalled`), written by
+# lane-bound.sh and read back by run_agent; when it is empty the agent ended by itself, and a status in
+# 129..191 then says a SIGNAL ended it, whose NUMBER is recorded. The record never names a SENDER: on
+# this box that cannot be measured (docs/ops/lane-signal-forensics.md), and a guessed killer is the
+# instrument-that-cannot-answer-its-own-question class this issue exists to remove.
+if [ -n "${AGENT_BOUND_VERDICT:-}" ]; then
+  lane_terminal_reason "killed:$AGENT_BOUND_VERDICT"
+elif [ "$rc" -ge 129 ] && [ "$rc" -le 191 ]; then
+  lane_terminal_reason "signal:$(( rc - 128 ))"
+fi
 # ⛔ A LANE THAT ENDS WITHOUT A MERGE-PHASE VERDICT IS A RECORDED FAILURE, NOT SILENCE (#2029).
 # The merge phase is the lane's own job now, so its absence is the exact defect this change targets —
 # and the only place it is visible is here. `merge-rate.sh` counts such a lane as UNKNOWN (it reads
@@ -430,8 +458,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   if [ "$rc" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
     echo "[lane $N] NOT started: THE BRIEF WAS REFUSED (brief gate, exit $rc) — no agent ran, nothing was consumed, and this is NOT a capacity refusal, so the issue is NOT yielded to a peer: re-author the brief (the [brief-gate] block above names every missing element and prints the canonical section), then re-dispatch." >> "$O/logs/lane-$N.log"
     echo "[lane $N] brief refused — see $O/logs/lane-$N.log; re-author and re-dispatch (not a capacity refusal)" >&2
+    lane_terminal_reason "refused:brief"
     exit "$rc"
   fi
+  # The cause the caller knows, named for the terminal record (#2833). Set BEFORE the capacity arm so
+  # the record carries the gate that actually refused even when no capacity record can be written.
+  lane_terminal_reason "refused:agent-gate"
   if [ -n "${capacity_record:-}" ]; then
     # ⛔ FORK IS CONSUMED, NOT BUCKETED AS LOAD (review P1, agent-infra#2293). `run_agent` returns
     # AGENT_FORK_REFUSED for a box that is out of PROCESSES, and this branch used to fold every code
@@ -447,6 +479,9 @@ if [ "$AGENT_STARTED" = "0" ]; then
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
     else _cap_gate=load; fi
+    # The terminal record names the SAME gate this block just chose, from the same variable, so the
+    # record and the capacity ledger cannot disagree about why the lane did not start (#2833).
+    lane_terminal_reason "refused:$_cap_gate"
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
     # README §7.2 says it in as many words ("**The yield is gate-independent, deliberately**"), and
     # ARCHITECTURE repeats it. A `land` refusal looks like it wants a SHORT window: it is repo-wide,
