@@ -2523,7 +2523,7 @@ assert_dir "$WT_LATEF" "A21f the worktree is still on disk"
 MUT6="$T/$ENV/pi-reap-worktrees.mutant-evidence.sh"
 awk '
     /BUT `clean` HERE STILL TOLERATES THE LANE EVIDENCE/ { skip = 1 }
-    skip && /ev_members_then/ { seen = 1 }
+    skip && /ev_sig_now/ { seen = 1 }
     skip && seen && /^        fi$/ { skip = 0; seen = 0; next }
     !skip { print }
 ' "$REAPER" >"$MUT6"
@@ -2557,11 +2557,104 @@ rm -f "$T/$ENV/cnt-g"
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEG/.worktree-report/late.md" \
     FAKE_LATE_COUNTER="$T/$ENV/cnt-g" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
 assert_eq "$RC" "0" "A21g a file created INSIDE the tolerated dir during the archive is a PRESERVE"
-assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CONTENT changed after the archive" \
-    "A21g …caught by the MEMBER comparison, not the name comparison"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21g …caught by the SIGNATURE comparison, not the name comparison"
 assert_file "$WT_LATEG/.worktree-report/late.md" "A21g the late file inside the tolerated dir SURVIVED"
 assert_dir "$WT_LATEG" "A21g the worktree is still on disk"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A21g nothing was removed"
+
+# A21h — A MEMBER THAT ALREADY EXISTED AND WAS APPENDED TO during the archive (review of #3422 round 9,
+# P2). A NAME comparison cannot see this, and it is the ordinary shape: the lane regenerates
+# `run.log`/`WORKTREE-REPORT.md` while the archive is being taken, so the tarball holds stage 1 and the
+# removal destroys stage 2. The signature carries `<crc> <size> <path>` per file, so any rewrite or
+# append differs.
+ENV=A21h; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21h)'
+WT_H="$(add_named_wt "$REPO" "$ENV-late" feat/a21h-late)"
+mkdir -p "$WT_H/.venv/bin" "$WT_H/.worktree-report"
+printf 'py\n' >"$WT_H/.venv/bin/python"
+printf 'stage1\n' >"$WT_H/.worktree-report/run.log"
+cat >"$T/bin/git-append-late" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do
+    if [ "$a" = "status" ]; then
+        "${REAL_GIT_BIN:-git}" "$@"; rc=$?
+        if [ -n "${FAKE_LATE_COUNTER:-}" ] && [ -n "${FAKE_LATE_FILE:-}" ]; then
+            c=0; [ -f "$FAKE_LATE_COUNTER" ] && c="$(cat "$FAKE_LATE_COUNTER")"
+            c=$((c + 1)); printf '%s\n' "$c" >"$FAKE_LATE_COUNTER"
+            [ "$c" -ge "${FAKE_LATE_ON:-1}" ] && printf 'stage2 appended during the archive\n' >>"$FAKE_LATE_FILE"
+        fi
+        exit "$rc"
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-append-late"
+rm -f "$T/$ENV/cnt-h"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_H/.worktree-report/run.log" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-h" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21h an APPEND to an already-captured member is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21h …caught by the signature (a name comparison cannot see it)"
+assert_contains "$(cat "$WT_H/.worktree-report/run.log" 2>/dev/null)" "stage2 appended during the archive" \
+    "A21h the appended content SURVIVED (the archive only ever held stage 1)"
+assert_dir "$WT_H" "A21h the worktree is still on disk"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21h nothing was removed"
+# MUTANT for the SIGNATURE comparison itself (covers A21g AND A21h: both are shapes a name comparison
+# cannot see). Removing just the signature block must lose the appended content.
+MUT7="$T/$ENV/pi-reap-worktrees.mutant-signature.sh"
+awk '
+    /AND NEITHER ARE THE ROOT NAMES ON THEIR OWN/ { skip = 1 }
+    skip && /ev_sig_now/ { seen = 1 }
+    skip && seen && /^        fi$/ { skip = 0; seen = 0; next }
+    !skip { print }
+' "$REAPER" >"$MUT7"
+if cmp -s "$REAPER" "$MUT7"; then
+    bad "A21h the SIGNATURE MUTANT DID NOT APPLY — the archive-signature gate is unverified"
+else
+    ok "A21h mutant applied: the signature comparison is removed"
+fi
+WT_H2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21h-late2)"
+mkdir -p "$WT_H2/.venv/bin" "$WT_H2/.worktree-report"
+printf 'py\n' >"$WT_H2/.venv/bin/python"
+printf 'stage1\n' >"$WT_H2/.worktree-report/run.log"
+rm -f "$T/$ENV/cnt-h2"
+OUT="$(REAPER_OVERRIDE="$MUT7" GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_H2/.worktree-report/run.log" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-h2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_H2" "A21h MUTANT GOES RED: without the signature comparison the checkout IS removed"
+assert_absent "$(cat "$WT_H2/.worktree-report/run.log" 2>/dev/null)" "stage2 appended during the archive" \
+    "A21h …and the content appended during the archive is GONE (the archive only holds stage 1)"
+
+
+# A21i — A SIGNATURE THAT CANNOT BE TAKEN IS A RED PASS, NOT A SILENT PRESERVE (review of #3422 round 9,
+# P2). `fs_bounded_out` emits nothing on a non-zero rc, so discarding the rc made "the walk failed" look
+# like "the set is empty": every evidence-bearing row became permanently unreclaimable while the pass
+# reported success — the inert-but-green class this whole PR is about.
+ENV=A21i; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21i)'
+WT_I="$(add_named_wt "$REPO" "$ENV-late" feat/a21i-late)"
+mkdir -p "$WT_I/.venv/bin" "$WT_I/.worktree-report"
+printf 'py\n' >"$WT_I/.venv/bin/python"
+printf 'stage1\n' >"$WT_I/.worktree-report/run.log"
+cat >"$T/bin/find-broken" <<'SHIM'
+#!/usr/bin/env bash
+# A walk that FAILS (like a hung/unreadable mount): emits nothing and returns non-zero.
+printf 'find: cannot walk\n' >&2
+exit 2
+SHIM
+chmod +x "$T/bin/find-broken"
+OUT="$(PATH="$T/bin:$PATH" REAP_WT_FIND_BIN="$T/bin/find-broken" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+if [ "$RC" = "4" ]; then
+    ok "A21i an unwalkable evidence tree is a FAILED removal (exit 4, RED) — not a silent permanent preserve"
+else
+    bad "A21i an unwalkable evidence tree must be RED (exit 4), got rc=$RC"
+fi
+assert_contains "$(cat "$T/$ENV/reap.log")" "could not be walked" "A21i …and the log names the cause"
+
 
 
 # …AND THE ORDERING THE INSERTION DEPENDS ON (review of #3422, P3): the doc row claims

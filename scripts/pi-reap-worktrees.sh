@@ -631,6 +631,9 @@ LSOF_BIN="${LSOF_BIN:-lsof}"
 # scratch/log cleanup keeps the real `rm` (it must not be defeated by a seam).
 RM_BIN="${RM_BIN:-rm}"
 TAR_BIN="${TAR_BIN:-tar}"
+# The walker the archive-signature gate uses (resolved once, like every other binary here). A seam
+# because the gate's failure arm — "the walk could not complete ⇒ RED" — has to be testable.
+FIND_BIN="${REAP_WT_FIND_BIN:-find}"
 DATE_BIN="${DATE_BIN:-/bin/date}"
 STATE_DIR="${REAP_WT_STATE_DIR:-${HOME:-}/.pi/agent/state}"
 REAP_WT_LOG="${REAP_WT_LOG:-$STATE_DIR/pi-reap-worktrees.log}"
@@ -1180,7 +1183,9 @@ is_agent_pointer_entry() { # <worktree-path> <entry>
 lane_evidence_present() {
     local path="$1" e out=""
     for e in $IGNORED_LANE_EVIDENCE; do
-        if [ -e "$path/$e" ] || [ -L "$path/$e" ]; then out="$out$e "; fi
+        # Bounded: this runs on the removal hot path (twice, either side of the archive), and a bare
+        # `[ -e ]` is the same indefinite block on a hung mount as any other unbounded stat here.
+        if fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$e"; then out="$out$e "; fi
     done
     printf '%s' "${out% }"
 }
@@ -2016,24 +2021,32 @@ EOF
     return 1
 }
 
-# evidence_members <path> <root>... — every path a tolerated lane-evidence root covers, as a sorted
-# RELATIVE listing (a root that is a file contributes its own name; a directory contributes everything
-# under it). Used to compare what the archive CAPTURED against what is there NOW: comparing root NAMES
-# alone cannot see a file created inside `.worktree-report/` during the archive, which is where the
-# fleet's own fixtures put the mandated report (review of #3422, P2). Bounded like every other read of
-# the checkout — `find` on a hung mount is the same indefinite block as a bare `stat`.
-evidence_members() {
-    local path="$1" r
+# evidence_signature <path> <root>... — a CONTENT signature of the tolerated lane-evidence roots:
+# one `<crc> <size> <path>` line per file (`cksum`, POSIX), plus a line for a root that is itself a
+# file. Both sides of the post-archive comparison are produced by THIS function, so no two tools' output
+# formats are ever compared — GNU `tar -t` QUOTES member names (`back\slash`, `a\tb`, non-ASCII under a
+# C locale) while `find` prints raw bytes, which made a name-listing comparison differ forever on any
+# such file and turn every pass into a silent, green, permanent preserve (review of #3422 round 9).
+# A size+CRC line also catches the case a NAME listing cannot: a member that EXISTED at archive time and
+# was appended to (or rewritten) during the archive — the lane's own `run.log`/`WORKTREE-REPORT.md`
+# regeneration, which is precisely the data gate (b) exists to keep.
+#
+# Returns non-zero when the walk itself fails, so the caller can FAIL the removal (red) instead of
+# mistaking "could not read" for "nothing there": an empty signature on both sides would otherwise
+# compare EQUAL and let a checkout with unlisted evidence be removed (review of #3422 round 9, P2).
+evidence_signature() {
+    local path="$1" r rc=0 out
     shift
     for r in "$@"; do
-        case "$r" in ''|*/*) continue ;; esac
+        case "$r" in ''|'<none>'|*/*) continue ;; esac
         if fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
-            fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" find "$path/$r" -print 2>/dev/null \
-                | sed "s|^$path/||; s|/$||" 
+            out="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r" -type f -exec cksum {} +)" \
+                || return 1
         else
-            printf '%s\n' "$r"
+            out="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r")" || return 1
         fi
-    done | sed '/^$/d' | sort -u
+        printf '%s\n' "$out"
+    done | sed '/^$/d' | sort -u | head -c 262144
 }
 
 # prune_preserve_archive — bound the new sink, across EVERY root an archive can land in (configured
@@ -3719,7 +3732,7 @@ holder_recheck() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local ev_archived ev_now ev_members_now ev_members_then
+    local ev_archived ev_now ev_before ev_sig_before ev_sig_now
     local path="$1" sha="$2" br="${3:-}" why="${4:-}" presv=""
     local eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
@@ -3794,6 +3807,18 @@ remove_one() {
     # work a human wanted, the lane-evidence tarball is the only copy of the mandatory per-lane report
     # once the tree is gone, and an inert-but-green class is the exact defect this PR removes.
     if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
+        # The signature is taken BEFORE the archive so it can be compared with the tree AFTER it; a
+        # walk that cannot complete is a FAILED removal (this gate could not do its job), never a skip.
+        ev_before="$(lane_evidence_present "$path")"
+        ev_sig_before=""
+        if [ -n "$ev_before" ]; then
+            # shellcheck disable=SC2086
+            ev_sig_before="$(evidence_signature "$path" $ev_before)" || {
+                REMOVE_SKIP_VERDICT="evidence-unreadable"
+                log "PRESERVE-SKIP $path lane evidence could not be walked before the archive — nothing removed, and this pass is RED"
+                rm -f "$out"; return 1
+            }
+        fi
         if ! presv="$(preserve_before_removal "$path" "$sha" "$br" "${why:-reclaimable}")"; then
             REMOVE_SKIP_VERDICT="preserve-failed"
             # ⛔ A FAILED CAPTURE IS A FAILED REMOVAL, NOT A BENIGN LATE PRESERVE (review of #3405
@@ -3841,18 +3866,23 @@ remove_one() {
             log "REMOVE-SKIP $path lane evidence changed after the archive ('${ev_archived:-<none>}' -> '$ev_now') — nothing removed, the archive is kept"
             rm -f "$out"; return 2
         fi
-        # ⛔ AND THE ROOT NAMES ARE NOT ENOUGH (review of #3422, P2). A file created INSIDE a tolerated
-        # root (`.worktree-report/late.md`) leaves the name set unchanged, so the comparison above read
-        # as covered while the archive — taken earlier — did not contain it: the removal took it. The
-        # captured MEMBER listing is compared with the listing now.
+        # ⛔ AND NEITHER ARE THE ROOT NAMES ON THEIR OWN (review of #3422). Two shapes slip past a
+        # name comparison: a file created INSIDE a tolerated root (`.worktree-report/late.md`), and a
+        # member that already existed and was APPENDED to / rewritten during the archive — the lane's
+        # own `run.log` regeneration, which is exactly the data gate (b) exists to keep. Both sides are
+        # signatures produced by the SAME function over the SAME tree, so no cross-tool format can
+        # differ, and a signature that cannot be taken FAILS the removal (red) rather than reading as an
+        # empty set that compares equal to another empty set.
         if [ "$ev_now" != "<none>" ]; then
             # shellcheck disable=SC2086
-            ev_members_now="$(evidence_members "$path" $ev_now)"
-            ev_members_then="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$TAR_BIN" -tzf "$presv/lane-evidence.tar.gz" 2>/dev/null \
-                | sed 's|/$||' | sed '/^$/d' | sort -u)"
-            if [ "$ev_members_now" != "$ev_members_then" ]; then
-                REMOVE_SKIP_VERDICT="lane-evidence-appeared"
-                log "REMOVE-SKIP $path lane evidence CONTENT changed after the archive (captured $(printf '%s' "$ev_members_then" | wc -l | tr -d ' ') members, now $(printf '%s' "$ev_members_now" | wc -l | tr -d ' ')) — nothing removed, the archive is kept"
+            ev_sig_now="$(evidence_signature "$path" $ev_now)" || {
+                REMOVE_SKIP_VERDICT="evidence-unreadable"
+                log "PRESERVE-SKIP $path lane evidence could not be walked after the archive — nothing removed, and this pass is RED"
+                rm -f "$out"; return 1
+            }
+            if [ "$ev_sig_now" != "$ev_sig_before" ]; then
+                REMOVE_SKIP_VERDICT="lane-evidence-changed"
+                log "REMOVE-SKIP $path lane evidence CHANGED during the archive ($(printf '%s' "$ev_sig_before" | grep -c .) -> $(printf '%s' "$ev_sig_now" | grep -c .) files) — nothing removed, the archive is kept"
                 rm -f "$out"; return 2
             fi
         fi
