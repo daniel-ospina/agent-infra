@@ -2253,7 +2253,11 @@ if [ -d "$DELTA_REPO" ]; then
   # only, so a legacy-only record was refused with "the superseded record carries no evidence" —
   # FALSE (the run had just read it) and its printed remedy is the full re-review `--delta` exists
   # to remove. This case was UNREACHABLE before the fix (the run exited 3), so reverting
-  # `${D_REC:-$FILE}` to `$FILE` in either read reddens exactly this vector — measured.
+  # `${D_REC:-$FILE}` to `$FILE` in `_carry_src` reddens exactly this vector — MEASURED. ⛔ NOT
+  # "either read": this fixture's predecessor carries `evidence:"comment:7102"`, so the
+  # `delta:`-inheritance branch is never entered and cannot exercise `_cd_src` (that read has its
+  # own vector, (33a9)). `_prior_src` is still unpinned — declared, not claimed. A comment that
+  # says "either read" is the same overclaim class as counting a suite green that never ran the path.
   rm -f "$DR_HOME/.pi/agent/reviews/fixture-repo-7102.json"
   printf '{"pr":7102,"head_sha":"%s","verdict":"clean","mint":"fresh","repo":"fixture/repo","evidence":"comment:7102","reviewed_at":"2026-11-02T00:00:00Z"}\n' \
     "$D_REVIEWED" > "$DR_HOME/.pi/agent/reviews/7102.json"
@@ -2272,6 +2276,21 @@ if [ -d "$DELTA_REPO" ]; then
   grep -qE '^D_REC=""$' "$SRC" \
     && pass "(33a8) the script initialises D_REC (a default, not a hope) — an ambient D_REC cannot redirect a non-delta predecessor read" \
     || fail "(33a8) scripts/record-review.sh has no top-level D_REC=\"\" default: an ambient D_REC can bypass the no-evidence refusal"
+  # (33a9) THE `delta:`-INHERITANCE READ RESOLVES A LEGACY PREDECESSOR TOO. (33a7) cannot reach it
+  # (its predecessor carries `comment:` evidence, so the `elif` at scripts/record-review.sh:4836 is
+  # never entered — MEASURED: reverting `_cd_src` to `$FILE` leaves both suites green). Without this
+  # vector the `_cd_src` half of the fix is pinned by nothing while the code comment claimed it was:
+  # a legacy predecessor whose evidence is `delta:A..B` would be falsely refused at "refusing a
+  # carry that inherits a delta claim" — the same false-diagnosis class as (33a7).
+  rm -f "$DR_HOME/.pi/agent/reviews/fixture-repo-7103.json"
+  printf '{"pr":7103,"head_sha":"%s","verdict":"clean","mint":"fresh","repo":"fixture/repo","evidence":"delta:%s..%s+comment:7103","delta_range":"%s..%s","delta_base":"%s","delta_kind":"authored","delta_digest":"%s","reviewed_at":"2026-11-02T00:00:00Z"}\n' \
+    "$D_REVIEWED" "$D_BASE" "$D_REVIEWED" "$D_BASE" "$D_REVIEWED" "$D_BASE" "$(printf 'a%.0s' 1 2 3 4 5 6 7 8)" \
+    > "$DR_HOME/.pi/agent/reviews/7103.json"
+  delta_run 7103 "$TMP/out32a9"; DRC_A9="$DR_RC"
+  D_REC7103="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7103.json" 2>/dev/null)"
+  [ "$DRC_A9" -eq 0 ] && grep -q "\"delta_range\":\"$D_BASE..$D_REVIEWED\"" <<<"$D_REC7103" \
+    && pass "(33a9) a LEGACY-key predecessor whose evidence is \`delta:A..B\` INHERITS its range — _cd_src resolves through \${D_REC:-\$FILE} too" \
+    || fail "(33a9) the legacy delta-inheriting carry was refused or lost its range (rc=$DRC_A9, record='$D_REC7103')"
 
   # (33a2) THE RECORD SHAPE IS THE CONTRACT, so it is PINNED rather than described. `proved` exists
   # because the field it replaced (`authored_unchanged:true`, hardcoded) was contradicted by the
@@ -2719,12 +2738,12 @@ fi
 # 33f2 pin the unproven-delta refusal and the "both verbs agree" invariant, which were MEASURED
 # green under deletion before they existed.
 # AFTER THE REBASE the count is main's plus this section's: main spent 185 -> 190 on #3347's own
-# section (32), and this section adds 16 (13 delta assertions + the (33a6) integration pin +
-# the (33a7) legacy-key vector + the (33a8) structural D_REC default), so the
-# pin is 206. The section is numbered 33 for the same
+# section (32), and this section adds 17 (13 delta assertions + the (33a6) integration pin +
+# (33a7)/(33a9) legacy-key vectors + the (33a8) structural D_REC default), so the
+# pin is 207. The section is numbered 33 for the same
 # reason — (32) was already taken on main by the time this branch was rebased.
-# MEASURED: `ALL PASSED (206 assertion(s))` on the merged tree.
-MIN_ASSERTIONS=206
+# MEASURED: `ALL PASSED (207 assertion(s))` on the merged tree.
+MIN_ASSERTIONS=207
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
