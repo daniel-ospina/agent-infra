@@ -577,7 +577,15 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
 
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
 `classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=` and
-`pr_merged=`. `examined = classified + deferred` and `classified = remove + preserved` are the two
+`pr_merged=`. Those are the **registered** delegate's numbers, and they structurally cannot see the
+class's second arm (abandoned scratch worktrees) — which reaps into the same sink. That arm answers on
+its own fields instead, so a pass that removed abandoned checkouts never reads as `removed=0`:
+`abandoned_worktree_candidates=`, `abandoned_worktree_reaped=`, `abandoned_worktree_kept=` and
+`abandoned_worktree_cover=` (`<answered>/<roots>`, the arm's coverage), mirrored on the class line as
+`abandoned_cand=` / `abandoned_reaped=` / `abandoned_kept=` / `abandoned_cover=`. They are `?`
+unless **every** root's `census=ok` SUMMARY answered — the owner prints a SUMMARY even on its
+fail-closed arm (`census=unreadable`, exit 3), and lifting that arm's zeros would publish a measured 0
+from a refusal. `examined = classified + deferred` and `classified = remove + preserved` are the two
 identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict
 was already `remove`, so folding it into `deferred` would deflate `preserved` and make the line
 contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote
@@ -602,7 +610,7 @@ scan: `want_class` was true and the record says `verdict_<class>=misconfigured` 
 setup-failure arms deselect it (`WANT_VENV=0`, because there is nothing left for it to measure), so
 its counters read `not-run` there. Neither token is a count — a refusal (`FAIL-CLOSED gh
 unavailable`) is not a measurement, and a measured zero beside an unknown classification is the
-false PASS this record exists to remove. Two of the five classes cannot answer the CANDIDATE count on
+false PASS this record exists to remove. Two of the four classes cannot answer the CANDIDATE count on
 every pass and say so rather than guessing `0`: `uv` (its owner publishes no tally, so an ARMED pass —
 which has no `DRY-RUN` rows to count — records `candidates_uv=?`), and `duplicate-install` only when its
 own `SUMMARY … candidates=<n>` did not answer (that delegate prints it in BOTH modes, so an armed pass

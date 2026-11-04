@@ -3063,6 +3063,98 @@ assert_contains "$ST60" "classified_venv=?" \
 assert_contains "$(grep -F 'class=venv' <<<"$OUT")" "candidates=1" \
     "T60 the class LINE agrees with the record about the candidate count"
 
+# ── T61: THE CLASS'S SECOND ARM ANSWERS ON ITS OWN FIELDS ──────────────────────────────────────
+# The worktree class has TWO arms (a registered delegate, and the abandoned-scratch arm), and they reap
+# into the SAME sink. Every `classified/preserved/removed` on the class line and in the record is
+# lifted from the REGISTERED delegate's SUMMARY, which structurally cannot see the abandoned arm — so
+# an APPLY pass that reaped abandoned checkouts published `removed=0` on the line an operator reads to
+# learn what the pass did, and recorded nothing about that work anywhere. Reproduced before the fix
+# with a stub pair (registered `removed=0`, abandoned `reaped=3`):
+#
+#   SUMMARY class=abandoned-worktree mode=apply candidates=4 reaped=3 kept=7 failed=0 census=ok …
+#   disk-reaper: class=worktree … mode=apply … classified=3 removed=0 preserved=3 … reasons=too-recent:3
+#
+# Three checkouts removed, every operator surface said none. That is the invented-measurement class this
+# report exists to remove, one arm over. The counts are published as their OWN fields so the registered
+# delegate's identities (`examined = classified + deferred`, `classified = remove + preserved`) stay
+# true rather than being widened to a set it never answered for.
+ENVNAME=t61
+REPO61="$(mk_repo t61)"
+mkdir -p "$T/t61/scratch"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=2 classified=2 remove=1 preserved=1 deferred=0 deferred_remove=0 removed=1 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:1 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t61-registered.sh"
+chmod +x "$T/t61-registered.sh"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in --print-config) echo "roots='"$T"'/t61/scratch"; exit 0 ;; esac; done' \
+    'echo "SUMMARY class=abandoned-worktree mode=apply candidates=4 reaped=3 kept=7 failed=0 census=ok rows=1 pids=0 aged=180m dirty=keep"' \
+    'exit 0' >"$T/t61-abandoned.sh"
+chmod +x "$T/t61-abandoned.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-registered.sh" ABANDONED_WT_REAPER="$T/t61-abandoned.sh" \
+    run_reaper --apply --repo "$REPO61" --only worktree 2>&1)"; RC=$?
+ST61="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+CL61="$(grep -F 'class=worktree' <<<"$OUT")"
+assert_eq "$RC" "0" "T61 the two-arm pass succeeds"
+# (a) THE ARM THAT DID THE WORK IS ON THE LINE. Without these the pass reads "nothing was removed".
+assert_contains "$CL61" "abandoned_reaped=3" \
+    "T61 the class LINE carries the abandoned arm's own reaped count"
+assert_contains "$CL61" "abandoned_kept=7" "T61 ... and the count it kept"
+assert_contains "$CL61" "abandoned_cand=4" "T61 ... and the count it classified"
+assert_contains "$CL61" "abandoned_cover=1/1" "T61 ... and its coverage, so a bare sum cannot hide a half-answer"
+# (b) AND IN THE RECORD, which is the surface a later audit reads.
+assert_contains "$ST61" "abandoned_worktree_reaped=3" "T61 the RECORD carries the abandoned arm's reaped count"
+assert_contains "$ST61" "abandoned_worktree_kept=7" "T61 ... and kept"
+assert_contains "$ST61" "abandoned_worktree_candidates=4" "T61 ... and candidates"
+# (c) THE REGISTERED IDENTITIES STAY THE REGISTERED DELEGATE'S — the fix must not FOLD the arm in, or
+# `classified = remove + preserved` becomes a claim about a set the delegate never answered for.
+assert_contains "$CL61" "classified=2" "T61 the registered counters are still the registered delegate's own"
+assert_contains "$CL61" "removed=1" "T61 ... so the abandoned arm's 3 is NOT silently added to its removed count"
+assert_absent "$CL61" "removed=4" "T61 ... never a folded sum presented as one delegate's tally"
+# (d) ⛔ A REFUSAL IS NOT A MEASUREMENT — the owner prints a SUMMARY even when its census is unreadable,
+# and its zeros are an artefact of the refusal. Lifting them would publish a measured 0 from a pass that
+# scanned nothing, which is the exact defect class this arm's counters exist to close.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in --print-config) echo "roots='"$T"'/t61/scratch"; exit 0 ;; esac; done' \
+    'echo "SUMMARY class=abandoned-worktree mode=apply candidates=0 reaped=0 kept=0 failed=0 census=unreadable"' \
+    'exit 3' >"$T/t61-abandoned-refuse.sh"
+chmod +x "$T/t61-abandoned-refuse.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-registered.sh" ABANDONED_WT_REAPER="$T/t61-abandoned-refuse.sh" \
+    run_reaper --apply --repo "$REPO61" --only worktree 2>&1)"; RC=$?
+ST61R="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+CL61R="$(grep -F 'class=worktree' <<<"$OUT")"
+assert_eq "$RC" "3" "T61 a refused abandoned census is a RED pass"
+assert_contains "$CL61R" "abandoned_reaped=?" "T61 a REFUSED census is '?' on the line, not a measured 0"
+assert_absent "$CL61R" "abandoned_reaped=0" "T61 ... its SUMMARY's placeholder 0 never reaches the operator"
+assert_contains "$ST61R" "abandoned_worktree_reaped=?" "T61 ... and the record agrees with the line"
+assert_absent "$ST61R" "abandoned_worktree_reaped=0" "T61 ... never an invented 0 in the record either"
+# (e) AND A HALF-ANSWERED ARM IS NOT AN ANSWER: two roots, one `census=ok` and one refusing, must not
+# publish the partial sum (the same rule the registered arm applies via `WT_TALLY_COVER`).
+mkdir -p "$T/t61/ra" "$T/t61/rb"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in --print-config) echo "roots='"$T"'/t61/ra:'"$T"'/t61/rb"; exit 0 ;; esac; done' \
+    'for a in "$@"; do case "$a" in */t61/ra) echo "SUMMARY class=abandoned-worktree mode=apply candidates=2 reaped=2 kept=0 failed=0 census=ok rows=1 pids=0 aged=180m dirty=keep"; exit 0 ;; esac; done' \
+    'echo "SUMMARY class=abandoned-worktree mode=apply candidates=0 reaped=0 kept=0 failed=0 census=unreadable"' \
+    'exit 0' >"$T/t61-abandoned-partial.sh"
+chmod +x "$T/t61-abandoned-partial.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-registered.sh" ABANDONED_WT_REAPER="$T/t61-abandoned-partial.sh" \
+    run_reaper --apply --repo "$REPO61" --only worktree 2>&1)"
+CL61P="$(grep -F 'class=worktree' <<<"$OUT")"
+assert_contains "$CL61P" "abandoned_reaped=?" "T61 one answering root of two does NOT publish its sum"
+assert_absent "$CL61P" "abandoned_reaped=2" "T61 ... never the partial sum, which a reader would call measured"
+assert_contains "$CL61P" "abandoned_cover=1/2" "T61 ... and the coverage that made it unanswerable is disclosed"
+# (f) ...and the CONTROL: with both roots answering, the same stub publishes the sum. Without it (e)
+# passes on an arm that can never publish an abandoned count at all.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'for a in "$@"; do case "$a" in --print-config) echo "roots='"$T"'/t61/ra:'"$T"'/t61/rb"; exit 0 ;; esac; done' \
+    'echo "SUMMARY class=abandoned-worktree mode=apply candidates=2 reaped=2 kept=0 failed=0 census=ok rows=1 pids=0 aged=180m dirty=keep"' \
+    'exit 0' >"$T/t61-abandoned-full2.sh"
+chmod +x "$T/t61-abandoned-full2.sh"
+OUT="$(WORKTREE_REAPER="$T/t61-registered.sh" ABANDONED_WT_REAPER="$T/t61-abandoned-full2.sh" \
+    run_reaper --apply --repo "$REPO61" --only worktree 2>&1)"
+CL61F="$(grep -F 'class=worktree' <<<"$OUT")"
+assert_contains "$CL61F" "abandoned_reaped=4" "T61 control: full coverage publishes the SUM of both roots"
+assert_contains "$CL61F" "abandoned_cover=2/2" "T61 control: full coverage is disclosed as 2/2"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

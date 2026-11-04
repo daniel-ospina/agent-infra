@@ -229,6 +229,12 @@ WANT_DUP=0
 # The worktree class's SECOND arm (abandoned scratch worktrees). It reports into the worktree class's
 # own keys — it is the same sink — and these are its accumulators.
 AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""
+# ⛔ THE ARM'S OWN CLASSIFICATION COUNTERS, ON THEIR OWN FIELDS (#4529 review, P1). The arm reaps into
+# the SAME sink as the registered delegate, but the class line's `classified/preserved/removed` are
+# lifted from the REGISTERED delegate's SUMMARY only — so an APPLY pass that removed three abandoned
+# checkouts published `removed=0` on the very line an operator reads to learn what the pass did. `?`
+# until EVERY root's `census=ok` SUMMARY answered, because a half-answered arm is not an answer.
+AW_CAND=0; AW_KEPT=0; AW_HAVE=0; AW_COVER="0/0"
 # Repos whose PR-state gate could not be verified, and the reason, as `<repo>[<reason>]` — one entry
 # each. A SKIPPED repo is not a failed CLASS: its own checkouts are untouched (fail closed) while the
 # other repos in the same class are still reclaimed. Reported per repo so a single unverifiable repo
@@ -1538,8 +1544,9 @@ reap_venv() {
 # sweep; `pinned()` / `lp_path_named()` inside it say what it will not touch). This function only
 # accounts: per root, a `df` reading before and after, never a `du` sum.
 reap_abandoned_arm() {
-    local roots root b a d out rc _r _root_rem
+    local roots root b a d out rc _r _root_rem _aw _awc _awk aw_repos=0 aw_tally_repos=0
     AW_FREED=0; AW_RAW=0; AW_MEASURED=1; AW_OUT=""; AW_NOTE=""; AW_REAPED=0; AW_SETUP_FAIL=0
+    AW_CAND=0; AW_KEPT=0; AW_HAVE=0; AW_COVER="0/0"
     if [ -z "$ABANDONED_WT_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree arm=abandoned FAIL-CLOSED — reap-abandoned-worktrees.sh not found (looked at \$ABANDONED_WT_REAPER, \$HOME/.pi/agent/scripts, and beside this script)"
         AW_NOTE="abandoned-worktree owner missing"
@@ -1579,6 +1586,27 @@ reap_abandoned_arm() {
         _r="$(sed -n 's/.* reaped=\([0-9][0-9]*\) .*/\1/p' <<<"$out" | head -1)"
         case "${_r:-}" in ''|*[!0-9]*) _r=0 ;; esac
         AW_REAPED=$((AW_REAPED + _r))
+        # ⛔ LIFT THE ARM'S OWN TALLY, AND ONLY FROM A `census=ok` LINE (#4529 review, P1). The owner
+        # prints a SUMMARY in BOTH modes and even on a REFUSAL — its fail-closed arm emits
+        # `candidates=0 reaped=0 kept=0 failed=0 census=unreadable` and exits 3 — so presence is not an
+        # answer. Lifting the zeros out of that line would publish a MEASURED 0 from a refusal, which is
+        # the invented-zero class this whole report exists to remove. `census=ok` is the arm's own
+        # statement that it enumerated and classified; anything else leaves the counts `?`.
+        aw_repos=$((aw_repos + 1))
+        _aw="$(printf '%s\n' "$out" | sed -n 's/^SUMMARY //p' | tail -1)"
+        case "$_aw" in
+            *census=ok*)
+                _awc="$(kv_field "$_aw" candidates)"
+                _awk="$(kv_field "$_aw" kept)"
+                # ⛔ `${x:-x}` PER FIELD, never a concatenation: an EMPTY field concatenates away, so
+                # `candidates=3` with `kept` ABSENT read as "all digits" (the same trap the registered
+                # arm's `have_tally` already documents).
+                case "${_awc:-x}${_awk:-x}${_r:-x}" in
+                    ''|*[!0-9]*) : ;;
+                    *) aw_tally_repos=$((aw_tally_repos + 1))
+                       AW_CAND=$((AW_CAND + _awc)); AW_KEPT=$((AW_KEPT + _awk)) ;;
+                esac ;;
+        esac
         say "$out"
         AW_OUT="${AW_OUT}${AW_OUT:+$'\n'}$out"
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
@@ -1594,6 +1622,13 @@ reap_abandoned_arm() {
     # window — credit taken for someone else's work. That is the same false credit `df`-instead-of-`du`
     # was adopted to stop, arriving through the other door. The observation is still reported, AS an
     # observation (df_raw), and named in the note.
+    AW_COVER="${aw_tally_repos}/${aw_repos}"
+    # Answered means EVERY root answered. A `census=ok` on one root and a refusal on the next is a
+    # HALF-ANSWERED arm, and a partial sum published as the arm's count is the defect the registered
+    # arm's own full-coverage gate (#4529, `WT_TALLY_COVER`) was written to stop — mirrored here so the
+    # two arms of one class cannot disagree about what an answer is.
+    AW_HAVE=0
+    [ "$aw_repos" -gt 0 ] && [ "$aw_tally_repos" -eq "$aw_repos" ] && AW_HAVE=1
     if [ "$AW_REAPED" = 0 ] && ! is_dry; then
         if [ "$AW_RAW" != 0 ]; then
             AW_NOTE="${AW_NOTE}${AW_NOTE:+; }nothing removed: the ${AW_RAW}MB df change belongs to another process (not attributed)"
@@ -1618,6 +1653,7 @@ reap_worktree() {
     # between repos is reported as `mixed` rather than letting the last repo answer for all of them.
     local sum_classified=0 sum_preserved=0 sum_remove=0 sum_reasons="" sum_removed=0 sum_failed=0
     local sum_deferred=0 sum_late=0 proof="" prm="" f_classified f_preserved f_remove f_reasons _sum _n _v
+    local AW_FIELDS=""
     # have_tally separates the two UNANSWERABLE cases from a measured zero: the class never ran
     # (`not-run`), or it ran and its delegate printed no SUMMARY (`?`). Both are recorded, neither is
     # reported as 0 — a `classified=0` beside `verdict=not-run` is a self-contradicting record, and it
@@ -1886,6 +1922,21 @@ reap_worktree() {
     if is_dry && { grep -qE '^(remove|preserve|SUMMARY) ' <<<"$delegate_rows" || grep -qE '^remove[[:space:]]' <<<"$rows"; }; then
         HAVE_WT_CAND=1
     fi
+    # ⛔ THE SECOND ARM'S OWN COUNTS, ON THE LINE AND IN THE RECORD (#4529 review, P1).
+    # `classified/preserved/removed` below are lifted from the REGISTERED delegate's SUMMARY, and that
+    # tally structurally cannot see the abandoned arm — which reaps into the SAME sink. So an APPLY pass
+    # that reaped abandoned checkouts published `removed=0`, and the line an operator reads to learn what
+    # the pass did said nothing had been removed (measured: `SUMMARY class=abandoned-worktree … reaped=3`
+    # beside `class=worktree … removed=0`). Published as their OWN fields rather than folded into the
+    # registered counters, so the delegate's identities (`examined = classified + deferred`,
+    # `classified = remove + preserved`) stay true instead of being widened to a set it never answered
+    # for. `?` when the arm did not answer — never an invented 0 beside a refusal.
+    # ⛔ THE NAMES ARE DELIBERATELY NOT `abandoned_` + THE REGISTERED KEY. `abandoned_candidates=`
+    # CONTAINS `candidates=`, so every existing `grep candidates=` assertion (the suite is full of
+    # them, and so is an operator's eye) would also match this arm — the escape-hatch shape that
+    # makes a substring gate report agreement between two different numbers. `abandoned_cand=`
+    # contains no registered key at all.
+    AW_FIELDS="abandoned_cand=$(_tally_num "$AW_HAVE" "$AW_CAND") abandoned_reaped=$(_tally_num "$AW_HAVE" "$AW_REAPED") abandoned_kept=$(_tally_num "$AW_HAVE" "$AW_KEPT") abandoned_cover=${AW_COVER:-0/0}"
     if is_dry; then
         # CLASS_TIMEOUT bounds the DELEGATE, not this sweep: N candidates x DU_TIMEOUT each would let a
         # single pass hold the lock for hours. The sweep gets ONE budget for the whole class.
@@ -1925,16 +1976,16 @@ reap_worktree() {
         done <<<"$rows"
         CAND_WT="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=dry-run candidates=$(_tally_num "$HAVE_WT_CAND" "$CAND_WT") would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+        say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=dry-run candidates=$(_tally_num "$HAVE_WT_CAND" "$CAND_WT") would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} ${AW_FIELDS} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
     else
         # `candidates_worktree` used to be structurally 0 on an ARMED pass (it was only accumulated in
         # the dry-run branch), so the record answered "no candidates" for a pass that classified fifty.
         # Lift the delegate's `remove=` instead of re-deriving it.
         CAND_WT="$sum_remove"
         if [ "${DF_WT_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} ${AW_FIELDS} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         else
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$VERDICT_WT mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") deferred_remove=$(_tally_num "$have_tally" "$sum_deferred_remove") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} ${AW_FIELDS} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}${SKIP_NOTE}"
         fi
     fi
     # An ANSWERED `reasons=none` is normalised ABOVE, before the class line prints it (a fix applied
@@ -2165,11 +2216,16 @@ UNMEASURED=""
 # ran with no tally makes the TOTAL unknown. Computed once, before either the line or the log uses it,
 # so the two surfaces cannot disagree again.
 CAND_TOTAL="$(( CAND_UV + CAND_VENV + CAND_WT + CAND_DUP ))"
-{ [ "${WANT_VENV:-0}" != 1 ] || [ "${HAVE_VENV_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
-{ [ "${WANT_WT:-0}" != 1 ] || [ "${HAVE_WT_CAND:-0}" = 1 ]; } || CAND_TOTAL="?"
+# ⛔ NO PER-CLASS PRE-LINES HERE (#4529 review, P2). There used to be two
+# (`{ [ "$WANT_VENV" != 1 ] || [ "$HAVE_VENV_CAND" = 1 ]; } || CAND_TOTAL="?"`, one for VENV and one
+# for WT) ABOVE the loop below. They were strictly SUBSUMED by it — the loop applies the same
+# `want ⇒ have` rule to all FOUR classes and also covers the `misconfigured` arm the pre-lines could
+# not see — so they restated a rule the file says is "expressed ONCE", in a weaker form, directly
+# above the one that actually decides. Removed rather than left as a second answer.
 # ⛔ A CLASS THAT MEASURED NOTHING CANNOT CONTRIBUTE A CONFIDENT `0` TO THE TOTAL — for ANY reason:
 # could not be SET UP (`misconfigured`), the delegate RAN and failed closed, or an armed pass with no
-# tally to lift. One rule over all five classes, so a sixth cannot be added and then forgotten here.
+# tally to lift. One rule over all FOUR classes (`uv`, `venv`, `worktree`, `duplicate-install`),
+# so a fifth cannot be added and then forgotten here.
 # ⛔ TWO OPPOSITE WAYS FOR A CLASS TO LOOK "NOT SELECTED", and only ONE of them is harmless:
 #   · `--only venv` leaves the others `WANT_*=0` because they never RAN — the `not-run` state, which is
 #     not a hole in the total. Requiring `want && have` on every class made the total `?` on EVERY
@@ -2261,6 +2317,17 @@ record_body() {
     # removal records `removed=0 failed=0 late_preserved=0`, which reads as "nothing to do" unless
     # this is visible. `?`/`not-run` polarity is the same as every other class field.
     printf 'deferred_remove_worktree=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${DEFERRED_REMOVE_WT:-}")"
+    # ⛔ THE CLASS'S SECOND ARM ANSWERS ON ITS OWN FIELDS (#4529 review, P1). Without these, an APPLY
+    # pass that reaped three abandoned checkouts recorded nothing about them anywhere in the record:
+    # `removed=` is not a record field at all, and every worktree tally above is the REGISTERED
+    # delegate's. A record that cannot see half a class reads as "nothing to do" for work the pass
+    # actually did — the same shape `deferred_remove_worktree` above exists to prevent, one arm over.
+    # Same `?`/`not-run` polarity as every other field: `?` when the arm did not answer (a refusal is
+    # `census=unreadable`, which is not a measurement), never an invented 0.
+    printf 'abandoned_worktree_candidates=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${AW_HAVE:-0}" "${AW_CAND:-}")"
+    printf 'abandoned_worktree_reaped=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${AW_HAVE:-0}" "${AW_REAPED:-}")"
+    printf 'abandoned_worktree_kept=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${AW_HAVE:-0}" "${AW_KEPT:-}")"
+    printf 'abandoned_worktree_cover=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${AW_HAVE:-0}" "${AW_COVER:-}")"
     printf 'main_proof=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PROOF_WT:-}")"
     printf 'pr_merged=%s\n' "$(_tally_rec "${WANT_WT:-0}" "${HAVE_WT_TALLY:-0}" "${PRM_WT:-}")"
     printf 'candidates_duplicate_install=%s\n' "$(_class_rec "${VERDICT_DUP:-not-run}" "${WANT_DUP:-0}" "${HAVE_DUP_CAND:-0}" "$CAND_DUP")"
