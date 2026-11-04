@@ -1184,17 +1184,18 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **13 cases and 18 mutants,
-31 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **14 cases and 19 mutants,
+33 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
 against the PRE-CHANGE tree (the base commit's
-`disk-reaper.sh` beside this owner) it reports **12 passed, 19 failed, 1 skipped**, and against this tree
-**31 passed, 0 failed, 3 skipped**: the discrimination is measured both ways, not asserted. (The 19 red on
-the pre-change tree are cases (a)—(h), (j), (k) and (l) plus the **eight** entry-point mutants that cannot even
+`disk-reaper.sh` beside this owner) it reports **12 passed, 21 failed, 1 skipped**, and against this tree
+**33 passed, 0 failed, 3 skipped**: the discrimination is measured both ways, not asserted. (The 21 red on
+the pre-change tree are cases (a)—(h), (j), (k), (l) and (n) plus the **nine** entry-point mutants that cannot even
 be applied there, because the arms they edit — including the `verdict_runner_work=` record line, the
-`unmeasurable_runner_work=` `?` polarity added at this revision, and the `--min-age` relay that carries the
-class's floor — do not exist in that `disk-reaper.sh`;
+`unmeasurable_runner_work=` `?` polarity added at this revision, the `--min-age` relay that carries the
+class's floor, and the `$_rw_line` guard that keeps a cut-short sweep from publishing a partial count —
+do not exist in that `disk-reaper.sh`;
 (i), (k)'s owner-side mutant, (j)'s two owner-side mutants, (l)'s owner-side mutant, (m) and its mutant (whose
 subject is the OWNER's own floor seam, so the base entry point cannot affect them) and the owner-side
 mutants of (a)—(c)/(h) stay
@@ -1244,7 +1245,7 @@ suite below could not be read as covering it. It was then **run to completion at
 pass is preserved, `reason=toctou`) — the same case and the same count as the pre-change baseline, i.e.
 pre-existing and not this class's. That tally is recorded here as what it is — the classes suite's own
 result, on the fields it actually asserts — and **not** as this class's evidence, which it never was. The
-record fields are MEASURED at this head by case (b) (`31 passed, 0 failed, 3 skipped` at this head on this
+record fields are MEASURED at this head by case (b) (`33 passed, 0 failed, 3 skipped` at this head on this
 box — it has real runner roots, so the (f) default-glob arm is skipped by name; the earlier
 `0 skipped` row was taken on a laptop and is not restated as this head's); the caveat that
 stood here for one revision is recorded rather than dropped silently, because "we could not measure it"
@@ -1254,13 +1255,13 @@ The measured transcript, `./scripts/disk-reaper-runner-work.test.sh`, at this he
 real runner roots (so the (f) default-glob arm is skipped by name, three times):
 
 ```
-  31 passed, 0 failed, 3 skipped
+  33 passed, 0 failed, 3 skipped
 ```
 
 and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 
 ```
-  12 passed, 19 failed, 1 skipped
+  12 passed, 21 failed, 1 skipped
 ```
 
 **The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
@@ -1272,19 +1273,19 @@ on a box told to have real runner roots so the skip path is taken (`<entry>` is 
 `mut-f` and `mut-u` are the mutant copies the suite makes in its own `$T`):
 
 ```
-  31 passed, 0 failed, 3 skipped
+  33 passed, 0 failed, 3 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-u/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
 ```
 
 **How those two numbers compose — `skipped` is ORTHOGONAL, so the arithmetic must not be "balanced".**
-`passed + failed` is the OUTCOME count (31 here: one line per case and per mutant). `skipped` is an
+`passed + failed` is the OUTCOME count (33 here: one line per case and per mutant). `skipped` is an
 independent count of arms that did not run: `skip()` neither increments nor decrements `PASS` — it records
 a reason in a file the outer runner reads at the end — and the arm's own pass line still lands, because the
 assertions beside the skip (the source check of the documented default list) still run. So
-`31 passed … 3 skipped` reads as **31 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
-`passed + skipped` legitimately EXCEEDS 31. ⛔ **A transcript is therefore never "corrected" on the grounds
+`33 passed … 3 skipped` reads as **33 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
+`passed + skipped` legitimately EXCEEDS 33. ⛔ **A transcript is therefore never "corrected" on the grounds
 that `passed + skipped` exceeds the outcome count.** An earlier revision of this section did exactly that,
 on the false premise that a skip must displace a pass, and replaced a correct transcript with
 `20 passed, 0 failed, 2 skipped` — a line no head of this suite can print; the same false premise then
@@ -1309,6 +1310,7 @@ three times, and "the same two skips" was already stale when it was written.
 | (k) | **a `reap` ROW is honoured — the table's OTHER disposition is not inert**: a `_foo|reap|…` row is injected into a copy of the owner, and `_work/_foo` is REAPED (a `REAP`/`REAPED` row names it), while the four `retain` rows still hold at the same age with their own reason strings, an UNDECIDED dead checkout beside them is reaped in the same pass, and the pass record names the decided row (`reaped-by-table=_foo`). Measured before the fix: `_foo` came back `RETAINED … reason=vendor-namespace-unlisted` — "no WORK_LAYOUT row" about a name whose row was in the table — while its `job-dead` control was reaped, i.e. the disposition the script and this doc tell an operator to write was inert AND the log named the wrong cause | the table lookup is filtered to `retain` (the shipped bug: a `reap` row then matches nothing and falls through to the `_`-prefix default) |
 | (l) | **a root that cannot be LISTED is an abstention, never a measured zero.** `_work` is set to mode 0111 (stat-able and traversable, NOT listable) with a dead entry under it; the glob then expands to itself and reaches no entry. The pass must count `roots=1 candidates=0 unmeasurable=1`, EXIT 0 (an abstention is not a failure), NAME the root (`reason=unlistable`), carry it into the record as `unmeasurable_runner_work=1`, and — because nothing was classified — the dead entry must SURVIVE. Before this arm the same fixture reported `unmeasurable=0 census=ok`, exit 0, `verdict_runner_work=ok`: an inert class reading healthy. ⚠️ Skipped by name (not passed) when the suite runs **as root**, because `chmod` cannot deny root and the condition cannot be made | the `[ "$_seen" = 0 ] && ! root_is_listable "$root"` guard is deleted, restoring the measured-zero reading |
 | (m) | **an OUT-OF-RANGE floor is REFUSED, and a leading-zero floor is NORMALISED** — the floor is the only gate on a `rm -rf`, so its refusal path is load-bearing: `--min-age 18446744073709551616` (2^64) is all-digits, `now − 2^64` WRAPS to `now` in bash's 64-bit arithmetic, the floor ref lands at NOW and every entry is older than it — **measured: a 5-minute-old entry `REAPED` under a floor set to "keep everything"**, the log asserting a flat falsehood about its age; and `--min-age 08` passed the digit check, then `$(( ))` died on the octal spelling, the floor became unusable, and the pass still exited **0** with `census=ok` calling every entry `reason=unreadable` — a bad knob reported as a filesystem problem. The case drives the **OWNER directly**, because the entry point already bounds its own seam and exits 3; the owner's `--min-age` / `REAP_RW_MIN_AGE` was bounded by nothing. Asserts rc 2, the cause named, the entry SURVIVED, no `census=ok`, and that `08` normalises to `min_age=8s` rather than aborting | the magnitude bound `[ "${#_rw_floor_norm}" -gt 9 ]` is disabled, restoring the wrap that deletes |
+| (n) | **a CUT-SHORT sweep publishes no PARTIAL candidate count.** The owner prints its `SUMMARY` unconditionally on every path that reaches the end of a pass, and it deliberately refuses to truncate a `--dry-run` ("a partial count presented as a total, which is the false-measurement shape this class's own `census=` refusal exists to prevent"); the ENTRY POINT then bounds the delegate with `CLASS_TIMEOUT`, so the rows a cut-short dry pass printed first ARE a partial count. Driven with a STUB owner that emits two `REAP` rows and no ledger — the observable shape of that cut, not a race against a real `timeout`, which flakes under load on exactly the box this class exists for. Asserts the record answers `candidates_runner_work=?` and NEVER a number, that the class line carries the same `?`, and that the rows it did scan are still NAMED as `WOULD-REMOVE`, so nothing an operator needs is lost | the `&& [ -n "$_rw_line" ]` guard on the dry-run row-count fallback is dropped, restoring the shipped fallback that turns partial rows into a total |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
