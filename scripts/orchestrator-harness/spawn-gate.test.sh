@@ -343,6 +343,42 @@ function selfdefault(nm, rhs,   m, head) {
   sub(/\}.*$/, "", m)
   return iscode(m) ? m : ""
 }
+# strip_comment(s) -> s with a trailing `#` comment removed, and ONLY a real one.
+# ⛔ A QUOTE-BLIND STRIP IS A FAIL-OPEN (review of `8af952e0`, P1 — measured). The first cut was
+# `sub(/[ \t]#.*$/, ...)`, which cuts at the first WHITESPACE-then-`#` with no quoting model — so a `#`
+# inside a QUOTED STRING truncated the line, and a genuine declaration AFTER it vanished: measured
+# through this predicate, `true && echo "a # b" && AGENT_NEW_GATE_REFUSED=83` gave 0 rows for the name
+# and RC=0 GREEN over a real duplicate of the skew code, while the same duplicate without the quoted
+# string was RED. That is the identical defect this scanner was rewritten to close (a declaration with
+# 0 rows), reintroduced by the arm written to stop a false red — so the strip has to know what a quote
+# is. bash's own rule, verified against the shell: a `#` begins a comment only when it begins a WORD
+# (line start, or an unquoted `[ \t;(]` before it) — `${X#*=}` (a name before it), `$#` and `echo a#b`
+# (no whitespace) are all NOT comments, and a `#` inside `"…"` or `'…'` is literal.
+# The word-start set is deliberately NARROWER than bash's: `)` is left out, because `x=(a)# hi` really
+# does NOT comment (measured) while `(echo a)# hi` does, and an ambiguous case must resolve to KEEPING
+# the text — over-keeping is a false RED (visible, and what the previous round complained about),
+# while over-stripping is a false GREEN (the fail-open this arm exists to prevent).
+function strip_comment(s,   i, n, c, q, p) {
+  n = length(s); q = ""
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (q == "") {
+      if (c == "\\") { i++; continue }        # an unquoted backslash escapes the next character
+      if (c == "\"") { q = "\""; continue }
+      if (c == "'")  { q = "'";  continue }
+      if (c == "#") {
+        p = (i == 1) ? "" : substr(s, i - 1, 1)
+        if (i == 1 || p ~ /[ \t;(]/) return substr(s, 1, i - 1)
+      }
+    } else if (q == "\"") {
+      if (c == "\\") { i++; continue }        # …and inside `"…"` it still does
+      if (c == "\"") q = ""
+    } else {
+      if (c == "'") q = ""                    # inside `'…'` NOTHING escapes
+    }
+  }
+  return s
+}
 function row(kind, name, v, f, ln) {
   if (iscode(v)) print kind, name, v + 0, f, ln
   else           print "unknown", name, v, f, ln
@@ -372,7 +408,11 @@ function row(kind, name, v, f, ln) {
   # treats `#` as a value terminator and this file's own `strip_comments` (`s/[[:space:]]#.*$//`) is the
   # same rule, so the scan now applies it to the whole LINE. A `#` that is part of an expansion
   # (`${X#*=}`, `${X##*/}`) has no whitespace before it and is untouched.
-  sub(/[ \t]#.*$/, "", scan)
+  # ⛔ AND THE STRIP WAS QUOTE-BLIND, WHICH MADE IT A FAIL-OPEN (review of `8af952e0`, P1 — measured):
+  # `sub(/[ \t]#.*$/, ...)` cut at a `#` inside a QUOTED STRING, hiding a declaration after it. It is
+  # `strip_comment()` now, which tracks `"…"` / `'…'` and only removes a `#` at a word start. See its
+  # definition for the measurement and for why the word-start set is narrower than bash's.
+  scan = strip_comment(scan)
   # ⛔ THE NAMING CONVENTION IS ASSERTED, NOT ASSUMED (review of PR #3237, finding 1). The claim scan
   # below is anchored on the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED` namespace, so a gate code
   # declared under ANY OTHER NAME is invisible to it — measured: `AGENT_MEM_GATE=81`, a real duplicate
@@ -425,6 +465,19 @@ function row(kind, name, v, f, ln) {
   rest = scan
   while (match(rest, /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)/)) {
     name = substr(rest, RSTART, RLENGTH)
+    # ⛔ A LONGER IDENTIFIER IS NOT THIS NAME (review of `8af952e0`, P2 — measured). The pattern above
+    # matches a PREFIX and has no name boundary after the suffix, so `AGENT_NEW_GATE_REFUSED_CHOICE`
+    # was read as a family token and refused as `unparseable declaration: <file>:<line>` — a false RED
+    # naming a variable that is not in the family at all. A name character immediately after the match
+    # means the token is LONGER than the family name, so the whole identifier is stepped over and the
+    # scan resumes after it (NOT at the match end, which would re-match an overlapping suffix and could
+    # skip a real declaration later on the same line).
+    if (substr(rest, RSTART + RLENGTH, 1) ~ /[A-Za-z0-9_]/) {
+      _e = RSTART
+      while (substr(rest, _e, 1) ~ /[A-Za-z0-9_]/) _e++
+      rest = substr(rest, _e)
+      continue
+    }
     pre  = substr(rest, 1, RSTART - 1)
     tail = substr(rest, RSTART + RLENGTH)
     if (pre ~ /\$\{[ \t"']*$/) {               # inside ${...}
@@ -2527,6 +2580,43 @@ printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
 ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip, a bare exit \"\$X\" and an INLINE COMMENT carrying a declaration all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1d) ⛔ THE COMMENT STRIP MUST KNOW WHAT A QUOTE IS (review of `8af952e0`, P1 — measured). The strip
+# was `sub(/[ \t]#.*$/, ...)`, a first-whitespace-then-`#` cut with NO quoting model — so a `#` inside a
+# QUOTED STRING truncated the line and a genuine declaration AFTER it vanished: 0 rows for the name and
+# RC=0 GREEN over a real duplicate of the skew code. That is the exact defect this scanner was rewritten
+# to close, reintroduced by the arm written to stop a false red, so it gets both directions pinned —
+# each alone is satisfiable by a strip that is simply wrong:
+#   1. a declaration AFTER a quoted `#` must still be READ (RED, naming the 83 collision);
+#   2. a quoted `#` with no declaration after it must still stay SILENT (the false red the strip exists
+#      for) — `echo "a # b"` and `echo 'a # b'`.
+_codemut_dir="$(_codemut comment-quote)"
+printf '\ntrue && echo "a # b" && AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote-blind comment) a declaration AFTER a quoted \`#\` is still READ and collides — a strip that cuts at the quoted \`#\` reads this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-quote-control)"
+printf "\necho \"a # b\"\necho 'a # b'\ntrue # AGENT_NEW_GATE_REFUSED=83\n" >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(quote-aware comment control) a \`#\` inside \"…\" or '…', and a real trailing comment on \`true\`, stay SILENT — the other direction of the same arm (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1e) ⛔ A LONGER IDENTIFIER IS NOT A FAMILY TOKEN (review of `8af952e0`, P2 — measured). The claim
+# scan matches a PREFIX of the identifier and had no name boundary after the suffix, so
+# `AGENT_NEW_GATE_REFUSED_CHOICE` was read as the family name and refused as an `unparseable
+# declaration` — a false RED naming a variable that is not in the family at all. Pinned in BOTH
+# directions, because a boundary that simply stopped scanning would pass the first row and lose the
+# declaration on the second.
+_codemut_dir="$(_codemut longer-identifier)"
+printf '\nread -r AGENT_NEW_GATE_REFUSED_CHOICE\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(name boundary) a LONGER identifier that merely ENDS in a family suffix (\`AGENT_NEW_GATE_REFUSED_CHOICE\`) is not the family token and stays SILENT — no name boundary read it as an unparseable declaration (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut after-longer-identifier)"
+printf '\nread -r AGENT_NEW_GATE_REFUSED_CHOICE; AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(name boundary, other direction) a real declaration AFTER a longer identifier on the same line is still READ and collides — stepping over the identifier must not stop the scan (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f) THE FAIL-CLOSED HALF: an assignment OPERATOR on a family token that is NOT in a declaration
 # position cannot be classified, so it must be RED and NAMED WITH ITS LINE — never dropped. This is the
