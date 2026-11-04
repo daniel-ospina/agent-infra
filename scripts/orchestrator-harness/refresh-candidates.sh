@@ -3867,14 +3867,18 @@ rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written,
   # ⛔ AND MEMBERSHIP IS CHECKED, NOT ASSUMED FROM THE AWK BEING RIGHT (review P1, cycle 4). Every guard
   # above reasons about ONE read of the queue; the install is a LATER, separate decision, and the file
   # can change in between (the prune in orch-loop.sh truncates it IN PLACE, no `.refresh.lock`). So the
-  # ROW SET about to be installed is compared with the row set the queue holds NOW: a partial or torn
-  # read can then only ever FAIL the reorder, leaving the queue untouched, instead of installing a
-  # truncated queue and calling it an order. `sort -u` compares SETS only — it never contributes an
-  # ordering, which stays the pool's rank alone (#1178).
-  if [ "$(LC_ALL=C sort -u "$queue" 2>/dev/null)" != "$(LC_ALL=C sort -u "$out" 2>/dev/null)" ]; then
-    return 1
-  fi
+  # ROW SET about to be installed is compared with the row set the queue holds — at the INSTALL, in
+  # `queue_order_from_pool` below, where the write actually happens. `sort -u` compares SETS only — it
+  # never contributes an ordering, which stays the pool's rank alone (#1178).
   return 0
+}
+# queue_order_refuse <O> <sentence> — the ONE refusal path for an install this pass must not perform.
+# It names the state, and leaves candidates.txt untouched: temps removed, no `mv`, nothing created.
+queue_order_refuse() {
+  QUEUE_ORDER_STATE="priority-unreadable"
+  echo "[refresh] priority-unreadable: ${2:-the order could not be installed — the queue is UNVERIFIED}"
+  rm -f "$1/.cand.ranked" "$1/.queue-rank" 2>/dev/null
+  return 1
 }
 # queue_order_from_pool <O> -> writes $O/candidates.txt in pool order, prints what it did (or why not)
 # ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
@@ -3905,20 +3909,46 @@ queue_order_from_pool() {
   # inode is silently REVERTED by our `mv`, so a dispatched id reappears in the queue; (b) worse, if the
   # read caught the truncate window the queue reads EMPTY, and an unconditional `mv` would put a
   # ZERO-BYTE file over the queue and destroy its MEMBERSHIP — the one thing "ORDER, NEVER MEMBERSHIP"
-  # forbids. ⛔ AND THIS IS NOT THE ONLY GUARD ON THAT WINDOW (review P1, cycle 4): `cmp` is a SECOND
-  # read, so it closes only the ordering where the file is still empty when it runs. The structural
-  # guard is the caller's — `rank_queue_by_pool` refuses a queue that is not a readable regular file and
-  # refuses an install whose ROW SET differs from the queue's — and this skip is the cheap case that
-  # also spares a needless inode swap.
+  # forbids.
+  #
+  # ⛔ AND THE MEMBERSHIP CHECK LIVES HERE, AT THE INSTALL — NOT IN THE RANKER (review P1, cycle 5). It
+  # used to sit ~40 lines above this block, inside `rank_queue_by_pool`, which returns EARLY on the
+  # drained-queue arm — so the one ordering the guard exists for (a prune truncates the queue between
+  # the read and this write) took the early return and skipped the compare entirely: `.cand.ranked` was
+  # the empty file, `cmp` then saw the now-repopulated queue and differed, and `mv` installed a ZERO-BYTE
+  # queue and reported it as a MEASURED "the queue is EMPTY". Reproduced with a `cmp` wrapper that models
+  # the prune landing (no code mutation): `MV: installing [0 bytes] over [8 bytes]` + "the queue is
+  # EMPTY", final file 0 bytes. An install-time invariant belongs at the install. The check is TWO
+  # parts: the emptied-reorder refusal below is the deterministic one (no comparison needed), and the
+  # row-set compare catches a partial/torn read. Re-reading the queue here also shrinks the resurrect
+  # window to two adjacent commands — it cannot be made atomic without a lock on the pruner, which this
+  # file does not own.
+  if [ ! -s "$o/.cand.ranked" ] && [ -s "$o/candidates.txt" ]; then
+    queue_order_refuse "$o" "the reorder produced an EMPTY queue while $o/candidates.txt holds rows — the queue changed under this pass (a concurrent prune truncated and refilled it); NOTHING was installed, so the queue keeps its rows and its order is UNVERIFIED"
+    return 1
+  fi
+  if [ "$(LC_ALL=C sort -u "$o/candidates.txt" 2>/dev/null)" != "$(LC_ALL=C sort -u "$o/.cand.ranked" 2>/dev/null)" ]; then
+    queue_order_refuse "$o" "the reorder's ROW SET differs from the one $o/candidates.txt holds NOW — the queue changed under this pass (a concurrent prune, or a torn read); NOTHING was installed and the queue is untouched"
+    return 1
+  fi
   _wrote=0
   if cmp -s "$o/.cand.ranked" "$o/candidates.txt"; then
     rm -f "$o/.cand.ranked" 2>/dev/null
-  elif ! mv "$o/.cand.ranked" "$o/candidates.txt"; then
-    QUEUE_ORDER_STATE="priority-unreadable"
-    echo "[refresh] priority-unreadable: the pool-ordered queue could not be moved into $o/candidates.txt — the queue on disk is UNCHANGED (the pre-reorder file, i.e. whatever the PREVIOUS pass left), so its order is UNVERIFIED this pass and its severity is UNKNOWN"
-    rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
-    return 1
   else
+    # ⛔ AND THE CHECK IS REPEATED HERE, ADJACENT TO THE `mv` (review P1, cycle 5). Everything above is a
+    # separate, earlier read; the prune can land between it and the move, and the failure that matters —
+    # an EMPTY install over a queue that now holds rows — is decided by the state of the file at the
+    # MOMENT OF THE MOVE. Two adjacent commands leave no practical window, and they are the last thing
+    # between a torn read and a destroyed queue.
+    if { [ ! -s "$o/.cand.ranked" ] && [ -s "$o/candidates.txt" ]; } \
+       || [ "$(LC_ALL=C sort -u "$o/candidates.txt" 2>/dev/null)" != "$(LC_ALL=C sort -u "$o/.cand.ranked" 2>/dev/null)" ]; then
+      queue_order_refuse "$o" "the queue changed between this pass's read and its install — candidates.txt no longer holds the rows the reorder was computed from; NOTHING was installed and the queue is untouched"
+      return 1
+    fi
+    if ! mv "$o/.cand.ranked" "$o/candidates.txt"; then
+      queue_order_refuse "$o" "the pool-ordered queue could not be moved into $o/candidates.txt — the queue on disk is UNCHANGED (the pre-reorder file, i.e. whatever the PREVIOUS pass left), so its order is UNVERIFIED this pass and its severity is UNKNOWN"
+      return 1
+    fi
     _wrote=1
   fi
   _r=0; _u=0; _h=""
@@ -3989,7 +4019,7 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
   case "${NOW_EPOCH:-}" in ''|*[!0-9]*) NOW_EPOCH=0 ;; esac
   AGE=$(( NOW_EPOCH - PREV_EPOCH ))
   if [ "$AGE" -ge 0 ] && [ "$AGE" -lt "$SKIP_TTL" ]; then
-    echo "[refresh] queue=$POOL_STATE unchanged for ${AGE}s (digest ${POOL_DIGEST%${POOL_DIGEST#????????}}, ttl ${SKIP_TTL}s) — the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate and left nothing unattempted, so this pass SKIPS the per-candidate pre-flight (#1984). Nothing was queued and nothing was judged: this is not \"no work\", it is \"the answer would be the same\" — checked.txt is untouched, and candidates.txt's MEMBERSHIP is untouched (its ORDER is still re-derived from the pool, which is not a queueing decision and does not depend on a verdict)."
+    echo "[refresh] queue=$POOL_STATE unchanged for ${AGE}s (digest ${POOL_DIGEST%${POOL_DIGEST#????????}}, ttl ${SKIP_TTL}s) — the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate and left nothing unattempted, so this pass SKIPS the per-candidate pre-flight (#1984). Nothing was queued and nothing was judged: this is not \"no work\", it is \"the answer would be the same\" — checked.txt is untouched, and candidates.txt's MEMBERSHIP is untouched. ⛔ POLICY, NOT A RESULT (review P2, cycle 5): its ORDER is RE-DERIVED from the pool every pass — that is what the call below does, and its own line reports whether it succeeded; asserting the outcome here would be a claim made before the work."
     # ⛔ A SKIPPED PASS IS A SUCCESS, AND IT MUST SAY SO (#2229). Without this record the EXIT trap —
     # which turns an UNRECORDED exit into a failure, correctly — would report every unchanged-input
     # pass as broken. It hands NOTHING (it judged nothing), so it names the queue's head instead of
@@ -4002,14 +4032,28 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     # here is how the head could stay a `P2-moderate` through an unchanged-input window (measured
     # 2026-11-01: head #2944 for 23 minutes of skipped passes).
     queue_order_from_pool "$O" || true
-    _skip_head="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
-    case "$_skip_head" in ''|*[!0-9]*) _skip_head="" ;; esac
-    _skip_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
-    case "$_skip_n" in ''|*[!0-9]*) _skip_n=0 ;; esac
-    if [ -n "$_skip_head" ]; then
+    # ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY ONE — and this arm used to type exactly that (review P2,
+    # cycle 5). `head`/`wc -l` on a candidates.txt that is a DIRECTORY (or unreadable) return nothing,
+    # which coerced to `_skip_n=0` and printed "the queue is empty, so dispatch has nothing to take" — a
+    # MEASURED-empty claim over a queue this pass could not read — and then wrote `backlog=0` into the
+    # durable record. That is the #1931 polarity the input guard above is there to enforce, reintroduced
+    # one layer up. The queue is READ, or the sentence says it could not be.
+    _skip_head=""; _skip_n=""; _skip_backlog=""
+    if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+      _skip_head="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
+      case "$_skip_head" in ''|*[!0-9]*) _skip_head="" ;; esac
+      _skip_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+      case "$_skip_n" in ''|*[!0-9]*) _skip_n="" ;; esac
+    fi
+    if [ -z "$_skip_n" ]; then
+      echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged), and the queue could NOT be READ ($O/candidates.txt is not a readable regular file), so this pass cannot say what dispatch would take"
+      _skip_backlog="UNKNOWN"
+    elif [ -n "$_skip_head" ]; then
       echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged); the queue still holds $_skip_n candidate(s), head #$_skip_head, which dispatch takes next"
+      _skip_backlog="$_skip_n"
     else
       echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged) and the queue is empty, so dispatch has nothing to take"
+      _skip_backlog="$_skip_n"
     fi
     REFRESH_RECORDED=1
     # ⛔ THE RECORD NAMES THE PROVENANCE IT ACTUALLY HAS, PER STATE (review P2, cycle 4). The literal used
@@ -4025,7 +4069,7 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     esac
     refresh_record_write ok skip 0 \
       "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, and NO candidate added or dropped ($_skip_order_why; a duplicate row, if the queue somehow carried one, is collapsed to its first occurrence)" \
-      "judged=0" "backlog=$_skip_n" "handed=$_skip_head" "unusable="
+      "judged=0" "backlog=$_skip_backlog" "handed=$_skip_head" "unusable="
     exit 0
   fi
 fi

@@ -200,23 +200,22 @@ got="$(cat "$TMP/member/order" 2>/dev/null)"
 [ "$got" = "100 5000 9000" ] && rc=0 || { rc=1; echo "      order '$got' (want '100 5000 9000')"; }
 ck "the ranked row leads, the unranked rows follow in their EXISTING order (100 5000 9000)" $rc
 
-# 2b) NON-VACUITY of the membership check: the tail-dropping mutation is refused by the membership
-#     guard (1c), so to prove the ASSERTION ITSELF can fail, drive the mutation with that guard removed
-#     too. Two mutations, two different claims: 1c pins the GUARD, this pins the ASSERTION.
-MUT_NOGUARD="$TMP/fns-drop-tail-noguard.sh"
-sed '/LC_ALL=C sort -u/,+2d' "$MUT_DROP_TAIL" > "$MUT_NOGUARD"
-grep -q 'LC_ALL=C sort -u' "$MUT_NOGUARD" && ng=1 || ng=0
-[ "$ng" -eq 0 ] && rc=0 || { rc=1; echo "      the guard-removing mutation did not apply — anchor drifted"; }
-ck "the guard-removing mutation applied (the membership set-compare is gone from the extracted copy)" $rc
-drive mut-member "$MUT_NOGUARD" '5000
-100
-9000
-5000
-' '100
-'
-mut_set="$(sort -n "$TMP/mut-member/o/candidates.txt" 2>/dev/null | uniq | tr '\n' ' ' | sed 's/ *$//')"
-[ "$mut_set" != "$before_set" ] && rc=0 || { rc=1; echo "      mutated source kept the set '$mut_set' — the membership assertion is vacuous"; }
-ck "non-vacuity: the membership assertion FAILS on the tail-dropping mutation once the guard is removed" $rc
+# 2b) NON-VACUITY of the membership guard: the condition it refuses on must be REACHABLE, not
+#     hypothetical. The guard now lives at the INSTALL (cycle 5), so a differing row set can no longer
+#     be installed at all — which means the proof belongs one layer down: drive the RANKER directly
+#     with the tail-dropping mutation and show its output's ROW SET really is missing a row. If this
+#     ever equals the queue's set, the mutation has gone inert and 1c's refusal proves nothing.
+DR="$TMP/mut-member"; mkdir -p "$DR"
+printf '5000\n100\n9000\n5000\n' > "$DR/q"
+printf '100\n' > "$DR/pool"
+{
+  cat "$MUT_DROP_TAIL"
+  printf 'rank_queue_by_pool "$1" "$2" "$3" "$4"\nexit $?\n'
+} > "$DR/drive.sh"
+( cd "$DR" && HOME="$DR" bash drive.sh "$DR/pool" "$DR/q" "$DR/out" "$DR/cnt" ) >/dev/null 2>&1
+mut_set="$(sort -n "$DR/out" 2>/dev/null | uniq | tr '\n' ' ' | sed 's/ *$//')"
+[ -n "$mut_set" ] && [ "$mut_set" != "$before_set" ] && rc=0 || { rc=1; echo "      mutated ranker emitted '$mut_set' (queue set '$before_set') — the tail-dropping mutation is inert, so 1c proves nothing"; }
+ck "non-vacuity: the tail-dropping ranker's ROW SET really does differ from the queue's (the condition the install refuses on)" $rc
 
 # ── 3) THE UNRANKED TAIL KEEPS ITS OWN RELATIVE ORDER ────────────────────────
 # Two ranked rows (200, 300) and two unranked (9, 7) INTERLEAVED in the queue: the tail must come out in
@@ -477,6 +476,41 @@ if [ "$dup_order" = "300 9" ] && grep -q 'WAS rewritten' "$TMP/dupnone/out" 2>/d
    && ! grep -q 'byte-identical' "$TMP/dupnone/out" 2>/dev/null; then rc=0
 else rc=1; echo "      order '$dup_order' (want '300 9'); out: $(tr '\n' '|' < "$TMP/dupnone/out" 2>/dev/null | head -c 260)"; fi
 ck "the ranked-none arm that DID rewrite (a duplicate collapsed) says so, and does not claim 'byte-identical'" $rc
+
+# ── 11) THE PRUNE THAT LANDS BETWEEN THE READ AND THE INSTALL IS REFUSED ─────
+# orch-loop.sh prunes candidates.txt with `open(path,"w")` — truncate IN PLACE, no `.refresh.lock` —
+# while this refresh runs BACKGROUNDED. The ordering that matters: the pass reads an EMPTY queue (the
+# truncate window) and the prune REFILLS it before the file is replaced. The membership check used to
+# live in `rank_queue_by_pool`, which returns EARLY on the drained arm — so on this exact ordering it
+# never ran, `.cand.ranked` was the empty file, `cmp` differed against the refilled queue, and `mv`
+# installed a ZERO-BYTE queue while the pass reported a MEASURED "the queue is EMPTY". Modelled
+# deterministically with a `cmp` shim on PATH that refills the queue before comparing (no mutation of
+# the code under test): the install must be REFUSED and the rows must survive.
+SH="$TMP/prunerace"; mkdir -p "$SH/o" "$SH/bin"
+printf '111\n222\n' > "$SH/seed"
+printf '200\n300\n' > "$SH/o/.pool"
+: > "$SH/o/candidates.txt"
+cat > "$SH/bin/cmp" <<'SHIM'
+#!/usr/bin/env bash
+# model the concurrent prune: refill the queue, THEN compare for real
+cp "$PRUNE_SEED" "$PRUNE_QUEUE" 2>/dev/null || true
+exec /usr/bin/cmp "$@"
+SHIM
+chmod +x "$SH/bin/cmp"
+{
+  echo 'QUEUE_ORDER_STATE=""'
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\nexit $?\n'
+} > "$SH/drive.sh"
+( cd "$SH" && HOME="$SH" PATH="$SH/bin:$PATH" PRUNE_SEED="$SH/seed" PRUNE_QUEUE="$SH/o/candidates.txt" bash drive.sh "$SH/o" ) > "$SH/out" 2>&1
+race_rc=$?
+race_rows="$(tr '\n' ' ' < "$SH/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+if [ "$race_rc" -ne 0 ] && [ "$race_rows" = "111 222" ] \
+   && grep -q 'priority-unreadable' "$SH/out" 2>/dev/null \
+   && ! grep -q 'the queue is EMPTY' "$SH/out" 2>/dev/null \
+   && [ ! -e "$SH/o/.cand.ranked" ]; then rc=0
+else rc=1; echo "      rc=$race_rc rows='$race_rows' (want '111 222'); out: $(tr '\n' '|' < "$SH/out" 2>/dev/null | head -c 300)"; fi
+ck "a prune that refills the queue between the read and the install is REFUSED — the rows survive, no 'EMPTY' is reported" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
