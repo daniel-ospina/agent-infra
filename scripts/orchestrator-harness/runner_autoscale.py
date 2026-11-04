@@ -61,14 +61,17 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
                agent names: the box's own inventory, attributable to a name and a repo.
   3. READ      the repo's pool (`gh api …/actions/runners`): name, status, busy, labels.
   4. CLASSIFY  each local install — the ORDER of these checks is the safety property
-               CONFIG-LOST its `.runner` is present and EMPTY (0 bytes). Checked FIRST, before any
-                         pool comparison: the install has no agentName and no URL, so a slug
-                         comparison would read it OTHER-REPO and `pool.get("")` would answer
-                         ORPHANED — i.e. a `--replace` re-registration of a name that does not
-                         exist. Reported in `config_lost` and in `notes`, never repaired. Its
-                         LIVENESS is still measured (a truncated config does not stop a listener
-                         that is already up). A NON-empty unparseable config is NOT this state:
-                         it may still describe a live registration, so it aborts the pass.
+               CONFIG-LOST its `.runner` is present and EMPTY (0 bytes). Checked first, before any
+                         pool comparison, because the install has no agentName and no URL: it must
+                         be REPORTED, not folded into a state that describes something else.
+                         Without this branch an empty `repo` compares UNEQUAL to `--repo`, so the
+                         install reads OTHER-REPO — never repaired either, but SILENT: it would
+                         leave `config_lost` and `notes` empty, a positive claim that nothing is
+                         lost, on the only channel a machine reader has. Never repaired (the agent
+                         name a re-registration needs is exactly what it lost). Its LIVENESS is
+                         still measured: a truncated config does not stop a listener that is
+                         already up. A NON-empty unparseable config is NOT this state — it may
+                         still describe a live registration, so it aborts the pass.
                OTHER-REPO  its `.runner` names a DIFFERENT repo. Checked before this repo's pool:
                          the pool cannot see that registration at all, so the absence below would
                          otherwise read as ORPHANED and re-register it HERE with `--replace`,
@@ -534,10 +537,12 @@ class LocalRunner:
     repo: str
     alive: bool = False
     # ⛔ A CONFIG THAT IS EMPTY IS NOT A CONFIG THAT IS UNREADABLE. `.runner` present with ZERO
-    # bytes records NO registration at all: no agentName, no URL, and its companion
-    # `.credentials` is empty too, so it cannot authenticate as any registration anywhere. That
-    # makes it the one unparseable shape that CANNOT describe a live runner elsewhere — which is
-    # the hazard the `Unmeasurable` in `_read_runner_config` exists to prevent. See `discover()`.
+    # bytes records NO registration at all: no agentName, no URL, so it cannot describe a live
+    # runner anywhere. That makes it the one unparseable shape this exemption is safe for — which is
+    # the hazard the `Unmeasurable` in `_read_runner_config` exists to prevent. In the MEASURED
+    # 2026-11-03 shape its `.credentials` and `.credentials_rsaparams` were truncated in the same
+    # breath, but this file does NOT stat those two: the exemption rests on the empty `.runner`
+    # ALONE (see `discover()`).
     config_lost: bool = False
 
     @property
@@ -3005,12 +3010,16 @@ def converge(
     for r in local:
         entry = pool.get(r.name)
         # ⛔ THE ORDER OF THESE BRANCHES IS THE SAFETY PROPERTY (review rounds 1–2).
-        #  0. A LOST CONFIG first, before ANY pool comparison: `r.name` is empty, so
-        #     `_repo_slug(r.repo) != _repo_slug(repo)` ("" != "daniel-ospina/tortoise") would
-        #     classify it OTHER-REPO and `pool.get("")` would answer `None` — ORPHANED, i.e. a
-        #     `--replace` re-registration of an install whose identity does not exist. It is
-        #     REPORTED and never repaired; its slot stays dead until a human (or a future arm that
-        #     can name it) re-registers it.
+        #  0. A LOST CONFIG first, before ANY pool comparison — and the cost of removing it is
+        #     SILENCE, not a `--replace` (corrected: an earlier version of this comment claimed
+        #     `pool.get("")` would answer `None` → ORPHANED → a re-registration. It cannot: an
+        #     empty `r.repo` is UNEQUAL to `--repo` at the next `elif`, so the chain stops at
+        #     OTHER-REPO and the `entry is None` arm is never reached. OTHER-REPO is never repaired
+        #     either, so the defective outcome was never destruction — it is that the lost slot
+        #     would vanish from `config_lost` and `notes` and be reported as ANOTHER REPO'S runner,
+        #     a positive claim that nothing is lost, on the one channel a machine reader has.)
+        #     It is therefore REPORTED (`config_lost` + `notes`) and never repaired; its slot stays
+        #     dead until a human (or a future arm that can name it) re-registers it.
         #  1. ANOTHER REPO next: `pool` is ONE repo's pool, so an install whose `.runner` names
         #     a different repo is simply ABSENT from it — indistinguishable from ORPHANED by the
         #     pool read alone. Treating that absence as ORPHANED re-registers it against `--repo`
