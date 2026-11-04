@@ -27,7 +27,8 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
   * neuter the lane-census reconciliation      -> 5 paired CENSUS reds (the fifth is the
                                                  exit-code check), plus collateral reds in the
-                                                 other census checks (measured 14 total)
+                                                 other census checks (measured 16 total, up from
+                                                 14 when the stale-roster arm was pinned)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -509,7 +510,8 @@ def leg_lane_census(mod):
         "CENSUS: an UNREADABLE process table is NAMED, never rendered as agreement",
         "CENSUS: a genuinely empty process table raises nothing",
         "CENSUS: a live, attributed lane reconciles the populations",
-        "CENSUS: an ACCURATE roster whose lanes have all exited raises nothing",
+        "CENSUS: an all-dead roster on a box with NO pi running is an idle fleet, not a stale roster",
+        "CENSUS: an all-dead roster while pi RUNS is a STALE ROSTER — the roster names none of the population",
     )
     # ⛔ A MISSING FUNCTION IS A RED, NOT A TRACEBACK. The pre-fix module has no `lane_census`,
     # and this suite must report that as failed checks so the red control can key on the ❌
@@ -537,11 +539,24 @@ def leg_lane_census(mod):
         check(bool(abst) and "UNRECONCILED" in abst, PREDICATE[2])
         check(fn(0, 0, 0, 7) is None, PREDICATE[3])
         check(fn(2, 7, 9, 7) is None, PREDICATE[4])
-        # ⛔ AN ALL-DEAD TABLE IS NOT A STALE ROSTER (review cycle 1, finding 1): `measured > 0`
-        # means the roster's own sessions ARE in the store and positively died — a legitimately
-        # idle fleet. Keying on `attributed == 0` alone made that state print "the roster is
-        # stale ... UNMEASURED (not dead)" over seven `PID DEAD` rows, and forced exit 1.
-        check(fn(0, 7, 1, 7) is None, PREDICATE[5])
+        # ⛔ "A CONCLUSIVE VERDICT" IS NOT "THE ROSTER ACCOUNTS FOR THE BOX" (review cycle 7,
+        # finding 1). This check used to read `check(fn(0, 7, 1, 7) is None, "an ACCURATE roster
+        # whose lanes have all exited raises nothing")` — and that LABEL WAS FALSE: with
+        # `pi_count=1` a pi process IS running that the roster does not name, so the roster is not
+        # accurate at all. It was the assertion that certified the bypass as correct. Split into
+        # the two states it had conflated: the genuinely idle box (pi measured 0) is silent, and
+        # the stale roster (every lane DEAD while pi runs) ALARMS — reproduced end-to-end at
+        # 17 live pi processes, seven `PID DEAD` rows, no census line, `✅ no suspects`.
+        check(fn(0, 7, 0, 7) is None, PREDICATE[5])
+        stale = fn(0, 7, 18, 7)
+        check(bool(stale) and "STALE ROSTER" in stale, PREDICATE[6])
+        # ... and the alarm is the POPULATION's, not the dead count's: six dead + one abstention
+        # while pi runs is a mismatch too, so "some lane is dead" can never be the silent trigger.
+        check(bool(fn(0, 6, 18, 7)) and "MISMATCH" in fn(0, 6, 18, 7),
+              "CENSUS: a mostly-dead roster while pi runs still alarms")
+        # ... while an all-dead roster on an UNREADABLE table adds nothing the verdicts lack.
+        check(fn(0, 7, None, 7) is None,
+              "CENSUS: an all-dead roster with an UNREADABLE table is resolved, not UNRECONCILED")
 
     # ⛔ THE PRODUCER'S OWN CONTRACT — `pi_process_count()` — was stubbed by this leg and pinned
     # by nothing, the same producer-contract gap this lane closed for `beta-progress.gh()`: a
@@ -727,8 +742,16 @@ def _flatten_exit4(src):
 
 
 MUTATIONS = [
+    # ⛔ THE MUTANT MUST NEUTER, NOT RE-ROUTE (review cycle 7). The anchor was
+    # `if established >= roster_size:` -> `if True:`, which used to BE the pre-fix behaviour. After
+    # the stale-roster split that substitution only re-routes the predicate into its all-dead arm,
+    # so it still RETURNED a note and 4 of the 5 paired checks still went red — while the exit-code
+    # pairing silently went green and the control correctly reported the pairing as MISSED. The
+    # mutation is now an early `return None`, which cannot be re-routed by any later branch: under
+    # it the predicate is genuinely silenced, which is the state the pairs assert against.
     ("neuter the lane-census reconciliation (the pre-fix module)",
-     _sub("    if established >= roster_size:\n", "    if True:\n"),
+     _sub("    established = alive + dead\n",
+          "    established = alive + dead\n    return None   # MUTANT: pre-fix — no verdict is ever produced\n"),
      ["CENSUS: pi running vs a roster with no records raises the mismatch",
       "CENSUS: an UNREADABLE process table is NAMED, never rendered as agreement",
       "CENSUS: main() prints the mismatch over a readable store holding none of the roster",
