@@ -919,10 +919,13 @@ ANCHORS = {
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees$(printf \x27%s\x27 \"$REPO_CANON\" | cksum | cut -d\x27 \x27 -f1).offset\"",
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees.offset\"   # MUTANT: the per-repo key dropped",
     ),
-    # ── G15 (the harness pin-tree veto, #10114) ── six anchors, one per INPUT of the veto (the record
-    # probe, the shape backstop, the `$HOME` guard, the sha-record derivation, the QUOTING of the
-    # `$HOME` element, and the `$CELL_HOME` element). The veto shipped with no mutation leg at all, and
-    # that is precisely how two of its assertions passed vacuously through three recorded clean reviews.
+    # ── G15 (the harness pin-tree veto, #10114) ── ONE ANCHOR PER INPUT of the veto: the record probe,
+    # the shape backstop, the `$HOME` guard, the sha-record derivation, the NORMALISATION of that derivation,
+    # the QUOTING of the `$HOME` element, and the `$CELL_HOME` element. ⛔ NO COUNT IN THIS SENTENCE ON
+    # PURPOSE: it read "four" over five entries and then "six" over seven, and a numeral that has to be
+    # maintained by hand is a claim this file cannot keep true. The dict is the count.
+    # The veto shipped with no mutation leg at all, and that is precisely how two of its assertions
+    # passed vacuously through three recorded clean reviews.
     # (1) delete the RECORD-BASED probe entirely, leaving the shape backstop. The row then reads
     # `reason=pin-tree-shape`, which a prefix match on `reason=pin-tree` ACCEPTS — so before the
     # exact-token assertion this mutant left G15a green.
@@ -946,6 +949,14 @@ ANCHORS = {
     "no-pin-root-derivation": (
         "        */state/HARNESS-PIN) pin_root=\"${pin_root%/state/HARNESS-PIN}\" ;;",
         "        */__mutant_no_pin_root_derivation__) pin_root=\"\" ;;   # MUTANT: the derivation is deleted",
+    ),
+    # (4b) delete the NORMALISATION (trailing-slash strip + `//` collapse) but keep the derivation, so a
+    # non-canonical spelling of the sha record derives the WRONG root — `<root>/.pi/agent/` — where the
+    # production dir record does not live. That is a silent miss and therefore a removal, and it is why
+    # the normalisation is not cosmetic (`check-farm-drift.sh:194` needed the same one).
+    "no-pin-root-normalisation": (
+        "        pin_root=\"$(printf \x27%s\x27 \"$pin_root\" | tr -s \x27/\x27)\"   # collapse `//` — POSIX, no bashism",
+        "        :   # MUTANT: the `//` collapse is deleted (the trailing-slash strip below still runs)",
     ),
     # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
     # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
@@ -4956,9 +4967,11 @@ assert_eq "$(reason_token "$(row_for "$OUT" "$MXWT")")" "pin-tree" \
 #       word, and a mutant of just the outer quotes stays GREEN. What splits is
 #       `${home:+$home/.harness-path}`, so the mutation leg (`home-expansion-unquoted`, G15-M5) drives
 #       THAT spelling. The fixture is worth keeping because the property is load-bearing (a split record
-#       is a silent miss and a silent miss here REMOVES the tree the box executes), and because it is the
-#       only leg that reaches the `$HOME` record source from a live `HOME` (G15k reaches it with a
-#       `CELL_HOME` set, G15i with both unset).
+#       is a silent miss and a silent miss here REMOVES the tree the box executes). Its UNIQUE property
+#       is the SPACE in `HOME` — not "the only leg that reaches `$HOME`", which is false: G15k reaches
+#       that element with a live `$HOME` too (its record is `$T/pin_tree_mixed/home/.harness-path`), and
+#       so does G15l. Both are discriminating for that element only because their tree paths
+#       (`pins/5b1b09aad2c1`) carry no `harness` component, so nothing else can carry the verdict.
 ENV=pin_tree_space
 REPO="$(mk_repo "$ENV")"
 SPWT="$T/$ENV/pins/5b1b09aad2c1"
@@ -4990,6 +5003,25 @@ OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN" \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
     "G15m the dir record is derived from the HARNESS-PIN sha record's OWN root (custom pin root, no 'harness' component)"
+# …and the DOUBLED-`//` spelling of the same record still derives and still PRESERVES. This is the one
+# non-canonical spelling the derivation accepts (the suffix strip leaves `<root>/.pi/agent/`, the
+# `/.pi/agent` strip does not fire, and the OS resolves the doubled slash), so the boundary comment in
+# `pin_tree_match` states it instead of claiming all three odd spellings fall back. The fail-safe
+# direction: a veto that can only preserve mis-reading an input toward PRESERVE costs disk.
+OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent//state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
+    "G15m a DOUBLED-'//' spelling of the sha record still derives the root and PRESERVES (the one odd spelling the derivation accepts)"
+
+# …and a TRAILING `/` on the same record normalises to the same root. Asserting it here (rather than
+# declaring it) is the point: this fixture's tree path carries no `harness` component, so if the strip
+# did not fire the row would read `reclaimable` — a silent miss, which on this veto REMOVES the tree.
+OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN/" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
+    "G15m a TRAILING-SLASH spelling of the sha record normalises to the same root and PRESERVES"
 
 # G15n: THE `$CELL_HOME` RECORD ELEMENT, ALONE (round 3, measured gap). Source 2 of the list is
 # `"$cell/.harness-path"`, and until this fixture existed NO assertion could see it: in G15a `cell` IS
@@ -4997,8 +5029,10 @@ assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
 # G15k/G15l point `CELL_HOME` at a home with no record. Measured: deleting `"$cell/.harness-path"` from
 # a mutant left all 21 G15 rows GREEN — the comment claimed a coverage that did not exist. That matters
 # beyond tidiness because this is the only record source that survives a box where `CELL_HOME != HOME`
-# and `HARNESS_PIN_FILE` is not in the reaper's environment (`harness-apply-pass.sh:207` writes the dir
-# record at `$CELL_HOME/.harness-path`), and a silent miss here REMOVES the tree the box executes.
+# and `HARNESS_PIN_FILE` is not in the reaper's environment (`harness-apply-pass.sh:207` CONSUMES the
+# dir record and roots its own default at `$CELL_HOME/.harness-path` — it does not write it; the writers
+# are `install.sh:1072`, `cloud-cell-bringup.sh:1034`, `cloud-cell-supervisor.sh:2316`), and a silent
+# miss here REMOVES the tree the box executes.
 # The record is under `CELL_HOME`, `$HOME` has NONE, and the tree path carries no `harness` component —
 # so neither the `$HOME` element nor the shape backstop can carry the verdict.
 ENV=pin_tree_cellhome
@@ -5057,6 +5091,14 @@ OUT="$(REAPER_OVERRIDE="$MUTP4" HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HA
     run_reaper pin_tree_derived --dry-run --repo "$T/pin_tree_derived/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "reclaimable" \
     "G15-M4 MUTATION: without the sha-record derivation the custom-root pin tree is WRONGLY rule-3 residue => G15m is discriminating"
+
+MUTP4B="$T/mutant-no-pin-root-normalisation.sh"
+mutate_reaper_anchored "$MUTP4B" no-pin-root-normalisation
+OUT="$(REAPER_OVERRIDE="$MUTP4B" HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent//state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_derived --dry-run --repo "$T/pin_tree_derived/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "reclaimable" \
+    "G15-M4b MUTATION: without the doubled-slash collapse the derived root is <root>/.pi/agent/ where no record lives, so the tree is WRONGLY rule-3 residue => G15m's '//' assertion is discriminating"
 
 MUTP5="$T/mutant-home-expansion-unquoted.sh"
 mutate_reaper_anchored "$MUTP5" home-expansion-unquoted
