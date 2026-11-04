@@ -287,6 +287,28 @@ cp "$HERE/brief-gate.sh" "$MUT/"
 # it the creation back-pressure gate cannot read the repo and refuses with 74 (`AGENT_LAND_BACKLOG`)
 # before the spawn — the same vacuity through another door, which this arm's own assertion caught.
 cp "$HERE/repo-slug.sh" "$MUT/"
+# …AND THE FORK INSTRUMENT, which is DEFECT A's shape one gate further in (measured 2026-11-04: this arm
+# alone went red on a runner while the suite was green on a dev box). `run_agent` reads the fork floor
+# BEFORE the spawn, and `spawn-gate.sh` now REFUSES 81 (`AGENT_HARNESS_SKEW_REFUSED`) when it cannot
+# resolve `capacity.sh` instead of WARNing and launching. `$MUT` is a bare directory, so on a runner every
+# resolver candidate is instrument-less (no `AGENT_INFRA_PATH`, no `~/.pi/agent/scripts`, no
+# `~/orchestrator`) and the mutant answered `rc=81 started=0`: B1b/B1c red, and B2/B3 would then assert
+# the ABSENCE of a ref from a lane that never started — a vacuous control exactly where it matters, the
+# same false green the #3042 brief-validator note above records. Seeded as a STUB, never the shipped
+# file: the real `capacity.sh` reads THIS HOST and would refuse 73 on a busy runner, replacing one
+# host-decided verdict with another. `spawn-gate.test.sh` seeds these same three functions for its own
+# rigs; keep the two definitions in step.
+seed_capacity_instrument() { # seed_capacity_instrument <dir holding a gate copy>
+  cat > "$1/capacity.sh" <<'CAPEOF'
+# Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
+cap_procs_pair_vars() { printf -v "${1:?}" '%s' 100; printf -v "${2:?}" '%s' 10000; printf -v "${3:?}" '%s' 'fixture'; }
+cap_h_for_vars() { printf -v "${3:?}" '%s' "$(( ${2:-0} - ${1:-0} ))"; }
+cap_fork_probe() { return 0; }
+CAPEOF
+  [ -f "$1/capacity.sh" ]
+}
+seed_capacity_instrument "$MUT"; rc=$?
+ck "B1a the mutant carries the fork instrument (a bare gate copy answers 81 before its lane can start)" $rc
 grep -q '^terminal_wip_rescue()' "$MUT/spawn-gate.sh" && ! grep -q '^  terminal_wip_rescue "\$label"' "$MUT/spawn-gate.sh"; rc=$?
 ck "B1 the mutation removed the CALL and kept the function (so the arm below tests the wiring, not a delete)" $rc
 # A SECOND worktree with the same shape, so the two arms cannot see each other's refs.
