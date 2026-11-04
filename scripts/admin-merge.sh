@@ -4459,7 +4459,9 @@ wait_for_first_checks() {
       # leaves the pre-existing behaviour (the bounded legacy window) in place, and
       # the message names the operator's escape.
       rederive_left=$((rederive_left - 1))
-      if head_checks="$(first_checks_head_check_count "$head")"; then
+      # MUTANT: a FAILED probe is read as a PROVEN-EMPTY head (the fail-open direction)
+      head_checks="$(first_checks_head_check_count "$head")" || head_checks=0
+      if true; then
         # The count is recorded either way: a PROVEN-EMPTY head is a different
         # state from an unread one, and the refusal must be able to say which.
         FIRST_CHECKS_HEAD_CHECKS="$head_checks"
