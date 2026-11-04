@@ -1125,7 +1125,7 @@ def _bound_verdict_re():
         # It is the ONLY witness of the child's real status in `watch` mode, so it is
         # what corroborates `rc=na` (see BOUND_OK_RC).
         globals()["_RUNNER_LINE_RE"] = _re.compile(
-            r"\[timeout\]\s+agent\s+pid=(\d+)\b[^\n]*?\brc=([^\s]+)")
+            r"\[timeout\]\s+agent\s+pid=(\d+)\b[^\n]*?\brc=(\d{1,3})\b")
         _RUNNER_LINE_RE = globals()["_RUNNER_LINE_RE"]
     return _BOUND_VERDICT_RE
 
@@ -1169,6 +1169,16 @@ def parse_runner_line(text: str):
 
     Last line wins (the log is appended to across dispatches), and ``pid`` is returned so
     the caller can require it belong to the SAME incarnation as the bound line.
+
+    ⛔ AN UNREADABLE ``rc`` IS AN ABSTENTION, NOT A NEGATIVE FACT. The token is an exit
+    STATUS — 1-3 digits (a POSIX status is 0-255, and a shell reports 128+signal) — so
+    anything else (`0x0`, `exit:0`, a non-ASCII digit, or a runaway token) makes the whole
+    line unparseable and the witness ABSENT. Matching any non-space token and testing
+    `!= "0"` read
+    a corrupt token as the positive claim "the child did NOT complete" — the same class of
+    error as reading an unreadable log as death — and a 5000-digit token was interpolated
+    whole into the reason string. The bound line's own `rc=` already uses a strict
+    allow-list and abstains (`finished-rc-unreadable`); this matches it.
     """
     if not text:
         return "", None
@@ -1179,7 +1189,6 @@ def parse_runner_line(text: str):
     if last is None:
         return "", None
     return last.group(1), last.group(2)
-
 
 def parse_bound_line(text: str):
     """``(verdict, rc)`` from the LAST ``[lane-bound] VERDICT`` line, or ``("", None)``.

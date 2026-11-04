@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty tests with seventy-three paired mutations: every mutation re-
+Fifty-one tests with seventy-six paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -17,8 +17,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 50 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (68)
+    python3 tools/fleet/liveness.test.py                # the 51 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (76)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2296,6 +2296,71 @@ def t50():
           "the session tuple is unchanged; got %r" % (liv.STATES,))
 
 
+@test("T51 `gather_log_lane` POPULATES the `rc=na` witness and binds it to the incarnation")
+def t51():
+    # ⛔ THE ACQUISITION HALF, EXECUTED. T37 stacks `LR(..., runner_rc=...)` by hand, so the
+    # pure verdict matrix is green even if `gather_log_lane` never fills the field — which is
+    # exactly the "guard present, INERT in production" shape the previous round found in the
+    # `rc` conjunct itself. And the witness is only this lane's if it names the SAME
+    # incarnation: the log is APPENDED to across dispatches (`tee -a` / `>>`), so an earlier
+    # dispatch's `[timeout] agent … rc=0` would otherwise corroborate a crash into a
+    # completion. Both are asserted here against a REAL log and a REAL reaped pid.
+    d = tempfile.mkdtemp(prefix="liv-runner-rc-")
+    try:
+        log = os.path.join(d, "lane.log")
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = child.pid
+        child.wait()
+
+        def write(runner_pid, runner_rc):
+            with open(log, "w", encoding="utf-8") as fh:
+                # `lane-bound.sh watch` writes `rc=na` UNCONDITIONALLY (`:397`) — this is
+                # the fleet's real shape, not a contrivance.
+                fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                         "elapsed=61s log=%s\n" % (dead, log))
+                fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=%s\n"
+                         % (runner_pid, runner_rc))
+
+        # (a) A launcher rc=0 for THIS incarnation corroborates `na` into completion.
+        write(dead, "0")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.rc == "na", "the bound line's `na` is read; got %r" % (lr.rc,))
+        check(lr.runner_rc == "0",
+              "gather_log_lane POPULATES runner_rc from the launcher line; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "finished",
+              "a corroborated `na` is finished through the REAL path; got %s/%s"
+              % (v.state, v.reason))
+
+        # (b) The launcher's rc is a CRASH — the same evidence that used to read `finished`.
+        write(dead, "7")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "no-verdict" and v.reason == "bound-finished-runner-rc:7",
+              "a crashed lane is NOT finished through the REAL path; got %s/%s"
+              % (v.state, v.reason))
+
+        # (c) A witness naming ANOTHER incarnation must not corroborate this verdict.
+        write(2 ** 31 - 1, "0")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.runner_rc is None,
+              "a witness from another incarnation is NOT adopted; got %r" % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown" and v.reason == "finished-rc-uncorroborated",
+              "…and the lane abstains rather than assuming success; got %s/%s"
+              % (v.state, v.reason))
+
+        # (d) An UNREADABLE launcher rc is an ABSTENTION, never a negative fact.
+        for junk in ("\u00b2", "0x0", "exit:0", "9" * 40):
+            check(liv.parse_runner_line(
+                "[timeout] agent pid=%d wall_limit=3300s elapsed=1s rc=%s" % (dead, junk))
+                  == ("", None),
+                  "an unreadable launcher rc is NO witness, never a crash: %r" % junk)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -2851,6 +2916,31 @@ MUTATIONS = [
         'LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown", "gone")',
         "the log-state vocabulary grows silently, breaking every consumer and the doc's "
         "disjointness claim while the whole suite stays green",
+    ),
+    # ── the ACQUISITION half: T51 fails if either of these is dropped ────────────────
+    Mutation(
+        "T51", "module",
+        '    if lr.rc == "na" and lr.readable:',
+        '    if False and lr.rc == "na" and lr.readable:',
+        "gather_log_lane stops POPULATING the `rc=na` witness, so every completed "
+        "watch-mode lane loses its corroboration and reads `unknown` — the pure verdict "
+        "matrix stays green because T37 stacks the field by hand",
+    ),
+    Mutation(
+        "T51", "module",
+        '            same_incarnation = ((runner_pid == lr.verdict_line_pid)',
+        '            same_incarnation = (True or (runner_pid == lr.verdict_line_pid)',
+        "the witness is not bound to an incarnation, so on an APPENDED log a previous "
+        "dispatch's `[timeout] agent … rc=0` corroborates a crash into a completion",
+    ),
+    Mutation(
+        "T51", "module",
+        '            r"\\[timeout\\]\\s+agent\\s+pid=(\\d+)\\b[^\\n]*?\\brc=(\\d{1,3})\\b")',
+        '            r"\\[timeout\\]\\s+agent\\s+pid=(\\d+)\\b[^\\n]*?\\brc=([^\\s]+)")',
+        "an UNREADABLE launcher rc is decoded as the positive claim \"the child did not "
+        "complete\" instead of an abstention, so a corrupt token (or a future spelling) "
+        "flips a completed lane to `no-verdict`, and a runaway token is interpolated "
+        "whole into the reason",
     ),
 ]
 
