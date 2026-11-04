@@ -657,6 +657,36 @@ case "$DELIVERY_PRFIX" in *"already has an open PR"*) rc=0;; *) rc=1;; esac
 for _p in has_commit_rule has_push_each has_cap_reason has_resume has_adopt; do
   "$_p" "$DELIVERY_BG"; ck $? "bg carries the same rule: $_p"
 done
+
+# §G.2c prpatch: a FORK PR's deliverable is the PATCH — it must never be told to push.
+echo
+echo "§G.2c prpatch: a FORK PR's deliverable is the PATCH — never a commit it cannot push (P1)"
+# ⛔ WHY THIS ROLE EXISTS (this PR's review, cycle 3 — P1). `pr-doctor.py` prepends the delivery
+# section to EVERY brief, and a fork PR's head is `refs/pull/<n>/head`, READ-ONLY here: its own fork
+# block says "do NOT push and do NOT create a branch", and `_ensure_head` turns commits no ref holds
+# into a PERSISTENT refusal of that PR. Rendering the `prfix` role for it shipped BOTH orders in one
+# brief, the first one read being the impossible one. Asserted both ways: the push orders are ABSENT
+# and the patch contract is PRESENT, so a regression that rendered `prfix` here cannot pass.
+DELIVERY_PRPATCH="$(delivery_brief_section prpatch)"
+has_fork_heading() { case "$1" in *"$DELIVERY_BRIEF_FORK_HEADING"*) return 0;; *) return 1;; esac; }
+has_patch_rule()   { case "$1" in *"your deliverable is the PATCH"*) return 0;; *) return 1;; esac; }
+no_push_rule()     { case "$1" in *"Push after every commit"*|*"commit and push onto it"*) return 1;; *) return 0;; esac; }
+has_fork_heading "$DELIVERY_PRPATCH"; ck $? "prpatch renders the FORK heading (its own, not the commit one)"
+case "$DELIVERY_PRPATCH" in *"$DELIVERY_BRIEF_HEADING"*) rc=0;; *) rc=1;; esac
+[ "$rc" -ne 0 ]; ck $? "⛔ …and NOT the shared commit heading — the two contracts are distinguishable"
+has_patch_rule "$DELIVERY_PRPATCH"; ck $? "…it states the patch is the deliverable"
+no_push_rule "$DELIVERY_PRPATCH"; ck $? "⛔ …and carries NO push/commit order (the exact false order the P1 removed)"
+has_open_pr "$DELIVERY_PRPATCH"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "⛔ …and is NOT ordered to open a PR it already has"
+for _p in has_resume has_adopt; do
+  "$_p" "$DELIVERY_PRPATCH"; ck $? "a fork worker keeps the ON RESUME half: $_p"
+done
+# …and the reverse: the commit roles must NOT acquire the fork contract. Without this, a regression
+# that rendered `prpatch` for everything would satisfy every arm above.
+for _r in lane prfix bg; do
+  case "$(delivery_brief_section "$_r")" in *"your deliverable is the PATCH"*) rc=0;; *) rc=1;; esac
+  [ "$rc" -ne 0 ]; ck $? "$_r does NOT carry the fork contract (the roles are not interchangeable)"
+done
 # ⛔ THE PR SENTENCE IS THE SECTION'S FIRST `- **` BULLET — pin the ORDER, because
 # `nonblocking-dispatch.sh` derives each role's identity from it (a role-invariant heading cannot tell
 # a `lane` brief from a `prfix` one, so the append's key is this line). A bullet reordered above it

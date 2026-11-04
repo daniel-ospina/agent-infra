@@ -3325,27 +3325,50 @@ _RESEARCH_SECTION = None
 _DELIVERY_SECTION = None
 
 
-def delivery_section() -> str:
-    """The canonical COMMIT AS YOU GO block, or "" (loudly) if the helper cannot be found."""
+def delivery_role(pr: dict) -> str:
+    """Which delivery contract this PR's worker must be given.
+
+    ⛔ A FORK PR IS `prpatch`, NOT `prfix`, AND THE DISTINCTION IS LOAD-BEARING. `prfix` orders the
+    worker to "commit and push onto it", which a fork worktree cannot do (its head is
+    `refs/pull/<n>/head`, read-only here) — and the attempt leaves commits no ref holds, which
+    `_ensure_head` turns into a PERSISTENT refusal of that PR. `_brief_body` already says the fork
+    truth; this is the same decision, made once, for the delivery block that is prepended to it.
+
+    Everything else is `prfix`: this script only ever spawns repair workers on an already-open PR.
+    """
+    return "prpatch" if pr.get("isCrossRepository") else "prfix"
+
+
+def delivery_section(role: str = "prfix") -> str:
+    """The canonical COMMIT AS YOU GO block, or "" (loudly) if the helper cannot be found.
+
+    ⛔ THE ROLE IS AN ARGUMENT, NOT A CONSTANT (review cycle 3, P1). A FORK PR's head is
+    `refs/pull/<n>/head`, READ-ONLY here, and `_brief_body`'s fork block tells that worker "do NOT
+    push and do NOT create a branch ... a committed-but-unpushable worktree makes every later pass
+    refuse this PR". Rendering the base-repo `prfix` block for it shipped BOTH orders in one brief,
+    and the first one read was the impossible one — so the caller that KNOWS the PR is a fork must be
+    able to ask for the fork contract (`prpatch`). The role vocabulary itself lives in the helper;
+    this function only passes it through, so there is still ONE home for the text.
+    """
     global _DELIVERY_SECTION
-    if _DELIVERY_SECTION is not None:
-        return _DELIVERY_SECTION
+    if _DELIVERY_SECTION is not None and _DELIVERY_SECTION[0] == role:
+        return _DELIVERY_SECTION[1]
     here = os.path.dirname(os.path.abspath(__file__))
     for cand in (os.path.join(ORCH_DIR, "reviewer-preflight.sh"),
                  os.path.join(here, "orchestrator-harness", "reviewer-preflight.sh")):
         if not os.path.isfile(cand):
             continue
         try:
-            out = subprocess.run(["bash", cand, "--delivery-brief", "prfix"],
+            out = subprocess.run(["bash", cand, "--delivery-brief", role],
                                  capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.SubprocessError):
             continue
         if out.returncode == 0 and out.stdout.strip():
-            _DELIVERY_SECTION = out.stdout.rstrip() + "\n"
-            return _DELIVERY_SECTION
-    log("brief: reviewer-preflight.sh --delivery-brief produced nothing (looked in %s and "
+            _DELIVERY_SECTION = (role, out.stdout.rstrip() + "\n")
+            return _DELIVERY_SECTION[1]
+    log("brief: reviewer-preflight.sh --delivery-brief %s produced nothing (looked in %s and "
         "%s/orchestrator-harness) -- this worker brief carries NO commit-as-you-go rule, and "
-        "nonblocking-dispatch.sh will append it at dispatch (agent-infra#2981)" % (ORCH_DIR, here))
+        "nonblocking-dispatch.sh will append it at dispatch (agent-infra#2981)" % (role, ORCH_DIR, here))
     # A FAILURE IS NOT CACHED, for the reason `research_section` gives above: a cached "" is the
     # "fix that is not live" shape — the box would keep composing section-less briefs long after the
     # helper appeared. The cost of not caching is one `bash` call per brief.
@@ -3392,7 +3415,7 @@ def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
     body = _brief_body(pr, action, why, cr)
     if not body:
         return body
-    return research_section() + "\n" + delivery_section() + "\n" + body
+    return research_section() + "\n" + delivery_section(delivery_role(pr)) + "\n" + body
 
 # ---------------------------------------------------------------------------
 # 4. WHAT HAPPENED TO A WORKER — the harness's own artifacts, never a guess
@@ -3550,16 +3573,24 @@ def void_refused_rows(st: dict) -> list[str]:
 # 5. DISPATCH — one worker, one PR, logged
 # ---------------------------------------------------------------------------
 
-def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
+def spawn_argv(name: str, worktree: str, brief_path: str, role: str = "prfix") -> list[str]:
     """The ONE spawn command. A test asserts this is the background dispatcher, not cmux.
 
-    ⛔ THE LAST ARGUMENT IS THE WORK KIND (agent-infra#2409), AND IT IS `prfix`, NOT THE DEFAULT.
+    ⛔ THE SIXTH ARGUMENT IS THE WORK KIND (agent-infra#2409), AND IT IS `prfix`, NOT THE DEFAULT.
     Every worker this script spawns repairs an ALREADY OPEN PR (fetch -> rebase -> fix -> push), so
     it is the drain, not creation. The dispatcher's default is `bg` -- measured as creation by the
     back-pressure gate -- because an UNdeclared caller is safer held than trusted; declaring it here
     is what keeps `pr-doctor` running when the backlog is over its ceiling.
+
+    ⛔ THE SEVENTH IS THE DELIVERY ROLE, AND IT IS NOT ALWAYS THE KIND. The two answer different
+    questions: the kind selects a spawn POLICY, the delivery role selects what the brief must be TRUE
+    about. A fork PR's worker is `prfix` policy-wise but must be told the PATCH contract, so passing
+    the kind alone would make the dispatcher look for the base-repo `prfix` sentence in a fork brief,
+    fail to find it, and APPEND the very push order this PR exists to remove. Declared here so the
+    composer that knows the PR shape decides (agent-infra#2981, review cycle 3).
     """
-    return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S), "prfix"]
+    return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S),
+            "prfix", role]
 
 
 def _confirm(name: str) -> tuple[str, str]:
@@ -3797,7 +3828,7 @@ def dispatch(pr: dict, action: str, text: str, dry: bool,
     # that worker's entire life (SPAWN_CALL_TIMEOUT_S carries the measurement). The verdict comes
     # from `$O/bg` -- `_confirm` -- never from the pipe; stderr still comes back (a temp file), so
     # the dispatcher's own refusal text reaches the log.
-    _, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=SPAWN_CALL_TIMEOUT_S,
+    _, errout, rc = sh_err(spawn_argv(name, wt, path, delivery_role(pr)), timeout=SPAWN_CALL_TIMEOUT_S,
                            cwd=HOME, env=_orch_env(), capture=False)
     if rc != 0:
         # ⛔ carry the CODE and the dispatcher's OWN words. rc=78 (no/stale spawn-gate.sh or a missing

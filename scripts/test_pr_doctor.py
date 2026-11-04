@@ -525,11 +525,38 @@ def test_spawn_argv_DECLARES_the_repair_kind(monkeypatch):
     """
     monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
     argv = pr.spawn_argv("prd-7", "/repo/.worktrees/prd-7", "/state/brief.txt")
-    assert argv[-1] == "prfix", (
+    # ⛔ THE KIND IS `prfix` AND IT IS NO LONGER THE LAST ELEMENT (agent-infra#2981). The delivery role
+    # is a SEPARATE argument, because the two answer different questions — the kind selects a spawn
+    # policy, the delivery role selects what the brief must be TRUE about (a FORK worker is `prfix`
+    # policy-wise yet must be told the PATCH contract). Asserted by POSITION so the timeout cannot be
+    # silently shifted out from under `SPAWN_CALL_TIMEOUT_S`.
+    assert argv[-3] == str(pr.SPAWN_TIMEOUT_S), (
+        "the timeout moved: inserting an argument here shifts it silently")
+    assert argv[-2] == "prfix", (
         "the spawn does not declare the repair kind: the dispatcher would default to `bg` and the "
         "creation back-pressure gate would refuse a PR-repair worker")
-    # The timeout keeps its own position: inserting a flag here would shift it silently.
-    assert argv[-2] == str(pr.SPAWN_TIMEOUT_S)
+    assert argv[-1] == "prfix", (
+        "the delivery role defaults to the kind; a base-repo PR must get the `prfix` sentence")
+
+
+def test_spawn_argv_declares_the_FORK_delivery_role(monkeypatch):
+    """⛔ A FORK PR IS SPAWNED WITH `prpatch`, NOT `prfix` (agent-infra#2981, review cycle 3 P1).
+
+    A fork's head is `refs/pull/<n>/head`, READ-ONLY from this repo. Its brief says so, and the
+    base-repo delivery block says the opposite ("commit and push onto it", "Push after every
+    commit"). Passing only the KIND would make the dispatcher look for the `prfix` sentence, fail to
+    find it in a fork brief, and APPEND the very push order the fork block forbids.
+    """
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
+    fork = _pr(7)
+    fork["isCrossRepository"] = True
+    argv = pr.spawn_argv("prd-7", "/repo/.worktrees/prd-7", "/state/brief.txt",
+                         pr.delivery_role(fork))
+    assert argv[-2] == "prfix", "the KIND is still the drain (`prfix`) even for a fork PR"
+    assert argv[-1] == "prpatch", (
+        "a fork PR was spawned with the base-repo delivery role, so the dispatcher would append the "
+        "push order its own brief forbids")
+    assert pr.delivery_role(_pr(8)) == "prfix", "a base-repo PR must keep the prfix role"
 
 
 def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
@@ -2612,7 +2639,23 @@ def test_the_brief_never_tells_a_fork_fixer_to_push(monkeypatch):
     assert "THERE IS NO BRANCH HERE TO PUSH" in text
     assert "git push origin HEAD:" not in text, "a fork fixer was given a push it cannot perform"
     assert "refs/pull/7/head" in text
+    # ⛔ AND THE DELIVERY BLOCK MUST NOT CONTRADICT IT (agent-infra#2981, review cycle 3 P1). The
+    # COMMIT AS YOU GO section is prepended by `brief()`; rendered with the base-repo `prfix` role it
+    # ordered the fork worker to "commit and push onto it" and "Push after every commit" — the exact
+    # commits the fork block forbids, and `_ensure_head` turns those into a PERSISTENT refusal. Both
+    # orders must be ABSENT from a fork brief, and the patch contract PRESENT.
+    for forbidden in ("Push after every commit", "commit and push onto it",
+                      "Commit as soon as you have a coherent unit, push it",
+                      "Open the PR as soon as the first commit is pushed"):
+        assert forbidden not in text, (
+            "a fork fixer was ordered to %r, which its own fork block forbids" % forbidden)
+    assert "your deliverable is the PATCH" in text, "the fork brief must state the patch contract"
+    # …and the ON RESUME half survives, because adopting a predecessor's tree is true for every worker
+    assert "read `git status` and `git diff` FIRST" in text
+    assert "Never discard" in text
     base = pr.brief(_pr(8), "fix-ci", "python-ci-gate", [])
+    assert "Push after every commit" in base, "the base-repo brief must KEEP the commit/push rule"
+    assert "your deliverable is the PATCH" not in base, "the fork contract leaked into a base PR"
     assert "git push origin HEAD:refs/heads/fix/branch-8" in base
 
 

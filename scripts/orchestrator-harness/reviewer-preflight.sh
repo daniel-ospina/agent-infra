@@ -9,7 +9,7 @@
 #   landing_artifacts_brief_section [self|harness]   → the section that tells the lane HOW to produce
 #     the artifacts `pipeline-compliance` checks ([a] issue ref, [b] scoping marker, [c] the
 #     head-bound review record, [d] plan evidence); spliced into the brief by lane.sh (#2325).
-#   delivery_brief_section [lane|prfix|bg]           → the section that tells a worker to COMMIT AND
+#   delivery_brief_section [lane|prfix|bg|prpatch]   → the section that tells a worker to COMMIT AND
 #     PUSH as it goes (and to adopt, never discard, an uncommitted tree it inherited); spliced into
 #     every generated brief that orders work — lane.sh, fix-one.sh, pr-doctor.py — and appended by
 #     nonblocking-dispatch.sh to any authored brief that does not already carry it (#2981).
@@ -327,15 +327,66 @@ BRIEF
 # ⛔ ROLE-CORRECT ON ONE SENTENCE, for the reason the landing section is role-correct on [c]: a
 # `prfix` worker is dispatched TO AN EXISTING PR (`pr-doctor.py` composes that brief), so ordering it
 # to "open the PR" would be a FALSE instruction — the class of untruth #2148 and #2325 both exist to
-# remove from a brief. `lane` opens its own PR; `prfix`/`fixer` already have one.
+# remove from a brief. `lane` opens its own PR; `prfix` (a fixer, in `brief-gate.sh`'s vocabulary) already
+# has one; `bg` is conditional because the dispatcher's default caller (`ai-drainer.sh`) owns no PR; and
+# `prpatch` is a FORK PR, whose deliverable is the PATCH because there is no branch here to push.
 DELIVERY_BRIEF_HEADING='## COMMIT AS YOU GO — a killed lane must leave a PR behind (agent-infra#2981)'
+# ⛔ A FORK PR GETS ITS OWN HEADING, because its rule is a DIFFERENT contract rather than one reworded
+# sentence: it must NOT commit or push at all. Both headings are owned here, and the two are distinct
+# ON PURPOSE — a dispatcher told `prpatch` looks for this one, so a fork brief can never be silently
+# re-sent the base-repo push order.
+DELIVERY_BRIEF_FORK_HEADING='## COMMIT AS YOU GO — a fork PR has no branch here, so your deliverable is the PATCH (agent-infra#2981)'
 
-# delivery_brief_section [lane|prfix|bg] — the same text for every worker that changes a tree; only
-# the sentence about the PR differs. `bg` is conditional ON PURPOSE: it is the dispatcher's DEFAULT
-# kind, so the worker behind it may be repairing one PR, many PRs, or opening none.
-delivery_brief_section() { # delivery_brief_section [lane|prfix|bg]
+# delivery_brief_section [lane|prfix|bg|prpatch] — the same text for every worker that changes a tree;
+# only the sentence about the PR differs. `bg` is conditional ON PURPOSE: it is the dispatcher's
+# DEFAULT kind, so the worker behind it may be repairing one PR, many PRs, or opening none.
+# ⛔ `prpatch` IS NOT A VARIANT SENTENCE, IT IS A DIFFERENT CONTRACT (review cycle 3, P1). A fork PR's
+# head is `refs/pull/<n>/head`, READ-ONLY from this repo — `pr-doctor.py::_brief_body` says so in its
+# own fork block, which ends "do NOT push and do NOT create a branch … a committed-but-unpushable
+# worktree makes every later pass refuse this PR". Prepending the base-repo `prfix` render to that
+# brief shipped BOTH orders, and the first one read was the one that cannot be performed; the harm is
+# the one the fork block names, because `_ensure_head` turns "commits the PR head does not" into a
+# PERSISTENT refusal. So the fork body replaces the commit/push bullets outright and keeps only the
+# ON RESUME half (which is true for every worker) — with "commit it" corrected to "carry it into your
+# patch", since adopting a predecessor's tree must not mint an unpushable commit either.
+delivery_brief_section() { # delivery_brief_section [lane|prfix|bg|prpatch]
   local role="${1:-lane}" open_pr
   case "$role" in
+    prpatch)
+      cat <<BRIEF
+${DELIVERY_BRIEF_FORK_HEADING}
+
+**This PR is a FORK: your worktree is DETACHED at \`refs/pull/<n>/head\`, which is READ-ONLY from this
+repo. Your deliverable is the PATCH, not a commit.** Do not save the work for the end. The wall
+clock does not warn before it fires: a worker killed at its cap takes the tree with it, so a worker
+that holds everything delivers NOTHING — its work is indistinguishable from no work at all while it
+exists only in a worktree that is about to be reaped.
+
+MEASURED 2026-10-27/28 (agent-infra#2981): five repair workers in one batch, all five killed at their
+2400 s cap — **0 commits, 0 PRs, 144 KB of work** recovered only as rescue patch files. Not one of
+them had done the wrong work. Not one of them had delivered it.
+
+- ⛔ **Do NOT commit, do NOT push, and do NOT create a branch.** The head branch lives in the
+  contributor's fork and is not a branch here, so a push has nowhere to go — and a commit that no
+  ref holds makes \`_ensure_head\` refuse this PR for EVER, which is worse than losing the work.
+- **Put the exact patch in your FINAL MESSAGE as soon as it is coherent**, then keep improving it
+  and re-state the final \`git diff\` at the end. The patch is the deliverable; a tree that is never
+  published from a worktree that is about to be reaped is not.
+- Report \`patch ready\` (or the blocker), NOT \`fixed\`.
+
+## ON RESUME — read the tree before you touch it
+
+If you did not write the tree you just found, **read \`git status\` and \`git diff\` FIRST** — before
+any edit, and before any checkout. An uncommitted tree in THIS worktree is your PREDECESSOR's work on
+this same task: a worker killed at its cap leaves exactly that, and it can be tens of KB of finished,
+tested work.
+
+Adopt it: read the diff, keep what is right, finish what is unfinished, and **carry it into your
+patch**. ⛔ **Never discard it** — no \`git checkout -- .\`, no \`git stash\`, no \`git clean\`, no
+\`git reset --hard\` over uncommitted work, and never "start from a clean tree". Discarding it is how
+the same work dies twice.
+BRIEF
+      return 0 ;;
     lane)
       open_pr='**Open the PR as soon as the first commit is pushed**, then keep improving it — the PR
   being open is a starting line, not a finish line. Once it exists you do NOT open a second PR for
@@ -346,7 +397,7 @@ delivery_brief_section() { # delivery_brief_section [lane|prfix|bg]
       open_pr='**If the work you were given already has an open PR, commit and push onto it** — and
   do NOT open a second PR for the same work.' ;;
     *)
-      printf 'reviewer-preflight.sh: unknown role "%s" (expected lane|prfix|bg)\n' "$role" >&2
+      printf 'reviewer-preflight.sh: unknown role "%s" (expected lane|prfix|bg|prpatch)\n' "$role" >&2
       return 2 ;;
   esac
   cat <<BRIEF
@@ -386,13 +437,13 @@ BRIEF
 
 # CLI, for tests and for a human who wants the exact text:
 #   bash reviewer-preflight.sh --line [self|harness|reviewer] | --brief [self|harness]
-#                                  | --landing-brief [self|harness] | --delivery-brief [lane|prfix|bg]
+#                                  | --landing-brief [self|harness] | --delivery-brief [lane|prfix|bg|prpatch]
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --line)  shift; reviewer_preflight_line "${1:-self}" ;;
     --brief) shift; reviewer_brief_section "${1:-self}" ;;
     --landing-brief) shift; landing_artifacts_brief_section "${1:-self}" ;;
     --delivery-brief) shift; delivery_brief_section "${1:-lane}" ;;
-    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness] | --landing-brief [self|harness] | --delivery-brief [lane|prfix|bg]\n' "$0" >&2; exit 2 ;;
+    *) printf 'usage: %s --line [self|harness|reviewer] | --brief [self|harness] | --landing-brief [self|harness] | --delivery-brief [lane|prfix|bg|prpatch]\n' "$0" >&2; exit 2 ;;
   esac
 fi
