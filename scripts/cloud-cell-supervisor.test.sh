@@ -1437,6 +1437,7 @@ prunesup() {
             O="$R/o" REPO="$R/repo" HARNESS_REPO="$R/repo" HARNESS_FETCH=0 HARNESS="$R/repo" \
             SCRATCH_ROOT="$R/scratch" HARNESS_PIN_DIR="$R/pin" HARNESS_PIN_FILE="$R/home/.harness-path" \
             REAP_VENV_MIN_AGE_SECONDS="${PRUNE_VENV_MIN_AGE:-1800}" \
+            PIN_PROC_ROOT="${PRUNE_PROC_ROOT:-/proc}" \
             bash "$SUP" prune "$@" 2>&1)"
   PR_RC=$?
 }
@@ -1605,6 +1606,85 @@ printf '%s\n' "$R/pin/$RP_B/scripts/orchestrator-harness" > "$R/home/.harness-pa
 prunesup
 [ ! -e "$R/pin/$RP_A" ] && ok "prune reclaims a SUPERSEDED harness pin (per-commit pinning would otherwise leak disk)" \
                         || bad "prune kept a superseded harness pin — the new pin scheme leaks disk"
+# ⛔ HELD BY A LIVE PROCESS (measured 2026-11-02). A superseded pin is *superseded*, not *unheld*: a
+# controller was executing its `orch-loop.sh` from an open fd when this arm `rm -rf`'d the tree 2 h 32
+# min into its run, leaving a live service on an unlinked inode (`links=0`). Both hold shapes are
+# asserted — a cwd INSIDE the tree, and an OPEN FD into it with the holder's cwd elsewhere (the fd-255
+# shape) — because `pgrep -f <path>` sees neither, and a directory's link count sees neither either.
+# ⛔ THE FIXTURE IS A CONTROLLED PROC ROOT, NOT THE HOST'S. Grading the host made these arms red on any
+# box without /proc (macOS — a platform this script runs on) and racy on any box with one. A fake
+# `<pid>/{cwd,exe,fd/N,cmdline}` tree drives the same code path deterministically, on every platform.
+PR_PROC="$R/proc-pin"; mkdir -p "$PR_PROC/4242/fd" "$R/neutral"
+printf 'bash\0%s\0' "$R/neutral" > "$PR_PROC/4242/cmdline"
+ln -sfn "$R/neutral" "$PR_PROC/4242/cwd"; ln -sfn /bin/bash "$PR_PROC/4242/exe"
+ln -sfn "$R/neutral/f" "$PR_PROC/4242/fd/3"; : > "$R/neutral/f"
+PRUNE_PROC_ROOT="$PR_PROC"
+pin_held_case() { PRUNE_PROC_ROOT="$PR_PROC" prunesup; }
+
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness"
+ln -sfn "$R/pin/$RP_A" "$PR_PROC/4242/cwd"          # the holder SITS in the tree
+pin_held_case
+[ -d "$R/pin/$RP_A" ] && ok "prune PRESERVES a superseded pin whose CWD a live process holds" \
+                      || bad "prune deleted a superseded pin a live process was sitting in — the 2026-11-02 shape"
+case "$PR_OUT" in
+  *"PRESERVED($R/pin/$RP_A, held-by-cwd:4242)"*) ok "the keep is NAMED with the holding pid (PRESERVED(<tree>, held-by-cwd:<pid>))" ;;
+  *) bad "the preserved pin was not named with its holding pid: $PR_OUT" ;;
+esac
+ln -sfn "$R/neutral" "$PR_PROC/4242/cwd"            # cwd elsewhere…
+ln -sfn "$R/pin/$RP_A/scripts/orchestrator-harness" "$PR_PROC/4242/fd/9"   # …an OPEN FD into the tree
+pin_held_case
+[ -d "$R/pin/$RP_A" ] && ok "prune PRESERVES a superseded pin held ONLY by an open FD (the fd-255 shape; pgrep cannot see it)" \
+                      || bad "prune deleted a superseded pin held on an open fd — the exact 2026-11-02 defect"
+case "$PR_OUT" in
+  *"PRESERVED($R/pin/$RP_A, held-by-fd:4242)"*) ok "the fd keep says held-by-fd:<pid> — the next reader can see WHY the tree was kept" ;;
+  *) bad "the fd-held pin was not reported as held-by-fd: $PR_OUT" ;;
+esac
+# THE ARGV SPELLINGS. A controller can be named by an `=`-attached absolute path with its cwd and fds
+# elsewhere (`--repo=/abs/tree`); a `/*` test alone missed that shape and a tree was reaped behind it.
+rm -f "$PR_PROC/4242/fd/9"; ln -sfn "$R/neutral/f" "$PR_PROC/4242/fd/9"
+printf 'bash\0-c\0sleep 9\0--repo=%s\0' "$R/pin/$RP_A" > "$PR_PROC/4242/cmdline"
+pin_held_case
+[ -d "$R/pin/$RP_A" ] && ok "prune PRESERVES a pin a live process NAMES in argv as --repo=<tree> (the =-attached spelling)" \
+                      || bad "an =-attached argv witness did not hold the tree — that spelling deletes live work"
+printf 'bash\0%s\0' "$R/neutral" > "$PR_PROC/4242/cmdline"
+# …and the sweep still WORKS once nothing holds it: the guard must not be a blanket refusal.
+pin_held_case
+[ ! -e "$R/pin/$RP_A" ] && ok "with the holders released, the SAME superseded pin is reclaimed (the guard is a check, not a wall)" \
+                        || bad "the guard false-blocked its own reclaim — a superseded pin is now permanent"
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness"
+# ⛔ THE OTHER DIRECTION: a holder of the PARENT must NOT block, or one idle shell anywhere above the pin
+# root would pin every superseded tree forever (the #2573 direction, on this arm).
+ln -sfn "$R/pin" "$PR_PROC/4242/cwd"
+pin_held_case
+[ ! -e "$R/pin/$RP_A" ] && ok "a holder of the PARENT (the pin root) does not block the reclaim — the match is one-directional" \
+                        || bad "a parent-directory holder kept a superseded pin alive — the match runs the wrong way"
+ln -sfn "$R/neutral" "$PR_PROC/4242/cwd"
+# ⛔ FAIL-CLOSED, DRIVEN: an unreadable census must PRESERVE and NAME, never delete. Without this seam the
+# check-unavailable arm is undrivable, so a regression turning it into "unheld" would redden nothing.
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness"
+PIN_CENSUS_UNAVAILABLE=1 PRUNE_PROC_ROOT="$PR_PROC" prunesup
+[ -d "$R/pin/$RP_A" ] && ok "an UNREADABLE process census PRESERVES the pin (cannot-verify is never a licence to delete)" \
+                      || bad "the pin was reclaimed with no census at all — fail-OPEN on the one path that rm -rf's"
+case "$PR_OUT" in
+  *"PRESERVED($R/pin/$RP_A, check-unavailable:"*) ok "the fail-closed keep SAYS check-unavailable:<what>" ;;
+  *) bad "the fail-closed keep was not named check-unavailable — an operator cannot see why the pin survived" ;;
+esac
+rm -rf "$R/pin/$RP_A"
+# ⛔ AN ARGV-ONLY CENSUS IS NOT A CENSUS. Measured in review: with the `readlink` probe broken, the argv
+# rows alone still satisfied "a real census", the disclosure looked identical to the healthy case, and
+# the sweep deleted a tree a live process was sitting in — argv can NEVER show an fd holder. A proc root
+# that yields only argv rows must therefore PRESERVE, not report "provably unheld".
+mkdir -p "$R/pin/$RP_A/scripts/orchestrator-harness" "$R/proc-argonly/9/fd"
+printf 'bash\0%s\0' "$R/pin/$RP_A" > "$R/proc-argonly/9/cmdline"
+PRUNE_PROC_ROOT="$R/proc-argonly" prunesup
+[ -d "$R/pin/$RP_A" ] && ok "an ARGV-ONLY census (no cwd/exe/fd row) PRESERVES the pin — it cannot see an fd holder" \
+                      || bad "an argv-only census deleted the tree — the exact review-found fail-open"
+case "$PR_OUT" in
+  *"check-unavailable:no cwd/exe/fd row"*) ok "the argv-only keep names WHY it could not verify" ;;
+  *) bad "the argv-only keep was not explained: $PR_OUT" ;;
+esac
+rm -rf "$R/pin/$RP_A"
+PRUNE_PROC_ROOT=""   # back to the host for the remaining arms
 [ -d "$R/pin/$RP_B" ] && ok "prune KEEPS the ACTIVE harness pin" \
                       || bad "prune deleted the ACTIVE pin — the cell no longer has its harness"
 # An empty pin file means "which pin is live" is NOT KNOWN: an unknown is an abstention, not a licence.

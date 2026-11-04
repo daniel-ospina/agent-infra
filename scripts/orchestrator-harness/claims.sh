@@ -97,8 +97,10 @@ esac
 # duplicate dispatch this file exists to prevent happens anyway. The arithmetic, from the shipped
 # defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
 #
-#   lane (LANE_TIMEOUT)            3300s   (~55 min — spawn-gate.sh's wall clock; raised from 2400
-#                                            when a lane took ownership of its merge, #2029)
+#   lane (LANE_BACKSTOP_S)        7200s   (~2 h — spawn-gate.sh's ABSOLUTE BACKSTOP; the lane's
+#                                            PRIMARY bound is lane-bound.sh's 2700 s progress
+#                                            allowance. This term was 3300s until agent-infra#2888
+#                                            demoted the wall clock to a backstop)
 #   chain-merge.sh waits for the PR 5400s  (90 x 60s) — it exits AT ONCE when the lane recorded a
 #                                           capacity refusal, releasing this claim within a poll
 #                                           interval (agent-infra#1909), so the ceiling below is a
@@ -106,7 +108,7 @@ esac
 #   chain-merge.sh merge-phase wait 1890s  (LANE_PHASE_GRACE 90 + LANE_HANDOFF_WAIT 1800, #2029)
 #   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
 #                                 ------  =======
-#                                 13590s  -> 14400s (4 h)
+#                                 17490s  -> 18000s (5 h)
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
@@ -115,12 +117,32 @@ esac
 # DUPLICATE DISPATCH this file exists to prevent (agent-infra#1850). #2029 raised TWO terms
 # (LANE_TIMEOUT +900s, and the new merge-phase wait +1890s) and this default moved with them in the
 # same commit; any future change to one of the four must do the same, or override CLAIM_ISSUE_TTL
-# (env, or the cell's keys.env).
+# (env, or the cell's keys.env). ⛔ #2888 RAISED THE FIRST TERM (3300 -> 7200) and this default moved
+# with it in the same commit (14400 -> 18000) — the review caught it moving WITHOUT the default, which
+# is exactly the mid-flight expiry this paragraph predicts.
 # The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
-CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-14400}"
+CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-18000}"
 case "${CLAIM_ISSUE_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=14400 ;;
-  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=14400 ;;
+  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=18000 ;;
+  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=18000 ;;
+esac
+
+# ── THE BRANCH CLAIM'S LEASE (agent-infra#3328) ─────────────────────────────────────────────
+# ⛔ THE CEILING IS THIS KEY'S OWN TERM (14400), NOT CLAIM_TTL_MAX (7200): `claim_branch_acquire`
+# passes CLAIM_BRANCH_TTL as BOTH the default and the ceiling, because a batch legitimately outlives the
+# 2 h PR/merge ceiling and clamping to it would expire a live batch mid-flight. Stated because the
+# comment below used to claim the opposite.
+# A BATCH BRANCH is held for the whole batch, which is longer than any single lane: the owner takes
+# it before the first lane pushes and releases it after the last one lands. Its term is therefore the
+# issue claim's ceiling, not the PR claim's 1800s — a batch claim that expires MID-BATCH lets a peer
+# reclaim it and push, which is the exact loss this key exists to prevent. It is capped by
+# CLAIM_TTL_MAX for the same reason every other key is (claim_branch_acquire passes it as its own
+# ceiling), so a caller cannot mint a term no reaper can reach.
+# ⛔ THE HOLDER RELEASES ON COMPLETION, so the full term is only ever spent by a box that died.
+CLAIM_BRANCH_TTL="${CLAIM_BRANCH_TTL:-14400}"
+case "${CLAIM_BRANCH_TTL:-}" in
+  ''|*[!0-9]*|0*) CLAIM_BRANCH_TTL=14400 ;;
+  *) [ "${#CLAIM_BRANCH_TTL}" -le 9 ] || CLAIM_BRANCH_TTL=14400 ;;
 esac
 
 # ── THE LEASE CEILING (agent-infra#2094) ──────────────────────────────────────────────────────
@@ -128,7 +150,8 @@ esac
 # merge/fix paths lease a PR claim for MORE than `CLAIM_TTL` on purpose, because the lease must cover
 # the review+merge the claim is taken for:
 #     merge-one.sh   CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))  -> 3000s
-#     fix-one.sh     FIX_LEASE=$(( FIX_TIMEOUT + 1200 ))      -> 3600s
+#     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 )) -> 8400s
+#                    (3600s before agent-infra#2888: the fixer ran 2400 s, now the 7200 s backstop)
 # So a clamp at 1800 would expire a claim MID-MERGE and hand the same head to a peer — the duplicate
 # work this registry exists to prevent. But before this bound there was no ceiling at ALL: the only
 # check was "at most 9 digits", so a caller could mint `lease_until = now + 999999999` (31 years) —
@@ -138,10 +161,10 @@ esac
 # lease below the review window, which is the mid-review expiry this block exists to prevent — so raise
 # CLAIM_TTL_MAX at the same time. The clamp is not silent: it reports itself on stderr.
 # Same digit clamp as the two TTLs above: an unparseable ceiling is worse than the default.
-CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-7200}"   # 2 h — twice fix-one's 3600s lease, the longest shipped one
+CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-9600}"   # 2 h 40 m — above fix-one's 8400s lease, the longest shipped one
 case "${CLAIM_TTL_MAX:-}" in
-  ''|*[!0-9]*|0*) CLAIM_TTL_MAX=7200 ;;
-  *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=7200 ;;
+  ''|*[!0-9]*|0*) CLAIM_TTL_MAX=9600 ;;
+  *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=9600 ;;
 esac
 [ "$CLAIM_TTL_MAX" -ge "$CLAIM_TTL" ] || CLAIM_TTL_MAX="$CLAIM_TTL"
 
@@ -382,6 +405,9 @@ claim_owner() {
 # ⛔ It is recorded from the RUNNING host at the moment a claim is judged, not at source time, for the
 # same reason the owner is: a source-time snapshot is a cache of a pre-rename state.
 CLAIM_STATE_DIR="${CLAIM_STATE_DIR:-${O:-$HOME/orchestrator}/state}"
+# The BRANCH claim's token files live beside the issue claim's records, under the same state dir, so a
+# box has ONE place an operator inspects for "what does this box hold" (agent-infra#3328).
+CLAIM_BRANCH_STATE_DIR="${CLAIM_BRANCH_STATE_DIR:-$CLAIM_STATE_DIR}"
 claim_hosts_file() { printf '%s/claim-hosts' "$CLAIM_STATE_DIR"; }
 # claim_host_record <host> — remember a name this box has answered to (idempotent, best-effort).
 # ⛔ IT RECORDS THE MACHINE'S OWN NAMES, SO IT NEVER RECORDS A SEAM IDENTITY. `CLAIM_OWNER_HOST`
@@ -554,6 +580,25 @@ claim_orphan_reason() {
   # for its full TTL). Only the branch that actually probes a process requires the pid.
 
   case "$ref" in
+    # ⛔ A BRANCH CLAIM'S HOLDER PID IS THE ACQUIRE CLI, AND IT IS DEAD BY DESIGN (agent-infra#3358 review
+    # B3/B4). `branch-claim.sh acquire` mints the claim and exits within the second, so "the minting pid
+    # is gone" is the NORMAL state of a live batch claim — the exact inversion decision (b) describes for
+    # issue claims, arrived at from the other side. Measured on a peer acquire: `branch-integration-
+    # land-batch-2-fix` matched the PR-shaped `*[0-9]*-*` arm (`…batch-2-fix`), probed the absent pid and
+    # RECLAIMED a claim holding 599s of live lease, after which the real owner's pushes were refused —
+    # two-lane ownership resolving to "whoever acquired last", which is the loss this key exists to stop.
+    # ⛔ AND THE HOST RULES DO NOT JUDGE IT EITHER — THE BRANCH KEY ABSTAINS ENTIRELY (agent-infra#3329
+    # cycle-2 review, F1). Skipping only the pid rule left the arms BELOW it (a former name of this box,
+    # CLAIM_DEAD_HOSTS, and the roster that calls an unknown host ORPHANED) still judging a branch key —
+    # and a branch claim's holder has NO liveness evidence of any kind: its pid is the acquiring CLI,
+    # dead by design, and its host is whatever box ran that CLI, which is not the lane. Measured:
+    # `claim_orphan_reason "oldbox:4242" refs/claims/branch-…` returned ORPHANED off the FORMER-NAME arm
+    # after a box rename, and with `CLAIM_KNOWN_HOSTS` set it returned ORPHANED for a live peer's claim —
+    # and `claim_prune` deletes on that verdict with NO expiry needed, after which the guard reads
+    # `unclaimed` and the stray push lands. Ownership of a branch ends at holder RELEASE or LEASE EXPIRY
+    # (claim_prune's expired arm), never at an orphan verdict. The bare spelling is covered too: a
+    # `branch-<slug>` with a digit-hyphen in it would otherwise reach the PR-shaped pid arm.
+    */branch-*|branch-*) return 1 ;;
     *"/issue-"*) : ;;   # the holder is the controller, not the worker -> the pid answers nothing
   # ⚠️ THE RESIDUAL THIS ARM ADMITS is confined to the ISSUE key: a rename frees the renamed box's own
   # IN-FLIGHT issue claims while their chains keep running — "the holder is gone but the work is not".
@@ -741,6 +786,196 @@ claim_pr_key() { printf 'pr-%s' "$1"; }
 
 # claim_pr_ref <pr> -> "refs/claims/pr-<N>"
 claim_pr_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_pr_key "$1")"; }
+
+# ── THE BRANCH KEY: "branch-<slug>", ONE REF PER BATCH BRANCH (agent-infra#3328) ─────────────
+# WHY A THIRD KEY. The per-head key answers "who is reviewing this commit" and `pr-<N>` answers
+# "who is landing this PR". Neither answers "who may MOVE this branch" — and a BATCH branch is the
+# one ref the fleet writes from several lanes at once. Measured 2026-11-03: a live peer pushed
+# `f8842dc7e` onto `integration/land-batch-2` at 01:48:47Z, ~43 min after two reviewers signed
+# `004d5afa4` and the 377-test suite ran. The push superseded the head, the per-PR `concurrency`
+# group (tortoise ci.yml, `cancel-in-progress: true`) cancelled run 41557371710, and ELEVEN already
+# green jobs were discarded with it. `gh run rerun --failed` cannot recover them: the run was
+# cancelled, not failed, and a QUEUED job may never be "marked" green. The loss was not CI's — it
+# was two lanes owning one branch.
+#
+# ⛔ IT IS THE SAME REGISTRY, NOT A SECOND ONE. Same CAS core (`_claim_acquire_at`), same lease-as-
+# data, same fencing, same reaper, same `refs/claims/*` namespace. A second registry would have to
+# re-derive the polarity of every one of those (this file's most expensive lesson, §_lease_is_live),
+# and the two would drift exactly where it matters: on "is this free?".
+#
+# ⛔ THE SLUG IS THE BRANCH NAME, MADE REF-SAFE, AND IT MUST BE INJECTIVE ENOUGH TO NOT MERGE TWO
+# BRANCHES. `integration/land-batch-2` -> `integration-land-batch-2`. Every character outside
+# `[A-Za-z0-9._-]` becomes `-`, and a run of them collapses to one, so `a/b` and `a-b` DO collide —
+# which is why the guard also compares the FULL branch name: the ref is the lock, the recorded branch
+# name is the identity check (see claim_branch_guard). A collision can therefore only ever produce a
+# refusal (two names sharing a lock), never a stray push that looks owned.
+claim_branch_slug() {
+  printf '%s' "${1:-}" | sed -e 's#[^A-Za-z0-9._-]#-#g' -e 's#--*#-#g' -e 's#^-*##' -e 's#-*$##'
+}
+
+# claim_branch_key <branch> -> "branch-<slug>"
+claim_branch_key() {
+  local s; s="$(claim_branch_slug "${1:-}")"
+  # An empty slug would mint `refs/claims/branch-` — one lock shared by every unnamable input. Refuse
+  # it by returning a key no branch can produce, so the caller's CAS fails loudly instead of silently
+  # serialising unrelated branches.
+  [ -n "$s" ] || s="__unnamed__"
+  printf 'branch-%s' "$s"
+}
+
+# claim_branch_ref <branch> -> "refs/claims/branch-<slug>"
+claim_branch_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_branch_key "$1")"; }
+
+# claim_branch_acquire <repo> <branch> [ttl] — the same CAS, keyed by BATCH BRANCH (#3328).
+# Sets CLAIM_RESULT / CLAIM_COMMIT / CLAIM_REF / CLAIM_OWNER exactly as its siblings do, so a caller
+# that already handles rc=1 (another lane owns it) and rc=2 (infra) needs no new vocabulary.
+claim_branch_acquire() {
+  _claim_acquire_at "$(claim_branch_ref "${2:-}")" "${3:-$CLAIM_BRANCH_TTL}" "$CLAIM_BRANCH_TTL" "$CLAIM_BRANCH_TTL"
+}
+
+# claim_branch_release <repo> <branch> [<own-commit>] — fenced release of a BRANCH claim (#3328).
+claim_branch_release() {
+  _claim_release_at "$(claim_branch_ref "${2:-}")" "${3:-}"
+}
+
+# claim_branch_status <repo> <branch> -> "owner\tlease_until", rc=1 if unheld (#3328)
+claim_branch_status() { _claim_status_at "$(claim_branch_ref "${2:-}")"; }
+
+# claim_branch_preflight <branch> — 0 CLEAN / 1 COLLISION / 2 INCOMPLETE, same polarity as the
+# issue- and PR-keyed reads (an abstention is NOT permission).
+claim_branch_preflight() {
+  _claim_preflight_at "$(claim_branch_ref "${1:-}")" "branch ${1:-?}"
+}
+
+# ── THE BRANCH CLAIM'S LOCAL TOKEN (agent-infra#3328) ───────────────────────────────────────
+# The holder's own claim commit, on disk, under the SAME `state/issueclaim-<N>` convention the issue
+# claim uses. The PRE-PUSH GUARD cannot ask "is this process the owner?" — it runs in a child of
+# whatever pushed — so it asks the question the fence can answer: *does this checkout hold the claim
+# commit that is currently the ref's tip?* Only the acquire that won the CAS ever writes that file,
+# and a peer's push does not carry it. The token is therefore a possession proof, not a liveness
+# probe, and it is exactly the fencing token `--force-with-lease` already uses.
+# ⛔ THE TOKEN IS PER-CHECKOUT, NOT PER-BOX, AND THAT IS THE WHOLE POINT. The incident's peer was a
+# LATER LANE, possibly on this same machine (the fleet runs several lanes per box), so a token in the
+# box's shared state dir is readable by every lane on that box — measured in this suite's first run,
+# where a "stray" clone on the same box read the owner's token and its push was ALLOWED through the
+# guard. The token therefore lives in the CLAIM_REPO's own git dir: two lanes are two checkouts, and
+# a lane that never acquired the claim simply has no file.
+claim_branch_token_path() { # <branch> [<dir>] -> path of this checkout's token file
+  local br="${1:-}" dir="${2:-${CLAIM_BRANCH_TOKEN_DIR:-}}"
+  if [ -z "$dir" ]; then dir="$(_git rev-parse --absolute-git-dir 2>/dev/null)"; fi
+  [ -n "$dir" ] || dir="$CLAIM_BRANCH_STATE_DIR"
+  printf '%s/branchclaim-%s' "$dir" "$(claim_branch_key "$br")"
+}
+
+claim_branch_record() { # <token-file> <branch> <own-commit> -> 0 written, 1 nothing
+  local file="${1:-}" br="${2:-}" own="${3:-}"
+  [ -n "$own" ] && [ -n "$br" ] && [ -n "$file" ] || return 1
+  mkdir -p "$(dirname -- "$file")" 2>/dev/null || return 1
+  printf '%s\n%s\n%s\n' "$br" "$own" "$(claim_owner)" > "$file" || return 1
+  printf '%s' "$file"
+  return 0
+}
+
+# claim_branch_token <token-file> -> the holder's own claim commit on stdout, or rc=1 when this
+# checkout holds no token for that branch (a stray lane, or a released claim).
+claim_branch_token() {
+  local file="${1:-}" rec own
+  [ -n "$file" ] && [ -r "$file" ] || return 1
+  # LINE 1 IS THE IDENTITY, LINE 2 THE FENCE. A file written for a DIFFERENT branch under the same
+  # slug (the collision claim_branch_slug's header names) must not pass as this branch's token.
+  rec="$(sed -n 1p "$file" 2>/dev/null)"
+  own="$(sed -n 2p "$file" 2>/dev/null)"
+  case "$own" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#own}" -eq 40 ] || return 1
+  printf '%s\t%s' "$rec" "$own"
+}
+
+claim_branch_forget() { # <token-file>
+  local file="${1:-}"
+  [ -n "$file" ] || return 0
+  rm -f "$file" 2>/dev/null || return 0
+}
+
+# ── THE PUSH BOUNDARY: claim_branch_guard (agent-infra#3328) ───────────────────────────────
+# THE GATE ITSELF. A pre-push hook (or any push wrapper) calls this with the branch it is about to
+# move; rc=0 means PUSH, anything else means REFUSE and the caller must abort the push.
+#
+# ⛔ WHAT MAKES IT A REFUSAL RATHER THAN ADVICE. The claim ref's tip IS the holder's claim commit,
+# and only the acquire that won the CAS wrote that commit into this checkout's token file
+# (claim_branch_record). So "may I push?" reduces to "does this checkout hold the token that is
+# currently the ref's tip?" — a possession proof the registry already mints, with no new state and
+# no second registry. A stray lane has no token for the branch (it never acquired it), and a token
+# left over from a claim that has since been released/reclaimed no longer matches the tip, so the
+# fencing property is inherited: the loser of a race cannot push on the strength of a stale token.
+#
+# ⛔ THE UNCLAIMED CASE IS ALLOWED, AND ONLY THE UNREADABLE CASE FAILS CLOSED. Refusing an unclaimed
+# branch would break every existing push to `integration/*` the moment this ships, including the
+# owner's own first push — a fail-closed default that trades a silent loss for a loud outage. An
+# UNREADABLE registry is the opposite: an abstention is not permission (this file's doctrine), and
+# it is precisely the case where a stray push would go through unnoticed.
+#
+# claim_branch_guard <branch>  -> 0 PUSH, 1 REFUSED (held by someone else), 2 UNREADABLE
+# Sets CLAIM_RESULT (one line, always naming the holder when one is known) and echoes it.
+claim_branch_guard() {
+  local br="${1:-}" ref out rc cur own owner until now lease tmp orph
+  # ⛔ `$'\t'`, NOT `\t`: inside a quoted case pattern a plain `\t` is a literal backslash-t, so the
+  # tab half of this test could never fire (measured inert — deleted-or-fixed rather than left looking
+  # load-bearing). git rejects such refnames before a hook runs, so this is a cheap last line only.
+  case "$br" in ''|*' '*|*$'\t'*) CLAIM_RESULT="branch-claim: REFUSED branch=<unreadable> reason=no-branch"; echo "$CLAIM_RESULT"; return 1 ;; esac
+  ref="$(claim_branch_ref "$br")"
+  # ⛔ THE EXIT STATUS IS THE DISTINCTION (the same split every pre-flight here makes): `ls-remote`
+  # exits 0 with EMPTY output when the ref does not exist, NON-ZERO only when the remote could not be
+  # consulted. Collapsing the two reads an outage as "unclaimed" and lets the stray push through.
+  out="$(_git ls-remote origin "$ref" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    CLAIM_RESULT="branch-claim: REFUSED branch=$br reason=registry-unreadable — cannot prove ownership, so the push is refused rather than guessed ($(_claim_repo_problem))"
+    echo "$CLAIM_RESULT"; return 2
+  fi
+  cur="$(printf '%s\n' "$out" | awk '{print $1}')"
+  if [ -z "$cur" ]; then
+    CLAIM_RESULT="branch-claim: PUSH branch=$br reason=unclaimed — no branch claim is held, nothing to refuse"
+    echo "$CLAIM_RESULT"; return 0
+  fi
+  # THE TOKEN CHECK — the fence. Owning the tip is owning the branch.
+  local tok rec
+  tok="$(claim_branch_token "$(claim_branch_token_path "$br")")" || tok=""
+  rec="${tok%%$'\t'*}"; own="${tok##*$'\t'}"
+  # The slug can collide across branch names (see claim_branch_slug); the recorded NAME is what makes
+  # the token this branch's, so a collision refuses rather than authorises.
+  [ "$rec" = "$br" ] || own=""
+  if [ -n "$own" ] && [ "$own" = "$cur" ]; then
+    CLAIM_RESULT="branch-claim: PUSH branch=$br reason=held-by-you holder=$(claim_owner)"
+    echo "$CLAIM_RESULT"; return 0
+  fi
+  # Not ours. Read the lease so the refusal can name the holder and say who to ask.
+  owner="?"; until="0"
+  tmp="$CLAIM_TMP_NS/brguard-$RANDOM$$"
+  if _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
+    lease="$(_lease_of "$tmp")"; owner="${lease%%$'\t'*}"; until="${lease##*$'\t'}"
+    _git update-ref -d "$tmp" 2>/dev/null
+  else
+    _git update-ref -d "$tmp" 2>/dev/null
+    CLAIM_RESULT="branch-claim: REFUSED branch=$br reason=claim-unreadable — a claim ref exists but its lease could not be read, so ownership cannot be proven"
+    echo "$CLAIM_RESULT"; return 2
+  fi
+  now="$(date +%s 2>/dev/null)"
+  case "${now:-}" in
+    ''|*[!0-9]*) CLAIM_RESULT="branch-claim: REFUSED branch=$br holder=$owner reason=clock-unreadable — the lease cannot be judged, so ownership cannot be proven"; echo "$CLAIM_RESULT"; return 2 ;;
+  esac
+  if _lease_is_live "$until" "$now"; then
+    # ⛔ AN ORPHANED HOLDER IS REPORTED, NOT SILENTLY OBEYED OR SILENTLY IGNORED. A dead holder's
+    # term remains a refusal HERE (unlike the pre-flight, which reports it reclaimable) because the
+    # guard does not take claims — it only answers "may this push proceed". The remedy is named.
+    orph="$(claim_orphan_reason "$owner" "$ref" 2>/dev/null)" || orph=""
+    CLAIM_RESULT="branch-claim: REFUSED branch=$br holder=$owner until=$until reason=held-by-live${orph:+ detail=orphaned-holder:$(printf '%s' "$orph" | tr ' ' '_')} — this branch is single-owner; ask $owner to release it (branch-claim.sh release $br on the holder's box) or wait for the lease to expire, then acquire before pushing"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  # Expired but not pruned: still not THIS actor's claim, so still a refusal. The reclaim is a CAS
+  # (branch-claim.sh acquire) that must be taken before pushing — which is exactly the ordering that
+  # stops the stray push.
+  CLAIM_RESULT="branch-claim: REFUSED branch=$br holder=$owner until=$until reason=claim-expired-unreclaimed — the stale claim must be reclaimed (branch-claim.sh acquire $br) before anyone pushes"
+  echo "$CLAIM_RESULT"; return 1
+}
 
 # _claim_commit <owner> <lease_until> -> commit sha carrying the lease as data
 #

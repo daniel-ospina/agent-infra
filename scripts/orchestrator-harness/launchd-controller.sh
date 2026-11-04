@@ -145,7 +145,14 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
-CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC"
+CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE"
+
+# ⛔ `UV_CACHE_DIR` / `UV_LINK_MODE` ARE THE HALF #3108 LEFT OUT. That change rendered both keys into
+# `launchd.plist.template` so every box pins uv's cache and link mode (#2159), but this list is the hop
+# that decides whether a plist key reaches the tmux PANE — so the pin was delivered to the job and
+# dropped here, and every controller pane kept uv's DEFAULT (a per-box cache and a copy-on-link store)
+# while the plist read as if it were pinned. Case E below is the equality that names it; the direction
+# of the repair is this list, never the template (a key removed from the template stops being pinned).
 
 # ⛔ THE PIN KEYS ARE HERE BECAUSE THE JOB'S CYCLE READS THEM (agent-infra#2215 / #2231). `harness-refresh.sh`
 # runs INSIDE this controller's cycle and decides from `HARNESS_PIN` / `HARNESS_PIN_FILE` / `HARNESS_REPO`

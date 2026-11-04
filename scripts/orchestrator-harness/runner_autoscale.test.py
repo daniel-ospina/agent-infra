@@ -2609,13 +2609,21 @@ def t33_starvation_eligibility_healthy():
     alarm exists for (#2875) becomes invisible.
 
     The alarm's second half is ELIGIBILITY (`starvation_eligible`): the pool advertises the fallback,
-    OR the gate wants `local`, OR the queue is at/above the gate's own backlog threshold."""
+    OR the gate wants `local`, OR the queue is at/above the gate's own backlog threshold.
+
+    ⛔ THE DEPTH IS THRESHOLD-RELATIVE, NOT 14, SINCE THE 2026-11-02 RULING. The case's whole point is
+    the FALLBACK-ONLY population — a queue the gate calls GitHub-hosted's work — so it must sit BELOW
+    the gate's trigger. It was written with the measured 14 when that trigger was 60; at the shipped
+    10 a 14-deep queue is at/above it, and the third eligibility term now fires correctly, which would
+    make this case assert the opposite of what it exists to pin. The ≥-threshold behaviour has its own
+    case (T43). Deriving the depth keeps the two in step if the trigger moves again."""
     with Env():
         box = Box("starve-ineligible")
         try:
             # The pool is up and idle; NOTHING advertises ubuntu-latest, and the gate says github.
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64", "Linux"])])
-            box.queued(14)
+            below_threshold = ra.GATE_QUEUE_THRESHOLD - 1
+            box.queued(below_threshold)
             box.gate_state("github")
             record = converge(box, want=0)
             check(
@@ -2628,7 +2636,7 @@ def t33_starvation_eligibility_healthy():
             )
             check(record["verdict"] != "starvation", f"verdict: {record['verdict']}")
             # ⛔ THE EVIDENCE SURVIVES THE VERDICT: the counts and the reason are still published.
-            check(record.get("queued_runs") == 14, f"the counts must stay published: {record}")
+            check(record.get("queued_runs") == below_threshold, f"the counts must stay published: {record}")
             blob = " ".join(record["notes"])
             contains(blob, "starvation NOT armed", "the record")
             contains(blob, "GitHub-hosted", "the record")
@@ -3016,7 +3024,7 @@ def t42_absent_gate_record_is_absence():
 def t43_deep_queue_threshold():
     """The third eligibility term exists for a queue nobody's labels explain: a DEEP backlog with an
     idle pool is worth a page whatever the pool advertises, and the number is the gate's own
-    (`ci_runner_gate.sh:43`, `CI_GATE_QUEUE_THRESHOLD:-60`) rather than a second opinion invented
+    (`ci_runner_gate.sh`, `CI_GATE_QUEUE_THRESHOLD:-10`) rather than a second opinion invented
     here. Review finding P1: without this case the constant was documented as "PINNED BY THE SUITE"
     with zero references in it, so a drift from 60 — or the term being dropped — was invisible."""
     with Env():
@@ -3496,9 +3504,12 @@ def t44_queue_age_eligibility():
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
             # #2875's own counts: the label is GONE from every runner (the gate on the hub stripped
-            # it), the pool is online and IDLE, and 53 runs are waiting (below the gate's 60).
+            # it), and the pool is online and IDLE. The depth sits BELOW the gate's own trigger on
+            # purpose: this case exists to prove the AGE term decides when the other terms do not, so
+            # a depth at/above the 2026-11-02 trigger of 10 would let the depth term answer first and
+            # the case would certify nothing (measured: it failed exactly that way at 53).
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
-            box.queued(53)
+            box.queued(ra.GATE_QUEUE_THRESHOLD - 1)
             # ⛔ ROW 0 IS NOT THE OLDEST (round-13 review finding P1). The runs endpoint is
             # newest-first and ignores `sort`/`direction`, so the page's first row is the run that
             # arrived a moment ago — and a queue STILL RECEIVING WORK is exactly #2875's shape. Pin
@@ -3539,7 +3550,7 @@ def t44_queue_age_eligibility():
                 "the reason must name the age bound it did not reach",
             )
             check(
-                record.get("starvation_queued") == 53,
+                record.get("starvation_queued") == ra.GATE_QUEUE_THRESHOLD - 1,
                 f"the counts are published on BOTH verdicts: {record}",
             )
         finally:
@@ -3556,7 +3567,7 @@ def t56_queue_age_reader_refusals():
         state for exactly this read.
         ⛔ PINNED AT THE UNIT BOUNDARY ON PURPOSE. In *this* tool the state is unreachable end to end:
         the age read is taken only after the depth term declines, i.e. at `queued <
-        GATE_QUEUE_THRESHOLD` (60), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
+        GATE_QUEUE_THRESHOLD` (10), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
         while the depth read reported 53 would assert an API response that cannot exist (both reads
         are the same endpoint) and would claim a false-open this tool cannot produce. The guard is
         kept for when the two numbers cross — the gate's threshold is operator-settable, its
@@ -3624,7 +3635,10 @@ def t56_queue_age_reader_refusals():
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
-            box.queued(53)
+            # Below the gate's trigger: an unreadable head must be reported as `unmeasured`, and a
+            # depth past the trigger would let the depth term decide first and mask the refusal.
+            measured_depth = ra.GATE_QUEUE_THRESHOLD - 1
+            box.queued(measured_depth)
             record = converge(box, nproc="2", dry_run=True)
             check(
                 record.get("starvation") == "unmeasured",
@@ -3640,7 +3654,7 @@ def t56_queue_age_reader_refusals():
                 "the refusal must carry its cause to the record, not a bare `unmeasured`",
             )
             check(
-                record.get("queued_runs") == 53,
+                record.get("queued_runs") == measured_depth,
                 f"and the depth the sample DID measure must survive the failed read — `--json` "
                 f"reporting it as absent is the round-7 defect: {record.get('queued_runs')}",
             )
@@ -5069,7 +5083,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T43",
-        "GATE_QUEUE_THRESHOLD = 60",
+        "GATE_QUEUE_THRESHOLD = 10",
         "GATE_QUEUE_THRESHOLD = 55",
         "the alarm's copy of the gate's threshold drifts away from the gate's own default",
     ),

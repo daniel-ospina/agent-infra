@@ -2093,6 +2093,69 @@ m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
 print(",".join(m.ACCOUNT_PARTITION_BUCKETS))' "$HELPER")"
 ck "account: the partition bucket list is CASE-FOLDED (a spelling cannot silence the partition) [$_part]" \
    "$([ "$_part" = "graphql,core" ] && echo 0 || echo 1)"
+# ⛔ M1b. THE DEFAULT PARTITIONS `core`, WHICH IS THE REVERSAL OF THE EARLIER DEFAULT. The old list
+# was `graphql` only, and that was measured wrong on 2026-11-03: `core` at 0/5000 (every
+# `gh run list` / `gh run view` / `gh api` refused) while `graphql` sat at 4973/5000 — the ONE
+# partitioned bucket was idle and the spent one was unbounded. Both buckets are `core`'s workload now:
+# `admin-merge.sh`'s FIRST-CHECKS wait polls `gh run list` and the re-run wait polls `gh run view`,
+# per lane, ~20 lanes to one account. A partition that bounds the idle bucket is the defect.
+_pdef="$(env -u GH_LIMIT_ACCOUNT_PARTITION_BUCKETS python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(",".join(m.ACCOUNT_PARTITION_BUCKETS))' "$HELPER")"
+ck "account: the DEFAULT partition covers core as well as graphql (a REST poll is bounded) [$_pdef]" \
+   "$([ "$_pdef" = "graphql,core" ] && echo 0 || echo 1)"
+# ⛔ AND THE ESCAPE HATCH IS NOT REMOVED, ONLY INVERTED: an operator who measures the opposite
+# pressure (graphql spent, core healthy — the situation the OLD default was written for) restores it.
+_pesc="$(env GH_LIMIT_ACCOUNT_PARTITION_BUCKETS='graphql' python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+print(",".join(m.ACCOUNT_PARTITION_BUCKETS))' "$HELPER")"
+ck "account: … and GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql still restores the old behaviour [$_pesc]" \
+   "$([ "$_pesc" = "graphql" ] && echo 0 || echo 1)"
+# ⛔ M1c. AND THE PARTITION IS HONOURED ON THE WIRE FOR A **CORE** POLL, which is the point of the
+# reversal. `gh run view` is a REST subcommand -> `bucket_for` answers `core`; under the OLD default
+# it took no slot at all and a fleet of lanes spun it as fast as they could. Same declaration as M2
+# (120/hr, safety 1.0, one box = 2/min) so the SAME third call that is free for graphql must wait
+# here too. This asserts the MECHANISM (a slot + a wait), not any rail's verdict.
+reset_env corepoll
+_core_env="GH_LIMIT_ACCOUNT_FLEET_SIZE=1 GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR=120 GH_LIMIT_ACCOUNT_SAFETY=1.0"
+for _i in 1 2; do
+  env $_core_env python3 "$HELPER" --real-gh "$TMP/stub-gh" -- run view 1 --json status >/dev/null 2>&1
+done
+ck "account(core): two REST polls fit the box's share and neither waits" \
+   "$([ -z "$(sleeps)" ] && echo 0 || echo 1)"
+env $_core_env python3 "$HELPER" --real-gh "$TMP/stub-gh" -- run view 1 --json status >/dev/null 2>&1
+ck "account(core): the THIRD REST poll waits out the window — a run-list/view poll is now PACED" \
+   "$(sleep_at_least 0 55 && sleep_below 0 90 && echo 0 || echo 1)"
+ck "account(core): the paced poll is recorded against bucket=core (an operator can see which pool)" \
+   "$(has 'account budget: core' "$(cat "$GH_LIMIT_DIR/events.log")" && echo 0 || echo 1)"
+# ⛔ M1d. THE ONE CHEAP READ — `GH-BUDGET(remaining=<n>, resets_at=<ISO>)`. A lane must be able to tell
+# QUOTA EXHAUSTION from a PRODUCT FAULT without spending a request (2026-11-03: three lanes reported
+# a "broken rail" that was an account at 0/5000). It rides the verb the fleet already calls at that
+# moment (`--health`, local files only), so it costs no new call.
+_tok() {  # <remaining> <reset|none> -> the token
+  python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1])
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+r=None if sys.argv[3]=="none" else int(sys.argv[3])
+print(m.budget_token(int(sys.argv[2]), r))' "$HELPER" "$@"
+}
+_btok="$(_tok 0 1700002580)"
+ck "budget token: at zero it names the remaining count AND the reset as ISO-8601 [$_btok]" \
+   "$(grep -Eq '^GH-BUDGET\(remaining=0, resets_at=20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\)$' <<<"$_btok" && echo 0 || echo 1)"
+# ⛔ AN UNDATED RECORD IS `?`, NEVER A SYNTHETIC WINDOW: printing a made-up reset would make a lane
+# wait out a number nobody measured (the same defect `--health`'s `resets_in=?` already documents).
+ck "budget token: an UNDATED record says resets_at=? rather than inventing a window" \
+   "$([ "$(_tok 0 none)" = 'GH-BUDGET(remaining=0, resets_at=?)' ] && echo 0 || echo 1)"
+ck "budget token: a non-zero count is reported as measured (the token is not exhaustion-only)" \
+   "$(grep -q 'remaining=42' <<<"$(_tok 42 1700002580)" && echo 0 || echo 1)"
+# ⛔ AN OUT-OF-RANGE RESET MUST NOT TAKE THE VERB DOWN. `time.gmtime` raises OverflowError (NOT
+# ValueError) for a corrupt/hand-edited `reset=`, and an uncaught one made `--health` exit 1 with a
+# traceback — the "the check failed" polarity this file's own docstring forbids, from the ONE verb an
+# operator reaches for while every gh call is refused. Same class as L22 (a 24-digit name).
+ck "budget token: an out-of-range reset renders ? and cannot trace back to rc 1" \
+   "$([ "$(_tok 0 999999999999999999999999)" = 'GH-BUDGET(remaining=0, resets_at=?)' ] && echo 0 || echo 1)"
 
 # ⛔ M2. AND IT IS HONOURED ON THE WIRE, with the cap derived from the DECLARED FLEET SIZE. A budget of
 # 120/hr at safety 1.0 is 2 calls/min for ONE declared box and 1/min for TWO, so the same second call

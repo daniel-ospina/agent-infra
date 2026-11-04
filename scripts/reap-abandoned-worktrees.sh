@@ -116,6 +116,26 @@ LOCK_DIR="$STATE_DIR/reap-abandoned-worktrees.lock"
 LOCK_STALE_SECONDS="${REAP_AW_LOCK_STALE_SECONDS:-1800}"
 AGED_MINUTES="${REAP_AW_AGED_MINUTES:-180}"
 DIRTY_MODE="${REAP_AW_DIRTY:-keep}"
+# ── the GITLESS arm (#3278) ───────────────────────────────────────────────────────────────────
+# OFF by default so every existing caller keeps today's exact behaviour (and its tests keep meaning
+# what they meant). The scheduled pass opts IN, because the class this arm covers is the one that
+# grows: a `/tmp/<name>` scratch tree with NO `.git` was invisible to every arm the hourly pass runs.
+INCLUDE_GITLESS=0
+# ⛔ A KEEP LIST IS NOT OPTIONAL. A gitless tree cannot be PROVEN to hold no work (there is no
+# branch, no remote ref, no PR to consult), so the paths a BOX depends on are named here and are
+# never candidates. `/tmp/actions-runner` is the CI runner install on every cell — removing it
+# breaks every job on the box, which is a worse outcome than the space it holds.
+GITLESS_KEEP="${REAP_AW_GITLESS_KEEP:-/tmp/actions-runner:/tmp/venv-shared*}"
+# ⛔ AND THE CLASS IS BOUNDED PER PASS (measured on cell-3: the unbounded first cut ran >17 min on
+# 487 top-level dirs, overran the entry point's class timeout and left the HOURLY REAPER RED — a
+# scheduled actuator that cannot finish is not a fix, whatever it removes on the way). The cap is a
+# deliberate throughput limit, not a safety rule: successive hourly passes make progress, and the
+# standing population on this box (4,594 MB / 453 trees) clears inside one pass.
+# 10, not 40: the binding cost is REMOVAL I/O, measured on cell-3 at 20-60 s per tree
+# (`08:38:24 - 08:39:41` for three trees on a 126 GB disk at 95 %), so 40 candidates is 15-25 min of
+# removing and overruns the class bound. 10 keeps a pass inside it while still clearing the standing
+# population (26 candidates when this landed) in ~3 hours of hourly passes.
+GITLESS_MAX="${REAP_AW_GITLESS_MAX:-10}"
 ROOTS="${REAP_AW_ROOTS:-/tmp}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
@@ -149,6 +169,11 @@ while [ $# -gt 0 ]; do
         --dirty)   [ $# -ge 2 ] || die "--dirty needs keep|reap"
                    case "$2" in keep|reap) DIRTY_MODE="$2" ;; *) die "--dirty must be keep|reap (got '$2')" ;; esac
                    shift 2 ;;
+        # ⛔ THE GITLESS ARM IS OPT-IN, and it has NO `--dirty` argument: a tree with no `.git` has no
+        # tree state to read, so the dial that governs it is AGE + the live-pid census + the keep
+        # list. Asking git whether it is clean would return nothing, and `--dirty keep` reads an
+        # unhelpful `dirty=` as `clean-unknown` — i.e. it would keep every one of them forever.
+        --include-gitless) INCLUDE_GITLESS=1; shift ;;
         --print-config) PRINT_CONFIG=1; shift ;;
         --list)    LIST_ONLY=1; DRY_RUN=1; shift ;;
         --help|-h) usage ;;
@@ -377,7 +402,7 @@ toctou_preserve() { # <worktree> -> 0 = still removable, 1 = PRESERVE (TOCTOU_WH
     # `read: read error: 0: Is a directory` lines). The fresh-census half was dead code.
     if lp_path_held "$fresh/live-paths.tsv" "$wt"; then TOCTOU_WHY="entered-during-pass ($LP_HOLD_WHY)"; rm -rf "$fresh"; return 1; fi
     if lp_path_named "$fresh/live-paths.tsv" "$wt"; then TOCTOU_WHY="argv-named-during-pass ($LP_NAME_WHY)"; rm -rf "$fresh"; return 1; fi
-    if [ "$DIRTY_MODE" = keep ]; then
+    if [ "$DIRTY_MODE" = keep ] && [ -f "$wt/.git" ]; then
         out="$(head_state "$wt")"
         dirty_n="$(printf '%s' "$out" | sed -n 's/.*dirty=\([0-9][0-9]*\).*/\1/p')"
         case "$dirty_n" in
@@ -442,10 +467,83 @@ remove_one() { # <worktree-canonical-path> <repo> — 0 removed, 1 not removed (
     return 1
 }
 
+# ── the gitless arm's tests (#3278) ───────────────────────────────────────────────────────────
+# ⛔ WHY THIS ARM EXISTS. The sweep below enumerates directories whose `.git` is a FILE. That is the
+# correct test for a LINKED worktree, and it is what keeps a primary checkout out of reach — but it
+# also means a `/tmp/<name>` scratch tree with NO `.git` is skipped by EVERY arm the scheduled pass
+# runs: `pi-reap-worktrees.sh` only sees REGISTERED checkouts, this file only sees linked ones.
+# Measured on cell-3 (2026-11-02): 453 such trees holding 4,594 MB, invisible to the hourly pass,
+# while the box reached 0 bytes free and its lanes died. The class is the one that grows.
+#
+# ⛔ IT IS NOT A WEAKENING OF THE LINKED-WORKTREE PREDICATE. The linked arm keeps its four proofs
+# (open-pr, dirty, no-pr, main-checkout) untouched; this arm adds a population those proofs cannot
+# describe, and it carries every guard they carry that DOES apply (age floor, live-pid census,
+# argv-named, pin, containment, toctou re-proof) plus the keep list.
+git_below() { # <dir> — is a git marker INSIDE the tree? Then a git arm owns it, not this one.
+    local x y
+    # ⛔ DEPTH 3, NOT ONE LEVEL (review of #3278, measured): a repo nested at `x/a/b/.git` was
+    # classified gitless and removable by the one-level version.
+    # ⛔ AND BY PURE PATH EXPANSION, NOT `find` (measured at 08:0xZ, the reason a scheduled pass exited
+    # 124): `find -maxdepth 3` forks and re-walks every directory of a 250 MB scratch tree, ~450 times
+    # per pass — the arm overran its class bound and the whole worktree class went RED. These globs
+    # readdir exactly three levels and fork nothing.
+    for x in "$d"/*/; do
+        [ -d "$x" ] || continue
+        x="${x%/}"
+        [ -e "$x/.git" ] && return 0
+        # a BARE repo nested in the tree is the same object class as a nested `.git`: `HEAD` +
+        # `objects/` + `refs/` ARE the repository (review of #3278 round 2).
+        if [ -e "$x/HEAD" ] && [ -d "$x/objects" ] && [ -d "$x/refs" ]; then return 0; fi
+        for y in "$x"/*/; do
+            y="${y%/}"
+            [ -e "$y/.git" ] && return 0
+            if [ -e "$y/HEAD" ] && [ -d "$y/objects" ] && [ -d "$y/refs" ]; then return 0; fi
+        done
+    done
+    return 1
+}
+gitless_keep() { # <canon> — is it a box dependency named in the keep list?
+    # ⛔ COMPARED ON THE CANONICAL PATH, and the list is read with `while read` not `$(…)` word
+    # splitting (review of #3278): splitting dropped the meaning of any entry containing a space —
+    # `REAP_AW_GITLESS_KEEP='/tmp/keep dir'` silently discarded the entry and DELETED the tree — and a
+    # raw-path comparison let `--root /tmp/` (→ `/tmp//actions-runner`) slip past the runner install.
+    local k kc
+    while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        kc="$(lp_canon "$k" 2>/dev/null)" || kc=""
+        [ -n "$kc" ] || kc="${k%/}"
+        [ -n "$kc" ] || continue
+        case "$1" in
+            "$kc"|"$kc"/*) GITLESS_KEEP_WHY="named in the --include-gitless keep list ($kc)"; return 0 ;;
+        esac
+        # ⛔ A TRAILING-GLOB ENTRY IS A PREFIX RULE. The documented safe-sweep exclusion set
+        # (docs/ops/disk-consumers.md R4) is a family, not a list — `/tmp/venv-shared-py312` holds a
+        # lane's INTERPRETER via VIRTUAL_ENV, which the cwd/exe/argv census cannot see, so a prefix
+        # entry is the only way to name it (review of #3278).
+        case "$kc" in
+            *'*'*) case "$1" in $kc|$kc/*) GITLESS_KEEP_WHY="matches keep-list pattern ($kc)"; return 0 ;; esac ;;
+        esac
+    done <<<"$(printf '%s' "${GITLESS_KEEP:-}" | tr ':' '\n')"
+    return 1
+}
+remove_gitless() { # <canon> — no git, so no branch/ref/reflog exists that could preserve anything
+    if gb rm -rf "$1" >/dev/null 2>&1; then REMOVE_HOW="rm-gitless"; return 0; fi
+    # ⛔ A READ-ONLY DIRECTORY INSIDE THE TREE DEFEATS `rm -rf` (mode `dr-xr-xr-x`: unlinking an entry
+    # needs WRITE on the directory, not just on the file), and the arm then reports
+    # `removal-failed` on every pass — measured on cell-3: /tmp/atom-e2e held
+    # `…/scripts/olddir` (dr-xr-xr-x, from a 17-day-old test fixture) and kept the hourly pass RED at
+    # rc=4 through two runs, long after the tree itself was proven removable. The tree has already been
+    # proven removable by every guard above (age, no live pid, no `.git`, not kept, inside the root, no
+    # symlink), so restoring the owner's write bit and completing the SAME decision is not a new one.
+    gb chmod -R u+rwX -- "$1" >/dev/null 2>&1
+    if gb rm -rf "$1" >/dev/null 2>&1; then REMOVE_HOW="rm-gitless(chmod)"; return 0; fi
+    return 1
+}
+
 # ── the sweep ─────────────────────────────────────────────────────────────────────────────────
 CAND=0; REAPED=0; KEPT=0; FAILED=0; REMOVE_HOW=""
 sweep_root() { # <root>
-    local root="$1" d canon base mt age repo out deadline dirty_n root_canon
+    local root="$1" d canon base mt age repo out deadline dirty_n root_canon gitless GITLESS_KEEP_WHY _ref _refc GITLESS_DONE=0
     deadline=$(( $(now) + BUDGET ))
     [ -d "$root" ] || { log_line "note: scratch root $root does not exist — nothing to sweep there"; return 0; }
     root_canon="$(lp_canon "$root")" || root_canon=""
@@ -468,7 +566,44 @@ sweep_root() { # <root>
         fi
         # ONLY a linked worktree. A primary checkout's `.git` is a DIRECTORY and is NEVER a candidate
         # (this is the test that keeps the hub and the cell's own repo out of reach, by construction).
-        [ -f "$d/.git" ] || continue
+        gitless=0
+        if [ -f "$d/.git" ]; then
+            :   # a linked worktree — the four proofs below own it, unchanged
+        elif [ -L "$d/.git" ] || [ -e "$d/.git" ]; then
+            # `.git` is a DIRECTORY or a SYMLINK: a primary checkout (or a checkout whose gitdir link
+            # went dangling — `-L` also catches a broken link, which `-f`/`-e` both miss and which
+            # used to fall through into the gitless arm with the tree's work still in it; review of
+            # #3278, measured). Named, so the preservation is visible in the pass log instead of
+            # being an anonymous `continue`.
+            KEPT=$((KEPT + 1)); log_line "PRESERVED($d, main-checkout) .git is a DIRECTORY/link — a primary checkout is never a candidate"; continue
+        else
+            # ── NO `.git` AT ALL: the uncovered class (#3278) ─────────────────────────────────────
+            if [ "$INCLUDE_GITLESS" != 1 ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=not-a-worktree (no .git; --include-gitless is off)"; continue
+            fi
+            # ⛔ BOTH LIMITS ARE CHECKED BEFORE ANY PER-TREE WORK. The budget check used to sit AFTER
+            # `git_below` and canonicalisation, so the expensive part of an over-budget arm still ran
+            # to the end of the root (measured: 17+ min, class timeout, rc=3 every hour).
+            if [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} candidates this pass; the remainder is PRESERVED for the next run)"; continue
+            fi
+            if [ "$(now)" -ge "$deadline" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed trees are PRESERVED)"; continue
+            fi
+            if git_below "$d"; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=git-below (a .git lives inside the tree, so a git arm owns it)"; continue
+            fi
+            # ⛔ A BARE REPO HAS NO `.git` AT ALL: `HEAD` + `objects/` + `refs/` ARE the repository.
+            # Classifying it gitless would take every commit in it (review of #3278, measured).
+            if [ -e "$d/HEAD" ] && [ -d "$d/objects" ] && [ -d "$d/refs" ]; then
+                KEPT=$((KEPT + 1)); log_line "PRESERVED($d, bare-repo) HEAD+objects/+refs/ — this IS a git repository, not scratch"; continue
+            fi
+            # ⛔ THE HOME/STATE GUARD IS NOT HERE — it runs on the CANONICAL path below (review of
+            # #3278 round 2: comparing the raw `$d` let `--root /tmp/` — `/tmp//cell-home` — delete the
+            # cell HOME in an armed pass; the same spelling bug the keep list had).
+            gitless=1
+            GITLESS_DONE=$((GITLESS_DONE + 1))
+        fi
         canon="$(lp_canon "$d")" || canon=""
         base="$(basename "$d")"
         if [ -z "$canon" ] || [ "$canon" = "$root_canon" ]; then
@@ -480,6 +615,27 @@ sweep_root() { # <root>
         # so the canonical path is what must be proven inside.
         if ! _lp_rel "$canon" "$root_canon"; then
             KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=outside-root ($canon is not inside $root_canon — this sweep has no authority there)"; continue
+        fi
+        # ⛔ NEVER THE CELL'S OWN HOME, NOR THE PASS'S STATE DIR — compared on the CANONICAL path,
+        # with each reference canonicalised too (review of #3278 round 2, measured: a non-canonical
+        # `--root` spelling reaped /tmp/cell-home, which holds ~9.8 GB of `.pi` / `.venvs` here, and the
+        # structural guard — the stamp's ancestor-pin — is absent on the scheduled path).
+        if [ "$gitless" = 1 ]; then
+            for _ref in "${HOME:-}" "${CELL_HOME:-}" "${REAP_AW_STATE_DIR:-}"; do
+                [ -n "$_ref" ] || continue
+                _refc="$(lp_canon "$_ref" 2>/dev/null)" || _refc=""
+                [ -n "$_refc" ] || _refc="${_ref%/}"
+                [ -n "$_refc" ] || continue
+                case "$canon" in
+                    "$_refc"|"$_refc"/*)
+                        KEPT=$((KEPT + 1)); log_line "PRESERVED($canon, home-or-state) the cell HOME / pass state dir is never a candidate"; continue 2 ;;
+                esac
+            done
+        fi
+        # ⛔ THE KEEP LIST IS CHECKED ON THE CANONICAL PATH, and it is checked for GITLESS candidates
+        # only: a linked worktree's protection is the four git proofs, not this list (review of #3278).
+        if [ "$gitless" = 1 ] && gitless_keep "$canon"; then
+            KEPT=$((KEPT + 1)); log_line "PRESERVED($canon, keep-list) ${GITLESS_KEEP_WHY:-named in the gitless keep list}"; continue
         fi
         mt="$(file_mtime "$d")"
         if ! num "$mt"; then
@@ -504,15 +660,18 @@ sweep_root() { # <root>
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
             continue
         fi
-        repo="$(repo_root_of "$d")" || repo=""
+        if [ "$gitless" = 1 ]; then repo=""; else repo="$(repo_root_of "$d")" || repo=""; fi
         if [ "$(now)" -ge "$deadline" ]; then
             # ⛔ THE BUDGET BOUNDS THE CLASSIFICATION TOO. `git status` per candidate is exactly the
             # unbounded per-record fork the budget exists for; an unprocessed candidate is PRESERVED.
             log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
         fi
-        out="$(head_state "$d")"
-        if [ "$DIRTY_MODE" = keep ]; then
+        # ⛔ ONLY A LINKED WORKTREE IS ASKED FOR ITS TREE STATE. For a gitless tree `head_state` is
+        # three bounded git forks on a directory git rejects — charged against the budget that exists
+        # to bound exactly this — and its answer is discarded anyway (review of #3278).
+        if [ "$gitless" = 1 ]; then out="kind=gitless"; else out="$(head_state "$d")"; fi
+        if [ "$DIRTY_MODE" = keep ] && [ "$gitless" != 1 ]; then
             dirty_n="$(printf '%s' "$out" | sed -n 's/.*dirty=\([0-9][0-9]*\).*/\1/p')"
             case "$dirty_n" in
                 '') # git did not answer: `--dirty keep` cannot PROVE the tree is clean, so it keeps it.
@@ -544,6 +703,16 @@ sweep_root() { # <root>
             KEPT=$((KEPT + 1))
             log_line "KEPT   $canon reason=toctou ($TOCTOU_WHY; the pass-start snapshot was up to ${BUDGET}s stale, and a live holder is never a guess; age=${age}m)"
             log "PRESERVE-TOCTOU $canon $TOCTOU_WHY"
+            continue
+        fi
+        if [ "$gitless" = 1 ]; then
+            if remove_gitless "$canon"; then
+                REAPED=$((REAPED + 1)); log_line "REAPED $canon how=${REMOVE_HOW:-rm} age=${age}m $out"
+                log "reaped $canon how=rm-gitless age=${age}m"
+            else
+                FAILED=$((FAILED + 1)); log_line "ERR    $canon reason=remove-failed (a live holder would fail exactly this way; look before retrying)"
+                log "REMOVAL FAILED $canon age=${age}m"
+            fi
             continue
         fi
         if remove_one "$canon" "$repo"; then

@@ -3143,6 +3143,15 @@ fi
 _ck_released_n=0
 _ck_deferred_n=0
 _ck_unjustified_n=0
+# ⛔ THE UNANSWERABLE READ IS NAMED ONCE PER PASS, NOT ONCE PER ENTRY (agent-infra#2466 review P2 /
+# #2741). The `*)` arm below keeps EVERY entry it could not decide, which is the fail-closed part —
+# but it used to keep them SILENTLY, so a pass that never had a registry was byte-identical on the
+# log to one that consulted it and found every entry held. The funnel line carried
+# `checked_refused=claim-registry-absent`, which is a MACHINE slug: the operator reading the log got a
+# suppression that renews itself for ever and no sentence telling them why. One line per pass (a
+# `checked.txt` of 300 entries must not print 300 of them), carrying the registry's OWN reason
+# (`CLAIM_RESULT`, which already says which path is missing or unreadable) and the one-command remedy.
+_ck_claim_named=0
 if [ -f "$O/state/checked-release-candidates" ]; then
   # every decision this pass makes, one `N<TAB>reason` line, written once and read three times below
   # ⛔ `$$`, like `checked-reap.$$` below (review E-P2, cycle 2): these are FIXED paths under `$O`, and
@@ -3253,7 +3262,25 @@ _ck_tmp="$O/.checked-decided.$$"
           # any code a future registry invents). An unrecognised answer is not evidence of freedom —
           # it is `claim-unknown`, kept, and COUNTED, so the line shows an unproven suppression
           # rather than an empty one.
-          *) printf '%s\tclaim-unknown\n' "$_n" >> "$_ck_tmp" ;;
+          # ⛔ AND IT SAYS SO (agent-infra#2741). KEEP-plus-COUNT is the fail-closed half; a refusal the
+          # log never states is the half that made this red main's assertion
+          # (`no registry: the refusal does not name the missing registry`). rc=2 is the INCOMPLETE
+          # polarity — a MISSING, unreadable or stale registry — and it must not be quieter than rc=3
+          # (NOT PROVISIONABLE), which already prints its reason and its remedy. Named ONCE per pass
+          # (`_ck_claim_named`): the reason is a property of the BOX, not of each entry, so the count
+          # of affected entries belongs in the funnel line (`skipped_checked_claim_unknown`), not in a
+          # repeated sentence.
+          *)
+            printf '%s\tclaim-unknown\n' "$_n" >> "$_ck_tmp"
+            if [ "$_ck_claim_named" -eq 0 ]; then
+              _ck_claim_named=1
+              if [ "$_ck_rc" -eq 2 ]; then
+                echo "[reap] claim read: ${CLAIM_RESULT:-the cross-box claim registry could not answer on #$_n} — the suppression is KEPT (an unanswerable claim read is never a release); affected entries are counted as claim-unknown, not released"
+                echo "[reap]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run)"
+              else
+                echo "[reap] claim read: the registry returned an UNRECOGNISED verdict (rc=$_ck_rc) on #$_n — a code this pass has no reading for is not evidence of freedom; affected entries are KEPT as claim-unknown"
+              fi
+            fi ;;
         esac
       done < "$_ck_sorted"
     done

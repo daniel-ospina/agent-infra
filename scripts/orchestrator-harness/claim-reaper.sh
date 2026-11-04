@@ -590,6 +590,20 @@ cr_judge() {
   case "$ref" in
     */issue-[0-9]*) CR_ISSUE="${ref##*/issue-}"; CR_ISSUE="${CR_ISSUE%%[!0-9]*}" ;;
     issue-[0-9]*)   CR_ISSUE="${ref#issue-}";     CR_ISSUE="${CR_ISSUE%%[!0-9]*}" ;;
+    # ⛔ A BRANCH CLAIM IS NEVER REAPED HERE (agent-infra#3358 review B4). Its holder pid is the
+    # `branch-claim.sh acquire` CLI, which exits within the second — so every gate that judges "the
+    # minting process is gone" answers GONE for a claim that is perfectly live. Measured end-to-end
+    # before this arm: acquire (14400s lease) -> this reaper with CR_MIN_AGE=10800 -> verdict
+    # RELEASABLE ("pid … is ABSENT") -> RELEASED -> the pre-push guard then read `unclaimed` and a
+    # stray push moved the branch head. The shipped defaults made that window ORDINARY: CR_MIN_AGE
+    # (10800) is less than CLAIM_BRANCH_TTL (14400), so a legitimate batch claim was releasable with
+    # an hour of its lease still left — on the holder's own box, where each box's reaper runs.
+    # Ownership of a branch is ended by its HOLDER (release) or by claim_prune at lease expiry, both
+    # of which are the registry's own paths. This tool abstains.
+    */branch-*|branch-*)
+      CR_VERDICT=ABSTAIN-BRANCH-KEY
+      CR_WHY="a branch claim's holder pid is the acquiring CLI, absent by design, so no gate here can prove its holder gone — a branch claim is released by its holder or expired by claim_prune, never reaped"
+      return 1 ;;
   esac
 
   cr_gate_identity || return 1

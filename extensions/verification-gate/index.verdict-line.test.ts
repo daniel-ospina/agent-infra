@@ -31,6 +31,8 @@
  *       model actually emits; and with the token read at the position the SHAPE anchored, so a second
  *       mid-sentence mention on the same line cannot attest. The AFFIRMATIVE block under it is the guard
  *       against the opposite error (`[no regressions] PASS`, `PASS: 0 failures`, `PASS: nothing to fix`).
+ *   (e-latch) three refusals in a row do NOT disable the gate: a refusal is a JUDGMENT, so it must not
+ *       count toward the #132 one-way latch that turns the gate off after 3 malformed dispatches.
  *   (e-cost) the ACCEPTED false-block class, pinned so it is not "fixed" away without a decision: an
  *       attested PASS whose immediate clause opens with a negation (`PASS: did not run the e2e suite`)
  *       blocks, because "not all files were needed" and "not all files verified" are the same shape.
@@ -41,7 +43,7 @@
  * fail-open is decided; adding a case that passes for the wrong reason is what the (c) note above
  * warns about. Measured and recorded on the issue instead.
  *
- * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 71 cases that
+ * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 88 cases that
  * went red under that single mutation, not an estimate — an unmeasured count here was review r1's
  * second finding):
  *   M1 revert the `verdictLine` helper to the pre-#10219 bare-token hasPass
@@ -64,8 +66,9 @@
  *   (they passed before the fix and must keep passing) — they are regressions guards, not
  *   discriminators, and are stated here rather than implied.
  *   M6 revert `hasPass = passAttested(textContent)` to the pre-#3164 expression
- *      → 32 red: every `(e)` negation case, both `(e-cost)` caveat cases, the negation-note case, and
- *      `(e)`'s `✅ not verified: PASS`. MEASURED on this tree, not estimated.
+ *      → 45 red: every `(e)` negation case (including the list/numbered/prefix/semicolon spellings),
+ *      the `(e-cost)` caveat cases, both judgment-remedy cases and the 3-refusal latch case.
+ *      MEASURED on this tree (43 passed / 45 failed), not estimated.
  *
  * Hermetic: HOME is redirected to a temp dir before the plugin is imported (the bridge and the
  * audit log are HOME-derived) and every case gets its own throwaway git repo.
@@ -374,6 +377,17 @@ async function main() {
     ["semicolon `[16:42] PASS; not verified`", "[16:42] PASS; not verified"],
     ["ellipsis `PASS… not verified`", "PASS\u2026 not verified"],
     ["slash `PASS/not verified`", "PASS/not verified"],
+    // The LIST arm is a shape the gate accepts; `(e)` had no negated case for it at all (review r2b).
+    ["list `- PASS is not claimed`", "- PASS is not claimed"],
+    ["numbered `1. PASS: not verified`", "1. PASS: not verified"],
+    // PREFIX position, with a word in FRONT of the negation: anchoring the prefix rule at offset 0
+    // left `[still not verified] PASS` and `✅ still not verified: PASS` MERGING (review r2b).
+    ["`[still not verified] PASS`", "[still not verified] PASS"],
+    ["`[16:42 not verified] PASS`", "[16:42 not verified] PASS"],
+    ["✅ prefixed `✅ still not verified: PASS`", "✅ still not verified: PASS"],
+    // An earlier bare `PASS` mention inside the bracket must not attest a line whose ANCHORED token is
+    // negated (review r2b: the guard read the first token on the line, not the anchored one).
+    ["`[PASS 1/2] PASS: not verified`", "[PASS 1/2] PASS: not verified"],
     // A line attests at the token the SHAPE anchored. A later, mid-sentence mention on the same line
     // is prose, not a second verdict — `verdictLine` is line-anchored for exactly this reason.
     ["mid-sentence second mention `PASS is not claimed: I cannot give a PASS.`", "PASS is not claimed: I cannot give a PASS. Two tests are red."],
@@ -435,19 +449,59 @@ async function main() {
   test("(e) a NEGATED PASS is refused by the #285 ceremony, not silently merged", async () => {
     const res = await verdictFor("PASS is not claimed — two tests are red.");
     ok(res && res.block === true, "the refusal must block");
-    ok(/fail-open-refused|unparseable/.test(String(res.reason ?? "")), `the block must carry the #285/unparseable ceremony; got: ${String(res.reason ?? "").slice(-400)}`);
+    ok(/fail-verdict|fail-open-refused|unparseable/.test(String(res.reason ?? "")), `the block must carry a named ceremony; got: ${String(res.reason ?? "").slice(-400)}`);
   });
   // ⛔ The remedy must not instruct the lane to produce the merge it just refused. The generic note
   // says "an accepted verdict line is `PASS` / …" and a lane's most literal compliance is to re-emit
   // `PASS` — which converts the verifier's refusal into an attestation. That is the (d3) failure
   // mode: a remedy pointing at the SHAPE of a line that was fine.
-  test("(e) the reminder names the NEGATION and forbids re-emitting PASS", async () => {
+  // ⛔ A REFUSAL IS A JUDGMENT, NOT A MALFORMED DISPATCH (#132). Classifying it `unparseable` would
+  // (a) hand the lane the format remedy — literally "re-dispatch with `PASS` on its own line", the
+  // re-emit that converts the refusal into the merge it refused — and (b) count a legitimate refusal
+  // toward the one-way latch that DISABLES the gate after 3 malformed dispatches. Review r1 measured
+  // both, including `⏸️ Auto-bypassed after 3 consecutive VGATE dispatch failures` followed by an
+  // unverified commit being ALLOWED. So the remedy must be the judgment one, and it must never name
+  // the shapes.
+  test("(e) a refusal is reported as a JUDGMENT with the fix-the-files remedy, not a format error", async () => {
     const res = await verdictFor("PASS is not claimed — two tests are red.");
     ok(res && res.block === true, "the refusal must block");
     const reason = String(res.reason ?? "");
-    ok(/NEGATED its PASS/.test(reason), `the note must name the negation; got: ${reason.slice(-500)}`);
-    ok(/Do NOT re-emit `PASS`/.test(reason), `the note must forbid re-emitting PASS; got: ${reason.slice(-500)}`);
+    ok(/fail-verdict/.test(reason), `the class must be the judgment class; got: ${reason.slice(-500)}`);
+    ok(/address the failures it listed/.test(reason), `the remedy must be 'fix the files it listed'; got: ${reason.slice(-500)}`);
     ok(!/an accepted verdict line is/.test(reason), "the shapes hint must NOT be shown — the shape was accepted, the content was not");
+    ok(!/Re-dispatch a verifier whose response is PASS/.test(reason), "the format remedy must NOT be shown — it instructs the re-emit that manufactures a false PASS");
+  });
+  test("(e) the ✅ shape gets the same judgment remedy (it had no shape arm to key a note on)", async () => {
+    const res = await verdictFor("✅ not verified: PASS");
+    ok(res && res.block === true, "the ✅ refusal must block");
+    const reason = String(res.reason ?? "");
+    ok(/fail-verdict/.test(reason), `the ✅ refusal must be a judgment class too; got: ${reason.slice(-400)}`);
+    ok(!/an accepted verdict line is/.test(reason), "the ✅ refusal must not be told to re-emit PASS either");
+  });
+  // The LATCH discriminator: three refusals in a row must not disable the gate. Pre-fix (round 1's
+  // unparseable classification) the third one tripped `vgateFailures` >= 3 and the retried commit was
+  // ALLOWED with the files unverified.
+  test("(e) three refusals do NOT disable the gate (a judgment is not a malformed dispatch)", async () => {
+    const refusal = { text: "PASS is not claimed — two tests are red." };
+    const res = await verdictAfter([refusal, refusal, refusal], "standard", "interactive");
+    ok(res && res.block === true, "3 refusals must not trip the #132 one-way latch and let the commit through");
+  });
+  // ReDoS guard (review r2b): the lead runs are BOUNDED, so a verdict line whose tail is a huge
+  // punctuation run must answer in constant time. Unbounded, the same class of input measured 598 ms
+  // at 8k chars, 1889 ms at 16k and ~32 s at 32k — synchronously, inside the tool_result handler, on
+  // the commit path. Timed on the PREDICATE, not end-to-end: a wall-clock bound through a git repo
+  // and a dispatch measures the box's load (measured: 9.9 s on a load-50 box for a 3 ms regex), and
+  // flaky machinery is its own defect.
+  test("(e) a 20k-char punctuation tail is answered in constant time (bounded lead)", async () => {
+    const started = Date.now();
+    const attested = (mod as any).passAttested as (t: string) => boolean;
+    const verdict = attested("PASS" + "!".repeat(20000));
+    const elapsed = Date.now() - started;
+    ok(verdict === true, "a bare PASS followed by punctuation is still an ATTESTATION");
+    ok(elapsed < 2000, `the guard must not backtrack quadratically (took ${elapsed} ms)`);
+  });
+  test("(e) the same reply through the real gate CLEARS (punctuation does not negate)", async () => {
+    equal(await verdictFor("PASS" + "!".repeat(200)), undefined);
   });
   test("(e) a reply whose line was NOT a shape still gets the generic shapes hint (the note did not move)", async () => {
     const res = await verdictFor("I looked at everything and it seems fine to me.");
