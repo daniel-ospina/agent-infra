@@ -2702,7 +2702,13 @@ record_body() {
     # carries enough of.
     _urb_min="${_urb_min:-512}"
     _low_free="${_low_free:-4096}"
-    _freed_total=$(( ${FREED_UV:-0} + ${FREED_VENV:-0} + ${FREED_WT:-0} + ${FREED_DUP:-0} ))
+    # ⛔ FIVE CLASSES, NOT FOUR — the sum is stated ONCE here and it must include every class the pass
+    # can free from, or this alert LIES in the one direction it exists to catch. Written against the
+    # four-class tree; merged with `runner-work`, whose whole justification is a box that reclaimed 19 G
+    # in ONE class while reading healthy — so a four-class sum would have reported
+    # `alert=under-reclaim` on the pass that just fixed the box. `FREED_RW` is the same unit (MB, a df
+    # delta), and `TOTAL` above is the same sum, so the two surfaces cannot disagree.
+    _freed_total=$(( ${FREED_UV:-0} + ${FREED_VENV:-0} + ${FREED_WT:-0} + ${FREED_DUP:-0} + ${FREED_RW:-0} ))
     _free_mb=""
     # ⛔ `${REAP_AW_ROOTS%%:*:-/tmp}` IS NOT A DEFAULT — it is the pattern `*:-/tmp`, so with
     # REAP_AW_ROOTS unset the expansion aborted and `free_mb` was `unmeasured` on exactly the path the
