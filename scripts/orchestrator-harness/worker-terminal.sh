@@ -377,6 +377,47 @@ wt_env_nonblank() {
   case "$val" in *[![:space:]]*) return 0 ;; esac
   return 1
 }
+# `wt_tmux_var_value <VARNAME>` — the value the tmux SERVER's global environment carries for that name
+# (the predicate is this question with the answer thrown away). The generic sibling of
+# `wt_tmux_server_token_value`: the provider variable is not a fixed name, so the name is a parameter.
+wt_tmux_var_value() {
+  local v="${1:-}" out
+  case "$v" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  command -v tmux >/dev/null 2>&1 || return 1
+  out="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-environment -g "$v" 2>/dev/null)" || return 1
+  case "$out" in
+    "$v="*) case "${out#"$v="}" in *[![:space:]]*) printf '%s\n' "${out#"$v="}"; return 0 ;; esac ;;
+  esac
+  return 1
+}
+# `wt_provider_reaches_pane <VARNAME>` — 0 iff a pane started by THIS call inherits the CALLER's value
+# for that name. ⛔ A VALUE IN THE CALLER IS NOT A VALUE IN THE PANE (P1 review finding, 2026-10-27,
+# MEASURED on the box this gate was written for). `wt_env_nonblank` answers "the caller holds it", which
+# is a different question from "it arrives": a tmux pane inherits the client's environment only when the
+# client STARTS the server, or when the name is published in the server's `update-environment`
+# (`cloud-cell-supervisor.sh` publishes its `WORKER_ENV_NAMES` there — the cell path). Measured: the
+# Mac's server carries no provider key and nothing publishes the name, so crediting a caller's export
+# returned 0 while the pane stayed keyless — pi printed `No API key found for deepseek` at 2-10 s and
+# the caller booked an attempt for a lane that never ran. That is the same false-PASS shape as the
+# measurement in this file's header, one layer in.
+# ⛔ TWO POSITIVE CHANNELS ONLY, and our own blindness is not one of them: a fired probe bound answers
+# rc 3 (UNKNOWN) and must never be read as "reaches" OR as "does not reach" — the caller falls through
+# to the FILE arms below, which is the arm that delivers, so an unreadable probe cannot by itself refuse
+# a spawn (#2210's asymmetry: a datum we cannot read must not become a refusal loop).
+wt_provider_reaches_pane() {
+  local v="${1:-}" srv_rc=0 list=""
+  case "$v" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  command -v tmux >/dev/null 2>&1 || return 1
+  wt_tmux_has_server || srv_rc=$?
+  case "$srv_rc" in
+    1) return 0 ;;   # positively NO server: this spawn creates one, and it inherits the client's whole env
+    0) : ;;          # a server answers: only `update-environment` can carry a NAME into the new session
+    *) return 1 ;;   # no ANSWER (bound fired) — never read it as delivery
+  esac
+  list="$(wt_bounded "${WT_PROBE_TIMEOUT:-15}" tmux show-options -gqv update-environment 2>/dev/null)" || return 1
+  case " $list " in *" $v "*) return 0 ;; esac
+  return 1
+}
 # `wt_launcher_home` — the HOME to export. An explicit `WT_WORKER_HOME` WINS outright (it is the
 # operator saying "the credential is HERE"; silently falling through would make the knob a suggestion).
 # Otherwise: the caller's own HOME, then the cell home — each only when it actually HOLDS a credential,
@@ -479,20 +520,43 @@ wt_launcher_env() {
   # cannot provision is refused BEFORE `tmux new-session`, because after it `wt_spawn` has already
   # reported success and the caller books an attempt for a lane that will die in seconds — the
   # measured shape that parked 12 PRs as "the reviewer produced no usable verdict".
-  local pvar="" pkeys="" phave=0 _pf
+  # `psrc` records WHICH channel is being credited, so the dynamic guard below (and a refusal) can name
+  # the channel it actually established instead of asserting one.
+  local pvar="" pkeys="" phave=0 psrc="" pstranded=0 _pf
   pvar="$(wt_provider_key_var "$home")"
   if [ -n "$pvar" ]; then
-    wt_env_nonblank "$pvar" && phave=1
+    # ARM 1 — the caller's own EXPORTED value, and only when the PANE will inherit it (see
+    # `wt_provider_reaches_pane`; P1 review finding above). Both halves are load-bearing: a plain shell
+    # variable never crosses a tmux client boundary at all, and an exported one crosses only through a
+    # server this spawn creates or an `update-environment` publication.
+    if wt_env_nonblank "$pvar" && _wt_exported "$pvar"; then
+      if wt_provider_reaches_pane "$pvar"; then
+        phave=1; psrc="this caller's exported environment (the pane inherits it)"
+      else
+        pstranded=1
+      fi
+    fi
+    # ARM 2 — a FILE that assigns it: the arm that DELIVERS (and the only one whose delivery this gate
+    # can verify from inside the pane). Precedence: the box-local operator file first (what this box's own
+    # shell sources), then the cell's `keys.env` (the operator-pushed contract on a cell).
     if [ "$phave" = "0" ]; then
-      # Precedence: the box-local operator file first (what this box's own shell sources), then the
-      # cell's `keys.env` (the operator-pushed contract on a cell). Whichever ASSIGNS it is used.
       for _pf in "$home/pi-keys.env" "$keys"; do
         [ -n "$_pf" ] && [ -f "$_pf" ] || continue
-        wt_provider_credit "$pvar" "$_pf" && { pkeys="$_pf"; phave=1; break; }
+        wt_provider_credit "$pvar" "$_pf" && { pkeys="$_pf"; phave=1; psrc="the file $pkeys"; break; }
       done
     fi
+    # ARM 3 — the SERVER already carries it, so the pane inherits it whatever the caller holds. The
+    # generic form of the gh arm's `wt_tmux_server_token` fallback: without it, a box whose server was
+    # created with the key refuses a spawn it could have run.
+    if [ "$phave" = "0" ] && wt_tmux_var_value "$pvar" >/dev/null 2>&1; then
+      phave=1; psrc="the tmux server's own environment"
+    fi
     if [ "$phave" = "0" ]; then
-      wt_warn "REFUSED a worker on '$(wt_lane_provider)': models.json resolves its credential from \$$pvar and NO source provides a value — not this caller's environment, not $home/pi-keys.env, not $keys. A worker started now dies at its first model call within seconds (pi: 'No API key found for $(wt_lane_provider)'), and the caller books that as a review that produced NO verdict and, at MAX_REVIEW_TRIES, PARKS the PR — measured 2026-10-26/27, 69 lane logs and 12 parked PRs. Refusing here spends nothing and leaves the PR queued, which is the honest state. Put the key where the worker can read it (a non-blank \$$pvar in $home/pi-keys.env or $home/keys.env)."
+      if [ "$pstranded" = "1" ]; then
+        wt_warn "REFUSED a worker on '$(wt_lane_provider)': \$$pvar IS set in this caller's environment, but it would NOT reach the worker — a tmux pane inherits the caller's environment only when this spawn STARTS the server or when the server publishes the name in \`update-environment\` (tmux show-options -gqv update-environment), and neither holds here. No file provides it either (checked $home/pi-keys.env, $home/keys.env). A worker started now inherits the keyless server environment and dies at its first model call within seconds (pi: 'No API key found for $(wt_lane_provider)') — measured 2026-10-26/27: 69 lane logs, 12 PRs parked as 'the reviewer produced NO usable verdict'. Refusing here spends nothing and leaves the PR queued, which is the honest state. Put the key where the worker can READ it (a non-blank \$$pvar in $home/pi-keys.env or $home/keys.env), or publish the name into the server's update-environment."
+      else
+        wt_warn "REFUSED a worker on '$(wt_lane_provider)': models.json resolves its credential from \$$pvar and NO source provides a value — not this caller's environment, not $home/pi-keys.env, not $keys, not the tmux server's environment. A worker started now dies at its first model call within seconds (pi: 'No API key found for $(wt_lane_provider)'), and the caller books that as a review that produced NO verdict and, at MAX_REVIEW_TRIES, PARKS the PR — measured 2026-10-26/27, 69 lane logs and 12 parked PRs. Refusing here spends nothing and leaves the PR queued, which is the honest state. Put the key where the worker can read it (a non-blank \$$pvar in $home/pi-keys.env or $home/keys.env)."
+      fi
       return 1
     fi
   fi
@@ -581,12 +645,22 @@ wt_launcher_env() {
   fi
   # ⛔ THE DELIVERY OF THE MODEL CREDENTIAL WHEN IT LIVES IN A BOX-LOCAL FILE (`~/pi-keys.env`, the file
   # this box's `~/.zshrc` sources and the ONLY place the key exists here). Same discipline as `keys.env`
-  # above and for the same measured reason: `set -a`, a parse check, and a sentinel proving the file
-  # FINISHED (a `keys.env` carrying `exit 0` parsed, then ended the worker's shell before anything ran).
+  # above and for the same measured reason: a parse check, and a sentinel proving the file FINISHED (a
+  # `keys.env` carrying `exit 0` parsed, then ended the worker's shell before anything ran).
   # Emitted BEFORE the HOME/PATH pins below, so the file cannot repoint either of them.
+  # ⛔ IT LIFTS **ONE** VARIABLE, NOT THE FILE (P2 review finding, 2026-10-27). `set -a; . FILE` exported
+  # EVERY key in `pi-keys.env` — the operator's whole key set (`pi-bootstrap/SETUP-NEW-MACHINE.md` calls
+  # that file "ALL your API keys") — into a worker that runs a model with tool access, so a secret-echo
+  # or prompt-injection incident widens from one credential to all of them (this repo keeps
+  # `extensions/secret-echo-guard.ts` precisely because that class is live). It was also an UNMODELLED
+  # credential source for the gh arm: the source was emitted after the store-override `unset GH_TOKEN
+  # GITHUB_TOKEN`, so a gh token sitting in that file overrode the store this gate had just probed. The
+  # file is therefore EVALUATED IN A SUBSHELL and only \$$pvar is lifted, exported explicitly; the
+  # marker is printed on the SAME line as the value (`S<value>`), so a value carrying newlines or leading
+  # spaces survives untouched, and a file that ended the shell early leaves no marker at all.
   if [ -n "$pkeys" ] && [ "$pkeys" != "$keys" ]; then
-    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; _pm="$( set -a; . %s >/dev/null 2>&1; set +a; echo __ai_provider_env_sourced__ )"; case "$_pm" in *__ai_provider_env_sourced__) unset _pm ;; *) exit 98 ;; esac; set -a; . %s; set +a' \
-      "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")"
+    printf '; [ -r %s ] || exit 98; if command -v bash >/dev/null 2>&1; then bash -n %s || exit 98; else sh -n %s || exit 98; fi; _pm="$( . %s >/dev/null 2>&1; printf "S%%s" "${%s:-}" )"; case "$_pm" in S?*) export %s="${_pm#S}"; unset _pm ;; *) echo "[worker-terminal] REFUSED: could not lift the model credential $%s out of %s — the file either ended the worker shell early (agent-infra#1713) or assigns it no value" >&2; exit 98 ;; esac' \
+      "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$(wt_q "$pkeys")" "$pvar" "$pvar" "$pvar" "$(wt_q "$pkeys")"
   fi
   # ⛔ A BROKEN `keys.env` MUST NOT RUN A HALF-PROVISIONED WORKER, AND AN ORDINARY ONE MUST NOT BE FATAL
   # (review findings, 2026-10-23, both measured). `… && . FILE || exit 98` reads the status of the LAST
@@ -677,12 +751,13 @@ wt_launcher_env() {
   printf '; case "${GH_TOKEN:-}${GITHUB_TOKEN:-}" in *[![:space:]]*) : ;; *) %s || exit 98 ;; esac' "$_guard"
   # ── AND THE MODEL CREDENTIAL IS VERIFIED WHERE THE gh ONE IS — AFTER every source, against the
   # environment the worker will actually run with. This is the question a static grep cannot answer: did
-  # the delivery LAND? It is asked only when this spawn DELIVERED it (`pkeys`), so a box whose credential
-  # arrives by a path this gate did not model is unaffected — the same polarity as the gh guard's
-  # "a static grep is not proof the source exports it", without turning an unmodelled path into a refusal.
-  if [ -n "$pkeys" ]; then
-    printf '; case "${%s:-}" in *[![:space:]]*) : ;; *) echo "[worker-terminal] REFUSED: the model credential \$%s is still blank after sourcing %s — this lane could not authenticate a single model call" >&2; exit 98 ;; esac' \
-      "$pvar" "$pvar" "$pkeys"
+  # the delivery LAND? ⛔ IT NOW FIRES ON EVERY CREDITED ARM, not only on the file arm (P1 review finding,
+  # 2026-10-27): gated on `pkeys`, the caller and server arms emitted no guard at all, so "delivered" there
+  # was ASSUMED. `psrc` names the channel that was credited, so the refusal states what this gate
+  # established instead of guessing at a cause.
+  if [ -n "$pvar" ] && [ "$phave" = "1" ]; then
+    printf '; case "${%s:-}" in *[![:space:]]*) : ;; *) echo "[worker-terminal] REFUSED: the model credential \$%s is BLANK in the worker environment even though this spawn credited %s — this lane could not authenticate a single model call" >&2; exit 98 ;; esac' \
+      "$pvar" "$pvar" "$psrc"
   fi
   return 0
 }
