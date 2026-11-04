@@ -1196,11 +1196,12 @@ lane_evidence_present() {
             out="$out$e "
         else
             rc=$?
-            # ⛔ "COULD NOT DETERMINE" IS NOT "NO EVIDENCE" (review of #3422 round 11, P3). 124 = the
-            # probe timed out, 125 = its own scratch file could not be made; treating either as absent
-            # skips the archive and the comparison entirely and lets the removal proceed over evidence
-            # nobody could read — the fail-open the sibling gate exists to prevent.
-            if [ "$rc" = 124 ] || [ "$rc" = 125 ]; then printf '!unreadable'; return 3; fi
+            # ⛔ "COULD NOT DETERMINE" IS NOT "NO EVIDENCE" (review of #3422 rounds 11/14, P3). The probe
+            # is a predicate, so 1 is its only legitimate "absent"; 124 (timed out), 125 (no scratch
+            # file), 137 (watchdog SIGKILL with no sentinel), 126/127 — all mean the probe never answered.
+            # Reading those as absent skips the archive and the comparison and lets the removal proceed
+            # over evidence nobody could read: the fail-open this gate exists to prevent.
+            if [ "$rc" != 1 ]; then printf '!unreadable'; return 3; fi
         fi
     done
     printf '%s' "${out% }"
@@ -2070,6 +2071,10 @@ evidence_signature() {
     shift
     sig="$(
         for r in "$@"; do
+            # `*/*` is unreachable by construction (`is_lane_evidence_entry` requires a ROOT name, so a
+            # nested entry can never make a row clean — it is `ignored-artifact` ⇒ PRESERVE upstream), and
+            # `''`/`<none>` are the no-evidence encodings. Skipped rather than signed: a name with a slash
+            # would silently narrow the digest if that seam ever changed.
             case "$r" in ''|'<none>'|*/*) continue ;; esac
             # ⛔ THE LINK TEST COMES FIRST, because `fs_exists_bounded` deliberately says TRUE for a
             # DANGLING symlink (`-e || -L`), so testing existence before link-ness sent a broken link
@@ -2080,23 +2085,26 @@ evidence_signature() {
             # hold HERE too. A `readlink` that fails is a walk that could not complete (RED), not a
             # `link r -> ` line that compares equal to itself forever.
             #
-            # ⛔ AND "COULD NOT ANSWER" IS NOT "ABSENT" HERE EITHER (review of #3422 round 13, P3). Every
-            # probe below returns 124 (timed out) or 125 (its scratch file could not be made); read as a
-            # plain `elif` false, the root would be dropped from the signature with rc 0 — the exact
-            # conflation round 11 removed one function away. So each probe's STATUS is captured.
+            # ⛔ AND "COULD NOT ANSWER" IS NOT "ABSENT" HERE EITHER (review of #3422 rounds 13/14). The
+            # probes are pure predicates, so their ONLY legitimate non-zero answer is 1 ("not a link" /
+            # "not a dir" / "absent"). Whitelisting just `124|125` was not enough: `lib/bounded.sh` can
+            # also surface 137 (its sentinel could not be written, so the watchdog SIGKILLs without one),
+            # 126/127 from `timeout`, or a killed child — and every one of those read as "absent" drops
+            # the root from the digest with rc 0, i.e. an INERT comparison that compares equal to itself
+            # forever (measured: two trees, one appended to, both digesting to `4294967295 0`).
             prc=0
             fs_link_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
             case "$prc" in
-                124|125) exit 3 ;;
                 0)
                     tgt="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" readlink "$path/$r")" || exit 3
                     printf 'link %s -> %s\n' "$r" "$tgt"
                     continue ;;
+                1) : ;;                       # the only legitimate "no"
+                *) exit 3 ;;                  # never answered (124/125/137/126/127/…) => RED
             esac
             prc=0
             fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
             case "$prc" in
-                124|125) exit 3 ;;
                 0)
                     # `-type f` for content, PLUS `-type l` for the links inside the root: `tar` stores an
                     # inner link as a link, so retargeting one during the archive is a change the file
@@ -2107,12 +2115,15 @@ evidence_signature() {
                         \( -type f -exec cksum {} + \) -o \
                         \( -type l -exec sh -c 'for l; do t="$(readlink "$l")" || exit 3; printf "link %s -> %s\n" "$l" "$t"; done' sh {} + \) || exit 3
                     continue ;;
+                1) : ;;
+                *) exit 3 ;;
             esac
             prc=0
             fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
             case "$prc" in
-                124|125) exit 3 ;;
                 0) fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r" || exit 3 ;;
+                1) : ;;
+                *) exit 3 ;;
             esac
         done | sed '/^$/d' | sort -u | cksum
     )" || return 1

@@ -2787,6 +2787,35 @@ assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the ar
 assert_dir "$WT_N" "A21n ...the worktree is still on disk"
 assert_contains "$(footer $ENV)" "REMOVED=0" "A21n ...nothing was removed"
 
+# A21o — A PROBE THAT NEVER ANSWERED IS NOT "ABSENT" (review of #3422 round 14, P2). The probes are
+# predicates, so 1 is their only legitimate "no"; 124/125/137/126/127 all mean the probe never answered.
+# Whitelisting just `124|125` left the rest reading as "absent", which DROPS the root from the digest at
+# rc 0 — an inert comparison that compares equal to itself forever (measured upstream: two trees, one
+# appended to, both digesting to `4294967295 0`) — and on the `lane_evidence_present` side it skips the
+# archive entirely. A functional fixture needs a `sh` shim on PATH that answers 137 to the link probe;
+# THAT DESTABILISES THE HARNESS (measured: run_reaper rc 127 with an empty log, because the shim also
+# intercepts the reaper's own `sh -c` predicates), so the invariant is pinned at the source instead:
+# every probe arm must end in a catch-all, and the presence probe must mean exactly 1 by "absent".
+# Removing either turns this RED (verified against both mutants).
+SIGFN="$(awk '/^evidence_signature\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$REAPER")"
+if [ -z "$SIGFN" ]; then
+    bad "A21o could not extract evidence_signature from the reaper — the assertion below would be vacuous"
+else
+    n_catch="$(printf '%s\n' "$SIGFN" | grep -cE '^ *\*\) exit 3 ;;')"
+    assert_eq "$n_catch" "3" "A21o all THREE probe arms end in a catch-all (any non-0/1 status is RED, not 'absent')"
+    if printf '%s\n' "$SIGFN" | grep -qE '124\|125\) exit 3'; then
+        bad "A21o the probe arms whitelist 124|125 again — 137/126/127 would read as 'absent' and drop the root"
+    else
+        ok "A21o …and no arm whitelists just 124|125"
+    fi
+fi
+LANEFN="$(awk '/^lane_evidence_present\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$REAPER")"
+if printf '%s\n' "$LANEFN" | grep -qF 'if [ "$rc" != 1 ]'; then
+    ok "A21o the presence probe treats ONLY 1 as 'absent' (every other non-zero => !unreadable => RED)"
+else
+    bad "A21o the presence probe no longer means exactly 1 by 'absent' — a 137 would skip the archive"
+fi
+
 # A21i — A SIGNATURE THAT CANNOT BE TAKEN IS A RED PASS, NOT A SILENT PRESERVE (review of #3422 round 9,
 # P2). `fs_bounded_out` emits nothing on a non-zero rc, so discarding the rc made "the walk failed" look
 # like "the set is empty": every evidence-bearing row became permanently unreclaimable while the pass

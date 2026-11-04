@@ -245,7 +245,7 @@ for f in $FILES; do
     # ⛔ ANCHORED ON A REAL DIGEST FIELD, not on any line ending in the name: the old pattern matched a
     # malformed `  <name>` line, so a file could be "recorded" and never measured (round 5, P2).
     if ! awk -v f="$f" '
-            $1 ~ /^[0-9a-f]{64}$/ || $1 == "missing" || $1 == "unmeasured" { if ($2 == f) found = 1 }
+            length($1) == 64 && $1 ~ /^[0-9a-f]+$/ || $1 == "missing" || $1 == "unmeasured" { if ($2 == f) found = 1 }
             END { exit !found }' "$RECORD" 2>/dev/null; then
         warn "UNRECORDED $f — pinned in this checker but absent from $RECORD; it has never been measured"
         drift=1
