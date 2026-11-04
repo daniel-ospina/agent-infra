@@ -2707,8 +2707,30 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   case "$RB_TEXT" in
     *" note="*) RB_NOTE="${RB_TEXT#* note=}" ;;
   esac
+  # ⛔ CANONICALISE THE COUNT AT **THIS** WRITE TOO (review, P3-5) — the mint's
+  # `--findings` canonicaliser exists because the value IS the record's validity:
+  # `"findings":$RB_FINDINGS` is written UNQUOTED, because every reader binds a
+  # JSON NUMBER (review-enforcer: `typeof record.findings === "number"`). This is
+  # the SECOND writer of that field, and it filtered with `*[!0-9]*` ALONE — so the
+  # rule the mint holds was never applied here. MEASURED against the previous arm:
+  # a signed marker carrying `findings=007` (admissible by RB_RE's `findings=[0-9]+`)
+  # recovered to `"findings":007`, which does not parse — `JSONDecodeError`, so the
+  # gate reads NO RECORD — and the file now EXISTS, so the next recovery refuses
+  # ("a record already exists — recovery fills an ABSENCE"). A dead end needing
+  # manual removal, created by the one verb whose job is to avoid a dead end, and
+  # therefore strictly worse than the absent record it replaced. `00` was worse
+  # still: it wrote `"findings":00` and exited 0, where the mint refuses a zero
+  # count outright ('not-clean' with zero findings IS 'clean').
+  #
+  # Same two steps as the mint, deliberately PURE STRING manipulation (`10#`
+  # arithmetic wraps on a pathologically long value): reject non-digits, then strip
+  # the leading-ZERO RUN — `007` → `7`, `08` → `8`, `12` → `12`, `00` → empty,
+  # which the not-clean arm immediately below refuses rather than writes.
   case "$RB_FINDINGS" in
     *[!0-9]*) RB_FINDINGS="" ;;
+    *)
+      RB_FINDINGS_ZEROS="${RB_FINDINGS%%[!0]*}"
+      RB_FINDINGS="${RB_FINDINGS#"$RB_FINDINGS_ZEROS"}" ;;
   esac
   if [ "$RB_VERDICT" = "not-clean" ] && [ -z "$RB_FINDINGS" ]; then
     echo "record-review.sh --recover-body: $REPO#$PR's marker is a \`not-clean\` attestation but carries no readable \`findings=\` count, so a recovered record could not tell the gate WHAT is open. Nothing was written; mint it again at the current head: record-review.sh $PR <current head> not-clean $REPO --findings <n> --evidence <artifact>" >&2
@@ -2810,6 +2832,8 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   # clean tier (empty string), so their record shape is unchanged.
   RB_FINDINGS_FIELD=""
   if [ "$RB_VERDICT" = "not-clean" ]; then
+    # `$RB_FINDINGS` is CANONICAL by here (P3-5: the parse path strips leading
+    # zeros and refuses a zero), so this write cannot emit `007`/`00` verbatim.
     RB_FINDINGS_FIELD="\"findings\":$RB_FINDINGS,"
     if [ -n "$RB_NOTE" ]; then RB_FINDINGS_FIELD="${RB_FINDINGS_FIELD}\"findings_note\":\"$RB_NOTE\","; fi
   fi

@@ -5383,6 +5383,54 @@ assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424968.json" 2>/dev/n
   "20.8f …and the count alongside it"
 unset NEG_CAP NEG_BODY STUB_BODY
 
+# ── 20.9 (review P3-5) THE SECOND WRITER OF THE UNQUOTED COUNT ─────────────
+# `--recover-body` writes `"findings":$RB_FINDINGS` — the SAME unquoted JSON number
+# the mint writes, and for the same reason (every reader binds `typeof … ===
+# "number"`) — but it filtered the marker's value with `*[!0-9]*` ONLY. So the
+# P2-1 canonicaliser the mint holds was never applied on the second writer.
+# Measured: `findings=007` (admissible by RB_RE's `findings=[0-9]+`) recovered to
+# `"findings":007`, which does not parse, so the gate read NO RECORD — while the
+# file now EXISTED, so the next recovery refused ("recovery fills an ABSENCE").
+# A dead end needing manual removal, created by the one verb whose purpose is to
+# avoid a dead end — strictly worse than the absent record it replaced.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX WRITER: `007` was written verbatim (the record
+# does not parse) and `00` was written as `"findings":00` with exit 0, where the
+# mint refuses a zero count outright ('not-clean' with zero findings IS 'clean').
+rb_clear
+NEG_Z_HEAD="$(printf 'e%.0s' $(seq 1 40))"
+NEG_Z_DIFF="$(printf '6%.0s' $(seq 1 64))"
+NEG_M_ZPAD="$(rb_marker 424970 "review recorded: reviews/424970.json verdict=not-clean @ $NEG_Z_HEAD diff=$NEG_Z_DIFF ($RB_REPO) findings=007")" \
+  || bad "fixture: the zero-padded marker could not be BUILT — 20.9 would otherwise pass on a missing marker"
+export STUB_BODY="$NEG_M_ZPAD"
+run_recover 424970 "$RB_REPO"
+NEG_Z_REC="$RB_RDIR/daniel-ospina-agent-infra-424970.json"
+assert_eq "$RB_RC" "0" "20.9 a signed marker carrying findings=007 recovers (exit 0)"
+assert_contains "$(cat "$NEG_Z_REC" 2>/dev/null)" '"findings":7,' "20.9 …writing the CANONICAL count 7, not the marker's spelling"
+if command grep -q '"findings":007' "$NEG_Z_REC" 2>/dev/null; then
+    bad "20.9 the recovered record holds a ZERO-PADDED count — invalid JSON, so the gate reads NO record while the file blocks the next recovery"
+else
+    ok "20.9 …and no zero-padded spelling reached the recovered record"
+fi
+# ⛔ THE ASSERTION THAT MATTERS: the record PARSES. `grep` cannot tell a valid
+# number from a token that only looks like one — and the consequence a reader sees
+# is a JSONDecodeError, then a permanent "a record already exists" refusal.
+if command python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["findings"]==7 and isinstance(d["findings"],int) else 1)' "$NEG_Z_REC" 2>"$T/negzpy"; then
+    ok "20.9 …and the recovered record PARSES as JSON with findings==7 as a NUMBER"
+else
+    bad "20.9 the recovered record does not parse as JSON with an integer findings — the gate would read it as NO RECORD: $(command head -1 "$T/negzpy" 2>/dev/null)"
+fi
+# The other half: `00` is not a count, it is the 'clean' contradiction. Recovery
+# must REFUSE and leave NO file, or the refusal itself becomes the dead end.
+rb_clear
+NEG_M_ZERO="$(rb_marker 424971 "review recorded: reviews/424971.json verdict=not-clean @ $NEG_Z_HEAD diff=$NEG_Z_DIFF ($RB_REPO) findings=00")" \
+  || bad "fixture: the zero-count marker could not be BUILT — 20.9b would otherwise pass on a missing marker"
+export STUB_BODY="$NEG_M_ZERO"
+run_recover 424971 "$RB_REPO"
+assert_eq "$RB_RC" "3" "20.9b a marker carrying findings=00 is REFUSED (exit 3) — zero findings is what 'clean' means"
+if [ -f "$(Q2 424971)" ]; then bad "20.9b a zero-count marker wrote a record"; else ok "20.9b …and writes nothing, so no unparseable file is left blocking the next recovery"; fi
+unset STUB_BODY
+
 # 20.3b REGRESSION GUARD, shape of 13n4/13n5 — the arm that ACTUALLY pins (1b).
 # 20.3 above does NOT (review, P3-3): its artifact has no `Outcome:` line, so the
 # loose arm (2) refuses it too and deleting (1b) leaves 20.3 green. The genuine
