@@ -278,7 +278,7 @@ was unmeasurable by construction. Shipped as `class=runner-work` + `scripts/reap
 (owner), with the mtime gate and the whole runner `_work` namespace (`_temp`, `_actions`, `_tool`,
 `_update`) retained from one declared table, and a root whose listing cannot be read counted as an
 abstention rather than a measured zero; its suite fails against the
-pre-change tree (10 passed / 18 failed) and kills all sixteen of its mutants
+pre-change tree (12 passed / 19 failed, 1 skipped) and kills all eighteen of its mutants
 (`scripts/disk-reaper-runner-work.test.sh`).
 
 ### G9 — the stale `/tmp` sink (filed as **#3043**, deliberately NOT fixed with G8)
