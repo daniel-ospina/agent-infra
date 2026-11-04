@@ -446,7 +446,16 @@ plist_probe() { # <file>
           # `&#46;` as the character `.` — the one place decoding must not apply, because inside CDATA XML
           # defines no references at all.
           gsub(/&/, "\\&amp;", body)
-          gsub(/</, "&lt;", body); gsub(/>/, "&gt;", body)
+          # ⛔ `\\&`, NOT `&` (review P1, cycle 12 of #1986). In an awk `gsub` REPLACEMENT, `&` means
+          # THE MATCHED TEXT, so `gsub(/</, "&lt;", body)` substitutes `<` for `<` and leaves `<lt;` —
+          # the `<` and `>` stay MARKUP, `canon` then eats everything from that `<` to the next `>` and
+          # the value is silently truncated. MEASURED both directions (gawk 5.2 and mawk): a CDATA
+          # `[/opt/orch/<d/../../../tmp/x>y/orch-loop.sh]` read back as `/opt/orch/<lt>gt;y/orch-loop.sh`,
+          # which passed every proof while plistlib resolves it to `/tmp/x>y/orch-loop.sh` — outside
+          # every root; and an honest CDATA path containing `<` lost its closing `</string>`, so the ARG
+          # was DROPPED and the arm refused for ever for "declares neither a Program nor a runnable
+          # ProgramArguments entry". The `&` line above was already correct; these two were not.
+          gsub(/</, "\\&lt;", body); gsub(/>/, "\\&gt;", body)
           out = out body
           if (p == 0) { s = "" } else { s = substr(s, p + 3); cinc = 0 }
         }
@@ -582,7 +591,21 @@ plist_probe() { # <file>
         if (q == 0) return out rest
         s = substr(rest, 2, q - 2)
         i = i + p + q - 1
-        if (substr(s, 1, 1) == "!" || substr(s, 1, 1) == "?") { out = out "<" s ">"; continue }
+        # ⛔ A DOCTYPE/PI SPAN IS DROPPED, NOT COPIED (review P1, cycle 12 of #1986). It contributes no
+        # keys to CFPropertyList, but copying it VERBATIM put its TEXT into the scanned document, where
+        # `depthat` counted `<dict>`/`</dict>` found inside it. MEASURED both directions, and neither
+        # needs an exotic path: `<?x <dict> ?>` before a foreign top-level `Program` made that key read
+        # as NESTED, so the gate PASSED (`PCOUNT=0`) while plistlib resolved `Program=/opt/evil/run-agent`;
+        # and `<?x </dict> ?>` inside `EnvironmentVariables` made an ENVIRONMENT VARIABLE named `Program`
+        # read at depth 1, so the gate "proved" our own controller as the program while launchd would run
+        # the `ProgramArguments[0]` foreign binary. A span is emitted as NOTHING — the remainder after its
+        # `>` stays as ordinary text, so the markup it contained is never scanned.
+        # ⛔ AN INTERNAL DTD SUBSET IS REFUSED rather than dropped: its ENTITY declarations are expanded by
+        # the real parser and not by this one, and its `>`-inside-`[...]` breaks the span scan.
+        if (substr(s, 1, 1) == "!" || substr(s, 1, 1) == "?") {
+          if (substr(s, 1, 1) == "!" && index(s, "[") > 0) dtd = 1
+          continue
+        }
         if (substr(s, 1, 1) == "/") { name = "/"; j = 2 } else { name = ""; j = 1 }
         while (j <= length(s) && substr(s, j, 1) ~ /[A-Za-z0-9_.:-]/) { name = name substr(s, j, 1); j++ }
         # ⛔ A SELF-CLOSING TAG MUST STAY SELF-CLOSING (review P0, cycle 10). `/` is outside the name charset,
@@ -668,6 +691,7 @@ plist_probe() { # <file>
       # that point, so a reference in a ProgramArguments element (the case that matters) produced NO
       # record at all and the caller compared a silently-truncated value.
       if (badref != "") printf "BADREF\0%s\0", badref
+      if (dtd) printf "DTD\0internal-subset\0"
     }' "$1" 2>/dev/null
 }
 # Returns 0 when the plist is NOT this label's job (and prints the reason); returns 1 only when it IS.
@@ -690,7 +714,7 @@ plist_probe() { # <file>
 #      `$LABEL` (measured). Proof 3 is about the program that RUNS.
 plist_not_this_job() { # <file>
   local -a _args=()
-  local _cnt="" _pcnt="" _pacnt="" _lbl="" _prog="" _kind _val _exec="" _e _root _badref=""
+  local _cnt="" _pcnt="" _pacnt="" _lbl="" _prog="" _kind _val _exec="" _e _root _badref="" _dtd=""
   while IFS= read -r -d '' _kind; do
     IFS= read -r -d '' _val || break
     case "$_kind" in
@@ -700,6 +724,7 @@ plist_not_this_job() { # <file>
       LABEL)   _lbl="$_val" ;;
       PROGRAM) _prog="$_val" ;;
       BADREF)  _badref="$_val" ;;
+      DTD)     _dtd="$_val" ;;
       ARG)     _args+=("$_val") ;;
     esac
   done < <(plist_probe "$1")
@@ -710,6 +735,13 @@ plist_not_this_job() { # <file>
   # rather than deciding on a string launchd will not see.
   if [ -n "$_badref" ]; then
     printf 'it declares XML character reference(s) this reader does not resolve (%s) — launchd DOES resolve them, so what a bootstrap would run cannot be proven from the raw text; re-render the plist without character references (or point WATCHDOG_PLIST at one that is already plain)' "$_badref"
+    return 0
+  fi
+  # ⛔ AN INTERNAL DTD SUBSET DECLARES ENTITIES THE REAL PARSER EXPANDS AND THIS READER DOES NOT (review P1,
+  # cycle 12 of #1986): refusing is the only honest answer, and the subset's own `>` characters also make
+  # the span scan ambiguous. It is not a reason to guess about the program.
+  if [ -n "$_dtd" ]; then
+    printf 'it declares an internal DTD subset, whose ENTITY declarations launchd resolves and this reader does not — what a bootstrap would run cannot be proven from the document; re-render the plist without an internal DTD subset'
     return 0
   fi
   # ⛔ NO FIELD SPLITTING AND NO DELIMITER PARSING ANYWHERE (review P2, cycle 7 of #1986). `$(…)` word-

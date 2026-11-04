@@ -1318,6 +1318,77 @@ ODD_LINES="$(awk '
   }' "$WD")"
 assert_eq "$ODD_LINES" "" "no awk-program line has an odd apostrophe count (an odd one unquotes the program)"
 
+# ═══ 8b(ap)-(aq): MARKUP *INSIDE* OTHER MARKUP IS STILL NOT MARKUP ════════════════════════════════
+# (ap) A DOCTYPE/PI SPAN CONTRIBUTES NO KEYS, but it used to be COPIED VERBATIM into the canon'd
+#      document, where `depthat` counted any `<dict>`/`</dict>` it contained. Both directions were
+#      measured and neither needs an exotic path: `<?x <dict> ?>` before a foreign top-level `Program`
+#      made that key read as NESTED (gate PASSED, `PCOUNT=0`, while plistlib resolves the foreign
+#      Program), and `<?x </dict> ?>` inside `EnvironmentVariables` made an ENV VAR named `Program`
+#      read at depth 1, so the gate "proved" our own controller while launchd would run the foreign
+#      `ProgramArguments[0]`.
+echo "── 8b(ap). a PI cannot hide OR promote a Program key (it is dropped, not scanned)"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAP1
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
+  <?x <dict> ?>
+  <key>Program</key><string>/opt/evil/run-agent</string>
+</dict></plist>
+PLISTAP1
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" \
+  "a PI containing <dict> cannot make a foreign Program read as nested"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…it is refused"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAP2
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>/opt/evil/run-agent</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <?x </dict> ?>
+    <key>Program</key><string>$C/o/orch-loop.sh</string>
+  </dict>
+</dict></plist>
+PLISTAP2
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" \
+  "a PI containing </dict> cannot promote an env var to a top-level Program"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…it is refused"
+# (aq) `<` AND `>` ARE ORDINARY CHARACTERS INSIDE CDATA, and the value must survive them intact. The
+#      escape was written `gsub(/</, "&lt;", body)` — and in an awk REPLACEMENT `&` is the MATCHED TEXT,
+#      so `<` became `<lt;`: the `<` stayed MARKUP, `canon` ate up to the next `>`, and the value was
+#      truncated. Measured: an honest CDATA path containing `<` LOST its ARG (arm inert for ever), and
+#      a CDATA traversal with `<`/`>` in it read back truncated and PASSED the gate while plistlib
+#      resolved it outside every root.
+echo "── 8b(aq). '<' and '>' inside CDATA are text: the value is neither truncated nor dropped"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAQ1
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string><![CDATA[$C/o/<d/../../../evil/orch-loop.sh]]></string></array>
+</dict></plist>
+PLISTAQ1
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" \
+  "a CDATA traversal carrying '<' is not bootstrap-ped"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "contains a .. segment" \
+  "…the value survived intact enough for the traversal guard to see it"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; mkdir -p "$C/o/a<b"
+cat > "$C/stack.plist" <<PLISTAQ2
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string><![CDATA[$C/o/a<b/orch-loop.sh]]></string></array>
+</dict></plist>
+PLISTAQ2
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" \
+  "an honest CDATA path containing '<' still lets the arm fire (the ARG is not dropped)"
+
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
 MUT="$WORK/mutant.sh"
