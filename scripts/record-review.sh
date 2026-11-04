@@ -1697,8 +1697,15 @@ post_marker_comment() { # <repo> <pr> <marker> [signed 0|1] -> ALWAYS 0 (best-ef
   #      a regression, not just an incomplete fix — and this restores it.
   #   2. THE CALLER CANNOT KNOW on `--flush-pending`, which re-posts bytes an EARLIER run
   #      wrote, so that arm VERIFIES THE MARKER'S OWN HMAC under the gate key. That is the
-  #      gate's rule, not a heuristic: the signature must equal HMAC over the text before
-  #      the FIRST ` sig=`, so text that merely looks like a signature cannot satisfy it.
+  #      gate's rule, not a heuristic: the signature must equal HMAC over the marker's text,
+  #      so text that merely looks like a signature cannot satisfy it.
+  #      ⛔ THE PREIMAGE CONVENTION IS THE **LAST** ` sig=`, MEASURED, NOT ASSUMED (`${x% sig=*}`
+  #      strips the SHORTEST matching suffix and `${x##* sig=}` the LONGEST prefix, so both cut
+  #      at the LAST delimiter — verified: `x="a sig=1 b sig=2"` ⇒ `"${x% sig=*}"` = `a sig=1 b`).
+  #      That is also what `--recover-body` and the #633 body site use, and a marker whose note
+  #      carries ` sig=` verifies there (measured via `--recover-body`, rc 0). So this check is
+  #      NOT what makes such a marker unreadable here — see the `--findings-note` refusal for
+  #      what the refusal actually rests on.
   #      (The key is re-derived here because the flush dispatch runs BEFORE the main flow's
   #      GATE_KEY resolution.) No key, or no verifiable signature, means no comment.
   # Whatever the arm, a trailing 64-hex field is still required: a marker whose signature
@@ -2130,17 +2137,26 @@ if [ "$VERDICT" = "not-clean" ]; then
     exit 2
   fi
   # ⛔ AND IT MUST NOT CARRY THE MARKER'S OWN SIGNATURE DELIMITER ' sig=' (review cycle 2,
-  # 2026-11-04). The note is interpolated right before the signature, and the signature is
-  # PARSED by splitting on that delimiter (`_text="${line% sig=*}"`, here and in
-  # --recover-body; ai-review-gate splits the same way). A note containing it therefore
-  # splits the marker INSIDE the note, so the HMAC computed over the full text can never
-  # match the text the reader verifies — the record would exist, and the evidence in the
-  # body and in the durable comment would be UNVERIFIABLE BY EVERY READER, which is the
-  # same outcome as no evidence at all while looking like success. It is also the shape two
-  # review rounds exploited to get an UNSIGNED marker published (a note that CONTAINS, or
-  # ENDS WITH, ` sig=<hex>`). Refusing here removes the class instead of pattern-matching it.
+  # re-worded in cycle 3 after the first justification was MEASURED FALSE).
+  # WHAT IS TRUE AND MEASURED HERE: this file's readers split at the LAST delimiter
+  # (`${line% sig=*}` strips the shortest matching suffix), so a marker whose note carries
+  # ` sig=` DOES verify against --recover-body (measured: rc 0, the marker restored intact).
+  # The cycle-3 reviewer is right that the first version of this comment claimed the
+  # opposite, and a lane "harmonising" a reader to a first-split because the comment said so
+  # would hash a different preimage than the mint signs. That is why the convention is
+  # spelled out above, where the guard uses it.
+  # WHY THE REFUSAL STILL STANDS: the marker is a CROSS-REPO CONTRACT and the consuming
+  # reader (ai-review-gate) lives in the consumer repo — it is not in this tree, so its split
+  # direction CANNOT be verified here. Emitting a marker whose reading depends on which
+  # delimiter a given reader happens to cut at is the ambiguity itself, and both review
+  # rounds used exactly it to get an UNSIGNED marker published (a note CONTAINING, or ENDING
+  # WITH, ` sig=<hex>`). So this is a PRECAUTION about an unverifiable consumer, not a claim
+  # about this file's readers — and it is deliberately NOT load-bearing for the comment
+  # guard, which is closed by provenance + HMAC alone (measured: removing this refusal
+  # leaves every 14.1d vector green). Cost when it fires: exit 2 by name, nothing recorded,
+  # the note reworded — never a silent loss.
   if [[ "$FINDINGS_NOTE" == *' sig='* ]]; then
-    echo "record-review.sh: --findings-note must not contain ' sig=' — that is the marker's signature delimiter, and a note carrying it makes the marker's own signature unverifiable (every reader splits the marker there). Reword the note; nothing was recorded." >&2
+    echo "record-review.sh: --findings-note must not contain ' sig=' — that is the marker's signature delimiter, and a note carrying it makes the marker's reading depend on which delimiter a reader cuts at (this file cuts at the last; the consuming gate's reader is in another repo and cannot be verified from here). Reword the note; nothing was recorded." >&2
     exit 2
   fi
 elif [ -n "$FINDINGS" ] || [ -n "$FINDINGS_NOTE" ]; then

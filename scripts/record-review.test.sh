@@ -4776,22 +4776,24 @@ assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the r
 #     permanent, so it must never be published to that channel.
 AI_REVIEW_GATE_KEY="" STUB_COMMENT_CAPTURE="$T/ccap_d" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d an UNSIGNED marker is never published as a comment"
-# (d2) ⛔ THE UNSIGNED-COMMENT GUARD, DEFEATED TWICE BY HEURISTICS (review cycles 1 and 2,
-#      2026-11-04). Its job: an UNSIGNED marker must never reach the PERMANENT comment
-#      channel. Both attempts inferred signedness from the marker's TEXT, and `note=` — a
-#      `not-clean` record's free-text `--findings-note` — is interpolated immediately
-#      BEFORE the signature, so no test of the text can tell a signature from text that
-#      looks like one:
-#        round 1  `case "$marker" in *" sig="*)`  → defeated by a note CONTAINING ` sig=…`;
-#        round 2  tail-after-the-LAST-` sig=` is 64 hex → defeated by a note ENDING ` sig=<64 hex>`.
-#      The shipped guard stops inferring: the mint arms pass `MARKER_SIGNED` (the
-#      authoritative flag main gated this post on before #3168 folded the channel here), and
-#      the one arm that cannot know (--flush-pending) verifies the marker's own HMAC. The
-#      note-carrying-delimiter shape is also refused outright at validation, because such a
-#      marker is unverifiable by EVERY reader (they all split at ' sig=').
-#      NON-VACUOUS PAIR, same record shape: (d2) UNSIGNED posts 0, (d3) SIGNED posts 1 — so
-#      neither can pass on "a not-clean record never posts" (d3 would red) nor on
-#      "the note text alone is enough" (d2 would red).
+# (d2) THE UNSIGNED-COMMENT GUARD. Its job: an UNSIGNED marker must never reach the
+#      PERMANENT comment channel. Two review rounds defeated it, once per text heuristic,
+#      because `note=` — a `not-clean` record's free-text `--findings-note` — is
+#      interpolated immediately BEFORE the signature, so no test of the marker's TEXT can
+#      tell a signature from text that looks like one:
+#        round 1  `case "$marker" in *" sig="*)`        → a note CONTAINING ` sig=…`;
+#        round 2  tail after the LAST ` sig=` is 64 hex → a note ENDING ` sig=<64 hex>`.
+#      The shipped guard stops inferring: mint arms pass `MARKER_SIGNED`, and the one arm
+#      that cannot know (--flush-pending) verifies the marker's own HMAC.
+#      ⛔ WHAT THESE VECTORS DO AND DO NOT PIN (measured in review cycle 3, and the cycle-2
+#      claim to the contrary was WRONG): (d)/(d2) pin only that A GUARD EXISTS — an unsigned
+#      marker with a benign note has no ` sig=` at all, so BOTH defeated guards refuse it
+#      too, and both were measured green on (d)/(d2)/(d3)/(d4). The vector that actually
+#      discriminates the text-inference class is 14.1d (d5): a marker with the RIGHT SHAPE
+#      and the WRONG HMAC, which both defeated guards admit and provenance/HMAC refuses.
+#      (d2)/(d3) remain as the non-vacuous PAIR for "unsigned posts 0, signed posts 1" — a
+#      guard that refused everything would red (d3); a guard that admitted anything would
+#      red (d2).
 run_record_dcraft() { # <pr> <out-capture> <key — pass '-' for the suite key, "" for UNSIGNED> [note]
     # ⛔ `${3-$AI_REVIEW_GATE_KEY}`, NOT `${3:-…}`: the unsigned arm passes an EMPTY key and
     # `:-` would treat it as absent and substitute the suite's key — which made the first cut
@@ -4880,6 +4882,20 @@ assert_eq "$(dc_posts 424958)" "0" \
 flush_pending_case 424959 "$FP_TEXT sig=$FP_SIG" "$T/ccap_d5b" "test-key-2982"
 assert_eq "$(dc_posts 424959)" "1" \
     "14.1d (d5) …while a genuinely signed pending marker IS published (the arm is not a blanket refusal)"
+# (d6) THE PROVENANCE CONTRACT AT THE CALL SITES — a SOURCE pin, and it says so.
+#      ⛔ WHY SOURCE-LEVEL: `MARKER_SIGNED` is layered on top of the HMAC check, so deleting the
+#      guard's use of it is BEHAVIOURALLY INVISIBLE — MEASURED in cycle 3 (mutant: the
+#      short-circuit removed ⇒ every 14.1d vector stays green, because every mint-side marker
+#      is genuinely signed and every unsigned one is refused by the HMAC arm instead). A pin
+#      that cannot discriminate behaviour must not pretend to; what CAN be pinned is that the
+#      mint arms still PASS the datum main gated on, and that no fourth caller quietly appears
+#      without it. (The suite already inspects the shipped script this way — see 20.1.)
+assert_eq "$(command grep -cF 'post_marker_comment "$REPO" "$PR" "$MARKER" "${MARKER_SIGNED:-0}"' "$RECORD" || true)" "2" \
+    "14.1d (d6) both mint-side \$MARKER call sites pass the authoritative MARKER_SIGNED"
+assert_eq "$(command grep -cF 'post_marker_comment "$REPO" "$PR" "$MISSING" "${MARKER_SIGNED:-0}"' "$RECORD" || true)" "1" \
+    "14.1d (d6) …and the body-PATCH-failure arm passes it for \$MISSING too"
+assert_eq "$(command grep -cF 'post_marker_comment "$repo" "$pr" "$marker"' "$RECORD" || true)" "1" \
+    "14.1d (d6) …and the ONLY call site without the flag is --flush-pending, which HMAC-verifies instead"
 # (e) THE P2 PIN: when the BODY channel fails, the run that most needs the durable
 #     copy must still attempt it. Both failure arms used to `exit 5` before reaching
 #     the durable block, so the channel never fired in the only scenario it exists
