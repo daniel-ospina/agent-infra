@@ -1966,7 +1966,8 @@ def t41():
         for argv in (["--log-census", "--json"],
                      ["--log-census", "--verdict-file", os.path.join(d, "V")],
                      ["--log-census", "--transcript", os.path.join(d, "T")],
-                     ["--log-census", "--start-seconds", "5"]):
+                     ["--log-census", "--start-seconds", "5"],
+                     ["--log-census", "--no-sample"]):
             refuse_rc, refuse_rows = census([], argv)
             check(refuse_rc == 2,
                   "%r must be REFUSED, not ignored; got rc=%r" % (argv[1:], refuse_rc))
@@ -2449,12 +2450,29 @@ def t51():
               "…and the lane abstains rather than assuming success; got %s/%s"
               % (v.state, v.reason))
 
-        # (d) An UNREADABLE launcher rc is an ABSTENTION, never a negative fact.
+        # (d) An UNREADABLE launcher rc is an ABSTENTION, never a negative fact — and it is
+        # a DIFFERENT FACT from "no launcher line": the pid is still returned, so the
+        # verdict can name what it could not read instead of asserting the line is absent.
         for junk in ("\u00b2", "0x0", "exit:0", "9" * 40):
             check(liv.parse_runner_line(
                 "[timeout] agent pid=%d wall_limit=3300s elapsed=1s rc=%s" % (dead, junk))
-                  == ("", None),
+                  == (str(dead), None),
                   "an unreadable launcher rc is NO witness, never a crash: %r" % junk)
+        check(liv.parse_runner_line("[timeout] agent pid=%d wall_limit=1s" % dead)
+              == (str(dead), None),
+              "a launcher line with NO status is the same distinction")
+        # …and the LOG-LEVEL detail names the fact rather than the absence.
+        write(dead, "0x0")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown" and v.reason == "finished-rc-uncorroborated",
+              "an unreadable launcher status abstains; got %s/%s" % (v.state, v.reason))
+        check("runner-rc-unreadable" in (v.detail or ""),
+              "…and the detail names the UNREADABLE reading, not a missing line; got %r"
+              % (v.detail,))
+        check("no CORROBORATING launcher" in (v.detail or ""),
+              "the static sentence claims no corroborating reading, not no line; got %r"
+              % (v.detail,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3033,12 +3051,12 @@ MUTATIONS = [
     ),
     Mutation(
         "T51", "module",
-        '            r"\\[timeout\\]\\s+agent\\s+pid=(\\d+)\\b[^\\n]*?\\brc=(\\d{1,3})\\b")',
-        '            r"\\[timeout\\]\\s+agent\\s+pid=(\\d+)\\b[^\\n]*?\\brc=([^\\s]+)")',
-        "an UNREADABLE launcher rc is decoded as the positive claim \"the child did not "
-        "complete\" instead of an abstention, so a corrupt token (or a future spelling) "
-        "flips a completed lane to `no-verdict`, and a runaway token is interpolated "
-        "whole into the reason",
+        'globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\\brc=(\\d{1,3})\\b")',
+        'globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\\brc=([^\\s]+)\\b")',
+        "an UNREADABLE launcher status is accepted as a status again, so the acquisition "
+        "path stops recording `runner-rc-unreadable` and the detail reverts to claiming "
+        "the launcher line is ABSENT — a fact the log contradicts. (The state is guarded "
+        "twice — the door normalises too — so the DETAIL is what discriminates here.)",
     ),
     # ── round 3: the unbounded bound-line token ───────────────────────────────────────
     # (the census `rc` column needs no mutation of its own: the allow-list lives at ONE
@@ -3063,7 +3081,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T41", "module",
-        '        if log or pid is not None or vfile or transcript or start_seconds is not None or as_json:',
+        '        if (log or pid is not None or vfile or transcript or start_seconds is not None\n'
+        '                or as_json or not sample):',
         '        if log or pid is not None:',
         "`--log-census` silently DROPS the per-lane flags again, so a `--verdict-file` that "
         "makes the single-lane arm say `finished` is ignored and the census publishes "

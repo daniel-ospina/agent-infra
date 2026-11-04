@@ -1731,8 +1731,9 @@ that line (`parse_runner_line` → `LogRead.runner_rc`):
 | `rc=0` | (not consulted) | `finished` — `run` mode's own success witness |
 | `rc=na` | `rc=0` | `finished` — corroborated completion |
 | `rc=na` | `rc=<non-zero>` | **`no-verdict`** (`bound-finished-runner-rc:<n>`) — the bound fired nothing, yet the child did NOT complete |
-| `rc=na` | absent / naming another incarnation | **`unknown`** (`finished-rc-uncorroborated`) — an abstention, never an assumed success |
-| `rc=na` | present but its `rc` is **unreadable** (not a 1–3 digit status, e.g. `0x0`, `exit:0`, a runaway token) | **`unknown`** (`finished-rc-uncorroborated`) — an unreadable status is not a negative fact |
+| `rc=na` | **absent** | **`unknown`** (`finished-rc-uncorroborated`) — an abstention, never an assumed success |
+| `rc=na` | **present, but naming another incarnation** | **`unknown`** — the witness is not this lane's (`runner-rc-unbound` in `detail`) |
+| `rc=na` | present but its `rc` is **unreadable** (not a 1–3 digit status, e.g. `0x0`, `exit:0`, a runaway token) | **`unknown`** (`finished-rc-uncorroborated`, and `detail` names `runner-rc-unreadable`) — an unreadable status is not a negative fact, and it is **not** the same fact as an absent line |
 | `rc=7` | (not consulted) | **`no-verdict`** (`bound-finished-rc:7`) |
 | no `rc=` | (not consulted) | **`unknown`** (`finished-rc-unreadable`) |
 
@@ -1833,6 +1834,12 @@ presence-only guess. `--no-sample` skips the 30 s second reading (deltas then st
 call abstains instead of claiming a state), and `--window-ms` below 1 is REFUSED: a zero-length window
 collapses both readings into one instant, making both signals trivially flat, so a live working lane
 would read `frozen`.
+
+⛔ **`--log-census` REFUSES every per-lane flag rather than ignoring it** (`--log`, `--pid`,
+`--verdict-file`, `--transcript`, `--start-seconds`, `--json`, `--no-sample`, exit 2). Accepting and
+dropping one is not harmless: a `--verdict-file` that makes the single-lane arm say `finished` was
+ignored, so the census published `no-verdict` for that lane and exited 0 — the §13.1 false-negative
+class with no signal that a flag had been discarded.
 
 `--log-census` takes the deltas **from the caller** (`?` = unread, which abstains) because a census
 that judged 76 lanes must not sleep 30 s per lane — the caller owns the two samples. Both shapes

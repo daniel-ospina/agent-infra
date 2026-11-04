@@ -331,7 +331,8 @@ _BOUND_VERDICT_RE = None  # compiled lazily, so importing the module stays cheap
 _BOUND_RC_RE = None
 _BOUND_PID_RE = None
 _BOUND_LINE_RE = None    # the `[lane-bound] VERDICT` MARKER alone (the line, not its token)
-_RUNNER_LINE_RE = None   # the LAUNCHER's own `[timeout] agent … rc=` exit-status line
+_RUNNER_MARKER_RE = None  # the LAUNCHER's `[timeout] agent pid=` line (location only)
+_RUNNER_RC_TOKEN_RE = None  # the status token read off that line
 # `rc=` is captured on the SAME line, because a verdict without its exit status is
 # not a completion (see BOUND_OK_RC).
 
@@ -1131,9 +1132,13 @@ def _bound_verdict_re():
         #   [timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>
         # It is the ONLY witness of the child's real status in `watch` mode, so it is
         # what corroborates `rc=na` (see BOUND_OK_RC).
-        globals()["_RUNNER_LINE_RE"] = _re.compile(
-            r"\[timeout\]\s+agent\s+pid=(\d+)\b[^\n]*?\brc=(\d{1,3})\b")
-        _RUNNER_LINE_RE = globals()["_RUNNER_LINE_RE"]
+        # The MARKER (pid only) locates the line; the STATUS is read off that line
+        # separately, so "no line" and "line present, status unreadable" stay distinct.
+        globals()["_RUNNER_MARKER_RE"] = _re.compile(
+            r"\[timeout\]\s+agent\s+pid=(\d+)\b")
+        _RUNNER_MARKER_RE = globals()["_RUNNER_MARKER_RE"]
+        globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\brc=(\d{1,3})\b")
+        _RUNNER_RC_TOKEN_RE = globals()["_RUNNER_RC_TOKEN_RE"]
     return _BOUND_VERDICT_RE
 
 
@@ -1186,16 +1191,27 @@ def parse_runner_line(text: str):
     error as reading an unreadable log as death — and a 5000-digit token was interpolated
     whole into the reason string. The bound line's own `rc=` already uses a strict
     allow-list and abstains (`finished-rc-unreadable`); this matches it.
+
+    ⛔ "MARKER ABSENT" AND "MARKER PRESENT, STATUS UNREADABLE" ARE DIFFERENT FACTS, and
+    the return shape says which: ``("", None)`` means NO line at all; ``(<pid>, None)``
+    means a line named this incarnation but its status could not be read. Collapsing the
+    two made the verdict publish "no launcher line to corroborate it" over a log that
+    demonstrably HAD one — the wrong-fact-in-the-detail class T49 closed for the
+    no-progress branch. The LAST marker wins, so a trailing unreadable line is not
+    rescued by an earlier readable one.
     """
     if not text:
         return "", None
     _bound_verdict_re()  # ensures the compiled globals exist
     last = None
-    for m in _RUNNER_LINE_RE.finditer(text):
+    for m in _RUNNER_MARKER_RE.finditer(text):
         last = m
     if last is None:
         return "", None
-    return last.group(1), last.group(2)
+    line_end = text.find("\n", last.start())
+    line = text[last.start(): line_end if line_end >= 0 else len(text)]
+    tok = _RUNNER_RC_TOKEN_RE.search(line)
+    return last.group(1), (tok.group(1) if tok else None)
 
 def parse_bound_line(text: str):
     """``(verdict, rc)`` from the LAST ``[lane-bound] VERDICT`` line, or ``("", None)``.
@@ -1530,9 +1546,9 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                     # Corroborate with it, and require it to describe THIS incarnation.
                     if runner_rc is None:
                         return Verdict("unknown", "finished-rc-uncorroborated",
-                                       detail=("verdict=finished rc=na and no launcher "
-                                               "`[timeout] agent … rc=` line to corroborate "
-                                               "it; completion is undecidable")
+                                       detail=("verdict=finished rc=na and no CORROBORATING "
+                                               "launcher `rc=` reading; completion is "
+                                               "undecidable")
                                               + _also(lr.detail))
                     if runner_rc != "0":
                         return Verdict("no-verdict", "bound-finished-runner-rc:%s" % runner_rc,
@@ -2698,7 +2714,13 @@ def gather_log_lane(
     # earlier dispatch appended to the same log is not this lane's exit status.
     if lr.rc == "na" and lr.readable:
         runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))
-        if runner_rc is not None:
+        if runner_pid and runner_rc is None:
+            # A launcher line IS present but its status is unreadable: name THAT fact, not
+            # the absence of the line. The state is the same (no witness -> abstain), but
+            # the detail is what a reader diagnoses from.
+            lr.detail = " | ".join(x for x in (
+                lr.detail, "runner-rc-unreadable runner_pid=%s" % runner_pid) if x)
+        elif runner_rc is not None:
             same_incarnation = ((runner_pid == lr.verdict_line_pid)
                                 if lr.verdict_line_pid else (runner_pid == str(pid)))
             if same_incarnation:
@@ -2900,10 +2922,11 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
         # and `--json` silently changed nothing about the TSV output. Both exited 0, so no
         # caller could tell it had been ignored. A refusal is consistent with the surface's
         # own contract (it reads lanes AND their evidence from stdin).
-        if log or pid is not None or vfile or transcript or start_seconds is not None or as_json:
+        if (log or pid is not None or vfile or transcript or start_seconds is not None
+                or as_json or not sample):
             print("liveness.py: --log-census reads its lanes and their evidence from stdin; "
                   "do not also pass --log/--pid/--verdict-file/--transcript/"
-                  "--start-seconds/--json", file=sys.stderr)
+                  "--start-seconds/--json/--no-sample", file=sys.stderr)
             return 2
         rc = 0
         for line in sys.stdin:
