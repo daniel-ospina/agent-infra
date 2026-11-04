@@ -144,6 +144,12 @@ mandate_state_root_undecidable() {
     p="$(dirname "$root")"
     [ "$p" = "$root" ] && break
     if [ -e "$p" ]; then
+      # ⛔ NOT A DIRECTORY IS UNDECIDABLE AT EVERY LEVEL, NOT ONLY AT THE ROOT (this change's review cycle 4,
+      # P2, MEASURED): testing only the execute bit made an ancestor that is a FILE -- `: > $CELL_HOME/.pi`
+      # -- grade DECIDABLE, so `--check` answered MISSING, `--line` printed the full block with the
+      # `ship the file` remedy, and `--missing` listed both paths with rc 0 — for a path that can never
+      # exist. This is the function's own leg (d) applied one level up, where it was missing.
+      [ -d "$p" ] || return 0
       [ -x "$p" ] || return 0
       return 1
     fi
