@@ -30,8 +30,28 @@
 
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
+# ⛔ PHYSICAL PATHS, OR THE "NEVER EXEC OURSELVES" GUARD FAILS OPEN (agent-infra#3309 review, P1).
+# `pwd` returns a LOGICAL path: with `~/orchestrator` (or any pin root) reachable through a symlink, the
+# stub's own path and an alias of its own directory are different STRINGS for the same file — so a pin
+# record naming the alias with `ORCH_ENTRY=orch-pin-exec.sh` was NOT refused: `--resolve-only` printed
+# the alias path of the stub itself and exited 0, and the exec path would re-exec this file every 10 s
+# under KeepAlive/ThrottleInterval. That is the launchd spin this guard exists to prevent, in its own
+# named shape. `pwd -P` alone is not enough either: a symlinked FILE needs following too, which is what
+# `phys` does (bash 3.2 / macOS safe — no `readlink -f`, no GNU tools).
+phys() { # <path> → absolute path with every dir AND file symlink resolved
+  local p="$1" d t
+  [ -n "$p" ] || { printf '%s' "$p"; return 0; }
+  while [ -L "$p" ]; do
+    d="$(cd -P "$(dirname "$p")" >/dev/null 2>&1 && pwd -P)" || break
+    t="$(readlink "$p" 2>/dev/null)" || break
+    case "$t" in /*) p="$t" ;; *) p="$d/$t" ;; esac
+  done
+  d="$(cd -P "$(dirname "$p")" >/dev/null 2>&1 && pwd -P)" || { printf '%s' "$p"; return 0; }
+  printf '%s/%s' "$d" "$(basename "$p")"
+}
+
+SELF_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+SELF="$(phys "${BASH_SOURCE[0]}")"
 
 die() {
   printf 'PIN-EXEC: DEAD-SUPERVISOR: %s\n' "$*" >&2
@@ -91,9 +111,10 @@ PROGRAM="$DIR/$ENTRY"
 [ -r "$PROGRAM" ] || die "'${PROGRAM}' exists but is unreadable"
 
 # ⛔ NEVER EXEC OURSELVES. A pin record pointing back at this stub (a mis-restored `.harness-path`
-# naming `$O`, or an entry name equal to this file) would fork-bomb launchd on a 10 s KeepAlive loop
-# instead of failing. Compare resolved paths, not strings.
-PROGRAM_REAL="$(cd "$(dirname "$PROGRAM")" >/dev/null 2>&1 && pwd)/$(basename "$PROGRAM")"
+# naming `$O` or a symlink to it, or an entry name equal to this file) would fork-bomb launchd on a 10 s
+# KeepAlive loop instead of failing. Compare PHYSICAL paths, not strings: `pwd` alone made the two sides
+# disagree whenever either was reached through a symlink, and the guard passed the alias through.
+PROGRAM_REAL="$(phys "$PROGRAM")"
 [ "$PROGRAM_REAL" != "$SELF" ] || die "the pin record resolves back to THIS wrapper (${SELF}) — refusing to exec ourselves in a launchd loop"
 
 if [ "$RESOLVE_ONLY" = "1" ]; then

@@ -1145,6 +1145,18 @@ esac
 # whose message ("this box RUNS …") describes a fact it never tested. So the evidence is the rendered
 # plist launchd will actually load: its ProgramArguments program, read with the same parser the
 # post-render assertion uses. No installed plist => nothing is running that could be lost => no refusal.
+#
+# ⛔ THE STABLE RESOLVER IS DEFINED HERE, BEFORE THIS GATE, BECAUSE THE GATE MUST EXEMPT IT BY NAME
+# (agent-infra#3309 review, P1). It is seeded into `$O` by THIS installer and is deliberately absent
+# from every pin that predates this commit — so the bare test below ("the installed program is a
+# basename the pinned tree does not carry") is TRUE for it on the second run, and the installer
+# refused its own fresh install with a diagnosis that is factually false for this file ("a LIVE-ONLY
+# TCC wrapper … the content must LAND first (PR #2020)"): measured, rc=78 on a re-run, leaving the box
+# un-rerunnable until the next pin advance. The exemption is the SEEDED NAME (`STABLE_PROG`'s
+# basename), never an assumption that the file lives in `$HARNESS` — the whole point of #3309 is that
+# the stable program does NOT live in the moving pin.
+STABLE_PROG="$O/orch-pin-exec.sh"
+STABLE_PROG_NAME="${STABLE_PROG##*/}"
 LIVE_ENTRY=""; _live_prog=""
 if [ -f "$PLIST" ]; then
   _live_prog="$(plist_program "$PLIST")"
@@ -1161,7 +1173,12 @@ if [ -f "$PLIST" ]; then
   fi
   # In scope only when the installed program is a script the PIN does not carry AND that file is on
   # disk. A plist naming a deleted path is a different failure (start's, not this installer's).
-  if [ -n "${_live_base:-}" ] && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
+  # ⛔ AND NEVER THE STABLE RESOLVER (agent-infra#3309 review, P1): it is the program THIS installer
+  # renders, it is seeded by this installer, and it is by design absent from a pin that predates the
+  # commit introducing it — so without this exemption the SECOND run of a successful install is
+  # refused with the TCC-wrapper diagnosis below, which describes nothing on this box.
+  if [ -n "${_live_base:-}" ] && [ "${_live_base}" != "$STABLE_PROG_NAME" ] \
+     && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
     LIVE_ENTRY="$_live_base"
   fi
 fi
@@ -1184,7 +1201,7 @@ ok "program: $HARNESS/$HARNESS_ENTRY (pinned; selected from the pin, not from \$
 # ⛔ NOT the #2231 defect coming back: the stub is seeded from the PINNED TREE on every run (never
 # hand-written into $O), it holds no controller logic to diverge, and the assertion below refuses the
 # install unless the stub, run now, resolves to the pin's own entrypoint.
-STABLE_PROG="$O/orch-pin-exec.sh"
+# (`STABLE_PROG` itself is defined above the live-only gate, which must exempt it by name.)
 # Prefer the pinned tree (after this lands the pin carries it); fall back to the installer's checkout so
 # a box installing ON the commit that introduces it is not blocked by a pin that predates it.
 _PIN_EXEC_SRC="$HARNESS/orch-pin-exec.sh"
@@ -1405,7 +1422,7 @@ PROGRAM_GOT="$(plist_program "$RENDER")"
 [ -n "$PROGRAM_GOT" ] || { rm -f "$RENDER"; die "the rendered plist declares no ProgramArguments program — launchd would load a job with nothing to exec (parse: $(plist_program "$RENDER"))" ; }
 if [ "$PROGRAM_GOT" != "$PROGRAM_WANT" ]; then
   rm -f "$RENDER"
-  die "REFUSED (pin): the rendered job would exec '$PROGRAM_GOT' but the stable program is '$PROGRAM_WANT' — nothing was installed (the previous plist is untouched)."
+  die "REFUSED (pin): the rendered job would exec '$PROGRAM_GOT' but the stable program is '$PROGRAM_WANT' (which must resolve to '$HARNESS/$HARNESS_ENTRY') — the plist and the pin disagree, and starting this job would run a program the stable resolver does not name. Nothing was installed (the previous plist is untouched)."
 fi
 # ⛔ STABILITY, ASSERTED ON THE RENDERED FILE (agent-infra#3309). Two independent claims, both read
 # back from the plist rather than from this script's variables:
@@ -1415,16 +1432,29 @@ fi
 #      what is checked is the behaviour launchd will get, not the installer's bookkeeping.
 # A relative or empty program fails (2) because --resolve-only would not be runnable at all.
 case "$PROGRAM_GOT" in
-  "$HARNESS_PIN_DIR"/*)
+  # ⛔ `${HARNESS_PIN_DIR%/}` — `HARNESS_PIN_DIR` is OPERATOR-SUPPLIED (`:836`) and a trailing slash made
+  # the pattern `/x/harness//*`, which matches NOTHING: the guard silently disabled itself for exactly
+  # the operator who typed the path with a slash. (agent-infra#3309 review, P2)
+  "${HARNESS_PIN_DIR%/}"/*)
     rm -f "$RENDER"
     die "REFUSED (#3309): the rendered job execs '$PROGRAM_GOT', which is INSIDE the harness pin root ($HARNESS_PIN_DIR). That tree is hash-named and garbage-collected as the pin advances, so this plist would die 'No such file or directory' (exit 127) on the next pin move while launchd still reported it loaded. Nothing was installed." ;;
 esac
 [ -f "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): the rendered job execs '$STABLE_PROG' but that file does not exist — launchd would load a job that exits 127 on every tick. Nothing was installed." ; }
 [ -x "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): '$STABLE_PROG' is not executable — launchd would fail to spawn it. Nothing was installed." ; }
-_PIN_EXEC_RESOLVED="$(/bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)"
+# ⛔ GUARDED, LIKE THE SIBLING AT THE `start` SEAM (agent-infra#3309 review, P1). This is an unguarded
+# `$( … )` in a file that sets `set -euo pipefail` (`:22`), and the resolver's OWN failure path is
+# `die` → exit 127 — so an unresolvable pin aborted the installer at rc=127 with NO diagnostic at all
+# and the refusal below could never print. In the change whose premise is "the real defect was
+# silence", the guard's own failure path was silent. `|| _PIN_EXEC_RESOLVED=""` makes the rc=0 path
+# of the substitution irrelevant and lets the refusal run; stderr is CAPTURED, not discarded, so the
+# resolver's `PIN-EXEC: DEAD-SUPERVISOR:` line reaches the operator in the message.
+_PIN_EXEC_ERR="$RENDER.pinerr"
+_PIN_EXEC_RESOLVED="$(/bin/bash "$STABLE_PROG" --resolve-only 2>"$_PIN_EXEC_ERR")" || _PIN_EXEC_RESOLVED=""
+_PIN_EXEC_WHY="$(tr '\n' ' ' < "$_PIN_EXEC_ERR" 2>/dev/null || true)"
+rm -f "$_PIN_EXEC_ERR"
 if [ "$_PIN_EXEC_RESOLVED" != "$HARNESS/$HARNESS_ENTRY" ]; then
   rm -f "$RENDER"
-  die "REFUSED (#3309): the stable program '$STABLE_PROG' resolves to '${_PIN_EXEC_RESOLVED:-<nothing>}' but the pin is '$HARNESS/$HARNESS_ENTRY' — the plist would run a tree the pin does not name, or nothing at all. Nothing was installed (the previous plist is untouched)."
+  die "REFUSED (#3309): the stable program '$STABLE_PROG' resolves to '${_PIN_EXEC_RESOLVED:-<nothing>}' but the pin is '$HARNESS/$HARNESS_ENTRY' — the plist would run a tree the pin does not name, or nothing at all.${_PIN_EXEC_WHY:+ The resolver said: ${_PIN_EXEC_WHY% }} Nothing was installed (the previous plist is untouched). Run it by hand to see why: /bin/bash '$STABLE_PROG' --resolve-only"
 fi
 ok "plist program is STABLE ($STABLE_PROG) and resolves to the pin ($_PIN_EXEC_RESOLVED)"
 # ⛔ IS THE LOADED JOB ON THIS RENDER? Recorded BEFORE the mv, because that is the only moment the file

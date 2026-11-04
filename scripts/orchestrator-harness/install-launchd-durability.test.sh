@@ -1635,10 +1635,15 @@ else
 fi
 assert_contains "$(cat "$HARNESS/launchd.plist.template")" "__PROGRAM__" "…it renders the STABLE __PROGRAM__ token instead"
 
-# J2. install.sh must substitute it, refuse a pin-root program, and PROVE resolution before installing.
+# J2. THE STATIC HALF. ⛔ THIS IS NOT THE WITNESS FOR BEHAVIOUR (agent-infra#3309 review, P2 finding 6):
+# these greps passed on code that silently aborted at rc=127 under a resolver that could not resolve,
+# refused a re-run with a factually false diagnosis, and disabled its own pin-root guard whenever the
+# operator's `HARNESS_PIN_DIR` ended in a slash. A grep cannot see any of those, so they are labelled for
+# what they are — a cheap STRUCTURAL claim (a token with no substitution rule renders a plist naming
+# nothing) — and the BEHAVIOURAL arms are J8 below and `scripts/mac-pin-parity.test.sh` §B8, which run the
+# shipped installer and read the outcome.
 assert_contains "$INSTALL_CODE" 's|__PROGRAM__|' "install.sh substitutes __PROGRAM__ (a token with no rule is a rendered plist naming nothing)"
-assert_contains "$INSTALL_CODE" 'INSIDE the harness pin root' "install.sh REFUSES a program inside \$HARNESS_PIN_DIR"
-assert_contains "$INSTALL_CODE" '--resolve-only' "install.sh proves the stable program resolves to the pin BEFORE installing"
+assert_contains "$INSTALL_CODE" 'REFUSED (#3309): the stable program' "…and it carries a refusal that NAMES the stable program (structure only — §J8 proves it can PRINT)"
 
 # J3. the invariant itself, on a real seeded copy: the program must be OUTSIDE the pin root.
 rm -rf "$T/j"; mkdir -p "$T/j/o" "$T/j/pin/aaaaaaaaaaaa" "$T/j/pin/bbbbbbbbbbbb"
@@ -1704,6 +1709,65 @@ printf '%s\n' "$T/j/o" > "$T/j/harness-path"
 out="$(HARNESS_PIN_FILE="$T/j/harness-path" ORCH_ENTRY=orch-pin-exec.sh /bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
 assert_eq "$rc" "127" "a pin that resolves back to the stub itself is refused (not an exec loop)"
 assert_contains "$out" "refusing to exec ourselves" "…and says so by name"
+
+# J7b. THE SAME GUARD MUST NOT FAIL OPEN ON A SYMLINK (agent-infra#3309 review, P1 finding 4). J7 names the
+# stub's own dir LITERALLY, so it passes on a guard that compares STRINGS — which is what the stub did:
+# both sides were built with `cd … && pwd` (LOGICAL paths). A pin record naming a SYMLINK to the stub's own
+# directory — the shape `~/orchestrator` takes on a box whose worker dir is a link — then made
+# `--resolve-only` PRINT THE ALIAS PATH OF THE STUB and exit 0, so the exec path would be
+# `exec /bin/bash <alias>/orch-pin-exec.sh` under KeepAlive/ThrottleInterval: the launchd spin the guard
+# exists to prevent, in its own named shape.
+ln -s "$T/j/o" "$T/j/o-alias" 2>/dev/null
+printf '%s\n' "$T/j/o-alias" > "$T/j/harness-alias"
+out="$(HARNESS_PIN_FILE="$T/j/harness-alias" ORCH_ENTRY=orch-pin-exec.sh /bin/bash "$STABLE_PROG" --resolve-only 2>&1)"; rc=$?
+if [ "$rc" -eq 127 ]; then ok "a pin record naming a SYMLINK to the stub's own dir is REFUSED (rc=127, not 0 with the alias printed)"
+else bad "a symlinked pin record still resolved to the stub through the alias (rc=$rc, out=$out) — the guard compares logical paths and FAILS OPEN into a launchd exec loop"; fi
+assert_contains "$out" "refusing to exec ourselves" "…and says so by name"
+# ⛔ AND THE ALIAS IS NOT HANDED ON AS THE PROGRAM. This is the datum that made the finding: the guard's
+# failure was not `rc=0 with silence`, it was `rc=0 having printed a program to exec`.
+assert_not_contains "$out" "$T/j/o-alias/orch-pin-exec.sh" "…and does NOT print the alias as the program to exec"
+
+# J7c. THE OTHER HALF OF THE SAME RESOLUTION: a pin dir holding a SYMLINKED FILE named for the entry (the
+# dir itself is not a link). `pwd -P` on the dirs alone still compares a link to its target as two paths.
+mkdir -p "$T/j/o-filelink"
+ln -s "$T/j/o/orch-pin-exec.sh" "$T/j/o-filelink/orch-pin-exec.sh" 2>/dev/null
+printf '%s\n' "$T/j/o-filelink" > "$T/j/harness-filelink"
+ffl="$(HARNESS_PIN_FILE="$T/j/harness-filelink" ORCH_ENTRY=orch-pin-exec.sh /bin/bash "$STABLE_PROG" --resolve-only 2>&1)"; rc=$?
+if [ "$rc" -eq 127 ]; then ok "a pin whose ENTRY FILE is a symlink to the stub is REFUSED too (rc=127)"
+else bad "a symlinked FILE resolved to the stub (rc=$rc, out=$ffl) — file symlinks need resolving, not just directories"; fi
+
+# J8. ⛔ BEHAVIOUR, NOT SOURCE TEXT (agent-infra#3309 review, P2 finding 6): RUN the shipped installer and
+# observe a REFUSAL. The invariant under test is the pin-root guard, and the condition is the one that
+# silently disabled it: `HARNESS_PIN_DIR` written with a TRAILING SLASH (operator-supplied, `:836`) made the
+# pattern `/x/harness//*` match NOTHING — while `$O` here is INSIDE that root, so a skip is a false PASS on
+# exactly the refusal that has to fire. §F's stage + launchd/tool stubs are reused; when §F could not run
+# (no usable git checkout) this arm SKIPS LOUDLY rather than passing.
+if [ -n "${STAGE:-}" ] && [ -f "$STAGE/install.sh" ] && type -t ORUN >/dev/null 2>&1; then
+  j8out="$(HARNESS_PIN_DIR="$T/" ORUN 2>&1)"; j8rc=$?
+  # ⛔ THE MESSAGE IS THE ASSERTION AND rc IS CORROBORATION (review finding). `rc -ne 0` alone PASSES on any
+  # refusal — and this installer has an earlier gate that can abort before the render stage at all
+  # (`merge-reminder.py does not parse` needs python3 >= 3.12; a 3.9 host reds §F/§G/§H and aborts here),
+  # so an rc-only arm reported PASS for a refusal that has nothing to do with `$HARNESS_PIN_DIR`: the exact
+  # false-PASS shape this hunk exists to argue against. A host that cannot reach the render stage is
+  # DECLARED as a skip, never counted as a pass.
+  # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841, the rule stated at :83): under `pipefail` the quiet
+  # grep exits on its first match, the writer takes SIGPIPE, and the PIPELINE reads 141 — so on a large
+  # installer log the parse-gate abort would go UNDETECTED and this arm would report a false FAILURE for
+  # the very host the skip exists for (`scripts/check-no-sigpipe-grep.sh` gates the shape in CI).
+  # ⛔ AND THE NEEDLE IS THE FULL ERROR, not `does not parse`: install.sh emits that phrasing at several
+  # gates (`bash -n` on the seeded entrypoint included), so the short form would attribute a different
+  # abort to python3 3.12. The skip still stays loud either way — it can never be a pass.
+  if grep -qF 'merge-reminder.py is missing or does not parse' <<<"$j8out"; then
+    skipd "§J8 — SKIPPED, NOT A PASS: the installer aborted at its python3 parse gate ($(command -v python3) — merge-reminder.py needs 3.12+) before reaching the render stage, so the pin-root refusal was NOT exercised here. Re-run with a 3.12+ python3 first on PATH (CI has one)."
+  else
+    assert_contains "$j8out" "INSIDE the harness pin root" "install.sh REFUSES a program INSIDE \$HARNESS_PIN_DIR — with the operator's path written as '$T/' (trailing slash; the guard used to be skipped silently)"
+    assert_contains "$j8out" "Nothing was installed" "…and says nothing was installed"
+    if [ "$j8rc" -ne 0 ]; then ok "…and the run exits NON-ZERO (rc=$j8rc), corroborating the refusal above"
+    else bad "…but the run exited 0 (rc=$j8rc) despite the refusal text"; fi
+  fi
+else
+  skipd "§J8 the installer is RUN against a sandbox HOME — SKIPPED: §F could not stage the installer here (no usable git checkout), so the pin-root refusal is witnessed only by scripts/mac-pin-parity.test.sh §B8 in this run"
+fi
 
 echo
 if [ "$FAIL" -eq 0 ]; then
