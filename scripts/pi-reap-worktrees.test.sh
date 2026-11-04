@@ -616,10 +616,18 @@ ENV=G4; REPO="$(mk_repo $ENV)"
 WT_LIVE="$(add_named_wt "$REPO" "$ENV-proc" feat/g4-proc)"
 FAKE_PS_LIVE_PATH="$WT_LIVE" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_LIVE")" "reason=live-process" "G4a live process argv holds the path => preserve"
+# ...and the row carries its RULE and its WITNESS. Restored after the holder scan was refactored into
+# `holders_live` (review round 1, P3): that refactor's row lost both fields, and a live-holder row is
+# the largest class in a real pass (57 of 77 records on cell-4), so a class that prints no `rule=` is a
+# class the pass record cannot count. The proof token names WHICH witness held it.
+assert_contains "$(row_for "$OUT" "$WT_LIVE")" "rule=1 proof=ps-argv:" \
+    "G4a2 a live-process row names its rule and its witness (argv), so the pass record is countable"
 FAKE_PS_LIVE_PATH=""
 FAKE_LSOF_CWD="$WT_LIVE" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_LIVE")" "reason=live-cwd" \
     "G4b process cwd inside the path => preserve (argv alone would miss it)"
+assert_contains "$(row_for "$OUT" "$WT_LIVE")" "rule=1 proof=lsof-cwd-prefix:" \
+    "G4b2 ...and a live-cwd row is countable by rule and names the cwd witness"
 FAKE_LSOF_CWD=""
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_LIVE")" "reason=reclaimable" \
@@ -2315,6 +2323,12 @@ mkdir -p "$WT_ETIME/.venv"; printf 'x\n' >"$WT_ETIME/.venv/marker"
 # `now` is the REAL clock here: the suite's fixed fixture date would put HEAD 39 days in the FUTURE,
 # and a start-before-HEAD comparison against a future HEAD can never hold. Only the AGE floor is
 # overridden, so the schedule gate allows the removal and the HOLDER rule is the only thing under test.
+# ⛔ AND RULE 7 IS NEUTRALISED TOO (#2756/#2721, merged after this arm was written): a checkout younger
+# than `REAP_WT_MIN_AGE_MINUTES` (45) is preserved as `too-young` BEFORE any removal rule is reached,
+# and this fixture's worktree-ctime witness is seconds old — so on a tree carrying rule 7 the arm read
+# `preserve/too-young` and its two assertions went red for a reason that has nothing to do with `etime`.
+# The floor is a SECOND age gate with its own knob; neutralising only `REAP_WT_AGED_DAYS_OVERRIDE`
+# (the schedule gate) leaves the stricter one in place.
 RNOW="$(date +%s)"
 ETIME_TS=$(( RNOW - 1000 ))
 commit_in_wt "$WT_ETIME" "@$ETIME_TS" etime
@@ -2324,15 +2338,17 @@ mkdir -p "$T/seq-gl"
 # CONTROL FIRST: with `ps` unable to report a start time at all, the holder is UNPROVABLE and must stay
 # LIVE. Without this arm a gate that demoted every shell would pass the assertion below.
 OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gl" REAP_WT_PROC_ROOT="$T/no-proc" FAKE_ETIMES= REAP_ETIME=\
-    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 REAP_WT_MIN_AGE_MINUTES=0 \
     run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
 assert_contains "$(row_for "$OUT" "$WT_ETIME")" "reason=live" \
     "G2721l a holder whose start time cannot be read at all stays LIVE (unprovable is not stale)"
 # ...and with `1:08:30`, the pre-fix parse ABORTS (bash: 08: value too great for base) and prints the
 # SAME live verdict — the mutation is invisible above. `10#` is what makes the demotion possible.
 OUT="$(FAKE_PS_SEQ_DIR="$T/seq-gl" REAP_WT_PROC_ROOT="$T/no-proc" FAKE_ETIME='1:08:30' \
-    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$RNOW" REAP_WT_AGED_DAYS_OVERRIDE=0 REAP_WT_MIN_AGE_MINUTES=0 \
     run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"
+printf 'DEBUG ROW: [%s]\n' "$(row_for "$OUT" "$WT_ETIME")"
+printf 'DEBUG OUT TAIL:\n%s\n' "$(printf '%s' "$OUT" | tail -5)"
 assert_contains "$(row_for "$OUT" "$WT_ETIME")" "reason=reclaimable" \
     "G2721l ...and a 1:08:30 idle shell that predates HEAD is DEMOTED (the hours component is parsed)"
 assert_contains "$(row_for "$OUT" "$WT_ETIME")" "unref=stale-shell: pid=65000(argv)" \

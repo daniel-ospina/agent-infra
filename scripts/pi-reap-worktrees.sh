@@ -1447,7 +1447,18 @@ classify_one() {
     # right once. `holders_live` is shared by both call sites for exactly that reason.
     local stale_txt=""
     if holders_live "$canon" "$path" "$sha"; then
-        printf 'preserve\t%s\t\tpid %s holds the path\n' "$HL_VERDICT" "$HL_DETAIL"; return 0
+        # ⛔ THE ROW KEEPS MAIN'S `rule=1`/`proof=` SHAPE (#2756): the holder scan was refactored into
+        # `holders_live` here (review round 1, P3 — the same evidence is consulted at removal time), and
+        # the refactor lost the two evidence fields the pre-refactor rows carried. A live-holder row is
+        # the LARGEST class in a real pass (57 of 77 records on cell-4), and the rule table is read by
+        # `rule=` — a class that prints none is a class an operator cannot count. The proof token names
+        # WHICH witness held it (argv vs cwd), which is the difference between a lane and a bystander.
+        case "$HL_VERDICT" in
+            live-process) printf 'preserve\tlive-process\t\trule=1 proof=ps-argv:pid=%s holds the path\n' "$HL_DETAIL" ;;
+            live-cwd)     printf 'preserve\tlive-cwd\t\trule=1 proof=lsof-cwd-prefix:pid=%s has cwd inside the path\n' "$HL_DETAIL" ;;
+            *)            printf 'preserve\t%s\t\trule=1 pid=%s holds the path\n' "$HL_VERDICT" "$HL_DETAIL" ;;
+        esac
+        return 0
     fi
     [ -n "$HL_STALE" ] && stale_txt="stale-shell:$HL_STALE"
 
