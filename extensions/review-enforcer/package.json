@@ -1,8 +1,0 @@
-{
-  "name": "review-enforcer",
-  "private": true,
-  "type": "module",
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.85.1"
-  }
-}
