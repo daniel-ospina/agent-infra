@@ -1295,6 +1295,18 @@ import json, sys
 t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
 sys.exit(0 if t.get("url") == "http://localhost:8000/mcp" else 1)
 PY
+# ⛔ INSTALL AND VERIFY MUST AGREE ABOUT THE ENTRY INSTALL JUST PRESERVED. They did not: the merge
+# deliberately kept a self-hosted `type: "sse"` entry, while `--verify` refused EVERY non-http `type`
+# before it ever looked at the url — so `cloud-cell-bringup.sh`'s repair loop (verify fails -> install ->
+# "operational layer present and verified") certified a layer it had just refused, and could never
+# converge, because each repair re-created the same refusal. The client picks its transport from `url`
+# alone (`extensions/mcp-client/index.ts`: `if (config.url) … StreamableHTTPClientTransport`), so `sse`
+# on a self-hosted daemon is the operator's spelling, not a fault. ONE rule, both sides.
+run_verify
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "SELFHOSTED:http://localhost:8000/mcp" "$LOG" \
+  && ok "install and verify AGREE on a preserved self-hosted entry (certified BY NAME, not refused for its transport)" \
+  || fail "--verify refused (rc=$rc) an entry install had just deliberately preserved, or did not certify it by name — the bringup repair loop then reports a refused layer as verified"
 cp "$ROOT/templates/.mcp.base.json" /tmp/_canon.tpl 2>/dev/null || true
 python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
 import json, sys
@@ -1503,6 +1515,33 @@ rc=$?
 grep -q "graph credential: UNRESOLVED" "$LOG" \
   && ok "LAYER VERIFIED states an UNRESOLVED graph credential (the 401 trap is not silent)" \
   || fail "a cell with no resolvable TORTOISE_MCP_API_KEY was certified without saying so (rc=$rc) — every lane on it will write GRAPH-UNREACHABLE"
+
+# ⛔ THE FILE PATH OF THE ALIAS RESOLVER IS THE WHOLE POINT OF THE RESOLVER, AND IT HAD NO COVERAGE.
+# Every arm above feeds the credential through the ENVIRONMENT, so `graph_key_from_env_file` could
+# regress to a line-parser — which reads `export TORTOISE_MCP_API_KEY="$TORTOISE_API_KEY"` as the
+# literal 19-character string and calls a live key malformed — with the suite still green. That is
+# the exact mistake measured while building this, so it gets an arm that can only pass by SOURCING.
+KEYHOME="$TMP/keyshome"
+mkdir -p "$KEYHOME"
+ALIAS_KEY35="t"
+ALIAS_KEY35="${ALIAS_KEY35}t_$(printf 'B%.0s' $(seq 32))"
+cat > "$KEYHOME/keys.env" <<EOF
+# the shape a LEGACY-name box carries: the standard name is an ALIAS, not a value.
+export TORTOISE_API_KEY="$ALIAS_KEY35"
+export TORTOISE_MCP_API_KEY="\$TORTOISE_API_KEY"
+EOF
+chmod 600 "$KEYHOME/keys.env"
+HOME="$KEYHOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
+  env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] \
+   && grep -qF "graph credential: resolves from $KEYHOME/keys.env (TORTOISE_MCP_API_KEY)" "$LOG" \
+   && ! grep -qF "not tt_/tk_-shaped" "$LOG"; then
+  ok "an ALIASED keys.env resolves by SOURCING (not by line-parsing), and the verdict names the file it read"
+else
+  fail "an aliased keys.env (export TORTOISE_MCP_API_KEY=\"\$TORTOISE_API_KEY\") did not resolve — a line-parser reads that as the literal string and reports a live key as malformed (rc=$rc; log: $LOG)"
+fi
 
 # skills/ was `[ -d ]` plus a non-empty `ls` until #1723's `--check` began verifying BEFORE it
 # installs: a cell holding 1 of the checkout's 124 SKILL.md files passed that check, so the fast

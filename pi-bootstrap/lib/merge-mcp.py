@@ -15,8 +15,13 @@ THE RULES, in order:
    It is NOT a "local extra to carry forward" — it was a BASE server, and a source-wins merge
    leaves every already-provisioned machine still loading it. The pop IS the migration.
 
-2. Every server the destination already declares survives untouched — EXCEPT `tortoise`, which
-   follows rule 3.
+2. A server the destination declares that the TEMPLATE DOES NOT CARRY survives untouched — that
+   is what "local extras preserved" has always meant. A server the template DOES carry is the
+   template's: replacing it is how a base-config fix reaches an already-provisioned machine, and
+   the `exa` removal above depends on exactly that direction. ⛔ Every such replacement is printed
+   as a `NOTE:` naming the server, because a silent overwrite of a hand-customized base entry is
+   indistinguishable from a merge that did nothing. `tortoise` is the ONE entry where the
+   destination's version wins, and it follows rule 3.
 
 3. `tortoise` — the graph server, and the only entry whose URL an operator is told to change
    (`templates/.mcp.base.json`'s `_comment`: self-host users point it at their own daemon):
@@ -231,6 +236,16 @@ def main(argv):
     else:
         for name, entry in base.items():
             if name != "tortoise":
+                was = have.get(name)
+                if isinstance(was, dict) and was != entry:
+                    # NOT SILENT (rule 2's second half). The template still wins — that is what makes
+                    # a base-config fix reach a provisioned machine — but replacing a
+                    # hand-customized entry is a decision the operator has to be able to see.
+                    print(
+                        "NOTE: replaced this machine's own %r with the template's (the base config is "
+                        "the source for every server except tortoise; keep a local variant under a "
+                        "different name if you need it)" % name
+                    )
                 have[name] = entry
 
     merged = {**dst, "mcpServers": have}
