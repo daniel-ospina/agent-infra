@@ -4053,7 +4053,11 @@ const DISPATCH_CLASS_REMEDIES: Record<DispatchFailureClass, string> = {
 const VERDICT_TOKEN_TAIL = "(?:\\b|:|\u2014)";
 
 function verdictLine(token: "PASS" | "FAIL"): RegExp {
-  const tok = `${token}${VERDICT_TOKEN_TAIL}`;
+  // The token is CAPTURED (one group per arm, at the end of each match) so `passAttested` can read
+  // the very token this shape anchored instead of the first token on the line: with a bare
+  // `[PASS 1/2] PASS: not verified` the first token is the one inside the bracket, and reading it
+  // would attest a line whose verdict token is negated.
+  const tok = `(${token}${VERDICT_TOKEN_TAIL})`;
   return new RegExp(
     [
       `(?:^|\\n)\\s*(?:[-*•]|\\d+\\.)?\\s*(?:>\\s*)*\\*{0,3}${tok}`, // bare / listed / bold / quoted
@@ -4112,7 +4116,14 @@ function verdictLine(token: "PASS" | "FAIL"): RegExp {
  *     wrong — but it is a different detector (a count, not a negation) and is left to a separate
  *     change rather than widening this one.
  */
-const NEGATION_LEAD = "[^\\p{L}\\p{N}]*";
+// ⛔ BOUNDED, not `*`. `NEGATION_LEAD` appears TWICE with only an optional group between them, and
+// two unbounded quantifiers over the same class backtrack polynomially: measured on this guard's own
+// source, a verdict line whose tail is a long punctuation run took 49 ms at 2 k chars, 598 ms at 8 k
+// and 1889 ms at 16 k (~32 s reported at 32 k through the plugin) — while the pre-change predicate
+// answered the same inputs in under 1 ms. The bound is also the rule's own semantics: a negation more
+// than 200 characters from the token is not ATTACHED to it. With both runs bounded the match is
+// linear (measured flat at 1-12 ms for every length above).
+const NEGATION_LEAD = "[^\\p{L}\\p{N}]{0,200}";
 const NEGATION_AUX =
   "(?:(?:is|are|was|were|be|been|being|has|have|had|does|do|did|can|could|will|would|may|might|must|should)\\s*)?";
 /**
@@ -4148,29 +4159,52 @@ function passTokenAt(line: string, from: number): RegExpExecArray | null {
   return occ.exec(line);
 }
 
-/** Does this reply ATTEST a PASS — i.e. carry a verdict line whose token is not negated? */
-function passAttested(textContent: string): boolean {
+/**
+ * Does a bounded PREFIX segment (`[still not verified]`, the text between a ✅ and the token) carry
+ * an ATTACHED negation? Anchoring only at offset 0 was the first cut's second error: any word in
+ * front of the negation defeated it, so `[still not verified] PASS` and `✅ still not verified: PASS`
+ * merged. The segment is bounded by the caller, so testing the rule at each word start is linear.
+ */
+function prefixNegates(segment: string): boolean {
+  const bounded = segment.slice(0, 200);
+  for (let i = 0; i < bounded.length; i++) {
+    if (i > 0 && /[\p{L}\p{N}]/u.test(bounded[i - 1])) continue; // start of a word only
+    if (NEGATION_AT_START.test(bounded.slice(i))) return true;
+  }
+  return false;
+}
+
+/** Does this reply ATTEST a PASS — i.e. carry a verdict line whose token is not negated?
+ *  Exported for the ReDoS non-regression case in `index.verdict-line.test.ts`: timing this predicate
+ *  directly is meaningful, whereas timing it through a git repo + a dispatch measures the box's load. */
+export function passAttested(textContent: string): boolean {
   const shape = verdictLine("PASS");
   for (const raw of textContent.split("\n")) {
     const shaped = shape.exec(raw);
     let tok: RegExpExecArray | null;
     if (shaped) {
       const bracket = NEGATED_BRACKET_PREFIX.exec(raw);
-      if (bracket && NEGATION_AT_START.test(bracket[1])) continue; // `[not verified] PASS`
-      // Read the token the SHAPE anchored, not any token on the line. A later, mid-sentence mention
-      // must not attest: `PASS is not claimed: I cannot give a PASS.` is one refusal, and
-      // `verdictLine` is line-anchored for exactly this reason.
-      tok = passTokenAt(raw, shaped.index);
+      if (bracket && prefixNegates(bracket[1])) continue; // `[not verified] PASS`, `[still not verified] PASS`
+      // Read the token the SHAPE anchored (its own capture group), not the first token on the line.
+      // A later, mid-sentence mention must not attest: `PASS is not claimed: I cannot give a PASS.`
+      // is one refusal, and `verdictLine` is line-anchored for exactly this reason.
+      const anchored = shaped[1] ?? shaped[2] ?? shaped[3];
+      tok = passTokenAt(raw, shaped.index + shaped[0].length - (anchored ?? "").length);
     } else {
       const tick = TICK_PASS.exec(raw);
       if (!tick) continue;
-      if (NEGATION_AT_START.test(tick[1])) continue; // `✅ not verified: PASS`
+      if (prefixNegates(tick[1])) continue; // `✅ not verified: PASS`
       tok = passTokenAt(raw, tick.index + tick[0].length - tick[2].length);
     }
     if (!tok) continue;
     if (!NEGATION_AT_START.test(raw.slice(tok.index + tok[0].length))) return true;
   }
   return false;
+}
+
+/** Did the reply MENTION a verdict-shaped PASS at all (negated or not)? */
+function passShapeMentioned(textContent: string): boolean {
+  return verdictLine("PASS").test(textContent) || new RegExp(`✅.*PASS${VERDICT_TOKEN_TAIL}`, "i").test(textContent);
 }
 
 /**
@@ -4222,16 +4256,12 @@ export function verdictLineDiagnostics(): string {
   if (lastVerdictLineTested === null) {
     return "\n  ⚠️ No line of the last verifier reply mentioned PASS or FAIL — there was no verdict to read.";
   }
-  // #3164: a NEGATED PASS is not a shape failure, and telling the lane that it was is the (d3)
-  // failure mode this file already pins — the remedy would point at the SHAPE of a line that was
-  // fine. Worse here: the literal compliance is to re-emit `PASS`, which turns the verifier's
-  // REFUSAL into the merge it was refusing. So the note names the negation and forbids that.
-  if (verdictLine("PASS").test(lastVerdictLineTested) && !passAttested(lastVerdictLineTested)) {
-    return (
-      `\n  ⚠️ The last verifier reply NEGATED its PASS — that is a REFUSAL, not a verdict: "${lastVerdictLineTested}"`
-      + " — the gate accepted the SHAPE and refused the CONTENT. Do NOT re-emit `PASS`: fix what the verifier named, then verify again."
-    );
-  }
+  // #3164: a NEGATED PASS never renders here. It is blocked as a JUDGMENT (`fail-verdict`) before
+  // this note's guard (`FORMAT_CLASSES`) can reach it, and `fail-verdict`'s own remedy says the right
+  // thing ("address the failures it listed, fix the files"). An earlier cut added a negation-specific
+  // branch here; it was removed because it was UNREACHABLE — and because keying it on
+  // `verdictLine("PASS")` would have missed the ✅ arm, rendering the generic shapes hint (i.e. the
+  // re-emit-a-PASS instruction) for a ✅ refusal. Review r1/r2 both found that gap independently.
   return (
     `\n  ⚠️ The last verifier reply mentioned a verdict on this line, and the gate did NOT read it as one: "${lastVerdictLineTested}"`
     + " — an accepted verdict line is `PASS` / `Result: PASS` / `> PASS` / `[16:42] PASS` on its own line, or the exact JSON shape."
@@ -5133,6 +5163,25 @@ export default function (pi: ExtensionAPI) {
       // a shape cannot express: the token must not be negated. A negated FAIL keeps blocking above
       // (fail-closed) — this narrows PASS acceptance only.
       const hasPass = passAttested(textContent);
+
+      // #3164: a reply whose verdict-shaped PASS tokens are ALL negated is a REFUSAL — a JUDGMENT
+      // ("I cannot attest, and here is why"), like a FAIL. It must block HERE, not fall through:
+      //   * the fall-through is `recordDispatchFailure("unparseable")`, so the lane is handed the
+      //     FORMAT remedy ("re-dispatch with PASS on its own line") — the very re-emit that turns the
+      //     verifier's refusal into the merge it refused (the (d3)/#7591 failure, one class over);
+      //   * it would also count a legitimate refusal toward the #132 one-way latch
+      //     (`vgateFailures` >= 3 disables the gate for the session), which #132 explicitly forbids
+      //     for a judgment — "3 legitimate FAIL verdicts must not silently disable the gate";
+      //   * in INTERACTIVE mode it would reach the #5724 fail-open and MERGE the prompt's files
+      //     (measured: `fail-open: merged 1/1`). The fail-open decision is untouched here; a refusal
+      //     simply never reaches it. This is what makes the fix hold in BOTH modes.
+      if (!hasPass && passShapeMentioned(textContent)) {
+        console.error("[verification-gate] \u274c Verifier REFUSED to attest (its PASS is negated): keep blocking, no merge");
+        recordDispatchJudgment("fail-verdict"); // #561/#132: judgment class — remedy text only, streak unchanged
+        lastBlockedCwd = null;   // consume stale block state (#5607)
+        lastBlockedFiles = [];
+        return undefined;
+      }
 
       if (hasPass) {
         // #1660: the prompt's explicit `Project root:` is authoritative; the

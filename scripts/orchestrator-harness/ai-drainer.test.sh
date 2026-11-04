@@ -828,6 +828,19 @@ SC_EOF
       && grep -q "active" <<<"$out"' "rc=$rc · $(printf "%s" "$out" | tail -1)"
   check "installer: the installed service carries an ExecStart" \
     'grep -q "^ExecStart=" "$T/units/eldato-ai-drainer.service"'
+  # ⛔ THE UNIT IS AN `Environment=` PIN, SO WHATEVER IS RENDERED HERE WINS FOREVER (agent-infra#2888
+  # review, P2 — verified). It used to render a retired 3000 s literal, which shadowed
+  # ai-drainer.sh's own `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` on every installed box: drainer lanes
+  # stayed capped at 50 min (300 s above the 2700 s progress allowance) and raising the seam changed
+  # nothing there — the censoring surviving on the box whose job is to drain the backlog. Rendered with
+  # LANE_TIMEOUT scrubbed so this measures the SEAM, not whatever the harness env happens to carry.
+  T4="$ROOT/inst4"; mkdir -p "$T4"
+  SEAM_T="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/spawn-gate.sh" | head -1)"
+  ( unset LANE_TIMEOUT; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+      DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" >/dev/null 2>&1 )
+  check "installer: the installed unit pins LANE_TIMEOUT to the SEAM (${SEAM_T:-?}s), not a retired 3000s literal" \
+    'v="$(sed -n "s/^Environment=LANE_TIMEOUT=//p" "$T4/units/eldato-ai-drainer.service" 2>/dev/null)"; [ -n "$SEAM_T" ] && [ "$v" = "$SEAM_T" ]' \
+    "rendered='$(sed -n 's/^Environment=LANE_TIMEOUT=//p' "$T4/units/eldato-ai-drainer.service" 2>/dev/null)' seam='${SEAM_T:-}'"
 else
   bad "installer missing at $INSTALLER"
 fi
