@@ -38,13 +38,21 @@
 # Run: bash repo-target.test.sh            (and `--nonvacuity <rev>` to re-measure the pre-fix tree)
 set -u
 
+# ⛔ THE DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395), AND THIS IS TEST HYGIENE.
+# C3 drives the SHIPPED `fix-one.sh`, which now asks the disk predicate through `wt_provision` BEFORE
+# it creates a worktree — so without this the arm is decided by THIS HOST's free space (measured: a
+# `df` reporting 3,584 MB flips C3 from rc=75 to rc=77 on an otherwise-green box, and the arm's
+# failure text then blames worktree materialisation). The idiom is the one `wt-lifecycle.test.sh` and
+# `harness-refresh.test.sh` already use; the gate's own behaviour is pinned in `disk-admission.test.sh`,
+# which STUBS `df` and therefore measures the gate rather than the host.
+export DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RT="$HERE/repo-target.sh"
 LANE="$HERE/lane.sh"
 FIX="$HERE/fix-one.sh"
 DM="$HERE/dispatch-merge.sh"
 for f in "$RT" "$LANE" "$FIX" "$DM"; do [ -f "$f" ] || { echo "❌ missing $f"; exit 2; }; done
-
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }

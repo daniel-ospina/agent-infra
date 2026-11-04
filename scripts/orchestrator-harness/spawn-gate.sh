@@ -361,8 +361,8 @@ python_target() { # python_target <path>
 # IN ONE PLACE, BECAUSE TWO SEAMS NOW READ THEM (review round 2, P2). `disk_lane_costs` (the live arm,
 # below) and `disk_worktree_terms` (the PRE-START seam, above) must not carry separate literals: raise
 # one and the other goes on admitting on the old number — which is #3395's own defect (a refusal one
-# step too late) wearing a constant instead of an ordering. `diskW_LANE_*_PY` are the shipped numbers,
-# overridable per cell only through the `DISK_LANE_*_MB` seams.
+# step too late) wearing a constant instead of an ordering. `DISK_LANE_*_PY_DEFAULT` are the shipped
+# numbers, overridable per cell only through the `DISK_LANE_*_MB` seams.
 DISK_LANE_TREE_PY_DEFAULT=350
 DISK_LANE_SELF_PY_DEFAULT=6144
 
@@ -532,8 +532,13 @@ disk_mb_gb() { # <mb>
 # the input class this file says it tolerates, so the validated terms are emitted in ONE place.
 disk_worktree_terms() { # -> "<self> <reserve>", both validated integers
   local self reserve
-  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; else self=6144; fi
-  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve=$(( 10#$DISK_MIN_FREE_MB * 4 )); fi
+  # ⛔ THE DEFAULTS ARE THE NAMED CONSTANTS / THE ONE RESERVE PROBE, NEVER A COPY (review rounds 2
+  # and 3, P2/P3): `disk_lane_costs` (the live arm) and this seam must not carry separate literals —
+  # raise one and the other goes on admitting on the old number, which is #3395's defect wearing a
+  # constant instead of an ordering. (The grep at review round 3 found the literals still here; the
+  # round-2 edit had not landed. It has now, and the seam==live arm asserts it.)
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; else self="$DISK_LANE_SELF_PY_DEFAULT"; fi
+  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve="$(disk_lane_reserve_default)"; fi
   printf '%s %s\n' "$self" "$reserve"
 }
 
@@ -541,7 +546,7 @@ disk_worktree_need() { # -> the MB a worktree creation must find free
   local self reserve
   self="$(disk_worktree_terms | awk '{print $1}')"
   reserve="$(disk_worktree_terms | awk '{print $2}')"
-  case "${self:-}" in ''|*[!0-9]*) self=6144 ;; esac
+  case "${self:-}" in ''|*[!0-9]*) self="$DISK_LANE_SELF_PY_DEFAULT" ;; esac
   case "${reserve:-}" in ''|*[!0-9]*) reserve=0 ;; esac
   # ⛔ AN EXPLICIT `0` IS HONOURED, exactly as `disk_lane_costs` honours it (the file's own word: the
   # test seam neutralises the terms in one place, and 0 is a STATED choice). Only an ABSENT/garbled
@@ -553,7 +558,11 @@ disk_worktree_need() { # -> the MB a worktree creation must find free
 
 # disk_admit <target-path> [<label>] — THE PRE-START DISK ADMISSION.
 #   prints ONE line on a refusal (nothing on admission unless DISK_ADMIT_VERBOSE=1)
-#   returns 0 ADMITTED · 77 REFUSED (`DISK_ADMIT_VERDICT` says which arm)
+#   returns 0 ADMITTED · 77 REFUSED; the verdict LINE is the interface (`DISK_ADMIT_LINE`, empty on
+#   admission) — the arm a caller needs to tell apart is `REFUSED-DISK` vs `REFUSED-UNKNOWN`, and it
+#   is IN that line, which is what the callers quote. ⛔ THERE IS NO `DISK_ADMIT_VERDICT` ANY MORE
+#   (review round 3, P3): it was documented as the interface and had no reader anywhere, so a caller
+#   written to the docs would have read a variable that told it nothing.
 # The verdict is in THREE parts, and all three are load-bearing: `REFUSED-DISK` (a reading we took and
 # compared — the arithmetic is printed so it can be re-done from the line), `REFUSED-UNKNOWN` (a
 # reading we could NOT take — the pre-start fail-closed arm), and `free`/`need`/`box` as named terms.
@@ -579,7 +588,6 @@ disk_worktree_need() { # -> the MB a worktree creation must find free
 # would have admitted, until an operator states a smaller worst case with DISK_LANE_SELF_MB.
 disk_admit() { # <target> [<label>]
   local target="${1:-.}" label="${2:-disk-admit}" free need box self reserve
-  DISK_ADMIT_VERDICT="admit"
   DISK_ADMIT_LINE=""
   need="$(disk_worktree_need)"
   self="$(disk_worktree_terms | awk '{print $1}')"
@@ -587,7 +595,6 @@ disk_admit() { # <target> [<label>]
   box="$(disk_box_id)"
   free="$(disk_free_mb_target "$target")"
   if ! disk_readable "$free"; then
-    DISK_ADMIT_VERDICT="unknown"
     DISK_ADMIT_LINE="[disk-admit] REFUSED-UNKNOWN $label: free=? need=$(disk_mb_gb "$need") box=$box target=$target — the free-space probe could not answer (no readable \`df\` for that path or its nearest EXISTING ancestor), so the lane's headroom CANNOT be verified. Nothing was created, no worktree, no branch; a PRE-START admission fails CLOSED (an unmeasurable box is not an empty one). Check PATH/'df' on this box, or pass the volume explicitly (agent-infra#3395/#3231)"
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
@@ -599,7 +606,6 @@ disk_admit() { # <target> [<label>]
   # created — where every other predicate in this file refuses an uncomparable reading. Written as
   # `need <= free`, an errored comparison is FALSE, i.e. a refusal.
   if ! [ "$need" -le "$free" ]; then
-    DISK_ADMIT_VERDICT="disk"
     DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$free"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$free, need_mb=$need) $label: $free MB free on $target < ${need}MB required (one lane's measured worst case ${self}MB + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
