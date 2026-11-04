@@ -1249,6 +1249,102 @@ FB="$T/$ENV_AA/preserve-fb"; mkdir -p "$FB/2020-01-01"
 REAP_WT_PRESERVE_DIR_OVERRIDE=/proc/nonexistent/reaped-evidence REAP_WT_PRESERVE_FALLBACKS_OVERRIDE="$FB" \
     run_reaper $ENV_AA --apply --repo "$REPO_PV" >/dev/null 2>&1
 assert_nodir "$FB/2020-01-01" "G2aa the FALLBACK root is pruned as well (an unbounded fallback is a sink on the full box)"
+# ── G2j: TWO DETACHED CHECKOUTS AT ONE COMMIT MUST NOT SHARE A CAPTURE ─────
+# A detached row carries `br="-"` (wt_list_load's `detached)` arm), NOT an empty string, so a
+# branch-derived slug is `-` for EVERY detached checkout and the `detached` fallback never fires. Two
+# detached checkouts sitting at the SAME commit therefore resolve to the same `<day>/-.<sha8>` — and
+# the second capture's `rm -f "$tarf"` plus truncating writes destroyed the first lane's
+# `lane-evidence.tar.gz` (the mandatory per-lane report) at the exact moment its tree was destroyed,
+# with both rows logging PRESERVED against one directory. That is the one artefact gate (b) exists to
+# keep, and **no case in this suite could see it**: the fixtures all sat at different commits, and the
+# idempotence assertion counts archives, so a collision read as "1 archive" and passed.
+# The key now carries a `cksum` digest of the checkout PATH (an identity, not a security boundary), so
+# the case below is the proof: TWO checkouts, ONE commit, TWO captures, each keeping ITS OWN content.
+# Under the pre-fix key this case reads ONE archive and `first-lane-report` is GONE — the destruction
+# itself, not a naming preference.
+ENV_PV2="$ENV-pv2"
+REPO_PV2="$(mk_repo "$ENV_PV2")"
+printf '%s\n' '.worktree-report/' 'WORKTREE-REPORT.md' 'scripts' >"$REPO_PV2/.gitignore"
+"$REAL_GIT" -C "$REPO_PV2" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO_PV2" commit -qm ignore3
+# The PR gate only exists where it is APPLICABLE (a github.com origin); the fake gh below carries a ref
+# that matches NO row, so the PR state can neither veto nor explain either checkout.
+"$REAL_GIT" -C "$REPO_PV2" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+mkdir -p "$T/$ENV_PV2/agent-infra-scripts"
+# detached_wt <repo> <dir> — a DETACHED worktree; echoes the path AS GIT RECORDS IT (git resolves
+# symlinks, and the reaper compares against git's own record, never against the argument).
+detached_wt() {
+    local repo="$1" d="$2" base
+    base="$(basename "$d")"
+    "$REAL_GIT" -C "$repo" worktree add -q --detach "$d" main
+    "$REAL_GIT" -C "$repo" worktree list --porcelain | awk -v b="$base" '
+        /^worktree / { p = substr($0, 10) }
+        /^detached$/ { if (p ~ ("/" b "$")) { print p; exit } }'
+}
+WT_DET1="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det1")"
+WT_DET2="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det2")"
+mk_evidence "$WT_DET1" '# LANE REPORT
+first-lane-report'
+mk_evidence "$WT_DET2" '# LANE REPORT
+second-lane-report'
+ln -s "$T/$ENV_PV2/agent-infra-scripts" "$WT_DET1/scripts"
+ln -s "$T/$ENV_PV2/agent-infra-scripts" "$WT_DET2/scripts"
+assert_eq "$("$REAL_GIT" -C "$WT_DET1" rev-parse HEAD)" "$("$REAL_GIT" -C "$WT_DET2" rev-parse HEAD)" \
+    "G2j precondition: both detached checkouts sit at ONE commit (the colliding shape)"
+PV2_DIR="$T/$ENV_PV2/preserve"
+cap_dir_for() { # <preserve-root> <checkout-path> — every capture directory whose manifest names it
+    grep -l "^path=$2\$" "$1"/*/*/manifest.txt 2>/dev/null | while IFS= read -r m; do
+        dirname "$m"
+    done
+}
+FAKE_GH_REFS="feat/g2j-none" run_reaper $ENV_PV2 --apply --repo "$REPO_PV2" >/dev/null 2>&1
+assert_nodir "$WT_DET1" "G2j --apply removed the first detached checkout"
+assert_nodir "$WT_DET2" "G2j --apply removed the second detached checkout"
+assert_eq "$(ls -d "$PV2_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "2" \
+    "G2j ⛔ TWO captures, not one — a shared key destroys the first lane's report"
+D1DIR="$(cap_dir_for "$PV2_DIR" "$WT_DET1" | head -1)"
+D2DIR="$(cap_dir_for "$PV2_DIR" "$WT_DET2" | head -1)"
+if [ -n "$D1DIR" ] && [ -n "$D2DIR" ] && [ "$D1DIR" != "$D2DIR" ]; then
+    ok "G2j each checkout has its own capture directory (the key identifies the checkout, not the branch)"
+else
+    bad "G2j the two captures share one directory ('$D1DIR' / '$D2DIR')"
+fi
+assert_contains "$(tar -xzOf "$D1DIR/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "first-lane-report" \
+    "G2j ⛔ the FIRST lane's report SURVIVED — the second capture did not overwrite it"
+assert_contains "$(tar -xzOf "$D2DIR/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "second-lane-report" \
+    "G2j the second lane's report is its own, in its own capture"
+assert_absent "$(tar -xzOf "$D1DIR/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "second-lane-report" \
+    "G2j the first capture was not rewritten by the later one (no truncation under a shared key)"
+assert_contains "$(cat "$D1DIR/manifest.txt" 2>/dev/null)" "path=$WT_DET1" \
+    "G2j the first capture's manifest still names ITS checkout"
+# ── G2k: an EXISTING capture is never reused, even for the SAME checkout ────────
+# The digest keys the path, so a re-dispatch onto the same path, branch and head within one UTC day
+# produces the same directory. The `rm -f "$tarf"` + truncating writes of that second capture destroyed
+# the first lane's evidence AFTER its tree was gone. An occupied directory must get a unique sibling:
+# the earlier capture keeps its BYTES, and the new one is a separate, complete capture.
+WT_DET3="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det3")"
+mk_evidence "$WT_DET3" '# LANE REPORT
+third-lane-report-v1'
+FAKE_GH_REFS="feat/g2j-none" run_reaper $ENV_PV2 --apply --repo "$REPO_PV2" >/dev/null 2>&1
+CAP3A="$(cap_dir_for "$PV2_DIR" "$WT_DET3" | head -1)"
+assert_contains "$(tar -tzf "$CAP3A/lane-evidence.tar.gz" 2>/dev/null)" "WORKTREE-REPORT.md" \
+    "G2k precondition: the first capture of the third checkout exists and holds its report"
+CAP3A_SUM="$(cksum "$CAP3A/lane-evidence.tar.gz" 2>/dev/null)"
+# The SAME checkout path again (a re-dispatch onto one path), with different content this time.
+WT_DET3B="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det3")"
+mk_evidence "$WT_DET3B" '# LANE REPORT
+third-lane-report-v2'
+FAKE_GH_REFS="feat/g2j-none" run_reaper $ENV_PV2 --apply --repo "$REPO_PV2" >/dev/null 2>&1
+CAP3B="$(cap_dir_for "$PV2_DIR" "$WT_DET3" | grep -vxF "$CAP3A" | head -1)"
+assert_eq "$(cksum "$CAP3A/lane-evidence.tar.gz" 2>/dev/null)" "$CAP3A_SUM" \
+    "G2k ⛔ the pre-existing capture was NOT overwritten (never delete a capture that exists)"
+if [ -n "$CAP3B" ] && [ "$CAP3B" != "$CAP3A" ]; then
+    ok "G2k the second capture took a unique sibling beside the occupied one ($(basename "$CAP3A") -> $(basename "$CAP3B"))"
+else
+    bad "G2k the second capture reused or destroyed the occupied one ('$CAP3A' / '$CAP3B')"
+fi
+assert_contains "$(tar -xzOf "$CAP3B/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "third-lane-report-v2" \
+    "G2k the new capture holds the NEW content, and the earlier one was preserved beside it"
 
 # ── G3: reachable gate (detached HEAD only) ────────────────────────────
 ENV=G3; REPO="$(mk_repo $ENV)"
