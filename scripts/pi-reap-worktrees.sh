@@ -2022,31 +2022,45 @@ EOF
 }
 
 # evidence_signature <path> <root>... — a CONTENT signature of the tolerated lane-evidence roots:
-# one `<crc> <size> <path>` line per file (`cksum`, POSIX), plus a line for a root that is itself a
-# file. Both sides of the post-archive comparison are produced by THIS function, so no two tools' output
-# formats are ever compared — GNU `tar -t` QUOTES member names (`back\slash`, `a\tb`, non-ASCII under a
-# C locale) while `find` prints raw bytes, which made a name-listing comparison differ forever on any
-# such file and turn every pass into a silent, green, permanent preserve (review of #3422 round 9).
-# A size+CRC line also catches the case a NAME listing cannot: a member that EXISTED at archive time and
-# was appended to (or rewritten) during the archive — the lane's own `run.log`/`WORKTREE-REPORT.md`
-# regeneration, which is precisely the data gate (b) exists to keep.
+# one `<crc> <size> <path>` line per file (`cksum`, POSIX). Both sides of the post-archive comparison are
+# produced by THIS function, so no two tools' output formats are ever compared — GNU `tar -t` QUOTES
+# member names (`back\slash`, `a\tb`, non-ASCII under a C locale) while `find` prints raw bytes, which
+# made a name-listing comparison differ forever on any such file and turn every pass into a silent,
+# green, permanent preserve (review of #3422 round 9). A size+CRC line also catches what a NAME listing
+# cannot: a member that existed at archive time and was appended to or rewritten during it.
 #
-# Returns non-zero when the walk itself fails, so the caller can FAIL the removal (red) instead of
-# mistaking "could not read" for "nothing there": an empty signature on both sides would otherwise
-# compare EQUAL and let a checkout with unlisted evidence be removed (review of #3422 round 9, P2).
+# Return codes are a VERDICT, not a boolean (review of #3422 round 10, P1):
+#   0  the signature was taken
+#   1  the walk could not be completed  => the caller FAILS the removal (RED, exit 4)
+#   2  the evidence set exceeds EVIDENCE_SIG_MAX lines => the caller PRESERVES with a NAMED verdict
+# ⛔ AND NO `head -c`: it stops reading, `sort` dies on SIGPIPE (141), and under `pipefail` a perfectly
+# readable tree reds the row forever with the wrong diagnosis ("could not be walked") — measured. The cap
+# is applied with `awk` (which consumes the whole stream) as ONE line past the limit, so an over-large
+# set is DETECTED rather than silently truncated to a pseudo-random subset of files.
+EVIDENCE_SIG_MAX="${REAP_WT_EVIDENCE_SIG_MAX:-2048}"
 evidence_signature() {
-    local path="$1" r rc=0 out
+    local path="$1" r sig n rc
     shift
-    for r in "$@"; do
-        case "$r" in ''|'<none>'|*/*) continue ;; esac
-        if fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
-            out="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r" -type f -exec cksum {} +)" \
-                || return 1
-        else
-            out="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r")" || return 1
-        fi
-        printf '%s\n' "$out"
-    done | sed '/^$/d' | sort -u | head -c 262144
+    sig="$(
+        for r in "$@"; do
+            case "$r" in ''|'<none>'|*/*) continue ;; esac
+            # The trailing `/` makes `find` follow a SYMLINKED root: without it the walk emits nothing
+            # while `fs_isdir_bounded` says "dir" and `tar` stores only the link, so a symlinked
+            # `.worktree-report` would compare equal on both sides and be destroyed with the checkout
+            # (review of #3422 round 10, P3).
+            if fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
+                fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r/" -type f -exec cksum {} + || exit 3
+            else
+                fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r" || exit 3
+            fi
+        done | sed '/^$/d' | sort -u | awk -v n="$EVIDENCE_SIG_MAX" 'NR <= n + 1'
+    )"
+    rc=$?
+    [ "$rc" = 0 ] || return 1
+    n="$(printf '%s\n' "$sig" | grep -c .)"
+    [ "$n" -le "$EVIDENCE_SIG_MAX" ] || return 2
+    printf '%s' "$sig"
+    return 0
 }
 
 # prune_preserve_archive — bound the new sink, across EVERY root an archive can land in (configured
@@ -3732,7 +3746,7 @@ holder_recheck() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local ev_archived ev_now ev_before ev_sig_before ev_sig_now
+    local ev_archived ev_now ev_before ev_sig_before ev_sig_now sig_rc
     local path="$1" sha="$2" br="${3:-}" why="${4:-}" presv=""
     local eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
@@ -3813,11 +3827,16 @@ remove_one() {
         ev_sig_before=""
         if [ -n "$ev_before" ]; then
             # shellcheck disable=SC2086
-            ev_sig_before="$(evidence_signature "$path" $ev_before)" || {
+            ev_sig_before="$(evidence_signature "$path" $ev_before)"; sig_rc=$?
+            if [ "$sig_rc" = 2 ]; then
+                REMOVE_SKIP_VERDICT="lane-evidence-too-large"
+                log "REMOVE-SKIP $path lane evidence exceeds $EVIDENCE_SIG_MAX files — its stability across the archive cannot be proven, nothing removed (the archive is kept)"
+                rm -f "$out"; return 2
+            elif [ "$sig_rc" != 0 ]; then
                 REMOVE_SKIP_VERDICT="evidence-unreadable"
                 log "PRESERVE-SKIP $path lane evidence could not be walked before the archive — nothing removed, and this pass is RED"
                 rm -f "$out"; return 1
-            }
+            fi
         fi
         if ! presv="$(preserve_before_removal "$path" "$sha" "$br" "${why:-reclaimable}")"; then
             REMOVE_SKIP_VERDICT="preserve-failed"
@@ -3875,11 +3894,16 @@ remove_one() {
         # empty set that compares equal to another empty set.
         if [ "$ev_now" != "<none>" ]; then
             # shellcheck disable=SC2086
-            ev_sig_now="$(evidence_signature "$path" $ev_now)" || {
+            ev_sig_now="$(evidence_signature "$path" $ev_now)"; sig_rc=$?
+            if [ "$sig_rc" = 2 ]; then
+                REMOVE_SKIP_VERDICT="lane-evidence-too-large"
+                log "REMOVE-SKIP $path lane evidence exceeds $EVIDENCE_SIG_MAX files after the archive — its stability cannot be proven, nothing removed (the archive is kept)"
+                rm -f "$out"; return 2
+            elif [ "$sig_rc" != 0 ]; then
                 REMOVE_SKIP_VERDICT="evidence-unreadable"
                 log "PRESERVE-SKIP $path lane evidence could not be walked after the archive — nothing removed, and this pass is RED"
                 rm -f "$out"; return 1
-            }
+            fi
             if [ "$ev_sig_now" != "$ev_sig_before" ]; then
                 REMOVE_SKIP_VERDICT="lane-evidence-changed"
                 log "REMOVE-SKIP $path lane evidence CHANGED during the archive ($(printf '%s' "$ev_sig_before" | grep -c .) -> $(printf '%s' "$ev_sig_now" | grep -c .) files) — nothing removed, the archive is kept"

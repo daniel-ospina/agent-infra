@@ -2623,6 +2623,59 @@ printf 'stage1\n' >"$WT_H2/.worktree-report/run.log"
 rm -f "$T/$ENV/cnt-h2"
 OUT="$(REAPER_OVERRIDE="$MUT7" GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_H2/.worktree-report/run.log" \
     FAKE_LATE_COUNTER="$T/$ENV/cnt-h2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
+# A21j — AN OVER-LARGE EVIDENCE SET IS A NAMED PRESERVE, AND THE CAP MUST NOT SIGPIPE (review of #3422
+# round 10, P1). `head -c` stopped reading, `sort` died on SIGPIPE (141) and `pipefail` made a perfectly
+# readable tree RED forever with the wrong diagnosis — and the truncation it did apply compared a
+# pseudo-random subset of files, so a change past the cut was invisible. The cap is now applied with awk
+# (which consumes the stream) and crossing it is `lane-evidence-too-large` (PRESERVE, named).
+ENV=A21j; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21j)'
+WT_J="$(add_named_wt "$REPO" "$ENV-late" feat/a21j-late)"
+mkdir -p "$WT_J/.venv/bin" "$WT_J/.worktree-report"
+printf 'py\n' >"$WT_J/.venv/bin/python"
+i=0; while [ "$i" -lt 8 ]; do printf 'x\n' >"$WT_J/.worktree-report/a-$i.log"; i=$((i + 1)); done
+# The cap is a seam so the arm does not have to create thousands of files (the fixture would take
+# minutes on a loaded box); the CODE PATH is identical.
+EVIDENCE_SIG_MAX=5 OUT="$(REAP_WT_EVIDENCE_SIG_MAX=5 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21j an over-large evidence set does NOT red the pass (no SIGPIPE: exit 0, not 4)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "exceeds $EVIDENCE_SIG_MAX files" \
+    "A21j …it is a NAMED verdict (lane-evidence-too-large), not a fabricated 'could not be walked'"
+assert_dir "$WT_J" "A21j nothing was removed (stability across the archive cannot be proven)"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21j …and the footer agrees"
+# control: with the DEFAULT cap the same fixture is reclaimed — the cap is not a blanket veto
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_J" "A21j control: under the default cap the same fixture IS reclaimed (not a veto)"
+
+# A21k — a SYMLINKED tolerated root is WALKED (review of #3422 round 10, P3). `find` does not follow its
+# operand without a trailing slash, while `fs_isdir_bounded` says "dir" and `tar` stores only the link —
+# so the CONTENT behind a symlinked `.worktree-report` was never compared. The signature now uses
+# `find "$path/$r/"`, and the walk's operand is what this asserts: the run below reaches the archive for
+# a symlinked root, and `find` is invoked with a trailing slash on it (checked through a recording
+# wrapper), which is the difference between "compared" and "a bare link".
+ENV=A21k; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21k)'
+mkdir -p "$T/$ENV-evidence"; printf 'keep me\n' >"$T/$ENV-evidence/report.md"
+WT_K="$(add_named_wt "$REPO" "$ENV-late" feat/a21k-late)"
+mkdir -p "$WT_K/.venv/bin"; printf 'py\n' >"$WT_K/.venv/bin/python"
+ln -s "$T/$ENV-evidence" "$WT_K/.worktree-report"
+cat >"$T/bin/find-recording" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FIND_ARGS_LOG:?}"
+exec find "$@"
+SHIM
+chmod +x "$T/bin/find-recording"
+: >"$T/$ENV/find-args"
+OUT="$(REAP_WT_FIND_BIN="$T/bin/find-recording" FIND_ARGS_LOG="$T/$ENV/find-args" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+if grep -qF '.worktree-report/' "$T/$ENV/find-args" 2>/dev/null; then
+    ok "A21k a SYMLINKED evidence root is walked WITH A TRAILING SLASH (its content is compared, not a bare link)"
+else
+    bad "A21k the walk did not use a trailing-slash operand on the symlinked root — content uncompared"
+fi
+assert_eq "$RC" "0" "A21k the pass completes cleanly with a symlinked evidence root (no fabricated RED)"
 assert_nodir "$WT_H2" "A21h MUTANT GOES RED: without the signature comparison the checkout IS removed"
 assert_absent "$(cat "$WT_H2/.worktree-report/run.log" 2>/dev/null)" "stage2 appended during the archive" \
     "A21h …and the content appended during the archive is GONE (the archive only holds stage 1)"
