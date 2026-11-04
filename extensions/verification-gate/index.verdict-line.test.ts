@@ -377,6 +377,26 @@ async function main() {
     // A line attests at the token the SHAPE anchored. A later, mid-sentence mention on the same line
     // is prose, not a second verdict — `verdictLine` is line-anchored for exactly this reason.
     ["mid-sentence second mention `PASS is not claimed: I cannot give a PASS.`", "PASS is not claimed: I cannot give a PASS. Two tests are red."],
+    // ⛔ THE CONTRACTION IS A WHOLE WORD (review r3). `n['’]t` alone only fires when the apostrophe
+    // lands exactly where the guard looks — true when the contraction's STEM is itself an auxiliary
+    // (`isn't` = `is` + `n't`), false for every one whose stem is not. `can't` = `ca` + `n't`, and
+    // `NEGATION_AUX`'s `can` ate the `n`, leaving `'t`. Measured end-to-end through the real plugin
+    // factory at `ae7c7e1`: every spelling below MERGED the files. `can't` is the most common
+    // English contraction, so the exact refusal this fix exists to close was one keystroke away.
+    ["contraction `PASS can't be claimed`", "PASS can't be claimed — two tests are red."],
+    ["contraction `PASS can't be verified: 2 failing tests`", "PASS can't be verified: 2 failing tests"],
+    ["irregular `PASS won't be verified`", "PASS won't be verified until the tests are green."],
+    ["irregular `PASS needn't be claimed`", "PASS needn't be claimed here; tests are red"],
+    ["irregular `PASS shan't be claimed`", "PASS shan't be claimed"],
+    ["irregular `PASS ain't claimed`", "PASS ain't claimed"],
+    ["smart-apostrophe `PASS can’t be claimed`", "PASS can\u2019t be claimed"],
+    // …and in every OTHER shape the gate accepts, because the shape and the guard read the same line.
+    ["labelled contraction `Result: PASS can't be claimed`", "Result: PASS can't be claimed"],
+    ["bold contraction `**PASS** won't be verified`", "**PASS** won't be verified"],
+    ["listed contraction `- PASS can't be claimed`", "- PASS can't be claimed"],
+    ["blockquoted contraction `> PASS can't be claimed`", "> PASS can't be claimed"],
+    ["bracketed contraction `[16:42] PASS can't be claimed`", "[16:42] PASS can't be claimed"],
+    ["✅ arm contraction `✅ not sure: PASS won't be verified`", "\u2705 not sure: PASS won't be verified"],
   ] as [string, string][]) {
     test(`(e) ${label} BLOCKS`, async () => {
       const res = await verdictFor(reply);
@@ -448,6 +468,20 @@ async function main() {
     ok(/NEGATED its PASS/.test(reason), `the note must name the negation; got: ${reason.slice(-500)}`);
     ok(/Do NOT re-emit `PASS`/.test(reason), `the note must forbid re-emitting PASS; got: ${reason.slice(-500)}`);
     ok(!/an accepted verdict line is/.test(reason), "the shapes hint must NOT be shown — the shape was accepted, the content was not");
+  });
+  test("✅ the ✅ arm gets the NEGATION note too, not the generic shapes hint (class 5)", async () => {
+    // ⛔ The remedy's branch used to ask only `verdictLine("PASS")`, and the ✅ shape is accepted
+    // through `TICK_PASS` — which `verdictLine` does not cover. So this refusal blocked correctly and
+    // was then handed "an accepted verdict line is `PASS` / `Result: PASS` / …" about a line whose
+    // shape WAS accepted — the (d3) failure mode, and the declared class-5 hazard verbatim: the
+    // lane's most literal compliance is to re-emit `PASS`, converting the refusal into the merge.
+    // `passShapeLine` is now the ONE definition both the acceptance rule and the remedy read.
+    const res = await verdictFor("\u2705 not verified: PASS");
+    ok(res && res.block === true, "the ✅ refusal must block");
+    const reason = String(res.reason ?? "");
+    ok(/NEGATED its PASS/.test(reason), `the ✅ arm's note must name the negation; got: ${reason.slice(-500)}`);
+    ok(/Do NOT re-emit `PASS`/.test(reason), `the ✅ arm's note must forbid re-emitting PASS; got: ${reason.slice(-500)}`);
+    ok(!/an accepted verdict line is/.test(reason), "the shapes hint must NOT be shown for a ✅ refusal — its shape was accepted");
   });
   test("(e) a reply whose line was NOT a shape still gets the generic shapes hint (the note did not move)", async () => {
     const res = await verdictFor("I looked at everything and it seems fine to me.");
