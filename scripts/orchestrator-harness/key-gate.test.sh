@@ -149,9 +149,17 @@ HE="$(mkhome envonly "$DEEPSEEK_JSON")"
 printf '{"deepseek":{"type":"api_key","env":{"KG_ENVONLY_UNSET":"sk-x"}}}\n' > "$HE/.pi/agent/auth.json"
 OUT="$(run_gate "$HE")"
 RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
-ck "2j a store entry with an \`env\` map but NO \`key\` does not authenticate, so the gate still REFUSES (rc=${RC:-<none>})" \
-   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
-hasnt "$OUT" "check=skipped reason=stored-credential" "2j2 …and does not claim the store answered (that claim was the false pass)"
+# ⛔ AND IT REFUSES NOTHING EITHER (review cycle 2, P1, measured against the vendor): an entry that EXISTS
+# for the provider but whose key resolves to nothing is NOT "no stored credential". pi hands the present
+# credential to `composeApiKeyAuth.resolve`, which delegates to the inherited handler
+# (`pi-ai/dist/auth/helpers.js:16-26` -> `envApiKeyAuth("DeepSeek API key", ["DEEPSEEK_API_KEY"])`), so
+# that box can still run on DEEPSEEK_API_KEY while the models.json template names something else. The
+# cycle-1 cut answered "no credential" here and REFUSED 82 a lane pi would have run — the false block this
+# gate must never produce. The honest answer is "cannot say": it claims no credential AND refuses nothing.
+ck "2j a store entry with an \`env\` map but NO \`key\` refuses NOTHING (rc=${RC:-<none>}) — pi may still resolve its own provider var" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "check=skipped reason=stored-credential " "2j2 …and does not claim the store answered (that claim was the false pass)"
+has "$OUT" "reason=stored-credential-unresolvable" "2j2b …and names the third answer instead: the entry is visible, its credential is not ours to resolve"
 # …and the inverse, so 2j cannot pass by refusing stores unconditionally: `key` ALONGSIDE `env` is the
 # shape `resolveConfigValue(credential.key, credential.env)` can actually use, so it must pass.
 HK="$(mkhome envpluskey "$DEEPSEEK_JSON")"
@@ -176,9 +184,9 @@ HT1="$(mkhome storeunresolved "$DEEPSEEK_JSON")"
 printf '{"deepseek":{"type":"api_key","key":"${KG_STORE_UNSET_XYZ}"}}\n' > "$HT1/.pi/agent/auth.json"
 OUT="$(run_gate "$HT1")"
 RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
-ck "2j4 a stored \`key\` that is a template naming an UNSET variable does not authenticate, so the gate REFUSES (rc=${RC:-<none>})" \
-   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
-hasnt "$OUT" "check=skipped reason=stored-credential" \
+ck "2j4 a stored \`key\` that is a template naming an UNSET variable refuses NOTHING (rc=${RC:-<none>}) — pi falls back to its own provider var" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "check=skipped reason=stored-credential " \
   "2j5 …and does not claim the store answered — that claim was the false pass (pi resolves the same template to undefined)"
 # …and the inverse: a template that RESOLVES (via the entry's own env map, which is the map pi passes to
 # resolveConfigValue) IS a credential, so the fix cannot pass by refusing every template.
@@ -201,6 +209,31 @@ ck "2j8 a stored \`!command\` value refuses NOTHING (rc=${RC:-<none>}) — only 
 has "$OUT" "reason=stored-credential-unresolvable" \
   "2j9 …and says it could not verify a credential it can SEE, rather than claiming one"
 hasnt "$OUT" "reason=stored-credential " "2j10 …and does not reuse the 'holds a credential' claim for a value it never resolved"
+# ⛔ 2j11/2j12: THE POLARITY GUARD AND THE TRUTHINESS TEST (review cycle 2, P2, mutation-verified). Both were
+# green on their own mutant: `*) return 1` (a bound's 143/124 folded into "no credential") stayed 65/65, and
+# dropping the resolved-value truthiness test stayed 65/65 — while each re-opens a different wrong answer
+# on the arm that decides whether a lane is refused.
+# 2j11 drives an auth.json that cannot be read (a directory) so the probe answers with a non-verdict
+# status; the gate must answer "cannot say", never "no credential" and never a claim.
+if command -v mkfifo >/dev/null 2>&1; then
+  HBR="$(mkhome storebound "$DEEPSEEK_JSON")"; rm -f "$HBR/.pi/agent/auth.json"; mkfifo "$HBR/.pi/agent/auth.json"
+  OUT="$(env -i PATH=/usr/bin:/bin HOME="$HBR" KEY_GATE_BOUND=3 bash -c '. "$1"; key_gate_assert t "$2"; echo "RC=$?"' _ "$KG" "$HBR" 2>&1)"
+  RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+  ck "2j11 a store that BLOCKS on open refuses NOTHING (rc=${RC:-<none>}) — a read that did not finish is not a missing credential" \
+     "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+  has "$OUT" "reason=stored-credential-unresolvable" \
+     "2j12 …and says so as its own reason, so a bound that fired is never reported as a positive absence"
+fi
+# …and a key that RESOLVES to an empty value is not a credential either (pi's own `if (credential.key)`
+# truthiness check): that arm is driven through the entry's env map, so the template parses and resolves.
+HEM="$(mkhome storeempty "$DEEPSEEK_JSON")"
+printf '{"deepseek":{"type":"api_key","key":"${KG_STORE_EMPTY}","env":{"KG_STORE_EMPTY":"   "}}}\n' > "$HEM/.pi/agent/auth.json"
+OUT="$(run_gate "$HEM")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2j13 a key resolving to a BLANK value refuses NOTHING and claims nothing (rc=${RC:-<none>})" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "check=skipped reason=stored-credential " \
+   "2j14 …and never claims a credential for a blank value (pi skips a falsy key)"
 
 # ── 2k: THE AGENT DIR IS `pi`'s OWN RESOLUTION, NOT A HARDCODED `~/.pi/agent` (review, P1, measured) ──
 # pi resolves `${PI_CODING_AGENT_DIR:-~/.pi/agent}`, and this repo already mirrors that rule
