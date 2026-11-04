@@ -367,10 +367,24 @@ codes_verdict() {
   # declaration mislabels every refusal that takes it, and it is invisible to a claims-only scan
   # because it declares nothing itself. An UNDECLARED name is not a mismatch — that is a forward
   # reference to a helper that is not in this copy (the same case `codes_for_name`'s EMPTY means).
+  # TWO PASSES, AND THE SECOND ONE IS THE ONLY REASON THIS CHECK CAN SEE A CALLER (blocking finding,
+  # review of `3a94b3b`, REPRODUCED before it was fixed). `refusal_codes()` emits rows in GLOB order,
+  # so every CALLER's fallback (`fix-one.sh`, `lane.sh`, `adopt-fix.sh`) is emitted BEFORE the
+  # `claim` row that declares it, because the declaration lives in `spawn-gate.sh` and sorts last. A
+  # single pass met each caller default while `decl` was still EMPTY, took the `!($2 in decl)`
+  # branch, and DROPPED the row: measured on the reviewed head, appending
+  # `true && _c="${AGENT_HARNESS_SKEW_REFUSED:-81}"` to `fix-one.sh` — the exact regression this
+  # check exists to catch — left the verdict GREEN with no `stale-defaults:` entry, while the SAME
+  # line appended to `spawn-gate.sh` (where the claim happens to precede it) went RED. So the rows
+  # are COLLECTED first and compared in `END`, once every claim has been read.
   _cv_stale="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '
-    $1=="claim"    { decl[$2] = $3 }
-    $1=="fallback" { if (!($2 in decl)) next
-                     if (decl[$2] != $3) printf "%s:%s:%s=%s(want %s)\n", $2, $4, $5, $3, decl[$2] }
+    $1=="claim"    { decl[$2] = $3; next }
+    $1=="fallback" { _n++; _fn[_n] = $2; _fc[_n] = $3; _ff[_n] = $4; _fl[_n] = $5; next }
+    END {
+      for (_i = 1; _i <= _n; _i++)
+        if ((_fn[_i] in decl) && (decl[_fn[_i]] != _fc[_i]))
+          printf "%s:%s:%s=%s(want %s)\n", _fn[_i], _ff[_i], _fl[_i], _fc[_i], decl[_fn[_i]]
+    }
   ' | sort | tr '\n' ' ')"
   _cv_stale="${_cv_stale% }"
   # A `NAME=<70..89>` in declaration position that is NOT in the family namespace: the claim scan
@@ -1565,21 +1579,30 @@ chmod +x "$RO/gh-limit/gh"
 # ⛔ AND THE ARM ASSERTS THE PATH WAS TRAVELLED, not just the number returned: the stub must be CALLED
 # and merge-one.sh must have RUN. Without that pair a future PATH change silently restores the inert
 # stub, and `want=1` goes back to being indistinguishable from the chain's own timeout.
-# ⛔ AND THE HANDOFF WAIT IS BOUNDED HERE, because finding the PR is what UNLOCKS it (P1 follow-up,
-# measured). Once the stub answers, `chain-merge.sh` no longer exits on its own no-PR timeout — it
-# runs the REAL path, and the rig's `$RO/state` carries a `lanemerge-<PR>.phase` marker from the earlier
-# arms, so the chain enters its merge-phase handoff wait: `HANDOFF_WAIT` (1800s) in `CHAIN_POLL` (15s)
-# steps, i.e. ~120 polls PER ARM and three arms in a row. Measured: the suite sat on this arm for over
-# 4 minutes with no progress. The wait is correct in production and irrelevant to what these rows
-# assert (propagation), so it is bounded to one 1s tick here — the same class of bound as
-# `CHAIN_POLLS=1` below, and stated for the same reason: an arm that hangs is an arm nobody runs.
+# ⛔ AND BOTH WAITS ARE BOUNDED HERE, because finding the PR is what UNLOCKS them (P1 follow-up,
+# measured; corrected by the review of `3a94b3b`, which measured the premise below to be FALSE). Once
+# the stub answers, `chain-merge.sh` no longer exits on its own no-PR timeout — it runs the REAL path,
+# and that path has TWO waits, neither of which these rows are about (they assert PROPAGATION):
+#   1. the PHASE wait (`chain-merge.sh:367`) — `while [ ! -f "$PR_PHASE" ] … PHASE_GRACE`. The rig has
+#      NO `lanemerge-<PR>.phase` marker (`$RO/state` is empty of one: this file mentions `.phase`
+#      nowhere else), so the loop is not skipped — it spins out the DEFAULT `PHASE_GRACE=90` at
+#      `CHAIN_POLL=1s`. That is ~90 s PER ARM, ~4.5 min for the three. Measured on `3a94b3b`: the
+#      three arms finished at 03:12:47, 03:14:27 and 03:16:02 — ~95-100 s each.
+#   2. the HANDOFF wait (`chain-merge.sh:400`) — reachable only when a marker DOES exist; bounded
+#      anyway so a future fixture that plants one cannot make the arm unbounded.
+# `LANE_PHASE_GRACE=1` bounds the first (the one that actually burns today) and `LANE_HANDOFF_WAIT=1`
+# the second — the same class of bound as `CHAIN_POLLS=1` below, stated for the same reason: an arm
+# that hangs is an arm nobody runs. ⛔ The earlier comment here claimed the rig "carries a
+# `lanemerge-<PR>.phase` marker from the earlier arms" and that the bound covered "one 1s tick"; both
+# were false, which is why the arm stayed the slowest thing in the suite while asserting a bound that
+# did not exist.
 for want in 0 1 75; do
   : > "$MERGE_LOG"; : > "$GH_LOG"
   # ⛔ `MERGE_LOG` IS PASSED IN ON PURPOSE: the merge-one stub is written in SINGLE quotes, so it reads
   # `$MERGE_LOG` from the ENVIRONMENT at run time (that is how every other arm here drives it) — an
   # arm that asserts on its output without exporting the path asserts on nothing.
   ( cd "$RREPO" && O="$RO" MERGE_RC="$want" CHAIN_POLLS=1 CHAIN_POLL_SECS=1 CHAIN_POLL=1 \
-      LANE_HANDOFF_WAIT=1 MERGE_LOG="$MERGE_LOG" PATH="$RIG/bin:$PATH" \
+      LANE_PHASE_GRACE=1 LANE_HANDOFF_WAIT=1 MERGE_LOG="$MERGE_LOG" PATH="$RIG/bin:$PATH" \
       bash "$HERE/chain-merge.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; crc=$?
   { [ "$crc" -eq "$want" ] && grep -q 'GH_STUB: pr list' "$GH_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
   ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — its gh stub was actually CALLED and merge-one.sh really RAN, so this is propagation and not the chain's own timeout" $rc
@@ -2311,6 +2334,24 @@ case "$CODE_MSG" in
 esac
 ck "(mutation g) a reader default that DISAGREES with the declaration is REFUSED and named (want 'AGENT_HARNESS_SKEW_REFUSED:spawn-gate.sh:$_wantline=81(want 83)') (rc=$CODE_RC; $CODE_MSG)" $rc
 
+# (g0) THE ORDERING HALF, AND IT IS A SEPARATE ARCHETYPE (blocking finding, review of `3a94b3b`).
+# (g) above appends to the DECLARING file, where the claim happens to precede the default — so it
+# passes on a single-pass comparison and proves nothing about a CALLER. Every real caller
+# (`fix-one.sh`, `lane.sh`) sorts BEFORE `spawn-gate.sh`, so its fallback row is emitted before the
+# claim that gives it meaning; a single pass drops it and reports GREEN. Measured on `3a94b3b`: the
+# identical stale default appended to `fix-one.sh` left the verdict at RC=0 with no
+# `stale-defaults:` entry. `adopt-fix.sh` is used because it is the file in the mutant set that sorts
+# FIRST — the ORDERING is the property under test, not which caller the line lands in.
+_codemut_dir="$(_codemut stale-default-caller)"
+printf '\ntrue && _c="${AGENT_HARNESS_SKEW_REFUSED:-81}"\n' >> "$_codemut_dir/adopt-fix.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/adopt-fix.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:adopt-fix.sh:$_wantline=81(want 83)"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(mutation g0) a stale default in a CALLER file — emitted BEFORE the declaring file — is REFUSED too, so the comparison is two-pass and not glob-order luck (want 'AGENT_HARNESS_SKEW_REFUSED:adopt-fix.sh:$_wantline=81(want 83)') (rc=$CODE_RC; $CODE_MSG)" $rc
+
 # (g1, g2) A QUOTED DEFAULT IS STILL A DEFAULT — and this pair was a FALSE PASS (review round 3, P1,
 # REPRODUCED before it was fixed). `valof` cut the operand at its leading quote, the empty result was
 # read as `${X:-}` (a bare read, which legitimately declares nothing), so `${X:-"81"}` reddened
@@ -2394,7 +2435,12 @@ _arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never com
 _arm_cls=""; _arm_other=""
 for _ac in $(printf '%s\n' "$_fixer_code" \
     | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u); do
-  if printf '%s\n' "$_fixer_code" | grep -qE "=[[:space:]]*\"\\\$\\{?${_ac}"; then
+  # ⛔ A HERE-STRING, NOT `printf … | grep -q` (sigpipe-grep gate, #841/#864). Under `pipefail` a
+  # `grep -q` that matches early closes the pipe, the writer takes SIGPIPE, and the pipeline's status
+  # becomes 141 — so THIS test would read "not an arm" exactly when the name DID match. That is a
+  # false-negative in the check that proves `fix-one.sh`'s arms are reachable, which is the same
+  # silently-unchecked-arm class the derivation exists to close (`check-no-sigpipe-grep.sh`).
+  if grep -qE "=[[:space:]]*\"\\\$\\{?${_ac}" <<<"$_fixer_code"; then
     _arm_cls="$_arm_cls $_ac"
   else
     _arm_other="$_arm_other $_ac"
