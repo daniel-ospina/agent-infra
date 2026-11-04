@@ -601,8 +601,12 @@ joined=$(awk '
     if ($0 ~ /\\$/) { sub(/\\$/, "", line); next }
     print line; line = ""
   }' "$GATE" 2>/dev/null)
-n_net=$(printf '%s\n' "$joined" | grep -cE 'git -C "\$root".*\b(push|fetch|ls-remote)\b')
-n_unbounded=$(printf '%s\n' "$joined" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -cv 'tb_timeout')
+n_net=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g' | grep -cE 'git -C "\$root".*\b(push|fetch|ls-remote)\b')
+# ⛔ COUNTED PER COMMAND SEGMENT, NOT PER LINE (review cycle 7: joining continuations made a bounded and an
+# unbounded call share one line, so `tb_timeout … ls-remote … \` + `&& git -C "$root" fetch origin` read as
+# bounded — a fail-open the join CREATED). Every segment that contains a network verb must carry its own
+# `tb_timeout`.
+n_unbounded=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g' | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -cv 'tb_timeout')
 [ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
   && [ "$n_net" -ge 3 ] && [ "$n_unbounded" = 0 ]; rcn14=$?
 ck "N14 …every network call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net)" $rcn14
@@ -638,9 +642,9 @@ exit_fn=$(awk '/^lane_end_push\(\)/,/^}/' "$GATE"; awk '/^terminal_wip_rescue\(\
 # false-negative it exists to prevent.
 exit_code_only=$(printf '%s\n' "$exit_fn" | grep -v '^[[:space:]]*#')
 n_force=$(printf '%s\n' "$exit_code_only" | grep -cE 'push.*(--force|(^| )-f( |$)|\+HEAD|\+refs)')
-n_destructive=$(printf '%s\n' "$exit_code_only" | grep -ciE 'stash|worktree +(remove|prune)|reset .*--hard')
+n_destructive=$(printf '%s\n' "$exit_code_only" | grep -ciE 'stash|worktree +(remove|prune)|reset .*--hard|clean +-[a-z]*f|checkout +(-f|-- )')
 [ "$n_force" = 0 ] && [ "$n_destructive" = 0 ]; rcn17=$?
-ck "N17 …the exit path carries no force (--force, -f, or a +refspec) and no stash/worktree-removal/reset --hard, on ANY branch" $rcn17
+ck "N17 …the exit path carries no force (--force, -f, or a +refspec) and no stash/worktree-removal/reset --hard/clean -f/checkout -f, on ANY branch" $rcn17
 # ⛔ N19 — THE R6 PROPERTY BEHAVIOURALLY, NOT BY SPELLING (review cycle 5, gap 1). A scan proves a verb is
 # absent; it cannot prove a DIVERGENT branch is refused rather than overwritten. The dangerous direction —
 # a dying lane reverting a peer's merged head — is exactly the non-fast-forward case, and D3 only proves
