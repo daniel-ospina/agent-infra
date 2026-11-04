@@ -315,8 +315,10 @@ are inventoried in [`orchestrator-mcp-inventory.md`](orchestrator-mcp-inventory.
   works on the hub and fails on the box that actually runs the lanes.
 * **`CELL_HOME` then `HOME`** for the state root; `$O` / `$AGENT_INFRA_PATH` / `~/.pi/agent/scripts` for the
   module (the same candidate ladder `spawn-gate.sh` uses for `lane-bound.sh`).
-* **The local write-through copy is never the authority.** `$HOME/.pi/agent/state/lanes/<id>.json` is the
-  box's own witness; the ref is the shared record. When only the local copy can be read, the payload says
+* **The local write-through copy is never the authority.** `local_dir()` — `$LANE_REGISTRY_LOCAL`, else
+  `${LANE_REGISTRY_STATE:-${CELL_HOME:-$HOME}/.pi/agent/state}/lanes`, so **`CELL_HOME` wins over `HOME`**
+  (a cell runs `CELL_HOME=/tmp/cell-home` with `HOME=/home/cmux`, and the two are different directories) —
+  is the box's own witness; the ref is the shared record. When only the local copy can be read, the payload says
   `coverage: "local-only"` and the MCP raises `isError` — a partial answer labelled is useful; labelled as
   complete it is not. A failure to write that copy is a **WARN, never a returned failure**: an
   unwritable `HOME` must not be able to abort the write of the shared record, which is the authority.
@@ -357,7 +359,7 @@ Or from a session, without a shell: `lane.list` / `lane.show`.
    # a corrupt SHARED ref (this is what makes the fleet read UNMEASURED)
    git -C <registry-repo> push origin :refs/lanes/<lane-id>
    # a corrupt record in THIS BOX's witness
-   rm "${LANE_REGISTRY_LOCAL:-$HOME/.pi/agent/state/lanes}/<lane-id>.json"
+   rm "${LANE_REGISTRY_LOCAL:-${LANE_REGISTRY_STATE:-${CELL_HOME:-$HOME}/.pi/agent/state}/lanes}/<lane-id>.json"
    ```
 4. **A beat publishes only when the lease needs renewing** (see §2.3): `beat` re-derives the lease locally
    on every call and pushes at the half-way point, or when `--push` is given. A lane beating every 60 s on

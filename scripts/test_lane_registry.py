@@ -855,14 +855,6 @@ def test_T24_repeating_an_id_is_REFUSED_even_when_a_sibling_record_is_corrupt(bo
                        + _remote(origin))
     assert rc == mod.REFUSED, (rc, out, err)
     assert "already exists" in err, err
-    # (b) a corrupt SIBLING must not disable the guard
-    (tmp_path / "state" / "lanes" / "poison.json").write_text("{not json")
-    rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "0", "--lane-id", lane]
-                       + _remote(origin))
-    assert rc == mod.REFUSED, ("a corrupt sibling defeated the guard", rc, out, err)
-    local = json.loads((tmp_path / "state" / "lanes" / ("%s.json" % lane)).read_text())
-    assert local["tag"] == "victim", "the existing record must not have been replaced"
-    (tmp_path / "state" / "lanes" / "poison.json").unlink()
     # (b2) a PEER's record: the ref exists, this box has no local copy. Only the ref probe can refuse it,
     # so this is the arm that makes deleting `if exists:` visible (it survived every other case).
     ok, _d, records, _src = mod.read_registry(origin, 20.0)
@@ -877,10 +869,23 @@ def test_T24_repeating_an_id_is_REFUSED_even_when_a_sibling_record_is_corrupt(bo
                              "--lane-id", peer["lane_id"]] + _remote(origin))
     assert rc == mod.REFUSED, ("a ref with no local copy must still refuse", rc, out, err)
     assert "already exists" in err, err
-    # (c) a repeat whose LOCAL record exists but whose ref does not (the LOCAL_ONLY case) — the ref is
-    # deleted and the local copy KEPT (`_purge` would remove both, which is a different state).
+    # (b) a corrupt SIBLING must not disable the guard — WITH THE REF GONE.
+    # ⛔ THE REF MUST BE DELETED FIRST, OR THIS ARM PASSES FOR THE WRONG REASON. With the ref still present
+    # `ref_exists` refuses first, so the assertions hold even when the local guard is the pre-fix
+    # directory-map version — a mutation run confirmed exactly that (M2 reverted the guard, 38/38 green).
+    # The state that actually exercises the guard is: no ref, a local copy, a corrupt sibling.
     subprocess.run(["git", "-C", origin, "update-ref", "-d", "refs/lanes/%s" % lane],
                    check=True, capture_output=True)
+    (tmp_path / "state" / "lanes" / "poison.json").write_text("{not json")
+    rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "0", "--lane-id", lane]
+                       + _remote(origin))
+    assert rc == mod.REFUSED, ("a corrupt sibling defeated the guard", rc, out, err)
+    local = json.loads((tmp_path / "state" / "lanes" / ("%s.json" % lane)).read_text())
+    assert local["tag"] == "victim", "the existing record must not have been replaced"
+    (tmp_path / "state" / "lanes" / "poison.json").unlink()
+    # (c) the plain LOCAL_ONLY repeat: ref absent, local copy present, NO corrupt sibling.
+    # (The ref was already deleted in (b); this is the same setup minus the poison, so a guard that only
+    # survives one of the two states is visible.)
     rc, out, err = run(mod, ["start", "--kind", "lane", "--tag", "0", "--lane-id", lane]
                        + _remote(origin))
     assert rc == mod.REFUSED, (rc, out, err)
@@ -907,6 +912,16 @@ def test_T25_a_lane_opened_during_an_outage_can_still_be_CLOSED_afterwards(box, 
     assert "refs/lanes/%s" % lane in refs, "closing it must PUBLISH the ref, or the fleet never learns"
     rec = json.loads(run(mod, ["show", "--lane-id", lane] + _remote(origin) + ["--json"])[1])
     assert rec["state"] == "DONE" and rec["artifacts"] == [{"kind": "pr", "value": "42"}], rec
+    # ⛔ AND A CORRUPT LOCAL COPY MUST NOT BE TRUSTED (or crash). `measure_existing` validates the local
+    # record with `_record_problem`; dropping that validation left this suite green, and the effect was an
+    # uncaught `KeyError: 'lease_until'` -> exit 1, outside the documented table, plus a corrupt witness
+    # being re-pushed as a verdict.
+    bad = tmp_path / "state" / "lanes" / "bad-lane.json"
+    bad.write_text(json.dumps({"lane_id": "bad-lane", "state": "RUNNING"}))
+    rc, out, err = run(mod, ["done", "--lane-id", "bad-lane", "--pr", "9"] + _remote(origin))
+    assert rc == mod.NOT_FOUND, (rc, out, err)
+    assert "Traceback" not in err, err
+    assert "refs/lanes/bad-lane" not in records_on_refs(origin)
 
 
 def test_T26_show_json_is_JSON_on_every_branch(box, tmp_path):
