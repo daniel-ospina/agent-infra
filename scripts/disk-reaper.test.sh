@@ -1049,6 +1049,26 @@ PY
     OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
     assert_contains "$OUT" "record ok=1" "T27 a HEALTHY record is read on a Linux-shaped host"
     assert_contains "$OUT" "ALARMS=[]" "T27 ... and contributes no alarm"
+    # (b2) A NON-`ok` CLASS VERDICT IS PRINTED, AND IS NOT A FLEET ALARM (#3057 review, P2). The
+    # reaper records `verdict_runner_work=partial` when it could read PART of the runners' `_work` sink
+    # and not the rest, and `=abstained` when it could read none of it. Both are rc 0 BY DECISION — the
+    # record is the alarm channel and an hourly red for a permission mismatch is the alarm-fatigue shape
+    # this family forbids — so this reader's whole duty is VISIBILITY, and it had none: the class verdict
+    # was never read, and the `detail` naming the abstention was thrown away in the `ok == 1` branch, so a
+    # cell whose sink filled behind a permission mismatch read HEALTHY here for ever.
+    printf 'epoch=%s\nok=1\nrc=0\nfreed_mb=12\ndetail=runner-work census is PARTIAL\nunmeasurable_runner_work=1\nverdict_runner_work=partial\nverdict_duplicate_install=ok\n' "$(date +%s)" \
+        >"$T/t27/home/.pi/agent/state/disk-reaper.status"
+    OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
+    assert_contains "$OUT" "runner-work=partial" "T27 a PARTIAL runner-work census is PRINTED (a field the reader does not print does not exist)"
+    assert_contains "$OUT" "unmeasurable=1" "T27 ... with the unmeasured tally, so the number names its own lower bound"
+    assert_absent "$OUT" "duplicate-install=" "T27 ... and a benign class verdict stays SILENT (a healthy cell gains no noise)"
+    assert_contains "$OUT" "ALARMS=[]" "T27 ... and it is NOT an alarm: rc 0 abstentions are the record's job by recorded decision (alarming here would reverse it fleet-wide)"
+    # (b3) the CONTROL: the same record with every verdict `ok` prints no class note at all, so (b2) is
+    # reading the verdict and not simply echoing every field it can find.
+    printf 'epoch=%s\nok=1\nrc=0\nfreed_mb=12\nverdict_runner_work=ok\n' "$(date +%s)" \
+        >"$T/t27/home/.pi/agent/state/disk-reaper.status"
+    OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
+    assert_absent "$OUT" "runner-work=" "T27 control: an OK class verdict adds no class note"
 else
     ok "T27 skipped — no python3 on this host"
 fi
