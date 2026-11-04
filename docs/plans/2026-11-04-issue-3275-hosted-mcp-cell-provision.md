@@ -94,13 +94,15 @@ credential into a 0644 file). It is: **make the entry installable**, then instal
 4. **DONE — the farm.** `setup.sh graph_srcs=(tortoise-graph.sh tortoise_graph_client.py)`, one line, real copies + `chmod +x`, `farm_missing` on absence, and `farm_declared_rel` updated so `check-farm-drift.sh` can see them. `graph_srcs` is decoded in `pi-bootstrap/tests/test-setup-no-nesting.sh`'s `FARM_ARRAYS` and `check_producer_farm_declared`.
 5. **DONE — the fallback client's two broken calls.** `tortoise_get_point` now sends `id` (was `point_id`); `tortoise_create_operator` now sends `op_type/source_id/target_ids/direction/semantics` (was `label`). Both were rejected by the server's argument validation; the second failed **after** the point was written.
 6. **DONE — canonical credential name.** `scripts/tortoise-graph.sh` reads `TORTOISE_MCP_API_KEY` first, legacy `TORTOISE_API_KEY` second, and its abstention message names both plus the remedy.
-7. **DONE — regression tests.** `pi-bootstrap/tests/test-cell-install.sh` → 191 assertions, `FAILURES=0`; the graph arms among them are named in the PR body.
+7. **DONE — regression tests.** `pi-bootstrap/tests/test-cell-install.sh` → **197 assertions at `4448ca06e`** (194 `ok`, 3 `FAIL`; measured, and head-bound because this branch has taken concurrent commits). `FAILURES=0` on a box where `/var` is not a symlink; on macOS the same suite reports 3 `FAIL` in the gh-shim arms — an unresolved `/var/folders/…/T//` `$TMP` compared against the verifier's physical `/private/var/folders/…`, identical at base `1f69ab544`, so it is declared and not chased. The graph arms among them are named in the PR body.
 8. **DONE — measured end-to-end.** `HOME=<scratch> bash pi-bootstrap/setup.sh` and `CELL_HOME=<scratch> bash pi-bootstrap/cell-install.sh --install` both print the expected farm + merge + `LAYER VERIFIED` lines (transcript excerpt in the PR body).
 
 ## Verification
 
 ```
-bash pi-bootstrap/tests/test-cell-install.sh        → 191 assertions, FAILURES=0
+bash pi-bootstrap/tests/test-cell-install.sh        → 197 assertions at 4448ca06e: 194 ok, 3 FAIL
+                                                      (the 3 fail identically at base — the gh-shim arms' `/var` →
+                                                       `/private/var` comparison, a macOS symlink artifact)
 bash pi-bootstrap/tests/test-farm-unfarm.sh         → green (graph_srcs declared, unfarm clean)
 bash -n over every shipped script                   → clean (bash 3.2 parse gate is CI-enforced)
 ```
