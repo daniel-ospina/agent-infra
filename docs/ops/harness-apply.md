@@ -114,11 +114,13 @@ ahead=0
 dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
+drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
 preserved=none
+remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
 lanes=none-signalled
 fetch=ok                     <- the comparison was FRESH; a failure is rc=23, never `current`
-detail=current: the pin tree already names origin/main — head=ce987bb2c1de deployed=ce987bb2c1de ref=ce987bb2c1de behind=0 ahead=0 dirty=0 pin=ce987bb2c1de pin_tree=ce987bb2c1de
+detail=current: the pin tree already names origin/main — head=ce987bb2c1de deployed=ce987bb2c1de ref=ce987bb2c1de behind=0 ahead=0 dirty=0 pin=ce987bb2c1de pin_tree=ce987bb2c1de drift=clean:current
 ```
 
 `detail` is the verdict sentence **plus the readings appended by the recorder**, so the line
@@ -152,16 +154,68 @@ this repo keeps deleting.
 | code | meaning | unit colour |
 |---|---|---|
 | 0 | `current` — the pin already names the ref tip; nothing changed | green |
+| 1 | REFUSED `deployed-drift` — the pass itself succeeded, but a live controller is **EXECUTING** a harness tree the box cannot match to this repo (see *Deployed-drift reading* below) | **red** |
 | 10 | `advanced` — the materialiser ran and the pin moved (or a lying pin record was repaired) | green |
 | 11 | `mended` — the pin was missing/empty; what the box actually runs was recorded | green |
 | 20 | REFUSED dirty — the tree carries work that could not be preserved | **red** |
 | 21 | REFUSED ahead — local commits are not on the ref's line | **red** |
 | 22 | REFUSED diverged | **red** |
 | 23 | REFUSED unknown — the ref/repo/HEAD cannot be resolved, the materialiser failed, or the pin record could not be written | **red** |
+| 24 | `farm-drift` — the **FARM** (`$CELL_HOME/.pi/agent/scripts`, the directory this box *executes*) differs from the ref, owes files, or cannot be graded (a dangling link, a checker that lives inside the farm, an explicitly-named farm that is absent) — an **absent *default* farm is SKIPPED and the pass stays green**, because only then does "no farm" describe the host rather than the config | **red** |
 | 25 | behind, and this box has nothing that can advance it | **red** |
 
 A red tick is deliberate: those are states a **human** must resolve, and the unit colour
 is the only surface that reaches someone who is not tailing a log.
+
+### Exit 1 — `deployed-drift`
+
+Every other code answers *"did this pass advance the box?"*. Exit 1 answers a different
+question, and it is the one `#10114` measured a whole fleet failing on:
+**is the code this box EXECUTES the code this repo ships?**
+
+The pass takes one deployed-drift reading per tick, from the final state, by calling
+`scripts/orchestrator-harness/check-deployed-drift.sh --surface` and printing its token as
+`harness: deployed_drift=<state> token=<token>` (recorded in the `drift=` field).
+
+The checker is DISCOVERED, not assumed, and it is not shipped by the farm — so the search covers
+both a deployed box and the scheduler's own environment, first match wins: beside this pass
+(`$HERE`), `$AGENT_INFRA_PATH/scripts/orchestrator-harness/`, `$O`, then the governed checkout
+(`$REPO/scripts/orchestrator-harness/` — the candidate the systemd unit's environment actually
+has, since it exports `HARNESS_APPLY_REPO` and no `AGENT_INFRA_PATH`). When none exists the
+reading is `not-run`/`absent` and says so: we cannot verify what we did not run.
+
+Only one token reds a pass this way:
+
+| token | pass result |
+|---|---|
+| **`executes:<dir>`** — a live controller executes a directory the box does not have | **exit 1**, `action=deployed-drift` |
+| `behind:<sha>`, `diverged:<sha>`, `payload-differs`, `uncommitted-edit:<path>`, `incomplete:<path>`, `source-dirty:<sha>`, `surface` | reported in `drift=`, pass stays green |
+| `UNKNOWN:` / exit 2 from the checker | reported, pass stays green (`cannot-verify-rc2`) |
+
+Scoped deliberately: the other tokens legitimately describe a developer box mid-edit or a
+deliberately-behind checkout, and a check that reds every working box is one operators
+learn to ignore. Only a live controller running code the box does not have means
+**nothing** the controller does is this repo's code.
+
+⛔ **Exit 1 is not clearable by redeploying.** A redeploy writes a copy at rest; it does not
+restart the controller, so the gone tree keeps being executed. The remedy — carried in the
+record's own `remedy=` field, untruncated — is: advance the pin
+(`bash <resolved>/cloud-cell-supervisor.sh apply --force --pin-only`), then **restart the
+controller from the pinned tree**.
+
+⛔ **The command is RESOLVED to a path, not named.** Nothing in this fleet puts
+`cloud-cell-supervisor.sh` on `PATH` (`command -v` is empty on a deployed cell; the farm keeps
+it beside this pass at `~/.pi/agent/scripts/`), so a bare command name would be
+`command not found` on exactly the boxes the red fires on. The pass emits
+`bash <path>` for the first of `$HARNESS_MATERIALISER`, `$HERE/cloud-cell-supervisor.sh`,
+`$O/cloud-cell-supervisor.sh`, `<repo>/scripts/cloud-cell-supervisor.sh` that exists, and says
+`NOT FOUND on this box — set HARNESS_MATERIALISER` when none does — never an implied command
+that cannot run.
+
+`detail=` is bounded at 240 characters, which is why `remedy=` and `preserved=` are
+separate fields: an operator-needed fact must never be at the mercy of a prose truncation
+(measured — the `deployed-drift` sentence is 706 characters and its remedy begins at 272,
+so `detail=` alone loses the remedy entirely).
 
 ## Install, verify, disarm
 
@@ -250,7 +304,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 
 ## Tests
 
-`scripts/harness-apply-timer.test.sh` — 197 assertions, run by the
+`scripts/harness-apply-timer.test.sh` — 261 assertions, run by the
 `harness-apply-timer` shard of `run-bash-shards.sh`:
 
 | | |
@@ -270,6 +324,7 @@ checkout can use the documented hatch. The same interaction is recorded for
 | T12 | a unit rendered from **transient scratch** (`/tmp/tmp.XXXX`) is refused — the measured 127-every-tick unit |
 | T13 | the cadence seam is validated (`abc`, `0`, `1441` refused); a value that does not divide the hour (7) is kept — the artifact states the cadence it keeps |
 | T14 | a **stale** record (including one dated in the FUTURE) is an alarm, a non-numeric staleness bound is refused, and no record at all is `never`, not success |
+| T24 | the **FARM** is graded against the ref: stale → **RED 24** naming the file, exit 3 (undeployable) is red too, a matching farm keeps the normal verdict, an **absent** farm is skipped by name while a **dangling** link reddens, an invalid seam value is refused *before* any move, and a checker living **inside** the farm it grades is refused rather than trusted |
 | T15 | a dirty **tracked symlink** is restored as a symlink, and the clean file it pointed at is byte-for-byte untouched (this repo tracks 34 symlinks; writing the blob through the link corrupted the target) |
 
 | T16 | the pass runs from **the unit's own environment** (`env -i` with only `HARNESS_APPLY_REPO`/`_REF`/`_MODE`/`_STATE_DIR`), asserted on the record's `ref=` — the rendered unit exported names the pass did not read, so every scheduled tick exited 23 while `list-timers` showed it scheduled |

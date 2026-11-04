@@ -527,9 +527,18 @@ esac
 # file exists to prevent. So the shipped value must still COVER the sum its own comment derives; that is
 # an acknowledgement (the same pattern install-launchd.test.sh uses), not a cache: any term moving
 # without the TTL reddens.
-LEASE_TERMS=$(( 3300 + 5400 + 1890 + 3000 ))   # lane + chain PR wait + merge-phase wait + review/merge
+# ⛔ THE LANE TERM IS READ FROM THE SHIPPED SOURCE, for the same reason the TTL above is (agent-infra#2888
+# review, P1 — verified). This sum carried the literal `3300` and stayed GREEN while the lane's own bound
+# moved to the 7200 s backstop (`LANE_BACKSTOP_S`, spawn-gate.sh) with `lane.sh`'s `run_agent` call — the
+# exact "a literal in the test" shape this file's comment above argues against. `lane.sh` names the seam
+# rather than a number, so resolve it from the seam's owner; an unreadable source keeps 3300 rather than
+# skipping the leg.
+LANE_TERM="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' \
+              "$(dirname "${BASH_SOURCE[0]}")/spawn-gate.sh" 2>/dev/null | head -1)"
+case "$LANE_TERM" in ''|*[!0-9]*) LANE_TERM=3300 ;; esac
+LEASE_TERMS=$(( LANE_TERM + 5400 + 1890 + 3000 ))   # lane + chain PR wait + merge-phase wait + review/merge
 [ "$ISSUE_TTL_EXPECTED" -ge "$LEASE_TERMS" ]
-ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s)" $?
+ck "O7 the shipped CLAIM_ISSUE_TTL (${ISSUE_TTL_EXPECTED}s) still COVERS its own derived terms (${LEASE_TERMS}s, lane term ${LANE_TERM}s read from spawn-gate.sh)" $?
 IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
 [ "$IVAL" = "$ISSUE_TTL_EXPECTED" ]
 ck "O7 the ISSUE claim's default TTL is the SHIPPED claims.sh value (${ISSUE_TTL_EXPECTED}s, got '$IVAL')" $?

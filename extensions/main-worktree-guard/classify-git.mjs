@@ -4683,7 +4683,9 @@ const HUB_MUTATING_VERBS = new Set([
  * allowlist. Returns:
  *   "recovery" — a sanctioned recovery op (checkout main, pull --ff-only,
  *                fetch, status, log, worktree ops, push of the checked-out
- *                branch).
+ *                branch; plus the named-path working-tree restore family
+ *                `checkout -- <path>` / `restore <path>` WHEN an escape hatch
+ *                is active — the #1484 M4 recovery window).
  *   "readonly" — a harmless read (diff/show/blame/...).
  *   "block"    — a mutation outside the allowlist (commit, checkout -b,
  *                foreign push, merge, reset, clean, ...).
@@ -4691,8 +4693,104 @@ const HUB_MUTATING_VERBS = new Set([
  * @param {string[]} args
  * @param {string|null} currentBranch — branch checked out in the hub (for the
  *   push carve-out; null = detached → foreign pushes are unknowable → block).
+ * @param {boolean} [escapeActive] — an escape hatch is ACTIVE for this call
+ *   (session-start AGENT_ALLOW_MAIN_EDITS=1, or the ~/.pi/agent/.allow-main-edits
+ *   marker). Opens the recovery window only; never widens to feature work.
  */
-export function isHubRecoveryInvocation(verb, args, currentBranch) {
+/** #1484 M4 recovery window — is this operand a NAMED path?
+ *
+ * The window is a named-path restore, so the operand test must be about the
+ * EFFECT, not the spelling (review round 2 measured the fail-open): the first
+ * cut refused only the literal `.`, so `git checkout -- ./`, `-- ..`, `-- ../`
+ * and `-- '*.txt'` were all PERMITTED under the hatch — `./` is the same wipe
+ * as `.`, `..` reaches ABOVE the hub, and a glob discards whatever it matches.
+ * Every one of them was BLOCKED on main, so this was a regression the arm
+ * introduced, not a gap it inherited. Strip trailing slashes, then refuse the
+ * whole-tree/dot-dot/absolute/home/glob/brace forms.
+ *
+ * ⚠️ ADMITTED ON PURPOSE — and this docblock used to claim otherwise (round 16):
+ * a DIRECTORY operand (`src`, `src/`) names its SUBTREE and is permitted, so one
+ * command discards every dirty tracked file under it. That is a deliberate part
+ * of the "name your paths" contract (the alternative is refusing the only route
+ * that clears dirt sitting in a directory), but it is not a whole-tree wipe and
+ * it is not silent: the M5 block text names the subtree case. Do not re-list it
+ * here as a closed fail-open unless the behaviour changes. */
+function _isNamedPathOperand(x) {
+  const p = String(x ?? "").replace(/\/+$/, "");
+  if (!p) return false;
+  if (p === "." || p === "..") return false;
+  if (p.startsWith("/") || p.startsWith("~") || p.startsWith(":")) return false;
+  if (p.split("/").includes("..")) return false;
+  // `{}` is the remaining shell-expansion construct (round 12, P1 MEASURED): the
+  // SHELL expands `. {,}` -> `[".","."]` BEFORE git sees it, so the operand the
+  // test judged is not the operand that runs — `git checkout -- .{,}` reset EVERY
+  // tracked file under a hatch (blocked with and without a hatch on origin/main,
+  // so this arm introduced it). A brace has no legitimate place in a named
+  // recovery path; refusing it falls back to M5's pre-existing fail-closed
+  // "pathspec not statically resolvable", which is what a genuinely brace-named
+  // file already gets on main — no new dead end.
+  if (/[*?[\]{}]/.test(p)) return false; // glob/brace pathspec — matches what it expands to
+  // Round 11 (P1, MEASURED — whole-tree wipe): stripping only TRAILING slashes let
+  // every dotted spelling of the whole tree through, because they normalize to
+  // `.`: `git checkout -- ./.` / `././` / `.//.` / `git restore ./.` were all
+  // `recovery` and ALLOWED under a hatch, and git reset EVERY tracked file —
+  // i.e. every sibling session's uncommitted work, the exact harm the `.` refusal
+  // exists to prevent. Normalize the remaining dot segments: an operand that
+  // collapses to nothing is the whole tree, not a named path.
+  const norm = p.split("/").filter((seg) => seg !== "" && seg !== ".").join("/");
+  if (norm === "") return false;
+  return true;
+}
+
+/** #1484 M4 recovery window — an invocation whose REPO SELECTION is explicit.
+ *
+ * Round 5 (P1, MEASURED fail-open): the window must be decided on the PARSED
+ * invocation, never on the command text. `allGitInvocations` STRIPS the
+ * target-selecting token into hints (`cHints`/`gitDirHint`/`workTreeHint`), so
+ * `git "-C" <other> checkout -- p` arrives as
+ * `{verb:"checkout", args:["--","p"], cHints:["<other>"]}` — an EMPTY prefix
+ * for the allowlist below, and a raw-text regex for `-C` does not match the
+ * quoted spelling. Measured: that form (and `git "--git-dir" … checkout --`)
+ * ALLOWED under a hatch and DESTROYED a foreign checkout's uncommitted work,
+ * and `--git-dir=<other>/.git` wrote a foreign blob INTO the hub — all three
+ * BLOCKED on main. A restore in the recovery window never needs to name another
+ * repository, so any target hint puts the invocation outside it. */
+function _invSelectsRepo(inv) {
+  if (!inv) return false;
+  const hints = [inv.gitDirHint, inv.workTreeHint, inv.indexFileHint, inv.objDirsHint];
+  if (hints.some((h) => typeof h === "string" && h.length > 0)) return true;
+  if (Array.isArray(inv.cHints) && inv.cHints.length > 0) return true;
+  // Round 6 (P2, MEASURED): the invocation carries TWO more config channels that
+  // git honours and this predicate ignored — `-c core.worktree=<other>` and
+  // `--config-env=core.worktree=VAR` classified `recovery` at head while
+  // origin/main blocked them. (Their effect was inert here because git ignores
+  // core.worktree inside a worktree, so this is a classification gap rather than
+  // a live discard — but it is the same enumeration hole, so it is closed with
+  // the seam: ANY config override puts the invocation outside the window.)
+  for (const list of [inv.configOverrides, inv.configEnvOverrides, inv.envPrefixes]) {
+    if (Array.isArray(list) && list.length > 0) return true;
+  }
+  // Round 7 (P1, MEASURED — data loss): the `cd` CHAIN is a target channel the
+  // classifier already resolves and this predicate never consulted. With a
+  // dirty hub and an active hatch, `cd <other> && git restore --staged f.txt`
+  // was ALLOWED and reset the FOREIGN checkout's index (its staged work lost),
+  // where origin/main blocked it — and M5 cannot backstop it because its
+  // descriptor family has no staged-only shape. A restore in the recovery
+  // window runs from the hub, so any `cd` prefix puts it outside the window.
+  if (Array.isArray(inv.cdChain) && inv.cdChain.some((c) => c !== null && c !== undefined)) return true;
+  // Round 8 (P1, MEASURED — data loss). The ambient-env predicate lived ONLY in
+  // index.ts's window, i.e. in the M5 half. M4's own verdict is decided HERE, so
+  // with `GIT_DIR`/`GIT_WORK_TREE` inherited by the pi process M4 classified
+  // `git restore --staged <path>` as recovery and let it through, and M5 cannot
+  // backstop it (its descriptor family has no staged-only shape): the FOREIGN
+  // checkout's index was reset, staged work destroyed, where origin/main blocked
+  // it. The channel check therefore belongs at the SINGLE decision point both
+  // gates share — this one.
+  if (Object.keys(process.env).some(isRepoSelectingEnvKey)) return true;
+  return false;
+}
+
+export function isHubRecoveryInvocation(verb, args, currentBranch, escapeActive = false, inv = null) {
   const a = args || [];
   const pos = a.filter((x) => !x.startsWith("-"));
   const flag = (f) => a.includes(f);
@@ -4701,7 +4799,58 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
     case "switch":
       // ONLY `checkout main|master` (recovery). Path-restore (--), discard-all
       // (.), previous-branch (-), create/force/orphan/detach forms → block.
-      if (a.includes("--")) return "block";
+      if (a.includes("--")) {
+        // `git switch` has NO pathspec mode (round 13, P1 MEASURED): after `--`
+        // its operand is a BRANCH, not a path. Reusing the checkout arm for it
+        // let `git switch -- feat-side` through the window, and real git switched
+        // the shared hub off `main` carrying the dirt — the exact state M4 exists
+        // to prevent (blocked on origin/main). Switch is never a restore.
+        if (verb === "switch") return "block";
+        // #1484 M4 RECOVERY WINDOW — the actionable escape.
+        // A PATH-RESTORE (`git checkout -- <path>`) is the ONLY sanctioned way
+        // to clear working-tree dirt, and refusing it made M4 UNRECOVERABLE in
+        // the very state it exists to repair: the gate answered `git checkout
+        // main && git pull --ff-only`, which on a dirty tree is a NO-OP (git
+        // cannot clear the dirt (it may refuse to switch, or carry the change
+        // along, and a pull may fast-forward or refuse), and an already-main dirty hub
+        // has nothing left to do). Measured 2026-11-02: one truncated tracked
+        // file (`tortoise/__init__.py`, 0 bytes, a pure 383-line deletion)
+        // froze a shared hub for ~12h across 7 live sessions, and every
+        // prescribed route was refused by another gate.
+        //
+        // D3 is PRESERVED, not reversed: an escape hatch opens a RECOVERY
+        // window, never feature work. Create/force/detach spellings stay
+        // blocked, `git checkout -- .` (a whole-tree wipe) stays blocked — a
+        // deliberate discard must NAME its paths — and every non-restore verb
+        // in this function is untouched.
+        if (!escapeActive) return "block";
+        if (_invSelectsRepo(inv)) return "block"; // round-5 target fail-open
+        if (["-b", "-B", "-c", "-C", "-f", "--force", "--create", "--force-create", "--orphan", "--detach"].some(flag) ||
+            a.some((x) => x.startsWith("--force-create=") || /^-[bBcC][^-]/.test(x))) return "block";
+        // ALLOWLIST, not a denylist (review P1, measured). The first cut accepted
+        // ANY operand before `--`, so `git checkout feat-side -- src/app.js` was
+        // permitted under the hatch and wrote another branch's blob into the
+        // shared hub AND STAGED it — feature work, the D3 clause this window
+        // must not touch. The only pre-`--` operand a restore may carry is the
+        // literal `HEAD` (restore-from-HEAD); every other ref is out of window.
+        const dash = a.indexOf("--");
+        const preOps = a.slice(0, dash).filter((x) => !x.startsWith("-"));
+        if (preOps.length > 1) return "block";
+        if (preOps.length === 1 && preOps[0] !== "HEAD") return "block";
+        // Harmless modifiers only (quiet/no-overlay/progress/patch/merge); an
+        // unknown flag is out of window — the same allowlist polarity, so a
+        // spelling this arm never enumerated cannot ride in.
+        const preFlags = a.slice(0, dash).filter((x) => x.startsWith("-") &&
+          !/^-(q|n|p|m)$/.test(x) && !/^--(quiet|no-overlay|progress|patch|merge)$/.test(x));
+        if (preFlags.length > 0) return "block";
+        // Operands AFTER `--` are paths: at least one is required (`checkout --`
+        // alone restores nothing), `.`/pathspec magic is refused (whole-tree
+        // discard, not a named recovery).
+        const paths = a.slice(dash + 1).filter((x) => !x.startsWith("-"));
+        if (paths.length === 0) return "block";
+        if (paths.some((x) => x === "-" || !_isNamedPathOperand(x))) return "block";
+        return "recovery";
+      }
       // Round-23 (final gate P1): force-create in ANY spelling (attached
       // short-option `-Cmain`/`-Bmain`, long-option equals `--force-create=`)
       // evaded the exact-match flag list and classified the HUB-path checkout
@@ -4725,6 +4874,26 @@ export function isHubRecoveryInvocation(verb, args, currentBranch) {
         if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) return "block";
       }
       if (verb === "pull" && !flag("--ff-only")) return "block";
+      return "recovery";
+    }
+    case "restore": {
+      // Same recovery window as the `checkout --` path-restore above: without
+      // it the gate's advice is a no-op and the dirt cannot be cleared.
+      if (!escapeActive) return "block";
+      if (_invSelectsRepo(inv)) return "block"; // round-5 target fail-open
+      // ALLOWLIST (review P2, measured): the denylist `x.startsWith("--source")`
+      // missed git's unambiguous long-option ABBREVIATIONS — `git restore --sour
+      // HEAD~1 a.txt` runs and restored HEAD~1's content while classifying
+      // `recovery`, i.e. the arbitrary-tree rollback the arm exists to refuse,
+      // reachable through a sibling spelling. Only the working-tree/index
+      // modifiers below are in window; every other flag (including `--source`,
+      // `--sour`, `-s`, `--patch`) is out.
+      const RESTORE_FLAGS = /^-[SWq]+$/; // bundled shorts too: `-SW` is a valid, standard spelling
+      const RESTORE_LONGS = /^--(staged|worktree|quiet|progress|overlay|no-overlay|ignore-unmerged)$/;
+      const bad = a.filter((x) => x.startsWith("-") && x !== "--" && !RESTORE_FLAGS.test(x) && !RESTORE_LONGS.test(x));
+      if (bad.length > 0) return "block";
+      if (pos.length === 0) return "block";
+      if (pos.some((x) => x === "-" || !_isNamedPathOperand(x))) return "block";
       return "recovery";
     }
     case "status":
@@ -5503,24 +5672,146 @@ export function hubNewFileVolumeVerdict(count) {
  * @param {string} command
  * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
  */
-export function evaluateHubGate(command, currentBranch) {
+/** #1484 M4 — the recovery advice must be ACTIONABLE in the state that tripped
+ *  the gate. `git checkout main && git pull --ff-only` is a NO-OP on a DIRTY
+ *  tree: git refuses to switch branches over modified paths, and an
+ *  already-main dirty hub has nothing left to do. Measured 2026-11-02 — a hub
+ *  carrying one truncated tracked file (0 bytes, a pure deletion) answered
+ *  `git checkout -- <path>` with "run `git checkout main`", a command that
+ *  cannot recover it; the hub stayed dirty ~12h across 7 live sessions. The
+ *  gate answered before its own inputs existed. A dirty hub therefore gets the
+ *  DIRT recovery (the named-path restore family an active escape hatch
+ *  sanctions — see isHubRecoveryInvocation) and an explicit statement that the
+ *  branch route does not apply. Clean/off-main-only keeps the branch route,
+ *  which DOES work there. */
+const REPO_SELECTING_ENV = {
+  GIT_DIR: true, GIT_WORK_TREE: true, GIT_INDEX_FILE: true,
+  GIT_OBJECT_DIRECTORY: true, GIT_ALTERNATE_OBJECT_DIRECTORIES: true, GIT_COMMON_DIR: true,
+};
+
+/** Round 15: ONE predicate for "this env var selects/redirects a repo", used by
+ *  BOTH the decision (`_invSelectsRepo`) and the message (`_ambientGitEnvLines`).
+ *  Two copies drifted: the message flagged GIT_CONFIG_NOSYSTEM, which the
+ *  decision exempts (it only suppresses /etc/gitconfig). */
+export function isRepoSelectingEnvKey(k) {
+  if (Object.prototype.hasOwnProperty.call(REPO_SELECTING_ENV, k)) {
+    return (process.env[k] ?? "").length > 0;
+  }
+  if (/^GIT_CONFIG_/.test(k) && !/^GIT_CONFIG_NOSYSTEM$/.test(k)) {
+    const v = process.env[k] ?? "";
+    return v.length > 0 && v !== "/dev/null";
+  }
+  return false;
+}
+
+/** Round 8 (P2): name an INHERITED repo-selecting env instead of prescribing a
+ *  restore that cannot converge. Empty when the process env is clean. */
+function _ambientGitEnvLines() {
+  // Round 15: the SAME predicate the DECISION uses (two copies drifted and the
+  // message declared a still-recoverable hub unrecoverable).
+  const found = Object.keys(process.env).filter(isRepoSelectingEnvKey);
+  if (found.length === 0) return [];
+  return [
+    `   ⚠️ THIS PROCESS INHERITED a repo-selecting env (${found.join(", ")}) — every`,
+    `     restore from here would target THAT checkout, not this hub, so the`,
+    `     recovery window is CLOSED and no command above can converge. Restart pi`,
+    `     without those variables, then restore here.`,
+  ];
+}
+
+export function hubDirtyRecoveryLines(hubContext, hatchActive = false) {
+  const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
+  if (!dirty) return [];
+  _dirtyHatchActive = hatchActive === true;
+  return _dirtyRecoveryBody();
+}
+
+/** Round 10 (P2): the dirty text must know whether the reader ALREADY holds the
+ *  hatch. Telling a hatched lane to "set AGENT_ALLOW_MAIN_EDITS=1 or stamp the
+ *  marker" is the round-4 defect (it prescribes what the reader has) left on the
+ *  M4 surface: measured `git checkout -- .` under an active marker, where the real
+ *  cause is `.` being a whole-tree pathspec, not a missing hatch. */
+function _hatchParagraph(hatchActive) {
+  if (hatchActive) {
+    return [
+      `     Your hatch IS active, so the route above is permitted — NAME the paths`,
+      `     (\`.\`, pathspec magic, a glob or a \`..\` operand is NOT a named path) and`,
+      `     run ONE bare command from the hub: no \`;\`/\`&&\`/pipe, no redirect, no`,
+      `     \`cd … &&\` prefix, no \`-C\`/\`GIT_DIR\` target, no wrapper (\`env\`/\`nice\`).`,
+    ];
+  }
+  return [
+    `     These named-path recoveries need an active escape hatch: the`,
+    `     AGENT_ALLOW_MAIN_EDITS=1 session-start env, or the`,
+    `     ~/.pi/agent/.allow-main-edits marker (same hatches #709 documents).`,
+  ];
+}
+
+let _dirtyHatchActive = false;
+
+function _dirtyRecoveryBody() {
+  const _ambientLines = _ambientGitEnvLines();
+  return [
+    `   → Recover the DIRT — a branch switch cannot clear it (\`git checkout main\` may`,
+    `     refuse or carry the change along; \`git pull --ff-only\` may fast-forward or`,
+    `     refuse). Which command depends on WHICH dirt; \`git status --porcelain\``,
+    `     tells you (column 1 = index, column 2 = worktree):`,
+    `       staged/index change  \`M \`  -> \`git restore --staged --worktree <path>\``,
+    `                                     (one command: unstage AND restore — a bare`,
+    `                                      \`--staged\` leaves the file MODIFIED, so the`,
+    `                                      hub stays dirty and you are refused again)`,
+    `       worktree change      \` M\`  -> \`git restore <path>\` / \`git checkout -- <path>\``,
+    `       UNTRACKED            \`??\`  -> move it OUT: \`mv <path> /tmp/\` (\`git clean\``,
+    `                                        stays refused — it is a discard)`,
+    // Round 8 (P2): if this process INHERITED a repo-selecting env, no restore
+    // from here can converge — the recovery window is closed and every restore
+    // would target the other checkout. Name the cause instead of prescribing a
+    // command that cannot run (the incident's exact failure shape).
+    // Round 17 (P2): these are MUTUALLY EXCLUSIVE. When a repo-selecting env is
+    // inherited the window is closed, so the hatch paragraph's "the route above is
+    // permitted, run ONE bare command" would contradict the paragraph immediately
+    // above it and prescribe a command measured to be BLOCKED. Emit one or the
+    // other.
+    ...(_ambientLines.length > 0 ? _ambientLines : _hatchParagraph(_dirtyHatchActive)),
+    `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+  ];
+}
+
+function _m4RecoveryLines(hubContext, hatchActive = false) {
+  const dirty = hubContext?.disorder === "dirty" || hubContext?.disorder === "both";
+  if (!dirty) {
+    return [
+      `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
+      `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+    ];
+  }
+  _dirtyHatchActive = hatchActive === true;
+  return _dirtyRecoveryBody();
+}
+
+export function evaluateHubGate(command, currentBranch, opts = {}) {
+  const escapeActive = opts.escapeActive === true;
+  const hatchActive = typeof opts.hatchActive === "boolean" ? opts.hatchActive : escapeActive;
+  const hubContext = opts.hubContext ?? null;
   const invocations = allGitInvocations(command);
   if (invocations.length === 0) return { verdict: "non-git" };
   let sawRecovery = false;
   for (const inv of invocations) {
     if (!inv.verb) continue;
-    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, escapeActive, inv);
     if (v === "block") {
       return {
         verdict: "block",
         reason: [
           `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          ..._m4CheckoutLines(hubContext),
           `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
           `   Sanctioned recovery ops only: git checkout main|master, git pull`,
           `   --ff-only, git fetch, git status, git log, git worktree`,
-          `   add|list|prune, git push origin <checked-out-branch> (WIP), marker touch.`,
-          `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-          `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+          `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
+          `   git restore <path> / git checkout -- <path> under an active escape`,
+          `   hatch, marker touch.`,
+          ..._m4RecoveryLines(hubContext, hatchActive),
         ].join("\n"),
       };
     }
@@ -5576,8 +5867,10 @@ function _mainProtectionReason(inv, hubContext, ...notes) {
     ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
     `   ${note}`,
-    `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-    `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+    // No `escapeActive` in scope here by design: these are FEATURE-WORK refusals
+    // (main-protection / shared-ref), so the hatch must not be described as the
+    // route — the hatch never opens them (D3).
+    ..._m4RecoveryLines(hubContext),
   ].join("\n");
 }
 
@@ -6178,7 +6471,18 @@ function _worktreeCheckoutBlock(inv, target, currentBranch, hubContext = null) {
  *   — the resolved disordered checkout, so every block reason can NAME it
  *   (#1125). Omitted/absent → no `Checkout:` line (2-arg callers unchanged).
  */
-export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null, hubContext = null) {
+export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null, hubContext = null, opts = {}) {
+  // #1484 M4 recovery window: an ACTIVE escape hatch is threaded in from the
+  // caller (index.ts passes `_isAllowMainEdits() || markerOn`). Without it the
+  // recovery allowlist cannot answer "with the marker, is this restore
+  // permitted?" — which is exactly why #709's documented marker appeared to do
+  // nothing here (measured 2026-11-02).
+  const escapeActive = opts.escapeActive === true;
+  // Round 11 (P2): the DECISION uses `escapeActive` (hatch AND bare-`git` shape),
+  // but the MESSAGE must know whether the hatch itself is held — otherwise a
+  // hatched lane refused for a SHAPE reason (`nice …`, `cd … && …`, a wrapper) is
+  // told to acquire the hatch it already has, and the real cause is never named.
+  const hatchActive = typeof opts.hatchActive === "boolean" ? opts.hatchActive : escapeActive;
   const invocations = allGitInvocations(command);
   // Round-5/6 (second-model P1): eval / $( ) / backtick / alias / function
   // command substitution is an UNVERIFIABLE one-token shell construct — the
@@ -6194,8 +6498,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
-        `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-        `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+        ..._m4RecoveryLines(hubContext, hatchActive),
       ].join("\n"),
     };
   }
@@ -6212,12 +6515,11 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
-          `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-          `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+          ..._m4RecoveryLines(hubContext, hatchActive),
         ].join("\n"),
       };
     }
-    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, escapeActive, inv);
     // Main-protection interception for the SANCTIONED form: `checkout main` from
     // a worktree while the hub is off-main lets the wt take the protected branch
     // (git allows it — main is free) and then commit/push mutate main.
@@ -6410,9 +6712,10 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
           `   Sanctioned recovery ops only: git checkout main|master, git pull`,
           `   --ff-only, git fetch, git status, git log, git worktree`,
-          `   add|list|prune, git push origin <checked-out-branch> (WIP), marker touch.`,
-          `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
-          `   → Feature work: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+          `   add|list|prune, git push origin <checked-out-branch> (WIP),`,
+          `   git restore <path> / git checkout -- <path> under an active escape`,
+          `   hatch, marker touch.`,
+          ..._m4RecoveryLines(hubContext, hatchActive),
         ].join("\n"),
       };
     }
@@ -9732,7 +10035,7 @@ function _gitInvocationsVerdict(invocations, currentBranch, executionCwd, sessio
   for (const inv of invocations) {
     if (!inv.verb) continue;
     if (inv.verb === "__unverifiable__") return "block"; // round-12: multiword $VAR command
-    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch);
+    const v = isHubRecoveryInvocation(inv.verb, inv.args, currentBranch, false, inv);
     // Round-20 (second-model P1): the script surface lacked the bash gate's
     // recovery-checkout main-protection — `cd <wt> && bash evil.sh` with
     // `git checkout main` content (hub off-main) takes the protected branch.

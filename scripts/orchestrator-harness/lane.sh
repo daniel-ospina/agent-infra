@@ -96,7 +96,28 @@ command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_a
 # defects that produced from wrapping it). Fail LOUD if it is missing — an unsourced snippet would silently
 # restore the 7-second death this exists to remove.
 [ -r "$SELF/lane-env.sh" ] || { echo "[lane $N] FATAL: $SELF/lane-env.sh missing — refusing to start a lane whose credentials nothing sourced (#3060)" >&2; exit 78; }
+# ⛔ THE TARGET IS AN ARGUMENT, AND SOURCING AN ENV FILE MUST NOT BE ABLE TO REPLACE IT (measured
+# 2026-11-01). `keys.env` on a cell carries `export OR=<owner/name>` (it is the CONTROLLER's default,
+# written for loops that mean it). Sourced here as a top-level snippet, that line silently overwrote the
+# target this lane was DISPATCHED for — so `repo_target_assert` compared the worktree against the
+# ENV FILE's repo, and a correct dispatch was refused with `reason=slug-mismatch` naming a repo nobody
+# asked for. The gate exists because the worktree must be the repo that was ASKED FOR; an ambient `OR`
+# is exactly the "default two programs invented" #1974 removed. Save the parsed target across the
+# sourcing and restore it, so the argument keeps the last word.
+#
+# ⛔ THE WHOLE DISPATCH-OWNED SET, NOT JUST THE TARGET (review of #3174, P2). `OR` was the variable the
+# refusal happened to name, but the same file can carry `export N=…`, `export BR=…`, `export O=…` or
+# `export LANE_REPO_DIR=…`, and each moves something the DISPATCH decided: which issue's brief is built,
+# which branch is asserted, where the lane records, and which checkout is compared. This is the class
+# `scripts/pr-repair-loop.sh` already settled — "`keys.env` remains authoritative for CREDENTIALS … it
+# may not move WHAT this box repairs or WHERE it records that." So the file keeps the last word on
+# CREDENTIALS (PATH, tokens, DSNs — see lane-env.test.sh A6) and the dispatch keeps it on these five.
+LANE_TARGET_ARG="$OR"; LANE_ISSUE_ARG="$N"; LANE_BRANCH_ARG="$BR"
+LANE_REPO_DIR_ARG="$LANE_REPO_DIR"; LANE_OUT_ARG="$O"
 LANE_ENV_LOG="$O/logs/lane-$N.log" LANE_ENV_LABEL="lane $N" . "$SELF/lane-env.sh"
+OR="$LANE_TARGET_ARG"; N="$LANE_ISSUE_ARG"; BR="$LANE_BRANCH_ARG"
+LANE_REPO_DIR="$LANE_REPO_DIR_ARG"; O="$LANE_OUT_ARG"
+unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_ARG
 
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
@@ -456,7 +477,13 @@ fi
 # wrong, and the lane log would end with no MERGED line even on a PR that merges (the chain is detached,
 # so the merge itself still completes — which is exactly why the missing line would be silent). The
 # bound is still a bound, and LANE_TIMEOUT overrides it as before.
-run_agent "${LANE_TIMEOUT:-3300}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
+# ⛔ AND SINCE agent-infra#2888 THAT BOUND IS THE ABSOLUTE BACKSTOP, NOT THE PRIMARY ONE: it no longer
+# defaults to a number of its own. The bound that decides wedged-vs-slow is `lane-bound.sh`'s PROGRESS
+# allowance (45 min, the fleet's own), and a lane that keeps working is no longer killed by elapsed
+# time — this argument is the ceiling for a lane that creeps forward for ever. It therefore takes the
+# ONE default (`LANE_BACKSTOP_S`, spawn-gate.sh) rather than a local literal, because three separate
+# literals is how the flat 40-minute cap outlived the allowance that contradicted it.
+run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
