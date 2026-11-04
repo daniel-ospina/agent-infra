@@ -167,14 +167,12 @@ fi
 drift=0
 checked=0
 appeared=""
-# ⛔ ONE PARSE RULE FOR THE LOOP AND THE RECONCILIATION (review of #3422, P1). An explicit
-# "two spaces" separator here while the reconciliation split on ANY whitespace made the two disagree:
-# a record line whose separator was a TAB (or a single space) was DROPPED by this loop and still
-# MATCHED by the reconciliation — counted as recorded, never measured, exit 0 — which was also a
-# regression against the pre-#3405 `read -r digest name` that measured those lines. The field split is
-# therefore plain whitespace (the shell's own, as awk does) and the FIELDS are validated instead: a
-# malformed token is DRIFT, never a skip.
-while read -r digest name _rest; do
+# ⛔ ONE PARSE RULE FOR THE LOOP AND THE RECONCILIATION (review of #3422). The round-5 draft parsed
+# with an explicit "two spaces" separator while the reconciliation split on ANY whitespace, so the two
+# disagreed about what a record line IS. The split is now plain whitespace (the shell's own, exactly
+# what awk does) and the FIELDS are validated instead: a malformed token is DRIFT, never a skip. The
+# remaining divergence is the unterminated last line, closed by the loop tail below.
+while read -r digest name _rest || [ -n "${digest:-}${name:-}" ]; do
     case "$digest" in ''|'#'*|*=*) continue ;; esac
     if [ -z "${name:-}" ]; then
         warn "DRIFT     (malformed record line, no name field): $digest"
@@ -232,6 +230,10 @@ while read -r digest name _rest; do
         fi
     fi
     say "same      $name $now"
+# ⛔ `read` DOES NOT RUN ITS BODY FOR A FINAL LINE WITHOUT A TRAILING NEWLINE (review of #3422, P2).
+# A truncated record — the delta's own stated threat model — therefore dropped its last line here while
+# the awk reconciliation read it normally: `deployed ok (8 files)`, exit 0, with a pinned delegate
+# DELETED. The `|| [ -n ... ]` tail makes the unterminated last line measure like any other.
 done < "$RECORD"
 
 # ⛔ THE RECORD IS RECONCILED WITH THE PINNED SET (review of #3405, P2). The loop above iterates the

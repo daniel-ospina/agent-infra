@@ -2495,6 +2495,50 @@ OUT="$(REAPER_OVERRIDE="$MUT5" GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_L
     FAKE_LATE_COUNTER="$T/$ENV/cnt-e2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
 assert_nodir "$WT_LATEE2" "A21e MUTANT GOES RED: without the post-archive re-check the checkout IS removed"
 assert_nofile "$WT_LATEE2/.env" "A21e …taking the late ignored file with it (the exposure this closes)"
+
+# A21f — LANE EVIDENCE THAT APPEARS DURING THE ARCHIVE (review of #3422, P2). `clean_gate` tolerates
+# IGNORED_LANE_EVIDENCE because `preserve_before_removal` is ABOUT TO archive it — a precondition that is
+# SPENT once the archive has run. Re-applying that tolerance blind after the archive means a
+# `WORKTREE-REPORT.md` created during it reads as `clean`, the removal proceeds, and the lane's mandatory
+# report — the class gate (b) exists for — is destroyed without ever being captured. Measured before the
+# fix: same fixture and probe index, `.env` => PRESERVE, `WORKTREE-REPORT.md` => REMOVED with
+# `evidence=none`.
+ENV=A21f; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence'
+WT_LATEF="$(add_named_wt "$REPO" "$ENV-late" feat/a21f-late)"
+mkdir -p "$WT_LATEF/.venv/bin"; printf 'py\n' >"$WT_LATEF/.venv/bin/python"
+rm -f "$T/$ENV/cnt-f"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEF/WORKTREE-REPORT.md" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-f" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21f lane evidence created during the archive is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence changed after the archive" \
+    "A21f …and the log names the reason (the archived set and the current set differ)"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21f nothing was removed"
+assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21f it is counted as a late preserve"
+assert_file "$WT_LATEF/WORKTREE-REPORT.md" "A21f the lane's MANDATORY report SURVIVED"
+assert_dir "$WT_LATEF" "A21f the worktree is still on disk"
+# MUTANT: drop the archived-vs-current comparison and the same fixture loses the report.
+MUT6="$T/$ENV/pi-reap-worktrees.mutant-evidence.sh"
+awk '
+    /BUT `clean` HERE STILL TOLERATES THE LANE EVIDENCE/ { skip = 1 }
+    skip && /^        fi$/ { skip = 0; next }
+    !skip { print }
+' "$REAPER" >"$MUT6"
+if cmp -s "$REAPER" "$MUT6"; then
+    bad "A21f the LANE-EVIDENCE MUTANT DID NOT APPLY — the comparison is unverified"
+else
+    ok "A21f mutant applied: the archived-vs-current comparison is removed"
+fi
+WT_LATEF2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21f-late2)"
+mkdir -p "$WT_LATEF2/.venv/bin"; printf 'py\n' >"$WT_LATEF2/.venv/bin/python"
+rm -f "$T/$ENV/cnt-f2"
+OUT="$(REAPER_OVERRIDE="$MUT6" GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEF2/WORKTREE-REPORT.md" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-f2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_LATEF2" "A21f MUTANT GOES RED: without the comparison the checkout IS removed"
+assert_nofile "$WT_LATEF2/WORKTREE-REPORT.md" "A21f …taking the mandatory report with it"
+
 # …AND THE ORDERING THE INSERTION DEPENDS ON (review of #3422, P3): the doc row claims
 # `holder_recheck` stays the LAST probe before the fork. Nothing else asserts it, and it is the reason
 # the block is safe to insert here at all, so it is pinned on the source itself.
@@ -4729,8 +4773,16 @@ assert_eq "$(find "$T/$ENV/state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -
     "A27j no \`.tmp.<pid>\` is left behind by the failed move"
 
 echo ""
-_missing_n="$(wc -l <"$_MISSING_LOG" 2>/dev/null | tr -d ' ')"
-[ -n "$_missing_n" ] || _missing_n=0
+# ⛔ AND IT MUST NOT FAIL OPEN WHEN THE RECORD CANNOT BE READ (review of #3422, P3): the creation
+# arm above only covers `mktemp`; an unreadable/removed record makes `wc -l` yield nothing, which the
+# old `|| _missing_n=0` turned into "no undefined commands" — green. An unreadable record is a FAILURE.
+if [ ! -r "$_MISSING_LOG" ]; then
+    FAIL=$((FAIL + 1)); _missing_n=0
+    echo "  ❌ harness bug: the undefined-command record is unreadable ($_MISSING_LOG) — the detector cannot report"
+else
+    _missing_n="$(wc -l <"$_MISSING_LOG" | tr -d ' ')"
+    [ -n "$_missing_n" ] || _missing_n=0
+fi
 if [ "$_missing_n" != 0 ]; then
     FAIL=$((FAIL + _missing_n))
     echo "  ❌ $_missing_n command(s) were UNDEFINED — those assertions never ran:"

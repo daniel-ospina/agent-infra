@@ -1837,7 +1837,7 @@ clean_gate() {
 # mid-edit when its PR auto-merged is the ordinary case).
 preserve_before_removal() { # <path> <sha> <branch> <reason>
     local path="$1" sha="$2" br="$3" why="$4"
-    local slug day dir ev tarf tarf_tmp out listed e rc ok=1 disc root mf
+    local slug day dir ev tarf out listed e rc ok=1 disc root mf
     root="${PRESERVE_ROOT_RESOLVED:-$(preserve_dir_resolve)}" || {
         log "PRESERVE-FAIL $path no writable preserve root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — nothing may be removed"
         return 1
@@ -1881,13 +1881,15 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
         # $ev is space-free ROOT names by construction (see IGNORED_LANE_EVIDENCE) — the same
         # discipline the ephemeral payload relies on. `-C "$path"` keeps the member names relative.
         # shellcheck disable=SC2086
-        # The tarball is built OFF-ROOT and moved in by a bounded child, for the same reason: `tar`
-        # opens its OUTPUT before the watchdog is armed when it is pointed at the archive root.
-        tarf_tmp="$out.tgz"
-        run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -czf "$tarf_tmp" -C "$path" $ev
+        # ⛔ THE TARBALL IS WRITTEN STRAIGHT INTO THE ARCHIVE, AND THAT IS BOUNDED (review of #3422,
+        # P3). `tar` IS the watchdog's child, so its own open() of the output happens inside the
+        # bounded fork; only `tb_run`'s `: >"$out"` redirect happens in the caller's shell, which is
+        # why the diff/status/manifest halves needed fs_write_bounded and this one does not. Round 5
+        # rebuilt the tarball off-root "for the same reason" — a false premise, and it made the ONE
+        # large artefact be written TWICE (peak usage doubled in $TMPDIR on the box being reclaimed)
+        # while a pass killed after this step left a tarball-sized `pi-reap-presv.*.tgz` behind.
+        run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -czf "$tarf" -C "$path" $ev
         rc=$?
-        if [ "$rc" = 0 ] && ! fs_write_bounded "$REAP_WT_REMOVE_TIMEOUT" "$tarf" "$tarf_tmp"; then rc=1; fi
-        rm -f "$tarf_tmp"
         if [ "$rc" != 0 ]; then
             log "PRESERVE-FAIL $path lane-evidence tar rc=$rc"
             fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true
@@ -3696,6 +3698,7 @@ holder_recheck() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
+    local ev_archived ev_now
     local path="$1" sha="$2" br="${3:-}" why="${4:-}" presv=""
     local eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
@@ -3796,6 +3799,22 @@ remove_one() {
         if [ "$cverdict" != clean ]; then
             REMOVE_SKIP_VERDICT="$cverdict"
             log "REMOVE-SKIP $path post-archive re-check not clean ($cverdict: $cpay) — nothing removed, the archive is kept"
+            rm -f "$out"; return 2
+        fi
+        # ⛔ BUT `clean` HERE STILL TOLERATES THE LANE EVIDENCE, AND THE TOLERANCE IS SPENT (review of
+        # #3422, P2). `clean_gate` admits IGNORED_LANE_EVIDENCE because `preserve_before_removal` is
+        # ABOUT TO archive it — a precondition that no longer holds once the archive has run. A
+        # `WORKTREE-REPORT.md` that appears during the archive therefore read as `clean`, the removal
+        # proceeded, and the lane's mandatory report (the very class gate (b) exists for) was destroyed
+        # without ever being captured: measured, same fixture and probe index, `.env` ⇒ PRESERVE,
+        # `WORKTREE-REPORT.md` ⇒ REMOVED with `evidence=none`. So the tolerated payload is compared
+        # against what the archive ACTUALLY captured: a set that grew is not covered.
+        ev_archived="$(sed -n 's/^lane_evidence=//p' "$presv/manifest.txt" 2>/dev/null | head -1)"
+        ev_now="$(lane_evidence_present "$path")"
+        [ -n "$ev_now" ] || ev_now="<none>"
+        if [ "$ev_now" != "${ev_archived:-<none>}" ]; then
+            REMOVE_SKIP_VERDICT="lane-evidence-appeared"
+            log "REMOVE-SKIP $path lane evidence changed after the archive ('${ev_archived:-<none>}' -> '$ev_now') — nothing removed, the archive is kept"
             rm -f "$out"; return 2
         fi
     fi

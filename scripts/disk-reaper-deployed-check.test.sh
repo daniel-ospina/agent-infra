@@ -249,17 +249,31 @@ has "$OUT" "SOURCE-DRIFT lib/live-paths.sh" "D12 …and it is named as a deploye
 # kept saying ok after that file was DELETED (review of #3405 round 5, P2).
 mk_env
 run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
-sed -i 's|^[0-9a-f]\{64\}  pi-reap-worktrees.sh$|  pi-reap-worktrees.sh|' "$REC"
+# ⛔ NO `sed -i` (review of #3422, P1): `sed -i` without a backup suffix is a GNU-only form and
+# `scripts/check-portability-traps.sh` reds the repo's own tree for it (the suite runs on BSD hosts,
+# where it would silently not edit the record and this arm would pass for the wrong reason). The
+# rewrite is a python one-liner, with the result ASSERTED before the arm asserts anything.
+python3 - "$REC" <<'PYBLANK'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s2 = re.sub(r'(?m)^[0-9a-f]{64}  pi-reap-worktrees\.sh$', '  pi-reap-worktrees.sh', s)
+assert s2 != s, "the blank-digest rewrite did not apply"
+open(p, 'w').write(s2)
+PYBLANK
+if grep -qxF '  pi-reap-worktrees.sh' "$REC"; then ok "D13 the blank-digest rewrite APPLIED"; else bad "D13 the blank-digest rewrite DID NOT APPLY — the arm is unverified"; fi
 OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
 eq "$RC" "1" "D13 a record line with a BLANK digest field is drift (exit 1)"
 has "$OUT" "malformed record line" "D13 …named as a malformed line, not silently skipped"
 rm -f "$T/deployed/pi-reap-worktrees.sh"
 OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
 eq "$RC" "1" "D13 …and the file is STILL not certified ok once it is deleted (the old hole)"
-# ⛔ THE SEPARATOR MUST NOT DECIDE WHETHER A FILE IS MEASURED (review of #3422, P1). An explicit
-# "two spaces" parse paired with an awk reconciliation that split on ANY whitespace meant a TAB or
-# single-space record line was dropped by the loop and still matched by the reconciliation: counted as
-# recorded, never measured, exit 0 — for a 9-file set with a delegate DELETED.
+# ⛔ THE SEPARATOR MUST NOT DECIDE WHETHER A FILE IS MEASURED (review of #3422). These are REGRESSION
+# guards for the parser, not for the blank-digest hole (that is the arm above): the round-5 draft
+# parsed with an explicit "two spaces" while the reconciliation split on ANY whitespace, so the two
+# could disagree about what a record line IS. Each arm now PROVES the rewrite applied before it
+# asserts anything — otherwise a missing python3 or a no-op rewrite would leave a valid record and both
+# arms would pass for the wrong reason.
 for sep in '\t' ' '; do
     mk_env
     run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
@@ -271,19 +285,53 @@ s = re.sub(r'^(?=[0-9a-f]{64}  pi-reap-worktrees\.sh$)', '', s, flags=re.M)
 s = s.replace('  pi-reap-worktrees.sh', sep + 'pi-reap-worktrees.sh')
 open(rec, 'w').write(s)
 PYSEP
+    if grep -qF "$(printf '%b' "$sep")pi-reap-worktrees.sh" "$REC" \
+            && ! grep -qF "  pi-reap-worktrees.sh" "$REC"; then
+        ok "D13 the $(printf '%q' "$sep")-separator rewrite APPLIED to the record"
+    else
+        bad "D13 the $(printf '%q' "$sep")-separator rewrite DID NOT APPLY — the arm is unverified"
+        continue
+    fi
     rm -f "$T/deployed/pi-reap-worktrees.sh"
     OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
     eq "$RC" "1" "D13 a record line with a $(printf '%q' "$sep") separator still MEASURES (drift on a deleted file, exit 1)"
     has "$OUT" "DRIFT     pi-reap-worktrees.sh" "D13 …and names the missing file"
 done
+# ⛔ A TRUNCATED RECORD LOSES ITS LAST LINE TO `read`, NOT TO THE CHECK (review of #3422, P2): the loop
+# body never runs for a final line without a trailing newline, while the reconciliation read it — so the
+# last pinned file could be DELETED and the summary still read ok. The threat model this PR states is
+# "a truncated or hand-edited record", which is exactly this shape.
+mk_env
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+python3 - "$REC" <<'PYTRUNC'
+import sys
+p = sys.argv[1]
+b = open(p, "rb").read()
+assert b.endswith(b"\n"), "the stamp should end with a newline"
+assert b"lib/live-paths.sh" in b, "the last pinned file should be live-paths.sh"
+open(p, "wb").write(b.rstrip(b"\n"))
+PYTRUNC
+if [ -n "$(tail -c1 "$REC")" ]; then ok "D14 the record's trailing newline was REMOVED"; else bad "D14 the truncation DID NOT APPLY — the arm is unverified"; fi
+rm -f "$T/deployed/lib/live-paths.sh"
+OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
+eq "$RC" "1" "D14 a TRUNCATED record still measures its last line (drift on a deleted file, exit 1)"
+has "$OUT" "DRIFT     lib/live-paths.sh" "D14 …and names it"
 mk_env
 run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
 printf 'stamped_at=2026-01-01T00:00:00Z\nsource=-\n' >>"$REC"
 OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
 eq "$RC" "0" "D13 control: header lines (no two-space field) are not read as malformed file lines"
 
-_missing_n="$(wc -l <"$_MISSING_LOG" 2>/dev/null | tr -d ' ')"
-[ -n "$_missing_n" ] || _missing_n=0
+# ⛔ AND IT MUST NOT FAIL OPEN WHEN THE RECORD CANNOT BE READ (review of #3422, P3): the creation
+# arm above only covers `mktemp`; an unreadable/removed record makes `wc -l` yield nothing, which the
+# old `|| _missing_n=0` turned into "no undefined commands" — green. An unreadable record is a FAILURE.
+if [ ! -r "$_MISSING_LOG" ]; then
+    FAIL=$((FAIL + 1)); _missing_n=0
+    echo "  ❌ harness bug: the undefined-command record is unreadable ($_MISSING_LOG) — the detector cannot report"
+else
+    _missing_n="$(wc -l <"$_MISSING_LOG" | tr -d ' ')"
+    [ -n "$_missing_n" ] || _missing_n=0
+fi
 if [ "$_missing_n" != 0 ]; then
     FAIL=$((FAIL + _missing_n))
     echo "  ❌ $_missing_n command(s) were UNDEFINED — those assertions never ran:"
