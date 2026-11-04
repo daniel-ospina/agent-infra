@@ -83,12 +83,26 @@ SH
   ARMWT="$d/repo/.worktrees/tm-3331"
 }
 
+# ⛔ `ENV_FILE` IS PINNED TO A FIXTURE-OWNED (ABSENT) FILE, AND THAT IS NOT COSMETIC — IT IS WHAT MAKES
+# THE SUITE HERMETIC IN THE FIRST PLACE. `lane.sh` dots `lane-env.sh`, which sources
+# `${ENV_FILE:-$HOME/keys.env}`; `ENV_FILE` is exported by the CONTROLLER, so a suite run on a real box
+# inherits the box's own `keys.env`. That file carries `PATH` and `HOME` (measured: 13 assignments, two
+# of them those), so sourcing it AFTER `lane.sh:65` prepended `$O/gh-rest` **displaced the fixture's `gh`
+# adapter** and returned the REAL repository's state to the creation gate (#2409).
+# MEASURED 2026-11-04 while rebasing #3342 onto main: every arm below refused with
+# `outcome=refused reason=land-backlog` because the gate read `41 open / 0.9 landings per hour` from the
+# live repo — a number the fixture's own adapter answers as `0`. That is the false-RED/false-GREEN class
+# this suite's `MAX_LOAD=999999` and the fixtures' `LANE_KEY_GATE=0` already exist to stop, one variable
+# further up: **a fixture that inherits the runner's environment is green on an idle box and red on a busy
+# one.** Pinning the seam (the same one `reviewer-preflight.test.sh` pins, "instead of depending on the
+# box's") is the root fix; a `gh`-only stub would leave `HOME`/`OR`/`REPO`/`PATH` still inherited.
+#
 # drive <worktree> [<VAR>=<value> …] — run the SHIPPED lane.sh in that worktree; echoes nothing, sets
 # LANE_RC. `pi` must already be exported by the caller. `TARGET_SLUG` overrides the repo the lane is told
 # to work on (arm 7d uses a WRONG one on purpose, to reach a refusal with a dry run).
 drive() {
   local wt="$1"; shift
-  ( cd "$wt" && env -u "$KEYVAR" O="$ARMDIR/o" HOME="$ARMDIR/home" \
+  ( cd "$wt" && env -u "$KEYVAR" O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
       bash "$LANE" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
@@ -97,7 +111,7 @@ drive() {
 # drive_bg <worktree> — the same, in the background, so a signal can reach the LANE process.
 drive_bg() {
   local wt="$1"; shift
-  ( cd "$wt" && exec env -u "$KEYVAR" O="$ARMDIR/o" HOME="$ARMDIR/home" \
+  ( cd "$wt" && exec env -u "$KEYVAR" O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
       bash "$LANE" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1 &
