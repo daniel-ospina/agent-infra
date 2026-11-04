@@ -4746,6 +4746,34 @@ STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENT_CAP
 assert_eq "$RECORD_RC" "5" "14.1d a failed body read is still a NAMED failure (rc 5)"
 assert_eq "$(dc_posts "$DC_PR")" "1" "14.1d …and the durable comment is STILL attempted — the channel exists for exactly this failure"
 
+# 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
+#      The recovery verb exists BECAUSE the body is the only copy of the verdict that
+#      travels — so handing the recovered marker back into that same MUTABLE field,
+#      with no durable twin, left a later body edit able to erase the only admitted
+#      copy of what the run had just restored. This vector reddens when the call is
+#      removed (measured: PASS=925 FAIL=1 with only that call deleted), which is the
+#      same discriminator shape as 14.1d(e).
+DC_RB_PR=424951
+rb_clear
+RB_M_E="$(rb_marker "$DC_RB_PR" "review recorded: reviews/${DC_RB_PR}.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — the 14.1e arm would otherwise fail on a MISSING marker"
+STUB_COMMENT_BODIES=""
+STUB_COMMENT_CAPTURE="$T/ccap_14e"
+STUB_BODY="PR body carrying a recovered verdict.
+
+$RB_M_E"
+export STUB_BODY STUB_COMMENT_BODIES STUB_COMMENT_CAPTURE
+: >"$LOG"
+run_recover "$DC_RB_PR" "$RB_REPO"
+assert_eq "$RB_RC" "0" "14.1e --recover-body still restores the record (exit 0)"
+assert_eq "$(dc_posts "$DC_RB_PR")" "1" "14.1e …and publishes the recovered marker to the durable comment channel"
+DC_RB_BODY="$(jq -r '.body // empty' "$T/ccap_14e" 2>/dev/null || true)"
+if [ -n "$DC_RB_BODY" ] && grep -qxF -- "$RB_M_E" <<<"$DC_RB_BODY"; then
+    ok "14.1e …carrying the RECOVERED marker line verbatim, alone on its line (gate-admissible)"
+else
+    bad "14.1e the durable comment did not carry the recovered marker line (capture: $DC_RB_BODY)"
+fi
+
 # 14.2 Fresh record (marker absent) with a stale FAILURE on the head: posts the
 #     marker AND re-runs the failed gate job in the same call.
 STUB_BODY="PR body" run_record_633 424321 "$SHA" \

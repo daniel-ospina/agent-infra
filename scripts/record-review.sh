@@ -1164,9 +1164,17 @@ post_marker_comment() { # <repo> <pr> <marker>
   if [ "$HAVE_COMMENT" = "0" ]; then
     if command jq -Rn --arg body "$marker" '{body: $body}' 2>/dev/null \
         | command gh api -X POST "repos/$repo/issues/$pr/comments" --input - >/dev/null 2>&1; then
-      echo "review evidence posted to $repo#$pr as a durable comment (body mirror retained: it is what re-triggers the gate)"
+      # ⛔ THIS FUNCTION CANNOT ASSERT THE BODY MIRROR'S STATE (#3168 fresh-review
+      # finding 2). It is shared by four arms, and THREE of them reach this line in a
+      # state where the body copy is NOT saved: the body READ failed, the body PATCH
+      # failed, or the body post has not run yet. The PATCH-failure arm even prints
+      # "CI reads the BODY, so the evidence is currently INVISIBLE" on the line above,
+      # so the two statements contradicted each other during exactly the 403 /
+      # spent-token window an operator is debugging. Each caller already reports its
+      # own body-channel outcome; this line reports ONLY what this function knows.
+      echo "review evidence posted to $repo#$pr as a durable comment"
     else
-      echo "note: could not post the durable comment copy of the review evidence (record and body copy still saved)" >&2
+      echo "note: could not post the durable comment copy of the review evidence" >&2
     fi
   fi
   return 0
@@ -2723,6 +2731,18 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     exit 5
   fi
   rm -f "$RB_TMP"
+  # ⛔ THE DURABLE CHANNEL, ALSO HERE (#3168 fresh-review finding 1). `--recover-body`
+  # exists BECAUSE the PR body is the only copy of the verdict that travels — so the
+  # one verb whose entire purpose is durability must not hand the recovered evidence
+  # back into the same MUTABLE field it was read from, leaving a later body edit able
+  # to erase the only admitted copy of what this run restored. `$RB_LINE` is the
+  # HMAC-VERIFIED marker line the scan above required, so post_marker_comment()'s own
+  # unsigned guard and line-anchored dedup apply here unchanged, exactly as at the
+  # mint and failure arms. ⛔ ITS STDOUT GOES TO STDERR: this verb's stdout is a
+  # MACHINE-READABLE tuple (`recovered<TAB><head><TAB><digest>`, pinned by 11.14a and
+  # 11.14p), so an informational line on stdout would corrupt the contract every
+  # caller parses. Best-effort: it cannot change this verb's result or exit.
+  post_marker_comment "$REPO" "$PR" "$RB_LINE" >&2 || true
   printf 'recovered\t%s\t%s\n' "$RB_HEAD" "${RB_DIFF:--}"
   echo "record-review.sh --recover-body: restored ${REPO}#$PR from the SIGNED marker in the PR body → ${RB_FILE/#$HOME/~} (verdict=${RB_VERDICT}, head=${RB_HEAD:0:12}…, mint=recovered-body). ⛔ reviewed_at is a LOWER BOUND, not the mint time: the review happened at or after the head commit's committer date ($RB_AT) — this box did not observe the mint, and recovered_at says when the restoration happened. This restores a verdict, it does not certify one: ask the gate whether it still covers what would merge — record-review.sh --check-carry $PR $REPO" >&2
   exit 0
