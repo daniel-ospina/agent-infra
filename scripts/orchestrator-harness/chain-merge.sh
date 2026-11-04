@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and returns 0 iff THIS dispatch was refused by a gate
+cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew|key` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -106,10 +106,13 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and retur
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk), not a gate: an unrecognised value is reported as
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 harness-skew / 82 key), not a gate: an
+  # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
-  # fleet-wide idleness R8 removes. `fork` is named rather than folded into `load` because its remedy is
+  # fleet-wide idleness R8 removes. ⛔ THE PARENTHESISED LIST IS THE RETURN CONTRACT ABOVE, NOT A COMMENT:
+  # it named six values while the `case` below had seven (review cycle 1, P2), which is how a reader ends
+  # up implementing the #2991 fold the next paragraph is about. `fork` is named rather than folded into `load` because its remedy is
   # the OPPOSITE of a load wait — the box must be restarted or drained from OUTSIDE (agent-infra#2293) —
   # and a chain that told its caller "load" would send the operator to wait for a retry the box cannot
   # even spawn. Its code is 73, NOT 74: 74 is the land-backlog gate below, and two gates that share a

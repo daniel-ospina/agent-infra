@@ -161,6 +161,47 @@ RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "2j3 …while \`key\` ALONGSIDE \`env\` does authenticate (rc=${RC:-<none>}) — the pair discriminates" \
    "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
 
+# ── 2j4–2j7: A STORED `key` THAT IS AN **UNRESOLVED TEMPLATE** IS NOT A CREDENTIAL (review cycle 1, P1) ──
+# ⛔ THE SAME FALSE PASS ONE SHAPE OVER, and it was open when 2j was written. `pi` does not read a stored
+# `key` as an opaque string: `auth-storage.js:223` is `{...credential, key: resolveConfigValue(key, env)}`,
+# and `resolveConfigValue("${NO_SUCH_VAR}")` is `undefined` — so an entry whose `key` is a template naming a
+# variable that resolves NOWHERE authenticates nothing. Testing the raw string for non-blankness said
+# "pi holds a credential", the gate went quiet with `check=skipped reason=stored-credential`, and `pi`
+# died with the exact line #3331 exists to remove. Measured against the vendor module on 2026-11-04:
+#   resolveConfigValue("${NO_SUCH_VAR_XYZ}") -> undefined ; isConfigValueConfigured -> false
+#   resolveConfigValue("sk-${KG_CANARY}")    -> "sk-<value>" ; isConfigValueConfigured -> true
+# The three arms below pin the resolution rule in BOTH directions plus the "cannot say" middle, because
+# each direction alone is satisfiable by getting the rule backwards (refuse all templates / accept all).
+HT1="$(mkhome storeunresolved "$DEEPSEEK_JSON")"
+printf '{"deepseek":{"type":"api_key","key":"${KG_STORE_UNSET_XYZ}"}}\n' > "$HT1/.pi/agent/auth.json"
+OUT="$(run_gate "$HT1")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2j4 a stored \`key\` that is a template naming an UNSET variable does not authenticate, so the gate REFUSES (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+hasnt "$OUT" "check=skipped reason=stored-credential" \
+  "2j5 …and does not claim the store answered — that claim was the false pass (pi resolves the same template to undefined)"
+# …and the inverse: a template that RESOLVES (via the entry's own env map, which is the map pi passes to
+# resolveConfigValue) IS a credential, so the fix cannot pass by refusing every template.
+HT2="$(mkhome storeresolved "$DEEPSEEK_JSON")"
+printf '{"deepseek":{"type":"api_key","key":"${KG_STORE_ENVKEY}","env":{"KG_STORE_ENVKEY":"sk_from_env_map"}}}\n' > "$HT2/.pi/agent/auth.json"
+OUT="$(run_gate "$HT2")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2j6 …while a stored \`key\` that RESOLVES from the entry's own \`env\` map does authenticate (rc=${RC:-<none>})" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=skipped reason=stored-credential " \
+  "2j7 …and the line names the store as the source, so a green gate is not read as 'the environment has the key'"
+# …and the middle answer: a `!command` value is pi's to execute, so the gate neither claims a credential
+# it did not verify nor refuses a box that works. Both would be a lie about the same datum.
+HT3="$(mkhome storecmd "$DEEPSEEK_JSON")"
+printf '{"deepseek":{"type":"api_key","key":"!cat /dev/null"}}\n' > "$HT3/.pi/agent/auth.json"
+OUT="$(run_gate "$HT3")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2j8 a stored \`!command\` value refuses NOTHING (rc=${RC:-<none>}) — only pi can say what it yields" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "reason=stored-credential-unresolvable" \
+  "2j9 …and says it could not verify a credential it can SEE, rather than claiming one"
+hasnt "$OUT" "reason=stored-credential " "2j10 …and does not reuse the 'holds a credential' claim for a value it never resolved"
+
 # ── 2k: THE AGENT DIR IS `pi`'s OWN RESOLUTION, NOT A HARDCODED `~/.pi/agent` (review, P1, measured) ──
 # pi resolves `${PI_CODING_AGENT_DIR:-~/.pi/agent}`, and this repo already mirrors that rule
 # (`extensions/builtin-tools/index.ts:272-280`, `scripts/checkout-hygiene/deepseek-balance-latch.py:98`).
@@ -197,6 +238,19 @@ hasnt "$OUT" "check=skipped" "2k4 …so blindness is not reported for a file it 
 HREL="$(mkhome reldir "$DEEPSEEK_JSON")"
 OUT="$(run_gate "$HREL" PI_CODING_AGENT_DIR=rel/nope)"
 has "$OUT" "models_json=$HREL/.pi/agent/models.json" "2k5 a RELATIVE override is ignored, not resolved against the CWD"
+# ⛔ `~/…` IS A LOCATION AND pi EXPANDS IT (review cycle 1, P2, measured). pi runs the override through
+# `normalizePath`, whose `expandTilde` branch maps `~` to `homedir()` (dist/config.js:478-479). Reading
+# only `/*` made the gate answer about `$HOME/.pi/agent` while pi read `$HOME/alt-agent` — wrong in BOTH
+# directions, and the arm below is the one that matters: the override is the ONLY place a store exists.
+HOV3="$(mkhome tildedir ABSENT)"
+OV3="$HOV3/alt-agent"; mkdir -p "$OV3"
+printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY"}}}\n' > "$OV3/models.json"
+printf '{"deepseek":{"type":"api_key","key":"sk_tilde_store"}}\n' > "$OV3/auth.json"
+OUT="$(run_gate "$HOV3" PI_CODING_AGENT_DIR='~/alt-agent')"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2k6 a \`~/…\` override is EXPANDED like pi does, so a store that exists only there is found (rc=${RC:-<none>})" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "agent_dir=$OV3" "2k7 …and it reads the expanded directory, not the home-relative default"
 
 # ── 3. BLINDNESS IS NOT A REFUSAL (polarity, the direction that stops a fleet) ───────────────────
 for spec in "absent:ABSENT" \
@@ -211,6 +265,30 @@ for spec in "absent:ABSENT" \
      "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
   has "$OUT" "check=skipped" "3 $name: it SAYS it could not resolve, rather than passing silently"
 done
+
+# ── 3b: A TEMPLATE WITH TEXT AROUND THE REFERENCE, OR WITH TWO REFERENCES (review cycle 1, P2) ────
+# ⛔ pi's grammar interpolates `$NAME` ANYWHERE in the string and refuses the provider unless EVERY name
+# resolves (`getConfigValueEnvVarNames` / `provider-composer.js`). The old probe required the whole
+# apiKey to be one bare reference (`re.fullmatch`), so `sk-${KG_EMB}` — a shape pi resolves happily —
+# answered `cannot-resolve-provider-credential` and the gate refused nothing while the variable was
+# genuinely missing. The two arms below pin both halves: text around a reference, and two references.
+HEMB="$(mkhome embedded '{"providers":{"deepseek":{"apiKey":"sk-${KG_EMB_CANARY}"}}}')"
+OUT="$(run_gate "$HEMB")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3b1 a template with TEXT AROUND the reference is resolved, so a missing variable REFUSES (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "var=KG_EMB_CANARY" "3b2 …and the refusal names the variable the template actually references"
+HMULTI="$(mkhome multi '{"providers":{"deepseek":{"apiKey":"${KG_MULTI_A}-${KG_MULTI_B}"}}}')"
+OUT="$(run_gate "$HMULTI" KG_MULTI_A=set_a)"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3b3 with TWO references and only ONE set, the gate still REFUSES (rc=${RC:-<none>}) — pi needs both" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "var=KG_MULTI_B" "3b4 …naming the one that is actually missing, not the one that is set"
+OUT="$(run_gate "$HMULTI" KG_MULTI_A=set_a KG_MULTI_B=set_b)"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3b5 …and with BOTH set it passes (rc=${RC:-<none>}) — so 3b3 is not passing by refusing every template" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=KG_MULTI_A,KG_MULTI_B" "3b6 …and the pass line names every variable it asserted"
 
 # ── 4. AGREEMENT with worker-terminal.sh (the other reader of the same rule) ────────────────────
 # Two readers of one rule are safe only if a divergence REDDENS something. This drives both against

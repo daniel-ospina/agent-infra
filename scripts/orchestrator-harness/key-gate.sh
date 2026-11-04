@@ -15,6 +15,13 @@
 #
 #     No API key found for the selected model.
 #
+# ⛔ SCOPE — READ THIS BEFORE TREATING A GREEN GATE AS "THE LANE WILL RUN" (corrected against #3331's own
+# measurement record, review cycle 1). The key was ONE of FOUR causes that record falsified: a lane with
+# `keys.env` sourced and `api-key-errors=0` STILL died silently, and the cause it VALIDATED is a lane
+# launched from a directory that is not a git repository (`fatal: not a git repository`). This gate
+# closes the REPORTING half of that class — "No API key found" stops being a silent end — and it does
+# not make a lane run. The launch-directory rule is `skills/cmux-cells/SKILL.md`.
+#
 # ⛔ AND NOTHING SAID SO — that is the real defect, and the reason this is category A rather than
 # friction. The dispatcher's `nohup … &` had returned (so the dispatch record said "launched"), the log
 # simply STOPPED (a print-mode `pi` buffers its output, so a silence reads exactly like "still
@@ -70,54 +77,120 @@ KEY_GATE_PROVIDER=""
 KEY_GATE_REASON=""
 KEY_GATE_MODELS_JSON=""
 
-_KEY_GATE_PY_VAR='
-import json, re, sys
+# ── THE TEMPLATE GRAMMAR, MIRRORED FROM `pi` RATHER THAN RE-INVENTED (review cycle 1, P1+P2) ──
+# `pi` does NOT treat an apiKey / a stored `key` as an opaque string: `dist/core/resolve-config-value.js`
+# parses it into LITERAL and ENV parts (`$NAME`, `${NAME}`, with `$$`/`$!` as escapes), a leading `!`
+# makes it a COMMAND, and `isConfigValueConfigured` answers "configured" only when EVERY referenced name
+# resolves (env-map first, then process env). Three shapes were measured against the vendor module on
+# 2026-11-04 with this gate's old readers:
+#   models.json apiKey  "sk-${KEY}"      -> pi resolves it, the old `re.fullmatch` did NOT -> gate said
+#                                          `cannot-resolve` and refused NOTHING while pi died silently
+#   auth.json   key     "${NO_SUCH_VAR}" -> pi resolves it to undefined (no credential), the old
+#                                          `nonblank()` said "holds a credential" -> gate went quiet and
+#                                          pi died with the exact line #3331 exists to remove (FALSE PASS)
+# So the two probes below implement pi's own two rules and nothing else:
+#   MODE=var    print EVERY env name the models.json apiKey template references (one per line); a
+#               literal apiKey prints nothing ("cannot say"), a `!command` prints nothing ("cannot say").
+#   MODE=store  exit 0 = a credential that RESOLVES to a non-blank value, 1 = no credential (fall
+#               through to the environment check), 3 = "cannot say" (`!command`, unreadable) — which the
+#               caller reports as its OWN reason so it never claims a credential it did not verify.
+# ⛔ POLARITY IS UNCHANGED: an unresolvable datum answers "cannot say" and refuses nothing (#2210).
+_KEY_GATE_PY='
+import json, os, re, sys
+
+NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def template_parts(cfg):
+    """-> (kind, [env names]) mirroring pi\x27s parseConfigValueTemplate."""
+    if cfg.startswith("!"):
+        return "cmd", []
+    names, i, n = [], 0, len(cfg)
+    while i < n:
+        j = cfg.find("$", i)
+        if j < 0:
+            break
+        nxt = cfg[j + 1:j + 2]
+        if nxt in ("$", "!"):
+            i = j + 2
+            continue
+        if nxt == "{":
+            end = cfg.find("}", j + 2)
+            if end < 0:
+                i = j + 1
+                continue
+            nm = cfg[j + 2:end]
+            if NAME.fullmatch(nm) and nm not in names:
+                names.append(nm)
+            i = end + 1
+            continue
+        m = NAME.match(cfg, j + 1)
+        if m:
+            if m.group(0) not in names:
+                names.append(m.group(0))
+            i = m.end()
+            continue
+        i = j + 1
+    return "template", names
+
+
+def resolve(cfg, env):
+    """-> (status, value) with status in {ok, missing, cmd}; pi\x27s resolveConfigValue + truthiness."""
+    kind, names = template_parts(cfg)
+    if kind == "cmd":
+        return "cmd", None
+    if not names:
+        return ("ok", cfg) if cfg.strip() else ("missing", None)
+    out = ""
+    for nm in names:
+        v = None
+        if isinstance(env, dict):
+            v = env.get(nm) or None
+        if v is None:
+            v = os.environ.get(nm) or None
+        if v is None:
+            return "missing", None
+        out += v
+    return ("ok", out) if out.strip() else ("missing", None)
+
+
 try:
-    d = json.load(open(sys.argv[1]))
+    doc = json.load(open(sys.argv[1]))
 except Exception:
+    raise SystemExit(0 if sys.argv[2] == "var" else 1)
+
+if sys.argv[2] == "var":
+    prov = (doc.get("providers") or {}).get(sys.argv[3]) or {}
+    key = prov.get("apiKey")
+    if not isinstance(key, str):
+        raise SystemExit(0)
+    kind, names = template_parts(key)
+    for nm in names:
+        print(nm)
     raise SystemExit(0)
-p = (d.get("providers") or {}).get(sys.argv[2]) or {}
-k = p.get("apiKey")
-if not isinstance(k, str):
-    raise SystemExit(0)
-m = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", k.strip())
-if m:
-    print(m.group(1))
-'
-_KEY_GATE_PY_STORE='
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
+
+# MODE=store
+if not isinstance(doc, dict):
     raise SystemExit(1)
-if not isinstance(d, dict):
+entry = doc.get(sys.argv[3])
+FIELDS = ("key", "api_key", "apikey", "access_token", "refresh_token", "token",
+          "access", "refresh")
+if isinstance(entry, str):
+    entry = {"key": entry}
+if not isinstance(entry, dict):
     raise SystemExit(1)
-e = d.get(sys.argv[2])
-def nonblank(v):
-    return isinstance(v, str) and v.strip() != ""
-if isinstance(e, str):
-    raise SystemExit(0 if nonblank(e) else 1)
-if isinstance(e, dict):
-    # ⛔ AN `env` MAP WITHOUT A `key` IS NOT A CREDENTIAL, AND CLAIMING IT IS WAS A FALSE PASS (review,
-    # P1, measured 2026-11-04). `pi` uses `env` only to RESOLVE a `key` template, never as the value:
-    # `dist/core/provider-composer.js` builds `{ apiKey: credential.key }` and reaches it under
-    # `if (input.credential.key)` (:260, :285-286), while `auth-storage.js` returns
-    # `{...credential, key: resolveConfigValue(credential.key, credential.env)}` — undefined when there is
-    # no template. So an entry shaped `{"type":"api_key","env":{"VAR":"sk-..."}}` with $VAR unset was
-    # read here as "pi holds a credential", the gate went quiet, and `pi` then printed exactly the death
-    # this issue exists to remove ("No API key found"). The old arm also **contradicted its own
-    # justification**: it cited pi\x27s *validator* (which accepts the shape) as evidence about
-    # *authentication* (which does not), and those are different questions.
-    # The shapes that DO authenticate, and why each is accepted rather than refused (the first draft
-    # accepted only the first group, so it refused a `pi /login` box — the exact false-block this gate
-    # must not be):
-    #   {"type":"api_key","key":"sk-..."}                                   — the plain shape
-    #   {"type":"oauth","access":"at_...","refresh":"rt_...","expires":N}   — what `pi /login` writes
-    for k in ("key", "api_key", "apikey", "access_token", "refresh_token", "token",
-              "access", "refresh"):
-        if nonblank(e.get(k)):
-            raise SystemExit(0)
-raise SystemExit(1)
+envmap = entry.get("env") if isinstance(entry.get("env"), dict) else None
+cannot = False
+for f in FIELDS:
+    val = entry.get(f)
+    if not isinstance(val, str) or not val.strip():
+        continue
+    status, _ = resolve(val, envmap)
+    if status == "ok":
+        raise SystemExit(0)
+    if status == "cmd":
+        cannot = True
+raise SystemExit(3 if cannot else 1)
 '
 
 # key_gate_bounded <secs> <cmd...> — run a probe under a TIME BOUND (review round 4, P1, measured).
@@ -172,8 +245,18 @@ key_gate_agent_dir() {
   local home="${1:-}"
   case "${PI_CODING_AGENT_DIR:-}" in
     /*) printf '%s\n' "$PI_CODING_AGENT_DIR"; return 0 ;;
-  esac
+    esac
   [ -n "$home" ] || return 0
+  # ⛔ `~` AND `~/…` ARE LOCATIONS AND ARE HONOURED (review cycle 1, P2, measured): pi runs every
+  # override through `normalizePath`, which expands `~` to `homedir()` (dist/config.js:478-479 and
+  # `normalizePath`'s `expandTilde ?? true` branch). Reading only `/*` made this gate read
+  # `$HOME/.pi/agent/{models,auth}.json` while pi read `$HOME/alt-agent/…` — wrong in BOTH directions
+  # (a false 82 on a box whose store lives under the override, and a silent death on a box whose
+  # models.json lives only there). `~user` is deliberately NOT expanded: pi does not expand it either.
+  case "${PI_CODING_AGENT_DIR:-}" in
+    '~') printf '%s\n' "$home"; return 0 ;;
+    '~/'*) printf '%s\n' "$home/${PI_CODING_AGENT_DIR#'~/'}"; return 0 ;;
+  esac
   printf '%s\n' "$home/.pi/agent"
 }
 
@@ -192,7 +275,10 @@ key_gate_var() {
   [ -n "$prov" ] || prov="${PI_LANE_PROVIDER:-deepseek}"
   command -v python3 >/dev/null 2>&1 || return 0
   # A literal apiKey, a provider absent from the file, and an unparseable file all print NOTHING.
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY_VAR" "$mj" "$prov" 2>/dev/null
+  # A TEMPLATE prints EVERY name it references (review cycle 1, P2): `sk-${A}${B}` is a shape pi fully
+  # resolves and the old single-name `fullmatch` answered "cannot resolve" for — a gate that goes quiet
+  # on a readable config. One name per line; empty output is still the "cannot say" answer.
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" var "$prov" 2>/dev/null
 }
 
 # key_gate_value_present <VARNAME> — 0 iff THIS environment holds a non-blank value.
@@ -227,8 +313,9 @@ key_gate_account_home() {
 # and the lane works, while the models.json template still names `$ZAI_API_KEY` — so a gate that looked
 # only at the environment refused a working box with 82. The store is the FIRST source `pi` consults, so
 # "the variable is unset" is not "the credential is missing".
-# Anything unreadable here answers "cannot say" (rc 1) -> the caller falls through to the environment
-# check, which is the direction that cannot fabricate a refusal.
+# Anything unreadable here answers "cannot say" (rc 3) -> the caller states that it could not verify a
+# credential it can SEE, and asserts nothing (a `!command` value is not ours to execute). rc 1 is a
+# positive "no credential", the only answer that lets the caller fall through to the environment check.
 key_gate_stored_credential() {
   local home="${1:-}" prov="${2:-}"
   local agent_dir aj
@@ -239,7 +326,14 @@ key_gate_stored_credential() {
   # No `[ -r ]` pre-test, for the same reason as key_gate_var's (review round 5, P2): stat can block before
   # the bound arms. An absent store makes the bounded open print nothing and answer "cannot say".
   command -v python3 >/dev/null 2>&1 || return 1
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY_STORE" "$aj" "$prov" 2>/dev/null
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$aj" store "$prov" 2>/dev/null
+  # rc 0 = a credential that RESOLVES; 3 = cannot say; anything else = no credential. The bound's own
+  # kill status (143/124/…) lands in the "cannot say" bucket because it is not a positive "absent".
+  local rc=$?
+  case "$rc" in
+    0|1|3) return "$rc" ;;
+    *) return 3 ;;
+  esac
 }
 
 # key_gate_candidates <home> — the files a box is known to carry credentials in, one per line, deduped
@@ -273,24 +367,43 @@ key_gate_assert() {
   KEY_GATE_VAR=""; KEY_GATE_PROVIDER="${prov:-${PI_LANE_PROVIDER:-deepseek}}"; KEY_GATE_REASON=""; KEY_GATE_MODELS_JSON=""; KEY_GATE_AGENT_DIR=""
   KEY_GATE_AGENT_DIR="$(key_gate_agent_dir "$home")"
   [ -n "$KEY_GATE_AGENT_DIR" ] && KEY_GATE_MODELS_JSON="$KEY_GATE_AGENT_DIR/models.json"
-  KEY_GATE_VAR="$(key_gate_var "$home" "$KEY_GATE_PROVIDER")"
-  if [ -z "$KEY_GATE_VAR" ]; then
+  local names n missing=""
+  names="$(key_gate_var "$home" "$KEY_GATE_PROVIDER")"
+  if [ -z "$names" ]; then
     # Blindness is not a refusal (see the header's polarity rule).
-    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential provider=%s home=%s — the apiKey template for this provider is not resolvable from %s (absent, unparseable, a literal, no python3, or a provider pi authenticates itself), so NOTHING is asserted here\n' \
+    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential provider=%s home=%s — the apiKey template for this provider is not resolvable from %s (absent, unparseable, a literal, no python3, a `!command` value, or a provider pi authenticates itself), so NOTHING is asserted here\n' \
       "$label" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}"
     return 0
   fi
-  if key_gate_value_present "$KEY_GATE_VAR"; then
+  # EVERY name a multi-reference template names must hold a value (review cycle 1, P2): pi refuses the
+  # provider unless all of them resolve, so asserting only the first would pass a lane pi still kills.
+  KEY_GATE_VAR="$(printf '%s\n' "$names" | paste -sd ',' - 2>/dev/null)"
+  for n in $names; do
+    key_gate_value_present "$n" || { missing="$n"; break; }
+  done
+  if [ -z "$missing" ]; then
     printf '[key-gate] %s check=ok var=%s provider=%s home=%s — the credential holds a value in the environment this lane runs with\n' \
       "$label" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "${home:-<none>}"
     return 0
   fi
-  if key_gate_stored_credential "$home" "$KEY_GATE_PROVIDER"; then
+  KEY_GATE_VAR="$missing"
+  local store_rc=1
+  key_gate_stored_credential "$home" "$KEY_GATE_PROVIDER"; store_rc=$?
+  if [ "$store_rc" = "0" ]; then
     # The store is what `pi` reads FIRST, so an absent variable is not an absent credential. Nothing is
     # asserted — and the line says WHICH source answered, so an operator reading a green gate is not
     # misled into thinking the environment carries the key.
     printf '[key-gate] %s check=skipped reason=stored-credential provider=%s home=%s agent_dir=%s — %s/auth.json holds a credential for this provider, and pi consults that store BEFORE the environment (and before the models.json template that names $%s), so whether $%s is exported here is not the question pi asks first; nothing is asserted here\n' \
       "$label" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "$KEY_GATE_VAR" "$KEY_GATE_VAR"
+    return 0
+  fi
+  if [ "$store_rc" = "3" ]; then
+    # ⛔ A STORE ENTRY THIS GATE CANNOT RESOLVE IS NOT A CREDENTIAL AND IS NOT A REFUSAL (review cycle 1,
+    # P2): `auth.json` holds a `!command` value, so only pi can say whether it yields a key. Saying
+    # `holds a credential` here would be the same FALSE PASS the `env`-without-`key` arm was fixed for; a
+    # refusal would be a false block on a box that works. The third answer is the honest one.
+    printf '[key-gate] %s check=skipped reason=stored-credential-unresolvable provider=%s home=%s agent_dir=%s — %s/auth.json holds an entry for this provider whose value this gate cannot resolve (a `!command`, or a template whose variables are absent from both the entry env map and this environment); whether that yields a key is pi\x27s answer alone, so NOTHING is asserted here\n' \
+      "$label" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}"
     return 0
   fi
   KEY_GATE_REASON="credential-missing"
