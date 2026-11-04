@@ -2519,8 +2519,80 @@ INNERPY
       && pass "(33g2) ATTRIBUTION: with the post-condition DELETED the same run no longer refuses at 3 nor emits the message (rc=$DRC_G2 — stopped later by this fixture's clean-micro surface cap), so (33g)'s refusal is the post-condition's own and not a pre-existing one" \
       || fail "(33g2) the mutant reproduced the (33g) refusal without the post-condition (rc=$DRC_G2, out='$OUT32G2'), so (33g) is attributable to something else"
   fi
+  # (33h) ONE VERB PER INVOCATION — ONE ASSERTION PER COMBINATION (#3247 review, P1).
+  #
+  # ⛔ THIS IS THE ARM THAT WAS MISSING, AND IT WAS MISSING IN THE WAY THIS SUITE KEEPS
+  # BEING BITTEN. Every `--delta` invocation in BOTH suites was the bare
+  # `--delta <pr> fixture/repo` form (`scripts/record-review.test.sh` contained no `--delta`
+  # at all), so deleting `|| [ "$DELTA" -eq 1 ]` from the one-verb guard — or dropping the
+  # `[ "$DELTA" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]` arity guard, or the delta arm of the
+  # `--evidence/--force-stale/--expect-head` refusal — reddened NOTHING while restoring exactly
+  # the false PASS the guard comment at `:1268-1274` says was MEASURED (`--delta
+  # --print-diff-hash` exited 0 with the record untouched; `--delta --check-carry` answered
+  # `fresh … run the code-review skill`, i.e. the paid re-review the verb exists to remove).
+  # The in-repo standard for this guard class already existed — `--recover-body`'s combinations
+  # are pinned assertion-per-combo in `scripts/record-review.test.sh:2947-2971` — so this section
+  # meets that standard instead of describing it.
+  #
+  # THE FIXTURE IS THE ACCEPTANCE TOPOLOGY ON PURPOSE: record at `$D_REVIEWED`, live head
+  # `$D_MERGED`, i.e. the exact pair (33a) proves exits 0 and MINTS. So if a guard were deleted
+  # and the extra argument silently ignored, the run would exit 0 and WRITE — which is why each
+  # arm asserts the record is BYTE-IDENTICAL as well as the exit code. A refusal that still wrote
+  # would be the false PASS, not the refusal.
+  delta_run_extra() { # <pr> <out-file> <extra args...> ; assigns DR_RC — same env as delta_run
+    local _pr="$1" _out="$2"
+    shift 2
+    ( cd "$DELTA_REPO" || exit 9
+      HOME="$DR_HOME" PATH="$TMP/dbin:$PATH" FIX_REPO="$DELTA_REPO" \
+      FIX_BASE="$(git rev-parse main)" FIX_HEAD="${FIX_DELTA_HEAD:?}" \
+        bash "$SRC" --delta "$_pr" fixture/repo "$@" ) > "$_out" 2>&1
+    DR_RC=$?
+  }
+  d_h_expect2() { # <label> <expected-message-fragment> <args...>
+    local _label="$1" _msg="$2"
+    shift 2
+    delta_run_extra 7109 "$TMP/out33h" "$@"
+    local _rc="$DR_RC" _now _bytes
+    _now="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7109.json" 2>/dev/null)"
+    if [ "$_now" = "$D_H_REC" ]; then _bytes="UNCHANGED"; else _bytes="CHANGED"; fi
+    if [ "$_rc" -eq 2 ] && [ "$_bytes" = "UNCHANGED" ] && grep -qF -- "$_msg" "$TMP/out33h"; then
+      pass "(33h) $_label is REFUSED at exit 2 and the record is BYTE-IDENTICAL — the mixed-verb shape that would exit 0 having re-attested nothing"
+    else
+      fail "(33h) $_label was NOT refused as a one-verb violation (rc=$_rc, record $_bytes, out='$(head -c 400 "$TMP/out33h" 2>/dev/null)')"
+    fi
+  }
+  delta_write_record 7109 "$D_REVIEWED" clean
+  D_H_REC="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7109.json")"
+  FIX_DELTA_HEAD="$D_MERGED"
+  d_h_expect2 '--delta --print-diff-hash' \
+    '--delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier' \
+    --print-diff-hash
+  d_h_expect2 '--delta --check-carry' \
+    '--delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier' \
+    --check-carry
+  d_h_expect2 '--delta --print-tier' \
+    '--delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier' \
+    --print-tier
+  d_h_expect2 '--delta --flush-pending' \
+    '--flush-pending is its own verb' \
+    --flush-pending
+  d_h_expect2 '--delta --recover-body' \
+    'both MINT a record' \
+    --recover-body
+  d_h_expect2 '--delta --evidence' \
+    'so it takes no --evidence/--force-stale/--expect-head' \
+    --evidence 'comment:9'
+  d_h_expect2 '--delta --force-stale' \
+    'so it takes no --evidence/--force-stale/--expect-head' \
+    --force-stale
+  d_h_expect2 '--delta --expect-head' \
+    'so it takes no --evidence/--force-stale/--expect-head' \
+    --expect-head "$D_MERGED"
+  d_h_expect2 '--delta with a third positional (a caller-supplied head/verdict)' \
+    'takes <pr> [owner/repo] and nothing else' \
+    clean
 else
-  fail "(33a) fixture missing"; fail "(33b) fixture missing"; fail "(33c) fixture missing"; fail "(33d) fixture missing"; fail "(33e) fixture missing"; fail "(33f) fixture missing"; fail "(33f2) fixture missing"; fail "(33g) fixture missing"; fail "(33g2) fixture missing"
+  fail "(33a) fixture missing"; fail "(33b) fixture missing"; fail "(33c) fixture missing"; fail "(33d) fixture missing"; fail "(33e) fixture missing"; fail "(33f) fixture missing"; fail "(33f2) fixture missing"; fail "(33g) fixture missing"; fail "(33g2) fixture missing"; fail "(33h) fixture missing"
 fi
 
 # ── MUTATION PINS on real output ──────────────────────────────────────────
@@ -2699,9 +2771,14 @@ fi
 # against a constant of 203, which is the rot a comment restating its own arithmetic always
 # suffers. The section is numbered 33 for the same reason — (32) was already taken on main when
 # this branch was rebased.
-# MEASURED: `ALL PASSED (204 assertion(s))` on this tree (macOS, bash 3.2). `bash-suites` REFUSES to
+# Review round 4: 204 -> 213. (33h) pins EVERY `--delta` verb-exclusivity / arity / mint-input
+# refusal the verb adds — one assertion per combination, each asserting exit 2 AND a byte-identical
+# record — because both suites previously drove only the bare `--delta <pr> <repo>` form and a
+# deleted guard reddened nothing. MIN_ASSERTIONS is a FLOOR (it reds when FEWER assertions run),
+# so it must be raised with the arm or the arm can be skipped silently; it is not a ceiling.
+# MEASURED: `ALL PASSED (213 assertion(s))` on this tree (macOS, bash 3.2). `bash-suites` REFUSES to
 # run on a live cell (exit 78), so a local ALL PASSED is NOT CI evidence — see the PR comment.
-MIN_ASSERTIONS=204
+MIN_ASSERTIONS=213
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
