@@ -451,15 +451,28 @@ darwin_stub_ok() {
   [ "$(PATH="$C/bin:$PATH" command -v launchctl 2>/dev/null)" = "$C/bin/launchctl" ] || return 1
   return 0
 }
-removed_pass() { # <pass-output-file>
+removed_pass() { # <pass-output-file> [O-dir]
+  local _o="${2:-$C/o}"
   if ! darwin_stub_ok; then
     bad "the launchctl/uname shim is NOT in place — the Darwin arm was NOT entered (a stub write that failed must never reach the real launchctl)"
     : > "$1"; return 1
   fi
-  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+  env O="$_o" HB="$_o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
       WATCHDOG_PLIST="$C/stack.plist" WATCHDOG_LAUNCHCTL_PIN="$C/bin/launchctl" SETTLE=0 \
       WATCHDOG_PIN_DIR="$C/no-pin" \
       LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$1" 2>&1
+}
+# mk_darwin_script <shell-body> — a BESPOKE launchctl, for the cases where the shared stub cannot answer:
+# `mk_darwin_bin` gives one exit code to every non-`print` verb, so it cannot express "enable succeeds but
+# the override did not clear" or "bootstrap fails and legacy `load` succeeds". The body is appended after
+# the call log, so every invocation is still recorded. `uname` is created by `mk_darwin_bin` first.
+mk_darwin_script() { # <shell-body>
+  mk_darwin_bin 0 'stub' >/dev/null 2>&1
+  {
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\n' "$C/launchctl.calls"
+    printf '%s\n' "$1"
+  } > "$C/bin/launchctl" 2>/dev/null
+  chmod +x "$C/bin/launchctl" "$C/bin/uname" 2>/dev/null
 }
 # ⛔ A FIXTURE PLIST MUST BE A REAL PLIST THAT PROVES IT IS THIS JOB (review P1, cycle 4 of #1986).
 # These cases used to write a 0-BYTE file (`: > "$C/stack.plist"`), and that is precisely what let the
@@ -898,6 +911,99 @@ mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator
 removed_pass "$C/pass.out"
 assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "the watchdog is never loaded onto the controller's label"
 assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses"
+# (y) PROOF 3 IS ABOUT THE PROGRAM LAUNCHD EXECUTES, NOT ABOUT ANY ARGUMENT (review P1, cycle 7).
+#     `bootstrap` execs argv[0] (or `Program`); the gate used to accept ANY element that looked like this
+#     box's controller, so a foreign program could be laundered by naming the controller path in a LATER
+#     argument — and the pass then reported a restore of a job it never loaded.
+echo "── 8b(y). a FOREIGN argv[0] is not laundered by a controller path in a later argument"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTY
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/opt/evil/run-agent</string><string>--controller</string><string>$C/o/orch-loop.sh</string></array>
+</dict></plist>
+PLISTY
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "argv[0] is the program launchd execs — a controller path in a later argument does not make it ours"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses and says so"
+# (z) `Program` OVERRIDES `ProgramArguments` (man launchd.plist). A reader that stopped at the first
+#     ProgramArguments array it found never saw a foreign `Program` at all.
+echo "── 8b(z). a FOREIGN Program key overrides a benign ProgramArguments array"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTZ
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>Program</key><string>/opt/evil/run-agent</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
+</dict></plist>
+PLISTZ
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "Program is what RUNS, so a benign ProgramArguments array cannot vouch for it"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses"
+# (aa) A TAB OR NEWLINE IN A VALUE MUST NOT FORGE A RECORD. The probe emitted `ARG<TAB>value` lines and
+#      the reader split on TAB, so a value containing a newline followed by `ARG<TAB><path>` forged an
+#      extra, controller-looking argument (measured). NUL framing makes it one value again.
+echo "── 8b(ab). a newline+tab inside a value cannot FORGE an ARG record"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+printf '<plist version="1.0"><dict>\n  <key>Label</key><string>com.eldato.orchestrator-stack</string>\n  <key>ProgramArguments</key><array><string>/opt/evil/run-agent</string><string>benign\nARG\t%s</string></array>\n</dict></plist>\n' "$C/o/orch-loop.sh" > "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a crafted value cannot inject a controller-looking argument into the proof"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses"
+# (ac) A SPACE IN A ROOT PATH MUST NOT MAKE THE ARM INERT. The reader used an unquoted `$(…)`, which
+#      word-splits, so on a box whose state dir contains a space NO plist could ever pass and the REMOVED
+#      arm never fired. This is the fail-CLOSED direction of the same framing bug, and it is worse: a dead
+#      arm that looks healthy.
+echo "── 8b(ac). a root path containing a SPACE is still matched (the arm is not inert there)"
+newcase; mkdir -p "$C/o space"; printf '999999\n' > "$C/o space/.orch.lock"; echo $(( $(date +%s) - 900 )) > "$C/o space/heartbeat"
+seed_plist "$C/stack.plist" 'com.eldato.orchestrator-stack' "$C/o space/orch-loop.sh"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out" "$C/o space"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" "a root with a space in it is matched exactly, so the arm still fires"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and is not refused for a path the reader split apart"
+# (ad) A BINARY PLIST IS UNREADABLE, NOT "0 LABEL KEYS, WHICH IS AMBIGUOUS". The polarity was already
+#      safe, but the message asserted something about the CONTENT of a file that was never parsed.
+echo "── 8b(ad). a binary plist is refused as UNREADABLE, not as ambiguous"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+printf 'bplist00\000\001\002\003not-xml\n' > "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a plist the reader cannot parse is never bootstrapped"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "could not be read as a plist" "…and the refusal says it was never read"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "ambiguous" "…rather than claiming the file declares 0 Label keys"
+# (ae) THE `enable` IS VERIFIED, NOT ASSUMED (review P2, cycle 7). `enable` exits 0 while the persistent
+#      Disabled override stands; `bootstrap` of a disabled label is a documented no-op that can still exit
+#      0. The pass used to report that as a restart. `lc_start` refuses here; so must this arm.
+echo "── 8b(ae). enable exits 0 but the Disabled override still stands ⇒ REFUSED, nothing bootstrapped"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
+mk_darwin_script 'case "$1" in
+  print) printf "Bad request.\nCould not find service \"com.eldato.orchestrator-stack\" in domain for user gui: 501\n"; exit 113 ;;
+  print-disabled) printf "\"com.eldato.orchestrator-stack\" => disabled\n"; exit 0 ;;
+esac
+exit 0'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a label that is STILL disabled is never bootstrapped into a state the next boot loses"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses and says so"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "STILL reads 'disabled'" "…naming the measured override, not the verb it hoped for"
+# (af) THE LEGACY `load` FALLBACK EXISTS FOR A MEASURED REASON: on 2026-10-17 `bootstrap` failed with EIO
+#      and plain `load` is what brought the controller back. Without it this arm reports RESTART-FAILED for
+#      ever on a box in that state and never tries the one verb that works.
+echo "── 8b(af). bootstrap fails ⇒ the legacy 'load' path is tried, and a success there is a SUCCESS"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
+mk_darwin_script 'case "$1" in
+  print) printf "Bad request.\nCould not find service \"com.eldato.orchestrator-stack\" in domain for user gui: 501\n"; exit 113 ;;
+  print-disabled) exit 0 ;;
+  bootstrap) exit 5 ;;
+  load) exit 0 ;;
+esac
+exit 0'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" "bootstrap is tried first"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "load $C/stack.plist" "…and the legacy load path is tried when it fails"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…so a box restored on the legacy path is not reported as a failed restart"
+assert_contains "$(grep -m1 -E 'verdict=(DOWN|WEDGED)' "$C/state/l" 2>/dev/null)" "restart=1" "…the restart it DID achieve is reported"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"

@@ -412,7 +412,10 @@ controller_pid() {
 # So: strip comments first (the state machine below handles comments spanning lines), then read the
 # document as ONE string, and report the number of `Label` keys so an ambiguous plist can be refused.
 # ⛔ NO `plutil` (macOS-only; these suites run on Linux CI too) and NO `python3` (a launchd job's PATH
-# may not carry it). awk only. Output is machine-read: `LABELCOUNT n`, `LABEL v`, `ARGS n`, `ARG v`.
+# may not carry it). awk only. Output is a sequence of NUL-TERMINATED kind/value PAIRS — `COUNT`, `LABEL`,
+# `PROGRAM`, then one `ARG` per ProgramArguments element — read back by `plist_not_this_job` with
+# `read -r -d ''`. The framing is NUL and not a tab/newline because the values come from the FILE and an
+# XML `<string>` may contain either; see the reader for the measured consequences of getting this wrong.
 plist_probe() { # <file>
   awk '
     function strip(s,   out, p) {
@@ -438,29 +441,47 @@ plist_probe() { # <file>
         p = index(substr(doc, pos), tag); if (p == 0) break
         c++; last = pos + p - 1; pos = last + length(tag)
       }
-      printf "LABELCOUNT\t%d\n", c
-      if (c >= 1) printf "LABEL\t%s\n", strval(doc, last + length(tag), length(doc))
-      # ProgramArguments (array) first, then the singular `Program` launchd also accepts.
-      for (k = 1; k <= 2; k++) {
-        key = (k == 1) ? "<key>ProgramArguments</key>" : "<key>Program</key>"
-        p = index(doc, key); if (p == 0) continue
-        from = p + length(key)
-        if (k == 1) {
-          a = index(substr(doc, from), "<array>"); if (a == 0) continue
-          from = from + a - 1 + 7
-          z = index(substr(doc, from), "</array>"); if (z == 0) continue
-          to = from + z - 2
-        } else { to = length(doc) }
-        n = 0; start = from
-        while (start <= to && n < 40) {
-          v = strval(doc, start, to); if (v == "" ) break
-          q = index(substr(doc, start, to - start + 1), "<string>"); if (q == 0) break
-          n++; arg[n] = v
-          start = start + q - 1 + 8 + length(v) + 9
+      # ⛔ NUL-FRAMED, NOT TAB/NEWLINE-DELIMITED (review P2, cycle 7 of #1986). Every value here comes
+      # from the FILE, and an XML `<string>` may legally contain a tab or a newline. The previous stream
+      # was read back with `awk -F'\t'` and an unquoted `$(…)`, so a tab inside a Label truncated it to a
+      # matching-looking prefix (a FOREIGN label then passed proof 1) and a newline inside a value FORGED
+      # an extra `ARG` record that satisfied proof 3. Both were measured. A NUL cannot occur in XML text,
+      # so `read -r -d ''` reads back exactly the value the file declared — whatever it contains.
+      printf "COUNT\0%d\0", c
+      if (c >= 1) {
+        # bounded to its OWN dict entry, so a Label with no value cannot borrow the next key value
+        from = last + length(tag); nk = index(substr(doc, from), "<key>")
+        printf "LABEL\0%s\0", strval(doc, from, (nk > 0) ? from + nk - 2 : length(doc))
+      }
+      # ⛔ `Program` AND `ProgramArguments` ARE REPORTED SEPARATELY, AND NEITHER IMPLIES THE OTHER (review
+      # P1, cycle 7). `man launchd.plist`: `Program` "maps to the first argument of execvp(3)" and, when
+      # present, is what RUNS — `ProgramArguments` then supplies only argv[1..]. A reader that only ever
+      # looked at ProgramArguments could therefore be shown this box controller entry in an ARGUMENT
+      # position while launchd execs a different file. Both are emitted; the caller decides which one is
+      # the program, because only the caller knows the precedence launchd applies.
+      p = index(doc, "<key>Program</key>")
+      if (p > 0) {
+        from = p + length("<key>Program</key>"); nk = index(substr(doc, from), "<key>")
+        printf "PROGRAM\0%s\0", strval(doc, from, (nk > 0) ? from + nk - 2 : length(doc))
+      }
+      p = index(doc, "<key>ProgramArguments</key>")
+      if (p > 0) {
+        from = p + length("<key>ProgramArguments</key>")
+        a2 = index(substr(doc, from), "<array>")
+        if (a2 > 0) {
+          from = from + a2 - 1 + 7
+          z = index(substr(doc, from), "</array>")
+          if (z > 0) {
+            to = from + z - 2
+            n = 0; start = from
+            while (start <= to && n < 40) {
+              q = index(substr(doc, start, to - start + 1), "<string>"); if (q == 0) break
+              v = strval(doc, start, to); if (v == "") break
+              n++; printf "ARG\0%s\0", v
+              start = start + q - 1 + 8 + length(v) + 9
+            }
+          }
         }
-        printf "ARGS\t%d\n", n
-        for (i = 1; i <= n; i++) printf "ARG\t%s\n", arg[i]
-        break
       }
     }' "$1" 2>/dev/null
 }
@@ -473,47 +494,101 @@ plist_probe() { # <file>
 #   1. EXACTLY ONE `Label`, and it IS `$LABEL`. Two Labels is ambiguous (which one does launchd resolve?)
 #      and an unknown one is a different job.
 #   2. `ProgramArguments` (or `Program`) declares a program.
-#   3. That program is a CONTROLLER ENTRY — basename one of the box's entry points — under one of THIS
-#      box's three roots ($O, this file's tree, $PIN_ROOT), with no `..` segment. A name list alone was
-#      cycle 5's bug (it refused the shipped `supervisor.sh`); a root test alone is cycle 6's (it
-#      accepted `$SELF_DIR/watchdog-loop.sh`, i.e. loading the WATCHDOG as the controller, which keeps
-#      the controller dead and then blocks the real restore with "service already loaded"). Together
-#      they say what the proof actually means: this is a controller program of this box.
+#   3. THE PROGRAM LAUNCHD WILL EXEC — not merely "some entry that looks like our controller" — is a
+#      CONTROLLER ENTRY (basename one of the box's entry points) under one of THIS box's three roots
+#      ($O, this file's tree, $PIN_ROOT), with no `..` segment. A name list alone was cycle 5's bug (it
+#      refused the shipped `supervisor.sh`); a root test alone was cycle 6's (it accepted
+#      `$SELF_DIR/watchdog-loop.sh`, i.e. loading the WATCHDOG as the controller, which keeps the
+#      controller dead and then blocks the real restore with "service already loaded"); and "ANY
+#      argument matches" was cycle 7's — a plist with `/opt/evil/run-agent` as argv[0] and this box's
+#      controller path in an ARGUMENT position PASSED, and `bootstrap` loaded the foreign program under
+#      `$LABEL` (measured). Proof 3 is about the program that RUNS.
 plist_not_this_job() { # <file>
-  local _probe _cnt _lbl _nargs _e _found="" _root _seen=""
-  _probe="$(plist_probe "$1")"
-  _cnt="$(printf '%s\n' "$_probe" | awk -F'\t' '$1=="LABELCOUNT"{print $2}')"
+  local -a _args=()
+  local _cnt="" _lbl="" _prog="" _kind _val _exec="" _e _root
+  while IFS= read -r -d '' _kind; do
+    IFS= read -r -d '' _val || break
+    case "$_kind" in
+      COUNT)   _cnt="$_val" ;;
+      LABEL)   _lbl="$_val" ;;
+      PROGRAM) _prog="$_val" ;;
+      ARG)     _args+=("$_val") ;;
+    esac
+  done < <(plist_probe "$1")
+  # ⛔ NO FIELD SPLITTING AND NO DELIMITER PARSING ANYWHERE (review P2, cycle 7 of #1986). `$(…)` word-
+  # splits on spaces, so on a box whose root path contains a space NO plist could ever pass and the arm
+  # was permanently INERT there; `awk -F'\t'` truncates at a tab, so a tab inside a Label made a FOREIGN
+  # label pass as `$LABEL`. Both measured. The values are now read exactly as the file declared them.
   case "${_cnt:-}" in
-    '' ) printf 'it could not be read as a plist at all (no Label key found)'; return 0 ;;
-    1  ) : ;;
-    *  ) printf 'it declares %s Label keys, which is ambiguous — refusing to guess which job launchctl would resolve' "$_cnt"; return 0 ;;
+    1)  : ;;
+    # ⛔ "THE FILE WAS NEVER PARSED" AND "NO LABEL KEY" ARE ONE ANSWER, AND 0 IS NOT "AMBIGUOUS" (review
+    # P2, cycle 7). A BINARY plist — a legitimate LaunchAgent format — yields 0, and the old `*` arm told
+    # the operator it "declares 0 Label keys, which is ambiguous": a claim about the CONTENT of a file
+    # that was never read. The polarity was safe (nothing loaded), but such a box was permanently inert
+    # and the reason it printed was false. `install.sh` already names the correct diagnosis for this.
+    0|'') printf 'it could not be read as a plist at all — no parsable Label key (a binary plist? this reader is XML-only; inspect it with plutil -p \047%s\047)' "$1"; return 0 ;;
+    *)  printf 'it declares %s Label keys, which is ambiguous — refusing to guess which job launchctl would resolve' "$_cnt"; return 0 ;;
   esac
-  _lbl="$(printf '%s\n' "$_probe" | awk -F'\t' '$1=="LABEL"{print $2; exit}')"
   [ "$_lbl" = "$LABEL" ] || {
     printf 'its Label is \047%s\047, not \047%s\047' "${_lbl:-<none>}" "$LABEL"; return 0; }
-  _nargs="$(printf '%s\n' "$_probe" | awk -F'\t' '$1=="ARGS"{print $2; exit}')"
-  case "${_nargs:-0}" in
-    0) printf 'it declares no ProgramArguments/Program, so there is nothing to load'; return 0 ;;
-  esac
-  for _e in $(printf '%s\n' "$_probe" | awk -F'\t' '$1=="ARG"{print $2}'); do
-    _seen="$_seen $_e"
-    # ⛔ TRAVERSAL IS REFUSED EXPLICITLY: the root test below is a string prefix, and an unnormalised
-    # `$O/../../evil/...` satisfies it while naming a program outside every root (measured in review).
-    case "$_e" in *..*) continue ;; esac
-    case "${_e##*/}" in
-      orch-loop.sh|launchd-controller.sh|supervisor.sh) : ;;
-      *) continue ;;
-    esac
-    for _root in "$O" "$SELF_DIR" "$PIN_ROOT"; do
-      [ -n "$_root" ] || continue
-      case "$_e" in "$_root"/*) _found="$_e"; break ;; esac
+  # ⛔ WHICH ELEMENT IS THE PROGRAM (review P1, cycle 7 of #1986). `man launchd.plist`: `Program` maps to
+  # "the first argument of execvp(3)" and, when present, is what RUNS — `ProgramArguments` then supplies
+  # only argv[1..]. Otherwise argv[0] is the program, and when argv[0] is an INTERPRETER the program it
+  # runs is the first following non-flag element. That is exactly the rule `install.sh`'s `plist_program`
+  # applies ("first non-interpreter element"), and this repo declares that function the ONE parser for
+  # this question — a second answer here is how the two come to disagree.
+  if [ -n "$_prog" ]; then
+    _exec="$_prog"
+  else
+    for _e in ${_args[@]+"${_args[@]}"}; do
+      case "$_e" in -*) continue ;; esac
+      case "${_e##*/}" in bash|sh|zsh|ksh|dash|env) continue ;; esac
+      _exec="$_e"; break
     done
-    [ -n "$_found" ] && break
+  fi
+  if [ -z "$_exec" ]; then
+    printf 'it declares neither a Program nor a runnable ProgramArguments entry, so there is nothing to load'
+    return 0
+  fi
+  # ⛔ TRAVERSAL IS REFUSED EXPLICITLY: the root test below is a string prefix, and an unnormalised
+  # `$O/../../evil/...` satisfies it while naming a program outside every root (measured in review).
+  case "$_exec" in
+    *..*) printf 'the program launchd would exec (%s) contains a .. segment' "$_exec"; return 0 ;;
+  esac
+  case "${_exec##*/}" in
+    orch-loop.sh|launchd-controller.sh|supervisor.sh) : ;;
+    *) printf 'launchd would exec \047%s\047, which is not a controller entry (orch-loop.sh/launchd-controller.sh/supervisor.sh) — loading it would run a DIFFERENT program under \047%s\047' "$_exec" "$LABEL"; return 0 ;;
+  esac
+  for _root in "$O" "$SELF_DIR" "$PIN_ROOT"; do
+    [ -n "$_root" ] || continue
+    case "$_exec" in "$_root"/*) return 1 ;; esac
   done
-  [ -n "$_found" ] && return 1
-  printf 'no ProgramArguments entry is a controller program (orch-loop.sh/launchd-controller.sh/supervisor.sh) under this box\047s roots (%s, %s, %s) — it runs:%s' \
-    "$O" "$SELF_DIR" "$PIN_ROOT" "${_seen:- <empty>}"
+  printf 'launchd would exec \047%s\047, which is not under any of this box\047s roots (%s, %s, %s)' \
+    "$_exec" "$O" "$SELF_DIR" "$PIN_ROOT"
   return 0
+}
+
+# disable_state <domain> <label> — the persistent Disabled override ACTUALLY in effect, measured from
+# `launchctl print-disabled` (read-only). One of `disabled`, `enabled`, `unset`, `unknown`.
+# ⛔ MEASURED, NOT ASSUMED (review P2, cycle 7 of #1986). `launchd-cycle.sh:412-413` verifies this after
+# `enable` and records why: a `disabled` that did not clear means the load would "either fail or — worse
+# — succeed into a state the next boot loses". This file's own comment already states the failure mode
+# ("bootstrap of a disabled label is a no-op that can still exit 0"), yet the REMOVED arm took `enable`
+# exiting 0 as proof and reported `restart=1` for a load that could not survive a reboot.
+# ⛔ THE THREE STATES ARE KEPT APART, exactly as `lc_disable_state` keeps them: "the read failed", "no
+# override is recorded" (the HEALTHY state) and "an entry we cannot classify" are different answers, and
+# folding them into one `unknown` made a healthy box report itself as unreadable at the moment an
+# operator is already diagnosing launchd. An UNREADABLE answer must never become a false block.
+disable_state() { # <domain> <label>
+  local out entry
+  out="$(launchctl print-disabled "$1" 2>/dev/null)" || { printf 'unknown\n'; return 0; }
+  entry="$(grep -F "\"$2\"" <<<"$out" 2>/dev/null || true)"
+  case "$entry" in
+    *'=> disabled'*) printf 'disabled\n' ;;
+    *'=> enabled'*)  printf 'enabled\n' ;;
+    '')              printf 'unset\n' ;;     # the read ANSWERED: no override for this label (healthy)
+    *)               printf 'unknown\n' ;;   # an entry we cannot classify
+  esac
 }
 
 launchd_job_state() {
@@ -686,8 +761,36 @@ restart_stack() {
               RESTART_VERB="launchctl enable $dom/$LABEL"
               launchctl enable "$dom/$LABEL" >>"$LOG" 2>&1 || rc=$?
               if [ "$rc" -eq 0 ]; then
+                # ⛔ THE ENABLE IS VERIFIED, NOT ASSUMED (review P2, cycle 7 of #1986). Same read-back,
+                # same words, same reason as `launchd-cycle.sh`'s `lc_start` — which is where this whole
+                # sequence comes from, and which the PR body claims this arm already matches. A DEFINITE
+                # `disabled` means the override did not clear, so the load would either fail or succeed
+                # into a state the next boot loses: refuse and say what an operator must run. Anything
+                # UNREADABLE is a warning and the bootstrap decides — an unknown must not become a false
+                # block either.
+                case "$(disable_state "$dom" "$LABEL")" in
+                  disabled)
+                    RESTART_REFUSED=1
+                    log_line "verdict=RESTART-REFUSED"$'\t'"note=launchctl enable $dom/$LABEL exited 0, but the persistent Disabled override STILL reads 'disabled' — NOT bootstrapping: the load would either fail or succeed into a state the next boot loses. Next: launchctl enable $dom/$LABEL; launchctl print-disabled $dom | grep $LABEL"
+                    return 1 ;;
+                  unknown)
+                    log_line "verdict=RESTART-WARN"$'\t'"note=could not read whether $LABEL is disabled (launchctl print-disabled gave no usable answer) — continuing, because the bootstrap below is the proof" ;;
+                esac   # `enabled` and `unset` (no override recorded — the healthy state) proceed silently
+                # ⛔ THE LEGACY FALLBACK IS HERE FOR THE MEASURED REASON `lc_start` CARRIES IT: on
+                # 2026-10-17 `bootstrap` failed with EIO and plain `load` is what brought the controller
+                # back. Without it this arm reports RESTART-FAILED for ever on a box in that state, and
+                # the one verb that works is never tried. WHICH path ran is what RESTART_VERB records, so
+                # the next operator does not have to guess. `load` is PLAIN, never `load -w`, which would
+                # write the disable straight back.
                 RESTART_VERB="launchctl bootstrap $dom $PLIST_PATH"
-                launchctl bootstrap "$dom" "$PLIST_PATH" >>"$LOG" 2>&1 || rc=$?
+                if launchctl bootstrap "$dom" "$PLIST_PATH" >>"$LOG" 2>&1; then
+                  rc=0
+                else
+                  rc=$?
+                  log_line "verdict=RESTART-WARN"$'\t'"note=launchctl bootstrap $dom exited $rc — trying the legacy 'load' path, which is what brought the controller back when bootstrap failed with EIO (measured 2026-10-17)"
+                  RESTART_VERB="launchctl load $PLIST_PATH"
+                  if launchctl load "$PLIST_PATH" >>"$LOG" 2>&1; then rc=0; else rc=$?; fi
+                fi
               fi
             fi ;;
           0)
