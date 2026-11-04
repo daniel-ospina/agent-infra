@@ -4776,26 +4776,28 @@ assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the r
 #     permanent, so it must never be published to that channel.
 AI_REVIEW_GATE_KEY="" STUB_COMMENT_CAPTURE="$T/ccap_d" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d an UNSIGNED marker is never published as a comment"
-# (d2) ⛔ THE SUBSTRING HOLE (review finding, 2026-11-04). The guard above was a
-#      substring test on ` sig=`, and the marker's only FREE-TEXT field is `note=` —
-#      a `not-clean` record's `--findings-note`, which the recorder validates against
-#      quotes/backslashes/control characters only. A note reading `… sig=deadbeef …`
-#      therefore satisfied the substring test on an UNSIGNED marker and published it to
-#      the PERMANENT comment channel that guard exists to protect. The guard now requires
-#      the tail after the LAST ` sig=` to be exactly 64 hex digits.
-#      NON-VACUOUS PAIR, same PR, same note: (d2) UNSIGNED must post 0, (d3) SIGNED must
-#      post 1 — so neither arm can pass on "a not-clean record never posts" (d3 would
-#      red) or on "the note text alone is enough" (d2 would red).
-NEG_D_EXTRA=(--findings 1 --findings-note '1 open P2 sig=deadbeef deadbeef')
-run_record_dcraft() { # <pr> <out-capture> [key — EMPTY STRING ⇒ unsigned, so use '-']
-    # ⛔ `${3-$AI_REVIEW_GATE_KEY}`, NOT `${3:-…}`: the signed arm below needs to pass an
-    # EMPTY key to mean UNSIGNED, and `:-` treats an empty argument as absent and
-    # substitutes the suite's key — which made the first cut of this vector "unsigned"
-    # ONLY in name (measured: the capture's marker ended ` sig=3509644a7…`, i.e. a real
-    # signature, and the vector reddened as it should have). The recorder resolves
-    # GATE_KEY from the env and falls back to $HOME/.pi/agent/.ai-review-gate-key; the
-    # suite's fake HOME has no such file, so an empty env key is genuinely unsigned.
-    local pr="$1" cap="$2" key="${3-$AI_REVIEW_GATE_KEY}"
+# (d2) ⛔ THE UNSIGNED-COMMENT GUARD, DEFEATED TWICE BY HEURISTICS (review cycles 1 and 2,
+#      2026-11-04). Its job: an UNSIGNED marker must never reach the PERMANENT comment
+#      channel. Both attempts inferred signedness from the marker's TEXT, and `note=` — a
+#      `not-clean` record's free-text `--findings-note` — is interpolated immediately
+#      BEFORE the signature, so no test of the text can tell a signature from text that
+#      looks like one:
+#        round 1  `case "$marker" in *" sig="*)`  → defeated by a note CONTAINING ` sig=…`;
+#        round 2  tail-after-the-LAST-` sig=` is 64 hex → defeated by a note ENDING ` sig=<64 hex>`.
+#      The shipped guard stops inferring: the mint arms pass `MARKER_SIGNED` (the
+#      authoritative flag main gated this post on before #3168 folded the channel here), and
+#      the one arm that cannot know (--flush-pending) verifies the marker's own HMAC. The
+#      note-carrying-delimiter shape is also refused outright at validation, because such a
+#      marker is unverifiable by EVERY reader (they all split at ' sig=').
+#      NON-VACUOUS PAIR, same record shape: (d2) UNSIGNED posts 0, (d3) SIGNED posts 1 — so
+#      neither can pass on "a not-clean record never posts" (d3 would red) nor on
+#      "the note text alone is enough" (d2 would red).
+run_record_dcraft() { # <pr> <out-capture> <key — pass '-' for the suite key, "" for UNSIGNED> [note]
+    # ⛔ `${3-$AI_REVIEW_GATE_KEY}`, NOT `${3:-…}`: the unsigned arm passes an EMPTY key and
+    # `:-` would treat it as absent and substitute the suite's key — which made the first cut
+    # of this vector "unsigned" ONLY in name (measured: the capture's marker ended
+    # ` sig=3509644a7…`, a real signature). `-` distinguishes "" from unset.
+    local pr="$1" cap="$2" key="$3" note="${4-1 open P2: re-reads the claim after release}"
     : > "$LOG"; : > "$cap"; rm -f "$T/dcraft.err"
     (
         export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
@@ -4806,30 +4808,78 @@ run_record_dcraft() { # <pr> <out-capture> [key — EMPTY STRING ⇒ unsigned, s
         export AI_REVIEW_GATE_KEY="$key"
         rc=0
         bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
-            --evidence "comment:${pr}01" "${NEG_D_EXTRA[@]}" 2>"$T/dcraft.err" || rc=$?
+            --findings 1 --findings-note "$note" \
+            --evidence "comment:${pr}01" 2>"$T/dcraft.err" || rc=$?
         printf '%s' "$rc" > "$T/dcraft.rc"
     ) 2>/dev/null || true
     RECORD_RC="$(cat "$T/dcraft.rc" 2>/dev/null || echo 99)"
     RECORD_ERR="$(cat "$T/dcraft.err" 2>/dev/null || true)"
 }
 run_record_dcraft 424955 "$T/ccap_d2" ""
-assert_eq "$RECORD_RC" "0" "14.1d (d2) fixture: a not-clean record whose NOTE contains ' sig=' mints (rc 0)"
+assert_eq "$RECORD_RC" "0" "14.1d (d2) fixture: an UNSIGNED not-clean record still MINTS (rc 0 — the body channel keeps it)"
 assert_eq "$(dc_posts 424955)" "0" \
-    "14.1d (d2) an UNSIGNED marker whose free-text note CONTAINS ' sig=' is still never published as a comment"
+    "14.1d (d2) an UNSIGNED marker is never published as a comment — and the refusal is NOT inferred from its text"
 if [ -s "$T/ccap_d2" ]; then
     bad "14.1d (d2) …and nothing was POSTed (captured: $(head -c 200 "$T/ccap_d2"))"
 else
     ok "14.1d (d2) …and the comment channel captured no body at all"
 fi
-run_record_dcraft 424956 "$T/ccap_d3"
+run_record_dcraft 424956 "$T/ccap_d3" "$AI_REVIEW_GATE_KEY"
 assert_eq "$(dc_posts 424956)" "1" \
-    "14.1d (d3) the SAME note on a SIGNED marker DOES publish — the guard judges the signature's shape, not the note"
-if grep -qE 'note=1 open P2 sig=deadbeef deadbeef sig=[0-9a-f]{64}$' \
+    "14.1d (d3) the same record SIGNED does publish — the pair is non-vacuous"
+if grep -qE 'note=1 open P2: re-reads the claim after release sig=[0-9a-f]{64}$' \
     <<<"$(jq -r '.body // empty' "$T/ccap_d3" 2>/dev/null || true)"; then
     ok "14.1d (d3) …and the published marker carries the note AND a real trailing 64-hex signature"
 else
     bad "14.1d (d3) the published marker's tail is not \"note=… sig=<64 hex>\" (captured: $(head -c 300 "$T/ccap_d3" 2>/dev/null))"
 fi
+# (d4) THE ROOT CAUSE, REFUSED AT VALIDATION. A note carrying the signature delimiter '
+#      sig=' splits the marker INSIDE the note for every reader (`${line% sig=*}` here and
+#      in --recover-body, and ai-review-gate splits the same way), so the HMAC over the full
+#      text can never match what the reader verifies — the record mints, the body and comment
+#      carry it, and NOTHING can verify it. That is "no evidence" reported as success.
+#      The shape below is EXACTLY the cycle-2 bypass: a note ENDING with ` sig=<64 hex>`.
+D_END64="$(printf 'a%.0s' $(seq 1 64))"
+run_record_dcraft 424957 "$T/ccap_d4" "" "all good, sig=$D_END64"
+assert_eq "$RECORD_RC" "2" \
+    "14.1d (d4) a --findings-note carrying the marker's delimiter (' sig=') is REFUSED (rc 2) — the class, not the pattern"
+assert_contains "$RECORD_ERR" "must not contain ' sig='" "14.1d (d4) …and the refusal names the delimiter"
+assert_eq "$(dc_posts 424957)" "0" "14.1d (d4) …and nothing was posted to the durable channel"
+if [ ! -f "$(Q2 424957)" ]; then
+    ok "14.1d (d4) …no record was written either (refused before anything is minted)"
+else
+    bad "14.1d (d4) a record WAS written for a note the marker cannot carry"
+fi
+# (d5) THE ARM THAT CANNOT KNOW: `--flush-pending` re-posts bytes an EARLIER run wrote, so it
+#      has no MARKER_SIGNED to pass and the guard VERIFIES THE MARKER'S OWN HMAC instead. Both
+#      directions are pinned, because an arm that refuses everything is as wrong as one that
+#      admits everything: an UNSIGNED pending marker posts 0, a SIGNED one posts 1.
+flush_pending_case() { # <pr> <pending-marker> <out-capture> <key>; assigns FP_RC
+    local pr="$1" mk="$2" cap="$3" key="$4"
+    # marker_pending_dir() is $HOME/.pi/agent/reviews/pending (see record-review.sh)
+    mkdir -p "$F_HOME/.pi/agent/reviews/pending"
+    printf '%s' "$mk" > "$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$pr.marker"
+    : > "$LOG"; : > "$cap"
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        export STUB_COMMENT_BODIES="" STUB_COMMENT_CAPTURE="$cap"
+        export AI_REVIEW_GATE_KEY="$key"
+        rc=0
+        bash "$RECORD" --flush-pending "$pr" daniel-ospina/agent-infra >/dev/null 2>&1 || rc=$?
+        printf '%s' "$rc" > "$T/dflush.rc"
+    ) 2>/dev/null || true
+    FP_RC="$(cat "$T/dflush.rc" 2>/dev/null || echo 99)"
+}
+FP_TEXT="review recorded: reviews/424958.json verdict=clean @ $SHA (daniel-ospina/agent-infra)"
+FP_SIG="$(printf '%s' "$FP_TEXT" | openssl dgst -sha256 -hmac "$AI_REVIEW_GATE_KEY" | awk '{print $NF}')"
+# unsigned: a plain 64-hex tail that is NOT this text's HMAC — the exact shape a forger can write
+FP_FAKE="$(printf 'b%.0s' $(seq 1 64))"
+flush_pending_case 424958 "$FP_TEXT sig=$FP_FAKE" "$T/ccap_d5a" "test-key-2982"
+assert_eq "$(dc_posts 424958)" "0" \
+    "14.1d (d5) an UNVERIFIABLE pending marker (right shape, wrong HMAC) is never published by --flush-pending"
+flush_pending_case 424959 "$FP_TEXT sig=$FP_SIG" "$T/ccap_d5b" "test-key-2982"
+assert_eq "$(dc_posts 424959)" "1" \
+    "14.1d (d5) …while a genuinely signed pending marker IS published (the arm is not a blanket refusal)"
 # (e) THE P2 PIN: when the BODY channel fails, the run that most needs the durable
 #     copy must still attempt it. Both failure arms used to `exit 5` before reaching
 #     the durable block, so the channel never fired in the only scenario it exists

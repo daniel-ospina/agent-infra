@@ -1639,7 +1639,12 @@ ${marker}"; else newbody="$marker"; fi
   fi
   return 1
 }
-# post_marker_comment <repo> <pr> <marker> -> ALWAYS 0 (best-effort, never fatal)
+# post_marker_comment <repo> <pr> <marker> [signed 0|1] -> ALWAYS 0 (best-effort, never fatal)
+#
+# `signed` is the CALLER'S datum: the mint arms pass `MARKER_SIGNED`. Omit it and the
+# function verifies the marker's own HMAC instead (the `--flush-pending` arm, which
+# re-posts bytes an earlier run wrote) — and refuses unless that verification succeeds.
+# It is never inferred from the marker's TEXT: see the guard's own comment.
 #
 # agent-infra#1224, PRODUCER HALF — the consumer half shipped in the gate in 2026-09,
 # and docs/ai-review-gate.md carried "Producer status: the producer half is NOT
@@ -1668,23 +1673,36 @@ ${marker}"; else newbody="$marker"; fi
   # The BODY mirror above stays: it is what fires `edited` and re-runs the gate
   # (a comment alone fires `issue_comment`, which this gate deliberately does
   # not trigger on — see the skip-footgun rule in the workflow header).
-post_marker_comment() { # <repo> <pr> <marker>
-  local repo="$1" pr="$2" marker="$3"
-  local PR_EVIDENCE_COMMENTS_JQ="" HAVE_COMMENT=0 EXISTING_COMMENT_BODIES="" SIGVAL=""
+post_marker_comment() { # <repo> <pr> <marker> [signed 0|1] -> ALWAYS 0 (best-effort, never fatal)
+  local repo="$1" pr="$2" marker="$3" signed="${4:-}"
+  local PR_EVIDENCE_COMMENTS_JQ="" HAVE_COMMENT=0 EXISTING_COMMENT_BODIES=""
+  local SIGVAL="" _text="" _key="" _got=""
   # ⛔ AN UNSIGNED MARKER IS NEVER PUBLISHED AS A COMMENT. The gate can never accept
   # one (it HMAC-verifies), and unlike the body a comment is PERMANENT. Enforced HERE,
   # at the single chokepoint, so no caller can forget it and no new call site can
   # reopen the hole. The unsigned path stays body-only, where its warning is loud.
-  # ⛔ AND IT IS THE SIGNATURE'S **SHAPE** THAT DECIDES, NOT THE SUBSTRING ` sig=`
-  # (review finding, 2026-11-04). The marker's one free-text field is `note=` — a
-  # `not-clean` record's `--findings-note`, validated only against quotes,
-  # backslashes and control characters — and it is interpolated BEFORE the
-  # signature. A substring test therefore admits an UNSIGNED marker whose note happens
-  # to read `… sig=deadbeef …`, publishing it to the PERMANENT channel this guard
-  # exists to protect, and it disagrees with the body site's #633 rerun gate, which
-  # tests `MARKER_SIGNED` exactly. The real signature is always appended LAST
-  # (`openssl dgst -sha256 -hmac … | awk '{print $NF}'`), so the tail after the final
-  # ` sig=` must be exactly 64 hex digits; anything shorter, longer or non-hex refuses.
+  # ⛔ AND PROVENANCE DECIDES IT — NEVER A SUBSTRING, NEVER A SHAPE.
+  # This guard has now been defeated twice, once per heuristic, and the second round is
+  # the reason the datum is taken from the caller instead of inferred from the text:
+  #   round 1 — `case "$marker" in *" sig="*)` admitted an UNSIGNED marker whose free-text
+  #     `note=` (a `not-clean` `--findings-note`) contained `… sig=deadbeef …`;
+  #   round 2 — requiring the tail after the LAST ` sig=` to be 64 hex admitted an
+  #     unsigned marker whose note ENDED with ` sig=<64 hex>`.
+  # Both were the same mistake: `note=` is free text interpolated immediately BEFORE the
+  # signature, so no test of the marker's own text can distinguish a real signature from
+  # text that looks like one. So:
+  #   1. THE MINT ARMS PASS `MARKER_SIGNED`, the authoritative flag the pre-#3168 code
+  #      gated this very post on at the mint site (`[ "${MARKER_SIGNED:-0}" = "1" ]`).
+  #      Folding the channel into this chokepoint REPLACED that flag with text inference —
+  #      a regression, not just an incomplete fix — and this restores it.
+  #   2. THE CALLER CANNOT KNOW on `--flush-pending`, which re-posts bytes an EARLIER run
+  #      wrote, so that arm VERIFIES THE MARKER'S OWN HMAC under the gate key. That is the
+  #      gate's rule, not a heuristic: the signature must equal HMAC over the text before
+  #      the FIRST ` sig=`, so text that merely looks like a signature cannot satisfy it.
+  #      (The key is re-derived here because the flush dispatch runs BEFORE the main flow's
+  #      GATE_KEY resolution.) No key, or no verifiable signature, means no comment.
+  # Whatever the arm, a trailing 64-hex field is still required: a marker whose signature
+  # field is absent or truncated is not evidence the gate can verify.
   case "$marker" in
     *" sig="*) : ;;
     *) return 0 ;;
@@ -1694,6 +1712,18 @@ post_marker_comment() { # <repo> <pr> <marker>
     ''|*[!0-9a-f]*) return 0 ;;
   esac
   [ "${#SIGVAL}" -eq 64 ] || return 0
+  if [ "$signed" != "1" ]; then
+    _text="${marker% sig=*}"
+    [ "$_text" != "$marker" ] || return 0
+    _key="${GATE_KEY:-${AI_REVIEW_GATE_KEY:-}}"
+    if [ -z "$_key" ] && [ -n "${HOME:-}" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+      _key="$(command cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+    fi
+    _key="$(printf '%s' "$_key" | tr -d '[:space:]')"
+    [ -n "$_key" ] || return 0
+    _got="$(printf '%s' "$_text" | command openssl dgst -sha256 -hmac "$_key" 2>/dev/null | awk '{print $NF}' || true)"
+    [ "$_got" = "$SIGVAL" ] || return 0
+  fi
   # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
   # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
   # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract says a producer
@@ -2097,6 +2127,20 @@ if [ "$VERDICT" = "not-clean" ]; then
   fi
   if [[ "$FINDINGS_NOTE" == *'"'* || "$FINDINGS_NOTE" == *'\\'* || "$FINDINGS_NOTE" =~ [[:cntrl:]] ]]; then
     echo "record-review.sh: --findings-note must be a single-line plain string (no quotes, backslashes or control characters) — it is embedded in the record's JSON, and an unescaped character would make the record unreadable (which the merge gate treats as NO record)." >&2
+    exit 2
+  fi
+  # ⛔ AND IT MUST NOT CARRY THE MARKER'S OWN SIGNATURE DELIMITER ' sig=' (review cycle 2,
+  # 2026-11-04). The note is interpolated right before the signature, and the signature is
+  # PARSED by splitting on that delimiter (`_text="${line% sig=*}"`, here and in
+  # --recover-body; ai-review-gate splits the same way). A note containing it therefore
+  # splits the marker INSIDE the note, so the HMAC computed over the full text can never
+  # match the text the reader verifies — the record would exist, and the evidence in the
+  # body and in the durable comment would be UNVERIFIABLE BY EVERY READER, which is the
+  # same outcome as no evidence at all while looking like success. It is also the shape two
+  # review rounds exploited to get an UNSIGNED marker published (a note that CONTAINS, or
+  # ENDS WITH, ` sig=<hex>`). Refusing here removes the class instead of pattern-matching it.
+  if [[ "$FINDINGS_NOTE" == *' sig='* ]]; then
+    echo "record-review.sh: --findings-note must not contain ' sig=' — that is the marker's signature delimiter, and a note carrying it makes the marker's own signature unverifiable (every reader splits the marker there). Reword the note; nothing was recorded." >&2
     exit 2
   fi
 elif [ -n "$FINDINGS" ] || [ -n "$FINDINGS_NOTE" ]; then
@@ -5392,7 +5436,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # ⛔ THE CALL, not just the paragraph above (measured: the paragraph shipped
     # WITHOUT it, so the arm this channel exists for still exited 5 having
     # published nothing — suite vector 14.1d(e) is the discriminator).
-    post_marker_comment "$REPO" "$PR" "$MARKER" || true
+    post_marker_comment "$REPO" "$PR" "$MARKER" "${MARKER_SIGNED:-0}" || true
     echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the signed marker was NOT posted — the record is saved but CI CANNOT SEE IT. The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers it WITHOUT a new review." >&2
     exit 5
   fi
@@ -5445,7 +5489,7 @@ ${MISSING}"
       # was refused, so the durable channel is the one that can still carry the
       # signed bytes. Attempted BEFORE the exit, and "$MISSING" not "$MARKER" — it
       # is the exact line this run tried to deliver.
-      post_marker_comment "$REPO" "$PR" "$MISSING" || true
+      post_marker_comment "$REPO" "$PR" "$MISSING" "${MARKER_SIGNED:-0}" || true
       echo "⛔ body-marker-unposted: the signed marker for $REPO#$PR could NOT be PATCHed into the PR body (gh/API refused — a spent token budget, a 403, a 5xx). The record IS saved at $FILE, but CI reads the BODY, so the evidence is currently INVISIBLE and ai-review-gate will refuse this PR." >&2
       echo "   The marker is kept verbatim in $(marker_pending_file "$REPO" "$PR") — deliver it with: record-review.sh --flush-pending $PR ${REPO}   (no new review, no new record, no re-record)" >&2
       exit 5
@@ -5456,7 +5500,10 @@ ${MISSING}"
   # (#1224 producer half.) The doctrine, the cross-repo byte-identity contract and
   # the declared residuals all live at post_marker_comment() — one chokepoint, so a
   # new call site cannot quietly skip the unsigned guard or the admission set.
-  post_marker_comment "$REPO" "$PR" "$MARKER" || true
+  # ⛔ `${MARKER_SIGNED:-0}` — PROVENANCE, NOT TEXT INFERENCE (review cycle 2). This is the
+  # channel whose marker text carries the free-text `note=`, and the datum the pre-#3168
+  # mint site gated on is still right here in scope, so it is PASSED rather than re-derived.
+  post_marker_comment "$REPO" "$PR" "$MARKER" "${MARKER_SIGNED:-0}" || true
 
   # ── Stale gate-run remediation (#633) ──────────────────────────────────
   # A completed pre-evidence FAILURE (the push-triggered run that evaluated
