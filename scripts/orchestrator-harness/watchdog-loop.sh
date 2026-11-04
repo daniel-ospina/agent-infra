@@ -385,6 +385,73 @@ controller_pid() {
 # correct if launchd's wording changes; UNKNOWN stays UNKNOWN and NEVER becomes "absent", because
 # deciding a mutation from an error message is how a healthy job gets re-bootstrapped underneath a live
 # controller.
+
+# ── PLIST PROVENANCE — read the job a bootstrap WOULD load, BEFORE loading it ─────────────────────
+# ⛔ WHY THIS EXISTS (review P1, cycle 4 of #1986). `launchctl bootstrap <dom> <plist>` resolves the job
+# by the plist's OWN `Label`, NOT by the file's name. So "a file exists at $PLIST_PATH" is NOT evidence
+# that loading it restores THIS label: `$PLIST_PATH` defaults to `$HOME/Library/LaunchAgents/$LABEL.plist`
+# but is also a documented knob (`WATCHDOG_PLIST`), so a stale or copied plist there — or one left by a
+# different provisioning model — makes the pass `enable $LABEL` (a no-op for the job launchd actually
+# holds) and then LOAD A DIFFERENT JOB beside the box's supervision model. That is the
+# duplicate-controller class this arm's own comment forbids (#1761/#1715), and the pass would report it
+# as a failed restart of a controller it never touched.
+# The doctrine is the repo's own — `orchestrator-bringup.sh` `launchd_job_for_state_dir()`: OPERATE THE
+# JOB THAT IS ALREADY HERE, never load a new one. Here the two proofs are (a) the plist's `Label` IS
+# `$LABEL`, and (b) its program is a controller entry inside one of THIS box's roots — the same three
+# the live-probe below uses: the deploy path `$O`, this file's own tree, and `$PIN_ROOT`.
+# ⛔ NO `plutil`: it is macOS-only, and these suites also run on Linux CI runners — a macOS-only reader
+# would leave the proof UNEXERCISED exactly where CI is supposed to prove it. Both readers below are
+# dependency-free (awk) and handle the same-line and the two-line `<string>` forms.
+plist_value() { # <file> <key> → the first <string> belonging to that key, or empty
+  awk -v key="$2" '
+    { n++; lines[n] = $0 }
+    END {
+      tag = "<key>" key "</key>"
+      for (i = 1; i <= n; i++) {
+        p = index(lines[i], tag); if (p == 0) continue
+        rest = substr(lines[i], p + length(tag))
+        if (match(rest, /<string>[^<]*<\/string>/)) {
+          m = substr(rest, RSTART, RLENGTH); gsub(/<\/?string>/, "", m); print m; exit
+        }
+        for (j = i + 1; j <= n && j <= i + 12; j++) {
+          if (match(lines[j], /<string>[^<]*<\/string>/)) {
+            m = substr(lines[j], RSTART, RLENGTH); gsub(/<\/?string>/, "", m); print m; exit
+          }
+        }
+      }
+    }' "$1" 2>/dev/null
+}
+plist_program_args() { # <file> → one ProgramArguments entry per line
+  awk '
+    /<key>ProgramArguments<\/key>/ { inarr = 1 }
+    inarr && /<\/array>/ { exit }
+    inarr && match($0, /<string>[^<]*<\/string>/) {
+      m = substr($0, RSTART, RLENGTH); gsub(/<\/?string>/, "", m); print m
+    }' "$1" 2>/dev/null
+}
+# Returns 0 when the plist IS this label's controller job; otherwise prints the reason and returns 1.
+plist_not_this_job() { # <file>
+  local _lbl _prog _e _entry="" _root _seen=""
+  _lbl="$(plist_value "$1" Label)"
+  [ "$_lbl" = "$LABEL" ] || {
+    printf 'its Label is \047%s\047, not \047%s\047' "${_lbl:-<none>}" "$LABEL"; return 0; }
+  _prog="$(plist_program_args "$1")"
+  for _e in $_prog; do
+    _seen="$_seen $_e"
+    case "$_e" in */orch-loop.sh|*/launchd-controller.sh) _entry="$_e"; break ;; esac
+  done
+  [ -n "$_entry" ] || {
+    printf 'its ProgramArguments name no controller entry (orch-loop.sh/launchd-controller.sh):%s' "${_seen:- <empty>}"
+    return 0; }
+  for _root in "$O" "$SELF_DIR" "$PIN_ROOT"; do
+    [ -n "$_root" ] || continue
+    case "$_entry" in "$_root"/*) return 1 ;; esac
+  done
+  printf 'its controller program is \047%s\047, which is under none of this box\047s roots (%s, %s, %s)' \
+    "$_entry" "$O" "$SELF_DIR" "$PIN_ROOT"
+  return 0
+}
+
 launchd_job_state() {
   local d out rc unknown="" target=""
   for d in "gui/$(id -u)" "user/$(id -u)"; do
@@ -526,6 +593,18 @@ restart_stack() {
               fi
               log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=$LABEL is NOT loaded and no $PLIST_PATH exists — there is nothing to bootstrap, so nothing was issued; provision the plist for $LABEL at that path"$'\t'"detail=$_remedy"
             else
+              # ⛔ PROVENANCE BEFORE MUTATION (review P1, cycle 4 of #1986). This branch used to go
+              # straight from "the file exists" to `enable` + `bootstrap`. `bootstrap` resolves the job
+              # by the plist's OWN Label, so a stale/copied/foreign plist at `$PLIST_PATH` would enable
+              # a label it does not hold and load a DIFFERENT job beside this box's supervision model
+              # (#1761/#1715) — then report the result as a failed restart of a controller nothing
+              # touched. `plist_not_this_job` proves it first, and a failed proof is a REFUSAL, not a
+              # failed verb: nothing is issued.
+              local _plist_why
+              if _plist_why="$(plist_not_this_job "$PLIST_PATH")"; then
+                log_line "verdict=RESTART-REFUSED"$'\t'"plist=$PLIST_PATH"$'\t'"note=$LABEL is NOT loaded and a plist exists at $PLIST_PATH, but it is NOT this job: $_plist_why — NOTHING was issued, because launchctl bootstrap resolves the job by the plist's own Label, so loading it would load a DIFFERENT job beside this box's model (the #1761/#1715 duplicate-controller class) and report it as a failed restart of a controller it never touched. Point WATCHDOG_PLIST at $LABEL's own plist, or provision it there"
+                RESTART_REFUSED=1; return 1
+              fi
               # ⛔ AN `enable` THAT FAILS STOPS THE ARM — it is not swallowed. It used to be
               # `enable … || true`, so a REFUSED verb fell through to a `bootstrap` of a label that may
               # still be disabled (a documented silent no-op that can exit 0) and the pass then reported
@@ -666,7 +745,7 @@ main() {
   # ⛔ `announced` is LOCAL: as a global it was inherited from the environment, and `env announced=1`
   # made the probe path suppress the generic decision line — a real restart with NO line saying it
   # happened. Test-only seams are allowed to be read from the environment; a control-flow flag is not.
-  local pid age verdict reason streak=0 restart=0 rc=0 episode=0 announced=0
+  local pid age verdict reason streak=0 restart=0 rc=0 episode=0 announced=0 decision_line=""
 
   # ── 1. ONE observation ──────────────────────────────────────────────────────────────────────────
   pid="$(controller_pid)"
@@ -769,11 +848,11 @@ main() {
       log_line "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE after a probe — the probe is NOT issued (a restart the cap cannot count is the tight loop this file exists to prevent)"
       return 0
     fi
-    log_line "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=observation ${obs} of this episode (> 2x${MAX_CONSEC}) — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next probe comes $((${MAX_CONSEC} + 1)) passes after this one)"
-    announced=1          # the decision is already stated; do not state it twice
+    decision_line="verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=observation ${obs} of this episode (> 2x${MAX_CONSEC}) — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next probe comes $((${MAX_CONSEC} + 1)) passes after this one)"
+    announced=1          # the decision is COMPOSED here; it is emitted only once the arm issued a verb
   fi
 
-  [ "${announced:-0}" = "1" ] || log_line "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"reason=$reason"
+  [ "${announced:-0}" = "1" ] || decision_line="verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"reason=$reason"
 
   # ── 4. ONE restart, then PROVE it after a settle window. Never a second restart in this pass: a
   #       loop that restarts until something looks healthy is the behaviour this file replaces.
@@ -784,8 +863,27 @@ main() {
   # The flag, not `rc`: see its declaration — a reserved exit code collides with a verb that fails with
   # that same value, and a failed `kickstart` must stay a FAILED kickstart.
   if [ "${RESTART_REFUSED:-0}" -eq 1 ]; then
+    # ⛔ AND A REFUSAL COSTS NOTHING (review P2, cycle 4 of #1986), in both directions:
+    #   * NO CLAIM. The decision line above carries `restart=1` and, at the cap, "ONE probe restart". It
+    #     used to be EMITTED BEFORE this test, so every refusal pass logged a restart — and a probe
+    #     restart — for a pass in which `launchctl.calls` held nothing but `print` lines. That is the
+    #     exact false claim cycle 3 removed from the arm's own lines, left alive one line above them.
+    #   * NO BUDGET. The streak is restored to the value this pass READ, because a WITHHELD restart is
+    #     not a restart that FAILED. Counting refusals against the consecutive cap let three harmless
+    #     refusals latch the box into `<verdict>_STOPPED` and then withheld the arm for up to
+    #     `2 x MAX_CONSEC` further passes — trading a dead arm for a safe one, which this arm's own
+    #     comment refuses. (`episode` is deliberately NOT restored: with the streak restored no crash is
+    #     recorded, so the episode number is never consumed by a refusal.)
+    printf '%s' "${prev_streak:-0}" 2>/dev/null > "$STREAK_FILE" || true
+    # ⛔ THE OBSERVATION IS STILL RECORDED — with `restart=0`, which is the honest claim. Dropping the
+    # decision line entirely on a refusal would lose the measured verdict (WEDGED/DOWN) that the arm's
+    # refusal is a statement ABOUT; keeping it with `restart=1` is the false claim above. Both halves are
+    # pinned: (r) asserts `restart=0` and no `restart=1` on a refusal pass, 8b(f) asserts the WEDGED
+    # observation survives it.
+    log_line "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${prev_streak:-0}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"reason=$reason"$'\t'"note=the restart was WITHHELD — the arm that refused stated why above; no platform verb was issued and this pass consumed no restart budget"
     return 0
   fi
+  log_line "$decision_line"
   if [ "$rc" -ne 0 ]; then
     log_line "verdict=RESTART-FAILED"$'\t'"pid=${pid:-none}"$'\t'"rc=$rc"$'\t'"verb=${RESTART_VERB:-unknown}"$'\t'"note=the platform restart verb failed; nothing else was attempted"
     return 0

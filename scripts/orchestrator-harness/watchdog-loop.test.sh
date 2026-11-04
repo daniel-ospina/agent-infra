@@ -461,12 +461,36 @@ removed_pass() { # <pass-output-file>
       WATCHDOG_PIN_DIR="$C/no-pin" \
       LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$1" 2>&1
 }
+# ⛔ A FIXTURE PLIST MUST BE A REAL PLIST THAT PROVES IT IS THIS JOB (review P1, cycle 4 of #1986).
+# These cases used to write a 0-BYTE file (`: > "$C/stack.plist"`), and that is precisely what let the
+# arm `enable`+`bootstrap` a plist nobody had read: a file that could not be parsed as a plist at all
+# was accepted as "the job to restore". The arm now reads `Label` and `ProgramArguments` before it
+# mutates, so the fixture has to be the thing the code is meant to accept — and the negative case (o)
+# is what proves a wrong one is refused.
+seed_plist() { # <path> [label] [controller-program]
+  local _p="$1" _lbl="${2:-com.eldato.orchestrator-stack}" _prog="${3:-$C/o/orch-loop.sh}"
+  cat > "$_p" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$_lbl</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$_prog</string>
+  </array>
+</dict>
+</plist>
+PLIST
+}
 # (a) ABSENT from both domains → enable + bootstrap from the plist, and NEVER a kickstart.
 # ⚠ THE FIXTURE IS THE MEASURED ANSWER, NOT A TIDY ONE: a real not-found read is rc 113 and its FIRST
 # line is `Bad request.` (verified on this box, gui/ and user/ alike). The old comment in the product
 # called that first line the UNREADABLE marker — it is the not-found marker, and this fixture is what
 # pins the difference (see (d) for the genuinely unreadable read).
-newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
 mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
 removed_pass "$C/pass.out"
 CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
@@ -584,7 +608,7 @@ assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-UNAVAILABLE" "…nor re
 #     a documented silent no-op that can exit 0 — so the pass reported "one restart did not restore
 #     cycling" for a restart that never ran.
 echo "── 8b(h). a failed enable stops the arm and is reported as RESTART-FAILED, naming the verb"
-newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
 mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501' 1
 removed_pass "$C/pass.out"
 assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "enable " "the arm did try enable"
@@ -600,7 +624,7 @@ assert_absent "$(cat "$C/state/l" 2>/dev/null)" "STILL_NOT_CYCLING" "…instead 
 #     same fixture must end in RESTART-FAILED rc=75 with NOTHING claiming it was a refusal. ⛔ THIS IS THE
 #     CASE THAT REDDENS IF THE SENTINEL COMES BACK.
 echo "── 8b(i). a verb failing with rc 75 is RESTART-FAILED, never mistaken for a refusal"
-newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
 mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501' 75
 removed_pass "$C/pass.out"
 assert_contains "$(grep -m1 RESTART-FAILED "$C/state/l" 2>/dev/null)" "rc=75" "a verb exiting 75 is reported as RESTART-FAILED with rc=75 (not swallowed as a refusal)"
@@ -726,6 +750,68 @@ echo "── 8b(n). the label literal in the remedy matches install.sh's rendere
 INSTALL_LABEL="$(sed -n 's/^LABEL="\([^"]*\)".*/\1/p' "$SELF_DIR/install.sh" 2>/dev/null | head -1)"
 WD_LABEL_LITERAL="$(sed -n 's/.*\[ "\$LABEL" = "\([^"]*\)" \]; then.*/\1/p' "$WD" 2>/dev/null | head -1)"
 assert_eq "${INSTALL_LABEL:-install.sh-has-no-LABEL-line}" "${WD_LABEL_LITERAL:-watchdog-has-no-label-literal}" "install.sh's rendered label and the watchdog's label literal are the same string"
+
+# ── 8b(o)-(r): PROVENANCE, DOMAIN-REJECTION POLARITY, AND WHAT A REFUSAL MAY CLAIM ───────────────
+# These four are the DISCRIMINATING cases for cycle 4. Each one was measured to stay GREEN with its
+# defect re-introduced before it was written down — a test that cannot fail is not a test.
+# (o) A PLIST THAT IS NOT THIS JOB IS REFUSED (review P1, cycle 4). `bootstrap` resolves the job by the
+#     plist's OWN Label, so a stale/copied plist must never be loaded: it would enable a label it does
+#     not hold and load a DIFFERENT job beside the box's model (#1761/#1715), reported as a failed
+#     restart of a controller nothing touched.
+echo "── 8b(o). a plist whose Label is NOT this label is REFUSED, never bootstrapped"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+seed_plist "$C/stack.plist" 'com.eldato.orchestrator-some-other-stack'
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_absent "$CALLS_OUT" "bootstrap" "a foreign plist is NEVER bootstrapped (it would load a different job)"
+assert_absent "$CALLS_OUT" "enable " "…and its label is not even enabled (nothing was issued)"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass REFUSES and says so"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "some-other-stack" "…naming the Label it actually found, so the operator can see the mix-up"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "restart=0" "…and it does not claim a restart it never attempted"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "restart=1" "…(no restart=1 anywhere on a refused pass)"
+# (o2) RIGHT LABEL, WRONG PROGRAM — a controller entry outside every root this box owns is still not
+#      this state dir's controller (the `launchd_job_for_state_dir` doctrine: operate the job that IS
+#      here, never load a new one).
+echo "── 8b(o2). a plist with the right Label but a FOREIGN controller program is REFUSED"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+seed_plist "$C/stack.plist" 'com.eldato.orchestrator-stack' '/opt/somebody-elses-checkout/scripts/orchestrator-harness/orch-loop.sh'
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a foreign controller program is never bootstrapped over this box's model"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…it refuses and names the reason"
+# (p) BOTH reads are DOMAIN-LEVEL rejections ⇒ UNKNOWN, never "absent" (review P2, cycle 3's own branch,
+#     which had NO discriminating test — measured: reverting it to `${target:-gui/$(id -u)}` left the
+#     whole suite GREEN). "Absent" is the state that AUTHORISES enable+bootstrap, so getting it wrong
+#     loads a job into a domain launchd just rejected.
+echo "── 8b(p). both domains reject the target ⇒ UNKNOWN (kickstart only), never a bootstrap"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find domain for user gui: 501'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_absent "$CALLS_OUT" "bootstrap" "a read that established NOTHING never authorises a bootstrap"
+assert_absent "$CALLS_OUT" "enable " "…nor the enable that precedes it"
+assert_contains "$CALLS_OUT" "kickstart -k" "…it takes the one verb that cannot double-load a job"
+# (q) A NOT-FOUND IS THE RETURN CODE, not the wording (the rc-113 marker). A read whose TEXT matches no
+#     known phrasing but whose rc is 113 IS not-found, so it must still reach the bootstrap arm; with the
+#     marker deleted the arm degrades to a kickstart for ever and this case reddens.
+echo "── 8b(q). rc 113 IS not-found even when the wording is unrecognised ⇒ the bootstrap arm is reached"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "rc 113 drives the polarity even if launchd's wording changes (the marker is load-bearing)"
+# (r) A REFUSAL CONSUMES NO RESTART BUDGET (review P2, cycle 4). Three harmless refusals used to latch
+#     the box into `<verdict>_STOPPED` and withhold the arm for up to 2xMAX_CONSEC further passes — a
+#     dead arm traded for a safe one. The streak must be exactly what the pass READ, across repeats.
+echo "── 8b(r). repeated refusals do NOT consume the restart budget, and each logs restart=0"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+seed_plist "$C/stack.plist" 'com.eldato.orchestrator-some-other-stack'
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+_i=0
+while [ "$_i" -lt 4 ]; do removed_pass "$C/pass.out"; _i=$(( _i + 1 )); done
+assert_eq "$(cat "$C/state/watchdog.streak" 2>/dev/null || echo 0)" "0" "four refusals leave the streak at 0 (a withheld restart is not a failed one)"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "STOPPED" "…so the arm is never latched into a STOPPED state by refusals alone"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "restart=1" "…and no refusal pass claims restart=1"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
