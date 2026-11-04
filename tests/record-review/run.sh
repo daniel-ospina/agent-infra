@@ -2333,7 +2333,7 @@ if [ -d "$DELTA_REPO" ]; then
     && [ "$(printf '%s' "$D_REC32" | grep -c '"conflicts":0')" = 1 ] \
     && pass "(33a2) the record NAMES what the arm proved (proved/arm=lane, conflicts:0 measured by clause D, NO authored_unchanged claim) — the shape is pinned, not just described" \
     || fail "(33a2) the delta record's proof fields are wrong (record='$D_REC32')"
-  # (33a6) A `--delta` MINT MUST NOT CARRY A MALFORMED `delta_range` (agent-infra#3247 × #3299).
+  # (33a6b) A `--delta` MINT MUST NOT CARRY A MALFORMED `delta_range` (agent-infra#3247 × #3299).
   # `DELTA_FROM` is a name BOTH features own: `--delta` sets it to the head it measures FROM and
   # sets nothing else, while only `delta_verify` sets DELTA_TO/KIND/DIGEST. The range write was
   # keyed on `DELTA_FROM` alone, so every delta record carried `"delta_range":"<head>.."` — an
@@ -2350,9 +2350,9 @@ if [ -d "$DELTA_REPO" ]; then
   D_RANGE_N32=""
   if [ -n "$D_REC32" ]; then D_RANGE_N32="$(grep -c '"delta_range"' <<<"$D_REC32" || true)"; fi
   if [ -n "$D_REC32" ] && { [ "$D_RANGE_N32" = "0" ] || grep -qE '"delta_range":"[0-9a-f]{40}\.\.[0-9a-f]{40}"' <<<"$D_REC32"; }; then
-    pass "(33a6) the delta record carries NO malformed delta_range (absent here — no range was verified; a delta-over-delta legitimately inherits 40-hex..40-hex) — a shared DELTA_FROM name cannot poison the signed claim"
+    pass "(33a6b) the delta record carries NO malformed delta_range (absent here — no range was verified; a delta-over-delta legitimately inherits 40-hex..40-hex) — a shared DELTA_FROM name cannot poison the signed claim"
   else
-    fail "(33a6) the delta record carries a MALFORMED delta_range (${D_RANGE_N32:-none} occurrence(s); record='$D_REC32')"
+    fail "(33a6b) the delta record carries a MALFORMED delta_range (${D_RANGE_N32:-none} occurrence(s); record='$D_REC32')"
   fi
   # (33a3) THE TRIPLE'S VALUES, not just its presence. 33d greps `^zero-conflict=` to prove the line
   # is REACHABLE; that cannot notice the field degrading to `no`/`UNMEASURED` on an ACCEPTED delta.
@@ -2411,6 +2411,28 @@ if [ -d "$DELTA_REPO" ]; then
   else
     fail "(33a5) delta_measured_from() could not be extracted from record-review.sh — re-anchor the pin rather than dropping it"
   fi
+  # (33a6) THE ACCEPTED DIRECTION, CHECKED BY THE READER — not just described by the writer
+  # (#3247 review, P2). Everything above asserts what the WRITER emitted, and (33f2) runs
+  # `--check-carry` only over the record `--delta` is supposed to REFUSE. Nothing ran the reader
+  # over the record the delta just minted, so a regression that stopped writing the top-level
+  # `carry_arm` would make every genuine delta answer `norecord`/exit 4 at the merge gate — the
+  # feature silently INERT — while this suite stayed green: (33a)/(33a2) never look at
+  # `carry_arm`, and (33f2) only proves the reader agrees about a record nothing should produce.
+  # It is the PAIR that is asserted, not the word: `--check-carry` requires `carry_arm` AND
+  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:2407-2418) BEFORE it
+  # head-binds at :2443, so a delta record missing either is a no-record for the gate.
+  D_REC_A6="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
+  CC_RC_A6=0
+  CC_OUT_A6="$( cd "$DELTA_REPO" || exit 9
+    HOME="$DR_HOME" PATH="$TMP/dbin:$PATH" FIX_REPO="$DELTA_REPO" \
+    FIX_BASE="$D_BASE" FIX_HEAD="$D_MERGED" \
+      bash "$SRC" --check-carry 7101 fixture/repo 2>/dev/null )" || CC_RC_A6=$?
+  [ "$CC_RC_A6" -eq 0 ] \
+    && [ "${CC_OUT_A6%%$'\t'*}" = "head" ] \
+    && [ "$(grep -c '"carry_arm":"lane"' <<<"$D_REC_A6")" = 1 ] \
+    && [ "$(grep -c '"evidence":"comment:9000001"' <<<"$D_REC_A6")" = 1 ] \
+    && pass "(33a6) the ACCEPTED delta record is accepted BY THE READER: --check-carry answers head/exit 0 for it, and the record carries top-level carry_arm=lane AND evidence — so the merge gate cannot classify a real delta as norecord" \
+    || fail "(33a6) the record the delta minted is not one --check-carry accepts (rc=$CC_RC_A6, out='$CC_OUT_A6', record='$D_REC_A6')"
   # (b) one real authored commit on top of the merge: authorship moved, so a review is owed.
   ( cd "$DELTA_REPO" || exit 9; printf 'lane fix\n' >> lane.txt; git add -A; git commit -qm "lane: a real fix commit" ) >/dev/null 2>&1
   D_FIXED="$( cd "$DELTA_REPO" && git rev-parse pr )"
@@ -2571,7 +2593,16 @@ while i < len(src):
 open(sys.argv[2], "w", encoding="utf-8").write("\n".join(out))
 print(f"mutant: dropped {dropped} post-condition(s)")
 INNERPY
-  if grep -q 'no carry arm ran' "$TMP/nodelta-postcond.sh"; then
+  # ⛔ THE MUTANT'S EXISTENCE IS PART OF THE ASSERTION (#3247 review, P3). `bash "$1"` on a path
+  # that was never written exits **127**, which satisfies `[ rc -ne 3 ]` and greps for a message no
+  # mutant could print — so a heredoc that failed outright would report ATTRIBUTION having mutated
+  # nothing. That is this suite's own recurring defect (an arm green because the thing it measures
+  # never ran), so the guards come FIRST and name it.
+  if [ ! -f "$TMP/nodelta-postcond.sh" ]; then
+    fail "(33g2) the mutant was never WRITTEN (the deletion heredoc failed), so 'no refusal' would be bash's 127 on a missing file rather than a measurement — attribution is unproven"
+  elif [ ! -s "$TMP/nodelta-postcond.sh" ]; then
+    fail "(33g2) the mutant is EMPTY — running it proves nothing about the post-condition"
+  elif grep -q 'no carry arm ran' "$TMP/nodelta-postcond.sh"; then
     fail "(33g2) the mutant still contains the post-condition — the deletion did not land, so attribution is unproven"
   else
     delta_write_record 7108 "$D_REVIEWED" clean-micro
@@ -2582,8 +2613,80 @@ INNERPY
       && pass "(33g2) ATTRIBUTION: with the post-condition DELETED the same run no longer refuses at 3 nor emits the message (rc=$DRC_G2 — stopped later by this fixture's clean-micro surface cap), so (33g)'s refusal is the post-condition's own and not a pre-existing one" \
       || fail "(33g2) the mutant reproduced the (33g) refusal without the post-condition (rc=$DRC_G2, out='$OUT32G2'), so (33g) is attributable to something else"
   fi
+  # (33h) ONE VERB PER INVOCATION — ONE ASSERTION PER COMBINATION (#3247 review, P1).
+  #
+  # ⛔ THIS IS THE ARM THAT WAS MISSING, AND IT WAS MISSING IN THE WAY THIS SUITE KEEPS
+  # BEING BITTEN. Every `--delta` invocation in BOTH suites was the bare
+  # `--delta <pr> fixture/repo` form (`scripts/record-review.test.sh` contained no `--delta`
+  # at all), so deleting `|| [ "$DELTA" -eq 1 ]` from the one-verb guard — or dropping the
+  # `[ "$DELTA" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]` arity guard, or the delta arm of the
+  # `--evidence/--force-stale/--expect-head` refusal — reddened NOTHING while restoring exactly
+  # the false PASS the guard comment at `:1268-1274` says was MEASURED (`--delta
+  # --print-diff-hash` exited 0 with the record untouched; `--delta --check-carry` answered
+  # `fresh … run the code-review skill`, i.e. the paid re-review the verb exists to remove).
+  # The in-repo standard for this guard class already existed — `--recover-body`'s combinations
+  # are pinned assertion-per-combo in `scripts/record-review.test.sh:2947-2971` — so this section
+  # meets that standard instead of describing it.
+  #
+  # THE FIXTURE IS THE ACCEPTANCE TOPOLOGY ON PURPOSE: record at `$D_REVIEWED`, live head
+  # `$D_MERGED`, i.e. the exact pair (33a) proves exits 0 and MINTS. So if a guard were deleted
+  # and the extra argument silently ignored, the run would exit 0 and WRITE — which is why each
+  # arm asserts the record is BYTE-IDENTICAL as well as the exit code. A refusal that still wrote
+  # would be the false PASS, not the refusal.
+  delta_run_extra() { # <pr> <out-file> <extra args...> ; assigns DR_RC — same env as delta_run
+    local _pr="$1" _out="$2"
+    shift 2
+    ( cd "$DELTA_REPO" || exit 9
+      HOME="$DR_HOME" PATH="$TMP/dbin:$PATH" FIX_REPO="$DELTA_REPO" \
+      FIX_BASE="$(git rev-parse main)" FIX_HEAD="${FIX_DELTA_HEAD:?}" \
+        bash "$SRC" --delta "$_pr" fixture/repo "$@" ) > "$_out" 2>&1
+    DR_RC=$?
+  }
+  d_h_expect2() { # <label> <expected-message-fragment> <args...>
+    local _label="$1" _msg="$2"
+    shift 2
+    delta_run_extra 7109 "$TMP/out33h" "$@"
+    local _rc="$DR_RC" _now _bytes
+    _now="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7109.json" 2>/dev/null)"
+    if [ "$_now" = "$D_H_REC" ]; then _bytes="UNCHANGED"; else _bytes="CHANGED"; fi
+    if [ "$_rc" -eq 2 ] && [ "$_bytes" = "UNCHANGED" ] && grep -qF -- "$_msg" "$TMP/out33h"; then
+      pass "(33h) $_label is REFUSED at exit 2 and the record is BYTE-IDENTICAL — the mixed-verb shape that would exit 0 having re-attested nothing"
+    else
+      fail "(33h) $_label was NOT refused as a one-verb violation (rc=$_rc, record $_bytes, out='$(head -c 400 "$TMP/out33h" 2>/dev/null)')"
+    fi
+  }
+  delta_write_record 7109 "$D_REVIEWED" clean
+  D_H_REC="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7109.json")"
+  FIX_DELTA_HEAD="$D_MERGED"
+  d_h_expect2 '--delta --print-diff-hash' \
+    '--delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier' \
+    --print-diff-hash
+  d_h_expect2 '--delta --check-carry' \
+    '--delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier' \
+    --check-carry
+  d_h_expect2 '--delta --print-tier' \
+    '--delta MINTS a record and cannot be combined with --check-carry/--print-diff-hash/--print-tier' \
+    --print-tier
+  d_h_expect2 '--delta --flush-pending' \
+    '--flush-pending is its own verb' \
+    --flush-pending
+  d_h_expect2 '--delta --recover-body' \
+    'both MINT a record' \
+    --recover-body
+  d_h_expect2 '--delta --evidence' \
+    'so it takes no --evidence/--force-stale/--expect-head' \
+    --evidence 'comment:9'
+  d_h_expect2 '--delta --force-stale' \
+    'so it takes no --evidence/--force-stale/--expect-head' \
+    --force-stale
+  d_h_expect2 '--delta --expect-head' \
+    'so it takes no --evidence/--force-stale/--expect-head' \
+    --expect-head "$D_MERGED"
+  d_h_expect2 '--delta with a third positional (a caller-supplied head/verdict)' \
+    'takes <pr> [owner/repo] and nothing else' \
+    clean
 else
-  fail "(33a) fixture missing"; fail "(33b) fixture missing"; fail "(33c) fixture missing"; fail "(33d) fixture missing"; fail "(33e) fixture missing"; fail "(33f) fixture missing"; fail "(33f2) fixture missing"; fail "(33g) fixture missing"; fail "(33g2) fixture missing"
+  fail "(33a) fixture missing"; fail "(33b) fixture missing"; fail "(33c) fixture missing"; fail "(33d) fixture missing"; fail "(33e) fixture missing"; fail "(33f) fixture missing"; fail "(33f2) fixture missing"; fail "(33g) fixture missing"; fail "(33g2) fixture missing"; fail "(33h) fixture missing"; fail "(33a6b) fixture missing"; fail "(33a7) fixture missing"; fail "(33a8) fixture missing"; fail "(33a9) fixture missing"; fail "(33a10) fixture missing"; fail "(33a11) fixture missing"
 fi
 
 # ── MUTATION PINS on real output ──────────────────────────────────────────
@@ -2765,14 +2868,30 @@ fi
 # this suite has no marker fixture and the patch/diff arms are otherwise unreachable; 33f and
 # 33f2 pin the unproven-delta refusal and the "both verbs agree" invariant, which were MEASURED
 # green under deletion before they existed.
-# AFTER THE REBASE the count is main's plus this section's: main spent 185 -> 190 on #3347's own
-# section (32), and this section adds 19 (13 delta assertions + the (33a6) integration pin +
-# (33a7)/(33a9) legacy-key vectors + the (33a8) structural D_REC default + (33a10)/(33a11), the two
-# previously-unpinned mode arms), so the
-# pin is 209. The section is numbered 33 for the same
-# reason — (32) was already taken on main by the time this branch was rebased.
-# MEASURED: `ALL PASSED (209 assertion(s))` on the merged tree.
-MIN_ASSERTIONS=209
+# AFTER THE REBASE the count is main's plus this section's. Section 33's arms are 33a, 33a2, 33a3,
+# 33a4, 33a5, 33a6, 33b, 33c, 33d, 33e, 33f, 33f2, 33g, 33g2 — count THEM, not this sentence: the
+# previous revision of this comment said "this PR adds 11, so the pin is 201" against a constant of
+# 203, which is the rot a comment restating its own arithmetic always suffers. The section is
+# numbered 33 for the same reason — (32) was already taken on main when this branch was rebased.
+# Review round 4: 204 -> 213. (33h) pins EVERY `--delta` verb-exclusivity / arity / mint-input
+# refusal the verb adds — one assertion per combination, each asserting exit 2 AND a byte-identical
+# record — because both suites previously drove only the bare `--delta <pr> <repo>` form and a
+# deleted guard reddened nothing.
+# ⛔ 213 -> 219 — THE #3401 UNION (agent-infra#3247 landed on main on its own while this branch was
+# open, at a DIFFERENT head of the same PR). Neither side is a superset: main carries the (33a6)
+# reader-side pin, the (33g2) mutant-existence guards and the whole (33h) block, while this branch
+# carries (33a7)/(33a9) legacy-key predecessor vectors, (33a8)'s structural D_REC default and
+# (33a10)/(33a11) — the two mode arms nothing else distinguished. The merge is main's file PLUS
+# those six; main's (33a6) keeps its label and this branch's malformed-range pin is relabelled
+# (33a6b), so neither assertion is lost to a name collision. 213 + 6 = 219, MEASURED, not computed.
+# ⛔ AND THE PIN IS AN EQUALITY, NOT A FLOOR — the sentence that stood here said a floor "reds when
+# FEWER assertions run"; the check below is `[ "$PASS" -ne "$MIN_ASSERTIONS" ]`, so it reds when MORE
+# run too (verified at this head: the union measured 219 against main's 213 and this file's own pin
+# refused). Raising it is therefore mandatory whenever an arm is added, and lowering it is how a
+# deleted section gets laundered.
+# MEASURED: `ALL PASSED (219 assertion(s))` on this tree. `bash-suites` REFUSES to
+# run on a live cell (exit 78), so a local ALL PASSED is NOT CI evidence — see the PR comment.
+MIN_ASSERTIONS=219
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
