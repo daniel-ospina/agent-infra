@@ -590,7 +590,13 @@ REFUSAL_AWK
 # The files that DECLARE a gate code in this deploy unit. Presence is not enough: each must actually
 # contribute a parsed claim, so this list cannot rot into naming a file that stopped declaring one,
 # and a file that vanishes from a `$O` copy is a RED rather than a quietly smaller scan.
-_codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh"
+_codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gate.sh"
+# ⛔ `key-gate.sh` IS REQUIRED BECAUSE IT IS THE ONLY DECLARER OF 82 (#3331), and it arrived on main
+# while this branch was open. Without it in this list the "a vanished declarer is a RED" property was
+# FALSE for the newest code in the deploy unit: measured on the head a fresh review measured, deleting
+# `key-gate.sh` from a copy left `RC=0 claims=14 absent: none` — a CLEAN report over a code whose only
+# declarer was gone. (`lane.sh:274` FATALs if the file is missing, so no live lane misread it; the
+# defect is that the guard's stated population was not the population it checked.)
 # A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
 # not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
 # now READS the bookkeeping assignments it used to drop, so the three names below are the full set it
@@ -2371,7 +2377,7 @@ chain_probe() { # <gate-word> -> sets CHAIN_RC and CHAIN_REMEDY (the gate the ch
 }
 # `<gate-word>:<CONSTANT-NAME>` — the value is read from the helper, so a RENUMBER here is followed
 # rather than pinned twice, and an absent constant shows up as an empty `want` (red), not as a pass.
-_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED"
+_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED key:KEY_GATE_REFUSED"
 _seen=""; _exercised=""
 for _pair in $_gate_expected; do
   _g="${_pair%%:*}"; _c="${_pair##*:}"
@@ -2395,13 +2401,54 @@ ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_
 # its only consumer, so `_cap_gate=<word>` over those two files is the population. Both directions
 # are required (a word with no row is unchecked; a row with no word is a dead assertion), and the
 # non-vacuity clause is what stops an EMPTY derivation from passing as equality.
-_capwords_derived="$(grep -ohE '_cap_gate=[a-z][a-z-]*' "$HERE/lane.sh" "$HERE/chain-merge.sh" \
-                    | sed 's/^_cap_gate=//' | sort -u | tr '\n' ' ')"
+# ⛔ BUT `_cap_gate=<word>` IS NOT THE ONLY SEAM A GATE WORD ARRIVES THROUGH (P1, fresh review of
+# `1f45677f`). #3331 landed `key` on main while this branch was open and records it through
+# `lane_standdown_write key …` (`lane.sh:827`), NOT through a `_cap_gate=key` arm — so a derivation built
+# only from `_cap_gate=` saw SIX words while the deploy unit carried SEVEN, and `_gate_expected` had six
+# too. The two sides agreed by AGREEING TO SAY NOTHING: measured on that head, the arm read
+# `derived: 'capability disk fork land load skew'` and the duplicate check's `codes:` list was
+# `71 73 75 74 77 83` — **82 did not appear anywhere**, so `key` could have been published with the load
+# remedy and no check would have noticed. That is this section's own defect, re-instantiated by the
+# newest code in the tree. So the population is derived from every seam that can PRODUCE a word:
+#   1. `_cap_gate=<word>`             — lane.sh's code-classification arms
+#   2. `lane_standdown_write <word>`  — a literal word passed straight to the record writer (#3331's form)
+#   3. `printf '<word>'` in `cap_refusal_gate` — the chain's own normaliser arm for that word
+# A new gate must arrive through one of them to be recordable at all; arriving through ANY of them now
+# puts it in this set, where a missing row is RED.
+_gatewords_derived_from() { # <dir> -> the gate words THIS deploy unit can record, space-separated
+  {
+    grep -ohE '_cap_gate=[a-z][a-z-]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | sed 's/^_cap_gate=//'
+    # A LITERAL word only: `lane_standdown_write "$_cap_gate"` (the replay of an already-classified
+    # refusal) is not a new word, and the `[a-z]` anchor is what excludes it — the variable form starts
+    # with a quote. The function's own definition line does not match either (it is followed by `()`).
+    grep -ohE 'lane_standdown_write [a-z][a-z-]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | awk '{print $2}'
+    # The chain's normaliser: one `printf '<word>'` arm per word it will pass through as itself.
+    sed -n '/^cap_refusal_gate()/,/^}/p' "$1/chain-merge.sh" 2>/dev/null \
+      | grep -oE "printf '[a-z][a-z-]*'" | sed "s/^printf '//; s/'$//"
+  } | sort -u | tr '\n' ' '
+}
+_capwords_derived="$(_gatewords_derived_from "$HERE")"
 _capwords_derived="${_capwords_derived% }"
 _capwords_expected="$(printf '%s\n' $_gate_expected | cut -d: -f1 | sort -u | tr '\n' ' ')"
 _capwords_expected="${_capwords_expected% }"
 { [ -n "$_capwords_derived" ] && [ "$_capwords_derived" = "$_capwords_expected" ]; }; rc=$?
 ck "the gate words the callers can RECORD and the rows above are the same set, derived from the callers themselves (derived: '${_capwords_derived:-<EMPTY>}'; rows: '${_capwords_expected:-<EMPTY>}') — a new word without a row would otherwise be published as a load refusal" $rc
+
+# ⛔ THE DERIVATION MUST SEE THE SEAM #3331 USED (P1, fresh review of `1f45677f`). The equality above is
+# worthless if BOTH sides are blind to the same word — which is exactly what happened: `key` was in
+# neither. These two arms pin the correction from the side that failed, so the class cannot come back
+# through that seam. The first is the live instance; the second is the GENERAL shape (a gate landed the
+# way `key` landed, with the word arriving through the standdown call and no `_cap_gate=` arm at all).
+case " $_capwords_derived " in *" key "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the derivation SEES #3331's seam — \`key\` is recorded through \`lane_standdown_write key\`, not \`_cap_gate=key\`, so a \`_cap_gate=\`-only derivation read six words for a seven-gate unit (derived: '${_capwords_derived:-<EMPTY>}')" $rc
+_gw_dir="$TMP/gatewords"; rm -rf "$_gw_dir"; mkdir -p "$_gw_dir"
+cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw_dir/"
+printf '\nlane_standdown_write mystery "$CAPACITY_YIELD_SECS"\n' >> "$_gw_dir/lane.sh"
+_gw_after="$(_gatewords_derived_from "$_gw_dir")"; _gw_after="${_gw_after% }"
+case " $_gw_after " in *" mystery "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a NEW gate landed through that SAME seam is SEEN, so the row/word equality is a real claim rather than two lists agreeing to say nothing (before: '$_capwords_derived'; after: '${_gw_after:-<EMPTY>}')" $rc
+[ "$_gw_after" != "$_capwords_derived" ]; rc=$?
+ck "...and the derived set CHANGES for it, so an unseen gate cannot pass the equality above (the fail-open this arm exists for read GREEN: 82 appeared in no side of the comparison)" $rc
 # The operator-facing half: the load REMEDY must not be printed for a capability refusal.
 chain_probe capability
 [ "$CHAIN_REMEDY" = "refused at the capability gate" ]; rc=$?
@@ -2449,9 +2496,14 @@ ck "every AGENT_*_REFUSED code is ACCOUNTED FOR — named in a caller's CODE or 
 # refusal through the fixer.
 # So the properties below are DERIVED from the shipped files and from the caller's own references,
 # never from a list a future author has to remember to extend:
-#   (0) the POPULATION of the table above is derived: every `<word>` the callers can record
-#       (`_cap_gate=<word>` in `lane.sh`/`chain-merge.sh`) must have a row and every row must have a
-#       word. Without it a sixth gate was published as a load refusal with nothing failing.
+#   (0) the POPULATION of the table above is derived: every `<word>` the callers can record — a
+#       `_cap_gate=<word>` arm in `lane.sh`/`chain-merge.sh`, a literal `lane_standdown_write <word>`
+#       call (#3331's seam), or a `printf '<word>'` arm in `cap_refusal_gate` — must have a row and every
+#       row must have a word. Without it a sixth gate was published as a load refusal with nothing
+#       failing. ⛔ THE THREE SEAMS ARE NAMED BECAUSE ONE OF THEM WAS MISSED: `key` (82) arrives through
+#       the standdown call, so a `_cap_gate=`-only derivation and this table's rows agreed on SIX words
+#       while the unit had seven; the equality passed, and 82 appeared in neither the derived set nor
+#       the duplicate check's code list (P1, fresh review of `1f45677f`).
 #   (1) two gates may not claim one code — and the claim list comes from a SCANNER OVER THE WHOLE
 #       DEPLOY UNIT that fails closed (an unreadable declaration, an absent declarer or an empty scan
 #       is a RED), because the first cut parsed `spawn-gate.sh` alone with a `^NAME=` anchor: it was
@@ -2526,6 +2578,18 @@ rm -f "$_codemut_dir/brief-gate.sh"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"absent: brief-gate.sh(absent)"*) rc=0 ;; *) rc=1 ;; esac
 ck "(mutation d) an ABSENT required declarer (brief-gate.sh) is REFUSED and named, not skipped (rc=$CODE_RC; $CODE_MSG)" $rc
+# ⛔ (d2) THE SAME PROPERTY FOR THE NEWEST CODE IN THE UNIT (P2, fresh review of `1f45677f`). `82` has
+# exactly ONE declarer — `key-gate.sh:71 KEY_GATE_REFUSED=82` — and that file arrived on main while this
+# branch was open, so it was outside `_codes_required`. Measured on the reviewed head: deleting it from
+# a copy left `RC=0 claims=14 absent: none`, i.e. the absent-declarer property this arm above proves was
+# FALSE for 82, and the tolerant `${KEY_GATE_REFUSED:-82}` in `chain-merge.sh` kept the tree readable and
+# silent about it. A required-list that does not name the only declarer of a code is a population claim
+# that is not the population checked.
+_codemut_dir="$(_codemut absent-key)"
+rm -f "$_codemut_dir/key-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"absent: key-gate.sh(absent)"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation d2) the ONLY declarer of 82 (key-gate.sh) is REFUSED when absent — it fell outside the required set, so its loss scanned CLEAN (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (e) FINDING 1, the root case: a scan that matches NOTHING. This is the shape a blind parser produces
 # on a tree it does not understand, and in the first cut it read as a clean pass.
