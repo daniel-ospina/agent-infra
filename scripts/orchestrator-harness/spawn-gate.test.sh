@@ -401,13 +401,27 @@ codes_verdict() {
     case "$_cv_ns" in *,*) _cv_shared="$_cv_shared $_cv_c=$_cv_ns" ;; esac
   done
   _cv_shared="${_cv_shared# }"
-  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale$_cv_foreign" ] \
+  # ONE NAME, TWO CODES — THE MIRROR OF THE COLLISION, AND IT WAS GREEN (P1, review of `dcb499b7`).
+  # The rule above catches one CODE under two names; nothing caught one NAME under two codes, and its
+  # two readers then disagreed about which one is real: `codes_for_name` returns the FIRST claim row
+  # (`{print $3; exit}`), while the `_cv_stale` pass keeps the LAST (`decl[$2] = $3` overwrites) — and
+  # neither is necessarily the value the shipped shell ends up with after the second assignment runs.
+  # Measured on the reviewed head: appending `PI_GATE_REFUSED=85` after the live `PI_GATE_REFUSED=76`
+  # left the verdict at RC=0 with a clean `shared:` line, and `codes_for_name`/`_cv_stale` then
+  # disagreed with the runtime value. A single pass is correct HERE, unlike `_cv_stale` above: this
+  # compares claim to claim, so it does not depend on which file is read first.
+  _cv_conf="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '
+    $1=="claim" { if (($2 in decl) && (decl[$2] != $3)) printf "%s:%s:%s,%s\n", $2, $4, decl[$2], $3
+                  decl[$2] = $3 }
+  ' | sort | tr '\n' ' ')"
+  _cv_conf="${_cv_conf% }"
+  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale$_cv_foreign$_cv_conf" ] \
      || [ "$_cv_shared" != "$_codes_sanctioned" ] || [ "$_cv_n" -eq 0 ]; then
     CODE_RC=1
   else
     CODE_RC=0
   fi
-  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale}${_cv_foreign:+ foreign:$_cv_foreign} shared:${_cv_shared:- none}"
+  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale}${_cv_foreign:+ foreign:$_cv_foreign}${_cv_conf:+ conflicting-declarations: $_cv_conf} shared:${_cv_shared:- none}"
 }
 
 # Computed here so every reader below shares ONE parse: the chain gate table, the coverage verdict,
@@ -2042,6 +2056,24 @@ done
 _dups="$(printf '%s\n' $_seen | sort | uniq -d | tr '\n' ' ')"
 [ -z "${_dups// /}" ]; rc=$?
 ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_dups:- none})" $rc
+
+# ⛔ THE POPULATION IS DERIVED TOO, NOT REMEMBERED (P2, review of `dcb499b7`). The rows above are
+# correct, but until this arm existed nothing FAILED when a caller gained a gate WORD without a row:
+# `chain-merge.sh` normalises an unrecognised word to `load` (`*) _cap_rc=75`, the documented
+# corruption fallback), so a sixth gate would be published with the load remedy to the operator, and
+# no check noticed — precisely the hand-maintained-list defect the preamble names as a root cause.
+# The set is derived from the CALLERS' own assignments: `lane.sh` is the ONLY writer of the record's
+# third field (`:572` writes `$_cap_gate` into `state/capacity-refused-<N>`) and `chain-merge.sh` is
+# its only consumer, so `_cap_gate=<word>` over those two files is the population. Both directions
+# are required (a word with no row is unchecked; a row with no word is a dead assertion), and the
+# non-vacuity clause is what stops an EMPTY derivation from passing as equality.
+_capwords_derived="$(grep -ohE '_cap_gate=[a-z][a-z-]*' "$HERE/lane.sh" "$HERE/chain-merge.sh" \
+                    | sed 's/^_cap_gate=//' | sort -u | tr '\n' ' ')"
+_capwords_derived="${_capwords_derived% }"
+_capwords_expected="$(printf '%s\n' $_gate_expected | cut -d: -f1 | sort -u | tr '\n' ' ')"
+_capwords_expected="${_capwords_expected% }"
+{ [ -n "$_capwords_derived" ] && [ "$_capwords_derived" = "$_capwords_expected" ]; }; rc=$?
+ck "the gate words the callers can RECORD and the rows above are the same set, derived from the callers themselves (derived: '${_capwords_derived:-<EMPTY>}'; rows: '${_capwords_expected:-<EMPTY>}') — a new word without a row would otherwise be published as a load refusal" $rc
 # The operator-facing half: the load REMEDY must not be printed for a capability refusal.
 chain_probe capability
 [ "$CHAIN_REMEDY" = "refused at the capability gate" ]; rc=$?
@@ -2087,17 +2119,25 @@ ck "every AGENT_*_REFUSED code is ACCOUNTED FOR — named in a caller's CODE or 
 # MEMORY refusal exited 81 under the "HARNESS/MISMATCH gate" label and the memory arm was UNREACHABLE.
 # One red out of 113 checks, and only because #2591 happened to write an arm that drove the memory
 # refusal through the fixer.
-# So the two properties below are DERIVED from the shipped files and from the caller's own references,
+# So the properties below are DERIVED from the shipped files and from the caller's own references,
 # never from a list a future author has to remember to extend:
+#   (0) the POPULATION of the table above is derived: every `<word>` the callers can record
+#       (`_cap_gate=<word>` in `lane.sh`/`chain-merge.sh`) must have a row and every row must have a
+#       word. Without it a sixth gate was published as a load refusal with nothing failing.
 #   (1) two gates may not claim one code — and the claim list comes from a SCANNER OVER THE WHOLE
 #       DEPLOY UNIT that fails closed (an unreadable declaration, an absent declarer or an empty scan
 #       is a RED), because the first cut parsed `spawn-gate.sh` alone with a `^NAME=` anchor: it was
 #       measured GREEN on `export AGENT_NEW_GATE_REFUSED=83` and blind to `brief-gate.sh`'s 80 and
-#       `adopt-fix.sh`'s 79, which is precisely how a unique code stops being unique;
+#       `adopt-fix.sh`'s 79, which is precisely how a unique code stops being unique; the same
+#       verdict also refuses ONE NAME declared under TWO codes (`conflicting-declarations`), because
+#       `codes_for_name` reads the FIRST such row while the stale-default pass reads the LAST;
 #   (2) every gate the fixer CLASSIFIES is DRIVEN, and must NAME ITSELF. A new constant that fix-one.sh
 #       reads but this table does not declare is a RED ("undeclared"), so the table cannot fall behind
 #       the helper silently — the blind spot that let 81 be claimed twice. The table's own accounting
 #       (`_armseen`) is read and asserted, so "every row was driven" is falsifiable rather than stated.
+# ⛔ WHAT IS STILL A LIST, stated so this preamble cannot rot into the claim it warns about: the
+# `<word>:<CONSTANT>` PAIRING in `_gate_expected` is hand-written (its POPULATION is derived), so a
+# change to which constant a word means is not caught here — the arm drive is what catches that.
 
 # (1) THE CODES ARE UNIQUE ACROSS THE WHOLE DEPLOY UNIT, not just the helper. This is the verdict of
 # the ONE scanner defined at the top of this file, and $CODE_MSG carries its readings so a red says
@@ -2352,6 +2392,23 @@ case "$CODE_MSG" in
 esac
 ck "(mutation g0) a stale default in a CALLER file — emitted BEFORE the declaring file — is REFUSED too, so the comparison is two-pass and not glob-order luck (want 'AGENT_HARNESS_SKEW_REFUSED:adopt-fix.sh:$_wantline=81(want 83)') (rc=$CODE_RC; $CODE_MSG)" $rc
 
+# (g3) ONE NAME UNDER TWO CODES — the MIRROR of the collision this section exists to end, and it was
+# GREEN (P1, review of `dcb499b7`). A name declared 79 in one helper and 84 in another passes both
+# rules above (each code is unique; each default may still agree), and its two readers then disagree
+# about which value is real — `codes_for_name` takes the FIRST row, `_cv_stale` the LAST — so a tree
+# whose runtime value is the second one is published as the first. Appended to `repo-target.sh`,
+# which sorts AFTER `adopt-fix.sh`, so this also pins that the LAST declaration is not silently
+# preferred over the first: the row names BOTH values and the file of the second one.
+_codemut_dir="$(_codemut redeclared)"
+printf '\nADOPT_DEFERRED=84\n' >> "$_codemut_dir/repo-target.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/repo-target.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"conflicting-declarations: ADOPT_DEFERRED:repo-target.sh:79,84"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(mutation g3) a name declared TWICE with different codes is REFUSED and names both values (want 'conflicting-declarations: ADOPT_DEFERRED:repo-target.sh:79,84') (rc=$CODE_RC; $CODE_MSG)" $rc
+
 # (g1, g2) A QUOTED DEFAULT IS STILL A DEFAULT — and this pair was a FALSE PASS (review round 3, P1,
 # REPRODUCED before it was fixed). `valof` cut the operand at its leading quote, the empty result was
 # read as `${X:-}` (a bare read, which legitimately declares nothing), so `${X:-"81"}` reddened
@@ -2435,11 +2492,21 @@ _arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never com
 _arm_cls=""; _arm_other=""
 for _ac in $(printf '%s\n' "$_fixer_code" \
     | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u); do
-  # ⛔ A HERE-STRING, NOT `printf … | grep -q` (sigpipe-grep gate, #841/#864). Under `pipefail` a
-  # `grep -q` that matches early closes the pipe, the writer takes SIGPIPE, and the pipeline's status
-  # becomes 141 — so THIS test would read "not an arm" exactly when the name DID match. That is a
-  # false-negative in the check that proves `fix-one.sh`'s arms are reachable, which is the same
-  # silently-unchecked-arm class the derivation exists to close (`check-no-sigpipe-grep.sh`).
+  # ⛔ A HERE-STRING, NOT `printf … | grep -q` (sigpipe-grep gate, #841/#864). ⛔ THE SHAPE IS BANNED
+  # UNCONDITIONALLY; IT WAS NOT A LIVE FALSE NEGATIVE HERE, AND SAYING SO MATTERS (P2, review of
+  # `dcb499b7`, which measured both halves). The race needs `set -o pipefail` in the INVOKING shell
+  # and a payload above the ~64 KiB pipe buffer after the match; this file sets only `set -u`
+  # (`:16`), a `bash <script>` child does not inherit a parent's `pipefail`, and the payload
+  # (`fix-one.sh` with comments stripped) is ~25 KB. Driven both ways on that head: the old and new
+  # forms returned the SAME `_arm_cls`. So this is the house form, not a repair of a measured
+  # failure — but the shape is one `set -o pipefail` (or one larger `fix-one.sh`) away from the
+  # false negative below, which is why `check-no-sigpipe-grep.sh` refuses it unconditionally.
+  # ⛔ AND THAT FAILURE IS MEASURED, not theoretical (the guard's own header: PR #751, 2026-09-12,
+  # where `pipeline-compliance` blocked a compliant PR): with pipefail on, a `grep -q` that matches
+  # early closes the pipe, the writer takes SIGPIPE, the pipeline's status becomes 141, and THIS test
+  # reads "not an arm" exactly when the name DID match — the same silently-unchecked-arm class the
+  # derivation exists to close. Driven with pipefail over this very payload: the old form classified
+  # 2 of the 5 arms.
   if grep -qE "=[[:space:]]*\"\\\$\\{?${_ac}" <<<"$_fixer_code"; then
     _arm_cls="$_arm_cls $_ac"
   else
