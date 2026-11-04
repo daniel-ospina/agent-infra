@@ -1107,7 +1107,14 @@ def _bound_verdict_re():
         # So: match the token alone, then scan that line's HEAD (everything before
         # ` log=`) for `rc=` and take the LAST one.
         _BOUND_VERDICT_RE = _re.compile(r"\[lane-bound\]\s+VERDICT\b.*?\bverdict=([a-z][a-z-]*)")
-        _BOUND_RC_RE = _re.compile(r"\brc=([0-9]+|na)\b")
+        # ⛔ THE `rc` TOKEN IS BOUNDED TOO. An exit STATUS is a small number (a POSIX
+        # status is 0-255; a shell reports 128+signal), so `{1,10}` is generous. The old
+        # unbounded `[0-9]+` matched a RUNAWAY token (measured: 400 digits) and the whole
+        # thing was interpolated into `reason`; bounding it makes an unreadable status
+        # ABSTAIN (`rc=None` -> `finished-rc-unreadable` -> `unknown`), which is the same
+        # doctrine the runner line and the census column follow. `na` is kept verbatim.
+        globals()["_BOUND_RC_RE"] = _re.compile(r"\brc=([0-9]{1,10}|na)\b")
+        _BOUND_RC_RE = _re.compile(r"\brc=([0-9]{1,10}|na)\b")
         globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=([0-9]+)\b")
         # ⛔ THE MARKER ALONE, with NO token requirement. `_BOUND_VERDICT_RE` demands
         # `verdict=` followed by `[a-z][a-z-]*`, so a FINAL line whose token is
@@ -2910,12 +2917,31 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
                     return ""
                 return _pidtok(f[idx].strip()) or "?"
 
+            def _census_rc(fields):
+                # ⛔ AN UNREADABLE STATUS IS NOT A NEGATIVE FACT — the same rule
+                # `parse_runner_line` and `parse_bound_line` apply. This column used to
+                # accept ANY non-empty, non-`?` token, so `0x0` published
+                # `no-verdict/bound-finished-rc:0x0` — the positive claim "the child did
+                # NOT complete" from nothing readable — where the log path for the SAME
+                # bytes abstains (`rc=None` -> `finished-rc-unreadable` -> `unknown`).
+                # That also contradicted the seam's own contract: no state may be decided
+                # here that `log_lane_verdict` would not decide. And a runaway token was
+                # interpolated whole into `reason` (measured: 400 digits -> 418-char
+                # reason). Only a 1-10 digit status or `na` is a reading.
+                if len(fields) <= 9:
+                    return None
+                tok = fields[9].strip()
+                if tok == "na":
+                    return "na"
+                return (tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10)
+                        else None)
+
             verdict_pid = _pidcol(10)
             row_pid = _num(0)
             path = f[1] if len(f) > 1 else ""
             lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=_opt(3),
                          window_ms=window_ms, verdict=verdict,
-                         rc=(f[9] if len(f) > 9 and f[9] not in ("", "?") else None),
+                         rc=_census_rc(f),
                          verdict_line_pid=verdict_pid,
                          verdict_source="caller" if verdict else "")
 

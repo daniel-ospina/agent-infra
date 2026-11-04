@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with seventy-six paired mutations: every mutation re-
+Fifty-one tests with seventy-eight paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (76)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (78)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1615,6 +1615,13 @@ def t37():
     check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished tag=rc=7 pid=42 rc=0\n")
           == ("finished", "0"),
           "the real rc= wins over an earlier rc=-shaped field")
+    # ⛔ AND THE rc TOKEN IS BOUNDED: an exit status is a small number, so a runaway
+    # token is UNREADABLE and abstains rather than being interpolated into the reason.
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=%s\n"
+                               % ("9" * 40)) == ("finished", None),
+          "a runaway rc token is unreadable, not a status")
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=255\n")
+          == ("finished", "255"), "a real 3-digit status is still read")
 
     # ⛔ `verdict=finished` IS NOT "the turn completed". `lane-bound.sh` writes it
     # whenever NO BOUND FIRED and puts the child's real status in `rc=` on the same
@@ -1860,6 +1867,17 @@ def t41():
             "29\t%s\t0\t0\t\t1\t3000000\t9\t0" % as_dir,
             # a NEGATIVE cpu delta is a broken reading, not a flat one
             "30\t%s\t0\t-200\t\t1\t3000000\t9\t0" % log,
+            # ⛔ AN UNREADABLE EXIT STATUS IS NOT A NEGATIVE FACT — the same rule the
+            # bound line and the launcher line apply. This column used to accept any
+            # non-empty, non-`?` token, so `0x0` published `no-verdict/bound-finished-rc:0x0`
+            # (the positive claim "the child did NOT complete") where the log path for the
+            # SAME bytes abstains as `finished-rc-unreadable` — and a runaway token was
+            # interpolated whole into the reason.
+            "31\t%s\t0\t0\tfinished\t0\t3000000\t9\t?\t0x0\t31" % log,
+            "32\t%s\t0\t0\tfinished\t0\t3000000\t9\t?\t%s\t32" % (log, "9" * 40),
+            # …and a REAL non-zero status still names itself, so the guard is not a
+            # blanket abstain.
+            "33\t%s\t0\t0\tfinished\t0\t3000000\t9\t?\t7\t33" % log,
         ])
         by_pid = {r[0]: (r[1], r[2]) for r in rows}
         check(by_pid["11"] == ("working", "within-window"), "row 11: %r" % (by_pid["11"],))
@@ -1890,6 +1908,17 @@ def t41():
         check(by_pid["30"][0] == "unknown",
               "a NEGATIVE cpu delta is a broken reading, not a flat one; got %r"
               % (by_pid["30"],))
+        check(by_pid["31"][0] == "unknown",
+              "an unreadable `rc` at the seam must ABSTAIN, never claim a crash; got %r"
+              % (by_pid["31"],))
+        check(by_pid["32"][0] == "unknown",
+              "a runaway `rc` token must ABSTAIN, not be interpolated into the reason; got %r"
+              % (by_pid["32"][:1] + (by_pid["32"][1][:40],),))
+        check(len(by_pid["32"][1]) < 64,
+              "the reason must not carry a runaway token verbatim; got %d chars"
+              % len(by_pid["32"][1]))
+        check(by_pid["33"] == ("no-verdict", "bound-finished-rc:7"),
+              "a REAL non-zero rc is still named; got %r" % (by_pid["33"],))
         check(rc == 3, "an abstaining census exits 3 (cannot-verify); got %r" % (rc,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -2941,6 +2970,22 @@ MUTATIONS = [
         "complete\" instead of an abstention, so a corrupt token (or a future spelling) "
         "flips a completed lane to `no-verdict`, and a runaway token is interpolated "
         "whole into the reason",
+    ),
+    # ── round 3: the census `rc` column, and the unbounded bound-line token ──────────
+    Mutation(
+        "T41", "module",
+        '                         rc=_census_rc(f),',
+        '                         rc=(f[9] if len(f) > 9 and f[9] not in ("", "?") else None),',
+        "the census `rc` column accepts ANY non-empty token again, so an unreadable "
+        "status (`0x0`) becomes the positive claim \"the child did NOT complete\" where "
+        "the log path abstains, and a runaway token is interpolated whole into `reason`",
+    ),
+    Mutation(
+        "T37", "module",
+        'globals()["_BOUND_RC_RE"] = _re.compile(r"\\brc=([0-9]{1,10}|na)\\b")',
+        'globals()["_BOUND_RC_RE"] = _re.compile(r"\\brc=([0-9]+|na)\\b")',
+        "an UNBOUNDED rc token matches a runaway value that then reads as a status and "
+        "is interpolated whole into the reason",
     ),
 ]
 
