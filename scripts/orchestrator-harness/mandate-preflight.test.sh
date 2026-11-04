@@ -442,6 +442,16 @@ case "$NOBASE_LINE" in *'CANNOT VERIFY'*) ok "…and it says CANNOT VERIFY inste
 # --missing: an UNKNOWN state must not look like the empty list that means "nothing missing".
 MISS_UNDEC_RC="$(T=$(mktemp -d); mkdir -p "$T/.pi/agent/state"; chmod 000 "$T/.pi/agent/state"; CELL_HOME="$T" bash "$HELPER" --missing >/dev/null 2>&1; _r=$?; chmod 755 "$T/.pi/agent/state"; rm -rf "$T"; printf %s "$_r")"
 [ "$MISS_UNDEC_RC" = "2" ]; ck $? "--missing on an UNRESOLVABLE state dir is 2, not 0-with-empty-output (a consumer reading 0 as 'all present' was reading unknown as clean; measured rc=$MISS_UNDEC_RC)"
+# ── E1l: AN ANCESTOR THAT IS NOT A DIRECTORY IS UNDECIDABLE TOO (cycle 4, P2, MEASURED) ─────────══
+# The walk tested only the EXECUTE bit, never `-d`, so an ancestor that exists, is executable, and is a
+# FILE was graded decidable — and the answer was `MISSING … ship the file` for a path that can never exist.
+# That is the function's own leg (d) ("a file where a dir belongs — a deployment fault, not an absence")
+# applied at the exact root and forgotten one level up.
+ANC=$(mktemp -d); : > "$ANC/.pi"; chmod 755 "$ANC/.pi"
+ANC_RC="$(CELL_HOME="$ANC" bash "$HELPER" --check >/dev/null 2>&1; printf %s $?)"
+[ "$ANC_RC" = "2" ]; ck $? "an ANCESTOR that is a non-directory → CANNOT VERIFY (2), not 1 'MISSING' with the ship-the-file remedy (measured rc=$ANC_RC)"
+case "$(CELL_HOME="$ANC" bash "$HELPER" --line 2>/dev/null)" in *'MISSING'*) bad "…and --line calls the files MISSING through a non-directory ancestor (wrong remedy)" ;; *) ok "…and --line never calls them MISSING through it" ;; esac
+rm -rf "$ANC"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
@@ -488,6 +498,13 @@ grep -qF 'STUB-PI-RAN' "$TMP/pi-ran.log" 2>/dev/null; ck $? "…and the agent ST
 # the count is exactly one.
 grep -qF 'RESEARCH FIRST' "$TMP/pi-ran.log" 2>/dev/null; ck $? "…and that invocation is the LAUNCH (it carries the brief in argv, which the probe never does)"
 [ "$(grep -cF 'STUB-PI-RAN' "$TMP/pi-ran.log" 2>/dev/null)" = "1" ]; ck $? "…and it is the ONLY stub invocation (LANE_PREFLIGHT=0 keeps the probe out; a probe-satisfied arm cannot pass this)"
+# ⛔ THE BLOCK MUST BE IN THE **LAUNCHED ARGV**, NOT ONLY IN THE FILE (this change's review cycle 4, P1,
+# MEASURED). The arms above prove the FILE was stamped and that a launch happened — nothing tied the two,
+# so reading the brief into a variable BEFORE the emit and launching from that variable leaves the file
+# stamped, the log correct, `RESEARCH FIRST` in argv and exactly one invocation: 97 passed, 0 failed, while
+# the block never reached the lane's context. That is precisely the log-only disclosure #3377 exists to
+# end ("the lane's context is the file `pi` reads"), and it is the half the change is FOR.
+grep -qF 'mandate-preflight #3377' "$TMP/pi-ran.log" 2>/dev/null; ck $? "…and the block is in the LAUNCHED ARGV — the lane's own context, not only the brief file (a read-before-emit refactor cannot pass this)"
 # DIAGNOSTICS: when a seam arm fails, print what the seam actually wrote — an assertion that only says
 # "not found" sends the next reader to re-run the suite by hand, which is the friction this avoids.
 if [ "$FAIL" -gt "$E3_MARK" ]; then
@@ -559,10 +576,23 @@ fi
 echo "§F non-vacuity, and the DEPLOYMENT manifests"
 mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
 N="$(run --line | grep -c .)"; [ "${N:-0}" -ge 3 ]; ck $? "--line renders ${N} lines when both are missing (§A's empty result is not an always-empty bug)"
-grep -qF 'mandate_files()' "$HELPER"; ck $? "the declaration is a single function (the ONE home)"
+# ⛔ A PRESENCE TEST IS NOT A UNIQUENESS TEST (this change's review cycle 4, P2, MEASURED): `grep -qF
+# 'mandate_files()'` stayed GREEN when a SECOND copy of the population was added to the helper — measured,
+# 97 passed, 0 failed — so the arm intended as "the ONE home" guarded nothing, while the declaration's own
+# comment nominates it as the drift chase. Count the SPECS instead: each name appears exactly once, and the
+# declaration is defined exactly once. Both are falsifiable by adding a copy.
+SPEC_COUNT="$(grep -c '^LANE-BRIEF-PREAMBLE\.md|' "$HELPER")"
+[ "$SPEC_COUNT" = "1" ]; ck $? "the preamble is declared EXACTLY once (a second copy reddens this; measured count=$SPEC_COUNT)"
+SPEC_COUNT2="$(grep -c '^TORTOISE-GRAPH-BRIEF\.md|' "$HELPER")"
+[ "$SPEC_COUNT2" = "1" ]; ck $? "the graph brief is declared EXACTLY once (measured count=$SPEC_COUNT2)"
+DEF_COUNT="$(grep -c '^mandate_files() {' "$HELPER")"
+[ "$DEF_COUNT" = "1" ]; ck $? "…and mandate_files is DEFINED exactly once (measured count=$DEF_COUNT)"
 # A `$O` that lost the file is a box where the disclosure silently does not happen — the "hand-copied
 # client ⇒ a fresh box receives nothing" class this helper exists to end.
-grep -qF 'mandate-preflight.sh' "$HERE/install.sh" 2>/dev/null; ck $? "install.sh names it in the drift list (a \$O missing it is reported)"
+# ⛔ AND THE NAME MUST BE IN THE LIST, NOT IN THE PROSE (review cycle 4, P2, MEASURED): a bare
+# `grep -qF 'mandate-preflight.sh'` matched install.sh's own COMMENTS, so deleting it from the `for f in …`
+# drift list still left the arm green — a `$O` losing the helper would go unreported. Pin the LIST line.
+grep -qE '^for f in .*mandate-preflight\.sh' "$HERE/install.sh" 2>/dev/null; ck $? "install.sh names it in the DRIFT LIST ITSELF, not merely in its comments (a \$O missing it is reported)"
 grep -qF 'mandate-preflight.sh' "$HERE/check-single-source.sh" 2>/dev/null; ck $? "check-single-source.sh names it in EXECUTED (presence-required)"
 
 echo
