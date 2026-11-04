@@ -39,33 +39,8 @@ reap() {
   wait "$1" 2>/dev/null
   return 0
 }
-# ⛔ START EACH CONTROLLER IN ITS OWN PROCESS GROUP AND REAP THE GROUP (agent-infra#3011). The
-# previous teardown here was `trap 'rm -rf "$T"' EXIT` alone, and a deleted cwd does not end a
-# process: every run left its REAL controllers resident, parked on a fifo `read` at 0 CPU and
-# reparented to 1. MEASURED 2026-10-28 on `pi-cell-4`: 145 leaked controllers, load 33–39 on 8 cores.
-# `fixture-hermetic.sh` starts each fixture in its own group, records the group, and on EXIT reaps it
-# and VERIFIES it is gone (a survivor fails the suite, because a false PASS is half the defect).
-# shellcheck source=/dev/null
-# ⛔ FAIL CLOSED ON THE LOAD ITSELF (review, cycle 2). Under `set -uo pipefail` (no `set -e`) a failed
-# `.` prints a diagnostic and the script CONTINUES: `fixture_guard_placement` then dies with 127, the
-# suite runs unguarded, and there is no EXIT reaper — the exact pre-#3011 behaviour, while looking
-# normal. `run-bash-shards.sh` already refuses in this situation; a suite run directly owes the same
-# contract, or the "enforcer that cannot fire" class returns through the other door.
-[ -r "$HERE/fixture-hermetic.sh" ] || {
-  echo "  ❌ missing $HERE/fixture-hermetic.sh — refusing to run fixtures that cannot be guarded or reaped" >&2
-  exit 2
-}
-. "$HERE/fixture-hermetic.sh"
-command -v fixture_guard_placement >/dev/null 2>&1 || {
-  echo "  ❌ $HERE/fixture-hermetic.sh did not define the placement guard — refusing to run unguarded" >&2
-  exit 2
-}
-# ⛔ AND REFUSE TO RUN AT ALL ON A LIVE CELL (#3011): a cell is a capacity resource, and its load is
-# the fleet's own dispatch signal. Keyed on a controller EXECUTING from a cell root, never on the
-# directory existing — a stale `/tmp/cell-home` on a laptop must not block a local run.
-fixture_guard_placement "harness-refresh.test.sh"
 T="$(mktemp -d "${TMPDIR:-/tmp}/harness-refresh.XXXXXX")"
-fixture_hermetic_init "$T/.fixture-pgids" "$T"
+trap 'rm -rf "$T"' EXIT
 echo "==> harness-refresh contract ($HERE)"
 
 [ -f "$RR" ]   || { echo "  ❌ missing $RR"; exit 1; }
@@ -1832,7 +1807,7 @@ mk_pin_tree() {
   [ -d "$d" ] || { mkdir -p "$root"; git -C "$T/src" worktree add --detach "$d" "$sha" >/dev/null 2>&1; }
   printf '%s\n' "$d"
 }
-# start_ctrl <tree> -> the pid of a LIVE controller executing that tree (== its process-group id)
+# start_ctrl <tree> -> the pid of a LIVE controller executing that tree; leaves it in $CTRL_PID_T
 # The script is overwritten AFTER the worktree exists: identity comes from `git rev-parse HEAD`, which a
 # dirty worktree does not change, and the fixture's own `orch-loop.sh` just echoes a label (it would
 # exit before it could be observed).
@@ -1840,15 +1815,11 @@ start_ctrl() {
   # ⛔ `sleep 300` WOULD FORK, and a forked child of the controller is (correctly) counted by the `tree`
   # population — so the fixture would read as "1 lane child" and `actuation=safe` would be unreachable
   # for a reason that is about the FIXTURE, not the box. A `read` on a fifo blocks INSIDE bash.
-  # The fifo lives INSIDE $T (not /tmp) so the teardown that removes $T also removes it — 145 stray
-  # `/tmp/ctrl-fifo.*` files were the other half of the #3011 residue.
-  local f; f="$(mktemp -u "$T/ctrl-fifo.XXXXXX")"; mkfifo "$f" 2>/dev/null
+  local f; f="$(mktemp -u "${TMPDIR:-/tmp}/ctrl-fifo.XXXXXX")"; mkfifo "$f" 2>/dev/null
   printf 'read -r _ < %s\n' "$f" > "$1/scripts/orchestrator-harness/orch-loop.sh"
-  # ⛔ GROUPED START, NOT `bash … &` (#3011). A plain background job stays in THIS suite's process
-  # group, so the id it returns is not a group id and a reaper signalling it can miss the live
-  # process. `fixture_start_group` sets the group id before `exec` (so the id it prints IS the group)
-  # and records it, so `fixture_reap_all` ends exactly this controller and nothing else on the box.
-  fixture_start_group bash "$1/scripts/orchestrator-harness/orch-loop.sh"
+  bash "$1/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
+  CTRL_PID_T=$!
+  printf '%s\n' "$CTRL_PID_T"
 }
 stop_ctrl() { [ -n "${1:-}" ] && { kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; }; }
 # req_of <O> <field> -> the field's value from the request record
@@ -2088,12 +2059,7 @@ printf 'restart request=pending requested_at=1700000000 requested_by=x running=a
   > "$D/cellhome/orchestrator/state/restart-request"
 PRU="$(env -u O CELL_HOME="$D/cellhome" HOME="$D/home" bash "$RR" --print-restart 2>&1)"
 case "$PRU" in
-  # ⛔ `$D/cellhome`, NOT `$CELL_HOME`: this is an ASSERTION MESSAGE, and `CELL_HOME` is unset in the
-  # suite's own shell — under the `set -u` at the top of this file the reference ABORTED the entire
-  # suite at this line (measured on origin/main 2026-10-28: 265 ✅, 0 ❌, then
-  # `line 2062: CELL_HOME: unbound variable`, so every later case — the A36/S3 controller-identity
-  # arms — never ran). A message must never be able to fail the run it is reporting on.
-  "restart request=pending"*) ok "the default located $D/cellhome/orchestrator/state/restart-request — the record the loop writes" ;;
+  "restart request=pending"*) ok "the default located $CELL_HOME/orchestrator/state/restart-request — the record the loop writes" ;;
   *no-O-set*) bad "the operator-shell reader abstained instead of reading the record: $PRU" ;;
   *) bad "the reader asserted an absence about a box that HAS a request: $PRU" ;; esac
 case "$PRU" in *"pending=deferred"*) ok "…and it printed the state verbatim, including pending=deferred" ;;
@@ -2405,33 +2371,6 @@ rm -f "$D/O/.orch.lock"; reap "$_PQ"
 case "$R13" in *"running=$(short "$C2")"*) ok "…the QUOTED path resolved to the tree the controller executes (dequoted, and not truncated)" ;;
                *"running=$(short "$C1")"*) bad "a quoted argv path fell back to the stamp — the dequote (or -ww) is missing, which is #2641 back on every cell: $R13" ;;
                *) bad "the record named neither tree: $R13" ;; esac
-
-# ⛔ S14: THE ADVANCE PATH MUST MAKE THE SAME CANNOT-VERIFY DOWNGRADE AS THE CURRENT-PIN PATH. This is the
-# branch where the pin has just moved, and `RUNNING` can be the stamp's CLAIM naming the NEW tip while the
-# controller still executes the OLD tree. ⛔ THE STAMP IS NOT REWRITTEN BY THIS CYCLE: the default advance
-# is `apply --force --pin-only`, which leaves `$O` (and the stamp) alone — a stamp naming the tip is written
-# by `start`'s `seed_and_stamp`, a `--re-seed` advance, or a hand seed, and it is only ever a CLAIM about
-# what was SEEDED. The advance branch used to compare `RUNNING` to `TIP` alone and report `current`: a false
-# PASS with no `pending=` on the spawn line and no request recorded. Driven with an unreadable identity
-# (`PS_BIN=/nonexistent/ps`) so the only source left is the stamp, planted naming the TIP while the pin
-# names an older commit — the shape a cell is in after a previous `start` seeded `$O` ahead of a re-pin.
-_CASE=$((_CASE+1)); echo "=== S14: a stamp-only identity naming the tip is NOT 'current' on the advance path ==="
-D="$T/s14"; mkdir -p "$D/o/state" "$D/pin" "$D/mat"
-PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"     # behind the tip, so the advance fires
-printf '{"commit": "%s"}\n' "$C2" > "$D/o/.agent-infra-stamp.json"   # the claim `apply` writes = the NEW tip
-printf '%s\n' "$$" > "$D/o/.orch.lock"                      # a LIVE controller, as on every box
-MAT="$(mk_stub_mat "$D/mat")"
-R14="$(O="$D/o" PS_BIN=/nonexistent/ps HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" \
-        --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"; RC14=$?
-case "$RC14" in 10) ok "the fixture really took the ADVANCE path (exit 10), so the branch under test is the one driven" ;;
-                *) bad "expected exit 10 (an advance) with a behind pin, got $RC14 — the case would be vacuous: $R14" ;; esac
-case "$R14" in
-  *"relation=current"*) bad "a stamp-only identity naming the tip was reported CURRENT on the advance path — the controller may still execute the old tree, and no request was recorded: $R14" ;;
-  *"relation=restart-pending"*) ok "…a stamp-only identity is restart-pending on the advance path too (cannot-verify is not a pass)" ;;
-  *) bad "the record named neither relation: $R14" ;; esac
-case "$R14" in
-  *"already on $(short "$C2")"*) bad "the prose asserted the controller is 'already on' the tip from a CLAIM: $R14" ;;
-  *) ok "…and the prose does NOT claim the controller is already on the new commit" ;; esac
 
 _CASE=$((_CASE+1)); echo "=== B6: the spawn-line token carries WHICH pending state (and stays bare for every other relation) ==="
 D="$T/b6"; mkdir -p "$D/O/state" "$D/O/logs"

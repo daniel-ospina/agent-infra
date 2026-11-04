@@ -102,7 +102,8 @@ is_limit "$MAX_ROUNDS" || { say_err "lane-merge: LANE_MERGE_MAX_ROUNDS='$MAX_ROU
 # ⛔ SIZED TO THE CI IT WAITS FOR, NOT TO A ROUND NUMBER (measured on this change's own PR: a
 # 22-check commit on a loaded box reached 7/22 completed at 15 min and was still 15-in-flight at the
 # old 900s bound, so EVERY lane would have spent a chunk on "still in flight — re-run"). 1500s covers
-# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, 3300s), so the
+# a ~25 min CI. It is a MERGE-PHASE cost from the lane's own wall clock (`LANE_TIMEOUT`, which resolves
+# to the `LANE_BACKSTOP_S` seam when unset — agent-infra#2888), so the
 # supervision bound below is derived from what is left AFTER it AND after the lane's implementation
 # time — the two must not add up to the whole clock. A re-run is still permitted and still cheap (one
 # PR read) — the bound is a runaway guard, never a reason to call a head green.
@@ -126,18 +127,19 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # phase can start; the merge phase must never be sized out of it. MAX_WATCH is DERIVED from what that
 # leaves (never a literal), so raising LANE_TIMEOUT buys supervision and lowering it cannot silently
 # eat the implementation time again. Shipped defaults:
-#     3300 - 1500 (check wait) - 900 (implementation reserve) = 900s / 120s = 7 chunks (840s)
-# i.e. the merge phase is bounded at 3240s of the 3300s clock, and a lane that implements within its
+#     7200 - 1500 (check wait) - 900 (implementation reserve) = 4800s / 120s = 40 chunks (4800s)
+# i.e. the merge phase is bounded at 6300s of the 7200s clock, and a lane that implements within its
 # reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
 # WAITING_* (exit 11) and the next invocation resumes the SAME counter.
-# ⛔ AND THE CLOCK ITSELF IS THE LANE'S, READ FROM THE SAME SEAM (#2888 review, P2/P3 — verified). It
-# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}` = 7200 s
-# — and `lane.sh` does not export `LANE_TIMEOUT`, so the merge phase permanently spent ~45% of the clock
-# the lane now owns. That is the opposite of what the paragraph above claims ("DERIVED from the lane's own
-# wall clock"). `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so this child reads the lane's real bound:
-#     7200 - 1500 (check wait) - 900 (implementation reserve) = 4800s / 120s = 40 chunks
 IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
-LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
+# ⛔ THE DEFAULT IS THE SEAM, NOT A LITERAL (agent-infra#2888 review, P2). This said `${LANE_TIMEOUT:-3300}`
+# with no fallback, and `lane.sh` does not export `LANE_TIMEOUT` — so the merge phase permanently spent
+# 45% of the clock the lane now owns (3240s of 7200s), while the header above claims the budget is
+# "DERIVED from the lane's own wall clock". `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so a child
+# process inherits it; the literal stays as the last resort for a standalone run whose box predates the
+# seam. lane-merge.test.sh asserts THIS expression against lane.sh's own resolution, so the two files
+# cannot drift apart in silence again.
+LANE_WALL_S="${LANE_TIMEOUT:-3300}";              is_limit "$LANE_WALL_S" || LANE_WALL_S=3300
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
 # that exits at once at its deadline), and dividing by it would break the arithmetic below instead of
 # yielding a bound.
@@ -410,13 +412,13 @@ if [ ! -f "$chain" ]; then
   else
     say_err "lane-merge: $O/merge-one.sh is missing and the copy beside this script ($_d) is not the"
     say_err "  harness $O — refusing to select the merge authority from a checkout that may be a lane's"
-    say_err "  own branch. Redeploy it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
+    say_err "  own branch. Sync it: cp scripts/orchestrator-harness/*.sh $O/"
     exit 2
   fi
 fi
   if [ ! -f "$chain" ]; then
     say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
-    say_err "            hand-roll a merge; redeploy the harness (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
+    say_err "            hand-roll a merge; sync the harness (cp scripts/orchestrator-harness/*.sh \$O/)"
     return 1
   fi
   # ⛔ THE CHECKOUT THE CHAIN RUNS FROM IS RESOLVED, NEVER INHERITED (landing-review F1). Resolved here,
@@ -691,9 +693,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
     # ⛔ THE BRANCH MUST BE RESOLVED, NOT A PLACEHOLDER (reviewer finding, P1, R11, measured): the brief's
     # own `--watch` call never passes `--branch`, so `${BR:-<branch>}` rendered the literal `<branch>` on
-    # the documented supervision path — and merge-one feeds that argument into
-    # `git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR"` (the shipped form since #3009 named
-    # the DESTINATION), so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
+    # the documented supervision path — and merge-one feeds that argument into `git fetch origin "$BR"`,
+    # so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
     # ⛔ A DETACHED HEAD IS NOT A BRANCH (reviewer finding, P2, R12, measured): `git rev-parse
     # --abbrev-ref HEAD` answers "HEAD" outside a branch, and `origin/HEAD` resolves to main — so the
     # printed command would hand the reviewer MAIN's content under the PR's name, and a `CLEAN` verdict

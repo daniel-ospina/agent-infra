@@ -197,26 +197,6 @@ the writer's branch order is the authority.
 `dispatched=0` and a `gate:merge-priority` refusal. That is deliberate (a draining box *is* healthy)
 but it means **a reader that prints only the verdict is reading a cycling-ness test, not an effect
 test** — which is exactly the confusion this epic is about.
-⛔ **AND ONE NAMED GATE IS NOT A REASON (#2924, #2927).** The gate arms are evaluated in order and
-`GATE_WHY` keeps only the **first** that fired, so the first arm — `merge-priority`, set whenever any
-workable un-owned PR exists — MASKS every capacity gate behind it. Measured on the Mac controller over
-**385 instrumented cycles** (2026-10-24→27, of which **384** reached the gate): **349** of those 384
-closed the issue path naming `merge-priority` with **25 of 25 lane slots free**; **88.5%** of the
-gated cycles *also* had a capacity gate that would have refused, and **64** were refused while
-`ci-queue` itself read `ok`. So the `[dispatch]` line's `(<gate>)` field
-alone could not tell "waiting for the PR sweep" (healthy, and the sweep is what clears it) from
-"throttled by a gate nobody can see" (the defect). The line now carries an appended, additive
-**gate vector** — `| gates: merge-priority(<n> un-owned) fork=ok fork_bound=ok(…) lanes=<n>/<max>
-load=ok(<l>/<max>) placement=… ci-queue=<verdict> slots=<n> free of <max> swap=… mem=…` — one named
-verdict per arm, **in evaluation order, whether the arm won or not**, with the measured number it was
-decided on. The two lane tokens are mutually exclusive by construction: `slots=<n> free of <max>`
-when a slot remains, `lanes_full=<n>>=<max>(0 slots free)` when none does. It is produced by the arms themselves (each assigns `GATE_WHY` only if still unset — the
-old first-wins semantics, byte for byte — and appends its own verdict), so a new arm cannot be added
-invisibly; `test-gates.sh` grades the co-binding case, the first-wins order, and two mutants (vector
-removed ⇒ a masked capacity refusal goes invisible again; arms made unconditional ⇒ the order
-flips). ⛔ **Scope, stated rather than implied:** the CYCLE RECORD still carries the winning arm only
-(`nothing=gate:<first>`); the vector rides the log line, and moving it into the record is #2924's
-remaining half.
 **Do not read `$O/logs/controller.log`.** Measured today: mtime **10 h stale**, **0** `[cap]` lines,
 last line `date: write error: No space left on device` — while the controller was cycling and landing.
 
@@ -328,23 +308,10 @@ fix the red).
 deliver to it"*, logged as `REFUSING: <reason>` and mirrored into `state/pr-doctor.status.json` with
 `rc`, `read` (`open_prs` | `transport` | …), `reason` and `repo`; `3` **NOT DELIVERED** — the work was
 legible and none of it went out: no worker took an order that was placed, **or** a durable state (a
-worktree holding uncommitted work, a refusing transport) stopped the order before delivery, so an
-operator must repair the chain; `6` **NO-CAPACITY** — the box's own spawn gate refused every order,
-**nothing was consumed**, and the sidecar also carries `verdict`, `refusal_bound`
-(`<axis>=<count>[,…]`, e.g. `load=1` or `disk=2,load=1`) and
-`room` (the `capacity.sh probe` record measured at decision time); the reason is a PREFIX —
-`VERDICT=… next=<token> bound=… room=<the few figures>; <the remedy sentence>` — because both readers
-cut the tail (110 chars in the beat), so the remedy must not sit past the cut; `4` crash; `64` the command line is
-unusable (**not** 2, so a launchd typo cannot masquerade as a refusal). ⛔ `3` and `6` are SEPARATE
-because their remedies are opposite — wait vs repair — and a caller that merges them sends an operator
-to the wrong one with full confidence (#2291, measured: `EXIT rc=3 -- 1 order(s) no worker accepted`
-for both). `6` is a pass for `fleet-inventory`'s table (state `WAITING`) **only on the LOAD axis** and is
-**never** rendered `ok`: the queue is not moving while the box has no room, and the other three axes
-(`disk`, `fork`, `land-backlog`) do not clear by waiting — the gate itself says so per code — so those
-render `FAILING`, and a `6` whose bound cannot be read renders `UNKNOWN` (an abstention is never a
-pass). ⛔ The sidecar **must** be overwritten by a
-refusing pass — otherwise the previous pass's
-`ok` stands and *"a failure only `launchctl list` can witness is a silent failure"*.
+worktree holding uncommitted work, a refusing transport) stopped the order before delivery; `4` crash;
+`64` the command line is unusable (**not** 2, so a launchd typo cannot masquerade as a refusal).
+⛔ The sidecar **must** be overwritten by a refusing pass — otherwise the previous pass's `ok` stands
+and *"a failure only `launchctl list` can witness is a silent failure"*.
 `scripts/test_pr_doctor.py` §10 pins exactly that agreement.
 ⛔ **AND `0` IS NOT REACHABLE FROM A PASS THAT REFUSED AN ORDER** (#2710, measured 2026-10-27). A
 worktree refusal that will not clear by waiting (uncommitted work, commits the PR head does not have)
@@ -502,31 +469,6 @@ census. ⛔ **Liveness is the worker's own exit-status file, never `%CPU`** (`%C
 **What repairs it.** `exit 78` → reinstall the harness (§3.14). `kind not bg|prfix` → the deployed `$O`
 copy predates the kind: refresh `$O`. A `.rc` that never appears → the worker died before its wrapper
 wrote it; the ledger row is the only trace.
-
-⛔ **A create refusal carries a MEASUREMENT, not the daemon's guess (#2404).** On a cell, worker
-spawning goes through the guest CLI's `workspace create`, and when the durable session owner can no
-longer allocate, it fails with `{"reason":"database or disk is full"}` — measured on cell-3
-2026-11-02 while `/` had 28 G free, inodes were 25 % used and `~/.cmux` was 37 M. `wt_spawn` used to
-relay that message as THE REASON, so every reader went to `df` and the cell stayed capped at the lanes
-it already had, while its `[cap]` line read healthy. A refusal now carries
-`MEASURED on this box — space … free=… inodes=… state=…; server status=…`, names the daemon's text a
-claim it did not verify, and — where the reading says the SESSION is the finding — tries
-`cmux server ensure --session <s>` up to `WT_SERVER_ENSURE_ATTEMPTS` times (default **2**, matching the
-measured fail-once flake; it never runs when the volume is measured short, and every attempt goes
-through the bounded wrapper) and then re-attempts the create **once**. **Read the measured
-line before touching the volume**: if the volume is not short and the owner answers `status running`,
-the repair is the session owner, not the disk. The spawn path never runs `server stop --force` (it ends
-every terminal inside the owner, i.e. every live lane); that lever stays an operator action, and a
-refusal it could not clear says so. **Operator knobs:** `WT_STATE_FREE_FLOOR_MB` (1024),
-`WT_STATE_INODE_PCT_FLOOR` (95), `WT_CMUX_SESSION` (`cloud`), `WT_SERVER_TIMEOUT` (10 s),
-`WT_SERVER_ENSURE_ATTEMPTS` (2 — the one recovery bound worth reaching for first),
-`WT_SERVER_ENSURE_SLEEP` (2 s), and `WT_SESSION_RECOVER=0` to disable probing and recovery entirely.
-⛔ `WT_CMUX_SESSION` is a **fixture seam, not a deployment knob**, and the CLI is why: the `server`
-verbs take `--session` but **`cmux layout apply` takes none** (measured on cell-4 2026-10-29 —
-`cmux layout apply --help` lists `--workspace/--name/--cwd/--json` and the create always dials
-`…/cloud.sock`). Set it to anything but `cloud` and the recovery ensures one session while the create
-tries another: the box keeps a stray durable owner and the create still fails. The defaults line up;
-a non-default value does not.
 
 **state.** cell-4: present (`prfix_hits=5`), workers live (2 `fix-*`, 2 `merge-*`).
 
@@ -770,40 +712,9 @@ prove it was safe" — which it must say.
 **Promises.** (a) Do not send more CI than the queue can absorb; (b) serialise `gh` so four boxes do
 not act as one rate-limited account.
 
-**ALIVE vs REFUSING vs IDLE.** `ci-queue.sh` produces the verdict; the **consumers** are `orch-loop.sh` — which
-turns it into the named gate line `GATE_WHY="${GATE_WHY:-ci-queue($CIQ_VER)}"` for the ISSUE path and withholds the CI
-RERUN — and `dispatch-merge.sh`, which defers an issue→PR batch. `gh-limit` **records the limit and returns at once** (`NO_WAIT`), so
+**ALIVE vs REFUSING vs IDLE.** `ci-queue.sh` produces the verdict; the **consumer** is `orch-loop.sh`, which
+turns it into the named gate line `GATE_WHY="ci-queue($CIQ_VER)"`; `gh-limit` **records the limit and returns at once** (`NO_WAIT`), so
 the caller sees a `RATE-LIMITED` verdict rather than an in-call sleep that outlives it.
-
-**What it may and may not gate (measured 2026-10-27, cell 4).** Only work that ADDS a new CI run: the
-issue→PR path, batch dispatch, and a rerun. **Repair is never queue-gated** — a red-check fixer, a
-review-findings fixer, a conflict fixer and the PR-sickness queue all act on a PR that already exists,
-so their bound is this box's lane slots and load gate instead. The basis is a decision plus a
-measurement, **not** a cost claim: a repair push *does* start a fresh run. On this repo many of them
-also supersede that PR's own earlier run — but **supersession is a property of the workflow, not of
-"a repair push"**: only a workflow that declares a `concurrency:` group cancels its predecessor, and
-a workflow with **no** `concurrency:` block stacks the new run. Enumerated by trigger at this commit,
-the four workflows that fire on a PR push are `.github/workflows/ci.yml` (`group:
-ci-${{ github.ref }}`, `cancel-in-progress: true`) and `.github/workflows/harness-single-source.yml`
-(same shape) — these **supersede** — and `.github/workflows/pipeline-compliance.yml` plus
-`.github/workflows/workflow-lock.yml`, both `pull_request*` with `[opened, synchronize, reopened,
-edited]` and **no** `concurrency:` block, deliberately (#2474: a per-PR group cannot tell a head from
-its successor, and a cancelled leg reads non-red — which on `pipeline-compliance` would leave the
-repo's ONLY required check green-with-no-verdict on the newest tree) — these **stack**. So a repair
-push DOES add a run on the required check, every time. **Name the property, not a list:** the previous
-revision of this passage named one stacking workflow and there are two, which is what a hand-kept
-list of filenames buys. Supersession is therefore a per-workflow detail, not the reason repair is
-ungated: what the measurement showed is that the number being gated on was the wrong quantity.
-Gating repair on the queue skipped **41 consecutive
-dispatches in one window** while 8 self-hosted
-runners and ~11 lane slots sat idle: the queue being read belonged to GitHub-HOSTED concurrency.
-The ceiling's `runners` term is the fleet's registered/online size, or the account's hosted allowance
-when the endpoint answers a parsed `total_count: 0`. ⛔ It is **never the in-progress job count when
-nothing could be read** (branch (c)): there the term is the module's own one-runner floor and the token
-names the reading that failed (`fleet=unreadable(…)`). The one branch that keeps the in-progress count
-is the measured-poor one — the endpoint answered with a DECLARED fleet and nothing online — where
-executing jobs are a genuine supply lower bound, and dropping it there was measured to pin the ceiling
-at 2 (arm (b12)).
 IDLE = the queue is below the bound; REFUSING = at/over it, with the version string naming why.
 
 **What repairs it.** Nothing on the box — this is a *wait* state, and the remedy is fewer lanes, which

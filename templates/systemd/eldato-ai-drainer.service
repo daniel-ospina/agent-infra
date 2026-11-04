@@ -39,6 +39,11 @@ Environment=SEED_REPO={{SEED_REPO}}
 # fleet's 2026-10-17 ruling for the lane ceiling), which is what a resized box needs.
 Environment=MAX_LANES={{MAX_LANES}}
 Environment=MIN_SWAP_MB={{MIN_SWAP_MB}}
+# ⛔ RENDERED BLANK BY DEFAULT, FOR THE SAME REASON AS MAX_LANES (agent-infra#2888). A value here is a
+# PIN the script never recomputes: an installed `LANE_TIMEOUT=3000` overrode ai-drainer.sh's own
+# `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` on every tick, so a drainer lane was still wall-killed at
+# 50 min — 300 s above the 2700 s progress allowance — and raising `LANE_BACKSTOP_S` changed nothing on
+# the one box whose job is to drain a backlog. Blank means "resolve the harness seam every tick".
 Environment=LANE_TIMEOUT={{LANE_TIMEOUT}}
 # The pass is a dispatch, not a deadline: never compete with a live lane for CPU.
 Nice=10

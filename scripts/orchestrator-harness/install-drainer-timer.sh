@@ -13,11 +13,10 @@
 # controller and the backlog the drainer exists for may belong to a repo that controller is not bound
 # to at all — and the fleet already schedules periodic one-shots this way.
 # ⛔ This paragraph used to say the drainer's lock "must OUTLIVE its own pass (it waits up to
-# LANE_TIMEOUT — the lane's backstop — for the lane it dispatched), so a role would block the loop's merge
-# and doctor passes and trip the loop's stall bound". That described #2639's lock scope, which is
-# WITHDRAWN: the lock now covers ONE TICK'S CRITICAL SECTION (settle → census → target → dispatch) and the
-# tick never waits for a lane — a lane that outlives its tick is simply counted by the next one. See
-# templates/systemd/eldato-ai-drainer.service for the full reasoning (and
+# LANE_TIMEOUT=3000s for the lane it dispatched), so a role would block the loop's merge and doctor
+# passes and trip the loop's stall bound". That described #2639's lock scope, which is WITHDRAWN: the
+# lock now covers ONE TICK'S CRITICAL SECTION (settle → census → target → dispatch) and the tick never
+# waits for a lane — a lane that outlives its tick is simply counted by the next one. See templates/systemd/eldato-ai-drainer.service for the full reasoning (and
 # for why the bring-up does not install it: a lane dispatcher is per-repo and costs model spend, so
 # it is an explicit, per-cell operator step, exactly like the disk reaper's arming).
 #
@@ -114,20 +113,6 @@ resolve_target || {
 }
 [ -n "${SYSTEMCTL:-}" ] || SYSTEMCTL="$([ "$TARGET" = system ] && printf 'sudo -n systemctl' || printf 'systemctl --user')"
 
-# ⛔ THE LANE'S BOUND IS RENDERED FROM THE SEAM, NOT FROM A LOCAL LITERAL (agent-infra#2888 review,
-# P2 — verified). This used to render `${LANE_TIMEOUT:-3000}` at INSTALL time into an `Environment=` PIN,
-# and a pin WINS over the script's own default — so on every box this installer touched,
-# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` could never take effect and drainer
-# lanes stayed killed at 50 min: 300 s above the 2700 s progress allowance, i.e. the censoring survived
-# on the box whose job is to drain the backlog, and raising `LANE_BACKSTOP_S` changed nothing there.
-# Resolved ONCE here, from the harness copy being installed, so the two cannot drift.
-DRAINER_LANE_TIMEOUT="${LANE_BACKSTOP_S:-}"
-if [ -z "$DRAINER_LANE_TIMEOUT" ]; then
-    DRAINER_LANE_TIMEOUT="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' \
-                              "$(dirname "${BASH_SOURCE[0]}")/spawn-gate.sh" 2>/dev/null | head -1)"
-fi
-case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=7200 ;; esac
-
 render() { # <template> <dest>
     local v tmp
     # ⛔ RENDER TO A TEMP FILE AND CHECK THE RESULT. Writing straight to "$2" let the shell truncate
@@ -135,6 +120,15 @@ render() { # <template> <dest>
     # EMPTY file — so `DRAINER_REPO_SLUG='a|b'` installed two zero-byte units, enabled the timer and
     # printed "scheduled". The checks below are on the bytes that would actually be installed.
     tmp="$2.tmp.$$"
+    # ⛔ `{{LANE_TIMEOUT}}` IS BLANK BY DEFAULT, NOT A 3000 LITERAL (agent-infra#2888 review, P2).
+    # `Environment=` is a PIN, not a comment: a rendered value wins over the script's own
+    # `${LANE_TIMEOUT:-…}` default on EVERY tick, forever. Installing the shipped
+    # `${LANE_TIMEOUT:-3000}` therefore pinned every box this installer had touched to a 3000 s lane
+    # wall — 300 s above the 2700 s progress allowance — so the censoring #2888 removes survived on the
+    # one box whose job is to drain a backlog, and an operator raising `LANE_BACKSTOP_S` saw no change
+    # there at all. Blank means "derive it from the script every tick" (which resolves that seam,
+    # 7200 s) — the same convention the template already documents for MAX_LANES — while an EXPLICIT
+    # LANE_TIMEOUT in the installer's environment still wins, because that is a deliberate pin.
     sed -e "s|{{USER}}|$(id -un)|g" \
         -e "s|{{HOME}}|$HOME_DIR|g" \
         -e "s|{{PATH}}|${PATH:-/usr/local/bin:/usr/bin:/bin}|g" \
@@ -144,7 +138,7 @@ render() { # <template> <dest>
         -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
         -e "s|{{MAX_LANES}}|${MAX_LANES:-}|g" \
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
-        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}|g" \
+        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-}|g" \
         -e "s|{{DRAINER}}|$DRAINER|g" \
         "$1" >"$tmp" || { rm -f "$tmp"; err "sed could not render $1 (a value carries '|' or '&'?) — refusing to install a partial unit"; return 1; }
     # A value carrying `|`/`&` corrupts the substitution; a leftover `{{…}}` means a placeholder

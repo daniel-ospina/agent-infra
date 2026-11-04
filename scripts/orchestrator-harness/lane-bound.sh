@@ -92,9 +92,7 @@
 #     --poll <secs>       sampling interval. Default min(60, max(1, idle/4)).
 #     --grace <secs>      TERM → KILL grace. Default 15 (unchanged from `run_agent`).
 #     --tag <label>       named in every line. Default `lane`.
-#     --verdict-file <f>  where the one-line verdict is also written. It is TRUNCATED at arm time and
-#                         APPENDED to per line, so on a TERM→KILL escalation it holds the verdict line
-#                         FOLLOWED by the kill outcome: a reader takes the first `verdict=` match.
+#     --verdict-file <f>  where the one-line verdict is also written.
 #
 #   `watch` supervises an EXISTING pid and kills it LEADER-ONLY, so the caller's own post-`wait`
 #   group reap (spawn-gate.sh) keeps working exactly as before. `run` spawns the command, supervises
@@ -298,15 +296,24 @@ V_START=0; V_UNREADABLE=0; V_EMITTED=0
 emit_line() { # emit_line <line>
   printf '%s\n' "$1"
   [ -n "$LOGF" ] && printf '%s\n' "$1" >> "$LOGF" 2>/dev/null
-  # ⛔ APPEND, NEVER `>` (agent-infra#2888 review, NEW finding — MEASURED on a real killed lane). With
-  # `>` each emitted line REPLACED the previous one, so on a TERM→KILL escalation the file ended up
-  # holding ONLY `[lane-bound] KILL … still alive 15s after TERM`; `spawn-gate.sh` reads it back with
-  # `sed -n 's/.*verdict=\([a-z-]*\).*/\1/p' | head -1` and got NOTHING, so `AGENT_BOUND_VERDICT` was
-  # blank for exactly the lane the bound killed (the human surface — the log — was intact, the
-  # machine-readable one was not). The verdict line is emitted BEFORE the kill by design (`enforce`),
-  # so appending keeps it FIRST in the file and `head -1` stays the right reader; the caller truncates
-  # the file at arm time (`rm -f`, both modes below), so nothing accumulates across runs.
-  [ -n "$VFILE" ] && printf '%s\n' "$1" >> "$VFILE" 2>/dev/null
+  # ⛔ THE MACHINE SURFACE KEEPS THE VERDICT; THE HUMAN ONE KEEPS THE NARRATIVE (agent-infra#2888
+  # review, NEW finding). This file used a plain `>` for EVERY line, so each emitted line REPLACED the
+  # last — and the one thing a caller reads programmatically was the line most likely to be replaced.
+  # On a KILL escalation the file ended up holding only `[lane-bound] KILL … still alive 15s after
+  # TERM`, so `spawn-gate.sh`'s `sed -n 's/.*verdict=\([a-z-]*\).*/\1/p'` read EMPTY and
+  # `AGENT_BOUND_VERDICT` was blank for exactly the lane the bound had killed. Measured on the silent
+  # arm: the LOG had `verdict=stalled … silent=2769s`, the verdict FILE had only the KILL line. The
+  # (h) case stayed green because its fixture dies on TERM and never reaches the escalation.
+  # The VERDICT line therefore REPLACES the file (it is the single status line — re-earned, not
+  # accumulated, if a bound ever decides twice), and every other line APPENDS, so the escalation is
+  # additional evidence after it rather than a replacement for it. Readers that take `head -1` (the
+  # shipped one does) keep getting the verdict; a reader that wants the aftermath gets it too.
+  if [ -n "$VFILE" ]; then
+    case "$1" in
+      *"VERDICT verdict="*) printf '%s\n' "$1" > "$VFILE" 2>/dev/null ;;
+      *)                    printf '%s\n' "$1" >> "$VFILE" 2>/dev/null ;;
+    esac
+  fi
   return 0
 }
 

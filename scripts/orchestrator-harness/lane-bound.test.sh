@@ -20,17 +20,6 @@
 # on it would pass here and do nothing on every Mac and cell. The absence is ASSERTED, not assumed.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# ⛔ THE CAPABILITY GATE IS DISABLED FOR THE ARMS IN THIS FILE, BY NAME AND ON PURPOSE (agent-infra#2935).
-# `run_agent` measures the box — one bounded `pi` call — immediately before every launch, and these
-# arms drive `run_agent` with a STUB `pi` that never emits the probe's answer token. With the gate live
-# here, each arm would spend up to 2 x LANE_PREFLIGHT_BOUND on a stub and then be REFUSED by a gate
-# this file is not testing, so an arm about the LOAD or DISK gate would report a capability refusal.
-# The capability gate has its own arms (`cell-lane-preflight.test.sh`, and the capability block in
-# `spawn-gate.test.sh`, which re-enables it with LANE_PREFLIGHT=1). This is the documented operator
-# escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
-# these arms go red, which is the assertion that the line is load-bearing rather than decorative.
-export LANE_PREFLIGHT=0
 BOUND="$HERE/lane-bound.sh"
 GATE="$HERE/spawn-gate.sh"
 PASS=0; FAIL=0
@@ -76,6 +65,17 @@ cat > "$TMP/bin/silent.sh" <<'EOF'
 # The observed shape: a process that exists, prints nothing, burns no CPU. It is NOT dead and NOT done.
 # The duration is a parameter so a mutation arm that removes the kill cannot park the suite on it.
 sleep "${1:-20}"
+EOF
+cat > "$TMP/bin/stubborn.sh" <<'EOF'
+#!/bin/sh
+# THE KILL-ESCALATION SHAPE (agent-infra#2888 review, NEW finding): exists, prints nothing, burns no
+# CPU, and IGNORES TERM — a SIGSTOPped lane, or a `pi` stuck in a syscall it cannot leave. The bound
+# must escalate to KILL, and the EMITTED lines for that escalation used to overwrite the machine-
+# readable verdict file (one `>` per line), so the very lane the bound killed was the one whose verdict
+# a caller could not read. Its children (the `sleep`) are still TERM-able, so the escalation is reached
+# the way production reaches it: through the grace loop, not by making the fixture unkillable.
+trap '' TERM
+while :; do sleep 1; done
 EOF
 cat > "$TMP/bin/chatty.sh" <<'EOF'
 #!/bin/sh
@@ -212,46 +212,51 @@ res="$(drive "$BOUND" d 600 2 "$TMP/logs/d.log" "$TMP/bin/chatty.sh" "$TMP/logs/
 [ "$(nfield "$TMP/logs/d.log" silent)" -lt 2 ] 2>/dev/null; rc=$?
 ck "(d) …and it was NOT the silence bound that fired (silent=$(nfield "$TMP/logs/d.log" silent)s)" $rc
 
-# ── (i) PROGRESS OVER THE WALL — the agent-infra#2888 regression, both directions ──────────────
+# ── (i) PROGRESS OVER THE WALL — the agent-infra#2888 regression ───────────────────────────────
 # THE MEASURED DEFECT: `prfix` rows read median = p90 = 2400 s in `walltime.tsv` (the cap IS the
 # median), and five of five lanes in one batch ended at `elapsed == cap` with zero commits and 144 KB
 # of finished, uncommitted work. A lane that is WORKING must not be killed for taking long; a lane with
 # no completed work for the allowance must be.
-#
-# ⛔ WHAT (i1)/(i2)/(i3) ARE, AND WHAT THEY ARE NOT (review finding, P2 — corrected label). They drive
-# this helper with EXPLICIT `--idle`/`--wall` flags, and the complete functional diff of `lane-bound.sh`
-# for #2888 is the two DEFAULT literals plus the new WARN — so these three cases exercise the
-# already-shipped interaction between two explicit bounds and PASS UNCHANGED on the pre-fix tree. They
-# are PINNED BEHAVIOUR, not a red→green pair, and must not be read as pre-fix-detecting. The property
-# that #2888 actually moves — that the shipped DEFAULTS order the backstop above the allowance, that
-# they are the fleet's declared numbers, and that the env seam reaches the run — is carried by (i0),
-# (i4) and (h3), which DO fail on the pre-fix tree.
+# ⛔ (i1)/(i2)/(i3) ARE [PINNED], NOT [RED→GREEN] — AND SAYING SO IS THE POINT (agent-infra#2888
+# review, P2). Every one of them drives an EXPLICIT `--idle`/`--wall`, so the flags make them
+# INSENSITIVE to the default change this PR is about: they pass UNCHANGED on the pre-fix tree (the
+# complete non-comment functional diff of lane-bound.sh between `origin/main` and this head is the two
+# default literals 3300→7200 / 1200→2700 plus the WARN block). They are real pins on lane-bound's
+# ORDERING — progress in front of the wall, and the wall still able to end a lane that never stops —
+# and they are worth keeping, but a reader must not take them as evidence that the bound moved.
+# The change itself is detected by (i0) (the shipped defaults and the whole ordering chain), (i4) (the
+# new WARN) and (h3) (the newly-honoured `LANE_BOUND_WALL_S` through the real `run_agent` path) — those
+# three DO fail on `origin/main`. The earlier framing here called (i1)/(i2) "the censoring, red then
+# green", which was wrong in the same direction: the red half is a fixture that never crosses the cap,
+# and no fixture can turn an explicit-flag pair into a default-sensitive one. Any future claim about
+# the DEFAULTS belongs in (i0)/(h3), not here.
 #
 # A unit of work every 1 s, for 8 s: it is still working at 6 s and at 8 s.
 UNIT_LANE=8
 
-# (i1) PINNED: with the allowance governing and a backstop above it, the lane finishes uncensored.
-# (Not a pre-fix detector — see the label note above; `--wall 12` also means the old flat cap is never
-# crossed here, so "survives past the old cap" would be an over-claim for this fixture.)
+# (i1) [PINNED] progress allowance governs when the backstop is above it → the lane finishes.
+# A unit of work every 1 s, for 8 s: it is still working at 6 s and at 8 s, and it finishes before the
+# 12 s wall — so this asserts "NOTHING censors a lane that completes its work", with the flags making
+# it blind to the defaults (see the note above).
 res="$(drive "$BOUND" i1 2 12 "$TMP/logs/i1.log" "$TMP/bin/units.sh" "$TMP/logs/i1.log" "$UNIT_LANE")"
-[ "$res" = "rc=0 verdict=finished" ]; ck "(i1) [PINNED] a lane that keeps COMPLETING units finishes with the bound silent → $res" $?
+[ "$res" = "rc=0 verdict=finished" ]; ck "(i1) [PINNED] a lane that keeps COMPLETING units finishes, and is not censored while the backstop is above it → $res" $?
 sil_i1="$(nfield "$TMP/logs/i1.log" silent)"
 [ -n "$sil_i1" ] && [ "$sil_i1" -lt 2 ]; rc=$?
 ck "(i1) …and it really was progressing the whole way (silent=${sil_i1:-?}s < 2s, elapsed=$(nfield "$TMP/logs/i1.log" elapsed)s)" $rc
 
-# (i2) PINNED: the same working lane IS killed when the backstop sits below its work (the shipped
-# 2400 < 2700 shape, armed explicitly). Asserted on the verdict AND on `silent`, because "killed at the
-# wall" is only censoring when the lane was in fact still working; a wall kill of a quiet lane is
-# correct behaviour.
+# (i2) [PINNED] the SAME fixture, with the backstop moved BELOW the work: it is killed, and the kill
+# lands while the lane was still working. Asserted on the verdict AND on `silent`, because "killed at the
+# wall" is only censoring when the lane was in fact still working; a wall kill of a quiet lane is the
+# correct behaviour. (This is the SHAPE of the defect, driven explicitly — not a default it detects.)
 res="$(drive "$BOUND" i2 2 6 "$TMP/logs/i2.log" "$TMP/bin/units.sh" "$TMP/logs/i2.log" "$UNIT_LANE")"
-[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i2) [PINNED] the SAME working lane IS killed when the backstop sits below its work → $res" $?
+[ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i2) [PINNED] with the backstop below the work the SAME working lane IS killed → $res" $?
 sil_i2="$(nfield "$TMP/logs/i2.log" silent)"
 [ -n "$sil_i2" ] && [ "$sil_i2" -lt 2 ]; rc=$?
 ck "(i2) …and it was KILLED WHILE WORKING (silent=${sil_i2:-?}s < 2s) — that is the censoring, not a stall" $rc
 
-# (i3) PINNED: the backstop still ends a lane that never stops working (the "creeps forward for ever"
-# class the progress rule cannot bound) — demoting the wall did not remove it, it moved the PROGRESS
-# rule in front of it.
+# (i3) [PINNED] THE WEDGE KILL IS NOT TRADED AWAY. The backstop still ends a lane that never stops
+# working (the "creeps forward for ever" class the progress rule cannot bound), so demoting the wall did
+# not remove it — it moved the PROGRESS rule in front of it.
 res="$(drive "$BOUND" i3 2 5 "$TMP/logs/i3.log" "$TMP/bin/units.sh" "$TMP/logs/i3.log" 60)"
 [ "$res" = "rc=143 verdict=exceeded-wallclock" ]; ck "(i3) [PINNED] the BACKSTOP still kills a lane that keeps working for ever → $res" $?
 
@@ -303,6 +308,18 @@ ck "(i0) …and its malformed-value fallback (${DRAIN_COERCE:-?}s) is the same n
 CHAIN_FB="$(sed -n 's/.*_PHASE_STALE_AFTER="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}}".*/\1/p' "$HERE/chain-merge.sh" | head -1)"
 [ -n "${CHAIN_FB:-}" ] && [ "$CHAIN_FB" = "${SEAM:-x}" ]; rc=$?
 ck "(i0) chain-merge's stale-marker fallback (${CHAIN_FB:-?}s) is the harness BACKSTOP, so a working lane's marker is not declared stale" $rc
+# ⛔ AND THE INSTALLED UNIT MUST NOT OUT-PIN THE SCRIPT (agent-infra#2888 review, P2). `Environment=` is
+# a PIN the script never recomputes, so an installer that renders a literal CANCELLS the seam on every
+# box it touched: `install-drainer-timer.sh` shipped `${LANE_TIMEOUT:-3000}`, which beat ai-drainer.sh's
+# own new default and left drainer lanes wall-killed at 50 min — 300 s above the 2700 s allowance — with
+# an operator's `LANE_BACKSTOP_S` override invisible there. Two pins, because either half alone repairs
+# nothing: the renderer must emit the seam (blank = "derive it every tick"), and the template must still
+# carry the placeholder that pin lands in.
+INSTALL_DEF="$(sed -n 's/.*{{LANE_TIMEOUT}}.*${LANE_TIMEOUT:-\([0-9]*\)}.*/\1/p' "$HERE/install-drainer-timer.sh" | head -1)"
+[ -z "${INSTALL_DEF:-}" ]; rc=$?
+ck "(i0) [RED→GREEN] install-drainer-timer.sh renders LANE_TIMEOUT BLANK (a rendered literal here out-pins the script: got '${INSTALL_DEF:-<blank>}')" $rc
+grep -q '^Environment=LANE_TIMEOUT={{LANE_TIMEOUT}}$' "$HERE/../../templates/systemd/eldato-ai-drainer.service"; rc=$?
+ck "(i0) the drainer template still carries the {{LANE_TIMEOUT}} placeholder the blank render lands in (an absent placeholder makes the renderer's substitution a no-op)" $rc
 # The seam itself must REACH those children: an unexported variable leaves an operator's override at
 # home while the child reads the compiled default (the "knob that does nothing" shape again).
 grep -q '^export LANE_BACKSTOP_S$' "$GATE"; ck "(i0) spawn-gate.sh EXPORTS LANE_BACKSTOP_S, so a lane's children agree with the clock it runs under" $?
@@ -476,32 +493,24 @@ ck "(h3) LANE_BOUND_WALL_S reaches the bound through run_agent (it used to be an
 grep -q 'backstop OVERRIDDEN by LANE_BOUND_WALL_S=3' "$TMP/logs/h3.log"; rc=$?
 ck "(h3) …and the override is NAMED in the lane log, so the bound that ran and the bound reported cannot disagree" $rc
 
-# ── (k) THE VERDICT SURVIVES A TERM→KILL ESCALATION (review finding, NEW — MEASURED) ──────────
-# `emit_line` wrote the verdict file with `>`, so each line REPLACED the last: on a KILL escalation the
-# file held ONLY `[lane-bound] KILL … still alive Ns after TERM`, and spawn-gate.sh's
-# `sed -n 's/.*verdict=\([a-z-]*\).*/\1/p' | head -1` then returned EMPTY — `AGENT_BOUND_VERDICT`
-# blank for exactly the lane the bound killed. The (a)/(h) arms above cannot see it: their fixture dies
-# on TERM, so there is never a third line to overwrite the verdict. This arm forces the escalation.
-cat > "$TMP/bin/stubborn.sh" <<'EOF'
-#!/bin/sh
-# A lane that IGNORES TERM: the only way to end it is the bound's KILL escalation after the grace.
-# Bounded at 30s so a broken arm cannot leave a spinner behind.
-trap '' TERM
-i=0
-while [ "$i" -lt 30 ]; do sleep 1; i=$((i+1)); done
-EOF
-chmod +x "$TMP/bin/stubborn.sh"
-rm -f "$TMP/logs/k.log" "$TMP/logs/k.log.v"
-# --tol-cs 100: this arm measures the KILL path, not the CPU tolerance, and the fixture forks one
-# `sleep` per second — on a loaded box that fork noise can exceed the 10 cs default and the arm would
-# intermittently measure a NON-stall instead of the escalation.
-sh "$BOUND" run --log "$TMP/logs/k.log" --idle 2 --wall 60 --grace 1 --tol-cs 100 --tag k \
-  --verdict-file "$TMP/logs/k.log.v" -- "$TMP/bin/stubborn.sh" >/dev/null 2>&1
-krc=$?
-[ "$krc" -eq 137 ]; ck "(k) FIXTURE: the lane really had to be KILLed (rc=$krc — TERM ignored), so the escalation path ran" $?
-grep -q 'lane-bound\] KILL tag=k' "$TMP/logs/k.log.v"; ck "(k) FIXTURE: …and the KILL line is IN the verdict file (so a third write really happened)" $?
-kv="$(sed -n 's/.*verdict=\([a-z-]*\).*/\1/p' "$TMP/logs/k.log.v" 2>/dev/null | head -1)"
-[ "$kv" = "stalled" ]; ck "(k) …and the verdict FILE still yields verdict=stalled (got '${kv:-<empty>}') — the machine-readable surface keeps the verdict the human one always had" $?
+# ⛔ (h4) THE MACHINE-READABLE VERDICT SURVIVES THE TERM→KILL ESCALATION (agent-infra#2888 review, NEW
+# finding — found by EXECUTING the bound, not by reading it). `emit_line` used a plain `>` for EVERY
+# line, so each line REPLACED the last in `--verdict-file`. On a KILL escalation the file ended up
+# holding only `[lane-bound] KILL … still alive 15s after TERM`, and `spawn-gate.sh`'s
+# `sed -n 's/.*verdict=\([a-z-]*\).*/\1/p'` then returned EMPTY — so `AGENT_BOUND_VERDICT` was blank
+# for EXACTLY the lane the bound had killed, and `cap_wip_snapshot` (keyed to it) never ran. Measured
+# on the silent-lane arm: the LOG had `verdict=stalled … silent=2769s`, the FILE had only the KILL line.
+# The existing (h) case cannot catch this: its fixture dies on TERM and never reaches the escalation,
+# which is why a green (h) coexisted with a blank verdict in production.
+res="$(drive "$BOUND" h4 2 60 "$TMP/logs/h4.log" "$TMP/bin/stubborn.sh")"
+[ "$res" = "rc=137 verdict=stalled" ]; rc=$?
+ck "(h4) [RED→GREEN] the verdict FILE still carries verdict=stalled after the bound had to escalate to KILL → $res" $rc
+grep -q 'KILL tag=h4' "$TMP/logs/h4.log"
+ck "(h4) …and the escalation really happened (a fixture that took TERM would make this arm vacuous)" $?
+grep -q 'KILL tag=h4' "$TMP/logs/h4.log.v"; rc=$?
+ck "(h4) …and the file carries the aftermath AFTER the verdict, not INSTEAD of it" $rc
+[ "$(sed -n '1p' "$TMP/logs/h4.log.v" | grep -c 'VERDICT verdict=stalled')" = 1 ]; rc=$?
+ck "(h4) …with the verdict as the FIRST line, so a reader taking head -1 keeps getting the verdict" $rc
 
 # ── (g) THE CALLER'S CONTRACT: `run_agent` reads the verdict, and a stale one cannot be mistaken ──
 # A caller that cannot tell "the lane finished" from "the bound ended it" reports a wedged lane as a
