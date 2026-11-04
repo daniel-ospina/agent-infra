@@ -2046,9 +2046,12 @@ case "$OUT" in
   *) bad "claim-unreachable: no aggregate INCOMPLETE line — output: $OUT" ;;
 esac
 
-# (c) The registry is NOT INSTALLED: the documented FALLBACK. The candidate IS queued (a missing FILE
-#     is not an unreachable registry — refusing here would make the box merge-only), and the box says
-#     so every time. This pins the limit the code comment states, so it cannot go quiet.
+# (c) The registry is NOT INSTALLED: REFUSED (agent-infra#2466, reversing the old fallback).
+#     A missing registry is a registry that cannot answer, and an answer nobody can read is not
+#     evidence of freedom — the old behaviour queued the issue unclaimed, which is exactly the
+#     duplicate dispatch the registry exists to prevent. The cost of the reversal is one command
+#     (`deploy-harness.sh`), named in the refusal; the cost of the old behaviour was two lanes on
+#     one issue, on a box that could neither take the claim nor see a peer's.
 mk_case claim-absent
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"
@@ -2059,13 +2062,18 @@ mk_gh_one_issue "$D"
 rm -f "$D/o/claims.sh"
 rf "$D" refresh
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
-  *42*) ok "claim-absent: a candidate is still queued (the fallback is not a false block)" ;;
-  *) bad "claim-absent: nothing was queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+  *42*) bad "claim-absent: #42 was QUEUED with no registry — a missing registry is not freedom" ;;
+  *) ok "claim-absent: a candidate is NOT queued when the registry is missing (fail-closed)" ;;
 esac
 case "$OUT" in
-  *"no claim registry at"*"cross-box issue-claim check is OFF"*) ok "claim-absent: the missing registry is ANNOUNCED (never silent)" ;;
-  *) bad "claim-absent: the missing registry is silent — output: $OUT" ;;
+  *"is NOT INSTALLED"*"INCOMPLETE, never CLEAN"*) ok "claim-absent: the refusal NAMES the missing registry and its polarity" ;;
+  *) bad "claim-absent: the refusal does not name the missing registry — output: $OUT" ;;
 esac
+# ⛔ AND THE PASS IS RED, NOT QUIET: an INCOMPLETE that queues nothing must not read as "no work
+# available". This is the aggregate contract the refresh already documents; with the fallback gone it
+# is the ONLY signal that an unprovisioned box has stopped dispatching.
+[ "$RC" -ne 0 ] && ok "claim-absent: the pass EXITS NON-ZERO (an unreadable registry is a red run)" \
+  || bad "claim-absent: the pass exited 0 while refusing every candidate (a silent stop)"
 
 # (f) A REASON MUST BELONG TO THE CANDIDATE IT IS PRINTED FOR (cycle-22 review). `CLAIM_RESULT` is a
 #     shell GLOBAL that the CLEAN arm reads to decide whether to print "queued because its ONLY claim is
@@ -2078,7 +2086,12 @@ esac
 mk_case claim-stale-reason
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"          # the pool holds issue 42
-rm -f "$D/o/claims.sh"
+# ⛔ A REGISTRY THAT ANSWERS CLEAN BUT NEVER RESETS THE GLOBAL (agent-infra#2466). This case used to
+# stage the hazard by REMOVING the registry — the absence used to reach the CLEAN arm and queue. It
+# no longer does (a missing registry is INCOMPLETE, case (c)), so the fixture now stages the same
+# hazard directly: a reader that returns CLEAN and leaves `CLAIM_RESULT` untouched. The walk's own
+# per-candidate reset is what must stop the inherited reason being printed for #42.
+printf 'claim_issue_preflight() { return 0; }\n' > "$D/o/claims.sh"
 rf "$D" refresh "CLAIM_RESULT=the only claim on #9999 is ORPHANED (ghostbox:1: held-by-orphan)"
 case "$OUT" in
   *"ONLY claim is ORPHANED"*) bad "claim-stale-reason: an inherited CLAIM_RESULT was attributed to THIS candidate — output: $OUT" ;;
@@ -2270,6 +2283,29 @@ if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblo
   case "$(cat "$DB4/log" 2>/dev/null)" in
     *rphan*|*eclaim*) ok "orch-loop dispatch: the log line carries the orphan/reclaim token" ;;
     *) bad "orch-loop dispatch: the log line does not name the orphan reason" ;;
+  esac
+
+  # (i-c) NO REGISTRY AT ALL: NOT batched (agent-infra#2466). This arm used to warn and dispatch
+  #       unclaimed — the fail-open that makes a second cell's work invisible to this one. The
+  #       assertion is deliberately NEGATIVE (nothing batched, nothing in dispatched.txt) plus a log
+  #       line that NAMES the cause, because the failure it prevents is silent by construction.
+  DB5="$T/db-noregistry"; mkdir -p "$DB5/o/state" "$DB5/repo"
+  git init -q --bare "$DB5/origin.git"; git init -q "$DB5/repo"
+  git -C "$DB5/repo" remote add origin "$DB5/origin.git"
+  # deliberately NO cp of claims.sh into $DB5/o
+  printf '42\n' > "$DB5/o/candidates.txt"; : > "$DB5/o/dispatched.txt"
+  db "$DB5"
+  case "$(tr '\n' ' ' < "$DB5/o/.batch" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: #42 was batched with NO claim registry (an absent registry is not freedom)" ;;
+    *) ok "orch-loop dispatch: with no registry the issue is NOT batched (fail-closed)" ;;
+  esac
+  case "$(tr '\n' ' ' < "$DB5/o/dispatched.txt" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: #42 reached dispatched.txt with no claim registry" ;;
+    *) ok "orch-loop dispatch: with no registry dispatched.txt is untouched (the candidate stays retryable)" ;;
+  esac
+  case "$(cat "$DB5/log" 2>/dev/null)" in
+    *"claim-unreadable"*"no registry at"*) ok "orch-loop dispatch: the refusal names claim-unreadable and the missing path" ;;
+    *) bad "orch-loop dispatch: the refusal does not name the cause — log: $(cat "$DB5/log" 2>/dev/null)" ;;
   esac
 
   # (ii) a PEER already holds it: NOT batched, NOT in dispatched.txt (so the issue stays in
@@ -4005,7 +4041,13 @@ grep -q 'SKIPPED' <<<"$OUT" && ok "no PR listing: the pass says it skipped the c
 [ ! -s "$D/o/candidates.txt" ] && ok "no PR listing: nothing was queued" \
   || bad "no PR listing: something was queued — $(tr '\n' ' ' < "$D/o/candidates.txt")"
 
-# ── Control G — no registry installed: the documented LOUD fallback still releases ─────────────
+# ── Control G — no registry installed: the release REFUSES, it does not fall back ──────────────
+# ⛔ THIS CONTROL USED TO PIN THE OPPOSITE (agent-infra#2466, review P2). It asserted that a box with
+# no `$O/claims.sh` "still releases on local facts" and fills the queue — the documented fallthrough.
+# That fallback is GONE: missing, unreadable and stale are ONE polarity in this file now (see the
+# `--check` arm, the walk's ICR=2 arm and the dispatch arm), and the release arm is where the rule was
+# broken last. Keeping the old assertion would have pinned the defect, so it is inverted rather than
+# deleted: the same fixture now proves the suppression SURVIVES a box that cannot consult the registry.
 mk_case checked-no-registry
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"
@@ -4013,22 +4055,23 @@ mk_tmux "$D"
 printf '42\n' > "$D/o/checked.txt"
 rm -f "$D/o/claims.sh"
 rf "$D" refresh
-grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
-  && ok "no registry: the documented fallback releases on local facts and the queue fills" \
-  || bad "no registry: nothing was queued although no registry exists to hold it — output: $OUT"
+grep -qx 42 "$D/o/checked.txt" 2>/dev/null \
+  && ok "no registry: #42 is NOT released — an absent registry is not evidence of freedom (agent-infra#2466)" \
+  || bad "no registry: #42 was RELEASED although no registry exists to consult — the fail-open this control now pins against ($(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null))"
+[ ! -s "$D/o/candidates.txt" ] && ok "no registry: nothing was queued on a release the registry never sanctioned" \
+  || bad "no registry: something was queued — output: $OUT"
 case "$OUT" in
-  *"claim registry"*"NOT INSTALLED"*) ok "no registry: the fallback is LOUD (it names the missing registry)" ;;
-  *) bad "no registry: the fallback released silently — output: $OUT" ;;
+  *"claim registry"*"NOT INSTALLED"*) ok "no registry: the refusal is LOUD (it names the missing registry and its INCOMPLETE polarity)" ;;
+  *) bad "no registry: the refusal does not name the missing registry — output: $OUT" ;;
 esac
-# ⛔ AND THE RECORD SAYS WHICH CHECK WAS MISSING (review). The fallback sets
-# `CHECKED_REFUSED=claim-registry-absent` so the dispatch line can distinguish a release made WITHOUT
-# the cross-box claim read from a fully claim-checked one — and until this assertion existed, nothing
-# wrote that value into `state/checked-reap` and the funnel's reader re-initialised it from there, so
-# the funnel published `checked_refused=none` for the one release that skipped the claim check. A
-# passing assertion here is the only thing that keeps the assignment from going dead again.
+# ⛔ AND THE RECORD SAYS THE CLAIM READ WAS MISSING (review E, cycle 5). `CHECKED_REFUSED` is published
+# into `state/checked-reap` and the funnel re-reads it from there; before that write existed the funnel
+# printed `checked_refused=none` on a box with no registry, i.e. a pass that never answered the holder
+# question was byte-identical on the operator line to one that did. The slug described a REFUSAL then
+# and still does — the arm that used it to license a release is the part that changed.
 case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
-  *checked_refused=claim-registry-absent*) ok "no registry: the funnel records WHY the release skipped the claim read (checked_refused=claim-registry-absent)" ;;
-  *) bad "no registry: the funnel says checked_refused=$(sed -n 's/.*checked_refused=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a release made without the claim read is then indistinguishable from a claim-checked one" ;;
+  *checked_refused=claim-registry-absent*) ok "no registry: the funnel records WHY the release refused (checked_refused=claim-registry-absent)" ;;
+  *) bad "no registry: the funnel says checked_refused=$(sed -n 's/.*checked_refused=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) — a pass that could not consult the claim read is then indistinguishable from one that did" ;;
 esac
 
 # ── Control H — the release cap defers, and the CURSOR rotates past a permanently-held head ────

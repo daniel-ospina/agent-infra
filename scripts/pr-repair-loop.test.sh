@@ -494,6 +494,21 @@ grep -q 'LANE SCRATCH' "$TMP/lanescratch.out" \
     && ok "the refusal names the #2697 hazard" \
     || bad "the refusal does not name the lane-scratch hazard"
 
+# ⛔ EVERY `--install` ARM MUST SATISFY THE CHECKS THAT RUN BEFORE ITS OWN GUARD. The installer verifies
+# its dispatch target FIRST -- a non-empty checkout, carrying `.git`, whose origin names the same repo
+# (#1974, #3007) -- and the linger and census guards below are reached only after it. An arm that omits
+# the checkout never reaches the guard it claims to prove: it dies at the target check, and the `grep`
+# for the guard's own wording then reads as "the guard is broken" over a fixture that never got there.
+# The checkout is therefore part of the fixture. HERMETIC, and deliberately not the box's own tree: a
+# `git init` + a remote URL, nothing fetched and nothing dispatched, so the arm behaves identically on a
+# CI runner -- pointing these at a real checkout would make them pass only where that checkout exists.
+co_pair() { # <dir> <slug>
+    mkdir -p "$1"
+    git -C "$1" init -q 2>/dev/null
+    git -C "$1" remote add origin "https://github.com/$2.git" 2>/dev/null
+}
+co_pair "$TMP/co-t3" daniel-ospina/tortoise
+
 # ⛔ THE LINGER REFUSAL MUST BE CONTRADICTIBLE (review of this PR, round 6): it was the one fix with
 # no arm, so deleting it restored the exact false PASS this capability removes — a user-scope unit that
 # dies with the last login, reported as activation. Hermetic: every binary the installer calls is a stub
@@ -529,6 +544,7 @@ chmod +x "$TMP/userbin/sudo" "$TMP/userbin/pgrep" "$TMP/userbin/loginctl" "$TMP/
 
 env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=no \
+    PR_DOCTOR_REPO=daniel-ospina/tortoise PR_DOCTOR_REPO_DIR="$TMP/co-t3" \
     "$INSTALLER" --install >"$TMP/linger-no.out" 2>&1
 check "a user-scope install without linger is REFUSED (rc≠0)" 1 "$?"
 if grep -q 'loginctl enable-linger' "$TMP/linger-no.out" \
@@ -539,6 +555,7 @@ else
 fi
 env PATH="$TMP/userbin:$PATH" HOME="$TMP/fakehome" UNIT_DIR= SYSTEMCTL= \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" STUB_LINGER=yes \
+    PR_DOCTOR_REPO=daniel-ospina/tortoise PR_DOCTOR_REPO_DIR="$TMP/co-t3" \
     "$INSTALLER" --install >"$TMP/linger-yes.out" 2>&1
 check "the same install with linger=yes succeeds (rc=0)" 0 "$?"
 [ -n "$(find "$TMP/fakehome" -name 'eldato-pr-repair.service' 2>/dev/null)" ] \
@@ -563,6 +580,7 @@ chmod +x "$TMP/claimbin/pgrep"
 # into /etc/systemd/system. This arm did exactly that once. An explicit UNIT_DIR pins the whole fixture.
 env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
+    PR_DOCTOR_REPO=daniel-ospina/tortoise PR_DOCTOR_REPO_DIR="$TMP/co-t3" \
     "$INSTALLER" --install >"$TMP/census.out" 2>&1
 check "a live foreign --loop REFUSES the install (rc≠0)" 1 "$?"
 if grep -qi 'already live' "$TMP/census.out" && [ -z "$(find "$TMP/claimunit" -name '*.service' 2>/dev/null)" ]; then
@@ -580,6 +598,7 @@ sleep 0.3
 cp "$TMP/stubbin/pgrep" "$TMP/claimbin/pgrep"
 env PATH="$TMP/claimbin:$PATH" UNIT_DIR="$TMP/claimunit" SYSTEMCTL="$TMP/userbin/systemctl" \
     PR_REPAIR_SCRIPTS="$TMP/farmfull" TEMPLATES_DIR="$ROOT/templates/systemd" \
+    PR_DOCTOR_REPO=daniel-ospina/tortoise PR_DOCTOR_REPO_DIR="$TMP/co-t3" \
     "$INSTALLER" --install >"$TMP/census-gone.out" 2>&1
 check "the same install succeeds with no foreign loop (rc=0)" 0 "$?"
 [ -n "$(find "$TMP/claimunit" -name 'eldato-pr-repair.service' 2>/dev/null)" ] \
@@ -770,15 +789,11 @@ echo "── the repo and its checkout are ONE seam, proven before dispatch (#30
 # Hermetic: each checkout is `git init` + a remote URL; nothing is fetched and nothing is dispatched
 # (`--dry-run`). The `flock` shim is for macOS, which has no `flock` -- without it every arm below
 # would stop at the pass-lock guard and prove nothing about the pair.
+# (`co_pair` and `$TMP/co-t3` are built ONCE, above, where the install arms need the same checkout --
+# one fixture, so the two sections cannot drift into two different repo shapes.)
 mkdir -p "$TMP/bin"
 printf '#!/bin/sh\nexit 0\n' >"$TMP/bin/flock"; chmod +x "$TMP/bin/flock"
-co_pair() { # <dir> <slug>
-    mkdir -p "$1"
-    git -C "$1" init -q 2>/dev/null
-    git -C "$1" remote add origin "https://github.com/$2.git" 2>/dev/null
-}
 co_pair "$TMP/co-ai" daniel-ospina/agent-infra
-co_pair "$TMP/co-t3" daniel-ospina/tortoise
 pair_run() { # <checkout-or-empty> <slug-or-empty> -> prints the run's output, last line `RC=<rc>`
     ( if [ -n "${1:-}" ]; then export PR_DOCTOR_REPO_DIR="$1"; fi
       if [ -n "${2:-}" ]; then export PR_DOCTOR_REPO="$2"; fi

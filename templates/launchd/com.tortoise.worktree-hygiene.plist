@@ -13,7 +13,11 @@
          remove` never deletes a branch. This job runs both reviewed engines, in
          order.
 
-         ⛔ SHIPS DISARMED — {{WORKTREE_HYGIENE_MODE}} RENDERS the `dry-run` flag.
+         ⛔ SHIPS DISARMED — the WORKTREE_HYGIENE_MODE placeholder RENDERS the
+         dry-run flag (spelled here WITHOUT braces: render() substitutes over the
+         whole file, comments included, and the value it inserts is a flag whose
+         leading hyphens are illegal inside an XML comment — XML 1.0 §2.5, and
+         python `plistlib` rejects the rendered file).
          This is a DELETION tool on a 6-hourly timer (worktree checkouts, then
          local branch refs), and the recorded rule (#1678, owner ruling
          2026-10-11: "the reaper may run unattended; arming it may not") is that
@@ -98,6 +102,20 @@
              class of job a no-op. -->
         <key>REAP_WT_BUDGET_SECONDS</key>
         <string>1800</string>
+        <!-- ⛔ THE LOCK'S STALENESS HORIZON MUST EXCEED THE PASS BUDGET, and this
+             unit is the one that actually DELETES (`pi-reap-worktrees.sh apply`), so
+             it is the one where losing the invariant is the F17/A15 P0: a
+             legitimately-running pass that outlives the horizon has its lock broken
+             by a second invocation, two armed passes then compute PRUNE_BLOCKED for
+             their own pass only, and the one that sees no deferred prunable record
+             runs the path-filterless `git worktree prune`. The budget is only
+             checked BETWEEN records, and each removal afterwards may take up to
+             REAP_WT_REMOVE_TIMEOUT (120s) plus the prune, so 1800s alone reaches
+             ~2000s. 7200s = 4x the budget, the same ratio the sibling dry-run
+             reaper ships (script-side: the reaper CLAMPS a non-exceeding horizon
+             and says so, so a caller cannot lose the invariant either). -->
+        <key>REAP_WT_LOCK_STALE_SECONDS</key>
+        <string>7200</string>
         <key>REAP_WT_GH_TIMEOUT</key>
         <string>120</string>
     </dict>

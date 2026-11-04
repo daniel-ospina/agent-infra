@@ -78,14 +78,16 @@ FX_SHA="$(git -C "$FX" rev-parse HEAD 2>/dev/null)"
 # The installer is driven from a STAGE copy, so nothing it does can reach this checkout's neighbours
 # and its own `bash -n` sweep sees only what is under test.
 STAGE="$T/stage"; mkdir -p "$STAGE"
-# ⛔ `merge-reminder.py` IS STAGED, NOT STUBBED (main's install.sh gates on it, 2026-10-24). The
-# installer parses `$HERE/merge-reminder.py` with `ast.parse` and DIES when it is absent — deliberately
-# unguarded, because a `[ -f ]` guard once let a MISSING file read as "parses fine" while the timer had
-# no script. Without it in the stage, every arm stops at that gate instead of at its own assertion; the
-# file is a shipped companion of install.sh (see install.sh's own drift list), so the stage carries the
-# REAL one rather than a stub — a stub would pass the parse gate while proving nothing about the ship set.
+# ⛔ `merge-reminder.py`, `check-class.py` AND `nochk-resolve.py` ARE STAGED, NOT STUBBED (main's
+# install.sh gates on them; agent-infra#2603, #2719). The installer parses each with `ast.parse` and DIES
+# when one is absent — deliberately unguarded, because a `[ -f ]` guard once let a MISSING file read as
+# "parses fine" while the timer/classifier had no script. Without them in the stage, every arm stops at
+# that gate instead of at its own assertion (measured: 66 arms red on a tree whose real defect was the
+# label seam, reading as `❌ check-class.py is missing or does not parse`); they are shipped companions
+# of install.sh (see install.sh's own drift list), so the stage carries the REAL ones rather than a stub
+# — a stub would pass the parse gate while proving nothing about the ship set.
 cp "$INSTALL" "$HARNESS/launchd-cycle.sh" "$TEMPLATE" "$HARNESS/refresh-candidates.sh" \
-   "$HARNESS/merge-reminder.py" "$STAGE/" 2>/dev/null
+   "$HARNESS/merge-reminder.py" "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" "$STAGE/" 2>/dev/null
 BIN="$T/bin"; mkdir -p "$BIN"
 # install.sh probes the real binaries (gh/network, tmux, pi, jq) and lints the plist with plutil. ALL of
 # them are stubbed IN $BIN: the assertions below are about the RENDERED PROGRAM, not the host's toolchain.
@@ -100,7 +102,22 @@ for b in gh tmux plutil pi jq; do printf '#!/bin/sh\nexit 0\n' > "$BIN/$b"; chmo
 SHOME="$T/home"; mkdir -p "$SHOME/Library/LaunchAgents" "$SHOME/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SHOME/.local/share/pi-node/current/bin/pi"
 chmod +x "$SHOME/.local/share/pi-node/current/bin/pi"
-PLIST="$SHOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+# ⛔ THE SANDBOX LABEL IS PART OF THE CONTRACT, NOT A DETAIL OF THE FIXTURE (agent-infra#1996).
+# launchd resolves a label in the USER DOMAIN and IGNORES `$HOME`, so a plist rendered under this
+# throwaway home with the PRODUCTION label still addresses the live controller — and
+# `ELDATO_ALLOW_TEST_HOME=1` (which this suite must set so launchd-cycle.sh's #446 guard permits a
+# sandbox run) says nothing about WHICH job is addressed. `install.sh`'s `label_guard` therefore
+# REFUSES a production label outside the real `$HOME`, and its refusal names the seam: `LABEL_OVERRIDE`.
+# That refusal is CORRECT (it is the only thing standing between a hermetic fixture and the live job a
+# `-w` verb addresses by name), so the suite sets the documented seam instead of asking install.sh to
+# make an exception for tests — exactly as `selftest.sh` and `install-launchd-durability.test.sh` do.
+# ⛔ EVERY plist path below is DERIVED from `$LABEL` through `plist_at`: the installer addresses
+# `<label>.plist`, so a fixture that kept the production filename would be a plist nothing reads and the
+# arm would pass on a file the installer never looked at.
+LABEL="com.eldato.orchestrator-loop-test"
+export LABEL_OVERRIDE="$LABEL"
+plist_at() { printf '%s/Library/LaunchAgents/%s.plist' "$1" "$LABEL"; }
+PLIST="$(plist_at "$SHOME")"
 O="$T/o"; mkdir -p "$O"
 
 RUN() { # <extra-env…> -- <install.sh args…>
@@ -109,6 +126,21 @@ RUN() { # <extra-env…> -- <install.sh args…>
       PATH="$SHOME/.local/share/pi-node/current/bin:$BIN:$PATH" \
       "$@" 2>&1
 }
+
+# ⛔ AND THE SEAM MUST NOT HAVE WEAKENED THE GUARD — the arm that keeps every other arm honest. The SAME
+# sandbox `$HOME` with the production label and NO override must still be REFUSED; otherwise
+# `LABEL_OVERRIDE` here would be indistinguishable from having deleted the guard, and this suite would
+# be green on a box where a "sandbox" install writes into the live LaunchAgents (and a `-w` verb
+# disables the controller it names). This is the refusal `label_guard` exists for; it is asserted, not
+# assumed, so a future lane cannot buy green by relaxing install.sh instead of setting the seam.
+SHOME_L="$T/home-label"; mkdir -p "$SHOME_L/Library/LaunchAgents"
+out="$(env -u LABEL_OVERRIDE HOME="$SHOME_L" O="$T/o-label" REPO="$FX" OR="acme/widget" HARNESS_REPO="$FX" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a PRODUCTION label under the sandbox \$HOME is still REFUSED (rc=$rc)"
+ck "$(has "$out" "LABEL_OVERRIDE" && echo 0 || echo 1)" "…and the refusal names the seam this suite uses (not a silent pass)"
+ck "$([ ! -f "$(plist_at "$SHOME_L")" ] && [ ! -f "$SHOME_L/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && echo 0 || echo 1)" \
+   "…and NEITHER a production nor a test plist was written by the refused run"
 # The same parser `install.sh` uses to read the program back out of its own render. Duplicated on
 # purpose: a suite that re-implemented the check with a DIFFERENT parse would pass while the shipped
 # assertion was broken, and the shipped one is the thing that must fire.
@@ -171,7 +203,7 @@ out="$(env HOME="$SHOME2" O="$T/o2" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         PATH="$SHOME2/.local/share/pi-node/current/bin:$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"
 rc=$?
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "an explicit HARNESS=<checkout harness> installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
-P2="$SHOME2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+P2="$(plist_at "$SHOME2")"
 ck "$([ "$(plist_program "$P2" 2>/dev/null)" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" "…and the program is that checkout's orch-loop.sh"
 ck "$([ -f "$SHOME2/.harness-path" ] && [ -f "$SHOME2/.pi/agent/state/HARNESS-PIN" ] && echo 0 || echo 1)" \
    "…and it MENDED both pin records, so the next reader resolves the same tree"
@@ -276,7 +308,7 @@ ck "$([ "$PIN_DIR_A3" != "$FX3H" ] && echo 0 || echo 1)" \
    "…and NOT the operator's checkout (a TCC-protected tree a launchd job cannot read)"
 ck "$([ "$(head -1 "$SHOME3P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX3_SHA" ] && echo 0 || echo 1)" \
    "…and the sha record names that commit"
-P3P="$SHOME3P/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+P3P="$(plist_at "$SHOME3P")"
 ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$PIN_DIR_A3/orch-loop.sh" ] && echo 0 || echo 1)" "…and the job execs that tree"
 # The launcher's verdict on the SAME two records: it must not call the box BROKEN.
 # ⛔ `HARNESS_REPO` IS PART OF THE FIXTURE, NOT DECORATION. `harness-up` resolves the repo whose object
@@ -375,7 +407,14 @@ ck "$([ "$(head -1 "$SHOME3R/.harness-path" 2>/dev/null)" = "$PIN_DIR_3R" ] && e
    "…and records the PIN-ROOT tree, not the (now dirty) checkout"
 ck "$([ "$(head -1 "$SHOME3R/.harness-path" 2>/dev/null)" != "$FX3H" ] && echo 0 || echo 1)" \
    "…NEVER the operator's checkout"
-git -C "$FX3" checkout -q -- scripts/orchestrator-harness/orch-loop.sh 2>/dev/null || true
+# ⛔ NO `git checkout` HERE, DELIBERATELY. The fleet's own worktree-discard guard reads every
+# `git … checkout -- <path>` an agent's script contains and FAILS CLOSED when the repo it discards from is
+# a shell variable (`$FX3` is one) — so this single line made the whole suite UN-RUNNABLE through the
+# agent tooling (`⛔ Working-tree discard blocked … the invocation's effective repo could not be
+# resolved`), and a suite nobody can run rots. The fixture file is restored by writing the bytes it was
+# COMMITTED with, which is exactly what the checkout did — and it says so, so the next reader does not
+# "helpfully" put the verb back.
+printf '#!/bin/bash\necho loop\n' > "$FX3/scripts/orchestrator-harness/orch-loop.sh"
 
 # B6 — THE HOME-DIR-ONLY ENTRYPOINT. A box that is LIVE on `launchd-controller.sh` (the tmux/Full-Disk-
 # Access wrapper that exists in NO commit — PR #2020 lifts it) must not be silently moved onto the
@@ -387,11 +426,11 @@ printf '#!/bin/bash\necho wrapper\n' > "$O7/launchd-controller.sh"
 # there is NOT proof that anything runs it — a box whose plist already names the pin's `orch-loop.sh`
 # must NOT be blocked by it (review finding, P1: the first form of this refusal was a permanent false
 # block on exactly that box). So the arm writes the plist the box is actually running.
-P7="$SHOME7/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+P7="$(plist_at "$SHOME7")"
 cat > "$P7" <<PLIST7
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>Label</key><string>com.eldato.orchestrator-loop-test</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -408,11 +447,11 @@ ck "$(has "$out" "$O7/launchd-controller.sh" && echo 0 || echo 1)" "…and names
 # The false-block companion: the SAME leftover `$O/launchd-controller.sh`, but the installed job already
 # runs the pin's `orch-loop.sh` — nothing is lost, so nothing may be refused.
 SHOME9="$T/home9"; mkdir -p "$SHOME9/Library/LaunchAgents"
-P9="$SHOME9/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+P9="$(plist_at "$SHOME9")"
 cat > "$P9" <<PLIST9
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>Label</key><string>com.eldato.orchestrator-loop-test</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -436,7 +475,7 @@ SHOME8="$T/home8"; mkdir -p "$SHOME8/Library/LaunchAgents"
 out="$(env HOME="$SHOME8" O="$O7" REPO="$T/repo2" OR="acme/widget" HARNESS="$FXH2" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-P8="$SHOME8/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+P8="$(plist_at "$SHOME8")"
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that CARRIES the entrypoint installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$([ "$(plist_program "$P8" 2>/dev/null)" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
    "…and the job runs the PINNED entrypoint, not \$O's copy"
@@ -455,11 +494,11 @@ ck "$(has "$out" "pkill -f \"[b]ash $FXH2/launchd-controller.sh\"" && echo 0 || 
 # that spelling; the parser read only ProgramArguments, so the job parsed as EMPTY and the gate read
 # "nothing is running" — silently dropping the very wrapper it exists to protect.
 SHOME7b="$T/home7b"; mkdir -p "$SHOME7b/Library/LaunchAgents"
-P7b="$SHOME7b/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+P7b="$(plist_at "$SHOME7b")"
 cat > "$P7b" <<PLIST7B
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>Label</key><string>com.eldato.orchestrator-loop-test</string>
   <key>Program</key>
   <string>$O7/launchd-controller.sh</string>
 </dict></plist>
@@ -471,7 +510,7 @@ ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a \`Program\`-key job running the 
 ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and names the class (the Program key is READ, not skipped)"
 # …and a plist whose program cannot be parsed at all is CANNOT-VERIFY, never "nothing to lose".
 SHOME7c="$T/home7c"; mkdir -p "$SHOME7c/Library/LaunchAgents"
-P7c="$SHOME7c/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+P7c="$(plist_at "$SHOME7c")"
 printf 'binary-plist-junk' > "$P7c"
 out="$(env HOME="$SHOME7c" O="$T/o7c" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
@@ -485,11 +524,11 @@ ck "$(has "$out" "cannot be READ" && echo 0 || echo 1)" "…and the refusal says
 # installer with its own stderr and no refusal at all.
 for _arg in status --keep; do
   SHOME7e="$T/home7e$(printf '%s' "$_arg" | tr -d '-')"; mkdir -p "$SHOME7e/Library/LaunchAgents"
-  P7e="$SHOME7e/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+  P7e="$(plist_at "$SHOME7e")"
   cat > "$P7e" <<PLIST7E
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>Label</key><string>com.eldato.orchestrator-loop-test</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
@@ -510,8 +549,8 @@ done
 # parsers — the gate failed OPEN on a one-line `Program` key and the post-render assertion refused a
 # correct render.
 SHOME7g="$T/home7g"; mkdir -p "$SHOME7g/Library/LaunchAgents"
-P7g="$SHOME7g/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
-printf '%s' "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.eldato.orchestrator-loop</string><key>Program</key><string>$O7/launchd-controller.sh</string></dict></plist>" > "$P7g"
+P7g="$(plist_at "$SHOME7g")"
+printf '%s' "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.eldato.orchestrator-loop-test</string><key>Program</key><string>$O7/launchd-controller.sh</string></dict></plist>" > "$P7g"
 out="$(env HOME="$SHOME7g" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
@@ -526,7 +565,7 @@ out="$(env HOME="$SHOME7h" O="$T/o7h" REPO="$FXSP" OR="acme/widget" HARNESS_REPO
         PATH="$SHOME7h/.local/share/pi-node/current/bin:$BIN:$PATH" \
         bash "$STAGE/install.sh" 2>&1)"; rc=$?
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin path containing a SPACE installs (rc=$rc, the post-render assertion accepts the correct program)"
-ck "$(has "$(plist_program "$SHOME7h/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" 2>/dev/null)" "$FXSP/scripts/orchestrator-harness/orch-loop.sh" && echo 0 || echo 1)" \
+ck "$(has "$(plist_program "$(plist_at "$SHOME7h")" 2>/dev/null)" "$FXSP/scripts/orchestrator-harness/orch-loop.sh" && echo 0 || echo 1)" \
    "…and the rendered program IS that path, space and all"
 
 # B6c — `set -e` HAZARDS IN THE RECORD CAPTURES (review P4). A pin RECORD that is a directory used to
@@ -545,7 +584,8 @@ ck "$(has "$out" "REFUSED (pin)" && echo 0 || echo 1)" "…and the refusal is th
 # docs/ops/fleet-harness-baseline.md §3.1) would sail through with the suite green (review finding, P2).
 # The mutation below IS that deviant template: one rule rewritten to the pre-change `__O__` program.
 STAGE_OLD="$T/stage-old"; mkdir -p "$STAGE_OLD"
-cp "$STAGE/install.sh" "$STAGE/launchd-cycle.sh" "$STAGE/refresh-candidates.sh" "$STAGE/merge-reminder.py" "$STAGE_OLD/" 2>/dev/null
+cp "$STAGE/install.sh" "$STAGE/launchd-cycle.sh" "$STAGE/refresh-candidates.sh" "$STAGE/merge-reminder.py" \
+   "$STAGE/check-class.py" "$STAGE/nochk-resolve.py" "$STAGE_OLD/" 2>/dev/null
 sed 's|<string>__HARNESS__/__ENTRY__</string>|<string>__O__/orch-loop.sh</string>|' "$TEMPLATE" > "$STAGE_OLD/launchd.plist.template"
 SHOME10="$T/home10"; mkdir -p "$SHOME10/Library/LaunchAgents"
 out="$(env HOME="$SHOME10" O="$T/o10" REPO="$FX" OR="acme/widget" HARNESS_REPO="$FX" HARNESS="$FXH" \
@@ -554,7 +594,7 @@ out="$(env HOME="$SHOME10" O="$T/o10" REPO="$FX" OR="acme/widget" HARNESS_REPO="
 ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a template that renders the OLD \`\$O\` program is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "the plist and the pin disagree" && echo 0 || echo 1)" "…and the refusal says the plist and the pin disagree"
 ck "$(has "$out" "$FXH/orch-loop.sh" && echo 0 || echo 1)" "…and names the program the pin resolved"
-ck "$([ ! -f "$SHOME10/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && echo 0 || echo 1)" \
+ck "$([ ! -f "$(plist_at "$SHOME10")" ] && echo 0 || echo 1)" \
    "…and NOTHING was installed (the refusal is atomic: the previous plist is untouched)"
 
 # B6e — a `HARNESS-PIN` that is a DIRECTORY is NOT an absent pin (review finding, pre-existing fail-open in
@@ -628,14 +668,29 @@ cell bring-up traps (born-pinned worktree, global GH_REPO, tmux env)|scripts/clo
 the Mac's controller runs its launchd program from the pin|scripts/orchestrator-harness/install.sh|scripts/mac-pin-parity.test.sh
 "
 SHARD_LIST="$REPO_ROOT/scripts/run-bash-shards.sh"
+# ⛔ ASK THE DRIVER FOR ITS LIST — NEVER GREP ITS TEXT (agent-infra#2609). The shard list is DERIVED
+# from `SUITE_GLOBS`: the file no longer contains a single suite's name (it said so itself — "a suite is
+# added by adding a FILE that matches one of these; nothing here is edited to wire one"). A text grep
+# therefore reds a CORRECTLY-WIRED witness — measured at origin/main: 3 of these 4 were RED while all 3
+# were in fact DISCOVERED, and the 4th passed only because `tests/heartbeat-fleet-advance/run.sh`'s
+# basename `run.sh` happens to occur in the driver's own `tests/*/run.sh` GLOB, i.e. the assertion was
+# passing on a glob string and could never prove the wiring. `--list` prints the list the runner
+# EXECUTES, from that one source, and a tool's own status verb outranks a reader's inference about its
+# text. This is STRICTER than the grep it replaces: an exact full-path line, not a basename substring
+# anywhere in the file.
+# ⛔ FAIL CLOSED: a driver that cannot derive its list prints NOTHING (it exits 2 on an empty
+# derivation), so every witness below REDS rather than passing on a list nothing could read.
+SHARD_DERIVED="$(bash "$SHARD_LIST" --list 2>/dev/null)"
 while IFS='|' read -r name carrier witness; do
   [ -n "${name// /}" ] || continue
   need "$REPO_ROOT/$carrier" >/dev/null 2>&1 && ok "carrier present: $carrier" || bad "carrier MISSING for '$name': $carrier"
   need "$REPO_ROOT/$witness" >/dev/null 2>&1 && ok "witness present: $witness" || bad "witness MISSING for '$name': $witness"
-  if grep -q "$(basename "$witness")" "$SHARD_LIST" 2>/dev/null; then
-    ok "witness is WIRED into the one shard list: $(basename "$witness")"
+  # A here-string, not a pipe: `grep -q` exits on its first match and the writer takes SIGPIPE under
+  # `pipefail` (#841 — the shape `scripts/check-no-sigpipe-grep.sh` gates).
+  if grep -qxF -- "$witness" <<<"$SHARD_DERIVED"; then
+    ok "witness is WIRED into the shard list the runner EXECUTES: $witness"
   else
-    bad "witness $(basename "$witness") is NOT in scripts/run-bash-shards.sh — a suite nothing runs is not a witness"
+    bad "witness $witness is NOT in the list scripts/run-bash-shards.sh derives and runs — a suite nothing runs is not a witness"
   fi
 done <<REG
 $FIX_REGISTER

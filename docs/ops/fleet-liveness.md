@@ -686,8 +686,30 @@ python3 tools/fleet/claim_lanes.py --snapshot ~/orchestrator/state/claims-snapsh
     --max-age-s 600 --pr 1525
 ```
 
-**The two drivers, one contract.** The normalized record is exactly the three fields
-`claim_snapshot` already writes — `<ref>\t<owner>\t<lease_until>`:
+**The two drivers, one contract.** The normalized record is exactly the three fields the body of
+`claim_snapshot` writes — `<ref>\t<owner>\t<lease_until>` — and it is preceded by a **header line**
+(`#2534`):
+
+```
+#claim-snapshot\t<read_at>\t<ok|failed>\t<refs>
+<ref>\t<owner>\t<lease_until>
+…
+```
+
+The header is what makes "the registry answered and holds nothing" distinguishable from "the registry
+was never read": `<read_at>` is the read instant, `ok|failed` is the **fetch**'s own answer, and
+`<refs>` is how many claims that read returned. Both FILE readers (`claims.sh`'s
+`claim_snapshot_verdict` and this driver's `read_snapshot`) honour it with the same polarity:
+
+- `<read_at>` — **not the file's mtime** — is the snapshot's age, so a fresh header on a copied file is
+  believed while an old header on a just-written file is refused.
+- `failed` — refused at **any** age: its rows are the *last good* read, so a claim published or released
+  since then is invisible.
+- a `read_at` **ahead** of the reader's clock is refused, never clamped to fresh — the age test is
+  one-sided, so trusting a future stamp believes it for ever.
+- a malformed header (wrong field count, non-numeric instant, not on line 1) is `claims-unreadable`, not
+  an old writer. The **mtime** fallback belongs only to a first line that is not a header at all, which
+  is what a writer predating the header produces.
 
 - **PULL** — `git ls-remote <remote> "<ns>/*"` is the authority on **presence**. A non-zero rc is
   `claims-unreadable` and is **never** "no claims"; rc 0 with zero refs is a *readable* empty
@@ -695,8 +717,11 @@ python3 tools/fleet/claim_lanes.py --snapshot ~/orchestrator/state/claims-snapsh
   read with `cat-file`, so a hostile registry can neither write nor delete a local ref. A
   per-claim metadata failure keeps `present=True` with `owner="?"` — presence alone refutes
   freedom.
-- **FILE** — `--snapshot PATH` with a caller-stated `--max-age-s`. Missing, stale, or
-  shape-drifted is `claims-unreadable`; a 0-byte file is a *readable* empty read.
+- **FILE** — `--snapshot PATH` with a caller-stated `--max-age-s`. Missing, unreadable, stale, a
+  `failed`-fetch header, or shape-drifted is `claims-unreadable`; a header stating `…\tok\t0` is a
+  *readable* empty read. `L27`/`L28` pin both readers to the shape the writer actually produces —
+  `L28` by running the shipped `claim_snapshot` and reading its output back, so the two drivers
+  cannot diverge again (a hand-written fixture can drift; the writer's bytes cannot).
 
 The read is bound to the target: `--repo PATH` (its `origin`) or `--remote-url URL`, never the
 current directory (the controller runs from launchd with cwd `$HOME`, which is how `claim_snapshot`

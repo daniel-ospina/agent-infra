@@ -51,6 +51,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODULE_PATH = os.path.normpath(os.environ.get("CLAIM_LANES_MODULE") or
@@ -1166,6 +1167,133 @@ def l26_host_seam_matches_the_writer():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# L27 — the snapshot HEADER is the contract, and BOTH readers honour it
+# ══════════════════════════════════════════════════════════════════════════
+@test("L27 the FILE reader parses the header claim_snapshot WRITES (#2534 review P1)")
+def l27_snapshot_header_is_the_contract():
+    """`claims.sh` publishes a 4-field header as the snapshot's first line.
+
+    This driver knew only the three-field body, so `len(parts) != 3` fired on line 1 of
+    EVERY real snapshot and the documented offline read answered `claims-unreadable` for
+    ever — a phantom UNREADABLE, the mirror of the phantom FREE the change removes. It was
+    invisible here because every fixture was header-less: a shape the writer no longer
+    produces. So the fixtures below are the shapes the writer DOES produce.
+    """
+    d = tempfile.mkdtemp(prefix="claims-hdr-")
+    try:
+        row = "refs/claims/5-abcdef123456\t%s:1\t%d\n" % (HOST, NOW_S + 1800)
+
+        def snap(text, age_s=0):
+            return write_snapshot(d, text, age_s=age_s)
+
+        fresh = "#claim-snapshot\t%d\tok\t1\n%s" % (NOW_S, row)
+        cr = cl.read_snapshot(snap(fresh), max_age_s=600, host=HOST, now=NOW_S, pr="5")
+        check(cr.readable is True, "a header-then-rows snapshot is READABLE; got %r" % (cr.detail,))
+        check(len(cr.claims) == 1 and cr.claims[0].key == "5-abcdef123456",
+              "the row under the header is the claim; got %r" % ([c.key for c in cr.claims],))
+        check(cr.claims[0].lease_state == "live", "the lease is still classified live")
+
+        # a readable EMPTY snapshot: the registry answered and holds nothing (the control —
+        # proves the body IS consulted and `claim-absent` is not a silent fallback)
+        empty = cl.read_snapshot(snap("#claim-snapshot\t%d\tok\t0\n" % NOW_S),
+                                 max_age_s=600, host=HOST, now=NOW_S, pr="5")
+        check(empty.readable is True and empty.claims == (),
+              "a header stating ZERO refs is a readable empty read, not an abstention")
+
+        # ⛔ A FAILED FETCH IS REFUSED AT ANY AGE: its rows are the LAST GOOD read, so a claim
+        # published or released since then is invisible — an answer this file cannot give.
+        failed = "#claim-snapshot\t%d\tfailed\t1\n%s" % (NOW_S, row)
+        cr = cl.read_snapshot(snap(failed), max_age_s=600, host=HOST, now=NOW_S, pr="5")
+        check(cr.readable is False, "a FAILED-fetch header must not be read as a snapshot")
+        check("FAILED fetch" in (cr.detail or ""), "and it says why; got %r" % (cr.detail,))
+
+        # ⛔ THE HEADER'S read_at IS THE AGE — NOT THE MTIME. An old mtime with a fresh header is
+        # a snapshot whose copy was carried; a fresh mtime with an old header is a stale read
+        # dressed up. Reading either off the mtime is how a stale read stays believed.
+        cr = cl.read_snapshot(snap(fresh, age_s=99999), max_age_s=600, host=HOST, now=NOW_S,
+                             pr="5")
+        check(cr.readable is True,
+              "a fresh HEADER is believed even when the file's mtime is old; got %r" % (cr.detail,))
+        old_hdr = "#claim-snapshot\t%d\tok\t1\n%s" % (NOW_S - 99999, row)
+        cr = cl.read_snapshot(snap(old_hdr), max_age_s=600, host=HOST, now=NOW_S, pr="5")
+        check(cr.readable is False, "an over-age HEADER is refused even on a fresh mtime")
+
+        # ⛔ A FUTURE STAMP IS DROPPED, NEVER TRUSTED (AGENTS.md's one-sided-age rule, now the
+        # fleet's cross-box signal): clamping it to fresh would believe it for ever.
+        future = "#claim-snapshot\t%d\tok\t1\n%s" % (NOW_S + 999, row)
+        cr = cl.read_snapshot(snap(future), max_age_s=600, host=HOST, now=NOW_S, pr="5")
+        check(cr.readable is False, "a read instant AHEAD of the clock is refused, not clamped")
+
+        # Malformed headers: a writer this reader cannot parse is NOT an old writer, so the
+        # mtime fallback (kept for the pre-header writer, below) must not answer for it.
+        for label, hdr in (("no read instant", "#claim-snapshot\n"),
+                           ("non-numeric read instant", "#claim-snapshot\tsoon\tok\t1\n"),
+                           ("three-field header", "#claim-snapshot\t%d\tok\n" % NOW_S)):
+            cr = cl.read_snapshot(snap(hdr + row), max_age_s=600, host=HOST, now=NOW_S, pr="5")
+            check(cr.readable is False, "a header with %s must abstain; got %r"
+                  % (label, cr.detail))
+        cr = cl.read_snapshot(snap(row + "#claim-snapshot\t%d\tok\t1\n" % NOW_S),
+                             max_age_s=600, host=HOST, now=NOW_S, pr="5")
+        check(cr.readable is False, "a header that is not the FIRST line is shape drift")
+
+        # The pre-header writer keeps working on the mtime — that fallback is for an OLD writer.
+        legacy = write_snapshot(d, row)
+        cr = cl.read_snapshot(legacy, max_age_s=600, host=HOST, now=NOW_S, pr="5")
+        check(cr.readable is True and len(cr.claims) == 1,
+              "a header-LESS snapshot from an older writer still reads; got %r" % (cr.detail,))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L28 — CROSS-LANGUAGE PIN: the file claims.sh WRITES is the file this reads
+# ══════════════════════════════════════════════════════════════════════════
+@test("L28 the SHIPPED claim_snapshot's output reads back here (#2534 review P1)")
+def l28_shell_written_snapshot_reads_back():
+    """The only pin that makes this class self-identifying: run the real writer.
+
+    Every fixture in this file is hand-written, so it can drift from the shape the shell
+    actually publishes — which is exactly how a 4-field header shipped past a 3-field
+    reader with this suite 26/26 green. Here the bytes come from `claim_snapshot` itself.
+    """
+    live_until = int(time.time()) + 1800
+    with bare_remote([("refs/claims/5-abcdef123456", "%s:1" % OTHER_HOST, str(live_until))]) as remote:
+        # `claim_snapshot` fetches from a remote named `origin`, so the fixture must be a checkout
+        # whose origin IS the registry — a bare path with no remote makes the fetch fail, which is
+        # the one shape that publishes a `failed` header (pinned separately in L27).
+        with work_repo(remote) as work:
+            d = tempfile.mkdtemp(prefix="claims-xlang-")
+            try:
+                snap = os.path.join(d, "claims-snapshot")
+                driver = os.path.join(d, "snapshot.sh")
+                with open(driver, "w", encoding="utf-8") as fh:
+                    fh.write("set -eu\n"
+                             'CLAIM_REPO="$1"\n'
+                             'CLAIM_OWNER_HOST="$3"\n'
+                             '. "$2"\n'
+                             'claim_snapshot "$4"\n')
+                proc = subprocess.run(["bash", driver, work, CLAIMS_SH, HOST, snap],
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                check(proc.returncode == 0,
+                      "claim_snapshot failed: %s" % proc.stderr.strip())
+                with open(snap, "r", encoding="utf-8") as fh:
+                    written = fh.read()
+                check(written.startswith("#claim-snapshot\t"),
+                      "the writer's first line must be the header; got %r" % written[:80])
+                cr = cl.read_snapshot(snap, max_age_s=600, host=HOST, pr="5")
+                check(cr.readable is True,
+                      "the file the SHIPPED writer publishes must be READABLE by the reader "
+                      "that documents it; got %r" % (cr.detail,))
+                check(len(cr.claims) == 1 and cr.claims[0].key == "5-abcdef123456",
+                      "and the claim the shell fetched is the claim this reads; got %r"
+                      % ([c.key for c in cr.claims],))
+                check(cr.claims[0].scope == "foreign",
+                      "the holder is another box, read from the shell's own owner stamp")
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # The mutation map: each entry reintroduces the defect its test catches.
 # ══════════════════════════════════════════════════════════════════════════
 class Mutation:
@@ -1178,6 +1306,28 @@ class Mutation:
 
 
 MUTATIONS = [
+    Mutation(
+        "L27", "reader",
+        '        if raw.startswith(SNAPSHOT_HEADER):',
+        '        if False:',
+        "the pre-fix reader returns: the writer's 4-field header is parsed as a 3-field "
+        "row, so EVERY real snapshot is SHAPE DRIFT and the fleet reads claims-unreadable "
+        "for ever (a phantom UNREADABLE, the mirror of a phantom FREE)",
+    ),
+    Mutation(
+        "L27", "reader",
+        '            if fetch == "failed":',
+        '            if False:',
+        "a FAILED fetch is believed: its rows are the last good read, so a released claim "
+        "still reads held and a live peer's new claim is invisible",
+    ),
+    Mutation(
+        "L27", "reader",
+        '            if age < 0:',
+        '            if False:',
+        "a future read instant is CLAMPED to fresh instead of dropped, so the further ahead "
+        "the stamp, the longer it is believed — with no age bound at all",
+    ),
     Mutation(
         "L1", "reader",
         '    return until, ("live" if now <= until else "expired")',
@@ -1216,16 +1366,16 @@ MUTATIONS = [
         '    except OSError as exc:\n'
         '        return liveness.ClaimRead(readable=False, present=False, claims=(), source=source,\n'
         '                                  detail="snapshot unreadable: %s" % sanitize(exc))\n'
-        '    age = now - int(st.st_mtime)',
+        '    mtime_age = now - int(st.st_mtime)',
         '    except OSError as exc:\n'
         '        return liveness.ClaimRead(readable=True, present=False, claims=(), source=source,\n'
         '                                  detail="snapshot unreadable: %s" % sanitize(exc))\n'
-        '    age = now - int(st.st_mtime)',
+        '    mtime_age = now - int(st.st_mtime)',
         "a MISSING snapshot reads as a successful empty read — absence inferred as freedom",
     ),
     Mutation(
         "L7", "reader",
-        '    if age > float(max_age_s):',
+        '    if not header_seen and mtime_age > float(max_age_s):',
         '    if False:',
         "the staleness bound is ignored, so an arbitrarily old snapshot decides",
     ),

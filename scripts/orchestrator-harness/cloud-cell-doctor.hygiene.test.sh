@@ -167,8 +167,29 @@ chmod +x "$T/bin/tmux" "$T/bin/uv" "$T/bin/docker" "$T/bin/sup" "$T/bin/ps" "$T/
 
 # ── the environment the doctor runs under ───────────────────────────────────────────────────────
 # EVERY seam is set explicitly: an ambient value in the caller's shell must not be able to change a
-# verdict, and nothing here may reach the host's /tmp, docker daemon or uv cache.
+# verdict, and nothing here may reach the host's /tmp, docker daemon, uv cache or git remote.
 export PATH="$T/bin:$PATH"
+# ⛔ THE REVIEW-REGISTRY SYNC IS PINNED OFF, AND IT IS WHY THIS SUITE USED TO COST OVER AN HOUR (#2483).
+# `run_hygiene`'s step 6 calls `registry-sync.sh union` — a REAL network git sync — and this fixture
+# set every seam EXCEPT this one. `registry_store_hub` accepts any checkout whose `origin` looks like
+# agent-infra, and `$SELF_DIR/../..` IS the real agent-infra checkout, so every live pass left the
+# sandbox: it provisioned `<checkout>/.worktrees/registry-sync` and could not converge from a test
+# fixture, so the sync never returned and `bounded`'s watchdog killed it at `REGISTRY_STEP_TIMEOUT` —
+# measured 300.4 s, on EVERY pass, because that bound is per-sub-step and not per-arm. Measured on a
+# live CI shard: the step was killed at 70 min 23 s with twelve 300 s gaps between an arm's header and
+# its ✅, and ~60 of those 70 minutes were this one wait.
+# ⛔ THIS PIN IS THE SIBLING SUITE'S OWN DOCTRINE, not a new idea: `cloud-cell-doctor.test.sh` sets this
+# same line "HERMETIC BY DEFAULT" (:276-281, which measured the same "300 s real fetch"), and that
+# suite OWNS the wiring contract — a real local bare store, the provisioned worktree, `--dry-run` not
+# writing, and a failed sync leaving the pass successful (:990-1097). This fixture names the registry
+# exactly once, in a COMMENT, and asserts no sync outcome; it cannot, because `sync_registry` is
+# best-effort by design and never touches `$h_rc`. So the pin removes waiting, not a gate.
+# ⛔ `off` returns BEFORE `registry_sync_path`/`registry_store_hub`, so `AGENT_INFRA_PATH`,
+# `HARNESS_PIN_DIR` and `$HARNESS_REPO`'s registry candidate are never consulted — the two extra
+# neutralisations the sibling needs for those are moot here. ⛔ Do NOT delete this line to "cover the
+# registry here": that re-arms a live network write against the operator's real checkout and puts the
+# 300 s back on the shard's budget.
+export DOCTOR_REGISTRY_SYNC=off
 export CELL_HOME="$T/home" O="$T/o" REPO="$T/repo" OR="" SESSION="hygiene-test-$$"
 export DOCTOR_TMUX_BIN="$T/bin/tmux" DOCTOR_TEST_TMUX="$T/tmux"
 export DOCTOR_DOCKER_BIN="$T/bin/docker" DOCTOR_TEST_DOCKER="$T/docker"

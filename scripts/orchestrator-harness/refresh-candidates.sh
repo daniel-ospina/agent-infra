@@ -973,17 +973,15 @@ gh_env_verdict() {
 # being wrong differs: refusing costs one PR's merge, certifying a free issue costs duplicated work
 # on two boxes.
 #
-# ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
-# through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
-# seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
-# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT the bare `cp` this comment used
-# to prescribe: depth-1 `*.sh` leaves `gh-limit/gh`, `gh-limit.py` and `retired/*` behind, which is the
-# #2041 shape. `install.sh` is not the answer either — it REPORTS drift rather than installing, and the
-# remedy it prints is now this same helper), so a deployed cell has it; a
-# box without it cannot take the claim either, and refusing to queue on a missing FILE would make
-# every such box merge-only — a bigger, less reversible failure than the state being removed.
-# Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a
-# provisioning failure (rc=3 below), because that one is local, permanent, and fixable in seconds.
+# MISSING IS REFUSED TOO — agent-infra#2466 REVERSED THE OLD "loud fallthrough" (2026-10-23). The old
+# rule let a box with NO registry file keep dispatching, unclaimed, on the argument that making a
+# missing file refuse would turn such a box merge-only. Two things changed that: (a) the PR path now
+# abstains on an unreadable registry as well, so the cell is not "merge-only" — it is silent, and this
+# change makes the silence announced with the one-line remedy; and (b) the fallthrough was not loud in
+# the place that matters: `issue_claim_verdict` ALREADY returned INCOMPLETE for a missing file, and the
+# call site simply did not ask it. So missing, unreadable and PRESENT-BUT-STALE are one polarity
+# (refuse), and `--check` refuses them up front. The migration cost is one command, named in the log
+# line and in `--check`'s output; the cost of the old behaviour was two lanes on one issue.
 # ⛔ THE REGISTRY PATH IS NOT READ FROM THE ENVIRONMENT (2026-10-16 review). `CLAIMS_SH` was a
 # regression-test seam, but three production callers had begun to honour it, which let an ambient
 # value resolve a DIFFERENT registry in each of them — a gate half-disabled by the environment, the
@@ -1221,9 +1219,15 @@ cmd_check() {
     fi
     echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
   else
-    # NOT a failure: the documented loud fallthrough (issue_claim_verdict's STATED LIMIT). The box
-    # dispatches, without the cross-box gate, and says so — the same verdict the refresh reaches.
-    echo "[refresh] check: claim registry=$O/claims.sh absent — the refresh will WARN per issue and dispatch without a cross-box claim"
+    # ⛔ A MISSING REGISTRY IS NOT A PASS (agent-infra#2466). This arm used to certify the cell and say
+    # the refresh would "WARN per issue and dispatch without a cross-box claim" — a check blessing the
+    # exact state the run now refuses, i.e. a false PASS. The run path (`issue_claim_verdict`) answers
+    # INCOMPLETE for a missing file, and `--check` must refuse what the run refuses, so both name the
+    # same one-line remedy.
+    echo "[refresh] check: FAIL $O/claims.sh is absent — the cross-box claim registry is NOT INSTALLED"
+    echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE (claim-unreadable), so a cell on this repo would dispatch NOTHING"
+    echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
+    return "$EXIT_NOT_PROVISIONABLE"
   fi
   # ⛔ JUDGE THE INTERPRETER THE REFRESH WILL ACTUALLY USE. `--check` must not create the scout
   # worktree, but the venv it reads must be the one the run will find there. Reading
@@ -2841,20 +2845,22 @@ _ck_tmp="$O/.checked-decided.$$"
 : > "$_ck_tmp" || { echo "[refresh] ABORT: cannot write $_ck_tmp — the checked classification could not be persisted (#2183)"; exit "$EXIT_TRANSIENT"; }
   if [ ! -s "$O/state/checked-release-candidates" ]; then
     : # the classification ran and found EVERY entry justified: nothing to ask, nothing to release
-  elif [ ! -f "$O/claims.sh" ]; then
-    # ⛔ A BOX WITHOUT THE REGISTRY IS THE DOCUMENTED LOUD FALLTHROUGH (issue_claim_verdict's STATED
-    # LIMIT): it cannot take a claim either, so refusing to release would leave a suppression no
-    # reader on that box could ever justify. No network read happens here, so the cap does not apply.
-    echo "[reap] the claim registry ($O/claims.sh) is NOT INSTALLED — releasing on local facts only (documented fallback)"
-    # ⛔ AND THE LINE SAYS SO (review E, cycle 5): the claim read is the one fact this pass cannot
-    # answer locally, and a release made without it is indistinguishable on the operator line from a
-    # fully claim-checked one. `none` means "nothing was refused"; this uses its own value.
-    CHECKED_REFUSED="claim-registry-absent"
-    while IFS= read -r _n; do
-      case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
-      printf '%s\treleased\n' "$_n" >> "$_ck_tmp"
-    done < "$O/state/checked-release-candidates"
   else
+    # ⛔ A MISSING REGISTRY IS NOT A LICENCE TO RELEASE (agent-infra#2466, review P2). This branch used
+    # to hold an `elif [ ! -f "$O/claims.sh" ]` arm that released every candidate "on local facts
+    # only" and called it the documented loud fallthrough — citing `issue_claim_verdict`'s STATED
+    # LIMIT, a section the same change DELETED and replaced with "MISSING IS REFUSED TOO". So the arm
+    # acted on a policy that no longer existed anywhere, while the one-polarity rule it broke is
+    # stated three other places in this file (the `--check` arm, the walk's ICR=2 arm, the dispatch
+    # arm): missing, unreadable and stale are ONE polarity — refuse.
+    # The refusal is already implemented one branch below by the ask loop, which calls
+    # `issue_claim_verdict` unconditionally and maps its 2 (INCOMPLETE, the answer for a missing
+    # file) to `claim-unknown` → the suppression is KEPT and COUNTED. The arm above pre-empted it.
+    # ⛔ BUT THE OPERATOR LINE STILL SAYS IT (kept from that arm, review E cycle 5): the claim read is
+    # the one fact this pass cannot answer locally, so a pass that could not consult the registry
+    # must not be byte-identical on the line to one that did. `none` means "nothing was refused";
+    # this uses its own value. It records a REFUSAL now, which is what the slug always described.
+    [ -f "$O/claims.sh" ] || CHECKED_REFUSED="claim-registry-absent"
     _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
     # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
     # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the
@@ -3059,12 +3065,13 @@ _ck_tmp="$O/.checked-decided.$$"
     # an operator to a field that never moves.
     echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — every entry it did not record is counted as skipped_checked_unknown (the breakdown still sums, so reason_conflict cannot show this) rather than name a reason nobody verified"
   fi
-  # ⛔ `refused=` IS PUBLISHED HERE (review): the no-registry fallback above sets
-  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say a release was made WITHOUT the
-  # cross-box claim read — and nothing ever wrote it here, while the funnel's reader re-initialises the
-  # variable from THIS record. Measured before this line existed: `checked_refused=none` on a box with no
-  # `$O/claims.sh`, i.e. the one release that skipped the claim check was byte-identical on the operator
-  # line to a fully claim-checked one — the "a fact with no statement" defect this change exists to end.
+  # ⛔ `refused=` IS PUBLISHED HERE (review): the absent-registry arm above sets
+  # `CHECKED_REFUSED=claim-registry-absent` so the operator line can say this pass could not consult
+  # the cross-box registry — and nothing ever wrote it here, while the funnel's reader re-initialises
+  # the variable from THIS record. Measured before this line existed: `checked_refused=none` on a box
+  # with no `$O/claims.sh`, i.e. a pass that never read the claim registry was byte-identical on the
+  # operator line to a fully claim-checked one — the "a fact with no statement" defect this change
+  # exists to end.
   if printf 'released=%s deferred=%s unjustified=%s refused=%s sort_failed=%s at=%s\n' \
        "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${CHECKED_REFUSED:-none}" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
        > "$O/state/.checked-reap.$$" 2>/dev/null \
@@ -4158,30 +4165,30 @@ while read -r N; do
         # the block's own rule is that neither line may claim an action this script did not take. The
         # reset makes the guarantee local: an empty reason can only come from THIS candidate.
         CLAIM_RESULT=''
+        # ⛔ A MISSING REGISTRY IS `ICR=2` (INCOMPLETE, never CLEAN) — agent-infra#2466. This call used
+        # to sit behind `if [ -f "$O/claims.sh" ]`, so an UNPROVISIONED box left `ICR=0` and QUEUED the
+        # issue: the one case the old note called a "documented loud fallthrough" was in fact a silent
+        # fail-open in the only place this block declares it never fails open, and it is the shape a
+        # second cell hits when it was never provisioned — the exact duplicate dispatch the issue claim
+        # exists for. `issue_claim_verdict` already answers 2 for a missing file, so the fix is to ASK
+        # it rather than to decide for it: one verdict, no second path. The cost is that an
+        # unprovisioned box queues nothing until the one-line remedy in `--check` is run.
+        #
         # ⛔ NO "MISSING READER" GUARD IS NEEDED HERE, and a guard was removed rather than kept (review,
         # F1): this loop body is also driven STANDALONE by selftest.sh, where `issue_claim_verdict` is
         # not defined and the call returns 127 — but the `case` below NAMES its CLEAN arm and sends
-        # every unrecognised code to `*)`, which is INCOMPLETE and queues nothing. The removed guard
-        # claimed that 127 "therefore QUEUES"; the `*)` arm forbids exactly that (#1853 review: "only
+        # every unrecognised code to its default, which is INCOMPLETE and queues nothing. The removed
+        # guard claimed that 127 "therefore QUEUES"; that arm forbids exactly that (#1853 review: "only
         # an explicit 0 queues"). It changed the log text only, so it is not restored: a line that
         # claims an invariant the adjacent code already holds is the class this file refuses.
-        # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE on the ordinary CLEAN path — the documented loud
-        # fallthrough (see issue_claim_verdict's STATED LIMIT), and the only case in which a box
-        # without the registry keeps dispatching. It is NOT a verdict: the branch below announces it
-        # every time. It is NOT tolerated when the registry is the ONLY authority left: if the board
-        # could not answer either, nothing has answered the holder question (HOLDER_BY_CLAIMS), so the
-        # fallback below turns it into ICR=2 instead.
-        if [ -f "$O/claims.sh" ]; then
-          # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
-          # condition's status surviving into the else branch.
-          # (A reader that does not exist is the `*)` arm's job, not a special case: 127 is an
-          # unrecognised verdict, so it is INCOMPLETE and never queues.)
-          issue_claim_verdict "$N"; ICR=$?
-        elif [ "${HOLDER_BY_CLAIMS:-0}" = 1 ]; then
-          ICR=2; CLAIM_RESULT="the pre-flight's holder surface could not answer and the cross-box claim registry ($O/claims.sh) is NOT INSTALLED"
-        else
-          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)"
-        fi
+        #
+        # ⛔ AND IT SUBSUMES THE `HOLDER_BY_CLAIMS` ARM THAT STOOD HERE (merge of main's #1853 work with
+        # #2466): that arm spelled the same refusal out by hand (`[ -f "$O/claims.sh" ]` … `elif
+        # HOLDER_BY_CLAIMS=1` … else). One unconditional call reaches all three outcomes from ONE
+        # verdict — a present registry answers, a missing file answers 2, a missing READER answers 127
+        # and falls to the default — so the hand-written arm was a second path to the same answer and
+        # is deleted rather than kept beside it.
+        issue_claim_verdict "$N"; ICR=$?
         # ⛔ THE CLEAN ARM IS NAMED, NOT THE WILDCARD (2026-10-16 review). `case 1) … 2) … *) CLEAN`
         # read EVERY other code — 127 from a missing function, and any code a foreign or future
         # registry might return — as CLEAN and queued the issue: fail-OPEN, in the one place this

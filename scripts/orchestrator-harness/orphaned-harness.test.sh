@@ -10,6 +10,8 @@
 #   OH5  a stock OS unit (dbus) is never read as an orphan
 #   OH6  a harness unit on an existing durable path is NOT named
 #   OH7  when NEITHER surface can be read, the report exits 2 (never a false "nothing to report")
+#   OH8  a just-spawned session (no `pi` descendant YET) is NOT named — the floor's too-young side
+#   OH9  a session 300 s old is NOT named — a floor lowered to five minutes or less is caught
 #
 # Mutations (same shape as claim-action-proof.test.sh) revert each judgeable rule in a temp copy
 # and require the paired case to go RED, proving the rule is load-bearing.
@@ -91,6 +93,7 @@ run_report() {
 NOW="$("$REAL_DATE" +%s)"
 OLD=$((NOW - 1000))   # 1000 s old -> past MIN_SESSION_AGE_S (600): reportable
 NEW=$((NOW - 5))      # 5 s old -> still launching: must NOT be named
+MID=$((NOW - 300))    # 300 s old -> not named unless the floor drops to 5 min or less
 
 # ── OH1/OH2: dead lane named with its PR, live lane not named ──────────────────────────────
 # sessions: "name created"; panes: "name pane_pid"; procs: "pid comm ppid".
@@ -108,6 +111,59 @@ if grep -q 'name=merge-10091' <<< "$OH12"; then
   bad "OH2 a live harness lane (live pi descendant) is NOT named"
 else
   ok "OH2 a live harness lane (live pi descendant) is NOT named"
+fi
+
+# ── OH8: THE FLOOR IS A TRUE FLOOR — a just-spawned session is NEVER named ─────────────────
+# `NEW` (5 s old) is the shape of a worker that has been spawned and is still launching its agent: it
+# has no `pi` descendant YET. Naming requires BOTH `dead` (NO live `pi` descendant) AND age >= the
+# floor, so without a floor this LAUNCH window — from spawn until `pi` exists, not the whole 600 s —
+# would be reported as an orphan, exactly when an operator is hunting the real orphans. (A lane that HAS
+# spawned `pi` is not named at any age: OH2's 1000 s-old live session is never named. The 600 s is a
+# GRACE, and the other window it covers is a session whose agent has already exited — that one is
+# genuinely dead, merely between incarnations.)
+# ⛔ WHY THIS ARM EXISTS: `NEW` was computed and documented from the day this suite landed, but no
+# case ever drove it, so only the PAST-the-floor direction was asserted and a floor lowered to 0 —
+# which reports a freshly-spawned lane during that launch window — stayed green (agent-infra#2788).
+write_scen \
+  "merge-10092 $NEW\n" \
+  "merge-10092 300\n" \
+  "300 bash 0\n" \
+  "" ""
+OH8="$(run_report)"
+if grep -q 'name=merge-10092' <<< "$OH8"; then
+  bad "OH8 a just-spawned dead-looking session (younger than MIN_SESSION_AGE_S) is NOT named"
+else
+  ok "OH8 a just-spawned dead-looking session (younger than MIN_SESSION_AGE_S) is NOT named"
+fi
+
+# ── OH9: THE FLOOR'S MAGNITUDE — a floor lowered to five minutes or less is caught ────────
+# OH8 (5 s) and OH1 (1000 s) bracket the floor by a factor of 200, so a floor lowered to 60 — still
+# "a minute of grace" — passed both. What a small floor actually shortens is the GRACE: it names a
+# session with NO live `pi` from its 60th second instead of its 600th. The launch window — from spawn
+# until the agent exists — is OH8's territory (it is short, but not the floor's business); the window a
+# 60 s floor newly reports is the lane whose agent has already exited — genuinely dead, merely between
+# incarnations — the same unreadable-report failure at a smaller scale. MID (300 s) closes that gap.
+# ⛔ WHAT THIS CASE DOES AND DOES NOT PIN, stated because it is easy to over-claim: the fixture is armed
+# at `NOW - 300` from `$REAL_DATE`, while the report reads its OWN clock at read time (`session_age_s`
+# runs `date +%s`) — and BOTH truncate to whole seconds. So the age the report sees is `300` when the
+# read lands in the same wall-clock second as the arm (the common case: this suite reaches OH9 in well
+# under a second), or `300 + elapsed` once a whole second has passed; it is never a fixed number. That
+# same-second case is exactly the one only `-ge` catches — a 300 s floor names the fixture and OH9 reds,
+# where `-gt` would let it through. So OH9 catches any floor of 300 or less ALWAYS, and a floor of 301
+# whenever at least one second has elapsed — a 301 s floor would make the case time-dependent, not
+# reliably green. It pins the floor's MAGNITUDE (> 5 min), never the exact 600; the exact value is pinned
+# by the registry's `value` field, in the `MIN_AGE` row's precedent. A fixture 599 s old could not pin an
+# integer boundary without flaking, because the clock moves between arming and reading (agent-infra#2788).
+write_scen \
+  "merge-10093 $MID\n" \
+  "merge-10093 400\n" \
+  "400 bash 0\n" \
+  "" ""
+OH9="$(run_report)"
+if grep -q 'name=merge-10093' <<< "$OH9"; then
+  bad "OH9 a session 300 s old (well inside a ten-minute floor) is NOT named"
+else
+  ok "OH9 a session 300 s old (well inside a ten-minute floor) is NOT named"
 fi
 
 # ── OH3/OH4/OH5/OH6: unit signals ───────────────────────────────────────────────────────────
@@ -183,6 +239,20 @@ PY
       '    if [ ! -e "$path" ]; then' \
       '    if false; then' \
       "orphan:kind=unit name=eldato-dead.service"
+  # M3: the COMPARISON, not the default's value — replace the floor OPERAND with a literal past every
+  # fixture and the old dead lane must stop being named. M1 shows the clause is load-bearing; M3 shows
+  # the comparison is, with the clause intact. NEITHER mutant reads the default: a floor lowered to 0
+  # or 60 leaves M3 green (measured, #2788). The registry's `value` fragment is what pins the NUMBER;
+  # this suite only BOUNDS it, and the UPPER bound moves with the clock: OH9 reds at any floor of 300
+  # or less, while OH1 reds only at a floor above `1000 + elapsed` (its 1000 s fixture is read at OH1's
+  # own clock — the same truncation as OH9) — so the bound is `(300, 1000 + elapsed]`, and a floor of
+  # 500 passes every arm (1000 + elapsed >= 500 names OH1's lane, while 5 and 300 stay below it).
+  # Stated so the bound is not read as a value pin, matching the `MIN_AGE` row's precedent and this
+  # row's own `guardedBy` at heartbeat-progress-edges.ts:1385.
+  mut "M3-age-floor" \
+      '"$age" -ge "${MIN_SESSION_AGE_S}"' \
+      '"$age" -ge 1000000000' \
+      "orphan:kind=tmux name=merge-10090"
 
   rm -rf "$mut_dir"
 }

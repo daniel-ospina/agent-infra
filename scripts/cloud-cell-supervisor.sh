@@ -2265,6 +2265,48 @@ cmd_check() {
   # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
   [ -f "$HARNESS/refresh-candidates.sh" ] \
     || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
+  # ── the LANE ROSTER, provisioned from THIS box's own population (agent-infra#1935) ────────
+  # The probe below answers "can this repo be pre-flighted?" and its holder surface is built FROM
+  # `$HOME/.pi/agent/state/lane-registry.tsv` — written only by the RETIRED cmux dispatcher, so a
+  # cell had none and EVERY candidate came back INCOMPLETE while the controller reported RUNNING
+  # (measured on cell 1, 2026-10-28). `check` is the last gate before a cell is started, so the
+  # roster is provisioned HERE, from the box's own lane population, and the arm it took is printed.
+  # ⛔ THIS `check` VERB WRITES, DELIBERATELY AND IN THE OPEN (#3032 review F7). It is the last gate
+  # before a cell is started, so a check that only REPORTED an unprovisioned roster would leave the
+  # cell dispatching nothing — the #1935 defect. The write is idempotent and non-destructive (a
+  # hand-maintained roster is never replaced; an existing derived roster is never shrunk by an arm
+  # that measured nothing) — the provisioner's own rules, pinned in its suite.
+  # ⛔ Idempotent and non-destructive: a hand-maintained roster is never replaced, and a second run
+  # on an unchanged box writes nothing (the provisioner's own rules, pinned in its suite).
+  # ⛔ A REFUSAL (rc 3) is REPORTED, not fatal: it means this box's population could not be
+  # MEASURED, which the harness's reduced-surface path (#2848) can still dispatch through. Failing
+  # the cell here would be a false block; writing an empty roster instead would be the fail-open
+  # that #8175 exists to prevent, and the provisioner refuses to do it.
+  # ⛔ NO INTERPRETER GUARD HERE, and that is not an omission: `cmd_check`'s dependency loop above
+  # (`for dep in git python3 pi`) has already died when `python3` is missing, so a `127` from the
+  # provisioner at this point can only mean the tool itself failed — which is what the arm below
+  # says. The BRING-UP site needs the guard because its check_dispatch has no such loop.
+  if [ -f "$HARNESS/provision-lane-registry.py" ]; then
+    local rv rvrc
+    rv=""; rvrc=0
+    rv="$(HOME="$CELL_HOME" python3 "$HARNESS/provision-lane-registry.py" --apply 2>&1)" || rvrc=$?
+    printf '%s\n' "$rv" | sed 's/^/    /'
+    if [ "$rvrc" -eq 3 ]; then
+      log_line "warn: lane roster NOT provisioned — the population is unmeasurable on this box (see above); the pre-flight's holder surface will refuse candidates until it is (agent-infra#1935)"
+    elif [ "$rvrc" -ne 0 ]; then
+      # ⛔ A CRASH IS NOT A PROVISION (review finding 2). The provisioner's documented exits are
+      # 0/2/3; anything else (rc 1 from an uncaught OSError in the atomic write on a full disk or
+      # a read-only $HOME — exactly what MIN_FREE_MB exists for, a traceback, rc 127) used to land
+      # in the arm below and print `ok: provisioned`, i.e. a false PASS on the one line this
+      # change adds to the start gate. Same shape as scheduler_ensure below: rc 3 is the tool's
+      # OWN refusal, any other non-zero is reported as what it is.
+      log_line "warn: lane roster provisioning FAILED (rc=$rvrc — not the tool's own refusal, so it crashed); the roster is in an UNKNOWN state and the pre-flight's holder surface may stay INCOMPLETE (agent-infra#1935)"
+    else
+      log_line "ok: lane roster — provisioned from this box's own population (agent-infra#1935)"
+    fi
+  else
+    log_line "warn: $HARNESS/provision-lane-registry.py missing — the lane roster cannot be provisioned, so the pre-flight's holder surface will refuse every candidate (agent-infra#1935)"
+  fi
   local pv pvrc
   pv=""
   pvrc=0
@@ -3494,13 +3536,14 @@ cmd_status() {
     log_line "restart: $(sed 's/^restart //' "$_rq" 2>/dev/null)"
     case "$(cat "$_rq" 2>/dev/null)" in
       # ⛔ `blocked=identity` IS ITS OWN CAUSE, AND IT COMES FIRST. The generic blocked arm below says
-      # "something this box can see would be interrupted" — but `harness-refresh.sh` writes
-      # `pending=unprovable … actuation=blocked blocked=identity lanes=unknown` when the running identity
-      # is a CLAIM. Nothing was measured busy there, so the generic sentence names a cause that does not
-      # exist and tells the operator to wait for a population that may never exist — the misdirection this
-      # change exists to remove.
+      # "something this box can see would be interrupted" — but on the `blocked=identity` path
+      # `harness-refresh.sh` returns from `set_pending` BEFORE `inflight_gate` is ever consulted, so no
+      # population was measured as the BLOCKER: the record's `lanes=` is still written (it is measured
+      # separately and may be non-zero) but it is not why the request is blocked. The identity is. So the
+      # generic sentence names a cause that does not exist and tells the operator to wait for a population
+      # that may never be the thing holding the restart back — the misdirection this change exists to remove.
       *'request=pending'*'blocked=identity'*)
-        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. Nothing is interrupted and nothing is waiting: re-check once the controller's argv/lock is readable." ;;
+        log_line "a restart is PENDING but was NOT certified needed — the running identity cannot be PROVEN (it comes from the stamp/claim, not from the live controller), and acting on an unproven premise is how a refresh becomes an incident. The block is the IDENTITY, not a busy population: nothing was measured as the blocker, and no population is waiting on this. Re-check once the controller's argv/lock is readable." ;;
       *'request=pending'*'actuation=blocked'*)
         log_line "⛔ a restart is PENDING and was NOT applied — something this box can see would be interrupted (named in blocked=/lanes= above). Actuator: '$0 stop && $0 apply && $0 start', or merge-reminder.py's deploy arm, once that population is idle." ;;
       *'request=pending'*'actuation=safe'*)
@@ -3544,12 +3587,41 @@ cmd_status() {
     _drs="$(bash "$_dr" --print-status 2>/dev/null)"; _drc=$?
     _dst="$(printf '%s\n' "$_drs" | sed -n 's/^status=//p' | head -1)"
     _det="$(printf '%s\n' "$_drs" | sed -n 's/^detail=//p' | head -1)"
+    # ⛔ THE DELEGATE'S OWN VERDICT, ON EVERY ARM (#3041 review, P2). An ineffective reap EXITS 0 by
+    # design, so `ok=1 rc=0` is the correct exit-code reading of the exact pass the #3041 incident was
+    # read from — `worktree=<MB>` and nothing else WAS the incident's misleading sentence. The reaper
+    # records the real answer as `delegate_verdict_worktree=`; a field the reader does not print does
+    # not exist. Printed WHENEVER IT CARRIES INFORMATION (`ok`/`?`/`not-run`/absent stay silent, so a
+    # genuinely healthy cell gains no noise).
+    #
+    # ⛔ THE SILENT SET IS THE BENIGN SET, NOT "OK-LIKE" SPELLINGS (#3058 review, P2). The delegate's
+    # vocabulary is the pass verdict this file's own sibling defines — `dry-run|reclaimed|idle|`
+    # `reap-ineffective|unmeasured` (pi-reap-worktrees.sh:642) plus TWO disagreement spellings at the
+    # entry point (disk-reaper.sh's `_dclass`): `mixed` when two ALARM answers disagree, and
+    # `mixed-benign` when two ordinary ones do. Only the alarm class is the ⛔, and every member of it
+    # is reprinted by a headline above: `reap-ineffective` (an armed pass that reclaimed nothing),
+    # `unmeasured`, and `mixed` (two alarm answers — the cell cannot say which). `dry-run`, `reclaimed`,
+    # `idle` and `mixed-benign` are the ORDINARY readings of a healthy pass — `dry-run` is even the
+    # shipped default (disk-reaper.sh:167), so a `ok`-only silent set painted ⛔ worktree-delegate=dry-run
+    # onto every pass of every cell that has not armed the reaper, and `idle` onto every armed pass with
+    # nothing to reclaim.
+    # ⛔ `mixed-benign` MUST STAY SILENT, AND THAT IS NOT A FAIL-OPEN (#3058 review, P1): the aggregator
+    # already lifted any ALARM answer out of the disagreement, so by the time this token is printed there
+    # is provably no alarm behind it. If it were printed instead, every healthy multi-repo cell — one
+    # repo with something to reclaim, one with nothing — would print a ⛔ on every pass.
+    # ⛔ The ⛔ is the operator's alarm channel, and the defect it creates is the one this same file
+    # names ten lines below for the ⏸ symbol: a glyph seen on healthy cells is a glyph the operator has
+    # been trained to skip, so the one line that MUST be read — `⛔ worktree-delegate=reap-ineffective`
+    # — is exactly what gets skipped. Polarity is therefore FAIL-LOUD: an unrecognised spelling (a new
+    # verdict added to the reaper and not taught to this reader) is printed, never swallowed.
+    _dr_del="$(printf '%s\n' "$_drs" | sed -n 's/^delegate_verdict_worktree=//p' | head -1)"
+    _dr_del_note() { case "${_dr_del:-}" in ''|ok|'?'|not-run|dry-run|reclaimed|idle|mixed-benign) printf '' ;; *) printf ' ⛔ worktree-delegate=%s' "$_dr_del" ;; esac; }
     if [ "$_drc" -eq 0 ]; then
             # ⛔ THE UNIT IS CONDITIONAL. A per-class field may read `unmeasured` (df could not answer),
             # and the old format appended a hardcoded MB to it — `uv=unmeasuredMB` reads as a byte count
             # to every consumer. Numeric values keep their unit; the sentinel is printed as it stands.
             _dr_mb() { case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}" ;; *) printf '%sMB' "$1" ;; esac; }
-            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))"
+            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))$(_dr_del_note)"
     elif [ "$_dst" = "never" ]; then
       log_line "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
     elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
@@ -3566,10 +3638,10 @@ cmd_status() {
       # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
       # the channel here — which is why it must not go quiet.)
       log_line "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
     else
       log_line "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
     fi
   fi
   # the loop's own view of itself

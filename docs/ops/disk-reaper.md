@@ -395,6 +395,37 @@ patch-ids against all of main's history (a reverted change still matches, and
 whitespace is ignored) and says nothing about whether any ref still holds the
 commit. Multi-commit squash merges do not match either, so they stay on the floor.
 
+**The survival allowlist has exactly ONE remove-eligible exception: `remote-holds` (#3041).**
+Survival is an **allowlist** — only `refs/heads/*` counts — because a remote-tracking,
+tag, stash or bisect ref is revocable by routine commands (`fetch --prune`,
+`fetch --prune-tags`, `stash drop`, `bisect reset`) and the commit would then be on
+nothing. That rule is right, and on its own it is **over-conservative against the remote
+itself**: a tip that was pushed and whose branch still exists on the remote is
+restorable with one `git fetch`, yet the allowlist preserved it for ever. The measured
+cost (pi-cell-4, 2026-10-29): `examined=52 classified=52 remove=0 preserved=52`, the box
+at **0 bytes free**, both repair loops at `cap: 0`, no cell able to dispatch for ~13 h;
+an operator then reclaimed 62 clean checkouts (7.7 GB) by hand, losing no commits.
+
+So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when a
+bounded `git ls-remote --heads <remote> refs/heads/<branch>` answers with **exactly this
+HEAD sha**. The advertised refname is matched literally and exactly once (⚠️ because `ls-remote`
+matches a pattern against the ref's **tail, from any slash separator**, so `refs/heads/<b>` also selects
+an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metacharacters: `check-ref-format`
+rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
+remote is the **longest configured remote name** prefixing the ref, not the first path
+segment (a remote name may contain a slash). Any failure, timeout, empty answer, unadvertised
+refname or different sha leaves the verdict where it was — `remote-only-ref`, PRESERVE — and a
+TRANSPORT failure is remembered for the rest of the pass so a dead remote costs one timeout,
+not one per candidate. The row is `remote-holds:<remote>/<branch>`, and — like
+`remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
+only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref),
+so the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that
+becomes prunable mid-pass, after a snapshot that saw it present) is closed for **every** reason by the
+reason-independent pre-prune re-read. Blocking on the reason instead would disable the `prunable`
+reclaim path for as long as ONE preserve row lives — `no-pr`, `too-recent` and `too-young` rows carry
+`refs=remote-holds:` too, for up to the whole aged-days floor — which is the F7 defect one reason
+class over. A26c pins both arms (the `reason=` REMOVE row and the `refs=` PRESERVE row).
+
 A lane **scratch** checkout — a directory whose basename matches
 `REAP_WT_SCRATCH_GLOB` (default `wt-*|cell-wt-*`) — has its floor **capped at**
 `REAP_WT_SCRATCH_AGE_DAYS` (default `1`): a dead lane's throwaway dir is not a
@@ -540,7 +571,7 @@ degraded, exclusion holds only against passes that resolved the same state dir.
 ```
 mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
-verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
+verdict_uv=deferred verdict_venv=ok verdict_worktree=ok delegate_verdict_worktree=reap-ineffective
 would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
 skipped_worktree=/tmp/cell-ai[gh-not-authenticated(rc=4)]
 freed_mb_unmeasured=
@@ -573,11 +604,85 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<n> deferr
         removed=<n> failed=<n> late_preserved=<n> prune_blocked=<0|1> reasons=<reason>:<n>,…
         main_proof=<auto|local|unavailable|auto-unfetched|ambiguous>
         main_ref=<refs/heads/…|refs/remotes/…|?> pr_merged=<ok|na|unavailable>
+        verdict=<dry-run|reclaimed|idle|reap-ineffective|unmeasured>
 ```
 
+⛔ **`verdict=` is the pass's own ANSWER, and the counters alone cannot supply it (#3041).** A pass
+can be perfectly self-consistent (`examined=52 classified=52 remove=0 preserved=52`) while reclaiming
+NOTHING on a box at 0 bytes free — pi-cell-4, 2026-10-29: that pass was the whole incident, and every
+number in it was true. So the pass must also say what its numbers MEAN:
+
+| `verdict=` | condition |
+|---|---|
+| `dry-run` | the pass was not armed — nothing may be removed, and that is the correct answer |
+| `reclaimed` | armed, and at least one checkout was removed |
+| `idle` | armed, removed nothing, and the **reason** is benign: free space is at or above the floor, or fewer than `REAP_WT_INEFFECTIVE_MIN_EXAMINED` records were **examined** (not *classified* — a budget-starved pass defers the rest, and deciding two of fifty-two while removing none on a full box is the incident, not an idle pass) |
+| `reap-ineffective` | armed, examined `>= REAP_WT_INEFFECTIVE_MIN_EXAMINED` (default 10) records, removed NONE, and free space is UNDER `REAP_WT_DISK_FLOOR_MB` (default 4096 MiB) — a reaper that cannot reclaim on a full box |
+| `unmeasured` | the condition depended on free space and `df` could not answer — **never** read as `idle` |
+
+⛔ **`reap-ineffective` also writes a durable record**, `$STATE_DIR/reap-ineffective.<repo>`, atomically
+(tmp + `mv`), carrying `verdict=`, `epoch=`, `repo=`, `mode=`, the counters, `free_mb=`, `floor_mb=`,
+`reasons=` and a one-line `remedy=`. A **summary line is not a verdict**: the line is gone when the
+next pass prints, and the incident is only visible afterwards if something durably said so. Any pass
+that **evaluated** the condition and found it not held REMOVES the file — so the record's presence
+means *the condition holds now*, not *it once held*; `unmeasured` deletes it too (a disk we could not
+read is not a disk we proved healthy).
+
+⛔ **ONE RECORD PER REPO, not one per state dir.** `disk-reaper.sh` runs the worktree delegate once per
+repo **with the same state dir**, so a single fixed filename is last-writer-wins ACROSS repos: an
+ineffective repo followed by any repo with room had its alarm erased by a pass that never looked at
+it — measured in a fixture. The path therefore carries the checkout's basename (readable) plus a
+`cksum` of its canonical path (unique, so two checkouts named alike cannot collide), and each record
+is owned by that repo's own pass. Presence means *THIS repo's condition holds, as of its `epoch=`*;
+sum the records to read the box. The residual, stated: dropping a repo from `DISK_REAPER_REPOS`
+leaves its last record behind, so compare `epoch=` rather than assuming the newest pass rewrote every
+file.
+
+⛔ **A `--dry-run` never touches the record.** It removes nothing by construction, so it has evaluated
+none of the live condition and cannot say whether the condition holds. This matters because
+`disk-reaper.sh` **defaults** to `DISK_REAPER_DRY_RUN=1`, so a "delete unless the verdict is
+reap-ineffective" rule let a routine dry run on a full cell erase the armed pass's alarm.
+
+A fail-closed abort evaluated nothing, so it neither writes nor deletes the file. ⚠️ **Not every abort
+prints a footer**: the `git worktree list` failure, the empty-list refusal, the unwritable-log refusal
+and the lock-held refusal exit 3 before a footer is reachable (the unwritable-log one cannot log
+anything at all), while the `gh` and `ps` aborts do print one — and where a footer is printed it
+carries `VERDICT=?`, never an empty field. ⛔ **A record that could
+not be WRITTEN says so** (log `record=NOT-WRITTEN`, and the pass states that the verdict exists only
+on its own line): this branch fires when free space is under the floor, i.e. exactly when `ENOSPC` is
+live, so a missing file is never evidence that the condition cleared. `REAP_WT_FREE_MB` (a witness)
+and `DF_BIN` are the test seams; the measured paths are `df -Pm <repo>` under `REAP_WT_DF_TIMEOUT`.
+
 — and the record lifts it into `candidates_worktree=` (the delegate's own `remove=`),
-`classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=` and
-`pr_merged=`. `examined = classified + deferred` and `classified = remove + preserved` are the two
+`classified_worktree=`, `preserved_worktree=`, `preserved_reasons_worktree=`, `main_proof=`,
+`pr_merged=` and `delegate_verdict_worktree=` (the delegate's own `verdict=`; it carries the same
+`?`/`not-run` vocabulary, but **not** `main_proof=`'s disagreement polarity — see below; it is printed
+by `--print-status` **and** on the cell health verb's
+per-class line (`scripts/cloud-cell-supervisor.sh`, `⛔ worktree-delegate=`) — a field the reader does not print
+does not exist, so a status channel that showed only `worktree=ok` for an ineffective reap was
+publishing the incident's own misleading sentence — and it is deliberately SEPARATE from
+`verdict_worktree=`, which stays the exit-code reading — an ineffective reap exits 0 by design, so
+without this field the fleet's record said `worktree=ok` for it).
+
+⛔ **A DISAGREEMENT IS NOT ONE THING, because this field feeds an ALARM.** `main_proof=` and
+`pr_merged=` collapse any disagreement to `mixed` and nothing reads that token. This field is printed
+with a ⛔ for every value outside the benign allow-list, so the same rule would mean two opposite
+things at once on the multi-repo shape (`DISK_REAPER_REPOS`, or `--repo` repeated):
+`reap-ineffective` + `idle` (**the alarm**) and `reclaimed` + `idle` (**two ordinary readings**) would
+both read `mixed`, painting a ⛔ onto healthy cells and making `⛔ worktree-delegate=reap-ineffective`
+unreachable. The aggregation therefore gives the **alarm class precedence** and spells the two cases
+differently (`scripts/disk-reaper.sh`, `_dclass`):
+
+| answers across repos | record | cell health verb |
+|---|---|---|
+| all agree | that answer | `ok`/`?`/`not-run`/`dry-run`/`reclaimed`/`idle` are silent; anything else prints ⛔ |
+| ordinary readings disagree (`reclaimed` + `idle`) | `mixed-benign` | silent |
+| an alarm answer, alone or beside any benign answer | **that alarm**, e.g. `reap-ineffective` | `⛔ worktree-delegate=reap-ineffective` |
+| two DIFFERENT alarm answers (`reap-ineffective` + `unmeasured`) | `mixed` | `⛔ worktree-delegate=mixed` — the only case where the cell cannot say |
+| a spelling this reader has not been taught | itself — the benign side is an allow-list | ⛔ (fail-loud) |
+
+The class is an ALLOW-LIST and not a deny-list for that last row: a verdict added to the reaper later
+must be SURFACED by a reader that was never taught it, never silently swallowed by one. `examined = classified + deferred` and `classified = remove + preserved` are the two
 identities, and a deferred REMOVAL is its own counter: an armed overrun defers a record whose verdict
 was already `remove`, so folding it into `deferred` would deflate `preserved` and make the line
 contradict itself. `main_proof=` names which source proved "merged into main" (`auto` = the remote
@@ -845,14 +950,25 @@ spawns passed `DISK_MIN_FREE_MB=500`, because a floor answers "is the filesystem
 is 4.5x that floor. `spawn-gate.sh`'s `run_agent` now also applies a **headroom** gate:
 
 ```
-ADMIT  iff  free_mb >= tree_mb + reserve_mb      (fresh `df` reading, at every spawn)
+ADMIT  iff  free_mb >= max(tree_mb, self_mb) + reserve_mb      (fresh `df` reading, at every spawn)
 REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK_REFUSED, 77)
 ```
 
-`tree` is what ONE more lane costs. `reserve` is the headroom a spawn must leave behind. Both are
-**measured per target**, never one global constant: #1852 recorded that a single constant cannot serve
-an agent-infra lane (48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized
-floor would refuse every harness spawn on every cell — a false *block*, which is its own defect.
+`tree` is what ONE more lane costs *while the shared uv cache holds*; `self` is what the same lane
+costs when it does not (a pruned cache, `--link-mode=copy`, a cache on another mount); `reserve` is the
+headroom that must still be free **after** that worst case — **4x the dispatch floor**, which is the
+number the cell's warning band defaults to, derived independently: the reserve is an *enforcement* bound
+and the band is a *reporting* threshold, so an operator lowering the band to quiet the logs cannot be
+lowering admission with it. `max(tree, self)` is not a redundancy: a
+gate that admitted on `tree + reserve` alone (2,350 MB with the shipped numbers) admits a lane that then
+writes 5,772 MB and drives the cell ~3,400 MB SHORT of zero — the cell-4 wedge, reached from a rule that
+looked one term cheaper. `tree` and `self` are **measured per target**,
+never one global constant (`reserve` is 4x the dispatch
+floor, which is enforcement, not a per-target measurement): #1852 recorded that a single constant cannot serve an agent-infra lane
+(48 MB, no install) and a tortoise lane (5.7 GB of python), and a tortoise-sized floor would refuse
+every harness spawn on every cell — a false *block*, which is its own defect. The band is
+evaluated **before** the headroom refusal (a warning that can never fire is not an instrument), and an
+admitted spawn cannot drop the cell below 4x the dispatch floor.
 
 ### Measured (2026-10-24, 8-vCPU cell, `/dev/root` 128,828 MB, `uv` 0.12.5, warm uv cache)
 
@@ -869,21 +985,70 @@ cache** (`nlink=3` measured on every `site-packages/*.so`): those blocks belong 
 *cache state*, not of the lane — `pi-cache-reap.sh` prunes the cache under pressure, `--link-mode=copy`
 and a cache on another mount never share at all — so the gate ships both numbers:
 
-| target | `DISK_LANE_TREE_MB` (default) | `DISK_LANE_RESERVE_MB` (default) |
-|---|---|---|
-| `uv.lock` present (python lane) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) |
-| no install step (harness lane) | **64** | **1024** |
+| target | `DISK_LANE_TREE_MB` | `DISK_LANE_SELF_MB` | `DISK_LANE_RESERVE_MB` |
+|---|---|---|---|
+| python project (any of nine package-manager markers — `uv.lock`, `pyproject.toml`, `requirements.txt`, `poetry.lock`, `pdm.lock`, `Pipfile`, `setup.py`, … — at the top level **or one level down**) | **350** | **6144** (6 GiB = the 5,772 MB self-contained tree, rounded up) | **2000** (4x the floor; admit iff free >= 8144) |
+| no install step (harness lane) | **64** | **64** | **2000** (admit iff free >= 2064) |
+
+The gate's ledger records `tree` (field 6), `reserve` (7) and `self` (8) per spawn. ⛔ `self` is
+appended **last** on purpose: field 7 already means *reserve* in the series already shipped, and moving
+the worst case into it would silently re-label every historical row — a `64 1024` harness row would read
+as "this lane costs 1024 MB without sharing", 16x its real cost, i.e. exactly the figure a per-cell
+budget is calibrated from.
+
+**Which path is measured.** The triple is derived from the lane's **checkout** — `DISK_GATE_PATH` when
+that path is one, otherwise the caller's cwd — and never from the mount root `df` was read on: an
+operator legitimately points `DISK_GATE_PATH` at a volume, where `df` is right and no marker exists, and
+classifying that would admit a python lane on the 64 MB harness pair. If neither path is a checkout the
+target is genuinely unknown; the gate charges the harness pair and **names it in the pass log**, because
+the alternative (charging the python bound) refuses every harness lane on any cell below ~8 GB free. That
+case is a caller bug, and the log is where it surfaces.
+
+`uv.lock` alone was the first discriminator and it was a **false pass**: a pip/poetry/pdm service, or a
+monorepo whose lock sits in `backend/`, installs the same ~5.7 GB venv and would have been admitted on
+the 64 MB harness pair. The detection fails toward the *expensive* pair on purpose — over-estimating a
+harness lane withholds a few spawns on an almost-full cell; under-estimating a python lane fills it.
+**Where that rationale does not hold, stated rather than implied:** the markers are matched as *exact
+names*, so a project whose only requirement file is `requirements/base.txt` (Django's default layout),
+`requirements-dev.txt`, or `environment.yml` matches nothing and derives the 64 MB harness pair — the
+failure is then toward the CHEAP pair, and a ~5.7 GB venv can materialise on 2,064 MB of headroom. The
+fleet's own lanes are covered (`uv.lock` in tortoise, no install step in agent-infra); a repo adopting
+one of those layouts should add its marker, or set `DISK_LANE_TREE_MB`/`DISK_LANE_SELF_MB` for the cell.
+
+⚠️ **What the reserve does not buy.** Two things, both stated rather than implied.
+
+**Concurrent spawns inside the materialisation window.** Admission compares one fresh reading against one
+lane's worst case, so it is correct for the lane it is deciding and for any lane spawned AFTER that lane's
+tree exists. It is **not** a reservation: a python lane's 5,772 MB materialises over minutes, and two or
+three dispatches inside that window all read the same free value and are all admitted. On a cell sitting
+at the bound with the sharing regime lost, k concurrent python spawns can consume k x 5,772 MB against
+~8.1 GB free — the #2721 wedge, with every log line saying *admitted*. Closing it needs a reservation
+(a lane marker held from admission to install, or a dispatcher-side counter), and no such marker exists
+today; the gate narrows the window, it does not remove it.
+
+**How the reserve itself can be lost.** The admission rule guarantees that the lane admitted *now* cannot
+consume the reserve even in its worst case. It does not guarantee `free >= reserve` for ever: a cell
+can lose the sharing regime wholesale (a `pi-cache-reap.sh --caches` sweep frees the cache but the NEXT
+sync re-materialises every venv it prunes), and the gate then refuses one lane at a time as the free
+space falls. That is the correct behaviour — the refusal is the signal — but it means the budget below
+is a *budget*, not a hard floor enforced by construction.
 
 ### The number the fleet must budget **per lane**
 
 * **316 MB/lane** on a cell whose shared uv cache is populated (measured above) — plus **~5.7 GB once**
   per cell for the cache itself.
-* **5,772 MB/lane** the moment the sharing is lost, which is why the reserve is 6 GiB and not 316 MB:
-  a budget built only on the marginal figure admits exactly the spawns that filled cell-4.
+* **5,772 MB/lane** the moment the sharing is lost, which is why admission is bounded by
+  `max(tree, self) + reserve` and not by the marginal figure: a budget built only on 316 MB admits
+  exactly the spawns that filled cell-4.
 * Consequence for the concurrency target (`MAX_LANES = vCPU * 5/2` = **20** on 8 vCPU): with sharing,
-  20 lanes ≈ 6.3 GB + 5.7 GB cache + 6 GB reserve ≈ **18 GB**, which fits a 128 GB cell with room for
-  the CI runners. **Without sharing, 20 lanes need 115 GB + the base image — it does not fit**, and the
-  honest answer is that such a cell can carry ~9 lanes. If a cell starts refusing `DISK-NOHEADROOM`
+  20 lanes ≈ 6.3 GB + 5.7 GB cache + **2 GB reserve** (`4 x the 500 MB dispatch floor`, the value the
+  code computes) ≈ **14 GB**, which fits a 128 GB cell with room for the CI runners.
+  **Without sharing, 20 lanes need 117 GB (115 GB of trees + the 2 GB reserve) + the base image — it does
+  not fit**, and the honest answer is that such a cell can carry ~9 lanes. ⛔ The reserve is **2 GB, not
+  the 6 GB python worst case**: those are different numbers doing different jobs (the reserve is what
+  must survive the *next* lane; `self` is what one lane costs when sharing is lost), and setting
+  `DISK_LANE_RESERVE_MB=6144` to "match the worst case" raises every python spawn's bar from 8,144 MB to
+  12,288 MB — mass `DISK-NOHEADROOM` refusals from a line of documentation. If a cell starts refusing `DISK-NOHEADROOM`
   while it has tens of GB free, the sharing regime was lost; measure it before raising the reserve.
 
 **Measure your own cell** (never infer it from `du`): in a fresh worktree,
@@ -897,8 +1062,12 @@ df -Pm / | awk 'NR==2{print $3}'   # after the install   -> the marginal venv co
 du -sm .venv                       # the APPARENT figure (upper bound, never the budget)
 ```
 
-then set `DISK_LANE_TREE_MB` / `DISK_LANE_RESERVE_MB` for that cell, and say so where an operator
-will read it. `scripts/worktree-disk-probe.sh` classifies which byte regime the machine is in.
+then set `DISK_LANE_TREE_MB` / `DISK_LANE_SELF_MB` / `DISK_LANE_RESERVE_MB` for that cell, and say so
+where an operator will read it. `scripts/worktree-disk-probe.sh` classifies which byte regime the
+machine is in. The gate's own ledger (`$O/state/disk.tsv`) records all three per spawn, so a series
+always separates *what a lane cost* (field 6) from *what it would have cost with sharing lost* (field 8)
+— field 7 is the reserve, not the worst case; reading it as the per-lane unshared cost budgets ~2000 MB
+where the real figure is ~5,772 MB.
 
 ### The KEEP rule: a shell at a prompt is not a live lane
 
@@ -915,9 +1084,28 @@ its pane or its `cd` behind is. Every other gate is untouched (`dirty`, `ignored
 `too-recent`, `detached-unreachable`, `remote-only-ref`, `main-proof-vanished`), so the blast radius
 of a wrong reading is a re-created env or checkout — never uncommitted or unpushed work. Every unprovable input (pid not in the
 `ps` table, unreadable start time, undatable HEAD, failed probe) leaves the holder **live**, and each
-demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`) and in the row
-(`unref=stale-shell:<pids>`). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
-reading without editing a shipped script.
+demotion is named in the pass log (`stale-shell:` / `STALE-SHELL`), and `pi-reap-worktrees.sh` also
+carries it into the row (`unref=stale-shell:<pids>`) — the venv reaper's row has no `unref` column, so
+for an env the pass log is the record (stated here because the difference otherwise reads as a missing
+field). `REAP_VENV_IDLE_SHELL=0` / `REAP_WT_IDLE_SHELL=0` restore the strict
+reading without editing a shipped script. The start time comes from the process table's own creation
+time (`/proc/<pid>`), and both reapers read it through a root seam — `REAP_VENV_PROC_ROOT` /
+`REAP_WT_PROC_ROOT`, default `/proc` — so a test can drive the `ps` fallback deterministically on a
+host where the fixture pid happens to be live; in production the seam is never set.
+
+Two more seams exist ONLY to make backstops testable, and production never sets them either:
+`REAP_VENV_SCAN_CAP` / `REAP_WT_SCAN_CAP` lower the scan's runaway cap so its **exhaustion** branch can be
+reached. That branch is otherwise unreachable by construction (the derived cap exceeds any holder count
+and each iteration consumes a distinct pid), which is exactly why it needs an arm: its polarity is
+`truncated => LIVE`, and the opposite reading — "no holder found" — deletes a live lane's env or
+checkout. Both suites drive it (`K10`, `G2721m`) and both fail if the branch is reverted.
+
+The scan that applies the rule examines **every** holder (an idle shell and a working lane routinely
+share a checkout) and carries a per-record exclude list instead of mutating the probe output, so one
+verdict cannot consume the evidence the next one needs and a probe that keeps returning the same pid
+terminates instead of spinning. `pi-reap-worktrees.sh` also asks the rule again **at removal time**,
+re-reading the process and cwd tables first: a shell demoted as idle can pick up a child — i.e. start
+working again — while the pass is still running, and that is exactly when the delete must stop.
 
 ⛔ **A shared *environment* is not the fix, and was not adopted.** The recorded decision in
 `docs/ops/lane-venv-reaper-policy.md` rejects a machine-wide venv because `uv` installs the project in

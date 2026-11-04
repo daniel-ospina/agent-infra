@@ -347,6 +347,67 @@ echo "  snapshot lookup => $sn"
 ck "snapshot lookup by claim_ref MATCHES" "^MATCH" "$sn"
 
 echo
+echo "=== 2d. a FAILED PUBLISH publishes NOTHING and keeps the last good snapshot (#2466 review) ==="
+# ⛔ THE FAIL-OPEN THIS PR REMOVED CAN COME BACK WITH EVERY SUITE GREEN, which is why this arm
+# exists. The writer used to discard its own exit status and run `mv … || true`, so a failed write
+# published a 0-byte snapshot; a header-less snapshot falls back to a fresh mtime, so every key then
+# read `claim-absent` (FREE) while the cycle log printed `read=ok`. Reverting the writer to that shape
+# reddened NOTHING: `claim_snapshot` is only ever driven on its writable path.
+#
+# The failure is forced deterministically and as any uid: squat a DIRECTORY on the writer's own
+# `$out.body.$$` path, so the body write cannot happen at all (a read-only dir would be ignored by
+# root, which would make the arm vacuous on a root runner).
+# The assertion is the OUTCOME a reader sees, not just a flag — and the DISCRIMINATOR here is that
+# the previous bytes survive at all (the pre-fix writer replaced them with a 32-byte header-only
+# snapshot, which is what made every key read FREE). The `reader=` token is PRINTED for triage but
+# deliberately NOT asserted: it depends on a live claim existing at this point in the suite, and on a
+# box where the claim machinery is itself red that would make this arm fail for an unrelated reason.
+pubfail() { # <box-dir> <snapshot-file> -> tokens, one per line
+  ( cd "$1" && export CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+    && claim_snapshot "$2" >/dev/null 2>&1 || { echo "setup=failed"; exit 0; } \
+    && cp "$2" "$2.before" \
+    && mkdir -p "$2.body.$$" \
+    && claim_snapshot "$2" >/dev/null 2>&1; rc=$? \
+    && printf 'rc=%s\nwrite=%s\nfetch=%s\n' "$rc" "${CLAIM_SNAPSHOT_WRITE:-?}" "${CLAIM_SNAPSHOT_FETCH:-?}" \
+    && if cmp -s "$2" "$2.before"; then echo "published=none"; else echo "published=replaced"; fi \
+    && if [ -e "$2.$$" ]; then echo "tmp=left"; else echo "tmp=clean"; fi \
+    && echo "reader=$(claim_snapshot_verdict "$2" "$(claim_ref "$PR" "$SHA")" >/dev/null 2>&1; echo $?)" )
+}
+pf="$(pubfail "$A" "$SNAP")"
+echo "  failed-publish tokens => $(echo "$pf" | tr '\n' ' ')"
+ck "a failed PUBLISH still returns 0 (the caller's contract)" '^0$' "$(echo "$pf" | sed -n 's/^rc=//p')"
+ck "…and is reported as a WRITE failure, not a FETCH one" '^failed$' "$(echo "$pf" | sed -n 's/^write=//p')"
+ck "…while the FETCH keeps its own (successful) answer" '^ok$' "$(echo "$pf" | sed -n 's/^fetch=//p')"
+# ⛔ THIS IS THE DISCRIMINATOR. The pre-fix writer replaced the file with a 32-byte header-only
+# snapshot (that is what made every key read FREE); it cannot leave the previous bytes intact.
+ck "…nothing is published, so the last GOOD snapshot survives byte-identical" '^none$' "$(echo "$pf" | sed -n 's/^published=//p')"
+ck "…and no temp file is left behind" '^clean$' "$(echo "$pf" | sed -n 's/^tmp=//p')"
+rm -rf "$SNAP.before" "$SNAP.body."* 2>/dev/null || true
+rm -f "$SNAP"
+# ⛔ AND THE OTHER HALF OF THE SAME INVARIANT, WHICH IS THE ONE THE READER SEES (review, P1): a failed
+# publish with NO previous snapshot must leave the key UNREADABLE (rc 2), never FREE (rc 0). The
+# pre-fix writer published a 0-byte snapshot here (it discarded its own write status and ran
+# `mv … || true`), and a header-less file is believed on its fresh mtime — so every key read
+# `claim-absent`, i.e. freedom, from a read that never happened. Nothing above can see that: the arm
+# above is graded on the bytes SURVIVING, and this one on the verdict the sweep consumes.
+# The failure is forced the same root-proof way (squat a DIRECTORY on the body path, not chmod).
+pubfail_none() { # <box-dir> <snapshot-file> -> tokens
+  ( cd "$1" && export CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+    && rm -f "$2" \
+    && mkdir -p "$2.body.$$" \
+    && claim_snapshot "$2" >/dev/null 2>&1; rc=$? \
+    && printf 'rc=%s\nwrite=%s\n' "$rc" "${CLAIM_SNAPSHOT_WRITE:-?}" \
+    && if [ -e "$2" ]; then echo "published=replaced"; else echo "published=none"; fi \
+    && echo "reader=$(claim_snapshot_verdict \"$2\" \"$(claim_ref "$PR" "$SHA")\" >/dev/null 2>&1; echo $?)" )
+}
+pn="$(pubfail_none "$A" "$SNAP")"
+echo "  failed-publish-with-no-previous tokens => $(echo "$pn" | tr '\n' ' ')"
+ck "no previous snapshot + a failed publish publishes NOTHING" '^none$' "$(echo "$pn" | sed -n 's/^published=//p')"
+ck "…and the READER answers claim-unreadable (rc 2), not freedom — the sweep acts on nothing" '^2$' "$(echo "$pn" | sed -n 's/^reader=//p')"
+rm -rf "$SNAP.body."* 2>/dev/null || true
+rm -f "$SNAP"
+
+echo
 echo "=== 6. fencing: A cannot release with ANOTHER LIVE claim's real sha ==="
 # ⛔ The old test offered a RANDOM 40-char sha, which is not an object anywhere, so it proved only
 # that `--force-with-lease` rejects a nonsense value — it would also pass with a plain unfenced

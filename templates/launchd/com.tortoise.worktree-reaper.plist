@@ -25,27 +25,74 @@
          from that process. This mirrors the configuration recorded as PROVEN
          end-to-end (WORKTREES=454 ... GH=ok), not the falsified `bash` one.
 
-         SHIPS IN DRY-RUN. The argument list below carries the reaper's
-         dry-run flag. Arming it is a deliberate, per-machine operator decision:
-         replace that flag with the reaper's apply flag HERE and re-run
-         scripts/install-launchd.sh. Removing the flag is NOT arming: with no
-         mode flag the reaper falls back to REAP_WT_DRY_RUN, whose default is 1,
-         so it would keep dry-running silently. The apply flag (or
-         REAP_WT_DRY_RUN=0) is the only arming switch.
+         STILL SHIPS DRY-RUN — DELIBERATELY, AND THE RULING IS #1678.
+         "The reaper may run unattended; arming it may not" (owner ruling
+         2026-10-11). Do NOT commit a literal `apply` flag here: install-launchd.sh
+         with no arguments installs EVERY template and pi-bootstrap/setup.sh
+         runs exactly that on every Darwin box, so a literal in a shared template
+         arms a fleet with no human step. Arming is a separate, dated, reversible
+         step.
 
-         The pass is bounded by REAP_WT_BUDGET_SECONDS (default 300s); a pass
-         that exhausts it defers the remainder and reports DEFERRED rather than
-         removing anything unclassified. A dry-run pass on the live estate
-         reported REMOVE=0 DEFERRED=432 of 454 worktrees, so this job's present
-         effect is a report, not a removal, and that budget (agent-infra #1095)
-         is the lever deciding how much one pass can classify.
+         WHERE THE ARMING ACTUALLY IS — two different jobs, and pointing at the
+         wrong one wastes the operator's afternoon. The supported, recorded verb
+         is `install-launchd.sh arm-worktree-hygiene`, and it arms the SIBLING
+         unit com.tortoise.worktree-hygiene (its record is
+         state/worktree-hygiene.armed, its placeholder is WORKTREE_HYGIENE_MODE),
+         whose sweep runs `scripts/pi-reap-worktrees.sh apply` — so that verb does
+         give a box an ARMED reaper. It does NOT arm THIS unit: this template
+         carries no placeholder and no arming verb exists for it, so arming this
+         job is a hand-edit of the flag in ProgramArguments below plus a re-run of
+         scripts/install-launchd.sh, which #1678 requires to stay a separate,
+         dated, reversible step rather than something a template does by itself.
+         ⛔ Do NOT write the placeholder spelling with braces in this comment:
+         install-launchd.sh's render() substitutes over the WHOLE file, comments
+         included, so a placeholder in a comment renders to a value below that
+         starts with two hyphens, and an XML comment may not contain one
+         (W3C XML 1.0 §2.5 — the sibling's WORKTREE_HYGIENE_MODE placeholder,
+         spelled here WITHOUT braces on purpose, is exactly that value).
+         Verified: python plistlib raises ExpatError on that render in BOTH modes;
+         `plutil` tolerates it, which is exactly why the leak would ship unnoticed.
+         Removing the flag is also NOT arming: with no mode flag the reaper
+         falls back to REAP_WT_DRY_RUN, whose default is 1.
+         ⚠️ FLAG NAMES ARE SPELLED WITHOUT THEIR LEADING DASHES THROUGHOUT THIS
+         COMMENT, as in the sibling com.tortoise.worktree-hygiene.plist. An XML
+         comment may not contain a double hyphen (the only legal occurrence is
+         its own closing delimiter), so a literal flag spelling here makes the
+         template unparseable: plutil/launchctl reject the unit, and
+         install-launchd.sh's plist_program_args swallows the parse error, so the
+         job would install with EMPTY program arguments instead of failing loudly.
+         Keep the prose, keep the dashes out (#2041 review).
+
+         MEASURED 2026-10-22 — why this job reported exit 0 and reclaimed
+         nothing for months. 748 worktrees (551 tortoise + 197 agent-infra),
+         load 222, `fseventsd` 100% CPU, ~150 MB free; last pass
+         `WORKTREES=538 REMOVE=7 REMOVED=0 DEFERRED=422`. THREE causes:
+           1. the installed unit ran the `dry-run` flag, so REMOVED=0 was structural;
+           2. the FARMED script was ~190 diff lines BEHIND `origin/main` — the
+              merged-age exemption had shipped but was never deployed, so the
+              box ran rules that held every merged worktree for 7 days. (The
+              farm also omitted `lib/bounded.sh`, which the newer reaper
+              requires: deploying it un-fixed would have armed a job that
+              FAIL-CLOSED exited 3 on every pass.)
+           3. a budget-limited pass classified the HEAD of a stable-ordered list
+              and deferred the same TAIL, so the newest worktrees — the ones a
+              pass exists to reap — were never reached at all.
+
+         The pass is bounded by REAP_WT_BUDGET_SECONDS; a pass that exhausts it
+         defers the remainder and reports DEFERRED rather than removing anything
+         unclassified. The budget is also the lever deciding how much one pass
+         can classify.
 
          BUDGET, RAISED 2026-10-11 — 300s was measured TOO SMALL for the live
          estate: a pass over 454 worktrees spent the whole budget and reported
          DEFERRED=432 (only 22 classified), and 294 worktrees still deferred 65.
          The budget bounds classification AND removal per worktree, so at 300s
-         the job could never reach the rows it exists to reap. Raised to 1800s
-         via REAP_WT_BUDGET_SECONDS below.
+         the job could never reach the rows it exists to reap. Raised in two
+         steps — to 1800s, then to the 3600s shipped in REAP_WT_BUDGET_SECONDS
+         below (quoted here rather than named, because a stale number in an
+         operator-facing comment is read as the shipped value). Whatever value
+         is set there, REAP_WT_LOCK_STALE_SECONDS below must keep exceeding it:
+         the lock's staleness test is an AGE test that ignores the budget.
 
          GH TIMEOUT, 2026-10-11 — the job fail-closed with
          `GH pr-list failed (rc=124) ... exit 3` on two passes (WORKTREES=388
@@ -91,10 +138,27 @@
              defaults — which are exactly the two values measured to make this
              job a no-op (DEFERRED=432, and the rc=124 fail-closed abort). -->
         <key>REAP_WT_BUDGET_SECONDS</key>
-        <string>1800</string>
+        <string>3600</string>
         <key>REAP_WT_GH_TIMEOUT</key>
         <string>120</string>
+        <!-- The lock's staleness horizon MUST exceed the pass budget, or a
+             LEGITIMATELY-RUNNING armed pass trips its own staleness mid-pass and
+             a second invocation breaks the lock and runs concurrently. Two
+             concurrent armed passes each compute PRUNE_BLOCKED for their own
+             pass only, so a deferred (UNCLASSIFIED) prunable record in pass A is
+             invisible to pass B, which then runs the path-filterless
+             `git worktree prune` — the F17/A15 P0. 14400s = 4x the budget. -->
+        <key>REAP_WT_LOCK_STALE_SECONDS</key>
+        <string>14400</string>
     </dict>
+    <!-- LowPriorityIO: this job's work IS bulk deletion (hundreds of checkouts,
+         millions of files), and at normal IO priority it competes with the very
+         thing it exists to relieve — `fseventsd` and the operator's foreground
+         work. `Nice` is deliberately NOT set: the budget, not a CPU penalty,
+         is what bounds the pass, and a niced pass would simply defer more rows.
+         The rotation below means a deferred tail is still reached next pass. -->
+    <key>LowPriorityIO</key>
+    <true/>
     <key>StartInterval</key>
     <!-- 21600s = 6h. Measured growth: 194 -> 259 -> 294 worktrees across a few
          passes, i.e. DAILY was too rare for the estate to stop growing, and it

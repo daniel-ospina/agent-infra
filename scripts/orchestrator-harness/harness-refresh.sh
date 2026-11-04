@@ -35,9 +35,20 @@
 # again (`StartLimitBurst=3`). Every harness change that night needed one. The orphan/restart half is
 # agent-infra#2315's, NOT this file's.
 # So the word is replaced by a STATE with a defined transition, in three parts:
-#   1. THE IDENTITY IS READ FROM THE PROCESS, NOT FROM A RECORD, where a cell is concerned — the live
-#      controller's argv names the tree it executes (see `controller_identity` below). That makes
-#      `current` reachable on a cell, which is the only thing that can ever END the state honestly.
+#   1. THE IDENTITY IS READ, IN PRECEDENCE ORDER, AND THE ORDER IS THE CONTRACT:
+#        `self:`            the script's own dir, where it is a git checkout (the laptop shape) — the
+#                           strongest evidence, and it answers FIRST, so on a laptop no process read is
+#                           involved at all.
+#        the controller's   where `self:` does not resolve (a cell's flat `$O`): the pin-rooted source-2
+#        argv               reader, then `controller_identity` as its fallback — both read the lock's pid
+#                           and the tree its argv names.
+#        the stamp          last: a CLAIM `apply` wrote. Where a controller is LIVE, a `stamp:` identity is
+#                           then DOWNGRADED to `restart-pending` by the `stamp:*` arm below; where none is
+#                           live, nothing runs and the stamp is the honest answer.
+#      ⛔ SO `restart-pending` ENDS WHEN THE ANSWERING SOURCE NAMES THE PIN — whichever source that is.
+#      Do NOT describe any ONE of these as "the only thing that can end the state": that was written here,
+#      and it is false twice over (a laptop ends it by moving `self:` with the same live pid; a box with no
+#      controller ends it by the stamp naming the pin). The code is the order above, not a single reader.
 #   2. THE PENDING STATE IS CLASSIFIED, and the classification rides in the record as `pending=`:
 #        inert       no live controller — nothing runs, so nothing is stale; the next launch runs the pin.
 #        unprovable  a controller IS live and its identity is a CLAIM (the stamp) — no restart is
@@ -50,9 +61,12 @@
 #      the next cycle that sees the process move records `request=honoured … after=<n>s`; a request whose
 #      premise disappears records `request=cleared`. Read it with `--print-restart`, or in
 #      `cloud-cell-supervisor.sh status`. ⛔ THIS SCRIPT CONTAINS NO ACTUATOR, DELIBERATELY: a loop that
-#      restarts itself is the one path that cannot be made safe, and the fleet already has THREE restart
-#      paths (`systemctl restart`, `cloud-cell-supervisor.sh stop/apply/start`, merge-reminder.py's
-#      deploy arm). A fourth is the duplication the owner ruled against; this one ASKS and RECORDS.
+#      restarts itself is the one path that cannot be made safe, and restart actuators already EXIST —
+#      the unit (`systemctl restart` / macOS `launchctl kickstart`), `cloud-cell-supervisor.sh
+#      stop/apply/start`, `cloud-cell-doctor.sh`'s unattended `"$SUPERVISOR" start` arm, and
+#      `merge-reminder.py`'s deploy arm (four surfaces; see the note above `inflight_gate`, which names
+#      what each one actually gates on). Adding a FIFTH here would be a second definition of "restart
+#      this box", which is a second thing to keep in step. This one ASKS and RECORDS.
 #
 # ── WHY THIS EXISTS (agent-infra#2215) ───────────────────────────────────────────────────────────
 # MEASURED 2026-10-20: three cells sat on a checkout 27 commits behind origin/main with an EMPTY
@@ -313,10 +327,23 @@ if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
   # controller gets EPERM, and reading that as NOT-LIVE has a consequence beyond this block: `set_pending`
   # would write `inert` and `restart_request_record` would durably record
   # `request=cleared reason=no-live-controller` — from inside a LIVE controller. `ps -p` reads across
-  # users, so it is the second opinion: GONE requires BOTH to say gone. This direction is fail-closed:
-  # `CONTROLLER_LIVE=1` only ever DOWNGRADES `current` (it gates the `stamp:*` refinement and the
-  # upgrade path re-verifies ownership with `_began_before_lock`), so a `ps` false positive cannot buy a
-  # `current` on its own.
+  # users, so it is the second opinion: GONE requires BOTH to say gone.
+  # ⛔ AND THE FLAG WORKS IN BOTH DIRECTIONS, SO ITS SAFETY ARGUMENT HAS TO COVER BOTH. It does NOT "only
+  # ever downgrade": `CONTROLLER_LIVE=1` also ENABLES `controller_identity` (the source-3 read) and the
+  # process-tree population, so it can turn `restart-pending` into `current` — which is how that state
+  # can honestly END on a cell. ⛔ BUT IT DOES NOT GATE EVERY READER: the pin-rooted source-2 stage below
+  # establishes liveness from the lock pid ITSELF (`kill -0` + `_began_before_lock`) and never consults
+  # this flag. ⛔ AND IT DOES NOT CHANGE WHAT A CASUAL READER MIGHT ASSUME: with NO controller live
+  # neither reader runs, the STAMP answers, and the relation is whatever that claim implies —
+  # `restart-pending` while the stamp is not the pin, and `current` when it happens to name it. So "no
+  # controller" is not by itself a `restart-pending`, and "a controller" is not by itself a `current`.
+  # ⛔ DO NOT ATTRIBUTE THE PROMOTION TO ONE READER: source-3 runs only `if [ -z "$RUNNING" ]`, so on the
+  # standard cell posture (`HARNESS_PIN_DIR` + `HARNESS_PIN_FILE`, flat `$O`) it is source-2 that answers
+  # and `RUNNING_FROM=proc:<tree>` that gets recorded. What keeps the promotion sound is that EACH stage
+  # proves OWNERSHIP for itself — `_began_before_lock` refuses unless the named process began at/before
+  # the lock was written, which a recycled pid cannot satisfy. So a `ps -p` false positive cannot buy a
+  # `current` on its own: not because the flag is downgrade-only, but because every stage it opens
+  # re-checks ownership by age.
   if [ -n "$CONTROLLER_PID" ] \
      && { kill -0 "$CONTROLLER_PID" 2>/dev/null || "${PS_BIN:-ps}" -p "$CONTROLLER_PID" >/dev/null 2>&1; }; then
     CONTROLLER_LIVE=1
@@ -324,8 +351,14 @@ if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
 fi
 
 # ── RUNNING, source 3: the CONTROLLER's OWN ARGV (agent-infra#2641) ─────────────────────────────
-# `self:` resolves on a laptop ($O is a checkout) and NEVER on a cell, whose $O is a flat seed with no
-# git identity. On a cell the only source left was the STAMP — a claim `apply` wrote, not a fact about
+# `self:` resolves on a laptop ($O is a checkout) and does NOT resolve on a SEEDED cell, whose $O is a
+# flat seed with no git identity. ⛔ "NEVER on a cell" was written here and is not true: `orch-loop.sh`
+# falls back to the copy BESIDE the loop when `$O/harness-refresh.sh` is absent, and on a pin-per-commit
+# cell the loop runs from the pinned WORKTREE — so `$SELF` can land inside a git checkout and `self:` can
+# answer there too (driven: `--self <worktree>/scripts/orchestrator-harness` reports
+# `running=<worktree HEAD>`). That shape is SAFE (a real checkout is real evidence); what the paragraph
+# below describes is the SEEDED posture, where `self:` cannot resolve. On a seeded cell the only source
+# left was the STAMP — a claim `apply` wrote, not a fact about
 # the running process — so the `stamp:*` arm downgraded `current` to `restart-pending` on EVERY cycle of
 # EVERY cell, for ever. MEASURED 2026-10-24 on pi-cell-3: running == pin == ref == 848ba4b1 and the
 # record still said `restart-pending`, while `cloud-cell-supervisor.sh status` printed `[current]` for the
@@ -406,7 +439,7 @@ controller_identity() { # sets CTRL_HEAD/CTRL_TREE from the LIVE controller. rc 
   # #2641 back). The quote characters live in variables, not as backslash escapes: this file is read by
   # a gate that dequotes it statically (see #2175), and a backslash-quote in the body changes what that
   # read sees.
-  # ⛔ AND IT IS THE SAME PREDICATE AS THE SOURCE-2 SPLIT'S DEQUOTE ABOVE. The two readers are redundant
+  # ⛔ AND IT IS THE SAME PREDICATE AS THE SOURCE-2 SPLIT'S DEQUOTE BELOW. The two readers are redundant
   # (source-2 is pin-rooted, this one is the fallback), so on any fixture each answers for the other and
   # NEITHER copy can be individually witnessed: removing either one alone leaves the suite green, and only
   # removing BOTH reddens S13 (measured). That makes this an aggregate witness, not a per-copy one — so if
@@ -455,7 +488,7 @@ RUNNING_FROM="self:$SELF"
 # alarm shape: a token that is never absent is a token nobody reads, and the one record that answers
 # "is this box on the deployed commit?" could never say yes on any cell.
 # ⛔ THE IDENTITY IS AVAILABLE AND AUTHORITATIVE. `$O/.orch.lock` names the pid that OWNS this state
-# dir — the same ownership record the `CONTROLLER_LIVE` read below already trusts and the
+# dir — the same ownership record the `CONTROLLER_LIVE` read ABOVE already trusts and the
 # supervisor's own controller census uses — and THAT process's argv names the tree it executes. So the
 # read is one pid, not a scan of the box's process table: there is nothing to disambiguate and nothing
 # else on the box can answer for it.
@@ -473,8 +506,17 @@ RUNNING_FROM="self:$SELF"
 # outside every recorded root is a PEER repo's controller and must never answer for this box; without
 # the pin file and flat-pin arms, a box on either would keep the permanent `restart-pending` this stage
 # exists to remove.
-# ⛔ It does NOT require `CONTROLLER_LIVE`: that is computed BELOW this block (it exists for the
-# `stamp:*` downgrade), and this stage establishes liveness itself from the lock pid it names.
+# ⛔ IT DOES NOT REQUIRE `CONTROLLER_LIVE`, AND THAT FLAG DOES NOT GATE IT: the flag gates
+# `controller_identity` and the process-tree population, not this stage. This stage establishes liveness
+# from the lock pid it names (`kill -0` + `_began_before_lock`) and never consults the flag.
+# ⛔ AND SAY THIS PLAINLY, BECAUSE AN EARLIER NOTE HERE GOT IT WRONG: the lock IS read more than once per
+# run — once by the `CONTROLLER_LIVE` read above, once here for this stage's own ownership proof, and once
+# more by the refusal prose. That is deliberate, not a defect: each stage proves ownership from the RECORD
+# rather than trusting another stage's verdict, and ownership is the one thing a cheap read can get wrong
+# (#1856: a recycled pid under a shared pin root). What must NOT be added here is a SECOND CONTROLLER_LIVE
+# COMPUTATION — the flag means one thing, computed once; this stage asks a different question of the same
+# record and answers it itself. (#2958 moved the single `CONTROLLER_LIVE` read above the RUNNING
+# computation; that move is NOT this PR's.)
 #
 # _began_before_lock <lock-file> <pid> — 0 when the process provably began at/before the lock was
 # written. This is the AGE half of the fleet's ONE controller-ownership rule (#1178), carried inline
@@ -520,7 +562,7 @@ _began_before_lock() { # <lock-file> <pid>
 }
 if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   _ctrl_pid=""
-  # ⛔ `-f` FIRST, LIKE THE SIBLING READ AT `CONTROLLER_LIVE` BELOW. `head` on a NON-REGULAR lock — a
+  # ⛔ `-f` FIRST, LIKE THE SIBLING READ AT `CONTROLLER_LIVE` ABOVE. `head` on a NON-REGULAR lock — a
   # FIFO left by a crashed writer, a wedged network mount — BLOCKS ON OPEN, so on a cell (the only shape
   # this block runs) the refresh and therefore the controller's whole cycle would hang every cycle with
   # no output. `launchd-cycle.sh` records the same finding for the same read.
@@ -533,8 +575,11 @@ if [ -z "$RUNNING" ] && [ -n "${HARNESS_PIN_DIR:-}${HARNESS_PIN_FILE:-}" ]; then
   # path, so the argv shape matches perfectly. `lock_controller_pid` carries the age for exactly this
   # reason ("A controller always writes $LOCK after it starts, so a process that BEGAN after the lock
   # was written cannot be its owner"); without it a stale lock buys `relation=current`, and it also
-  # feeds the ahead/diverged refusals — while the pre-existing `CONTROLLER_LIVE` use of the same pid
-  # could only ever DOWNGRADE `current`, which is why the same weak evidence was safe there.
+  # feeds the ahead/diverged refusals — while the pre-existing `CONTROLLER_LIVE` use of the same pid was
+  # safe with that weak evidence for a DIFFERENT reason: NOT that the flag is downgrade-only (it is not —
+  # `CONTROLLER_LIVE=1` opens `controller_identity` and the process-tree census, so it can end
+  # `restart-pending` as `current`; see the flag's own block above), but that every stage it opens
+  # re-proves OWNERSHIP by age. Take the age check below away and this read would need it just as much.
   if [ -n "$_ctrl_pid" ] && kill -0 "$_ctrl_pid" 2>/dev/null \
      && _began_before_lock "${O:-}/.orch.lock" "$_ctrl_pid"; then
     # ⛔ `-ww`, BECAUSE `COLUMNS` OVERRIDES THE SAFE DEFAULT (#2926). A command substitution is not a tty,
@@ -864,7 +909,12 @@ fi
 # of this very cycle). Restart actuators ALREADY EXIST and this change adds none: the unit
 # (`systemctl restart eldato-orchestrator` / macOS `launchctl kickstart`), `cloud-cell-supervisor.sh stop
 # -> apply -> start`, `cloud-cell-doctor.sh`'s unattended `"$SUPERVISOR" start` arm, and
-# `merge-reminder.py`'s deploy arm — the last two already gate on role locks and refuse by name. A
+# `merge-reminder.py`'s deploy arm. ⛔ THEY DO NOT ALL GATE THE SAME WAY, and saying they do overstates
+# the safety: `merge-reminder.py`'s deploy arm is the one that refuses BY NAME on a live role lock /
+# landing in flight; `cloud-cell-doctor.sh`'s start arm is bounded by its own STOP-generation check and
+# the tmux session read (`cell_stopped_midpass`), not by `state/roles`; `cloud-cell-supervisor.sh start`
+# reads no role lock at all. That asymmetry is why this file records `actuation=blocked blocked=…`
+# rather than assuming every actuator will refuse for itself. A
 # further one would be duplication, and by this repo's own rule a SECOND definition of "restart this box"
 # is a second thing to keep in step. So this script ASKS, records who was asked and what it would cost,
 # and leaves the transition to an existing actuator and its confirmation to the next cycle.
@@ -1416,6 +1466,21 @@ write_pin "$APPLIED" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
 # saying `current` would be the false PASS (an operator reads "current" about last week's code).
 _rel=restart-pending
 [ "$RUNNING" = "$TIP" ] && _rel=current
+# ⛔ THE SAME CANNOT-VERIFY DOWNGRADE THE CURRENT-PIN PATH MAKES, MADE HERE TOO. This is the branch where
+# the pin has just moved, and `RUNNING` here can be the stamp's CLAIM naming the NEW tip while the
+# controller still executes the OLD tree. ⛔ AND DO NOT EXPLAIN THAT BY "apply rewrites the stamp": the
+# DEFAULT advance is `apply --force --pin-only` (the `_mat_args` ternary just above — cited by NAME,
+# not by line, because a line number here was already one commit stale), which deliberately leaves `$O`
+# — and so the stamp — alone (`cloud-cell-supervisor.sh` returns before `seed_and_stamp` on `--pin-only`).
+# A stamp that already names the tip comes from `start`'s `seed_and_stamp`, from a `--re-seed` advance, or
+# from a hand seed, and it remains only a CLAIM about what was SEEDED, never proof of what is EXECUTING.
+# `[ "$RUNNING" = "$TIP" ]` then reads that claim as agreement and reports `current`: the exact false PASS
+# this job exists to end, with no `pending=` on the spawn line and no request recorded. A live controller
+# whose identity comes only from the stamp cannot be certified, so it is restart-pending — and
+# `set_pending` then records WHY (`pending=unprovable`), which the `current` arm would have skipped.
+case "$RUNNING_FROM" in
+  stamp:*) [ "${CONTROLLER_LIVE:-0}" = 1 ] && [ "$_rel" = current ] && _rel=restart-pending ;;
+esac
 # The same decision the current-pin path makes, for the cycle where the pin JUST moved: the advance does
 # not restart anything, so a repin is exactly a request that has not been honoured yet.
 [ "$_rel" = restart-pending ] && set_pending
@@ -1458,10 +1523,15 @@ if [ "$DEPLOYED" = "$APPLIED" ]; then
 else
   _dep_clause="the deployed tree NOW names $(short "$APPLIED") (was $DEP_SHORT)"
 fi
-if [ "$RUNNING" = "$APPLIED" ]; then
+if [ "$RUNNING" != "$APPLIED" ]; then
+  _rest_clause="the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
+elif [ "$_rel" = current ]; then
   _rest_clause="the running controller is already on $RUN_SHORT"
 else
-  _rest_clause="the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
+  # ⛔ `RUNNING` EQUALS THE TIP BUT THE IDENTITY IS A CLAIM. Saying "already on" here would assert, in the
+  # one line an operator reads, that the controller executes the new commit — when all the box has is a
+  # stamp `apply` wrote. That is the assertion this arm exists to refuse to make.
+  _rest_clause="the running identity is only a CLAIM ($RUNNING_FROM) — it names $RUN_SHORT, but nothing proves the controller executes it, so this is restart-pending, not current"
 fi
 if [ "$_act" = reseeded ]; then _word=RESEEDED; else _word=REPINNED; fi
 # ⛔ THE NON-DESTRUCTION SENTENCE BELONGS TO THE `--pin-only` ARM ONLY (review finding). A re-seed calls
