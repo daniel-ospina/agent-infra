@@ -1004,6 +1004,80 @@ assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u
 assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "load $C/stack.plist" "…and the legacy load path is tried when it fails"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…so a box restored on the legacy path is not reported as a failed restart"
 assert_contains "$(grep -m1 -E 'verdict=(DOWN|WEDGED)' "$C/state/l" 2>/dev/null)" "restart=1" "…the restart it DID achieve is reported"
+# (ag) A KEY NESTED IN ANOTHER DICT IS NOT THE JOB'S KEY (review P1, cycle 8). launchd resolves `Program`
+#      by TOP-LEVEL key lookup; a `Program` entry inside `EnvironmentVariables` is an ENV VAR. A
+#      document-wide first-match read reported it as PROGRAM, and because PROGRAM overrode
+#      ProgramArguments a FOREIGN argv[0] was laundered through it — the cycle-7 class, re-opened by the
+#      key cycle 7 added.
+echo "── 8b(ag). a Program key nested in EnvironmentVariables cannot vouch for a foreign argv[0]"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAG
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>Program</key><string>$C/o/orch-loop.sh</string>
+  </dict>
+  <key>ProgramArguments</key><array><string>/opt/evil/run-agent</string></array>
+</dict></plist>
+PLISTAG
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "an env var named Program is not the job's Program, so argv[0] still decides"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses"
+# (ah) A DUPLICATE KEY IS AMBIGUOUS. CFPropertyList keeps the LAST occurrence and a first-match reader
+#      keeps the FIRST, so the reader that decides whether to bootstrap must not be the lenient one.
+echo "── 8b(ah). a plist declaring ProgramArguments TWICE is refused as ambiguous"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
+  <key>ProgramArguments</key><array><string>/opt/evil/run-agent</string></array>
+</dict></plist>
+PLISTAH
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a repeated ProgramArguments key is never resolved by guessing"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "ambiguous" "…the refusal names the ambiguity"
+# (ai) THE INTERPRETER SKIP APPLIES TO `Program` TOO. `Program=/bin/bash` with the box controller as the
+#      first argument is a box this repo ships the shape for; without the skip it was refused on EVERY
+#      pass, for ever, with a line claiming launchd would run `/bin/bash` — a dead arm that looks healthy.
+echo "── 8b(ai). Program=/bin/bash plus the controller as the first argument IS this box's job"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAI
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>Program</key><string>/bin/bash</string>
+  <key>ProgramArguments</key><array><string>$C/o/supervisor.sh</string></array>
+</dict></plist>
+PLISTAI
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" "an interpreter Program resolves to the script it runs, so the arm still fires"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and is not refused for being an interpreter"
+# (aj) A TRAILING SLASH IN A ROOT. `O=~/orchestrator/` is ordinary operator spelling, and the prefix test
+#      became `/…/orchestrator//*`, which a normal path never matches — a legitimate plist refused for
+#      ever, naming the very root the program is under.
+echo "── 8b(aj). a root spelled with a trailing slash still matches"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out" "$C/o/"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" "a trailing slash on the root does not refuse this box's own plist"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the arm is not inert there"
+# (ak) THE CRASH RECORD IS APPEND-ONLY, SO `--status` MUST SHOW THE CURRENT EPISODE. It used to print the
+#      first three lines, i.e. the OLDEST block, under a header naming the CURRENT episode — so an
+#      operator read a previous outage's `cause:` while diagnosing this one.
+echo "── 8b(ak). --status shows the CURRENT episode's crash block, not the oldest"
+newcase
+printf '2026-01-01T00:00:00Z\tverdict=WEDGED_STOPPED\tpid=none\theartbeat=900s\tstreak=3/3\trestart=0\tepisode=1\tcrash=x\ncause: EPISODE-ONE syntax error\n--- last 25 lines ---\n' > "$C/state/controller-watchdog.crash"
+printf '2026-01-02T00:00:00Z\tverdict=WEDGED_STOPPED\tpid=none\theartbeat=900s\tstreak=3/3\trestart=0\tepisode=2\tcrash=x\ncause: EPISODE-TWO unbound variable\n--- last 25 lines ---\n' >> "$C/state/controller-watchdog.crash"
+printf '2' > "$C/state/controller-watchdog.episode"
+stout="$(env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" \
+         WATCHDOG_LOG="$C/state/controller-watchdog.log" \
+         WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 bash "$WD" --status 2>&1)"
+assert_contains "$stout" "EPISODE-TWO" "--status shows the crash block for the episode it just named"
+assert_absent "$stout" "EPISODE-ONE" "…and not the previous, superseded one"
+assert_eq "$(restarts)" "0" "…and --status still dispatches nothing"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"

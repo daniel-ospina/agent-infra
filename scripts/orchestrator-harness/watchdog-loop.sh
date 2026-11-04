@@ -434,12 +434,40 @@ plist_probe() { # <file>
       q = index(substr(doc, p + 8), "</string>"); if (q == 0) return ""
       return substr(doc, p + 8, q - 1)
     }
+    # the value of the key whose `<key>…</key>` starts at `at`, bounded to that key OWN dict entry
+    function keyval(doc, at, keylen,   from, nk) {
+      from = at + keylen; nk = index(substr(doc, from), "<key>")
+      return strval(doc, from, (nk > 0) ? from + nk - 2 : length(doc))
+    }
+    # ⛔ DICT DEPTH AT A POSITION, because launchd resolves `Label`/`Program`/`ProgramArguments` by
+    # TOP-LEVEL key lookup and NOT by substring (review P1, cycle 8). A `<key>Program</key>` nested inside
+    # `EnvironmentVariables` is an ENV VAR named Program, which launchd ignores — yet a document-wide
+    # first-match read reported it as PROGRAM, that value overrode ProgramArguments, and a plist whose
+    # real argv[0] was `/opt/evil/run-agent` PASSED the gate and was bootstrapped under `$LABEL`
+    # (measured). Every key below is therefore accepted only at depth 1.
+    function depthat(doc, upto,   rest, n, p) {
+      n = 0; rest = substr(doc, 1, upto - 1)
+      while ((p = index(rest, "<dict>")) > 0) { n++; rest = substr(rest, p + 6) }
+      rest = substr(doc, 1, upto - 1)
+      while ((p = index(rest, "</dict>")) > 0) { n--; rest = substr(rest, p + 7) }
+      return n
+    }
     { doc = doc strip($0) "\n" }
     END {
-      tag = "<key>Label</key>"; c = 0; pos = 1
-      while (pos <= length(doc)) {
-        p = index(substr(doc, pos), tag); if (p == 0) break
-        c++; last = pos + p - 1; pos = last + length(tag)
+      # ⛔ EVERY TOP-LEVEL KEY IS COUNTED, NOT JUST `Label` (review P1, cycle 8). A plist declaring
+      # `Program` or `ProgramArguments` TWICE is as ambiguous as one declaring `Label` twice —
+      # CFPropertyList keeps the LAST occurrence while a first-match reader keeps the FIRST, so the two
+      # readers disagree about what runs. The caller refuses on a count > 1 for any of the three.
+      lc = 0; pc = 0; ac = 0; pos = 1
+      while ((p = index(substr(doc, pos), "<key>")) > 0) {
+        at = pos + p - 1
+        if (depthat(doc, at) == 1) {
+          rest = substr(doc, at)
+          if (index(rest, "<key>Label</key>") == 1)            { lc++; lpos[lc] = at }
+          else if (index(rest, "<key>Program</key>") == 1)     { pc++; ppos[pc] = at }
+          else if (index(rest, "<key>ProgramArguments</key>") == 1) { ac++; apos[ac] = at }
+        }
+        pos = at + 5
       }
       # ⛔ NUL-FRAMED, NOT TAB/NEWLINE-DELIMITED (review P2, cycle 7 of #1986). Every value here comes
       # from the FILE, and an XML `<string>` may legally contain a tab or a newline. The previous stream
@@ -447,26 +475,18 @@ plist_probe() { # <file>
       # matching-looking prefix (a FOREIGN label then passed proof 1) and a newline inside a value FORGED
       # an extra `ARG` record that satisfied proof 3. Both were measured. A NUL cannot occur in XML text,
       # so `read -r -d ''` reads back exactly the value the file declared — whatever it contains.
-      printf "COUNT\0%d\0", c
-      if (c >= 1) {
-        # bounded to its OWN dict entry, so a Label with no value cannot borrow the next key value
-        from = last + length(tag); nk = index(substr(doc, from), "<key>")
-        printf "LABEL\0%s\0", strval(doc, from, (nk > 0) ? from + nk - 2 : length(doc))
-      }
+      printf "COUNT\0%d\0", lc
+      printf "PCOUNT\0%d\0", pc
+      printf "PACOUNT\0%d\0", ac
+      if (lc >= 1) printf "LABEL\0%s\0", keyval(doc, lpos[lc], length("<key>Label</key>"))
       # ⛔ `Program` AND `ProgramArguments` ARE REPORTED SEPARATELY, AND NEITHER IMPLIES THE OTHER (review
       # P1, cycle 7). `man launchd.plist`: `Program` "maps to the first argument of execvp(3)" and, when
       # present, is what RUNS — `ProgramArguments` then supplies only argv[1..]. A reader that only ever
       # looked at ProgramArguments could therefore be shown this box controller entry in an ARGUMENT
-      # position while launchd execs a different file. Both are emitted; the caller decides which one is
-      # the program, because only the caller knows the precedence launchd applies.
-      p = index(doc, "<key>Program</key>")
-      if (p > 0) {
-        from = p + length("<key>Program</key>"); nk = index(substr(doc, from), "<key>")
-        printf "PROGRAM\0%s\0", strval(doc, from, (nk > 0) ? from + nk - 2 : length(doc))
-      }
-      p = index(doc, "<key>ProgramArguments</key>")
-      if (p > 0) {
-        from = p + length("<key>ProgramArguments</key>")
+      # position while launchd execs a different file. Both are emitted; the caller decides.
+      if (pc >= 1) printf "PROGRAM\0%s\0", keyval(doc, ppos[pc], length("<key>Program</key>"))
+      if (ac >= 1) {
+        from = apos[ac] + length("<key>ProgramArguments</key>")
         a2 = index(substr(doc, from), "<array>")
         if (a2 > 0) {
           from = from + a2 - 1 + 7
@@ -505,11 +525,13 @@ plist_probe() { # <file>
 #      `$LABEL` (measured). Proof 3 is about the program that RUNS.
 plist_not_this_job() { # <file>
   local -a _args=()
-  local _cnt="" _lbl="" _prog="" _kind _val _exec="" _e _root
+  local _cnt="" _pcnt="" _pacnt="" _lbl="" _prog="" _kind _val _exec="" _e _root
   while IFS= read -r -d '' _kind; do
     IFS= read -r -d '' _val || break
     case "$_kind" in
       COUNT)   _cnt="$_val" ;;
+      PCOUNT)  _pcnt="$_val" ;;
+      PACOUNT) _pacnt="$_val" ;;
       LABEL)   _lbl="$_val" ;;
       PROGRAM) _prog="$_val" ;;
       ARG)     _args+=("$_val") ;;
@@ -531,21 +553,33 @@ plist_not_this_job() { # <file>
   esac
   [ "$_lbl" = "$LABEL" ] || {
     printf 'its Label is \047%s\047, not \047%s\047' "${_lbl:-<none>}" "$LABEL"; return 0; }
-  # ⛔ WHICH ELEMENT IS THE PROGRAM (review P1, cycle 7 of #1986). `man launchd.plist`: `Program` maps to
-  # "the first argument of execvp(3)" and, when present, is what RUNS — `ProgramArguments` then supplies
-  # only argv[1..]. Otherwise argv[0] is the program, and when argv[0] is an INTERPRETER the program it
-  # runs is the first following non-flag element. That is exactly the rule `install.sh`'s `plist_program`
-  # applies ("first non-interpreter element"), and this repo declares that function the ONE parser for
-  # this question — a second answer here is how the two come to disagree.
-  if [ -n "$_prog" ]; then
-    _exec="$_prog"
-  else
-    for _e in ${_args[@]+"${_args[@]}"}; do
-      case "$_e" in -*) continue ;; esac
-      case "${_e##*/}" in bash|sh|zsh|ksh|dash|env) continue ;; esac
-      _exec="$_e"; break
-    done
-  fi
+  # ⛔ A DUPLICATE `Program`/`ProgramArguments` IS AS AMBIGUOUS AS A DUPLICATE `Label` (review P1, cycle 8).
+  # CFPropertyList keeps the LAST occurrence of a repeated key while a first-match reader keeps the FIRST,
+  # so the two disagree about which program runs — and the reader that decides whether to bootstrap must
+  # not be the lenient one. Only TOP-LEVEL keys are counted (the probe's `depthat`), so a `Program`-named
+  # entry inside `EnvironmentVariables` is not a job key at all and cannot be substituted for one.
+  case "${_pcnt:-0}" in 1) : ;; 0) : ;; *) printf 'it declares %s top-level Program keys, which is ambiguous — a repeated key resolves to a DIFFERENT one for launchd than for a first-match reader' "$_pcnt"; return 0 ;; esac
+  case "${_pacnt:-0}" in 1) : ;; 0) : ;; *) printf 'it declares %s top-level ProgramArguments keys, which is ambiguous — a repeated key resolves to a DIFFERENT one for launchd than for a first-match reader' "$_pacnt"; return 0 ;; esac
+  # ⛔ WHICH ELEMENT IS THE PROGRAM (review P1, cycle 7; interpreter skip in the `Program` branch review
+  # P2, cycle 8). `man launchd.plist`: `Program` maps to "the first argument of execvp(3)" and, when
+  # present, is argv[0], while `ProgramArguments` then supplies argv[1..]; otherwise argv[0] is the first
+  # ProgramArguments element. In BOTH cases, when argv[0] is an INTERPRETER the file that actually runs is
+  # the first following non-flag element. So the candidate sequence is `Program` first, then every
+  # ProgramArguments element, and the answer is the first that is neither a flag nor an interpreter.
+  # ⛔ THE PREVIOUS VERSION APPLIED THE SKIP ONLY TO ProgramArguments, so `Program=/bin/bash` with the
+  # box controller as the first argument was REFUSED on every pass for ever — with a line asserting
+  # launchd would run `/bin/bash`, which is not what happens (measured, cycle 8). That is the "dead arm
+  # that looks healthy" shape this file refuses elsewhere.
+  # ⛔ NOTE THE PRECEDENCE DIFFERS FROM `install.sh` `plist_program`, WHICH PREFERS ProgramArguments AND
+  # FALLS BACK TO Program. This one follows the man page, because this gate is deciding what `execvp`
+  # receives. `install.sh` asks a different question (which SCRIPT does the rendered job start) and its
+  # answer is still right for that; where the two differ, this answer is the more conservative of the two
+  # in the direction that matters (it takes `Program` when both are present).
+  for _e in ${_prog:+"$_prog"} ${_args[@]+"${_args[@]}"}; do
+    case "$_e" in -*) continue ;; esac
+    case "${_e##*/}" in bash|sh|zsh|ksh|dash|env) continue ;; esac
+    _exec="$_e"; break
+  done
   if [ -z "$_exec" ]; then
     printf 'it declares neither a Program nor a runnable ProgramArguments entry, so there is nothing to load'
     return 0
@@ -559,8 +593,14 @@ plist_not_this_job() { # <file>
     orch-loop.sh|launchd-controller.sh|supervisor.sh) : ;;
     *) printf 'launchd would exec \047%s\047, which is not a controller entry (orch-loop.sh/launchd-controller.sh/supervisor.sh) — loading it would run a DIFFERENT program under \047%s\047' "$_exec" "$LABEL"; return 0 ;;
   esac
+  # ⛔ TRAILING SLASHES ARE STRIPPED FIRST (review P2, cycle 8). `$O` is an exported operator value and
+  # `O=~/orchestrator/` is ordinary spelling; `case "$_exec" in "$_root"/*)` then becomes
+  # `/…/orchestrator//*`, which a normal path never matches — so a legitimate plist was REFUSED on every
+  # pass, naming the very root the program is under. `install.sh:879-881` already normalises exactly this
+  # way before a prefix test; this uses the same loop.
   for _root in "$O" "$SELF_DIR" "$PIN_ROOT"; do
     [ -n "$_root" ] || continue
+    while [ "${#_root}" -gt 1 ] && [ "${_root%/}" != "$_root" ]; do _root="${_root%/}"; done
     case "$_exec" in "$_root"/*) return 1 ;; esac
   done
   printf 'launchd would exec \047%s\047, which is not under any of this box\047s roots (%s, %s, %s)' \
@@ -905,7 +945,16 @@ status_show() {
     echo "  ⛔ CRASH RECORDED ($CRASH_FILE):"
     echo "     (restarting was stopped for that episode; a later probe restart continues it with the"
     echo "      budget spent, and a healthy pass ends it. The record is never erased here.)"
-    sed -n '1,3p' "$CRASH_FILE"
+    # ⛔ THE LAST BLOCK, NOT THE FIRST THREE LINES (review P2, cycle 8). `record_crash` APPENDS per
+    # episode and the 64 KiB trimmer keeps the TAIL, so `sed -n '1,3p'` printed the OLDEST episode while
+    # the header one line above reported the CURRENT one — during an outage the operator read a previous
+    # episode's `cause:` under a report that named a different episode (measured: `episode: 2` above
+    # `episode=1 … cause: EPISODE-ONE`). Start at the LAST line that begins with an ISO timestamp — the
+    # shape `record_crash` writes as each block's header — so the block shown is the one that matters.
+    awk 'BEGIN { last = 0 }
+         { lines[NR] = $0
+           if ($0 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z[[:space:]]/) last = NR }
+         END { if (last == 0) last = 1; for (i = last; i <= NR; i++) print lines[i] }' "$CRASH_FILE" 2>/dev/null
   else
     echo "  crash:  none recorded"
   fi
@@ -1062,7 +1111,7 @@ main() {
     # refusal is a statement ABOUT; keeping it with `restart=1` is the false claim above. Both halves are
     # pinned: (r) asserts `restart=0` and no `restart=1` on a refusal pass, 8b(f) asserts the WEDGED
     # observation survives it.
-    log_line "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${prev_streak:-0}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"reason=$reason"$'\t'"note=the restart was WITHHELD — the arm that refused stated why above; no platform verb was issued and this pass consumed no restart budget"
+    log_line "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${prev_streak:-0}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"reason=$reason"$'\t'"note=the restart was WITHHELD — the arm that refused stated why above, and this pass consumed no restart budget. ⛔ NOT "no platform verb was issued": the one arm that refuses AFTER reaching launchd (the persistent Disabled override still reading 'disabled' following a successful `enable`) has already said so in its own line above, and for every other refusing arm nothing was issued"
     return 0
   fi
   log_line "$decision_line"
