@@ -624,15 +624,25 @@ chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # ⛔ A STUB, NOT THE SHIPPED FILE: the shipped `capacity.sh` reads THIS HOST's process population, and
 # a busy runner would then refuse 73 (fork) before the gate an arm names ever ran. The arithmetic has
 # its own suite (`capacity-placement.test.sh`); here the instrument only has to be PRESENT and HEALTHY.
-cat > "$RO/capacity.sh" <<'CAPEOF'
+# ⛔ ONE DEFINITION, EVERY RIG THAT COPIES THE GATE (§11's `$RES` is the second caller). The `$RES` rig
+# copies `spawn-gate.sh` into a directory that holds no harness, drives the REAL `run_agent`, and seeds
+# its validator — but NOT this instrument. With the floor as a refusal, that copy answers 81 (nodeploy)
+# BEFORE the capability resolver the arm exists to exercise ever runs, so the arm reported the SPREAD OF
+# THE INSTRUMENT as a capability-gate behaviour. It read green on a box whose ambient `AGENT_INFRA_PATH`
+# or `~/orchestrator` happened to supply the file and red on the runner, which is the same host-decides
+# class as the round-3 HOME fix and the §9 `_rigmiss` loop. Two heredocs would drift; one seeder cannot.
+seed_capacity_instrument() { # seed_capacity_instrument <dir holding a gate copy>
+  cat > "$1/capacity.sh" <<'CAPEOF'
 # Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
 cap_procs_pair_vars() { printf -v "${1:?}" '%s' 100; printf -v "${2:?}" '%s' 10000; printf -v "${3:?}" '%s' 'fixture'; }
 cap_h_for_vars() { printf -v "${3:?}" '%s' "$(( ${2:-0} - ${1:-0} ))"; }
 cap_fork_probe() { return 0; }
 CAPEOF
+  [ -f "$1/capacity.sh" ]
+}
 # …and assert it, so a future edit that drops the seed fails HERE naming the file, instead of
 # resurfacing as a bogus 81 two hundred lines later (the `_rigmiss` idiom, applied to the instrument).
-[ -f "$RO/capacity.sh" ]; rc=$?
+seed_capacity_instrument "$RO"; rc=$?
 ck "the rig carries the fork instrument (a rig without it answers 81 for every load/disk arm)" $rc
 # ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
 # ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
@@ -1477,6 +1487,15 @@ cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
 # instead of the 71 this arm asserts (measured: 247 passed / 1 failed, the failure being this arm).
 # The subject here is the CAPABILITY resolver, so the validator that gates it must travel with the rig.
 cp "$HERE/brief-gate.sh" "$RES/brief-gate.sh"
+# ⛔ AND THE FORK INSTRUMENT, FOR EXACTLY THE SAME REASON (measured 2026-11-04: this arm alone went red
+# on the runner while the whole file was green locally). Same class as the `$3042` note above and the
+# `$RO` seeder: `run_agent` reads the fork floor BEFORE it reaches the capability probe, and since that
+# floor REFUSES when its instrument is unresolvable, a gate copy in a bare directory answers 81 and the
+# resolver under test never runs. The arm then asserts 71 against 81 — a verdict about the SPREAD of
+# `capacity.sh`, not about the resolver. It passed on any box whose ambient `AGENT_INFRA_PATH` or
+# `~/orchestrator` supplied the file and failed on a bare runner, so the host decided it.
+seed_capacity_instrument "$RES"; rc=$?
+ck "the resolver rig carries the fork instrument too (a bare gate copy answers 81 before the probe runs)" $rc
 cat > "$RES/bin/pi" <<'PIHANG'
 #!/bin/sh
 case "$1" in --version) echo 9.9.9-stub; exit 0 ;; esac
