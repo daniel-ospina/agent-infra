@@ -400,33 +400,68 @@ controller_pid() {
 # `$LABEL`, and (b) its program is a controller entry inside one of THIS box's roots — the same three
 # the live-probe below uses: the deploy path `$O`, this file's own tree, and `$PIN_ROOT`.
 # ⛔ NO `plutil`: it is macOS-only, and these suites also run on Linux CI runners — a macOS-only reader
-# would leave the proof UNEXERCISED exactly where CI is supposed to prove it. Both readers below are
-# dependency-free (awk) and handle the same-line and the two-line `<string>` forms.
-plist_value() { # <file> <key> → the first <string> belonging to that key, or empty
-  awk -v key="$2" '
-    { n++; lines[n] = $0 }
-    END {
-      tag = "<key>" key "</key>"
-      for (i = 1; i <= n; i++) {
-        p = index(lines[i], tag); if (p == 0) continue
-        rest = substr(lines[i], p + length(tag))
-        if (match(rest, /<string>[^<]*<\/string>/)) {
-          m = substr(rest, RSTART, RLENGTH); gsub(/<\/?string>/, "", m); print m; exit
-        }
-        for (j = i + 1; j <= n && j <= i + 12; j++) {
-          if (match(lines[j], /<string>[^<]*<\/string>/)) {
-            m = substr(lines[j], RSTART, RLENGTH); gsub(/<\/?string>/, "", m); print m; exit
-          }
-        }
-      }
-    }' "$1" 2>/dev/null
-}
-plist_program_args() { # <file> → one ProgramArguments entry per line
+# ── THE PROBE: one dependency-free reader that reports what the plist ACTUALLY declares ──────────
+# ⛔ IT IS A PROBE, NOT THREE GREPS, because every previous version was fooled by a shape it did not
+# imagine (review P1, cycle 6 of #1986):
+#   * the COMPACT form `<key>ProgramArguments</key><array><string>…</string></array>` — which is the
+#     shape `orchestrator-bringup.test.sh` writes for THIS BOX'S OWN stack plist — made the old
+#     line-oriented reader return EMPTY, so the arm was inert on the shipped configuration;
+#   * `<!-- … -->` comments were scanned as if they were data, so a "copied from" comment naming the
+#     right label made a FOREIGN plist pass;
+#   * a plist declaring `Label` TWICE (the superseded one first) passed on the first match.
+# So: strip comments first (the state machine below handles comments spanning lines), then read the
+# document as ONE string, and report the number of `Label` keys so an ambiguous plist can be refused.
+# ⛔ NO `plutil` (macOS-only; these suites run on Linux CI too) and NO `python3` (a launchd job's PATH
+# may not carry it). awk only. Output is machine-read: `LABELCOUNT n`, `LABEL v`, `ARGS n`, `ARG v`.
+plist_probe() { # <file>
   awk '
-    /<key>ProgramArguments<\/key>/ { inarr = 1 }
-    inarr && /<\/array>/ { exit }
-    inarr && match($0, /<string>[^<]*<\/string>/) {
-      m = substr($0, RSTART, RLENGTH); gsub(/<\/?string>/, "", m); print m
+    function strip(s,   out, p) {
+      out = ""
+      while (length(s) > 0) {
+        if (inc) { p = index(s, "-->"); if (p == 0) { s = "" } else { s = substr(s, p + 3); inc = 0 } }
+        else     { p = index(s, "<!--"); if (p == 0) { out = out s; s = "" } else { out = out substr(s, 1, p - 1); s = substr(s, p + 4); inc = 1 } }
+      }
+      return out
+    }
+    # value of the FIRST <string> at or after `from`, bounded by `to`
+    function strval(doc, from, to,   p, q) {
+      if (to <= from) return ""
+      p = index(substr(doc, from, to - from + 1), "<string>"); if (p == 0) return ""
+      p = from + p - 1
+      q = index(substr(doc, p + 8), "</string>"); if (q == 0) return ""
+      return substr(doc, p + 8, q - 1)
+    }
+    { doc = doc strip($0) "\n" }
+    END {
+      tag = "<key>Label</key>"; c = 0; pos = 1
+      while (pos <= length(doc)) {
+        p = index(substr(doc, pos), tag); if (p == 0) break
+        c++; last = pos + p - 1; pos = last + length(tag)
+      }
+      printf "LABELCOUNT\t%d\n", c
+      if (c >= 1) printf "LABEL\t%s\n", strval(doc, last + length(tag), length(doc))
+      # ProgramArguments (array) first, then the singular `Program` launchd also accepts.
+      for (k = 1; k <= 2; k++) {
+        key = (k == 1) ? "<key>ProgramArguments</key>" : "<key>Program</key>"
+        p = index(doc, key); if (p == 0) continue
+        from = p + length(key)
+        if (k == 1) {
+          a = index(substr(doc, from), "<array>"); if (a == 0) continue
+          from = from + a - 1 + 7
+          z = index(substr(doc, from), "</array>"); if (z == 0) continue
+          to = from + z - 2
+        } else { to = length(doc) }
+        n = 0; start = from
+        while (start <= to && n < 40) {
+          v = strval(doc, start, to); if (v == "" ) break
+          q = index(substr(doc, start, to - start + 1), "<string>"); if (q == 0) break
+          n++; arg[n] = v
+          start = start + q - 1 + 8 + length(v) + 9
+        }
+        printf "ARGS\t%d\n", n
+        for (i = 1; i <= n; i++) printf "ARG\t%s\n", arg[i]
+        break
+      }
     }' "$1" 2>/dev/null
 }
 # Returns 0 when the plist is NOT this label's job (and prints the reason); returns 1 only when it IS.
@@ -434,23 +469,41 @@ plist_program_args() { # <file> → one ProgramArguments entry per line
 # proof function that returned 0 for "proven bad" would invite the inverse reading at the one call site
 # that mutates, and an inverted reading there bootstraps the FOREIGN plist, which is the exact
 # duplicate-controller class this function exists to stop (#1761/#1715).
+# ⛔ THE THREE PROOFS, and why each is there:
+#   1. EXACTLY ONE `Label`, and it IS `$LABEL`. Two Labels is ambiguous (which one does launchd resolve?)
+#      and an unknown one is a different job.
+#   2. `ProgramArguments` (or `Program`) declares a program.
+#   3. That program is a CONTROLLER ENTRY — basename one of the box's entry points — under one of THIS
+#      box's three roots ($O, this file's tree, $PIN_ROOT), with no `..` segment. A name list alone was
+#      cycle 5's bug (it refused the shipped `supervisor.sh`); a root test alone is cycle 6's (it
+#      accepted `$SELF_DIR/watchdog-loop.sh`, i.e. loading the WATCHDOG as the controller, which keeps
+#      the controller dead and then blocks the real restore with "service already loaded"). Together
+#      they say what the proof actually means: this is a controller program of this box.
 plist_not_this_job() { # <file>
-  local _lbl _prog _e _found="" _root _seen=""
-  _lbl="$(plist_value "$1" Label)"
+  local _probe _cnt _lbl _nargs _e _found="" _root _seen=""
+  _probe="$(plist_probe "$1")"
+  _cnt="$(printf '%s\n' "$_probe" | awk -F'\t' '$1=="LABELCOUNT"{print $2}')"
+  case "${_cnt:-}" in
+    '' ) printf 'it could not be read as a plist at all (no Label key found)'; return 0 ;;
+    1  ) : ;;
+    *  ) printf 'it declares %s Label keys, which is ambiguous — refusing to guess which job launchctl would resolve' "$_cnt"; return 0 ;;
+  esac
+  _lbl="$(printf '%s\n' "$_probe" | awk -F'\t' '$1=="LABEL"{print $2; exit}')"
   [ "$_lbl" = "$LABEL" ] || {
     printf 'its Label is \047%s\047, not \047%s\047' "${_lbl:-<none>}" "$LABEL"; return 0; }
-  _prog="$(plist_program_args "$1")"
-  # ⛔ NO BASENAME ALLOWLIST (review P1, cycle 5 of #1986). The first version demanded an entry named
-  # `orch-loop.sh`/`launchd-controller.sh`, and that REFUSED THIS BOX'S OWN JOB: the shipped stack label
-  # `com.eldato.orchestrator-stack` runs `/bin/bash $O/supervisor.sh` (see `RESOLVER_SET` in
-  # `orchestrator-bringup.sh`, "the ProgramArguments of this box's controller job"), while
-  # `com.eldato.orchestrator-loop` runs `orch-loop.sh` and a cell may run `launchd-controller.sh`. An
-  # allowlist of entry-point names therefore made the arm INERT on the default configuration — trading
-  # a dead arm for a safe one, which this arm's own comment forbids. The provenance is the ROOT the
-  # program lives in, not the name it has: a plist for another job is rejected by the `Label` equality
-  # above, so the root test only has to establish THAT THIS IS A PROGRAM OF THIS BOX.
-  for _e in $_prog; do
+  _nargs="$(printf '%s\n' "$_probe" | awk -F'\t' '$1=="ARGS"{print $2; exit}')"
+  case "${_nargs:-0}" in
+    0) printf 'it declares no ProgramArguments/Program, so there is nothing to load'; return 0 ;;
+  esac
+  for _e in $(printf '%s\n' "$_probe" | awk -F'\t' '$1=="ARG"{print $2}'); do
     _seen="$_seen $_e"
+    # ⛔ TRAVERSAL IS REFUSED EXPLICITLY: the root test below is a string prefix, and an unnormalised
+    # `$O/../../evil/...` satisfies it while naming a program outside every root (measured in review).
+    case "$_e" in *..*) continue ;; esac
+    case "${_e##*/}" in
+      orch-loop.sh|launchd-controller.sh|supervisor.sh) : ;;
+      *) continue ;;
+    esac
     for _root in "$O" "$SELF_DIR" "$PIN_ROOT"; do
       [ -n "$_root" ] || continue
       case "$_e" in "$_root"/*) _found="$_e"; break ;; esac
@@ -458,7 +511,7 @@ plist_not_this_job() { # <file>
     [ -n "$_found" ] && break
   done
   [ -n "$_found" ] && return 1
-  printf 'none of its ProgramArguments are a program under this box\047s roots (%s, %s, %s) — it runs:%s' \
+  printf 'no ProgramArguments entry is a controller program (orch-loop.sh/launchd-controller.sh/supervisor.sh) under this box\047s roots (%s, %s, %s) — it runs:%s' \
     "$O" "$SELF_DIR" "$PIN_ROOT" "${_seen:- <empty>}"
   return 0
 }
@@ -571,8 +624,17 @@ restart_stack() {
               # queue (#1715). `pid_is_controller` still gates each candidate, so a recycled pid or a
               # look-alike without `orch-loop.sh` in its argv is not evidence of life.
               local _pat _cand
+              # ⛔ THE PIN-TREE PATTERN IS INTERPRETER-ANCHORED, LIKE ITS TWO SIBLINGS (review P2, cycle 6).
+              # It used to be a bare path, and `pid_is_controller` accepts any argv merely CONTAINING
+              # `orch-loop.sh` — so an editor, a `tail -f` or a `git diff` left open on the controller file
+              # was read as "a controller is ALIVE" and withheld the restore for as long as it lived, then
+              # named it as the controller in the durable log (measured). `(^|/)bash ` keeps the shapes the
+              # box actually launches (`/bin/bash …` and `bash …`) and drops the look-alikes. RESIDUAL,
+              # stated because it is the dangerous direction: a controller started through a DIFFERENT
+              # interpreter would no longer be seen by this pattern — the same residual the other two
+              # patterns already carry, which is why this makes the set CONSISTENT rather than adding it.
               for _pat in "bash ${O}/orch-loop.sh" "bash ${SELF_DIR}/orch-loop.sh" \
-                          "${PIN_ROOT}/[^ ]*/scripts/orchestrator-harness/orch-loop.sh"; do
+                          "(^|/)bash +${PIN_ROOT}/[^ ]*/scripts/orchestrator-harness/(orch-loop|launchd-controller)\.sh"; do
                 for _cand in $(pgrep -f "$_pat" 2>/dev/null); do
                   [ "$_cand" = "$$" ] && continue
                   if pid_is_controller "$_cand"; then live="$_cand"; break 2; fi
@@ -799,6 +861,8 @@ main() {
   streak="$(cat "$STREAK_FILE" 2>/dev/null || echo 0)"
   case "${streak:-}" in ''|*[!0-9]*) streak=0 ;; esac
   local prev_streak="$streak"
+  local prev_episode; prev_episode="$(cat "$EPISODE_FILE" 2>/dev/null || echo 0)"
+  case "${prev_episode:-}" in ''|*[!0-9]*) prev_episode=0 ;; esac
   streak=$(( streak + 1 ))
   # ⛔ THE PERSIST COMES BEFORE THE EPISODE BUMP, AND THE BUMP IS GATED ON IT. When the streak file
   # cannot be written the read is ALWAYS 0, so an unguarded `if streak -eq 0` starts a new episode on
@@ -879,13 +943,17 @@ main() {
     #     used to be EMITTED BEFORE this test, so every refusal pass logged a restart — and a probe
     #     restart — for a pass in which `launchctl.calls` held nothing but `print` lines. That is the
     #     exact false claim cycle 3 removed from the arm's own lines, left alive one line above them.
-    #   * NO BUDGET. The streak is restored to the value this pass READ, because a WITHHELD restart is
-    #     not a restart that FAILED. Counting refusals against the consecutive cap let three harmless
-    #     refusals latch the box into `<verdict>_STOPPED` and then withheld the arm for up to
-    #     `2 x MAX_CONSEC` further passes — trading a dead arm for a safe one, which this arm's own
-    #     comment refuses. (`episode` is deliberately NOT restored: with the streak restored no crash is
-    #     recorded, so the episode number is never consumed by a refusal.)
+    #   * NO BUDGET. The streak AND the episode are restored to the values this pass READ, because a
+    #     WITHHELD restart is not a restart that FAILED. Counting refusals against the consecutive cap
+    #     let three harmless refusals latch the box into `<verdict>_STOPPED` and then withheld the arm
+    #     for up to `2 x MAX_CONSEC` further passes — trading a dead arm for a safe one, which this arm's
+    #     own comment refuses. The episode matters for the same reason cycle 6 found it: the bump is
+    #     PERSISTED during the pass, so leaving it alone made every refusal consume an episode number
+    #     (measured: `episode=1,2,3,4,5` across five refusals with `streak=0` throughout), and the crash
+    #     record's `episode=` — whose whole purpose is "a new streak is a NEW crash loop" — degenerated
+    #     into a pass counter (~288/day at the 300 s cadence) that no operator can correlate.
     printf '%s' "${prev_streak:-0}" 2>/dev/null > "$STREAK_FILE" || true
+    printf '%s' "${prev_episode:-0}" 2>/dev/null > "$EPISODE_FILE" || true
     # ⛔ THE OBSERVATION IS STILL RECORDED — with `restart=0`, which is the honest claim. Dropping the
     # decision line entirely on a refusal would lose the measured verdict (WEDGED/DOWN) that the arm's
     # refusal is a statement ABOUT; keeping it with `restart=1` is the false claim above. Both halves are

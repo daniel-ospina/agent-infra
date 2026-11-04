@@ -812,6 +812,7 @@ while [ "$_i" -lt 4 ]; do removed_pass "$C/pass.out"; _i=$(( _i + 1 )); done
 assert_eq "$(cat "$C/state/controller-watchdog.streak" 2>/dev/null || echo 0)" "0" "four refusals leave the streak at 0 (a withheld restart is not a failed one)"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "STOPPED" "…so the arm is never latched into a STOPPED state by refusals alone"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "restart=1" "…and no refusal pass claims restart=1"
+assert_eq "$(cat "$C/state/controller-watchdog.episode" 2>/dev/null || echo 0)" "0" "…and no episode number is consumed by a refusal (the crash record's episode must stay correlatable)"
 # (s) THE SHIPPED STACK SHAPE IS ACCEPTED. ⛔ THIS CASE EXISTS BECAUSE THE FIRST PROVENANCE GATE REFUSED IT
 #     (review P1, cycle 5): the gate demanded an entry named `orch-loop.sh`/`launchd-controller.sh`, but
 #     the DEFAULT label's job — `com.eldato.orchestrator-stack` — runs `/bin/bash $O/supervisor.sh`
@@ -827,6 +828,76 @@ removed_pass "$C/pass.out"
 CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
 assert_contains "$CALLS_OUT" "bootstrap gui/$(id -u) $C/stack.plist" "the box's OWN stack plist (supervisor.sh, not orch-loop.sh) is bootstrapped"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and the provenance gate does not refuse the shipped configuration"
+
+# (t) THE REAL SHAPE OF THAT PLIST IS COMPACT. ⛔ CYCLE 5's §8b(s) seeded the multi-line form and went
+#     green while the arm was INERT on the plist `orchestrator-bringup.test.sh` actually writes:
+#     `<key>ProgramArguments</key><array><string>…</string></array>` on ONE line. The line-oriented
+#     reader returned no entries for it, so the gate refused the box's own job (review P1, cycle 6).
+#     This case is the shipped shape verbatim, and it is the one that reddens if the reader regresses.
+echo "── 8b(t). the COMPACT ProgramArguments form (bringup's real shape) is read, not skipped"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTC
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/supervisor.sh</string></array>
+</dict></plist>
+PLISTC
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "bootstrap gui/$(id -u) $C/stack.plist" "a COMPACT one-line ProgramArguments array is parsed, so the arm still fires"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and is not refused for declaring no ProgramArguments"
+# (u) A COMMENT IS NOT DATA. A "copied from" comment naming the right label made a FOREIGN plist pass the
+#     gate, which is the stale/copied-plist case the gate exists for (review P1, cycle 6).
+echo "── 8b(u). a matching Label inside an XML COMMENT does not make a foreign plist pass"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<'PLISTU'
+<plist version="1.0"><dict>
+  <!-- copied from <key>Label</key><string>com.eldato.orchestrator-stack</string> -->
+  <key>Label</key><string>com.somebody.else.job</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>ORCH</string></array>
+</dict></plist>
+PLISTU
+sed -i "s#ORCH#$C/o/supervisor.sh#" "$C/stack.plist" 2>/dev/null || sed -i '' "s#ORCH#$C/o/supervisor.sh#" "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a Label that only appears in a comment is not the plist's Label"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses and says so"
+# (v) TWO Labels IS AMBIGUOUS. launchctl resolves the job from the plist; the gate must not pick one.
+echo "── 8b(v). a plist declaring TWO Label keys is refused as ambiguous"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTV
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>SUP</string></array>
+  <key>Label</key><string>com.somebody.else.job</string>
+</dict></plist>
+PLISTV
+sed -i "s#SUP#$C/o/supervisor.sh#" "$C/stack.plist" 2>/dev/null || sed -i '' "s#SUP#$C/o/supervisor.sh#" "$C/stack.plist"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "an ambiguous plist is never bootstrapped"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "ambiguous" "…the refusal names the ambiguity"
+# (w) TRAVERSAL. The root test is a string prefix; an unnormalised `$O/../../evil/…` satisfied it while
+#     naming a program outside every root (review P2, cycle 6).
+echo "── 8b(w). a .. traversal that LOOKS under a root is refused"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+seed_plist "$C/stack.plist" 'com.eldato.orchestrator-stack' "$C/o/../../evil/scripts/orchestrator-harness/orch-loop.sh"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a program outside every root cannot pass by traversing through one"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses"
+# (x) THE WATCHDOG IS NOT THE CONTROLLER. A root-only test accepted
+#     `$SELF_DIR/watchdog-loop.sh`, i.e. loading the WATCHDOG onto the controller's label: the controller
+#     stays dead AND the real restore is then blocked with "service already loaded".
+echo "── 8b(x). the watchdog itself is not accepted as the controller program"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+seed_plist "$C/stack.plist" 'com.eldato.orchestrator-stack' "$SELF_DIR/watchdog-loop.sh"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "the watchdog is never loaded onto the controller's label"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…the pass refuses"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
