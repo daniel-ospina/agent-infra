@@ -119,6 +119,13 @@ fi
     exit 3
 }
 
+# ⛔ AN UNREADABLE RECORD IS 2, NOT 3 (review of #3405, P2). A permissions problem is not "nobody
+# stamped it", and steering the operator to re-stamp over it is the wrong remedy.
+[ -r "$RECORD" ] || {
+    warn "REFUSING: $RECORD exists but cannot be read — this is a permissions/ownership problem, not an unstamped box."
+    exit 2
+}
+
 # ⛔ THE RECORD OWNS THE DIRECTORY. The reaper's unit runs with HOME=/tmp/cell-home while an operator's
 # shell has HOME=/home/<user>, so `--dir` defaulting to the CALLER's HOME would check a directory the
 # timer never executes (measured: a stamp written against /tmp/cell-home verified as seven MISSING
@@ -131,13 +138,21 @@ fi
 
 drift=0
 checked=0
+appeared=""
 while read -r digest name; do
     case "$digest" in ''|\#*) continue ;; esac
     [ -n "$name" ] || continue
     checked=$((checked + 1))
     if [ "$digest" = missing ]; then
-        # The stamp recorded it absent; a file that APPEARED is fine (someone farmed it since).
-        if [ -f "$DIR/$name" ]; then say "appeared  $name (stamp had it missing)"; fi
+        # ⛔ A FILE THAT APPEARED IS NOT VERIFIED (review of #3405, P2). It used to `continue` to a
+        # green summary, so a delegate the stamp recorded ABSENT and someone then hand-copied in was
+        # reported ok WITHOUT ever being hashed — exit 0 for bytes nobody measured. It is now a
+        # re-stamp requirement: the box changed under the record.
+        if [ -f "$DIR/$name" ]; then
+            warn "APPEARED  $name — farmed after the stamp and never measured; re-stamp to make it accountable"
+            appeared="$appeared $name"
+            drift=1
+        fi
         continue
     fi
     if [ ! -f "$DIR/$name" ]; then
@@ -162,6 +177,18 @@ while read -r digest name; do
     fi
     say "same      $name $now"
 done < "$RECORD"
+
+# ⛔ THE RECORD IS RECONCILED WITH THE PINNED SET (review of #3405, P2). The loop above iterates the
+# record's OWN lines, so a delegate added to $FILES (and to the unit's `Environment=*_REAPER=`) after
+# the stamp was taken was never checked while the summary still read ok — which is exactly the "a file
+# the unit executes cannot sit outside the check" promise this script's header makes. A pinned file
+# with no record line is therefore a drift.
+for f in $FILES; do
+    if ! grep -qE "  $f\$" "$RECORD" 2>/dev/null; then
+        warn "UNRECORDED $f — pinned in this checker but absent from $RECORD; it has never been measured"
+        drift=1
+    fi
+done
 
 if [ "$checked" = 0 ]; then
     warn "UNSTAMPED: $RECORD names no file — an empty record verifies nothing."

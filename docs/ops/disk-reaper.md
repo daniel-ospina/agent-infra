@@ -174,18 +174,23 @@ only honest answer is to **preserve it out of the tree and then let the ordinary
 
 * `IGNORED_LANE_EVIDENCE` (`REAP_WT_IGNORED_EVIDENCE`, default ` .worktree-report WORKTREE-REPORT.md `)
   and `IGNORED_POINTER` (`REAP_WT_IGNORED_POINTER`, default ` scripts `) stop vetoing. Both are
-  **ROOT-level only**, and the pointer is tolerated **only when it really is a symlink** (`-L`): a real
-  `scripts/` DIRECTORY is a checkout's own content and keeps preserving.
+  **ROOT-level only**, and the pointer is tolerated **only when it really is a symlink** (`-L`) — the
+  NAME list and the `-L` test are a CONJUNCTION, so a real `scripts/` DIRECTORY is a checkout's own
+  content and keeps preserving, and a symlink under any other name is not admitted either. Both
+  negative controls are fixtures in the suite, each with its own mutant.
 * **Every other ignored entry still preserves** (`ignored-artifact`) — `G2b`/`G2e` hold that line, and
   the `data/kind_index`, `build/`, `.coverage` rows above are untouched by this change.
 * `preserve_before_removal()` is **gate (b)** on **every** removal (not only evidence rows): before the
-  fork that destroys, it writes
-  `<REAP_WT_PRESERVE_DIR>/<UTC date>/<slug>.<sha8>/` with `lane-evidence.tar.gz` (the mandated report),
-  `worktree.diff` (`git diff HEAD`), `worktree.status` (`git status --porcelain`) and `manifest.txt`
-  (path, branch, HEAD, reason, time, restore recipe) — **and verifies the capture**. A capture that
-  does not verify takes the PRESERVE arm: nothing is removed. This is the same contract as
-  `backup_before_removal`, and it exists because a LANDED checkout can still hold work a human wanted
-  (a fixer mid-edit when its PR auto-merged is the ordinary case).
+  fork that destroys — and **before the last holder re-check**, so the final liveness probe is still
+  the last thing before the fork — it writes
+  `<REAP_WT_PRESERVE_DIR>/<UTC date>/<slug>.<sha8>.<pathdisc>/` with `lane-evidence.tar.gz` (the
+  mandated report), `worktree.diff` (`git diff HEAD`), `worktree.status` (`git status --porcelain`)
+  and `manifest.txt` (path, branch, HEAD, reason, time, restore recipe) — **and verifies the
+  capture**. The directory is keyed on the CHECKOUT, not the branch: every DETACHED worktree has no
+  branch, so a branch-keyed name made two removals in one pass overwrite each other's evidence. A
+  capture that does not verify takes the PRESERVE arm: nothing is removed. This is the same contract
+  as `backup_before_removal`, and it exists because a LANDED checkout can still hold work a human
+  wanted (a fixer mid-edit when its PR auto-merged is the ordinary case).
 * `REAP_WT_PRESERVE=0` restores the **pre-fix verdict exactly** — the tolerance in `clean_gate` is
   gated on the same switch as the archive, so a row can never be called `clean` because of something
   the removal path will not write down.
@@ -221,13 +226,15 @@ scripts/disk-reaper-deployed-check.sh --source ~/agent-infra           # …and 
 | exit | meaning |
 |---|---|
 | 0 | every pinned file matches the stamp (and the checkout, when `--source` was given) |
-| 1 | **DRIFT** — a deployed file changed since the stamp, is missing, or differs from the checkout |
-| 2 | usage, or the record cannot be read/written |
+| 1 | **DRIFT** — a deployed file changed since the stamp, is missing, is one the stamp never MEASURED (`APPEARED`), or is pinned by this checker but absent from the record (`UNRECORDED`), or differs from the checkout |
+| 2 | usage, or the record exists but cannot be read (a permissions problem — **not** "unstamped") |
 | 3 | **UNSTAMPED** — no record, so "the copy that runs is the copy we think" is **UNPROVEN** |
 
-3 is deliberately distinct from 1: an absent record is a *set-up gap*, not a change. The file list is
-the set the systemd unit **pins** (`Environment=*_REAPER=`), written once in the checker, so a delegate
-the unit executes cannot sit outside the check. `disk-reaper-deployed-check.test.sh` drives every
+3 is deliberately distinct from 1: an absent record is a *set-up gap*, not a change. A file the stamp
+recorded `missing` and someone later farmed is **`APPEARED`** and fails: it is bytes nobody measured,
+and the remedy is a re-stamp, never a green summary. The file list is the set the systemd unit
+**pins** (`Environment=*_REAPER=`), written once in the checker, and the record is **reconciled**
+against it every run, so a delegate the unit executes cannot sit outside the check. `disk-reaper-deployed-check.test.sh` drives every
 branch to its red path (D2 a one-byte change, D3 a missing delegate, D5 `SOURCE-DRIFT` for the
 153-commit shape, D6 a checkout that cannot explain the file, D7/D8 unstamped, D9 usage) — a checker
 that cannot fail would certify a stale deployment.
@@ -1027,8 +1034,8 @@ own fixture: without that, a `--apply` assertion anywhere in it would sweep the 
 | T55 | **a full disk does not stop the pass** (#2443): an uncreatable state dir falls back to a tmpfs candidate — the classes RUN, the record is written with `state_dir=`/`state_dir_primary=` and says why, and the pass discloses it; the fallback lock is a REAL lock (a live holder still defers, 6); nothing writable anywhere is still a refusal naming every candidate; a writable configured dir produces the unchanged record; and the record returns to the configured path on the next pass once it can be written |
 | T62 | the **installer** refuses to render a unit that scans nothing: an all-empty resolved list is refused (rc=1, no unit written) and an entry dropped from a PARTIALLY resolvable list is NAMED on **stderr** — quoting git's own first line, measured on its own stream — while the entries it CAN use still install. It also pins the absolute-path arm hoisted above the git probe (a relative / `git@host:owner/repo.git` candidate is dropped for the reason that applies, not blamed on a missing checkout) and the `<git gave no message>` fallback (#2159/#2878) |
 | T63 | the **hourly pass** applies the same rule in its own `resolve_repos`: git's own error line reaches the operator (`git cannot use it here (fatal: cannot change to …)`) instead of the blanket `not a git checkout`, a silent non-zero git renders `<git gave no message>`, and a probe killed by the BOUND (rc=124, a dead or hung mount) is named as a timeout rather than as a git that said nothing (#2159) |
-| T64 | **lane evidence** (`scripts/pi-reap-worktrees.test.sh` G2g–G2x): a LANDED checkout whose only ignored entries are the fleet-mandated ones is `reclaimable`, and an armed pass removes it while the unlanded (open-PR) and dirty-but-landed siblings in the SAME fixture are refused; the archive is verified **by content** (the lane's own report text round-trips out of the tarball), the `manifest` names path/HEAD/reason, **a second pass removes nothing and writes no second archive**, a dry run archives nothing, and a **mutant** with the evidence predicate neutered goes RED while the control on the same fixture stays green (#1932 over-preservation, the 70-row/20.5 GB class) |
-| T65 | **deployed-vs-source** (`scripts/disk-reaper-deployed-check.test.sh` D1–D9): a fresh stamp verifies (control), one changed byte is `DRIFT` (1) and is NAMED, a pinned delegate that is MISSING is drift, a file that appeared after the stamp is not, deployed-vs-checkout disagreement is `SOURCE-DRIFT` (the measured 153-commit shape), a checkout that cannot explain a file is drift, and **no record / an empty record is `UNSTAMPED` (3), never 0** |
+| T64 | **lane evidence** (`scripts/pi-reap-worktrees.test.sh` G2g–G2y): a LANDED checkout whose only ignored entries are the fleet-mandated ones is `reclaimable`, and an armed pass removes it while the unlanded (open-PR) and dirty-but-landed siblings in the SAME fixture are refused; the archive is verified **by content** (the lane's own report text round-trips out of the tarball), the `manifest` names path/HEAD/reason, **a second pass removes nothing and writes no second archive**, a dry run archives nothing, and TWO mutants must go RED while controls on the same fixtures stay green — the evidence predicate neutered (G2x) and the pointer predicate back to its shipped early-return form, which would admit a real `scripts/` DIRECTORY and an unrelated ignored symlink (G2y) (#1932 over-preservation, the 70-row/20.5 GB class) |
+| T65 | **deployed-vs-source** (`scripts/disk-reaper-deployed-check.test.sh` D1–D9c): a fresh stamp verifies (control), one changed byte is `DRIFT` (1) and is NAMED, a pinned delegate that is MISSING is drift, a file farmed after the stamp is `APPEARED` (unmeasured, exit 1) and re-stamping clears it, a pinned file absent from the record is `UNRECORDED` (the set is reconciled, not trusted), deployed-vs-checkout disagreement is `SOURCE-DRIFT` (the measured 153-commit shape), an unreadable record is 2 (permissions) and **no record / an empty record is `UNSTAMPED` (3), never 0** |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
 flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1

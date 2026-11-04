@@ -76,14 +76,21 @@ eq "$RC" "1" "D3 a MISSING pinned delegate is drift (exit 1)"
 has "$OUT" "reap-lane-venvs.sh — MISSING" "D3 the missing file is named, with why it matters"
 mv "$T/deployed/.gone" "$T/deployed/reap-lane-venvs.sh"
 
-# ── D4: a file that APPEARED since the stamp is NOT drift ────────────────────────
+# ── D4: a file farmed after the stamp is APPARENT, not verified (review of #3405) ─────
+# It used to continue to a green summary, i.e. exit 0 for bytes nobody had ever hashed. A delegate the
+# record called absent and someone then hand-copied in is exactly the "stale copy that quietly runs"
+# shape, so it is now a re-stamp requirement.
 mk_env
 mv "$T/deployed/pi-reap-worktrees.sh" "$T/deployed/.later"
 run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
 mv "$T/deployed/.later" "$T/deployed/pi-reap-worktrees.sh"
 OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
-eq "$RC" "0" "D4 a file farmed AFTER the stamp does not fail the pass"
-has "$OUT" "appeared  pi-reap-worktrees.sh" "D4 …and the check says so rather than staying silent"
+eq "$RC" "1" "D4 a file farmed AFTER the stamp is not claimed as verified (exit 1)"
+has "$OUT" "APPEARED  pi-reap-worktrees.sh" "D4 …and the check names it as unmeasured, not as ok"
+has "$OUT" "re-stamp" "D4 …and says what makes it accountable again"
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
+eq "$RC" "0" "D4 …re-stamping makes it green again (a measurement, not a permanent error)"
 
 # ── D5/D6: the deployed-vs-SOURCE comparison ────────────────────────────────────
 mk_env
@@ -116,6 +123,25 @@ run --bogus >/dev/null 2>&1; eq "$?" "2" "D9 an unknown flag is a usage error (2
 run --help >/dev/null 2>&1; eq "$?" "0" "D9 --help exits 0"
 run --stamp --dir "$T/does-not-exist" --record "$T/r2" >/dev/null 2>&1; eq "$?" "2" \
     "D9 --stamp on a directory that does not exist is refused (a stamp of nothing is a false PASS)"
+# D9b: an UNREADABLE record is 2 (a permissions problem), never 3 ("nobody stamped it").
+mk_env
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+chmod 000 "$REC"
+OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
+chmod 644 "$REC"
+if [ "$(id -u)" = 0 ]; then
+    echo "  · D9b skipped (root can read anything)"
+else
+    eq "$RC" "2" "D9b an unreadable record is exit 2, not 'unstamped'"
+    has "$OUT" "cannot be read" "D9b …and the refusal says it is a permissions problem"
+fi
+# D9c: a pinned file that the record never mentions is UNMEASURED, not fine.
+printf '# trimmed record\n' >"$T/trim.record"
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+grep -vF '  reap-duplicate-installs.sh' "$REC" >"$T/trim.record"
+OUT="$(run --dir "$T/deployed" --record "$T/trim.record")"; RC=$?
+eq "$RC" "1" "D9c a pinned delegate missing from the record makes the check fail (the set is reconciled, not trusted)"
+has "$OUT" "UNRECORDED reap-duplicate-installs.sh" "D9c …and it is named"
 
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ] || exit 1

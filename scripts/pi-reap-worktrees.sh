@@ -802,9 +802,10 @@ IGNORED_REGENERABLE=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS
 # the removal path (`preserve_before_removal`), and it is why `clean_gate` may call a tree with only
 # these entries `clean` at all.
 #
-# ROOT-LEVEL ONLY, and every name must be SPACE-FREE: `lane_evidence_present` returns this list to a
-# caller that expands it UNQUOTED (like the ephemeral payload), so a name containing a space would
-# split and archive/delete the wrong thing. Both defaults satisfy that; keep it true.
+# ROOT-LEVEL ONLY, and every name must be SPACE-FREE **and GLOB-FREE**: `lane_evidence_present`
+# returns this list to a caller that expands it UNQUOTED (like the ephemeral payload), so a name
+# containing a space would split and one containing `*?[` would expand against the reaper's cwd.
+# Both defaults satisfy that; keep it true.
 IGNORED_LANE_EVIDENCE="${REAP_WT_IGNORED_EVIDENCE- .worktree-report WORKTREE-REPORT.md }"
 # The agent-infra pointer. Tolerated ONLY when it really is a SYMLINK at the worktree root (`-L` is
 # checked in clean_gate): a real `scripts/` DIRECTORY is a checkout's own content and stays protected.
@@ -1096,7 +1097,13 @@ is_agent_pointer_entry() { # <worktree-path> <entry>
     local path="$1" p="${2%/}" base
     base="${p##*/}"
     [ "$p" = "$base" ] || return 1
-    case "$IGNORED_POINTER" in *" $base "*) return 0 ;; esac
+    # ⛔ THE NAME ARM MUST NOT RETURN EARLY (review of #3405, P1). An earlier version read
+    # `case … in *" $base "*) return 0 ;; esac` — which returned on the NAME alone, leaving the
+    # `-L` test reachable only for a name that did NOT match, i.e. it admitted **any root-level
+    # ignored symlink of any name** and admitted a real `scripts/` DIRECTORY too. Both halves are
+    # load-bearing: the name list chooses WHICH entry may be dismissed, and `-L` proves that the
+    # thing being dismissed is a pointer rather than a checkout's own content.
+    case "$IGNORED_POINTER" in *" $base "*) ;; *) return 1 ;; esac
     [ -L "$path/$base" ] || return 1
     return 0
 }
@@ -1760,11 +1767,19 @@ clean_gate() {
 # mid-edit when its PR auto-merged is the ordinary case).
 preserve_before_removal() { # <path> <sha> <branch> <reason>
     local path="$1" sha="$2" br="$3" why="$4"
-    local slug day dir ev tarf out listed e rc ok=1
+    local slug day dir ev tarf out listed e rc ok=1 disc
     slug="$(printf '%s' "${br#refs/heads/}" | tr '/' '_')"
     [ -n "$slug" ] || slug="detached"
     day="$("$DATE_BIN" -u +%Y-%m-%d 2>/dev/null)" || day="undated"
-    dir="$REAP_WT_PRESERVE_DIR/$day/$slug.${sha:0:8}"
+    # ⛔ THE DIRECTORY IS KEYED ON THE CHECKOUT, NOT ON THE BRANCH (review of #3405, P1). A DETACHED
+    # worktree has no branch (`-`), so every detached checkout at one commit maps to the same
+    # `$day/-.<sha8>`: two removals in one pass then OVERWRITE each other's tarball, diff, status and
+    # manifest — silently destroying the only copy of the earlier lane's evidence AFTER its tree is
+    # gone. Detached-at-main is the ordinary dispatch shape, so this was reachable on any busy pass.
+    # The path digest makes the directory unique per checkout; the manifest still carries `path=` for
+    # a human, and this is an identity key, not a security boundary.
+    disc="$(printf '%s' "$path" | cksum | cut -d' ' -f1)"
+    dir="$REAP_WT_PRESERVE_DIR/$day/$slug.${sha:0:8}.$disc"
     if ! mkdir -p "$dir" 2>/dev/null; then
         log "PRESERVE-FAIL $path cannot create $dir"
         return 1
@@ -3543,18 +3558,18 @@ remove_one() {
         rm -f "$out"; return 2
     fi
 
-    # Re-check #3 — THE HOLDER RULE, as the LAST thing before the fork (review round 3, P2). The
-    # comment on re-check #0 called it "right before the delete" while it actually ran first, leaving
-    # the two `git status` calls and the ephemeral deletions (up to REAP_WT_REMOVE_TIMEOUT each)
-    # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
-    holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
-
     # ── GATE (b): PRESERVE, THEN DESTROY ─────────────────────────────────
-    # Runs AFTER the last holder/liveness re-check (so a checkout that just came back to life is
-    # never even archived) and IMMEDIATELY BEFORE the fork that destroys — the narrowest window this
-    # file has. A capture that does not verify takes the PRESERVE arm (rc 2), never a removal: the
-    # whole point is that a LANDED checkout can still hold work a human wanted, and the lane-evidence
-    # tarball is the only copy of the mandatory per-lane report once the tree is gone.
+    # ⛔ IT SITS BETWEEN THE STATUS RE-CHECK AND THE HOLDER RE-CHECK, NOT AFTER BOTH (review of #3405,
+    # P2). Re-check #3 exists because review round 3 found the fork uncovered during "the two
+    # `git status` calls and the ephemeral deletions … the largest part of the window". The archive is
+    # FOUR more bounded forks (tar -czf, tar -tzf, git diff, git status — up to ~4.7 min at the
+    # defaults), so putting it after re-check #3 would re-open that same window, one size class worse:
+    # a lane that comes back to life during the archive would be destroyed under it. With this order
+    # the last liveness probe is still the LAST thing before the fork, and a row preserved by it
+    # leaves a harmless archive that the next pass rewrites in the same per-checkout directory.
+    # A capture that does not verify takes the PRESERVE arm (rc 2), never a removal: a LANDED
+    # checkout can still hold work a human wanted, and the lane-evidence tarball is the only copy of
+    # the mandatory per-lane report once the tree is gone.
     if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
         if ! presv="$(preserve_before_removal "$path" "$sha" "$br" "${why:-reclaimable}")"; then
             REMOVE_SKIP_VERDICT="preserve-failed"
@@ -3563,6 +3578,13 @@ remove_one() {
         fi
         log "PRESERVE-OK $path $presv"
     fi
+
+    # Re-check #3 — THE HOLDER RULE, as the LAST thing before the fork (review round 3, P2). The
+    # comment on re-check #0 called it "right before the delete" while it actually ran first, leaving
+    # the two `git status` calls and the ephemeral deletions (up to REAP_WT_REMOVE_TIMEOUT each)
+    # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
+    # ⛔ AND IT STAYS LAST (#3405 review, P2): gate (b) above runs BEFORE it for exactly this reason.
+    holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
 
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
     rc=$?

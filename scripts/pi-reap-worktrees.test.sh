@@ -1013,7 +1013,7 @@ assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/g2-eph | wc -l | tr -d ' 
 # the reaper's actuator could not deliver while every one of its gates read green.
 ENV_PV="$ENV-pv"
 REPO_PV="$(mk_repo "$ENV_PV")"
-printf '%s\n' '.worktree-report/' 'WORKTREE-REPORT.md' 'scripts' >"$REPO_PV/.gitignore"
+printf '%s\n' '.worktree-report/' 'WORKTREE-REPORT.md' 'scripts' 'data' >"$REPO_PV/.gitignore"
 printf 'base2\n' >"$REPO_PV/base2.txt"
 "$REAL_GIT" -C "$REPO_PV" add .gitignore base2.txt
 GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO_PV" commit -qm ignore2
@@ -1038,6 +1038,18 @@ WT_DIRT="$(add_named_wt "$REPO_PV" "$ENV_PV-dirty" feat/g2i-dirty)"
 mk_evidence "$WT_DIRT" '# LANE REPORT
 dirty but landed'
 printf 'uncommitted work a human wanted\n' >>"$WT_DIRT/base.txt"
+# (4) The POINTER'S NEGATIVE CONTROL — an ignored `scripts/` that is a REAL DIRECTORY (review of
+# #3405, P1/P2). The first fix returned on the NAME alone, so a real `scripts/` directory full of
+# someone's content was admitted as "a pointer" and destroyed with no archive at all — and the suite
+# could not see it, because G2g builds `scripts` as a symlink and the mutant only moved the EVIDENCE
+# predicate. This fixture is what makes the `-L` half load-bearing.
+WT_SCRDIR="$(add_named_wt "$REPO_PV" "$ENV_PV-scrdir" feat/g2y-scrdir)"
+mkdir -p "$WT_SCRDIR/scripts"
+printf 'operator content that is NOT a pointer\n' >"$WT_SCRDIR/scripts/work.sh"
+# …and a second negative control: an ignored ROOT SYMLINK under an unrelated name. `-L` alone must
+# never admit it; only the NAME list plus `-L` may.
+WT_OTHLINK="$(add_named_wt "$REPO_PV" "$ENV_PV-othlink" feat/g2y-othlink)"
+ln -s "$T/$ENV_PV/agent-infra-scripts" "$WT_OTHLINK/data"
 PV_DIR="$T/$ENV_PV/preserve"
 # The open-PR veto only exists where the PR gate is APPLICABLE: a github.com origin (G5a's shape).
 # Without it the PR state is N/A and an aged unmerged checkout is reclaimed under `refs=branch-retained`
@@ -1051,12 +1063,18 @@ assert_contains "$(row_for "$OUT" "$WT_UNL")" "reason=open-pr" \
     "G2h an UNLANDED branch (open PR) is refused even though its evidence is identical"
 assert_contains "$(row_for "$OUT" "$WT_DIRT")" "reason=dirty" \
     "G2i a dirty-but-LANDED checkout is refused (a landed tree can still hold work a human wanted)"
+assert_contains "$(row_for "$OUT" "$WT_SCRDIR")" "reason=ignored-artifact" \
+    "G2y a REAL ignored scripts/ DIRECTORY is not a pointer => still preserved"
+assert_contains "$(row_for "$OUT" "$WT_OTHLINK")" "reason=ignored-artifact" \
+    "G2y an ignored symlink under a name NOT on the pointer list is still preserved (the -L arm alone admits nothing)"
 assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "0" \
     "G2g a DRY RUN archives nothing (dry-run first, always)"
 OUT="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
 assert_nodir "$WT_EVID" "G2g --apply removed the landed evidence-only checkout"
 assert_dir  "$WT_UNL"  "G2h --apply refused the unlanded checkout"
 assert_dir  "$WT_DIRT" "G2i --apply refused the dirty-but-landed checkout"
+assert_dir  "$WT_SCRDIR" "G2y --apply kept the real scripts/ directory (its content is not a pointer)"
+assert_dir  "$WT_OTHLINK" "G2y --apply kept the unrelated ignored symlink"
 assert_contains "$("$REAL_GIT" -C "$WT_DIRT" status --porcelain)" " M base.txt" \
     "G2i the dirty checkout's diff is PRESERVED (the tree is kept, so the modification is still there)"
 assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "1" \
@@ -1111,6 +1129,32 @@ assert_contains "$(row_for "$OUT_S" "$WT_EVID2")" "reason=ignored-artifact" \
     "G2x REAP_WT_PRESERVE=0 restores the pre-fix veto exactly (the tolerance and the archive cannot disagree)"
 assert_contains "$(row_for "$OUT_S" "$WT_EVID2")" "WORKTREE-REPORT.md" \
     "G2x …and the row still NAMES the offending entry, as it always did"
+# ── G2y: the mutant for the POINTER half (review of #3405, P1) ───────────────────────
+# The first implementation returned on the NAME before the `-L` check — `case … in *" $base "*)
+# return 0 ;; esac` — so a real `scripts/` DIRECTORY (operator content) was admitted and deleted with
+# nothing archived, and any root-level ignored symlink of ANY name was admitted too. Nothing in the
+# suite could see it. This mutant reproduces that exact line; both negative-control fixtures above
+# must then flip to the DANGEROUS verdict, which is what proves both predicate halves are load-bearing.
+MUT2="$T/$ENV_PV/pi-reap-worktrees.mutant-pointer.sh"
+awk '{
+    if ($0 ~ /case "\$IGNORED_POINTER"/) {
+        print "    case \"$IGNORED_POINTER\" in *\" $base \"*) return 0 ;; *) ;; esac"
+    } else { print }
+}' "$REAPER" >"$MUT2"
+if cmp -s "$REAPER" "$MUT2"; then
+    bad "G2y the POINTER MUTANT DID NOT APPLY (the name arm moved) — the pointer half is unverified"
+else
+    ok "G2y pointer mutant applied: the shipped early-return bug is reproduced"
+fi
+OUT_P="$(FAKE_GH_REFS="$GH_PV" REAPER_OVERRIDE="$MUT2" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_P" "$WT_SCRDIR")" "reason=reclaimable" \
+    "G2y MUTANT GOES RED: without the -L arm a real scripts/ DIRECTORY would be destroyed unarchived"
+assert_contains "$(row_for "$OUT_P" "$WT_OTHLINK")" "reason=reclaimable" \
+    "G2y MUTANT GOES RED: the early return also admits an unrelated ignored symlink"
+assert_contains "$(row_for "$OUT_R" "$WT_SCRDIR")" "reason=ignored-artifact" \
+    "G2y CONTROL: the real script keeps the same fixture preserved"
+assert_contains "$(row_for "$OUT_R" "$WT_OTHLINK")" "reason=ignored-artifact" \
+    "G2y CONTROL: …and keeps the unrelated symlink preserved"
 
 # ── G3: reachable gate (detached HEAD only) ────────────────────────────
 ENV=G3; REPO="$(mk_repo $ENV)"
