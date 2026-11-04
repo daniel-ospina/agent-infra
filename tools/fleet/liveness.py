@@ -1487,6 +1487,20 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         if (rc is not None and rc != "na"
                 and not (rc.isascii() and rc.isdigit() and len(rc) <= 10)):
             rc = None
+        # ⛔ THE SAME RULE FOR THE LAUNCHER'S STATUS, which is the *other* half of the same
+        # decision. `runner_rc` was consumed RAW: any non-None value that is not "0" was
+        # decoded as "the child did NOT complete" — so `0x0`, `exit:0`, a non-ASCII digit,
+        # `""` (the census's own "present but not read" shape) and a 400-digit token all
+        # published `no-verdict/bound-finished-runner-rc:<junk>`, interpolating the token
+        # whole into `reason`. The shipped producer is strict (`\brc=(\d{1,3})\b`), which is
+        # exactly why nothing caught it: the parser refuses those tokens, so only a DIRECT
+        # caller — the reader §13.5 says is next — reaches the door with one. The doc's
+        # matrix already promises `unknown` here.
+        runner_rc = lr.runner_rc
+        if (runner_rc is not None
+                and not (runner_rc.isascii() and runner_rc.isdigit()
+                         and len(runner_rc) <= 3)):
+            runner_rc = None
         if verdict:
             if verdict in BOUND_FINISHED:
                 # ⛔ `verdict=finished` ALONE IS NOT A COMPLETION — it means "no bound
@@ -1514,17 +1528,17 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                     # The real status IS in the same log, one line later, from the
                     # caller: `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh:1583`).
                     # Corroborate with it, and require it to describe THIS incarnation.
-                    if lr.runner_rc is None:
+                    if runner_rc is None:
                         return Verdict("unknown", "finished-rc-uncorroborated",
                                        detail=("verdict=finished rc=na and no launcher "
                                                "`[timeout] agent … rc=` line to corroborate "
                                                "it; completion is undecidable")
                                               + _also(lr.detail))
-                    if lr.runner_rc != "0":
-                        return Verdict("no-verdict", "bound-finished-runner-rc:%s" % lr.runner_rc,
+                    if runner_rc != "0":
+                        return Verdict("no-verdict", "bound-finished-runner-rc:%s" % runner_rc,
                                        detail=("verdict=finished rc=na but the launcher "
                                                "reported rc=%s — the bound fired nothing, "
-                                               "yet the child did NOT complete" % lr.runner_rc)
+                                               "yet the child did NOT complete" % runner_rc)
                                               + _also(lr.detail))
                     return Verdict("finished", "bound-verdict:%s" % verdict,
                                    detail=("verdict_source=%s rc=na runner_rc=0"
@@ -1611,7 +1625,13 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                                % (_n(lr.size_delta), _n(lr.transcript_grew),
                                   _n(lr.cpu_delta_cs), int(bool(lr.cpu_unreadable)),
                                   lr.window_ms)) + _also(lr.detail))
-    if lr.age_ms is None:
+    if lr.age_ms is None or lr.age_ms < 0:
+        # ⛔ A NEGATIVE AGE IS A BROKEN READING, NOT "less than the freeze window". The
+        # acquisition path clamps it (`max(0, …)`), so this is the census surface: with
+        # `age_ms < freeze_ms` read as "nothing is happening YET", a negative age published
+        # `working/within-window` and the freeze check could never fire — the identical rule
+        # this function already applies to the two deltas (a stable log cannot lose bytes or
+        # CPU), and the row printed its own contradicting evidence beside `freeze_ms=`.
         return Verdict("unknown", "log-age-unreadable", detail=lr.detail)
 
     # (4) Both signals flat. Inside the window the lane is still working — a

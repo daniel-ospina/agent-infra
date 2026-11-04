@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with seventy-nine paired mutations: every mutation re-
+Fifty-one tests with eighty-one paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (79)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (81)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1660,6 +1660,26 @@ def t37():
           "the LAST launcher rc= wins")
     check(liv.parse_runner_line("no launcher line here") == ("", None),
           "no launcher line is no witness, never rc=0")
+    # ⛔ AND AN UNREADABLE LAUNCHER STATUS IS NO WITNESS EITHER — at the VERDICT door, not
+    # just in the parser. The shipped producer is strict (`\brc=(\d{1,3})\b`), so only a
+    # DIRECT caller reaches the door with a junk token; consuming it raw decoded any
+    # non-"0" value as "the child did NOT complete" — including `""` (the census's own
+    # "present but not read" shape) — and interpolated a runaway token whole into
+    # `reason`. The doc's matrix already promises `unknown` for this row.
+    for junk_runner in ("0x0", "exit:0", "\u00b2", "9" * 400, ""):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na",
+                                   runner_rc=junk_runner))
+        check(v.state == "unknown" and v.reason == "finished-rc-uncorroborated",
+              "an unreadable launcher status must ABSTAIN at the door; got %s/%s"
+              % (v.state, v.reason))
+        check(len(v.reason) < 64,
+              "…and must not be interpolated into the reason; got %d chars" % len(v.reason))
+    for good_runner in ("7", "137", "255"):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na",
+                                    runner_rc=good_runner))
+        check(v.state == "no-verdict"
+              and v.reason == "bound-finished-runner-rc:%s" % good_runner,
+              "a real launcher status is still named; got %s/%s" % (v.state, v.reason))
     # An rc that cannot be read is an ABSTENTION, never an assumed success.
     v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=None))
     check(v.state == "unknown" and v.reason == "finished-rc-unreadable",
@@ -2265,6 +2285,23 @@ def t47():
     lr.size_delta = 0
     v = liv.evaluate(liv.Evidence(log_read=lr))
     check(v.state == "frozen", "a flat log still freezes; got %s" % v.state)
+    # ⛔ A NEGATIVE LOG AGE IS A BROKEN READING, not "less than the freeze window". The
+    # acquisition path clamps it (`max(0, …)`), so this is the census surface: read as
+    # "nothing is happening YET", a negative age published `working/within-window` and the
+    # freeze check could never fire — while the row printed its own contradicting evidence
+    # (`age_ms=-1` beside `freeze_ms=`). Same rule the two deltas already get.
+    for bad_age in (-1, -999999999):
+        broken = liv.LogRead(readable=True, present=True, path="/x", size_delta=0,
+                             cpu_delta_cs=0, transcript_grew=False, alive=True,
+                             age_ms=bad_age, window_ms=liv.LOG_WINDOW_MS)
+        v = liv.evaluate(liv.Evidence(log_read=broken))
+        check(v.state == "unknown" and v.reason == "log-age-unreadable",
+              "a negative age must ABSTAIN, never read as within-window; got %s/%s"
+              % (v.state, v.reason))
+    # …and a zero age is legitimate (the log was just written), so this is not a blanket rule.
+    broken.age_ms = 0
+    v = liv.evaluate(liv.Evidence(log_read=broken))
+    check(v.state == "working", "a zero age is still within-window; got %s" % v.state)
 
 
 @test("T48 the census survives the `?` it prints itself, and declares an unbound row")
@@ -2950,7 +2987,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T37", "module",
-        '                    if lr.runner_rc != "0":',
+        '                    if runner_rc != "0":',
         '                    if False:',
         "the launcher's NON-ZERO rc is ignored, so a crashed / OOM-killed / "
         "watchdog-killed lane publishes `finished` — the false PASS over lost work the "
@@ -3031,6 +3068,21 @@ MUTATIONS = [
         "`--log-census` silently DROPS the per-lane flags again, so a `--verdict-file` that "
         "makes the single-lane arm say `finished` is ignored and the census publishes "
         "`no-verdict` for that lane with exit 0",
+    ),
+    # ── round 5: the launcher status at the door, and a negative log age ───────────
+    Mutation(
+        "T37", "module",
+        '        if (runner_rc is not None',
+        '        if False and (runner_rc is not None',
+        "the verdict function stops normalising the LAUNCHER status, so a DIRECT caller's "
+        "unreadable token becomes the positive claim \"the child did NOT complete\"",
+    ),
+    Mutation(
+        "T47", "module",
+        '    if lr.age_ms is None or lr.age_ms < 0:',
+        '    if lr.age_ms is None:',
+        "a NEGATIVE log age reads as \"less than the freeze window\" again, so a broken "
+        "reading publishes `working/within-window` and the freeze check can never fire",
     ),
 ]
 
