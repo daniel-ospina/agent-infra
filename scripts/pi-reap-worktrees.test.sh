@@ -4517,11 +4517,13 @@ assert_absent "$OUT" "unbound variable" \
 assert_eq "$(reason_token "$(row_for "$OUT" "$NHWT")")" "pin-tree" \
     "G15i …and the pin tree is still classified, not left as a blank row"
 
-# G15j: the record named by `$HARNESS_PIN_FILE` ITSELF — the production variable
-# (`cloud-cell-bringup.sh:89`, `cloud-cell-supervisor.sh:1775` write it and persist it in the
-# cell ENV_FILE; `install.sh:837` roots it at `$HOME`), pointing OUTSIDE both `$CELL_HOME` and
-# `$HOME`. Before round 2 that source appeared NOWHERE in this suite, so it was a claimed input
-# with no coverage at all.
+# G15j: the record named by `$HARNESS_PIN_FILE` ITSELF — the production variable. Those three sites
+# only ROOT it: `cloud-cell-bringup.sh:89` and `cloud-cell-supervisor.sh:1775` default it to
+# `$CELL_HOME/.harness-path`, `install.sh:837` to `$HOME` (all `${VAR:-…}`, no write). The WRITERS are
+# `install.sh:1072` (`pin_write_record`), `cloud-cell-bringup.sh:1034` and
+# `cloud-cell-supervisor.sh:2316`; `orchestrator-bringup.sh:449` is what persists it into the cell
+# ENV_FILE. This fixture points it OUTSIDE both `$CELL_HOME` and `$HOME`. Before round 2 that source
+# appeared NOWHERE in this suite, so it was a claimed input with no coverage at all.
 ENV=pin_tree_pinfile
 REPO="$(mk_repo "$ENV")"
 PFWT="$T/$ENV/pins/5b1b09aad2c1"
@@ -4598,16 +4600,18 @@ OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN" \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
     "G15m the dir record is derived from the HARNESS-PIN sha record's OWN root (custom pin root, no 'harness' component)"
-# …and the DOUBLED-`//` spelling of the same record still derives and still PRESERVES. This is the one
-# non-canonical spelling the derivation accepts (the suffix strip leaves `<root>/.pi/agent/`, the
-# `/.pi/agent` strip does not fire, and the OS resolves the doubled slash), so the boundary comment in
-# `pin_tree_match` states it instead of claiming all three odd spellings fall back. The fail-safe
-# direction: a veto that can only preserve mis-reading an input toward PRESERVE costs disk.
+# …and the DOUBLED-`//` spelling of the same record still derives and still PRESERVES, because the
+# `tr -s` collapse runs BEFORE the suffix strip and the derivation then lands on the same root a
+# canonical spelling does. Without that collapse the strip leaves `<root>/.pi/agent/`, the `/.pi/agent`
+# strip does not fire, and the derived candidate is `<root>/.pi/agent//.harness-path` — a path the
+# production layout never writes, so the tree is a silent miss and rule 3 REMOVES it. That is the
+# mutant G15-M4b drives, and it is why the normalisation is not cosmetic. A TRAILING `/` is normalised
+# by the same block and asserted below.
 OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent//state/HARNESS-PIN" \
     REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
-    "G15m a DOUBLED-'//' spelling of the sha record still derives the root and PRESERVES (the one odd spelling the derivation accepts)"
+    "G15m a DOUBLED-'//' spelling of the sha record still derives the root and PRESERVES (the collapse runs before the suffix strip)"
 
 # …and a TRAILING `/` on the same record normalises to the same root. Asserting it here (rather than
 # declaring it) is the point: this fixture's tree path carries no `harness` component, so if the strip
