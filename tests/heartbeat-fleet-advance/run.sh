@@ -322,7 +322,18 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # not a change somewhere else (the commit's only other edit is a renumbered header comment). The
 # shipped egress is untouched by it: `send` token = 6, MSG reads outside the appends = 0, block
 # depth at the last MSG= = 25 and at the send = 24 — all pinned above and all unmoved.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "16972079405712"
+# ⛔ RE-PINNED A FOURTH TIME 2026-10-31, DELIBERATELY, WITH THE DIFF CHECKED — and this one is a
+# ONE-LINE REWRITE, the same class as the 2026-10-19 note, not an added block. The 300K→800K
+# geometry move (owner decision 2026-10-31, docs/ops/cost-config-policy.md §7.1) makes the
+# `_pane_has_pi` status-line marker tuple accept `/800k` as well as the historical `/300k`, so
+# every lane that renders its footer at the new window is still recognised as a pi lane. Verified
+# when re-pinning, rather than assumed: the matched-line COUNT is 169 on BOTH sides (main's file and
+# this one), the diff of the MATCHED lines is exactly one line (the `for _m in (...)` tuple, which
+# begins with `for` and so is hashed), and the byte count half of the digest reconciles exactly
+# (5712 → 5720 — the 8 added bytes are the one new tuple element `"/800k",`). No keyword line was added, deleted, reordered or moved, so no gate moved with
+# it; the executable-line pin below is UNTOUCHED (589 before and after), which is the second half of
+# that proof — a statement that had been added or removed would have moved it too.
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "25224790895720"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.

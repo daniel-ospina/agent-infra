@@ -353,6 +353,22 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: Fleet snapshot suite (#1178, zero-dep)
+        # #1178 — the ONE instrument with two POPULATIONS. `fleet_snapshot.py` is the
+        # new population's reader AND the one-command box snapshot
+        # (`tools/fleet/fleet_snapshot.py --box NAME [--json]`), and
+        # `lane_liveness.py` IMPORTS it for the dispatch section — so this suite pins
+        # the population extension (a cmux Evidence still classifies exactly as before,
+        # a dispatch lane with no bound incarnation is an ABSTENTION and never `dead`),
+        # the two real shapes from 2026-10-30, the `UNMEASURED(<why>)` rule (never a
+        # manufactured 0), and the `MAX_LANES` derivation the drainer and the controller
+        # must agree on. REGISTRATION IS THE POINT: this repo registers `.py` suites
+        # individually, and an unwired suite passes by never running — which is exactly
+        # what the first review of this PR found (#3134 P1-3). Zero-dep by construction:
+        # a standalone script driving the module against temp fixtures, no pytest, no
+        # network; its own step for the same one-verdict-per-step reason as every suite
+        # here.
+        run: python3.12 tools/fleet/fleet_snapshot.test.py
       - name: PR state router suite (#2866, zero-dep)
         # #2866 — the router is the ONE answer to "what does this PR need next, and should anything
         # be running for it right now". Its rules are what decide whether CI is spent (a `cancelled`

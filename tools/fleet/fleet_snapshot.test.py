@@ -43,9 +43,11 @@ import liveness  # noqa: E402
 import fleet_snapshot as fs  # noqa: E402
 
 FAILS = []
+RUN = []
 
 
 def ck(name, cond, detail=""):
+    RUN.append(name)
     if not cond:
         FAILS.append("%s%s" % (name, (": " + detail) if detail else ""))
 
@@ -208,5 +210,14 @@ if FAILS:
     for f in FAILS:
         print("  - " + f)
     sys.exit(1)
+# ⛔ NON-VACUITY, COUNTED RATHER THAN TRANSCRIBED. The success line said `18` while
+# the file ran 23 pins, so the one number a reader takes from a green run was a
+# literal nobody re-cut — the same claim-surface defect the CI registration fixes
+# (#3134 P1-3). The count is now derived, and the floor makes a DELETED pin loud
+# instead of a shorter green: dropping any pin here fails this suite.
+if len(RUN) < 23:
+    print("FAIL (1):")
+    print("  - non-vacuity: at least 23 pins must run (ran: %d)" % len(RUN))
+    sys.exit(1)
 print("PASS: %d pins hold (population extension, 2 real shapes, UNMEASURED, MAX_LANES, binding)"
-      % 18)
+      % len(RUN))
