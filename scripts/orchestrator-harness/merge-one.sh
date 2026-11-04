@@ -789,6 +789,39 @@ if [ ! -x "$RECORDER" ]; then
   exit 3
 fi
 
+# ── 0) RECOVER BEFORE PAYING (agent-infra#2872 record recovery / #1377 carry rule) ──────────────
+# The record file is PER-BOX; the SIGNED marker in the PR body is the only copy of a verdict that
+# travels with the PR. So a review minted on a cell reads as NO-RECORD on the box that merges, and
+# the same review gets bought again. Both verbs below exist for this and were consumed by NOTHING:
+# `--check-carry` (does my record still describe what would merge?) and `--recover-body` (rebuild a
+# missing record from the signed marker, refusing an unverifiable one).
+# Measured 2026-10-28: #10255 was clean at 3cccad7d0, the live diff was UNCHANGED (carry), and a
+# fourth paid review was about to be ordered for a diff nobody had changed.
+# ⛔ EXIT 0 ONLY WHEN THE RECORD COVERS THIS HEAD. Every other outcome falls through to the review
+# path below, unchanged — so a box without the signing key degrades to the old behaviour, never to a
+# false CLEAN. The recovery is not a certification: the gate re-decides on the live diff.
+# ⛔ THE EXIT TRAP IS REGISTERED EARLY (line ~472) BUT ITS HANDLER IS DEFINED LATE (~991), so an
+# early `exit 0` fires the trap before `review_abandoned_record` exists and prints
+# "command not found". Stub it, so exiting here is quiet and the claim release still runs.
+if ! declare -F review_abandoned_record >/dev/null 2>&1; then review_abandoned_record() { :; }; fi
+_cc_rc=1
+"$RECORDER" --check-carry "$PR" "$OR" >/dev/null 2>&1 && _cc_rc=0
+if [ "$_cc_rc" = "0" ]; then
+  echo "[merge $PR] CARRY — the record already covers this head (check-carry rc 0); no review cycle ordered, nothing paid" >> "$L.log"
+  exit 0
+fi
+if "$RECORDER" --recover-body "$PR" "$OR" >> "$L.log" 2>&1; then
+  _cc2=1
+  "$RECORDER" --check-carry "$PR" "$OR" >/dev/null 2>&1 && _cc2=0
+  if [ "$_cc2" = "0" ]; then
+    echo "[merge $PR] RECOVERED — the signed body marker covers this head; record restored, no review ordered, nothing paid" >> "$L.log"
+    exit 0
+  fi
+  echo "[merge $PR] recovery restored a record that does NOT cover this head (check-carry rc=$_cc2) — a fresh review is owed" >> "$L.log"
+else
+  echo "[merge $PR] no recoverable marker for this head (or no signing key on this box) — a fresh review is owed" >> "$L.log"
+fi
+
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 # ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound inside this prompt.
 # The reviewer's cwd is the MAIN checkout, which has no `.venv`, so a prompt that only says "run
