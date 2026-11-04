@@ -1416,6 +1416,71 @@ PY
     && ok "--verify refuses the lookalike host $LOOKALIKE (loopback is an IP test, not a prefix test)" \
     || fail "--verify certified $LOOKALIKE — a host that merely STARTS with 127 was treated as loopback, and the tenant key would go to it in cleartext"
 done
+# ⛔ THE LOOPBACK EXEMPTION MUST ACCEPT EVERY SPELLING OF LOOPBACK, not just the one this suite
+# happened to write. The bracketed-IPv6 arm string-matched `::1`, so the fully expanded
+# `[0:0:0:0:0:0:0:1]` was called REMOTE and refused `INSECURE_URL` — a false block on the documented
+# local self-host, in the direction that bricks a bring-up (verify refuses → install preserves it
+# again → verify refuses). It asks `ipaddress` now, and THIS ARM is what makes a revert to the string
+# match red: before it existed, nothing in the suite noticed the predicate at all. Install AND
+# verify, because the defect lived on both sides (`merge-mcp.py` `usable()` carries the same copy).
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+t = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+t["url"] = "http://[0:0:0:0:0:0:0:1]:8000/mcp"     # loopback, spelled out in full
+t["_selfHosted"] = True
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+run_verify
+rc=$?
+[ "$rc" -eq 0 ] && grep -qF 'SELFHOSTED:http://[0:0:0:0:0:0:0:1]:8000/mcp' "$LOG" \
+  && ok "a fully-expanded IPv6 loopback self-host is PRESERVED and certified (loopback is an IP test in both files)" \
+  || fail "a legal loopback spelling (http://[0:0:0:0:0:0:0:1]:8000/mcp) was refused (rc=$rc) — a false block on the documented local self-host, and the repair cannot converge"
+# ⛔ A `headers` THAT IS NOT AN OBJECT IS REFUSED BY NAME **AND** REPAIRABLE BY INSTALL. `.get` on a
+# str/list raised before the write on the install side and left an EMPTY marker on the verify side,
+# so `--install` — the repair path — could not fix the entry either: the "config nothing can repair"
+# class, one step earlier than the shape rule. Refused by name here; replaced on install.
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+t = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+t["headers"] = "Bearer ${TORTOISE_MCP_API_KEY}"    # a curl-style paste: a STRING, not an object
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'BADDERS:str' "$LOG" \
+  && ok "--verify refuses a tortoise entry whose headers is a STRING, BY NAME (BADDERS:str, not an empty marker beside a traceback)" \
+  || fail "--verify did not name a non-object headers (rc=$rc) — the operator gets 'marker: none' and a traceback instead of the shape that is wrong"
+run_install
+run_verify
+rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "install REPAIRS a non-object headers into the hosted entry (the repair path can clear the refusal)" \
+  || fail "install could not repair a non-object headers (verify rc=$rc) — the cell is stuck with a config nothing can fix"
+# ⛔ A MERGE MUST NOT REWRITE LINES IT HAS NO OPINION ABOUT. `json.dump`'s default re-encodes every
+# non-ASCII character as `\uXXXX`, so a cell-local entry carrying a literal em dash came back
+# rewritten on every sync — byte churn that reads as a content change in every diff of a file this
+# PR has no reason to touch.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.setdefault("mcpServers", {})["cell-local"] = {"type": "http", "url": "http://127.0.0.1:9/mcp", "purpose": "a \u2014 b"}
+open(p, "w", encoding="utf-8").write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a merge leaves a literal non-ASCII character ALONE (ensure_ascii=False — no churn in a line it has no opinion about)" \
+  || fail "a merge re-encoded a literal em dash as \\u2014 — byte churn in every consumer's diff on every sync"
+import io, sys
+raw = io.open(sys.argv[1], encoding="utf-8").read()
+sys.exit(0 if ("a \u2014 b" in raw and "\\u2014" not in raw) else 1)
+PY
 # ⛔ A MERGE MUST NOT WIDEN WHAT IT REPLACES. temp+`os.replace` hands the destination the TEMP file's
 # mode, so a hardened 0600 came back 0644 — on a credential-adjacent file, the wrong direction.
 python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'

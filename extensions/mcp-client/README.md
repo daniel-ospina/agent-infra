@@ -2,8 +2,12 @@
 
 Connects pi to MCP servers declared in `.mcp.json` and registers each tool as
 `mcp__<server>__<tool>`. Since #199, server lifecycle is **decoupled from the
-session lifecycle**: a small eager core is pre-loaded, everything else is
-discoverable via a catalog and loads on demand, then idle-stops.
+session lifecycle**: servers are discoverable via a catalog and load on demand
+(`mcp_load <server>`), then idle-stop. ⛔ NOTHING in the shipped base catalog is eager:
+`templates/.mcp.base.json` and the repo's `.mcp.json` mark every server `lazy: true`
+(graph-mcp-provision — the hosted graph's cold handshake exceeds pi's default connect budget,
+and the entry lands on memory-constrained cells where a core server would block every session
+start). Say `mcp_load tortoise` before you read the graph.
 
 ## Server tiers
 
