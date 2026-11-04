@@ -3042,7 +3042,12 @@ One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `
 Freshness is part of the verdict, not a separate guard: `claim_snapshot` writes a
 `#claim-snapshot\t<read_at>\t<ok|failed>\t<refs>` header, and a snapshot older than
 `CLAIM_SNAPSHOT_MAX_AGE` (900 s, ≈3.75 cycles at the shipped `CYC=240`) or written from a failed
-fetch reads `claim-unreadable`. A snapshot whose WRITE failed is never published at all: the
+fetch reads `claim-unreadable`. So does a snapshot whose header cannot be parsed (an empty or
+non-numeric `read_at`, or a third field that is neither `ok` nor `failed`), whose first line could not
+be READ, whose file this process cannot OPEN (`[ -f ]` is a stat, not a read), or whose `read_at` is
+AHEAD of the local clock — the age test is one-sided, so a future stamp would otherwise never age out.
+A failed refresh keeps the last good ENTRIES but republishes them under a `failed` header, so it can
+never be mistaken for a fresh read. A snapshot whose WRITE failed is never published at all: the
 previous one is left in place **with its own header**, so it keeps answering only while that header
 says `ok` and it is inside `CLAIM_SNAPSHOT_MAX_AGE` — and it is `claim-unreadable` otherwise, or
 when there is no previous snapshot at all. A failed publish is therefore not automatically a

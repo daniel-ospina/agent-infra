@@ -1321,6 +1321,44 @@ FAKE
       "1" "$(_own 1)"
   : > "$O/state/claims-snapshot"
 
+  # ⛔ THE WORD SEPARATION ITSELF, PINNED ON THE SHIPPED CHAIN (review, P1). Every case above is
+  # graded through `pr_owned`, and that mapping collapses `claim-absent` (rc 0) and
+  # `claim-unreadable` (rc 2) into the SAME observable ("unowned") — so a mutation that restores the
+  # old "missing = free" reader leaves all of them GREEN, with two cells duplicating work exactly as
+  # before #2466. `claim_selection_verdict` is the shipped chain, and its EXIT STATUS is the
+  # distinction: 0 free, 1 held (skip), 2 unreadable (act on nothing). These assertions are the ones
+  # that go red on that mutation; a stub or a re-implementation cannot satisfy them because both the
+  # wrapper (extracted from `orch-loop.sh`) and the reader (sourced from `claims.sh`) are shipped code.
+  _seen() { ( . "$HERE/claims.sh"; . "$TMP/ownfunctions.sh"; claim_selection_verdict "$1" "$2" >/dev/null; echo $? ); }
+  rm -f "$O/state/claims-snapshot"
+  eqv "a MISSING snapshot -> SELECTION verdict 2 (unreadable), never 0 (free)" "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tfailed\t0\n' "$(date +%s)" > "$O/state/claims-snapshot"
+  eqv "a FAILED-fetch header -> 2, never 0" "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tok\t0\n' "$(( $(date +%s) - 100000 ))" > "$O/state/claims-snapshot"
+  eqv "an OVER-AGE header -> 2, never 0" "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tok\t0\n' "$(( $(date +%s) + 3600 ))" > "$O/state/claims-snapshot"
+  eqv "a FUTURE-dated read instant -> 2 (a future stamp is never believed), never 0" "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\n' > "$O/state/claims-snapshot"
+  eqv "a MALFORMED header (no fields) -> 2, never 0" "2" "$(_seen 12 ddd000000000)"
+  printf '#claim-snapshot\t%d\tmaybe\t0\n' "$(date +%s)" > "$O/state/claims-snapshot"
+  eqv "a header that does not say whether the fetch answered -> 2, never 0" "2" "$(_seen 12 ddd000000000)"
+  # the discriminating OTHER SIDE: a fresh snapshot that genuinely ANSWERED and holds nothing is free.
+  # Without this the block above would pass on a reader that abstains unconditionally.
+  : > "$O/state/claims-snapshot"
+  eqv "a FRESH EMPTY snapshot -> 0 (a registry that answered and holds nothing)" "0" "$(_seen 12 ddd000000000)"
+  printf 'refs/claims/12-ddd000000000\totherbox:1\t9999999999\n' > "$O/state/claims-snapshot"
+  eqv "a LIVE foreign claim -> 1 (held), distinct from free and from unreadable" "1" "$(_seen 12 ddd000000000)"
+  # ⛔ AN EXISTING BUT UNREADABLE FILE (review, P2): `[ -f ]` is a stat, so this shape used to pass
+  # the file check, `head` yielded "", the OLD-WRITER arm believed the fresh MTIME, and it read FREE.
+  # Skipped for root, where mode 000 is not actually unreadable (the arm would be vacuous, not wrong).
+  if [ "$(id -u)" != 0 ]; then
+    printf '#claim-snapshot\t%d\tok\t1\nrefs/claims/12-ddd000000000\totherbox:1\t9999999999\n' "$(date +%s)" > "$O/state/claims-snapshot"
+    chmod 000 "$O/state/claims-snapshot"
+    eqv "an UNREADABLE snapshot file -> 2, never 0" "2" "$(_seen 12 ddd000000000)"
+    chmod 644 "$O/state/claims-snapshot"
+  fi
+  : > "$O/state/claims-snapshot"
+
   # (4) THE COUNT over a real listing, through the SHIPPED unowned_pr_count. Rows are
   # `number:head:branch` — the branch is in the row because ownership is per-PR and LIVE.
   _live 'fix/3-b	/repo/.worktrees/3	11	/repo/.worktrees/3' \

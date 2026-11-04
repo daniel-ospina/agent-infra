@@ -1349,23 +1349,54 @@ claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
   fi
   if [ ! -f "$f" ]; then
     why="no claim snapshot at $f — the registry has never been read on this box, so its silence is not evidence of freedom"
+  elif [ ! -r "$f" ]; then
+    # ⛔ `[ -f ]` IS A STAT, NOT A READ (review, P2). A snapshot the process cannot OPEN (mode 000,
+    # a `sudo` deploy, a restore) used to pass this gate while `head` silently yielded "", the
+    # header case took its OLD-WRITER arm, and the fresh MTIME made it read `claim-absent` (FREE).
+    why="the claim snapshot at $f exists but is NOT READABLE by this process — a read we could not perform is not an empty registry"
+  elif ! hdr="$(head -n 1 "$f" 2>/dev/null)"; then
+    # A FAILED READ IS NOT AN ABSENT DATUM (the same rule probe reads follow elsewhere in this
+    # tree): an I/O error must abstain, never fall back to the mtime of a file it could not read.
+    why="the claim snapshot at $f could not be read (its first line never came back)"
   else
-    hdr="$(head -n 1 "$f" 2>/dev/null || true)"
     case "$hdr" in
       '#claim-snapshot'*)
         read_at="$(printf '%s' "$hdr" | cut -f2)"
-        fetch="$(printf '%s' "$hdr" | cut -f3)" ;;
-      *) read_at=""; fetch="" ;;   # a writer older than this reader: mtime is the only age available
+        fetch="$(printf '%s' "$hdr" | cut -f3)"
+        # ⛔ A HEADER THIS READER CANNOT USE IS `claim-unreadable`, NOT AN OLD WRITER (review, P2).
+        # The mtime fallback exists for a SUCCESSFULLY READ file with NO header at all (what an
+        # older writer emits). A `#claim-snapshot` line with empty/non-numeric fields, or without a
+        # fetch answer, is a MALFORMED header — a truncated write, a future writer, a hand edit —
+        # and falling through to mtime would believe it at face value.
+        case "${read_at:-}" in
+          ''|*[!0-9]*) why="the snapshot header carries no usable read instant (read_at='${read_at:-}')" ;;
+        esac
+        case "${fetch:-}" in
+          ok|failed) ;;
+          *) [ -n "$why" ] || why="the snapshot header does not say whether its fetch answered (field 3='${fetch:-}', expected ok|failed)" ;;
+        esac ;;
+      *) read_at=""; fetch="" ;;   # successfully read, no header (older writer): mtime is the only age
     esac
-    [ -n "$read_at" ] || read_at="$(claim_file_mtime "$f")"
+    # ONLY an absent header falls back to mtime; a parsed header's OWN stamp decides its age.
+    if [ -z "$why" ] && [ -z "${read_at:-}" ]; then
+      read_at="$(claim_file_mtime "$f")"
+    fi
     now="$(date +%s 2>/dev/null || true)"
     case "${now:-}" in ''|*[!0-9]*) why="the local clock is unreadable (date +%s -> '${now:-}')" ;; esac
     case "${read_at:-}" in
       ''|*[!0-9]*) [ -n "$why" ] || why="the snapshot's read instant could not be read (header and mtime both unusable)" ;;
     esac
     if [ -z "$why" ]; then
-      age=$(( now - read_at )); [ "$age" -lt 0 ] && age=0
-      if [ "$fetch" = "failed" ]; then
+      age=$(( now - read_at ))
+      if [ "$age" -lt 0 ]; then
+        # ⛔ A FUTURE STAMP IS NEVER BELIEVED (review, P2). The age test is ONE-SIDED: clamping a
+        # stamp ahead of the local clock to 0 made it fresh at ANY offset — the exact rule already
+        # recorded for a persisted stamp elsewhere (`AGENTS.md` §Skill Reading Protocol: a future
+        # stamp is dropped, never trusted, "because the age test is one-sided, so a single
+        # future-dated line would otherwise satisfy the gate forever"). This is the fleet's
+        # cross-box duplicate signal, so a clock-skewed read abstains instead of reading fresh.
+        why="the snapshot's read instant (${read_at}) is AHEAD of this box's clock (${now}) — a future stamp is never believed"
+      elif [ "$fetch" = "failed" ]; then
         # ⛔ THE FETCH ITSELF DID NOT ANSWER: the entries below are the LAST GOOD read, so a claim
         # published (or released) since then is invisible. That is a stale read, not a snapshot.
         why="the snapshot was written from a FAILED fetch (its entries are the last good read, ${age}s old)"

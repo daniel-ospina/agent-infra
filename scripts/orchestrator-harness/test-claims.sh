@@ -359,9 +359,8 @@ echo "=== 2d. a FAILED PUBLISH publishes NOTHING and keeps the last good snapsho
 # root, which would make the arm vacuous on a root runner).
 # The assertion is the OUTCOME a reader sees, not just a flag — and the DISCRIMINATOR here is that
 # the previous bytes survive at all (the pre-fix writer replaced them with a 32-byte header-only
-# snapshot, which is what made every key read FREE). The `reader=` token is PRINTED for triage but
-# deliberately NOT asserted: it depends on a live claim existing at this point in the suite, and on a
-# box where the claim machinery is itself red that would make this arm fail for an unrelated reason.
+# snapshot, which is what made every key read FREE). The `reader=` token is now ASSERTED (=1, held by
+# the claim this suite acquired in §1) — NOT 0, which is the free answer the pre-fix writer produced.
 pubfail() { # <box-dir> <snapshot-file> -> tokens, one per line
   ( cd "$1" && export CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
     && claim_snapshot "$2" >/dev/null 2>&1 || { echo "setup=failed"; exit 0; } \
@@ -382,6 +381,13 @@ ck "…while the FETCH keeps its own (successful) answer" '^ok$' "$(echo "$pf" |
 # snapshot (that is what made every key read FREE); it cannot leave the previous bytes intact.
 ck "…nothing is published, so the last GOOD snapshot survives byte-identical" '^none$' "$(echo "$pf" | sed -n 's/^published=//p')"
 ck "…and no temp file is left behind" '^clean$' "$(echo "$pf" | sed -n 's/^tmp=//p')"
+# ⛔ AND THE READ THE SURVIVING SNAPSHOT PRODUCES IS ASSERTED, not just printed (review, P1). The
+# recovered file is the one the PREVIOUS (successful) writer published, so it still carries A's LIVE
+# claim: the reader must answer `claim-held` (rc 1). The failure this pins is the pre-fix writer's
+# — it replaced the file with a header-only snapshot, which read `claim-absent` (rc 0, FREE) — so
+# rc 0 is the mutation, and this line is the only one that distinguishes it. (Asserting rc 2 here
+# would be wrong: a failed PUBLISH publishes nothing, so the kept `ok` snapshot IS believed.)
+ck "…so the surviving snapshot still answers the registry question (held, not free)" '^1$' "$(echo "$pf" | sed -n 's/^reader=//p')"
 rm -rf "$SNAP.before" "$SNAP.body."* 2>/dev/null || true
 rm -f "$SNAP"
 
