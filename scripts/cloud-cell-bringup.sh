@@ -1444,7 +1444,7 @@ check_graph_client() {
     # compares the deployed bytes. An unqualified `ok … present` would therefore certify the very
     # hand-copy this change exists to expose (measured: 2328 B / 5079 B deployed vs 2698 B / 8123 B
     # shipped). The line states its own scope instead of implying a verification it cannot do.
-    ok "graph client: present at $client (presence only — byte-identity is graded by \`cell-install.sh --verify\`, which covers this file only once this box's checkout declares it in its farm (\`graph_srcs\`)"
+    ok "graph client: present at $client (presence only — byte-identity is graded by \`cell-install.sh --verify\`, which covers this file only once this box's checkout declares it in its farm (\`graph_srcs\`))"
   else
     warn "graph client MISSING: $client — the graph mandate is UNEXECUTABLE on this box, so every lane must report GRAPH-UNREACHABLE(...). FIX: re-run the farm that installs it (bash pi-bootstrap/cell-install.sh --install, or pi-bootstrap/setup.sh on a Mac) — a hand-copy is not a deployment and does not survive the next bring-up"
     # ⛔ NO EARLY RETURN. The absence of the client and the absence of its CREDENTIAL are two

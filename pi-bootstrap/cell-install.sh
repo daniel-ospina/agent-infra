@@ -253,14 +253,21 @@ graph_key_from_env_file() { # <file> [<variable>] -> its value
 # An EMPTY result is meaningful, not a fallback: the documented self-host entry
 # (`{"url":"http://localhost:8000/mcp"}`) declares no header, and a local daemon needs no key — so
 # there is nothing to resolve and nothing may be reported as missing.
+# ⛔ `NOENTRY` IS A THIRD STATE, and collapsing it into "empty" was a lie in the run log: an ABSENT
+# `.mcp.json` (a missing template, a missing lib, no python3, a merge that failed) or a file with no
+# `tortoise` key made this function return empty, which the caller renders as "the tortoise entry
+# declares no Authorization — a self-hosted daemon needs none" — a sentence asserting the existence of
+# an entry that is not there. The run is not certified either way, but this is THE line a reader uses
+# to tell a working cell from a 401 one, and it named the wrong reason.
 graph_mcp_var() {
-  [ -f "$DEST/.mcp.json" ] || return 0
+  [ -f "$DEST/.mcp.json" ] || { printf 'NOENTRY'; return 0; }
   python3 -c '
 import json, sys
 try:
     t = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]
     auth = (t.get("headers") or {}).get("Authorization") or ""
 except Exception:
+    print("NOENTRY")                # unreadable / no such entry — NOT "declares no Authorization"
     sys.exit(0)
 if "${" not in auth:
     sys.exit(0)                     # no env-indirect credential (self-host, or a literal -- which verify refuses)
@@ -277,6 +284,14 @@ graph_key_resolve() {
   GRAPH_KEY=""
   GRAPH_KEY_SRC="the environment"
   GRAPH_NOAUTH=0
+  GRAPH_NOENTRY=0
+  if [ "$GRAPH_VAR" = "NOENTRY" ]; then
+    # no readable tortoise entry at all — a DIFFERENT state from "an entry that needs no key", and
+    # reporting it as the latter asserts an entry that is not there (see graph_mcp_var).
+    GRAPH_NOENTRY=1
+    GRAPH_VAR=""
+    return 0
+  fi
   if [ -z "$GRAPH_VAR" ]; then
     # the tortoise entry declares no env-indirect Authorization: a self-hosted daemon needs none
     GRAPH_NOAUTH=1
@@ -308,6 +323,10 @@ graph_key_resolve() {
 # The state as it belongs in a certification line — a cell is never reported VERIFIED without it.
 graph_credential_state() {
   graph_key_resolve
+  if [ "$GRAPH_NOENTRY" -eq 1 ]; then
+    printf 'UNKNOWN — no readable tortoise entry at %s/.mcp.json to resolve (the failure above says why)' "$DEST"
+    return 0
+  fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
     printf 'none required — the tortoise entry declares no Authorization (self-hosted daemon)'
     return 0
@@ -322,6 +341,10 @@ graph_credential_state() {
 graph_credential_note() {
   graph_key_resolve
   local key="$GRAPH_KEY" src="$GRAPH_KEY_SRC"
+  if [ "$GRAPH_NOENTRY" -eq 1 ]; then
+    log_line "⚠️  graph credential: UNKNOWN — there is no readable tortoise entry at $DEST/.mcp.json, so there is no credential to resolve (the failure above names the reason). ⛔ A MISSING entry is not a self-host and must not be reported as one"
+    return 0
+  fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
     log_line "graph credential: the tortoise entry declares no Authorization — a self-hosted daemon needs none, so there is nothing to resolve"
     return 0
@@ -423,14 +446,43 @@ if not url:
 # unconditionally, which made INSTALL and VERIFY disagree about the SAME preserved entry: the merge
 # (`merge-mcp.py` `usable()`) deliberately preserves a self-hosted entry that spells `type: "sse"`
 # for its own daemon, marks it `_selfHosted`, and rc=0; this verifier then refused `sse` and rc=1.
-# `cloud-cell-bringup.sh` on a verify failure runs INSTALL and then prints "operational layer present
-# and verified" WITHOUT re-reading the verdict — so the disagreement was a FALSE PASS on the layer
-# gate, and it repeated on every bringup because the repair could only re-create the refusal. The
+# ⛔ THE MECHANISM WAS A FALSE **BLOCK**, NOT A FALSE PASS — and the difference decides whether a
+# reader goes looking for the right hole. `cloud-cell-bringup.sh` repairs a verify failure by running
+# INSTALL, and INSTALL ends in this same verify (`verify_layer` runs for `--install` too, and any
+# recorded failure exits 1) — so the repair re-created the refusal and exited non-zero, which that
+# script turns into a `die`. The cell could therefore NEVER converge: every bringup failed loudly, on
+# a config the installer had itself just preserved, and no repair could clear it. Certification is not
+# the hole (it comes from the INSTALL's rc, which already carries this verdict); convergence is. The
 # rule is ONE rule, applied by both sides: a non-http `type` disqualifies the HOSTED default (where
 # `http` is the contract) and is the operator's business on their own daemon. See the url branch below.
 auth = ((t.get("headers") or {}).get("Authorization") or "")
 if auth and "${" not in auth:
     print("LITERAL_AUTH")
+    sys.exit(1)
+# ⛔ A CREDENTIAL OVER CLEARTEXT IS NOT CERTIFIABLE, and `_selfHosted` must never become the
+# exemption that says otherwise. `merge-mcp.py` preserves a genuine self-host (a DIFFERENT HOST) and
+# this verifier reports it BY NAME; a SCHEME-only difference is a typo — and it is the one typo whose
+# cost is not just a 401: the client expands the header and sends `Bearer <tt_…>` over that transport,
+# so the live tenant key crosses the wire in cleartext while the cell prints LAYER VERIFIED and a
+# green `graph credential: resolves from …` beside it (measured: `http://api.premiselabs.co/mcp/`
+# was marked `_selfHosted` by the merge and then certified here, rc=0). `https` is therefore the FLOOR
+# for any url carrying a credential to a destination that can leave the box. ⛔ LOOPBACK IS EXEMPT ON
+# PURPOSE: a key sent to `localhost`/`127.0.0.0/8`/`::1` never crosses a network, and the repo's own
+# documented self-host fixture is exactly that shape with the template's header still attached —
+# refusing it would be the false block that teaches an operator to ignore this gate. A self-host that
+# needs a key off-box must serve it over https.
+def _loopback(authority):
+    h = (authority or "").lower()
+    if h.startswith("["):
+        return h.startswith("[::1]")
+    h = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    return h == "localhost" or h.startswith("127.") or h == "::1"
+
+
+_m = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/]+)", url, re.I)
+if auth and (_m.group(1).lower() if _m else "") != "https" \
+   and not _loopback(_m.group(2) if _m else ""):
+    print("INSECURE_URL:%s" % url)
     sys.exit(1)
 # ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client sends headers VERBATIM
 # (extensions/mcp-client/index.ts:819-821), so `Authorization: ${TORTOISE_MCP_API_KEY}` (no scheme) is
@@ -494,6 +546,8 @@ PY
         fail ".mcp.json's tortoise entry carries a LITERAL bearer token instead of \${TORTOISE_MCP_API_KEY} — the shared file is the leak" ;;
       WRONG_AUTH:*)
         fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_MCP_API_KEY}' (or the legacy 'Bearer \${TORTOISE_API_KEY}') — the client sends headers VERBATIM, so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
+      INSECURE_URL:*)
+        fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED. Use https, or drop the Authorization for a local daemon (which needs none)" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)
