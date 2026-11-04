@@ -125,6 +125,17 @@
     <key>HARNESS_MATERIALISER</key>
     <string>__HARNESS_MATERIALISER__</string>
 
+    <!-- ── THE ENTRYPOINT OVERRIDE (#3309) ─────────────────────────────────────────────────────────
+         EMPTY BY DEFAULT, and that is the point: with no value the stable resolver picks the entry on
+         every tick from the pin it has just resolved, so a pin advance that adds `launchd-controller.sh`
+         takes effect WITHOUT a re-render — the property the stable resolver exists to buy. install.sh
+         renders a value here ONLY when the operator set `HARNESS_ENTRY` explicitly, because that is a
+         standing instruction about which entry to run and must survive into the tick; the resolver
+         reads it as `ORCH_ENTRY`. Without this key the override was honoured at render time and
+         silently ignored by launchd, which is worse than not offering it. -->
+    <key>ORCH_ENTRY</key>
+    <string>__ORCH_ENTRY__</string>
+
     <!-- drain scope: auto (count rule) | own (pin own-only) | broad (pin broad).
          A fleet runs exactly ONE broad box; the rest pin own (README section 5). -->
     <key>SCOPE</key>

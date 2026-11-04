@@ -1129,11 +1129,29 @@ ok "pinned scripts parse ($HARNESS)"
 #     name both — because rendering `$HARNESS/orch-loop.sh` here would silently delete the TCC wrapper,
 #     and silently rendering the home copy is the divergence this whole change exists to end.
 # `HARNESS_ENTRY=<name>` is the deliberate override (a name INSIDE the pinned tree, never a path).
+# ⛔ WHETHER IT WAS EXPLICIT NOW MATTERS (#3309). With no override, the STUB chooses the entry on EVERY
+# tick from the pin it resolves, and the installer must NOT freeze that choice into the plist — a pin
+# advance that adds `launchd-controller.sh` has to take effect without a re-render (that is the whole
+# reason the program stopped being a pin path). An EXPLICIT override is the opposite case: the operator
+# named an entry, so the choice must survive to RUNTIME — which means it has to be rendered into the
+# plist's environment (`__ORCH_ENTRY__`). Without that, launchd's tick silently used the stub's own
+# preference: `HARNESS_ENTRY=orch-loop.sh` was REFUSED at render time on every pin that also carries
+# `launchd-controller.sh`, i.e. the documented override was unusable.
+_ENTRY_EXPLICIT=0
 HARNESS_ENTRY="${HARNESS_ENTRY:-}"
+if [ -n "$HARNESS_ENTRY" ]; then _ENTRY_EXPLICIT=1; fi
 if [ -z "$HARNESS_ENTRY" ]; then
   if [ -f "$HARNESS/launchd-controller.sh" ]; then HARNESS_ENTRY="launchd-controller.sh"
   else HARNESS_ENTRY="orch-loop.sh"; fi
 fi
+# ⛔ DEFINED HERE, NOT AT THE SEEDING BLOCK BELOW, BECAUSE THE LIVE-ONLY GATE NEEDS IT (#3309). The gate
+# below asks "is the installed job running a file the pin does not carry?", and the stable resolver is
+# EXACTLY such a file on a box whose pin predates this commit — by design, because this installer seeds it
+# from `$HERE` in that case. Without this exclusion the gate refused on the SECOND install (the first one
+# leaves the plist naming `$O/orch-pin-exec.sh`, the pin still lacks it) and explained it as a lost macOS
+# Full-Disk-Access wrapper — a false block with a fabricated cause, which no re-run could clear.
+STABLE_NAME="orch-pin-exec.sh"
+STABLE_PROG="$O/$STABLE_NAME"
 case "$HARNESS_ENTRY" in
   ''|*/*) pin_refuse "HARNESS_ENTRY must be a NAME inside the pinned harness dir (got '$HARNESS_ENTRY') — a path would let the program be anything, which is what the pin check exists to prevent" ;;
 esac
@@ -1161,7 +1179,10 @@ if [ -f "$PLIST" ]; then
   fi
   # In scope only when the installed program is a script the PIN does not carry AND that file is on
   # disk. A plist naming a deleted path is a different failure (start's, not this installer's).
-  if [ -n "${_live_base:-}" ] && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
+  # ⛔ AND NEVER THE STABLE RESOLVER (#3309): it is a file THIS INSTALLER SHIPS and seeds at a fixed path,
+  # not live-only content that must "land" in a commit before it can be used. Its absence from a pin
+  # that predates this commit is the case the seeding block below explicitly supports.
+  if [ -n "${_live_base:-}" ] && [ "$_live_base" != "$STABLE_NAME" ] && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
     LIVE_ENTRY="$_live_base"
   fi
 fi
@@ -1184,12 +1205,12 @@ ok "program: $HARNESS/$HARNESS_ENTRY (pinned; selected from the pin, not from \$
 # ⛔ NOT the #2231 defect coming back: the stub is seeded from the PINNED TREE on every run (never
 # hand-written into $O), it holds no controller logic to diverge, and the assertion below refuses the
 # install unless the stub, run now, resolves to the pin's own entrypoint.
-STABLE_PROG="$O/orch-pin-exec.sh"
+# (`STABLE_PROG` / `STABLE_NAME` are defined ABOVE, beside the live-only gate that has to know them.)
 # Prefer the pinned tree (after this lands the pin carries it); fall back to the installer's checkout so
 # a box installing ON the commit that introduces it is not blocked by a pin that predates it.
-_PIN_EXEC_SRC="$HARNESS/orch-pin-exec.sh"
-[ -f "$_PIN_EXEC_SRC" ] || _PIN_EXEC_SRC="$HERE/orch-pin-exec.sh"
-[ -f "$_PIN_EXEC_SRC" ] || die "orch-pin-exec.sh not found in the pinned tree ($HARNESS) or this checkout ($HERE) — the stable launchd program cannot be seeded, and rendering the pin path instead is exactly the #3309 defect"
+_PIN_EXEC_SRC="$HARNESS/$STABLE_NAME"
+[ -f "$_PIN_EXEC_SRC" ] || _PIN_EXEC_SRC="$HERE/$STABLE_NAME"
+[ -f "$_PIN_EXEC_SRC" ] || die "$STABLE_NAME not found in the pinned tree ($HARNESS) or this checkout ($HERE) — the stable launchd program cannot be seeded, and rendering the pin path instead is exactly the #3309 defect"
 # ⛔ STAGE-THEN-RENAME (same rule as the other $O seeds): a plain `cp` truncates the target first, so a
 # concurrent KeepAlive tick could exec a half-written stub and die with a syntax error.
 mkdir -p "$O" || die "cannot create \$O ($O)"
@@ -1353,6 +1374,7 @@ sed \
   -e "s|__HARNESS__|$(esc "$HARNESS")|g" \
   -e "s|__PROGRAM__|$(esc "$STABLE_PROG")|g" \
   -e "s|__ENTRY__|$(esc "$HARNESS_ENTRY")|g" \
+  -e "s|__ORCH_ENTRY__|$(esc "$(_ENTRY_EXPLICIT_RENDER=""; if [ "$_ENTRY_EXPLICIT" = "1" ]; then _ENTRY_EXPLICIT_RENDER="$HARNESS_ENTRY"; fi; printf '%s' "$_ENTRY_EXPLICIT_RENDER")")|g" \
   -e "s|__HARNESS_PIN__|$(esc "$HARNESS_PIN")|g" \
   -e "s|__HARNESS_PIN_FILE__|$(esc "$HARNESS_PIN_FILE")|g" \
   -e "s|__HARNESS_PIN_DIR__|$(esc "$HARNESS_PIN_DIR")|g" \
@@ -1414,14 +1436,33 @@ fi
 #   2. the program RESOLVES to the pin's own entrypoint RIGHT NOW — via the stub's --resolve-only, so
 #      what is checked is the behaviour launchd will get, not the installer's bookkeeping.
 # A relative or empty program fails (2) because --resolve-only would not be runnable at all.
-case "$PROGRAM_GOT" in
-  "$HARNESS_PIN_DIR"/*)
+# ⛔ BOTH SIDES ARE RESOLVED THROUGH THE FILESYSTEM BEFORE THEY ARE COMPARED (#3309 review). The check
+# used to be a STRING prefix on "$HARNESS_PIN_DIR"/*, so the one shape it exists to forbid could be
+# spelled around: `O=$HOME/x/../harness/<sha12>/…`, or an `$O` that is a SYMLINK into the pin root,
+# passed the case, passed -f/-x, passed --resolve-only, and was then reported as "STABLE". A guard whose
+# subject is a path has to compare paths, not the text that happens to name them.
+_PIN_ROOT_REAL="$(cd "$HARNESS_PIN_DIR" 2>/dev/null && pwd -P || printf '%s' "$HARNESS_PIN_DIR")"
+_PROG_DIR_REAL="$(cd "$(dirname -- "$PROGRAM_GOT")" 2>/dev/null && pwd -P || printf '%s' "$(dirname -- "$PROGRAM_GOT")")"
+case "$_PROG_DIR_REAL/" in
+  "$_PIN_ROOT_REAL"/*)
     rm -f "$RENDER"
-    die "REFUSED (#3309): the rendered job execs '$PROGRAM_GOT', which is INSIDE the harness pin root ($HARNESS_PIN_DIR). That tree is hash-named and garbage-collected as the pin advances, so this plist would die 'No such file or directory' (exit 127) on the next pin move while launchd still reported it loaded. Nothing was installed." ;;
+    die "REFUSED (#3309): the rendered job execs '$PROGRAM_GOT', whose directory resolves INSIDE the harness pin root ($_PIN_ROOT_REAL). That tree is hash-named and garbage-collected as the pin advances, so this plist would die 'No such file or directory' (exit 127) on the next pin move while launchd still reported it loaded. Nothing was installed." ;;
 esac
 [ -f "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): the rendered job execs '$STABLE_PROG' but that file does not exist — launchd would load a job that exits 127 on every tick. Nothing was installed." ; }
 [ -x "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): '$STABLE_PROG' is not executable — launchd would fail to spawn it. Nothing was installed." ; }
-_PIN_EXEC_RESOLVED="$(/bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)"
+# ⛔ `|| _PIN_EXEC_RESOLVED=""` IS NOT COSMETIC. Under `set -e`, a bare assignment from a substitution
+# takes the substitution's exit status, so a stub that DIES (127 on a dead pin, 2 on a bad record) killed
+# the installer with the stub's silent status instead of reaching the named refusal below — the operator
+# got no message at all, and `--start` plus the plist were never touched. The empty value routes every
+# failure into the one REFUSED line that names it.
+# ⛔ AND AN EXPLICIT `HARNESS_ENTRY` IS PASSED THROUGH, or the probe asks a question the runtime will not:
+# the stub picks its own preference when ORCH_ENTRY is unset, so the render-time check has to speak the
+# same override that `__ORCH_ENTRY__` renders into the plist.
+if [ "$_ENTRY_EXPLICIT" = "1" ]; then
+  _PIN_EXEC_RESOLVED="$(ORCH_ENTRY="$HARNESS_ENTRY" /bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)" || _PIN_EXEC_RESOLVED=""
+else
+  _PIN_EXEC_RESOLVED="$(/bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)" || _PIN_EXEC_RESOLVED=""
+fi
 if [ "$_PIN_EXEC_RESOLVED" != "$HARNESS/$HARNESS_ENTRY" ]; then
   rm -f "$RENDER"
   die "REFUSED (#3309): the stable program '$STABLE_PROG' resolves to '${_PIN_EXEC_RESOLVED:-<nothing>}' but the pin is '$HARNESS/$HARNESS_ENTRY' — the plist would run a tree the pin does not name, or nothing at all. Nothing was installed (the previous plist is untouched)."

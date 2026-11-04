@@ -64,6 +64,14 @@ PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}"
 # (`cd '/x/y\r'`); `head -n1` also means a record with diagnostics appended after the path still
 # resolves instead of silently failing.
 DIR="$(head -n1 "$PIN_FILE" 2>/dev/null | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+# ⛔ A TRAILING SLASH IS THE SAME PIN, AND MUST RESOLVE TO THE SAME PROGRAM (#3309 review). The
+# installer normalises the record (`HARNESS="${HARNESS%/}"`, and `pin_path_state` strips repeatedly), so
+# leaving it here made the two halves disagree: the record `…/harness/` produced
+# `…/harness//launchd-controller.sh`, which is a path the filesystem, launchd and the controller all
+# accept — and install.sh then REFUSED the whole install because its equality test did not. A false
+# block on a working config is the class this stub is supposed to end, not create. Strip the SAME way
+# (repeatedly), so the two sides agree by construction rather than by luck.
+while [ "${#DIR}" -gt 1 ] && [ "${DIR%/}" != "$DIR" ]; do DIR="${DIR%/}"; done
 
 [ -n "$DIR" ] || die "pin dir record ${PIN_FILE} is EMPTY — a blank record is a dead supervisor, not an unset option"
 case "$DIR" in
@@ -90,11 +98,18 @@ PROGRAM="$DIR/$ENTRY"
 [ -f "$PROGRAM" ] || die "the pin dir '${DIR}' does not carry '${ENTRY}' — the pin is half-materialised (re-run harness-refresh.sh)"
 [ -r "$PROGRAM" ] || die "'${PROGRAM}' exists but is unreadable"
 
-# ⛔ NEVER EXEC OURSELVES. A pin record pointing back at this stub (a mis-restored `.harness-path`
-# naming `$O`, or an entry name equal to this file) would fork-bomb launchd on a 10 s KeepAlive loop
-# instead of failing. Compare resolved paths, not strings.
+# ⛔ NEVER EXEC OURSELVES — AND NEVER THE DEPLOYED COPY WE SIT BESIDE (#3309 review).
+# The self-check below catches only the case where the RESOLVED ENTRY is this file. That is not the shape
+# a mis-restored `.harness-path` produces: `$O` is the WORKER SEED and it carries `launchd-controller.sh`,
+# which the entry preference ahead of this check selects FIRST — so a record naming `$O` resolved to
+# `$O/launchd-controller.sh`, was not this file, and was exec'd with no marker at all. That is exactly the
+# #2231 divergence (a home-dir copy of a repo script, at no commit) returning silently through the door
+# this file exists to close. Two independent refusals, because they cover different reachable states.
 PROGRAM_REAL="$(cd "$(dirname "$PROGRAM")" >/dev/null 2>&1 && pwd)/$(basename "$PROGRAM")"
 [ "$PROGRAM_REAL" != "$SELF" ] || die "the pin record resolves back to THIS wrapper (${SELF}) — refusing to exec ourselves in a launchd loop"
+DIR_REAL="$(cd "$DIR" >/dev/null 2>&1 && pwd -P)"
+SELF_DIR_REAL="$(cd "$SELF_DIR" >/dev/null 2>&1 && pwd -P)"
+[ "$DIR_REAL" != "$SELF_DIR_REAL" ] || die "the pin dir record (${PIN_FILE}) names THIS wrapper's own directory (${DIR}) — that is the deployed copy, not a pin, so exec'ing '${PROGRAM}' from it is the #2231 divergence (a home-dir copy of a repo script, at no commit). Refusing to exec ourselves in a launchd loop"
 
 if [ "$RESOLVE_ONLY" = "1" ]; then
   printf '%s\n' "$PROGRAM"
