@@ -1083,6 +1083,7 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
   local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_from_sha="" sfr="" range_ok=""
+  local _self="" _extra=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1748,6 +1749,15 @@ FLUSH_PENDING=0
 # is the whole point: a lane that had to remember the old head could not use it).
 DELTA=0
 DELTA_FROM=""
+# ⛔ `D_REC` IS INITIALISED HERE, NOT ONLY IN THE `--delta` BLOCK (agent-infra#3401 review, P1).
+# `--delta` assigns it to the record it RESOLVED — the repo-qualified key, or the legacy `<PR>.json`
+# — and the predecessor reads resolve through `"${D_REC:-$FILE}"`. Leaving the name UNSET on every
+# other path made the invariant ENVIRONMENTAL: an ambient `D_REC` in the caller's environment
+# redirected those reads. MEASURED: a non-delta mint with `D_REC` pointing at an arbitrary file
+# inherited `"evidence":"comment:1234"` from it and BYPASSED the #10677 no-evidence refusal,
+# minting ONE record whose head came from the real record and whose review artifact came from a
+# file the recorder never opened. Initialising it here makes the invariant structural.
+D_REC=""
 # #3247 review (P1) — the head the DECIDING ARM actually measured, which is NOT always
 # DELTA_FROM: only `lane` measures from the record's head. Written into the record as
 # `delta.from`, so the pair a reader checks is the pair the proof covers.
@@ -4908,13 +4918,18 @@ if [ -n "$CARRY_ARM" ]; then
 fi
 REVIEWED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if [ -n "$CARRY_ARM" ]; then
-  # $FILE is read BEFORE the mv below, so it still holds the record this carry
-  # supersedes; that record names the head the verdict was minted at, so its
+  # The predecessor is read BEFORE the mv below, so the file it names still holds the record this
+  # carry supersedes; that record names the head the verdict was minted at, so its
   # reviewed_at IS the mint time.
+  # ⛔ THE PREDECESSOR THE ARM RESOLVED, not `$FILE` (agent-infra#3401 review, P2). On the legacy
+  # key `--delta` reads `$D_LEGACY`, so a `$FILE`-only read here loses a RECOVERABLE mint time and
+  # prints "no record on disk names <head> with a reviewed_at" about a record that does — the
+  # false diagnosis the sibling reads were just fixed for. `D_REC` is empty outside `--delta`.
+  _prior_src="${D_REC:-$FILE}"
   PRIOR_HEAD=""; PRIOR_AT=""
-  if [ -f "$FILE" ]; then
-    PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
-    PRIOR_AT="$(sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
+  if [ -f "$_prior_src" ]; then
+    PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$_prior_src" | command head -1)"
+    PRIOR_AT="$(sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' "$_prior_src" | command head -1)"
   fi
   # ⛔ A RECOVERED reviewed_at IS A LOWER BOUND, NOT A MINT TIME (#2872 review,
   # round 3). Carrying it forward verbatim and printing "preserved as the ORIGINAL
@@ -4923,7 +4938,7 @@ if [ -n "$CARRY_ARM" ]; then
   # whole arm exists to prevent. So a recovered predecessor falls into the honest
   # branch below, which says the mint time is NOT recoverable.
   PRIOR_RECOVERED=0
-  if [ -f "$FILE" ] && grep -q '"mint":"recovered-body"' "$FILE"; then PRIOR_RECOVERED=1; fi
+  if [ -f "$_prior_src" ] && grep -q '"mint":"recovered-body"' "$_prior_src"; then PRIOR_RECOVERED=1; fi
   if [ "$PRIOR_RECOVERED" -eq 0 ] && [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
     REVIEWED_AT="$PRIOR_AT"
     echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=$([ "$DELTA" -eq 1 ] && echo delta || echo carried), carried_from=${ORIG_SHA:0:12}…)" >&2

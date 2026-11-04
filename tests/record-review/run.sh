@@ -2247,6 +2247,32 @@ if [ -d "$DELTA_REPO" ]; then
     && [ "$(printf '%s' "$D_REC32" | grep -c '"evidence":"comment:9000001"')" = 1 ] \
     && pass "(33a) a conflict-free forward merge RE-BINDS, and the record says mint=delta at the new head AND keeps the review artifact its verdict rests on" \
     || fail "(33a) the delta was not rebound as a delta (rc=$DRC_A, record='$D_REC32', out='$OUT32')"
+  # (33a7) A LEGACY-KEY PREDECESSOR IS REACHABLE AND ITS EVIDENCE IS INHERITED (agent-infra#3401
+  # review — found independently in two rounds). `--delta` mirrors `--check-carry`'s lookup and
+  # accepts `<PR>.json` when the repo-qualified key is absent; the predecessor reads used `$FILE`
+  # only, so a legacy-only record was refused with "the superseded record carries no evidence" —
+  # FALSE (the run had just read it) and its printed remedy is the full re-review `--delta` exists
+  # to remove. This case was UNREACHABLE before the fix (the run exited 3), so reverting
+  # `${D_REC:-$FILE}` to `$FILE` in either read reddens exactly this vector — measured.
+  rm -f "$DR_HOME/.pi/agent/reviews/fixture-repo-7102.json"
+  printf '{"pr":7102,"head_sha":"%s","verdict":"clean","mint":"fresh","repo":"fixture/repo","evidence":"comment:7102","reviewed_at":"2026-11-02T00:00:00Z"}\n' \
+    "$D_REVIEWED" > "$DR_HOME/.pi/agent/reviews/7102.json"
+  delta_run 7102 "$TMP/out32a7"; DRC_A7="$DR_RC"
+  D_REC7102="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7102.json" 2>/dev/null)"
+  [ "$DRC_A7" -eq 0 ] && grep -q '"evidence":"comment:7102"' <<<"$D_REC7102" \
+    && pass "(33a7) a LEGACY-key predecessor (<PR>.json) is reachable and its review artifact is INHERITED — the read resolves through \${D_REC:-\$FILE}, not \$FILE" \
+    || fail "(33a7) the legacy-key predecessor was not usable (rc=$DRC_A7, record='$D_REC7102')"
+  # (33a8) NON-VACUITY OF THE ENVIRONMENT SURFACE (the P1 this vector's sibling fixed): `D_REC`
+  # must be INITIALISED, not merely unset, or an ambient `D_REC` in the caller's environment
+  # redirects the predecessor reads on a NON-delta mint and bypasses the #10177 no-evidence refusal
+  # — MEASURED: a pass-through `D_REC` made one record whose head came from the real record and
+  # whose `evidence` came from an arbitrary file. Asserted STRUCTURALLY on the bytes, because the
+  # suite invokes the verb per mode and an env-only vector would pass whichever way the default is
+  # written only if the default is absent.
+  grep -qE '^D_REC=""$' "$SRC" \
+    && pass "(33a8) the script initialises D_REC (a default, not a hope) — an ambient D_REC cannot redirect a non-delta predecessor read" \
+    || fail "(33a8) scripts/record-review.sh has no top-level D_REC=\"\" default: an ambient D_REC can bypass the no-evidence refusal"
+
   # (33a2) THE RECORD SHAPE IS THE CONTRACT, so it is PINNED rather than described. `proved` exists
   # because the field it replaced (`authored_unchanged:true`, hardcoded) was contradicted by the
   # SAME run's triple on the lane path — and the lane arm must emit NEITHER `authored_unchanged`
@@ -2693,11 +2719,12 @@ fi
 # 33f2 pin the unproven-delta refusal and the "both verbs agree" invariant, which were MEASURED
 # green under deletion before they existed.
 # AFTER THE REBASE the count is main's plus this section's: main spent 185 -> 190 on #3347's own
-# section (32), and this section adds 14 (13 delta assertions + the (33a6) integration pin), so the
-# pin is 204. The section is numbered 33 for the same
+# section (32), and this section adds 16 (13 delta assertions + the (33a6) integration pin +
+# the (33a7) legacy-key vector + the (33a8) structural D_REC default), so the
+# pin is 206. The section is numbered 33 for the same
 # reason — (32) was already taken on main by the time this branch was rebased.
-# MEASURED: `ALL PASSED (204 assertion(s))` on the merged tree.
-MIN_ASSERTIONS=204
+# MEASURED: `ALL PASSED (206 assertion(s))` on the merged tree.
+MIN_ASSERTIONS=206
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
