@@ -454,48 +454,52 @@ grep -q '\[mem-gate\] REFUSED .*spawn point refused the launch for MEMORY' "$TMP
 # advice for both, so an operator on a box whose /proc/meminfo or vm_stat is unreadable was told to
 # wait for an event that cannot arrive — contradicting run_agent's own arm for the same state, on the
 # one surface that reaches merge-one's reviewers and hand-written runners.
-# Reachability differs by platform: the probe prefers /proc/meminfo, so on Linux UNREADABLE cannot be
-# produced from PATH and the arm SKIPS LOUDLY rather than pretending to have exercised it.
-if [ -r /proc/meminfo ]; then
-  checks=$((checks + 1)); echo "   ⏭  SKIPPED the UNREADABLE-remedy arm: /proc/meminfo is readable here, so the probe cannot be forced unreadable from PATH (run this suite on macOS to exercise it)"
-else
-  mkdir -p "$TMP/unreadshim"
-  # The macOS branch of the probe: `vm_stat` answers nothing, so mem_avail_mb returns non-zero and the
-  # shim has no reading to compare. NOT a low reading — no reading at all.
-  printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/unreadshim/vm_stat"
-  chmod +x "$TMP/unreadshim/vm_stat"
-  reset_probe
-  before="$(ledger_rows)"
-  err="$(PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" TAG=mem-unreadable MAX_LOAD=999999999 \
-    PATH="$TMP/unreadshim:$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
-    bash -c 'pi -p x' 2>&1 >/dev/null)"; rc=$?
-  [ "$rc" -eq 72 ] \
-    && pass "an UNREADABLE probe REFUSES (rc=$rc) — fail-closed, not fail-open like the disk gate" \
-    || fail "an unreadable memory probe returned $rc instead of refusing with 72 (fail-OPEN)"
-  [ ! -s "$TMP/probe" ] \
-    && pass "…and the real pi did NOT start on it" \
-    || fail "an unreadable probe still started pi: $(tr '\n' ' ' < "$TMP/probe")"
-  grep -q 'REFUSED (memory) UNREADABLE' <<<"$err" \
-    && pass "…and the line names the STATE as UNREADABLE (not a number, not LOW)" \
-    || fail "the refusal did not carry UNREADABLE: $(head -1 <<<"$err")"
-  grep -q 'the PROBE is broken, not the box' <<<"$err" \
-    && pass "…and the remedy says the PROBE is broken, which is the action that can actually clear it" \
-    || fail "the UNREADABLE remedy does not name the broken probe: $(grep -i remedy <<<"$err" | head -1)"
-  if grep -q 're-dispatch when resident lanes finish' <<<"$err"; then rc=1; else rc=0; fi
-  ck_unread_no_wait=$rc
-  [ "$ck_unread_no_wait" -eq 0 ] \
-    && pass "…and it does NOT tell the operator to wait for lanes to finish (nothing finishes to fix a probe)" \
-    || fail "the UNREADABLE refusal borrowed the LOW remedy, which can never clear it"
-  # The reading is persisted for the population this surface serves: `-` was the old row's answer to
-  # "what was the memory reading", and a shim refusal used to record the LOAD pair instead.
-  after="$(ledger_rows)"
-  [ "$(ledger_field "$after" 11)" = "UNREADABLE" ] \
-    && pass "…and the durable row records WHY (field 11 = UNREADABLE), not the load reading it did not bind on" \
-    || fail "the shim's memory row does not record the memory reading (field 11 = '$(ledger_field "$after" 11)')"
-  { [ "$after" -eq "$(( before + 1 ))" ] && [ "$(ledger_field "$after" 2)" = "refused" ]; } \
-    && pass "…and it is still exactly ONE row in the same ledger ($before -> $after)" \
-    || fail "the shim wrote $(( after - before )) rows for one refusal ($before -> $after)"
-fi
+# Reachability NO LONGER differs by platform (review of #2591, P2): this arm used to depend on
+# /proc/meminfo being UNREADABLE, which cannot be produced from PATH on Linux, so it printed SKIPPED
+# on the very lane CI runs it in — an inert arm guarding the UNREADABLE remedy. It is now driven by
+# breaking the PARSER instead of the file, which is the same UNREADABLE class `mem_avail_mb` returns
+# (`awk` answers nothing → non-zero → no reading to compare) and it reproduces on Linux AND macOS.
+# The failure text no longer claims "fail-OPEN": the pre-renumber arm asserted 72, a code the shim has
+# not returned since the merge onto main (72 is `REPO_TARGET_REFUSED`), so the arm reddened on the one
+# host that ran it while naming the property the gate has RIGHT.
+mkdir -p "$TMP/unreadshim"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/unreadshim/awk"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/unreadshim/vm_stat"
+chmod +x "$TMP/unreadshim/awk" "$TMP/unreadshim/vm_stat"
+reset_probe
+before="$(ledger_rows)"
+err="$(PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" TAG=mem-unreadable MAX_LOAD=999999999 \
+  PATH="$TMP/unreadshim:$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
+  bash -c 'pi -p x' 2>&1 >/dev/null)"; rc=$?
+# ⛔ 82, the SHIPPED `PI_GATE_MEM_REFUSED` — the same code §12 above asserts, and the same one
+# `run_agent` translates to 81. Asserting 72 here made a memory refusal indistinguishable from a
+# repo-identity refusal to every reader of this suite.
+[ "$rc" -eq 82 ] \
+  && pass "an UNREADABLE probe REFUSES (rc=$rc) — fail-closed, not fail-open like the disk gate" \
+  || fail "an unreadable memory probe returned $rc instead of refusing with 82 (fail-OPEN)"
+[ ! -s "$TMP/probe" ] \
+  && pass "…and the real pi did NOT start on it" \
+  || fail "an unreadable probe still started pi: $(tr '\n' ' ' < "$TMP/probe")"
+grep -q 'REFUSED (memory) UNREADABLE' <<<"$err" \
+  && pass "…and the line names the STATE as UNREADABLE (not a number, not LOW)" \
+  || fail "the refusal did not carry UNREADABLE: $(head -1 <<<"$err")"
+grep -q 'the PROBE is broken, not the box' <<<"$err" \
+  && pass "…and the remedy says the PROBE is broken, which is the action that can actually clear it" \
+  || fail "the UNREADABLE remedy does not name the broken probe: $(grep -i remedy <<<"$err" | head -1)"
+if grep -q 're-dispatch when resident lanes finish' <<<"$err"; then rc=1; else rc=0; fi
+ck_unread_no_wait=$rc
+[ "$ck_unread_no_wait" -eq 0 ] \
+  && pass "…and it does NOT tell the operator to wait for lanes to finish (nothing finishes to fix a probe)" \
+  || fail "the UNREADABLE refusal borrowed the LOW remedy, which can never clear it"
+# The reading is persisted for the population this surface serves: `-` was the old row's answer to
+# "what was the memory reading", and a shim refusal used to record the LOAD pair instead.
+after="$(ledger_rows)"
+[ "$(ledger_field "$after" 11)" = "UNREADABLE" ] \
+  && pass "…and the durable row records WHY (field 11 = UNREADABLE), not the load reading it did not bind on" \
+  || fail "the shim's memory row does not record the memory reading (field 11 = '$(ledger_field "$after" 11)')"
+{ [ "$after" -eq "$(( before + 1 ))" ] && [ "$(ledger_field "$after" 2)" = "refused" ]; } \
+  && pass "…and it is still exactly ONE row in the same ledger ($before -> $after)" \
+  || fail "the shim wrote $(( after - before )) rows for one refusal ($before -> $after)"
 
 echo
 if [ "$failures" -gt 0 ]; then

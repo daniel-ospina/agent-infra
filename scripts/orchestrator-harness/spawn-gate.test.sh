@@ -52,7 +52,7 @@ echo "==> spawn-gate self-test ($HERE)"
 # ── the MEMORY gate's neutraliser (agent-infra#2387) ───────────────────────────
 # EVERY arm in this suite except section 12 wants the memory gate out of the way, for exactly the
 # reason the disk arms pin `DISK_MIN_FREE_MB=1` below: a spawn assertion must be decided by its
-# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `73` to a
+# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `81` to a
 # load-gate arm and the suite would report "load-gate regressions" that are not regressions. It is
 # exported once rather than repeated at fourteen call sites, and it is a FLOOR, not a switch: there
 # is still a comparison, still a probe and still a refusal path — section 12 drives all three, and
@@ -1131,6 +1131,33 @@ ck "adopt-fix.sh exits with the FIXER's status (75 on a load refusal), not echo'
 # that reports the DISK remedy for a load refusal (review round 2, P2).
 grep -q 'fixer NOT started (load gate)' "$RO/logs/adopt-7.log"; rc=$?
 ck "adopt-fix.sh NAMES the load gate on a load refusal" $rc
+# ⛔ ... AND MEMORY (81) AND FORK (73) ARE EACH NAMED BY THEIR OWN GATE (review of #2591, P1).
+# `adopt-fix.sh` was written against the DRAFT numbering and mapped MEMORY to `73` — which has been
+# `AGENT_FORK_REFUSED` since agent-infra#2293 — so BOTH directions were wrong: a fork refusal told the
+# operator to wait for resident lanes (on a box that cannot fork the retry at all, and whose only
+# remedy is a restart/drain from OUTSIDE) while a memory refusal (`81`) matched NO arm and wrote NO
+# line into `adopt-<PR>.log`, the log this wrapper exists to fill (#1720). Neither is reachable by
+# driving the real fixer from this box, so the fixer's own exit status is stubbed: the property under
+# test is the WRAPPER's classification, and a stub is the only way to put both codes in front of it.
+# Each code asserts (a) propagation, (b) ITS OWN wording, and (c) the ABSENCE of the other's — a
+# wrapper that named both, or that hardcoded one remedy, would pass (a)+(b) and fail (c).
+ADOPT_REAL_FIX="$TMP/adopt-real-fix-one.sh"
+cp "$RO/fix-one.sh" "$ADOPT_REAL_FIX"
+for pair in "81:MEMORY" "73:FORK"; do
+  _code="${pair%%:*}"; _word="${pair##*:}"
+  if [ "$_word" = "MEMORY" ]; then _other='FORK gate'; else _other='MEMORY gate'; fi
+  printf '#!/usr/bin/env bash\nexit %s\n' "$_code" > "$RO/fix-one.sh"
+  : > "$RO/logs/adopt-7.log"
+  ( cd "$RREPO" && O="$RO" PATH="$RIG/bin:$PATH" \
+      bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; _arc=$?
+  [ "$_arc" -eq "$_code" ]; rc=$?
+  ck "adopt-fix.sh propagates the fixer's rc=$_code (got $_arc) — not normalised to another gate's" $rc
+  grep -q "fixer NOT started ($_word gate)" "$RO/logs/adopt-7.log"; rc=$?
+  ck "adopt-fix.sh NAMES the $_word gate on a $_word refusal (rc=$_code)" $rc
+  if grep -q "fixer NOT started ($_other)" "$RO/logs/adopt-7.log"; then rc=1; else rc=0; fi
+  ck "...and does NOT report rc=$_code as the $_other — opposite remedies (free RAM vs restart the BOX)" $rc
+done
+cp "$ADOPT_REAL_FIX" "$RO/fix-one.sh"
 # ... and the SUCCESS arm too: a constant-75 wrapper would pass the line above and report every
 # successful adopt as a refusal.
 : > "$PI_LOG"; : > "$MERGE_LOG"
@@ -1897,14 +1924,23 @@ ck "a PRESENT-but-NON-NUMERIC MemAvailable FAILS (rc=$mrc, '${got:-<empty>}') �
 # …and the same input driven END TO END must reach the UNREADABLE remedy, not the LOW one — and must
 # never write a fabricated `0` into the durable series. The reading is taken by the SHIPPED parser
 # (below) and then handed to the shipped `run_agent` through the same probe seam every other arm uses.
-bad_avail="$(read_mem "$TMP/meminfo-badfield2")"
-res="$(drive_mem "${bad_avail:-UNREADABLE}" 2048)"
+# ⛔ THE FIXTURE IS `meminfo-badfield`, THE SAME FILE CREATED TWO LINES ABOVE (review of #2591, P3).
+# This arm used to read `$TMP/meminfo-badfield2`, which is NEVER CREATED: on Linux `[ -r ]` was false,
+# `mem_avail_mb` fell through to `vm_stat`, answered nothing, and `${bad_avail:-UNREADABLE}` supplied the
+# literal — so the arm proved the EXPLICIT-UNREADABLE case again, not the present-but-non-numeric input
+# its name claims. On a host where `vm_stat` works it read the box's REAL memory, `drive_mem` ALLOWED,
+# and both assertions below went red on a machine with nothing wrong. Reading the real fixture removes
+# BOTH: the input is exactly the non-numeric field, and no fallback or escape hatch is needed.
+bad_avail="$(read_mem "$TMP/meminfo-badfield")"
+{ [ -z "$bad_avail" ]; }; rc=$?
+ck "…the present-but-non-numeric fixture answers NO reading (got '${bad_avail:-<empty>}') — not a number, so there is nothing to compare" $rc
+res="$(drive_mem "$bad_avail" 2048)"
 [ "$res" = "rc=81 started=0" ]; rc=$?
 ck "…and end to end that input REFUSES as UNREADABLE rather than as a LOW reading ($res)" $rc
 grep -q '\[mem-gate\] REFUSED .*UNREADABLE' "$LOG"; rc=$?
 ck "…with the UNREADABLE line, so the remedy names the broken PROBE and not resident lanes" $rc
 bf="$(tail -1 "$TMP/O/state/mem-avail.tsv" 2>/dev/null | cut -f4)"
-{ [ "$bf" = "UNREADABLE" ] || [ -z "$bad_avail" ]; }; rc=$?
+[ "$bf" = "UNREADABLE" ]; rc=$?
 ck "…and the durable series never records a fabricated 0 for it (avail='${bf:-<none>}')" $rc
 
 # ⛔ THE macOS PAGE SIZE IS REQUIRED, NOT DEFAULTED (review, P3). `if (ps=="") ps=16384` made the ONE

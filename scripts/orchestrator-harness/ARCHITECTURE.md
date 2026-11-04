@@ -69,7 +69,6 @@ issue (open, labelled P0/P1/P2, unassigned)
   │                           into the brief (#2148) — the requirement is not discovered by being
   │                           refused at the rail. A gate refusal starts no agent and writes
   │                           `state/capacity-refused-<N>` (`<epoch>\t<yield_until>\t<fork|load|mem|disk|capability|land>`).
-  │                           `state/capacity-refused-<N>` (`<epoch>\t<yield_until>\t<load|disk|land>`).
   │                           ⛔ BOUNDED IN THE WRAPPER (2026-10-27): `run_agent` runs the `pi`
   │                           under `lane-bound.sh watch`, so a lane ends on EITHER a wall-clock
   │                           ceiling OR a SILENCE bound (no output growth AND no CPU delta for
