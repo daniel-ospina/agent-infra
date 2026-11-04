@@ -239,6 +239,19 @@ case_a() { # <entry-point> <owner>
     case_check "$(grep -qF 'WOULD-REMOVE' <<<"$out" && echo 1 || echo 0)" "no WOULD-REMOVE row was printed"
     case_check "$(grep -qF 'reason=written-within-floor' <<<"$out" && echo 0 || echo 1)" \
                "and each is KEPT by name, with the reason that proves it is alive"
+    # ⛔ THE FLOOR IS RELAYED FROM THE SEAM, NOT HARDCODED. Every assertion above is satisfied by an
+    # entry point that never reads `DISK_REAPER_RUNNER_MIN_AGE` and hands the owner a literal 3600 — the
+    # default and the literal are the same number, so a dry-run-only suite calls both of them correct.
+    # That is an INERT KNOB: an operator who RAISES the floor on a box whose jobs write outside the
+    # checkout would change nothing, and the class would keep deleting. Driving the seam to 60 s must make
+    # the 5-minute entry a CANDIDATE while the 0 s one is still kept, which is only true if the entry
+    # point's own `RUNNER_MIN_AGE` actually reaches the owner's decision.
+    s3="$(uniqstate a3)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=60 run_pass "$pass" "$s3" "$base/gh-runner*/_work" --dry-run --only runner-work)"
+    case_check "$(grep -qF 'candidates=1 ' <<<"$out" && echo 0 || echo 1)" \
+               "the entry point's RUNNER_MIN_AGE is RELAYED to the owner: a 60 s seam makes the 5-minute entry a candidate (the 0 s one stays kept)"
+    case_check "$(grep -qF 'WOULD-REMOVE class=runner-work' <<<"$out" && echo 0 || echo 1)" \
+               "… and it is named as a WOULD-REMOVE row, so the raised floor is what moved it, not the census"
     # ⛔ THE ARMED PASS TOO. A dry-run-only assertion is satisfied by a class that deletes in `--apply`
     # regardless — the exact asymmetry that loses a job.
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s2" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
@@ -724,7 +737,7 @@ case_l() { # <entry-point> <owner>
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
-MUT_A='s/when=\$(( \$(now) - MIN_AGE ))/when=$(now)/'
+MUT_A='s/when=\$(( \$(now) - RUNNER_WORK_MIN_AGE ))/when=$(now)/'
 MUT_B='s/-newer "\$ref" -print 2>\/dev\/null | head -1/-print 2>\/dev\/null | head -1/'
 # (b) has a SECOND mutant, on the ENTRY POINT: DELETE the `verdict_runner_work=` line from the pass
 # record. Every other runner-work field is rendered by a different expression, so only an assertion that

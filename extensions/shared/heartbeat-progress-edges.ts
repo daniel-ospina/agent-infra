@@ -1076,6 +1076,29 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "#1932 (review of PR #1949) — the STATED free-disk floor the reaper's per-pass capacity line asserts against (2 GiB = one MEASURED lane env, ~1.85 GB of real non-shared disk per lane), so 'above the floor' means 'one more lane still fits'. Registered rather than left as a bare constant because it bounds how much of the box the fleet may consume, and a bound only the reaper knows about is invisible to the audit that exists to notice exactly that. It ASSERTS, it does not reclaim: a breach exits 5 (the reaper's own `over-bound` code — `disk-reaper.sh` KEEPS that 5 since agent-infra#2156 landed, so an apply pass records `rc=3 verdict_venv=fail-closed` and a dry run records `rc=5 verdict_venv=over-bound`; the old `worst_rc` drop of 5 that recorded `rc=0 verdict=ok` is gone, do not restate it) and is named on the report, and no live lane's env is ever deleted to get back above it. Unlike the age floor this is a SPACE bound, so it answers to the hygiene axis (disk reapers that are not agent-stall detectors), not retention.",
   },
+  // ── ai#3057: the runner-work reclaim class's floor, as a MATCHED PAIR ────────────────────────────
+  // The entry point's pass-through and the owner's own floor are two declarations of one policy (as
+  // `VENV_MIN_AGE` / `REAP_VENV_MIN_AGE_SECONDS` above are), so both are registered: a floor only ONE
+  // of the two layers knows about is invisible to the audit that exists to notice exactly that.
+  {
+    name: "RUNNER_MIN_AGE",
+    owners: ["scripts/disk-reaper.sh"],
+    value: "${DISK_REAPER_RUNNER_MIN_AGE:-3600}",
+    axis: "reap",
+    guardedBy:
+      "scripts/disk-reaper-runner-work.test.sh cases (a) and (b) — (a) proves a `_work` entry YOUNGER than the floor is neither counted nor reaped in `--dry-run` AND `--apply`, (b) proves one PAST it is reaped; its mutant (the floor reference becomes `now`) turns (a) RED",
+    note: "ai#3057 — the entry point's pass-through of the runner `_work` mtime floor to its owner (`reap-runner-work.sh`, whose own `RUNNER_WORK_MIN_AGE` is registered below). It exists here so the scheduled cell pass can tune the floor WITHOUT editing the owner, and it is registered for the same reason `VENV_MIN_AGE` is: a floor that only the scheduler knows about is invisible to the audit. ⛔ NOT an 'idle' or busy-check bound — the class deliberately has none (the listener is a child of the runner service and `_work/<entry>` carries no owner pid or lock), so this mtime floor is the ONLY gate on the delete decision.",
+  },
+  {
+    name: "RUNNER_WORK_MIN_AGE",
+    owners: ["scripts/reap-runner-work.sh"],
+    value: "${REAP_RW_MIN_AGE:-3600}",
+    axis: "reap",
+    guardedBy:
+      "scripts/disk-reaper-runner-work.test.sh cases (a), (b) and (g) — (a) a YOUNG entry is neither counted nor reaped in `--dry-run` AND `--apply`, (b) an OLD entry IS removed by `--apply` and reported as a `df` delta, (g) a full-disk fallback pass still REAPS the dead entry it exists for; (a)'s mutant (the floor reference becomes `now`) turns the case RED",
+    overrides: ['RUNNER_WORK_MIN_AGE="$2"; shift 2 ;;'],
+    note: "ai#3057 — the owner's own mtime FLOOR for the runner `_work` class: an entry is a candidate only when nothing under it — including its own top directory — has been written for longer than this. ⛔ NAMED `RUNNER_WORK_MIN_AGE`, NOT the bare `MIN_AGE`, and that was a REVIEW FINDING, not a style choice: the bare name is already a REGISTERED term owned by `scripts/orchestrator-harness/lane-container-reap.sh` (4 h), so declaring it here made ONE name hold TWO unrelated floors and the reverse scan refused it — correctly, because co-owner registration would demand both files carry the SAME value and they must not. The `X_MIN_AGE` form is the recorded convention for exactly this collision (`CR_MIN_AGE`/`VENV_MIN_AGE`). ⚠️ The validated 7200 s (a measured 120-minute hand reap) is NOT the shipped default: 3600 s is deliberate, and a box whose jobs write outside the checkout should raise it.",
+  },
   {
     name: "STALL_FIX_BRIEF_MAX_AGE_MIN",
     owners: ["scripts/orchestrator-harness/stall-fix.sh"],
