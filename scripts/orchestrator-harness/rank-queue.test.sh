@@ -46,7 +46,9 @@
 # No network, no gh, no controller: the functions touch one directory of plain files.
 #
 # Run:  bash scripts/orchestrator-harness/rank-queue.test.sh
-# shard: on — hermetic; one temp dir, no state outside it.
+# (No `# shard:` line: the marker is read from the first 20 lines ONLY, so one down here is inert, and
+#  moved into the header it would be an UNRECOGNISED marker — run-bash-shards.sh:236 refuses the whole
+#  run on it. This suite has no opt-out to declare; shard_discover runs an unmarked suite by default.)
 
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -265,6 +267,34 @@ if [ "$sum_before" = "$sum_after" ] && grep -q 'priority-unreadable' "$TMP/nopoo
    && [ ! -e "$TMP/nopool/o/.cand.ranked" ] && [ ! -e "$TMP/nopool/o/.queue-rank" ]; then rc=0
 else rc=1; echo "      out: $(tr '\n' '|' < "$TMP/nopool/out" 2>/dev/null | head -c 300); leftovers: $(ls -a "$TMP/nopool/o" | tr '\n' ' ')"; fi
 ck "an unreadable pool leaves candidates.txt byte-identical, names 'priority-unreadable', and leaves no temp file behind" $rc
+
+# ── 6b) AN UNVERIFIABLE COUNT IS NOT A DRAINED QUEUE (review P2) ────────────
+# `rank_queue_by_pool` writes `<ranked> <unranked> <head>` and the caller reads it to choose its
+# state word. `0 0` is the DRAINED-QUEUE claim, so a count that cannot be read must fail the reorder
+# where the caller can still say `priority-unreadable` — never arrive as zeros and be reported as
+# “the queue is EMPTY — there is nothing to order” over a queue that is not empty (the same convention
+# this file already applies to an unreadable pool row count, #1931). `/dev/null` is the fixture for
+# it: the write SUCCEEDS (awk exits 0) and the file is permanently `-s`-empty, so the guard, and only
+# the guard, decides the outcome.
+#
+# Positive pair in the same check: the identical call with a REAL count path must succeed, so a
+# producer that simply always failed could not satisfy this assertion.
+QC="$TMP/countguard"; mkdir -p "$QC"
+printf '300\n9\n' > "$QC/q"
+printf '300\n' > "$QC/pool"
+{
+  cat "$FNS"
+  printf 'rank_queue_by_pool "$1" "$2" "$3" "$4"\nexit $?\n'
+} > "$QC/one.sh"
+( cd "$QC" && HOME="$QC" bash one.sh "$QC/pool" "$QC/q" "$QC/out-bad" /dev/null ) >/dev/null 2>&1
+bad_rc=$?
+( cd "$QC" && HOME="$QC" bash one.sh "$QC/pool" "$QC/q" "$QC/out-good" "$QC/cnt-good" ) >/dev/null 2>&1
+good_rc=$?
+if [ "$bad_rc" -ne 0 ] && [ -s "$QC/out-bad" ] && [ "$good_rc" -eq 0 ] && [ -s "$QC/cnt-good" ]; then rc=0
+else
+  rc=1; echo "      unverifiable-count rc=$bad_rc (want !=0, with a written reorder); real-count rc=$good_rc (want 0, count written)"
+fi
+ck "a reorder whose COUNT cannot be verified FAILS instead of reporting a drained queue (positive pair: a real count succeeds)" $rc
 
 # ── 7) THE WIRING CANNOT GO INERT — the false-PASS this suite was written for ──
 # The first cut of this change DEFINED both functions ~1,337 lines BELOW the skip arm that calls one, so
