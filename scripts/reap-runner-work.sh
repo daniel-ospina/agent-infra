@@ -596,7 +596,17 @@ sweep_root() { # <_work root>
     # where "nothing is here" and "I could not look" are indistinguishable from the loop alone. Counted in
     # the SAME abstention channel an unreadable ENTRY uses, so `candidates=` still reports what WAS seen
     # while `unmeasurable=` names what was not, and `note_runner_work=` surfaces it end to end.
+    # ⛔ AND A VANISHED ROOT IS NOT AN UNLISTABLE ONE — the same distinction the entry-level walk gained,
+    # one level up, and it matters MORE here because the two-phase pass widens the window between
+    # discovery and sweep. `find` on a deleted path exits non-zero exactly like a permission failure, so a
+    # runner tree removed between the two phases (a re-image, a runner teardown) was reported as an
+    # abstention about a root that is simply gone. Re-stat before claiming the abstention.
     if [ "$_seen" = 0 ] && ! root_is_listable "$root"; then
+        if [ ! -e "$root" ]; then
+            GONE=$((GONE + 1))
+            log_line "GONE   $root reason=vanished (the root no longer exists: it was removed between discovery and the sweep — nothing under it was measured because there is nothing there, which is not an abstention)"
+            return 0
+        fi
         UNMEASURABLE=$((UNMEASURABLE + 1))
         log_line "KEPT   $root reason=unlistable (the root EXISTS but its listing could not be READ, so nothing under it was measured; an abstention, never an empty population)"
     fi
@@ -637,7 +647,17 @@ log "==== pass start mode=$MODE_TEXT min_age=${RUNNER_WORK_MIN_AGE}s explicit=$E
 # than trusted. A leading `~/` is expanded here because a seam written in a unit file is not expanded by
 # the shell that reads it. (A path containing a space cannot be expressed in this list — these layouts
 # have none — and `--glob` is repeatable for the rest.)
-for _g in $GLOBS; do
+# ⛔ AND THE PATTERN LIST IS SPLIT WITH GLOBBING OFF, OR `globs=` COUNTS ROOTS AND THE `(glob …)`
+# ATTRIBUTION PRINTS AN EXPANSION. `for _g in $GLOBS` performs word splitting AND pathname expansion, so
+# with two patterns where one matched two roots the SUMMARY read `globs=3` — a count of WORDS — and every
+# `root … (glob …)` line named the expanded path instead of the pattern that matched it, which is the one
+# thing that line exists to answer. `set -f` around the split gives one line per PATTERN; globbing is
+# restored for the inner expansion, which needs it.
+set -f
+PATTERNS="$(printf '%s\n' $GLOBS)"
+set +f
+while IFS= read -r _g; do
+    [ -n "$_g" ] || continue
     case "$_g" in "~/"*) _g="${HOME:-}/$(printf '%s' "$_g" | sed 's|^~/||')" ;; esac
     GLOBS_N=$((GLOBS_N + 1))
     _matched=0
@@ -672,7 +692,9 @@ for _g in $GLOBS; do
         log_line "reap-runner-work: root $_r (glob $_g)"
     done
     [ "$_matched" = 1 ] || log_line "reap-runner-work: note: glob $_g matched no runner _work root on this box"
-done
+done <<EOF
+$PATTERNS
+EOF
 
 # ⛔ PHASE 2 DOES NOT BEGIN UNTIL EVERY MATCHED ROOT HAS PASSED THE NAME GATE — THE PASS IS TWO-PHASE
 # BECAUSE SWEEPING AS IT DISCOVERED MADE THE RECORD LIE ABOUT A PASS THAT HAD ALREADY DELETED. The gate

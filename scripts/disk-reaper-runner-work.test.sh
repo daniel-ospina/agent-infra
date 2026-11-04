@@ -777,6 +777,42 @@ case_l() { # <entry-point> <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (s) an entry that VANISHES mid-pass is GONE, not unreadable ─────────────────────────────────
+# ⛔ `find` ON A PATH A RUNNER DELETED EXITS NON-ZERO EXACTLY LIKE A PERMISSION FAILURE, so a job
+# finishing during the sweep (the runner removes its own `_work/<entry>`) was counted into
+# `unmeasurable=` — and, with the census keyed on what was reached, that is enough to publish a non-`ok`
+# verdict on a pass that measured everything else. The two facts have different consequences (one says "I
+# could not prove this checkout dead", the other says "there is nothing to prove"), so the walk re-stats
+# before claiming an abstention. Driven with an INSTRUMENTED copy of the real owner — the delete is
+# injected at the classification site so the REAL `entry_written_since` runs against a missing path; that
+# is a race fixture, not a stub of the logic under test. The mutant then reverts the guard itself.
+case_s() { # <entry-point> <owner — INSTRUMENTED: it deletes the entry at the classification site>
+    local pass="$1" owner="$2" base work dead out rc sum s1
+    PASS_OWNER="$owner"
+    base="$T/s.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-40)"
+    fixture_entry dead "$work" job-vanishing 300 || return 1
+    s1="$(uniqstate s1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    # ⛔ THE FIXTURE MUST HAVE ACTUALLY VANISHED THE ENTRY, or every assertion below is satisfied by a
+    # normal reap (which is exactly how the first version of this case passed while measuring nothing).
+    case_check "$(grep -qF 'REAPED' <<<"$out" && echo 1 || echo 0)" \
+               "the fixture entry was GONE at classification, so nothing was reaped (the race was driven)"
+    case_check "$(grep -qF 'reason=vanished' <<<"$out" && echo 0 || echo 1)" \
+               "an entry deleted during the pass is NAMED reason=vanished, with its own row"
+    case_check "$(grep -qF 'gone=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… counted in its OWN field (summary: ${sum:-<none>})"
+    case_check "$(grep -qF 'unmeasurable=0 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… and NOT as unmeasurable — a gone checkout is a fact about the runner, not a doubt about the box"
+    case_check "$(grep -qF 'census=ok' <<<"$sum" && echo 0 || echo 1)" \
+               "… so the census stays ok: nothing was left unmeasured"
+    case_check "$(grep -q '^verdict_runner_work=ok$' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the class verdict is ok, so no operator is sent to look at a permission problem that does not exist"
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
+               "… and the pass exits 0 (rc=$rc)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── (m) an OUT-OF-RANGE floor is refused, and a leading-zero floor is normalised ────────────────
 # ⛔ THIS CASE EXISTS BECAUSE THE FLOOR IS THE ONLY GATE ON A `rm -rf`, so its REFUSAL path is as
 # load-bearing as its delete path — and it was unguarded. `num` accepts any digit string, so:
@@ -937,7 +973,7 @@ case_r() { # <entry-point> <owner>
     case_check "$(grep -q 'no entry was classified' <<<"$(status_of "$s2")" && echo 1 || echo 0)" \
                "… and the record does NOT claim no entry was classified, which would be false about the entry it just kept"
     case_check "$(grep -q '^candidates_runner_work=0$' <<<"$(status_of "$s2")" && echo 0 || echo 1)" \
-               "… the count is the MEASURED lower bound (0 here), not `?` — something was measured, there was just nothing reapable"
+               "… the count is the MEASURED lower bound (0 here), not unknown — something was measured, there was just nothing reapable"
     case_check "$(grep -q '^verdict_runner_work=partial$' <<<"$(status_of "$s2")" && echo 0 || echo 1)" \
                "… while the verdict still refuses to say ok, because a root went unread"
     return $((CASE_FAIL > 0))
@@ -1087,7 +1123,7 @@ case_q() { # <owner>
     out="$(REAP_RW_STATE_DIR="$T/q-st2" REAP_RW_EXPLICIT=1 REAP_RW_GLOBS="$base/nope-*/_work" \
            BOUNDED_LIB="$HERE/lib/bounded.sh" bash "$owner" --dry-run 2>&1)"; rc=$?
     case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
-               "control: the SAME unmatched glob with EXPLICIT=1 is `no-roots` (rc=$rc) — both spellings refuse"
+               "control: the SAME unmatched glob with EXPLICIT=1 is no-roots (rc=$rc) — both spellings refuse"
     case_check "$(grep -qF 'census=no-roots' <<<"$out" && echo 0 || echo 1)" \
                "… through the documented no-roots route, which the emptied value was bypassing"
     return $((CASE_FAIL > 0))
@@ -1178,16 +1214,22 @@ MUT_A4='s/^RUNNER_WORK_MIN_AGE="\${REAP_RW_MIN_AGE:-7200}"$/RUNNER_WORK_MIN_AGE=
 # would leave one surface lying: the owner's token (so the count is withdrawable) and the entry point's
 # verdict mapping (so `ok` is not published for an abstention).
 MUT_L2='s/^if \[ "\$UNMEASURABLE" -gt 0 \]; then$/if false; then/'
-MUT_L3='s/^    \[ "\$RW_ABSTAINED" = 1 \] && VERDICT_RW="abstained"$/    :/'
+MUT_L3='s/^            \[ "\$RW_ABSTAINED" = 1 \] && VERDICT_RW="abstained"$/            :/'
 # (r)'s arms, on the PARTIAL census — the abstention one state over (#3057 review, P1). Each half is
 # mutated separately for the same reason as (l2)/(l3): `else CENSUS=ok` publishes a partly-unread
 # population as measured (so the record says ok again), and deleting the entry point's override lets a
 # `census=partial` land as `verdict_runner_work=ok` — either half alone leaves one surface lying.
 MUT_R1='s/else CENSUS=partial/else CENSUS=ok/'
-MUT_R2='s/^    \[ "\$RW_PARTIAL" = 1 \] && VERDICT_RW="partial"$/    :/'
+MUT_R2='s/^            \[ "\$RW_PARTIAL" = 1 \] && VERDICT_RW="partial"/            :/'
 # (o)'s SECOND arm, on the CAUSE the record publishes. Without its own census token, a refused root falls
 # into the `no-roots` arm and the record says the glob "matched nothing" — false, with the wrong remedy.
 MUT_O2='s/^    print_summary refused$/    print_summary no-roots/'
+# (s)'s TWO fixtures. `MUT_S_INSTRUMENT` is not a behaviour mutation but the only way to drive a RACE
+# deterministically: it deletes the entry between classification and the walk, so the REAL
+# `entry_written_since` runs against a path that no longer exists — exactly what a runner finishing a job
+# during the pass does. `MUT_S` then reverts the guard under test, which must redden the same fixture.
+MUT_S_INSTRUMENT='s/^    entry_written_since "\$entry" "\$FLOOR_REF"; verdict=\$?/    rm -rf "$entry" 2>\/dev\/null; entry_written_since "$entry" "$FLOOR_REF"; verdict=$?/'
+MUT_S='s/; \[ -e "\$entry" \] || return 3; return 2; }$/; return 2; }/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -1389,6 +1431,19 @@ if apply_mutation "$REAPER" "$T/mut-r2/disk-reaper.sh" "$MUT_R2"; then
     expect_fail "r2 mutation: mapping a partial census back onto verdict=ok turns the case RED" case_r "$T/mut-r2/disk-reaper.sh" "$OWNER"
 else
     bad "r2 mutation could not be applied (the partial-verdict override moved) — that verdict is not checked any more"
+fi
+
+if apply_mutation "$OWNER" "$T/mut-s-instrumented/reap-runner-work.sh" "$MUT_S_INSTRUMENT"; then
+    expect_pass "s an entry that VANISHES during the pass is gone=, never unmeasurable= (not an abstention)" \
+        case_s "$REAPER" "$T/mut-s-instrumented/reap-runner-work.sh"
+    if apply_mutation "$T/mut-s-instrumented/reap-runner-work.sh" "$T/mut-s/reap-runner-work.sh" "$MUT_S"; then
+        expect_fail "s mutation: reverting the re-stat turns the case RED (a gone entry becomes an abstention)" \
+            case_s "$REAPER" "$T/mut-s/reap-runner-work.sh"
+    else
+        bad "s mutation could not be applied (the vanished-entry guard moved) — the arm is not checked any more"
+    fi
+else
+    bad "s the vanishing fixture could not be built (the classification call moved) — the race arm is not covered"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
