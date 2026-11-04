@@ -902,7 +902,7 @@ fi
 merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh)
 # The hosted-graph FALLBACK half (graph-mcp-provision). The MCP entry in
 # templates/.mcp.base.json is the PRIMARY path; this script is what a lane can still use when
-# the MCP client is unavailable from inside the session (#10605: ${TORTOISE_API_KEY} expanded
+# the MCP client is unavailable from inside the session (#10605: ${TORTOISE_MCP_API_KEY} expanded
 # at process start, so the client sends an EMPTY Bearer while the same key authenticates a
 # direct POST). It existed only as a hand-written file on two boxes and in no repo, so a
 # rebuilt machine lost it silently — farming it is what makes it durable.
@@ -1109,7 +1109,7 @@ echo "    shell profile wired: AGENT_INFRA_PATH + AGENT_SYNC_MODE"
 # which needs no checkout, no venv and no local FalkorDB. This probe is kept because other
 # local tooling still reads the variable and removing a variable the fleet may use is a bigger
 # change than this one — but the message below must not be allowed to imply the graph is wired
-# because TORTOISE_HOME exists. The graph needs TORTOISE_API_KEY in ~/keys.env.
+# because TORTOISE_HOME exists. The graph needs TORTOISE_MCP_API_KEY in ~/keys.env.
 TORTOISE_HOME_SET=0
 if [ -n "${TORTOISE_HOME:-}" ]; then
   TORTOISE_HOME_SET=1
@@ -1126,9 +1126,9 @@ else
   done
 fi
 if [ "$TORTOISE_HOME_SET" -eq 1 ]; then
-  echo "    TORTOISE_HOME wired (LOCAL/self-hosted tortoise tooling) — the graph MCP itself is the HOSTED server and needs TORTOISE_API_KEY in ~/pi-keys.env (interactive shells) or ~/keys.env (lanes a controller spawns)"
+  echo "    TORTOISE_HOME wired (LOCAL/self-hosted tortoise tooling) — the graph MCP itself is the HOSTED server and needs TORTOISE_MCP_API_KEY in ~/pi-keys.env (interactive shells) or ~/keys.env (lanes a controller spawns)"
 else
-  echo "    note: TORTOISE_HOME not set and no tortoise checkout found — local/self-hosted tortoise tooling unavailable (the base MCP entry does not need it; it needs TORTOISE_API_KEY in ~/pi-keys.env for an interactive shell, or ~/keys.env for lanes)"
+  echo "    note: TORTOISE_HOME not set and no tortoise checkout found — local/self-hosted tortoise tooling unavailable (the base MCP entry does not need it; it needs TORTOISE_MCP_API_KEY in ~/pi-keys.env for an interactive shell, or ~/keys.env for lanes)"
 fi
 
 # Launchd agents (idempotent, #304): install the versioned plist templates

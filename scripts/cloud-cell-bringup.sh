@@ -1540,7 +1540,7 @@ swap_avail_kb() {
 # farm, and its key is in the environment of the process that runs it. Both were false on every cell
 # and NO instrument said so — the client had been hand-copied (so a fresh box received nothing, and the
 # next bring-up would not have changed that), and a missing key surfaced only when a lane tried to use
-# it. So: the client is farmed (`pi-bootstrap/setup.sh`'s `fleet_srcs`, which
+# it. So: the client is farmed (`pi-bootstrap/setup.sh`'s `graph_srcs`, which
 # `pi-bootstrap/cell-install.sh` parses — the ONE seam that already delivers per-box scripts), and the
 # key gets this reading.
 #
@@ -1561,12 +1561,12 @@ check_graph_client() {
     # change exists to replace, and claiming otherwise would be the false PASS the review named. The
     # byte-comparison against the checkout is `cell-install.sh --verify`'s job, not this line's.
     # ⛔ PRESENCE ONLY, AND SAY SO. The byte comparison is `cell-install --verify`'s job — but that job
-    # grades this file only once the CELL'S OWN checkout declares it in `fleet_srcs` (`read_farm_set`
+    # grades this file only once the CELL'S OWN checkout declares it in a farm array (`read_farm_set`
     # parses `$INFRA_ROOT/pi-bootstrap/setup.sh`), so on a cell pinned before agent-infra#3253 NOTHING
     # compares the deployed bytes. An unqualified `ok … present` would therefore certify the very
     # hand-copy this change exists to expose (measured: 2328 B / 5079 B deployed vs 2698 B / 8123 B
     # shipped). The line states its own scope instead of implying a verification it cannot do.
-    ok "graph client: present at $client (presence only — byte-identity is graded by \`cell-install.sh --verify\`, which covers this file only once this box's checkout declares it in \`fleet_srcs\`)"
+    ok "graph client: present at $client (presence only — byte-identity is graded by \`cell-install.sh --verify\`, which covers this file only once this box's checkout declares it in its farm (\`graph_srcs\`)"
   else
     warn "graph client MISSING: $client — the graph mandate is UNEXECUTABLE on this box, so every lane must report GRAPH-UNREACHABLE(...). FIX: re-run the farm that installs it (bash pi-bootstrap/cell-install.sh --install, or pi-bootstrap/setup.sh on a Mac) — a hand-copy is not a deployment and does not survive the next bring-up"
     # ⛔ NO EARLY RETURN. The absence of the client and the absence of its CREDENTIAL are two
@@ -1589,7 +1589,7 @@ check_graph_client() {
     if [ -f "$py" ]; then
       ok "graph client: tortoise_graph_client.py beside it (the sibling the .sh execs)"
     else
-      warn "graph client HALF-DELIVERED: $py is absent, so every call dies on its first turn. FIX: the same farm run — fleet_srcs carries BOTH files, and farming the .sh alone is the defect"
+      warn "graph client HALF-DELIVERED: $py is absent, so every call dies on its first turn. FIX: the same farm run — graph_srcs carries BOTH files, and farming the .sh alone is the defect"
     fi
   fi
   # The client prefers TORTOISE_MCP_API_KEY and falls back to TORTOISE_API_KEY, so this reading mirrors

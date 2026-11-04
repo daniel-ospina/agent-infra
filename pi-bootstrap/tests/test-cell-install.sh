@@ -1338,7 +1338,7 @@ p, bad = sys.argv[1], sys.argv[2]
 d = json.load(open(p))
 t = dict(d["mcpServers"]["tortoise"])
 if bad == "no-scheme":
-    t["headers"] = {"Authorization": "${TORTOISE_API_KEY}"}          # no `Bearer ` prefix
+    t["headers"] = {"Authorization": "${TORTOISE_MCP_API_KEY}"}      # no `Bearer ` prefix
 else:
     t["headers"] = {"Authorization": "Bearer ${SOME_OTHER_KEY}"}     # a var the resolver never reads
 d["mcpServers"]["tortoise"] = t
@@ -1346,44 +1346,45 @@ json.dump(d, open(p, "w"), indent=2)
 PY
   run_verify
   [ $? -eq 1 ] && grep -q "Authorization is not 'Bearer" "$LOG" \
-    && ok "--verify REFUSES a hosted Authorization that is not 'Bearer \${TORTOISE_API_KEY}' ($bad)" \
+    && ok "--verify REFUSES a hosted Authorization that is not 'Bearer \${TORTOISE_MCP_API_KEY}' ($bad)" \
     || fail "--verify certified a hosted header the client sends VERBATIM ($bad) — the lane gets a 401 with LAYER VERIFIED behind it"
   cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
 done
-# ...and the fleet ALIAS is accepted, because the resolver reads it too (so the certification line
-# and the entry can never describe different variables).
+# ...and the LEGACY name is accepted, because the resolver reads it too (so the certification line
+# and the entry can never describe different variables), while the STANDARD name is what the layer
+# installs.
 python3 - "$DEST/.mcp.json" <<'PY'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 t = dict(d["mcpServers"]["tortoise"])
-t["headers"] = {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}
+t["headers"] = {"Authorization": "Bearer ${TORTOISE_API_KEY}"}
 d["mcpServers"]["tortoise"] = t
 json.dump(d, open(p, "w"), indent=2)
 PY
 run_verify
-[ $? -eq 0 ] && ok "--verify ACCEPTS the fleet alias Bearer \${TORTOISE_MCP_API_KEY} (the resolver reads it)" \
-  || fail "--verify refused the fleet alias header it is supposed to accept"
+[ $? -eq 0 ] && ok "--verify ACCEPTS the LEGACY Bearer \${TORTOISE_API_KEY} (the resolver reads it)" \
+  || fail "--verify refused the legacy-name header it is supposed to accept"
 cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
 rm -f "$DEST/.mcp.json.keep"
 
 # ⛔ THE RESOLVER MUST RESOLVE THE VARIABLE THE ARTIFACT NAMES. The installed entry expands exactly
-# one (`${TORTOISE_API_KEY}`), and pi's mcp-client resolves `process.env[NAME]` VERBATIM — no alias
+# one (`${TORTOISE_MCP_API_KEY}`), and pi's mcp-client resolves `process.env[NAME]` VERBATIM — no alias
 # mapping exists. A resolver that also accepted the fleet alias printed "the hosted MCP will
 # authenticate" on a box whose entry expands to the EMPTY string: the exact opposite of the artifact.
-# Here the alias is the ONLY thing set, and the entry names the canonical var — so the verdict must
+# Here the LEGACY name is the ONLY thing set, and the entry names the STANDARD var — so the verdict must
 # be UNRESOLVED, and the remedy it prints must name the alias it found.
 ALIAS_KEY="t"
 ALIAS_KEY="${ALIAS_KEY}t_$(printf 'A%.0s' $(seq 24))"
 HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
-  env -u TORTOISE_API_KEY TORTOISE_MCP_API_KEY="$ALIAS_KEY" \
+  env -u TORTOISE_MCP_API_KEY TORTOISE_API_KEY="$ALIAS_KEY" \
   bash "$INSTALLER" --verify > "$LOG" 2>&1
 grep -q "graph credential: UNRESOLVED" "$LOG" \
-  && ok "an alias-only box is NOT certified as authenticating when the entry expands the canonical var" \
-  || fail "an alias-only box was certified 'will authenticate' while the installed entry expands an unset variable — the certification contradicts the artifact"
-grep -q "the fleet alias TORTOISE_MCP_API_KEY IS set" "$LOG" \
-  && ok "the refusal names the alias it found, with the line that connects them (#5153)" \
-  || fail "an alias-only box got no alias-specific remedy — it is told to push a key it already has"
+  && ok "a legacy-name-only box is NOT certified as authenticating when the entry expands the STANDARD var" \
+  || fail "a legacy-name-only box was certified 'will authenticate' while the installed entry expands an unset variable — the certification contradicts the artifact"
+grep -q "the LEGACY name TORTOISE_API_KEY IS set" "$LOG" \
+  && ok "the refusal names the legacy variable it found, with the line that connects them (#5153)" \
+  || fail "a legacy-name-only box got no alias-specific remedy — it is told to push a key it already has"
 
 # ...and a RE-SYNC must not rewrite that alias-named entry into an empty Bearer.
 python3 - "$DEST/.mcp.json" <<'PY'
@@ -1391,21 +1392,21 @@ import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 t = dict(d["mcpServers"]["tortoise"])
-t["headers"] = {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}
+t["headers"] = {"Authorization": "Bearer ${TORTOISE_API_KEY}"}
 d["mcpServers"]["tortoise"] = t
 json.dump(d, open(p, "w"), indent=2)
 PY
 run_install
-python3 - "$DEST/.mcp.json" <<'PY' && ok "a re-sync KEEPS an entry's own credential variable (an alias-named entry is not silently rewritten)" \
-  || fail "a re-sync rewrote a working alias-named Authorization to the canonical variable — on an alias-only box that is an empty Bearer"
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a re-sync KEEPS an entry's own credential variable (a legacy-named entry is not silently rewritten)" \
+  || fail "a re-sync rewrote a working legacy-named Authorization to the standard variable — on a legacy-name-only box that is an empty Bearer"
 import json, sys
 t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
 auth = (t.get("headers") or {}).get("Authorization") or ""
-sys.exit(0 if "TORTOISE_MCP_API_KEY" in auth else 1)
+sys.exit(0 if "TORTOISE_API_KEY" in auth else 1)
 PY
 run_verify
-[ $? -eq 0 ] && ok "--verify accepts the kept alias-named entry (install and verify agree)" \
-  || fail "--verify refused the alias-named entry the install just kept"
+[ $? -eq 0 ] && ok "--verify accepts the kept legacy-named entry (install and verify agree)" \
+  || fail "--verify refused the legacy-named entry the install just kept"
 # restore the canonical entry so the arms below start from the shape the layer installs
 python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
 import json, sys
@@ -1419,19 +1420,19 @@ PY
 # own servers (`merge-mcp.py` preserves them on purpose), so a file-wide first-`Authorization` read
 # made `LAYER VERIFIED` say "will authenticate" about a variable the TORTOISE entry does not expand —
 # while that entry expanded an unset one and the lane got a 401. Here another server's header comes
-# FIRST and names the alias; the tortoise entry names the canonical var, which is unset.
+# FIRST and names the LEGACY var; the tortoise entry names the STANDARD var, which is unset.
 python3 - "$DEST/.mcp.json" <<'PY'
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 servers = {"acme-hosted": {"type": "http", "url": "https://example.invalid/mcp/",
-                           "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}}}
+                           "headers": {"Authorization": "Bearer ${TORTOISE_API_KEY}"}}}
 servers.update(d["mcpServers"])
 d["mcpServers"] = servers
 json.dump(d, open(p, "w"), indent=2)
 PY
 HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
-  env -u TORTOISE_API_KEY TORTOISE_MCP_API_KEY="$ALIAS_KEY" \
+  env -u TORTOISE_MCP_API_KEY TORTOISE_API_KEY="$ALIAS_KEY" \
   bash "$INSTALLER" --verify > "$LOG" 2>&1
 grep -q "graph credential: UNRESOLVED" "$LOG" \
   && ok "the verdict follows the TORTOISE entry's variable, not another server's header" \
@@ -1481,20 +1482,20 @@ raw = open(sys.argv[1]).read()
 sys.exit(1 if ("t" + "t" + "_") in raw else 0)
 PY
 
-# ⛔ LAYER VERIFIED CARRIES THE CREDENTIAL STATE. Before this, a cell whose TORTOISE_API_KEY did not
+# ⛔ LAYER VERIFIED CARRIES THE CREDENTIAL STATE. Before this, a cell whose TORTOISE_MCP_API_KEY did not
 # resolve was certified LAYER VERIFIED with the 401 warning scrolled away above it — and nothing else
 # catches it (the key is not part of the layer; cloud-cell-bringup.sh does not check it). Exit 0 is
 # deliberate; the STATE has to be unmissable instead. Both directions, so neither can be vacuous.
 KEY="t"
 KEY="${KEY}t_$(printf 'A%.0s' $(seq 24))"
-CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" TORTOISE_API_KEY="$KEY" \
+CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" TORTOISE_MCP_API_KEY="$KEY" \
   bash "$INSTALLER" --verify > "$LOG" 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && grep -q "graph credential: resolves from the environment" "$LOG" \
   && ok "LAYER VERIFIED states the graph credential resolves (a cell certified with a working key)" \
   || fail "LAYER VERIFIED did not report a resolving graph credential (rc=$rc) — a reader cannot tell a working cell from a 401 one"
 mkdir -p "$TMP/nohome"
-# BOTH names are cleared: a box that exports the fleet alias (the standard variable) would
+# BOTH names are cleared: a box that exports the legacy alias would
 # otherwise resolve and the arm would go red on a correctly-configured machine.
 HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
   env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
@@ -1502,7 +1503,7 @@ HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
 rc=$?
 grep -q "graph credential: UNRESOLVED" "$LOG" \
   && ok "LAYER VERIFIED states an UNRESOLVED graph credential (the 401 trap is not silent)" \
-  || fail "a cell with no resolvable TORTOISE_API_KEY was certified without saying so (rc=$rc) — every lane on it will write GRAPH-UNREACHABLE"
+  || fail "a cell with no resolvable TORTOISE_MCP_API_KEY was certified without saying so (rc=$rc) — every lane on it will write GRAPH-UNREACHABLE"
 
 # skills/ was `[ -d ]` plus a non-empty `ls` until #1723's `--check` began verifying BEFORE it
 # installs: a cell holding 1 of the checkout's 124 SKILL.md files passed that check, so the fast

@@ -195,11 +195,12 @@ def main(argv):
                 have["tortoise"] = cur
             else:
                 # SAME ENDPOINT: take the template's fields (lazy/timeout/purpose…), but KEEP the
-                # credential variable this entry already declares when it is one of the canonical
-                # two. Rewriting `Bearer ${TORTOISE_MCP_API_KEY}` to `Bearer ${TORTOISE_API_KEY}` on a
-                # box whose environment sets only the alias turns a WORKING entry into an empty
-                # Bearer — the client expands `process.env[NAME]` verbatim, with no alias mapping —
-                # and doing it silently is the repoint class this file exists to stop.
+                # credential variable this entry already declares when it is one of the two names a
+                # client can resolve. The template installs the STANDARD name
+                # (`TORTOISE_MCP_API_KEY`); rewriting an existing `Bearer ${TORTOISE_API_KEY}` entry
+                # to it on a LEGACY-only box turns a WORKING entry into an empty Bearer — the client
+                # expands `process.env[NAME]` verbatim, with no alias mapping — and doing it silently
+                # is the repoint class this file exists to stop.
                 entry = dict(want)
                 cur_auth = ((cur.get("headers") or {}).get("Authorization") or "").strip()
                 want_auth = ((want.get("headers") or {}).get("Authorization") or "").strip()
