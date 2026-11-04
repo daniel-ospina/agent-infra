@@ -1094,6 +1094,88 @@ mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator
 removed_pass "$C/pass.out"
 assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "the env var is not the job's Program just because the dict carries an attribute"
 assert_contains "$(cat "$C/state/l" 2>/dev/null)" "run-agent" "…argv[0] still decides"
+# (ah5) A SELF-CLOSING TAG IS STILL A CLOSED TAG (review P0, cycle 10). `canon` dropped the `/`, so
+#      `<dict/>` became an UNCLOSED `<dict>`: `depthat` rose for the rest of the document and every later
+#      top-level key read as nested — i.e. "not a job key at all". Two directions, both measured: the
+#      duplicate-key guard was bypassed (a benign array first, a FOREIGN one last, which plistlib resolves
+#      to the foreign program) and an honest plist with an empty `<dict/>` was read as declaring no program
+#      at all, so the recovery arm was inert for ever.
+echo "── 8b(ah5). '<dict/>' between two top-level keys does not hide the second"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH5
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>$C/o/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict/>
+  <key>ProgramArguments</key><array><string>/opt/evil/run-agent</string></array>
+</dict></plist>
+PLISTAH5
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "an empty '<dict/>' does not make the second ProgramArguments invisible"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "ambiguous" "…it is refused as the ambiguous duplicate it is"
+# (ah6) …AND THE HONEST DIRECTION: a plist declaring an empty `<dict/>` and ONE ProgramArguments must still
+#      be recovered. Without this, "refuse the odd spelling" would be satisfied by an arm that never fires.
+echo "── 8b(ah6). an honest plist with an empty '<dict/>' before ProgramArguments is still bootstrapped"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH6
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>EnvironmentVariables</key><dict/>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
+</dict></plist>
+PLISTAH6
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" "the recovery arm still fires for this box's own plist"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and does not refuse it"
+# (ah7) CDATA IS TEXT, NOT MARKUP (review P1, cycle 10). `<!…>` was passed through to `canon`, which stops
+#      at the first `>` — legal inside a CDATA body — so a `<dict>` written INSIDE a CDATA string was
+#      counted as a real dict and hid the top-level `Program` that follows it. plistlib resolves the
+#      document below to `Program=/opt/evil/run-agent`, i.e. launchd would run the foreign program while
+#      the gate passed — the #1761/#1715 class with a PASS, again.
+echo "── 8b(ah7). a '<dict>' inside a CDATA string cannot hide the real top-level Program"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH7
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/orch-loop.sh</string></array>
+  <key>Notes</key><string><![CDATA[x><dict>]]></string>
+  <key>Program</key><string>/opt/evil/run-agent</string>
+</dict></plist>
+PLISTAH7
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a CDATA body cannot smuggle a dict into the depth count"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "run-agent" "…the Program launchd would exec still decides"
+# (ah8) …AND CDATA IS STILL A STRING VALUE: dropping the body instead of escaping it would hand the gate
+#      the same fail-open in reverse (a CDATA-wrapped foreign Program would read as EMPTY and a benign
+#      ProgramArguments would decide), and it would make an honest CDATA-wrapped path unresolvable.
+echo "── 8b(ah8). a CDATA-wrapped controller path is still the path that runs"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAH8
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string><![CDATA[$C/o/orch-loop.sh]]></string></array>
+</dict></plist>
+PLISTAH8
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" "a CDATA-wrapped path is read as the value it declares"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…so it is not refused"
+# (ah9) THE WITHHELD-RESTART NOTE WAS A COMMAND SUBSTITUTION (review P1, cycle 10). The note was written
+#      with backticks and inner double quotes inside a double-quoted shell string, so every refusal pass
+#      RAN `enable` and appended bash's builtin listing (60+ lines) into the decision log — which
+#      `--status` and `scripts/lib/fleet-inventory.sh:583` (`tail -1 | cut -f2-`, then a `*STOPPED*` match)
+#      read as the last decision. The log is one tab-separated line per decision; this pins that a refusal
+#      pass writes exactly TWO and neither is a builtin name.
+echo "── 8b(ah9). a refusal pass writes ONE line per decision — never the output of a command it ran"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; seed_plist "$C/stack.plist" com.eldato.orchestrator-stack /opt/evil/run-agent
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "a foreign program is refused"
+assert_eq "$(wc -l < "$C/state/l" | tr -d ' ')" "2" "…and the pass writes exactly two decision lines (reason + withheld verdict), not a builtin listing"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "enable times" "…with no command substitution output in the record"
 # (ai) THE INTERPRETER SKIP APPLIES TO `Program` TOO. `Program=/bin/bash` with the box controller as the
 #      first argument is a box this repo ships the shape for; without the skip it was refused on EVERY
 #      pass, for ever, with a line claiming launchd would run `/bin/bash` — a dead arm that looks healthy.

@@ -418,11 +418,32 @@ controller_pid() {
 # XML `<string>` may contain either; see the reader for the measured consequences of getting this wrong.
 plist_probe() { # <file>
   awk '
-    function strip(s,   out, p) {
+    function strip(s,   out, p, pc, pd, body) {
       out = ""
       while (length(s) > 0) {
-        if (inc) { p = index(s, "-->"); if (p == 0) { s = "" } else { s = substr(s, p + 3); inc = 0 } }
-        else     { p = index(s, "<!--"); if (p == 0) { out = out s; s = "" } else { out = out substr(s, 1, p - 1); s = substr(s, p + 4); inc = 1 } }
+        if (inc)       { p = index(s, "-->");  if (p == 0) { s = "" } else { s = substr(s, p + 3); inc = 0 } }
+        # ⛔ CDATA IS TEXT, NOT MARKUP (review P1, cycle 10 of #1986). `<!…>` was passed through to canon,
+        # which stops at the first `>` — and `>` is legal inside a CDATA body — so the remainder of the
+        # section (`]]>`) stayed in the document and any `<dict>`/`<key>` it CONTAINED was scanned as a real
+        # tag. MEASURED: a benign ProgramArguments followed by `<key>Notes</key><string><![CDATA[x><dict>]]>
+        # </string>` and then a top-level `Program` of `/opt/evil/run-agent` left `depthat` one level deep for
+        # the rest of the document, so the foreign `Program` was not counted, the gate PASSED and `bootstrap`
+        # loaded it (plistlib resolves that document to the foreign Program). The body is now consumed as a
+        # UNIT and kept as VALUE TEXT with `<`/`>` entity-escaped, so it can be neither scanned as a tag nor
+        # dropped from the value (dropping it would hand back the same fail-open: a CDATA-wrapped foreign
+        # Program would read as empty and a benign ProgramArguments would decide).
+        else if (cinc) {
+          p = index(s, "]]>"); body = (p == 0) ? s : substr(s, 1, p - 1)
+          gsub(/</, "&lt;", body); gsub(/>/, "&gt;", body)
+          out = out body
+          if (p == 0) { s = "" } else { s = substr(s, p + 3); cinc = 0 }
+        }
+        else {
+          pc = index(s, "<!--"); pd = index(s, "<![CDATA[")
+          if (pc == 0 && pd == 0) { out = out s; s = "" }
+          else if (pd > 0 && (pc == 0 || pd < pc)) { out = out substr(s, 1, pd - 1); s = substr(s, pd + 9); cinc = 1 }
+          else { out = out substr(s, 1, pc - 1); s = substr(s, pc + 4); inc = 1 }
+        }
       }
       return out
     }
@@ -473,6 +494,15 @@ plist_probe() { # <file>
         if (substr(s, 1, 1) == "!" || substr(s, 1, 1) == "?") { out = out "<" s ">"; continue }
         if (substr(s, 1, 1) == "/") { name = "/"; j = 2 } else { name = ""; j = 1 }
         while (j <= length(s) && substr(s, j, 1) ~ /[A-Za-z0-9_.:-]/) { name = name substr(s, j, 1); j++ }
+        # ⛔ A SELF-CLOSING TAG MUST STAY SELF-CLOSING (review P0, cycle 10). `/` is outside the name charset,
+        # so `<dict/>` was emitted as `<dict>` — a CLOSED empty element became an UNCLOSED one, `depthat` rose
+        # for the rest of the document, and every later top-level key read as nested, i.e. "not a job key at
+        # all". MEASURED, both directions: a plist with `<key>EnvironmentVariables</key><dict/>` between a
+        # benign and a foreign top-level `ProgramArguments` PASSED (plistlib resolves the duplicate to the
+        # foreign one — the duplicate-key guard was bypassed), and an honest plist with an empty `<dict/>`
+        # before `ProgramArguments` was read as declaring no program at all, so the recovery arm refused for
+        # ever. `<array/>` and `<dict/>` are ordinary plist spellings; the marker is preserved verbatim.
+        if (substr(s, 1, 1) != "/" && substr(s, length(s), 1) == "/") name = name "/"
         out = out "<" name ">"
       }
       return out substr(doc, i)
@@ -1143,7 +1173,7 @@ main() {
     # refusal is a statement ABOUT; keeping it with `restart=1` is the false claim above. Both halves are
     # pinned: (r) asserts `restart=0` and no `restart=1` on a refusal pass, 8b(f) asserts the WEDGED
     # observation survives it.
-    log_line "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${prev_streak:-0}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"reason=$reason"$'\t'"note=the restart was WITHHELD — the arm that refused stated why above, and this pass consumed no restart budget. ⛔ NOT "no platform verb was issued": the one arm that refuses AFTER reaching launchd (the persistent Disabled override still reading 'disabled' following a successful `enable`) has already said so in its own line above, and for every other refusing arm nothing was issued"
+    log_line "verdict=$verdict"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${prev_streak:-0}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"reason=$reason"$'\t'"note=the restart was WITHHELD — the arm that refused stated why above, and this pass consumed no restart budget. ⛔ NOT no platform verb was issued: the one arm that refuses AFTER reaching launchd (the persistent Disabled override still reading 'disabled' following a successful enable) has already said so in its own line above, and for every other refusing arm nothing was issued"
     return 0
   fi
   log_line "$decision_line"
