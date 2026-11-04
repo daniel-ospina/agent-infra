@@ -33,7 +33,7 @@ case "$N" in
   *) [ "$N" -ge 1 ] && ok "ncpu: $N (>=1)" || bad "ncpu: $N < 1 — a 0 propagates into every divisor" ;;
 esac
 prov="$(box_provenance)"
-printf '%s' "$prov" | grep -qE 'ncpu=(sysctl|nproc|getconf|forced)' \
+grep -qE 'ncpu=(sysctl|nproc|getconf|forced)' <<<"$prov" \
   && ok "ncpu: mechanism named [$prov]" \
   || bad "ncpu: no mechanism named in '$prov'"
 
