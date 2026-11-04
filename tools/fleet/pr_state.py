@@ -98,8 +98,9 @@ and `--cancelled` prints those rows WITH the re-trigger command for each. Re-tri
 automatic: a push starts the new head's runs.
 
 Exit codes: 0 the table was produced (whatever it decided); 2 the pass could not be made (the PR
-listing, the queue, or the authority could not be read — an unreadable read is never "nothing to
-do"). `--suppress` returns 2 when the cancel pass could not be completed.
+listing could not be read). An unreadable QUEUE renders `?` and an unreadable AUTHORITY is a WAIT row,
+both at exit 0 — they are rows, not a failed pass — and `--suppress` exits 2 when the inventory could
+not be read (a cancel pass that could enumerate nothing is not a pass that found nothing).
 
 Environment seams (all optional; tests drive them):
     PR_STATE_GH        the gh binary (default `gh`)
@@ -413,6 +414,20 @@ def gh_json(args, timeout=60):
         raise ReadError("%s returned a body that is not JSON (%d bytes)" % (" ".join(args[:3]), len(out)))
 
 
+def gh_object(args, timeout=60):
+    """A `gh` read whose payload MUST be a JSON object.
+
+    ⛔ A 200 WITH AN ERROR BODY (or a bare `null`, or a string) IS A FAILED READ. `d.get(...)` on any
+    of those is an `AttributeError` that kills the WHOLE pass — `build_rows` fans rows out through a
+    thread pool, so the exception escapes every row, not the one it came from — where the documented
+    answer is a named ReadError (exit 2 / a row's own `could not be read` reason).
+    """
+    d = gh_json(args, timeout=timeout)
+    if not isinstance(d, dict):
+        raise ReadError("%s returned a body that is not an object (%s)" % (" ".join(args[:3]), type(d).__name__))
+    return d
+
+
 def gh_stream(args, timeout=180):
     """`gh api --paginate` emits ONE JSON OBJECT PER PAGE. Walk the stream, never just the first.
 
@@ -437,11 +452,18 @@ def gh_stream(args, timeout=180):
         except ValueError as e:
             raise ReadError("%s returned a body that is not JSON (%d bytes, %s)" % (" ".join(args[:3]), len(out), e))
         if isinstance(obj, list):
+            if any(not isinstance(x, dict) for x in obj):
+                raise ReadError("%s returned a page element that is not a JSON object" % " ".join(args[:3]))
             items.extend(obj)
         elif isinstance(obj, dict) and isinstance(obj.get("items"), list):
             items.extend(obj["items"])
-        elif obj is not None:
+        elif isinstance(obj, dict):
             items.append(obj)
+        else:
+            # ⛔ A PAGE THAT IS NOT AN OBJECT IS A FAILED READ, NOT AN EMPTY ONE. Dropping it (the old
+            # `elif obj is not None`) turns a `null` page into `[]`, which the callers cannot tell
+            # from "nothing there" — the "nothing is named" answer that reddens a green head.
+            raise ReadError("%s returned a page that is not a JSON object (%s)" % (" ".join(args[:3]), type(obj).__name__))
     return items
 
 
@@ -465,7 +487,7 @@ def confirm_mergeable(repo, pr):
     """
     for _ in range(2):
         try:
-            d = gh_json(["pr", "view", str(pr), "--repo", repo, "--json", "mergeable,isDraft"])
+            d = gh_object(["pr", "view", str(pr), "--repo", repo, "--json", "mergeable,isDraft"])
         except ReadError:
             return None
         if d.get("mergeable") in ("MERGEABLE", "CONFLICTING"):
@@ -484,6 +506,8 @@ def read_check_rows(repo, sha):
             runs.extend(item.get("check_runs") or [])
         elif item.get("name") is not None:
             runs.append(item)
+    if any(not isinstance(r, dict) for r in runs):
+        raise ReadError("the check surface carried an entry that is not an object")
     rows = []
     for r in runs:
         m = DETAILS_RUN.search(r.get("details_url") or "")
@@ -518,7 +542,16 @@ def resolve_workflows(repo, sha):
     except ReadError:
         return None
     for run in items:
-        runs = run.get("workflow_runs") if isinstance(run.get("workflow_runs"), list) else [run]
+        if isinstance(run.get("workflow_runs"), list):
+            runs = run["workflow_runs"]
+        elif run.get("id") is not None:
+            runs = [run]
+        else:
+            # ⛔ AN OBJECT THAT IS NEITHER A RUN NOR A LISTING IS A FAILED READ. `{}` (or an error
+            # body) parses fine and names nothing, which is the `{}` answer this function must not
+            # give on failure: it splits every attempt into its own group and reddens a green head.
+            raise ReadError("the head's run listing carried an object that is neither a run nor a "
+                            "listing (keys: %s)" % ", ".join(sorted(run)[:6]))
         for r in runs:
             if r.get("id") is not None:
                 out[str(r["id"])] = (r.get("name") or "").strip()
@@ -529,8 +562,14 @@ def read_queued(repo, page_limit=10):
     """The repo's QUEUED runs, keyed by head sha: one paginated read, not one call per PR."""
     by_head, page = {}, 1
     while page <= page_limit:
-        d = gh_json(["api", "repos/%s/actions/runs?status=queued&per_page=100&page=%d" % (repo, page)])
-        runs = d.get("workflow_runs") or []
+        d = gh_object(["api", "repos/%s/actions/runs?status=queued&per_page=100&page=%d" % (repo, page)])
+        # ⛔ THE DOCUMENTED PAYLOAD, OR A FAILED READ. An error body ({"message": "Bad credentials"})
+        # answers 200 too; read as "no queued runs" it makes the table print `0` and a `--suppress`
+        # pass exit 0 having cancelled nothing — the false pass the `?` rendering exists to prevent.
+        if not isinstance(d.get("workflow_runs"), list):
+            raise ReadError("the queued-run inventory was not the documented payload (workflow_runs is %s)"
+                            % type(d.get("workflow_runs")).__name__)
+        runs = d.get("workflow_runs")
         total = d.get("total_count") or 0
         for r in runs:
             head = r.get("head_sha") or ""
@@ -548,7 +587,7 @@ def read_queued(repo, page_limit=10):
 def read_main_reds(repo, base="main"):
     """The (app, workflow, job) groups red at main's head — main's newest attempt per group."""
     try:
-        ref = gh_json(["api", "repos/%s/git/ref/heads/%s" % (repo, base)])
+        ref = gh_object(["api", "repos/%s/git/ref/heads/%s" % (repo, base)])
         sha = ((ref.get("object") or {}).get("sha") or "")
         if not sha:
             return None
@@ -781,7 +820,7 @@ def ledger_path():
 
 def cancel_run(repo, run_id):
     """Cancel ONE run, after re-reading it. A run that is no longer `queued` is NEVER cancelled."""
-    cur = gh_json(["api", "repos/%s/actions/runs/%s" % (repo, run_id)])
+    cur = gh_object(["api", "repos/%s/actions/runs/%s" % (repo, run_id)])
     status = (cur.get("status") or "").strip().lower()
     if status != "queued":
         return False, "status is %r now, not queued — not cancelled" % (status or "?")

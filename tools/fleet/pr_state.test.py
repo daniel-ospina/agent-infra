@@ -829,6 +829,70 @@ def _(M):
         w.cleanup()
 
 
+@test("page-not-an-object")
+def _(M):
+    """A 200 body that PARSES but is not the documented payload is a FAILED READ, not "nothing there".
+
+    `gh_stream` used to DROP a `null` page (making `[]`), so a `null` run listing read as "nothing is
+    named" — every attempt its own group, a green head reddened — and a `null` check surface read as
+    "no checks configured". A non-object page element or a non-object `gh_json` body used to escape as
+    an `AttributeError`, which kills the whole table (rows run through a thread pool), not one row.
+    """
+    cases = [
+        ("runs-%s.json", None),          # a `null` page on the run listing
+        ("runs-%s.json", {}),            # an object with no workflow_runs
+        ("checks-%s.1.json", [1, 2]),    # page elements that are not objects
+        ("checks-%s.1.json", None),      # a `null` page on the check surface
+    ]
+    for name, body in cases:
+        w = World()
+        try:
+            head = "1" * 40
+            w.prs([w.pr(7, head)])
+            green(w, head)
+            w.record(7, head)
+            w.write(name % head, body)
+            r = by_pr(rows_of(w))[7]
+            assert r["action"] == "WAIT:no-check-surface", ((name, body), r)
+            assert "could not be read" in r["reason"], ((name, body), r)
+        finally:
+            w.cleanup()
+
+
+@test("queue-not-the-payload")
+def _(M):
+    """An error body answered 200 on the queue endpoint is a FAILED READ, not "0 queued runs".
+
+    `{"message": "Bad credentials"}` has no `workflow_runs` list; read as "nothing queued" it made the
+    table print `0` and a `--suppress` pass exit 0 having cancelled nothing — the false pass the `?`
+    rendering exists to prevent, reached through a shape instead of a ReadError.
+    """
+    w = World()
+    try:
+        head = "1" * 40
+        w.prs([w.pr(7, head)])
+        w.checks(head, [("github-actions", "unit", "completed", "failure", 11, "900")])
+        w.workflows(head, {"900": "CI"})
+        w.write("queued-1.json", {"message": "Bad credentials"})
+        rows = rows_of(w)
+        assert rows and rows[0]["queued_known"] is False, rows
+        assert "? queued runs on ? PRs" in M.render_table(rows, REPO), M.render_table(rows, REPO)
+        rc, out, err = w.cli("--repo", REPO, "--suppress")
+        assert rc == 2, (rc, out, err)
+        assert w.cancelled_ids() == [], w.cancelled_ids()
+        # …and a body that is not even an OBJECT is a read failure too, not an AttributeError that
+        # kills the whole table (rows run through a thread pool, so one bad body reds every row).
+        w.write("queued-1.json", [])
+        rows = rows_of(w)
+        assert rows and rows[0]["queued_known"] is False, rows
+        # CONTROL: the documented payload still reads as a queue.
+        w.queued([(head, 4242, "CI")])
+        rows = rows_of(w)
+        assert rows[0]["queued_known"] is True and rows[0]["queued_runs"] == [4242], rows
+    finally:
+        w.cleanup()
+
+
 @test("action-needs-only")
 def _(M):
     """`--action` without `--only` REFUSES: the row it would print is another PR's answer."""
@@ -1145,6 +1209,26 @@ MUTATIONS = [
      '            if names is None:',
      '            if False:',
      "the evidence_for guard lets an unresolved workflow map through to the grouping"),
+    ("page-not-an-object",
+     '        else:\n            # ⛔ A PAGE THAT IS NOT AN OBJECT IS A FAILED READ, NOT AN EMPTY ONE.',
+     '        elif False:\n            # ⛔ A PAGE THAT IS NOT AN OBJECT IS A FAILED READ, NOT AN EMPTY ONE.',
+     "a `null` page is silently dropped, so a failed read reads as an empty one"),
+    ("page-not-an-object",
+     '            if any(not isinstance(x, dict) for x in obj):',
+     '            if False:',
+     "a page whose elements are not objects reaches the caller as garbage"),
+    ("page-not-an-object",
+     '            raise ReadError("the head\'s run listing carried an object that is neither a run nor a "',
+     '            pass  # raise ReadError("the head\'s run listing carried an object that is neither a run nor a "',
+     "an object that is neither a run nor a listing reads as 'nothing is named'"),
+    ("queue-not-the-payload",
+     '        if not isinstance(d.get("workflow_runs"), list):',
+     '        if False:',
+     "an error body on the queue endpoint reads as 'no queued runs'"),
+    ("queue-not-the-payload",
+     '    if not isinstance(d, dict):',
+     '    if False:',
+     "a non-object `gh_json` body escapes as an AttributeError that kills the whole table"),
 ]
 
 
