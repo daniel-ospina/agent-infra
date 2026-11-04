@@ -2260,19 +2260,23 @@ if [ -d "$DELTA_REPO" ]; then
     && [ "$(printf '%s' "$D_REC32" | grep -c '"conflicts":0')" = 1 ] \
     && pass "(33a2) the record NAMES what the arm proved (proved/arm=lane, conflicts:0 measured by clause D, NO authored_unchanged claim) — the shape is pinned, not just described" \
     || fail "(33a2) the delta record's proof fields are wrong (record='$D_REC32')"
-  # (33a6) A `--delta` MINT MUST NOT CARRY A MALFORMED `delta_range` (agent-infra#3247 × #3299).
+  # (33a6) A `--delta` MINT MUST NOT CARRY A `delta_range` AT ALL (agent-infra#3247 × #3299).
   # `DELTA_FROM` is a name BOTH features own: `--delta` sets it to the head it measures FROM and
   # sets nothing else, while only `delta_verify` sets DELTA_TO/KIND/DIGEST. The range write was
   # keyed on `DELTA_FROM` alone, so every delta record carried `"delta_range":"<head>.."` — an
   # empty upper bound with an empty base/classification/digest — AND the delta-inheriting carry
   # arm below became unreachable for exactly the shape it was written for. Each PR was green in
-  # isolation; only the merged tree shows it. MEASURED RED before the fix; after it the delta
-  # record carries no `delta_range` at all, because no RANGE was verified in this run.
-  D_RANGE32="$(printf '%s' "$D_REC32" | sed -n 's/.*"delta_range":"\([^"]*\)".*/\1/p')"
-  if [ -z "$D_RANGE32" ] || grep -qE '^[0-9a-f]{40}\.\.[0-9a-f]{40}$' <<<"$D_RANGE32"; then
-    pass "(33a6) the delta record carries NO malformed delta_range (absent, or 40-hex..40-hex) — a shared DELTA_FROM name cannot poison the signed claim"
+  # isolation; only the merged tree shows it. MEASURED RED before the fix.
+  # ⛔ NON-VACUITY: an ABSENT/empty record must FAIL this pin. A form like `[ -z "$D_RANGE32" ] ||
+  # <well-formed>` is vacuously TRUE for an empty $D_REC32 — it would report "no malformed range"
+  # without having read a record at all. So the exact claim is asserted instead: this run verified
+  # NO range, therefore the record carries no `delta_range` field, and the record must exist.
+  D_RANGE_N32=""
+  if [ -n "$D_REC32" ]; then D_RANGE_N32="$(grep -c '"delta_range"' <<<"$D_REC32" || true)"; fi
+  if [ -n "$D_REC32" ] && [ "$D_RANGE_N32" = "0" ]; then
+    pass "(33a6) the delta record carries NO delta_range at all (no range was verified here) — a shared DELTA_FROM name cannot poison the signed claim"
   else
-    fail "(33a6) the delta record carries a MALFORMED delta_range='$D_RANGE32' (record='$D_REC32')"
+    fail "(33a6) a --delta mint must carry NO delta_range (found $D_RANGE_N32 occurrence(s); record='$D_REC32')"
   fi
   # (33a3) THE TRIPLE'S VALUES, not just its presence. 33d greps `^zero-conflict=` to prove the line
   # is REACHABLE; that cannot notice the field degrading to `no`/`UNMEASURED` on an ACCEPTED delta.
@@ -2686,9 +2690,10 @@ fi
 # 33f2 pin the unproven-delta refusal and the "both verbs agree" invariant, which were MEASURED
 # green under deletion before they existed.
 # AFTER THE REBASE the count is main's plus this section's: main spent 185 -> 190 on #3347's own
-# section (32), and this PR adds 11, so the pin is 201. The section is numbered 33 for the same
+# section (32), and this section adds 14 (13 delta assertions + the (33a6) integration pin), so the
+# pin is 204. The section is numbered 33 for the same
 # reason — (32) was already taken on main by the time this branch was rebased.
-# MEASURED: `ALL PASSED (201 assertion(s))` on the rebased tree.
+# MEASURED: `ALL PASSED (204 assertion(s))` on the merged tree.
 MIN_ASSERTIONS=204
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
