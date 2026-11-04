@@ -437,7 +437,7 @@ LEDGER_WRITTEN=0
 copy_fail=()
 detail=()
 if [ "$DISCARD_UNKNOWN" -eq 1 ]; then
-  detail+=("DISCARD-UNKNOWN	.harness-provenance	(the record could not be used — cannot tell which files this run would discard)")
+  detail+=("DISCARD-UNKNOWN	.harness-provenance	(no readable record — cannot tell which files this run would discard)")
 fi
 for rel in "${REL[@]}"; do
   dst="$O/$rel"

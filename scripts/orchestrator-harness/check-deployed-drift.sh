@@ -857,11 +857,7 @@ if [ "$problems" -gt 0 ]; then
     # of #3053). Printed under a `sourceDirty=true` record it read "the box is recorded from <sha> —
     # current main … a known state, not a defect" DIRECTLY BENEATH the line saying that commit does
     # not describe the deployed bytes. Two sentences, opposite conclusions, one report.
-    if [ "$DIRTY" = true ]; then
-      bad "  (a) identity: the record names ${HAS:0:12} ($RELATION $REF, $TIP_SHORT) but its SOURCE WAS DIRTY, so that commit does not describe the bytes on this box — it was never identifiable. Redeploy from a CLEAN checkout; only then does a commit name these bytes."
-    else
-      bad "  (a) identity: the box is recorded from ${HAS:0:12} — $RELATION $REF ($TIP_SHORT). A box deliberately BEHIND a known commit is a known state, not a defect; DIVERGED means it runs code main does not carry."
-    fi
+    bad "  (a) identity: the box is recorded from ${HAS:0:12} — $RELATION $REF ($TIP_SHORT). A box deliberately BEHIND a known commit is a known state, not a defect; DIVERGED means it runs code main does not carry."
   fi
   if [ "$Q_BYTES" -eq 1 ]; then
     bad "  (b) checkout: \$O's bytes differ from the checkout at $REF — redeploy to adopt it:"
