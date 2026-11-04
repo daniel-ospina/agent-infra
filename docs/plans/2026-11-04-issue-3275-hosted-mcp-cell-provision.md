@@ -48,7 +48,7 @@ Two distinct failures, one symptom (`Connection closed` / 401):
 
 | # | Failure | Root | Evidence |
 |---|---------|------|----------|
-| F1 | the placeholder is 19 chars and the server wants `tt_` + 32 = 35 | a client sends headers **verbatim** — it never shell-expands a `${VAR}` inside a JSON header value | #3275 body; tortoise `#3601` ships the hosted entry as the committed shape |
+| F1 | the placeholder is 19 chars and the server wants `tt_` + 32 = 35 | the header is expanded by the CLIENT — `expandEnvVars(config.headers)` (`extensions/mcp-client/index.ts:819`, `expandExpr` `:548-562`) — and an UNSET variable expands to the EMPTY string, so the wire carried `Bearer ` and the server answered 401 | #3275 body; `index.ts:819`/`:548-562`; PR body "sends `Bearer `" |
 | F2 | the cells had no MCP layer at all | the template's `tortoise` entry was **stdio** (`${TORTOISE_HOME}/.venv/bin/python3 -m tortoise.mcp_server` + `TORTOISE_DB_URI=docker://…:16379`) — uninstallable on a cell, so `cell-install.sh` skipped the layer on purpose | `cell-install.sh` pre-change `--verify`; cell-3/cell-4 inventory in the PR body |
 
 So the fix is **not** "stop skipping the layer" (that would install an unspawnable server and a
@@ -94,13 +94,13 @@ credential into a 0644 file). It is: **make the entry installable**, then instal
 4. **DONE — the farm.** `setup.sh graph_srcs=(tortoise-graph.sh tortoise_graph_client.py)`, one line, real copies + `chmod +x`, `farm_missing` on absence, and `farm_declared_rel` updated so `check-farm-drift.sh` can see them. `graph_srcs` is decoded in `pi-bootstrap/tests/test-setup-no-nesting.sh`'s `FARM_ARRAYS` and `check_producer_farm_declared`.
 5. **DONE — the fallback client's two broken calls.** `tortoise_get_point` now sends `id` (was `point_id`); `tortoise_create_operator` now sends `op_type/source_id/target_ids/direction/semantics` (was `label`). Both were rejected by the server's argument validation; the second failed **after** the point was written.
 6. **DONE — canonical credential name.** `scripts/tortoise-graph.sh` reads `TORTOISE_MCP_API_KEY` first, legacy `TORTOISE_API_KEY` second, and its abstention message names both plus the remedy.
-7. **DONE — regression tests.** `pi-bootstrap/tests/test-cell-install.sh` → 140 assertions, `FAILURES=0`; four of them new and named in the PR body.
+7. **DONE — regression tests.** `pi-bootstrap/tests/test-cell-install.sh` → 179 assertions, `FAILURES=0`; the graph arms among them are named in the PR body.
 8. **DONE — measured end-to-end.** `HOME=<scratch> bash pi-bootstrap/setup.sh` and `CELL_HOME=<scratch> bash pi-bootstrap/cell-install.sh --install` both print the expected farm + merge + `LAYER VERIFIED` lines (transcript excerpt in the PR body).
 
 ## Verification
 
 ```
-bash pi-bootstrap/tests/test-cell-install.sh        → 140 assertions, FAILURES=0
+bash pi-bootstrap/tests/test-cell-install.sh        → 179 assertions, FAILURES=0
 bash pi-bootstrap/tests/test-farm-unfarm.sh         → green (graph_srcs declared, unfarm clean)
 bash -n over every shipped script                   → clean (bash 3.2 parse gate is CI-enforced)
 ```
@@ -108,13 +108,18 @@ bash -n over every shipped script                   → clean (bash 3.2 parse ga
 ## External Research
 
 Rung 3 (`web_fetch`) on the MCP transport specification's HTTP section, to settle the one question the
-issue left open — *is `headers` interpolation supported?* Finding: an HTTP-transport client sends
-`headers` **verbatim**; there is no shell expansion step, which is why the 19-character placeholder
-reached the server as a literal. That confirms D2's env-indirect shape must be expanded by the
-**client/resolver**, not assumed to expand itself, and it is why `--verify` reports *which file the key
-resolved from* rather than trusting the file's text. (Contradiction test: no recorded decision covers
-header interpolation; the relevant recorded decisions — owner mandate 2026-11-02 on graph reads, and the
-`cloud-cell-bringup.sh` credential-ownership rule — are both **obeyed** here, not overridden.)
+issue left open — *is `headers` interpolation supported?* Finding: the MCP spec's HTTP transport
+carries `headers` as request init, and **this repo's client DOES interpolate them**: `index.ts:819`
+(`expandEnvVars(config.headers)`), whose `expandExpr` (`:548-562`) yields the EMPTY STRING for an unset
+variable. So the 19-character placeholder never reached the wire as a literal — it reached it as
+`Bearer ` and the server answered 401. The 19 chars are a property of the FILE, not of the request;
+an earlier draft of this finding said "verbatim, no expansion step" and was **wrong** (corrected
+2026-11-04 in review — the diagnosis of the empty-Bearer trap is unchanged, and D2's env-indirect
+shape is *what makes* the client expand a real key instead of nothing). It is why `--verify` reports
+*which file the key resolved from* rather than trusting the file's text. (Contradiction test: no
+recorded decision covers header interpolation; the relevant recorded decisions — owner mandate
+2026-11-02 on graph reads, and the `cloud-cell-bringup.sh` credential-ownership rule — are both
+**obeyed** here, not overridden.)
 
 ## Known reds on main (not caused by this PR, verified by re-running the same suites at `origin/main`)
 
