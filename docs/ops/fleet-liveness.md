@@ -1663,11 +1663,12 @@ is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is `lane-bound.s
 instead of a second, unreviewed one.
 
 ⛔ **NOT `LANE_REAP_LIVE_MIN`, AND NOT THE WALL.** This paragraph once said the 45 min was
-`LANE_REAP_LIVE_MIN`'s value "chosen above `lane.sh`'s 2400 s wall limit". Both halves were wrong, and
-the file contradicted itself: `LANE_REAP_LIVE_MIN` defaults to **125 min** (stated correctly in §11.2)
-and the lane's wall is **3300 s**, with `LANE_BACKSTOP_S` = 7200 s the absolute ceiling — so the
-number was described as sitting above a bound it actually sat 65 min below. The source of the 45 min
-is the progress allowance, because that is the bound that asks the same question.
+`LANE_REAP_LIVE_MIN`'s value "chosen above `lane.sh`'s 2400 s wall limit". Every half was wrong,
+and the file contradicted itself: `LANE_REAP_LIVE_MIN` defaults to **125 min** (stated correctly in
+§11.3) and the lane's wall is `LANE_BACKSTOP_S` = **7200 s** (`spawn-gate.sh:1480`, consumed as the
+default at `lane.sh:486`) — so the number was described as sitting above a bound it actually sat
+80 min below. The source of the 45 min is the progress allowance, because that is the bound that
+asks the same question.
 
 **A NEGATIVE DELTA IS A BROKEN READING, NOT A FLAT ONE.** A stable subtree cannot *lose* CPU, so a
 negative delta means one of the two reads was incomplete (a child exited between the samples, a
