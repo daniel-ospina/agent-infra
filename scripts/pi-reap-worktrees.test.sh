@@ -204,6 +204,20 @@ for _h in $_used; do
             ;;
     esac
 done
+
+# ⛔ AND THE GENERAL DETECTOR, because the list above is an EXPLICIT VOCABULARY, not a derivation —
+# it recognises the helper names this suite uses today, so a NEW helper called before it is defined
+# would still slip through (review of #3405 round 5, P3). bash hands every unresolved command to this
+# hook, so any undefined helper — whatever it is called — is caught, counted, and reported.
+# ⛔ bash runs this handler in a SUBSHELL, so a counter variable would be lost (measured: the hook
+# fired and the summary still read 0). The record is therefore a FILE, and the summary reads it.
+_MISSING_LOG="$(mktemp "${TMPDIR:-/tmp}/pi-reap-missing.XXXXXX")" || _MISSING_LOG=/dev/null
+trap 'rm -f "$_MISSING_LOG"' EXIT
+command_not_found_handle() {
+    printf '%s\n' "$1" >>"$_MISSING_LOG" 2>/dev/null
+    printf '  ❌ harness bug: undefined command: %s\n' "$1" >&2
+    return 127
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-worktree-test.XXXXXX")"
 # Resolve T once: git records RESOLVED worktree paths (/tmp/x is stored as
 # /private/tmp/x), so every expectation must compare resolved-to-resolved.
@@ -2434,6 +2448,47 @@ assert_absent "$OUT" "the checkout changed" \
 assert_contains "$(footer $ENV)" "FAILED=0" "A21d the probe failure is not reported as a removal failure"
 assert_dir "$WT_LATED" "A21d the worktree is preserved"
 
+# A21e — the POST-ARCHIVE re-check (review of #3405 round 5, P3). Gate (b) spends four bounded forks
+# between re-check #2 and the fork, so a `clean` verdict captured before the archive does not prove the
+# checkout is clean NOW — and the archive's own `git status` does not list ignored entries, so a file
+# that appears during the archive would be destroyed with the tree and not even recorded as evidence.
+# The shim writes after the Nth `status` probe, so the probe that first sees it is N+1; the archive's
+# own status is the probe before the post-archive gate, which is what makes FAKE_LATE_ON point at the
+# window gate (b) opened.
+ENV=A21e; REPO="$(mk_late_repo $ENV)"
+WT_LATEE="$(add_named_wt "$REPO" "$ENV-late" feat/a21e-late)"
+mkdir -p "$WT_LATEE/.venv/bin"; printf 'py\n' >"$WT_LATEE/.venv/bin/python"
+rm -f "$T/$ENV/cnt-e"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEE/.env" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-e" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21e a file that appears DURING the archive is still a PRESERVE (not a removal)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "post-archive re-check not clean (ignored-artifact" \
+    "A21e …caught by the POST-ARCHIVE re-check specifically (the log names which one)"
+assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21e the footer counts the late preserve"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21e nothing was removed"
+assert_file "$WT_LATEE/.env" "A21e the late ignored file SURVIVED (the exposure gate (b) opened)"
+assert_dir "$WT_LATEE" "A21e the worktree is still on disk"
+# MUTANT: drop the post-archive re-check and the same fixture LOSES the file — which is what makes the
+# assertions above load-bearing rather than incidental.
+MUT5="$T/$ENV/pi-reap-worktrees.mutant-post-archive.sh"
+awk '
+    /RE-CHECK #2 AGAIN, AFTER THE ARCHIVE/ { skip = 1 }
+    skip && /^        fi$/ { skip = 0; next }
+    !skip { print }
+' "$REAPER" >"$MUT5"
+if cmp -s "$REAPER" "$MUT5"; then
+    bad "A21e the POST-ARCHIVE MUTANT DID NOT APPLY — the re-check is unverified"
+else
+    ok "A21e mutant applied: the post-archive re-check is removed"
+fi
+WT_LATEE2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21e-late2)"
+mkdir -p "$WT_LATEE2/.venv/bin"; printf 'py\n' >"$WT_LATEE2/.venv/bin/python"
+rm -f "$T/$ENV/cnt-e2"
+OUT="$(REAPER_OVERRIDE="$MUT5" GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEE2/.env" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-e2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_LATEE2" "A21e MUTANT GOES RED: without the post-archive re-check the checkout IS removed"
+assert_nofile "$WT_LATEE2/.env" "A21e …taking the late ignored file with it (the exposure this closes)"
+
 # ── A22: a LOCAL TAG is not a survival mechanism either (re-review) ────
 # The first F3 fix blacklisted only refs/remotes/*. A blacklist cannot be
 # completed: `git fetch --prune --prune-tags` (or fetch.pruneTags=true) removes
@@ -4655,6 +4710,13 @@ assert_eq "$(find "$T/$ENV/state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -
     "A27j no \`.tmp.<pid>\` is left behind by the failed move"
 
 echo ""
+_missing_n="$(wc -l <"$_MISSING_LOG" 2>/dev/null | tr -d ' ')"
+[ -n "$_missing_n" ] || _missing_n=0
+if [ "$_missing_n" != 0 ]; then
+    FAIL=$((FAIL + _missing_n))
+    echo "  ❌ $_missing_n command(s) were UNDEFINED — those assertions never ran:"
+    sed 's/^/       /' "$_MISSING_LOG"
+fi
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

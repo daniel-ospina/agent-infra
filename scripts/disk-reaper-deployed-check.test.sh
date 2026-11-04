@@ -53,6 +53,20 @@ for _h in $_used; do
     esac
 done
 
+# ⛔ AND THE GENERAL DETECTOR, because the list above is an EXPLICIT VOCABULARY, not a derivation —
+# it recognises the helper names this suite uses today, so a NEW helper called before it is defined
+# would still slip through (review of #3405 round 5, P3). bash hands every unresolved command to this
+# hook, so any undefined helper — whatever it is called — is caught, counted, and reported.
+# ⛔ bash runs this handler in a SUBSHELL, so a counter variable would be lost (measured: the hook
+# fired and the summary still read 0). The record is therefore a FILE, and the summary reads it.
+_MISSING_LOG="$(mktemp "${TMPDIR:-/tmp}/pi-reap-missing.XXXXXX")" || _MISSING_LOG=/dev/null
+trap 'rm -f "$_MISSING_LOG"' EXIT
+command_not_found_handle() {
+    printf '%s\n' "$1" >>"$_MISSING_LOG" 2>/dev/null
+    printf '  ❌ harness bug: undefined command: %s\n' "$1" >&2
+    return 127
+}
+
 [ -x "$CHECK" ] || { echo "  ❌ the checker is not executable: $CHECK"; echo "PASS=0 FAIL=1"; exit 1; }
 
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
@@ -214,6 +228,33 @@ OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src" 2>&1)"; RC=$?
 eq "$RC" "1" "D12 a STALE deployed lib/live-paths.sh is drift, not ok"
 has "$OUT" "SOURCE-DRIFT lib/live-paths.sh" "D12 …and it is named as a deployed-vs-source mismatch"
 
+# ── D13: a record line whose DIGEST field is blank is drift, even when the file is absent ─
+# The shipped writer can no longer emit this shape (it writes `unmeasured  <name>`), but a truncated or
+# hand-edited record can — and the old parse split `  <name>` into digest=<name>/name="", dropped the
+# line, and let the reconciliation MATCH it. Result: `deployed ok (8 files)` for a 9-file set, and it
+# kept saying ok after that file was DELETED (review of #3405 round 5, P2).
+mk_env
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+sed -i 's|^[0-9a-f]\{64\}  pi-reap-worktrees.sh$|  pi-reap-worktrees.sh|' "$REC"
+OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
+eq "$RC" "1" "D13 a record line with a BLANK digest field is drift (exit 1)"
+has "$OUT" "EMPTY digest field" "D13 …named as a malformed line, not silently skipped"
+rm -f "$T/deployed/pi-reap-worktrees.sh"
+OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
+eq "$RC" "1" "D13 …and the file is STILL not certified ok once it is deleted (the old hole)"
+mk_env
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+printf 'stamped_at=2026-01-01T00:00:00Z\nsource=-\n' >>"$REC"
+OUT="$(run --dir "$T/deployed" --record "$REC" 2>&1)"; RC=$?
+eq "$RC" "0" "D13 control: header lines (no two-space field) are not read as malformed file lines"
+
+_missing_n="$(wc -l <"$_MISSING_LOG" 2>/dev/null | tr -d ' ')"
+[ -n "$_missing_n" ] || _missing_n=0
+if [ "$_missing_n" != 0 ]; then
+    FAIL=$((FAIL + _missing_n))
+    echo "  ❌ $_missing_n command(s) were UNDEFINED — those assertions never ran:"
+    sed 's/^/       /' "$_MISSING_LOG"
+fi
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ] || exit 1
 exit 0

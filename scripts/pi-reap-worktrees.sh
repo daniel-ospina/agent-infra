@@ -1837,7 +1837,7 @@ clean_gate() {
 # mid-edit when its PR auto-merged is the ordinary case).
 preserve_before_removal() { # <path> <sha> <branch> <reason>
     local path="$1" sha="$2" br="$3" why="$4"
-    local slug day dir ev tarf out listed e rc ok=1 disc root mf
+    local slug day dir ev tarf tarf_tmp out listed e rc ok=1 disc root mf
     root="${PRESERVE_ROOT_RESOLVED:-$(preserve_dir_resolve)}" || {
         log "PRESERVE-FAIL $path no writable preserve root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — nothing may be removed"
         return 1
@@ -1881,8 +1881,13 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
         # $ev is space-free ROOT names by construction (see IGNORED_LANE_EVIDENCE) — the same
         # discipline the ephemeral payload relies on. `-C "$path"` keeps the member names relative.
         # shellcheck disable=SC2086
-        run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -czf "$tarf" -C "$path" $ev
+        # The tarball is built OFF-ROOT and moved in by a bounded child, for the same reason: `tar`
+        # opens its OUTPUT before the watchdog is armed when it is pointed at the archive root.
+        tarf_tmp="$out.tgz"
+        run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -czf "$tarf_tmp" -C "$path" $ev
         rc=$?
+        if [ "$rc" = 0 ] && ! fs_write_bounded "$REAP_WT_REMOVE_TIMEOUT" "$tarf" "$tarf_tmp"; then rc=1; fi
+        rm -f "$tarf_tmp"
         if [ "$rc" != 0 ]; then
             log "PRESERVE-FAIL $path lane-evidence tar rc=$rc"
             fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true
@@ -1908,20 +1913,28 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     # ── the diff and the status: what a human would ask for first ────────
     # Written for EVERY removal, not only the evidence rows: gate (b) is a property of destroying a
     # checkout, not of one gate. Both are bounded like every other git probe in this file.
-    run_bounded "$REAP_WT_GIT_TIMEOUT" "$dir/worktree.diff" "$GIT_BIN" -C "$path" \
+    # ⛔ AND THEY ARE CAPTURED OFF-ROOT, THEN COPIED (review of #3405 round 5, P2). `run_bounded`'s
+    # first act is `: >"$out"` IN THE CALLER'S SHELL (lib/bounded.sh) — the open() happens before the
+    # watchdog exists, so pointing it at the archive root left the two LARGEST writes into that root
+    # as the only unbounded ones, on the same dead-mount path the manifest fix addressed.
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
         -c core.quotepath=false diff HEAD --no-color
     rc=$?
     if [ "$rc" != 0 ]; then
         log "PRESERVE-FAIL $path git diff rc=$rc (the working tree could not be captured)"
         rm -f "$out"; return 1
     fi
-    run_bounded "$REAP_WT_GIT_TIMEOUT" "$dir/worktree.status" "$GIT_BIN" -C "$path" \
+    fs_write_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/worktree.diff" "$out" \
+        || { log "PRESERVE-FAIL $path worktree.diff unwritable at $dir"; rm -f "$out"; return 1; }
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
         -c core.quotepath=false status --porcelain --untracked-files=normal
     rc=$?
     if [ "$rc" != 0 ]; then
         log "PRESERVE-FAIL $path git status rc=$rc (the working tree could not be captured)"
         rm -f "$out"; return 1
     fi
+    fs_write_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/worktree.status" "$out" \
+        || { log "PRESERVE-FAIL $path worktree.status unwritable at $dir"; rm -f "$out"; return 1; }
 
     # The manifest is built OFF the archive root (a local temp) and then COPIED through a bounded
     # child: the open() on the archive root is the operation that blocks on a dead mount, and a
@@ -3768,6 +3781,23 @@ remove_one() {
             rm -f "$out"; return 1
         fi
         log "PRESERVE-OK $path $presv"
+        # ⛔ RE-CHECK #2 AGAIN, AFTER THE ARCHIVE (review of #3405 round 5, P3). Re-check #2 exists to
+        # catch a gitignored NON-EPHEMERAL file that appeared in the window ("would be deleted with the
+        # checkout — silently"). Gate (b) then spends FOUR bounded forks (up to ~4.7 min at the
+        # defaults) between that verdict and the fork, so a lane's build writing `.env`/`data/`/
+        # `.coverage` during the archive was admitted by a `clean` read taken BEFORE it existed — and
+        # the archive's own `git status` does not list ignored entries, so it would not even be
+        # recorded as evidence. A `clean` captured in the archive proves the checkout was clean at
+        # capture time; it does not prove it is clean now. One more bounded gate closes the half of
+        # the window the archive opened, and `holder_recheck` STAYS LAST.
+        crumb="$(clean_gate "$path")"
+        cverdict="${crumb%%$'\t'*}"
+        cpay="${crumb#*$'\t'}"
+        if [ "$cverdict" != clean ]; then
+            REMOVE_SKIP_VERDICT="$cverdict"
+            log "REMOVE-SKIP $path post-archive re-check not clean ($cverdict: $cpay) — nothing removed, the archive is kept"
+            rm -f "$out"; return 2
+        fi
     fi
 
     # Re-check #3 — THE HOLDER RULE, as the LAST thing before the fork (review round 3, P2). The

@@ -167,14 +167,32 @@ fi
 drift=0
 checked=0
 appeared=""
-while read -r digest name; do
-    case "$digest" in ''|\#*) continue ;; esac
-    [ -n "$name" ] || continue
+while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    # A file line is `<digest><two spaces><name>`; every other line is a header (`key=value`).
+    # Splitting with default IFS on the raw line is what made a blanked digest field invisible
+    # (round 5, P2), so the separator is found EXPLICITLY and a header can never look malformed.
+    case "$line" in
+        *'  '*) digest="${line%%  *}"; name="${line#*  }" ;;
+        *) continue ;;
+    esac
+    # ⛔ A LINE WITH NO NAME IS A MALFORMED FILE LINE, NOT A BLANK (review of #3405 round 5, P2).
+    # `  pi-reap-worktrees.sh` (two spaces, no digest) previously split into digest=<name>/name="",
+    # `continue` dropped it, and the reconciliation's `grep "  $f$"` MATCHED it — so a record line with
+    # its digest field blanked certified `deployed ok (8 files)` for a 9-file pinned set, and went on
+    # doing so after that deployed file was DELETED.
+    if [ -z "$name" ]; then
+        warn "DRIFT     (malformed record line, no digest field): $line"
+        drift=1; continue
+    fi
+    if [ -z "$digest" ]; then
+        warn "DRIFT     (malformed record line, EMPTY digest field): $name"
+        drift=1; continue
+    fi
     checked=$((checked + 1))
     # ⛔ AN UNMEASURED RECORD LINE IS DRIFT (review of #3405 round 3, P2). A digest that could not be
-    # taken at stamp time must never read as verified, and a malformed line (a name with no digest at
-    # all) is the same defect one step further along.
-    if [ -z "$digest" ] || [ "$digest" = unmeasured ]; then
+    # taken at stamp time must never read as verified.
+    if [ "$digest" = unmeasured ]; then
         warn "DRIFT     $name — recorded as UNMEASURED (no digest could be taken); it has never been verified"
         drift=1; continue
     fi
@@ -223,7 +241,11 @@ done < "$RECORD"
 # the unit executes cannot sit outside the check" promise this script's header makes. A pinned file
 # with no record line is therefore a drift.
 for f in $FILES; do
-    if ! grep -qE "  $f\$" "$RECORD" 2>/dev/null; then
+    # ⛔ ANCHORED ON A REAL DIGEST FIELD, not on any line ending in the name: the old pattern matched a
+    # malformed `  <name>` line, so a file could be "recorded" and never measured (round 5, P2).
+    if ! awk -v f="$f" '
+            $1 ~ /^[0-9a-f]{64}$/ || $1 == "missing" || $1 == "unmeasured" { if ($2 == f) found = 1 }
+            END { exit !found }' "$RECORD" 2>/dev/null; then
         warn "UNRECORDED $f — pinned in this checker but absent from $RECORD; it has never been measured"
         drift=1
     fi
