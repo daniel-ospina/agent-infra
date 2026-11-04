@@ -658,6 +658,10 @@ RAIL_AMBIENT_GH_REPO="${GH_REPO:-}"
 if command -v python3 >/dev/null 2>&1; then PYTHON_BIN=python3; else PYTHON_BIN=python; fi
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
+# #1377 — the carry/re-record decision is DELEGATED to the producer, never re-derived
+# here (a second hashing path would be a second definition of "unchanged", which the
+# cross-repo record contract forbids). The seam exists so the suite can fake the producer.
+RECORD_SH="${ADMIN_MERGE_RECORD_REVIEW_SH:-$SELF_DIR/record-review.sh}"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # SELF_EDIT_WAIT — the bound on the #1417 wait for the rail's own body-edit run
@@ -1086,10 +1090,14 @@ refresh_pr_branch() {
     say_err "      markers (atomic-land.sh does, with the gate key), so it will not move a head out"
     say_err "      from under an attestation."
     say_err "      Clearing this refusal depends on the ⛔ line: for a record BOUND to this head,"
-    say_err "      re-review and re-record at a new head, or re-trigger this PR's checks by an"
-    say_err "      event that does not move it — a re-run re-executes the SAME merge commit, and an"
-    say_err "      update or empty commit moves the head and strands the record. For a store, path or"
-    say_err "      JSON the rail could not read, repair that first: neither action above clears it."
+    say_err "      move the head only when the reviewed diff is unchanged — then the carry arm"
+    say_err "      re-mints the record at the new head with NO re-review (run"
+    say_err "      record-review.sh --check-carry <pr> <repo>: 'carry' means re-record and land,"
+    say_err "      'DIFF CHANGED' means a review is owed in full) — or re-trigger this PR's checks"
+    say_err "      by an event that does not move it — a re-run re-executes the SAME merge commit,"
+    say_err "      and an update or empty commit moves the head and strands the record. For a store,"
+    say_err "      path or JSON the rail could not read, repair that first: neither action above"
+    say_err "      clears it."
     return 1
   fi
 
@@ -1110,6 +1118,127 @@ refresh_pr_branch() {
   info "   re-run on the new head. Re-run this rail once those checks complete — the update"
   info "   itself certifies nothing."
   return 0
+}
+
+# ── reconcile_review_record <pr> <live-head> ────────────────────────────────
+# #1377 — a STALE record whose reviewed diff is unchanged is RE-MINTED, not
+# re-reviewed. `record-review.sh --check-carry` already answers the question
+# (`head` / `carry` / `DIFF CHANGED`); the rail now ACTS on that answer instead of
+# leaving a stale record for the next lane to re-earn. This is the rail's ONLY
+# review-record read on the landing path, and it never computes a diff itself:
+# the carryability verdict is the producer's, and the re-mint is the producer's
+# carry arm, which re-verifies the signed marker, refuses a changed diff, refuses
+# a measurably red head (#1575 clause E), keeps the verdict class verbatim (#2358)
+# and fails closed on an unreadable diff. The rail must never auto-review and
+# never carry across changed content.
+#
+# Returns 0 = proceed (record bound, or carried), 1 = refuse (a review is owed,
+# or the carry could not be shown safe). On the carry path it prints exactly ONE
+# line naming the reviewed sha, the live sha and the diff digest, so an automatic
+# re-bind is never invisible (a carry that cannot be seen is how a forged or stale
+# record hides).
+reconcile_review_record() { # <pr> <live-head>
+  local pr="$1" live="$2"
+  local rdir="$HOME/.pi/agent/reviews" cands=() f="" rec="" rec_head="" rec_verdict="" rec_diff=""
+  local cc_out="" cc_word="" cc_live="" cc_log="" rc=0
+
+  # The producer is the only way to mint or carry a record. Absent, there is
+  # nothing this rail can reconcile — the merge gate's own record check still
+  # owns the merge decision in that repo.
+  [ -f "$RECORD_SH" ] || return 0
+
+  # The SAME lookup the producer's --check-carry and the merge gate apply: the
+  # repo-qualified name first, then the legacy <pr>.json honoured only when its
+  # embedded repo is empty or THIS repo (#426). REPO is always the resolved
+  # owner/repo slug by the time this runs.
+  cands+=("$rdir/${REPO%/*}-${REPO#*/}-$pr.json" "$rdir/$pr.json")
+  for f in "${cands[@]}"; do
+    [ -f "$f" ] || continue
+    case "${f##*/}" in
+      *-*) rec="$f"; break ;;
+      *)
+        local rec_repo=""
+        rec_repo="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("repo") or "")' "$f" 2>/dev/null || true)"
+        rec_repo="$(printf '%s' "$rec_repo" | tr 'A-Z' 'a-z')"
+        if [ -z "$rec_repo" ] || [ "$rec_repo" = "$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')" ]; then
+          rec="$f"; break
+        fi ;;
+    esac
+  done
+  # NO RECORD FOR THIS PR: the carry can never fire on an absence, and an
+  # absence is not a carry — it is a review owed. Nothing is minted.
+  if [ -z "$rec" ]; then
+    say_err "admin-merge: ✗ BLOCK — no review record for $REPO#$pr, so there is no verdict to carry. A review is owed; this rail cannot author one. Nothing was merged."
+    return 1
+  fi
+
+  rec_head="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("head_sha") or "")' "$rec" 2>/dev/null || true)"
+  rec_verdict="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("verdict") or "")' "$rec" 2>/dev/null || true)"
+  rec_diff="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("diff_sha256") or "")' "$rec" 2>/dev/null || true)"
+  rec_head="$(printf '%s' "$rec_head" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+  rec_diff="$(printf '%s' "$rec_diff" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+
+  # A record that cannot be interpreted fails CLOSED — never read as "nothing to
+  # carry" (#426 / #2353's unreadable-record arm).
+  if [ -z "$rec_head" ] || [ -z "$rec_verdict" ]; then
+    say_err "admin-merge: ✗ BLOCK — the review record at $rec carries no usable head_sha/verdict, so the rail cannot tell whether it binds this head. A review is owed; nothing was merged."
+    return 1
+  fi
+  case "$rec_head" in
+    *[!0-9a-f]*)
+      say_err "admin-merge: ✗ BLOCK — the review record at $rec has a non-hex head_sha — refusing; a review is owed."
+      return 1 ;;
+  esac
+  [ "${#rec_head}" -eq 40 ] || {
+    say_err "admin-merge: ✗ BLOCK — the review record at $rec has a head_sha that is not a full 40-hex sha — refusing; a review is owed."
+    return 1
+  }
+
+  # Bound to the live head: nothing is stale, nothing to carry, nothing to re-review.
+  if [ "$rec_head" = "$live" ]; then
+    return 0
+  fi
+
+  # STALE: the producer's own predicate decides carry vs fresh. Its exit code maps
+  # 1:1 (head/carry = 0, fresh = 1, unreadable = 3, norecord = 4, nodigest = 5);
+  # parse only the FIRST word of the FIRST stdout line.
+  cc_out="$(bash "$RECORD_SH" --check-carry "$pr" "$REPO" 2>/dev/null || true)"
+  cc_out="${cc_out%%$'\n'*}"
+  cc_word="${cc_out%%$'\t'*}"
+  cc_live="${cc_out##*$'\t'}"
+  case "$cc_word" in
+    carry) ;;
+    head) return 0 ;;
+    fresh)
+      say_err "admin-merge: ✗ BLOCK — the review record at ${rec_head:0:12}… does NOT cover the live head ${live:0:12}…: the DIFF CHANGED (recorded ${rec_diff:0:12}… vs live ${cc_live:0:12}…). A review of the CHANGED diff is owed; this rail cannot author one and never carries across changed content. Nothing was merged."
+      return 1 ;;
+    norecord)
+      say_err "admin-merge: ✗ BLOCK — the producer found NO review record for $REPO#$pr, so there is no verdict to carry. A review is owed; nothing was merged."
+      return 1 ;;
+    nodigest|unreadable|"")
+      say_err "admin-merge: ✗ BLOCK — the stale review record at ${rec_head:0:12}… cannot be carried (${cc_word:-no answer from --check-carry}): a record without a usable diff digest, or a live diff that could not be read, is NEVER a carry. Re-record at the live head, or RETRY if the diff read was transient. Nothing was merged."
+      return 1 ;;
+    *)
+      say_err "admin-merge: ✗ BLOCK — record-review.sh --check-carry answered '$cc_word', which is not a carryable verdict — refusing to carry across an unproven diff. A review is owed; nothing was merged."
+      return 1 ;;
+  esac
+
+  # CARRY: re-mint at the live head with NO review, via the producer's carry arm.
+  # The verdict class is passed VERBATIM from the record (#2358 — a carry never
+  # upgrades or downgrades a verdict class).
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    info "admin-merge: carried review record ${rec_head:0:12}… → ${live:0:12}… (diff ${cc_live:0:12}…) [dry-run: no record written]"
+    return 0
+  fi
+  cc_log="$TMP/record-carry.log"
+  if bash "$RECORD_SH" "$pr" "$rec_head" "$rec_verdict" "$REPO" >"$cc_log" 2>&1; then
+    info "admin-merge: carried review record ${rec_head:0:12}… → ${live:0:12}… (diff ${cc_live:0:12}…)"
+    return 0
+  fi
+  rc=$?
+  sed 's/^/admin-merge:     record-review: /' "$cc_log" >&2
+  say_err "admin-merge: ✗ BLOCK — the carry was REFUSED by the producer (exit $rc; reason above). The reviewed diff may have changed, or the target head may be measurably red (#1575 clause E): do NOT re-review on this message alone — read the producer's refusal above. Nothing was merged."
+  return 1
 }
 
 # ── write_merge_retraction <pr> <head> <reason> <detail-file> <detail-label> ──
@@ -8334,6 +8463,18 @@ main() {
       say_err "   No evidence was posted and no merge attempted."
       exit 1
     fi
+  fi
+
+  # ── #1377: A STALE REVIEW RECORD THAT CARRIES IS RE-MINTED, NOT RE-REVIEWED ──
+  # The rail re-mints a stale record whose reviewed diff is unchanged (the
+  # producer's --check-carry verdict is `carry`), and STOPS when the diff changed
+  # or no record exists to carry. It fires only when a record is present, so a
+  # record-less PR keeps the pre-#1377 behaviour: the merge gate's own
+  # record-presence check refuses it, and this rail never mints a record nobody
+  # earned. The decision lives in reconcile_review_record (one lookup, one
+  # authority); the two-file presence guard here is only the trigger.
+  if [ -f "$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$PR.json" ]; then
+    reconcile_review_record "$PR" "$head" || exit 1
   fi
 
   local pr_count main_count

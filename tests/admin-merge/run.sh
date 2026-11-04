@@ -14798,6 +14798,238 @@ grep -q "check 'bash-suites (5)'" "$SCEN/mut-err" 2>/dev/null \
   && fail "(m) deleting the naming arm changed nothing — the assertions above pin no line in the rail" \
   || pass "(m) deleting the arm removes the check's name: the assertions above rest on it"
 
+# ── 80. #1377: A STALE REVIEW RECORD WHOSE DIFF IS UNCHANGED IS CARRIED ────
+# The rail's pre-merge gate asks `record-review.sh --check-carry` about a stale
+# record and ACTS on the answer: `carry` re-mints at the live head with NO
+# re-review and proceeds; `fresh` (DIFF CHANGED) or no record STOPS with a review
+# owed. The producer's carry arm is the only re-mint path, so a verdict class is
+# preserved verbatim (#2358), a red head is refused (#1575 clause E), an
+# unreadable diff is never a carry, and the rail never carries across changed
+# content. The decision is delegated, never re-derived: this suite fakes the
+# producer, so what is pinned here is the RAIL's arm — that it consults the
+# producer FIRST and acts on the verdict word, not on its own hashing.
+echo "== 80. #1377: a stale review record with an unchanged diff is carried, never re-reviewed =="
+
+# The producer fake. It logs every invocation and answers --check-carry from
+# fixture files; the re-mint form logs its argv and succeeds unless told to fail.
+FRSH="$TMP/fake-record-review.sh"
+cat > "$FRSH" <<'FRSHEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf '%s\n' "$*" >> "$SCEN/record-calls"
+if [ "${1:-}" = "--check-carry" ]; then
+  ans="$(cat "$SCEN/cc-answer" 2>/dev/null || printf 'head')"
+  d="$(cat "$SCEN/cc-digest" 2>/dev/null || printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')"
+  d2="$(cat "$SCEN/cc-digest2" 2>/dev/null || printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')"
+  case "$ans" in
+    carry) printf 'carry\t%s\t%s\n' "$d" "$d"; exit 0 ;;
+    head)  printf 'head\t%s\t%s\n' "$d" "$d"; exit 0 ;;
+    fresh) printf 'fresh\t%s\t%s\n' "$d" "$d2"; exit 1 ;;
+    norecord) printf 'norecord\t-\t-\n'; exit 4 ;;
+    nodigest) printf 'nodigest\t-\t%s\n' "$d"; exit 5 ;;
+    unreadable) printf 'unreadable\t%s\tunavailable\n' "$d"; exit 3 ;;
+    *) printf '%s\n' "$ans"; exit 2 ;;
+  esac
+fi
+# re-mint form: <pr> <reviewed-head> <verdict> [repo]
+if [ -f "$SCEN/record-mint-fail" ]; then
+  printf 'record-review.sh: refused (fixture mint-fail)\n' >&2
+  exit 3
+fi
+exit 0
+FRSHEOF
+chmod +x "$FRSH"
+
+# carry_green_surface <head> — a measured-green PR tree on a green base, so the
+# rail reaches its pre-merge gate (4.6/4.7 are skipped on a green base).
+carry_green_surface() {
+  local head="$1"
+  printf '%s\n' "$head" > "$SCEN/head"
+  lane_pass "$head" 9101 > "$SCEN/runs-$head"
+  lane_pass main9101 9102 > "$SCEN/runs-main"
+  write_pr_checks "$(check_run 5601 'ci / lint' completed success 7701 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+  pr_run_map 7701 pull_request 'CI'
+  main_green_surface
+}
+
+# carry_record <head> <verdict> <diff> — one review record in the scenario's OWN
+# store, bound to the REVIEWED head (which the live head has since moved past).
+carry_record() {
+  mkdir -p "$SCEN/home/.pi/agent/reviews"
+  printf '{"pr":42,"head_sha":"%s","verdict":"%s","repo":"daniel-ospina/agent-infra","diff_sha256":"%s"}\n' \
+    "$1" "$2" "$3" > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+}
+
+# run_admin_carry — `run_admin_here` with an ISOLATED review store and the
+# producer seam, so a scenario's record and --check-carry answer decide the gate.
+run_admin_carry() {
+  local -a genv=(
+    "HOME=$SCEN/home" "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_RECORD_REVIEW_SH=$FRSH"
+    "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
+    "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
+    "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
+    "ADMIN_MERGE_FIRST_CHECKS_STALL=${SUITE_FIRST_CHECKS_STALL:-}"
+    "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
+    "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
+  )
+  [ -n "${GH_REPO:-}" ] && genv+=("GH_REPO=$GH_REPO")
+  env "${genv[@]}" bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+  return $?
+}
+
+CARRY_DIFF="$(printf 'a%.0s' $(seq 1 64))"
+CARRY_DIFF2="$(printf 'b%.0s' $(seq 1 64))"
+
+# (a) UNCHANGED DIFF + MOVED HEAD: the rail carries, re-mints at the live head,
+# and proceeds — in a dry run it says "carried" and does NOT ask for a review.
+new_scen carry-unchanged
+HEAD_OLD_A="cccc000000000000000000000000000000000000"
+HEAD_NEW_A="dddd000000000000000000000000000000000000"
+carry_green_surface "$HEAD_NEW_A"
+carry_record "$HEAD_OLD_A" clean "$CARRY_DIFF"
+printf 'carry\n' > "$SCEN/cc-answer"
+run_admin_carry 42 --dry-run
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) unchanged diff + moved head: the rail carries and proceeds (exit $rc)" \
+  || fail "(a) the rail did not proceed on a carryable stale record (exit $rc): $(head -5 "$SCEN/err")"
+grep -q "carried review record cccc00000000… → dddd00000000… (diff aaaaaaaaaaaa…" "$SCEN/out" \
+  && pass "(a) …and prints ONE line naming the reviewed sha, the live sha and the diff digest" \
+  || fail "(a) the carry line is missing or malformed: $(grep -m1 'carried' "$SCEN/out")"
+grep -q "^--check-carry" "$SCEN/record-calls" \
+  && pass "(a) …and --check-carry was consulted FIRST" \
+  || fail "(a) --check-carry was not consulted: $(cat "$SCEN/record-calls")"
+grep -q "^42 cccc" "$SCEN/record-calls" \
+  && fail "(a) …but a dry run re-minted the record (it must not write)" \
+  || pass "(a) …and the dry run does NOT re-mint"
+if grep -qE "review (is owed|required)|FRESH review|re-review" "$SCEN/out" "$SCEN/err"; then
+  fail "(a) the carry asked for a review"
+else
+  pass "(a) …and does NOT ask for a review"
+fi
+
+# (b) CHANGED DIFF: the rail refuses, names the review, and does NOT re-mint.
+new_scen carry-changed
+HEAD_OLD_B="cccc000000000000000000000000000000000000"
+HEAD_NEW_B="dddd000000000000000000000000000000000000"
+carry_green_surface "$HEAD_NEW_B"
+carry_record "$HEAD_OLD_B" clean "$CARRY_DIFF"
+printf 'fresh\n' > "$SCEN/cc-answer"
+printf '%s\n' "$CARRY_DIFF2" > "$SCEN/cc-digest2"
+run_admin_carry 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) changed diff: the rail refuses (exit $rc)" \
+  || fail "(b) the rail merged past a changed diff (exit $rc)"
+grep -q "DIFF CHANGED" "$SCEN/err" \
+  && pass "(b) …naming what changed (DIFF CHANGED)" \
+  || fail "(b) the refusal does not name the changed diff: $(head -3 "$SCEN/err")"
+grep -q "review of the CHANGED diff is owed" "$SCEN/err" \
+  && pass "(b) …and says a review is owed" \
+  || fail "(b) the refusal does not say a review is owed"
+grep -q "^42 cccc" "$SCEN/record-calls" \
+  && fail "(b) …but it re-minted across changed content" \
+  || pass "(b) …and does NOT re-mint"
+grep -q "pr merge" "$SCEN/calls" \
+  && fail "(b) …but it merged anyway" \
+  || pass "(b) …and does NOT merge"
+
+# (c) MUTATION — make the carry IGNORE the diff digest (hardcode the producer's
+# verdict word to `carry`). The (b) assertions must redden: the mutant carries a
+# changed diff because it never reads the producer's diff comparison.
+MUTC="$TMP/mut-carry-diff"; rm -rf "$MUTC"; mkdir -p "$MUTC"
+awk '/cc_word="\$\{cc_out%%/{ print "  cc_word=carry"; next } { print }' "$ADM" > "$MUTC/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTC/"
+bash -n "$MUTC/admin-merge.sh" \
+  && pass "(c) the mutant (fresh folded into carry) is still valid bash" \
+  || fail "(c) the mutant does not parse"
+new_scen carry-mut-diff
+HEAD_OLD_C="cccc000000000000000000000000000000000000"
+HEAD_NEW_C="dddd000000000000000000000000000000000000"
+carry_green_surface "$HEAD_NEW_C"
+carry_record "$HEAD_OLD_C" clean "$CARRY_DIFF"
+printf 'fresh\n' > "$SCEN/cc-answer"
+printf '%s\n' "$CARRY_DIFF2" > "$SCEN/cc-digest2"
+HOME="$SCEN/home" SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_RECORD_REVIEW_SH="$FRSH" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 \
+  bash "$MUTC/admin-merge.sh" 42 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
+mutrc=$?
+grep -q "carried review record" "$SCEN/mut-out" \
+  && pass "(c) the mutant CARRIES a changed diff — test (b) reddens on it" \
+  || fail "(c) the mutant did NOT carry — the mutation was not effective (exit $mutrc): $(head -3 "$SCEN/mut-err")"
+
+# (d) A CARRY NEVER UPGRADES A VERDICT CLASS: clean-micro stays clean-micro.
+new_scen carry-verdict-class
+HEAD_OLD_D="cccc000000000000000000000000000000000000"
+HEAD_NEW_D="dddd000000000000000000000000000000000000"
+carry_green_surface "$HEAD_NEW_D"
+carry_record "$HEAD_OLD_D" clean-micro "$CARRY_DIFF"
+printf 'carry\n' > "$SCEN/cc-answer"
+run_admin_carry 42
+rc=$?
+[ "$rc" -eq 0 ] && pass "(d) clean-micro stays clean-micro: the carry proceeds (exit $rc)" \
+  || fail "(d) the carry did not proceed for clean-micro (exit $rc): $(head -5 "$SCEN/err")"
+grep -qE '^42 cccc' "$SCEN/record-calls" && grep -q ' clean-micro ' "$SCEN/record-calls" \
+  && pass "(d) …and the re-mint passes the recorded verdict VERBATIM (clean-micro, never upgraded)" \
+  || fail "(d) the re-mint did not pass clean-micro verbatim: $(cat "$SCEN/record-calls")"
+
+# (d2) MUTATION — make the carry UPGRADE clean-micro to clean. The (d)
+# assertions must redden: the mutant re-mints with a different verdict class.
+MUTD2="$TMP/mut-carry-verdict"; rm -rf "$MUTD2"; mkdir -p "$MUTD2"
+sed '/"\$rec_head" "\$rec_verdict"/ s|"\$rec_verdict"|clean|' "$ADM" > "$MUTD2/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$MUTD2/"
+bash -n "$MUTD2/admin-merge.sh" \
+  && pass "(d2) the mutant (verdict upgraded to clean) is still valid bash" \
+  || fail "(d2) the mutant does not parse"
+new_scen carry-mut-verdict
+HEAD_OLD_D2="cccc000000000000000000000000000000000000"
+HEAD_NEW_D2="dddd000000000000000000000000000000000000"
+carry_green_surface "$HEAD_NEW_D2"
+carry_record "$HEAD_OLD_D2" clean-micro "$CARRY_DIFF"
+printf 'carry\n' > "$SCEN/cc-answer"
+HOME="$SCEN/home" SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_RECORD_REVIEW_SH="$FRSH" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 \
+  bash "$MUTD2/admin-merge.sh" 42 >"$SCEN/mut-out" 2>"$SCEN/mut-err"
+mut2rc=$?
+# The mutant's re-mint names `clean` (upgraded), never `clean-micro`: test (d) reddens.
+if grep -qE '^42 cccc' "$SCEN/record-calls" && grep -q ' clean ' "$SCEN/record-calls" \
+   && ! grep -q ' clean-micro ' "$SCEN/record-calls"; then
+  pass "(d2) the mutant re-mints clean (upgraded) — test (d) reddens on it"
+else
+  fail "(d2) the mutant did not upgrade the verdict (exit $mut2rc): $(cat "$SCEN/record-calls")"
+fi
+
+# (e) NO RECORD AT ALL: the carry helper refuses and the re-mint can never fire
+# on an absence. Direct-drive, because the rail's own trigger is "a record is
+# present and stale" — record PRESENCE is the merge gate's refusal, not this
+# rail's. Pinned here so the helper's own arm cannot silently read "absent" as
+# "carried".
+CARRY_DEFS="$TMP/carry-defs.sh"
+sed '$d' "$ADM" > "$CARRY_DEFS"
+CARRY_PROBE="$TMP/carry-probe.sh"
+cat > "$CARRY_PROBE" <<'CARRYEOF'
+set -uo pipefail
+. "$CARRY_DEFS"
+REPO="daniel-ospina/agent-infra"
+reconcile_review_record 42 eeee000000000000000000000000000000000000
+CARRYEOF
+new_scen carry-no-record
+env CARRY_DEFS="$CARRY_DEFS" ADMIN_MERGE_RECORD_REVIEW_SH="$FRSH" \
+    HOME="$SCEN/home" SCEN="$SCEN" bash "$CARRY_PROBE" >"$SCEN/e-out" 2>"$SCEN/e-err"
+erc=$?
+[ "$erc" -ne 0 ] && pass "(e) no record at all: the carry helper refuses (exit $erc)" \
+  || fail "(e) the helper proceeded with no record (exit $erc)"
+grep -q "review is owed" "$SCEN/e-err" \
+  && pass "(e) …saying a review is owed" \
+  || fail "(e) the no-record refusal does not say a review is owed: $(head -2 "$SCEN/e-err")"
+if [ -f "$SCEN/record-calls" ] && grep -qE '^42 ' "$SCEN/record-calls"; then
+  fail "(e) …but the re-mint was invoked — a carry fired on an absence"
+else
+  pass "(e) …and the re-mint is NEVER invoked (never carried)"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1

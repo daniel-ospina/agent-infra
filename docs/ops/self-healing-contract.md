@@ -239,8 +239,10 @@ head-bound evidence, so bypass is safe or it does not happen.
 - IDLE: not a state this capability has (it acts on one PR when asked). Its *caller* has one (§3.4).
 
 **What repairs it.** A record bound to the current head blocks a branch update **full stop** — remedy:
-re-review and re-record at a new head, or re-trigger the PR's checks by an event that does not move
-it. `blocked-by-rail` classes (`flip-gate`/`drift-guard`/`provenance`) are repaired by the dispatcher
+if the reviewed diff is unchanged, carry it to the new head (run `record-review.sh --check-carry <pr>
+<repo>`: `carry` means re-record and land, no re-review; `DIFF CHANGED` means a review is owed in
+full), or re-trigger the PR's checks by an event that does not move it. `blocked-by-rail` classes
+(`flip-gate`/`drift-guard`/`provenance`) are repaired by the dispatcher
 (§3.6). Under an unreadable record the rail **fails closed by name** (a file whose `head_sha` is
 missing/short/non-hex is not "no record").
 ⛔ **Gap: nothing attributes a landing to the box that performed it** (no host in the land path), so
