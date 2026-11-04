@@ -78,9 +78,13 @@ def _objective():
     if not os.environ.get("OBJECTIVE_REPO"):
         derived, why = _checkout_repo()
         if not derived:
-            # ⛔ TWO CAUSES, TWO REMEDIES, NAMED SEPARATELY. Collapsing them made the operator apply
-            # the stated remedy ("run from the checkout you mean") forever on a box that is in fact
-            # MISSING the deriver — the loop stays dead and the message points elsewhere.
+            # ⛔ THREE CAUSES, THREE REMEDIES, NAMED SEPARATELY. Collapsing them made the operator
+            # apply the stated remedy ("run from the checkout you mean") forever on a box that is in
+            # fact MISSING the deriver — the loop stays dead and the message points elsewhere. The
+            # same collapse ate the THIRD cause too (ai#2922 review, P1): `cwd-unreadable` was
+            # computed by `_checkout_repo` and then reached the `underivable` branch below, which
+            # tells an operator holding a launchd cwd failure to debug their origin remote. Each
+            # branch below states the remedy for the cause it was actually given.
             if why == "deriver-missing":
                 raise SystemExit(
                     "pr-loop: cannot bind this checkout's repo — the ONE slug deriver is MISSING "
@@ -88,6 +92,13 @@ def _objective():
                     "repo-slug.sh). Refusing to grade ANOTHER repo (the classifier's fallback is "
                     "daniel-ospina/tortoise). Remedy: deploy scripts/orchestrator-harness/repo-slug.sh "
                     "with this file, or export OBJECTIVE_REPO=<owner/name>.")
+            if why == "cwd-unreadable":
+                raise SystemExit(
+                    "pr-loop: cannot read this process's working directory — the OS refused "
+                    "(PermissionError/ENOENT; a sandboxed launcher with no Full Disk Access). "
+                    "Refusing to grade ANOTHER repo (the classifier's fallback is "
+                    "daniel-ospina/tortoise). Remedy: move the job's WorkingDirectory out of the "
+                    "protected tree, or export OBJECTIVE_REPO=<owner/name>.")
             raise SystemExit(
                 "pr-loop: cannot derive this checkout's repo from its origin remote — refusing to "
                 "grade ANOTHER repo (the classifier's fallback is daniel-ospina/tortoise). Run from "
@@ -99,11 +110,28 @@ def _objective():
     return mod
 
 
+def _safe_cwd():
+    """The process's cwd, or None when the OS REFUSES to say where the process is.
+
+    ⛔ `os.getcwd()` IS NOT A TOTAL FUNCTION (ai#2922) -- see the twin in `objective.py`'s
+    `_checkout_repo`, which this shim mirrors deliberately. Under launchd with no Full Disk Access
+    the call RAISES (`PermissionError`, or `FileNotFoundError` for a deleted `WorkingDirectory`)
+    instead of returning a path.
+    """
+    try:
+        return os.getcwd()
+    except OSError:                            # PermissionError, ENOENT, ENOENT-after-delete
+        return None
+
+
 def _checkout_repo(path=None):
     """(slug, reason): `owner/name` of the checkout this loop acts on, or (None, why).
 
     Sourced, never re-implemented — see the block above `_objective`. The reason is "deriver-missing"
-    when the script is deployed without repo-slug.sh, else "underivable" — two different remedies.
+    when the script is deployed without repo-slug.sh, "cwd-unreadable" when the OS refuses to report
+    the working directory, else "underivable" — three different remedies, reported rather than
+    collapsed (ai#2922: a cwd failure used to reach the broad `except` below and be reported as
+    "underivable", whose remedy is to debug `git`/`bash`).
     """
     lib = None
     for cand in (HERE / "orchestrator-harness" / "repo-slug.sh", HERE / "repo-slug.sh"):
@@ -112,10 +140,15 @@ def _checkout_repo(path=None):
             break
     if lib is None:
         return None, "deriver-missing"
+    # ⛔ RESOLVED OUTSIDE THE `try`: a cwd that cannot be read is a NAMED cause.
+    if not path:
+        path = _safe_cwd()
+        if path is None:
+            return None, "cwd-unreadable"
     try:
         res = subprocess.run(
             ["bash", "-c", '. "$1" >/dev/null 2>&1; derive_or "$2"', "_", str(lib),
-             str(path or os.getcwd())],
+             str(path)],
             capture_output=True, text=True, timeout=30)
     except Exception:
         return None, "underivable"

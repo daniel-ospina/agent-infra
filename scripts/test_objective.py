@@ -3881,6 +3881,56 @@ def test_a_deployment_WITHOUT_the_deriver_says_so_instead_of_guessing(tmp_path):
     assert check == "uncompared:deriver-missing", check
 
 
+def test_an_UNREADABLE_CWD_is_a_NAMED_cause_and_not_a_laundered_underivable(monkeypatch, tmp_path):
+    """⛔ agent-infra#2922: `os.getcwd()` IS NOT A TOTAL FUNCTION, and its failure was LAUNDERED.
+
+    Under launchd with no Full Disk Access the call RAISES instead of returning a path --
+    `PermissionError` for a TCC-denied `WorkingDirectory`, `FileNotFoundError` for a deleted one
+    (both measured on this box). `_checkout_repo()` evaluated it INSIDE the `try` around
+    `subprocess.run`, so the raise was caught by the broad `except Exception` below and reported as
+    `underivable` -- the cause whose remedy is "go and debug `git`/`bash`". So an operator on such a
+    box debugged the deriver for ever while the actual cause was the launcher's working directory,
+    and it is the exact outcome #2922's Objective forbids: "when the cwd is unreadable and no other
+    evidence names the repo, the refusal NAMES the unreadable cwd".
+
+    Reproduced before the fix: with `os.getcwd` raising, `_checkout_repo()` returned
+    `(None, 'underivable')`, and `resolve_repo()` put `repo_check=uncompared:underivable` on the
+    line. Both assertions below are red on that code.
+    """
+
+    def boom():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(objective.os, "getcwd", boom)
+    assert objective._checkout_repo() == (None, "cwd-unreadable")
+    # an EMPTY path is the same signal as no path: both mean "resolve the cwd", never `"."`
+    assert objective._checkout_repo("") == (None, "cwd-unreadable")
+    _slug, src_kind, refusal, check = objective.resolve_repo(env="acme/widget", checkout=None)
+    assert (src_kind, refusal) == ("env", "")
+    assert check == "uncompared:cwd-unreadable", check
+
+    # ⛔ AND THE TWO FACTS STAY APART: an explicit checkout that is not a checkout is still
+    # `underivable`. A fix that renamed every reason would satisfy the arm above and destroy this one.
+    monkeypatch.undo()
+    assert objective._checkout_repo(str(tmp_path)) == (None, "underivable")
+
+
+def test_an_explicit_path_never_touches_the_cwd(monkeypatch, tmp_path):
+    """The other half of totality: a caller that SUPPLIES a path must not call `os.getcwd()` at all.
+
+    `REPO`, `PR_DOCTOR_REPO_DIR` and `--repo` are explicit, and on a launchd box the cwd is the one
+    input that may be unreadable. Resolving it anyway is how a pass that already held the datum for
+    the repo died asking a question it did not need answered (agent-infra#2913, #2922).
+    """
+
+    def boom():
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(objective.os, "getcwd", boom)
+    # an explicit path still resolves normally -- the deriver answers, no cwd is consulted
+    assert objective._checkout_repo(str(tmp_path)) == (None, "underivable")
+
+
 # ── REVIEW ROUND 2 (#2710): three ways the rule above could still let a wrong answer through ──────
 # Each of these was REPRODUCED before the fix, by running it against the pre-fix file. They are the
 # gaps a first pass over the refusal rule leaves: an incomplete blindness inventory, a tool that

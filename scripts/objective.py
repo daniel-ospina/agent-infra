@@ -153,8 +153,23 @@ REPO_DEFAULT = "daniel-ospina/tortoise"
 DECLARED_ENVS = ("OBJECTIVE_REPO", "OR")
 
 
+def _safe_cwd():
+    """The process's cwd, or None when the OS REFUSES to say where the process is.
+
+    ⛔ `os.getcwd()` IS NOT A TOTAL FUNCTION (ai#2922). Under launchd with no Full Disk Access the
+    call RAISES (`PermissionError`, or `FileNotFoundError` for a deleted `WorkingDirectory`) instead
+    of returning a path, so a bare `os.getcwd()` inside a `try` is not a resolution -- it is a
+    failure that lands in whatever `except` happens to be nearest. Measured on this box: a deleted
+    cwd raises `FileNotFoundError`, an unreadable one raises `PermissionError`.
+    """
+    try:
+        return os.getcwd()
+    except OSError:                            # PermissionError, ENOENT, ENOENT-after-delete
+        return None
+
+
 def _checkout_repo(path=None):
-    """(slug, why): the `owner/name` of the checkout this process stands in, or (None, why).
+    """(slug, reason): the `owner/name` of the checkout this process stands in, or (None, why).
 
     ⛔ SOURCED, NEVER RE-IMPLEMENTED: `scripts/orchestrator-harness/repo-slug.sh`'s `derive_or` is
     the fleet's ONE answer to "which owner/name is this checkout" (shared with `orch-loop.sh`,
@@ -164,6 +179,13 @@ def _checkout_repo(path=None):
     the shell file). `why` is "deriver-missing" when this script was deployed without it (the farm
     copy `~/.pi/agent/scripts/` is such a box today) and "underivable" otherwise -- two causes, two
     remedies, and the difference is reported rather than collapsed.
+
+    ⛔ THREE CAUSES NOW, AND THE THIRD IS THE CWD (ai#2922). "cwd-unreadable" is the launcher's
+    working directory being unreadable to the OS -- under launchd, TCC denying a `WorkingDirectory`
+    under `~/Documents`. It used to be swallowed by the broad `except` below and reported as
+    "underivable", whose remedy is to go and debug `git`/`bash`; the actual remedy is to move the
+    job's `WorkingDirectory` out of the protected tree or to declare `REPO`. Collapsing it sent an
+    operator to the wrong remedy for ever, which is the failure this whole resolution exists to end.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     lib = None
@@ -174,10 +196,16 @@ def _checkout_repo(path=None):
             break
     if lib is None:
         return None, "deriver-missing"
+    # ⛔ RESOLVED OUTSIDE THE `try`: a cwd that cannot be read is a NAMED cause, never a neighbour
+    # of whatever exception the subprocess happened to raise.
+    if not path:
+        path = _safe_cwd()
+        if path is None:
+            return None, "cwd-unreadable"
     try:
         res = subprocess.run(
             ["bash", "-c", '. "$1" >/dev/null 2>&1; derive_or "$2"', "_", lib,
-             str(path or os.getcwd())],
+             str(path)],
             capture_output=True, text=True, timeout=30)
     except Exception:
         return None, "underivable"
@@ -213,8 +241,9 @@ def resolve_repo(env=None, checkout=None, checkout_why=None):
     IMPOSSIBLE, and returning `("", "env")` would let a declared repo pass as if it had been
     verified: an inert guard that reads as a satisfied one, which is the shape this whole issue is
     about. `check` therefore carries the reason (`uncompared:deriver-missing` /
-    `uncompared:underivable`) so the line can say so; and it is empty when the comparison either
-    happened or was not needed (nothing declared, or nothing to compare against anyway).
+    `uncompared:underivable` / `uncompared:cwd-unreadable`) so the line can say so; and it is empty
+    when the comparison either happened or was not needed (nothing declared, or nothing to compare
+    against anyway).
 
     `checkout` and `checkout_why` are injectable so the mismatch rule is testable without a git
     fixture; production callers pass nothing and the real cwd is used.

@@ -124,8 +124,8 @@ reason_is "invalid-knob"
 # ── the dispatch verdict follows the dispatcher's OWN rc (round-2 review) ────────────────────────
 # A fake dispatcher: the loop must record what pr-doctor said, not that it returned. `refused` keeps
 # the pass's exit code at 2; `undelivered` is a readable pass whose work nobody took.
-mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok"
-for d in farm-refuse farm-undeliver farm-ok; do
+mkdir -p "$TMP/farm-refuse" "$TMP/farm-undeliver" "$TMP/farm-ok" "$TMP/farm-crash"
+for d in farm-refuse farm-undeliver farm-ok farm-crash; do
     # ⛔ THE REAPER LOGS ITS ARGV (round-4 review): a dry-run that reaps must be OBSERVABLE, or the
     # dry-run guard can be deleted and the suite stays green while a "preview" removes worktrees.
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${REAP_OUT:-/dev/null}"\nexit 0\n' >"$TMP/$d/pi-reap-worktrees.sh"
@@ -134,6 +134,15 @@ done
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(2)\n' >"$TMP/farm-refuse/pr-doctor.py"
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(3)\n' >"$TMP/farm-undeliver/pr-doctor.py"
 printf '#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n' >"$TMP/farm-ok/pr-doctor.py"
+# ⛔ agent-infra#2922: A CRASH IS NOT A REFUSAL. 4 is what the dispatcher dies with -- `pr-doctor`'s
+# own `EXIT_CRASH`, and the code an unreadable cwd produced under launchd
+# (`PermissionError`/`FileNotFoundError` out of `os.getcwd()`, recorded as
+# `EXIT rc=4 -- UNCAUGHT ...`). Before this arm the record case had no `2)` case and no crash case, so
+# rc=2 and rc=4 landed on the SAME catch-all: both wrote `decision: refusing` /
+# `reason: dispatcher-refused` and exited 2. A dead dispatcher was therefore byte-identical to a
+# legitimate "could not read the world", and because 2 is a VERDICT the crash consumed the backstop
+# window instead of being retried. The assertion is the DISTINCTION, not just the new code.
+printf '#!/usr/bin/env python3\nimport sys\nsys.exit(4)\n' >"$TMP/farm-crash/pr-doctor.py"
 rm -f "$ROW"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-refuse" \
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
@@ -144,6 +153,26 @@ env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/fa
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
 check "an UNDELIVERED dispatch is rc=3 and named" 3 "$?"
 reason_is "no-worker-took-it"
+# The crash arm (agent-infra#2922): a FAILURE, never the REFUSING verdict.
+rm -f "$ROW"
+env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-crash" \
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+check "a CRASHING dispatcher is rc=4 -- a failure, NOT the rc=2 REFUSING verdict" 4 "$?"
+reason_is "dispatcher-crashed"
+if grep -q '"decision": "pass-failed"' "$ROW" 2>/dev/null; then
+    ok "...and the row says pass-failed, so a crash and a refusal are DISTINGUISHABLE"
+else
+    bad "the crash was not recorded as pass-failed (row: $(tr -d '\n' <"$ROW" 2>/dev/null | cut -c1-200))"
+fi
+# ...and the refusal side of that distinction is still recorded as its own fact, not as a failure.
+rm -f "$ROW"
+env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-refuse" \
+    REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 "$LOOP" --once >/dev/null 2>&1
+if grep -q '"decision": "refusing"' "$ROW" 2>/dev/null; then
+    ok "a genuine REFUSAL still records decision=refusing (the catch-all did not eat it)"
+else
+    bad "a genuine refusal no longer records as refusing (row: $(tr -d '\n' <"$ROW" 2>/dev/null | cut -c1-200))"
+fi
 rm -f "$ROW" "$TMP/reap.out"
 env O="$TMP/state" PR_DOCTOR_REPO_DIR="$TMP/checkout" PR_REPAIR_SCRIPTS="$TMP/farm-ok" \
     REPAIR_DISK_FLOOR_MB=0 REPAIR_DISK_PER_WORKER_MB=1 REAP_OUT="$TMP/reap.out" \
