@@ -566,9 +566,13 @@ the caller sees a `RATE-LIMITED` verdict rather than an in-call sleep that outli
 issue→PR path, batch dispatch, and a rerun. **Repair is never queue-gated** — a red-check fixer, a
 review-findings fixer, a conflict fixer and the PR-sickness queue all act on a PR that already exists,
 so their bound is this box's lane slots and load gate instead. The basis is a decision plus a
-measurement, **not** a cost claim: a repair push *does* start a fresh run (it also supersedes that PR's
-own run — `ci.yml` pins `concurrency: cancel-in-progress` — so it does not stack depth onto the queue),
-and what the measurement showed is that the number being gated on was the wrong quantity. Gating repair
+measurement, **not** a cost claim — and this sentence has been wrong in BOTH directions, so it says
+what a repair push actually costs: it **does** add queued runs (`ci.yml` cancels only its own
+still-in-flight run for the same ref; `workflow-lock.yml` and `pipeline-compliance.yml` pin no
+`concurrency:` block on purpose — #2474 — and fire on `synchronize`, and this gate prices every
+workflow's queued runs). What carries the exclusion is (i) the decision — repair is bounded by lane
+slots and the load gate, the resources a lane consumes — and (ii) the measurement that the number
+being applied to repair was demand read as supply. Gating repair
 on the queue skipped **41 consecutive dispatches in one window** while 8 self-hosted
 runners and ~11 lane slots sat idle: the queue being read belonged to GitHub-HOSTED concurrency.
 The ceiling's `runners` term is the fleet's registered/online size, or the account's hosted allowance
