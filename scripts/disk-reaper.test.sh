@@ -2646,7 +2646,15 @@ assert_dir "$WT_SP" "T55c and its checkout was still left alone"
 # The token is SPACE-FREE BY CONTRACT: a reason that interpolated a path containing a space
 # (`scratch-unwritable(TMPDIR=/My Temp)`) would split at the space, parse to nothing, and turn this
 # repo's skip back into an anonymous class-wide `verdict=fail-closed` (#2443 review P1).
-OUT="$(REAP_WT_MAIN_PROOF=local GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
+# ⛔ THIS CALL GOES TO THE DELEGATE DIRECTLY (there is no `run_reaper` wrapper here, because the point is
+# the delegate's OWN token), so it must pin `HOME` and the state dir ITSELF. Without them the delegate
+# resolves `STATE_DIR="$HOME/.pi/agent/state"` on the REAL box, takes the real lock, and writes a real
+# offset file: the suite then reddens whenever anything else on the box holds that lock (`FAIL-CLOSED
+# abort: lock held`, rc 3, an EMPTY reason token) — measured at this head as a 1-of-718 failure on one
+# run and a green one on the next, with no file changed in between. That is the same hermeticity rule
+# the header states for every other invocation, applied to the one call that bypasses the wrapper.
+OUT="$(HOME="$T/home" REAP_WT_STATE_DIR="$T/$ENVNAME/state" REAP_WT_LOG="$T/$ENVNAME/state/pi-reap-worktrees.log" \
+      REAP_WT_MAIN_PROOF=local GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T55c the delegate itself exits 3 for a repo under a spaced path"
 assert_eq "$(printf '%s\n' "$OUT" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1)" \
     "gh-not-authenticated(rc=4)" "T55c the reason token is exact and space-free (a spaced repo path cannot split it)"
