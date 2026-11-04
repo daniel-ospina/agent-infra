@@ -2682,11 +2682,17 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     case "$pin_root" in
         */.pi/agent) pin_root="${pin_root%/.pi/agent}" ;;
     esac
-    # THE FOUR SOURCES, and each one is exercised by a fixture (G15a, G15j, G15k, G15l):
+    # THE FOUR SOURCES, and each one is DISCRIMINATINGLY exercised by a fixture (G15j, G15n, G15k,
+    # G15m — plus G15a/G15l for the co-rooted and whitespace-HOME spellings of the `$HOME` element):
     #   `${HARNESS_PIN_FILE}`  the production variable — cloud-cell-bringup.sh:89 and
     #                          cloud-cell-supervisor.sh:1775 write it and persist it in the cell
     #                          ENV_FILE, install.sh:837 roots it at `$HOME`;
-    #   `$CELL_HOME/…`         harness-apply-pass.sh co-roots the DIR record with the sha record;
+    #   `$CELL_HOME/…`         harness-apply-pass.sh co-roots the DIR record with the sha record.
+    #                          ⛔ G15n is the ONLY fixture where this element is the sole candidate:
+    #                          in G15a `cell` IS `$HOME` (so the third element names the same file and
+    #                          masks it), and G15k/G15l point `CELL_HOME` at a record-less home. Measured
+    #                          before G15n existed: deleting just this element left all 21 G15 rows
+    #                          GREEN, i.e. the coverage this comment claimed did not exist;
     #   `$HOME/…`              pi-bootstrap/setup.sh:26 (`DEST=$HOME/.pi/agent`), which passes
     #                          `--pin-file "$DEST/state/HARNESS-PIN"` at `:1109`;
     #   derived                from the sha record's own root, as above.

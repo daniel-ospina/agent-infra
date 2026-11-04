@@ -879,7 +879,7 @@ ANCHORS = {
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees$(printf \x27%s\x27 \"$REPO_CANON\" | cksum | cut -d\x27 \x27 -f1).offset\"",
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees.offset\"   # MUTANT: the per-repo key dropped",
     ),
-    # ── G15 (the harness pin-tree veto, #10114) ── four anchors, one per INPUT of the veto. The veto
+    # ── G15 (the harness pin-tree veto, #10114) ── five anchors, one per INPUT of the veto. The veto
     # shipped with no mutation leg at all, and that is precisely how two of its assertions passed
     # vacuously through three recorded clean reviews.
     # (1) delete the RECORD-BASED probe entirely, leaving the shape backstop. The row then reads
@@ -917,6 +917,16 @@ ANCHORS = {
     "home-expansion-unquoted": (
         "\"${home:+\"$home/.harness-path\"}\"",
         "${home:+$home/.harness-path}",
+    ),
+    # (6) delete the `$CELL_HOME` record element ALONE, leaving the other three sources and both probes.
+    # ⛔ THIS LEG EXISTS BECAUSE THE COVERAGE THE COMMENT CLAIMED DID NOT (round 3, measured): with only
+    # G15a/G15k/G15l naming the cell root, `cell` was either `$HOME` (so the NEXT element found the same
+    # file and masked the deletion) or a record-less home — deleting this one element changed ZERO
+    # assertions. G15n gives `CELL_HOME` the record and leaves `$HOME` without one, so this mutant is the
+    # only thing that can turn it red, and it does.
+    "no-cell-home-record": (
+        "\"$cell/.harness-path\" \"${home:+\"$home/.harness-path\"}\"",
+        "\"${home:+\"$home/.harness-path\"}\"",
     ),
 }
 s = open(src).read()
@@ -4575,6 +4585,30 @@ OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN" \
 assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
     "G15m the dir record is derived from the HARNESS-PIN sha record's OWN root (custom pin root, no 'harness' component)"
 
+# G15n: THE `$CELL_HOME` RECORD ELEMENT, ALONE (round 3, measured gap). Source 2 of the list is
+# `"$cell/.harness-path"`, and until this fixture existed NO assertion could see it: in G15a `cell` IS
+# `$HOME`, so the `$HOME` element that follows names the SAME file and masks a deletion of source 2;
+# G15k/G15l point `CELL_HOME` at a home with no record. Measured: deleting `"$cell/.harness-path"` from
+# a mutant left all 21 G15 rows GREEN — the comment claimed a coverage that did not exist. That matters
+# beyond tidiness because this is the only record source that survives a box where `CELL_HOME != HOME`
+# and `HARNESS_PIN_FILE` is not in the reaper's environment (`harness-apply-pass.sh:207` writes the dir
+# record at `$CELL_HOME/.harness-path`), and a silent miss here REMOVES the tree the box executes.
+# The record is under `CELL_HOME`, `$HOME` has NONE, and the tree path carries no `harness` component —
+# so neither the `$HOME` element nor the shape backstop can carry the verdict.
+ENV=pin_tree_cellhome
+REPO="$(mk_repo "$ENV")"
+CHWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$CHWT" HEAD
+mkdir -p "$T/$ENV/cell-home"
+printf '%s\n' "$CHWT/scripts/orchestrator-harness" >"$T/$ENV/cell-home/.harness-path"
+assert_nofile "$T/$ENV/home/.harness-path" \
+    "G15n precondition: the \$HOME record is ABSENT, so the \$CELL_HOME element is the only candidate"
+OUT="$(CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "pin-tree" \
+    "G15n a \$CELL_HOME-rooted record is read with NO record at \$HOME and no 'harness' in the path (the mixed-root shape, other direction from G15k)"
+
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg while
 # every neighbouring gate in this file has one, and that is how two vacuous assertions survived three
@@ -4625,6 +4659,14 @@ OUT="$(REAPER_OVERRIDE="$MUTP5" HOME_OVERRIDE="$SPHOME" CELL_HOME_OVERRIDE="$T/p
     run_reaper pin_tree_space --dry-run --repo "$T/pin_tree_space/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$SPWT")")" "reclaimable" \
     "G15-M5 MUTATION: with BOTH quoting layers removed the spaced HOME splits, the record is skipped and the tree is WRONGLY rule-3 residue => G15l is discriminating"
+
+MUTP6="$T/mutant-no-cell-home-record.sh"
+mutate_reaper_anchored "$MUTP6" no-cell-home-record
+OUT="$(REAPER_OVERRIDE="$MUTP6" CELL_HOME_OVERRIDE="$T/pin_tree_cellhome/cell-home" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_cellhome --dry-run --repo "$T/pin_tree_cellhome/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "reclaimable" \
+    "G15-M6 MUTATION: without the \$CELL_HOME record element that tree is WRONGLY rule-3 residue => G15n is discriminating (it was NOT, before this leg)"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
