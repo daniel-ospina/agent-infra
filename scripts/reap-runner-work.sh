@@ -252,6 +252,30 @@ case "$GLOBS" in *[![:space:]]*) : ;; *)
     exit 3 ;;
 esac
 num "$RUNNER_WORK_MIN_AGE"            || die "REAP_RW_MIN_AGE must be a whole number of seconds (got '$RUNNER_WORK_MIN_AGE')"
+# ⛔ BOUNDED BY MAGNITUDE AND NORMALISED, NOT JUST ALL-DIGITS. `num` accepts ANY digit string, and this
+# floor is the ONLY gate on a `rm -rf`, so an out-of-range value fails OPEN in the direction an operator
+# would use to PROTECT work:
+#   · `--min-age 18446744073709551616` (2^64) is all-digits, so it passed `num`; `now - 2^64` wraps to
+#     `now` in bash's 64-bit arithmetic, the floor ref lands at NOW, and EVERY entry is older than it.
+#     MEASURED at the previous head: a 5-minute-old entry was `REAPED`, and the log asserted "no content
+#     written for >= 18446744073709551616s" — a flat falsehood about a 5-minute-old checkout. An operator
+#     RAISING the floor to keep everything would have deleted a live-looking tree instead.
+#   · `--min-age 08` passes `num`, then `$(( ))` errors ("08: value too great for base"), `make_floor_ref`
+#     returns an unusable floor, and the pass still exited 0 with `census=ok` reporting EVERY entry as
+#     `reason=unreadable` — a bad floor disguised as a filesystem problem, i.e. a silent full abstention
+#     that reads as a healthy box.
+# The normalised value is what the rest of the pass uses, which fixes the octal case as a side effect of
+# the bound (leading zeros are harmless once stripped, and 9 digits is ~31 years — no real floor exceeds
+# it). This is the SAME guard this family already ships for the same seam: `scripts/reap-lane-venvs.sh`
+# ("out of range — at most 9 digits (~31 years)") and `scripts/disk-reaper.sh`'s `seam_too_large`.
+_rw_floor_norm="${RUNNER_WORK_MIN_AGE#"${RUNNER_WORK_MIN_AGE%%[!0]*}"}"
+[ -n "$_rw_floor_norm" ] || _rw_floor_norm=0
+if [ "${#_rw_floor_norm}" -gt 9 ]; then
+    printf '%s: ⛔ FAIL-CLOSED — REAP_RW_MIN_AGE='%s' is out of range: at most 9 digits (~31 years). Nothing removed (exit 2).\n' \
+        "$SCRIPT_NAME" "$RUNNER_WORK_MIN_AGE" >&2
+    exit 2
+fi
+RUNNER_WORK_MIN_AGE="$_rw_floor_norm"
 num "$BUDGET"             || die "REAP_RW_BUDGET_SECONDS must be a whole number"
 num "$LOCK_STALE_SECONDS" || die "REAP_RW_LOCK_STALE_SECONDS must be a whole number"
 num "$DU_TIMEOUT"         || die "REAP_RW_DU_TIMEOUT must be a whole number"
@@ -436,7 +460,7 @@ prune_entry() { # <entry> <root>
     entry_written_since "$entry" "$FLOOR_REF"; verdict=$?
     case "$verdict" in
         0)  KEPT=$((KEPT + 1))
-            log_line "KEPT   $entry reason=written-within-floor (the entry or its content was written within ${RUNNER_WORK_MIN_AGE}s — a running job writes continuously, so this is the proof it is alive)" ;;
+            log_line "KEPT   $entry reason=written-within-floor (something under the entry was written within ${RUNNER_WORK_MIN_AGE}s, so it is not a candidate — ⚠️ NOT proof the job is alive: a job that writes only OUTSIDE its checkout is the disclosed residual, see the header)" ;;
         2)  UNMEASURABLE=$((UNMEASURABLE + 1))
             log_line "KEPT   $entry reason=unreadable (the bounded walk could not answer, so there is no proof the entry is dead; NOT removed)" ;;
         1)  CAND=$((CAND + 1))
