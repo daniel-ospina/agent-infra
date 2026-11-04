@@ -251,7 +251,22 @@ fixture "o/r:feat/dead:fff999" "620 feat/dead fff000 3600"
 run --apply
 eq "exit (fail-closed)" "$RC" 2
 eq "posts" "$(posts)" 0
-has "queued" && ok "names the queue surface" || bad "surface not named"
+# ⛔ THE ASSERTION MUST MATCH A STRING ONLY THE SCRIPT CAN PRODUCE (review cycle 2, finding 2).
+# `has "queued"` was satisfied by the STUB's own stderr (`gh: HTTP 502 (queued stub)`), so the
+# surface-naming property this arm exists to pin was unpinned — dropping `$st` from the script's
+# message left the suite green. The script now says `QUEUE '<status>'`, which no stub line contains.
+has "QUEUE 'queued'" && ok "names the queue surface" || bad "surface not named: $(printf '%s' "$OUT" | grep FAIL-CLOSED)"
+
+echo "(f7) ⛔ an UNREPRESENTABLE open-PR total is FAIL-CLOSED, not 'complete' (cycle-2 finding 1)"
+# `test -ne` fails rc=2 on an operand it cannot represent, so the completeness `if` is never taken and
+# the pass proceeded on a list it had just failed to measure. Latent (GitHub cannot report 19 digits
+# today), hardened because the failure direction is cancelling live work.
+fixture "o/r:feat/live:aaa111" "9000 feat/live bbb000 3600"
+printf '99999999999999999999' >"$WORK/fx/search_total"
+run --apply
+eq "exit (unrepresentable total)" "$RC" 2
+eq "posts (unrepresentable total)" "$(posts)" 0
+has "out of range" && ok "names the range defect" || bad "did not name the range defect: $OUT"
 
 echo "(f4) ⛔ a queue LARGER than one page aborts the pass, NAMING the queue"
 fixture "o/r:feat/x:ggg999"
