@@ -594,9 +594,22 @@ if PV="$(REPO="$REPO" OR="$OR" O="$O" bash "$HERE/refresh-candidates.sh" --check
   ok "dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
 else
   printf '%s\n' "$PV" >&2
-  warn "this repo cannot be provisioned for dispatch — a cell on it could only MERGE;"
-  warn "  refresh-candidates.sh would add nothing to the backlog (agent-infra#1736)."
-  warn "  Fix: set TORTOISE_REPO=<a tortoise checkout>, or vendor tools/collision_preflight.py into $REPO."
+  # ⛔ THE DIAGNOSIS FOLLOWS THE REASON (review, P2). Every rc≠0 used to be summarised as "a cell on it
+  # could only MERGE" — and for the CLAIM-REGISTRY causes that is the opposite of what this change
+  # documents: such a cell is not merge-only, it is SILENT (every claim reads unreadable, so nothing is
+  # spawned, armed or merged) — and silence is exactly what let two cells duplicate work. The remedies
+  # below also name the right one-line fix: `TORTOISE_REPO`/vendoring cannot clear a missing registry.
+  case "$PV" in
+    *"claim registry is NOT INSTALLED"*|*"predates the issue-claim reader"*|*"predates the snapshot VERDICT reader"*)
+      warn "the CROSS-BOX CLAIM REGISTRY is missing, unloadable, or older than this harness — not a"
+      warn "  pre-flight problem. A cell on this box would dispatch NOTHING (every claim reads unreadable),"
+      warn "  which is SILENT rather than merge-only (agent-infra#2466)."
+      warn "  Fix: bash $HERE/deploy-harness.sh --repo $REPO --o $O  (then re-run this check)." ;;
+    *)
+      warn "this repo cannot be provisioned for dispatch — a cell on it could only MERGE;"
+      warn "  refresh-candidates.sh would add nothing to the backlog (agent-infra#1736)."
+      warn "  Fix: set TORTOISE_REPO=<a tortoise checkout>, or vendor tools/collision_preflight.py into $REPO." ;;
+  esac
 fi
 # The scout VENV is a uv-Python step: warn about it only for a repo that declares one.
 if [ -f "$REPO/pyproject.toml" ] && [ ! -x "$REPO/.worktrees/dispatch-scout/.venv/bin/python" ]; then

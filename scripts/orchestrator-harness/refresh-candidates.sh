@@ -1217,6 +1217,18 @@ cmd_check() {
       echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
       return "$EXIT_NOT_PROVISIONABLE"
     fi
+    # ⛔ THE SAME PROBE FOR THE **SNAPSHOT VERDICT** READER (review, P1). `claim_snapshot_verdict` is
+    # what every PR's selection answer comes from, and a registry that predates it is a state this
+    # check used to CERTIFY: the sweep then read `claim-unreadable` for EVERY PR and continued before
+    # any arm (no spawn, no red-fixer, no auto-arm, no merge) while the issue path kept minting PRs —
+    # a cell that looks alive and lands nothing. A check that blesses that is the false PASS this
+    # check exists to remove, so refuse it before a cell starts, with the same one-line remedy.
+    if ! ( CLAIM_REPO="$SC"; . "$O/claims.sh"; declare -f claim_snapshot_verdict >/dev/null 2>&1 ) 2>/dev/null; then
+      echo "[refresh] check: FAIL $O/claims.sh predates the snapshot VERDICT reader (no claim_snapshot_verdict)"
+      echo "[refresh] NOT PROVISIONABLE: every PR would read claim-unreadable, so the sweep would spawn, arm and merge NOTHING — while the issue path still dispatches, i.e. a cell that mints PRs and lands none"
+      echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
     echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
   else
     # ⛔ A MISSING REGISTRY IS NOT A PASS (agent-infra#2466). This arm used to certify the cell and say

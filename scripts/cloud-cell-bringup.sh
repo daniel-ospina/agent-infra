@@ -714,6 +714,24 @@ check_dispatch() {
     # the rest, only a TRANSIENT refusal that names the SCOUT gets the scout wording — rc=1 also covers
     # causes that are not the scout at all (`FAIL repo not found`, `'uv' is not runnable`).
     if [ "$outrc" -eq 3 ]; then
+      # ⛔ THE {MISSING,STALE}-REGISTRY CAUSES ARE NOT "MERGE ONLY" (review, P2): a cell in that state
+      # dispatches NOTHING — silent, not merge-only — and the remedy is the registry deploy, not the
+      # pre-flight tool. And on a box whose controller home is not seeded yet this refusal would be a
+      # FALSE BLOCK: `check_dispatch` reads `$CELL_HOME/orchestrator`, which is created by `start`
+      # (nothing else in bring-up touches it), so a registry that CANNOT exist at this point cannot
+      # refuse it. The enforcing gate is the supervisor's `check`, which runs with the seeded `$O`.
+      case "$out" in
+        *"claim registry is NOT INSTALLED"*|*"predates the issue-claim reader"*|*"predates the snapshot VERDICT reader"*)
+          if [ ! -d "$CELL_HOME/orchestrator" ]; then
+            warn "the cross-box claim registry is not installed at $CELL_HOME/orchestrator yet — that home is"
+            warn "  seeded by 'start', so this check cannot judge it here; cloud-cell-supervisor.sh check"
+            warn "  (which 'start' calls) enforces it before the controller runs"
+            printf '%s\n' "$out" | sed 's/^/    /'
+            ok "dispatch provisioning pre-flight passed (claim registry deferred to the supervisor's check)"
+            return 0
+          fi
+          die "this box's CROSS-BOX CLAIM REGISTRY is missing, unloadable, or older than this harness — a cell here would dispatch NOTHING (every claim reads unreadable), which is SILENT rather than merge-only, and silence is what let two cells duplicate work. Fix: bash $harness/deploy-harness.sh --repo $WORKDIR --o $CELL_HOME/orchestrator  (then re-run) — reason above: $(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -1)" ;;
+      esac
       die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736)"
     fi
     case "$out" in
