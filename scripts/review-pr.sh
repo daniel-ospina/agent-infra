@@ -2382,7 +2382,19 @@ if [ "$REC_RC" -ne 0 ]; then
   # that into "record-review.sh FAILED rc=3" would send the operator hunting for a recorder bug while
   # the actionable fact is that the REVIEWED REVISION IS STALE: the verdict is intact, its subject
   # moved, so the record that was refused is the only record that would have been honest.
-  if [ "$REC_RC" -eq 3 ] && grep -q -- '--expect-head' "$RUN_DIR/record.out" 2>/dev/null; then
+  # ⛔ TWO DISTINCT exit-3 CAUSES BOTH NAME `--expect-head` (#2572 review, P2), so the flag alone is
+  # NOT a classification. `record-review.sh` exits 3 both when the pin MISMATCHES ("the PR head is X,
+  # NOT the Y you named") and when the pin could NOT BE CHECKED ("could not verify the PR head
+  # against …", which fires on ANY transient gh/API failure). Keyed on the flag, the second — a read
+  # that FAILED — was reported as "the head MOVED … a fresh review is owed", i.e. a paid re-review
+  # bought by an unreadable API: the #1362-D1 "a failed read is not a changed artifact" misdiagnosis
+  # this PR invokes as its own reason for not touching atomic-land.sh, reintroduced one file over.
+  # Discriminate on the recorder's OWN literals, and require the mismatch's own wording for the MOVED
+  # verdict so an unrecognised exit 3 stays the generic named failure below.
+  if [ "$REC_RC" -eq 3 ] && grep -qF -- 'could not verify the PR head' "$RUN_DIR/record.out" 2>/dev/null; then
+    die "$E_RECORD" "the recorder could NOT VERIFY the PR head against the pin (${HEAD:0:12}…) — rc=3 from its fail-closed pin check, i.e. the head could not be READ (a gh/API failure), NOT a head that moved. NOTHING was recorded and NO fresh review is owed: this run's verdict and its comment:$CID artifact stand for ${HEAD:0:12}…, so RETRY THE RECORD at the same head once the API is readable — paying for a second review of one revision is the remedy that does not exist here."
+  fi
+  if [ "$REC_RC" -eq 3 ] && grep -qF -- 'you named' "$RUN_DIR/record.out" 2>/dev/null; then
     die "$E_RECORD" "the PR head MOVED between the review and the record: the recorder REFUSED the --expect-head pin (rc=3) rather than bind this clean verdict to ${HEAD:0:12}…, and its refusal above names both shas. NOTHING was recorded — a record minted now would attest the live head, which this run did not review. Re-run this command at the new head: a fresh review is owed, not a carry."
   fi
   die "$E_RECORD" "record-review.sh FAILED rc=$REC_RC at head ${HEAD:0:12}… — no record was minted, so check (c) stays red. Its output is above; the review comment (comment:$CID) stands and can be recorded by hand once the cause is fixed."

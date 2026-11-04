@@ -1157,7 +1157,20 @@ case "$LAST" in
       # record: the verdict is intact and its subject moved, so the parking reason must say that a
       # fresh review is owed. Advising a hand re-record (the generic rc!=0 wording below) would tell
       # the operator to carry a stale verdict onto a head nobody read — the exact failure being fixed.
-      if [ $rc -eq 3 ] && grep -q -- '--expect-head' "$REC_OUT" 2>/dev/null; then
+      # ⛔ TWO DISTINCT exit-3 CAUSES BOTH NAME `--expect-head` (#2572 review, P2), so the flag alone
+      # is NOT a classification. `record-review.sh` exits 3 both when the pin MISMATCHES ("the PR head
+      # is X, NOT the Y you named") and when the pin could NOT BE CHECKED ("could not verify the PR
+      # head against …", any transient gh/API failure). Keyed on the flag, a READ THAT FAILED was
+      # parked as "the head MOVED … a FRESH review is owed" — i.e. this lane pays for a second review
+      # of one revision, on the strength of an unread API. Discriminate on the recorder's OWN
+      # literals; the MOVED arm requires the mismatch's own wording, so an unrecognised exit 3 still
+      # takes the generic remedy below.
+      if [ $rc -eq 3 ] && grep -qF -- 'could not verify the PR head' "$REC_OUT" 2>/dev/null; then
+        rec_out_cleanup
+        park "the PR head could NOT BE VERIFIED against the pin at head=$HEAD — record-review.sh failed CLOSED on its --expect-head check (rc=3) because the head could not be READ (a gh/API failure), not because it moved. NOTHING was recorded and NO fresh review is owed: the review this lane paid for stands for head=$HEAD, so RETRY THE RECORD once the API is readable (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID --expect-head $HEAD), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        echo "[merge $PR] ABORT: the pinned head could not be verified — retry the record, do not re-review" >> "$L.log"; exit 3
+      fi
+      if [ $rc -eq 3 ] && grep -qF -- 'you named' "$REC_OUT" 2>/dev/null; then
         rec_out_cleanup
         park "the PR head MOVED between the review and the record at head=$HEAD — record-review.sh REFUSED the --expect-head pin (rc=3) rather than attest a head the reviewer never read; its refusal in the log names both shas. The review artifact exists for the REVIEWED head only, so a FRESH review at the new head is owed (a hand re-record would carry a stale verdict)."
         echo "[merge $PR] ABORT: head moved before the record — refusing to bind a stale verdict" >> "$L.log"; exit 3

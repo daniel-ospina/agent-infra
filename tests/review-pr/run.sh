@@ -131,7 +131,8 @@ export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
        FIXTURE_MARKER_MISSING FIXTURE_MARKER_DIFF FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE FIXTURE_READ_FAIL FIXTURE_NO_RECORD_FILE FIXTURE_FLIP_DIFF \
-       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD
+       FIXTURE_SIGN_KEY FIXTURE_PI_SLEEP FIXTURE_COMMENT_RC FIXTURE_LIVE_HEAD_AT_RECORD \
+       FIXTURE_PIN_UNVERIFIABLE
 # ⛔ THE BOX'S OWN SIGNING KEY MUST NOT LEAK IN (P3, fresh review of #2288): a lane runs with
 # `AI_REVIEW_GATE_KEY` exported (that is how the real recorder signs), and an inherited key lets
 # the fake recorder mint a real HMAC even when `run()` passes it NONE — so the suite could not
@@ -342,6 +343,16 @@ if [ -n "${FIXTURE_LIVE_HEAD_AT_RECORD:-}" ] && [ "$pin" != "$FIXTURE_LIVE_HEAD_
   fi
   sha="$FIXTURE_LIVE_HEAD_AT_RECORD"
 fi
+# ⛔ THE RECORDER'S **OTHER** exit-3 (#2572 review, P2), reproduced verbatim: its fail-closed
+# "the pin could not be CHECKED" arm, which fires whenever the head cannot be READ (no $REPO, gh
+# missing or the API failing) — see `scripts/record-review.sh:3029`. It names `--expect-head` too,
+# so a seam that classifies a pin refusal on the FLAG ALONE cannot tell it apart from a head that
+# MOVED, and would report a read failure as "a fresh review is owed". §A3(4) drives it.
+if [ "${FIXTURE_PIN_UNVERIFIABLE:-0}" = "1" ]; then
+  printf '\u26d4 --expect-head: could not verify the PR head against %s — refusing to record (no record written, no marker posted).\n' "$pin" >&2
+  printf '   Resolved head: <unavailable: no $REPO, or gh missing/failing>. A pin exists only if it is checked; recording without checking it would make --expect-head decorative.\n' >&2
+  exit 3
+fi
 owner="${repo%%/*}"; name="${repo##*/}"
 mkdir -p "$HOME/.pi/agent/reviews"
 # FIXTURE_NO_RECORD_FILE: rc=0 having written NOTHING — the "recorder returned 0 but the
@@ -416,7 +427,7 @@ reset() {
   FIXTURE_ISSUE_URL="https://github.com/$REPO_FIXTURE/issues/1876"
   FIXTURE_ISSUE_BODY="the linked issue body"
   FIXTURE_CID="9001"; FIXTURE_AUTH_RC=0; FIXTURE_PI_RC=0
-  FIXTURE_MOVE_HEAD_TO=""; FIXTURE_RECORD_RC=0
+  FIXTURE_MOVE_HEAD_TO=""; FIXTURE_RECORD_RC=0; FIXTURE_PIN_UNVERIFIABLE=0
   FIXTURE_LIVE_HEAD_AT_RECORD=""
   FIXTURE_PI_SLEEP=""
   FIXTURE_COMMENT_RC=0
@@ -443,6 +454,7 @@ rc_of() { cat "$TMP/rc"; }
 out_has() { case "$(cat "$TMP/out.txt")" in *"$1"*) return 0;; *) return 1;; esac; }
 out_not_has() { case "$(cat "$TMP/out.txt")" in *"$1"*) return 1;; *) return 0;; esac; }
 err_has() { case "$(cat "$TMP/err.txt")" in *"$1"*) return 0;; *) return 1;; esac; }
+err_not_has() { case "$(cat "$TMP/err.txt")" in *"$1"*) return 1;; *) return 0;; esac; }
 no_record() { [ ! -f "$TMP/record-argv.txt" ]; }
 no_comment() { [ ! -f "$TMP/comment.md" ]; }
 no_reviewer() { [ ! -f "$TMP/pi-runs.txt" ]; }
@@ -565,6 +577,35 @@ run "$SRC" 2284
 [ "$(rc_of)" = "9" ]; ck $? "a recorder that refuses (rc=3) => exit 9, never success (rc=$(rc_of))"
 out_not_has "recorded clean"; ck $? "  …and no success line"
 err_has "record-review.sh FAILED rc=3"; ck $? "  …and a refusal that does NOT name the pin stays the generic named failure (the new arm is not a catch-all)"
+# (4) THE OTHER exit-3 THAT NAMES THE PIN — a pin that could not be CHECKED is NOT a moved head.
+# `record-review.sh` fails CLOSED on both counts and names `--expect-head` in both messages, so a
+# seam that classifies the refusal on the FLAG ALONE sends the operator off to pay for a second
+# review of the SAME revision after a gh/API blip — #1362-D1 (a failed read is not a changed
+# artifact), the misdiagnosis class this PR invokes as its own reason not to touch atomic-land.sh.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_PIN_UNVERIFIABLE=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "an UNVERIFIABLE pin (rc=3) => exit 9, never success (rc=$(rc_of))"
+out_not_has "recorded clean"; ck $? "  …and no success line"
+err_has "could NOT VERIFY the PR head"; ck $? "  …the seam names the CAUSE the recorder reported (the head could not be READ)"
+err_not_has "MOVED between the review"; ck $? "  …and does NOT report a moved head — a read that failed is not a changed artifact (#1362-D1)"
+err_not_has "Re-run this command at the new head: a fresh review is owed"; ck $? "  …nor prescribe a fresh PAID review of a revision that WAS reviewed"
+err_has "RETRY THE RECORD"; ck $? "  …it prescribes the remedy that exists: retry the record at the SAME head"
+[ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]
+ck $? "  …and NOTHING was recorded"
+# THE MUTATION — collapse the discrimination back to the FLAG ALONE (the pre-fix shape) and the SAME
+# scenario returns the MOVED verdict, so the assertions above are shown FALSE in their own words
+# rather than asserted through a proxy. `cmp -s` is the anti-vacuity guard: if the anchored literal
+# moves, the control fails instead of silently mutating nothing.
+MUT_FLAG="$TMP/mutant-flagonly.sh"
+sed "s|grep -qF -- 'you named'|grep -qF -- '--expect-head'|" "$SRC" > "$MUT_FLAG"; chmod +x "$MUT_FLAG"
+if cmp -s "$SRC" "$MUT_FLAG"; then
+  fail "the §A3(4) mutation did not apply — the MOVED arm is no longer keyed on its own wording, so this control proves NOTHING"
+else
+  pass "mutation applied (the MOVED arm keyed on \`--expect-head\` — the pre-fix flag-only classification)"
+  reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_PIN_UNVERIFIABLE=1
+  run "$MUT_FLAG" 2284
+  err_has "MOVED between the review"; ck $? "  …and the MUTANT calls an unreadable head a MOVED one and prescribes a fresh review — the misdiagnosis the discrimination removes"
+fi
 
 # ── §A4 MUTATION — drop the pin and the SAME move mints a record at the unreviewed head ──
 # ⛔ THIS IS THE WHOLE ISSUE, ONE LAYER UP: a suite whose pin assertion still passed with
