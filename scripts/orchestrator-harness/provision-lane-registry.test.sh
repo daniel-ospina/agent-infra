@@ -217,8 +217,8 @@ chk "D10 …the roster is byte-identical afterwards (nothing was written)" \
 chk "D11 …and the refusal names the disagreement, not a generic error" \
     'case "$OUT" in *"NOT reproduced"*) true;; *) false;; esac'
 run_it --apply --force
-chk "D12 --force is how an operator declares those rows stale (rc 0, zero rows)" \
-    '[ "$RC" -eq 0 ] && [ "$(grep -vc "^#" "$ROSTER")" -eq 0 ]'
+chk "D12 --force is how an operator declares those rows stale (rc 0, zero rows), and the drop is REPORTED on THIS arm too" \
+    '[ "$RC" -eq 0 ] && [ "$(grep -vc "^#" "$ROSTER")" -eq 0 ] && case "$OUT" in *"dropped: lane-77"*) true;; *) false;; esac'
 
 echo
 echo "== E. HAND-MAINTAINED: never replaced, not even by --apply =="
@@ -244,6 +244,8 @@ run_it --check --force
 chk "E8 --check --force writes NOTHING either (a report never mutates) (#3032 F2)" \
     '[ "$RC" -ne 0 ] && cmp -s "$ROSTER" "$T/hand.first"'
 run_it --apply --force
+chk "E9 the forced replacement REPORTS each row it removes (never a silent overwrite)" \
+    'case "$OUT" in *"dropped: 1 Capture write doors"*) true;; *) false;; esac'
 chk "E4 --force replaces it with the derived roster" \
     '[ "$RC" -eq 0 ] && grep -qx "# provisioned-by: provision-lane-registry.py" "$ROSTER" && [ "$(grep -vc "^#" "$ROSTER")" -eq 2 ]'
 
@@ -358,29 +360,38 @@ echo "== G. WIRING: the bring-up and the supervisor both call it, and classify i
 # now require the actual `--apply` invocation, so deleting the call and leaving the prose behind
 # reds the suite.
 echo
-echo "== L. A PARTIAL WINDOW ANSWER: absence from ONE window is not proof a lane ended =="
-# ⛔ #3032 cycle 2: the same argument that justifies refusing a ZERO-workspace answer applies to a
-# MISSING ROW. The file's own refusal says "the workspace list is per-window, so absence is not
-# evidence" — if that is true for an empty list it is true for one row, so a partial answer must not
+echo "== L. A PARTIAL WINDOW ANSWER: neither lose a row, nor freeze the roster ==".
+# ⛔ #3032 cycle 2/3. The file's own refusal says "the workspace list is per-window, so absence is
+# not evidence" — if that holds for an EMPTY list it holds for ONE ROW, so a partial answer must not
 # delete a live lane's row (the roster is the board's only source, so a missing row makes a live
 # lane read as unheld — the false-COLLISION direction).
+# ⛔ BUT REFUSING THE WHOLE WRITE IS ALSO WRONG, and worse: NEITHER caller ever passes `--force`
+# (`cloud-cell-bringup.sh:733`, `cloud-cell-supervisor.sh:2292` both pass a bare `--apply`), so a
+# refusal vetoes the ADDITIVE half too and the roster freezes permanently the first time one lane
+# ends — dead rows stay and the new lane's row is never written. So: the row is CARRIED, the new row
+# is ADDED, and `--force` is the only thing that DELETES.
 mk_case partial; mk_stub 0 payload; mk_payload
+mkdir -p "$CASE/repo/.worktrees/lane-99" "$CASE/repo/.git/worktrees/lane-99"
+printf 'gitdir: %s\n' "$CASE/repo/.git/worktrees/lane-99" > "$CASE/repo/.worktrees/lane-99/.git"
 run_it --apply
 chk "L1 pre-state: two rows rostered" '[ "$(grep -vc "^#" "$ROSTER")" -eq 2 ]'
-cp "$ROSTER" "$T/partial.first"
 cat > "$CASE/list.json" <<JSON
 {"window_ref":"window:1","workspaces":[
- {"id":"c2c97e96-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77","current_directory":"$CASE/repo/.worktrees/lane-77"}
+ {"id":"c2c97e96-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 77","current_directory":"$CASE/repo/.worktrees/lane-77"},
+ {"id":"e5e5e5e5-0cbc-4dfe-bc91-fef44f09b5bd","custom_title":"LANE 99","current_directory":"$CASE/repo/.worktrees/lane-99"}
 ]}
 JSON
 run_it --apply
-chk "L2 a PARTIAL answer refuses to delete the missing lane's row (rc 3)" '[ "$RC" -eq 3 ]'
-chk "L3 …and nothing was written" 'cmp -s "$ROSTER" "$T/partial.first"'
-chk "L4 …and it NAMES the row it would have removed" \
-    'case "$OUT" in *"would REMOVE: lane-88"*) true;; *) false;; esac'
+chk "L2 the partial answer does NOT delete the missing lane's row (rc 0, carried)" '[ "$RC" -eq 0 ]'
+chk "L3 …the vanished row is still there, and the NEW lane's row was ADDED (no freeze)" \
+    'grep -q "^lane-88	AA11BB22" "$ROSTER" && grep -q "^lane-99	E5E5E5E5" "$ROSTER"'
+chk "L4 …and the carry is REPORTED, never silent" \
+    'case "$OUT" in *"carried: lane-88"*) true;; *) false;; esac'
+chk "L5 …and NOT reported as dropped (nothing was deleted)" \
+    'case "$OUT" in *"dropped:"*) false;; *) true;; esac'
 run_it --apply --force
-chk "L5 --force drops it and the drop is REPORTED, never silent" \
-    '[ "$RC" -eq 0 ] && [ "$(grep -vc "^#" "$ROSTER")" -eq 1 ] && case "$OUT" in *"dropped:"*) true;; *) false;; esac'
+chk "L6 --force is what DELETES it, and the drop is REPORTED, never silent" \
+    '[ "$RC" -eq 0 ] && ! grep -q "^lane-88" "$ROSTER" && grep -q "^lane-99" "$ROSTER" && case "$OUT" in *"dropped: lane-88"*) true;; *) false;; esac'
 
 chk "G1 cloud-cell-bringup.sh PROVISIONS the roster (COMMENTS FILTERED: prose cannot satisfy this)" \
     'grep -v "^[[:space:]]*#" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -qF "provision-lane-registry.py\" --apply"'
@@ -395,8 +406,8 @@ chk "G4 the bring-up's rc-3 arm WARNS, and never dies (a die would false-block e
     'grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -q "warn " && ! grep -A3 "provrc\" -eq 3" "$ROOT/scripts/cloud-cell-bringup.sh" | grep -q "die "'
 chk "G5 the supervisor's rc-3 arm WARNS, and never dies" \
     'grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "log_line \"warn" && ! grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "die "'
-chk "G6 rc 3 and the crash arm NEVER print the ok line (only the rc-0 arm is 'provisioned')" \
-    '! grep -A3 "rvrc\" -eq 3" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "ok: lane roster" && ! grep -A3 "rvrc\" -ne 0" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "ok: lane roster"'
+chk "G6 the ok line sits INSIDE the else arm — unreachable from rc 3 and from the crash arm" \
+    'grep -B3 "ok: lane roster" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "^    else$" && grep -A3 "ok: lane roster" "$ROOT/scripts/cloud-cell-supervisor.sh" | grep -q "^    fi$" && [ "$(grep -c "ok: lane roster" "$ROOT/scripts/cloud-cell-supervisor.sh")" -eq 1 ]'
 chk "G3 this suite is WIRED into the shard list (an unwired suite reds bash-suites by design)" \
     'bash "$ROOT/scripts/run-bash-shards.sh" --list | grep -qx "scripts/orchestrator-harness/provision-lane-registry.test.sh"'
 

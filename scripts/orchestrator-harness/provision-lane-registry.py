@@ -395,8 +395,9 @@ def derive_rows(workspaces: list[dict]) -> tuple[list[tuple[str, str, str]], lis
             continue
         # ⛔ THE SAME LANE FROM TWO CHECKOUTS IS ONE LANE (#3032 review F5). Deduping only on the
         # workspace uuid rostered TWO rows for one LABEL, and a duplicated label is the one shape
-        # the board's own reader refuses to adjudicate: `fleet_state.load_registry` gives it its
-        # own arms (`duplicate` / `other-row-binds` / `second-unbound`) precisely because one label
+        # the board's own reader refuses to adjudicate: `fleet_state.build_board` gives it its own
+        # arms (`duplicate` / `other-row-binds` / `second-unbound`, tools/fleet_state.py:2463-2522)
+        # precisely because one label
         # enumerating two lane records makes the claim gate read that label as unreadable
         # (`collision_preflight._holders_from_board` → HOLDER_UNMEASURED, INCOMPLETE/exit 2
         # fleet-wide — queued by tortoise tools/fleet_state.py:2382-2385). That is the silent-idle
@@ -480,6 +481,15 @@ def write_atomic(path: str, text: str) -> None:
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
+        # ⛔ PRESERVE THE MODE THE ROSTER HAD, DEFAULT 0644 (#3032 cycle 3). `mkstemp` creates 0600
+        # and `os.replace` keeps it, so a roster this tool wrote was unreadable to any OTHER uid
+        # sharing `$CELL_HOME` — which `existing()` then turns into a permanent rc 3, exactly the
+        # "a root-owned 0600 in a shared cell home" state `RosterUnreadable` is about.
+        try:
+            _mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            _mode = 0o644
+        os.chmod(tmp, _mode)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -598,42 +608,52 @@ def main(argv: list[str] | None = None) -> int:
         for label, wsid, lane in rows:
             print("\t".join([label, wsid, lane]))
 
-    # ── THE EXISTING ROWS, READ UNDER THE LOCK THE OTHER WRITERS HONOUR ──────────────────────
+    # ── THE EXISTING ROWS, READ UNDER THE LOCK THE OTHER WRITERS HONOUR, UNCONDITIONALLY ─────
     # `scripts/turn-classify.py` APPENDS rows to this exact file under `fcntl.flock`, and its own
     # comment says it is "a read-modify-write on a file shared with lane-status.py /
-    # lane-actions.py". So the file is read HERE, under that same lock, and THIS read governs both
-    # the shrink guard below and the drop report. `rows_now` — the snapshot `existing()` took BEFORE
-    # `MEASURE`, up to 90 s earlier (two 45 s timeouts) — cannot govern a decision about what the
-    # write will destroy: a row appended inside that window would be invisible to the guard and
-    # then deleted by it (#3032 cycle 2).
+    # lane-actions.py". So the file is read HERE, under that same lock, and THIS read alone decides
+    # `present` / `ours` / `existing` — and therefore every decision below.
+    # ⛔ NOT `existing()`, WHICH RAN BEFORE `MEASURE` (#3032 cycle 3). That snapshot is up to 90 s
+    # old (two 45 s timeouts), and `turn-classify.py:458` opens the file `"a+"`, which CREATES it.
+    # A curated roster appearing inside that window was never read and then REPLACED by
+    # `write_atomic`, with no drop report and rc 0 — the file's central promise ("a file without
+    # the marker is left alone unless --force") defeated, while the run reported success.
     # RESIDUAL, stated rather than hidden: `write_atomic` ends in `os.replace`, which swaps the
     # inode, so an `a+` holder cannot follow it — the exposure is the instant between this read and
     # the replace, and `turn-classify` re-adopts its own rows on its next pass.
     current = ""
-    if present:
-        try:
-            with open(path, errors="ignore") as fh:
+    present = False
+    ours = False
+    try:
+        with open(path, errors="ignore") as fh:
+            if fcntl is not None:
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX)
+                except OSError:
+                    pass
+            try:
+                current = fh.read()
+            finally:
                 if fcntl is not None:
                     try:
-                        fcntl.flock(fh, fcntl.LOCK_EX)
+                        fcntl.flock(fh, fcntl.LOCK_UN)
                     except OSError:
                         pass
-                try:
-                    current = fh.read()
-                finally:
-                    if fcntl is not None:
-                        try:
-                            fcntl.flock(fh, fcntl.LOCK_UN)
-                        except OSError:
-                            pass
-        except OSError:
-            current = ""
-    existing_rows = [ln for ln in current.splitlines()
-                     if ln.strip() and not ln.startswith("#") and "\t" in ln]
+        present = True
+        ours = any(ln.strip() == MARKER for ln in current.splitlines())
+    except FileNotFoundError:
+        current = ""
+    except OSError as exc:
+        print(f"REFUSED: the roster EXISTS and could not be READ ({exc}) — so this script does "
+              "not know what is in it, and a file it has never seen is never replaced")
+        print(f"  roster: {path} (present — left untouched)")
+        return 3
 
-    # ── DECIDE WHAT MAY BE WRITTEN ────────────────────────────────────────────────────────
+    # ── DECIDE WHAT MAY BE WRITTEN ──────────────────────────────────────────────
     if present and not ours and not args.force:
-        print(f"HAND-MAINTAINED roster left in place: {path} ({len(rows_now)} row(s))")
+        _hand = [ln for ln in current.splitlines()
+                 if ln.strip() and not ln.startswith("#") and "\t" in ln]
+        print(f"HAND-MAINTAINED roster left in place: {path} ({len(_hand)} row(s))")
         if rows:
             print(f"  derivation offers {len(rows)} row(s); a hand-curated roster is not "
                   "replaced without --force")
@@ -641,56 +661,60 @@ def main(argv: list[str] | None = None) -> int:
               "attribution, and a bring-up must not overwrite it to satisfy a form)")
         return 0
 
-    # ── NEVER SHRINK A DERIVED ROSTER WITHOUT SAYING SO (#3032 review F1, cycle 2) ────────────
-    # This applies to BOTH arms, because the argument is the same on both and the roster is the
-    # board's only source of lane rows (`fleet_state.load_registry`): a row this run does not
-    # reproduce makes a LIVE lane read as unheld, which is the false-COLLISION direction.
-    #   * `not-applicable` MEASURES NOTHING — the daemon is silent and no layout was ever
-    #     persisted, so its zero rows are an UNREAD population, the same datum the file already
-    #     calls "not an empty fleet" when the list comes back empty. One 45 s timeout lands here.
-    #   * `derive` reads ONE WINDOW. The file's own zero-list refusal says so: "the workspace list
-    #     is per-window, so absence is not evidence". If absence is not evidence for an EMPTY list,
-    #     it is not evidence for a MISSING ROW either — a partial answer must not delete rows.
-    # `--force` is the operator's statement that the vanished rows are stale.
-    new_keys = {(r[1].upper(), r[0].lower()) for r in rows}
-    vanished: list[tuple[str, str]] = []
-    for ln in existing_rows:
-        parts = ln.split("\t")
-        lbl = parts[0]
-        w = parts[1].upper() if len(parts) > 1 else ""
-        if (w, lbl.lower()) not in new_keys:
-            vanished.append((lbl, w))
+    # ⛔ THE READER STRIPS EVERY COLUMN AND IGNORES A ROW WITH NO WORKSPACE UUID
+    # (`fleet_state.load_registry`: `parts = [p.strip() for p in line.split("\t")]`, kept only
+    # when `parts[1]`). Comparing RAW columns therefore invented a phantom "vanished row" for a
+    # label carrying one extra space, and printed `would REMOVE` when nothing was missing.
+    existing_rows: list[tuple[str, str, str]] = []
+    for ln in current.splitlines():
+        if not ln.strip() or ln.startswith("#") or "\t" not in ln:
+            continue
+        parts = [p.strip() for p in ln.split("\t")]
+        if len(parts) >= 2 and parts[1]:
+            existing_rows.append((parts[0], parts[1].upper(), parts[2] if len(parts) > 2 else ""))
 
-    if present and ours and vanished and not args.force:
+    new_keys = {(r[1].strip().upper(), r[0].strip().lower()) for r in rows}
+    vanished = [e for e in existing_rows if (e[1], e[0].lower()) not in new_keys]
+
+    # ⛔ THE ARM THAT MEASURED NOTHING MAY NOT SHRINK THE ROSTER (#3032 review F1). `not-applicable`
+    # is decided from the current probe alone — the daemon is silent and no layout was ever
+    # persisted — and one 45 s timeout lands there. Its zero rows are an UNREAD population, the
+    # same datum the file already calls "not an empty fleet", so it refuses rather than publishing
+    # "0 cmux lanes" for a box that has lanes.
+    if arm == "not-applicable" and vanished and not args.force:
         print(f"REFUSED: {len(vanished)} row(s) in {path} are NOT reproduced by this run "
-              f"(arm={arm}, {len(rows)} row(s) would replace {len(existing_rows)})")
-        for lbl, w in vanished:
-            print(f"  would REMOVE: {lbl} ({w[:8] if w else 'no workspace uuid'})")
-        if arm == "not-applicable":
-            print("  arm=not-applicable MEASURES NOTHING: the cmux daemon does not answer and no "
-                  "workspace layout was ever persisted, so a zero-row result is an UNREAD "
-                  "population, not an empty one")
-        else:
-            print("  arm=derive read ONE cmux window: the workspace list is per-window, so a lane "
-                  "absent from this answer is not proof that it ended")
-        print("  nothing was written — re-run when the population reads fully, or say "
-              "`--apply --force` to declare those rows stale")
+              f"(arm=not-applicable, 0 row(s) would replace {len(existing_rows)})")
+        for lbl, w, _lane in vanished:
+            print(f"  would REMOVE: {lbl} ({w[:8]})")
+        print("  arm=not-applicable MEASURES NOTHING: the cmux daemon does not answer and no "
+              "workspace layout was ever persisted, so a zero-row result is an UNREAD population, "
+              "not an empty one")
+        print("  nothing was written — re-run when the daemon answers, or say `--apply --force` to "
+              "declare those rows stale")
         return 3
 
-    # ── A ROW THIS RUN DOES NOT PRODUCE IS NAMED, NEVER DROPPED IN SILENCE ────────────────
-    # The comment this replaced claimed "a hand-edited file loses the marker, and this script will
-    # then never replace it". APPENDING A ROW is the common hand edit and it KEEPS the marker, so
-    # that promise was false and the row vanished without a word. Every existing row this run does
-    # not reproduce is reported on BOTH arms — gating this on `arm == "derive"` left the
-    # `not-applicable` arm deleting the whole file with no report at all (#3032 cycle 2).
-    # ⛔ NO CAUSE IS INVENTED: this run knows only that it produced no row for the (label,
-    # workspace) pair. Whether that is because the workspace is gone, or because `derive_rows`
-    # EXCLUDED it (a duplicate label, a relative cwd, an owner window) is one line up in the
-    # exclusions — inventing "the lane is no longer a fleet worktree" printed both halves of a
-    # contradiction on the duplicate-label case.
-    for lbl, w in vanished:
-        print(f"  dropped: {lbl} ({w[:8] if w else 'no workspace uuid'}) — this run produced no "
-              "row for it; if it was excluded rather than unmeasured, the exclusion above names why")
+    # ⛔ A ROW THIS RUN DID NOT REPRODUCE IS CARRIED, NEVER DELETED (#3032 cycle 3). Refusing here
+    # instead — which the previous revision did, on BOTH arms — vetoed the ADDITIVE half of the
+    # same update, and NEITHER caller ever passes `--force` (`cloud-cell-bringup.sh:733` and
+    # `cloud-cell-supervisor.sh:2292` both pass a bare `--apply`). So the roster froze permanently
+    # the first time one lane ended: dead rows stayed, and a NEW lane's row was never written, which
+    # is the label↔workspace pair `lane-status.py:680/696` reads. The invariant that matters is "no
+    # row is LOST", not "nothing changes": keep the row, say so, and let `--force` delete it.
+    if arm == "derive" and vanished and not args.force:
+        carried = vanished
+        for lbl, w, lane in carried:
+            print(f"  carried: {lbl} ({w[:8]}) — not reproduced by this run's one window; kept "
+                  "as-is (a lane absent from one window is not proof that it ended)")
+            rows.append((lbl, w, lane))
+        rows.sort(key=lambda r: (r[0].lower(), r[1]))
+        text = render(rows, arm, note + f"; {len(carried)} row(s) carried from the previous "
+                                           "roster because this run did not reproduce them")
+        vanished = []
+
+    # `--force` is the only path that DELETES, and it names every row it removes.
+    for lbl, w, _lane in vanished:
+        print(f"  dropped: {lbl} ({w[:8]}) — this run produced no row for it; if it was excluded "
+              "rather than unmeasured, the exclusion above names why")
 
     if present and ours and current == text:
         print(f"CURRENT: {path} ({len(rows)} row(s), arm={arm})")
