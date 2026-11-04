@@ -11,6 +11,21 @@
 # worktree and the result, so a wrong-repo lane is a grep rather than an investigation.
 set -u
 N=""; BR=""; OR=""; _or_pos=""; _lt_pos=0
+# ⛔ THE KEY GATE'S ESCAPE IS **ARGV**, NEVER AN ENVIRONMENT VARIABLE (review, P1, measured 2026-11-04).
+# The first cut of the escape was `LANE_KEY_GATE=0` read from this process's environment, and the previous
+# commit tried to fence it by restoring the value CAPTURED BEFORE `lane-env.sh` sourced the box's file.
+# That fence closes only the DIRECT route: on a cell the controller itself was started by
+# `cloud-cell-supervisor.sh`, which does `set -a; . "$ENV_FILE"; set +a` (`:633`) — so a value in the box's
+# `keys.env` arrives at this process as ORDINARY INHERITED ENVIRONMENT, indistinguishable from a dispatch
+# that meant it, and the "dispatch-owned" restore faithfully re-applied it. Measured: with
+# `export LANE_KEY_GATE=0` in the box's `keys.env`, a key-less lane ran to `outcome=done reason=agent-exit-0`
+# — the silent death this issue exists to remove, re-openable with every check green.
+# ⛔ NO ENVIRONMENT CAN INJECT AN ARGUMENT. That is the whole reason the switch moved here: argv is
+# constructed by the caller's command line, not inherited by every descendant, so a fixture (or an
+# operator debugging one) can turn the assertion off for ONE invocation and a box cannot turn it off for
+# every lane it will ever dispatch. Nothing reads `LANE_KEY_GATE` any more; setting it is reported and
+# IGNORED, so an operator whose habit it was gets a line rather than a silent change of behaviour.
+KEY_GATE_ESCAPE=0
 LANE_REPO_DIR=""; LANE_REPO_SLUG=""
 while [ $# -gt 0 ]; do
   case "${1:-}" in
@@ -20,6 +35,10 @@ while [ $# -gt 0 ]; do
     --repo)
       [ $# -ge 2 ] || { echo "[lane] refusing: --repo needs an owner/name slug" >&2; exit 78; }
       LANE_REPO_SLUG="$2"; shift 2 ;;
+    --key-gate-off)
+      # The DECLARED escape, for a fixture that STUBS `pi` (so the credential is not what it measures).
+      # It is argv-only on purpose: see the block at the top of this file.
+      KEY_GATE_ESCAPE=1; shift ;;
     --)
       shift
       while [ $# -gt 0 ]; do
@@ -264,20 +283,17 @@ command -v key_gate_assert >/dev/null 2>&1 && [ -n "${KEY_GATE_REFUSED:-}" ] \
 # may not move WHAT this box repairs or WHERE it records that." So the file keeps the last word on
 # CREDENTIALS (PATH, tokens, DSNs — see lane-env.test.sh A6) and the dispatch keeps it on these five.
 LANE_TARGET_ARG="$OR"; LANE_ISSUE_ARG="$N"; LANE_BRANCH_ARG="$BR"
-LANE_REPO_DIR_ARG="$LANE_REPO_DIR"; LANE_OUT_ARG="$O"; LANE_KEY_GATE_ARG="${LANE_KEY_GATE-__unset__}"
+LANE_REPO_DIR_ARG="$LANE_REPO_DIR"; LANE_OUT_ARG="$O"
 LANE_ENV_LOG="$O/logs/lane-$N.log" LANE_ENV_LABEL="lane $N" . "$SELF/lane-env.sh"
 OR="$LANE_TARGET_ARG"; N="$LANE_ISSUE_ARG"; BR="$LANE_BRANCH_ARG"
 LANE_REPO_DIR="$LANE_REPO_DIR_ARG"; O="$LANE_OUT_ARG"
-# ⛔ `LANE_KEY_GATE` IS A POLICY SWITCH, SO IT BELONGS IN THE DISPATCH-OWNED SET, NOT IN THE CREDENTIAL
-# FILE (review P2, measured). It is read at the gate, i.e. AFTER this sourcing, so a box `keys.env`
-# carrying `export LANE_KEY_GATE=0` — exactly what `export -p` records — turned the assertion off for
-# every lane on that box while the lane then reported `outcome=done`. That is the ambient-env bypass the
-# gate exists to refuse, and it is the same precedent recorded a few lines above for the other five
-# (#3174): "`keys.env` remains authoritative for CREDENTIALS … it may not move WHAT this box repairs or
-# WHERE it records that". A fixture still turns it off by setting it in the DISPATCH environment, which
-# is what the escape is documented for.
-if [ "$LANE_KEY_GATE_ARG" = "__unset__" ]; then unset LANE_KEY_GATE; else LANE_KEY_GATE="$LANE_KEY_GATE_ARG"; fi
-unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_ARG LANE_KEY_GATE_ARG
+# ⛔ `LANE_KEY_GATE` IS **NOT** IN THIS SET, AND ITS ABSENCE IS THE POINT (review, P1). It was a sixth
+# member in the previous commit and the save/restore could not work: the value reaches this process as
+# INHERITED environment from the controller (which sources `keys.env` under `set -a`), so "the value the
+# caller had" and "the value the box's file had" are the same string and the restore re-applies the box's.
+# The switch is argv-only now (`--key-gate-off`), which no file and no parent shell can set for us. See the
+# block at the top of the file. `lane-env.sh:42` records the same fact from the file's side.
+unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_ARG
 # ⛔ THE ADAPTERS ARE RE-PREPENDED **AFTER** THE FILE IS SOURCED, AND THAT ORDER IS THE WHOLE POINT
 # (review P1, measured 2026-11-04). `lane-env.sh` gives the file the last word on credentials, PATH
 # included (lane-env.test.sh A6) — but the prepends happen at :64-65, ABOVE this line, so a `keys.env`
@@ -711,22 +727,37 @@ lane_standdown_write() { # <gate> <yield-seconds>
   now="$(date +%s)"
   printf '%s\t%s\t%s\n' "$now" "$(( now + ${2:-0} ))" "$1" > "$capacity_record" 2>/dev/null
 }
-# ── THE KEY GATE (agent-infra#3331) — THE LAST GATE, IMMEDIATELY BEFORE `pi` ───────────────────
-# It is LAST because it is the last thing that can be true: every other gate is checked before it, and
-# this one asserts the exact environment `run_agent` is about to hand to `pi` — after `lane-env.sh` has
-# sourced the box's file, after every export above, with nothing left that could change it. Measured
+# ── THE KEY GATE (agent-infra#3331) — THE FIRST SPAWN GATE, IMMEDIATELY BEFORE `run_agent` ─────
+# ⛔ IT IS *FIRST*, NOT LAST, AND THE EARLIER COMMENT HERE CLAIMED THE OPPOSITE (review, P2). `run_agent`
+# runs 60 lines BELOW, and it is where the brief gate (80), the disk gate (77), the fork gate (73) and the
+# load gate (75) live — so this gate decides BEFORE any of them. That is deliberate and it is not free: a
+# dispatch with both an inadmissible brief and an unset credential reports the CREDENTIAL, yields the item
+# to peers for `CAPACITY_YIELD_SECS`, and a peer refuses it with 80 — one wasted hop. It is still the right
+# order, because a missing credential is the one condition that makes every later measurement meaningless
+# (`pi` cannot run at all), and fixing it is a property of THIS box, which is exactly what the yield
+# expresses. Recorded here rather than implied, so the next reader is not told a gate ordering the code
+# contradicts.
+# It asserts the exact environment `run_agent` is about to hand to `pi` — after `lane-env.sh` has sourced
+# the box's file, after every export above, with nothing left in THIS SHELL that could change it. Measured
 # 2026-11-02: two cells, `HOME=/tmp/cell-home` for the operational layer, the credential in the ACCOUNT
 # home's `keys.env` — `pi` printed `No API key found for the selected model.`, exited, and the lane was
 # gone with a log that simply stopped.
 # ⛔ THE OTHER HALF IS `outcome=refused`, written by the trap. A refusal that only reaches stderr is the
 # same silence one layer up: `dispatch-merge.sh` had already recorded "launched" from `nohup … &`.
-if [ "${LANE_KEY_GATE:-1}" = "0" ]; then
+if [ "${KEY_GATE_ESCAPE:-0}" = "1" ]; then
   # ⛔ THE DECLARED ESCAPE, AND IT ANNOUNCES ITSELF. It exists for fixtures that STUB `pi` (so the
   # credential is not what they measure) — a fixture that inherited the box's own key would be a false
   # GREEN on one box and a false RED on another. On a live box this line IS a bypass, and it says so in
   # the log rather than switching the gate off quietly.
-  echo "[key-gate] lane $N check=skipped reason=LANE_KEY_GATE=0 — the model-credential assertion is OFF for this process (declared escape: fixtures that stub pi; on a live box this line is a bypass and says so) (#3331)" >> "$O/logs/lane-$N.log"
+  echo "[key-gate] lane $N check=skipped reason=--key-gate-off — the model-credential assertion is OFF for this invocation (declared escape: argv, for fixtures that stub pi; on a live box this line is a bypass and says so) (#3331)" >> "$O/logs/lane-$N.log"
 else
+  # ⛔ THE RETIRED ENVIRONMENT ROUTE IS REPORTED, NOT OBEYED (review, P1, measured). A box `keys.env` or a
+  # controller's launchd environment can carry `LANE_KEY_GATE=0`, and the previous cut honoured it. It is
+  # not honoured now — but it is not silently ignored either, because an operator whose fixture relied on
+  # it would otherwise see a lane refuse 82 with no explanation of what changed.
+  if [ -n "${LANE_KEY_GATE:-}" ]; then
+    echo "[key-gate] lane $N check=ignored var=LANE_KEY_GATE=${LANE_KEY_GATE} — the escape is ARGV now (--key-gate-off). An environment variable can be inherited from the box (the cell supervisor sources keys.env under \`set -a\`, so its children carry it), which made it a fleet-wide off switch rather than a fixture-only one; this value was NOT honoured and the gate below still ran. Pass --key-gate-off to the invocation if you meant it." >> "$O/logs/lane-$N.log"
+  fi
   # ⛔ NOT A `$(…)` CAPTURE, AND THAT IS LOAD-BEARING. A command substitution runs the gate in a
   # SUBSHELL, so the `KEY_GATE_VAR`/`KEY_GATE_REASON` it sets evaporate — and the lane then announces
   # the refusal with `var=unknown`, which is the very silence this issue removes (measured on this
@@ -739,7 +770,13 @@ else
   # gate that lives 200 lines LATER. So the file is created (and proved writable) first, and anything that
   # is not exactly KEY_GATE_REFUSED is reported as the gate being UNABLE TO RUN, with its own outcome and
   # no stand-down record (nothing was measured, so nothing is yielded).
-  KEY_GATE_OUT="$O/state/key-gate-$N.line"
+  # ⛔ PER-RUN, NOT PER-ISSUE (review, P2, measured). The scratch path used to be `state/key-gate-<N>.line`,
+  # keyed on the ISSUE — while the verdict written beside it is explicitly PER RUN for the same reason: a
+  # previous run of the same issue can still be ALIVE. Two concurrent runs of #N then truncated, `tee`d and
+  # `rm`ed the same file, so one run's log could carry `check=ok` while its own `outcome=` said
+  # `refused reason=key-gate:…` — the reading and the verdict disagreeing, which is the
+  # instrument-misstates-itself class this whole change exists to remove.
+  KEY_GATE_OUT="$O/state/key-gate-$N-${LANE_RUN_TOKEN}.line"
   if ! { : > "$KEY_GATE_OUT"; } 2>/dev/null; then
     lane_outcome died "key-gate-not-run:no-outcome-file"
     echo "[lane $N] NOT started: the KEY gate could not be RUN ($O/state is not writable) — this is NOT a credential refusal and NOTHING was measured about the model, so nothing is yielded and the credential is not the suspect. Fix $O (free space / permissions; the DISK gate reports the same condition as 77) and re-dispatch." >> "$O/logs/lane-$N.log"
@@ -817,7 +854,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
     "${AGENT_LAND_BACKLOG:-74}")         lane_outcome refused "land-backlog" ;;
     "${AGENT_HARNESS_SKEW_REFUSED:-81}") lane_outcome refused "harness-skew" ;;
     "${AGENT_CAPABILITY_REFUSED:-71}")   lane_outcome refused "capability-gate" ;;
-    "${PI_GATE_REFUSED:-76}")            lane_outcome refused "pi-gate" ;;
+    # ⛔ NO `pi-gate` ARM: THE CODE CANNOT REACH HERE (review, P2, measured). `run_agent` translates the
+    # spawn point's `PI_GATE_REFUSED` (76) into `AGENT_LOAD_REFUSED` (75) before returning
+    # (`spawn-gate.sh:2460-2463`), precisely so no caller has to learn a second code — so an arm here for
+    # 76 was dead code that advertised a `reason=pi-gate` token NO lane can produce, in the very vocabulary
+    # an operator is told to grep. An instrument that answers with silence is the defect this issue is
+    # about; removing the arm is the fix, not adding it to the docs.
     # ⛔ AN UNMAPPED STATUS FROM A GATE IS STILL A REFUSAL, NOT SILENCE: nothing was started, which is
     # a fact about the lane whatever the number means. It names the code so the next reader has the one
     # lead the vocabulary could not supply.

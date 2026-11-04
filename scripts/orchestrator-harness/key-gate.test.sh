@@ -138,6 +138,66 @@ OUT="$(run_gate "$HA")"
 RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "2i a store for a DIFFERENT provider still refuses (rc=${RC:-<none>})" "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
 
+# ── 2j: AN `env` MAP WITH NO `key` IS **NOT** A CREDENTIAL (review, P1, measured) ─────────────────
+# ⛔ THE FALSE PASS THIS ARM CLOSES. pi uses a stored `env` map only to RESOLVE a `key` template —
+# `dist/core/provider-composer.js` reaches `{ apiKey: credential.key }` under `if (input.credential.key)`
+# (:260, :285-286) — so an entry with `env` and no `key` authenticates nothing. The gate used to treat
+# that shape as "pi holds a credential": it went quiet, and `pi` then printed the exact line this issue
+# exists to remove, on the same box, with the gate reporting success. An assertion that cannot tell a
+# working box from a dead one is the defect, not the fix.
+HE="$(mkhome envonly "$DEEPSEEK_JSON")"
+printf '{"deepseek":{"type":"api_key","env":{"KG_ENVONLY_UNSET":"sk-x"}}}\n' > "$HE/.pi/agent/auth.json"
+OUT="$(run_gate "$HE")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2j a store entry with an \`env\` map but NO \`key\` does not authenticate, so the gate still REFUSES (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+hasnt "$OUT" "check=skipped reason=stored-credential" "2j2 …and does not claim the store answered (that claim was the false pass)"
+# …and the inverse, so 2j cannot pass by refusing stores unconditionally: `key` ALONGSIDE `env` is the
+# shape `resolveConfigValue(credential.key, credential.env)` can actually use, so it must pass.
+HK="$(mkhome envpluskey "$DEEPSEEK_JSON")"
+printf '{"deepseek":{"type":"api_key","key":"sk_ok","env":{"KG_ENVONLY_UNSET":"sk-x"}}}\n' > "$HK/.pi/agent/auth.json"
+OUT="$(run_gate "$HK")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2j3 …while \`key\` ALONGSIDE \`env\` does authenticate (rc=${RC:-<none>}) — the pair discriminates" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+
+# ── 2k: THE AGENT DIR IS `pi`'s OWN RESOLUTION, NOT A HARDCODED `~/.pi/agent` (review, P1, measured) ──
+# pi resolves `${PI_CODING_AGENT_DIR:-~/.pi/agent}`, and this repo already mirrors that rule
+# (`extensions/builtin-tools/index.ts:272-280`, `scripts/checkout-hygiene/deepseek-balance-latch.py:98`).
+# Hardcoding the home-relative path made the gate answer a question pi does not ask, in BOTH directions:
+# a false block on a box pi would have run, and `check=skipped` on a box pi dies on. Both are asserted
+# below, because each one alone can be satisfied by getting the direction backwards.
+HOV="$(mkhome agentdir "$DEEPSEEK_JSON")"
+OV="$T/agentdir-override"; mkdir -p "$OV"
+# The override carries BOTH files pi would read there: the same models.json the home has (so the variable
+# NAME resolves identically either way) and the store that answers for it. That isolates the ONE thing
+# under test — WHICH directory the gate reads — from "can it resolve a variable name at all".
+printf '%s\n' "$DEEPSEEK_JSON" > "$OV/models.json"
+printf '{"deepseek":{"type":"api_key","key":"sk_override_store"}}\n' > "$OV/auth.json"
+OUT="$(run_gate "$HOV" PI_CODING_AGENT_DIR="$OV")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2k a store under PI_CODING_AGENT_DIR is found, so a working box is NOT refused (rc=${RC:-<none>})" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=skipped reason=stored-credential" \
+    "2k1 …because the STORE answered — before the fix this box read the home's (absent) store and refused 82"
+has "$OUT" "agent_dir=$OV" "2k2 …and the line names the directory it actually measured, not the one it assumed"
+# The other direction: the override is the ONLY place a resolvable provider exists. Before the fix this
+# printed `check=skipped` and the lane died silently, which is the whole subject of the issue.
+HOV2="$(mkhome agentdir2 ABSENT)"
+OV2="$T/agentdir-override2"; mkdir -p "$OV2"
+printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY"}}}\n' > "$OV2/models.json"
+OUT="$(run_gate "$HOV2" PI_CODING_AGENT_DIR="$OV2")"
+RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "2k3 …and a models.json that exists ONLY under the override is still asserted, not skipped (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+hasnt "$OUT" "check=skipped" "2k4 …so blindness is not reported for a file it could have read"
+# A RELATIVE override cannot name a location, so it is ignored rather than guessed against: the answer
+# must be the home-relative one, which here is a real refusal (the failure this pins is a gate that
+# reads `rel/…` against the CWD and answers about a file nobody asked about).
+HREL="$(mkhome reldir "$DEEPSEEK_JSON")"
+OUT="$(run_gate "$HREL" PI_CODING_AGENT_DIR=rel/nope)"
+has "$OUT" "models_json=$HREL/.pi/agent/models.json" "2k5 a RELATIVE override is ignored, not resolved against the CWD"
+
 # ── 3. BLINDNESS IS NOT A REFUSAL (polarity, the direction that stops a fleet) ───────────────────
 for spec in "absent:ABSENT" \
             "literal:{\"providers\":{\"deepseek\":{\"apiKey\":\"sk_literal_not_a_template\"}}}" \
@@ -173,6 +233,12 @@ if [ -r "$WT" ]; then
     theirs="$(env -i PATH=/usr/bin:/bin HOME="$AH" bash -c '. "$1" >/dev/null 2>&1; wt_provider_key_var "$2"' _ "$WT" "$AH" 2>/dev/null)"
     [ "$mine" = "$theirs" ] || { agree=1; diffs="$diffs [body=$(printf '%s' "$body" | cut -c1-40)… mine='$mine' theirs='$theirs']"; }
   done
+  # ⛔ THE MATRIX MUST BE ASSERTED, OR IT IS DECORATION (review, P2, measured). The loop above computed
+  # `agree`/`diffs` and then read NEITHER: forcing the comparison to a constant, or breaking
+  # `worker-terminal.sh`'s resolver outright, both left the suite green — an arm whose stated job is to
+  # redden a divergence that could not redden anything. That is the same "two readers of one rule" drift
+  # this suite's header says the arm exists to catch, so it is asserted here as ONE falsifiable claim.
+  eqv "$agree" "0" "4a both resolvers answer identically over the fixture matrix$diffs"
   # …and the provider-source pair, in the production shape (lane-env.sh has exported the file's value).
   FP="$(mkhome fileprov "{\"providers\":{\"zai\":{\"apiKey\":\"\$KG_CANARY_ALT\"},\"deepseek\":{\"apiKey\":\"\$KG_CANARY_KEY\"}}}")"
   printf 'export PI_LANE_PROVIDER=zai\n' > "$FP/keys.env"
