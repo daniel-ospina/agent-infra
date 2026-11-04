@@ -3649,7 +3649,7 @@ MUTANT_PRE="$T/mutant-verdict-reverted.sh"
 # Portable across GNU and BSD sed: a `c\` command is not portable, so the
 # loose mutant neutralises the guard's DECISION at its call site instead.
 sed 's#clean_low_shape_ok "\$ROWS"#true#' "$RECORD" > "$MUTANT_LOOSE"
-sed 's#^  clean|clean-micro|clean-low) ;;#  clean|clean-micro) ;;#' "$RECORD" > "$MUTANT_PRE"
+sed 's#^  clean|clean-micro|clean-low|not-clean) ;;#  clean|clean-micro) ;;#' "$RECORD" > "$MUTANT_PRE"
 bash -n "$MUTANT_LOOSE" && ok "mutation: neutered-guard mutant parses" || bad "mutation: neutered-guard mutant is not valid bash"
 bash -n "$MUTANT_PRE" && ok "mutation: reverted-verdict mutant parses" || bad "mutation: reverted-verdict mutant is not valid bash"
 if cmp -s "$MUTANT_LOOSE" "$RECORD"; then bad "mutation: guard-neutering sed did not change the script"; else ok "mutation: guard-neutering sed changed the script"; fi
@@ -5067,6 +5067,156 @@ run_record_raw "$E_NOREPO" "$SHA" clean --expect-head "$SHA"
 assert_contains "$RECORD_ERR" "could not verify the PR head" "19.6 the refusal says the pin could not be checked"
 [ ! -f "$(Q2 $E_NOREPO)" ] && ok "19.6 no record written" || bad "19.6 a record was written for an unverifiable pin"
 [ ! -f "$F_HOME/.pi/agent/reviews/$E_NOREPO.json" ] && ok "19.6 no legacy record written" || bad "19.6 a legacy record was written for an unverifiable pin"
+
+# The repo root, so §20 can read the merge gate's OWN allowlist rather than a
+# restatement of it (a copied list is how a new verdict drifts out of the gate).
+REPO_ROOT="$(cd "$(dirname "$RECORD")/.." && pwd)"
+
+# ═════════════════════════════════════════════════════════════════════════
+# 20. #3400 — THE NEGATIVE VERDICT, AND RECENCY-AWARE MARKER READING
+# ═════════════════════════════════════════════════════════════════════════
+# The defect this section pins is a reviewed artifact moving under its record
+# with nothing noticing. Three live instances in one night: a train whose head
+# moved after its composite review, a composed tree that carried code REMOVING a
+# fail-open fix, and tortoise#3295 whose body said `verdict=clean` while the most
+# recent review at that head was NOT CLEAN. The last one survived because the
+# recorder had NO negative verdict (agent-infra#3400) and the marker reader was
+# presence-based, not recency-based (agent-infra#3410): a later NOT CLEAN could
+# not supersede an earlier `clean` at the same head.
+#
+# ⛔ EVERY ARM BELOW IS A DISCRIMINATOR, not a smoke test: 20.2 fails if recency
+# handling is removed (first-marker-wins would recover `clean`), and 20.4 fails
+# if `not-clean` grows a path that skips the evidence requirement `clean` has.
+echo "── 20. #3400: the negative verdict + recency-aware marker reading ────────────"
+
+# 20.0 THE MINT. A `not-clean` verdict must be RECORDABLE at all — that was the
+# defect: the verdict list admitted clean|clean-micro|clean-low, so a review that
+# found a defect could not be written down anywhere a gate reads.
+NEG_F=1
+run_record_neg() { # <pr> [extra args…]; $EV_REF names the artifact (empty ⇒ omit)
+    local pr="$1"; shift
+    local rcfile="$T/negrc" errfile="$T/negerr"
+    rm -f "$errfile"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        rc=0
+        if [ -n "${EV_REF:-}" ]; then
+            bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+                --findings "${NEG_F:-1}" --evidence "$EV_REF" "$@" 2>"$errfile" || rc=$?
+        else
+            bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+                --findings "${NEG_F:-1}" "$@" 2>"$errfile" || rc=$?
+        fi
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+NEG_PR=424950
+EV_REF="comment:42495001"
+STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+1 open P2: the retry loop re-reads the claim after the lock is released.'
+export STUB_EVIDENCE_BODY
+run_record_neg "$NEG_PR"
+assert_eq "$RECORD_RC" "0" "20.0 a not-clean verdict MINTS (rc 0) — before #3400 this was exit 2 and no record could exist"
+NEG_REC="$(Q2 "$NEG_PR")"
+if [ -f "$NEG_REC" ]; then ok "20.0 the negative record file is written"; else bad "20.0 no record written for not-clean"; fi
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"verdict":"not-clean"' "20.0 the record carries verdict=not-clean"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"findings":1' "20.0 …and the FINDING COUNT, so the gate can say WHAT is open"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "20.0 …bound to the head exactly as a clean record is"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"evidence":"comment:42495001"' "20.0 …and it names the VERIFIED artifact it rests on"
+assert_contains "$RECORD_ERR" "review evidence verified" "20.0 …because the evidence gate actually RAN (not skipped by the negative verdict)"
+
+# 20.1 THE GATE READS IT AS A FAILURE NAMING THE FINDING — not as "no record".
+# The merge gate's allowlist (`extensions/review-enforcer::ACCEPTED_VERDICTS`) is
+# the ONE place a verdict unlocks a merge, so a recorded negative must be ABSENT
+# from it (recording one must never license a merge) while the gate's own
+# not-clean branch names the head and the count (so a lane is not sent to "record
+# a review" it already did, which is the "no record found" confusion).
+ENF="$REPO_ROOT/extensions/review-enforcer/index.ts"
+if [ -f "$ENF" ]; then
+    ACC_LIST="$(command grep -n 'export const ACCEPTED_VERDICTS' "$ENF" | command head -1)"
+    case "$ACC_LIST" in
+        *not-clean*) bad "20.1 not-clean is in ACCEPTED_VERDICTS — recording a negative would license a merge" ;;
+        *) ok "20.1 not-clean is NOT in the merge allowlist (a negative record blocks, as it must)" ;;
+    esac
+    command grep -q 'reviewed NOT CLEAN at' "$ENF" \
+        && ok "20.1 the gate NAMES the finding (\"reviewed NOT CLEAN at <sha>: N open finding(s)\"), not \"no record found\"" \
+        || bad "20.1 the gate has no not-clean branch — a recorded negative would read as an absent record"
+    command grep -q 'record.findings' "$ENF" \
+        && ok "20.1 …and it reads the recorded COUNT" \
+        || bad "20.1 the gate never reads the recorded finding count"
+else
+    bad "20.1 fixture: extensions/review-enforcer/index.ts not found at $ENF"
+fi
+
+# 20.2 RECENCY. Two markers at the SAME head, `clean` FIRST and `not-clean`
+# SECOND — the exact tortoise#3295 shape. The reader must take the LATEST one.
+# ⛔ MUTATION PIN: with recency handling removed (keep-first, or a presence test
+# that stops at the first match), the recovered record is `clean` and this arm
+# FAILS. That is what makes it a discriminator rather than a smoke test.
+rb_clear
+NEG_HEAD="$(printf 'd%.0s' $(seq 1 40))"
+NEG_DIFF="$(printf '7%.0s' $(seq 1 64))"
+NEG_M_CLEAN="$(rb_marker 424952 "review recorded: reviews/424952.json verdict=clean @ $NEG_HEAD diff=$NEG_DIFF ($RB_REPO)")" \
+  || bad "fixture: the clean marker could not be BUILT — 20.2 would otherwise fail on a missing marker"
+NEG_M_NEG="$(rb_marker 424952 "review recorded: reviews/424952.json verdict=not-clean @ $NEG_HEAD diff=$NEG_DIFF ($RB_REPO) findings=2")" \
+  || bad "fixture: the not-clean marker could not be BUILT — 20.2 would otherwise fail on a missing marker"
+export STUB_BODY="Some PR description.
+
+$NEG_M_CLEAN
+
+$NEG_M_NEG"
+run_recover 424952 "$RB_REPO"
+NEG_REC2="$RB_RDIR/daniel-ospina-agent-infra-424952.json"
+assert_eq "$RB_RC" "0" "20.2 a body with clean-then-not-clean recovers (exit 0)"
+assert_contains "$(cat "$NEG_REC2" 2>/dev/null)" '"verdict":"not-clean"' \
+  "20.2 the LATEST marker wins: verdict=not-clean, NOT the earlier clean (#3410)"
+assert_contains "$(cat "$NEG_REC2" 2>/dev/null)" '"findings":2' \
+  "20.2 …carrying the negative marker's own finding count"
+if command grep -q '"verdict":"clean"' "$NEG_REC2" 2>/dev/null; then
+    bad "20.2 the recovered record says clean — a later NOT CLEAN did not supersede it (recency handling missing)"
+else
+    ok "20.2 …and the superseded clean verdict is not in the record"
+fi
+
+# 20.3 REGRESSION GUARD — the negative verdict must not open a hole in the CLEAN
+# path. §13f proves a clean mint over a NOT-CLEAN artifact refuses; this re-runs
+# that pair AFTER a successful not-clean mint, because the (1b) declared-negative
+# arm is the thing most likely to be refactored while adding a negative family.
+rb_clear
+STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+2 P1s remain: unbounded retry, missing auth check.'
+EV_REF="comment:42495301" run_record_ev 424953
+assert_eq "$RECORD_RC" "3" "20.3 a CLEAN mint over a declared-negative artifact still REFUSES (rc 3) — the (1b) arm is intact"
+if [ -f "$(Q2 424953)" ]; then bad "20.3 the refused clean mint wrote a record"; else ok "20.3 …and writes nothing"; fi
+
+# 20.4 `not-clean` DOES NOT BUY A CHEAPER PATH. It is held to `--evidence` exactly
+# as `clean` is: without an artifact it must refuse with exit 3, or a lane could
+# park a PR with a recorded negative it never earned.
+rb_clear
+EV_REF=""
+run_record_neg 424954
+assert_eq "$RECORD_RC" "3" "20.4 a not-clean mint with NO --evidence refuses (exit 3)"
+if [ -f "$(Q2 424954)" ]; then bad "20.4 an unevidenced negative wrote a record"; else ok "20.4 …and writes nothing"; fi
+assert_contains "$RECORD_ERR" "NEGATIVE verdict is still a claim" "20.4 …and says WHY a negative verdict needs evidence"
+
+# 20.5 `--findings` is REQUIRED on not-clean and REFUSED elsewhere. Both are
+# silently wrong otherwise: a negative with no count cannot be reported, and a
+# clean record that swallowed a count looks like it recorded findings it cannot
+# carry.
+NEG_F=0
+EV_REF="comment:42495501"
+run_record_neg 424955
+assert_eq "$RECORD_RC" "2" "20.5 --findings 0 is a contradiction and refuses (rc 2)"
+if [ -f "$(Q2 424955)" ]; then bad "20.5 --findings 0 wrote a record"; else ok "20.5 …and writes nothing"; fi
+NEG_F=1
+run_record_raw 424956 "$SHA" clean "daniel-ospina/agent-infra" --findings 3 $EV_ARGS
+assert_eq "$RECORD_RC" "2" "20.5 --findings on a CLEAN verdict is refused, not silently dropped (rc 2)"
+assert_contains "$RECORD_ERR" "only meaningful with 'not-clean'" "20.5 …and names why"
 
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"
