@@ -520,7 +520,7 @@ ck "N7 a clean tree whose branch is on origin gets next='nothing to recover … 
 # ⛔ N8 — an unreadable HEAD is NOT a verification (review cycle 2, finding 2, REPRODUCED: a shim push plus
 # an unreadable HEAD recorded push=pushed and claimed '= this worktree HEAD').
 mkdir -p "$TMP/bin-nohead"
-{ printf '#!/bin/sh\ncase " $* " in *" rev-parse HEAD "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-nohead/git"
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 0 ;; *" rev-parse HEAD "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-nohead/git"
 chmod +x "$TMP/bin-nohead/git"
 PATH="$TMP/bin-nohead:$PATH" O="$O" bash -c '
   . "$1"
@@ -530,6 +530,61 @@ PATH="$TMP/bin-nohead:$PATH" O="$O" bash -c '
 ' _ "$GATE" "$WT2" 2>/dev/null > "$TMP/nohead.out"
 grep -q 'push=FAILED' "$TMP/nohead.out"; rcn8=$?
 ck "N8 …an unreadable HEAD records push=FAILED, never push=pushed (measured: $(head -c 60 "$TMP/nohead.out"))" $rcn8
+# ⛔ N8b — and the FIXTURE, not the assertion, is what makes N8 discriminate (cycle 3: the fixture's tree
+# was BEHIND origin/durable, so the pre-fix run died at the non-fast-forward rejection and never reached the
+# unreadable-HEAD branch — the arm passed identically before the fix). This asserts the precondition that
+# made it vacuous, so if the fixture ever drifts forward again the reason N8 is meaningful disappears
+# LOUDLY rather than silently.
+[ "$(git -C "$WT2" rev-list --count HEAD..origin/durable 2>/dev/null)" -gt 0 ]; rcn8b=$?
+ck "N8b …and the fixture precondition holds: WT2 is BEHIND origin/durable, so without the push-succeeds shim the transfer would be rejected before verification (which is what made N8 vacuous)" $rcn8b
+# ⛔ N10 — A TRUNCATED MARKER MUST NEVER REPLACE A COMPLETE ONE (review cycle 3, finding 4): the `:`
+# terminator made the block exit 0 unconditionally, so a write that died part-way installed a partial
+# artifact with no loud line. The sentinel is injected to fail, deterministically.
+mkdir -p "$TMP/trO/state"
+O="$TMP/trO" bash -c '
+  . "$1"
+  LANE_END_LOG="$2/tr.log"; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_DIRTY=0
+  LANE_END_MARKER_FRESH=1; LANE_END_PUSH=running
+  lane_end_marker "keeps whole" 0 0
+  printf() { case "$1" in end=ok*) return 1 ;; esac; builtin printf "$@"; }
+  LANE_END_PUSH=pushed
+  lane_end_marker "keeps whole" 0 0
+' _ "$GATE" "$TMP" 2>/dev/null
+grep -qx 'push=running' "$TMP/trO/state/lane-exit-keeps_whole.state" 2>/dev/null \
+  && grep -q 'TRUNCATED' "$TMP/tr.log" 2>/dev/null; rcn10=$?
+ck "N10 …a TRUNCATED write is refused by the end sentinel (the whole file stays, and the log says TRUNCATED)" $rcn10
+# ⛔ N11 — STALE CONTENT MUST NOT SURVIVE A LATER TERMINAL ON THE SAME LABEL (review cycle 3, finding 5:
+# `fix-one.sh` runs `run_agent` more than once in one shell, so the marker is rewritten for a NEW terminal).
+O="$TMP/trO" bash -c '
+  . "$1"
+  LANE_END_LOG=/dev/null; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_DIRTY=0
+  LANE_END_MARKER_FRESH=1; LANE_END_PUSH=pushed; LANE_END_TREE=clean
+  lane_end_marker "twice" 0 0
+  LANE_END_MARKER_FRESH=1; LANE_END_PUSH=refused-protected; LANE_END_TREE=dirty
+  lane_end_marker "twice" 1 0
+' _ "$GATE" 2>/dev/null
+grep -qx 'push=refused-protected' "$TMP/trO/state/lane-exit-twice.state" 2>/dev/null \
+  && ! grep -qx 'push=pushed' "$TMP/trO/state/lane-exit-twice.state" 2>/dev/null; rcn11=$?
+ck "N11 …and a SECOND terminal on the same label replaces it (push=pushed is gone, not merged with it)" $rcn11
+# ⛔ N12 — THE LEDGER ROW IS A FIXED-ARITY TSV (R5): a tenth column would silently shift every consumer
+# that reads $5/$6. Asserted on the real row the arms above produced.
+awk -F'\t' 'NF!=9 {bad=1} END {exit bad?1:0}' "$O/state/lane-end.tsv" 2>/dev/null; rcn12=$?
+ck "N12 …every lane-end.tsv row still has exactly 9 fields" $rcn12
+# ⛔ N13 — THE ARCHIVE ARM MUST NAME THE REF IT ACTUALLY CARRIES (cycle-3 verification of a review finding:
+# the guard was written as `archived`, a word this code never assigns, so the fetch instruction was printed
+# for `nothing` and suppressed for the one value where origin holds the only off-box copy).
+mkdir -p "$TMP/archO/state"
+O="$TMP/archO" bash -c '
+  . "$1"
+  LANE_END_LOG=/dev/null; LANE_END_ROOT=/x; LANE_END_BRANCH=fix/x; LANE_END_TREE=dirty
+  LANE_END_RESCUE=refs/wip/fix-x
+  lane_end_next > "$2/arch.next"
+  LANE_END_RESCUE=nothing
+  lane_end_next > "$2/none.next"
+' _ "$GATE" "$TMP" 2>/dev/null
+grep -q 'git fetch origin refs/wip/fix-x' "$TMP/arch.next" 2>/dev/null \
+  && ! grep -q 'git fetch' "$TMP/none.next" 2>/dev/null; rcn13=$?
+ck "N13 …a dirty tree WITH an archive gets the fetch of the ref it names; rescue=nothing gets none" $rcn13
 # ⛔ N9 — A FAILED LATER WRITE MUST NOT DELETE THIS TERMINAL'S OWN PRE-NETWORK MARKER (review cycle 2,
 # finding 5, REPRODUCED: an ENOSPC-shaped mktemp failure at the final write left NO marker at all).
 mkdir -p "$TMP/mkO/state"

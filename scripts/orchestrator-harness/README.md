@@ -542,7 +542,8 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     worktree are different facts;
   * `unpushed-only` is MEASURED, NAMED **and now PUSHED** (`lane_end_push`, #3396 — the half #2834 left
     owed). `bg-rescue-wip.sh` archives only a NON-EMPTY `git status` and never moves a branch, so the
-    branch half is its own function: `git push -u origin HEAD:refs/heads/<branch>`, bounded (120 s via
+    branch half is its own function: `git push -u origin HEAD:refs/heads/<branch>`, bounded (15 s push
+    + 15 s symref + 5 s verify = 35 s, the whole network budget, via
     `lib/bounded.sh`), **never forced**, and **verified by reading the remote** (`ls-remote`) rather than
     by the push's exit status — transport success is not delivery. It fires only when the measured
     unpushed count is > 0, so the majority of lanes cost no network call. It REFUSES, loudly and by name,
