@@ -112,6 +112,13 @@ SRC="$ROOT/pi-bootstrap/pi-config/extensions"
 DST="$ROOT/extensions"
 FAILURES=0
 
+# The machine-local farm pi LOADS. Defined UNCONDITIONALLY: check 5 read it inside
+# its `parse_ok` branch, so an unparseable manifest left it unbound and, under
+# `set -u`, the script died at check 6's guard with `LIVE_FARM: unbound variable` —
+# a shell fault where the gate should have printed its own failure summary. The
+# verdict was still red, but it named the wrong thing.
+LIVE_FARM="${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"
+
 # Resolve to an absolute, symlink-free path ("" when unresolvable).
 resolve_path() {
   if command -v realpath >/dev/null 2>&1; then
@@ -121,6 +128,27 @@ resolve_path() {
   else
     echo ""
   fi
+}
+
+# The LOADER'S TEST-FILE SET — ONE definition, used by EVERY shell arm below
+# (check 3's untracked naming, 4a's tracked set, 4a's manifest comparison and
+# check 6's scan). The four arms had drifted: 3/4a exempted `*.test.ts` alone
+# while check 6 recognised four names, so the same TRACKED file made two mutually
+# unsatisfiable demands — 3/4a required a `pi-config` wiring plus a
+# `manifest.json` row, and check 6 then forbade the farmed entry that row
+# materialises. A `.spec.ts` was unshippable while a `.test.ts` was fine, for no
+# reason but the drift. `pi-bootstrap/setup.sh` carries the same four names in
+# its copy-loop and its sweep.
+#
+# `.tsx`, `.mts` and `.cjs` are DELIBERATELY absent: `collectAutoExtensionEntries`
+# matches only `entry.name.endsWith(".ts") || entry.name.endsWith(".js")`, so the
+# loader never executes them and exempting them would be a false PASS. This is a
+# decision, not an omission — do not "complete" the list by guess.
+is_test_name() {
+  case "$(basename "$1")" in
+    *.test.ts|*.spec.ts|*.test.js|*.spec.js) return 0 ;;
+  esac
+  return 1
 }
 
 # is_furniture <path> — true (0) only for a DOT-NAMED entry that is NOT
@@ -234,9 +262,7 @@ if [ "$index_ok" -eq 1 ]; then
     # checks 1/2 loops already make this distinction.
     [ -e "$e" ] || [ -L "$e" ] || continue
     base="$(basename "$e")"
-    case "$base" in
-      *.test.ts) continue ;;
-    esac
+    if is_test_name "$base"; then continue; fi
     if is_furniture "$e"; then continue; fi   # dot-named, not extension-shaped
     present_exts="${present_exts:+$present_exts }$base"
     grep -Fqx -- "$base" <<<"$TRACKED_EXTENSIONS" || untracked_exts="${untracked_exts:+$untracked_exts }$base"
@@ -260,9 +286,7 @@ fi
 if [ "$index_ok" -eq 1 ]; then
   while IFS= read -r base; do
     [ -n "$base" ] || continue
-    case "$base" in
-      *.test.ts) continue ;;   # test files are not extensions; not shipped
-    esac
+    if is_test_name "$base"; then continue; fi   # test files are not extensions; not shipped
     if is_furniture "$DST/$base"; then continue; fi   # dot-named, not extension-shaped
     # Tracked but ABSENT from the worktree means the index and disk disagree (an
     # unstaged `rm`): there is nothing to wire, and demanding a manifest row for a
@@ -341,9 +365,7 @@ if [ "$parse_ok" -eq 1 ]; then
   if [ "$index_ok" -eq 1 ]; then
     while IFS= read -r base; do
       [ -n "$base" ] || continue
-      case "$base" in
-        *.test.ts) continue ;;   # test files are not shipped; never in manifest
-      esac
+      if is_test_name "$base"; then continue; fi   # test files are not shipped; never in manifest
       if is_furniture "$DST/$base"; then continue; fi   # dot-named, not extension-shaped
       [ -e "$DST/$base" ] || [ -L "$DST/$base" ] || continue   # index/disk disagreement — see check 3
       verified=$((verified + 1))
@@ -371,7 +393,6 @@ fi
 # does not ship is somebody else's state. Guarded by parse_ok because
 # manifest_rows only exists once the manifest parsed.
 if [ "$parse_ok" -eq 1 ]; then
-  LIVE_FARM="${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"
   if [ ! -d "$LIVE_FARM" ]; then
     echo "⏭️  live extension farm not found at $LIVE_FARM — check 5 (dangling shipped links) skipped; set PI_EXTENSIONS_DIR to aim it at a farm"
   else
@@ -473,18 +494,30 @@ if [ -d "$LIVE_FARM" ]; then
   #              returns them and its directory scan never runs; arm (a) demotes
   #              its hits to INERT rather than failing them.
   #   executed — a ROOT row (c) or a subdirectory row (b) whose EXISTING target is
-  #              named like a test. A row pointing at a file that does not exist is
-  #              NOT loaded (`existsSync` in `resolveExtensionEntries`), so inditing
-  #              it would be the #2425 false-block class.
+  #              a FILE named like a test. A row pointing at a path that does not
+  #              exist is NOT loaded (`existsSync` in `resolveExtensionEntries`), so
+  #              inditing it would be the #2425 false-block class — and a row
+  #              pointing at a DIRECTORY named like a test is not indited either
+  #              (`isFile`; pi loads that directory's `index.ts`, not its name).
   if command -v python3 >/dev/null 2>&1; then
     loader_rows="$(python3 - "$LIVE_FARM" <<'PYEOF' 2>/dev/null
 import json, os, sys
 
 root = sys.argv[1]
+# MUST equal the shell `is_test_name` set above and `pi-bootstrap/setup.sh`'s two
+# `case` arms — ONE set, mirrored in each place, all derived from the loader's
+# `entry.name.endsWith(".ts") || entry.name.endsWith(".js")`.
 test_names = ('.test.ts', '.spec.ts', '.test.js', '.spec.js')
 
 def is_test(path):
-    return path.endswith(test_names)
+    """A test FILE the loader would EXECUTE — `isFile` AND a test-shaped name.
+    The `isfile` half is not decoration: a DIRECTORY whose NAME looks like a test is
+    not executed as a file. `collectAutoExtensionEntries` hands it to
+    `resolveExtensionEntries` and pushes whatever THAT resolves (`index.ts`/
+    `index.js`), so the directory's own name is never a test file and inditing it
+    would be this gate's own false block (#2425 — the same reason arm (a) below
+    spells the loader's `isFile` branch as `-f`, and case 32 pins it)."""
+    return os.path.isfile(path) and path.endswith(test_names)
 
 def pi_rows(d):
     """pi pi-manifest.js::readPiManifest — null unless the file is an object with a
@@ -559,7 +592,7 @@ PYEOF
       esac
     done <<< "$loader_rows"
   else
-    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's `pi.extensions` row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
+    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's \`pi.extensions\` row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
   fi
   # (a) top-level entries: the loader's own scan, spelled the same way — the glob
   #     skips dot-named names exactly as `collectAutoExtensionEntries` does, and
@@ -579,16 +612,14 @@ PYEOF
   #     never runs, so they are NAMED as inert instead (#2425).
   for lap in "$LIVE_FARM"/*; do
     [ -f "$lap" ] || continue
-    case "$(basename "$lap")" in
-      *.test.ts|*.spec.ts|*.test.js|*.spec.js)
-        if [ "$short_circuit" -eq 1 ]; then
-          inert_short="$inert_short$lap"$'\n'
-        else
-          executed="$executed$lap"$'\n'
-          executed_paths="$executed_paths$(resolve_path "$lap")"$'\n'
-        fi
-        ;;
-    esac
+    if is_test_name "$lap"; then
+      if [ "$short_circuit" -eq 1 ]; then
+        inert_short="$inert_short$lap"$'\n'
+      else
+        executed="$executed$lap"$'\n'
+        executed_paths="$executed_paths$(resolve_path "$lap")"$'\n'
+      fi
+    fi
   done
   if [ -n "$executed" ]; then
     echo "❌ test file(s) in the live extension farm — pi EXECUTES these as extensions, so each one runs its suite at session start and its output replaces the session's answer:"
@@ -611,7 +642,7 @@ PYEOF
     inert="$inert$lap"$'\n'
   done <<< "$(find "$LIVE_FARM" -mindepth 2 -maxdepth 3 -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) 2>/dev/null | grep -v '/node_modules/' | head -10)"
   if [ -n "$inert" ]; then
-    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json `pi.extensions` row/index.ts entry, so this file is never loaded):"
+    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json \`pi.extensions\` row/index.ts entry, so this file is never loaded):"
     printf '%s' "$inert" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
     echo "   → \`pi-bootstrap/setup.sh\` sweeps these on the next sync; nothing here executes today."
   fi

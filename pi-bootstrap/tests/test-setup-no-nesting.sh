@@ -31,10 +31,12 @@ RUNS_LOG="$TMP/runs.log"
 FAILURES=0
 SRC_MARKER=""                     # set later; guarded in cleanup
 SPEC_FIXTURE=""                   # #2841: a temporary pi-config/extensions entry, guarded in cleanup
+SPEC_JS_FIXTURE=""                # #2841: same, for the `.js` half of the loader's set
 
 cleanup() {
   [ -n "$SRC_MARKER" ] && rm -f "$SRC_MARKER"
   [ -n "$SPEC_FIXTURE" ] && rm -f "$SPEC_FIXTURE"
+  [ -n "$SPEC_JS_FIXTURE" ] && rm -f "$SPEC_JS_FIXTURE"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -1878,11 +1880,18 @@ done
 : > "$DEST/extensions/leak-nest/node_modules/dep/parse.test.js"
 
 # Same defect through the COPY-LOOP half (not just the sweep): a farm-source entry
-# named `*.spec.ts` must never be copied into $DEST. `pi-config/extensions` ships no
-# spec file today, so this is the only way to exercise that arm — a temporary REAL
-# file there (the #93 marker below uses the same trick) removed by the trap.
+# named after ANY loadable test name must never be copied into $DEST. `pi-config/
+# extensions` ships no test file today, so this is the only way to exercise that arm —
+# temporary REAL files there (the #93 marker below uses the same trick) removed by the
+# trap. `.spec.ts` AND `.spec.js` because the copy-loop `case` names all four and the
+# `.ts`/`.js` half is a SEPARATE pattern from the `.test`/`.spec` half — a name dropped
+# from one direction is not caught by a fixture in the other. The END STATE alone does
+# not pin either (the sweep masks a copy), which is why the discriminating assertion is
+# on the RUN LOG below: a copied file is named there by the sweep that had to remove it.
 SPEC_FIXTURE="$ROOT/pi-bootstrap/pi-config/extensions/zz-setup-test-2841.spec.ts"
+SPEC_JS_FIXTURE="$ROOT/pi-bootstrap/pi-config/extensions/zz-setup-test-2841.spec.js"
 : > "$SPEC_FIXTURE"
+: > "$SPEC_JS_FIXTURE"
 
 echo "== run 1: fresh install"
 run_setup
@@ -1907,11 +1916,25 @@ check_no_nesting "$ROOT/extensions" "repo-extensions"
 # a non-test file (the over-delete control). Asserted on the REAL setup.sh run above,
 # not on the pattern's text.
 for leak in stale.test.ts stale.spec.ts stale.test.js stale.spec.js leak-nest/inner.test.ts \
-            zz-setup-test-2841.spec.ts; do
+            zz-setup-test-2841.spec.ts zz-setup-test-2841.spec.js; do
   if [ -e "$DEST/extensions/$leak" ]; then
     fail "#2841: $leak survived setup.sh — pi EXECUTES a top-level .ts/.js in the farm as an extension, so a test file there runs its suite at every session start"
   else
     echo "ok: #2841 setup.sh left no $leak in the farm"
+  fi
+done
+# The COPY-LOOP half pinned where it is OBSERVABLE. Its own `case` and the recursive
+# sweep are two halves of ONE guarantee, so an end-state assertion cannot tell them
+# apart — either half leaves $DEST clean (measured: with `*.spec.js` dropped from the
+# copy-loop `case`, the end-state assertions above stay GREEN because the sweep removes
+# the copy). The discriminator is the LOG: if the `case` stops matching, the file is
+# copied into the farm and the sweep must then NAME it. "The name never appears in run
+# 1's log" therefore pins the copy-loop itself; a sweep-only run prints the name.
+for leak in zz-setup-test-2841.spec.ts zz-setup-test-2841.spec.js; do
+  if grep -q -- "$leak" "$RUNS_LOG"; then
+    fail "#2841: setup.sh's log names $leak — the copy-loop COPIED a test file into the farm and only the sweep removed it; both halves must match the loader's set, or a name dropped from one is masked by the other"
+  else
+    echo "ok: #2841 the copy-loop refused $leak (never copied, so the sweep never had to name it)"
   fi
 done
 if [ -f "$DEST/extensions/local-testkit.ts" ]; then

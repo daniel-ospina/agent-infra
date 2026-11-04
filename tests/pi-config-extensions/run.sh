@@ -134,9 +134,9 @@ write_manifest() {
 #       live-dangling | ignored-node-modules | mixed-ignored | no-git |
 #       all-untracked | nested-git | newline-name | dash-name |
 #       dangling-ext | dotfile-ext | dot-extension | dotdot-untracked |
-#       live-test-file | live-spec-file | live-test-js | live-nested-test |
+#       live-test-file | live-spec-file | live-test-js | live-spec-js | live-nested-test |
 #       live-pkg-row-test | live-root-pkg-row-test | live-root-short-circuit |
-#       live-top-level-ext-key | live-dir-named-like-test
+#       live-top-level-ext-key | live-dir-named-like-test | live-root-row-dir-like-test
 # The live-farm dir is always $TMP/live-extensions (run_gate points
 # PI_EXTENSIONS_DIR at it); only the live-* modes create it, so every other mode
 # exercises check 5's explicit skip.
@@ -150,11 +150,19 @@ build_farm() {
   mkdir -p "$TMP/scripts" "$TMP/extensions" "$TMP/pi-bootstrap/pi-config/extensions"
   cp "$GUARD" "$TMP/scripts/check-pi-config-extensions.sh"
 
-  # extensions/ tree: two single-file extensions, one dir extension, one
-  # *.test.ts (test files are not extensions — never shipped, never wired).
+  # extensions/ tree: two single-file extensions, one dir extension, and one file
+  # per LOADER-LOADABLE test name (test files are not extensions — never shipped,
+  # never wired). The four test names are here ON PURPOSE and staged like any other
+  # tree file: checks 3/4a must exempt ALL of them. Before the follow-up fix only
+  # `*.test.ts` was exempted, so a TRACKED `*.spec.ts` was told to wire itself into
+  # pi-config AND to take a manifest row — while check 6 then forbade the farmed
+  # entry that row materialises. Two unsatisfiable demands; case 34 pins the fix.
   : > "$TMP/extensions/a.ts"
   : > "$TMP/extensions/b.ts"
   : > "$TMP/extensions/c.test.ts"
+  : > "$TMP/extensions/c.spec.ts"
+  : > "$TMP/extensions/c.test.js"
+  : > "$TMP/extensions/c.spec.js"
   mkdir -p "$TMP/extensions/d"
   : > "$TMP/extensions/d/index.ts"
 
@@ -265,6 +273,14 @@ build_farm() {
                     mkdir -p "$TMP/live-extensions"
                     ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
                     touch "$TMP/live-extensions/leaked.test.js" ;;
+    # #2841 review — `.spec.js` was the one name in the set with NO fixture of its
+    # own, so deleting it from check 6's arm AND from the python `test_names` left
+    # this suite fully green (measured at head d0a42f385, both mutations). The code
+    # was right; nothing LOCKED it, so the #2841 false PASS could come back silently.
+    live-spec-js)   ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    touch "$TMP/live-extensions/leaked.spec.js" ;;
     # #2841 — a test file NESTED in a farm subdirectory. pi resolves the subdirectory
     # through package.json/index and never recurses, so this is INERT: it must not
     # fail the gate (the measured 62-file false block) and must not be skipped
@@ -332,6 +348,20 @@ build_farm() {
                     mkdir -p "$TMP/live-extensions/weird.test.ts"
                     ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
                     : > "$TMP/live-extensions/weird.test.ts/index.ts" ;;
+    # #2841 review — the ROW arm's `isFile` branch, which case 32 does NOT reach:
+    # case 32's directory is a TOP-LEVEL entry (arm a), while this one is named by a
+    # farm ROOT `pi.extensions` row (arm c). The loader's `resolveExtensionEntries`
+    # keeps it (`existsSync`, so the row is honoured and the directory scan is
+    # short-circuited), and pi then loads `weird.test.ts/index.ts` — the directory's
+    # NAME is never an executed test file, so inditing it is the same #2425 false
+    # block. Measured at head d0a42f385: this fixture reddened the gate, because the
+    # row arm matched on the NAME alone (`os.path.exists`, no `isfile`).
+    live-root-row-dir-like-test) ln -s ../../../extensions/b.ts "$FARM/b.ts"
+                    mkdir -p "$TMP/live-extensions/weird.test.ts"
+                    ln -s "$TMP/extensions/a.ts" "$TMP/live-extensions/a.ts"
+                    : > "$TMP/live-extensions/weird.test.ts/index.ts"
+                    printf '{\n  "name": "farm-root",\n  "pi": { "extensions": ["weird.test.ts"] }\n}\n' \
+                      > "$TMP/live-extensions/package.json" ;;
   esac
 
   # #2425 — checks 3/4a read the GIT INDEX, so every fixture is a real repo with
@@ -568,17 +598,30 @@ run_gate 1 "js test file in the live farm" live-test-js \
   "leaked.test.js" \
   "!symlink farm into extensions/"
 
+echo "26b. #2841 review — a *.spec.js in the LIVE farm is EXECUTED too (the fourth name; it had no fixture, so nothing locked it)"
+run_gate 1 "spec js file in the live farm" live-spec-js \
+  "test file(s) in the live extension farm" \
+  "leaked.spec.js" \
+  "!symlink farm into extensions/"
+
 echo ""
 echo "27. #2841 — a test file NESTED in a farm subdirectory is INERT: not fatal, but NAMED"
 # The negative half is the pin: this case exists because the old `-maxdepth 3`
 # `find` failed 62 files the loader cannot reach and thereby aborted every
 # `./sync.sh` on the reporting box. A future "just widen the find again" edit
 # reddens this case, and the named-note assertion keeps the skip honest.
+#
+# `!command not found` pins the SHELL-QUOTING defect this message's `echo` carried:
+# unescaped backticks around `pi.extensions` were command-substituted, so every run
+# reaching this line printed `line 614: pi.extensions: command not found` to stderr
+# and dropped the key name from its own diagnostic. stderr is merged into $OUT by
+# run_gate, so both the message and the wrapper are pinned here.
 run_gate 0 "nested test copy is inert" live-nested-test \
   "symlink farm into extensions/" \
   "not gated (test copy NESTED in a farm subdirectory" \
   "pkg/leaked.test.ts" \
-  "!test file(s) in the live extension farm"
+  "!test file(s) in the live extension farm" \
+  "!command not found"
 
 echo ""
 echo "28. #2841 — a farm subdir's package.json pi.extensions row naming a test file IS loaded"
@@ -641,6 +684,30 @@ run_gate 0 "a directory named like a test is not a test file" live-dir-named-lik
   "symlink farm into extensions/" \
   "!test file(s) in the live extension farm" \
   "!weird.test.ts"
+
+echo ""
+echo "33. #2841 review — a ROOT ROW naming a DIRECTORY named like a test is not a test FILE (arm c, isFile)"
+# Case 32 pins arm (a) (a top-level directory); this pins the ROW arm, which matched
+# on the basename alone. The loader keeps the row (`existsSync`) and executes the
+# directory's `index.ts`, so the directory's own name is never an executed test file.
+run_gate 0 "a root row naming a directory named like a test is not a test file" \
+  live-root-row-dir-like-test \
+  "symlink farm into extensions/" \
+  "!test file(s) in the live extension farm" \
+  "!weird.test.ts"
+
+echo ""
+echo "34. #2841 review — EVERY loadable test name is exempt from 3/4a, not just *.test.ts"
+# The four names are TRACKED in the fixture tree and deliberately NOT wired into
+# pi-config and NOT given a manifest row — exactly what checks 3/4a used to red for
+# `*.spec.ts`/`*.test.js`/`*.spec.js` while check 6 forbade the very farm entry the
+# demanded manifest row would materialise. A green exit here IS the assertion: with
+# the single-name exemption restored, checks 3/4a demand wiring for three tracked
+# files. A non-vacuous pass — the same tree still reds case 19 (`unwired`) on e.ts.
+run_gate 0 "all four loadable test names are exempt from checks 3/4a" clean \
+  "symlink farm into extensions/" \
+  "!is not wired into pi-config/extensions" \
+  "!has no manifest.json files.extensions.entries row"
 
 echo ""
 if [ "$failures" -gt 0 ]; then
