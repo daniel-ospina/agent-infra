@@ -2593,7 +2593,12 @@ fi
 #      onto a tree with nothing in the record a reader could check — the tortoise#10677
 #      shape. The record here carries a full `delta` object and still names NO arm and NO
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
-#      a real delta record DOES write top-level `carry_arm` (scripts/record-review.sh:4174)
+#      a real delta record DOES write top-level `carry_arm` — the site is the `CARRY_FIELDS=`
+#      assignment in scripts/record-review.sh, `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","`.
+#      ⛔ CITED BY SYMBOL, NOT BY LINE. A line number here rotted TWICE in one review cycle: a round-4
+#      review found it pointing at 4123, it was re-anchored to 4174, and the very fix that re-anchored
+#      it (the 36-line post-condition block above it) pushed the real site to 4210 — so the "citation
+#      rot" fix reproduced the defect it fixed, one commit later. The assignment text cannot rot.
 #      and `evidence`, so naming the mint alone buys nothing.
 printf '{"pr":424920,"head_sha":"%s","diff_sha256":"%s","mint":"delta","carried_from":"%s","delta":{"from":"%s","to":"%s","proved":"lane","arm":"lane"},"verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
     "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_FILE-424920.json"
