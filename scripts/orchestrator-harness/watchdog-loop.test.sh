@@ -1222,6 +1222,102 @@ assert_contains "$stout" "verdict=WEDGED_STOPPED" "…including that block's HEA
 assert_contains "$stout" "[startup] tick 1" "…and the block's own evidence tail"
 assert_eq "$(restarts)" "0" "…and --status still dispatches nothing"
 
+# ═══ 8b(al)-(an): THE PROOF MUST AGREE WITH THE PARSER THAT LOADS THE JOB ══════════════════════════
+# `launchctl bootstrap` resolves the plist with CFPropertyList — a real XML parser that decodes
+# character references and honours attributes. The gate read the file as RAW TEXT, so the two disagreed
+# about what would run, in BOTH directions. Cycle 11 of #1986; every fixture below was run against the
+# shipped `plist_probe`/`plist_not_this_job` before the fix and reproduced (fail-open = the gate said
+# "this job", inert = a legitimate plist refused with a FALSE reason).
+#
+# (al) A TRAVERSAL SPELLED AS XML REFERENCES. `&#46;&#46;` IS `..` to the loader, and the raw string has
+#      no `..` segment and string-PREFIXES $O — so every proof passed and the arm would `bootstrap`
+#      `/opt/orch/../evil/orch-loop.sh`, i.e. `/opt/evil/orch-loop.sh`, outside every root. That is the
+#      duplicate-controller class (#1761/#1715) the provenance gate exists to stop, reported as PASS.
+echo "── 8b(al). a traversal written as XML character references is REFUSED, not bootstrapped"
+for _enc in '&#46;&#46;' '&#x2E;&#x2E;'; do
+  newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+  cat > "$C/stack.plist" <<PLISTAL
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o/${_enc}/evil/orch-loop.sh</string></array>
+</dict></plist>
+PLISTAL
+  mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+  removed_pass "$C/pass.out"
+  assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" \
+    "[$_enc] a reference-encoded .. path is not bootstrapped"
+  assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" \
+    "[$_enc] …it is refused, and the refusal is recorded"
+done
+# (am) A TAG ENDING INSIDE A QUOTED ATTRIBUTE VALUE. XML allows attributes on ANY element and `>` is
+#      legal inside one, so the tag scan ended at `note="a>`; the remainder `b">Program</key>` became
+#      TEXT, a foreign top-level `Program` was invisible to every count and proof, and plistlib resolves
+#      that document to Program=/opt/evil/run-agent.
+echo "── 8b(am). a quoted '>' in an attribute cannot hide a foreign Program key"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+cat > "$C/stack.plist" <<PLISTAM
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>$C/o/orch-loop.sh</string></array>
+  <key note="a>b">Program</key><string>/opt/evil/run-agent</string>
+</dict></plist>
+PLISTAM
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" \
+  "a foreign Program hidden behind a quoted '>' attribute is not bootstrapped"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…it is refused"
+#      (an) THE INERT DIRECTION, AND THE TRUTHFULNESS OF THE REASON. A reference the reader does not
+#      RESOLVE must be refused for THAT reason — it used to be compared raw, so an honest path under a
+#      root with a non-ASCII character was refused with the FALSE line "not under any of this box … roots"
+#      over a path that IS. And a reference it CAN resolve (`&amp;`, a legal spelling for a root holding
+#      `&`) must decode and let the arm fire, or the box is inert for one character in its own path.
+echo "── 8b(an). an unresolvable reference is refused for the TRUE reason; a resolvable one decodes"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; OAMP="$C/o&x"; mkdir -p "$OAMP"
+cat > "$C/stack.plist" <<PLISTAN
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/o&amp;x/orch-loop.sh</string></array>
+</dict></plist>
+PLISTAN
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out" "$OAMP"
+assert_contains "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap gui/$(id -u) $C/stack.plist" \
+  "a root holding '&' spelled as &amp; still lets the arm fire"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; JUDIR="$C/Usr josé"; mkdir -p "$JUDIR"
+cat > "$C/stack.plist" <<PLISTJU
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$C/Usr jos&#233;/orch-loop.sh</string></array>
+</dict></plist>
+PLISTJU
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out" "$JUDIR"
+assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" \
+  "an undecodable non-ASCII reference is NOT bootstrapped (the reader must not guess at an encoding)"
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "character reference" \
+  "…and it says WHY (unresolved reference), not the false 'not under any of this box roots' reason"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "not under any of" \
+  "…so the old false reason is gone"
+# ═══ 8b(ao): THE awk PROGRAM IS SINGLE-QUOTED, SO ONE APOSTROPHE IN IT UNQUOTES THE REST ═════════════
+# Cycle 11 hit this LIVE: a comment reading "a CDATA body's own literal …" closed the string, and the
+# shell then read the following ~25 lines as UNQUOTED text — minting a command substitution out of a
+# `$(…)` and mangling every `\0`. It is the same class as the cycle-10 bug that RAN `enable` from a
+# comment, and it is SILENT: two apostrophes pair up and the file parses while rewriting its own text.
+echo "── 8b(ao). no line of the plist_probe awk program carries an ODD number of apostrophes"
+ODD_LINES="$(awk '
+  /^plist_probe\(\) \{/ { inside=1; next }
+  inside && /^\}/        { inside=0 }
+  inside {
+    # skip the program DELIMITERS themselves: the opener `awk \047` and the closer carry one each
+    if ($0 ~ /^[ \t]*awk \047[ \t]*$/) next
+    if ($0 ~ /^[ \t]*\}\047/) { inside=0; next }
+    s=$0; n=0
+    while ((p=index(s,"\047"))>0) { n++; s=substr(s,p+1) }
+    if (n%2==1) printf "%d ", NR
+  }' "$WD")"
+assert_eq "$ODD_LINES" "" "no awk-program line has an odd apostrophe count (an odd one unquotes the program)"
+
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
 MUT="$WORK/mutant.sh"

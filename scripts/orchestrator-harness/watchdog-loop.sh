@@ -63,8 +63,15 @@
 #             NOT necessarily one `install.sh` rendered: see `PLIST_PATH` below)
 #             ⛔ AND ONLY ON EVIDENCE THE CONTROLLER IS **GONE**, NEVER MERELY WEDGED (review P1,
 #             #1986). `WEDGED` is a state of a LIVE controller — `pid_is_controller` proved it alive —
-#             so a `bootstrap` there starts a SECOND controller beside the first, and on a box whose
-#             operator deliberately stopped the job it resurrects what they stopped. The mechanism, in
+#             so a `bootstrap` there starts a SECOND controller beside the first.
+#             ⛔ IT DOES **NOT** PROTECT A DELIBERATE STOP, AND MUST NOT CLAIM TO (review P2, cycle 11).
+#             `launchctl disable`/`bootout` leaves exactly the state this arm acts on — REMOVED, with no
+#             live controller — and on this evidence a `Disabled` override is indistinguishable from the
+#             `-w` residue the arm exists to clear, so the arm DOES clear it and re-load (the same
+#             enable-then-verify sequence as `launchd-cycle.sh`'s `lc_start`/`lc_disable_state`). An
+#             operator who wants the fleet stopped must keep a live controller, or point
+#             `WATCHDOG_PLIST` at nothing. ⛔ A PRE-`enable` refusal on a `disabled` read was considered
+#             and is WRONG: it would make this arm inert for its own main case. The mechanism, in
 #             `orch-loop.sh`'s own words: the lock is `LOCKF="$O/.orch.lock"` (`:1570`) and its
 #             acquisition is `if ! acq; then … if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID"; then echo
 #             "[orch-loop] already running (pid $OPID)"; exit 0` (`:1573-1574`) — so a newcomer beside a
@@ -434,6 +441,11 @@ plist_probe() { # <file>
         # Program would read as empty and a benign ProgramArguments would decide).
         else if (cinc) {
           p = index(s, "]]>"); body = (p == 0) ? s : substr(s, 1, p - 1)
+          # ⛔ `&` IS ESCAPED FIRST, so a literal reference inside a CDATA body stays TEXT through the
+          # decoder (review P1, cycle 11 of #1986). Escaping only `<`/`>` meant `decode()` read a
+          # `&#46;` as the character `.` — the one place decoding must not apply, because inside CDATA XML
+          # defines no references at all.
+          gsub(/&/, "\\&amp;", body)
           gsub(/</, "&lt;", body); gsub(/>/, "&gt;", body)
           out = out body
           if (p == 0) { s = "" } else { s = substr(s, p + 3); cinc = 0 }
@@ -447,14 +459,77 @@ plist_probe() { # <file>
       }
       return out
     }
-    # value of the FIRST <string> at or after `from`, bounded by `to`
-    function strval(doc, from, to,   p, q) {
+    # ⛔ XML CHARACTER REFERENCES ARE RESOLVED THE WAY launchd RESOLVES THEM (review P1, cycle 11 of
+    # #1986). Reading a value as RAW TEXT made this proof disagree with the parser that actually loads
+    # the job, in BOTH directions, and the fail-open one is the duplicate-controller class this gate
+    # exists to stop. MEASURED with the shipped functions before this fix: `ProgramArguments`
+    # `[/bin/bash, /opt/orch/&#46;&#46;/evil/orch-loop.sh]` has no literal `..` and string-prefixes `$O`,
+    # so every proof PASSED and `bootstrap` would have run it — while CFPropertyList/plistlib resolve
+    # that element to `/opt/orch/../evil/orch-loop.sh`, i.e. `/opt/evil/orch-loop.sh`, outside every
+    # root. The inert direction is equally real: a plist that escapes a NON-ASCII character in an honest
+    # path (`/x/Usr jos&#233;/orch-loop.sh`, `plistlib` → `…josé…`) was refused for ever with a FALSE
+    # reason ("not under any of the box roots" over a path that IS).
+    # So: named refs and ASCII numeric refs are decoded; a reference this reader will NOT decode is
+    # collected in `badref` and reported, so the caller REFUSES with the true reason instead of comparing
+    # a raw string and refusing with a false one. ⛔ Only code points 1..126 are decoded — never a guess
+    # at a wider encoding: `sprintf("%c", n)` for n > 126 means a UTF-8 code point in gawk and a single
+    # BYTE in BWK awk (macOS), so "decoding" those would mint mojibake on one of the two platforms. A
+    # reference it cannot prove is refused, not invented.
+    function hexval(h,   i, c, v, n) {
+      n = 0
+      for (i = 1; i <= length(h); i++) {
+        c = tolower(substr(h, i, 1))
+        if (index("0123456789abcdef", c) == 0) return -1
+        n = n * 16 + (index("0123456789abcdef", c) - 1)
+        if (n > 1114111) return -1
+      }
+      return (length(h) == 0) ? -1 : n
+    }
+    function decval(d,   i, n) {
+      n = 0
+      for (i = 1; i <= length(d); i++) {
+        if (substr(d, i, 1) !~ /[0-9]/) return -1
+        n = n * 10 + (substr(d, i, 1) + 0)
+        if (n > 1114111) return -1
+      }
+      return (length(d) == 0) ? -1 : n
+    }
+    function note_badref(ref) { badref = badref (badref == "" ? "" : ",") ref }
+    function decode(s,   out, p, q, ref, cp) {
+      out = ""
+      while ((p = index(s, "&")) > 0) {
+        out = out substr(s, 1, p - 1)
+        q = index(substr(s, p), ";")
+        if (q == 0) { out = out substr(s, p); return out }
+        ref = substr(s, p + 1, q - 2)
+        s = substr(s, p + q)
+        if (ref == "lt")        { out = out "<" }
+        else if (ref == "gt")   { out = out ">" }
+        else if (ref == "amp")  { out = out "&" }
+        else if (ref == "quot") { out = out "\"" }
+        else if (ref == "apos") { out = out "\047" }
+        else if (substr(ref, 1, 2) == "#x" || substr(ref, 1, 2) == "#X") {
+          cp = hexval(substr(ref, 3))
+          if (cp < 1 || cp > 126) note_badref(ref); else out = out sprintf("%c", cp)
+        }
+        else if (substr(ref, 1, 1) == "#") {
+          cp = decval(substr(ref, 2))
+          if (cp < 1 || cp > 126) note_badref(ref); else out = out sprintf("%c", cp)
+        }
+        else note_badref(ref)
+      }
+      return out s
+    }
+    # value of the FIRST <string> at or after `from`, bounded by `to`, AS THE FILE SPELLED IT
+    function strraw(doc, from, to,   p, q) {
       if (to <= from) return ""
       p = index(substr(doc, from, to - from + 1), "<string>"); if (p == 0) return ""
       p = from + p - 1
       q = index(substr(doc, p + 8), "</string>"); if (q == 0) return ""
       return substr(doc, p + 8, q - 1)
     }
+    # …and the same value with its character references resolved
+    function strval(doc, from, to) { return decode(strraw(doc, from, to)) }
     # the value of the key whose `<key>…</key>` starts at `at`, bounded to that key OWN dict entry
     function keyval(doc, at, keylen,   from, nk) {
       from = at + keylen; nk = index(substr(doc, from), "<key>")
@@ -483,13 +558,29 @@ plist_probe() { # <file>
     # read as nested and the recovery arm was refused on every pass for ever (an inert arm). Rewriting each
     # tag to `<name>`/`</name>` before the scans makes the answer a property of the DOCUMENT rather than of
     # its spelling. Text content is copied untouched; `<!…>`/`<?…>` (DOCTYPE, XML decl) are preserved.
-    function canon(doc,   out, i, p, q, s, name, j) {
+    # ⛔ A TAG ENDS AT THE FIRST `>` **OUTSIDE A QUOTED ATTRIBUTE VALUE** (review P1, cycle 11 of #1986).
+    # XML allows attributes on ANY element and `>` is legal inside one, so `index(s, ">")` ended the tag
+    # INSIDE `<key note="a>b">Program</key>`; the remainder `b">Program</key>` became TEXT, so a foreign
+    # top-level `Program` was invisible to every count and every proof. MEASURED with the shipped
+    # functions: that document PASSED the gate while plistlib resolves it to `Program= /opt/evil/run-agent`.
+    function tagend(s,   i, ch, q) {
+      q = ""
+      for (i = 2; i <= length(s); i++) {
+        ch = substr(s, i, 1)
+        if (q != "") { if (ch == q) q = "" }
+        else if (ch == "\"" || ch == "\047") { q = ch }
+        else if (ch == ">") { return i }
+      }
+      return 0
+    }
+    function canon(doc,   out, i, p, q, s, name, j, rest) {
       out = ""; i = 1
       while ((p = index(substr(doc, i), "<")) > 0) {
         out = out substr(doc, i, p - 1)
-        q = index(substr(doc, i + p - 1), ">")
-        if (q == 0) return out substr(doc, i + p - 1)
-        s = substr(doc, i + p, q - 2)
+        rest = substr(doc, i + p - 1)
+        q = tagend(rest)
+        if (q == 0) return out rest
+        s = substr(rest, 2, q - 2)
         i = i + p + q - 1
         if (substr(s, 1, 1) == "!" || substr(s, 1, 1) == "?") { out = out "<" s ">"; continue }
         if (substr(s, 1, 1) == "/") { name = "/"; j = 2 } else { name = ""; j = 1 }
@@ -527,10 +618,17 @@ plist_probe() { # <file>
       }
       # ⛔ NUL-FRAMED, NOT TAB/NEWLINE-DELIMITED (review P2, cycle 7 of #1986). Every value here comes
       # from the FILE, and an XML `<string>` may legally contain a tab or a newline. The previous stream
-      # was read back with `awk -F'\t'` and an unquoted `$(…)`, so a tab inside a Label truncated it to a
+      # was read back with `awk -F` on a TAB and an unquoted `$(…)`, so a tab inside a Label truncated it to a
       # matching-looking prefix (a FOREIGN label then passed proof 1) and a newline inside a value FORGED
       # an extra `ARG` record that satisfied proof 3. Both were measured. A NUL cannot occur in XML text,
-      # so `read -r -d ''` reads back exactly the value the file declared — whatever it contains.
+      # so `read -r -d` with an EMPTY delimiter reads back exactly the value the file declared — whatever it
+      # contains.
+      # ⛔ AND THAT IS WHY NO APOSTROPHE MAY APPEAR IN THIS awk PROGRAM (review P1, cycle 11 of #1986). The
+      # program is single-quoted, so one apostrophe inside it CLOSES the string: the shell then reads the
+      # rest as UNQUOTED text — minting a command substitution out of a `$(…)` and mangling every `\0` —
+      # which is the same class as the cycle-10 bug that RAN `enable` from a comment. Two pre-existing
+      # apostrophes in this program happened to pair up, so the file parsed while silently rewriting its
+      # own text. §8b(am) now fails on an ODD number of apostrophes anywhere in this program.
       printf "COUNT\0%d\0", lc
       printf "PCOUNT\0%d\0", pc
       printf "PACOUNT\0%d\0", ac
@@ -552,13 +650,24 @@ plist_probe() { # <file>
             n = 0; start = from
             while (start <= to && n < 40) {
               q = index(substr(doc, start, to - start + 1), "<string>"); if (q == 0) break
-              v = strval(doc, start, to); if (v == "") break
+              # ⛔ THE ADVANCE USES THE **RAW** LENGTH, NOT THE DECODED ONE (review P1, cycle 11 of
+              # #1986). `start` walks the DOCUMENT, so skipping `length(decoded)` left it mid-element
+              # after any reference was resolved (`&amp;` is 5 chars raw, 1 decoded): the next
+              # `index(…, "<string>")` would then land inside the element it had just read, and an ARG
+              # could be reported TWICE or dropped.
+              raw = strraw(doc, start, to); if (raw == "") break
+              v = decode(raw)
               n++; printf "ARG\0%s\0", v
-              start = start + q - 1 + 8 + length(v) + 9
+              start = start + q - 1 + 8 + length(raw) + 9
             }
           }
         }
       }
+      # ⛔ THE UNDECODABLE-REFERENCE RECORD IS EMITTED LAST, AFTER EVERY VALUE HAS BEEN DECODED (review
+      # P1, cycle 11 of #1986). Emitting it beside LABEL/PROGRAM meant the ARGs were still undecoded at
+      # that point, so a reference in a ProgramArguments element (the case that matters) produced NO
+      # record at all and the caller compared a silently-truncated value.
+      if (badref != "") printf "BADREF\0%s\0", badref
     }' "$1" 2>/dev/null
 }
 # Returns 0 when the plist is NOT this label's job (and prints the reason); returns 1 only when it IS.
@@ -581,7 +690,7 @@ plist_probe() { # <file>
 #      `$LABEL` (measured). Proof 3 is about the program that RUNS.
 plist_not_this_job() { # <file>
   local -a _args=()
-  local _cnt="" _pcnt="" _pacnt="" _lbl="" _prog="" _kind _val _exec="" _e _root
+  local _cnt="" _pcnt="" _pacnt="" _lbl="" _prog="" _kind _val _exec="" _e _root _badref=""
   while IFS= read -r -d '' _kind; do
     IFS= read -r -d '' _val || break
     case "$_kind" in
@@ -590,9 +699,19 @@ plist_not_this_job() { # <file>
       PACOUNT) _pacnt="$_val" ;;
       LABEL)   _lbl="$_val" ;;
       PROGRAM) _prog="$_val" ;;
+      BADREF)  _badref="$_val" ;;
       ARG)     _args+=("$_val") ;;
     esac
   done < <(plist_probe "$1")
+  # ⛔ A REFERENCE THIS READER CANNOT PROVE IS A REFUSAL, WITH THE TRUE REASON (review P1, cycle 11 of
+  # #1986). It used to be compared as raw text, which is how `&#46;&#46;` passed as "not `..`" (fail-open)
+  # and how an honest non-ASCII path was refused with the FALSE line "not under any of this box's roots"
+  # (inert arm). launchd resolves these references; this gate therefore refuses what it cannot resolve
+  # rather than deciding on a string launchd will not see.
+  if [ -n "$_badref" ]; then
+    printf 'it declares XML character reference(s) this reader does not resolve (%s) — launchd DOES resolve them, so what a bootstrap would run cannot be proven from the raw text; re-render the plist without character references (or point WATCHDOG_PLIST at one that is already plain)' "$_badref"
+    return 0
+  fi
   # ⛔ NO FIELD SPLITTING AND NO DELIMITER PARSING ANYWHERE (review P2, cycle 7 of #1986). `$(…)` word-
   # splits on spaces, so on a box whose root path contains a space NO plist could ever pass and the arm
   # was permanently INERT there; `awk -F'\t'` truncates at a tab, so a tab inside a Label made a FOREIGN
