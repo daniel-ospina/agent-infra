@@ -367,7 +367,9 @@
 #   worktree-locked (an `initializing` lock older than REAP_WT_STALE_INIT_SECONDS is DETECTED here
 #   and the interrupted-add class stays pending) > unreadable-path | prunable > live-process >
 #   live-cwd > pin-tree | pin-tree-shape (#10114 — a HARNESS PIN TREE is a holder /proc cannot
-#   show, so it outranks every removal rule) > live-claim > claim-unverified >
+#   show, so it outranks every removal rule that can fire on a tree that still EXISTS — rules
+#   3/4/5 and the residue gates below it; the `unreadable-path | prunable` arm ABOVE it only fires
+#   when the directory is already gone, so it cannot destroy a pin tree) > live-claim > claim-unverified >
 #   interrupted-add[-unreachable] >
 #   dirty | ignored-artifact | status-timeout | status-error > abandoned-wip >
 #   detached-unreachable > open-pr > too-recent | ghost-zero-ahead > too-young >
@@ -3149,10 +3151,13 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     #   for x in ${h:+"$h/.p"};  do echo "[$x]"; done   # h='/a b'  ->  [/a b/.p]     (one word)
     #   for x in ${h:+$h/.p};    do echo "[$x]"; done   # h='/a b'  ->  [/a] [b/.p]    (splits)
     # The hazard is dropping the INNER quoting, not the outer: `${home:+$home/.harness-path}` splits and
-    # the record is skipped in silence, which is the silent-miss class this veto exists to close. The
-    # outer quotes below are kept for uniformity with the sibling elements and pinned by G15l
-    # (mutation leg `home-expansion-unquoted`), which drives the splitting spelling.
-    for rec in "${HARNESS_PIN_FILE:-}" "$cellpin" ${home:+"$home/.harness-path"} "${pin_root:+"$pin_root/.harness-path"}"; do
+    # the record is skipped in silence, which is the silent-miss class this veto exists to close.
+    # ⛔ ONLY THE INNER QUOTING IS LOAD-BEARING. The outer quotes below are cosmetic and NOTHING pins
+    # them — that is measured, not assumed: a mutant of the outer quotes ALONE stays GREEN (it is how
+    # the round-2 claim was falsified), so G15l's mutation leg `home-expansion-unquoted` drives the
+    # INNER spelling, which is the one that actually splits.
+    for rec in "${HARNESS_PIN_FILE:-}" "$cellpin" "${home:+"$home/.harness-path"}" "${pin_root:+"$pin_root/.harness-path"}"; do
+
         [ -n "$rec" ] || continue
         [ -r "$rec" ] || continue
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"
@@ -3338,10 +3343,14 @@ classify_one() {
     fi
     [ -n "$HL_STALE" ] && stale_txt="stale-shell:$HL_STALE"
 
-    # ── THE PIN TREE OUTRANKS EVERY REMOVAL RULE (#10114) ────────────────────────────────────────
+    # ── THE PIN TREE OUTRANKS EVERY REMOVAL RULE THAT CAN FIRE ON AN EXISTING TREE (#10114) ──────
     # Placed HERE, with the other vetoes and before rule 3, because the reason it must run first is
     # the one that failed: a pin tree is ALWAYS an ancestor of main, so rule 3 fires on it every
     # single pass unless something says what it is. See `pin_tree_match` for the measurement.
+    # ⛔ NOT "EVERY REMOVAL RULE" WITHOUT THAT QUALIFIER: this function already emitted one `remove`
+    # row above (the `prunable` arm, reachable only when `canonicalize` came back EMPTY because the
+    # directory is already absent). That arm cannot destroy a pin tree — there are no bytes left to
+    # destroy — but a claim it contradicts is a claim a reader has to reconcile, so it is stated here.
     if pin_tree_match "$canon"; then
         printf 'preserve\t%s\t\trule=P %s\n' "$PIN_VERDICT" "$PIN_PROOF"
         return 0
