@@ -3894,7 +3894,7 @@ ck "refresh-candidates.sh ranks the tiers P0=0 < P1=1 < P2=2 (a constant rank wo
 # `set -u` with `rc_dedupe: unbound variable`: no FAIL line, no summary, and every check after this one
 # never ran. The guard's failure path is the one thing that must never itself crash. Defaulting to 1
 # makes a skipped drive count a named FAIL and lets the suite continue, as it did before this change.
-rc_dedupe=1; rc_rank=1
+rc_dedupe=1; rc_rank=1; rc_handoff=1
 if [ -s "$REFRESH" ]; then
   awk '/^done < /{f=1;next} f' "$REFRESH" > "$TMP/tail.sh"
   # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
@@ -3925,7 +3925,7 @@ if [ -s "$REFRESH" ]; then
     #    fail-closed arm, so this fixture no longer doubles as an accidental one).
     rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
     printf '5000\n100\n9000\n5000\n' > "$TMP/candidates.txt"
-    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-with-qorder.sh ) >/dev/null 2>&1
+    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-with-qorder.sh ) > "$TMP/dedupe-drive.log" 2>&1
     tail_got="$(tr '\n' ' ' < "$TMP/candidates.txt" 2>/dev/null | sed 's/ *$//')"
     [ "$tail_got" = "5000 100 9000" ] && rc_dedupe=0 || rc_dedupe=1
     # B) THE ORDER IS THE POOL'S, and the call is LIVE. Same fixture, plus a pool that ranks `100` once:
@@ -3938,12 +3938,23 @@ if [ -s "$REFRESH" ]; then
     rank_got="$(tr '\n' ' ' < "$TMP/candidates.txt" 2>/dev/null | sed 's/ *$//')"
     [ "$rank_got" = "100 5000 9000" ] && rc_rank=0 || rc_rank=1
     [ "$rc_rank" -eq 0 ] || echo "      pool-ranked drive gave '$rank_got' (want '100 5000 9000'); log: $(tr '\n' '|' < "$TMP/qorder-drive.log" 2>/dev/null | head -c 240)"
+    # C) THE HANDOFF LINE NAMES THE ORDER IT ACTUALLY HAS (review P2, cycle 2). The two arms are the
+    #    ONE place the claim reaches the durable record (`handed_why=`), so an adjective typed rather
+    #    than read survives there long after the log line is gone. A (no pool) must take the
+    #    `priority-unreadable` arm and must NOT name "ARRIVAL order" — the file was left UNTOUCHED, so
+    #    its order is the previous pass's, not one this pass read. B (a pool that ranks) must take the
+    #    `severity` arm. Both arms are asserted, so a message that collapses to one wording REDS.
+    if grep -q 'established NO priority order' "$TMP/dedupe-drive.log" 2>/dev/null \
+       && ! grep -q 'ARRIVAL order' "$TMP/dedupe-drive.log" 2>/dev/null \
+       && grep -q 'highest-ranked CLEAN entry in the pool-ordered queue' "$TMP/qorder-drive.log" 2>/dev/null; then rc_handoff=0; fi
+    [ "$rc_handoff" -eq 0 ] || { echo "      handoff arm (no pool): $(grep -c 'established NO priority order' "$TMP/dedupe-drive.log" 2>/dev/null) / ARRIVAL-named: $(grep -c 'ARRIVAL order' "$TMP/dedupe-drive.log" 2>/dev/null) / severity arm: $(grep -c 'highest-ranked CLEAN entry in the pool-ordered queue' "$TMP/qorder-drive.log" 2>/dev/null)"; }
     [ "$rc_dedupe" -eq 0 ] || echo "      dedupe drive gave '$tail_got' (want '5000 100 9000')"
     rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
   fi
 fi
 ck "refresh-candidates.sh dedupes the backlog in place (and leaves the order alone when the pool ranks nothing)" $rc_dedupe
 ck "refresh-candidates.sh re-derives the queue's head from the pool — the ranked row leads, unranked rows keep their tail order" $rc_rank
+ck "the handoff line names the order it actually has — 'priority-unreadable' without inventing 'ARRIVAL order', and the severity arm when the pool ranked" $rc_handoff
 
 # ── 19) the harness runs on Linux as well as macOS (#1702) ──────────────────────
 # The shipped cell controller (cloud-cell-supervisor.sh) starts THIS loop on a Linux cell, and every

@@ -29,7 +29,10 @@
 #   4. An EMPTY queue is a neutral success in its own words, never the failure word (`priority-unreadable`
 #      over a fully drained queue — the routine state after a good pass — would be a false alarm).
 #   5. A reorder that FAILS leaves the file byte-identical AND names itself, so a failed write can never
-#      read as an ordered queue.
+#      read as an ordered queue — and it may NOT name an order it did not read. The failure arms leave the
+#      file UNTOUCHED (`rm -f`, no `mv`), so it holds whatever the PREVIOUS pass left; "is in ARRIVAL
+#      order" was a typed claim about an unread file, and is asserted ABSENT here while assertion 3 (the
+#      arm that really does rewrite in arrival order) asserts it PRESENT, so the pair discriminates.
 #   6. The WIRING: both call sites exist and both follow the definitions, so the reorder cannot go inert
 #      the way the first cut of this change did (defined after the skip arm's call site, line ~1337
 #      apart — `command not found`, absorbed).
@@ -228,12 +231,16 @@ drive norank "$FNS" '300
 sum_before="$(cksum < "$TMP/norank/o/candidates.txt" 2>/dev/null)"
 sum_after="$(printf '300\n9\n' | cksum)"
 same=1; [ "$sum_before" = "$sum_after" ] && same=0
+# ⛔ AND IT MAY NAME "ARRIVAL ORDER" HERE (review P2, cycle 2) — this is the ONE arm that may, because
+# the file really was rewritten and the pool ranked nothing in it. That makes the ABSENCE asserted in
+# test 6 below discriminating rather than a phrase nobody ever emits.
 if [ "$same" -eq 0 ] && grep -q 'priority-unreadable' "$TMP/norank/out" 2>/dev/null \
+   && grep -q 'ARRIVAL order' "$TMP/norank/out" 2>/dev/null \
    && ! grep -q 'severity-first' "$TMP/norank/out" 2>/dev/null; then rc=0
 else
   rc=1; echo "      same=$same; out: $(tr '\n' '|' < "$TMP/norank/out" 2>/dev/null | head -c 300)"
 fi
-ck "a pool ranking NONE of the queue says 'priority-unreadable', leaves the file byte-identical, and never claims severity" $rc
+ck "a pool ranking NONE of the queue says 'priority-unreadable', leaves the file byte-identical, names ARRIVAL order, and never claims severity" $rc
 
 # 4b) POSITIVE PAIR: the same drive with a pool that DOES rank one row must claim severity-first — so the
 #     absence asserted above is not just a broken driver printing nothing.
@@ -267,6 +274,25 @@ if [ "$sum_before" = "$sum_after" ] && grep -q 'priority-unreadable' "$TMP/nopoo
    && [ ! -e "$TMP/nopool/o/.cand.ranked" ] && [ ! -e "$TMP/nopool/o/.queue-rank" ]; then rc=0
 else rc=1; echo "      out: $(tr '\n' '|' < "$TMP/nopool/out" 2>/dev/null | head -c 300); leftovers: $(ls -a "$TMP/nopool/o" | tr '\n' ' ')"; fi
 ck "an unreadable pool leaves candidates.txt byte-identical, names 'priority-unreadable', and leaves no temp file behind" $rc
+
+# 6a) A FAILED REORDER MAY NOT NAME AN ORDER IT DID NOT READ (review P2, cycle 2). The failure arms leave
+#     the file UNTOUCHED, so it still holds whatever the PREVIOUS pass left — after a good pass that is
+#     the POOL's order, not arrival order. The first version of the message asserted "is in ARRIVAL
+#     order" about a file this pass never read, which is a typed claim where a read one belongs.
+if ! grep -q 'ARRIVAL order' "$TMP/nopool/out" 2>/dev/null && grep -q 'UNVERIFIED' "$TMP/nopool/out" 2>/dev/null; then rc=0
+else rc=1; echo "      out: $(tr '\n' '|' < "$TMP/nopool/out" 2>/dev/null | head -c 300)"; fi
+ck "a FAILED reorder says the queue is UNCHANGED/UNVERIFIED — it does not name 'ARRIVAL order' for a file it never read" $rc
+
+# 6a-bis) AND THE DISTINCTION IS REAL, not a phrase dropped everywhere: test 4 above still REQUIRES
+#     'ARRIVAL order' on the arm that genuinely rewrote the file. Re-drive it here so the pair cannot
+#     drift apart (a later edit that deletes the phrase from BOTH messages reds exactly one of them).
+drive norank2 "$FNS" '300
+9
+' '777
+'
+if grep -q 'ARRIVAL order' "$TMP/norank2/out" 2>/dev/null; then rc=0
+else rc=1; echo "      out: $(tr '\n' '|' < "$TMP/norank2/out" 2>/dev/null | head -c 300)"; fi
+ck "non-vacuity pair: the pool-ranked-nothing arm still names ARRIVAL order, so the absence in 6a is discriminating" $rc
 
 # ── 6b) AN UNVERIFIABLE COUNT IS NOT A DRAINED QUEUE (review P2) ────────────
 # `rank_queue_by_pool` writes `<ranked> <unranked> <head>` and the caller reads it to choose its
