@@ -261,7 +261,7 @@ state that read as fine on cell-1.
 This is what answers "is it self-dispatching" without a human reading a pane: a live pane shows a
 *process*, a fresh record shows a *cycle*.
 
-## 7.1 Tests
+### 7.1 Tests
 
 `scripts/orchestrator-harness/capacity-placement.test.sh` (in `scripts/run-bash-shards.sh`, so both
 CI lanes run it): the saturated box skipped and the least-loaded eligible box chosen; an
@@ -477,10 +477,11 @@ action, the age bound sweeps a stale entry and keeps a fresh one (and the operan
 threshold), a missing root is a `defect tmpdir-missing` whose printed remedy restores it, and a mutant
 with the export removed must leave the listener running under whatever temp dir the box gave it.
 
-### 8.1 The slot ceiling is SYMMETRIC — surplus above it is permanent until a human retires it
+### 8.1 The ceiling bounds ADDITION only — surplus above it is permanent until a human retires it
 
-⛔ **The ceiling bounds ADDITION. Nothing in this repo can bring a box that is already ABOVE it
-back down, and that is a live oversubscription, not a theoretical one.**
+⛔ **The ceiling is ONE-DIRECTIONAL: it bounds ADDITION. Nothing in this repo can bring a box that
+is already ABOVE it back down, and that is a live oversubscription, not a theoretical one. Do not
+read "ceiling" as a target the box converges to from either side — a box above it stays above it.**
 
 **The intended count, from the owner's own sizing** (agent-infra#2344 comment 6347825624: *"the
 sustainable counts are 3 on cell-1, 3 on cell-4, 2 on cell-3"*). ⚠️ **Two tools encode it, and they
