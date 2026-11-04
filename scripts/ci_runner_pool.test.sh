@@ -253,11 +253,26 @@ cat >"$TEMPLATE/run.sh" <<'STUB'
 SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
-# ⛔ GITHUB'S run.sh SOURCES `.env` — so this stub is the ONE place the real contract is observable:
-#   whatever `.env` names becomes the environment the listener and every job step run under. A stub
-#   that skipped it would pass while the SHIPPED launcher left a TMPDIR nobody created, because the
-#   only thing that consumes `TMPDIR=` is the file this stub was ignoring (agent-infra#2937).
-if [ -f .env ]; then . ./.env; fi
+# ⛔ THIS STUB MODELS THE LISTENER'S REAL `.env` PARSE — NOT A SHELL'S (agent-infra#3004 review round
+#   5, P1). The previous build did `. ./.env`, under a comment claiming GitHub's `run.sh` sources it.
+#   It does not: `actions/runner` src/Runner.Listener/Program.cs `LoadAndSetEnv()` splits each line at
+#   the FIRST `=` and assigns the remainder VERBATIM — no quote stripping, no `#` comment, no `$`
+#   expansion, no trimming — and `export TMPDIR=…` sets a variable literally NAMED `export TMPDIR`.
+#   Because this stub SOURCED the file, it agreed with the tool's own (wrong) parser and the whole
+#   suite was blind to the false PASS that followed. A stub modelling the RUNNER is the only thing
+#   that makes these arms mean anything.
+if [ -f .env ]; then
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _line="${_line%$'\r'}"
+    [ -n "$_line" ] || continue
+    case "$_line" in *=*) ;; *) continue ;; esac
+    _k="${_line%%=*}"; _v="${_line#*=}"
+    # The KEY is matched EXACTLY — `export ` and any leading whitespace are part of the key, as .NET
+    # does it. An empty value UNSETS the variable (the `envValue = null` arm).
+    [ "$_k" = "TMPDIR" ] || continue
+    if [ -n "$_v" ]; then export TMPDIR="$_v"; else unset TMPDIR; fi
+  done <.env
+fi
 # ⛔ AND IT RECORDS WHAT IT INHERITED, from INSIDE the listener, at the instant the real run.sh would
 #   hand that env to a job. `absent` here is precisely the state in which every job on the instance
 #   dies at `mktemp` while GitHub reports the runner `online` — so the ordering the fix claims
@@ -1300,12 +1315,14 @@ else
 fi
 chmod 600 "$RUNNER_ROOT/pi-runner-lock/.env"
 
-# ── (9) A VALUE THAT NEEDS SHELL EXPANSION IS REFUSED, NOT GUESSED AT ────────────────────
-# ⛔ `run.sh` SOURCES `.env`; a `sed` read does not. `TMPDIR=$HOME/ci-tmp` therefore had this tool create
-#   a directory literally named `$HOME` (under the instance dir, because the value is not `/`-leading),
-#   print `created tmpdir=…` and exit 0 — while the listener inherited an ABSENT /home/…/ci-tmp. The
-#   (a trailing comment is the opposite case — a sourcing shell ENDS the value at the whitespace, so it
-#   is TOLERATED; see case 9 below.)
+# ── (9) A VALUE CARRYING SHELL SYNTAX IS REFUSED, NOT FABRICATED FROM ──────────────────
+# ⛔ The listener does NOT expand `.env` (it splits at the first `=` and takes the rest verbatim), so
+#   `TMPDIR=$HOME/ci-tmp` names the literal directory `$HOME/ci-tmp`. Creating that would make the
+#   listener work while silently "repairing" a value nobody meant — so it is `cannot-act`, naming the
+#   value the listener would ACTUALLY use. (The old text here claimed a sourcing shell expanded it;
+#   that premise was false — #3004 review round 5, P1.)
+#   (A trailing comment is NO LONGER tolerated either: `#` is not a comment to the listener, so
+#   `TMPDIR=/tmp/x  # scratch` names a directory including the comment text. See 9a.)
 echo "── tmpdir: a \$VAR value is refused, not mis-created ──"
 fresh_pool tmpexp; reset_logs
 register pi-runner-exp
@@ -1319,15 +1336,12 @@ assert_absent "$RUNNER_ROOT/pi-runner-exp/\$HOME" "no literal '\$HOME' directory
 assert_absent "$RUNNER_ROOT/pi-runner-exp/ci-tmp" "and nothing was guessed at either"
 assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-exp") ))" "0" "nothing was started"
 
-# ── (9a) SHELL SYNTAX THIS PARSER DOES NOT MODEL IS REFUSED, NEVER TRUNCATED ────────────────
-# ⛔ Truncating at syntax instead of refusing it created a DIFFERENT directory and reported
-#   `created tmpdir=…` with rc 0 over the real path's absence — measured on the round-2 shape:
-#     `TMPDIR=/tmp/x/a\ b`       → created `a\`       (the shell's value is `/tmp/x/a b`)
-#     `TMPDIR=/tmp/x/x; echo hi` → created `x;`       (the shell's value is `/tmp/x/x`)
-#     `TMPDIR='/tmp/adj'x`       → created `/tmp/adj` (adjacent segments concatenate: `/tmp/adjx`)
-#   A backslash, a separator, a redirection or a subshell is EVALUATION, and this tool will not
-#   evaluate another user's `.env` (`status` may run as root) — so each is `cannot-act` (#3004 review
-#   round 3, P1).
+# ── (9a) SHELL SYNTAX IS REFUSED, NEVER TRUNCATED INTO A PATH NOBODY MEANT ────────
+# ⛔ Truncating at syntax created a DIFFERENT directory and reported `created tmpdir=…` with rc 0 over
+#   the real path's absence. The listener itself does not interpret any of it (the whole string is the
+#   directory name), but a `.env` carrying a backslash, a separator, a redirection or a subshell was
+#   written for a shell that will never read it — so each is `cannot-act` (#3004 review round 3, P1;
+#   re-grounded on the listener's real parse in round 5).
 echo "── tmpdir: backslash / separator / adjacent-segment values are refused, not truncated ──"
 syn_expect() { # <case#> <value> <truncated-path-that-must-NOT-exist>
   fresh_pool "tmpsyn$1"; reset_logs
@@ -1348,63 +1362,88 @@ syn_expect 1 '/tmp/x/a\ b'      '/tmp/x/a\'
 syn_expect 2 '/tmp/x/x; echo hi' '/tmp/x/x;'
 syn_expect 3 "/tmp/x/adj'x"      "/tmp/x/adj'x"
 rm -rf '/tmp/x/a\' '/tmp/x/x;' "/tmp/x/adj'x" 2>/dev/null
+# ⛔ `#` IS NOT A COMMENT TO THE LISTENER. `TMPDIR=/tmp/x  # scratch` names the directory
+# `/tmp/x  # scratch`, so creating `/tmp/x` — what a sourcing shell would name — left the listener's own
+# path ABSENT while `status` called the row clean. The verbatim value is refused instead, and both
+# absences are asserted: a refusal must create nothing at all.
+echo "── tmpdir: a trailing '# comment' is REFUSED — the listener does not treat it as a comment ──"
 fresh_pool tmpcmt; reset_logs
 register pi-runner-cmt
 printf 'TMPDIR=%s/pi-runner-cmt/tmp  # scratch\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-cmt/.env"
 : >"$TMPLOG"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-cmt)"
-assert_eq "$?" "0" "a trailing comment is TOLERATED — an unquoted assignment ends at the whitespace"
-assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-cmt/tmp (named by" "so the value BEFORE the comment is created"
-assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-cmt/tmp" "and that is the path the listener inherits"
-assert_absent "$RUNNER_ROOT/pi-runner-cmt/tmp  # scratch" "no directory whose NAME carries the comment was made"
+assert_eq "$?" "2" "a trailing comment is cannot-act (rc 2), never a silently truncated path"
+assert_contains "$out" "cannot-act why=tmpdir-value-not-literal" "naming the shape it refused"
+assert_contains "$out" "# scratch" "and showing the verbatim value the listener would use"
+assert_absent "$RUNNER_ROOT/pi-runner-cmt/tmp" "the TRUNCATED path was NOT created (the false PASS this replaces)"
+assert_absent "$RUNNER_ROOT/pi-runner-cmt/tmp  # scratch" "and neither was a directory carrying the comment"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-cmt") ))" "0" "nothing was started"
 
-# ── (9b) LEGAL VALUES THE OLD REFUSAL TOOK WITH IT ──────────────────────────────────────────
-# ⛔ The previous shape stripped quotes FIRST and then refused the remainder for whitespace/`$`/`~`,
-# i.e. it removed exactly the characters that had made the value legal. A quoted path with a SPACE
-# and a single-quoted `$` are values the sourcing listener honours EXACTLY, yet both were `cannot-act`,
-# so `restart` — the remedy `status` prints — started NOTHING on a legal `.env` (#3004 review, P2).
-echo "── tmpdir: a quoted path with a space, and a single-quoted dollar, are ACCEPTED ──"
+# ── (9b) QUOTES ARE LITERAL TO THE LISTENER — REFUSED; A REAL SPACED PATH STILL WORKS ──────
+# ⛔ Round 2 ACCEPTED `TMPDIR="/tmp/a b"` and `TMPDIR='/tmp/a$b'` as "values the listener honours
+# EXACTLY", on the false premise that the listener sources `.env`. It does not: the value IS the string
+# WITH its quote characters, i.e. a directory named `"/tmp/a b"`. Accepting it created `/tmp/a b` while
+# the listener used `"/tmp/a b"` — the same false PASS class as the comment arm above. Two truths are
+# asserted here: the quoted forms are REFUSED, and the spaced path an operator actually means — written
+# WITHOUT quotes, which is the only form the listener needs — is created VERBATIM. The old parser cut
+# that one at the first space and created only its prefix.
+echo "── tmpdir: quotes are refused; an unquoted spaced path is created verbatim ──"
 fresh_pool tmpq; reset_logs
 register pi-runner-q
 printf 'TMPDIR="%s/pi-runner-q/dir with space"\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-q/.env"
 : >"$TMPLOG"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-q)"
-assert_eq "$?" "0" "a double-quoted path containing a space is accepted"
-if [ -d "$RUNNER_ROOT/pi-runner-q/dir with space" ]; then ok "and the directory is created with that name"; else bad "the space-bearing directory was not created"; fi
-assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-q/dir with space" "and the listener inherits it"
+assert_eq "$?" "2" "a double-quoted path is cannot-act — the quotes are part of the listener's value"
+assert_contains "$out" "cannot-act why=tmpdir-value-not-literal" "naming the shape it refused"
+assert_absent "$RUNNER_ROOT/pi-runner-q/dir with space" "and the un-quoted path was NOT created for it"
+assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-q") ))" "0" "nothing was started"
 fresh_pool tmpq2; reset_logs
 register pi-runner-q2
 printf "TMPDIR='%s/pi-runner-q2/\$lit'\n" "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-q2/.env"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-q2)"
+assert_eq "$?" "2" "a single-quoted value is cannot-act too — the quotes are literal characters"
+assert_absent "$RUNNER_ROOT/pi-runner-q2/\$lit" "no directory was created from it"
+# ⛔ THE CASE THAT MUST STILL WORK — and the one the old parser got WRONG. `TMPDIR=/tmp/a b` is ONE
+# literal path containing a space to the listener; the old shape cut at the space, created `/tmp/a`,
+# and reported `created tmpdir=…` over the listener's absent path.
+fresh_pool tmpspace; reset_logs
+register pi-runner-space
+printf 'TMPDIR=%s/pi-runner-space/dir with space\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-space/.env"
 : >"$TMPLOG"
-out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-q2)"
-assert_eq "$?" "0" "a single-quoted value containing a dollar is accepted (single quotes are LITERAL)"
-if [ -d "$RUNNER_ROOT/pi-runner-q2/\$lit" ]; then ok "the literal-dollar directory is created, not an expanded one"; else bad "the literal-dollar directory was not created"; fi
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-space)"
+assert_eq "$?" "0" "an UNQUOTED spaced path is accepted — it is one literal path to the listener"
+assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-space/dir with space (named by" "created with its space, VERBATIM"
+assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-space/dir with space" "and that is what the listener inherits"
+assert_absent "$RUNNER_ROOT/pi-runner-space/dir" "and the TRUNCATED prefix was not created on its own"
 
-# ── (9c) AN UNTERMINATED QUOTE NAMES NO PATH ────────────────────────────────────────────────
-# `TMPDIR="/tmp/x` has no closing quote, so the string written is not a path the listener resolves.
-# The old code created a directory literally named after the stray quote — a false success.
+# ── (9c) A QUOTED VALUE NAMES NO PATH THE LISTENER USES ─────────────────────────────────────
+# `TMPDIR="/tmp/x` has no closing quote. To the listener that is simply a directory NAME beginning with
+# a quote character — never the path `/tmp/x` — so it is refused rather than turned into one.
 echo "── tmpdir: an unterminated quote is refused, not turned into a directory ──"
 fresh_pool tmpuq; reset_logs
 register pi-runner-uq
 printf 'TMPDIR="/tmp/unterminated\n' >"$RUNNER_ROOT/pi-runner-uq/.env"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-uq)"
 assert_eq "$?" "2" "an unterminated quote is cannot-act (rc 2)"
-assert_contains "$out" "cannot-act why=tmpdir-value-unterminated-quote" "naming the shape"
+assert_contains "$out" "cannot-act why=tmpdir-value-not-literal" "naming the shape"
 assert_absent "$RUNNER_ROOT/pi-runner-uq/\"" "no directory named after the stray quote was created"
 assert_eq "$(( $(listeners_for "$RUNNER_ROOT/pi-runner-uq") ))" "0" "nothing was started"
 
-# ── (10) `export TMPDIR=` IS THE SAME ASSIGNMENT TO A SOURCING SHELL ─────────────────────
-# `. ./.env` honours `export TMPDIR=…`; requiring a bare `TMPDIR=` made the assignment invisible to BOTH
-# the creation and the detection, so the directory was never made and status never reported it.
-echo "── tmpdir: 'export TMPDIR=' is honoured ──"
+# ── (10) `export TMPDIR=` IS NOT AN ASSIGNMENT TO TMPDIR ────────────────────────────────
+# ⛔ Round 2 HONOURED `export TMPDIR=…` on the false premise that `. ./.env` handles it. To the listener
+# the KEY is `export TMPDIR` (everything before the first `=`), so TMPDIR is left untouched and the
+# instance simply names none. Honouring it created a directory nothing used — and made a row look clean
+# on a value the runner never reads.
+echo "── tmpdir: 'export TMPDIR=' names no TMPDIR, and nothing is created for it ──"
 fresh_pool tmpexport; reset_logs
 register pi-runner-exp2
 printf 'export TMPDIR=%s/pi-runner-exp2/tmp\n' "$RUNNER_ROOT" >"$RUNNER_ROOT/pi-runner-exp2/.env"
 : >"$TMPLOG"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TMPDIR_LOG="$TMPLOG" run restart --name pi-runner-exp2)"
-assert_eq "$?" "0" "an exported assignment is read like any other"
-assert_contains "$out" "created tmpdir=$RUNNER_ROOT/pi-runner-exp2/tmp" "so the directory is created"
-assert_contains "$(cat "$TMPLOG")" "present $RUNNER_ROOT/pi-runner-exp2/tmp" "and the listener inherits it"
+assert_eq "$?" "0" "an 'export TMPDIR=' line is not an assignment to TMPDIR — the instance names none"
+assert_omits "$out" "created tmpdir=" "so no directory is created for a value the listener never reads"
+assert_absent "$RUNNER_ROOT/pi-runner-exp2/tmp" "and the named path was not created"
+assert_omits "$(cat "$TMPLOG")" "pi-runner-exp2/tmp" "the listener inherits no such TMPDIR from that line"
 
 # ── (11) A PREVIEW MAY NOT ANNOUNCE A START THE REAL PASS REFUSES ───────────────────────
 # ⛔ The env precondition lives in `start_listener`, i.e. DOWNSTREAM of cmd_restart's `--dry-run` return,

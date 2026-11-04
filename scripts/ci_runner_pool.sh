@@ -53,8 +53,9 @@
 #
 # ⛔ THE ENV A LISTENER INHERITS IS PART OF STARTING IT (agent-infra#2937). An instance's `.env` can
 #   name a TMPDIR (`TMPDIR=/tmp/ci-actions-runner-N` on the pi-runner VM, hand-written 2026-09-30), and
-#   NOTHING creates that directory: GitHub's `run.sh` sources `.env` and runs every job step under it,
-#   and the runner has no mkdir of its own. The instance dir is persistent and its unit is enabled, so
+#   NOTHING creates that directory: the listener loads `.env` at startup and runs every job step under
+#   it (see `instance_tmpdir` for the exact parse), and the runner has no mkdir of its own. The
+#   instance dir is persistent and its unit is enabled, so
 #   after a reboot the LISTENER survives and its TMPDIR does not — `mktemp: failed to create file via
 #   template '/tmp/ci-actions-runner-2/tmp.XXXXXXXXXX'`, exit 2, on a runner GitHub reports `online`.
 #   That presentation is the damage: jobs that use `mktemp` fail identically and jobs that do not, pass,
@@ -520,8 +521,9 @@ probe_listener() {
 }
 
 # instance_tmpdir <dir> — the TMPDIR the instance's own `.env` names, as an ABSOLUTE path, or empty
-# when it names none. ⛔ NOTHING CREATES THAT DIRECTORY (agent-infra#2937). GitHub's `run.sh` sources
-# `.env` and runs every job step under that TMPDIR; the runner has no mkdir of its own, and this tool
+# when it names none. ⛔ NOTHING CREATES THAT DIRECTORY (agent-infra#2937). The listener loads `.env`
+# (`actions/runner` src/Runner.Listener/Program.cs `LoadAndSetEnv`) and runs every job step under that
+# TMPDIR; the runner has no mkdir of its own, and this tool
 # neither wrote the `.env` nor ever looked at it. So an instance whose `.env` names a VOLATILE path
 # (`/tmp/ci-actions-runner-N`, hand-written on the pi-runner VM) keeps a HEALTHY listener across a
 # reboot while its TMPDIR is gone: the job is PICKED UP, starts, and dies in its first seconds at
@@ -542,103 +544,93 @@ probe_listener() {
 #   0, no output    · it names none (the agent-infra `ai-runner-*` shape) — nothing to create
 #   2               · CANNOT MEASURE (unreadable `.env`), or a value no shell-free read can satisfy
 #
-# ⛔ AND THE VALUE IS PARSED THE WAY A SOURCING SHELL PARSES IT, NOT LIKE A SHELL WORD (#3004 review,
-# P1 + P2). `run.sh` SOURCES `.env`, so the listener sees the EXPANDED value while a `sed` read sees
-# the raw text: `TMPDIR=$HOME/ci-tmp` had this tool create a directory literally named `$HOME` under
-# the instance dir and print `created tmpdir=…` (rc 0) over a runner that still inherited an ABSENT
-# TMPDIR — a false PASS in the exact dimension this arm adds. A value needing shell evaluation is
-# refused rather than guessed at.
-# ⛔ BUT THE REFUSAL MUST NOT TAKE LEGAL VALUES WITH IT. The first shape stripped quotes FIRST and then
-# refused the unquoted remainder for whitespace/`$`/`~`, i.e. it removed exactly the characters that
-# had made the value legal. Measured refusals on values the listener honours EXACTLY:
-# `TMPDIR="/tmp/a b"` (a quoted path with a space) and `TMPDIR='/tmp/a$b'` (single quotes are
-# literal) were both `cannot-act`, so `restart` — the remedy `status` prints — started NOTHING on a
-# legal `.env`; and `TMPDIR=/tmp/x  # scratch` was refused although an unquoted assignment ENDS at
-# the first whitespace, so `/tmp/x` is not a guess but the value. The shell's own rules:
-#   unquoted  · ends at the first whitespace (which is also where a trailing comment starts);
-#               `~` expands ONLY as the FIRST character; `$`/`` ` `` expand
-#   'single'  · everything up to the closing quote is LITERAL — nothing expands
-#   "double"  · spaces are part of the value; `$`/`` ` `` expand; `~` does not
-# Anything whose meaning depends on evaluation is refused, naming the value and the remedy.
+# ⛔ AND THE VALUE IS PARSED THE WAY THE LISTENER PARSES IT — VERIFIED AT THE SOURCE, NOT ASSUMED
+# (#3004 review round 5, P1). `actions/runner` src/Runner.Listener/Program.cs `LoadAndSetEnv()` is the
+# ONLY consumer of `.env` (`run.sh` never sources it; no unit carries `EnvironmentFile=`), and it is
+# NOT a shell:
+#     var separatorIndex = env.IndexOf('=');
+#     string envKey   = env.Substring(0, separatorIndex);
+#     string envValue = env.Substring(separatorIndex + 1);
+#     Environment.SetEnvironmentVariable(envKey, envValue);
+# KEY = everything before the FIRST `=`, VALUE = everything after it, BOTH VERBATIM: no quote
+# stripping, no comment handling, no `$`/backtick expansion, no whitespace trimming, and
+# `export TMPDIR=…` is NOT an assignment to TMPDIR (its key is `export TMPDIR`). The LAST such line
+# wins, and an EMPTY value UNSETS the variable (the `envValue = null` arm).
+# ⛔ THE SHAPE THIS REPLACED MODELLED A SOURCING SHELL, AND THE LISTENER IS NOT ONE. It stripped quotes
+# and cut an unquoted value at its first whitespace, so `TMPDIR="/tmp/a b"` created `/tmp/a b` and
+# `TMPDIR=/tmp/x  # scratch` created `/tmp/x`, while the listener's TMPDIR was the literal
+# `"/tmp/a b"` / `/tmp/x  # scratch` — neither of which existed. `restart` printed `created tmpdir=…`
+# (rc 0) and `status` called the row clean, over a directory NO JOB USES: a false PASS in the exact
+# dimension this arm adds. It was found by reading the runner's source rather than by reasoning from
+# bash — and it means the earlier rounds' "values the listener honours EXACTLY" were never legal paths
+# at all, only strings the sourcing model invented.
+# ⛔ THE REFUSAL IS STILL THE FAIL-CLOSED DIRECTION. A verbatim value carrying shell-quoting syntax (a
+# quote, `$`, a backtick, a backslash), leading/trailing whitespace, a comment-shaped `# …`, or a
+# control character is almost certainly a `.env` written for a shell that will never read it, so it is
+# `cannot-act` — naming the value the listener would ACTUALLY use — rather than a directory fabricated
+# from it. A value meant literally still works: an interior space (`TMPDIR=/tmp/a b`) is one legal
+# absolute path and is created verbatim.
 instance_tmpdir() {
-  local d="$1" raw t rest
+  local d="$1" raw
   [ -f "$d/.env" ] || return 0
   # An EXISTING but unreadable `.env` is cannot-measure. `-r` is the read this function actually does
   # (and it is FALSE for a mode-000 file, which `-f` alone happily accepts).
   [ -r "$d/.env" ] || { err "cannot-measure why=tmpdir-unreadable path=$d/.env"; return 2; }
-  # LAST assignment wins, which is what a shell sourcing the file would do. `export TMPDIR=…` is
-  # honoured too — `. ./.env` accepts it, so requiring a bare `TMPDIR=` made a legal .env invisible to
-  # BOTH the creation and the detection. The `2>/dev/null` is gone on purpose: a read that failed must
-  # be visible, not silently equal to "names none".
-  raw="$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}TMPDIR=//p' "$d/.env" | tail -n 1)" || return 2
-  raw="${raw%$'\r'}"   # a `.env` edited on a CRLF host would otherwise name a path with a CR in it
-  # ⛔ ANY SHELL SYNTAX THIS PARSER DOES NOT MODEL IS REFUSED UP FRONT, because truncating at it would
-  # silently create a DIFFERENT directory and report `created tmpdir=…` over the real one's absence.
-  # Measured on the round-2 shape, each accepted with rc 0 and the WRONG path created:
-  #   `TMPDIR=/tmp/x/a\ b`      → created `a\`      (the shell's value is `/tmp/x/a b`)
-  #   `TMPDIR=/tmp/x/x; echo hi` → created `x;`      (the shell's value is `/tmp/x/x`)
-  #   `TMPDIR="/tmp/a\"b"`       → created `/tmp/a\`   (the shell's value is `/tmp/a"b`)
-  #   `TMPDIR='/tmp/a'x`         → created `/tmp/a`  (adjacent segments concatenate: `/tmp/ax`)
-  # A backslash, a command separator, a redirection or a subshell is EVALUATION, and evaluation is the
-  # one thing this function may not do (`.env` is another user's file; `status` may run as root). So the
-  # presence of any of them is `cannot-act` — refused, never guessed at (#3004 review round 3, P1).
+  # ⛔ THE LISTENER'S OWN PARSE, NOT A SHELL'S (see the header; verified at the source). The LAST line
+  # whose key is EXACTLY `TMPDIR` wins, and its value is everything after the FIRST `=`, VERBATIM.
+  # `\r` is stripped per line because `File.ReadAllLines` splits a CRLF file into lines WITHOUT the
+  # terminator — keeping the CR would name a path with a CR in it. An EMPTY value makes the listener
+  # call `SetEnvironmentVariable(key, null)`, i.e. UNSET, which is indistinguishable here from "names
+  # none": either way there is nothing to create.
+  #
+  # ⛔ NO SED ANY MORE, ON PURPOSE. The previous read was a `sed -n 's/^\(export…\)\?TMPDIR=//p'`, i.e.
+  # it ACCEPTED `export TMPDIR=` and LEADING WHITESPACE before the key. To the listener both of those
+  # are keys named `export TMPDIR` / `  TMPDIR`, so TMPDIR is left untouched — yet the tool created a
+  # directory for the value and printed `created tmpdir=…`. `index($0,"=")` splitting at the FIRST `=`
+  # is the listener's own rule; awk is used rather than sed because the value may contain the `#`,
+  # `;`, `&` and `\` that sed's replacement syntax would rewrite.
+  raw="$(awk '{sub(/\r$/,"")} {i=index($0,"="); if (i>0) {k=substr($0,1,i-1); if (k=="TMPDIR") {found=1; v=substr($0,i+1)}}} END{if (found) printf "%s", v}' "$d/.env")" || return 2
+  [ -n "$raw" ] || return 0
+  # ⛔ REFUSED, NEVER FABRICATED FROM. A verbatim value carrying shell-quoting syntax is almost
+  # certainly a `.env` written for a shell that will never read it: quote characters, `$`, a backtick
+  # and a backslash are NOT interpreted by the listener, so they are part of the directory NAME.
+  # Creating a directory called `"/tmp/a b"` (quotes included) WOULD make the listener work, but it
+  # silently "repairs" a value nobody meant and then `status` calls the row clean — so this is
+  # `cannot-act`, naming the value the listener would ACTUALLY use (#3004 review round 5, P1).
   case "$raw" in
-    *'\'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*)
-      err "cannot-act why=tmpdir-value-not-literal value=$raw (named by $d/.env) — the value contains shell syntax (a backslash, a separator, a redirection or a subshell) that only EVALUATION could resolve, and this tool will not evaluate another user's .env; write a plain absolute path in $d/.env"
+    *'"'*|*"'"*|*'`'*|*'$'*|*'\'*)
+      err "cannot-act why=tmpdir-value-not-literal value=$raw (named by $d/.env) — the listener reads .env by splitting at the FIRST '=' and using the rest VERBATIM (actions/runner Program.cs LoadAndSetEnv): it does not strip quotes, expand \$, or interpret a backslash, so this value IS the literal directory name it would use, quote characters and all. Creating that would repair a path nobody meant; write one plain absolute path in $d/.env"
+      return 2 ;;
+  esac
+  # ⛔ AND SHELL METACHARACTERS ARE REFUSED TOO. The listener does not interpret them either, so they
+  # would be literal path characters — but a `.env` carrying `;`, `&`, `|`, a redirection or a subshell
+  # was written for a shell that will never read it, and a directory named `/tmp/x; echo hi` is not a
+  # path anybody meant. Refusing (fail-closed) hands the operator the real value instead.
+  case "$raw" in
+    *';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'('*|*')'*)
+      err "cannot-act why=tmpdir-value-not-literal value=$raw (named by $d/.env) — the listener does not interpret a command separator, a redirection or a subshell: it takes the text VERBATIM, so this value IS a directory name carrying that syntax. A .env written that way means a shell was expected; write one plain absolute path in $d/.env"
+      return 2 ;;
+  esac
+  # ⛔ WHITESPACE IS PART OF THE VALUE — the listener does not trim. `TMPDIR=/tmp/x ` names `/tmp/x `
+  # (one trailing space), so creating `/tmp/x` would leave the listener's own path absent.
+  case "$raw" in
+    [[:space:]]*|*[[:space:]])
+      err "cannot-act why=tmpdir-value-verbatim-whitespace value=[$raw] (named by $d/.env) — the listener does NOT trim, so this leading/trailing whitespace is part of the directory name it uses; remove it in $d/.env"
+      return 2 ;;
+  esac
+  # ⛔ `#` IS NOT A COMMENT TO THE LISTENER. `TMPDIR=/tmp/x  # scratch` names `/tmp/x  # scratch`, so
+  # creating `/tmp/x` (what a sourcing shell would name) is exactly the false PASS this arm replaces.
+  case "$raw" in
+    *[[:space:]]#*)
+      err "cannot-act why=tmpdir-value-not-literal value=$raw (named by $d/.env) — the listener does not treat '#' as a comment, so this value IS the directory name, comment text included; remove the comment and write one plain absolute path in $d/.env"
       return 2 ;;
   esac
   case "$raw" in
-    \'*)
-      # A closing quote is part of the value's MEANING — without it the string written is not the path
-      # the listener resolves, so an unterminated one is refused rather than turned into a directory.
-      case "${raw#\'}" in
-        *\'*) t="${raw#\'}"; rest="${t#*\'}"; t="${t%%\'*}" ;;
-        *) err "cannot-act why=tmpdir-value-unterminated-quote value=$raw (named by $d/.env) — single quotes are taken LITERALLY by the listener, so nothing but a closing quote makes this a path; write the path, or close the quote, in $d/.env"
-           return 2 ;;
-      esac ;;
-    \"*)
-      case "${raw#\"}" in
-        *\"*) t="${raw#\"}"; rest="${t#*\"}"; t="${t%%\"*}" ;;
-        *) err "cannot-act why=tmpdir-value-unterminated-quote value=$raw (named by $d/.env) — a double-quoted value ends at its closing quote, so this names no path; write the path, or close the quote, in $d/.env"
-           return 2 ;;
-      esac
-      # INSIDE double quotes a `$` or a backtick IS expanded by the sourcing listener, so it still
-      # cannot be honoured from the raw text; a space or a `~` inside them is LITERAL.
-      case "$t" in
-        *'$'*|*'`'*)
-          err "cannot-act why=tmpdir-value-not-literal value=$raw (named by $d/.env) — the listener SOURCES .env, so this value is expanded there and cannot be satisfied from the raw text; write a literal absolute path in $d/.env"
-          return 2 ;;
-      esac ;;
-    *)
-      t="${raw%%[[:space:]]*}"   # an unquoted assignment ENDS at the first whitespace
-      rest="${raw#"${raw%%[[:space:]]*}"}"
-      # ⛔ A QUOTE INSIDE AN UNQUOTED VALUE IS STILL QUOTING SYNTAX, and a sourcing shell would USE it:
-      # `/tmp/x/adj'x` is `/tmp/x/adjx` to the listener. Unmodelled, it was accepted verbatim and the
-      # tool created a directory whose name carries the quote (#3004 review round 3, P1).
-      case "$t" in
-        *"'"*|*'"'*|'~'*|*'$'*|*'`'*)
-          err "cannot-act why=tmpdir-value-not-literal value=$t (named by $d/.env) — the listener SOURCES .env, so this value is expanded there and cannot be satisfied from the raw text; write a literal absolute path in $d/.env"
-          return 2 ;;
-      esac ;;
+    *[[:cntrl:]]*)
+      err "cannot-act why=tmpdir-value-not-literal value=[$raw] (named by $d/.env) — the value carries a control character, which cannot be a directory this tool creates; write one plain absolute path in $d/.env"
+      return 2 ;;
   esac
-  # ⛔ WHAT FOLLOWS THE VALUE MUST BE BLANK OR A COMMENT. Anything else is a second shell word that a
-  # sourcing shell would either CONCATENATE (`'/tmp/a'x` → `/tmp/ax`) or run (`… ; rm -rf /`), and this
-  # parser models neither — so it refuses rather than create the path it happened to read (#3004
-  # review round 3, P1). ⛔ AND `#` IS ONLY A COMMENT AT THE START OF A WORD: for a QUOTED value `rest`
-  # begins immediately after the closing quote, so `'/tmp/a'#x` has `#x` CONCATENATED into the word
-  # (`/tmp/a#x`) and is NOT a comment — accepting it created the truncated `/tmp/a` and reported
-  # `created tmpdir=…` over the listener's absent path (#3004 review round 4, P1). Hence: blank, or
-  # WHITESPACE followed by nothing-or-comment. Never `#` with no whitespace before it.
-  case "$rest" in
-    '') : ;;
-    [[:space:]]*) case "${rest#"${rest%%[![:space:]]*}"}" in ''|'#'*) : ;; *)
-        err "cannot-act why=tmpdir-value-trailing-syntax value=$raw (named by $d/.env) — a sourcing shell would CONCATENATE or EXECUTE what follows the value (${rest}), so the path this tool read is not the path the listener uses; write one plain absolute path in $d/.env"
-        return 2 ;; esac ;;
-    *) err "cannot-act why=tmpdir-value-trailing-syntax value=$raw (named by $d/.env) — a sourcing shell would CONCATENATE or EXECUTE what follows the value (${rest}), so the path this tool read is not the path the listener uses; write one plain absolute path in $d/.env"
-       return 2 ;;
-  esac
-  [ -n "$t" ] || return 0
-  case "$t" in /*) printf '%s' "$t"; return 0 ;; esac
+  case "$raw" in /*) printf '%s' "$raw"; return 0 ;; esac
   # ⛔ A RELATIVE VALUE IS REFUSED, NOT RESOLVED (#3004 review, P2). This arm used to create
   # `$d/<value>`, on the claim that `run.sh` `cd`s into the instance dir before the listener reads the
   # variable. That is true of the READ and false at USE: the listener hands the env to each JOB, whose
@@ -647,7 +639,7 @@ instance_tmpdir() {
   # `created tmpdir=…`, exited 0, and `status` called the row clean: a false PASS in the exact
   # dimension this arm adds. Nothing here can make a relative value true (the value is the listener's,
   # not ours — rewriting another tool's `.env` is not this function's to do), so it is refused.
-  err "cannot-act why=tmpdir-value-relative value=$t (named by $d/.env) — a relative TMPDIR is resolved against each JOB's working directory (_work/<repo>/<repo>), not the instance dir, so no directory created here would be the one a job uses; write an absolute path in $d/.env"
+  err "cannot-act why=tmpdir-value-relative value=$raw (named by $d/.env) — a relative TMPDIR is resolved against each JOB's working directory (_work/<repo>/<repo>), not the instance dir, so no directory created here would be the one a job uses; write an absolute path in $d/.env"
   return 2
 }
 
