@@ -624,13 +624,17 @@ chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # ⛔ A STUB, NOT THE SHIPPED FILE: the shipped `capacity.sh` reads THIS HOST's process population, and
 # a busy runner would then refuse 73 (fork) before the gate an arm names ever ran. The arithmetic has
 # its own suite (`capacity-placement.test.sh`); here the instrument only has to be PRESENT and HEALTHY.
-# ⛔ ONE DEFINITION, EVERY RIG THAT COPIES THE GATE (§11's `$RES` is the second caller). The `$RES` rig
-# copies `spawn-gate.sh` into a directory that holds no harness, drives the REAL `run_agent`, and seeds
-# its validator — but NOT this instrument. With the floor as a refusal, that copy answers 81 (nodeploy)
-# BEFORE the capability resolver the arm exists to exercise ever runs, so the arm reported the SPREAD OF
-# THE INSTRUMENT as a capability-gate behaviour. It read green on a box whose ambient `AGENT_INFRA_PATH`
-# or `~/orchestrator` happened to supply the file and red on the runner, which is the same host-decides
-# class as the round-3 HOME fix and the §9 `_rigmiss` loop. Two heredocs would drift; one seeder cannot.
+# ⛔ ONE DEFINITION FOR EVERY RIG IN THIS FILE THAT COPIES THE GATE (§10's `$RES`, below, is the second
+# caller; §11 is the DISK gate). The `$RES` rig copies `spawn-gate.sh` into a directory that holds no
+# harness, drives the REAL `run_agent`, and seeds its validator — but NOT this instrument. With the floor
+# as a refusal, that copy answers 81 (nodeploy) BEFORE the capability resolver the arm exists to
+# exercise ever runs, so the arm reported the SPREAD OF THE INSTRUMENT as a capability-gate behaviour. It
+# read green on a box whose ambient `AGENT_INFRA_PATH` or `~/orchestrator` happened to supply the file
+# and red on the runner, which is the same host-decides class as the round-3 HOME fix and the §9
+# `_rigmiss` loop. Two heredocs in ONE file would drift; one seeder cannot.
+# ⛔ CROSS-FILE: `wip-rescue-exit.test.sh`'s non-vacuity mutant is the same half-deployed box and carries
+# its own copy of this stub (a suite cannot source another suite — it would RUN it), so the two
+# definitions must stay in step: the same three functions, the same fixed HEALTHY readings.
 seed_capacity_instrument() { # seed_capacity_instrument <dir holding a gate copy>
   cat > "$1/capacity.sh" <<'CAPEOF'
 # Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
