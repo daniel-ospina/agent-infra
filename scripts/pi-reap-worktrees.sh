@@ -3050,7 +3050,8 @@ abstain_gate() {
 #
 # TWO PROBES, and the second exists because the first can be silent:
 #   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
-#       fixture drives (G15a/G15j/G15k/G15l). Accepted in EITHER direction, because the record
+#       DISCRIMINATING fixture drives: `$HARNESS_PIN_FILE` G15j · `$CELL_HOME` G15n · `$HOME`
+#       G15k/G15l · derived-from-the-sha-record G15m. Accepted in EITHER direction, because the record
 #       names a DESCENDANT of the worktree (`<tree>/scripts/orchestrator-harness`). ⛔ THESE FOUR
 #       ARE NOT AN EXHAUSTIVE SET OF ROOTS and the code does not claim they are: a `.harness-path`
 #       under a fifth root is a SILENT MISS here (the residual, measured and named by

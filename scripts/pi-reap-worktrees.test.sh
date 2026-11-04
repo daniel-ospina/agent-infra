@@ -919,9 +919,10 @@ ANCHORS = {
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees$(printf \x27%s\x27 \"$REPO_CANON\" | cksum | cut -d\x27 \x27 -f1).offset\"",
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees.offset\"   # MUTANT: the per-repo key dropped",
     ),
-    # ── G15 (the harness pin-tree veto, #10114) ── five anchors, one per INPUT of the veto. The veto
-    # shipped with no mutation leg at all, and that is precisely how two of its assertions passed
-    # vacuously through three recorded clean reviews.
+    # ── G15 (the harness pin-tree veto, #10114) ── six anchors, one per INPUT of the veto (the record
+    # probe, the shape backstop, the `$HOME` guard, the sha-record derivation, the QUOTING of the
+    # `$HOME` element, and the `$CELL_HOME` element). The veto shipped with no mutation leg at all, and
+    # that is precisely how two of its assertions passed vacuously through three recorded clean reviews.
     # (1) delete the RECORD-BASED probe entirely, leaving the shape backstop. The row then reads
     # `reason=pin-tree-shape`, which a prefix match on `reason=pin-tree` ACCEPTS — so before the
     # exact-token assertion this mutant left G15a green.
