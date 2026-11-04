@@ -936,15 +936,15 @@ def main():
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
         return 1
     if census_note:
-        # ⛔ REPORTED, NOT DEGRADED TO A WARNING. A census note means the rows above are NOT a
-        # verdict — either some lanes reached none (INCOMPLETE), or a COMPLETE roster is
-        # contradicted by the population (STALE ROSTER / UNVERIFIED) — and it must reach a
-        # scheduler the same way the unreadable store above does (a census that prints rows and
-        # exits 0 is exactly the false PASS this guards).
-        # ⛔ …and it deliberately no longer says "some lanes did not reach a conclusive verdict":
-        # that was TRUE only while a note could mean one thing, and the all-dead arm now reaches
-        # here with EVERY lane conclusive (review cycle 13). A rationale narrower than the set of
-        # states it explains teaches the next editor the exact coupling cycles 7-9 removed.
+        # ⛔ REPORTED, NOT DEGRADED TO A WARNING: a census note means the scan is NOT a clean result,
+        # and it must reach a scheduler the same way the unreadable store above does — a census that
+        # prints rows and exits 0 is exactly the false PASS this guards.
+        # ⛔ THIS BRANCH DELIBERATELY CHARACTERISES NOTHING. What KIND of note it is, and what that
+        # kind says about the rows, is `lane_census`'s own docstring; the word and tail printed below
+        # come from `census_exit_verdict`. Every attempt to summarise those states here in one
+        # sentence has been false for at least one of them ("some lanes did not reach a conclusive
+        # verdict" — untrue of STALE ROSTER; "contradicted by the population" — untrue of UNVERIFIED,
+        # whose population was never read), so the summary is gone rather than re-worded.
         # ⛔ AND IT NAMES THE NUMBER IT ACTUALLY HAS (review cycle 3, finding 2): the line used to
         # read "0 rostered lanes measured" for EVERY note, including a partial mismatch where 1-6
         # lanes WERE established — telling an operator the census established nothing when it had.
