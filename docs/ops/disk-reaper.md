@@ -557,8 +557,8 @@ headroom.
   (`l2` the owner's census, `l3` the entry point's mapping), because either half alone leaves one
   surface lying.
   ⛔ **AND THE ABSTENTION IS ONLY THE *TOTAL* CASE — a PARTLY-unreadable population is the same hole one
-  state over (#3057 review, P1).** `census=abstained` is gated on `candidates=0`, so a pass that READ one
-  root and could not read another published `census=ok`, and the entry point lifted it as
+  state over (#3057 review, P1).** `census=abstained` WAS gated on `candidates=0` at that head, so a pass
+  that READ one root and could not read another published `census=ok`, and the entry point lifted it as
   `verdict_runner_work=ok`. MEASURED on two roots — one readable holding a dead checkout, one mode-0111
   holding a dead checkout: `roots=2 candidates=1 unmeasurable=1 census=ok` ⇒ record
   `{candidates=1, unmeasurable=1, verdict=ok}`. That is the LIKELY shape on a real cell, not a corner: the
@@ -1327,7 +1327,7 @@ reaps" was false in each clause. What was actually missing, stated so a reader c
 `--print-status` — the field's only READER — had **no assertion at all** anywhere in the suite (the only
 `print-status` reference in `runner-work.test.sh` is the one added at this revision). So it now reads `ok`
 on case (b)'s reaping pass (measured at this head), `--print-status` is asserted to RENDER it, and deleting
-the record line turns case (b) red: that mutation is (b)'s second, counted among the 30 above.
+the record line turns case (b) red: that mutation is (b)'s second, counted among the 31 above.
 The classes suite was **killed at 30 minutes with no result** on the box that measured this PR (load
 180–220), so at that point the record-field delta was **unmeasured** and a green run of the owner-level
 suite below could not be read as covering it. It was then **run to completion at load ~15 on the same
