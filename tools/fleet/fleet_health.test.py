@@ -27,8 +27,9 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
   * neuter the lane-census reconciliation      -> 5 paired CENSUS reds (the fifth is the
                                                  exit-code check), plus collateral reds in the
-                                                 other census checks (measured 16 total, up from
-                                                 14 when the stale-roster arm was pinned)
+                                                 other census checks (measured 24 total, up from
+                                                 14 when the stale-roster and UNVERIFIED arms
+                                                 were pinned)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -512,6 +513,7 @@ def leg_lane_census(mod):
         "CENSUS: a live, attributed lane reconciles the populations",
         "CENSUS: an all-dead roster on a box with NO pi running is an idle fleet, not a stale roster",
         "CENSUS: an all-dead roster while pi RUNS is a STALE ROSTER — the roster names none of the population",
+        "CENSUS: an all-dead roster over an UNREADABLE table is UNVERIFIED, never clean",
     )
     # ⛔ A MISSING FUNCTION IS A RED, NOT A TRACEBACK. The pre-fix module has no `lane_census`,
     # and this suite must report that as failed checks so the red control can key on the ❌
@@ -554,9 +556,18 @@ def leg_lane_census(mod):
         # while pi runs is a mismatch too, so "some lane is dead" can never be the silent trigger.
         check(bool(fn(0, 6, 18, 7)) and "MISMATCH" in fn(0, 6, 18, 7),
               "CENSUS: a mostly-dead roster while pi runs still alarms")
-        # ... while an all-dead roster on an UNREADABLE table adds nothing the verdicts lack.
-        check(fn(0, 7, None, 7) is None,
-              "CENSUS: an all-dead roster with an UNREADABLE table is resolved, not UNRECONCILED")
+        # ... while a MEASURED-EMPTY table means nothing is running, so the resolved roster misleads
+        # nobody.
+        check(fn(0, 7, 0, 7) is None,
+              "CENSUS: an all-dead roster with a MEASURED-EMPTY table is a resolved idle fleet")
+        # ⛔ AN UNREADABLE TABLE IS NOT A MEASURED ZERO, NOT EVEN HERE (review cycle 8, finding 1).
+        # This check used to assert `fn(0, 7, None, 7) is None` — and that PINNED A FAIL-OPEN: on a
+        # host whose `ps` degrades, an all-dead roster printed `✅ no suspects` with no census line,
+        # while the same box with a working `ps` printed STALE ROSTER. The read FAILING flipped
+        # ALARM into CLEAN. `None` means an idle fleet and a stale roster are indistinguishable,
+        # which is a state to NAME (R2: "no clean claim"), never one to call clean.
+        unverified = fn(0, 7, None, 7)
+        check(bool(unverified) and "UNVERIFIED" in unverified, PREDICATE[7])
 
     # ⛔ THE PRODUCER'S OWN CONTRACT — `pi_process_count()` — was stubbed by this leg and pinned
     # by nothing, the same producer-contract gap this lane closed for `beta-progress.gh()`: a
@@ -688,6 +699,29 @@ def leg_lane_census(mod):
           "CENSUS: an unreadable process table is never rendered as a clean scan")
     check(rc_abs == 1,
           "CENSUS: an unreconcilable census exits non-zero, so a scheduler can see it")
+
+    # ── end-to-end: an ALL-DEAD roster must not read as a clean scan ────────────────
+    # ⛔ THE PREDICATE ARMS ABOVE WERE ALL GREEN THROUGH BOTH OF CYCLES 7 AND 8's P1s, because the
+    # bypass was reachable only through `main()`: seven `PID DEAD` rows, no census line,
+    # `✅ no suspects`. Pinned end-to-end for BOTH populations, because the population is exactly
+    # what the verdict turns on and the read failing is what flipped ALARM into CLEAN.
+    DEAD_PID = 99999999          # beyond any plausible pid_max; the probe must read it ABSENT
+    check(mod._observed(DEAD_PID, 1000000000) == "absent",
+          "CENSUS: PRECONDITION: the all-dead fixture's pid reads ABSENT through the real probe")
+    dead_recs = [{"sessionId": sid, "pid": DEAD_PID, "pidStartSeconds": 1000000000,
+                  "agentLifecycle": "idle"} for _, sid in mod.LANES]
+    rc_stale, out_stale = _drive(lambda: 18, records=dead_recs)
+    check("LANE CENSUS STALE ROSTER" in out_stale,
+          "CENSUS: main() names a STALE ROSTER when every lane is DEAD while pi runs")
+    check("no suspects" not in out_stale,
+          "CENSUS: an all-dead roster never prints a clean scan while pi runs")
+    check(rc_stale == 1, "CENSUS: the stale-roster scan exits non-zero")
+    rc_unv, out_unv = _drive(lambda: None, records=dead_recs)
+    check("LANE CENSUS UNVERIFIED" in out_unv,
+          "CENSUS: …and an UNREADABLE table makes the same roster UNVERIFIED, never clean")
+    check("no suspects" not in out_unv,
+          "CENSUS: an unreadable table never turns an all-dead roster into a clean scan")
+    check(rc_unv == 1, "CENSUS: the unverified scan exits non-zero")
 
     # ⛔ THE CYCLE-2 DEFECT ITSELF (review cycle 3, finding 1): a rostered lane whose record is
     # PRESENT but whose identity read ABSTAINS (a live pid and no `pidStartSeconds` -> the row
