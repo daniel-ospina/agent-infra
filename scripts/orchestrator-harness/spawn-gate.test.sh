@@ -358,23 +358,51 @@ function selfdefault(nm, rhs,   m, head) {
 # does NOT comment (measured) while `(echo a)# hi` does, and an ambiguous case must resolve to KEEPING
 # the text — over-keeping is a false RED (visible, and what the previous round complained about),
 # while over-stripping is a false GREEN (the fail-open this arm exists to prevent).
-function strip_comment(s,   i, n, c, q, p) {
-  n = length(s); q = ""
+# ⛔ THE QUOTE MODEL ALONE WAS STILL FAIL-OPEN (review of `f756d31b`, P1 — three measured shapes), because
+# it answered "is this `#` in a quote" from a WHOLE-PHYSICAL-LINE, quote-local state and knew nothing of
+# the constructs around it. Each shape below put a `#` that is NOT an outer comment on the same line as
+# (or the continuation line of) a real duplicate of the skew code, and the strip deleted the declaration:
+#   1. ANSI-C quoting `$'it\'s # here'` — `\'` IS an escape inside `$'…'`, so the quote closed early and
+#      the following ` #` was read as a comment. (In plain `'…'` nothing escapes, and that stays true.)
+#   2. a BACKTICK substitution — ``X=`printf %s 83 # c` `` — that `#` comments the INNER command only, and
+#      the outer line continues after the closing backtick.
+#   3. a quote OPENED on one line and CLOSED on the next — awk is line-based, so the continuation line's
+#      `#` looked unquoted. Measured through this predicate: all three gave 0 rows for the name and RC=0
+#      GREEN, while bash assigns 83 in every one (verified against the shell).
+# So the state is a STACK, carried ACROSS LINES per file (reset at FNR == 1) and nesting-aware, and a
+# `#` is stripped only in the OUTERMOST unquoted context — the only context where it really is this
+# line's comment. An unrecognised construct leaves text in place, which is the safe direction.
+SQ[0] = ""
+function strip_comment(s,   i, n, c, p) {
+  n = length(s)
   for (i = 1; i <= n; i++) {
     c = substr(s, i, 1)
-    if (q == "") {
-      if (c == "\\") { i++; continue }        # an unquoted backslash escapes the next character
-      if (c == "\"") { q = "\""; continue }
-      if (c == "'")  { q = "'";  continue }
+    if (SQ[SD] == "") {
+      if (c == "\\")  { i++; continue }                       # an unquoted backslash escapes the next char
+      if (c == "`")   { SD++; SQ[SD] = "bt";   continue }      # command substitution — a NESTED context
+      if (c == "\"")  { SD++; SQ[SD] = "dq";   continue }
+      if (c == "'")   { SD++; SQ[SD] = (((i > 1) && substr(s, i - 1, 1) == "$") ? "ansi" : "sq"); continue }
       if (c == "#") {
         p = (i == 1) ? "" : substr(s, i - 1, 1)
         if (i == 1 || p ~ /[ \t;(]/) return substr(s, 1, i - 1)
       }
-    } else if (q == "\"") {
-      if (c == "\\") { i++; continue }        # …and inside `"…"` it still does
-      if (c == "\"") q = ""
-    } else {
-      if (c == "'") q = ""                    # inside `'…'` NOTHING escapes
+    } else if (SQ[SD] == "dq") {
+      if (c == "\\")  { i++; continue }                       # …and inside `"…"` it still does
+      if (c == "`")   { SD++; SQ[SD] = "bt"; continue }
+      if (c == "\"")  { if (SD > 0) SD--; continue }
+    } else if (SQ[SD] == "bt") {
+      if (c == "\\")  { i++; continue }
+      if (c == "`")   { if (SD > 0) SD--; continue }
+      # ⛔ A `#` INSIDE BACKTICKS IS NOT THIS LINE'S COMMENT. It comments the INNER command, and an
+      # inner comment runs to the end of the PHYSICAL LINE while the OUTER line carries on after the
+      # closing backtick — so stripping here would delete code that still runs. Measured: with the
+      # strip applied, a duplicate of 83 after such a backtick read GREEN with 0 rows while bash sets
+      # 83. Keeping the text is the fail-closed direction.
+    } else if (SQ[SD] == "sq") {
+      if (c == "'")   { if (SD > 0) SD--; continue }          # inside `'…'` NOTHING escapes…
+    } else if (SQ[SD] == "ansi") {
+      if (c == "\\")  { i++; continue }                       # …but `$'…'` (ANSI-C) DOES honour `\'`
+      if (c == "'")   { if (SD > 0) SD--; continue }
     }
   }
   return s
@@ -384,6 +412,7 @@ function row(kind, name, v, f, ln) {
   else           print "unknown", name, v, f, ln
 }
 {
+  if (FNR == 1) { SD = 0; SQ[0] = "" }       # quote state is PER FILE, never carried between files
   if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
   f = basename(FILENAME)
   s = $0
@@ -2617,6 +2646,35 @@ printf '\nread -r AGENT_NEW_GATE_REFUSED_CHOICE; AGENT_NEW_GATE_REFUSED=83\n' >>
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
 ck "(name boundary, other direction) a real declaration AFTER a longer identifier on the same line is still READ and collides — stepping over the identifier must not stop the scan (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1f) ⛔ THE COMMENT STRIP STILL FAILED OPEN ON THREE CONSTRUCTS (review of `f756d31b`, P1 — each
+# measured through this predicate and confirmed against the shell). A quote-local, whole-line state knew
+# nothing of the construct AROUND the `#`, so in every row below a real duplicate of 83 read GREEN with 0
+# rows while bash assigns 83:
+#   1. ANSI-C quoting `$'\''…'` — `\'` IS an escape inside `$'…'`, so the quote closed early;
+#   2. a BACKTICK substitution — a `#` in it comments the INNER command only, and the outer line continues
+#      after the closing backtick;
+#   3. a quote OPENED on one line and CLOSED on the next — awk is line-based.
+# The strip is now a nesting-aware STACK carried across lines per file, and a `#` is removed only in the
+# outermost unquoted context. Three DRIVEN arms, one per construct — a regression in any one fails here.
+_codemut_dir="$(_codemut comment-ansi-c)"
+# A quoted heredoc, so the fixture is the LITERAL line bash would run — no printf escaping to get wrong.
+cat >> "$_codemut_dir/spawn-gate.sh" <<'PR_ANSI_C_ARM'
+true && echo $'it\'s # here' && AGENT_NEW_GATE_REFUSED=83
+PR_ANSI_C_ARM
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote model: ANSI-C) a declaration after a \$'...' string that contains an ESCAPED QUOTE and a \`#\` is still READ — a quote-local model closes the quote at the escaped one and reads this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-backtick)"
+printf '\nX=`printf %%s 83 # c` && AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote model: backtick) a declaration after a BACKTICK substitution carrying a \`#\` is still READ — that \`#\` comments the INNER command only, so stripping here deletes code that runs (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-multiline-quote)"
+printf 'echo "usage: x\nb # c" && AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote model: across lines) a declaration after a quote CLOSED on that line, when the quote was OPENED on the previous one, is still READ — awk is line-based, so per-line state read this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f) THE FAIL-CLOSED HALF: an assignment OPERATOR on a family token that is NOT in a declaration
 # position cannot be classified, so it must be RED and NAMED WITH ITS LINE — never dropped. This is the
