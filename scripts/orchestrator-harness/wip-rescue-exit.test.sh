@@ -585,6 +585,60 @@ O="$TMP/archO" bash -c '
 grep -q 'git fetch origin refs/wip/fix-x' "$TMP/arch.next" 2>/dev/null \
   && ! grep -q 'git fetch' "$TMP/none.next" 2>/dev/null; rcn13=$?
 ck "N13 …a dirty tree WITH an archive gets the fetch of the ref it names; rescue=nothing gets none" $rcn13
+# ⛔ N14 — THE NETWORK BUDGET IS PINNED TO THE CODE, NOT TO PROSE (review cycle 4, gap 1: this claim
+# regressed TWICE by hand — the function comment, then the README — with the suite green both times).
+# A static scan is the right instrument here: no behavioural arm can see a bound that was widened.
+n_bound=$(grep -c 'tb_timeout 15 git -C "$root" push' "$GATE" 2>/dev/null)
+n_sym=$(grep -c 'tb_timeout 15 git -C "$root" ls-remote --symref' "$GATE" 2>/dev/null)
+n_ver=$(grep -c 'tb_timeout 5 git -C "$root" ls-remote --heads' "$GATE" 2>/dev/null)
+[ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
+  && ! grep -E 'git -C "\$root" push' "$GATE" 2>/dev/null | grep -qv 'tb_timeout'; rcn14=$?
+ck "N14 …all three network calls are BOUNDED (15/15/5) and no unbounded push exists in the exit path" $rcn14
+# ⛔ N15 — THE HUB REFUSAL IS READ, NOT INHERITED (review cycle 4, gap 3: F7 executes the shape but no arm
+# ever greps `refused-main-checkout`, so deleting the block left the suite green — the merge-gate bypass
+# the comment names, undetected).
+chk_hub=$(awk '/^lane_end_push\(\)/,/^}/' "$GATE" 2>/dev/null | grep -c 'LANE_END_PUSH="refused-main-checkout"')
+[ "$chk_hub" = 1 ] && grep -q 'rev-parse --git-dir' "$GATE" 2>/dev/null \
+  && grep -q 'rev-parse --git-common-dir' "$GATE" 2>/dev/null; rcn15=$?
+ck "N15 …a hub checkout (git-dir == git-common-dir) is refused BY NAME in lane_end_push, not merely skipped by luck" $rcn15
+# ⛔ N16 — THE CLONE-REF LEG OF THE LANDING CHECK (review cycle 4, gap 2): with the remote's own answer
+# unavailable, a clone whose refs/remotes/origin/HEAD still names the renamed default must refuse THAT name.
+git -C "$WT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk 2>/dev/null
+pi_stub unpushed_landing
+: > "$O/logs/cloneref.log"
+PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
+  . "$1"; cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "clone ref leg" >>"$4.agent" 2>&1
+' _ "$GATE" "$TMP/wt5" "$O" "$O/logs/cloneref.log" "$PROMPT"
+arm "$O/logs/cloneref.log"
+ck "N16 …with the remote silent, the clone's refs/remotes/origin/HEAD still refuses the renamed default (trunk not moved) [$(tail -1 "$O/logs/cloneref.log" 2>/dev/null | cut -c1-90)]" \
+  $(grep -q 'refused-protected' "$O/logs/cloneref.log" && ! git -C "$BARE" rev-parse -q --verify refs/heads/trunk >/dev/null 2>&1 && echo 0 || echo 1)
+# ⛔ N17 — NO FORBIDDEN VERB ON ANY EXIT BRANCH (review cycle 4, gap 4). The dangerous direction is a
+# `--force` on the refusal/failure path: a dying lane reverting a peer's merged head. D3 only proves the
+# happy path was a fast-forward, so a force on the failure branch was invisible.
+awk '/^lane_end_push\(\)/,/^}/' "$GATE" | grep -q -- '--force' && rcn17=1 || rcn17=0
+awk '/^terminal_wip_rescue\(\)/,/^}/' "$GATE" | grep -qE 'git +stash|worktree +remove|worktree +prune|reset +--hard' && rcn17=1
+ck "N17 …the exit path carries no --force, no git stash, no worktree removal/prune, no reset --hard" $rcn17
+# ⛔ N18 — THE SILENT-WRITE RULE IS LOUD ON THE mkdir/mktemp BRANCHES TOO (review cycle 4, gap 5): N9 sends
+# the log to /dev/null, so those two lines could go silent and stay green.
+mkdir -p "$TMP/ro"
+: > "$TMP/ro.notadir"
+mkdir -p "$TMP/ro2/state"
+O="$TMP/ro.notadir" bash -c '
+  . "$1"
+  LANE_END_LOG="$2/ro.log"; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_MARKER_FRESH=0
+  lane_end_marker "no state dir" 0 0
+  LANE_END_LOG="$2/ro2.log"; O="$3"
+  chmod 500 "$3/state"
+  lane_end_marker "no mktemp" 0 0
+  chmod 700 "$3/state"
+' _ "$GATE" "$TMP" "$TMP/ro2" 2>/dev/null
+chmod 700 "$TMP/ro2/state" 2>/dev/null
+grep -q 'NO resume marker' "$TMP/ro.log" 2>/dev/null && grep -qi 'could not create' "$TMP/ro2.log" 2>/dev/null; rcn18=$?
+ck "N18 …a failed state-dir create AND a failed mktemp both say so loudly (no silent absence of the artifact)" $rcn18
 # ⛔ N9 — A FAILED LATER WRITE MUST NOT DELETE THIS TERMINAL'S OWN PRE-NETWORK MARKER (review cycle 2,
 # finding 5, REPRODUCED: an ENOSPC-shaped mktemp failure at the final write left NO marker at all).
 mkdir -p "$TMP/mkO/state"
