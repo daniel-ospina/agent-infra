@@ -1078,7 +1078,7 @@ echo "    shell profile wired: AGENT_INFRA_PATH + AGENT_SYNC_MODE"
 
 # TORTOISE_HOME — for LOCAL / self-hosted tortoise tooling only.
 # ⛔ The BASE MCP entry no longer uses it (graph-mcp-provision): templates/.mcp.base.json
-# declares the HOSTED server (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_API_KEY}`),
+# declares the HOSTED server (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_MCP_API_KEY}`),
 # which needs no checkout, no venv and no local FalkorDB. This probe is kept because other
 # local tooling still reads the variable and removing a variable the fleet may use is a bigger
 # change than this one — but the message below must not be allowed to imply the graph is wired

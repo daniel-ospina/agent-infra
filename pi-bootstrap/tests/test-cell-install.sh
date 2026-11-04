@@ -1625,14 +1625,19 @@ PY
 # resolve was certified LAYER VERIFIED with the 401 warning scrolled away above it — and nothing else
 # catches it (the key is not part of the layer; cloud-cell-bringup.sh does not check it). Exit 0 is
 # deliberate; the STATE has to be unmissable instead. Both directions, so neither can be vacuous.
+# Both directions, so neither can be vacuous. ⛔ AND THE POSITIVE ARM MUST READ THE CERTIFICATION
+# LINE ITSELF: `graph_credential_note` prints `graph credential: resolves from …` on the SAME run
+# (`cell-install.sh`), so a whole-log grep stays green with the state removed from the cert line
+# entirely — i.e. it could not detect the very regression the code comment names. Measured: a
+# synthetic two-line log (cert line without the state, state on its own line) passed the old grep.
 KEY="t"
 KEY="${KEY}t_$(printf 'A%.0s' $(seq 24))"
 CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" TORTOISE_MCP_API_KEY="$KEY" \
   bash "$INSTALLER" --verify > "$LOG" 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && grep -q "graph credential: resolves from the environment" "$LOG" \
+[ "$rc" -eq 0 ] && grep -E 'LAYER VERIFIED' "$LOG" | grep -q 'graph credential: resolves from the environment' \
   && ok "LAYER VERIFIED states the graph credential resolves (a cell certified with a working key)" \
-  || fail "LAYER VERIFIED did not report a resolving graph credential (rc=$rc) — a reader cannot tell a working cell from a 401 one"
+  || fail "LAYER VERIFIED did not report a resolving graph credential ON THE CERTIFICATION LINE (rc=$rc) — a reader cannot tell a working cell from a 401 one"
 mkdir -p "$TMP/nohome"
 # BOTH names are cleared: a box that exports the legacy alias would
 # otherwise resolve and the arm would go red on a correctly-configured machine.
