@@ -3723,9 +3723,7 @@ def _in_this_checkout(worktree: str) -> bool:
         return True                       # unresolvable: unreadable evidence never narrows
     if wt.startswith(root + os.sep):
         return True                       # by construction
-    for path, _branch in _worktrees():     # the ADOPT arm's population, everywhere it lives
-        if _rp(path) == wt:
-            return True
+# MUTANT: the _worktrees() arm deleted
     # a brother checkout of the SAME repo (its own registry cannot list this clone's worktrees)
     slug, _why = _origin_slug(wt)         # total: ("", why) on any failure, never raises
     if not slug:
