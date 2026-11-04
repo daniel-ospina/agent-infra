@@ -2734,6 +2734,59 @@ assert_nodir "$WT_L" "A21l a dangling link holds nothing, so the checkout is sti
 assert_absent "$(cat "$T/$ENV/reap.log")" "vanished during the archive" \
     "A21l …and a removal with no surviving root does NOT log the vanished-evidence note (review round 12, P3)"
 
+# A21m — A REMOVAL WITH NO TOLERATED EVIDENCE LOGS NO "vanished" NOTE (review of #3422 round 13, P3).
+# `ev_before` keeps `lane_evidence_present`'s empty-string "no evidence" encoding while its neighbours use
+# the manifest's `<none>`, so without normalisation the waived-precondition note fires on EVERY ordinary
+# removal — and it is the only signal for a genuinely waived before-signature. This fixture has no
+# tolerated evidence at all, which is the shape the other fixtures cannot produce (they all have one
+# before AND after the archive, so the note's branch is unreachable for them).
+ENV=A21m; REPO="$(mk_late_repo $ENV)"
+WT_M="$(add_named_wt "$REPO" "$ENV-late" feat/a21m-late)"
+mkdir -p "$WT_M/.venv/bin"; printf 'py\n' >"$WT_M/.venv/bin/python"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_nodir "$WT_M" "A21m a checkout with NO tolerated evidence is reclaimed"
+assert_eq "$RC" "0" "A21m ...cleanly"
+assert_absent "$(cat "$T/$ENV/reap.log")" "vanished during the archive" \
+    "A21m ...and the 'vanished' note does NOT fire when there was nothing to vanish (no false positive)"
+
+# A21n — RETARGETING A LINK DURING THE ARCHIVE IS CAUGHT (review of #3422 round 13, P3). A21k/A21l prove a
+# link is not FOLLOWED, but both pass if the signature drops the target string entirely (`link <path>`
+# alone) — and `tar` stores the target, so a retarget during the archive is exactly the loss the gate is
+# for. The link is retargeted between the two signatures, which a target-less line cannot see.
+ENV=A21n; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21n)'
+mkdir -p "$T/$ENV-a" "$T/$ENV-b"
+printf 'first\n' >"$T/$ENV-a/report.md"; printf 'second\n' >"$T/$ENV-b/report.md"
+WT_N="$(add_named_wt "$REPO" "$ENV-late" feat/a21n-late)"
+mkdir -p "$WT_N/.venv/bin"; printf 'py\n' >"$WT_N/.venv/bin/python"
+ln -s "$T/$ENV-a" "$WT_N/.worktree-report"
+cat >"$T/bin/git-retarget-late" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do
+    if [ "$a" = "status" ]; then
+        "${REAL_GIT_BIN:-git}" "$@"; rc=$?
+        if [ -n "${FAKE_LATE_COUNTER:-}" ] && [ -n "${FAKE_RETARGET_TO:-}" ] && [ -n "${FAKE_RETARGET_LINK:-}" ]; then
+            c=0; [ -f "$FAKE_LATE_COUNTER" ] && c="$(cat "$FAKE_LATE_COUNTER")"
+            c=$((c + 1)); printf '%s\n' "$c" >"$FAKE_LATE_COUNTER"
+            [ "$c" -ge "${FAKE_LATE_ON:-1}" ] && ln -sfn "$FAKE_RETARGET_TO" "$FAKE_RETARGET_LINK" 2>/dev/null
+        fi
+        exit "$rc"
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-retarget-late"
+rm -f "$T/$ENV/cnt"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-retarget-late" FAKE_LATE_COUNTER="$T/$ENV/cnt" FAKE_LATE_ON=4 \
+    FAKE_RETARGET_LINK="$WT_N/.worktree-report" FAKE_RETARGET_TO="$T/$ENV-b" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21n a link RETARGETED during the archive is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21n ...CAUGHT: the signature carries the link's TARGET, not just its name"
+assert_dir "$WT_N" "A21n ...the worktree is still on disk"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21n ...nothing was removed"
+
 # A21i — A SIGNATURE THAT CANNOT BE TAKEN IS A RED PASS, NOT A SILENT PRESERVE (review of #3422 round 9,
 # P2). `fs_bounded_out` emits nothing on a non-zero rc, so discarding the rc made "the walk failed" look
 # like "the set is empty": every evidence-bearing row became permanently unreclaimable while the pass

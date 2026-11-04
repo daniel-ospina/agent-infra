@@ -2066,7 +2066,7 @@ EOF
 #
 # Return code: 0 the signature was taken; 1 the walk could not be completed => caller FAILS the removal.
 evidence_signature() {
-    local path="$1" r sig tgt
+    local path="$1" r sig tgt prc
     shift
     sig="$(
         for r in "$@"; do
@@ -2079,20 +2079,41 @@ evidence_signature() {
             # oneshot unit has no timeout — so the doctrine stated above `lane_evidence_present` has to
             # hold HERE too. A `readlink` that fails is a walk that could not complete (RED), not a
             # `link r -> ` line that compares equal to itself forever.
-            if fs_link_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
-                tgt="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" readlink "$path/$r")" || exit 3
-                printf 'link %s -> %s\n' "$r" "$tgt"
-            elif fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
-                # `-type f` for content, PLUS `-type l` for the links inside the root: `tar` stores an
-                # inner link as a link, so retargeting one during the archive is a change the file
-                # listing cannot see (review of #3422 round 12, P3). `cksum` would follow such a link,
-                # so the link arm prints the link's own target instead.
-                fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r/" \
-                    \( -type f -exec cksum {} + \) -o \
-                    \( -type l -exec sh -c 'for l; do printf "link %s -> %s\n" "$l" "$(readlink "$l")"; done' sh {} + \) || exit 3
-            elif fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r"; then
-                fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r" || exit 3
-            fi
+            #
+            # ⛔ AND "COULD NOT ANSWER" IS NOT "ABSENT" HERE EITHER (review of #3422 round 13, P3). Every
+            # probe below returns 124 (timed out) or 125 (its scratch file could not be made); read as a
+            # plain `elif` false, the root would be dropped from the signature with rc 0 — the exact
+            # conflation round 11 removed one function away. So each probe's STATUS is captured.
+            prc=0
+            fs_link_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
+            case "$prc" in
+                124|125) exit 3 ;;
+                0)
+                    tgt="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" readlink "$path/$r")" || exit 3
+                    printf 'link %s -> %s\n' "$r" "$tgt"
+                    continue ;;
+            esac
+            prc=0
+            fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
+            case "$prc" in
+                124|125) exit 3 ;;
+                0)
+                    # `-type f` for content, PLUS `-type l` for the links inside the root: `tar` stores an
+                    # inner link as a link, so retargeting one during the archive is a change the file
+                    # listing cannot see (review of #3422 round 12, P3). `cksum` would follow such a link,
+                    # so the link arm prints the link's own target — and a `readlink` that fails there
+                    # reds the pass (round 13, P2) instead of emitting `link <path> -> ` forever.
+                    fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r/" \
+                        \( -type f -exec cksum {} + \) -o \
+                        \( -type l -exec sh -c 'for l; do t="$(readlink "$l")" || exit 3; printf "link %s -> %s\n" "$l" "$t"; done' sh {} + \) || exit 3
+                    continue ;;
+            esac
+            prc=0
+            fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
+            case "$prc" in
+                124|125) exit 3 ;;
+                0) fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r" || exit 3 ;;
+            esac
         done | sed '/^$/d' | sort -u | cksum
     )" || return 1
     printf '%s' "$sig"
@@ -3869,7 +3890,7 @@ remove_one() {
         # vanished root in the waived-precondition note below (review of #3422 round 12, P3)
         [ -n "$ev_before" ] || ev_before="<none>"
         ev_sig_before=""
-        if [ -n "$ev_before" ]; then
+        if [ "$ev_before" != "<none>" ]; then
             # shellcheck disable=SC2086
             ev_sig_before="$(evidence_signature "$path" $ev_before)"; sig_rc=$?
             if [ "$sig_rc" != 0 ]; then
