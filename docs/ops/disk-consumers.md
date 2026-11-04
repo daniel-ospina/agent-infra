@@ -239,7 +239,7 @@ The class cannot run there, for three independent reasons:
 * the delegates are **absent from the cell's harness**: `/tmp/cell-home/.pi/agent/scripts/` has
   `disk-reaper.sh`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `pi-reap-worktrees.sh` — but **no
   `reap-duplicate-installs.sh` and no `reap-abandoned-worktrees.sh`** (both are in the repo at
-  `scripts/`, and both are in the farm list at `pi-bootstrap/setup.sh:574`);
+  `scripts/`, and both are in the farm list at `pi-bootstrap/setup.sh:602`);
 * the installed unit has **no `DUP_INSTALL_REAPER` / `ABANDONED_WT_REAPER`** env pins (the template does,
   `templates/systemd/eldato-disk-reaper.service:50-51`);
 * the pass record confirms it: `classes=uv,venv,worktree`.
@@ -428,7 +428,7 @@ diagnosis only. What a follow-up PR would touch, per finding:
 | **G1** `/home/cmux/tortoise` outside `DISK_REAPER_REPOS` | nothing in code — an installer argument. `install-disk-reaper-timer.sh --repo` on each cell, then verify `classes=` and the worktree census in the next pass. |
 | **G2** lane-scratch population unbounded | a decision, not a patch: replacing `systemd-tmpfiles`' 30 d with an aged class needs an owner ruling on what scratch counts as evidence. Out of scope by design (see the two rules in `docs/ops/disk-reaper.md`). |
 | **G3** uv bound unclaimable on a busy cell | `scripts/pi-cache-reap.sh` — a deferral that recurs on N consecutive passes cannot stay a silent `deferral`; it needs a named escalation (raise the bound deliberately, or report `bound-unclaimed-for=…` in the status record) plus a test. Two-arm change, not one line. |
-| **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:574`) already names both delegates, so the list is not the defect. Needs its own test. |
+| **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:602`) already names both delegates, so the list is not the defect. Needs its own test. |
 | **G8** the runner `_work` sink had no class | **shipped** (2026-10-28): `scripts/reap-runner-work.sh` + `class=runner-work` in `scripts/disk-reaper.sh`, pinned in both scheduled artifacts and in the farm list. A class an operator has to remember to enable is the hole it closes, so it is in the DEFAULT `--only` list — and its globs are in `DISK_REAPER_RUNNER_GLOBS`, so an explicit-but-unmatched layout is a refusal rather than a measured zero. |
 | **G9** stale `/tmp` | **gitless scratch trees are swept** (merged base 2026-11-03, #3272: `--include-gitless`, live-pid census, keep list, cap 10/pass); the remainder — `.git`-owned trees and anything past the cap — is filed as **#3043** and needs an owner ruling on what scratch counts as evidence; an exclusion set is already in place (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`). |
 | **G5** `/tmp` swept only at 30 d | policy (`/etc/tmpfiles.d/`), one owner decision; no repo change. |

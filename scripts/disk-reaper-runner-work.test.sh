@@ -263,12 +263,13 @@ case_b() { # <entry-point> <owner>
     # was asserted 0 above and `class_verdict 0` is `ok` by construction, so any other value beside a
     # removed entry is the record contradicting the pass it records.
     # ⛔ CORRECTED — this comment used to say "Case (b) is the only case that REAPS" and "(f)/(g) … neither
-    # of those reaps", and BOTH claims are measurably false: case (a) drives `--apply` (:210) and reads its
-    # record (:214); case_g() (locate it by `grep -n 'case_g()'` → :468, never by a bare number alone) drives
-    # `--apply` (:483), reads its record (:485) AND reaps — its "and it reaped the dead entry" assertion (:487)
-    # passes. ⛔ ALL SIX numbers VERIFIED AT THIS HEAD — re-read them, never carry one over: the prior
-    # revision wrote its numbers from PRE-INSERTION numbering and then placed them after the insertion,
-    # which is exactly how they drifted. At the prior head `301235ef8`, (g) already reaped and already
+    # of those reaps", and BOTH claims are measurably false: case (a) drives `--apply` and reads the
+    # record the pass wrote; case_g() (locate it with `grep -n 'case_g()'`, NEVER by a bare line number)
+    # drives `--apply`, reads its record AND reaps — its "and it reaped the dead entry" case_check passes.
+    # ⛔ ANCHOR ON CONTENT, NOT ON A NUMBER, and this comment is the proof: EVERY absolute number it has
+    # ever carried was wrong within one revision, because inserting a case above `case_g()` moves all of
+    # them — the last one drifted from `:468` to `:550` and then to `:552` by edits to THIS block. The
+    # statements below are greppable instead. At the prior head `301235ef8`, (g) already reaped and already
     # asserted `^verdict_runner_work=ok$`. What this assertion ACTUALLY closes: (b) reads
     # every OTHER field of the record, and this one was the exception on the suite's most complete reaping
     # path — it adds field COMPLETENESS to (b), not a unique mutant kill (deleting the record line reddens

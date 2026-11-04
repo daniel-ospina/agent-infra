@@ -23,8 +23,8 @@
 # WHAT THIS IS NOT
 # ----------------
 # ⛔ IT IS NOT A SECOND DISK REAPER, AND IT OWNS NO PERMANENT DELETION POLICY. `scripts/disk-reaper.sh`
-# remains the owner of the four sink classes (uv / venv / worktree / duplicate-install), each of whose
-# delete rule lives in a dedicated delegate. This file implements only the CHEAP, ALWAYS-SAFE subset
+# remains the owner of the FIVE sink classes (uv / venv / worktree / duplicate-install / runner-work),
+# each of whose delete rule lives in a dedicated delegate. This file implements only the CHEAP, ALWAYS-SAFE subset
 # that is defensible to run in the middle of a cycle, and it says so in its own line:
 #
 #   class                 what is removed                                   why it is always safe
@@ -293,7 +293,7 @@ disk_floor_gate() { # <state-dir>
     return 0
   fi
   why="still below the floor after the safe reclaim pass"
-  printf '[disk] SKIP free=%sMB floor=%sMB reclaimed=%sMB (%s) — %s, so NO refresh, NO dispatch and no PR sweep this cycle. The remaining classes (lane worktrees, lane venvs, duplicate installs) are disk-reaper.sh'"'"'s and are NOT touched here; if this repeats, free space or lower DISK_FLOOR_MB deliberately\n' \
+  printf '[disk] SKIP free=%sMB floor=%sMB reclaimed=%sMB (%s) — %s, so NO refresh, NO dispatch and no PR sweep this cycle. The remaining classes (lane worktrees, lane venvs, duplicate installs, CI runner _work checkouts) are disk-reaper.sh'"'"'s and are NOT touched here; if this repeats, free space or lower DISK_FLOOR_MB deliberately\n' \
     "$before" "$DISK_FLOOR_MB" "$reclaimed" "${acts:-no action taken}" "$why"
   return 1
 }
