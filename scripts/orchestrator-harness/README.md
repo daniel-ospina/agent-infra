@@ -5097,8 +5097,11 @@ refusal. The dispatcher that produced that line (an ad-hoc pusher, `/tmp/robust_
 `df=` in a log line and asserted nothing, because there was nothing for it to call: a `df` in a log
 is a REPORT, and a report is not a gate.
 
-Three surfaces now exist, and they are ONE predicate (`spawn-gate.sh`'s `disk_free_mb` /
-`disk_readable` / `disk_lane_need`), not three implementations:
+Three surfaces now exist, and they are ONE predicate — `spawn-gate.sh`'s `disk_free_mb` /
+`disk_readable` / `disk_worktree_terms` / `disk_worktree_need`, the SAME functions the live arm's
+`disk_lane_costs` / `disk_lane_need` are built on (the live arm adds the `max(tree, self)` choice, so
+it decides on the marginal cost when the shared cache holds; the PRE-START seam deliberately takes the
+worst case, since at that point the brief's install step is unknown):
 
 | surface | when it is asked | verdict |
 |---|---|---|
@@ -5132,9 +5135,13 @@ same 5.6 GB venv), and the marginal `tree` figure is only true while a warm shar
 cache that pressure prunes first. **The cost of that choice, stated:** a box at ~5 GB free refuses a
 harness lane the live gate would have admitted, until an operator states a smaller worst case.
 
-⚠️ **SCOPE:** these are the three LANE-creation paths. `stall-fix.sh` and `ai-drainer.sh` call
-`git worktree add` directly for throwaway/mend checkouts and are NOT gated here — a named residual,
-whose ENOSPC behaviour this change leaves exactly as it was.
+⚠️ **SCOPE:** these are the three LANE-creation paths. Six scripts create checkouts directly and are
+NOT gated here, which is a named residual of this change: `stall-fix.sh` (`git worktree add` for a
+throwaway mend checkout), `ai-drainer.sh` (the same), `refresh-candidates.sh`,
+`cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance checkouts). Their ENOSPC
+behaviour is exactly what it was; each is a place where a lane can still die on a full volume, and
+moving them onto `wt_provision` (or the `--disk-admit` verb) is the follow-up this change does not do.
+`grep -rn 'worktree add' scripts/` is the live list — treat it as the census, not this sentence.
 
 Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
 the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real
