@@ -107,6 +107,18 @@ print(json.dumps({"repo": "o/r", "verdict": "starvation", "ncpu": 8, "mem_availa
                   "ceiling": 3, "reading": "ncpu=8 ceiling=3"}))
 raise SystemExit(4)
 STARVED
+# A converger that MEASURED the box and then reports a DESTROYED runner config (exit 6, `config-lost`).
+# That verdict did not exist when this suite was written — `runner_autoscale.py` grew it in #3355, on main,
+# AFTER this branch's base — so the installer's case-allow-list fell through to `*)` and refused it as
+# "could not measure this box". Same decision as STARVATION: the box WAS measured, so the timer is what
+# surfaces the alarm and refusing would leave the box with no schedule at all.
+cat >"$T/home/configlost.py" <<'CONFIGLOST'
+import json
+print(json.dumps({"repo": "o/r", "verdict": "config-lost", "ncpu": 8, "mem_available_mb": 5000,
+                  "ceiling": 3, "reading": "ncpu=8 ceiling=3",
+                  "config_lost": ["/tmp/fixture/runner-1"]}))
+raise SystemExit(6)
+CONFIGLOST
 # A converger whose ACTION failed (exit 3) while still answering — a box that was not measured, so
 # `--arm` must refuse it. The other side of the allow-list.
 cat >"$T/home/actionfail.py" <<'ACTIONFAIL'
@@ -460,7 +472,11 @@ assert_nofile "$D/$UNIT_NAME.timer" "the timer file is gone"
 assert_contains "$(cat "$T/systemctl.log")" "disable --now $UNIT_NAME.timer" \
     "the timer was disabled before removal (a live timer must not outlive its files)"
 if [ "$(id -u)" = "0" ]; then
-    echo "  ↷ skipping the unremovable-dir case: running as root, a mode-500 dir is still writable"
+    # ⛔ ONE `ok` PER DROPPED ASSERTION, never a bare echo: a skip that prints nothing shrinks the
+    # assertion count while the suite still exits 0, so a host-dependent skip becomes a silent green over
+    # coverage that is no longer there. Same shape as the root skip further down this file.
+    ok "--uninstall refuses when the files could NOT be removed (skipped: running as root, where a 0500 dir stays writable)"
+    ok "the refusal says the removal failed, naming the dir (skipped: root)"
 else
     RO="$T/c10ro"; fresh "$RO"
     run_install Linux "$RO" --install >/dev/null 2>&1
@@ -504,7 +520,18 @@ print(d["StartInterval"], d["Label"], d["RunAtLoad"], d["Nice"], d["ProcessType"
         "the armed plist ENDS at the repo value: no empty positional argument"
     rm -f "$ARM"
 else
-    echo "  ↷ skipping the plist content checks: no python3 on this box"
+    # ⛔ ONE `ok` PER DROPPED ASSERTION (see the root skip above): a no-python3 host used to lose NINE
+    # assertions — including the armed `--apply` pin, the headline defect of this PR — while the suite
+    # exited 0. The labels are the real ones so the count and the report stay honest on every host.
+    ok "the installed plist is well-formed XML (skipped: no python3 on this box)"
+    ok "ProgramArguments names the converger that was installed (skipped: no python3)"
+    ok "the disarmed plist carries --dry-run (skipped: no python3)"
+    ok "the plist carries the cadence, label, load-at-login, niceness and type (skipped: no python3)"
+    ok "the systemd timer's interval is the plist's (9 min = 540 s) (skipped: no python3)"
+    ok "the armed launchd install exits 0 (skipped: no python3)"
+    ok "the armed plist carries no --dry-run (skipped: no python3)"
+    ok "the armed plist carries no --apply either (no such verb) (skipped: no python3)"
+    ok "the armed plist ENDS at the repo value: no empty positional argument (skipped: no python3)"
 fi
 assert_contains "$(cat "$T/launchctl.log")" "bootstrap" "the job was bootstrapped with launchctl"
 
@@ -1465,6 +1492,17 @@ assert_eq "$RC" 0 "a STARVED box (rc=4) still ARMS — 4 means the box was measu
 assert_contains "$OUT" "ARMED" "the verb reports it armed"
 assert_file "$ARM" "the record exists"
 assert_contains "$(cat "$ARM" 2>/dev/null)" "ceiling=3" "carrying the ceiling the starved pass still measured"
+rm -f "$ARM"
+# 6 (config-lost) is the same class as 4, and it arrived on MAIN after this installer was written
+# (#3355). Unnamed, it fell into the `*)` refusal arm and told the operator the box "could not measure"
+# while advising `gh auth` — for a box that measured fine and holds a 0-byte `.runner` no pass can
+# re-register. The assertion pins the DECISION, not just the message: refusing here leaves a box with no
+# schedule, which is the one state this whole feature exists to remove.
+ENVV=(RUNNER_AUTOSCALE_SCRIPT="$T/home/configlost.py")
+OUT="$(run_install Linux "$D" --arm --reason fixture)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a CONFIG-LOST box (rc=6) also ARMS — a 0-byte .runner IS a measurement (#3355)"
+assert_contains "$OUT" "ARMED" "and the verb reports it armed, rather than 'could not measure'"
+assert_contains "$(cat "$ARM" 2>/dev/null)" "ceiling=3" "carrying the ceiling the config-lost pass still measured"
 rm -f "$ARM"
 
 # ── T53: the arming record and the pass log live where the ARTIFACT says, not where this shell looks ─

@@ -1627,12 +1627,22 @@ do_arm() {
     rc=$?
     json="$(cat "$rec_tmp")"
     # ⛔ ALLOW-LIST, NOT A BLACKLIST OF 2. 0 is a capacity answer (converged / at-ceiling / under-target /
-    # over-ceiling / provisioner-refused: the pass measured the box and decided); 4 is STARVATION, which
-    # is a reason to arm rather than a reason to refuse. Everything else — 1 a refusal, 2 a measurement
-    # or pool read that could not be taken, 3 an action failure, 5 a unit finding — means this box was
-    # not measured, and arming it would be signing a record the box cannot honour.
+    # over-ceiling / provisioner-refused: the pass measured the box and decided); 4 is STARVATION and 6 is
+    # CONFIG-LOST — BOTH mean the pass MEASURED this box and reported a state it cannot repair, which is a
+    # reason to arm rather than a reason to refuse: the schedule is what SURFACES the alarm, so refusing
+    # leaves the box with no timer at all and the loud per-tick red never runs. Everything else — 1 a
+    # refusal, 2 a measurement or pool read that could not be taken, 3 an action failure, 5 a unit
+    # finding — means this box was not measured, and arming it would be signing a record the box cannot
+    # honour.
+    #
+    # ⛔ 6 JOINED THIS LIST ON 2026-11-03, and it is a MAIN-SIDE addition this file did not know about:
+    # `runner_autoscale.py` grew the `config-lost` verdict and its exit code (#3355 — a 0-byte `.runner`
+    # holds no agentName and no URL, so no pass can re-register it) AFTER this installer was written. Until
+    # it was named here it fell into the `*)` arm below and was refused as "the preflight could not measure
+    # this box … usually gh auth or the pool/queue API" — a MEASUREMENT reported as an unmeasurable box,
+    # with a remedy that cannot clear it. Pinned by T52.
     case "$rc" in
-        0|4) : ;;
+        0|4|6) : ;;
         *)
             rm -f "$rec_tmp"
             err "REFUSING to arm: the preflight could not measure this box (rc=$rc). Nothing was armed."
