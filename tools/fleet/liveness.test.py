@@ -2168,6 +2168,41 @@ def t49():
               "a non-ASCII digit is unreadable, not an exception: %r" % bad)
 
 
+@test("T50 the masking refusal covers the session axis's ABSTENTIONS, not only its evidence")
+def t50():
+    """⛔ AN ABSTENTION IS EVIDENCE TOO (#1777 B7 on the log axis).
+
+    `ps_ok=False` / `store_ok=False` ARE the session axis answering: they are the
+    `unknown/ps-unreadable` and `unknown/store-unreadable` abstentions. The masking
+    guard listed only the POSITIVE session fields, so a log read resolved over a
+    FAILED read — and because the log axis CAN reach `frozen`, that did not merely
+    mask the abstention, it CONVICTED a lane on evidence it had just discarded.
+    """
+    lr_working = LR(alive=True, size_delta=7, transcript_grew=True, cpu_delta_cs=99,
+                    age_ms=10, window_ms=liv.LOG_WINDOW_MS)
+    lr_frozen = LR(alive=True, size_delta=0, transcript_grew=False, cpu_delta_cs=0,
+                   age_ms=liv.LOG_FREEZE_MS + H, window_ms=liv.LOG_WINDOW_MS)
+
+    # CONTROL FIRST — the guard must not be made non-vacuous by refusing everything.
+    check(liv.evaluate(liv.Evidence(log_read=lr_working)).state == "working",
+          "a log read with NO session evidence still resolves (it is not refused for existing)")
+    check(liv.evaluate(liv.Evidence(log_read=lr_frozen)).state == "frozen",
+          "…including the convicting state, which is legitimate on a CLEAN log-only query")
+
+    for label, e in (
+            ("working + ps_ok=False", liv.Evidence(log_read=lr_working, ps_ok=False)),
+            ("working + store_ok=False", liv.Evidence(log_read=lr_working, store_ok=False)),
+            # The discriminating one: without the fix this returns `frozen`, i.e. the log
+            # axis CONVICTS on the exact reading it discarded.
+            ("frozen + ps_ok=False", liv.Evidence(log_read=lr_frozen, ps_ok=False)),
+            ("frozen + store_ok=False", liv.Evidence(log_read=lr_frozen, store_ok=False)),
+    ):
+        v = liv.evaluate(e)
+        check(v.state == "unknown" and v.reason == "log-read-on-session-query",
+              "a log read over a session ABSTENTION (%s) is refused by name; got %s/%s"
+              % (label, v.state, v.reason))
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -2209,10 +2244,24 @@ MUTATIONS = [
         "T36", "module",
         '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
         '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
-        '                or ev.tool is not None or ev.jsonl_turn is not None:\n',
+        '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '                or not ev.ps_ok or not ev.store_ok:\n',
         '        if False:\n',
         "the log axis accepts a query that ALSO carries session/claim evidence, so a log "
         "read can mask it (the #1777 B7 shape, reconstructed on the new axis)",
+    ),
+    Mutation(
+        "T50", "module",
+        '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
+        '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
+        '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '                or not ev.ps_ok or not ev.store_ok:\n',
+        '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
+        '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
+        '                or ev.tool is not None or ev.jsonl_turn is not None:\n',
+        "the masking refusal ignores the SESSION AXIS'S ABSTENTIONS, so a log read "
+        "resolves over `unknown/ps-unreadable` — and a `frozen` log read then CONVICTS "
+        "a lane on the evidence it discarded (the #1777 B7 shape on a new axis)",
     ),
     Mutation(
         "T37", "module",

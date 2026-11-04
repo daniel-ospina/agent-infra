@@ -286,10 +286,19 @@ LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown")
 # the fleet's existing two-sample span.
 LOG_WINDOW_MS = 30_000
 # The freeze window: how long EVERY signal must have been flat before a LIVE tree
-# is called ``frozen``. `LANE_REAP_LIVE_MIN` default 45 min — already the reviewed
-# bound for "log advanced ⇒ live", chosen above `lane.sh`'s 2400 s wall limit so a
-# long silent tool call is not read as death. Reusing it keeps ONE number for one
-# question instead of a second, unreviewed one.
+# is called ``frozen``. 45 min = `scripts/orchestrator-harness/lane-bound.sh`'s
+# `LANE_BOUND_IDLE_S` default (2700 s) — the fleet's own declared NO-PROGRESS
+# allowance, and since agent-infra#2888 the bound that decides wedged-vs-slow.
+# Copied from there, so a long silent tool call is not read as death by a second,
+# unreviewed number.
+#
+# ⛔ NOT `LANE_REAP_LIVE_MIN`, AND NOT THE WALL. This comment once said the value was
+# `LANE_REAP_LIVE_MIN`'s 45 min "chosen above `lane.sh`'s 2400 s wall limit". Both
+# halves were wrong: `LANE_REAP_LIVE_MIN` defaults to 125 min (`lane-reap.sh:175`),
+# the lane's wall is 3300 s (`lane.sh:474`) and `LANE_BACKSTOP_S` is 7200 s
+# (`spawn-gate.sh:1480`) — so the number was described as sitting ABOVE a bound it
+# actually sat ~65 min below. The 45 min is the progress allowance because that is
+# the bound that asks the SAME question ("is this lane still working?").
 LOG_FREEZE_MS = 45 * 60 * 1000
 # The CPU tolerance: a delta at or below this is NOT progress. `LANE_REAP_CPU_TOL_CS`
 # default 10 (0.10 s) — a sub-0.1 s twitch is indistinguishable from a parked fork
@@ -1444,9 +1453,16 @@ def evaluate(ev: Evidence) -> Verdict:
         # evidence in the same query means the caller has a second axis's answer in
         # hand, and resolving silently to the log axis would DISCARD it — the
         # #1777 B7 shape. Naming the refusal beats picking a winner.
+        # ⛔ AN ABSTENTION IS EVIDENCE TOO (T50). `ps_ok`/`store_ok` are the session
+        # axis answering `unknown/ps-unreadable` / `unknown/store-unreadable`. This
+        # guard once listed only the POSITIVE session fields, so a log read resolved
+        # over a FAILED read — and a `frozen` log read then CONVICTED a lane on
+        # evidence it had thrown away, which is strictly worse than the masking the
+        # guard exists to stop.
         if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \
                 or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \
-                or ev.tool is not None or ev.jsonl_turn is not None:
+                or ev.tool is not None or ev.jsonl_turn is not None \
+                or not ev.ps_ok or not ev.store_ok:
             return Verdict(
                 "unknown", "log-read-on-session-query",
                 detail="a log-lane query carries ONLY log_read; supplying session or claim "

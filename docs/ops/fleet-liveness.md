@@ -1657,9 +1657,17 @@ So on Linux, `LOG_WINDOW_MS` = 30 s (`LANE_REAP_WINDOW`) with `LOG_CPU_TOL_CS` =
 (`LANE_REAP_CPU_TOL_CS`) resolves S2 to **0.10 CPU-seconds per 30 s (about 3.3 mCPU)**. Where only a
 whole-second `ps` is available the floor is **1.0 CPU-s per window (about 33 mCPU)** — a lane burning
 under ~3 % of a core reads flat there, which is why `/proc` is preferred and why the tolerance alone
-is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is `LANE_REAP_LIVE_MIN`'s existing value — already the
-reviewed bound for "log advanced ⇒ live", chosen above `lane.sh`'s 2400 s wall limit — reused so one
-number answers one question instead of a second, unreviewed one.
+is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is `lane-bound.sh`'s
+`LANE_BOUND_IDLE_S` default (2700 s) — the fleet's own declared NO-PROGRESS allowance, and since
+`agent-infra#2888` the bound that decides wedged-vs-slow — reused so one number answers one question
+instead of a second, unreviewed one.
+
+⛔ **NOT `LANE_REAP_LIVE_MIN`, AND NOT THE WALL.** This paragraph once said the 45 min was
+`LANE_REAP_LIVE_MIN`'s value "chosen above `lane.sh`'s 2400 s wall limit". Both halves were wrong, and
+the file contradicted itself: `LANE_REAP_LIVE_MIN` defaults to **125 min** (stated correctly in §11.2)
+and the lane's wall is **3300 s**, with `LANE_BACKSTOP_S` = 7200 s the absolute ceiling — so the
+number was described as sitting above a bound it actually sat 65 min below. The source of the 45 min
+is the progress allowance, because that is the bound that asks the same question.
 
 **A NEGATIVE DELTA IS A BROKEN READING, NOT A FLAT ONE.** A stable subtree cannot *lose* CPU, so a
 negative delta means one of the two reads was incomplete (a child exited between the samples, a
@@ -1758,9 +1766,16 @@ The axis is an **evidence field of `evaluate`** (`Evidence.log_read`), exactly l
 `log_lane_verdict` is reached **only** from `evaluate`. It is **inert when `log_read is None`** (pinned
 by T36 and by the mutation that degenerates its `if ev.log_read is not None:` guard), and supplying
 `log_read` on a query that ALSO carries session or claim evidence (`sid`, `claim_read`, `candidates`,
-`record`, `jsonl_grew`, `jsonl_age_ms`, `tool`, `jsonl_turn`) is **refused by name**
-(`log-read-on-session-query`) rather than resolved by whichever axis is checked first — that would be
-the #1777 B7 defect (an added axis masking other evidence) rebuilt on a new axis.
+`record`, `jsonl_grew`, `jsonl_age_ms`, `tool`, `jsonl_turn`, and the **failed-read flags** `ps_ok` /
+`store_ok`) is **refused by name** (`log-read-on-session-query`) rather than resolved by whichever axis
+is checked first — that would be the #1777 B7 defect (an added axis masking other evidence) rebuilt on
+a new axis.
+
+⛔ **AN ABSTENTION IS EVIDENCE TOO** (T50). `ps_ok=False` / `store_ok=False` are the session axis
+answering `unknown/ps-unreadable` / `unknown/store-unreadable`, so a log read resolving over them
+discards that answer — and when the log read is `frozen` it does worse than mask: it **convicts** a
+lane on evidence it threw away. The guard listed only *positive* session fields once; the two
+failed-read flags are in it for that reason.
 
 Considered and rejected: a new `tools/fleet/log_liveness.py` (that **is** the second verdict function
 the rule forbids), and widening `lane_liveness.py`'s population (§8/§11) to log lanes (its population
