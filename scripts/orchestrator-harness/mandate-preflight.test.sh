@@ -180,6 +180,23 @@ else
   run --line | grep -qF 'UNREADABLE'; ck $? "--line names the unreadable file as UNREADABLE"
 fi
 chmod 644 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" 2>/dev/null
+# ⛔ …AND THE THIRD CELL OF THE SAME TABLE: a path OCCUPIED by something that is not a regular file
+# (this change's review, P2, measured). `[ -f ]` is false for a directory, so the helper called it ABSENT
+# and told the operator to SHIP a file the path cannot hold — while the state-dir arm ONE LEVEL UP already
+# treats the same shape as a deployment fault ("exists but is not a directory … must not be answered with
+# 'ship the file'"). The remedy here is neither `ship` nor `chmod`: the occupant has to move.
+mkstate
+: > "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+mkdir "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+run --check >/dev/null 2>&1; [ $? -eq 2 ]; ck $? "a DIRECTORY where a declared FILE belongs → rc 2 CANNOT VERIFY, not 1 MISSING"
+run --check 2>&1 | grep -qF 'not a regular file'; ck $? "…and the verdict NAMES the shape, so the operator knows it is not a deployment"
+run --missing | grep -qF 'LANE-BRIEF-PREAMBLE.md' && bad "--missing reports an occupied path as ABSENT (wrong remedy: move the occupant, not ship a file)" || ok "--missing does NOT call an occupied path absent"
+run --line | grep -qF 'NOT-A-FILE'; ck $? "--line names it NOT-A-FILE — neither MISSING nor UNREADABLE, each of which prescribes the wrong fix"
+# THE CONTROL: the SAME fixture with a regular file must be rc 0, else the arm above passes on a helper that
+# answers 2 to everything.
+rmdir "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+: > "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+run --check >/dev/null 2>&1; [ $? -eq 0 ]; ck $? "…and the same fixture with a REGULAR file is rc 0 (the arm above can fail)"
 
 echo "§E BOTH dispatch seams are WIRED — BEHAVIOURALLY, not by grepping their source"
 # ⛔ THIS SECTION WAS SOURCE-GREPS AND COULD NOT FAIL (this change's review cycle 2, P1, MEASURED): with
@@ -298,6 +315,31 @@ else
   grep -qF 'REACHED-AFTER-EMIT' "$TMP/errexit.out"; ck $? "…and the CALLER kept running past it (the sourced-mode promise, not just the return code)"
 fi
 chmod 600 "$RO_LOG" 2>/dev/null
+# ── E1f: an UNREADABLE BRIEF must not abort a `set -e` caller either — the E1e bug, one argument along ──
+# E1e pinned the LOG write. The SAME class sat on `brief_text="$(cat "$prompt" 2>/dev/null)"`: `[ -f ]`
+# passes a mode-000 file, the substitution then fails, and a BARE assignment takes ITS status — so the
+# caller died at the assignment, before the disclosure was appended AND before the dispatch started, which
+# is the very over-block the header forbids (this change's review, P2, measured: rc=1, no
+# REACHED-AFTER-EMIT). Pinned behaviourally here, and the sibling renderer assignment that cannot be made
+# to fail from a fixture is pinned as a source-drift rule below — because a fix to one line does not cover
+# the other, and the next author will meet both.
+mkstate
+BRIEF1F="$TMP/brief-000.txt"; printf '# a brief\n' > "$BRIEF1F"; chmod 000 "$BRIEF1F"
+if [ -r "$BRIEF1F" ]; then
+  ok "(skipped: this user can read a 000 brief — running as root?)"
+else
+  CELL_HOME="$TMP/home" bash -c 'set -e; . "$1"; mandate_preflight_emit "$2" "$3" f; printf REACHED-AFTER-EMIT' \
+    _ "$HELPER" "$TMP/errexit-f.log" "$BRIEF1F" > "$TMP/errexit-f.out" 2>/dev/null
+  ERC=$?
+  [ "$ERC" -eq 0 ]; ck $? "an unreadable BRIEF under a set -e caller: the emit still returns 0 (rc=$ERC)"
+  grep -qF 'REACHED-AFTER-EMIT' "$TMP/errexit-f.out"; ck $? "…and the CALLER kept running past it (the abort happened at the assignment, not the log write)"
+fi
+chmod 600 "$BRIEF1F" 2>/dev/null
+# ⛔ EVERY COMMAND-SUBSTITUTION ASSIGNMENT IN THE EMIT CARRIES A GUARD — the drift rule behind E1e/E1f.
+# A new `v="$(cmd)"` added later without `|| :` re-opens the abort for whatever data it reads, and E1e/E1f
+# would stay GREEN because they drive only the two that exist today. This asserts the CLASS, so the guard
+# cannot be lost by adding a third.
+UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -nE '^[[:space:]]+[a-z_]+="\$\([^)]*\)"[[:space:]]*$' | sed 's/^/emit+/')"; [ -z "$UNGUARDED" ]; ck $? "every command-substitution assignment in the emit carries a guard against a set -e caller (unguarded:${UNGUARDED:- none})"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
