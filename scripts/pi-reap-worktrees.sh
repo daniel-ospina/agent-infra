@@ -3049,8 +3049,12 @@ abstain_gate() {
 # 3/4/5 exactly like `live-claim` — it is a preserve, never a removal.
 #
 # TWO PROBES, and the second exists because the first can be silent:
-#   (a) RECORD-BASED — every pin record this box can name. Accepted in EITHER direction, because
-#       the record names a DESCENDANT of the worktree (`<tree>/scripts/orchestrator-harness`).
+#   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
+#       fixture drives (G15a/G15j/G15k/G15l). Accepted in EITHER direction, because the record
+#       names a DESCENDANT of the worktree (`<tree>/scripts/orchestrator-harness`). ⛔ THESE FOUR
+#       ARE NOT AN EXHAUSTIVE SET OF ROOTS and the code does not claim they are: a `.harness-path`
+#       under a fifth root is a SILENT MISS here (the residual, measured and named by
+#       `check-farm-drift.sh:161-208`).
 #   (b) SHAPE BACKSTOP — a checkout under a directory named `harness`/`harness-next`. A pin tree
 #       whose record is unreadable (another HOME, a lost record) still matches, and every false
 #       positive here costs DISK, never work: this probe can only PRESERVE.
@@ -3077,7 +3081,51 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     if [ -n "${CELL_HOME:-}" ] || [ -n "$home" ]; then
         cellpin="${CELL_HOME:-$home}/.harness-path"
     fi
-    for rec in "${HARNESS_PIN_FILE:-}" "$cellpin" ${home:+"$home/.harness-path"}; do
+    # ⛔ A PIN IS TWO RECORDS AND THE DIR RECORD IS NOT ALWAYS UNDER `$CELL_HOME` OR `$HOME` —
+    # check-farm-drift.sh:161-208 already MEASURED that, and derives the `.harness-path` root from the
+    # `HARNESS-PIN` sha record's OWN root because a `CELL_HOME`-rooted `.harness-path` beside a
+    # `$HOME`-rooted sha record made its LOST-PIN arm answer `OK`/rc=0 with the pin identity
+    # unverified (the false PASS at `14683c442`). The same derivation belongs HERE, where a silent miss
+    # is worse than a false PASS: a pin tree this box EXECUTES that no record source names falls
+    # through to rule 3 and is REMOVED. So the sha record is read when the caller names it, and its
+    # root contributes a fourth candidate.
+    # `$HARNESS_PIN` is install.sh:838's and harness-apply-pass.sh:206's own name for the sha record, and
+    # neither exports it, so this arm is INERT unless a box points its pin record somewhere else — which
+    # is exactly the box the shape backstop cannot save, because `HARNESS_PIN_DIR` is operator-settable
+    # and a custom pin root need not be named `harness`.
+    # ⛔ ITS BOUNDARY, DECLARED RATHER THAN IMPLIED: only a `<root>/state/HARNESS-PIN` spelling derives a
+    # root. A trailing `/`, a doubled `//` or a RELATIVE spelling derives NOTHING and falls back to the
+    # three sources above — the same normalisation failure `check-farm-drift.sh` had to fix (it strips
+    # trailing slashes and collapses `//` for exactly that reason). This arm is deliberately left
+    # unnormalised rather than shipping a spelling no fixture drives: an input without a test is the
+    # defect class this PR exists to remove, so the boundary is written down instead.
+    local pin_root="${HARNESS_PIN:-}"
+    case "$pin_root" in
+        */state/HARNESS-PIN) pin_root="${pin_root%/state/HARNESS-PIN}" ;;
+        *)                   pin_root="" ;;
+    esac
+    case "$pin_root" in
+        */.pi/agent) pin_root="${pin_root%/.pi/agent}" ;;
+    esac
+    # THE FOUR SOURCES, and each one is exercised by a fixture (G15a, G15j, G15k, G15l):
+    #   `${HARNESS_PIN_FILE}`  the production variable — cloud-cell-bringup.sh:89 and
+    #                          cloud-cell-supervisor.sh:1775 write it and persist it in the cell
+    #                          ENV_FILE, install.sh:837 roots it at `$HOME`;
+    #   `$CELL_HOME/…`         harness-apply-pass.sh co-roots the DIR record with the sha record;
+    #   `$HOME/…`              pi-bootstrap/setup.sh:26 (`DEST=$HOME/.pi/agent`), which passes
+    #                          `--pin-file "$DEST/state/HARNESS-PIN"` at `:1109`;
+    #   derived                from the sha record's own root, as above.
+    # ⛔ MEASURED, BECAUSE THE REVIEW'S SECOND CLAIM ABOUT THIS LINE IS FALSE (2026-11-04). The review
+    # reported that `${home:+"$home/.harness-path"}` is unquoted and so word-splits on a HOME containing
+    # whitespace, turning the record into a relative path that matches nothing. That is NOT what bash
+    # does: the value is quoted INSIDE the alternate word, so the expansion is already one word.
+    #   for x in ${h:+"$h/.p"};  do echo "[$x]"; done   # h='/a b'  ->  [/a b/.p]     (one word)
+    #   for x in ${h:+$h/.p};    do echo "[$x]"; done   # h='/a b'  ->  [/a] [b/.p]    (splits)
+    # The hazard is dropping the INNER quoting, not the outer: `${home:+$home/.harness-path}` splits and
+    # the record is skipped in silence, which is the silent-miss class this veto exists to close. The
+    # outer quotes below are kept for uniformity with the sibling elements and pinned by G15l
+    # (mutation leg `home-expansion-unquoted`), which drives the splitting spelling.
+    for rec in "${HARNESS_PIN_FILE:-}" "$cellpin" ${home:+"$home/.harness-path"} "${pin_root:+"$pin_root/.harness-path"}"; do
         [ -n "$rec" ] || continue
         [ -r "$rec" ] || continue
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"

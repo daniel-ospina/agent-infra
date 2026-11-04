@@ -726,6 +726,25 @@ add_claim() {
 run_reaper() {
     local envname="$1"; shift
     local nowval="${REAP_WT_NOW_EPOCH_OVERRIDE-$NOW}"
+    # ⛔ `HOME` MUST BE REMOVABLE, NOT JUST SETTABLE (#10114 review round 2). The `$HOME` guard in
+    # `pin_tree_match` can only be exercised with HOME **and** CELL_HOME both UNSET — with either one
+    # set, `${CELL_HOME:-$HOME}` never expands `$HOME` and the guard is untested, which is how the
+    # assertion it protects passed against the exact pre-fix spelling. A test that bypassed this helper
+    # to hand-roll `env -u HOME` lost every other seam (see G15i). So the seams stay ONE list and the
+    # unset is applied LAST, by `env`, to the same list: the `HOME=` assignment reaches `env`, and
+    # `--unset=HOME` removes it before bash starts. The array is NEVER empty (it carries a no-op name on
+    # the default path) because `"${arr[@]}"` on an empty array is an unbound-variable error under
+    # `set -u` in bash 3.2, which this suite must run on.
+    # `-u NAME`, not `--unset=NAME`: BSD/macOS `env` has no long options, and it answers an unknown
+    # one by REFUSING to exec — which is how the first draft of this silently produced empty output
+    # for every fixture downstream (the failure mode the mutation legs exist to prevent, caught here
+    # by the suite's own G-rows going red).
+    local -a unset_env=(-u __REAP_WT_TEST_NO_SUCH_VAR__)
+    # ⛔ ONLY `HOME`/`CELL_HOME` ARE REMOVED. `HARNESS_PIN_FILE`/`HARNESS_PIN` are SET by the list below
+    # (to "" or to their own override), so an ambient value cannot leak — and unsetting them here would
+    # delete the very seam the no-home fixture names its record through (measured: the record was
+    # dropped and the row read `reason=reclaimable`, which is how this was caught).
+    [ -n "${RUN_REAPER_UNSET_HOME:-}" ] && unset_env=(-u HOME -u CELL_HOME)
     # ⛔ EVERY FIXTURE IS OFFLINE: REAP_WT_MAIN_PROOF is pinned to `local` in the env list below.
     # `auto` (the production default) asks the remote that pushes which branch it calls HEAD — a
     # network round trip that would make a fixture's verdict depend on the host's connectivity and the
@@ -742,7 +761,7 @@ run_reaper() {
     # hermetic (no `df` on the host's real state, no verdict firing by accident); a fixture that wants
     # the probe sets REAP_WT_FREE_MB_OVERRIDE="" (empty = "measure it") and points DF_BIN_OVERRIDE at a
     # shim. `${VAR-default}`, not `${VAR:-default}`: SET-BUT-EMPTY is a real, meaningful value here.
-    HOME="$T/$envname/home" \
+    HOME="${HOME_OVERRIDE:-$T/$envname/home}" \
     PATH="$T/bin:$PATH" \
     REAP_WT_STATE_DIR="${REAP_WT_STATE_DIR_OVERRIDE:-$T/$envname/state}" \
     REAP_WT_LOG="${REAP_WT_LOG_OVERRIDE:-$T/$envname/reap.log}" \
@@ -798,6 +817,9 @@ run_reaper() {
     REAP_WT_MAIN_PROOF="local" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES_OVERRIDE:-45}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-}" \
+    CELL_HOME="${CELL_HOME_OVERRIDE:-}" \
+    HARNESS_PIN_FILE="${HARNESS_PIN_FILE_OVERRIDE:-}" \
+    HARNESS_PIN="${HARNESS_PIN_OVERRIDE:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
     FAKE_GH_EXIT="${FAKE_GH_EXIT:-}" \
     FAKE_GH_ARGS_LOG="${FAKE_GH_ARGS_LOG:-}" \
@@ -810,8 +832,14 @@ run_reaper() {
     FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-3}" \
     DU_CANARY="${DU_CANARY:-}" \
     REAL_GIT_BIN="$REAL_GIT" \
-    bash "${REAPER_OVERRIDE:-$REAPER}" "$@"
+    env "${unset_env[@]}" bash "${REAPER_OVERRIDE:-$REAPER}" "$@"
 }
+
+# reason_token <row> — the row's reason FIELD, exactly. `reason=pin-tree` is a PREFIX of
+# `reason=pin-tree-shape`, so `assert_contains "reason=pin-tree"` accepts BOTH and a deletion of the
+# record-based probe leaves the assertion green (#10114 review round 2, measured). Comparing the parsed
+# token pins the class, and a row with no reason field at all cannot satisfy it.
+reason_token() { printf '%s\n' "$1" | sed -n 's/^ *reason=\([^ ]*\).*$/\1/p' | head -1; }
 
 row_for() { # <output> <path> — the verdict line + its reason line for one path
     printf '%s\n' "$1" | awk -v p="$2" 'index($0,p)>0 {print; if (getline > 0) print; exit}'
@@ -890,6 +918,45 @@ ANCHORS = {
     "no-per-repo-offset-key": (
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees$(printf \x27%s\x27 \"$REPO_CANON\" | cksum | cut -d\x27 \x27 -f1).offset\"",
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees.offset\"   # MUTANT: the per-repo key dropped",
+    ),
+    # ── G15 (the harness pin-tree veto, #10114) ── four anchors, one per INPUT of the veto. The veto
+    # shipped with no mutation leg at all, and that is precisely how two of its assertions passed
+    # vacuously through three recorded clean reviews.
+    # (1) delete the RECORD-BASED probe entirely, leaving the shape backstop. The row then reads
+    # `reason=pin-tree-shape`, which a prefix match on `reason=pin-tree` ACCEPTS — so before the
+    # exact-token assertion this mutant left G15a green.
+    "no-pin-tree-record-probe": (
+        "    for rec in \"${HARNESS_PIN_FILE:-}\" \"$cellpin\" ${home:+\"$home/.harness-path\"} \"${pin_root:+\"$pin_root/.harness-path\"}\"; do",
+        "    for rec in \"${__MUTANT_PIN_RECORD_PROBE_REMOVED:-}\"; do   # MUTANT: the record-based probe is deleted",
+    ),
+    # (2) delete the SHAPE backstop. A pin tree with no readable record falls to rule 3.
+    "no-pin-tree-shape": (
+        "        */harness|*/harness/*|*/harness-next|*/harness-next/*)",
+        "        */__mutant_pin_shape_removed__|*/__mutant_pin_shape_removed__/*)",
+    ),
+    # (3) restore the PRE-FIX spelling of the `$HOME` guard — bare `$HOME` under `set -u`. The
+    # harness-apply pass then reads `pin_tree=none` and the disk pass removes the tree the box execs.
+    "unguarded-home": (
+        "    local home=\"${HOME:-}\"",
+        "    local home=\"${HOME}\"   # MUTANT: the ${HOME:-} guard is removed (the pre-fix spelling)",
+    ),
+    # (4) delete the sha-record root derivation, so a `.harness-path` under a CUSTOM pin root is a
+    # silent miss (`check-farm-drift.sh:161-208` measures the same class one variable over).
+    "no-pin-root-derivation": (
+        "        */state/HARNESS-PIN) pin_root=\"${pin_root%/state/HARNESS-PIN}\" ;;",
+        "        */__mutant_no_pin_root_derivation__) pin_root=\"\" ;;   # MUTANT: the derivation is deleted",
+    ),
+    # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
+    # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
+    # inside the alternate word); `${home:+$home/.harness-path}` is TWO, so a HOME containing a space
+    # becomes `<prefix>/home` + `space/.harness-path`, neither readable, and the record is skipped in
+    # silence. ⛔ MEASURED 2026-11-04: the first draft of this leg mutated only the OUTER quotes and
+    # stayed GREEN, which falsifies the second half of review finding 5 — bash does not split
+    # `${h:+"$h/.p"}`. That is why the anchor below drops the inner quotes too: it models the regression
+    # that actually exists.
+    "home-expansion-unquoted": (
+        "\"${home:+\"$home/.harness-path\"}\"",
+        "${home:+$home/.harness-path}",
     ),
 }
 s = open(src).read()
@@ -4676,6 +4743,14 @@ assert_eq "$(find "$T/$ENV/state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -
 # 23 cannot-verify for 2h17m. The age floors are pinned OUT of the fixture
 # (`TREE_TS` 30d old, `MIN_AGE_MINUTES=0`) so every assertion below is about the
 # VETO and not about the clock.
+#
+# ⛔ THE REASON IS COMPARED AS AN EXACT TOKEN, NEVER AS A PREFIX (#10114 review round 2). `reason=pin-tree`
+# is a prefix of `reason=pin-tree-shape`, and the two are DIFFERENT PROBES: the first reads a record, the
+# second matches a directory name. Measured: with the assertions written as `assert_contains …, "reason=pin-tree"`
+# the deletion of the ENTIRE record-based probe left G15a and G15b GREEN (the row still read
+# `reason=pin-tree-shape rule=P`), so of the three assertions the body cited as proving the record probe
+# only one was discriminating. `reason_token` compares the field, and a row with no reason field at all
+# cannot satisfy it either.
 ENV=pin_tree
 REPO="$(mk_repo "$ENV")"
 PINWT="$T/$ENV/harness/5b1b09aad2c1"
@@ -4685,8 +4760,8 @@ mkdir -p "$T/$ENV/home"
 printf '%s\n' "$PINWT/scripts/orchestrator-harness" >"$PIN_REC"
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$PINWT")" "reason=pin-tree" \
-    "G15a a recorded harness pin tree is a HOLDER (reason=pin-tree), not residue"
+assert_eq "$(reason_token "$(row_for "$OUT" "$PINWT")")" "pin-tree" \
+    "G15a a recorded harness pin tree is a HOLDER (reason is pin-tree EXACTLY — pin-tree-shape is the other probe)"
 assert_contains "$(row_for "$OUT" "$PINWT")" "rule=P" \
     "G15b the veto prints rule=P (a preserve — never a removal rule)"
 assert_contains "$(row_for "$OUT" "$PINWT")" "this box EXECUTES it" \
@@ -4704,7 +4779,7 @@ SHAPEWT="$T/$ENV/harness/5b1b09aad2c1"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$SHAPEWT" HEAD
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$SHAPEWT")" "reason=pin-tree-shape" \
+assert_eq "$(reason_token "$(row_for "$OUT" "$SHAPEWT")")" "pin-tree-shape" \
     "G15e with no record at all, the harness shape still preserves (backstop)"
 
 # G15f: the NEGATIVE control — the veto is the RECORD/shape, not 'anything
@@ -4740,8 +4815,8 @@ mkdir -p "$T/$ENV/home"
 printf '%s\n' "$LINKPINS/5b1b09aad2c1/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$LINKWT")" "reason=pin-tree" \
-    "G15g a record spelled through a SYMLINK still matches the canonicalised worktree"
+assert_eq "$(reason_token "$(row_for "$OUT" "$LINKWT")")" "pin-tree" \
+    "G15g a record spelled through a SYMLINK still matches the canonicalised worktree (and it is the RECORD, not the shape)"
 
 # G15h: the pin ROOT is ITSELF a registered worktree (the legacy FLAT pin —
 # `cloud-cell-supervisor.sh` `cmd_prune` has a branch for it, and on the affected
@@ -4754,27 +4829,32 @@ mkdir -p "$T/$ENV"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$ROOTWT" HEAD
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$ROOTWT")" "reason=pin-tree-shape" \
+assert_eq "$(reason_token "$(row_for "$OUT" "$ROOTWT")")" "pin-tree-shape" \
     "G15h the pin ROOT itself (no <sha12> child, no record) is preserved by shape"
 
-# G15i: `HOME` UNSET must not abort the classifier. `${CELL_HOME:-$HOME}` does not
-# guard `$HOME`, and this file runs `set -u`: the old code killed the classifier's
-# subshell, which returned an EMPTY row, which the caller counted as a PRESERVE —
-# a pass that removes nothing and reports `verdict=idle`, the HEALTHY verdict.
+# G15i: `HOME` AND `CELL_HOME` BOTH UNSET — the ONLY configuration in which bare
+# `$HOME` aborts. `${CELL_HOME:-$HOME}` does NOT guard `$HOME`, and this file runs
+# `set -u`: with HOME unset the old code killed the classifier's subshell, which
+# returned an EMPTY row, which the caller counts as a PRESERVE — a pass that
+# removes nothing and reports `verdict=idle`, the HEALTHY verdict. MEASURED (round 2):
+# a fixture that set `CELL_HOME` instead proved NOTHING — the `${CELL_HOME:-$HOME}`
+# arm never expanded `$HOME`, so the pre-fix spelling kept this assertion green.
+# ⛔ AND IT ROUTES THROUGH `run_reaper` (round 2, finding 6): the hand-rolled
+# `env -u HOME … bash "$REAPER"` it used to be set NO seams, so this fixture consulted
+# the REAL host process table in `holders_live` — contrary to the rule at the top of
+# `run_reaper`. `RUN_REAPER_UNSET_HOME` applies the unset to the SAME seam list.
 ENV=pin_tree_nohome
-REPO="$(mk_repo "$ENV")"
-NHWT="$T/$ENV/harness/5b1b09aad2c1"
-"$REAL_GIT" -C "$REPO" worktree add -q --detach "$NHWT" HEAD
-mkdir -p "$T/$ENV/home"
-printf '%s\n' "$NHWT/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
-OUT="$(env -u HOME CELL_HOME="$T/$ENV/home" \
-    REAP_WT_DRY_RUN=1 REAP_WT_STATE_DIR="$T/$ENV/state" REAP_WT_LOG="$T/$ENV/reap.log" \
-    REAP_WT_NOW_EPOCH="$NOW" REAP_WT_MAIN_PROOF=local REAP_WT_TREE_TS=$((NOW - 86400 * 30)) \
-    REAP_WT_MIN_AGE_MINUTES=0 \
-    bash "${REAPER_OVERRIDE:-$REAPER}" --dry-run --repo "$REPO" 2>&1)"
+NH_REPO="$(mk_repo "$ENV")"
+NHWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$NH_REPO" worktree add -q --detach "$NHWT" HEAD
+NHREC="$T/$ENV/pin-record"
+printf '%s\n' "$NHWT/scripts/orchestrator-harness" >"$NHREC"
+OUT="$(RUN_REAPER_UNSET_HOME=1 HARNESS_PIN_FILE_OVERRIDE="$NHREC" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$NH_REPO" 2>&1)"
 assert_absent "$OUT" "unbound variable" \
-    "G15i an unset HOME does not abort the classifier (set -u)"
-assert_contains "$(row_for "$OUT" "$NHWT")" "reason=pin-tree" \
+    "G15i with HOME and CELL_HOME BOTH unset the classifier does not abort (set -u)"
+assert_eq "$(reason_token "$(row_for "$OUT" "$NHWT")")" "pin-tree" \
     "G15i …and the pin tree is still classified, not left as a blank row"
 
 # G15j: THE PIN RECORD IS ASKED AGAIN AT REMOVAL TIME, LIKE EVERY OTHER HOLDER ─────────────────
@@ -4820,6 +4900,137 @@ cp "$T/seq-g15j-ctl/1" "$T/seq-g15j-ctl/2"
 OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j-ctl" HARNESS_PIN_FILE="$T/$ENV/pinfile-none" \
     REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
 assert_nodir "$WT_CONTROL" "G15j …and a checkout with no pin record at either reading is still removed"
+# G15p: the record named by `$HARNESS_PIN_FILE` ITSELF — the production variable
+# (`cloud-cell-bringup.sh:89`, `cloud-cell-supervisor.sh:1775` write it and persist it in the
+# cell ENV_FILE; `install.sh:837` roots it at `$HOME`), pointing OUTSIDE both `$CELL_HOME` and
+# `$HOME`. Before round 2 that source appeared NOWHERE in this suite, so it was a claimed input
+# with no coverage at all.
+ENV=pin_tree_pinfile
+REPO="$(mk_repo "$ENV")"
+PFWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$PFWT" HEAD
+mkdir -p "$T/$ENV/record"
+printf '%s\n' "$PFWT/scripts/orchestrator-harness" >"$T/$ENV/record/.harness-path"
+OUT="$(HARNESS_PIN_FILE_OVERRIDE="$T/$ENV/record/.harness-path" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$PFWT")")" "pin-tree" \
+    "G15p \$HARNESS_PIN_FILE's own record preserves the tree, from a root that is neither CELL_HOME nor HOME"
+
+# G15k: THE MIXED ROOTS — `CELL_HOME` names one home and the record lives at `$HOME`. This is the
+# shape `check-farm-drift.sh:161-208` MEASURED as a false PASS (`14683c442`: a CELL_HOME-rooted
+# record beside a `$HOME`-rooted pin). Here it is the third source that carries the verdict, and
+# without it the tree is rule-3 residue because the fixture path carries no `harness` component.
+ENV=pin_tree_mixed
+REPO="$(mk_repo "$ENV")"
+MXWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$MXWT" HEAD
+mkdir -p "$T/$ENV/cell-home" "$T/$ENV/home"
+printf '%s\n' "$MXWT/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
+OUT="$(CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$MXWT")")" "pin-tree" \
+    "G15k a \$HOME-rooted record is still read when CELL_HOME names a DIFFERENT home (the mixed-root shape)"
+
+# G15l: a HOME containing a SPACE — the record must still be read. This is a REAL host shape
+# (`HOME=/Users/first last`), and the property under test is that the expansion yields ONE word.
+# ⛔ TWO CORRECTIONS TO THE ROUND-2 DRAFT OF THIS FIXTURE, both measured:
+#   (a) `CELL_HOME` MUST name a DIFFERENT home. With it unset, `cell` IS `$HOME`, so the SECOND source
+#       — `$cellpin` — resolves to the same file and matches first; the `$HOME` element is
+#       never reached and the fixture proves nothing about it. A cell home with no record leaves the
+#       `$HOME` element as the only candidate.
+#   (b) THE PROPERTY IS NOT THE OUTER QUOTING. `${home:+"$home/.harness-path"}` was reported by review as
+#       word-splitting; it does not — the value is quoted inside the alternate word, so bash produces one
+#       word, and a mutant of just the outer quotes stays GREEN. What splits is
+#       `${home:+$home/.harness-path}`, so the mutation leg (`home-expansion-unquoted`, G15-M5) drives
+#       THAT spelling. The fixture is worth keeping because the property is load-bearing (a split record
+#       is a silent miss and a silent miss here REMOVES the tree the box executes), and because it is the
+#       only leg that reaches the `$HOME` record source from a live `HOME` (G15k reaches it with a
+#       `CELL_HOME` set, G15i with both unset).
+ENV=pin_tree_space
+REPO="$(mk_repo "$ENV")"
+SPWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$SPWT" HEAD
+SPHOME="$T/$ENV/home with space"
+mkdir -p "$SPHOME" "$T/$ENV/cell-home"
+printf '%s\n' "$SPWT/scripts/orchestrator-harness" >"$SPHOME/.harness-path"
+OUT="$(HOME_OVERRIDE="$SPHOME" CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$SPWT")")" "pin-tree" \
+    "G15l a HOME containing whitespace is still read as ONE record path (the expansion is not split)"
+
+# G15m: THE DERIVED ROOT — a CUSTOM pin root, not named `harness`/`harness-next`, recorded by a
+# `HARNESS-PIN` sha record at `<root>/.pi/agent/state/HARNESS-PIN`. `check-farm-drift.sh:161-208`
+# derives the `.harness-path` root this way and records WHY: a record rooted anywhere else is a
+# silent miss, and a silent miss HERE deletes the tree the box executes. The shape backstop cannot
+# save this box, because `HARNESS_PIN_DIR` is operator-settable (`install.sh:836`).
+ENV=pin_tree_derived
+REPO="$(mk_repo "$ENV")"
+DVWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$DVWT" HEAD
+DVHOME="$T/$ENV/derived-home"
+mkdir -p "$DVHOME/.pi/agent/state"
+printf '5b1b09aad2c1\n' >"$DVHOME/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$DVWT/scripts/orchestrator-harness" >"$DVHOME/.harness-path"
+OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
+    "G15m the dir record is derived from the HARNESS-PIN sha record's OWN root (custom pin root, no 'harness' component)"
+
+# ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
+# ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg while
+# every neighbouring gate in this file has one, and that is how two vacuous assertions survived three
+# recorded clean reviews. Each leg below asserts the MUTANT's behaviour — so each one shows the
+# corresponding G15 assertion can go red, which is the only thing that makes it an assertion.
+G15_REPO="$T/pin_tree/repo"
+G15_PINWT="$T/pin_tree/harness/5b1b09aad2c1"
+G15_TS=$((NOW - 86400 * 30))
+
+MUTP1="$T/mutant-no-pin-tree-record-probe.sh"
+mutate_reaper_anchored "$MUTP1" no-pin-tree-record-probe
+OUT="$(REAPER_OVERRIDE="$MUTP1" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree --dry-run --repo "$G15_REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$G15_PINWT")")" "pin-tree-shape" \
+    "G15-M1 MUTATION: with the record-based probe deleted the tree falls to the SHAPE backstop, so G15a's exact-reason assertion reds => it is discriminating"
+
+MUTP2="$T/mutant-no-pin-tree-shape.sh"
+mutate_reaper_anchored "$MUTP2" no-pin-tree-shape
+OUT="$(REAPER_OVERRIDE="$MUTP2" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_shape --dry-run --repo "$T/pin_tree_shape/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_shape/harness/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M2 MUTATION: without the shape backstop the unrecorded pin tree is WRONGLY rule-3 residue => G15e/G15h are discriminating"
+OUT="$(REAPER_OVERRIDE="$MUTP2" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree --dry-run --repo "$G15_REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$G15_PINWT")")" "pin-tree" \
+    "G15-M2 …and the RECORD probe preserves on its own, so the two probes are proven INDEPENDENTLY"
+
+MUTP3="$T/mutant-unguarded-home.sh"
+mutate_reaper_anchored "$MUTP3" unguarded-home
+OUT="$(RUN_REAPER_UNSET_HOME=1 REAPER_OVERRIDE="$MUTP3" HARNESS_PIN_FILE_OVERRIDE="$NHREC" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_nohome --dry-run --repo "$NH_REPO" 2>&1)"
+assert_contains "$OUT" "unbound variable" \
+    "G15-M3 MUTATION: restoring bare \$HOME makes G15i's assertion go RED => the guard is the thing that fixture proves"
+
+MUTP4="$T/mutant-no-pin-root-derivation.sh"
+mutate_reaper_anchored "$MUTP4" no-pin-root-derivation
+OUT="$(REAPER_OVERRIDE="$MUTP4" HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_derived --dry-run --repo "$T/pin_tree_derived/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "reclaimable" \
+    "G15-M4 MUTATION: without the sha-record derivation the custom-root pin tree is WRONGLY rule-3 residue => G15m is discriminating"
+
+MUTP5="$T/mutant-home-expansion-unquoted.sh"
+mutate_reaper_anchored "$MUTP5" home-expansion-unquoted
+OUT="$(REAPER_OVERRIDE="$MUTP5" HOME_OVERRIDE="$SPHOME" CELL_HOME_OVERRIDE="$T/pin_tree_space/cell-home" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_space --dry-run --repo "$T/pin_tree_space/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$SPWT")")" "reclaimable" \
+    "G15-M5 MUTATION: with BOTH quoting layers removed the spaced HOME splits, the record is skipped and the tree is WRONGLY rule-3 residue => G15l is discriminating"
+
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
