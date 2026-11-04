@@ -8,13 +8,16 @@
 #   D1  a fresh stamp verifies (control — without this every case below could be red for the wrong reason)
 #   D2  ONE BYTE changed in a deployed delegate => DRIFT, exit 1, and the file is NAMED
 #   D3  a delegate DELETED from the deployed dir => DRIFT (the unit pins it; the pass would fail closed)
-#   D4  a file that APPEARED since the stamp (was recorded `missing`) is NOT drift
+#   D4  a file farmed after the stamp is APPEARED => re-stamp required (never green); the
+#       same stamp re-taken over it verifies (a measurement, not a latch)
 #   D5  the checkout disagrees with the deployed copy => SOURCE-DRIFT, exit 1 (the measured shape:
 #       a farm copy byte-identical to origin/main beside a checkout 153 commits behind)
 #   D6  the checkout does not have the file at all => drift, named
 #   D7  NO record => exit 3 UNSTAMPED, never 0 (an absent record is a set-up gap, not a match)
 #   D8  an EMPTY record => exit 3 (a record that names no file verifies nothing)
-#   D9  usage errors => exit 2, and --help exits 0
+#   D9  usage errors => exit 2, unreadable record => 2, --help => 0; D9c a pinned file the record
+#       never mentions is UNRECORDED (the pinned set is reconciled, not trusted)
+#   D10 a stamp taken over an INCOMPLETE deployed set can never verify (a missing pinned file is drift)
 # Hermetic: pure filesystem fixtures under a temp dir; no network, no systemd, no $HOME writes.
 set -uo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -29,12 +32,12 @@ has() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; 
 [ -x "$CHECK" ] || { echo "  ❌ the checker is not executable: $CHECK"; echo "PASS=0 FAIL=1"; exit 1; }
 
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh"
 
 # mk_env — a deployed dir + a matching checkout, both carrying the same bytes.
 mk_env() {
     T="$(mktemp -d "${TMPDIR:-/tmp}/drdc-test.XXXXXX")"
-    mkdir -p "$T/deployed" "$T/src/scripts"
+    mkdir -p "$T/deployed/lib" "$T/src/scripts/lib"
     local f
     for f in $FILES; do
         printf '#!/bin/bash\n# %s v1\n' "$f" >"$T/deployed/$f"
@@ -53,10 +56,10 @@ eq "$RC" "0" "D1 --stamp exits 0"
 has "$OUT" "STAMPED" "D1 --stamp says what it did"
 OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
 eq "$RC" "0" "D1 a fresh stamp VERIFIES (control: the cases below are not red by default)"
-has "$OUT" "SUMMARY deployed ok (7 files" "D1 the summary counts every pinned file"
+has "$OUT" "SUMMARY deployed ok (8 files" "D1 the summary counts every pinned file"
 OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src")"; RC=$?
 eq "$RC" "0" "D1 …and it verifies against the checkout it was stamped from"
-has "$OUT" "SUMMARY deployed ok (7 files; matches $T/src)" "D1 the source is named in the summary"
+has "$OUT" "SUMMARY deployed ok (8 files; matches $T/src)" "D1 the source is named in the summary"
 
 # ── D2: ONE BYTE changed in one delegate => DRIFT, named ─────────────────────────
 printf '#!/bin/bash\n# pi-reap-worktrees.sh v2\n' >"$T/deployed/pi-reap-worktrees.sh"
@@ -142,6 +145,23 @@ grep -vF '  reap-duplicate-installs.sh' "$REC" >"$T/trim.record"
 OUT="$(run --dir "$T/deployed" --record "$T/trim.record")"; RC=$?
 eq "$RC" "1" "D9c a pinned delegate missing from the record makes the check fail (the set is reconciled, not trusted)"
 has "$OUT" "UNRECORDED reap-duplicate-installs.sh" "D9c …and it is named"
+
+# ── D10: a stamp taken over an INCOMPLETE deployed set must not verify (round 2) ────────
+# The first fix only caught "farmed after the stamp". A file stamped MISSING and STILL absent fell
+# through to a green summary — so stamping an empty directory printed `deployed ok` and exited 0 with
+# every pinned file, entry point included, gone. A pinned file that is missing IS the exit-1 arm.
+mk_env
+rm -f "$T/deployed/disk-reaper.sh"
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
+eq "$RC" "1" "D10 a stamp taken over an incomplete set does NOT verify (exit 1)"
+has "$OUT" "DRIFT     disk-reaper.sh — stamped MISSING and still absent" "D10 …and the missing pinned file is named"
+mk_env
+OUT="$(run --dir "$T/deployed" --record "$T/never" 2>/dev/null)"; RC=$?
+eq "$RC" "3" "D10 control: a directory nobody stamped is UNSTAMPED (3), not drift"
+run --stamp --dir "$T/deployed" --record "$REC" >/dev/null 2>&1
+OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
+eq "$RC" "0" "D10 control: the complete set still verifies"
 
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ] || exit 1

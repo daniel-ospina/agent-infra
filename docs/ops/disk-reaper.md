@@ -187,10 +187,24 @@ only honest answer is to **preserve it out of the tree and then let the ordinary
   mandated report), `worktree.diff` (`git diff HEAD`), `worktree.status` (`git status --porcelain`)
   and `manifest.txt` (path, branch, HEAD, reason, time, restore recipe) — **and verifies the
   capture**. The directory is keyed on the CHECKOUT, not the branch: every DETACHED worktree has no
-  branch, so a branch-keyed name made two removals in one pass overwrite each other's evidence. A
+  branch, so a branch-keyed name made two removals in one pass overwrite each other's evidence, and an
+  occupied directory name is never reused (a re-dispatched lane at the same path gets a unique sibling
+  instead of clobbering the earlier lane's only copy). A
   capture that does not verify takes the PRESERVE arm: nothing is removed. This is the same contract
   as `backup_before_removal`, and it exists because a LANDED checkout can still hold work a human
   wanted (a fixer mid-edit when its PR auto-merged is the ordinary case).
+* ⛔ **A capture FAILURE is a pass failure, never a routine pause** (`PRESERVE-SKIP` ⇒ rc 1 ⇒
+  `failed=` ⇒ exit 4, red). And because gate (b) inserts a WRITE into every removal, an unwritable
+  archive root must not make the class inert on exactly the box that needs it: the root is the first
+  writable of `REAP_WT_PRESERVE_DIR` and **`REAP_WT_PRESERVE_FALLBACKS`** (default
+  `${XDG_RUNTIME_DIR:-/dev/shm}/pi-disk-reaper-<uid>/reaped-evidence` then `$TMPDIR/pi-reap-evidence`
+  — tmpfs is deliberately not the volume being reclaimed), and a fallback is DISCLOSED as
+  `PRESERVE-DIR-FALLBACK` in the log. An empty `REAP_WT_PRESERVE_FALLBACKS` restores "this directory
+  or nothing" for a box whose state dir must be the only one — and then the pass refuses to remove.
+* The archive is a NEW sink on the reclaim path, so it is **bounded**: `REAP_WT_PRESERVE_KEEP_DAYS`
+  (default 14) prunes dated subdirectories of the configured root, oldest first, under the pass lock;
+  a dry run only reports. Only `YYYY-MM-DD` directory names are ever candidates — anything else there
+  is operator data and is never touched — and an unusable `date` skips the prune rather than guessing.
 * `REAP_WT_PRESERVE=0` restores the **pre-fix verdict exactly** — the tolerance in `clean_gate` is
   gated on the same switch as the archive, so a row can never be called `clean` because of something
   the removal path will not write down.
@@ -233,8 +247,11 @@ scripts/disk-reaper-deployed-check.sh --source ~/agent-infra           # …and 
 3 is deliberately distinct from 1: an absent record is a *set-up gap*, not a change. A file the stamp
 recorded `missing` and someone later farmed is **`APPEARED`** and fails: it is bytes nobody measured,
 and the remedy is a re-stamp, never a green summary. The file list is the set the systemd unit
-**pins** (`Environment=*_REAPER=`), written once in the checker, and the record is **reconciled**
-against it every run, so a delegate the unit executes cannot sit outside the check. `disk-reaper-deployed-check.test.sh` drives every
+**pins** (`Environment=*_REAPER=` **plus** `Environment=BOUNDED_LIB=`, the watchdog every bounded fork
+goes through — absent, the reaper refuses to start), written once in the checker, and the record is
+**reconciled** against it every run, so a file the unit executes cannot sit outside the check. A
+pinned file the stamp recorded `missing` and that is **still absent** is `DRIFT` (exit 1): stamping an
+empty directory must not certify a deployment that cannot execute. `disk-reaper-deployed-check.test.sh` drives every
 branch to its red path (D2 a one-byte change, D3 a missing delegate, D5 `SOURCE-DRIFT` for the
 153-commit shape, D6 a checkout that cannot explain the file, D7/D8 unstamped, D9 usage) — a checker
 that cannot fail would certify a stale deployment.
@@ -1035,7 +1052,8 @@ own fixture: without that, a `--apply` assertion anywhere in it would sweep the 
 | T62 | the **installer** refuses to render a unit that scans nothing: an all-empty resolved list is refused (rc=1, no unit written) and an entry dropped from a PARTIALLY resolvable list is NAMED on **stderr** — quoting git's own first line, measured on its own stream — while the entries it CAN use still install. It also pins the absolute-path arm hoisted above the git probe (a relative / `git@host:owner/repo.git` candidate is dropped for the reason that applies, not blamed on a missing checkout) and the `<git gave no message>` fallback (#2159/#2878) |
 | T63 | the **hourly pass** applies the same rule in its own `resolve_repos`: git's own error line reaches the operator (`git cannot use it here (fatal: cannot change to …)`) instead of the blanket `not a git checkout`, a silent non-zero git renders `<git gave no message>`, and a probe killed by the BOUND (rc=124, a dead or hung mount) is named as a timeout rather than as a git that said nothing (#2159) |
 | T64 | **lane evidence** (`scripts/pi-reap-worktrees.test.sh` G2g–G2y): a LANDED checkout whose only ignored entries are the fleet-mandated ones is `reclaimable`, and an armed pass removes it while the unlanded (open-PR) and dirty-but-landed siblings in the SAME fixture are refused; the archive is verified **by content** (the lane's own report text round-trips out of the tarball), the `manifest` names path/HEAD/reason, **a second pass removes nothing and writes no second archive**, a dry run archives nothing, and TWO mutants must go RED while controls on the same fixtures stay green — the evidence predicate neutered (G2x) and the pointer predicate back to its shipped early-return form, which would admit a real `scripts/` DIRECTORY and an unrelated ignored symlink (G2y) (#1932 over-preservation, the 70-row/20.5 GB class) |
-| T65 | **deployed-vs-source** (`scripts/disk-reaper-deployed-check.test.sh` D1–D9c): a fresh stamp verifies (control), one changed byte is `DRIFT` (1) and is NAMED, a pinned delegate that is MISSING is drift, a file farmed after the stamp is `APPEARED` (unmeasured, exit 1) and re-stamping clears it, a pinned file absent from the record is `UNRECORDED` (the set is reconciled, not trusted), deployed-vs-checkout disagreement is `SOURCE-DRIFT` (the measured 153-commit shape), an unreadable record is 2 (permissions) and **no record / an empty record is `UNSTAMPED` (3), never 0** |
+| T65 | **deployed-vs-source** (`scripts/disk-reaper-deployed-check.test.sh` D1–D10): a fresh stamp verifies (control), one changed byte is `DRIFT` (1) and is NAMED, a pinned file that is MISSING is drift, a file farmed after the stamp is `APPEARED` (unmeasured, exit 1) and re-stamping clears it, a file stamped MISSING and still absent is drift (a stamp over an incomplete set can never verify), a pinned file absent from the record is `UNRECORDED` (the set is reconciled, not trusted), deployed-vs-checkout disagreement is `SOURCE-DRIFT` (the measured 153-commit shape), an unreadable record is 2 (permissions) and **no record / an empty record is `UNSTAMPED` (3), never 0** |
+| T66 | **the archive cannot make the class inert** (`scripts/pi-reap-worktrees.test.sh` G2z): with NO writable archive root the checkout is KEPT, the log names the cause, the row is NOT recorded as a benign late preserve, and the pass exits **4 (red)**; with a writable `REAP_WT_PRESERVE_FALLBACKS` candidate the same unwritable configured root still reclaims, the archive lands in the fallback, and the pass DISCLOSES `PRESERVE-DIR-FALLBACK`; and a mutant that inverts the capture result leaves the checkout in place, which is what makes the removal assertions load-bearing |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
 flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1

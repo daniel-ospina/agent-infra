@@ -724,6 +724,8 @@ run_reaper() {
     REAP_WT_BACKUP_DIR="${REAP_WT_BACKUP_DIR_OVERRIDE:-}" \
     REAP_WT_PRESERVE="${REAP_WT_PRESERVE_OVERRIDE:-1}" \
     REAP_WT_PRESERVE_DIR="${REAP_WT_PRESERVE_DIR_OVERRIDE:-$T/$envname/preserve}" \
+    REAP_WT_PRESERVE_FALLBACKS="${REAP_WT_PRESERVE_FALLBACKS_OVERRIDE-}" \
+    REAP_WT_PRESERVE_KEEP_DAYS="${REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE:-14}" \
     REAP_WT_IGNORED_EVIDENCE="${REAP_WT_IGNORED_EVIDENCE_OVERRIDE- .worktree-report WORKTREE-REPORT.md }" \
     REAP_WT_IGNORED_POINTER="${REAP_WT_IGNORED_POINTER_OVERRIDE- scripts }" \
     MOVE_COUNTER="${MOVE_COUNTER:-}" \
@@ -1155,6 +1157,43 @@ assert_contains "$(row_for "$OUT_R" "$WT_SCRDIR")" "reason=ignored-artifact" \
     "G2y CONTROL: the real script keeps the same fixture preserved"
 assert_contains "$(row_for "$OUT_R" "$WT_OTHLINK")" "reason=ignored-artifact" \
     "G2y CONTROL: …and keeps the unrelated symlink preserved"
+
+# ── G2z: a FAILED capture must remove NOTHING and must not read as a routine pause ────────
+# Gate (b) inserts a write into every removal, so an unwritable archive root would otherwise make the
+# whole class inert while every gate reads green — the exact defect this PR exists to remove (review
+# of #3405 round 2, P1). Two halves: (a) with no writable root at all, the checkout is KEPT and the
+# pass reports a FAILURE (not a benign late preserve); (b) with a fallback available, the same
+# unwritable configured root does NOT stop the reclaim — the archive lands in the fallback.
+WT_FALL="$(add_named_wt "$REPO_PV" "$ENV_PV-fallback" feat/g2z-fallback)"
+mk_evidence "$WT_FALL" '# LANE REPORT\nfallback case'
+OUT_Z="$(FAKE_GH_REFS="$GH_PV" REAP_WT_PRESERVE_DIR_OVERRIDE=/proc/nonexistent/reaped-evidence \
+        REAP_WT_PRESERVE_FALLBACKS_OVERRIDE= run_reaper $ENV_PV --apply --repo "$REPO_PV" 2>&1)"; RC_Z=$?
+assert_dir "$WT_FALL" "G2z NO writable archive root => the checkout is KEPT (a pass that cannot preserve must not delete)"
+assert_contains "$(cat "$T/$ENV_PV/reap.log")" "no writable preserve root" \
+    "G2z …and the log names the cause (no writable preserve root), not a routine re-check"
+assert_absent "$(cat "$T/$ENV_PV/reap.log")" "PRESERVED-LATE" \
+    "G2z …and it is NOT recorded as a benign late preserve (that arm is for a checkout that changed)"
+assert_eq "$RC_Z" "4" "G2z …and it is a REMOVAL FAILURE (exit 4, RED), never a benign late preserve"
+OUT_ZB="$(FAKE_GH_REFS="$GH_PV" REAP_WT_PRESERVE_DIR_OVERRIDE=/proc/nonexistent/reaped-evidence \
+        REAP_WT_PRESERVE_FALLBACKS_OVERRIDE="$T/$ENV_PV/preserve-fallback" \
+        run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_nodir "$WT_FALL" "G2z a WRITABLE fallback keeps the reclaim working (a full/read-only archive root cannot make the class inert)"
+assert_eq "$(ls -d "$T/$ENV_PV/preserve-fallback"/*/feat_g2z-fallback.* 2>/dev/null | wc -l | tr -d ' ')" "1" \
+    "G2z …and the archive landed in the fallback root"
+assert_contains "$(cat "$T/$ENV_PV/reap.log")" "PRESERVE-DIR-FALLBACK" "G2z …and the pass DISCLOSES that it fell back"
+# (b) the mutant for the fail-closed arm: dropping the `!` turns every successful capture into a
+# refusal, so the landed fixture must survive — i.e. the "removed" assertions above are load-bearing.
+WT_MUT="$(add_named_wt "$REPO_PV" "$ENV_PV-mut" feat/g2z-mut)"
+mk_evidence "$WT_MUT" '# LANE REPORT\nmutant gate'
+MUT3="$T/$ENV_PV/pi-reap-worktrees.mutant-gate.sh"
+sed 's/if ! presv="\$(preserve_before_removal/if presv="$(preserve_before_removal/' "$REAPER" >"$MUT3"
+if cmp -s "$REAPER" "$MUT3"; then
+    bad "G2z the GATE MUTANT DID NOT APPLY — the fail-closed arm is unverified"
+else
+    ok "G2z gate mutant applied: the capture result is inverted"
+fi
+OUT_ZM="$(FAKE_GH_REFS="$GH_PV" REAPER_OVERRIDE="$MUT3" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_dir "$WT_MUT" "G2z MUTANT GOES RED: inverting the capture result leaves the checkout in place (so the removal assertions above are load-bearing)"
 
 # ── G3: reachable gate (detached HEAD only) ────────────────────────────
 ENV=G3; REPO="$(mk_repo $ENV)"

@@ -32,9 +32,12 @@ set -uo pipefail
 PROG="$(basename "${0:-disk-reaper-deployed-check.sh}")"
 DIR_DEFAULT="${HOME:-/tmp}/.pi/agent/scripts"
 RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
-# The entry point the timer executes, the wrapper it goes through, and the six pinned delegates.
+# The entry point the timer executes, the wrapper it goes through, the six pinned delegates, AND the
+# bounded-execution library the delegates source (pinned by `Environment=BOUNDED_LIB=`, and the reaper
+# fails closed at startup without it — so a stale or absent copy means no class runs at all, which the
+# checker must not certify as ok; review of #3405 round 2, P2).
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh"
 
 usage() {
     cat <<EOF
@@ -144,13 +147,17 @@ while read -r digest name; do
     [ -n "$name" ] || continue
     checked=$((checked + 1))
     if [ "$digest" = missing ]; then
-        # ⛔ A FILE THAT APPEARED IS NOT VERIFIED (review of #3405, P2). It used to `continue` to a
-        # green summary, so a delegate the stamp recorded ABSENT and someone then hand-copied in was
-        # reported ok WITHOUT ever being hashed — exit 0 for bytes nobody measured. It is now a
-        # re-stamp requirement: the box changed under the record.
+        # ⛔ "STAMPED MISSING AND STILL ABSENT" IS MISSING, NOT OK (review of #3405 round 2, P1). The
+        # first fix only caught "farmed after the stamp"; a file the stamp recorded absent and that is
+        # STILL absent fell through to a green summary — so `--stamp` over an empty directory printed
+        # `deployed ok (N files)` and exited 0 with every pinned file, including the entry point, gone.
+        # A missing pinned file is the exit-1 arm this script's own header documents.
         if [ -f "$DIR/$name" ]; then
             warn "APPEARED  $name — farmed after the stamp and never measured; re-stamp to make it accountable"
             appeared="$appeared $name"
+            drift=1
+        else
+            warn "DRIFT     $name — stamped MISSING and still absent from $DIR (the unit pins it)"
             drift=1
         fi
         continue

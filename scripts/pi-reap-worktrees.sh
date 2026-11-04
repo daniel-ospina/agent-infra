@@ -818,6 +818,18 @@ REAP_WT_PRESERVE="${REAP_WT_PRESERVE:-1}"
 # Where the archive lands. Same root convention as REAP_WT_BACKUP_DIR (`$ORCH/state/…`), because the
 # two are the same promise: something was taken out of a checkout and a human may want it back.
 REAP_WT_PRESERVE_DIR="${REAP_WT_PRESERVE_DIR:-${O:-${HOME:-/tmp}/orchestrator}/state/reaped-evidence}"
+# ⛔ A CAPTURE FAILURE MUST NOT MAKE THE CLASS INERT (review of #3405 round 2, P1). Gate (b) inserts a
+# WRITE into every removal, so a full data volume, a read-only mount, or a `state/` owned by another
+# user would otherwise turn the whole worktree class into a no-op that reports success — the exact
+# shape this PR exists to remove, and a regression against `disk-reaper.sh`'s own "a full disk does not
+# stop the pass" invariant (#2443). These are the fallback roots, tried in order, mirroring that
+# module's `DISK_REAPER_STATE_DIR_FALLBACKS`: tmpfs first (it is not the volume being reclaimed).
+# An EMPTY value disables falling back, restoring the strict "this directory or nothing" behaviour.
+REAP_WT_PRESERVE_FALLBACKS="${REAP_WT_PRESERVE_FALLBACKS-${XDG_RUNTIME_DIR:-/dev/shm}/pi-disk-reaper-$(id -u 2>/dev/null || printf 0)/reaped-evidence ${TMPDIR:-/tmp}/pi-reap-evidence}"
+# ⛔ AND THE ARCHIVE IS A NEW SINK ON THE RECLAIM PATH, so it gets a bound (review of #3405 round 2,
+# P2). Only DATED subdirectories of the configured root are ever considered, oldest first, and only
+# strictly older than the cutoff — a name that is not `YYYY-MM-DD` is never touched. 0 disables.
+REAP_WT_PRESERVE_KEEP_DAYS="${REAP_WT_PRESERVE_KEEP_DAYS:-14}"
 
 MODE=unknown
 LIST_ONLY=0
@@ -1761,13 +1773,21 @@ clean_gate() {
 #   worktree.status       `git status --porcelain`: what git thought was modified/untracked/ignored
 #   manifest.txt          identity (path, branch, sha, reason, time) + what was captured
 #
+# The directory is `<root>/<UTC date>/<slug>.<sha8>.<pathdigest>` (plus a numeric suffix if that
+# identity is already captured — an archive is never overwritten), where <root> is the first WRITABLE
+# of REAP_WT_PRESERVE_DIR and REAP_WT_PRESERVE_FALLBACKS.
+#
 # Returns 0 ONLY when every part that EXISTED at <path> is present in the archive. A partial capture
 # returns 1 and the caller must not remove — the same contract as backup_before_removal, and for the
 # same measured reason: a LANDED worktree can still hold uncommitted work a human wanted (a fixer
 # mid-edit when its PR auto-merged is the ordinary case).
 preserve_before_removal() { # <path> <sha> <branch> <reason>
     local path="$1" sha="$2" br="$3" why="$4"
-    local slug day dir ev tarf out listed e rc ok=1 disc
+    local slug day dir ev tarf out listed e rc ok=1 disc root
+    root="$(preserve_dir_resolve)" || {
+        log "PRESERVE-FAIL $path no writable preserve root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — nothing may be removed"
+        return 1
+    }
     slug="$(printf '%s' "${br#refs/heads/}" | tr '/' '_')"
     [ -n "$slug" ] || slug="detached"
     day="$("$DATE_BIN" -u +%Y-%m-%d 2>/dev/null)" || day="undated"
@@ -1779,7 +1799,16 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     # The path digest makes the directory unique per checkout; the manifest still carries `path=` for
     # a human, and this is an identity key, not a security boundary.
     disc="$(printf '%s' "$path" | cksum | cut -d' ' -f1)"
-    dir="$REAP_WT_PRESERVE_DIR/$day/$slug.${sha:0:8}.$disc"
+    dir="$root/$day/$slug.${sha:0:8}.$disc"
+    # ⛔ AND NEVER CLOBBER AN EXISTING CAPTURE (review of #3405 round 2, P2). A lane re-dispatched onto
+    # the SAME path, branch and head within one UTC day produced the same directory, so the second
+    # removal's `rm -f` + truncating writes destroyed the first lane's evidence — after its tree was
+    # gone. An occupied directory gets a unique sibling instead; re-running over the SAME checkout (a
+    # pass that removed nothing) leaves a harmless duplicate rather than an overwrite.
+    if [ -e "$dir/manifest.txt" ]; then
+        dir="$dir.$(now_epoch)"
+        [ -e "$dir/manifest.txt" ] && dir="$dir.$$"
+    fi
     if ! mkdir -p "$dir" 2>/dev/null; then
         log "PRESERVE-FAIL $path cannot create $dir"
         return 1
@@ -1856,6 +1885,63 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     log "PRESERVED $path -> $dir (evidence=${ev:-none})"
     printf '%s' "$dir"
     return 0
+}
+
+# preserve_dir_resolve — the first writable root among REAP_WT_PRESERVE_DIR and
+# REAP_WT_PRESERVE_FALLBACKS, resolved at most once per pass and cached. Emits the root on stdout,
+# or nothing when no candidate can be written (the caller must then FAIL, not silently skip: a pass
+# that cannot preserve must not delete).
+PRESERVE_DIR_RESOLVED=""
+preserve_dir_resolve() {
+    local cand probe
+    if [ -n "$PRESERVE_DIR_RESOLVED" ]; then printf '%s' "$PRESERVE_DIR_RESOLVED"; return 0; fi
+    # shellcheck disable=SC2086
+    for cand in "$REAP_WT_PRESERVE_DIR" $REAP_WT_PRESERVE_FALLBACKS; do
+        [ -n "$cand" ] || continue
+        probe="$cand/.pi-reap-probe.$$"
+        # Never write THROUGH a pre-planted name (a symlink/FIFO there would truncate a target or
+        # hang the pass); the identity check is the same rule the state-dir resolver uses.
+        if [ -e "$probe" ] || [ -L "$probe" ]; then continue; fi
+        if mkdir -p "$cand" 2>/dev/null && : >"$probe" 2>/dev/null; then
+            rm -f "$probe" 2>/dev/null
+            PRESERVE_DIR_RESOLVED="$cand"
+            if [ "$cand" != "$REAP_WT_PRESERVE_DIR" ]; then
+                log "PRESERVE-DIR-FALLBACK $cand (configured '$REAP_WT_PRESERVE_DIR' is not writable)"
+            fi
+            printf '%s' "$cand"; return 0
+        fi
+        rm -f "$probe" 2>/dev/null
+    done
+    return 1
+}
+
+# prune_preserve_archive — bound the new sink. ONLY dated directories of the configured root are
+# candidates; anything else in that directory is operator data and is never touched. Dry run
+# reports without removing. A `date` that cannot answer skips the prune and says so (never a guess).
+prune_preserve_archive() {
+    local root="$REAP_WT_PRESERVE_DIR" days="$REAP_WT_PRESERVE_KEEP_DAYS" cutoff d
+    [ -n "$root" ] && [ -d "$root" ] || return 0
+    is_pos_int "$days" || { log "PRESERVE-PRUNE skipped: REAP_WT_PRESERVE_KEEP_DAYS='$days' is not a number"; return 0; }
+    [ "$days" -gt 0 ] || return 0
+    cutoff="$("$DATE_BIN" -u -d "@$(( $(now_epoch) - days * 86400 ))" +%Y-%m-%d 2>/dev/null)" \
+        || cutoff="$("$DATE_BIN" -u -v-$((days))d +%Y-%m-%d 2>/dev/null)" \
+        || cutoff=""
+    [ -n "$cutoff" ] || { log "PRESERVE-PRUNE skipped: DATE_BIN could not compute a cutoff"; return 0; }
+    for d in "$root"/*; do
+        [ -d "$d" ] || continue
+        d="${d##*/}"
+        case "$d" in
+            [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) : ;;
+            *) continue ;;
+        esac
+        [ "$d" \< "$cutoff" ] || continue
+        if [ "$MODE" = apply ]; then
+            if "$RM_BIN" -rf "$root/$d" 2>/dev/null; then log "PRESERVE-PRUNE removed $root/$d (older than $days days)"
+            else log "PRESERVE-PRUNE-FAIL $root/$d"; fi
+        else
+            log "PRESERVE-PRUNE would remove $root/$d (older than $days days)"
+        fi
+    done
 }
 
 # pr_state_load — ONE batched call for the whole pass, with an explicit
@@ -3573,8 +3659,13 @@ remove_one() {
     if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
         if ! presv="$(preserve_before_removal "$path" "$sha" "$br" "${why:-reclaimable}")"; then
             REMOVE_SKIP_VERDICT="preserve-failed"
-            log "PRESERVE-SKIP $path the pre-removal capture did NOT verify — nothing removed"
-            rm -f "$out"; return 2
+            # ⛔ A FAILED CAPTURE IS A FAILED REMOVAL, NOT A BENIGN LATE PRESERVE (review of #3405
+            # round 2, P1). rc 2 means "the checkout changed, we kept it" — a routine pause. This is
+            # "the gate could not do its job", so it must reach the caller's REMOVE-FAILED arm (rc 1
+            # -> FAILED -> exit 4) and go RED. Otherwise an unwritable archive root makes the whole
+            # class inert while every gate reads green: the defect this PR exists to remove.
+            log "PRESERVE-SKIP $path the pre-removal capture did NOT verify — nothing removed, and this pass is RED"
+            rm -f "$out"; return 1
         fi
         log "PRESERVE-OK $path $presv"
     fi
@@ -3875,7 +3966,8 @@ run() {
              REAP_WT_DF_TIMEOUT:"$REAP_WT_DF_TIMEOUT" \
              REAP_WT_INEFFECTIVE_MIN_EXAMINED:"$REAP_WT_INEFFECTIVE_MIN_EXAMINED" \
              REAP_WT_DISK_FLOOR_MB:"$REAP_WT_DISK_FLOOR_MB" \
-             REAP_WT_SCRATCH_AGE_DAYS:"$REAP_WT_SCRATCH_AGE_DAYS"; do
+             REAP_WT_SCRATCH_AGE_DAYS:"$REAP_WT_SCRATCH_AGE_DAYS" \
+             REAP_WT_PRESERVE_KEEP_DAYS:"$REAP_WT_PRESERVE_KEEP_DAYS"; do
         is_pos_int "${v#*:}" || { echo "bad ${v%%:*}: ${v#*:} (want a non-negative integer)" >&2; exit 2; }
     done
     # An explicit free-space witness is a NUMBER or it is a refusal, for the same reason
@@ -4004,6 +4096,10 @@ run() {
     fi
 
     log "==== pi-reap-worktrees pass: MODE=$MODE repo=$REPO_CANON aged=${REAP_WT_AGED_DAYS}d main=${MAIN_CANON} now=$now ===="
+    # Bound the archive this pass writes (review of #3405 round 2, P2): the preserve directory is a NEW
+    # sink on the reclaim path, so it is pruned oldest-first under REAP_WT_PRESERVE_KEEP_DAYS. Runs
+    # under the lock, so two passes cannot prune the same tree; a dry run only reports.
+    prune_preserve_archive
     WT_TOTAL="$(printf '%s\n' "$WT_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 
     # ROTATION — see rotate_records(). The offset lives in the state dir so it
