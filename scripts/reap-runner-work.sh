@@ -422,14 +422,25 @@ entry_written_since() { # <entry> <floor-ref>
     [ -n "$out" ] && return 0
     # The FIRST hit is enough, so a live entry costs one stat instead of a walk of a 4 GB tree; only an
     # EMPTY answer pays for the second walk, and it is about to be deleted anyway.
-    tb_timeout "$FIND_TIMEOUT" find "$entry" \( -type f -o -type d \) -newer "$ref" -print 2>/dev/null >"$probe" || { rm -f "$probe" 2>/dev/null; return 2; }
+    # ⛔ A NON-ZERO WALK IS NOT AUTOMATICALLY AN ABSTENTION: AN ENTRY THAT NO LONGER EXISTS IS GONE, NOT
+    # UNREADABLE. `find` on a vanished path exits non-zero like a permission failure, so a runner finishing
+    # a job mid-pass (it deletes its own `_work/<entry>`) was counted into `unmeasurable=` and could
+    # publish a non-`ok` census on a pass that measured everything else — MEASURED: `find /tmp/…/does-not-exist`
+    # → rc 1, 0 bytes. The two are different facts with different consequences (one says "I could not
+    # prove this checkout dead", the other says "there is nothing to prove"), so the re-stat is asked
+    # BEFORE the abstention is claimed. Return 3 is "vanished", which no caller counts as unmeasured.
+    tb_timeout "$FIND_TIMEOUT" find "$entry" \( -type f -o -type d \) -newer "$ref" -print 2>/dev/null >"$probe" \
+        || { rm -f "$probe" 2>/dev/null; [ -e "$entry" ] || return 3; return 2; }
     if [ -s "$probe" ]; then rm -f "$probe" 2>/dev/null; return 0; fi
     rm -f "$probe" 2>/dev/null
     return 1
 }
 
 # ── the sweep ───────────────────────────────────────────────────────────────────────────────────
-ROOTS=0; GLOBS_N=0; CAND=0; REAPED=0; KEPT=0; RETAINED=0; FAILED=0; UNMEASURABLE=0; REFUSED_ROOTS=0
+ROOTS=0; GLOBS_N=0; CAND=0; REAPED=0; KEPT=0; RETAINED=0; FAILED=0; UNMEASURABLE=0; REFUSED_ROOTS=0; GONE=0
+# Roots that PASSED the name gate and are waiting to be swept. The pass is TWO-PHASE (discover, then
+# sweep) so a refused seam can end it before anything is deleted — see the long note at phase 2.
+PENDING_ROOTS=""
 # Roots already swept, SPACE-delimited and matched with a `case` guard: bash 3.2 (this repo still ships
 # to macOS) has no associative arrays, so the seen-set is a string, exactly as `disk-reaper.sh`'s
 # `SKIPPED_WT` accumulates, and the surrounding spaces are what let ONE pattern cover the FIRST root too.
@@ -486,6 +497,9 @@ prune_entry() { # <entry> <root>
     fi
     entry_written_since "$entry" "$FLOOR_REF"; verdict=$?
     case "$verdict" in
+        3)  GONE=$((GONE + 1))
+            log_line "GONE   $entry reason=vanished (the entry no longer exists: a job finished and the runner cleaned its own checkout during this pass — nothing was measured and nothing removed, so it is NOT an abstention)"
+            return 0 ;;
         0)  KEPT=$((KEPT + 1))
             log_line "KEPT   $entry reason=written-within-floor (something under the entry was written within ${RUNNER_WORK_MIN_AGE}s, so it is not a candidate — ⚠️ NOT proof the job is alive: a job that writes only OUTSIDE its checkout is the disclosed residual, see the header)" ;;
         2)  UNMEASURABLE=$((UNMEASURABLE + 1))
@@ -522,6 +536,9 @@ prune_entry() { # <entry> <root>
             # the SAME question, so it cannot disagree with the policy it re-asks.
             entry_written_since "$entry" "$FLOOR_REF"; verdict=$?
             case "$verdict" in
+                3) GONE=$((GONE + 1))
+                   log_line "GONE   $entry reason=toctou-vanished (the entry disappeared between classification and removal — the runner cleaned it up itself; nothing removed, and not an abstention)"
+                   return 0 ;;
                 0) KEPT=$((KEPT + 1))
                    log_line "KEPT   $entry reason=toctou (a writer appeared during the pass; re-probed immediately before removal)"
                    return 0 ;;
@@ -645,65 +662,54 @@ for _g in $GLOBS; do
                 continue ;;
         esac
         case " $SEEN_ROOTS " in
-            *" $_r "*) log_line "reap-runner-work: root $_r was already swept from an earlier glob — not counted twice"
+            *" $_r "*) log_line "reap-runner-work: root $_r was already QUEUED from an earlier glob — not counted twice"
                 _matched=1
                 continue ;;
         esac
         SEEN_ROOTS="$SEEN_ROOTS $_r"
+        PENDING_ROOTS="$PENDING_ROOTS $_r"
         _matched=1
         log_line "reap-runner-work: root $_r (glob $_g)"
-        sweep_root "$_r"
     done
     [ "$_matched" = 1 ] || log_line "reap-runner-work: note: glob $_g matched no runner _work root on this box"
 done
 
+# ⛔ PHASE 2 DOES NOT BEGIN UNTIL EVERY MATCHED ROOT HAS PASSED THE NAME GATE — THE PASS IS TWO-PHASE
+# BECAUSE SWEEPING AS IT DISCOVERED MADE THE RECORD LIE ABOUT A PASS THAT HAD ALREADY DELETED. The gate
+# is per-root inside the loop, so with a seam that matched BOTH a real `_work` and a runner INSTALL tree
+# the pass REAPED under the good root and only then hit the refusal and exited 3 carrying a note that
+# said "nothing was swept": MEASURED (seam `…/gh-runner-x64-1/_work …/gh-runner*`, one --apply pass):
+#   REAPED …/gh-runner-x64-1/_work/job-dead how=rm (no content written for >= 7200s)
+#   REFUSED …/gh-runner-x64-1 reason=not-a-_work-root
+#   record: ok=0 rc=3 freed_mb=0 freed_mb_runner_work=not-run candidates_runner_work=?
+#   note_runner_work=… so nothing was swept …
+# A checkout was destroyed, the record credited 0 bytes for it, and the sentence an operator reads
+# denied it happened — the class can also trip `alert=under-reclaim` on the pass it DID reclaim. So a
+# wrong seam now refuses BEFORE anything is touched: `refused` means refused for the whole pass, which is
+# also what makes the entry point's "nothing was swept" note true. Every accepted root is still swept in
+# a single deterministic order, and the dedupe/attribution lines stay in discovery where they belong.
+
 # ⛔ THE CENSUS IS DECIDED BEFORE THE SUMMARY IS PRINTED, so the line the entry point lifts and the
 # exit status can never disagree about whether this pass measured anything.
-CENSUS=ok
-if [ "$ROOTS" = 0 ] && [ "$EXPLICIT" = 1 ]; then CENSUS=no-roots; fi
+# The two pre-sweep refusals come first and print their own SUMMARY, because they END the pass.
+print_summary() { # <census>
+    log_line "SUMMARY class=runner-work mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE gone=$GONE refused=$REFUSED_ROOTS min_age=${RUNNER_WORK_MIN_AGE}s explicit=$EXPLICIT census=$1"
+    log "SUMMARY mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE gone=$GONE refused=$REFUSED_ROOTS census=$1"
+}
+
 # ⛔ A MATCHED ROOT THAT WAS REFUSED IS ITS OWN CENSUS, because it has its own REMEDY. Without this
 # token the record narrowed a one-component-short seam (`/opt/gh-runner*/` for `/opt/gh-runner*/_work`)
 # down to `roots=0 census=no-roots`, which the entry point relays as "no runner _work root matched
-# DISK_REAPER_RUNNER_GLOBS" — a statement that is FALSE (the glob matched 12 install trees and they were
-# refused BY NAME) and that points the operator at the wrong fix. The refusal arm below has always
-# exited 3; what was missing was a token that says WHY, on the line the entry point lifts.
-if [ "$REFUSED_ROOTS" -gt 0 ]; then CENSUS=refused; fi
-# ⛔ A ZERO THAT NOTHING MEASURED IS NOT A ZERO — THE FALSE PASS A REVIEW FOUND AT THIS CLASS'S OWN FIX.
-# The root-abstention above counts an unlistable root into `unmeasurable=`, which is the right ANSWER and
-# was the wrong RECORD: with nothing readable, `CAND` stays 0, so the owner still printed `census=ok`
-# with `candidates=0`, and the entry point lifted that into `candidates_runner_work=0` /
-# `verdict_runner_work=ok`. MEASURED (a mode-0111 `_work` holding a provably dead entry):
-#   record: ok=1 / candidates_runner_work=0 / unmeasurable_runner_work=1 / verdict_runner_work=ok
-#   dead entry survived? YES
-# — a box whose sink fills and whose alarm reads `ok` for ever, on the very permission mismatch this
-# class's header names as plausible. `census=no-roots` (a WEAKER situation) already had the correct
-# treatment; this is the same rule one state over. The population was not measured, so it is not
-# reported: `candidates` stops being a count and the token says why. rc stays 0 — an abstention is not
-# a failure of the pass, it is the pass saying it could not look (an ALARM is the caller's judgement).
-# ⛔ AND AN ABSTENTION IS NOT ONLY TOTAL — `census=abstained` is gated on `candidates=0`, so a population
-# that was PARTLY unreadable still published `census=ok` and the entry point lifted it as
-# `verdict_runner_work=ok`: MEASURED on two roots, one readable with a dead entry and one mode-0111 —
-# `candidates=1 unmeasurable=1 census=ok`, so the record read ok while a whole runner's checkouts went
-# unmeasured. On a cell whose runners are not all owned by the same user (one `_work` root-owned 0750,
-# the rest readable) that is the LIKELY shape, not the corner: the unread root's dead entries accumulate
-# for ever and the one class verdict an operator reads says healthy. `census=partial` is the token for
-# it: the count that WAS measured stays reported (as a LOWER BOUND) and the verdict is not `ok`.
-if [ "$CENSUS" = ok ] && [ "$UNMEASURABLE" -gt 0 ]; then
-    if [ "$CAND" = 0 ]; then CENSUS=abstained; else CENSUS=partial; fi
-fi
-
-log_line "SUMMARY class=runner-work mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE refused=$REFUSED_ROOTS min_age=${RUNNER_WORK_MIN_AGE}s explicit=$EXPLICIT census=$CENSUS"
-log "SUMMARY mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE refused=$REFUSED_ROOTS census=$CENSUS"
-
-# ⛔ A REFUSED ROOT IS LOUD AND FAILS THE PASS. Checked BEFORE the no-roots arm: a layout whose only
-# match was refused is a WRONG LAYOUT seam, not a box with no runners, and the two need different
-# remedies — so the specific one wins.
+# DISK_REAPER_RUNNER_GLOBS" — a statement that is FALSE (the glob matched the runner INSTALL trees and
+# they were refused BY NAME) and that points the operator at the wrong fix. It is raised BEFORE the
+# sweep, so `census=refused` always means "nothing in this pass was touched".
 if [ "$REFUSED_ROOTS" -gt 0 ]; then
-    log_line "SKIP reason=not-a-_work-root ($REFUSED_ROOTS matched root(s) refused because their BASENAME is not '_work': the seam is one component short, e.g. '/opt/gh-runner*/' instead of '/opt/gh-runner*/_work' — sweeping it would delete the runner INSTALL tree)"
+    print_summary refused
+    log_line "SKIP reason=not-a-_work-root ($REFUSED_ROOTS matched root(s) refused because their BASENAME is not '_work': the seam is one component short, e.g. '/opt/gh-runner*/' instead of '/opt/gh-runner*/_work' — sweeping it would delete the runner INSTALL tree, so NOTHING was swept this pass)"
     exit 3
 fi
 
-if [ "$CENSUS" = no-roots ]; then
+if [ -z "${PENDING_ROOTS# }" ] && [ "$EXPLICIT" = 1 ]; then
     # ⛔ AN EXPLICIT LAYOUT THAT MATCHES NOTHING IS A REFUSAL, NOT A ZERO. When the operator (or the
     # rendered unit) SET the glob list, they asserted where this box's runners live; a sweep over a
     # population that is not there must not report `candidates=0` as if it had measured the sink. It is
@@ -712,9 +718,31 @@ if [ "$CENSUS" = no-roots ]; then
     # With the DEFAULT globs the opposite is true: a box with no runners in the documented layouts has
     # an EMPTY POPULATION, which IS a measurement (`roots=0`), not a misconfiguration. Painting that red
     # every hour is the alarm-fatigue shape this family forbids — an alarm nobody reads.
+    print_summary no-roots
     log_line "SKIP reason=no-roots-matched (the glob list was set EXPLICITLY and matched no directory: '$GLOBS')"
     exit 3
 fi
+
+for _r in $PENDING_ROOTS; do sweep_root "$_r"; done
+
+# ⛔ A ZERO THAT NOTHING MEASURED IS NOT A ZERO — THE FALSE PASS A REVIEW FOUND AT THIS CLASS'S OWN FIX.
+# ⛔ AND "NOTHING MEASURED" IS NOT "NO CANDIDATES": THE TEST IS WHAT WAS REACHED, NOT WHAT WAS REAPABLE.
+# The first version of this gate keyed on `candidates=0`, which conflated two different states and made
+# the ABSTENTION claim a falsehood on the most ordinary healthy box: two roots, one readable holding only
+# a FRESH checkout, one unlistable — `kept=1 unmeasurable=1` — published `census=abstained`, whose note
+# says "nothing under a matched _work root could be READ … no entry was classified" about an entry that
+# WAS read and classified as `written-within-floor`, and painted a non-`ok` verdict on a cell that was
+# fine. The gate is therefore REACHED-ness: any entry classified (candidate, kept, retained, reaped,
+# failed or observed-gone) means the census saw something, so the token is `partial` and the count is a
+# LOWER BOUND. `abstained` is reserved for the pass that reached NOTHING (case (l)'s shape). rc stays 0
+# either way — an abstention is not a failure of the pass, it is the pass saying it could not look (an
+# ALARM is the caller's judgement).
+CENSUS=ok
+if [ "$UNMEASURABLE" -gt 0 ]; then
+    if [ $(( CAND + KEPT + RETAINED + REAPED + FAILED + GONE )) -eq 0 ]; then CENSUS=abstained; else CENSUS=partial; fi
+fi
+
+print_summary "$CENSUS"
 
 [ "$FAILED" -gt 0 ] && exit 4
 exit 0
