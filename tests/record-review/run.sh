@@ -2317,6 +2317,28 @@ if [ -d "$DELTA_REPO" ]; then
   else
     fail "(33a5) delta_measured_from() could not be extracted from record-review.sh — re-anchor the pin rather than dropping it"
   fi
+  # (33a6) THE ACCEPTED DIRECTION, CHECKED BY THE READER — not just described by the writer
+  # (#3247 review, P2). Everything above asserts what the WRITER emitted, and (33f2) runs
+  # `--check-carry` only over the record `--delta` is supposed to REFUSE. Nothing ran the reader
+  # over the record the delta just minted, so a regression that stopped writing the top-level
+  # `carry_arm` would make every genuine delta answer `norecord`/exit 4 at the merge gate — the
+  # feature silently INERT — while this suite stayed green: (33a)/(33a2) never look at
+  # `carry_arm`, and (33f2) only proves the reader agrees about a record nothing should produce.
+  # It is the PAIR that is asserted, not the word: `--check-carry` requires `carry_arm` AND
+  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:2407-2418) BEFORE it
+  # head-binds at :2443, so a delta record missing either is a no-record for the gate.
+  D_REC_A6="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
+  CC_RC_A6=0
+  CC_OUT_A6="$( cd "$DELTA_REPO" || exit 9
+    HOME="$DR_HOME" PATH="$TMP/dbin:$PATH" FIX_REPO="$DELTA_REPO" \
+    FIX_BASE="$D_BASE" FIX_HEAD="$D_MERGED" \
+      bash "$SRC" --check-carry 7101 fixture/repo 2>/dev/null )" || CC_RC_A6=$?
+  [ "$CC_RC_A6" -eq 0 ] \
+    && [ "${CC_OUT_A6%%$'\t'*}" = "head" ] \
+    && [ "$(grep -c '"carry_arm":"lane"' <<<"$D_REC_A6")" = 1 ] \
+    && [ "$(grep -c '"evidence":"comment:9000001"' <<<"$D_REC_A6")" = 1 ] \
+    && pass "(33a6) the ACCEPTED delta record is accepted BY THE READER: --check-carry answers head/exit 0 for it, and the record carries top-level carry_arm=lane AND evidence — so the merge gate cannot classify a real delta as norecord" \
+    || fail "(33a6) the record the delta minted is not one --check-carry accepts (rc=$CC_RC_A6, out='$CC_OUT_A6', record='$D_REC_A6')"
   # (b) one real authored commit on top of the merge: authorship moved, so a review is owed.
   ( cd "$DELTA_REPO" || exit 9; printf 'lane fix\n' >> lane.txt; git add -A; git commit -qm "lane: a real fix commit" ) >/dev/null 2>&1
   D_FIXED="$( cd "$DELTA_REPO" && git rev-parse pr )"
@@ -2477,7 +2499,16 @@ while i < len(src):
 open(sys.argv[2], "w", encoding="utf-8").write("\n".join(out))
 print(f"mutant: dropped {dropped} post-condition(s)")
 INNERPY
-  if grep -q 'no carry arm ran' "$TMP/nodelta-postcond.sh"; then
+  # ⛔ THE MUTANT'S EXISTENCE IS PART OF THE ASSERTION (#3247 review, P3). `bash "$1"` on a path
+  # that was never written exits **127**, which satisfies `[ rc -ne 3 ]` and greps for a message no
+  # mutant could print — so a heredoc that failed outright would report ATTRIBUTION having mutated
+  # nothing. That is this suite's own recurring defect (an arm green because the thing it measures
+  # never ran), so the guards come FIRST and name it.
+  if [ ! -f "$TMP/nodelta-postcond.sh" ]; then
+    fail "(33g2) the mutant was never WRITTEN (the deletion heredoc failed), so 'no refusal' would be bash's 127 on a missing file rather than a measurement — attribution is unproven"
+  elif [ ! -s "$TMP/nodelta-postcond.sh" ]; then
+    fail "(33g2) the mutant is EMPTY — running it proves nothing about the post-condition"
+  elif grep -q 'no carry arm ran' "$TMP/nodelta-postcond.sh"; then
     fail "(33g2) the mutant still contains the post-condition — the deletion did not land, so attribution is unproven"
   else
     delta_write_record 7108 "$D_REVIEWED" clean-micro
@@ -2662,10 +2693,15 @@ fi
 # 33f2 pin the unproven-delta refusal and the "both verbs agree" invariant, which were MEASURED
 # green under deletion before they existed.
 # AFTER THE REBASE the count is main's plus this section's: main spent 185 -> 190 on #3347's own
-# section (32), and this PR adds 11, so the pin is 201. The section is numbered 33 for the same
-# reason — (32) was already taken on main by the time this branch was rebased.
-# MEASURED: `ALL PASSED (201 assertion(s))` on the rebased tree.
-MIN_ASSERTIONS=203
+# section (32), and this PR's section 33 adds 14, so the pin is 204 (190 + 14). Section 33's arms
+# are 33a, 33a2, 33a3, 33a4, 33a5, 33a6, 33b, 33c, 33d, 33e, 33f, 33f2, 33g, 33g2 — count THEM, not
+# this sentence: the previous revision of this comment said "this PR adds 11, so the pin is 201"
+# against a constant of 203, which is the rot a comment restating its own arithmetic always
+# suffers. The section is numbered 33 for the same reason — (32) was already taken on main when
+# this branch was rebased.
+# MEASURED: `ALL PASSED (204 assertion(s))` on this tree (macOS, bash 3.2). `bash-suites` REFUSES to
+# run on a live cell (exit 78), so a local ALL PASSED is NOT CI evidence — see the PR comment.
+MIN_ASSERTIONS=204
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

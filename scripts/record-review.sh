@@ -3536,7 +3536,7 @@ delta_measured_from() { # <arm> <record-head> <diff-arm-sha> <patch-arm-sha>
 }
 
 delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
-  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp=""
+  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp="" n3="" _seen=0 _ln=""
   local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
   b="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
   case "$b" in *[!0-9a-f]* | "") b="" ;; esac
@@ -3641,7 +3641,23 @@ delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
     elif [ "$n" -eq 0 ]; then
       printf 'no-new-authored-commits=yes commits=0\n'
     else
-      printf 'no-new-authored-commits=no commits=%s %s\n' "${n:-0}" "$(printf '%s' "$extra" | command head -3 | command tr '\n' ',' | command sed 's/,$//')"
+      # ⛔ NO PIPE HERE EITHER (#3247 review, P3). This is the `no-new-authored-commits` listing and
+      # it was the ONE remaining `printf … | head -3 | tr | sed` in the file, ~30 lines below the `mt`
+      # line above and ~90 below the reader whose 9-in-40 empty-stdout measurement justifies de-piping
+      # that shape. It did NOT fault — the pipeline is an ARGUMENT to the outer `printf`, so the 141
+      # was never a command's own status — but "this instance happens not to fault" is not a reason to
+      # keep one convention for the diagnostic the arms above exist to make reachable and another
+      # everywhere else: the next edit that hoists it into a statement would ARM the bug. Built in
+      # BASH, like `${mt_raw%%$'\n'*}` above: no writer process exists, so nothing can be signalled.
+      # (`mapfile`/`readarray` are NOT available — this file must run on bash 3.2.)
+      while IFS= read -r _ln; do
+        if [ "$_seen" -lt 3 ]; then
+          n3="${n3:+$n3,}$_ln"; _seen=$((_seen+1))
+        else
+          break
+        fi
+      done <<<"$extra"
+      printf 'no-new-authored-commits=no commits=%s %s\n' "${n:-0}" "$n3"
     fi
   else
     printf 'no-new-authored-commits=UNMEASURED(no authoritative base read)\n'

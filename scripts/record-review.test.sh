@@ -2593,8 +2593,12 @@ fi
 #      onto a tree with nothing in the record a reader could check — the tortoise#10677
 #      shape. The record here carries a full `delta` object and still names NO arm and NO
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
-#      a real delta record DOES write top-level `carry_arm` (scripts/record-review.sh:4174)
-#      and `evidence`, so naming the mint alone buys nothing.
+#      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
+#      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
+#      (scripts/record-review.sh:4226 at this head — RE-DERIVE it, do not trust the number: a bare
+#      line citation here rotted once already, :4174 -> :4210, and this comment is not what makes
+#      the assertion true). One command answers it:
+#        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
 printf '{"pr":424920,"head_sha":"%s","diff_sha256":"%s","mint":"delta","carried_from":"%s","delta":{"from":"%s","to":"%s","proved":"lane","arm":"lane"},"verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
     "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_FILE-424920.json"
 run_check_carry 424920 "$CC_REPO"
