@@ -420,35 +420,41 @@ function odd_trailing_bs(s,   n, k) {
 # main rule uses — one scanner, so a unit can never be treated differently according to where it sits.
 {
   if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
-  if (FNR == 1) { flush_unit(); ACC = ""; ACCFNR = 0 }
+  if (FNR == 1) { flush_unit(); ACC = ""; ACCFNR = 0; ACCFILE = "" }
   if (ACC == "" && $0 ~ /^[ \t]*#/) next       # documentation — decided on the FIRST physical line
-  if (ACC == "") { s = $0; ACCFNR = FNR } else { s = ACC $0 }
+  # ⛔ THE FILE IS REMEMBERED WITH THE LINE, not read at flush time. `flush_unit()` also runs at this
+  # very `FNR == 1` boundary — the moment `FILENAME` has already advanced to the file being OPENED —
+  # so a unit dangling at the end of a NON-last file was attributed to the file AFTER it (P1, review of
+  # `7d65a618`; measured: `AGENT_NEW_GATE_REFUSED=83\` at `brief-gate.sh:274` emitted
+  # `claim … key-gate.sh  274`, a file holding zero occurrences of that name).
+  if (ACC == "") { s = $0; ACCFNR = FNR; ACCFILE = FILENAME } else { s = ACC $0 }
   # ⛔ THE JOIN DROPS BOTH THE BACKSLASH AND THE NEWLINE — it does NOT insert a space (measured on the
   # first cut: joining with " " turned `NAME\`+`=83` into `NAME =83`, which parses as neither an
   # assignment nor the original, so the fix left the fail-open in place AND reddened nothing).
   if (odd_trailing_bs(s)) { ACC = substr(s, 1, length(s) - 1); next }
   ACC = ""
-  scan_unit(s, ACCFNR)
+  scan_unit(s, ACCFNR, FILENAME)
 }
 END { flush_unit() }
 
 # flush_unit() — scan whatever the accumulator still holds, then clear it.
 function flush_unit() {
   if (ACC == "") return
-  _fu = ACC; _ful = ACCFNR
+  _fu = ACC; _ful = ACCFNR; _fuf = ACCFILE
   ACC = ""
   if (_fu ~ /^[ \t]*#/) return                # a comment unit declares nothing
-  scan_unit(_fu, _ful)
+  scan_unit(_fu, _ful, FILENAME)
 }
 
-# scan_unit(s, ln) — scan ONE logical line. `ln` is its FIRST physical line, so every row points a reader
-# at the start of the declaration rather than into the middle of a continuation.
-function scan_unit(s, ln,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, _vv, _e, _t2) {
-  LN = ln
-  f = basename(FILENAME)
-  sub(/^[ \t]+/, "", s)
-  LN = ACCFNR                                 # rows report the declaration's FIRST physical line
-  f = basename(FILENAME)
+# scan_unit(s, ln, fl) — scan ONE logical line. `ln`/`fl` are its FIRST physical line and THE FILE THAT
+# LINE LIVES IN, so every row points a reader at the declaration's own start rather than into the middle
+# of a continuation or at whichever file happens to be open now. (`fl` is passed, never derived from
+# `FILENAME`: see the `ACCFILE` note in the main rule. Three dead statements lived here — a `LN = ln`
+# immediately overwritten by `LN = ACCFNR`, and this `basename(FILENAME)` / `sub()` pair repeated — and
+# they are the mechanism of that wrong-file row, not cosmetic.)
+function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, _vv, _e, _t2) {
+  LN = ln                                     # rows report the declaration's FIRST physical line
+  f = basename(fl)
   sub(/^[ \t]+/, "", s)
   if (s ~ /^#/) next                          # documentation, never a declaration
   # ⛔ A GLUED `printf -vNAME` IS THE SAME DECLARATION (review cycle 3, P2 — measured). bash accepts
@@ -2739,9 +2745,16 @@ while IFS='|' read -r _shtag _shline; do
   esac
 done <<< "$_codeshapes"
 _shape_n="$(printf '%s\n' "$_codeshapes" | awk 'NF{n++} END{print n+0}')"
-[ -z "${_shape_unread// /}" ]; rc=$?
+# ⛔ THE COUNT IS ASSERTED, NOT ONLY PRINTED (P1, review of `7d65a618` — measured). Every arm below
+# is a loop over a TABLE, and an EMPTY table drives ZERO iterations, leaves its accumulator empty, and
+# satisfies `[ -z "$_unread" ]` — so the arm goes GREEN having read NOTHING. Measured with
+# `_codeshapes=""`: "CLASSIFIES all 0 declaration shapes … (unread: none)" PASSED, which is precisely
+# the silent-gap class this list exists to close, reproduced inside the arm that closes it. The
+# `_armdriven`/`_armrows` accounting below already solves this for the arm table; these three shape
+# tables (shape, residual, foreign) get the same non-vacuity guard on BOTH of their arms.
+[ "$_shape_n" -gt 0 ] && [ -z "${_shape_unread// /}" ]; rc=$?
 ck "the scanner CLASSIFIES all $_shape_n declaration shapes as a claim of the code they carry (unread:${_shape_unread:- none}) — the parser this replaces reported 0 rows for each of them" $rc
-[ -z "${_shape_unred// /}" ]; rc=$?
+[ "$_shape_n" -gt 0 ] && [ -z "${_shape_unred// /}" ]; rc=$?
 ck "...and EVERY one of them REDDENS the duplicate check as the 83 collision, not for some other reason (green:${_shape_unred:- none})" $rc
 
 # ⛔ THE P1 THE LIST ITSELF COULD NOT SEE (review of `87b8d708b`, BLOCKING). The list above is a
@@ -2813,9 +2826,10 @@ while IFS='|' read -r _rtag _rkind _rline; do
   esac
 done <<< "$_residshapes"
 _resid_n="$(printf '%s\n' "$_residshapes" | awk 'NF{n++} END{print n+0}')"
-[ -z "${_resid_unread// /}" ]; rc=$?
+# …and the same non-vacuity guard as the shape table above: an empty residual table must be a RED.
+[ "$_resid_n" -gt 0 ] && [ -z "${_resid_unread// /}" ]; rc=$?
 ck "the scanner CLASSIFIES all $_resid_n RESIDUAL declaration shapes (array subscripts, printf -v, read) — the reviewed head reported 0 rows for every one of them (unread:${_resid_unread:- none})" $rc
-[ -z "${_resid_unred// /}" ]; rc=$?
+[ "$_resid_n" -gt 0 ] && [ -z "${_resid_unred// /}" ]; rc=$?
 ck "...and EVERY one of them REDDENS the code check as a NAMED collision or 'unparseable declaration: file:line' — a shape that vanishes again fails HERE (green:${_resid_unred:- none})" $rc
 # (f1c) THE ANTIDOTE — a guard that reddens everything detects NOTHING, and every arm above would then
 # pass for the wrong reason. These lines are token-bearing or declaration-SHAPED and declare no code: an
@@ -2950,6 +2964,21 @@ printf '\nAGENT_NEW_GATE_REFUSED=83\\' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
 ck "(continuation) a declaration on the file's LAST line ending in \`\\\` (no trailing newline) is READ — an accumulator that is never flushed at EOF drops it silently (rc=$CODE_RC; $CODE_MSG)" $rc
+# ⛔ AND THE SAME UNIT MUST BE ATTRIBUTED TO THE FILE IT IS IN (P1, review of `7d65a618` — measured).
+# `flush_unit()` is also called from the `FNR == 1` boundary, where `FILENAME` is already the file being
+# OPENED — so a unit dangling at the end of a NON-last file took the NEXT file's name. Measured on the
+# shipped scanner: `AGENT_NEW_GATE_REFUSED=83\` appended to `brief-gate.sh:274` emitted
+# `claim … key-gate.sh  274`, and `key-gate.sh` holds ZERO occurrences of that name. Only the LINE
+# number survived (both sides read `ACCFNR`), which is what made the wrong file hard to see. The arm
+# above cannot catch it: it appends to `spawn-gate.sh`, which sorts LAST in `*.sh` glob order, so the
+# EOF flush happens to name the right file. This one appends to a file that sorts in the MIDDLE, and
+# asserts the ROW (the artefact an operator acts on), not just that the verdict reddened.
+_codemut_dir="$(_codemut dangling-mid-file)"
+printf '\nAGENT_NEW_GATE_REFUSED=83\\' >> "$_codemut_dir/brief-gate.sh"
+_dmf_line="$(awk 'END{print NR}' "$_codemut_dir/brief-gate.sh")"
+_dmf_row="$(refusal_codes "$_codemut_dir" | awk -F'\t' -v n=AGENT_NEW_GATE_REFUSED '$1=="claim" && $2==n{print $4":"$5; exit}')"
+[ "$_dmf_row" = "brief-gate.sh:$_dmf_line" ]; rc=$?
+ck "(continuation) a dangling \`\\\` on the LAST line of a file that is NOT last in scan order is attributed to ITS OWN file (want: brief-gate.sh:$_dmf_line; got:${_dmf_row:- none}) — a unit flushed at the \`FNR == 1\` boundary named the file being OPENED, sending an operator to a file that does not contain the declaration (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f1i) and the other direction: `==` is a COMPARISON, in both spellings. The spaced form was silent and
 # the UNSPACED form was refused, so the verdict held only by whitespace.
@@ -3036,7 +3065,9 @@ while IFS= read -r _fsp; do
   codes_verdict "$_codemut_dir"
   case "$CODE_MSG" in *"foreign:"*) : ;; *) _unred_spell="$_unred_spell [$_fsp]" ;; esac
 done <<< "$_foreign_decl"
-[ -z "${_unred_spell// /}" ]; rc=$?
+# …and the non-vacuity guard: `_fsi` counts the forms actually DRIVEN, so an emptied table is a RED
+# here rather than a green sentence that names zero spellings it never checked.
+[ "$_fsi" -gt 0 ] && [ -z "${_unred_spell// /}" ]; rc=$?
 ck "...and EVERY spelling AND SHAPE of that foreign declaration is REFUSED ($_fsi forms: bare, quoted ×2, leading zero, plus-sign, array subscript, +=, printf -v, arithmetic, :=, associative literal, and the bare-suffix NAME) — a verdict that depends on how a constant was SPELLED is not a guard (unred:${_unred_spell:- none})" $rc
 # ... and the precision half: the net reads the VALUE A DECLARATION GIVES, not every uppercase
 # assignment, so widening the reader must not start reddening ordinary variables. Each line below is
