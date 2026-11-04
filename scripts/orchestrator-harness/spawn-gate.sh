@@ -1785,7 +1785,17 @@ brief_gate_lib() {
 # CANNOT VERIFY out loud instead of staying silent, which is the half that matters.
 mandate_preflight_lib() {
   local c here
-  if [ -n "${MANDATE_PREFLIGHT_SH:-}" ]; then printf '%s\n' "$MANDATE_PREFLIGHT_SH"; return 0; fi
+  # ⛔ AN OVERRIDE IS A CANDIDATE, NOT A VERDICT (this change's review, P2, MEASURED). This returned
+  # `$MANDATE_PREFLIGHT_SH` on `[ -n ]` alone while the four real candidates below were each tested with
+  # `[ -f ]` — so a STALE path in that ambient variable short-circuited the resolver to something that is
+  # not a file, `. "$_mp_sh"` then failed at the call site, and the disclosure silently degraded to the
+  # LOG-ONLY `CANNOT VERIFY` line on a box whose `$O/mandate-preflight.sh` is present and correct. The
+  # lane-visible half — the half this whole change exists to deliver — would be gone, while `install.sh`'s
+  # DRIFTED list and `check-single-source.sh`'s EXECUTED arm still reported the helper verified. An
+  # override that is not a file is therefore SKIPPED, exactly like `O=`-relative candidates that are
+  # absent, and the resolver keeps looking. (The polarity is deliberately NOT `brief_gate_lib`'s:
+  # a brief gate refuses loudly, this one discloses.)
+  if [ -n "${MANDATE_PREFLIGHT_SH:-}" ] && [ -f "${MANDATE_PREFLIGHT_SH}" ]; then printf '%s\n' "$MANDATE_PREFLIGHT_SH"; return 0; fi
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   for c in "${O:-}/mandate-preflight.sh" "$here/mandate-preflight.sh" \
            "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh" \
