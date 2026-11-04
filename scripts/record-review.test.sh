@@ -5600,7 +5600,7 @@ assert_contains "$(cat "$(Q2 $EH20E)" 2>/dev/null || true)" '"mint":"carried"' "
 #       carry-provenance arm (#10177); neither side could see it alone.
 DV_DIGEST="$(printf '0123456789abcdef%.0s' 1 2 3 4)"
 EH21=425172; rm -f "$(Q2 $EH21)"
-printf '{"pr":%d,"head_sha":"%s","evidence":"delta:%s..%s+comment:42517201","delta_range":"%s..%s","delta_base":"%s","delta_kind":"lane","delta_digest":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
+printf '{"pr":%d,"head_sha":"%s","evidence":"delta:%s..%s+comment:42517201","delta_range":"%s..%s","delta_base":"%s","delta_kind":"authored","delta_digest":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-06-02T00:00:00Z"}\n' \
     "$EH21" "$DG_A1" "$DG_BASE" "$DG_A1" "$DG_BASE" "$DG_A1" "$DG_M1" "$DV_DIGEST" > "$(Q2 $EH21)"
 run_record_carry_at $EH21 "$DG_A1" "$DG_HEAD" ""
 assert_eq "$RECORD_RC" "0" "20f-d a carry inheriting a delta claim records (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
@@ -5608,7 +5608,7 @@ R21="$(cat "$(Q2 $EH21)" 2>/dev/null || true)"
 assert_contains "$R21" '"mint":"carried"' "20f-d …as a carry"
 assert_contains "$R21" "\"delta_range\":\"$DG_BASE..$DG_A1\"" "20f-d …keeping the REVIEWED range, not the range up to the carry head"
 assert_contains "$R21" "\"delta_base\":\"$DG_M1\"" "20f-d …and the base it was classified against (re-derivable)"
-assert_contains "$R21" '"delta_kind":"lane"' "20f-d …and its classification"
+assert_contains "$R21" '"delta_kind":"authored"' "20f-d …and its classification (a value the producer can actually emit: 'authored'|'merge-only', never the carry arm 'lane')"
 assert_contains "$R21" "\"delta_digest\":\"$DV_DIGEST\"" "20f-d …and the digest, so the inherited claim stays checkable"
 assert_contains "$R21" '"evidence":"delta:' "20f-d …while the evidence it inherits is the delta claim it substantiates"
 # REFUSAL DIRECTION: a predecessor that names a delta but carries none of its fields

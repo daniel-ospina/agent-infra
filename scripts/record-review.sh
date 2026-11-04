@@ -3918,7 +3918,7 @@ delta_measured_from() { # <arm> <record-head> <diff-arm-sha> <patch-arm-sha>
 }
 
 delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
-  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp=""
+  local from="$1" to="$2" b="" p2="" mt="" mt_raw="" m_rc=0 ct="" extra="" pd1="" pd2="" n="" dtmp="" n_rc=0
   local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
   b="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
   case "$b" in *[!0-9a-f]* | "") b="" ;; esac
@@ -4774,7 +4774,16 @@ fi
 # validates only the fields it reads, and record_identity compares whole strings,
 # so an added field can only ever make two records MORE distinguishable).
 DELTA_FIELDS=""
-if [ -n "$DELTA_FROM" ]; then
+# ⛔ THE PREDICATE IS THE RANGE'S OWN FIELD SET, NOT `DELTA_FROM` (agent-infra#3247 × #3299).
+# `DELTA_FROM` is a name BOTH features own: `--delta` sets it to the head it measures FROM
+# and sets NOTHING else, while only `delta_verify` sets DELTA_TO/DELTA_KIND/DELTA_DIGEST.
+# Keying this write on `DELTA_FROM` alone therefore emitted
+# `"delta_range":"<head>.."` — an empty upper bound with an empty base, classification and
+# digest — into EVERY `--delta` record, and simultaneously made the `elif` below (the
+# delta-inheriting carry) UNREACHABLE for exactly the record shape it was written for.
+# Each feature was green in isolation; only the merged tree shows it. Requiring the whole
+# verified set is what says "a range was actually verified HERE".
+if [ -n "$DELTA_FROM" ] && [ -n "$DELTA_TO" ] && [ -n "$DELTA_DIGEST" ]; then
   DELTA_FIELDS="\"delta_range\":\"$DELTA_FROM..$DELTA_TO\",\"delta_base\":\"$DELTA_BASE\",\"delta_kind\":\"$DELTA_KIND\",\"delta_digest\":\"$DELTA_DIGEST\","
 elif [ -n "$CARRY_EVIDENCE" ] && [ "${CARRY_EVIDENCE#delta:}" != "$CARRY_EVIDENCE" ]; then
   # ⛔ A CARRY THAT INHERITS A `delta:` CLAIM MUST CARRY THE CLAIM'S OWN FIELDS.
@@ -4782,10 +4791,10 @@ elif [ -n "$CARRY_EVIDENCE" ] && [ "${CARRY_EVIDENCE#delta:}" != "$CARRY_EVIDENC
   # (#10177). A carry re-binds a verdict that was minted at an EARLIER head and
   # copies that verdict's `evidence` verbatim — so a predecessor whose evidence was
   # `delta:A..B` produced a carried record asserting a RANGE whose `delta_range`,
-  # `delta_base`, `delta_kind` and `delta_digest` were ABSENT, because `DELTA_FROM`
-  # is set only by `delta_verify` and a carry never reaches it (the delta-vs-carry
-  # guard above refuses a delta ref on the COMMAND LINE; it says nothing about a
-  # carry that INHERITS one). The record then claims exactly the thing this feature
+  # `delta_base`, `delta_kind` and `delta_digest` were ABSENT, because only
+  # `delta_verify` sets DELTA_TO/DELTA_KIND/DELTA_DIGEST and a carry never reaches it
+  # (the delta-vs-carry guard above refuses a delta ref on the COMMAND LINE; it says
+  # nothing about a carry that INHERITS one). The record then claims exactly the thing this feature
   # exists to make checkable, and no reader can re-derive it — the header's own
   # promise ("a reader can re-derive the range, its classification and the digest")
   # would be false of every carried delta.
@@ -4795,8 +4804,14 @@ elif [ -n "$CARRY_EVIDENCE" ] && [ "${CARRY_EVIDENCE#delta:}" != "$CARRY_EVIDENC
   # claim — and `carried_from`/`carry_arm`/`reviewed_diff_sha256` say how it moved.
   # They are COPIED, never re-derived: `delta_verify` would refuse here anyway, since
   # it requires the range's upper bound to BE the head being recorded and in a carry
-  # that head has moved. The range is re-checked against the inherited evidence below,
-  # so an inconsistent predecessor is refused instead of silently transcribed.
+  # that head has moved. The two fields are then COMPARED against the inherited
+  # `evidence` below (range equality plus non-emptiness), so a predecessor whose fields
+  # disagree with its own evidence string is refused instead of silently transcribed.
+  # ⛔ WHAT THIS IS NOT: the digest is NOT recomputed and the record file is NOT
+  # signature-checked here — `$FILE` is local JSON. A hand-edited predecessor with a
+  # self-consistent range/digest pair is transcribed verbatim into a freshly SIGNED
+  # marker. Declared as a residual (see the PR body); closing it needs a re-deriving
+  # read here, which is a larger change than this integration.
   _cd_range="$(sed -n 's/.*"delta_range":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
   _cd_base="$(sed -n 's/.*"delta_base":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
   _cd_kind="$(sed -n 's/.*"delta_kind":"\([^"]*\)".*/\1/p' "$FILE" 2>/dev/null | command head -1 || true)"
