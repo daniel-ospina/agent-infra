@@ -3859,13 +3859,20 @@ queue_order_from_pool() {
     # The reorder could not be produced at all. The queue is UNCHANGED (membership is not this
     # function's business), and the ORDER's provenance is stated rather than assumed.
     QUEUE_ORDER_STATE="priority-unreadable"
-    echo "[refresh] priority-unreadable: the queue order could NOT be re-derived from $o/.pool — $o/candidates.txt is in ARRIVAL order, which is NOT a priority decision (this line exists so that state can never read as an ordered queue)"
+    # ⛔ AND IT IS NOT "ARRIVAL ORDER" EITHER (review P2). Both failure arms leave `candidates.txt`
+    # UNTOUCHED (`rm -f`, no `mv`), so the file still holds whatever the PREVIOUS pass left — after any
+    # successful pass that is the POOL's order. The first version of this line asserted "is in ARRIVAL
+    # order" about a file this pass never read: the same defect as the P1 above (a typed claim where a
+    # read one belongs), in the opposite direction. Measured: `queue '300 9 200'` + `pool '200 300'` ->
+    # `200 300 9`; a second pass with `.pool` missing printed "ARRIVAL order" while the file still held
+    # `200 300 9`. Say only what the function knows: the reorder did not run, so the ORDER IS UNVERIFIED.
+    echo "[refresh] priority-unreadable: the queue order could NOT be re-derived from $o/.pool — the reorder did NOT run, so $o/candidates.txt is UNCHANGED: its order is whatever the PREVIOUS pass left, which this pass never verified. Read it as UNVERIFIED (severity UNKNOWN) — not as this pass's priority decision, and not as arrival order either"
     rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
     return 1
   fi
   if ! mv "$o/.cand.ranked" "$o/candidates.txt"; then
     QUEUE_ORDER_STATE="priority-unreadable"
-    echo "[refresh] priority-unreadable: the pool-ordered queue could not be moved into $o/candidates.txt — the queue on disk is the pre-reorder file, so its order is NOT a priority decision"
+    echo "[refresh] priority-unreadable: the pool-ordered queue could not be moved into $o/candidates.txt — the queue on disk is UNCHANGED (the pre-reorder file, i.e. whatever the PREVIOUS pass left), so its order is UNVERIFIED this pass and its severity is UNKNOWN"
     rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
     return 1
   fi
@@ -5641,10 +5648,24 @@ if [ -n "$_head_issue" ]; then
   # declared unreadable — a queue the pool ranked nothing in, and a reorder that failed. The pre-change
   # wording ("the oldest CLEAN entry") was at least true. Now the adjective is chosen from what the
   # writer recorded, and the unreadable case keeps the honest word.
+  # ⛔ AND EVERY ARM DESCRIBES THE STATE IT ACTUALLY HANDLES (review P2, cycle 2). Two of these were
+  # still false claims, in the same shape the P1 was fixing:
+  #   · `empty` claimed "the queue is EMPTY, so this ROW is unranked", about a row that cannot exist in
+  #     that state — `empty` is only reachable when the reorder read an EMPTY queue, and nothing writes
+  #     candidates.txt after it, so `_head_issue` is then empty and this `[ -n ]` guard is false. The
+  #     arm is kept as the INCONSISTENCY arm (it is the one case where writer and reader disagree) and
+  #     now says that instead of inventing a row.
+  #     ⛔ b3037738 recorded this finding as "FALSIFIED — it is reachable and driven by the drained-queue
+  #     arm … the suite already asserts it". That falsification was WRONG: the suite assertion it cites
+  #     drives `queue_order_from_pool`'s own message, not THIS branch. Corrected here, at the source.
+  #   · `*)` claimed "the order is ARRIVAL order", which is true of a reorder that ranked NOTHING
+  #     (the file really is rewritten in arrival order) and FALSE of a reorder that FAILED (the file is
+  #     untouched, so its order is the previous pass's — possibly severity-ordered). The one fact true
+  #     of both is that THIS PASS established no priority order.
   case "${QUEUE_ORDER_STATE:-}" in
     severity) _head_rank="the highest-ranked CLEAN entry in the pool-ordered queue" ;;
-    empty)    _head_rank="the oldest CLEAN entry still queued (the queue is EMPTY of pool-ranked work, so this row is unranked — its severity is UNKNOWN)" ;;
-    *)        _head_rank="the OLDEST CLEAN entry still queued — priority-unreadable: the order is ARRIVAL order and its severity is UNKNOWN, not a priority decision" ;;
+    empty)    _head_rank="the oldest CLEAN entry still queued — the reorder ranked NOTHING (it read an empty queue) and yet a row is here, so writer and reader disagree: treat this row as UNRANKED with severity UNKNOWN, not as ranked by anything" ;;
+    *)        _head_rank="the OLDEST CLEAN entry still queued — priority-unreadable: this pass established NO priority order for the queue, so its severity is UNKNOWN, not a priority decision" ;;
   esac
   case " ${QUEUED_THIS_PASS:-}" in
     *" $_head_issue "*) _head_why="judged CLEAN by THIS pass, and $_head_rank" ;;
