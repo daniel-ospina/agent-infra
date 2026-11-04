@@ -112,6 +112,7 @@ case "${GH_MODE:-merged}" in
   merged) printf 'MERGED 2026-10-27T03:56:04Z %s\n' "$url" ;;
   open)   printf 'OPEN - %s\n' "$url" ;;
   wrongrepo) printf 'MERGED 2026-10-27T03:56:04Z https://github.com/someone/else/pull/%s\n' "$pr" ;;
+  wrongrepoghe) printf 'MERGED 2026-10-27T03:56:04Z https://ghe.example.com/someone/else/pull/%s\n' "$pr" ;;
   otherhost) printf 'MERGED 2026-10-27T03:56:04Z https://ghe.example.com/%s/pull/%s\n' "${repo:-x/y}" "$pr" ;;
   nourl)  printf 'MERGED 2026-10-27T03:56:04Z -\n' ;;
   fail)   printf 'HTTP 502: bad gateway\n' >&2; exit 1 ;;
@@ -782,9 +783,23 @@ assert_rc 25 "$RC" "WRONG-ID: a same-host url naming another repo abstains"
 assert_contains "$TXT" "wrong IDENTITY" "WRONG-ID: the note names the identity, not the host"
 assert_contains "$TXT" "start a new run" "WRONG-ID: and prescribes the ONLY action that records a new identity"
 assert_contains "$TXT" "--repo" "WRONG-ID: naming the correct --repo as what the new run must carry"
-assert_contains "$TXT" "--repo github.com/" "WRONG-ID: and SPELLING the host it just proved right — a BARE owner/repo supplies no host, so start would re-record RAIL_RUN_GH_HOST/origin (#2959 review, cycle 6, P2)"
-assert_contains "$TXT" "BARE" "WRONG-ID: and saying why the bare form is not enough, so the reader does not shorten it"
+assert_contains "$TXT" "RAIL_RUN_GH_HOST=github.com" "WRONG-ID: and naming the host it just PROVED through the KNOB (#2959 review, cycle 7, P2)"
+assert_contains "$TXT" "BARE --repo" "WRONG-ID: with a BARE slug, because a bare owner/repo supplies no host for start to record"
+assert_not_contains "$TXT" "--repo github.com/" "WRONG-ID: and NOT the host-qualified form, which the rail refuses with rc 2"
 assert_not_contains "$TXT" "DIFFERENT host" "WRONG-ID: and does not blame the host that MATCHED"
+# (b2) ⛔ THE SAME CAUSE ON A NON-github.com HOST, which arm (b) structurally cannot cover: it records no
+# `host` file, so `$host` is `github.com` — the ONE value `admin-merge.sh` is willing to strip from a
+# host-qualified `--repo` (`rail_normalize_slug` drops the leading segment only for `github.com` or the
+# checkout's own host, and otherwise the value fails `--repo`'s <owner>/<repo> shape check with
+# `return 2`). So a remedy that spells `$host` into `--repo` looks fine on arm (b) and is REFUSED for
+# every other host — measured: `admin-merge.sh 999999 --repo ghe.example.com/acme/widgets` →
+# "✗ refusing --repo … it is not an <owner>/<repo>", rc 2 → `derive`'s rc=2 arm → `refused` (20), a row
+# a lane reads as "abandon this PR". This arm is what makes the GHE prescription falsifiable.
+craft 192 wrongidentityghe host=ghe.example.com rc=0 >/dev/null
+OUT="$(GH_MODE=wrongrepoghe poll 192)"; RC="${OUT%%|*}"; TXT="${OUT#*|}"
+assert_rc 25 "$RC" "WRONG-ID/GHE: a same-GHE-host url naming another repo abstains"
+assert_contains "$TXT" "RAIL_RUN_GH_HOST=ghe.example.com" "WRONG-ID/GHE: the new run pins the GHE host through the KNOB"
+assert_not_contains "$TXT" "--repo ghe.example.com/" "WRONG-ID/GHE: and never through a host-qualified --repo, which the rail refuses (rc 2 → refused, not a merge attempt)"
 # (c) the run may STILL BE ALIVE — the host remedy must not be prescribed as an action to take NOW,
 #     because `start` refuses a new run while `prev_in_flight` holds (RAIL_RUN_RECORD_MAX, 24 h). This
 #     is the `rail_liveness=unknown` branch the round-3 diff newly made print the note; NO arm reached

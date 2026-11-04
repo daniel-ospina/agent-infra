@@ -877,6 +877,20 @@ derive() {
       # so when a host-naming `--repo`/`RAIL_RUN_REPO_SLUG` supplied the identity the knob is never read:
       # an imperative that leads with `RAIL_RUN_GH_HOST=` sends that reader to re-record the SAME host
       # and read this identical row again. The precedence is stated first, so the advice is not inert.
+      # ⛔ AND THE FORM PRESCRIBED MUST SURVIVE THE RAIL IT IS HANDED TO (#2959 review, cycle 7, P2).
+      # A host-qualified `--repo host/owner/repo` is forwarded verbatim to `admin-merge.sh`, which drops
+      # the leading segment ONLY for `github.com` or the checkout's own remote host
+      # (`rail_normalize_slug`) and otherwise REFUSES the invocation with `return 2` — so prescribing it
+      # buys a run whose rail exits 2 before it analyses the head, and `status` then reports `refused`
+      # (rc 20), the row `docs/ops/rail-run.md` says makes a lane abandon a PR. MEASURED in a
+      # github.com checkout:
+      #   $ bash scripts/admin-merge.sh 999999 --repo ghe.example.com/acme/widgets
+      #   admin-merge: ✗ refusing --repo 'ghe.example.com/acme/widgets' — it is not an <owner>/<repo>
+      # The form that records a chosen host AND hands the rail a slug it always accepts is the KNOB plus
+      # a BARE slug — `RAIL_RUN_GH_HOST=<host> start <pr> --repo owner/repo`: `resolve_host` answers the
+      # knob (`:283`, its only caller is `start` at `:653`) and a bare slug passes through untouched.
+      # That GHE host in a github.com checkout is precisely what the knob exists for
+      # (`docs/ops/rail-run.md:54-56`), so it is the form both host arms below prescribe.
       # ⛔ AND A POLL CANNOT MOVE CAUSE 14 AT ALL (#2959 review, cycle 5, P1). The identity half is
       # recorded too: re-polling with the RECORDED slug reproduces the same url, and naming a DIFFERENT
       # `--repo` is refused as an identity mismatch (`derive`'s `cli_slug != rec` guard). `--repo` is
@@ -892,25 +906,25 @@ derive() {
         13)
           # Another HOST. Only `start` writes `rd/host` (`resolve_host`), so a re-poll is powerless.
           if [ "$run_over" = "1" ]; then
-            abstain_why="the url for PR $pr did not name $slug/pull/$pr on host $host — it is on a DIFFERENT host, and the host is RECORDED at start, so a re-poll cannot change it. The remedy is to start a new run: pin the web host with RAIL_RUN_GH_HOST=<web host> ONLY if this run recorded the host bare, because a host-naming --repo or RAIL_RUN_REPO_SLUG outranks it — if one of those recorded $host, THAT is what must change"
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr on host $host — it is on a DIFFERENT host, and the host is RECORDED at start, so a re-poll cannot change it. The remedy is a new run that records the RIGHT host: RAIL_RUN_GH_HOST=<the host the url names> with a BARE --repo owner/repo — a host-naming --repo or RAIL_RUN_REPO_SLUG outranks the knob, so if one of those recorded $host, DROP it (the rail also refuses a host-qualified --repo it cannot attest)"
           else
-            abstain_why="the url for PR $pr did not name $slug/pull/$pr on host $host — it is on a DIFFERENT host, and the host is RECORDED at start, so this run can never land this PR. The remedy is a NEW run (pin the web host with RAIL_RUN_GH_HOST=<web host> ONLY if this run recorded the host bare — a host-naming --repo or RAIL_RUN_REPO_SLUG outranks it). A start can be REFUSED while THIS record still looks live, and that refusal is BOUNDED, not indefinite: it ends at RAIL_RUN_CLAIM_MAX when no incarnation was recorded, and at RAIL_RUN_RECORD_MAX (24 h) when a probe abstains — re-poll, and start once the bound passes"
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr on host $host — it is on a DIFFERENT host, and the host is RECORDED at start, so this run can never land this PR. The remedy is a NEW run that records the RIGHT host: RAIL_RUN_GH_HOST=<the host the url names> with a BARE --repo owner/repo (a host-naming --repo or RAIL_RUN_REPO_SLUG outranks the knob, so drop it if it supplied $host; the rail also refuses a host-qualified --repo it cannot attest). A start can be REFUSED while THIS record still looks live, and that refusal is BOUNDED, not indefinite: it ends at RAIL_RUN_CLAIM_MAX when no incarnation was recorded, and at RAIL_RUN_RECORD_MAX (24 h) when a probe abstains — re-poll, and start once the bound passes"
           fi ;;
         14)
           # Same host, wrong repo/PR: the host is RIGHT, so the fault is the IDENTITY, and no poll can
           # move it (`derive` refuses a poll that names a different `--repo`). Only a new run records one.
-          # ⛔ AND THAT RUN MUST SPELL THE HOST (#2959 review, cycle 6, P2). The bare form `--repo
-          # owner/repo` supplies no host — `host_from_slug_arg` returns nothing for it (`:319`) — so
-          # `start` records `${host_hint:-$(resolve_host)}`, i.e. the knob and then `origin`. Measured:
-          # the remedy "start a new run with --repo <owner/repo>" written for a run whose host IS
-          # `ghe.example.com` re-recorded `github.com` and produced cause 13 on the very next poll — a
-          # second merge attempt that could never land, plus a third run. Spelling the host is the ONE
-          # form that re-records both halves this message just proved: the identity from the argv value,
-          # the host from the same value.
+          # ⛔ AND THAT RUN MUST RECORD BOTH HALVES WITHOUT HANDING THE RAIL A SLUG IT REFUSES (#2959
+          # review, cycles 6-7, P2). The BARE form `--repo owner/repo` supplies no host —
+          # `host_from_slug_arg` returns nothing for it (`:319`) — so `start` records
+          # `${host_hint:-$(resolve_host)}`, i.e. the knob and then `origin`: measured, the bare remedy
+          # written for a run whose host IS `ghe.example.com` re-recorded `github.com` and produced
+          # cause 13 on the very next poll. Spelling the host INTO `--repo` fixes that and breaks the
+          # rail instead (see the block note above). So the one form that records the identity AND
+          # survives the rail is: the KNOB for the host, a BARE slug for the repo.
           if [ "$run_over" = "1" ]; then
-            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY (a renamed or transferred repo, or the wrong slug for PR $pr), and no poll can change an identity a run recorded, because naming a different --repo is refused as an identity mismatch. The remedy is to start a new run naming BOTH halves — --repo $host/<the owner/repo the url actually names> — because a BARE owner/repo supplies no host, so start would record RAIL_RUN_GH_HOST and then origin instead of the $host this run proves is right"
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY (a renamed or transferred repo, or the wrong slug for PR $pr), and no poll can change an identity a run recorded, because naming a different --repo is refused as an identity mismatch. The remedy is to start a new run naming BOTH halves: RAIL_RUN_GH_HOST=$host with a BARE --repo <the owner/repo the url actually names> — a bare slug supplies no host, and a host-qualified --repo is refused by the rail, so the knob is what records the $host this run proves is right"
           else
-            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY, and no poll can change an identity a run recorded. The remedy is a new run naming BOTH halves — --repo $host/<the owner/repo the url actually names> — because a BARE owner/repo supplies no host and would re-record RAIL_RUN_GH_HOST/origin instead of $host; and a start can be refused while THIS record still looks live — that refusal is BOUNDED (RAIL_RUN_CLAIM_MAX / RAIL_RUN_RECORD_MAX), so re-poll and start once the bound passes"
+            abstain_why="the url for PR $pr did not name $slug/pull/$pr, and it IS on host $host — the host matched, so it is not the fault: this run RECORDED the wrong IDENTITY, and no poll can change an identity a run recorded. The remedy is a new run naming BOTH halves: RAIL_RUN_GH_HOST=$host with a BARE --repo <the owner/repo the url actually names> (a bare slug supplies no host, a host-qualified --repo is refused by the rail); and a start can be refused while THIS record still looks live — that refusal is BOUNDED (RAIL_RUN_CLAIM_MAX / RAIL_RUN_RECORD_MAX), so re-poll and start once the bound passes"
           fi ;;
         *)
           # The READ failed: nothing was compared, so there is no host verdict to give. A second run
