@@ -166,6 +166,7 @@ pi_stub() {
     clean)    printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' ;;
     unpushed) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "committed but never pushed\\n" > local.txt\ngit add local.txt >/dev/null 2>&1\ngit -c user.email=t@t -c user.name=t commit -q -m "local only"\nexit 0\n' ;;
     sleepdirty) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "work in flight when the cap fired\\n" > capdirty.txt\nsleep 30\n' ;;
+    unpushed_landing) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "a landing branch with local commits\\n" > local.txt\ngit add local.txt >/dev/null 2>&1\ngit -c user.email=t@t -c user.name=t commit -q -m "local only on a landing branch"\nexit 0\n' ;;
     *)        printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nsleep 30\n' ;;
   esac > "$TMP/bin/pi"
   chmod +x "$TMP/bin/pi"
@@ -313,14 +314,18 @@ git -C "$BARE" rev-parse -q --verify "refs/wip/mutation-probe" >/dev/null 2>&1; 
 ck "B2 with the exit-path call REMOVED the same lane leaves NO ref for its branch (so arm A is not vacuous)" $([ "$rc" -ne 0 ] && echo 0 || echo 1)
 grep -q '\[wip\] end' "$O/logs/mut.log"; rcn=$?
 ck "B3 …and the mutant writes no terminal record at all (the absence is the mutation, not a silent skip)" $([ "$rcn" -ne 0 ] && echo 0 || echo 1)
-# ⛔ `switch`, NOT `checkout`, AND THE BRANCH NAME IS LITERAL. Two reasons, one of them measured:
-# the write-guard's static scanner classifies a `git checkout <ref>` inside a script as a possible
-# working-tree discard and fails CLOSED on it (`Form: checkout-bare-path`, first on `$BR` being
-# unresolvable and then on `git -C "$WT"` being an unresolvable repo) — so this suite could not be run
-# from an agent shell AT ALL, and a suite no agent can run stops being run. `switch` cannot discard
-# uncommitted changes by design (it refuses), which is why it is not a re-implementation of the verb
-# the guard is protecting. The branch is created as `work` 200 lines above, so the literal is the same
-# value by construction. (CI shards invoke the file directly and never meet the scanner.)
+# ⛔ `switch`, NOT `checkout`, AND THE BRANCH NAME IS LITERAL — and note what this does NOT buy. The
+# write-guard's static scanner refuses a `git checkout <ref>` inside a script, first on `$BR` being an
+# unresolvable pathspec and then on `git -C "$WT"` being an unresolvable repo, so ONE of the forms was
+# removed (`switch` cannot discard uncommitted changes by design, which is why it is not a
+# re-implementation of the verb the guard protects). ⛔ THE SUITE IS STILL NOT RUNNABLE FROM AN AGENT
+# SHELL: review cycle 1 measured that, and the remaining forms are the pre-existing
+# `git -C "$WT" checkout -q -b mutation-probe` and this change's own `reset --hard`/`clean -fd` fixture
+# resets, none of which the scanner can resolve. The supported path is the sanctioned runner
+# (`BASH_SHARD_SLICE=<i>/<n> bash ./scripts/run-bash-shards.sh`), which is also what CI uses — the
+# switch edit only removes one needless refusal, and claiming more would be a capability the file does
+# not have (the guard false-positive class is #3173). The branch is created as `work` 200 lines above,
+# so the literal is the same value by construction.
 git -C "$WT" switch -q "work"; git -C "$WT" branch -q -D mutation-probe
 rm -f "$WT/early.txt"
 
@@ -432,6 +437,61 @@ ck "D9b …while the lane REALLY HAD an unpushed commit (head $(git -C "$WT3" re
   $([ "$(git -C "$WT3" rev-parse HEAD)" != "$seed3" ] && echo 0 || echo 1)
 ck "D10 …and NO resume marker is written, exactly as at origin/main — so D5/D6 are the change's, not git's" \
   $([ ! -e "$O/state/lane-exit-pre_fix.state" ] && echo 0 || echo 1)
+
+# ── N) THE TWO GATE PROPERTIES REVIEW CYCLE 1 BROKE, EACH WITH ITS OWN FIXTURE ─────────────────
+# ⛔ N1-N2 — R1 IS A SET, NOT A NAME (review finding 1, and both halves were REPRODUCED). With
+# `origin/HEAD = origin/main`, a lane on **master** pushed: the old code resolved ONE default and
+# compared `sym = def`. The union is now consulted, so a branch that is a landing branch under ANY
+# spelling is refused. The remote here states `main`; the lane sits on `master`.
+WT4="$TMP/wt4"
+git -C "$BARE" symbolic-ref HEAD refs/heads/main 2>/dev/null
+# A symref to a branch that does not exist is an UNBORN HEAD, and `ls-remote --symref` then prints
+# nothing at all — so the branch must EXIST for the fixture to state its default (measured: without
+# this line N0 was empty and the arm below was asserting the static union, not the remote's answer).
+git -C "$WT" push -q origin HEAD:refs/heads/main 2>/dev/null
+git -C "$WT" worktree add -q "$WT4" -b master 2>/dev/null
+hdr4="$(git ls-remote --symref "$BARE" HEAD 2>/dev/null | head -1)"
+case "$hdr4" in *'refs/heads/main'*) okhdr=0 ;; *) okhdr=1 ;; esac
+ck "N0 the fixture's remote really states main as its default ($hdr4), so the next arm is not vacuous" $okhdr
+pi_stub unpushed_landing
+: > "$O/logs/landing.log"
+PATH="$TMP/bin:$PATH" PI_LOG="$O/pi6.log" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "landing" >>"$4.agent" 2>&1
+' _ "$GATE" "$WT4" "$O" "$O/logs/landing.log" "$PROMPT"
+arm "$O/logs/landing.log"
+ck "N1 a lane on master is REFUSED when the remote's default is main: no refs/heads/master is created on origin" \
+  $(! git -C "$BARE" rev-parse -q --verify refs/heads/master >/dev/null 2>&1 && echo 0 || echo 1)
+grep -q 'refused-protected' "$O/logs/landing.log"; rcn1=$?
+ck "N2 …and the refusal is named (push=refused-protected), not a silent no-op" $rcn1
+# ⛔ N3-N4 — “VERIFIED BY READING THE REMOTE” MUST MEAN THE SHA, NOT THE REF (review finding 2,
+# REPRODUCED: a push shim that exits 0 left origin at an older sha while the marker said push=pushed).
+mkdir -p "$TMP/bin-shim"
+REAL_GIT="$(command -v git)"
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 0 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-shim/git"
+chmod +x "$TMP/bin-shim/git"
+pi_stub unpushed
+: > "$O/logs/shim.log"; rm -f "$O/state/lane-exit-shim.state"
+PATH="$TMP/bin-shim:$TMP/bin:$PATH" PI_LOG="$O/pi7.log" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "shim" >>"$4.agent" 2>&1
+' _ "$GATE" "$WT2" "$O" "$O/logs/shim.log" "$PROMPT"
+arm "$O/logs/shim.log"
+ck "N3 the push shim really lies (origin/durable did NOT move to the lane's head: $(git -C "$BARE" rev-parse --short refs/heads/durable 2>/dev/null) vs $(git -C "$WT2" rev-parse --short HEAD))" \
+  $([ "$(git -C "$BARE" rev-parse refs/heads/durable 2>/dev/null)" != "$(git -C "$WT2" rev-parse HEAD)" ] && echo 0 || echo 1)
+grep -q 'the push did NOT deliver this lane' "$O/logs/shim.log"; rcn3=$?
+ck "N4 …and the exit path does NOT record push=pushed for it: a 0 exit from the push is not a delivery" $rcn3
+grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
+ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
+git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 
 # ── E) A MISSING RESCUER IS LOUD, NOT A SILENT SKIP ─────────────────────────────────────────────
