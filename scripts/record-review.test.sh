@@ -4835,11 +4835,19 @@ if grep -qE 'note=1 open P2: re-reads the claim after release sig=[0-9a-f]{64}$'
 else
     bad "14.1d (d3) the published marker's tail is not \"note=… sig=<64 hex>\" (captured: $(head -c 300 "$T/ccap_d3" 2>/dev/null))"
 fi
-# (d4) THE ROOT CAUSE, REFUSED AT VALIDATION. A note carrying the signature delimiter '
-#      sig=' splits the marker INSIDE the note for every reader (`${line% sig=*}` here and
-#      in --recover-body, and ai-review-gate splits the same way), so the HMAC over the full
-#      text can never match what the reader verifies — the record mints, the body and comment
-#      carry it, and NOTHING can verify it. That is "no evidence" reported as success.
+# (d4) THE AMBIGUOUS SHAPE, REFUSED AT VALIDATION. ⛔ THE FIRST VERSION OF THIS COMMENT WAS
+#      MEASURED FALSE (cycle 3) AND IS CORRECTED HERE; it is the same claim the .sh carried
+#      until cycle 3 fixed it, and cycle 4 caught that this copy was left behind.
+#      WHAT IS TRUE: this file's readers split at the LAST delimiter (`${x% sig=*}` strips the
+#      SHORTEST matching suffix — `x="a sig=1 b sig=2"` ⇒ `a sig=1 b`), so the note plus the
+#      real appended signature leaves the signed preimage intact and a marker whose note
+#      carries ` sig=` DOES verify here (measured: `--recover-body` restores it).
+#      WHAT THE REFUSAL RESTS ON, THEN: the marker is a CROSS-REPO CONTRACT whose CONSUMING
+#      reader lives in the consumer repo and cannot be verified from this tree, so a marker
+#      whose reading depends on which delimiter a reader cuts at is the ambiguity itself — and
+#      it is the shape BOTH review rounds used to get an UNSIGNED marker published. So this is a
+#      PRECAUTION about an unverifiable consumer, not a claim about this file's readers, and it
+#      is NOT load-bearing for the comment guard (provenance + HMAC close that class alone).
 #      The shape below is EXACTLY the cycle-2 bypass: a note ENDING with ` sig=<64 hex>`.
 D_END64="$(printf 'a%.0s' $(seq 1 64))"
 run_record_dcraft 424957 "$T/ccap_d4" "" "all good, sig=$D_END64"
@@ -4884,18 +4892,25 @@ assert_eq "$(dc_posts 424959)" "1" \
     "14.1d (d5) …while a genuinely signed pending marker IS published (the arm is not a blanket refusal)"
 # (d6) THE PROVENANCE CONTRACT AT THE CALL SITES — a SOURCE pin, and it says so.
 #      ⛔ WHY SOURCE-LEVEL: `MARKER_SIGNED` is layered on top of the HMAC check, so deleting the
-#      guard's use of it is BEHAVIOURALLY INVISIBLE — MEASURED in cycle 3 (mutant: the
-#      short-circuit removed ⇒ every 14.1d vector stays green, because every mint-side marker
-#      is genuinely signed and every unsigned one is refused by the HMAC arm instead). A pin
-#      that cannot discriminate behaviour must not pretend to; what CAN be pinned is that the
-#      mint arms still PASS the datum main gated on, and that no fourth caller quietly appears
-#      without it. (The suite already inspects the shipped script this way — see 20.1.)
+#      guard's use of it is BEHAVIOURALLY INVISIBLE — MEASURED in cycle 3 (the short-circuit
+#      removed ⇒ every 14.1d vector stays green, because every mint-side marker is genuinely
+#      signed and every unsigned one is refused by the HMAC arm instead). A pin that cannot
+#      discriminate behaviour must not pretend to.
+#      ⛔ AND IT PINS THE SHAPE, NOT ONE SPELLING (cycle 4): an earlier cut counted three exact
+#      strings, so a FOURTH call site in any other spelling left the counts at 2/1/1 and every
+#      assertion stayed green while the contract was broken. The counts below are over CALL SITES
+#      (any arguments) and over call sites that name MARKER_SIGNED, so a new caller of ANY shape
+#      moves them — and exactly one call site is allowed to lack the flag.
+DC_ALL_CALLS="$(command grep -c '^[[:space:]]*post_marker_comment "' "$RECORD" || true)"
+DC_SIGNED_CALLS="$(command grep -c '^[[:space:]]*post_marker_comment ".*MARKER_SIGNED' "$RECORD" || true)"
+assert_eq "$DC_ALL_CALLS" "4" \
+    "14.1d (d6) the chokepoint has 4 call sites (mint, body-read failure, \$MISSING, --flush-pending) — a NEW caller of any shape must revisit this contract"
+assert_eq "$DC_SIGNED_CALLS" "$(( DC_ALL_CALLS - 1 ))" \
+    "14.1d (d6) …and every call site except ONE passes the authoritative MARKER_SIGNED (got $DC_SIGNED_CALLS of $DC_ALL_CALLS)"
 assert_eq "$(command grep -cF 'post_marker_comment "$REPO" "$PR" "$MARKER" "${MARKER_SIGNED:-0}"' "$RECORD" || true)" "2" \
-    "14.1d (d6) both mint-side \$MARKER call sites pass the authoritative MARKER_SIGNED"
-assert_eq "$(command grep -cF 'post_marker_comment "$REPO" "$PR" "$MISSING" "${MARKER_SIGNED:-0}"' "$RECORD" || true)" "1" \
-    "14.1d (d6) …and the body-PATCH-failure arm passes it for \$MISSING too"
-assert_eq "$(command grep -cF 'post_marker_comment "$repo" "$pr" "$marker"' "$RECORD" || true)" "1" \
-    "14.1d (d6) …and the ONLY call site without the flag is --flush-pending, which HMAC-verifies instead"
+    "14.1d (d6) …both mint-side \$MARKER call sites pass it"
+assert_eq "$(command grep -cF 'post_marker_comment "$repo" "$pr" "$marker" || true' "$RECORD" || true)" "1" \
+    "14.1d (d6) …and the one without the flag is --flush-pending, which HMAC-verifies instead"
 # (e) THE P2 PIN: when the BODY channel fails, the run that most needs the durable
 #     copy must still attempt it. Both failure arms used to `exit 5` before reaching
 #     the durable block, so the channel never fired in the only scenario it exists

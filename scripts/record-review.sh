@@ -2136,6 +2136,10 @@ if [ "$VERDICT" = "not-clean" ]; then
     echo "record-review.sh: --findings-note must be a single-line plain string (no quotes, backslashes or control characters) — it is embedded in the record's JSON, and an unescaped character would make the record unreadable (which the merge gate treats as NO record)." >&2
     exit 2
   fi
+  if [[ "$FINDINGS_NOTE" == *' sig='* ]]; then
+    echo "record-review.sh: --findings-note must not contain ' sig=' — that is the marker's signature delimiter, and a note carrying it makes the marker's reading depend on which delimiter a reader cuts at (this file cuts at the last; the consuming gate's reader is in another repo and cannot be verified from here). Reword the note; nothing was recorded." >&2
+    exit 2
+  fi
   # ⛔ AND IT MUST NOT CARRY THE MARKER'S OWN SIGNATURE DELIMITER ' sig=' (review cycle 2,
   # re-worded in cycle 3 after the first justification was MEASURED FALSE).
   # WHAT IS TRUE AND MEASURED HERE: this file's readers split at the LAST delimiter
@@ -2152,13 +2156,10 @@ if [ "$VERDICT" = "not-clean" ]; then
   # rounds used exactly it to get an UNSIGNED marker published (a note CONTAINING, or ENDING
   # WITH, ` sig=<hex>`). So this is a PRECAUTION about an unverifiable consumer, not a claim
   # about this file's readers — and it is deliberately NOT load-bearing for the comment
-  # guard, which is closed by provenance + HMAC alone (measured: removing this refusal
-  # leaves every 14.1d vector green). Cost when it fires: exit 2 by name, nothing recorded,
-  # the note reworded — never a silent loss.
-  if [[ "$FINDINGS_NOTE" == *' sig='* ]]; then
-    echo "record-review.sh: --findings-note must not contain ' sig=' — that is the marker's signature delimiter, and a note carrying it makes the marker's reading depend on which delimiter a reader cuts at (this file cuts at the last; the consuming gate's reader is in another repo and cannot be verified from here). Reword the note; nothing was recorded." >&2
-    exit 2
-  fi
+  # guard, which is closed by provenance + HMAC alone (measured: with this refusal REMOVED the
+  # comment-guard vectors (d2)/(d3)/(d5)/(d6) all stay green and ONLY (d4) reds — so the
+  # refusal is pinned by (d4) and by nothing else, which is exactly what (d4) is for).
+  # Cost when it fires: exit 2 by name, nothing recorded, the note reworded — never a silent loss.
 elif [ -n "$FINDINGS" ] || [ -n "$FINDINGS_NOTE" ]; then
   echo "record-review.sh: --findings/--findings-note describe a NEGATIVE verdict and are only meaningful with 'not-clean' (got verdict '$VERDICT'). Accepting them here would let the caller believe findings were recorded when the record cannot carry them." >&2
   exit 2
