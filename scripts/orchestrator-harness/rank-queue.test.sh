@@ -162,6 +162,11 @@ ck "non-vacuity: the pre-fix baseline (arrival order) does NOT satisfy the rank 
 
 # 1c) NON-VACUITY by MUTATION: drop the unranked-tail emit from the awk and confirm the ORDER checks
 #     redden on it. A guard whose red path has never run is an assertion about a fixture.
+#     ⛔ AND THE MEMBERSHIP GUARD IS WHAT NOW CATCHES IT (review P1, cycle 4): the tail-dropping awk no
+#     longer emits the same ROW SET, so `rank_queue_by_pool` REFUSES the install — the queue is left
+#     BYTE-IDENTICAL and the pass says `priority-unreadable`. That is a STRONGER outcome than the old
+#     assertion ("the mutated order lands, minus the tail"), and it is what must be pinned: a mutation
+#     that silently discards a row must be UNINSTALLABLE, not merely visible.
 MUT_DROP_TAIL="$TMP/fns-drop-tail.sh"
 sed 's/{ print n; unranked++ }/{ unranked++ }/' "$FNS" > "$MUT_DROP_TAIL"
 grep -q 'print n; unranked++' "$MUT_DROP_TAIL" && mutated=1 || mutated=0
@@ -174,8 +179,9 @@ drive mut-droptail "$MUT_DROP_TAIL" '300
 300
 '
 mut="$(cat "$TMP/mut-droptail/order" 2>/dev/null)"
-[ "$mut" = "200 300" ] && rc=0 || { rc=1; echo "      mutated source gave '$mut' (want the dropped-tail '200 300' — the mutation is LIVE, so the membership checks below can fail)"; }
-ck "mutation is LIVE: dropping the unranked tail loses the tail rows ('9' disappears)" $rc
+if [ "$mut" = "300 9 200" ] && grep -q 'priority-unreadable' "$TMP/mut-droptail/out" 2>/dev/null; then rc=0
+else rc=1; echo "      mutated source gave '$mut' (want the queue UNTOUCHED, '300 9 200'); out: $(tr '\n' '|' < "$TMP/mut-droptail/out" 2>/dev/null | head -c 240)"; fi
+ck "mutation is LIVE and UNINSTALLABLE: a tail-dropping reorder refuses to install, leaving the queue untouched" $rc
 
 # ── 2) MEMBERSHIP IS PRESERVED — order only, and a duplicate is not a distinct row ──
 # The queue carries a DUPLICATE 5000, which the pre-existing `awk !seen` dedupe already collapses. The
@@ -194,9 +200,15 @@ got="$(cat "$TMP/member/order" 2>/dev/null)"
 [ "$got" = "100 5000 9000" ] && rc=0 || { rc=1; echo "      order '$got' (want '100 5000 9000')"; }
 ck "the ranked row leads, the unranked rows follow in their EXISTING order (100 5000 9000)" $rc
 
-# 2b) NON-VACUITY of the membership check: run it against the tail-dropping mutation and require it to
-#     fail. This is the check that catches "the reorder silently discards a CLEAN-judged candidate".
-drive mut-member "$MUT_DROP_TAIL" '5000
+# 2b) NON-VACUITY of the membership check: the tail-dropping mutation is refused by the membership
+#     guard (1c), so to prove the ASSERTION ITSELF can fail, drive the mutation with that guard removed
+#     too. Two mutations, two different claims: 1c pins the GUARD, this pins the ASSERTION.
+MUT_NOGUARD="$TMP/fns-drop-tail-noguard.sh"
+sed '/LC_ALL=C sort -u/,+2d' "$MUT_DROP_TAIL" > "$MUT_NOGUARD"
+grep -q 'LC_ALL=C sort -u' "$MUT_NOGUARD" && ng=1 || ng=0
+[ "$ng" -eq 0 ] && rc=0 || { rc=1; echo "      the guard-removing mutation did not apply — anchor drifted"; }
+ck "the guard-removing mutation applied (the membership set-compare is gone from the extracted copy)" $rc
+drive mut-member "$MUT_NOGUARD" '5000
 100
 9000
 5000
@@ -204,7 +216,7 @@ drive mut-member "$MUT_DROP_TAIL" '5000
 '
 mut_set="$(sort -n "$TMP/mut-member/o/candidates.txt" 2>/dev/null | uniq | tr '\n' ' ' | sed 's/ *$//')"
 [ "$mut_set" != "$before_set" ] && rc=0 || { rc=1; echo "      mutated source kept the set '$mut_set' — the membership assertion is vacuous"; }
-ck "non-vacuity: the membership assertion FAILS on the tail-dropping mutation" $rc
+ck "non-vacuity: the membership assertion FAILS on the tail-dropping mutation once the guard is removed" $rc
 
 # ── 3) THE UNRANKED TAIL KEEPS ITS OWN RELATIVE ORDER ────────────────────────
 # Two ranked rows (200, 300) and two unranked (9, 7) INTERLEAVED in the queue: the tail must come out in
@@ -239,6 +251,7 @@ same=1; [ "$sum_before" = "$sum_after" ] && same=0
 # the honest word PRESENT, and `ARRIVAL order` ABSENT.
 if [ "$same" -eq 0 ] && grep -q 'priority-unreadable' "$TMP/norank/out" 2>/dev/null \
    && grep -q 'established NO priority order' "$TMP/norank/out" 2>/dev/null \
+   && grep -q 'UNTOUCHED' "$TMP/norank/out" 2>/dev/null \
    && ! grep -q 'ARRIVAL order' "$TMP/norank/out" 2>/dev/null \
    && ! grep -q 'severity-first' "$TMP/norank/out" 2>/dev/null; then rc=0
 else
@@ -419,6 +432,51 @@ else
   rc=1; echo "      identical reorder inode $ino_a1 -> $ino_a2 (want equal), order '$order_a'; real reorder inode $ino_b1 -> $ino_b2 (want differ), order '$order_b'"
 fi
 ck "an IDENTICAL reorder does not swap the file's inode, and a real one still does (no needless rewrite, no dead writer)" $rc
+
+# ── 9) THE QUEUE MUST BE A READABLE REGULAR FILE, AND "DRAINED" IS AN EARNED WORD ──────────
+# `[ -s ]` answers "is the size non-zero", not "can this be read as a queue". Measured on the shipped
+# function: a queue that is a DIRECTORY made awk SKIP it (`warning: … is a directory: skipped`), after
+# which the rank emitted the POOL's rows as if they were queued (count `0 2 -`, rc 0) and the caller
+# reported "the pool ranked NONE of the 2 queued" — membership ADDED, and a false statement. An ABSENT
+# queue was reported as a measured DRAINED one and a 0-byte file was created (#1931's prohibition).
+# Both must now be `priority-unreadable`, with nothing written.
+GQ="$TMP/guards"; mkdir -p "$GQ"
+printf '200\n300\n' > "$GQ/pool"
+mkdir -p "$GQ/absent-o" "$GQ/dir-o/candidates.txt"
+{
+  echo 'QUEUE_ORDER_STATE=""'
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\nexit $?\n'
+} > "$GQ/drive.sh"
+( cd "$GQ" && HOME="$GQ" bash drive.sh "$GQ/absent-o" ) > "$GQ/absent.log" 2>&1
+absent_rc=$?
+( cd "$GQ" && HOME="$GQ" bash drive.sh "$GQ/dir-o" ) > "$GQ/dir.log" 2>&1
+dir_rc=$?
+if [ "$absent_rc" -ne 0 ] && [ ! -e "$GQ/absent-o/candidates.txt" ] \
+   && grep -q 'priority-unreadable' "$GQ/absent.log" 2>/dev/null \
+   && [ "$dir_rc" -ne 0 ] && [ -d "$GQ/dir-o/candidates.txt" ] \
+   && [ ! -e "$GQ/dir-o/candidates.txt/.cand.ranked" ] \
+   && grep -q 'priority-unreadable' "$GQ/dir.log" 2>/dev/null; then rc=0
+else
+  rc=1; echo "      absent: rc=$absent_rc created=$( [ -e "$GQ/absent-o/candidates.txt" ] && echo yes || echo no ); dir: rc=$dir_rc moved-in=$( [ -e "$GQ/dir-o/candidates.txt/.cand.ranked" ] && echo yes || echo no )"
+fi
+ck "an ABSENT or NON-REGULAR queue is 'priority-unreadable' with NOTHING written — never a drained queue, never pool rows installed" $rc
+
+# ── 10) A REWRITE IS REPORTED AS A REWRITE ──────────────────────────────────
+# The ranked-none arm CAN write: `qseen` collapses a DUPLICATE row, so `300 9 300` comes out `300 9` and
+# the install runs. The message must then say it rewrote — "byte-identical" was a typed claim about a
+# write this call had just performed, and test 4 above pins the opposite half on a fixture with no
+# duplicates, so the pair discriminates.
+drive dupnone "$FNS" '300
+9
+300
+' '777
+'
+dup_order="$(cat "$TMP/dupnone/order" 2>/dev/null)"
+if [ "$dup_order" = "300 9" ] && grep -q 'WAS rewritten' "$TMP/dupnone/out" 2>/dev/null \
+   && ! grep -q 'byte-identical' "$TMP/dupnone/out" 2>/dev/null; then rc=0
+else rc=1; echo "      order '$dup_order' (want '300 9'); out: $(tr '\n' '|' < "$TMP/dupnone/out" 2>/dev/null | head -c 260)"; fi
+ck "the ranked-none arm that DID rewrite (a duplicate collapsed) says so, and does not claim 'byte-identical'" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
