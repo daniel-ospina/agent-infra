@@ -3131,7 +3131,7 @@ def converge(
 
     target = ceil if want is None else want
 
-    # 5. REPAIR (DEAD / ORPHANED) — NEVER a BUSY, SERVING or OTHER-REPO runner ------------------
+    # 5. REPAIR (DEAD / ORPHANED) — NEVER a BUSY, SERVING, OTHER-REPO or CONFIG-LOST runner ------
     # ⛔ `live` IS THE BOX TOTAL, MEASURED — not a count of our own repairs. `ceiling` is also a box
     # total (`running` includes every listener alive on this box, another repo's included, because
     # their memory is really gone from MemAvailable), so the fill decision must compare like with
