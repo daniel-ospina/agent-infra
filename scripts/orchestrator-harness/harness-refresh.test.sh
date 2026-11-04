@@ -20,6 +20,15 @@
 # Run:  bash scripts/orchestrator-harness/harness-refresh.test.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ⛔ THE DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395), AND THIS IS TEST HYGIENE, NOT
+# CONVENIENCE. The C2/C2b rigs drive the REAL `dispatch-merge.sh` with a stubbed `git`, so
+# `wt_provision` → `wt_disk_admit` → `disk_admit` reads the HOST's real `df` — measured on a cell at
+# 6.5 GB free: 306 passed / 3 failed, each one `[disk-admit] REFUSED-DISK(free=6.5GB, need=8.0GB …)`
+# where the arm expected a spawn line, and the PARENT commit on the same box was 309/0. That is the
+# "test of the host rather than of the gate" defect `disk-admission.test.sh` denounces: the gate's own
+# behaviour is pinned there, with a stubbed `df`. Nothing here tests admission, so both documented
+# cost seams are zeroed (the same idiom `wt-lifecycle.test.sh` uses).
+export DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 RR="$HERE/harness-refresh.sh"
 LOOP="$HERE/orch-loop.sh"
 DM="$HERE/dispatch-merge.sh"
