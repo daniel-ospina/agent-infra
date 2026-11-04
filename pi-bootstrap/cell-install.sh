@@ -253,24 +253,33 @@ graph_key_from_env_file() { # <file> [<variable>] -> its value
 # An EMPTY result is meaningful, not a fallback: the documented self-host entry
 # (`{"url":"http://localhost:8000/mcp"}`) declares no header, and a local daemon needs no key — so
 # there is nothing to resolve and nothing may be reported as missing.
-# ⛔ `NOENTRY` IS A THIRD STATE, and collapsing it into "empty" was a lie in the run log: an ABSENT
-# `.mcp.json` (a missing template, a missing lib, no python3, a merge that failed) or a file with no
-# `tortoise` key made this function return empty, which the caller renders as "the tortoise entry
-# declares no Authorization — a self-hosted daemon needs none" — a sentence asserting the existence of
-# an entry that is not there. The run is not certified either way, but this is THE line a reader uses
-# to tell a working cell from a 401 one, and it named the wrong reason.
+# ⛔ THE MARKERS ARE A FOURTH QUESTION, and collapsing them into "empty" was a lie in the run log:
+#   NOENTRY — no readable `.mcp.json`/`tortoise` entry at all (missing template, missing lib, no
+#             python3, a merge that failed). The caller used to render that as "the tortoise entry
+#             declares no Authorization — a self-hosted daemon needs none", a sentence asserting the
+#             existence of an entry that is not there.
+#   LITERAL — an `Authorization` that is NOT env-indirect: a credential written into the shared file,
+#             which `--verify` refuses (LITERAL_AUTH). It is not "no authorization" either.
+# Only a real entry with no `Authorization` key at all is the self-host shape.
 graph_mcp_var() {
   [ -f "$DEST/.mcp.json" ] || { printf 'NOENTRY'; return 0; }
+  # no python3 means this file cannot be READ — "UNKNOWN", never "needs no key"
+  command -v python3 >/dev/null 2>&1 || { printf 'NOENTRY'; return 0; }
   python3 -c '
 import json, sys
 try:
     t = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]
+    if not isinstance(t, dict):
+        raise ValueError("tortoise entry is not an object")
     auth = (t.get("headers") or {}).get("Authorization") or ""
 except Exception:
     print("NOENTRY")                # unreadable / no such entry — NOT "declares no Authorization"
     sys.exit(0)
+if not auth.strip():
+    sys.exit(0)                     # no Authorization AT ALL: the documented self-host shape
 if "${" not in auth:
-    sys.exit(0)                     # no env-indirect credential (self-host, or a literal -- which verify refuses)
+    print("LITERAL")                # a literal credential --verify refuses (LITERAL_AUTH)
+    sys.exit(0)
 name = auth.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
 print(name)
 ' "$DEST/.mcp.json" 2>/dev/null
@@ -285,13 +294,21 @@ graph_key_resolve() {
   GRAPH_KEY_SRC="the environment"
   GRAPH_NOAUTH=0
   GRAPH_NOENTRY=0
-  if [ "$GRAPH_VAR" = "NOENTRY" ]; then
-    # no readable tortoise entry at all — a DIFFERENT state from "an entry that needs no key", and
-    # reporting it as the latter asserts an entry that is not there (see graph_mcp_var).
-    GRAPH_NOENTRY=1
-    GRAPH_VAR=""
-    return 0
-  fi
+  GRAPH_LITERAL=0
+  case "$GRAPH_VAR" in
+    NOENTRY)
+      # no readable tortoise entry at all — a DIFFERENT state from "an entry that needs no key",
+      # and reporting it as the latter asserts an entry that is not there (see graph_mcp_var).
+      GRAPH_NOENTRY=1
+      GRAPH_VAR=""
+      return 0 ;;
+    LITERAL)
+      # an Authorization that is not env-indirect: a credential in the shared file, refused by
+      # --verify (LITERAL_AUTH) — also NOT "needs no key"
+      GRAPH_LITERAL=1
+      GRAPH_VAR=""
+      return 0 ;;
+  esac
   if [ -z "$GRAPH_VAR" ]; then
     # the tortoise entry declares no env-indirect Authorization: a self-hosted daemon needs none
     GRAPH_NOAUTH=1
@@ -327,6 +344,10 @@ graph_credential_state() {
     printf 'UNKNOWN — no readable tortoise entry at %s/.mcp.json to resolve (the failure above says why)' "$DEST"
     return 0
   fi
+  if [ "$GRAPH_LITERAL" -eq 1 ]; then
+    printf 'LITERAL — the tortoise entry carries a literal credential in the shared file; --verify refuses it (LITERAL_AUTH)'
+    return 0
+  fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
     printf 'none required — the tortoise entry declares no Authorization (self-hosted daemon)'
     return 0
@@ -343,6 +364,10 @@ graph_credential_note() {
   local key="$GRAPH_KEY" src="$GRAPH_KEY_SRC"
   if [ "$GRAPH_NOENTRY" -eq 1 ]; then
     log_line "⚠️  graph credential: UNKNOWN — there is no readable tortoise entry at $DEST/.mcp.json, so there is no credential to resolve (the failure above names the reason). ⛔ A MISSING entry is not a self-host and must not be reported as one"
+    return 0
+  fi
+  if [ "$GRAPH_LITERAL" -eq 1 ]; then
+    log_line "⚠️  graph credential: the tortoise entry carries a LITERAL credential in .mcp.json — a shared config file must be env-indirect (\${TORTOISE_MCP_API_KEY}), and --verify REFUSES this file (LITERAL_AUTH); move the key to \$HOME/keys.env (mode 600) and leave the file env-indirect"
     return 0
   fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
@@ -392,6 +417,7 @@ verify_graph_mcp() {
 # A heredoc in a FUNCTION body called from the substitution parses correctly in both.
 graph_mcp_marker() { # <config.json> <template.json> -> marker on stdout; non-zero = not certifiable
   python3 - "$1" "$2" <<'PY'
+import ipaddress
 import json
 import re
 import sys
@@ -471,12 +497,31 @@ if auth and "${" not in auth:
 # documented self-host fixture is exactly that shape with the template's header still attached —
 # refusing it would be the false block that teaches an operator to ignore this gate. A self-host that
 # needs a key off-box must serve it over https.
+# ⛔ THE LOOPBACK TEST IS AN IP-LITERAL TEST, NOT A PREFIX TEST — a prefix test is a BYPASS, measured:
+# `127.attacker.example` is an ordinary DNS name its owner can point anywhere, and `127.0.0.1@evil.example`
+# is the loopback spelling going on to an attacker's HOST (userinfo, not authority). Both skip a
+# `startswith("127.")` exemption and then certified `SELFHOSTED:` rc=0 with the tenant key attached.
+# So: strip userinfo, refuse anything with trailing labels, and ask ipaddress whether the literal is
+# loopback. `merge-mcp.py`'s `usable()` applies the SAME predicate (marked MUST MATCH there).
 def _loopback(authority):
-    h = (authority or "").lower()
-    if h.startswith("["):
-        return h.startswith("[::1]")
-    h = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
-    return h == "localhost" or h.startswith("127.") or h == "::1"
+    h = (authority or "").strip().lower()
+    if "@" in h:                                  # userinfo is NOT the host
+        h = h.rsplit("@", 1)[1]
+    if h.startswith("["):                          # an IPv6 literal: `[<addr>]`, optionally `:port`
+        end = h.find("]")
+        if end < 0:
+            return False
+        rest = h[end + 1:]
+        if rest and not rest.startswith(":"):
+            return False
+        return h[1:end] == "::1"
+    host = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False                             # a DNS name is never loopback, whatever it says
 
 
 _m = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/]+)", url, re.I)

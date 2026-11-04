@@ -51,9 +51,11 @@ Exit 0 with the file written, 2 on bad usage, 3 when the template has no usable 
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import stat
 import sys
 
 # The HOSTED endpoint's header must be the canonical shape: a `Bearer ` scheme plus one of the two
@@ -111,6 +113,46 @@ def near_miss(url, want_url):
     return bool(wh) and uh == wh
 
 
+def _loopback(authority):
+    """⛔ MUST MATCH `cell-install.sh`'s `_loopback` — the verifier applies the same rule, and a
+    disagreement here is the "install preserves what verify refuses" loop this file's docstring
+    forbids. An IP-LITERAL test, never a prefix test: `127.attacker.example` is an ordinary DNS name
+    its owner can point anywhere and `127.0.0.1@evil.example` is userinfo followed by an attacker's
+    host — both passed a `startswith("127.")` exemption and were then certified `SELFHOSTED:` with
+    the tenant key attached.
+    """
+    h = (authority or "").strip().lower()
+    if "@" in h:                                  # userinfo is NOT the host
+        h = h.rsplit("@", 1)[1]
+    if h.startswith("["):                          # an IPv6 literal: `[<addr>]`, optionally `:port`
+        end = h.find("]")
+        if end < 0:
+            return False
+        rest = h[end + 1:]
+        if rest and not rest.startswith(":"):
+            return False
+        return h[1:end] == "::1"
+    host = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False                             # a DNS name is never loopback, whatever it says
+
+
+def credential_in_the_clear(url):
+    """True when a credential sent to this url would cross a network unencrypted.
+
+    Same rule the verifier applies (`cell-install.sh` `INSECURE_URL`): `https`, or a LOOPBACK
+    destination that cannot leave the box. A self-host that needs a key off-box must serve https.
+    """
+    m = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/]+)", (url or "").strip(), re.I)
+    if not m:
+        return True                              # unparseable url: nothing certifiable
+    return m.group(1).lower() != "https" and not _loopback(m.group(2))
+
+
 def usable(entry, want_url):
     """Can a lane actually use this entry? Returns (ok, reason-for-refusal).
 
@@ -145,6 +187,12 @@ def usable(entry, want_url):
     if auth and "${" not in auth:
         # a literal credential written into a shared config file is the leak, never the fix
         return False, "literal"
+    if auth and credential_in_the_clear(url):
+        # ⛔ THE VERIFIER'S https FLOOR, APPLIED HERE TOO. `--verify` refuses a credential sent to a
+        # non-loopback non-https url; preserving such an entry would mint a config the verifier
+        # refuses and `--install` then exits non-zero on — a bring-up that can never converge, which
+        # is exactly the "config `--verify` must refuse in perpetuity" this function exists to stop.
+        return False, "insecure"
     if url != want_url:
         # a self-hosted daemon may need no key at all (docs/quickstart-selfhosted.md), and its
         # header may legitimately name a different variable — it is the operator's daemon.
@@ -243,7 +291,8 @@ def main(argv):
         else:
             print(
                 "NOTE: REPLACED an unusable tortoise entry (reason: %s — the hosted endpoint needs an "
-                "env-indirect Authorization, and no entry can carry a literal key) with the hosted "
+                "env-indirect Authorization, no entry may carry a literal key, and a credential may not "
+                "be sent to a non-loopback url over a non-https scheme) with the hosted "
                 "default; a preserved one could never be repaired" % why
             )
             have["tortoise"] = want
@@ -279,11 +328,18 @@ def main(argv):
     # and see ZERO MCP servers: exactly the GRAPH-UNREACHABLE symptom this change exists to remove,
     # reintroduced as a race. `cell-install.sh`'s own `install_file` writes temp+`mv` for this reason;
     # `.mcp.json` is now a cell artifact too, so it gets the same treatment.
-    tmp = "%s.tmp.%d" % (dst_path, os.getpid())
+    # ⛔ AND IT MUST NOT WIDEN WHAT IT REPLACES: `os.replace` gives the destination the TEMP file's
+    # mode, which on a credential-adjacent file is the wrong direction (measured: a 0600 destination
+    # came back 0644), and a dotfiles-SYMLINKED `.mcp.json` would be silently replaced by a regular
+    # file. So the mode is carried over, and the write follows a symlink to its target.
+    dst_real = os.path.realpath(dst_path)
+    tmp = "%s.tmp.%d" % (dst_real, os.getpid())
     try:
         with open(tmp, "w") as fh:
             json.dump(merged, fh, indent=2)
-        os.replace(tmp, dst_path)
+        if os.path.exists(dst_real):
+            os.chmod(tmp, stat.S_IMODE(os.stat(dst_real).st_mode))
+        os.replace(tmp, dst_real)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
