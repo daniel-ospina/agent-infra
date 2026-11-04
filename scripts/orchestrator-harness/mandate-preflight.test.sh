@@ -407,9 +407,14 @@ fi
 # ── E1i: A RENDER THAT PRODUCES NOTHING MUST NOT READ AS "EVERY FILE PRESENT" (review P1) ─────────
 # The disclosure is rendered into `line`; when that render fails the OLD code took the empty result as
 # "nothing to declare" and — if a second read also failed — appended "BOTH mandated files are now PRESENT"
-# to a brief on a box where they are missing, i.e. #3377's false claim restored inside the fix. The
-# renderer is overridden here (a function override in the same shell, so no fixture is needed) to prove the
-# emit no longer answers an empty render with a present claim.
+# to a brief on a box where they are missing, i.e. #3377's false claim restored inside the fix.
+# ⛔ THE ARMS BELOW WERE DECORATION FOR THAT P1 AND THE PROPERTY IS COVERED BY E1i-b (this change's review,
+# P2, MEASURED): they stubbed only `mandate_preflight_line`, while `mandate_missing` still returned both
+# paths, so the OLD code reached CANNOT VERIFY too and every assertion stayed GREEN under a revert of the
+# `healthy` determination (measured: 101 passed, the single red being E1j's declaration arm). What they do
+# falsify is narrower and still worth having: a render failure on a box whose verdict IS decidable must not
+# be answered with a present claim. The P1's actual mechanism — BOTH reads failing for the SAME cause — is
+# E1i-b's subject, and it is the arm that reddens.
 mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
 BRIEF1I="$TMP/brief-renderfail.txt"; printf '# a brief\n' > "$BRIEF1I"
 # ⛔ THE FIXTURE MUST BE STAMPED FIRST (MEASURED while writing this arm): on a FRESH brief the emit returns
@@ -425,6 +430,27 @@ if grep -qF 'BOTH mandated files are now PRESENT' "$BRIEF1I"; then
   bad "…but it ALSO claimed both files are now PRESENT while they are missing — a false claim is worse than the silence it replaced"
 else
   ok "…and it does NOT claim they are present (the false-present branch is unreachable from a failed render)"
+fi
+# ── E1i-b: BOTH READS FAIL FOR THE SAME CAUSE — the P1's actual mechanism, and the ONLY arm that reddens
+# on it (this change's review, P2, MEASURED). A state dir with no search bit empties the render AND every
+# second-read verb at once (they short-circuit to nothing), so "the render failed" and "the state reads
+# clean" become the SAME observation — and the OLD shape answered that with a present claim. The stub
+# supplies the empty render (the failure the dir causes), the chmod supplies the genuinely-failed re-read;
+# a revert that drops the `! mandate_state_root_undecidable` guard turns this arm RED (measured on that
+# mutant: it is the only arm that does, which is why E1i alone could not carry the P1).
+UD="$(mktemp -d)"; mkdir -p "$UD/.pi/agent/state"
+: > "$UD/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; : > "$UD/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+BRIEF1IB="$TMP/brief-undecidable.txt"; printf '# a brief\n' > "$BRIEF1IB"
+CELL_HOME="$UD" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" stamp' _ "$HELPER" "$TMP/undec.log" "$BRIEF1IB" >/dev/null 2>&1
+chmod 000 "$UD/.pi/agent/state"
+CELL_HOME="$UD" bash -c '. "$1"; mandate_preflight_line() { :; }; mandate_preflight_emit "$2" "$3" undecidable' \
+  _ "$HELPER" "$TMP/undec.log" "$BRIEF1IB" >/dev/null 2>&1
+chmod 755 "$UD/.pi/agent/state"; rm -rf "$UD"
+grep -qF 'CANNOT VERIFY' "$BRIEF1IB"; ck $? "E1i-b: an empty render on an UNDECIDABLE box still says CANNOT VERIFY (dropping the undecidable guard reddens THIS arm)"
+if grep -qF 'BOTH mandated files are now PRESENT' "$BRIEF1IB"; then
+  bad "…and an undecidable box is NOT answered with a present claim (this is #3377's own false claim, restored inside the fix)"
+else
+  ok "…and an undecidable box is never answered with a present claim"
 fi
 # The last-resort literal must carry the ONE sentinel, or the block stops being idempotent on that path.
 grep -qF "line='$(bash -c '. "$1"; mandate_sentinel' _ "$HELPER")" "$HELPER"; ck $? "the last-resort literal's first line IS mandate_sentinel's value (the ONE marker cannot drift into two)"
@@ -542,9 +568,15 @@ fi
 # a presence check on the delegate, never a claim that the delegate's behaviour is exercised here; that
 # dead-branch wrap is the disclosed residual of this suite.
 grep -qF 'mandate_preflight_lib' "$SPAWN";  ck $? "spawn-gate.sh still resolves the helper"
-grep -qF 'mandate_sh' "$MERGE";             ck $? "merge-one.sh still resolves the helper (its own run_agent copy)"
+grep -qF 'mandate_sh="$_ms"; break;' "$MERGE"; ck $? "merge-one.sh still resolves the helper (its own run_agent copy)"
 grep -qF 'mandate_preflight_emit "$log" "$prompt" "$label"' "$SPAWN";           ck $? "spawn-gate.sh calls the shared emit"
 grep -qF 'mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"' "$MERGE"; ck $? "merge-one.sh calls the SAME shared emit"
+# ⛔ A GREP FOR A NAME IS SATISFIED BY THAT NAME'S OWN DEFINITION OR INITIALISATION (this change's review,
+# P2, MEASURED): `grep -qF 'mandate_preflight_lib' "$SPAWN"` stayed GREEN with the resolver CALL deleted at
+# `spawn-gate.sh`'s `_mp_sh="$(mandate_preflight_lib)"`, because the function's own declaration contains the
+# string; and `grep -qF 'mandate_sh' "$MERGE"` stayed GREEN on an empty-string initialisation. Each arm is
+# therefore pinned to the CALL/ASSIGNMENT SHAPE, never to the bare name.
+grep -qF '_mp_sh="$(mandate_preflight_lib)"' "$SPAWN"; ck $? "spawn-gate.sh CALLS its resolver into _mp_sh (a name-grep was satisfied by the declaration)"
 grep -qF 'declare -F mandate_preflight_emit' "$SPAWN"; ck $? "spawn-gate.sh checks the helper is USABLE, not merely sourceable"
 grep -qF 'declare -F mandate_preflight_emit' "$MERGE"; ck $? "merge-one.sh checks the helper is USABLE too"
 # ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
@@ -566,6 +598,19 @@ fi
 # SOURCE pin on the resolver line — and it pins CODE, not the comment above it (cycle 2's finding).
 grep -qF 'for _ms in "${MANDATE_PREFLIGHT_SH:-}"' "$MERGE"; ck $? "merge-one.sh's resolver STARTS its candidate list with MANDATE_PREFLIGHT_SH (the copy had diverged — an override that worked for every lane but the reviewer)"
 grep -qF '[ -n "$_ms" ] && [ -f "$_ms" ]' "$MERGE"; ck $? "…and merge-one.sh tests each candidate is a FILE (the stale-override degradation is not re-introduced on the reviewer seam)"
+# ⛔ PINNING THE LOOP'S FIRST CANDIDATE DOES NOT PIN THE LIST (this change's review, P2, MEASURED): dropping
+# the `$_M1_HERE/mandate-preflight.sh` entry from `merge-one.sh`'s list left the suite at 102 passed, 0
+# failed, while the two resolvers now disagreed about where the helper is — E6's exact subject, in the
+# green. And dropping the ASSIGNMENT (`mandate_sh="$_ms"; break;` → `break;`) left the same 102/0 while
+# the reviewer seam became PERMANENTLY LOG-ONLY: the loop ran, found nothing, `mandate_preflight_emit` was
+# never called, and every reviewer `pi` session got no block — #3377 restored on that seam with a green
+# suite. Each candidate is therefore pinned BY ITS OWN TOKEN (each appears exactly once per file), so any
+# dropped or reordered entry, and any divergence between the two lists, reddens.
+for _mf_cand in '${MANDATE_PREFLIGHT_SH:-}' '$O/mandate-preflight.sh' '$_M1_HERE/mandate-preflight.sh' \
+                '${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh' \
+                '${HOME:-}/.pi/agent/scripts/mandate-preflight.sh'; do
+  grep -qF -- "$_mf_cand" "$MERGE"; ck $? "merge-one.sh's candidate list still contains $_mf_cand (a dropped entry is a resolver disagreement, not a tidying)"
+done
 # The emit itself must be non-fatal on every branch.
 if awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -qE '\breturn [1-9]'; then
   bad "mandate_preflight_emit returns non-zero on some branch — callers would treat a disclosure as a refusal"
