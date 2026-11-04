@@ -460,15 +460,25 @@ jobs:
     secrets: inherit
 
   script-validate-gates:
-    # ⛔ THE GUARDS MOVE OUT OF THE MATRIX, AND THE REASON IS ARITHMETIC. `script-validate` is now a
-    # shard matrix (see the comment there), so every step left in it runs EIGHT times. These three are
-    # whole-tree checks with no shard dimension — node syntax over `scripts/*`, the lane-parity guard,
-    # and that guard's own mutation self-test (5 + 15 min measured) — so keeping them in the matrix
-    # would cost ~30 runner-minutes x 8 slices to produce ONE verdict, spending more than the sharding
-    # saves. They stay a single job, with the same steps and the same bounds as before.
+    # ⛔ THE GUARDS MOVE OUT OF THE MATRIX, AND THE REASON IS STRUCTURAL — they have no shard dimension.
+    # `script-validate` is now a shard matrix (see the comment there), so every step left in it runs
+    # EIGHT times; these three are whole-tree checks (node syntax over `scripts/*`, the lane-parity
+    # guard, and that guard's own mutation self-test) that would each produce the SAME verdict 8 times.
+    # ⚠ THE COST OF THAT DUPLICATION IS SMALL AND IS NOT THE ARGUMENT — measured in the run this PR
+    # cites (run 41693024926, job 126116214764, step timeline): node check ≈ 0.8 s, parity guard ≈ 0.5 s,
+    # self-test ≈ 35 s, i.e. ≈ 36 s total, ≈ 5 runner-minutes if duplicated 8×. An earlier draft of this
+    # comment cited the steps' `timeout-minutes` (5 and 15) as if they were runtimes and claimed ~30
+    # runner-minutes × 8; that was wrong by ~50×, and it is corrected here rather than deleted so the
+    # next reader does not re-derive it. The split stands on the structural reason: one verdict, once.
     # This mirrors ci.yml, which splits its sweep (`bash-suites`) from its guards (`bash-suites-gate`)
     # for exactly this reason (#1369).
     runs-on: ubuntu-latest
+    # ⛔ THE SAME NON-RED ARITHMETIC AS THE MATRIX JOB, because it is the same hazard: a job-level
+    # timeout reports `cancelled`, which this repo's rail treats as NON-RED, so the job bound must sit
+    # ABOVE the sum of the step bounds or the non-red one can win.
+    #   10 (checkout) + 10 (setup-node) + 10 (node --check) + 5 (parity) + 15 (self-test) = 50 < 60
+    # A step bound raised by 11 min would silently convert a red into a non-red — re-check this sum
+    # whenever one of those bounds moves.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4

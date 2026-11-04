@@ -15563,8 +15563,8 @@ grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN/e
   && pass "(m2) …and answers SLICE-TO-SLICE: base-caused via script-validate (5) ≡ bash-suites (5) — the same shard set" \
   || fail "(m2) the slice-to-slice answer is missing (a bare-name-only mapping would print 'NO BASE COUNTERPART' here): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
 grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
-  && fail "(m2) …and does NOT fall back to the bare name when the base publishes the slice (the slice candidate must win)" \
-  || pass "(m2) …and the slice candidate WINS over the bare fallback when both would match"
+  && fail "(m2) …and does not answer with the BARE name when the base publishes only the slice form" \
+  || pass "(m2) …and the answer is the slice form, not the bare fallback (this fixture publishes only the slice, so it pins that the slice candidate is TRIED; the both-present ordering is pinned by the function contract, not here)"
 new_scen named-refusal-unmapped
 # The scenario dir is captured BY NAME because (n3) re-enters it later: `SCEN` is a global
 # that a later `new_scen` overwrites (the cycle-2 P1), and this arm must not inherit another.
