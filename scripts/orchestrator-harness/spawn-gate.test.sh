@@ -237,8 +237,9 @@ function codeval(t,   v, i) {
 #     `readarray` (a value this scanner cannot know, so it cannot claim a code).
 # A residual that only READS the token (`${X}`, `${X#*=}`, `X[0]`, `[ "$X" = 83 ]`) is untouched: a
 # read declares nothing, and turning reads into REDs would be the over-block that makes a scanner
-# ignored. The subscript test is anchored at the `]` for the same reason — `[ "$X[0]" = 83 ]` is a
-# comparison, and its `=` comes after a QUOTE, so it stays silent.
+# ignored. The subscript test is anchored at the OPERATOR being GLUED TO THE `]`: `X[0]=83` is an
+# assignment, `X[0] =83` is not (`bash: X[0]: command not found`) and `[ $X[0] = 83 ]` is a
+# comparison, so the operator's position — not the presence of a quote — is what separates them.
 function residual(pre, tail, s, name, f, ln,   p, t2, v) {
   # ⛔ A SUBSCRIPT MAY CONTAIN BRACKETS OF ITS OWN (`X[a[0]]=83`) — `[^]]*` stopped at the INNER `]`,
   # matched no arm, and the form read GREEN with 0 rows (review of PR #3237, finding 2, measured).
@@ -249,12 +250,16 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v) {
   # form matched no arm and fell through the fail-closed branch in silence: measured, 0 rows, verdict
   # GREEN, while `bash -c 'X[a==b]=83'` assigns element 83. `.*` scans to the `]` that is actually
   # followed by the assignment operator (POSIX awk takes the longest match, so a NESTED subscript
-  # still ends at its own closing `]`). The arm is also gated on `cmdpos(pre)` — the position test the
-  # claim path uses — because a COMPARISON is not a declaration: `[ $X[0] = 83 ]` is a read, and
-  # before this gate it was red only when someone happened to QUOTE the element (`[ "$X[0]" = 83 ]`
-  # was silent because the `=` sits after a quote). Anchoring on position instead of on punctuation
-  # makes the rule the same one the rest of the scan uses, so it stops depending on quoting at all.
-  if (cmdpos(pre) && tail ~ /^\[.*\][ \t]*:?\+?=/) { print "unparseable", name, s, f, ln; return }
+  # still ends at its own closing `]`).
+  # ⛔ AND THE GATE ON DECLARATION POSITION WAS WRONG (review round 2, P2 — the fix above carried it,
+  # measured): `cmdpos(pre)` is FALSE for a prefix-assignment position, so `FOO=1 X[0]=83` fell through
+  # in SILENCE (0 rows, verdict GREEN) while the identical `FOO=1 X=83` was refused — the same
+  # position test giving opposite verdicts on two spellings, with the silent one a real assignment
+  # (`bash -c 'FOO=1 X[0]=83; echo ${X[0]}'` → 83). The operator's POSITION does the work instead:
+  # an assignment operator is GLUED to the `]`, so `X[0]=83` / `X[0]+=83` / `${X[0]:=83}` / a nested
+  # `X[a[0]]=83` / an `=`-bearing `X[a==b]=83` all match, while a comparison never does — it has a
+  # space or a quote between the bracket and the `=`.
+  if (tail ~ /^\[.*\][:]?\+?=/) { print "unparseable", name, s, f, ln; return }
   # ⛔ A QUOTED OPERAND IS STILL THE SAME BUILTIN: `printf -v "X" %d 83` and `read -r -d "" X`. The
   # anchors below required a TRAILING SPACE, so a quoted argument between the builtin and the name
   # defeated them and the declaration again read GREEN with 0 rows (finding 2). Strip trailing quotes
@@ -275,25 +280,68 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v) {
   }
   # `getopts` writes the OPTION CHARACTER into the name (and the index into OPTIND), so it is the same
   # class as `read`: a value this scanner cannot know (finding 2).
-  if (p ~ /(^|[ \t;&|({])(read|mapfile|readarray|getopts)([ \t]+(-[A-Za-z]+|"[^"]*"|'[^']*'))*$/) {
+  # ⛔ ANY ARGUMENT BETWEEN THE BUILTIN AND THE NAME KEEPS IT THE SAME BUILTIN (review round 2, P2).
+  # The anchor used to enumerate `-[A-Za-z]+` or a QUOTED string and nothing else, so a flag with a
+  # SEPARATE OPERAND matched nothing and the declaration read GREEN with 0 rows — measured on this
+  # head: `read -u 3 X`, `read -rt 5 X`, `read -r -p "gate: " X`, `mapfile -t -s 1 X` and
+  # `getopts "a:" X` all produced 0 rows. The table only drove the forms that happened to work (`read
+  # -r`, `read -r -d ""` — the one quoted operand the trailing-quote strip survives — and `getopts ""`),
+  # which is how the gap survived the arm written for it. What sits between them is an ARGUMENT LIST,
+  # not a command boundary, so it accepts anything up to a separator.
+  if (p ~ /(^|[ \t;&|({])(read|mapfile|readarray|getopts)([ \t]+[^;&|(){}<>]*)?[ \t]*$/) {
     print "unparseable", name, s, f, ln
     return
   }
-  # AN ARITHMETIC ASSIGNMENT (`(( X = 83 ))`) DECLARES the code with no `=` in a declaration position: the
-  # parenthesised context makes `cmdpos` false, so the operator chain REFUSED it as if it were
-  # `echo "X=83"` — red, but for the wrong reason, and `(( X == 83 ))` must stay SILENT (a comparison,
-  # not a declaration). Claim it when the value is readable so the duplicate COLLIDES — the property
-  # this whole namespace check exists for — and refuse it otherwise.
+  # AN ARITHMETIC ASSIGNMENT (`(( X = 83 ))`) DECLARES the code with no `=` in a declaration position.
+  # The arm is reached because `tail` begins with WHITESPACE, which `^=` / `^:?[-+]` cannot match — it
+  # used to say the parenthesised context made `cmdpos` false, which is MEASURED FALSE (cmdpos("(( ") =
+  # 1); the behaviour was right and the stated cause was wrong, which matters because that sentence is
+  # the reason the arm exists. `(( X == 83 ))` must stay SILENT (a comparison, not a declaration).
+  # ⛔ AND THE VALUE MUST BE ONE LITERAL (review round 2, P2): `valof` cuts at the first space, so
+  # `(( X = 70 + 13 ))` claimed **70** while bash assigns **83** — the skew gate's own code — giving a
+  # fail-open past the collision check (`(( X = 84 - 1 ))` claimed 84). The same value written as
+  # `X=$(( 70 + 13 ))` is already refused, so the two paths disagreed. Claim only a single literal;
+  # anything computed is `unparseable`.
   if (p ~ /\(\([^()]*$/ && tail ~ /^[ \t]*(:|\+)?=([^=]|$)/) {
     t2 = tail
     sub(/^[ \t]+/, "", t2)
     sub(/^(:|\+)?=/, "", t2)      # the OPERATOR is the declaration, not the value
     sub(/^[ \t]+/, "", t2)
     v = valof(t2)
-    if (v != "") row("claim", name, v, f, ln)
-    else         print "unparseable", name, s, f, ln
+    # ONE LITERAL, and the rest of the expression must be nothing but the closing parens: a computed
+    # right-hand side is REFUSED rather than claimed as its first term.
+    if (t2 ~ /^[0-9]+[ \t]*\)*[ \t]*$/ && v != "") row("claim", name, v, f, ln)
+    else                                     print "unparseable", name, s, f, ln
     return
   }
+}
+# ⛔ `X="${X:-83}"` IS A DECLARATION OF 83 WHEN UNSET (review round 2, P2 — measured), and it is the
+# HOUSE IDIOM for a defaulted constant: `scripts/pi-reap-worktrees.sh:835` declares
+# `REAP_WT_PRESERVE_KEEP_DAYS="${REAP_WT_PRESERVE_KEEP_DAYS:-14}"` exactly that way, and that is the
+# very declaration the registry row in this PR is about. The scanner read the right-hand side as an
+# operand it could not resolve and emitted `unknown` — a RED naming no duplicate, with a message a
+# reader cannot act on ("unparseable declaration: spawn-gate.sh:AGENT_X_REFUSED") — while its OWN
+# fallback pass read the same value as `83`. A future gate constant written the way the rest of the
+# repo writes constants would have been a false red. Recognised ONLY when the operand is exactly
+# `${<the same name><operator><literal>}`, so nothing else is reinterpreted; a computed self-default
+# (`${X:-$y}`) stays `unknown`/RED, and an operand naming a DIFFERENT constant is not a claim here.
+function selfdefault(nm, rhs,   m, head) {
+  m = rhs
+  sub(/^["']/, "", m)
+  sub(/["'][ \t]*$/, "", m)
+  sub(/[ \t]+$/, "", m)
+  head = "${" nm
+  if (substr(m, 1, length(head)) != head) return ""
+  m = substr(m, length(head) + 1)
+  if      (m ~ /^:-/) m = substr(m, 3)
+  else if (m ~ /^:=/) m = substr(m, 3)
+  else if (m ~ /^=/)  m = substr(m, 2)
+  else if (m ~ /^-/)  m = substr(m, 2)
+  else if (m ~ /^\+/) m = substr(m, 2)
+  else return ""
+  if (m !~ /^[0-9]+\}[ \t]*$/) return ""
+  sub(/\}.*$/, "", m)
+  return iscode(m) ? m : ""
 }
 function row(kind, name, v, f, ln) {
   if (iscode(v)) print kind, name, v + 0, f, ln
@@ -317,6 +365,14 @@ function row(kind, name, v, f, ln) {
   # `printf -v` followed by a space is the same command as the glued form, so nothing else moves.
   scan = s
   gsub(/printf[ \t]+-v/, "printf -v ", scan)
+  # ⛔ AN INLINE COMMENT IS DOCUMENTATION TOO (review round 2, P2 — measured). Only WHOLE-LINE comments
+  # were skipped, so `true # AGENT_X_REFUSED=83` and `true # ${X:-81}` were REFUSED as
+  # `unparseable declaration: file:line` and as a stale default — false REDS produced by documentation,
+  # against the contract above ("A COMMENT line is documentation, not a declaration"). `valof` already
+  # treats `#` as a value terminator and this file's own `strip_comments` (`s/[[:space:]]#.*$//`) is the
+  # same rule, so the scan now applies it to the whole LINE. A `#` that is part of an expansion
+  # (`${X#*=}`, `${X##*/}`) has no whitespace before it and is untouched.
+  sub(/[ \t]#.*$/, "", scan)
   # ⛔ THE NAMING CONVENTION IS ASSERTED, NOT ASSUMED (review of PR #3237, finding 1). The claim scan
   # below is anchored on the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED` namespace, so a gate code
   # declared under ANY OTHER NAME is invisible to it — measured: `AGENT_MEM_GATE=81`, a real duplicate
@@ -395,7 +451,11 @@ function row(kind, name, v, f, ln) {
       if (cmdpos(pre)) row("claim", name, valof(substr(tail, 3)), f, FNR)
       else             print "unparseable", name, s, f, FNR
     } else if (tail ~ /^=/) {
-      if (cmdpos(pre)) row("claim", name, valof(substr(tail, 2)), f, FNR)
+      if (cmdpos(pre)) {
+        v = selfdefault(name, substr(tail, 2))   # `X="${X:-83}"` — the house default idiom
+        if (v != "") row("claim", name, v, f, FNR)
+        else          row("claim", name, valof(substr(tail, 2)), f, FNR)
+      }
       else             print "unparseable", name, s, f, FNR
     } else if (tail ~ /^:?[-+]/) {
       print "unparseable", name, s, f, FNR
@@ -2420,7 +2480,14 @@ getopts-builtin|unparseable|getopts \"\" AGENT_NEW_GATE_REFUSED
 arith-assign|claim|(( AGENT_NEW_GATE_REFUSED = 83 ))
 array-nested-subscript|unparseable|AGENT_NEW_GATE_REFUSED[a[0]]=83
 printf-v-glued|claim|printf -vAGENT_NEW_GATE_REFUSED %d 83
-array-subscript-eq|unparseable|AGENT_NEW_GATE_REFUSED[a==b]=83"
+array-subscript-eq|unparseable|AGENT_NEW_GATE_REFUSED[a==b]=83
+subscript-prefix-assign|unparseable|FOO=1 AGENT_NEW_GATE_REFUSED[0]=83
+arith-computed|unparseable|(( AGENT_NEW_GATE_REFUSED = 70 + 13 ))
+read-flag-operand|unparseable|read -u 3 AGENT_NEW_GATE_REFUSED
+read-p-prompt|unparseable|read -r -p \"gate: \" AGENT_NEW_GATE_REFUSED
+mapfile-flag-operand|unparseable|mapfile -t -s 1 AGENT_NEW_GATE_REFUSED
+getopts-optstring|unparseable|getopts \"a:\" AGENT_NEW_GATE_REFUSED
+self-default|claim|AGENT_NEW_GATE_REFUSED=\"\${AGENT_NEW_GATE_REFUSED:-83}\""
 _resid_unread=""; _resid_unred=""
 while IFS='|' read -r _rtag _rkind _rline; do
   [ -n "$_rtag" ] || continue
@@ -2449,6 +2516,17 @@ _resid_n="$(printf '%s\n' "$_residshapes" | awk 'NF{n++} END{print n+0}')"
 ck "the scanner CLASSIFIES all $_resid_n RESIDUAL declaration shapes (array subscripts, printf -v, read) — the reviewed head reported 0 rows for every one of them (unread:${_resid_unread:- none})" $rc
 [ -z "${_resid_unred// /}" ]; rc=$?
 ck "...and EVERY one of them REDDENS the code check as a NAMED collision or 'unparseable declaration: file:line' — a shape that vanishes again fails HERE (green:${_resid_unred:- none})" $rc
+# (f1c) THE ANTIDOTE — a guard that reddens everything detects NOTHING, and every arm above would then
+# pass for the wrong reason. These lines are token-bearing or declaration-SHAPED and declare no code,
+# and TWO of them were FALSE REDS on the reviewed head (`be1`/`f2` fixes above): an element COMPARISON
+# was red when unquoted and silent when quoted (punctuation deciding a verdict), and an INLINE COMMENT
+# carrying a declaration was refused with `unparseable declaration: file:line`. A `#` inside an
+# expansion (`${X#*=}`) must survive the comment strip, which row 3 pins.
+_codemut_dir="$(_codemut residual-control)"
+printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\ntrue # AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip, a bare exit \"\$X\" and an INLINE COMMENT carrying a declaration all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f) THE FAIL-CLOSED HALF: an assignment OPERATOR on a family token that is NOT in a declaration
 # position cannot be classified, so it must be RED and NAMED WITH ITS LINE — never dropped. This is the
