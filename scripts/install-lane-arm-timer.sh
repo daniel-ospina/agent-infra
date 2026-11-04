@@ -226,8 +226,17 @@ do_status() {
     A=$("${LANE_ARM_PYTHON:-python3}" -c 'import os,sys,time
 try: print(int(time.time()-os.stat(sys.argv[1]).st_mtime))
 except OSError: raise SystemExit(1)' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || echo '?')
-    W="$(grep -c '^WEDGED' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || true)"
-    say "queue    : present, ${A}s old, wedged=${W:-0}"
+    # ⛔ COUNT EVERY ROW, AND NAME WHAT THEY ARE (2026-10-31, review). This counted `^WEDGED` -- exactly
+    # the under-count the arm itself was fixed for: the queue's first column now carries the
+    # classifier's own verdict word, so a queue whose only row is `CHILD_STUCK_PARKED` (the one row with
+    # a documented action) reported `wedged=0`, i.e. "nothing to unblock" over the only actionable row.
+    W="$(grep -vc '^#' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || true)"
+    U="$(awk -F'\t' '/^# unrecognized\t/{print $2}' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || true)"
+    BY="$(grep -v '^#' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null | cut -f1 | sort | uniq -c | awk '{printf "%s=%s ", $2, $1}' || true)"
+    say "queue    : present, ${A}s old, wedge_family=${W:-0}${BY:+ (${BY% })}"
+    if [ -n "$U" ] && [ "$U" != 0 ]; then
+      say "queue    : ⛔ ${U} row(s) carried a verdict word the arm does not know (see the # unrecognized line) -- NOT queued"
+    fi
   else
     say "queue    : ABSENT (no pass has succeeded here)"
   fi
@@ -235,14 +244,38 @@ except OSError: raise SystemExit(1)' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || 
     linux)
       # use the RESOLVED binary and the same scope discipline as --install
       if [ -z "$SYSTEMCTL" ]; then
-        say "timer    : no systemctl on this box"
-      else
-        $SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
-          || $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
-          || say "timer    : not installed"
+        # ⛔ AN ABSENT MANAGER IS NOT "NOT INSTALLED" (2026-10-31, review). This printed `timer : not
+        # installed` and exited 0 while the read never happened -- on a box that has a real timer firing.
+        # Same "absence is not a verdict" rule the *) arm below refuses.
+        say "timer    : UNVERIFIABLE -- no systemctl on this box, so nothing was read (NOT 'not installed')"
+        say "FAIL: the schedule could not be READ (no systemctl); refusing to report an absence as an answer" >&2
+        exit 1
       fi
+      # ⛔ A FAILED READ IS NOT AN ABSENT TIMER EITHER. Each query's status is checked, and only a
+      # query that actually ANSWERED may be read as "not installed".
+      _sys=$($SYSTEMCTL list-timers --all --no-legend 2>/dev/null; echo "rc=$?")
+      _usr=$($SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null; echo "rc=$?")
+      case "$_sys" in
+        *"$LABEL"*) printf '%s\n' "$_sys" | grep -F "$LABEL"; exit 0 ;;
+      esac
+      case "$_usr" in
+        *"$LABEL"*) printf '%s\n' "$_usr" | grep -F "$LABEL"; exit 0 ;;
+      esac
+      # Neither scope listed it -- but only claim that if BOTH reads answered.
+      case "$_sys" in
+        *rc=0) : ;; *) say "timer    : UNVERIFIABLE -- the system manager read FAILED (${_sys##*rc=}); this is not an absence" >&2; exit 1 ;;
+      esac
+      case "$_usr" in
+        *rc=0) : ;; *) _unread=1 ;;
+      esac
+      [ -n "${_unread:-}" ] && say "timer    : not in the system scope; the USER scope could not be read (no user manager) -- absence there is UNVERIFIED"
+      say "timer    : not installed"
       ;;
     macos)
+      if ! "$LAUNCHCTL" list >/dev/null 2>&1; then
+        say "job      : UNVERIFIABLE -- launchctl could not be read; this is not an absence" >&2
+        exit 1
+      fi
       "$LAUNCHCTL" list 2>/dev/null | grep -F 'com.eldato.lane-arm' || say "job      : not installed"
       ;;
     # ⛔ AN UNKNOWN PLATFORM IS NOT A SCHEDULE (2026-10-31, review). This `case` had no `*)` arm, so on
@@ -286,15 +319,26 @@ if [ "$VERB" = uninstall ]; then
       fi
       rm -f "$_userdir/${LABEL}.service" "$_userdir/${LABEL}.timer" 2>/dev/null || true
       # VERIFY, never the send: only claim removal when the timer is actually gone from BOTH scopes.
+      # ⛔ AND SAY WHICH SCOPES WERE ACTUALLY VERIFIED (2026-10-31, review). The user manager may not exist
+      # (or this run may hold a different $HOME than the identity that installed it), so claiming
+      # "verified absent from both" was a claim about a read that never happened -- measured with
+      # HOME=/tmp/other and an unrunnable `systemctl --user`: it printed exactly that while a live user
+      # unit remained. The user scope is only ASSERTED when it was consulted.
+      _useryes=0
+      if $SYSTEMCTL --user show-environment >/dev/null 2>&1; then _useryes=1; fi
       if $SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL" \
-         || $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL"; then
-        fail "removal reported but ${LABEL}.timer is STILL listed -- not uninstalled. system=$($SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | tr '\n' ' ') user=$($SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | tr '\n' ' ')"
+         || { [ "$_useryes" = 1 ] && $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL"; }; then
+        fail "removal reported but ${LABEL}.timer is STILL listed -- not uninstalled. system=$($SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | tr '\n' ' ') user=$([ "$_useryes" = 1 ] && $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | tr '\n' ' ')"
       fi
       for _d in "$_sysdir" "$_userdir"; do
         [ -e "$_d/${LABEL}.timer" ] || [ -e "$_d/${LABEL}.service" ] || continue
-        fail "removal reported but unit files remain in $_d -- not uninstalled (a manager may hold them open, or another identity owns them)"
+        fail "removal reported but unit files remain in $_d -- not uninstalled (a manager may hold them open, another identity may own them, or this run's \$HOME is not the installing identity's)"
       done
-      say "uninstalled ${LABEL}.timer (verified absent from both the system and user managers)"
+      if [ "$_useryes" = 1 ]; then
+        say "uninstalled ${LABEL}.timer (verified absent from the system AND user managers)"
+      else
+        say "uninstalled ${LABEL}.timer (system scope verified; NO user manager here, so the user scope at $_userdir was removed if present but is UNVERIFIED -- check it if this box schedules as another identity)"
+      fi
       ;;
     macos)
       # ⛔ VERIFY, NEVER THE SEND -- the same rule the Linux branch above spells out. `bootout` is
@@ -390,6 +434,20 @@ Group=$_group"; fi
     if $RUN list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL"; then
       say "installed ($SCOPE): ${LABEL}.timer, every ${INTERVAL}s"
       $RUN list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | sed 's/^/  /'
+      # ⛔ "INSTALLED" HERE MEANS THE SCHEDULE IS REGISTERED -- NOT THAT THE ARM CAN START (2026-10-31,
+      # review). `list-timers` cannot tell a working unit from one whose ExecStart is unparseable: a unit
+      # with a quoted ExecStart was measured listed-but-failing (status=203/EXEC) while this verb said
+      # "installed". The rendering is unquoted now, but the CHECK still cannot see the difference, so it
+      # says which of the two questions it answered instead of implying both.
+      if command -v systemd-analyze >/dev/null 2>&1; then
+        if systemd-analyze verify "$D/${LABEL}.service" >/dev/null 2>&1; then
+          say "unit     : systemd-analyze verify OK (the unit PARSES; a start has not been exercised)"
+        else
+          fail "installed and enabled, but \`systemd-analyze verify $D/${LABEL}.service\` FAILED -- the unit is registered and would fail to start. Not claiming a working install"
+        fi
+      else
+        say "unit     : SCHEDULE verified only -- systemd-analyze is absent, so this box has NOT proved the unit can start"
+      fi
     else
       fail "enable reported success but the timer is not listed in the $SCOPE scope -- treating as NOT installed"
     fi
