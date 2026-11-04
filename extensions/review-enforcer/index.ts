@@ -5795,7 +5795,20 @@ function mergeVerbWalk(command: string, groupFirst: boolean): boolean {
     const raw = scan.tokens[i];
     const w = shellWord(raw);
     const verbWord = withoutAssignmentPrefix(w);
-    const bareDollar = raw === "$";
+    // ⛔ THE INTRODUCER OF A SPLIT EXPANSION, QUOTED OR NOT. `scanTokens` splits `${P}` at the
+    // braces, so a QUOTED single-word expansion `"${P}"` becomes the tokens `"$` + `P}"` — and
+    // `shellWord(""$")` dequotes to `$` and then strips the leading `$`, leaving "". Reading that
+    // as "not the introducer" cleared adjacency MID-WORD, so the group slot could never accept
+    // `P}"` and no arm matched:
+    //
+    //   P=pr; G=gh; $G "${P}" merge 999 --admin      (bash hands gh `pr merge 999 --admin`)
+    //
+    // `origin/main` refused it and HEAD did not — and because `isGitOp` delegates to
+    // `isAdminMergeCommand`, the handler returned before ANY gate ran: a silent fail-open, not
+    // merely a candidate that lost its flag (review cycle 5, P0; 154 of a 31k generated
+    // cross-product sample). `dequote` is what makes the quoted spelling the SAME WORD as `$` —
+    // and it is the only spelling this widens, since a bare `$` was already an introducer here.
+    const bareDollar = dequote(raw) === "$";
     // The command word is `gh`, OR a construct where a command word belongs (`g$'h'`, `$GH`,
     // `X='gh pr merge 9'`, `CMD+=gh`). ⛔ OMITTING THE CONSTRUCT CASE WAS THE CYCLE-2 P0: bash
     // resolves `g$'h' "pr" merge 999 --admin` to `gh pr merge 999 --admin`, and with only a

@@ -5316,12 +5316,19 @@ test("mergeInvocationInText: a construct on BOTH sides is not an invocation (rev
   // ⛔ THE OVER-BLOCK the cycle-2 fix introduced, and the reason arm 2 requires a READABLE
   // `gh`: accepting a construct as the command word there turned "construct command + construct
   // group" into the same vocabulary guess the predicate exists to replace. Every command below
-  // is READ-ONLY, is refused at `origin/main` as well (so this is not a regression fence — it
-  // is the class the whole change is about), and was measured to be BLOCKED by the interim
-  // head: `evaluateAdminMergeGate(null, null, null, false)` → `status: "block"`,
+  // is READ-ONLY and was measured to be BLOCKED by the interim head:
+  // `evaluateAdminMergeGate(null, null, null, false)` → `status: "block"`,
   // `reasonTag: "admin_no_pr"`, with `countMergeVerbs` 0 and `readsNonMergeGhCall` false, so
   // the shim stand-down could not rescue them either. The first row is the script that
   // verifies the evidence for THIS gate.
+  //
+  // ⛔ PROVENANCE — these are REGRESSION FENCES for the cycle-2 interim head, NOT the pre-existing
+  // class (review cycle 5, P2). This block used to claim they were "refused at `origin/main` as
+  // well"; re-measured against the merge-base build, `isAdminMergeCommand` is FALSE for all five
+  // there (the old vocabulary arm needs a `gh` word or a `pr`+`merge` pair, and none has one), so
+  // `origin/main` ADMITS every one of them. Labeling them as pre-existing coverage is what would
+  // let a later re-widening of the candidate rule treat this false block as already-caught, so the
+  // pin stays and only the provenance claim is corrected.
   const overBlocks = [
     `bash $AIR/scripts/verify-admin-merge-evidence.sh "$PR"`,
     `$PY $SCRIPT --check-admin-policy`,
