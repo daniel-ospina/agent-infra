@@ -106,25 +106,38 @@ mandate_sentinel() { printf '%s' '<!-- mandate-preflight #3377 -->'; }
 # mandate_state_root — WHERE the files live, resolved the same way the bring-up resolves it. `CELL_HOME`
 # first because the operational layer on a cell is installed under it (§1 of the `cmux-cells` skill), and
 # `$HOME` otherwise, so a Mac and a cell read the same rule instead of two drifting copies.
+# ⛔ IT RENDERS NOTHING WHEN NEITHER IS SET — it does NOT fall back to "" (this change's review cycle 3,
+# P1, MEASURED). "${CELL_HOME:-${HOME:-}}" with BOTH unset is the EMPTY STRING, so the root became
+# `/.pi/agent/state` — an absolute path this box never reads — and `--check` answered MISSING for two files
+# under `/`, `--line` rendered a full MANDATE-UNSATISFIABLE block, and the emit appended it to the
+# dispatched lane's brief as its LAST instruction. That is a false absence claim with the wrong remedy
+# (`ship the file`), on the one class of box the answer is CANNOT VERIFY for; and it is reachable —
+# `spawn-gate.sh` handles "neither CELL_HOME nor HOME is set" a few blocks above this emit. An empty value
+# here means "the base could not be named", and every caller treats that as undecidable.
 mandate_state_root() {
-  printf '%s/.pi/agent/state' "${CELL_HOME:-${HOME:-}}"
+  local base="${CELL_HOME:-${HOME:-}}"
+  [ -n "$base" ] || return 0
+  printf '%s/.pi/agent/state' "$base"
 }
 
 # mandate_state_root_undecidable — TRUE when NOTHING can be decided about the state dir's CONTENTS, and it
-# is not merely absent. Three ways that happens, all of which used to be reported as ABSENT:
-#   (a) the dir exists but has no SEARCH (execute) bit for this process — `chmod 000`, `chmod 640`, an
+# is not merely absent. Four ways that happens, all of which used to be reported as ABSENT:
+#   (a) no base could be NAMED AT ALL (`CELL_HOME` and `HOME` both empty) — there is no path to look under,
+#       so every individual file is UNKNOWN, never missing (this change's review cycle 3, P1, measured);
+#   (b) the dir exists but has no SEARCH (execute) bit for this process — `chmod 000`, `chmod 640`, an
 #       ordinary dir owned by another user at `--x`-less mode;
-#   (b) an ANCESTOR on the path is unsearchable, so `[ -d "$root" ]` is itself FALSE and the absence test
+#   (c) an ANCESTOR on the path is unsearchable, so `[ -d "$root" ]` is itself FALSE and the absence test
 #       below could never fire (review cycle 9, measured: `chmod 000 ~/.pi/agent` reported both PRESENT
 #       files as MISSING with the `ship it` remedy — the same false-absence claim, one directory up, and on
 #       exactly the box where naming the permission fault is the whole value);
-#   (c) the path exists but is not a directory (a file where a dir belongs) — a deployment fault, not an
+#   (d) the path exists but is not a directory (a file where a dir belongs) — a deployment fault, not an
 #       absence, so it must not be answered with "ship the file".
 # A GENUINELY absent chain stays undecidable=FALSE: the walk climbs through parents that do not exist and
 # stops at the first one that does, which is the ordinary "not provisioned yet" case (§C's fixture).
 mandate_state_root_undecidable() {
   local root p
   root="$(mandate_state_root)"
+  [ -n "$root" ] || return 0
   if [ -d "$root" ]; then [ -x "$root" ] || return 0; return 1; fi
   [ -e "$root" ] && return 0
   while [ -n "$root" ] && [ "$root" != "/" ]; do
@@ -223,7 +236,7 @@ EOF
 # and brief stay byte-for-byte what they were (an always-on banner is noise a reader learns to skip, and
 # a warning that is always printed is not a warning).
 mandate_preflight_line() {
-  local root path why missing unreadable irregular
+  local root path why missing unreadable irregular cv_where
   root="$(mandate_state_root)"
   # ⛔ AN UNREADABLE STATE DIR MAKES `-f` FALSE FOR EVERY FILE UNDER IT, so testing the files first
   # reported the whole dir's contents as MISSING — a false ABSENCE claim about files that may be
@@ -231,8 +244,16 @@ mandate_preflight_line() {
   # short-circuits: nothing can be said about individual files through a dir that cannot be read.
   if mandate_state_root_undecidable; then
     printf '%s\n' "$(mandate_sentinel)"
-    printf '[mandate-preflight] ⛔ CANNOT VERIFY on this box (%s): the mandated files live in %s, which cannot be resolved by this process (its own or a parent directory search (execute) bit is clear, or it is not a directory) — so whether the lane can obey its "READ … FIRST" instruction is UNKNOWN, and a cannot-verify is NEVER a pass (agent-infra#3377). Remedy is a mode fix on that directory, NOT a missing deployment.\n' \
-      "$(hostname 2>/dev/null || printf 'this box')" "$root"
+    # ⛔ THE REMEDY IS PART OF THE FACT (review cycle 3, P1): when no base can be NAMED there is no
+    # directory to fix the mode of, so the message must not send the reader at a `chmod` on a path that does
+    # not exist — and it must not name `/.pi/…` as if that were where the lane looks.
+    if [ -n "$root" ]; then
+      cv_where="the mandated files live in $root, which cannot be resolved by this process (its own or a parent directory search (execute) bit is clear, or it is not a directory), so the remedy is a mode fix on that directory, NOT a missing deployment"
+    else
+      cv_where="no state directory can even be NAMED on this box — neither CELL_HOME nor HOME is set, so the mandated files have no resolvable location and nothing about them can be decided (the remedy is an environment fix, not a deployment and not a chmod)"
+    fi
+    printf '[mandate-preflight] ⛔ CANNOT VERIFY on this box (%s): %s — so whether the lane can obey its "READ … FIRST" instruction is UNKNOWN, and a cannot-verify is NEVER a pass (agent-infra#3377).\n' \
+      "$(hostname 2>/dev/null || printf 'this box')" "$cv_where"
     return 0
   fi
   missing="$(mandate_missing)"
@@ -456,8 +477,12 @@ mandate_verdict() {
     return 2
   fi
   if mandate_state_root_undecidable; then
-    printf '[mandate-preflight] CANNOT VERIFY: %s cannot be resolved by %s (no search/execute bit on it or on a parent directory, or it is not a directory) — so nothing can be known about the mandated files. A cannot-verify is NEVER a pass\n' \
-      "$root" "$(id -un 2>/dev/null || printf 'this user')" >&2
+    if [ -n "$root" ]; then
+      printf '[mandate-preflight] CANNOT VERIFY: %s cannot be resolved by %s (no search/execute bit on it or on a parent directory, or it is not a directory) — so nothing can be known about the mandated files. A cannot-verify is NEVER a pass\n' \
+        "$root" "$(id -un 2>/dev/null || printf 'this user')" >&2
+    else
+      printf '[mandate-preflight] CANNOT VERIFY: no state directory can be named on this box (neither CELL_HOME nor HOME is set), so nothing can be known about the mandated files and no path may be called missing. A cannot-verify is NEVER a pass\n' >&2
+    fi
     return 2
   fi
   if [ -n "$(mandate_unreadable)" ]; then
@@ -488,13 +513,23 @@ _mandate_cli() {
       fi
       return "$rc" ;;
     --line)    mandate_preflight_line ;;
-    --missing) mandate_missing ;;
+    # ⛔ `--missing` MUST NOT ANSWER "UNKNOWN" WITH STATUS 0 (this change's review cycle 3, P2, MEASURED):
+    # in the undecidable case `mandate_missing` returns 0 with NO output — identical to "nothing is
+    # missing" — so a consumer writing `if ! … --missing; then all-present` read an UNKNOWN state as
+    # CLEAN. That is this file's own doctrine ("a cannot-verify is NEVER a pass") applied to `--check`
+    # and forgotten here. The verb now answers 2 for the same state, and names why on stderr.
+    --missing)
+      if mandate_state_root_undecidable; then
+        printf '[mandate-preflight] CANNOT VERIFY: the state dir cannot be resolved on this box, so no path may be called missing (a cannot-verify is never an empty list). Use --check for the verdict.\n' >&2
+        return 2
+      fi
+      mandate_missing ;;
     --files)   mandate_files | cut -d'|' -f1 ;;
     -h|--help)
       printf 'usage: %s [--check|--line|--missing|--files]\n' "$0"
       printf '  --check    0 every mandated file present · 1 any missing (each named on stderr) · 2 CANNOT VERIFY\n'
       printf '  --line     the disclosure block appended to a brief (EMPTY when all are present)\n'
-      printf '  --missing  the missing paths, one per line\n'
+      printf '  --missing  the missing paths, one per line · 2 CANNOT VERIFY (never an empty list for an unknown state)\n'
       printf '  --files    the declared names, one per line\n' ;;
     "")
       mandate_preflight_line ;;
