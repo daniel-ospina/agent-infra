@@ -87,17 +87,6 @@ command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_a
   && command -v repo_target_head_branch >/dev/null 2>&1 && command -v repo_target_slug >/dev/null 2>&1 \
   && command -v repo_target_refuse >/dev/null 2>&1 && [ -n "${REPO_TARGET_REFUSED:-}" ] \
   || { echo "[lane $N] FATAL: $SELF/repo-target.sh is stale (needs repo_target_assert/repo_target_branch_assert/repo_target_head_branch/repo_target_slug/repo_target_refuse and REPO_TARGET_REFUSED) — refusing to start a lane whose repo cannot be asserted (#2724)" >&2; exit 78; }
-# ── THE LANE'S OWN CREDENTIALS (agent-infra#3060) ───────────────────────────────────────────────────
-# A lane started OUTSIDE the controller inherits no keys and dies in ~7 s with "No API key found for
-# deepseek" — after passing every gate, because the capability gate sources the key file for its own probe
-# call and therefore cannot see that the lane has none. The sourcing lives in lane-env.sh so it is testable
-# without a worktree, a pi binary or a provider (lane-env.test.sh), and it is a TOP-LEVEL snippet on
-# purpose: `. file` inside a function means something different (see that file's header for the three
-# defects that produced from wrapping it). Fail LOUD if it is missing — an unsourced snippet would silently
-# restore the 7-second death this exists to remove.
-[ -r "$SELF/lane-env.sh" ] || { echo "[lane $N] FATAL: $SELF/lane-env.sh missing — refusing to start a lane whose credentials nothing sourced (#3060)" >&2; exit 78; }
-LANE_ENV_LOG="$O/logs/lane-$N.log" LANE_ENV_LABEL="lane $N" . "$SELF/lane-env.sh"
-
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
 # (measured 2026-10-19: three lanes did the whole job, then were refused at the rail). A lane's gate is
@@ -284,14 +273,14 @@ if [ ! -f "$LANE_MERGE_CMD" ]; then
   # while the brief pointed at nothing. Say nothing rather than something false, and name the remedy.
   if [ "$SELF/lane-merge.sh" != "$LANE_MERGE_CMD" ] && [ -f "$SELF/lane-merge.sh" ]; then
     LANE_MERGE_CMD="$SELF/lane-merge.sh"
-    echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O/" >> "$O/logs/lane-$N.log"
+    echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Sync: cp scripts/orchestrator-harness/*.sh $O/" >> "$O/logs/lane-$N.log"
   else
     # ⛔ THE BRIEF MUST SAY WHAT THIS LINE SAYS (landing-review finding 2): the merge-loop section below is
     # rendered from $MERGE_LOOP_NOTE, so this arm now really does tell the lane the tool is missing and
     # what to do instead — previously the log promised that and the brief named a path that did not exist
     # (exit 127, unmapped by the brief's own exit-code table).
-    MERGE_LOOP_NOTE="⛔ THE MERGE LOOP IS NOT INSTALLED ON THIS BOX ($LANE_MERGE_CMD does not exist). Do NOT hand-roll a polling loop: if you cannot reach \`merged\`, report the exact blocker as a hand-off comment per **Handoff** below and stop. An operator can install it from the agent-infra checkout (NOT from this lane worktree) with: \`bash scripts/orchestrator-harness/deploy-harness.sh --repo <agent-infra> --o $O\`"
-    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief now says so and tells the lane to hand off instead of running a missing path; redeploy first FROM THE agent-infra CHECKOUT (not this lane worktree) with bash scripts/orchestrator-harness/deploy-harness.sh --repo <agent-infra> --o $O/" >> "$O/logs/lane-$N.log"
+    MERGE_LOOP_NOTE="⛔ THE MERGE LOOP IS NOT INSTALLED ON THIS BOX ($LANE_MERGE_CMD does not exist). Do NOT hand-roll a polling loop: if you cannot reach \`merged\`, report the exact blocker as a hand-off comment per **Handoff** below and stop. An operator can install it with: \`cp $SELF/*.sh $O/\`"
+    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief now says so and tells the lane to hand off instead of running a missing path; sync first: cp $SELF/*.sh $O/" >> "$O/logs/lane-$N.log"
   fi
 fi
 cat > "$O/logs/prompt-$N.txt" <<EOF
@@ -569,12 +558,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
   if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then
     echo "[lane $N] NOT started: FORK gate refused — this box is out of PROCESSES (agent-infra#2293). Waiting cannot clear it and this box cannot start the retry: restart or drain it from OUTSIDE, or let its lanes finish and the issue be re-dispatched elsewhere." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
-    # ⛔ TWO CONDITIONS SHARE CODE 77 (review round 1, P2): below `DISK_MIN_FREE_MB`, AND above it but
-    # without the headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). This line used to
-    # claim only the first, so the operator grepping it was told the filesystem was full when the floor
-    # had been MET — a false cause, and the same #1765 class (a remedy for the wrong condition) this
-    # block exists to prevent. Both are named, and the refusing line above carries the numbers.
-    echo "[lane $N] NOT started: DISK gate refused — either the filesystem is below DISK_MIN_FREE_MB, or it is above the floor but has no headroom for one lane's dependency tree (DISK-NOHEADROOM, agent-infra#2721). The '[disk-gate] REFUSED' line above says which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches; --scratch for /tmp) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is

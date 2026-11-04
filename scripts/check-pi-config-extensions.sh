@@ -39,11 +39,8 @@
 #      links this repo does not ship are not this gate's business, so it cannot
 #      false-block on someone else's half-installed farm. An absent farm prints
 #      an explicit STOP line and passes, and an absent link for a row is simply
-#      not inspected. The farm ROOT is resolved by the rule below: an explicit
-#      PI_EXTENSIONS_DIR always wins; in CI the ambient `$HOME/.pi` farm is
-#      REFUSED (a repo-level verdict must not be decided by the runner box's own
-#      state — measured on #3002); otherwise it is the machine-local farm, which
-#      is what makes this check meaningful on the box itself.
+#      not inspected; PI_EXTENSIONS_DIR overrides the farm root for
+#      tests/pi-config-extensions/run.sh.
 #
 # Because each entry IS the extensions/ file/dir (via symlink), content can
 # never drift between the two trees; checks 1-3 close every farm drift mode:
@@ -309,15 +306,7 @@ else
   # as "dir/"; the tree lists bare basenames). One row per line; empty when
   # the entries array is missing/empty (fail-closed on the tree→manifest loop
   # below).
-  # ⛔ THE PRODUCER IS A FUNCTION, never a here-doc inside `$( )`. bash 3.2's substitution scanner does
-  # not skip a here-doc body: it walks the body as code, so an apostrophe in it (this body carries
-  # "this dir's" and "subdirectory's") desynchronises the parse for the REST OF THE FILE and the file
-  # fails `bash -n` — which is how #2930 made `install.sh` refuse to install the harness on a stock
-  # Mac, with the error reported ~80 lines below the defect (#2248 is the same class, one step worse).
-  # scripts/check-bash32-parse.sh enforces the shape; scripts/orchestrator-harness/merge-reminder.test.sh
-  # and tests/actionlint/run.sh were rewritten to it in the same change.
-  _manifest_rows() {
-    python3 - "$MANIFEST" <<'PYEOF'
+  manifest_rows="$(python3 - "$MANIFEST" <<'PYEOF'
 import json, sys
 
 try:
@@ -329,8 +318,7 @@ except (OSError, ValueError):
 for e in (m.get("files") or {}).get("extensions/", {}).get("entries") or []:
     print(str(e).rstrip("/"))
 PYEOF
-  }
-  manifest_rows="$(_manifest_rows)" || {
+)" || {
     echo "❌ cannot parse $MANIFEST — malformed JSON or missing files.extensions.entries"
     FAILURES=$((FAILURES + 1))
     parse_ok=0
@@ -376,46 +364,15 @@ if [ "$parse_ok" -eq 1 ]; then
   done <<< "$manifest_rows"
 fi
 
-# --- the live-farm ROOT, and when it may be read at all (#3002) --------------
-# ⛔ A REPO-LEVEL VERDICT MUST NOT BE DECIDED BY THE RUNNER BOX'S OWN ~/.pi FARM.
-# Measured 2026-10-28 on PR #3002: this job reddened on runner
-# `ai-runner-cell3-x64-3` — a SELF-HOSTED pi box whose ~/.pi/agent/extensions
-# held 12 stale top-level `*.test.ts` COPIES (the #1509 shape, materialized
-# before #2849 stopped farming test files; #1465 is why nothing pruned them) —
-# over a diff that touched neither extensions/ nor the farm. A PR whose job
-# landed on that box was red for a BOX defect and one landing elsewhere was
-# green: a host-dependent required check, and the shape the suite header already
-# forbids ("this suite's verdict never depends on the developer's own ~/.pi
-# state"). The old comment here said "CI has no ~/.pi" — FALSE for this repo,
-# whose CI runs on self-hosted pi boxes by design.
-# So the ambient farm is read ONLY where it means something: on the box itself
-# (sync.sh, pre-commit, a session). In CI the root must be NAMED via
-# PI_EXTENSIONS_DIR — .github/workflows/ci.yml aims it at the farm THIS REPO
-# SHIPS, so the CI verdict is deterministic AND still load-bearing (a test-file
-# entry or a dangling link added to the shipped farm reds; cases 33-34 pin both
-# halves). Neither set in CI -> a NAMED skip, never a guess about the box.
-if [ -n "${PI_EXTENSIONS_DIR:-}" ]; then
-  LIVE_FARM="$PI_EXTENSIONS_DIR"
-  FARM_WHY="named by PI_EXTENSIONS_DIR"
-elif [ "${GITHUB_ACTIONS:-}" = "true" ] || [ -n "${CI:-}" ]; then
-  # Empty on purpose: nothing below may read it, and `[ -d "" ]` is false.
-  LIVE_FARM=""
-  FARM_WHY="CI — the runner box's ambient ~/.pi farm is not this repo's verdict"
-else
-  LIVE_FARM="${HOME:-}/.pi/agent/extensions"
-  FARM_WHY="machine-local farm"
-fi
-
-# --- check 5: live-farm liveness (machine-local; see the ROOT rule above) ----
+# --- check 5: live-farm liveness (machine-local; CI has no ~/.pi) ------------
 # See the header. Only manifest-listed entries are inspected, and only when they
 # are present as symlinks: an absent live link is not this gate's business (the
 # machine may simply not be bootstrapped for that row), and a link this repo
 # does not ship is somebody else's state. Guarded by parse_ok because
 # manifest_rows only exists once the manifest parsed.
 if [ "$parse_ok" -eq 1 ]; then
-  if [ -z "$LIVE_FARM" ]; then
-    echo "⏭️  live extension farm NOT READ ($FARM_WHY) — checks 5/6 (dangling shipped links, executed test files) skipped: set PI_EXTENSIONS_DIR to aim them at a farm the repo controls"
-  elif [ ! -d "$LIVE_FARM" ]; then
+  LIVE_FARM="${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"
+  if [ ! -d "$LIVE_FARM" ]; then
     echo "⏭️  live extension farm not found at $LIVE_FARM — check 5 (dangling shipped links) skipped; set PI_EXTENSIONS_DIR to aim it at a farm"
   else
     while IFS= read -r row; do
@@ -505,7 +462,7 @@ fi
 # modelled here. A test file filtered by such a list is still reported — the file
 # should not be in the farm at all, and a hand-rolled ignore parser would be a new
 # false-PASS surface.
-if [ -n "$LIVE_FARM" ] && [ -d "$LIVE_FARM" ]; then
+if [ -d "$LIVE_FARM" ]; then
   executed=""         # display lines: what pi WOULD execute (the failure block)
   executed_paths=""   # the same files as absolute paths — keeps the inert list honest
   inert_short=""      # top-level test-shaped entries the ROOT short-circuit hides
@@ -520,11 +477,7 @@ if [ -n "$LIVE_FARM" ] && [ -d "$LIVE_FARM" ]; then
   #              NOT loaded (`existsSync` in `resolveExtensionEntries`), so inditing
   #              it would be the #2425 false-block class.
   if command -v python3 >/dev/null 2>&1; then
-    # ⛔ Function-wrapped for the same reason as `_manifest_rows` above: no here-doc inside `$( )`
-    # (#2930). The body below is Python, so a quote in it is DATA — and under 3.2 the scanner cannot
-    # tell that, which is exactly the defect this shape removes.
-    _loader_rows() {
-      python3 - "$LIVE_FARM" <<'PYEOF' 2>/dev/null
+    loader_rows="$(python3 - "$LIVE_FARM" <<'PYEOF' 2>/dev/null
 import json, os, sys
 
 root = sys.argv[1]
@@ -594,8 +547,7 @@ for name in names:
             print('executed\t%s\t%s: pi.extensions row -> %s'
                   % (target, sub, os.path.relpath(target, sub)))
 PYEOF
-    }
-    loader_rows="$(_loader_rows)"
+)"
     while IFS=$'\t' read -r kind lpath disp; do
       case "$kind" in
         short) short_circuit=1 ;;
@@ -607,7 +559,7 @@ PYEOF
       esac
     done <<< "$loader_rows"
   else
-    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's \`pi.extensions\` row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
+    echo "⏭️  check 6's loader arm skipped (no python3) — a farm subdir's `pi.extensions` row, or a ROOT row, naming a test file would not be seen (arm (a) still runs); this run already FAILED at check 4 for the same missing python3, so the verdict is not a silent pass"
   fi
   # (a) top-level entries: the loader's own scan, spelled the same way — the glob
   #     skips dot-named names exactly as `collectAutoExtensionEntries` does, and
@@ -659,10 +611,7 @@ PYEOF
     inert="$inert$lap"$'\n'
   done <<< "$(find "$LIVE_FARM" -mindepth 2 -maxdepth 3 -type f \( -name '*.test.ts' -o -name '*.spec.ts' -o -name '*.test.js' -o -name '*.spec.js' \) 2>/dev/null | grep -v '/node_modules/' | head -10)"
   if [ -n "$inert" ]; then
-    # ⛔ The backticks are ESCAPED: inside double quotes an unescaped `\`` is a command substitution, so
-    # this message used to report its own failure on stderr (`pi.extensions: command not found`, seen on
-    # a live run) and print WITHOUT the quoted words it was quoting (#2976).
-    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json \`pi.extensions\` row/index.ts entry, so this file is never loaded):"
+    echo "⏭️  not gated (test copy NESTED in a farm subdirectory — pi resolves a subdirectory through its package.json `pi.extensions` row/index.ts entry, so this file is never loaded):"
     printf '%s' "$inert" | while IFS= read -r lap; do [ -n "$lap" ] && echo "   $lap"; done
     echo "   → \`pi-bootstrap/setup.sh\` sweeps these on the next sync; nothing here executes today."
   fi

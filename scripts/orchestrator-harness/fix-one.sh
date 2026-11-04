@@ -100,9 +100,9 @@ FIX_DELIVERY_BRIEF="$(bash "$delivery_sh" --delivery-brief prfix)" || {
 # checkout and a DIFFERENT target repo used to materialise a worktree in the checkout and run there,
 # reporting failures about branches instead of about the repo. Missing = FATAL, because a silently
 # skipped assertion is the defect. `REPO_TARGET_REFUSED` (72) is distinct from every gate code.
-. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
+. "$SELF/repo-target.sh" || { echo "[fix $PR] FATAL: $SELF/repo-target.sh missing (or its repo-slug.sh parser is) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
 command -v repo_target_assert >/dev/null 2>&1 && command -v repo_target_branch_assert >/dev/null 2>&1 \
-  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $SELF" >&2; exit 78; }
+  || { echo "[fix $PR] FATAL: $SELF/repo-target.sh is stale (no repo_target_assert/repo_target_branch_assert) — refusing to run a fixer whose repo cannot be asserted (#2694)" >&2; exit 78; }
 # ── THE GATE DECISION IS MEASURED, NOT ASSUMED (agent-infra#2319) — see lane.sh for the full note.
 . "$SELF/gate-policy.sh" 2>/dev/null || { echo "[fix $PR] FATAL: $SELF/gate-policy.sh missing — refusing to run a fixer that cannot say whether its gates are on" >&2; exit 78; }
 apply_gate_policy fix-one
@@ -207,21 +207,8 @@ fi
   # failed for network reasons is covered too: the branch is unproven here, and the refusal names
   # both possibilities rather than blaming worktree creation.
   if ! git rev-parse --verify -q "refs/heads/$BR" >/dev/null; then
-    # ⛔ NAME THE DESTINATION, NOT JUST THE SOURCE (#3009, the SAME defect pr-doctor had).
-    # `git fetch origin "$BR"` does NOT create `refs/remotes/origin/$BR`: with no colon the fetched
-    # ref lands in FETCH_HEAD, and a remote-tracking ref is only ALSO updated when a CONFIGURED
-    # `remote.<name>.fetch` refspec maps that source. A full clone maps every branch, so the bug is
-    # invisible on a dev box — but a CELL checkout is a SINGLE-BRANCH clone
-    # (`+refs/heads/main:refs/remotes/origin/main`), so the fetch SUCCEEDS (rc=0), creates nothing,
-    # and the very next line asks for the ref it just declined to create. The guard then fires with
-    # a FABRICATED diagnosis (`branch is not in <OR> — a BRANCH/REPO mismatch`) — a false accusation
-    # of the wrong repo, which is worse than a silent failure because it sends the operator at the
-    # remote instead of at the clone. The leading `+` keeps the update valid after the force-push a
-    # PR branch routinely gets.
-git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$L.log" 2>&1
+    git fetch origin "$BR" --quiet >> "$L.log" 2>&1
     if ! git rev-parse --verify -q "refs/remotes/origin/$BR" >/dev/null 2>&1; then
-      # Reached only when the fetch genuinely could not read the branch (network, auth, a real
-      # BRANCH/REPO mismatch) — the refspec above no longer produces a FALSE hit here.
       repo_target_branch_assert "fixer #$PR" "$REPO_ABS" "$BR" "$OR" >> "$L.log"
       echo "[fix $PR] REFUSED: branch '$BR' is not in $OR (checkout $REPO_ABS) — it could not be read after fetching origin. This is a BRANCH/REPO mismatch, not a worktree-materialisation failure; refusing before any fixer starts" >> "$L.log"
       refund_gate_attempt
@@ -293,13 +280,12 @@ fi
 # ⛔ WHY THIS FILE AND NOT THE CALLER. The controller already refuses to spawn when `claim_live`
 # says the lock is held, but `fix-one.sh` is ALSO reached directly and by `adopt-fix.sh`, and a
 # guard that lives only in the controller leaves those paths pushing at a live lander — the same
-# argument the repo-identity assert above makes for itself (it runs here, not only in the spawner,
-# because `adopt-fix.sh` reaches this script without the controller in the path at all).
+# argument the CI-queue gate above makes for itself, and the reason both read the same state.
 #
 # ⛔ THE DIRECTION IS DEFER, NEVER BLOCK-AND-HOLD. Contention writes the SAME refundable bail marker
-# the cross-box refusal writes, so the controller refunds the attempt and re-decides from a fresh read
-# next cycle: nothing is dropped, and a lander that lands the PR ends the work entirely. Nothing here
-# is sticky — the marker describes one cycle, not a state.
+# the CI-queue and cross-box refusals write, so the controller refunds the attempt and re-decides
+# from a fresh read next cycle: nothing is dropped, and a lander that lands the PR ends the work
+# entirely. Nothing here is sticky — the marker describes one cycle, not a state.
 #
 # ⛔ A STALE CLAIM IS TAKEN OVER, NOT REFUSED (#2574 (b)) — AND THE TAKEOVER IS A RENAME, NEVER
 # `rm && write`. Measured staleness is the whole licence: the record's pid is numeric and `kill -0`
@@ -423,8 +409,8 @@ release_prlock() { # never removes a lock we do not own: a lander that outlived 
 # run must not pretend to have booked one.
 # ⛔ THE FIRST LINE IS A STABLE TOKEN (`DEFERRED: the LANDER`), because `adopt-fix.sh` — the operator
 # surface onto this script — has to name the cause in the log the operator reads, exactly as it does
-# for the PR-owner lock arm below. A second, cosmetic reword would silently make `adopt-fix <PR>`
-# report SUCCESS for a run that pushed nothing (review of PR #2576, P2).
+# for the CI-queue deferral. A second, cosmetic reword would silently make `adopt-fix <PR>` report
+# SUCCESS for a run that pushed nothing (review of PR #2576, P2).
 prlock_defer() { # prlock_defer <why>
   echo "[fix $PR] DEFERRED: ${1} — nothing pushed, so no attestation was invalidated by this lane" >> "$L.log"
   if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
@@ -620,7 +606,7 @@ $FIX_DELIVERY_BRIEF
 
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
-If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (\`head12: <12 chars>\`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
+If \`$O/state/sickbrief-$PR.md\` exists, READ IT FIRST: it was generated from THIS PR's failing CI job — the failing check, the run id and the failing job's own log excerpt — not from a template. It is the reason this lane was dispatched when no reviewer finding named the check. ⛔ IT NAMES THE HEAD IT WAS GENERATED AT (`head12: <12 chars>`), and nothing deletes it: if that prefix is not the first 12 characters of THIS head (\`$HEAD\`), the brief is STALE — a later dispatch at a new head — so ignore it and work from the files above.
 
 If $L-failing.txt is non-empty, REQUIRED CI CHECKS ARE ALSO FAILING and their failing logs are in that file — read it and fix the cause as well: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. That is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
@@ -726,10 +712,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
   elif [ "$ar" = "${AGENT_FORK_REFUSED:-73}" ]; then
     why="fork gate: this box is out of PROCESSES (agent-infra#2293) — restart or drain the BOX from outside; waiting for load to fall cannot clear it and the box cannot start the retry"
   elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
-    # ⛔ CODE 77 IS TWO CONDITIONS (review round 1, P2): below the floor, and above it without the
-    # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
-    # operator a full filesystem was the cause when it was not.
-    why="disk gate: either below DISK_MIN_FREE_MB, or no headroom for one lane's dependency tree (DISK-NOHEADROOM) — the '[disk-gate] REFUSED' line above names which, with both terms; reclaim space (cloud-cell-supervisor.sh prune --caches) — this will NOT clear by waiting"
+    why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi

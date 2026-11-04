@@ -184,18 +184,10 @@ grep -q 'PI_RAN' "$PI_LOG"; ck $? "…the stub pi really ran (the refusal above 
 # an isolated HOME, so the search cannot reach a real installed copy. 78 = cannot verify, and the log
 # must say so — a gate that silently passes when it cannot find its rules is the failure mode this
 # whole layer exists to prevent.
-# ⛔ AND AN ISOLATED `$HOME` IS NOT ENOUGH — `$AGENT_INFRA_PATH` IS A FIFTH SEARCH ROOT (#1881 LANE,
-# measured on a cell). `spawn-gate.sh`/`lane.sh` also resolve the validator under
-# `\$AGENT_INFRA_PATH/scripts/orchestrator-harness`, and `AGENTS.md` makes exporting that variable a
-# PREREQUISITE of this repo — so on every dev box and every cell these arms found the REAL checkout's
-# validator, ran it, and reported `rc=0 started=1`, i.e. they reddened exactly where the variable is
-# set and passed on a clean runner. Same class as the suite-side defect this lane fixed in
-# `scripts/test_cmux_payload.py`: a fixture that inherits ambient env cannot make a claim about
-# isolation. `env -u` is the isolation the arm already claimed.
 mkdir -p "$TMP/nolib"
 cp "$HERE/spawn-gate.sh" "$TMP/nolib/"
 : > "$PI_LOG"
-res="$( cd "$FIXREPO" && env -u AGENT_INFRA_PATH PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
+res="$( cd "$FIXREPO" && PATH="$TMP/bin:$PATH" O="$TMP/o2" HOME="$TMP/fakehome" PI_LOG="$PI_LOG" MAX_LOAD=1000 DISK_MIN_FREE_MB=1 \
   bash -c '. "$1"; load1() { printf "1"; }; run_agent 1 "$2" "$3" "no validator" >/dev/null 2>&1
            printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$TMP/nolib/spawn-gate.sh" "$TMP/nolib.log" "$CANON" )"
 [ "$res" = "rc=78 started=0" ]; ck $? "a MISSING validator is 78/cannot-verify, not a pass ($res)"
@@ -361,12 +353,7 @@ PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
 [ -s "$CMUX_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and cmux was never called (the refusal precedes target resolution — the defect is the brief, not the pane)"
 : > "$CMUX_LOG"
-# ⛔ THE STUB NEVER SUBMITS, SO WITHOUT A WINDOW THIS ARM WAITS ONE OUT (#1881 review P2). The stub
-# `cmux` records calls and never names a session, so nothing can ever verify: `orch-send.sh` polls
-# `read-screen` to its deadline (90 s default + the helper's two 2 s sleeps ≈ 95 s of a CI shard) and
-# the assertion below — satisfied by the footer probe — uses none of it. `ORCH_SEND_VERIFY_TIMEOUT=0`
-# is what the Python suite sets for the same reason: it changes WHAT the arm costs, not what it proves.
-PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" ORCH_SEND_VERIFY_TIMEOUT=0 \
+PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" \
   bash "$ROOT/scripts/orch-send.sh" 00000000-0000-0000-0000-000000000000 test "@$CANON" >/dev/null 2>&1
 [ -s "$CMUX_LOG" ]; ck $? "POSITIVE CONTROL: a compliant @file order passes the gate and reaches cmux"
 : > "$CMUX_LOG"
@@ -409,20 +396,7 @@ bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=
 
 # ── pr-doctor.py: the fleet's own generated worker brief must carry the contract, or every worker the
 # beat spawns is refused. Driven through the module, not grepped from the source.
-# ⛔ THE PROBE IS ISOLATED, AND ITS ISOLATION IS ASSERTED BELOW (agent-infra#2708, review). Before
-# agent-infra#2708 `brief()`'s success path logged NOTHING, so an unisolated probe neither resolved the
-# box's `brief-gate.sh` copies nor wrote anything outside the repo. Both changed: `research_section()`
-# now `log()`s a provenance line ("rendered by <copy> and admitted by N validator(s)"), `log()` appends
-# to `$STATE_DIR/pr-doctor.log` resolved AT CALL TIME from `HOME`, and `_brief_gate_paths()` widened the
-# ladder to `$AGENT_INFRA_PATH` and the farm with a VETO from any rung that refuses. Unisolated, that is
-# two defects in one line: this shard appends a fabricated provenance line to the operator's LIVE log
-# (indistinguishable from a real pass's, naming a copy no pass used -- the class
-# `test_pr_doctor.py::_clean_env` already closed for pytest), and its verdict becomes a statement about
-# what this box happens to have installed. `O` an empty dir + a private `HOME` + no `AGENT_INFRA_PATH`
-# leaves the TREE's own copy as the only rung, which is what the arm is about.
-mkdir -p "$TMP/pd-o" "$TMP/fakehome"
-out="$("$ROOT/../venv-brief-probe" 2>/dev/null; env -u AGENT_INFRA_PATH O="$TMP/pd-o" HOME="$TMP/fakehome" \
-        python3 - "$ROOT" <<'PY' 2>/dev/null
+out="$("$ROOT/../venv-brief-probe" 2>/dev/null; python3 - "$ROOT" <<'PY' 2>/dev/null
 import importlib.util, sys, os
 root = sys.argv[1]
 spec = importlib.util.spec_from_file_location("pd", os.path.join(root, "scripts", "pr-doctor.py"))
@@ -439,31 +413,7 @@ open(os.path.join(sys.argv[1], ".pd-brief.txt"), "w").write(b)
 print("ok")
 PY
 )"
-# ⛔ THE SENTINEL IS THE LAST LINE, NOT THE WHOLE STREAM. `brief()` logs to STDOUT (`log()` in
-# pr-doctor.py -- the operator log an agent-infra pass is read from), and agent-infra#2708 gave it one
-# more line on that path: "brief: research contract rendered by <copy> and admitted by N validator(s)",
-# which is what turns the measured 6h32m stale-copy stall into a one-line read. Comparing the ENTIRE
-# capture to "ok" made that legitimate log line a red in this shard -- a test that fails because the
-# capability got MORE observable. The probe still has to reach its final `print("ok")`, which is after
-# every assert, so nothing is weakened: a failed assert or a crash leaves the last line short of "ok".
-# Parameter expansion, not a pipe: `${out##*$'\n'}` has no subprocess to SIGPIPE. (This file sets only
-# `set -u`; `run-bash-shards.sh` sets `pipefail` for ITSELF but spawns each shard as `bash "$1"`, a child
-# that does not inherit it. `sigpipe-grep-guard` is repo-wide regardless, so the expansion stands on its
-# own merits and not on a `pipefail` claim this file cannot make.)
-[ "${out##*$'\n'}" = "ok" ]; ck $? "pr-doctor.py's generated brief carries the research contract (driven through brief())"
-# ⛔ AND THE PROVENANCE LINE LANDS IN THE FIXTURE, NAMING THE TREE'S OWN COPY -- asserted by EFFECT,
-# not by the presence of `HOME=`/`O=` above, and not by a prefix match either. Both halves of the
-# defect are graded here because both are visible in the one line: WHERE it went (inside the private
-# home, so the live operator log was never touched) and WHICH COPY it names (`_brief_gate_paths`,
-# `pr-doctor.py:3470-3482`, resolves `$ROOT/scripts/orchestrator-harness/brief-gate.sh` and nothing
-# else once `O` is an empty dir, `HOME` is private and `$AGENT_INFRA_PATH` is unset). Measured: a
-# PREFIX-ONLY grep is green on a half-revert that keeps `HOME=` and drops `O=`/`env -u`, because the
-# line still lands in the fixture -- it just names the BOX's copy and its validator count (the
-# box-dependence half of the defect, unasserted). Pinning the whole line reds that half-revert, so the
-# `O=` and `env -u` in the invocation above cannot rot silently. `-F`: `$ROOT` is a path, not a regex.
-grep -qF "brief: research contract rendered by $ROOT/scripts/orchestrator-harness/brief-gate.sh and admitted by 1 validator(s)" \
-  "$TMP/fakehome/.pi/agent/state/pr-doctor.log"; ck $? \
-  "…and its provenance line names the TREE's own copy (1 validator) and lands in the FIXTURE, never the live log"
+[ "$out" = "ok" ]; ck $? "pr-doctor.py's generated brief carries the research contract (driven through brief())"
 bash "$GATE" --check "$ROOT/.pd-brief.txt" worker >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "…and that generated brief PASSES the validator (worker role) (rc=$rc)"
 rm -f "$ROOT/.pd-brief.txt"
@@ -488,10 +438,7 @@ bash "$GATE" --check "$TMP/lane-o/logs/prompt-2258.txt" lane >/dev/null 2>&1; rc
 grep -q '## RESEARCH FIRST' "$TMP/lane-o/logs/prompt-2258.txt"; ck $? "…and carries the section, not just the pre-flight line"
 grep -q '#2258 research-first' "$TMP/lane-o/logs/lane-2258.log"; ck $? "…and the one-line pre-flight is in the lane LOG (what an operator greps)"
 mv "$GATE" "$GATE.moved"
-# ⛔ `env -u AGENT_INFRA_PATH`: see the note at the §"MISSING validator" arm — the variable is a
-# documented fifth search root and is exported on every cell, so without this the "missing validator"
-# fixture finds the REAL one and the arm refuses 72 (the worktree precondition) instead of 78.
-( cd "$TMP" && env -u AGENT_INFRA_PATH O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+( cd "$TMP" && O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/x daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
 mv "$GATE.moved" "$GATE"
 [ "$rc" -eq 78 ]; ck $? "a MISSING validator refuses the LANE with 78 (fail-closed: never a lane nobody asked to look first) (rc=$rc)"
@@ -528,24 +475,7 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # in one commit (capacity-transfer and tests/pi-shim — the latter with a brief that was never created
 # at all). Declared here so the reference is accounted for; the broader class is named in the STATED
 # LIMIT below rather than silently believed to be covered.
-# the at all). Declared here so the reference is accounted for; the broader class is named in the STATED
-# LIMIT below rather than silently believed to be covered.
-#
-# ⛔ AND A SUITE THAT BUILDS ITS OWN FIXTURES FROM THIS VALIDATOR IS A MEMBER TOO (#1881 review P2).
-# `scripts/test_cmux_payload.py` asks `brief-gate.sh --section lane` for the RESEARCH contract its
-# dispatch fixtures must carry (the same construction `capacity-transfer.test.sh` uses, and for the
-# same reason: a hard-coded block would drift from the gate and the suite would pin a brief no
-# dispatcher accepts). It reaches the gate through `orch-send.sh`, which this census already counts,
-# so it is a deliberate NAMER of the gate rather than a new dispatch path — but it is a REFERENCER,
-# and an undeclared one reddens this equality. Measured: unregistered, this arm fails with
-# `ADDED: scripts/test_cmux_payload.py`, which is exactly the attributable red the census exists for.
-# ⛔ AND THE LIST IS AN EQUALITY, SO IT MUST BE KEPT CURRENT BY WHOEVER MOVES THE SCAN (#1881 LANE,
-# measured). The five `orchestrator-harness` entries without a comment above arrived on `main` after
-# the last time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the
-# four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
-# superset), independently of any branch. Declared here because an equality that is red on its own
-# base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

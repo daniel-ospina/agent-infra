@@ -21,10 +21,9 @@
 # measurement (41 consecutive repair dispatches skipped while 8 runners and ~11 lane slots sat idle).
 # ⛔ THE FOURTH-ARM CHURN IS GONE WITH IT (#2408's disclosure, superseded). `orch-loop.sh`'s RED-TREE
 # fixer used to book its attempt, spawn, and then be turned away at `fix-one.sh`'s first push, so the
-# cost was CHURN. Nothing on the repair path reads this module now, so that refusal cannot happen,
-# and the refund line no longer has to name a second cause — it reads `another box holds the claim`,
-# not `another box holds the claim, or the CI-queue gate deferred the push`. A lane that is started
-# will push.
+# cost was CHURN. Nothing on the repair path reads this module now, so that refusal — and the refund
+# line that had to name both causes (`another box holds the claim, or the CI-queue gate deferred the
+# push`) — cannot happen. A lane that is started will push.
 # ⛔ AND IT IS NOT THE ONLY UNGATED PUSHER — this paragraph used to claim it was, which is the class
 # of coverage claim a reader trusts and then stops checking (#2540). `pr-doctor`'s `prfix` workers
 # are the other one, and they are not an orch-loop arm at all: `pr-doctor.py` spawns up to `MAX_FIX`
@@ -32,14 +31,9 @@
 # (:1723-1733) or `gh run rerun …` (:1898), through `nonblocking-dispatch.sh`/`spawn-gate.sh`,
 # neither of which reads this module — `rg -c 'ciq|ci-queue' scripts/pr-doctor.py` is 0. The `prfix`
 # kind is declared for the CREATION back-pressure gate (#2409), not this one, so on the repo whose
-# 92-deep queue this header opens with, a launchd job still adds CI behind it. ⛔ THAT SURFACE STAYS
-# UNGATED BY DECISION, NOT BY OMISSION: #2540 asks for it to be gated, and #2927 rules repair — of
-# which a `prfix` worker is one — out of this gate on purpose (its bound is the box's lane slots and
-# the load/disk gate). So wiring it is a RE-OPEN OF #2927, argued there with the measurement, and NOT
-# an execution of #2540; the README's §CI back-pressure says the same thing, because two opposite
-# instructions in two files this change touches is how the next lane picks the wrong one. The
-# standalone verb below (`status`, rc 0 deep / 1 ok / 2 unknown) exists so a caller that is not bash
-# can branch on it — it does not by itself decide that anything should be wired to it.
+# 92-deep queue this header opens with, a launchd job still adds CI behind it. Wiring that surface
+# is agent-infra #2540; the standalone verb below (`status`, rc 0 deep / 1 ok / 2 unknown) exists so
+# a caller that is not bash can branch on it.
 # ⛔ NOT gated, on purpose: the merge rail's second-sample re-run (`admin-merge.sh`, the flake retry).
 # It is not an omission — a rail that is MERGING removes a PR and its load from the system, and
 # refusing the retry would replace a merge with a stuck red head; the retry happens only inside that
@@ -140,10 +134,9 @@
 #     `runners=~<n>` when it did not.
 #   * ⛔ WHAT THIS GATE IS ALLOWED TO GATE IS TWO CLASSES, AND THE LINE IS THE ACTION'S COST (#2927).
 #     ONLY work that ADDS A NEW CI RUN is queue-gated: opening a PR from an issue (agent-infra's
-#     `dispatch-merge.sh`, and `orch-loop.sh`'s ISSUE path) and the CI RERUN (`orch-loop.sh`'s rerun
-#     site — the one verb in the sweep that queues a fresh run for the same head). REPAIR — acting on a
-#     PR that already exists (a red-check fixer, a review-findings fixer, a conflict/rebase fixer, the
-#     PR-sickness queue) — is NOT queue-gated by this module and must
+#     `dispatch-merge.sh`, and `orch-loop.sh`'s ISSUE path) and the merge rail's own CI-spending
+#     steps. REPAIR — acting on a PR that already exists (a red-check fixer, a review-findings fixer,
+#     a conflict/rebase fixer, the PR-sickness queue) — is NOT queue-gated by this module and must
 #     not become so again: its real bounds are the lane slots (`MAX_LANES` vs lanes alive) and the
 #     load/headroom gate.
 #     ⛔ THE BASIS IS A DECISION PLUS A MEASUREMENT, NOT A COST CLAIM — and it used to be stated as a
@@ -726,7 +719,7 @@ ciq_ci_allowed() {
 # Prints the verdict, the record and the derivation. Exit code follows the verdict (0 deep, 1 ok,
 # 2 unknown) so an operator (or a hook) can branch on it without parsing.
 ciq_cli() {
-  local repo="" verb="${1:-status}" operand="" v drc rc src
+  local repo="" verb="${1:-status}" operand="" v drc rc
   # ⛔ `shift 2>/dev/null` IS NOT `shift 2` WITH STDERR SILENCED (#2333 review cycle 2, P2): bash parses
   # `2>` as an FD redirect, so that spelling shifts ONE positional and drops the verb — accidentally
   # right here, and a trap for the next editor who adds a second `shift`. Drop the verb explicitly.
@@ -752,25 +745,9 @@ ciq_cli() {
       # assigned nowhere in the repo, so it said `source=gh` on the run where gh had failed), and the
       # record's PATH is labelled a path — `at=` in the record is an epoch second, so printing a
       # path under that label was a second unmeasured claim.
-      # ⛔ NO `case` INSIDE A `$( )` HERE (#2969). On bash 3.2 — macOS's `/bin/bash`, and the
-      # interpreter the launchd controller is started with — the `)` that closes a `case` PATTERN is
-      # read as the closer of the SUBSTITUTION: the substitution is re-parsed at EXECUTION, bash
-      # reports `syntax error near unexpected token 'newline'` against this line, and substitutes the
-      # LITERAL remainder of the line instead of a value. Measured on this box: `source=` printed
-      # ` printf 'gh' ;; cache) printf 'record(cache)' ;; *) printf 'unknown' ;; esac )` while the
-      # command still exited 0 — a corrupted field under a green exit, so every consumer read the
-      # `source` of the reading as script text. `bash -n` is blind to it (it parses the outer script
-      # only) and bash 4.4+ parse it correctly, which is why only 3.2 boxes were wrong.
-      # ⛔ PARENTHESISING THE PATTERN IS NOT THE FIX: bash counts parens, so `(fresh)` only helps
-      # until the `*)` catch-all, whose own `)` closes the substitution (measured: the shape
-      # `in (fresh) … *) …` still fails). Hoisting the `case` out of the substitution removes the
-      # ambiguity for every bash instead of for the ones that happen to parse it.
-      case "${CIQ_STATE}" in
-        fresh) src='gh' ;;
-        cache) src='record(cache)' ;;
-        *)     src='unknown' ;;
-      esac
-      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" "$src" "${CIQ_AGE:-?}"
+      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" \
+        "$( case "${CIQ_STATE}" in fresh) printf 'gh' ;; cache) printf 'record(cache)' ;; *) printf 'unknown' ;; esac )" \
+        "${CIQ_AGE:-?}"
       printf 'record: queued=%s running=%s runners=%s busy=%s record-file=%s\n' \
         "${CIQ_QUEUED:-?}" "${CIQ_RUNNING:-?}" "${CIQ_RUNNERS:-?}" "${CIQ_BUSY:-?}" "$(ciq_state_dir)/ci-queue-$(ciq_slug "${repo:-}")"
       printf 'derivation: ceiling = ceil(runners * horizon / job_p90) = ceil(%s * %s / %s) = %s\n' \

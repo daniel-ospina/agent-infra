@@ -233,16 +233,6 @@ shard_errors=0
 shard_ran=0
 shard_skipped=0
 shard_listed=0
-# ── CALLS ALLOWED PAST THE END OF THE LIST (#2838) ──────────────────────────────────────────────
-# `slice_skips` counts EVERY call, so `executed + skipped == listed` only holds when the calls made
-# are the calls the list describes. `run_shard` has TWO call sites: the derived loop ($listed calls,
-# 0 … listed-1) and the runtime sentinel (position `listed`, which must always execute so a slice
-# cannot leave the failure-recording arm untested). `shard_past_list=1` marks that ONE call BY NAME;
-# `slice_skips` refuses any other call past the end.
-shard_past_list=0
-slice_calls=0
-past_list_calls=0
-past_list_budget=1
 shard_time=0
 shard_slowest_secs=0
 shard_slowest=""
@@ -318,31 +308,8 @@ fi
 # correct COUNT (10 each) and print ✅ while 10 of the 80 shards never run at all. The list grows, so
 # that decay is scheduled rather than hypothetical. The set is compared at the end.
 shard_ran_log="$(mktemp 2>/dev/null || echo "/tmp/bash-shards-ran.$$")"
-# ⛔ THE SKIPPED PATHS ARE RECORDED TOO, WITH THEIR REASON (agent-infra#3079). `shard_skipped` was a
-# bare counter, so a slice could SAY it had skipped 31 shards and name none of them — and the
-# `ran + skipped == listed` check had no way to tell "this slice skipped 31 by design" from "31
-# shards vanished and the counter drifted to the same number". One line per skip, `<path>\t<reason>`.
-shard_skip_log="${shard_ran_log}.skipped"
 : > "$shard_ran_log" 2>/dev/null || true
-: > "$shard_skip_log" 2>/dev/null || true
-trap 'rm -f "$shard_ran_log" "$shard_skip_log"' EXIT
-
-# shard_unaccounted — the listed shards this run neither EXECUTED nor SKIPPED, one path per line.
-# ⛔ DERIVED FROM THE LIST, never from the counters (agent-infra#3079). `executed + skipped == listed`
-# on its own can be satisfied while a specific shard is missing — the counters are what the loop
-# writes, and a loop that never reached a shard writes neither. This compares the derived list
-# against the two logs, so the answer is `which shards`, not `how many`.
-shard_unaccounted() {
-  local all="${shard_ran_log}.all" acct="${shard_ran_log}.acct"
-  printf '%s\n' "$shard_paths" | awk 'NF' | LC_ALL=C sort -u > "$all" 2>/dev/null || return 0
-  { cat "$shard_ran_log"; cut -f1 "$shard_skip_log"; } 2>/dev/null | awk 'NF' | LC_ALL=C sort -u > "$acct"
-  comm -23 "$all" "$acct" 2>/dev/null
-  rm -f "$all" "$acct"
-  return 0
-}
-# shard_count_lines <text> — the non-empty line count of a string (a COUNT that cannot be satisfied
-# by an empty string is the point: `wc -l` on a value without a trailing newline reports 0).
-shard_count_lines() { awk 'NF { n++ } END { print n + 0 }' <<<"$1"; }
+trap 'rm -f "$shard_ran_log"' EXIT
 
 # ── NAMING THE FAILING SHARD (#2643) ──────────────────────────────────────────────────────────
 # The count alone is UNATTRIBUTABLE. `❌ 4 bash shard(s) failed` names no suite, so nobody reading
@@ -382,31 +349,12 @@ shard_fail() { shard_record_failure "$1"; }
 slice_skips() {
   slice_pos=$shard_listed
   shard_listed=$((shard_listed + 1))
-  slice_calls=$((slice_calls + 1))
   # Whether this call is a LIST line or one of the sentinels below (used by the timing report).
   if [ "$slice_pos" -lt "$listed" ]; then shard_is_listed=1; else shard_is_listed=0; fi
-  # ⛔ A POSITION PAST THE DERIVED COUNT IS AN ERROR, NOT EXTRA WORK TO RUN (#2838). This used to
-  # answer "past the list, RUN it", which hid the one thing the arithmetic at the end of this file
-  # exists to catch: the #2838 enumerated block sat at positions `listed`..`listed+103`, so ~104 rows
-  # ran in EVERY slice (measured: all 8 shards died at 70.3-70.4 min). A caller past the end must now
-  # DECLARE itself (`shard_past_list=1`, the sentinel) and only `past_list_budget` may do so.
-  if [ "$slice_pos" -ge "$listed" ]; then
-    if [ "$shard_past_list" -ne 1 ]; then
-      echo "❌ call #$((slice_pos + 1)) to run_shard is PAST the derived list ($listed listed shard(s)) and did not DECLARE itself — the list and the execution disagree, so 'executed + skipped == listed' cannot hold. The likely cause is a second, enumerated list of suites in this file (#2838). Refusing: extra work is not a repair for two lists that disagree. Already ran $shard_ran and skipped $shard_skipped of $listed."
-      exit 1
-    fi
-    past_list_calls=$((past_list_calls + 1))
-    if [ "$past_list_calls" -gt "$past_list_budget" ]; then
-      echo "❌ $past_list_calls call(s) past the derived list ($listed listed shard(s)); the declared budget is $past_list_budget — the runtime failure-recording sentinel alone. Refusing (#2838)."
-      exit 1
-    fi
-  fi
   [ "$slice_count" -gt 0 ] || return 1
-  # A DECLARED sentinel always runs: a slice must not leave the failure arm untested.
   [ "$slice_pos" -lt "$listed" ] || return 1
   [ $((slice_pos % slice_count)) -eq "$slice_index" ] && return 1
   shard_skipped=$((shard_skipped + 1))
-  printf '%s\tslice %s/%s\n' "$1" "$((slice_index + 1))" "$slice_count" >> "$shard_skip_log" 2>/dev/null || true
   return 0
 }
 
@@ -459,7 +407,7 @@ shard_note() {
 # parser's own rules and names the suite — the rail can rate-compare it against main's baseline instead
 # of refusing. It does NOT weaken the comparison: a suite that fails here and is green on main is still
 # a PR-unique failure and still blocks.
-run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" </dev/null || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
+run_shard() { slice_skips "$1" && return 0; shard_ran=$((shard_ran + 1)); printf '%s\n' "$1" >> "$shard_ran_log"; shard_t0=$SECONDS; shard_err0=$shard_errors; bash "$1" || { shard_rc=$?; shard_errors=$((shard_errors + 1)); [ "$shard_is_listed" = 1 ] && printf '❌ SHARD FAILED (rc %s): %s\n' "$shard_rc" "$1"; [ "${1#/}" != "$1" ] || echo "::error::bash shard failed: $1"; }; [ "$shard_errors" -ne "$shard_err0" ] && shard_fail "$1"; [ "$shard_is_listed" = 1 ] && shard_note "$1" $((SECONDS - shard_t0)); return 0; }
 
 # Sweeping is counted too: a `for` loop whose BODY was neutered (`: ` instead of `bash -n`) would
 # otherwise leave the loops — and therefore any glob floor in the guard — perfectly intact while
@@ -520,29 +468,16 @@ for pattern in "${SWEEP_GLOBS[@]}"; do
   done
 done
 
-echo "── hermetic suites ────────────────────────────────────────────────"
-# Every suite the list below runs is hermetic (temp repos / temp HOME / stubbed tools, no network).
+# ⛔ THE PER-SUITE `run_shard <path>` LINES THAT USED TO FILL THIS REGION ARE GONE.
+# `1d56cc109` DERIVED the list but left the 103 enumerated `run_shard` lines IN PLACE, so this
+# script still EXECUTED them and then ran the derived list on top of them: every shard ran twice,
+# `executed + skipped == listed` could never hold, and `tests/ci-lane-parity/run.sh` §11/§12 went
+# red on every PR head. They were history, not a list: a suite is wired by the FILE it lives in
+# matching SUITE_GLOBS, and is DISCOVERED above.
 #
-# ⛔ THERE IS NO PER-SUITE ROW IN THIS SECTION, AND THAT IS THE COMMITMENT (#2838). `1d56cc10`
-# (#2614) made this list a DERIVATION; an older branch's 103 enumerated `run_shard <path>` rows
-# landed back on top of it in `718a0874` (#2035) and were never removed — so every suite ran TWICE,
-# once from each list, and this file's own `executed + skipped == listed` self-check could never
-# hold (measured when #2838 was filed: "executed 212 of 108 listed"). The rows are deleted and must
-# not come back: a suite is wired by the FILE matching SUITE_GLOBS, and `tests/ci-lane-parity/run.sh`
-# assertion 11 fails on any literal `run_shard <path>` row. The one-sentence notes those rows
-# carried (what a suite pins, which incident added it) live in git history on this commit and in
-# each suite's own header — and see the note at the end of this file for why they are likewise not
-# reproduced here as prose.
-# ⛔ THE SAME RULE APPLIES TO A DUPLICATE, which is the shape #1989 + #2597 produced: the SAME suite
-# was listed TWICE (the second copy appended instead of editing the first), so the tree ran it twice
-# and `test_bash_shard_identity_is_injective_over_the_listed_shards` (tests/test_ci_exemption.py)
-# went red on main — a fleet-wide merge block caused by a list, not by code. Under DERIVATION that
-# failure mode is structurally gone (a file is matched once, and `shard_list` de-duplicates a path
-# two globs both match), which is why a suite that gains a claim amends THIS note and never adds a
-# row.
-# ⛔ AND `tests/pr-doctor-trigger/run.sh` (#2700 C5) NEEDS NO ROW EITHER: `tests/*/run.sh` matches
-# it, so the suite is wired by the FILE existing — an enumerated row would be the second execution
-# of the same suite, i.e. the defect #2838 records.
+# PROVENANCE: those lines were moved out of ci-main.yml's `script-validate`, so each carried the
+# note that workflow carried. Those notes live in git history on the deriving commit, and each
+# suite's own header states what it pins — a suite's MEMBERSHIP needs neither.
 #
 # ⛔ #2439 FOLDED THE DUPLICATE RUN SITES — this paragraph used to say the opposite, deliberately.
 # It read: "That duplication is deliberate here … the PR lane runs those twice … Dropping them
@@ -562,104 +497,34 @@ echo "── hermetic suites ─────────────────
 # list, which is why agent-infra#2417 (the lane-parity self-test's live-gate control fixture) is a
 # coverage hole for every shard, not just the folded five.
 # ⛔ #1997 OWNS, AND NOTHING HERE PINS: the supervisor's classified-read invariant — `sup_session_list` answers 0 present / 1 absent / 3 cannot-verify, every tmux target is EXACT (`=name`), a session name carrying `:`/`.` is refused rather than resolved, and `TMUX_READ_TIMEOUT` is validated > 0. Its suite (`scripts/cloud-cell-supervisor.hardening.test.sh`) was DROPPED at ba5ba770 because the implementation it pinned was never landed on this branch, so these invariants are currently UNPINNED in this tree — they must return BESIDE the implementation (#1997's land), not as a suite added ahead of it.
+# ⛔ ONE ENTRY PER SUITE. This suite was listed TWICE (line 1 added by #1989, the second copy by #2597,
+# which should have EDITED the #1989 comment instead of appending a row): the tree ran the same suite
+# twice and `test_bash_shard_identity_is_injective_over_the_listed_shards` (tests/test_ci_exemption.py)
+# went red on main, which reds the `test` job for every PR whose base includes it — a fleet-wide merge
+# block caused by a list, not by code. Rows are additive; a suite that gains a claim gets its comment
+# amended here, never a second row.
+# ⛔ NO ROW FOR `tests/pr-doctor-trigger/run.sh` (#2700 C5): this file DERIVES its list from
+# SUITE_GLOBS (`tests/*/run.sh` matches it), so a suite is wired by ADDING THE FILE — an enumerated
+# row here would be a second execution of the same suite (the defect #2838 records).
+
 # ── the run — ONE loop over the DERIVED list ──────────────────────────────────────────────────
 # There is no per-suite line here any more, on purpose: a suite is wired by the FILE it lives in
 # matching SUITE_GLOBS, so two harness PRs adding two suites no longer conflict in this file.
 # The order is the list's (LC_ALL=C sort -u) — see DERIVATION: every suite is hermetic, so no
 # suite depends on running before or after another.
-#
-# ⛔ THE LIST IS READ INTO MEMORY BEFORE THE FIRST SHARD RUNS (agent-infra#3079). It used to be
-# `while read shard; do run_shard "$shard"; done <<<"$shard_paths"`, and that loop's stdin WAS the
-# list: every shard inherited it, so a shard that read stdin consumed the lines the driver had not
-# reached yet and the loop simply ENDED — no error, no name. Measured on main's `script-validate`
-# job (2026-10-30): `executed 107 of 139 listed shard(s) (0 skipped)`, the last timing row being
-# `▸ 60s scripts/pi-reap-idle.test.sh` — that suite reads stdin (see `run_shard`'s `</dev/null`),
-# drained the remaining 32 lines, and 32 shards silently never ran on main or on any PR for as long
-# as the count was tolerated as "a mismatch". An ARRAY cannot be drained by a child, so the list is
-# now consumed by the driver alone; `run_shard` additionally hands every shard `</dev/null` so the
-# hermetic contract is stated rather than inherited.
-shard_array=()
 while IFS= read -r shard; do
-  # A line with no non-blank text is not a path, so it is not queued. The counter at `:275` counts
-  # `awk 'NF { n++ } END { print n + 0 }'`, i.e. lines with at least one field, so the two agree on
-  # everything that can actually arrive: the list comes from `shard_discover` (`:143`), which emits
-  # only glob-matched paths that passed `[ -f "$f" ]`, and the containment loop above re-verifies
-  # each is a real file (exit 1 at `:506`) — so every line here is a non-blank path and both sides
-  # count it exactly once. They are NOT identical as predicates — a CR/VT/FF-only line is a field to
-  # awk's default FS and is stripped by bash's `[[:space:]]` — and that residue cannot arrive either:
-  # such a line is not a file, so the containment loop above exits 1 on it. The assertion below says
-  # what a divergence would mean.
-  [ -n "${shard//[[:space:]]/}" ] || continue
-  shard_array+=("$shard")
-done <<<"$shard_paths"
-# ⛔ WHAT THIS COMPARISON IS, AND WHAT IT IS NOT (`#3099` review, P2 — this comment has now claimed a
-# protection that does not exist TWICE: first as a truncation detector, then as the arm that caught a
-# whitespace-only list line with an inverted message). Neither is true.
-#   * It is NOT what makes the list safe: the read above is IN-PROCESS — a here-string consumed by the
-#     driver alone — so no child can shorten it. The ARRAY is what makes the list safe.
-#   * It is NOT reachable from a blank list line, blank OR whitespace-only: the target-containment
-#     loop above rejects a non-file target (`[ ! -f "$t" ]` → exit 1, "does not exist") before this
-#     line is reached, and a whitespace-only line is not a file.
-#   * The net that NAMES an un-reached shard is the end-of-run set difference below
-#     (`shard_unaccounted`, a `comm -23` of the derived list against the two logs) — what the 8ap
-#     mutant exercises, not this.
-# What remains is a DEFENSIVE ASSERTION, and it fails CLOSED (exit 1 below, before the first shard
-# runs). ⛔ Do NOT look for a live trigger — there is none, and asserting one is what this block got
-# wrong twice already. Given the current derivation, this comparison CANNOT fire: `shard_discover`
-# (`:143`, and `[ -f "$f" ]` at `:147`) emits only glob-matched paths that passed that check, the
-# containment loop above
-# re-verifies each is a real file inside the checkout, and the read above is in-process — so no line
-# reaching it can be blank and no line can be lost. It is kept for the case where that CONTRACT
-# changes (a derivation that can emit a non-path, or a read that becomes an external process), and a
-# firing means "the derivation or the read changed", never "a shard is missing". The arm that names a
-# missing shard is the end-of-run set difference (`shard_unaccounted`), and it is proven by the 8ap
-# mutant. The predicates are not identical either way — bash's `[[:space:]]` covers CR/VT/FF where
-# awk's default FS does not — which is why this is a comparison of two derivations and not a tautology
-# to be deleted.
-if [ "${#shard_array[@]}" -ne "$listed" ]; then
-  echo "❌ the derived list counts $listed shard(s) but its IN-MEMORY array holds ${#shard_array[@]} — the two derivations of ONE list disagree, so the count no longer describes what would run. Refusing to start (this is a DERIVATION or READ change, not a missing shard: the end-of-run set difference names those)."
-  exit 1
-fi
-for shard in ${shard_array[@]+"${shard_array[@]}"}; do
+  [ -n "$shard" ] || continue
   run_shard "$shard"
-done
+done <<<"$shard_paths"
 echo "───────────────────────────────────────────────────────────────────"
+# Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
+# a helper whose execution was disabled — a text-only floor would still see the same listed count.
 # Runtime self-check 1: every listed shard must have been EXECUTED or DELIBERATELY SKIPPED for
 # this slice. This is the arm that catches a helper whose execution was disabled — a text-only
 # floor would still see the same listed count. `executed + skipped == listed` also means the list
 # was traversed end to end: a slice cannot quietly stop early.
-#
-# ⛔ AND IT NAMES WHAT IS MISSING (agent-infra#3079). The count alone is the defect that hid this
-# for 32 shards: `executed 107 of 139 listed shard(s)` says a number is wrong and nothing else, so
-# the reader cannot tell which suites never ran, and the merge rail cannot tell "this shard is red"
-# from "this shard did not run". The set difference below is computed from the LIST and the two logs
-# the loop itself writes, so it reports every listed shard that is neither executed nor skipped —
-# by path — and a mismatch whose missing set is EMPTY is reported as the different defect it is
-# (a shard executed twice, i.e. a second list), never as the same message.
 if [ $((shard_ran + shard_skipped)) -ne "$listed" ]; then
   echo "❌ executed $shard_ran of $listed listed shard(s) ($shard_skipped skipped) — the list and the execution disagree"
-  unaccounted="$(shard_unaccounted)"
-  if [ -n "$unaccounted" ]; then
-    echo "❌ LISTED BUT NEITHER EXECUTED NOR SKIPPED — $(shard_count_lines "$unaccounted") shard(s) this run never reached:"
-    while IFS= read -r _u; do [ -n "$_u" ] && printf '   ❌ NEVER RAN: %s\n' "$_u"; done <<<"$unaccounted"
-    echo "   (a short COUNT is not a short LIST: each path above is in the derived list and was never handed to a shard — fix the driver, do not lower the number)"
-  else
-    echo "❌ …yet every listed shard IS accounted for — so a shard was executed MORE than once: $(sort "$shard_ran_log" | uniq -d | tr '\n' ' ')"
-    echo "   (a duplicated run is not extra coverage: check for a second list fed into this loop, #2838's class)"
-  fi
-  if [ "$shard_skipped" -gt 0 ]; then
-    echo "   ⏭  $shard_skipped shard(s) were DELIBERATELY skipped, with the reason recorded:"
-    while IFS="$(printf '\t')" read -r _p _why; do [ -n "$_p" ] && printf '   ⏭  SKIPPED: %s (%s)\n' "$_p" "$_why"; done < "$shard_skip_log"
-  fi
-  exit 1
-fi
-# ⛔ THE CALL COUNT IS CHECKED TOO, NOT ONLY THE TALLY (#2838). `ran + skipped` uses the same
-# counters the loop increments, so it cannot see how many times the loop was ENTERED (a second list
-# appended to `$shard_paths` moves both sides together). `slice_calls - past_list_calls` is the
-# number of calls the LIST accounts for, and it is the arm that survives the refusal above being
-# downgraded to a skip.
-if [ $((slice_calls - past_list_calls)) -ne "$listed" ]; then
-  echo "❌ the shard loop entered run_shard $((slice_calls - past_list_calls)) time(s) for a list of $listed shard(s) — the list and the execution disagree (a second list, or a re-read of the same one)"
   exit 1
 fi
 
@@ -734,11 +599,7 @@ before_err=$shard_errors
 before_ran=$shard_ran
 before_skip=$shard_skipped
 before_listed=$shard_listed
-# ⛔ THE ONE CALL PAST THE LIST, DECLARED BY NAME (#2838): `slice_skips` refuses an undeclared call
-# past the end, and a second sentinel must raise `past_list_budget` deliberately.
-shard_past_list=1
 run_shard "$sentinel"
-shard_past_list=0
 rm -f "$sentinel"
 if [ "$shard_errors" -ne $((before_err + 1)) ]; then
   echo "❌ the failure-recording arm is broken — a failing shard would not fail this run"

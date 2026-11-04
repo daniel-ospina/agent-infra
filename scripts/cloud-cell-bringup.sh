@@ -89,34 +89,6 @@ HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 HARNESS_PIN_RECORD="${HARNESS_PIN_RECORD:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
 MODE="${1:---check}"
-# ── THE uv CACHE + LINK-MODE PIN (agent-infra#2159) ──────────────────────────────────────────────
-# A worktree `.venv` costs what the box's uv CACHE makes it cost, and that is not a property of the
-# lane: measured 2026-10-30 across the three cells, a box with a warm cache hardlinks every venv to it
-# (5.8 GB of `du` per worktree, ~0 distinct bytes), while a box with NO cache materialises the full
-# 5.8 GB per worktree — cell-3 went 17 GB free -> 257 MB free in ~50 minutes as its lanes synced.
-# So the pin is DELIVERED here, not left to whichever profile an operator happened to edit:
-#   * set EARLY (before keys.env is sourced below), so a `keys.env` line still WINS — this file
-#     defaults, it never overrides an operator's pin;
-#   * exported, so it reaches every process this bring-up starts and every process the cell's
-#     supervisor starts later (which is where lanes inherit it from);
-#   * REPORTED by `check_uv_env` below, so a cold cache is a stated condition rather than a surprise
-#     measured 50 minutes later as 257 MB of free disk.
-# A helper that cannot be read is not fatal here (a bring-up must still be able to report the state of
-# a box): `check_uv_env` says so and the values are computed from the same one-line formula.
-BRINGUP_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)"
-UV_ENV_HELPER="${BRINGUP_HERE:+$BRINGUP_HERE/orchestrator-harness/uv-env.sh}"
-if [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ]; then
-  . "$UV_ENV_HELPER"
-  # ⛔ THE DEFAULT RESOLVES UNDER $CELL_HOME, NOT THE AMBIENT $HOME: `export HOME=$CELL_HOME` happens
-  # further down, and a bring-up started with HOME=/root would otherwise pin /root/.cache/uv for a cell
-  # whose lanes run under /tmp/cell-home — two caches, no cross-sharing, and every venv a full copy.
-  uv_env_apply "${CELL_HOME:-${HOME:-}}"
-else
-  UV_ENV_HELPER=""
-  [ -n "${UV_CACHE_DIR:-}" ] || UV_CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-}/.cache}/uv"
-  [ -n "${UV_LINK_MODE:-}" ] || UV_LINK_MODE=hardlink
-  export UV_CACHE_DIR UV_LINK_MODE
-fi
 # Set by `check_disk_reaper` and read by `check_reaping_armed`, so the two checks name the SAME reaper
 # and the same last-pass reading (#2916 check 5).
 DISK_REAPER_RESOLVED=""
@@ -735,55 +707,6 @@ check_dispatch() {
   local out outrc
   out=""
   outrc=0
-  # ── THE LANE ROSTER (agent-infra#1935) ─────────────────────────────────────────────────────
-  # The pre-flight's holder surface is built FROM `$HOME/.pi/agent/state/lane-registry.tsv`
-  # (tortoise `tools/fleet_state.py`), and the only thing that ever wrote it was the RETIRED cmux
-  # dispatcher — so a cell has no roster, `load_registry` reports `measured=False`, the board
-  # cannot answer, and EVERY candidate is INCOMPLETE. Measured on cell 1, 2026-10-28:
-  #     issue assignee/holder INCOMPLETE … the roster was NEVER PROVISIONED in this cell
-  #     [refresh] ABORT: none of the 12 candidate(s) … judged NOTHING
-  # Provisioned HERE, from this box's OWN population, so "never provisioned" cannot recur.
-  # ⛔ THIS `--check` PATH WRITES, DELIBERATELY AND IN THE OPEN (#3032 review F7). A `--check` that
-  # silently mutated state would be a contract change; this one is stated instead: the roster is a
-  # PREREQUISITE of dispatch, `--check` is the last gate before a cell is started, and a check that
-  # only REPORTED an unprovisioned roster would leave the cell dispatching nothing — the defect
-  # (#1935) this whole change removes. The write is idempotent (a second run writes nothing) and
-  # non-destructive (a hand-maintained roster is never replaced, and an existing derived roster is
-  # never shrunk by an arm that measured nothing).
-  # ⛔ rc=3 is a WARNING, not a death: it means the population could not be MEASURED on this box,
-  # and the harness's reduced-surface path (refresh-candidates.sh, #2848) can still dispatch by
-  # handing the holder question to the cross-box claim registry. Killing a cell over an
-  # unmeasurable roster would be a false block; refusing to write an empty one is the rule that
-  # matters (#8175), and that lives in the provisioner.
-  if [ -f "$harness/provision-lane-registry.py" ] && command -v python3 >/dev/null 2>&1; then
-    local provout provrc
-    provout=""; provrc=0
-    provout="$(HOME="${CELL_HOME:-$HOME}" python3 "$harness/provision-lane-registry.py" --apply 2>&1)" || provrc=$?
-    printf '%s\n' "$provout" | sed 's/^/    /'
-    if [ "$provrc" -eq 3 ]; then
-      warn "the LANE ROSTER could not be provisioned (the population was unmeasurable — see above);"
-      warn "  the pre-flight's holder surface stays INCOMPLETE until it can be (agent-infra#1935)"
-    elif [ "$provrc" -ne 0 ]; then
-      # ⛔ A CRASH IS NOT A PROVISION (review finding 2): the provisioner's documented exits are
-      # 0/2/3, so any other non-zero is a failure of the tool itself, never "provisioned".
-      warn "the LANE ROSTER provisioning FAILED (rc=$provrc — not the tool's own refusal, so it crashed);"
-      warn "  the roster is in an UNKNOWN state and the holder surface may stay INCOMPLETE (agent-infra#1935)"
-    else
-      ok "lane roster: this box's own population (agent-infra#1935)"
-    fi
-  else
-    # ⛔ TWO CAUSES, TWO DIAGNOSES. The guard above has two halves (the tool is present AND an
-    # interpreter exists), and naming only the first made an absent `python3` read as a missing
-    # harness file — sending the operator to re-pull a file that is already there (review round 2,
-    # minor). The supervisor needs no twin here: its `cmd_check` dependency loop
-    # (cloud-cell-supervisor.sh:2101) dies on a missing python3 before this line is reached.
-    if [ ! -f "$harness/provision-lane-registry.py" ]; then
-      warn "provision-lane-registry.py not found at $harness — the lane roster is not provisioned here;"
-    else
-      warn "python3 is not on PATH — the lane roster provisioner cannot run here;"
-    fi
-    warn "  the pre-flight's holder surface will refuse every candidate (agent-infra#1935)"
-  fi
   out="$(REPO="$WORKDIR" OR="$REPO_SLUG" O="$CELL_HOME/orchestrator" bash "$harness/refresh-candidates.sh" --check 2>&1)" || outrc=$?
   if [ "$outrc" -ne 0 ]; then
     printf '%s\n' "$out" >&2
@@ -1239,47 +1162,6 @@ check_caches() {
     warn "  from 7.1GB in ~/.cache/uv to 258MB free and refused every dispatch (#1987). Reclaim it now:"
     warn "    bash ${reaper:-$HOME/.pi/agent/scripts/pi-cache-reap.sh} --apply"
   fi
-}
-
-# ── (5b) the uv cache + link-mode pin, and what a worktree venv COSTS here (agent-infra#2159) ────
-# The cache report above answers "is the cache over its bound". It cannot answer the question the
-# lanes actually pay for: on THIS box, is a worktree's `.venv` hardlinked into the cache (cheap) or
-# materialised (a full copy, ~5.8 GB measured on a tortoise checkout)? Same size, opposite
-# consequence — and nothing on the cell reported the difference, which is why "disk is the ceiling"
-# and "the venvs are nearly free" were both true on different cells at the same time.
-# The reading is the helper's (`uv-env.sh report`), so the same sentence is printed by the supervisor
-# and by a lane — one authority, not a second opinion that drifts.
-check_uv_env() {
-  local out
-  # Re-apply AFTER keys.env has been sourced (it is sourced by `check_provider`, which runs earlier):
-  # `uv_env_apply` only fills what is UNSET, so an operator's keys.env line still wins, and the
-  # `defaulted` record recomputed here is the honest one — reporting "defaulted cache" for a cell
-  # whose keys.env pinned it would accuse the operator of a default they did not take.
-  [ -n "$UV_ENV_HELPER" ] && [ -r "$UV_ENV_HELPER" ] && uv_env_apply "${CELL_HOME:-${HOME:-}}"
-  if [ -z "$UV_ENV_HELPER" ] || [ ! -r "$UV_ENV_HELPER" ]; then
-    warn "uv pin: no uv-env.sh beside this script — the values above are this file's inline default and the cold-cache reading is UNAVAILABLE (a cold cache is then only discovered as free disk disappearing)"
-  else
-    out="$(uv_env_report --estate "${WORKDIR:-$REPO}" 2>&1)" || out="[uv-env] report FAILED — the cold-cache reading is unavailable on this box"
-    # ⛔ THE CHANNEL CARRIES THE VERDICT. A COLD cache printed through `ok` is a green line for the one
-    # condition this check exists to raise, and an operator scanning for `warn:` never sees it (review
-    # finding). Everything that is a COST or a CANNOT-VERIFY is a warning; a measured/warm reading is ok.
-    printf '%s\n' "$out" | while IFS= read -r line; do
-      case "$line" in
-        '') continue ;;
-        *verdict=COLD-CACHE*|*verdict=NOT-SHARED*|*verdict=NOT-SHARING-BY-DESIGN*|*verdict=CACHE-UNMEASURABLE*|*verdict=SHARING-UNMEASURED*|*"report FAILED"*)
-          warn "$line" ;;
-        *) ok "$line" ;;
-      esac
-    done
-  fi
-  case "${UV_ENV_DEFAULTED:-}" in
-    none) ok "uv pin: UV_CACHE_DIR=$UV_CACHE_DIR UV_LINK_MODE=$UV_LINK_MODE (operator-set, not defaulted)" ;;
-    ''|*)
-      # The DEFAULT is what this bring-up ran with; the DURABLE home for an operator override is the
-      # cell's keys.env, which is sourced after these defaults and therefore wins. Say that, because a
-      # default that vanishes on the next shell is exactly the "operator's sed on one box" this fixes.
-      warn "uv pin: defaulted ${UV_ENV_DEFAULTED:-?} (UV_CACHE_DIR=$UV_CACHE_DIR UV_LINK_MODE=$UV_LINK_MODE) — this bring-up exports it for every process it starts; to make it durable on this CELL, put the same two lines in $ENV_FILE" ;;
-  esac
 }
 
 # ── (6) swap: a memory spike must PAGE, not OOM-kill the lanes (agent-infra#2390) ───────────────
@@ -1896,9 +1778,6 @@ main() {
       check_provider_layer
       check_schedule
       check_caches
-      # AFTER the cache report, and for the same reason: the bound is one question, the COST of a
-      # worktree venv on this box is the other (a hardlinked venv versus a 5.8 GB copy, #2159).
-      check_uv_env
       # Before the reaper's install step: a cell that cannot get swap must be refused EARLY, not
       # after the scheduler work — and the reading is what the operator needs from the refusal.
       check_swap
