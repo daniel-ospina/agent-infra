@@ -2394,7 +2394,12 @@ _arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never com
 _arm_cls=""; _arm_other=""
 for _ac in $(printf '%s\n' "$_fixer_code" \
     | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u); do
-  if printf '%s\n' "$_fixer_code" | grep -qE "=[[:space:]]*\"\\\$\\{?${_ac}"; then
+  # ⛔ A HERE-STRING, NOT `printf … | grep -q` (sigpipe-grep gate, #841/#864). Under `pipefail` a
+  # `grep -q` that matches early closes the pipe, the writer takes SIGPIPE, and the pipeline's status
+  # becomes 141 — so THIS test would read "not an arm" exactly when the name DID match. That is a
+  # false-negative in the check that proves `fix-one.sh`'s arms are reachable, which is the same
+  # silently-unchecked-arm class the derivation exists to close (`check-no-sigpipe-grep.sh`).
+  if grep -qE "=[[:space:]]*\"\\\$\\{?${_ac}" <<<"$_fixer_code"; then
     _arm_cls="$_arm_cls $_ac"
   else
     _arm_other="$_arm_other $_ac"
