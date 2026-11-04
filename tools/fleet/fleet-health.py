@@ -936,10 +936,15 @@ def main():
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
         return 1
     if census_note:
-        # ⛔ REPORTED, NOT DEGRADED TO A WARNING. Some lanes were PRINTED but did not reach a
-        # conclusive verdict, which is the same INCOMPLETE class as the unreadable store above and
-        # must reach a scheduler the same way (a census that prints rows and exits 0 is exactly
-        # the false PASS this guards).
+        # ⛔ REPORTED, NOT DEGRADED TO A WARNING. A census note means the rows above are NOT a
+        # verdict — either some lanes reached none (INCOMPLETE), or a COMPLETE roster is
+        # contradicted by the population (STALE ROSTER / UNVERIFIED) — and it must reach a
+        # scheduler the same way the unreadable store above does (a census that prints rows and
+        # exits 0 is exactly the false PASS this guards).
+        # ⛔ …and it deliberately no longer says "some lanes did not reach a conclusive verdict":
+        # that was TRUE only while a note could mean one thing, and the all-dead arm now reaches
+        # here with EVERY lane conclusive (review cycle 13). A rationale narrower than the set of
+        # states it explains teaches the next editor the exact coupling cycles 7-9 removed.
         # ⛔ AND IT NAMES THE NUMBER IT ACTUALLY HAS (review cycle 3, finding 2): the line used to
         # read "0 rostered lanes measured" for EVERY note, including a partial mismatch where 1-6
         # lanes WERE established — telling an operator the census established nothing when it had.
