@@ -1340,10 +1340,10 @@ lane_end_push() {
       echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but $sym is a LANDING branch of this remote (checked against:$_protected) and this exit path will NOT push it — a landing branch moves only through the repo's merge rail with a recorded review, and a push from a dying lane would bypass both. Nothing was pushed; the commits are in the local object store" >> "$log" 2>/dev/null || true
       return 0 ;;
   esac
-  # ⛔ THE BOUND IS RESOLVED *BEFORE* ANY NETWORK CALL, because the landing-branch check below asks the
-  # REMOTE (`ls-remote --symref origin HEAD`) and that read must itself be bounded (see the ordering note
-  # beside the landing check). A missing library is a refusal for the whole network half — not for the
-  # local checks above, which have already run.
+  # ⛔ THE BOUND IS RESOLVED *BEFORE* ANY NETWORK CALL, because the landing-branch check asks the REMOTE
+  # (`ls-remote --symref origin HEAD`, the read at the top of this function) and that read must itself be
+  # bounded — which is why it carries `tb_timeout 15`. A missing library is a refusal for the whole
+  # network half — not for the local checks above, which have already run.
   # ⛔ THE THREE NETWORK BOUNDS ARE ONE BUDGET, SUMMED (review cycle 2, finding 4). A launcher gives the
   # exit path 20 s after TERM and 15 s more after KILL = 35 s, and the three calls of this whole function
   # are exactly that: 15 s (the symref read above) + 15 s (the push below) + 5 s (the verifying read) =
@@ -1439,14 +1439,27 @@ lane_end_next() {
     return 0
   fi
   if [ "${LANE_END_TREE:-}" = "dirty" ] || [ "${LANE_END_TREE:-}" = "cannot-verify" ]; then
-    if [ "${LANE_END_RESCUE:-}" = "nothing" ]; then
-      printf 'the tree measured %s with rescue=nothing — read the [wip] line before removing %s; no archive ref is claimed here\n' \
-        "${LANE_END_TREE}" "${LANE_END_ROOT:-<unknown>}"; return 0
-    fi
-    printf 'recover the uncommitted state: git fetch origin refs/wip/%s && git diff --stat HEAD FETCH_HEAD (%s); %s\n' \
-      "$(printf '%s' "${LANE_END_BRANCH:-detached}" | tr '/' '-')" \
-      "the archive commit's TREE is the worktree as it was left" \
-      "then re-dispatch"
+    # ⛔ ONLY THE VALUE THAT PROVES AN ARCHIVE MAY NAME IT (review cycle 3 — the SAME defect as the finding
+    # this change fixed one arm above): `rescue=nothing` never created a ref, and the EMPTY value — the
+    # pre-network marker, written before the rescue half ran — cannot claim one either, yet both were
+    # routed to "git fetch origin refs/wip/…", which fails.
+    # ⛔ THE SUCCESS VALUE IS THE REF ITSELF, NOT A WORD (found by verification of the review finding that
+    # prompted this arm): `LANE_END_RESCUE` is assigned `refs/wip/<slug>` when `bg-rescue-wip.sh` reports a
+    # pin, and `archived` is assigned NOWHERE — a guard written as `archived` was unreachable dead code
+    # that suppressed the fetch instruction for the ONE case where origin holds the only off-box copy.
+    # The domain is read from the assignments, never from prose: `nothing` / `refs/wip/<slug>` /
+    # `archived-local` / `FAILED` / `UNAVAILABLE` / `DISABLED` / empty. `archived-local` has its own arm
+    # above (local pin, no off-box copy) and the failure values refuse before this point.
+    case "${LANE_END_RESCUE:-}" in
+      refs/wip/*)
+        printf 'recover the uncommitted state: git fetch origin %s && git diff --stat HEAD FETCH_HEAD (%s); %s\n' \
+          "${LANE_END_RESCUE}" \
+          "the archive commit's TREE is the worktree as it was left" \
+          "then re-dispatch"
+        return 0 ;;
+    esac
+    printf 'the tree measured %s with rescue=%s — no archive ref is claimed here; the work is IN %s. Read the [wip] line before removing it, then re-dispatch\n' \
+      "${LANE_END_TREE}" "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_ROOT:-<unknown>}"
     return 0
   fi
   # ⛔ THE COUNT IS READ, NEVER HARD-CODED (review P1: this arm printed `unpushed=0` as a literal, so a
@@ -1509,17 +1522,24 @@ lane_end_marker() {
     if [ "$n" -gt 40 ] 2>/dev/null; then
       printf '... %s more entr(y/ies) not listed (see the lane log)\n' "$((n - 40))"
     fi
-    # ⛔ THE BLOCK MUST END ON A COMMAND THAT SUCCEEDS. It ended on `[ -n "$shown" ] && printf …`,
-    # which is EXIT 1 on the majority case (a CLEAN tree has no porcelain lines) — so `&& mv` never
-    # ran and NO MARKER WAS WRITTEN for exactly the lanes that are safe to reclaim. Caught by arm D5
-    # of `wip-rescue-exit.test.sh`, which is why that arm asserts the FILE and not the log line.
-    :
-  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null && LANE_END_MARKER_FRESH=0 || {
+    # ⛔ THE BLOCK MUST END ON A COMMAND THAT SUCCEEDS **AND** THE RESULT MUST BE VERIFIED (review cycle
+    # 3). It ended on `[ -n "$shown" ] && printf …`, which is EXIT 1 on the majority case (a CLEAN tree
+    # has no porcelain lines) — so `&& mv` never ran and NO MARKER WAS WRITTEN for exactly the lanes that
+    # are safe to reclaim (arm D5). The first remedy was a bare `:`, which made the group exit 0
+    # UNCONDITIONALLY — so a write that died part-way (ENOSPC, the 92-98 % condition this artifact
+    # exists for) installed a TRUNCATED marker with no loud line: the same silent-artifact class from the
+    # other side. The block therefore ends on a SENTINEL LINE, and it is the SENTINEL that is verified,
+    # so a partial file cannot be mistaken for a complete one.
+    printf 'end=ok\n'
+  } > "$tmp" 2>/dev/null
+  if [ "$(tail -1 "$tmp" 2>/dev/null)" = "end=ok" ] && mv -f "$tmp" "$f" 2>/dev/null; then
+    LANE_END_MARKER_FRESH=0
+  else
     rm -f "$tmp" 2>/dev/null
     # The write tail used to swallow this (review cycle 1, finding 3): a silent failure leaves NO marker
     # and an operator who believes there is one. Loud, pointing at the disk, never at git.
-    echo "[lane-exit] ⛔ label=$label: the marker write to $f FAILED and the temp file was removed — there is NO per-lane artifact for this terminal. A full disk (ENOSPC) is the usual cause and is also why the worktree exists; the ledger row is unaffected" >> "${LANE_END_LOG:-/dev/null}" 2>/dev/null || true
-  }
+    echo "[lane-exit] ⛔ label=$label: the marker write to $f FAILED or was TRUNCATED (the end sentinel did not land) and the temp file was removed — there is NO per-lane artifact for this terminal. A full disk (ENOSPC) is the usual cause and is also why the worktree exists; the ledger row is unaffected" >> "${LANE_END_LOG:-/dev/null}" 2>/dev/null || true
+  fi
   return 0
 }
 
