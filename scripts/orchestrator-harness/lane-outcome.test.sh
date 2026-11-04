@@ -96,13 +96,20 @@ SH
 # further up: **a fixture that inherits the runner's environment is green on an idle box and red on a busy
 # one.** Pinning the seam (the same one `reviewer-preflight.test.sh` pins, "instead of depending on the
 # box's") is the root fix; a `gh`-only stub would leave `HOME`/`OR`/`REPO`/`PATH` still inherited.
+# ⛔ `PI_LANE_PROVIDER` / `PI_LANE_MODEL` ARE SCRUBBED FOR THE SAME REASON (review P2, measured 2026-11-04):
+# the fleet exports them into every lane (`worker-terminal.sh` writes `export PI_LANE_PROVIDER=<prov>` into
+# each pane), and `key-gate.sh` resolves the variable from `${PI_LANE_PROVIDER:-deepseek}`. The fixture's
+# `models.json` names ONLY `deepseek`, so an ambient provider made the gate answer `check=skipped` and every
+# key arm flip to `done` — green on a deepseek box, red on a zai one. `provider-credential.test.sh` already
+# scrubs exactly these two for exactly this reason; this suite now does the same.
 #
 # drive <worktree> [<VAR>=<value> …] — run the SHIPPED lane.sh in that worktree; echoes nothing, sets
 # LANE_RC. `pi` must already be exported by the caller. `TARGET_SLUG` overrides the repo the lane is told
 # to work on (arm 7d uses a WRONG one on purpose, to reach a refusal with a dry run).
 drive() {
   local wt="$1"; shift
-  ( cd "$wt" && env -u "$KEYVAR" O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
+  ( cd "$wt" && env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL \
+      O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
       bash "$LANE" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1
@@ -111,7 +118,8 @@ drive() {
 # drive_bg <worktree> — the same, in the background, so a signal can reach the LANE process.
 drive_bg() {
   local wt="$1"; shift
-  ( cd "$wt" && exec env -u "$KEYVAR" O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
+  ( cd "$wt" && exec env -u "$KEYVAR" -u PI_LANE_PROVIDER -u PI_LANE_MODEL \
+      O="$ARMDIR/o" HOME="$ARMDIR/home" ENV_FILE="$ARMDIR/home/keys.env" \
       REAP_LANE_VENV_DISABLE=1 LANE_PREFLIGHT=0 \
       MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$ARMDIR" "$@" \
       bash "$LANE" 3331 "$BR" "${TARGET_SLUG:-$SLUG}" ) > "$ARMDIR/out.txt" 2>&1 &

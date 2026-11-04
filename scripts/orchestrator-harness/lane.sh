@@ -144,6 +144,13 @@ lane_terminal_line() {
   # So: deny ONLY on a non-empty token that is not ours (that is the only case where an owner is observable
   # and it is not this process). An absent/unreadable token means nothing is authoritative — (re)stamp and
   # publish, which is also how a failed dispatch-side stamp heals.
+  # ⛔ STATED RESIDUAL (review P2, not fixed here): read → re-stamp → write are three steps, so a PREVIOUS
+  # run whose trap read the token BEFORE the new dispatch stamped it still passes this comparison and can
+  # write ITS line into the NEW run's verdict file after the dispatch's `rm`. The window is the length of a
+  # trap firing mid-handover, and closing it needs an atomic compare-and-swap the shell does not offer
+  # (the honest remedies are `mkdir`-lock or an flock on the owner file). The dispatch-order note above is
+  # therefore true only for a trap that STARTS after the stamp — this comment is the record of that limit,
+  # so the next reader does not re-derive it as a guarantee that does not exist.
   LANE_OWNER_NOW="$(cat "$O/logs/lane-$N.owner" 2>/dev/null || true)"
   if [ -n "$LANE_OWNER_NOW" ] && [ "$LANE_OWNER_NOW" != "${LANE_RUN_TOKEN:-}" ]; then
     echo "[lane $N] (outcome not written to logs/lane-$N.outcome: a LATER dispatch of #$N owns that file — this line is the transcript, that file is the current run's verdict)" >> "$O/logs/lane-$N.log" 2>/dev/null || true
@@ -257,11 +264,33 @@ command -v key_gate_assert >/dev/null 2>&1 && [ -n "${KEY_GATE_REFUSED:-}" ] \
 # may not move WHAT this box repairs or WHERE it records that." So the file keeps the last word on
 # CREDENTIALS (PATH, tokens, DSNs — see lane-env.test.sh A6) and the dispatch keeps it on these five.
 LANE_TARGET_ARG="$OR"; LANE_ISSUE_ARG="$N"; LANE_BRANCH_ARG="$BR"
-LANE_REPO_DIR_ARG="$LANE_REPO_DIR"; LANE_OUT_ARG="$O"
+LANE_REPO_DIR_ARG="$LANE_REPO_DIR"; LANE_OUT_ARG="$O"; LANE_KEY_GATE_ARG="${LANE_KEY_GATE-__unset__}"
 LANE_ENV_LOG="$O/logs/lane-$N.log" LANE_ENV_LABEL="lane $N" . "$SELF/lane-env.sh"
 OR="$LANE_TARGET_ARG"; N="$LANE_ISSUE_ARG"; BR="$LANE_BRANCH_ARG"
 LANE_REPO_DIR="$LANE_REPO_DIR_ARG"; O="$LANE_OUT_ARG"
-unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_ARG
+# ⛔ `LANE_KEY_GATE` IS A POLICY SWITCH, SO IT BELONGS IN THE DISPATCH-OWNED SET, NOT IN THE CREDENTIAL
+# FILE (review P2, measured). It is read at the gate, i.e. AFTER this sourcing, so a box `keys.env`
+# carrying `export LANE_KEY_GATE=0` — exactly what `export -p` records — turned the assertion off for
+# every lane on that box while the lane then reported `outcome=done`. That is the ambient-env bypass the
+# gate exists to refuse, and it is the same precedent recorded a few lines above for the other five
+# (#3174): "`keys.env` remains authoritative for CREDENTIALS … it may not move WHAT this box repairs or
+# WHERE it records that". A fixture still turns it off by setting it in the DISPATCH environment, which
+# is what the escape is documented for.
+if [ "$LANE_KEY_GATE_ARG" = "__unset__" ]; then unset LANE_KEY_GATE; else LANE_KEY_GATE="$LANE_KEY_GATE_ARG"; fi
+unset LANE_TARGET_ARG LANE_ISSUE_ARG LANE_BRANCH_ARG LANE_REPO_DIR_ARG LANE_OUT_ARG LANE_KEY_GATE_ARG
+# ⛔ THE ADAPTERS ARE RE-PREPENDED **AFTER** THE FILE IS SOURCED, AND THAT ORDER IS THE WHOLE POINT
+# (review P1, measured 2026-11-04). `lane-env.sh` gives the file the last word on credentials, PATH
+# included (lane-env.test.sh A6) — but the prepends happen at :64-65, ABOVE this line, so a `keys.env`
+# carrying `PATH=…` silently DISPLACED `$O/gh-rest/gh` and `$O/gh-limit`:
+#     BEFORE env sourcing: <box>/o/gh-rest/gh      AFTER: /usr/bin/gh
+# Every gate that measures this repo (`spawn-gate.sh`'s #2409 land-backlog read is the one that bit)
+# then queries GitHub with the REAL client, bypassing the pacing adapter #1988 requires to stay first,
+# and — measured on a real box — returned `41 open / 0.9 landings per hour` where the box's own adapter
+# answers `0`. The file still owns the REST of PATH (its entries keep their order and reach the child);
+# only the two adapter directories are pinned back in front, which is the rule :64-65 already states.
+# A6 is untouched: it drives `lane-env.sh` directly and never runs this file.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 
 # ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
 # The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
@@ -612,7 +641,14 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, `gate` one of `load`, `disk` or `land`.
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the SIX refusal gates
+# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`.
+# ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
+# emitted six since the fork/capability/skew/key gates were added, and `chain-merge.sh` folds an
+# UNRECOGNISED third field to `load` — so a reader implemented from this sentence alone would report a
+# credential stand-down as a load wait, which is the #2991 mislabelling this file is careful to avoid
+# three lines above. The vocabulary lives in `cap_refusal_gate`; this comment names it rather than
+# restating a list that can drift again.
 # (`land` is the CREATION back-pressure refusal, agent-infra#2409 — see run_agent in spawn-gate.sh.
 # It is written by the same line and read by the same two readers; chain-merge.sh maps it to exit 74
 # and says in its own words that it is NOT a capacity transfer, because no peer box can clear a

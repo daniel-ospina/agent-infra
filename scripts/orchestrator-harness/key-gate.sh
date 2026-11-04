@@ -98,9 +98,23 @@ def nonblank(v):
 if isinstance(e, str):
     raise SystemExit(0 if nonblank(e) else 1)
 if isinstance(e, dict):
-    for k in ("key", "api_key", "apikey", "access_token", "refresh_token", "token"):
+    # ⛔ THE STORE HAS THREE SHAPES, AND ALL THREE MEAN "pi HOLDS A CREDENTIAL" (review P1, verified
+    # against pi\x27s own schema, `dist/core/auth-storage.js` `read()`):
+    #   {"type":"api_key","key":"sk-..."}                      — the plain shape
+    #   {"type":"api_key","env":{"VAR":"sk-..."}}              — `key` is OPTIONAL in pi\x27s validator,
+    #                                                            so this shape is VALID with no `key` at all
+    #   {"type":"oauth","access":"at_...","refresh":"rt_...","expires":N}   — what `pi /login` writes
+    # The first draft accepted only key/api_key/apikey/access_token/refresh_token/token, so the latter two
+    # were read as "no credential" and the gate REFUSED (82) a box that would have run — the exact
+    # false-block this gate exists not to be, and it contradicted the file\x27s own polarity claim. The
+    # remedy it printed ("export an API key") cannot even apply to a store-authenticated box.
+    for k in ("key", "api_key", "apikey", "access_token", "refresh_token", "token",
+              "access", "refresh"):
         if nonblank(e.get(k)):
             raise SystemExit(0)
+    env = e.get("env")
+    if isinstance(env, dict) and any(nonblank(v) for v in env.values()):
+        raise SystemExit(0)
 raise SystemExit(1)
 '
 
