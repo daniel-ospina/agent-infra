@@ -3128,8 +3128,10 @@ def converge(
         runners=classified,
         # ⛔ DERIVED FROM `classified` HERE, NOT APPENDED IN THE REPAIR LOOP (review finding P2).
         # The repair loop can be left before it reaches a CONFIG-LOST entry — by a `--want` refusal
-        # and by any `stop_pass` break — and the field is the ONLY channel a machine reader has
-        # (this is deliberately not a `problem`). Appending there published `"config_lost": []`, a
+        # and by any `stop_pass` break — and the field is the ONLY CLASS-LEVEL channel a machine
+        # reader has (the same fact is per install in `runners[*].state`, which IS published above; a
+        # consumer asking "is any slot dead?" should not have to filter `runners`). This is
+        # deliberately not a `problem`. Appending there published `"config_lost": []`, a
         # positive claim that nothing is lost, on exactly the passes that stopped early.
         config_lost=[str(c["dir"]) for c in classified if c["state"] == "CONFIG-LOST"],
         local=[{"dir": str(r.directory), "name": r.name} for r in local],
