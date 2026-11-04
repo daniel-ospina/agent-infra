@@ -95,7 +95,16 @@
 // hatch M2/M3/M4 are all inactive (the M4 hub-state block is wrapped in
 // `if (!_isAllowMainEdits())`) and M1 detection stays ACTIVE; under the TTL
 // MARKER only M2/M3 are inactive while M4 stays ACTIVE (D3 — a stranded lane
-// recovers with the marker but cannot resume feature work in the hub). There
+// recovers with the marker but cannot resume feature work in the hub). M4's
+// recovery WINDOW is the part the marker opens: the named-path working-tree
+// restore family (`git restore <path>` / `git checkout -- <path>`) classifies
+// as recovery under either hatch, because a dirty hub cannot be cleared by the
+// branch route M4 used to prescribe alone (#1484; measured 2026-11-02 — a hub
+// carrying one truncated tracked file answered every restore with
+// `git checkout main`, a no-op on a dirty tree, and stayed dirty ~12h). Every
+// feature-work verb stays blocked under the marker: no commit, no branch
+// create/force, no foreign push, and `checkout -- .` (whole-tree wipe) is
+// refused — a deliberate discard must name its paths. There
 // is NO auto-bypass: the guard blocks every time, so a rogue/parallel agent
 // cannot retry its way past it.
 //
@@ -167,7 +176,7 @@ let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
 let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } = () => ({ disorder: null, branch: null, path: null, dirtyPaths: 0 });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null, opts?: { escapeActive?: boolean; hatchActive?: boolean } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 // #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
@@ -283,12 +292,24 @@ let extractMarkerReason: (command: string) => string | null = () => null;
 let parseMarkerContent: (content: string) => Record<string, unknown> | null = () => null;
 let isAllowMarkerRealpath: (path: string) => boolean = () => false;
 let readAllowMarkerState: (path: string, sessionId: string | null | undefined, nowMs?: number, ttlMs?: number) => boolean = () => false;
+// #1484: ONE three-shape dirty-hub recovery text, shared by every block message
+// (M4's classifier reason and this file's write/edit + bash-write surfaces) so
+// the advice cannot drift from the enforcement.
+let hubDirtyRecoveryLines: (hubContext?: { disorder?: string | null } | null, hatchActive?: boolean) => string[] = () => [];
+let isRepoSelectingEnvKey: (k: string) => boolean = () => false;
+// Round 11 (P2): the REAL hatch state for the CURRENT tool call, resolved with the
+// ctx session id (not the env-only form). `_hubWriteRecoverLines` used to derive
+// it itself via `_currentSessionId(undefined)`, which is empty in production (pi
+// sets PI_SESSION_ID only in bash CHILDREN), so the hatch-active paragraph was
+// unreachable on the write/edit, bash-write and inline-payload surfaces.
+let _currentHatchActive = false;
 try {
   ({ classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd,
      extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout,
      getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS,
      isAllowMarkerActive, isAllowMarkerPath, isAllowMarkerCommand,
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
+     hubDirtyRecoveryLines, isRepoSelectingEnvKey,
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, scriptIsInterpreted, evaluateHubGateWithTargets,
      extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
@@ -555,8 +576,7 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
   };
 }
 
-// ── M4: hub-state gate (#1484) ─────────────────────────────────────────────
-// The hub's only legal states are main+clean. When the session cwd IS the hub
+// ── M4: hub-state gate (#1484) ─────────────────────────────────────────────// The hub's only legal states are main+clean. When the session cwd IS the hub
 // main checkout (agent-infra included since #615) and the hub is off-main or
 // dirty, every git op is
 // gated by the recovery allowlist (classify-git evaluateHubGateWithTargets) and
@@ -592,6 +612,22 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
   if (st.disorder === "off_main" || st.disorder === "both") bits.push(`off-main: ${st.branch ?? "<detached>"}`);
   if (st.disorder === "dirty" || st.disorder === "both") bits.push(`dirty: ${st.dirtyPaths} path(s)`);
   return `   Checkout: ${st.path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`;
+}
+
+/** #1484 — the write/edit route's recovery advice must be as ACTIONABLE as the
+ *  bash route's (review round 2, P2). This route keeps D3's freeze even under
+ *  the hatch, so it cannot tell the reader to just edit; but it CAN tell them
+ *  how to clear the dirt on the route that has a working escape — the bash
+ *  named-path restore, which an active hatch sanctions. The old line said
+ *  `git checkout main && git pull --ff-only`, which on a DIRTY hub is the very
+ *  no-op this change removes from the bash message: git refuses to switch over
+ *  modified paths. */
+function _hubWriteRecoverLines(st: { disorder: string | null } | null, hatchActive: boolean = _currentHatchActive): string[] {
+  // ONE text, shared with M4's classifier reason (round 9): the two used to
+  // diverge, and only the classifier's covered all three dirt shapes.
+  const lines = hubDirtyRecoveryLines(st, hatchActive);
+  if (lines.length > 0) return lines;
+  return [`   → Recover first: cd <repo> && git checkout main && git pull --ff-only`];
 }
 
 // #1919 — refuse a `git worktree add|move` whose target lands INSIDE a git
@@ -1285,6 +1321,19 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
 // cross-checkout write into a hub's `.git/` metadata freezes too; only
 // session-start host env bypasses; a mid-command `export` cannot) plus the
 // sanctioned ways forward (salvage / worktree).
+/** Round 10 (P2): the hub state of the checkout a BLOCKED WRITE TARGETS (not the
+ *  session's cwd — a cross-checkout write is about the OTHER hub, and telling
+ *  that reader to `git checkout main` in a hub already on main and dirty is the
+ *  #1484 no-op again). Falls back to the session hub when the target's repo
+ *  cannot be resolved. */
+function _targetHubState(resolvedPath: string): { disorder: string | null } | null {
+  try {
+    const top = resolveTargetTopLevel(resolvedPath) ?? _mainTopLevel();
+    if (top) return readHubDisorder(top, { skipWorktree: true });
+  } catch { /* fall through */ }
+  return _hubState();
+}
+
 function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind?: "script-depth" | "untracked-existing" }): string {
   if (hit.kind === "untracked-existing") {
     return [
@@ -1328,6 +1377,15 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
     `   NEW-file writes and own-main untracked writes stay allowed. Only`,
     `   session-start host env (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a`,
     `   mid-command export cannot.`,
+    // Round 9 (P1): THIS is the arm the incident's refusal #4 (`cp <worktree
+    // copy> <truncated tracked file>`) hits — round 8's lines landed on the
+    // untracked-existing branch instead.
+    // Round 10 (P2): the state must be the HUB THE WRITE TARGETS, not the
+    // session's cwd. Measured: session rooted in a clean hub A running
+    // `cp A/a.txt B/tracked.txt` (B = a dirty hub main) was told
+    // `git checkout main && git pull --ff-only` — a no-op on B, which is already
+    // on main and dirty. The target's own disorder decides the advice.
+    ..._hubWriteRecoverLines(_targetHubState(hit.resolvedPath)),
     `   → Work in a worktree of the TARGET repo (using-git-worktrees skill,`,
     `     or bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
     `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
@@ -2475,9 +2533,39 @@ function _worktreeDiscardBlockReason(
           `     ~2.4M files of I/O per cycle (#1141). Where it exists, prefer`,
           `     \`scripts/scratch-worktree.sh run ...\` — it removes the worktree itself.`,
           `   → Inspect first: git status --porcelain; git diff <path>.`,
-          `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
-          `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
-          `     marker — both bypass this gate unchanged.`,
+          // Round 4 (P2) — the remedy must depend on whether the hatch is ALREADY
+          // active. Telling a hatched reader to stamp the marker it already holds
+          // is the incident's "each prescription not working" signature: the real
+          // cause is the window's own shape limit (one bare invocation, run from
+          // the hub), which this branch never used to name.
+          ...(_wtDiscardHatchActive
+            ? [
+                `   → Your hatch IS active: the window covers ONE bare invocation run`,
+                `     from the dirty hub — no \`;\`/\`&&\`/pipe, no redirect, no \`cd … &&\``,
+                `     prefix, no \`-C\`/\`GIT_DIR=\` target selection. Run it alone:`,
+                `       git checkout -- <path>          # cwd is the hub`,
+                // Round 17 (P3): the DIRECTORY carve-out is a documented trade-off;
+                // it must be named on the surface a HATCHED reader actually sees
+                // (this one), not only in the hatch-inactive text.
+                `     NOTE a DIRECTORY operand (\`src\`, \`src/\`) IS admitted and discards that`,
+                `     entire subtree, so name a FILE when that is what you mean.`,
+              ]
+            : [
+                // Round 14 (P2): the two hatches are NOT equivalent and this
+                // sentence said they were. `AGENT_ALLOW_MAIN_EDITS=1` is a FULL
+                // bypass (it returns before M4/M5 are consulted, so `.`/globs ARE
+                // permitted under it — measured); only the TTL MARKER opens the
+                // narrow window. The pinned phrase is kept verbatim (test.mjs and
+                // test-discard-gate pin it) and the scoping is stated around it.
+                `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
+                `     ELDATO_ALLOW_MAIN_EDITS=1) — a FULL bypass of M4/M5, whole-tree`,
+                `     discards included — or stamp the ~/.pi/agent/.allow-main-edits MARKER,`,
+                `     which opens the same narrow recovery window as M4: name the paths,`,
+                `     \`git restore <path>\` / \`git checkout -- <path>\`. Refused UNDER THE MARKER:`,
+                `     a whole-tree discard (\`.\`, \`./\`, pathspec magic, a glob, a brace) — and`,
+                `     NOTE a DIRECTORY operand (\`src\`, \`src/\`) IS admitted and discards that`,
+                `     entire subtree, so name a FILE when that is what you mean.`,
+              ]),
         ]),
   ].join("\n");
 }
@@ -2749,8 +2837,108 @@ function _wtExpandedScriptShape(text: string, depth = 0): _WtExpandedHit | null 
  *  tracked work in the checkout it targets, else null. Covers the direct argv
  *  surface, interpreter-inline payloads (via allGitInvocations) and the
  *  script-file surface (`bash /tmp/restore.sh`) to a bounded depth. */
-function _worktreeDiscardBlock(command: string): string | null {
+/** #1484 M4 recovery window — the M5 half (#709).
+ *
+ * Both gates must agree on the SAME window, or the hatch moves the refusal one
+ * line down instead of removing it. Measured (review, 2026-11-02): with the TTL
+ * marker ACTIVE and a hub carrying one truncated tracked file, M4 permitted
+ * `git checkout -- <path>` and M5 then refused it — "Working-tree discard
+ * blocked … it would destroy uncommitted work (#709)" — so the hub stayed
+ * unrecoverable while BOTH messages claimed a hatch worked.
+ *
+ * The hatch state is PASSED IN (the caller already computed it, the same value
+ * M4's `escapeActive` gets). Recomputing it here resolved the session id from
+ * the ENV only (`_currentSessionId(undefined)`) while M4 and the marker STAMP
+ * use the ctx form (`_currentSessionId(_ctx)`) — two different ids, so in the
+ * production geometry (pi sets PI_SESSION_ID only in the CHILD env, not its own
+ * process) this window silently never opened and "M4 permits, M5 refuses"
+ * survived. Measured by review round 2 driving the real handler with a
+ * ctx-stamped marker and no env id.
+ *
+ * SCOPE (all three required): an active hatch; the SESSION cwd is the DISORDERED
+ * hub (a clean repo, a linked worktree and a foreign checkout are outside it);
+ * and the command is ONE simple git invocation. The last clause closes the
+ * compound hole round 2 measured: exempting the whole command let one permitted
+ * restore neutralise M5 for everything after it (`git checkout -- other.txt; x=w;
+ * git show HEAD:"$x" > "$x"` was ALLOWED, re-opening #1060/D8). */
+function _m4HatchRecoveryWindow(command: string, hatchActive: boolean): boolean {
+  if (!hatchActive || !classifierLoaded) return false;
+  // A compound command is never in the window. NEWLINE is in the class
+  // deliberately (review round 3, P1 — measured): the first cut listed `;` but
+  // not `\n`, which is the shell's most common separator and a boundary
+  // `allGitInvocations` itself splits on, so
+  //   `git checkout -- wip.txt` NL `bash w.txt`   (w.txt = `git checkout -- .`)
+  // was ALLOWED and wiped a sibling session's uncommitted work — a way to run a
+  // script body the #1484 script backdoor refuses to run in command position.
+  if (/[;&|<>`$()\n\r]/.test(command)) return false;
+  // The window is the SESSION's disordered hub, so the invocation's TARGET must
+  // be that hub too (review round 3, P2 — measured): `git -C <dirty checkout B>
+  // checkout -- p` from a dirty hub A was ALLOWED, exempting M5 for a discard
+  // aimed at a checkout that is NOT the hub (origin/main blocked it). A
+  // repo-SELECTING flag can point the restore anywhere, so it is refused
+  // outright — fail closed to M5; the plain form, run from the hub, is the
+  // window and is what the message tells the reader to use.
+  // Round 10 (P1, MEASURED — data loss): the reject required a separator AFTER
+  // `-C`, so `env -C"<other>" git checkout -- tracked.txt` (BSD env accepts the
+  // attached form; GNU env -C/--chdir on the Linux cells) slipped BOTH layers —
+  // the parser only sees the `git` invocation, and M4's early-return then calls
+  // the window so M5 never runs. It DESTROYED a foreign checkout's uncommitted
+  // work where origin/main blocked it. The documented shape is "ONE bare
+  // invocation run from the hub", so make that literal: the command must START
+  // with `git`. That closes env -C/--chdir, env -i, nice, sudo, xargs and
+  // `sh -c` in one predicate instead of enumerating wrappers.
+  if (!/^\s*git\s/.test(command)) return false;
+  if (/(^|\s)(-C|--git-dir|--work-tree|--prefix)(\s|=)/.test(command)) return false;
+  // …and the ENV spelling of the same thing (round 4, P1 — MEASURED fail-open:
+  // `GIT_DIR=<other>/.git GIT_WORK_TREE=<other> git checkout -- tracked.txt`
+  // was ALLOWED and discarded a FOREIGN checkout's uncommitted work, where
+  // origin/main blocked it. An enumerated flag list cannot cover a second
+  // spelling family, so the window refuses ANY env-assignment prefix: a bare
+  // restore needs none, and "one bare invocation, run from the hub" is the
+  // shape the message tells the reader to use. Everything else falls back to
+  // M5's normal (blocking) behaviour — fail closed, never fail open.)
+  if (/(^|\s)[A-Za-z_][A-Za-z0-9_]*=/.test(command)) return false;
+  // …and the AMBIENT env (round 6, P2 — MEASURED): with `GIT_DIR`/`GIT_WORK_TREE`
+  // in the pi PROCESS env, a bare `git checkout -- tracked.txt` run from the dirty
+  // hub targeted the OTHER checkout and rewrote its uncommitted work. Under the
+  // TTL marker that was newly reachable (origin/main blocked it; only the env
+  // hatch — a full bypass — allowed it there). No channel predicate can see the
+  // process env, so it is checked directly.
+  if (Object.keys(process.env).some(isRepoSelectingEnvKey)) return false;
+  // …including the AMBIENT spelling of the config channel (round 7, P2 — the
+  // `-c`/`--config-env` family r6 closed is also settable through the env:
+  // GIT_CONFIG_PARAMETERS / GIT_CONFIG_COUNT+KEY_n/VALUE_n / GIT_CONFIG_GLOBAL /
+  // GIT_CONFIG_SYSTEM all reached the window). Effect was inert (git ignores
+  // core.worktree inside a worktree) so this was a classification gap, but the
+  // fix is the principle rather than three more names: a bare restore needs NO
+  // git config at all, so ANY `GIT_CONFIG_*` in the env puts it out of window.
+
+  const st = _hubState();
+  if (!st.disorder) return false; // the window exists only for a DISORDERED hub
+  try {
+    const base = resolve(process.cwd());
+    const withHatch = evaluateHubGateWithTargets(command, st.branch, base, null, st, { escapeActive: true });
+    if (withHatch.verdict !== "recovery") return false;
+    const withoutHatch = evaluateHubGateWithTargets(command, st.branch, base, null, st);
+    return withoutHatch.verdict === "block";
+  } catch {
+    return false; // degrade — never widen on a classifier failure
+  }
+}
+
+// Round 4 (P2): set by _worktreeDiscardBlock, read by _worktreeDiscardBlockReason, so the
+// block message can tell a hatched reader what its hatch actually covers.
+let _wtDiscardHatchActive = false;
+
+function _worktreeDiscardBlock(command: string, hatchActive = false): string | null {
   if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
+  // #1484/#709 — the hatch's recovery window, decided ONCE and shared with M4.
+  if (_m4HatchRecoveryWindow(command, hatchActive)) return null;
+  // The reason builder needs the same datum so it can name the WINDOW (rather
+  // than re-prescribe a hatch the reader already holds). Set per call, read
+  // immediately — every path into `_worktreeDiscardBlockReason` runs through
+  // this function.
+  _wtDiscardHatchActive = hatchActive === true;
   // Backslash-newline line continuations (`git \<LF> checkout -- f`) are joined
   // by the shell BEFORE it tokenizes — join them here too, so every textual arm
   // below sees the same command the shell runs (reviewer round-7 P1).
@@ -4274,8 +4462,18 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
             `   The non-shell interpreter backdoor (python -c, node -e, ruby -e,`,
             `   perl -e, php -r, pwsh -Command) is closed: the inline payload`,
             `   contains a non-sanctioned git operation.`,
-            `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
-            `     or work in an isolated worktree:`,
+            `   → Run the git commands directly, or work in an isolated worktree:`,
+            // Round 6 (P2): this was the last message still prescribing the
+            // no-op. On a DIRTY hub `git checkout main && git pull --ff-only`
+            // cannot run (git refuses to switch over modified paths), and it
+            // never named the named-path restore the recovery window sanctions.
+            // Round 9 (P2): and it listed the BARE `--staged` spelling, which
+            // is the form this PR documents as non-convergent — it leaves the
+            // file MODIFIED so the hub stays dirty. The shared three-shape text
+            // replaces that list.
+            ...(_hubState().disorder
+              ? _hubWriteRecoverLines(_hubState())
+              : [`     (recovery from an off-main hub: git checkout main && git pull --ff-only)`]),
             `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
           ].join("\n");
         }
@@ -4770,6 +4968,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_call", async (event, _ctx) => {
     const pid = process.pid;
+    // Round 11 (P2): resolve the hatch ONCE per tool call, with the CTX session
+    // id, before any gate or message runs. The write/edit, bash-write and
+    // inline-payload messages used to derive it themselves from the env-only id —
+    // empty in production (pi sets PI_SESSION_ID only in bash CHILDREN) — so the
+    // hatch-active paragraph was unreachable on exactly the surfaces a stranded
+    // lane hits.
+    _currentHatchActive = _isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
 
     // M1 runs on EVERY tool_call (read included — a reviewer whose tree moved
     // mid-review sees the warn before proceeding, AC8). Active under the
@@ -4847,7 +5052,16 @@ export default function (pi: ExtensionAPI) {
             }
           } catch { /* empty set → only the hub's current branch protects */ }
           if (st.branch) checkedOutNames.add(st.branch);
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st);
+          // Round 10 (P1): the recovery window applies to ONE BARE `git`
+          // invocation run from the hub. A WRAPPER (`env -C<dir>`, `nice`, `sudo`,
+          // `xargs`, `sh -c`) is not that shape: the parser only reports the
+          // inner `git` invocation, so a wrapper's own target selection is
+          // invisible to it, and `env -C"<other>" git checkout -- tracked.txt`
+          // destroyed a foreign checkout's uncommitted work with M4 classifying
+          // recovery and M5 never consulted. Wiring the hatch to the shape (not
+          // just to the window) makes M4 refuse those forms exactly as main does.
+          const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(command);
+          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -4888,7 +5102,10 @@ export default function (pi: ExtensionAPI) {
               // was left to decide. The hub's tracked dirt is exactly what that
               // command destroys, so the effect gate must still be consulted
               // before the arm calls the command done.
-              const discardReason = _worktreeDiscardBlock(command);
+              // Round 15: the MESSAGE needs the hatch itself, not the shape-gated
+              // `escapeActive` — passing the latter told a hatched lane (refused for
+              // being compound/wrapped) to stamp the marker it already holds.
+              const discardReason = _worktreeDiscardBlock(command, _currentHatchActive);
               if (discardReason) return { block: true, reason: discardReason };
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
@@ -4934,7 +5151,7 @@ export default function (pi: ExtensionAPI) {
                     `   New files are additive (they cannot collide with a sibling's uncommitted`,
                     `   work) but unbounded accumulation is the #347 amplifier, and the hub's`,
                     `   only legal state is main+clean.`,
-                    `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+                    ..._hubWriteRecoverLines(st),
                     `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
                   ].join("\n"),
                 };
@@ -4949,7 +5166,7 @@ export default function (pi: ExtensionAPI) {
                 ...(ctxLine ? [ctxLine] : []),
                 `   The hub's only legal states are main+clean. Non-recovery edits are`,
                 `   blocked even under the TTL marker (D3).`,
-                `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+                ..._hubWriteRecoverLines(st),
                 `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
               ].join("\n"),
             };
@@ -5008,7 +5225,7 @@ export default function (pi: ExtensionAPI) {
       // branch-ownership loaded, and in a linked worktree as well as the hub.
       // It sits AFTER the env/marker hatch return above, so both hatches
       // bypass it unchanged.
-      const discardBlock = _worktreeDiscardBlock(command);
+      const discardBlock = _worktreeDiscardBlock(command, false);
       if (discardBlock) return { block: true, reason: discardBlock };
       // #350: hub-WIP discipline prompts (never block) — bash-write detection
       // (heredoc/tee/python into the hub) + the throttled periodic hub-hygiene
