@@ -109,6 +109,11 @@
 #                         PATH is a different binary, NO launchctl verb is issued and the pass says
 #                         RESTART-REFUSED. A test enters the Darwin arm behind a PATH shim and pins it,
 #                         so a shim that failed to be written refuses instead of reaching the real verb.
+#   WATCHDOG_SUPERVISOR_PIN  the ONLY cell supervisor this file may execute, by path (the cell arm's
+#                         equivalent of the launchctl pin). A MISMATCH refuses and issues nothing. This
+#                         matters because the arm's own fallback resolves `$SELF_DIR/../cloud-cell-
+#                         supervisor.sh`, which in any checkout IS the box's live supervisor: without a
+#                         pin, a harness whose `SUPERVISOR` is unset executes the real one (#1986 review).
 #   WATCHDOG_SLEEP_BIN    `sleep` seam (TESTS ONLY)
 set -uo pipefail
 
@@ -149,6 +154,13 @@ STATE_DIR="${WATCHDOG_STATE_DIR:-$HOME/.pi/agent/state}"
 # location for THIS label, provisioned by whatever provisioned the job — and an absent plist is
 # REPORTED (RESTART-UNAVAILABLE) rather than guessed at or rendered in passing.
 PLIST_PATH="${WATCHDOG_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
+# The root the per-commit harness trees live under. ⛔ THIS IS WHERE THE CONTROLLER'S ARGV ACTUALLY
+# POINTS on a shipped Mac: launchd runs `bash __HARNESS__/__ENTRY__` (`launchd.plist.template:24`,
+# rendered from install.sh's `HARNESS_PIN_DIR`, default `$HOME/harness`), NOT `$O/orch-loop.sh`. Measured
+# on a live box: `bash /home/cmux/harness/9a3cf06e09b4/scripts/orchestrator-harness/orch-loop.sh`, while
+# `$O` is the deployed harness dir and this file's `$SELF_DIR` is whatever checkout it was started from —
+# three different paths. The REMOVED arm's liveness probe needs this root or it is LOCK-ONLY.
+PIN_ROOT="${WATCHDOG_PIN_DIR:-${HARNESS_PIN_DIR:-$HOME/harness}}"
 # ⛔ A DELIBERATE REFUSAL IS NOT A FAILED VERB — AND IT IS NOT AN EXIT CODE EITHER (review P1, #1986).
 # Both are non-zero (a refusal must never be read as a recovery), but only a refusal means *nothing was
 # executed*, so `main` must not turn it into RESTART-FAILED and must not fall through to the post-settle
@@ -320,12 +332,17 @@ controller_pid() {
   # The lock is absent, unreadable, or names a pid that is not this controller. Scan, newest first is
   # meaningless here — there must be at most ONE, so the first match is the one the fleet has.
   # ⛔ TWO SCOPES, because the controller's argv carries a DIFFERENT path on each platform: a Mac
-  # launchd job runs `bash __O__/orch-loop.sh` (launchd.plist.template:10), while a cell's supervisor
-  # runs `bash '<harness>/orch-loop.sh'` (cloud-cell-supervisor.sh:1985 — the same measurement the
-  # inventory records in fleet-inventory.sh's two-scope controller row). A single `$O`-scoped scan
-  # therefore could not see a cell's controller AT ALL, so WEDGED was unreachable there: a live but
-  # frozen controller read as DOWN, and every pass issued a restart. The second pattern is THIS
-  # script's own sibling — the harness dir the cell pins — not a guess at an operator's path.
+  # launchd job runs `bash __HARNESS__/__ENTRY__` (`launchd.plist.template:24`) — the PIN tree, which is
+  # neither `$O` nor `$SELF_DIR`, see `PIN_ROOT` — while a cell's supervisor runs `bash
+  # '<harness>/orch-loop.sh'` (cloud-cell-supervisor.sh:1985 — the same measurement the inventory records
+  # in fleet-inventory.sh's two-scope controller row). A single `$O`-scoped scan therefore could not see a
+  # cell's controller AT ALL, so WEDGED was unreachable there: a live but frozen controller read as DOWN,
+  # and every pass issued a restart. The second pattern is THIS script's own sibling — the harness dir the
+  # cell pins — not a guess at an operator's path.
+  # ⚠ STILL INCOMPLETE, AND NAMED RATHER THAN HIDDEN: this scan does not cover the MAC's pin-tree argv, so
+  # on a shipped Mac a live-but-frozen controller reads DOWN and WEDGED is unreachable (filed as a
+  # follow-up; the REMOVED arm guards itself separately with the same three roots, because THAT is where a
+  # wrong answer mutates the box).
   local pat
   for pat in "bash ${O}/orch-loop.sh" "bash ${SELF_DIR}/orch-loop.sh"; do
     [ -n "$pat" ] || continue
@@ -383,7 +400,14 @@ launchd_job_state() {
     esac
   done
   if [ -n "$unknown" ]; then printf '2 -\n'; return 0; fi
-  printf '1 %s\n' "${target:-gui/$(id -u)}"
+  # ⛔ NO DOMAIN ACCEPTED THE TARGET SPECIFIER ⇒ UNKNOWN, NOT "ABSENT" (review P2, cycle 3 of #1986).
+  # When BOTH reads were a domain-level rejection the loop never set `target`, and the old
+  # `${target:-gui/$(id -u)}` fallback printed state 1 — the state that authorises `enable`+`bootstrap` —
+  # for a read that established nothing about the job, in the very domain it had just rejected. That
+  # contradicted the ⛔ note above ("does NOT count as a place to load into") and T2's polarity. With no
+  # accepted domain the only safe answer is UNKNOWN, whose whole consequence is a `kickstart`.
+  [ -n "$target" ] || { printf '2 -\n'; return 0; }
+  printf '1 %s\n' "$target"
 }
 # RESTART_VERB — the one platform verb this pass issued, for the caller's failure line. A bare
 # `RESTART-FAILED rc=1` cannot be acted on: `enable`, `bootstrap`, `kickstart` and the cell supervisor
@@ -411,7 +435,14 @@ restart_stack() {
   fi
   case "$(uname -s 2>/dev/null)" in
     Darwin)
-      if ! command -v launchctl >/dev/null 2>&1; then rc=127
+      if ! command -v launchctl >/dev/null 2>&1; then
+        # ⛔ A REFUSAL, NOT A FAILED VERB (review P2, cycle 3 of #1986): no `launchctl` on this box's
+        # PATH means NOTHING WAS ISSUED, so `main` must not report `RESTART-FAILED … verb=unknown` — the
+        # sixth arm of this function, and the same invariant the plist and cell arms were fixed for.
+        # §8b(k) covers it (uname shim = Darwin, no launchctl anywhere on the fixture PATH).
+        rc=127
+        RESTART_REFUSED=1
+        log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=no launchctl on this box's PATH — nothing was issued (this is the macOS arm, so the job cannot be recovered from here)"
       else
         # ⛔ A PINNED BINARY THAT IS NOT THE ONE ON PATH REFUSES EVERY VERB — INCLUDING THE READS.
         # The Darwin arm is the one place this file executes another program that can MUTATE the box, and
@@ -444,6 +475,32 @@ restart_stack() {
             # still running. `WEDGED` is exactly such a state, and `main` cannot tell them apart at this
             # call site — so this arm asks.
             local live; live="$(controller_pid)"
+            if [ -z "$live" ]; then
+              # ⛔ THE SECOND PROBE, SCOPED TO THE TREE launchd ACTUALLY RUNS (review P1, cycle 3 of
+              # #1986). `controller_pid` scans the LOCK and two PATH-SCOPED argv patterns that name
+              # `$O` and `$SELF_DIR` — and on a shipped box NEITHER is the controller's path (see
+              # `PIN_ROOT` above). So without this the guard is LOCK-ONLY, and the dangerous case is
+              # exactly a controller alive with an ABSENT or STALE lock — the case `orch-loop.sh:1575-1577`
+              # lets a newcomer TAKE OVER. Measured by review: a live controller at the pinned path plus
+              # no lock produced `enable` + `bootstrap` over it.
+              # ⛔ SCOPED, NOT A BLANKET `pgrep -f orch-loop.sh`: on a box that also runs a controller for
+              # another root (or a second checkout), a blanket scan REFUSES FOR EVER and the arm — which
+              # exists to put a REMOVED controller back — never fires. The three roots here are the
+              # deploy path, this file's own tree, and the pin root; a fourth is a follow-up, not a reason
+              # to trade a dead arm for a safe one.
+              # ⛔ OVER-REFUSING WITHIN THOSE ROOTS IS DELIBERATE: a withheld bootstrap costs one retry on
+              # the next pass, while a bootstrap beside a live controller is two controllers on one PR
+              # queue (#1715). `pid_is_controller` still gates each candidate, so a recycled pid or a
+              # look-alike without `orch-loop.sh` in its argv is not evidence of life.
+              local _pat _cand
+              for _pat in "bash ${O}/orch-loop.sh" "bash ${SELF_DIR}/orch-loop.sh" \
+                          "${PIN_ROOT}/[^ ]*/scripts/orchestrator-harness/orch-loop.sh"; do
+                for _cand in $(pgrep -f "$_pat" 2>/dev/null); do
+                  [ "$_cand" = "$$" ] && continue
+                  if pid_is_controller "$_cand"; then live="$_cand"; break 2; fi
+                done
+              done
+            fi
             if [ -n "$live" ]; then
               log_line "verdict=RESTART-REFUSED"$'\t'"pid=$live"$'\t'"note=$LABEL is NOT in any launchd domain, but a controller (pid $live) is ALIVE — NOT bootstrapping: over a job an operator deliberately stopped this reverses that stop, a bootstrapped job that then loses the lock race exits at once so KeepAlive thrashes it, and where that controller's lock is absent or stale the newcomer WOULD take over — a SECOND controller on one PR queue. Nothing was issued; if the box needs this controller replaced, stop it first (the handoff ritual) and the next REMOVED pass will restore it"
               RESTART_REFUSED=1; return 1
@@ -500,6 +557,15 @@ restart_stack() {
       [ -n "$sup" ] || { [ -f "$O/cloud-cell-supervisor.sh" ] && sup="$O/cloud-cell-supervisor.sh"; }
       [ -n "$sup" ] || { [ -f "$SELF_DIR/../cloud-cell-supervisor.sh" ] && sup="$SELF_DIR/../cloud-cell-supervisor.sh"; }
       if [ -n "$sup" ] && [ -f "$sup" ]; then
+        # ⛔ THE SUPERVISOR PIN (review P2, cycle 3 of #1986) — the cell arm's equivalent of
+        # WATCHDOG_LAUNCHCTL_PIN, and for the same measured reason: this branch executes a binary that
+        # starts the box's controller, and its own fallback (`$SELF_DIR/../cloud-cell-supervisor.sh`)
+        # resolves to the REAL supervisor in any checkout. A caller that pins a path gets nothing run
+        # when what would run is not that path.
+        if [ -n "${WATCHDOG_SUPERVISOR_PIN:-}" ] && [ "$sup" != "$WATCHDOG_SUPERVISOR_PIN" ]; then
+          log_line "verdict=RESTART-REFUSED"$'\t'"note=WATCHDOG_SUPERVISOR_PIN=${WATCHDOG_SUPERVISOR_PIN} but the supervisor resolves to ${sup} — NO supervisor verb was issued; whatever would have answered is not the binary this caller pinned"
+          RESTART_REFUSED=1; return 1
+        fi
         # ⛔ PIN `ORCH_FOREGROUND=0` (review P2, #2402). A watchdog that itself runs INSIDE a service-managed
         # controller's environment inherits `Environment=ORCH_FOREGROUND=1` from the unit (it is exported into
         # the whole controller tree, and a tmux server started by that controller carries it to every lane

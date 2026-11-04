@@ -619,6 +619,22 @@ OUT="$(AI_MAIN="$R" SRC_REF=main O="$M3" PHASE=A STAGE="$TMP/stage7" bash "$MACD
 ck "a real PHASE=A run CREATES the missing \$O (it used to die on its own cp)" "$([ -d "$M3" ] && echo 0 || echo 1)"
 ck "…and it lands claims.sh there" "$([ -f "$M3/claims.sh" ] && echo 0 || echo 1)"
 ck "…and writes NO record (a phase-A tree is not a complete deploy)" "$([ -e "$M3/.harness-provenance" ] && echo 1 || echo 0)"
+# ⛔ THE OTHER HALF OF THE ARCHIVE GUARD: A REF THAT **HAS** `scripts/lib/lane-ceiling.sh` MUST GET IT
+# (review P2, cycle 3 of #1986). Every fixture above ships no `scripts/lib/`, so together they prove only
+# the ABSENT-library polarity — deleting the guarded block in `deploy-mac-orchestrator.sh` leaves them all
+# green, while phase A then prints "has no scripts/lib/lane-ceiling.sh" over a ref that HAS it: a
+# seemingly-good deploy over a lost library. This fixture ships it, and both halves are graded.
+R3="$TMP/repo-lib"; mkdir -p "$R3/scripts/orchestrator-harness" "$R3/scripts/lib"
+cp "$SRC/orch-loop.sh" "$SRC/claims.sh" "$SRC/harness-provenance.sh" "$R3/scripts/orchestrator-harness/"
+printf '#!/usr/bin/env bash\n# lane-ceiling fixture: the real library ships a probe + report\nlc_probe() { :; }\n' > "$R3/scripts/lib/lane-ceiling.sh"
+( cd "$R3" && $G init -q -b main . && $G add -A && $G commit -qm lib ) >/dev/null 2>&1
+M5="$TMP/maclib"
+OUT="$(AI_MAIN="$R3" SRC_REF=main O="$M5" PHASE=A STAGE="$TMP/stage8" bash "$MACDEP" 2>&1)"; RC=$?
+ck "a ref that SHIPS scripts/lib/lane-ceiling.sh deploys cleanly (rc 0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
+ck "…and the library lands in the flat path install.sh probes" "$([ -f "$M5/lib/lane-ceiling.sh" ] && echo 0 || echo 1)"
+ck "…and the run SAYS it staged it" "$(qF "staged $M5/lib/lane-ceiling.sh" "$OUT" && echo 0 || echo 1)"
+ck "…and does NOT claim the ref has no library (the false-provenance shape)" \
+   "$(qF "has no scripts/lib/lane-ceiling.sh" "$OUT" && echo 1 || echo 0)"
 
 echo
 echo "── §5 this suite is REGISTERED as a shard (the ONE list both CI lanes run) ──"

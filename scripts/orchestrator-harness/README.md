@@ -3014,7 +3014,7 @@ lives in the ONE tracked watchdog, `scripts/orchestrator-harness/watchdog-loop.s
 | state, MEASURED with `launchctl print` in **both** `gui/` and `user/` | the ONE verb the loop issues |
 |---|---|
 | loaded (rc 0) | `launchctl kickstart -k <domain>/<label>` — in the DOMAIN the read found it (`gui/` or `user/`; a job loaded from an SSH session lives in `user/`, where a `gui/`-only verb could never reach it) — the wedge cure it always had |
-| **REMOVED** (absent from every domain, **and no controller process alive**) | `launchctl enable` then `launchctl bootstrap <domain> <plist>` — the state `KeepAlive` cannot reach, and the one a routine `-w`/`bootout` flow leaves behind. ⛔ ONLY when the controller is **GONE**: the arm re-probes the recorded pid at the moment of the mutation, because a bootstrap beside a live (`WEDGED`) controller is a SECOND controller on one PR queue |
+| **REMOVED** (absent from every domain, **and no controller process alive**) | `launchctl enable` then `launchctl bootstrap <domain> <plist>` — the state `KeepAlive` cannot reach, and the one a routine `-w`/`bootout` flow leaves behind. ⛔ ONLY when the controller is **GONE**: the arm re-probes the recorded pid at the moment of the mutation, because a bootstrap beside a live (`WEDGED`) controller is a SECOND controller on one PR queue. ⚠ THAT RE-PROBE IS SCOPED AND MUST SEE THE **PIN TREE**: launchd runs `bash __HARNESS__/__ENTRY__` (`launchd.plist.template:24`), which is neither `$O` nor the watchdog's own dir — measured on a live box, `bash /home/cmux/harness/<sha12>/scripts/orchestrator-harness/orch-loop.sh`, while `$O` is the deployed harness dir. So the probe also scans the pin root (`PIN_ROOT`, `$HOME/harness` by default); without that it is lock-only and a controller alive with an absent/stale lock gets bootstrapped over (measured) |
 | **UNREADABLE** ⚠ CORRECTED (`rc 64` `Unrecognized target specifier.`, or any non-zero whose text names neither a missing service nor a missing domain) | `kickstart` only — never a bootstrap, because that action must not re-load a job that may exist |
 | REMOVED **with no plist on disk** | nothing; `verdict=RESTART-UNAVAILABLE` names the label and the path it looked for — ⛔ it does NOT tell the operator to run `install.sh`, which renders the **loop** label only (`com.eldato.orchestrator-loop`), not this file's default **stack** label (`com.eldato.orchestrator-stack`, the box's own supervision job — `orchestrator-bringup.sh:1065-1069`). Following that remedy would load a DIFFERENT job beside the box's model, the duplicate-controller class (#1761) |
 | REMOVED **while a controller process is alive** | nothing; `verdict=RESTART-REFUSED` names the live pid and says why (this is the `WEDGED` shape, and it is not a failed restart — no verb ran). The mechanism is the lock, not deference: `orch-loop.sh:1573-1574` makes a newcomer beside a LIVE lock-holder exit at once (so a bootstrapped job is `KeepAlive` thrash), and where that lock is absent or stale the newcomer TAKES OVER — a second controller on one PR queue (#1715) |
@@ -3038,7 +3038,11 @@ names `install.sh` only for the one label `install.sh` renders), REMOVED over a 
 `RESTART-REFUSED`, a failed `enable` → `RESTART-FAILED` naming the verb, a verb failing with `rc 75` →
 `RESTART-FAILED rc=75` (never a refusal), and a pin that does not match the `launchctl` on PATH → nothing
 runs at all), which reddens on the pre-fold script. §8c covers the CELL arm on the same terms: a box with
-no `cloud-cell-supervisor.sh` reports `RESTART-UNAVAILABLE` and is never restated as a failed verb.
+no `cloud-cell-supervisor.sh` reports `RESTART-UNAVAILABLE` and is never restated as a failed verb. The
+third review cycle added four more: §8b(k) the macOS arm with no `launchctl` at all, §8b(l) a live
+controller at the **pinned** path with no lock (the bypass the lock-only re-probe allowed), §8b(m) the
+cell supervisor's own pin (`WATCHDOG_SUPERVISOR_PIN`), and §8b(n) a cross-file pin that the label literal
+in the remedy still equals `install.sh`'s rendered label.
 
 ### 6.5.7 The cell's own roles run on a schedule, not when someone looks
 

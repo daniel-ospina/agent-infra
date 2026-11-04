@@ -458,6 +458,7 @@ removed_pass() { # <pass-output-file>
   fi
   env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
       WATCHDOG_PLIST="$C/stack.plist" WATCHDOG_LAUNCHCTL_PIN="$C/bin/launchctl" SETTLE=0 \
+      WATCHDOG_PIN_DIR="$C/no-pin" \
       LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$1" 2>&1
 }
 # (a) ABSENT from both domains → enable + bootstrap from the plist, and NEVER a kickstart.
@@ -524,6 +525,7 @@ if ! darwin_stub_ok; then
 else
   env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
       WATCHDOG_PLIST="$C/stack.plist" WATCHDOG_LAUNCHCTL_PIN="$C/pinned-stub-that-is-not-there" SETTLE=0 \
+      WATCHDOG_PIN_DIR="$C/no-pin" \
       LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
   assert_contains "$(cat "$C/state/l" 2>/dev/null)" "verdict=RESTART-REFUSED" "a mismatched WATCHDOG_LAUNCHCTL_PIN REFUSES instead of running the verb"
   assert_contains "$(grep -m1 RESTART-REFUSED "$C/state/l" 2>/dev/null)" "NO launchctl verb was issued" "…and says so in the line itself"
@@ -620,7 +622,7 @@ if ! darwin_stub_ok; then
 else
   env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
       LABEL=com.eldato.orchestrator-loop WATCHDOG_PLIST="$C/loop.plist" \
-      WATCHDOG_LAUNCHCTL_PIN="$C/bin/launchctl" SETTLE=0 \
+      WATCHDOG_LAUNCHCTL_PIN="$C/bin/launchctl" SETTLE=0 WATCHDOG_PIN_DIR="$C/no-pin" \
       LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
   assert_contains "$(cat "$C/state/l" 2>/dev/null)" "renders THIS label (com.eldato.orchestrator-loop)" "for the loop label the remedy NAMES install.sh as the correct provisioning verb"
   assert_absent "$(cat "$C/state/l" 2>/dev/null)" "does not repair this label" "…and never says it does not repair the label it does render"
@@ -640,11 +642,90 @@ if [ ! -x "$C/bin/uname" ]; then
   bad "8c: the uname shim could not be staged — the cell arm was NOT entered on an unknown host"
 else
   env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
-      SUPERVISOR="$C/no-such-supervisor.sh" SETTLE=0 PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
+      SUPERVISOR="$C/no-such-supervisor.sh" SETTLE=0 WATCHDOG_PIN_DIR="$C/no-pin" PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
   assert_contains "$(cat "$C/pass.out")" "RESTART-UNAVAILABLE" "a cell with no supervisor reports RESTART-UNAVAILABLE"
   assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…and nothing was executed, so nothing is reported as a FAILED verb"
   assert_absent "$(cat "$C/state/l" 2>/dev/null)" "verb=unknown" "…nor does the log claim an unnamed verb ran"
 fi
+
+# (k) DARWIN WITH NO `launchctl` REPORTS A REFUSAL, NOT A FAILED VERB (review P2, cycle 3 of #1986).
+#     The sixth arm of `restart_stack`: `command -v launchctl` fails, nothing is executed — so `main` must
+#     not follow it with `RESTART-FAILED … verb=unknown`. ⛔ SKIPPED HONESTLY WHERE THE ARM IS UNREACHABLE:
+#     on macOS `/bin/launchctl` exists, so this case cannot enter the branch there; it says so instead of
+#     passing vacuously.
+echo "── 8b(k). no launchctl on PATH: RESTART-UNAVAILABLE, never a failed verb"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mkdir -p "$C/bin" 2>/dev/null
+printf '#!/bin/sh\nif [ "$1" = -s ]; then echo Darwin; exit 0; fi\nexec /usr/bin/uname "$@"\n' > "$C/bin/uname" 2>/dev/null
+chmod +x "$C/bin/uname" 2>/dev/null
+if PATH="$C/bin:/usr/bin:/bin" command -v launchctl >/dev/null 2>&1; then
+  ok "8b(k) SKIPPED — this host has launchctl on a PATH the case cannot strip (macOS); the arm is covered on Linux"
+else
+  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+      WATCHDOG_PLIST="$C/stack.plist" SETTLE=0 WATCHDOG_PIN_DIR="$C/no-pin" \
+      PATH="$C/bin:/usr/bin:/bin" bash "$WD" >"$C/pass.out" 2>&1
+  assert_contains "$(cat "$C/pass.out")" "RESTART-UNAVAILABLE" "with no launchctl the pass reports RESTART-UNAVAILABLE"
+  assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…and nothing was executed, so nothing is reported as a FAILED verb"
+  assert_absent "$(cat "$C/state/l" 2>/dev/null)" "verb=unknown" "…nor does the log claim an unnamed verb ran"
+fi
+
+# (l) A LIVE CONTROLLER AT THE **PINNED** PATH IS SEEN — AND NEVER BOOTSTRAPPED OVER (review P1, cycle 3
+#     of #1986). `controller_pid`'s patterns name `$O` and `$SELF_DIR`; on a shipped Mac launchd runs
+#     `bash __HARNESS__/__ENTRY__`, i.e. the PIN tree (launchd.plist.template:24) — so with no live lock the
+#     old guard saw nothing and bootstrapped a second controller over the running one. ⛔ THE FIXTURE IS
+#     EXACTLY THAT SHAPE: a controller whose argv is the pinned path, and NO lock at all.
+echo "── 8b(l). a live controller at the PINNED path with NO lock is REFUSED, not bootstrapped over"
+newcase; hb_stale; : > "$C/stack.plist"
+mkdir -p "$C/pin/abc123def456/scripts/orchestrator-harness" 2>/dev/null
+printf 'sleep 300\n' > "$C/pin/abc123def456/scripts/orchestrator-harness/orch-loop.sh" 2>/dev/null
+if [ ! -f "$C/pin/abc123def456/scripts/orchestrator-harness/orch-loop.sh" ]; then
+  bad "8b(l): the pinned-path fixture could not be staged — case NOT run"
+else
+  bash "$C/pin/abc123def456/scripts/orchestrator-harness/orch-loop.sh" >/dev/null 2>&1 &
+  PPID_FIX=$!; printf '%s\n' "$PPID_FIX" >> "$WORK/pids"
+  mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+  : > "$C/launchctl.calls"
+  if ! darwin_stub_ok; then
+    bad "8b(l): the launchctl/uname shim is NOT in place — the Darwin arm was NOT entered"
+  else
+    env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+        WATCHDOG_PLIST="$C/stack.plist" WATCHDOG_LAUNCHCTL_PIN="$C/bin/launchctl" SETTLE=0 \
+        WATCHDOG_PIN_DIR="$C/pin" LAUNCHCTL_CALLS="$C/launchctl.calls" \
+        PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
+    assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "a controller alive at the PINNED path is never bootstrapped over"
+    assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "enable" "…nor enabled"
+    assert_contains "$(grep -m1 RESTART-REFUSED "$C/state/l" 2>/dev/null)" "pid=$PPID_FIX" "…and the refusal NAMES the live pinned-path pid it saw"
+    assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…and it is a refusal, not a failed verb"
+  fi
+fi
+
+# (m) THE CELL SUPERVISOR IS PINNED TOO (review P2, cycle 3 of #1986). The cell arm executes a binary that
+#     starts the box's controller, and its own fallback resolves the REAL `cloud-cell-supervisor.sh` in any
+#     checkout — so a caller that pins a path must get nothing run when what would run is not that path.
+echo "── 8b(m). a supervisor that is not the pinned one is REFUSED, and never executed"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+printf '#!/bin/sh\nprintf "supervisor-start\\n" >> "%s"\n' "$C/sup.calls" > "$C/sup-stub.sh"; chmod +x "$C/sup-stub.sh"
+mkdir -p "$C/bin" 2>/dev/null
+printf '#!/bin/sh\nif [ "$1" = -s ]; then echo Linux; exit 0; fi\nexec /usr/bin/uname "$@"\n' > "$C/bin/uname" 2>/dev/null
+chmod +x "$C/bin/uname" 2>/dev/null
+if [ ! -x "$C/bin/uname" ]; then
+  bad "8b(m): the uname shim could not be staged — the cell arm was NOT entered"
+else
+  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+      SUPERVISOR="$C/sup-stub.sh" WATCHDOG_SUPERVISOR_PIN="$C/a-different-supervisor.sh" SETTLE=0 \
+      WATCHDOG_PIN_DIR="$C/no-pin" PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
+  assert_eq "$([ -f "$C/sup.calls" ] && cat "$C/sup.calls" | wc -l | tr -d ' ' || echo 0)" "0" "a supervisor that is not the pinned one is NEVER executed"
+  assert_contains "$(grep -m1 RESTART-REFUSED "$C/state/l" 2>/dev/null)" "WATCHDOG_SUPERVISOR_PIN" "…and the refusal names the pin that did not match"
+  assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…and it is a refusal, not a failed verb"
+fi
+
+# (n) THE LABEL LITERAL IS PINNED TO ITS SOURCE OF TRUTH (review P2, cycle 3 of #1986). `watchdog-loop.sh`'s
+#     label-aware remedy repeats `install.sh`'s rendered label as a literal; without a cross-file pin a
+#     rename makes the remedy false in BOTH directions and nothing reddens.
+echo "── 8b(n). the label literal in the remedy matches install.sh's rendered label"
+INSTALL_LABEL="$(sed -n 's/^LABEL="\([^"]*\)".*/\1/p' "$SELF_DIR/install.sh" 2>/dev/null | head -1)"
+WD_LABEL_LITERAL="$(sed -n 's/.*\[ "\$LABEL" = "\([^"]*\)" \]; then.*/\1/p' "$WD" 2>/dev/null | head -1)"
+assert_eq "${INSTALL_LABEL:-install.sh-has-no-LABEL-line}" "${WD_LABEL_LITERAL:-watchdog-has-no-label-literal}" "install.sh's rendered label and the watchdog's label literal are the same string"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
