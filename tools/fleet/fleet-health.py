@@ -83,6 +83,111 @@ LANES = [
 SUSPECT_AGE = 300      # 5 min
 CHILD_SUSPECT_AGE = 600  # 10 min
 
+# ── the lane census gets a SECOND population to disagree with ─────────────
+# ⛔ A FROZEN ROSTER IS NOT A CENSUS (measured 2026-11-03). `LANES` above is a fixed list of
+# seven session ids. On a box where none of them is present -- a fresh cell, a reboot, a
+# renamed lane -- the table still prints seven rows, each one `pid None / life ?`, and because
+# every row is UNMEASURED rather than FLAGGED nothing lands in `suspects`; with a readable
+# hook store the summary underneath then reads `✅ no suspects`. That is a false PASS from a
+# liveness instrument: a clean result over ZERO measured lanes, while pi processes were
+# demonstrably running on the box. Reproduced with a readable store containing no rostered
+# session: seven unmeasured rows and `✅ no suspects`, no mention of the running processes.
+#
+# The cure is not a bigger roster (a hardcoded list can always fall behind). It is to count a
+# population the roster does not control -- the process table -- and DISAGREE LOUDLY when the
+# two cannot be reconciled. `lanes=<N> pi=<M>` both unmeasured is a fact worth an alarm; it is
+# never a clean scan.
+PI_PS_ARGV = ["ps", "-Ao", "pid=,command="]
+
+
+def pi_process_count():
+    """How many `pi` processes are running on THIS box, or None when unreadable.
+
+    `None` is the abstention and is NOT interchangeable with `0`: a failed `ps` must never
+    manufacture the "no processes, so no mismatch" clean result this reconciliation exists to
+    prevent (the same unknown-vs-zero rule the identity probe follows).
+
+    ⛔ EXACT BASENAME, NOT A PREFIX (review cycle 1, finding 4). The matcher was
+    `base == "pi" or base.startswith("pi-")`, which counts every `pi-*` HELPER --
+    `pi-cache-reap`, `pi-reap-orphans.sh`, `pi-task-session-prune.sh` -- as a lane-bearing pi.
+    Measured: `exec -a pi-cache-reap sleep` is counted by the prefix form. That over-count feeds
+    the census a population the fleet does not have, and on a box whose roster is current it
+    fabricates a MISMATCH out of a reaper. The fleet's own binary is exactly `pi` (measured: 18
+    processes, argv0 `pi`), so an exact basename is both correct and narrower.
+
+    ⛔ AN EMPTY TABLE IS AN UNREADABLE READ, NOT A MEASURED ZERO (review cycle 3, finding 3).
+    A `ps` that exits 0 and prints no rows fell through the loop as `0`, which the census maps to
+    its silent arm — the pre-fix false PASS reached through the gate's own input, on any host where
+    `ps` degrades. That is also the contract this repo ALREADY pins one level down:
+    `scripts/lib/pid-identity.sh` `pid_table_nonempty` -- "a read that 'succeeds' but prints no
+    table is not 'no such process' ... an empty table is an UNREADABLE read, never absence"
+    (#1178 C3). The probing process itself must appear in any real table, so zero parsed rows is
+    reported as None here rather than as a second, contradicting ps contract.
+    """
+    try:
+        cp = subprocess.run(PI_PS_ARGV, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if cp.returncode != 0:
+        return None
+    n = 0
+    rows = 0
+    for line in cp.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            continue
+        rows += 1
+        argv0 = parts[1].split()[0]
+        if os.path.basename(argv0) == "pi":
+            n += 1
+    if rows == 0:
+        return None      # empty table = unreadable, never "zero pi processes"
+    return n
+
+
+def lane_census(alive, dead, pi_count, roster_size):
+    """The census note, or None when every rostered lane carries a CONCLUSIVE verdict.
+
+    ⛔ SILENCE REQUIRES A CONCLUSION PER LANE, NOT A RECORD PER LANE (review cycle 2, finding 1).
+    The previous form keyed silence on "the store has a record for some rostered lane", which
+    let a SINGLE pid-less or abstaining record silence a census in which nothing was established
+    while 18 pi processes ran — `✅ no suspects`, exit 0, the original defect one input over.
+
+    * `alive` -- lanes the ONE verdict function positively bound to a live incarnation (`holder`).
+    * `dead` -- lanes POSITIVELY dead (`absent` / `zombie`). An ABSTENTION (unreadable / off-fence)
+      is neither, which is the whole point: an identity read that did not happen must never be
+      counted as an established one.
+    * `pi_count` -- the independent population, or None when unreadable.
+
+    ⛔ SILENT ARMS, EXHAUSTIVELY: `alive + dead >= roster_size` (every lane has a conclusive
+    verdict), or `pi_count <= 0` (nothing is running, so an inconclusive roster cannot mislead).
+    Nothing else is silent.
+
+    ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
+    table cannot be read, returning None would render that state identically to `pi_count == 0`
+    -- "reconciled, nothing running" -- and the summary would print `✅ no suspects` with exit 0.
+    That is the pre-fix false PASS arriving through the new gate's own input, so it gets its own
+    UNRECONCILED note instead.
+    """
+    established = alive + dead
+    if established >= roster_size:
+        # Every rostered lane has a conclusive verdict. An all-`PID DEAD` table is a legitimately
+        # idle fleet, not a stale roster, and must not raise the alarm.
+        return None
+    if pi_count is None:
+        return ("LANE CENSUS UNRECONCILED: only %d of the %d rostered lanes has a conclusive "
+                "verdict (%d alive, %d dead) and the process table could not be read — the scan "
+                "is UNMEASURED, not clean" % (established, roster_size, alive, dead))
+    if pi_count <= 0:
+        # Nothing is running at all: an inconclusive roster cannot mislead about a box with no
+        # processes, so there is nothing to reconcile against.
+        return None
+    return ("LANE CENSUS MISMATCH: %d pi process(es) running but only %d of the %d rostered lanes "
+            "has a conclusive verdict (%d alive, %d dead) — the roster is stale on this box or "
+            "its lanes are unattributable, so every row without a verdict is UNMEASURED "
+            "(not dead, and NOT a clean result)"
+            % (pi_count, established, roster_size, alive, dead))
+
 
 def walk_records(obj, out):
     """Collect every dict that looks like a session record, whatever the hook file's shape."""
@@ -626,6 +731,8 @@ def main():
     print(f"fleet health — {time.strftime('%H:%M:%S', time.localtime(now))}\n")
     print(f"{'lane':4} {'pid':>7} {'life':9} {'q':>2} {'ctx-age':>8} {'cpu-delta':>10}  flag")
     print("-" * 62)
+    attributed = 0
+    dead = 0          # lanes POSITIVELY absent/zombie; every other non-holder is UNESTABLISHED
     for lane, sid in LANES:
         rec = hook.get(sid, {})
         pid = rec.get("pid")
@@ -647,9 +754,12 @@ def main():
         flag = ""
         quiet = ""
         observed = _observed(pid, rec.get("pidStartSeconds")) if pid else None
+        if observed == HOLDER_OBSERVED:
+            attributed += 1      # positively bound to a live incarnation — see lane_census()
         if observed in DEAD_OBSERVED:
             # A positively absent/zombie incarnation: the process is gone, so the
             # transcript ladder has nothing left to add.
+            dead += 1
             flag = "PID DEAD"
         else:
             # An ABSTENTION is NOT a clean bill of health. Name it, and STILL run the
@@ -678,6 +788,23 @@ def main():
 
         age_txt = f"{age:.0f}s" if age is not None else "-"
         print(f"{lane:4} {str(pid):>7} {life[:9]:9} {str(depth):>2} {age_txt:>8} {delta_txt:>10}  {flag}")
+
+    # ── lane census reconciliation (see lane_census) ────────────────────
+    # The roster above is a frozen list; the process table is not. When the roster accounts
+    # for NONE of the running pi processes, the table is not a census and must say so rather
+    # than let the summary below read as a clean scan.
+    # ⛔ NO CENSUS VERDICT WITHOUT A STORE READ (review cycle 2, finding 3). With `hook_ok` False
+    # no lane has a record at all, so the census would report "the roster is stale on this box"
+    # beside "hook store unreadable" — asserting a cause it never established, and pointing an
+    # operator at editing the roster when the STORE READ is the fault. The store failure already
+    # has its own INCOMPLETE path below; the census simply has nothing to say about a roster it
+    # could not read.
+    census_note = (lane_census(attributed, dead, pi_process_count(), len(LANES))
+                   if hook_ok else None)
+    if census_note:
+        print()
+        print(f"⚠️  {census_note}")
+        suspects.append(("census", census_note))
 
     # --- task children -------------------------------------------------
     kids = []
@@ -728,6 +855,17 @@ def main():
         # SUPPRESS a suspect the ladder did find, which is the same defect one level up
         # from where the identity abstention was fixed.
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
+        return 1
+    if census_note:
+        # ⛔ REPORTED, NOT DEGRADED TO A WARNING. Some lanes were PRINTED but did not reach a
+        # conclusive verdict, which is the same INCOMPLETE class as the unreadable store above and
+        # must reach a scheduler the same way (a census that prints rows and exits 0 is exactly
+        # the false PASS this guards).
+        # ⛔ AND IT NAMES THE NUMBER IT ACTUALLY HAS (review cycle 3, finding 2): the line used to
+        # read "0 rostered lanes measured" for EVERY note, including a partial mismatch where 1-6
+        # lanes WERE established — telling an operator the census established nothing when it had.
+        print("⚠️  lane census INCOMPLETE (%d of %d rostered lanes conclusive) — rows without a "
+              "verdict are not a verdict" % (attributed + dead, len(LANES)))
         return 1
     if sched_alarms:
         # A reaper alarm does not make the LANE rows wrong, so it is reported after them — but it
