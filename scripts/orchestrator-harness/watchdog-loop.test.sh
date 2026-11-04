@@ -809,9 +809,24 @@ seed_plist "$C/stack.plist" 'com.eldato.orchestrator-some-other-stack'
 mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
 _i=0
 while [ "$_i" -lt 4 ]; do removed_pass "$C/pass.out"; _i=$(( _i + 1 )); done
-assert_eq "$(cat "$C/state/watchdog.streak" 2>/dev/null || echo 0)" "0" "four refusals leave the streak at 0 (a withheld restart is not a failed one)"
+assert_eq "$(cat "$C/state/controller-watchdog.streak" 2>/dev/null || echo 0)" "0" "four refusals leave the streak at 0 (a withheld restart is not a failed one)"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "STOPPED" "…so the arm is never latched into a STOPPED state by refusals alone"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "restart=1" "…and no refusal pass claims restart=1"
+# (s) THE SHIPPED STACK SHAPE IS ACCEPTED. ⛔ THIS CASE EXISTS BECAUSE THE FIRST PROVENANCE GATE REFUSED IT
+#     (review P1, cycle 5): the gate demanded an entry named `orch-loop.sh`/`launchd-controller.sh`, but
+#     the DEFAULT label's job — `com.eldato.orchestrator-stack` — runs `/bin/bash $O/supervisor.sh`
+#     (`orchestrator-bringup.sh` RESOLVER_SET: "the ProgramArguments of this box's controller job"), so
+#     the arm was INERT on the configuration the box actually ships. Every other fixture seeded
+#     `$C/o/orch-loop.sh`, which is exactly why nothing caught it: a fixture population that only
+#     exercises one entry-point name cannot prove a name-independent gate.
+echo "── 8b(s). the SHIPPED stack plist (/bin/bash \$O/supervisor.sh) is ACCEPTED and bootstrapped"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+seed_plist "$C/stack.plist" 'com.eldato.orchestrator-stack' "$C/o/supervisor.sh"
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-stack" in domain for user gui: 501'
+removed_pass "$C/pass.out"
+CALLS_OUT="$(cat "$C/launchctl.calls" 2>/dev/null)"
+assert_contains "$CALLS_OUT" "bootstrap gui/$(id -u) $C/stack.plist" "the box's OWN stack plist (supervisor.sh, not orch-loop.sh) is bootstrapped"
+assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and the provenance gate does not refuse the shipped configuration"
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"

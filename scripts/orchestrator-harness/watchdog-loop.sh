@@ -429,26 +429,37 @@ plist_program_args() { # <file> → one ProgramArguments entry per line
       m = substr($0, RSTART, RLENGTH); gsub(/<\/?string>/, "", m); print m
     }' "$1" 2>/dev/null
 }
-# Returns 0 when the plist IS this label's controller job; otherwise prints the reason and returns 1.
+# Returns 0 when the plist is NOT this label's job (and prints the reason); returns 1 only when it IS.
+# ⛔ THE CONVENTION IS DELIBERATELY "0 = REFUSE", read as `if plist_not_this_job …; then refuse` — a
+# proof function that returned 0 for "proven bad" would invite the inverse reading at the one call site
+# that mutates, and an inverted reading there bootstraps the FOREIGN plist, which is the exact
+# duplicate-controller class this function exists to stop (#1761/#1715).
 plist_not_this_job() { # <file>
-  local _lbl _prog _e _entry="" _root _seen=""
+  local _lbl _prog _e _found="" _root _seen=""
   _lbl="$(plist_value "$1" Label)"
   [ "$_lbl" = "$LABEL" ] || {
     printf 'its Label is \047%s\047, not \047%s\047' "${_lbl:-<none>}" "$LABEL"; return 0; }
   _prog="$(plist_program_args "$1")"
+  # ⛔ NO BASENAME ALLOWLIST (review P1, cycle 5 of #1986). The first version demanded an entry named
+  # `orch-loop.sh`/`launchd-controller.sh`, and that REFUSED THIS BOX'S OWN JOB: the shipped stack label
+  # `com.eldato.orchestrator-stack` runs `/bin/bash $O/supervisor.sh` (see `RESOLVER_SET` in
+  # `orchestrator-bringup.sh`, "the ProgramArguments of this box's controller job"), while
+  # `com.eldato.orchestrator-loop` runs `orch-loop.sh` and a cell may run `launchd-controller.sh`. An
+  # allowlist of entry-point names therefore made the arm INERT on the default configuration — trading
+  # a dead arm for a safe one, which this arm's own comment forbids. The provenance is the ROOT the
+  # program lives in, not the name it has: a plist for another job is rejected by the `Label` equality
+  # above, so the root test only has to establish THAT THIS IS A PROGRAM OF THIS BOX.
   for _e in $_prog; do
     _seen="$_seen $_e"
-    case "$_e" in */orch-loop.sh|*/launchd-controller.sh) _entry="$_e"; break ;; esac
+    for _root in "$O" "$SELF_DIR" "$PIN_ROOT"; do
+      [ -n "$_root" ] || continue
+      case "$_e" in "$_root"/*) _found="$_e"; break ;; esac
+    done
+    [ -n "$_found" ] && break
   done
-  [ -n "$_entry" ] || {
-    printf 'its ProgramArguments name no controller entry (orch-loop.sh/launchd-controller.sh):%s' "${_seen:- <empty>}"
-    return 0; }
-  for _root in "$O" "$SELF_DIR" "$PIN_ROOT"; do
-    [ -n "$_root" ] || continue
-    case "$_entry" in "$_root"/*) return 1 ;; esac
-  done
-  printf 'its controller program is \047%s\047, which is under none of this box\047s roots (%s, %s, %s)' \
-    "$_entry" "$O" "$SELF_DIR" "$PIN_ROOT"
+  [ -n "$_found" ] && return 1
+  printf 'none of its ProgramArguments are a program under this box\047s roots (%s, %s, %s) — it runs:%s' \
+    "$O" "$SELF_DIR" "$PIN_ROOT" "${_seen:- <empty>}"
   return 0
 }
 
