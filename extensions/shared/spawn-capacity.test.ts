@@ -19,7 +19,7 @@ import {
   SPAWN_ATTEMPT_CAP,
   SPAWN_UNSPAWNABLE_TOKEN,
   type SpawnAttempt,
-} from "./spawn-capacity.js";
+} from "./spawn-capacity.ts";
 import { ok, equal } from "node:assert/strict";
 
 let passed = 0, failed = 0;

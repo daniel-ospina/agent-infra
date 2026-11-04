@@ -5,7 +5,7 @@
  * Run: npx tsx extensions/loop-enforcer/manifest.test.ts
  */
 
-import { readManifest, writeManifest, abortLoop, abortAllLoops, buildEndSummary, pauseLoop, blockLoop, resumeLoop, Manifest } from "./manifest.js";
+import { readManifest, writeManifest, abortLoop, abortAllLoops, buildEndSummary, pauseLoop, blockLoop, resumeLoop, Manifest } from "./manifest.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";

@@ -41,7 +41,7 @@ import {
   familyLegs,
   legIdentity,
   legIsFamilyMember,
-} from "./provider-failover.js";
+} from "./provider-failover.ts";
 
 import * as fs from "node:fs";
 import * as path from "node:path";

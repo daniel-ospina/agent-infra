@@ -39,8 +39,8 @@ import extension, {
   _setBannerSinkForTests,
   _usageTotalsForTests,
   _resetUsageForTests,
-} from "./provider-exhaustion.js";
-import { readLatchState, setExhausted, clearExhaustion } from "./shared/provider-failover.js";
+} from "./provider-exhaustion.ts";
+import { readLatchState, setExhausted, clearExhaustion } from "./shared/provider-failover.ts";
 
 let passed = 0;
 let failed = 0;

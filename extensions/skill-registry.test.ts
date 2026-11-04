@@ -56,7 +56,7 @@ import hook, {
   projectRoot,
   runSync,
   staleRemedy,
-} from "./skill-registry.js";
+} from "./skill-registry.ts";
 
 const REPO_ROOT = resolve(__dirname, "..");
 const MODULE_SRC = join(REPO_ROOT, "extensions", "skill-registry.ts");

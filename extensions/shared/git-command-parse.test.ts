@@ -30,7 +30,7 @@ import {
   commandSpellings,
   collapseUnquotedWhitespace,
   GH_PR_MERGE_VERB,
-} from "./git-command-parse.js";
+} from "./git-command-parse.ts";
 import { ok, equal } from "node:assert/strict";
 import { resolve as resolvePath } from "node:path";
 import * as os from "node:os";

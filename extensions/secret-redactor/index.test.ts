@@ -370,7 +370,7 @@ async function test(name: string, fn: () => void | Promise<void>): Promise<void>
 }
 
 async function main(): Promise<void> {
-  const { default: secretRedactor, refreshSecrets } = (await import("./index.js")) as {
+  const { default: secretRedactor, refreshSecrets } = (await import("./index.ts")) as {
     default: (pi: unknown) => void;
     refreshSecrets: () => void;
   };

@@ -80,7 +80,7 @@ import {
   vacuityFindings,
   yieldCommentLines,
   type ScanResult,
-} from "./declared-surface.js";
+} from "./declared-surface.ts";
 import {
   ACTIVITY_EDGE_EVENTS,
   CLOCK_RESET_EVENT,
@@ -100,7 +100,7 @@ import {
   childRegisteredEvents,
   isActivityEdge,
   stallScanSpec,
-} from "./heartbeat-progress-edges.js";
+} from "./heartbeat-progress-edges.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -293,7 +293,7 @@ test("the parent derives KNOWN_MARKER_KINDS from the shared MARKER_KINDS", () =>
     "KNOWN_MARKER_KINDS must be derived from MARKER_KINDS, not restated as a literal list",
   );
   ok(
-    parentCode.includes('from "../shared/heartbeat-progress-edges.js"'),
+    parentCode.includes('from "../shared/heartbeat-progress-edges.ts"'),
     "builtin-tools/index.ts must import the shared declaration",
   );
 });

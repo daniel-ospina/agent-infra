@@ -48,7 +48,7 @@
  * with NO `npm ci`.
  */
 
-import { collectFiles, type ScanSpec, type StallTerm, type Exemption, type ProgressDriver } from "./declared-surface.js";
+import { collectFiles, type ScanSpec, type StallTerm, type Exemption, type ProgressDriver } from "./declared-surface.ts";
 import * as path from "node:path";
 
 // ── the progress-edge classification ────────────────────────────────────────

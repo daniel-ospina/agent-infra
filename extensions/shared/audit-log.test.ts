@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/shared/audit-log.test.ts
  */
 
-import { appendJsonl, gateEventsFile } from "./audit-log.js";
+import { appendJsonl, gateEventsFile } from "./audit-log.ts";
 import { ok, equal } from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";

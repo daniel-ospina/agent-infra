@@ -14,7 +14,7 @@ import { homedir } from "node:os";
 export const LOOPS_DIR = join(homedir(), ".pi", "agent", "loops");
 
 // ── Types ──────────────────────────────────────────────────────────
-import type { Indicator } from "./goal.js";
+import type { Indicator } from "./goal.ts";
 
 interface CycleEntry {
   number: number;

@@ -19,7 +19,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { McpOAuthClientProvider } from "./index.js";
+import { McpOAuthClientProvider } from "./index.ts";
 
 let passed = 0;
 let failed = 0;

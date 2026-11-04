@@ -19,7 +19,7 @@
  * Run: npx tsx extensions/subagent/provider-fallback.test.ts
  */
 
-import ext, { qualifyBareModel } from "./index.js";
+import ext, { qualifyBareModel } from "./index.ts";
 import { ok, equal } from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";

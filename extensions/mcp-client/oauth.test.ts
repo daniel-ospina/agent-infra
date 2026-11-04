@@ -22,7 +22,7 @@ import {
   McpServerManager,
   classifyServers,
   buildMcpServerEnv,
-} from "./index.js";
+} from "./index.ts";
 
 let passed = 0;
 let failed = 0;

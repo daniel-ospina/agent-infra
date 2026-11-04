@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { resolveMcpJsonPath, expandEnvVars, buildMcpServerEnv } from "./index.js";
+import { resolveMcpJsonPath, expandEnvVars, buildMcpServerEnv } from "./index.ts";
 
 let passed = 0;
 let failed = 0;

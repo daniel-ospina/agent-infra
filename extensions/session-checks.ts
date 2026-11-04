@@ -50,7 +50,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { isPrintMode } from "./shared/print-mode.js";
+import { isPrintMode } from "./shared/print-mode.ts";
 
 export const HUB_H_DEFAULT = 6;
 export const ORACLE_H_DEFAULT = 24;

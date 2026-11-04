@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/loop-enforcer/session-affinity.test.ts
  */
 
-import { shouldResumeLoop, readSessionContext } from "./index.js";
+import { shouldResumeLoop, readSessionContext } from "./index.ts";
 import { writeFileSync, mkdirSync, rmSync, existsSync, readFileSync, copyFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";

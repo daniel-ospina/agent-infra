@@ -28,7 +28,7 @@ import compactionWatchdog, {
   _setCompactionWatchdogHooksForTest,
   _resetCompactionWatchdogLatchesForTest,
   type CompactionWatchdogHooks,
-} from "./compaction-watchdog.js";
+} from "./compaction-watchdog.ts";
 
 // ── Manual test harness (reflect-hook / session-checks style) ───────────────
 let passed = 0;

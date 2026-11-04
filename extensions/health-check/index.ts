@@ -7,10 +7,10 @@
  * marked as loaded (they were loaded by pi successfully).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { register, getReport, registerExternal } from "../shared/health.js";
+import { register, getReport, registerExternal } from "../shared/health.ts";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode } from "../shared/print-mode.ts";
 
 const EXTENSIONS_DIR = join(import.meta.dirname || __dirname, "..");
 

@@ -13,7 +13,7 @@
 // Import discipline: `import type` ONLY from ./index.js. index.ts:2 value-imports
 // the pi SDK, so a value import would break the zero-dep `verify` CI job.
 
-import type { DiffScope } from "./index.js";
+import type { DiffScope } from "./index.ts";
 import { execFileSync } from "node:child_process";
 
 // ── Vocabulary ───────────────────────────────────────

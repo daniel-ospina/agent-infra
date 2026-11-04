@@ -50,12 +50,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { isPrintMode } from "./shared/print-mode.js";
-import { execFileAsync, type ExecFn } from "./session-checks.js";
+import { isPrintMode } from "./shared/print-mode.ts";
+import { execFileAsync, type ExecFn } from "./session-checks.ts";
 // #1245: the #203 lossless-recovery primitive, shared (never duplicated — a
 // second copy of the tree-byte-identity gate would drift). Flat→flat sibling
 // imports resolve under pi's jiti exactly like ./session-checks.js above.
-import { tryLosslessRecover } from "./auto-sync.js";
+import { tryLosslessRecover } from "./auto-sync.ts";
 
 // ── Knobs ───────────────────────────────────────────────────────────────
 

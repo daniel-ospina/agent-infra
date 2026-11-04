@@ -40,8 +40,8 @@ import {
   _setLaneContractForTest,
   _resetLaneContractForTest,
   type LaneContract,
-} from "./headless-lane.js";
-import hook, { _setSkillReadsFileForTest } from "../skill-enforcer.js";
+} from "./headless-lane.ts";
+import hook, { _setSkillReadsFileForTest } from "../skill-enforcer.ts";
 
 const HERE = resolve(import.meta.dirname);
 
@@ -668,7 +668,7 @@ async function main() {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, "headless-lane.ts"), SRC.replace(from, to));
       writeFileSync(join(dir, "print-mode.ts"), readFileSync(join(HERE, "print-mode.ts"), "utf8"));
-      return import(pathToFileURL(join(dir, "headless-lane.ts")).href) as Promise<typeof import("./headless-lane.js")>;
+      return import(pathToFileURL(join(dir, "headless-lane.ts")).href) as Promise<typeof import("./headless-lane.ts")>;
     }
 
     /** Run a paired assertion and require it to go RED; report its message verbatim. */

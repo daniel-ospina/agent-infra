@@ -35,7 +35,7 @@ import { existsSync, realpathSync, mkdirSync } from "node:fs";
 import { readFile, writeFile, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode } from "../shared/print-mode.ts";
 
 // ── OAuth config (#595) ────────────────────────────────────────────
 
@@ -415,7 +415,7 @@ interface McpServerConfig {
   // `oauth: true` = auto-discovery with DCR; `oauth: { clientId: "..." }` uses a
   // pre-configured public client. Requires `url` to be set. Tokens are stored in
   // ~/.pi/mcp-tokens/<origin>/ and NEVER written to .mcp.json or env.
-  oauth?: import("./index.js").OAuthConfig;
+  oauth?: import("./index.ts").OAuthConfig;
 }
 
 interface McpJson {

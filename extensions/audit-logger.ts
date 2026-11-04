@@ -5,7 +5,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
-import { isPrintMode } from "./shared/print-mode.js";
+import { isPrintMode } from "./shared/print-mode.ts";
 
 const AUDIT_DIR = `${homedir()}/.pi/agent/audit`;
 const AUDIT_FILE = `${AUDIT_DIR}/audit.jsonl`;

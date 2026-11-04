@@ -41,7 +41,7 @@
 
 import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { appendLedger, auditLedgerFile } from "./provider-failover.js";
+import { appendLedger, auditLedgerFile } from "./provider-failover.ts";
 
 /** JSONL event name for the outcome row. One row per spawn ATTEMPT. */
 export const DISPATCH_RECORD_EVENT = "dispatch-outcome";

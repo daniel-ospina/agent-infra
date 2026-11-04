@@ -19,7 +19,7 @@ import {
   nextLegAfter,
   resolveWithChain,
   unkeyedProviders,
-} from "./provider-failover.js";
+} from "./provider-failover.ts";
 
 let passed = 0;
 let failed = 0;

@@ -61,8 +61,8 @@ import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-codin
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, readdirSync, statSync } from "node:fs";
 import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { isPrintMode } from "./shared/print-mode.js";
-import { register } from "./shared/health.js";
+import { isPrintMode } from "./shared/print-mode.ts";
+import { register } from "./shared/health.ts";
 // #2965 — the lane contract is DERIVED, not demanded. `lane.sh` exports
 // SKILL_ENFORCER_DISABLED=1 for its own lanes; a headless run started any other
 // way (a cloud-cell dispatch, a hand-run `pi -p … --no-session`) got the gates
@@ -71,7 +71,7 @@ import { register } from "./shared/health.js";
 // contract from what the process can observe (print mode + a LINKED worktree),
 // and is consulted by `_isBypassEnv` below. The hub arm is unchanged: headless
 // in the hub checkout derives nothing and stays guarded.
-import { laneContract, applyLaneContract } from "./shared/headless-lane.js";
+import { laneContract, applyLaneContract } from "./shared/headless-lane.ts";
 // #1321/#1330 — the inlined copy of pi's `isToolCallEventType` now has ONE home
 // (shared/tool-call-event.ts) and is pinned against the real export by
 // extensions/verification-gate/tool-call-event-parity.test.ts. It is imported
@@ -79,8 +79,8 @@ import { laneContract, applyLaneContract } from "./shared/headless-lane.js";
 // here precisely so the pin covers every consumer: a private copy in this file
 // would drift under a pi upgrade while the extension kept reporting
 // `✅ Loaded — enforcing N skill gates` with every gate inert (#1330).
-import { isToolCallEventType } from "./shared/tool-call-event.js";
-import { commandSpellings } from "./shared/git-command-parse.js";
+import { isToolCallEventType } from "./shared/tool-call-event.ts";
+import { commandSpellings } from "./shared/git-command-parse.ts";
 
 // ── Real module location ────────────────────────────
 // See the DEPLOYED LAYOUT note at the top of this file. The try/catch keeps a

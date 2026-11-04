@@ -22,7 +22,7 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getPgid, groupExists, isGroupAbsent, killProcessGroup, sweepProcessGroup, listPgid, sweepExecTimeoutMs } from "./process-sweep.js";
+import { getPgid, groupExists, isGroupAbsent, killProcessGroup, sweepProcessGroup, listPgid, sweepExecTimeoutMs } from "./process-sweep.ts";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
 let passed = 0;

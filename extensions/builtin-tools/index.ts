@@ -45,11 +45,11 @@ import { resolve, dirname } from "node:path";
 import * as path from "node:path";
 import { homedir, cpus, freemem } from "node:os";
 import { randomBytes } from "node:crypto";
-import { isPrintMode } from "../shared/print-mode.js";
-import { retry, createCircuitBreaker } from "../shared/retry.js";
-import { register } from "../shared/health.js";
-import { treeKill } from "../shared/tree-kill.js";
-import { getPgid, sweepProcessGroup } from "../shared/process-sweep.js";
+import { isPrintMode } from "../shared/print-mode.ts";
+import { retry, createCircuitBreaker } from "../shared/retry.ts";
+import { register } from "../shared/health.ts";
+import { treeKill } from "../shared/tree-kill.ts";
+import { getPgid, sweepProcessGroup } from "../shared/process-sweep.ts";
 // #476 provider-exhaustion failover — shared latch/chain/signature engine
 // (extensions/shared/provider-failover.ts; NOT an extension).
 import {
@@ -71,15 +71,15 @@ import {
   dispatchUnkeyedSet,
   appendLedger,
   scanStderrForExhaustion,
-} from "../shared/provider-failover.js";
+} from "../shared/provider-failover.ts";
 import type {
   ExhaustionMarker,
   LatchState,
   LegRef,
-} from "../shared/provider-failover.js";
+} from "../shared/provider-failover.ts";
 // #783 Task 2 — repo state for the handoff payload (probed once per dispatch,
 // never from the heartbeat).
-import { asyncRepoState, type RepoState } from "../repo-freshness.js";
+import { asyncRepoState, type RepoState } from "../repo-freshness.ts";
 // #783 Task 1 — durable child session per spawn (fresh id + dir per attempt).
 import {
   assertValidSessionId,
@@ -88,7 +88,7 @@ import {
   mintChildSessionId,
   newChildSession,
   resolveTaskSessionRoot,
-} from "../shared/session-id.js";
+} from "../shared/session-id.ts";
 // #1662 — durable run records for BACKGROUND task dispatch (returns-early
 // path + task_status/task_collect seam). Record I/O + pid liveness only; the
 // heartbeat parsing for status lives here (parseHeartbeatLine) so the import
@@ -111,7 +111,7 @@ import {
   type BoundedLogWriter,
   type TaskRunRecord,
   type TaskRunStatus,
-} from "../shared/task-runs.js";
+} from "../shared/task-runs.ts";
 // #783 Task 4 — durable per-spawn-attempt outcome record. The row CONTRACT and
 // the write+confirm live in shared/dispatch-record.ts; the writer is invoked
 // from doResolve's settle-once gate (see `writeOutcomeRow`).
@@ -125,7 +125,7 @@ import {
   sessionArgFromArgs,
   type DispatchRecordContext,
   type RecordWriteResult,
-} from "../shared/dispatch-record.js";
+} from "../shared/dispatch-record.ts";
 // #1068: the progress-edge classification + marker vocabulary + kill-reason
 // clause set are DECLARED once, in shared/. The parent DERIVES from them instead
 // of restating them, so a new edge or clause cannot be added on one side only.
@@ -133,7 +133,7 @@ import {
   MARKER_KINDS,
   HEARTBEAT_KILL_REASONS,
   type HeartbeatKillReasonName,
-} from "../shared/heartbeat-progress-edges.js";
+} from "../shared/heartbeat-progress-edges.ts";
 export { HEARTBEAT_KILL_REASONS };
 
 // ── Helpers ─────────────────────────────────────────────────────────

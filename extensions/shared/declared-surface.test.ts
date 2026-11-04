@@ -43,7 +43,7 @@ import {
   type ScanResult,
   type ScanSpec,
   type StallTerm,
-} from "./declared-surface.js";
+} from "./declared-surface.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "../..");

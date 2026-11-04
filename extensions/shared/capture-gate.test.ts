@@ -23,7 +23,7 @@ import {
   resolveMainRepoRoot,
   resolveProjectCaptureScope,
   resolveProjectRoot,
-} from "./capture-gate.js";
+} from "./capture-gate.ts";
 
 const dirs: string[] = [];
 function tmpProject(label: string, config?: Record<string, unknown>): string {

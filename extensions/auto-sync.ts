@@ -23,7 +23,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, lstatSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { execSync, execFileSync } from "node:child_process";
-import { isPrintMode } from "./shared/print-mode.js";
+import { isPrintMode } from "./shared/print-mode.ts";
 import { repoKey, acquireRepoLock, releaseRepoLock } from "./shared/branch-ownership.mjs";
 
 export function shortHead(repo: string, ref = "HEAD"): string {

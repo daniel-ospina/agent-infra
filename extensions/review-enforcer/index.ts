@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync, execFileSync } from "child_process";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode } from "../shared/print-mode.ts";
 // #966: the command parsers are ONE copy shared with verification-gate, in
 // extensions/shared/. This file used to define its own extractPrNumber /
 // extractRepoFlag / extractGhRepoEnv / parseCdChains / expandCdTarget /
@@ -18,13 +18,13 @@ import {
   parseCdChains,
   unquotedMask,
   type CdChainInfo,
-} from "../shared/git-command-parse.js";
+} from "../shared/git-command-parse.ts";
 import * as fs from "fs";
 import * as os from "os";
 import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
-import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
-import { redactCommand } from "../shared/redact-command.js";
+import { appendJsonl, type GateEventName } from "../shared/audit-log.ts";
+import { redactCommand } from "../shared/redact-command.ts";
 import {
   attemptClass,
   classifySpawnOutcome,
@@ -34,7 +34,7 @@ import {
   spawnFaultLabel,
   SPAWN_UNSPAWNABLE_TOKEN,
   type SpawnAttempt,
-} from "../shared/spawn-capacity.js";
+} from "../shared/spawn-capacity.ts";
 // #2148 — the reviewer requirement disclosed UP FRONT. The ≥1-dispatch rule and the merge-registry
 // gate were both correct and both spoke only at the finish line, so a lane did the whole job (rebase,
 // implement, test, push, PR) and was then refused. This module holds the disclosure's ONE wording
@@ -44,8 +44,8 @@ import {
   reviewerPreflightMessage,
   reviewerFirstPushNotice,
   REVIEWER_PREFLIGHT_RECORD_CMD,
-} from "../shared/reviewer-preflight.js";
-import type { ReviewerRole } from "../shared/reviewer-preflight.js";
+} from "../shared/reviewer-preflight.ts";
+import type { ReviewerRole } from "../shared/reviewer-preflight.ts";
 // Re-exported public surface (tests and external consumers import from
 // ./index.js) — the DEFINITION lives only in shared/.
 export {

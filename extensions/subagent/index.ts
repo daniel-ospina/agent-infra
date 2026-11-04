@@ -18,16 +18,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 // #36: shared sub-agent PATH augmentation (python3 resolution for MCP servers)
-import { getSubAgentPath, DEFAULT_TOOL_STALL_MS, resolveProviderModel } from "../builtin-tools/index.js";
+import { getSubAgentPath, DEFAULT_TOOL_STALL_MS, resolveProviderModel } from "../builtin-tools/index.ts";
 
 // #208: local constants (the builtin-tools equivalents live on the builtin
 // task tool; the ext keeps its own copies so it stays self-contained).
 const DEFAULT_BACKSTOP_MARGIN_MS = 1_800_000; // 30 min over tool-stall
 const DEFAULT_EXIT_SETTLE_GRACE_MS = 2_000; // exit-settle grace (2s)
 // #137: recursive process-tree kill for abort/timeout (orphan MCP reaping)
-import { treeKill } from "../shared/tree-kill.js";
+import { treeKill } from "../shared/tree-kill.ts";
 // #208: shared pgid-anchored process-group sweep (settle-path orphan reaping)
-import { getPgid, sweepProcessGroup } from "../shared/process-sweep.js";
+import { getPgid, sweepProcessGroup } from "../shared/process-sweep.ts";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";

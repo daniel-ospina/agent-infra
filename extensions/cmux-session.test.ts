@@ -23,7 +23,7 @@
 import { ok, equal } from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import cmuxPiSessionExtension from "./cmux-session.js";
+import cmuxPiSessionExtension from "./cmux-session.ts";
 
 /**
  * The snapshot's marker version. cmux upgrades the live file

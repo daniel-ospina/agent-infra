@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { machineIdFrom } from "./shared/capture-attribution.js";
+import { machineIdFrom } from "./shared/capture-attribution.ts";
 
 // ── Setup: temp fallback dir + dynamic reflect-hook import ──────────────────
 const FALLBACK_DIR = mkdtempSync(join(tmpdir(), "reflect-hook-test-"));
@@ -29,7 +29,7 @@ process.env.TORTOISE_FALLBACK_DIR = FALLBACK_DIR;
 
 // Dynamic require (not static ESM import) ensures env is set before module body runs
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const reflectMod = require("./reflect-hook.js");
+const reflectMod = require("./reflect-hook.ts");
 const reflectHook = reflectMod.default;
 const {
   buildQuitPayload,
@@ -40,7 +40,7 @@ const {
 const {
   resolveCaptureGate,
   captureStatusLine,
-} = require("./shared/capture-gate.js");
+} = require("./shared/capture-gate.ts");
 
 // ── Manual test harness ─────────────────────────────────────────────────────
 let passed = 0;

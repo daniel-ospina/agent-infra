@@ -14,9 +14,9 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 // Import functions under test
-import { buildGoalSpec, populateGoalFields, decomposeGoal, GOALS_UNVERIFIED_FLAG } from "./goal.js";
-import { writeManifest, readManifest } from "./manifest.js";
-import { shouldResumeLoop, readSessionContext } from "./index.js";
+import { buildGoalSpec, populateGoalFields, decomposeGoal, GOALS_UNVERIFIED_FLAG } from "./goal.ts";
+import { writeManifest, readManifest } from "./manifest.ts";
+import { shouldResumeLoop, readSessionContext } from "./index.ts";
 
 let passed = 0;
 let failed = 0;

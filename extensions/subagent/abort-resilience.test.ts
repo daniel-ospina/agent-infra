@@ -12,8 +12,8 @@
  * Run: npx tsx extensions/subagent/abort-resilience.test.ts
  */
 
-import { runSingleAgent, type SingleResult } from "./index.js";
-import type { AgentConfig } from "./agents.js";
+import { runSingleAgent, type SingleResult } from "./index.ts";
+import type { AgentConfig } from "./agents.ts";
 import { ok, notEqual } from "node:assert/strict";
 
 // #496: real-pi suite — provider-fallback kill-switch ON (see

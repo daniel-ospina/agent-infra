@@ -27,7 +27,7 @@ import {
   spawnSubAgent,
   ABNORMAL_EXIT_DETAIL_KEYS,
   DEFAULT_HARD_CAP_MS,
-} from "./index.js";
+} from "./index.ts";
 import { spawn, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";

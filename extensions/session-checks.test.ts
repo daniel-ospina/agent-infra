@@ -24,8 +24,8 @@ import {
   POLL_MIN_MAX,
   type ExecFn,
   type ExecResult,
-} from "./session-checks.js";
-import sessionChecksHook from "./session-checks.js"; // default export = pi registration fn
+} from "./session-checks.ts";
+import sessionChecksHook from "./session-checks.ts"; // default export = pi registration fn
 
 let passed = 0;
 let failed = 0;

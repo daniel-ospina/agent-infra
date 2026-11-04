@@ -185,7 +185,7 @@ async function verdictFor(reply: string, promptKind: "standard" | "nonstandard" 
 
 async function main() {
   // Load the plugin AFTER HOME + mode are set (BRIDGE_DIR is computed at module load).
-  const mod = await import("./index.js");
+  const mod = await import("./index.ts");
   (mod as any).default(fakePi);
 
   console.log("\n(a) every rendered verdict line clears the gate — in `pi -p` / task-child mode:");

@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { McpServerManager } from "./index.js";
+import { McpServerManager } from "./index.ts";
 
 let passed = 0;
 let failed = 0;

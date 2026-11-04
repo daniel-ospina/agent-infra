@@ -172,7 +172,7 @@ function section(name: string) {
 
 async function main() {
   // Load the plugin AFTER HOME is set (BRIDGE_DIR is computed at module load)
-  const mod = await import("./index.js");
+  const mod = await import("./index.ts");
   const plugin = (mod as any).default as (pi: any) => void;
   plugin(fakePi);
 
@@ -1031,7 +1031,7 @@ async function main() {
     const home = join(TEST_ROOT, "lock-home");
     const verDir = join(home, ".pi", "agent", "verification");
     mkdirSync(verDir, { recursive: true });
-    const modUrl = new URL("./index.js", import.meta.url).href;
+    const modUrl = new URL("./index.ts", import.meta.url).href;
     const script = join(home, "probe.mjs");
     writeFileSync(
       script,
@@ -1156,7 +1156,7 @@ async function main() {
       }),
     );
     await fire("session_start", {});
-    const m = await import("./index.js");
+    const m = await import("./index.ts");
     ok(
       (m as any).bridgeRoots().includes(realM),
       `malformed shapes must not abort recovery or hide valid roots; got ${JSON.stringify((m as any).bridgeRoots())}`,

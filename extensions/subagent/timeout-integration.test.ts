@@ -32,8 +32,8 @@
 // provider-fallback.test.ts instead.
 process.env.SUBAGENT_FALLBACK_DISABLE = "1";
 
-import { runSingleAgent, isFailedResult, type SingleResult } from "./index.js";
-import type { AgentConfig } from "./agents.js";
+import { runSingleAgent, isFailedResult, type SingleResult } from "./index.ts";
+import type { AgentConfig } from "./agents.ts";
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";

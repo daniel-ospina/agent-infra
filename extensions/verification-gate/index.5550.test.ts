@@ -40,7 +40,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync, chmodSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolvePushRangeScope } from "./index.js";
+import { resolvePushRangeScope } from "./index.ts";
 
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-5550-"));
 // Hermetic git config. The #1491 narrowing now reads `vgate.integrationRef` from

@@ -35,7 +35,7 @@ import {
   bindSession,
   __setBridgeUrl,
   gitRemoteTimeoutMs,
-} from "./index.js";
+} from "./index.ts";
 
 // Resolve project root regardless of cwd — the test may be run from any directory.
 // agent-infra has no AGENTS.md / operations/subjects (moved to swarm, #102), so
@@ -72,7 +72,7 @@ for (const k of [
 }
 
 // Dynamic import for the factory (default export)
-const { default: slackBridge } = await import("./index.js");
+const { default: slackBridge } = await import("./index.ts");
 
 // ── Test helpers ─────────────────────────────────────
 
@@ -631,7 +631,7 @@ try {
   // Bind a session first
   const sessionStart = handlers.get("session_start")![0];
   // Skip UI prompts by forcing session bind directly
-  await import("./index.js").then(m => {
+  await import("./index.ts").then(m => {
     m.__setBridgeUrl(`http://localhost:${mock.port}`);
     return m.bindSession(stubCtx, "test-session", "test-team", "test-role", { skipHealth: true });
   });
@@ -742,7 +742,7 @@ try {
   const teams = parseSubjects(testSubjectsDir);
 
   if (teams.length > 0) {
-    const { selectTeamStdin } = await import("./index.js");
+    const { selectTeamStdin } = await import("./index.ts");
     assert(typeof selectTeamStdin === "function", "selectTeamStdin: exported function");
     assert(selectTeamStdin.length === 1, "selectTeamStdin: accepts 1 arg (teams array)");
     assert(teams.length >= 3, `selectTeamStdin: ${teams.length} teams available`);
@@ -901,7 +901,7 @@ try {
 
 // ── Approval forwarding: enablement config ────────────
 {
-  const { slackApprovalConfig, approvalStatusLine, initApprovalForwarding } = await import("./index.js");
+  const { slackApprovalConfig, approvalStatusLine, initApprovalForwarding } = await import("./index.ts");
   // Slow poll + no approvals file: a started poller must not fire or post.
   process.env.SLACK_APPROVAL_POLL_MS = "60000";
   const noFile = join(tmpDir(), "does-not-exist.json");
@@ -950,7 +950,7 @@ try {
 
 // ── Approval forwarding: message blocks ───────────────
 {
-  const { buildApprovalBlocks } = await import("./index.js");
+  const { buildApprovalBlocks } = await import("./index.ts");
   const blocks = buildApprovalBlocks({
     id: "apr-abc123",
     from_role: "product-implementer",
@@ -974,7 +974,7 @@ try {
 
 // ── Approval forwarding: Slack Web API POST (mock) ────
 {
-  const { slackApiPost, postApprovalRequest, __setSlackApiUrl } = await import("./index.js");
+  const { slackApiPost, postApprovalRequest, __setSlackApiUrl } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   try {
@@ -1016,7 +1016,7 @@ try {
 
 // ── Approval forwarding: approvals.json discovery ─────
 {
-  const { findApprovalsFile } = await import("./index.js");
+  const { findApprovalsFile } = await import("./index.ts");
   const dir = tmpDir();
   try {
     assert(findApprovalsFile(dir) === null, "findApprovalsFile: none → null");
@@ -1047,8 +1047,8 @@ try {
 
 // ── Approval forwarding: per-repo store discovery (#2492) ─────
 {
-  const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile, gitRemoteTimeoutMs } = await import("./index.js");
-  const { loadScaledTimeoutMs, getSystemLoad } = await import("./socket-mode.js");
+  const { repoNameFromUrl, deriveRepoName, approvalsStorePath, findApprovalsFile, gitRemoteTimeoutMs } = await import("./index.ts");
+  const { loadScaledTimeoutMs, getSystemLoad } = await import("./socket-mode.ts");
 
   // gitRemoteTimeoutMs — #196: env-overridable git-lookup cap (default 5s).
   // The 2s default flaked discovery on multi-second `git remote get-url` stalls.
@@ -1202,7 +1202,7 @@ try {
 
 // ── Approval forwarding: scanApprovals end-to-end ─────
 {
-  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   const dir = tmpDir();
@@ -1264,7 +1264,7 @@ try {
 
 // ── Approval conversation loop (#1402) ──
 {
-  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   const dir = tmpDir();
@@ -1354,7 +1354,7 @@ try {
 
 // ── Approval forwarding: resolved-message updates (#150) ──
 {
-  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   const dir = tmpDir();
@@ -1424,7 +1424,7 @@ try {
 
 // ── Approval revision awareness (#157): v2 re-post + supersede (iv) ──
 {
-  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   const dir = tmpDir();
@@ -1483,7 +1483,7 @@ try {
 
 // ── Approval revision cap (#157): revision > 15 → ⛔ escalated, once (v) ──
 {
-  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   const dir = tmpDir();
@@ -1533,7 +1533,7 @@ try {
 
 // ── Legacy approvals without revision: exactly as before (vi) ──
 {
-  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.js");
+  const { scanApprovals, __setSlackApiUrl, __setApprovalStateFile } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   const dir = tmpDir();
@@ -1577,7 +1577,7 @@ try {
 // (vii) gh failure → no escalated_at, retried next sweep.
 // The gh call is mocked via __setGhIssueFileImpl — tests never shell out.
 {
-  const { sweepStaleRedrafts, __setSlackApiUrl, __setApprovalStateFile, __setGhIssueFileImpl, __setCurrentRepoOverride } = await import("./index.js");
+  const { sweepStaleRedrafts, __setSlackApiUrl, __setApprovalStateFile, __setGhIssueFileImpl, __setCurrentRepoOverride } = await import("./index.ts");
   const slack = new MockSlack();
   __setSlackApiUrl(`http://localhost:${slack.port}`);
   const dir = tmpDir();

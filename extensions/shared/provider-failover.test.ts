@@ -41,7 +41,7 @@ import {
   legIsFamilyMember,
   appendLedger,
   auditLedgerFile,
-} from "./provider-failover.js";
+} from "./provider-failover.ts";
 
 import * as fs from "node:fs";
 import * as os from "node:os";

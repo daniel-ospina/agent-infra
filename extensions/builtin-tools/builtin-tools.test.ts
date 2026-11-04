@@ -12,26 +12,26 @@
  * node_modules/typebox. Created by CI setup or manually.
  */
 
-import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress } from "./index.js";
-import { dispatchUnkeyedSet } from "../shared/provider-failover.js";
-import { asyncRepoState } from "../repo-freshness.js";
-import builtinTools from "./index.js";
+import { stripHtml, getPerplexityKey, augmentPath, PATH_EXTRA_DIRS, getPiInvocation, getSubAgentPath, resolveProviderModel, loadModelRegistry, getModelsJsonPath, getExitGraceMs, DEFAULT_EXIT_GRACE_MS, armExitWatchdog, getExitCompleteGraceMs, DEFAULT_EXIT_COMPLETE_GRACE_MS, armCompletionWatchdog, composeTaskResult, getFallbackModel, DEFAULT_FALLBACK_MODEL, connectionErrorDetected, shouldFallback, resolveProviderBaseUrl, HEARTBEAT_MARKER_PREFIX, HEARTBEAT_INTERVAL_MIN_MS, HEARTBEAT_INTERVAL_MAX_MS, DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_STREAM_STALL_MS, DEFAULT_TOOL_STALL_MS, DEFAULT_FIRST_MESSAGE_MS, clampHeartbeatIntervalMs, getHeartbeatIntervalMs, getStreamStallMs, getToolStallMs, getFirstMessageMs, createHeartbeatState, parseHeartbeatLine, flushHeartbeatResidue, flushHeartbeatLineBuf, ingestHeartbeatChunk, heartbeatKillDecision, HEARTBEAT_LINE_BUF_MAX, HEARTBEAT_TRACE_MAX, getTaskMaxDispatchMs, getTaskHardCapMs, DEFAULT_HARD_CAP_MS, loadScaledBound, getFirstOutputTimeoutMs, getSystemLoad, setLoad1Override, getLoad1, getCutGapMs, getEffectiveCutGapMs, getCpuStallMs, DEFAULT_CPU_STALL_MS, DEFAULT_PROGRESS_AGE_MS, getProgressAgeMs, classifyTaskExit, getTaskBackstopMs, DEFAULT_BACKSTOP_MARGIN_MS, DEFAULT_TASK_MODEL, renderRepoStateLine, renderMachineStateLine, countPiProcs, countPiInPsOutput, formatLoad1, probeSystemLoad, resolveTaskCwd, taskCwdRefusal, spawnSubAgent, resolveStreamStallMs, streamStallInertWarning, inFlightProgress } from "./index.ts";
+import { dispatchUnkeyedSet } from "../shared/provider-failover.ts";
+import { asyncRepoState } from "../repo-freshness.ts";
+import builtinTools from "./index.ts";
 
-import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.js";
-import * as childHb from "../task-heartbeat.js";
+import type { HeartbeatState, HeartbeatIngestContext, HeartbeatDecisionInput, CompletionWatchdog, ComposeTaskResultInput } from "./index.ts";
+import * as childHb from "../task-heartbeat.ts";
 // #1068 — the single declaration of the progress-edge classification; read (never
 // restated) by the child↔parent parity assertions below.
-import * as progressEdges from "../shared/heartbeat-progress-edges.js";
+import * as progressEdges from "../shared/heartbeat-progress-edges.ts";
 
 /** tsx/CJS interop: the repo root is "type": "commonjs", so the child module's
  * default factory arrives nested (module.exports.default). Unwrap defensively. */
 const childFactory: (pi: any) => void =
   ((childHb as any).default?.default ?? (childHb as any).default) as (pi: any) => void;
-import type { ModelRegistry } from "./index.js";
+import type { ModelRegistry } from "./index.ts";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn, execSync } from "node:child_process";
-import { treeKill } from "../shared/tree-kill.js";
+import { treeKill } from "../shared/tree-kill.ts";
 import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -50,10 +50,10 @@ import {
   recordVeniceRoute,
   parseTaskUsageLine,
   scanStderrForUsage,
-} from "./index.js";
-import { readLatchState, setExhausted, familyOf, familyLegs } from "../shared/provider-failover.js";
+} from "./index.ts";
+import { readLatchState, setExhausted, familyOf, familyLegs } from "../shared/provider-failover.ts";
 // #1662 — background dispatch + status/collect seam.
-import { startBackgroundTask, evaluateTaskRunStatus, collectTaskRun, getHeartbeatTimeoutMs, formatCollectedRunHead, buildBackgroundDispatchResult } from "./index.js";
+import { startBackgroundTask, evaluateTaskRunStatus, collectTaskRun, getHeartbeatTimeoutMs, formatCollectedRunHead, buildBackgroundDispatchResult } from "./index.ts";
 import {
   mintRunId,
   resolveTaskRunsRoot,
@@ -65,8 +65,8 @@ import {
   pidAlive,
   SETTLE_GRACE_MS,
   DEFAULT_TASK_RUNS_ROOT,
-} from "../shared/task-runs.js";
-import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.js";
+} from "../shared/task-runs.ts";
+import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.ts";
 import { dirname, join, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -5706,7 +5706,7 @@ test("E15b: monotonic high-water-mark latch — a post-storm load drop never re-
 });
 
 testAsync("E16: loop-level wiring — per-tick getLoad1() read + latched bound threaded across ticks", async () => {
-  const mod = await import("./index.js");
+  const mod = await import("./index.ts");
   let latched: number | undefined;
   mod.setLoad1Override(() => 60);
   try {

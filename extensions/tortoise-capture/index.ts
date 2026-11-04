@@ -45,12 +45,12 @@ import {
   stampSessionPayload,
   modelFromContext,
   type SessionAttribution,
-} from "../shared/capture-attribution.js";
+} from "../shared/capture-attribution.ts";
 import {
   asConfigStringField,
   resolveCaptureGate,
   type CaptureGateResult,
-} from "../shared/capture-gate.js";
+} from "../shared/capture-gate.ts";
 
 // ── Config ──────────────────────────────────────────────
 

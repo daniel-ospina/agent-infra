@@ -11,7 +11,7 @@
 // 0 runtime dependencies beyond Node stdlib.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode } from "../shared/print-mode.ts";
 import { request as httpRequest, createServer as httpCreateServer, type Server } from "node:http";
 import { request as httpsRequest } from "node:https";
 import {

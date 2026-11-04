@@ -40,7 +40,7 @@
  */
 import { ok, equal, deepEqual } from "node:assert/strict";
 import * as pi from "@earendil-works/pi-coding-agent";
-import { isToolCallEventType as shared } from "../shared/tool-call-event.js";
+import { isToolCallEventType as shared } from "../shared/tool-call-event.ts";
 
 let passed = 0;
 let failed = 0;

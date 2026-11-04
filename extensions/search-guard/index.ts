@@ -39,7 +39,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { expandCdTarget, parseCdChains, unquotedMask } from "../shared/git-command-parse.js";
+import { expandCdTarget, parseCdChains, unquotedMask } from "../shared/git-command-parse.ts";
 
 /** The binaries whose recursive use can amplify into a tree walk. */
 const WATCHED = new Set(["grep", "find", "rg", "fd"]);

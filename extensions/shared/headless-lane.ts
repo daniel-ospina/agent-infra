@@ -131,7 +131,7 @@
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
-import { isPrintMode } from "./print-mode.js";
+import { isPrintMode } from "./print-mode.ts";
 
 /** Everything the derivation concluded, plus the evidence it concluded it from. */
 export interface LaneContract {

@@ -12,7 +12,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { DiffScope } from "./index.js";
+import type { DiffScope } from "./index.ts";
 import {
   subtractCommitArm,
   subtractPushArm,
@@ -24,7 +24,7 @@ import {
   type SubCtx,
   type RecordedSide,
   type ArmLabel,
-} from "./subtract-scope.js";
+} from "./subtract-scope.ts";
 
 // ── fixtures ─────────────────────────────────────────
 // The fixture is the TDD entry point: it must bind the CURRENT interface, or it

@@ -38,8 +38,8 @@
  * Run: npx tsx extensions/builtin-tools/cut-resume.integration.test.ts
  */
 
-import { spawnSubAgent, sweepRunCount } from "./index.js";
-import { groupExists, listPgid } from "../shared/process-sweep.js";
+import { spawnSubAgent, sweepRunCount } from "./index.ts";
+import { groupExists, listPgid } from "../shared/process-sweep.ts";
 import { spawn, execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";

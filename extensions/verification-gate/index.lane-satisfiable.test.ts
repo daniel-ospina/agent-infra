@@ -299,7 +299,7 @@ test("(a) bridge recovery re-installs the gate's sha256, not the verifier's md5 
 
 // ── direct unit pins (no plugin) ─────────────────────
 test("unit: digestAlgoForRecord classifies md5/sha1/sha256 and rejects everything else", async () => {
-  const mod = await import("./index.js");
+  const mod = await import("./index.ts");
   equal(mod.digestAlgoForRecord(md5("x")), "md5");
   equal(mod.digestAlgoForRecord(sha1("x")), "sha1");
   equal(mod.digestAlgoForRecord(sha256("x")), "sha256");
@@ -312,7 +312,7 @@ test("unit: digestAlgoForRecord classifies md5/sha1/sha256 and rejects everythin
 });
 
 test("unit: splitMutationFromCommit splits at the commit arm, and is null without one", async () => {
-  const mod = await import("./index.js");
+  const mod = await import("./index.ts");
   const split = mod.splitMutationFromCommit(CHAINED);
   equal(split?.mutation, "printf 'x\\n' > a.txt && git add a.txt");
   equal(split?.commit, "git commit -m x");
@@ -377,7 +377,7 @@ test("unit: splitMutationFromCommit splits at the commit arm, and is null withou
 
 // ── runner ────────────────────────────────────────────
 async function main() {
-  const mod = await import("./index.js");
+  const mod = await import("./index.ts");
   ((mod as any).default as (pi: any) => void)(fakePi);
   console.log(`\n#1460/#540 — lane-satisfiable verification gate (${pending.length} tests)`);
   for (const { name, fn } of pending) {

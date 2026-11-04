@@ -42,7 +42,7 @@
  * Consumers import this with an ESM `.js` specifier (repo convention; pi's jiti
  * and tsx both resolve it to this `.ts`):
  *   import { isToolCallEventType } from "./shared/tool-call-event.js";   // flat extension
- *   import { isToolCallEventType } from "../shared/tool-call-event.js";  // dir extension
+ *   import { isToolCallEventType } from "../shared/tool-call-event.ts";  // dir extension
  */
 export function isToolCallEventType(toolName: string, event: unknown): boolean {
   return (event as { toolName?: unknown }).toolName === toolName;

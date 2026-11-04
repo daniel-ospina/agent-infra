@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/shared/retry.test.ts
  */
 
-import { retry, createCircuitBreaker, circuitAllows, circuitRecordSuccess, circuitRecordFailure, CircuitBreaker } from "./retry.js";
+import { retry, createCircuitBreaker, circuitAllows, circuitRecordSuccess, circuitRecordFailure, CircuitBreaker } from "./retry.ts";
 import { ok, equal } from "node:assert/strict";
 
 let passed = 0, failed = 0;

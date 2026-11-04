@@ -36,8 +36,8 @@ import {
 	exhaustionFallbackDoomed,
 	type ProviderFailureClass,
 	type SingleResult,
-} from "./index.js";
-import { augmentPath, getSubAgentPath, getPiInvocation } from "../builtin-tools/index.js";
+} from "./index.ts";
+import { augmentPath, getSubAgentPath, getPiInvocation } from "../builtin-tools/index.ts";
 import { ok, equal } from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";

@@ -189,7 +189,7 @@ async function main() {
   git("add f.txt");
   git("commit -m baseline");
 
-  const mod: any = await import("./index.js");
+  const mod: any = await import("./index.ts");
   mod.default(fakePi);
   await fire("session_start", {}, { cwd: repoDir() });
   const head = git("rev-parse HEAD");

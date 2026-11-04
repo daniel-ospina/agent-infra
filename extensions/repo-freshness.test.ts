@@ -35,10 +35,10 @@ import repoFreshness, {
   freshnessTick,
   DEFAULT_FRESHNESS_INTERVAL_MS,
   MIN_FRESHNESS_INTERVAL_MS,
-} from "./repo-freshness.js";
+} from "./repo-freshness.ts";
 // #1245: the recovery primitive + the guard's disorder reader are read-only
 // imports here — this suite pins that NEITHER is changed for other-repo use.
-import { tryLosslessRecover } from "./auto-sync.js";
+import { tryLosslessRecover } from "./auto-sync.ts";
 import { readHubDisorder } from "./main-worktree-guard/classify-git.mjs";
 
 let passed = 0, failed = 0;

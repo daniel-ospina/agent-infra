@@ -18,7 +18,7 @@
  * Run: npx tsx extensions/loop-enforcer/scheduler-unref.test.ts
  */
 
-import { startScheduler } from "./scheduler.js";
+import { startScheduler } from "./scheduler.ts";
 
 let passed = 0;
 let failed = 0;

@@ -88,8 +88,8 @@ import * as path from "node:path";
 // #385: shared process primitives — flat extensions CAN resolve ./shared/*
 // (verified 2026-08-13). getChildPids/treeKill for the descendant kill,
 // getPgid/listPgid for the pgid catch-net.
-import { getChildPids, treeKill } from "./shared/tree-kill.js";
-import { getPgid, listPgid } from "./shared/process-sweep.js";
+import { getChildPids, treeKill } from "./shared/tree-kill.ts";
+import { getPgid, listPgid } from "./shared/process-sweep.ts";
 // #1068: the progress-edge classification is DECLARED once, in shared/, and
 // consumed here — so the child's clock edges and the parent's parsed-marker
 // classification cannot drift apart silently. Re-exported so the parity test
@@ -99,7 +99,7 @@ import {
   LIFECYCLE_EVENTS,
   CLOCK_RESET_EVENT,
   type ActivityEdge,
-} from "./shared/heartbeat-progress-edges.js";
+} from "./shared/heartbeat-progress-edges.ts";
 export { ACTIVITY_EDGE_EVENTS, LIFECYCLE_EVENTS };
 
 /**

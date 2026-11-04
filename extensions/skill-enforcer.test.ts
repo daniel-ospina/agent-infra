@@ -49,13 +49,13 @@ import hook, {
   resolveManifestPath,
   _setSkillReadsFileForTest,
   _setManifestForTest,
-} from "./skill-enforcer.js";
+} from "./skill-enforcer.ts";
 // The derivation itself is asserted in its own suite (extensions/shared/
 // git-command-parse.test.ts); this file only needs it for the OR property below.
-import { commandSpellings } from "./shared/git-command-parse.js";
+import { commandSpellings } from "./shared/git-command-parse.ts";
 // #2965 — the derived lane contract is a bypass channel, so it must be pinned
 // OFF before any gate assertion can mean anything (see scrubBypassEnv).
-import { _setLaneContractForTest } from "./shared/headless-lane.js";
+import { _setLaneContractForTest } from "./shared/headless-lane.ts";
 
 const REPO_ROOT = resolve(__dirname, "..");
 const REAL_MANIFEST = join(REPO_ROOT, "enforcement", "dangerous-ops.txt");
@@ -1203,7 +1203,7 @@ async function main() {
     // extensions/verification-gate/tool-call-event-parity.test.ts; a private copy
     // in this file would drift under a pi upgrade with every gate still reporting
     // `✅ Loaded`. shared/tool-call-event.test.ts asserts this import repo-wide.
-    ok(SOURCE.includes('import { isToolCallEventType } from "./shared/tool-call-event.js"'),
+    ok(SOURCE.includes('import { isToolCallEventType } from "./shared/tool-call-event.ts"'),
       "the shared predicate import must be present (it replaces the #1321 inline)");
     ok(!/function isToolCallEventType\(/.test(SOURCE), "the predicate must not be re-inlined here (#1330)");
   });

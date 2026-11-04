@@ -55,7 +55,7 @@ import {
   reviewerPreflightLine,
   reviewerPreflightMessage,
   reviewerFirstPushNotice,
-} from "./reviewer-preflight.js";
+} from "./reviewer-preflight.ts";
 
 /** Read a repo file relative to this suite — no cwd assumption, no `git` subprocess. */
 function repoFile(rel: string): string {

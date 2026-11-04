@@ -57,7 +57,7 @@
  */
 
 import { execSync } from "node:child_process";
-import { parsePidList } from "./tree-kill.js";
+import { parsePidList } from "./tree-kill.ts";
 
 /** #1074: pgrep/ps cap on the sweep path — env-overridable (default 5s;
  * invalid/absent/non-positive → default). Mirrors tree-kill's `execTimeoutMs`

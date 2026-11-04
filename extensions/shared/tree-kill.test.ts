@@ -8,7 +8,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { parsePidList, getChildPids, treeKill, execTimeoutMs } from "./tree-kill.js";
+import { parsePidList, getChildPids, treeKill, execTimeoutMs } from "./tree-kill.ts";
 import { ok, equal } from "node:assert/strict";
 
 let passed = 0;

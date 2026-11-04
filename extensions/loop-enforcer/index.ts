@@ -27,14 +27,14 @@ import {
   mkdirSync, readdirSync, appendFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { buildGoalSpec, populateGoalFields, decomposeGoal, spawnChildLoop, isGoalAdvisory, runGoalVerification, goalVerificationPrompt, GOALS_UNVERIFIED_FLAG, detectUserConfirmation, detectEndCommand } from "./goal.js";
-import type { Indicator } from "./goal.js";
-import { dispatchVerifier } from "./verifier.js";
-import { evaluateTermination, type CycleData } from "./termination.js";
-import { startScheduler, releaseCronLock } from "./scheduler.js";
-import { executeWriteBack } from "./writeback.js";
+import { buildGoalSpec, populateGoalFields, decomposeGoal, spawnChildLoop, isGoalAdvisory, runGoalVerification, goalVerificationPrompt, GOALS_UNVERIFIED_FLAG, detectUserConfirmation, detectEndCommand } from "./goal.ts";
+import type { Indicator } from "./goal.ts";
+import { dispatchVerifier } from "./verifier.ts";
+import { evaluateTermination, type CycleData } from "./termination.ts";
+import { startScheduler, releaseCronLock } from "./scheduler.ts";
+import { executeWriteBack } from "./writeback.ts";
 import { homedir } from "node:os";
-import { isPrintMode } from "../shared/print-mode.js";
+import { isPrintMode } from "../shared/print-mode.ts";
 // #1419: KILL_SWITCH_FILE used to be referenced here without being defined or
 // imported (5 sites), so every write raised ReferenceError into a swallowed
 // catch — the "guaranteed escape" could not fire. One home, imported.
@@ -44,8 +44,8 @@ import {
   isSessionEscaped,
   sessionEscapeStatus,
   isEnforcementBypassed,
-} from "../shared/kill-switch.js";
-import { LOOPS_DIR, readManifest, writeManifest, abortLoop, abortAllLoops, buildEndSummary, pauseLoop, blockLoop, resumeLoop, type Manifest } from "./manifest.js";
+} from "../shared/kill-switch.ts";
+import { LOOPS_DIR, readManifest, writeManifest, abortLoop, abortAllLoops, buildEndSummary, pauseLoop, blockLoop, resumeLoop, type Manifest } from "./manifest.ts";
 
 // ── Session context resolution ──────────────────────────────────
 const SESSION_FILE = join(homedir(), ".pi", "agent", "slack-session.json");
@@ -1743,7 +1743,7 @@ Goal: ${m.goal}` }] };
     const nextCycle = (manifest.cycles?.length || 0) + 1;
     if (manifest.indicators && manifest.indicators.length > 0) {
       try {
-        const { runIndicatorChecks } = await import("./verifier.js");
+        const { runIndicatorChecks } = await import("./verifier.ts");
         const checkResult = await runIndicatorChecks(manifest);
         if (!checkResult.passed) {
           const failureMsgs = checkResult.failures.map(f => `${f.indicator}: ${f.error}`).join("; ");

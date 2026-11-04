@@ -5,10 +5,10 @@ import { relative, resolve, isAbsolute, join, dirname, basename, extname } from 
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync, openSync, closeSync, writeSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { register } from "../shared/health.js";
-import { appendJsonl } from "../shared/audit-log.js";
-import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
-import { redactCommand } from "../shared/redact-command.js";
+import { register } from "../shared/health.ts";
+import { appendJsonl } from "../shared/audit-log.ts";
+import { isPrintMode, argvAllowsTask } from "../shared/print-mode.ts";
+import { redactCommand } from "../shared/redact-command.ts";
 // #966: the command parsers are ONE copy shared with review-enforcer, in
 // extensions/shared/ — the two extensions carried private copies that silently
 // drifted (and asserted opposite answers for the same input). Kept in shared/
@@ -22,7 +22,7 @@ import {
   extractGhRepoEnv,
   extractPrNumber,
   extractRepoFlag,
-} from "../shared/git-command-parse.js";
+} from "../shared/git-command-parse.ts";
 // #755 merge-scope subtraction. VALUE import of a nested sibling module — safe:
 // pi's extension loader only auto-loads a directory's index.ts/index.js or its
 // package.json#pi.extensions, so subtract-scope.ts is never registered as an
@@ -36,7 +36,7 @@ import {
   SUBTRACT_SKIP_REASONS,
   type SubBundle,
   type SubAudit,
-} from "./subtract-scope.js";
+} from "./subtract-scope.ts";
 // Re-exported for the module's public surface (tests and any external consumer
 // import them from ./index.js) — the DEFINITION lives only in shared/.
 export { extractCdPath, extractGhRepoEnv, extractPrNumber, extractRepoFlag };

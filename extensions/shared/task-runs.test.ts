@@ -28,7 +28,7 @@ import {
   safeRunId,
   writeRunRecord,
   type TaskRunRecord,
-} from "./task-runs.js";
+} from "./task-runs.ts";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

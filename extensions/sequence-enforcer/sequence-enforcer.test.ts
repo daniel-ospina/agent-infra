@@ -47,8 +47,8 @@ import {
   type EnforcementLogEntry,
   default as sequenceEnforcer,
   type Step,
-} from "./index.js";
-import { isEnforcementBypassed } from "../shared/kill-switch.js";
+} from "./index.ts";
+import { isEnforcementBypassed } from "../shared/kill-switch.ts";
 import { ok, equal, deepEqual } from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, chmodSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";

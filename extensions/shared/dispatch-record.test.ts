@@ -26,9 +26,9 @@
  * Run: npx tsx extensions/shared/dispatch-record.test.ts
  */
 
-import { spawnSubAgent } from "../builtin-tools/index.js";
-import { retry } from "./retry.js";
-import { auditLedgerFile } from "./provider-failover.js";
+import { spawnSubAgent } from "../builtin-tools/index.ts";
+import { retry } from "./retry.ts";
+import { auditLedgerFile } from "./provider-failover.ts";
 import {
   DISPATCH_RECORD_EVENT,
   DEFAULT_DISPATCH_CLASS,
@@ -39,7 +39,7 @@ import {
   resolveDispatchClass,
   resolveTranscriptPath,
   sessionArgFromArgs,
-} from "./dispatch-record.js";
+} from "./dispatch-record.ts";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as fs from "node:fs";

@@ -18,7 +18,7 @@ import {
   MODEL_MAX,
   MODEL_CACHE_MAX,
   type SessionAttribution,
-} from "./capture-attribution.js";
+} from "./capture-attribution.ts";
 
 // ── machineIdFrom ──────────────────────────────────────────────────────────
 

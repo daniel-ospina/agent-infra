@@ -61,7 +61,7 @@ import {
   type CheckpointResult,
   type GitRunner,
   type LaneSignalRecord,
-} from "./task-signal-forensics.js";
+} from "./task-signal-forensics.ts";
 
 const EXTENSION_SOURCE = path.resolve(path.dirname(new URL(import.meta.url).pathname), "task-signal-forensics.ts");
 /** The one shared module the extension imports (see `spawnLane`'s bridge below). */

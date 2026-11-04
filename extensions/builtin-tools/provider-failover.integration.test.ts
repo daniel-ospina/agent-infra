@@ -32,8 +32,8 @@
  * Run: npx tsx extensions/builtin-tools/provider-failover.integration.test.ts
  */
 
-import builtinToolsExt, { spawnSubAgent, recordVeniceRoute, DEFAULT_TASK_MODEL } from "./index.js";
-import { readLatchState } from "../shared/provider-failover.js";
+import builtinToolsExt, { spawnSubAgent, recordVeniceRoute, DEFAULT_TASK_MODEL } from "./index.ts";
+import { readLatchState } from "../shared/provider-failover.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

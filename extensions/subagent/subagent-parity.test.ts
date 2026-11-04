@@ -100,7 +100,7 @@ section("Shared seam (import from builtin-tools)");
 test("imports the FROZEN tool-stall export by name (the split's whole reason)", () => {
   hasOnce(
     subagent,
-    `import { getSubAgentPath, DEFAULT_TOOL_STALL_MS, resolveProviderModel } from "../builtin-tools/index.js";`,
+    `import { getSubAgentPath, DEFAULT_TOOL_STALL_MS, resolveProviderModel } from "../builtin-tools/index.ts";`,
     "builtin-tools import seam",
   );
 });

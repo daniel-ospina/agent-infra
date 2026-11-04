@@ -31,7 +31,7 @@
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
 import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { join, resolve, extname } from "node:path";
-import { isToolCallEventType } from "./tool-call-event.js";
+import { isToolCallEventType } from "./tool-call-event.ts";
 
 const REPO_ROOT = resolve(import.meta.dirname, "..", "..");
 const EXT_ROOT = join(REPO_ROOT, "extensions");
@@ -159,7 +159,7 @@ test("exactly one definition exists, and it is extensions/shared/tool-call-event
 test("the consumers import the shared predicate rather than re-declaring it", () => {
   const consumers: Array<[string, string]> = [
     ["extensions/skill-enforcer.ts", 'from "./shared/tool-call-event.js"'],
-    ["extensions/sequence-enforcer/index.ts", 'from "../shared/tool-call-event.js"'],
+    ["extensions/sequence-enforcer/index.ts", 'from "../shared/tool-call-event.ts"'],
   ];
   for (const [rel, specifier] of consumers) {
     const src = readFileSync(join(REPO_ROOT, rel), "utf8");
@@ -192,7 +192,7 @@ test("the SDK-bearing parity suite is present and wired to the same module", () 
   const p = join(REPO_ROOT, rel);
   ok(existsSync(p), `${rel} is missing — the shared copy would then have no pin against the real export`);
   const src = readFileSync(p, "utf8");
-  ok(src.includes('from "../shared/tool-call-event.js"'),
+  ok(src.includes('from "../shared/tool-call-event.ts"'),
     `${rel} must import the shared predicate it pins`);
   ok(src.includes("@earendil-works/pi-coding-agent"),
     `${rel} must import the real SDK export it pins against`);

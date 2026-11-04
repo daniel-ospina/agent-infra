@@ -32,7 +32,7 @@ import {
   buildProvider,
   runExtension,
   __resetWarnFlagsForTests,
-} from "./index.js";
+} from "./index.ts";
 import type { Dispatcher } from "undici";
 import type { FetchFunction, ProviderStreams } from "@earendil-works/pi-ai";
 

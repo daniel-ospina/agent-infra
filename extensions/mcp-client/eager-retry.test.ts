@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { McpServerManager, connectEagerWithRetry, isRetryableEagerConnectError } from "./index.js";
+import { McpServerManager, connectEagerWithRetry, isRetryableEagerConnectError } from "./index.ts";
 
 // Sub-agent harnesses may run with PI_MCP_SERVERS="none" (the #286 zero-connect
 // sentinel), which excludes every server from the eager set. These tests assert

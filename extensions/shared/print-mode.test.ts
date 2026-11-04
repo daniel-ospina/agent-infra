@@ -3,7 +3,7 @@
  * Run: npx tsx extensions/shared/print-mode.test.ts
  */
 
-import { isPrintMode, isPrintModeEnv, argvAllowsTask } from "./print-mode.js";
+import { isPrintMode, isPrintModeEnv, argvAllowsTask } from "./print-mode.ts";
 import { ok, equal } from "node:assert/strict";
 
 // env set (builtin-tools spawn path)

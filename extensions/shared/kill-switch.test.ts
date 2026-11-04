@@ -34,7 +34,7 @@ import {
   sessionEscapeStatus,
   clearSessionEscape,
   SESSION_ESCAPE_CELL_KEY,
-} from "./kill-switch.js";
+} from "./kill-switch.ts";
 
 const scratch = mkdtempSync(join(tmpdir(), "killswitch-"));
 const SWITCH = join(scratch, "kill");           // never the machine path

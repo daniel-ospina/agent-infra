@@ -32,8 +32,8 @@
 // in the hermetic provider-fallback.test.ts).
 process.env.SUBAGENT_FALLBACK_DISABLE = "1";
 
-import { runSingleAgent, getCacheDir, type SingleResult } from "./index.js";
-import type { AgentConfig } from "./agents.js";
+import { runSingleAgent, getCacheDir, type SingleResult } from "./index.ts";
+import type { AgentConfig } from "./agents.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

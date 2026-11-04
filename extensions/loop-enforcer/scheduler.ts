@@ -7,7 +7,7 @@
 import {
   readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync,
 } from "node:fs";
-import { readManifest } from "./manifest.js";
+import { readManifest } from "./manifest.ts";
 import { join } from "node:path";
 import { homedir } from "node:os";
 

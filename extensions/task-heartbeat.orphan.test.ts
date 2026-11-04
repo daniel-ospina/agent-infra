@@ -29,7 +29,7 @@ import {
   getOrphanGraceMs,
   orphanWatchdogHooks,
   _resetWatchdogArmedForTests,
-} from "./task-heartbeat.js";
+} from "./task-heartbeat.ts";
 import { ok, equal } from "node:assert/strict";
 
 let passed = 0;

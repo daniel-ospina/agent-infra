@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent, verificationCandidates } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent, verificationCandidates } from "./index.ts";
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
@@ -17,7 +17,7 @@ import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 // #966: the shared parser module — the drift-pin below asserts this extension's
 // exported helpers ARE these functions (one copy, not a lookalike).
-import * as sharedParse from "../shared/git-command-parse.js";
+import * as sharedParse from "../shared/git-command-parse.ts";
 
 let passed = 0;
 let failed = 0;
@@ -512,7 +512,7 @@ test("the declaration scan detects every form it claims — and only those", () 
     "const extractCdPathRegex = /x/;",
     "const myExtractCdPath = 1;",
     "const x = extractCdPath(cmd);",
-    'import { extractCdPath } from "../shared/git-command-parse.js";',
+    'import { extractCdPath } from "../shared/git-command-parse.ts";',
     "export { extractCdPath, extractPrNumber };",
   ]) {
     ok(!declaresHelper(decoy, "extractCdPath"), `must ignore: ${decoy}`);
@@ -556,7 +556,7 @@ test("imports verification-gate without errors (#5622 regression)", async () => 
   // signal), so an ok(true) body would be empty. What the static import does
   // NOT check is the module's primary export — the plugin factory the e2e
   // harness mounts via mod.default — so assert it is present and callable.
-  const mod = (await import("./index.js")) as any;
+  const mod = (await import("./index.ts")) as any;
   equal(typeof mod.default, "function", "plugin factory default export must be callable");
 });
 

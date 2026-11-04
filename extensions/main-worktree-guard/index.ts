@@ -143,8 +143,8 @@ import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirS
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { isPrintMode } from "../shared/print-mode.js";
-import { appendJsonl } from "../shared/audit-log.js";
+import { isPrintMode } from "../shared/print-mode.ts";
+import { appendJsonl } from "../shared/audit-log.ts";
 
 // Shared destructive-git rules (also used by test.mjs). If the import fails
 // TOTALLY (jiti resolution edge case), the bash guard degrades to non-blocking

@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode, currentBranch, pinMismatchLines } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode, currentBranch, pinMismatchLines } from "./auto-sync.ts";
 import { repoKey } from "./shared/branch-ownership.mjs";
 
 // ⛔ `sync.sh` is resolved from the CHECKOUT, never from the working directory

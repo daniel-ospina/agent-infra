@@ -53,8 +53,8 @@ import {
   failoverDisabled,
   renderExhaustionMarker,
   dispatchUnkeyedSet,
-} from "./shared/provider-failover.js";
-import type { ExhaustionMarker } from "./shared/provider-failover.js";
+} from "./shared/provider-failover.ts";
+import type { ExhaustionMarker } from "./shared/provider-failover.ts";
 
 // ── Pure helpers (exported for unit tests) ─────────────────────────────
 

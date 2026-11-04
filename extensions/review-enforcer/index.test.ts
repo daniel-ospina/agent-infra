@@ -135,19 +135,19 @@ import {
   RECORD_STATE_LIVE_UNREADABLE,
   RECORD_STATE_CARRY_ALLOWED,
   type ReviewRecord,
-} from "./index.js";
+} from "./index.ts";
 // #2665: the token is imported from the module that OWNS it, so a rename cannot leave this
 // suite green (the review of #2665 caught the hardcoded copy).
-import { SPAWN_ATTEMPT_CAP, SPAWN_UNSPAWNABLE_TOKEN, describeSpawnCapacity, readMachineCapacity } from "../shared/spawn-capacity.js";
+import { SPAWN_ATTEMPT_CAP, SPAWN_UNSPAWNABLE_TOKEN, describeSpawnCapacity, readMachineCapacity } from "../shared/spawn-capacity.ts";
 // The wording itself is pinned by its own drift suite (extensions/shared/reviewer-preflight.test.ts);
 // this file asserts the paths/route the DISCLOSURE hands a lane, so it reads the same constants.
 import {
   REVIEWER_PREFLIGHT_RECORD_CMD,
   REVIEWER_PREFLIGHT_RAIL_CMD,
-} from "../shared/reviewer-preflight.js";
+} from "../shared/reviewer-preflight.ts";
 // #966: the shared parser module — the drift-pin below asserts this extension's
 // exported helpers ARE these functions (one copy, not a lookalike).
-import * as sharedParse from "../shared/git-command-parse.js";
+import * as sharedParse from "../shared/git-command-parse.ts";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
 // This test file lives beside the extension, so this is the extension's own

@@ -18,7 +18,7 @@ import {
   McpServerManager,
   DEFAULT_IDLE_TIMEOUT_MS,
   IDLE_SWEEP_INTERVAL_MS,
-} from "./index.js";
+} from "./index.ts";
 
 let passed = 0;
 let failed = 0;

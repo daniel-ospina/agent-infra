@@ -45,7 +45,7 @@ import {
   parsePsLstart, // #386 pure parser (macOS)
   parseProcStarttime, // #386 pure parser (Linux)
   probePidBootTime, // #386 pid probe
-} from "./socket-mode.js";
+} from "./socket-mode.ts";
 
 // ── Environment hygiene ─────────────────────────────
 for (const k of [

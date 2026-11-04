@@ -18,7 +18,7 @@ import tortoiseCapture, {
   captureToHosted,
   buildCloudPayload,
 } from "./index";
-import { resolveProjectRoot } from "../shared/capture-gate.js";
+import { resolveProjectRoot } from "../shared/capture-gate.ts";
 
 // Replicate the pure functions inline (cannot import .ts extension in vitest with jiti)
 function extractText(content: unknown): string | null {
