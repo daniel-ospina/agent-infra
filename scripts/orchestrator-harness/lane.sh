@@ -109,7 +109,16 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # while the token still names this process: the older run's line goes to the append-only log (its
 # transcript) and cannot be mistaken for the current run's verdict.
 #   the verdict of the current run:  cat "$O/logs/lane-<N>.outcome"      (absent = no verdict yet)
-#   which lane logs never said anything, any run:  grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log
+#   which lane logs never said anything, any run:
+#       grep -L '^outcome=\(done\|refused\|failed\|died\) reason=' "$O"/logs/lane-[0-9]*.log
+#   ⛔ THE PATTERN IS ANCHORED (review cycle 3, P2, measured): this line used to say a bare
+#   `grep -L '^outcome='`, and that form counts a lane as REPORTED whenever ANY line in the file starts
+#   with `outcome=` — including the agent transcript (`run_agent` appends pi's stdout to the same log) and
+#   including the CONTRACT LINE this comment is part of, which a lane editing `lane.sh` will quote. Measured
+#   on a dead lane whose transcript carries that quote: bare form → nothing listed (false pass), anchored
+#   form → the lane listed. The README states the same rule and the end-scoped per-file form; this is the
+#   containment reader and it must use the same pattern, because two artifacts answering one question with
+#   different commands is how the wrong one gets run during an incident.
 #   ⛔ `lane-[0-9]*` IS NOT COSMETIC (review round 2, P2, measured): `lane-*.log` ALSO matches
 #   `lane-merge-<PR>.log`, which `lane-merge.sh` writes and which is NOT a lane (`merge-rate.sh` excludes
 #   it by name for exactly that reason). Lane logs are `<issue>.log`, and `$N` is validated numeric above.

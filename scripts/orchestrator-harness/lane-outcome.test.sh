@@ -512,7 +512,8 @@ check_terminal "7f" refused "repo-target:REFUSED" 72
 unset TARGET_SLUG
 
 # ═══ 8. THE VOCABULARY IS ONE SOURCE OF TRUTH ═══════════════════════════════════════════════════
-# A scanner's whole job is `grep -L '^outcome=' "$O"/logs/lane-[0-9]*.log`; this arm asserts the words it
+# A scanner's whole job is `grep -L '^outcome=\(done\|refused\|failed\|died\) reason=' "$O"/logs/lane-[0-9]*.log`
+# (anchored — see lane.sh's contract block); this arm asserts the words it
 # can ever see are the ones the contract declares, so a fifth cannot be introduced without reddening.
 # ⛔ IT PINS THE WRITER'S CASE ARM, NOT A COMMENT (review round 3, P2, measured). The first cut grepped
 # the whole file for the literal `done|refused|failed|died`, which is BRE (so `|` is a plain character) and
