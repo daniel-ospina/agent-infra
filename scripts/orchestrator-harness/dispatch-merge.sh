@@ -376,12 +376,28 @@ for N in "$@"; do
        # Every issue in this batch creates its worktree on the SAME volume, so a refusal here is a
        # fact about the BOX: continuing would run the next `git worktree add` into the same full
        # disk and produce the measured `fatal: cannot create directory …: No space left on device`,
-       # once per remaining issue. The refusal names its own numbers (free/need/box), the claim is
-       # released so the issue is not held for a box that cannot build it, and the batch stops.
+       # once per remaining issue. The refusal names its own numbers (free/need/box) and the batch stops.
+       # ⛔ AND A STOPPED BATCH RELEASES **EVERY** CLAIM IT WILL NOT ATTEMPT (review round 2, P1).
+       # The controller has ALREADY taken `refs/claims/issue-<N>` for every id it handed us, and this
+       # file's own rule says "Nothing will start" must also mean "nothing stays claimed" — otherwise
+       # each skipped issue is refused by every peer until `CLAIM_ISSUE_TTL` (18,000 s) expires. The
+       # first version released only `$N` and broke, which BOTH left the rest claimed for the lease and
+       # was a regression against the old `*)` arm, where each issue released its own claim as it went.
        echo "#$N: $WT_RESULT"
-       echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take #$N"
-       release_issue_claim_unspawned "$N"
-       drop_dispatched_rows "$N" 2>/dev/null || true
+       echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take the remaining issues"
+       # ⛔ NEVER RELEASE A CLAIM FOR AN ISSUE THIS BATCH ALREADY **SPAWNED** A LANE FOR. `SPAWNED_IDS`
+       # holds the lanes that ARE running; releasing their claim would let a peer duplicate the work
+       # (the rule the chain-start failure path states at length). Only the unspawned remainder is
+       # released — this issue and everything after it.
+       _dm_unspawned=""
+       for _dm in "$N" "$@"; do
+         case "${_dm:-}" in ''|*[!0-9]*) continue ;; esac
+         case " $SPAWNED_IDS " in *" $_dm "*) continue ;; esac
+         case " $_dm_unspawned " in *" $_dm "*) continue ;; esac
+         _dm_unspawned="$_dm_unspawned $_dm"
+         release_issue_claim_unspawned "$_dm"
+       done
+       drop_dispatched_rows $_dm_unspawned 2>/dev/null || true
        break ;;
     *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; drop_dispatched_rows "$N"; continue ;;
   esac

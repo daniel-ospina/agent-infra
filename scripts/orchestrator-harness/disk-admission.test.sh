@@ -52,6 +52,12 @@ trap 'rm -rf "$T"' EXIT
 [ -f "$WTL" ]  || { echo "FATAL: no wt-lifecycle.sh beside this suite" >&2; exit 2; }
 [ -f "$GATE" ] || { echo "FATAL: no spawn-gate.sh beside this suite" >&2; exit 2; }
 
+# ⛔ HERMETIC AGAINST THE AMBIENT OVERRIDES TOO (review round 2, P2 — MEASURED). The arms below assert
+# the SHIPPED requirement (need_mb=8144), so an operator's `DISK_LANE_SELF_MB=1024` in the environment —
+# the very remedy the refusal text recommends for a cheaper box — turned this suite into 25 passed /
+# 12 failed. Cleared here and passed explicitly only by the arms that mean to vary them.
+export DISK_LANE_SELF_MB= DISK_LANE_RESERVE_MB= DISK_LANE_TREE_MB=
+
 # ── the `df` stubs ───────────────────────────────────────────────────────────────────────────────
 # TWO separate directories, never one PATH prefix: the fixture must be able to say "readable, N MB"
 # and "UNREADABLE" without the arms sharing state.
@@ -214,6 +220,22 @@ NEED2="$( env DISK_MIN_FREE_MB=500 DISK_LANE_SELF_MB=2048 DISK_LANE_RESERVE_MB=5
 [ "$NEED2" = 2560 ]; rc=$?
 ck "…and honours the overrides (2,048 + 512 = 2,560) — got '$NEED2'" $rc
 
+# ⛔ THE SEAM'S REQUIREMENT IS PINNED TO THE LIVE ARM'S OWN FUNCTION, NOT TO ITSELF (review round 2,
+# P2). `disk_lane_costs` on a PYTHON fixture is the reference: if someone raises the live arm's SELF
+# and not the named constant, this arm reds instead of the drift admitting a lane one step late.
+mkdir -p "$T/pytarget" && : > "$T/pytarget/uv.lock"
+LIVE_NEED="$( env DISK_MIN_FREE_MB=500 bash -c '. "$1"; set -- $(disk_lane_costs "$2"); disk_lane_need "$1" "$2" "$3"' _ "$GATE" "$T/pytarget" )"
+[ "$NEED" = "$LIVE_NEED" ]; rc=$?
+ck "the seam's requirement equals the live arm's disk_lane_need on a python target (seam=$NEED, live=$LIVE_NEED)" $rc
+
+# ⛔ AN ALL-DIGIT READING BEYOND THE COMPARISON'S RANGE MUST REFUSE (review round 2, P2). The first
+# version compared `free -lt need`, so an ERRORED comparison (rc 2) read as "not below" and ADMITTED.
+OVR="$( env DISK_MIN_FREE_MB=500 bash -c '
+        . "$1"; disk_free_mb_target() { printf "%s\n" 99999999999999999999; }; disk_admit "$2"; printf "rc=%s\n" "$?"
+      ' _ "$GATE" "$REPO" 2>/dev/null )"
+case "$OVR" in *'rc=77'*) rc=0 ;; *) rc=1 ;; esac
+ck "an over-range all-digit reading REFUSES (an errored comparison is not an admission) — $(printf '%s' "$OVR" | tail -1)" $rc
+
 # ── F2) A GARBLED OVERRIDE STILL PRODUCES A NAMED REFUSAL (review round 1, P2) ───────────────
 # The message used to re-derive the reserve from the RAW env value, so `DISK_LANE_SELF_MB=12x`-
 # style spellings (an operator writing `6G` or `6144MB` is the realistic case) made the REFUSAL
@@ -256,13 +278,20 @@ for pair in "fix-one.sh:AGENT_DISK_REFUSED" "adopt-fix.sh:exit 77" "dispatch-mer
   f="${pair%%:*}"; want="${pair##*:}"
   script="$HERE/$f"
   if [ ! -f "$script" ]; then bad "H) $f is missing — the census cannot be vacuous"; continue; fi
-  # Two shapes in this tree: `if [ "$_wt_rc" = 4 ]` (fix-one, adopt-fix) and `case "$_wt_rc" in 4)`
-  # (dispatch-merge). Accept both — a census that knows only one spelling fails on a correct caller.
-  if ! grep -qE '(_wt_rc"? = "?4|^[[:space:]]*4\))' "$script"; then
+  # ⛔ SCOPED TO THE rc-4 ARM'S OWN BODY (review round 2, P2 — MEASURED). The first version grepped the
+  # WHOLE file, and both tokens already appear pre-change elsewhere (`AGENT_DISK_REFUSED` at fix-one.sh's
+  # live-arm readers, `break` in dispatch-merge's loop), so it could not fail for the reason it claims.
+  arm=""
+  if grep -qE '^[[:space:]]*4\)' "$script"; then
+    arm="$(awk '/^[[:space:]]*4\)[[:space:]]*#?/{f=1} f&&/^[[:space:]]*;;[[:space:]]*$/{exit} f' "$script")"
+  else
+    arm="$(awk '/(^|[[:space:]])(if|elif)[[:space:]]+\[.*_wt_rc[" ]*=[[:space:]]*["]?4/{f=1;n=0} f{print;n++} f&&n>12{exit}' "$script")"
+  fi
+  if [ -z "$arm" ]; then
     bad "H) $f has no rc-4 arm — a disk refusal from wt_provision would be read as an add failure"
     continue
   fi
-  if grep -qF -- "$want" "$script"; then ok "H) $f keeps the rc-4 arm and names $want"; else bad "H) $f has the rc-4 arm but does not reach '$want'"; fi
+  if grep -qF -- "$want" <<<"$arm"; then ok "H) $f keeps the rc-4 arm and names $want inside it"; else bad "H) $f's rc-4 arm does not reach '$want' (arm: $(printf '%s' "$arm" | head -1))"; fi
 done
 
 # The seam returns 4, and 4 must not collide with a code the callers already use for something else.

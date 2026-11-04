@@ -5103,8 +5103,13 @@ Three surfaces now exist, and they are ONE predicate (`spawn-gate.sh`'s `disk_fr
 | surface | when it is asked | verdict |
 |---|---|---|
 | `run_agent` (live dispatch) | immediately before the agent starts | `REFUSED … DISK-NOHEADROOM` (unchanged, fail-OPEN on an unreadable probe) |
-| `wt_provision` → `wt_disk_admit` (PRE-START) | before `git worktree add`, i.e. before anything is created | `REFUSED-DISK(free=…, need=…, box=…)`, return **4**; callers map it to 77 (`AGENT_DISK_REFUSED`) |
+| `wt_provision` → `wt_disk_admit` (PRE-START) | before `git worktree add`, i.e. before anything is created | `REFUSED-DISK(free=…, need=…, box=…; free_mb=, need_mb=)`, return **4** |
 | `spawn-gate.sh --disk-admit <target>` (the VERB) | from a dispatcher that is not this tree's shell code | same lines, exit 0/77/64 |
+
+rc **4** is mapped by each caller to what ITS surface can express: `fix-one.sh` refunds the attempt
+and exits **77** (`AGENT_DISK_REFUSED`); `adopt-fix.sh` exits **77**; `dispatch-merge.sh` releases the
+claims of the unspawned remainder (never the lanes it already started) and **stops the batch**, because
+a full volume is a fact about the box rather than about one issue.
 
 The PRE-START arm fails **CLOSED** on an unreadable `df` (`REFUSED-UNKNOWN free=?`): refusing before
 anything is created costs a re-dispatch, while the live arm's documented fail-open protects a running
@@ -5116,6 +5121,20 @@ derivation is measured, not invented: two lanes consumed **11 GB in six minutes*
 cell whose `.worktrees` was 36.4 GB of 47 GB, and the check therefore takes the cell that will BUILD,
 not the box that decided. A box whose lanes are measured cheaper lowers `DISK_LANE_SELF_MB` /
 `DISK_LANE_RESERVE_MB` deliberately (the seams the live arm already documents).
+
+⛔ **THE TWO SEAMS SHARE THE NUMBERS BUT NOT THE CLASSIFIER, AND THAT IS SAID OUT LOUD.** `self` and
+`reserve` come from ONE place (`DISK_LANE_SELF_PY_DEFAULT`, `disk_lane_reserve_default()`), so raising
+the live arm's worst case cannot leave this seam admitting on the old figure; `disk-admission.test.sh`
+pins the seam's requirement against `disk_lane_costs`/`disk_lane_need` on a python fixture for exactly
+that reason. What the seam does NOT do is consult `python_target`: at this step the lane's install
+step is the BRIEF's, not the checkout's (a harness checkout whose lane runs a python suite pays the
+same 5.6 GB venv), and the marginal `tree` figure is only true while a warm shared cache holds — the
+cache that pressure prunes first. **The cost of that choice, stated:** a box at ~5 GB free refuses a
+harness lane the live gate would have admitted, until an operator states a smaller worst case.
+
+⚠️ **SCOPE:** these are the three LANE-creation paths. `stall-fix.sh` and `ai-drainer.sh` call
+`git worktree add` directly for throwaway/mend checkouts and are NOT gated here — a named residual,
+whose ENOSPC behaviour this change leaves exactly as it was.
 
 Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
 the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real

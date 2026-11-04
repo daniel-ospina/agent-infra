@@ -357,15 +357,29 @@ python_target() { # python_target <path>
 # silently turn the gate into "0 + 0 + 0" (admit always) — the inert-gate class the floor guards at
 # source time. An explicit `0` IS honoured: the test seam neutralises all three in one place, and an
 # operator zeroing the reserve is making a stated choice.
+# ⛔ THE TWO PYTHON-CLASS DEFAULTS (350 marginal / 6,144 worst case) AND THE RESERVE ARE NAMED HERE,
+# IN ONE PLACE, BECAUSE TWO SEAMS NOW READ THEM (review round 2, P2). `disk_lane_costs` (the live arm,
+# below) and `disk_worktree_terms` (the PRE-START seam, above) must not carry separate literals: raise
+# one and the other goes on admitting on the old number — which is #3395's own defect (a refusal one
+# step too late) wearing a constant instead of an ordering. `diskW_LANE_*_PY` are the shipped numbers,
+# overridable per cell only through the `DISK_LANE_*_MB` seams.
+DISK_LANE_TREE_PY_DEFAULT=350
+DISK_LANE_SELF_PY_DEFAULT=6144
+
+# disk_lane_reserve_default -> 4x the DISPATCH floor. ⛔ Computed from `DISK_MIN_FREE_MB`, NOT from
+# `DISK_WARN_FREE_MB` (review round 3, P2): the band is a NOISE threshold an operator lowers to quiet
+# logs, and wiring enforcement to a diagnostic knob means silencing a warning loosens admission.
+disk_lane_reserve_default() { printf '%s\n' "$(( 10#$DISK_MIN_FREE_MB * 4 ))"; }
+
 disk_lane_costs() { # disk_lane_costs <path>
   local p="${1:-.}" tree self reserve py=0
   python_target "$p" && py=1
-  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$py" = 1 ]; then tree=350; else tree=64; fi
-  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; elif [ "$py" = 1 ]; then self=6144; else self=64; fi
+  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$py" = 1 ]; then tree="$DISK_LANE_TREE_PY_DEFAULT"; else tree=64; fi
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; elif [ "$py" = 1 ]; then self="$DISK_LANE_SELF_PY_DEFAULT"; else self=64; fi
   # 4x the DISPATCH floor — the same number the warn band defaults to, derived INDEPENDENTLY: the
   # reserve is enforcement, the band is reporting, and an operator lowering the band to quiet logs must
   # not be lowering admission with it (review round 3, P2).
-  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve=$(( 10#$DISK_MIN_FREE_MB * 4 )); fi
+  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve="$(disk_lane_reserve_default)"; fi
   printf '%s %s %s\n' "$tree" "$self" "$reserve"
 }
 
@@ -399,15 +413,23 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 #
 # and the dispatcher that produced it printed `df=` in a log line and asserted nothing. A `df` in a
 # log is a REPORT; a report is not a gate. So the same predicate is now ALSO callable from the one
-# place a lane checkout is created (`wt-lifecycle.sh`'s `wt_provision`, which every creation path in
-# this tree routes through: `dispatch-merge.sh`, `fix-one.sh`, `adopt-fix.sh`) and from a stable
+# place a LANE checkout is created (`wt-lifecycle.sh`'s `wt_provision`, which the three DISPATCH paths
+# route through: `dispatch-merge.sh`, `fix-one.sh`, `adopt-fix.sh`) and from a stable
 # verb, so a dispatcher that is not this tree's shell code (an ad-hoc pusher on another box) calls
 # THIS function instead of re-implementing `df`. That divergence — harness copy gated, ad-hoc copy
 # not — is the whole defect.
+# ⚠️ SCOPE, STATED (review round 2, P3): those three are the LANE creation paths, not every checkout
+# this tree ever creates. `stall-fix.sh` and `ai-drainer.sh` call `git worktree add` directly for
+# throwaway / mend checkouts and are NOT gated here — a named residual whose ENOSPC behaviour this
+# change does not alter, not a silent hole.
 #
-# ⛔ ONE PREDICATE, NOT TWO: `disk_admit` below reads through `disk_free_mb`, bounds through
-# `disk_worktree_need`/`disk_lane_need`, and classifies readability through `disk_readable` — the
-# same four functions the live arm uses. Nothing here re-derives a threshold.
+# ⛔ ONE PREDICATE, ON TWO BOUNDS — AND THE DIFFERENCE IS STATED, NOT GLOSSED (review round 2, P2).
+# `disk_admit` reads through `disk_free_mb_target` → `disk_free_mb`, classifies readability through
+# `disk_readable`, and derives its requirement through `disk_worktree_terms`, which takes the SAME
+# `DISK_LANE_SELF_PY_DEFAULT` and `disk_lane_reserve_default()` that the live arm's `disk_lane_costs`
+# uses — one set of numbers, not two. What it does NOT share is the live arm's per-TARGET classifier
+# (`python_target` → the marginal `tree`): see `disk_admit`'s note for why the PRE-START bound is the
+# worst case for any checkout, and README §7.2i for the cost of that choice.
 #
 # ⛔ POLARITY AT THIS SEAM IS FAIL-CLOSED, AND THAT IS NOT A CONTRADICTION OF THE LIVE ARM'S
 # FAIL-OPEN. The file states the distinction above: a PRE-START check may refuse at no cost, while a
@@ -570,7 +592,13 @@ disk_admit() { # <target> [<label>]
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
   fi
-  if [ "$free" -lt "$need" ]; then
+  # ⛔ ADMIT ONLY ON A COMPARISON THAT SUCCEEDED (review round 2, P2 — this was the ONE place in this
+  # file that failed OPEN on a reading it could not compare). `[ "$free" -lt "$need" ]` returns 2 when
+  # an all-digit reading exceeds bash's integer range, and the `if` then took the ADMITTED branch:
+  # measured, `free=99999999999999999999` printed `integer expression expected` and let the worktree be
+  # created — where every other predicate in this file refuses an uncomparable reading. Written as
+  # `need <= free`, an errored comparison is FALSE, i.e. a refusal.
+  if ! [ "$need" -le "$free" ]; then
     DISK_ADMIT_VERDICT="disk"
     DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$free"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$free, need_mb=$need) $label: $free MB free on $target < ${need}MB required (one lane's measured worst case ${self}MB + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
     printf '%s\n' "$DISK_ADMIT_LINE"
