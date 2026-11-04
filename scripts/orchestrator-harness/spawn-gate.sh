@@ -1499,7 +1499,14 @@ lane_end_marker() {
     return 0
   }
   n="$(printf '%s\n' "${LANE_END_PORCELAIN:-}" | grep -c . 2>/dev/null)"; [ -n "$n" ] || n=0
-  shown="$(printf '%s\n' "${LANE_END_PORCELAIN:-}" | sed 's/\t/  /g' | head -40)"
+  # ⛔ `tr`, NOT `sed 's/\t/  /g'` (review cycle 7, finding 1). `git status --porcelain -uall` emits NO
+  # tabs (v1 separates with a SPACE and C-quotes odd paths — measured: `?? a.txt`, `?? "b c.txt"`), so
+  # the sed was a no-op on GNU sed and ACTIVELY CORRUPTING on BSD/macOS sed, where `\t` is not an
+  # escape: the pattern matched a literal `t` and doubled every one of them, so a path no longer
+  # resolved (` M scripts/test.sh` became ` M scrip  s/  es  .sh`) in the one section a reclaim pass
+  # reads to learn WHAT is in the worktree. Same portability class this repo already pins; same `tr`
+  # idiom `lane_end_record` uses 60 lines below for the TSV's path column.
+  shown="$(printf '%s\n' "${LANE_END_PORCELAIN:-}" | tr '\t' '  ' | head -40)"
   {
     printf 'LANE-EXIT\n'
     printf 'label=%s\n' "$label"
