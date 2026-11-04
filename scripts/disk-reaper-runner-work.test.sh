@@ -865,6 +865,61 @@ case_n() { # <entry-point>
     return $((CASE_FAIL > 0))
 }
 
+# ── (r) a PARTLY-unreadable population is `census=partial`, and its count is a LOWER BOUND ────────
+# ⛔ THE ABSTENTION WAS ONLY IMPLEMENTED FOR THE TOTAL CASE (#3057 review, P1). `census=abstained` is
+# gated on `candidates=0`, so a pass that read ONE root and could not read ANOTHER published
+# `census=ok`; the entry point lifted it as `verdict_runner_work=ok`; and the unread root's dead
+# checkouts were invisible to the only field an operator reads. MEASURED at that head with this exact
+# fixture (readable root with a dead entry + mode-0111 root with a dead entry):
+#   `roots=2 candidates=1 unmeasurable=1 census=ok` ⇒ record {candidates=1, unmeasurable=1, verdict=ok}
+# That is the likely shape on a real cell, not a corner: the runners are not all owned by one user (one
+# `_work` root-owned 0750, the rest readable), so the sink that fills silently is the one the verdict
+# calls healthy. The count that WAS measured stays reported — withdrawing a real count to signal doubt
+# would hide work the class can prove — and the verdict is the distinct token.
+case_r() { # <entry-point> <owner>
+    local pass="$1" owner="$2" base good unreadable dead_good dead_unread out rc sum s1
+    PASS_OWNER="$owner"
+    base="$T/r.$$.$RANDOM"
+    good="$(mk_work "$base" gh-runner-x64-30)"; fixture_entry dead_good "$good" job-done 300 || return 1
+    unreadable="$(mk_work "$base" gh-runner-x64-31)"; fixture_entry dead_unread "$unreadable" job-hung 300 || return 1
+    # 0111 = stat-able and traversable, NOT listable — the permission mismatch this class's header names
+    # as plausible. `chmod` cannot deny root, so the arm is SKIPPED there rather than asserted.
+    chmod 0111 "$unreadable" 2>/dev/null || { skip "(r) a PARTLY-UNREADABLE population: chmod is unavailable on this host, so the arm was NOT measured"; return 0; }
+    if [ -r "$unreadable" ]; then
+        chmod 0755 "$unreadable" 2>/dev/null
+        skip "(r) a PARTLY-UNREADABLE population: this process can read a mode-0111 directory anyway (running as root), so the arm was NOT measured"
+        return 0
+    fi
+    s1="$(uniqstate r1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    # RESTORE BEFORE ANY ASSERTION — a 0111 root would defeat the trap's `rm -rf "$T"` on the way out.
+    chmod 0755 "$unreadable" 2>/dev/null
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
+               "a PARTIAL census is not a failure, so the pass still exits 0 (rc=$rc)"
+    case_check "$(grep -qF 'census=partial' <<<"$sum" && echo 0 || echo 1)" \
+               "… and the OWNER's census says partial, not ok, so a partly-unread population is not published as measured (summary: ${sum:-<none>})"
+    case_check "$(grep -qF 'candidates=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… the entry it COULD read is still counted (the count is not withdrawn, it is a lower bound)"
+    case_check "$(grep -qF 'unmeasurable=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… and the root it could not read is counted as unmeasurable"
+    case_check "$(grep -q '^candidates_runner_work=1$' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… the RECORD keeps the MEASURED count — a real candidate is not discarded to signal doubt"
+    case_check "$(grep -q '^verdict_runner_work=partial$' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the VERDICT is partial, so nothing keying on 'ok' inherits the false PASS"
+    case_check "$(grep -q '^unmeasurable_runner_work=1$' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… with the unmeasured root carried in the record, so the gap is findable without reading the log"
+    case_check "$(grep -qF 'census is PARTIAL' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the NOTE states the count is a LOWER BOUND, which is the sentence that makes the number honest"
+    case_check "$([ ! -e "$dead_good" ] && echo 0 || echo 1)" \
+               "… the readable root's dead checkout was REAPED — a partial census must not make the class inert"
+    case_check "$([ -e "$dead_unread" ] && echo 0 || echo 1)" \
+               "… and the UNREADABLE root's entry SURVIVED — nothing was classified there, so nothing may be removed"
+    case_check "$(grep -qF 'verdict=partial' <<<"$out" && echo 0 || echo 1)" \
+               "the class line agrees with the record (verdict=partial)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── (o) a matched root whose BASENAME is not `_work` is REFUSED, by name and fail-closed ────────
 # ⛔ THE LAST GATE BEFORE `rm -rf`, AND IT WAS MISSING. The root loop tested only `-d` and `! -L`, so a
 # seam ONE COMPONENT SHORT — `/opt/gh-runner*/` instead of `/opt/gh-runner*/_work` — matched the runner
@@ -909,6 +964,19 @@ case_o() { # <entry-point> <owner>
                "… both install roots are COUNTED as refused, so 'why did this pass do nothing' has an answer (summary: ${sum:-<none>})"
     case_check "$(grep -qF 'roots=0 ' <<<"$sum" && echo 0 || echo 1)" \
                "… and they are not counted as SWEPT roots"
+    # ⛔ THE RECORD MUST NAME THE REFUSAL, NOT A GLOB THAT MATCHED NOTHING (#3057 review, P2). The glob
+    # DID match — 2 install trees — and they were refused BY NAME. Without a `census=refused` token the
+    # owner's `roots=0` fell into the `no-roots` arm and the record said "no runner _work root matched
+    # DISK_REAPER_RUNNER_GLOBS": a false statement whose remedy (widen the glob) is the OPPOSITE of the
+    # correct one (the glob is already matching; it is one component short). Same rc, different answer.
+    case_check "$(grep -qF 'census=refused' <<<"$sum" && echo 0 || echo 1)" \
+               "… and the OWNER's census says refused, so no caller can read this as an empty population (summary: ${sum:-<none>})"
+    case_check "$(grep -q 'REFUSED because its basename is not' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… the RECORD names the BASENAME REFUSAL as the cause, which is the seam an operator must fix"
+    case_check "$(grep -q 'no runner _work root matched' <<<"$(status_of "$s1")" && echo 1 || echo 0)" \
+               "… and does NOT claim the glob matched nothing — it matched, and saying otherwise aims the operator at the wrong remedy"
+    case_check "$(grep -q 'runner-work-root-refused' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… with its own misconfiguration token, distinct from the nothing-matched one"
     # THE CONTROL, and it is what makes the refusal about the NAME and not about sweeping nothing: the
     # SAME tree with the CORRECT seam reaps the dead checkout and leaves the install alone.
     s2="$(uniqstate o2)"
@@ -1064,8 +1132,17 @@ MUT_A4='s/^RUNNER_WORK_MIN_AGE="\${REAP_RW_MIN_AGE:-7200}"$/RUNNER_WORK_MIN_AGE=
 # that into `candidates_runner_work=0 verdict_runner_work=ok`. Mutated separately because either half alone
 # would leave one surface lying: the owner's token (so the count is withdrawable) and the entry point's
 # verdict mapping (so `ok` is not published for an abstention).
-MUT_L2='s/^if \[ "\$CENSUS" = ok \] && \[ "\$UNMEASURABLE" -gt 0 \] && \[ "\$CAND" = 0 \]; then CENSUS=abstained; fi$/:/'
+MUT_L2='s/^if \[ "\$CENSUS" = ok \] && \[ "\$UNMEASURABLE" -gt 0 \]; then$/if false; then/'
 MUT_L3='s/^    \[ "\$RW_ABSTAINED" = 1 \] && VERDICT_RW="abstained"$/    :/'
+# (r)'s arms, on the PARTIAL census — the abstention one state over (#3057 review, P1). Each half is
+# mutated separately for the same reason as (l2)/(l3): `else CENSUS=ok` publishes a partly-unread
+# population as measured (so the record says ok again), and deleting the entry point's override lets a
+# `census=partial` land as `verdict_runner_work=ok` — either half alone leaves one surface lying.
+MUT_R1='s/else CENSUS=partial/else CENSUS=ok/'
+MUT_R2='s/^    \[ "\$RW_PARTIAL" = 1 \] && VERDICT_RW="partial"$/    :/'
+# (o)'s SECOND arm, on the CAUSE the record publishes. Without its own census token, a refused root falls
+# into the `no-roots` arm and the record says the glob "matched nothing" — false, with the wrong remedy.
+MUT_O2='s/^if \[ "\$REFUSED_ROOTS" -gt 0 \]; then CENSUS=refused; fi$/:/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -1237,6 +1314,11 @@ if apply_mutation "$OWNER" "$T/mut-o/reap-runner-work.sh" "$MUT_O"; then
 else
     bad "o mutation could not be applied (the basename guard moved) — the last gate before rm -rf is not checked any more"
 fi
+if apply_mutation "$OWNER" "$T/mut-o2/reap-runner-work.sh" "$MUT_O2"; then
+    expect_fail "o2 mutation: dropping the REFUSED census token turns the case RED (the record blames a glob that matched)" case_o "$REAPER" "$T/mut-o2/reap-runner-work.sh"
+else
+    bad "o2 mutation could not be applied (the refused-census arm moved) — the record's CAUSE is not checked any more"
+fi
 
 expect_pass "p a root matched by TWO globs is swept once, not counted twice" case_p "$REAPER" "$OWNER"
 if apply_mutation "$OWNER" "$T/mut-p/reap-runner-work.sh" "$MUT_P"; then
@@ -1250,6 +1332,18 @@ if apply_mutation "$OWNER" "$T/mut-q/reap-runner-work.sh" "$MUT_Q"; then
     expect_fail "q mutation: taking the 0|1 arm for every value turns the case RED (the emptied assertion is disarmed)" case_q "$T/mut-q/reap-runner-work.sh"
 else
     bad "q mutation could not be applied (the EXPLICIT range guard moved) — the emptied seam is not checked any more"
+fi
+
+expect_pass "r a PARTLY-unreadable population is census=partial with a LOWER-BOUND count, not verdict=ok" case_r "$REAPER" "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-r1/reap-runner-work.sh" "$MUT_R1"; then
+    expect_fail "r1 mutation: publishing census=ok for a PARTLY-unread population turns the case RED (the false PASS returns)" case_r "$REAPER" "$T/mut-r1/reap-runner-work.sh"
+else
+    bad "r1 mutation could not be applied (the partial-census arm moved) — that token is not checked any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-r2/disk-reaper.sh" "$MUT_R2"; then
+    expect_fail "r2 mutation: mapping a partial census back onto verdict=ok turns the case RED" case_r "$T/mut-r2/disk-reaper.sh" "$OWNER"
+else
+    bad "r2 mutation could not be applied (the partial-verdict override moved) — that verdict is not checked any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from

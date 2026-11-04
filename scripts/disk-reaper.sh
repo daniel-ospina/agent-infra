@@ -115,7 +115,8 @@
 #                              $HOME/actions-runner*/_work, /tmp/actions-runner*/_work). A SET-but-EMPTY
 #                              value is a REFUSAL at startup, never "scan nothing": an emptied seam
 #                              would otherwise report a measured zero for a sink nothing looked at
-#   DISK_REAPER_RUNNER_MIN_AGE the runner-work mtime floor in seconds (default 3600): a `_work` entry
+#   DISK_REAPER_RUNNER_MIN_AGE the runner-work mtime floor in seconds (default 7200 — the only
+#                              empirically validated floor, see the class note below): a `_work` entry
 #                              whose NEWEST content is older than this is reapable
 #   DISK_REAPER_CLASS_TIMEOUT  watchdog per class, secs  (default 1800)
 #   DISK_REAPER_DU_TIMEOUT     watchdog per dry-run `du`, secs (default 120)
@@ -282,6 +283,12 @@ HAVE_RW_CAND=0
 # on the owner side, and rc stays 0 here, because the alarm channel is the RECORD (`verdict_runner_work`
 # + `candidates_runner_work=?`) and not the unit's colour — see the `ok=` contract at `record_body`.
 RW_ABSTAINED=0
+# 1 = the owner's census was PARTIAL: `unmeasurable>0` AND `candidates>0` — some of the population was
+# read and some was not. Distinct from `abstained` because the two need different words and the count is
+# still usable: the candidate tally IS a measurement of what was seen (published as a LOWER BOUND), while
+# the class verdict — the one field a reader keys on — must not be `ok`. Deliberately NOT a failure, for
+# the same reason `abstained` is not: rc stays 0 and the RECORD carries the alarm.
+RW_PARTIAL=0
 # The owner's `unmeasurable=` tally: entries it KEPT because the bounded walk could not ANSWER (a
 # permission error, a vanished mount, a watchdog 124, or a TOCTOU re-probe that could not answer).
 # ⛔ THIS IS THE CLASS'S ONLY "COULD NOT DECIDE" OUTCOME AND IT NEEDED ITS OWN CHANNEL. The entry point
@@ -2278,7 +2285,7 @@ reap_dup() {
 # that with T6).
 #
 # ⛔ THE SAFETY GATE IS ONE SENTENCE: an entry is a candidate ONLY when its NEWEST CONTENT is older than
-# the floor (`DISK_REAPER_RUNNER_MIN_AGE`, default 3600 s). The IN-ENTRY witness is the checkout's own
+# the floor (`DISK_REAPER_RUNNER_MIN_AGE`, default 7200 s). The IN-ENTRY witness is the checkout's own
 # writes; `_work/_temp` (step scripts, command logs) is a SIBLING OF THE CHECKOUT **INSIDE `_work`** — the
 # vendor resolves it as `Combine(Work, "_temp")` (`actions/runner` `HostContext.GetDirectory`) — so it
 # protects nothing here, and mtime is the proof for the entry being deleted. ⛔ THAT IS ALSO WHY THE
@@ -2401,6 +2408,18 @@ reap_runner_work() {
     # remedy is different from "the delegate ran and could not work". The owner only reports this for a
     # glob list an operator SET; the DEFAULT globs matching nothing is a box with no runners, which IS a
     # measurement (`roots=0`) and must not paint an hourly alarm on a healthy box.
+    # ⛔ A REFUSED BY NAME ROOT IS NOT A MISSING ROOT. The owner refuses a matched root whose basename is
+    # not `_work` (a seam one component short matches the runner INSTALL tree, which must never be swept)
+    # and exits 3; it now also publishes `census=refused`, because the `no-roots` arm below used to claim
+    # the glob "matched" nothing when it had matched and been refused. Same rc, same misconfigured
+    # class, DIFFERENT note — the note is what an operator acts on, so naming the wrong cause aims them
+    # at the wrong remedy (widening a glob that is already matching).
+    if [ "$_rw_census" = "refused" ]; then
+        log_line "disk-reaper: ⛔ class=runner-work FAIL-CLOSED — a matched root was REFUSED because its BASENAME is not '_work' (the seam is one component short, e.g. '/opt/gh-runner*/' instead of '/opt/gh-runner*/_work'; sweeping it would delete the runner INSTALL tree)"
+        NOTE_RW="a matched root under DISK_REAPER_RUNNER_GLOBS was REFUSED because its basename is not '_work' — the seam is one component short (e.g. '/opt/gh-runner*/' for '/opt/gh-runner*/_work'), so nothing was swept; fix the glob, do not widen it"; RC_RW=3
+        MISCONFIG="${MISCONFIG}${MISCONFIG:+, }runner-work-root-refused"
+        WANT_RW=0; VERDICT_RW="misconfigured"; DF_RW_OK=1; return 3
+    fi
     if [ "$_rw_census" = "no-roots" ]; then
         log_line "disk-reaper: ⛔ class=runner-work FAIL-CLOSED — no directory matched DISK_REAPER_RUNNER_GLOBS ('$RUNNER_GLOBS'), and it was set EXPLICITLY; a class that scans nothing is NOT a pass"
         NOTE_RW="no runner _work root matched DISK_REAPER_RUNNER_GLOBS"; RC_RW=3
@@ -2424,7 +2443,19 @@ reap_runner_work() {
         NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: a matched _work root could not be listed, so no entry was classified and the candidate count is UNKNOWN, not 0"
         RW_ABSTAINED=1
     fi
-    if [ "$_rw_census" = "ok" ]; then
+    # ⛔ A PARTLY-UNREADABLE POPULATION IS STILL AN ABSTENTION, ONE STATE OVER. `census=abstained` only
+    # covers the case where NOTHING was measured (`candidates=0`), so a pass that read one root and could
+    # not read another published `census=ok` and landed as `verdict_runner_work=ok` — MEASURED on two
+    # roots (one readable with a dead entry, one mode 0111): `candidates=1 unmeasurable=1 census=ok`, so
+    # the unread root's dead checkouts were invisible to the one field an operator reads. The count that
+    # WAS measured is kept (it is a LOWER BOUND, and withdrawing it would hide real work), and the
+    # verdict is the distinct token, so nothing keying on `ok` inherits the lie. rc stays 0.
+    if [ "$_rw_census" = "partial" ]; then
+        log_line "disk-reaper: ⚠️  class=runner-work census PARTIAL — ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read, so candidates=$_rw_cand is a LOWER BOUND, not the population (the unreadable ones were KEPT)"
+        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census is PARTIAL: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read, so the candidate count is a LOWER BOUND"
+        RW_PARTIAL=1
+    fi
+    if [ "$_rw_census" = "ok" ] || [ "$_rw_census" = "partial" ]; then
         case "${_rw_cand:-}" in
             ''|*[!0-9]*) : ;;
             *) CAND_RW="$_rw_cand"; HAVE_RW_CAND=1 ;;
@@ -2450,6 +2481,9 @@ reap_runner_work() {
     # ⛔ THE ABSTENTION IS A VERDICT, NOT A FOOTNOTE. `class_verdict 0` is `ok`, which is the one word
     # this state must never publish; set AFTER the mapping so the two cannot drift apart.
     [ "$RW_ABSTAINED" = 1 ] && VERDICT_RW="abstained"
+    # Same rule one state over: a PARTIAL census is not `ok` either. Set after the mapping for the same
+    # reason, and it can never collide with the abstention above (the owner publishes exactly one token).
+    [ "$RW_PARTIAL" = 1 ] && VERDICT_RW="partial"
     DF_RW_OK="$MEASURED"; RAW_RW="$raw"
     if is_dry; then FREED_RW=0; else FREED_RW="$freed"; fi
     # The owner's `candidates=` is the count; the `REAP` rows carry the BYTES, so they are scanned for the

@@ -17,7 +17,7 @@
 #
 # ── THE SAFETY GATE, AND IT IS THE WHOLE POLICY ────────────────────────────────────────────────
 # A `_work` entry is reapable ONLY when its **newest content is older than the floor**
-# (`--min-age`, default 3600 s). The IN-ENTRY witness is the checkout's OWN writes — the outputs, build
+# (`--min-age`, default 7200 s). The IN-ENTRY witness is the checkout's OWN writes — the outputs, build
 # artefacts, `.venv`/`node_modules` and any file a step creates under the checkout — so "nothing under
 # this entry has been written for N seconds" is a positive fact about a dead entry. ⛔ `_work/_temp`
 # (the step scripts and the command logs) is a SIBLING OF THE CHECKOUT **INSIDE THE ROOT THIS SWEEPS**,
@@ -81,7 +81,7 @@
 #   --apply         armed pass
 #   --glob PATTERN  a shell glob naming runner `_work` roots (repeatable; replaces the default list)
 #   --min-age S     seconds a `_work` entry must have gone unwritten before it is a candidate
-#                   (default 3600)
+#                   (default 7200 — the only empirically validated floor; see the note at line 54)
 #   --print-config  `globs=…` / `min_age=…` / `retained=…` / `reaped_by_table=…` / `mode=…` for
 #                   the caller (both halves of WORK_LAYOUT, so neither disposition can be invisible)
 #   --help          this text (exit 0)
@@ -94,7 +94,7 @@
 #                       directory deeper (`/tmp/actions-runner/<name>/_work`) needs `*/*` in the pattern.
 #                       A SET-but-EMPTY value is a REFUSAL (an empty list would scan nothing for ever
 #                       while the class reported a measured zero).
-#   REAP_RW_MIN_AGE     the mtime floor in seconds (default 3600)
+#   REAP_RW_MIN_AGE     the mtime floor in seconds (default 7200)
 #   REAP_RW_DRY_RUN     0 supplies the default mode only (an explicit flag always wins)
 #   REAP_RW_STATE_DIR   lock + log dir (default $HOME/.pi/agent/state)
 #   REAP_RW_LOG         pass log (default $REAP_RW_STATE_DIR/reap-runner-work.log)
@@ -661,6 +661,13 @@ done
 # exit status can never disagree about whether this pass measured anything.
 CENSUS=ok
 if [ "$ROOTS" = 0 ] && [ "$EXPLICIT" = 1 ]; then CENSUS=no-roots; fi
+# ⛔ A MATCHED ROOT THAT WAS REFUSED IS ITS OWN CENSUS, because it has its own REMEDY. Without this
+# token the record narrowed a one-component-short seam (`/opt/gh-runner*/` for `/opt/gh-runner*/_work`)
+# down to `roots=0 census=no-roots`, which the entry point relays as "no runner _work root matched
+# DISK_REAPER_RUNNER_GLOBS" — a statement that is FALSE (the glob matched 12 install trees and they were
+# refused BY NAME) and that points the operator at the wrong fix. The refusal arm below has always
+# exited 3; what was missing was a token that says WHY, on the line the entry point lifts.
+if [ "$REFUSED_ROOTS" -gt 0 ]; then CENSUS=refused; fi
 # ⛔ A ZERO THAT NOTHING MEASURED IS NOT A ZERO — THE FALSE PASS A REVIEW FOUND AT THIS CLASS'S OWN FIX.
 # The root-abstention above counts an unlistable root into `unmeasurable=`, which is the right ANSWER and
 # was the wrong RECORD: with nothing readable, `CAND` stays 0, so the owner still printed `census=ok`
@@ -673,7 +680,17 @@ if [ "$ROOTS" = 0 ] && [ "$EXPLICIT" = 1 ]; then CENSUS=no-roots; fi
 # treatment; this is the same rule one state over. The population was not measured, so it is not
 # reported: `candidates` stops being a count and the token says why. rc stays 0 — an abstention is not
 # a failure of the pass, it is the pass saying it could not look (an ALARM is the caller's judgement).
-if [ "$CENSUS" = ok ] && [ "$UNMEASURABLE" -gt 0 ] && [ "$CAND" = 0 ]; then CENSUS=abstained; fi
+# ⛔ AND AN ABSTENTION IS NOT ONLY TOTAL — `census=abstained` is gated on `candidates=0`, so a population
+# that was PARTLY unreadable still published `census=ok` and the entry point lifted it as
+# `verdict_runner_work=ok`: MEASURED on two roots, one readable with a dead entry and one mode-0111 —
+# `candidates=1 unmeasurable=1 census=ok`, so the record read ok while a whole runner's checkouts went
+# unmeasured. On a cell whose runners are not all owned by the same user (one `_work` root-owned 0750,
+# the rest readable) that is the LIKELY shape, not the corner: the unread root's dead entries accumulate
+# for ever and the one class verdict an operator reads says healthy. `census=partial` is the token for
+# it: the count that WAS measured stays reported (as a LOWER BOUND) and the verdict is not `ok`.
+if [ "$CENSUS" = ok ] && [ "$UNMEASURABLE" -gt 0 ]; then
+    if [ "$CAND" = 0 ]; then CENSUS=abstained; else CENSUS=partial; fi
+fi
 
 log_line "SUMMARY class=runner-work mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE refused=$REFUSED_ROOTS min_age=${RUNNER_WORK_MIN_AGE}s explicit=$EXPLICIT census=$CENSUS"
 log "SUMMARY mode=$MODE_TEXT globs=$GLOBS_N roots=$ROOTS candidates=$CAND reaped=$REAPED kept=$KEPT retained=$RETAINED failed=$FAILED unmeasurable=$UNMEASURABLE refused=$REFUSED_ROOTS census=$CENSUS"
