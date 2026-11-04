@@ -231,16 +231,20 @@ drive norank "$FNS" '300
 sum_before="$(cksum < "$TMP/norank/o/candidates.txt" 2>/dev/null)"
 sum_after="$(printf '300\n9\n' | cksum)"
 same=1; [ "$sum_before" = "$sum_after" ] && same=0
-# ⛔ AND IT MAY NAME "ARRIVAL ORDER" HERE (review P2, cycle 2) — this is the ONE arm that may, because
-# the file really was rewritten and the pool ranked nothing in it. That makes the ABSENCE asserted in
-# test 6 below discriminating rather than a phrase nobody ever emits.
+# ⛔ AND IT MAY **NOT** NAME "ARRIVAL ORDER" (review P2, cycle 3). It used to, on the premise that "the
+# file really was rewritten and the pool ranked nothing in it" — but the rewrite emits the rows in their
+# EXISTING order (`qorder`), so the bytes do not move; after an earlier ranking pass that existing order
+# IS severity, not arrival. The claim was therefore false in exactly the state a `.pool` that lists
+# nothing (routine) lands in, and this suite REQUIRED the false wording. Both halves are asserted here:
+# the honest word PRESENT, and `ARRIVAL order` ABSENT.
 if [ "$same" -eq 0 ] && grep -q 'priority-unreadable' "$TMP/norank/out" 2>/dev/null \
-   && grep -q 'ARRIVAL order' "$TMP/norank/out" 2>/dev/null \
+   && grep -q 'established NO priority order' "$TMP/norank/out" 2>/dev/null \
+   && ! grep -q 'ARRIVAL order' "$TMP/norank/out" 2>/dev/null \
    && ! grep -q 'severity-first' "$TMP/norank/out" 2>/dev/null; then rc=0
 else
   rc=1; echo "      same=$same; out: $(tr '\n' '|' < "$TMP/norank/out" 2>/dev/null | head -c 300)"
 fi
-ck "a pool ranking NONE of the queue says 'priority-unreadable', leaves the file byte-identical, names ARRIVAL order, and never claims severity" $rc
+ck "a pool ranking NONE of the queue says 'priority-unreadable', leaves the file byte-identical, names NO priority order and NOT 'ARRIVAL order', and never claims severity" $rc
 
 # 4b) POSITIVE PAIR: the same drive with a pool that DOES rank one row must claim severity-first — so the
 #     absence asserted above is not just a broken driver printing nothing.
@@ -283,16 +287,21 @@ if ! grep -q 'ARRIVAL order' "$TMP/nopool/out" 2>/dev/null && grep -q 'UNVERIFIE
 else rc=1; echo "      out: $(tr '\n' '|' < "$TMP/nopool/out" 2>/dev/null | head -c 300)"; fi
 ck "a FAILED reorder says the queue is UNCHANGED/UNVERIFIED — it does not name 'ARRIVAL order' for a file it never read" $rc
 
-# 6a-bis) AND THE DISTINCTION IS REAL, not a phrase dropped everywhere: test 4 above still REQUIRES
-#     'ARRIVAL order' on the arm that genuinely rewrote the file. Re-drive it here so the pair cannot
-#     drift apart (a later edit that deletes the phrase from BOTH messages reds exactly one of them).
+# 6a-bis) AND THE TWO UNREADABLE STATES ARE DISTINGUISHABLE, so the ABSENCES above discriminate rather
+#     than being phrases nobody emits (review P2, cycle 3). The FAILED arm says UNVERIFIED and must NOT
+#     claim "NO priority order" was established; the ranked-nothing arm says the opposite. One arm's
+#     absence is the other's presence, so deleting a phrase from BOTH reds exactly one of them.
 drive norank2 "$FNS" '300
 9
 ' '777
 '
-if grep -q 'ARRIVAL order' "$TMP/norank2/out" 2>/dev/null; then rc=0
-else rc=1; echo "      out: $(tr '\n' '|' < "$TMP/norank2/out" 2>/dev/null | head -c 300)"; fi
-ck "non-vacuity pair: the pool-ranked-nothing arm still names ARRIVAL order, so the absence in 6a is discriminating" $rc
+_rn="$TMP/norank2/out"; _np="$TMP/nopool/out"
+if grep -q 'established NO priority order' "$_rn" 2>/dev/null \
+   && ! grep -q 'UNVERIFIED' "$_rn" 2>/dev/null \
+   && grep -q 'UNVERIFIED' "$_np" 2>/dev/null \
+   && ! grep -q 'established NO priority order' "$_np" 2>/dev/null; then rc=0
+else rc=1; echo "      ranked-none: NO-order=$(grep -c 'established NO priority order' "$_rn" 2>/dev/null) UNVERIFIED=$(grep -c 'UNVERIFIED' "$_rn" 2>/dev/null); failed: UNVERIFIED=$(grep -c 'UNVERIFIED' "$_np" 2>/dev/null) NO-order=$(grep -c 'established NO priority order' "$_np" 2>/dev/null)"; fi
+ck "the two unreadable states are distinguishable: 'failed' says UNVERIFIED, 'ranked nothing' says NO priority order — never both" $rc
 
 # ── 6b) AN UNVERIFIABLE COUNT IS NOT A DRAINED QUEUE (review P2) ────────────
 # `rank_queue_by_pool` writes `<ranked> <unranked> <head>` and the caller reads it to choose its
@@ -327,30 +336,89 @@ ck "a reorder whose COUNT cannot be verified FAILS instead of reporting a draine
 # on every skipped pass bash resolved the call to nothing (`command not found`, absorbed by `|| true`)
 # and the reorder never ran. A definition that lives after its call site is indistinguishable from no
 # function at all at runtime, and every assertion above still passes because they supply their own call.
-# So pin the ORDER of the shipped text: both call sites must FOLLOW the definition.
+#
+# ⛔ POSITION IS NOT REACHABILITY (review P1, cycle 3). Pinning only "both calls sit below the
+# definition" leaves the DEFECT IT NAMES alive: moving the skip arm's call BELOW that arm's own
+# `exit 0` keeps it after the definition, keeps the count at 2, and keeps this check GREEN — while the
+# skip path, the COMMON path the PR's own measurement is about (23 minutes of skipped passes), never
+# reorders again. So the skip arm's call is pinned by CONTAINMENT: it must sit inside the arm, between
+# `refresh_stage skip "digest compare` and that arm's `exit 0`.
+skip_call_line() {  # <file> -> the line number of a call INSIDE the skip arm, or empty
+  awk '
+    /^[[:space:]]*refresh_stage skip "digest compare/{ arm = 1; next }
+    arm && /^[[:space:]]*exit 0[[:space:]]*$/{ exit }
+    arm && /queue_order_from_pool "\$O"/{ print NR; exit }
+  ' "$1"
+}
 def_line="$(grep -n '^queue_order_from_pool() {' "$REFRESH" | head -1 | cut -d: -f1)"
 call_lines="$(grep -n 'queue_order_from_pool "\$O"' "$REFRESH" | cut -d: -f1 | tr '\n' ' ' | sed 's/ *$//')"
 call_n="$(grep -c 'queue_order_from_pool "\$O"' "$REFRESH")"
+skip_in_arm="$(skip_call_line "$REFRESH")"
 bad_calls=""
 for c in $call_lines; do
   [ -n "$def_line" ] && [ "$c" -gt "$def_line" ] || bad_calls="$bad_calls $c"
 done
-if [ -n "$def_line" ] && [ "$call_n" -eq 2 ] && [ -z "$bad_calls" ]; then rc=0
+if [ -n "$def_line" ] && [ "$call_n" -eq 2 ] && [ -z "$bad_calls" ] && [ -n "$skip_in_arm" ]; then rc=0
 else
   rc=1
-  echo "      def_line='$def_line' call_n='$call_n' calls='$call_lines' BEFORE-def:${bad_calls:-none}"
-  echo "      (want: a definition, exactly 2 call sites — the skip arm and the main pass — and both AFTER it)"
+  echo "      def_line='$def_line' call_n='$call_n' calls='$call_lines' BEFORE-def:${bad_calls:-none} skip-arm-call='${skip_in_arm:-MISSING}'"
+  echo "      (want: a definition, exactly 2 call sites — the skip arm and the main pass — both AFTER it, and the skip arm's INSIDE the arm, before its exit 0)"
 fi
-ck "both call sites FOLLOW the definitions (2 call sites, def at line ${def_line:-?}) — the reorder cannot go inert" $rc
+ck "both call sites FOLLOW the definitions AND the skip arm's call is REACHABLE — inside the arm, before its exit 0 (def at line ${def_line:-?})" $rc
 
-# 7b) NON-VACUITY of the wiring pin: a source with the definition MOVED below one call site must redden
-#     it. Built here rather than read from git history so the check does not depend on a commit.
+# 7b) NON-VACUITY: a definition placed AFTER a call site must redden it — the defect this check was
+#     born for. Built here rather than read from git history so it does not depend on a commit.
 MOVED="$TMP/moved.sh"
 { printf 'queue_order_from_pool "$O"\n'; cat "$FNS"; } > "$MOVED"
 mdef="$(grep -n '^queue_order_from_pool() {' "$MOVED" | head -1 | cut -d: -f1)"
 mcall="$(grep -n 'queue_order_from_pool "\$O"' "$MOVED" | head -1 | cut -d: -f1)"
 [ -n "$mdef" ] && [ -n "$mcall" ] && [ "$mcall" -lt "$mdef" ] && rc=0 || { rc=1; echo "      moved fixture: call=$mcall def=$mdef"; }
 ck "non-vacuity: the wiring pin reddens on a definition placed AFTER its call site" $rc
+
+# 7c) NON-VACUITY of the REACHABILITY half: the same arm shape with the call moved below its `exit 0`
+#     must produce NO line from skip_call_line — otherwise the containment pin is a phrase, and this is
+#     exactly the mutation a position-only pin stays green on.
+INERT="$TMP/skip-inert.sh"
+printf '%s\n' \
+  '  refresh_stage skip "digest compare (fixture)"' \
+  '  exit 0' \
+  '  queue_order_from_pool "$O" || true' > "$INERT"
+if [ -z "$(skip_call_line "$INERT")" ]; then rc=0
+else rc=1; echo "      a call below the arm's exit 0 still read as reachable (line $(skip_call_line "$INERT"))"; fi
+ck "non-vacuity: the reachability pin reddens on a skip call moved BELOW the arm's exit 0 (position-only pins stay green there)" $rc
+
+# ── 8) A REORDER THAT CHANGES NOTHING DOES NOT SWAP THE INODE ────────────────
+# `mv` REPLACES candidates.txt, and the dispatch prune truncates that file IN PLACE, without
+# `.refresh.lock`, while this refresh runs BACKGROUNDED — so every avoidable swap is a chance to revert
+# a prune, and a read that catches the truncate window would `mv` a ZERO-BYTE file over the queue and
+# destroy its membership (the one thing "order, never membership" forbids). An identical reorder must
+# therefore write NOTHING. The positive pair keeps this from being satisfied by a dead writer.
+ID="$TMP/inode"; mkdir -p "$ID/o"
+inode_of() { ls -i "$1" 2>/dev/null | awk '{print $1}'; }
+{
+  echo 'QUEUE_ORDER_STATE=""'
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\nexit 0\n'
+} > "$ID/drive.sh"
+# A) ALREADY IN POOL ORDER -> identical bytes -> no swap.
+printf '200\n300\n9\n' > "$ID/o/candidates.txt"
+printf '200\n300\n' > "$ID/o/.pool"
+ino_a1="$(inode_of "$ID/o/candidates.txt")"
+( cd "$ID" && HOME="$ID" bash drive.sh "$ID/o" ) >/dev/null 2>&1
+ino_a2="$(inode_of "$ID/o/candidates.txt")"
+order_a="$(tr '\n' ' ' < "$ID/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+# B) POSITIVE PAIR: a queue that IS out of pool order -> the reorder must actually land on disk.
+printf '9\n300\n200\n' > "$ID/o/candidates.txt"
+ino_b1="$(inode_of "$ID/o/candidates.txt")"
+( cd "$ID" && HOME="$ID" bash drive.sh "$ID/o" ) >/dev/null 2>&1
+ino_b2="$(inode_of "$ID/o/candidates.txt")"
+order_b="$(tr '\n' ' ' < "$ID/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+if [ -n "$ino_a1" ] && [ "$ino_a1" = "$ino_a2" ] && [ "$order_a" = "200 300 9" ] \
+   && [ "$ino_b1" != "$ino_b2" ] && [ "$order_b" = "200 300 9" ]; then rc=0
+else
+  rc=1; echo "      identical reorder inode $ino_a1 -> $ino_a2 (want equal), order '$order_a'; real reorder inode $ino_b1 -> $ino_b2 (want differ), order '$order_b'"
+fi
+ck "an IDENTICAL reorder does not swap the file's inode, and a real one still does (no needless rewrite, no dead writer)" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

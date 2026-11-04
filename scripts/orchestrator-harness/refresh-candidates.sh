@@ -3870,7 +3870,18 @@ queue_order_from_pool() {
     rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
     return 1
   fi
-  if ! mv "$o/.cand.ranked" "$o/candidates.txt"; then
+  # ⛔ AN IDENTICAL REORDER WRITES NOTHING, AND THAT IS A SAFETY PROPERTY, NOT AN OPTIMISATION (review
+  # P2). `mv` REPLACES the inode, and the dispatch prune in `orch-loop.sh` truncates candidates.txt IN
+  # PLACE — `open(…, "w")`, no `.refresh.lock` — while this refresh runs BACKGROUNDED. Two consequences,
+  # both removed by not writing when the bytes are already right: (a) a prune that lands on the old
+  # inode is silently REVERTED by our `mv`, so a dispatched id reappears in the queue; (b) worse, if the
+  # read caught the truncate window the queue reads EMPTY, and an unconditional `mv` would put a
+  # ZERO-BYTE file over the queue and destroy its MEMBERSHIP — the one thing "ORDER, NEVER MEMBERSHIP"
+  # forbids. The window is narrow and the failure is total, so it is closed by construction rather than
+  # argued down: an unchanged order is not a rewrite.
+  if cmp -s "$o/.cand.ranked" "$o/candidates.txt"; then
+    rm -f "$o/.cand.ranked" 2>/dev/null
+  elif ! mv "$o/.cand.ranked" "$o/candidates.txt"; then
     QUEUE_ORDER_STATE="priority-unreadable"
     echo "[refresh] priority-unreadable: the pool-ordered queue could not be moved into $o/candidates.txt — the queue on disk is UNCHANGED (the pre-reorder file, i.e. whatever the PREVIOUS pass left), so its order is UNVERIFIED this pass and its severity is UNKNOWN"
     rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
@@ -3896,8 +3907,14 @@ queue_order_from_pool() {
     echo "[refresh] queue order: severity-first from the pool — head #$_h is the highest-ranked CLEAN entry still queued ($_r pool-ranked, $_u unranked at the tail)"
   else
     # Not a silent degradation: nothing in the queue is ranked by the pool, so the ORDER MEANS NOTHING.
+    # ⛔ AND IT IS NOT "ARRIVAL ORDER" EITHER (review P2). This arm rewrites the file with the rows in
+    # their EXISTING order (the awk's END loop over `qorder`), so the bytes are unchanged — after any
+    # earlier ranking pass, "existing order" IS that pass's severity order, not the append order the
+    # rows arrived in. Reachable in a routine state (`.pool` legitimately EMPTY with a non-empty queue),
+    # and it is the same typed-claim defect this PR already fixed one arm over. Say only what was
+    # verified: this pass established NO priority order, and the file keeps the order it already had.
     QUEUE_ORDER_STATE="priority-unreadable"
-    echo "[refresh] priority-unreadable: the pool ranked NONE of the $_u queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so candidates.txt is in ARRIVAL order — read that as \"unranked\", never as \"severity-ordered\""
+    echo "[refresh] priority-unreadable: the pool ranked NONE of the $_u queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — candidates.txt keeps the order it ALREADY had (byte-identical; not re-derived here, and NOT this pass's arrival order either): read it as UNRANKED, never as \"severity-ordered\""
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
     echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry"
@@ -5658,14 +5675,22 @@ if [ -n "$_head_issue" ]; then
   #     ⛔ b3037738 recorded this finding as "FALSIFIED — it is reachable and driven by the drained-queue
   #     arm … the suite already asserts it". That falsification was WRONG: the suite assertion it cites
   #     drives `queue_order_from_pool`'s own message, not THIS branch. Corrected here, at the source.
-  #   · `*)` claimed "the order is ARRIVAL order", which is true of a reorder that ranked NOTHING
-  #     (the file really is rewritten in arrival order) and FALSE of a reorder that FAILED (the file is
-  #     untouched, so its order is the previous pass's — possibly severity-ordered). The one fact true
-  #     of both is that THIS PASS established no priority order.
+  #   · `*)` claimed "the order is ARRIVAL order", which is FALSE in BOTH cases it covers: a reorder that
+  #     ranked NOTHING rewrites the rows in their EXISTING order (so the file is unchanged, and after an
+  #     earlier ranking pass that order IS severity), and a reorder that FAILED leaves the file untouched
+  #     (the previous pass's order). ⛔ `OLDEST` was the same defect one word over (review P2, cycle 3):
+  #     age rank is a claim about arrival order, and neither arm verified one. The one fact true of both
+  #     is that THIS PASS established no priority order — so that is all either arm may say.
   case "${QUEUE_ORDER_STATE:-}" in
     severity) _head_rank="the highest-ranked CLEAN entry in the pool-ordered queue" ;;
-    empty)    _head_rank="the oldest CLEAN entry still queued — the reorder ranked NOTHING (it read an empty queue) and yet a row is here, so writer and reader disagree: treat this row as UNRANKED with severity UNKNOWN, not as ranked by anything" ;;
-    *)        _head_rank="the OLDEST CLEAN entry still queued — priority-unreadable: this pass established NO priority order for the queue, so its severity is UNKNOWN, not a priority decision" ;;
+    # ⛔ NO ARM MAY TYPE AN AGE CLAIM IT DID NOT READ (review P2). Both unreadable arms used to open with
+    # "the OLDEST CLEAN entry still queued" — an ARRIVAL-order assertion this string then writes to the
+    # DURABLE record as `handed_why=`, where it outlives the log line. It is false in both: a failed
+    # reorder leaves the PREVIOUS pass's order (possibly severity-ordered, so the head may be the
+    # top-ranked one, not the oldest), and the ranked-none arm keeps the queue's pre-existing order,
+    # whose head is not the arrival-oldest either. Say where the row is, not how old it is.
+    empty)    _head_rank="the entry at the head of the queue — the reorder ranked NOTHING (it read an empty queue) and yet a row is here, so writer and reader disagree: treat this row as UNRANKED with severity UNKNOWN, not as ranked by anything" ;;
+    *)        _head_rank="the entry at the head of the queue — priority-unreadable: this pass established NO priority order for the queue, so neither its severity nor its age rank is known, and it is not a priority decision" ;;
   esac
   case " ${QUEUED_THIS_PASS:-}" in
     *" $_head_issue "*) _head_why="judged CLEAN by THIS pass, and $_head_rank" ;;
