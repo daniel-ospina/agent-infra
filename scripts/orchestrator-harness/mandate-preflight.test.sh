@@ -197,6 +197,48 @@ grep -qF 'mandate-preflight #3377' "$BRIEF"; ck $? "the emit APPENDS the block t
 [ "$(grep -cF 'mandate-preflight #3377' "$BRIEF")" = "1" ]; ck $? "TWO emits append exactly ONE block (the marker guard is real, not decorative)"
 grep -qF '[mandate-preflight]' "$TMP/emit.log"; ck $? "…and the OPERATOR log names it too (both readers are served)"
 grep -qF 'second' "$TMP/emit.log"; ck $? "…and the second emit took the already-named branch (idempotence, not a silent skip)"
+# ── E1b: the SENTINEL SURVIVES IN THE CANNOT-VERIFY SHAPE — the ONE shape whose marker was absent which
+# is the defect this file's header records as MEASURED ("the guard used to key on the MISSING shape's
+# prose, so the CANNOT-VERIFY shape carried no marker at all … two emits gave two blocks"). §E1 drives
+# only the MISSING shape, so before this arm DELETING the sentinel from the undecidable branch left the
+# suite at 50 passed / 0 failed (this change's review, P2, measured) while two emits stacked two blocks
+# and zero sentinels — the "gate that cannot redden" class §E's own header names.
+mkstate; chmod 000 "$TMP/home/.pi/agent/state"
+if [ -x "$TMP/home/.pi/agent/state" ]; then
+  ok "(skipped: this user keeps search permission on a 000 state dir — running as root?)"
+else
+  BRIEF1B="$TMP/brief-cannotverify.txt"; printf '# a brief\n' > "$BRIEF1B"; : > "$TMP/cv.log"
+  CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" cv1; mandate_preflight_emit "$2" "$3" cv2' \
+    _ "$HELPER" "$TMP/cv.log" "$BRIEF1B" >/dev/null 2>&1
+  [ "$(grep -cF 'mandate-preflight #3377' "$BRIEF1B")" = "1" ]; ck $? "CANNOT VERIFY carries the sentinel — exactly ONCE across TWO emits (the measured two-block stacking)"
+  [ "$(grep -cF 'CANNOT VERIFY on this box' "$BRIEF1B")" = "1" ]; ck $? "…and exactly ONE cannot-verify block (an unguarded append stacks them)"
+  grep -qF 'CANNOT VERIFY' "$BRIEF1B"; ck $? "…and the brief says CANNOT VERIFY, never MISSING (the wrong remedy)"
+fi
+chmod 755 "$TMP/home/.pi/agent/state"
+# ── E1c: the GUARD IS CONTENT-AWARE — a changed box state reaches the brief, in BOTH directions ────
+# A brief's block is a reading about BOX STATE, and #1193 is going to change that state. A presence-only
+# guard answered "the sentinel is there" as "still true", so (a) a brief stamped for one absence set
+# SUPPRESSED a different, real absence discovered later — the #3377 silence, restored by its own guard —
+# and (b) a brief stamped while files were missing kept ordering the lane to report a falsehood after the
+# box was provisioned. Both were measured on the shipped helper before this arm existed; the policy is
+# #2981's (append the current block behind a one-line supersession notice, never rewrite the stale one).
+mkstate
+STATE="$TMP/home/.pi/agent/state"
+: > "$STATE/TORTOISE-GRAPH-BRIEF.md"                 # only the PREAMBLE is missing → stamp
+BRIEF1C="$TMP/brief-restate.txt"; printf '# a brief\n' > "$BRIEF1C"; : > "$TMP/restate.log"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" s1' _ "$HELPER" "$TMP/restate.log" "$BRIEF1C" >/dev/null 2>&1
+grep -qF 'LANE-BRIEF-PREAMBLE.md' "$BRIEF1C"; ck $? "E1c fixture: the first state names the missing PREAMBLE (the arm cannot pass vacuously)"
+# flip the absence set: provision the preamble, LOSE the graph brief
+: > "$STATE/LANE-BRIEF-PREAMBLE.md"; rm -f "$STATE/TORTOISE-GRAPH-BRIEF.md"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" s2' _ "$HELPER" "$TMP/restate.log" "$BRIEF1C" >/dev/null 2>&1
+grep -qF 'TORTOISE-GRAPH-BRIEF.md' "$BRIEF1C"; ck $? "a CHANGED absence set is named in the brief — the stale-negative case is not suppressed by the sentinel"
+grep -qF 'SUPERSEDES' "$BRIEF1C"; ck $? "…and it is appended behind a SUPERSESSION notice, so the lane cannot read both blocks as true"
+[ "$(grep -cF 'mandate-preflight #3377' "$BRIEF1C")" = "2" ]; ck $? "…with exactly TWO sentinels (one per STATE — a per-state block, not per-dispatch noise)"
+# and the stale POSITIVE direction: stamped while missing, box then provisioned
+touch "$STATE/LANE-BRIEF-PREAMBLE.md" "$STATE/TORTOISE-GRAPH-BRIEF.md"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" s3' _ "$HELPER" "$TMP/restate.log" "$BRIEF1C" >/dev/null 2>&1
+grep -qF 'BOTH mandated files are now PRESENT' "$BRIEF1C"; ck $? "a PROVISIONED box retires its stale block loudly — the lane is no longer ordered to report a false absence"
+grep -qF 's3' "$TMP/restate.log"; ck $? "…and the operator log records that supersession (it used to record NOTHING)"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate

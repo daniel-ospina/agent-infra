@@ -225,36 +225,84 @@ EOF
 # carrying its own. Every branch PROCEEDS and the function never returns non-zero: this is a disclosure,
 # not a gate (the file's header states why a refusal here would be an over-block that halts the fleet).
 mandate_preflight_emit() {
-  local log="${1:-/dev/null}" prompt="${2:-}" label="${3:-agent}" line
+  local log="${1:-/dev/null}" prompt="${2:-}" label="${3:-agent}" line notice brief_text has_brief stamped current
   # ⛔ A FAILED RENDER IS NOT "NOTHING TO SAY" (this change's review, P2). The command substitution used
   # to swallow the renderer's stderr, so a failure produced an empty `line` and the `[ -n ]` guard read it
   # as "every file is present" and returned 0 in silence — the exact defect this file exists to end. An
   # empty render is now only trusted AFTER the state has been re-read independently.
   line="$(mandate_preflight_line 2>/dev/null)"
+  if [ -z "$line" ] && { [ -n "$(mandate_missing)$(mandate_unreadable)" ] || mandate_state_root_undecidable; }; then
+    line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")"
+  fi
+  # ⛔ THE GUARD IS CONTENT-AWARE, NOT PRESENCE-ONLY (this change's review, P2 — measured, and it is the
+  # #3377 defect coming back through the guard written to stop it). It used to test only whether the
+  # SENTINEL was present in the brief, and it returned before the box state could be re-read at all. But a
+  # brief's block is a reading about BOX STATE — the one thing this disclosure exists to report and the one
+  # thing that changes — so "the marker is there" was answered as "still true", in both wrong directions:
+  #   * STALE POSITIVE — stamped while a file was missing, box later provisioned: the lane still reads
+  #     "MISSING … do NOT claim to have read it" about a file that is now present, i.e. it is ordered to
+  #     report a falsehood, and the operator log records NOTHING (the fresh render is empty, so the old
+  #     code returned before it ever looked at the brief).
+  #   * STALE NEGATIVE (the worse one) — stamped for ONE absence set, box state then CHANGES: the sentinel
+  #     suppressed the new, correct block, so a REAL absence was HIDDEN. That is exactly the silence this
+  #     file exists to end, restored by its own guard.
+  # THE POLICY IS #2981's, and it is already in this repo (`nonblocking-dispatch.sh`): append the CURRENT
+  # block behind a ONE-LINE SUPERSESSION NOTICE and never rewrite the stale one — a brief is never
+  # rewritten under its author. So the sentinel stays ONE marker (the recorded "one sentinel" decision is
+  # intact); what changes is only WHEN it is honoured.
+  #
+  # ⛔ THE COMPARISON IS THE WHOLE BLOCK, NOT A LINE OF IT (measured while writing this fix): `grep -F`
+  # with a MULTI-LINE pattern treats each line as its own pattern, so "the brief contains THIS block"
+  # degenerated into "the brief contains ANY line of it" — and two different absence sets share the
+  # sentinel, the heading and the closing line, so a CHANGED state still read as current and stayed
+  # hidden. A `case` on the brief read once makes the match a literal substring of the entire block, and
+  # is POSIX/bash-3.2 rather than a GNU-grep extension.
+  has_brief=""; brief_text=""; stamped=""; current=""
+  if [ -n "$prompt" ] && [ -f "$prompt" ]; then
+    has_brief=1
+    brief_text="$(cat "$prompt" 2>/dev/null)"
+    case "$brief_text" in *"$(mandate_sentinel)"*) stamped=1 ;; esac
+    if [ -n "$line" ]; then case "$brief_text" in *"$line"*) current=1 ;; esac; fi
+  fi
+  # ── the HEALTHY case: nothing to declare about the box ───────────────────────────────────────────
+  # A CLEAN brief stays byte-for-byte untouched (an always-on banner is noise a reader learns to skip).
+  # A STAMPED brief is not clean: it carries a block that no longer describes this box, and leaving it
+  # silently is how a lane reports an absence that is not there.
   if [ -z "$line" ]; then
-    if [ -n "$(mandate_missing)$(mandate_unreadable)" ] || mandate_state_root_undecidable; then
-      line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")"
+    [ -n "$stamped" ] || return 0
+    notice="$(printf '%s\n[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: BOTH mandated files are now PRESENT and readable on this box (%s), so that earlier block is a STALE reading of box state and must NOT be reported — do not claim a mandated file is missing (agent-infra#3377).' "$(hostname 2>/dev/null || printf 'this box')")"
+    if { printf '\n%s\n' "$notice" >> "$prompt"; } 2>/dev/null; then
+      { echo "[mandate-preflight] $label: the brief carried a STALE mandate block (this box is now provisioned); appended the supersession notice to $prompt" >> "$log"; } 2>/dev/null
     else
-      return 0
+      { echo "[mandate-preflight] WARN $label: the brief at $prompt still carries a STALE mandate block and the supersession notice could not be appended — the LANE may report an absence that is no longer true." >> "$log"; } 2>/dev/null
     fi
+    return 0
   fi
   # ⛔ GROUPED REDIRECT (this change's review, P2): `printf … >> "$log" 2>/dev/null` applies
   # left-to-right, so an unwritable `$log` emitted `bash: … Permission denied` on the CALLER's stderr —
   # the same class the brief-append below already fixes, on the other file.
   { printf '%s\n' "$line" >> "$log"; } 2>/dev/null
-  if [ -z "$prompt" ] || [ ! -f "$prompt" ]; then
+  if [ -z "$has_brief" ]; then
     { echo "[mandate-preflight] WARN $label: no brief file to append to ($prompt), so only THIS LOG names the absence and the LANE will not see it." >> "$log"; } 2>/dev/null
     return 0
   fi
-  if grep -qF "$(mandate_sentinel)" "$prompt" 2>/dev/null; then
+  # EXACTLY this block is present: idempotent, append nothing (the ordinary re-dispatch case).
+  if [ -n "$current" ]; then
     { echo "[mandate-preflight] $label: the brief ALREADY names the unsatisfiable mandate file(s) — not appending a second copy" >> "$log"; } 2>/dev/null
     return 0
+  fi
+  # A stamped-but-DIFFERENT brief is the stale-negative case: the earlier block is SUPERSEDED, not
+  # suppressed, so the current absence actually reaches the lane. Worded so the lane cannot read both
+  # blocks as true at once.
+  notice=""
+  if [ -n "$stamped" ]; then
+    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: box state has CHANGED, so the block BELOW is the CURRENT reading and the earlier one is stale — use only what follows (agent-infra#3377).') "
   fi
   # ⛔ GROUP THE REDIRECT WITH THE COMMAND (#3377 review, P2): `printf … >> "$prompt" 2>/dev/null` applies
   # left-to-right, so the FAILING `>>` emitted its raw `: <path>: Permission denied` to the caller's stderr
   # BEFORE `2>/dev/null` took effect — an untagged bash error escaping run_agent's log contract. The
   # braces make the suppression cover the redirection itself.
-  if { printf '\n%s\n' "$line" >> "$prompt"; } 2>/dev/null; then
+  if { printf '\n%s%s\n' "$notice" "$line" >> "$prompt"; } 2>/dev/null; then
     { echo "[mandate-preflight] $label: named the absence IN THE BRIEF as well ($prompt) — the lane cannot obey an instruction it was never told was unsatisfiable" >> "$log"; } 2>/dev/null
   else
     { echo "[mandate-preflight] WARN $label: could not append the mandate block to $prompt, so only THIS LOG names it and the LANE will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null
