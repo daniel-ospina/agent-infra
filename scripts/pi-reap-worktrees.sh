@@ -2669,13 +2669,26 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # neither exports it, so this arm is INERT unless a box points its pin record somewhere else — which
     # is exactly the box the shape backstop cannot save, because `HARNESS_PIN_DIR` is operator-settable
     # and a custom pin root need not be named `harness`.
-    # ⛔ ITS BOUNDARY, DECLARED RATHER THAN IMPLIED: only a `<root>/state/HARNESS-PIN` spelling derives a
-    # root. A trailing `/`, a doubled `//` or a RELATIVE spelling derives NOTHING and falls back to the
-    # three sources above — the same normalisation failure `check-farm-drift.sh` had to fix (it strips
-    # trailing slashes and collapses `//` for exactly that reason). This arm is deliberately left
-    # unnormalised rather than shipping a spelling no fixture drives: an input without a test is the
-    # defect class this PR exists to remove, so the boundary is written down instead.
+    # ⛔ ITS BOUNDARY, DECLARED RATHER THAN IMPLIED — and MEASURED, because the first two drafts of this
+    # paragraph were both wrong in opposite directions. The arm is NORMALISED first, the same way
+    # `check-farm-drift.sh:194` had to be: strip trailing slashes, collapse `//`, and REQUIRE an absolute
+    # path. Without the collapse a `//`-spelled record strips to `<root>/.pi/agent/`, the `/.pi/agent`
+    # strip below then does not fire, and the derived candidate becomes `<root>/.pi/agent//.harness-path`
+    # — a path the PRODUCTION layout never writes (the dir record lives at `<root>/.harness-path`), so the
+    # box is a SILENT MISS and rule 3 removes the tree it executes. Without the trailing-slash strip the
+    # same miss happens by a shorter route. Without the absolute requirement a RELATIVE spelling derives
+    # `.pi/agent`, a CWD-relative candidate that IS read — an input whose verdict depends on the reaper's
+    # working directory. Both odd spellings are now pinned by G15m rather than left as prose, because a
+    # spelling no fixture drives is the defect class this PR exists to remove.
+    # What still derives NOTHING, by construction: a `$HARNESS_PIN` that is not `…/state/HARNESS-PIN` at
+    # all (a bare directory, a different file name), and any relative spelling. Those fall back to the
+    # other three sources — the declared residual, not a covered case.
     local pin_root="${HARNESS_PIN:-}"
+    case "$pin_root" in /?*) : ;; *) pin_root="" ;; esac
+    if [ -n "$pin_root" ]; then
+        pin_root="$(printf '%s' "$pin_root" | tr -s '/')"   # collapse `//` — POSIX, no bashism
+        while [ "${pin_root%/}" != "$pin_root" ]; do pin_root="${pin_root%/}"; done
+    fi
     case "$pin_root" in
         */state/HARNESS-PIN) pin_root="${pin_root%/state/HARNESS-PIN}" ;;
         *)                   pin_root="" ;;
@@ -2685,10 +2698,17 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     esac
     # THE FOUR SOURCES, and each one is DISCRIMINATINGLY exercised by a fixture (G15j, G15n, G15k,
     # G15m — plus G15a/G15l for the co-rooted and whitespace-HOME spellings of the `$HOME` element):
-    #   `${HARNESS_PIN_FILE}`  the production variable — cloud-cell-bringup.sh:89 and
-    #                          cloud-cell-supervisor.sh:1775 write it and persist it in the cell
-    #                          ENV_FILE, install.sh:837 roots it at `$HOME`;
-    #   `$CELL_HOME/…`         harness-apply-pass.sh co-roots the DIR record with the sha record.
+    #   `${HARNESS_PIN_FILE}`  the production variable — `cloud-cell-bringup.sh:89` and
+    #                          `cloud-cell-supervisor.sh:1775` ROOT it at `$CELL_HOME/.harness-path`
+    #                          (`${HARNESS_PIN_FILE:-…}`, a default, not a write), `install.sh:837`
+    #                          roots it at `$HOME`, and `orchestrator-bringup.sh:449` is what PERSISTS
+    #                          it into the cell ENV_FILE. The writers are `install.sh:1072`
+    #                          (`pin_write_record`), `cloud-cell-bringup.sh:1034` and
+    #                          `cloud-cell-supervisor.sh:2316`;
+    #   `$CELL_HOME/…`         `harness-apply-pass.sh:207` CONSUMES the DIR record and roots its own
+    #                          default at `$CELL_HOME/.harness-path` — the co-rooting that makes this
+    #                          source real on a box whose `CELL_HOME` is not `$HOME` (its uses are reads:
+    #                          `:555`, `:1159`).
     #                          ⛔ G15n is the ONLY fixture where this element is the sole candidate:
     #                          in G15a `cell` IS `$HOME` (so the third element names the same file and
     #                          masks it), and G15k/G15l point `CELL_HOME` at a record-less home. Measured
