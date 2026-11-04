@@ -105,7 +105,15 @@ GATE="$HERE/spawn-gate.sh"
 #                 • an ARRAY SUBSCRIPT completed by an assignment — `X[0]=83`, `X[0]+=83`, `X[k]=83`,
 #                   `${X[0]:=83}` (the P1: these produced NO ROW and read GREEN, measured);
 #                 • an assignment BUILTIN whose value this scanner cannot know — `read -r X`,
-#                   `mapfile X` — or a `printf -v X …` whose format it cannot read.
+#                   `mapfile X` — or a `printf -v X …` whose format it cannot read. The GLUED option
+#                   form `printf -vX %d 83` is the same declaration and is normalised before the scan
+#                   (review cycle 3, P2: it matched the family token from the `v`, so the name was
+#                   `vX` in a position neither `cmdpos` nor `residual` recognised, and it produced NO
+#                   ROW of any class — the third instance of "a shape the author did not think of").
+#                   A subscript containing its own `=` (`X[a==b]=83`) is refused by the same arm, and
+#                   that arm is now gated on DECLARATION POSITION, so an element COMPARISON
+#                   (`[ $X[0] = 83 ]`) is silent whether or not the element is quoted — before this it
+#                   was red when unquoted and silent when quoted, i.e. punctuation deciding a verdict.
 # STATED LIMIT (and it is now TRUE, which it was not before): a family token with NO assignment
 # operator and no assignment builtin writing it is a READ, not a declaration (`exit "$AGENT_X_REFUSED"`,
 # `${X}`, `${X[0]}`, `[ "$X" = 83 ]`), and is not reported — the scan is about declarations. That
@@ -237,7 +245,16 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v) {
   # Scan to the ASSIGNMENT instead of to the first bracket. A COMPARISON on an element still stays
   # silent, because its `=` comes after a QUOTE, which `[ \t]*:?\+?=` cannot bridge — that is the
   # reason the subscript test is anchored at the `]` in the first place.
-  if (tail ~ /^\[[^=]*\][ \t]*:?\+?=/) { print "unparseable", name, s, f, ln; return }
+  # ⛔ AND THE SUBSCRIPT ITSELF MAY CONTAIN AN `=` (`X[a==b]=83`) — `[^=]*` cannot cross it, so that
+  # form matched no arm and fell through the fail-closed branch in silence: measured, 0 rows, verdict
+  # GREEN, while `bash -c 'X[a==b]=83'` assigns element 83. `.*` scans to the `]` that is actually
+  # followed by the assignment operator (POSIX awk takes the longest match, so a NESTED subscript
+  # still ends at its own closing `]`). The arm is also gated on `cmdpos(pre)` — the position test the
+  # claim path uses — because a COMPARISON is not a declaration: `[ $X[0] = 83 ]` is a read, and
+  # before this gate it was red only when someone happened to QUOTE the element (`[ "$X[0]" = 83 ]`
+  # was silent because the `=` sits after a quote). Anchoring on position instead of on punctuation
+  # makes the rule the same one the rest of the scan uses, so it stops depending on quoting at all.
+  if (cmdpos(pre) && tail ~ /^\[.*\][ \t]*:?\+?=/) { print "unparseable", name, s, f, ln; return }
   # ⛔ A QUOTED OPERAND IS STILL THE SAME BUILTIN: `printf -v "X" %d 83` and `read -r -d "" X`. The
   # anchors below required a TRAILING SPACE, so a quoted argument between the builtin and the name
   # defeated them and the declaration again read GREEN with 0 rows (finding 2). Strip trailing quotes
@@ -288,6 +305,18 @@ function row(kind, name, v, f, ln) {
   s = $0
   sub(/^[ \t]+/, "", s)
   if (s ~ /^#/) next                          # documentation, never a declaration
+  # ⛔ A GLUED `printf -vNAME` IS THE SAME DECLARATION (review cycle 3, P2 — measured). bash accepts
+  # the option and its operand joined (`printf -vAGENT_X %d 83` assigns 83 into AGENT_X), and the
+  # token scan then found the family token ONE CHARACTER to the right of where it belongs: it matched
+  # from the `v`, so the name was `vAGENT_X_REFUSED` and `pre` was `printf -`, a position NEITHER
+  # `cmdpos` nor `residual` recognises (both anchor at `-v$`). The line fell through the one arm meant
+  # to fail closed: measured through the shipped scanner on a copy of the deploy unit,
+  # `printf -vAGENT_NEW_GATE_REFUSED %d 83` produced 0 rows of ANY class, the claim count stayed at
+  # 14 and the verdict was GREEN over a genuine duplicate of 83.
+  # Normalised on a COPY (`scan`), never on `s`: a row still reports the source as written, and
+  # `printf -v` followed by a space is the same command as the glued form, so nothing else moves.
+  scan = s
+  gsub(/printf[ \t]+-v/, "printf -v ", scan)
   # ⛔ THE NAMING CONVENTION IS ASSERTED, NOT ASSUMED (review of PR #3237, finding 1). The claim scan
   # below is anchored on the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED` namespace, so a gate code
   # declared under ANY OTHER NAME is invisible to it — measured: `AGENT_MEM_GATE=81`, a real duplicate
@@ -322,7 +351,7 @@ function row(kind, name, v, f, ln) {
   # which is where the fail-closed rule belongs. The one shape this narrowing drops, measured: the
   # old regex reddened `X=81abc` as `foreign 81`; that was a side effect of its `([^0-9]|$)`
   # terminator, not a code claim.
-  _fr = s
+  _fr = scan
   while (match(_fr, /[A-Z_][A-Z0-9_]*/)) {
     _nm  = substr(_fr, RSTART, RLENGTH)
     _p   = substr(_fr, 1, RSTART - 1)
@@ -337,7 +366,7 @@ function row(kind, name, v, f, ln) {
     _vv = codeval(_fr)
     if (_vv != "") print "foreign", _nm, _vv + 0, f, FNR
   }
-  rest = s
+  rest = scan
   while (match(rest, /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)/)) {
     name = substr(rest, RSTART, RLENGTH)
     pre  = substr(rest, 1, RSTART - 1)
@@ -2389,7 +2418,9 @@ read-dash-d|unparseable|read -r -d \"\" AGENT_NEW_GATE_REFUSED
 printf-v-quoted|claim|printf -v \"AGENT_NEW_GATE_REFUSED\" %d 83
 getopts-builtin|unparseable|getopts \"\" AGENT_NEW_GATE_REFUSED
 arith-assign|claim|(( AGENT_NEW_GATE_REFUSED = 83 ))
-array-nested-subscript|unparseable|AGENT_NEW_GATE_REFUSED[a[0]]=83"
+array-nested-subscript|unparseable|AGENT_NEW_GATE_REFUSED[a[0]]=83
+printf-v-glued|claim|printf -vAGENT_NEW_GATE_REFUSED %d 83
+array-subscript-eq|unparseable|AGENT_NEW_GATE_REFUSED[a==b]=83"
 _resid_unread=""; _resid_unred=""
 while IFS='|' read -r _rtag _rkind _rline; do
   [ -n "$_rtag" ] || continue
