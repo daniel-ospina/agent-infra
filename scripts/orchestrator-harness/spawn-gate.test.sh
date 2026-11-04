@@ -2414,17 +2414,28 @@ ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_
 #   2. `lane_standdown_write <word>`  — a literal word passed straight to the record writer (#3331's form)
 #   3. `printf '<word>'` in `cap_refusal_gate` — the chain's own normaliser arm for that word
 # A new gate must arrive through one of them to be recordable at all; arriving through ANY of them now
-# puts it in this set, where a missing row is RED.
+# puts it in this set, where a missing row is RED. The word class is `[a-z][a-z0-9_-]*` — DIGITS AND
+# UNDERSCORES INCLUDED, because a narrower class does not drop such a word, it TRUNCATES it into a
+# different one (`land2` → `land`) and the equality then passes over a gate with no row.
+# ⛔ THE WORD CLASS MUST BE ABLE TO REPRESENT A GATE WORD, OR THE SEAM ABSORBS IT (P3, second fresh
+# review of `b0b65af5`). `[a-z][a-z-]*` stops at the first character outside it, so a word ending in a
+# digit does not vanish — it TRUNCATES INTO A DIFFERENT WORD: measured on the reviewed head,
+# `_cap_gate=land2` derived as `… land …` (baseline identical), so `land2` had no row, its arm was never
+# driven, and the equality above passed GREEN over a word in NEITHER side of the comparison — the same
+# shape as the `key` fail-open this commit fixes, one character class further out. Every gate word in
+# the tree is alphabetic today, so there is no live instance; the convention "gate words are [a-z-]" was
+# also stated nowhere, which made the universal claim below wider than the code under it. Digits and
+# underscores are representable now, so such a word arrives as ITSELF and a missing row is RED.
 _gatewords_derived_from() { # <dir> -> the gate words THIS deploy unit can record, space-separated
   {
-    grep -ohE '_cap_gate=[a-z][a-z-]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | sed 's/^_cap_gate=//'
+    grep -ohE '_cap_gate=[a-z][a-z0-9_-]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | sed 's/^_cap_gate=//'
     # A LITERAL word only: `lane_standdown_write "$_cap_gate"` (the replay of an already-classified
     # refusal) is not a new word, and the `[a-z]` anchor is what excludes it — the variable form starts
     # with a quote. The function's own definition line does not match either (it is followed by `()`).
-    grep -ohE 'lane_standdown_write [a-z][a-z-]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | awk '{print $2}'
+    grep -ohE 'lane_standdown_write [a-z][a-z0-9_-]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | awk '{print $2}'
     # The chain's normaliser: one `printf '<word>'` arm per word it will pass through as itself.
     sed -n '/^cap_refusal_gate()/,/^}/p' "$1/chain-merge.sh" 2>/dev/null \
-      | grep -oE "printf '[a-z][a-z-]*'" | sed "s/^printf '//; s/'$//"
+      | grep -oE "printf '[a-z][a-z0-9_-]*'" | sed "s/^printf '//; s/'$//"
   } | sort -u | tr '\n' ' '
 }
 _capwords_derived="$(_gatewords_derived_from "$HERE")"
@@ -2449,6 +2460,25 @@ case " $_gw_after " in *" mystery "*) rc=0 ;; *) rc=1 ;; esac
 ck "...and a NEW gate landed through that SAME seam is SEEN, so the row/word equality is a real claim rather than two lists agreeing to say nothing (before: '$_capwords_derived'; after: '${_gw_after:-<EMPTY>}')" $rc
 [ "$_gw_after" != "$_capwords_derived" ]; rc=$?
 ck "...and the derived set CHANGES for it, so an unseen gate cannot pass the equality above (the fail-open this arm exists for read GREEN: 82 appeared in no side of the comparison)" $rc
+# ⛔ AND A WORD THE CLASS CANNOT REPRESENT MUST NOT BE ABSORBED (P3, second fresh review of `b0b65af5`).
+# `[a-z][a-z-]*` TRUNCATED at a digit, so `land2` derived as the existing word `land`: no row, no arm,
+# equality GREEN — the `key` fail-open one character class further out. `land2` is chosen because it
+# collides with a word that IS in the table, which is the case a truncating class hides; `zzz2` would
+# have gone RED under a mangled name and looked healthy. Both are driven.
+_gw2="$TMP/gatewords2"; rm -rf "$_gw2"; mkdir -p "$_gw2"
+cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw2/"
+printf '\n_cap_gate=land2\n' >> "$_gw2/lane.sh"
+_gw2_after="$(_gatewords_derived_from "$_gw2")"; _gw2_after="${_gw2_after% }"
+case " $_gw2_after " in *" land2 "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a DIGIT-bearing gate word arrives as ITSELF, not truncated into an existing word (\\`land2\\` must appear, else it absorbs into \\`land\\`: derived: '${_gw2_after:-<EMPTY>}')" $rc
+[ "$_gw2_after" != "$_capwords_derived" ]; rc=$?
+ck "...so it CHANGES the derived set and a missing row is RED rather than an equality that passes over it" $rc
+_gw3="$TMP/gatewords3"; rm -rf "$_gw3"; mkdir -p "$_gw3"
+cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw3/"
+printf '\nlane_standdown_write zzz2 "$CAPACITY_YIELD_SECS"\n' >> "$_gw3/lane.sh"
+_gw3_after="$(_gatewords_derived_from "$_gw3")"; _gw3_after="${_gw3_after% }"
+case " $_gw3_after " in *" zzz2 "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the same for a word whose alpha prefix is NOT in the table (\\`zzz2\\`), which a truncating class reddened under a name that is not in the file: derived: '${_gw3_after:-<EMPTY>}'" $rc
 # The operator-facing half: the load REMEDY must not be printed for a capability refusal.
 chain_probe capability
 [ "$CHAIN_REMEDY" = "refused at the capability gate" ]; rc=$?
