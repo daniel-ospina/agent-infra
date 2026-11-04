@@ -937,6 +937,79 @@ case_n() { # <entry-point>
     return $((CASE_FAIL > 0))
 }
 
+# ── (v) THE TWO TALLIES THE RECORD USED TO DROP: `reaped=` AND `gone=` (#3057 review, P1 + P2) ─────
+# Both holes are the SAME defect class this suite exists for — a record that states something the pass did
+# not measure — and both are about DELETION, which is why they are P1/P2 rather than prose:
+#   * a sweep killed at CLASS_TIMEOUT prints no SUMMARY, so `reaped=` was the COERCED 0 and the entry point
+#     concluded the observed `df` change "belongs to another process", i.e. the class blamed someone else
+#     for the entry it had just deleted;
+#   * `gone=` (a job finished and the runner cleaned its own checkout) was never lifted, so a pass whose
+#     whole population VANISHED recorded exactly what an empty `_work` records.
+# The first arm uses a stub owner that really deletes an entry and exits 124 — the observable shape of a
+# watchdog kill, not a race against a real `timeout` (which flakes under load on exactly the box this
+# class exists for). The second drives a SUMMARY the owner would never print for an empty sink.
+case_v() { # <entry-point> <owner>
+    local pass="$1" owner="$2" base work dead stub out st s ps_out
+    # ── (v1) cut short on an ARMED pass, having already removed an entry ─────────────────────────────
+    base="$T/v1.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-v1)"
+    fixture_entry dead "$work" job-killed 180 4 || return 1   # 3 h old, real bytes
+    stub="$T/v-stub-cut.$$.$RANDOM.sh"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'rm -rf -- "%s"\n' "$dead"          # what a sweep killed mid-pass has already done
+        printf 'printf "REAP job-dead 4MB %%s\\n" "%s"\n' "$dead"
+        printf 'exit 124\n'                          # the watchdog kill: NO SUMMARY is printed
+    } >"$stub"; chmod +x "$stub"
+    PASS_OWNER="$stub"
+    s="$(uniqstate v1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s" "$base/gh-runner*/_work" --apply --only runner-work)"
+    st="$(status_of "$s")"
+    case_check "$([ ! -e "$dead" ] && echo 0 || echo 1)" \
+               "v1 the cut-short pass really DID delete the entry, so what follows is about a real deletion"
+    case_check "$(grep -q '^reaped_runner_work=?$' <<<"$st" && echo 0 || echo 1)" \
+               "v1 … the record answers reaped_runner_work=? — a DELETE the owner never answered is not a measured 0"
+    case_check "$(grep -qF 'CUT SHORT' <<<"$st" && echo 0 || echo 1)" \
+               "v1 … and the note NAMES the cut, so an operator is told the removal count is unknown"
+    case_check "$(grep -qF 'belongs to another process' <<<"$st" && echo 1 || echo 0)" \
+               "v1 … and it never asserts that the class removed nothing and another process caused the df change"
+    ps_out="$(DISK_REAPER_STATE_DIR="$s" bash "$pass" --print-status 2>/dev/null)"
+    case_check "$(grep -qE '(^|\|)reaped_runner_work=\?(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
+               "v1 … and --print-status RENDERS it, so the field has a reader and not only a writer"
+    # ── (v2) a VANISHED population must not read as an empty sink ──────────────────────────────────
+    base="$T/v2.$$.$RANDOM"; mkdir -p "$base"; s="$(uniqstate v2)"
+    stub="$T/v-stub-gone.$$.$RANDOM.sh"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'printf "GONE   %%s/ghost reason=vanished\\n" "%s"\n' "$base"
+        printf 'printf "SUMMARY class=runner-work mode=apply globs=1 roots=2 candidates=0 reaped=0 kept=0 retained=0 failed=0 unmeasurable=0 gone=2 refused=0 min_age=3600s explicit=1 census=ok\\n"\n'
+        printf 'exit 0\n'
+    } >"$stub"; chmod +x "$stub"
+    PASS_OWNER="$stub"
+    run_pass "$pass" "$s" "$base/gh-runner*/_work" --apply --only runner-work >/dev/null 2>&1
+    st="$(status_of "$s")"
+    case_check "$(grep -q '^gone_runner_work=2$' <<<"$st" && echo 0 || echo 1)" \
+               "v2 the record carries the owner's gone= tally (2), so a VANISHED population is not an empty one"
+    case_check "$(grep -q '^candidates_runner_work=0$' <<<"$st" && grep -q '^verdict_runner_work=ok$' <<<"$st" && echo 0 || echo 1)" \
+               "v2 … and every OTHER field reads exactly as an EMPTY sink does, so gone= is the only thing that parts them"
+    case_check "$(grep -qF 'VANISHED' <<<"$st" && echo 0 || echo 1)" \
+               "v2 … and the note NAMES it, so an operator does not have to know the field exists"
+    ps_out="$(DISK_REAPER_STATE_DIR="$s" bash "$pass" --print-status 2>/dev/null)"
+    case_check "$(grep -qE '(^|\|)gone_runner_work=2(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
+               "v2 … and --print-status renders it"
+    # ── (v3) ANSWERED: both are MEASUREMENTS, not a permanent ? ───────────────────────────────────
+    base="$T/v3.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-v3)"
+    fixture_entry dead "$work" job-young 5 1 || return 1
+    PASS_OWNER="$owner"
+    s="$(uniqstate v3)"
+    DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s" "$base/gh-runner*/_work" --apply --only runner-work >/dev/null 2>&1
+    st="$(status_of "$s")"
+    case_check "$(grep -q '^gone_runner_work=0$' <<<"$st" && echo 0 || echo 1)" \
+               "v3 a fully-answered pass that saw nothing vanish records gone_runner_work=0 — a MEASUREMENT"
+    case_check "$(grep -q '^reaped_runner_work=0$' <<<"$st" && echo 0 || echo 1)" \
+               "v3 … and reaped_runner_work=0, so an ANSWER clears the sentinel (the field is not a permanent ?)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── (r) a PARTLY-unreadable population is `census=partial`, and its count is a LOWER BOUND ────────
 # ⛔ THE ABSTENTION WAS ONLY IMPLEMENTED FOR THE TOTAL CASE (#3057 review, P1). `census=abstained` is
 # gated on `candidates=0`, so a pass that read ONE root and could not read ANOTHER published
@@ -1176,6 +1249,12 @@ MUT_B='s/-newer "\$ref" -print 2>\/dev\/null | head -1/-print 2>\/dev\/null | he
 # that merely prints it. A missing record line is the defect shape the review named: a field that looks
 # checked because it is present in a transcript.
 MUT_BV="/printf 'verdict_runner_work=/d"
+# ⛔ (v) HAS THREE ARMS AND THREE MUTANTS, one per assertion that matters: the GATE that stops a cut-short
+# pass from claiming a removal it never measured, the LIFT that carries the owner's `gone=`, and the RECORD
+# LINE that publishes `reaped_runner_work=` at all. A fix with no mutant is a claim, not a test.
+MUT_V_CS='s/if \[ "${HAVE_RW_REAPED:-0}" = 1 \]; then/if [ 1 = 1 ]; then/'
+MUT_V_GONE='s/^        \*) HAVE_RW_GONE=1; GONE_RW="\$_rw_gone" ;;$/        *) : ;;/'
+MUT_V_RR="/printf 'reaped_runner_work=/d"
 # ⛔ THE CARVE-OUT'S TWO SPELLINGS ARE ONE ARM: the derived table AND the runner-namespace default, so
 # the mutation removes both. Emptying only the table leaves `_tool`/`_actions`/`_temp` retained by the
 # `_`-prefix default and the case would pass on a tree with no table at all — the "mutant survived"
@@ -1498,6 +1577,23 @@ if apply_mutation "$OWNER" "$T/mut-t-instrumented/reap-runner-work.sh" "$MUT_T_I
     fi
 else
     bad "t the vanishing-root fixture could not be built (the sweep loop moved) — the race arm is not covered"
+fi
+
+expect_pass "v the two tallies the record used to drop — a cut-short DELETE is ?, a VANISHED sink is gone=" case_v "$REAPER" "$OWNER"
+if apply_mutation "$REAPER" "$T/mut-v-cs/disk-reaper.sh" "$MUT_V_CS"; then
+    expect_fail "v mutation: ungating the 'nothing removed / another process' arm turns the case RED (it claims a ledger answered)" case_v "$T/mut-v-cs/disk-reaper.sh" "$OWNER"
+else
+    bad "v mutation could not be applied (the HAVE_RW_REAPED gate moved) — the cut-short arm is not checked any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-v-gone/disk-reaper.sh" "$MUT_V_GONE"; then
+    expect_fail "v mutation: dropping the gone= lift turns the case RED (a vanished population reads as an empty sink)" case_v "$T/mut-v-gone/disk-reaper.sh" "$OWNER"
+else
+    bad "v mutation could not be applied (the gone lift moved) — that field is not checked any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-v-rr/disk-reaper.sh" "$MUT_V_RR"; then
+    expect_fail "v mutation: deleting reaped_runner_work= from the record turns the case RED (the removal count has no channel)" case_v "$T/mut-v-rr/disk-reaper.sh" "$OWNER"
+else
+    bad "v mutation could not be applied (the reaped record line moved) — that field is not checked any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from

@@ -298,6 +298,20 @@ RW_PARTIAL=0
 # distinction the whole class rests on. `?` until a fully-answered SUMMARY lifts a numeric value, the
 # same sentinel `HAVE_RW_CAND` carries (an initialised 0 is never published as a measurement).
 RW_UNMEAS='?'
+# ⛔ TWO MORE TALLIES THE OWNER ANSWERS AND THE RECORD USED TO DROP (#3057 review, P2s). Same sentinel
+# discipline as `RW_UNMEAS` and for the same reason: `?` until a lifted SUMMARY answers a numeric value,
+# so an UNANSWERED tally is never published as the initialised 0.
+#   `reaped=` — how many entries the owner REMOVED. Without it the record could not say what a cut-short
+#               (CLASS_TIMEOUT) pass had deleted, and the arm that attributes an unexplained `df` delta
+#               then asserted the class had removed NOTHING (the P1 the note arm now gates on
+#               `HAVE_RW_REAPED`).
+#   `gone=`   — entries/roots that VANISHED under the pass (a job finished and the runner cleaned its own
+#               checkout). A FACT, not an abstention; the owner already feeds it into its census decision
+#               and cases (s)/(t) exist to keep it out of `unmeasurable=` — but the record had no field for
+#               it, so "the sink was empty" and "the whole population vanished while we looked" were the
+#               same record (`candidates_runner_work=0 verdict_runner_work=ok`).
+REAPED_RW='?'; HAVE_RW_REAPED=0
+GONE_RW='?';   HAVE_RW_GONE=0
 RC_RW=0
 VERDICT_RW="not-run"
 NOTE_RW=""
@@ -528,6 +542,12 @@ print_status() {
     # without opening the record file — it is the only surface that distinguishes "nothing was written
     # for an hour" (reaped) from "the walk could not answer" (kept).
     log_line "unmeasurable_runner_work=$(status_field unmeasurable_runner_work)"
+    # … and its two siblings, on the same rule (#3057 review, P2s): a field written every pass and printed
+    # by nobody does not exist. `reaped_runner_work=?` is the only way a reader can see that a cut-short
+    # armed pass did not answer what it deleted, and `gone_runner_work=` is the only surface that separates
+    # an empty sink from a population that vanished under the pass.
+    log_line "reaped_runner_work=$(status_field reaped_runner_work)"
+    log_line "gone_runner_work=$(status_field gone_runner_work)"
     log_line "verdict_uv=$(status_field verdict_uv)"
     log_line "verdict_venv=$(status_field verdict_venv)"
     log_line "verdict_worktree=$(status_field verdict_worktree)"
@@ -2403,7 +2423,21 @@ reap_runner_work() {
     # The eighth field — the one the lift used to drop. Carried, never re-derived: the owner is the only
     # component that can say which entries its walk could not read.
     _rw_unmeasurable="$(kv_field "$_rw_line" unmeasurable)"
-    case "${_rw_reaped:-}" in ''|*[!0-9]*) _rw_reaped=0 ;; esac
+    # ⛔ THE COERCION STAYS (the arithmetic below needs a number) BUT IT IS NO LONGER A MEASUREMENT.
+    # `HAVE_RW_REAPED` records whether the owner ANSWERED, and every surface that STATES what was removed
+    # — the note arm and `reaped_runner_work=` — is gated on it. Without the sentinel a pass killed
+    # mid-sweep (no SUMMARY ⇒ no `reaped=`) read as "removed nothing", which is the opposite of what a
+    # killed deleter may have done (#3057 review, P1 — measured: a stub owner removed 40 MB and exited
+    # 124; the record said `freed_mb_runner_work=0` and the note blamed "another process").
+    case "${_rw_reaped:-}" in
+        ''|*[!0-9]*) _rw_reaped=0 ;;
+        *) HAVE_RW_REAPED=1; REAPED_RW="$_rw_reaped" ;;
+    esac
+    _rw_gone="$(kv_field "$_rw_line" gone)"
+    case "${_rw_gone:-}" in
+        ''|*[!0-9]*) : ;;                       # unanswered: `GONE_RW` stays `?`, never an invented 0
+        *) HAVE_RW_GONE=1; GONE_RW="$_rw_gone" ;;
+    esac
     case "${_rw_unmeasurable:-}" in
         ''|*[!0-9]*) : ;;                       # unanswered: `RW_UNMEAS` stays `?`, never an invented 0
         *) RW_UNMEAS="$_rw_unmeasurable"
@@ -2479,13 +2513,38 @@ reap_runner_work() {
             *) CAND_RW="$_rw_cand"; HAVE_RW_CAND=1 ;;
         esac
     fi
+    # ⛔ A VANISHED POPULATION IS A FACT AND NEEDED ITS OWN CHANNEL (#3057 review, P2). The owner counts
+    # `gone=` and feeds it into its census decision; cases (s)/(t) exist to keep "the entry/root no longer
+    # exists" OUT of `unmeasurable=`, because a gone root is a fact about the box, not a doubt about
+    # permissions. But the entry point never lifted the field, so a pass whose whole population vanished
+    # recorded `candidates_runner_work=0 verdict_runner_work=ok` — byte-identical to a sink that was simply
+    # empty. Carried in `gone_runner_work=` AND named here, because the field alone does not tell an
+    # operator that the sink moved under the pass.
+    case "${GONE_RW:-?}" in
+        ''|*[!0-9]*) : ;;                       # unanswered: never invent a tally
+        *) [ "$GONE_RW" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${GONE_RW} entr$( [ "$GONE_RW" = 1 ] && printf 'y' || printf 'ies')/root$( [ "$GONE_RW" = 1 ] && printf '' || printf 's') VANISHED during the pass (a job finished and the runner cleaned its own checkout); nothing under them was measured and nothing was removed — a fact about the box, not an abstention; see gone_runner_work" ;;
+    esac
     # ⛔ NOTHING REMOVED MEANS THE DELTA IS NOT OURS. Another lane (or a runner finishing a job, or the
     # runner's own cleanup) moves `df` inside the window; crediting it would report a reclaim this class
     # did not cause — the false credit `df`-instead-of-`du` was adopted to stop, arriving through the
     # other door. The observation is still reported, AS an observation (`df_raw`), and named in the note.
+    # ⛔ AND IT IS ONLY TRUE WHEN THE OWNER ANSWERED (#3057 review, P1). "Removed nothing" is a claim
+    # about the LEDGER, so it may only be made on the owner's own `reaped=0`. A sweep cut short by
+    # `CLASS_TIMEOUT` prints no SUMMARY, so `_rw_reaped` is the COERCED 0 — and this arm then asserted the
+    # class had removed NOTHING while attributing the delta it had just caused to "another process".
+    # MEASURED with a stub owner that removes 40 MB and exits 124: the record read
+    # `freed_mb_runner_work=0` beside `note_runner_work=nothing removed: the 40MB df change belongs to
+    # another process`. On a deleter that sentence is the opposite of what happened, so an unanswered
+    # ledger now reports the delta as UNMEASURED and names it as possibly this class's OWN.
     if [ "$_rw_reaped" = 0 ] && ! is_dry; then
-        if [ "$raw" != 0 ]; then
-            _rw_why="nothing removed: the ${raw}MB df change belongs to another process (not attributed)"
+        if [ "${HAVE_RW_REAPED:-0}" = 1 ]; then
+            if [ "$raw" != 0 ]; then
+                _rw_why="nothing removed: the ${raw}MB df change belongs to another process (not attributed)"
+                NOTE_RW="${NOTE_RW}${NOTE_RW:+; }$_rw_why"
+            fi
+        else
+            _rw_why="CUT SHORT (rc=$rc): reap-runner-work.sh never answered reaped=, so what it removed is UNMEASURED"
+            [ "$raw" != 0 ] && _rw_why="$_rw_why — the ${raw}MB df change MAY BE ITS OWN (unattributed; this is NOT proof another process caused it)"
             NOTE_RW="${NOTE_RW}${NOTE_RW:+; }$_rw_why"
         fi
         freed=0
@@ -2552,12 +2611,12 @@ reap_runner_work() {
         # ⛔ `kept=` IS NOT A DECISION AND `unmeasurable=` IS AN ABSTENTION — both are on the line, so an
         # operator reading the class line alone can tell "ten entries were written within the floor" from
         # "ten entries could not be read at all" (the second is a broken probe, not a healthy box).
-        log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=dry-run candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") would_free_du=${WOULD_RW}MB (du estimate) freed_df=0MB min_age=${RUNNER_MIN_AGE}s retained=${_rw_retained:-?} kept=$(_tally_num "$HAVE_RW_CAND" "${_rw_kept:-?}") unmeasurable=$RW_UNMEAS roots=${_rw_roots:-?}"
+        log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=dry-run candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") would_free_du=${WOULD_RW}MB (du estimate) freed_df=0MB min_age=${RUNNER_MIN_AGE}s retained=${_rw_retained:-?} kept=$(_tally_num "$HAVE_RW_CAND" "${_rw_kept:-?}") unmeasurable=$RW_UNMEAS roots=${_rw_roots:-?} gone=$(_tally_num "$HAVE_RW_GONE" "$GONE_RW")"
     else
         if [ "${DF_RW_OK:-0}" = 1 ]; then
-            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=${FREED_RW}MB df_raw=${RAW_RW}MB (df delta) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
+            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=${FREED_RW}MB df_raw=${RAW_RW}MB (df delta) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_REAPED" "$REAPED_RW") gone=$(_tally_num "$HAVE_RW_GONE" "$GONE_RW") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
         else
-            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_CAND" "${_rw_reaped:-?}") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
+            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_REAPED" "$REAPED_RW") gone=$(_tally_num "$HAVE_RW_GONE" "$GONE_RW") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
         fi
     fi
     return 0
@@ -2770,6 +2829,21 @@ record_body() {
         esac
     }
     printf 'unmeasurable_runner_work=%s\n' "$(_unmeas_rec)"
+    # ⛔ THE OTHER TWO TALLIES THE RECORD USED TO DROP (#3057 review, P2s), on `_unmeas_rec`'s polarity
+    # rather than `_tally_rec`'s: a class that could not be SET UP answers `?` (it measured nothing), a
+    # class this pass did not SELECT answers `not-run`, and otherwise the owner's own answer — `?` when the
+    # owner never answered, which is exactly the cut-short case. `reaped_runner_work=` is the machine
+    # channel for "what did it delete" (so a `?` beside `freed_mb_runner_work=0` says the figure is not a
+    # measurement), and `gone_runner_work=` is the channel that tells an empty sink from a vanished one.
+    _rw_tally_rec() {
+        case "${VERDICT_RW:-not-run}" in
+            misconfigured) printf '?' ;;
+            not-run)       printf 'not-run' ;;
+            *) [ "${WANT_RW:-0}" = 1 ] && printf '%s' "$1" || printf 'not-run' ;;
+        esac
+    }
+    printf 'reaped_runner_work=%s\n' "$(_rw_tally_rec "$REAPED_RW")"
+    printf 'gone_runner_work=%s\n' "$(_rw_tally_rec "$GONE_RW")"
     printf 'cand_runner_work=%s\n' "$(_class_rec "${VERDICT_RW:-not-run}" "${WANT_RW:-0}" "${HAVE_RW_CAND:-0}" "$CAND_RW")"
     # The class's own cause channel. `detail=` still carries it joined with its siblings (the supervisor
     # prints one line); this field exists so a reader can ask "why is runner-work not ok" without
