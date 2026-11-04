@@ -127,6 +127,15 @@ CAPACITY_LIB="${CAPACITY_LIB:-$SELF_DIR/orchestrator-harness/capacity.sh}"
 # listener is ever restarted.
 SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
 
+# ── canonical label set, ONE source (#2875) ────────────────────────────────────────────────────
+# The pool's runners must ALWAYS advertise their arch marker AND `ubuntu-latest`; the healer
+# (`ci_runner_starvation.sh`) and this provisioning path read the set from the SAME library, so a
+# re-provision cannot reintroduce the gap the 2026-10-27 starvation incident was (every runner
+# advertising `self-hosted-x64` while every workflow asks `ubuntu-latest`).
+LABELS_LIB="${LABELS_LIB:-$SELF_DIR/lib/ci-runner-labels.sh}"
+# shellcheck source=lib/ci-runner-labels.sh
+. "$LABELS_LIB" || { printf '%s\n' "cannot-measure why=labels-lib-absent path=$LABELS_LIB" >&2; exit 2; }
+
 RUNNER_ROOT="${RUNNER_ROOT:-/tmp/actions-runner}"
 RUNNER_TEMPLATE="${RUNNER_TEMPLATE:-$RUNNER_ROOT/_template}"
 MEM_FLOOR_MB="${RUNNER_MEM_FLOOR_MB:-3584}"   # 3.5 GB, the floor the gate refused at (#2373)
@@ -134,8 +143,8 @@ CORES_PER_SLOT="${RUNNER_CORES_PER_SLOT:-3}"  # 8 cores -> 3 slots, 4 cores -> 2
 SETTLE_S="${RUNNER_START_SETTLE_S:-5}"        # how long a just-started listener gets to appear
 POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"
 GH_CMD="${RUNNER_POOL_GH:-gh}"
-POOL_LABEL_X64="self-hosted-x64"
-POOL_LABEL_ARM64="self-hosted-arm64"
+POOL_LABEL_X64="$CI_RUNNER_LABEL_X64"
+POOL_LABEL_ARM64="$CI_RUNNER_LABEL_ARM64"
 
 DRY=0
 MEM_MB=""; NCPU=""; CEILING=""; LISTENER_PID=""; SLOTS=""
@@ -224,6 +233,26 @@ pool_label_for_host() {
     arm64|aarch64)         printf '%s' "$POOL_LABEL_ARM64" ;;
     *) return 1 ;;
   esac
+}
+
+# assert_runner_labels <name> — the POST-FINISH label assertion (agent-infra#2875, the actual fix).
+# Registration succeeding is NOT the contract: the runner is not healthy until it ADVERTISES the
+# canonical label set. A runner registered without `ubuntu-latest` is the starved-pool defect, so
+# this re-reads GitHub and applies the SAME predicate the healer uses
+# (`ci_runner_labels_have_canonical`) — the one check, not two copies.
+# rc 0 canonical · 1 read-and-missing · 2 cannot-measure (fail-closed: the healer is the net).
+assert_runner_labels() {
+  local name="$1" rows nm lb found=0 labels=""
+  # ⛔ --paginate is REQUIRED: a pool larger than one page would otherwise hide the just-registered
+  # runner on a later page and read as a false cannot-measure.
+  rows="$("$GH_CMD" api --paginate "repos/$POOL_REPO/actions/runners" --jq '.runners[] | [.name, ([.labels[].name] | join(","))] | @tsv' 2>/dev/null)" || return 2
+  while IFS=$'\t' read -r nm lb; do
+    [ "$nm" = "$name" ] || continue
+    found=1; labels="$lb"; break
+  done <<<"$rows"
+  [ "$found" = 1 ] || return 2
+  ci_runner_labels_have_canonical "${labels//,/ }" || return 1
+  return 0
 }
 
 # ── the pool as it stands ────────────────────────────────────────────────────────────────────
@@ -624,6 +653,14 @@ cmd_add() {
     *",$POOL_LABEL_X64,"*|*",$POOL_LABEL_ARM64,"*) ;;
     *) err "cannot-measure why=label-unknown value=$label — a runner without $POOL_LABEL_X64/$POOL_LABEL_ARM64 matches no job and is invisible to ci_runner_gate.sh"; return 2 ;;
   esac
+  # ⛔ THE CANONICAL SET IS MARKER **AND** ubuntu-latest (#2875). A runner registered with only the
+  # marker is the 2026-10-27 starvation shape: advertised, online, and matching no `runs-on:
+  # ubuntu-latest` job. The label APPENDS `ubuntu-latest` here (never replaces the override's extra
+  # labels), and the post-finish assertion below re-checks it on GitHub.
+  case ",$label," in
+    *",$CI_RUNNER_LABEL_UBUNTU,"*) ;;
+    *) label="$label,$CI_RUNNER_LABEL_UBUNTU" ;;
+  esac
   say "reading: MemAvailable=$(mb_as_gb "$MEM_MB") GB (${MEM_MB} MB) floor=$(mb_as_gb "$MEM_FLOOR_MB") GB ncpu=$NCPU ceiling=$CEILING slots=$SLOTS labels=$label"
 
   [ -x "$RUNNER_TEMPLATE/config.sh" ] || {
@@ -733,6 +770,16 @@ cmd_add() {
     err "registered=1 listener=dead name=$name dir=$dir — the registration is in place; run: $SELF restart --name $name"
     return 2
   fi
+  # ⛔ POST-FINISH LABEL ASSERTION (#2875) — the actual fix, not the net. A runner that registered
+  # but does NOT advertise the canonical set is the starved-pool defect; the healer is the safety
+  # net for EXISTING runners, this is the gate that stops a re-provision from reintroducing the gap.
+  local ar_rc=0
+  assert_runner_labels "$name" || ar_rc=$?
+  case "$ar_rc" in
+    0) : ;;
+    1) err "label-assertion-failed name=$name — registered, but GitHub does NOT show the canonical label set ($CI_RUNNER_LABEL_X64/$CI_RUNNER_LABEL_ARM64 + $CI_RUNNER_LABEL_UBUNTU); the healer (ci_runner_starvation.sh) is the net"; return 2 ;;
+    *) err "cannot-measure why=label-assertion-unreadable name=$name (the runner was registered but its labels could not be re-read — the healer will verify)"; return 2 ;;
+  esac
   say "added name=$name dir=$dir listener_pid=$(listener_pid "$dir")"
   return 0
 }

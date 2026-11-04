@@ -1,0 +1,24 @@
+[Unit]
+# Every two minutes, measured from the last pass (`OnUnitActiveSec`) rather than from the wall clock.
+#
+# ⛔ THE SPACING IS THE DETECTOR'S PERSISTENCE CONTRACT, NOT A CADENCE PREFERENCE. The invariant is
+# `queued>0 AND busy==0` persistent across 3 consecutive samples ~2 min apart; this timer IS the ~2
+# min, so a starved pool trips the heal ladder after ~6 min. A wall-clock `OnCalendar=*:0/2` would
+# express the same idea but the monotonic form is exactly two minutes between samples whatever else
+# the box is doing, and it is the same form the harness-apply timer already uses.
+#
+# ⛔ `Persistent=` IS DELIBERATELY ABSENT. It only means anything for `OnCalendar=` timers; on a
+# monotonic timer it is ignored, and writing it would claim a catch-up behaviour that does not happen.
+# The reboot case is covered by `OnBootSec` below: a box that was off runs one pass two minutes after
+# it comes back.
+Description=eldato ci runner starvation check every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+# Spread the fleet's ticks so two cells do not hit the GitHub API at the same second.
+RandomizedDelaySec=20
+Unit=eldato-ci-starvation.service
+
+[Install]
+WantedBy=timers.target

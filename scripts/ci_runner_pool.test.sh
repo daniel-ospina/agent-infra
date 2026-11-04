@@ -125,6 +125,29 @@ if [ -n "${FIXTURE_GH_LATE_REGISTER:-}" ]; then
   esac
 fi
 case "$*" in *registration-token*) printf 'tok-fixture\n'; exit 0 ;; esac
+# ⛔ POST-FINISH LABEL ASSERTION (#2875): `add` re-reads the runner list after registering and
+# verifies the canonical set. The shim emits ONE runner row per registered instance dir, with the
+# labels the add path derived (the same `--labels` it passed to config.sh, completed with
+# `ubuntu-latest`). FIXTURE_GH_RUNNER_LABELS overrides the per-runner labels for the assertion-
+# failure case (a runner that registered but did not advertise the canonical set).
+case "$*" in *"actions/runners"*)
+  for d in "${RUNNER_ROOT:?}"/*/ "${RUNNER_ROOT:?}"/.[!.]*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    [ -e "$d/.runner" ] || [ -L "$d/.runner" ] || continue
+    nm="$(basename "$d")"
+    if [ -n "${FIXTURE_GH_RUNNER_LABELS:-}" ]; then
+      # the assertion-failure fixture: GitHub advertises EXACTLY this, which may lack ubuntu-latest
+      lb="$FIXTURE_GH_RUNNER_LABELS"
+    else
+      # the happy path: the add derived the canonical set (marker + ubuntu-latest)
+      lb="${RUNNER_LABELS:-self-hosted-x64}"
+      case ",$lb," in *",ubuntu-latest,"*) ;; *) lb="$lb,ubuntu-latest" ;; esac
+    fi
+    printf '%s\t%s\n' "$nm" "$lb"
+  done
+  exit 0 ;;
+esac
 exit 1
 STUB
 cat >"$BIN/ps" <<'STUB'
@@ -279,15 +302,15 @@ echo "── add: above the floor ──"
 fresh_pool add; reset_logs
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-a)"
 assert_eq "$?" "0" "add above the floor exits 0"
-assert_contains "$out" "reading: MemAvailable=11.72 GB (12000 MB) floor=3.50 GB ncpu=8 ceiling=3 slots=0 labels=self-hosted-x64" \
-  "add PRINTS THE READING IT USED, including the label it registered (owner decision #2344)"
+assert_contains "$out" "reading: MemAvailable=11.72 GB (12000 MB) floor=3.50 GB ncpu=8 ceiling=3 slots=0 labels=self-hosted-x64,ubuntu-latest" \
+  "add PRINTS THE READING IT USED, including the CANONICAL label set it registered (owner decision #2344, #2875)"
 assert_contains "$out" "added name=pi-runner-a" "add reports the runner it added"
 assert_file "$RUNNER_ROOT/pi-runner-a/.runner" "the registration marker lands in the INSTANCE dir"
 assert_file "$RUNNER_ROOT/pi-runner-a/config.sh" "the instance dir holds a complete install"
 assert_absent "$TEMPLATE/.runner" "the shared template was not mutated"
 assert_contains "$(cat "$CONFIG_LOG")" "$RUNNER_ROOT/pi-runner-a | " \
   "config.sh ran with ITS OWN directory as cwd (GitHub's contract, not the caller's)"
-assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-x64" "config.sh was given the pool marker"
+assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-x64,ubuntu-latest" "config.sh was given the CANONICAL set (pool marker + ubuntu-latest, #2875)"
 assert_contains "$(cat "$CONFIG_LOG")" "--token tok-fixture" "config.sh was given a registration token"
 # ⛔ The URL is the argument whose absence made every real `add` fail while the suite stayed green.
 assert_contains "$(cat "$CONFIG_LOG")" "--url https://github.com/daniel-ospina/tortoise" \
@@ -919,15 +942,24 @@ assert_contains "$out" "cannot-measure why=arch-unknown" "it names the arch it c
 assert_absent "$RUNNER_ROOT/pi-runner-z" "it registered nothing"
 fresh_pool label
 assert_contains "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_LABELS=self-hosted-arm64 run add --name pi-runner-z)" \
-  "labels=self-hosted-arm64" "RUNNER_LABELS overrides the derived marker"
-assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-arm64" "and config.sh received that marker"
+  "labels=self-hosted-arm64,ubuntu-latest" "RUNNER_LABELS overrides the derived marker, ubuntu-latest appended"
+assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-arm64,ubuntu-latest" "and config.sh received that marker plus ubuntu-latest"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_LABELS=self_hosted_x64 run add --name pi-runner-typo)"
 assert_eq "$?" "2" "a label override WITHOUT a pool marker is cannot-measure (rc 2), never a jobless runner"
 assert_contains "$out" "cannot-measure why=label-unknown" "it names the bad label"
 assert_absent "$RUNNER_ROOT/pi-runner-typo" "it registered nothing"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_LABELS='self-hosted-x64,extra-label' run add --name pi-runner-extra)"
 assert_eq "$?" "0" "a label LIST containing the marker is accepted"
-assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-x64,extra-label" "the extra labels reach config.sh"
+assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-x64,extra-label,ubuntu-latest" "the extra labels reach config.sh AND ubuntu-latest is appended"
+
+# ⛔ POST-FINISH LABEL ASSERTION (#2875, the actual fix): a runner that REGISTERED but does not
+# advertise the canonical set must FAIL the add — the healer is the net, this is the gate.
+fresh_pool assertlabel; reset_logs
+out="$(FIXTURE_GH_RUNNER_LABELS=self-hosted-x64 FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-nocanon)"
+assert_eq "$?" "2" "an add whose registered labels LACK ubuntu-latest fails the post-finish assertion (rc 2)"
+assert_contains "$out" "label-assertion-failed" "it names the label assertion, not the registration"
+assert_contains "$out" "pi-runner-nocanon" "it names the runner"
+assert_file "$RUNNER_ROOT/pi-runner-nocanon/.runner" "the registration is NOT destroyed — the healer is the net, not this gate"
 
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$T/nope" run add --name pi-runner-t)"
 assert_eq "$?" "2" "a missing runner template is cannot-act (rc 2)"
@@ -1124,7 +1156,9 @@ assert text.count(needle) == 1, "the floor comparison moved: update the mutation
 open(dst, "w", encoding="utf-8").write(text.replace(needle, '[ "$MEM_MB" -lt 0 ]'))
 PY
 assert_file "$MUT" "the mutation copy was produced"
-mut_out="$(FIXTURE_MEM_MB=2263 FIXTURE_NCPU=8 bash "$MUT" add --name pi-runner-mut 2>&1)"
+# ⛔ The mutant's SELF_DIR is $T (the copy's own dir), so its canonical-label lib is not beside it.
+# Point it at the SHIPPED lib — the mutation target is the FLOOR, not the lib resolution.
+mut_out="$(LABELS_LIB="$SCRIPT_DIR/lib/ci-runner-labels.sh" FIXTURE_MEM_MB=2263 FIXTURE_NCPU=8 bash "$MUT" add --name pi-runner-mut 2>&1)"
 mut_rc=$?
 assert_eq "$mut_rc" "0" "the MUTANT no longer refuses below the floor (the floor assertion is live)"
 assert_contains "$mut_out" "added name=pi-runner-mut" "the mutant proceeds to add — so case 2 pins the floor"
