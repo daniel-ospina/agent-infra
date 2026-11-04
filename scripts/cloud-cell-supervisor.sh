@@ -2646,7 +2646,14 @@ cmd_check() {
   # `. "$SELF/spawn-gate.sh" || exit 78`, and dispatch-merge.sh runs `bash '$O/lane.sh'`, so `$SELF` is
   # `$O` — a cell without it has its every lane die at startup while `check` printed the green banner.
   # install.sh:812 already required it; this list did not.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
+  # ⛔ AND EVERY HELPER `lane.sh` REFUSES *LOUDLY* WITHOUT BELONGS HERE TOO (review round 3, P2, verified
+  # `grep -c` = 0 for all four on the pre-change tree). `lane.sh` sources each of these with
+  # `. "$SELF/<f>" || { …; exit 78; }`, so a $O missing one makes EVERY dispatch on the box die at
+  # startup — while this list, whose own comment says it exists to prevent exactly that false PASS,
+  # certified the box runnable. `key-gate.sh` (#3331) and `lane-env.sh` (#3060) are the two newest;
+  # `brief-gate.sh` (#2258) and `wt-lifecycle.sh` (#2033) are older instances of the same class and were
+  # equally absent, so they are added with it rather than left as the next thing to be found by hand.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"

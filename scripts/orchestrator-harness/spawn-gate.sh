@@ -2264,6 +2264,91 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       echo "[capability-gate] WARN $label: cell-lane-preflight.sh not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this spawn starts with NO evidence the box can complete a call and return (#2935). Redeploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log"
     fi
   fi
+  # ── THE UV PIN, APPLIED AT THE SPAWN SEAM (agent-infra#2159) ─────────────────────────────────────
+  # `uv-env.sh`'s header lists the delivery paths its pin (`UV_CACHE_DIR` + `UV_LINK_MODE`) was wired
+  # into: the macOS launchd plist, the Linux cell bring-up, the cell supervisor, and the per-lane env
+  # snapshot `worker-terminal.sh` writes. THIS function was not among them, so a lane started here
+  # took both from the ambient environment — measured 2026-11-03 on pi-cell-1 and pi-cell-4: unset
+  # ambient AND unset after sourcing `keys.env`, with `uv`'s default link mode `clone`, which is a full
+  # copy on a filesystem that cannot clone. `docs/ops/lane-venv-reaper-policy.md` states the retention
+  # rule this violates: "`UV_LINK_MODE` is never unset on a cell" (rule 3), and its companion "the cache
+  # stays on the same filesystem as the worktrees" (rule 2), because cross-filesystem linking degrades
+  # to a full copy — the two classes are 58x apart and `du` CANNOT tell them apart.
+  # ⛔ SO THIS BLOCK DOES NOT CLAIM A SIZE. A `du -sm .venv` of 5,705 MB (measured on cell-1) is the
+  # ambiguous reading that document exists to prevent — cell-1's cache is 12 GB and its recorded
+  # normal is "venvs hardlink -> ~FREE", so that venv may well be in the free class. What is NOT
+  # ambiguous is that the pin was absent; that is the defect, and it is what this fixes.
+  # SCOPE, STATED: the launchers that reach this function are `lane.sh`, `fix-one.sh` and
+  # `nonblocking-dispatch.sh`. It is NOT every launcher — `lane-exec.sh` `exec`s `pi` directly and
+  # carries its own copy of this block; `merge-one.sh` has its own `run_agent()` and `review-pr.sh`
+  # spawns `pi` itself (both reviewer paths, whose briefs do not `uv sync`, so neither materialises a
+  # lane venv — a named residual, not an oversight).
+  # ⛔ AN OPERATOR'S PIN ALWAYS WINS: `uv_env_apply` fills only what is UNSET (its own tested contract),
+  # so a box that chose `copy` or another cache keeps it and `UV_ENV_DEFAULTED=none` says so.
+  # ⛔ AND IT MUST NOT BE ABLE TO REFUSE A SPAWN — a box with an odd install must not stop starting
+  # lanes; that is worse than the disk it saves. Every step degrades, and an unusable helper is LOUD
+  # (the neighbours warn rather than dropping it silently: `worker-terminal.sh` "the pin itself is not
+  # optional", and the capability gate above logs a WARN when ITS helper is missing).
+  {
+    local _uvdir _uvbase _uvsame
+    _uvdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _uvdir=""
+    _uvbase="${CELL_HOME:-${HOME:-}}"
+    if [ -z "$_uvdir" ] || [ ! -r "$_uvdir/uv-env.sh" ]; then
+      echo "[uv-env] WARN $label: uv-env.sh not readable beside this helper (looked in '${_uvdir:-unresolved}') — this spawn runs with NO cache/link-mode pin, so a venv it creates may be a full copy (#2159). Redeploy the harness to fix; the spawn proceeds." >> "$log"
+    elif [ -z "$_uvbase" ]; then
+      # With both HOME and CELL_HOME empty the helper resolves `/.cache/uv` — a root-level cache nobody
+      # created. Skipping leaves uv's own default, i.e. the pre-change behaviour, and says so.
+      echo "[uv-env] WARN $label: neither CELL_HOME nor HOME is set, so there is no base to resolve a cache under — this spawn runs with NO pin (uv's own default). Not applying a root-level '/.cache/uv'." >> "$log"
+    else
+      # shellcheck source=/dev/null
+      . "$_uvdir/uv-env.sh" 2>/dev/null || true
+      if command -v uv_env_apply >/dev/null 2>&1; then
+        uv_env_apply "$_uvbase" 2>/dev/null || true
+        export UV_CACHE_DIR UV_LINK_MODE
+        # RETENTION RULE 2, MEASURED RATHER THAN ASSUMED: a cache on a different filesystem from the
+        # worktree degrades hardlinking to a full copy silently, so the log carries the device
+        # comparison beside the requested mode.
+        # ⛔ BOTH READS MUST SUCCEED, OR THE ANSWER IS `?`. `stat -c %d` is GNU-only: on BSD/macOS it
+        # exits 1 with EMPTY output, so two guarded substitutions both become the empty string and
+        # compare EQUAL — an affirmative `same_fs=yes` from ZERO successful reads, in the one place a
+        # reader can check rule 2, on a host this very block runs on (the macOS launchd path). Measured
+        # on the hub: `stat -c %d /tmp` → rc=1, out=[]. So the BSD form is a fallback, and an empty or
+        # partial read is `?` — the block's own contract two lines up.
+        _uvdev() { # <path> -> device number, or empty when unreadable
+          local _d
+          _d="$(stat -c %d "$1" 2>/dev/null || stat -f %d "$1" 2>/dev/null || true)"
+          printf '%s' "$_d"
+        }
+        _uvsame="?"
+        if [ -n "${UV_CACHE_DIR:-}" ] && [ -d "${DISK_GATE_PATH:-$PWD}" ]; then
+          # The cache directory may not exist yet (uv creates it on first sync), so compare the nearest
+          # EXISTING ancestor — that is the filesystem the entries will land on.
+          _uvcand="${UV_CACHE_DIR:-}"
+          while [ -n "$_uvcand" ] && [ ! -e "$_uvcand" ]; do
+            _uvparent="$(dirname "$_uvcand")"
+            [ "$_uvparent" = "$_uvcand" ] && break
+            _uvcand="$_uvparent"
+          done
+          _uvdev_cache="$(_uvdev "$_uvcand")"
+          _uvdev_wt="$(_uvdev "${DISK_GATE_PATH:-$PWD}")"
+          if [ -n "$_uvdev_cache" ] && [ -n "$_uvdev_wt" ]; then
+            if [ "$_uvdev_cache" = "$_uvdev_wt" ]; then _uvsame=yes; else _uvsame=no; fi
+          fi
+        fi
+        # ⛔ NO BACKTICKS IN AN EMITTED STRING. The first cut of the residual below read
+        # "`uv-env.sh`'s recorded choice" inside a DOUBLE-QUOTED `echo` — i.e. a LIVE command
+        # substitution on the busiest path in the harness: the shell resolved `uv-env.sh` on PATH and
+        # spliced its output into the log line, or printed `command not found` on stderr, on EVERY
+        # spawn. Nothing executes the string a test greps, which is why two rounds missed it; a review
+        # ran the block against a stub on PATH and saw its output land mid-line. Plain words only.
+        # RECOVERY, for the record: a poisoned cache entry is cleared with `uv cache clean` + a re-sync,
+        # NOT `uv cache prune` — prune removes UNUSED entries, and one a live venv shares is in use.
+        echo "[uv-env] link_mode=${UV_LINK_MODE:-<unset>} cache_dir=${UV_CACHE_DIR:-<unset>} defaulted=${UV_ENV_DEFAULTED:-none} same_fs=${_uvsame} same_fs_target=${DISK_GATE_PATH:-$PWD} (rule 2: a cross-filesystem cache degrades hardlinks to a full copy; '?' means NOT COMPARED — either no readable target or a device read failed; rule 3: the link mode is never unset on a cell — #2159; residual: on a clone-capable filesystem hardlink shares INODES where uv's own default would copy-on-write — deliberate, uv-env.sh's recorded choice)" >> "$log"
+      else
+        echo "[uv-env] WARN $label: uv-env.sh is readable but defines no uv_env_apply (a truncated or version-skewed copy) — this spawn runs with NO pin (#2159). Redeploy the harness." >> "$log"
+      fi
+    fi
+  }
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`

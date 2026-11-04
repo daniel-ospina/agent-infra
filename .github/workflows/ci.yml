@@ -281,6 +281,89 @@ jobs:
         # runs is a suite the repo does not have.
         run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py -x --timeout=60 -q
 
+  sanctioned-pin:
+    # ⛔ ITS OWN JOB, NOT A STEP IN `verify` (agent-infra#3121). The pin-freshness
+    # gate below is a NO-OP GATE when it shares a job: it sat ~50 steps into
+    # `verify`, so any earlier failure there skipped it and the job was red for a
+    # DIFFERENT reason — nothing looked wrong, and the gate that says "a stale pin
+    # cannot reach main silently" never ran on the PR that made the pin stale.
+    # MEASURED: PR #3103 (`653b935e3`) changed a pinned script without a re-cut,
+    # `verify` failed at its 41st step, the pin step was `skipped`, and the stale
+    # pin merged; `main` was then red on `extension-tests / unit-test` and every
+    # branch after it was graded against a red base. A gate that can be disarmed
+    # by an unrelated red is not a gate, so it gets a job whose ONLY steps are
+    # these two: nothing else in a job can skip them, and `verify` failing
+    # elsewhere now leaves this verdict intact and visible on its own check name.
+    # Same class as agent-infra#2741's shard identity: name the check, so a red
+    # that is not yours is distinguishable from one that is.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # #2818 — this gate judges the PR's OWN COMMIT, not the synthetic merge
+          # GitHub checks out for `pull_request` (a merge result mixes the branch's
+          # pin with `main`'s scripts, so the verdict tracked how far `main` had
+          # moved). Depth 2 = the merge commit plus its two parents, i.e. the head
+          # tree, without a full clone.
+          fetch-depth: 2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: main-worktree-guard sanctioned-script IDENTITY + pin (#2332)
+        # The exemption for `SANCTIONED_SCRIPT_RELPATHS` was a realpath STRING
+        # EQUALITY against the module's own checkout, which is only correct where
+        # the guard and the scripts live in ONE tree. On a copy-deployed box the
+        # module root is `~/.pi/agent` (partial `scripts/`, no `admin-merge.sh`
+        # at all, #2176) while the rail lives in `$AGENT_INFRA_PATH/scripts/` —
+        # so the mandated merge rail was REFUSED from every hub-rooted session
+        # and the only routes left were the hatch or a bare `gh pr merge` that
+        # skips every comparison the rail makes. This suite pins the two halves
+        # that make the widened exemption safe — sanctioned relpath INSIDE a
+        # framework checkout, sha256 equal to the pin, AND the audited DELEGATION
+        # CLOSURE (every `$SELF_DIR` helper the script executes) — and MUTATES the
+        # shipped source to prove each part is load-bearing (literal-path equality
+        # restored ⇒ the rail blocks again; leaf digest dropped ⇒ a renamed
+        # destructive script is allowed; root check dropped ⇒ a non-framework dir
+        # is exempted; closure dropped ⇒ the pinned rail runs an agent-chosen
+        # `ci_exemption.py`, its own grader). It is a PIN-FRESHNESS gate
+        # too: a PR that changes (or deletes) a listed script — or a helper one of
+        # them executes by its own location — without re-cutting
+        # `sanctioned-scripts.pin.json` reds here, so a stale pin cannot reach
+        # main and silently block the rail.
+        #
+        # ⛔ #2818 — `--ref` is the whole fix for the treadmill. Without it the
+        # gate reads the pin and the scripts out of the SAME CHECKOUT, which here
+        # is GitHub's synthetic MERGE of head onto the base TIP: a merge result
+        # takes each file from whichever side changed it, so a branch that re-cut
+        # its pin beside ITS OWN sanctioned-script edit carried that pin next to
+        # scripts an unrelated merge had since changed — red until someone re-cut,
+        # and every new merge re-opened it on every other open PR. Naming the head
+        # commit answers the question the gate exists to answer ("did THIS change
+        # drift the sanctioned surface without re-cutting?"), which no unrelated
+        # merge can invalidate. The polarity is unchanged and is pinned by
+        # `test-sanctioned-pin-merge-base.mjs`: untouched surface ⇒ pass however
+        # far main moved; edited surface without a re-cut ⇒ fail; edited +
+        # re-cut ⇒ pass.
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step
+        # for the same reason as the suite above: the `extensions/*/test*.mjs`
+        # glob in ci-main.yml runs on the push lane only (`main`, plus
+        # `integration/**` since #3131), never on a PR.
+        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"
+      - name: main-worktree-guard pin freshness is a property of ONE commit (#2818)
+        # The non-vacuity rig for the line above. Hermetic git repos build the
+        # treadmill: a branch re-cuts its pin beside its OWN sanctioned-script
+        # edit, an unrelated merge moves another sanctioned script on `main`, and
+        # the merge GitHub would build then carries the branch's pin beside main's
+        # scripts. Asserts (a) the change PASSES judged on its own commit; (a′)
+        # the SAME change FAILS judged on the merged tree — the pre-#2818 reading,
+        # so dropping `--ref` reds this suite instead of silently restoring the
+        # treadmill; (b) an edit without a re-cut still FAILS; (b′) a deletion
+        # without one still FAILS; (c) edit + re-cut PASSES, base moved or not.
+        # It also asserts this wiring (`--ref`, `fetch-depth: 2`, this step),
+        # because an unwired suite passes by never running.
+        # Zero-dep (`node:*` + the `git` binary), ~2s.
+        run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
+
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
     # reports the same shard segment the push lane reports. What remains here is
@@ -294,11 +377,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # #2818 — the pin-freshness gate below judges the PR's OWN COMMIT, not
-          # the synthetic merge GitHub checks out for `pull_request` (a merge
-          # result mixes the branch's pin with `main`'s scripts, so the verdict
-          # tracked how far `main` had moved). Depth 2 = the merge commit plus its
-          # two parents, i.e. the head tree, without a full clone.
+          # ⛔ THE PIN GATE IS NOT IN THIS JOB ANY MORE (agent-infra#3121) — it moved
+          # to the `sanctioned-pin` job, which carries its own depth-2 checkout
+          # because `--ref` needs the head commit's tree. This comment used to say
+          # "the pin-freshness gate below", and after the move that sentence was
+          # FALSE: `verify` no longer contains any step that reads it. Depth 2 is
+          # kept here only because it was already the checkout's shape and nothing
+          # in this job is known to read history at a shallower depth; a future
+          # reader must NOT re-plant the pin steps here to match this comment.
           fetch-depth: 2
       - uses: actions/setup-node@v4
         with:
@@ -948,60 +1034,6 @@ jobs:
         # before anything reads it.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
         run: node extensions/main-worktree-guard/test-command-position.mjs
-      - name: main-worktree-guard sanctioned-script IDENTITY + pin (#2332)
-        # The exemption for `SANCTIONED_SCRIPT_RELPATHS` was a realpath STRING
-        # EQUALITY against the module's own checkout, which is only correct where
-        # the guard and the scripts live in ONE tree. On a copy-deployed box the
-        # module root is `~/.pi/agent` (partial `scripts/`, no `admin-merge.sh`
-        # at all, #2176) while the rail lives in `$AGENT_INFRA_PATH/scripts/` —
-        # so the mandated merge rail was REFUSED from every hub-rooted session
-        # and the only routes left were the hatch or a bare `gh pr merge` that
-        # skips every comparison the rail makes. This suite pins the two halves
-        # that make the widened exemption safe — sanctioned relpath INSIDE a
-        # framework checkout, sha256 equal to the pin, AND the audited DELEGATION
-        # CLOSURE (every `$SELF_DIR` helper the script executes) — and MUTATES the
-        # shipped source to prove each part is load-bearing (literal-path equality
-        # restored ⇒ the rail blocks again; leaf digest dropped ⇒ a renamed
-        # destructive script is allowed; root check dropped ⇒ a non-framework dir
-        # is exempted; closure dropped ⇒ the pinned rail runs an agent-chosen
-        # `ci_exemption.py`, its own grader). It is a PIN-FRESHNESS gate
-        # too: a PR that changes (or deletes) a listed script — or a helper one of
-        # them executes by its own location — without re-cutting
-        # `sanctioned-scripts.pin.json` reds here, so a stale pin cannot reach
-        # main and silently block the rail.
-        #
-        # ⛔ #2818 — `--ref` is the whole fix for the treadmill. Without it the
-        # gate reads the pin and the scripts out of the SAME CHECKOUT, which here
-        # is GitHub's synthetic MERGE of head onto the base TIP: a merge result
-        # takes each file from whichever side changed it, so a branch that re-cut
-        # its pin beside ITS OWN sanctioned-script edit carried that pin next to
-        # scripts an unrelated merge had since changed — red until someone re-cut,
-        # and every new merge re-opened it on every other open PR. Naming the head
-        # commit answers the question the gate exists to answer ("did THIS change
-        # drift the sanctioned surface without re-cutting?"), which no unrelated
-        # merge can invalidate. The polarity is unchanged and is pinned by
-        # `test-sanctioned-pin-merge-base.mjs`: untouched surface ⇒ pass however
-        # far main moved; edited surface without a re-cut ⇒ fail; edited +
-        # re-cut ⇒ pass.
-        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step
-        # for the same reason as the suite above: the `extensions/*/test*.mjs`
-        # glob in ci-main.yml runs on the push lane only (`main`, plus
-        # `integration/**` since #3131), never on a PR.
-        run: node extensions/main-worktree-guard/test-sanctioned-identity.mjs --ref "${{ github.event.pull_request.head.sha }}"
-      - name: main-worktree-guard pin freshness is a property of ONE commit (#2818)
-        # The non-vacuity rig for the line above. Hermetic git repos build the
-        # treadmill: a branch re-cuts its pin beside its OWN sanctioned-script
-        # edit, an unrelated merge moves another sanctioned script on `main`, and
-        # the merge GitHub would build then carries the branch's pin beside main's
-        # scripts. Asserts (a) the change PASSES judged on its own commit; (a′)
-        # the SAME change FAILS judged on the merged tree — the pre-#2818 reading,
-        # so dropping `--ref` reds this suite instead of silently restoring the
-        # treadmill; (b) an edit without a re-cut still FAILS; (b′) a deletion
-        # without one still FAILS; (c) edit + re-cut PASSES, base moved or not.
-        # It also asserts this wiring (`--ref`, `fetch-depth: 2`, this step),
-        # because an unwired suite passes by never running.
-        # Zero-dep (`node:*` + the `git` binary), ~2s.
-        run: node extensions/main-worktree-guard/test-sanctioned-pin-merge-base.mjs
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked

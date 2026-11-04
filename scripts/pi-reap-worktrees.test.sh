@@ -183,6 +183,27 @@ assert_nofile()   { if [ -e "$1" ]; then bad "$2 (present: $1)"; else ok "$2"; f
 assert_branch()   { if "$REAL_GIT" -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; then ok "$3"; else bad "$3 (no ref: $2)"; fi; }
 assert_nobranch() { if "$REAL_GIT" -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; then bad "$3 (ref still exists: $2)"; else ok "$3"; fi; }
 
+# ⛔ A MISSING HELPER IS A SILENTLY-SKIPPED ASSERTION, NOT A TEST FAILURE (review of #3405 round 3: a
+# call to an undefined helper reported "command not found" and the suite stayed GREEN, one arm short —
+# twice, because a hardcoded vocabulary list just moved the hole). So the vocabulary is DERIVED from
+# the file: every helper-shaped name the script uses must be defined by a `name()` in the same file.
+_self="${BASH_SOURCE[0]}"
+_used="$(grep -oE '\b(assert_[a-z_]+|eq|neq|ok|bad|has)\b' "$_self" | sort -u)"
+_defined="$(grep -oE '^[a-z_][a-z0-9_]*\(\)' "$_self" | sed -E 's/\(\).*$//' | sort -u)"
+# ⛔ NO PIPE IN THE LOOKUP: `printf | grep -q` under `set -o pipefail` is a FALSE-RED GENERATOR.
+# grep -q exits at the first match, printf takes SIGPIPE (141), pipefail propagates it, and `if !`
+# then reports a helper that IS defined as missing — measured 49/100 runs on the unmodified file.
+# A membership test must not be a pipeline: `case` on a newline-delimited string is pure bash.
+for _h in $_used; do
+    case $'\n'"$_defined"$'\n' in
+        *$'\n'"$_h"$'\n'*) : ;;
+        *)
+            if grep -qE "(^|[;&|]|then |else |if |while |! )$_h( |\$)" "$_self"; then
+                echo "  ❌ harness bug: assertion helper '$_h' is CALLED but never DEFINED"; exit 1
+            fi
+            ;;
+    esac
+done
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-worktree-test.XXXXXX")"
 # Resolve T once: git records RESOLVED worktree paths (/tmp/x is stored as
 # /private/tmp/x), so every expectation must compare resolved-to-resolved.
@@ -722,6 +743,12 @@ run_reaper() {
     REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF_OVERRIDE:-}" \
     TAR_BIN="${TAR_BIN_OVERRIDE:-tar}" \
     REAP_WT_BACKUP_DIR="${REAP_WT_BACKUP_DIR_OVERRIDE:-}" \
+    REAP_WT_PRESERVE="${REAP_WT_PRESERVE_OVERRIDE:-1}" \
+    REAP_WT_PRESERVE_DIR="${REAP_WT_PRESERVE_DIR_OVERRIDE:-$T/$envname/preserve}" \
+    REAP_WT_PRESERVE_FALLBACKS="${REAP_WT_PRESERVE_FALLBACKS_OVERRIDE-}" \
+    REAP_WT_PRESERVE_KEEP_DAYS="${REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE:-14}" \
+    REAP_WT_IGNORED_EVIDENCE="${REAP_WT_IGNORED_EVIDENCE_OVERRIDE- .worktree-report WORKTREE-REPORT.md }" \
+    REAP_WT_IGNORED_POINTER="${REAP_WT_IGNORED_POINTER_OVERRIDE- scripts }" \
     MOVE_COUNTER="${MOVE_COUNTER:-}" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
     REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT_OVERRIDE:-1000}" \
@@ -996,6 +1023,328 @@ assert_dir "$WT_DATA" "G2e --apply preserves the non-cache ignored-artifact work
 assert_nodir "$WT_SPACE" "G2f --apply removes the spaced-cache worktree (no partial rm -rf of the tracked sibling)"
 assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/g2-eph | wc -l | tr -d ' ')" "1" \
     "G2c branch ref survives the checkout removal"
+
+# ── G2g/G2h/G2i/G2x: LANE EVIDENCE — the two entries the FLEET ITSELF requires ────────
+# ⛔ THE MEASURED DEFECT THIS PINS (2026-11-03, cell-3 at 90% used). The reaper was ARMED, passing
+# hourly and CORRECT, and reclaimed ONE worktree per pass against ~80 created per day, because
+# `ignored-artifact` (a PRESERVE rule) was its own largest bucket:
+#   examined=133 classified=133 remove=1 preserved=132 reasons=ignored-artifact:70,…
+# — 70 rows holding 20,557 MB, and 54 of them carried exactly the two names below. They are the
+# entries the FLEET MANDATES every checkout to materialise and then GITIGNORES: the per-lane
+# `WORKTREE-REPORT.md` + `.worktree-report/` (owner ruling 2026-10-28, #10220) and the agent-infra
+# `scripts` SYMLINK (#9475). Obeying the fleet's own instructions made a checkout unreclaimable, so
+# the reaper's actuator could not deliver while every one of its gates read green.
+ENV_PV="$ENV-pv"
+REPO_PV="$(mk_repo "$ENV_PV")"
+printf '%s\n' '.worktree-report/' 'WORKTREE-REPORT.md' 'scripts' 'data' >"$REPO_PV/.gitignore"
+printf 'base2\n' >"$REPO_PV/base2.txt"
+"$REAL_GIT" -C "$REPO_PV" add .gitignore base2.txt
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO_PV" commit -qm ignore2
+mkdir -p "$T/$ENV_PV/agent-infra-scripts"
+mk_evidence() { # <worktree> <report-body> — the mandated lane residue, at the ROOT only
+    mkdir -p "$1/.worktree-report"
+    printf 'suite: bash tests/x\n' >"$1/.worktree-report/run.log"
+    printf '%s\n' "$2" >"$1/WORKTREE-REPORT.md"
+}
+# (1) LANDED: 0 commits ahead of main (the ancestry proof), and the ONLY dirt is the lane evidence.
+WT_EVID="$(add_named_wt "$REPO_PV" "$ENV_PV-evidence" feat/g2g-evidence)"
+mk_evidence "$WT_EVID" '# LANE REPORT
+preserve-me-42'
+ln -s "$T/$ENV_PV/agent-infra-scripts" "$WT_EVID/scripts"
+# (2) UNLANDED: the branch holds a commit main does not have, and its PR is OPEN.
+WT_UNL="$(add_named_wt "$REPO_PV" "$ENV_PV-unlanded" feat/g2h-unlanded)"
+mk_evidence "$WT_UNL" '# LANE REPORT
+unlanded'
+commit_in_wt "$WT_UNL" "$OLD_DATE" unlanded
+# (3) DIRTY but LANDED: merged, carries evidence, AND a tracked modification a human wanted.
+WT_DIRT="$(add_named_wt "$REPO_PV" "$ENV_PV-dirty" feat/g2i-dirty)"
+mk_evidence "$WT_DIRT" '# LANE REPORT
+dirty but landed'
+printf 'uncommitted work a human wanted\n' >>"$WT_DIRT/base.txt"
+# (4) The POINTER'S NEGATIVE CONTROL — an ignored `scripts/` that is a REAL DIRECTORY (review of
+# #3405, P1/P2). The first fix returned on the NAME alone, so a real `scripts/` directory full of
+# someone's content was admitted as "a pointer" and destroyed with no archive at all — and the suite
+# could not see it, because G2g builds `scripts` as a symlink and the mutant only moved the EVIDENCE
+# predicate. This fixture is what makes the `-L` half load-bearing.
+WT_SCRDIR="$(add_named_wt "$REPO_PV" "$ENV_PV-scrdir" feat/g2y-scrdir)"
+mkdir -p "$WT_SCRDIR/scripts"
+printf 'operator content that is NOT a pointer\n' >"$WT_SCRDIR/scripts/work.sh"
+# …and a second negative control: an ignored ROOT SYMLINK under an unrelated name. `-L` alone must
+# never admit it; only the NAME list plus `-L` may.
+WT_OTHLINK="$(add_named_wt "$REPO_PV" "$ENV_PV-othlink" feat/g2y-othlink)"
+ln -s "$T/$ENV_PV/agent-infra-scripts" "$WT_OTHLINK/data"
+PV_DIR="$T/$ENV_PV/preserve"
+# The open-PR veto only exists where the PR gate is APPLICABLE: a github.com origin (G5a's shape).
+# Without it the PR state is N/A and an aged unmerged checkout is reclaimed under `refs=branch-retained`
+# — a DIFFERENT, deliberate rule (G6b) that would make this case prove nothing about the fix.
+"$REAL_GIT" -C "$REPO_PV" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+GH_PV="feat/g2h-unlanded"
+OUT="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT" "$WT_EVID")" "reason=reclaimable" \
+    "G2g evidence-only + the scripts SYMLINK => reclaimable, not ignored-artifact (the 70-row / 20.5 GB class)"
+assert_contains "$(row_for "$OUT" "$WT_UNL")" "reason=open-pr" \
+    "G2h an UNLANDED branch (open PR) is refused even though its evidence is identical"
+assert_contains "$(row_for "$OUT" "$WT_DIRT")" "reason=dirty" \
+    "G2i a dirty-but-LANDED checkout is refused (a landed tree can still hold work a human wanted)"
+assert_contains "$(row_for "$OUT" "$WT_SCRDIR")" "reason=ignored-artifact" \
+    "G2y a REAL ignored scripts/ DIRECTORY is not a pointer => still preserved"
+assert_contains "$(row_for "$OUT" "$WT_OTHLINK")" "reason=ignored-artifact" \
+    "G2y an ignored symlink under a name NOT on the pointer list is still preserved (the -L arm alone admits nothing)"
+assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "G2g a DRY RUN archives nothing (dry-run first, always)"
+OUT="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_nodir "$WT_EVID" "G2g --apply removed the landed evidence-only checkout"
+assert_dir  "$WT_UNL"  "G2h --apply refused the unlanded checkout"
+assert_dir  "$WT_DIRT" "G2i --apply refused the dirty-but-landed checkout"
+assert_dir  "$WT_SCRDIR" "G2y --apply kept the real scripts/ directory (its content is not a pointer)"
+assert_dir  "$WT_OTHLINK" "G2y --apply kept the unrelated ignored symlink"
+assert_contains "$("$REAL_GIT" -C "$WT_DIRT" status --porcelain)" " M base.txt" \
+    "G2i the dirty checkout's diff is PRESERVED (the tree is kept, so the modification is still there)"
+assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "1" \
+    "G2g EXACTLY one archive exists — the two refused rows produced none"
+PVDIR="$(ls -d "$PV_DIR"/*/* 2>/dev/null | head -1)"
+assert_file "$PVDIR/manifest.txt" "G2g gate (b): a manifest was written BEFORE the checkout was destroyed"
+assert_file "$PVDIR/worktree.diff" "G2g gate (b): git diff HEAD was captured"
+assert_file "$PVDIR/worktree.status" "G2g gate (b): git status --porcelain was captured"
+assert_file "$PVDIR/lane-evidence.tar.gz" "G2g the mandatory per-lane report was ARCHIVED, not silently deleted"
+assert_contains "$(cat "$PVDIR/manifest.txt")" "path=$WT_EVID" "G2g the manifest names the checkout it came from"
+assert_contains "$(cat "$PVDIR/manifest.txt")" "head=$("$REAL_GIT" -C "$REPO_PV" rev-parse feat/g2g-evidence)" \
+    "G2g the manifest names the exact HEAD that was removed"
+assert_contains "$(cat "$PVDIR/manifest.txt")" "reason=reclaimable" "G2g the manifest names why"
+mkdir -p "$T/$ENV_PV/unpack"
+tar -xzf "$PVDIR/lane-evidence.tar.gz" -C "$T/$ENV_PV/unpack" 2>/dev/null
+assert_file "$T/$ENV_PV/unpack/WORKTREE-REPORT.md" "G2g the archive holds the report FILE"
+assert_file "$T/$ENV_PV/unpack/.worktree-report/run.log" "G2g the archive holds the report DIRECTORY"
+assert_contains "$(cat "$T/$ENV_PV/unpack/WORKTREE-REPORT.md" 2>/dev/null)" "preserve-me-42" \
+    "G2g the archived report is the lane's own CONTENT (a tarball that exists is not a capture)"
+assert_eq "$("$REAL_GIT" -C "$REPO_PV" rev-parse --verify -q feat/g2g-evidence | wc -l | tr -d ' ')" "1" \
+    "G2g the branch ref survives — removal is the CHECKOUT, never a branch"
+# ── IDEMPOTENCE: the same pass run twice must not remove or archive anything more ────────
+OUT2="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_contains "$OUT2" "removed=0" "G2g IDEMPOTENT: a second pass removes nothing"
+assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "1" \
+    "G2g IDEMPOTENT: a second pass writes no second archive"
+assert_dir "$WT_UNL" "G2h IDEMPOTENT: the unlanded checkout is still refused on the second pass"
+# ── G2x: the MUTANT that must turn this case RED ──────────────────────────────────
+# A case that cannot fail proves nothing (the rule `disk-reaper-classes.test.sh` is built on). The
+# mutant neuters the ONE predicate the fix is: the evidence tolerance in `clean_gate`. The same
+# fixture must then fall back to the old `ignored-artifact` PRESERVE. If it still reads
+# `reclaimable`, the assertions above are not measuring this change at all.
+WT_EVID2="$(add_named_wt "$REPO_PV" "$ENV_PV-evidence2" feat/g2x-evidence)"
+mk_evidence "$WT_EVID2" '# LANE REPORT
+mutant control'
+MUT="$T/$ENV_PV/pi-reap-worktrees.mutant.sh"
+sed 's/&& is_lane_evidence_entry "\$p"; then/\&\& false; then/' "$REAPER" >"$MUT"
+if cmp -s "$REAPER" "$MUT"; then
+    bad "G2x the MUTANT DID NOT APPLY (the evidence predicate moved) — the case cannot discriminate"
+else
+    ok "G2x mutant applied: the evidence predicate is neutered"
+fi
+OUT_M="$(FAKE_GH_REFS="$GH_PV" REAPER_OVERRIDE="$MUT" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_M" "$WT_EVID2")" "reason=ignored-artifact" \
+    "G2x MUTANT GOES RED: without the fix the evidence-only checkout is PRESERVED again (the 70-row class)"
+OUT_R="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_R" "$WT_EVID2")" "reason=reclaimable" \
+    "G2x CONTROL: the real script reads the SAME fixture as reclaimable (so the mutant difference is the code)"
+# The seam that restores the pre-fix policy, for a box that wants the old conservatism back.
+OUT_S="$(FAKE_GH_REFS="$GH_PV" REAP_WT_PRESERVE_OVERRIDE=0 run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_S" "$WT_EVID2")" "reason=ignored-artifact" \
+    "G2x REAP_WT_PRESERVE=0 restores the pre-fix veto exactly (the tolerance and the archive cannot disagree)"
+assert_contains "$(row_for "$OUT_S" "$WT_EVID2")" "WORKTREE-REPORT.md" \
+    "G2x …and the row still NAMES the offending entry, as it always did"
+# ── G2y: the mutant for the POINTER half (review of #3405, P1) ───────────────────────
+# The first implementation returned on the NAME before the `-L` check — `case … in *" $base "*)
+# return 0 ;; esac` — so a real `scripts/` DIRECTORY (operator content) was admitted and deleted with
+# nothing archived, and any root-level ignored symlink of ANY name was admitted too. Nothing in the
+# suite could see it. This mutant reproduces that exact line; both negative-control fixtures above
+# must then flip to the DANGEROUS verdict, which is what proves both predicate halves are load-bearing.
+MUT2="$T/$ENV_PV/pi-reap-worktrees.mutant-pointer.sh"
+awk '{
+    if ($0 ~ /case "\$IGNORED_POINTER"/) {
+        print "    case \"$IGNORED_POINTER\" in *\" $base \"*) return 0 ;; *) ;; esac"
+    } else { print }
+}' "$REAPER" >"$MUT2"
+if cmp -s "$REAPER" "$MUT2"; then
+    bad "G2y the POINTER MUTANT DID NOT APPLY (the name arm moved) — the pointer half is unverified"
+else
+    ok "G2y pointer mutant applied: the shipped early-return bug is reproduced"
+fi
+OUT_P="$(FAKE_GH_REFS="$GH_PV" REAPER_OVERRIDE="$MUT2" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_P" "$WT_SCRDIR")" "reason=reclaimable" \
+    "G2y MUTANT GOES RED: without the -L arm a real scripts/ DIRECTORY would be destroyed unarchived"
+assert_contains "$(row_for "$OUT_P" "$WT_OTHLINK")" "reason=reclaimable" \
+    "G2y MUTANT GOES RED: the early return also admits an unrelated ignored symlink"
+assert_contains "$(row_for "$OUT_R" "$WT_SCRDIR")" "reason=ignored-artifact" \
+    "G2y CONTROL: the real script keeps the same fixture preserved"
+assert_contains "$(row_for "$OUT_R" "$WT_OTHLINK")" "reason=ignored-artifact" \
+    "G2y CONTROL: …and keeps the unrelated symlink preserved"
+
+# ── G2z: a FAILED capture must remove NOTHING and must not read as a routine pause ────────
+# Gate (b) inserts a write into every removal, so an unwritable archive root would otherwise make the
+# whole class inert while every gate reads green — the exact defect this PR exists to remove (review
+# of #3405 round 2, P1). Two halves: (a) with no writable root at all, the checkout is KEPT and the
+# pass reports a FAILURE (not a benign late preserve); (b) with a fallback available, the same
+# unwritable configured root does NOT stop the reclaim — the archive lands in the fallback.
+WT_FALL="$(add_named_wt "$REPO_PV" "$ENV_PV-fallback" feat/g2z-fallback)"
+mk_evidence "$WT_FALL" '# LANE REPORT\nfallback case'
+OUT_Z="$(FAKE_GH_REFS="$GH_PV" REAP_WT_PRESERVE_DIR_OVERRIDE=/proc/nonexistent/reaped-evidence \
+        REAP_WT_PRESERVE_FALLBACKS_OVERRIDE= run_reaper $ENV_PV --apply --repo "$REPO_PV" 2>&1)"; RC_Z=$?
+assert_dir "$WT_FALL" "G2z NO writable archive root => the checkout is KEPT (a pass that cannot preserve must not delete)"
+assert_contains "$(cat "$T/$ENV_PV/reap.log")" "no writable preserve root" \
+    "G2z …and the log names the cause (no writable preserve root), not a routine re-check"
+assert_absent "$(cat "$T/$ENV_PV/reap.log")" "PRESERVED-LATE" \
+    "G2z …and it is NOT recorded as a benign late preserve (that arm is for a checkout that changed)"
+assert_eq "$RC_Z" "4" "G2z …and it is a REMOVAL FAILURE (exit 4, RED), never a benign late preserve"
+OUT_ZB="$(FAKE_GH_REFS="$GH_PV" REAP_WT_PRESERVE_DIR_OVERRIDE=/proc/nonexistent/reaped-evidence \
+        REAP_WT_PRESERVE_FALLBACKS_OVERRIDE="$T/$ENV_PV/preserve-fallback" \
+        run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_nodir "$WT_FALL" "G2z a WRITABLE fallback keeps the reclaim working (a full/read-only archive root cannot make the class inert)"
+assert_eq "$(ls -d "$T/$ENV_PV/preserve-fallback"/*/feat_g2z-fallback.* 2>/dev/null | wc -l | tr -d ' ')" "1" \
+    "G2z …and the archive landed in the fallback root"
+assert_contains "$(cat "$T/$ENV_PV/reap.log")" "PRESERVE-DIR-FALLBACK" "G2z …and the pass DISCLOSES that it fell back"
+# (b) the mutant for the fail-closed arm: dropping the `!` turns every successful capture into a
+# refusal, so the landed fixture must survive — i.e. the "removed" assertions above are load-bearing.
+WT_MUT="$(add_named_wt "$REPO_PV" "$ENV_PV-mut" feat/g2z-mut)"
+mk_evidence "$WT_MUT" '# LANE REPORT\nmutant gate'
+MUT3="$T/$ENV_PV/pi-reap-worktrees.mutant-gate.sh"
+sed 's/if ! presv="\$(preserve_before_removal/if presv="$(preserve_before_removal/' "$REAPER" >"$MUT3"
+if cmp -s "$REAPER" "$MUT3"; then
+    bad "G2z the GATE MUTANT DID NOT APPLY — the fail-closed arm is unverified"
+else
+    ok "G2z gate mutant applied: the capture result is inverted"
+fi
+OUT_ZM="$(FAKE_GH_REFS="$GH_PV" REAPER_OVERRIDE="$MUT3" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_dir "$WT_MUT" "G2z MUTANT GOES RED: inverting the capture result leaves the checkout in place (so the removal assertions above are load-bearing)"
+
+# ── G2aa: the archive is BOUNDED, and bounded in EVERY root it can land in (round 3) ─────
+# `prune_preserve_archive` is the only `rm -rf` in this file whose target is chosen by a string
+# pattern, and round 2 added the archive without any test at all — which is how the fallback root
+# shipped as an unbounded sink. Every arm is pinned here: a dated old dir is removed, a recent dated
+# dir survives, a NON-date name survives (operator data), the dry run reports without removing, `0`
+# disables, a bad value is refused by validation, and the FALLBACK root is pruned too.
+ENV_AA="$ENV-pv-aa"
+PR="$T/$ENV_AA/preserve"; mkdir -p "$PR/2020-01-01" "$PR/2026-11-03" "$PR/notadate" "$PR/2020-01-0" "$PR/2026-11-03-nodash"
+for d in 2020-01-01 2026-11-03 notadate 2020-01-0 2026-11-03-nodash; do : >"$PR/$d/manifest.txt"; done
+REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" run_reaper $ENV_AA --repo "$REPO_PV" >/dev/null 2>&1
+assert_dir "$PR/2020-01-01" "G2aa control: a DRY RUN does not prune"
+assert_contains "$(cat "$T/$ENV_AA/reap.log" 2>/dev/null || true)" "PRESERVE-PRUNE would remove $PR/2020-01-01" \
+    "G2aa …it reports what it would prune"
+REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" run_reaper $ENV_AA --apply --repo "$REPO_PV" >/dev/null 2>&1
+assert_nodir "$PR/2020-01-01" "G2aa a dated dir older than KEEP_DAYS is pruned"
+assert_dir "$PR/2026-11-03" "G2aa a RECENT dated dir survives"
+assert_dir "$PR/notadate" "G2aa a non-date name survives (operator data, never a candidate)"
+assert_dir "$PR/2020-01-0" "G2aa a MALFORMED date survives (a prefix match would have eaten it)"
+assert_dir "$PR/2026-11-03-nodash" "G2aa a date-SHAPED suffix survives (only an exact YYYY-MM-DD is a candidate)"
+mkdir -p "$PR/2020-01-02"
+REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE=0 run_reaper $ENV_AA --apply --repo "$REPO_PV" >/dev/null 2>&1
+assert_dir "$PR/2020-01-02" "G2aa KEEP_DAYS=0 keeps EVERYTHING (0 means disabled, not everything-expired)"
+OUT_AA="$(REAP_WT_PRESERVE_DIR_OVERRIDE="$PR" REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE=abc \
+    run_reaper $ENV_AA --apply --repo "$REPO_PV" 2>&1)"; RC_AA=$?
+assert_eq "$RC_AA" "2" "G2aa an unusable KEEP_DAYS is REFUSED by seam validation (exit 2, not a silent skip)"
+assert_contains "$OUT_AA" "REAP_WT_PRESERVE_KEEP_DAYS" "G2aa …and the refusal names the seam"
+assert_dir "$PR/2020-01-02" "G2aa …and nothing was pruned"
+# the FALLBACK root is bounded too — it is the root a full/read-only data volume pushes writes INTO,
+# so an unbounded fallback is unbounded exactly when the box is already out of space.
+FB="$T/$ENV_AA/preserve-fb"; mkdir -p "$FB/2020-01-01"
+REAP_WT_PRESERVE_DIR_OVERRIDE=/proc/nonexistent/reaped-evidence REAP_WT_PRESERVE_FALLBACKS_OVERRIDE="$FB" \
+    run_reaper $ENV_AA --apply --repo "$REPO_PV" >/dev/null 2>&1
+assert_nodir "$FB/2020-01-01" "G2aa the FALLBACK root is pruned as well (an unbounded fallback is a sink on the full box)"
+# ── G2j: TWO DETACHED CHECKOUTS AT ONE COMMIT MUST NOT SHARE A CAPTURE ─────
+# A detached row carries `br="-"` (wt_list_load's `detached)` arm), NOT an empty string, so a
+# branch-derived slug is `-` for EVERY detached checkout and the `detached` fallback never fires. Two
+# detached checkouts sitting at the SAME commit therefore resolve to the same `<day>/-.<sha8>` — and
+# the second capture's `rm -f "$tarf"` plus truncating writes destroyed the first lane's
+# `lane-evidence.tar.gz` (the mandatory per-lane report) at the exact moment its tree was destroyed,
+# with both rows logging PRESERVED against one directory. That is the one artefact gate (b) exists to
+# keep, and **no case in this suite could see it**: the fixtures all sat at different commits, and the
+# idempotence assertion counts archives, so a collision read as "1 archive" and passed.
+# The key now carries a `cksum` digest of the checkout PATH (an identity, not a security boundary), so
+# the case below is the proof: TWO checkouts, ONE commit, TWO captures, each keeping ITS OWN content.
+# Under the pre-fix key this case reads ONE archive and `first-lane-report` is GONE — the destruction
+# itself, not a naming preference.
+ENV_PV2="$ENV-pv2"
+REPO_PV2="$(mk_repo "$ENV_PV2")"
+printf '%s\n' '.worktree-report/' 'WORKTREE-REPORT.md' 'scripts' >"$REPO_PV2/.gitignore"
+"$REAL_GIT" -C "$REPO_PV2" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO_PV2" commit -qm ignore3
+# The PR gate only exists where it is APPLICABLE (a github.com origin); the fake gh below carries a ref
+# that matches NO row, so the PR state can neither veto nor explain either checkout.
+"$REAL_GIT" -C "$REPO_PV2" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+mkdir -p "$T/$ENV_PV2/agent-infra-scripts"
+# detached_wt <repo> <dir> — a DETACHED worktree; echoes the path AS GIT RECORDS IT (git resolves
+# symlinks, and the reaper compares against git's own record, never against the argument).
+detached_wt() {
+    local repo="$1" d="$2" base
+    base="$(basename "$d")"
+    "$REAL_GIT" -C "$repo" worktree add -q --detach "$d" main
+    "$REAL_GIT" -C "$repo" worktree list --porcelain | awk -v b="$base" '
+        /^worktree / { p = substr($0, 10) }
+        /^detached$/ { if (p ~ ("/" b "$")) { print p; exit } }'
+}
+WT_DET1="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det1")"
+WT_DET2="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det2")"
+mk_evidence "$WT_DET1" '# LANE REPORT
+first-lane-report'
+mk_evidence "$WT_DET2" '# LANE REPORT
+second-lane-report'
+ln -s "$T/$ENV_PV2/agent-infra-scripts" "$WT_DET1/scripts"
+ln -s "$T/$ENV_PV2/agent-infra-scripts" "$WT_DET2/scripts"
+assert_eq "$("$REAL_GIT" -C "$WT_DET1" rev-parse HEAD)" "$("$REAL_GIT" -C "$WT_DET2" rev-parse HEAD)" \
+    "G2j precondition: both detached checkouts sit at ONE commit (the colliding shape)"
+PV2_DIR="$T/$ENV_PV2/preserve"
+cap_dir_for() { # <preserve-root> <checkout-path> — every capture directory whose manifest names it
+    grep -l "^path=$2\$" "$1"/*/*/manifest.txt 2>/dev/null | while IFS= read -r m; do
+        dirname "$m"
+    done
+}
+FAKE_GH_REFS="feat/g2j-none" run_reaper $ENV_PV2 --apply --repo "$REPO_PV2" >/dev/null 2>&1
+assert_nodir "$WT_DET1" "G2j --apply removed the first detached checkout"
+assert_nodir "$WT_DET2" "G2j --apply removed the second detached checkout"
+assert_eq "$(ls -d "$PV2_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "2" \
+    "G2j ⛔ TWO captures, not one — a shared key destroys the first lane's report"
+D1DIR="$(cap_dir_for "$PV2_DIR" "$WT_DET1" | head -1)"
+D2DIR="$(cap_dir_for "$PV2_DIR" "$WT_DET2" | head -1)"
+if [ -n "$D1DIR" ] && [ -n "$D2DIR" ] && [ "$D1DIR" != "$D2DIR" ]; then
+    ok "G2j each checkout has its own capture directory (the key identifies the checkout, not the branch)"
+else
+    bad "G2j the two captures share one directory ('$D1DIR' / '$D2DIR')"
+fi
+assert_contains "$(tar -xzOf "$D1DIR/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "first-lane-report" \
+    "G2j ⛔ the FIRST lane's report SURVIVED — the second capture did not overwrite it"
+assert_contains "$(tar -xzOf "$D2DIR/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "second-lane-report" \
+    "G2j the second lane's report is its own, in its own capture"
+assert_absent "$(tar -xzOf "$D1DIR/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "second-lane-report" \
+    "G2j the first capture was not rewritten by the later one (no truncation under a shared key)"
+assert_contains "$(cat "$D1DIR/manifest.txt" 2>/dev/null)" "path=$WT_DET1" \
+    "G2j the first capture's manifest still names ITS checkout"
+# ── G2k: an EXISTING capture is never reused, even for the SAME checkout ────────
+# The digest keys the path, so a re-dispatch onto the same path, branch and head within one UTC day
+# produces the same directory. The `rm -f "$tarf"` + truncating writes of that second capture destroyed
+# the first lane's evidence AFTER its tree was gone. An occupied directory must get a unique sibling:
+# the earlier capture keeps its BYTES, and the new one is a separate, complete capture.
+WT_DET3="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det3")"
+mk_evidence "$WT_DET3" '# LANE REPORT
+third-lane-report-v1'
+FAKE_GH_REFS="feat/g2j-none" run_reaper $ENV_PV2 --apply --repo "$REPO_PV2" >/dev/null 2>&1
+CAP3A="$(cap_dir_for "$PV2_DIR" "$WT_DET3" | head -1)"
+assert_contains "$(tar -tzf "$CAP3A/lane-evidence.tar.gz" 2>/dev/null)" "WORKTREE-REPORT.md" \
+    "G2k precondition: the first capture of the third checkout exists and holds its report"
+CAP3A_SUM="$(cksum "$CAP3A/lane-evidence.tar.gz" 2>/dev/null)"
+# The SAME checkout path again (a re-dispatch onto one path), with different content this time.
+WT_DET3B="$(detached_wt "$REPO_PV2" "$T/$ENV_PV2-det3")"
+mk_evidence "$WT_DET3B" '# LANE REPORT
+third-lane-report-v2'
+FAKE_GH_REFS="feat/g2j-none" run_reaper $ENV_PV2 --apply --repo "$REPO_PV2" >/dev/null 2>&1
+CAP3B="$(cap_dir_for "$PV2_DIR" "$WT_DET3" | grep -vxF "$CAP3A" | head -1)"
+assert_eq "$(cksum "$CAP3A/lane-evidence.tar.gz" 2>/dev/null)" "$CAP3A_SUM" \
+    "G2k ⛔ the pre-existing capture was NOT overwritten (never delete a capture that exists)"
+if [ -n "$CAP3B" ] && [ "$CAP3B" != "$CAP3A" ]; then
+    ok "G2k the second capture took a unique sibling beside the occupied one ($(basename "$CAP3A") -> $(basename "$CAP3B"))"
+else
+    bad "G2k the second capture reused or destroyed the occupied one ('$CAP3A' / '$CAP3B')"
+fi
+assert_contains "$(tar -xzOf "$CAP3B/lane-evidence.tar.gz" WORKTREE-REPORT.md 2>/dev/null)" "third-lane-report-v2" \
+    "G2k the new capture holds the NEW content, and the earlier one was preserved beside it"
 
 # ── G3: reachable gate (detached HEAD only) ────────────────────────────
 ENV=G3; REPO="$(mk_repo $ENV)"
