@@ -120,6 +120,12 @@
 #       registration no longer exists server-side (`restart`, `reconcile`). It is NOT 2 (nothing was
 #       measured wrongly: this IS the measurement) and NOT 3 (no gate refused it): a scheduler must be
 #       able to branch on "recover with `reclaim`". `reclaim` is the only verb that repairs it.
+#       ⛔ `reconcile` DOES return 6, but only for the state that verb documents: it MEASURED the
+#       orphan (a `restart` arm rc 6) and did NOT retire it in the same pass (#2892 review round 5,
+#       P1). A pass that retires what it measured returns 0 — the rc 6 is "there is still an orphan",
+#       not "this verb cannot retire". `reconcile` exits 2 instead when it could not CLASSIFY a dead
+#       directory at all (an unreadable process table): that is a reading it could not take, and
+#       calling it 6 would assert a provable orphan it never proved.
 #
 # `status` exits 3 when it produced a report in which at least one listener is DEAD **or at least one
 # registration is ORPHANED** — a report is still a report, but either state is a fact a caller must be
@@ -773,6 +779,10 @@ probe_listener() {
 # gone for any other reason → cannot-act (2), naming the log the operator has to read.
 start_listener() {
   local d="$1" i=0 rc log before="0" started=0 ev=""
+  # Global, deliberately: the CALLERS print the verdict (`restarted name=…`), and a caller that says
+  # "restarted" over a listener this pass never forked is the false-claim class this file exists to
+  # kill (#2892 review round 5, P2). Set 1 only at the fork.
+  LISTENER_FORKED=0
   [ -x "$d/run.sh" ] || { err "cannot-act why=runner-not-installed path=$d/run.sh"; return 2; }
   log="$d/listener.log"
   # The pre-start length, so "this attempt's" evidence can be told apart from a previous one's.
@@ -784,7 +794,30 @@ start_listener() {
   # is routed straight to `reclaim`, which deletes the install. Both bounds are therefore passed.
   started="$(date -u +%s 2>/dev/null)" || started=0
   case "$started" in ''|*[!0-9]*) started=0 ;; esac
+  # ⛔ PROBE ONCE MORE, IMMEDIATELY BEFORE THE FORK (#2892 review round 5, P2). The caller's probe is
+  # NOT adjacent to this fork: `cmd_reclaim` reads the evidence, then takes a bounded NETWORK clock
+  # probe (up to RUNNER_CLOCK_PROBE_TIMEOUT_S, default 10 s), then scans same-named siblings — so a
+  # registration that was DEAD when it was judged can be brought up INSIDE that window by a systemd
+  # unit or a concurrent pass. Forking blind there starts a SECOND listener for one registration, and
+  # the post-start read below then takes the OTHER process as proof of survival and prints a repair
+  # over a doubled slot. Same doctrine as `cmd_restart`'s process-table arm — a blind start is how a
+  # listener is doubled — checked HERE, in the code that forks, rather than only in each caller
+  # (defence in depth, the same shape as the `run.sh` precondition above).
+  #
+  # ⛔ A LIVE LISTENER IS rc 0, NOT A REFUSAL — the SAME verdict `cmd_restart` gives the same fact
+  # (`0) say "live name=$name pid=$LISTENER_PID — not touched"; return 0`): another process starting it
+  # is the outcome this verb wants, so refusing it made `add` report `cannot-act why=listener-already-live`
+  # (measured: a re-created instance dir whose previous listener was still running) over a
+  # registration that IS being served. What this arm forbids is a SECOND fork, not a live listener.
+  # rc 1 (dead) is the expected state and falls through.
+  rc=0; probe_listener "$d" || rc=$?
+  case "$rc" in
+    0) say "live name=$(basename "$d") pid=$LISTENER_PID — a listener for this registration came up after it was judged dead (a systemd start, or another pass), so none was forked here; this pass did not start it"
+       return 0 ;;
+    2) err "cannot-act why=liveness-recheck-unmeasured path=$d — the liveness re-check that guards the fork could not measure, so this pass starts nothing"; return 2 ;;
+  esac
   ( cd "$d" && exec "$d/run.sh" ) >>"$log" 2>&1 &
+  LISTENER_FORKED=1
   while [ "$i" -lt $((SETTLE_S * 2)) ]; do
     rc=0; probe_listener "$d" || rc=$?
     case "$rc" in
@@ -1178,7 +1211,7 @@ cmd_restart() {
   if [ "$DRY" = 1 ]; then say "dry-run: would start the listener for name=$name"; return 0; fi
   rc=0; start_listener "$dir" || rc=$?
   case "$rc" in
-    0) say "restarted name=$name pid=$(listener_pid "$dir")"; return 0 ;;
+    0) if [ "$LISTENER_FORKED" = 1 ]; then say "restarted name=$name pid=$(listener_pid "$dir")"; else say "live name=$name pid=$LISTENER_PID — not started here: a listener for this registration came up after this verb's own probe, so none was forked (the line above says when)"; fi; return 0 ;;
     # ⛔ 6 IS PASSED THROUGH, NOT FOLDED INTO 2 (#2620). "I could not act" and "this registration is
     # GONE server-side" lead an operator to opposite next steps — re-run versus `reclaim` — and the
     # caller that matters here is `reconcile`, which routes 6 to the retire arm and counts 2 as
@@ -1383,7 +1416,7 @@ cmd_reclaim() {
     case "$vrc" in
       0)
         revived=$((revived + 1))
-        say "revived name=$nm agent_id=$aid dir=$d — the listener started and SURVIVED the settle window, so this registration still answers GitHub: the 'deleted' line in its log is NOT evidence (a skewed clock prints the same line — actions/runner#4648) and nothing was deleted"
+        say "revived name=$nm agent_id=$aid dir=$d — a listener for this registration is LIVE and SURVIVED the settle window, so this registration still answers GitHub: the 'deleted' line in its log is NOT evidence (a skewed clock prints the same line — actions/runner#4648) and nothing was deleted (the line above says whether THIS pass started it)"
         continue ;;
       6)
         say "verified name=$nm agent_id=$aid dir=$d — GitHub refused a session started in THIS pass, under the clock measured here (skew=${skew}s bound=${MAX_SKEW_S}s): the retirement rests on a refusal it dated itself, not on an old log line" ;;
@@ -1431,7 +1464,7 @@ cmd_reclaim() {
 }
 
 cmd_reconcile() {
-  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 failed=0 n=1 rc budget scan=0 dry_adds=0 outside reclaimed=0 rcout=""
+  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 failed=0 n=1 rc budget scan=0 dry_adds=0 outside reclaimed=0 revived=0 orphan6=0 rcout=""
   while [ $# -gt 0 ]; do
     case "$1" in --dry-run) DRY=1; shift ;; *) err "usage: reconcile [--dry-run]"; return 1 ;; esac
   done
@@ -1492,7 +1525,15 @@ cmd_reconcile() {
       # real capacity. Before #2620 this code did not exist, so an orphan was either reported
       # `restarted` (when the process appeared first) or `cannot` — and either way the pass never fixed
       # it, which is why `pi-cell-4` sat at 2 live runners with 2 dead installs for days.
-      6) : ;;   # the retire arm below repairs it; counting it here too would double-report the slot
+      # ⛔ THE MEASUREMENT IS KEPT, NOT DISCARDED (#2892 review round 5, P1). This arm is the ONLY
+      # place the pass PROVES the orphan (a real start that GitHub refused); the retire arm below
+      # re-derives that same fact from `capacity_class`, which is a SECOND read that can fail on its
+      # own (`listener_pid` → an unreadable process table). Dropping the signal here meant a pass that
+      # had measured and enumerated a dead slot, not retired it, and could not re-classify it, printed
+      # `dead=1 … reclaimed=0` and exited 0 — the false PASS this file forbids by name below
+      # ("A PASS THAT PROVISIONED NOTHING IS NOT A SUCCESS"). The counter makes the proven state reach
+      # the exit code.
+      6) orphan6=$((orphan6 + 1)) ;;
       # ⛔ A RESTART REFUSAL IS NOT A PASS (#2381 review, P2). `refused` is the ADD arm's
       # floor/ceiling refusal — a legitimate outcome that must not fail the pass — and it NEVER
       # reaches the exit decision, so counting a `restart` rc 3 here printed `dead=1 refused=1` and
@@ -1526,10 +1567,21 @@ cmd_reconcile() {
   #      says there is something to retire (`capacity_class` = orphaned), so a healthy box never pays for
   #      `reclaim`'s clock probe and never sees a refusal it did not need. In a dry run the same
   #      evidence drives a preview: `restart --dry-run` starts nothing, so it cannot observe the orphan.
-  local cand="" e
+  # ⛔ `2>/dev/null` HERE WAS GUARD 3'S OWN DEFECT, REPEATED (#2892 review round 5, P1). A
+  # `capacity_class` that cannot measure (rc 2 — an unreadable process table) has ALREADY named its
+  # reason, and this line discarded both the reason and the return code: the directory dropped out of
+  # `cand` with nothing counted, so the pass could not retire it AND did not disclose that it had not
+  # measured it. It is the same "an unreadable listing became an empty one" shape this file fixes
+  # above for the sibling listing. The code is captured and a cannot-measure is COUNTED.
+  local cand="" e cls crc
   while read -r e; do
     [ -n "$e" ] || continue
-    [ "$(capacity_class "$e" 2>/dev/null)" = "orphaned" ] || continue
+    cls=""; crc=0
+    cls="$(capacity_class "$e")" || crc=$?
+    case "$crc" in
+      0) [ "$cls" = "orphaned" ] || continue ;;
+      *) cannot=$((cannot + 1)); continue ;;
+    esac
     cand="$cand$( [ -n "$cand" ] && printf '\n' )$e"
   done <<<"$dirs"
   if [ -n "$cand" ]; then
@@ -1538,7 +1590,34 @@ cmd_reconcile() {
     [ -n "$rcout" ] && say "$rcout"
     reclaimed="$(printf '%s\n' "$rcout" | sed -n 's/^reclaim: retired=\([0-9][0-9]*\) .*/\1/p' | head -1)"
     case "${reclaimed:-}" in ''|*[!0-9]*) reclaimed=0 ;; esac
+    # ⛔ A REVIVED REGISTRATION IS A RESOLVED SLOT (#2892 review round 5, P1): `reclaim` proves the
+    # orphan was a skew artifact by starting a listener that SURVIVES, and a pass that read only
+    # `retired=` would report that repair as an orphan left behind. Parsed from the SAME summary line,
+    # so the two numbers always describe one pass.
+    revived="$(printf '%s\n' "$rcout" | sed -n 's/^reclaim: retired=[0-9][0-9]* preserved=[0-9][0-9]* revived=\([0-9][0-9]*\) .*/\1/p' | head -1)"
+    case "${revived:-}" in ''|*[!0-9]*) revived=0 ;; esac
     case "$rc" in 0) : ;; *) cannot=$((cannot + 1)) ;; esac
+  fi
+  # ⛔ A PROVEN ORPHAN THAT WAS NOT RETIRED IS NOT A PASS, AND THE REASON MAY BE THE PASS'S OWN
+  # (a refused clock, a live sibling holding the name) (#2892 review round 5, P1). `reclaimed` is what
+  # `reclaim` actually retired this pass; anything measured as orphaned and still standing is the
+  # state a scheduler must be able to branch on, so it exits 6 rather than 0 over a slot the pass
+  # itself enumerated as dead. `-lt` and not `-eq 0`: a partial retirement (2 measured, 1 retired)
+  # still leaves an orphan behind and must not read as success.
+  #
+  # ⛔ A REVIVAL IS A REPAIR, NOT A LEFT-BEHIND ORPHAN. `capacity_class` says "orphaned" from an OLD
+  # log line, and `reclaim` deliberately does not believe it: it STARTS the listener and believes only
+  # a refusal it dated ITSELF (a skewed clock prints the same line — actions/runner#4648). When that
+  # start SURVIVES, the registration answers GitHub and the pass repaired it (`revived=`), which is
+  # exactly the state rc 6 must NOT be emitted over — a false 6 sends a scheduler to `reclaim` for a
+  # box that is already healthy. So the resolved count is BOTH outcomes of the retire arm.
+  if [ "$orphan6" -gt 0 ] && [ $((reclaimed + revived)) -lt "$orphan6" ]; then
+    # The summary is printed HERE for the same reason the unlistable-root arm prints one: a monitor
+    # keyed on `dead=` must not see a pass that measured a dead slot and then published nothing.
+    printf 'reconcile: dead=%s restarted=%s added=%s skipped=%s failed=%s refused=%s cannot=%s slots=unmeasured ceiling=%s mem_available=unmeasured floor=%s MB dry_run=%s\n' \
+      "$dead" "$restarted" "$added" "$skipped" "$failed" "$refused" "$cannot" "${CEILING:-unmeasured}" "${MEM_FLOOR_MB:-unset}" "$DRY"
+    err "cannot-act why=orphaned-not-retired measured=$orphan6 retired=$reclaimed revived=$revived — this pass proved at least one registration is gone server-side and neither retired nor revived it, so the slot is still lost; the refusal above is the reason — re-read: $SELF status, then run: $SELF reclaim"
+    return 6
   fi
 
   # ⛔ THE TWO HALVES OF THE PASS DO NOT NEED THE SAME INPUTS. Restarting a dead listener needs no

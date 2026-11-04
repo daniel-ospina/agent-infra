@@ -1149,7 +1149,7 @@ assert_eq "$?" "3" "a FILE squatting on the name is a refusal (rc 3), not a miss
 assert_contains "$out" "is not a searchable directory (a file or a symlink)" "restart names the shape it found"
 assert_contains "$out" "clear it, or pick another name" "and the remedy that clears it"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-file)"
-assert_eq "$?" "4" "and `add` refuses that SAME path — the two verbs agree on the state"
+assert_eq "$?" "4" 'and `add` refuses that SAME path — the two verbs agree on the state'
 ln -s "$T/no-such-target" "$RUNNER_ROOT/pi-runner-dangle"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-dangle)"
 assert_eq "$?" "3" "a DANGLING SYMLINK (not a directory) is the same refusal, not 'add it first'"
@@ -2026,6 +2026,63 @@ assert_eq "$?" "0" "the preview exits 0"
 assert_contains "$out" "reconcile: dead=1 restarted=0" "the orphan counts as ONE dead slot in the preview"
 assert_contains "$out" "reclaimed=1" "and the preview announces the retirement"
 
+# ⛔ rc 6 IS "THERE IS STILL AN ORPHAN", NOT "THIS VERB CANNOT RETIRE" (#2892 review round 5, P1).
+# The restart arm MEASURES the orphan (rc 6) and the retire arm re-derives the same fact a second
+# time, from a read that can fail on its own. Dropping the measurement meant a pass that enumerated a
+# dead slot, could not re-classify it and retired nothing still exited 0 — with `dead=1` on the line
+# above it. Both halves are pinned: a repair keeps 0, an unretired orphan is 6.
+echo "── reconcile: an orphan it RETIRES is still 0, and one it does NOT is 6 ──"
+fresh_pool reconorph; reset_logs
+run add --name pi-runner-ro1 >/dev/null 2>&1; run add --name pi-runner-ro2 >/dev/null 2>&1
+run add --name pi-runner-ro3 >/dev/null 2>&1   # slots=3 = ceiling, so the ADD arm below adds nothing
+register pi-runner-roorph
+orphanize pi-runner-roorph
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)"
+assert_eq "$?" "0" "a pass that MEASURED the orphan and RETIRED it exits 0"
+assert_contains "$out" "reclaimed=1" "and it says what it retired"
+assert_absent "$RUNNER_ROOT/pi-runner-roorph" "the install is gone, so the slot came back"
+assert_contains "$out" "added=0" "(the add arm still ran, at the ceiling)"
+
+fresh_pool reconorph2; reset_logs
+register pi-runner-noretire
+orphanize pi-runner-noretire
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_TIME_SKEW_S=600 run reconcile)"
+assert_eq "$?" "6" "a pass that measured the orphan and did NOT retire it is rc 6, never 0"
+assert_contains "$out" "why=orphaned-not-retired measured=1 retired=0" "naming the proven state and what it did about it"
+assert_contains "$out" "reconcile: dead=1 restarted=0" "and still publishing the summary a monitor reads"
+assert_file "$RUNNER_ROOT/pi-runner-noretire/.runner" "the refused retirement deleted nothing"
+
+# ⛔ THE FORK RE-CHECKS LIVENESS ITSELF (#2892 review round 5, P2). `reclaim` puts a NETWORK clock probe
+# (up to 10 s) and a sibling scan between its "dead" verdict and `start_listener`'s fork, so a listener
+# a systemd unit or another pass brought up inside that window was forked OVER: a second listener for
+# one registration, with the post-start read then taking the OTHER process as proof of survival. The
+# shim plants exactly that: a listener row that appears only from the SECOND read on, i.e. between the
+# caller's probe and the fork.
+echo "── start_listener: a listener that appears inside the caller's window is NOT doubled ──"
+fresh_pool prefork; reset_logs
+register pi-runner-pre
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_PS_OUTSIDE_AFTER=1 \
+  FIXTURE_PS_EXTRA="    999999  $RUNNER_ROOT/pi-runner-pre/bin/Runner.Listener run --startuptype service" \
+  run restart --name pi-runner-pre)"
+assert_eq "$?" "0" "a registration that came up in the window is LIVE (rc 0), not a refusal"
+assert_contains "$out" "did not start it" "and the start says THIS pass did not fork it"
+assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-pre")" "0" "no listener was forked — the double start the arm exists to stop"
+
+# ⛔ A REVIVAL IS A REPAIR (#2892 review round 5, P1): `capacity_class` calls a registration orphaned
+# from an OLD log line, and `reclaim` then proves it healthy by starting a listener that survives — the
+# skew-artifact case (actions/runner#4648). Reading only `retired=` made that repair look like an orphan
+# left behind, and a false rc 6 sends a scheduler to `reclaim` over a healthy box.
+echo "── reconcile: an orphan-LOOKALIKE that the start proves healthy is 0, not 6 ──"
+fresh_pool reconrevived; reset_logs
+register pi-runner-revived
+printf 'Failed to create a session. The runner registration has been deleted from the server, please re-configure.\n' \
+  >"$RUNNER_ROOT/pi-runner-revived/listener.log"   # a skew-era line: no `.orphan`, so a start SURVIVES
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=3 run reconcile)"
+assert_eq "$?" "0" "a registration the start proves healthy exits 0 — the pass repaired it"
+assert_contains "$out" "revived=1" "and the pass reports the revival it achieved"
+assert_contains "$out" "reclaimed=0" "with nothing retired, because nothing was gone"
+assert_file "$RUNNER_ROOT/pi-runner-revived/.runner" "the install is untouched"
+
 # (6) A refusal must never be printed as a message containing a COMMAND the shell executes: the
 #     preserve message carried `config.sh remove` in backticks inside a double-quoted string.
 echo "── the retire messages contain no executable substitutions ──"
@@ -2177,7 +2234,7 @@ cp -a "$TEMPLATE/." "$RUNNER_ROOT/nameless/"
 printf '{}\n' >"$RUNNER_ROOT/nameless/.runner"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reclaim)"
 assert_eq "$?" "0" "the pass still retires the orphaned install"
-assert_contains "$out" "the name is UNVERIFIED" "a `.runner` we could not parse still suppresses the re-register advice"
+assert_contains "$out" "the name is UNVERIFIED" 'a `.runner` we could not parse still suppresses the re-register advice'
 
 # ── THE REFUSAL NAMES A REMEDY THAT EXISTS (#2892 review round 4, P2) ──────────────────────────
 # `reclaim --name` on a dir that is not a registration used to say "'add --name <name>' is the verb
