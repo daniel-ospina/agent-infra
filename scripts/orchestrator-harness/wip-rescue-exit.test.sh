@@ -591,9 +591,21 @@ ck "N13 …a dirty tree WITH an archive gets the fetch of the ref it names; resc
 n_bound=$(grep -c 'tb_timeout 15 git -C "$root" push' "$GATE" 2>/dev/null)
 n_sym=$(grep -c 'tb_timeout 15 git -C "$root" ls-remote --symref' "$GATE" 2>/dev/null)
 n_ver=$(grep -c 'tb_timeout 5 git -C "$root" ls-remote --heads' "$GATE" 2>/dev/null)
+# ⛔ CONTINUATIONS ARE JOINED AND COMMENTS STRIPPED BEFORE THE SCAN (review cycle 6, gap B: a call split by
+# a line continuation — natural for a long refspec — was seen by neither the bounded nor the unbounded
+# count, so `git -C "$root" \` + `fetch origin` on the next line shipped green).
+joined=$(awk '
+  /^lane_end_push\(\)/,/^}/ {
+    if ($0 ~ /^[[:space:]]*#/) next
+    line = line $0
+    if ($0 ~ /\\$/) { sub(/\\$/, "", line); next }
+    print line; line = ""
+  }' "$GATE" 2>/dev/null)
+n_net=$(printf '%s\n' "$joined" | grep -cE 'git -C "\$root".*\b(push|fetch|ls-remote)\b')
+n_unbounded=$(printf '%s\n' "$joined" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -cv 'tb_timeout')
 [ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
-  && [ "$(awk '/^lane_end_push\(\)/,/^}/' "$GATE" | grep -E 'git -C "\$root" (push|fetch|ls-remote)' | grep -cv 'tb_timeout')" = 0 ]; rcn14=$?
-ck "N14 …all three network calls are BOUNDED (15/15/5) and no unbounded push exists in the exit path" $rcn14
+  && [ "$n_net" -ge 3 ] && [ "$n_unbounded" = 0 ]; rcn14=$?
+ck "N14 …every network call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net)" $rcn14
 # ⛔ N15 — THE HUB REFUSAL IS READ, NOT INHERITED (review cycle 4, gap 3: F7 executes the shape but no arm
 # ever greps `refused-main-checkout`, so deleting the block left the suite green — the merge-gate bypass
 # the comment names, undetected).
@@ -626,7 +638,7 @@ exit_fn=$(awk '/^lane_end_push\(\)/,/^}/' "$GATE"; awk '/^terminal_wip_rescue\(\
 # false-negative it exists to prevent.
 exit_code_only=$(printf '%s\n' "$exit_fn" | grep -v '^[[:space:]]*#')
 n_force=$(printf '%s\n' "$exit_code_only" | grep -cE 'push.*(--force|(^| )-f( |$)|\+HEAD|\+refs)')
-n_destructive=$(printf '%s\n' "$exit_code_only" | grep -ciE 'stash|worktree +(remove|prune)|reset +--hard')
+n_destructive=$(printf '%s\n' "$exit_code_only" | grep -ciE 'stash|worktree +(remove|prune)|reset .*--hard')
 [ "$n_force" = 0 ] && [ "$n_destructive" = 0 ]; rcn17=$?
 ck "N17 …the exit path carries no force (--force, -f, or a +refspec) and no stash/worktree-removal/reset --hard, on ANY branch" $rcn17
 # ⛔ N19 — THE R6 PROPERTY BEHAVIOURALLY, NOT BY SPELLING (review cycle 5, gap 1). A scan proves a verb is
@@ -639,14 +651,16 @@ git -C "$TMP/wt6" push -q origin diverged 2>/dev/null
 base_sha=$(git -C "$BARE" rev-parse refs/heads/diverged 2>/dev/null)
 git -C "$TMP/wt6" update-ref refs/heads/diverged "$seed2" 2>/dev/null
 git -C "$TMP/wt6" commit -q --allow-empty -m divergent 2>/dev/null
+local_head=$(git -C "$TMP/wt6" rev-parse HEAD 2>/dev/null)
 O="$O" bash -c '
   . "$1"
   lane_end_push "diverged" "$2" "$3" diverged 1 1
   printf "push=%s\n" "$LANE_END_PUSH"
 ' _ "$GATE" "$O/logs/diverged.log" "$TMP/wt6" 2>/dev/null > "$TMP/diverged.out"
 grep -q 'push=FAILED' "$TMP/diverged.out" 2>/dev/null \
-  && [ "$(git -C "$BARE" rev-parse refs/heads/diverged 2>/dev/null)" = "$base_sha" ]; rcn19=$?
-ck "N19 …a DIVERGENT branch is refused and the remote sha is UNMOVED (never forced, never rewound) — measured: $(head -1 "$TMP/diverged.out" | cut -c1-40)" $rcn19
+  && [ "$(git -C "$BARE" rev-parse refs/heads/diverged 2>/dev/null)" = "$base_sha" ] \
+  && [ "$(git -C "$TMP/wt6" rev-parse HEAD 2>/dev/null)" = "$local_head" ]; rcn19=$?
+ck "N19 …a DIVERGENT branch is refused, the remote sha is UNMOVED and the LOCAL head still holds the commit (any destructive verb on the failure branch goes red) — measured: $(head -1 "$TMP/diverged.out" | cut -c1-40)" $rcn19
 # ⛔ N18 — THE SILENT-WRITE RULE IS LOUD ON THE mkdir/mktemp BRANCHES TOO (review cycle 4, gap 5): N9 sends
 # the log to /dev/null, so those two lines could go silent and stay green.
 mkdir -p "$TMP/ro"
