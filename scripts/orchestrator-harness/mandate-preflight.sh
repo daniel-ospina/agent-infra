@@ -233,7 +233,7 @@ EOF
 # carrying its own. Every branch PROCEEDS and the function never returns non-zero: this is a disclosure,
 # not a gate (the file's header states why a refusal here would be an over-block that halts the fleet).
 mandate_preflight_emit() {
-  local log="${1:-/dev/null}" prompt="${2:-}" label="${3:-agent}" line notice brief_text has_brief stamped current
+  local log="${1:-/dev/null}" prompt="${2:-}" label="${3:-agent}" line notice brief_text has_brief stamped current brief_payload
   # ⛔ A FAILED RENDER IS NOT "NOTHING TO SAY" (this change's review, P2). The command substitution used
   # to swallow the renderer's stderr, so a failure produced an empty `line` and the `[ -n ]` guard read it
   # as "every file is present" and returned 0 in silence — the exact defect this file exists to end. An
@@ -259,18 +259,25 @@ mandate_preflight_emit() {
   # rewritten under its author. So the sentinel stays ONE marker (the recorded "one sentinel" decision is
   # intact); what changes is only WHEN it is honoured.
   #
-  # ⛔ THE COMPARISON IS THE WHOLE BLOCK, NOT A LINE OF IT (measured while writing this fix): `grep -F`
-  # with a MULTI-LINE pattern treats each line as its own pattern, so "the brief contains THIS block"
-  # degenerated into "the brief contains ANY line of it" — and two different absence sets share the
-  # sentinel, the heading and the closing line, so a CHANGED state still read as current and stayed
-  # hidden. A `case` on the brief read once makes the match a literal substring of the entire block, and
-  # is POSIX/bash-3.2 rather than a GNU-grep extension.
+  # ⛔ THE COMPARISON IS THE WHOLE BLOCK, AND "CURRENT" MEANS "THIS IS THE LAST THING THE BRIEF SAYS"
+  # — not "the text appears somewhere in it". Both halves were wrong in the first cut of this guard
+  # (this change's review, P1 and P2, measured):
+  #   * a multi-line `grep -F` pattern is treated as ONE PATTERN PER LINE, so "contains THIS block"
+  #     degenerated into "contains ANY line of it" — and two different absence sets share the sentinel,
+  #     the heading and the closing line, so a CHANGED state read as current;
+  #   * a substring test over the WHOLE brief is still wrong for the FLIP-BACK (A → provisioned → A):
+  #     block A is still in the brief from the first stamp, so the emit short-circuited while the LAST
+  #     thing the lane reads was the supersession notice "BOTH mandated files are now PRESENT" — a
+  #     CURRENT, FALSE present claim with no correcting block. That is the stale-negative again, reached
+  #     through the very transition this guard advertises, and the LANE is the reader that matters.
+  # A `case` pattern anchored at the END (`*"$line"`, no trailing `*`) makes it "the brief ENDS with this
+  # block", which is exactly the claim the lane sees last. POSIX/bash-3.2, and no GNU-grep extension.
   has_brief=""; brief_text=""; stamped=""; current=""
   if [ -n "$prompt" ] && [ -f "$prompt" ]; then
     has_brief=1
     brief_text="$(cat "$prompt" 2>/dev/null)"
     case "$brief_text" in *"$(mandate_sentinel)"*) stamped=1 ;; esac
-    if [ -n "$line" ]; then case "$brief_text" in *"$line"*) current=1 ;; esac; fi
+    if [ -n "$line" ]; then case "$brief_text" in *"$line") current=1 ;; esac; fi
   fi
   # ── the HEALTHY case: nothing to declare about the box ───────────────────────────────────────────
   # A CLEAN brief stays byte-for-byte untouched (an always-on banner is noise a reader learns to skip).
@@ -278,42 +285,57 @@ mandate_preflight_emit() {
   # silently is how a lane reports an absence that is not there.
   if [ -z "$line" ]; then
     [ -n "$stamped" ] || return 0
-    notice="$(printf '%s\n[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: BOTH mandated files are now PRESENT and readable on this box (%s), so that earlier block is a STALE reading of box state and must NOT be reported — do not claim a mandated file is missing (agent-infra#3377).' "$(hostname 2>/dev/null || printf 'this box')")"
+    # ⛔ ONE `%s`, ONE ARGUMENT (this change's review, P2, measured): the first cut passed one argument for
+    # TWO conversions, so the hostname took the first `%s` and split onto its own line while the box name
+    # rendered as an empty `()` — in a notice whose whole value is naming WHICH box has WHICH state. The
+    # leading `'%s\n'` is unnecessary anyway: the caller wraps the notice in `printf '\n%s\n'`.
+    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: BOTH mandated files are now PRESENT and readable on this box (%s), so that earlier block is a STALE reading of box state and must NOT be reported — do not claim a mandated file is missing (agent-infra#3377).' "$(hostname 2>/dev/null || printf 'this box')")"
+    # ⛔ AND IT IS IDEMPOTENT (this change's review, P2, measured: five dispatches on a provisioned box
+    # produced FIVE notices). `stamped` never clears, so without this test every later dispatch appended
+    # another copy and the brief grew without bound. If the brief already ENDS with this notice, the claim
+    # the lane reads last is already correct — there is nothing to add.
+    case "$brief_text" in *"$notice") return 0 ;; esac
     if { printf '\n%s\n' "$notice" >> "$prompt"; } 2>/dev/null; then
-      { echo "[mandate-preflight] $label: the brief carried a STALE mandate block (this box is now provisioned); appended the supersession notice to $prompt" >> "$log"; } 2>/dev/null
+      { echo "[mandate-preflight] $label: the brief carried a STALE mandate block (this box is now provisioned); appended the supersession notice to $prompt" >> "$log"; } 2>/dev/null || :
     else
-      { echo "[mandate-preflight] WARN $label: the brief at $prompt still carries a STALE mandate block and the supersession notice could not be appended — the LANE may report an absence that is no longer true." >> "$log"; } 2>/dev/null
+      { echo "[mandate-preflight] WARN $label: the brief at $prompt still carries a STALE mandate block and the supersession notice could not be appended — the LANE may report an absence that is no longer true." >> "$log"; } 2>/dev/null || :
     fi
     return 0
   fi
   # ⛔ GROUPED REDIRECT (this change's review, P2): `printf … >> "$log" 2>/dev/null` applies
   # left-to-right, so an unwritable `$log` emitted `bash: … Permission denied` on the CALLER's stderr —
   # the same class the brief-append below already fixes, on the other file.
-  { printf '%s\n' "$line" >> "$log"; } 2>/dev/null
+  # ⛔ AND IT MUST NOT ABORT A `set -e` CALLER (this change's review, P2, measured): this was the ONE
+  # bare redirection in the file — its neighbours sit inside `if` — so an unwritable `$log` (full disk,
+  # read-only dir) made the group non-zero and terminated a caller with `errexit` half-way through a
+  # dispatch, against the header's sourced-mode promise. `|| :` makes it what it is: a log write.
+  { printf '%s\n' "$line" >> "$log"; } 2>/dev/null || :
   if [ -z "$has_brief" ]; then
-    { echo "[mandate-preflight] WARN $label: no brief file to append to ($prompt), so only THIS LOG names the absence and the LANE will not see it." >> "$log"; } 2>/dev/null
+    { echo "[mandate-preflight] WARN $label: no brief file to append to ($prompt), so only THIS LOG names the absence and the LANE will not see it." >> "$log"; } 2>/dev/null || :
     return 0
   fi
-  # EXACTLY this block is present: idempotent, append nothing (the ordinary re-dispatch case).
+  # EXACTLY this block is the brief's LAST statement: idempotent, append nothing (the ordinary
+  # re-dispatch case, and why an unchanged state does not grow the brief).
   if [ -n "$current" ]; then
-    { echo "[mandate-preflight] $label: the brief ALREADY names the unsatisfiable mandate file(s) — not appending a second copy" >> "$log"; } 2>/dev/null
+    { echo "[mandate-preflight] $label: the brief ALREADY ends with this mandate block — not appending a second copy" >> "$log"; } 2>/dev/null || :
     return 0
   fi
-  # A stamped-but-DIFFERENT brief is the stale-negative case: the earlier block is SUPERSEDED, not
-  # suppressed, so the current absence actually reaches the lane. Worded so the lane cannot read both
-  # blocks as true at once.
-  notice=""
+  # A stamped-but-DIFFERENT brief is the stale-negative (or the flip-back) case: the earlier claim is
+  # SUPERSEDED, not suppressed, so the CURRENT state actually reaches the lane. Worded so the lane cannot
+  # read both blocks as true at once.
+  brief_payload="$line"
   if [ -n "$stamped" ]; then
-    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block earlier in this brief: box state has CHANGED, so the block BELOW is the CURRENT reading and the earlier one is stale — use only what follows (agent-infra#3377).') "
+    notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block(s) earlier in this brief: box state has CHANGED, so the block BELOW is the CURRENT reading and every earlier one is stale — use only what follows (agent-infra#3377).')"
+    brief_payload="$(printf '%s\n%s' "$notice" "$line")"
   fi
   # ⛔ GROUP THE REDIRECT WITH THE COMMAND (#3377 review, P2): `printf … >> "$prompt" 2>/dev/null` applies
   # left-to-right, so the FAILING `>>` emitted its raw `: <path>: Permission denied` to the caller's stderr
   # BEFORE `2>/dev/null` took effect — an untagged bash error escaping run_agent's log contract. The
   # braces make the suppression cover the redirection itself.
-  if { printf '\n%s%s\n' "$notice" "$line" >> "$prompt"; } 2>/dev/null; then
-    { echo "[mandate-preflight] $label: named the absence IN THE BRIEF as well ($prompt) — the lane cannot obey an instruction it was never told was unsatisfiable" >> "$log"; } 2>/dev/null
+  if { printf '\n%s\n' "$brief_payload" >> "$prompt"; } 2>/dev/null; then
+    { echo "[mandate-preflight] $label: named the absence IN THE BRIEF as well ($prompt) — the lane cannot obey an instruction it was never told was unsatisfiable" >> "$log"; } 2>/dev/null || :
   else
-    { echo "[mandate-preflight] WARN $label: could not append the mandate block to $prompt, so only THIS LOG names it and the LANE will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null
+    { echo "[mandate-preflight] WARN $label: could not append the mandate block to $prompt, so only THIS LOG names it and the LANE will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null || :
   fi
   return 0
 }

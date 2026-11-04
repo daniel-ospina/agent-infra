@@ -239,6 +239,65 @@ touch "$STATE/LANE-BRIEF-PREAMBLE.md" "$STATE/TORTOISE-GRAPH-BRIEF.md"
 CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" s3' _ "$HELPER" "$TMP/restate.log" "$BRIEF1C" >/dev/null 2>&1
 grep -qF 'BOTH mandated files are now PRESENT' "$BRIEF1C"; ck $? "a PROVISIONED box retires its stale block loudly — the lane is no longer ordered to report a false absence"
 grep -qF 's3' "$TMP/restate.log"; ck $? "…and the operator log records that supersession (it used to record NOTHING)"
+# ── E1d: the FLIP-BACK (A → provisioned → A), and the notice's own two failure modes ─────────────−
+# The first cut of the content guard compared a SUBSTRING over the whole brief, so block A was still
+# "present" from the first stamp and the emit short-circuited — while the LAST thing the brief said was
+# "BOTH mandated files are now PRESENT". The lane therefore read a CURRENT, FALSE present claim with no
+# correcting block: the stale-negative again, reached through the very transition the guard advertises
+# (this change's review, P1, measured). "Current" must mean the brief ENDS with this block.
+: > "$STATE/TORTOISE-GRAPH-BRIEF.md"; rm -f "$STATE/LANE-BRIEF-PREAMBLE.md"   # only PREAMBLE missing
+BRIEF1D="$TMP/brief-flipback.txt"; printf '# a brief\n' > "$BRIEF1D"; : > "$TMP/flip.log"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" f1' _ "$HELPER" "$TMP/flip.log" "$BRIEF1D" >/dev/null 2>&1
+: > "$STATE/LANE-BRIEF-PREAMBLE.md"                                           # provisioned
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" f2' _ "$HELPER" "$TMP/flip.log" "$BRIEF1D" >/dev/null 2>&1
+rm -f "$STATE/LANE-BRIEF-PREAMBLE.md"                                         # THE SAME ABSENCE RETURNS
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" f3' _ "$HELPER" "$TMP/flip.log" "$BRIEF1D" >/dev/null 2>&1
+# The brief's LAST claim must be the CURRENT one: a missing-PREAMBLE block, not the earlier "now present"
+# notice. Assert on ORDER, not on presence — both strings are in the file, so a substring test would pass
+# on the buggy code.
+LASTP_CLAIM="$(grep -E 'BOTH mandated files are now PRESENT|MISSING .*LANE-BRIEF-PREAMBLE\.md' "$BRIEF1D" | tail -1)"
+case "$LASTP_CLAIM" in *MISSING*LANE-BRIEF-PREAMBLE.md*) ok "the FLIP-BACK re-discloses the absence — the brief's LAST claim is the current missing file, not a stale 'now PRESENT'" ;; *) bad "the FLIP-BACK left the stale 'now PRESENT' notice as the brief's last word (got: $LASTP_CLAIM)" ;; esac
+# ⛔ THE NOTICE MUST NAME THE BOX AND HAVE NO EMPTY `()` — the first cut passed ONE argument for TWO `%s`,
+# so the hostname split onto its own line and the box name rendered empty.
+grep -qF 'on this box ()' "$BRIEF1D" && bad "the supersession notice rendered an EMPTY box name — a printf with more conversions than arguments" || ok "the supersession notice's box name is populated (no empty () )"
+# ⛔ AND IT IS IDEMPOTENT: `stamped` never clears, so without a guard every later dispatch appended
+# ANOTHER notice (measured: five dispatches on a provisioned box → five notices, brief grown to 2195 B).
+touch "$STATE/LANE-BRIEF-PREAMBLE.md" "$STATE/TORTOISE-GRAPH-BRIEF.md"
+: > "$TMP/flip2.log"
+BEFORE_N="$(grep -cF 'SUPERSEDES' "$BRIEF1D")"
+for _i in 1 2 3 4 5; do
+  CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" r' _ "$HELPER" "$TMP/flip2.log" "$BRIEF1D" >/dev/null 2>&1
+done
+AFTER_N="$(grep -cF 'SUPERSEDES' "$BRIEF1D")"
+# ONE notice for the STATE TRANSITION (this batch's first emit sees the flip-back's block as the last
+# word), and then NOTHING for the four dispatches after it — that is the property: a notice per state
+# change, never per dispatch. Asserting an absolute count would have been wrong (a transition is entitled
+# to one); asserting growth per dispatch is what the measured defect was.
+[ "$AFTER_N" -eq "$((BEFORE_N + 1))" ]; ck $? "a state flip adds ONE notice, and the four dispatches after it add none (before=$BEFORE_N after=$AFTER_N)"
+for _i in 1 2 3 4 5; do
+  CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" r' _ "$HELPER" "$TMP/flip2.log" "$BRIEF1D" >/dev/null 2>&1
+done
+FINAL_N="$(grep -cF 'SUPERSEDES' "$BRIEF1D")"
+[ "$FINAL_N" -eq "$AFTER_N" ]; ck $? "…and FIVE MORE dispatches on a provisioned box add nothing at all (a reused brief cannot grow without bound)"
+# ── E1e: an unwritable LOG must not ABORT a `set -e` caller ──────────────────────────────────────
+# This was the file's ONE bare redirection — every neighbour sits inside an `if` — so an unwritable log
+# (full disk, read-only dir, a rotated path) made the group non-zero and TERMINATED a caller with
+# `errexit` half-way through a dispatch, against the header's sourced-mode promise that sourcing cannot
+# abort its caller. That promise is what a future seam author will rely on, so it is pinned here rather
+# than left as prose (this change's review, P2, measured: rc=1 and the caller never continued).
+mkstate
+RO_LOG="$TMP/readonly.log"; : > "$RO_LOG"; chmod 400 "$RO_LOG"
+BRIEF1E="$TMP/brief-errexit.txt"; printf '# a brief\n' > "$BRIEF1E"
+if [ -w "$RO_LOG" ]; then
+  ok "(skipped: this user can write a 400 file — running as root?)"
+else
+  CELL_HOME="$TMP/home" bash -c 'set -e; . "$1"; mandate_preflight_emit "$2" "$3" errexit; printf REACHED-AFTER-EMIT' \
+    _ "$HELPER" "$RO_LOG" "$BRIEF1E" > "$TMP/errexit.out" 2>/dev/null
+  ERC=$?
+  [ "$ERC" -eq 0 ]; ck $? "an unwritable LOG under a set -e caller: the emit still returns 0 (rc=$ERC)"
+  grep -qF 'REACHED-AFTER-EMIT' "$TMP/errexit.out"; ck $? "…and the CALLER kept running past it (the sourced-mode promise, not just the return code)"
+fi
+chmod 600 "$RO_LOG" 2>/dev/null
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
