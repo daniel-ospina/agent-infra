@@ -238,6 +238,17 @@ export HOME="$T/home"
 # would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
 # SYSTEMD_UNIT_DIR above; the shipped default is what cloud-cell-bringup.verify.test.sh's red arms use.
 export CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root
+# ⛔ THE DISK FLOOR IS A HOST READ *AND* A HOST WRITE (review P1, #2916). `--check` now ends with
+# `check_reaping_armed`, which sources `disk-floor.sh` and runs the REAL `disk_floor_gate`: below the
+# floor that function runs the fleet's safe reclaim — `uv cache prune` (and `uv cache clean` when no
+# uv is live), plus deletion of day-old `${TMPDIR:-/tmp}/cloud-cell-<dead-pid>.*` scratch. This suite
+# drives `--check` end to end, so without the seam below it (a) MUTATES the host it exists to be
+# hermetic against, and (b) reddens every success-expecting arm on any runner under the floor, with
+# no defect behind it — a fleet-wide `bash-suites` red manufactured by a test fixture.
+# The floor is stubbed HERE; the real gate (including its below-floor refusal) is exercised by
+# cloud-cell-bringup.verify.test.sh, where `df` is stubbed.
+export DISK_FLOOR_LIB="$T/disk-floor-stub.sh"
+printf '#!/bin/sh\ndisk_floor_gate() { return 0; }\n' > "$DISK_FLOOR_LIB"
 export SYSTEMCTL="$STUB/systemctl"
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script

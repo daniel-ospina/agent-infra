@@ -709,16 +709,67 @@ _pids_join() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ *$//'; }
 # state dir the pid actually runs from, and the exact command.
 # ⛔ MESSAGE ONLY — nothing here signals anything. Auto-clearing a pid/session this state dir cannot
 # prove it owns is the #1856 hazard; the remedy is PRINTED for the operator, never executed.
+#
+# ⛔ `-ww`, NOT A BARE `ps -eo` (review P2, #2916). procps TRUNCATES `args` to `$COLUMNS`, and BSD/macOS
+# `ps` truncates unless `-w`; a cut line loses the `…/orch-loop.sh` token, so `_pid_state_dir` returns
+# nothing and the message silently drops the state dir — the entire deliverable of check 6 — without
+# saying it dropped it. This repo already fixed this once (`ci_runner_pool.sh`: "`-ww`, NOT A BARE
+# `ps -eo`").
+_ps_table() { ps -ww -eo pid=,args= 2>/dev/null; }
+# The state dir a pid's OWN command line names, or empty when it names none. Read from the full args,
+# split on spaces/quotes/equals so `O=…` inside a `bash -c` body still yields the path.
+_pid_state_dir() { # <pid> -> the …/orch-loop.sh directory that pid runs from
+  local t
+  t="$(_ps_table)" || t=""
+  [ -n "$t" ] || return 0
+  printf '%s\n' "$t" | awk -v pp="$1" '$1==pp' | tr ' \t' '\n\n' \
+    | sed -n 's|^\(.*\)/orch-loop\.sh$|\1|p' | head -1
+}
 _pids_join_with_dirs() { # <pids-newline-separated> -> "pid <p> (state dir <d>)" …
-  local t p d out=""
-  t="$(ps -eo pid=,command= 2>/dev/null)" || t=""
+  local p d out=""
   for p in $1; do
-    d=""
-    [ -n "$t" ] && d="$(printf '%s\n' "$t" | awk -v pp="$p" '$1==pp' | tr ' \t' '\n\n' \
-                       | sed -n 's|^\(.*\)/orch-loop\.sh$|\1|p' | head -1)"
+    d="$(_pid_state_dir "$p")"
     if [ -n "$d" ]; then out="$out, pid $p (state dir $d)"; else out="$out, pid $p"; fi
   done
   printf '%s' "${out#, }"
+}
+# The pids from <seen> whose own command line names <dir> — and ONLY those are provably this state
+# dir's, so only those may be named with `kill`.
+_pids_owning_dir() { # <pids-newline-separated> <state dir>
+  local p d
+  for p in $1; do
+    d="$(_pid_state_dir "$p")"
+    [ -n "$d" ] && [ "$d" = "$2" ] && printf '%s\n' "$p"
+  done
+}
+# ⛔ THE REMEDY IS PARTITIONED BY THE EVIDENCE THE MESSAGE ALREADY PRINTS (review P1, #2916).
+# `seen_controller_pids` explicitly REFUSES to claim ownership — the `$HARNESS` leg "is NOT an
+# ownership claim … two repos on one machine pin the same harness path and this read returns repo A's
+# controller to repo B (#1856, reproduced)" — and `_pids_minus`'s contract is "Reported, never
+# signalled, never fatal". An earlier draft of this message nonetheless printed a bare
+# `kill <every seen pid>` and asserted the set was "a leftover inner-chain member": on a two-repo box
+# the pid it names is the OTHER cell's LIVE controller, so an operator (or the unit's journal, since
+# the caller is the service's own ExecStart) would kill a peer's dispatcher mid-merge — while THIS
+# cell was the one that could not prove itself. A pid whose command line names THIS state dir is this
+# cell's leftover; anything else belongs to another cell and must be left alone.
+# ⛔ THE STATE DIR IS `$O`, NOT `$OR`. `O` is the state dir (`$CELL_HOME/orchestrator`); `OR` is the
+# REPO SLUG (`OR="$QUEUE_REPO"`). The two predecessor messages interpolated `$OR` into the phrase
+# "this state dir's ($OR)" and into "a pid whose state dir is not $OR", so the sentence an operator
+# reads named the repo where it meant the directory — and partitioning on it would match no pid at
+# all, silently deleting the ONE actionable case (this cell's own leftover, the measured row-7 shape).
+_unproven_remedy() { # <seen pids> -> the FIX sentence, safe to act on
+  local seen="$1" mine rest out=""
+  mine="$(_pids_owning_dir "$seen" "$O")"
+  rest="$(comm -23 <(printf '%s\n' "$seen" | awk 'NF' | sort -u) \
+                    <(printf '%s\n' "$mine" | awk 'NF' | sort -u))"
+  if [ -n "$mine" ]; then
+    out="kill $(_pids_join "$mine") — that pid's OWN command line names $O/orch-loop.sh, so it is THIS state dir's leftover"
+  fi
+  if [ -n "$rest" ]; then
+    out="${out:+$out. }do NOT kill $(_pids_join "$rest") — it runs from a DIFFERENT state dir ($(_pids_join_with_dirs "$rest")), so it is that cell's live controller and killing it stops a peer's dispatch; give this repo its own SESSION in ${ENV_FILE:-$CELL_HOME/keys.env} instead"
+  fi
+  [ -n "$out" ] || out="nothing here is provably this state dir's — give this repo its own SESSION in ${ENV_FILE:-$CELL_HOME/keys.env}"
+  printf '%s' "$out"
 }
 # The state dir a FOREIGN doctor session runs from, read from its own pane command (the same evidence
 # `doctor_session_foreign` uses). Empty when the pane does not name one — printed as <unreadable>
@@ -2575,7 +2626,7 @@ cmd_start() {
       if [ -z "$_own" ]; then
         _seen="$(seen_controller_pids 2>/dev/null)" || _seen=""
         if [ -n "$_seen" ]; then
-          die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$_seen")) and is not provably this state dir's ($OR) — refusing to wait for it (that would supervise nothing while reporting an active unit). FIX: kill $(_pids_join "$_seen") — a pid whose state dir is not $OR is a leftover inner-chain member from a previous state dir (the measured row-7 case) and it blocks this cell's first start until it is gone; if it IS this repo's, give this repo its own SESSION in $ENV_FILE instead"
+          die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$_seen")) and is not provably this state dir's ($O) — refusing to wait for it (that would supervise nothing while reporting an active unit). FIX: $(_unproven_remedy "$_seen")"
         fi
       fi
       # ⛔ THE CEILING DEPENDS ON WHICH WAIT THIS IS. An owned pid is a controller doing its work — long
@@ -2738,7 +2789,7 @@ cmd_start() {
     # up" when it was not, and named `stop` as the remedy — which this same state dir refuses in this
     # exact state (#1856 review, reproduced). Starting here would put a second controller on one
     # queue, which is what #1761 forbids, so refuse and say exactly what is and is not known.
-    die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$live")) and is not provably this state dir's ($OR) — refusing to start a second controller; it is left alone. FIX: kill $(_pids_join "$live") — a pid whose state dir is not $OR is a leftover inner-chain member from a previous state dir (the measured row-7 case) and it blocks this cell's first start until it is gone; if it IS this repo's, give this repo its own SESSION in $ENV_FILE instead"
+    die "a controller runs from this machine's shared harness path ($(_pids_join_with_dirs "$live")) and is not provably this state dir's ($O) — refusing to start a second controller; it is left alone. FIX: $(_unproven_remedy "$live")"
   fi
   # ── a box whose controller is a SERVICE is started BY the service manager (agent-infra#2402) ────
   # Reaching this line means nothing of this cell's is running (every branch above returned or died), so

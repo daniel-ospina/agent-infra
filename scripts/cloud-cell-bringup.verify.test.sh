@@ -49,6 +49,27 @@ say_case() { echo; echo "── $1 ──"; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/cell-verify-2916.XXXXXX")"
 trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
 
+# ⛔ THE SUITE MUST NOT TOUCH THE HOST'S REAL SECRETS OR THE HOST'S REAL UNITS (review P1 ×2, #2916).
+#
+# 1) Sourcing the shipped file runs its TOP-LEVEL `install_secret_traps` + `register_secret
+#    "$GH_TOKEN_FILE"` (cloud-cell-bringup.sh:234-238), so every arm's subshell EXIT trap runs
+#    `remove_secrets` → `rm -f "$GH_TOKEN_FILE"`, whose default is the REAL `/tmp/.gh-tok`. Measured
+#    on 2026-10-27: a decoy placed at /tmp/.gh-tok was GONE after one run, its only trace an
+#    `ok: secret file removed` line buried inside an arm's captured output. On a cell that file is
+#    the operator's push-capable github token — a test silently destroying it is exactly the class
+#    this PR removes from the bring-up. The sibling suite pins it for the same reason
+#    (cloud-cell-bringup.test.sh, "GH_TOKEN_FILE keeps it hermetic").
+# 2) `check_one_home units` scans EVERY dir `_one_home_unit_dirs` returns, and two of them default to
+#    the HOST's (`/etc/systemd/system`, `$HOME/.config/systemd/user`). On any box that has run the
+#    installers — every cell, and a dev box — the arms read the host's `eldato-*` units and refuse on
+#    THOSE, never reaching the branch under test: the "no rendered unit" arm then passes for an
+#    unrelated reason and no mutation can see it. Pinned to empty fixtures below.
+export GH_TOKEN_FILE="$T/.gh-tok"
+printf 'DECOY — this fixture token must SURVIVE the whole suite\n' > "$GH_TOKEN_FILE"
+export CONTROLLER_SYSTEM_UNIT_DIR="$T/units-sys"
+export CONTROLLER_USER_UNIT_DIR="$T/units-user"
+mkdir -p "$T/units-sys" "$T/units-user"
+
 for f in "$BRINGUP" "$SUP" "$FLOOR_LIB"; do
   [ -f "$f" ] || { echo "missing $f"; exit 1; }
 done
@@ -144,6 +165,19 @@ U2="$T/units-empty"; mkdir -p "$U2"
 CELL_HOME="$H" SYSTEMD_UNIT_DIR="$U2" br check_one_home units
 [ "$RC" -ne 0 ] && ok "red: NO rendered unit found -> REFUSED (a leg that scans nothing is not a pass)" \
                || bad "red: an empty unit dir PASSED — vacuous gate"
+case "$OUT" in
+  *"no rendered eldato-*.service|timer was found"*) ok "red: refuses on the n==0 branch, not on a foreign unit" ;;
+  *) bad "red: refused for some OTHER reason — the arm is not keyed on n==0: $OUT" ;;
+esac
+
+# mutation: the n==0 refusal removed. Without this the empty-dir arm could be satisfied by any other
+# refusal (a host unit, a scan hit) and would prove nothing about the branch it names.
+mutate 'if [ "$n" -eq 0 ]; then' 'if false; then' "$T/mut-empty.sh" \
+  || bad "mutation(empty): edit did not apply"
+LIB_RUN="$T/mut-empty.sh" CELL_HOME="$H" SYSTEMD_UNIT_DIR="$U2" br check_one_home units
+[ "$RC" -eq 0 ] && ok "mutation(empty): with the n==0 refusal removed the empty dir PASSES (arm keys on it)" \
+               || bad "mutation(empty): an empty unit dir still refuses (rc=$RC) — the arm is not keyed on n==0"
+LIB_RUN="$LIB"
 
 mutate '_one_home_under_volatile "$p"' 'false' "$T/mut-scan.sh" \
   || bad "mutation(scan): edit did not apply"
@@ -296,7 +330,63 @@ sleep 0.3
 OUT="$( ( . "$SUPLIB"; _pids_join_with_dirs "$PEER_PID" ) 2>&1 )"; RC=$?
 case "$OUT" in *"pid $PEER_PID (state dir $PEER)"*) ok "message names each controller pid AND its state dir" ;;
                 *) bad "the pid->state-dir read did not resolve: '$OUT'" ;; esac
+
+# ⛔ THE REMEDY MUST NOT HAND THE OPERATOR A `kill` FOR A PEER CELL (review P1, #2916). The whole
+# FATAL fires exactly when ownership is UNPROVEN, and on a two-repo box the pid it names is the other
+# cell's LIVE controller (#1856). An earlier draft printed `kill <every seen pid>` and asserted the set
+# was a leftover — an operator following it takes a peer's dispatcher down mid-merge.
+# ⛔ `O` IS THE STATE DIR; `OR` IS THE REPO SLUG (`OR="$QUEUE_REPO"`). Partitioning on `OR` matches no
+# pid at all, which silently deletes the ONE actionable case (this cell's own leftover, row 7).
+THIS_O="$T/myo/orchestrator"; mkdir -p "$THIS_O"
+printf '#!/bin/sh\nsleep 30\n' > "$THIS_O/orch-loop.sh"
+bash "$THIS_O/orch-loop.sh" & MINE_PID=$!
+sleep 0.3
+# same peer pid, judged from a state dir that is NOT its own -> must be protected, not killed
+OUT="$( ( . "$SUPLIB"; O="$THIS_O"; _unproven_remedy "$PEER_PID" ) 2>&1 )"
+case "$OUT" in *"do NOT kill $PEER_PID"*) ok "a pid from ANOTHER state dir is named as NOT-to-kill (a peer cell's live controller)" ;;
+                *) bad "the remedy does not protect a foreign state dir's controller: '$OUT'" ;; esac
+case "$OUT" in "kill $PEER_PID "*|*"FIX: kill $PEER_PID "*) bad "the remedy still instructs killing a PEER cell's controller: '$OUT'" ;;
+                *) ok "the remedy does not instruct killing a peer cell's controller" ;; esac
+case "$OUT" in *"$PEER"*) ok "the protected pid is shown with the state dir that proves it is not ours" ;;
+                *) bad "the remedy does not name the foreign state dir, so the operator cannot tell peer from leftover: '$OUT'" ;; esac
+# a pid whose OWN command line names this state dir IS this cell's leftover -> kill is safe and named
+OUT="$( ( . "$SUPLIB"; O="$THIS_O"; _unproven_remedy "$MINE_PID" ) 2>&1 )"
+# ⛔ ANCHORED ON THE WHOLE SENTENCE, not on `kill <pid>`: the protection text CONTAINS "kill <pid>", so a
+# substring pattern reads "do NOT kill 123" as the actionable case and passes against the very bug this
+# arm exists to catch — it did, on the first draft of this fix.
+case "$OUT" in *"kill $MINE_PID "*) ok "a pid whose own command line names THIS state dir IS named with kill (the actionable case survives)" ;;
+                *) bad "this cell's own leftover is not actioned any more — the row-7 case is unreachable: '$OUT'" ;; esac
+case "$OUT" in *"do NOT kill"*) bad "this cell's OWN leftover is also protected — the remedy can never be acted on: '$OUT'" ;;
+                *) ok "this cell's own leftover is actioned, not protected" ;; esac
+kill -9 "$MINE_PID" 2>/dev/null; wait "$MINE_PID" 2>/dev/null
+# the ps read must survive a narrow COLUMNS (procps truncates `args` without -ww)
+OUT="$( COLUMNS=40 bash -c '. "$1"; _pid_state_dir "$2"' _ "$SUPLIB" "$PEER_PID" 2>&1 )"
+case "$OUT" in "$PEER") ok "the pid->state-dir read survives a 40-column terminal (-ww, not a bare ps -eo)" ;;
+                 *) bad "a narrow COLUMNS truncates the ps read, silently dropping the state dir: got '$OUT' want '$PEER'" ;; esac
 kill -9 "$PEER_PID" 2>/dev/null; wait "$PEER_PID" 2>/dev/null
+
+# ── the suite's OWN hermeticity (review P1, #2916) ────────────────────────────────────────────────────
+# Sourcing the shipped file installs the secret-lifetime trap, so an unpinned GH_TOKEN_FILE means this
+# suite's EXIT traps `rm -f` the host's REAL /tmp/.gh-tok — a credential destroyed by a test, with no
+# failure to show for it. ⛔ The assertion is about the SEAM, not survival: the arms *should* remove the
+# token they registered (that is the trap doing its job), so "the fixture file is gone" is correct
+# behaviour and must not be asserted. What must hold is that the registered path is INSIDE this
+# fixture — which is also why the suite writes a decoy to $GH_TOKEN_FILE before any arm runs.
+case "$GH_TOKEN_FILE" in
+  "$T"/*) ok "the secret seam is pinned inside the fixture ($GH_TOKEN_FILE) — no arm can remove the host's /tmp/.gh-tok" ;;
+  "") bad "GH_TOKEN_FILE is UNSET at the end of the run — the arms fell back to the shipped default /tmp/.gh-tok and this suite would delete the host's real token" ;;
+  *) bad "GH_TOKEN_FILE is '$GH_TOKEN_FILE', not inside the fixture root $T — an arm can reach a real credential" ;;
+esac
+[ "$GH_TOKEN_FILE" != "/tmp/.gh-tok" ] \
+  && ok "the shipped default (/tmp/.gh-tok) is NOT in effect" \
+  || bad "the shipped default /tmp/.gh-tok IS in effect — this suite deletes the host's real token"
+
+# the host's real unit dirs must not have decided any arm above
+case "$CONTROLLER_SYSTEM_UNIT_DIR" in
+  "$T"/*) ok "the suite's unit read-side seams are pinned to its own fixtures (no arm read the host's units)" ;;
+  *) bad "CONTROLLER_SYSTEM_UNIT_DIR is '${CONTROLLER_SYSTEM_UNIT_DIR:-<unset>}', not inside the fixture — an arm may have read the host's /etc/systemd/system" ;;
+esac
+[ -d "$CONTROLLER_USER_UNIT_DIR" ] && case "$CONTROLLER_USER_UNIT_DIR" in "$T"/*) : ;; *) bad "CONTROLLER_USER_UNIT_DIR is not inside the fixture" ;; esac
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

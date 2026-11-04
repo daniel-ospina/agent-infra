@@ -398,7 +398,7 @@ FIX: move the state under \$HOME (CELL_HOME=\$HOME, and point WORKDIR/ENV_FILE/H
   # scoped to "Darwin AND no explicit unit dir".
   if [ "$(uname -s 2>/dev/null)" = "Darwin" ] \
      && [ -z "${SYSTEMD_UNIT_DIR:-}${CONTROLLER_SYSTEM_UNIT_DIR:-}${CONTROLLER_USER_UNIT_DIR:-}" ]; then
-    warn "one home: the RENDERED UNITS were NOT scanned on macOS — the cell's systemd units are a Linux surface and launchd is out of scope here. Verify with: grep -HnE '^(Environment|ExecStart)=' \${CONTROLLER_USER_UNIT_DIR:-\$HOME/.config/systemd/user}/*.plist 2>/dev/null | grep /tmp"
+    warn "one home: the RENDERED UNITS were NOT scanned on macOS — the cell's systemd units are a Linux surface and launchd is out of scope here. Verify with: grep -Hn '/tmp' \"${LAUNCHD_AGENTS_DIR:-$HOME/Library/LaunchAgents}\"/eldato-*.plist"
     return 0
   fi
   dirs="$(_one_home_unit_dirs)"
@@ -1476,13 +1476,17 @@ check_disk_reaper() {
 check_reaping_armed() {
   local floor="" cand rc=0 out
   for cand in "${DISK_FLOOR_LIB:-}" \
-              "${HOME:-}/.pi/agent/scripts/orchestrator-harness/disk-floor.sh" \
               "${LAYER_ROOT:-}/scripts/orchestrator-harness/disk-floor.sh" \
               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/orchestrator-harness/disk-floor.sh" \
               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/disk-floor.sh"; do
     [ -n "$cand" ] && [ -f "$cand" ] && { floor="$cand"; break; }
   done
-  [ -n "$floor" ] || die "CANNOT VERIFY [reaping armed before lanes]: disk-floor.sh not found (looked at \$DISK_FLOOR_LIB, \$HOME/.pi/agent/scripts/orchestrator-harness, \$LAYER_ROOT/scripts/orchestrator-harness, and beside this script) — the disk floor and its reclaim pass cannot be run, and a cell certified without them stops dispatching at ~97% used with 'No space left on device' (row 8). FIX: re-run the operational-layer step (it farms the harness scripts) and re-run this check"
+  # ⛔ NO `$HOME/.pi/agent/scripts/orchestrator-harness/` CANDIDATE (review P2, #2916): the farm is FLAT
+  # and `disk-floor.sh` is not in `fleet_srcs` at all (`pi-bootstrap/setup.sh`: `cp $INFRA_ROOT/scripts/<base>
+  # → $DEST/scripts/<base>`), so that path can never exist and listing it sent the operator to a
+  # directory the layer step does not create. The layer that DOES carry it is `$LAYER_ROOT` (the
+  # checkout `check_operational_layer` just installed), which is the candidate named in the FIX below.
+  [ -n "$floor" ] || die "CANNOT VERIFY [reaping armed before lanes]: disk-floor.sh not found (looked at \$DISK_FLOOR_LIB, \$LAYER_ROOT/scripts/orchestrator-harness, and beside this script) — the disk floor and its reclaim pass cannot be run, and a cell certified without them stops dispatching at ~97% used with 'No space left on device' (row 8). FIX: this file is NOT farmed, so the operational-layer farm will not place it — point INFRA_ROOT at the agent-infra checkout (or set DISK_FLOOR_LIB to its scripts/orchestrator-harness/disk-floor.sh) and re-run this check"
   # shellcheck source=/dev/null
   . "$floor"
   out="$(disk_floor_gate "${CELL_HOME:-$HOME}" 2>&1)"; rc=$?
