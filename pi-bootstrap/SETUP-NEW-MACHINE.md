@@ -169,9 +169,10 @@ machine's pi instance.
   ruling (2026-10-31); do not re-add it.
 - **Tortoise MCP server:** the base config declares the **HOSTED** server —
   `type: http`, `url: https://api.premiselabs.co/mcp/`, `Authorization: Bearer
-  ${TORTOISE_API_KEY}`, `lazy: true`. It needs **no tortoise checkout, no venv and no
+  ${TORTOISE_MCP_API_KEY}`, `lazy: true`. It needs **no tortoise checkout, no venv and no
   local FalkorDB**: the DB target is resolved server-side. What it needs is a hosted key,
-  `TORTOISE_API_KEY`. WHERE it goes depends on who reads it, and the two are different files
+  `TORTOISE_MCP_API_KEY` — the name in the entry, and the name this doc tells you to provision.
+  WHERE it goes depends on who reads it, and the two are different files
   (mode 600 either way): an **interactive shell** gets keys from `~/pi-keys.env` (wired into the
   shell profile by `setup.sh`), while **lanes a controller spawns** get them from `~/keys.env`
   (the launch line sources it). Naming only one of them sends half the operators to a file that
