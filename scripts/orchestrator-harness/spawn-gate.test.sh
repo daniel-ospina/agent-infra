@@ -2413,10 +2413,25 @@ ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_
 #   1. `_cap_gate=<word>`             — lane.sh's code-classification arms
 #   2. `lane_standdown_write <word>`  — a literal word passed straight to the record writer (#3331's form)
 #   3. `printf '<word>'` in `cap_refusal_gate` — the chain's own normaliser arm for that word
-# A new gate must arrive through one of them to be recordable at all; arriving through ANY of them now
-# puts it in this set, where a missing row is RED. The word class is `[a-z][a-z0-9_-]*` — DIGITS AND
-# UNDERSCORES INCLUDED, because a narrower class does not drop such a word, it TRUNCATES it into a
-# different one (`land2` → `land`) and the equality then passes over a gate with no row.
+# A new gate must arrive through one of them to be recordable at all, and arriving through one of them
+# with a LITERAL word — bare, single- or double-quoted, digits and underscores included — puts it in
+# this set, where a missing row is RED.
+# ⛔ THE LIMIT OF A STATIC DERIVATION, STATED BECAUSE THE UNIVERSAL FORM OF THIS SENTENCE WAS FALSE
+# (P3, fifth fresh review of `af50e80c`). An operand written as a SUBSTITUTION is treated as a REPLAY
+# and is NOT resolved: `_cap_gate=$(gate_word_for "$rc")`, `_cap_gate=$(echo land2)`,
+# `_cap_gate="${X:-land2}"`, `_cap_gate=$'land2'` and `_cap_gate=$gate_word` all RECORD a word at run
+# time, and all of them are invisible here — the derived set stays identical to baseline and the
+# equality above passes. That is deliberate and not closable by another exclusion: the one operand this
+# MUST keep out is `_cap_gate="$(cap_refusal_gate)"` (`chain-merge.sh:259`, a genuine replay, excluded
+# as intended), and it is TEXTUALLY INDISTINGUISHABLE from `_cap_gate=$(echo land2)`. A rule that keeps
+# the real replay out absorbs the substituting gate; a rule that admits the substitution reds the
+# shipped seam. So the derivation covers LITERAL spellings only, and the honest boundary is stated here
+# rather than claimed away. ⛔ THIS IS NOT A LIVE DEFECT: every gate word in the deploy unit is a bare
+# literal (`fork disk land skew capability load` on `_cap_gate=`, `key` on the standdown call), so the
+# population is exactly the seven rows. The durable form — classify-or-REFUSE, the way
+# `refusal-codes.awk` above already does it: emit a `replay` row for every unresolvable operand and RED
+# any that is not on a declared, reasoned list — is recorded on #3238 with this evidence, because it is
+# a change to the guard's design and not a sixth rule.
 # ⛔ THE WORD CLASS MUST BE ABLE TO REPRESENT A GATE WORD, OR THE SEAM ABSORBS IT (P3, second fresh
 # review of `b0b65af5`). `[a-z][a-z-]*` stops at the first character outside it, so a word ending in a
 # digit does not vanish — it TRUNCATES INTO A DIFFERENT WORD: measured on the reviewed head,
@@ -2430,9 +2445,10 @@ ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_
 # `_internal`, `landX`, `load:2` were dropped entirely, each leaving the derived set byte-identical to the
 # baseline so `derived == rows` passed with the word in NEITHER side. Widening the class again would be
 # the same mistake a third time. So the derivation imposes NO class on the word at all: it captures the
-# whole OPERAND and excludes only the forms that are not a new word (a quoted VARIABLE or command
-# substitution, which is a replay, not a claim). A word the table has no row for then
-# arrives as ITSELF — however it is spelled — and REDS the equality instead of vanishing into a neighbour.
+# whole OPERAND and classifies the forms that are not a word (a quoted VARIABLE or command substitution
+# is a REPLAY, not a claim — see the preamble's stated limit). A LITERAL word the table has no row for
+# then arrives as ITSELF — bare or quoted, digits and underscores included — and REDS the equality
+# instead of vanishing into a neighbour.
 _gatewords_derived_from() { # <dir> -> the gate words THIS deploy unit can record, space-separated
   {
     # Seam 1: the operand after `_cap_gate=`, to the end of the word. NO character class on the value.
@@ -2489,13 +2505,14 @@ printf '\nlane_standdown_write zzz2 "$CAPACITY_YIELD_SECS"\n' >> "$_gw3/lane.sh"
 _gw3_after="$(_gatewords_derived_from "$_gw3")"; _gw3_after="${_gw3_after% }"
 case " $_gw3_after " in *" zzz2 "*) rc=0 ;; *) rc=1 ;; esac
 ck "...and the same for a word whose alpha prefix is NOT in the table (\`zzz2\`), which a truncating class reddened under a name that is not in the file: derived: '${_gw3_after:-<EMPTY>}'" $rc
-# ⛔ NO CLASS ON THE WORD AT ALL (P3, third fresh review of `048f9d5e`). Three separate left-anchored
+# ⛔ NO CHARACTER CLASS ON THE WORD (P3, third fresh review of `048f9d5e`). Three separate left-anchored
 # classes each ABSORBED a conforming-looking-but-different word (`land2` → `land`, then `land.2` → `land`,
 # and `GPU` / `2fa` / `_internal` / `landX` / `load:2` dropped) with the set UNCHANGED and the equality
 # GREEN. Widening the class was the wrong instrument twice; the derivation now captures the OPERAND and
-# excludes only replays. So the property is: EVERY word a caller can record reaches the set as ITSELF,
-# however it is spelled, and the ROW is what has to match it. Driven over the words a class cannot
-# represent, plus a control that the replay form is still excluded.
+# classifies the forms that are NOT a word. So the property is: every LITERAL spelling a caller can use
+# — bare, quoted, digits and underscores included — reaches the set as ITSELF, and the ROW is what has to
+# match it. Driven over the words a character class cannot represent, plus a control that the replay
+# form is still excluded.
 _gw4="$TMP/gatewords4"
 _gw4_bad=""
 for _gw4_w in land.2 GPU 2fa _internal landX load:2; do
