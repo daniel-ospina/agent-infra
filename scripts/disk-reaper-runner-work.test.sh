@@ -734,6 +734,56 @@ case_l() { # <entry-point> <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (m) an OUT-OF-RANGE floor is refused, and a leading-zero floor is normalised ────────────────
+# ⛔ THIS CASE EXISTS BECAUSE THE FLOOR IS THE ONLY GATE ON A `rm -rf`, so its REFUSAL path is as
+# load-bearing as its delete path — and it was unguarded. `num` accepts any digit string, so:
+#   · `--min-age 18446744073709551616` (2^64) passed it, `now - 2^64` WRAPPED to `now` in bash's 64-bit
+#     arithmetic, the floor ref landed at NOW, and every entry was older than it — the operator's "keep
+#     everything" direction became "delete everything", with the log asserting a flat falsehood about
+#     the entry's age. MEASURED at the previous head: a 5-minute-old entry `REAPED` under that floor.
+#   · `--min-age 08` passed it too, then `$(( ))` died ("08: value too great for base"), the floor was
+#     unusable, and the pass still exited 0 with `census=ok` calling every entry `reason=unreadable` —
+#     a bad floor reported as a filesystem problem. A silent full abstention that reads as a healthy box.
+# The fix normalises (leading zeros stripped) and bounds by MAGNITUDE (<= 9 digits ~= 31 years), which
+# is the guard `scripts/reap-lane-venvs.sh` and `disk-reaper.sh`'s `seam_too_large` already ship for the
+# same seam. Normalisation is what makes the octal spelling work rather than merely refusing it.
+# ⛔ THIS CASE DRIVES THE **OWNER** DIRECTLY, and that is the point rather than a shortcut. The entry
+# point already bounds its own seam (`disk-reaper.sh`, the `seam_too_large` loop at startup) and exits 3,
+# so the hourly pass was never exposed — but the owner's OWN seam (`--min-age`, the spelling its `--help`
+# recommends, and `REAP_RW_MIN_AGE`) was bounded by NOTHING, so a hand run or a future caller got the
+# fail-open. A case that went through the entry point would have been green on a tree whose deleter
+# trusted any digit string.
+run_owner() { # <owner> <state-dir> <glob> <argv...> — the OWNER's own seam, not the entry point's
+    local owner="$1" st="$2" glob="$3"; shift 3
+    REAP_RW_GLOBS="$glob" REAP_RW_STATE_DIR="$st" REAP_RW_EXPLICIT=1 \
+    BOUNDED_LIB="$HERE/lib/bounded.sh" bash "$owner" "$@" 2>&1
+}
+case_m() { # <entry-point> <owner>
+    local pass="$1" owner="$2" base work dead out rc
+    base="$T/m.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-12)"
+    # 5 minutes old: younger than the 3600 s default, so a WORKING floor KEEPS it — which is what makes
+    # this the "protect" direction. Under the unbounded floor it was deleted.
+    fixture_entry dead "$work" job-quiet 5 4 || return 1
+    out="$(run_owner "$owner" "$T/m-st1" "$base/gh-runner*/_work" --apply --min-age 18446744073709551616)"; rc=$?
+    case_check "$([ "$rc" = 2 ] && echo 0 || echo 1)" \
+               "an out-of-range floor is REFUSED (rc=$rc, expected 2) — never a wrapped floor that deletes"
+    case_check "$(grep -qF 'out of range' <<<"$out" && echo 0 || echo 1)" \
+               "and the refusal NAMES the cause, so an operator does not read it as a filesystem problem"
+    case_check "$([ -d "$dead" ] && echo 0 || echo 1)" \
+               "the 5-minute entry SURVIVED — 'raise the floor to keep everything' must never delete"
+    case_check "$(grep -qF 'census=ok' <<<"$out" && echo 1 || echo 0)" \
+               "and no pass SUMMARY claims census=ok for a floor it never used"
+    # ⛔ NORMALISED, NOT MERELY REFUSED. `08` is a legitimate way to write 8 seconds and `$(( ))` reads it
+    # as octal, which is almost always a bug — so the leading zeros are stripped and the pass RUNS.
+    out="$(run_owner "$owner" "$T/m-st2" "$base/gh-runner*/_work" --dry-run --min-age 08)"; rc=$?
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "a leading-zero floor ('08') does not abort the pass (rc=$rc)"
+    case_check "$(grep -qF 'min_age=8s' <<<"$out" && echo 0 || echo 1)" \
+               "… it is NORMALISED to 8 s, not read as octal and not silently the 3600 s default"
+    case_check "$(grep -qF 'value too great for base' <<<"$out" && echo 1 || echo 0)" \
+               "… and no arithmetic error was swallowed into a fake 'unreadable' abstention"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
@@ -781,6 +831,16 @@ MUT_J2='s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
 # (l)'s arm: the whole "the root itself is a measurement" guard. Deleting it restores the measured-zero
 # reading a reviewer found at this head, so if this mutant ever survives the abstention has gone inert.
 MUT_L='s/^    if \[ "\$_seen" = 0 \] && ! root_is_listable "\$root"; then$/    if false; then/'
+# (a)'s SECOND arm, on the ENTRY POINT: the floor RELAY. Every other (a) assertion is satisfied by an
+# entry point that ignores `DISK_REAPER_RUNNER_MIN_AGE` and hands the owner a literal 3600 — the default
+# and the literal are the same number, so without this mutant the relay arm is an assertion nothing
+# proves still discriminates. The edit replaces the relayed symbol with the literal, which is exactly
+# the inert-knob shape the arm exists to refuse.
+MUT_A2='s/--min-age "\$RUNNER_MIN_AGE"/--min-age 3600/'
+# (m)'s arm: the magnitude bound. Disabling it restores the fail-open — `now - 2^64` wraps to `now`, so
+# a floor an operator set to KEEP EVERYTHING deletes a 5-minute-old entry. If this mutant ever survives,
+# the refusal is nominal and the deleter trusts any digit string again.
+MUT_M='s/^if \[ "\${#_rw_floor_norm}" -gt 9 \]; then$/if false; then/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -808,6 +868,11 @@ if apply_mutation "$OWNER" "$T/mut-a/reap-runner-work.sh" "$MUT_A"; then
     expect_fail "a mutation: ignoring the floor (ref = now) turns the case RED" case_a "$REAPER" "$T/mut-a/reap-runner-work.sh"
 else
     bad "a mutation could not be applied (the floor derivation moved) — the case is not checking it any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-a2/disk-reaper.sh" "$MUT_A2"; then
+    expect_fail "a2 mutation: HARDCODING the floor instead of relaying RUNNER_MIN_AGE turns the case RED" case_a "$T/mut-a2/disk-reaper.sh" "$OWNER"
+else
+    bad "a2 mutation could not be applied (the --min-age relay moved) — the relay arm is not checking it any more"
 fi
 
 expect_pass "b an OLD entry is counted in dry-run and removed by --apply, reported as a df delta" case_b "$REAPER" "$OWNER"
@@ -905,6 +970,13 @@ if apply_mutation "$OWNER" "$T/mut-l/reap-runner-work.sh" "$MUT_L"; then
     expect_fail "l mutation: deleting the root-is-a-measurement guard turns the case RED (it is an abstention, not a zero)" case_l "$REAPER" "$T/mut-l/reap-runner-work.sh"
 else
     bad "l mutation could not be applied (the unlistable-root arm moved) — the case is not checking it any more"
+fi
+
+expect_pass "m an OUT-OF-RANGE floor is refused (never a wrapped floor that deletes), and a leading-zero floor is normalised" case_m "$REAPER" "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-m/reap-runner-work.sh" "$MUT_M"; then
+    expect_fail "m mutation: removing the magnitude bound turns the case RED (now - 2^64 wraps to now, so 'keep everything' DELETES)" case_m "$REAPER" "$T/mut-m/reap-runner-work.sh"
+else
+    bad "m mutation could not be applied (the magnitude bound moved) — the refusal is not checked any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
