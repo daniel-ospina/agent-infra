@@ -1366,6 +1366,17 @@ rc=$?
   && ! python3 -c 'import json,sys; sys.exit(0 if (json.load(open(sys.argv[1])).get("mcpServers") or {}) else 1)' "$TMP/typo-dest.json" \
   && ok "a mistyped --cell is a USAGE ERROR (rc=2) that writes nothing, not a silent full-catalog install" \
   || fail "merge-mcp.py accepted a mistyped flag (rc=$rc) and installed the full base catalog on a cell"
+# ⛔ A CELL THAT ALREADY DECLARES A BASE SERVER: the merge KEEPS it (never clobber, rule 2) — and
+# must SAY SO. `dropped` was computed as `k not in have`, so the NOTE listed only the servers that
+# were MISSING: a cell carrying a hand-installed `seo-intelligence` (which cannot spawn there at
+# all) printed "not installed on a cell: gemini, playwright-browser" and nothing else, which reads as
+# "the base catalog is not here" while the unspawnable entry sat in the file, `--verify` certifying.
+printf '{"mcpServers":{"seo-intelligence":{"command":"hand-installed","args":[]}}}' > "$TMP/kept-dest.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/kept-dest.json" --cell > "$LOG" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "already declares seo-intelligence" "$LOG" && grep -q 'KEPT' "$LOG" \
+  && ok "--cell NAMES a base server the cell already declares (KEPT, not silently absent from the note)" \
+  || fail "--cell left a pre-existing base server unreported (rc=$rc) — the log implies the base catalog is not installed while an unspawnable entry sits in the file, certified"
 python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
 import json, sys
 p, tpl = sys.argv[1], sys.argv[2]
@@ -1456,8 +1467,9 @@ PY
 run_verify
 rc=$?
 [ "$rc" -eq 1 ] && grep -q 'BADDERS:str' "$LOG" \
-  && ok "--verify refuses a tortoise entry whose headers is a STRING, BY NAME (BADDERS:str, not an empty marker beside a traceback)" \
-  || fail "--verify did not name a non-object headers (rc=$rc) — the operator gets 'marker: none' and a traceback instead of the shape that is wrong"
+  && grep -qF 'declares its headers value as a str, not an object' "$LOG" \
+  && ok "--verify refuses a tortoise entry whose headers is a STRING, BY NAME (BADDERS:str AND the named FAIL sentence — not an empty marker beside a traceback)" \
+  || fail "--verify did not name a non-object headers in the FAIL sentence (rc=$rc) — an unescaped \${VAR} in that message aborts the verifier under strict-unset, so the operator gets 'marker: none' instead of the shape that is wrong"
 run_install
 run_verify
 rc=$?
@@ -1714,6 +1726,17 @@ rc=$?
 grep -q "graph credential: UNRESOLVED" "$LOG" \
   && ok "LAYER VERIFIED states an UNRESOLVED graph credential (the 401 trap is not silent)" \
   || fail "a cell with no resolvable TORTOISE_MCP_API_KEY was certified without saying so (rc=$rc) — every lane on it will write GRAPH-UNREACHABLE"
+# ⛔ AND THE NEGATIVE ARM MUST READ THE SAME LINE. It grepped the whole log, so a revert that moved
+# the UNRESOLVED state onto its own `log_line` — the regression the code comment names, and the one
+# `cloud-cell-bringup.sh`'s `grep -E 'mode=--verify|LAYER VERIFIED'` silently drops — stayed green.
+# Scoped to the certification line, like its positive twin above.
+HOME="$TMP/nohome" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
+  env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+rc=$?
+grep -E 'LAYER VERIFIED' "$LOG" | grep -q "graph credential: UNRESOLVED" \
+  && ok "…and the UNRESOLVED state is ON the certification line, not on a line the bring-up drops" \
+  || fail "the UNRESOLVED state was not on the LAYER VERIFIED line (rc=$rc) — cloud-cell-bringup.sh filters for that line, so a separate one is silently invisible"
 
 # ⛔ THE FILE PATH OF THE ALIAS RESOLVER IS THE WHOLE POINT OF THE RESOLVER, AND IT HAD NO COVERAGE.
 # Every arm above feeds the credential through the ENVIRONMENT, so `graph_key_from_env_file` could
@@ -1741,6 +1764,66 @@ if [ "$rc" -eq 0 ] \
 else
   fail "an aliased keys.env (export TORTOISE_MCP_API_KEY=\"\$TORTOISE_API_KEY\") did not resolve — a line-parser reads that as the literal string and reports a live key as malformed (rc=$rc; log: $LOG)"
 fi
+# ⛔ SOURCING A FILE IS CODE EXECUTION, SO THE FILE MUST BELONG TO THIS USER AND NOT BE WRITABLE BY
+# ANYONE ELSE. One candidate is `$CELL_HOME/keys.env`, and CELL_HOME defaults to `/tmp/cell-home` — a
+# path under a WORLD-WRITABLE parent — so a planted file would be executed as whoever provisions the
+# cell, from a script whose every comment says the file is operator-pushed and 0600. Both
+# directions, and the polarity too: a refused file is a WARNING (the layer is still certified, the
+# key is not), and `UNRESOLVED` still rides the certification line.
+MODHOME="$TMP/modehome"
+mkdir -p "$MODHOME" "$CELL_HOME"
+printf 'export TORTOISE_MCP_API_KEY="%s"\n' "$ALIAS_KEY35" > "$CELL_HOME/keys.env"
+chmod 660 "$CELL_HOME/keys.env"
+HOME="$MODHOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
+  env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ] \
+   && grep -qF "$CELL_HOME/keys.env is NOT a credential source" "$LOG" \
+   && grep -E 'LAYER VERIFIED' "$LOG" | grep -q 'graph credential: UNRESOLVED'; then
+  ok "a GROUP-WRITABLE keys.env is refused as a credential source (not sourced, not hidden), and the cell still certifies with UNRESOLVED"
+else
+  fail "a group-writable keys.env was SOURCED (rc=$rc) — `--verify` would execute a file any local user can rewrite, as the provisioning user (log: $LOG)"
+fi
+chmod 600 "$CELL_HOME/keys.env"
+HOME="$MODHOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
+  env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
+  bash "$INSTALLER" --verify > "$LOG" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -qF "graph credential: resolves from $CELL_HOME/keys.env (TORTOISE_MCP_API_KEY)" "$LOG" \
+  && ok "…and the SAME file at 0600 DOES resolve (the gate refuses the mode, not the path)" \
+  || fail "the ownership/mode gate refused a 0600 file of the right owner (rc=$rc) — a false block on a correctly-provisioned cell"
+rm -f "$CELL_HOME/keys.env"
+# ⛔ `usable()` AND THE VERIFIER MUST BE TOTAL OVER ARBITRARY JSON. A hand-edit can produce
+# `"Authorization": 12345` or `"url": 123`; both used to raise (TypeError / AttributeError) BEFORE
+# the write, so the merge exited 1 with the file unchanged and `--verify` left an empty marker — the
+# "config nothing can repair" class, one level below the `headers` shape fixed in the same commit.
+for BADSHAPE in auth url; do
+  python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" "$BADSHAPE" <<'PY'
+import json, sys
+p, tpl, bad = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(p))
+t = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+if bad == "auth":
+    t["headers"] = {"Authorization": 12345}
+else:
+    t["url"] = 123
+    t["headers"] = {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+  run_verify
+  rc=$?
+  [ "$rc" -eq 1 ] && grep -qE 'BADAUTH:int|URLTYPE:int' "$LOG" \
+    && ok "--verify names a non-string $BADSHAPE in the tortoise entry (a marker, not a traceback and an empty marker)" \
+    || fail "--verify did not name a non-string $BADSHAPE (rc=$rc) — the entry reports as 'nothing can be certified' with no shape and no repair"
+  run_install
+  run_verify
+  rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "install REPAIRS a non-string $BADSHAPE into the hosted entry (the repair path converges)" \
+    || fail "install could not repair a non-string $BADSHAPE (rc=$rc) — the cell is stuck"
+done
 
 # skills/ was `[ -d ]` plus a non-empty `ls` until #1723's `--check` began verifying BEFORE it
 # installs: a cell holding 1 of the checkout's 124 SKILL.md files passed that check, so the fast
