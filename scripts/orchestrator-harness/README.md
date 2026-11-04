@@ -2582,8 +2582,13 @@ grep -L '^outcome=\(done\|refused\|failed\|died\) reason=' "$O"/logs/lane-[0-9]*
 # ⛔ AND THAT IS STILL A CONTAINMENT TEST, NOT AN "ends with" TEST (review cycle 2, P2): `grep -L` answers
 # "no line anywhere in this file matches". A lane KILLed with SIGKILL whose transcript already contains a
 # quoted `outcome=failed reason=…` is therefore listed as reported — i.e. the census under-reports exactly
-# in the residual case above. When the question really is "did this file END with its own line", ask it:
-awk 'END{if ($0 !~ /^outcome=(done|refused|failed|died) reason=/) print FILENAME}' "$O"/logs/lane-[0-9]*.log
+# in the residual case above. When the question really is "did this file END with its own line", ask it
+# PER FILE — ⛔ NOT with a multi-file `awk 'END{…}'`, which runs its END action ONCE at the end of the whole
+# input, with `$0`/`FILENAME` describing only the LAST file, so N-1 logs are never examined and the census
+# reports a false pass (measured 2026-11-04: three logs, one dead, printed nothing). The loop is the form:
+for f in "$O"/logs/lane-[0-9]*.log; do
+  tail -n 1 "$f" | grep -q '^outcome=\(done\|refused\|failed\|died\) reason=' || echo "$f"
+done
 # what did the CURRENT run of THIS lane do?  (an ABSENT file means no verdict yet)
 cat "$O/logs/lane-<N>.outcome"
 ```
@@ -2605,8 +2610,10 @@ fires, so each dispatch stamps `logs/lane-<N>.owner` and the trap writes the ver
 owns it (the older run's line still lands in the append-only log, and it says in the log why).
 
 `grep -L` is the right reader for "did ANY line in this log report" because it asks about the WHOLE
-file; the `awk END` form above is the right reader for "did this log END with its own report", and the
-two answer different questions — the first can be satisfied by the transcript, the second cannot.
+file; the per-file `tail -n 1` loop above is the right reader for "did this log END with its own
+report", and the two answer different questions — the first can be satisfied by the transcript, the
+second cannot. Both are per-file by construction; a multi-file awk `END` action is not, and silently
+examines one file.
 There is ONE single-lane read, and it is `lane-<N>.outcome`; `tail -1` of the log is a FALLBACK for
 history only (a `lane.sh` that predates the per-run file), and it is wrong for a re-dispatched issue by
 construction — which is why the file above exists. Both forms are stated here because the earlier text
