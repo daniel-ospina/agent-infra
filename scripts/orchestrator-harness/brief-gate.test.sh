@@ -589,17 +589,16 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     invocation, so they join this equality without joining the dispatch population.
 #   * `check-farm-drift.sh` (88c720f54, #3120) and `nonblocking-dispatch.test.sh` (e9b8b7663, #3219 —
 #     issue #3162) landed on `main` after the list was last edited and are the same class: a REFERENCER
-#     (it names the gate in prose, `:19`) and a SUITE (it stubs the gate). They were the TWO names that
-#     kept this equality red at every head (#3379 measured `found`=30 vs the 28 declared), which is the
-#     condition this block's own paragraph calls out — an equality red on its own base attributes
-#     nothing, so a NEW dispatch path added tomorrow would inherit the same red and stay invisible. They
-#     are declared here so the arm can pass and therefore say something again.
-#   * `cloud-cell-supervisor.sh` and `key-gate.sh` (29b3af07, #3331/#3342) are those SAME two shapes
-#     arriving one base later — the supervisor NAMES the gate in prose and in its own preflight list
-#     (`:2654`, `:2656`), the key gate names it in prose (`:33`) — and they landed after this list was
-#     last edited, so the equality went red on `main` itself again, measured at this change's rebase:
-#     `found`=32 vs the 30 declared. Declared for the reason above, not because they belong to the
-#     dispatch population: neither dispatches a `pi` invocation.
+#     (it names the gate in prose, `:19`) and a SUITE (it stubs the gate). They are TWO of the four names
+#     that kept this equality red at this change's base — measured there (29b3af07), `found`=30 vs the 26
+#     declared — which is the condition this block's own paragraph calls out: an equality red on its own
+#     base attributes nothing, so a NEW dispatch path added tomorrow would inherit the same red and stay
+#     invisible. They are declared here so the arm can pass and therefore say something again.
+#   * `cloud-cell-supervisor.sh` and `key-gate.sh` (29b3af07, #3331/#3342) are the OTHER two of those
+#     four, arriving with that same commit and declared for the same reason: the supervisor NAMES the
+#     gate in prose and in its own preflight list (`:2654`, `:2656`), the key gate names it in prose
+#     (`:33`). Measured at this change's rebase head (19f1c6fe), `found`=32 vs the 30 declared. Neither
+#     dispatches a `pi` invocation, so neither joins the dispatch population.
 #   * ⛔ THE `pi`-INVOKER CENSUS COVERS THE HELPER ONLY, NOT ITS SUITE (measured): `spawn-gate.test.sh`'s
 #     scan excludes `*.test.*` by name, so `mandate-preflight.test.sh` is invisible to it. That is why the
 #     suite's own E5 states its residual in-line instead of pointing at that census for protection.
