@@ -36,7 +36,7 @@
 #                                                                 install (a runner family), removing
 #                                                                 only copies PROVEN idle, always
 #                                                                 keeping the newest, never the last
-#   runner-work scripts/reap-runner-work.sh   (this change)        the CI runners' `_work` checkout
+#   runner-work scripts/reap-runner-work.sh   (#3057)            the CI runners' `_work` checkout
 #                                                                 dirs (19 G measured on one cell at
 #                                                                 98%): an entry is removed ONLY when
 #                                                                 its newest CONTENT is older than the
@@ -2450,9 +2450,20 @@ reap_runner_work() {
                     esac ;;
             esac
         done <<<"$rows"
-        # The tally is authoritative when the owner answered; the row count is the fallback for a SUMMARY
-        # that did not (a truncated line). Never an invented 0.
-        [ "$HAVE_RW_CAND" = 1 ] || { CAND_RW="$all_c"; [ "$all_c" -gt 0 ] && HAVE_RW_CAND=1; }
+        # The tally is authoritative when the owner answered it. The row count is the fallback ONLY for a
+        # SUMMARY that EXISTED and did not answer (a `candidates=` token this lift cannot parse) — never
+        # an invented 0.
+        # ⛔ A MISSING SUMMARY IS A KILLED SWEEP, NOT A TRUNCATED LINE, AND ITS ROWS ARE A PARTIAL COUNT.
+        # The owner prints its SUMMARY unconditionally on every path that reaches the end, so the only way
+        # `$_rw_line` is empty is that the owner never got there — it is bounded by `CLASS_TIMEOUT`
+        # (`run_class`), and a `--dry-run` is deliberately unbounded by its own `REAP_RW_BUDGET_SECONDS`,
+        # with up to one `du` per candidate. Publishing the rows in hand as `candidates=` then states a
+        # PARTIAL count as a total, which is the false-measurement shape the arm 40 lines above forbids by
+        # name ("a killed sweep … is `?`"). `candidates_runner_work` records `?` instead, and the
+        # partial rows are still NAMED above as WOULD-REMOVE lines, so nothing an operator needs is lost.
+        if [ "$HAVE_RW_CAND" != 1 ] && [ -n "$_rw_line" ]; then
+            CAND_RW="$all_c"; [ "$all_c" -gt 0 ] && HAVE_RW_CAND=1
+        fi
         [ -n "$cands" ] && log_line "$cands"
         # ⛔ `kept=` IS NOT A DECISION AND `unmeasurable=` IS AN ABSTENTION — both are on the line, so an
         # operator reading the class line alone can tell "ten entries were written within the floor" from

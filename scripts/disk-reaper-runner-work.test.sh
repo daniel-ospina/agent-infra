@@ -784,6 +784,44 @@ case_m() { # <entry-point> <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (n) a CUT-SHORT sweep may not publish a PARTIAL candidate count ─────────────────────────────
+# The owner prints its `SUMMARY` unconditionally on every path that reaches the END of a pass
+# (`reap-runner-work.sh:614`), and it deliberately does NOT truncate a `--dry-run`
+# (`REAP_RW_BUDGET_SECONDS` bounds `--apply` only — owner header, `reap-runner-work.sh:100-107`: "truncating
+# a dry pass would emit a SUMMARY candidates=N for a population LARGER than N, i.e. a partial count
+# presented as a total, which is the false-measurement shape this class's own `census=` refusal exists to
+# prevent"). The ENTRY POINT then bounds the delegate with `CLASS_TIMEOUT`, and a dry pass over a big
+# population can be cut short there (`--dry-run` is deliberately unbounded by the owner's own budget, and
+# each candidate costs up to one `du`), so the REAP rows it printed before the cut ARE a partial count.
+# This arm drives that READING with a STUB owner — rows, no ledger — rather than racing a real `timeout`:
+# the property under test is what the entry point RECORDS, not that a kill happens, and a timeout-racing
+# assertion is load-dependent flake on exactly the loaded box this class was built for.
+case_n() { # <entry-point>
+    local pass="$1" base work dead stub out rc st s1
+    base="$T/n.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-9)"
+    fixture_entry dead "$work" job-killed 180 24 || return 1
+    stub="$T/n-stub.$$.$RANDOM.sh"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'printf "REAP job-dead 24MB %%s\\n" "%s"\n' "$dead"
+        printf 'printf "REAP job-dead 11MB %%s/ghost\\n" "%s"\n' "$work"
+        printf 'exit 0\n'
+    } >"$stub"
+    PASS_OWNER="$stub"
+    s1="$(uniqstate n1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --dry-run --only runner-work)"; rc=$?
+    st="$(status_of "$s1")"
+    case_check "$(grep -qF 'WOULD-REMOVE class=runner-work' <<<"$out" && echo 0 || echo 1)" \
+               "a cut-short pass still NAMES every candidate it scanned, so nothing an operator needs is lost"
+    case_check "$(grep -qE '^candidates_runner_work=\?$' <<<"$st" && echo 0 || echo 1)" \
+               "… but it publishes NO count: with no SUMMARY the rows in hand are a PARTIAL count, so the record says ? (candidates_runner_work=?)"
+    case_check "$(grep -qE '^candidates_runner_work=[0-9]' <<<"$st" && echo 1 || echo 0)" \
+               "… and never a number — a partial count presented as a total is the false measurement the owner's own census= refusal exists to prevent"
+    case_check "$(grep -qF 'candidates=?' <<<"$out" && echo 0 || echo 1)" \
+               "the class line carries the same ? , so the log and the record agree"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
@@ -841,6 +879,11 @@ MUT_A2='s/--min-age "\$RUNNER_MIN_AGE"/--min-age 3600/'
 # a floor an operator set to KEEP EVERYTHING deletes a 5-minute-old entry. If this mutant ever survives,
 # the refusal is nominal and the deleter trusts any digit string again.
 MUT_M='s/^if \[ "\${#_rw_floor_norm}" -gt 9 \]; then$/if false; then/'
+# (n)'s arm: the GUARD that keeps a missing SUMMARY from being read as an answered tally. Removing it
+# restores the shipped line `[ "$HAVE_RW_CAND" = 1 ] || { CAND_RW="$all_c"; … }`, which turns the rows a
+# cut-short sweep managed to print into a `candidates=` total — the partial-count-as-a-total the owner
+# refuses to emit itself. If this mutant ever survives, the entry point is free to manufacture one.
+MUT_N='s/ && \[ -n "\$_rw_line" \]; then$/; then/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -977,6 +1020,13 @@ if apply_mutation "$OWNER" "$T/mut-m/reap-runner-work.sh" "$MUT_M"; then
     expect_fail "m mutation: removing the magnitude bound turns the case RED (now - 2^64 wraps to now, so 'keep everything' DELETES)" case_m "$REAPER" "$T/mut-m/reap-runner-work.sh"
 else
     bad "m mutation could not be applied (the magnitude bound moved) — the refusal is not checked any more"
+fi
+
+expect_pass "n a CUT-SHORT sweep publishes no PARTIAL candidate count, and still names what it scanned" case_n "$REAPER"
+if apply_mutation "$REAPER" "$T/mut-n/disk-reaper.sh" "$MUT_N"; then
+    expect_fail "n mutation: reading a MISSING SUMMARY as an answered tally turns the case RED (the rows are partial)" case_n "$T/mut-n/disk-reaper.sh"
+else
+    bad "n mutation could not be applied (the \$_rw_line guard moved) — the case is not checking it any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
