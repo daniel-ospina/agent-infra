@@ -3879,10 +3879,23 @@ ck "refresh-candidates.sh ranks the tiers P0=0 < P1=1 < P2=2 (a constant rank wo
 # reaping pass above that writes dispatched.txt/checked.txt — so nothing above the loop can re-sort the
 # backlog today. A re-sort GATED on a value assigned above the loop would still be missed (verified).
 # Widening further means stubbing `gh` and driving the pool build too; this is the boundary drawn.
+# ⛔ AND THE FUNCTIONS THE TAIL CALLS MUST BE IN THE DRIVEN REGION (#2019, PR #3234). The queue's order
+# is now RE-DERIVED from the pool at the dedupe site, so the tail CALLS `queue_order_from_pool`. Both
+# definitions sit ~1,100 lines ABOVE this anchor, so the first version of that change left the drive
+# calling an UNDEFINED command — `command not found`, absorbed by `|| true`, output discarded — and this
+# check stayed GREEN while its own name asserted "nothing running it re-sorts it" about a file the
+# shipped code now re-sorts on every pass. The shipped behaviour and the guard's claim had inverted and
+# nothing reddened: a false-PASS guard. The definitions are therefore PREPENDED here, and a SECOND
+# fixture gives the pool a rank so the drive must actually move the head — a POSITIVE assertion, so an
+# inert call reads RED instead of green.
 if [ -s "$REFRESH" ]; then
   awk '/^done < /{f=1;next} f' "$REFRESH" > "$TMP/tail.sh"
-  # Fail closed if the extraction found nothing, or lost the file it is supposed to exercise.
-  if [ -s "$TMP/tail.sh" ] && grep -q 'candidates\.txt' "$TMP/tail.sh"; then
+  # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
+  # both functions are contiguous there, and a terminator anchor cannot silently capture half the file.
+  awk '/^rank_queue_by_pool\(\) \{/{f=1} f && /^# The previous pass.s record/{exit} f' "$REFRESH" > "$TMP/qorder-fns.sh"
+  # Fail closed if an extraction found nothing, or lost the file it is supposed to exercise.
+  if [ -s "$TMP/tail.sh" ] && grep -q 'candidates\.txt' "$TMP/tail.sh" \
+     && grep -q '^queue_order_from_pool() {' "$TMP/qorder-fns.sh"; then
     # Redirect $O at the SOURCE rather than editing paths: `awk -v` passes the fixture dir without any
     # shell quoting of `$O` on the command line. Escape it first — in awk's gsub REPLACEMENT `&` means
     # the matched text and `\x` is an escape, so a `&` or `\\` in $TMP would corrupt the generated
@@ -3890,20 +3903,41 @@ if [ -s "$REFRESH" ]; then
     # TMPDIR and this harness treats `&`-in-path as hostile everywhere else.
     esc_tmp="${TMP//\\/\\\\}"; esc_tmp="${esc_tmp//&/\\&}"
     awk -v tmp="$esc_tmp" '{gsub(/\$O/, tmp)} 1' "$TMP/tail.sh" > "$TMP/tail-drive.sh"
-    # 5000 leads AND repeats, so one expectation separates all three outcomes: in-place dedupe keeps
-    # the first occurrence (5000 100 9000); a re-sort of ANY spelling moves 100 to the front; a
-    # deleted dedupe leaves both 5000s.
-    printf '5000\n100\n9000\n5000\n' > "$TMP/candidates.txt"
+    awk -v tmp="$esc_tmp" '{gsub(/\$O/, tmp)} 1' "$TMP/qorder-fns.sh" > "$TMP/qorder-fns-drive.sh"
+    # DEFINITIONS BEFORE THE TAIL — the order the shipped file has, and the order the tail needs.
+    cat "$TMP/qorder-fns-drive.sh" "$TMP/tail-drive.sh" > "$TMP/tail-with-qorder.sh"
     # ⛔ SANDBOX THE DRIVE. The substitution above only rewrites the literal `$O`; a path spelled any
     # other way escapes to the REAL location — and `$HOME/orchestrator/candidates.txt` is the shipped
     # script's own default O and is live on a running box. Binding O and HOME to $TMP closes it
     # (confirmed: without this a `$HOME/orchestrator/...` variant rewrote the live file).
-    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-drive.sh ) >/dev/null 2>&1
+    #
+    # A) DEDUPE. 5000 leads AND repeats, so one expectation separates all three outcomes: in-place
+    #    dedupe keeps the first occurrence (5000 100 9000); a re-sort by NUMBER of ANY spelling moves
+    #    100 to the front; a deleted dedupe leaves both 5000s. No `.pool` here — the only reorder in the
+    #    tail is the pool rank, and with no pool rank it must leave the order alone (which is ALSO the
+    #    fail-closed arm, so this fixture no longer doubles as an accidental one).
+    rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
+    printf '5000\n100\n9000\n5000\n' > "$TMP/candidates.txt"
+    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-with-qorder.sh ) >/dev/null 2>&1
     tail_got="$(tr '\n' ' ' < "$TMP/candidates.txt" 2>/dev/null | sed 's/ *$//')"
-    [ "$tail_got" = "5000 100 9000" ] && rc=0 || rc=1
+    [ "$tail_got" = "5000 100 9000" ] && rc_dedupe=0 || rc_dedupe=1
+    # B) THE ORDER IS THE POOL'S, and the call is LIVE. Same fixture, plus a pool that ranks `100` once:
+    #    the ranked row must move to the head and the unranked rows keep their order at the tail. If the
+    #    tail's call is `command not found` (definitions missing) this stays `5000 100 9000` and REDS.
+    rm -f "$TMP/.cand.ranked" "$TMP/.queue-rank"
+    printf '5000\n100\n9000\n5000\n' > "$TMP/candidates.txt"
+    printf '100\n' > "$TMP/.pool"
+    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-with-qorder.sh ) > "$TMP/qorder-drive.log" 2>&1
+    rank_got="$(tr '\n' ' ' < "$TMP/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+    [ "$rank_got" = "100 5000 9000" ] && rc_rank=0 || rc_rank=1
+    [ "$rc_rank" -eq 0 ] || echo "      pool-ranked drive gave '$rank_got' (want '100 5000 9000'); log: $(tr '\n' '|' < "$TMP/qorder-drive.log" 2>/dev/null | head -c 240)"
+    [ "$rc_dedupe" -eq 0 ] || echo "      dedupe drive gave '$tail_got' (want '5000 100 9000')"
+    rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
+    rc=0; [ "$rc_dedupe" -eq 0 ] && [ "$rc_rank" -eq 0 ] || rc=1
   else rc=1; fi
 else rc=1; fi
-ck "refresh-candidates.sh dedupes the backlog in place and nothing running it re-sorts it" $rc
+ck "refresh-candidates.sh dedupes the backlog in place (and leaves the order alone when the pool ranks nothing)" $rc_dedupe
+ck "refresh-candidates.sh re-derives the queue's head from the pool — the ranked row leads, unranked rows keep their tail order" $rc_rank
 
 # ── 19) the harness runs on Linux as well as macOS (#1702) ──────────────────────
 # The shipped cell controller (cloud-cell-supervisor.sh) starts THIS loop on a Linux cell, and every
