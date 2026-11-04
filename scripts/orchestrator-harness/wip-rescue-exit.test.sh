@@ -169,9 +169,9 @@ pi_stub() {
   case "$1" in
     dirty)    printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "the work a lane leaves behind\\n" > early.txt\nexit 0\n' ;;
     clean)    printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' ;;
-    unpushed) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "committed but never pushed\\n" > local.txt\ngit add local.txt >/dev/null 2>&1\ngit -c user.email=t@t -c user.name=t commit -q -m "local only"\nexit 0\n' ;;
+    unpushed) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "committed but never pushed\\n" > local.txt\ngit add local.txt >/dev/null 2>&1\ngit -c user.email=t@t -c user.name=t commit -q -m "local only $$"\nexit 0\n' ;;
     sleepdirty) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "work in flight when the cap fired\\n" > capdirty.txt\nsleep 30\n' ;;
-    unpushed_landing) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "a landing branch with local commits\\n" > local.txt\ngit add local.txt >/dev/null 2>&1\ngit -c user.email=t@t -c user.name=t commit -q -m "local only on a landing branch"\nexit 0\n' ;;
+    unpushed_landing) printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nprintf "a landing branch with local commits\\n" > local.txt\ngit add local.txt >/dev/null 2>&1\ngit -c user.email=t@t -c user.name=t commit -q -m "local only on a landing branch $$"\nexit 0\n' ;;
     *)        printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nsleep 30\n' ;;
   esac > "$TMP/bin/pi"
   chmod +x "$TMP/bin/pi"
@@ -1108,6 +1108,73 @@ awk -F'\t' '$2=="no temp dir" && $5=="cannot-verify" {f=1} END{exit !f}' "$O/sta
 ck "M3 …and the verdict is still cannot-verify (fail-closed), so the wording fix did not weaken the gate" $rcm3
 ck "M4 …and the rescue still never changes the lane's exit status (the function returned $rcnotmp)" \
   $([ "$rcnotmp" -eq 0 ] && echo 0 || echo 1)
+echo
+# ⛔ N20/N21/N22 — THE PUSH VERDICT'S FAIL-CLOSED ARMS, AND THE RESET THAT ONLY A SECOND TERMINAL
+# CAN SEE (review cycle 7, findings 2 and 3). All three were IMPLEMENTED AND UNPROVEN: every other arm
+# in this file drives ONE terminal inside a FRESH `bash -c`, so a fresh shell is empty whatever the
+# reset does, and no arm referenced `push=unmeasured` or `push=detached` at all (measured: deleting the
+# `uok`/detached guards, and deleting the whole reset block, each left this suite green — an inert
+# assertion is the exact class this PR exists to refuse).
+#
+# N20 is the dangerous direction in one line: without the `uok` guard a FAILED count read leaves
+# `unpushed=0`, which falls through to `push=nothing` — an affirmative "there was nothing to push"
+# over a number nobody read. Arm L proves the TREE verdict for an unreadable count; this proves the
+# PUSH verdict, which is what a reclaim pass actually reads.
+O="$O" bash -c '
+  . "$1"
+  lane_end_push "unmeasured push" "/dev/null" "$2" never-pushed 0 0
+  printf "unmeasured=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$WT" > "$TMP/n20.out" 2>/dev/null
+grep -qx 'unmeasured=unmeasured' "$TMP/n20.out"; rcn20=$?
+ck "N20 an UNREADABLE unpushed count is recorded as push=unmeasured — never push=nothing (an UNREAD zero is not a measured zero)" $rcn20
+# N21 — A DETACHED HEAD IS NOT A BRANCH TO INVENT. The refusal must be recorded AND nothing may reach
+# origin, so the head sha is checked against the REMOTE's own refs rather than against a log line.
+git -C "$WT" worktree add -q "$TMP/wt7" -b detachedsrc 2>/dev/null
+git -C "$TMP/wt7" commit -q --allow-empty -m "local only on a detached head" 2>/dev/null
+det_sha="$(git -C "$TMP/wt7" rev-parse HEAD 2>/dev/null)"
+git -C "$TMP/wt7" switch -q --detach 2>/dev/null
+O="$O" bash -c '
+  . "$1"
+  lane_end_push "detached push" "/dev/null" "$2" ignored 1 1
+  printf "detached=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$TMP/wt7" > "$TMP/n21.out" 2>/dev/null
+grep -qx 'detached=detached' "$TMP/n21.out"; rcn21a=$?
+# NON-VACUITY: the arm is only meaningful if the head really had a commit origin did not — and
+# nothing invented a ref for it. Both read the REMOTE, not the gate's own prose.
+case "$det_sha" in ''|*[!0-9a-f]*) rcn21b=1 ;; *) rcn21b=0 ;; esac
+git -C "$BARE" for-each-ref --format='%(objectname)' 2>/dev/null | grep -qx "$det_sha" && rcn21c=1 || rcn21c=0
+ck "N21 a DETACHED head with local commits is recorded as push=detached and NOTHING is pushed or invented (head ${det_sha:0:12} absent from origin's refs)" \
+  $([ "$rcn21a" -eq 0 ] && [ "$rcn21b" -eq 0 ] && [ "$rcn21c" -eq 0 ] && echo 0 || echo 1)
+# N22 — TWO TERMINALS IN ONE SHELL. `fix-one.sh` calls `run_agent` more than once in ONE shell, and the
+# durable globals are reset at the TOP of `terminal_wip_rescue`, BEFORE the `WIP_RESCUE_DISABLE=1`
+# hatch can return. The ORDERING is the property: resetting after the hatch would let a second
+# terminal's `not-measured` row carry the FIRST lane's `push=pushed` — the most dangerous value to
+# mis-carry. The first terminal here genuinely pushes (so the value being overwritten is real, not
+# primed by the arm), and the second is the hatch, which returns before measuring anything.
+# ⛔ ITS OWN WORKTREE AND BRANCH, on purpose: `$WT2` is BEHIND `origin/durable` by N8b's own
+# precondition, so driving this arm there made the first push a NON-FAST-FORWARD — a refusal, not the
+# `pushed` this arm needs to overwrite (measured: `first-push=FAILED`). A fresh branch has no remote
+# history, so its push is a create, and the arm measures the reset rather than a rebase policy.
+git -C "$WT" worktree add -q "$TMP/wt8" -b twoterm 2>/dev/null
+git -C "$TMP/wt8" commit -q --allow-empty -m "unpushed for the two-terminal arm" 2>/dev/null
+rm -f "$O/state/lane-exit-term_two.state" 2>/dev/null
+O="$O" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  lane_end_push "term one" "/dev/null" "$2" twoterm 1 1
+  printf "first-push=%s\n" "$LANE_END_PUSH"
+  WIP_RESCUE_DISABLE=1 terminal_wip_rescue "term two" 0 0 "/dev/null"
+  printf "second-push=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$TMP/wt8" > "$TMP/n22.out" 2>&1
+grep -qx 'first-push=pushed' "$TMP/n22.out"; rcn22a=$?
+grep -qx 'second-push=' "$TMP/n22.out"; rcn22b=$?
+grep -qx 'state=not-measured' "$O/state/lane-exit-term_two.state" 2>/dev/null; rcn22c=$?
+grep -qx 'push=' "$O/state/lane-exit-term_two.state" 2>/dev/null; rcn22d=$?
+# NON-VACUITY ON THE REMOTE: the first terminal's push must really have created the branch, otherwise
+# `first-push=pushed` could be a log line with nothing behind it and the reset would be untested.
+git -C "$BARE" rev-parse -q --verify refs/heads/twoterm >/dev/null 2>&1; rcn22e=$?
+ck "N22 a SECOND terminal in the SAME shell carries NO stale push verdict from the first (first genuinely pushed -> origin/twoterm $(git -C "$BARE" rev-parse --short refs/heads/twoterm 2>/dev/null); second: $(sed -n '2p' "$TMP/n22.out" 2>/dev/null | cut -c1-30))" \
+  $([ "$rcn22a" -eq 0 ] && [ "$rcn22b" -eq 0 ] && [ "$rcn22c" -eq 0 ] && [ "$rcn22d" -eq 0 ] && [ "$rcn22e" -eq 0 ] && echo 0 || echo 1)
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
