@@ -287,6 +287,17 @@ the same trade as G8: a live lane's cwd can be under `/tmp` (measured, a running
 nothing can prove it landed (this doc's G2 and `docs/ops/disk-reaper.md`'s rule 6). It needs a liveness
 witness plus an owner ruling on what scratch counts as evidence — see **#3043**.
 
+⛔ **Status on the merged base (2026-11-03): the GITLESS half is now swept, and this section's headline
+would otherwise be a false state claim.** #3272 (`f2d40ef8`) added
+`scripts/reap-abandoned-worktrees.sh --include-gitless` — reached from this pass's abandoned arm, with
+`DISK_REAPER_GITLESS=0` as the off-switch — so a `/tmp/<name>` tree with **no `.git` at all** is a
+candidate once the liveness witness this section asks for answers (a live-pid cwd/exe census; a live
+lane preserves the tree with `reason=live-cwd`). It carries a keep list (`REAP_AW_GITLESS_KEEP`,
+default `/tmp/actions-runner:/tmp/venv-shared*`) and a per-pass cap (`REAP_AW_GITLESS_MAX`, default 10).
+**#3043's remaining scope** is therefore the trees a `.git`-owned arm claims (they keep their own
+`open-pr`/`dirty`/`main-checkout` proofs) plus whatever the cap leaves for the next hour — not
+"everything under `/tmp`".
+
 ## Age distribution — the disk is a rolling 7-day window, not a rot
 
 Top 250 `/tmp` children, summed by directory mtime (covers ~71 GB of cell 3's 86 GB, ~58 GB of cell 4's 69 GB):
@@ -419,7 +430,7 @@ diagnosis only. What a follow-up PR would touch, per finding:
 | **G3** uv bound unclaimable on a busy cell | `scripts/pi-cache-reap.sh` — a deferral that recurs on N consecutive passes cannot stay a silent `deferral`; it needs a named escalation (raise the bound deliberately, or report `bound-unclaimed-for=…` in the status record) plus a test. Two-arm change, not one line. |
 | **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:574`) already names both delegates, so the list is not the defect. Needs its own test. |
 | **G8** the runner `_work` sink had no class | **shipped** (2026-10-28): `scripts/reap-runner-work.sh` + `class=runner-work` in `scripts/disk-reaper.sh`, pinned in both scheduled artifacts and in the farm list. A class an operator has to remember to enable is the hole it closes, so it is in the DEFAULT `--only` list — and its globs are in `DISK_REAPER_RUNNER_GLOBS`, so an explicit-but-unmatched layout is a refusal rather than a measured zero. |
-| **G9** stale `/tmp` has no class | filed as **#3043** — a liveness witness (`scripts/lib/live-paths.sh`) per candidate, an owner ruling on what scratch counts as evidence, and an exclusion set that is not a name list. |
+| **G9** stale `/tmp` | **gitless scratch trees are swept** (merged base 2026-11-03, #3272: `--include-gitless`, live-pid census, keep list, cap 10/pass); the remainder — `.git`-owned trees and anything past the cap — is filed as **#3043** and needs an owner ruling on what scratch counts as evidence; an exclusion set is already in place (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`). |
 | **G5** `/tmp` swept only at 30 d | policy (`/etc/tmpfiles.d/`), one owner decision; no repo change. |
 | **G6** cell 4's `cell-reclaim.service` failing since 02:09 | not yet diagnosed — the message (`no PR surface readable`) is *correct* fail-closed behaviour; the open question is why that read fails while `gh pr list` succeeds from the same `HOME`. Needs a read-only repro before any patch. |
 | **G7** one transient `gh` failure costs a repo's pass | `#2036` territory (exit-code semantics already split); the recoverable half is a bounded retry inside `pi-reap-worktrees.sh`'s gh probe, with a test that a second failure still fails closed. |
