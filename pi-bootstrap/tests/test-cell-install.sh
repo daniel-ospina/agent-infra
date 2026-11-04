@@ -1540,19 +1540,64 @@ run_install >/dev/null 2>&1
 [ "$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$DEST/.mcp.json")" = "0o600" ] \
   && ok "a merge PRESERVES the destination's mode (0600 in, 0600 out)" \
   || fail "a merge WIDENED .mcp.json's mode — a credentialed config's permissions must not be a side effect of a re-sync"
-# ⛔ "NO READABLE ENTRY" IS NOT "NEEDS NO KEY". With .mcp.json unparseable the merge fails and the
-# credential note runs anyway; it used to assert "the tortoise entry declares no Authorization — a
-# self-hosted daemon needs none" about a file it had just failed to read (see graph_mcp_var's
-# NOENTRY/LITERAL markers).
-cp "$DEST/.mcp.json" "$TMP/mcp-keep.json"      # the arm corrupts the file next; keep a COPY to restore
+# ⛔ "NO READABLE ENTRY" IS NOT "NEEDS NO KEY", **AND** AN UNPARSEABLE FILE IS NOT UNREPAIRABLE.
+# Two arms, because the old single arm pinned the wrong half of the pair. It asserted that an
+# unparseable `.mcp.json` FAILED the install (rc≠0) and reported `graph credential: UNKNOWN`: true at
+# the time, and the reason the file could never converge. `cloud-cell-bringup.sh` runs `--install`
+# ONLY on a verify failure, so an unparseable file was a bring-up that died every time, on a box, with
+# no remedy but a hand-edit — the same class as the non-object containers above, one level up, and
+# reachable: the pre-#3374 merge wrote with `json.dump(open(dst,"w"))` (truncate-in-place), so an
+# interrupted legacy run left a truncated file on an already-provisioned box.
+cp "$DEST/.mcp.json" "$TMP/mcp-keep.json"      # the arm corrupts the file below; keep a COPY to restore
 printf 'not json at all' > "$DEST/.mcp.json"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'NOTJSON' "$LOG" \
+  && ! grep -qF "declares no Authorization" "$LOG" \
+  && ! grep -q 'marker: none' "$LOG" \
+  && ok "--verify NAMES an unparseable .mcp.json (NOTJSON), never as 'this entry needs no key' and never an empty marker beside a traceback" \
+  || fail "--verify handled an unparseable .mcp.json badly (rc=$rc) — either it did not name NOTJSON, or it reported the credential state as 'no Authorization' for a file it could not read, or it printed 'marker: none' over a traceback"
+rm -f "$DEST/.mcp.json.bak"
 run_install
 rc=$?
-[ "$rc" -ne 0 ] && grep -q "graph credential: UNKNOWN" "$LOG" \
-  && ! grep -qF "declares no Authorization" "$LOG" \
-  && ok "an unreadable .mcp.json is reported UNKNOWN, never as 'this entry needs no key'" \
-  || fail "a failed merge reported the credential state as 'no Authorization' for a file it could not read (rc=$rc) — the one diagnostic a reader uses to tell a working cell from a 401 one"
+run_verify
+rc2=$?
+[ "$rc" -eq 0 ] && [ "$rc2" -eq 0 ] && [ -f "$DEST/.mcp.json.bak" ] \
+  && [ "$(cat "$DEST/.mcp.json.bak")" = "not json at all" ] \
+  && ok "install REPAIRS an unparseable .mcp.json (rc=0, and --verify then certifies) and KEEPS the discarded bytes as .mcp.json.bak" \
+  || fail "install could not repair an unparseable .mcp.json (install rc=$rc, verify rc=$rc2, .bak=$([ -f "$DEST/.mcp.json.bak" ] && echo present || echo missing)) — cloud-cell-bringup dies on every attempt and no operator instruction can clear it"
+rm -f "$DEST/.mcp.json.bak"
 cp "$TMP/mcp-keep.json" "$DEST/.mcp.json"      # restore from the COPY, not by re-reading an unparseable file
+
+# ⛔ A MERGE MUST NOT PRESERVE A LEAK SILENTLY. The token scan only ever sees the TORTOISE entry, so a
+# literal credential in ANY OTHER server was preserved with rc=0 and the log reading
+# `hosted tortoise entry installed (cell-local servers preserved)` — while `--verify` then refused the
+# very file the merge had just written (`SECRET_IN_FILE`), so the layer failed and `--install` could
+# never converge. The merge now NAMES the path. It does not refuse (the bytes are ALREADY in the
+# destination, a merge never clobbers, and setup.sh merges on laptops where no verifier runs), so the
+# arm asserts the SENTENCE, which is the half that was missing.
+printf '{"mcpServers":{"cell-local":{"command":"/bin/true","env":{"K":"%s"}}}}' "t$(printf 't_%s' "$(printf 'A%.0s' 1 2 3 4 5 6 7 8 9 10 11 12)")" > "$TMP/leak.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/leak.json" --cell > "$TMP/leak.out" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -q 'STILL carries a literal credential at cell-local.env.K' "$TMP/leak.out" \
+  && ok "the merge NAMES a literal credential it PRESERVED in another server (cell-local.env.K), so its rc and its log agree with the layer's verdict" \
+  || fail "the merge preserved a credential in another server and said nothing (rc=$rc) — the install log reports success over a file --verify refuses, and the operator is never told which entry holds it"
+
+# ⛔ A HOME-LESS CONTEXT MUST NOT ABORT THE VERIFIER. This script runs under `set -uo pipefail`, so an
+# unguarded `$HOME/keys.env` aborted `--verify` with `HOME: unbound variable` — and it aborted LATE,
+# after `.mcp.json verify: OK`, so the log looked like a graph problem while `guard_tools_dir`,
+# `guard_spawn_gate`, `guard_gh_shim` and the `LAYER VERIFIED` verdict were all SKIPPED. systemd units,
+# `sudo -u`, `env -i` and CI steps all run without HOME, and a correctly-installed cell could not be
+# certified from any of them. Two sites had it; this arm reaches one of them (the credential note's
+# legacy-alias probe is the other, and it is only reached on a box with no resolvable key).
+: > "$TMP/nohome.log"
+env -u HOME CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --verify >> "$TMP/nohome.log" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'unbound variable' "$TMP/nohome.log" \
+  && grep -q 'LAYER VERIFIED' "$TMP/nohome.log" \
+  && ok "--verify completes with HOME UNSET (rc=0, LAYER VERIFIED reached) — a systemd/\`env -i\` context certifies the layer instead of aborting mid-run" \
+  || fail "--verify aborted or refused with HOME unset (rc=$rc) — the unbound-variable abort skips every guard after the graph check and reports a graph problem for a HOME problem"
 
 # ⛔ THE INSTALL SIDE MUST ENFORCE THE HOSTED HEADER TOO. The verifier has three arms for it; the
 # merge carries its own copy of the predicate, so an install that PRESERVED a foreign variable would

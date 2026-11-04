@@ -352,7 +352,15 @@ graph_key_resolve() {
   # and cell-4: HOME=/home/cmux), and the launcher sources $HOME/keys.env. CELL_HOME follows
   # because it is where THIS script installs, and on some images the two differ.
   local f
-  for f in "$HOME/keys.env" "$CELL_HOME/keys.env"; do
+  # ⛔ `${HOME:-}`, NOT `$HOME`. This function runs under `set -uo pipefail` (line 205), so a
+  # HOME-less context — systemd/launchd units, `sudo -u`, `env -i`, a CI step — aborted the WHOLE
+  # verifier here with `HOME: unbound variable`, skipping `guard_tools_dir`, `guard_spawn_gate`,
+  # `guard_gh_shim` and the `LAYER VERIFIED` verdict: a correctly-installed cell could not be
+  # certified, and the abort lands AFTER `.mcp.json verify: OK` so the log looks like a graph
+  # problem. `${CELL_HOME:-}` too — it is assigned from `${CELL_HOME:-$HOME}` elsewhere, but this
+  # loop must not depend on that. An empty candidate is skipped, not stat'd as `""`.
+  for f in "${HOME:-}/keys.env" "${CELL_HOME:-}/keys.env"; do
+    [ -n "$f" ] && [ "$f" != "keys.env" ] || continue
     [ -f "$f" ] || continue
     val="$(graph_key_from_env_file "$f" "$GRAPH_VAR")"
     GRAPH_KEY_SRC="$f ($GRAPH_VAR)"
@@ -410,8 +418,8 @@ graph_credential_note() {
       log_line "    GRAPH-UNREACHABLE. Remedy: put the hosted key in $CELL_HOME/keys.env (mode 600) as"
       log_line "    $GRAPH_VAR, or alias the name an older box carries: export TORTOISE_MCP_API_KEY=\"\$TORTOISE_API_KEY\" (#5153)."
       if [ "$GRAPH_VAR" = "TORTOISE_MCP_API_KEY" ] && { [ -n "${TORTOISE_API_KEY:-}" ] \
-         || [ -n "$(graph_key_from_env_file "$HOME/keys.env" TORTOISE_API_KEY 2>/dev/null)" ] \
-         || [ -n "$(graph_key_from_env_file "$CELL_HOME/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; }; then
+         || { [ -n "${HOME:-}" ] && [ -n "$(graph_key_from_env_file "${HOME}/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; } \
+         || [ -n "$(graph_key_from_env_file "${CELL_HOME:-}/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; }; then
         log_line "    ⚠️  the LEGACY name TORTOISE_API_KEY IS set — add the alias line above and it resolves"
       fi ;;
     *)
