@@ -1400,8 +1400,36 @@ if [ "$VERDICT" = "not-clean" ]; then
     echo "record-review.sh: the 'not-clean' verdict requires --findings <n> — a negative verdict asserts that a review found something OPEN, and a count is the minimum that makes that assertable to the gate (which otherwise can only report 'a record exists whose verdict is not clean'). Nothing was recorded." >&2
     exit 2
   fi
-  if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]] || [ "$FINDINGS" -lt 1 ]; then
+  # ⛔ CANONICALISE THE COUNT — DO NOT MERELY ACCEPT IT (review, P2-1). The count
+  # is written UNQUOTED (`"findings":$FINDINGS`) because every reader binds a JSON
+  # NUMBER (review-enforcer: `typeof record.findings === "number"`), so the
+  # spelling of the value IS the record's validity, not a formatting nicety.
+  #
+  # Measured against the previous arms: `^[0-9]+$` accepts `007`, and
+  # `[ 007 -lt 1 ]` is FALSE (bash reads a leading zero as OCTAL), so `--findings 007`
+  # was accepted and wrote `"findings":007` — invalid JSON, therefore an
+  # UNREADABLE record, therefore a gate that reports "No review record found" over
+  # a review that DID happen and WAS correct. `08` was worse still: `-lt` aborts the
+  # test with "value too great for base", and stderr noise does not make the record
+  # any more parseable. Fail-closed both times (a broken record cannot license a
+  # merge), but the arm silently destroyed a CORRECT negative record, so it did not
+  # hold its own contract.
+  #
+  # Why COERCE rather than refuse: `007` is a caller TYPO, not a lie about the
+  # review, and the count it denotes is unambiguous — seven. The strip below is
+  # pure STRING manipulation (no `10#` arithmetic), so a pathologically long value
+  # cannot wrap or overflow into a different number than the caller wrote.
+  if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then
     echo "record-review.sh: --findings expects a POSITIVE integer (got '$FINDINGS') — 'not-clean' with zero findings is a contradiction: that is what 'clean' means. Nothing was recorded." >&2
+    exit 2
+  fi
+  # `${FINDINGS%%[!0]*}` is the leading-ZERO RUN (empty when it does not start with
+  # 0); removing it from the front yields the canonical decimal (`007` → `7`,
+  # `08` → `8`, `12` → `12`).
+  FINDINGS_ZEROS="${FINDINGS%%[!0]*}"
+  FINDINGS="${FINDINGS#"$FINDINGS_ZEROS"}"
+  if [ -z "$FINDINGS" ]; then
+    echo "record-review.sh: --findings expects a POSITIVE integer, and the value given ('${FINDINGS_ZEROS}') is zero — 'not-clean' with zero findings is a contradiction: that is what 'clean' means. Nothing was recorded." >&2
     exit 2
   fi
   if [[ "$FINDINGS_NOTE" == *'"'* || "$FINDINGS_NOTE" == *'\\'* || "$FINDINGS_NOTE" =~ [[:cntrl:]] ]]; then
@@ -2686,7 +2714,29 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
     echo "record-review.sh --recover-body: $REPO#$PR's marker is a \`not-clean\` attestation but carries no readable \`findings=\` count, so a recovered record could not tell the gate WHAT is open. Nothing was written; mint it again at the current head: record-review.sh $PR <current head> not-clean $REPO --findings <n> --evidence <artifact>" >&2
     exit 3
   fi
-  RB_HEAD="$(printf '%s' "$RB_TEXT" | command sed -n 's/.* @ \([0-9a-f]\{40\}\).*/\1/p')"
+  # ⛔ THE HEAD IS READ FROM ITS STRUCTURAL POSITION, NEVER "the last ` @ <40hex>`"
+  # (review, P3-2). The previous read was a GREEDY sed — `s/.* @ \([0-9a-f]\{40\}\).*/\1/p`
+  # — which takes the LAST ` @ ` followed by 40 hex IN THE LINE. `RB_TEXT` carries
+  # the `note=` trailer, a note is free-form, and a note naming a sha (`also fails
+  # at @ <sha>`, a plausible thing for a lane to write) therefore WON the match:
+  # measured, the sed returned the note's sha instead of the minted head, so the
+  # recovered record bound to a head the negative was never minted at.
+  #
+  # Both expansions below are SHORTEST-prefix (`#`), so each takes the EARLIEST
+  # occurrence, and the head's ` @ ` is the first one after `verdict=` by the
+  # marker's own grammar (RB_RE has already proved that grammar above):
+  #   verdict=<v> @ <40hex> [diff=<64hex>] (<repo>) [findings=<n> [note=<rest>]]
+  # `verdict=` cannot appear before the verdict (the fixed prefix is
+  # `review recorded: reviews/<pr>.json `), the verdict token contains no ` @ `,
+  # and the note/diff/repo all come AFTER the head — so nothing a note contains can
+  # move the read, whether or not this version is the one that wrote the note.
+  RB_AFTER_VERDICT="${RB_TEXT#*verdict=}"
+  RB_AFTER_HEAD="${RB_AFTER_VERDICT#* @ }"
+  RB_HEAD="${RB_AFTER_HEAD:0:40}"
+  if ! [[ "$RB_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "record-review.sh --recover-body: the marker for $REPO#$PR matched the marker grammar but its head could not be read structurally (got '${RB_HEAD:0:40}') — a record bound to a half-read sha is worse than no record, because the gate would key on a head the review never happened at. Nothing was written." >&2
+    exit 3
+  fi
   # ⛔ A `clean-low` MARKER CANNOT BE RECOVERED HONESTLY (review, #2872 P0).
   # That tier certifies the MERGE BASE the diff was taken from, and a normal
   # clean-low record always carries `merge_base_sha`. The signed marker does NOT
@@ -3957,6 +4007,18 @@ fi
 # `findings` field would be a clean verdict admitting an open finding.
 FINDINGS_FIELD=""
 if [ "$VERDICT" = "not-clean" ]; then
+  # ⛔ THE WRITE RE-CHECKS THE SPELLING IT DEPENDS ON (review, P2-1). This field is
+  # UNQUOTED on purpose — quoting it would change its JSON TYPE, and every reader
+  # binds a number (`typeof record.findings === "number"`), so "quote it on write"
+  # is not available here: it would retire the count the negative verdict exists to
+  # carry. What IS available is to refuse to emit a value that would produce an
+  # unparseable record, because the gate reads an unparseable record as NO RECORD —
+  # the exact #3400 confusion. The input arm above canonicalises; this refuses if
+  # that ever stops holding, so no future edit can write `"findings":007`.
+  if ! [[ "$FINDINGS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "record-review.sh: refusing to write findings='$FINDINGS' — the field is emitted as an UNQUOTED JSON number, so a non-canonical spelling (leading zeros, sign, decimals) would make the whole record unparseable, and the merge gate reads an unparseable record as NO record. Nothing was recorded." >&2
+    exit 2
+  fi
   FINDINGS_FIELD="\"findings\":$FINDINGS,"
   if [ -n "$FINDINGS_NOTE" ]; then
     FINDINGS_FIELD="${FINDINGS_FIELD}\"findings_note\":\"$FINDINGS_NOTE\","

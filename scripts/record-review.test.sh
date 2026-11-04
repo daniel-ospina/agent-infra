@@ -5080,9 +5080,13 @@ REPO_ROOT="$(cd "$(dirname "$RECORD")/.." && pwd)"
 # moved after its composite review, a composed tree that carried code REMOVING a
 # fail-open fix, and tortoise#3295 whose body said `verdict=clean` while the most
 # recent review at that head was NOT CLEAN. The last one survived because the
-# recorder had NO negative verdict (agent-infra#3400) and the marker reader was
-# presence-based, not recency-based (agent-infra#3410): a later NOT CLEAN could
-# not supersede an earlier `clean` at the same head.
+# recorder had NO negative verdict (agent-infra#3400) and the marker reader could
+# not SEE a negative marker (agent-infra#3410): a `verdict=not-clean` line fell
+# into RB_NBAD ("a marker whose signature does not verify"), so the keep-LAST rule
+# — which already existed at the base commit, `1f69ab544:2521` — could never be
+# given a negative to keep, and an earlier `clean` won by being the only readable
+# marker. (Stated precisely: the delta is VISIBILITY, not recency. "Recency was
+# presence-based" would be false — the recency rule was already there.)
 #
 # ⛔ EVERY ARM BELOW IS A DISCRIMINATOR, not a smoke test: 20.2 fails if recency
 # handling is removed (first-marker-wins would recover `clean`), and 20.4 fails
@@ -5187,11 +5191,20 @@ fi
 # path. §13f proves a clean mint over a NOT-CLEAN artifact refuses; this re-runs
 # that pair AFTER a successful not-clean mint, because the (1b) declared-negative
 # arm is the thing most likely to be refactored while adding a negative family.
+#
+# ⛔ WHAT THIS ARM DOES *NOT* PROVE (review, P3-3): it is NOT a (1b) discriminator.
+# Its artifact carries NO `Outcome:` line, so the LOOSE arm (2) refuses it too on
+# its own (`not[[:space:]_-]*clean`, unsuppressed) — delete arm (1b) entirely and
+# this arm still goes green with rc 3. It is a guard that the CLEAN path still
+# refuses at all, which is worth keeping and is all it claims. The pins that can
+# ONLY pass through (1b) are §13n4/§13n5 (an `**Outcome: CLEAN …**` line, which
+# SUPPRESSES arm (2), plus a declared NOT-CLEAN header) and §20.3b below, which is
+# the same shape placed next to this arm so the claim and its pin travel together.
 rb_clear
 STUB_EVIDENCE_BODY='## Review — NOT CLEAN
 2 P1s remain: unbounded retry, missing auth check.'
 EV_REF="comment:42495301" run_record_ev 424953
-assert_eq "$RECORD_RC" "3" "20.3 a CLEAN mint over a declared-negative artifact still REFUSES (rc 3) — the (1b) arm is intact"
+assert_eq "$RECORD_RC" "3" "20.3 a CLEAN mint over a declared-negative artifact still REFUSES (rc 3) — arm (2) alone suffices here; the (1b) pin is 20.3b"
 if [ -f "$(Q2 424953)" ]; then bad "20.3 the refused clean mint wrote a record"; else ok "20.3 …and writes nothing"; fi
 
 # 20.4 `not-clean` DOES NOT BUY A CHEAPER PATH. It is held to `--evidence` exactly
@@ -5217,6 +5230,177 @@ NEG_F=1
 run_record_raw 424956 "$SHA" clean "daniel-ospina/agent-infra" --findings 3 $EV_ARGS
 assert_eq "$RECORD_RC" "2" "20.5 --findings on a CLEAN verdict is refused, not silently dropped (rc 2)"
 assert_contains "$RECORD_ERR" "only meaningful with 'not-clean'" "20.5 …and names why"
+
+# ── 20.6 (review P2-1) THE COUNT IS A CANONICAL JSON NUMBER, NOT A SPELLING ──
+# The record writes `"findings":$FINDINGS` UNQUOTED, because every reader binds it
+# as a JSON NUMBER (review-enforcer: `typeof record.findings === "number"`). So a
+# zero-padded count is not cosmetic: `007` emits `"findings":007`, which does not
+# parse, and the gate reads an unparseable record as NO RECORD — the #3400
+# confusion, re-created by the feature that ends it.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX ARM AND CANNOT PASS BY ACCIDENT: before the fix
+# `^[0-9]+$` accepted `007`, `[ 007 -lt 1 ]` was FALSE (bash reads a leading zero
+# as octal) and the raw value was written straight through.
+run_record_neg_cap() { # <pr> [extra args…] — the mint, CAPTURING the posted marker
+    local pr="$1"; shift
+    local rcfile="$T/negrc" errfile="$T/negerr" cap="$T/negcap"
+    rm -f "$errfile"; : > "$cap"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_CAPTURE="$cap"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        rc=0
+        bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+            --findings "${NEG_F:-1}" --evidence "${EV_REF}" "$@" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+    NEG_CAP="$(cat "$cap" 2>/dev/null || true)"
+    # The PATCH sink holds the gh API ENVELOPE (`{"body":"…\n…"}`), whose marker
+    # line is a `\n`-ESCAPED string rather than a line. Decode it: a round-trip has
+    # to start from the body a reader of the PR would actually see.
+    NEG_BODY="$(command python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$cap" 2>/dev/null || true)"
+    [ -n "$NEG_BODY" ] || NEG_BODY="$NEG_CAP"
+}
+NEG_F=007
+EV_REF="comment:42496001"
+run_record_neg_cap 424961
+assert_eq "$RECORD_RC" "0" "20.6 --findings 007 is ACCEPTED and NORMALISED, not written verbatim (rc 0)"
+NEG_PAD_REC="$(Q2 424961)"
+assert_contains "$(cat "$NEG_PAD_REC" 2>/dev/null)" '"findings":7,' "20.6 …the record carries the canonical integer 7"
+if command grep -q '"findings":007' "$NEG_PAD_REC" 2>/dev/null; then
+    bad "20.6 the record holds a ZERO-PADDED count — that is invalid JSON, and the gate would report 'No review record found'"
+else
+    ok "20.6 …and no zero-padded spelling reached the record"
+fi
+# ⛔ THE ASSERTION THAT ACTUALLY MATTERS: the record PARSES. A string comparison
+# ( `grep` above) cannot tell a valid number from a token that only looks like one.
+if command python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["findings"]==7 and isinstance(d["findings"],int) else 1)' "$NEG_PAD_REC" 2>"$T/negpy"; then
+    ok "20.6 …and the record PARSES as JSON with findings==7 as a NUMBER (not a string)"
+else
+    bad "20.6 the record does not parse as JSON with an integer findings — the gate would read it as NO RECORD: $(command head -1 "$T/negpy" 2>/dev/null)"
+fi
+assert_contains "$NEG_CAP" " findings=7 " "20.6 …the posted marker carries the same canonical count"
+# `08` is the case that made the OLD arm emit a bash error as well as a bad record:
+# `[ 08 -lt 1 ]` aborts with "value too great for base".
+NEG_F=08
+run_record_neg_cap 424962
+assert_eq "$RECORD_RC" "0" "20.6b --findings 08 (the octal-abort case) is accepted and normalised (rc 0)"
+assert_contains "$(cat "$(Q2 424962)" 2>/dev/null)" '"findings":8,' "20.6b …recorded as the canonical integer 8"
+# All-zero spellings are still the 'clean' contradiction, and are still refused.
+NEG_F=00
+run_record_neg_cap 424963
+assert_eq "$RECORD_RC" "2" "20.6c --findings 00 is still the zero-findings contradiction (rc 2)"
+if [ -f "$(Q2 424963)" ]; then bad "20.6c a zero count wrote a record"; else ok "20.6c …and writes nothing"; fi
+# A NON-INTEGER is refused at the input arm, not normalised into existence.
+NEG_F=1.5
+run_record_neg_cap 424964
+assert_eq "$RECORD_RC" "2" "20.6d --findings 1.5 (a float) is refused (rc 2)"
+NEG_F=1
+
+# ── 20.7 (review P3-2) A NOTE CANNOT REBIND THE RECOVERED HEAD ─────────────
+# `--recover-body` used to read the head with a GREEDY `s/.* @ \([0-9a-f]\{40\}\).*/\1/p`,
+# i.e. "the LAST ` @ <40hex>` in the line" — and the line carries the free-form
+# `note=`. A note naming a sha ("also fails at @ <sha>", a plausible thing to
+# write) therefore WON the match and the recovered record bound to a head the
+# negative was never minted at.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX READER: measured, it recovered the NOTE's sha.
+# The marker is SIGNED properly, so this is not an HMAC vector — it is the parse.
+rb_clear
+NEG_H_HEAD="$(printf 'b%.0s' $(seq 1 40))"
+NEG_H_FAKE="$(printf 'a%.0s' $(seq 1 40))"
+NEG_H_DIFF="$(printf '5%.0s' $(seq 1 64))"
+NEG_M_HOSTILE="$(rb_marker 424965 "review recorded: reviews/424965.json verdict=not-clean @ $NEG_H_HEAD diff=$NEG_H_DIFF ($RB_REPO) findings=3 note=also fails at @ $NEG_H_FAKE")" \
+  || bad "fixture: the hostile-note marker could not be BUILT — 20.7 would otherwise pass on a missing marker"
+STUB_BODY="$NEG_M_HOSTILE"
+run_recover 424965 "$RB_REPO"
+NEG_H_REC="$RB_RDIR/daniel-ospina-agent-infra-424965.json"
+assert_eq "$RB_RC" "0" "20.7 a not-clean marker whose NOTE names a sha still recovers (exit 0)"
+assert_contains "$(cat "$NEG_H_REC" 2>/dev/null)" "\"head_sha\":\"$NEG_H_HEAD\"" \
+  "20.7 the recovered head is the MINTED one, not the sha the note names"
+if command grep -q "\"head_sha\":\"$NEG_H_FAKE\"" "$NEG_H_REC" 2>/dev/null; then
+    bad "20.7 the record's HEAD bound to the note's sha — a hostile note moved the head (the greedy-sed defect)"
+else
+    ok "20.7 …and the note's sha is not the head the record binds"
+fi
+assert_contains "$(cat "$NEG_H_REC" 2>/dev/null)" '"findings":3' "20.7 …the finding count survives the hostile note"
+
+# ── 20.8 (review P3-4) THE `--check-carry` NEGATIVE DIAGNOSIS AND THE note= ROUND-TRIP ──
+# `cc_report_negative` / `cc_num_field` had ZERO assertions, so the arm that must
+# stop a lane being told "land it" over an open finding rested on reading alone.
+rb_clear
+NEG_F=02
+EV_REF="comment:42496601"
+# `run_check_carry` reads the live head and the live diff from the fixture globals
+# the 11.13 vectors set; this section owns its own, so a lane asking at the
+# CURRENT head is the vector (the negative report must fire there too).
+CC_HEAD="$SHA"
+CC_DIFF="$T/neg-diff"
+printf '%s\n' 'diff --git a/x b/x' > "$CC_DIFF"
+run_record_neg_cap 424966
+assert_eq "$RECORD_RC" "0" "20.8 fixture: the not-clean record mints (rc 0)"
+run_check_carry 424966 "daniel-ospina/agent-infra"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "reviewed NOT CLEAN at" \
+  "20.8a --check-carry STATES the negative verdict (cc_report_negative) instead of advising 'land it' in silence"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "2 open finding(s)" \
+  "20.8b …naming the COUNT it read back with cc_num_field (--findings 02 normalised to 2)"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "NOT a licence to merge" \
+  "20.8c …and refusing the mis-reading: a carried negative is not a permission"
+# cc_num_field reads an UNQUOTED JSON number and nothing else — the same binding the
+# gate makes (`typeof record.findings === "number"`). A quoted count is therefore
+# NOT a count, and the diagnosis must degrade to "no number" rather than print one.
+rb_clear
+CC_HEAD="$NEG_H_HEAD"
+printf '%s\n' "{\"pr\":424967,\"head_sha\":\"$NEG_H_HEAD\",\"diff_sha256\":\"$NEG_H_DIFF\",\"verdict\":\"not-clean\",\"repo\":\"daniel-ospina/agent-infra\",\"findings\":\"4\"}" > "$(Q2 424967)"
+run_check_carry 424967 "daniel-ospina/agent-infra"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "reviewed NOT CLEAN at" \
+  "20.8d a string-typed findings is still a negative verdict"
+if command grep -q "open finding(s)" "$T/cc-err" 2>/dev/null; then
+    bad "20.8d cc_num_field read a QUOTED findings — it must bind an unquoted number, as the gate does"
+else
+    ok "20.8d …and cc_num_field does NOT report a count it cannot bind as a number"
+fi
+# THE ROUND-TRIP: mint → posted marker → --recover-body, with the note intact.
+rb_clear
+NEG_F=3
+EV_REF="comment:42496801"
+run_record_neg_cap 424968 --findings-note "1 P2 + 2 P3"
+assert_eq "$RECORD_RC" "0" "20.8e fixture: a not-clean record with --findings-note mints (rc 0)"
+assert_contains "$(cat "$(Q2 424968)" 2>/dev/null)" '"findings_note":"1 P2 + 2 P3"' \
+  "20.8e the record carries the note it was given"
+assert_contains "$NEG_CAP" " note=1 P2 + 2 P3" "20.8e …and the POSTED marker carries it as the trailer"
+rb_clear
+STUB_BODY="$NEG_BODY"
+run_recover 424968 "$RB_REPO"
+assert_eq "$RB_RC" "0" "20.8f the minted marker RECOVERS on a box that lost the record (exit 0)"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424968.json" 2>/dev/null)" '"findings_note":"1 P2 + 2 P3"' \
+  "20.8f …with the note= ROUND-TRIPPED, not dropped"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424968.json" 2>/dev/null)" '"findings":3' \
+  "20.8f …and the count alongside it"
+unset NEG_CAP NEG_BODY STUB_BODY
+
+# 20.3b REGRESSION GUARD, shape of 13n4/13n5 — the arm that ACTUALLY pins (1b).
+# 20.3 above does NOT (review, P3-3): its artifact has no `Outcome:` line, so the
+# loose arm (2) refuses it too and deleting (1b) leaves 20.3 green. The genuine
+# (1b)-only shape is `**Outcome: CLEAN …**` PLUS a declared NOT-CLEAN header: the
+# Outcome line SUPPRESSES arm (2), so only the declared-negative arm (1b) can
+# refuse. This arm is 20.3's real discriminator, next to it so the claim and the
+# pin travel together.
+rb_clear
+STUB_EVIDENCE_BODY='**Outcome: CLEAN — verified, no issues.**
+
+## Review — NOT CLEAN
+1 P1 remains: the retry loop re-reads the claim after the lock is released.'
+EV_REF="comment:42496901" run_record_ev 424969
+assert_eq "$RECORD_RC" "3" "20.3b (1b) refuses a CLEAN mint whose artifact declares NOT CLEAN even when an Outcome: CLEAN line suppresses arm (2) (rc 3)"
+if [ -f "$(Q2 424969)" ]; then bad "20.3b the refused clean mint wrote a record"; else ok "20.3b …and writes nothing"; fi
+assert_contains "$RECORD_ERR" "DECLARES a non-clean outcome" "20.3b …and names the declaration it refused on, which only (1b) can see"
+NEG_F=1
+EV_REF="comment:42495501"
 
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"
