@@ -454,7 +454,20 @@ restart_stack() {
               # the pass were the two `print` reads. The arm below states the verdict and its reason;
               # `main` must not restate it as a failed verb. §8b(c) asserts RESTART-FAILED is ABSENT.
               RESTART_REFUSED=1; rc=127
-              log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=$LABEL is NOT loaded and no $PLIST_PATH exists — there is nothing to bootstrap, so nothing was issued; provision the plist for $LABEL at that path"$'\t'"detail=install.sh renders only com.eldato.orchestrator-loop, so it repairs the loop label and NOT this one (§6 of this file's header)"
+              # ⛔ THE REMEDY IS LABEL-DEPENDENT (review P2, cycle 2 of #1986). `install.sh` renders
+              # `com.eldato.orchestrator-loop` (see `PLIST_PATH` above), which IS this arm's subject when
+              # LABEL is that label — so a hardcoded "it repairs the loop label and NOT this one" withheld
+              # the one provisioning verb that is CORRECT on such a box, and contradicted the note beside
+              # it in the same record. For any other label (the default `com.eldato.orchestrator-stack`)
+              # install.sh would render a DIFFERENT job, so naming it there would install that job beside
+              # the box's supervision model.
+              local _remedy
+              if [ "$LABEL" = "com.eldato.orchestrator-loop" ]; then
+                _remedy="install.sh renders THIS label ($LABEL) at this same path, so it is the correct provisioning verb on this box"
+              else
+                _remedy="install.sh renders only com.eldato.orchestrator-loop — a DIFFERENT job — so it does not repair this label ($LABEL); provision $LABEL's plist from whatever provisioned the job"
+              fi
+              log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=$LABEL is NOT loaded and no $PLIST_PATH exists — there is nothing to bootstrap, so nothing was issued; provision the plist for $LABEL at that path"$'\t'"detail=$_remedy"
             else
               # ⛔ AN `enable` THAT FAILS STOPS THE ARM — it is not swallowed. It used to be
               # `enable … || true`, so a REFUSED verb fell through to a `bootstrap` of a label that may
@@ -497,6 +510,13 @@ restart_stack() {
         ORCH_FOREGROUND=0 bash "$sup" start >>"$LOG" 2>&1 || rc=$?
       else
         rc=127
+        # ⛔ THE SAME REFUSAL, ON THE CELL ARM (review P2, cycle 2 of #1986). This branch issued NOTHING
+        # — there is no supervisor to run — so it must not be followed by `main`'s RESTART-FAILED
+        # (`verb=unknown`), which claims a platform verb ran and failed. The plist arm above and this one
+        # are the same class; the invariant stated there ("a deliberate refusal is not a failed verb")
+        # holds on every platform, and a cell farm deployed by `cp *.sh` (agent-infra#2041) is exactly
+        # where this arm is reached. §8c asserts RESTART-FAILED is ABSENT here too.
+        RESTART_REFUSED=1
         log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=no $O/cloud-cell-supervisor.sh and no SUPERVISOR set — nothing was restarted"
       fi ;;
   esac

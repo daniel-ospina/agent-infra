@@ -3033,10 +3033,12 @@ are two MUTATING actors restarting one controller**, and `docs/ops/fleet-livenes
 second plist for `install.sh` to render. Proven by `watchdog-loop.test.sh` §8b (a stubbed `uname` + a
 `launchctl` argv log, entered only behind `WATCHDOG_LAUNCHCTL_PIN`: REMOVED with the controller GONE →
 `enable`+`bootstrap`, loaded → `kickstart -k` in the domain it was found in, unreadable → `kickstart`,
-no-plist → `RESTART-UNAVAILABLE` (and NO `RESTART-FAILED` over it), REMOVED over a LIVE controller →
+no-plist → `RESTART-UNAVAILABLE` (and NO `RESTART-FAILED` over it, and its remedy is LABEL-AWARE: it
+names `install.sh` only for the one label `install.sh` renders), REMOVED over a LIVE controller →
 `RESTART-REFUSED`, a failed `enable` → `RESTART-FAILED` naming the verb, a verb failing with `rc 75` →
 `RESTART-FAILED rc=75` (never a refusal), and a pin that does not match the `launchctl` on PATH → nothing
-runs at all), which reddens on the pre-fold script.
+runs at all), which reddens on the pre-fold script. §8c covers the CELL arm on the same terms: a box with
+no `cloud-cell-supervisor.sh` reports `RESTART-UNAVAILABLE` and is never restated as a failed verb.
 
 ### 6.5.7 The cell's own roles run on a schedule, not when someone looks
 

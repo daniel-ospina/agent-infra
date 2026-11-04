@@ -488,6 +488,9 @@ mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator
 removed_pass "$C/pass.out"
 assert_contains "$(cat "$C/pass.out")" "RESTART-UNAVAILABLE" "a REMOVED job with no plist on disk reports RESTART-UNAVAILABLE"
 assert_absent "$(cat "$C/launchctl.calls" 2>/dev/null)" "bootstrap" "…and issues no bootstrap with nothing to load"
+# …and the REMEDY it names is label-aware: for this (default stack) label install.sh renders a DIFFERENT
+# job, so the line must say so rather than send the operator to install that one beside the box's model.
+assert_contains "$(cat "$C/state/l" 2>/dev/null)" "does not repair this label (com.eldato.orchestrator-stack)" "…naming the stack label as one install.sh does NOT repair"
 # ⛔ NOTHING WAS EXECUTED, SO NOTHING FAILED: the report must not carry a SECOND, false verdict on top of
 # the one the arm already stated (review P2, #1986). It used to, with `verb=unknown`, which is a claim that
 # a verb ran and failed. This assertion is what reddens when that regresses.
@@ -601,6 +604,47 @@ removed_pass "$C/pass.out"
 assert_contains "$(grep -m1 RESTART-FAILED "$C/state/l" 2>/dev/null)" "rc=75" "a verb exiting 75 is reported as RESTART-FAILED with rc=75 (not swallowed as a refusal)"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-REFUSED" "…and is never reported as a deliberate refusal"
 assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-UNAVAILABLE" "…nor as a missing plist (the plist is present)"
+
+# (j) THE MISSING-PLIST REMEDY IS LABEL-AWARE (review P2, cycle 2 of #1986). The `detail=` used to assert
+#     unconditionally that install.sh "repairs the loop label and NOT this one" — which CONTRADICTS the
+#     note beside it when LABEL IS the loop label, the one label install.sh actually renders
+#     (`install.sh:147`→`:156`). Following it would leave the operator hunting a provisioning path that
+#     exists, on the one box where it does. ⛔ BOTH DIRECTIONS ARE PINNED: (c) above asserts the stack
+#     label is called unrepaired; this asserts the loop label is called repairable.
+echo "── 8b(j). the missing-plist remedy is LABEL-AWARE (install.sh renders the loop label)"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale
+mk_darwin_bin 113 'Bad request.\nCould not find service "com.eldato.orchestrator-loop" in domain for user gui: 501'
+: > "$C/launchctl.calls"
+if ! darwin_stub_ok; then
+  bad "8b(j): the launchctl/uname shim is NOT in place — the Darwin arm was NOT entered"
+else
+  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+      LABEL=com.eldato.orchestrator-loop WATCHDOG_PLIST="$C/loop.plist" \
+      WATCHDOG_LAUNCHCTL_PIN="$C/bin/launchctl" SETTLE=0 \
+      LAUNCHCTL_CALLS="$C/launchctl.calls" PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
+  assert_contains "$(cat "$C/state/l" 2>/dev/null)" "renders THIS label (com.eldato.orchestrator-loop)" "for the loop label the remedy NAMES install.sh as the correct provisioning verb"
+  assert_absent "$(cat "$C/state/l" 2>/dev/null)" "does not repair this label" "…and never says it does not repair the label it does render"
+fi
+
+# ═══ 8c. THE CELL ARM: a refusal there is not a failed verb either (review P2, cycle 2 of #1986) ═══
+# The plist arm's fix left the LINUX/cell arm emitting RESTART-UNAVAILABLE and then, because the refusal
+# flag stayed 0, `main`'s RESTART-FAILED with `verb=unknown` on top of it — one false claim that a
+# platform verb ran and failed, on the platform every cell runs. `uname` is shimmed to Linux so the case
+# is determined on ANY host, and a nonexistent SUPERVISOR forces the arm without executing anything.
+echo "── 8c. no cell supervisor: RESTART-UNAVAILABLE, and NOTHING is reported as a failed verb"
+newcase; printf '999999\n' > "$C/o/.orch.lock"; hb_stale; : > "$C/stack.plist"
+mkdir -p "$C/bin" 2>/dev/null
+printf '#!/bin/sh\nif [ "$1" = -s ]; then echo Linux; exit 0; fi\nexec /usr/bin/uname "$@"\n' > "$C/bin/uname" 2>/dev/null
+chmod +x "$C/bin/uname" 2>/dev/null
+if [ ! -x "$C/bin/uname" ]; then
+  bad "8c: the uname shim could not be staged — the cell arm was NOT entered on an unknown host"
+else
+  env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" WATCHDOG_LOG="$C/state/l" \
+      SUPERVISOR="$C/no-such-supervisor.sh" SETTLE=0 PATH="$C/bin:$PATH" bash "$WD" >"$C/pass.out" 2>&1
+  assert_contains "$(cat "$C/pass.out")" "RESTART-UNAVAILABLE" "a cell with no supervisor reports RESTART-UNAVAILABLE"
+  assert_absent "$(cat "$C/state/l" 2>/dev/null)" "RESTART-FAILED" "…and nothing was executed, so nothing is reported as a FAILED verb"
+  assert_absent "$(cat "$C/state/l" 2>/dev/null)" "verb=unknown" "…nor does the log claim an unnamed verb ran"
+fi
 
 # ═══ 9. NON-VACUITY: remove the heartbeat check and the WEDGED arm MUST fail ═════════════════════
 echo "── 9. non-vacuity: without the heartbeat check, a wedged controller reads healthy"
